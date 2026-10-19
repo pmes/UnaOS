@@ -52,6 +52,10 @@
 //! whose name or a row's label holds the text, and Return opens [`search_best`]'s hit — the row's tab with its control
 //! selected and the row ringed in the accent. The launcher's [`row_of_key`] reads the same table. `tests settingsmap`.
 //!
+//! REASK (rmbp-ledger B681, R130 law 2): the Privacy tab (the last) — one row per decision the user made (an answered ask
+//! kept in Principia's store, `prefs::decisions`), each with a Revoke; the revoke is latched and run on [`service`]
+//! (`prefs::revoke`): `[settings] privacy revoke key=<k> ok=<0|1>`. The next time that ask arises, it asks.
+//!
 //! Witness: `:: SETTINGS: controls=<n> tabs=<n> loaded=<n> saved=<n> -> PASS ::` on open and on save, and the
 //! `tests` fixture `settings` ([`selftest`]: set idle to 5, save, re-read the file, compare).
 
@@ -116,8 +120,8 @@ const TOP: usize = PANE_Y;
 const ROW_H: usize = 48;
 const ROWS: usize = 10;
 /// The tabs, in the column's order.
-pub const TABS: usize = 10;
-pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8 · A11YPANE (B655) 9
+pub const TABS: usize = 11;
+pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8 · A11YPANE (B655) 9 · REASK (B681) 10
 const WIN_H: usize = TOP + ROWS * ROW_H + PAD;
 /// Tab rows the column shows at once; more than this and it scrolls (the wheel, or the selection kept in view).
 const COL_VIS: usize = (WIN_H - COL_PAD - 8) / COL_ROW;
@@ -492,7 +496,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -712,7 +716,7 @@ fn avatar(st: &mut State, x: usize, y: usize, d: usize, name: &str) {
 
 /// A tab's tile colour: the accents table and the ink — no literal (General, About, Login Items, Trackpad and File
 /// Types the slate; Users and Display the first accent; Appearance the ink itself; Notifications the rose;
-/// Accessibility the slate).
+/// Accessibility and Privacy the slate).
 fn icon_tile(tab: usize) -> u32 {
     match tab {
         1 | 2 => theme::ACCENTS[0],
@@ -789,6 +793,12 @@ fn tab_icon(s: &mut draw::Surf, tab: usize, x: i32, y: i32, t: i32, tile: Option
             fill_rrect(s, Rect::new(x + f(26), y + f(16), f(48), f(68)), Radii::new(f(6), f(22), f(6), f(6)), ink);
             fill_rrect(s, Rect::new(x + f(34), y + f(46), f(32), sw), 0, bg);
             fill_rrect(s, Rect::new(x + f(34), y + f(60), f(22), sw), 0, bg);
+        }
+        PRIV_TAB => {
+            // Privacy: a padlock — the shackle's arch, the body, the keyhole in the tile's colour (REASK B681).
+            stroke_rrect(s, Rect::new(x + f(32), y + f(16), f(36), f(44)), f(18), sw, ink);
+            fill_rrect(s, Rect::new(x + f(22), y + f(44), f(56), f(40)), f(8), ink);
+            fill_circle(s, cx, y + f(62), f(7).max(1), bg);
         }
         9 => {
             // Accessibility: the universal-access figure — a ring, the head, the arms across, the two legs (A11YPANE B655).
@@ -919,6 +929,7 @@ fn paint(st: &mut State, v: &Values) {
         t if t as usize == FT_TAB => paint_filetypes(st), // FILETYPES (B423)
         t if t as usize == NP_TAB => paint_notifypane(st), // NOTIFYPANE (B435)
         t if t as usize == A11Y_TAB => paint_a11y(st), // A11YPANE (B655)
+        t if t as usize == PRIV_TAB => paint_privacy(st), // REASK (B681)
         _ => paint_about(st),
     }
     if let Some((t, r)) = st.found { if t as usize == tab { found_ring(st, r as usize); } } // SETTINGSMAP (B673): the row the search opened
@@ -1683,6 +1694,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         t if t == FT_TAB => press_filetypes(row, cx), // FILETYPES (B423)
         t if t == NP_TAB => press_notifypane(row, cx), // NOTIFYPANE (B435)
         t if t == A11Y_TAB => press_a11y(row, cx), // A11YPANE (B655)
+        t if t == PRIV_TAB => press_privacy(row, cx), // REASK (B681)
         2 => {
             if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
@@ -2835,6 +2847,7 @@ pub fn row_of_key(key: &str) -> (usize, usize) {
         k if k.starts_with("display.") => (2, AT_FIRST),
         k if k.starts_with("login.") => (4, AT_FIRST),
         k if k.starts_with("accessibility.") => (A11Y_TAB, AT_FIRST), // A11YPANE (B655)
+        k if k.starts_with("decisions.") => (PRIV_TAB, AT_FIRST), // REASK (B681)
         _ => (0, AT_FIRST),
     }
 }
@@ -2872,8 +2885,8 @@ fn take_at(tab: usize) -> (usize, bool) {
 // posts) and the stored stanzas: Allow, Banner/Center, Sound; row 9 the `settings/notify` link. Every change applies
 // LIVE in `notifypane`'s cell and latches ONE store write drained on NOTIFY's service pass (never a bus call here).
 
-/// The Notifications tab's index on the strip (FILETYPES precedes it; A11YPANE (B655) follows it as the last tab).
-pub const NP_TAB: usize = TABS - 2;
+/// The Notifications tab's index on the strip (FILETYPES precedes it; A11YPANE (B655) follows it; REASK's Privacy is last).
+pub const NP_TAB: usize = 8;
 const NP_ROW0: usize = 3;
 const NP_APP_ROWS: usize = 6;
 const NP_ALLOW_X: usize = PANE_X + 300;
@@ -3022,8 +3035,8 @@ fn press_filetypes(row: usize, cx: usize) {
 // re-reads), stored as ONE latched PrefSet per changed key drained by [`a11y_service`] (never a bus write in the click
 // router). Wire: `[settings] accessibility.<key>=<v> applied=<0|1>`, `[settings] accessibility loaded …`.
 
-/// The Accessibility tab's index on the strip: the last tab.
-pub const A11Y_TAB: usize = TABS - 1;
+/// The Accessibility tab's index on the strip (REASK B681's Privacy follows it).
+pub const A11Y_TAB: usize = 9;
 /// The schema's `accessibility.text_size` spellings, in step order.
 const A11Y_TEXT_NAMES: [&str; 4] = ["default", "large", "larger", "largest"];
 /// The CSS px each text step writes to `system.display.font_size`: the body size (DESIGN-LANGUAGE §2.2, 13), x1.25,
@@ -3224,6 +3237,96 @@ pub fn selftest_a11y() {
     );
 }
 
+// ── REASK (rmbp-ledger B681, R130 law 2) — the Privacy tab ────────────────────────────────────────────────────────
+// Row 0 is the tab's one MAP row: `Remember my answers` (`system.privacy.remember`, a switch; off = a new answer is not
+// kept) with the count of answers kept; rows 1..=PRIV_ROWS one decision each (`<domain>: <subject's leaf>`, the answer and its
+// date, a Revoke at the right); the row after them `+<n> more`. Revoke is LATCHED in the click router and run by
+// [`privacy_service`] on the service pass (`prefs::revoke` saves a domain file — never in the router).
+
+/// The Privacy tab's index on the strip: the last tab.
+pub const PRIV_TAB: usize = 10;
+const _: () = assert!(PRIV_TAB == TABS - 1 && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB);
+/// Decision rows shown.
+const PRIV_ROWS: usize = 8;
+/// The Revoke button's x (right-aligned in the row).
+const PRIV_REVOKE_X: usize = CTRL_R - BTN_W;
+/// A revoke the router latched (the decision's key), run by [`privacy_service`].
+static PRIV_REVOKE: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+/// The Remember switch: the value this window last chose (`u32::MAX` = read the store) and its owed store write.
+static PRIV_REMEMBER_SHOWN: AtomicU32 = AtomicU32::new(u32::MAX);
+static PRIV_REMEMBER_OWED: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Are new answers kept? This window's last choice, else the store's (default on).
+fn privacy_remember() -> bool {
+    match PRIV_REMEMBER_SHOWN.load(Ordering::Relaxed) {
+        u32::MAX => crate::prefs::flag(crate::prefs::key::PRIVACY_REMEMBER).unwrap_or(true),
+        v => v != 0,
+    }
+}
+
+fn paint_privacy(st: &mut State) {
+    let d = crate::prefs::decisions();
+    let on = privacy_remember();
+    groups(st, &[(0, 0), (1, d.len().clamp(1, PRIV_ROWS))]);
+    txt(st, LABEL_X, 0, "Remember my answers");
+    tog(st, 0, TOG_X, on, false);
+    txt2(st, TRACK_X, 0, &alloc::format!("{} kept; revoke one to be asked again", d.len()));
+    if d.is_empty() {
+        txt2(st, LABEL_X, 1, "None yet: an ask you answer is kept here.");
+    }
+    for (k, x) in d.iter().take(PRIV_ROWS).enumerate() {
+        let leaf = x.who.trim_end_matches('/').rsplit('/').next().unwrap_or(&x.who);
+        let leaf: String = leaf.chars().take(28).collect();
+        txt(st, LABEL_X, 1 + k, &alloc::format!("{}: {}", x.domain, leaf));
+        let when = if x.at == 0 {
+            String::from("date unknown")
+        } else {
+            let (y, mo, dd, _, _, _) = crate::clock::civil_from_unix(x.at);
+            alloc::format!("{:04}-{:02}-{:02}", y, mo, dd)
+        };
+        txt2(st, TRACK_X, 1 + k, &alloc::format!("{} ({})", x.answer, when));
+        btn(st, 1 + k, PRIV_REVOKE_X, "Revoke");
+    }
+    if d.len() > PRIV_ROWS {
+        txt2(st, LABEL_X, 1 + PRIV_ROWS, &alloc::format!("+{} more", d.len() - PRIV_ROWS));
+    }
+}
+
+/// A press on the Privacy tab: a row's Revoke latches that decision's key (no store write in the router).
+fn press_privacy(row: usize, cx: usize) {
+    if row == 0 {
+        let v = !privacy_remember();
+        PRIV_REMEMBER_SHOWN.store(v as u32, Ordering::Relaxed);
+        PRIV_REMEMBER_OWED.store(v as u32, Ordering::Release);
+        say("privacy.remember", if v { "true" } else { "false" }, true);
+        repaint();
+        return;
+    }
+    if !(1..=PRIV_ROWS).contains(&row) || cx < PRIV_REVOKE_X || cx >= PRIV_REVOKE_X + BTN_W {
+        return;
+    }
+    let d = crate::prefs::decisions();
+    let Some(x) = d.get(row - 1) else { return };
+    if let Some(mut g) = PRIV_REVOKE.try_lock() {
+        *g = Some(x.key.clone());
+        serial_println!("[settings] privacy revoke key={} latched", x.key);
+    }
+}
+
+/// The service pass: run a latched Revoke, repaint the open Privacy pane.
+fn privacy_service() {
+    let v = PRIV_REMEMBER_OWED.swap(u32::MAX, Ordering::AcqRel);
+    if v != u32::MAX {
+        crate::prefs::set_sys(crate::prefs::key::PRIVACY_REMEMBER, crate::prefs::PrefValue::Bool(v != 0));
+    }
+    let Some(k) = PRIV_REVOKE.try_lock().and_then(|mut g| g.take()) else { return };
+    let ok = crate::prefs::revoke(&k);
+    serial_println!("[settings] privacy revoke key={} ok={}", k, ok as u8);
+    if is_open() && cur_tab() == PRIV_TAB {
+        repaint();
+    }
+}
+
 // ── SETTINGSMAP (rmbp-ledger B673, BP-bar-17, R118) — one row per preference, and the search that reaches it ─────────
 // "One Settings row per preference" (BAR row 17): [`MAP`] is the ONE table of Settings rows. A row names the Principia
 // keys it edits (`system.<key>`, every one in `prefs::key::ALL`), the tab and row it is painted on, the label it paints
@@ -3252,7 +3355,7 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 31] = {
+pub const MAP: [MapRow; 32] = {
     use crate::prefs::key::*;
     [
         // General (0)
@@ -3293,6 +3396,8 @@ pub const MAP: [MapRow; 31] = {
         mr(&[A11Y_INCREASE_CONTRAST], A11Y_TAB, 1, "Increase contrast", NO_CTRL),
         mr(&[A11Y_CURSOR_SIZE], A11Y_TAB, 2, "Cursor size", NO_CTRL),
         mr(&[A11Y_TEXT_SIZE], A11Y_TAB, 3, "Text size", NO_CTRL),
+        // Privacy (REASK B681): the switch row; the decisions below it are dynamic (`prefs::decisions`), each with a Revoke
+        mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL),
         // The tab column
         mr(&[SETTINGS_TAB], COLUMN, 0, "Settings tabs", NO_CTRL),
     ]
@@ -3466,6 +3571,8 @@ pub fn selftest_map() {
         ":: SETTINGSMAP: keys={} rows={} orphans={} unrowed={} search={} -> {} :: live={} owners_same={}",
         keys, MAP.len(), orphans, unrowed, search, if ok { "PASS" } else { "FAIL" }, live, same as u8
     );
+}
+
 // ── A11YTREE (rmbp-ledger B675; BP-bar-22: "Tab through Settings shows a ≥ 2 px ring at every stop") ──────────────
 // Every kit control draws DESIGN-LANGUAGE §2.7's ring when it holds the keyboard (`draw::focus_ring`, the
 // `focus_ring` token, `DIMS.focus_ring` logical px device-scaled), and the column's pill does (`st.strip && st.kbd`).

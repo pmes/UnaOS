@@ -22,6 +22,7 @@
 | BP-gates-10 | Durable records go to a round directory under `docs/dev/evidence/`; nothing durable lives in scratch; nothing under `/tmp` on the bench. | `docs/dev/LAWS.md` §3 "Nothing durable lives in a round's scratch" | GATE-LEDGER (unanchored excerpt refused, `docs/dev/PLAYBOOK.md:95-96`) |
 | BP-gates-11 | On the rMBP track the gate is the compile legs plus the doc gates; QEMU legs are not run per arc (R78, R113; R114 a one-time exception). The metal boot is the proof. | R78, R113, R114 (`docs/dev/RULINGS.md`) | review |
 | BP-gates-12 | The design is written in the commit body BEFORE the code; the executor compiles what it touched and runs `./arroyo gates` (R106). | R106; `docs/dev/PLAYBOOK.md:32-35` | review |
+| BP-gates-13 | No fn reachable from the `video/` furniture (menubar, dock, crystal, notify, strip, settings, login) calls `smolnet`, `net_fetch`, `net_dns` or `netring3`, save a local read-only accessor on the gate's ALLOW table with its reason (BP-bar-10). | `unaos/scripts/nonet-check.py:29-34` | `gates` row `nonet` (a call walk over `use` aliases and paths; control: a synthetic dock -> helper -> `smolnet` chain) |
 
 ## 3. The host gates (`GATES_SET`, `unaos/arroyo:14279`)
 | row | script | holds |
@@ -41,6 +42,7 @@
 | image-line, knob-parity-orin, knob-parity-pi | `unaos/scripts/knob-parity.sh` | BP-gates-9 |
 | mbench-selftest, specscore | `unaos/scripts/mbench.py`, `unaos/scripts/orin-specscore.py` | the scorers' self-tests |
 | blueprint (added by `dee2d6ed`) | `unaos/scripts/blueprint-check.py` | these sheets: anchors exist, ids unique and stem-named, sheets listed, ≤ 120 lines, no claim words |
+| nonet (B672) | `unaos/scripts/nonet-check.py` | BP-gates-13 |
 
 ## 4. Verbs (`unaos/arroyo` tail `case`)
 `check` · `state` · `gates [--list|--selftest]` · `test` / `test-arm` / `test-fat` / `test-install` / `test-ptr` / `test-splash` / `test-selfhost` (QEMU) · `x86` / `arm` (QEMU GUI) ·

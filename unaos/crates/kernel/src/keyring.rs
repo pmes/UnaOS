@@ -695,3 +695,134 @@ fn no_ring_home() -> Option<String> {
         None => String::from("home-not-unafs"),
     })
 }
+
+// =================================================================================================
+// VOLKEY (rmbp-ledger B684) M1 + M3 — the volume key slot's KERNEL half. TAIL-APPENDED.
+//
+// The slot format, the wraps and the mount gate are the `unafs` crate's (`unafs::keyslot`, unafs-records.md
+// §R2a — ONE implementation, BP-storage-7); the kernel supplies the entropy (`rand::drbg_fill`) and proves the
+// password KEK is SYS_KDF's (the same Argon2id call). Nothing here keeps a key (BP-security-11): `volkey_seal`
+// returns the slot and the recovery words, and the words wipe themselves when the caller drops them.
+//
+// NOT here (VOLKEY's STOP, reported with the exact change): keying the LIVE root at the set-password screen.
+// The kernel mounts the root before anyone can type (USERS.DAT is on it, BP-storage-13), and three mount sites
+// outside this arc's files (`fs/unafs.rs:452` is in it; `install/unafsmirror.rs:149/161` and
+// `arch/aarch64/sdmmc_tegra.rs:2333` are not) would answer `KeyRequired` for a keyed root on the next boot.
+// The pre-boot unlock comes first; until then no code path writes a slot to a volume the kernel boots from.
+// =================================================================================================
+
+/// VOLKEY: a key slot for `password` at `kdf` — a fresh 32-byte data key and recovery key from the kernel DRBG,
+/// wrapped by Argon2id(password) and by the recovery key. The words are shown ONCE by the caller and dropped.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub fn volkey_seal(password: &[u8], kdf: ::unafs::KdfParams) -> Result<(::unafs::KeySlot, ::unafs::RecoveryWords), ::unafs::KeySlotError> {
+    ::unafs::KeySlot::seal(password, kdf, &mut |b: &mut [u8]| {
+        let _ = crate::rand::drbg_fill(b);
+    })
+}
+
+/// How many times `needle` occurs in `hay` (the never-on-disk scan).
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+fn volkey_count(hay: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return 0;
+    }
+    hay.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+/// `tests volkey` (M3): on a RAM volume — key it, then: no key = refused, a wrong password = refused, the
+/// password opens it, the 24 words (and the words cut to four letters) open it, a one-word typo is refused before
+/// any key work; the slot survives a grow; the password KEK equals SYS_KDF's for the slot's salt; and the data
+/// key, the recovery words, their bytes and the password occur 0 times in the volume's bytes (`sends=`). Floor
+/// KDF costs; no secret on the wire — this fixture prints counts and words like `ok` only.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub fn volkey_selftest() {
+    use ::unafs::fs::FileSystemError;
+    use ::unafs::{KdfParams, KeySlotError, MemDevice, UnaFS, Unlock};
+    const PW: &[u8] = b"volkey-fixture-pw";
+    const WRONG: &[u8] = b"volkey-fixture-pX";
+    const WITNESS: &[u8] = b"VOLKEY witness: opened with the key";
+    const FROM: u64 = 512;
+    const TO: u64 = 640;
+    let t0 = crate::arch::ms();
+    let fail = |why: &str| serial_println!(":: VOLKEY: wrapped=0 mount_nokey=none mount_key=none recovery=none sends=0 -> FAIL ({}) ::", why);
+    // ── a RAM volume with a witness file, keyed, then grown (block 0 rewritten: the slot must stay) ──────────
+    let mut fs = match UnaFS::format(MemDevice::with_blocks(FROM), 0) {
+        Ok(f) => f,
+        Err(_) => return fail("format refused"),
+    };
+    let root = fs.superblock.root_inode;
+    let wrote = fs.create_file(root, "w.txt".into()).and_then(|id| fs.write_data(id, 0, WITNESS)).is_ok();
+    let (slot, words) = match volkey_seal(PW, KdfParams::FLOOR) {
+        Ok(x) => x,
+        Err(e) => return fail(match e { KeySlotError::NoMemory => "kdf memory", _ => "seal refused" }),
+    };
+    let salt = *slot.salt();
+    let set = fs.set_key_slot(slot.clone()).is_ok();
+    fs.device.resize_blocks(TO);
+    let grown = fs.grow(TO).is_ok();
+    let bytes = core::mem::take(&mut fs.device).into_bytes();
+    drop(fs);
+    let on_disk = matches!(::unafs::KeySlot::parse(&bytes[..::unafs::BLOCK_SIZE as usize]), Ok(Some(s)) if s == slot);
+    // ── the wrap is SYS_KDF's: the kernel's body and the crate's KEK agree for the slot's salt ─────────────
+    let mut req = alloc::vec![0u8; una_abi::KDF_HDR_LEN + PW.len() + salt.len()];
+    let f = KdfParams::FLOOR;
+    let sys = una_abi::kdf_request(f.m_kib, f.t, f.p, PW, &salt, &mut req).and_then(|n| kdf(&req[..n]).ok());
+    let crate_kek = ::unafs::keyslot::password_kek(PW, &salt, f).ok();
+    let same_kdf = matches!((&sys, &crate_kek), (Some(a), Some(b)) if a == b);
+    if let Some(mut k) = sys { wipe(&mut k); }
+    if let Some(mut k) = crate_kek { wipe(&mut k); }
+    let wrapped = wrote && set && grown && on_disk && same_kdf;
+    // ── no key, a wrong key: refused ────────────────────────────────────────────────────────────────────────
+    let nokey = UnaFS::mount(MemDevice::from_bytes(bytes.clone()));
+    let nokey_ok = matches!(nokey, Err(FileSystemError::KeyRequired));
+    drop(nokey);
+    let wrong = UnaFS::mount_with(MemDevice::from_bytes(bytes.clone()), &Unlock::Password(WRONG));
+    let wrong_ok = matches!(wrong, Err(FileSystemError::KeySlot(KeySlotError::KeyRefused)));
+    drop(wrong);
+    let mount_nokey = if nokey_ok && wrong_ok { "refused" } else if !nokey_ok { "OPENED" } else { "wrong-key-OPENED" };
+    // ── the password opens it, the witness reads back, the volume is the grown size ─────────────────────────
+    let read_back = |m: &mut UnaFS<MemDevice>| m.resolve_path("/w.txt").and_then(|id| m.read_data(id, 0, WITNESS.len() as u64)).is_ok_and(|d| d == WITNESS);
+    let (key_ok, pw_key) = match UnaFS::mount_with(MemDevice::from_bytes(bytes.clone()), &Unlock::Password(PW)) {
+        Ok(mut m) => {
+            let ok = read_back(&mut m) && m.superblock.block_count == TO;
+            (ok, m.key_slot().and_then(|s| s.unwrap(&Unlock::Password(PW)).ok()))
+        }
+        Err(_) => (false, None),
+    };
+    // ── the recovery words open it (whole and cut to four letters); a one-word typo is refused first ───────
+    let mut cut = String::new();
+    for (i, w) in words.as_str().split(' ').enumerate() {
+        if i > 0 { cut.push(' '); }
+        cut.push_str(&w[..w.len().min(4)]);
+    }
+    let mut typo = String::new();
+    for (i, w) in words.as_str().split(' ').enumerate() {
+        if i > 0 { typo.push(' '); }
+        typo.push_str(if i == 5 { if w == "zone" { "able" } else { "zone" } } else { w });
+    }
+    let rc_key = slot.unwrap(&Unlock::Recovery(words.as_str())).ok();
+    let rc_mount = UnaFS::mount_with(MemDevice::from_bytes(bytes.clone()), &Unlock::Recovery(words.as_str())).is_ok_and(|mut m| read_back(&mut m));
+    let rc_cut = slot.unwrap(&Unlock::Recovery(&cut)).is_ok();
+    let rc_typo = matches!(slot.unwrap(&Unlock::Recovery(&typo)), Err(KeySlotError::BadRecovery) | Err(KeySlotError::KeyRefused)); // the checksum catches it (1 in 65536 reaches the tag, which refuses)
+    let same_key = matches!((&pw_key, &rc_key), (Some(a), Some(b)) if a.bytes() == b.bytes());
+    let recovery = rc_mount && rc_cut && rc_typo && same_key;
+    // ── never on the disk: the data key, the words, their bytes, the password ──────────────────────────────
+    let mut entropy = ::unafs::keyslot::parse_recovery(words.as_str()).unwrap_or([0; ::unafs::keyslot::RECOVERY_ENTROPY]);
+    let mut sends = volkey_count(&bytes, PW) + volkey_count(&bytes, words.as_str().as_bytes()) + volkey_count(&bytes, &entropy);
+    if let Some(k) = &pw_key { sends += volkey_count(&bytes, k.bytes()); }
+    wipe(&mut entropy);
+    let (mut cut, mut typo) = (cut.into_bytes(), typo.into_bytes());
+    wipe(&mut cut);
+    wipe(&mut typo);
+    drop((pw_key, rc_key, words));
+    serial_println!(
+        "[volkey] fx kdf=argon2id m={}KiB t={} p={} slot=sector1 sys_kdf={} grow_kept={} typo={} cut4={} ms={}",
+        f.m_kib, f.t, f.p, if same_kdf { "same" } else { "DIFFERS" }, if grown && on_disk { "yes" } else { "NO" },
+        if rc_typo { "refused" } else { "ACCEPTED" }, if rc_cut { "ok" } else { "FAIL" }, crate::arch::ms().saturating_sub(t0)
+    );
+    let pass = wrapped && mount_nokey == "refused" && key_ok && recovery && sends == 0;
+    serial_println!(
+        ":: VOLKEY: wrapped={} mount_nokey={} mount_key={} recovery={} sends={} -> {} ::",
+        wrapped as u8, mount_nokey, if key_ok { "ok" } else { "FAIL" }, if recovery { "ok" } else { "FAIL" }, sends, if pass { "PASS" } else { "FAIL" }
+    );
+}

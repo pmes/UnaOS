@@ -843,7 +843,7 @@ fn stack_sendto_inner(sid: usize, ip: [u8; 4], port: u16, payload: &[u8]) -> Res
             return Err(());
         }
         sock.send_slice(payload, ep).map_err(|_| ())?;
-    }
+    } crate::net_tick::note_send(idle_own(stack, sid)); // IDLENET (B672): one datagram queued (LINE-NEUTRAL append)
     // NETCLOCK: the datagram is queued; one poll now egresses it (or starts ARP). The rest rides the
     // gated polls of `stack_recvfrom` / `service_poll` — no 20k-iteration send pump.
     kick();
@@ -1170,7 +1170,7 @@ pub fn stack_connect(sid: usize, ip: [u8; 4], port: u16) -> ConnectOutcome {
         let mut g = STACK.lock();
         let Some(stack) = g.as_mut() else { return ConnectOutcome::Refused };
         let Some(handle) = tcp_handle(stack, sid) else { return ConnectOutcome::Refused };
-        let local = next_ephemeral();
+        let local = next_ephemeral(); let own = idle_own(stack, sid); // IDLENET (B672): a ring-3 socket's connect is Ring3's; a kernel socket's is its task's starter (LINE-NEUTRAL append)
         let SmolStack { iface, sockets, .. } = stack;
         let sock = sockets.get_mut::<tcp::Socket>(handle);
         if !sock.is_open() {
@@ -1180,7 +1180,7 @@ pub fn stack_connect(sid: usize, ip: [u8; 4], port: u16) -> ConnectOutcome {
             if sock.connect(iface.context(), remote, le).is_err() {
                 return ConnectOutcome::Refused;
             }
-            kick(); // NETCLOCK: the SYN is queued — poll now
+            kick(); crate::net_tick::note_connect(own); // IDLENET (B672): the SYN is the connect, counted once (a re-call while SYN-SENT issues none). NETCLOCK: the SYN is queued — poll now
         }
     }
     // (2) Pump chunked (lock released between chunks) chasing ESTABLISHED.
@@ -1212,7 +1212,7 @@ pub fn stack_send(sid: usize, data: &[u8]) -> Result<usize, bool> {
         }
         match sock.send_slice(data) {
             Ok(0) => return Err(true), // tx ring momentarily full — would block
-            Ok(n) => n,
+            Ok(n) => { crate::net_tick::note_send(idle_own(stack, sid)); n } // IDLENET (B672): one stream write queued
             Err(_) => return Err(false), // send half closed
         }
     };
@@ -2277,4 +2277,14 @@ fn usb_lease_tick() {
     }
     crate::drivers::xhci::usbnet::lease_applied();
     serial_println!("[dhcp] lease applied ip={}.{}.{}.{}/{} client=net smoltcp-dhcp=removed", ip[0], ip[1], ip[2], ip[3], cidr.prefix_len());
+}
+
+/// IDLENET (rmbp-ledger B672): the counting site's own starter for socket `sid` — `Ring3` for a socket a ring-3 row owns,
+/// `None` for a kernel-owned one (`usize::MAX` owner), whose event then goes to its task's open `net_tick::scope` or to
+/// nobody (the bucket `tests idlenet` must read 0).
+fn idle_own(stack: &SmolStack, sid: usize) -> Option<crate::net_tick::Who> {
+    match stack.reg.get(sid).and_then(|s| s.as_ref()) {
+        Some((_, owner, _)) if *owner != usize::MAX => Some(crate::net_tick::Who::Ring3),
+        _ => None,
+    }
 }
