@@ -22,15 +22,16 @@
 | BP-input-10 | The wheel is read from byte 3 of the relative boot report only when the transfer length says it exists; delivery is to the focused window (no consumer scrolls yet). | `unaos/crates/kernel/src/drivers/xhci/mod.rs:5084`; `docs/PRODUCT.md` (Scrolling row) | `[wheel1]` census |
 | BP-input-11 | Pointer and keyboard never falter; a faltering pointer is a fault named on the wire, not a load (R88, R103). | `unaos/crates/kernel/src/hidstall.rs:1-8`; R88 | `[lag] stall … stage=hid …`; `[hid] stall census` |
 | BP-input-12 | Trackpad gain is Principia's `system.trackpad.speed`, applied after the sub-pixel curve; x86 only (the pad hangs off EHCI). | `docs/dev/OS/05_USER_EXPERIENCE/trackpad.md:1-10` | `tests pointerfeel` |
+| BP-input-13 | Every queued event carries a cycle stamp beside it (a per-slot stamp parallel to `EVENT_QUEUE`, not a field of `Event`): the HID report's decode instant (`pal::k2p::decode`, xHCI and EHCI) or, for a push with no fresh decode mark, the push instant; the stamp follows its event through a fold and the DRAGGLIDE swap, and the counted drain (`pop_event`) hands the oldest consumed stamp to the compositor, which records its age at the present (K2P, B671, BP-bar-5). x86 + `wc`. | `unaos/crates/kernel/src/pal.rs:922` `unaos/crates/kernel/src/pal.rs:1262` `unaos/crates/kernel/src/pal.rs:1990` (`pal::k2p`, file tail); `unaos/crates/kernel/src/drivers/xhci/mod.rs:4859`; `unaos/crates/kernel/src/drivers/ehci/mod.rs:14061`; `unaos/crates/kernel/src/video/wm.rs:5214` `unaos/crates/kernel/src/video/wm.rs:5217` | `[input] k2p p50= p99= n=`; `tests k2p` |
 
 ## 3. Seams
-- Decoders may call: `pal::push_event` only. They may not call `wm`, `login` or ring-3 code.
+- Decoders may call: `pal::push_event` only, and `pal::k2p::decode` (the stamp, BP-input-13). They may not call `wm`, `login` or ring-3 code.
 - The router may call: `login::consume_key`, `user_input_enqueue`, `wm` hit-test/focus, `keymap::resolve`.
 - aarch64 carries the same router seam (`unaos/crates/kernel/src/arch/aarch64/syscall.rs:13188`); the arch `syscall.rs` owns the ring, una-abi owns the encoding.
 - Services that hold a lock the input lanes need run bounded (cores.md BP-cores-9, -15): input rides the service core's cadence.
 
 ## 4. Wire
-`[login] key latency ms=` · `[login] key echo comp_ms=` (`unaos/crates/kernel/src/video/login.rs:2951`) · `[lag] click→shown ms= … worst=` · `[lag] stall … stage=hid hid_gap_ms=` · `[hid] stall census … pump_cpu= -> CLEAR` · `[wheel1]` census.
+`[login] key latency ms=` · `[login] key echo comp_ms=` (`unaos/crates/kernel/src/video/login.rs:2951`) · `[lag] click→shown ms= … worst=` · `[lag] stall … stage=hid hid_gap_ms=` · `[hid] stall census … pump_cpu= -> CLEAR` · `[wheel1]` census · `[input] k2p p50= p99= n=` · `[input] drag_age_ms p99=` · `[wc] missed_vblank=` (`unaos/crates/kernel/src/video/wm.rs`, K2P tail).
 
 ## 5. Ruled, unbuilt
 - Scroll consumers: no content offset in `wm`, no scrollbar widget, no rect-scoped blit (`docs/PRODUCT.md`, Scrolling row).

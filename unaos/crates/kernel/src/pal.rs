@@ -919,7 +919,7 @@ impl EventQueue {
                 Event::Mouse { .. } | Event::MouseAbsolute { .. }
             );
         if shape {
-            self.buffer.swap(last, prev);
+            self.buffer.swap(last, prev); #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::on_swap(last, prev); // K2P (B671): the stamps follow their events (file tail). ⚠ LINE-NEUTRAL fold, code before the comment.
         }
         shape
     }
@@ -1259,7 +1259,7 @@ fn push_locked(q: &mut EventQueue, event: Event, lift: LiftHint, coalesce: bool)
         EVQ_ACT_PUSH.fetch_add(1, Relaxed);
     }
     let stored = {
-        let stored = q.push(event);
+        let stored = q.push(event); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if stored { k2p::on_push(q); } // K2P (B671): the slot the event landed in takes the decode stamp (file tail), BEFORE the DRAGGLIDE swap below moves it. ⚠ LINE-NEUTRAL fold, code before the comment.
         // DRAGGLIDE — the adjacency record. The sequence is bumped on EVERY push, stored or not:
         // review defect this closes — with the bump conditional on `stored`, an event the full ring
         // dropped left the push BEFORE it looking adjacent to the push AFTER it, manufacturing
@@ -1987,7 +1987,7 @@ fn pop_event() -> Option<Event> {
         let mut q = EVENT_QUEUE.lock();
         // R0 / rtwit — EVENT_QUEUE max-hold on the DRAIN side (see `push_event`).
         let _evh = crate::rtwit::hold(crate::rtwit::Lock::Evq);
-        q.pop()
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::on_pop(&q); q.pop() // K2P (B671): the consume — the oldest stamp since the last pass is claimed for the compositor (file tail). ⚠ LINE-NEUTRAL fold, code before the comment.
     });
     // APPCLIP — `Event::Action` is excluded HERE for the same reason it is excluded from the push
     // classification, and the two exclusions are one decision: the class is outside `push - drop -
@@ -2389,4 +2389,114 @@ pub fn keyrepeat_selftest() {
         cancelled as u8,
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// =================================================================================================
+// K2P (rmbp-ledger B671, BP-bar-5, BP-input-13) — THE INPUT HALF OF THE INPUT-TO-PHOTON STAMP.
+// =================================================================================================
+//
+// `Event` is a `Copy + Eq` enum matched in hundreds of places, so the stamp does not ride IN it: it
+// rides BESIDE it, in a per-slot cycle stamp parallel to `EVENT_QUEUE`'s ring, written and read under
+// the same ring lock (`push_locked` / `pop_event` / the DRAGGLIDE swap, each a same-line fold). The
+// decoders mark the report's decode instant with [`k2p::decode`]; the first event the report pushes
+// spends it. The compositor (`video::wm::k2p`) takes the oldest consumed stamp at each pass and records
+// its age at the present. x86 + `wc` only (the compositor's build); elsewhere none of this compiles.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod k2p {
+    use super::{Event, EventQueue, QUEUE_SIZE};
+    use core::sync::atomic::{AtomicU64, Ordering::{AcqRel, Relaxed}};
+
+    /// A decode stamp older than this (in us) was not taken in the push's own decode pass: the push
+    /// stamps itself instead. A report's decode-to-push is microseconds.
+    const FRESH_US: u64 = 200;
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU64 = AtomicU64::new(0);
+    /// The cycle stamp of the event in ring slot `i` (0 = none). Written and read under `EVENT_QUEUE`.
+    static SLOT: [AtomicU64; QUEUE_SIZE] = [Z; QUEUE_SIZE];
+    /// The decoder's mark for the report being decoded (0 = spent).
+    static DECODE: AtomicU64 = AtomicU64::new(0);
+    /// The OLDEST event consumed since the last pass began: its stamp and the instant it was consumed.
+    static OLDEST: AtomicU64 = AtomicU64::new(0);
+    static CONS_AT: AtomicU64 = AtomicU64::new(0);
+    /// The stamp of the newest consumed pointer motion — the position the cursor now holds.
+    static NEWEST_PTR: AtomicU64 = AtomicU64::new(0);
+
+    /// The decoder's stamp: called once at the top of a HID report's decode (xHCI, EHCI).
+    #[inline]
+    pub fn decode() {
+        DECODE.store(crate::arch::now_cycles(), Relaxed);
+    }
+
+    /// `push_locked`, after a stored push: stamp the slot the event landed in.
+    pub(super) fn on_push(q: &EventQueue) {
+        let now = crate::arch::now_cycles();
+        let d = DECODE.swap(0, Relaxed);
+        let fresh = d != 0 && now >= d && crate::video::blitter::cycles_to_us(now - d) < FRESH_US;
+        SLOT[(q.head + QUEUE_SIZE - 1) % QUEUE_SIZE].store(if fresh { d } else { now }, Relaxed);
+    }
+
+    /// The DRAGGLIDE reorder: the stamps follow their events.
+    pub(super) fn on_swap(a: usize, b: usize) {
+        let (sa, sb) = (SLOT[a].load(Relaxed), SLOT[b].load(Relaxed));
+        SLOT[a].store(sb, Relaxed);
+        SLOT[b].store(sa, Relaxed);
+    }
+
+    /// `pop_event`, before the pop: the event at the tail is being consumed.
+    pub(super) fn on_pop(q: &EventQueue) {
+        if q.head == q.tail {
+            return;
+        }
+        let s = SLOT[q.tail].swap(0, Relaxed);
+        if s == 0 {
+            return;
+        }
+        consumed(s, &q.buffer[q.tail]);
+    }
+
+    fn consumed(stamp: u64, ev: &Event) {
+        if OLDEST.compare_exchange(0, stamp, AcqRel, Relaxed).is_ok() {
+            CONS_AT.store(crate::arch::now_cycles(), Relaxed);
+        }
+        if matches!(ev, Event::Mouse { .. } | Event::MouseAbsolute { .. }) {
+            NEWEST_PTR.store(stamp, Relaxed);
+        }
+    }
+
+    /// The compositor's pass-begin read: `(oldest stamp, consumed at)`, cleared; `(0, 0)` = no input.
+    pub fn take() -> (u64, u64) {
+        let s = OLDEST.swap(0, AcqRel);
+        if s == 0 {
+            return (0, 0);
+        }
+        (s, CONS_AT.load(Relaxed))
+    }
+
+    /// The stamp of the newest consumed pointer motion (0 = none yet).
+    pub fn newest_ptr() -> u64 {
+        NEWEST_PTR.load(Relaxed)
+    }
+
+    /// `tests k2p`: one zero-motion report through the REAL carriers — decode stamp, `push_locked`,
+    /// the slot stamp, the pop hook — taken back under the same ring lock, and only when the ring is
+    /// empty, so no other consumer can take it and the router never sees it (the cursor does not
+    /// move). Returns its stamp, or 0 when the ring was busy.
+    pub fn fixture_inject() -> u64 {
+        crate::arch::without_interrupts(|| {
+            let mut q = super::EVENT_QUEUE.lock();
+            if q.len() != 0 {
+                return 0;
+            }
+            decode();
+            if !super::push_locked(&mut q, Event::Mouse { x: 0, y: 0 }, super::LiftHint::Unknown, false) {
+                return 0;
+            }
+            let s = SLOT[q.tail].load(Relaxed);
+            on_pop(&q);
+            let _ = q.pop();
+            super::EVQ_POP.fetch_add(1, Relaxed); // UVUG-10: it left the pipeline for good
+            s
+        })
+    }
 }

@@ -4813,7 +4813,7 @@ fn owedtail_emit() {
     );
 }
 
-pub fn composite() { let _lag = crate::video::lag::pass(); if let Some(term) = super::panel_refuse_term() { super::note_panel_write_refused(super::REFUSE_TIER_PASS, term, "wm::composite"); return; } // PANELREFUSE Tier 1 — THE WHOLE PASS DECLINES once the machine is dying. Sited at the TOP OF THE FUNCTION, above the arch split on the two lines below, and that siting is the design's central finding rather than convenience: `composite_pass_half` calls `strip::compose_all` AFTER `composite_inner` returns, and the furniture (dock/menubar/crystal) reaches the glass through its OWN blocking `*WRITER.lock()` without ever consulting `panel_snapshot`. A refusal placed at `panel_snapshot` instead would therefore produce a PARTIAL PAINT — windows suppressed, furniture stamped across the panic backdrop — a screen state no boot has ever produced and no capture in the corpus describes. Refusing above the fork declines `composite_once` -> `composite_pass_half` -> `composite_inner` AND `strip::compose_all` in one place, on both arches: the non-x86 arm below is a bare `composite_once()` with no gate and no decline path of its own, so a check inside the x86 `COMP_GATE` block would leave aarch64 uncovered. It takes NO gate (this is before `COMP_GATE`), holds nothing, clears nothing, and deliberately does NOT set `COMP_PENDING` — nothing is coming to service the damage, and arming a re-drive on a dying machine is a futile wake, not tidiness. Damage stays on the table. LOCKFIX: two atomic loads, no acquire of any kind, so a refused pass cannot leak a hold into a preemption. ⚠ SAME-LINE fold, line-NEUTRAL — `wm.rs` is ~21k lines and a line added here would renumber every panic `Location` below it; the reviewing seat required that cost be CHOSEN, and this is the choice not to pay it. Idiom: `video/fbcon.rs`'s `⚠ SAME-LINE fold` markers.
+pub fn composite() { let _lag = crate::video::lag::pass(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _k2p = k2p::Flush; if let Some(term) = super::panel_refuse_term() { super::note_panel_write_refused(super::REFUSE_TIER_PASS, term, "wm::composite"); return; } // PANELREFUSE Tier 1 — THE WHOLE PASS DECLINES once the machine is dying. Sited at the TOP OF THE FUNCTION, above the arch split on the two lines below, and that siting is the design's central finding rather than convenience: `composite_pass_half` calls `strip::compose_all` AFTER `composite_inner` returns, and the furniture (dock/menubar/crystal) reaches the glass through its OWN blocking `*WRITER.lock()` without ever consulting `panel_snapshot`. A refusal placed at `panel_snapshot` instead would therefore produce a PARTIAL PAINT — windows suppressed, furniture stamped across the panic backdrop — a screen state no boot has ever produced and no capture in the corpus describes. Refusing above the fork declines `composite_once` -> `composite_pass_half` -> `composite_inner` AND `strip::compose_all` in one place, on both arches: the non-x86 arm below is a bare `composite_once()` with no gate and no decline path of its own, so a check inside the x86 `COMP_GATE` block would leave aarch64 uncovered. It takes NO gate (this is before `COMP_GATE`), holds nothing, clears nothing, and deliberately does NOT set `COMP_PENDING` — nothing is coming to service the damage, and arming a re-drive on a dying machine is a futile wake, not tidiness. Damage stays on the table. LOCKFIX: two atomic loads, no acquire of any kind, so a refused pass cannot leak a hold into a preemption. ⚠ SAME-LINE fold, line-NEUTRAL — `wm.rs` is ~21k lines and a line added here would renumber every panic `Location` below it; the reviewing seat required that cost be CHOSEN, and this is the choice not to pay it. Idiom: `video/fbcon.rs`'s `⚠ SAME-LINE fold` markers. K2P (B671): `_k2p` prints the input-to-photon lines after the pass and its gate (file tail), same-line fold, code before the comment.
     #[cfg(not(target_arch = "x86_64"))]
     comp_gate_pass(); // COMPGATE — NO LONGER A BARE PASS. The non-x86 arm now runs under this module's own gate: a second entrant on any core FOLDS (its damage stays on the table and is serviced by the holder's re-run) or WAITS bounded, and can never reach `draw_window`'s direct, unclipped, per-pixel front-buffer path. The gate, its preemption hold, its witnesses and its nested-present fixture are at the FILE TAIL — see the COMPGATE ledger there for the mechanism (`decl_lock=73` is same-core re-entrancy by construction, because `STAGE` is per core) and for why the hold is a switch decline rather than an interrupt mask. ⚠ SAME-LINE fold, line-NEUTRAL, on the identical argument the PANELREFUSE fold above states: `wm.rs` is ~25k lines and a line added here renumbers every panic `Location` below it. x86 is untouched — the arm below is byte-for-byte what it was.
     #[cfg(target_arch = "x86_64")]
@@ -5211,10 +5211,10 @@ fn composite_once() {
         #[cfg(not(feature = "witness"))]
         let _ = cashed;
     }
-    let owed = composite_pass_half();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] let k2p_pass = k2p::begin(); let owed = composite_pass_half(); // K2P (B671): this frame takes its oldest consumed input and judges its vblank deadline (file tail). ⚠ LINE-NEUTRAL fold, code before the comment.
     // x86 (and anything not aarch64): cash inline, in the pass, as the trunk always has.
     #[cfg(not(target_arch = "aarch64"))]
-    cash_tail(owed);
+    cash_tail(owed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::end(k2p_pass); // K2P (B671): the frame is on the glass — its input's age is recorded (file tail). ⚠ LINE-NEUTRAL fold, code before the comment.
     // aarch64: stash and leave — but ONLY when a cash is actually coming, i.e. this pass is a
     // present's, whose epilogue calls `composite_tail_owed` a few instructions from now with IRQs
     // restored. Any other caller cashes inline, exactly as the trunk does. See
@@ -17467,7 +17467,7 @@ pub fn drag_motion(x: i32, y: i32) -> bool {
     // another core giving up inside this window is attributed here — and it is benign in the only
     // direction that matters, because a barrier that is not converging is not converging for
     // whoever asks, and the cancellation's cost is one gesture the operator repeats.
-    let stall0 = {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::drag_latch(); let stall0 = { // K2P (B671): the dragged frame is drawn from the newest consumed pointer sample — latched for `drag_age_ms` (file tail). ⚠ LINE-NEUTRAL fold, code before the comment.
         use core::sync::atomic::Ordering::Relaxed;
         MOVE_DRAIN_GIVEUP.load(Relaxed).wrapping_add(MOVE_DRAIN_SKIPPED.load(Relaxed))
     };
@@ -30586,4 +30586,262 @@ fn app_first_present(owner: u64) {
     }
     let Some((name, len, ms)) = crate::procslot::launch::take((owner - 1) as usize) else { return };
     serial_println!("[app] {} exec->frame ms={}", core::str::from_utf8(&name[..len]).unwrap_or("?"), ms);
+// =================================================================================================
+// K2P (rmbp-ledger B671, BP-bar-5) — THE COMPOSITOR HALF OF THE INPUT-TO-PHOTON STAMP.
+// =================================================================================================
+//
+// `pal::k2p` carries each HID report's decode stamp beside its event through the ring to the consume.
+// Here, per frame: `composite_once` takes the OLDEST consumed stamp at pass begin ([`k2p::begin`]) and
+// records its age at the present ([`k2p::end`], after `cash_tail`). `drag_motion` latches the stamp of
+// the pointer sample the dragged frame is drawn from ([`k2p::drag_latch`]). `composite()`'s guard
+// ([`k2p::Flush`]) prints after the gate, IRQs on:
+//
+//   `[input] k2p p50=<us> p99=<us> n=<n> max=<us> expired=<n>`   every 5 s while input flows
+//   `[input] drag_age_ms p99=<ms> p50=<ms> n=<n>`                 every 5 s while a drag draws
+//   `[wc] missed_vblank=<n> passes=<n> deadline_us=16667`         every 60 s with input passes
+//
+// MISSED VBLANK, defined: a pass that carries input and BEGAN more than one vblank after its oldest input
+// was consumed — a vblank went by with input waiting and no composite begun. Phase-free (no raster is
+// read), so it means the same on QEMU and on the panel. EXPIRED: an age over 1 s is a consumed event no
+// pass drew (the pointer sprite moves without a composite); it is counted, never a percentile sample.
+// Nothing here touches the gate (WCSER); every hook is a cfg-erased same-line fold.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod k2p {
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+
+    /// One vblank at 60 Hz, and the full-frame scanout that follows it (BP-bar-5's bar: p99 <= both).
+    pub const VBLANK_US: u64 = 16_667;
+    pub const SCANOUT_US: u64 = 16_667;
+    /// The QEMU allowance the fixture's verdict states (TCG timing is not the panel's).
+    pub const QEMU_ALLOW: u64 = 2;
+    const EXPIRE_US: u64 = 1_000_000;
+    const SPAN_MS: u64 = 5_000;
+    const MINUTE_MS: u64 = 60_000;
+    const CAP: usize = 512;
+    const DCAP: usize = 256;
+    const FIX_N: usize = 200;
+
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU32 = AtomicU32::new(0);
+    static AGE: [AtomicU32; CAP] = [Z; CAP];
+    static AGE_N: AtomicUsize = AtomicUsize::new(0);
+    static AGE_MAX: AtomicU32 = AtomicU32::new(0);
+    static EXPIRED: AtomicU32 = AtomicU32::new(0);
+    static DRAG: [AtomicU32; DCAP] = [Z; DCAP];
+    static DRAG_N: AtomicUsize = AtomicUsize::new(0);
+    static DRAG_LATCH: AtomicU64 = AtomicU64::new(0);
+    static MISSED_MIN: AtomicU32 = AtomicU32::new(0);
+    static PASSES_MIN: AtomicU32 = AtomicU32::new(0);
+    static MISSED_TOTAL: AtomicU64 = AtomicU64::new(0);
+    static SPAN_T: AtomicU64 = AtomicU64::new(0);
+    static MIN_T: AtomicU64 = AtomicU64::new(0);
+    // `tests k2p`: the fixture's own copy of what the compositor records, for stamps at/after FIX_T0.
+    static FIX_ON: AtomicBool = AtomicBool::new(false);
+    static FIX_T0: AtomicU64 = AtomicU64::new(0);
+    static FIX_AGE: [AtomicU32; FIX_N] = [Z; FIX_N];
+    static FIX_CNT: AtomicUsize = AtomicUsize::new(0);
+    static FIX_DRAG: [AtomicU32; FIX_N] = [Z; FIX_N];
+    static FIX_DCNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn us(dt: u64) -> u64 {
+        crate::video::blitter::cycles_to_us(dt)
+    }
+
+    /// What one pass took at its begin: the oldest consumed stamp and the drag sample (0 = none).
+    pub struct Pass {
+        stamp: u64,
+        drag: u64,
+    }
+
+    /// `composite_once`, before the pass: take this frame's input and judge its vblank deadline.
+    pub fn begin() -> Pass {
+        let (stamp, cons_at) = crate::pal::k2p::take();
+        let drag = DRAG_LATCH.swap(0, AcqRel);
+        if stamp != 0 {
+            PASSES_MIN.fetch_add(1, Relaxed);
+            let t0 = crate::arch::now_cycles();
+            if t0 > cons_at && us(t0 - cons_at) > VBLANK_US {
+                MISSED_MIN.fetch_add(1, Relaxed);
+                MISSED_TOTAL.fetch_add(1, Relaxed);
+            }
+        }
+        Pass { stamp, drag }
+    }
+
+    /// `composite_once`, after `cash_tail`: the frame is on the glass — record its input's age.
+    pub fn end(p: Pass) {
+        if p.stamp == 0 && p.drag == 0 {
+            return;
+        }
+        let now = crate::arch::now_cycles();
+        let fix = FIX_ON.load(Acquire);
+        let t0 = FIX_T0.load(Relaxed);
+        if p.stamp != 0 {
+            let a = us(now.saturating_sub(p.stamp));
+            if a > EXPIRE_US {
+                EXPIRED.fetch_add(1, Relaxed);
+            } else {
+                let a = a as u32;
+                let i = AGE_N.fetch_add(1, Relaxed);
+                if i < CAP {
+                    AGE[i].store(a, Relaxed);
+                }
+                AGE_MAX.fetch_max(a, Relaxed);
+                if fix && p.stamp >= t0 {
+                    let j = FIX_CNT.fetch_add(1, Relaxed);
+                    if j < FIX_N {
+                        FIX_AGE[j].store(a, Relaxed);
+                    }
+                }
+            }
+        }
+        if p.drag != 0 {
+            let a = us(now.saturating_sub(p.drag));
+            if a <= EXPIRE_US {
+                let a = a as u32;
+                let i = DRAG_N.fetch_add(1, Relaxed);
+                if i < DCAP {
+                    DRAG[i].store(a, Relaxed);
+                }
+                if fix && p.drag >= t0 {
+                    let j = FIX_DCNT.fetch_add(1, Relaxed);
+                    if j < FIX_N {
+                        FIX_DRAG[j].store(a, Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `drag_motion`, about to move the window to the cursor: the frame it draws is drawn from the
+    /// newest consumed pointer sample.
+    pub fn drag_latch() {
+        let s = crate::pal::k2p::newest_ptr();
+        if s != 0 {
+            DRAG_LATCH.store(s, Release);
+        }
+    }
+
+    /// `composite()`'s guard: the lines are printed after the pass and its gate, IRQs on.
+    pub struct Flush;
+
+    impl Drop for Flush {
+        fn drop(&mut self) {
+            if x86_64::instructions::interrupts::are_enabled() {
+                flush(crate::arch::ms());
+            }
+        }
+    }
+
+    /// Sort `v` and read its p50 / p99 (nearest rank, lower).
+    pub fn p50_p99(v: &mut [u32]) -> (u32, u32) {
+        if v.is_empty() {
+            return (0, 0);
+        }
+        v.sort_unstable();
+        let n = v.len() - 1;
+        (v[n * 50 / 100], v[n * 99 / 100])
+    }
+
+    fn take(ring: &[AtomicU32], cnt: &AtomicUsize, buf: &mut [u32]) -> (usize, usize) {
+        let n = cnt.swap(0, AcqRel);
+        let k = n.min(ring.len()).min(buf.len());
+        for (i, b) in buf.iter_mut().take(k).enumerate() {
+            *b = ring[i].load(Relaxed);
+        }
+        (n, k)
+    }
+
+    fn ms_d(us: u32) -> (u32, u32) {
+        (us / 1000, (us % 1000) / 100)
+    }
+
+    fn flush(now: u64) {
+        let s = SPAN_T.load(Relaxed);
+        if s == 0 {
+            let _ = SPAN_T.compare_exchange(0, now.max(1), AcqRel, Relaxed);
+        } else if now.wrapping_sub(s) >= SPAN_MS && SPAN_T.compare_exchange(s, now.max(1), AcqRel, Relaxed).is_ok() {
+            let mut buf = [0u32; CAP];
+            let (n, k) = take(&AGE, &AGE_N, &mut buf);
+            let max = AGE_MAX.swap(0, Relaxed);
+            let exp = EXPIRED.swap(0, Relaxed);
+            if n > 0 || exp > 0 {
+                let (p50, p99) = p50_p99(&mut buf[..k]);
+                serial_println!("[input] k2p p50={} p99={} n={} max={} expired={}", p50, p99, n, max, exp);
+            }
+            let mut dbuf = [0u32; DCAP];
+            let (dn, dk) = take(&DRAG, &DRAG_N, &mut dbuf);
+            if dn > 0 {
+                let (p50, p99) = p50_p99(&mut dbuf[..dk]);
+                let ((a, b), (c, d)) = (ms_d(p99), ms_d(p50));
+                serial_println!("[input] drag_age_ms p99={}.{} p50={}.{} n={}", a, b, c, d, dn);
+            }
+        }
+        let m = MIN_T.load(Relaxed);
+        if m == 0 {
+            let _ = MIN_T.compare_exchange(0, now.max(1), AcqRel, Relaxed);
+        } else if now.wrapping_sub(m) >= MINUTE_MS && MIN_T.compare_exchange(m, now.max(1), AcqRel, Relaxed).is_ok() {
+            let passes = PASSES_MIN.swap(0, Relaxed);
+            let missed = MISSED_MIN.swap(0, Relaxed);
+            if passes > 0 {
+                serial_println!("[wc] missed_vblank={} passes={} deadline_us={}", missed, passes, VBLANK_US);
+            }
+        }
+    }
+
+    /// `tests k2p`: 200 synthetic reports through the real carriers and the real compositor record.
+    pub fn selftest() {
+        FIX_CNT.store(0, Relaxed);
+        FIX_DCNT.store(0, Relaxed);
+        FIX_T0.store(crate::arch::now_cycles(), Relaxed);
+        let missed0 = MISSED_TOTAL.load(Relaxed);
+        FIX_ON.store(true, Release);
+        let t_end = crate::arch::ms() + 20_000;
+        let mut busy = 0u32;
+        while FIX_CNT.load(Relaxed) < FIX_N && crate::arch::ms() < t_end {
+            let before = FIX_CNT.load(Relaxed);
+            if crate::pal::k2p::fixture_inject() == 0 {
+                busy += 1;
+                core::hint::spin_loop();
+                continue;
+            }
+            drag_latch();
+            super::composite();
+            // A pass the gate folded is re-run by its holder; give it one frame before the next report.
+            let w = crate::arch::ms() + 17;
+            while FIX_CNT.load(Relaxed) == before && crate::arch::ms() < w {
+                core::hint::spin_loop();
+            }
+        }
+        FIX_ON.store(false, Release);
+        let missed = MISSED_TOTAL.load(Relaxed).wrapping_sub(missed0);
+        let mut a = [0u32; FIX_N];
+        let n = FIX_CNT.load(Relaxed).min(FIX_N);
+        for (i, v) in a.iter_mut().take(n).enumerate() {
+            *v = FIX_AGE[i].load(Relaxed);
+        }
+        let (p50, p99) = p50_p99(&mut a[..n]);
+        let mut d = [0u32; FIX_N];
+        let dn = FIX_DCNT.load(Relaxed).min(FIX_N);
+        for (i, v) in d.iter_mut().take(dn).enumerate() {
+            *v = FIX_DRAG[i].load(Relaxed);
+        }
+        let (_, dp99) = p50_p99(&mut d[..dn]);
+        let bar_us = (VBLANK_US + SCANOUT_US) * QEMU_ALLOW;
+        let bar_drag_us = VBLANK_US * QEMU_ALLOW;
+        let ok = n == FIX_N && dn > 0 && (p99 as u64) <= bar_us && missed == 0 && (dp99 as u64) <= bar_drag_us;
+        let ((da, db), (ba, bb)) = (ms_d(dp99), ms_d(bar_drag_us as u32));
+        serial_println!(
+            ":: K2P: n={} p50_us={} p99_us={} missed={} drag_age_ms={}.{} drag_n={} bar_p99_us={} bar_drag_ms={}.{} allowance={}x busy={} -> {} ::",
+            n, p50, p99, missed, da, db, dn, bar_us, ba, bb, QEMU_ALLOW, busy, if ok { "PASS" } else { "FAIL" }
+        );
+    }
+
+    /// Register `tests k2p` once.
+    pub fn ensure_tests() {
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if !DONE.swap(true, AcqRel) {
+            crate::tests::register("k2p", selftest);
+        }
+    }
 }
