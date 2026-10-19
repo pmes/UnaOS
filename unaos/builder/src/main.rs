@@ -24,13 +24,15 @@ mod vm_image;
 mod kelfsha;
 
 /// KELFHASH (B709): `KELF.SHA`'s slot-A row for the kernel bytes staged as `kernel.elf` — their sha256 (crypto_core,
-/// the builder's own SHA-256), the file, the slot and the loader's `KELF max=` (`kelfsha::kelf_of`). A kernel that is
-/// not an ELF64 stops the build: the loader would refuse it anyway.
+/// the builder's own SHA-256), the file, the slot and the key (STAGEWINDOW B733: the loader's `KELF max=`, the size
+/// and the sha256 of the first 4 KiB, `kelfsha::key_of`), spelled by the one `kelfsha::row` the stage and the
+/// promotion also call. A kernel that is not an ELF64 stops the build: the loader would refuse it anyway.
 fn kelf_sha_record(elf: &[u8]) -> Vec<u8> {
     let sha = crypto_core::sha2::sha256(elf);
-    let kelf = kelfsha::kelf_of(elf).expect("KELFHASH: the staged kernel is not an ELF64 with a PT_LOAD");
+    let head = crypto_core::sha2::sha256(kelfsha::head(elf));
+    let key = kelfsha::key_of(elf, elf.len() as u64, &head).expect("KELFHASH: the staged kernel is not an ELF64 with a PT_LOAD");
     let mut out = [0u8; kelfsha::ROW_MAX];
-    let n = kelfsha::row(&sha, "KERNEL.ELF", kelfsha::SLOT_A, kelf, &mut out);
+    let n = kelfsha::row(&kelfsha::Row::new(sha, kelfsha::SLOT_A, key), &mut out);
     out[..n].to_vec()
 }
 
@@ -2871,9 +2873,9 @@ mod kelfhash_tests {
     use super::kelfsha::{self, Check};
 
     /// A little-endian ELF64 fixture: the 64-byte header, two PT_LOAD program headers (vaddr+memsz 0x2000+0x800 and
-    /// 0x1000+0x400, so `KELF max=` 0x2800) and 64 bytes of "code".
+    /// 0x1000+0x400, so `KELF max=` 0x2800) and 8 KiB of "code" (so the file runs past the 4 KiB `head=`).
     fn fixture() -> Vec<u8> {
-        let mut e = vec![0u8; 64 + 2 * 56 + 64];
+        let mut e = vec![0u8; 64 + 2 * 56 + 8192];
         e[..4].copy_from_slice(b"\x7fELF");
         e[4] = 2; // ELFCLASS64
         e[5] = 1; // little-endian
@@ -2892,38 +2894,65 @@ mod kelfhash_tests {
         e
     }
 
-    /// KELFHASH (B709): the builder's row round-trips through the loader's own check — ok on the bytes it names, a
-    /// flipped code byte is a mismatch, a row for another image is stale, no record and no row are `unverified`.
+    fn key(elf: &[u8]) -> Option<kelfsha::Key> {
+        kelfsha::key_of(elf, elf.len() as u64, &crypto_core::sha2::sha256(kelfsha::head(elf)))
+    }
+
+    fn check(rec: &[u8], slot: u8, elf: &[u8]) -> Check {
+        kelfsha::check(Some(rec), slot, &crypto_core::sha2::sha256(elf), key(elf).as_ref())
+    }
+
+    /// KELFHASH (B709) + STAGEWINDOW (B733): the builder's keyed row round-trips through the loader's own check — ok on
+    /// the bytes it names; a byte flipped past the 4 KiB head (same key) is a mismatch; another build with the SAME
+    /// `kelf=` max but a different head or size is stale; another `kelf=` is stale; no record and no row are
+    /// `unverified`; a pre-STAGEWINDOW row (no `size=`/`head=`) keys on `kelf=` alone.
     #[test]
     fn kelf_sha_row_round_trips_through_the_loaders_check() {
         let elf = fixture();
         assert_eq!(kelfsha::kelf_of(&elf), Some(0x2800));
         let rec = super::kelf_sha_record(&elf);
         let text = String::from_utf8(rec.clone()).unwrap();
-        let sha: String = crypto_core::sha2::sha256(&elf).iter().map(|b| format!("{:02x}", b)).collect();
-        assert_eq!(text, format!("sha256={} file=KERNEL.ELF slot=A kelf=0x2800\n", sha));
+        let hex = |d: [u8; 32]| -> String { d.iter().map(|b| format!("{:02x}", b)).collect() };
+        let sha = hex(crypto_core::sha2::sha256(&elf));
+        let head = hex(crypto_core::sha2::sha256(&elf[..4096]));
+        assert_eq!(text, format!("sha256={} file=KERNEL.ELF slot=A kelf=0x2800 size={} head={}\n", sha, elf.len(), head));
+        assert!(rec.len() <= kelfsha::ROW_MAX);
         let row = kelfsha::find(&rec, kelfsha::SLOT_A).expect("slot A row");
         assert_eq!(row.kelf, 0x2800);
+        assert_eq!(row.size, Some(elf.len() as u64));
         assert_eq!(row.sha, crypto_core::sha2::sha256(&elf));
 
         let sha_ok = crypto_core::sha2::sha256(&elf);
-        assert_eq!(kelfsha::check(Some(rec.as_slice()), kelfsha::SLOT_A, &sha_ok, &elf), Check::Ok);
-        assert_eq!(kelfsha::check(None, kelfsha::SLOT_A, &sha_ok, &elf), Check::NoRecord);
-        assert_eq!(kelfsha::check(Some(rec.as_slice()), kelfsha::SLOT_B, &sha_ok, &elf), Check::NoRow);
+        assert_eq!(check(&rec, kelfsha::SLOT_A, &elf), Check::Ok);
+        assert_eq!(kelfsha::check(None, kelfsha::SLOT_A, &sha_ok, key(&elf).as_ref()), Check::NoRecord);
+        assert_eq!(check(&rec, kelfsha::SLOT_B, &elf), Check::NoRow);
 
         let mut torn = elf.clone();
-        torn[64 + 2 * 56 + 7] ^= 1;
-        let sha_torn = crypto_core::sha2::sha256(&torn);
-        assert_eq!(kelfsha::check(Some(rec.as_slice()), kelfsha::SLOT_A, &sha_torn, &torn), Check::Bad);
+        torn[6000] ^= 1;
+        assert_eq!(check(&rec, kelfsha::SLOT_A, &torn), Check::Bad, "a tear past the head with the size intact is a mismatch");
         let mut zeroed = elf.clone();
         zeroed[..64].fill(0);
-        let sha_zero = crypto_core::sha2::sha256(&zeroed);
-        assert_eq!(kelfsha::check(Some(rec.as_slice()), kelfsha::SLOT_A, &sha_zero, &zeroed), Check::Bad, "unparseable bytes are a mismatch");
+        assert_eq!(check(&rec, kelfsha::SLOT_A, &zeroed), Check::Bad, "unparseable bytes are a mismatch");
 
+        let mut same_kelf = elf.clone();
+        same_kelf[64 + 2 * 56 + 7] ^= 1; // another build, one `kelf=` max, one size, another head
+        assert_eq!(kelfsha::kelf_of(&same_kelf), Some(0x2800));
+        assert_eq!(check(&rec, kelfsha::SLOT_A, &same_kelf), Check::Stale);
+        let mut longer = elf.clone();
+        longer.push(0); // one `kelf=` max, one head, another size
+        assert_eq!(check(&rec, kelfsha::SLOT_A, &longer), Check::Stale);
         let mut other = elf.clone();
         other[64 + 0x28..64 + 0x30].copy_from_slice(&0x900u64.to_le_bytes()); // another build: KELF max 0x2900
-        let sha_other = crypto_core::sha2::sha256(&other);
-        assert_eq!(kelfsha::check(Some(rec.as_slice()), kelfsha::SLOT_A, &sha_other, &other), Check::Stale);
-        println!("KELFHASH builder: row={} ok=1 torn=mismatch other=stale -> PASS", text.trim_end());
+        assert_eq!(check(&rec, kelfsha::SLOT_A, &other), Check::Stale);
+
+        // A row written before STAGEWINDOW keys on `kelf=` alone (the old rule).
+        let legacy = format!("sha256={} file=KERNEL.ELF slot=A kelf=0x2800\n", sha).into_bytes();
+        assert_eq!(check(&legacy, kelfsha::SLOT_A, &elf), Check::Ok);
+        assert_eq!(check(&legacy, kelfsha::SLOT_A, &same_kelf), Check::Bad);
+        assert_eq!(check(&legacy, kelfsha::SLOT_A, &other), Check::Stale);
+        // KELF.SHA.NEW, when present, is the record.
+        assert_eq!(kelfsha::record(Some(&legacy), Some(&rec)), Some(rec.as_slice()));
+        assert_eq!(kelfsha::record(Some(&legacy), None), Some(legacy.as_slice()));
+        println!("KELFHASH builder: row={} ok=1 torn=mismatch same_kelf=stale other=stale legacy=kelf -> PASS", text.trim_end());
     }
 }

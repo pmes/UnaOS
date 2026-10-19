@@ -1676,11 +1676,19 @@ mod kelfcheck {
     use unaos_boot_info::{KelfVerdict, KELF_HASH_OK, KELF_HASH_UNVERIFIED, KELF_SLOT_NAMES, KELF_VERDICT_MAGIC};
 
     const RECORD: &CStr16 = cstr16!("KELF.SHA");
+    /// STAGEWINDOW (B733): `kelfsha::NEXT` — the promotion's next record, present only between its write (before the
+    /// kernel renames) and its rename over `KELF.SHA` (after them).
+    const NEXT: &CStr16 = cstr16!("KELF.SHA.NEW");
 
-    /// `KELF.SHA` (at most `kelfsha::MAX` bytes); `None` when absent or unreadable.
-    fn read_record(root: &mut Directory, buf: &mut [u8; kelfsha::MAX]) -> Option<usize> {
-        let mut f = root.open(RECORD, FileMode::Read, FileAttribute::empty()).ok()?.into_regular_file()?;
+    /// One record file (at most `kelfsha::MAX` bytes); `None` when absent or unreadable.
+    fn read_record(root: &mut Directory, name: &CStr16, buf: &mut [u8; kelfsha::MAX]) -> Option<usize> {
+        let mut f = root.open(name, FileMode::Read, FileAttribute::empty()).ok()?.into_regular_file()?;
         f.read(buf).ok()
+    }
+
+    /// STAGEWINDOW: the bytes' key (`kelf=`, `size=`, `head=` — the sha256 of the first 4 KiB).
+    fn key(buf: &[u8]) -> Option<kelfsha::Key> {
+        kelfsha::key_of(buf, buf.len() as u64, &sha2::sha256(kelfsha::head(buf)))
     }
 
     /// Read a whole slot into fresh LOADER_DATA pages; `None` when the file is absent or the read fails.
@@ -1723,11 +1731,17 @@ mod kelfcheck {
     /// (the same buffer, or the other slot's) and the verdict for the kernel; never returns when both slots are bad.
     pub fn verify<'a>(root: &mut Directory, buf: &'a mut [u8]) -> (&'a mut [u8], KelfVerdict) {
         let mut rb = [0u8; kelfsha::MAX];
-        let rn = read_record(root, &mut rb);
-        let rec = rn.map(|n| &rb[..n]);
+        let rn = read_record(root, RECORD, &mut rb);
+        // STAGEWINDOW (B733): a KELF.SHA.NEW means the promotion got past its record write — it IS the record.
+        let mut xb = [0u8; kelfsha::MAX];
+        let xn = read_record(root, NEXT, &mut xb);
+        if xn.is_some() {
+            log::info!("[loader] kelf record=KELF.SHA.NEW (a promotion past its record write; KELF.SHA {})", if rn.is_some() { "beside" } else { "absent" });
+        }
+        let rec = kelfsha::record(rn.map(|n| &rb[..n]), xn.map(|n| &xb[..n]));
         let first = slots::opened() & 1;
         let sha = sha2::sha256(buf);
-        let c = kelfsha::check(rec, if first == 0 { kelfsha::SLOT_A } else { kelfsha::SLOT_B }, &sha, buf);
+        let c = kelfsha::check(rec, if first == 0 { kelfsha::SLOT_A } else { kelfsha::SLOT_B }, &sha, key(buf).as_ref());
         say(first, c, &sha);
         if c != Check::Bad {
             return (buf, verdict(first, c, sha, 0));
@@ -1737,7 +1751,7 @@ mod kelfcheck {
         log::info!("[loader] kelf slot={} mismatch: trying slot={}", KELF_SLOT_NAMES[first as usize], KELF_SLOT_NAMES[other as usize]);
         if let Some(nb) = read_slot(root, other) {
             let sha2v = sha2::sha256(nb);
-            let c2 = kelfsha::check(rec, if other == 0 { kelfsha::SLOT_A } else { kelfsha::SLOT_B }, &sha2v, nb);
+            let c2 = kelfsha::check(rec, if other == 0 { kelfsha::SLOT_A } else { kelfsha::SLOT_B }, &sha2v, key(nb).as_ref());
             if c2 == Check::Bad {
                 say(other, c2, &sha2v);
             } else {
