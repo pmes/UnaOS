@@ -603,7 +603,7 @@ refs/heads/exec-rmbp-kelfstage     7d549210 FOLDED-BY-HAND (this commit) 2026-10
 refs/heads/exec-rmbp-softydots     b71c7fa8 IN-FLIGHT cloud wave36 SOFTYDOTS
 refs/heads/exec-rmbp-raiseverb     d5cbfcf4 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-net6grant     86048eb9 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-uacmic        b71c7fa8 IN-FLIGHT cloud wave36 UACMIC
+refs/heads/exec-rmbp-uacmic        fad9ba46 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-rawcolor      b71c7fa8 IN-FLIGHT cloud wave36 RAWCOLOR
 refs/heads/exec-rmbp-hwreport      b71c7fa8 IN-FLIGHT cloud wave36 HWREPORT
 refs/heads/exec-rmbp-updateui      16ffa390 FOLDED-BY-HAND (this commit) 2026-10-19
@@ -620,3 +620,4 @@ refs/heads/exec-rmbp-oneinstance  bfc63a86 IN-FLIGHT cloud wave36 ONEINSTANCE (B
 refs/heads/exec-rmbp-crawlc       394e9c16 IN-FLIGHT cloud wave36 CRAWLC (the drivers/audio/loader crawl fixes)
 refs/heads/exec-rmbp-pinchzoom    996f1f6f IN-FLIGHT cloud wave36 PINCHZOOM (B735)
 refs/heads/exec-rmbp-crawla       bc6f934b IN-FLIGHT cloud wave36 CRAWLA (the video/settings/prefs crawl fixes)
+refs/heads/exec-rmbp-micring3     2e8a3cd1 IN-FLIGHT cloud wave36 MICRING3 (B736)
