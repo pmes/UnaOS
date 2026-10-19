@@ -460,7 +460,7 @@ pub fn request_open() {
 pub fn service() {
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     { let _s = super::loginrender::stamp(super::loginrender::W_S_LAUNCHER); super::launcher::service(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::appswitch::service(); } /* APPSWITCH (B428): the switcher's pass. KVMLAT2 (B579): each part of this fn is a nested `loginrender` stamp */ // LAUNCHER (B417): the launcher's pass (snapshot, ranking, picks, the recency file) — off the input router
-    let av = { let _s = super::loginrender::stamp(super::loginrender::W_S_ASSOC); crate::fs::assoc::view_service() }; if av && is_open() && cur_tab() == FT_TAB { repaint(); } // FILETYPES (B423): the registry's rows / a preferred-app change, applied off the click path
+    #[cfg(all(target_arch = "aarch64", feature = "login"))] super::lock::service(); /* crawl A 14: AUTOLOCK's pass on aarch64 desktop_firmware (x86 runs it from `login::submit_drain`) */ let av = { let _s = super::loginrender::stamp(super::loginrender::W_S_ASSOC); crate::fs::assoc::view_service() }; if av && is_open() && cur_tab() == FT_TAB { repaint(); } // FILETYPES (B423): the registry's rows / a preferred-app change, applied off the click path
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))] { let _s = super::loginrender::stamp(super::loginrender::W_S_NAMEINDEX); crate::fs::nameindex::service(); } // NAMEINDEX (B432): the login task's chunked name-index build (idle: one load)
     { let _s = super::loginrender::stamp(super::loginrender::W_S_PREFS); crate::prefs::service(); } { let _s = super::loginrender::stamp(super::loginrender::W_S_LOGINITEMS); super::loginitems::service(); } { let _s = super::loginrender::stamp(super::loginrender::W_S_FILES); super::settingsfiles::service(); } { let _s = super::loginrender::stamp(super::loginrender::W_S_APPEARANCE); super::appearance::service(); super::look::service(); } // SOFTY (B629): the look's pass (the login's load, PrefChanged, the Settings choice, the Start menu's hover) rides the appearance stamp. PREFSUI (R91): the session's login items — read, saved, launched after the desktop
     // BRIGHTFLOOR M2: the level loaded at the previous pass's login is applied HERE, one pass later.
@@ -3071,9 +3071,9 @@ fn press_filetypes(row: usize, cx: usize) {
 // router). Wire: `[settings] accessibility.<key>=<v> applied=<0|1>`, `[settings] accessibility loaded …`.
 // A11YFILTERS (rmbp-ledger B705): rows 4-5 — `cvd` (enum none / protan / deutan / tritan / grayscale, a segmented
 // control) and `invert` (bool, a switch), applied to `blitter::a11yfilter`'s latch, which every writer to the scanout
-// reads at its copy (BP-video-20); the help text moves to rows 6-7. The filter's cost line,
+// reads at its copy (BP-video-25); ZOOM (B713) rows 6-7, PERFHUD (B710) row 8, the help text row 9. The filter's cost line,
 // `[a11y] filter=<mode> pass_us=<n> motion=<full|reduced> presents=<n> px=<n> why=<load|change|tick>`, is printed by
-// [`a11y_cost_line`] at the login's load, on every change of rows 0 / 4 / 5, and every ten seconds while a filter is on.
+// [`a11y_cost_line`] at the login's load, on every stored change of row 0 or rows 4..=8, and every ten seconds while a filter is on.
 
 use super::blitter::a11yfilter as af;
 
@@ -3096,7 +3096,7 @@ static A11Y_REDUCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 static A11Y_CONTRAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static A11Y_CURSOR_Q: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(A11Y_CURSOR_MIN_Q);
 static A11Y_TEXT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert, 6 zoom, 7 zoom follow).
+/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert, 6 zoom, 7 zoom follow, 8 show performance).
 static A11Y_PERSIST: AtomicU32 = AtomicU32::new(0);
 /// ZOOM (B713): the magnifier's factor as stored (0 off, 2, 3, 4) and what it follows (0 the pointer, 1 the focus) —
 /// the rows' latch; the lens (`video/zoom.rs`, x86 `wc`) is handed both by [`zoom_apply`].
@@ -3179,14 +3179,14 @@ fn a11y_load(via: &str) {
     let inv = flag(key::A11Y_INVERT).unwrap_or(false); let _ = super::perfhud::latch(flag(key::A11Y_SHOW_PERF).unwrap_or(false), via); // PERFHUD (B710)
     let (rm0, ic0, cq0, ts0) = (A11Y_REDUCE.swap(rm, Ordering::Relaxed), A11Y_CONTRAST.swap(ic, Ordering::Relaxed), A11Y_CURSOR_Q.swap(cq, Ordering::Relaxed), A11Y_TEXT.swap(ts, Ordering::Relaxed));
     let (cvd0, inv0) = (af::mode(), af::invert());
-    af::set(cvd, inv);
+    af::set(cvd, inv); if cvd0 != cvd || inv0 != inv { a11y_filter_moved(); } // crawl A 6: the whole glass takes the new filter (BP-video-25)
     let moved = (rm0 != rm) as u8 + (ic0 != ic) as u8 + (cq0 != cq) as u8 + (ts0 != ts) as u8 + (cvd0 != cvd) as u8 + (inv0 != inv) as u8;
     if via != "login" && ts0 != ts { A11Y_PERSIST.fetch_or(1 << 3, Ordering::AcqRel); }
     let zm = crate::prefs_client::sys_int(key::A11Y_ZOOM, 0, 4).map_or(0, |v| a11y_zoom_of_seg(a11y_zoom_seg(v as u8))); // ZOOM (B713)
     let zf = text(key::A11Y_ZOOM_FOLLOW).and_then(|s| A11Y_FOLLOW_NAMES.iter().position(|n| *n == s)).unwrap_or(0) as u8;
-    A11Y_ZOOM.store(zm, Ordering::Relaxed);
-    A11Y_FOLLOW.store(zf, Ordering::Relaxed);
-    zoom_apply();
+    let zoom_owed = A11Y_PERSIST.load(Ordering::Acquire) & (3 << 6) != 0; if !zoom_owed { A11Y_ZOOM.store(zm, Ordering::Relaxed); } // crawl A 15: a chord's or a press's zoom write still owed is newer than the store, so the re-read leaves the lens alone
+    if !zoom_owed { A11Y_FOLLOW.store(zf, Ordering::Relaxed); }
+    if !zoom_owed { zoom_apply(); }
     if via == "login" || moved > 0 {
         serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} cvd={} invert={} moved={} via={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], af::NAMES[cvd], inv as u8, moved, via);
         a11y_cost_line(if via == "login" { "load" } else { "change" });
@@ -3209,7 +3209,7 @@ static A11Y_COST_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// The periodic cost line's interval while a filter is on (ms).
 const A11Y_COST_MS: u64 = 10_000;
 
-/// Set row `row` (0 / 1 toggles = `val != 0`; 2 the cursor size in quarters; 3 the text step), apply it to the latch
+/// Set row `row` (0 / 1 / 5 / 8 switches = `val != 0`; 2 the cursor size in quarters; 3 the text step; 4 the cvd mode; 6 the zoom factor; 7 the follow), apply it to the latch
 /// the glass reads, and when `store`: print the change and latch the store write. Repaints.
 fn a11y_set(row: usize, val: usize, store: bool) {
     let (name, vtxt, applied) = match row {
@@ -3217,11 +3217,11 @@ fn a11y_set(row: usize, val: usize, store: bool) {
         1 => { A11Y_CONTRAST.store(val != 0, Ordering::Relaxed); let _ = super::theme::set_contrast(val != 0); /* CONTRAST (B664): the theme takes the set and bumps its epoch, so chrome, menus and the generated wallpaper redraw as an accent change does. ⚠ LINE-NEUTRAL append. */ ("increase_contrast", alloc::format!("{}", (val != 0) as u8), true) }
         2 => { let q = (val.min(255) as u8).clamp(A11Y_CURSOR_MIN_Q, A11Y_CURSOR_MAX_Q); A11Y_CURSOR_Q.store(q, Ordering::Relaxed); ("cursor_size", alloc::format!("x{}", a11y_cursor_str(q)), super::cursor::armed()) }
         3 => { let s = val.min(A11Y_TEXT_NAMES.len() - 1); A11Y_TEXT.store(s as u8, Ordering::Relaxed); ("text_size", alloc::format!("{} ({} px)", A11Y_TEXT_NAMES[s], A11Y_TEXT_PX[s]), true) }
-        4 => { let m = val.min(af::MODES - 1); af::set(m, af::invert()); ("cvd", String::from(af::NAMES[m]), true) }
-        5 => { af::set(af::mode(), val != 0); ("invert", alloc::format!("{}", (val != 0) as u8), true) }
+        4 => { let m = val.min(af::MODES - 1); if m != af::mode() { af::set(m, af::invert()); a11y_filter_moved(); } ("cvd", String::from(af::NAMES[m]), true) }
+        5 => { if (val != 0) != af::invert() { af::set(af::mode(), val != 0); a11y_filter_moved(); } ("invert", alloc::format!("{}", (val != 0) as u8), true) }
         6 => { let z = a11y_zoom_of_seg(a11y_zoom_seg(val.min(4) as u8)); A11Y_ZOOM.store(z, Ordering::Relaxed); zoom_apply(); ("zoom", alloc::format!("{}", z), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // ZOOM (B713)
         7 => { let f = val.min(A11Y_FOLLOW_NAMES.len() - 1); A11Y_FOLLOW.store(f as u8, Ordering::Relaxed); zoom_apply(); ("zoom_follow", alloc::format!("{}", A11Y_FOLLOW_NAMES[f]), cfg!(all(target_arch = "x86_64", feature = "wc"))) }
-        8 => { let _ = super::perfhud::set_visible(val != 0, "settings"); ("show_performance", alloc::format!("{}", (val != 0) as u8), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // PERFHUD (B710): applied where the compositor paints it
+        8 => { let _ = super::perfhud::apply(val != 0, "settings", false); /* crawl A 24: the store write is this row's bit 8, not perfhud's OWED too */ ("show_performance", alloc::format!("{}", (val != 0) as u8), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // PERFHUD (B710): applied where the compositor paints it
         _ => return,
     };
     if store {
@@ -3242,12 +3242,9 @@ fn a11y_service() {
             a11y_cost_line("tick");
         }
     }
-    if A11Y_DIRTY.swap(false, Ordering::AcqRel) && LOAD_DONE.load(Ordering::Acquire) {
-        a11y_load("prefchanged");
-        if is_open() && cur_tab() == A11Y_TAB { repaint(); }
-    }
     // ZOOM (B713): the lens's own pass (engage / disengage off the input band, owed presents, the `[zoom]` line), then
-    // a chord's step taken into the row's latch and stored like a press — only once the login's load has run.
+    // a chord's step taken into the row's latch and stored like a press — only once the login's load has run. crawl A 15:
+    // BEFORE the PrefChanged re-read below, so a reload in the same pass cannot reset the lens to the stored value first.
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     {
         super::zoom::service();
@@ -3260,6 +3257,10 @@ fn a11y_service() {
                 if is_open() && cur_tab() == A11Y_TAB { repaint(); }
             }
         }
+    }
+    if A11Y_DIRTY.swap(false, Ordering::AcqRel) && LOAD_DONE.load(Ordering::Acquire) {
+        a11y_load("prefchanged");
+        if is_open() && cur_tab() == A11Y_TAB { repaint(); }
     }
     let owed = A11Y_PERSIST.swap(0, Ordering::AcqRel) | if super::perfhud::take_owed() { 1 << 8 } else { 0 }; // PERFHUD (B710): the chord's toggle is written back here too (row 8 at the fold)
     if owed == 0 { return; }
@@ -3316,8 +3317,7 @@ fn paint_a11y(st: &mut State) {
     txt(st, LABEL_X, 8, "Show performance");
     tog(st, 8, TOG_X, hud, false);
     txt2(st, TRACK_X, 8, if hud { "Frame times, latency and memory, top right" } else { "Off (Win+F12 toggles it)" });
-    txt2(st, LABEL_X, 9, "Reduce motion makes every slide a cut; cursor size scales the pointer's blocks (to x4 at 1:1).");
-    txt2(st, LABEL_X, 10, "Text size sets the UI font size; the colour filter and invert cover the whole glass; zoom magnifies it around the pointer or the focus.");
+    txt2(st, LABEL_X, 9, "Zoom magnifies around the pointer or focus; the colour filter and invert cover the whole glass."); // crawl A 3: ROWS = 10, so row 9 is the last painted row (row 10 clipped at WIN_H)
 }
 
 /// A11YFILTERS (B705): what row 4's value column says per mode (the segments name the cone each filter simulates).
@@ -3390,7 +3390,7 @@ pub fn selftest_a11y() {
     );
 }
 
-/// `tests a11yfilters` (A11YFILTERS, rmbp-ledger B705; BP-video-20): (1) each of the five `cvd` modes, and invert,
+/// `tests a11yfilters` (A11YFILTERS, rmbp-ledger B705; BP-video-25): (1) each of the five `cvd` modes, and invert,
 /// SET on the live latch, then three probe pixels copied by the CPU blitter's `CopyFilter` (the window present's op)
 /// from an unfiltered RAM row into a RAM surface and READ BACK — each within 1 per channel of the reference computed
 /// from Machado 2009's published decimals in f64 (`a11yfilter::reference`), and equal to the solid-colour path
@@ -3660,12 +3660,12 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 46] = {
+pub const MAP: [MapRow; 45] = {
     use crate::prefs::key::*;
     [
         // General (0)
         mr(&[VOLUME], 0, 0, "Volume", 1),
-        mr(&[MUTE], 0, 1, "Mute", 2),
+        mr(&[MUTE, AUDIO_OUTPUT], 0, 1, "Mute", 2), // UAC1 (B706): the output picker shares the Mute row
         mr(&[POINTER], 0, 2, "Pointer", NO_CTRL),
         mr(&[WALLPAPER], 0, 3, "Wallpaper", 5),
         mr(&[DOCK_POSITION], 0, 6, "Dock position", NO_CTRL),
@@ -3715,7 +3715,7 @@ pub const MAP: [MapRow; 46] = {
         // Keyboard (KEYMAPS B704): the layout, the Compose tap
         mr(&[KBD_LAYOUT], KB_TAB, 0, "Layout", NO_CTRL),
         mr(&[KBD_COMPOSE], KB_TAB, 1, "Compose key", NO_CTRL),
-        mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL), mr(&[LOCK_AFTER_IDLE_MIN], SEC_TAB, 0, SEC_ROW_NAMES[0], NO_CTRL), mr(&[LOCK_ON_LID], SEC_TAB, 1, SEC_ROW_NAMES[1], NO_CTRL), mr(&[LOCK_ON_SLEEP], SEC_TAB, 2, SEC_ROW_NAMES[2], NO_CTRL), // Security (AUTOLOCK B712): one row per key. LINE-NEUTRAL fold
+        mr(&[LOCK_AFTER_IDLE_MIN], SEC_TAB, 0, SEC_ROW_NAMES[0], NO_CTRL), mr(&[LOCK_ON_LID], SEC_TAB, 1, SEC_ROW_NAMES[1], NO_CTRL), mr(&[LOCK_ON_SLEEP], SEC_TAB, 2, SEC_ROW_NAMES[2], NO_CTRL), // Security (AUTOLOCK B712): one row per key. LINE-NEUTRAL fold
         // The tab column
         mr(&[SETTINGS_TAB], COLUMN, 0, "Settings tabs", NO_CTRL),
     ]
@@ -4429,4 +4429,14 @@ pub(crate) mod sysimg {
             super::repaint();
         }
     }
+}
+
+/// crawl A 6 (BP-video-25) — TAIL-APPENDED. The colour filter moved: every scanout writer filters at its copy, so
+/// everything already on the glass is in the OLD colours until it is copied again — bump the theme epoch (every strip
+/// re-seals, `strip::seal`), damage every window and ask the desktop layer for its full present, as `set_contrast`'s
+/// epoch bump and the lock's wipe do.
+fn a11y_filter_moved() {
+    super::theme::bump_epoch();
+    let _ = wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+    super::screen::request_full_present();
 }

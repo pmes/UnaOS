@@ -832,7 +832,7 @@ fn pass(now: u64) {
     if let Some(n) = sound {
         let _ = super::notifypane::sound_for(n.app(), headless); // NOTIFYPANE (B435): one alert sound per pass
     }
-    // the press router's requests
+    let mut later: Option<Note> = None; // crawl A 25: an action runs after ST is dropped (undo's disk I/O, Quarry's MODEL, repaints). The press router's requests
     if act != 0 || dis != 0 {
         for i in 0..STACK_MAX {
             let Some(c) = st.cards[i] else { continue };
@@ -840,7 +840,7 @@ fn pass(now: u64) {
                 let n = close_card(&mut st, i, "action");
                 restack(&mut st, pw);
                 if let Some(n) = n {
-                    run_action(&n);
+                    later = Some(n);
                 }
                 break;
             }
@@ -866,7 +866,7 @@ fn pass(now: u64) {
             recount(&st.ring);
             let n = st.ring[k];
             center_close(&mut st, "action");
-            run_action(&n);
+            later = Some(n);
         }
     }
     match creq {
@@ -932,7 +932,7 @@ fn pass(now: u64) {
     }
     promote(&mut st, pw, now); // TOASTCAP (B674): a freed slot (time, click, action, a closed Center) takes the oldest waiting card
     craft_hover(&st, hot); // MENUSCRAFT (B642): the toast's hover x, repainted on the edge
-    drop(st);
+    drop(st); if let Some(n) = later { run_action(&n); }
     if UNREAD.load(Ordering::Relaxed) != unread0 && !headless {
         wm::composite(); // the bell's badge is bar chrome: a collected notification still repaints the bar
     }

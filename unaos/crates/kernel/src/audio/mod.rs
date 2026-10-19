@@ -27,7 +27,7 @@ pub enum Sink {
 }
 
 /// Principia key (namespace `system`): `"hda"` or `"usb"`.
-pub const PREF_KEY: &str = "audio.output";
+pub const PREF_KEY: &str = crate::prefs::key::AUDIO_OUTPUT;
 
 static USB_PRESENT: AtomicBool = AtomicBool::new(false);
 static USB_ID: AtomicU32 = AtomicU32::new(0);

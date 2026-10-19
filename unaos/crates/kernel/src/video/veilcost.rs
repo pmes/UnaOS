@@ -52,7 +52,7 @@ fn ns(dt: u64) -> u32 {
 pub fn measure() -> Option<(u32, u32)> {
     let back = crate::video::wm::desktop::live_back()?;
     let (pw, ph) = (back.w, back.h);
-    let bar_h = crate::ui::px(28).min(ph / 8).max(1);
+    let (bx, by, bw, bar_h) = crate::video::menubar::geometry(pw, ph).unwrap_or((0, 0, pw, crate::ui::px(28).min(ph / 8).max(1))); // crawl A 5: the LIVE bar's rect (BAR_H = TITLE_HEIGHT), so the VeilKey is the compose's and the sample times the cached row
     if pw == 0 {
         return None;
     }
@@ -67,7 +67,7 @@ pub fn measure() -> Option<(u32, u32)> {
     let out = &mut g[..pw];
     let t0 = crate::arch::now_cycles();
     for j in 0..bar_h {
-        crate::video::wm::desktop::bar_row_live(out, 0, 0, pw, bar_h, j, Some(&back)); // the fold: STAGEVERB's cached row, the live path
+        crate::video::wm::desktop::bar_row_live(out, bx, by, bw.min(pw), bar_h, j, Some(&back)); // the fold: STAGEVERB's cached row, the live path
         core::hint::black_box(&mut *out);
     }
     let t1 = crate::arch::now_cycles();

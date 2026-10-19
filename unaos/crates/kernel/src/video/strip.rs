@@ -425,7 +425,7 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
             let c = s.log[i];
             if c != mc {
                 mc = c;
-                mr = fb.encode4(super::blitter::a11yfilter::color(c)).unwrap_or(0); // A11YFILTERS (B705): the logical colour filtered once per memo miss, at the copy (BP-video-20)
+                mr = fb.encode4(super::blitter::a11yfilter::color(c)).unwrap_or(0); // A11YFILTERS (B705): the logical colour filtered once per memo miss, at the copy (BP-video-25)
             }
             s.raw[i] = mr;
         }
@@ -713,7 +713,7 @@ pub fn compose_all() -> bool {
         let b = if super::menubar::enabled() { false } else { super::menubar::compose() }; // OFF: its own one-shot erase
         return a | b;
     }
-    let a = super::dock::compose();
+    #[cfg(feature = "login")] if super::lock::veiled() { let a = super::dock::vacate_off(); let b = super::menubar::compose(); bar_rollup_tick(); return a | b; } let a = super::dock::compose(); // crawl A 13: under the session lock (BP-video-28) the dock is vacated and no dropdown composes; the bar paints its clock only (menubar's model fold)
     let b = super::menubar::compose();
     // CRYSTAL — the SHARD menu's dropdown is a TRANSIENT surface, not a registered strip tenant (it
     // takes no occlusion slot), so it is not in `TENANTS`/`rects`; but its per-pass compose belongs

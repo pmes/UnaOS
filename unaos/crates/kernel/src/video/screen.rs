@@ -1384,7 +1384,7 @@ impl Screen {
     /// CURSOR-9's colour-guard residual is therefore mended sooner than before, not later.
     /// `TOUCHED_SINCE_DRAW` is untouched: a present landing under a live sprite still arms the
     /// repair through `note_present_over_sprite`, and it now has a live sprite to arm it for.
-    pub fn flush(&mut self) { if !self.direct && super::wm::wp_take_stale() { self.back.fill_screen(super::wm::DESKTOP_BG); super::wm::wp_paint(&self.back); self.mark_full(); } // WALLPAPER — live reload / late-mounted volume: repaint the desktop layer once
+    pub fn flush(&mut self) { if !self.direct && super::wm::wp_take_stale() { self.back.fill_screen(super::wm::DESKTOP_BG); super::wm::wp_paint(&self.back); self.mark_full(); } #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !self.direct { self.front = super::zoom::screen_front(self.front); } // crawl A 8 (BP-video-26): while the lens is live the panel Screen writes the RAM frame, never the scan-out. WALLPAPER — live reload / late-mounted volume: repaint the desktop layer once
         // SHELLWIN-OOM — single-buffer mode: every draw already landed in the one real surface, so
         // there is no back→front copy to perform (the pointers are equal — the row copy would be UB)
         // and no panel present to bracket: this front is a WINDOW surface the compositor reads on
@@ -2014,7 +2014,7 @@ impl Screen {
                         let off = (y * stride + xs) * bpp;
                         let seg = (gap_end - xs) * bpp;
                         if off + seg <= self.back_store.len() {
-                            super::blitter::a11yfilter::each(self.info.pixel_format, bpp, &self.back_store[off..off + seg], |i, c| self.front.blit(off + i, c)); // A11YFILTERS (B705): the desktop layer's span filtered at the copy (BP-video-20)
+                            super::blitter::a11yfilter::each(self.info.pixel_format, bpp, &self.back_store[off..off + seg], |i, c| self.front.blit(off + i, c)); // A11YFILTERS (B705): the desktop layer's span filtered at the copy (BP-video-25)
                             flushed += seg as u64;
                             // WC-I — this span reached glass; fold it into the present's union.
                             // Inside the length guard, so a span the bounds check rejected is not

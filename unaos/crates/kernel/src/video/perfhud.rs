@@ -187,7 +187,7 @@ mod glass {
     /// The desktop is built and not held bare (BP-video-9: before a session the furniture owns no pixels).
     fn desktop_up() -> bool {
         #[cfg(feature = "login")]
-        if crate::boot::shot_bare_held() || !super::super::desktopbuild::built() {
+        if crate::boot::shot_bare_held() || !super::super::desktopbuild::built() || super::super::lock::veiled() { // crawl A 13: no overlay over the session lock (BP-video-28)
             return false;
         }
         true
@@ -226,7 +226,7 @@ mod glass {
             let i = FT_N_SEEN.fetch_add(1, Relaxed);
             FT[i % FT_N].store(d, Relaxed);
         }
-        let Some((pw, ph)) = super::super::panel_snapshot().filter(|f| f.is_ready()).map(|f| (f.width(), f.height())) else { return false };
+        let Some((pw, ph)) = super::super::WRITER.try_lock().map(|f| *f).filter(|f| f.is_ready()).map(|f| (f.width(), f.height())) else { return false }; // crawl A 16: no blocking WRITER hold inside the pass (BP-video-27)
         // Never wait in the pass: a cache the sampler is swapping is a skipped paint (the next pass repaints).
         let Some(c) = CACHE.try_lock() else { return false };
         let Some(r) = rect(pw, ph, c.w, c.h) else {

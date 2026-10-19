@@ -210,7 +210,7 @@ fn apply(e: &mut Entry, back: bool) -> Result<(), &'static str> {
             if !same(&now, e.inode) {
                 return Err("changed");
             }
-            if t.stat(&then).is_ok() {
+            if !now.eq_ignore_ascii_case(&then) && t.stat(&then).is_ok() { // crawl A 28: a case-only rename finds itself on a case-insensitive volume
                 return Err("occupied");
             }
             ops::op_rename(&now, &then).map_err(|_| "rename-failed")
@@ -420,5 +420,14 @@ pub fn fixture_take() -> Journal {
 pub fn fixture_put(saved: Journal) {
     let mut j = JOURNAL.lock();
     *j = saved;
+    mirror(&j);
+}
+
+/// crawl A 1 — Log Out (`desktopbuild::teardown`): the journal is the SESSION's. Both stacks dropped, so the next
+/// user's Ctrl+Z / Edit > Undo can never replay the previous user's renames, Trash restores or folder removals on
+/// their paths. The seq counter keeps counting (an old toast's `Undo` then finds no entry: `refused:nothing`).
+pub fn clear() {
+    let mut j = JOURNAL.lock();
+    *j = Journal::default();
     mirror(&j);
 }

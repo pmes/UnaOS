@@ -362,10 +362,10 @@ fn engage(z: u8) -> Result<u64, &'static str> {
     }
     let l = g.as_mut().ok_or("lens")?;
     let t0 = crate::arch::now_cycles();
-    for y in 0..h {
-        // SAFETY: row `y` of the panel (`stride * 4` pitch, inside its mapped length) into row `y` of the RAM frame.
-        unsafe { core::ptr::copy_nonoverlapping((real.base_addr() + y * info.stride * 4) as *const u32, l.shadow.as_mut_ptr().add(y * w), w) };
-    }
+    // crawl A 7: seeded from RAM, never read back from BAR1 (uncached, ~1.7 us a probe: seconds at 1920x1200) — the
+    // frame starts as the filtered desktop colour; the theme epoch bump below re-seals every strip and the damage-all
+    // re-composes every window into it (the lock's wipe idiom, `lock::wipe`).
+    l.sfb.fill_screen(super::blitter::a11yfilter::color(super::wm::DESKTOP_BG));
     {
         let mut wg = super::WRITER.lock();
         if wg.base_addr() != real.base_addr() {
@@ -375,7 +375,7 @@ fn engage(z: u8) -> Result<u64, &'static str> {
     }
     LIVE.store(z, Release);
     let us = super::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
-    drop(g);
+    drop(g); super::theme::bump_epoch(); // crawl A 7: every strip re-seals into the RAM frame
     let _ = super::wm::damage_intersecting(0, 0, w, h);
     super::screen::request_full_present();
     ENGAGE_US.store(us, Relaxed);
@@ -522,4 +522,29 @@ pub fn selftest() {
         ":: ZOOM: z=2 px_ok={} present_us={} -> {} :: panel={}x{} smooth_us={} engage_us={} budget_us={} under={} lost={}",
         px_ok, worst, if pass { "PASS" } else { "FAIL" }, w, h, smooth_us, ENGAGE_US.load(Relaxed), BUDGET_US, (worst <= BUDGET_US) as u8, PANEL_LOST.load(Relaxed)
     );
+}
+
+// crawl A 8 (BP-video-26) — TAIL-APPENDED. The render service's panel `Screen` copied the REAL `WRITER` handle once at
+// start, so while the lens was live `Screen::flush` wrote the scan-out unmagnified, around `present`. Each flush now
+// asks this for its front: the RAM frame while live, the real panel otherwise — only for a `Screen` whose front IS the
+// lens's panel (or its frame) and only when the geometry is the frame's (the frame's tight pitch must equal the panel's
+// pitch, or the back store's offsets would not address it; then the flush keeps its own handle, as before). A flush
+// into the frame owes a present (the service pass's `OWED`). Try-locks only, in the LENS -> nothing order: a lens
+// mid-engage keeps the handle the flush already had.
+pub fn screen_front(front: FrameBuffer) -> FrameBuffer {
+    let Some(g) = LENS.try_lock() else { return front };
+    let Some(l) = g.as_ref() else { return front };
+    if front.base_addr() != l.real.base_addr() && front.base_addr() != l.sfb.base_addr() {
+        return front;
+    }
+    let (fi, si) = (front.info(), l.sfb.info());
+    if fi.width != si.width || fi.height != si.height || fi.stride != si.stride || fi.bytes_per_pixel != si.bytes_per_pixel {
+        return front;
+    }
+    if LIVE.load(Acquire) != 0 {
+        OWED.store(true, Release);
+        l.sfb
+    } else {
+        l.real
+    }
 }

@@ -1078,3 +1078,11 @@ impl TypeStep {
         (Some(self.weight), if self.opsz == 0 { None } else { Some(self.opsz as f32) })
     }
 }
+
+/// crawl A 6/7 — TAIL-APPENDED, so no line above moves. Bump the change epoch with no table moving: a change to what
+/// every scanout writer does at the copy (the Accessibility colour filter, BP-video-25) or to WHERE they write (the
+/// lens's RAM frame, BP-video-26) must re-seal every strip (`strip::seal` folds [`epoch`]) exactly as a theme switch
+/// does, though no token changed.
+pub fn bump_epoch() {
+    EPOCH.fetch_add(1, AOrd::AcqRel);
+}
