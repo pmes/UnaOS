@@ -544,3 +544,7 @@ refs/heads/exec-rmbp-contrast   0bf68bb9 IN-FLIGHT cloud wave36 CONTRAST (B664)
 refs/heads/exec-rmbp-winkey     0bf68bb9 IN-FLIGHT cloud wave36 WINKEY (B665)
 refs/remotes/origin/exec-orin22-keep13      51f06bea WIP-SURVIVOR orin-track (fs/unafs fits= superblock compare; not folded on this branch, orin's to fold) 2026-10-19
 refs/heads/exec-rmbp-fpu        e2a6a6ca IN-FLIGHT cloud wave36 FPU (B666)
+refs/heads/exec-rmbp-gatesteal2 b3543ae5 IN-FLIGHT cloud wave36 GATESTEAL2 (B657 B667) KEY TASK (Fable, rule 13)
+refs/heads/exec-rmbp-winedge2   b3543ae5 IN-FLIGHT cloud wave36 WINEDGE2 (B659 B668)
+refs/heads/exec-rmbp-wifimac    b3543ae5 IN-FLIGHT cloud wave36 WIFIMAC (B669)
+refs/heads/exec-rmbp-hidstall2  b3543ae5 IN-FLIGHT cloud wave36 HIDSTALL2 (B670)
