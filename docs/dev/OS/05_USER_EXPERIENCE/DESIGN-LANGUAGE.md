@@ -258,8 +258,21 @@ Copying Apple's exact values gains nothing and is the kind of detail §7 asks us
 
 **Contrast targets** (gates for every craft arc): text ≥ 4.5:1 below 18 pt and ≥ 3:1 from 18 pt [S1] [S38]. UI
 component boundaries and state indicators ≥ 3:1 [S39]. The focus indicator changes ≥ 3:1 between focused and
-unfocused, over a ≥ 2-device-px perimeter [S42]. Thresholds are never rounded (4.499 fails) [S38]. A "High contrast"
-switch in Settings → Accessibility raises `text.secondary` to `text.primary` and `line.*` to `line.control`.
+unfocused, over a ≥ 2-device-px perimeter [S42]. Thresholds are never rounded (4.499 fails) [S38]. The "Increase
+contrast" switch in Settings → Accessibility selects the contrast set below.
+
+**The contrast set** (CONTRAST, rmbp-ledger B664). With `system.accessibility.increase_contrast` on, the theme resolves
+the same 27 tokens through `palette_core::contrast` (`contrast::rows(dark, on)`). The surfaces, discs, status colours,
+inks, syntax and accents do not change. The text ramp and the three lines move toward the ends of OKLCH L, at the same
+neutral trace (chroma 0.006, h 265). Each one takes the highest L (Light) or the lowest L (Dark), in 0.001 steps, that
+reaches its target against the **lowest-contrast of the six surfaces**. The targets: `text.primary` at L 0.13 / 0.985;
+`text.secondary` ≥ 9:1; `text.tertiary` ≥ 7:1, the enhanced floor of WCAG 1.4.6 [S38], so every text token clears 7:1
+on every surface; `text.disabled` ≥ 4.5:1 (no longer exempt); `line.subtle` ≥ 3:1 [S39]; `line.strong` ≥ 4.5:1;
+`line.control` ≥ 6:1. The method is §10's. The hex values and their ratios are in palette_core's `contrast` module, and
+a const block there recomputes every ratio from the hex at build time, so a value below its floor fails the build.
+Softy's Light table gets its own pairs, solved the same way against Softy's five grounds. Softy's Dark uses the
+contrast set's Dark row. A toggle bumps the theme epoch, the same as an accent change, so chrome, menus and the
+generated wallpaper redraw. `tests contrast` samples six text-on-surface pairs on each look.
 
 **Dark mode** is not an inversion [S5]. Elevation in dark is *lighter* surfaces (window `#1D1E21` < raised `#292A2D`
 < overlay `#2F3033`), because shadows are hard to see there [S49]. Pure `#000000` is reserved for the console and media

@@ -3082,7 +3082,7 @@ fn a11y_load(via: &str) {
 fn a11y_set(row: usize, val: usize, store: bool) {
     let (name, vtxt, applied) = match row {
         0 => { A11Y_REDUCE.store(val != 0, Ordering::Relaxed); ("reduce_motion", alloc::format!("{}", (val != 0) as u8), true) }
-        1 => { A11Y_CONTRAST.store(val != 0, Ordering::Relaxed); ("increase_contrast", alloc::format!("{}", (val != 0) as u8), true) }
+        1 => { A11Y_CONTRAST.store(val != 0, Ordering::Relaxed); let _ = super::theme::set_contrast(val != 0); /* CONTRAST (B664): the theme takes the set and bumps its epoch, so chrome, menus and the generated wallpaper redraw as an accent change does. ⚠ LINE-NEUTRAL append. */ ("increase_contrast", alloc::format!("{}", (val != 0) as u8), true) }
         2 => { let q = (val.min(255) as u8).clamp(A11Y_CURSOR_MIN_Q, A11Y_CURSOR_MAX_Q); A11Y_CURSOR_Q.store(q, Ordering::Relaxed); ("cursor_size", alloc::format!("x{}", a11y_cursor_str(q)), super::cursor::armed()) }
         3 => { let s = val.min(A11Y_TEXT_NAMES.len() - 1); A11Y_TEXT.store(s as u8, Ordering::Relaxed); ("text_size", alloc::format!("{} ({} px)", A11Y_TEXT_NAMES[s], A11Y_TEXT_PX[s]), true) }
         _ => return,
