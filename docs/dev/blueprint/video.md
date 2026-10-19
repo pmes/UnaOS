@@ -25,6 +25,7 @@
 | BP-video-13 | A screen capture has an owner (the session user's Desktop); with no session it is refused; root takes no screenshots (R67). | `unaos/crates/kernel/src/video/prtscr.rs:83` `unaos/crates/kernel/src/video/prtscr.rs:175`; R67 | `tests prtscr` |
 | BP-video-14 | A ring-3 present returns 0 for every success on both arches; no pacing status exists (renderers run unpaced). | `unaos/crates/una-abi/src/lib.rs:233-252` | compile |
 | BP-video-15 | DESKTOPCRAFT is paint-only: no hit box, strip rect or router changes from the look's paint. | `docs/dev/OS/05_USER_EXPERIENCE/DESKTOPCRAFT.md:16-19` | `tests desktopcraft` |
+| BP-video-16 | The desktop's memory is a line, not a guess (BP-bar-24, BP-bar-9): the build's ask opens a heap high-water window; `[desktop] built` reads `heap_kb` (used), `high_kb` (the peak from the ask) and `furniture_kb` (the panel bytes the `strip::rects` tenants own); every build after the first prints `high_delta_pct` against the first, and a Log Out then log in returns within 2 %. The 64 MB bar is reported (`under=`), not enforced. | `unaos/crates/kernel/src/video/desktopbuild.rs:435-458` `unaos/crates/kernel/src/video/desktopbuild.rs:513` `unaos/crates/kernel/src/allocator.rs:165-203` | `:: MEMLINE: … logout_delta_pct=<n> -> PASS ::` (`tests memline`) |
 
 ## 3. Seams
 - `wm` may be called by: kernel apps (`facet`, `quarry`, `settings`, `fileview`, `login`, …), ring-3 window syscalls (ring3.md), the input router (input.md), `splash`, `desktopbuild`.
@@ -33,7 +34,7 @@
 - A kernel app file declares `CHARTER: Kernel — wm` or its handler (BP-shape-8).
 
 ## 4. Wire
-`[wc-x] desktop-clear panel=<w>x<h> …` · `[desktop] built …` · `[look] switch to= from= ms= windows_rechromed=` · `:: WALLPAPER: src= … -> PASS ::` ·
+`[wc-x] desktop-clear panel=<w>x<h> …` · `[desktop] built … heap_kb= high_kb= furniture_kb= high_delta_pct=` · `:: MEMLINE: … ::` · `[look] switch to= from= ms= windows_rechromed=` · `:: WALLPAPER: src= … -> PASS ::` ·
 `:: DESKTOPCRAFT: cost … frame_us= budget_us=16667 … -> UNDER|OVER ::` · `:: LOGINZ: … ::` · `[wm] limit windows= procs=` · `:: GPUBLIT: … blitter=gpu` (Kepler takeover).
 
 ## 5. Ruled, unbuilt
