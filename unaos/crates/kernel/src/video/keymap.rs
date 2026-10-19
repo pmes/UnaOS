@@ -748,3 +748,19 @@ pub fn winkey_drive(chord: bool) {
     TAP.store(0, Relaxed);
     HID_MODS_LAST.store(mods0, Relaxed);
 }
+
+// ══════════════ KEYMAPS (rmbp-ledger B704) — the LAYOUT seam — TAIL-APPENDED ══════════════
+//
+// The chord table above judges what a chord MEANS; the layout tables (`input/layouts.rs`, declared here so the crate
+// root is untouched) say what a key TYPES on the operator's keyboard: us gb de fr es it se ch, dead keys, AltGr, the
+// Compose tap. ONE call per HID boot report is the whole seam, beside `resolve_edge`, which a decoder already makes.
+
+#[path = "../input/layouts.rs"]
+pub mod layouts;
+
+/// KEYMAPS: THE LAYOUT SEAM — one HID boot report's PRESS edges typed on the live layout (`system.keyboard.layout`),
+/// through the dead-key and Compose state machine; returns how many chars were written to `out`. A key the layout
+/// does not claim (a chord, a Ctrl fold, a non-printing key) writes nothing and stays on `hid_key_ascii`'s path.
+pub fn layout_report(cur_keys: &[u8; 6], prev_keys: &[u8; 6], modifiers: u8, caps: bool, out: &mut [char; 12]) -> usize {
+    layouts::report_live(cur_keys, prev_keys, modifiers, caps, out)
+}

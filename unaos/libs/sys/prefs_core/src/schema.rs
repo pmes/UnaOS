@@ -267,6 +267,16 @@ pub static SCHEMA: &[Key] = &[
         doc: "The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock.",
     },
     Key {
+        ns: "system", key: "keyboard.compose", kind: Kind::Bool, default: Default::Bool(false),
+        writers: &[Writer::Settings], reader: "kernel KEYMAPS (`input/layouts.rs`), Settings > Keyboard",
+        doc: "A tap of Right Alt (down and up alone) is the Compose key: the next two characters compose (s s = ß, = e = €, \" u = ü); Right Alt held with a key stays AltGr (KEYMAPS B704).",
+    },
+    Key {
+        ns: "system", key: "keyboard.layout", kind: Kind::Enum(&["us", "gb", "de", "fr", "es", "it", "se", "ch"]), default: Default::Str("us"),
+        writers: &[Writer::Settings], reader: "kernel KEYMAPS (`input/layouts.rs`), Settings > Keyboard",
+        doc: "The keyboard layout keys type on: U.S., British, German, French, Spanish, Italian, Swedish / Finnish, Swiss German, with their dead keys and AltGr characters (KEYMAPS B704).",
+    },
+    Key {
         ns: "system", key: "login.items", kind: Kind::Str { max_len: crate::login::VALUE_MAX, printable: true },
         default: Default::Str(""),
         writers: &[Writer::Settings, Writer::Dock], reader: "kernel login items (`video/loginitems.rs`)",
@@ -315,9 +325,9 @@ pub static SCHEMA: &[Key] = &[
         doc: "Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18).",
     },
     Key {
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 10 }, default: Default::Int(0),
+        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 11 }, default: Default::Int(0),
         writers: &[Writer::Settings, Writer::Program], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy, Keyboard).",
     },
     // ── TRACKPADPANE (B412, MACPARITY row 16): the Trackpad pane; the rules are `crate::trackpad` ──────────────
     Key {
