@@ -10,10 +10,19 @@ counter (always available) and, on a networked board, an SNTP sync (learns *civi
 
 * **aarch64** — `CNTPCT_EL0` / `CNTFRQ_EL0` (EL-independent, free-running, never stops — the
   same JD3 mechanism the BOT pump and screen-on-boot deadline ride).
-* **x86_64** (CLOCK-X1) — the invariant TSC (`rdtsc`), calibrated once at boot against the ACPI
-  PM timer (`apic::tsc_hz`), gated on CPUID's invariant-TSC bit (`apic::tsc_invariant`). A
-  non-invariant or uncalibrated TSC returns `None` — the kernel never serves an untrustworthy
-  counter as a clock.
+* **x86_64** (CLOCK-X1, CLOCKX86) — the invariant TSC (`rdtsc`), calibrated once at boot against
+  the ACPI PM timer (`apic::tsc_hz`), gated on CPUID's invariant-TSC bit (`apic::tsc_invariant`).
+  Where CPUID lacks that bit (leaf 0x8000_0007 EDX[8]) — the image-26 KVM vCPU reads
+  `[clock] source=apic … invariant=0` (`docs/dev/evidence/qemu-image26/serial.log:60`) — CLOCKX86
+  (rmbp-ledger B618) serves CLOCKCORE's calibrated millisecond tick instead, `(arch::ms(), 1000)`,
+  so `unix_now`, `try_unix_now` (the menu bar), `now` (FAT mtimes) and `logts_now` advance rather
+  than serve the anchor's own second all boot. Invariance is a CPUID constant, so one boot never
+  mixes the two tick domains. `None` remains only while neither counter is live (before
+  `apic::calibrate`, or when it aborted/rejected: `tsc_hz == 0` on an invariant machine,
+  `apic_timer_hz == 0` on the other) — the kernel never serves a non-invariant TSC or an
+  uncalibrated tick as a clock. `clock::civil_counter()` names the leg (`tsc|ms|frozen`) for the
+  `[clock]` boot line's `civil=` field. `uptime_secs()` (and so the CLOCK-X1 witness) stays on the
+  TSC leg only.
 
 Everything below reads time through this one function, so both clocks work on both arches with
 no new plumbing.
@@ -118,9 +127,9 @@ are unaffected.
   BPACE/GPACE `t=`/`since-entry` figure by seconds; subtracting `bootpace::origin_cycles()` makes
   the prefix directly comparable to those ledgers on both arches.
 * `[      ?ms] ` — the emission time is genuinely unknown: printed before the `entry` stamp exists
-  or before the counter is calibrated (x86 TSC pre-calibration, or a machine with no invariant
-  TSC — where **every** line reads `?` and the null result is visible instead of a fabricated
-  `0ms` masquerading as a fast boot).
+  or before the counter is calibrated (x86 pre-calibration — the null result is visible instead of
+  a fabricated `0ms` masquerading as a fast boot). A machine with no invariant TSC reads the
+  CLOCKX86 ms tick, which already counts from its arming after `entry`.
 * post-sync (a civil anchor exists — SNTP, or a `date -s` Manual): `[15:04:07Z] ` — UTC wall time
   `HH:MM:SS`. The prefix flips the instant `set_anchor` plants the anchor.
 
