@@ -4441,6 +4441,7 @@ fn helpf1_selftest() {
 /// session's journal is set aside for the run and put back; the scratch folder is removed (`leftovers=`).
 #[cfg(all(feature = "quarry", feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn trashtoast_selftest() {
+    use alloc::{string::String, vec::Vec};
     use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
     use crate::video::quarry::live::ops;
     use crate::video::quarry::undo;
