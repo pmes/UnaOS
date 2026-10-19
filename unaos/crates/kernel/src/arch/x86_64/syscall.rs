@@ -9354,7 +9354,7 @@ fn sys_sendto(handle: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let hdr = unsafe { core::slice::from_raw_parts(msg_ptr as *const u8, 8) };
     let ip = [hdr[0], hdr[1], hdr[2], hdr[3]];
     let port = u16::from_le_bytes([hdr[4], hdr[5]]);
-    let payload = unsafe { core::slice::from_raw_parts((msg_ptr + 8) as *const u8, plen) };
+    let payload = unsafe { core::slice::from_raw_parts((msg_ptr + 8) as *const u8, plen) }; if let Err(e) = crate::fs::apptrust::net_gate(row, ip, port, false) { return e; } // NETGRANT (B707): a datagram is an outbound reach too — the same grant before it is queued (-EAGAIN while asking). ⚠ LINE-NEUTRAL append, code before this comment
     match crate::smolnet::stack_sendto(sid, ip, port, payload) {
         Ok(n) => n as i64,
         Err(()) => EAGAIN,
@@ -9434,7 +9434,7 @@ fn sys_connect(handle: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let port = u16::from_le_bytes([hdr[4], hdr[5]]);
     if port == 0 {
         return EINVAL;
-    }
+    } if let Err(e) = crate::fs::apptrust::net_gate(row, ip, port, true) { return e; } // NETGRANT (B707, BP-security-16): the user's grant BEFORE the SYN — Never = -EPERM and the stack is never entered; asking = -EINPROGRESS, nothing queued. ⚠ LINE-NEUTRAL append, code before this comment
     match crate::smolnet::stack_connect(sid, ip, port) {
         crate::smolnet::ConnectOutcome::Established => 0,
         crate::smolnet::ConnectOutcome::InProgress => EINPROGRESS,
