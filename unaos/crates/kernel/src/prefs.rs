@@ -452,13 +452,13 @@ fn watch_task(_cpu: usize) {
 fn watch_deleted() -> Vec<String> {
     let Some(_g) = SAVE_LOCK.try_lock() else { return Vec::new() };
     let mt = store_mt(); say_stat_once(&mt); // DONGLEBOOT (B658): the store's own volume, never a mount-table build per pass (LINE-NEUTRAL fold, code first)
-    let gone: Vec<String> = ON_DISK.lock().iter().filter(|d| mt.stat(&domain_path(d)).is_err() && mt.stat(&alloc::format!("{}.new", domain_path(d))).is_err()).cloned().collect();
+    let gone: Vec<String> = ON_DISK.lock().iter().filter(|d| mt.stat(&domain_path(d)).is_err() && mt.stat(&alloc::format!("{}.new", domain_path(d))).is_err()).cloned().collect(); let mut cleared: Vec<(String, String)> = Vec::new(); // PREFSDELETED (B755): the keys a delete clears (LINE-NEUTRAL fold, code first)
     for d in &gone {
         let keys = prefs_core::files::clear(&mut TREE.lock(), d);
         ON_DISK.lock().retain(|x| x != d);
-        serial_println!("[prefs] settings/{} absent -> defaults (deleted by the user) keys={}", d, keys.len());
+        serial_println!("[prefs] settings/{} absent -> defaults (deleted by the user) keys={}", d, keys.len()); cleared.extend(keys); // PREFSDELETED (B755): collected, posted below (LINE-NEUTRAL fold, code first)
     }
-    gone
+    drop(_g); deleted_post(&cleared); gone // PREFSDELETED (B755): SAVE_LOCK and the TREE lock released, then one PrefChanged per cleared key (file tail). LINE-NEUTRAL fold, code first.
 }
 
 // ── Save ─────────────────────────────────────────────────────────────────────────────────────
@@ -1646,9 +1646,165 @@ pub fn revoke(key: &str) -> bool {
 pub fn reload_from_store() -> usize {
     DECIDE_Q.lock().clear();
     DECIDE_OWED.store(false, Ordering::Release);
-    *TREE.lock() = PrefTree::new();
+    let old = core::mem::replace(&mut *TREE.lock(), PrefTree::new()); // PREFSDELETED (B755): the tree before the reload, diffed after it (LINE-NEUTRAL fold, code first)
     *LOADED_FOR.lock() = None;
     PREFS_SEEN.forget();
-    ensure_loaded();
+    ensure_loaded(); reload_post(&old); // PREFSDELETED (B755): one PrefChanged per key the reload moved (file tail). LINE-NEUTRAL fold, code first.
     TREE.lock().len()
+}
+
+// ══════════════ PREFSDELETED (rmbp-ledger B755, BP-security-18, BP-storage-15) — TAIL-APPENDED ══════════════
+// A deleted domain file (R98's delete watch, `watch_deleted`) and `reload_from_store` reset keys in the tree without a
+// write, so no `changed()` ran and no PrefChanged was made: the lock (`lock::prefs_pass`, which re-reads only when
+// `prefs_client::CHANGED_N` moves) and Settings (`bus_changes_inner`) kept the old value until something else moved.
+// Now each cleared key posts the SAME frame of record `changed()` posts (`prefs_client::on_changed`, under its cfg),
+// carrying the value the key answers once unset: its declared default — the schema's static default, a derived one
+// evaluated against the store (the kernel has no environment variables and no local models, so those rule inputs
+// answer no), or the program's `PrefDeclare` default for `app.<name>.<key>`. A key with no preference-level default
+// (`Default::Consumer`, an undeclared key) has no value the frame can carry: it is counted `unsent=` and owed an
+// unset form of verb 19 (prefs_core::wire, outside this arc).
+
+/// The kernel's rule inputs: the store's stored values, no environment variable, no local model.
+struct StoreEnv;
+
+impl prefs_core::rules::RuleEnv for StoreEnv {
+    fn pref(&self, ns: &str, key: &str) -> Option<PrefValue> {
+        TREE.lock().get(ns, key).cloned()
+    }
+    fn env_set(&self, _var: &str) -> bool {
+        false
+    }
+    fn local_model_installed(&self, _name: &str) -> bool {
+        false
+    }
+}
+
+/// The value `ns`.`k` answers once it leaves the store, as the PrefChanged's `Applied` (never clamped). `None` = no
+/// preference-level default (the consumer computes it, or the key is undeclared).
+fn default_applied(ns: &str, k: &str) -> Option<prefs_core::schema::Applied> {
+    let value = if ns == prefs_core::files::APP_NS {
+        prefs_core::declare::lookup(&DECLARED.lock(), k).map(|d| d.default.clone())
+    } else {
+        prefs_core::schema::default_of(ns, k, &StoreEnv).map(|(v, _)| v)
+    }?;
+    Some(prefs_core::schema::Applied { value, clamped: false })
+}
+
+/// Post one PrefChanged per `(ns, key, value)`. Called with no prefs lock held (`on_changed` takes the bus queue's
+/// and the ring-3 subscribers' locks only). Returns the frames handed to `on_changed`.
+fn post_changes(changes: &[(String, String, prefs_core::schema::Applied)]) -> usize {
+    for (ns, k, a) in changes {
+        #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))]
+        crate::prefs_client::on_changed(ns, k, a); // the `changed()` cfg: no bus on this build, no frame
+        let _ = (ns, k, a);
+    }
+    changes.len()
+}
+
+/// `watch_deleted`'s keys, after its locks are dropped: each answers its default now, said once per run.
+fn deleted_post(cleared: &[(String, String)]) {
+    if cleared.is_empty() {
+        return;
+    }
+    let mut out: Vec<(String, String, prefs_core::schema::Applied)> = Vec::new();
+    for (ns, k) in cleared {
+        if let Some(a) = default_applied(ns, k) {
+            out.push((ns.clone(), k.clone(), a));
+        }
+    }
+    let sent = post_changes(&out);
+    serial_println!("[prefs] deleted -> changed keys={} sent={} unsent={} (unsent: no declared default)", cleared.len(), sent, cleared.len() - sent);
+}
+
+/// `reload_from_store`'s diff: every key whose value the reload moved (added, changed, or gone -> its default).
+fn reload_post(old: &PrefTree) {
+    let mut out: Vec<(String, String, prefs_core::schema::Applied)> = Vec::new();
+    let mut gone: Vec<(String, String)> = Vec::new();
+    {
+        let t = TREE.lock();
+        for (ns, k, v) in t.entries() {
+            if old.get(ns, k) != Some(v) {
+                out.push((String::from(ns), String::from(k), prefs_core::schema::Applied { value: v.clone(), clamped: false }));
+            }
+        }
+        for (ns, k, _) in old.entries() {
+            if t.get(ns, k).is_none() {
+                gone.push((String::from(ns), String::from(k)));
+            }
+        }
+    }
+    let n = out.len() + gone.len();
+    for (ns, k) in &gone {
+        if let Some(a) = default_applied(ns, k) {
+            out.push((ns.clone(), k.clone(), a));
+        }
+    }
+    let sent = post_changes(&out);
+    if n > 0 {
+        serial_println!("[prefs] reload -> changed keys={} sent={} unsent={} (unsent: no declared default)", n, sent, n - sent);
+    }
+}
+
+/// `tests autolock`'s `deleted=` leg (tests.rs tail): the domain `ns`.`k` lives in.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // the fixture's cfg (tests.rs `autolock_selftest`)
+pub fn domain_of_key(ns: &str, k: &str) -> String {
+    prefs_core::files::domain_of(ns, k)
+}
+
+/// `tests autolock`'s `deleted=` leg: the domain file's bytes as they are now (`None` = not on disk, or held).
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // the fixture's cfg (tests.rs `autolock_selftest`)
+pub fn domain_bytes(d: &str) -> Option<Vec<u8>> {
+    ensure_loaded();
+    if held(d) || !ON_DISK.lock().iter().any(|x| x == d) {
+        return None;
+    }
+    read_all(&domain_path(d))
+}
+
+/// `tests autolock`'s `deleted=` leg: delete the domain file as the user's Quarry delete would (the file and any
+/// `.new`), then run THE delete watch until the domain has left the tree (a worker-core watch may take it first;
+/// bounded). `true` = the domain is off disk and out of the tree.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // the fixture's cfg (tests.rs `autolock_selftest`)
+pub fn delete_domain_watched(d: &str) -> bool {
+    let p = domain_path(d);
+    let mt = store_mt();
+    let k = crate::fs::vfs::KERNEL_PRINCIPAL;
+    if mt.unlink(&p, k).is_err() {
+        return false;
+    }
+    let _ = mt.unlink(&alloc::format!("{}.new", p), k);
+    let t0 = crate::arch::ms();
+    loop {
+        let _ = watch_deleted();
+        if !ON_DISK.lock().iter().any(|x| x == d) {
+            return true;
+        }
+        if crate::arch::ms().wrapping_sub(t0) > 5_000 {
+            return false;
+        }
+        crate::arch::sched::yield_now();
+    }
+}
+
+/// `tests autolock`'s `deleted=` leg: put the domain file back byte for byte, merge its keys into the tree and post
+/// their PrefChanged (the restore is a change too). `true` = written and parsed.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // the fixture's cfg (tests.rs `autolock_selftest`)
+pub fn restore_domain(d: &str, bytes: &[u8]) -> bool {
+    let Some(Ok(t)) = core::str::from_utf8(bytes).ok().map(PrefTree::parse) else { return false };
+    {
+        let _g = SAVE_LOCK.lock();
+        ensure_dirs();
+        if write_all(&domain_path(d), bytes).is_err() {
+            return false;
+        }
+        prefs_core::files::merge(&mut TREE.lock(), &t);
+        let mut od = ON_DISK.lock();
+        if !od.iter().any(|x| x == d) {
+            od.push(String::from(d));
+        }
+    }
+    let out: Vec<(String, String, prefs_core::schema::Applied)> =
+        t.entries().map(|(ns, k, v)| (String::from(ns), String::from(k), prefs_core::schema::Applied { value: v.clone(), clamped: false })).collect();
+    let _ = post_changes(&out);
+    true
 }
