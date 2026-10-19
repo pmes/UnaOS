@@ -3174,7 +3174,7 @@ fn a11y_load(via: &str) {
     let cq = sys_get(key::A11Y_CURSOR_SIZE).and_then(|v| v.as_float()).map_or(A11Y_CURSOR_MIN_Q, a11y_cursor_q_of);
     let ts = text(key::A11Y_TEXT_SIZE).and_then(|s| A11Y_TEXT_NAMES.iter().position(|n| *n == s)).unwrap_or(0) as u8;
     let cvd = text(key::A11Y_CVD).and_then(|s| af::mode_of(&s)).unwrap_or(0);
-    let inv = flag(key::A11Y_INVERT).unwrap_or(false);
+    let inv = flag(key::A11Y_INVERT).unwrap_or(false); let _ = super::perfhud::latch(flag(key::A11Y_SHOW_PERF).unwrap_or(false), via); // PERFHUD (B710)
     let (rm0, ic0, cq0, ts0) = (A11Y_REDUCE.swap(rm, Ordering::Relaxed), A11Y_CONTRAST.swap(ic, Ordering::Relaxed), A11Y_CURSOR_Q.swap(cq, Ordering::Relaxed), A11Y_TEXT.swap(ts, Ordering::Relaxed));
     let (cvd0, inv0) = (af::mode(), af::invert());
     af::set(cvd, inv);
@@ -3219,6 +3219,7 @@ fn a11y_set(row: usize, val: usize, store: bool) {
         5 => { af::set(af::mode(), val != 0); ("invert", alloc::format!("{}", (val != 0) as u8), true) }
         6 => { let z = a11y_zoom_of_seg(a11y_zoom_seg(val.min(4) as u8)); A11Y_ZOOM.store(z, Ordering::Relaxed); zoom_apply(); ("zoom", alloc::format!("{}", z), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // ZOOM (B713)
         7 => { let f = val.min(A11Y_FOLLOW_NAMES.len() - 1); A11Y_FOLLOW.store(f as u8, Ordering::Relaxed); zoom_apply(); ("zoom_follow", alloc::format!("{}", A11Y_FOLLOW_NAMES[f]), cfg!(all(target_arch = "x86_64", feature = "wc"))) }
+        8 => { let _ = super::perfhud::set_visible(val != 0, "settings"); ("show_performance", alloc::format!("{}", (val != 0) as u8), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // PERFHUD (B710): applied where the compositor paints it
         _ => return,
     };
     if store {
@@ -3253,12 +3254,12 @@ fn a11y_service() {
                 A11Y_ZOOM.store(z, Ordering::Relaxed);
                 A11Y_FOLLOW.store(f, Ordering::Relaxed);
                 say("accessibility.zoom", &alloc::format!("{}", z), true);
-                A11Y_PERSIST.fetch_or(1 << 4, Ordering::AcqRel);
+                A11Y_PERSIST.fetch_or(1 << 6, Ordering::AcqRel); // the fold: zoom is row 6
                 if is_open() && cur_tab() == A11Y_TAB { repaint(); }
             }
         }
     }
-    let owed = A11Y_PERSIST.swap(0, Ordering::AcqRel);
+    let owed = A11Y_PERSIST.swap(0, Ordering::AcqRel) | if super::perfhud::take_owed() { 1 << 8 } else { 0 }; // PERFHUD (B710): the chord's toggle is written back here too (row 8 at the fold)
     if owed == 0 { return; }
     use crate::prefs::{key, PrefValue as P}; use crate::prefs_client::sys_set as set_sys;
     if owed & 1 != 0 { set_sys(key::A11Y_REDUCE_MOTION, P::Bool(A11Y_REDUCE.load(Ordering::Relaxed))); }
@@ -3276,10 +3277,11 @@ fn a11y_service() {
         let f = (A11Y_FOLLOW.load(Ordering::Relaxed) as usize).min(A11Y_FOLLOW_NAMES.len() - 1);
         set_sys(key::A11Y_ZOOM_FOLLOW, P::Str(String::from(A11Y_FOLLOW_NAMES[f])));
     }
+    if owed & 256 != 0 { set_sys(key::A11Y_SHOW_PERF, P::Bool(super::perfhud::visible())); } // PERFHUD (B710), row 8
 }
 
 fn paint_a11y(st: &mut State) {
-    groups(st, &[(0, 1), (2, 3), (4, 5)]);
+    groups(st, &[(0, 1), (2, 3), (4, 5), (6, 7), (8, 8)]);
     let (rm, ic, q) = (reduce_motion(), increase_contrast(), A11Y_CURSOR_Q.load(Ordering::Relaxed));
     txt(st, LABEL_X, 0, "Reduce motion");
     tog(st, 0, TOG_X, rm, false); // SETTINGSCRAFT: the kit's switch, right-aligned (a press anywhere on the row flips it)
@@ -3308,8 +3310,12 @@ fn paint_a11y(st: &mut State) {
     txt2(st, VAL_X, 6, if zm == 0 { "Win+= zooms in" } else { "Win+- out, Win+0 off" });
     txt(st, LABEL_X, 7, "Zoom follows");
     seg(st, 7, &[b"Pointer", b"Focus"], zf, false);
-    txt2(st, LABEL_X, 8, "Reduce motion makes every slide a cut; cursor size scales the pointer's blocks (to x4 at 1:1).");
-    txt2(st, LABEL_X, 9, "Text size sets the UI font size; the colour filter and invert cover the whole glass; zoom magnifies it around the pointer or the focus.");
+    let hud = super::perfhud::visible(); // PERFHUD (B710): the overlay's switch
+    txt(st, LABEL_X, 8, "Show performance");
+    tog(st, 8, TOG_X, hud, false);
+    txt2(st, TRACK_X, 8, if hud { "Frame times, latency and memory, top right" } else { "Off (Win+F12 toggles it)" });
+    txt2(st, LABEL_X, 9, "Reduce motion makes every slide a cut; cursor size scales the pointer's blocks (to x4 at 1:1).");
+    txt2(st, LABEL_X, 10, "Text size sets the UI font size; the colour filter and invert cover the whole glass; zoom magnifies it around the pointer or the focus.");
 }
 
 /// A11YFILTERS (B705): what row 4's value column says per mode (the segments name the cone each filter simulates).
@@ -3326,6 +3332,7 @@ fn press_a11y(row: usize, cx: usize) {
         5 => a11y_set(5, (!af::invert()) as usize, true),
         6 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(6, a11y_zoom_of_seg((cx - TRACK_X) / (TRACK_W / A11Y_ZOOM_SEGS.len())) as usize, true); } } // ZOOM (B713)
         7 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(7, ((cx - TRACK_X) / (TRACK_W / A11Y_FOLLOW_NAMES.len())).min(A11Y_FOLLOW_NAMES.len() - 1), true); } }
+        8 => a11y_set(8, (!super::perfhud::visible()) as usize, true), // PERFHUD (B710)
         _ => {}
     }
 }
@@ -3651,7 +3658,7 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 41] = {
+pub const MAP: [MapRow; 42] = {
     use crate::prefs::key::*;
     [
         // General (0)
@@ -3696,6 +3703,7 @@ pub const MAP: [MapRow; 41] = {
         mr(&[A11Y_INVERT], A11Y_TAB, 5, "Invert colours", NO_CTRL),
         mr(&[A11Y_ZOOM], A11Y_TAB, 6, "Zoom", NO_CTRL), // ZOOM (B713)
         mr(&[A11Y_ZOOM_FOLLOW], A11Y_TAB, 7, "Zoom follows", NO_CTRL),
+        mr(&[A11Y_SHOW_PERF], A11Y_TAB, 8, "Show performance", NO_CTRL), // PERFHUD (B710)
         // Privacy (REASK B681): the switch row; the decisions below it are dynamic (`prefs::decisions`), each with a Revoke
         mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL),
         // Date & Time (TZLOCALE B701): the one locale authority's three keys

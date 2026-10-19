@@ -83,7 +83,7 @@ pub fn fn_row_usage(path: u8, usage: u8, modifiers: u8) -> Option<FnAct> {
     if usage <= 1 {
         return None;
     }
-    let act = decide(usage, modifiers)?;
+    if super::perfhud::chord(usage, modifiers) { return None; } let act = decide(usage, modifiers)?; // PERFHUD (B710): Win+F12 toggles the performance overlay and is consumed here (the one F-row router), before the F12 volume step. LINE-NEUTRAL fold, code first
     match act {
         FnAct::Bright(up) => super::brightkeys::key(if up { Action::BrightnessUp } else { Action::BrightnessDown }),
         FnAct::Media(k) => super::player::media_key(k),

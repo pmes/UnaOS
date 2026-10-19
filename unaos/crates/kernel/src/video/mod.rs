@@ -1264,3 +1264,5 @@ pub mod look { #[inline] pub fn is_softy() -> bool { false } }
 // ZOOM (B713): the screen magnifier — the panel composed unfiltered in a RAM frame `WRITER` points at, presented through a lens (x2/x3/x4) that follows the pointer or the focus. x86 `wc` (the compositor it sits under); at the tail so no line above moves.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod zoom;
+
+pub mod look; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod softy; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod perfhud; // PERFHUD (B710): the performance overlay (Win+F12, Settings > Accessibility > Show performance); the toggle on both desktop families, the glass half x86 `wc`. LINE-NEUTRAL fold, code first

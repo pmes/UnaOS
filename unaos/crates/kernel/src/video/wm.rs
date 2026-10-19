@@ -5211,7 +5211,7 @@ fn composite_once() {
         #[cfg(not(feature = "witness"))]
         let _ = cashed;
     }
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] let k2p_pass = k2p::begin(); let owed = composite_pass_half(); // K2P (B671): this frame takes its oldest consumed input and judges its vblank deadline (file tail). ⚠ LINE-NEUTRAL fold, code before the comment.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] let k2p_pass = k2p::begin(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::perfhud::pass_begin(); let owed = composite_pass_half(); // K2P (B671): this frame takes its oldest consumed input and judges its vblank deadline (file tail). ⚠ LINE-NEUTRAL fold, code before the comment. PERFHUD (B710): `perfhud::pass_begin` stamps the pass start its frame-time ring reads at the overlay layer (one relaxed store while visible), same-line fold, code before the comment.
     // x86 (and anything not aarch64): cash inline, in the pass, as the trunk always has.
     #[cfg(not(target_arch = "aarch64"))]
     cash_tail(owed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::on_damage(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::end(k2p_pass); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] crate::video::veilcost::frame(); // ZOOM (B713): the pass's pixels are in the RAM frame while the lens is live — present them through it before the frame is judged on the glass. K2P (B671): the frame is on the glass — its input's age is recorded (file tail). VEILCOST (B696): the sample. ⚠ LINE-NEUTRAL fold, code before the comment.
@@ -5286,7 +5286,7 @@ fn composite_pass_half() -> Owed {
     // and neither can short-circuit the other's damage test (a disabled tenant returns on one relaxed load). PI-DESK — the
     // aarch64 half of the gate below is the WHOLE of M2: same seam, same position, same duty, same layering.
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-    let strip_painted = super::strip::compose_all();
+    let strip_painted = super::strip::compose_all(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let strip_painted = super::perfhud::compose() | strip_painted; // PERFHUD (B710): the HUD is the topmost panel layer, painted after every window and furniture strip and before the cursor tail (its `true` is the tail's `dirty`); paints from a cache the sampler renders (`video/perfhud.rs`). LINE-NEUTRAL append, code first
     #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let strip_painted = false;
     #[cfg(feature = "witness")]
@@ -30769,7 +30769,7 @@ pub mod k2p {
             let exp = EXPIRED.swap(0, Relaxed);
             if n > 0 || exp > 0 {
                 let (p50, p99) = p50_p99(&mut buf[..k]);
-                serial_println!("[input] k2p p50={} p99={} n={} max={} expired={}", p50, p99, n, max, exp);
+                serial_println!("[input] k2p p50={} p99={} n={} max={} expired={}", p50, p99, n, max, exp); HUD_P99.store(p99, Relaxed); // PERFHUD (B710): the HUD reads the last printed p99
             }
             let mut dbuf = [0u32; DCAP];
             let (dn, dk) = take(&DRAG, &DRAG_N, &mut dbuf);
@@ -30784,7 +30784,7 @@ pub mod k2p {
             let _ = MIN_T.compare_exchange(0, now.max(1), AcqRel, Relaxed);
         } else if now.wrapping_sub(m) >= MINUTE_MS && MIN_T.compare_exchange(m, now.max(1), AcqRel, Relaxed).is_ok() {
             let passes = PASSES_MIN.swap(0, Relaxed);
-            let missed = MISSED_MIN.swap(0, Relaxed);
+            let missed = MISSED_MIN.swap(0, Relaxed); HUD_MISSED.store(missed, Relaxed); // PERFHUD (B710): the HUD reads the last minute's count
             if passes > 0 {
                 serial_println!("[wc] missed_vblank={} passes={} deadline_us={}", missed, passes, VBLANK_US);
             }
@@ -30845,6 +30845,16 @@ pub mod k2p {
         if !DONE.swap(true, AcqRel) {
             crate::tests::register("k2p", selftest);
         }
+    }
+
+    // PERFHUD (rmbp-ledger B710): what the HUD reads — the last `[input] k2p` p99 (0 = none printed yet) and the last
+    // minute's `missed_vblank` count, stored where `flush` prints them. Appended at the module's tail.
+    static HUD_P99: AtomicU32 = AtomicU32::new(0);
+    static HUD_MISSED: AtomicU32 = AtomicU32::new(0);
+
+    /// `(k2p_p99_us, missed_vblank_last_minute, missed_vblank_since_boot)` for `video::perfhud`.
+    pub fn hud() -> (u32, u32, u64) {
+        (HUD_P99.load(Relaxed), HUD_MISSED.load(Relaxed), MISSED_TOTAL.load(Relaxed))
     }
 }
 // A11YTREE (rmbp-ledger B675, BP-bar-22): the accessibility role/name tree read from this table and the furniture's
