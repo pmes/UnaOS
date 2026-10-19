@@ -31,6 +31,10 @@ pub use live::{close, is_open, key_route, menu_press, open, press_route, request
 #[cfg(all(feature = "quarry", target_arch = "x86_64", feature = "wc"))]
 pub use live::ops_selftest;
 
+/// UNPLUG (B703): `tests unplug`'s doors into the window over a removed volume (mark in place, close on click).
+#[cfg(feature = "quarry")]
+pub use live::{unplug_click, unplug_mark, unplug_open};
+
 #[cfg(all(feature = "quarry", feature = "witness"))]
 pub use live::{door_selftest, selftest, selftest_result};
 
@@ -81,3 +85,16 @@ pub fn right_press(_x: i32, _y: i32) -> bool { false }
 #[cfg(not(feature = "quarry"))]
 #[inline(always)]
 pub fn menu_press(_x: i32, _y: i32) -> bool { false }
+
+// UNPLUG (B703) knob-off stubs: no window, nothing marked, nothing to close.
+#[cfg(not(feature = "quarry"))]
+#[inline(always)]
+pub fn unplug_open(_path: &str) -> bool { false }
+
+#[cfg(not(feature = "quarry"))]
+#[inline(always)]
+pub fn unplug_mark() -> Option<alloc::string::String> { None }
+
+#[cfg(not(feature = "quarry"))]
+#[inline(always)]
+pub fn unplug_click() -> bool { false }

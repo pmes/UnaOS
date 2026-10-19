@@ -258,14 +258,14 @@ fn retree(m: &mut Model) {
 }
 
 /// Re-list the open window's folder after a namespace change. Returns the rows now listed.
-fn relist(m: &mut Model) -> usize {
+pub(super) fn relist(m: &mut Model) -> usize {
     let sel = m.list.get(m.list_sel).map(|e| e.name.clone());
     let (scroll, focus) = (m.list_scroll, m.focus);
     m.invalidate();
     retree(m);
     let cwd = m.cwd.clone();
     m.show(&cwd);
-    if m.err.is_some() && cwd != "/" {
+    if m.err.is_some() && cwd != "/" && crate::fs::removable::departed_name(&cwd).is_none() { // UNPLUG (B703): a folder whose VOLUME left stays, marked `Removed: <name>` (show), until a click closes it or the stick returns
         m.navigate(&parent(&cwd)); // the folder itself went away: its parent, as the Finder does
     } else {
         m.list_scroll = scroll;

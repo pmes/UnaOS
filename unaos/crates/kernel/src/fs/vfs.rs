@@ -565,7 +565,7 @@ impl MountTable {
     /// as long as a root mount exists this never returns
     /// [`VfsError::NoSuchVolume`].
     pub fn resolve<'a>(&'a self, path: &'a str) -> Result<(&'a dyn VfsBackend, &'a str), VfsError> {
-        let path = if path.is_empty() { "/" } else { path }; if let Some(r) = crate::fs::rootdisk::redirect(self, path) { return r; } // ROOTDISK (B390, R94): `/volumes/UnaOS/…` IS `/…` through the whole table; (ROOTDISK2: the one-image `/apps/LIB` compat is deleted). Folded: this file's panic Locations are line-pinned.
+        let path = if path.is_empty() { "/" } else { path }; if let Some(r) = crate::fs::rootdisk::redirect(self, path) { return r; } if crate::fs::removable::departed(path) { return Err(VfsError::NoSuchVolume); } // ROOTDISK (B390, R94): `/volumes/UnaOS/…` IS `/…` through the whole table; (ROOTDISK2: the one-image `/apps/LIB` compat is deleted). UNPLUG (B703): a path on a removable volume that LEFT (pull or Eject) is NoSuchVolume (-ENODEV) until the same stick is back, never the root's -ENOENT; idle cost one atomic load. Folded: this file's panic Locations are line-pinned.
         let mut best: Option<&Mount> = None;
         for m in &self.mounts {
             if prefix_claims(&m.prefix, path) {
