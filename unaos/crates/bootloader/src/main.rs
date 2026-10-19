@@ -1587,6 +1587,13 @@ mod slots {
         f.write(bytes).is_ok() && f.flush().is_ok()
     }
 
+    /// KELFSTAGE (rmbp-ledger B720): the kelf check fell back from a bad A to B — mark this boot a TRIAL with the one
+    /// mark the user-restart pick writes (`why=trial`), BEFORE the jump, so the next DESKTOPBUILT PASS promotes B and a
+    /// bad A is not hashed and re-read every boot. `true` when the record was written.
+    pub fn mark_trial(root: &mut Directory) -> bool {
+        put_rec(root, SHUTDOWN, abslot::REC_TRIAL)
+    }
+
     fn drop_rec(root: &mut Directory, name: &CStr16) -> bool {
         match root.open(name, FileMode::ReadWrite, FileAttribute::empty()) {
             Ok(f) => f.delete().is_ok(),
@@ -1731,7 +1738,21 @@ mod kelfcheck {
         if let Some(nb) = read_slot(root, other) {
             let sha2v = sha2::sha256(nb);
             let c2 = kelfsha::check(rec, if other == 0 { kelfsha::SLOT_A } else { kelfsha::SLOT_B }, &sha2v, nb);
-            say(other, c2, &sha2v);
+            if c2 == Check::Bad {
+                say(other, c2, &sha2v);
+            } else {
+                // KELFSTAGE (B720): A bad, B good — a TRIAL of B (the user-restart mark), so a PASS promotes it.
+                let trial = other == 1 && slots::mark_trial(root);
+                let s = kelfsha::short(&sha2v);
+                log::info!(
+                    "[loader] kelf slot={} hash={} why=fallback trial={} row={} sha={}",
+                    KELF_SLOT_NAMES[other as usize],
+                    c2.hash_word(),
+                    trial as u8,
+                    c2.why_word(),
+                    core::str::from_utf8(&s).unwrap_or("?")
+                );
+            }
             if c2 != Check::Bad {
                 return (nb, verdict(other, c2, sha2v, 1 << first));
             }

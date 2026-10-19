@@ -210,7 +210,7 @@ fn ensure_selfinstall() {
     #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); register("install", crate::install::selfinstall::install_selftest); register("abimage", crate::install::abimage::selftest); #[cfg(feature = "ahciroot")] register("ahciw", crate::install::ahciroot::ahciw_selftest); #[cfg(all(feature = "ahciroot", feature = "instgui"))] register("instgui", crate::video::instgui::install3::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("selfinstall", crate::install::selfinstall::selftest); register("install", crate::install::selfinstall::install_selftest); register("abimage", crate::install::abimage::selftest); register("kelfstage", kelfstage_selftest); #[cfg(feature = "ahciroot")] register("ahciw", crate::install::ahciroot::ahciw_selftest); #[cfg(all(feature = "ahciroot", feature = "instgui"))] register("instgui", crate::video::instgui::install3::selftest); }
     }
 }
 
@@ -2341,4 +2341,100 @@ fn fontkit_selftest() {
         "FAIL"
     };
     serial_println!(":: FONTKIT: roles={} variable={} wght_ok={} opsz_ok={} -> {} ::", p.roles, p.variable as u8, wght_ok as u8, opsz_ok as u8, verdict);
+}
+
+// KELFSTAGE (rmbp-ledger B720, BP-boot-17, BP-bar-8) — TAIL-APPENDED. KELF.SHA follows ABIMAGE's slots: the stage
+// writes the slot-B row, the promotion respells it as slot A, and the loader's A->B hash fallback is a TRIAL the next
+// DESKTOPBUILT PASS promotes (`install/abimage.rs`, `crates/bootloader/src/kelfsha.rs`). `tests kelfstage`: stage the
+// running image's own `/boot/KERNEL.ELF`, check the two rows, simulate the promotion on the record (the pure rewrite;
+// the boot volume's kernel is never renamed by a fixture), check the trial rules, unstage and check the B row went.
+// `:: KELFSTAGE: rows=2 promoted_row=ok fallback_trial=ok -> PASS ::`
+
+/// KELFSTAGE: the slot the loader jumped to (0 = A, 1 = B), from the verdict `kelf_note` kept; `None` for a loader
+/// older than KELFHASH (`install::abimage::should_promote` then keeps ABIMAGE's rule).
+#[cfg(target_arch = "x86_64")]
+pub fn kelf_booted_slot() -> Option<u8> {
+    (*KELF_KEPT.lock()).filter(|v| v.present()).map(|v| v.slot & 1)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+fn kelfstage_selftest() {
+    use crate::install::abimage::{self, kelfsha};
+    use crate::install::abslot;
+    let before = abimage::kelf_record();
+    let a_before = before.as_deref().and_then(|r| kelfsha::find(r, kelfsha::SLOT_A));
+    let src = alloc::format!("/boot/{}", abslot::ELF);
+    let staged = abimage::stage_image(&src);
+    let rec = abimage::kelf_record();
+    // The bytes the stage left as KERNEL.NEW, read back whole: the B row must be THEIR sha256 and pass the loader's check.
+    let new_bytes = {
+        let mt = crate::shell::vfs_mount_table();
+        let p = alloc::format!("/boot/{}", abslot::NEW);
+        mt.stat(&p).ok().and_then(|st| mt.read(&p, 0, st.size as usize).ok())
+    };
+    let (rows, rows_ok, b_sha) = match (&staged, rec.as_deref(), new_bytes.as_deref()) {
+        (Ok(st), Some(r), Some(nb)) => {
+            let n = r.split(|&c| c == b'\n').filter(|l| !l.is_empty()).count();
+            let sha = crypto_core::sha2::sha256(nb);
+            let b = kelfsha::find(r, kelfsha::SLOT_B);
+            let a_kept = a_before.is_none() || kelfsha::find(r, kelfsha::SLOT_A) == a_before;
+            let ok = b.is_some_and(|b| b.sha == sha && b.sha == st.sha)
+                && kelfsha::check(Some(r), kelfsha::SLOT_B, &sha, nb) == kelfsha::Check::Ok
+                && a_kept
+                && n == if a_before.is_some() { 2 } else { 1 };
+            (n, ok, Some(sha))
+        }
+        _ => (0, false, None),
+    };
+    // The promotion's rewrite, on the record: one row, slot A, file=KERNEL.ELF, B's sha — and the loader's A check
+    // of the promoted bytes (KERNEL.NEW's) says ok.
+    let promoted_ok = match (rec.as_deref(), b_sha, new_bytes.as_deref()) {
+        (Some(r), Some(sha), Some(nb)) => {
+            let mut out = [0u8; kelfsha::MAX];
+            kelfsha::promoted(r, &mut out).is_some_and(|n| {
+                let p = &out[..n];
+                p.split(|&c| c == b'\n').filter(|l| !l.is_empty()).count() == 1
+                    && kelfsha::find(p, kelfsha::SLOT_B).is_none()
+                    && kelfsha::find(p, kelfsha::SLOT_A).is_some_and(|a| a.sha == sha)
+                    && p.windows(16).any(|w| w == b"file=KERNEL.ELF ")
+                    && kelfsha::check(Some(p), kelfsha::SLOT_A, &sha, nb) == kelfsha::Check::Ok
+            })
+        }
+        _ => false,
+    };
+    // The fallback trial: the loader's A->B fallback marks `why=trial` with no stage; the kernel promotes a trial only
+    // when it is running slot B; an older loader keeps ABIMAGE's rule; the loader's next decision on that record is ELF.
+    let cases: [(&str, bool, bool, Option<u8>, bool); 5] = [
+        ("fallback-nostage", false, true, Some(1), true),
+        ("fallback-staged", true, true, Some(1), true),
+        ("torn-new-ran-A", true, true, Some(0), false),
+        ("old-loader", true, true, None, true),
+        ("no-trial", true, false, Some(1), false),
+    ];
+    let mut case_ok = 0u32;
+    for (name, st, tr, booted, want) in cases {
+        let got = abimage::should_promote(st, tr, booted);
+        case_ok += (got == want) as u32;
+        serial_println!("[kelfstage] case={} promote={} -> {}", name, got as u8, if got == want { "ok" } else { "WRONG" });
+    }
+    let d = abslot::decide(None, Some(abslot::REC_TRIAL));
+    let fallback_ok = case_ok == 5 && d.slot == abslot::Slot::Elf && d.why == abslot::Why::Normal;
+    let cleaned = abimage::unstage().is_ok();
+    let after = abimage::kelf_record();
+    let unstaged_ok = cleaned
+        && after.as_deref().map_or(true, |r| kelfsha::find(r, kelfsha::SLOT_B).is_none())
+        && after.as_deref().and_then(|r| kelfsha::find(r, kelfsha::SLOT_A)) == a_before;
+    serial_println!(
+        "[kelfstage] stage={} rows={} a_row={} unstaged={}",
+        match &staged { Ok(_) => "ok", Err(e) => *e },
+        rows,
+        if a_before.is_some() { "builder" } else { "absent" },
+        unstaged_ok as u8
+    );
+    let pass = rows == 2 && rows_ok && promoted_ok && fallback_ok && unstaged_ok;
+    let w = |b: bool| if b { "ok" } else { "bad" };
+    serial_println!(
+        ":: KELFSTAGE: rows={} promoted_row={} fallback_trial={} -> {} ::",
+        rows, w(rows_ok && promoted_ok), w(fallback_ok && unstaged_ok), if pass { "PASS" } else { "FAIL" }
+    );
 }

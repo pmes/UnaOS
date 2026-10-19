@@ -21,6 +21,13 @@
 //!
 //! `tests abimage`: stage a copy of the running kernel, assert the record, assert `abslot::decide`'s four cases,
 //! then remove the stage it made; then the same through the `stage` verb (its printed line and the record it left).
+//!
+//! KELFSTAGE (rmbp-ledger B720, BP-boot-17): `KELF.SHA` follows the slots. The stage writes the slot-B row (sha256 of
+//! the RE-READ `KERNEL.NEW`, `kelfsha::kelf_of`'s `kelf=`) before `STAGE.REC`; the promotion, AFTER both renames,
+//! respells it as the slot-A row (`kelfsha::promoted`) so `hash=ok` survives an update; a failed rename leaves the old
+//! row; the unstage drops the B row. The promotion is decided by [`should_promote`]: a trial that the running kernel
+//! is slot B (the loader's verdict) — which is also how the loader's A->B hash fallback (`why=trial`, no stage) ends.
+//! `tests kelfstage` (tests.rs tail).
 
 use alloc::format;
 use alloc::string::String;
@@ -29,6 +36,12 @@ use alloc::vec::Vec;
 use super::abslot::{self, Slot, Why, Write};
 use crate::fs::bootfat::{self, Writer};
 use crate::fs::vfs::{MountTable, NodeKind, KERNEL_PRINCIPAL};
+
+// KELFSTAGE (B720): the KELF.SHA record — the very file the UEFI loader checks and the builder writes, compiled here by
+// path (`crates/bootloader/src/kelfsha.rs`), so the stage's row and the loader's check cannot disagree.
+#[allow(dead_code)]
+#[path = "../../../bootloader/src/kelfsha.rs"]
+pub(crate) mod kelfsha;
 
 const CHUNK: usize = 1 << 20;
 
@@ -81,6 +94,60 @@ pub struct Staged {
     pub kelf: u64,
     pub bytes: u64,
     pub crc: u32,
+    /// KELFSTAGE: the sha256 of `KERNEL.NEW` as re-read, the slot-B row's.
+    pub sha: [u8; 32],
+}
+
+/// KELFSTAGE: `KELF.SHA`'s bytes (at most `kelfsha::MAX`); `None` when absent.
+fn read_kelf(mt: &MountTable) -> Option<Vec<u8>> {
+    let p = esp(kelfsha::NAME);
+    let st = mt.stat(&p).ok()?;
+    mt.read(&p, 0, (st.size as usize).min(kelfsha::MAX)).ok()
+}
+
+/// KELFSTAGE: `KELF.SHA` as the namespace holds it (`tests kelfstage`).
+pub fn kelf_record() -> Option<Vec<u8>> {
+    read_kelf(&crate::shell::vfs_mount_table())
+}
+
+/// KELFSTAGE: replace `slot`'s row (`None` drops it). No record and nothing to add = nothing written.
+fn kelf_put_row(mt: &MountTable, slot: u8, row: Option<&[u8]>) -> Result<(), &'static str> {
+    let old = read_kelf(mt);
+    if old.is_none() && row.is_none() {
+        return Ok(());
+    }
+    let mut out = [0u8; kelfsha::MAX];
+    let n = kelfsha::with_row(old.as_deref().unwrap_or(&[]), slot, row, &mut out).ok_or("kelfsha-full")?;
+    put(mt, kelfsha::NAME, &out[..n]).map_err(|_| "kelfsha-write")
+}
+
+/// KELFSTAGE: the record after KERNEL.NEW became KERNEL.ELF — the B row respelled as A; with no B row the A row would
+/// describe the outgoing image, so the record is removed (`no-record` = `unverified`, never a lockout). The word says
+/// which.
+fn kelf_promote(mt: &MountTable) -> &'static str {
+    let Some(old) = read_kelf(mt) else { return "none" };
+    let mut out = [0u8; kelfsha::MAX];
+    match kelfsha::promoted(&old, &mut out) {
+        Some(n) => match put(mt, kelfsha::NAME, &out[..n]) {
+            Ok(()) => "row-A",
+            Err(_) => "write-FAILED",
+        },
+        None => match drop_file(mt, kelfsha::NAME) {
+            Ok(()) => "dropped-no-B-row",
+            Err(_) => "drop-FAILED",
+        },
+    }
+}
+
+/// KELFSTAGE: THE PROMOTION DECISION. `booted` is the slot the loader jumped to (`BootInfo::kelf`, 0 = A, 1 = B;
+/// `None` for a loader older than KELFHASH). With a verdict: a trial (`why=trial`) promotes iff the kernel running is
+/// slot B — the user-restart trial and the loader's A->B hash fallback alike, and never a B->A fallback (the torn
+/// KERNEL.NEW stays where it is). Without one: ABIMAGE's rule, staged and a trial.
+pub fn should_promote(staged: bool, trial: bool, booted: Option<u8>) -> bool {
+    trial && match booted {
+        Some(slot) => slot == 1,
+        None => staged,
+    }
 }
 
 /// Stage `path` (any readable path in the namespace) as `KERNEL.NEW`. The running image is untouched; the switch is
@@ -93,7 +160,7 @@ pub fn stage_image(path: &str) -> Result<Staged, &'static str> {
     }
     let head = mt.read(path, 0, (st.size as usize).min(64 << 10)).map_err(|_| "source-read")?;
     let kelf = kelf_of(&head).ok_or("not-a-kernel-elf")?;
-    let _unlock = bootfat::fat_unlock(Writer::Updater, "KERNEL.NEW + STAGE.REC");
+    let _unlock = bootfat::fat_unlock(Writer::Updater, "KERNEL.NEW + KELF.SHA + STAGE.REC");
     if !bootfat::allows() {
         return Err("esp-locked");
     }
@@ -123,22 +190,30 @@ pub fn stage_image(path: &str) -> Result<Staged, &'static str> {
     }
     let crc = crc.finish();
     let mut back = crate::hash::Crc32::new();
+    let mut sha = crypto_core::sha2::Sha256::new();
     let mut off = 0u64;
     while off < st.size {
         let want = ((st.size - off) as usize).min(CHUNK);
         let buf = mt.read(&new, off, want).map_err(|_| "new-reread")?;
         back.update(&buf);
+        sha.update(&buf);
         off += want as u64;
     }
     if back.finish() != crc || mt.stat(&new).map(|s| s.size).ok() != Some(st.size) {
         return Err("new-verify");
     }
+    let sha = sha.finalize();
     put(&mt, abslot::SHUTDOWN, abslot::REC_STAGED)?;
+    // KELFSTAGE (B720): the slot-B row, BEFORE STAGE.REC (a stage whose row is not written is no stage).
+    let mut row = [0u8; kelfsha::ROW_MAX];
+    let rn = kelfsha::row(&sha, abslot::NEW, kelfsha::SLOT_B, kelfsha::kelf_of(&head).unwrap_or(kelf), &mut row);
+    kelf_put_row(&mt, kelfsha::SLOT_B, Some(&row[..rn]))?;
     let mut rec = [0u8; abslot::REC_MAX];
     let n = abslot::stage_record(kelf, st.size, crc, &mut rec);
     put(&mt, abslot::STAGE, &rec[..n])?;
-    serial_println!("[update] staged kelf={:#x} bytes={} crc={:#010x} from={} (loader switches after a user restart)", kelf, st.size, crc, path);
-    Ok(Staged { kelf, bytes: st.size, crc })
+    let short = kelfsha::short(&sha);
+    serial_println!("[update] staged kelf={:#x} bytes={} crc={:#010x} row=B sha={} from={} (loader switches after a user restart)", kelf, st.size, crc, core::str::from_utf8(&short).unwrap_or("?"), path);
+    Ok(Staged { kelf, bytes: st.size, crc, sha })
 }
 
 /// `stage <path>` (STAGEVERB B690, BP-bar-8): stage a kernel ELF as `KERNEL.NEW` through [`stage_image`]. The shell's
@@ -164,6 +239,7 @@ pub fn unstage() -> Result<(), &'static str> {
     heal(&mt)?;
     drop_file(&mt, abslot::STAGE)?;
     drop_file(&mt, abslot::NEW)?;
+    kelf_put_row(&mt, kelfsha::SLOT_B, None)?; // KELFSTAGE: no KERNEL.NEW, no B row
     drop_file(&mt, abslot::SHUTDOWN)
 }
 
@@ -186,21 +262,26 @@ pub fn note_user_shutdown(action: &str) {
 pub fn desktop_built(pass: bool) {
     let mt = crate::shell::vfs_mount_table();
     let stage = read_rec(&mt, abslot::STAGE);
-    if !abslot::staged(stage.as_deref()) {
-        return;
-    }
+    let staged = abslot::staged(stage.as_deref());
     let shut = read_rec(&mt, abslot::SHUTDOWN);
-    if shut.as_deref().and_then(|r| abslot::field(r, b"why")) != Some(&b"trial"[..]) {
-        return; // staged, but this boot is the current image: nothing to promote
+    let trial = shut.as_deref().and_then(|r| abslot::field(r, b"why")) == Some(&b"trial"[..]);
+    let booted = crate::tests::kelf_booted_slot();
+    if !should_promote(staged, trial, booted) {
+        if trial && booted == Some(0) {
+            // KELFSTAGE: the loader fell back from a torn KERNEL.NEW to A on its own trial: never promote the torn file.
+            serial_println!("[update] trial ran slot=A (the loader fell back from KERNEL.NEW): not promoted");
+        }
+        return; // no trial, or this boot is the current image: nothing to promote
     }
     let kelf = stage.as_deref().and_then(|r| abslot::field(r, b"kelf")).and_then(abslot::parse_hex).unwrap_or(0);
+    let via = if staged { "stage" } else { "kelf-fallback" };
     if !pass {
-        serial_println!("[update] trial kelf={:#x} desktopbuilt=FAIL: not promoted (the loader falls back next boot)", kelf);
+        serial_println!("[update] trial kelf={:#x} via={} desktopbuilt=FAIL: not promoted (the loader falls back next boot)", kelf, via);
         return;
     }
     match promote(&mt) {
-        Ok(()) => serial_println!("[update] promoted NEW -> ELF kelf={:#x} (desktopbuilt PASS on the trial boot)", kelf),
-        Err(e) => serial_println!("[update] promote kelf={:#x} -> FAILED {} (the loader falls back next boot)", kelf, e),
+        Ok(k) => serial_println!("[update] promoted NEW -> ELF kelf={:#x} via={} kelfsha={} (desktopbuilt PASS on the trial boot)", kelf, via, k),
+        Err(e) => serial_println!("[update] promote kelf={:#x} via={} -> FAILED {} (the loader falls back next boot)", kelf, via, e),
     }
 }
 
@@ -211,11 +292,13 @@ fn heal(mt: &MountTable) -> Result<(), &'static str> {
         return Ok(());
     }
     mt.rename(&esp(abslot::NEW), &esp(abslot::ELF), KERNEL_PRINCIPAL).map_err(|_| "heal-rename")?;
-    serial_println!("[update] healed a torn promotion: KERNEL.NEW -> KERNEL.ELF");
+    let k = kelf_promote(mt); // KELFSTAGE: the record follows the rename
+    serial_println!("[update] healed a torn promotion: KERNEL.NEW -> KERNEL.ELF kelfsha={}", k);
     drop_file(mt, abslot::OLD)
 }
 
-fn promote(mt: &MountTable) -> Result<(), &'static str> {
+/// Ok carries the KELF.SHA rewrite's word (KELFSTAGE): the record is rewritten only AFTER both renames held.
+fn promote(mt: &MountTable) -> Result<&'static str, &'static str> {
     let _unlock = bootfat::fat_unlock(Writer::Updater, "promote KERNEL.NEW -> KERNEL.ELF");
     if !bootfat::allows() {
         return Err("esp-locked");
@@ -226,9 +309,10 @@ fn promote(mt: &MountTable) -> Result<(), &'static str> {
     drop_file(mt, abslot::OLD)?;
     mt.rename(&esp(abslot::ELF), &esp(abslot::OLD), KERNEL_PRINCIPAL).map_err(|_| "rename-elf-old")?;
     mt.rename(&esp(abslot::NEW), &esp(abslot::ELF), KERNEL_PRINCIPAL).map_err(|_| "rename-new-elf")?;
+    let k = kelf_promote(mt);
     drop_file(mt, abslot::OLD)?;
     drop_file(mt, abslot::STAGE)?;
-    put(mt, abslot::SHUTDOWN, abslot::REC_PROMOTED)
+    put(mt, abslot::SHUTDOWN, abslot::REC_PROMOTED).map(|()| k)
 }
 
 /// `tests abimage` — stage a copy of the running kernel, assert the record, assert the loader's decision function's
