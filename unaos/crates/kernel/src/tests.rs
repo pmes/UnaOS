@@ -4542,6 +4542,21 @@ fn trashtoast_selftest() {
     let solo_toasts = undo::trash_toasts() - t1;
     let solo_back = solo_ok && solo_seq.map(|s| undo::from_toast(&s.to_le_bytes()) == "quarry-undone").unwrap_or(false) && at(&solo);
     let single = solo_toasts == 1 && solo_back;
+    // DNDTRASH (B753): a drag of three onto the dock's Trash tile — `dnd::deliver`, the release's own call — is one
+    // entry and one toast, and one Ctrl+Z (`undo::undo`) brings all three back; a drag of one posts one toast (M2)
+    let dnd_files: Vec<String> = ["DND1.TXT", "DND2.TXT", "DND3.TXT"].iter().map(|n| format!("{}/{}", base, n)).collect();
+    let dnd_made = dnd_files.iter().all(|p| mk(p));
+    let pl = |paths: Vec<String>| crate::video::dnd::Payload { kind: crate::video::dnd::Kind::File, paths, dir: false, from: crate::video::wm::WIN_NONE, label: String::from("dnd") };
+    let (d0, t2) = (undo::depth().0, undo::trash_toasts());
+    let (_, d_ok) = crate::video::dnd::deliver(&pl(dnd_files.clone()), &crate::video::dnd::Target::Trash, false);
+    let d_toasts = undo::trash_toasts() - t2;
+    let d_entries = undo::depth().0.saturating_sub(d0);
+    let d_gone = dnd_files.iter().all(|p| !at(p));
+    let d_undone = undo::undo().is_ok() && dnd_files.iter().all(|p| at(p));
+    let t3 = undo::trash_toasts();
+    let (_, s_ok) = crate::video::dnd::deliver(&pl(alloc::vec![dnd_files[0].clone()]), &crate::video::dnd::Target::Trash, false);
+    let d_single = s_ok && undo::trash_toasts() - t3 == 1 && !at(&dnd_files[0]) && undo::undo().is_ok() && at(&dnd_files[0]);
+    let dnd = dnd_made && d_ok && d_toasts == 1 && d_entries == 1 && d_gone && d_undone && d_single;
     // clean-up: anything still in the Trash from the scratch folder, then the folder
     for e in crate::fs::trash::entries().into_iter().filter(|e| e.orig.starts_with(&base)) {
         if crate::fs::trash::restore(&e.name).is_ok() {
@@ -4551,9 +4566,9 @@ fn trashtoast_selftest() {
     let _ = ops::op_delete(&base);
     let leftovers = at(&base) as usize + crate::fs::trash::entries().iter().filter(|e| e.orig.starts_with(&base)).count();
     undo::fixture_put(saved);
-    serial_println!("[trashtoast] made={} entries={} gone={} pressed={} single={} leftovers={} base={}", made, entries, gone, pressed, single, leftovers, base);
-    let pass = made && items == 3 && toasts == 1 && entries == 1 && gone && pressed == "quarry-undone" && undone == 3 && single && leftovers == 0;
-    serial_println!(":: TRASHTOAST: items={} toasts={} undone={} -> {} ::", items, toasts, undone, if pass { "PASS" } else { "FAIL" });
+    serial_println!("[trashtoast] made={} entries={} gone={} pressed={} single={} leftovers={} base={} dnd_toasts={} dnd_entries={} dnd_gone={} dnd_undone={} dnd_single={}", made, entries, gone, pressed, single, leftovers, base, d_toasts, d_entries, d_gone, d_undone, d_single);
+    let pass = made && items == 3 && toasts == 1 && entries == 1 && gone && pressed == "quarry-undone" && undone == 3 && single && leftovers == 0 && dnd;
+    serial_println!(":: TRASHTOAST: items={} toasts={} undone={} -> {} :: dnd={}", items, toasts, undone, if pass { "PASS" } else { "FAIL" }, if dnd { "ok" } else { "FAIL" });
 }
 // ══════════════ UNDOKEYS (rmbp-ledger B743) — `tests undokeys` — TAIL-APPENDED ══════════════
 

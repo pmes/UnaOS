@@ -5231,3 +5231,12 @@ fn menu_new_window(owner: u64) {
         None => serial_println!("[dock] menu new-window owner={:#x} -> no-app", owner),
     }
 }
+
+// ── DNDTRASH (rmbp-ledger B753) — a Trash-tile drop routed through Quarry's journal still owes the dock its re-poll ──
+// `video::dnd::deliver` trashes through `quarry::undo` (one entry, one toast per drop); this is `dnd_drop`'s tail
+// without the move: the Trash tile's fullness is re-read on the next service pass and the strip owes a composite.
+#[cfg(feature = "quarry")]
+pub(crate) fn dnd_trashed() {
+    TRASH_POLLED.store(0, Ordering::Relaxed);
+    PASS_OWED.store(true, Ordering::Release);
+}
