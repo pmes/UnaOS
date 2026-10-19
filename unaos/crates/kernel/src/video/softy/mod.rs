@@ -102,6 +102,7 @@ pub fn selftest() {
         && lum(d(S::TextPrimary)) > 4 * lum(d(S::SurfaceWindow))
         && d(S::AccentFill) == crate::video::theme::accent();
     let accent_ok = palette::ACCENT() == crate::video::theme::accent();
+    let (own, own_n) = palette::dark_own();
     // 9. The caption buttons' pressed state: a latched press on the focused window's close button reads back pressed.
     let pressed = match wm::wl_focused() {
         Some((id, _)) => {
@@ -112,7 +113,7 @@ pub fn selftest() {
         }
         None => "nowindow",
     };
-    let s2_ok = keys_ok && q_open && q_close && c_open && c_close && band > 0 && dark_ok && accent_ok && pressed != "no";
+    let s2_ok = keys_ok && q_open && q_close && c_open && c_close && band > 0 && dark_ok && accent_ok && pressed != "no" && own == own_n;
     // 10. SOFTY3 (B651): the clock's flyout opens notify's OWN Center beside it and closes it with itself — the request
     //     is notify's seam (`request_center`), acted on by its service pass, which the leg drives once per press.
     //     The Center the operator had open is asked back at the end.
@@ -137,12 +138,12 @@ pub fn selftest() {
     let ok = (switched || was == look::Look::Softy) && geo_ok && painted == Some(want) && open_ok && close_ok && tile_ok && btn_ok && s2_ok && (back || was == look::Look::Softy) && gone && dock_back && bar_back;
     let yn = |b: bool| if b { "ok" } else { "no" };
     serial_println!(
-        ":: SOFTY: switch={} bar={},{},{}x{} tiles={} start={},{} tile={} buttons={} keys=softy-mac:{},una-pc:{},tap:{},spoil:{} quick={} calendar={},{} shadow={} dark={}/{} accent={} pressed={} back={},{} -> {} ::",
+        ":: SOFTY: switch={} bar={},{},{}x{} tiles={} start={},{} tile={} buttons={} keys=softy-mac:{},una-pc:{},tap:{},spoil:{} quick={} calendar={},{} shadow={} dark={}/{} own={}/{} accent={} pressed={} back={},{} -> {} ::",
         if switched { "ok" } else { "no" }, want.0, want.1, want.2, want.3, tiles,
         if open_ok { "open" } else { "no" }, if close_ok { "close" } else { "no" }, tile_word, btn,
         yn(k_mac), yn(k_pc), yn(k_tap), yn(k_spoil), q_word,
         if c_open { "open" } else { "no" }, if c_close { "close" } else { "no" }, band,
-        if dark_ok { named } else { 0 }, palette::SEMS.len(), if accent_ok { "table" } else { "no" }, pressed,
+        if dark_ok { named } else { 0 }, palette::SEMS.len(), own, own_n, if accent_ok { "table" } else { "no" }, pressed,
         if bar_back { "menubar" } else { "no-menubar" }, if dock_back { "dock" } else { "no-dock" },
         if ok { "PASS" } else { "FAIL" }
     );

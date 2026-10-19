@@ -41,21 +41,30 @@ the settings service pass, never in the input router. A switch is one act with n
 
 ## Dimensions and colours (logical px at 96 ppi; the glass scales them with `ui::px`)
 
-| Token | Value | Use |
-|---|---|---|
-| `SURFACE` | `#F3F3F3` | taskbar, the focused window's head and frame |
-| `SURFACE_IDLE` | `#FAFAFA` | an unfocused window's head and frame |
-| `FLYOUT` / `FLYOUT_FOOT` | `#F9F9F9` / `#EFEFEF` | Start and calendar body / Start footer |
-| `TEXT` / `TEXT_2` / `TEXT_IDLE` | `#202020` / `#5C5C5C` / `#8C8C8C` | ink / secondary / unfocused caption |
-| `ACCENT` / `ON_ACCENT` | `#0067C0` / `#FFFFFF` | the one accent; ink on it |
-| `STROKE` at `STROKE_A` | black at 26/255 (~10 %) | every hairline: the bar's top edge, flyout outlines, dividers |
-| `EDGE_IDLE` | `#C8C8C8` | an unfocused window's 1 px border (focused: `ACCENT`) |
-| `HOVER` at `HOVER_A` | white at 190/255 | a hovered tile, tray group, clock |
-| `PRESS` at `PRESS_A` | black at 14/255 | pressed |
-| `BTN_HOVER_A` | black at 18/255 | hovered minimise / maximise |
-| `CLOSE_HOT` / `CLOSE_INK` | `#C42B1C` / `#FFFFFF` | the close button under the pointer |
-| `FIELD` / `FIELD_LINE` | `#FFFFFF` / `#8A8A8A` | the search field and its editable underline |
-| `PIP` | `#8C8C8C` | a running app's pip (focused: `ACCENT`) |
+Colour tokens carry a Light and a Dark value (SOFTYDARK, rmbp-ledger B694): `system.appearance.mode` picks the
+column through `theme::is_dark`, exactly as it picks the Una look's. Light is `palette_core::softy`, Dark is
+`palette_core::softy::dark`, every Dark value OKLCH (L, 0): the grounds chosen on a ramp (dark elevation rises toward
+light, DESIGN-LANGUAGE §2.3), the inks SOLVED as the lowest L reaching their floor on all five Dark grounds (the
+derivation is the module's head). Increase contrast takes `palette_core::contrast::softy` (Light) and its Dark twins
+`contrast::softy::dark`: TEXT `#FAFAFA`, TEXT_2 `#CDCDCD` (9:1), TEXT_IDLE `#B5B5B5` (7:1), EDGE_IDLE `#737373` (3:1),
+FIELD_LINE `#919191` (4.5:1). The accent is the accent table's in both modes; in Dark the focused edge and the pips
+take §2.3 `accent.ink`.
+
+| Token | Light | Dark | Use |
+|---|---|---|---|
+| `SURFACE` | `#F3F3F3` | `#1F1F1F` (L 0.240) | taskbar, the focused window's head and frame; in Dark the taskbar lays it at `VEIL_A` 199/255 (78 %, §2.4) over the wallpaper's VEIL |
+| `SURFACE_IDLE` | `#FAFAFA` | `#1B1B1B` (L 0.220) | an unfocused window's head and frame |
+| `FLYOUT` / `FLYOUT_FOOT` | `#F9F9F9` / `#EFEFEF` | `#2A2A2A` (L 0.285) / `#232323` (L 0.255) | Start and calendar body / Start footer |
+| `TEXT` / `TEXT_2` / `TEXT_IDLE` | `#202020` / `#5C5C5C` / `#8C8C8C` | `#F2F2F2` (12.8:1) / `#A8A8A8` (6:1) / `#919191` (4.5:1) | ink / secondary / unfocused caption |
+| `ACCENT` / `ON_ACCENT` | the accent table / `#FFFFFF` | the same | the one accent; ink on it |
+| `STROKE` at `STROKE_A` | black at 26/255 (~10 %) | white at 20/255 | every hairline: the bar's top edge, flyout outlines, dividers |
+| `EDGE_IDLE` | `#C8C8C8` | `#3E3E3E` (1.6:1 on its head, the Light table's own measure) | an unfocused window's 1 px border (focused: `ACCENT`; Dark: `accent.ink`) |
+| `HOVER` at `HOVER_A` | white at 190/255 | white at 18/255 | a hovered tile, tray group, clock |
+| `PRESS` at `PRESS_A` | black at 14/255 | white at 10/255 | pressed |
+| `BTN_HOVER_A` | black at 18/255 | white at 22/255 | hovered minimise / maximise |
+| `CLOSE_HOT` / `CLOSE_INK` | `#C42B1C` / `#FFFFFF` | the same | the close button under the pointer |
+| `FIELD` / `FIELD_LINE` | `#FFFFFF` / `#8A8A8A` | `#161616` (L 0.200, sunken) / `#737373` (3:1) | the search field and its editable underline |
+| `PIP` | `#8C8C8C` | `#919191` | a running app's pip (focused: `ACCENT`) |
 | `APP_HUES` | eleven calm hues | monogram tiles when the registrar has no icon |
 | `BAR_H` | 48 | the taskbar's height |
 | `TILE_W` x `TILE_H`, `TILE_GAP`, `TILE_R` | 44 x 40, 4, 6 | one taskbar button |
@@ -159,6 +168,11 @@ assert the taskbar is gone, the dock tenant is the dock's again and the menu bar
 :: SOFTY: switch=ok bar=0,<y>,<pw>x<h> tiles=<n> start=open,close tile=<app> buttons=right(min,max,close) back=menubar,dock -> PASS ::
 ```
 
+SOFTYDARK (B694) adds `own=<n>/15` beside SOFTY2's `dark=<n>/19` (the §2.3 names): `palette::dark_own()` walks
+Softy's fifteen colour roles on its DARK set whatever mode is live (the grounds rise and stay dark, the inks meet
+their floors on all five Dark grounds, the washes and hairline sit above the band, the close glyph reads) and PASS
+needs `own=15/15`. The one line that prints it is `video/softy/mod.rs`'s, the seat's at the fold.
+
 `buttons=nowindow` is a pass with no focused window to ask.
 
 ## Not yet Windows-like (owed)
@@ -168,7 +182,12 @@ Replaced 2026-10-19 by WINKEY (rmbp-ledger B665) with SOFTY3's list (`docs/dev/e
 
 * DONE in SOFTY2 (B641): the Win key (a bare tap of the key playing the Windows role, R126), Settings > Appearance >
   Look, soft shadows under the flyouts (`paint::shadow`, elev.2), pressed states (caption buttons, taskbar), quick
-  settings (sound, Wi-Fi, battery), dark Softy (`palette::dark(Sem)`).
+  settings (sound, Wi-Fi, battery), dark Softy over the Una look's Dark column (`palette::dark(Sem)`).
+* DONE in SOFTYDARK (B694): **Softy's OWN Dark set** (`palette_core::softy::dark`, OKLCH, the table above) picked by
+  `appearance.mode`, the taskbar under the VEIL in Dark, increase-contrast Dark twins (`contrast::softy::dark`), all
+  floors re-derived at build time. `palette::dark(Sem)` now serves only the accent's derivations. The pressed states
+  (caption buttons: `chrome`'s `PRESSED_BIT` latch; the taskbar: `Model::pressed` from the pointer's level) were already
+  latched by SOFTY2 and are unchanged.
 * DONE in SOFTY3 (B651): the clock opens notify's own Center beside the calendar.
 * DONE in WINKEY (B665): **Start's ONE trigger is the tap counter** — `keymap::tap_track` (from `note_mods`, every HID
   report of both decoders) counts a bare press-and-release of the key that plays the Windows role (Option on a Mac

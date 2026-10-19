@@ -559,6 +559,53 @@ pub mod softy {
     0x138C88, // una
     0xC9465C, // stria
     ];
+
+    /// SOFTYDARK (rmbp-ledger B694) — Softy's OWN Dark set, selected by `system.appearance.mode` exactly as the Una
+    /// look's Dark column is (`video::softy::palette` picks per paint through `theme::is_dark`). Windows 11's dark
+    /// comfort, our values: a near-black taskbar under the VEIL, near-black heads, a lighter flyout (dark elevation is
+    /// LIGHTER, DESIGN-LANGUAGE §2.3), light ink, white hairlines at a whisper; the accent stays the accent table's.
+    ///
+    /// DERIVATION (palette_core::contrast's method, rerunnable): every value is OKLCH (L, 0, -) — chroma 0, like the
+    /// Light table above — → OKLab → linear sRGB (Ottosson) → gamma-encoded, 8 bits. The GROUNDS are chosen on a
+    /// ramp: FIELD 0.200 → 161616 (the sunken search well), SURFACE_IDLE 0.220 → 1B1B1B, SURFACE 0.240 → 1F1F1F,
+    /// FLYOUT_FOOT 0.255 → 232323, FLYOUT 0.285 → 2A2A2A. The INKS are SOLVED: each is the LOWEST L (0.001 steps)
+    /// whose WCAG 2.x ratio to the lightest of the five grounds (FLYOUT) reaches its target: TEXT pinned at L 0.960 →
+    /// F2F2F2 (12.82); TEXT_2 6:1 (the Light ramp's 5.8, made a floor) → 0.730 A8A8A8 (6.03); TEXT_IDLE 4.5:1 → 0.656
+    /// 919191 (4.55); FIELD_LINE 3:1 ([S39]) → 0.554 737373 (3.02); EDGE_IDLE takes the Light table's own measure,
+    /// its border against its idle head (C8C8C8 on FAFAFA, 1.60:1) → 0.362 3E3E3E (1.61 on 1B1B1B). The const block
+    /// in `contrast` re-derives every floor from the hex at build time.
+    pub mod dark {
+        /// The taskbar (under the VEIL at [`VEIL_A`]) and the focused window's head.
+        pub const SURFACE: u32 = 0x1F1F1F;
+        /// An unfocused head: one step DOWN (it recedes; dark elevation rises toward light).
+        pub const SURFACE_IDLE: u32 = 0x1B1B1B;
+        /// The Start menu's, the calendar's and quick settings' body (an overlay: lighter).
+        pub const FLYOUT: u32 = 0x2A2A2A;
+        /// The Start menu's footer band.
+        pub const FLYOUT_FOOT: u32 = 0x232323;
+        /// Primary ink.
+        pub const TEXT: u32 = 0xF2F2F2;
+        /// Secondary ink.
+        pub const TEXT_2: u32 = 0xA8A8A8;
+        /// An unfocused window's caption.
+        pub const TEXT_IDLE: u32 = 0x919191;
+        /// The hairline: white, at the dark alpha (`rim.dark`'s idea: edges survive a dark wallpaper).
+        pub const STROKE: u32 = 0xFFFFFF;
+        /// An unfocused window's 1 px border.
+        pub const EDGE_IDLE: u32 = 0x3E3E3E;
+        /// A hovered control's wash and a pressed one's: white at a whisper (the dark state layers).
+        pub const HOVER: u32 = 0xFFFFFF;
+        pub const PRESS: u32 = 0xFFFFFF;
+        /// The close button under the pointer: the same red in both modes (status colours never change by theme).
+        pub const CLOSE_HOT: u32 = super::CLOSE_HOT;
+        /// The search field's face (sunken, below every ground) and its editable underline.
+        pub const FIELD: u32 = 0x161616;
+        pub const FIELD_LINE: u32 = 0x737373;
+        /// The idle running pip.
+        pub const PIP: u32 = TEXT_IDLE;
+        /// The VEIL's tint for the taskbar: `SURFACE` at 78 % over the blurred wallpaper (DESIGN-LANGUAGE §2.4, Dark).
+        pub const VEIL_A: u8 = 199;
+    }
 }
 
 /// STARFIELD (rmbp-ledger B661, R128) — the generated default wallpaper's palette: dark matter on ULTRA BLACK, the
@@ -620,8 +667,9 @@ pub mod starfield {
 /// SOFTY's Light table is its own (chroma 0, `softy::*`), so its pairs are solved the same way against Softy's five
 /// grounds (SURFACE, SURFACE_IDLE, FLYOUT, FLYOUT_FOOT, FIELD): TEXT L 0.13 → 070707 (17.52), TEXT_2 9:1 → 404040
 /// (9.02), TEXT_IDLE 7:1 → 505050 (7.01), EDGE_IDLE 3:1 → 8A8A8A (3.00), FIELD_LINE 4.5:1 → 6C6C6C (4.57); the idle
-/// pip takes TEXT_IDLE. Softy's Dark reads the Dark column above (its `Sem` seam). The const block at the end of this
-/// module re-derives every ratio from the hex at compile time ([`ratio_x100`]) and fails the build below a floor.
+/// pip takes TEXT_IDLE. Softy's Dark is its own set (`super::softy::dark`, SOFTYDARK B694), its twins solved against
+/// its five Dark grounds (`softy::dark` here). The const blocks at the end of this module re-derive every ratio from
+/// the hex at compile time ([`ratio_x100`]) and fail the build below a floor.
 pub mod contrast {
     use super::{Tok, TOKENS};
 
@@ -680,6 +728,19 @@ pub mod contrast {
         pub const EDGE_IDLE: u32 = 0x8A8A8A;
         pub const FIELD_LINE: u32 = 0x6C6C6C;
         pub const PIP: u32 = TEXT_IDLE;
+
+        /// SOFTYDARK (B694): the Dark twins, solved the same way against Softy's five DARK grounds (the LOWEST L
+        /// reaching the target, chroma 0): TEXT pinned at L 0.985 → FAFAFA (13.75), TEXT_2 9:1 → 0.847 CDCDCD (9.02),
+        /// TEXT_IDLE 7:1 → 0.772 B5B5B5 (7.00), EDGE_IDLE 3:1 → 0.554 737373 (3.02), FIELD_LINE 4.5:1 → 0.656 919191
+        /// (4.55); the idle pip takes TEXT_IDLE.
+        pub mod dark {
+            pub const TEXT: u32 = 0xFAFAFA;
+            pub const TEXT_2: u32 = 0xCDCDCD;
+            pub const TEXT_IDLE: u32 = 0xB5B5B5;
+            pub const EDGE_IDLE: u32 = 0x737373;
+            pub const FIELD_LINE: u32 = 0x919191;
+            pub const PIP: u32 = TEXT_IDLE;
+        }
     }
 
     /// One 8-bit sRGB channel, linearised (WCAG 2.x). `x^2.4 = x^2 * (x^2)^(1/5)`; the fifth root by Newton from 1.0
@@ -748,6 +809,47 @@ pub mod contrast {
         }
         m
     }
+
+    /// SOFTYDARK (B694): Softy's five DARK grounds.
+    pub const SOFTY_DARK_GROUNDS: [u32; 5] = [
+        super::softy::dark::SURFACE,
+        super::softy::dark::SURFACE_IDLE,
+        super::softy::dark::FLYOUT,
+        super::softy::dark::FLYOUT_FOOT,
+        super::softy::dark::FIELD,
+    ];
+
+    /// The lowest ratio (x100) of `ink` against Softy's five Dark grounds.
+    pub const fn softy_dark_min(ink: u32) -> u32 {
+        let mut m = u32::MAX;
+        let mut i = 0;
+        while i < SOFTY_DARK_GROUNDS.len() {
+            let r = ratio_x100(ink, SOFTY_DARK_GROUNDS[i]);
+            if r < m {
+                m = r;
+            }
+            i += 1;
+        }
+        m
+    }
+
+    // SOFTYDARK (B694): Softy's Dark set and its twins, re-derived from the hex — the floors, the elevations and the
+    // ramp's order. A value edited below its target fails the build.
+    const _: () = {
+        use super::softy::dark as d;
+        assert!(softy_dark_min(d::TEXT) >= 1200 && softy_dark_min(d::TEXT_2) >= 600 && softy_dark_min(d::TEXT_IDLE) >= 450);
+        assert!(softy_dark_min(d::FIELD_LINE) >= 300 && ratio_x100(d::EDGE_IDLE, d::SURFACE_IDLE) >= 160);
+        assert!(softy_dark_min(softy::dark::TEXT) >= 700 && softy_dark_min(softy::dark::TEXT_2) >= 900 && softy_dark_min(softy::dark::TEXT_IDLE) >= 700);
+        assert!(softy_dark_min(softy::dark::EDGE_IDLE) >= 300 && softy_dark_min(softy::dark::FIELD_LINE) >= 450);
+        assert!(softy_dark_min(softy::dark::TEXT_2) >= softy_dark_min(d::TEXT_2) && softy_dark_min(softy::dark::TEXT_IDLE) >= softy_dark_min(d::TEXT_IDLE));
+        assert!(ratio_x100(d::CLOSE_HOT, super::softy::CLOSE_INK) >= 450);
+        // Dark elevation rises toward light: field < idle head < taskbar < footer < flyout.
+        assert!(luminance(d::FIELD) < luminance(d::SURFACE_IDLE) && luminance(d::SURFACE_IDLE) < luminance(d::SURFACE));
+        assert!(luminance(d::SURFACE) < luminance(d::FLYOUT_FOOT) && luminance(d::FLYOUT_FOOT) < luminance(d::FLYOUT));
+        // The ramp keeps its order, lightest-first.
+        assert!(luminance(d::TEXT) > luminance(d::TEXT_2) && luminance(d::TEXT_2) > luminance(d::TEXT_IDLE));
+        assert!(luminance(softy::dark::TEXT) > luminance(softy::dark::TEXT_2) && luminance(softy::dark::TEXT_2) > luminance(softy::dark::TEXT_IDLE));
+    };
 
     // The floors, re-derived from the hex at compile time: a value edited below its target fails the build.
     const _: () = {

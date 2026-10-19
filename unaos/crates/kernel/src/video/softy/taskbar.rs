@@ -365,10 +365,12 @@ pub(super) fn glyph_bat(s: &mut Surf, x: usize, y: usize, d: usize, pct: u16, ch
     }
 }
 
-/// Compose strip row `j` of the band.
-fn paint_row(out: &mut [u32], m: &Model, l: &Layout, w: usize, j: usize) {
+/// Compose strip row `j` of the band at panel rect `r`: the face (SOFTYDARK B694: in Dark, `SURFACE` at the VEIL's
+/// tint over the blurred wallpaper, DESIGN-LANGUAGE §2.4; flat in Light), then the hairline and the items.
+fn paint_row(out: &mut [u32], m: &Model, l: &Layout, r: strip::Rect, j: usize) {
+    let w = r.2;
+    p::veil_row(out, w, r.0, r.1 + j, k::SURFACE(), k::VEIL_A());
     let mut s = Surf::row(out, w, j);
-    p::fill(&mut s, (0, j, w, 1), k::SURFACE(), 255);
     p::hairline_h(&mut s, 0, 0, w, k::STROKE(), k::STROKE_A());
     // The tiles: Start, then the apps.
     for i in 0..=m.n {
@@ -491,7 +493,7 @@ pub fn compose() -> bool {
     }
     let old = SLOT.packed();
     strip::settle("softy", Some(r));
-    if !strip::paint("softy", r, |out, j| paint_row(out, &m, &l, r.2, j)) {
+    if !strip::paint("softy", r, |out, j| paint_row(out, &m, &l, r, j)) {
         return false;
     }
     if old != 0 && old != strip::pack_rect(Some(r)) {
