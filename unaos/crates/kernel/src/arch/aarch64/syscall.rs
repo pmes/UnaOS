@@ -24029,7 +24029,7 @@ fn net6_sys_sendto(handle: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     if copy_from_user(&mut buf[..plen], msg_ptr + hdr as u64, plen).is_err() {
         return EFAULT;
     }
-    match crate::net_phy::net6::sendto(sid, ip, port, &buf[..plen]) {
+    if let Err(e) = crate::fs::apptrust::net_gate_asid(asid, ip, port, false) { return e; } match crate::net_phy::net6::sendto(sid, ip, port, &buf[..plen]) { // NET6GRANT (SR151, BP-security-17): the user's grant before the datagram is queued — Never = -EPERM, asking = -EAGAIN, the stack never entered. ⚠ LINE-NEUTRAL append, code before this comment
         Ok(n) => n as i64,
         Err(()) => NET6_EAGAIN,
     }
@@ -24077,7 +24077,7 @@ fn net6_sys_connect(handle: u64, msg_ptr: u64, msg_len: u64) -> i64 {
         Ok(v) => v,
         Err(e) => return e,
     };
-    match crate::net_phy::net6::connect(sid, ip, port) {
+    if let Err(e) = crate::fs::apptrust::net_gate_asid(asid, ip, port, true) { return e; } match crate::net_phy::net6::connect(sid, ip, port) { // NET6GRANT (SR151, BP-security-17): the user's grant BEFORE the SYN — Never = -EPERM, asking = -EINPROGRESS, nothing queued. ⚠ LINE-NEUTRAL append, code before this comment
         crate::net_phy::net6::ConnectOutcome::Established => 0,
         crate::net_phy::net6::ConnectOutcome::InProgress => NET6_EINPROGRESS,
         crate::net_phy::net6::ConnectOutcome::Refused => NET6_ECONNREFUSED,
@@ -25848,7 +25848,7 @@ fn sys_resolve(name_ptr: u64, name_len: u64, out_ptr: u64) -> i64 {
         return EFAULT;
     }
     match crate::netring3::resolve(&nb[..n]) {
-        Ok(out) => if copy_to_user(out_ptr, &out, out.len()).is_err() { EFAULT } else { 0 },
+        Ok(out) => { #[cfg(feature = "net6")] crate::fs::apptrust::net_name_note(&nb[..n], [out[0], out[1], out[2], out[3]]); if copy_to_user(out_ptr, &out, out.len()).is_err() { EFAULT } else { 0 } } // NET6GRANT (SR151): the answer recorded for the ask (ip -> the name asked). ⚠ LINE-NEUTRAL append, code before this comment
         Err(e) => e,
     }
 }

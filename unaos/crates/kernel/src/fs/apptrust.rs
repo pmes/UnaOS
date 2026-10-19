@@ -678,14 +678,14 @@ pub fn ensure_tests() {
 // Wire: `[net] grant app=<name> dst=<ip:port> decision=<once|always|never|asked>` (said when the answer for a task and
 // destination changes, not per poll), `[netgrant] answer=<always|once|never|dismissed> app= kept=<0|1>`.
 
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 /// `-EPERM` (Linux 1): the user said Never — the refusal on the wire (una-abi names no EPERM yet).
 pub const NET_EPERM: i64 = -1;
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 /// The asks posted (the fixture's count).
 static NET_ASKS: AtomicU32 = AtomicU32::new(0);
 
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 /// The ask on the glass: the program, the asking task, the destination.
 #[derive(Clone)]
 struct NetAsk {
@@ -694,22 +694,22 @@ struct NetAsk {
     dst: String,
 }
 
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 static NET_ASKING: crate::sync::Mutex<Option<NetAsk>> = crate::sync::Mutex::new(None);
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 /// This run's answers: `(task, app, allow)` — `Allow Once`, a dismissal, and any answer the store did not keep.
 static NET_RUN: crate::sync::Mutex<Vec<(u64, String, bool)>> = crate::sync::Mutex::new(Vec::new());
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 /// Run rows kept at most (oldest dropped; a dropped row only means that run is asked again).
 const NET_RUN_MAX: usize = 64;
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 /// The last `[net] grant` line said: `(task, ip, port, decision)`.
 static NET_SAID: crate::sync::Mutex<Option<(u64, [u8; 4], u16, u8)>> = crate::sync::Mutex::new(None);
 
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 const NET_WORDS: [&str; 4] = ["once", "always", "never", "asked"];
 
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 /// Say the decision for `task` → `ip:port` once per change (the door is polled; the wire is not).
 fn net_say(app: &str, task: u64, ip: [u8; 4], port: u16, d: u8) {
     let Some(mut g) = NET_SAID.try_lock() else { return };
@@ -718,7 +718,7 @@ fn net_say(app: &str, task: u64, ip: [u8; 4], port: u16, d: u8) {
     }
     *g = Some((task, ip, port, d));
     drop(g);
-    serial_println!("[net] grant app={} dst={}.{}.{}.{}:{} decision={}", app, ip[0], ip[1], ip[2], ip[3], port, NET_WORDS[d as usize]);
+    match net_name_of(ip) { Some(nm) => serial_println!("[net] grant app={} dst={}({}.{}.{}.{}:{}) decision={}", app, nm, ip[0], ip[1], ip[2], ip[3], port, NET_WORDS[d as usize]), None => serial_println!("[net] grant app={} dst={}.{}.{}.{}:{} decision={}", app, ip[0], ip[1], ip[2], ip[3], port, NET_WORDS[d as usize]) } // NET6GRANT (SR151): the host the program resolved, from SYS_RESOLVE's reverse cache (in-place edit, line count kept)
 }
 
 /// The program a ring-3 socket's slot runs, by the launcher's name (module note above); `None` = a kernel fixture blob.
@@ -752,7 +752,7 @@ pub fn net_gate(row: usize, ip: [u8; 4], port: u16, stream: bool) -> Result<(), 
 }
 
 /// [`net_gate`]'s body for a named program: the store's decision, then this run's answer, then the ask.
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 pub fn net_gate_for(app: &str, task: u64, owner: u64, ip: [u8; 4], port: u16, stream: bool) -> Result<(), i64> {
     let wait = if stream { -115 } else { una_abi::EAGAIN }; // EINPROGRESS: the connect's own retry word
     // try_lock throughout: this runs in the IF-masked syscall path and never spins (a busy lock = poll again).
@@ -778,11 +778,11 @@ pub fn net_gate_for(app: &str, task: u64, owner: u64, ip: [u8; 4], port: u16, st
     if asking.is_some() {
         return Err(wait); // this program's ask (or another's) is on the glass: wait for the answer
     }
-    let dst = alloc::format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port);
-    #[cfg(feature = "wc")]
+    let ipp = alloc::format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port); let nm = net_name_of(ip); let dst = match &nm { Some(n) => alloc::format!("{}({})", n, ipp), None => ipp.clone() }; // NET6GRANT (SR151): `<name>(<ip:port>)` when SYS_RESOLVE answered this ip (in-place edit)
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         use crate::video::dialog::{self, Act, Dlg, Icon};
-        let msg = alloc::format!("{} wants to reach {}", app, dst);
+        let msg = match &nm { Some(n) => alloc::format!("{} wants to reach {} ({})", app, n, ipp), None => alloc::format!("{} wants to reach {}", app, ipp) }; // NET6GRANT (SR151): the ask names the host
         let info = alloc::format!("Always and Never are kept; Settings > Privacy revokes them.\nAllow Once lets this run of {} through.", app);
         let mut d = Dlg::new(Icon::Caution, b"Network", msg.as_bytes(), info.as_bytes(), &[b"Always", b"Allow Once", b"Never"]);
         d.cancel = Some(2); // Esc is a refusal of this run, never the leftmost `Always`
@@ -797,7 +797,7 @@ pub fn net_gate_for(app: &str, task: u64, owner: u64, ip: [u8; 4], port: u16, st
         net_say(app, task, ip, port, 3);
         Err(wait)
     }
-    #[cfg(not(feature = "wc"))]
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         // No dialog in this build: nobody can be asked, so nothing reaches the wire without a kept Always.
         let _ = (owner, &mut asking);
@@ -808,7 +808,7 @@ pub fn net_gate_for(app: &str, task: u64, owner: u64, ip: [u8; 4], port: u16, st
 
 /// DIALOG's answer (press/key route; queue-only): `Always` 0 · `Allow Once` 1 · `Never` 2 (the default, `ok`); Esc
 /// resolves to Never's index with `ok = false` — a dismissal, this run refused, nothing kept.
-#[cfg(all(feature = "smolnet", target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64", feature = "wc"), all(feature = "net6", target_arch = "aarch64", feature = "desktop_firmware")))]
 fn net_answer(ok: bool) {
     let Some(a) = NET_ASKING.lock().take() else { return };
     let word = match (ok, crate::video::dialog::last_button()) {
@@ -832,13 +832,13 @@ fn net_answer(ok: bool) {
     serial_println!("[netgrant] answer={} app={} dst={} kept={}", word, a.app, a.dst, kept as u8);
 }
 
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 /// The asks posted since boot (`tests netgrant`).
 pub fn net_asks() -> u32 {
     NET_ASKS.load(Ordering::Relaxed)
 }
 
-#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
 /// `tests netgrant`'s clean slate: `app`'s kept decision revoked, its run rows and any ask of its dropped.
 pub fn net_forget(app: &str) {
     let k = crate::prefs::decision_key(crate::prefs::decide::NET, app);
@@ -850,4 +850,84 @@ pub fn net_forget(app: &str) {
     if g.as_ref().map(|x| x.app == app).unwrap_or(false) {
         *g = None;
     }
+}
+
+// ── NET6GRANT (LEDGER SR151, BP-security-17, BP-net-12, BP-bar-10/12) — TAIL-APPENDED: the aarch64 door, and the name ──
+//
+// M1 — aarch64's NET6 socket doors (`net6_sys_connect`, `net6_sys_sendto` in `arch/aarch64/syscall.rs`) call
+// [`net_gate_asid`] before `net_phy::net6::connect` / `sendto`, the same ONE check x86's `sys_connect`/`sys_sendto` call:
+// [`net_gate_for`] is shared, so the decision order (the store's kept answer, this run's, then ONE ask) and the decision
+// key (`system.decisions.net.<app>`, per app) are x86's, unchanged. Only "who asks" is per arch: on aarch64 the
+// compositor owner IS the ASID (`wm::owner_of_launch` is the identity here), so the program is `wm::app_name_of(asid)`,
+// else `argv[0]` on the caller's args page (`USER_ARGS_VA_ARM`, kernel-written, read through the bound-checked
+// `copy_from_user`); neither = a kernel fixture blob (the NET6 EL0 fixture), not asked — x86's rule.
+//
+// M2 — the ask names the host: aarch64's `sys_resolve` records each answer here ([`net_name_note`]: ip -> the name the
+// program asked for, the last [`NET_NAMES_MAX`] answers, newest wins for an ip two names share). The ask then reads
+// `<app> wants to reach <name> (<ip:port>)` and the wire `[net] grant app= dst=<name>(<ip:port>) decision=`; an ip
+// nobody resolved stays `<ip:port>`. The name is display only: it never enters the decision key.
+
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+/// SYS_RESOLVE answers remembered for the ask (oldest dropped).
+const NET_NAMES_MAX: usize = 32;
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+/// `(ip, name)`, oldest first.
+static NET_NAMES: crate::sync::Mutex<Vec<([u8; 4], String)>> = crate::sync::Mutex::new(Vec::new());
+
+/// SYS_RESOLVE's record: `name` answered `ip`. try_lock (the IF-masked syscall path never spins; a busy lock costs the
+/// ask its name, never the resolve).
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+pub fn net_name_note(name: &[u8], ip: [u8; 4]) {
+    let Ok(s) = core::str::from_utf8(name) else { return };
+    if s.is_empty() || ip == [0, 0, 0, 0] {
+        return;
+    }
+    let Some(mut g) = NET_NAMES.try_lock() else { return };
+    g.retain(|(i, _)| *i != ip);
+    if g.len() >= NET_NAMES_MAX {
+        g.remove(0);
+    }
+    g.push((ip, String::from(s)));
+}
+
+/// The name SYS_RESOLVE last answered `ip` with, if it is still among the remembered answers.
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+fn net_name_of(ip: [u8; 4]) -> Option<String> {
+    NET_NAMES.try_lock()?.iter().rev().find(|(i, _)| *i == ip).map(|(_, n)| n.clone())
+}
+
+/// The destination the ask on the glass names (`tests netgrant`'s name leg), if an ask is up.
+#[cfg(any(all(feature = "smolnet", target_arch = "x86_64"), all(feature = "net6", target_arch = "aarch64")))]
+pub fn net_asking_dst() -> Option<String> {
+    NET_ASKING.try_lock()?.as_ref().map(|a| a.dst.clone())
+}
+
+/// THE door's check on aarch64 (`net6_sys_connect` with `stream`, `net6_sys_sendto` without), for the caller's `asid`:
+/// `Ok` = the stack may be entered; `Err(-EPERM)` refused; `Err(-EINPROGRESS | -EAGAIN)` asking, nothing queued.
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+pub fn net_gate_asid(asid: u64, ip: [u8; 4], port: u16, stream: bool) -> Result<(), i64> {
+    let Some(app) = net_app_of_asid(asid) else { return Ok(()) };
+    let task = crate::arch::sched::current_id().unwrap_or(0);
+    net_gate_for(&app, task, asid, ip, port, stream)
+}
+
+/// The program the caller's address space runs, by the launcher's name (the note above); `None` = a kernel fixture blob.
+#[cfg(all(feature = "net6", target_arch = "aarch64"))]
+fn net_app_of_asid(asid: u64) -> Option<String> {
+    if asid == 0 {
+        return None;
+    }
+    let mut nb = [0u8; crate::video::wm::MAX_TITLE];
+    let n = crate::video::wm::app_name_of(asid, &mut nb);
+    if n > 0 {
+        return core::str::from_utf8(&nb[..n]).ok().map(String::from);
+    }
+    // The caller's TTBR0 is live (syscall context); its args page is a legal read source (`xwin::range_ok`).
+    let va = una_abi::USER_ARGS_VA_ARM;
+    let mut page = alloc::vec![0u8; 4096];
+    crate::arch::syscall::copy_from_user(&mut page, va, 4096).ok()?;
+    let a = una_abi::Args::parse(&page[..], va)?;
+    let w = core::str::from_utf8(a.get(0)?).ok()?;
+    let p = crate::video::wm::program_name(w);
+    if p.is_empty() { None } else { Some(String::from(p)) }
 }

@@ -1417,7 +1417,7 @@ fn netgrant_selftest() {
         );
     }
     #[cfg(not(all(feature = "smolnet", feature = "wc", target_arch = "x86_64")))]
-    serial_println!(":: NETGRANT: -> SKIP reason=x86-smolnet-wc-only ::");
+    netgrant_arm(); // NET6GRANT (SR151): aarch64 runs the same legs over NET6 (body at the FILE TAIL); any other build SKIPs there. In-place edit, line count kept
 }
 
 /// UAC1 (rmbp-ledger B706): `tests uac1` — the USB Audio Class 1 descriptor walk on its fixture, then 440 Hz for 1 s
@@ -2242,4 +2242,108 @@ fn mtpphone_selftest() {
             enumerated as u8, nst, nobj, okf(read_ok), okf(write_ok), okf(delete_ok), ms, why.unwrap_or("-")
         );
     }
+}
+
+// NET6GRANT (LEDGER SR151, BP-security-17, BP-net-12) — TAIL-APPENDED. `tests netgrant` on aarch64: NETGRANT's legs
+// (Never, Always after a revoke, persisted across a store read-back) through the SAME check the NET6 doors call
+// (`fs::apptrust::net_gate_for`, the body `net_gate_asid` runs for `net6_sys_connect`), then the NET6 stack
+// (`net_phy::net6::connect`), in `net6_sys_connect`'s order, on a kernel-owned NET6 socket. aarch64 counts no connect on
+// the outbound ledger (BP-net-11), so "the stack was never entered" is counted at the door: every call that passed the
+// check into `net6::connect` (`denied_pkts` in the Never leg, `allowed` in the Always leg); the NIC's other transmits in
+// the Never leg are said for the reader. The name leg (M2): SYS_RESOLVE's record (`apptrust::net_name_note`, the call
+// aarch64's `sys_resolve` makes) for the probe's ip, and the ask on the glass names it — `dst=<name>(<ip:port>)`.
+// `:: NETGRANT: asked=1 denied_pkts=0 allowed=1 persisted=1 named=1 arch=aarch64 -> PASS ::`.
+#[cfg(all(feature = "netring3", not(all(feature = "smolnet", feature = "wc", target_arch = "x86_64"))))]
+fn netgrant_arm() {
+    #[cfg(all(feature = "net6", feature = "desktop_firmware", target_arch = "aarch64"))]
+    {
+        use crate::fs::apptrust::{net_asking_dst, net_asks, net_forget, net_gate_for, net_name_note, NET_EPERM};
+        use crate::video::dialog::{self, Answer};
+        const APP: &str = "NGPROBE";
+        const NAME: &str = "netgrant.probe";
+        const IP: [u8; 4] = [10, 0, 2, 2];
+        const PORT: u16 = 9;
+        const RUN1: u64 = u64::MAX - 0x4e47;
+        const RUN2: u64 = RUN1 - 1;
+        const RUN3: u64 = RUN1 - 2;
+        static ENTERED: AtomicU32 = AtomicU32::new(0);
+        if dialog::is_up() {
+            serial_println!(":: NETGRANT: arch=aarch64 -> SKIP reason=dialog-up ::");
+            return;
+        }
+        net_forget(APP);
+        let Some(sid) = crate::net_phy::net6::open(u64::MAX, true) else {
+            serial_println!(":: NETGRANT: arch=aarch64 -> SKIP reason=no-stack (no NIC adapter) ::");
+            return;
+        };
+        let was = dialog::headless(true);
+        net_name_note(NAME.as_bytes(), IP);
+        let connect = |task: u64| -> i64 {
+            match net_gate_for(APP, task, 0, IP, PORT, true) {
+                Err(e) => e,
+                Ok(()) => {
+                    ENTERED.fetch_add(1, Ordering::Relaxed);
+                    match crate::net_phy::net6::connect(sid, IP, PORT) {
+                        crate::net_phy::net6::ConnectOutcome::Established => 0,
+                        crate::net_phy::net6::ConnectOutcome::InProgress => -115,
+                        crate::net_phy::net6::ConnectOutcome::Refused => -111,
+                    }
+                }
+            }
+        };
+        let key = crate::prefs::decision_key(crate::prefs::decide::NET, APP);
+        let other_tx = || {
+            let (t, arp, dhcp) = crate::net_phy::tx_emission_counts();
+            t.wrapping_sub(arp).wrapping_sub(dhcp)
+        };
+
+        // Never (and the name on the ask).
+        let e0 = ENTERED.load(Ordering::Relaxed);
+        let tx0 = other_tx();
+        let a0 = net_asks();
+        let r1 = connect(RUN1);
+        let dst = net_asking_dst().unwrap_or_default();
+        let named = dst == alloc::format!("{}({}.{}.{}.{}:{})", NAME, IP[0], IP[1], IP[2], IP[3], PORT);
+        dialog::open_now();
+        let up = dialog::is_up();
+        dialog::answer(Answer::Default); // Never
+        let r2 = connect(RUN1);
+        let r3 = connect(RUN2);
+        let asked = net_asks() - a0;
+        let denied_pkts = ENTERED.load(Ordering::Relaxed) - e0;
+        let tx_other = other_tx().wrapping_sub(tx0);
+        let never_kept = crate::prefs::decided(crate::prefs::decide::NET, APP, "-").as_deref() == Some("never");
+
+        // Always: revoked, a new run asks, answered Always.
+        let revoked = crate::prefs::revoke(&key);
+        let e1 = ENTERED.load(Ordering::Relaxed);
+        let a1 = net_asks();
+        let r4 = connect(RUN2);
+        dialog::open_now();
+        dialog::answer(Answer::Button(0)); // Always
+        let r5 = connect(RUN2);
+        let reasks_always = net_asks() - a1;
+        let allowed = (ENTERED.load(Ordering::Relaxed) - e1).min(1);
+
+        // persisted: the store read back, a third run passes unasked.
+        let flushed = crate::prefs::decisions_flush();
+        let keys = crate::prefs::reload_from_store();
+        let a2 = net_asks();
+        let kept = crate::prefs::decided(crate::prefs::decide::NET, APP, "-").as_deref() == Some("always");
+        let r6 = net_gate_for(APP, RUN3, 0, IP, PORT, true);
+        let persisted = (kept && r6.is_ok() && net_asks() == a2) as u32;
+
+        crate::net_phy::net6::close(sid);
+        net_forget(APP);
+        dialog::headless(was);
+        let pending = -115;
+        let ok = asked == 1 && up && named && r1 == pending && r2 == NET_EPERM && r3 == NET_EPERM && never_kept && denied_pkts == 0
+            && revoked && r4 == pending && reasks_always == 1 && r5 != NET_EPERM && allowed == 1 && persisted == 1;
+        serial_println!(
+            ":: NETGRANT: asked={} denied_pkts={} allowed={} persisted={} named={} arch=aarch64 -> {} :: r={}/{}/{}/{}/{} dst={} never_kept={} revoked={} reask_after_revoke={} flushed={} keys={} tx_other_in_never_leg={} key={}",
+            asked, denied_pkts, allowed, persisted, named as u8, if ok { "PASS" } else { "FAIL" }, r1, r2, r3, r4, r5, dst, never_kept as u8, revoked as u8, reasks_always, flushed, keys, tx_other, key
+        );
+    }
+    #[cfg(not(all(feature = "net6", feature = "desktop_firmware", target_arch = "aarch64")))]
+    serial_println!(":: NETGRANT: -> SKIP reason=needs-x86-smolnet-wc-or-aarch64-net6-desktop ::");
 }
