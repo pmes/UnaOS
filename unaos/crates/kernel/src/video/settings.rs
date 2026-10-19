@@ -4453,6 +4453,11 @@ static HW_WANT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool:
 static HW_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The note line: what the last press copied, or the honest line for a device with no driver.
 static HW_NOTE: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
+/// HWTAB2 (B759): the `Report…` button's x (left of Refresh), the report's leaf in the home, and the press's latch
+/// (the click router never writes storage; the service pass does, [`hw_service`]).
+const HW_REPORT_X: usize = HW_REFRESH_X - BTN_W - 10;
+const HW_REPORT_NAME: &str = "hardware-report.txt";
+static HW_REPORT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The list's geometry: `(box top, box bottom, line pitch, visible lines)`, logical px.
 fn hw_geom() -> (usize, usize, usize, usize) {
@@ -4482,9 +4487,10 @@ fn paint_hardware(st: &mut State) {
         draw::group_box(&mut s, Rect::new(e(BOX_X), e(top), ew(BOX_X, BOX_W), e(bot) - e(top)), b"");
     }
     btn(st, HW_SUM_ROW, HW_REFRESH_X, "Refresh");
+    btn(st, HW_SUM_ROW, HW_REPORT_X, "Report…");
     let note = HW_NOTE.try_lock().map(|g| g.clone()).unwrap_or_default();
     if note.is_empty() {
-        txt2(st, LABEL_X, HW_NOTE_ROW, "Press a device to copy its line to the console.");
+        txt2(st, LABEL_X, HW_NOTE_ROW, "Press a device to copy its line to the clipboard.");
     } else {
         txt(st, LABEL_X, HW_NOTE_ROW, &note);
     }
@@ -4540,13 +4546,94 @@ fn hw_line_at(cy: usize, cx: usize, n: usize) -> Option<usize> {
     (i < vis && k < n).then_some(k)
 }
 
-/// The note a press on `r` leaves: the honest line for a device no driver claimed (BP-bar-25), else what was copied.
-fn hw_note(r: &crate::hw::Row) -> String {
-    if r.driver == "none" {
-        alloc::format!("No driver yet — tell us: {} {}", r.bus, r.id)
-    } else {
-        alloc::format!("Copied to the console: {}", r.name)
+/// The note a press on `r` leaves: the honest line for a device no driver claimed (BP-bar-25), else what was copied;
+/// `clip` = the line reached the clipboard (HWTAB2 B759).
+fn hw_note(r: &crate::hw::Row, clip: bool) -> String {
+    match (r.driver == "none", clip) {
+        (true, true) => alloc::format!("No driver yet — tell us: {} {} (copied)", r.bus, r.id),
+        (true, false) => alloc::format!("No driver yet — tell us: {} {}", r.bus, r.id),
+        (false, true) => alloc::format!("Copied to the clipboard: {}", r.name),
+        (false, false) => alloc::format!("Copied to the console: {}", r.name),
     }
+}
+
+/// HWTAB2 (B759): the press's copy — `hw::line(r)` to the console (wait-free) and the serial wire as `[hw] row`, then
+/// onto the clipboard (`clipboard::set`, the one put fn) so ⌘V pastes it; a byte outside the clipboard's text set (a
+/// USB product string may carry UTF-8) is spelled `?`, the line being ours to compose. Returns `(the put text, put)`.
+fn hw_copy(r: &crate::hw::Row) -> (String, bool) {
+    let l = crate::hw::line(r);
+    let _ = crate::termring::console_out(format_args!("[hw] row {}", l));
+    serial_println!("[hw] row {}", l);
+    let t: String = l.chars().map(|ch| if ch == '\t' || (' '..='~').contains(&ch) { ch } else { '?' }).collect();
+    let put = super::clipboard::set(t.as_bytes());
+    (t, put)
+}
+
+/// HWTAB2 (B759): the report's path, `<home>/hardware-report.txt` (the home as `fs::trash` names it).
+fn hw_report_path() -> String {
+    alloc::format!("{}/{}", crate::fs::trash::home_base(), HW_REPORT_NAME)
+}
+
+/// HWTAB2 (B759): the build's kernel features as the `⚡ kernel features:` banner lists them. The list is composed by
+/// arroyo at load and the kernel holds no copy: OWED (the seat's fold, outside this arc's files) — arroyo exports
+/// `UNAOS_KERNEL_FEATURES="${_feats%,}"` beside the banner, `scripts/k8-reach.registry` gains its ENV row, and this
+/// body reads that variable at compile time (the `UNAOS_GIT_SHA` shape, `unstamped` when unset). Until then: `unstamped`.
+fn hw_kernel_features() -> &'static str {
+    "unstamped"
+}
+
+/// HWTAB2 (B759): the report's text — the build image, the build's kernel features ([`hw_kernel_features`]), the
+/// census's summary, the `hw` verb's header and every census line.
+fn hw_report_text(c: &crate::hw::Census) -> String {
+    let d = c.driven();
+    let mut s = String::new();
+    s.push_str("UnaOS hardware report\n");
+    s.push_str(&alloc::format!("build image: {}\n", option_env!("UNAOS_GIT_SHA").unwrap_or("unstamped")));
+    s.push_str(&alloc::format!("kernel features: {}\n", hw_kernel_features()));
+    s.push_str(&alloc::format!("devices: {}, {} with a driver, {} without\n\n", c.rows.len(), d, c.rows.len() - d));
+    s.push_str(&alloc::format!("{:<4} {:<10} {:<14} {:<8} {:<18} {}\n", "bus", "id", "at", "driver", "state", "device"));
+    for r in &c.rows {
+        s.push_str(&crate::hw::line(r));
+        s.push('\n');
+    }
+    s
+}
+
+/// HWTAB2 (B759): write the report through the VFS (an old copy unlinked, then create + write, as `fs/trash.rs` writes
+/// the home). `Ok((path, bytes))`, or the refusal as `-E<errno>`.
+fn hw_report_write(c: &crate::hw::Census) -> Result<(String, usize), String> {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
+    let path = hw_report_path();
+    let body = hw_report_text(c);
+    let why = |e: crate::fs::vfs::VfsError| alloc::format!("-E{}", crate::fs::attrsys::errno_of(&e).unsigned_abs());
+    let mt = crate::shell::vfs_mount_table();
+    if mt.stat(&path).is_ok() {
+        mt.unlink(&path, P).map_err(why)?;
+    }
+    mt.create(&path, NodeKind::File, P).map_err(why)?;
+    mt.write(&path, 0, body.as_bytes(), P).map_err(why)?;
+    Ok((path, body.len()))
+}
+
+/// HWTAB2 (B759): save the report for census `c`, toast the outcome (the path, or the refusal) and set the note.
+/// Returns `(the write's outcome, toast posted)`.
+fn hw_report_save(c: &crate::hw::Census) -> (Result<(String, usize), String>, bool) {
+    let r = hw_report_write(c);
+    let (title, body, note): (&str, String, String) = match &r {
+        Ok((p, n)) => {
+            serial_println!("[hw] report path={} bytes={} devices={} -> saved", p, n, c.rows.len());
+            ("Hardware report saved", p.clone(), alloc::format!("Saved the report: {}", p))
+        }
+        Err(w) => {
+            serial_println!("[hw] report path={} devices={} -> refused why={}", hw_report_path(), c.rows.len(), w);
+            ("Hardware report failed", w.clone(), alloc::format!("The report was not saved ({})", w))
+        }
+    };
+    let toasted = super::toast::post(title.as_bytes(), body.as_bytes());
+    if let Some(mut g) = HW_NOTE.try_lock() {
+        *g = note;
+    }
+    (r, toasted)
 }
 
 /// A press in the Hardware pane: `Refresh` asks for a census (the service pass builds it); a line copies the device's
@@ -4557,6 +4644,8 @@ fn hw_press(row: usize, cy: usize, cx: usize) {
             HW_AT.store(0, Ordering::Relaxed);
             HW_WANT.store(true, Ordering::Relaxed);
             serial_println!("[hw] refresh asked");
+        } else if cx >= HW_REPORT_X && cx < HW_REPORT_X + BTN_W {
+            HW_REPORT.store(true, Ordering::Release); // HWTAB2 (B759): the service pass writes it
         }
         repaint();
         return;
@@ -4564,10 +4653,8 @@ fn hw_press(row: usize, cy: usize, cx: usize) {
     let Some(c) = crate::hw::last() else { repaint(); return };
     if let Some(k) = hw_line_at(cy, cx, c.rows.len()) {
         let r = &c.rows[k];
-        let l = crate::hw::line(r);
-        let _ = crate::termring::console_out(format_args!("[hw] row {}", l));
-        serial_println!("[hw] row {}", l);
-        let note = hw_note(r);
+        let (_, clip) = hw_copy(r);
+        let note = hw_note(r, clip);
         if let Some(mut g) = HW_NOTE.try_lock() {
             *g = note;
         }
@@ -4577,6 +4664,20 @@ fn hw_press(row: usize, cy: usize, cx: usize) {
 
 /// The service pass: a census the Hardware pane asked for, built without waiting (a held registry asks again next pass).
 fn hw_service() {
+    if HW_REPORT.swap(false, Ordering::AcqRel) {
+        // HWTAB2 (B759): `Report…` — the last census, else one built without waiting (held = ask again next pass).
+        let c = match crate::hw::last() {
+            Some(c) => Some(c),
+            None => Some(crate::hw::census(false)).filter(|c| !c.busy),
+        };
+        match c {
+            Some(c) => {
+                let _ = hw_report_save(&c);
+                repaint();
+            }
+            None => HW_REPORT.store(true, Ordering::Release),
+        }
+    }
     if !HW_WANT.load(Ordering::Relaxed) || !is_open() || cur_tab() != HW_TAB {
         return;
     }
@@ -4638,12 +4739,90 @@ pub fn hwtab_probe() -> (usize, usize, usize, bool, String) {
         HW_TOP.store(k, Ordering::Relaxed);
         let i = k - hw_first(n);
         let hit = hw_line_at(top + 8 + i * lh + lh / 2, LABEL_X + 4, n);
-        let note = hw_note(&c.rows[k]);
+        let note = hw_note(&c.rows[k], false);
         let want = if c.rows[k].driver == "none" { note.starts_with("No driver yet — tell us: ") } else { note.starts_with("Copied") };
         (hit == Some(k) && want, note)
     };
     HW_TOP.store(top0, Ordering::Relaxed);
     (HW_TAB, n, painted, press, note)
+}
+
+/// `tests hwreport`'s HWTAB2 leg (B759). (clip) the first `none` row (else row 0) through the press's own [`hw_copy`]:
+/// the clipboard read back equals the put line and the note says copied; the user's clipboard is put back (or
+/// cleared). (report) the home ensured, [`hw_report_save`] run: the file read back holds the image line, the features
+/// line and every census line, and its toast posted; a report that was not there before is removed; a home on a
+/// volume that vetoes writes reads `skip(home-not-writable)`. HW_NOTE is put back. Returns `(clip, report)`, each
+/// `ok`, `skip(…)` or `FAIL(<why>)`.
+pub fn hwtab2_probe() -> (String, String) {
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
+    let Some(c) = crate::hw::last() else { return (String::from("FAIL(no-census)"), String::from("FAIL(no-census)")) };
+    if c.rows.is_empty() {
+        return (String::from("FAIL(empty)"), String::from("FAIL(empty)"));
+    }
+    let note0 = HW_NOTE.try_lock().map(|g| g.clone()).unwrap_or_default();
+    let k = c.rows.iter().position(|r| r.driver == "none").unwrap_or(0);
+    let mut saved: Vec<u8> = alloc::vec![0u8; super::clipboard::CLIP_CAP];
+    let had = super::clipboard::get(&mut saved);
+    let (t, put) = hw_copy(&c.rows[k]);
+    let mut back: Vec<u8> = alloc::vec![0u8; t.len() + 1];
+    let got = super::clipboard::get(&mut back);
+    let said = hw_note(&c.rows[k], put).to_ascii_lowercase().contains("copied");
+    if had > 0 {
+        let _ = super::clipboard::set(&saved[..had]);
+    } else {
+        super::clipboard::clear("hwreport");
+    }
+    let clip = if !put {
+        String::from("FAIL(refused)")
+    } else if got != t.len() || &back[..got] != t.as_bytes() {
+        alloc::format!("FAIL(readback len={} want={})", got, t.len())
+    } else if !said {
+        String::from("FAIL(note)")
+    } else {
+        String::from("ok")
+    };
+    let path = hw_report_path();
+    let mt = crate::shell::vfs_mount_table();
+    let home = crate::fs::trash::home_base();
+    if mt.stat(&home).is_err() {
+        let _ = mt.create(&home, NodeKind::Dir, P);
+    }
+    let report = if let Some(k) = crate::fs::vfs::home_unwritable(&mt, &path) {
+        alloc::format!("skip(home-not-writable:{})", k)
+    } else {
+        let existed = mt.stat(&path).is_ok();
+        drop(mt);
+        let (r, toasted) = hw_report_save(&c);
+        let mt = crate::shell::vfs_mount_table();
+        let out = match r {
+            Err(w) => alloc::format!("FAIL(write {})", w),
+            Ok((p, n)) => {
+                let body = mt.read(&p, 0, n + 1).unwrap_or_default();
+                let text = core::str::from_utf8(&body).unwrap_or("");
+                let img = alloc::format!("build image: {}\n", option_env!("UNAOS_GIT_SHA").unwrap_or("unstamped"));
+                let lines = c.rows.iter().all(|r| text.contains(crate::hw::line(r).as_str()));
+                if body.len() != n {
+                    alloc::format!("FAIL(readback bytes={} want={})", body.len(), n)
+                } else if !text.contains(img.as_str()) || !text.contains("\nkernel features: ") {
+                    String::from("FAIL(header)")
+                } else if !lines {
+                    String::from("FAIL(lines)")
+                } else if !toasted {
+                    String::from("FAIL(toast)")
+                } else {
+                    String::from("ok")
+                }
+            }
+        };
+        if !existed {
+            let _ = mt.unlink(&path, P);
+        }
+        out
+    };
+    if let Some(mut g) = HW_NOTE.try_lock() {
+        *g = note0;
+    }
+    (clip, report)
 }
 
 /// crawl A 6 (BP-video-25) — TAIL-APPENDED. The colour filter moved: every scanout writer filters at its copy, so
