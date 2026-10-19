@@ -225,7 +225,7 @@ fn ensure_unafsx86() {
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {
         static GROW: AtomicBool = AtomicBool::new(false);
-        if !GROW.swap(true, Ordering::AcqRel) { register("unafsgrow", crate::fs::unafsgrow::selftest); } // UNAFSGROW (B347) M4: the native module's builds (aarch64 always, x86 under `unafs`)
+        if !GROW.swap(true, Ordering::AcqRel) { register("unafsgrow", crate::fs::unafsgrow::selftest); register("diskfull", diskfull_selftest); } // UNAFSGROW (B347) M4: the native module's builds (aarch64 always, x86 under `unafs`)
     }
 }
 
@@ -788,4 +788,84 @@ pub fn applaunch_selftest() {
         alloc::string::String::from("PASS")
     };
     serial_println!(":: APPLAUNCH: app={} n={} p50_ms={} p99_ms={} bar_ms={} -> {} ::", name, N, show(p50), show(p99), BAR_MS, verdict);
+}
+
+/// DISKFULL (rmbp-ledger B699, BP-storage-18, BP-bar-26) — `tests diskfull`: a full UnaFS volume answers `-ENOSPC`,
+/// never a panic, never a half-written transaction, and the user is told once.
+///
+/// On a RAM-backed volume (`MemDevice`, [`DF_BLOCKS`] blocks — the crate's own backend, the root untouched):
+/// 1. fill it with [`DF_FILE`]-block files until it is under `LOW_PCT` % free (the status bar's disk line);
+/// 2. ONE more write — a file larger than the free space — through `diskfull::write_or_full`, the root's own mapping:
+///    it must answer `Backend("nospace")` and `attrsys::errno_of` must render it `-ENOSPC` (`enospc=1`);
+/// 3. roll back as the root does (re-mount from the committed root: the crate left the failed write's allocations in
+///    RAM, `residue=` counts them): the file's committed size is 0, the free count is the pre-write count, fsck clean
+///    (`tx_rolled=1`);
+/// 4. the same write again: `-ENOSPC` again, and the toast's once-a-minute floor holds it (`toasts=1`, `repeat=suppressed`);
+/// 5. delete fill files, then the same write succeeds and reads back (`after_delete=ok`).
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+const DF_BLOCKS: u64 = 1024;
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+const DF_FILE: u64 = 24;
+
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub fn diskfull_selftest() {
+    use crate::fs::unafs::diskfull;
+    use ::unafs::{MemDevice, UnaFS, BLOCK_SIZE};
+    const VOL: &str = "diskfull-ram";
+    let fail = |why: &str| serial_println!(":: DISKFULL: enospc=0 panics=0 tx_rolled=0 after_delete=no toasts=0 -> FAIL ({}) ::", why);
+    let Ok(mut fs) = UnaFS::format(MemDevice::with_blocks(DF_BLOCKS), 0) else { return fail("format of the RAM volume failed") };
+    let root = fs.superblock.root_inode;
+    diskfull::reset();
+    // 1. fill to the low line
+    let chunk = alloc::vec![0x5au8; (DF_FILE * BLOCK_SIZE) as usize];
+    let mut files = 0usize;
+    while fs.free_blocks() >= DF_FILE * 2 && files < DF_BLOCKS as usize {
+        let Ok(id) = fs.create_file(root, format!("fill{}", files)) else { return fail("fill create failed") };
+        if diskfull::write_or_full(&mut fs, VOL, id, 0, &chunk).is_err() {
+            return fail("a fill write failed above the low line");
+        }
+        files += 1;
+    }
+    let low = diskfull::low_of(fs.free_blocks(), DF_BLOCKS);
+    // 2. one more write, bigger than the room left
+    let Ok(over) = fs.create_file(root, "over.bin".into()) else { return fail("create of the over file failed") };
+    let free0 = fs.free_blocks();
+    let big = alloc::vec![0xa5u8; ((free0 + 16) * BLOCK_SIZE) as usize];
+    let r1 = diskfull::write_or_full(&mut fs, VOL, over, 0, &big);
+    let errno = r1.as_ref().err().map(crate::fs::attrsys::errno_of);
+    let enospc = (errno == Some(una_abi::ENOSPC)) as u32;
+    let toast1 = diskfull::after_hold();
+    // 3. the rollback: re-mount from the committed root, as the root's discard does
+    let residue = free0.saturating_sub(fs.free_blocks());
+    let dev = core::mem::take(&mut fs.device);
+    drop(fs);
+    let Ok(mut fs) = UnaFS::mount(dev) else { return fail("re-mount after the full write failed") };
+    let size0 = fs.read_inode(over).map(|i| i.size).unwrap_or(u64::MAX);
+    let fsck = fs.fsck(false).is_ok_and(|rep| rep.is_clean());
+    let tx_rolled = size0 == 0 && fs.free_blocks() == free0 && fsck;
+    // 4. again: still -ENOSPC, and the toast floor holds it
+    let r2 = diskfull::write_or_full(&mut fs, VOL, over, 0, &big);
+    let repeat = r2.as_ref().err().map(crate::fs::attrsys::errno_of) == Some(una_abi::ENOSPC);
+    let toast2 = diskfull::after_hold();
+    let dev = core::mem::take(&mut fs.device);
+    drop(fs);
+    let Ok(mut fs) = UnaFS::mount(dev) else { return fail("re-mount after the repeat write failed") };
+    // 5. delete, then the same write lands
+    let mut deleted = 0usize;
+    for k in 0..files.min(3) {
+        if fs.unlink(root, &format!("fill{}", k)).is_ok() {
+            deleted += 1;
+        }
+    }
+    let after = diskfull::write_or_full(&mut fs, VOL, over, 0, &big).is_ok()
+        && fs.read_data(over, 0, big.len() as u64).is_ok_and(|d| d == big)
+        && fs.fsck(false).is_ok_and(|rep| rep.is_clean());
+    let (_, toasts, suppressed) = diskfull::counts();
+    let pass = enospc == 1 && tx_rolled && after && toasts == 1 && toast1 && !toast2 && repeat && low.is_some();
+    serial_println!(
+        ":: DISKFULL: enospc={} panics=0 tx_rolled={} after_delete={} toasts={} -> {} :: vol={} blocks={} files={} low_pct={} free_kb={} write_kb={} residue={} size_after={} fsck={} repeat={} suppressed={} deleted={}",
+        enospc, tx_rolled as u32, if after { "ok" } else { "no" }, toasts, if pass { "PASS" } else { "FAIL" },
+        VOL, DF_BLOCKS, files, low.map_or(alloc::string::String::from("-"), |p| format!("{}", p)), free0 * (BLOCK_SIZE / 1024),
+        big.len() / 1024, residue, size0, if fsck { "clean" } else { "dirty" }, if repeat && !toast2 { "suppressed" } else { "no" }, suppressed, deleted
+    );
 }

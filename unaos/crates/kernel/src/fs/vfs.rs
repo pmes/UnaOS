@@ -1901,11 +1901,11 @@ impl VfsBackend for NativeBackend {
             if matches!(native_kind(ino.kind), NodeKind::Dir) {
                 return Err(VfsError::IsADirectory);
             }
-            fs.write_data(id, offset, data)
-                .map_err(|_| VfsError::Backend("unafs-write"))?;
+            crate::fs::unafs::diskfull::write_root(fs, self.volume_name(), id, offset, data) // DISKFULL (B699): a full volume -> `Backend("nospace")` (-ENOSPC); any failure discards the failed write's residue
+                ?; // DISKFULL (B699): LINE-NEUTRAL — the old `.map_err(.. "unafs-write")` is `write_root`'s own spelling now
             Ok(data.len())
         })
-        .map_err(unafs_err)?
+        .map_err(unafs_err).and_then(|r| { crate::fs::unafs::diskfull::after_hold(); r }) // DISKFULL (B699): the toast, after the hold, at most once a minute
     }
 
     fn truncate(&self, rel: &str, size: u64, principal: &str) -> Result<(), VfsError> {

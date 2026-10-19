@@ -759,6 +759,9 @@ pub const ITEM_NONE: u8 = 0xff;
 /// MENUBARSLOTS (B499): the Notification Center's bell — a BAR item (menubar's flow, the wire's `items=`), not a
 /// statusmenu item, so it sits past [`ITEMS`].
 pub const ITEM_NOTIFY: u8 = 5;
+/// DISKFULL (rmbp-ledger B699, BP-storage-18): the disk item — shown only while the root volume is under
+/// `fs::unafs::diskfull::LOW_PCT` % free ([`disk_low`]). A BAR item past [`ITEMS`] like the bell (no statusmenu menu).
+pub const ITEM_DISK: u8 = 6;
 
 /// The item's wire name.
 pub fn item_name(i: u8) -> &'static str {
@@ -769,6 +772,7 @@ pub fn item_name(i: u8) -> &'static str {
         ITEM_BATTERY => "battery",
         ITEM_CLOCK => "clock",
         ITEM_NOTIFY => "notify",
+        ITEM_DISK => "disk",
         _ => "none",
     }
 }
@@ -805,6 +809,7 @@ static TRAY_VOL: AtomicU8 = AtomicU8::new(0); // 1 = a sink exists
 static TRAY_NET: AtomicU64 = AtomicU64::new(0); // medium | up<<8 | has_ip<<9 | ip<<16
 static TRAY_CLOCK: AtomicU8 = AtomicU8::new(0);
 static TRAY_SEEN: AtomicU8 = AtomicU8::new(0); // 1 once a pass published
+static TRAY_DISK: AtomicU8 = AtomicU8::new(0); // DISKFULL (B699): root free % + 1 while under the low line, 0 otherwise
 
 /// **The owners' pass** — called beside [`poll`] on the desktop service pass. Reads only the owners' own
 /// accessors (each a relaxed load: no port, no lock that a composite holds), so it is not throttled.
@@ -842,6 +847,8 @@ pub fn tray_publish() {
     }
     TRAY_NET.store(net, Ordering::Relaxed);
     TRAY_CLOCK.store(crate::clock::try_unix_now().is_some() as u8, Ordering::Relaxed);
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    TRAY_DISK.store(crate::fs::unafs::diskfull::low_pct().map_or(0, |p| p.saturating_add(1)), Ordering::Relaxed); // DISKFULL (B699): the owner's relaxed loads
     TRAY_SEEN.store(1, Ordering::Relaxed);
     #[cfg(feature = "witness")]
     TRAY_PUB.store(false, Ordering::SeqCst); // UIREDS26 (B599): this pass's stores are done
@@ -880,7 +887,17 @@ pub fn item_known(t: &Tray, i: u8) -> bool {
         ITEM_NET => t.net.is_some(),
         ITEM_VOLUME => t.volume.is_some(),
         ITEM_BATTERY => bar_item().is_some(),
+        ITEM_DISK => disk_low().is_some(),
         _ => false,
+    }
+}
+
+/// DISKFULL (B699): the disk item's one fact — the root volume's free percent while it is under the low line
+/// (`None` = enough room, or no root write measured yet: the item is not drawn). Relaxed load: paint-path legal.
+pub fn disk_low() -> Option<u8> {
+    match TRAY_DISK.load(Ordering::Relaxed) {
+        0 => None,
+        p => Some(p - 1),
     }
 }
 

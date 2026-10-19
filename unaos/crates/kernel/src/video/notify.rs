@@ -194,6 +194,14 @@ pub fn post_quiet(app: &[u8], title: &[u8], line: &[u8], label: &[u8], act: u8, 
     enqueue(n)
 }
 
+/// DISKFULL (rmbp-ledger B699, BP-storage-18): the full-volume toast — `Disk full: <volume> - <n> MB free` (ASCII: a card
+/// carries printable ASCII only, so the sheet's dash is `-`) with an `Open Trash` action that opens Quarry at `trash`.
+/// QUEUE ONLY like every post; the once-a-minute floor is the caller's (`fs::unafs::diskfull::after_hold`).
+pub fn disk_full(vol: &str, free_mb: u64, trash: &str) -> bool {
+    let title = alloc::format!("Disk full: {} - {} MB free", vol, free_mb);
+    post_full(b"system", title.as_bytes(), b"Empty the Trash or delete files to make room.", b"Open Trash", ACT_OPEN_DIR, trash.as_bytes())
+}
+
 // ── the state (the window-safe pass) ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
