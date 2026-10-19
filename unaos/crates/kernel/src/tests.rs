@@ -189,7 +189,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("focussteal", focussteal_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("veilcost", veilcost_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))] register("aging", aging_selftest); register("a11yfilters", crate::video::settings::selftest_a11yfilters); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("zoom", zoom_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("perfhud", crate::video::perfhud::selftest); register("undomove", undomove_selftest); register("fontkit", fontkit_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("raiseverb", raiseverb_selftest); register("keychars", keychars_selftest); register("softydots", softydots_selftest); register("helpsearch", helpsearch_selftest); register("filesearch", filesearch_selftest); }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("focussteal", focussteal_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("veilcost", veilcost_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))] register("aging", aging_selftest); register("a11yfilters", crate::video::settings::selftest_a11yfilters); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("zoom", zoom_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("perfhud", crate::video::perfhud::selftest); register("undomove", undomove_selftest); register("fontkit", fontkit_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("raiseverb", raiseverb_selftest); register("keychars", keychars_selftest); register("softydots", softydots_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpsearch", helpsearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))] register("filesearch", filesearch_selftest); }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -2842,10 +2842,10 @@ pub fn keychars_selftest() {
     #[cfg(not(feature = "quarry"))]
     let field: Option<alloc::string::String> = None;
     let field_n = field.as_deref().map(|f| { let v: alloc::vec::Vec<char> = f.chars().collect(); if v.len() == WANT.len() { count(&v) } else { 0 } }).unwrap_or(0);
-    let wake = keychars_wake(); let pass = chars_n == 5 && window_n == 5 && field_n == 5 && altgr && wake && repeat_byte; // KEYCHARSARM: the Char repeat (`repeat=owed`) rides a u8 tracker (pal.rs) outside the arc
+    let wake = keychars_wake(); let pass = chars_n == 5 && window_n == 5 && field_n == 5 && altgr && wake && repeat_byte; // CHARREPEAT (SR156): `repeat_byte` now also drives the tracker with a held `ü` and a held de `z` (`keychars_repeat_byte`, tail); `repeat=` is its word
     serial_println!(
-        ":: KEYCHARS: layout=de chars={} window={} field={} altgr={} arch={} wake={} repeat=owed -> {} :: claimed={}/{} routed={} ring={} field_state={} repeat_byte={} window_by={}",
-        chars_n, window_n, field_n, if altgr { "ok" } else { "bad" }, if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" }, if wake { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" },
+        ":: KEYCHARS: layout=de chars={} window={} field={} altgr={} arch={} wake={} repeat={} -> {} :: claimed={}/{} routed={} ring={} field_state={} repeat_byte={} window_by={}",
+        chars_n, window_n, field_n, if altgr { "ok" } else { "bad" }, if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" }, if wake { "ok" } else { "bad" }, keychars_repeat_word(), if pass { "PASS" } else { "FAIL" },
         claimed, SEQ.len(), routed, rn, if field.is_some() { "scratch" } else { "busy-or-absent" }, if repeat_byte { "ok" } else { "bad" }, if cfg!(target_arch = "aarch64") { "depth" } else { "payload" }
     );
 }
@@ -4129,11 +4129,63 @@ fn keychars_wake() -> bool {
     ok
 }
 
-/// KEYCHARSARM `repeat_byte=` (asked while `de` is live): the byte a HELD key hands the typematic tracker is the
+/// KEYCHARSARM `repeat_byte=` (asked while `de` is live): the key a HELD usage hands the typematic tracker is the
 /// layout's — usage 0x1C (US `y`) claims `z`, and `ü` (0x2F) claims 0, so neither EHCI's feed nor the aarch64 xHCI feed
-/// forges the US byte (`y`, `[`). Repeating the `ü` itself is owed: the tracker carries one ASCII byte (pal.rs).
+/// forges the US byte (`y`, `[`). CHARREPEAT (LEDGER SR156): the feeds' token (`hid_repeat_key`) is `z` for 0x1C and the
+/// `ü` CHARACTER token for 0x2F, and where the tracker is compiled (`keychars_repeat_tracker`) the tracker repeats them.
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn keychars_repeat_byte() -> bool {
     use crate::drivers::xhci as hx;
-    hx::hid_layout_claim(0x1C, 0, false) == Some(b'z') && hx::hid_layout_claim(0x2F, 0, false) == Some(0)
+    let bytes = hx::hid_layout_claim(0x1C, 0, false) == Some(b'z') && hx::hid_layout_claim(0x2F, 0, false) == Some(0);
+    let (tz, tu) = (hx::hid_repeat_key(0x1C, 0, false, b'y'), hx::hid_repeat_key(0x2F, 0, false, b'['));
+    let tokens = tz == b'z' as u32 && tu == crate::pal::typematic_char_key('\u{fc}');
+    let tracker = keychars_repeat_tracker(tz, tu);
+    let ok = bytes && tokens && tracker.unwrap_or(true);
+    KEYCHARS_REPEAT.store(match tracker { Some(_) if ok => 1, None if ok => 2, _ => 0 }, core::sync::atomic::Ordering::Relaxed);
+    serial_println!("[keychars] repeat bytes={} tokens={} tracker={} -> {}", bytes as u8, tokens as u8, match tracker { Some(true) => "ok", Some(false) => "bad", None => "absent" }, keychars_repeat_word());
+    ok
+}
+
+/// CHARREPEAT: the `repeat=` word — `ok` (tokens right AND the tracker repeated them), `bad`, or `no-tracker` (tokens
+/// right on an image with no host typematic at all: no feed compiles there for ANY key, e.g. a tegra image).
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+static KEYCHARS_REPEAT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn keychars_repeat_word() -> &'static str {
+    match KEYCHARS_REPEAT.load(core::sync::atomic::Ordering::Relaxed) { 1 => "ok", 2 => "no-tracker", _ => "bad" }
+}
+
+/// CHARREPEAT: drive the live tracker through its own seams — a held `ü` repeats `Event::Char('ü')`, a held de `z`
+/// repeats `Event::Key(b'z')`, a RELEASED `ü` (its token absent from the next report) repeats nothing in 64 due ticks.
+/// Each hold is retried up to 8 times: on x86 the service core's `x86_typematic_pump` may take a forced-due repeat
+/// between the fixture's force and its tick. The tracker is reset before and after (`typematic_test_reset`).
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc", feature = "ehcihid"), all(target_arch = "aarch64", feature = "desktop_firmware", feature = "baremetal"))))]
+fn keychars_repeat_tracker(tz: u32, tu: u32) -> Option<bool> {
+    use crate::pal::{self, Event};
+    let held_repeats = |tok: u32, want: Event| -> bool {
+        (0..8).any(|_| {
+            pal::typematic_test_reset();
+            pal::typematic_note_keys(tok, &[tok]);
+            pal::typematic_test_force_due();
+            pal::typematic_tick() == Some(want)
+        })
+    };
+    let char_repeats = held_repeats(tu, Event::Char('\u{fc}'));
+    let z_repeats = held_repeats(tz, Event::Key(b'z'));
+    pal::typematic_test_reset();
+    pal::typematic_note_keys(tu, &[tu]);
+    pal::typematic_note_keys(0, &[]); // the `ü` released
+    let released = (0..64).all(|_| {
+        pal::typematic_test_force_due();
+        pal::typematic_tick().is_none()
+    });
+    pal::typematic_test_reset();
+    serial_println!("[keychars] repeat char={} z={} released={}", char_repeats as u8, z_repeats as u8, released as u8);
+    Some(char_repeats && z_repeats && released)
+}
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), not(any(all(target_arch = "x86_64", feature = "ehcihid"), all(target_arch = "aarch64", feature = "baremetal")))))]
+fn keychars_repeat_tracker(_tz: u32, _tu: u32) -> Option<bool> {
+    None
 }

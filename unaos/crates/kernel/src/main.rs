@@ -3003,7 +3003,7 @@ fn jd2_console_pump(_arg: usize) {
                     // JD20's raw line: an event reached the PUMP. ORIN-CLICK (rung 3) then hands the same edge to the window layer — a separate claim, kept on a separate line, so a capture can tell a decoder fault from a routing fault. ⚠ LINE-NEUTRAL: the routing call is APPENDED to the JD20 statement, never given a line of its own — panic `Location` records embed line numbers, so a line added anywhere in this file breaks the knob-off byte-identity proof.
                     serial_println!(":: tegra: JD20 — pointer BUTTON {:#04x} (down) ::", mask); #[cfg(feature = "orinclick")] unaos_kernel::arch::display_tegra::orin_click(mask); // ORIN-CLICK rung 3 — route the edge into `wc_click_route`; witness `[orinclick] edge=...`
                 }
-                _ => {}
+                #[cfg(all(feature = "login", feature = "desktop_firmware"))] Event::Char(ch) if unaos_kernel::fs::users::screen_up() && !unaos_kernel::video::dialog::over_screen() => { cursor::restore(&mut pal); let _ = unaos_kernel::video::crystal::login::consume_char(ch); needs_render = true; key_repainted = true; } _ => {} // CHARREPEAT (LEDGER SR156): the login password takes a layout CHARACTER here too (KEYCHARSARM's owed fold): the screen's `consume_char` (UTF-8, a Backspace drops the whole character), cursor erased first like the Key arm; screen down or under the power-row confirm -> `_`, dropped (BP-input-4). ⚠ LINE-NEUTRAL fold, code first.
             }
         }
         // One cursor composite for the whole frame's pointer activity — bounded work no matter how
@@ -4269,7 +4269,7 @@ fn typematic_selftest() {
     // (A) baseline: press 'x' at the report level, force the repeat due, expect one synthesised 'x'.
     pal::typematic_note_report(b'x', &[b'x']);
     pal::typematic_test_force_due();
-    let baseline = pal::typematic_tick() == Some(b'x');
+    let baseline = pal::typematic_tick() == Some(pal::Event::Key(b'x'));
     while pal::next_event().is_some() {}
     // (B) backpressure: still "held"; fill the ring past half full; a due tick must now suppress the inject.
     pal::typematic_note_report(b'x', &[b'x']); // re-arm (baseline's tick advanced NEXT past due)
@@ -4330,7 +4330,7 @@ fn typematic_selftest() {
     pal::typematic_note_report(0, &[b'g']); // no press edge — only "still held"
     let lapse_rearms = pal::typematic_test_armed() == Some(b'g');
     pal::typematic_test_force_due();
-    let rearm_repeats = pal::typematic_tick() == Some(b'g');
+    let rearm_repeats = pal::typematic_tick() == Some(pal::Event::Key(b'g'));
     while pal::next_event().is_some() {}
 
     // (H) LAPSE THEN RELEASED: the same lapse, but the next report's held set is EMPTY. A release outranks the
@@ -4459,8 +4459,8 @@ fn pump_usb_into_gui() {
     // UVUG-5 typematic: BEFORE the drain, synthesise a held key's repeat into EVENT_QUEUE so it rides this
     // pass's routing exactly like a real key edge (`poll_events()` above already re-armed the HID rings and
     // pushed any genuine edges). No key held / not yet due -> no-op; QEMU has no HID so this never fires.
-    if let Some(k) = unaos_kernel::pal::typematic_tick() {
-        unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(k));
+    if let Some(ev) = unaos_kernel::pal::typematic_tick() { // CHARREPEAT (SR156): the due repeat is the EVENT its press pushed — `Key(b)`, or `Char(c)` for a held `ü`
+        unaos_kernel::pal::push_event(ev);
     }
     // UVUG-10: producer/consumer accounting for EVENT_QUEUE itself. Placed BEFORE the routing branches so it
     // reports on every pass regardless of which sink owns input this instant — the question it answers ("was
@@ -4683,7 +4683,7 @@ fn pump_usb_into_gui() {
             unaos_kernel::pal::Event::Wheel(_) => {
                 unaos_kernel::pal::wheel_note_no_focus();
             }
-            _ => {}
+            #[cfg(feature = "login")] unaos_kernel::pal::Event::Char(_) => gui_send(ev), _ => {} // CHARREPEAT (LEDGER SR156): a layout CHARACTER with the shell holding focus goes to the render task, whose `render_pass` offers it to the login screen (the task that already owns `screen_key` here). ⚠ LINE-NEUTRAL fold, code first.
         }
     }
     click2_depth_witness();
@@ -5506,7 +5506,7 @@ fn render_pass<W: RenderWait>(w: &mut W) {
             // furniture cadence is a property of the discipline — the strip pulse on this member, the
             // input service's own pulse on the folding one, a CNTPCT compare on a polled terminus — so
             // the pass reads ONE answer and the impl decides what produced it. Other events: nothing.
-            _ => {}
+            #[cfg(all(feature = "login", feature = "desktop_firmware"))] unaos_kernel::pal::Event::Char(ch) => { if unaos_kernel::fs::users::screen_up() && !unaos_kernel::video::dialog::over_screen() { let _ = unaos_kernel::video::crystal::login::consume_char(ch); } } _ => {} // CHARREPEAT (LEDGER SR156): the Pi's login password takes a layout CHARACTER (the Key arm's `screen_key` twin; the screen paints itself, as on a consumed key); otherwise dropped, as before. ⚠ LINE-NEUTRAL fold, code first.
         }}
         // SERIAL-FOCUS — **THE CONSUMER SIDE OF THE SOURCE SPLIT.** The shell's serial inbox is
         // drained here, on every pass, unconditionally, and the bytes are dispatched through the
@@ -5850,7 +5850,7 @@ fn usb_pump(_: usize) {
 #[cfg(target_arch = "x86_64")]
 fn x86_typematic_pump() {
     #[cfg(feature = "ehcihid")]
-    if let Some(k) = unaos_kernel::pal::typematic_tick() {
+    if let Some(ev) = unaos_kernel::pal::typematic_tick() { // CHARREPEAT (SR156): `Key(b)`, or `Char(c)` for a held layout character
         // WITNESS, once per boot. The `[keystat] typematic hold end` rollup already reports per-hold
         // and per-boot repeat counts from shared code, but it only prints when a hold ENDS — so a
         // capture taken mid-hold, or a boot where the operator never lifted the key, would show
@@ -5861,11 +5861,11 @@ fn x86_typematic_pump() {
         if !FIRST.swap(true, core::sync::atomic::Ordering::Relaxed) {
             serial_println!(
                 ":: KEYREPEAT-X86: first synthesised repeat — key={}{} (host typematic armed on the EHCI keyboard) == witness ::",
-                unaos_kernel::pwwire::key_class(k),
+                match ev { unaos_kernel::pal::Event::Key(k) => unaos_kernel::pwwire::key_class(k), _ => "char" },
                 "" // CONSOLEFIX M3: a class, never the key
             );
         }
-        unaos_kernel::pal::push_event(unaos_kernel::pal::Event::Key(k));
+        unaos_kernel::pal::push_event(ev);
     }
 }
 

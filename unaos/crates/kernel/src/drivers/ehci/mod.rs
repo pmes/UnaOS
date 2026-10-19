@@ -16765,14 +16765,14 @@ unsafe fn decode_boot_keyboard(
     // are absent from both, exactly as on the xHCI feed — `IDLE_RUN_TO_LATCH` covers the residue.
     // Mirrors `drivers::xhci`'s call site one-for-one; the tracker itself is shared code.
     {
-        let mut held: [u8; 6] = [0; 6];
+        let mut held: [u32; 6] = [0; 6];
         let mut hn = 0usize;
-        let mut newest_press: u8 = 0;
+        let mut newest_press: u32 = 0;
         for &keycode in cur_keys.iter() {
             if keycode <= 1 {
                 continue;
             }
-            let ascii = super::xhci::hid_layout_claim(keycode, modifiers, caps).unwrap_or_else(|| ascii_of(keycode)); // KEYCHARS (B718): a claimed usage repeats the byte its layout typed (0 = none: no `[` forged for a held `ü`)
+            let ascii = super::xhci::hid_repeat_key(keycode, modifiers, caps, ascii_of(keycode)); // CHARREPEAT (SR156): the layout's TOKEN — the byte it typed, or a char token so a held `ü` repeats `ü` (never the US `[`); KEYCHARS (B718) handed the claim byte, 0 for `ü`
             if ascii != 0 {
                 held[hn] = ascii;
                 hn += 1;
@@ -16781,7 +16781,7 @@ unsafe fn decode_boot_keyboard(
                 }
             }
         }
-        crate::pal::typematic_note_report(newest_press, &held[..hn]); for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::fnrow::fn_row_usage(crate::video::fnrow::PATH_EHCI, kc, modifiers); } } // XHCIMEDIA (B438): through the one fn-row router. VOLKEYS: F10/F11/F12 press edges -> mute/down/up (codec amp + bar indicator)
+        crate::pal::typematic_note_keys(newest_press, &held[..hn]); for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let _ = crate::video::fnrow::fn_row_usage(crate::video::fnrow::PATH_EHCI, kc, modifiers); } } // XHCIMEDIA (B438): through the one fn-row router. VOLKEYS: F10/F11/F12 press edges -> mute/down/up (codec amp + bar indicator)
     }
 
     // The release edges. Bounded by six per report, and a human's key releases are human-rate, so

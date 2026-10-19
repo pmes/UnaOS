@@ -1612,7 +1612,7 @@ pub fn keyboard_detach_gen() -> u64 {
 ))]
 mod typematic {
     use core::sync::atomic::{AtomicU32, AtomicU64};
-    /// ASCII of the key eligible to repeat, +1 (0 = none). Newest press wins.
+    /// The key TOKEN eligible to repeat, +1 (0 = none): an ascii byte, or `TYPEMATIC_CHAR | c` (CHARREPEAT). Newest wins.
     pub(super) static KEY_P1: AtomicU32 = AtomicU32::new(0);
     /// `ms()` at which the next repeat is due.
     pub(super) static NEXT_MS: AtomicU64 = AtomicU64::new(0);
@@ -1687,11 +1687,11 @@ mod typematic {
     all(target_arch = "aarch64", feature = "baremetal"),
     all(target_arch = "x86_64", feature = "ehcihid")
 ))]
-fn pack_held(held: &[u8]) -> u64 {
+fn pack_held(held: &[u32]) -> u64 {
     let n = held.len().min(6);
     let mut v: u64 = (1 << 63) | ((n as u64) << 56);
-    for (i, &b) in held.iter().take(n).enumerate() {
-        v |= (b as u64) << (i * 8);
+    for (i, &t) in held.iter().take(n).enumerate() {
+        let b = if t & TYPEMATIC_CHAR != 0 { 0x80 | ((t ^ (t >> 7) ^ (t >> 14)) & 0x7F) } else { t & 0xFF }; v |= (b as u64) << (i * 8); // CHARREPEAT: a char token folds to one byte (equality only)
     }
     v
 }
@@ -1705,7 +1705,7 @@ fn pack_held(held: &[u8]) -> u64 {
     all(target_arch = "aarch64", feature = "baremetal"),
     all(target_arch = "x86_64", feature = "ehcihid")
 ))]
-pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
+pub fn typematic_note_keys(newest_press: u32, held: &[u32]) { // CHARREPEAT: tokens (`typematic_char_key`); the u8 `typematic_note_report` is the file-tail wrapper
     use core::sync::atomic::Ordering;
     let now = crate::arch::ms();
     typematic::LAST_REPORT_MS.store(now.max(1), Ordering::Relaxed);
@@ -1740,7 +1740,7 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
     }
     let kp1 = typematic::KEY_P1.load(Ordering::Relaxed);
     if kp1 != 0 {
-        let k = (kp1 - 1) as u8;
+        let k = kp1 - 1;
         if !held.contains(&k) {
             typematic::KEY_P1.store(0, Ordering::Relaxed);
         } else if idle_run >= typematic::IDLE_RUN_TO_LATCH {
@@ -1769,7 +1769,7 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
         // both of those clear `LAPSED_P1` too).
         let lapsed = typematic::LAPSED_P1.load(Ordering::Relaxed);
         if lapsed != 0 {
-            let k = (lapsed - 1) as u8;
+            let k = lapsed - 1;
             if held.contains(&k) {
                 typematic::KEY_P1.store(lapsed, Ordering::Relaxed);
                 // A fresh initial delay, not the repeat rate: the re-arm re-enters the hold at its start, so a
@@ -1780,7 +1780,7 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
                 if n <= typematic::REARM_LOG_MAX {
                     serial_println!(
                         "[keystat] typematic re-arm — key={} still held after a liveness lapse; repeat resumed at delay={}ms (hold re-arms={} boot re-arms={})",
-                        crate::pwwire::key_class(k), // CONSOLEFIX M3: a class, never the key
+                        typematic_token_class(k), // CONSOLEFIX M3: a class, never the key
                         typematic::DELAY_MS,
                         n,
                         typematic::BOOT_REARMS.load(Ordering::Relaxed)
@@ -1793,11 +1793,11 @@ pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
     }
     // Arm the newest press (newest-wins typematic) and (re)start the initial delay.
     if newest_press != 0 {
-        typematic::KEY_P1.store(newest_press as u32 + 1, Ordering::Relaxed);
+        typematic::KEY_P1.store(newest_press + 1, Ordering::Relaxed);
         typematic::NEXT_MS.store(now.wrapping_add(typematic::DELAY_MS), Ordering::Relaxed);
         // A press supersedes any parked lapse (newest-wins), and names the hold for the rollup.
         typematic::LAPSED_P1.store(0, Ordering::Relaxed);
-        typematic::HOLD_KEY.store(newest_press as u32 + 1, Ordering::Relaxed);
+        typematic::HOLD_KEY.store(newest_press + 1, Ordering::Relaxed);
     }
 }
 
@@ -1819,7 +1819,7 @@ fn typematic_hold_rollup() {
     }
     serial_println!(
         "[keystat] typematic hold end — key={} repeats={} re-arms={} window={}ms (boot: repeats={} re-arms={})",
-        crate::pwwire::key_class(key.wrapping_sub(1) as u8), // CONSOLEFIX M3
+        typematic_token_class(key.wrapping_sub(1)), // CONSOLEFIX M3
         repeats,
         rearms,
         if typematic::STREAMS_WHILE_HELD.load(Ordering::Relaxed) != 0 {
@@ -1839,20 +1839,20 @@ fn typematic_hold_rollup() {
     all(target_arch = "aarch64", feature = "baremetal"),
     all(target_arch = "x86_64", feature = "ehcihid")
 ))]
-fn typematic_lapse_disarm(k: u8) {
+fn typematic_lapse_disarm(k: u32) {
     use core::sync::atomic::Ordering;
     typematic::KEY_P1.store(0, Ordering::Relaxed);
-    typematic::LAPSED_P1.store(k as u32 + 1, Ordering::Relaxed);
+    typematic::LAPSED_P1.store(k + 1, Ordering::Relaxed);
 }
 
-/// UVUG-6 — if a held key's repeat is due, return its ascii and schedule the next one. Returns `None` when no
+/// UVUG-6 — if a held key's repeat is due, return its event (CHARREPEAT: `Key(b)`, or `Char(c)` for a char token) and schedule the next one. Returns `None` when no
 /// key is held, the repeat is not yet due, the keyboard detached, liveness lapsed, or EVENT_QUEUE is past half
 /// full. Called once per USB pump pass, BEFORE the drain, by the host pump in `main`.
 #[cfg(any(
     all(target_arch = "aarch64", feature = "baremetal"),
     all(target_arch = "x86_64", feature = "ehcihid")
 ))]
-pub fn typematic_tick() -> Option<u8> {
+pub fn typematic_tick() -> Option<Event> {
     use core::sync::atomic::Ordering;
     // (2) detach guard: a keyboard unplugged mid-hold never sends its release report.
     let dg = keyboard_detach_gen();
@@ -1889,7 +1889,7 @@ pub fn typematic_tick() -> Option<u8> {
         // PAL-TYPEMATIC: park the key rather than forget it. Either window may be wrong about a hold that is
         // still physically in progress — that is the whole of chain B — and the cheapest possible refutation
         // is the next report's held set. `typematic_note_report` performs it.
-        typematic_lapse_disarm((kp1 - 1) as u8);
+        typematic_lapse_disarm(kp1 - 1);
         // UVUG-9: name the BACKSTOP when it is what fired. A repeat that simply stops is indistinguishable at
         // the bench from the bug this arc fixed, so the coarse 30 s bound must say so out loud — one line per
         // disarm, which is self-limiting at a minimum of `HOLD_MAX_MS` apart. The tight `LIVENESS_MS` disarm
@@ -1917,14 +1917,14 @@ pub fn typematic_tick() -> Option<u8> {
         if typematic::HOLD_KEY.load(Ordering::Relaxed) == 0 {
             typematic::HOLD_KEY.store(kp1, Ordering::Relaxed);
         }
-        return Some((kp1 - 1) as u8);
+        return typematic_token_event(kp1 - 1);
     }
     None
 }
 
 /// UVUG-6 test aid — force the next repeat "due" now, so the QEMU selftest can exercise the inject/suppress
 /// decision deterministically without waiting out the real delay. Not used on any boot path.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), all(target_arch = "x86_64", feature = "ehcihid")))] // CHARREPEAT: the tracker's own cfg (was aarch64+baremetal), so `tests keychars` drives it on x86 too
 pub fn typematic_test_force_due() {
     use core::sync::atomic::Ordering;
     typematic::NEXT_MS.store(crate::arch::ms(), Ordering::Relaxed);
@@ -1941,7 +1941,7 @@ pub fn typematic_test_streams_latched() -> bool {
 
 /// UVUG-9 test aid — clear all typematic tracker state so a selftest leg starts from a known baseline
 /// (equivalent to a fresh keyboard, without faking a detach generation). Not used on any boot path.
-#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+#[cfg(any(all(target_arch = "aarch64", feature = "baremetal"), all(target_arch = "x86_64", feature = "ehcihid")))] // CHARREPEAT: the tracker's own cfg (was aarch64+baremetal), so `tests keychars` drives it on x86 too
 pub fn typematic_test_reset() {
     use core::sync::atomic::Ordering;
     typematic::KEY_P1.store(0, Ordering::Relaxed);
@@ -1973,7 +1973,7 @@ pub fn typematic_test_armed() -> Option<u8> {
 pub fn typematic_test_force_lapse() {
     let kp1 = typematic::KEY_P1.load(core::sync::atomic::Ordering::Relaxed);
     if kp1 != 0 {
-        typematic_lapse_disarm((kp1 - 1) as u8);
+        typematic_lapse_disarm(kp1 - 1);
     }
 }
 
@@ -2351,7 +2351,7 @@ pub fn keyrepeat_selftest() {
     typematic_note_report(b'k', &[b'k']);
     let (mut repeats, mut first) = (0u32, 0u64);
     while crate::arch::ms().wrapping_sub(t0) < 700 && spins < cap {
-        if typematic_tick() == Some(b'k') {
+        if typematic_tick() == Some(Event::Key(b'k')) {
             if repeats == 0 {
                 first = crate::arch::ms().wrapping_sub(t0);
             }
@@ -2499,4 +2499,48 @@ pub mod k2p {
             s
         })
     }
+}
+
+// ══════════════ CHARREPEAT (LEDGER SR156) — the typematic tracker's key TOKEN — TAIL-APPENDED ══════════════
+//
+// The tracker (`mod typematic`, above) arms and releases on a u32 TOKEN: an ascii / press byte `b` as `b` (the 0x80..
+// Ctrl-chord bytes included: they repeat as the `Key` they were), a layout character `c` at or above U+0080 as
+// `TYPEMATIC_CHAR | c`. Bit 31 is free (a scalar is at most 0x10FFFF), so the two never collide and token+1 fits the
+// u32 slots. `typematic_tick` turns the due token back into the event the press pushed: KEYCHARS' rule (BP-input-19),
+// below 0x80 rides `Key`, at or above rides `Char`. So a held `ü` repeats `ü`, a held German `z` repeats `z`.
+
+/// CHARREPEAT: the tag bit of a CHARACTER token (see the block above).
+pub const TYPEMATIC_CHAR: u32 = 1 << 31;
+
+/// CHARREPEAT: the tracker token of a layout character (the HID feeds, via `drivers::xhci::hid_repeat_key`).
+pub fn typematic_char_key(c: char) -> u32 {
+    TYPEMATIC_CHAR | c as u32
+}
+
+/// CHARREPEAT: the event a due token repeats — `Char(c)` for a character token, `Key(b)` otherwise.
+pub fn typematic_token_event(t: u32) -> Option<Event> {
+    if t & TYPEMATIC_CHAR != 0 {
+        char::from_u32(t & !TYPEMATIC_CHAR).map(Event::Char)
+    } else {
+        Some(Event::Key(t as u8))
+    }
+}
+
+/// CHARREPEAT: a token's wire class (CONSOLEFIX M3: a class, never the key; a character prints `char`).
+pub fn typematic_token_class(t: u32) -> &'static str {
+    if t & TYPEMATIC_CHAR != 0 { "char" } else { crate::pwwire::key_class(t as u8) }
+}
+
+/// UVUG-6's byte-level feed, kept for its callers (the uvug6 selftest): an ascii `newest_press` and held set, as tokens.
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "baremetal"),
+    all(target_arch = "x86_64", feature = "ehcihid")
+))]
+pub fn typematic_note_report(newest_press: u8, held: &[u8]) {
+    let mut t = [0u32; 6];
+    let n = held.len().min(6);
+    for (d, &b) in t.iter_mut().zip(held.iter()) {
+        *d = b as u32;
+    }
+    typematic_note_keys(newest_press as u32, &t[..n]);
 }
