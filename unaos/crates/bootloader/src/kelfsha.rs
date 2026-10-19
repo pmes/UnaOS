@@ -7,12 +7,15 @@
 //!
 //! and the x86 loader hashes the bytes it read and asks [`check`] BEFORE the jump. `kelf=` is the loader's own
 //! `KELF max=` (BP-boot-13), computed by [`kelf_of`] on both sides: it binds a row to the image it describes, so a
-//! row left behind by ABIMAGE's promotion (KERNEL.NEW renamed over KERNEL.ELF, the record untouched) reads as
-//! [`Check::Stale`] — `unverified`, never a lockout (BP-bar-1). What this guards against is a torn write and a
-//! half-flashed stick, nothing else: no signing, no key (BP-security-16).
+//! row for another image reads as [`Check::Stale`] — `unverified`, never a lockout (BP-bar-1). What this guards
+//! against is a torn write and a half-flashed stick, nothing else: no signing, no key (BP-security-16).
 //!
-//! Pure: no `alloc`, no `uefi`, no `crate::` path — the loader includes it by `#[path]` (`main.rs` tail) and so does
-//! the builder (`builder/src/main.rs`), so the writer and the reader cannot disagree.
+//! KELFSTAGE (B720): the kernel's `install::abimage` keeps the record in step with the slots — the stage writes the
+//! slot-B row ([`with_row`]), the promotion respells it as the slot-A row ([`promoted`]), the unstage drops it.
+//!
+//! Pure: no `alloc`, no `uefi`, no `crate::` path — the loader includes it by `#[path]` (`main.rs` tail), and so do
+//! the builder (`builder/src/main.rs`) and the kernel (`install/abimage.rs`), so the writers and the reader cannot
+//! disagree.
 
 /// The record's file on the ESP (8.3; FAT names are case-blind).
 pub const NAME: &str = "KELF.SHA";
@@ -32,7 +35,7 @@ pub enum Check {
     Ok,
     /// No `KELF.SHA` on the volume (an image older than KELFHASH): `hash=unverified`, jump.
     NoRecord,
-    /// A record, but no row for this slot (KERNEL.NEW is staged by the kernel, not the builder): `unverified`, jump.
+    /// A record, but no row for this slot (a KERNEL.NEW staged before KELFSTAGE): `unverified`, jump.
     NoRow,
     /// The row describes another image (its `kelf=` is not these bytes'): `unverified`, jump.
     Stale,
@@ -198,6 +201,42 @@ pub fn row(sha: &[u8; 32], file: &str, slot: u8, kelf: u64, out: &mut [u8; ROW_M
     }
     put(b"\n", &mut n);
     n
+}
+
+/// KELFSTAGE (rmbp-ledger B720): `rec` with `slot`'s row replaced — every well-formed row of ANOTHER slot kept in order,
+/// then `new_row` (a [`row`] spelling) appended; `None` for `new_row` drops the slot's row. Blank and malformed lines
+/// are not carried. `None` when the result would not fit [`MAX`]. The kernel's stage (slot B) and unstage call it.
+pub fn with_row(rec: &[u8], slot: u8, new_row: Option<&[u8]>, out: &mut [u8; MAX]) -> Option<usize> {
+    let mut n = 0;
+    let mut put = |s: &[u8], n: &mut usize| -> Option<()> {
+        let end = n.checked_add(s.len())?;
+        out.get_mut(*n..end)?.copy_from_slice(s);
+        *n = end;
+        Some(())
+    };
+    for line in rec.split(|&c| c == b'\n') {
+        if parse_row(line).is_some_and(|r| r.slot != slot) {
+            put(line, &mut n)?;
+            put(b"\n", &mut n)?;
+        }
+    }
+    if let Some(r) = new_row {
+        let r = r.strip_suffix(b"\n").unwrap_or(r);
+        put(r, &mut n)?;
+        put(b"\n", &mut n)?;
+    }
+    Some(n)
+}
+
+/// KELFSTAGE (B720): the record after ABIMAGE's promotion (KERNEL.NEW renamed over KERNEL.ELF) — slot B's row
+/// respelled as `file=KERNEL.ELF slot=A` (same sha256, same `kelf=`), every other row dropped, so the old image's A
+/// row never survives an update (`hash=ok` does). `None` when there is no slot-B row to promote.
+pub fn promoted(rec: &[u8], out: &mut [u8; MAX]) -> Option<usize> {
+    let b = find(rec, SLOT_B)?;
+    let mut r = [0u8; ROW_MAX];
+    let n = row(&b.sha, "KERNEL.ELF", SLOT_A, b.kelf, &mut r);
+    out.get_mut(..n)?.copy_from_slice(&r[..n]);
+    Some(n)
 }
 
 /// THE LOADER'S CHECK of one slot's bytes — pure over the record (`None` = no `KELF.SHA`), the slot, the bytes'
