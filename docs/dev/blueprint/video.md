@@ -27,6 +27,7 @@
 | BP-video-15 | DESKTOPCRAFT is paint-only: no hit box, strip rect or router changes from the look's paint. | `docs/dev/OS/05_USER_EXPERIENCE/DESKTOPCRAFT.md:16-19` | `tests desktopcraft` |
 | BP-video-16 | Settings rows are ONE table, `settings::MAP`: every `prefs::key::ALL` key is on exactly one row (`system.settings.tab` on the tab column), every row names declared keys; the search field (filter, Return to the row), the launcher's `row_of_key` and the fixture read it; every label is reached by at most 2 typed keys + Return (BP-bar-17, R118). | `unaos/crates/kernel/src/video/settings.rs:3255` `unaos/crates/kernel/src/video/settings.rs:3319` `unaos/crates/kernel/src/prefs.rs:104` | `tests settingsmap` (`:: SETTINGSMAP: … -> PASS ::`) |
 | BP-video-16 | Toasts: at most 3 cards on the glass, 5 s each, the clock paused while hovered; a post that finds the stack full WAITS and is never closed to make room (the Center keeps every post, R116). Dialogs: one `accent.fill` button per view (the default); Return accepts, Escape cancels, on every view (BP-bar-18, DESIGN-LANGUAGE §3.6/§3.8). | `unaos/crates/kernel/src/video/notify.rs` (`STACK_MAX`, `CARD_MS`, `show_card`/`promote`, the hover arm of `pass`); `unaos/crates/kernel/src/video/dialog.rs` (`paint`'s `PRIMARY`, `route_key`) | `tests toastcap` (B674) |
+| BP-video-16 | The desktop's memory is a line, not a guess (BP-bar-24, BP-bar-9): the build's ask opens a heap high-water window; `[desktop] built` reads `heap_kb` (used), `high_kb` (the peak from the ask) and `furniture_kb` (the panel bytes the `strip::rects` tenants own); every build after the first prints `high_delta_pct` against the first, and a Log Out then log in returns within 2 %. The 64 MB bar is reported (`under=`), not enforced. | `unaos/crates/kernel/src/video/desktopbuild.rs:435-458` `unaos/crates/kernel/src/video/desktopbuild.rs:513` `unaos/crates/kernel/src/allocator.rs:165-203` | `:: MEMLINE: … logout_delta_pct=<n> -> PASS ::` (`tests memline`) |
 
 ## 3. Seams
 - `wm` may be called by: kernel apps (`facet`, `quarry`, `settings`, `fileview`, `login`, …), ring-3 window syscalls (ring3.md), the input router (input.md), `splash`, `desktopbuild`.
@@ -37,6 +38,8 @@
 ## 4. Wire
 `[wc-x] desktop-clear panel=<w>x<h> …` · `[desktop] built …` · `[look] switch to= from= ms= windows_rechromed=` · `:: WALLPAPER: src= … -> PASS ::` ·
 `:: DESKTOPCRAFT: cost … frame_us= budget_us=16667 … -> UNDER|OVER ::` · `:: LOGINZ: … ::` · `:: SETTINGSMAP: keys= rows= orphans=0 unrowed=0 search=ok(<label>:<n>) -> PASS ::` · `[wm] limit windows= procs=` · `:: GPUBLIT: … blitter=gpu` (Kepler takeover).
+`[wc-x] desktop-clear panel=<w>x<h> …` · `[desktop] built … heap_kb= high_kb= furniture_kb= high_delta_pct=` · `:: MEMLINE: … ::` · `[look] switch to= from= ms= windows_rechromed=` · `:: WALLPAPER: src= … -> PASS ::` ·
+`:: DESKTOPCRAFT: cost … frame_us= budget_us=16667 … -> UNDER|OVER ::` · `:: LOGINZ: … ::` · `[wm] limit windows= procs=` · `:: GPUBLIT: … blitter=gpu` (Kepler takeover).
 
 ## 5. Ruled, unbuilt
 - R121: the Una look's full refinement waits on 3D acceleration (Kepler GR, gen7 R10+); R101 keeps one executor on each GPU.
