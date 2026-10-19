@@ -656,7 +656,7 @@ fn tog(st: &mut State, r: usize, x: usize, on: bool, focus: bool) {
     let y = mid_y(r, th);
     let c = cs(st, x, y, tw, th, focus);
     let (now, tab) = (st.now, st.tab);
-    let knob = st.glides.to(mkey(MK_TOGGLE, tab, r, x), if on { draw::motion::ONE as i32 } else { 0 }, now, draw::motion::BASE, draw::motion::Curve::Standard);
+    let knob = st.glides.to(mkey(MK_TOGGLE, tab, r, x), if on { draw::motion::ONE as i32 } else { 0 }, now, draw::motion::dur(draw::motion::BASE), draw::motion::Curve::Standard);
     draw::toggle_at(&mut sf(st), e(x), e(y), knob as u32, c);
 }
 
@@ -677,7 +677,7 @@ fn seg(st: &mut State, r: usize, labels: &[&[u8]], sel: usize, focus: bool) {
     let (x0, w) = (e(TRACK_X), ew(TRACK_X, TRACK_W));
     let target = x0 + (w / labels.len().max(1) as i32) * sel.min(labels.len().saturating_sub(1)) as i32;
     let (now, tab) = (st.now, st.tab);
-    let tx = st.glides.to(mkey(MK_SEG, tab, r, 0), target, now, draw::motion::BASE, draw::motion::Curve::Standard);
+    let tx = st.glides.to(mkey(MK_SEG, tab, r, 0), target, now, draw::motion::dur(draw::motion::BASE), draw::motion::Curve::Standard);
     draw::segmented_at(&mut sf(st), x0, e(y), w, labels, sel, tx, c);
 }
 
@@ -869,7 +869,7 @@ fn paint_column(st: &mut State, tab: usize) {
     let vis = top..(top + COL_VIS).min(n);
     let pill = vis.clone().find(|&i| list[i] as usize == tab).map(|i| {
         let (now, ph) = (st.now, dp(PILL_H));
-        let py = st.glides.to(mkey(MK_PILL, 0, 0, 0), e(pill_y(i, top)), now, draw::motion::BASE, draw::motion::Curve::Standard);
+        let py = st.glides.to(mkey(MK_PILL, 0, 0, 0), e(pill_y(i, top)), now, draw::motion::dur(draw::motion::BASE), draw::motion::Curve::Standard);
         Rect::new(e(PILL_X), py, ew(PILL_X, cw), ph)
     });
     for i in vis.clone() {
@@ -3034,6 +3034,13 @@ fn press_filetypes(row: usize, cx: usize) {
 // login's load ([`a11y_load`]), followed on PrefChanged (`bus_changes_inner` marks [`A11Y_DIRTY`], the service pass
 // re-reads), stored as ONE latched PrefSet per changed key drained by [`a11y_service`] (never a bus write in the click
 // router). Wire: `[settings] accessibility.<key>=<v> applied=<0|1>`, `[settings] accessibility loaded …`.
+// A11YFILTERS (rmbp-ledger B705): rows 4-5 — `cvd` (enum none / protan / deutan / tritan / grayscale, a segmented
+// control) and `invert` (bool, a switch), applied to `blitter::a11yfilter`'s latch, which every writer to the scanout
+// reads at its copy (BP-video-20); the help text moves to rows 6-7. The filter's cost line,
+// `[a11y] filter=<mode> pass_us=<n> motion=<full|reduced> presents=<n> px=<n> why=<load|change|tick>`, is printed by
+// [`a11y_cost_line`] at the login's load, on every change of rows 0 / 4 / 5, and every ten seconds while a filter is on.
+
+use super::blitter::a11yfilter as af;
 
 /// The Accessibility tab's index on the strip (REASK B681's Privacy follows it).
 pub const A11Y_TAB: usize = 9;
@@ -3054,7 +3061,7 @@ static A11Y_REDUCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 static A11Y_CONTRAST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static A11Y_CURSOR_Q: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(A11Y_CURSOR_MIN_Q);
 static A11Y_TEXT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size).
+/// Store writes owed: bit k = row k (0 reduce motion, 1 contrast, 2 cursor size, 3 text size, 4 cvd, 5 invert).
 static A11Y_PERSIST: AtomicU32 = AtomicU32::new(0);
 /// A PrefChanged named an `accessibility.*` key: the service pass re-reads the four.
 static A11Y_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -3109,13 +3116,34 @@ fn a11y_load(via: &str) {
     let ic = flag(key::A11Y_INCREASE_CONTRAST).unwrap_or(false);
     let cq = sys_get(key::A11Y_CURSOR_SIZE).and_then(|v| v.as_float()).map_or(A11Y_CURSOR_MIN_Q, a11y_cursor_q_of);
     let ts = text(key::A11Y_TEXT_SIZE).and_then(|s| A11Y_TEXT_NAMES.iter().position(|n| *n == s)).unwrap_or(0) as u8;
+    let cvd = text(key::A11Y_CVD).and_then(|s| af::mode_of(&s)).unwrap_or(0);
+    let inv = flag(key::A11Y_INVERT).unwrap_or(false);
     let (rm0, ic0, cq0, ts0) = (A11Y_REDUCE.swap(rm, Ordering::Relaxed), A11Y_CONTRAST.swap(ic, Ordering::Relaxed), A11Y_CURSOR_Q.swap(cq, Ordering::Relaxed), A11Y_TEXT.swap(ts, Ordering::Relaxed));
-    let moved = (rm0 != rm) as u8 + (ic0 != ic) as u8 + (cq0 != cq) as u8 + (ts0 != ts) as u8;
+    let (cvd0, inv0) = (af::mode(), af::invert());
+    af::set(cvd, inv);
+    let moved = (rm0 != rm) as u8 + (ic0 != ic) as u8 + (cq0 != cq) as u8 + (ts0 != ts) as u8 + (cvd0 != cvd) as u8 + (inv0 != inv) as u8;
     if via != "login" && ts0 != ts { A11Y_PERSIST.fetch_or(1 << 3, Ordering::AcqRel); }
     if via == "login" || moved > 0 {
-        serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} moved={} via={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], moved, via);
+        serial_println!("[settings] accessibility loaded reduce_motion={} increase_contrast={} cursor_size=x{} text_size={} cvd={} invert={} moved={} via={}", rm as u8, ic as u8, a11y_cursor_str(cq), A11Y_TEXT_NAMES[ts as usize], af::NAMES[cvd], inv as u8, moved, via);
+        a11y_cost_line(if via == "login" { "load" } else { "change" });
     }
 }
+
+/// A11YFILTERS (B705): the filter's wire line, draining the cost counters: `pass_us` = the transform's microseconds
+/// per filtered window present since the last line (every scanout writer's transform summed, over the window
+/// presents `present_band` counted), `px` the pixels filtered.
+fn a11y_cost_line(why: &str) {
+    let (p, px, us) = af::take_stats();
+    serial_println!(
+        "[a11y] filter={} pass_us={} motion={} presents={} px={} why={}",
+        af::label(af::mode(), af::invert()), if p > 0 { us / p } else { 0 }, if draw::motion::reduced() { "reduced" } else { "full" }, p, px, why
+    );
+}
+
+/// The cost line's clock: `arch::ms()` of the last periodic line.
+static A11Y_COST_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The periodic cost line's interval while a filter is on (ms).
+const A11Y_COST_MS: u64 = 10_000;
 
 /// Set row `row` (0 / 1 toggles = `val != 0`; 2 the cursor size in quarters; 3 the text step), apply it to the latch
 /// the glass reads, and when `store`: print the change and latch the store write. Repaints.
@@ -3125,11 +3153,14 @@ fn a11y_set(row: usize, val: usize, store: bool) {
         1 => { A11Y_CONTRAST.store(val != 0, Ordering::Relaxed); let _ = super::theme::set_contrast(val != 0); /* CONTRAST (B664): the theme takes the set and bumps its epoch, so chrome, menus and the generated wallpaper redraw as an accent change does. ⚠ LINE-NEUTRAL append. */ ("increase_contrast", alloc::format!("{}", (val != 0) as u8), true) }
         2 => { let q = (val.min(255) as u8).clamp(A11Y_CURSOR_MIN_Q, A11Y_CURSOR_MAX_Q); A11Y_CURSOR_Q.store(q, Ordering::Relaxed); ("cursor_size", alloc::format!("x{}", a11y_cursor_str(q)), super::cursor::armed()) }
         3 => { let s = val.min(A11Y_TEXT_NAMES.len() - 1); A11Y_TEXT.store(s as u8, Ordering::Relaxed); ("text_size", alloc::format!("{} ({} px)", A11Y_TEXT_NAMES[s], A11Y_TEXT_PX[s]), true) }
+        4 => { let m = val.min(af::MODES - 1); af::set(m, af::invert()); ("cvd", String::from(af::NAMES[m]), true) }
+        5 => { af::set(af::mode(), val != 0); ("invert", alloc::format!("{}", (val != 0) as u8), true) }
         _ => return,
     };
     if store {
         say(&alloc::format!("accessibility.{}", name), &vtxt, applied);
         A11Y_PERSIST.fetch_or(1 << row, Ordering::AcqRel);
+        if row == 0 || row >= 4 { a11y_cost_line("change"); }
     }
     repaint();
 }
@@ -3137,6 +3168,13 @@ fn a11y_set(row: usize, val: usize, store: bool) {
 /// The service pass: a PrefChanged's re-read, then the owed store writes (one PrefSet per changed key; the text
 /// step also writes its px to `system.display.font_size`, the seam `video::text` follows within a second).
 fn a11y_service() {
+    if af::active() {
+        let now = crate::arch::ms();
+        if now.saturating_sub(A11Y_COST_AT.load(Ordering::Relaxed)) >= A11Y_COST_MS {
+            A11Y_COST_AT.store(now, Ordering::Relaxed);
+            a11y_cost_line("tick");
+        }
+    }
     if A11Y_DIRTY.swap(false, Ordering::AcqRel) && LOAD_DONE.load(Ordering::Acquire) {
         a11y_load("prefchanged");
         if is_open() && cur_tab() == A11Y_TAB { repaint(); }
@@ -3152,10 +3190,12 @@ fn a11y_service() {
         set_sys(key::A11Y_TEXT_SIZE, P::Str(String::from(A11Y_TEXT_NAMES[s])));
         set_sys(key::FONT_SIZE, P::Int(A11Y_TEXT_PX[s]));
     }
+    if owed & 16 != 0 { set_sys(key::A11Y_CVD, P::Str(String::from(af::NAMES[af::mode()]))); }
+    if owed & 32 != 0 { set_sys(key::A11Y_INVERT, P::Bool(af::invert())); }
 }
 
 fn paint_a11y(st: &mut State) {
-    groups(st, &[(0, 1), (2, 3)]);
+    groups(st, &[(0, 1), (2, 3), (4, 5)]);
     let (rm, ic, q) = (reduce_motion(), increase_contrast(), A11Y_CURSOR_Q.load(Ordering::Relaxed));
     txt(st, LABEL_X, 0, "Reduce motion");
     tog(st, 0, TOG_X, rm, false); // SETTINGSCRAFT: the kit's switch, right-aligned (a press anywhere on the row flips it)
@@ -3171,9 +3211,19 @@ fn paint_a11y(st: &mut State) {
     let step = a11y_text_step_of(px).unwrap_or(A11Y_TEXT.load(Ordering::Relaxed) as usize).min(A11Y_TEXT_NAMES.len() - 1);
     seg(st, 3, &[b"Default", b"Large", b"Larger", b"Largest"], step, false);
     txt2(st, VAL_X, 3, &alloc::format!("{} px", px));
-    txt2(st, LABEL_X, 4, "Reduce motion makes every slide a cut; cursor size scales the pointer's blocks (to x4 at 1:1).");
-    txt2(st, LABEL_X, 5, "Text size sets the UI font size the faces follow; contrast raises the secondary ink and the lines.");
+    let (m, inv) = (af::mode(), af::invert());
+    txt(st, LABEL_X, 4, "Colour filter");
+    seg(st, 4, &[b"None", b"Red", b"Green", b"Blue", b"Gray"], m, false);
+    txt2(st, VAL_X, 4, A11Y_CVD_SAY[m]);
+    txt(st, LABEL_X, 5, "Invert colours");
+    tog(st, 5, TOG_X, inv, false);
+    txt2(st, TRACK_X, 5, if inv { "Every colour on the glass inverted" } else { "Colours as drawn" });
+    txt2(st, LABEL_X, 6, "Reduce motion makes every slide a cut; cursor size scales the pointer's blocks (to x4 at 1:1).");
+    txt2(st, LABEL_X, 7, "Text size sets the UI font size the faces follow; the colour filter and invert cover the whole glass.");
 }
+
+/// A11YFILTERS (B705): what row 4's value column says per mode (the segments name the cone each filter simulates).
+const A11Y_CVD_SAY: [&str; 5] = ["Off", "Protanopia", "Deuteranopia", "Tritanopia", "Grayscale"];
 
 /// A press on the Accessibility tab: a toggle row flips, the cursor slider captures (a drag), a text segment sets.
 fn press_a11y(row: usize, cx: usize) {
@@ -3182,6 +3232,8 @@ fn press_a11y(row: usize, cx: usize) {
         1 => a11y_set(1, (!increase_contrast()) as usize, true),
         2 => { if cx + 6 >= TRACK_X && cx <= TRACK_X + TRACK_W + 6 { drag_begin(A11Y_CURSOR_CTRL, cx); } }
         3 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(3, ((cx - TRACK_X) / (TRACK_W / A11Y_TEXT_NAMES.len())).min(A11Y_TEXT_NAMES.len() - 1), true); } }
+        4 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { a11y_set(4, ((cx - TRACK_X) / (TRACK_W / af::MODES)).min(af::MODES - 1), true); } }
+        5 => a11y_set(5, (!af::invert()) as usize, true),
         _ => {}
     }
 }
@@ -3234,6 +3286,97 @@ pub fn selftest_a11y() {
         ":: A11Y: keys={} declared={} pane={} reduce_motion=snap({}) contrast={} cursor={}(x2) text={} -> {} ::",
         keys.len(), if declared == keys.len() { "ok" } else { "FAIL" }, if pane { "ok" } else { "FAIL" }, if snap && eases { "ok" } else if snap { "no-ease" } else { "FAIL" },
         if contrast { "ok" } else { "FAIL" }, if cursor { "ok" } else { "FAIL" }, if text { "ok" } else { "FAIL" }, if ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// `tests a11yfilters` (A11YFILTERS, rmbp-ledger B705; BP-video-20): (1) each of the five `cvd` modes, and invert,
+/// SET on the live latch, then three probe pixels copied by the CPU blitter's `CopyFilter` (the window present's op)
+/// from an unfiltered RAM row into a RAM surface and READ BACK — each within 1 per channel of the reference computed
+/// from Machado 2009's published decimals in f64 (`a11yfilter::reference`), and equal to the solid-colour path
+/// (`a11yfilter::color`); the gray leg runs on an `Rgb` surface, the rest on `Bgr`; (2) the transform over a 1920x1200
+/// RAM frame (deutan, the full matrix) timed — printed against the 1 ms bar, not gated on it; (3) the motion seam:
+/// with Reduce motion latched, `motion::dur` answers 0 for each of the four role durations (and the role's own value
+/// without it). Every latch is restored; nothing is written to the store.
+/// `[a11y] filter=deutan pass_us=<n> motion=<full|reduced> frame=1920x1200 budget_us=1000 under=<0|1> why=fixture`
+/// `:: A11YFILTERS: modes=5 px_ok=<n> pass_us=<n> motion_zero=<n> -> PASS ::`
+pub fn selftest_a11yfilters() {
+    use super::blitter::{self as bl, BlitJob, Op, Surface};
+    use unaos_boot_info::{FrameBufferInfo, PixelFormat};
+    let (m0, i0) = (af::mode(), af::invert());
+    let probes = [theme::fixture::RGB_RED, theme::fixture::RGB_GREEN, theme::fixture::STEEL];
+    let legs: [(usize, bool, PixelFormat); 6] = [
+        (0, false, PixelFormat::Bgr), (1, false, PixelFormat::Bgr), (2, false, PixelFormat::Bgr),
+        (3, false, PixelFormat::Bgr), (4, false, PixelFormat::Rgb), (0, true, PixelFormat::Bgr),
+    ];
+    let total = legs.len() * probes.len();
+    let mut px_ok = 0usize;
+    let mut modes = [false; af::MODES];
+    for &(m, inv, fmt) in legs.iter() {
+        let rgb = fmt == PixelFormat::Rgb;
+        let mut src = [0u8; 12];
+        let mut dst = [0u8; 16];
+        for (k, &c) in probes.iter().enumerate() {
+            let (r, g, b) = ((c >> 16) as u8, (c >> 8) as u8, c as u8);
+            src[4 * k..4 * k + 4].copy_from_slice(&if rgb { [r, g, b, 0] } else { [b, g, r, 0] });
+        }
+        let mk = |base: usize, len: usize, w: usize| {
+            let mut f = super::FrameBuffer::new();
+            f.init(base, len, FrameBufferInfo { width: w, height: 1, stride: w, bytes_per_pixel: 4, pixel_format: fmt });
+            f
+        };
+        let (sfb, dfb) = (mk(src.as_ptr() as usize, src.len(), 3), mk(dst.as_mut_ptr() as usize, dst.len(), 4));
+        af::set(m, inv);
+        let rect = [bl::Rect { sx: 0, sy: 0, dx: 1, dy: 0, w: 3, h: 1 }];
+        let (res, _) = bl::run_on(&bl::CPU, &BlitJob { src: Surface::ram(sfb), dst: Surface::ram(dfb), rects: &rect, op: Op::CopyFilter });
+        let mut leg_ok = true;
+        for (k, &c) in probes.iter().enumerate() {
+            let p = &dst[4 * (k + 1)..4 * (k + 2)];
+            let got = if rgb { (p[0] as u32) << 16 | (p[1] as u32) << 8 | p[2] as u32 } else { (p[2] as u32) << 16 | (p[1] as u32) << 8 | p[0] as u32 };
+            let want = af::reference(c, m, inv);
+            let close = (0..3).all(|sh| ((got >> (8 * sh)) & 255).abs_diff((want >> (8 * sh)) & 255) <= 1);
+            if res.is_ok() && close && af::color(c) == got {
+                px_ok += 1;
+            } else {
+                leg_ok = false;
+                serial_println!("[a11y] px mode={} invert={} in={:06x} got={:06x} want={:06x} blit_ok={}", af::NAMES[m], inv as u8, c, got, want, res.is_ok() as u8);
+            }
+        }
+        if leg_ok && !inv { modes[m] = true; }
+    }
+    af::set(m0, i0);
+    // (2) the full-frame transform.
+    const FW: usize = 1920;
+    const FH: usize = 1200;
+    const BUDGET_US: u64 = 1000;
+    let mut frame: Vec<u8> = Vec::new();
+    let pass_us = if frame.try_reserve_exact(FW * FH * 4).is_ok() {
+        frame.resize(FW * FH * 4, 0);
+        for (i, b) in frame.iter_mut().enumerate() { *b = (i ^ (i >> 11)) as u8; }
+        let t0 = crate::arch::now_cycles();
+        af::transform(PixelFormat::Bgr, 2, false, &mut frame);
+        Some(bl::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0)))
+    } else {
+        None
+    };
+    drop(frame);
+    let _ = af::take_stats(); // the fixture's own row transforms are not the glass's cost
+    // (3) the motion seam, on the live latch.
+    use draw::motion::{dur, BASE, ENTER, EXIT, FAST};
+    let rm0 = A11Y_REDUCE.swap(true, Ordering::Relaxed);
+    let motion_zero = [FAST, BASE, ENTER, EXIT].iter().filter(|&&d| dur(d) == 0).count();
+    A11Y_REDUCE.store(false, Ordering::Relaxed);
+    let full = [FAST, BASE, ENTER, EXIT].iter().all(|&d| dur(d) == d && d > 0);
+    A11Y_REDUCE.store(rm0, Ordering::Relaxed);
+    let nmodes = modes.iter().filter(|&&x| x).count();
+    let us = pass_us.unwrap_or(0);
+    serial_println!(
+        "[a11y] filter=deutan pass_us={} motion={} frame={}x{} budget_us={} under={} px_ok={}/{} why=fixture",
+        us, if draw::motion::reduced() { "reduced" } else { "full" }, FW, FH, BUDGET_US, (pass_us.is_some() && us <= BUDGET_US) as u8, px_ok, total
+    );
+    let ok = nmodes == af::MODES && px_ok == total && pass_us.is_some() && motion_zero == 4 && full;
+    serial_println!(
+        ":: A11YFILTERS: modes={} px_ok={} pass_us={} motion_zero={} -> {} ::",
+        nmodes, px_ok, if pass_us.is_some() { alloc::format!("{}", us) } else { String::from("skip(heap)") }, motion_zero, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -3355,7 +3498,7 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 32] = {
+pub const MAP: [MapRow; 34] = {
     use crate::prefs::key::*;
     [
         // General (0)
@@ -3396,6 +3539,8 @@ pub const MAP: [MapRow; 32] = {
         mr(&[A11Y_INCREASE_CONTRAST], A11Y_TAB, 1, "Increase contrast", NO_CTRL),
         mr(&[A11Y_CURSOR_SIZE], A11Y_TAB, 2, "Cursor size", NO_CTRL),
         mr(&[A11Y_TEXT_SIZE], A11Y_TAB, 3, "Text size", NO_CTRL),
+        mr(&[A11Y_CVD], A11Y_TAB, 4, "Colour filter", NO_CTRL),
+        mr(&[A11Y_INVERT], A11Y_TAB, 5, "Invert colours", NO_CTRL),
         // Privacy (REASK B681): the switch row; the decisions below it are dynamic (`prefs::decisions`), each with a Revoke
         mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL),
         // The tab column

@@ -21230,7 +21230,7 @@ fn stage_window(
             if clip.n == 0 {
                 // WEDGESRC — `blit_traced` IS `fb.blit` plus the per-core aim/issued/done ledger
                 // (three relaxed ops, x86+witness only; the shim is `fb.blit` verbatim elsewhere).
-                if !par { blit_traced(fb, py * fb_row + bx * bpp, &stage[src..src + row_bytes]); }
+                if !par { let d = py * fb_row + bx * bpp; super::blitter::a11yfilter::each(fb.info().pixel_format, bpp, &stage[src..src + row_bytes], |i, c| blit_traced(fb, d + i, c)); /* A11YFILTERS (B705): filtered at the copy, the stage never written (LINE-NEUTRAL fold) */ }
                 #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
                 {
                     wrote_px += bw as u64;
@@ -21249,7 +21249,7 @@ fn stage_window(
             for &(sx0, sx1) in spans[..ns].iter() {
                 let off = (sx0 - bx) * bpp;
                 let len = (sx1 - sx0) * bpp;
-                blit_traced(fb, py * fb_row + sx0 * bpp, &stage[src + off..src + off + len]);
+                let d = py * fb_row + sx0 * bpp; super::blitter::a11yfilter::each(fb.info().pixel_format, bpp, &stage[src + off..src + off + len], |i, c| blit_traced(fb, d + i, c)); // A11YFILTERS (B705): each unoccluded span filtered at the copy (BP-video-20; LINE-NEUTRAL fold, code first)
                 #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
                 {
                     row_written += (sx1 - sx0) as u64;
@@ -21500,7 +21500,7 @@ fn stage_fill(
             pixel_format: info.pixel_format,
         },
     );
-    layer.fill_rect(0, 0, w, 1, color); let sc = shadow_casts_for(color == DESKTOP_BG); let wp = color == DESKTOP_BG && (wp_active() || shadow_on(&sc)); // WALLPAPER — the row below is per-scanline when a picture is loaded; DESIGNAPPLY (B639): and when a window shadow reaches the desktop (the fill shades every pixel it writes)
+    layer.fill_rect(0, 0, w, 1, super::blitter::a11yfilter::color(color)); /* A11YFILTERS (B705): the flat row in the filtered colour */ let sc = shadow_casts_for(color == DESKTOP_BG); let wp = color == DESKTOP_BG && (wp_active() || shadow_on(&sc)); // WALLPAPER — the row below is per-scanline when a picture is loaded; DESIGNAPPLY (B639): and when a window shadow reaches the desktop (the fill shades every pixel it writes)
 
     #[cfg(feature = "witness")]
     let t1 = crate::arch::now_cycles();
@@ -21614,7 +21614,7 @@ fn stage_fill(
     // `[wc-k]` line stops being arch-dependent in meaning. Equals `h` wherever no clip exists.
     let mut blit_calls: usize = 0; let hb = super::beam::hold(y, y + h, info.height, false, true); // BEAM (orin 26) — the fill's bracket: opened here, after the compose and after every `defer!`/`drop_fill!` exit (a declined fill writes no pixel and must not wait for a beam), closed after the rows are cleaned below.
     for r in 0..h {
-        let py = y + r; if wp { bg_row(&sc, &layer, &mut stage[..row_bytes], bpp, color, py, x, w); } // WALLPAPER — this scanline's pixels into the staged row; DESIGNAPPLY (B639): the flat colour again where no picture, then every shadow over it (`wm::desktop::shade_bytes`)
+        let py = y + r; if wp { bg_row(&sc, &layer, &mut stage[..row_bytes], bpp, color, py, x, w); super::blitter::a11yfilter::in_place(info.pixel_format, bpp, &mut stage[..row_bytes]); /* A11YFILTERS (B705): the picture row filtered once, after it is composed */ } // WALLPAPER — this scanline's pixels into the staged row; DESIGNAPPLY (B639): the flat colour again where no picture, then every shadow over it (`wm::desktop::shade_bytes`)
         let off = py * fb_row + x * bpp;
         if prev != usize::MAX && off != prev + fb_row {
             contig = false;

@@ -2000,7 +2000,7 @@ fn for_each_sprite_pixel(
     for row in 0..bh {
         for col in 0..bw {
             if let Some(color) = sprite_color(s, col, row) {
-                f(bx + col, by + row, color, i);
+                f(bx + col, by + row, super::blitter::a11yfilter::color(color), i); // A11YFILTERS (B705): every sprite pixel as the panel holds it, filtered (the draw, the colour guards and the settle all compare against the panel)
                 i += 1;
             }
         }
@@ -3539,7 +3539,7 @@ pub fn wedge11_rollup(scope: &str) {
 ///
 /// It is also the one place an owed close is cashed — see [`owe_overlay_close`]. The order matters:
 /// the abandoned session is retired BEFORE the `session` test, or the deferral would defer forever.
-pub fn overlay_open(plan: &Plan) -> bool {
+pub fn overlay_open(plan: &Plan) -> bool { if super::blitter::a11yfilter::active() { return false; } // A11YFILTERS (B705): no layer session under a colour filter — the layer composes the arrow UNFILTERED for a filtered present and its save is layer content, so the pass takes CURSOR-3's whole-sprite bracket, always available and always correct (LINE-NEUTRAL fold, code first)
     let mut ov = match overlay_claim() {
         Ok(l) => l,
         Err(_) => {

@@ -425,7 +425,7 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
             let c = s.log[i];
             if c != mc {
                 mc = c;
-                mr = fb.encode4(c).unwrap_or(0);
+                mr = fb.encode4(super::blitter::a11yfilter::color(c)).unwrap_or(0); // A11YFILTERS (B705): the logical colour filtered once per memo miss, at the copy (BP-video-20)
             }
             s.raw[i] = mr;
         }
@@ -473,7 +473,7 @@ pub fn erase_rect(r: Rect) -> bool {
         return erase_declined(LOCK_SCRATCH); // MENULOCK (B200) — still `false`, now named once per holder
     }; s.tag(TAG_ERASE); // MENULOCK — ⚠ SAME-LINE fold
     super::cursor::undraw();
-    let raw = fb.encode4(wm::DESKTOP_BG).unwrap_or(0);
+    let raw = fb.encode4(super::blitter::a11yfilter::color(wm::DESKTOP_BG)).unwrap_or(0); // A11YFILTERS (B705): the vacated rect in the filtered desktop colour
     for i in 0..w {
         s.raw[i] = raw;
     }
