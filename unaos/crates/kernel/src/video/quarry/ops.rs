@@ -1118,8 +1118,15 @@ fn ver_read(np: &str, n: usize) -> Option<Vec<u8>> {
     crate::fs::unafs::read_version(np, n)
 }
 #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
-fn ver_restore(np: &str, n: usize) -> bool {
-    crate::fs::unafs::restore_version(np, n)
+fn ver_restore(np: &str, n: usize) -> Result<(), &'static str> {
+    // QVBAR: `fs::unafs::restore_version`'s body (the restore, the discard of a failed one inside the hold, crawl B
+    // 10) with the crate's error kept, so the face can say WHY (`restore_refusal`).
+    use crate::fs::unafs::{request_mount_discard, restore_version_on, with_unafs};
+    match with_unafs(|fs| restore_version_on(fs, np, n).map_err(|e| { request_mount_discard(); e })) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(restore_refusal(&e).unwrap_or(REFUSED_OTHER)),
+        Err(_) => Err("no volume is mounted"),
+    }
 }
 #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
 fn ver_list(_: &str) -> Option<Vec<(u64, u64, u64)>> {
@@ -1130,8 +1137,48 @@ fn ver_read(_: &str, _: usize) -> Option<Vec<u8>> {
     None
 }
 #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
-fn ver_restore(_: &str, _: usize) -> bool {
-    false
+fn ver_restore(_: &str, _: usize) -> Result<(), &'static str> {
+    Err(REFUSED_OTHER)
+}
+
+/// QVBAR: the reasons a version row is greyed and its Restore toasted — the crate's two named refusals.
+/// VERSIONSCOMPAT (SR154): the root carries a ROCOMPAT bit this build does not know; the mount is read-only.
+pub const REFUSED_READONLY: &str = "the volume is read-only here: it uses features this build does not know";
+/// Crawl B's restore guard: a block the version names lost its references (an older `fsck --repair`), so the
+/// restore could point the file at blocks handed out again.
+pub const REFUSED_CORRUPT: &str = "a block of this version lost its references (an older repair): restoring it is unsafe";
+/// Any other refusal (the old text; the row is not greyed).
+const REFUSED_OTHER: &str = "the file system refused the restore";
+
+/// QVBAR: the ONE classifier — which crate error greys the row, and what the toast says (`None`: not a refusal of
+/// the version itself).
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+pub fn restore_refusal(e: &::unafs::fs::FileSystemError) -> Option<&'static str> {
+    use ::unafs::fs::FileSystemError as E;
+    match e {
+        E::ReadOnly(_) => Some(REFUSED_READONLY),
+        E::CorruptVolume(_) => Some(REFUSED_CORRUPT),
+        _ => None,
+    }
+}
+
+/// QVBAR: a refusal known before any press — the native mount of `path` is read-only (VERSIONSCOMPAT), so every
+/// row's Restore is refused; `getinfo::open_versions` greys them all before the first paint. (The CorruptVolume
+/// guard is the crate's private check: that row greys at its first refused Restore.)
+pub fn restore_refused_now(path: &str) -> Option<&'static str> {
+    let _np = native_path(path)?;
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    if crate::fs::unafs::with_unafs(|fs| fs.read_only()).ok() == Some(true) {
+        return Some(REFUSED_READONLY);
+    }
+    None
+}
+
+/// QVBAR: a greyed Restore's toast (TOASTCAP's card, BP-video-17 — never a second dialog) and its status line.
+fn refused_toast(path: &str, seq: u64, why: &str) {
+    serial_println!("[quarry] version refused path={} seq={} greyed=1 reason={}", path, seq, why);
+    let _ = crate::video::notify::post_full(b"Quarry", b"Can't restore this version", why.as_bytes(), b"", crate::video::notify::ACT_NONE, &[]);
+    say(alloc::format!("restore refused ({})", why));
 }
 
 /// QUARRYVERSIONS (B732): the versions of the file at `path`, newest first, as `(seq, replaced-at unix s, size)`.
@@ -1156,9 +1203,7 @@ pub fn op_restore_version(path: &str, seq: u64) -> Result<u64, String> {
     ns_check(path, false)?;
     let np = native_path(path).ok_or_else(|| String::from("this volume keeps no versions"))?;
     let (n, when) = version_at(&np, seq)?;
-    if !ver_restore(&np, n) {
-        return Err(String::from("the file system refused the restore"));
-    }
+    ver_restore(&np, n).map_err(String::from)?; // QVBAR: the refusal's reason, not a bare `false`
     let _ = crate::fs::ns_bump(Ok::<(), ()>(())); // the bytes changed behind the VFS write dispatch: a listing change
     Ok(when)
 }
@@ -1216,6 +1261,12 @@ fn do_versions() {
 pub fn version_press(path: &str, seq: u64, restore: bool) {
     let tag = alloc::format!("seq{}", seq);
     if restore {
+        if let Some(why) = super::getinfo::version_refused(seq) {
+            // QVBAR: a greyed row's Restore is not run again — the reason is said.
+            log_op("version-restore", path, &tag, &Err(String::from(why)));
+            refused_toast(path, seq, why);
+            return;
+        }
         let r = op_restore_version(path, seq);
         log_op("version-restore", path, &tag, &r.clone().map(|_| ()));
         match r {
@@ -1228,10 +1279,16 @@ pub fn version_press(path: &str, seq: u64, restore: bool) {
                 say(title);
                 super::getinfo::open_versions(path);
             }
-            Err(e) => {
-                refuse_notice(&e);
-                say(alloc::format!("restore refused ({})", e));
-            }
+            Err(e) => match [REFUSED_READONLY, REFUSED_CORRUPT].into_iter().find(|w| *w == e.as_str()) {
+                Some(why) => {
+                    super::getinfo::mark_refused(seq, why); // QVBAR: the row greys
+                    refused_toast(path, seq, why);
+                }
+                None => {
+                    refuse_notice(&e);
+                    say(alloc::format!("restore refused ({})", e));
+                }
+            },
         }
     } else {
         let r = op_open_version(path, seq);

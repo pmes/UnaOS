@@ -22,6 +22,8 @@ struct Panel {
     /// QUARRYVERSIONS (B732): `Some` = the panel is the file's version list (`(seq, replaced-at, size)`, newest
     /// first), not its attributes.
     versions: Option<Vec<(u64, u64, u64)>>,
+    /// QVBAR: the version rows whose Restore is refused (`(seq, why)`): painted greyed, their Restore toasts `why`.
+    refused: Vec<(u64, &'static str)>,
 }
 
 /// CLOCKPAINTERS (B719): a date the panel paints, in Principia's locale (`clock::locale::fmt_stamp`); the serial
@@ -71,7 +73,7 @@ pub fn open(path: &str) {
         serial_println!("[getinfo]   {} ({}) = {} changed={}", r.key, r.ty, r.val, r.when.map(af::fmt_when).unwrap_or_else(|| String::from("-")));
     }
     let _ = KERNEL_PRINCIPAL;
-    *PANEL.lock() = Some(Panel { path: String::from(path), head, rows, note, versions: None });
+    *PANEL.lock() = Some(Panel { path: String::from(path), head, rows, note, versions: None, refused: Vec::new() });
     UP.store(true, Ordering::Release);
 }
 
@@ -141,8 +143,13 @@ pub fn open_versions(path: &str) {
         Ok(v) => (v, None),
         Err(why) => (Vec::new(), Some(why)),
     };
-    serial_println!("[quarry] versions path={} native={} listed={}", path, super::ops::native_path(path).as_deref().unwrap_or("-"), rows.len());
-    *PANEL.lock() = Some(Panel { path: String::from(path), head, rows: Vec::new(), note, versions: Some(rows) });
+    // QVBAR: a read-only mount (VERSIONSCOMPAT) refuses every Restore: all rows grey before the first paint.
+    let refused: Vec<(u64, &'static str)> = match super::ops::restore_refused_now(path) {
+        Some(why) => rows.iter().map(|r| (r.0, why)).collect(),
+        None => Vec::new(),
+    };
+    serial_println!("[quarry] versions path={} native={} listed={} refused={}", path, super::ops::native_path(path).as_deref().unwrap_or("-"), rows.len(), refused.len());
+    *PANEL.lock() = Some(Panel { path: String::from(path), head, rows: Vec::new(), note, versions: Some(rows), refused });
     UP.store(true, Ordering::Release);
 }
 
@@ -154,6 +161,20 @@ pub fn version_count() -> Option<usize> {
 /// QUARRYVERSIONS (B732): the `seq` of version row `i` of the open list.
 pub fn version_seq(i: usize) -> Option<u64> {
     PANEL.lock().as_ref().and_then(|p| p.versions.as_ref().and_then(|v| v.get(i).map(|r| r.0)))
+}
+
+/// QVBAR: grey the open list's row stamped `seq` — its Restore was refused for `why` (ops' classifier).
+pub fn mark_refused(seq: u64, why: &'static str) {
+    if let Some(p) = PANEL.lock().as_mut() {
+        if p.versions.as_ref().is_some_and(|v| v.iter().any(|r| r.0 == seq)) && !p.refused.iter().any(|r| r.0 == seq) {
+            p.refused.push((seq, why));
+        }
+    }
+}
+
+/// QVBAR: why the open list's row stamped `seq` cannot be restored (`None`: it can, or no list is up).
+pub fn version_refused(seq: u64) -> Option<&'static str> {
+    PANEL.lock().as_ref().and_then(|p| p.refused.iter().find(|r| r.0 == seq).map(|r| r.1))
 }
 
 /// The panel's frame over the list pane, shared by the painter and the press: `(x, y, w, h, rh)`.
@@ -229,11 +250,14 @@ fn paint_versions(m: &Model, px: &mut [u32], p: &Panel, v: &[(u64, u64, u64)]) {
             break;
         }
         let top = row_top(y, rh, i);
-        let s = alloc::format!("{:<20} {:>10} bytes", super::ops::version_date(r.1), r.2);
-        text(px, g, x + PAD(), top + g.ts, &ascii(&s), rx.min(clip), theme::text_primary());
-        for (bx, label) in [(rx, "Restore"), (ox, "Open")] {
-            keyline(px, g, Rect { x: bx, y: top, w: bw, h: rh }, theme::accent());
-            text(px, g, bx + PAD(), top + g.ts, label.as_bytes(), (bx + bw).min(clip), theme::text_primary());
+        // QVBAR: a refused row is greyed (date, size, Restore); Open stays live — a read is not refused.
+        let greyed = p.refused.iter().any(|f| f.0 == r.0);
+        let ink = if greyed { theme::text_disabled() } else { theme::text_primary() };
+        let s = alloc::format!("{:<20} {:>10} bytes{}", super::ops::version_date(r.1), r.2, if greyed { "  can't restore" } else { "" });
+        text(px, g, x + PAD(), top + g.ts, &ascii(&s), rx.min(clip), ink);
+        for (bx, label, off) in [(rx, "Restore", greyed), (ox, "Open", false)] {
+            keyline(px, g, Rect { x: bx, y: top, w: bw, h: rh }, if off { theme::text_disabled() } else { theme::accent() });
+            text(px, g, bx + PAD(), top + g.ts, label.as_bytes(), (bx + bw).min(clip), if off { theme::text_disabled() } else { theme::text_primary() });
         }
     }
 }
