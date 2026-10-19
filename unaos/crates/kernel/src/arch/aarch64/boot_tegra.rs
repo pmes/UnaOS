@@ -108,7 +108,7 @@ unsafe fn enable_el1_regime(l1_pa: u64) {
             mair = in(reg) MAIR_VAL,
             tcr = in(reg) TCR_EL1_ACTIVE,
             ttbr0 = in(reg) l1_pa,
-            sctlr = in(reg) SCTLR_EL1_VAL,
+            sctlr = in(reg) SCTLR_EL1_VAL | crate::tests::wxn64::sctlr_wxn(), // WXN64 (B685): +WXN once `mmu_tegra::init` carved `L1_EL1`
             options(nostack, preserves_flags),
         );
     }

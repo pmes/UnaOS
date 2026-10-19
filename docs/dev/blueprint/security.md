@@ -21,7 +21,7 @@
 | BP-security-9 | A program sighted on a removable/foreign volume is not a registrant: it writes nothing, lives in RAM for the boot, and opens only after ONE ask (Copy to Apps / Open / Cancel). Ring-3 input never widens kernel trust by itself. | `unaos/crates/kernel/src/fs/apptrust.rs:1-20` | `tests apptrust` (unverified name) |
 | BP-security-10 | A preference is Principia's (its store), never a `<home>/.name` dotfile; the gate reds a dotfile literal with no allowlist row. | `docs/dev/EXECUTOR-BRIEF.md:49-51`; `unaos/scripts/arch-check.py:21` | `gates` rows `charter`, `arch` (`dotslash` leg) |
 | BP-security-11 | The kernel keeps no secret and answers no Holocron verb; the formats, ring and policy are `holocron_core`, one implementation. | `unaos/crates/kernel/src/keyring.rs:4-12` | compile |
-| BP-security-12 | A workaround that weakens a protection (SMEP, NXE, WXN, page permissions, checksums) is a STOP tripwire, never an executor's call. | `docs/dev/LAWS.md` §3 STOP tripwires | review; `:: WXAUDIT-CORES …` (`unaos/crates/kernel/src/arch/x86_64/smp.rs:199`) |
+| BP-security-12 | A workaround that weakens a protection (SMEP, NXE, WXN, page permissions, checksums) is a STOP tripwire, never an executor's call. | `docs/dev/LAWS.md` §3 STOP tripwires; aarch64: `unaos/crates/kernel/src/arch/aarch64/mmu_wxn.rs` (the carve, B685) | review; `:: WXAUDIT-CORES …` (`unaos/crates/kernel/src/arch/x86_64/smp.rs:199`); aarch64 `tests wxaudit` → `:: WXAUDIT: wxn=1 wx_pages=0 -> PASS ::` (virt EL1, Orin; Pi owed) |
 | BP-security-13 | The SATA write capability needs a minted grant on one port and LBA range (RAII hold, `-EPERM` without it) AND the operator's typed token for an install write. | `unaos/crates/kernel/src/install/ahciroot.rs:9-12`; `unaos/scripts/image-line.env:13-17` | `tests ahciw` |
 
 ## 3. Seams
@@ -32,12 +32,13 @@
 
 ## 4. Wire
 `[login] installer: first-user form open …` · `[login] session open user=<n> role=admin …` · `[login] denied user=<n> …` · `[login] screen locked user=` ·
-`[rootacl] owner=system trees=<n> stamped=<m> root=<vol>` · `[boot] fat write refused …` · `[rand] source=`.
+`[rootacl] owner=system trees=<n> stamped=<m> root=<vol>` · `[boot] fat write refused …` · `[rand] source=` ·
+`[wxaudit] arm64 el= sctlr= roots= leaves= pages= el1x_pages= el0x_pages= rx=[…) carve= text_rx= data_xn= classifier=` · `:: WXAUDIT: wxn=<0|1> wx_pages=<n> -> PASS|FAIL|SKIP ::`.
 
 ## 5. Ruled, unbuilt / open
 - Helm's kernel core linked into Ring 0 (CODEX §2 Helm row says "Its kernel core (`unaos/libs/sys/helm/`)"): not a kernel dependency at HEAD.
 - `permission_model.md` §2 "ask on use" and §3 "Glass Room" mock data: design text; status beyond §4 `unverified`.
-- aarch64 W^X: report only, WXN not enabled (`docs/SECURITY.md:439`).
+- aarch64 W^X (B685 WXN64): the kernel image's PF_X pages are carved EL1-RO+X and every other EL1&0 leaf is execute-never, then `SCTLR_EL1.WXN` is set, on QEMU `virt` (`boot_virt::build_l1`) and the Orin (`mmu_tegra::init`). The Pi is NOT carved: `kernel8.img` carries no ELF header and `pi-baremetal.ld` defines no page-aligned end-of-read-only symbol, so its `tests wxaudit` reads `wxn=0 … -> FAIL` until that symbol lands. `docs/SECURITY.md:439` ("report only") predates this.
 
 ## 6. Read further
 - `docs/SECURITY.md` (model + hardening ledger), `docs/dev/review/SEC-2026-10-06.md`.
