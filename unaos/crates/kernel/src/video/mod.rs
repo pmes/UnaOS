@@ -1256,8 +1256,6 @@ pub mod svclatch;
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod draw;
 // SOFTY (B629): the desktop's second LOOK (`video::softy`: the taskbar, Start, the chrome at the right) and its switch (`video::look`, Principia's `system.look`). Same gate as the dock; at the tail so no line above moves.
-#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub mod look; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod softy; #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] pub mod lock; // AUTOLOCK (B712): the session lock (video/lock.rs) — the login screen's gate. LINE-NEUTRAL fold, code first.
 // LOOKSHIM: text.rs asks `look::is_softy()` on every build; without the desktop the answer is "no" (the plain `kernel8` verb, no PIDESK, was red: E0433 at text.rs:309).
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub mod look { #[inline] pub fn is_softy() -> bool { false } }
@@ -1265,4 +1263,5 @@ pub mod look { #[inline] pub fn is_softy() -> bool { false } }
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod zoom;
 
-pub mod look; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod softy; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod perfhud; // PERFHUD (B710): the performance overlay (Win+F12, Settings > Accessibility > Show performance); the toggle on both desktop families, the glass half x86 `wc`. LINE-NEUTRAL fold, code first
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod look; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod softy; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod perfhud; #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] pub mod lock; // AUTOLOCK (B712): the session lock (video/lock.rs) — the login screen's gate. LINE-NEUTRAL fold, code first. // PERFHUD (B710): the performance overlay (Win+F12, Settings > Accessibility > Show performance); the toggle on both desktop families, the glass half x86 `wc`. LINE-NEUTRAL fold, code first
