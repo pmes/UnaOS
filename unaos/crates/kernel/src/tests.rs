@@ -3102,7 +3102,7 @@ fn fileversions_face() -> (bool, alloc::string::String) {
         let path = format!("{}/VersionsFace.txt", home);
         let menu = ops::versions_item_probe();
         if ops::native_path(&path).is_none() {
-            return (menu, format!("menu={} listed=skip restored_via_face=skip", okf(menu)));
+            return (menu, format!("menu={} listed=skip restored_via_face=skip refused=skip", okf(menu)));
         }
         let _ = ops::op_delete(&path);
         let body = |k: u8| -> alloc::vec::Vec<u8> { (0..3000u32).map(|i| k.wrapping_mul(37).wrapping_add(i as u8)).collect() };
@@ -3121,16 +3121,32 @@ fn fileversions_face() -> (bool, alloc::string::String) {
         let restored = oldest.is_some() && back && relisted && newest;
         let copy = getinfo::version_seq(1).and_then(|s| ops::op_open_version(&path, s).ok());
         let open_ok = copy.as_deref().is_some_and(|c| c.starts_with(ops::versions_scratch().as_str()) && t.read(c, 0, 4096).is_ok_and(|d| d == body(2)));
-        serial_println!("[fileversions] face listed={:?} back={} relisted={} newest={} open_copy={} path={}", n, back, relisted, newest, okf(open_ok), copy.as_deref().unwrap_or("-"));
+        // QVBAR (B732): refused — the ONE classifier maps the crate's real refusals (VERSIONSCOMPAT's `ReadOnly`, crawl
+        // B's restore guard `CorruptVolume`) to their reasons and nothing else to one; the newest row marked refused
+        // reads greyed, and its Restore through `ops::version_press` (what the button runs) changes neither the
+        // file's bytes nor the list (the reason is toasted, the restore not run).
+        use ::unafs::fs::FileSystemError as Fse;
+        let kinds = ops::restore_refusal(&Fse::ReadOnly(1 << 40)) == Some(ops::REFUSED_READONLY)
+            && ops::restore_refusal(&Fse::CorruptVolume("qvbar")) == Some(ops::REFUSED_CORRUPT)
+            && ops::restore_refusal(&Fse::NotFound).is_none();
+        let (before, count, seq0) = (t.read(&path, 0, 4096).ok(), getinfo::version_count(), getinfo::version_seq(0));
+        if let Some(s) = seq0 {
+            getinfo::mark_refused(s, ops::REFUSED_CORRUPT);
+            ops::version_press(&path, s, true);
+        }
+        let greyed = seq0.is_some_and(|s| getinfo::version_refused(s) == Some(ops::REFUSED_CORRUPT));
+        let unchanged = before.is_some() && t.read(&path, 0, 4096).ok() == before && getinfo::version_count() == count;
+        let refused = kinds && greyed && unchanged;
+        serial_println!("[fileversions] face listed={:?} back={} relisted={} newest={} open_copy={} path={} refused_kinds={} greyed={} unchanged={}", n, back, relisted, newest, okf(open_ok), copy.as_deref().unwrap_or("-"), okf(kinds), okf(greyed), okf(unchanged));
         if let Some(c) = copy.as_deref() {
             let _ = t.unlink(c, P);
         }
         getinfo::dismiss();
         let _ = ops::op_delete(&path);
-        let ok = menu && listed_ok && restored && open_ok;
-        return (ok, format!("menu={} listed={} restored_via_face={}", okf(menu), n.unwrap_or(0), okf(restored)));
+        let ok = menu && listed_ok && restored && open_ok && refused;
+        return (ok, format!("menu={} listed={} restored_via_face={} refused={}", okf(menu), n.unwrap_or(0), okf(restored), okf(refused)));
     }
-    (true, alloc::string::String::from("menu=- listed=- restored_via_face=-"))
+    (true, alloc::string::String::from("menu=- listed=- restored_via_face=- refused=-"))
 }
 
 // LOCK2 (rmbp-ledger B728, BP-video-28) — TAIL-APPENDED, so no line above moves. `tests autolock`'s two extra legs, folded
