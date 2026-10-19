@@ -187,7 +187,8 @@ enum Commands {
         img: String,
     },
     /// Show an object's id, kind, size, parent and timestamps (v6; a pre-v6
-    /// volume reports 0 for what it cannot store)
+    /// volume reports 0 for what it cannot store), then the volume line
+    /// `volume blocks= free= reserve=` (DISKRESERVE SR152: free is usable, the reserve excluded)
     Stat {
         path: String,
         #[arg(short, long, default_value = "unafs.img")]
@@ -1008,6 +1009,8 @@ async fn main() -> Result<()> {
                 st.atime,
                 fs.path_of(id).map_err(|e| anyhow::anyhow!(e))?
             );
+            // DISKRESERVE (SR152): the volume's usable free count and the metadata reserve, in blocks.
+            println!("volume blocks={} free={} reserve={}", fs.superblock.block_count, fs.free_blocks(), fs.reserve_blocks());
         }
         Commands::Query { query, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
