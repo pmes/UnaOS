@@ -23,6 +23,7 @@
 | BP-gates-11 | On the rMBP track the gate is the compile legs plus the doc gates; QEMU legs are not run per arc (R78, R113; R114 a one-time exception). The metal boot is the proof. | R78, R113, R114 (`docs/dev/RULINGS.md`) | review |
 | BP-gates-12 | The design is written in the commit body BEFORE the code; the executor compiles what it touched and runs `./arroyo gates` (R106). | R106; `docs/dev/PLAYBOOK.md:32-35` | review |
 | BP-gates-13 | No fn reachable from the `video/` furniture (menubar, dock, crystal, notify, strip, settings, login) calls `smolnet`, `net_fetch`, `net_dns` or `netring3`, save a local read-only accessor on the gate's ALLOW table with its reason (BP-bar-10). | `unaos/scripts/nonet-check.py:29-34` | `gates` row `nonet` (a call walk over `use` aliases and paths; control: a synthetic dock -> helper -> `smolnet` chain) |
+| BP-gates-14 | The ABI gate is a COMMITTED binary, not a rebuild: fixtures/ABIPROBE-v&lt;N&gt;.ELF with its `.sha256` pin; the builder refuses to stage a fixture whose bytes left the pin, and `tests abielf` runs what it staged. A fixture is never re-built in place; an ABI bump adds one (BP-ring3-15). | `unaos/builder/src/main.rs:59`; `unaos/fixtures/ABIPROBE-v1.ELF.sha256`; `unaos/crates/kernel/src/tests.rs:802` | the builder's pin assert; `tests abielf` |
 
 ## 3. The host gates (`GATES_SET`, `unaos/arroyo:14279`)
 | row | script | holds |

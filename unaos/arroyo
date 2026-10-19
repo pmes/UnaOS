@@ -4636,6 +4636,31 @@ build_user_big_x86() {
     echo -e "${COLOR_GREEN}✅ x86 ring-3 ELF-window proof program: BIG-X86.ELF${COLOR_RESET}"
 }
 
+# ABIELF (rmbp-ledger B693, BP-bar-13, BP-ring3-15): build ABIPROBE.ELF (crates/user-abiprobe → target/ABIPROBE-X86.ELF),
+# build_user_big_x86's shape. NOT part of any image flow: the image stages the COMMITTED fixture
+# (unaos/fixtures/ABIPROBE-v<N>.ELF, pinned by its .sha256 — builder/src/main.rs checks the pin) so `tests abielf`
+# runs bytes an older tree built. Run this ONCE when una_abi::ABI_VERSION is bumped, then commit the new ELF as
+# fixtures/ABIPROBE-v<N>.ELF and `sha256sum` it beside (the old fixtures stay). It prints the committed pin beside
+# the fresh build's for comparison; a differing rebuild is expected across toolchains and is not a verdict.
+build_user_abiprobe_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 ABI probe (crates/user-abiprobe → target/ABIPROBE-X86.ELF)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-abiprobe"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-abiprobe/user-abiprobe-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-abiprobe/target/x86_64-unknown-none/release/user-abiprobe" \
+      "${WORKSPACE_DIR}/target/ABIPROBE-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/ABIPROBE-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: ABIPROBE-X86.ELF missing/empty — x86 ABIPROBE build failed${COLOR_RESET}"; exit 1; }
+    local amach; amach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/ABIPROBE-X86.ELF" | tr -d ' \n')"
+    [ "$amach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: ABIPROBE-X86.ELF e_machine is ${amach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/ABIPROBE-X86.ELF" "ABIPROBE-X86.ELF"
+    local abiv; abiv="$(awk '/^pub const ABI_VERSION: u32 = /{gsub(/;/,"",$NF); print $NF}' "${WORKSPACE_DIR}/crates/una-abi/src/lib.rs")"
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 ABI probe: ABIPROBE-X86.ELF (abi=${abiv}) sha256 $(sha256sum "${WORKSPACE_DIR}/target/ABIPROBE-X86.ELF" | cut -d' ' -f1); committed fixtures/ABIPROBE-v${abiv}.ELF.sha256: $(cut -d' ' -f1 "${WORKSPACE_DIR}/fixtures/ABIPROBE-v${abiv}.ELF.sha256" 2>/dev/null || echo none)${COLOR_RESET}"
+}
+
 build_kernel_aarch64() {
     echo -e "${COLOR_YELLOW}⚡ Building aarch64 Kernel...${COLOR_RESET}"
     cd "$WORKSPACE_DIR/crates/kernel"

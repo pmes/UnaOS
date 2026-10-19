@@ -438,7 +438,7 @@ fn ensure_fpu() {
     #[cfg(target_arch = "x86_64")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("fpu", crate::arch::sched::fpu::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("fpu", crate::arch::sched::fpu::selftest); register("abielf", abielf_selftest); } // ABIELF (B693): `tests abielf` beside it, same cfg (the file-tail fn). LINE-NEUTRAL fold, code before the comment.
     }
 }
 
@@ -788,4 +788,46 @@ pub fn applaunch_selftest() {
         alloc::string::String::from("PASS")
     };
     serial_println!(":: APPLAUNCH: app={} n={} p50_ms={} p99_ms={} bar_ms={} -> {} ::", name, N, show(p50), show(p99), BAR_MS, verdict);
+}
+
+// ABIELF (rmbp-ledger B693, BP-bar-13, BP-ring3-15) — TAIL-APPENDED. `tests abielf`: an ELF built at una-abi vN runs
+// unchanged on this build. `/apps/ABIPROBE.ELF` is the COMMITTED fixture (unaos/fixtures/ABIPROBE-v<N>.ELF, staged by the
+// builder after its sha256 pin check) — bytes an older tree built, never a rebuild. It calls one verb of each stable family
+// (file open/write/read/close, window create/present/close, a bus GET round trip, the zero-timeout input read, the
+// prefs_client PREF_GET) and judges each against its contract; this fixture judges its exit status:
+// 1<<24 (it ran) | abi<<16 | syscalls<<8 | ok. PASS = exited, it ran, syscalls > 0, ok == syscalls, 1 <= abi <= ABI_VERSION.
+// SKIP (never a pin) when no fixture is staged; a fault or a 10 s timeout is a FAIL named by outcome.
+// `:: ABIELF: elf=ABIPROBE.ELF bytes=<n> abi=<N> kernel_abi=<K> syscalls=<n> ok=<n> outcome=<o> -> PASS|FAIL ::`
+#[cfg(target_arch = "x86_64")]
+fn abielf_selftest() {
+    use crate::arch::syscall::RunOutcome;
+    const PATH: &str = "/apps/ABIPROBE.ELF";
+    let k = una_abi::ABI_VERSION;
+    let mt = crate::shell::vfs_mount_table();
+    let full = crate::shell::vfs_path(PATH);
+    let Ok(st) = mt.stat(&full) else {
+        serial_println!(":: ABIELF: elf=- abi=- kernel_abi={} syscalls=0 ok=0 -> SKIP reason=no-fixture ::", k);
+        return;
+    };
+    let bytes = match mt.read(&full, 0, st.size as usize) {
+        Ok(b) if b.len() as u64 == st.size => b,
+        _ => {
+            serial_println!(":: ABIELF: elf=ABIPROBE.ELF abi=- kernel_abi={} syscalls=0 ok=0 -> FAIL reason=read ::", k);
+            return;
+        }
+    };
+    let (outcome, status) = match crate::arch::syscall::run_user_image_argv("abielf", &bytes, 10_000, &["abiprobe"]) {
+        Ok((RunOutcome::Exited(s), _)) => ("exited", Some(s as u32)),
+        Ok((RunOutcome::Faulted, _)) => ("faulted", None),
+        Ok((RunOutcome::Timeout, _)) => ("timeout", None),
+        Err(e) => (e, None),
+    };
+    let s = status.unwrap_or(0);
+    let (ran, abi, n, ok) = (s >> 24 == 1, (s >> 16) & 0xFF, (s >> 8) & 0xFF, s & 0xFF);
+    let pass = ran && n > 0 && ok == n && abi >= 1 && abi <= k;
+    serial_println!("[abielf] outcome={} status={:?} bytes={}", outcome, status, bytes.len());
+    serial_println!(
+        ":: ABIELF: elf=ABIPROBE.ELF bytes={} abi={} kernel_abi={} syscalls={} ok={} outcome={} -> {} ::",
+        bytes.len(), abi, k, n, ok, outcome, if pass { "PASS" } else { "FAIL" }
+    );
 }

@@ -2731,3 +2731,16 @@ const _: () = assert!(
     SYS_AUDIO_OPEN == SYS_KILL + 1 && SYS_AUDIO_WRITE == SYS_AUDIO_OPEN + 1 && SYS_AUDIO_CLOSE == SYS_AUDIO_WRITE + 1 && SYS_AUDIO_POS == SYS_AUDIO_CLOSE + 1
         && AUDIO_POS_PLAYED != AUDIO_POS_UNDERRUNS && AUDIO_RATE_MIN < AUDIO_RATE_MAX && AUDIO_WRITE_MAX % 4 == 0
 );
+
+// =================================================================================================
+// ABIELF (rmbp-ledger B693, BP-bar-13, BP-ring3-15) — THE ABI VERSION. A program built against this crate at
+// version N runs unchanged on every later build: `unaos/fixtures/ABIPROBE-v<N>.ELF` is that program, built ONCE
+// and committed (with its .sha256), staged by the builder as APPS/ABIPROBE.ELF and run by `tests abielf`. The
+// RULE (docs/dev/blueprint/ring3.md BP-ring3-15): an ADDITIVE change (a new number, flag, verb tag or errno at
+// the file tail) keeps N. An INCOMPATIBLE change — a number re-meant, an argument moved, a layout or a documented
+// answer changed — bumps N in the same commit AND commits a new fixture ELF beside the old one; the old fixture
+// must still PASS, or the sheet says which surface it lost and why. Appended at the file tail; no line above moves.
+// =================================================================================================
+
+/// The una-abi version the tree speaks. `tests abielf` refuses a fixture that claims a higher one.
+pub const ABI_VERSION: u32 = 1;

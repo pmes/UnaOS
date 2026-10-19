@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The Architect & Una
+#
+# ABIELF (rmbp-ledger B693, BP-bar-13): ABIPROBE.ELF — the smallest ring-3 program that touches every stable
+# ABI surface once (file, window, bus, input, prefs) and says so in one line. Built ONCE per una-abi version by
+# arroyo's build_user_abiprobe_x86 and COMMITTED as unaos/fixtures/ABIPROBE-v<N>.ELF (+ its .sha256); the
+# builder stages the committed bytes as APPS/ABIPROBE.ELF and `tests abielf` runs them — never a rebuild.
+# Linked at the ELF window like user-big (crates/user-abiprobe/user-abiprobe-x86.ld). x86_64 only.
+#
+# The empty [workspace] table makes this crate its OWN workspace root (the user-prefs idiom).
+[workspace]
+
+[package]
+name = "user-abiprobe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "user-abiprobe"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
+lto = true
+
+[dependencies]
+una-abi = { path = "../una-abi" }

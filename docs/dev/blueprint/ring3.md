@@ -24,6 +24,7 @@
 | BP-ring3-12 | Entropy and name lookup for ring 3 have ONE kernel body each (`SYS_GETRANDOM` 56 → the DRBG; `SYS_RESOLVE` 57 → the arch's resolver). | `unaos/crates/kernel/src/netring3.rs:1-20` | `tests net` |
 | BP-ring3-13 | A program declares console vs windowed in a PT_NOTE read by `midden_core::app_note_flags`; no `run`/`bg` to type (R82). | `unaos/crates/user-big/src/main.rs` (EXECNAME note); R82 | unverified gate |
 | BP-ring3-14 | A ring-3 launch is timed exec→first frame (BP-bar-7, x86 `wc`): the launcher stamps the slot before the ELF load (`run_user_image_argv`, `spawn_user_image_bg_inner` — every `run`, `bg`, bare-name and `SYS_SPAWN_PATH` launch), and the slot's FIRST `wm::present` takes the stamp once and prints `[app] <name> exec->frame ms=<n>`; the sidecar is `procslot::launch`, outside WCSER. | `unaos/crates/kernel/src/procslot.rs:130` `unaos/crates/kernel/src/arch/x86_64/syscall.rs:16892` `unaos/crates/kernel/src/arch/x86_64/syscall.rs:16999` `unaos/crates/kernel/src/video/wm.rs:1713` `unaos/crates/kernel/src/video/wm.rs:30583` | `tests applaunch` (`unaos/crates/kernel/src/tests.rs:640`) → `:: APPLAUNCH: app= n=5 p50_ms= p99_ms= bar_ms=400 -> PASS ::` |
+| BP-ring3-15 | The ABI is versioned: `una_abi::ABI_VERSION` (1). An ADDITIVE change (a new number, flag, verb tag or errno at the file tail) keeps it; an INCOMPATIBLE one (a number re-meant, an argument moved, a layout or a documented answer changed) bumps it in the same commit AND commits a new `fixtures/ABIPROBE-v<N>.ELF` beside the old (built once by `build_user_abiprobe_x86`, its `.sha256` beside it); every older fixture must still PASS, or this sheet names the surface it lost and why. The image stages the COMMITTED bytes (pin-checked by the builder), never a rebuild. Changed by: ABIELF (rmbp-ledger B693, BP-bar-13). | `unaos/crates/una-abi/src/lib.rs:2746`; `unaos/fixtures/ABIPROBE-v1.ELF`; `unaos/fixtures/ABIPROBE-v1.ELF.sha256`; `unaos/crates/user-abiprobe/src/main.rs:179`; `unaos/builder/src/main.rs:59`; `unaos/arroyo:4645` | `tests abielf` (`unaos/crates/kernel/src/tests.rs:802`) → `:: ABIPROBE: abi=1 syscalls=12 ok=12 -> PASS ::` (the fixture's own line) and `:: ABIELF: elf=ABIPROBE.ELF bytes=12720 abi=1 kernel_abi=1 syscalls=12 ok=12 outcome=exited -> PASS ::` |
 
 ## 3. Seams
 - Ring 3 may call: `una-abi` syscalls only; the bus for handler verbs; the shared `*_core` crates it links.
@@ -41,6 +42,7 @@
 | LUMEN | yes | yes | vessel `lumen` (Vein's face; `vein_ring3`) |
 | VUG (+VUGX/VUGC/VUGK variants) | yes | yes | Vug |
 | PREFS, NET, DIAG, BIG | yes | no aarch64 recipe found | probes/fixtures (owner `unverified`) |
+| ABIPROBE | committed fixture (`unaos/fixtures/ABIPROBE-v1.ELF`), never rebuilt by the image | no | the ABI gate (BP-ring3-15) |
 | STAT, PULSE | yes | yes | instruments |
 | blob / elf / blob-x86 | flat test blobs | | fixtures |
 
