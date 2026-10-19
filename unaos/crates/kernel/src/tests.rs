@@ -188,7 +188,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -1155,5 +1155,121 @@ pub fn tzlocale_selftest() {
     serial_println!(
         ":: TZLOCALE: zones={} dst_edges_ok={}/{} painted_ok={}/{} painters={} seen={:#05b} orphans={} -> {} :: faults={} defaults={}",
         tz::ZONES.len(), dst_ok, 2 * edges.len(), painted_ok, painted.len(), locale::PAINTERS, locale::painted(), orphans, if ok { "PASS" } else { "FAIL" }, faults, defaults as u8
+    );
+}
+
+// ══════════════ KEYMAPS (rmbp-ledger B704) — `tests keymaps` — TAIL-APPENDED ══════════════
+
+/// `tests keymaps`: 'ü é ñ ß € @' fed as HID boot reports on de, fr and es through `keymap::layouts::report` — the
+/// same walk the live seam (`keymap::layout_report`) makes — and the characters read back: direct keys, dead keys,
+/// AltGr and the Compose tap (Right Alt down and up alone); three dead-key edges (twice = the mark, + Space = the
+/// mark, + no match = mark and char); Caps Lock on letters only; the US layout unchanged; one press through the LIVE
+/// seam (the live layout swapped in silently and restored); the Settings > Keyboard rows read back from `MAP`.
+/// `window=owed`: the decoders do not call the seam yet and `pal::Event::Key` carries one byte (B704's owed wiring).
+/// `:: KEYMAPS: layouts=8 dead_ok=8 compose_ok=3 altgr_ok=6 -> PASS :: typed=18/18 direct=4 caps=4 us=3 seam=ok settings=ok window=owed`
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn keymaps_selftest() {
+    use crate::video::keymap::layouts::{self as kl, KbdState, RALT};
+    use alloc::string::String;
+    const SH: u8 = 0x02;
+    const TAP: (u8, u8) = (0, 0);
+    /// One key down and up (two boot reports) under `mods`, then every modifier released; `(0, 0)` is a Right Alt TAP.
+    fn feed(l: &kl::Layout, st: &mut KbdState, caps: bool, seq: &[(u8, u8)], acc: &mut String) {
+        let mut out = ['\0'; 12];
+        let none = [0u8; 6];
+        for &(mods, usage) in seq {
+            if usage == 0 {
+                kl::report(l, st, true, &none, &none, RALT, caps, &mut out);
+                kl::report(l, st, true, &none, &none, 0, caps, &mut out);
+                continue;
+            }
+            let mut down = [0u8; 6];
+            down[0] = usage;
+            let n = kl::report(l, st, true, &down, &none, mods, caps, &mut out);
+            acc.extend(out[..n].iter());
+            let n = kl::report(l, st, true, &none, &down, mods, caps, &mut out);
+            acc.extend(out[..n].iter());
+            if mods != 0 {
+                let n = kl::report(l, st, true, &none, &none, 0, caps, &mut out);
+                acc.extend(out[..n].iter());
+            }
+        }
+    }
+    // (layout, caps, reports, want, class): 0 direct, 1 dead, 2 AltGr, 3 Compose, 4 Caps, 5 US, 6 dead edge.
+    let legs: [(&str, bool, &[(u8, u8)], &str, u8); 28] = [
+        ("de", false, &[(0, 0x2F)], "ü", 0),
+        ("de", false, &[(0, 0x2E), (0, 0x08)], "é", 1),
+        ("de", false, &[TAP, (RALT, 0x30), (0, 0x11)], "ñ", 3),
+        ("de", false, &[(0, 0x2D)], "ß", 0),
+        ("de", false, &[(RALT, 0x08)], "€", 2),
+        ("de", false, &[(RALT, 0x14)], "@", 2),
+        ("fr", false, &[(SH, 0x2F), (0, 0x18)], "ü", 1),
+        ("fr", false, &[(0, 0x1F)], "é", 0),
+        ("fr", false, &[(RALT, 0x1F), (0, 0x11)], "ñ", 1),
+        ("fr", false, &[TAP, (0, 0x16), (0, 0x16)], "ß", 3),
+        ("fr", false, &[(RALT, 0x08)], "€", 2),
+        ("fr", false, &[(RALT, 0x27)], "@", 2),
+        ("es", false, &[(SH, 0x34), (0, 0x18)], "ü", 1),
+        ("es", false, &[(0, 0x34), (0, 0x08)], "é", 1),
+        ("es", false, &[(0, 0x33)], "ñ", 0),
+        ("es", false, &[TAP, (0, 0x16), (0, 0x16)], "ß", 3),
+        ("es", false, &[(RALT, 0x08)], "€", 2),
+        ("es", false, &[(RALT, 0x1F)], "@", 2),
+        ("de", false, &[(0, 0x2E), (0, 0x2E)], "´", 6),
+        ("de", false, &[(0, 0x2E), (0, 0x2C)], "´", 6),
+        ("de", false, &[(0, 0x35), (0, 0x1B)], "^x", 6),
+        ("de", true, &[(0, 0x2F)], "Ü", 4),
+        ("de", true, &[(0, 0x1E)], "1", 4),
+        ("de", true, &[(SH, 0x2F)], "ü", 4),
+        ("fr", true, &[(0, 0x1F)], "é", 4),
+        ("us", false, &[(0, 0x04)], "a", 5),
+        ("us", false, &[(SH, 0x1F)], "@", 5),
+        ("us", false, &[(RALT, 0x08)], "", 5),
+    ];
+    let mut by = [0usize; 7];
+    for &(name, caps, seq, want, class) in legs.iter() {
+        let Some(i) = kl::index_of(name) else { continue };
+        let mut st = KbdState::new();
+        let mut got = String::new();
+        feed(kl::LAYOUTS[i], &mut st, caps, seq, &mut got);
+        if got == want && st == KbdState::new() {
+            by[class as usize] += 1;
+        } else {
+            let hex = |s: &str| s.chars().map(|c| format!("U+{:04X}", c as u32)).collect::<alloc::vec::Vec<_>>().join(",");
+            serial_println!("[kbd] leg fail layout={} class={} want={} got={}", name, class, hex(want), hex(&got));
+        }
+    }
+    // The tables: eight, named as the schema spells them, their dead keys counted.
+    const DEADS: [usize; 8] = [0, 0, 3, 4, 4, 0, 5, 5];
+    let layouts = kl::LAYOUTS.len();
+    let tables = layouts == 8
+        && (0..layouts).all(|i| kl::LAYOUTS[i].name == kl::NAMES[i] && kl::index_of(kl::NAMES[i]) == Some(i) && kl::dead_count(kl::LAYOUTS[i]) == DEADS[i])
+        && matches!(prefs_core::schema::lookup(crate::prefs::NS, crate::prefs::key::KBD_LAYOUT).map(|k| k.kind), Some(prefs_core::schema::Kind::Enum(e)) if e == &kl::NAMES[..]);
+    // The LIVE seam: German swapped in silently, one press of usage 0x2F, everything put back.
+    let seam = match kl::index_of("de") {
+        Some(de) => {
+            let saved = kl::fixture_swap(de, false, KbdState::new().pack());
+            let mut out = ['\0'; 12];
+            let mut down = [0u8; 6];
+            down[0] = 0x2F;
+            let n = crate::video::keymap::layout_report(&down, &[0; 6], 0, false, &mut out);
+            let ok = n == 1 && out[0] == 'ü';
+            let _ = crate::video::keymap::layout_report(&[0; 6], &down, 0, false, &mut out);
+            kl::fixture_swap(saved.0, saved.1, saved.2);
+            ok
+        }
+        None => false,
+    };
+    // Settings > Keyboard: both keys on their rows of the one table, the launcher opens the tab.
+    let row = |key: &str, label: &str| crate::video::settings::MAP.iter().any(|r| r.keys.contains(&key) && r.tab == crate::video::settings::KB_TAB && r.label == label)
+        && crate::video::settings::row_of_key(key).0 == crate::video::settings::KB_TAB;
+    let settings = row(crate::prefs::key::KBD_LAYOUT, "Layout") && row(crate::prefs::key::KBD_COMPOSE, "Compose key");
+    let (direct, dead_ok, altgr_ok, compose_ok) = (by[0], by[1] + by[6], by[2], by[3]);
+    let typed = by[0] + by[1] + by[2] + by[3];
+    let pass = tables && direct == 4 && dead_ok == 8 && altgr_ok == 6 && compose_ok == 3 && by[4] == 4 && by[5] == 3 && seam && settings;
+    serial_println!(
+        ":: KEYMAPS: layouts={} dead_ok={} compose_ok={} altgr_ok={} -> {} :: typed={}/18 direct={} caps={} us={} tables={} seam={} settings={} window=owed",
+        layouts, dead_ok, compose_ok, altgr_ok, if pass { "PASS" } else { "FAIL" }, typed, direct, by[4], by[5],
+        if tables { "ok" } else { "bad" }, if seam { "ok" } else { "bad" }, if settings { "ok" } else { "bad" }
     );
 }

@@ -14,7 +14,7 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 64.
+Rows: 66.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -42,6 +42,8 @@ Rows: 64.
 | `system.dock.autohide` | bool | `false` | settings, dock, program | yes | kernel dock | Hide the dock until the pointer reaches its edge (DOCK2). Edited in Settings > General > Auto-hide dock. |
 | `system.dock.pins` | string ≤256 printable | consumer: every pin the build carries (lumen, aether, midden, una, stria each only on its own build) | dock | — | kernel dock | Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen, aether, midden, una, stria); TOML arrays are outside the subset. |
 | `system.dock.position` | enum `bottom \| left \| right` | `"bottom"` | settings, dock, program | yes | kernel dock | The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock. |
+| `system.keyboard.compose` | bool | `false` | settings | — | kernel KEYMAPS (`input/layouts.rs`), Settings > Keyboard | A tap of Right Alt (down and up alone) is the Compose key: the next two characters compose (s s = ß, = e = €, " u = ü); Right Alt held with a key stays AltGr (KEYMAPS B704). |
+| `system.keyboard.layout` | enum `us \| gb \| de \| fr \| es \| it \| se \| ch` | `"us"` | settings | — | kernel KEYMAPS (`input/layouts.rs`), Settings > Keyboard | The keyboard layout keys type on: U.S., British, German, French, Spanish, Italian, Swedish / Finnish, Swiss German, with their dead keys and AltGr characters (KEYMAPS B704). |
 | `system.locale.first_day` | enum `mon \| sun \| sat` | `"mon"` | settings | — | kernel `clock::locale` | The week's first day (calendars). Edited in Settings > Date & Time. |
 | `system.locale.region` | enum `ymd-24 \| ymd-12 \| dmy-24 \| dmy-12 \| mdy-24 \| mdy-12` | `"ymd-24"` | settings | — | kernel `clock::locale` | The date order (`ymd` YYYY-MM-DD, `dmy` DD/MM/YYYY, `mdy` MM/DD/YYYY) and the hour cycle (24 or 12) every civil print uses. Edited in Settings > Date & Time. |
 | `system.locale.tz` | string ≤40 printable | `"UTC"` | settings | — | kernel `clock::locale` (the zone table `clock/tz.rs`) | The time zone, an IANA name from the kernel's compiled table (fixed DST rules); the civil anchor stays UTC and the zone is applied when a second is printed. An unknown name reads as UTC. Edited in Settings > Date & Time. |
@@ -54,7 +56,7 @@ Rows: 64.
 | `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | settings | — | kernel POWERMENU, Settings > Display (Low battery shutdown, `settings::lowbat_step`) | Battery percent at which the machine shuts down; 0 = off. |
 | `system.privacy.remember` | bool | `true` | settings | — | kernel `prefs::decide` (REASK), Settings > Privacy | Keep the answer the user gives to an ask (`system.decisions.*`, see Decisions below) so it is not asked again; off = a new answer is not kept and the ask asks every time (REASK B681, R130 law 2). |
 | `system.quarry.favorites` | string ≤512 printable | consumer: none — the sidebar's six built-in favorites only | quarry | — | kernel Quarry sidebar (`video/quarry/sidebar.rs`) | Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18). |
-| `system.settings.tab` | int `0..=11` | `0` | settings, program | yes | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy, Date & Time). |
+| `system.settings.tab` | int `0..=12` | `0` | settings, program | yes | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy, Date & Time, Keyboard). |
 | `system.trackpad.natural_scroll` | bool | `true` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Two-finger scrolling moves the content with the fingers (on) or the other way (off). Edited in Settings > Trackpad. |
 | `system.trackpad.secondary_click` | enum `two-finger \| off` | `"two-finger"` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | A click (or, with tap to click, a tap) made with two fingers down is a secondary click. Edited in Settings > Trackpad. |
 | `system.trackpad.speed` | int `1..=10` | `5` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Tracking speed: one gain on the TPSPEED curve (5 = the curve as flown, x0.25 at 1 .. x2.5 at 10); the curve's shape never changes. Unset, a stored `system.pointer.speed` maps to 4/5/7. Edited in Settings > Trackpad. |

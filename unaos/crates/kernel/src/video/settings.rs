@@ -120,8 +120,8 @@ const TOP: usize = PANE_Y;
 const ROW_H: usize = 48;
 const ROWS: usize = 10;
 /// The tabs, in the column's order.
-pub const TABS: usize = 12;
-pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy", "Date & Time"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8 · A11YPANE (B655) 9 · REASK (B681) 10 · TZLOCALE (B701) 11
+pub const TABS: usize = 13;
+pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy", "Date & Time", "Keyboard"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE · TZLOCALE (B701) 11 · KEYMAPS (B704) 12
 const WIN_H: usize = TOP + ROWS * ROW_H + PAD;
 /// Tab rows the column shows at once; more than this and it scrolls (the wheel, or the selection kept in view).
 const COL_VIS: usize = (WIN_H - COL_PAD - 8) / COL_ROW;
@@ -369,7 +369,7 @@ fn load_for_login() {
     if mask & 8 != 0 { apply_idle(v.idle_min); }
     tp_load(if mask & 16 != 0 { Some(v.ptr) } else { None }); // TRACKPADPANE (B412): the five trackpad keys; a legacy pointer.speed stands in for an unset speed
     if mask & 32 != 0 && !v.wall.is_empty() { apply_wall(&v.wall); }
-    mode_at_login(); super::appearance::load_at_login(); a11y_load("login"); // A11YPANE (B655): the four accessibility keys, latched for the glass. PREFSUI (R93): a stored `system.display.mode` is this session's scale
+    mode_at_login(); super::appearance::load_at_login(); a11y_load("login"); kbd_load("login"); // KEYMAPS (B704): the layout and the Compose switch, live for the decoders' seam. A11YPANE (B655): the four accessibility keys, latched for the glass. PREFSUI (R93): a stored `system.display.mode` is this session's scale
 }
 
 /// Set control `i` to `val` (slider position, toggle 0/1, chooser index), apply, print, save, repaint.
@@ -496,7 +496,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); kbd_service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -807,6 +807,17 @@ fn tab_icon(s: &mut draw::Surf, tab: usize, x: i32, y: i32, t: i32, tile: Option
             line_aa(s, cx * SUB, cy * SUB, (x + f(32)) * SUB, (y + f(40)) * SUB, sw * SUB, ink);
             fill_circle(s, cx, cy, f(6).max(1), ink);
         }
+        KB_TAB => {
+            // Keyboard: a rounded deck, two rows of keys and the space bar (KEYMAPS B704).
+            stroke_rrect(s, Rect::new(x + f(12), y + f(28), f(76), f(46)), f(8), sw, ink);
+            for i in 0..4i32 {
+                fill_rrect(s, Rect::new(x + f(22 + 15 * i), y + f(37), f(9).max(1), f(8).max(1)), f(2), ink);
+            }
+            for i in 0..3i32 {
+                fill_rrect(s, Rect::new(x + f(29 + 15 * i), y + f(49), f(9).max(1), f(8).max(1)), f(2), ink);
+            }
+            fill_rrect(s, Rect::new(x + f(30), y + f(61), f(40), f(6).max(1)), f(3), ink);
+        }
         9 => {
             // Accessibility: the universal-access figure — a ring, the head, the arms across, the two legs (A11YPANE B655).
             stroke_circle(s, cx, cy, f(44).max(2), sw, ink);
@@ -938,6 +949,7 @@ fn paint(st: &mut State, v: &Values) {
         t if t as usize == A11Y_TAB => paint_a11y(st), // A11YPANE (B655)
         t if t as usize == PRIV_TAB => paint_privacy(st), // REASK (B681)
         t if t as usize == DT_TAB => paint_datetime(st), // TZLOCALE (B701)
+        t if t as usize == KB_TAB => paint_keyboard(st), // KEYMAPS (B704)
         _ => paint_about(st),
     }
     if let Some((t, r)) = st.found { if t as usize == tab { found_ring(st, r as usize); } } // SETTINGSMAP (B673): the row the search opened
@@ -1704,6 +1716,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         t if t == A11Y_TAB => press_a11y(row, cx), // A11YPANE (B655)
         t if t == PRIV_TAB => press_privacy(row, cx), // REASK (B681)
         t if t == DT_TAB => press_datetime(row, cx), // TZLOCALE (B701)
+        t if t == KB_TAB => press_keyboard(row, cx), // KEYMAPS (B704)
         2 => {
             if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
@@ -2019,7 +2032,7 @@ fn bus_changes_inner() -> (usize, usize, usize) {
     let mut keys: Vec<&'static str> = Vec::new();
     let mut idle = 0usize;
     let frames = crate::prefs_client::changes_drain(|ns, k| {
-        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } // A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
+        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } if k.starts_with("keyboard.") { KB_DIRTY.store(true, Ordering::Release); } // KEYMAPS (B704): another client chose a layout. A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
         if let Some(s) = SHOWN.iter().find(|s| **s == k) {
             if *s == crate::prefs::key::IDLE_MIN { idle += 1; }
             if !keys.contains(s) { keys.push(s); }
@@ -3252,9 +3265,9 @@ pub fn selftest_a11y() {
 // date, a Revoke at the right); the row after them `+<n> more`. Revoke is LATCHED in the click router and run by
 // [`privacy_service`] on the service pass (`prefs::revoke` saves a domain file — never in the router).
 
-/// The Privacy tab's index on the strip: the one before Date & Time (TZLOCALE B701).
+/// The Privacy tab's index on the strip: Date & Time (TZLOCALE B701) then Keyboard (KEYMAPS B704) follow it.
 pub const PRIV_TAB: usize = 10;
-const _: () = assert!(DT_TAB == TABS - 1 && PRIV_TAB + 1 == DT_TAB && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB); // TZLOCALE (B701): Date & Time follows Privacy
+const _: () = assert!(KB_TAB == TABS - 1 && DT_TAB + 1 == KB_TAB && PRIV_TAB + 1 == DT_TAB && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB); // the fold: Date & Time 11, Keyboard 12
 /// Decision rows shown.
 const PRIV_ROWS: usize = 8;
 /// The Revoke button's x (right-aligned in the row).
@@ -3423,7 +3436,7 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 35] = {
+pub const MAP: [MapRow; 37] = {
     use crate::prefs::key::*;
     [
         // General (0)
@@ -3470,6 +3483,9 @@ pub const MAP: [MapRow; 35] = {
         mr(&[LOCALE_TZ], DT_TAB, 0, "Time zone", NO_CTRL),
         mr(&[LOCALE_REGION], DT_TAB, 1, "Date and time format", NO_CTRL),
         mr(&[LOCALE_FIRST_DAY], DT_TAB, 2, "First day of week", NO_CTRL),
+        // Keyboard (KEYMAPS B704): the layout, the Compose tap
+        mr(&[KBD_LAYOUT], KB_TAB, 0, "Layout", NO_CTRL),
+        mr(&[KBD_COMPOSE], KB_TAB, 1, "Compose key", NO_CTRL),
         // The tab column
         mr(&[SETTINGS_TAB], COLUMN, 0, "Settings tabs", NO_CTRL),
     ]
@@ -3720,4 +3736,85 @@ pub fn ring_probe() -> (usize, usize, usize, Option<(usize, usize)>) {
         }
     }
     (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail)
+}
+
+// ── KEYMAPS (rmbp-ledger B704) — the Keyboard tab ─────────────────────────────────────────────────────────────────────
+// Row 0 `Layout` (`system.keyboard.layout`, a segmented control over `keymap::layouts::LAYOUTS`), row 1 `Compose key`
+// (`system.keyboard.compose`, a switch: a Right Alt tap composes). Read over the bus at login and on a PrefChanged naming
+// `keyboard.*`; applied to the live layout the decoders' seam (`keymap::layout_report`) reads; a press latches the store
+// write for [`kbd_service`] (never a bus write in the click router). Wire: `[kbd] layout=<name> dead=<n> compose=<0|1> via=`.
+
+/// The Keyboard tab's index on the strip: the last tab.
+pub const KB_TAB: usize = 12;
+const _: () = assert!(KB_TAB == TABS - 1);
+/// Store writes owed: bit 0 the layout, bit 1 the Compose switch.
+static KB_PERSIST: AtomicU32 = AtomicU32::new(0);
+/// A PrefChanged named a `keyboard.*` key: the service pass re-reads both.
+static KB_DIRTY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Read the two keys over the bus (the schema's default where unset: `us`, off) and make them live. `via` = `login`
+/// (always announced) or `prefchanged` (announced when something moved).
+fn kbd_load(via: &str) {
+    use crate::video::keymap::layouts as kl;
+    use crate::prefs::key; use crate::prefs_client::{sys_flag, sys_text};
+    let i = sys_text(key::KBD_LAYOUT).and_then(|s| kl::index_of(s.as_str())).unwrap_or(0);
+    let c = sys_flag(key::KBD_COMPOSE).unwrap_or(false);
+    let i0 = kl::index_of(kl::active().name).unwrap_or(0);
+    if via == "login" || i != i0 || c != kl::compose_on() {
+        kl::set(i, c, via);
+    }
+}
+
+/// Row 0: layout `val`; row 1: Compose on when `val != 0`. Live at once, printed, the store write latched. Repaints.
+fn kbd_set(row: usize, val: usize) {
+    use crate::video::keymap::layouts as kl;
+    let i = kl::index_of(kl::active().name).unwrap_or(0);
+    match row {
+        0 => { let v = val.min(kl::LAYOUTS.len() - 1); kl::set(v, kl::compose_on(), "settings"); say("keyboard.layout", kl::NAMES[v], true); }
+        1 => { kl::set(i, val != 0, "settings"); say("keyboard.compose", if val != 0 { "true" } else { "false" }, true); }
+        _ => return,
+    }
+    KB_PERSIST.fetch_or(1 << row, Ordering::AcqRel);
+    repaint();
+}
+
+/// The service pass: a PrefChanged's re-read, then the owed store writes.
+fn kbd_service() {
+    use crate::video::keymap::layouts as kl;
+    if KB_DIRTY.swap(false, Ordering::AcqRel) && LOAD_DONE.load(Ordering::Acquire) {
+        kbd_load("prefchanged");
+        if is_open() && cur_tab() == KB_TAB { repaint(); }
+    }
+    let owed = KB_PERSIST.swap(0, Ordering::AcqRel);
+    if owed == 0 { return; }
+    use crate::prefs::{key, PrefValue as P}; use crate::prefs_client::sys_set as set_sys;
+    if owed & 1 != 0 { set_sys(key::KBD_LAYOUT, P::Str(String::from(kl::active().name))); }
+    if owed & 2 != 0 { set_sys(key::KBD_COMPOSE, P::Bool(kl::compose_on())); }
+}
+
+fn paint_keyboard(st: &mut State) {
+    use crate::video::keymap::layouts as kl;
+    groups(st, &[(0, 1)]);
+    let l = kl::active();
+    let on = kl::compose_on();
+    let labels: [&[u8]; 8] = core::array::from_fn(|k| kl::LAYOUTS[k].label.as_bytes());
+    txt(st, LABEL_X, 0, "Layout");
+    seg(st, 0, &labels, kl::index_of(l.name).unwrap_or(0), false);
+    txt2(st, VAL_X, 0, l.title);
+    txt(st, LABEL_X, 1, "Compose key");
+    tog(st, 1, TOG_X, on, false);
+    txt2(st, TRACK_X, 1, if on { "Tap Right Alt, then two keys: s s, = e, \" u" } else { "Right Alt is AltGr" });
+    txt2(st, LABEL_X, 3, &alloc::format!("{}: {} dead keys. Press one, then a letter; press it twice for the mark itself.", l.title, kl::dead_count(l)));
+    txt2(st, LABEL_X, 4, "Caps Lock shifts letters only; Right Alt held with a key types its AltGr character.");
+}
+
+/// A press on the Keyboard tab: a layout segment, or the Compose switch (anywhere on its row).
+fn press_keyboard(row: usize, cx: usize) {
+    use crate::video::keymap::layouts as kl;
+    let n = kl::LAYOUTS.len();
+    match row {
+        0 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { kbd_set(0, ((cx - TRACK_X) / (TRACK_W / n)).min(n - 1)); } }
+        1 => kbd_set(1, (!kl::compose_on()) as usize),
+        _ => {}
+    }
 }
