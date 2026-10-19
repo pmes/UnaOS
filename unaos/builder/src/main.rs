@@ -791,6 +791,10 @@ fn main() {
     // and WXN-M3b failure). Default OFF => the page code and its constants unlinked, media
     // byte-identical. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_BTC").is_ok() { feats.push("btc"); }
+    // A2DPENV (rmbp-ledger B752): UNAOS_A2DP=1 arms the Bluetooth A2DP source (drivers/bt/*, the BTHID hooks, audio's
+    // `bt` sink, `tests a2dp`). `a2dp` implies `btc` in Cargo.toml (A2DPKNOB B750). THIS list is what reaches the
+    // media kernel, so arroyo's mapping alone would ship A2DP disabled under a banner naming it. Kept in sync.
+    if std::env::var("UNAOS_A2DP").is_ok() { feats.push("a2dp"); }
     // BT-DIR: UNAOS_BTDIR=1 arms THE DIRECTION TEST — after the outbound page stage has printed its
     // tally, write HCI_Write_Scan_Enable (0x0C1A) = 0x03 so the peer can page THIS host, hold one
     // 6400 ms page window, report whether a Connection Request (event 0x04) arrived, then write
