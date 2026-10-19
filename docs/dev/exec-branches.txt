@@ -655,3 +655,9 @@ refs/heads/exec-rmbp-undodocs       5582f4a8 IN-FLIGHT cloud wave36 UNDODOCS
 refs/heads/exec-rmbp-lockchanged    5582f4a8 IN-FLIGHT cloud wave36 LOCKCHANGED
 refs/heads/exec-rmbp-hwtab2         5582f4a8 IN-FLIGHT cloud wave36 HWTAB2
 refs/heads/exec-rmbp-fsearchicons   5582f4a8 IN-FLIGHT cloud wave36 FSEARCHICONS
+refs/heads/exec-rmbp-sbcframe       ac54e385 IN-FLIGHT cloud wave36 SBCFRAME
+refs/heads/exec-rmbp-orinrepeat     ac54e385 IN-FLIGHT cloud wave36 ORINREPEAT
+refs/heads/exec-rmbp-openargqueue   ac54e385 IN-FLIGHT cloud wave36 OPENARGQUEUE
+refs/heads/exec-rmbp-trashbatchdock ac54e385 IN-FLIGHT cloud wave36 TRASHBATCHDOCK
+refs/heads/exec-rmbp-prefsreload    ac54e385 IN-FLIGHT cloud wave36 PREFSRELOAD
+refs/heads/exec-rmbp-hwcensusarm    ac54e385 IN-FLIGHT cloud wave36 HWCENSUSARM
