@@ -353,7 +353,6 @@ fn a_full_volume_spends_the_oldest_version_before_it_refuses_an_overwrite() {
 
 // ---- VERSIONSCOMPAT (SR154): the root record's ROCOMPAT `versions` bit and the read-only rule ----
 
-use unafs::fs::FileSystemError;
 use unafs::root::{ROOT_FLAG_VERSIONS, read_active, write_slot};
 
 /// The active root's `flags` word as it sits on the device.
