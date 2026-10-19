@@ -25,6 +25,7 @@
 | BP-video-13 | A screen capture has an owner (the session user's Desktop); with no session it is refused; root takes no screenshots (R67). | `unaos/crates/kernel/src/video/prtscr.rs:83` `unaos/crates/kernel/src/video/prtscr.rs:175`; R67 | `tests prtscr` |
 | BP-video-14 | A ring-3 present returns 0 for every success on both arches; no pacing status exists (renderers run unpaced). | `unaos/crates/una-abi/src/lib.rs:233-252` | compile |
 | BP-video-15 | DESKTOPCRAFT is paint-only: no hit box, strip rect or router changes from the look's paint. | `docs/dev/OS/05_USER_EXPERIENCE/DESKTOPCRAFT.md:16-19` | `tests desktopcraft` |
+| BP-video-16 | Text resolves per glyph run through ONE fallback chain, in the loader's table order: Inter → Noto Sans → the Noto script faces → DejaVu Sans → `font8x8` (DESIGN-LANGUAGE §2.2); a script no face covers is NAMED (`font8x8`) and its `.notdef` counted, never hidden. | `unaos/libs/text/font_core/src/ui.rs:303` (`Engine::stack`, load order); `unaos/crates/kernel/src/video/text.rs:407` (`FACES`) | `tests glyphs` (`:: GLYPHS: … notdef=0 rtl=ok pseudo_clipped=0 -> PASS ::`, B676) |
 
 ## 3. Seams
 - `wm` may be called by: kernel apps (`facet`, `quarry`, `settings`, `fileview`, `login`, …), ring-3 window syscalls (ring3.md), the input router (input.md), `splash`, `desktopbuild`.
