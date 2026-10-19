@@ -7946,6 +7946,11 @@ pub struct Rehomed {
     pub sleeping: u32,
     pub left: u32,
     pub current: Option<u64>,
+    /// GATESTEAL2 (B667): the registered SINGLETON lived on the dead core in no queue (its CURRENT task, or parked on a
+    /// wait queue) and was restarted at its loop head on `live` ([`singleton_restart`]); `current` then names the
+    /// superseded tid and `restarted` the fresh one.
+    pub moved_current: bool,
+    pub restarted: Option<u64>,
 }
 
 /// GATESTEAL — the thief's step 3 for a task leaving a dead core: home, migration count, residency clock.
@@ -7959,7 +7964,9 @@ fn rehome_fields(task: &mut Task, live: usize, now_ms: u64) {
 /// what moved and what could not. A no-op (all zeros, `current: None`) when `dead`/`live` are out of
 /// range, equal, or `live` does not dispatch — the caller chose badly and nothing is touched.
 pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
-    let mut r = Rehomed { ready: 0, sleeping: 0, left: 0, current: None };
+    let mut r = Rehomed { ready: 0, sleeping: 0, left: 0, current: None, moved_current: false, restarted: None };
+    let sgl = SGL_TID.load(Ordering::Acquire);
+    let mut sgl_moved = false;
     if dead >= MAX_CPUS || live >= MAX_CPUS || dead == live || !cpu_dispatching(live) {
         return r;
     }
@@ -7978,6 +7985,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
                 continue;
             }
             rehome_fields(&mut task, live, now_ms);
+            sgl_moved |= task.id == sgl;
             let prio = task.priority;
             RUN_QUEUES[live].lock().push(task);
             poke_for(live, prio);
@@ -7997,6 +8005,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
                 continue;
             }
             rehome_fields(&mut task, live, now_ms);
+            sgl_moved |= task.id == sgl;
             let left = deadline.saturating_sub(dead_ticks);
             SLEEPERS[live].lock().push_back(Sleeper { deadline: live_ticks.saturating_add(left), task });
             r.sleeping += 1;
@@ -8006,18 +8015,270 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
             SLEEPERS[dead].lock().push_back(s);
         }
     });
-    match SCHED[dead].current_tid.load(Ordering::Relaxed) {
-        0 => {}
-        t => r.current = Some(t),
+    let cur = SCHED[dead].current_tid.load(Ordering::Relaxed);
+    if cur != 0 {
+        r.current = Some(cur);
+    }
+    // GATESTEAL2 (B667) M1: the registered singleton (the usb-pump) on the dead core and in no queue it could be moved
+    // from — its CURRENT task, or PARKED on a wait queue (flight 36 boot 1: `current=-1`, the pump in neither queue) —
+    // is restarted at its loop head on `live`. Never a frame move: see the block at [`singleton_restart`].
+    let was = if cur != 0 && cur == sgl { "running" } else { "parked" };
+    if sgl != 0 && !sgl_moved && SGL_HOME.load(Ordering::Acquire) == dead {
+        if let Some((old, new)) = singleton_restart(dead, live) {
+            r.current = Some(old);
+            r.moved_current = true;
+            r.restarted = Some(new);
+        }
     }
     serial_println!(
-        ":: [smpbal] rehome dead=c{} live=c{} ready={} sleeping={} left={} current={} (GATESTEAL B657: the pin contract is void on a core the steal declared dead; the current task is in no queue and stays) ::",
+        ":: [smpbal] rehome dead=c{} live=c{} ready={} sleeping={} left={} current={} moved_current={} was={} new={} (GATESTEAL B657: the pin contract is void on a core the steal declared dead; GATESTEAL2 B667: the singleton in no queue restarts at its loop head) ::",
         dead,
         live,
         r.ready,
         r.sleeping,
         r.left,
-        r.current.map_or(-1i64, |t| t as i64)
+        r.current.map_or(-1i64, |t| t as i64),
+        r.moved_current as u8,
+        if r.moved_current { was } else { "-" },
+        r.restarted.map_or(-1i64, |t| t as i64)
     );
     r
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// GATESTEAL2 (rmbp-ledger B667) — A SINGLETON THE RE-HOME CANNOT MOVE RESTARTS AT ITS LOOP HEAD.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// Flight 36 boot 1 (f36-boot1.log 00:11:49): `[pump] REHOME: c7 is dead and carried the usb-pump (tid 9): moved
+// ready=0 sleeping=4 left=0 current=-1`. `current=-1` is `SCHED[c7].current_tid == 0` — cleared at every switch-back
+// and set only at dispatch (the dispatch loop above) — so c7 ran NO task at that look, and the pump was in neither of
+// the two queues [`rehome_dead_core`] drains: it was PARKED on a wait queue (`park_blocked`'s PARK_WAITQ arm — a
+// Semaphore/Mutex/channel waiter list owns its Box), holding COMP_GATE across the park. It woke ON c7 one pass later
+// (`[pump] wedge cleared`, then PUMPWEDGE `pump=9@cpu7` again): c7 dispatches. Boot 2 (00:16:28) is the same pump,
+// parked in its net-hda step, with no gate and no steal at all.
+//
+// THE CHOICE: a fresh start at the loop head, never a frame move. A task CURRENT on a dead core has its registers live
+// on that CPU and a `ctx_rsp` stale since its last switch; the W5 NMI (`interrupts.rs` `nmi_handler`) records rip/cs and
+// returns to the same instruction, so there is no stopped frame to copy, and copying a stack another CPU may still be
+// executing is a second runner on one stack. A PARKED task's Box belongs to a wait queue another core may `post()` at
+// any moment, so no third core may take it. The usb-pump's loop allows the restart: its body (main.rs `usb_pump`) is a
+// stateless poll — every step a one-shot latch or an idempotent service, the prologue's two task starts latched
+// (`xhci::poll_task_start` swaps POLL_TASK) — and its only per-instance state is the `cpu` arg.
+//
+// So the pump REGISTERS itself ([`singleton_register`], its prologue) and [`singleton_restart`] spawns a fresh instance
+// with the same name, entry and priority pinned to the live core (arg = that core) and publishes its tid. The old
+// instance is FENCED, not killed: [`singleton_superseded`] (one load + `current_id`, at the pump's loop top and at the end
+// of each long step) returns `true` to it, and it returns from `usb_pump` — an ordinary task exit — the first time it gets
+// there. Until then it may finish the step it was parked in; the fence points sit at the end of every long step, so a
+// woken revenant runs at most the remainder of that one step beside the fresh instance. Callers: [`rehome_dead_core`]
+// (the singleton on the dead core in no queue) and the pump watch on a stealless wedge (sessionwedge.rs, owed — see the
+// arc's report). `tests gatesteal2` below.
+
+static SGL_TID: AtomicU64 = AtomicU64::new(0);
+static SGL_ENTRY: AtomicUsize = AtomicUsize::new(0);
+static SGL_NAME_PTR: AtomicUsize = AtomicUsize::new(0);
+static SGL_NAME_LEN: AtomicUsize = AtomicUsize::new(0);
+static SGL_PRIO: AtomicU8 = AtomicU8::new(PRIO_NORMAL);
+/// The core the singleton lives on; `usize::MAX` = none registered. The restart CASes it, so one death restarts once.
+static SGL_HOME: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SGL_STAMPS: AtomicU64 = AtomicU64::new(0);
+static SGL_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static SGL_LAST_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SGL_RESTARTS: AtomicU32 = AtomicU32::new(0);
+static SGL_RESTART_OLD: AtomicU64 = AtomicU64::new(0);
+/// The fresh instance's first stamp (`arch::ms`), 0 until it stamps.
+static SGL_FRESH_MS: AtomicU64 = AtomicU64::new(0);
+static SGL_REVENANTS: AtomicU32 = AtomicU32::new(0);
+
+fn sgl_name() -> &'static str {
+    let p = SGL_NAME_PTR.load(Ordering::Acquire);
+    let n = SGL_NAME_LEN.load(Ordering::Acquire);
+    if p == 0 {
+        return "singleton";
+    }
+    // SAFETY: `p`/`n` were taken from a `&'static str` in `singleton_register`.
+    unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(p as *const u8, n)) }
+}
+
+/// GATESTEAL2 — register the CALLING task as the restartable singleton (the usb-pump's prologue). A no-op off a
+/// scheduled task.
+pub fn singleton_register(name: &'static str, entry: fn(usize), prio: u8) {
+    let Some(tid) = current_id() else { return };
+    SGL_NAME_PTR.store(name.as_ptr() as usize, Ordering::Release);
+    SGL_NAME_LEN.store(name.len(), Ordering::Release);
+    SGL_ENTRY.store(entry as usize, Ordering::Release);
+    SGL_PRIO.store(prio, Ordering::Relaxed);
+    SGL_HOME.store(meter_current_cpu(), Ordering::Release);
+    SGL_TID.store(tid, Ordering::Release);
+}
+
+/// GATESTEAL2 — the revenant fence and the singleton's liveness stamp. `true` = the calling task was superseded by a
+/// restart and must return from its entry now (it says so once); `false` stamps ms, core and count.
+pub fn singleton_superseded() -> bool {
+    let Some(me) = current_id() else { return false };
+    let reg = SGL_TID.load(Ordering::Acquire);
+    if reg != 0 && reg != me {
+        SGL_REVENANTS.fetch_add(1, Ordering::Release);
+        serial_println!(
+            "[sched] singleton revenant tid={} exits at its loop head on c{} (superseded by tid={}) (GATESTEAL2 B667)",
+            me,
+            meter_current_cpu(),
+            reg
+        );
+        return true;
+    }
+    let now = crate::arch::ms().max(1);
+    SGL_LAST_MS.store(now, Ordering::Relaxed);
+    SGL_LAST_CPU.store(meter_current_cpu(), Ordering::Relaxed);
+    SGL_STAMPS.fetch_add(1, Ordering::Relaxed);
+    if SGL_FRESH_MS.load(Ordering::Relaxed) == 0 && SGL_RESTARTS.load(Ordering::Relaxed) != 0 {
+        let _ = SGL_FRESH_MS.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed);
+    }
+    false
+}
+
+/// GATESTEAL2 — restart the registered singleton on `live` when it lives on `from`: a fresh instance at its loop head
+/// (see the block above). Returns `(superseded tid, fresh tid)`, or `None` when nothing is registered, it does not live
+/// on `from`, `live` does not dispatch or is parked by name, or another caller already restarted it for this death.
+pub fn singleton_restart(from: usize, live: usize) -> Option<(u64, u64)> {
+    let old = SGL_TID.load(Ordering::Acquire);
+    let entry = SGL_ENTRY.load(Ordering::Acquire);
+    if old == 0 || entry == 0 || from >= MAX_CPUS || live >= MAX_CPUS || from == live || !cpu_dispatching(live) || is_dead_core(live) {
+        return None;
+    }
+    if SGL_HOME.compare_exchange(from, live, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return None;
+    }
+    // SAFETY: `entry` was stored from a `fn(usize)` in `singleton_register`; fn pointers round-trip through usize.
+    let f: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(entry) };
+    let name = sgl_name();
+    let new = spawn_inner(name, f, live, live, SGL_PRIO.load(Ordering::Relaxed), TASK_STACK_SIZE, None, None);
+    SGL_TID.store(new, Ordering::Release);
+    SGL_FRESH_MS.store(0, Ordering::Release);
+    SGL_RESTART_OLD.store(old, Ordering::Relaxed);
+    SGL_RESTARTS.fetch_add(1, Ordering::AcqRel);
+    serial_println!(
+        ":: [sched] RESTART: {} tid={} on c{} in no queue the re-home could drain -> tid={} on c{} at its loop head (GATESTEAL2 B667: a fresh start, never a frame move; the old instance exits at its next fence) ::",
+        name,
+        old,
+        from,
+        new,
+        live
+    );
+    Some((old, new))
+}
+
+// ── `tests gatesteal2` — a synthetic W5 death of the pump's core with the pump parked mid-step ─────────────────────
+
+static HOLD2_SEM: Semaphore = Semaphore::new(0);
+static HOLD2_ARMED: AtomicBool = AtomicBool::new(false);
+/// 0 = not held, 1 = parked on the fixture's semaphore, 2 = released.
+static HOLD2_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// GATESTEAL2 — is the fixture's park armed for the CALLING task (the registered singleton)? One relaxed load when not.
+pub fn singleton_hold_armed() -> bool {
+    HOLD2_ARMED.load(Ordering::Relaxed) && current_id() == Some(SGL_TID.load(Ordering::Acquire))
+}
+
+/// GATESTEAL2 — the fixture's mid-step park: the singleton blocks on a semaphore (PARK_WAITQ: in no run queue, in no
+/// sleeper list, not current — flight 36's shape) until `tests gatesteal2` posts it.
+pub fn singleton_hold_maybe() {
+    if !singleton_hold_armed() || !HOLD2_ARMED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    HOLD2_STATE.store(1, Ordering::Release);
+    let _ = HOLD2_SEM.wait();
+    HOLD2_STATE.store(2, Ordering::Release);
+}
+
+#[cfg(feature = "wc")]
+fn hold2_wait(ms: u64, mut f: impl FnMut() -> bool) -> bool {
+    let t0 = crate::arch::ms();
+    loop {
+        if f() {
+            return true;
+        }
+        if crate::arch::ms().saturating_sub(t0) >= ms {
+            return false;
+        }
+        sleep_ms(10);
+    }
+}
+
+/// GATESTEAL2 — register `tests gatesteal2` once (from `tests::ensure_*`, never run at boot, R80).
+#[cfg(feature = "wc")]
+pub fn gatesteal2_ensure_tests() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) {
+        crate::tests::register("gatesteal2", gatesteal2_selftest);
+    }
+}
+
+/// `:: GATESTEAL2: death=c<n> current=<tid> moved_current=<0|1> rehome=<watch|none> pump_alive_ms=<n>
+/// gate_released_steps=<n> -> PASS|FAIL|SKIP :: new_tid= live=c<n> was=<parked|running> door=<alive|stale>
+/// revenant=<exited|stuck> hold=<parked|none>`. The pump parks at the end of its store-services step after one
+/// composite (declined by the pump-lane rule: `gate=released`); the fixture publishes a death of the pump's core through
+/// the steal's own gauges (`wm::comp_death_publish_fixture`) and drives the watch (`sessionwedge::look`), which re-homes
+/// through [`rehome_dead_core`] -> [`singleton_restart`]. PASS iff the restart superseded the parked tid, the fresh
+/// instance stamped on a live core within 500 ms of the death, it kept stamping (and `xhci-poll` is armed) — the door's
+/// cadence — the revenant exited at its fence once released, and at least one long step released the gate. Go-red by
+/// mutation: `sgl_moved = true` in `rehome_dead_core` -> `moved_current=0 rehome=none -> FAIL`.
+#[cfg(feature = "wc")]
+fn gatesteal2_selftest() {
+    let old = SGL_TID.load(Ordering::Acquire);
+    let dead = SGL_HOME.load(Ordering::Acquire);
+    if old == 0 || dead >= MAX_CPUS {
+        serial_println!(":: GATESTEAL2: death=- current=- moved_current=0 rehome=none pump_alive_ms=- gate_released_steps=- -> SKIP :: reason=no-singleton");
+        return;
+    }
+    if sibling_online_cpu(dead) == dead {
+        serial_println!(":: GATESTEAL2: death=c{} current={} moved_current=0 rehome=none pump_alive_ms=- gate_released_steps=- -> SKIP :: reason=no-sibling-core", dead, old);
+        return;
+    }
+    HOLD2_SEM.init();
+    let restarts0 = SGL_RESTARTS.load(Ordering::Acquire);
+    let rev0 = SGL_REVENANTS.load(Ordering::Acquire);
+    HOLD2_STATE.store(0, Ordering::Release);
+    HOLD2_ARMED.store(true, Ordering::Release);
+    let held = hold2_wait(3_000, || HOLD2_STATE.load(Ordering::Acquire) == 1);
+    if !held {
+        HOLD2_ARMED.store(false, Ordering::Release);
+        serial_println!(":: GATESTEAL2: death=c{} current={} moved_current=0 rehome=none pump_alive_ms=- gate_released_steps={} -> FAIL :: hold=none reason=the-pump-never-reached-its-store-services-fence", dead, old, crate::video::wm::pump_gate_released_steps());
+        return;
+    }
+    // The park's switch-back clears the core's published tid: wait for it, so the death finds the pump parked.
+    let _ = hold2_wait(50, || current_task_id(dead) != Some(old));
+    let t_death = crate::arch::ms();
+    crate::video::wm::comp_death_publish_fixture(dead);
+    let restarted = hold2_wait(1_500, || {
+        crate::sessionwedge::look(crate::arch::ms());
+        SGL_RESTARTS.load(Ordering::Acquire) != restarts0 && SGL_FRESH_MS.load(Ordering::Acquire) != 0
+    });
+    let moved_current = restarted && SGL_RESTART_OLD.load(Ordering::Relaxed) == old;
+    let alive_ms = if restarted { SGL_FRESH_MS.load(Ordering::Acquire).saturating_sub(t_death) } else { 0 };
+    let new = SGL_TID.load(Ordering::Acquire);
+    let live = SGL_HOME.load(Ordering::Acquire);
+    let live_ok = restarted && live != dead && SGL_LAST_CPU.load(Ordering::Relaxed) == live;
+    let s1 = SGL_STAMPS.load(Ordering::Relaxed);
+    sleep_ms(1_000);
+    let door = SGL_STAMPS.load(Ordering::Relaxed) > s1 && crate::drivers::xhci::poll_task_armed();
+    HOLD2_SEM.post();
+    let revenant = hold2_wait(1_500, || SGL_REVENANTS.load(Ordering::Acquire) != rev0);
+    let steps = crate::video::wm::pump_gate_released_steps();
+    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1;
+    serial_println!(
+        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} revenant={} hold={}",
+        dead,
+        old,
+        moved_current as u8,
+        if restarted { "watch" } else { "none" },
+        alive_ms,
+        steps,
+        if ok { "PASS" } else { "FAIL" },
+        if restarted { new as i64 } else { -1 },
+        if restarted { live as i64 } else { -1 },
+        if door { "alive" } else { "stale" },
+        if revenant { "exited" } else { "stuck" },
+        match HOLD2_STATE.load(Ordering::Acquire) { 1 => "parked", 2 => "released", _ => "none" }
+    );
 }
