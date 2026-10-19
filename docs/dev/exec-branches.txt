@@ -629,3 +629,15 @@ refs/heads/exec-rmbp-a2dp          e448dc14 IN-FLIGHT cloud wave36 A2DP
 refs/heads/exec-rmbp-geodebackup   d0b56d0c FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-filesearch    1c8b27a4 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-grantnames    116bb415 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-undokeys       3bbd2569 IN-FLIGHT cloud wave36 UNDOKEYS
+refs/heads/exec-rmbp-charrepeat     3bbd2569 IN-FLIGHT cloud wave36 CHARREPEAT
+refs/heads/exec-rmbp-micstage       3bbd2569 IN-FLIGHT cloud wave36 MICSTAGE
+refs/heads/exec-rmbp-geodemod       3bbd2569 IN-FLIGHT cloud wave36 GEODEMOD
+refs/heads/exec-rmbp-filesearch2    3bbd2569 IN-FLIGHT cloud wave36 FILESEARCH2
+refs/heads/exec-rmbp-prefstests     3bbd2569 IN-FLIGHT cloud wave36 PREFSTESTS
+refs/heads/exec-rmbp-helpf1         3bbd2569 IN-FLIGHT cloud wave36 HELPF1
+refs/heads/exec-rmbp-trashtoast     3bbd2569 IN-FLIGHT cloud wave36 TRASHTOAST
+refs/heads/exec-rmbp-lockprefs      3bbd2569 IN-FLIGHT cloud wave36 LOCKPREFS
+refs/heads/exec-rmbp-rootincompat   3bbd2569 IN-FLIGHT cloud wave36 ROOTINCOMPAT
+refs/heads/exec-rmbp-qvbar          3bbd2569 IN-FLIGHT cloud wave36 QVBAR
+refs/heads/exec-rmbp-softymic       3bbd2569 IN-FLIGHT cloud wave36 SOFTYMIC
