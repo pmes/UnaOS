@@ -129,7 +129,7 @@ fn say(bar_ms: u64) {
         serial_println!(
             ":: DESKTOPBUILT: prebuilt={} built_at={} bar_first_paint_ms={} battery={} dock={} swept={} -> {} ::",
             prebuilt as u8, if at_login { "login" } else { "stage" }, bar_ms, (battery == "painted") as u8, dock as u8, swept, crate::tests::boot_word(pass) // SMALLFIX7 (B501): a record at boot
-        );
+        ); #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] crate::install::abimage::desktop_built(pass); // ABIMAGE (B683): a PASS on the loader's trial boot promotes KERNEL.NEW -> KERNEL.ELF. LINE-NEUTRAL append, code first
     }
 }
 
