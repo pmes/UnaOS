@@ -28,9 +28,17 @@
 //! `[notify] bell press at=(<x>,<y>) box=(<x>,<y>,<w>,<h>) -> center-open|center-close|miss`, `[notify] center open
 //! items=<n> unread=<n> apps=<n> shown=<n> by=<bell|clock>` / `[notify] center close by=<bell|outside|action|clock>`
 //! (SOFTY3 B651: under Softy the taskbar's clock flyout opens and closes the Center with itself, `request_center`), `[notify] center
-//! dismiss title=<t> left=<n>`, and `tests notify` → `:: NOTIFY: stack_max=4 center=ok ring=64 badge=ok dnd=<0|1>
+//! dismiss title=<t> left=<n>`, and `tests notify` → `:: NOTIFY: stack_max=3 center=ok ring=64 badge=ok dnd=<0|1>
 //! posted=<n> center_kept=2 unread=2 -> PASS :: …`.
 //! Design: `docs/dev/evidence/rmbp-1005/notify.md`; the pane and the sound: `notifypane.md`.
+//!
+//! TOASTCAP (rmbp-ledger B674; DESIGN-LANGUAGE §3.6, BP-bar-18, BP-video-16): at most [`STACK_MAX`] = 3 cards on the
+//! glass, each [`CARD_MS`] = 5 s, its clock PAUSED while the pointer is over it (the time left is frozen, at least
+//! `HOVER_KEEP_MS` once it leaves); a post that finds the stack full WAITS in `St::wait` (FIFO) and shows when a
+//! slot frees — no card is closed to make room (R116: and every post is already in the ring the Center lists).
+//! Wire: `[notify] queued title=<t> waiting=<n>`; `tests toastcap` → `:: TOASTCAP: posted=12 shown_max=3 queued=9
+//! dropped=0 hover_pause=ok dialogs=<n> primary_max=1 return=ok esc=ok -> PASS ::` (the dialog half is
+//! `dialog::toastcap_leg`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -38,14 +46,16 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 
 use super::{metrics, theme, wm};
 
-/// Cards visible at once.
-pub const STACK_MAX: usize = 4;
+/// Cards visible at once (TOASTCAP B674: DESIGN-LANGUAGE §3.6 "at most 3 stacked", BP-bar-18).
+pub const STACK_MAX: usize = 3;
 /// The session ring the Center lists (NOTIFYCENTER B622: N=64).
 pub const RING: usize = 64;
-/// How long a card stays (the toast's time).
-pub const CARD_MS: u64 = super::toast::TOAST_MS;
+/// How long a card stays (TOASTCAP B674: DESIGN-LANGUAGE §3.6 "auto-dismiss after 5 s"; was the toast's 3 s).
+pub const CARD_MS: u64 = 5000;
 /// A hovered card keeps at least this much time once the pointer leaves.
 const HOVER_KEEP_MS: u64 = 1500;
+/// TOASTCAP (B674): the cards waiting for a slot are bounded by the ring (the Center keeps every one of them).
+const WAIT_MAX: usize = RING;
 
 /// No action (a press dismisses).
 pub const ACT_NONE: u8 = 0;
@@ -194,6 +204,8 @@ struct Card {
     surf: usize,
     /// NOTICEFIX (B491): the pass clock the card was shown at (the timeout close's `after_ms`).
     at: u64,
+    /// TOASTCAP (B674): the time left, frozen while the pointer is over the card (`0` = not hovered: the clock runs).
+    left: u64,
 }
 
 struct St {
@@ -202,9 +214,11 @@ struct St {
     ring: Vec<Note>,
     center: wm::WinId,
     seq: u32,
+    /// TOASTCAP (B674): posts that found the stack full, oldest first; each shows when a slot frees.
+    wait: Vec<Note>,
 }
 
-static ST: crate::sync::Mutex<St> = crate::sync::Mutex::new(St { cards: [None; STACK_MAX], ring: Vec::new(), center: wm::WIN_NONE, seq: 0 });
+static ST: crate::sync::Mutex<St> = crate::sync::Mutex::new(St { cards: [None; STACK_MAX], ring: Vec::new(), center: wm::WIN_NONE, seq: 0, wait: Vec::new() });
 static HEADLESS: AtomicBool = AtomicBool::new(false);
 static DND: AtomicBool = AtomicBool::new(false);
 static DND_LOADED: AtomicBool = AtomicBool::new(false);
@@ -221,9 +235,14 @@ fn wire() -> bool {
 /// The panel size the cards were laid out on (`w << 32 | h`), for the press router.
 static PANEL: AtomicU64 = AtomicU64::new(0);
 /// Per stack slot: the card's seq (0 = empty slot), for the press router.
-static SLOT_SEQ: [AtomicU32; STACK_MAX] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+static SLOT_SEQ: [AtomicU32; STACK_MAX] = [const { AtomicU32::new(0) }; STACK_MAX];
 /// Per stack slot: the card has a button.
-static SLOT_BTN: [AtomicBool; STACK_MAX] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+static SLOT_BTN: [AtomicBool; STACK_MAX] = [const { AtomicBool::new(false) }; STACK_MAX];
+/// TOASTCAP (B674): cards shown (every show, a promoted one included), waiting cards shed past [`WAIT_MAX`] (they stay
+/// in the ring), and the fixture's pointer (`x << 32 | y`; `u64::MAX` = none) — the headless pass has no cursor.
+static SHOWN: AtomicU32 = AtomicU32::new(0);
+static WAIT_SHED: AtomicU32 = AtomicU32::new(0);
+static FIX_PTR: AtomicU64 = AtomicU64::new(u64::MAX);
 /// Requests the press router records for [`service`].
 static REQ_DISMISS: AtomicU32 = AtomicU32::new(0);
 static REQ_ACT: AtomicU32 = AtomicU32::new(0);
@@ -246,7 +265,7 @@ fn recount(ring: &[Note]) {
 }
 
 const SURF_N: usize = STACK_MAX + 1; // + the Center
-static SURF_AT: [AtomicUsize; SURF_N] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static SURF_AT: [AtomicUsize; SURF_N] = [const { AtomicUsize::new(0) }; SURF_N];
 
 fn surf(i: usize) -> &'static mut [u32] {
     let (w, h) = if i == STACK_MAX { (CW, CH) } else { (W, H) };
@@ -511,10 +530,31 @@ fn close_card(st: &mut St, i: usize, by: &str) -> Option<Note> {
 }
 
 fn show_card(st: &mut St, n: Note, pw: usize, now: u64) {
-    if st.cards[STACK_MAX - 1].is_some() {
-        let _ = close_card(st, STACK_MAX - 1, "overflow");
-        restack(st, pw);
+    if st.cards[STACK_MAX - 1].is_some() || !st.wait.is_empty() {
+        // TOASTCAP (B674): the stack is full (or older posts already wait) — this one waits its turn; nothing is
+        // closed to make room. Past WAIT_MAX the OLDEST waiting card is shed from the wait (never from the ring).
+        if st.wait.len() >= WAIT_MAX {
+            let old = st.wait.remove(0);
+            WAIT_SHED.fetch_add(1, Ordering::Relaxed);
+            if wire() { serial_println!("[notify] closed by=overflow title={} (kept in the center)", s(old.title())); }
+        }
+        st.wait.push(n);
+        if wire() { serial_println!("[notify] queued title={} waiting={}", s(n.title()), st.wait.len()); }
+        return;
     }
+    show_now(st, n, pw, now);
+}
+
+/// TOASTCAP (B674): the waiting cards take the free slots, oldest first (each lands on top: it is newer than the
+/// cards it joins). Not while the Center is open — the Center lists them, as it does every post made then.
+fn promote(st: &mut St, pw: usize, now: u64) {
+    while st.cards[STACK_MAX - 1].is_none() && !st.wait.is_empty() && !CENTER_OPEN.load(Ordering::Relaxed) {
+        let n = st.wait.remove(0);
+        show_now(st, n, pw, now);
+    }
+}
+
+fn show_now(st: &mut St, n: Note, pw: usize, now: u64) {
     let sf = free_surf(st);
     paint_card(sf, &n);
     // newest on top: shift the stack down one slot, then open the new card at slot 0
@@ -525,7 +565,8 @@ fn show_card(st: &mut St, n: Note, pw: usize, now: u64) {
     let f0 = wm::focus_asid();
     let (x, y, _, _) = card_rect(pw, 0);
     let win = open_row(sf, x, y);
-    st.cards[0] = Some(Card { n, win, until: now.saturating_add(CARD_MS).max(1), surf: sf, at: now }); // NOTICEFIX (B491): the pass's clock, never a second read of it
+    st.cards[0] = Some(Card { n, win, until: now.saturating_add(CARD_MS).max(1), surf: sf, at: now, left: 0 }); // NOTICEFIX (B491): the pass's clock, never a second read of it
+    SHOWN.fetch_add(1, Ordering::Relaxed);
     restack(st, pw);
     let kept = wm::focus_asid() == f0;
     if !kept {
@@ -741,7 +782,7 @@ fn pass(now: u64) {
     let act = REQ_ACT.swap(0, Ordering::AcqRel);
     let idis = REQ_ITEM_DISMISS.swap(0, Ordering::AcqRel);
     let iact = REQ_ITEM_ACT.swap(0, Ordering::AcqRel);
-    let busy = k > 0 || creq != 0 || dis != 0 || act != 0 || idis != 0 || iact != 0 || CENTER_STALE.load(Ordering::Relaxed) || ST.try_lock().map(|g| g.cards.iter().any(|c| c.is_some())).unwrap_or(true);
+    let busy = k > 0 || creq != 0 || dis != 0 || act != 0 || idis != 0 || iact != 0 || CENTER_STALE.load(Ordering::Relaxed) || ST.try_lock().map(|g| g.cards.iter().any(|c| c.is_some()) || !g.wait.is_empty()).unwrap_or(true);
     if !busy {
         return;
     }
@@ -843,7 +884,8 @@ fn pass(now: u64) {
     }
     // hover pauses; time closes
     let ptr = if headless {
-        None
+        let f = FIX_PTR.load(Ordering::Relaxed); // TOASTCAP (B674): the fixture's pointer
+        if f == u64::MAX { None } else { Some(((f >> 32) as usize, (f & 0xffff_ffff) as usize)) }
     } else {
         #[cfg(all(target_arch = "x86_64", feature = "wc"))]
         {
@@ -860,10 +902,16 @@ fn pass(now: u64) {
     for i in 0..STACK_MAX {
         let Some(c) = st.cards[i].as_mut() else { continue };
         if ptr.map(|(x, y)| inside(x, y, card_rect(pw, i))).unwrap_or(false) {
-            c.until = c.until.max(now.saturating_add(HOVER_KEEP_MS));
+            // TOASTCAP (B674): PAUSED — the time left is frozen at the hover's first pass (at least HOVER_KEEP_MS)
+            // and the deadline rides `now` with it, so leaving resumes the clock where it stopped.
+            if c.left == 0 {
+                c.left = c.until.saturating_sub(now).max(HOVER_KEEP_MS);
+            }
+            c.until = now.saturating_add(c.left);
             hot = c.n.seq;
             continue;
         }
+        c.left = 0;
         if now >= c.until {
             let after = now.saturating_sub(c.at);
             if wire() { serial_println!("[notify] toast close reason=timeout after_ms={}", after); } // NOTICEFIX (B491)
@@ -874,6 +922,7 @@ fn pass(now: u64) {
     if closed {
         restack(&mut st, pw);
     }
+    promote(&mut st, pw, now); // TOASTCAP (B674): a freed slot (time, click, action, a closed Center) takes the oldest waiting card
     craft_hover(&st, hot); // MENUSCRAFT (B642): the toast's hover x, repainted on the edge
     drop(st);
     if UNREAD.load(Ordering::Relaxed) != unread0 && !headless {
@@ -883,7 +932,7 @@ fn pass(now: u64) {
 
 // ── `tests notify` (model-only: headless, the real post / service / press code) ──────────────────────────
 
-type Held = ([Option<Card>; STACK_MAX], Vec<Note>, wm::WinId, u32, bool, bool, bool, [u32; STACK_MAX]);
+type Held = ([Option<Card>; STACK_MAX], Vec<Note>, wm::WinId, u32, bool, bool, bool, [u32; STACK_MAX], Vec<Note>);
 
 fn hold() -> Held {
     super::notifypane::bypass(true, true); // NOTIFYPANE: the fixtures never read the user's rules or schedule
@@ -891,12 +940,13 @@ fn hold() -> Held {
     let cards = core::mem::replace(&mut g.cards, [None; STACK_MAX]);
     let ring = core::mem::take(&mut g.ring);
     let center = core::mem::replace(&mut g.center, wm::WIN_NONE);
+    let wait = core::mem::take(&mut g.wait); // TOASTCAP (B674)
     drop(g);
     let mut seqs = [0u32; STACK_MAX];
     for (i, s) in SLOT_SEQ.iter().enumerate() {
         seqs[i] = s.swap(0, Ordering::AcqRel);
     }
-    (cards, ring, center, UNREAD.swap(0, Ordering::AcqRel), CENTER_OPEN.swap(false, Ordering::AcqRel), DND.load(Ordering::Relaxed), HEADLESS.swap(true, Ordering::AcqRel), seqs)
+    (cards, ring, center, UNREAD.swap(0, Ordering::AcqRel), CENTER_OPEN.swap(false, Ordering::AcqRel), DND.load(Ordering::Relaxed), HEADLESS.swap(true, Ordering::AcqRel), seqs, wait)
 }
 
 fn restore(h: Held) {
@@ -906,7 +956,9 @@ fn restore(h: Held) {
         g.cards = h.0;
         g.ring = h.1;
         g.center = h.2;
+        g.wait = h.8; // TOASTCAP (B674)
     }
+    FIX_PTR.store(u64::MAX, Ordering::Relaxed);
     UNREAD.store(h.3, Ordering::Relaxed);
     CENTER_OPEN.store(h.4, Ordering::Relaxed);
     DND.store(h.5, Ordering::Relaxed);
@@ -933,12 +985,13 @@ pub fn test() {
     let h = hold();
     DND.store(false, Ordering::Relaxed);
     let t0 = 1_000_000u64;
-    // (1) the stack: six posts, four cards, newest on top, the toast's front included.
+    // (1) the stack: three posts, three cards (TOASTCAP B674: STACK_MAX is 3 and a fourth would WAIT, `tests toastcap`),
+    // newest on top, the toast's front included.
     // NOTIFYCENTER (B622): the toast posts in its OWN pass after the five. One pass drains the toast queue BEFORE the
     // inbound queue (`take_inbound`), so a same-pass toast was the OLDEST card and closed by overflow — flight 34's
     // `-> FAIL` with every printed field ok: `top` was false and `stack_max=` printed the count (4) either way.
     let mut posted_ok = true;
-    for k in 0..5u8 {
+    for k in 0..(STACK_MAX as u8 - 1) {
         posted_ok &= post_full(b"quarry", &[b'N', b'0' + k], b"fixture line", b"", ACT_NONE, b"");
     }
     pass(t0);
@@ -972,6 +1025,7 @@ pub fn test() {
         }
     }
     MUTE.store(false, Ordering::Relaxed);
+    ST.lock().wait.clear(); // TOASTCAP (B674): the bulk's waiting cards are the ring's (kept there); the legs below count cards
     let ring_n = ST.lock().ring.len();
     let ring_last = ST.lock().ring.last().map(|n| n.line() == b"104").unwrap_or(false);
     let ring_ok = ring_n == RING && ring_last;
@@ -1057,6 +1111,76 @@ pub fn toast_fixture() -> bool {
     let kept = FOCUS_MOVED.load(Ordering::Relaxed) == moved0;
     restore(h);
     posted && up && gone && kept
+}
+
+/// `tests toastcap` (TOASTCAP, rmbp-ledger B674; DESIGN-LANGUAGE §3.6/§3.8, BP-bar-18), model-only over the REAL post /
+/// pass code: twelve posts, at most three cards on the glass, nine waiting, none lost (every post in the ring, nothing
+/// shed or refused); a hovered card outlives four of its times and leaves on its frozen remainder; every card shows
+/// in turn. The dialog half is [`super::dialog::toastcap_leg`]: one `accent.fill` button per view, Return accepts and
+/// Escape cancels on every view.
+pub fn toastcap_selftest() {
+    const N: usize = 12;
+    let h = hold();
+    DND.store(false, Ordering::Relaxed);
+    MUTE.store(true, Ordering::Relaxed);
+    let (d0, shed0, shown0) = (DROPPED.load(Ordering::Relaxed), WAIT_SHED.load(Ordering::Relaxed), SHOWN.load(Ordering::Relaxed));
+    let t0 = 4_000_000u64;
+    let mut posted = 0usize;
+    let mut shown_max = 0usize;
+    for k in 0..N {
+        let t = [b'T', b'0' + (k / 10) as u8, b'0' + (k % 10) as u8];
+        if post_full(b"system", &t, b"toastcap fixture", b"", ACT_NONE, b"") {
+            posted += 1;
+        }
+        pass(t0); // one pass per post: the inbound queue (IQ) is never the limit measured here
+        shown_max = shown_max.max(banners());
+    }
+    let queued = ST.lock().wait.len();
+    let in_ring = ST.lock().ring.len();
+    // hover: the top card at t0+1000 (4000 ms left), held over 4x CARD_MS; it stays, its neighbours time out
+    let pk = PANEL.load(Ordering::Relaxed);
+    let pw = (pk >> 32) as usize;
+    let r0 = card_rect(pw, 0);
+    let hseq = ST.lock().cards[0].map(|c| c.n.seq).unwrap_or(0);
+    FIX_PTR.store(((r0.0 + r0.2 / 2) as u64) << 32 | (r0.1 + r0.3 / 2) as u64, Ordering::Relaxed);
+    let up = |seq: u32| ST.lock().cards.iter().flatten().any(|c| c.n.seq == seq);
+    pass(t0 + 1000);
+    pass(t0 + 1000 + 4 * CARD_MS);
+    shown_max = shown_max.max(banners());
+    let held = hseq != 0 && up(hseq);
+    FIX_PTR.store(u64::MAX, Ordering::Relaxed);
+    let t_leave = t0 + 1000 + 4 * CARD_MS;
+    pass(t_leave + (CARD_MS - 1000) - 1);
+    shown_max = shown_max.max(banners());
+    let resumed = up(hseq); // the frozen 4000 ms, not a fresh 5000, and not gone at once
+    pass(t_leave + (CARD_MS - 1000) + 1);
+    shown_max = shown_max.max(banners());
+    let left = !up(hseq);
+    let hover_ok = held && resumed && left;
+    // drain: every waiting card shows in turn, three at most
+    let mut t = t_leave + CARD_MS;
+    for _ in 0..(2 * N) {
+        if banners() == 0 && ST.lock().wait.is_empty() {
+            break;
+        }
+        t += CARD_MS + 1;
+        pass(t);
+        shown_max = shown_max.max(banners());
+    }
+    let shown = (SHOWN.load(Ordering::Relaxed) - shown0) as usize;
+    let drained = banners() == 0 && ST.lock().wait.is_empty();
+    let dropped = (DROPPED.load(Ordering::Relaxed) - d0) as usize + (WAIT_SHED.load(Ordering::Relaxed) - shed0) as usize + N.saturating_sub(in_ring);
+    MUTE.store(false, Ordering::Relaxed);
+    restore(h);
+    let (dialogs, primary_max, ret_ok, esc_ok) = super::dialog::toastcap_leg();
+    let toast_ok = posted == N && shown_max == STACK_MAX && queued == N - STACK_MAX && dropped == 0 && hover_ok && shown == N && drained;
+    let ok = toast_ok && dialogs > 0 && primary_max == 1 && ret_ok && esc_ok;
+    let w = |b: bool| if b { "ok" } else { "FAIL" };
+    serial_println!(
+        ":: TOASTCAP: posted={} shown_max={} queued={} dropped={} hover_pause={} dialogs={} primary_max={} return={} esc={} -> {} :: shown={} drained={} card_ms={} held={} resumed={} left={}",
+        posted, shown_max, queued, dropped, w(hover_ok), dialogs, primary_max, w(ret_ok), w(esc_ok), if ok { "PASS" } else { "FAIL" },
+        shown, w(drained), CARD_MS, w(held), w(resumed), w(left)
+    );
 }
 
 /// NOTIFYPANE (B435): `tests notifypane`'s leg over the real pass — `(block, center, sound_gate)`: an app turned

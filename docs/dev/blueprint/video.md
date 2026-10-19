@@ -25,6 +25,7 @@
 | BP-video-13 | A screen capture has an owner (the session user's Desktop); with no session it is refused; root takes no screenshots (R67). | `unaos/crates/kernel/src/video/prtscr.rs:83` `unaos/crates/kernel/src/video/prtscr.rs:175`; R67 | `tests prtscr` |
 | BP-video-14 | A ring-3 present returns 0 for every success on both arches; no pacing status exists (renderers run unpaced). | `unaos/crates/una-abi/src/lib.rs:233-252` | compile |
 | BP-video-15 | DESKTOPCRAFT is paint-only: no hit box, strip rect or router changes from the look's paint. | `docs/dev/OS/05_USER_EXPERIENCE/DESKTOPCRAFT.md:16-19` | `tests desktopcraft` |
+| BP-video-16 | Toasts: at most 3 cards on the glass, 5 s each, the clock paused while hovered; a post that finds the stack full WAITS and is never closed to make room (the Center keeps every post, R116). Dialogs: one `accent.fill` button per view (the default); Return accepts, Escape cancels, on every view (BP-bar-18, DESIGN-LANGUAGE §3.6/§3.8). | `unaos/crates/kernel/src/video/notify.rs` (`STACK_MAX`, `CARD_MS`, `show_card`/`promote`, the hover arm of `pass`); `unaos/crates/kernel/src/video/dialog.rs` (`paint`'s `PRIMARY`, `route_key`) | `tests toastcap` (B674) |
 
 ## 3. Seams
 - `wm` may be called by: kernel apps (`facet`, `quarry`, `settings`, `fileview`, `login`, …), ring-3 window syscalls (ring3.md), the input router (input.md), `splash`, `desktopbuild`.

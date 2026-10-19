@@ -486,6 +486,10 @@ token. Every state follows §2.7, and every motion follows §2.6.
   right-aligned.
 * At most 3 stacked, 8 apart. Auto-dismiss after 5 s, paused while hovered. Enter is a slide in from the edge plus a
   fade (`motion.enter`). Exit is `motion.exit`. Under Reduce motion, both are a fade.
+* **Built, the counts** (TOASTCAP, rmbp-ledger B674, wave 36): `video/notify.rs` holds `STACK_MAX = 3` and
+  `CARD_MS = 5000`; a hovered card's time left is frozen until the pointer leaves; a post that finds the stack full
+  waits (oldest first) and shows when a slot frees, and is never closed to make room (R116: the Center keeps every
+  post). The card's geometry and motion above are not part of this build. Witness: `tests toastcap`.
 
 ### 3.7 Menus (menu-bar menus, context menus, the crystal)
 
@@ -507,6 +511,10 @@ token. Every state follows §2.7, and every motion follows §2.6.
 * **Softy (content dialog)**: 400–540 wide, radius 8, `type.title3` title left, body left, padding 24. A **footer band**
   80 tall in `surface.window` with buttons right-aligned at equal width; the primary button is `accent.fill`.
 * Both: Return = default, Escape = cancel, focus starts on the default button, one primary action [S79].
+* **Built, the rules** (TOASTCAP, rmbp-ledger B674, wave 36): `video/dialog.rs` `paint` fills only the default
+  button with `accent.fill` and counts what it filled; Return answers the default and Escape the Cancel button (a
+  one-button alert's Escape dismisses it) on every caller's button row, the power confirm and the bus dialog. The
+  Una/Softy geometry above is not part of this build. Witness: `tests toastcap` (`primary_max=1 return=ok esc=ok`).
 
 ### 3.9 The login screen
 
