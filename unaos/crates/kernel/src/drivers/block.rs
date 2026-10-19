@@ -3843,3 +3843,21 @@ pub fn pin_boot_medium_once() {
 /// USBSTOR: no Sdhc handle in this image — nothing to pin.
 #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
 pub fn pin_boot_medium_once() {}
+
+// QEMUCLASS1 (rmbp-ledger B604) — TAIL-APPENDED (no line above moves). QEMUIMAGE26 booted from the AHCI ESP with
+// QEMU's Sdhc card present: `pin_boot_medium_once` read the card, did not find the loader's serial on it and stored 2
+// (`[block] boot medium=not-sdhc serial=0xfabe1afd`), and USBSTOR printed `boot_medium_kept=0 … -> FAIL
+// reason=boot-medium-not-pinned` about a pin whose subject (a boot from the Sdhc card, R95) was never there.
+
+/// USBSTOR: `true` only when the pin was decided AGAINST the card on a named serial — the loader handed a boot
+/// volume serial and the Sdhc card's FAT volumes do not carry it. `false` while undecided, when kept, and when the
+/// loader named nothing (serial 0: no proof either way, the fixture stays red).
+pub fn boot_medium_not_sdhc() -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
+    {
+        return BOOT_PIN.load(core::sync::atomic::Ordering::Acquire) == 2
+            && BOOT_VOLUME_SERIAL.load(core::sync::atomic::Ordering::Acquire) != 0;
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
+    false
+}

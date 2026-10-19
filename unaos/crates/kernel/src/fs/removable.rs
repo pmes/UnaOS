@@ -283,9 +283,9 @@ fn witness() {
     let names: Vec<String> = MOUNTED.lock().iter().map(|v| alloc::format!("{}:{}", v.name, v.fs)).collect();
     let refused = REFUSED.lock().len();
     let global_usb = fat::source_unit(BlockSource::Default).is_some();
-    let ok = kept && !global_usb && pw == "ok" && refused == 0;
+    let ok = kept && !global_usb && pw == "ok" && refused == 0; let nsd = !kept && crate::drivers::block::boot_medium_not_sdhc(); let skip = nsd && refused == 0; // QEMUCLASS1 (B604): the pin's subject is a boot from the Sdhc card (R95); a boot the pin found elsewhere has no medium to keep — SKIP, unless a disk was refused (a red on any boot)
     let reason = if !kept {
-        "boot-medium-not-pinned"
+        if skip { "boot-medium-not-sdhc" } else if nsd { "unmountable-disk" } else { "boot-medium-not-pinned" }
     } else if global_usb {
         "usb-in-global-slot"
     } else if pw != "ok" {
@@ -302,7 +302,7 @@ fn witness() {
         pw,
         if names.is_empty() { String::from("-") } else { names.join(",") },
         if HOTPLUG.load(Ordering::Relaxed) == 1 { "ok" } else { "-" },
-        if ok { "PASS" } else { "FAIL" },
+        if ok { "PASS" } else if skip { "SKIP reason=boot-medium-not-sdhc" } else { "FAIL" },
         reason,
         refused
     );
