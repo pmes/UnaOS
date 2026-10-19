@@ -1941,7 +1941,7 @@ fn pace_admit(id: WinId, exempt: bool) -> bool {
 /// bounded scan of [`MAX_WINDOWS`] stamps, no locks.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn pace_service() {
-    use core::sync::atomic::Ordering::Relaxed;
+    use core::sync::atomic::Ordering::Relaxed; gesture_service(); // PINCHZOOM (B735): a three-finger swipe the trackpad latched is acted on here, ahead of the pacer's early return (one relaxed load when none). LINE-NEUTRAL fold, code first
     if !PACE_PENDING_ANY.swap(false, Relaxed) {
         return;
     }
@@ -31175,4 +31175,51 @@ fn lock_veiled(r: &Window) -> bool {
         let _ = r;
         false
     }
+}
+
+// PINCHZOOM (rmbp-ledger B735) — TAIL-APPENDED, so no line above moves. The three-finger swipe's route: the trackpad
+// decoder may not call the window system (BP-input §3), so `gestures::feed` latches the swipe and [`pace_service`] (the
+// ~1 kHz device-service pass, main-loop context, unmasked — the context the x86 router acts in) takes it here.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn gesture_service() {
+    let d = super::zoom::gestures::take_swipe();
+    if d != 0 {
+        let _ = gesture_swipe(d);
+    }
+}
+
+/// PINCHZOOM (B735): a three-finger swipe under WINCYCLE's focus rule. `dir > 0` (fingers moved left) = the next
+/// window — the router's `CycleWindow` arm exactly: [`cycle_pick`] (the least-recently-raised app row), the keyboard
+/// handed to its owner, [`cycle_commit`]. `dir < 0` = the previous — the rotation undone: every row under the top
+/// raised bottom-first, then the row under the old top focused and raised, so a next then a previous is the stack the
+/// user started from. A live drag is cancelled first. Fewer than two app windows (or a locked session's veil, which
+/// hides them from [`cycle_order`]): nothing. Returns the row brought to the front.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn gesture_swipe(dir: i8) -> Option<WinId> {
+    let mut ord = alloc::vec::Vec::new();
+    let n = cycle_order(&mut ord);
+    if n < 2 || dir == 0 {
+        return None;
+    }
+    if drag_active() != WIN_NONE {
+        drag_cancel("gesture-swipe");
+    }
+    if dir > 0 {
+        let (id, owner) = cycle_pick()?;
+        crate::arch::x86_64::syscall::user_input_set_active(owner);
+        cycle_commit(id, owner);
+        serial_println!("[wm-act] action=swipe dir=next win={} owner={:#x} windows={}", id, owner, n);
+        return Some(id);
+    }
+    let id = ord[1];
+    let owner = info(id)?.owner_asid;
+    for &r in ord[2..n].iter().rev() {
+        let _ = raise_one(r);
+    }
+    crate::arch::x86_64::syscall::user_input_set_active(owner);
+    focus_changed(owner);
+    let ok = raise_one(id);
+    wm_act("swipe", id, owner, if ok { "action=swipe prev raised" } else { "action=swipe prev refused" }, 0, 0);
+    serial_println!("[wm-act] action=swipe dir=prev win={} owner={:#x} windows={}", id, owner, n);
+    Some(id)
 }

@@ -118,7 +118,7 @@ pub(super) fn shape(f: Wsp2Frame, buttons: u8, dx: i32, dy: i32, len: usize, _id
         if s.held == Held::Secondary { evs[ne] = Some(Event::Button(0x00)); ne += 1; }
         s.held = Held::None;
     }
-    s.btn_prev = phys;
+    s.btn_prev = phys; #[cfg(feature = "wc")] let (dx, dy) = if crate::video::zoom::gestures::feed(n, (f.x0, f.y0, f.touch0), (f.x1, f.y1, f.touch1), now, phys || s.held != Held::None, !three_on) { (0, 0) } else { (dx, dy) }; // PINCHZOOM (B735): the contact seam — the frame's two records to the gesture recogniser (pinch -> the lens, the three-finger swipe -> the window cycle); while it claims the fingers no wheel detent and no pointer motion leave this frame. LINE-NEUTRAL fold, code first
     let three = three_on && n >= 3 && !phys;
     if three && !s.three_held { wit(&mut s, 4, n, len, format_args!("hold=primary")); }
     s.three_held = three;
