@@ -25,6 +25,7 @@
 | BP-video-13 | A screen capture has an owner (the session user's Desktop); with no session it is refused; root takes no screenshots (R67). | `unaos/crates/kernel/src/video/prtscr.rs:83` `unaos/crates/kernel/src/video/prtscr.rs:175`; R67 | `tests prtscr` |
 | BP-video-14 | A ring-3 present returns 0 for every success on both arches; no pacing status exists (renderers run unpaced). | `unaos/crates/una-abi/src/lib.rs:233-252` | compile |
 | BP-video-15 | DESKTOPCRAFT is paint-only: no hit box, strip rect or router changes from the look's paint. | `docs/dev/OS/05_USER_EXPERIENCE/DESKTOPCRAFT.md:16-19` | `tests desktopcraft` |
+| BP-video-16 | Settings rows are ONE table, `settings::MAP`: every `prefs::key::ALL` key is on exactly one row (`system.settings.tab` on the tab column), every row names declared keys; the search field (filter, Return to the row), the launcher's `row_of_key` and the fixture read it; every label is reached by at most 2 typed keys + Return (BP-bar-17, R118). | `unaos/crates/kernel/src/video/settings.rs:3255` `unaos/crates/kernel/src/video/settings.rs:3319` `unaos/crates/kernel/src/prefs.rs:104` | `tests settingsmap` (`:: SETTINGSMAP: … -> PASS ::`) |
 
 ## 3. Seams
 - `wm` may be called by: kernel apps (`facet`, `quarry`, `settings`, `fileview`, `login`, …), ring-3 window syscalls (ring3.md), the input router (input.md), `splash`, `desktopbuild`.
@@ -34,7 +35,7 @@
 
 ## 4. Wire
 `[wc-x] desktop-clear panel=<w>x<h> …` · `[desktop] built …` · `[look] switch to= from= ms= windows_rechromed=` · `:: WALLPAPER: src= … -> PASS ::` ·
-`:: DESKTOPCRAFT: cost … frame_us= budget_us=16667 … -> UNDER|OVER ::` · `:: LOGINZ: … ::` · `[wm] limit windows= procs=` · `:: GPUBLIT: … blitter=gpu` (Kepler takeover).
+`:: DESKTOPCRAFT: cost … frame_us= budget_us=16667 … -> UNDER|OVER ::` · `:: LOGINZ: … ::` · `:: SETTINGSMAP: keys= rows= orphans=0 unrowed=0 search=ok(<label>:<n>) -> PASS ::` · `[wm] limit windows= procs=` · `:: GPUBLIT: … blitter=gpu` (Kepler takeover).
 
 ## 5. Ruled, unbuilt
 - R121: the Una look's full refinement waits on 3D acceleration (Kepler GR, gen7 R10+); R101 keeps one executor on each GPU.
