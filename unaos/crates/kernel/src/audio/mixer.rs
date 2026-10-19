@@ -291,7 +291,7 @@ fn mix_alive(_: usize, _: u64) -> bool {
 
 fn release(o: &mut Out) {
     match o.kind {
-        #[cfg(feature = "uvc")]
+        #[cfg(feature = "uac")]
         OUT_USB => crate::drivers::usb::uac::finish(),
         #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
         OUT_HDA => {
@@ -305,7 +305,7 @@ fn release(o: &mut Out) {
 
 fn acquire(o: &mut Out, kind: u8) -> bool {
     let r: Result<u32, &'static str> = match kind {
-        #[cfg(feature = "uvc")]
+        #[cfg(feature = "uac")]
         OUT_USB => crate::drivers::usb::uac::begin().map(|_| 0),
         #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
         OUT_HDA => crate::drivers::hda::play::r3_open(MIX_ROW, MIX_GEN, mix_alive, 0, RATE as u64, 2, 16).map_err(|(_, why)| why),
@@ -333,7 +333,7 @@ fn acquire(o: &mut Out, kind: u8) -> bool {
 fn queued(o: &Out) -> u64 {
     let pend = ((o.pend.len() - o.pend_off) / 4) as u64;
     let held = match o.kind {
-        #[cfg(feature = "uvc")]
+        #[cfg(feature = "uac")]
         OUT_USB => (crate::drivers::usb::uac::queued() / 4) as u64,
         #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
         OUT_HDA => {
@@ -355,7 +355,7 @@ fn marks(kind: u8) -> (u64, u64) {
 fn deliver(o: &mut Out) -> bool {
     while o.pend_off < o.pend.len() {
         let took: i64 = match o.kind {
-            #[cfg(feature = "uvc")]
+            #[cfg(feature = "uac")]
             OUT_USB => crate::drivers::usb::uac::write(&o.pend[o.pend_off..]) as i64,
             #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
             OUT_HDA => crate::drivers::hda::play::r3_write(o.hda as u64, MIX_ROW, MIX_GEN, &o.pend[o.pend_off..]),

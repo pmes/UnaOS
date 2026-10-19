@@ -306,6 +306,7 @@ fn usb_claim(slot: u8, vid: u16, pid: u16, roles: u8) -> (&'static str, &'static
         if ptp::is_open() && ptp::vid_pid() == (vid, pid) {
             return if ptp::is_mtp_session() { ("mtp", "up", "Phone (MTP)") } else { ("ptp", "up", "Camera (PTP)") };
         }
+        #[cfg(feature = "uac")]
         if crate::drivers::usb::uac::device().is_some_and(|(v, p, _)| (v, p) == (vid, pid)) {
             return ("uac", "up", "Audio device");
         }

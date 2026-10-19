@@ -174,7 +174,7 @@ pub fn stage_image(path: &str) -> Result<Staged, &'static str> {
 
 /// [`stage_image`]'s body: the source is read through `src` (the namespace, or the fixture's RAM volume), every ESP
 /// write goes through the namespace's `/boot`. `from` and `sha` land in the [`SIDECAR`] (the pane's "from where").
-fn stage_core(src: &MountTable, path: &str, from: &str, sha: &str) -> Result<Staged, &'static str> {
+fn stage_core(src: &MountTable, path: &str, from: &str, src_sha: &str) -> Result<Staged, &'static str> {
     let mt = crate::shell::vfs_mount_table();
     let st = src.stat(path).map_err(|_| "source-missing")?;
     if st.kind != NodeKind::File || st.size == 0 {
@@ -230,7 +230,7 @@ fn stage_core(src: &MountTable, path: &str, from: &str, sha: &str) -> Result<Sta
     let mut row = [0u8; kelfsha::ROW_MAX];
     let rn = kelfsha::row(&sha, abslot::NEW, kelfsha::SLOT_B, kelfsha::kelf_of(&head).unwrap_or(kelf), &mut row);
     kelf_put_row(&mt, kelfsha::SLOT_B, Some(&row[..rn]))?;
-    let side = format!("src={} sha={} at={} kelf={:#x}\n", clean(from, 40), clean(sha, 8), crate::clock::unix_now().unwrap_or(0), kelf);
+    let side = format!("src={} sha={} at={} kelf={:#x}\n", clean(from, 40), clean(src_sha, 8), crate::clock::unix_now().unwrap_or(0), kelf);
     put(&mt, SIDECAR, side.as_bytes())?; // UPDATEUI (B726): before STAGE.REC, so the record stays the stage's last write
     let mut rec = [0u8; abslot::REC_MAX];
     let n = abslot::stage_record(kelf, st.size, crc, &mut rec);
