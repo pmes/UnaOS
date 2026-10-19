@@ -71,6 +71,15 @@ impl RowDecoder {
         Ok(d)
     }
 
+    /// The coding's name on the wire (`[raw] arw=`): `craw` (Sony ARW 2.x compressed, 8-bit delta blocks) or
+    /// `plain` (uncompressed 16-bit containers, 12/14/16-bit samples).
+    pub fn coding(&self) -> &'static str {
+        match self.kind {
+            Kind::Plain { .. } => "plain",
+            Kind::Craw { .. } => "craw",
+        }
+    }
+
     /// Bytes one coded row occupies.
     pub fn row_bytes(&self) -> usize {
         match self.kind {

@@ -27,7 +27,7 @@
 | Amber Bytes | Disks | `amber_bytes` | `amber_core` (GPT) in kernel; `unaos/crates/kernel/src/video/instgui.rs` charter |
 | Aulë | Forge | `aule` | selfhost (`unaos/crates/kernel/src/selfhost/`) — owner `unverified` |
 | Comscan | Signals | `comscan` | none found |
-| Facet | Images | `facet` | kernel viewer `unaos/crates/kernel/src/video/facet.rs` (charter Facet) |
+| Facet | Images | `facet` | kernel viewer `unaos/crates/kernel/src/video/facet.rs` (charter Facet); camera raw through `unaos/libs/media/raw_core` (shared-core) in `unaos/crates/kernel/src/video/facet_raw.rs`: the embedded preview FAST, the half-size white-balanced develop when a file has none (B711), CR2/NEF typed-only |
 | Geode | Archives | `geode` | none found |
 | Helm | Control | `helm` | `unaos/libs/sys/helm` (host workspace only) |
 | Holocron | Secrets | `holocron` | `APPS/HOLOCRON.ELF`; login screen charter (`unaos/crates/kernel/src/video/login.rs`) |

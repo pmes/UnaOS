@@ -44,6 +44,17 @@ pub fn thresholds() -> [f64; 255] {
     t
 }
 
+/// The 255 decision points of a pure power-2.2 curve (B711's half-size develop): `t[c - 1]` = the linear value at
+/// which code `c` begins, `((c - 0.5) / 255)^2.2`, with `x^2.2 = x^2 * x^(1/5)` — no `powf` in `no_std`.
+pub fn gamma22_thresholds() -> [f64; 255] {
+    let mut t = [0.0f64; 255];
+    for (i, e) in t.iter_mut().enumerate() {
+        let x = (i as f64 + 0.5) / 255.0;
+        *e = x * x * fifth_root(x);
+    }
+    t
+}
+
 /// Encode one linear value in `[0, 1]` (clamped) to an sRGB byte.
 pub fn encode(lin: f64, t: &[f64; 255]) -> u8 {
     t.partition_point(|&x| x <= lin) as u8

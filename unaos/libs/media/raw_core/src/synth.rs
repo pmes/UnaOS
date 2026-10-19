@@ -141,9 +141,50 @@ pub fn craw_row(codes: &[u16]) -> Vec<u8> {
     out
 }
 
+/// What a synthetic ARW carries beyond its strip (RAWVIEW, B711).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Opts {
+    /// The embedded JPEG (IFD0's and IFD1's 513/514). `false` = a raw with NO preview: Quick Look's half path.
+    pub preview: bool,
+    /// Sony's as-shot levels, R G G B (`WB_RGGBLevels`, 0x7313), in an SR2SubIFD encrypted with `key` and named
+    /// by an SR2Private IFD that IFD0's DNGPrivateData (50740) points at.
+    pub wb_rggb: Option<[u16; 4]>,
+    pub key: u32,
+}
+
+/// The SR2 key the synthetic files use.
+pub const SR2_KEY: u32 = 0x5EED_0A11;
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts { preview: true, wb_rggb: None, key: SR2_KEY }
+    }
+}
+
 /// A synthetic ARW of `w x h` (w a multiple of 32 for `Craw`) holding `samples` (14-bit for `Plain14`, 11-bit
-/// codes for `Craw`), row-major.
+/// codes for `Craw`), row-major — with the preview, no white balance ([`arw_with`] and [`Opts::default`]).
 pub fn arw(w: u32, h: u32, samples: &[u16], coding: Coding) -> Vec<u8> {
+    arw_with(w, h, samples, coding, Opts::default())
+}
+
+/// The plaintext SR2SubIFD at file offset `at`: one entry, `WB_RGGBLevels` (four SHORTs, out of line at `at + 18`).
+fn sr2_block(at: u32, levels: [u16; 4]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&crate::wb::tag::WB_RGGB.to_le_bytes());
+    b.extend_from_slice(&3u16.to_le_bytes());
+    b.extend_from_slice(&4u32.to_le_bytes());
+    b.extend_from_slice(&(at + 18).to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    for l in levels {
+        b.extend_from_slice(&l.to_le_bytes());
+    }
+    b.resize(28, 0);
+    b
+}
+
+/// [`arw`] with [`Opts`].
+pub fn arw_with(w: u32, h: u32, samples: &[u16], coding: Coding, o: Opts) -> Vec<u8> {
     let strip: Vec<u8> = match coding {
         Coding::Plain14 => samples.iter().flat_map(|v| v.to_le_bytes()).collect(),
         Coding::Craw => samples.chunks(w as usize).flat_map(craw_row).collect(),
@@ -152,18 +193,19 @@ pub fn arw(w: u32, h: u32, samples: &[u16], coding: Coding) -> Vec<u8> {
         Coding::Plain14 => (14, 1, BLACK, WHITE),
         Coding::Craw => (8, 32767, BLACK, WHITE),
     };
-    let build = |jpeg_at: u32, strip_at: u32, sub: u32, exif: u32| {
-        let ifd0 = vec![
-            e16(259, &[6]),
-            eascii(271, MAKE),
-            eascii(272, MODEL),
-            e16(274, &[1]),
-            e32(330, sub),
-            e32(513, jpeg_at),
-            e32(514, PREVIEW_JPEG.len() as u32),
-            e32(34665, exif),
-        ];
-        let ifd1 = vec![e16(259, &[6]), e32(513, jpeg_at), e32(514, PREVIEW_JPEG.len() as u32)];
+    let sr2_len = 28u32;
+    let build = |jpeg_at: u32, strip_at: u32, sub: u32, exif: u32, sr2p: u32, sr2_at: u32| {
+        let mut ifd0 = vec![e16(259, &[6]), eascii(271, MAKE), eascii(272, MODEL), e16(274, &[1]), e32(330, sub), e32(34665, exif)];
+        let mut ifd1 = vec![e16(259, &[6])];
+        if o.preview {
+            ifd0.push(e32(513, jpeg_at));
+            ifd0.push(e32(514, PREVIEW_JPEG.len() as u32));
+            ifd1.push(e32(513, jpeg_at));
+            ifd1.push(e32(514, PREVIEW_JPEG.len() as u32));
+        }
+        if o.wb_rggb.is_some() {
+            ifd0.push(e32(crate::wb::tag::DNG_PRIVATE, sr2p));
+        }
         let raw = vec![
             e32(256, w),
             e32(257, h),
@@ -186,24 +228,58 @@ pub fn arw(w: u32, h: u32, samples: &[u16], coding: Coding) -> Vec<u8> {
             erat(37386, 35, 1),
             eascii(42036, LENS),
         ];
-        let mut ifds = [ifd0, ifd1, raw, exif];
-        emit(&mut ifds, &[Some(1), None, None, None], 8)
+        if o.wb_rggb.is_some() {
+            let sr2p = vec![e32(crate::wb::tag::SR2_OFFSET, sr2_at), e32(crate::wb::tag::SR2_LENGTH, sr2_len), e32(crate::wb::tag::SR2_KEY, o.key)];
+            let mut ifds = [ifd0, ifd1, raw, exif, sr2p];
+            emit(&mut ifds, &[Some(1), None, None, None, None], 8)
+        } else {
+            let mut ifds = [ifd0, ifd1, raw, exif];
+            emit(&mut ifds, &[Some(1), None, None, None], 8)
+        }
     };
-    // Pass 1 sizes the head; pass 2 writes the real offsets (sizes do not depend on values).
-    let (head, _) = build(0, 0, 0, 0);
+    // Pass 1 sizes the head and places the IFDs; pass 2 writes the real offsets (sizes do not depend on values).
+    let (head, offs) = build(0, 0, 0, 0, 0, 0);
     let jpeg_at = 8 + head.len() as u32;
-    let strip_at = (jpeg_at + PREVIEW_JPEG.len() as u32 + 15) & !15;
-    let (head, offs) = build(0, 0, 0, 0);
-    let (head2, _) = build(jpeg_at, strip_at, offs[2], offs[3]);
+    let after = jpeg_at + if o.preview { PREVIEW_JPEG.len() as u32 } else { 0 };
+    let sr2_at = (after + 3) & !3;
+    let tail = if o.wb_rggb.is_some() { sr2_at + sr2_len } else { after };
+    let strip_at = (tail + 15) & !15;
+    let (head2, _) = build(jpeg_at, strip_at, offs[2], offs[3], offs.get(4).copied().unwrap_or(0), sr2_at);
     debug_assert_eq!(head.len(), head2.len());
     let mut f = b"II\x2a\x00".to_vec();
     f.extend_from_slice(&8u32.to_le_bytes());
     f.extend_from_slice(&head2);
-    f.extend_from_slice(PREVIEW_JPEG);
+    if o.preview {
+        f.extend_from_slice(PREVIEW_JPEG);
+    }
+    if let Some(levels) = o.wb_rggb {
+        f.resize(sr2_at as usize, 0);
+        let mut blk = sr2_block(sr2_at, levels);
+        crate::wb::sony_decrypt(&mut blk, o.key);
+        f.extend_from_slice(&blk);
+    }
     f.resize(strip_at as usize, 0);
     f.extend_from_slice(&strip);
     f
 }
+
+/// A GREY scene under the light the levels name (R G G B, green = 1024 in [`crate::wb`]'s sense): every cell's
+/// samples are `BLACK + GREY_G * 1024 / level`, so a correct white balance renders R = G = B. The KAT's levels
+/// (2048, 1024, 1024, 1536) give R = 3000, G = 6000, B = 4000 above black: exact products after the gain.
+pub fn grey(w: u32, h: u32, levels: [u16; 4]) -> Vec<u16> {
+    let lv = [levels[0] as u32, ((levels[1] as u32 + levels[2] as u32) / 2).max(1), levels[3] as u32];
+    let mut v = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let c = [0usize, 1, 1, 2][((y & 1) * 2 + (x & 1)) as usize];
+            v.push(BLACK + (GREY_G * lv[1] / lv[c].max(1)) as u16);
+        }
+    }
+    v
+}
+
+/// The grey scene's green sample above black.
+pub const GREY_G: u32 = 6000;
 
 /// The synthetic mosaic `tests rawcore` and the KATs use: a horizontal ramp per colour plane, 14-bit, above black.
 pub fn ramp(w: u32, h: u32) -> Vec<u16> {

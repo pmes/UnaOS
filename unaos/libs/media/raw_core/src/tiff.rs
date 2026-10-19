@@ -172,6 +172,8 @@ pub struct RawInfo {
     pub preview: Option<(u64, u64)>,
     pub orientation: u8,
     pub facts: Facts,
+    /// The as-shot white balance (AsShotNeutral, else Sony's SR2 levels) — RAWVIEW (B711), [`crate::wb`].
+    pub wb: Option<crate::wb::Wb>,
 }
 
 #[derive(Default)]
@@ -243,6 +245,12 @@ fn read_ifd(r: &Reader, ents: &[Entry], info: &mut RawInfo, queue: &mut Vec<u32>
                 }
             }
             tag::SONY_WHITE => d.white = u(0).map(|v| v as u16),
+            // RAWVIEW (B711): AsShotNeutral outranks Sony's levels wherever it is met.
+            crate::wb::tag::AS_SHOT_NEUTRAL => {
+                if let Some(w) = crate::wb::neutral(r, e).and_then(crate::wb::Wb::from_neutral) {
+                    info.wb = Some(w);
+                }
+            }
             _ => {}
         }
         if ifd0 {
@@ -255,6 +263,7 @@ fn read_ifd(r: &Reader, ents: &[Entry], info: &mut RawInfo, queue: &mut Vec<u32>
                         info.ifds += exif::read(r, o as usize, &mut info.facts) as u32;
                     }
                 }
+                crate::wb::tag::DNG_PRIVATE if info.wb.is_none() => info.wb = crate::wb::sony_sr2(r, e),
                 _ => {}
             }
         }
