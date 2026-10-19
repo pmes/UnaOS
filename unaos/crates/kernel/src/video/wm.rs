@@ -31159,6 +31159,39 @@ pub mod focussteal {
         }
         Ok(raise_request(caller))
     }
+
+    /// ONEINSTANCE (B734): the running instance of a program for a second launch by the user's verb, raised. The
+    /// instance is an owner in the window table — a live, non-compat ring-3 row — whose armed program name
+    /// ([`super::app_name_of`]: the launcher's `program_name(path)` or APPRES's launch name, MAX_TITLE bytes) equals one
+    /// of `names` (ASCII case folded: a typed `lumen` names `/apps/LUMEN.ELF`) and that `keep` admits (the arch's same-session, same-user
+    /// test). The owners are collected under `TABLE` and the guard dropped before the leaf `APP_NAMES` and `keep` are
+    /// asked (nothing is called out from under `TABLE`). The user's verb names that owner NOW, so it is recorded as
+    /// [`VERB_OWNER`] before [`raise_request`]: the answer is given (`[wm] raise owner= focus=given cause=verb`).
+    /// `Some((owner, given))`; the seam grants both halves on given. `None`: no running instance (spawn as before).
+    pub fn raise_instance(names: &[&str], keep: &dyn Fn(u64) -> bool) -> Option<(u64, bool)> {
+        let cut = |n: &str| n.len().min(super::MAX_TITLE);
+        if names.iter().all(|n| n.is_empty()) {
+            return None;
+        }
+        let mut owners: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+        {
+            let t = super::table();
+            for r in t.rows.iter() {
+                let o = r.owner_asid;
+                if r.used && !r.compat && o != 0 && !super::is_kernel_owner(o) && !owners.contains(&o) && owners.try_reserve(1).is_ok() {
+                    owners.push(o);
+                }
+            }
+        }
+        let mut buf = [0u8; super::MAX_TITLE];
+        let owner = owners.into_iter().find(|&o| {
+            let n = super::app_name_of(o, &mut buf);
+            n > 0 && names.iter().any(|w| cut(w) == n && buf[..n].eq_ignore_ascii_case(&w.as_bytes()[..n])) && keep(o)
+        })?;
+        VERB_T.store(crate::arch::ms(), Ordering::Relaxed);
+        VERB_OWNER.store(owner, Ordering::Release);
+        Some((owner, raise_request(owner)))
+    }
 }
 
 // AUTOLOCK (rmbp-ledger B712, BP-video-28) — TAIL-APPENDED, so no line above moves. The lock is a VEIL over the table,

@@ -3180,3 +3180,65 @@ mod micring3_tests {
         assert_eq!(audio_source_handle_parse(&[7, 0, 0]), None);
     }
 }
+
+// =================================================================================================
+// ONEINSTANCE (rmbp-ledger B734; BP-ring3-18, BP-video-23, BP-bar-7/18) — A SECOND LAUNCH HANDS ITS ASK TO THE RUNNING
+// PROGRAM. When the user's verb (the glass or a typed line) launches a program whose ELF is already running for this
+// session as the same user with a window, the kernel does not spawn it again: it RAISES the running instance under the
+// focus-steal rule (the user's verb -> given) and, when the launch carried an argument (a file path or a URL, argv[1]),
+// delivers it to that instance as one OPEN_ARG frame in its mailbox. `new=1` (Shift-click on the dock, the tile menu's
+// `New Window`) spawns another copy as before.
+//
+// FRAME (kernel -> program, the `bus_notice_to` shape): kind REPLY, verb [`BUS_VERB_OPEN_ARG`], corr 0, status 0, body
+// = the argument's bytes (1..=[`OPEN_ARG_MAX`]). A program reads it on its `SYS_MRECV` drain ([`open_arg_body`]); a
+// program that never reads it loses nothing (its window still came forward). ADDITIVE: `ABI_VERSION` stays 1; a ring-3
+// REQUEST of this verb is -EINVAL. Appended at the tail so no existing line moves.
+// =================================================================================================
+
+/// Bus verb: the argument of a launch handed to the running instance (see the block above).
+pub const BUS_VERB_OPEN_ARG: u8 = 27; // 26 is BUS_VERB_WINDOW_RAISE
+const _: () = assert!(BUS_VERB_OPEN_ARG > BUS_VERB_WINDOW_RAISE && BUS_VERB_OPEN_ARG < BUS_VERB_REGISTER);
+/// The longest argument an OPEN_ARG frame carries; a longer one is not delivered (the raise still happens).
+pub const OPEN_ARG_MAX: usize = 1024;
+const _: () = assert!(OPEN_ARG_MAX <= BUS_BODY_MAX);
+
+/// The argument in a received frame: `Some(body)` when `frame` (the bytes `SYS_MRECV` returned) is a kernel-delivered
+/// OPEN_ARG frame — magic, kind REPLY, verb [`BUS_VERB_OPEN_ARG`], corr 0, status 0, a body of 1..=[`OPEN_ARG_MAX`]
+/// bytes inside the frame — else `None` (any other frame: the caller's drain treats it as before).
+pub fn open_arg_body(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() < BUS_HDR_LEN || frame[0..4] != BUS_MAGIC || frame[5] != BUS_KIND_REPLY || frame[6] != BUS_VERB_OPEN_ARG {
+        return None;
+    }
+    if frame[8..16] != [0u8; 8] {
+        return None; // corr 0 and status 0: the kernel's own delivery, never a reply to an ask
+    }
+    let n = u32::from_le_bytes([frame[48], frame[49], frame[50], frame[51]]) as usize;
+    if n == 0 || n > OPEN_ARG_MAX || frame.len() < BUS_HDR_LEN + n {
+        return None;
+    }
+    Some(&frame[BUS_HDR_LEN..BUS_HDR_LEN + n])
+}
+
+#[cfg(test)]
+mod oneinstance_tests {
+    extern crate std;
+    use super::*;
+    #[test]
+    fn open_arg_frame_parse() {
+        let mut f = [0u8; BUS_HDR_LEN + 5];
+        f[0..4].copy_from_slice(&BUS_MAGIC);
+        f[4] = BUS_VERSION;
+        f[5] = BUS_KIND_REPLY;
+        f[6] = BUS_VERB_OPEN_ARG;
+        f[48..52].copy_from_slice(&5u32.to_le_bytes());
+        f[BUS_HDR_LEN..].copy_from_slice(b"a.txt");
+        assert_eq!(open_arg_body(&f), Some(&b"a.txt"[..]));
+        f[8] = 1; // a correlated reply is not a delivery
+        assert_eq!(open_arg_body(&f), None);
+        f[8] = 0;
+        f[6] = BUS_VERB_NOTICE;
+        assert_eq!(open_arg_body(&f), None);
+        f[6] = BUS_VERB_OPEN_ARG;
+        assert_eq!(open_arg_body(&f[..BUS_HDR_LEN + 4]), None);
+    }
+}
