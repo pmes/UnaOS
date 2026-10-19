@@ -614,7 +614,7 @@ fn fs_append(console: &mut Console, arg: &str, data: &[u8]) {
 /// JD6 `rm`: delete a FILE. A directory is `-EISDIR` (use `rmdir`, or `rm -r`); an absent name is
 /// `-ENOENT` EXCEPT under `force` (JD14 `-f`), which is quiet the way POSIX `rm -f` is. A
 /// wrong-usage `-EISDIR` is still shown under `-f`, exactly as POSIX `rm -f DIR` still complains.
-fn fs_rm(console: &mut Console, arg: &str, force: bool) {
+pub(crate) fn fs_rm(console: &mut Console, arg: &str, force: bool) { // TRASHRM (B692): pub(crate) so `tests trash` drives `rm -P`'s body
     use crate::fs::vfs::VfsError;
     let Some((mt, path)) = vfs_write_open(console, "rm", arg) else { return };
     match mt.unlink(&path, SHELL_PRINCIPAL) {
@@ -3303,7 +3303,7 @@ fn shell_relics_witness() {
         // Self-clean: a volume that ACCEPTED the write now holds a file named `0`; remove it the
         // same way, through the dispatcher, so the battery leaves the root as it found it.
         if lines.iter().any(|l| l.starts_with("wrote ")) {
-            let _ = witness_capture(|c| { let _ = dispatch_command("rm 0", c, &mut pal); });
+            let _ = witness_capture(|c| { let _ = dispatch_command("rm -P 0", c, &mut pal); });
         }
         verdict(
             "shell.relics.write_raw",
@@ -5462,17 +5462,17 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             // from the paths exactly as `cp`/`mv` do — a name literally beginning with `-` is reachable as
             // `./-name`. Without `-r`, a directory target stays -EISDIR (byte-identical to pre-JD13). JD14:
             // `-f`/force suppresses the missing-target error (POSIX `rm -f NOSUCH`/`rm -rf NOSUCH` are
-            // quiet, and a no-match wildcard is quiet); bundled short flags parse (`rm -rf DIR`).
-            let (recursive, force, _no_clobber, paths) = split_flags(&args);
+            // quiet, and a no-match wildcard is quiet); bundled short flags parse (`rm -rf DIR`). TRASHRM (B692, R130): without `-P`/`--now` every target MOVES to the Trash (fs::trash::rm_to_trash, Quarry's Delete body); `-P` (bundles too: `-rP`) or `--now` is the ONE immediate delete — the JD6/JD13 bodies below, which print each path they destroyed.
+            let now = args.iter().any(|a| *a == "--now" || (a.len() > 1 && a.starts_with('-') && a[1..].bytes().all(|b| b.is_ascii_alphabetic()) && a.contains('P'))); let args: Vec<&str> = args.iter().copied().filter(|a| *a != "--now").collect(); let (recursive, force, _no_clobber, paths) = split_flags(&args);
             if paths.is_empty() {
-                console.println_styled(crate::video::theme::TERM_RED, "usage: rm [-r] [-f] <path> [path ...]");
-            } else if !paths.iter().any(|a| has_glob(a)) {
+                console.println_styled(crate::video::theme::TERM_RED, "usage: rm [-r] [-f] [-P|--now] <path> [path ...]"); } else if !now { let mt = vfs_mount_table(); let mut targets: Vec<String> = Vec::new(); for a in &paths { match vfs_glob(&mt, &vfs_path(a)) { Glob::Literal(p) => targets.push(p), Glob::Matched { parent, rows } => { if rows.is_empty() && !force { console.println(&alloc::format!("rm: {}: no match", a)); } targets.extend(rows.iter().map(|r| vfs_join(&parent, &r.name))); } } } crate::fs::trash::rm_to_trash(console, "rm", &targets, recursive, force, false);
+            } else if !paths.iter().any(|a| has_glob(a)) { console.println("rm -P: deleting now, NOT to the Trash:");
                 // No wildcard: delete each literal target (a single non-recursive/non-force arg is
                 // byte-identical to pre-JD14).
                 for &a in &paths {
                     if recursive { fs_rm_recursive(console, a, force); } else { fs_rm(console, a, force); }
                 }
-            } else {
+            } else { console.println("rm -P: deleting now, NOT to the Trash:");
                 rm_globbed(console, &paths, recursive, force);
             }
         },
@@ -5484,10 +5484,10 @@ pub fn dispatch_command(cmd_line: &str, console: &mut Console, pal: &mut TargetP
             }
         },
         "rmdir" | "rd" => {
-            // JD7: remove an EMPTY directory (non-empty → -ENOTEMPTY; root refused). `rmdir <path>`.
-            match args.first() {
-                None => console.println_styled(crate::video::theme::TERM_RED, "usage: rmdir <path>"),
-                Some(name) => fs_rmdir(console, name),
+            // JD7: remove an EMPTY directory (non-empty → -ENOTEMPTY; root refused). `rmdir <path>`. TRASHRM (B692): the empty folder MOVES to the Trash; `rmdir -P|--now <path>` removes it at once.
+            let now = args.iter().any(|a| *a == "-P" || *a == "--now"); match args.iter().copied().find(|a| *a != "-P" && *a != "--now") {
+                None => console.println_styled(crate::video::theme::TERM_RED, "usage: rmdir [-P|--now] <path>"),
+                Some(name) => if now { console.println("rmdir -P: removing now, NOT to the Trash:"); fs_rmdir(console, name) } else { crate::fs::trash::rm_to_trash(console, "rmdir", &[vfs_path(name)], false, false, true); },
             }
         },
         #[cfg(any(all(feature = "aarch64_el0", target_arch = "aarch64"), target_arch = "x86_64"))]

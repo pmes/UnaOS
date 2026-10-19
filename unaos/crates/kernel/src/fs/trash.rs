@@ -212,11 +212,11 @@ pub fn empty() -> Result<usize, String> {
     r
 }
 
-/// The shell verb: `trash <path>` · `trash list` · `trash restore <name>` · `trash empty`.
+/// The shell verb: `trash <path>` · `trash ls` (or `list`) · `trash restore <name>` · `trash empty`.
 pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
     match args.first().copied() {
-        None => console.println("usage: trash <path> | trash list | trash restore <name> | trash empty"),
-        Some("list") => {
+        None => console.println("usage: trash <path> | trash ls | trash restore <name> | trash empty"),
+        Some("ls") | Some("list") => {
             let es = entries();
             for e in &es {
                 console.println(&alloc::format!("{}  <- {}  @{}", e.name, e.orig, e.when));
@@ -242,6 +242,92 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
             }
         }
     }
+}
+
+/// TRASHRM (rmbp-ledger B692, R130: nothing the user did not ask for is destroyed): Midden's `rm` / `rmdir`
+/// without `-P`. Each target (absolute, globs already expanded by the shell arm) MOVES to the Trash through
+/// [`trash`] — the same body Quarry's Delete calls (`video/quarry/ops.rs` `do_trash`), so both rings' deletes
+/// land in one listing and `trash restore <name>` puts each back at its path. The shell's refusals keep their
+/// errno shape: absent `-ENOENT` (quiet under `-f`), a directory without `-r` `-EISDIR`, `rmdir` of a file
+/// `-ENOTDIR` and of a non-empty folder `-ENOTEMPTY`. A path trash_core refuses (outside the home, the home
+/// itself, already in the Trash) is NOT deleted: the line says why and names `rm -P`, the one immediate delete.
+/// Returns how many targets went to the Trash.
+pub fn rm_to_trash(console: &mut crate::console::Console, verb: &str, paths: &[String], recursive: bool, force: bool, dir_only: bool) -> usize {
+    let t = mt();
+    let mut moved = 0usize;
+    for p in paths {
+        let st = match t.stat(p) {
+            Ok(st) => st,
+            Err(_) => {
+                if !force {
+                    console.println(&alloc::format!("{}: {}: not found (-ENOENT)", verb, p));
+                }
+                continue;
+            }
+        };
+        let dir = matches!(st.kind, NodeKind::Dir);
+        if p == "/" {
+            console.println(&alloc::format!("{}: /: cannot remove the root directory (-EBUSY)", verb));
+            continue;
+        }
+        if dir_only && !dir {
+            console.println(&alloc::format!("{}: {}: not a directory (-ENOTDIR)", verb, p));
+            continue;
+        }
+        if dir_only && t.read_dir(p).map(|v| v.iter().any(|e| e.name != "." && e.name != "..")).unwrap_or(false) {
+            console.println(&alloc::format!("{}: {}: directory not empty (-ENOTEMPTY)", verb, p));
+            continue;
+        }
+        if !dir_only && dir && !recursive {
+            console.println(&alloc::format!("{}: {}: is a directory (-EISDIR; `rm -r` moves the tree to the Trash)", verb, p));
+            continue;
+        }
+        match trash(p) {
+            Ok(n) => {
+                moved += 1;
+                console.println(&alloc::format!("{}: moved {} to the Trash as {} (`trash restore {}` puts it back)", verb, p, n, n));
+            }
+            Err(e) => console.println(&alloc::format!("{}: {}: not deleted ({}); `{} -P {}` deletes it now", verb, p, e, verb, p)),
+        }
+    }
+    moved
+}
+
+/// TRASHRM (B692): `:: TRASH: quarry=1 midden=1 listed=2 restored=2 paths=ok now_flag=destroyed -> PASS ::` — one
+/// scratch file deleted through Quarry's Delete body ([`trash`]), one through Midden's `rm` body ([`rm_to_trash`]);
+/// both must appear in ONE listing ([`entries`]) with their original paths, both restore to those paths with their
+/// bytes, and a third file given to `rm -P`'s body (`shell::fs_rm`, the arm's immediate delete) is gone from its
+/// folder AND absent from the Trash. Runs after the TRASH legs above, on the same home.
+fn rm_selftest() {
+    let t = mt();
+    let base = home_base();
+    let q = join(&base, "QRMFX.TXT");
+    let m = join(&base, "MRMFX.TXT");
+    let now = join(&base, "NOWFX.TXT");
+    let _ = empty();
+    for p in [&q, &m, &now] {
+        if t.stat(p).is_ok() {
+            let _ = t.unlink(p, P);
+        }
+        let _ = t.create(p, NodeKind::File, P).and_then(|_| t.write(p, 0, p.as_bytes(), P));
+    }
+    let mut c = crate::console::Console::new();
+    let quarry = trash(&q).is_ok() as u32; // Quarry's Delete: `ops::do_trash` -> `fs::trash::trash(&path)`
+    let midden = rm_to_trash(&mut c, "rm", &[m.clone()], false, false, false) as u32; // Midden's `rm` arm without -P
+    let names: Vec<String> = entries().into_iter().filter(|e| e.orig == q || e.orig == m).map(|e| e.name).collect();
+    let in_list = names.len();
+    let restored = names.iter().filter(|n| restore(n).is_ok()).count();
+    let back = |p: &str| t.read(p, 0, 256).map(|b| b == p.as_bytes()).unwrap_or(false);
+    let paths_ok = back(&q) && back(&m) && entries().is_empty();
+    crate::shell::fs_rm(&mut c, &now, false); // `rm -P` / `rm --now`: the arm's immediate delete
+    let destroyed = t.stat(&now).is_err() && !entries().iter().any(|e| e.orig == now) && !listed(&t, &trash_dir(), "NOWFX.TXT");
+    let _ = t.unlink(&q, P);
+    let _ = t.unlink(&m, P);
+    let pass = quarry == 1 && midden == 1 && in_list == 2 && restored == 2 && paths_ok && destroyed;
+    serial_println!(
+        ":: TRASH: quarry={} midden={} listed={} restored={} paths={} now_flag={} -> {} ::",
+        quarry, midden, in_list, restored, if paths_ok { "ok" } else { "moved" }, if destroyed { "destroyed" } else { "kept" }, if pass { "PASS" } else { "FAIL" }
+    );
 }
 
 fn listed(t: &MountTable, dir: &str, name: &str) -> bool {
@@ -342,6 +428,7 @@ pub fn selftest() {
         ":: TRASH: store={} trashed={} restored={} emptied={} query_ok={} -> {} ::",
         s.name(), trashed, restored, emptied, query_ok, if pass { "PASS" } else { "FAIL" }
     );
+    rm_selftest(); // TRASHRM (B692): Quarry's and Midden's deletes in one listing, both restored, `rm -P` destroys
 }
 
 // ── HIDSTALL (rmbp-ledger B485): the Trash's change generation ───────────────────────────────────────────────────────
