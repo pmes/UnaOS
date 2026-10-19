@@ -39,7 +39,7 @@ static ROUTED: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 pub enum FnAct {
     Bright(bool),
     Media(u8),
-    Volume(u8),
+    Volume(u8), #[cfg(all(target_arch = "x86_64", feature = "wc"))] Help, // HELPF1 (B746): F1 / Shift+F1 opened the focused app's Help page (`help_chord`, file tail). LINE-NEUTRAL fold, code first
 }
 
 impl FnAct {
@@ -52,7 +52,7 @@ impl FnAct {
             FnAct::Media(_) => "media-next",
             FnAct::Volume(0) => "volume-up",
             FnAct::Volume(1) => "volume-down",
-            FnAct::Volume(_) => "volume-mute",
+            FnAct::Volume(_) => "volume-mute", #[cfg(all(target_arch = "x86_64", feature = "wc"))] FnAct::Help => "help", // HELPF1 (B746). LINE-NEUTRAL fold, code first
         }
     }
 }
@@ -83,13 +83,13 @@ pub fn fn_row_usage(path: u8, usage: u8, modifiers: u8) -> Option<FnAct> {
     if usage <= 1 {
         return None;
     }
-    if super::perfhud::chord(usage, modifiers) { return None; } let act = decide(usage, modifiers)?; // PERFHUD (B710): Win+F12 toggles the performance overlay and is consumed here (the one F-row router), before the F12 volume step. LINE-NEUTRAL fold, code first
+    if super::perfhud::chord(usage, modifiers) { return None; } #[cfg(all(target_arch = "x86_64", feature = "wc"))] if help_chord(path, usage, modifiers) { return Some(FnAct::Help); } let act = decide(usage, modifiers)?; // PERFHUD (B710): Win+F12 toggles the performance overlay and is consumed here (the one F-row router), before the F12 volume step. LINE-NEUTRAL fold, code first
     match act {
         FnAct::Bright(up) => super::brightkeys::key(if up { Action::BrightnessUp } else { Action::BrightnessDown }),
         FnAct::Media(k) => super::player::media_key(k),
         FnAct::Volume(_) => {
             let _ = super::status::volkey_usage(usage);
-        }
+        } #[cfg(all(target_arch = "x86_64", feature = "wc"))] FnAct::Help => {} // HELPF1 (B746): never reached — `help_chord` returns before `decide`. LINE-NEUTRAL fold, code first
     }
     ROUTED[(path == PATH_XHCI) as usize].fetch_add(1, Ordering::Relaxed);
     serial_println!("[hid] fnrow path={} usage={:#04x} -> {}", path_name(path), usage, act.name());
@@ -170,4 +170,42 @@ pub fn fixture() {
         if other_ok { "ok" } else { "FAIL" },
         if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// ══════════════ HELPF1 (rmbp-ledger B746, BP-video-35) — TAIL-APPENDED: F1 opens Help for the focused app ══════════════
+// x86 `wc` (the Help window, `help::window`, is x86 `wc`). The ONE fold is on `fn_row_usage`'s PERFHUD line, before
+// `decide`: a press `help_key` accepts latches `help::window::request_for_focus()` (an atomic store; the desktop pass
+// opens the page) and is consumed — the brightness step does not also run. R60, the theme is the binding: a table that
+// binds F1 to brightness (CRISPY_ROWS: both Una tables; the rMBP's brightness key IS usage 0x3A) keeps bare F1 for
+// brightness and gives Help to Shift+F1; a table that binds no F1 (PC_ROWS: both Softy tables) gives Help to F1 itself;
+// a table that binds F1 to anything else keeps it. The keymap names no Help action, so no other chord exists.
+// Wire per press: `[hid] fnrow path=<ehci|xhci> usage=0x3a -> help`, then the pass's `[help] f1 owner= app= page=`.
+
+/// F1's HID keyboard-page usage.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub const USAGE_F1: u8 = 0x3A;
+
+/// The decision alone (pure): does `usage` under `modifiers` mean Help on `table`?
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn help_key(table: &keymap::Table, usage: u8, modifiers: u8) -> bool {
+    if usage != USAGE_F1 {
+        return false;
+    }
+    match keymap::resolve(table, modifiers, usage) {
+        None => true,
+        Some(a) if a.is_brightness() => modifiers & crate::drivers::xhci::HID_MOD_SHIFT != 0,
+        Some(_) => false,
+    }
+}
+
+/// The router's Help arm: `true` = the press was Help on the live table, the focused app's page is latched, consumed.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn help_chord(path: u8, usage: u8, modifiers: u8) -> bool {
+    if !help_key(keymap::active(), usage, modifiers) {
+        return false;
+    }
+    crate::help::window::request_for_focus();
+    ROUTED[(path == PATH_XHCI) as usize].fetch_add(1, Ordering::Relaxed);
+    serial_println!("[hid] fnrow path={} usage={:#04x} -> {}", path_name(path), usage, FnAct::Help.name());
+    true
 }
