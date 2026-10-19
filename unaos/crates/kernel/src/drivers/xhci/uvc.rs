@@ -149,6 +149,14 @@ static GENERATION: AtomicU32 = AtomicU32::new(0);
 static GEOM: AtomicU32 = AtomicU32::new(0);
 static FOURCC: AtomicU32 = AtomicU32::new(0);
 static SLOT: AtomicU8 = AtomicU8::new(0);
+/// PTPCAM (rmbp-ledger B687): where the viewer's frames come from — the UVC stream's assembler, or a Sony body in
+/// PC-Remote mode over PTP (`ptp::liveview_frame`, one JPEG per GetObject(0xFFFFC002)). One viewer, one window.
+const SRC_UVC: u8 = 0;
+const SRC_PTP: u8 = 1;
+static SOURCE: AtomicU8 = AtomicU8::new(SRC_UVC);
+/// PTPCAM: Space in the Camera window (a PTP source) asks the viewer task to fire the shutter — the key path
+/// never waits on the cable; the task, which already owns the camera's cadence, does.
+static SHUTTER_REQ: AtomicBool = AtomicBool::new(false);
 
 /// Camera frames the viewer saw complete (sequence advance), frames it presented, frames it never showed,
 /// frames its decoder or converter refused.
@@ -159,6 +167,7 @@ static BAD: AtomicU64 = AtomicU64::new(0);
 
 /// `uvc::stream_arm`: the committed stream is `w x h`, FourCC `cc` (`MJPG` for a Motion-JPEG commit).
 pub fn arm(slot: u8, w: u16, h: u16, cc: [u8; 4]) {
+    SOURCE.store(SRC_UVC, Ordering::Relaxed);
     GEOM.store(((w as u32) << 16) | h as u32, Ordering::Relaxed);
     FOURCC.store(u32::from_le_bytes(cc), Ordering::Relaxed);
     SLOT.store(slot, Ordering::Relaxed);
@@ -169,7 +178,41 @@ pub fn arm(slot: u8, w: u16, h: u16, cc: [u8; 4]) {
 
 /// `uvc::stream_disarm`: the stream is gone. The viewer closes its window on its next pass.
 pub fn disarm() {
-    ARMED.store(false, Ordering::Release);
+    if SOURCE.load(Ordering::Relaxed) == SRC_UVC {
+        ARMED.store(false, Ordering::Release);
+    }
+}
+
+/// PTPCAM: arm the viewer on a PTP live-view source (the session opened on a Sony body in PC-Remote mode, or the
+/// `ptp view` verb). The frames are JPEGs, so the geometry comes from the first decode.
+pub fn arm_ptp(slot: u8) {
+    SOURCE.store(SRC_PTP, Ordering::Relaxed);
+    GEOM.store(0, Ordering::Relaxed);
+    FOURCC.store(u32::from_le_bytes(*b"MJPG"), Ordering::Relaxed);
+    SLOT.store(slot, Ordering::Relaxed);
+    SHUTTER_REQ.store(false, Ordering::Relaxed);
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+    ARMED.store(true, Ordering::Release);
+    serial_println!("[uvc] view armed slot={} source=ptp liveview", slot);
+}
+
+/// PTPCAM: the PTP camera went away; a UVC-armed viewer is left alone.
+pub fn disarm_ptp() {
+    if SOURCE.load(Ordering::Relaxed) == SRC_PTP {
+        ARMED.store(false, Ordering::Release);
+    }
+}
+
+/// PTPCAM: a key offered to the Camera window (the desktop's key chain): Space fires the shutter of a PTP source
+/// while the window holds focus. `false` = not ours, the chain goes on.
+pub fn key_route(ev: crate::pal::Event) -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    return view::key_route(ev);
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        let _ = ev;
+        false
+    }
 }
 
 /// The controller's service ladder (beside `service_uvc`): start the viewer for an armed stream. Atomics only
@@ -340,6 +383,20 @@ mod view {
     static TASK: AtomicBool = AtomicBool::new(false);
     static WIN: AtomicU32 = AtomicU32::new(wm::WIN_NONE);
 
+    pub fn key_route(ev: crate::pal::Event) -> bool {
+        let id = WIN.load(Ordering::Acquire);
+        if id == wm::WIN_NONE || SOURCE.load(Ordering::Relaxed) != SRC_PTP || wm::focus_asid() != OWNER {
+            return false;
+        }
+        match ev {
+            crate::pal::Event::Key(b' ') => {
+                SHUTTER_REQ.store(true, Ordering::Release);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn pump() {
         if ARMED.load(Ordering::Acquire) && !TASK.swap(true, Ordering::AcqRel) {
             crate::arch::sched::spawn_stack("uvc-view", task, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL, STACK);
@@ -418,6 +475,8 @@ mod view {
         let g = GEOM.load(Ordering::Relaxed);
         let (gw, gh) = ((g >> 16) as usize, (g & 0xFFFF) as usize);
         let cc = FOURCC.load(Ordering::Relaxed).to_le_bytes();
+        let ptp_src = SOURCE.load(Ordering::Relaxed) == SRC_PTP;
+        let mut said_ptp_err = false;
         serial_println!("[uvc] view start slot={} {}x{} fourcc={}", SLOT.load(Ordering::Relaxed), gw, gh, cc_str(cc).as_str());
         let mut copy: Vec<u8> = Vec::new();
         let mut want = 0usize;
@@ -444,9 +503,44 @@ mod view {
                 win = None;
                 user_closed = true;
                 serial_println!("[uvc] view closed by user — frames still counted");
+                if ptp_src {
+                    disarm_ptp(); // PTPCAM: a closed live view stops pulling frames over the cable; `ptp view` reopens it
+                    break "closed-by-user";
+                }
             }
             // COPY OUT under the stream lock (a memcpy, never an allocation: the claim path waits on this lock).
             let mut got: Option<u32> = None;
+            if ptp_src {
+                // PTPCAM: the shutter first (Space in the window), then one live-view JPEG over the cable. The fetch IS
+                // the cadence: GetObject returns when the camera has a frame.
+                if SHUTTER_REQ.swap(false, Ordering::AcqRel) {
+                    match crate::drivers::xhci::ptp::shutter() {
+                        Ok(added) => serial_println!("[uvc] view shutter fired source=ptp object_added={}", added as u8),
+                        Err(e) => serial_println!("[uvc] view shutter refused: {}", e),
+                    }
+                }
+                match crate::drivers::xhci::ptp::liveview_frame(0) {
+                    Ok(f) => {
+                        copy.clear();
+                        if copy.try_reserve(f.len()).is_err() {
+                            break "alloc-copy";
+                        }
+                        copy.extend_from_slice(&f);
+                        got = Some(last_seq.wrapping_add(1).max(1));
+                    }
+                    Err(e) => {
+                        if !crate::drivers::xhci::ptp::is_open() {
+                            break "ptp-session-closed";
+                        }
+                        BAD.fetch_add(1, Ordering::Relaxed);
+                        if !said_ptp_err {
+                            said_ptp_err = true;
+                            serial_println!("[uvc] view ptp frame refused: {} (first refusal; counted as bad=)", e);
+                        }
+                        crate::arch::sched::sleep_ms(50);
+                    }
+                }
+            } else {
             let _ = class::latest_frame(&mut |b, seq| {
                 if seq == last_seq {
                     return;
@@ -466,6 +560,7 @@ mod view {
                 }
                 want = 0;
                 continue;
+            }
             }
             if let Some(seq) = got {
                 let step = if last_seq == 0 { 1 } else { seq.wrapping_sub(last_seq) as u64 };
@@ -548,7 +643,7 @@ mod view {
                 cam_stat = cam;
                 render_us_max = 0;
             }
-            crate::arch::sched::sleep_ms(PASS_MS);
+            crate::arch::sched::sleep_ms(if ptp_src { 1 } else { PASS_MS });
         };
         close(&mut win);
         serial_println!(

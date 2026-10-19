@@ -795,6 +795,7 @@ pub fn disconnect(slot: u8) {
     }
     *OBJ_CACHE.lock() = None;
     *LV_CACHE.lock() = None;
+    super::uvc::disarm_ptp();
     walk_reset();
     if was >= ST_CONFIGURED {
         let _ = crate::fs::ns_bump::<(), ()>(Ok(()));
@@ -1026,6 +1027,9 @@ impl XhciController {
         crate::fs::vfs::register_hotplug(crate::fs::vfs::ptpfs::provide);
         let _ = crate::fs::ns_bump::<(), ()>(Ok(()));
         serial_println!("[ptp] volume /volumes/{} mounted (read-only; objects listed a chunk per pass)", volume);
+        if SONY_READY.load(Ordering::Relaxed) {
+            super::uvc::arm_ptp(slot); // the Camera window (UVCCAM's viewer) pulls live-view JPEGs from this session
+        }
     }
 
     /// Sony PC-Remote handshake, libgphoto2's order (library.c camera_init, PTP_VENDOR_SONY): SDIO_Connect
@@ -1741,9 +1745,58 @@ pub fn liveview_cached() -> Option<Vec<u8>> {
     LV_CACHE.lock().as_ref().map(|(_, b)| b.clone())
 }
 
-/// Fire the shutter once (M3). The verb that calls it is owed (PTPCAM report: a shell verb `ptp shutter`).
+/// Fire the shutter once (M3): the `ptp shutter` verb and Space in the Camera window (`uvc::key_route`).
 pub fn shutter() -> Result<bool, &'static str> {
     with_controller(|c| c.ptp_shutter())
+}
+
+// ── The `ptp` verb ─────────────────────────────────────────────────────────────────────────────────
+
+/// `ptp` / `ptp status` · `ptp view` (open the Camera window on the live view) · `ptp shutter` · `ptp frame`
+/// (fetch one live-view JPEG and say its size).
+pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
+    let say = |c: &mut crate::console::Console, l: &str| {
+        c.println(l);
+        serial_println!("[ptp] verb: {}", l);
+    };
+    match args.first().copied().unwrap_or("status") {
+        "status" => match describe() {
+            Some((d, _)) if is_open() => {
+                let line = alloc::format!("{} volume=/volumes/{}", d, volume_name().unwrap_or_default());
+                say(console, &line)
+            }
+            _ => say(console, "ptp: no camera session (plug a camera in PC-Remote or MTP mode)"),
+        },
+        "view" => {
+            if is_open() && sony_ready() {
+                super::uvc::arm_ptp(SLOT.load(Ordering::Relaxed));
+                say(console, "ptp: live view armed — the Camera window opens on the first frame (Space fires the shutter)");
+            } else {
+                say(console, "ptp view: no live view (a Sony body in PC-Remote mode is needed)");
+            }
+        }
+        "shutter" => match shutter() {
+            Ok(added) => {
+                let line = alloc::format!("ptp shutter: fired (object_added={})", added as u8);
+                say(console, &line)
+            }
+            Err(e) => {
+                let line = alloc::format!("ptp shutter: {}", e);
+                say(console, &line)
+            }
+        },
+        "frame" => match liveview_frame(0) {
+            Ok(f) => {
+                let line = alloc::format!("ptp frame: {} bytes JPEG", f.len());
+                say(console, &line)
+            }
+            Err(e) => {
+                let line = alloc::format!("ptp frame: {}", e);
+                say(console, &line)
+            }
+        },
+        _ => say(console, "usage: ptp [status] | ptp view | ptp shutter | ptp frame"),
+    }
 }
 
 // ── `tests ptp` ────────────────────────────────────────────────────────────────────────────────────

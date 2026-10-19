@@ -3731,7 +3731,7 @@ hda-sie = ["hda-tone"]
 # `scripts/banner-cert.sh`, certifies the feature ON THE ARTIFACT; a fifth, `scripts/
 # k8-reach.registry`, records why this knob has no Pi bare-metal arm.
 # See docs/dev/OS/07_USB_STORAGE/uvc.md.
-uvc = []
+uvc = ["midden_core/uvc"] # PTPCAM (B687): + the `ptp` host verb row in midden_core (forwarded like `login`)
 # REALSENSE (LEDGER SR92, R112): `UNAOS_SONDE=1` arms Sonde's first probe, the Intel RealSense D435i —
 # `drivers/uvc.rs`'s appended `multi` census (one record per VideoStreaming function: depth Z16, infrared
 # Y8, colour YUY2; every extension unit; the HID interface), a D400's three XU `GET_CUR`s (laser power,

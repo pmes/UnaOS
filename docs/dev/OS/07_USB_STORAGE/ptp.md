@@ -111,11 +111,26 @@ ObjectInfo with its date as unix seconds, the live-view cut both ways — and a 
 (109 bytes): `:: PTP: codec=ok deviceinfo=ok(fixture) stream=skip(no-device) -> PASS ::`; with the camera in
 PC-Remote mode `stream=ok(<n>B)` is one live-view JPEG over the cable.
 
-## 7. Owed (not in this rung)
+## 7. The Camera window and the verb
 
-* The live-view WINDOW at ≥ 24 fps (BP-bar-25): frames are served as `LIVEVIEW.JPG`; a streaming viewer is
-  UVCCAM's window or a Stria view (outside this arc's files).
-* A verb that fires `ptp::shutter()` (a shell `ptp shutter`, or the viewer's button) and the 0xFFFFC001
-  capture download.
+* **Live view in the window.** UVCCAM's viewer (`drivers/xhci/uvc.rs`, task `uvc-view`, window "Camera") has a
+  second SOURCE: `uvc::arm_ptp(slot)` (called when a Sony session opens with the SDIO handshake done, and by
+  `ptp view`) makes the task loop `ptp::liveview_frame(0)` → `pixel_core::decode_jpeg` → the same fit/blit as a
+  UVC MJPEG frame. The fetch is the cadence (GetObject returns when the body has a frame); the rate is MEASURED
+  on the bench by the viewer's own line, `[uvc] stream fps=<n> frames=<n> … window=open` every 5 s — the target
+  is ≥ 24 fps (BP-bar-25). Closing the window stops the pulls (`ptp view` reopens). The camera leaving ends the
+  task (`[uvc] view end reason=ptp-session-closed` or `stream-disarmed`).
+* **Space in the Camera window** sets a request (`uvc::key_route`, focus = the window's owner, PTP source only);
+  the viewer task fires `ptp::shutter()` before its next fetch (`[uvc] view shutter fired source=ptp
+  object_added=<0|1>`). The key path never waits on the cable. Its one caller in the desktop key chain
+  (`video/quarry/live.rs` `key_route`) is OWED — see the ledger row.
+* **`ptp` verb** (midden_core HOST_VERBS row under the `uvc` feature, shell.rs arm, help.rs row):
+  `ptp [status] | ptp view | ptp shutter | ptp frame`.
+
+## 8. Owed (not in this rung)
+
+* The 0xFFFFC001 capture download after the shutter.
+* Space reaching the Camera window: `|| crate::drivers::xhci::uvc::key_route(ev)` (under `#[cfg(feature =
+  "uvc")]`) in `video/quarry/live.rs`'s key chain.
 * Endpoint-halt recovery (CLEAR_FEATURE + Reset Endpoint) instead of closing the session; MTP-only devices
   (class 0xFF + the "MTP" OS descriptor); CloseSession on detach.
