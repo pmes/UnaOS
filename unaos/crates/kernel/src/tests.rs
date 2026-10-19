@@ -4233,7 +4233,7 @@ fn keychars_repeat_byte() -> bool {
 }
 
 /// CHARREPEAT: the `repeat=` word — `ok` (tokens right AND the tracker repeated them), `bad`, or `no-tracker` (tokens
-/// right on an image with no host typematic at all: no feed compiles there for ANY key, e.g. a tegra image).
+/// right on an image with no host typematic at all: no feed compiles there for ANY key, an aarch64 image with neither `baremetal` nor `tegra`; ORINREPEAT SR164 gave the Orin its feed).
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 static KEYCHARS_REPEAT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
@@ -4246,7 +4246,7 @@ fn keychars_repeat_word() -> &'static str {
 /// repeats `Event::Key(b'z')`, a RELEASED `ü` (its token absent from the next report) repeats nothing in 64 due ticks.
 /// Each hold is retried up to 8 times: on x86 the service core's `x86_typematic_pump` may take a forced-due repeat
 /// between the fixture's force and its tick. The tracker is reset before and after (`typematic_test_reset`).
-#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc", feature = "ehcihid"), all(target_arch = "aarch64", feature = "desktop_firmware", feature = "baremetal"))))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc", feature = "ehcihid"), all(target_arch = "aarch64", feature = "desktop_firmware", any(feature = "baremetal", feature = "tegra")))))]
 fn keychars_repeat_tracker(tz: u32, tu: u32) -> Option<bool> {
     use crate::pal::{self, Event};
     let held_repeats = |tok: u32, want: Event| -> bool {
@@ -4271,7 +4271,7 @@ fn keychars_repeat_tracker(tz: u32, tu: u32) -> Option<bool> {
     Some(char_repeats && z_repeats && released)
 }
 
-#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), not(any(all(target_arch = "x86_64", feature = "ehcihid"), all(target_arch = "aarch64", feature = "baremetal")))))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), not(any(all(target_arch = "x86_64", feature = "ehcihid"), all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra"))))))]
 fn keychars_repeat_tracker(_tz: u32, _tu: u32) -> Option<bool> {
     None
 }

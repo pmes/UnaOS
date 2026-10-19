@@ -656,7 +656,7 @@ refs/heads/exec-rmbp-lockchanged    c68b67f0 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-hwtab2         ba1c1b81 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-fsearchicons   5582f4a8 IN-FLIGHT cloud wave36 FSEARCHICONS
 refs/heads/exec-rmbp-sbcframe       6f79b4d5 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-orinrepeat     ac54e385 IN-FLIGHT cloud wave36 ORINREPEAT
+refs/heads/exec-rmbp-orinrepeat     76408458 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-openargqueue   ac54e385 IN-FLIGHT cloud wave36 OPENARGQUEUE
 refs/heads/exec-rmbp-trashbatchdock ac54e385 IN-FLIGHT cloud wave36 TRASHBATCHDOCK
 refs/heads/exec-rmbp-prefsreload    ac54e385 IN-FLIGHT cloud wave36 PREFSRELOAD
