@@ -882,6 +882,11 @@ pub fn last_button() -> u8 {
 // [`notice`]: `what` names the refusal (the table [`REFUSALS`] sorts it — information is a toast, a refusal the
 // person caused is the alert, app-modal), `why` is the wire's own words. Once: the same `(what, why)` twice in a
 // row is said on the wire and shown once. Queue-only (try_lock, no `wm`), safe from the VFS and the boot path.
+//
+// REASK (rmbp-ledger B681, R130 law 2): "once" outlives the boot. A refusal's one answer is OK, so reaching the glass
+// IS the answer: it is recorded in Principia's store (`prefs::decide`, `system.decisions.<refusal_domain>.<key>`,
+// subject = `why`) when it is queued, and consulted first (`prefs::decided_quiet`, try_lock only): `[refusal] what=
+// why= -> remembered`. Settings > Privacy's Revoke shows it again.
 
 /// OPENERTRUST (B447): a file's `una:preferred` named a program that is not a registrant of its type.
 pub const WHAT_OPENER: &[u8] = b"Opener refused";
@@ -901,8 +906,22 @@ static REF_LAST: crate::sync::Mutex<([u8; 96], usize)> = crate::sync::Mutex::new
 static REF_ALERTS: AtomicU32 = AtomicU32::new(0);
 static REF_TOASTS: AtomicU32 = AtomicU32::new(0);
 
+/// REASK (B681): the decision domain a refusal `what` records under (`prefs::decide`).
+pub fn refusal_domain(what: &[u8]) -> &'static str {
+    use crate::prefs::decide;
+    if what == WHAT_OPENER {
+        decide::OPENER
+    } else if what == WHAT_FIRMWARE {
+        decide::FIRMWARE
+    } else if what == WHAT_SYSTEM_FILES {
+        decide::SYSFILES
+    } else {
+        decide::NOTICE
+    }
+}
+
 /// Show a refusal: the alert (an error the person caused, or one the table sorts as an error) or a toast.
-/// Returns `true` when something was queued for the glass (`false`: a repeat, or the queue was full).
+/// Returns `true` when something was queued for the glass (`false`: a repeat, remembered, or the queue was full).
 pub fn refused(what: &[u8], why: &[u8]) -> bool {
     refused_by(what, why, 0)
 }
@@ -911,6 +930,11 @@ pub fn refused(what: &[u8], why: &[u8]) -> bool {
 /// `0` = free-standing). A toast has no owner.
 pub fn refused_by(what: &[u8], why: &[u8], owner: u64) -> bool {
     let (kind, user) = REFUSALS.iter().find(|e| e.0 == what).map(|e| (e.1, e.2)).unwrap_or((Kind::Info, false));
+    let (dom, who) = (refusal_domain(what), core::str::from_utf8(why).unwrap_or("?"));
+    if crate::prefs::decided_quiet(dom, who, "-").is_some() {
+        serial_println!("[refusal] what={} why={} -> remembered owner={} (REASK B681: said once; Settings > Privacy revokes)", core::str::from_utf8(what).unwrap_or("?"), who, owner);
+        return false;
+    }
     let mut key = [0u8; 96];
     let mut kn = 0;
     for &b in what.iter().chain(b"\x1f".iter()).chain(why.iter()).take(key.len()) {
@@ -937,12 +961,78 @@ pub fn refused_by(what: &[u8], why: &[u8], owner: u64) -> bool {
             d.user = user;
             d.owner = owner;
             LAST_REF_OWNER.store(owner, Ordering::Relaxed);
-            post(d)
+            let p = post(d);
+            if p {
+                crate::prefs::decide(dom, who, "-", "seen"); // REASK (B681): its one answer (OK), kept
+            }
+            p
         }
         Kind::Info => {
             REF_TOASTS.fetch_add(1, Ordering::Relaxed);
-            super::toast::post(what, why)
+            let p = super::toast::post(what, why);
+            if p {
+                crate::prefs::decide(dom, who, "-", "seen"); // REASK (B681): FWPIN's toast, said once
+            }
+            p
         }
+    }
+}
+
+/// REASK (B681): drop the decision a refusal `(what, why)` recorded (a fixture's own legs; Settings revokes by key).
+fn forget_refusal(what: &[u8], why: &[u8]) {
+    let k = crate::prefs::decision_key(refusal_domain(what), core::str::from_utf8(why).unwrap_or("?"));
+    if crate::prefs::decisions().iter().any(|d| d.key == k) {
+        let _ = crate::prefs::revoke(&k);
+    }
+}
+
+/// REASK (B681): `tests reask`'s refusal legs — one per refusal domain, the fixture's own `why`.
+#[cfg(feature = "witness")]
+pub const REASK_LEGS: [(&[u8], &[u8]); 3] = [
+    (WHAT_OPENER, b"preferred=/apps/REASK.ELF refused=reask-fixture"),
+    (WHAT_SYSTEM_FILES, b"write id=0 principal=reask-fixture reason=system-owned"),
+    (WHAT_FIRMWARE, b"reask-ucode reason=reask-fixture"),
+];
+
+/// REASK (B681): raise each [`REASK_LEGS`] refusal once, headless, as a fresh boot would (the router's RAM repeat memory
+/// cleared first: only the store may remember). Returns the legs that reached the glass (bit i = leg i); an alert is
+/// answered. Saves and restores the glass's dialogs and toasts as `tests refusalui` does.
+#[cfg(feature = "witness")]
+pub fn reask_refusals() -> u32 {
+    let was = HEADLESS.swap(true, Ordering::Relaxed);
+    let saved = { let mut g = ST.lock(); (g.cur.take(), g.pend.take(), core::mem::replace(&mut g.win, wm::WIN_NONE), g.deadline) };
+    let tsaved = super::toast::fixture_hold(true);
+    let rsaved = REF_LAST.lock().1;
+    let mut shown = 0u32;
+    for (i, (what, why)) in REASK_LEGS.iter().enumerate() {
+        REF_LAST.lock().1 = 0;
+        if refused(what, why) {
+            shown |= 1 << i;
+            open_pending();
+            if is_up() {
+                answer(Answer::Default);
+            }
+        }
+    }
+    super::toast::fixture_drain();
+    super::toast::fixture_hold_restore(tsaved);
+    {
+        let mut g = ST.lock();
+        g.cur = saved.0;
+        g.pend = saved.1;
+        g.win = saved.2;
+        g.deadline = saved.3;
+    }
+    REF_LAST.lock().1 = rsaved;
+    HEADLESS.store(was, Ordering::Relaxed);
+    shown
+}
+
+/// REASK (B681): the [`REASK_LEGS`] decisions leave the store.
+#[cfg(feature = "witness")]
+pub fn reask_forget() {
+    for (what, why) in REASK_LEGS.iter() {
+        forget_refusal(what, why);
     }
 }
 
@@ -955,6 +1045,11 @@ pub fn toast_answer(owner: u64, token: u8, ix: u8) {
 /// `tests refusalui` (R80: run only when asked; model-only, headless):
 /// `:: REFUSALUI: opener=alert toast_action=answered fwpin=toast rootacl=alert -> PASS :: repeat=<once|why> queued=<n>`.
 pub fn refusalui_selftest() {
+    // REASK (B681): the legs' refusals were recorded as decisions by an earlier run — the fixture starts and ends without them.
+    const OWN: [(&[u8], &[u8]); 3] = [(WHAT_OPENER, b"preferred=/apps/EVIL.ELF refused=not-a-registrant"), (WHAT_SYSTEM_FILES, b"attr-set path=/system/types refused=system-tree principal=anon"), (WHAT_FIRMWARE, b"b43-ucode reason=unpinned")];
+    for (w, y) in OWN.iter() {
+        forget_refusal(w, y);
+    }
     let was = HEADLESS.swap(true, Ordering::Relaxed);
     let saved = { let mut g = ST.lock(); (g.cur.take(), g.pend.take(), core::mem::replace(&mut g.win, wm::WIN_NONE), g.deadline) };
     let tsaved = super::toast::fixture_hold(true);
@@ -1005,6 +1100,9 @@ pub fn refusalui_selftest() {
     }
     REF_LAST.lock().1 = rsaved;
     HEADLESS.store(was, Ordering::Relaxed);
+    for (w, y) in OWN.iter() {
+        forget_refusal(w, y);
+    }
     let pass = opener == "alert" && toast_action == "answered" && fwpin == "toast" && rootacl == "alert" && repeat == "once";
     serial_println!(
         ":: REFUSALUI: opener={} toast_action={} fwpin={} rootacl={} -> {} :: repeat={} queued={}",

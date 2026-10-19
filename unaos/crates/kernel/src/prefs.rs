@@ -58,6 +58,13 @@
 //! carries the session's uid; aarch64: its principal is the session's `user:` record) may SET, in any
 //! namespace — the file is the session user's. PrefChanged: see [`changed`].
 //!
+//! # Decisions (REASK, rmbp-ledger B681, R130 law 2)
+//!
+//! An answer the user gave to an ASK (apptrust's foreign-volume Open, a refusal alert, FWPIN's toast) is the user's
+//! word: it is stored ONCE here, as `system.decisions.<domain>.<key>` (the `general` domain file), consulted before
+//! the ask is raised again, and dropped only by a Revoke (Settings > Privacy). See [`decide`] / [`decided`] /
+//! [`revoke`] below.
+//!
 //! Witness: `:: PREFS: path=<p> loaded=<n> saved=<n> ns=system -> PASS ::` on load and on save;
 //! `[prefs] set <ns>.<key>=<value> ok=<0|1>` per change; `[prefs] changed <ns>.<key>` per accepted change.
 
@@ -406,9 +413,12 @@ pub fn ensure_loaded() { let (sk, sq) = PREFS_SEEN.check(); if sq.is_some() { re
 }
 
 /// The desktop service passes call this (settings, dock): the per-login load happens here, off the
-/// click paths — and the SETTINGSFILES delete watch.
+/// click paths — and the SETTINGSFILES delete watch, and REASK's (B681) owed decisions (persisted off the press route).
 pub fn service() {
     ensure_loaded();
+    if DECIDE_OWED.load(Ordering::Acquire) {
+        let _ = decisions_flush();
+    }
     let now = crate::arch::ms();
     if now.saturating_sub(WATCH_MS.load(Ordering::Relaxed)) >= WATCH_EVERY_MS {
         WATCH_MS.store(now, Ordering::Relaxed);
@@ -1376,4 +1386,262 @@ pub fn dongleboot_stat_probe() -> (usize, String, String, u32, bool) {
     let native = STORE_KIND.load(Ordering::Acquire) == 1;
     serial_println!("[prefs] stat domain={} mounts_walked={} device={} stats={} store={}", ds[0], walked, dev, n, if native { "native-root" } else { "full-table" });
     (walked, dev, ds[0].clone(), n, native)
+}
+
+// ── REASK (rmbp-ledger B681, R130 law 2) — a decision the user made is kept in THIS store and never asked again ──────
+//
+// Peter, R130: "everything else is ASK with the risk said once, then the user's word is final and Principia remembers
+// it." Every ASK seam records the answer here and consults it first; nothing expires (R130 law 1: no date the user does
+// not control) — only a Revoke drops one.
+//
+// * Key: `system.decisions.<domain>.<stem>-<fnv64>` — `<domain>` one of [`decide`]'s words; `<stem>` the subject's
+//   leaf in key characters (readable in `settings/general`), `<fnv64>` FNV-1a over the WHOLE subject (one key per
+//   subject). `prefs_core::files::domain_of` files `system.decisions.*` in `settings/general`.
+// * Value (a TOML string): `<answer> <at> <bind> <who>` — the answer word, the civil second it was given (0 = the clock
+//   was unset), what the answer is BOUND to (`-` = nothing; apptrust: the program's volume and stamp, so another
+//   program at the same path asks again), and the subject itself (the last field, may hold spaces).
+// * Recording is QUEUE-ONLY ([`decide`]: no I/O; the answers arrive on the press route) and the queue answers
+//   [`decided`] at once; [`service`] persists it through [`set`] (the one swap). [`revoke`] removes and saves.
+// * Wire: `[decision] record domain= key= answer= at= queued=1`, `[decision] consult domain= key= answer= age_d= ->
+//   remembered`, `[decision] stale domain= key= was= now= -> ask`, `[decision] persist key= ok=`, `[decision] revoke
+//   key= ok=`.
+
+/// The decisions' first key segment under `system`.
+pub const DECISIONS: &str = "decisions";
+
+/// The ASK seams that record a decision — the key's `<domain>` segment, one word each.
+pub mod decide {
+    /// `fs::apptrust`: a program on a foreign volume, answered `Open`.
+    pub const APPTRUST: &str = "apptrust";
+    /// `video::dialog::WHAT_OPENER`: a file's preferred opener refused.
+    pub const OPENER: &str = "opener";
+    /// `video::dialog::WHAT_FIRMWARE`: FWPIN's toast.
+    pub const FIRMWARE: &str = "firmware";
+    /// `video::dialog::WHAT_SYSTEM_FILES`: a write to the system trees refused.
+    pub const SYSFILES: &str = "sysfiles";
+    /// Any other refusal routed through `dialog::refused`.
+    pub const NOTICE: &str = "notice";
+}
+
+/// A subject is kept to this many bytes (the value stays one short line in `settings/general`).
+const WHO_MAX: usize = 160;
+/// The readable stem of a key.
+const STEM_MAX: usize = 24;
+
+/// One decision the user made.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Decision {
+    /// The full key under `system` (`decisions.<domain>.<stem>-<hash>`) — what [`revoke`] takes.
+    pub key: String,
+    pub domain: String,
+    pub answer: String,
+    /// Civil seconds when it was given (0 = the clock was unset).
+    pub at: u64,
+    pub bind: String,
+    pub who: String,
+}
+
+/// Decisions given and not yet persisted (`(key, value)`), answered by [`decided`] at once.
+static DECIDE_Q: crate::sync::Mutex<Vec<(String, String)>> = crate::sync::Mutex::new(Vec::new());
+/// The queue holds a decision the store has not seen ([`service`] persists it).
+static DECIDE_OWED: AtomicBool = AtomicBool::new(false);
+/// A fixture's civil second (`0` = the live clock). CONSOLEFIX M1: a fixture never sets the live clock — `tests reask`
+/// plants a `clock::FixtureClock` and hands its reading here.
+static DECIDE_NOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The decisions' view of the civil clock: the fixture's when one is planted, else the live clock (`try_lock`).
+fn decision_now() -> Option<u64> {
+    match DECIDE_NOW.load(Ordering::Acquire) {
+        0 => crate::clock::try_unix_now(),
+        n => Some(n),
+    }
+}
+
+/// `tests reask`: plant (`Some`) or drop (`None`) the fixture's civil second.
+pub fn decision_clock(fixture: Option<u64>) {
+    DECIDE_NOW.store(fixture.unwrap_or(0), Ordering::Release);
+}
+
+/// `s` cut to at most `n` bytes on a character boundary.
+fn clip(s: &str, n: usize) -> &str {
+    let mut e = s.len().min(n);
+    while !s.is_char_boundary(e) {
+        e -= 1;
+    }
+    &s[..e]
+}
+
+/// The subject as stored: clipped, printable (a byte outside 0x20..0x7e reads `?`).
+fn subject(who: &str) -> String {
+    clip(who, WHO_MAX).chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).collect()
+}
+
+/// A value field with no blank in it (the answer, the bind).
+fn field_word(s: &str) -> String {
+    let w: String = s.chars().map(|c| if c.is_ascii_graphic() { c } else { '_' }).collect();
+    if w.is_empty() { String::from("-") } else { w }
+}
+
+/// The key a `(domain, who)` decision lives at: `decisions.<domain>.<stem>-<fnv64 of who>`.
+pub fn decision_key(domain: &str, who: &str) -> String {
+    let leaf = who.trim_end_matches('/').rsplit('/').next().unwrap_or(who);
+    let mut stem: String = leaf.bytes().take(STEM_MAX).map(|b| if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' { b as char } else { '_' }).collect();
+    if stem.is_empty() {
+        stem.push('x');
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in who.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let dom = if prefs_core::valid_segment(domain) { domain } else { decide::NOTICE };
+    alloc::format!("{}.{}.{}-{:016x}", DECISIONS, dom, stem, h)
+}
+
+/// Parse a stored decision (`None` = not a decision's key or value).
+fn parse_decision(key: &str, v: &str) -> Option<Decision> {
+    let rest = key.strip_prefix(DECISIONS)?.strip_prefix('.')?;
+    let domain = rest.split('.').next()?;
+    let mut it = v.splitn(4, ' ');
+    let answer = it.next()?;
+    let at = it.next()?.parse::<u64>().ok()?;
+    let bind = it.next()?;
+    let who = it.next().unwrap_or("");
+    Some(Decision { key: String::from(key), domain: String::from(domain), answer: String::from(answer), at, bind: String::from(bind), who: String::from(who) })
+}
+
+/// The stored value at `key`: the queue first (given, not yet persisted), then the tree. `blocking = false` takes
+/// every lock with `try_lock` (a busy lock reads as no decision: the caller asks, it never spins).
+fn decision_value(key: &str, blocking: bool) -> Option<String> {
+    let q = if blocking { Some(DECIDE_Q.lock()) } else { DECIDE_Q.try_lock() };
+    if let Some(v) = q.as_ref().and_then(|q| q.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone())) {
+        return Some(v);
+    }
+    drop(q);
+    let t = if blocking { Some(TREE.lock()) } else { TREE.try_lock() };
+    t?.get(NS, key).and_then(|v| v.as_str().map(String::from))
+}
+
+fn consult(domain: &str, who: &str, bind: &str, blocking: bool) -> Option<String> {
+    let key = decision_key(domain, who);
+    let d = parse_decision(&key, &decision_value(&key, blocking)?)?;
+    if d.who != subject(who) {
+        serial_println!("[decision] collision domain={} key={} -> ask", domain, key);
+        return None;
+    }
+    let bw = field_word(bind);
+    if d.bind != bw {
+        serial_println!("[decision] stale domain={} key={} was={} now={} -> ask", domain, key, d.bind, bw);
+        return None;
+    }
+    let age = match decision_now() {
+        Some(n) if d.at != 0 => alloc::format!("{}", n.saturating_sub(d.at) / 86_400),
+        _ => String::from("?"),
+    };
+    serial_println!("[decision] consult domain={} key={} answer={} age_d={} -> remembered (R130)", domain, key, d.answer, age);
+    Some(d.answer)
+}
+
+/// The user's answer to the `(domain, who)` ask, if they gave one bound to `bind` — consulted BEFORE the ask is raised.
+/// No expiry: the civil clock only dates it (`age_d=` on the wire). Never does I/O.
+pub fn decided(domain: &str, who: &str, bind: &str) -> Option<String> {
+    consult(domain, who, bind, true)
+}
+
+/// [`decided`] for a path that must never spin (the refusal router, reached from the VFS): every lock `try_lock`.
+pub fn decided_quiet(domain: &str, who: &str, bind: &str) -> Option<String> {
+    consult(domain, who, bind, false)
+}
+
+/// Record the user's `answer` to the `(domain, who)` ask, bound to `bind` (`-` = nothing). QUEUE-ONLY (no I/O: the
+/// press route calls it); [`decided`] answers it at once and [`service`] persists it. Replaces an earlier answer.
+pub fn decide(domain: &str, who: &str, bind: &str, answer: &str) {
+    let key = decision_key(domain, who);
+    let at = decision_now().unwrap_or(0);
+    let aw = field_word(answer);
+    let v = alloc::format!("{} {} {} {}", aw, at, field_word(bind), subject(who));
+    {
+        let mut q = DECIDE_Q.lock();
+        q.retain(|(k, _)| *k != key);
+        q.push((key.clone(), v));
+    }
+    DECIDE_OWED.store(true, Ordering::Release);
+    serial_println!("[decision] record domain={} key={} answer={} at={} queued=1", domain, key, aw, at);
+}
+
+/// Persist the queued decisions through [`set`] (the domain file's swap). A decision whose save fails stays queued (it
+/// still answers this boot) and is said. Returns the decisions persisted.
+pub fn decisions_flush() -> usize {
+    DECIDE_OWED.store(false, Ordering::Release);
+    let q = DECIDE_Q.lock().clone();
+    let mut n = 0usize;
+    for (k, v) in q {
+        match set(NS, &k, PrefValue::Str(v.clone())) {
+            Ok(()) => {
+                DECIDE_Q.lock().retain(|(qk, qv)| !(*qk == k && *qv == v));
+                n += 1;
+            }
+            Err(e) => serial_println!("[decision] persist key={} ok=0 why={} (kept in RAM for this boot)", k, e),
+        }
+    }
+    if n > 0 {
+        serial_println!("[decision] persist n={} ok=1", n);
+    }
+    n
+}
+
+/// Every decision the user made (the store's, then any not yet persisted) — Settings > Privacy's rows.
+pub fn decisions() -> Vec<Decision> {
+    let mut out: Vec<Decision> = {
+        let t = TREE.lock();
+        t.list(NS)
+            .into_iter()
+            .filter_map(|(k, v)| if k.starts_with(DECISIONS) { v.as_str().and_then(|s| parse_decision(k, s)) } else { None })
+            .collect()
+    };
+    if let Some(q) = DECIDE_Q.try_lock() {
+        for (k, v) in q.iter() {
+            if !out.iter().any(|d| d.key == *k) {
+                if let Some(d) = parse_decision(k, v) {
+                    out.push(d);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Revoke the decision at `key` (a [`Decision::key`]): it leaves the queue and the tree and its domain file is saved, so
+/// the next ask asks. A failed save puts it back (store and RAM never disagree). `true` = a decision was dropped.
+pub fn revoke(key: &str) -> bool {
+    ensure_loaded();
+    let queued = {
+        let mut q = DECIDE_Q.lock();
+        let n = q.len();
+        q.retain(|(k, _)| k != key);
+        n != q.len()
+    };
+    let old = TREE.lock().remove(NS, key);
+    if let Some(v) = &old {
+        if let Err(e) = save_domain(&prefs_core::files::domain_of(NS, key)) {
+            let _ = TREE.lock().set(NS, key, v.clone());
+            serial_println!("[decision] revoke key={} ok=0 why={} (kept)", key, e);
+            return false;
+        }
+    }
+    let ok = queued || old.is_some();
+    serial_println!("[decision] revoke key={} ok={} -> the next ask asks", key, ok as u8);
+    ok
+}
+
+/// `tests reask`'s reboot: the RAM a reboot loses (the tree, the unpersisted queue, the session's load record) is
+/// cleared and the store is read back from its files by the one [`load`]. Returns the keys loaded.
+pub fn reload_from_store() -> usize {
+    DECIDE_Q.lock().clear();
+    DECIDE_OWED.store(false, Ordering::Release);
+    *TREE.lock() = PrefTree::new();
+    *LOADED_FOR.lock() = None;
+    PREFS_SEEN.forget();
+    ensure_loaded();
+    TREE.lock().len()
 }
