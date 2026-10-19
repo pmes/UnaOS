@@ -66,7 +66,7 @@ pub const ACT_OPEN_DIR: u8 = 2;
 /// A program's own action: `arg` = owner (8 bytes LE) + token (4 bytes LE) + button (1); answered on the dialog bus path.
 pub const ACT_ANSWER: u8 = 3;
 /// NOTIFYCENTER (B622): open the file at the path in `arg` in the image viewer (`facet::request_open`).
-pub const ACT_OPEN_FILE: u8 = 4;
+pub const ACT_OPEN_FILE: u8 = 4; pub const ACT_UNDO: u8 = 5; // UNDOMOVE (B716): Quarry's undo of the journal entry whose seq is `arg` (8 bytes LE), `quarry::undo::from_toast`. Same-line fold: notify.rs is in every furniture image.
 
 /// Principia's key (namespace `system`).
 pub const KEY_DND: &str = "notify.dnd";
@@ -627,7 +627,7 @@ fn run_action(n: &Note) {
             let ok = false;
             if ok { "quarry-opened" } else { "quarry-declined" }
         }
-        ACT_ANSWER => answer_poster(n.arg()), // REFUSALUI (B468): the bus poster gets INPUT_EV_DIALOG_ANSWER
+        ACT_ANSWER => answer_poster(n.arg()), #[cfg(feature = "quarry")] ACT_UNDO => super::quarry::undo::from_toast(n.arg()), // UNDOMOVE (B716): the Trash toast's Undo (same-line fold, code before the comment). REFUSALUI (B468): the bus poster gets INPUT_EV_DIALOG_ANSWER
         ACT_OPEN_FILE => {
             // NOTIFYCENTER (B622): the viewer's click-safe latch (drained by its own service pass).
             #[cfg(feature = "facet")]

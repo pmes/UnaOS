@@ -98,3 +98,9 @@ pub fn unplug_mark() -> Option<alloc::string::String> { None }
 #[cfg(not(feature = "quarry"))]
 #[inline(always)]
 pub fn unplug_click() -> bool { false }
+
+// UNDOMOVE (rmbp-ledger B716): Quarry's ONE undo journal (`live::undo`, `video/quarry/undo.rs`), named at the seam so
+// notify's `ACT_UNDO`, the Edit menu's Undo/Redo rows and `tests undomove` reach it as `video::quarry::undo`.
+// Appended at the file's end: nothing above it moves, and with `quarry` off it compiles to nothing.
+#[cfg(feature = "quarry")]
+pub use live::undo;

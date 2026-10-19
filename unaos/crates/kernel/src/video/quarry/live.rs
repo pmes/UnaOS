@@ -2251,6 +2251,10 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
         key_witness(c, true, true);
         return true;
     }
+    // UNDOMOVE (B716): Ctrl+Z folds to 0x1A (xhci `hid_key_ascii`; Shift does not change the fold), so the two chords
+    // are told apart by the latest report's Shift (`keymap::shift_held`): Ctrl+Shift+Z redoes, Ctrl+Z undoes.
+    if c == 0x1A && crate::video::keymap::shift_held() { let _ = undo::redo(); key_witness(c, true, true); return true; }
+    if c == 0x1A { let _ = undo::undo(); key_witness(c, true, true); return true; }
     if q3_key(c) { key_witness(c, true, true); repaint(); return true; } if columns::key(c) { key_witness(c, true, true); repaint(); return true; } // QUARRY3 (B413): search field, Quick Look, icon arrows, `<` `>` `v` `/` first; QUARRY2 (B336): `s` sort column, `[`/`]` column width
     let mut acted = true;
     let mut refreshed = false;
@@ -4873,3 +4877,7 @@ pub fn unplug_mark() -> Option<String> {
 pub fn unplug_click() -> bool {
     removed_click() && !is_open()
 }
+
+// UNDOMOVE (rmbp-ledger B716): the one undo journal — every namespace verb's inverse; Ctrl+Z / Ctrl+Shift+Z in `key_route`.
+#[path = "undo.rs"]
+pub mod undo;
