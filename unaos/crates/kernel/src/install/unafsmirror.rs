@@ -146,7 +146,7 @@ impl<T: InstallTarget> SectorDevice for TargetSectors<'_, T> {
 pub fn fsck_target<T: InstallTarget>(t: &mut T, first_lba: u64, block_count: u64) -> Result<bool, &'static str> {
     let span = PartitionSpan { base_lba: first_lba, block_count };
     let adapter = BlockAdapter::for_partition(TargetSectors(t), &span);
-    let mut fs = ::unafs::UnaFS::mount(adapter).map_err(|_| "the copy did not mount")?;
+    let mut fs = ::unafs::UnaFS::mount(adapter).map_err(|e| if matches!(e, ::unafs::fs::FileSystemError::KeyRequired) { "the volume is keyed: it opens only with its key, which the install does not carry" } else { "the copy did not mount" })?; // KEYBOOT (B688): a keyed copy says so
     let r = fs.fsck(false).map_err(|_| "fsck errored")?;
     Ok(r.is_clean())
 }
@@ -158,7 +158,7 @@ pub fn fsck_target<T: InstallTarget>(t: &mut T, first_lba: u64, block_count: u64
 pub fn grow_target<T: InstallTarget>(t: &mut T, first_lba: u64, span_blocks: u64, want: u64) -> Result<(u64, u64, bool), &'static str> {
     let span = PartitionSpan { base_lba: first_lba, block_count: span_blocks };
     let adapter = BlockAdapter::for_partition(TargetSectors(t), &span);
-    let mut fs = ::unafs::UnaFS::mount(adapter).map_err(|_| "the volume did not mount")?;
+    let mut fs = ::unafs::UnaFS::mount(adapter).map_err(|e| if matches!(e, ::unafs::fs::FileSystemError::KeyRequired) { "the volume is keyed: it opens only with its key, which the install does not carry" } else { "the volume did not mount" })?; // KEYBOOT (B688): a keyed copy says so
     let from = fs.superblock.block_count;
     let r = fs.grow(want.max(from)).map_err(|_| "the grow was refused")?;
     let clean = fs.fsck(false).map(|rep| rep.is_clean()).unwrap_or(false);

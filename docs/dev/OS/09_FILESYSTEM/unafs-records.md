@@ -136,6 +136,18 @@ data blocks are plaintext. A `cipher = 1` slot comes only with a CIPHERED volume
 * What `cipher = 0` is NOT: the data blocks are plaintext, so a raw read of the medium sees them, and
   erasing sector 1 makes the volume mount unkeyed. The slot gates every reader that goes through the
   crate (the kernel, `tools/unafs`, the installer). `cipher = 1` (§R2b) closes both.
+* The LIVE ROOT (KEYBOOT, rmbp-ledger B688). The kernel keys the volume it boots from at ONE moment: the
+  first administrator's account (`users::installer_create_user`, R100) seals a slot with that password at
+  `una_abi::RING_KDF_*` costs and writes it through the bound mount (`set_key_slot`) — only a native UnaFS root,
+  only when it is unkeyed, only in an image that carries the unlock form. The 24 words are shown ONCE on the
+  login screen (a Continue that needs a click) and dropped. On every later boot the root is keyed before anyone
+  types, so the boot HOLDS before the root binds: `unafs::keyboot_probe` reads this sector (no mount), the login
+  screen's unlock form takes the password or the words, and `unafs::unlock_root` opens the volume with
+  `KeySlot::unwrap` then `UnaFS::mount_with_key` and binds it as the one mount; that key stays with the open
+  root (RAM, wiped on drop) so a rebind re-opens it. A password change of the keying administrator RE-WRAPS the
+  slot: `KeySlot::rewrap_password` keeps bytes 0..48 (the recovery wrap's AAD binds them) and re-seals the data
+  key under Argon2id(new) with a fresh nonce; `UnaFS::replace_key_slot` writes it (sector 0 byte-identical). The
+  recovery words and the data key do not change.
 
 ## §R2b Ciphered volume (version 8; XTS, rmbp-ledger B689 = VOLKEY M2)
 

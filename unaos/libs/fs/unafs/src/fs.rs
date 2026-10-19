@@ -477,7 +477,16 @@ impl<D: BlockDevice> UnaFS<D> {
     /// [`FileSystemError::KeyRequired`] before anything past block 0 is read — it opens only through
     /// [`mount_with`](Self::mount_with). An unkeyed volume mounts exactly as before.
     pub fn mount(device: D) -> Result<Self, FileSystemError> {
-        Self::mount_keyed(device, None)
+        Self::mount_keyed(device, None, None)
+    }
+
+    /// KEYBOOT (B688): mount a keyed volume with its already-unwrapped data key — the kernel's pre-boot unlock
+    /// (one Argon2id: `KeySlot::unwrap`, then this) and its rebind of the same root. A [`VolumeKey`](crate::keyslot::VolumeKey)
+    /// is minted only by `KeySlot::unwrap`/`seal`; the caller passes the key of THIS volume's slot (M1's blocks are
+    /// plaintext, so the key is not consulted further; M2's cipher reads with it). An unkeyed volume mounts as
+    /// [`mount`](Self::mount) does.
+    pub fn mount_with_key(device: D, key: &crate::keyslot::VolumeKey) -> Result<Self, FileSystemError> {
+        Self::mount_keyed(device, None, Some(key))
     }
 
     /// VOLKEY (B684): mount with the volume's key — its password (Argon2id at the slot's recorded costs) or
@@ -491,10 +500,10 @@ impl<D: BlockDevice> UnaFS<D> {
     /// then on (decrypt on read, encrypt on write), installed before anything past block 0 is read; a device
     /// that cannot carry it refuses ([`StorageError::NoCipher`]).
     pub fn mount_with(device: D, unlock: &crate::keyslot::Unlock<'_>) -> Result<Self, FileSystemError> {
-        Self::mount_keyed(device, Some(unlock))
+        Self::mount_keyed(device, Some(unlock), None)
     }
 
-    fn mount_keyed(mut device: D, unlock: Option<&crate::keyslot::Unlock<'_>>) -> Result<Self, FileSystemError> {
+    fn mount_keyed(mut device: D, unlock: Option<&crate::keyslot::Unlock<'_>>, key: Option<&crate::keyslot::VolumeKey>) -> Result<Self, FileSystemError> {
         let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
         device.read_block(0, &mut sb_block)?;
         // XTS (B689): a ciphered slot sits under a v8 stamp and the layout beneath is v7's; any other pairing
@@ -508,7 +517,7 @@ impl<D: BlockDevice> UnaFS<D> {
             set_stamp(&mut sb_block, crate::superblock::VERSION_PAGED_MAPS);
         }
         let superblock = Superblock::from_bytes(&sb_block)?;
-        if let Some(slot) = &key_slot {
+        if let (Some(slot), None) = (&key_slot, key) {
             let Some(u) = unlock else {
                 return Err(FileSystemError::KeyRequired);
             };
@@ -517,6 +526,12 @@ impl<D: BlockDevice> UnaFS<D> {
                 device.set_cipher(Some(crate::storage::VolumeCipher::new(&key)?))?;
             }
             drop(key);
+        }
+        // KEYBOOT x XTS (the fold): the pre-unwrapped key of a ciphered volume installs the cipher the same way.
+        if let (Some(_), Some(k)) = (&key_slot, key) {
+            if ciphered {
+                device.set_cipher(Some(crate::storage::VolumeCipher::new(k)?))?;
+            }
         }
 
         let loaded = Self::load_committed(&mut device, &superblock)?;
@@ -918,6 +933,23 @@ impl<D: BlockDevice> UnaFS<D> {
         });
         if wrote.is_err() {
             self.key_slot = None;
+        }
+        wrote
+    }
+
+    /// KEYBOOT (B688): REPLACE a keyed volume's slot (a password change: [`KeySlot::rewrap_password`](crate::keyslot::KeySlot::rewrap_password))
+    /// — [`set_key_slot`](Self::set_key_slot) without the `AlreadyKeyed` refusal: block 0 rewritten with sector 0
+    /// byte-identical, then flushed; a failed write leaves the previous slot in RAM (the disk holds the old or the new).
+    pub fn replace_key_slot(&mut self, slot: crate::keyslot::KeySlot) -> Result<(), FileSystemError> {
+        let sb = self.superblock.clone();
+        let prev = self.key_slot.replace(slot);
+        let wrote = self.block0(&sb).and_then(|b| {
+            self.device.write_block(0, &b)?;
+            self.device.flush()?;
+            Ok(())
+        });
+        if wrote.is_err() {
+            self.key_slot = prev;
         }
         wrote
     }

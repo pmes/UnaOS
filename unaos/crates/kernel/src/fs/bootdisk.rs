@@ -596,7 +596,7 @@ pub fn survey() -> Survey {
         }
     }
     // The walk runs OUTSIDE both locks (see [`CACHE`]): a long disk read never holds one.
-    let v = walk_and_witness();
+    let v = walk_and_witness(); if keyboot_locked() { return v; } // KEYBOOT (B688): while the keyed root is locked (the unlock hold) no answer is cached, neither CACHE nor PENDING — the root binds after the unlock (LINE-NEUTRAL append, before this comment; body at the tail)
     if v.root.is_some() {
         *PENDING.lock() = None;
         *CACHE.lock() = Some(v.clone()); crate::bootpace::record_once(&ROOT_BIND_STAMP, "root-bind"); // BOOTSLOW (rmbp-ledger B201): the BPACE `root-bind` rung — the instant the boot first HAS a root, stamped where the answer is cached and nowhere else, so every caller (the root pass, a verb, a fixture) reports the same moment. `record_once` because two walks can race to this line. ⚠ LINE-NEUTRAL fold, statement BEFORE the comment; the latch and the root pass are at this file's tail.
@@ -3045,4 +3045,17 @@ fn unafsx86_witness(src: BlockSource, native_root: bool) {
         if native_root { "/home" } else { "/HOME" },
         if native_root { "mounted" } else { "skipped reason=fat-root" }
     );
+}
+
+/// KEYBOOT (rmbp-ledger B688): the keyed root is locked — the boot holds at the unlock form and a survey now would
+/// see the root refuse its bind (`KeyRequired`) and settle on another volume. [`survey`] caches nothing then.
+fn keyboot_locked() -> bool {
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        crate::fs::unafs::root_locked()
+    }
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
+    {
+        false
+    }
 }
