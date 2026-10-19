@@ -148,7 +148,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); crate::pwwire::ensure_tests(); // CONSOLEFIX (B365): `tests pwwire`, `tests notice`. LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
     ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::smallfix6::ensure(); crate::smallfix7::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); ensure_fpu(); #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] { crate::video::cursor::cursorshape::ensure(); } /* CURSORSHAPE: the module is gated so (cursor.rs tail); ARMVIRT found the ungated call reds every aarch64 kernel without el0 */ // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); #[cfg(target_arch = "x86_64")] crate::loaderstage::ensure_tests(); crate::soundopeners::ensure(); // LOADERSTALL (B490): `tests loader`. FILETYPE (B307): `tests filetype`.
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::wm::k2p::ensure_tests(); // K2P (B671): `tests k2p` — 200 synthetic reports through the input-to-photon carriers (`video/wm.rs` tail). LINE-NEUTRAL append, code before the comment.
+    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::wm::k2p::ensure_tests(); // K2P (B671): `tests k2p` — 200 synthetic reports through the input-to-photon carriers (`video/wm.rs` tail). LINE-NEUTRAL append, code before the comment. 
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::shotmask::ensure_tests(); crate::video::blitter::ensure_tests(); crate::prof::ensure_tests(); crate::video::text::ensure_tests(); crate::video::metrics::ensure_tests(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::video::menubar::ensure_tests(); // MENUBARSLOTS (B499): `tests menubar`. GLASSEYES (B343): `tests shot`. KCOMP (B321): `tests blitter`. PROFILE (B331): `tests prof`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); #[cfg(target_arch = "x86_64")] crate::execname::ensure(); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] /* ARMNOEL0: the prefs_client cfg (lib.rs) */ crate::prefs_client::ensure_tests(); #[cfg(feature = "selfdiag")] crate::selfdiag::ensure(); // EXECNAME (B322): `tests exec`. SETTINGSBUS (B337): `tests settingsbus`. SELFDIAG (B324): `tests selfdiag`. (merge12 fold: one line)
     if args.first().copied() == Some("list") {
@@ -637,6 +637,73 @@ pub fn defer_polled(name: &'static str, f: fn(), latch: &AtomicBool) -> bool {
         register(name, f);
     }
     true
+}
+
+// IDLENET (rmbp-ledger B672, BP-bar-1) — TAIL-APPENDED. `tests idlenet` (the stack's outbound ledger over an idle window,
+// `net_tick::idlenet_selftest`) and `tests nicabsent` (a boot with no NIC builds its desktop without waiting on a net
+// starter). Registered from the verb only: the idle window sleeps 60 s on the shell job, never at boot.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn ensure_idlenet() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) {
+        register("idlenet", crate::net_tick::idlenet_selftest);
+        #[cfg(feature = "wc")]
+        register("nicabsent", nicabsent_selftest);
+    }
+}
+
+/// The net starters among the desktop bar's held starters (`video/desktopbuild.rs` `steps::STARTERS`): a NIC-absent
+/// boot must hold none of them.
+#[cfg(all(feature = "smolnet", feature = "wc", target_arch = "x86_64"))]
+const NET_STARTERS: [&str; 2] = ["usbnet", "wifi"];
+
+/// NICABSENT's judge, pure: `nic` = a NIC was found (the fixture is for a boot without one); `built` = the desktop's
+/// bar was said; `waited` = how many of [`NET_STARTERS`] the bar held (`None` = that census is not readable here).
+#[cfg(all(feature = "smolnet", feature = "wc", target_arch = "x86_64"))]
+fn nicabsent_judge(nic: bool, built: bool, waited: Option<u32>) -> &'static str {
+    match (nic, built, waited) {
+        (true, _, _) => "SKIP reason=nic-present",
+        (false, false, _) => "FAIL reason=no-desktop",
+        (false, true, None) => "SKIP reason=starter-census-owed",
+        (false, true, Some(0)) => "PASS",
+        (false, true, Some(_)) => "FAIL reason=net-starter-waited",
+    }
+}
+
+/// NICABSENT — `tests nicabsent`: a boot with no e1000 and no USB Ethernet reached `[desktop] built` and its bar held no
+/// net starter (no `[desktop] starter after-bar who=usbnet|wifi`, no `held_starters=` naming one). The held-starter
+/// census is `video::desktopbuild::net_starters_held` over `steps::SAID | HELD` (a `None` census, which no caller passes
+/// now, stays `SKIP reason=starter-census-owed` — never a PASS on an unread input). The judge's own table runs first
+/// (a wrong row is a FAIL).
+/// `:: NICABSENT: nic=<0|1> built=<0|1> bar_ms=<n|none> net_starters_waited=<n|owed> table=<ok>/<n> -> PASS|FAIL|SKIP ::`
+#[cfg(all(feature = "smolnet", feature = "wc", target_arch = "x86_64"))]
+fn nicabsent_selftest() {
+    let table: [((bool, bool, Option<u32>), &str); 5] = [
+        ((true, true, Some(0)), "SKIP reason=nic-present"),
+        ((false, false, Some(0)), "FAIL reason=no-desktop"),
+        ((false, true, None), "SKIP reason=starter-census-owed"),
+        ((false, true, Some(0)), "PASS"),
+        ((false, true, Some(1)), "FAIL reason=net-starter-waited"),
+    ];
+    let ok = table.iter().filter(|(a, want)| nicabsent_judge(a.0, a.1, a.2) == *want).count();
+    let e1000 = crate::drivers::e1000::nic_present();
+    #[cfg(feature = "usbnet")]
+    let dongle = crate::drivers::xhci::usbnet::kind() != 0;
+    #[cfg(not(feature = "usbnet"))]
+    let dongle = false;
+    let bar = crate::video::desktopbuild::last_bar_ms();
+    let waited: Option<u32> = Some(crate::video::desktopbuild::net_starters_held(&NET_STARTERS));
+    let verdict = if ok != table.len() { "FAIL reason=judge-table" } else { nicabsent_judge(e1000 || dongle, bar.is_some(), waited) };
+    serial_println!(
+        ":: NICABSENT: nic={} built={} bar_ms={} net_starters_waited={} table={}/{} -> {} ::",
+        (e1000 || dongle) as u8,
+        bar.is_some() as u8,
+        bar.map(|b| alloc::format!("{}", b)).unwrap_or_else(|| alloc::string::String::from("none")),
+        waited.map(|w| alloc::format!("{}", w)).unwrap_or_else(|| alloc::string::String::from("owed")),
+        ok,
+        table.len(),
+        verdict
+    );
 }
 
 // APPLAUNCH (rmbp-ledger B678, BP-bar-7) — TAIL-APPENDED. `tests applaunch`: the SMALLEST windowed ring-3 ELF under

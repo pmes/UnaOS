@@ -14276,9 +14276,11 @@ jobs_image() {
 # plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
 # `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
 #   GATEPATH selftest: plants=<n> caught=<n> -> PASS
-GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py"
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py"
 # BLUEPRINT (2026-10-19, Peter: "a set of blueprints … a front-side gate"): docs/dev/blueprint/ sheets — every anchor
 # exists at its line, BP-ids unique and stem-named, every sheet listed and ≤ 120 lines, no claim words (blueprint-check.py).
+# NONET (B672, BP-bar-10): no fn reachable from the video/ furniture (menubar, dock, crystal, notify, strip, settings,
+# login) calls smolnet / net_fetch / net_dns / netring3 — a call walk over `use` aliases and paths (nonet-check.py).
 # TOOLING1 (2026-10-13; ARCH-CONFORMANCE 14, rmbp-ledger B107): the last two rows are the bench's two SCORERS'
 # own self-tests, headless and seconds-long (mbench ~4 s, of which most is its FIFO round-trip; specscore ~1 s).
 # `mbench --self-test` was reachable only through `check`'s GATE-HOSTTESTS (behind the cargo legs) and
@@ -14298,6 +14300,7 @@ _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary li
         knob-parity-pi)   e=(--line "$R/unaos/scripts/image-line-pi.env" --board pi) ;;       # ARMPARITY: the Pi line against kernel8()'s K8_FEATS arms, Cargo, banner-cert, k8-reach; shared knobs also against the x86 maps
         mbench-selftest|specscore) e=(--self-test) ;;   # TOOLING1: the scorers' own self-tests (see GATES_SET)
         blueprint) e=("$R") ;;   # BLUEPRINT: the repo root (the sheets are docs/dev/blueprint/, the anchors are tree paths)
+        nonet) e=("$R/unaos") ;;   # NONET (B672): the unaos dir (the walk reads crates/kernel/src)
         *) e=() ;;
     esac
     local tdir="$R/unaos/target/gates-tmp"; mkdir -p "$tdir" 2>/dev/null || tdir="${TMPDIR:-}"
@@ -14329,6 +14332,7 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         mbench-selftest) sed -i 's/, r"-> FLICKER"\]/]/' "$C/unaos/scripts/mbench.py"; echo "SELF-TEST FAIL" ;; # TOOLING1: a default FORBID dropped from DEFAULT_FORBIDS — every spec silently stops forbidding it (renaming RC_TRUNCATED was tried first and MISSED: the self-test compares against the constant, so it moves with it)
         specscore)  sed -i 's/^    return DEAD, (f"the only site/    return WIRE, (f"the only site/' "$C/unaos/scripts/orin-specscore.py"; echo "SPECSCORE SELF-TEST FAIL" ;; # TOOLING1: a compiled-out emitter read as reachable — the coverage lie the tool exists to catch
         blueprint)  mkdir -p "$C/docs/dev/blueprint" && printf '| BP-zzgateplant-1 | plant | `unaos/zz_gateplant_nowhere.rs` | - |\n' > "$C/docs/dev/blueprint/zzgateplant.md"; echo zz_gateplant_nowhere ;; # BLUEPRINT: a sheet citing a file that is not in the tree
+        nonet)      printf 'pub fn fetch_feed() { let _ = crate::smolnet::resolve("feed.invalid"); }\n' > "$K/video/zz_gateplant_nonethop.rs" && printf 'pub fn paint() { crate::video::zz_gateplant_nonethop::fetch_feed(); }\n' > "$K/video/dockzz_gateplant_nonet.rs"; echo zz_gateplant_nonethop ;; # NONET (B672): a dock fn reaching the resolver through a helper one module away (the walk, not the file's own text)
         *) return 1 ;;
     esac
 }
@@ -14371,7 +14375,7 @@ gates_selftest() {
         else
             echo "plant=${n} token=${tok:-<none>} rc=${rc} -> MISSED  (${line})"
         fi
-        rm -f "$C"/unaos/crates/kernel/src/video/zz_gateplant_*.rs "$C/docs/dev/blueprint/zzgateplant.md"; rm -rf "$C/zzgateplant"
+        rm -f "$C"/unaos/crates/kernel/src/video/zz_gateplant_*.rs "$C"/unaos/crates/kernel/src/video/dockzz_gateplant_*.rs "$C/docs/dev/blueprint/zzgateplant.md"; rm -rf "$C/zzgateplant"
         cp -p "$C.bak/STATUS.tsv" "$C/docs/dev/"; cp -p "$C.bak/lib.rs" "$C/unaos/libs/sys/midden_core/src/"
         cp -p "$C.bak/banner-cert.sh" "$C.bak/mbench.py" "$C.bak/orin-specscore.py" "$C/unaos/scripts/"; cp -p "$C.bak/arroyo" "$C/unaos/"
     done
