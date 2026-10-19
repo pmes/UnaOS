@@ -2954,3 +2954,126 @@ mod a11ytree_tests {
 
 /// The una-abi version the tree speaks. `tests abielf` refuses a fixture that claims a higher one.
 pub const ABI_VERSION: u32 = 1;
+
+// =================================================================================================
+// RAISEVERB (rmbp-ledger B722; BP-video-23, BP-bar-18) — A PROGRAM ASKS FOR ITS OWN WINDOW TO COME FORWARD. The
+// kernel routes the ask to the window manager's focus policy (FOCUSSTEAL): the window is RAISED and handed the
+// keyboard only when the user is talking to it — it already holds focus, or its program was launched by the user's
+// verb (the glass or a typed line) within the verb window (2 s) — and otherwise its dock tile PULSES once and
+// nothing moves. A program may ask only for a window it owns: another program's window is -EPERM.
+//
+// REQUEST body: [`WINDOW_RAISE_BODY_LEN`] bytes, `win u32` LE — the id `SYS_WIN_CREATE` returned. Any other length is
+// -EINVAL; a free id is -EBADF; another owner's window is -EPERM.
+// REPLY body (status 0): one byte, [`WINDOW_RAISE_GIVEN`] or [`WINDOW_RAISE_PULSED`].
+// ADDITIVE (a new verb number at the tail): `ABI_VERSION` stays 1. A kernel with no arm for it answers -EINVAL.
+// [`window_raise`] is the ring-3 helper (the caller passes its own syscall stub, so this crate stays asm-free and
+// static-free). Appended at the tail so no existing line moves.
+// =================================================================================================
+
+/// Bus verb: raise the caller's own window (see the block above).
+pub const BUS_VERB_WINDOW_RAISE: u8 = 26; // 25 is BUS_VERB_A11Y_TREE
+const _: () = assert!(BUS_VERB_WINDOW_RAISE > BUS_VERB_A11Y_TREE && BUS_VERB_WINDOW_RAISE < BUS_VERB_REGISTER);
+/// Not permitted: the window named is not the caller's (RAISEVERB's foreign ask).
+pub const EPERM: i64 = -1;
+/// The request body's length: `win u32` LE.
+pub const WINDOW_RAISE_BODY_LEN: usize = 4;
+/// Reply byte: the window came forward and holds the keyboard.
+pub const WINDOW_RAISE_GIVEN: u8 = 1;
+/// Reply byte: the user is elsewhere — the window stayed where it was and its dock tile pulsed once.
+pub const WINDOW_RAISE_PULSED: u8 = 2;
+/// The request frame's length.
+pub const WINDOW_RAISE_FRAME_LEN: usize = BUS_HDR_LEN + WINDOW_RAISE_BODY_LEN;
+
+/// The WINDOW_RAISE request frame for `win` under correlation id `corr`.
+pub const fn window_raise_frame(win: u32, corr: u32) -> [u8; WINDOW_RAISE_FRAME_LEN] {
+    let mut f = [0u8; WINDOW_RAISE_FRAME_LEN];
+    f[0] = BUS_MAGIC[0];
+    f[1] = BUS_MAGIC[1];
+    f[2] = BUS_MAGIC[2];
+    f[3] = BUS_MAGIC[3];
+    f[4] = BUS_VERSION;
+    f[5] = BUS_KIND_REQUEST;
+    f[6] = BUS_VERB_WINDOW_RAISE;
+    let c = corr.to_le_bytes();
+    let l = (WINDOW_RAISE_BODY_LEN as u32).to_le_bytes();
+    let w = win.to_le_bytes();
+    let mut i = 0;
+    while i < 4 {
+        f[8 + i] = c[i];
+        f[48 + i] = l[i];
+        f[BUS_HDR_LEN + i] = w[i];
+        i += 1;
+    }
+    f
+}
+
+/// The window id from a WINDOW_RAISE request body; `None` when the length is not [`WINDOW_RAISE_BODY_LEN`].
+pub const fn window_raise_body_parse(body: &[u8]) -> Option<u32> {
+    if body.len() != WINDOW_RAISE_BODY_LEN {
+        return None;
+    }
+    Some(u32::from_le_bytes([body[0], body[1], body[2], body[3]]))
+}
+
+/// The verdict from a reply: `Ok(true)` given, `Ok(false)` pulsed, `Err(status)` refused (`-EIO` for a body that
+/// is neither byte).
+pub const fn window_raise_reply(status: i64, body: &[u8]) -> Result<bool, i64> {
+    if status != 0 {
+        return Err(status);
+    }
+    if body.len() != 1 {
+        return Err(EIO);
+    }
+    match body[0] {
+        WINDOW_RAISE_GIVEN => Ok(true),
+        WINDOW_RAISE_PULSED => Ok(false),
+        _ => Err(EIO),
+    }
+}
+
+/// RAISEVERB's ring-3 helper: ask for window `win` (the caller's own) to come forward. `sys` is the program's own
+/// syscall stub (`n, a0, a1, a2, a3 -> rc`); `rx` receives the reply (at least `BUS_HDR_LEN + 1` bytes; a frame
+/// that is not this ask's reply is skipped, as every synchronous bus client here does). `Ok(true)` = given,
+/// `Ok(false)` = pulsed, `Err(-errno)` = refused or the bus failed.
+pub fn window_raise(win: u32, rx: &mut [u8], sys: fn(u64, u64, u64, u64, u64) -> i64) -> Result<bool, i64> {
+    let corr = 0x5241_0000 | (win & 0xFFFF);
+    let tx = window_raise_frame(win, corr);
+    let s = sys(SYS_MSEND, tx.as_ptr() as u64, tx.len() as u64, 0, 0);
+    if s != 0 {
+        return Err(s);
+    }
+    let mut tries = 0;
+    while tries < 8 {
+        tries += 1;
+        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, 0, 0);
+        if n < 0 {
+            return Err(n);
+        }
+        let n = (n as usize).min(rx.len());
+        if n < BUS_HDR_LEN || rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY || rx[6] != BUS_VERB_WINDOW_RAISE || rx[8..12] != corr.to_le_bytes() {
+            continue; // not this ask's reply
+        }
+        let status = i32::from_le_bytes([rx[12], rx[13], rx[14], rx[15]]) as i64;
+        let blen = (u32::from_le_bytes([rx[48], rx[49], rx[50], rx[51]]) as usize).min(n - BUS_HDR_LEN);
+        return window_raise_reply(status, &rx[BUS_HDR_LEN..BUS_HDR_LEN + blen]);
+    }
+    Err(EIO)
+}
+
+#[cfg(test)]
+mod raiseverb_tests {
+    extern crate std;
+    use super::*;
+    #[test]
+    fn raise_wire_round_trip() {
+        let f = window_raise_frame(7, 0x5241_0007);
+        assert_eq!(&f[0..4], &BUS_MAGIC);
+        assert_eq!(f[6], BUS_VERB_WINDOW_RAISE);
+        assert_eq!(window_raise_body_parse(&f[BUS_HDR_LEN..]), Some(7));
+        assert_eq!(window_raise_body_parse(&f[BUS_HDR_LEN + 1..]), None);
+        assert_eq!(window_raise_reply(0, &[WINDOW_RAISE_GIVEN]), Ok(true));
+        assert_eq!(window_raise_reply(0, &[WINDOW_RAISE_PULSED]), Ok(false));
+        assert_eq!(window_raise_reply(EPERM, &[]), Err(EPERM));
+        assert_eq!(window_raise_reply(0, &[9]), Err(EIO));
+    }
+}
