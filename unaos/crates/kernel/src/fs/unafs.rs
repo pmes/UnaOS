@@ -3087,7 +3087,7 @@ pub mod splitread {
                 if ino.kind == ::unafs::FileKind::Directory {
                     return Err(ReadMiss::IsADirectory);
                 }
-                let root_gen = fs.root_generation();
+                if fs.key_slot().is_some_and(|k| k.cipher == ::unafs::keyslot::CIPHER_AES256_XTS) { return Ok(None); } let root_gen = fs.root_generation(); // crawl B 1: a CIPHERED root's raw sectors are XTS ciphertext — the one-hold read goes through the mount's VolumeCipher (LINE-NEUTRAL fold, code first)
                 Ok(BOUND.lock().as_ref().copied().map(|bound| Plan { root_gen, bound, chunks: ino.chunks, size: ino.size }))
             })();
             (r, crate::hidstall::now_us().saturating_sub(h0))
@@ -3425,7 +3425,7 @@ pub fn keyboot_probe() -> Option<(block::BlockHandle, bool)> {
         let mut b = [0u8; 1024];
         let read = handle_read(h, span.base_lba, &mut b[..512]).is_ok() && handle_read(h, span.base_lba + 1, &mut b[512..]).is_ok();
         let keyed = read && !matches!(::unafs::KeySlot::parse(&b), Ok(None));
-        *KB_HANDLE.lock() = Some(h);
+        crate::arch::without_interrupts(|| *KB_HANDLE.lock() = Some(h)); // crawl B 7: IRQ-masked, as `keyboot_mount` takes it inside the masked MOUNT hold (a holder preempted here would deadlock it)
         KB_KEYED.store(keyed, Ordering::Release);
         return Some((h, keyed));
     }
@@ -3436,7 +3436,7 @@ pub fn keyboot_probe() -> Option<(block::BlockHandle, bool)> {
 /// `Ok(())` once bound (or when a mount is already bound: the unlock is then moot); otherwise the crate's answer —
 /// `Fs(KeySlot(KeyRefused))` for a wrong key, `Fs(KeySlot(BadRecovery))` for words that fail their checksum.
 pub fn unlock_root(u: &::unafs::Unlock<'_>) -> Result<(), MountError> {
-    let handle = (*KB_HANDLE.lock()).ok_or(MountError::NoVolume)?;
+    let handle = crate::arch::without_interrupts(|| *KB_HANDLE.lock()).ok_or(MountError::NoVolume)?; // crawl B 7: IRQ-masked (see `keyboot_probe`)
     install_warn_hook();
     crate::fs::unafstime::install_clock_hook();
     let span = locate_on(handle)?;
@@ -3456,20 +3456,20 @@ pub fn unlock_root(u: &::unafs::Unlock<'_>) -> Result<(), MountError> {
     if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) {
         return Err(MountError::Busy); // RENDERWEDGE's bounded pre-wait, as every MOUNT taker on the render task
     }
-    let bound = crate::arch::without_interrupts(|| {
+    let prev = crate::arch::without_interrupts(|| KB_KEY.lock().replace(key)); let bound = crate::arch::without_interrupts(|| { // crawl B 8 + 7: the open root's key is parked BEFORE the bind (a discard or remount right after it rebinds WITH the key, `keyboot_mount`), IRQ-masked; wiped on drop
         let mut g = MOUNT.lock();
-        if g.is_some() {
-            return false;
+        if let Some(b) = g.as_ref() {
+            return if b.handle == handle { Some(false) } else { None }; // crawl B 4: this root already bound = moot; ANOTHER volume bound = refused below
         }
         if let Some(m) = fs.take() {
             #[cfg(all(target_arch = "x86_64", feature = "wc"))]
             splitread::note_bound(handle);
             *g = Some(BoundMount { handle, fs: m });
         }
-        true
+        Some(true)
     });
     drop(fs);
-    *KB_KEY.lock() = Some(key); // the open root's key: a rebind re-opens it (`keyboot_mount`); wiped on drop
+    let Some(bound) = bound else { crate::arch::without_interrupts(|| *KB_KEY.lock() = prev); return Err(MountError::Busy); }; // crawl B 4: another volume holds MOUNT — the key goes (wiped, BP-security-11) and the hold stays; the boot never releases onto the wrong root
     KB_UNLOCKED.store(true, Ordering::Release);
     serial_println!(
         "[keyboot] root unlocked handle={} via={} bound={} (the data key lives only with the open root, in RAM, wiped on drop)",
@@ -3493,18 +3493,18 @@ pub fn root_locked() -> bool {
     KB_KEYED.load(Ordering::Acquire) && !KB_UNLOCKED.load(Ordering::Acquire)
 }
 
-/// DISKFULL (rmbp-ledger B699; BP-storage-18, BP-bar-26; research B §6: a full disk must never wedge the OS or lose the
+/// DISKFULL (rmbp-ledger B699; BP-storage-21, BP-bar-26; research B §6: a full disk must never wedge the OS or lose the
 /// file being written) — the ONE place a UnaFS write that found the volume full becomes `-ENOSPC`.
 ///
 /// - **The mapping.** [`write_or_full`] is the only caller of `UnaFS::write_data` on the VFS write path: the crate's
-///   `FileSystemError::NoSpace` (`unaos/libs/fs/unafs/src/fs.rs:92`, raised by `alloc_block` at `fs.rs:1036` and the
-///   span check at `fs.rs:1419-1421`) becomes `VfsError::Backend(NOSPACE)`, which `attrsys::errno_of` — the one VFS
+///   `FileSystemError::NoSpace` (`unaos/libs/fs/unafs/src/fs.rs:94`, raised by `alloc_block` at `fs.rs:1104` and the
+///   span check at `fs.rs:1540-1541`) becomes `VfsError::Backend(NOSPACE)`, which `attrsys::errno_of` — the one VFS
 ///   refusal -> errno table every path syscall reads (`SYS_PATH_WRITE`'s `path_write_as`) — renders `-ENOSPC`. Every
 ///   other write failure keeps its old spelling (`unafs-write` -> `-EIO`). Never a panic: no unwrap on the path.
-/// - **The rollback, read in the crate.** A failed `write_data` (`fs.rs:1460-1468`) returns `write_data_inner`'s error
+/// - **The rollback, read in the crate.** A failed `write_data` (`fs.rs:1594`) returns `write_data_inner`'s error
 ///   BEFORE `maybe_commit`: the root never flips, so the committed tree is untouched (K8a CoW: `write_data_inner`
-///   writes only fresh blocks, `fs.rs:1440-1446`, and the inode last, `fs.rs:1452`) — but unlike `create_files_batch`
-///   (`fs.rs:1752`/`:1761`) and `commit_inner` (`fs.rs:900-906`) it does NOT call `txn_unwind`, so the allocations
+///   writes only fresh blocks, `fs.rs:1569-1570`, and the inode last, `fs.rs:1584`) — but unlike `create_files_batch`
+///   (`fs.rs:1941`/`:1950`) and `commit_inner` (`fs.rs:968-971`) it does NOT call `txn_unwind` (only `nospace_room`'s versioned retry does), so the allocations
 ///   it made stay in the mount's in-RAM refcount view. A later commit on the same mount would persist that residue
 ///   as leaked blocks. So the KERNEL rolls it back: on the root mount [`write_root`] asks the enclosing `with_unafs`
 ///   hold to discard the cached mount ([`request_mount_discard`], consumed inside the same hold above), which
@@ -3700,5 +3700,19 @@ pub fn read_version(path: &str, n: usize) -> Option<Vec<u8>> {
 
 /// FILEVERSIONS (B714): [`restore_version_on`] on THE mount (`true` once committed).
 pub fn restore_version(path: &str, n: usize) -> bool {
-    matches!(with_unafs(|fs| restore_version_on(fs, path, n).is_ok()), Ok(true))
+    matches!(with_unafs(|fs| restore_version_on(fs, path, n).map_err(|_| request_mount_discard()).is_ok()), Ok(true)) // crawl B 10: a failed restore's in-RAM references are discarded inside the hold, as `diskfull::write_root` does
+}
+
+/// KEYBOOT (crawl B 2, TAIL-APPENDED): `users::keyboot_key_root`'s hand-off — the first administrator just keyed THE
+/// bound root on `handle` (`set_key_slot`), so this boot's rebinds of it (`diskfull::write_root`'s discard, a
+/// `force_remount`, a K9 discard) open it with `key` through [`keyboot_mount`] instead of refusing `KeyRequired`.
+/// Parked BEFORE the slot is written (an unkeyed volume opens with a key as without one); `None` takes it back when
+/// the write failed. IRQ-masked, as every KB_* write (crawl B 7).
+pub fn keyboot_adopt(handle: block::BlockHandle, key: Option<::unafs::VolumeKey>) {
+    let on = key.is_some();
+    crate::arch::without_interrupts(|| {
+        *KB_HANDLE.lock() = Some(handle);
+        *KB_KEY.lock() = key;
+    });
+    KB_UNLOCKED.store(on, Ordering::Release);
 }

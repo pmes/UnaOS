@@ -3185,7 +3185,7 @@ pub fn installer_create_user(name: &[u8], password: &[u8]) -> Result<(), &'stati
 
 /// After the create-user form logged the new user in: the desktop ignites for them.
 pub fn installer_desktop_ignite() {
-    stage_resolve("user-created");
+    stage_resolve("user-created"); #[cfg(any(target_arch = "aarch64", feature = "unafs"))] drop(KB_WORDS.lock().take()); // crawl B 26: the desktop ignites after the words screen (or none) — words the glass never took go now (wiped), never kept for the boot (LINE-NEUTRAL fold, code first)
     firstuser_witness("first-user"); // FIRSTUSER (R100): the flow's one line, at the first user's session
 }
 
@@ -3944,9 +3944,9 @@ fn keyboot_key_root(name: &[u8], password: &[u8]) {
             Err(::unafs::KeySlotError::NoMemory) => return why("kdf-memory"),
             Err(_) => return why("seal"),
         };
-        let seal_ms = crate::arch::ms().saturating_sub(t0);
+        let seal_ms = crate::arch::ms().saturating_sub(t0); crate::fs::unafs::keyboot_adopt(h, slot.unwrap(&::unafs::Unlock::Recovery(words.as_str())).ok()); // crawl B 2: the open root's key, parked BEFORE the slot lands (the words' HKDF unwrap, no second Argon2id), so this boot's rebinds open the keyed root
         if !crate::fs::unafs::with_unafs(|fs| fs.set_key_slot(slot.clone()).is_ok()).unwrap_or(false) {
-            return why("slot-write");
+            crate::fs::unafs::keyboot_adopt(h, None); return why("slot-write"); // crawl B 2: not keyed — the key goes (wiped)
         }
         *KB_WORDS.lock() = Some(words);
         serial_println!(

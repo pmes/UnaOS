@@ -252,7 +252,7 @@ fn reconcile() {
                         used.push(n.clone());
                         n
                     }
-                    None => crate::fs::bootdisk::next_volume_point(&mut used, &name).0,
+                    None => { let dep: Vec<String> = DEPARTED.lock().iter().map(|(n, _)| n.clone()).filter(|n| !used.contains(n)).collect(); used.extend(dep.iter().cloned()); let u = crate::fs::bootdisk::next_volume_point(&mut used, &name).0; used.retain(|n| !dep.contains(n)); u } // crawl B 22: another stick never takes a DEPARTED name (BP-storage-20: only the same stick, by fingerprint, takes it back); the departed names are free again for the next stick's own `prior` (LINE-NEUTRAL fold, code first)
                 };
                 undepart(&uniq);
                 let fat1 = fat1_locate(*ix, &fs);

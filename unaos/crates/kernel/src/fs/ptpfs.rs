@@ -239,7 +239,7 @@ impl VfsBackend for PtpFs {
                     ptp::liveview_cached().ok_or(VfsError::Backend("live view: no frame read at offset 0"))?
                 };
                 let s = (offset as usize).min(f.len());
-                Ok(f[s..(s + len).min(f.len())].to_vec())
+                Ok(f[s..s.saturating_add(len).min(f.len())].to_vec()) // crawl B 25: `len` near usize::MAX never overflows the slice end
             }
         }
     }

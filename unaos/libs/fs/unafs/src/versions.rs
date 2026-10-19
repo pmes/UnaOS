@@ -328,7 +328,7 @@ impl<D: BlockDevice> UnaFS<D> {
     pub fn read_version(&mut self, inode_id: u64, n: usize, offset: u64, length: u64) -> Result<Vec<u8>, FileSystemError> {
         let inode = self.read_inode(inode_id)?;
         let ring = decode_ring(&inode.versions)?;
-        let i = ring.len().checked_sub(n + 1).ok_or(FileSystemError::NotFound)?;
+        let i = ring.len().checked_sub(1).and_then(|l| l.checked_sub(n)).ok_or(FileSystemError::NotFound)?; // n = usize::MAX is NotFound, never an overflow
         let e = &ring[i];
         self.read_from_extents(&e.extents, offset, length, e.size)
     }
@@ -344,10 +344,11 @@ impl<D: BlockDevice> UnaFS<D> {
             return Err(FileSystemError::NotFound);
         }
         let ring = decode_ring(&inode.versions)?;
-        let i = ring.len().checked_sub(n + 1).ok_or(FileSystemError::NotFound)?;
+        let i = ring.len().checked_sub(1).and_then(|l| l.checked_sub(n)).ok_or(FileSystemError::NotFound)?; // n = usize::MAX is NotFound, never an overflow
         let chosen = ring[i].clone();
-        self.incref_extents(&chosen.extents);
         let bc = self.superblock.block_count;
+        self.version_refs_intact(&ring, &inode.chunks, &chosen.extents)?;
+        self.incref_extents(&chosen.extents);
         let released = block_set(&inode.chunks, bc).difference(&block_set(&chosen.extents, bc)).count() as u64;
         let held = Held { chunks: core::mem::take(&mut inode.chunks), size: inode.size, mtime: inode.mtime };
         if held.size > 0 || !held.chunks.is_empty() {
@@ -359,6 +360,35 @@ impl<D: BlockDevice> UnaFS<D> {
         self.write_inode(&inode)?;
         self.versions_bound()?;
         self.maybe_commit()
+    }
+
+    /// The restore's guard (the stopgap for a volume a pre-B714 `fsck --repair` touched: that build counts no
+    /// ring reference, so it frees blocks only a version still names, and a later restore would point the
+    /// live file at blocks the allocator may have handed out again). Every block the restored version names
+    /// must still carry at least the references this inode's ring and live extents hold on it; one that
+    /// carries fewer refuses the restore (`CorruptVolume`) and nothing changes. A freed block that was
+    /// ALREADY reallocated carries the new owner's reference and can pass — only a record an older repair
+    /// refuses to rewrite (a ROCOMPAT bit, or a stamp) closes that; see the FILEVERSIONS ledger row.
+    fn version_refs_intact(&mut self, ring: &[VersionEntry], live: &ExtentList, chosen: &ExtentList) -> Result<(), FileSystemError> {
+        let bc = self.superblock.block_count;
+        let mut need: alloc::collections::BTreeMap<u64, u32> = alloc::collections::BTreeMap::new();
+        for list in ring.iter().map(|e| &e.extents).chain(core::iter::once(live)) {
+            for extent in list {
+                for i in 0..extent.length.div_ceil(BLOCK_SIZE) {
+                    match extent.physical_block.checked_add(i) {
+                        Some(b) if b < bc => *need.entry(b).or_insert(0) += 1,
+                        _ => break,
+                    }
+                }
+            }
+        }
+        for b in block_set(chosen, bc) {
+            let want = need.get(&b).copied().unwrap_or(1);
+            if self.refmap.refcount(&mut self.device, b) < want {
+                return Err(FileSystemError::CorruptVolume("a version's block lost its references (an older fsck repair?): restore refused"));
+            }
+        }
+        Ok(())
     }
 
     /// Take one reference on every block an extent list covers (bounded like [`decref_extents`]).
@@ -404,33 +434,50 @@ impl<D: BlockDevice> UnaFS<D> {
         let bound = self.version_bound_blocks();
         let mut ledger = self.version_ledger()?;
         let mut changed = false;
-        while ledger.kept() > bound {
-            let Some(pos) = (0..ledger.rows.len()).min_by_key(|&i| (ledger.rows[i].oldest_seq, ledger.rows[i].inode)) else {
-                break;
-            };
-            let id = ledger.rows[pos].inode;
+        while ledger.kept() > bound && self.drop_oldest_in(&mut ledger)? {
             changed = true;
-            let mut inode = match self.read_inode(id) {
-                Ok(i) => i,
-                Err(FileSystemError::NotFound) => {
-                    ledger.rows.remove(pos);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let mut ring = decode_ring(&inode.versions)?;
-            if !ring.is_empty() {
-                let gone = ring.remove(0);
-                self.decref_extents(&gone.extents);
-                inode.versions = encode_ring(&ring);
-                self.write_inode(&inode)?;
-            }
-            ledger.set_row(id, &ring);
         }
         if changed {
             self.put_ledger(&ledger)?;
         }
         Ok(())
+    }
+
+    /// Drop the OLDEST version anywhere (lowest `seq`) out of `ledger` and release its references (a stale
+    /// row whose inode is gone is just removed). `false` = the ledger has no rows. The caller puts the ledger.
+    fn drop_oldest_in(&mut self, ledger: &mut Ledger) -> Result<bool, FileSystemError> {
+        let Some(pos) = (0..ledger.rows.len()).min_by_key(|&i| (ledger.rows[i].oldest_seq, ledger.rows[i].inode)) else {
+            return Ok(false);
+        };
+        let id = ledger.rows[pos].inode;
+        let mut inode = match self.read_inode(id) {
+            Ok(i) => i,
+            Err(FileSystemError::NotFound) => {
+                ledger.rows.remove(pos);
+                return Ok(true);
+            }
+            Err(e) => return Err(e),
+        };
+        let mut ring = decode_ring(&inode.versions)?;
+        if !ring.is_empty() {
+            let gone = ring.remove(0);
+            self.decref_extents(&gone.extents);
+            inode.versions = encode_ring(&ring);
+            self.write_inode(&inode)?;
+        }
+        ledger.set_row(id, &ring);
+        Ok(true)
+    }
+
+    /// A full volume's room (`write_data`/`truncate_data` on `NoSpace`): drop the oldest version anywhere, one
+    /// row's oldest entry, in the open transaction. `false` = no version is kept anywhere.
+    pub(crate) fn version_drop_oldest(&mut self) -> Result<bool, FileSystemError> {
+        let mut ledger = self.version_ledger()?;
+        let dropped = self.drop_oldest_in(&mut ledger)?;
+        if dropped {
+            self.put_ledger(&ledger)?;
+        }
+        Ok(dropped)
     }
 
     /// `unlink`: release every version of `inode` (their references) and its ledger row. The ring's own

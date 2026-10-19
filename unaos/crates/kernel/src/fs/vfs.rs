@@ -565,7 +565,7 @@ impl MountTable {
     /// as long as a root mount exists this never returns
     /// [`VfsError::NoSuchVolume`].
     pub fn resolve<'a>(&'a self, path: &'a str) -> Result<(&'a dyn VfsBackend, &'a str), VfsError> {
-        let path = if path.is_empty() { "/" } else { path }; if let Some(r) = crate::fs::rootdisk::redirect(self, path) { return r; } if crate::fs::removable::departed(path) { return Err(VfsError::NoSuchVolume); } // ROOTDISK (B390, R94): `/volumes/UnaOS/…` IS `/…` through the whole table; (ROOTDISK2: the one-image `/apps/LIB` compat is deleted). UNPLUG (B703): a path on a removable volume that LEFT (pull or Eject) is NoSuchVolume (-ENODEV) until the same stick is back, never the root's -ENOENT; idle cost one atomic load. Folded: this file's panic Locations are line-pinned.
+        let path = if path.is_empty() { "/" } else { path }; if let Some(r) = crate::fs::rootdisk::redirect(self, path) { return r; } // ROOTDISK (B390, R94): `/volumes/UnaOS/…` IS `/…` through the whole table; (ROOTDISK2: the one-image `/apps/LIB` compat is deleted). UNPLUG (B703): a path on a removable volume that LEFT (pull or Eject) is NoSuchVolume (-ENODEV) until the same stick is back, never the root's -ENOENT; idle cost one atomic load — asked AFTER the walk (crawl B 23: only when no mount at `/volumes/<name>` or below claims the path, so a live PTP camera or fixed volume at a departed name still answers). Folded: this file's panic Locations are line-pinned.
         let mut best: Option<&Mount> = None;
         for m in &self.mounts {
             if prefix_claims(&m.prefix, path) {
@@ -575,7 +575,7 @@ impl MountTable {
                 }
             }
         }
-        let m = best.ok_or(VfsError::NoSuchVolume)?;
+        if crate::fs::removable::departed(path) && !best.is_some_and(|b| b.prefix.len() > crate::fs::bootdisk::VOLUMES.len() && b.prefix.starts_with(crate::fs::bootdisk::VOLUMES)) { return Err(VfsError::NoSuchVolume); } let m = best.ok_or(VfsError::NoSuchVolume)?; // crawl B 23: UNPLUG's departed answer, after the walk (LINE-NEUTRAL fold, code first)
         // The volume-relative remainder: strip the prefix. Root ("/") keeps the
         // whole path; a named prefix strips it, leaving "" for the mount point
         // itself or "/rest" below it.
@@ -1924,8 +1924,8 @@ impl VfsBackend for NativeBackend {
                 // Zero-extend from the old EOF.
                 let add = (size - ino.size) as usize;
                 let zeros = alloc::vec![0u8; add];
-                fs.write_data(id, ino.size, &zeros)
-                    .map_err(|_| VfsError::Backend("unafs-write"))?;
+                crate::fs::unafs::diskfull::write_root(fs, self.volume_name(), id, ino.size, &zeros) // crawl B 9: the zero-extend is a VFS write too (BP-storage-21): `-ENOSPC` on a full volume, the failed write's residue discarded
+                    ?; // crawl B 9: LINE-NEUTRAL — `write_root` carries the old `unafs-write` spelling for every other failure
                 return Ok(());
             }
             // A shrink (including to 0) would DROP the per-object ACL if done by
@@ -1934,10 +1934,10 @@ impl VfsBackend for NativeBackend {
             // shrink (`truncate_data`: same inode, blocks past the end released,
             // the tail block CoW'd zeroed) — flight 23's SYSKAT2 check 19 was a
             // native shrink refused here and EIO'd by the Linux shim's fallback.
-            fs.truncate_data(id, size).map_err(|_| VfsError::Backend("unafs-truncate"))?;
+            fs.truncate_data(id, size).map_err(|_| { crate::fs::unafs::request_mount_discard(); VfsError::Backend("unafs-truncate") })?; // crawl B 10: a failed shrink's in-RAM version references and allocations are discarded inside the hold, as `write_root` does
             Ok(())
         })
-        .map_err(unafs_err)?
+        .map_err(unafs_err).and_then(|r| { crate::fs::unafs::diskfull::after_hold(); r }) // crawl B 9: the full-disk toast, after the hold, as `write`
     }
 
     fn unlink(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
