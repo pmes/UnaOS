@@ -165,7 +165,7 @@ pub enum Action {
     WinSizeLeft,
     WinSizeRight,
     WinSizeUp,
-    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */, QuitApp /* APPMENU2: ⌘Q, code 42 */, CloseWindow /* APPMENU2: ⌘W, code 43 */, HideApp /* APPMENU2: ⌘H, code 44 */, OpenSettings /* APPMENU2: ⌘, code 45 */, ForceQuit /* APPMENU2: ⌘⌥Esc, code 46 */, ClearView /* LUMENBIN: ⌘K — clear the focused view (LUMEN.ELF's transcript), code 41 */, GetInfo /* ATTRCOLUMNS (B402): ⌘I — Quarry's Get Info, code 47 */, Launcher /* LAUNCHER (B417): ⌘Space, code 48 (the arc wrote 47; renumbered at merge17) */, Interrupt /* SHELLTASK2 (B474): ⌘. — abort the shell window's running command (Ctrl-C's twin), code 49 */, Start /* WINKEY (B665): the Windows key ALONE — RING-3 DELIVERY ONLY, code 50; no row binds it, no decoder emits it yet, and it is NOT Start's trigger (the tap counter below is: `tap_track` → `startmenu::key_service`) */,
+    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */, QuitApp /* APPMENU2: ⌘Q, code 42 */, CloseWindow /* APPMENU2: ⌘W, code 43 */, HideApp /* APPMENU2: ⌘H, code 44 */, OpenSettings /* APPMENU2: ⌘, code 45 */, ForceQuit /* APPMENU2: ⌘⌥Esc, code 46 */, ClearView /* LUMENBIN: ⌘K — clear the focused view (LUMEN.ELF's transcript), code 41 */, GetInfo /* ATTRCOLUMNS (B402): ⌘I — Quarry's Get Info, code 47 */, Launcher /* LAUNCHER (B417): ⌘Space, code 48 (the arc wrote 47; renumbered at merge17) */, Interrupt /* SHELLTASK2 (B474): ⌘. — abort the shell window's running command (Ctrl-C's twin), code 49 */, Start /* WINKEY (B665): the Windows key ALONE — RING-3 DELIVERY ONLY, code 50; no row binds it, no decoder emits it yet, and it is NOT Start's trigger (the tap counter below is: `tap_track` → `startmenu::key_service`) */, Undo /* UNDOKEYS (B743): ⌘Z — Quarry's journal (`ops::action` -> `undo::undo`), ring-3 code 51 */, Redo /* UNDOKEYS (B743): ⌘⇧Z, code 52 */,
 }
 
 impl Action {
@@ -209,7 +209,7 @@ impl Action {
             Action::WinSizeLeft => "win-size-left",
             Action::WinSizeRight => "win-size-right",
             Action::WinSizeUp => "win-size-up",
-            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", Action::ClearView => "clear-view", Action::QuitApp => "quit-app", Action::CloseWindow => "close-window", Action::HideApp => "hide-app", Action::OpenSettings => "open-settings", Action::ForceQuit => "force-quit", Action::GetInfo => "get-info", Action::Launcher => "launcher", Action::Interrupt => "interrupt", Action::Start => "start", // WINKEY (B665) · WINDOWLIST · LUMENBIN · APPMENU2 · ATTRCOLUMNS
+            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", Action::ClearView => "clear-view", Action::QuitApp => "quit-app", Action::CloseWindow => "close-window", Action::HideApp => "hide-app", Action::OpenSettings => "open-settings", Action::ForceQuit => "force-quit", Action::GetInfo => "get-info", Action::Launcher => "launcher", Action::Interrupt => "interrupt", Action::Start => "start", Action::Undo => "undo", Action::Redo => "redo", // UNDOKEYS (B743) · WINKEY (B665) · WINDOWLIST · LUMENBIN · APPMENU2 · ATTRCOLUMNS
         }
     }
 
@@ -342,7 +342,7 @@ pub fn resolve_edge(
     prev_keys: &[u8; 6],
     modifiers: u8,
 ) -> Option<(Action, &'static str)> {
-    note_keys(cur_keys, prev_keys); #[cfg(all(target_arch = "x86_64", feature = "wc"))] zoom_edge(cur_keys, prev_keys, modifiers); let mut i = 0; // ZOOM (B713): Win+= / Win+- / Win+0 through `ZOOM_ROWS` (file tail). SOFTY2 (B641): a key edge spoils a Windows-key tap; an Esc edge is counted for the flyouts. SAME-LINE fold, code first.
+    note_keys(cur_keys, prev_keys); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if zoom_edge(cur_keys, prev_keys, modifiers) { return None; } let mut i = 0; // UNDOKEYS (B743): a zoom chord is CONSUMED — no row answers its report and its release is swallowed (`zoom_swallow`, file tail). ZOOM (B713): Win+= / Win+- / Win+0 through `ZOOM_ROWS` (file tail). SOFTY2 (B641): a key edge spoils a Windows-key tap; an Esc edge is counted for the flyouts. SAME-LINE fold, code first.
     while i < cur_keys.len() {
         let u = cur_keys[i];
         if u != 0 && !prev_keys.contains(&u) {
@@ -780,18 +780,57 @@ pub fn layout_report(cur_keys: &[u8; 6], prev_keys: &[u8; 6], modifiers: u8, cap
 pub const ZOOM_ROWS: [(u8, i8); 3] = [(0x2E, 1), (0x2D, -1), (0x27, 0)];
 
 /// From [`resolve_edge`]: each press edge of a `ZOOM_ROWS` usage with `HID_MOD_GUI` held is one step (atomics only).
+/// UNDOKEYS (B743): returns `true` when a step fired — the chord is CONSUMED: `resolve_edge` answers `None` for the
+/// report (no row, no `Event::Action`), and the row's bit in [`ZOOM_UP`] arms [`zoom_swallow`] for the one key-up the
+/// decoder will push when the key lifts (`hid_key_release_ascii` ignores GUI, so that release would otherwise reach the
+/// focused window as a lone `KeyUp('=')`). A press of the same usage WITHOUT the GUI key clears a stale bit first, so a
+/// release the route never offered (the login screen took it) cannot eat a typed key's own release.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-fn zoom_edge(cur: &[u8; 6], prev: &[u8; 6], modifiers: u8) {
-    if modifiers & HID_MOD_GUI == 0 {
-        return;
-    }
+fn zoom_edge(cur: &[u8; 6], prev: &[u8; 6], modifiers: u8) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let gui = modifiers & HID_MOD_GUI != 0;
+    let mut fired = false;
     for &u in cur.iter() {
         if u != 0 && !prev.contains(&u) {
-            if let Some(&(_, step)) = ZOOM_ROWS.iter().find(|r| r.0 == u) {
-                super::zoom::chord(step);
+            if let Some(i) = ZOOM_ROWS.iter().position(|r| r.0 == u) {
+                if gui {
+                    super::zoom::chord(ZOOM_ROWS[i].1);
+                    ZOOM_UP.fetch_or(1 << i, Relaxed);
+                    fired = true;
+                } else {
+                    ZOOM_UP.fetch_and(!(1 << i), Relaxed);
+                }
             }
         }
     }
+    fired
+}
+
+/// UNDOKEYS (B743): one bit per [`ZOOM_ROWS`] row whose chord fired and whose key-up has not yet been swallowed.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static ZOOM_UP: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// UNDOKEYS (B743): THE ZOOM CHORD'S RELEASE DOOR, asked in the x86 route's door chain (`shortcuts::overlay_key`, ahead
+/// of the focused ring and of `quarry::key_route`): a `KeyUp` whose byte is an armed row's key (`=`/`+`, `-`/`_`,
+/// `0`/`)` — the decoder's `hid_key_release_ascii`, Shift or not) clears that row's bit and is consumed, so the focused
+/// window never sees any half of `Win+=` / `Win+-` / `Win+0` (the press types nothing: GUI suppresses it). Every other
+/// event, and every key-up while no bit is armed (one relaxed load), falls through untouched.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn zoom_swallow(ev: crate::pal::Event) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let crate::pal::Event::KeyUp(b) = ev else { return false };
+    let armed = ZOOM_UP.load(Relaxed);
+    if armed == 0 {
+        return false;
+    }
+    for (i, &(u, _)) in ZOOM_ROWS.iter().enumerate() {
+        let rel = |m: u8| crate::drivers::xhci::hid_key_release_ascii(u, m, false);
+        if armed & (1 << i) != 0 && b != 0 && (b == rel(0) || b == rel(HID_MOD_SHIFT)) {
+            ZOOM_UP.fetch_and(!(1 << i), Relaxed);
+            return true;
+        }
+    }
+    false
 }
 
 // AUTOLOCK (rmbp-ledger B712) — TAIL-APPENDED, so no line above moves. THE Win+L ENTRY: the key that plays the Windows

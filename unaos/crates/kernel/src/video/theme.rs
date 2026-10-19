@@ -405,7 +405,7 @@ pub static CRISPY_ROWS: &[Binding] = &[ // SMALLFIX3 (B416): a slice — the cou
     Binding { roles: CMD, usage: 0x06, action: Action::Copy, token: "cmd-c" },
     Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "cmd-v" },
     Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "cmd-x" },
-    Binding { roles: CMD, usage: 0x04, action: Action::SelectAll, token: "cmd-a" },
+    Binding { roles: CMD, usage: 0x04, action: Action::SelectAll, token: "cmd-a" }, Binding { roles: CMD | SHIFT, usage: 0x1D, action: Action::Redo, token: super::shortcuts::C_CMD_SHIFT_Z }, Binding { roles: CMD, usage: 0x1D, action: Action::Undo, token: super::shortcuts::C_CMD_Z }, // UNDOKEYS (B743): ⌘⇧Z ABOVE ⌘Z (`no_shadow`); Ctrl+Z is no row (R61)
     // TERMSEL — one cell at a time, and the PC-keyboard line ends.
     Binding { roles: SHIFT, usage: 0x50, action: Action::SelectLeft, token: "shift-left" },
     Binding { roles: SHIFT, usage: 0x4F, action: Action::SelectRight, token: "shift-right" },
@@ -487,7 +487,7 @@ pub static PC_ROWS: &[Binding] = &[ // SMALLFIX3 (B416): a slice — the count i
     Binding { roles: CMD, usage: 0x06, action: Action::Copy, token: "alt-c" },
     Binding { roles: CMD, usage: 0x19, action: Action::Paste, token: "alt-v" },
     Binding { roles: CMD, usage: 0x1B, action: Action::Cut, token: "alt-x" },
-    Binding { roles: CMD, usage: 0x04, action: Action::SelectAll, token: "alt-a" },
+    Binding { roles: CMD, usage: 0x04, action: Action::SelectAll, token: "alt-a" }, Binding { roles: CMD | SHIFT, usage: 0x1D, action: Action::Redo, token: "alt-shift-z" }, Binding { roles: CMD, usage: 0x1D, action: Action::Undo, token: "alt-z" }, // UNDOKEYS (B743): Alt+Shift+Z ABOVE Alt+Z (`no_shadow`)
     // TERMSEL — a PC keyboard's selection chords. No `Alt+Shift+←` row: on a PC the line ends
     // are Home and End, which every PC keyboard has.
     Binding { roles: SHIFT, usage: 0x50, action: Action::SelectLeft, token: "shift-left" },

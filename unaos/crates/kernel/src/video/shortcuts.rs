@@ -48,7 +48,7 @@ pub const C_CMD_ALT_ESC: &str = "cmd-alt-esc";
 pub const C_CTRL_CMD_Q: &str = "ctrl-cmd-q";
 pub const C_CMD_I: &str = "cmd-i"; // ATTRCOLUMNS (B402)
 pub const C_CMD_SPACE: &str = "cmd-space"; // LAUNCHER (B417)
-pub const C_CMD_PERIOD: &str = "cmd-."; // SHELLTASK2 (B474)
+pub const C_CMD_PERIOD: &str = "cmd-."; pub const C_CMD_Z: &str = "cmd-z"; pub const C_CMD_SHIFT_Z: &str = "cmd-shift-z"; // SHELLTASK2 (B474) · UNDOKEYS (B743): Undo / Redo
 
 const fn s(chord: &'static str, scope: &'static str, action: &'static str, arc: &'static str) -> Shortcut {
     Shortcut { chord, scope, action, arc }
@@ -81,7 +81,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     s("cmd-x", "Edit", "Cut", "APPCLIP"),
     s("cmd-c", "Edit", "Copy", "APPCLIP"),
     s("cmd-v", "Edit", "Paste", "APPCLIP"),
-    s("cmd-a", "Edit", "Select All", "APPCLIP"),
+    s("cmd-a", "Edit", "Select All", "APPCLIP"), s(C_CMD_Z, "Edit", "Undo", "UNDOKEYS"), s(C_CMD_SHIFT_Z, "Edit", "Redo", "UNDOKEYS"), // UNDOKEYS (B743)
     s("right-click tile", "Dock", "Tile menu (Quit)", "DOCKRUN"),
     s("right-click entry", "Quarry", "File operations", "QUARRYOPS"),
     s("Ctrl-C", "Shell", "Cancel line", "SHELLUX"),
@@ -289,7 +289,7 @@ pub fn close() -> bool {
 
 /// The key door: while the overlay is up ANY key (or action) closes it and is consumed; a key-up is swallowed.
 pub fn overlay_key(ev: crate::pal::Event) -> bool {
-    if !is_open() {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] if super::keymap::zoom_swallow(ev) { return true; } if !is_open() { // UNDOKEYS (B743): the zoom chord's key-up is consumed at this door (ahead of the focused ring), overlay or not. LINE-NEUTRAL, code first
         return false;
     }
     match ev {
