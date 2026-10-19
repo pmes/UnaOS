@@ -119,6 +119,12 @@ impl<D: BlockDevice> UnaFS<D> {
     /// stored count disagrees with the multi-root truth; only `repair == true`
     /// (which rebuilds true per-root counts) corrects magnitude drift.
     pub fn fsck(&mut self, repair: bool) -> Result<FsckReport, FileSystemError> {
+        // VERSIONSCOMPAT (SR154): a repair rebuilds every refcount from what THIS build can see; on a root
+        // carrying a ROCOMPAT bit it does not know, blocks may be named by records it cannot read — refuse
+        // before anything is walked or written (the dry run still reports).
+        if repair {
+            self.write_gate()?;
+        }
         let block_count = self.superblock.block_count;
 
         // Phase 0: read-only reachability + orphan detection.
@@ -203,6 +209,11 @@ impl<D: BlockDevice> UnaFS<D> {
         // which re-walks after it — the rewrite moves the reclaim inode's block).
         if ledger_stale {
             self.version_ledger_rebuild(&census)?;
+        }
+        // VERSIONSCOMPAT (SR154): a volume that holds versions carries the ROCOMPAT `versions` bit (one
+        // written by B714 before the flag existed gets it here; the commit below persists it). Never cleared.
+        if census.versions > 0 {
+            self.mark_rocompat(crate::root::ROOT_FLAG_VERSIONS);
         }
 
         // Phase 2: re-walk and rebuild the refcount map to the computed

@@ -133,6 +133,11 @@ pub enum FileSystemError {
     /// VOLKEY (B684): the key slot refused (wrong key, unreadable slot, KDF memory).
     #[error("Key slot: {0}")]
     KeySlot(crate::keyslot::KeySlotError),
+    /// VERSIONSCOMPAT (SR154): the root record carries ROCOMPAT bits this build does not know (the value: those
+    /// bits, `flags & ROOT_ROCOMPAT_MASK & !ROOT_ROCOMPAT_KNOWN`) — the volume is mounted READ-ONLY and every
+    /// mutation, commit and `fsck --repair` is refused before it reaches the root (unafs-records.md §R12, §R17).
+    #[error("The volume is read-only here: it uses features this build does not know (rocompat {0:#x})")]
+    ReadOnly(u64),
 }
 
 /// A directory entry pointing to an inode (by stable LOGICAL id).
@@ -348,6 +353,10 @@ pub struct UnaFS<D: BlockDevice> {
     /// ([`set_versioning`](Self::set_versioning); off on a fresh mount — the kernel's bound mount and
     /// `tools/unafs` turn it on).
     versioning: bool,
+    /// VERSIONSCOMPAT (SR154): the ROCOMPAT word (`crate::root::ROOT_ROCOMPAT_MASK` bits) every commit
+    /// writes into the root record beside `root_flags` — read off the mounted root, OR-ed by the first
+    /// version kept ([`ROOT_FLAG_VERSIONS`](crate::root::ROOT_FLAG_VERSIONS)), never cleared.
+    rocompat: u64,
 }
 
 impl<D: BlockDevice> UnaFS<D> {
@@ -440,6 +449,7 @@ impl<D: BlockDevice> UnaFS<D> {
             map_budget: crate::refmap::DEFAULT_CACHE_BYTES,
             key_slot: None,
             versioning: false,
+            rocompat: 0,
         };
 
         // The reserved system objects, in id order (1..=4).
@@ -561,11 +571,16 @@ impl<D: BlockDevice> UnaFS<D> {
             map_budget: crate::refmap::DEFAULT_CACHE_BYTES,
             key_slot,
             versioning: false,
+            rocompat: loaded.root.rocompat(),
         };
 
         // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
         // the drain is one commit; a power cut mid-drain resumes here).
-        fs.reclaim_drain()?;
+        // VERSIONSCOMPAT (SR154): a root with ROCOMPAT bits this build does not know mounts READ-ONLY —
+        // nothing is drained (the drain is a commit); the queue waits for a reader that knows them.
+        if fs.write_gate().is_ok() {
+            fs.reclaim_drain()?;
+        }
 
         Ok(fs)
     }
@@ -777,6 +792,31 @@ impl<D: BlockDevice> UnaFS<D> {
         self.root.generation
     }
 
+    /// VERSIONSCOMPAT (SR154): the ROCOMPAT word the next commit writes (the mounted root's, plus
+    /// [`ROOT_FLAG_VERSIONS`](crate::root::ROOT_FLAG_VERSIONS) once a version is kept).
+    pub fn rocompat(&self) -> u64 {
+        self.rocompat
+    }
+
+    /// VERSIONSCOMPAT (SR154): the volume's root carries ROCOMPAT bits this build does not know — it is
+    /// mounted read-only: reads work, every write, commit and repair answers `ReadOnly`.
+    pub fn read_only(&self) -> bool {
+        self.rocompat & !crate::root::ROOT_ROCOMPAT_KNOWN != 0
+    }
+
+    /// VERSIONSCOMPAT (SR154): the ONE write check — `ReadOnly(<the unknown bits>)` on a read-only mount.
+    pub(crate) fn write_gate(&self) -> Result<(), FileSystemError> {
+        match self.rocompat & !crate::root::ROOT_ROCOMPAT_KNOWN {
+            0 => Ok(()),
+            unknown => Err(FileSystemError::ReadOnly(unknown)),
+        }
+    }
+
+    /// VERSIONSCOMPAT (SR154): set a ROCOMPAT bit this build knows (persisted by the next commit).
+    pub(crate) fn mark_rocompat(&mut self, bit: u64) {
+        self.rocompat |= bit & crate::root::ROOT_ROCOMPAT_KNOWN;
+    }
+
     /// Free blocks in the current (in-flight) view that a DATA write may use:
     /// the refcount map's free count less the metadata reserve
     /// (DISKRESERVE SR152) — the number a user is shown. The root record keeps
@@ -865,6 +905,11 @@ impl<D: BlockDevice> UnaFS<D> {
     /// transaction's single atomic point. On a v6 volume the first commit
     /// also migrates both maps to the paged v7 shape (UNAFSMAP).
     pub fn commit(&mut self) -> Result<(), FileSystemError> {
+        // VERSIONSCOMPAT (SR154): a read-only mount never flips the root; what was staged is discarded.
+        if let Err(e) = self.write_gate() {
+            self.txn_unwind();
+            return Err(e);
+        }
         if !self.migrate_pending {
             return self.commit_inner();
         }
@@ -942,6 +987,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// XTS (B689): a `cipher = 1` slot is refused here (`Unsupported`) — this volume's blocks are plaintext and
     /// keying writes block 0 only; a ciphered volume is made by [`encipher`].
     pub fn set_key_slot(&mut self, slot: crate::keyslot::KeySlot) -> Result<(), FileSystemError> {
+        self.write_gate()?; // VERSIONSCOMPAT (SR154)
         if self.key_slot.is_some() {
             return Err(FileSystemError::KeySlot(crate::keyslot::KeySlotError::AlreadyKeyed));
         }
@@ -965,6 +1011,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// — [`set_key_slot`](Self::set_key_slot) without the `AlreadyKeyed` refusal: block 0 rewritten with sector 0
     /// byte-identical, then flushed; a failed write leaves the previous slot in RAM (the disk holds the old or the new).
     pub fn replace_key_slot(&mut self, slot: crate::keyslot::KeySlot) -> Result<(), FileSystemError> {
+        self.write_gate()?; // VERSIONSCOMPAT (SR154)
         let sb = self.superblock.clone();
         let prev = self.key_slot.replace(slot);
         let wrote = self.block0(&sb).and_then(|b| {
@@ -1089,7 +1136,7 @@ impl<D: BlockDevice> UnaFS<D> {
             refmap_block: self.refmap.top(),
             refmap_leaves: self.refmap.leaf_count(),
             free_blocks,
-            flags: self.root_flags,
+            flags: (self.root_flags & !crate::root::ROOT_ROCOMPAT_MASK) | self.rocompat,
         };
         let slot = self.active_slot.other();
         crate::root::write_slot(&mut self.device, slot, &new_root)?;
@@ -1135,6 +1182,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// nothing (a missing name, a taken name) unwinds nothing, so an
     /// auto-commit-off caller keeps its staged work on a plain refusal.
     fn txn_guard<T>(&mut self, op: impl FnOnce(&mut Self) -> Result<T, FileSystemError>) -> Result<T, FileSystemError> {
+        self.write_gate()?; // VERSIONSCOMPAT (SR154): a read-only mount stages nothing
         let (epoch, ids) = (self.refmap.epoch(), self.imap.len());
         let r = op(self);
         let grew = self.imap.len() != ids;

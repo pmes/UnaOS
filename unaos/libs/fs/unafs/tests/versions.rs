@@ -350,3 +350,127 @@ fn a_full_volume_spends_the_oldest_version_before_it_refuses_an_overwrite() {
     let r = fs.fsck(false).unwrap();
     assert!(r.is_clean(), "{r:?}");
 }
+
+// ---- VERSIONSCOMPAT (SR154): the root record's ROCOMPAT `versions` bit and the read-only rule ----
+
+use unafs::fs::FileSystemError;
+use unafs::root::{ROOT_FLAG_VERSIONS, read_active, write_slot};
+
+/// The active root's `flags` word as it sits on the device.
+fn disk_flags(dev: &mut MemDevice) -> u64 {
+    read_active(dev).unwrap().expect("a valid root").0.flags
+}
+
+/// Commit a new root (generation + 1, to the inactive slot) whose `flags` are `f(old flags)` — what a
+/// reader built later, or one built before the flag, would have left on the disk.
+fn reroot(bytes: Vec<u8>, f: impl Fn(u64) -> u64) -> Vec<u8> {
+    let mut dev = MemDevice::from_bytes(bytes);
+    let (mut rec, slot) = read_active(&mut dev).unwrap().expect("a valid root");
+    rec.generation += 1;
+    rec.flags = f(rec.flags);
+    write_slot(&mut dev, slot.other(), &rec).unwrap();
+    dev.as_bytes().to_vec()
+}
+
+#[test]
+fn the_first_version_sets_the_rocompat_bit_and_repair_keeps_every_version_block() {
+    // A volume that never kept a version says nothing.
+    let mut plain = vol(2048);
+    let root = plain.superblock.root_inode;
+    let id = plain.create_file(root, "once.txt".into()).unwrap();
+    plain.write_data(id, 0, &content(7, 5000)).unwrap();
+    assert_eq!(disk_flags(&mut plain.device) & ROOT_FLAG_VERSIONS, 0);
+    assert_eq!(plain.rocompat(), 0);
+
+    let mut fs = vol(2048);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "doc.txt".into()).unwrap();
+    for i in 0..10u8 {
+        fs.write_data(id, 0, &content(i, 5000)).unwrap();
+    }
+    assert_eq!(fs.rocompat(), ROOT_FLAG_VERSIONS);
+    assert!(!fs.read_only());
+    assert_ne!(disk_flags(&mut fs.device) & ROOT_FLAG_VERSIONS, 0, "the commit carries the bit");
+
+    // The current reader's repair counts every ring's references: nothing reclaimed, nothing cleared.
+    let r = fs.fsck(true).unwrap();
+    assert_eq!(r.reclaimed_blocks, 0, "{r:?}");
+    assert_eq!(r.versions, RING_MAX as u64);
+    assert_ne!(disk_flags(&mut fs.device) & ROOT_FLAG_VERSIONS, 0, "repair keeps the bit");
+
+    // Every block a version names is still held: fill the free space, then read every version back.
+    for f in 0..40u8 {
+        let n = fs.create_file(root, format!("fill{f}.bin")).unwrap();
+        fs.write_data(n, 0, &content(100 + f, 8 * BLOCK_SIZE as usize)).unwrap();
+    }
+    let mut fs = remount(fs);
+    assert_eq!(fs.rocompat(), ROOT_FLAG_VERSIONS);
+    for n in 0..RING_MAX {
+        assert_eq!(fs.read_version(id, n, 0, 5000).unwrap(), content(8 - n as u8, 5000), "version {n}");
+    }
+    let r = fs.fsck(false).unwrap();
+    assert!(r.is_clean(), "{r:?}");
+}
+
+#[test]
+fn a_volume_versioned_before_the_flag_gets_it_on_repair() {
+    let mut fs = vol(2048);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "old.txt".into()).unwrap();
+    for i in 0..3u8 {
+        fs.write_data(id, 0, &content(i, 6000)).unwrap();
+    }
+    // FILEVERSIONS (B714) before SR154 kept versions under a root with no ROCOMPAT word.
+    let bytes = reroot(fs.device.as_bytes().to_vec(), |f| f & !ROOT_FLAG_VERSIONS);
+    let mut fs = UnaFS::mount(MemDevice::from_bytes(bytes)).unwrap();
+    assert_eq!(fs.rocompat(), 0);
+    let r = fs.fsck(true).unwrap();
+    assert_eq!(r.reclaimed_blocks, 0, "{r:?}");
+    assert_eq!(r.versions, 2);
+    assert_eq!(fs.rocompat(), ROOT_FLAG_VERSIONS);
+    assert_ne!(disk_flags(&mut fs.device) & ROOT_FLAG_VERSIONS, 0);
+    assert_eq!(fs.read_version(id, 1, 0, 6000).unwrap(), content(0, 6000));
+}
+
+#[test]
+fn an_unknown_rocompat_bit_mounts_read_only_and_refuses_repair_and_writes() {
+    const FUTURE: u64 = 1 << 40;
+    let mut fs = vol(2048);
+    let root = fs.superblock.root_inode;
+    let id = fs.create_file(root, "kept.txt".into()).unwrap();
+    for i in 0..3u8 {
+        fs.write_data(id, 0, &content(i, 5000)).unwrap();
+    }
+    let bytes = reroot(fs.device.as_bytes().to_vec(), |f| f | FUTURE);
+    let mut fs = UnaFS::mount(MemDevice::from_bytes(bytes.clone())).expect("mounts (read-only)");
+    assert!(fs.read_only());
+    assert_eq!(fs.rocompat(), ROOT_FLAG_VERSIONS | FUTURE);
+    let generation = fs.root_generation();
+
+    // Reads work.
+    assert_eq!(fs.read_data(id, 0, 5000).unwrap(), content(2, 5000));
+    assert_eq!(fs.versions(id).unwrap().len(), 2);
+    assert_eq!(fs.read_version(id, 1, 0, 5000).unwrap(), content(0, 5000));
+    assert!(fs.fsck(false).unwrap().is_clean(), "the dry run reports");
+
+    // Every write and the repair are refused before they touch the device.
+    let ro = |r: Result<(), FileSystemError>| matches!(r, Err(FileSystemError::ReadOnly(b)) if b == FUTURE);
+    assert!(ro(fs.write_data(id, 0, b"x").map(|_| ())));
+    assert!(ro(fs.truncate_data(id, 1).map(|_| ())));
+    assert!(ro(fs.create_file(root, "new.txt".into()).map(|_| ())));
+    assert!(ro(fs.mkdir(root, "dir".into()).map(|_| ())));
+    assert!(ro(fs.unlink(root, "kept.txt").map(|_| ())));
+    assert!(ro(fs.fsck(true).map(|_| ())));
+    assert!(ro(fs.recover().map(|_| ())));
+    assert!(ro(fs.commit()));
+    assert_eq!(fs.device.as_bytes(), &bytes[..], "not one byte written");
+
+    // A mutation outside the guarded set stages, then its commit is refused: the root never flips.
+    assert!(ro(fs.restore_version(id, 1)));
+    let root_block = BLOCK_SIZE as usize..2 * BLOCK_SIZE as usize;
+    assert_eq!(fs.device.as_bytes()[..root_block.end], bytes[..root_block.end], "block 0 and the root slots");
+    let mut again = UnaFS::mount(MemDevice::from_bytes(fs.device.as_bytes().to_vec())).unwrap();
+    assert_eq!(again.root_generation(), generation);
+    assert_eq!(again.read_data(id, 0, 5000).unwrap(), content(2, 5000));
+    assert!(again.read_only());
+}

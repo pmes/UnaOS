@@ -53,6 +53,19 @@ pub const ROOT_FLAG_GROW: u64 = 1;
 /// superblock rewrite may not have landed. Mount reads the maps paged and the
 /// next commit finishes the migration.
 pub const ROOT_FLAG_MIGRATE: u64 = 2;
+/// VERSIONSCOMPAT (SR154): bits 32..63 of [`RootRecord::flags`] are the ROCOMPAT word — features a reader
+/// may READ without knowing them but must not WRITE or REPAIR: a reader that finds a bit here it does not
+/// know mounts the volume read-only (`UnaFS::read_only`) and refuses every mutation, the commit and
+/// `fsck --repair` (`FileSystemError::ReadOnly`). Bits 0..31 stay the commit-protocol flags above.
+/// Every reader before SR154 ignores this word (it tests bits 0 and 1 only): the rule binds from SR154 on.
+pub const ROOT_ROCOMPAT_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+/// VERSIONSCOMPAT (SR154): ROCOMPAT bit 0 (flags bit 32) — this volume has kept a file version
+/// (FILEVERSIONS B714, unafs-records.md §R17): blocks are referenced by `una:versions` rings, which a
+/// reader that cannot see them would count as leaks and free on repair. Set by the first version kept (or
+/// by this build's `fsck --repair` on a volume that holds versions); never cleared.
+pub const ROOT_FLAG_VERSIONS: u64 = 1 << 32;
+/// VERSIONSCOMPAT (SR154): the ROCOMPAT bits this build knows (and so may write under).
+pub const ROOT_ROCOMPAT_KNOWN: u64 = ROOT_FLAG_VERSIONS;
 /// The atomicity unit of record: one 512 B sector.
 pub const ROOT_SECTOR_SIZE: usize = 512;
 
@@ -107,11 +120,22 @@ pub struct RootRecord {
     /// Free blocks at commit time (refcount == 0 in the committed map).
     pub free_blocks: u64,
     /// Flags: [`ROOT_FLAG_GROW`] (bit 0), [`ROOT_FLAG_MIGRATE`] (bit 1);
-    /// every other bit reserved (0).
+    /// bits 2..31 reserved (0); bits 32..63 the ROCOMPAT word
+    /// ([`ROOT_ROCOMPAT_MASK`]: [`ROOT_FLAG_VERSIONS`], the rest reserved).
     pub flags: u64,
 }
 
 impl RootRecord {
+    /// VERSIONSCOMPAT (SR154): the record's ROCOMPAT word (bits 32..63 of `flags`, in place).
+    pub fn rocompat(&self) -> u64 {
+        self.flags & ROOT_ROCOMPAT_MASK
+    }
+
+    /// VERSIONSCOMPAT (SR154): the ROCOMPAT bits this build does not know (non-zero = read-only).
+    pub fn rocompat_unknown(&self) -> u64 {
+        self.rocompat() & !ROOT_ROCOMPAT_KNOWN
+    }
+
     /// Pack the record into an exactly-[`ROOT_RECORD_SIZE`]-byte buffer,
     /// checksummed (FNV-1a over everything before the checksum field).
     pub fn to_bytes(&self) -> [u8; ROOT_RECORD_SIZE] {

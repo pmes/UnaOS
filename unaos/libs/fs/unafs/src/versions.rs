@@ -38,6 +38,9 @@
 //!   of the current contents (its references MOVE to the version; the live file takes new references on
 //!   the restored blocks — no data is copied). `unlink` releases every version with the inode; a
 //!   Trash move is a rename, so the versions travel with the file.
+//! * **The flag** (VERSIONSCOMPAT SR154, §R12): the first version kept sets the root record's ROCOMPAT bit
+//!   `versions` ([`crate::root::ROOT_FLAG_VERSIONS`]); a reader that does not know a ROCOMPAT bit mounts
+//!   read-only and refuses `fsck --repair` — the repair that would free every block only a ring names.
 
 use super::*;
 use crate::inode::EXTENT_ENC_LEN;
@@ -425,6 +428,9 @@ impl<D: BlockDevice> UnaFS<D> {
         }
         inode.versions = encode_ring(&ring);
         ledger.set_row(inode.id, &ring);
+        // VERSIONSCOMPAT (SR154): the volume now holds references only a ring names — the root says so
+        // (ROCOMPAT `versions`), so a reader that cannot see rings mounts it read-only and never repairs it.
+        self.mark_rocompat(crate::root::ROOT_FLAG_VERSIONS);
         self.put_ledger(&ledger)
     }
 

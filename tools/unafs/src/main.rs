@@ -82,6 +82,20 @@ impl Key {
     }
 }
 
+/// VERSIONSCOMPAT (SR154): name a root record's ROCOMPAT word — `versions` for the bit this build knows, the
+/// hex of any other set bit, `none` for an empty word (unafs-records.md §R12).
+fn rocompat_label(bits: u64) -> String {
+    let mut names = Vec::new();
+    if bits & unafs::root::ROOT_FLAG_VERSIONS != 0 {
+        names.push("versions".to_string());
+    }
+    let unknown = bits & unafs::root::ROOT_ROCOMPAT_MASK & !unafs::root::ROOT_ROCOMPAT_KNOWN;
+    if unknown != 0 {
+        names.push(format!("unknown:{unknown:#x}"));
+    }
+    if names.is_empty() { "none".to_string() } else { names.join(",") }
+}
+
 /// VOLKEY (B684): mount `device` — an unkeyed volume as it always mounted; a KEYED volume (unafs-records.md
 /// §R2a) only with the key passed on stdin. Without it: refused, with the way to pass it.
 fn mount_dev(device: FileDevice, key: &Key) -> Result<FileSystem> {
@@ -1165,6 +1179,8 @@ async fn main() -> Result<()> {
         Commands::Fsck { img, repair } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
             let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
+            // VERSIONSCOMPAT (SR154): the root record's ROCOMPAT word, named (an unknown bit = read-only here).
+            println!("  root flags           : rocompat={} read_only={}", rocompat_label(fs.rocompat()), fs.read_only() as u8);
 
             if *repair {
                 let report = fs
