@@ -244,3 +244,13 @@ pub fn ensure() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) { crate::tests::register("helpdoc", selftest); }
 }
+
+// HELPSEARCH (rmbp-ledger B729): the ONE help index — `docs/help/*.md` packed by the builder into `HELP.IDX` — is read
+// by `index` (no_std, `help/index.rs`); `window` is the Help window and the Settings-row source, a painter, so its file
+// lives with the painters in `video/helpwin.rs` (the appearance gate scans it). Children of this file (no `lib.rs` or
+// `video/mod.rs` line), x86 `wc` only (their doors ride the Launcher's); TAIL-APPENDED, so no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod index;
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[path = "video/helpwin.rs"]
+pub mod window;

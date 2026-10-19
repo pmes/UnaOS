@@ -28,6 +28,13 @@
 //! `[launcher] close`, `[launcher] saved recent=<n> via=prefs ok=<0|1>`; `tests launcher` →
 //! `:: LAUNCHER: programs=<n> files=<n> settings=<n> math=ok open=ok recency=via-prefs ms=<n> -> PASS ::`.
 //! Design: `docs/dev/evidence/rmbp-1005/launcher.md`.
+//!
+//! HELPSEARCH (rmbp-ledger B729, research C §8: help is in the OS, searchable, offline): two more groups and a wider
+//! Settings group, so typing finds help pages, Settings rows and shell verbs TOGETHER — Help (`help::index`'s pages,
+//! the one `HELP.IDX` the builder packs from `docs/help/`), Shell commands (`help::DOCS`), and Settings now ranks
+//! `settings::MAP`'s painted row labels (`help::window::search_rows`) before the schema keys. A Help or verb pick opens
+//! the Help window (`help::window`); its doors are chained from this file's (when the Launcher is down) and its pass
+//! from [`service`]. Wire: the query line's `hits=` gains `/h<n>/v<n>`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -290,6 +297,10 @@ pub enum Kind {
     File,
     Setting,
     Math,
+    /// HELPSEARCH (B729): a help page (`target` = its slug).
+    Help,
+    /// HELPSEARCH (B729): a shell verb (`target` = its name).
+    Verb,
 }
 
 impl Kind {
@@ -299,6 +310,8 @@ impl Kind {
             Kind::File => "file",
             Kind::Setting => "setting",
             Kind::Math => "math",
+            Kind::Help => "help",
+            Kind::Verb => "verb",
         }
     }
     const fn group(self) -> &'static str {
@@ -307,6 +320,8 @@ impl Kind {
             Kind::File => "Files",
             Kind::Setting => "Settings",
             Kind::Math => "Math",
+            Kind::Help => "Help",
+            Kind::Verb => "Shell commands",
         }
     }
 }
@@ -329,13 +344,16 @@ pub struct Item {
 const P_MAX: usize = 5;
 const F_MAX: usize = 6;
 const S_MAX: usize = 4;
+const H_MAX: usize = 3;
+const V_MAX: usize = 3;
 
-/// Rank `q` over the sources: Programs, Files, Settings, Math — each group recent-first, then by quality.
-/// Returns the items and `(programs, files, settings, math)` counts.
-fn rank(q: &str, progs: &[Prog], files: &[search::Hit], lru: &[String]) -> (Vec<Item>, [usize; 4]) {
+/// Rank `q` over the sources: Programs, Files, Settings, Help, Shell commands, Math — each group recent-first, then by
+/// quality. `help` is the index's ranked pages for `q` as `(slug, title)` (HELPSEARCH). Returns the items and the
+/// `(programs, files, settings, math, help, verbs)` counts.
+fn rank(q: &str, progs: &[Prog], files: &[search::Hit], lru: &[String], help: &[(String, String)]) -> (Vec<Item>, [usize; 6]) {
     let pos = |t: &str| lru.iter().position(|x| x == t).unwrap_or(usize::MAX);
     let mut out: Vec<Item> = Vec::new();
-    let mut n = [0usize; 4];
+    let mut n = [0usize; 6];
     if q.is_empty() {
         return (out, n);
     }
@@ -365,13 +383,44 @@ fn rank(q: &str, progs: &[Prog], files: &[search::Hit], lru: &[String]) -> (Vec<
     out.extend(fs.into_iter().take(F_MAX).map(|x| x.2));
 
     let mut ss: Vec<(usize, i32, Item)> = Vec::new();
+    // HELPSEARCH (B729): the Settings rows by their painted labels first (SETTINGSMAP's one table), then the schema keys
+    // no row label matched.
+    for (i, s) in crate::help::window::search_rows(q) {
+        let r = super::settings::MAP[i];
+        let Some(key) = r.keys.first().copied() else { continue };
+        let token = alloc::format!("setting:{}", key);
+        let tab = super::settings::TAB_NAMES.get(r.tab).copied().unwrap_or("Settings");
+        ss.push((pos(&token), 1000 + s, Item { kind: Kind::Setting, label: String::from(r.label), detail: alloc::format!("Settings > {}", tab), target: String::from(key), token, icon: String::new(), dir: false, launch: None }));
+    }
     for (key, label, doc, s) in settings_matches(q) {
+        if ss.iter().any(|x| x.2.target == key) {
+            continue;
+        }
         let token = alloc::format!("setting:{}", key);
         ss.push((pos(&token), s, Item { kind: Kind::Setting, label, detail: String::from(doc), target: String::from(key), token, icon: String::new(), dir: false, launch: None }));
     }
     ss.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
     n[2] = ss.len();
     out.extend(ss.into_iter().take(S_MAX).map(|x| x.2));
+
+    // HELPSEARCH (B729): the help pages (already ranked by the index), recent first; then the shell verbs.
+    let mut hs: Vec<(usize, usize, Item)> = Vec::new();
+    for (i, (slug, title)) in help.iter().enumerate() {
+        let token = alloc::format!("help:{}", slug);
+        hs.push((pos(&token), i, Item { kind: Kind::Help, label: title.clone(), detail: String::from("Help page"), target: slug.clone(), token, icon: String::new(), dir: false, launch: None }));
+    }
+    hs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    n[4] = hs.len();
+    out.extend(hs.into_iter().take(H_MAX).map(|x| x.2));
+    let mut vs: Vec<(usize, i32, Item)> = Vec::new();
+    for (i, s) in crate::help::index::search_verbs(q) {
+        let d = &crate::help::DOCS[i];
+        let token = alloc::format!("verb:{}", d.name);
+        vs.push((pos(&token), s, Item { kind: Kind::Verb, label: String::from(d.name), detail: String::from(d.summary), target: String::from(d.name), token, icon: String::new(), dir: false, launch: None }));
+    }
+    vs.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    n[5] = vs.len();
+    out.extend(vs.into_iter().take(V_MAX).map(|x| x.2));
 
     if let Some(v) = math(q) {
         n[3] = 1;
@@ -383,7 +432,7 @@ fn rank(q: &str, progs: &[Prog], files: &[search::Hit], lru: &[String]) -> (Vec<
 // ── State ───────────────────────────────────────────────────────────────────────────────────────
 
 const QUERY_MAX: usize = 64;
-const LINES_MAX: usize = 1 + P_MAX + 1 + F_MAX + 1 + S_MAX + 1 + 1;
+const LINES_MAX: usize = 1 + P_MAX + 1 + F_MAX + 1 + S_MAX + 1 + H_MAX + 1 + V_MAX + 1 + 1;
 const LRU_MAX: usize = 16;
 
 struct St {
@@ -479,7 +528,7 @@ fn paint(st: &mut St) {
     let tx = pad + 12 + ch;
     let ty = fy + (fh - ch) / 2;
     if st.query.is_empty() {
-        text(buf, w, h, "Launcher - programs, files, settings, or a sum", tx, ty, theme::text_secondary(), false);
+        text(buf, w, h, "Launcher - programs, files, settings, help, or a sum", tx, ty, theme::text_secondary(), false);
     } else {
         text(buf, w, h, &st.query, tx, ty, theme::text_primary(), false);
         let cx = tx + st.query.len() * menubar::BAR_CELL_W() + 1;
@@ -519,6 +568,8 @@ fn paint(st: &mut St) {
                 Kind::File => "F",
                 Kind::Setting => "S",
                 Kind::Math => "=",
+                Kind::Help => "?",
+                Kind::Verb => ">",
             };
             fill(buf, w, h, ix, iy, ch, ch, if on { theme::surface_raised() } else { theme::line_subtle() });
             text(buf, w, h, mark, ix + ch / 4, iy, if on { theme::accent() } else { theme::surface_raised() }, true);
@@ -645,7 +696,7 @@ pub fn key_door(ev: crate::pal::Event) -> bool {
         return true;
     }
     if !is_open() {
-        return false;
+        return crate::help::window::key_route(ev); // HELPSEARCH (B729): the Help window's keys, while it holds focus
     }
     match ev {
         Event::Key(c) => {
@@ -694,7 +745,7 @@ pub fn key_door(ev: crate::pal::Event) -> bool {
 /// row picks it; any other press closes the Launcher. Consumed (`true`) whenever it was up.
 pub fn press_at(x: i32, y: i32, mask: u8) -> bool {
     if !is_open() {
-        return false;
+        return crate::help::window::press_route(x, y, mask); // HELPSEARCH (B729): the Help window's close box, links, focus
     }
     let hit = {
         let g = ST.lock();
@@ -856,6 +907,14 @@ fn act(it: &Item) -> String {
             let ok = super::clipboard::set(it.target.as_bytes());
             alloc::format!("clipboard value={} copied={}", it.target, ok as u8)
         }
+        Kind::Help => match crate::help::window::open_page(&it.target) {
+            Ok(id) => alloc::format!("help page={} win={}", it.target, id),
+            Err(e) => alloc::format!("refused ({})", e),
+        },
+        Kind::Verb => match crate::help::window::open_verb(&it.target) {
+            Ok(id) => alloc::format!("help verb={} win={}", it.target, id),
+            Err(e) => alloc::format!("refused ({})", e),
+        },
     };
     serial_println!("[launcher] pick kind={} name={} -> {}", it.kind.word(), it.label, how);
     lru_note(&it.token);
@@ -891,16 +950,17 @@ fn rerank() {
         None => return,
     };
     let lru = LRU.lock().clone();
+    let help = help_pages(&q);
     // NAMEINDEX (B432): per keystroke, ONE range scan of the volume's name index; the open-time snapshot is
     // only the FAT root's (or a still-building index's) fallback.
     let indexed = if q.is_empty() { None } else { search::query(&q, 64) };
     let (items, n) = {
         let p = PROGS.lock();
         match &indexed {
-            Some(f) => rank(&q, &p, f, &lru),
+            Some(f) => rank(&q, &p, f, &lru, &help),
             None => {
                 let f = FILES.lock();
-                rank(&q, &p, &f, &lru)
+                rank(&q, &p, &f, &lru, &help)
             }
         }
     };
@@ -914,12 +974,18 @@ fn rerank() {
     }
     repaint();
     if !q.is_empty() {
-        serial_println!("[launcher] query={} hits=p{}/f{}/s{}{} ms={}", q, n[0], n[1], n[2], if n[3] != 0 { "/m1" } else { "" }, crate::arch::ms().saturating_sub(t0));
+        serial_println!("[launcher] query={} hits=p{}/f{}/s{}{}/h{}/v{} ms={}", q, n[0], n[1], n[2], if n[3] != 0 { "/m1" } else { "" }, n[4], n[5], crate::arch::ms().saturating_sub(t0));
     }
+}
+
+/// HELPSEARCH (B729): the help index's pages for `q`, best first, as `(slug, title)` (none until the index is loaded).
+fn help_pages(q: &str) -> Vec<(String, String)> {
+    crate::help::index::with(|ix| ix.search_pages(q).into_iter().map(|(p, _)| (ix.pages[p].slug.clone(), ix.pages[p].title.clone())).collect()).unwrap_or_default()
 }
 
 /// **The pass** — chained from `settings::service` (the desktop's service tick). Idle: four atomic loads.
 pub fn service() {
+    crate::help::window::service(); // HELPSEARCH (B729): the Help window's latched opens, links, closes and paints
     if let Some(it) = PICK_POSTED.take(&PICK) { // SVCLATCH (B462): no lock on a quiet pass
         lru_load();
         let _ = act(&it);
@@ -933,6 +999,7 @@ pub fn service() {
     if SNAP_OWED.swap(false, Ordering::AcqRel) {
         let t0 = crate::arch::ms();
         lru_load();
+        crate::help::index::ensure_loaded(); // HELPSEARCH (B729): read HELP.IDX once, here on the pass, never in a door
         let p = programs();
         // NAMEINDEX (B432): an indexed root needs no walk — each keystroke asks the index.
         let idx = search::indexed();
@@ -964,8 +1031,8 @@ pub fn selftest() {
         Some(h) => (search::Snapshot { hits: h, truncated: false }, search::SRC_INDEX),
         None => (search::snapshot(search::SNAP_BUDGET), "walk"),
     };
-    let (items_p, n_p) = rank("set", &progs, &[], &[]);
-    let (_, n_f) = rank("test", &[], &snap.hits, &[]);
+    let (items_p, n_p) = rank("set", &progs, &[], &[], &[]);
+    let (_, n_f) = rank("test", &[], &snap.hits, &[], &[]);
     let sm = settings_matches("bright");
     let bright = sm.first().map(|s| s.0 == "display.brightness" && s.1 == "Display > Brightness").unwrap_or(false);
     let math_ok = math("2*(3+4)").as_deref() == Some("14") && math("1/0").is_none() && math("42").is_none() && math("1.5*2").as_deref() == Some("3");
