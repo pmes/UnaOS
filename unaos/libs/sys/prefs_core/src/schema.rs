@@ -265,7 +265,7 @@ pub static SCHEMA: &[Key] = &[
         ns: "system", key: "dock.position", kind: Kind::Enum(&["bottom", "left", "right"]), default: Default::Str("bottom"),
         writers: &[Writer::Settings, Writer::Dock, Writer::Program], reader: "kernel dock",
         doc: "The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock.",
-    },
+    }, Key { ns: "system", key: "lock.after_idle_min", kind: Kind::Int { min: 0, max: 1440 }, default: Default::Int(10), writers: &[Writer::Settings], reader: "kernel AUTOLOCK (`video/lock.rs`), Settings > Security", doc: "Minutes with no key or pointer event before the session locks (the window table veiled, the login screen's password field opens it, nothing closed); 0 = never (AUTOLOCK B712)." }, Key { ns: "system", key: "lock.on_lid", kind: Kind::Bool, default: Default::Bool(true), writers: &[Writer::Settings], reader: "kernel AUTOLOCK (`video/lock.rs`), Settings > Security", doc: "Lock the session when the lid closes, before the sleep state (AUTOLOCK B712)." }, Key { ns: "system", key: "lock.on_sleep", kind: Kind::Bool, default: Default::Bool(true), writers: &[Writer::Settings], reader: "kernel AUTOLOCK (`video/lock.rs`), Settings > Security", doc: "Lock the session before any other sleep entry (the lid has its own key) (AUTOLOCK B712)." }, // AUTOLOCK (B712): three rows on one line, so no row below moves
     Key {
         ns: "system", key: "login.items", kind: Kind::Str { max_len: crate::login::VALUE_MAX, printable: true },
         default: Default::Str(""),
@@ -315,9 +315,9 @@ pub static SCHEMA: &[Key] = &[
         doc: "Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18).",
     },
     Key {
-        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 10 }, default: Default::Int(0),
+        ns: "system", key: "settings.tab", kind: Kind::Int { min: 0, max: 11 }, default: Default::Int(0),
         writers: &[Writer::Settings, Writer::Program], reader: "kernel settings",
-        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy).",
+        doc: "The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy, Security).",
     },
     // ── TRACKPADPANE (B412, MACPARITY row 16): the Trackpad pane; the rules are `crate::trackpad` ──────────────
     Key {

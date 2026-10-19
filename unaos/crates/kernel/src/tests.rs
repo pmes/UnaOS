@@ -323,7 +323,7 @@ fn ensure_brightfloor() {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", crate::video::lidsleep::sleep_selftest); } // SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
+        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", crate::video::lidsleep::sleep_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); } // AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
     }
 }
 
@@ -937,5 +937,73 @@ fn abielf_selftest() {
     serial_println!(
         ":: ABIELF: elf=ABIPROBE.ELF bytes={} abi={} kernel_abi={} syscalls={} ok={} outcome={} -> {} ::",
         bytes.len(), abi, k, n, ok, outcome, if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+// AUTOLOCK (rmbp-ledger B712, BP-bar-15/20) — TAIL-APPENDED, so no line above moves. `tests autolock` (R80: registered,
+// never at boot unless `tests-at-boot`): Win+L through the live resolver (`keymap::resolve_edge`, the Windows key of the
+// live look and keyboard held, an L press edge) must answer `LockScreen`; the router's arm (`login::lock`) locks; two
+// keystrokes offered at the router's first gate (`users::screen_key`) must both be the screen's (`leaked_keys` counts a
+// key the screen did not take, i.e. one the focused window would have read); a wrong password is refused and counted;
+// the right one opens it (the worker's verdict drained here, bounded 15 s, as the render pass would); the window table's
+// fingerprint (`lock::fingerprint`: every app row's id, owner, minimised bit, title and frame, then the focused row) is
+// the same before and after. The credential is the loginst fixture account's (`una`); any other session SKIPs — the
+// fixture never learns a password it was not given. One line:
+// `:: AUTOLOCK: entered=<0|1> leaked_keys=<n> reopened=<ok|FAIL> table_same=<0|1> ms=<n> -> PASS|FAIL|SKIP :: …`
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn autolock_selftest() {
+    use crate::video::{crystal::login, keymap, lock};
+    const NAME: &[u8] = b"una";
+    const PW: &[u8] = b"correct-horse";
+    const WRONG: &[u8] = b"wrong-horse";
+    let mut nb = [0u8; crate::fs::users::NAME_MAX];
+    let is_una = |nb: &mut [u8; crate::fs::users::NAME_MAX]| matches!(crate::fs::users::whoami(nb), Some(k) if &nb[..k] == NAME);
+    if !is_una(&mut nb) {
+        serial_println!(":: AUTOLOCK: entered=0 leaked_keys=0 reopened=- table_same=- ms=- -> SKIP reason=session-not-fixture-user (needs the loginst session una) ::");
+        return;
+    }
+    if lock::active() || login::is_open() {
+        serial_println!(":: AUTOLOCK: entered=0 leaked_keys=0 reopened=- table_same=- ms=- -> SKIP reason=screen-up ::");
+        return;
+    }
+    let feed = |s: &[u8]| { for &b in s { let _ = crate::fs::users::screen_key(b); } };
+    let settle = || {
+        let t0 = crate::arch::ms();
+        loop {
+            login::submit_drain();
+            if !login::submit_busy() || crate::arch::ms().wrapping_sub(t0) > 15_000 { break; }
+            crate::arch::sched::yield_now();
+        }
+    };
+    let before = lock::fingerprint();
+    let role = keymap::start_role();
+    let win = if role != 0 { role } else { crate::drivers::xhci::HID_MOD_GUI };
+    let mut cur = [0u8; 6];
+    cur[0] = 0x0F;
+    let chord = keymap::resolve_edge(keymap::active(), &cur, &[0u8; 6], win);
+    let token = chord.map(|(_, t)| t).unwrap_or("none");
+    let chord_ok = matches!(chord, Some((keymap::Action::LockScreen, _)));
+    let entered = chord_ok && login::lock() && lock::active();
+    let hidden = lock::hidden();
+    let mut leaked = 0u32;
+    if entered {
+        for b in [b'q', 8u8] {
+            if !crate::fs::users::screen_key(b) { leaked += 1; }
+        }
+    }
+    let w0 = lock::wrong_count();
+    if entered { feed(WRONG); let _ = crate::fs::users::screen_key(b'\n'); settle(); }
+    let wrong = lock::wrong_count().wrapping_sub(w0);
+    let refused = entered && lock::active() && wrong == 1;
+    if entered { feed(PW); let _ = crate::fs::users::screen_key(b'\n'); settle(); }
+    let reopened = entered && !lock::active() && !login::is_open() && is_una(&mut nb);
+    let after = lock::fingerprint();
+    let same = before == after;
+    let ms = lock::last_open_ms();
+    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some();
+    serial_println!(
+        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} -> {} :: chord={} wrong={} windows_hidden={}",
+        entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)),
+        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden
     );
 }

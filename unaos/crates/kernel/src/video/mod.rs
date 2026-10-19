@@ -1257,7 +1257,7 @@ pub mod svclatch;
 pub mod draw;
 // SOFTY (B629): the desktop's second LOOK (`video::softy`: the taskbar, Start, the chrome at the right) and its switch (`video::look`, Principia's `system.look`). Same gate as the dock; at the tail so no line above moves.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub mod look; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod softy;
+pub mod look; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] pub mod softy; #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] pub mod lock; // AUTOLOCK (B712): the session lock (video/lock.rs) — the login screen's gate. LINE-NEUTRAL fold, code first.
 // LOOKSHIM: text.rs asks `look::is_softy()` on every build; without the desktop the answer is "no" (the plain `kernel8` verb, no PIDESK, was red: E0433 at text.rs:309).
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub mod look { #[inline] pub fn is_softy() -> bool { false } }

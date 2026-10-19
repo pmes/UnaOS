@@ -14,7 +14,7 @@ PREFSCAP (B454): a ring-3 program's PREF_SET reaches only its own `app.<name>.*`
 after it, and the rows marked `yes` under `ring 3` (writer `program`); every other row is NOT settable
 from ring 3 (`prefs_core::cap`).
 
-Rows: 61.
+Rows: 64.
 
 | key | type | default | writers | ring 3 | reader | meaning |
 | :-- | :-- | :-- | :-- | :-- | :-- | :-- |
@@ -42,6 +42,9 @@ Rows: 61.
 | `system.dock.autohide` | bool | `false` | settings, dock, program | yes | kernel dock | Hide the dock until the pointer reaches its edge (DOCK2). Edited in Settings > General > Auto-hide dock. |
 | `system.dock.pins` | string ≤256 printable | consumer: every pin the build carries (lumen, aether, midden, una, stria each only on its own build) | dock | — | kernel dock | Comma-joined pinned app names (console, shell, quarry, activity, settings, editor, lumen, aether, midden, una, stria); TOML arrays are outside the subset. |
 | `system.dock.position` | enum `bottom \| left \| right` | `"bottom"` | settings, dock, program | yes | kernel dock | The panel edge the dock sits on (DOCK2, MACPARITY row 25). Edited in Settings > General > Dock. |
+| `system.lock.after_idle_min` | int `0..=1440` | `10` | settings | — | kernel AUTOLOCK (`video/lock.rs`), Settings > Security | Minutes with no key or pointer event before the session locks (the window table veiled, the login screen's password field opens it, nothing closed); 0 = never (AUTOLOCK B712). |
+| `system.lock.on_lid` | bool | `true` | settings | — | kernel AUTOLOCK (`video/lock.rs`), Settings > Security | Lock the session when the lid closes, before the sleep state (AUTOLOCK B712). |
+| `system.lock.on_sleep` | bool | `true` | settings | — | kernel AUTOLOCK (`video/lock.rs`), Settings > Security | Lock the session before any other sleep entry (the lid has its own key) (AUTOLOCK B712). |
 | `system.login.items` | string ≤256 printable | `""` | settings, dock | — | kernel login items (`video/loginitems.rs`) | Comma-joined program names launched after the desktop is built at login, in order; empty = nothing opens itself (R88, R91). Edited in Settings > Login Items and the dock tile menu's Open at Login. |
 | `system.look` | enum `una \| softy` | `"una"` | settings, program | yes | kernel `video::look` (SOFTY) | The desktop's look: `una` (menu bar, dock, UnaOS chrome) or `softy` (a bottom taskbar with a Start menu, window controls at the right), applied live on PrefChanged (SOFTY B629). |
 | `system.notify.dnd` | bool | `false` | settings, program | yes | kernel NOTIFY (`video/notify.rs`) | Do Not Disturb: notifications collect silently in the Notification Center (the bell counts them, no card shows, no sound) (NOTIFY, MACPARITY row 24). Edited in Settings > Notifications; stored in settings/notify (NOTIFYPANE B435). |
@@ -51,7 +54,7 @@ Rows: 61.
 | `system.power.lowbat_shutdown_pct` | int `0..=100` | consumer: the `UNAOS_LOWBAT_SHUTDOWN` build knob, 0 (off) when unset | settings | — | kernel POWERMENU, Settings > Display (Low battery shutdown, `settings::lowbat_step`) | Battery percent at which the machine shuts down; 0 = off. |
 | `system.privacy.remember` | bool | `true` | settings | — | kernel `prefs::decide` (REASK), Settings > Privacy | Keep the answer the user gives to an ask (`system.decisions.*`, see Decisions below) so it is not asked again; off = a new answer is not kept and the ask asks every time (REASK B681, R130 law 2). |
 | `system.quarry.favorites` | string ≤512 printable | consumer: none — the sidebar's six built-in favorites only | quarry | — | kernel Quarry sidebar (`video/quarry/sidebar.rs`) | Comma-joined absolute folder paths the user dragged onto Quarry's sidebar Favorites, in order, after the six built in (DRAGDROP, MACPARITY row 18). |
-| `system.settings.tab` | int `0..=10` | `0` | settings, program | yes | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy). |
+| `system.settings.tab` | int `0..=11` | `0` | settings, program | yes | kernel settings | The Settings window's open tab (General, Users, Display, About, Login Items, Appearance, Trackpad, File Types, Notifications, Accessibility, Privacy, Security). |
 | `system.trackpad.natural_scroll` | bool | `true` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Two-finger scrolling moves the content with the fingers (on) or the other way (off). Edited in Settings > Trackpad. |
 | `system.trackpad.secondary_click` | enum `two-finger \| off` | `"two-finger"` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | A click (or, with tap to click, a tap) made with two fingers down is a secondary click. Edited in Settings > Trackpad. |
 | `system.trackpad.speed` | int `1..=10` | `5` | settings, program | yes | kernel trackpad gesture stage (`drivers/ehci/tpgest.rs`) | Tracking speed: one gain on the TPSPEED curve (5 = the curve as flown, x0.25 at 1 .. x2.5 at 10); the curve's shape never changes. Unset, a stored `system.pointer.speed` maps to 4/5/7. Edited in Settings > Trackpad. |

@@ -120,8 +120,8 @@ const TOP: usize = PANE_Y;
 const ROW_H: usize = 48;
 const ROWS: usize = 10;
 /// The tabs, in the column's order.
-pub const TABS: usize = 11;
-pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8 · A11YPANE (B655) 9 · REASK (B681) 10
+pub const TABS: usize = 12; // AUTOLOCK (B712): + Security (SEC_TAB, the file tail)
+pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy", "Security"]; // AUTOLOCK (B712) 11 · PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE (B412) 6 · FILETYPES (B423) 7 · NOTIFYPANE (B435) 8 · A11YPANE (B655) 9 · REASK (B681) 10
 const WIN_H: usize = TOP + ROWS * ROW_H + PAD;
 /// Tab rows the column shows at once; more than this and it scrolls (the wheel, or the selection kept in view).
 const COL_VIS: usize = (WIN_H - COL_PAD - 8) / COL_ROW;
@@ -496,7 +496,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); security_service(); } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -794,7 +794,7 @@ fn tab_icon(s: &mut draw::Surf, tab: usize, x: i32, y: i32, t: i32, tile: Option
             fill_rrect(s, Rect::new(x + f(34), y + f(46), f(32), sw), 0, bg);
             fill_rrect(s, Rect::new(x + f(34), y + f(60), f(22), sw), 0, bg);
         }
-        PRIV_TAB => {
+        SEC_TAB => { stroke_rrect(s, Rect::new(x + f(26), y + f(14), f(48), f(70)), f(14), sw, ink); fill_rrect(s, Rect::new(cx - f(5), y + f(30), f(10).max(1), f(26)), f(5), ink); fill_circle(s, cx, y + f(64), f(6).max(1), ink); } /* Security (AUTOLOCK B712): a shield — its outline, a bar and a dot (the lock's mark). LINE-NEUTRAL fold. */ PRIV_TAB => {
             // Privacy: a padlock — the shackle's arch, the body, the keyhole in the tile's colour (REASK B681).
             stroke_rrect(s, Rect::new(x + f(32), y + f(16), f(36), f(44)), f(18), sw, ink);
             fill_rrect(s, Rect::new(x + f(22), y + f(44), f(56), f(40)), f(8), ink);
@@ -929,7 +929,7 @@ fn paint(st: &mut State, v: &Values) {
         t if t as usize == FT_TAB => paint_filetypes(st), // FILETYPES (B423)
         t if t as usize == NP_TAB => paint_notifypane(st), // NOTIFYPANE (B435)
         t if t as usize == A11Y_TAB => paint_a11y(st), // A11YPANE (B655)
-        t if t as usize == PRIV_TAB => paint_privacy(st), // REASK (B681)
+        t if t as usize == PRIV_TAB => paint_privacy(st), t if t as usize == SEC_TAB => paint_security(st), // REASK (B681) · AUTOLOCK (B712)
         _ => paint_about(st),
     }
     if let Some((t, r)) = st.found { if t as usize == tab { found_ring(st, r as usize); } } // SETTINGSMAP (B673): the row the search opened
@@ -1694,7 +1694,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         t if t == FT_TAB => press_filetypes(row, cx), // FILETYPES (B423)
         t if t == NP_TAB => press_notifypane(row, cx), // NOTIFYPANE (B435)
         t if t == A11Y_TAB => press_a11y(row, cx), // A11YPANE (B655)
-        t if t == PRIV_TAB => press_privacy(row, cx), // REASK (B681)
+        t if t == PRIV_TAB => press_privacy(row, cx), t if t == SEC_TAB => press_security(row, cx), // REASK (B681) · AUTOLOCK (B712)
         2 => {
             if mode_press(row, cx) { return true; } // PREFSUI (R93): the Resolution dropdown, open or opening
             let on_track = cx >= TRACK_X - 6 && cx <= TRACK_X + TRACK_W + 6;
@@ -3245,7 +3245,7 @@ pub fn selftest_a11y() {
 
 /// The Privacy tab's index on the strip: the last tab.
 pub const PRIV_TAB: usize = 10;
-const _: () = assert!(PRIV_TAB == TABS - 1 && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB);
+const _: () = assert!(PRIV_TAB + 1 == SEC_TAB && SEC_TAB == TABS - 1 && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB);
 /// Decision rows shown.
 const PRIV_ROWS: usize = 8;
 /// The Revoke button's x (right-aligned in the row).
@@ -3355,7 +3355,7 @@ const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'stat
 }
 
 /// Every Settings row, in column order then row order. Labels are the strings the panes paint.
-pub const MAP: [MapRow; 32] = {
+pub const MAP: [MapRow; 35] = {
     use crate::prefs::key::*;
     [
         // General (0)
@@ -3397,7 +3397,7 @@ pub const MAP: [MapRow; 32] = {
         mr(&[A11Y_CURSOR_SIZE], A11Y_TAB, 2, "Cursor size", NO_CTRL),
         mr(&[A11Y_TEXT_SIZE], A11Y_TAB, 3, "Text size", NO_CTRL),
         // Privacy (REASK B681): the switch row; the decisions below it are dynamic (`prefs::decisions`), each with a Revoke
-        mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL),
+        mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL), mr(&[LOCK_AFTER_IDLE_MIN], SEC_TAB, 0, SEC_ROW_NAMES[0], NO_CTRL), mr(&[LOCK_ON_LID], SEC_TAB, 1, SEC_ROW_NAMES[1], NO_CTRL), mr(&[LOCK_ON_SLEEP], SEC_TAB, 2, SEC_ROW_NAMES[2], NO_CTRL), // Security (AUTOLOCK B712): one row per key. LINE-NEUTRAL fold
         // The tab column
         mr(&[SETTINGS_TAB], COLUMN, 0, "Settings tabs", NO_CTRL),
     ]
@@ -3648,4 +3648,87 @@ pub fn ring_probe() -> (usize, usize, usize, Option<(usize, usize)>) {
         }
     }
     (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail)
+}
+
+// ── AUTOLOCK (rmbp-ledger B712, BP-bar-15/20) — the Security tab — TAIL-APPENDED, so no line above moves ──────────────
+// Three MAP rows, one per `system.lock.*` key: `Lock after idle` (a segmented control over `lock::IDLE_STEPS`: Never, 5,
+// 10, 30, 60 minutes), `Lock when the lid closes` and `Lock before sleep` (switches). A press applies at once through
+// `video::lock::set_policy` (the lock reads it on its next pass) and owes the store write, made by
+// [`security_service`] on the service pass (`lock::persist`, never in the router). A fourth line says what locks now.
+
+/// The Security tab's index on the strip: the last tab.
+pub const SEC_TAB: usize = 11;
+/// The three rows' labels, as painted and as MAP names them.
+const SEC_ROW_NAMES: [&str; 3] = ["Lock after idle", "Lock when the lid closes", "Lock before sleep"];
+/// The idle steps' segment labels (`lock::IDLE_STEPS`' order).
+const SEC_IDLE_LABELS: [&[u8]; 5] = [b"Never", b"5 min", b"10 min", b"30 min", b"1 hr"];
+
+/// The policy as the pane shows it: `(after_idle_min, on_lid, on_sleep)` — the lock's own (a press applies there first).
+fn security_policy() -> (u32, bool, bool) {
+    #[cfg(feature = "login")]
+    {
+        crate::video::lock::policy()
+    }
+    #[cfg(not(feature = "login"))]
+    {
+        (0, false, false)
+    }
+}
+
+/// The idle step a stored value shows as: the nearest step at or above it (a hand-set 15 shows 30), Never for 0.
+fn sec_idle_step(m: u32) -> usize {
+    #[cfg(feature = "login")]
+    {
+        let steps = crate::video::lock::IDLE_STEPS;
+        if m == 0 { return 0; }
+        steps.iter().position(|&s| s >= m && s != 0).unwrap_or(steps.len() - 1)
+    }
+    #[cfg(not(feature = "login"))]
+    {
+        let _ = m;
+        0
+    }
+}
+
+fn paint_security(st: &mut State) {
+    let (m, lid, sleep) = security_policy();
+    groups(st, &[(0, 2)]);
+    txt(st, LABEL_X, 0, SEC_ROW_NAMES[0]);
+    seg(st, 0, &SEC_IDLE_LABELS, sec_idle_step(m), false);
+    txt(st, LABEL_X, 1, SEC_ROW_NAMES[1]);
+    tog(st, 1, TOG_X, lid, false);
+    txt(st, LABEL_X, 2, SEC_ROW_NAMES[2]);
+    tog(st, 2, TOG_X, sleep, false);
+    txt2(st, LABEL_X, 3, if cfg!(feature = "login") { "Win+L locks now. Your password opens it; nothing is closed." } else { "No login on this build: nothing locks." });
+}
+
+/// A press on the Security tab: the segment under `cx` on row 0, a switch flip on rows 1 and 2.
+fn press_security(row: usize, cx: usize) {
+    #[cfg(feature = "login")]
+    {
+        use crate::video::lock::{set_policy, IDLE_STEPS};
+        let (_, lid, sleep) = security_policy();
+        match row {
+            0 => {
+                if cx < TRACK_X || cx >= TRACK_X + TRACK_W { return; }
+                let k = ((cx - TRACK_X) / (TRACK_W / IDLE_STEPS.len())).min(IDLE_STEPS.len() - 1);
+                set_policy(Some(IDLE_STEPS[k]), None, None);
+                say("lock.after_idle_min", &alloc::format!("{}", IDLE_STEPS[k]), true);
+            }
+            1 => { set_policy(None, Some(!lid), None); say("lock.on_lid", if !lid { "true" } else { "false" }, true); }
+            2 => { set_policy(None, None, Some(!sleep)); say("lock.on_sleep", if !sleep { "true" } else { "false" }, true); }
+            _ => return,
+        }
+        repaint();
+    }
+    #[cfg(not(feature = "login"))]
+    {
+        let _ = (row, cx);
+    }
+}
+
+/// The service pass: the Security rows' owed store writes.
+fn security_service() {
+    #[cfg(feature = "login")]
+    crate::video::lock::persist();
 }

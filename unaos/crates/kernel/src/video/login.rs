@@ -1867,7 +1867,7 @@ static LOCK_REIGNITED: AtomicU32 = AtomicU32::new(0);
 ///
 /// Refused (`false`) when there is no session, when the screen is already up, or when the session's row has
 /// no credential to unlock with (a lock nobody can lift is a dead machine).
-pub fn lock() -> bool {
+pub fn lock() -> bool { crate::video::lock::enter(crate::video::lock::Cause::Key) } #[doc = "AUTOLOCK (B712): THE SHARED PASSWORD FIELD — the locked screen (the session's name read-only, the password field, its verdict through `apply_unlock`) with no veil of its own; `video::lock::enter` opens it, then veils the window table. Every other caller asks [`lock`], so every lock is AUTOLOCK's (cause, count, veil). LINE-NEUTRAL fold, code first."] pub fn lock_screen() -> bool {
     let mut nb = [0u8; users::NAME_MAX];
     let Some(n) = users::whoami(&mut nb) else {
         serial_println!("[login] lock refused (no session)");
@@ -1902,7 +1902,7 @@ fn submit_unlock(n: &[u8], p: &[u8]) {
 
 /// INPUTSTALL M5: the lock screen's outcome, applied on the render task.
 fn apply_unlock(n: &[u8], verified: bool) {
-    if !verified {
+    if !verified { crate::video::lock::wrong(WIN.load(Ordering::Relaxed)); // AUTOLOCK (B712): counted, the card shakes (video/lock.rs). LINE-NEUTRAL fold, code first.
         serial_println!("[login] denied user={} (locked; one answer for every refusal)", core::str::from_utf8(n).unwrap_or("?"));
         let mut f = FORM.lock();
         f.message = "Login failed";
@@ -1915,7 +1915,7 @@ fn apply_unlock(n: &[u8], verified: bool) {
     if SWEPT.load(Ordering::Acquire) {
         LOCK_REIGNITED.fetch_add(1, Ordering::Relaxed); // never on this path: a lock sweeps nothing
     }
-    FORM.lock().state = State::Session;
+    FORM.lock().state = State::Session; crate::video::lock::opened(); // AUTOLOCK (B712): the row is down — the veil lifts, every row repaints in one composite (video/lock.rs). LINE-NEUTRAL fold, code first.
 }
 
 /// SCREENLOCK: is the locked screen up?
@@ -2404,7 +2404,7 @@ fn submit_worker(_: usize) {
 
 /// The render task's drain: apply a landed outcome (called from the render loop's pulse and ahead of every
 /// key the screen reads). One relaxed load when nothing is in flight.
-pub fn submit_drain() {
+pub fn submit_drain() { crate::video::lock::service(); // AUTOLOCK (B712): the render pulse — the lock policy, the idle lock, the shake (video/lock.rs). LINE-NEUTRAL fold, code first.
     if !BUSY.load(Ordering::Acquire) {
         return;
     }
