@@ -566,3 +566,7 @@ refs/heads/exec-rmbp-wxn64 5e9b7026 IN-FLIGHT cloud wave36 WXN64
 refs/heads/exec-rmbp-shimmeridle 72f50c42 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-uvccam 5e9b7026 IN-FLIGHT cloud wave36 UVCCAM
 refs/heads/exec-rmbp-ptpcam 5e9b7026 IN-FLIGHT cloud wave36 PTPCAM
+refs/heads/exec-rmbp-keyboot    e1c9dcd0 IN-FLIGHT cloud wave36 KEYBOOT (B688)
+refs/heads/exec-rmbp-xts        e1c9dcd0 IN-FLIGHT cloud wave36 XTS (B689)
+refs/heads/exec-rmbp-stageverb  e1c9dcd0 IN-FLIGHT cloud wave36 STAGEVERB (B690)
+refs/heads/exec-rmbp-sleep      e1c9dcd0 IN-FLIGHT cloud wave36 SLEEP (B691)
