@@ -4,7 +4,8 @@
 //! FONTSCRAFT (rmbp-ledger B640, R124): OpenType font variations, from the specification ("OpenType Font
 //! Variations Overview", `fvar`, `avar`, `gvar`, `HVAR`, "Item Variation Store", "DeltaSetIndexMap").
 //!
-//! * [`Fvar`]: the axes (tag, min, default, max) and [`Fvar::normalize`] — user value → default-relative
+//! * [`Fvar`]: the axes (tag, min, default, max), the named instances ([`NamedInstance`], FVAR SR150) and
+//!   [`Fvar::normalize`] — user value → default-relative
 //!   normalized coordinate in [-1, 1], rounded to the F2Dot14 grid the way the spec says, then through `avar`'s
 //!   segment maps ([`Avar`], version 1 maps) and rounded again.
 //! * [`ItemVariationStore`]: region lists and delta sets (16/8-bit and 32/16-bit rows); [`region_scalar`].
@@ -48,6 +49,30 @@ pub fn f2dot14_round(v: f32) -> f32 {
     crate::fmath::round(v * 16384.0) / 16384.0
 }
 
+/// FVAR (LEDGER SR150): a variable font is a [`crate::Font`] with an `fvar` table — ONE font type; the alias names
+/// the arc's call, `VarFont::instance(&font, &[user coords])` ([`crate::Font::instance`]).
+pub type VarFont<'a> = crate::Font<'a>;
+
+/// FVAR (SR150): one `fvar` InstanceRecord ("fvar — Font Variations Table", InstanceRecord): a named position in
+/// the design space, in USER units, one coordinate per axis in axis order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NamedInstance {
+    pub subfamily_name_id: u16,
+    pub flags: u16,
+    /// User coordinates (Fixed 16.16 in the table); the first `axis_count` are meaningful (at most [`MAX_AXES`]).
+    pub coords: [f32; MAX_AXES],
+    pub axis_count: usize,
+    /// `postScriptNameID`, present only when `instanceSize == axisCount * 4 + 6`.
+    pub postscript_name_id: Option<u16>,
+}
+
+impl NamedInstance {
+    /// The user coordinates, in axis order.
+    pub fn user_coords(&self) -> &[f32] {
+        &self.coords[..self.axis_count.min(MAX_AXES)]
+    }
+}
+
 /// `fvar` — font variations table.
 #[derive(Clone, Copy, Debug)]
 pub struct Fvar<'a> {
@@ -55,6 +80,10 @@ pub struct Fvar<'a> {
     axes_off: usize,
     pub axis_count: u16,
     axis_size: usize,
+    /// FVAR (SR150): `instanceCount` and `instanceSize` (header offsets 12 and 14); 0 instances when the size is
+    /// neither `axisCount * 4 + 4` nor `+ 6` or the records do not fit (a malformed list is no list).
+    pub instance_count: u16,
+    instance_size: usize,
 }
 
 impl<'a> Fvar<'a> {
@@ -69,7 +98,42 @@ impl<'a> Fvar<'a> {
             return None;
         }
         slice(d, axes_off, axis_count as usize * axis_size)?;
-        Some(Fvar { data: d, axes_off, axis_count, axis_size })
+        // InstanceRecords follow the axis array: subfamilyNameID, flags, coordinates[axisCount] (Fixed), and an
+        // optional postScriptNameID — the record size says which.
+        let base = 4 + 4 * axis_count as usize;
+        let (mut instance_count, instance_size) = (u16_at(d, 12).unwrap_or(0), u16_at(d, 14).unwrap_or(0) as usize);
+        if (instance_size != base && instance_size != base + 2)
+            || slice(d, axes_off + axis_count as usize * axis_size, instance_count as usize * instance_size).is_none()
+        {
+            instance_count = 0;
+        }
+        Some(Fvar { data: d, axes_off, axis_count, axis_size, instance_count, instance_size })
+    }
+
+    /// FVAR (SR150): named instance `i` (`None` past the list).
+    pub fn instance(&self, i: usize) -> Option<NamedInstance> {
+        if i >= self.instance_count as usize {
+            return None;
+        }
+        let n = self.axis_count as usize;
+        let o = self.axes_off + n * self.axis_size + i * self.instance_size;
+        let mut coords = [0f32; MAX_AXES];
+        for (k, slot) in coords.iter_mut().enumerate().take(n.min(MAX_AXES)) {
+            *slot = fixed(u32_at(self.data, o + 4 + 4 * k)?);
+        }
+        let postscript_name_id = if self.instance_size == 4 * n + 6 { Some(u16_at(self.data, o + 4 + 4 * n)?) } else { None };
+        Some(NamedInstance {
+            subfamily_name_id: u16_at(self.data, o)?,
+            flags: u16_at(self.data, o + 2)?,
+            coords,
+            axis_count: n,
+            postscript_name_id,
+        })
+    }
+
+    /// FVAR (SR150): every named instance, in table order.
+    pub fn instances(&self) -> Vec<NamedInstance> {
+        (0..self.instance_count as usize).filter_map(|i| self.instance(i)).collect()
     }
 
     pub fn axis(&self, i: usize) -> Option<Axis> {

@@ -7,7 +7,7 @@ use crate::glyf::Glyf;
 use crate::layout::{Gdef, Gpos, Gsub, Kern};
 use crate::path::{OutlineSink, Path};
 use crate::reader::{i16_at, slice, u16_at, u32_at};
-use crate::var::{Avar, Axis, Fvar, Gvar, Hvar, ItemVariationStore, Mvar, MAX_AXES};
+use crate::var::{f2dot14_round, Avar, Axis, Fvar, Gvar, Hvar, ItemVariationStore, Mvar, NamedInstance, MAX_AXES};
 use crate::var::{MVAR_CPHT, MVAR_HASC, MVAR_HCLA, MVAR_HCLD, MVAR_HDSC, MVAR_HLGP, MVAR_UNDO, MVAR_UNDS, MVAR_XHGT};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -282,6 +282,46 @@ impl<'a> Font<'a> {
     /// Back to the default instance.
     pub fn reset_variations(&mut self) {
         self.coords = [0.0; MAX_AXES];
+    }
+
+    /// FVAR (SR150): this face at the design-space position `user` — one USER coordinate per `fvar` axis, in axis
+    /// order — starting from the DEFAULT instance (an instance is a full position: axes past `user`'s end stay at
+    /// their default). Each value is clamped to its axis and normalized through `avar` exactly as
+    /// [`Font::set_variation`] does ("Font Variations Overview", coordinate normalization). The returned face yields
+    /// the varied outlines ([`Font::outline`], `gvar`) and advances ([`Font::advance`], `HVAR` else the phantom
+    /// points). A static face is returned unchanged.
+    pub fn instance(&self, user: &[f32]) -> Font<'a> {
+        let mut f = *self;
+        f.coords = [0.0; MAX_AXES];
+        if let Some(fv) = self.fvar {
+            for (i, &v) in user.iter().enumerate().take((fv.axis_count as usize).min(MAX_AXES)) {
+                f.coords[i] = fv.normalize(i, v, self.avar.as_ref());
+            }
+        }
+        f
+    }
+
+    /// FVAR (SR150): this face at NORMALIZED coordinates `n` (axis order, each clamped to [-1, 1] and rounded to the
+    /// F2Dot14 grid; `avar` is NOT applied — the caller already holds design-space normalized values).
+    pub fn with_normalized(&self, n: &[f32]) -> Font<'a> {
+        let mut f = *self;
+        f.coords = [0.0; MAX_AXES];
+        let axes = self.fvar.map_or(0, |fv| (fv.axis_count as usize).min(MAX_AXES));
+        for (i, &v) in n.iter().enumerate().take(axes) {
+            f.coords[i] = if v.is_finite() { f2dot14_round(v.clamp(-1.0, 1.0)) } else { 0.0 };
+        }
+        f
+    }
+
+    /// FVAR (SR150): the `fvar` named instances (empty for a static face).
+    pub fn named_instances(&self) -> Vec<NamedInstance> {
+        self.fvar.map_or_else(Vec::new, |f| f.instances())
+    }
+
+    /// FVAR (SR150): this face at named instance `i` (`None` past the list or for a static face).
+    pub fn named_instance(&self, i: usize) -> Option<Font<'a>> {
+        let ni = self.fvar?.instance(i)?;
+        Some(self.instance(ni.user_coords()))
     }
 
     /// The user value of axis `tag` at this instance (the inverse of the default normalization; `avar` is not
