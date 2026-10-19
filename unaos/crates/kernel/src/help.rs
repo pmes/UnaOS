@@ -214,7 +214,7 @@ fn man_one(console: &mut Console, w: &str) { help_one(console, w); }
 
 /// The dispatcher's one check: `help`, `help <verb>`, `man <verb>`, `<verb> --help`. True = handled.
 pub fn intercept(line: &str, console: &mut Console) -> bool {
-    let mut it = line.split_whitespace();
+    let mut it = line.split_whitespace(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if search_shell(line, console) { return true; } // HELPF1 (B746): `help <words>` searches the help index (file tail); `help`, `help <verb>`, `help tests` fall through unchanged. LINE-NEUTRAL fold, code first
     let Some(first) = it.next() else { return false };
     let first = first.to_ascii_lowercase();
     let a1 = it.next();
@@ -255,3 +255,68 @@ pub mod index;
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 #[path = "video/helpwin.rs"]
 pub mod window;
+
+
+// HELPF1 (rmbp-ledger B746, BP-video-35) — TAIL-APPENDED: `help <words>` searches the ONE help index with the Launcher's
+// own ranking (`index::Index::search_pages`) and prints the top pages with their slugs. Folded onto `intercept`'s first
+// line, x86 `wc` (the index is x86 `wc`): `help` alone keeps the verb list, `help <verb>` (or a gated-off verb, or
+// `tests`) keeps the verb's doc; a single word that is no verb and finds no page keeps today's "no help for" line.
+// Wire: `[help] shell q=<q> hits=<n> top=<slug|->`.
+
+/// Pages printed by `help <words>`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub const SHELL_PAGES: usize = 5;
+
+/// The query `line` would search, or `None` when `intercept`'s verb paths keep it (pure).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn shell_query(line: &str) -> Option<String> {
+    let mut it = line.split_whitespace();
+    if !it.next()?.eq_ignore_ascii_case("help") {
+        return None;
+    }
+    let words: Vec<&str> = it.collect();
+    match words.as_slice() {
+        [] => None,
+        [w] if *w == "tests" || find(&w.to_ascii_lowercase()).is_some() || midden_core::gated_off_line(w).is_some() => None,
+        ws => Some(ws.join(" ")),
+    }
+}
+
+/// The index's top `n` pages for `q` as `(slug, title)`, best first — the Launcher's ranking (`search_pages`). Loads the
+/// index on first use; a first try that found no volume is retried once.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn top_pages(q: &str, n: usize) -> Option<Vec<(String, String)>> {
+    if !index::ensure_loaded() {
+        index::retry();
+        if !index::ensure_loaded() {
+            return None;
+        }
+    }
+    index::with(|ix| ix.search_pages(q).into_iter().take(n).map(|(p, _)| (ix.pages[p].slug.clone(), ix.pages[p].title.clone())).collect())
+}
+
+/// `intercept`'s search arm. `true` = handled (printed).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn search_shell(line: &str, console: &mut Console) -> bool {
+    let Some(q) = shell_query(line) else { return false };
+    let single = !q.contains(' ');
+    match top_pages(&q, SHELL_PAGES) {
+        Some(pages) if !pages.is_empty() => {
+            console.println(&alloc::format!("help pages for \"{}\" (open one from the Launcher, Cmd-Space):", q));
+            let wid = pages.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
+            for (slug, title) in &pages {
+                console.println(&alloc::format!("  {:<w$}  {}", slug, title, w = wid));
+            }
+            serial_println!("[help] shell q={} hits={} top={}", q, pages.len(), pages[0].0);
+            true
+        }
+        r => {
+            serial_println!("[help] shell q={} hits=0 top=- index={}", q, if r.is_some() { "loaded" } else { "absent" });
+            if single {
+                return false; // today's "help: no help for `<w>`" line
+            }
+            console.println(&alloc::format!("help: no page matches \"{}\" (`help` lists the commands)", q));
+            true
+        }
+    }
+}
