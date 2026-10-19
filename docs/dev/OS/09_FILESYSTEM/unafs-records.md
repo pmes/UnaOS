@@ -24,8 +24,10 @@ Companion documents: the B+tree node (`btree.md`, referenced from §R11a), the p
 * Every other block is reached from the active root: map leaves and index nodes (§R13), inode
   blocks (§R3), data/directory/system-object extents, indirect blocks (§R8), B+tree nodes (§R11a).
 * Versions: 3 (K8 CoW), 4 (+extent spill §R8), 5 (+two-level legacy refmap), 6 (+B+tree catalog
-  §R11, +inode meta trailer §R7), 7 (+paged maps §R13). This build mounts 3..=7 and formats 7; v2 is
-  read-only (§R14). A version outside the range is refused, never guessed at.
+  §R11, +inode meta trailer §R7), 7 (+paged maps §R13), 8 (= the v7 layout with every block but
+  block 0 AES-256-XTS, §R2b; only beside a `cipher = 1` key slot). This build mounts 3..=8 and formats
+  7 (a v8 volume is made by `encipher`, §R2b); v2 is read-only (§R14). A version outside the range is
+  refused, never guessed at.
 
 ## §R1 Encoding rules (the "record codec")
 
@@ -78,7 +80,7 @@ Minimum encoded sizes (used by rule 1): `FileKind` 4, `Extent` 24, `AttributeVal
 | off | len | field | notes |
 | ---: | ---: | :--- | :--- |
 | 0 | 5 | `magic` `[u8;5]` | `"UNAFS"` |
-| 5 | 4 | `version` `u32` | 3..=7 |
+| 5 | 4 | `version` `u32` | 3..=7; 8 on a ciphered volume (§R2b) |
 | 9 | 4 | `block_size` `u32` | 4096 |
 | 13 | 8 | `block_count` `u64` | volume span in blocks; ≥ 3; ≤ 2^31 on v7, ≤ 2^28 on v5/v6, ≤ 2^19 before v5 |
 | 21 | 8 | `root_inode` `u64` | always 1 |
@@ -96,15 +98,15 @@ Hand-packed (not a §R1 record), little-endian, magic-discriminated; written by
 `UnaFS::set_key_slot` (`unafs::keyslot`), never by format. Its presence makes the volume KEYED:
 `UnaFS::mount` refuses it (`KeyRequired`) after reading block 0 and before reading anything else;
 `UnaFS::mount_with(Unlock::Password | Unlock::Recovery)` opens it only when the key unwraps the data
-key. The superblock version does NOT change (a keyed volume is still v7, BP-storage-6): an older
-reader ignores sector 1 and mounts the volume — true at M1 because the data blocks are plaintext;
-M2's cipher will need its own INCOMPAT stamp (the seat's decision, see below).
+key. Keying (`set_key_slot`, `cipher = 0`) does NOT change the superblock version (a keyed volume is
+still v7, BP-storage-6): an older reader ignores sector 1 and mounts the volume — harmless because the
+data blocks are plaintext. A `cipher = 1` slot comes only with a CIPHERED volume, stamped v8 (§R2b).
 
 | off | len | field | notes |
 | ---: | ---: | :--- | :--- |
 | 0 | 8 | magic | `"UNAFSKS1"` |
 | 8 | 4 | version `u32` | 1; any other is refused (`Unsupported`) |
-| 12 | 4 | cipher `u32` | 0 = none (M1: data blocks plaintext); 1 = AES-256-XTS (M2, reserved — this build refuses it) |
+| 12 | 4 | cipher `u32` | 0 = none (M1: data blocks plaintext); 1 = AES-256-XTS (§R2b, XTS B689); any other is refused (`Unsupported`) |
 | 16 | 4 | kdf `u32` | 2 = Argon2id v1.3 |
 | 20 | 4 | m_kib `u32` | Argon2 memory, 19456..=65536 (SYS_KDF's bounds; a hostile slot cannot ask for more) |
 | 24 | 4 | t `u32` | passes, 2..=10 |
@@ -119,8 +121,8 @@ M2's cipher will need its own INCOMPAT stamp (the seat's decision, see below).
 | 168 | 16 | rc_tag | Poly1305 tag |
 
 * Data key: 32 random bytes per volume (the kernel's DRBG; the host's `/dev/urandom`). Never on disk,
-  never on the wire; an unwrapped key (`VolumeKey`) is wiped on drop. M2 expands it by HKDF into
-  XTS's two 256-bit keys.
+  never on the wire; an unwrapped key (`VolumeKey`) is wiped on drop. On a `cipher = 1` volume the
+  mount expands it by HKDF into XTS's two 256-bit keys (§R2b) and drops it.
 * KEK_pw = Argon2id(password, salt, m_kib, t, p) → 32 B — the `crypto_core::argon2` call `SYS_KDF`'s
   body makes (`tests volkey` checks the two agree). AAD = `"UnaFS volkey password v1"` ‖ bytes 0..48.
 * Recovery key: 24 words from `unafs::keyslot::WORDS` (256 words, one per byte; sorted; unique in
@@ -131,10 +133,48 @@ M2's cipher will need its own INCOMPAT stamp (the seat's decision, see below).
   bytes 0..48 or of a wrap, fails the tag (`KeyRefused`, one answer).
 * Writing: block 0 is rewritten whole with sector 0 byte-identical, then flushed; every later
   rewrite of block 0 (GROW, the v6→v7 migration) is built by the same `block0` and keeps the slot.
-* What M1 is NOT: the data blocks are plaintext, so a raw read of the medium sees them, and erasing
-  sector 1 makes the volume mount unkeyed. The slot gates every reader that goes through the crate
-  (the kernel, `tools/unafs`, the installer). M2 (per-block AES-256-XTS, tweak = block number) closes
-  both; `crypto_core` has AES-256 (`aes::Aes`, forward and inverse) but no XTS mode yet.
+* What `cipher = 0` is NOT: the data blocks are plaintext, so a raw read of the medium sees them, and
+  erasing sector 1 makes the volume mount unkeyed. The slot gates every reader that goes through the
+  crate (the kernel, `tools/unafs`, the installer). `cipher = 1` (§R2b) closes both.
+
+## §R2b Ciphered volume (version 8; XTS, rmbp-ledger B689 = VOLKEY M2)
+
+A volume whose key slot (§R2a) says `cipher = 1`. Every block but block 0 is XTS-AES-256 (IEEE Std
+1619-2007; `crypto_core::xts`, held to the standard's Annex B vectors 1-19 in
+`unaos/libs/sys/crypto_core/tests/xts.rs`) — free blocks included.
+
+* Keys: `Key1 ‖ Key2` = HKDF-SHA256(salt = empty, ikm = the 32-byte data key, info =
+  `"UnaFS volume XTS-AES-256 v1"`) → 64 bytes. The data key is already uniform, so no salt is needed; the
+  info string separates this use from every other. Equal halves are refused (SP 800-38E's guidance).
+* Data unit = one 4096 B block; tweak = the volume's block number, `u64` little-endian zero-extended to
+  128 bits (1619 §5.1's data-unit sequence number). A partition adapter's block 0 is the volume's block 0,
+  so an image enciphers the same wherever it sits.
+* Block 0 is plaintext (the superblock and the slot must be read before there is a key). Its sector 0 is
+  the superblock byte-identical to the v7 it was made from EXCEPT `version` = 8.
+* WHY 8: the cipher changes what every block past 0 means, so it is an INCOMPAT bump like every one before
+  it (BP-storage-6). A reader built before XTS mounts 3..=7 and has never heard of sector 1: without the
+  stamp it would take ciphertext for maps; with it, it refuses (`InvalidVersion(8)`). A VOLKEY-M1 reader
+  refuses twice (the stamp, and `cipher = 1` in the slot). 8 says nothing about layout: under the cipher
+  the layout is v7's; the mount reads the stamp as v7 once the slot is `cipher = 1`, and a v8 stamp
+  without such a slot, or such a slot under 3..=7, is refused (`CorruptVolume`), never read. The cipher
+  field is inside both wraps' AAD (bytes 0..48), so editing it fails the tag.
+* Where the cipher runs: the `BlockDevice` seam (`unafs::storage::VolumeCipher`) — `MemDevice`,
+  `FileDevice` and `BlockAdapter` carry it (`set_cipher`): decrypt on read, encrypt on write, so the CoW
+  commit, the maps and the trees above never see ciphertext. `UnaFS::mount_with` installs it before it
+  reads anything past block 0; a device that cannot carry it refuses (`NoCipher`). The root flip's single
+  512 B sector write is enciphered alone at its offset (AES blocks `32s..32s+31` of the unit), byte-identical
+  to that sector of the whole block, so the flip stays one sector write.
+* How one is made: `unafs::fs::encipher(src, dst, slot, key)` — a block-for-block COPY of an unkeyed,
+  committed v7 volume (`KeySlot::seal_ciphered` makes the slot and hands back the key), block 0 last,
+  then a flush; never in place, so a cut leaves the source whole and the copy without a superblock.
+  `tools/unafs key --cipher --password-stdin` copies to `<img>.xts-tmp` and renames it over the image.
+  `UnaFS::set_key_slot` refuses a `cipher = 1` slot (it writes block 0 only). `tools/unafs dump` refuses
+  a ciphered volume (its raw blocks are ciphertext); the mounted commands read it with the key.
+* Not provided: integrity. XTS is length-preserving and unauthenticated; a flipped ciphertext bit
+  scrambles its 16-byte block on read (the maps' checksums catch it there, data blocks do not).
+* KAT: `unaos/libs/fs/unafs/tests/xts.rs` (raw image: stamp 8, no witness run, every block ≠ plaintext;
+  the words and the password mount it; a write lands enciphered; `BlockAdapter`'s sector path and
+  `MemDevice`'s block path agree); kernel `tests xts`.
 
 ## §R3 Inode block (one 4096 B block per inode)
 

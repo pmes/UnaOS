@@ -42,16 +42,23 @@
 //! refused by the tag before any key is released. A wrong password and a wrong recovery key read ONE answer:
 //! [`KeySlotError::KeyRefused`].
 //!
-//! # What M1 is, and what it is not
+//! # The two ciphers a slot names
 //!
-//! `cipher = 0` ([`CIPHER_NONE`]): the DATA BLOCKS ARE NOT ENCRYPTED yet. The slot makes every reader that
+//! `cipher = 0` ([`CIPHER_NONE`], VOLKEY M1): the data blocks are plaintext. The slot makes every reader that
 //! goes through [`crate::UnaFS::mount`] refuse the volume (`KeyRequired`) and [`crate::UnaFS::mount_with`]
 //! open it only after the key unwraps — the kernel's own mounts and `tools/unafs` alike — but a raw read of
-//! the medium still sees plaintext, and erasing the slot makes the volume mount unkeyed. Those two stop being
-//! true at M2, when `cipher = 1` ([`CIPHER_AES256_XTS`], reserved) encrypts every block from the data key
-//! (expanded by HKDF to XTS's two 256-bit keys). This build REFUSES a slot that names a cipher it does not
-//! implement (a v-next volume is refused, never misread). M1 releases no key to anyone: [`KeySlot::unwrap`]
-//! returns a [`VolumeKey`] that wipes itself on drop, and the mount drops it at once.
+//! the medium still sees plaintext, and erasing the slot makes the volume mount unkeyed.
+//!
+//! `cipher = 1` ([`CIPHER_AES256_XTS`], XTS rmbp-ledger B689 = VOLKEY M2): EVERY BLOCK BUT BLOCK 0 is
+//! XTS-AES-256 (IEEE 1619, `crypto_core::xts`) under two keys HKDF-SHA256 expands from the data key, the tweak
+//! the block number ([`crate::storage::VolumeCipher`], unafs-records.md §R2b); the superblock's version field
+//! reads [`VERSION_CIPHERED`] (8), so a reader older than XTS refuses the volume instead of reading ciphertext.
+//! A raw read sees only ciphertext, and erasing the slot leaves a v8 volume nobody mounts. Such a volume is
+//! made by [`crate::fs::encipher`] (a block-for-block copy), never by keying a plaintext volume in place.
+//! The cipher value is bound into both wraps (the header is AAD), so editing it on the disk fails the tag.
+//!
+//! Neither releases the data key to a caller: [`KeySlot::unwrap`] returns a [`VolumeKey`] that wipes itself on
+//! drop; the mount of a `cipher = 1` volume expands it into the device's cipher and drops it at once.
 
 use alloc::vec::Vec;
 use crypto_core::ct::Zeroize;
@@ -66,8 +73,14 @@ pub const SLOT_LEN: usize = 184;
 pub const SLOT_VERSION: u32 = 1;
 /// M1: data blocks plaintext; the slot gates every mount through this crate.
 pub const CIPHER_NONE: u32 = 0;
-/// M2 (reserved, refused by this build): every block AES-256-XTS from the data key.
+/// XTS (B689, VOLKEY M2): every block but block 0 AES-256-XTS from the data key (§R2b).
 pub const CIPHER_AES256_XTS: u32 = 1;
+/// XTS (B689): the superblock version a `cipher = 1` volume carries on the disk (§R2 `version`, bytes 5..9 of
+/// block 0). The layout under the cipher is v7's; 8 is the INCOMPAT stamp (BP-storage-6) that makes every
+/// reader built before XTS — which mounts 3..=7 and has never heard of sector 1 — refuse the volume rather than
+/// take ciphertext for maps. `UnaFS::mount_with` accepts it only beside a `cipher = 1` slot and reads the v7
+/// layout through the cipher.
+pub const VERSION_CIPHERED: u32 = 8;
 /// The password KDF a slot names: Argon2id v1.3.
 pub const KDF_ARGON2ID: u32 = 2;
 /// The data key's length.
@@ -148,11 +161,12 @@ pub enum Unlock<'a> {
     Recovery(&'a str),
 }
 
-/// The unwrapped data key. Wiped on drop; M1 has no consumer for it beyond proving it unwrapped.
+/// The unwrapped data key. Wiped on drop; its one consumer is [`crate::storage::VolumeCipher::new`] (a
+/// `cipher = 1` volume's block path).
 pub struct VolumeKey([u8; KEY_LEN]);
 
 impl VolumeKey {
-    /// The key bytes (M2's block path; `tests volkey`'s never-on-disk scan).
+    /// The key bytes (the block path's HKDF; `tests volkey`'s never-on-disk scan).
     pub fn bytes(&self) -> &[u8; KEY_LEN] {
         &self.0
     }
@@ -188,7 +202,7 @@ impl Drop for RecoveryWords {
 /// The key slot (§R2a). Holds only wrapped material, salts and nonces: nothing in it is secret.
 #[derive(Clone, PartialEq, Eq)]
 pub struct KeySlot {
-    /// [`CIPHER_NONE`] (M1) or [`CIPHER_AES256_XTS`] (M2, refused by this build).
+    /// [`CIPHER_NONE`] (M1) or [`CIPHER_AES256_XTS`] (XTS, B689).
     pub cipher: u32,
     /// The password KDF's costs.
     pub kdf: KdfParams,
@@ -328,13 +342,36 @@ impl KeySlot {
     /// Returns the slot and the recovery words — show them ONCE, then drop them. The data key never leaves
     /// this function.
     pub fn seal(password: &[u8], kdf: KdfParams, rng: &mut dyn FnMut(&mut [u8])) -> Result<(KeySlot, RecoveryWords), KeySlotError> {
-        if !kdf.valid() {
+        Self::seal_cipher(password, kdf, CIPHER_NONE, rng).map(|(slot, words, key)| {
+            drop(key);
+            (slot, words)
+        })
+    }
+
+    /// XTS (B689): make a `cipher = 1` slot — as [`seal`](Self::seal), and the fresh data key is returned too
+    /// (wiped on drop), because the one thing such a slot is for is [`crate::fs::encipher`], which writes the
+    /// volume's blocks under it. Show the words once, encipher, drop the key.
+    pub fn seal_ciphered(
+        password: &[u8],
+        kdf: KdfParams,
+        rng: &mut dyn FnMut(&mut [u8]),
+    ) -> Result<(KeySlot, RecoveryWords, VolumeKey), KeySlotError> {
+        Self::seal_cipher(password, kdf, CIPHER_AES256_XTS, rng)
+    }
+
+    fn seal_cipher(
+        password: &[u8],
+        kdf: KdfParams,
+        cipher: u32,
+        rng: &mut dyn FnMut(&mut [u8]),
+    ) -> Result<(KeySlot, RecoveryWords, VolumeKey), KeySlotError> {
+        if !kdf.valid() || !cipher_known(cipher) {
             return Err(KeySlotError::Unsupported);
         }
         let mut key = [0u8; KEY_LEN];
         let mut entropy = [0u8; RECOVERY_ENTROPY];
         let mut slot = KeySlot {
-            cipher: CIPHER_NONE,
+            cipher,
             kdf,
             salt: [0; 16],
             pw_nonce: [0; 12],
@@ -352,10 +389,11 @@ impl KeySlot {
         rng(&mut slot.rc_salt);
         rng(&mut slot.rc_nonce);
         let r = slot.wrap_both(password, &key, &entropy);
+        let vk = VolumeKey(key);
         key.zeroize();
         let words = recovery_words(&entropy);
         entropy.zeroize();
-        r.map(|()| (slot, words))
+        r.map(|()| (slot, words, vk))
     }
 
     fn wrap_both(&mut self, password: &[u8], key: &[u8; KEY_LEN], entropy: &[u8; RECOVERY_ENTROPY]) -> Result<(), KeySlotError> {
@@ -378,7 +416,7 @@ impl KeySlot {
     /// Unwrap the data key with `unlock`. A wrong password, a wrong (but well-formed) recovery key and a
     /// tampered slot all answer [`KeySlotError::KeyRefused`].
     pub fn unwrap(&self, unlock: &Unlock<'_>) -> Result<VolumeKey, KeySlotError> {
-        if self.cipher != CIPHER_NONE || !self.kdf.valid() {
+        if !cipher_known(self.cipher) || !self.kdf.valid() {
             return Err(KeySlotError::Unsupported);
         }
         let hdr = self.header();
@@ -447,7 +485,7 @@ impl KeySlot {
         }
         let kdf = KdfParams { m_kib: u32_at(s, 20), t: u32_at(s, 24), p: u32_at(s, 28) };
         let cipher = u32_at(s, 12);
-        if u32_at(s, 8) != SLOT_VERSION || cipher != CIPHER_NONE || u32_at(s, 16) != KDF_ARGON2ID || !kdf.valid() {
+        if u32_at(s, 8) != SLOT_VERSION || !cipher_known(cipher) || u32_at(s, 16) != KDF_ARGON2ID || !kdf.valid() {
             return Err(KeySlotError::Unsupported);
         }
         Ok(Some(KeySlot {
@@ -463,6 +501,11 @@ impl KeySlot {
             rc_tag: arr(s, 168),
         }))
     }
+}
+
+/// The ciphers this build implements: none (M1) and AES-256-XTS (B689). Any other is refused, never guessed at.
+fn cipher_known(cipher: u32) -> bool {
+    cipher == CIPHER_NONE || cipher == CIPHER_AES256_XTS
 }
 
 fn aad(role: &[u8], hdr: &[u8; HDR_LEN], extra: &[u8]) -> Vec<u8> {

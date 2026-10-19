@@ -23,6 +23,7 @@
 //! | [`pbkdf2`] | PBKDF2-HMAC | RFC 8018 §5.2 |
 //! | [`chacha20`], [`poly1305`], [`chacha20poly1305`] | ChaCha20, Poly1305, the AEAD | RFC 8439 |
 //! | [`aes`], [`gcm`] | AES-128/192/256 (bitsliced; forward and inverse cipher), GCM/GMAC | FIPS 197, SP 800-38D |
+//! | [`xts`] | XTS-AES-128/256 (ciphertext stealing; whole-block slices of a data unit) | IEEE Std 1619-2007, SP 800-38E |
 //! | [`x25519`] | X25519 | RFC 7748 |
 //! | [`ed25519`] | Ed25519 | RFC 8032 |
 //! | [`p256`] | P-256 ECDH + ECDSA | SP 800-186, FIPS 186-5, RFC 6979, SEC 1 |
@@ -66,6 +67,7 @@ pub mod poly1305;
 pub mod chacha20poly1305;
 pub mod aes;
 pub mod gcm;
+pub mod xts; // XTS (rmbp-ledger B689): IEEE 1619 XTS-AES over `aes::Aes` — the UnaFS volume cipher
 mod field25519;
 pub mod x25519;
 pub mod ed25519;

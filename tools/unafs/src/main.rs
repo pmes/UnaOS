@@ -109,6 +109,11 @@ fn key_gate_raw(img: &str, key: &Key) -> Result<()> {
             anyhow::bail!("this volume is KEYED (VOLKEY): it opens only with its key — pass --password-stdin or --recovery-stdin and the key on stdin");
         };
         drop(slot.unwrap(&u).map_err(|e| anyhow::anyhow!("key slot: {e}"))?);
+        // XTS (B689): `dump` reads the raw medium; a ciphered volume's blocks there are ciphertext (§R2b).
+        anyhow::ensure!(
+            slot.cipher != unafs::keyslot::CIPHER_AES256_XTS,
+            "this volume is ENCIPHERED (XTS): its raw blocks are ciphertext — the mounted commands (ls, cat, …) read it with the key"
+        );
     }
     Ok(())
 }
@@ -118,10 +123,15 @@ enum Commands {
     /// VOLKEY (B684): KEY an unkeyed volume with the password on stdin (`--password-stdin`): a fresh data key
     /// is wrapped by Argon2id(password) and by a fresh recovery key, the slot goes into block 0 sector 1, and
     /// the 24 recovery words are printed ONCE (never written anywhere). From then on every command refuses the
-    /// volume without its key. M1: the data blocks are NOT encrypted yet (unafs-records.md §R2a).
+    /// volume without its key. Without `--cipher` the data blocks stay plaintext (unafs-records.md §R2a).
     Key {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
+        /// XTS (B689): also ENCIPHER the volume — every block but block 0 AES-256-XTS under the data key
+        /// (§R2b, superblock stamped v8). Done as a copy (`<img>.xts-tmp`, block 0 last, flushed) renamed over
+        /// the image, so a cut leaves the plaintext image whole. Needs a v7 volume and free disk for one copy.
+        #[arg(long)]
+        cipher: bool,
     },
     /// Initialize a new unafs.img vault
     Init {
@@ -781,7 +791,7 @@ async fn main() -> Result<()> {
     let vkey = Key::read(&cli)?; // VOLKEY: not `key` — attribute commands bind a field of that name
 
     match &cli.command {
-        Commands::Key { img } => {
+        Commands::Key { img, cipher } => {
             let Key::Password(pw) = &vkey else {
                 anyhow::bail!("key: pass the new password with --password-stdin");
             };
@@ -795,15 +805,42 @@ async fn main() -> Result<()> {
                 use std::io::Read;
                 urandom.read_exact(b).expect("/dev/urandom read");
             };
-            let (slot, words) = unafs::KeySlot::seal(pw, unafs::KdfParams::HOST, &mut fill)
-                .map_err(|e| anyhow::anyhow!("key slot: {e}"))?;
-            fs.set_key_slot(slot).context("writing the key slot")?;
+            let words = if *cipher {
+                // XTS (B689): the mount above proved the volume unkeyed and drained its reclaim queue; every op
+                // commits, so the image on disk is the committed volume once the mount is dropped (flushed).
+                drop(fs);
+                let (slot, words, key) = unafs::KeySlot::seal_ciphered(pw, unafs::KdfParams::HOST, &mut fill)
+                    .map_err(|e| anyhow::anyhow!("key slot: {e}"))?;
+                let tmp = format!("{img}.xts-tmp");
+                let _ = std::fs::remove_file(&tmp);
+                let len = std::fs::metadata(img).context("reading the image size")?.len();
+                std::fs::File::create(&tmp)
+                    .and_then(|f| f.set_len(len))
+                    .with_context(|| format!("creating '{tmp}'"))?;
+                let mut src = FileDevice::open_read_only(img).context("Failed to open device")?;
+                let mut dst = FileDevice::open(&tmp).with_context(|| format!("opening '{tmp}'"))?;
+                let n = unafs::fs::encipher(&mut src, &mut dst, &slot, &key).map_err(|e| {
+                    let _ = std::fs::remove_file(&tmp);
+                    anyhow::anyhow!("enciphering '{img}': {e} (a pre-v7 volume migrates first)")
+                })?;
+                drop((key, src, dst));
+                std::fs::rename(&tmp, img).with_context(|| format!("renaming '{tmp}' over '{img}'"))?;
+                println!("'{img}' is keyed and ENCIPHERED: {n} blocks, every block but block 0 AES-256-XTS (superblock v8).");
+                words
+            } else {
+                let (slot, words) = unafs::KeySlot::seal(pw, unafs::KdfParams::HOST, &mut fill)
+                    .map_err(|e| anyhow::anyhow!("key slot: {e}"))?;
+                fs.set_key_slot(slot).context("writing the key slot")?;
+                words
+            };
             println!("'{img}' is keyed (argon2id m=64MiB t=3 p=4). Its RECOVERY KEY, shown this once and stored nowhere:");
             println!();
             println!("    {}", words.as_str());
             println!();
             println!("Write it down. It opens the volume (--recovery-stdin) if the password is lost.");
-            println!("M1: the slot gates every UnaFS reader; the data blocks are not encrypted yet.");
+            if !*cipher {
+                println!("The slot gates every UnaFS reader; the data blocks are plaintext (--cipher enciphers them).");
+            }
         }
         Commands::Init { path, size_mb } => {
             println!(
