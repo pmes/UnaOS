@@ -16,6 +16,11 @@
 //! one; the window opens in [`service`] (the storage pass, `login::notice_service`). Shut Down / Restart /
 //! Log Out confirm through [`power_confirm`] with a 60 s countdown that counts on the glass and proceeds on
 //! expiry: `[power] confirm action=<a> countdown_s=60 answer=<ok/cancel/expired>`.
+//!
+//! TOASTCAP (rmbp-ledger B674; DESIGN-LANGUAGE §3.8, BP-bar-18, BP-video-16): ONE primary per view — [`paint`] fills
+//! the default button, and only it, with `accent.fill` (`theme::accent`), and counts what it filled (`PRIMARY`);
+//! Return accepts (the default), Escape cancels (the button named Cancel, else the leftmost; a one-button alert's
+//! Escape dismisses it) on every view. `tests toastcap` drives [`toastcap_leg`] over every caller's button row.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -171,6 +176,8 @@ static DROPPED: AtomicU32 = AtomicU32::new(0);
 /// The last answer: 0 none, 1 default/ok, 2 cancel, 3 expired, 4 another button.
 static LAST: AtomicU32 = AtomicU32::new(0);
 static LAST_ACT_FIRED: AtomicU64 = AtomicU64::new(0);
+/// TOASTCAP (B674): the `accent.fill` buttons the last [`paint`] drew (one per view, §3.8).
+static PRIMARY: AtomicU32 = AtomicU32::new(0);
 
 static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn surf() -> &'static mut [u32] {
@@ -246,10 +253,15 @@ fn paint(d: &Dlg, left_s: u32) {
         let line = alloc::format!("automatically in {} second{}.", left_s, if left_s == 1 { "" } else { "s" });
         text(px, 88, y, line.as_bytes(), theme::text_primary(), false);
     }
+    let mut primary = 0u32;
     for i in 0..d.nb {
         let (x, by, w, h) = btn_rect(i, d.nb);
         let def = i == d.default_ix();
-        fill(px, x, by, w, h, if def { theme::accent() } else { theme::surface_raised() });
+        let face = if def { theme::accent() } else { theme::surface_raised() };
+        if face == theme::accent() {
+            primary += 1; // TOASTCAP (B674): counted by the ink painted, not by the intent
+        }
+        fill(px, x, by, w, h, face);
         fill(px, x, by, w, 1, theme::line_subtle());
         fill(px, x, by + h - 1, w, 1, theme::line_subtle());
         fill(px, x, by, 1, h, theme::line_subtle());
@@ -258,6 +270,7 @@ fn paint(d: &Dlg, left_s: u32) {
         let tw = metrics::ladvance(l, false, crate::video::text::Face::Ui);
         text(px, x + w.saturating_sub(tw) / 2, by + 5, l, if def { theme::surface_raised() } else { theme::text_primary() }, false);
     }
+    PRIMARY.store(primary, Ordering::Relaxed);
 }
 
 fn left_s(deadline: u64) -> u32 {
@@ -639,7 +652,7 @@ pub fn fixture() -> (bool, bool, bool, bool, u32, bool) {
 pub enum Kind {
     /// An operation failed or was refused: the alert, app-modal to the owner it concerns.
     Error,
-    /// Something happened: a toast (3 s, top right, no focus).
+    /// Something happened: a toast (5 s, top right, no focus; TOASTCAP B674).
     Info,
 }
 
@@ -1129,4 +1142,81 @@ pub fn caller_owner() -> u64 {
     {
         0
     }
+}
+
+// ── TOASTCAP (rmbp-ledger B674) — §3.8 over every view: one primary, Return accepts, Escape cancels ─────────
+
+/// Every caller's button row (labels left to right, the default LAST), as `Dlg::new` receives it: `post_program_stopped`
+/// and `notice`'s errors, PANICSCREEN, `power_confirm` (Restart; Shut Down and Log Out are the same row), the dock's
+/// Empty Trash, TEXTEDIT's close sheet (the bus verbs' three-button fixture too), APPTRUST's Open With.
+const VIEWS: [(&[u8], &[&[u8]]); 6] = [
+    (b"Program stopped", &[b"OK"]),
+    (b"Previous session stopped", &[b"OK", b"Show log"]),
+    (b"UnaOS", &[b"Cancel", b"Restart"]),
+    (b"Trash", &[b"Cancel", b"Empty Trash"]),
+    (b"Text Editor", &[b"Don't Save", b"Cancel", b"Save"]),
+    (b"Open With", &[b"Copy to Apps", b"Open", b"Cancel"]),
+];
+
+/// One view through the real paint and key route (model-only): `(primary, return_ok, esc_ok)`. `raise` posts the
+/// view (`true` when it is up); Return must answer the default (`LAST` 1, the default's index), Escape the cancel
+/// button (`LAST` 2, its index) or, with no cancel button, dismiss the alert.
+fn view_leg(d: &Dlg, raise: &dyn Fn() -> bool) -> (u32, bool, bool) {
+    paint(d, d.countdown_s);
+    let primary = PRIMARY.load(Ordering::Relaxed);
+    let ret = raise() && is_up() && route_key(b'\r', true) && !is_up() && LAST.load(Ordering::Relaxed) == 1 && LAST_IX.load(Ordering::Relaxed) == d.default_ix() as u32;
+    let esc = raise() && is_up() && route_key(0x1b, true) && !is_up() && match d.cancel {
+        Some(c) => LAST.load(Ordering::Relaxed) == 2 && LAST_IX.load(Ordering::Relaxed) == c as u32,
+        None => LAST.load(Ordering::Relaxed) == 1,
+    };
+    (primary, ret, esc)
+}
+
+/// `tests toastcap`'s dialog half: `(views, primary_max, return_ok, esc_ok)`, primary_max read as 0 when a view
+/// painted none (every view must paint exactly one). Headless; the glass's dialog is set aside and put back.
+pub fn toastcap_leg() -> (usize, u32, bool, bool) {
+    let was = HEADLESS.swap(true, Ordering::Relaxed);
+    let saved = { let mut g = ST.lock(); (g.cur.take(), g.pend.take(), core::mem::replace(&mut g.win, wm::WIN_NONE), g.deadline) };
+    let fired0 = LAST_ACT_FIRED.load(Ordering::Relaxed);
+    let (mut n, mut pmax, mut pmin, mut ret, mut esc) = (0usize, 0u32, u32::MAX, true, true);
+    let mut tally = |r: (u32, bool, bool)| {
+        n += 1;
+        pmax = pmax.max(r.0);
+        pmin = pmin.min(r.0);
+        ret &= r.1;
+        esc &= r.2;
+    };
+    for (title, btns) in VIEWS.iter() {
+        let d = Dlg::new(Icon::Caution, title, b"TOASTCAP fixture", b"one primary, Return, Escape", btns);
+        tally(view_leg(&d, &|| { let p = post(d); open_pending(); p }));
+    }
+    // the real power confirm (kind 9 acts on nothing) and the real bus dialog (headless: the reply is said, not delivered)
+    let _ = power_confirm(9);
+    let cur = ST.lock().cur; // the guard drops here: `answer` takes ST
+    if let Some(d) = cur {
+        answer(Answer::Cancel);
+        tally(view_leg(&d, &|| power_confirm(9)));
+    }
+    let mut b = [0u8; 96];
+    if let Some(len) = una_abi::dialog_body(7, b"TOASTCAP bus", b"fixture", &[b"Don't Save", b"Cancel", b"Save"], &mut b) {
+        if bus_fulfil(una_abi::BUS_VERB_DIALOG, 0x4242, &b[..len]) == 0 {
+            open_pending();
+            let cur = ST.lock().cur;
+            if let Some(d) = cur {
+                answer(Answer::Cancel);
+                tally(view_leg(&d, &|| { let p = bus_fulfil(una_abi::BUS_VERB_DIALOG, 0x4242, &b[..len]) == 0; open_pending(); p }));
+            }
+        }
+    }
+    let acted = LAST_ACT_FIRED.load(Ordering::Relaxed) != fired0; // kind 9 never fires: a change is a fixture fault
+    {
+        let mut g = ST.lock();
+        g.cur = saved.0;
+        g.pend = saved.1;
+        g.win = saved.2;
+        g.deadline = saved.3;
+    }
+    HEADLESS.store(was, Ordering::Relaxed);
+    serial_println!("[dialog] toastcap views={} primary_min={} primary_max={} return={} esc={}", n, if pmin == u32::MAX { 0 } else { pmin }, pmax, ret as u8, esc as u8);
+    (n, if pmin == 1 { pmax } else { 0 }, ret && !acted, esc && !acted)
 }

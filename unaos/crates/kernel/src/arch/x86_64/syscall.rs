@@ -16887,9 +16887,9 @@ pub fn run_user_image_argv(
     deadline_ms: u64,
     argv: &[&str],
 ) -> Result<(RunOutcome, u64), &'static str> {
-    let _ = name; // the task name is fixed (`RUN_TASK_NAME`) so the kill arm can match it
+    let _ = name; #[cfg(feature = "wc")] let app_t0 = crate::arch::now_cycles(); // APPLAUNCH (B678): the exec stamp, before the ELF load. ⚠ LINE-NEUTRAL fold. — // the task name is fixed (`RUN_TASK_NAME`) so the kill arm can match it
     argv_fits(argv)?; // RING3ABI2 M2: refused BEFORE a slot exists, so a too-long line leaks nothing
-    let (mapped, pi) = load_program_common(bytes)?; super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
+    let (mapped, pi) = load_program_common(bytes)?; super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "wc")] crate::procslot::launch::exec_stamp(mapped.slot, crate::video::wm::program_name(argv.first().copied().unwrap_or(name)), app_t0); /* APPLAUNCH (B678) */ // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // SPAWN-FOCUS: a foreground `run` is an operator-typed launch by construction — this entry point
     // has exactly one caller, the shell's `run` verb — so its first window takes focus. Armed here,
     // before `spawn_user_preemptible` below, for the same reason `spawn_user_image_bg_inner` arms
@@ -16994,9 +16994,9 @@ fn spawn_user_image_bg_inner(
     no_autofocus: bool,
     argv: &[&str], as_row: Option<usize>, pipe: Option<usize>,
 ) -> Result<(u64, u64, u64), &'static str> {
-    let _ = no_autofocus; // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
+    let _ = no_autofocus; #[cfg(feature = "wc")] let app_t0 = crate::arch::now_cycles(); // APPLAUNCH (B678): the exec stamp, before the ELF load. ⚠ LINE-NEUTRAL fold. — // read only on `wc` builds — see `SLOT_NO_AUTOFOCUS`
     argv_fits(argv)?; // RING3ABI2 M2: refused BEFORE a slot exists
-    let (mapped, pi) = load_program_common(bytes)?; if let Some(i) = pipe { crate::pipe::bind(i, mapped.slot, pipe_gen(mapped.slot)); } super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "login")] slot_user_inherit(mapped.slot, as_row); #[cfg(not(feature = "login"))] let _ = as_row; // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
+    let (mapped, pi) = load_program_common(bytes)?; if let Some(i) = pipe { crate::pipe::bind(i, mapped.slot, pipe_gen(mapped.slot)); } super::memory::args_write(mapped.slot, argv); #[cfg(feature = "login")] slot_user_stamp(mapped.slot); #[cfg(feature = "login")] slot_user_inherit(mapped.slot, as_row); #[cfg(not(feature = "login"))] let _ = as_row; #[cfg(feature = "wc")] crate::procslot::launch::exec_stamp(mapped.slot, crate::video::wm::program_name(argv.first().copied().unwrap_or("-")), app_t0); /* APPLAUNCH (B678) */ // LOGIN M1 — with a session open the slot runs AS THE USER (file tail); knob-off `#[cfg]`-erased. ⚠ LINE-NEUTRAL append.
     // PROCREAP: mark the row SCAVENGEABLE before the task can exist. This is the one launch path whose
     // reaper is a shell HANDLE (`BG_JOBS`) rather than a held index, so it is the one path whose row can
     // be orphaned by losing that handle — and therefore the only one BGRUN-SCAV may reclaim. See the

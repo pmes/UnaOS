@@ -1811,7 +1811,7 @@ impl VfsBackend for NativeBackend {
     }
 
     fn read(&self, rel: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
-        let path = native_abs(rel); let mut tx = TxCost::default();
+        let path = native_abs(rel); let mut tx = TxCost::default(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { let _ = &mut tx; return crate::fs::unafs::splitread::read(&path, offset, len as u64).map_err(|m| match m { crate::fs::unafs::splitread::ReadMiss::NoSuchPath => VfsError::NoSuchPath, crate::fs::unafs::splitread::ReadMiss::IsADirectory => VfsError::IsADirectory, crate::fs::unafs::splitread::ReadMiss::Failed => VfsError::Backend("unafs-read"), crate::fs::unafs::splitread::ReadMiss::Mount(e) => unafs_err(e) }); } // HIDSTALL2 (B670): the data read leaves MOUNT (LINE-NEUTRAL append)
         crate::fs::unafs::with_unafs(|fs| {
             tx.start(); let id = fs.resolve_path(&path); tx.resolved(fs.root_generation()); let id = id.map_err(|_| VfsError::NoSuchPath)?;
             let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;

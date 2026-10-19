@@ -1171,9 +1171,9 @@ struct SfPal {
 }
 
 impl SfPal {
-    fn live() -> SfPal {
+    /// One look's set: [`wall_gen`] passes the live look; WINEDGE2 (B668)'s `shadow_dark=` probe draws both.
+    fn of(dark: bool) -> SfPal {
         use crate::video::theme::starfield as sf;
-        let dark = theme::is_dark();
         let p = |t: (u32, u32)| if dark { t.1 } else { t.0 };
         SfPal {
             void: p(sf::VOID),
@@ -2162,10 +2162,15 @@ fn sf_shimmer(px: &[u32], w: usize, h: usize, p: &SfPal, g: &SfGem, b: &SfBeam, 
 /// `None` when `w`/`h` are out of range or memory refused a table (the picture may then be partly drawn; the caller
 /// installs it without a shimmer).
 pub fn wall_gen(px: &mut [u32], w: usize, h: usize) -> Option<Scene> {
+    wall_gen_look(px, w, h, theme::is_dark())
+}
+
+/// [`wall_gen`] in a named look's set (`dark`), whatever the live one is (WINEDGE2 B668's `shadow_dark=` probe).
+fn wall_gen_look(px: &mut [u32], w: usize, h: usize, dark: bool) -> Option<Scene> {
     if w < 64 || h < 64 || w > 16_384 || h > 16_384 || px.len() < w * h {
         return None;
     }
-    let p = SfPal::live();
+    let p = SfPal::of(dark);
     let f = SfField::build(w, h)?;
     sf_haze(px, w, h, &f, &p)?;
     let mut cand: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
@@ -2246,7 +2251,7 @@ static SF_ONTO: crate::sync::Mutex<[u64; 4096]> = crate::sync::Mutex::new([0; 40
 
 /// The scene's ground colour in the live set (`theme::starfield::VOID`).
 pub fn scene_void() -> u32 {
-    SfPal::live().void
+    SfPal::of(crate::video::theme::is_dark()).void
 }
 
 /// The star pass over the static scratch field. `None` off range or when the grid outgrows the scratch.
@@ -2267,7 +2272,7 @@ fn sf_stars_static(w: usize, h: usize, seed: u64, plot: &mut impl FnMut(i64, i64
     let (gx, gy) = (&mut gx[..n], &mut gy[..n]);
     let gmax = sf_field_fill(w, h, dims, &mut dens[..n], &mut phi[..n], &mut tmp[..n], None, gx, gy);
     let lens = SfLens { c: dims.0, gw: dims.1, gh: dims.2, gx, gy, gmax };
-    let (drawn, _) = sf_stars_core(w, h, &lens, &SfPal::live(), seed, plot, &mut |_| {});
+    let (drawn, _) = sf_stars_core(w, h, &lens, &SfPal::of(crate::video::theme::is_dark()), seed, plot, &mut |_| {});
     Some(drawn)
 }
 
@@ -2369,6 +2374,11 @@ static SHIM_LAST: AtomicU64 = AtomicU64::new(0);
 static SHIM_CURSOR: AtomicU32 = AtomicU32::new(0);
 static SHIM_TICKS: AtomicU32 = AtomicU32::new(0);
 static SHIM_BUSY: AtomicBool = AtomicBool::new(false);
+/// SHIMMERIDLE (B663): the last tick's cost (us, re-tint + queue) and the boxes it queued.
+#[cfg(feature = "facet")]
+static SHIM_TICK_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "facet")]
+static SHIM_TICK_NB: AtomicU32 = AtomicU32::new(0);
 
 /// The live seat (from [`track`], at the head of the composite pass, before the erase drain): at most once per
 /// [`SHIMMER_MS`], only when the erase queue is empty and the pass queued no shadow fill, only while the desktop scene
@@ -2387,11 +2397,12 @@ fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
     }
     SHIM_LAST.store(now, Ordering::Relaxed);
     let cur = SHIM_CURSOR.load(Ordering::Relaxed);
+    let t0 = now_ns().0;
     let next = crate::video::wallpaper::shimmer_with(|s, buf, w, h| {
         if w != pw || h != ph || s.w != w || s.h != h {
-            return cur;
+            return (cur, 0);
         }
-        let (c, _, _, _) = shimmer_tick(
+        let (c, _, nb, _) = shimmer_tick(
             s,
             now,
             occ,
@@ -2403,10 +2414,13 @@ fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
             |x, y, c| unsafe { core::ptr::write_volatile(buf.add(y * w + x), c) },
             |x, y, bw, bh| super::defer_erase(x, y, bw, bh, super::DEFER_ROUTE, false),
         );
-        c
+        (c, nb)
     });
-    if let Some(c) = next {
+    if let Some((c, nb)) = next {
         SHIM_CURSOR.store(c, Ordering::Relaxed);
+        // SHIMMERIDLE (B663): this tick's cost (re-tint + queue) and its boxes, read by the idle seat.
+        SHIM_TICK_US.store(now_ns().0.saturating_sub(t0) / 1000, Ordering::Relaxed);
+        SHIM_TICK_NB.store(nb, Ordering::Relaxed);
         SHIM_TICKS.fetch_add(1, Ordering::Relaxed);
     }
     SHIM_BUSY.store(false, Ordering::Release);
@@ -2417,6 +2431,125 @@ fn shimmer_live(_occ: &[(usize, usize, usize, usize)], _pw: usize, _ph: usize) {
 /// Shimmer ticks run live since boot.
 pub fn shimmer_ticks() -> u32 {
     SHIM_TICKS.load(Ordering::Relaxed)
+}
+
+// ── SHIMMERIDLE (rmbp-ledger B663): the twinkle on an idle desktop ───────────────────────────────────────────────
+//
+// The live seat ([`shimmer_live`]) rides [`track`], and `track` runs only inside a composite pass: on a desktop where
+// nothing draws no pass runs, so the stars stood still. The TIMER is the device-service pass `x86_usb_pump` runs at
+// ~1 kHz (`desktop_uefi::desktop_app_service`, beside `pace_service` and `splash::hold_service`, which already make an
+// unmasked one-pass `composite` from this lane). [`shimmer_idle`] is called there on every pass and costs one clock
+// read and one load until a tick is due. When one is due and the glass is idle it runs ONE ordinary `wm::composite`:
+// the pass's own `track` runs the tick (fresh occluders, the `nf == 0` "no window moved since the last pass" rule,
+// the empty-erase-queue rule), and the SAME pass's drain presents its boxes through `stage_fill` — the cheapest
+// present there is, the one the live seat already uses. On the service core that pass is a ONE-PASS holder
+// (GATESTEAL B657, `wm.rs` `masked = … || service_cpu()`): no re-run rounds, no re-acquire.
+//
+// It never contends for the gate: it runs only when `COMP_GATE` is free and nothing is owed (`COMP_PENDING`, the erase
+// queue, a damaged row, the menu), so it never declines, never parks and never steals; any real work makes the pass
+// that follows it carry the shimmer instead. It does not run while the splash hold covers the panel (`hold_service`
+// ticks the hold store then) or while reduce motion is set (DESIGN-LANGUAGE §2.6). A tick that queued no box (the
+// desktop covered, or the picture not the panel's) backs the idle floor off to [`SHIM_IDLE_BACKOFF`] x the floor.
+
+/// The idle seat's floor multiplier after a tick that queued nothing (a covered desktop: ~4 probes a second).
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+const SHIM_IDLE_BACKOFF: u64 = 8;
+/// The idle seat's last attempt (ms), whether its last pass queued nothing, its ticks, its worst tick (us), its worst
+/// whole pass (us, tick + present), the attempts it skipped as not idle, and the fixture's reduce-motion force.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_IDLE_LAST: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_IDLE_EMPTY: AtomicBool = AtomicBool::new(false);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_IDLE_TICKS: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_IDLE_MAX_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_IDLE_PASS_US: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_IDLE_SKIPS: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_RM_FORCE: AtomicBool = AtomicBool::new(false);
+
+/// THE GATE CHECK: the compositor gate is free and nothing is owed — no declined pass (`COMP_PENDING`), no queued
+/// erase box, no menu paint, no damaged row (a window that moved or drew since the last pass). Read-only; the window
+/// table is taken once, for the scan.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn idle_glass() -> bool {
+    !super::COMP_GATE.load(Ordering::Acquire)
+        && !super::COMP_PENDING.load(Ordering::Acquire)
+        && super::DEFER_N.load(Ordering::Relaxed) == 0
+        && !super::menu_paint_owed()
+        && !super::any_damaged()
+}
+
+/// **The idle tick** (SHIMMERIDLE, B663) — from the device-service pass on every iteration. See the block above.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+pub fn shimmer_idle() {
+    let now = crate::arch::ms();
+    let floor = if SHIM_IDLE_EMPTY.load(Ordering::Relaxed) { SHIMMER_MS * SHIM_IDLE_BACKOFF } else { SHIMMER_MS };
+    if now.wrapping_sub(SHIM_LAST.load(Ordering::Relaxed)) < SHIMMER_MS || now.wrapping_sub(SHIM_IDLE_LAST.load(Ordering::Relaxed)) < floor {
+        return;
+    }
+    if crate::video::settings::reduce_motion() || SHIM_RM_FORCE.load(Ordering::Relaxed) || crate::splash::holding() || !crate::video::wallpaper::owns_backdrop() {
+        return;
+    }
+    SHIM_IDLE_LAST.store(now, Ordering::Relaxed);
+    if !idle_glass() {
+        SHIM_IDLE_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let n0 = SHIM_TICKS.load(Ordering::Relaxed);
+    let t0 = now_ns().0;
+    super::composite();
+    let pass_us = now_ns().0.saturating_sub(t0) / 1000;
+    let ticked = SHIM_TICKS.load(Ordering::Relaxed) != n0;
+    SHIM_IDLE_EMPTY.store(!ticked || SHIM_TICK_NB.load(Ordering::Relaxed) == 0, Ordering::Relaxed);
+    if ticked {
+        SHIM_IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
+        SHIM_IDLE_MAX_US.fetch_max(SHIM_TICK_US.load(Ordering::Relaxed), Ordering::Relaxed);
+        SHIM_IDLE_PASS_US.fetch_max(pass_us, Ordering::Relaxed);
+    }
+}
+
+/// **`tests shimmeridle`** (R80: a verb, never at boot). Two 200 ms windows with the fixture's own task asleep (it
+/// draws nothing): (1) the shimmer's ticks in the window (all seats) must be 4..=7 — the 33 ms floor caps it at 7, the
+/// idle seat must lift it to at least 4 — each idle tick under STARFIELD's bound (800 us), and no gate steal;
+/// (2) with reduce motion forced, the idle seat ticks zero times.
+/// `:: SHIMMERIDLE: detail idle_ticks=<n> pass_max_us=<n> skips=<n> backdrop=<0|1> ::`
+/// `:: SHIMMERIDLE: idle_ms=<n> ticks=<n> max_us=<n> reduce_motion_ticks=<n> gate_steals=<n> -> PASS|FAIL ::`
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+pub fn shimmeridle_selftest() {
+    const IDLE_MS: u64 = 200;
+    if crate::video::settings::reduce_motion() {
+        serial_println!(":: SHIMMERIDLE: reduce motion is set (the idle tick is off by design) -> SKIP ::");
+        return;
+    }
+    let steal0 = super::comp_steal_gen();
+    let (skip0, i0) = (SHIM_IDLE_SKIPS.load(Ordering::Relaxed), SHIM_IDLE_TICKS.load(Ordering::Relaxed));
+    SHIM_IDLE_MAX_US.store(0, Ordering::Relaxed);
+    SHIM_IDLE_PASS_US.store(0, Ordering::Relaxed);
+    let (t0, a0) = (crate::arch::ms(), SHIM_TICKS.load(Ordering::Relaxed));
+    crate::arch::sched::sleep_ms(IDLE_MS);
+    let idle_ms = crate::arch::ms().saturating_sub(t0);
+    let ticks = SHIM_TICKS.load(Ordering::Relaxed).wrapping_sub(a0);
+    let idle_ticks = SHIM_IDLE_TICKS.load(Ordering::Relaxed).wrapping_sub(i0);
+    let (max_us, pass_us) = (SHIM_IDLE_MAX_US.load(Ordering::Relaxed), SHIM_IDLE_PASS_US.load(Ordering::Relaxed));
+    SHIM_RM_FORCE.store(true, Ordering::Relaxed);
+    let r0 = SHIM_IDLE_TICKS.load(Ordering::Relaxed);
+    crate::arch::sched::sleep_ms(IDLE_MS);
+    let rm_ticks = SHIM_IDLE_TICKS.load(Ordering::Relaxed).wrapping_sub(r0);
+    SHIM_RM_FORCE.store(false, Ordering::Relaxed);
+    let steals = super::comp_steal_gen().wrapping_sub(steal0);
+    let ok = (4..=7).contains(&ticks) && idle_ticks > 0 && max_us <= 800 && rm_ticks == 0 && steals == 0;
+    serial_println!(
+        ":: SHIMMERIDLE: detail idle_ticks={} pass_max_us={} skips={} backdrop={} ::",
+        idle_ticks, pass_us, SHIM_IDLE_SKIPS.load(Ordering::Relaxed).wrapping_sub(skip0), crate::video::wallpaper::owns_backdrop() as u8
+    );
+    serial_println!(
+        ":: SHIMMERIDLE: idle_ms={} ticks={} max_us={} reduce_motion_ticks={} gate_steals={} -> {} ::",
+        idle_ms, ticks, max_us, rm_ticks, steals, if ok { "PASS" } else { "FAIL" }
+    );
 }
 
 /// The shimmer's cost on an offscreen picture: `ticks` ticks 7 x [`SHIMMER_MS`] apart, each re-tint plus the drain's
@@ -2671,6 +2804,75 @@ struct FixWin {
     title: &'static [u8],
 }
 
+/// WINEDGE2 (B668) — which base each desktop painter lays on THIS boot, `(desk, fill)`: true = the wallpaper
+/// picture, false = the flat `DESKTOP_BG`. The fill under a shadow (`wm::stage_fill` → `bg_row`) lays the picture
+/// whenever one is installed (`wallpaper::active`); the desktop layer beside it (`Screen`'s back buffer, through
+/// `wm::wp_paint`) only while the scene owns the backdrop (`video::desktop_scene_owns_backdrop`). Flight 36 (x86,
+/// no `[realdesk]` line) ran `(false, true)`: the margin was the only place the picture reached the glass. With no
+/// picture installed both are read over the generated one (the design case).
+fn live_bases() -> (bool, bool) {
+    #[cfg(feature = "facet")]
+    if crate::video::wallpaper::active() {
+        return (crate::video::desktop_scene_owns_backdrop(), true);
+    }
+    (true, true)
+}
+
+/// One look's `shadow_dark=` reading: the margin's outermost pixel equals the backdrop under it (`outer_eq`), and
+/// `inner` — the first pixel outside the box minus the backdrop beside it, mean of three channels, the weaker of the
+/// bottom and left sides (negative = darker; positive = the flight-36 flaw, a margin LIGHTER than the backdrop).
+struct DarkRead {
+    outer_eq: bool,
+    inner: i64,
+    ok: bool,
+}
+
+/// WINEDGE2 (B668): a focused window (`elev.3`) over the generated wallpaper drawn in look `dark` into `buf`
+/// (`w` x `h`), its shadow shaded as the fill shades it over the fill's base, read against the desktop layer's base
+/// (`bases`, [`live_bases`]) at the bottom margin (mid-width) and the left margin (mid-height). `None` when the
+/// picture, the tiles or the margin do not fit.
+fn shadow_dark_look(buf: &mut [u32], w: usize, h: usize, dark: bool, bases: (bool, bool)) -> Option<DarkRead> {
+    if buf.len() < w * h {
+        return None;
+    }
+    buf[..w * h].fill(theme::DESKTOP_BG);
+    wall_gen_look(buf, w, h, dark)?;
+    let t = tiles_for(ELEV_WINDOW, dark, win_radius(false))?;
+    let (x0, y0) = (w as i32 / 6, h as i32 / 8);
+    let (x1, y1) = (x0 + w as i32 / 2, y0 + h as i32 * 5 / 12);
+    if x0 - t.side < 0 || y1 + t.bot > h as i32 || t.bot <= 0 || t.side <= 0 {
+        return None;
+    }
+    let mut one = Casts::EMPTY;
+    one.push(Cast { id: 0xD5E0, x0, y0, x1, y1, t });
+    let buf = &buf[..w * h];
+    let desk = |x: usize, y: usize| if bases.0 { buf[y * w + x] } else { theme::DESKTOP_BG };
+    let fill = |x: usize, y: usize| {
+        let mut p = [if bases.1 { buf[y * w + x] } else { theme::DESKTOP_BG }];
+        shade_words(&one, &mut p, y as i32, x as i32);
+        p[0]
+    };
+    let ch = |c: u32, s: u32| ((c >> s) & 255) as i64;
+    let (mx, my) = (((x0 + x1) / 2) as usize, ((y0 + y1) / 2) as usize);
+    // (inner, outer): the first pixel outside the box, the margin's last pixel — below, then to the left.
+    let pairs = [((mx, y1 as usize), (mx, (y1 + t.bot - 1) as usize)), (((x0 - 1) as usize, my), ((x0 - t.side) as usize, my))];
+    let mut r = DarkRead { outer_eq: true, inner: i64::MIN, ok: true };
+    for &((ix, iy), (ox, oy)) in pairs.iter() {
+        if fill(ox, oy) != desk(ox, oy) {
+            r.outer_eq = false;
+        }
+        let (b, m) = (desk(ix, iy), fill(ix, iy));
+        let lighter = [16u32, 8, 0].iter().any(|&s| ch(m, s) > ch(b, s));
+        let d = [16u32, 8, 0].iter().map(|&s| ch(m, s) - ch(b, s)).sum::<i64>() / 3;
+        if lighter || d >= 0 {
+            r.ok = false;
+        }
+        r.inner = r.inner.max(d);
+    }
+    r.ok &= r.outer_eq;
+    Some(r)
+}
+
 /// **`tests desktopcraft`** — paints the default desktop into an offscreen surface the size of the rMBP panel
 /// (2880x1800; 1440x900 where memory refuses) the way the compositor does: the generated wallpaper and its VEIL,
 /// the desktop under every window's shadow (the fill's own shading, [`shade_words`], over the pre-rendered tiles),
@@ -2678,7 +2880,7 @@ struct FixWin {
 /// the dock's plate with nine tiles. It asserts the invariants and prints the paint cost on the running machine
 /// against the 60 Hz frame (16 667 us):
 ///
-/// `:: DESKTOPCRAFT: corners=ok shadow=ok edge=ok(1px) hairline=ok black=ok windows=3 surface=<w>x<h> -> PASS ::`
+/// `:: DESKTOPCRAFT: corners=ok shadow=ok edge=ok(1px) shadow_dark=ok(outer=eq inner=-<n>) hairline=ok black=ok windows=3 surface=<w>x<h> -> PASS ::`
 /// `:: DESKTOPCRAFT: cost clock=<tsc|ms> frame_us=<n> budget_us=16667 backdrop_us=<n> chrome_us=<n> bar_us=<n> dock_us=<n> wall_ms=<n> veil_ms=<n> shadow_us=<n> tiles_us=<n> tiles_kib=<n> margin=<t>/<s>/<b> idle_margin=<t>/<s>/<b> ramp_a=<first>/<last> ramp_dark=<first>/<last> frame=<n> track_fills=<n> black_runs=<n> shimmer_us=<n> -> UNDER|OVER ::`
 ///
 /// * **corners** — the focused window's top-left box pixel (outside the rounded head) is the desktop under the
@@ -2699,6 +2901,12 @@ struct FixWin {
 ///   arc are the ink; one pixel further in is the content (or the head's face), so it is ONE px; and one pixel
 ///   outside, on the left and below, is the shaded desktop (the edge is inside the box, the shadow outside it).
 ///   Printed `edge=ok(1px)`;
+/// * **shadow_dark** — WINEDGE2 (B668, flight 36: the margin painted as a pale box over a dark desktop): on BOTH
+///   looks, a focused window over the generated wallpaper ([`shadow_dark_look`]), the margin as the fill lays it and
+///   the backdrop beside it as the desktop layer lays it on this boot ([`live_bases`]): the margin's outermost pixel
+///   EQUALS the backdrop under it and the first pixel outside the box is darker than the backdrop (no channel
+///   lighter). Printed `shadow_dark=ok(outer=eq inner=-<n>)` (`n`, the weaker look's mean channel darkening), else
+///   `shadow_dark=FAIL(look=<light|dark> outer=<eq|ne> inner=<+-n> bases=<wall|flat>/<wall|flat>)`;
 /// * **hairline** — the dock plate's top edge is a line over the plate;
 /// * **black** — no run of pure `#000000` longer than 2 px outside a glyph zone.
 pub fn selftest() {
@@ -2959,11 +3167,47 @@ pub fn selftest() {
     if runs > 0 {
         black = false;
     }
-    let ok = corners && shadow && edge && hairline && black;
+    // shadow_dark (WINEDGE2 B668): both looks, the margin against the backdrop beside it, on this boot's two bases.
+    let bases = live_bases();
+    let (sw, sh) = (720usize, 480usize);
+    let mut sbuf: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let (mut sd_n, mut sd_fail): (i64, Option<(bool, Option<DarkRead>)>) = (i64::MIN, None);
+    if sbuf.try_reserve_exact(sw * sh).is_ok() {
+        sbuf.resize(sw * sh, 0);
+        for look_dark in [false, true] {
+            match shadow_dark_look(&mut sbuf, sw, sh, look_dark, bases) {
+                Some(r) => {
+                    sd_n = sd_n.max(r.inner);
+                    if !r.ok && sd_fail.is_none() {
+                        sd_fail = Some((look_dark, Some(r)));
+                    }
+                }
+                None => {
+                    if sd_fail.is_none() {
+                        sd_fail = Some((look_dark, None));
+                    }
+                }
+            }
+        }
+    } else {
+        sd_fail = Some((dark, None));
+    }
+    drop(sbuf);
+    let wf = |b: bool| if b { "wall" } else { "flat" };
+    let lk = |d: bool| if d { "dark" } else { "light" };
+    let shadow_dark_s = match &sd_fail {
+        None => alloc::format!("ok(outer=eq inner={:+})", sd_n),
+        Some((d, Some(r))) => alloc::format!(
+            "FAIL(look={} outer={} inner={:+} bases={}/{})",
+            lk(*d), if r.outer_eq { "eq" } else { "ne" }, r.inner, wf(bases.0), wf(bases.1)
+        ),
+        Some((d, None)) => alloc::format!("FAIL(look={} no-probe)", lk(*d)),
+    };
+    let ok = corners && shadow && edge && sd_fail.is_none() && hairline && black;
     let fl = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!(
-        ":: DESKTOPCRAFT: corners={} shadow={} edge={} hairline={} black={} windows={} surface={}x{} -> {} ::",
-        fl(corners), fl(shadow), if edge { "ok(1px)" } else { "FAIL" }, fl(hairline), fl(black), wins.len(), pw, ph, if ok { "PASS" } else { "FAIL" }
+        ":: DESKTOPCRAFT: corners={} shadow={} edge={} shadow_dark={} hairline={} black={} windows={} surface={}x{} -> {} ::",
+        fl(corners), fl(shadow), if edge { "ok(1px)" } else { "FAIL" }, shadow_dark_s, fl(hairline), fl(black), wins.len(), pw, ph, if ok { "PASS" } else { "FAIL" }
     );
     let frame_us = f4.saturating_sub(f0) / 1000;
     // STARFIELD (B661): the shimmer's worst tick over these windows (after every check: it re-tints `wall`).

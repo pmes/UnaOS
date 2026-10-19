@@ -91,8 +91,8 @@ impl Sem {
 /// toward black or white). When DESIGNAPPLY (B639) lands §2.3's tokens in `palette_core`, each arm becomes the token
 /// of the same name and nothing else in Softy moves.
 pub fn dark(t: Sem) -> u32 {
-    use crate::video::theme::{Tok, DARK};
-    let d = |k: Tok| DARK[k as usize];
+    use crate::video::theme::Tok;
+    let d = |k: Tok| palette_core::contrast::rows(true, crate::video::theme::contrast())[k as usize]; // CONTRAST (B664): the Dark column, or its increase-contrast row.
     let acc = crate::video::theme::accent();
     match t {
         // Flight 35 (SOFTY dark=0/19): the seat's LOCAL WAVE 3 fold mapped the retired material tokens onto the
@@ -137,9 +137,9 @@ fn pick(l: u32, t: Sem) -> u32 {
 #[allow(non_snake_case)] #[inline] pub fn SURFACE_IDLE() -> u32 { pick(light::SURFACE_IDLE, Sem::SurfaceSunken) }
 #[allow(non_snake_case)] #[inline] pub fn FLYOUT() -> u32 { pick(light::FLYOUT, Sem::SurfaceOverlay) }
 #[allow(non_snake_case)] #[inline] pub fn FLYOUT_FOOT() -> u32 { pick(light::FLYOUT_FOOT, Sem::SurfaceWindow) }
-#[allow(non_snake_case)] #[inline] pub fn TEXT() -> u32 { pick(light::TEXT, Sem::TextPrimary) }
-#[allow(non_snake_case)] #[inline] pub fn TEXT_2() -> u32 { pick(light::TEXT_2, Sem::TextSecondary) }
-#[allow(non_snake_case)] #[inline] pub fn TEXT_IDLE() -> u32 { pick(light::TEXT_IDLE, Sem::TextTertiary) }
+#[allow(non_snake_case)] #[inline] pub fn TEXT() -> u32 { pick(hc(light::TEXT, hcl::TEXT), Sem::TextPrimary) }
+#[allow(non_snake_case)] #[inline] pub fn TEXT_2() -> u32 { pick(hc(light::TEXT_2, hcl::TEXT_2), Sem::TextSecondary) }
+#[allow(non_snake_case)] #[inline] pub fn TEXT_IDLE() -> u32 { pick(hc(light::TEXT_IDLE, hcl::TEXT_IDLE), Sem::TextTertiary) }
 /// THE accent — the accent table's FILL for the chosen accent (`system.appearance.accent`), in both modes.
 #[allow(non_snake_case)] #[inline] pub fn ACCENT() -> u32 { crate::video::theme::accent() }
 /// The accent pressed (§2.3 `accent.pressed`).
@@ -148,7 +148,7 @@ fn pick(l: u32, t: Sem) -> u32 {
 #[allow(non_snake_case)] #[inline] pub fn ACCENT_INK() -> u32 { pick(ACCENT(), Sem::AccentInk) }
 /// The hairline's colour: black in light; `rim.dark` (white) in dark.
 #[allow(non_snake_case)] #[inline] pub fn STROKE() -> u32 { pick(light::STROKE, Sem::RimDark) }
-#[allow(non_snake_case)] #[inline] pub fn EDGE_IDLE() -> u32 { pick(light::EDGE_IDLE, Sem::LineStrong) }
+#[allow(non_snake_case)] #[inline] pub fn EDGE_IDLE() -> u32 { pick(hc(light::EDGE_IDLE, hcl::EDGE_IDLE), Sem::LineStrong) }
 /// A hovered control's wash: white over the light surface; white at a whisper over the dark one.
 #[allow(non_snake_case)] #[inline] pub fn HOVER() -> u32 { pick(light::HOVER, Sem::RimDark) }
 /// A pressed control's wash: a touch of ink in light; a lighter whisper in dark.
@@ -157,8 +157,8 @@ fn pick(l: u32, t: Sem) -> u32 {
 /// The close button held down: the hot fill a step darker.
 #[allow(non_snake_case)] #[inline] pub fn CLOSE_PRESSED() -> u32 { palette_core::mix(CLOSE_HOT(), light::PRESS, 1, 5) }
 #[allow(non_snake_case)] #[inline] pub fn FIELD() -> u32 { pick(light::FIELD, Sem::SurfaceContent) }
-#[allow(non_snake_case)] #[inline] pub fn FIELD_LINE() -> u32 { pick(light::FIELD_LINE, Sem::LineControl) }
-#[allow(non_snake_case)] #[inline] pub fn PIP() -> u32 { pick(light::PIP, Sem::TextTertiary) }
+#[allow(non_snake_case)] #[inline] pub fn FIELD_LINE() -> u32 { pick(hc(light::FIELD_LINE, hcl::FIELD_LINE), Sem::LineControl) }
+#[allow(non_snake_case)] #[inline] pub fn PIP() -> u32 { pick(hc(light::PIP, hcl::PIP), Sem::TextTertiary) }
 
 /// The hairline's alpha (about 10 % in light; `rim.dark`'s 8 % in dark).
 #[allow(non_snake_case)] #[inline] pub fn STROKE_A() -> u8 { if is_dark() { 20 } else { 26 } }
@@ -254,3 +254,15 @@ pub const QS_BTN: usize = 36;
 /// The status tile (Wi-Fi): its height and radius.
 pub const QS_TILE_H: usize = 64;
 pub const QS_TILE_R: usize = 6;
+
+// ── CONTRAST (rmbp-ledger B664) — Softy's own high-contrast pairs ──────────────────────────────────────────────────
+// Under Settings → Accessibility → Increase contrast (`theme::contrast`), Softy's Light inks and edges take
+// `palette_core::contrast::softy` (solved against Softy's five grounds: TEXT >= 7:1, TEXT_2 >= 9:1, TEXT_IDLE >= 7:1,
+// EDGE_IDLE >= 3:1, FIELD_LINE >= 4.5:1); its Dark reads the increase-contrast Dark row through [`dark`].
+use palette_core::contrast::softy as hcl;
+
+/// `base`, or its high-contrast pair while the switch is on.
+#[inline]
+fn hc(base: u32, high: u32) -> u32 {
+    if crate::video::theme::contrast() { high } else { base }
+}

@@ -656,7 +656,7 @@ static EPOCH: AtomicU32 = AtomicU32::new(0);
 /// The live value of token `t`.
 #[inline]
 pub fn tok(t: Tok) -> u32 {
-    if DARK_ON.load(AOrd::Relaxed) { DARK[t as usize] } else { LIGHT[t as usize] }
+    palette_core::contrast::rows(DARK_ON.load(AOrd::Relaxed), CONTRAST_ON.load(AOrd::Relaxed))[t as usize] // CONTRAST (B664): the set is (Light|Dark) x (base|increase-contrast), palette_core's four rows; the latch is this file's tail. ⚠ LINE-NEUTRAL: edited in place.
 }
 
 /// Is the Dark set live?
@@ -676,7 +676,7 @@ pub fn highlight_index() -> usize {
 
 /// Change epoch (0 = never changed).
 pub fn epoch() -> u32 {
-    EPOCH.load(AOrd::Acquire)
+    contrast_follow(); EPOCH.load(AOrd::Acquire) // CONTRAST (B664): every epoch reader first takes a changed Accessibility latch (the login load as well as the toggle), so the bump lands before the reader compares (fn at this file's tail). ⚠ LINE-NEUTRAL append.
 }
 
 /// Install a set / accent / highlight. Returns whether anything moved (the epoch is bumped only then).
@@ -962,4 +962,103 @@ pub fn type_role(role: TypeRole, softy: bool) -> TypeStep {
         i += 1;
     }
     TYPE_RAMP[2].1
+}
+
+// ── CONTRAST (rmbp-ledger B664) — Settings → Accessibility → Increase contrast, honoured ───────────────────────────
+// A11YPANE (B655) latched `system.accessibility.increase_contrast` (`settings::increase_contrast`) and nothing read it.
+// The theme now resolves every token through `palette_core::contrast::rows(dark, on)` ([`tok`]): the same 27 tokens,
+// the text ramp and the three lines pushed toward the ends of OKLCH L (palette_core's derivation; DESIGN-LANGUAGE §2.3
+// "The contrast set"). The switch is this latch; a change bumps [`EPOCH`] exactly as an accent change does, so
+// `strip::seal`, the menus, Quarry's pass and the generated wallpaper (`wallpaper::regen_on_theme`) redraw. Appended at
+// the file's tail so no line above moves.
+
+/// The increase-contrast set is live.
+static CONTRAST_ON: AtomicBool = AtomicBool::new(false);
+/// The Accessibility latch as this file last saw it (only a CHANGE of it moves the theme, so a fixture's direct
+/// [`set_contrast`] is not undone by the next [`epoch`] read).
+static CONTRAST_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Is the increase-contrast set live?
+#[inline]
+pub fn contrast() -> bool {
+    CONTRAST_ON.load(AOrd::Relaxed)
+}
+
+/// Install / remove the increase-contrast set. Returns whether it moved (the epoch is bumped only then).
+pub fn set_contrast(on: bool) -> bool {
+    let moved = CONTRAST_ON.swap(on, AOrd::AcqRel) != on;
+    if moved {
+        EPOCH.fetch_add(1, AOrd::AcqRel);
+    }
+    moved
+}
+
+/// Take a changed Accessibility latch (desktop images; the console-only image has no Settings and no switch).
+#[inline]
+fn contrast_follow() {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        let s = crate::video::settings::increase_contrast();
+        if CONTRAST_SEEN.swap(s, AOrd::AcqRel) != s {
+            set_contrast(s);
+        }
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    let _ = &CONTRAST_SEEN;
+}
+
+/// `tests contrast`: on each look (Una through [`tok`], Softy through `softy::palette`) six named text-on-surface pairs,
+/// sampled live in the current mode. Toggle ON -> every pair >= 7:1 and the epoch bumped; toggle OFF -> the pairs are
+/// the base pairs again (equal to the sample taken before, and to the base table) and the epoch bumped again. The
+/// prior state is restored after.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub fn contrast_selftest() {
+    use crate::video::softy::palette as sp;
+    use palette_core::contrast::ratio_x100;
+    const UNA: [(Tok, Tok, &str); 6] = [
+        (Tok::TextPrimary, Tok::SurfaceWindow, "text.primary/surface.window"),
+        (Tok::TextPrimary, Tok::SurfaceOverlay, "text.primary/surface.overlay"),
+        (Tok::TextSecondary, Tok::SurfaceSidebar, "text.secondary/surface.sidebar"),
+        (Tok::TextSecondary, Tok::SurfaceRaised, "text.secondary/surface.raised"),
+        (Tok::TextTertiary, Tok::SurfaceContent, "text.tertiary/surface.content"),
+        (Tok::TextTertiary, Tok::SurfaceSunken, "text.tertiary/surface.sunken"),
+    ];
+    const SOFTY: [&str; 6] = ["TEXT/SURFACE", "TEXT/FLYOUT", "TEXT_2/FLYOUT_FOOT", "TEXT_2/FIELD", "TEXT_IDLE/SURFACE_IDLE", "TEXT_IDLE/SURFACE"];
+    let pairs = || -> [(u32, u32); 12] {
+        let u = |i: usize| (tok(UNA[i].0), tok(UNA[i].1));
+        [
+            u(0), u(1), u(2), u(3), u(4), u(5),
+            (sp::TEXT(), sp::SURFACE()), (sp::TEXT(), sp::FLYOUT()), (sp::TEXT_2(), sp::FLYOUT_FOOT()),
+            (sp::TEXT_2(), sp::FIELD()), (sp::TEXT_IDLE(), sp::SURFACE_IDLE()), (sp::TEXT_IDLE(), sp::SURFACE()),
+        ]
+    };
+    let c0 = contrast();
+    let _ = set_contrast(false);
+    let base = pairs();
+    let dark = is_dark();
+    let table = palette_core::contrast::rows(dark, false);
+    let base_is_table = UNA.iter().zip(base.iter()).all(|(n, p)| p.0 == table[n.0 as usize] && p.1 == table[n.1 as usize]);
+    let e0 = EPOCH.load(AOrd::Acquire);
+    let _ = set_contrast(true);
+    let e1 = EPOCH.load(AOrd::Acquire);
+    let on = pairs();
+    let ratios: [u32; 12] = core::array::from_fn(|i| ratio_x100(on[i].0, on[i].1));
+    let min = ratios.iter().copied().min().unwrap_or(0);
+    let on_ok = min >= 700;
+    let _ = set_contrast(false);
+    let e2 = EPOCH.load(AOrd::Acquire);
+    let off = pairs();
+    let off_ok = off == base && base_is_table;
+    let bumps = (e1 != e0) as u32 + (e2 != e1) as u32;
+    let _ = set_contrast(c0);
+    let pass = on_ok && off_ok && bumps == 2;
+    for i in 0..12 {
+        let name = if i < 6 { UNA[i].2 } else { SOFTY[i - 6] };
+        serial_println!("[contrast] look={} pair={} on={}.{:02} off={}.{:02}", if i < 6 { "una" } else { "softy" }, name, ratios[i] / 100, ratios[i] % 100, ratio_x100(base[i].0, base[i].1) / 100, ratio_x100(base[i].0, base[i].1) % 100);
+    }
+    serial_println!(
+        ":: CONTRAST: on={}(min_ratio={}.{}) off={} epoch_bumps={} looks=2 -> {} :: mode={} epoch={}->{}->{} ::",
+        if on_ok { "ok" } else { "LOW" }, min / 100, (min % 100) / 10, if off_ok { "ok" } else { "MOVED" }, bumps,
+        if pass { "PASS" } else { "FAIL" }, if dark { "dark" } else { "light" }, e0, e1, e2
+    );
 }

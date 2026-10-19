@@ -258,8 +258,21 @@ Copying Apple's exact values gains nothing and is the kind of detail §7 asks us
 
 **Contrast targets** (gates for every craft arc): text ≥ 4.5:1 below 18 pt and ≥ 3:1 from 18 pt [S1] [S38]. UI
 component boundaries and state indicators ≥ 3:1 [S39]. The focus indicator changes ≥ 3:1 between focused and
-unfocused, over a ≥ 2-device-px perimeter [S42]. Thresholds are never rounded (4.499 fails) [S38]. A "High contrast"
-switch in Settings → Accessibility raises `text.secondary` to `text.primary` and `line.*` to `line.control`.
+unfocused, over a ≥ 2-device-px perimeter [S42]. Thresholds are never rounded (4.499 fails) [S38]. The "Increase
+contrast" switch in Settings → Accessibility selects the contrast set below.
+
+**The contrast set** (CONTRAST, rmbp-ledger B664). With `system.accessibility.increase_contrast` on, the theme resolves
+the same 27 tokens through `palette_core::contrast` (`contrast::rows(dark, on)`). The surfaces, discs, status colours,
+inks, syntax and accents do not change. The text ramp and the three lines move toward the ends of OKLCH L, at the same
+neutral trace (chroma 0.006, h 265). Each one takes the highest L (Light) or the lowest L (Dark), in 0.001 steps, that
+reaches its target against the **lowest-contrast of the six surfaces**. The targets: `text.primary` at L 0.13 / 0.985;
+`text.secondary` ≥ 9:1; `text.tertiary` ≥ 7:1, the enhanced floor of WCAG 1.4.6 [S38], so every text token clears 7:1
+on every surface; `text.disabled` ≥ 4.5:1 (no longer exempt); `line.subtle` ≥ 3:1 [S39]; `line.strong` ≥ 4.5:1;
+`line.control` ≥ 6:1. The method is §10's. The hex values and their ratios are in palette_core's `contrast` module, and
+a const block there recomputes every ratio from the hex at build time, so a value below its floor fails the build.
+Softy's Light table gets its own pairs, solved the same way against Softy's five grounds. Softy's Dark uses the
+contrast set's Dark row. A toggle bumps the theme epoch, the same as an accent change, so chrome, menus and the
+generated wallpaper redraw. `tests contrast` samples six text-on-surface pairs on each look.
 
 **Dark mode** is not an inversion [S5]. Elevation in dark is *lighter* surfaces (window `#1D1E21` < raised `#292A2D`
 < overlay `#2F3033`), because shadows are hard to see there [S49]. Pure `#000000` is reserved for the console and media
@@ -282,6 +295,11 @@ libadwaita's outline [S23]:
 Shadow notation is `x y blur` in pt, black at the stated alpha. Focus changes shadow *size*, as macOS and libadwaita
 do (libadwaita's backdrop transition is 200 ms [S22] [S23]). That gives a focused window a clear lift with no colour
 change in its title.
+
+**The falloff rule (WINEDGE2, rmbp-ledger B668).** A shadow only ever darkens the backdrop the desktop shows beside it, on
+every look: the margin's outermost pixel IS that backdrop's pixel, the innermost is it multiplied down by the level's
+strength (the table above, `palette_core` tokens, never a literal), and a picture under the margin (the starfield's
+stars) stays visible, only dimmed — the fill under a shadow and the desktop layer beside it lay the same base.
 
 **DECISION — shadows are pre-rendered, never computed per frame.** A window's shadow is a 9-slice (four corner tiles
 plus four edge ramps) rendered once per (radius, level, scale, theme) into a cached alpha table and blitted with the
@@ -486,6 +504,10 @@ token. Every state follows §2.7, and every motion follows §2.6.
   right-aligned.
 * At most 3 stacked, 8 apart. Auto-dismiss after 5 s, paused while hovered. Enter is a slide in from the edge plus a
   fade (`motion.enter`). Exit is `motion.exit`. Under Reduce motion, both are a fade.
+* **Built, the counts** (TOASTCAP, rmbp-ledger B674, wave 36): `video/notify.rs` holds `STACK_MAX = 3` and
+  `CARD_MS = 5000`; a hovered card's time left is frozen until the pointer leaves; a post that finds the stack full
+  waits (oldest first) and shows when a slot frees, and is never closed to make room (R116: the Center keeps every
+  post). The card's geometry and motion above are not part of this build. Witness: `tests toastcap`.
 
 ### 3.7 Menus (menu-bar menus, context menus, the crystal)
 
@@ -507,6 +529,10 @@ token. Every state follows §2.7, and every motion follows §2.6.
 * **Softy (content dialog)**: 400–540 wide, radius 8, `type.title3` title left, body left, padding 24. A **footer band**
   80 tall in `surface.window` with buttons right-aligned at equal width; the primary button is `accent.fill`.
 * Both: Return = default, Escape = cancel, focus starts on the default button, one primary action [S79].
+* **Built, the rules** (TOASTCAP, rmbp-ledger B674, wave 36): `video/dialog.rs` `paint` fills only the default
+  button with `accent.fill` and counts what it filled; Return answers the default and Escape the Cancel button (a
+  one-button alert's Escape dismisses it) on every caller's button row, the power confirm and the bus dialog. The
+  Una/Softy geometry above is not part of this build. Witness: `tests toastcap` (`primary_max=1 return=ok esc=ok`).
 
 ### 3.9 The login screen
 

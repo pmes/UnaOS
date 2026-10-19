@@ -400,7 +400,7 @@ mod tt {
     use font_core::Font;
 
     /// (file, wire name, role, bold). FONTSCRAFT (B640): Inter and JetBrains Mono are the Sans and Mono primaries;
-    /// Noto Sans and DejaVu Sans are the fallback chain after them. The DejaVu Sans / Sans Mono rows are the
+    /// the fallback chain after them is this table's ORDER (GLYPHS, B676): Noto Sans, the Noto script faces, DejaVu. The DejaVu Sans / Sans Mono rows are the
     /// STAND-INS: when Inter (JetBrains Mono) did not load they take its role, as KERNELFONT had them, and a DejaVu
     /// mono face is read only then. A sans face (Inter or DejaVu Sans) is REQUIRED: without one the desktop stays on
     /// the bitmap face.
@@ -408,16 +408,16 @@ mod tt {
         ("InterVariable.ttf", "inter", Role::Sans, false),
         ("JetBrainsMono-Variable.ttf", "jetbrains-mono", Role::Mono, false),
         ("NotoSans-Variable.ttf", "noto-sans", Role::Fallback, false),
+        ("NotoSansArabic-Regular.ttf", "noto-arabic", Role::Script, false),
+        ("NotoSansHebrew-Regular.ttf", "noto-hebrew", Role::Script, false),
+        ("NotoSansDevanagari-Regular.ttf", "noto-devanagari", Role::Script, false),
+        ("NotoSansThai-Regular.ttf", "noto-thai", Role::Script, false),
         ("DejaVuSans.ttf", "dejavu-sans", Role::Fallback, false),
         ("DejaVuSans-Bold.ttf", "dejavu-sans-bold", Role::Fallback, true),
         ("DejaVuSansMono.ttf", "dejavu-mono", Role::Mono, false),
         ("DejaVuSansMono-Bold.ttf", "dejavu-mono-bold", Role::Mono, true),
         ("DejaVuSerif.ttf", "dejavu-serif", Role::Serif, false),
         ("DejaVuSerif-Bold.ttf", "dejavu-serif-bold", Role::Serif, true),
-        ("NotoSansArabic-Regular.ttf", "noto-arabic", Role::Script, false),
-        ("NotoSansHebrew-Regular.ttf", "noto-hebrew", Role::Script, false),
-        ("NotoSansDevanagari-Regular.ttf", "noto-devanagari", Role::Script, false),
-        ("NotoSansThai-Regular.ttf", "noto-thai", Role::Script, false),
     ];
 
     /// `system.display.font` / `system.display.font_size` (Principia schema rows, KERNELFONT M3).
@@ -913,7 +913,7 @@ pub fn ensure_tests() {
     use core::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
-        crate::tests::register("font", fixture); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::tests::register("fonts", fonts2_fixture); // FONTS2 (B650): `tests fonts` — tnum, MVAR, FeatureVariations, the vendored KAT; desktop builds only, body at the FILE TAIL (LINE-NEUTRAL append, before this comment)
+        crate::tests::register("font", fixture); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::tests::register("fonts", fonts2_fixture); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::tests::register("glyphs", glyphs_fixture); // GLYPHS (B676): `tests glyphs` — the four scripts, RTL, the pseudo-locale pass (LINE-NEUTRAL append, before this comment). FONTS2 (B650): `tests fonts` — tnum, MVAR, FeatureVariations, the vendored KAT; desktop builds only, body at the FILE TAIL (LINE-NEUTRAL append, before this comment)
     }
 }
 
@@ -1125,5 +1125,171 @@ fn fonts2_fixture() {
         ":: FONTS2: tnum={}(clock,meters={}) mvar={}(instances={}) gsub_fv={}(rules={}) kat={}(vendored={}) -> {} ::",
         word(tnum_ok), meters_ok, word(mvar_ok), n_inst, word(fv_ok), rules, word(kat_ok), vendored,
         if tnum_ok && mvar_ok && fv_ok && kat_ok { "PASS" } else { "FAIL" }
+    );
+}
+
+// ------------------------------------------------------------------------------------------------ GLYPHS (B676)
+// The file tail again (FONTS2's rule: no line above moves). `tests glyphs` — i18n through the one text seam. Desktop
+// builds only, like the engine it reads.
+
+/// GLYPHS (rmbp-ledger B676): one line per script `tests glyphs` renders — Arabic (two words: an RTL paragraph),
+/// Devanagari (opening on the conjunct KSSA, KA + VIRAMA + SSA), CJK (Han and Hiragana), Thai (above and below marks).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+const GLYPH_LINES: [(&str, &str); 4] = [
+    ("arabic", "\u{645}\u{631}\u{62D}\u{628}\u{627} \u{628}\u{627}\u{644}\u{639}\u{627}\u{644}\u{645}"),
+    ("devanagari", "\u{915}\u{94D}\u{937}\u{92E}\u{93E} \u{928}\u{92E}\u{938}\u{94D}\u{924}\u{947}"),
+    ("cjk", "\u{4E2D}\u{6587} \u{65E5}\u{672C}\u{8A9E} \u{3072}\u{3089}\u{304C}\u{306A}"),
+    ("thai", "\u{E2A}\u{E27}\u{E31}\u{E2A}\u{E14}\u{E35}\u{E0A}\u{E32}\u{E27}\u{E42}\u{E25}\u{E01}"),
+];
+
+/// GLYPHS (B676): the Devanagari conjunct the fixture asks the shaper to FORM (KA + VIRAMA + SSA -> one KSSA glyph in
+/// Noto Sans Devanagari): fewer glyphs than code points, none of them `.notdef`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+const GLYPH_CONJUNCT: &str = "\u{915}\u{94D}\u{937}";
+
+/// GLYPHS (B676): the PSEUDO-LOCALE of a furniture label — its Latin letters swapped for accented forms (which keep
+/// the letter's width class: a translation's diacritics) and 40 % more characters, rounded up, cycled from its own
+/// letters (so the label's letter mix, and with it its mean advance, is kept): `Shut Down` -> `Shüt DöwñShüt`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn pseudo_label(s: &str) -> alloc::string::String {
+    let acc = |c: char| match c {
+        'a' => 'á',
+        'e' => 'é',
+        'i' => 'í',
+        'o' => 'ö',
+        'u' => 'ü',
+        'y' => 'ý',
+        'c' => 'ç',
+        'n' => 'ñ',
+        'A' => 'Á',
+        'E' => 'É',
+        'I' => 'Í',
+        'O' => 'Ö',
+        'U' => 'Ü',
+        'C' => 'Ç',
+        'N' => 'Ñ',
+        _ => c,
+    };
+    let base: alloc::vec::Vec<char> = s.chars().map(acc).collect();
+    let letters: alloc::vec::Vec<char> = base.iter().copied().filter(|c| !c.is_whitespace()).collect();
+    let mut out: alloc::string::String = base.iter().collect();
+    if !letters.is_empty() {
+        for i in 0..(base.len() * 2).div_ceil(5) {
+            out.push(letters[i % letters.len()]);
+        }
+    }
+    out
+}
+
+/// `tests glyphs` (GLYPHS, rmbp-ledger B676; DESIGN-LANGUAGE §2.2; BP-bar-22): i18n is first-class.
+/// * The fallback chain resolves PER GLYPH RUN: the four [`GLYPH_LINES`] are drawn through the seam (`Face::Ui`) into
+///   an offscreen surface (ink counted per line) and resolved glyph by glyph by `font_core::ui::Engine::resolve` — the
+///   draw calls' own shaping path — naming the face each glyph came from; `.notdef` (glyph 0) is counted. A script no
+///   face in the chain covers falls to the chain's terminal, the `font8x8` atlas — an ASCII atlas that has no glyph
+///   for it either — and its word is `font8x8` with its `.notdef` count: measured, not hidden.
+/// * Devanagari: [`GLYPH_CONJUNCT`] forms (fewer glyphs than code points). Arabic: the run advances right to left —
+///   its source clusters DESCEND along the visual order (first > last, never rising).
+/// * Pseudo-locale: every fixed-box furniture label (`crystal::label_boxes`, `softy::startmenu::label_boxes`) at
+///   +40 % ([`pseudo_label`]) is measured with `advance` in its own face and weight against the box its painter
+///   clips it to; a label wider than its box is a clip.
+///
+/// `:: GLYPHS: arabic=ok devanagari=ok cjk=ok thai=ok notdef=0 rtl=ok pseudo_clipped=0 -> PASS ::`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn glyphs_fixture() {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    tt::service();
+    if !tt::ready() {
+        serial_println!(":: GLYPHS: arabic=fail devanagari=fail cjk=fail thai=fail notdef=0 rtl=fail pseudo_clipped=0 -> FAIL :: (no face loaded from {}: see the [kfont] load line)", DIR);
+        return;
+    }
+    let face = Face::Ui;
+    let ch = face.cell_h().max(1);
+    const W: usize = 1536;
+    let h = GLYPH_LINES.len() * ch + 8;
+    let (white, ink) = (crate::video::theme::fixture::WHITE, crate::video::theme::fixture::INK);
+    let mut surf = alloc::vec![white; W * h];
+    let mut pens = [0usize; 4];
+    for (i, (_, line)) in GLYPH_LINES.iter().enumerate() {
+        pens[i] = draw_text(&mut surf, W, W, h, 4, 4 + i * ch, line.as_bytes(), ink, false, face);
+    }
+    let inked = |i: usize| surf[(4 + i * ch) * W..((4 + (i + 1) * ch) * W).min(surf.len())].iter().filter(|&&p| p != white).count();
+    let res = tt::with(|t| {
+        let mut st = t.styles[face.index()].0;
+        st.bold = false;
+        let chain = t.eng.chain_names(&st);
+        let names: Vec<&'static str> = t.eng.slots().iter().map(|s| s.name).collect();
+        let lines: Vec<Vec<font_core::ui::Resolved>> = GLYPH_LINES.iter().map(|(_, l)| t.eng.resolve(l.as_bytes(), st)).collect();
+        let conj = t.eng.resolve(GLYPH_CONJUNCT.as_bytes(), st);
+        (chain, names, lines, conj, st.size)
+    });
+    let Some((chain, names, lines, conj, size)) = res else {
+        serial_println!(":: GLYPHS: arabic=fail devanagari=fail cjk=fail thai=fail notdef=0 rtl=fail pseudo_clipped=0 -> FAIL :: (engine lock busy)");
+        return;
+    };
+    serial_println!("[glyphs] chain={}>font8x8 face=ui size={:.2} surface={}x{}", chain.join(">"), size, W, h);
+    let mut words = ["fail"; 4];
+    let (mut notdef_all, mut rtl_ok) = (0usize, false);
+    let conj_n = GLYPH_CONJUNCT.chars().count();
+    let conj_ok = !conj.is_empty() && conj.len() < conj_n && conj.iter().all(|g| g.glyph != 0);
+    for (i, ((key, line), r)) in GLYPH_LINES.iter().zip(lines.iter()).enumerate() {
+        let notdef = r.iter().filter(|g| g.glyph == 0).count();
+        notdef_all += notdef;
+        let mut faces: Vec<&str> = Vec::new();
+        for g in r.iter().filter(|g| g.glyph != 0) {
+            let n = names.get(g.face as usize).copied().unwrap_or("?");
+            if !faces.contains(&n) {
+                faces.push(n);
+            }
+        }
+        let cl: Vec<usize> = r.iter().map(|g| g.cluster).collect();
+        let desc = cl.len() >= 2 && cl.windows(2).all(|p| p[0] >= p[1]) && cl[0] > cl[cl.len() - 1];
+        let (px, adv) = (inked(i), pens[i].saturating_sub(4));
+        let mut ok = !r.is_empty() && notdef == 0 && px > 0 && adv > 0;
+        let mut extra = String::new();
+        match *key {
+            "arabic" => {
+                rtl_ok = desc;
+                ok &= desc;
+                extra = alloc::format!(" clusters={}", if desc { "descending(rtl)" } else { "not-descending" });
+            }
+            "devanagari" => {
+                ok &= conj_ok;
+                extra = alloc::format!(" conjunct=KA+VIRAMA+SSA glyphs={}/{} formed={}", conj.len(), conj_n, conj_ok as u8);
+            }
+            _ => {}
+        }
+        words[i] = if ok { "ok" } else if notdef > 0 { "font8x8" } else { "fail" };
+        serial_println!(
+            "[glyphs] line script={} faces={} glyphs={} chars={} notdef={} ink_px={} adv_px={}{}{}",
+            key, if faces.is_empty() { String::from("none") } else { faces.join("+") }, r.len(), line.chars().filter(|c| !c.is_whitespace()).count(), notdef, px, adv, extra,
+            if notdef > 0 { " resolved=none(no face in the chain covers it; the terminal font8x8 is an ASCII atlas: drawn as .notdef)" } else { "" }
+        );
+    }
+    // The pseudo-locale pass.
+    let mut boxes: Vec<(&'static str, String, usize, bool, Face)> = Vec::new();
+    crate::video::crystal::label_boxes(&mut boxes);
+    crate::video::softy::startmenu::label_boxes(&mut boxes);
+    let (mut clipped, mut worst) = (0usize, (0usize, "", String::new(), 0usize, 0usize));
+    for (surface, label, bx, bold, f) in boxes.iter() {
+        let p = pseudo_label(label);
+        let (wp, w0) = (advance(p.as_bytes(), *bold, *f), advance(label.as_bytes(), *bold, *f));
+        let per_mille = wp * 1000 / (*bx).max(1);
+        if per_mille > worst.0 {
+            worst = (per_mille, *surface, label.clone(), wp, *bx);
+        }
+        if wp > *bx {
+            clipped += 1;
+            serial_println!("[glyphs] pseudo clipped surface={} label=\"{}\" base_w={} pseudo_w={} box={}", surface, label, w0, wp, bx);
+        }
+    }
+    serial_println!(
+        "[glyphs] pseudo labels={} expand=+40% clipped={} worst={}:\"{}\" pseudo_w={} box={} fill={}.{}%",
+        boxes.len(), clipped, worst.1, worst.2, worst.3, worst.4, worst.0 / 10, worst.0 % 10
+    );
+    let pass = words.iter().all(|&w| w == "ok") && notdef_all == 0 && rtl_ok && clipped == 0 && !boxes.is_empty();
+    serial_println!(
+        ":: GLYPHS: arabic={} devanagari={} cjk={} thai={} notdef={} rtl={} pseudo_clipped={} -> {} ::",
+        words[0], words[1], words[2], words[3], notdef_all, if rtl_ok { "ok" } else { "fail" }, clipped, if pass { "PASS" } else { "FAIL" }
     );
 }

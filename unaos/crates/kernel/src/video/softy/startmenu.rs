@@ -1034,3 +1034,24 @@ pub fn winkey_selftest() {
         role
     );
 }
+
+// ── GLYPHS (rmbp-ledger B676) — the Start menu's fixed-box labels, for `tests glyphs`' pseudo-locale pass ─────────
+
+/// GLYPHS (B676): the Start menu's labels whose box does not depend on the flyout's size, as `(surface, label, box
+/// px, bold, face)` — the power menu's rows (drawn at `m.0 + px(16)` clipped to `POWER_W - px(24)`) and the grid's
+/// app names (centred in the `CELL_W` column, clipped to `CELL_W - px(8)`), exactly the clips [`paint_start`]'s
+/// `p::text` calls pass. Measurement only — no layout reads this.
+pub fn label_boxes(out: &mut Vec<(&'static str, alloc::string::String, usize, bool, Face)>) {
+    let row_box = k::px(k::POWER_W).saturating_sub(k::px(24));
+    for l in POWER_ROWS {
+        out.push(("softy-power", alloc::string::String::from(l), row_box, false, Face::Ui));
+    }
+    let cell_box = k::px(k::CELL_W).saturating_sub(k::px(8));
+    let mut items = [0u8; 16];
+    let n = grid_items(&mut items);
+    for &pin in &items[..n] {
+        let mut lb = [0u8; 16];
+        let ll = label(pin as usize, &mut lb);
+        out.push(("softy-start", alloc::string::String::from_utf8_lossy(&lb[..ll]).into_owned(), cell_box, false, Face::Ui));
+    }
+}

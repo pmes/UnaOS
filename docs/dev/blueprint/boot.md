@@ -24,6 +24,7 @@
 | BP-boot-12 | Boot timing uses the free-running counter (rdtsc / CNTVCT_EL0), converted at print time; drop-NEWEST on overflow. | `unaos/crates/kernel/src/bootpace.rs:16-29` | BPACE ledger on the wire |
 | BP-boot-13 | The loader's `KELF min= max=` line is the boot's identity for scoring a capture. | `unaos/crates/bootloader/src/main.rs:795`; `docs/dev/PLAYBOOK.md` §4.6 | bench scoring (unheld in-tree) |
 | BP-boot-14 | Orin (`tegra`) leaves `kernel_main` early at `tegra_early_stop`; the shared GUI path below it is unreachable there. | `unaos/crates/kernel/src/main.rs:72-79` `unaos/crates/kernel/src/main.rs:190` | `./arroyo check` tegra leg |
+| BP-boot-15 | Every image line names its oldest machine (`boot::OLDEST`, one const per board: rmbp12 2012, pi4 2019, orin 2023; `login` builds only, written in each line's tail comment) and the boot's first `[desktop] built` prints `:: OLDEST: board= year= image=<build sha> net=<absent|present> -> BOOTS ::`; BP-bar-1. | `unaos/crates/kernel/src/boot.rs:410-459` `unaos/crates/kernel/src/video/desktopbuild.rs:122`; `unaos/scripts/image-line.env:70` | twoboot boot 1 (`x86-twoboot-1.spec`) |
 
 ## 3. Seams
 - `boot::phase/services_gate` are asked by: `wm::create_inner`, every service starter, the WC-D valve (`unaos/crates/kernel/src/boot.rs:17-21`).

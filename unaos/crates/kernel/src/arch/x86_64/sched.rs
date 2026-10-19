@@ -454,6 +454,11 @@ pub struct Task {
     /// eligibility, and giving this field any authority would quietly recreate the two-class
     /// distinction the arc removed.
     hint_placed: bool,
+    /// FPU (rmbp-ledger B666): this task's x87/SSE register file as a 512-byte FXSAVE image, 16-aligned
+    /// (`FpuArea` is `align(16)`, so the `Box<Task>` is). Live in the registers while the task runs;
+    /// `fpu::switch_out` saves it here at every switch-back and `fpu::dispatch` restores it at every
+    /// dispatch, on whichever core that is. Only ring-3 tasks use it (kernel code is soft-float).
+    fpu: fpu::FpuArea,
 
     // ── R1 / rtpi: PRIORITY-INHERITANCE state (feature-gated so a knob-off `Task` is byte-identical) ──
     //
@@ -2453,6 +2458,7 @@ fn spawn_inner(
         steal_esc: 0,
         migrate_ms: 0,
         hint_placed: false,
+        fpu: fpu::FpuArea::INIT, // FPU (B666): a fresh task starts from the initial x87/SSE image
         #[cfg(feature = "rtpi")]
         held: [const { AtomicU64::new(0) }; PI_HELD_MAX],
     });
@@ -2572,6 +2578,11 @@ extern "C" fn user_task_trampoline() -> ! {
         }
     }
 
+    // FPU (B666): enter a UnaOS program AS IF CALLED — rsp = 8 (mod 16), what a SysV `extern "C"` entry
+    // (`_start`, a SYS_THREAD_SPAWN worker) assumes. The loaders and SYS_THREAD_SPAWN hand a 16-aligned
+    // top; hardware-float code spills with `movaps`, which would #GP one slot off. A Linux task keeps its
+    // exact rsp (argc lives at [rsp]). See `fpu::entry_pad`.
+    let user_rsp = user_rsp - fpu::entry_pad(unsafe { (*raw).name });
     // Drop to ring 3. `swapgs` parks this CPU's PerCpuData pointer in the GS shadow for the syscall
     // path; the `iretq` frame is [SS, RSP, RFLAGS, CS, RIP] (RIP pushed LAST so `iretq` pops it
     // first). Interrupts are masked HERE, so the swapgs/iretq window can't take an IRQ; a preemptible
@@ -2740,6 +2751,7 @@ fn spawn_user_inner(
         steal_esc: 0,
         migrate_ms: 0,
         hint_placed: false,
+        fpu: fpu::FpuArea::INIT, // FPU (B666): a fresh task starts from the initial x87/SSE image
         #[cfg(feature = "rtpi")]
         held: [const { AtomicU64::new(0) }; PI_HELD_MAX],
     });
@@ -2995,6 +3007,7 @@ pub fn spawn_user_thread(
         migrate_ms: 0,
         // VUGSPREAD (review F16): this core came from ring 3's `place` argument. Attribution only.
         hint_placed: true,
+        fpu: fpu::FpuArea::INIT, // FPU (B666): a thread starts from the initial x87/SSE image, never its creator's
         #[cfg(feature = "rtpi")]
         held: [const { AtomicU64::new(0) }; PI_HELD_MAX],
     });
@@ -6383,7 +6396,7 @@ fn run() -> ! {
                     let uc = unsafe { (*raw).user_cr3 };
                     { #[cfg(feature = "linuxabi")] if uc != 0 { crate::arch::linuxabi::on_dispatch(uc); } /* LINUXABI2: re-assert this process's FS_BASE per switch-in */ if uc != 0 { uc } else { crate::arch::memory::kernel_cr3() } }
                 };
-                #[cfg(feature = "linuxabi")] crate::arch::linuxabi::fpu::dispatch(cpu, unsafe { (*raw).user_cr3 }, unsafe { (*raw).name }, unsafe { (*raw).user_entry } != 0); // LINUXABI3: a Linux task gets CR4.OSFXSR + its FXSAVE image; a UnaOS ring-3 task gets OSFXSR cleared (its SSE #UD fence).
+                fpu::dispatch(cpu, raw); // FPU (B666): every ring-3 task gets CR4.OSFXSR + its FXSAVE image (a UnaOS task its `Task::fpu`, a Linux task its LINUXABI3 slot); kernel tasks change nothing.
                 //
                 // VUGSPREAD adds one counter and no branch. `CR3_RELOADS` already counted the RARE
                 // arm — the generation-behind revalidation — but the arm that a MIGRATION actually
@@ -6472,7 +6485,7 @@ fn run() -> ! {
                 // free it is below).
                 stack_guard_check(cpu, raw);
 
-                #[cfg(feature = "linuxabi")] crate::arch::linuxabi::fpu::switch_out(cpu); // LINUXABI3: save a Linux task's x87/XMM file and scrub it before anything else runs on this core.
+                fpu::switch_out(cpu); // FPU (B666): save the ring-3 task's x87/XMM file (its own `Task::fpu`, or a Linux task's slot) and scrub it before anything else runs on this core. LINUXABI3's hook rides inside.
                 // --- The task switched back to us (yield / preempt / block / exit). IF=0. ---
                 SCHED[cpu].current.store(0, Ordering::Release);
                 SCHED[cpu].current_prio.store(PRIO_IDLE, Ordering::Release);
@@ -7946,6 +7959,11 @@ pub struct Rehomed {
     pub sleeping: u32,
     pub left: u32,
     pub current: Option<u64>,
+    /// GATESTEAL2 (B667): the registered SINGLETON lived on the dead core in no queue (its CURRENT task, or parked on a
+    /// wait queue) and was restarted at its loop head on `live` ([`singleton_restart`]); `current` then names the
+    /// superseded tid and `restarted` the fresh one.
+    pub moved_current: bool,
+    pub restarted: Option<u64>,
 }
 
 /// GATESTEAL — the thief's step 3 for a task leaving a dead core: home, migration count, residency clock.
@@ -7959,7 +7977,9 @@ fn rehome_fields(task: &mut Task, live: usize, now_ms: u64) {
 /// what moved and what could not. A no-op (all zeros, `current: None`) when `dead`/`live` are out of
 /// range, equal, or `live` does not dispatch — the caller chose badly and nothing is touched.
 pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
-    let mut r = Rehomed { ready: 0, sleeping: 0, left: 0, current: None };
+    let mut r = Rehomed { ready: 0, sleeping: 0, left: 0, current: None, moved_current: false, restarted: None };
+    let sgl = SGL_TID.load(Ordering::Acquire);
+    let mut sgl_moved = false;
     if dead >= MAX_CPUS || live >= MAX_CPUS || dead == live || !cpu_dispatching(live) {
         return r;
     }
@@ -7978,6 +7998,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
                 continue;
             }
             rehome_fields(&mut task, live, now_ms);
+            sgl_moved |= task.id == sgl;
             let prio = task.priority;
             RUN_QUEUES[live].lock().push(task);
             poke_for(live, prio);
@@ -7997,6 +8018,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
                 continue;
             }
             rehome_fields(&mut task, live, now_ms);
+            sgl_moved |= task.id == sgl;
             let left = deadline.saturating_sub(dead_ticks);
             SLEEPERS[live].lock().push_back(Sleeper { deadline: live_ticks.saturating_add(left), task });
             r.sleeping += 1;
@@ -8006,18 +8028,531 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
             SLEEPERS[dead].lock().push_back(s);
         }
     });
-    match SCHED[dead].current_tid.load(Ordering::Relaxed) {
-        0 => {}
-        t => r.current = Some(t),
+    let cur = SCHED[dead].current_tid.load(Ordering::Relaxed);
+    if cur != 0 {
+        r.current = Some(cur);
+    }
+    // GATESTEAL2 (B667) M1: the registered singleton (the usb-pump) on the dead core and in no queue it could be moved
+    // from — its CURRENT task, or PARKED on a wait queue (flight 36 boot 1: `current=-1`, the pump in neither queue) —
+    // is restarted at its loop head on `live`. Never a frame move: see the block at [`singleton_restart`].
+    let was = if cur != 0 && cur == sgl { "running" } else { "parked" };
+    if sgl != 0 && !sgl_moved && SGL_HOME.load(Ordering::Acquire) == dead {
+        if let Some((old, new)) = singleton_restart(dead, live) {
+            r.current = Some(old);
+            r.moved_current = true;
+            r.restarted = Some(new);
+        }
     }
     serial_println!(
-        ":: [smpbal] rehome dead=c{} live=c{} ready={} sleeping={} left={} current={} (GATESTEAL B657: the pin contract is void on a core the steal declared dead; the current task is in no queue and stays) ::",
+        ":: [smpbal] rehome dead=c{} live=c{} ready={} sleeping={} left={} current={} moved_current={} was={} new={} (GATESTEAL B657: the pin contract is void on a core the steal declared dead; GATESTEAL2 B667: the singleton in no queue restarts at its loop head) ::",
         dead,
         live,
         r.ready,
         r.sleeping,
         r.left,
-        r.current.map_or(-1i64, |t| t as i64)
+        r.current.map_or(-1i64, |t| t as i64),
+        r.moved_current as u8,
+        if r.moved_current { was } else { "-" },
+        r.restarted.map_or(-1i64, |t| t as i64)
     );
     r
+}
+
+// ── FPU (rmbp-ledger B666): the x87/SSE context of every ring-3 task — ONE mechanism for both kinds ──────────
+//
+// The kernel target (`unaos/x86_64-unaos.json`) is soft-float with MMX/SSE off, so no kernel code touches the x87/XMM
+// file or MXCSR: what a ring-3 task left there is still there when the scheduler runs. EAGER: `dispatch` (the one
+// dispatch site in `run`, IF=0, before the switch in) sets CR4.OSFXSR and `fxrstor64`s the incoming ring-3 task's
+// image; `switch_out` (the first statement after any task returns to the scheduler: yield, preempt, block, exit; IF=0;
+// the Task box still live) `fxsave64`s it and loads the initial image, so no x87/XMM residue reaches the next task.
+// Lazy CR0.TS/#NM is not used: there is no #NM handler (interrupts.rs wires #MF/#XM only), and the U2.5 first-entry
+// `fninit` scrub in `user_task_trampoline` runs at CPL 0, where TS would itself trap. The SYSCALL stub
+// (`unaos_syscall_entry`, syscall.rs) moves GPRs only and calls soft-float Rust: a syscall that does not block leaves
+// XMM/MXCSR/x87 untouched; one that blocks or yields goes through `switch_out`. FXSAVE, not XSAVE: CR4.OSXSAVE and
+// XCR0 stay clear, so AVX/VEX is a clean #UD and the ring-3 target enables sse,sse2 only.
+// A UnaOS ring-3 task (and SYS_THREAD_SPAWN thread) keeps its image in `Task::fpu`; a Linux-ABI task keeps the
+// LINUXABI3 slot keyed by PML4/thread (fork copies it before the child task exists) — `linuxabi::fpu` calls these
+// primitives and owns only its table.
+pub mod fpu {
+    use super::Task;
+    use crate::arch::gdt::MAX_CPUS;
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+
+    const CR0_MP: u64 = 1 << 1;
+    const CR0_EM: u64 = 1 << 2;
+    const CR0_TS: u64 = 1 << 3;
+    const CR0_NE: u64 = 1 << 5;
+    const CR4_OSFXSR: u64 = 1 << 9;
+    const CR4_OSXMMEXCPT: u64 = 1 << 10;
+    /// Initial MXCSR: every SSE exception masked, round-to-nearest, no flags (Linux's too).
+    pub const MXCSR_INIT: u32 = 0x1F80;
+    /// The context size every ring-3 task owns.
+    pub const CTX_BYTES: usize = core::mem::size_of::<FpuArea>();
+
+    /// One FXSAVE image (Intel SDM Vol. 1 §10.5.1): 512 bytes, 16-aligned.
+    #[repr(C, align(16))]
+    pub struct FpuArea(pub [u8; 512]);
+    const _: () = assert!(core::mem::size_of::<FpuArea>() == 512 && core::mem::align_of::<FpuArea>() == 16);
+
+    impl FpuArea {
+        /// The initial FP state as an FXSAVE image: FCW 0x37F (all x87 exceptions masked, 64-bit precision), empty
+        /// tags, MXCSR 0x1F80, every register zero.
+        pub const INIT: FpuArea = {
+            let mut a = [0u8; 512];
+            a[0] = 0x7F;
+            a[1] = 0x03;
+            a[24] = (MXCSR_INIT & 0xFF) as u8;
+            a[25] = (MXCSR_INIT >> 8) as u8;
+            FpuArea(a)
+        };
+    }
+    /// The scrub image `switch_out` loads (an address for `fxrstor64`).
+    pub static INIT: FpuArea = FpuArea::INIT;
+
+    /// Per core: the `Task::fpu` whose state is LIVE in this core's registers (0 = none — a kernel task, or a Linux
+    /// task whose live state the LINUXABI3 table tracks).
+    static LIVE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    /// Per core: shadow of CR4.OSFXSR as last written here (exact once `core_init` ran); one-time CR0/CR4 init done.
+    static CR4_ON: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+    static CORE_INIT: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+    /// UnaOS ring-3 images saved / restored (the Linux box counts its own in `linuxabi::fpu`).
+    pub static SAVES: AtomicU64 = AtomicU64::new(0);
+    pub static RESTORES: AtomicU64 = AtomicU64::new(0);
+    /// CR4.OSFXSR writes after a core's init (only a slotless Linux task clears it now).
+    pub static CR4_FLIPS: AtomicU64 = AtomicU64::new(0);
+
+    /// FXSR + SSE + SSE2 (CPUID.1:EDX bits 24/25/26) — every x86_64 part has them; checked anyway, fail closed.
+    pub fn supported() -> bool {
+        // 0 = not probed, 1 = yes, 2 = no. Cached: CPUID is serialising (and a VM exit under a hypervisor).
+        static PROBE: AtomicU8 = AtomicU8::new(0);
+        match PROBE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let ok = core::arch::x86_64::__cpuid(1).edx & (7 << 24) == 7 << 24;
+                PROBE.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+                ok
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub unsafe fn fxsave(a: *mut FpuArea) {
+        unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) a, options(nostack, preserves_flags)) };
+    }
+
+    #[inline(always)]
+    pub unsafe fn fxrstor(a: *const FpuArea) {
+        unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) a, options(nostack, preserves_flags, readonly)) };
+    }
+
+    /// Once per core, before the first ring-3 FP image is loaded there: CR0.MP|NE set, EM|TS clear (native x87 errors,
+    /// no #NM), CR4.OSXMMEXCPT|OSFXSR set (SSE on, unmasked SSE exceptions as #XM). The AP trampoline leaves CR4 = PAE
+    /// only and the BSP keeps firmware's, so the shadow is made exact here rather than assumed.
+    pub fn core_init(cpu: usize) {
+        if cpu >= MAX_CPUS || CORE_INIT[cpu].load(Ordering::Relaxed) || !supported() {
+            return;
+        }
+        use x86_64::registers::control::{Cr0, Cr4};
+        unsafe {
+            let cr0 = Cr0::read_raw() as u64;
+            Cr0::write_raw(((cr0 | CR0_MP | CR0_NE) & !(CR0_EM | CR0_TS)) as _);
+            Cr4::write_raw((Cr4::read_raw() as u64 | CR4_OSXMMEXCPT | CR4_OSFXSR) as _);
+        }
+        CR4_ON[cpu].store(true, Ordering::Relaxed);
+        CORE_INIT[cpu].store(true, Ordering::Relaxed);
+    }
+
+    /// Set or clear CR4.OSFXSR on this core (one write per change, shadowed).
+    pub fn set_osfxsr(cpu: usize, on: bool) {
+        if cpu >= MAX_CPUS || CR4_ON[cpu].load(Ordering::Relaxed) == on || (on && !supported()) {
+            return;
+        }
+        use x86_64::registers::control::Cr4;
+        unsafe {
+            let cr4 = Cr4::read_raw() as u64;
+            Cr4::write_raw((if on { cr4 | CR4_OSFXSR } else { cr4 & !CR4_OSFXSR }) as _);
+        }
+        CR4_ON[cpu].store(on, Ordering::Relaxed);
+        CR4_FLIPS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Cores whose CR4.OSFXSR is set (by the shadow) — the `tests fpu` detail line.
+    pub fn osfxsr_cores() -> usize {
+        CR4_ON.iter().filter(|b| b.load(Ordering::Relaxed)).count()
+    }
+
+    /// `user_task_trampoline`'s entry pad: 8 for a UnaOS program (enter as if called), 0 for a Linux-ABI task.
+    pub fn entry_pad(name: &str) -> u64 {
+        #[cfg(feature = "linuxabi")]
+        if name == crate::arch::linuxabi::TASK_NAME {
+            return 0;
+        }
+        let _ = name;
+        8
+    }
+
+    /// The scheduler's dispatch hook (IF=0, `current` published, before the switch into `t`).
+    pub(super) fn dispatch(cpu: usize, t: *mut Task) {
+        if cpu >= MAX_CPUS {
+            return;
+        }
+        let (ring3, cr3, name) = unsafe { ((*t).user_entry != 0, (*t).user_cr3, (*t).name) };
+        #[cfg(feature = "linuxabi")]
+        if crate::arch::linuxabi::fpu::dispatch(cpu, cr3, name) {
+            return; // a Linux task: its slot restored, or OSFXSR cleared (no slot — fail closed)
+        }
+        let _ = (cr3, name);
+        if !ring3 || !supported() {
+            return; // a kernel task touches no FP state; without FXSR a ring-3 SSE instruction stays #UD
+        }
+        core_init(cpu);
+        set_osfxsr(cpu, true);
+        let a = unsafe { core::ptr::addr_of_mut!((*t).fpu) };
+        unsafe { fxrstor(a) };
+        LIVE[cpu].store(a as u64, Ordering::Relaxed);
+        RESTORES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The scheduler's switch-back hook (IF=0, the task just returned to the scheduler, its Box not yet requeued,
+    /// parked or freed). One relaxed load when no ring-3 FP state is live.
+    pub(super) fn switch_out(cpu: usize) {
+        if cpu < MAX_CPUS {
+            let p = LIVE[cpu].load(Ordering::Relaxed);
+            if p != 0 {
+                LIVE[cpu].store(0, Ordering::Relaxed);
+                unsafe {
+                    fxsave(p as *mut FpuArea);
+                    fxrstor(&INIT); // the scrub: no ring-3 x87/XMM residue reaches the next task
+                }
+                SAVES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        #[cfg(feature = "linuxabi")]
+        crate::arch::linuxabi::fpu::switch_out(cpu);
+    }
+
+    /// `tests fpu` (M3): BIG.ELF's `fpu` verb — two ring-3 tasks of one process (the program and one SYS_THREAD_SPAWN
+    /// worker on its core) each load xmm0..xmm15 and their own MXCSR, yield, and read them back, 64 rounds; then one
+    /// hardware-float computation held in registers across yields, checked bit-exactly. Exit status: low byte = pass
+    /// bits (0x80 the verb ran, 0x01 program xmm, 0x02 worker xmm, 0x04 both MXCSRs, 0x08 float math, 0x10 worker
+    /// joined), bits 8..23 = rounds in which the OTHER task moved across the yield (the observed interleave).
+    /// `:: FPU: osfxsr=<0|1> ctx_bytes=512 tasks=<n> switches=<n> xmm_survived=<ok|bad> mode=eager -> PASS|FAIL|SKIP ::`
+    pub fn selftest() {
+        use crate::arch::syscall::RunOutcome;
+        const PATH: &str = "/apps/BIG.ELF";
+        const ALL: u32 = 0x9F;
+        let mt = crate::shell::vfs_mount_table();
+        let full = crate::shell::vfs_path(PATH);
+        let Ok(st) = mt.stat(&full) else {
+            serial_println!(":: FPU: osfxsr=- ctx_bytes={} tasks=0 switches=0 xmm_survived=- mode=eager -> SKIP reason=no-big-bin ::", CTX_BYTES);
+            return;
+        };
+        let bytes = match mt.read(&full, 0, st.size as usize) {
+            Ok(b) if b.len() as u64 == st.size => b,
+            _ => {
+                serial_println!(":: FPU: osfxsr=- ctx_bytes={} tasks=0 switches=0 xmm_survived=- mode=eager -> FAIL reason=read ::", CTX_BYTES);
+                return;
+            }
+        };
+        let (s0, r0) = (SAVES.load(Ordering::Relaxed), RESTORES.load(Ordering::Relaxed));
+        let res = crate::arch::syscall::run_user_image_argv("fpu", &bytes, 10_000, &["big", "fpu"]);
+        let (saves, restores) = (SAVES.load(Ordering::Relaxed).wrapping_sub(s0), RESTORES.load(Ordering::Relaxed).wrapping_sub(r0));
+        let (outcome, status) = match res {
+            Ok((RunOutcome::Exited(s), _)) => ("exited", Some(s as u32)),
+            Ok((RunOutcome::Faulted, _)) => ("faulted", None),
+            Ok((RunOutcome::Timeout, _)) => ("timeout", None),
+            Err(e) => (e, None),
+        };
+        let bits = status.map(|s| s & 0xFF).unwrap_or(0);
+        let switches = status.map(|s| (s >> 8) & 0xFFFF).unwrap_or(0);
+        let tasks = if bits & 0x80 != 0 { 1 + (bits & 0x10 != 0) as u32 } else { 0 };
+        // The program's own SSE instructions ran without #UD: that is CR4.OSFXSR=1 on the cores it ran on.
+        let osfxsr = bits & 0x80 != 0;
+        let xmm_ok = bits & 0x07 == 0x07;
+        // Every yield of either task is one save and one restore here; 2 x 64 rounds is the floor.
+        let pass = bits == ALL && tasks == 2 && switches >= 1 && saves >= 128 && restores >= 128 && CTX_BYTES == 512;
+        serial_println!(
+            "[fpu] outcome={} status={:?} bits={:#x} saves={} restores={} osfxsr_cores={} cr4_flips={}",
+            outcome, status, bits, saves, restores, osfxsr_cores(), CR4_FLIPS.load(Ordering::Relaxed)
+        );
+        serial_println!(
+            ":: FPU: osfxsr={} ctx_bytes={} tasks={} switches={} xmm_survived={} mode=eager -> {} ::",
+            osfxsr as u8, CTX_BYTES, tasks, switches, if xmm_ok { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" }
+        );
+    }
+}
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// GATESTEAL2 (rmbp-ledger B667) — A SINGLETON THE RE-HOME CANNOT MOVE RESTARTS AT ITS LOOP HEAD.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// Flight 36 boot 1 (f36-boot1.log 00:11:49): `[pump] REHOME: c7 is dead and carried the usb-pump (tid 9): moved
+// ready=0 sleeping=4 left=0 current=-1`. `current=-1` is `SCHED[c7].current_tid == 0` — cleared at every switch-back
+// and set only at dispatch (the dispatch loop above) — so c7 ran NO task at that look, and the pump was in neither of
+// the two queues [`rehome_dead_core`] drains: it was PARKED on a wait queue (`park_blocked`'s PARK_WAITQ arm — a
+// Semaphore/Mutex/channel waiter list owns its Box), holding COMP_GATE across the park. It woke ON c7 one pass later
+// (`[pump] wedge cleared`, then PUMPWEDGE `pump=9@cpu7` again): c7 dispatches. Boot 2 (00:16:28) is the same pump,
+// parked in its net-hda step, with no gate and no steal at all.
+//
+// THE CHOICE: a fresh start at the loop head, never a frame move. A task CURRENT on a dead core has its registers live
+// on that CPU and a `ctx_rsp` stale since its last switch; the W5 NMI (`interrupts.rs` `nmi_handler`) records rip/cs and
+// returns to the same instruction, so there is no stopped frame to copy, and copying a stack another CPU may still be
+// executing is a second runner on one stack. A PARKED task's Box belongs to a wait queue another core may `post()` at
+// any moment, so no third core may take it. The usb-pump's loop allows the restart: its body (main.rs `usb_pump`) is a
+// stateless poll — every step a one-shot latch or an idempotent service, the prologue's two task starts latched
+// (`xhci::poll_task_start` swaps POLL_TASK) — and its only per-instance state is the `cpu` arg.
+//
+// So the pump REGISTERS itself ([`singleton_register`], its prologue) and [`singleton_restart`] spawns a fresh instance
+// with the same name, entry and priority pinned to the live core (arg = that core) and publishes its tid. The old
+// instance is FENCED, not killed: [`singleton_superseded`] (one load + `current_id`, at the pump's loop top and at the end
+// of each long step) returns `true` to it, and it returns from `usb_pump` — an ordinary task exit — the first time it gets
+// there. Until then it may finish the step it was parked in; the fence points sit at the end of every long step, so a
+// woken revenant runs at most the remainder of that one step beside the fresh instance. Callers: [`rehome_dead_core`]
+// (the singleton on the dead core in no queue) and the pump watch on a stealless wedge (sessionwedge.rs, owed — see the
+// arc's report). `tests gatesteal2` below.
+
+static SGL_TID: AtomicU64 = AtomicU64::new(0);
+static SGL_ENTRY: AtomicUsize = AtomicUsize::new(0);
+static SGL_NAME_PTR: AtomicUsize = AtomicUsize::new(0);
+static SGL_NAME_LEN: AtomicUsize = AtomicUsize::new(0);
+static SGL_PRIO: AtomicU8 = AtomicU8::new(PRIO_NORMAL);
+/// The core the singleton lives on; `usize::MAX` = none registered. The restart CASes it, so one death restarts once.
+static SGL_HOME: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SGL_STAMPS: AtomicU64 = AtomicU64::new(0);
+static SGL_LAST_MS: AtomicU64 = AtomicU64::new(0);
+static SGL_LAST_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SGL_RESTARTS: AtomicU32 = AtomicU32::new(0);
+static SGL_RESTART_OLD: AtomicU64 = AtomicU64::new(0);
+/// The fresh instance's first stamp (`arch::ms`), 0 until it stamps.
+static SGL_FRESH_MS: AtomicU64 = AtomicU64::new(0);
+static SGL_REVENANTS: AtomicU32 = AtomicU32::new(0);
+
+fn sgl_name() -> &'static str {
+    let p = SGL_NAME_PTR.load(Ordering::Acquire);
+    let n = SGL_NAME_LEN.load(Ordering::Acquire);
+    if p == 0 {
+        return "singleton";
+    }
+    // SAFETY: `p`/`n` were taken from a `&'static str` in `singleton_register`.
+    unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(p as *const u8, n)) }
+}
+
+/// GATESTEAL2 — register the CALLING task as the restartable singleton (the usb-pump's prologue). A no-op off a
+/// scheduled task.
+pub fn singleton_register(name: &'static str, entry: fn(usize), prio: u8) {
+    let Some(tid) = current_id() else { return };
+    SGL_NAME_PTR.store(name.as_ptr() as usize, Ordering::Release);
+    SGL_NAME_LEN.store(name.len(), Ordering::Release);
+    SGL_ENTRY.store(entry as usize, Ordering::Release);
+    SGL_PRIO.store(prio, Ordering::Relaxed);
+    SGL_HOME.store(meter_current_cpu(), Ordering::Release);
+    SGL_TID.store(tid, Ordering::Release);
+}
+
+/// GATESTEAL2 — the revenant fence and the singleton's liveness stamp. `true` = the calling task was superseded by a
+/// restart and must return from its entry now (it says so once); `false` stamps ms, core and count.
+pub fn singleton_superseded() -> bool {
+    let Some(me) = current_id() else { return false };
+    let reg = SGL_TID.load(Ordering::Acquire);
+    if reg != 0 && reg != me {
+        SGL_REVENANTS.fetch_add(1, Ordering::Release);
+        serial_println!(
+            "[sched] singleton revenant tid={} exits at its loop head on c{} (superseded by tid={}) (GATESTEAL2 B667)",
+            me,
+            meter_current_cpu(),
+            reg
+        );
+        return true;
+    }
+    let now = crate::arch::ms().max(1);
+    SGL_LAST_MS.store(now, Ordering::Relaxed);
+    SGL_LAST_CPU.store(meter_current_cpu(), Ordering::Relaxed);
+    SGL_STAMPS.fetch_add(1, Ordering::Relaxed);
+    if SGL_FRESH_MS.load(Ordering::Relaxed) == 0 && SGL_RESTARTS.load(Ordering::Relaxed) != 0 {
+        let _ = SGL_FRESH_MS.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed);
+    }
+    false
+}
+
+/// GATESTEAL2 — restart the registered singleton on `live` when it lives on `from`: a fresh instance at its loop head
+/// (see the block above). Returns `(superseded tid, fresh tid)`, or `None` when nothing is registered, it does not live
+/// on `from`, `live` does not dispatch or is parked by name, or another caller already restarted it for this death.
+pub fn singleton_restart(from: usize, live: usize) -> Option<(u64, u64)> {
+    let old = SGL_TID.load(Ordering::Acquire);
+    let entry = SGL_ENTRY.load(Ordering::Acquire);
+    if old == 0 || entry == 0 || from >= MAX_CPUS || live >= MAX_CPUS || from == live || !cpu_dispatching(live) || is_dead_core(live) {
+        return None;
+    }
+    if SGL_HOME.compare_exchange(from, live, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return None;
+    }
+    // SAFETY: `entry` was stored from a `fn(usize)` in `singleton_register`; fn pointers round-trip through usize.
+    let f: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(entry) };
+    let name = sgl_name();
+    let new = spawn_inner(name, f, live, live, SGL_PRIO.load(Ordering::Relaxed), TASK_STACK_SIZE, None, None);
+    SGL_TID.store(new, Ordering::Release);
+    SGL_FRESH_MS.store(0, Ordering::Release);
+    SGL_RESTART_OLD.store(old, Ordering::Relaxed);
+    SGL_RESTARTS.fetch_add(1, Ordering::AcqRel);
+    serial_println!(
+        ":: [sched] RESTART: {} tid={} on c{} in no queue the re-home could drain -> tid={} on c{} at its loop head (GATESTEAL2 B667: a fresh start, never a frame move; the old instance exits at its next fence) ::",
+        name,
+        old,
+        from,
+        new,
+        live
+    );
+    Some((old, new))
+}
+
+// ── `tests gatesteal2` — a synthetic W5 death of the pump's core with the pump parked mid-step ─────────────────────
+
+static HOLD2_SEM: Semaphore = Semaphore::new(0);
+static HOLD2_ARMED: AtomicBool = AtomicBool::new(false);
+/// 0 = not held, 1 = parked on the fixture's semaphore, 2 = released.
+static HOLD2_STATE: AtomicU8 = AtomicU8::new(0);
+
+/// GATESTEAL2 — is the fixture's park armed for the CALLING task (the registered singleton)? One relaxed load when not.
+pub fn singleton_hold_armed() -> bool {
+    HOLD2_ARMED.load(Ordering::Relaxed) && current_id() == Some(SGL_TID.load(Ordering::Acquire))
+}
+
+/// GATESTEAL2 — the fixture's mid-step park: the singleton blocks on a semaphore (PARK_WAITQ: in no run queue, in no
+/// sleeper list, not current — flight 36's shape) until `tests gatesteal2` posts it.
+pub fn singleton_hold_maybe() {
+    if !singleton_hold_armed() || !HOLD2_ARMED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    HOLD2_STATE.store(1, Ordering::Release);
+    let _ = HOLD2_SEM.wait();
+    HOLD2_STATE.store(2, Ordering::Release);
+}
+
+#[cfg(feature = "wc")]
+fn hold2_wait(ms: u64, mut f: impl FnMut() -> bool) -> bool {
+    let t0 = crate::arch::ms();
+    loop {
+        if f() {
+            return true;
+        }
+        if crate::arch::ms().saturating_sub(t0) >= ms {
+            return false;
+        }
+        sleep_ms(10);
+    }
+}
+
+/// GATESTEAL2 — register `tests gatesteal2` once (from `tests::ensure_*`, never run at boot, R80).
+#[cfg(feature = "wc")]
+pub fn gatesteal2_ensure_tests() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if !DONE.swap(true, Ordering::AcqRel) {
+        crate::tests::register("gatesteal2", gatesteal2_selftest);
+    }
+}
+
+/// `:: GATESTEAL2: death=c<n> current=<tid> moved_current=<0|1> rehome=<steal|watch|none> pump_alive_ms=<n>
+/// gate_released_steps=<n> -> PASS|FAIL|SKIP :: new_tid= live=c<n> was=parked door=<alive|stale> revenant=<exited|stuck>
+/// wedge_rehome=<wedge|none|unparked> wedge_current=<tid> wedge_from=c<n> wedge_live=c<n> wedge_restart_ms=<n>
+/// wedge_revenant=<exited|stuck> deaths=<n>`. LEG 2 (M2) parks the fresh pump again and lets the watch's PUMPWEDGE edge
+/// restart it with no death published (`rehome=wedge`); `wedge_restart_ms` runs from the park, so it carries the 2 s
+/// wedge bound. The pump parks at the end of its store-services step after one
+/// composite (declined by the pump-lane rule: `gate=released`); the fixture publishes a death of the pump's core through
+/// the steal's own gauges (`wm::comp_death_publish_fixture`) and drives the watch (`sessionwedge::look`), which re-homes
+/// through [`rehome_dead_core`] -> [`singleton_restart`]. PASS iff the restart superseded the parked tid, the fresh
+/// instance stamped on a live core within 500 ms of the death, it kept stamping (and `xhci-poll` is armed) — the door's
+/// cadence — the revenant exited at its fence once released, and at least one long step released the gate. Go-red by
+/// mutation: `sgl_moved = true` in `rehome_dead_core` -> `moved_current=0 rehome=none -> FAIL`.
+#[cfg(feature = "wc")]
+fn gatesteal2_selftest() {
+    let old = SGL_TID.load(Ordering::Acquire);
+    let dead = SGL_HOME.load(Ordering::Acquire);
+    if old == 0 || dead >= MAX_CPUS {
+        serial_println!(":: GATESTEAL2: death=- current=- moved_current=0 rehome=none pump_alive_ms=- gate_released_steps=- -> SKIP :: reason=no-singleton");
+        return;
+    }
+    if sibling_online_cpu(dead) == dead {
+        serial_println!(":: GATESTEAL2: death=c{} current={} moved_current=0 rehome=none pump_alive_ms=- gate_released_steps=- -> SKIP :: reason=no-sibling-core", dead, old);
+        return;
+    }
+    HOLD2_SEM.init();
+    let restarts0 = SGL_RESTARTS.load(Ordering::Acquire);
+    let rev0 = SGL_REVENANTS.load(Ordering::Acquire);
+    HOLD2_STATE.store(0, Ordering::Release);
+    HOLD2_ARMED.store(true, Ordering::Release);
+    let held = hold2_wait(3_000, || HOLD2_STATE.load(Ordering::Acquire) == 1);
+    if !held {
+        HOLD2_ARMED.store(false, Ordering::Release);
+        serial_println!(":: GATESTEAL2: death=c{} current={} moved_current=0 rehome=none pump_alive_ms=- gate_released_steps={} -> FAIL :: hold=none reason=the-pump-never-reached-its-store-services-fence", dead, old, crate::video::wm::pump_gate_released_steps());
+        return;
+    }
+    // The park's switch-back clears the core's published tid: wait for it, so the death finds the pump parked.
+    let _ = hold2_wait(50, || current_task_id(dead) != Some(old));
+    let t_death = crate::arch::ms();
+    crate::video::wm::comp_death_publish_fixture(dead);
+    let restarted = hold2_wait(1_500, || {
+        crate::sessionwedge::look(crate::arch::ms());
+        SGL_RESTARTS.load(Ordering::Acquire) != restarts0 && SGL_FRESH_MS.load(Ordering::Acquire) != 0
+    });
+    let moved_current = restarted && SGL_RESTART_OLD.load(Ordering::Relaxed) == old;
+    let alive_ms = if restarted { SGL_FRESH_MS.load(Ordering::Acquire).saturating_sub(t_death) } else { 0 };
+    let new = SGL_TID.load(Ordering::Acquire);
+    let live = SGL_HOME.load(Ordering::Acquire);
+    let live_ok = restarted && live != dead && SGL_LAST_CPU.load(Ordering::Relaxed) == live;
+    let s1 = SGL_STAMPS.load(Ordering::Relaxed);
+    sleep_ms(1_000);
+    let door = SGL_STAMPS.load(Ordering::Relaxed) > s1 && crate::drivers::xhci::poll_task_armed();
+    HOLD2_SEM.post();
+    let revenant = hold2_wait(1_500, || SGL_REVENANTS.load(Ordering::Acquire) != rev0);
+    let by1 = crate::sessionwedge::gatesteal2_rehome().0;
+    // LEG 2 — M2, the wedge with NO steal (flight 36 boot 2): park the fresh pump again and let the watch's PUMPWEDGE
+    // edge (2 s of silence, `sessionwedge::look`) restart it — no death is published. The leg's wedge reads
+    // `-> SEEN :: fixture=1`.
+    crate::sessionwedge::gatesteal2_wedge_leg(true);
+    let restarts1 = SGL_RESTARTS.load(Ordering::Acquire);
+    let rev1 = SGL_REVENANTS.load(Ordering::Acquire);
+    let old2 = SGL_TID.load(Ordering::Acquire);
+    let from2 = SGL_HOME.load(Ordering::Acquire);
+    HOLD2_STATE.store(0, Ordering::Release);
+    HOLD2_ARMED.store(true, Ordering::Release);
+    let held2 = hold2_wait(3_000, || HOLD2_STATE.load(Ordering::Acquire) == 1);
+    HOLD2_ARMED.store(false, Ordering::Release);
+    let t_park2 = crate::arch::ms();
+    let wedged = held2
+        && hold2_wait(4_000, || {
+            crate::sessionwedge::look(crate::arch::ms());
+            SGL_RESTARTS.load(Ordering::Acquire) != restarts1 && SGL_FRESH_MS.load(Ordering::Acquire) != 0
+        });
+    let (by2, deaths) = crate::sessionwedge::gatesteal2_rehome();
+    let wedge_ok = wedged && by2 == 2 && SGL_RESTART_OLD.load(Ordering::Relaxed) == old2 && SGL_HOME.load(Ordering::Acquire) != from2;
+    let wedge_ms = if wedged { SGL_FRESH_MS.load(Ordering::Acquire).saturating_sub(t_park2) } else { 0 };
+    if held2 {
+        HOLD2_SEM.post();
+    }
+    let revenant2 = held2 && hold2_wait(1_500, || SGL_REVENANTS.load(Ordering::Acquire) != rev1);
+    crate::sessionwedge::gatesteal2_wedge_leg(false);
+    let steps = crate::video::wm::pump_gate_released_steps();
+    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1 && wedge_ok && revenant2;
+    serial_println!(
+        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} revenant={} wedge_rehome={} wedge_current={} wedge_from=c{} wedge_live=c{} wedge_restart_ms={} wedge_revenant={} deaths={}",
+        dead,
+        old,
+        moved_current as u8,
+        if restarted { if by1 == 1 { "steal" } else { "watch" } } else { "none" },
+        alive_ms,
+        steps,
+        if ok { "PASS" } else { "FAIL" },
+        if restarted { new as i64 } else { -1 },
+        if restarted { live as i64 } else { -1 },
+        if door { "alive" } else { "stale" },
+        if revenant { "exited" } else { "stuck" },
+        if wedge_ok { "wedge" } else if held2 { "none" } else { "unparked" },
+        old2,
+        from2 as i64,
+        if wedge_ok { SGL_HOME.load(Ordering::Acquire) as i64 } else { -1 },
+        wedge_ms,
+        if revenant2 { "exited" } else { "stuck" },
+        deaths
+    );
 }

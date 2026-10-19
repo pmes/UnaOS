@@ -31,7 +31,7 @@
 //! [`PANE_Y`], under a title band carrying the tab's name. Column focus: Up/Down move the tab; Tab moves focus
 //! between the column and the pane. Wire: `[settings] tabs=left col_w=<n> rows=<n> sel=<name>` once per open. Users = list + Add / Delete (two-step) / Reset password, every action a
 //! `[settings] users op= name= ok= reason=` line; Display = brightness (BRIGHTFLOOR M5), idle blank, UI scale (read-only: the compositor fixes it at
-//! takeover), clock (fixed: CLOCKBAR has no runtime switch); About = version, board, CPUs, RAM, uptime.
+//! takeover), low battery shutdown (SETTINGSMAP: the row the fixed-clock caption held); About = version, board, CPUs, RAM, uptime.
 //!
 //! SETTINGSCRAFT (rmbp-ledger B630): the window is drawn with GLASSKIT's kit (`video::draw`), DESIGN-LANGUAGE §3.4's
 //! Settings: a sidebar (the user card, a search field that filters the tab names, one 28-px pill per tab with a drawn
@@ -45,6 +45,12 @@
 //! A11YPANE (rmbp-ledger B655): the Accessibility tab (the last) — Reduce motion, Increase contrast, Cursor size, Text
 //! size — the four `system.accessibility.*` keys, applied as atomics the glass reads (`motion::reduced`,
 //! `cursor::block_scale`), loaded at login and followed on PrefChanged; `tests a11y`.
+//!
+//! SETTINGSMAP (rmbp-ledger B673, BP-bar-17, R118): ONE table, [`MAP`], names every Settings row — the Principia keys it
+//! edits, its tab and row, its label — and every `prefs::key::ALL` key is on exactly one row (`system.settings.tab`'s
+//! row is the tab column itself). The search field at the column's top reads it: typing filters the column to the tabs
+//! whose name or a row's label holds the text, and Return opens [`search_best`]'s hit — the row's tab with its control
+//! selected and the row ringed in the accent. The launcher's [`row_of_key`] reads the same table. `tests settingsmap`.
 //!
 //! REASK (rmbp-ledger B681, R130 law 2): the Privacy tab (the last) — one row per decision the user made (an answered ask
 //! kept in Principia's store, `prefs::decisions`), each with a Revoke; the revoke is latched and run on [`service`]
@@ -196,6 +202,8 @@ struct State {
     frame: draw::motion::Frame,
     now: u64,
     tab: usize,
+    /// SETTINGSMAP (B673): the `(tab, row)` the search's Return opened, ringed until the next press, key or tab switch.
+    found: Option<(u8, u8)>,
 }
 
 impl State {
@@ -203,7 +211,7 @@ impl State {
         State {
             sel, strip, col_top, col_hover: None, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf,
             query: String::new(), search: false, kbd: false, ptr: None, press: None, hits: Vec::new(), hot: None,
-            glides: draw::motion::Glides::new(), frame: draw::motion::Frame::new(), now: 0, tab: 0,
+            glides: draw::motion::Glides::new(), frame: draw::motion::Frame::new(), now: 0, tab: 0, found: None,
         }
     }
 }
@@ -488,7 +496,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); privacy_service(); } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -924,6 +932,7 @@ fn paint(st: &mut State, v: &Values) {
         t if t as usize == PRIV_TAB => paint_privacy(st), // REASK (B681)
         _ => paint_about(st),
     }
+    if let Some((t, r)) = st.found { if t as usize == tab { found_ring(st, r as usize); } } // SETTINGSMAP (B673): the row the search opened
     // SETTINGSFILES (B407, R98): the pane's file, as a link (the accent ink) that reveals `<home>/settings` in Quarry.
     if let Some((r, x, t)) = super::settingsfiles::footer(v.tab as usize, ROWS, CTRL_R, LABEL_X) {
         txt_ink(st, x, r, &t, theme::accent());
@@ -933,7 +942,7 @@ fn paint(st: &mut State, v: &Values) {
 
 fn paint_general(st: &mut State, v: &Values) {
     // BRIGHTFLOOR M5: Brightness moved to the Display tab. SETTINGSCRAFT: Sound · Desktop · Account · Dock, four boxes.
-    groups(st, &[(0, 1), (2, 4), (5, 5), (6, 7)]);
+    groups(st, &[(0, 1), (2, 4), (5, 5), (6, 8)]); // SETTINGSMAP (B673): the Dock box holds the pins row (8)
     let (k, sel) = (st.kbd && !st.strip, st.sel);
     let fo = move |i: usize| k && sel == i;
     txt(st, LABEL_X, 0, "Volume");
@@ -957,7 +966,7 @@ fn paint_general(st: &mut State, v: &Values) {
 }
 
 fn paint_display(st: &mut State, v: &Values) {
-    groups(st, &[(0, 1), (2, 3), (4, 7), (8, 8)]);
+    groups(st, &[(0, 1), (2, 2), (3, 3), (4, 7), (8, 8)]);
     let (k, sel) = (st.kbd && !st.strip, st.sel);
     let fo = move |i: usize| k && sel == i;
     // BRIGHTFLOOR M5: Brightness lives here (row 0) — where Peter looked for it on flight 19.
@@ -973,8 +982,13 @@ fn paint_display(st: &mut State, v: &Values) {
     txt2(st, VAL_X, 1, &it);
     txt(st, LABEL_X, 2, "Resolution"); // PREFSUI (R93): the popup of the modes the display path can set (was the read-only UI scale row)
     mode_field(st);
-    txt(st, LABEL_X, 3, "Menu bar clock");
-    txt2(st, TRACK_X, 3, "24-hour (fixed: no runtime switch)");
+    // SETTINGSMAP (B673): `system.power.lowbat_shutdown_pct` gets its row here, in place of the fixed-clock caption (a row
+    // that held no key): - / + in steps of LOWBAT_STEP, 0 = off; the store write is drained by `lowbat_service`.
+    txt(st, LABEL_X, LOWBAT_ROW, "Low battery shutdown");
+    btn(st, LOWBAT_ROW, TRACK_X, "-");
+    btn(st, LOWBAT_ROW, TRACK_X + BTN_W + 10, "+");
+    let lb = lowbat_now();
+    txt2(st, TRACK_X + 2 * BTN_W + 24, LOWBAT_ROW, &if lb == 0 { String::from("Off") } else { alloc::format!("at {}%", lb) });
     // KERNELFONT M3 (B359) -> KERNELFONT2 M4 (B363): the Font row is a PICKER — the family as three segments and the
     // size as - / + — writing Principia's `system.display.font` / `font_size` (`video::text` follows them within a
     // second and every window repaints once); the faces drawing now and a sample line IN the UI face below.
@@ -1320,6 +1334,7 @@ fn switch_tab(t: usize) {
         st.u = UsersUi::new();
         st.strip = true;
         st.modes_open = false;
+        st.found = None;
         if let Some(&c) = tab_ctrls(t).first() { st.sel = c; }
         let (list, n) = col_list(&st.query); // SETTINGSCRAFT: the chosen row is kept in view of the (filtered) column
         if let Some(p) = list[..n].iter().position(|&k| k as usize == t) { st.col_top = col_scrolled(st.col_top, p, n); }
@@ -1343,12 +1358,13 @@ fn name_matches(name: &str, q: &str) -> bool {
     q.is_empty() || name.as_bytes().windows(q.len()).any(|w| w.eq_ignore_ascii_case(q.as_bytes()))
 }
 
-/// The tabs the column lists for the search text `q`, in column order, and how many.
+/// The tabs the column lists for the search text `q`, in column order, and how many. SETTINGSMAP (B673): a tab is
+/// listed when its name holds `q` or one of its rows' labels does ([`MAP`]).
 fn col_list(q: &str) -> ([u8; TABS], usize) {
     let mut out = [0u8; TABS];
     let mut n = 0;
     for (k, name) in TAB_NAMES.iter().enumerate() {
-        if name_matches(name, q) { out[n] = k as u8; n += 1; }
+        if name_matches(name, q) || MAP.iter().any(|r| r.tab == k && hold_rank(r.label, q).is_some()) { out[n] = k as u8; n += 1; }
     }
     (out, n)
 }
@@ -1469,7 +1485,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     use crate::video::keymap::Action;
     if let crate::pal::Event::Wheel(d) = ev { return wheel(d); } // SETTINGSCRAFT: the wheel goes by the pointer, not the focus
     if !is_open() || wm::focus_asid() != OWNER { return false; }
-    let searching = STATE.lock().as_mut().map(|x| { x.kbd = true; x.search }).unwrap_or(false); // SETTINGSCRAFT: a key shows the focus ring
+    let searching = STATE.lock().as_mut().map(|x| { x.kbd = true; x.found = None; x.search }).unwrap_or(false); // SETTINGSCRAFT: a key shows the focus ring
     if searching { return search_key(ev); }
     let (s, strip) = STATE.lock().as_ref().map(|x| (x.sel, x.strip)).unwrap_or((0, true));
     let tab = cur_tab();
@@ -1557,9 +1573,11 @@ fn strip_step(tab: usize, down: bool) {
 
 /// SETTINGSCRAFT: a key while the search field holds the keys — type to filter, Backspace, Enter opens the first
 /// match, Esc clears and leaves, Down leaves to the column. Every key is consumed (the field has the keyboard).
+/// SETTINGSMAP (B673): Return opens [`search_best`]'s hit (a row, or a tab); the first listed tab only when none.
 fn search_key(ev: crate::pal::Event) -> bool {
     let crate::pal::Event::Key(c) = ev else { return true };
     let mut pick = None;
+    let mut hit = None;
     {
         let mut g = STATE.lock();
         let Some(x) = g.as_mut() else { return true };
@@ -1570,7 +1588,8 @@ fn search_key(ev: crate::pal::Event) -> bool {
                 let (list, n) = col_list(&x.query);
                 x.search = false;
                 x.strip = true;
-                if n > 0 { pick = Some(list[0] as usize); }
+                hit = if c == 0x1F { None } else { search_best(&x.query) };
+                if hit.is_none() && n > 0 { pick = Some(list[0] as usize); }
                 x.col_top = 0;
             }
             0x20..=0x7e => { if x.query.len() < 24 { x.query.push(c as char); x.col_top = 0; } }
@@ -1579,6 +1598,7 @@ fn search_key(ev: crate::pal::Event) -> bool {
     }
     let q = STATE.lock().as_ref().map(|x| x.query.clone()).unwrap_or_default();
     serial_println!("[settings] search q={} matches={}", q, col_list(&q).1);
+    if let Some(h) = hit { open_hit(h, q.len()); return true; }
     match pick {
         Some(t) if t != cur_tab() => switch_tab(t),
         _ => repaint(),
@@ -1651,7 +1671,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
     // press anywhere but the search field takes the keys back from it; the focus ring hides until the next key.
     let in_search = cx >= SEARCH_X && cx < SEARCH_X + SEARCH_W && cy >= SEARCH_Y && cy < SEARCH_Y + SEARCH_H;
     let (top, query) = match STATE.lock().as_mut() {
-        Some(s) => { s.press = Some((cx, cy, crate::arch::ms().max(1))); s.kbd = false; s.search = in_search; (s.col_top, s.query.clone()) }
+        Some(s) => { s.press = Some((cx, cy, crate::arch::ms().max(1))); s.kbd = false; s.search = in_search; s.found = None; (s.col_top, s.query.clone()) }
         None => return true,
     };
     if cx < COL_W { // SETTINGSTABS (B623): a press in the column selects by row
@@ -1683,6 +1703,8 @@ pub fn press_route(x: i32, y: i32) -> bool {
             if row == 4 && cx >= TRACK_X && cx < TRACK_X + TRACK_W { select(9); set_font(9, ((cx - TRACK_X) / (TRACK_W / 3)).min(2) as i64); } // KERNELFONT2: the family segments
             if row == 5 && cx >= TRACK_X && cx < TRACK_X + BTN_W { select(10); set_font(10, (font_size() - 1).max(FONT_MIN)); } // KERNELFONT2: size −
             if row == 5 && cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 { select(10); set_font(10, (font_size() + 1).min(FONT_MAX)); } // size +
+            if row == LOWBAT_ROW && cx >= TRACK_X && cx < TRACK_X + BTN_W { lowbat_step(false); } // SETTINGSMAP (B673): low battery -
+            if row == LOWBAT_ROW && cx >= TRACK_X + BTN_W + 10 && cx < TRACK_X + 2 * BTN_W + 10 { lowbat_step(true); } // low battery +
         }
         _ => {}
     }
@@ -2493,6 +2515,10 @@ fn paint_dock_rows(st: &mut State) {
     seg(st, 6, &[DOCK_POS_NAMES[0].as_bytes(), DOCK_POS_NAMES[1].as_bytes(), DOCK_POS_NAMES[2].as_bytes()], p, false);
     txt(st, LABEL_X, 7, "Automatically hide the dock");
     tog(st, 7, TOG_X, super::dock::autohide(), false);
+    // SETTINGSMAP (B673): `system.dock.pins`' row — the pinned set is edited on the dock itself (its tile menu, a drag);
+    // the row says how many it holds.
+    txt(st, LABEL_X, 8, "Dock pins");
+    txt2(st, TRACK_X, 8, &alloc::format!("{} pinned (edited on the dock)", super::dock::pins_pinned()));
 }
 
 fn dock_rows_press(row: usize, cx: usize) {
@@ -2815,15 +2841,9 @@ const AT_FIRST: usize = 0xFF;
 
 /// The tab and control a `system.*` schema key lives on (`AT_FIRST` = the tab's first control).
 pub fn row_of_key(key: &str) -> (usize, usize) {
+    if let Some(r) = MAP.iter().find(|r| r.tab < TABS && r.keys.contains(&key)) { return (r.tab, r.ctrl); } // SETTINGSMAP (B673): the one table
     match key {
-        "display.brightness" => (2, 0),
-        "display.idle_min" => (2, 3),
-        "display.font" => (2, 9),
-        "display.font_size" => (2, 10),
-        "audio.volume" | "audio.amp_holdoff_ms" => (0, 1),
-        "audio.mute" => (0, 2),
-        "pointer.speed" => (0, 4),
-        "display.wallpaper" => (0, 5),
+        "audio.amp_holdoff_ms" => (0, 1),
         k if k.starts_with("display.") => (2, AT_FIRST),
         k if k.starts_with("login.") => (4, AT_FIRST),
         k if k.starts_with("accessibility.") => (A11Y_TAB, AT_FIRST), // A11YPANE (B655)
@@ -2940,13 +2960,19 @@ fn press_notifypane(row: usize, cx: usize) {
 
 /// The File Types tab's index: the LAST tab (APPEARANCE B408 holds index 5 at the fold; this one is then 6).
 pub const FT_TAB: usize = 7; // merge18: NOTIFYPANE (B435) is the last tab (8)
-const FT_ROWS: usize = 8;
+const FT_ROWS: usize = 7; // SETTINGSMAP (B673): row 8 is the sidebar favorites row
+const FT_FAV_ROW: usize = 8;
 const FT_NAV_ROW: usize = 9;
 const FT_PREV_X: usize = TRACK_X;
 const FT_NEXT_X: usize = TRACK_X + 2 * BTN_W + 40;
 static FT_PAGE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 fn paint_filetypes(st: &mut State) {
+    // SETTINGSMAP (B673): `system.quarry.favorites`' row — Quarry's sidebar folders, added by a drag onto the sidebar.
+    groups(st, &[(FT_FAV_ROW, FT_FAV_ROW)]);
+    let favs = crate::prefs::text(crate::prefs::key::QUARRY_FAVORITES).map_or(0, |t| t.split(',').filter(|f| f.trim().starts_with('/')).count());
+    txt(st, LABEL_X, FT_FAV_ROW, "Sidebar favorites");
+    txt2(st, TRACK_X, FT_FAV_ROW, &alloc::format!("{} added (drag a folder onto Quarry's sidebar)", favs));
     let v = crate::fs::assoc::view();
     let preferred = v.iter().filter(|r| !r.preferred.is_empty()).count();
     txt2(st, LABEL_X, 0, &alloc::format!("File types ({}, {} with an app). Click a type to change its app:", v.len(), preferred));
@@ -3039,7 +3065,8 @@ pub fn reduce_motion() -> bool {
     A11Y_REDUCE.load(Ordering::Relaxed)
 }
 
-/// Increase contrast, as applied (the theme's read: `text.secondary` -> `text.primary`, `line.*` -> `line.control`).
+/// Increase contrast, as applied: the switch `theme::tok` asks to answer from `palette_core::contrast`'s token set in
+/// place of the standard pairs (one table, both sets; no painter keeps its own high-contrast rule).
 #[inline]
 pub fn increase_contrast() -> bool {
     A11Y_CONTRAST.load(Ordering::Relaxed)
@@ -3095,7 +3122,7 @@ fn a11y_load(via: &str) {
 fn a11y_set(row: usize, val: usize, store: bool) {
     let (name, vtxt, applied) = match row {
         0 => { A11Y_REDUCE.store(val != 0, Ordering::Relaxed); ("reduce_motion", alloc::format!("{}", (val != 0) as u8), true) }
-        1 => { A11Y_CONTRAST.store(val != 0, Ordering::Relaxed); ("increase_contrast", alloc::format!("{}", (val != 0) as u8), true) }
+        1 => { A11Y_CONTRAST.store(val != 0, Ordering::Relaxed); let _ = super::theme::set_contrast(val != 0); /* CONTRAST (B664): the theme takes the set and bumps its epoch, so chrome, menus and the generated wallpaper redraw as an accent change does. ⚠ LINE-NEUTRAL append. */ ("increase_contrast", alloc::format!("{}", (val != 0) as u8), true) }
         2 => { let q = (val.min(255) as u8).clamp(A11Y_CURSOR_MIN_Q, A11Y_CURSOR_MAX_Q); A11Y_CURSOR_Q.store(q, Ordering::Relaxed); ("cursor_size", alloc::format!("x{}", a11y_cursor_str(q)), super::cursor::armed()) }
         3 => { let s = val.min(A11Y_TEXT_NAMES.len() - 1); A11Y_TEXT.store(s as u8, Ordering::Relaxed); ("text_size", alloc::format!("{} ({} px)", A11Y_TEXT_NAMES[s], A11Y_TEXT_PX[s]), true) }
         _ => return,
@@ -3211,7 +3238,8 @@ pub fn selftest_a11y() {
 }
 
 // ── REASK (rmbp-ledger B681, R130 law 2) — the Privacy tab ────────────────────────────────────────────────────────
-// Row 0 says what the list is; rows 1..=PRIV_ROWS one decision each (`<domain>: <subject's leaf>`, the answer and its
+// Row 0 is the tab's one MAP row: `Remember my answers` (`system.privacy.remember`, a switch; off = a new answer is not
+// kept) with the count of answers kept; rows 1..=PRIV_ROWS one decision each (`<domain>: <subject's leaf>`, the answer and its
 // date, a Revoke at the right); the row after them `+<n> more`. Revoke is LATCHED in the click router and run by
 // [`privacy_service`] on the service pass (`prefs::revoke` saves a domain file — never in the router).
 
@@ -3224,11 +3252,25 @@ const PRIV_ROWS: usize = 8;
 const PRIV_REVOKE_X: usize = CTRL_R - BTN_W;
 /// A revoke the router latched (the decision's key), run by [`privacy_service`].
 static PRIV_REVOKE: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
+/// The Remember switch: the value this window last chose (`u32::MAX` = read the store) and its owed store write.
+static PRIV_REMEMBER_SHOWN: AtomicU32 = AtomicU32::new(u32::MAX);
+static PRIV_REMEMBER_OWED: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Are new answers kept? This window's last choice, else the store's (default on).
+fn privacy_remember() -> bool {
+    match PRIV_REMEMBER_SHOWN.load(Ordering::Relaxed) {
+        u32::MAX => crate::prefs::flag(crate::prefs::key::PRIVACY_REMEMBER).unwrap_or(true),
+        v => v != 0,
+    }
+}
 
 fn paint_privacy(st: &mut State) {
     let d = crate::prefs::decisions();
-    txt2(st, LABEL_X, 0, &alloc::format!("Answers you gave ({}). UnaOS does not ask again unless you revoke one.", d.len()));
-    groups(st, &[(1, d.len().clamp(1, PRIV_ROWS))]);
+    let on = privacy_remember();
+    groups(st, &[(0, 0), (1, d.len().clamp(1, PRIV_ROWS))]);
+    txt(st, LABEL_X, 0, "Remember my answers");
+    tog(st, 0, TOG_X, on, false);
+    txt2(st, TRACK_X, 0, &alloc::format!("{} kept; revoke one to be asked again", d.len()));
     if d.is_empty() {
         txt2(st, LABEL_X, 1, "None yet: an ask you answer is kept here.");
     }
@@ -3252,6 +3294,14 @@ fn paint_privacy(st: &mut State) {
 
 /// A press on the Privacy tab: a row's Revoke latches that decision's key (no store write in the router).
 fn press_privacy(row: usize, cx: usize) {
+    if row == 0 {
+        let v = !privacy_remember();
+        PRIV_REMEMBER_SHOWN.store(v as u32, Ordering::Relaxed);
+        PRIV_REMEMBER_OWED.store(v as u32, Ordering::Release);
+        say("privacy.remember", if v { "true" } else { "false" }, true);
+        repaint();
+        return;
+    }
     if !(1..=PRIV_ROWS).contains(&row) || cx < PRIV_REVOKE_X || cx >= PRIV_REVOKE_X + BTN_W {
         return;
     }
@@ -3265,10 +3315,260 @@ fn press_privacy(row: usize, cx: usize) {
 
 /// The service pass: run a latched Revoke, repaint the open Privacy pane.
 fn privacy_service() {
+    let v = PRIV_REMEMBER_OWED.swap(u32::MAX, Ordering::AcqRel);
+    if v != u32::MAX {
+        crate::prefs::set_sys(crate::prefs::key::PRIVACY_REMEMBER, crate::prefs::PrefValue::Bool(v != 0));
+    }
     let Some(k) = PRIV_REVOKE.try_lock().and_then(|mut g| g.take()) else { return };
     let ok = crate::prefs::revoke(&k);
     serial_println!("[settings] privacy revoke key={} ok={}", k, ok as u8);
     if is_open() && cur_tab() == PRIV_TAB {
         repaint();
     }
+}
+
+// ── SETTINGSMAP (rmbp-ledger B673, BP-bar-17, R118) — one row per preference, and the search that reaches it ─────────
+// "One Settings row per preference" (BAR row 17): [`MAP`] is the ONE table of Settings rows. A row names the Principia
+// keys it edits (`system.<key>`, every one in `prefs::key::ALL`), the tab and row it is painted on, the label it paints
+// and the keyboard control that edits it (`NO_CTRL` = a mouse row). Every `prefs::key::ALL` key is on exactly one row;
+// `system.settings.tab` is on the tab COLUMN (its control is the column). The search field reads the table
+// ([`col_list`], [`search_best`]), so does the launcher ([`row_of_key`]); `tests settingsmap` holds both directions and
+// that every row's label is reached by at most two typed keys and Return.
+
+/// The `tab` of a row that lives on the tab column itself (`system.settings.tab`: the column is its control).
+pub const COLUMN: usize = TABS;
+/// A row with no keyboard control (a mouse row, a list, a link): Return selects its tab and rings the row.
+const NO_CTRL: usize = AT_FIRST;
+
+/// One Settings row: the keys it edits, where it is painted, its label as painted, its keyboard control.
+#[derive(Clone, Copy)]
+pub struct MapRow {
+    pub keys: &'static [&'static str],
+    pub tab: usize,
+    pub row: usize,
+    pub label: &'static str,
+    pub ctrl: usize,
+}
+
+const fn mr(keys: &'static [&'static str], tab: usize, row: usize, label: &'static str, ctrl: usize) -> MapRow {
+    MapRow { keys, tab, row, label, ctrl }
+}
+
+/// Every Settings row, in column order then row order. Labels are the strings the panes paint.
+pub const MAP: [MapRow; 32] = {
+    use crate::prefs::key::*;
+    [
+        // General (0)
+        mr(&[VOLUME], 0, 0, "Volume", 1),
+        mr(&[MUTE], 0, 1, "Mute", 2),
+        mr(&[POINTER], 0, 2, "Pointer", NO_CTRL),
+        mr(&[WALLPAPER], 0, 3, "Wallpaper", 5),
+        mr(&[DOCK_POSITION], 0, 6, "Dock position", NO_CTRL),
+        mr(&[DOCK_AUTOHIDE], 0, 7, "Automatically hide the dock", NO_CTRL),
+        mr(&[DOCK_PINS], 0, 8, "Dock pins", NO_CTRL),
+        // Display (2)
+        mr(&[BRIGHTNESS], 2, 0, "Brightness", 0),
+        mr(&[IDLE_MIN], 2, 1, "Blank screen", 3),
+        mr(&[DISPLAY_MODE], 2, 2, "Resolution", NO_CTRL),
+        mr(&[LOWBAT_PCT], 2, LOWBAT_ROW, "Low battery shutdown", NO_CTRL),
+        mr(&[FONT], 2, 4, "Font", 9),
+        mr(&[FONT_SIZE], 2, 5, "Font size", 10),
+        // Login Items (4)
+        mr(&[LOGIN_ITEMS], 4, 0, "Open at login", NO_CTRL),
+        // Appearance (5)
+        mr(&[APPEARANCE_MODE], 5, 0, "Appearance", NO_CTRL),
+        mr(&[APPEARANCE_ACCENT], 5, 2, "Accent colour", NO_CTRL),
+        mr(&[APPEARANCE_HIGHLIGHT], 5, 3, "Highlight colour", NO_CTRL),
+        mr(&[LOOK], 5, 7, "Look", NO_CTRL),
+        // Trackpad
+        mr(&[TP_SPEED], TP_TAB, 0, "Tracking speed", NO_CTRL),
+        mr(&[TP_TAP], TP_TAB, 1, TP_ROW_NAMES[0], NO_CTRL),
+        mr(&[TP_NATURAL], TP_TAB, 2, TP_ROW_NAMES[1], NO_CTRL),
+        mr(&[TP_SECONDARY], TP_TAB, 3, TP_ROW_NAMES[2], NO_CTRL),
+        mr(&[TP_THREE_DRAG], TP_TAB, 4, TP_ROW_NAMES[3], NO_CTRL),
+        // File Types
+        mr(&[QUARRY_FAVORITES], FT_TAB, FT_FAV_ROW, "Sidebar favorites", NO_CTRL),
+        // Notifications
+        mr(&[NOTIFY_DND], NP_TAB, 0, "Do Not Disturb", NO_CTRL),
+        mr(&[NOTIFY_DND_FROM, NOTIFY_DND_UNTIL], NP_TAB, 1, "Scheduled", NO_CTRL),
+        // Accessibility
+        mr(&[A11Y_REDUCE_MOTION], A11Y_TAB, 0, "Reduce motion", NO_CTRL),
+        mr(&[A11Y_INCREASE_CONTRAST], A11Y_TAB, 1, "Increase contrast", NO_CTRL),
+        mr(&[A11Y_CURSOR_SIZE], A11Y_TAB, 2, "Cursor size", NO_CTRL),
+        mr(&[A11Y_TEXT_SIZE], A11Y_TAB, 3, "Text size", NO_CTRL),
+        // Privacy (REASK B681): the switch row; the decisions below it are dynamic (`prefs::decisions`), each with a Revoke
+        mr(&[PRIVACY_REMEMBER], PRIV_TAB, 0, "Remember my answers", NO_CTRL),
+        // The tab column
+        mr(&[SETTINGS_TAB], COLUMN, 0, "Settings tabs", NO_CTRL),
+    ]
+};
+
+/// How well `text` holds the query `q`, ASCII case-insensitive: 0 = it starts with `q`, 1 = a word in it does (after
+/// a byte that is not a letter or digit), 2 = `q` is inside it; `None` = not at all (and for the empty query). Pure.
+fn hold_rank(text: &str, q: &str) -> Option<u8> {
+    let (t, q) = (text.as_bytes(), q.as_bytes());
+    if q.is_empty() || q.len() > t.len() { return None; }
+    let at = |i: usize| t[i..i + q.len()].eq_ignore_ascii_case(q);
+    let last = t.len() - q.len();
+    if at(0) { return Some(0); }
+    if (1..=last).any(|i| !t[i - 1].is_ascii_alphanumeric() && at(i)) { return Some(1); }
+    if (1..=last).any(at) { return Some(2); }
+    None
+}
+
+/// What the search's Return opens: a row of [`MAP`], or a tab whose name the text matched.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hit { Row(usize), Tab(usize) }
+
+/// The search's best hit for `q`: the lowest [`hold_rank`]; at the same rank a row before a tab, then table order. Pure.
+pub fn search_best(q: &str) -> Option<Hit> {
+    let rows = MAP.iter().enumerate().filter_map(|(i, r)| hold_rank(r.label, q).map(|k| (k, 0u8, i)));
+    let tabs = TAB_NAMES.iter().enumerate().filter_map(|(i, n)| hold_rank(n, q).map(|k| (k, 1u8, i)));
+    rows.chain(tabs).min().map(|(_, kind, i)| if kind == 0 { Hit::Row(i) } else { Hit::Tab(i) })
+}
+
+/// Open a hit: a row's tab, its control selected when it has a keyboard one (else focus stays on the column) and the
+/// row ringed; the column row focuses the column; a tab opens as the column's pick did. No lock held by the caller.
+fn open_hit(h: Hit, typed: usize) {
+    let i = match h {
+        Hit::Tab(t) => { if t != cur_tab() { switch_tab(t); } else { repaint(); } return; }
+        Hit::Row(i) => i,
+    };
+    let r = MAP[i];
+    if r.tab < TABS && r.tab != cur_tab() { switch_tab(r.tab); }
+    if let Some(st) = STATE.lock().as_mut() {
+        let keyed = r.tab < TABS && tab_ctrls(r.tab).contains(&r.ctrl);
+        st.strip = !keyed;
+        if keyed { st.sel = r.ctrl; }
+        st.found = (r.tab < TABS).then_some((r.tab as u8, r.row as u8));
+    }
+    let tn = if r.tab < TABS { TAB_NAMES[r.tab] } else { "column" };
+    serial_println!("[settings] search hit row={} tab={} key=system.{} typed={}", r.label, tn, r.keys.first().copied().unwrap_or(""), typed);
+    repaint();
+}
+
+/// The accent ring around row `r` (the row the search opened).
+fn found_ring(st: &mut State, r: usize) {
+    let (x, y) = (BOX_X + GAP, row_top(r) + GAP);
+    let rr = Rect::new(e(x), e(y), ew(x, BOX_W - 2 * GAP), ew(y, ROW_H - 2 * GAP));
+    draw::stroke_rrect(&mut sf(st), rr, dp(draw::DIMS.row_radius), dp(2).max(1), Ink::argb(theme::accent()));
+}
+
+/// The Display tab's Low battery shutdown row (`system.power.lowbat_shutdown_pct`, 0 = off) and its step.
+const LOWBAT_ROW: usize = 3;
+const LOWBAT_STEP: i64 = 5;
+/// The value this window last set (`u32::MAX` = read the store), and a store write owed to the service pass.
+static LOWBAT_SHOWN: AtomicU32 = AtomicU32::new(u32::MAX);
+static LOWBAT_OWED: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// The shutdown percent the row shows: this window's last choice, else the one in force (the store, else the build's).
+fn lowbat_now() -> i64 {
+    let s = LOWBAT_SHOWN.load(Ordering::Relaxed);
+    if s != u32::MAX { return s as i64; }
+    #[cfg(feature = "lowbat_shutdown")]
+    { super::powerui::lowbat_shutdown_pct() as i64 }
+    #[cfg(not(feature = "lowbat_shutdown"))]
+    { crate::prefs::peek_int(crate::prefs::key::LOWBAT_PCT, 0, 100).unwrap_or(0) }
+}
+
+/// - / + on the row: one step, held to the schema's 0..=100; the store write is latched for [`lowbat_service`].
+fn lowbat_step(up: bool) {
+    let v = (lowbat_now() + if up { LOWBAT_STEP } else { -LOWBAT_STEP }).clamp(0, 100) as u32;
+    LOWBAT_SHOWN.store(v, Ordering::Relaxed);
+    LOWBAT_OWED.store(v, Ordering::Release);
+    say("lowbat_shutdown_pct", &alloc::format!("{}", v), true);
+    repaint();
+}
+
+/// Drain the row's owed store write (the service pass; never a bus write in the click router).
+fn lowbat_service() {
+    let v = LOWBAT_OWED.swap(u32::MAX, Ordering::AcqRel);
+    if v != u32::MAX { crate::prefs_client::sys_set(crate::prefs::key::LOWBAT_PCT, crate::prefs::PrefValue::Int(v as i64)); }
+}
+
+/// The shortest typed text (one key, else two) whose Return opens row `i`: built from the label's own bytes, letters and
+/// digits first. `None` = no text of two keys or fewer reaches it. Pure.
+fn reach(i: usize) -> Option<String> {
+    let mut ch: Vec<u8> = MAP[i].label.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    ch.sort_by_key(|&b| (!b.is_ascii_alphanumeric(), b));
+    ch.dedup();
+    let hits = |q: &String| search_best(q) == Some(Hit::Row(i));
+    for &a in &ch {
+        let q = String::from(a as char);
+        if hits(&q) { return Some(q); }
+    }
+    for &a in &ch {
+        for &b in &ch {
+            let mut q = String::from(a as char);
+            q.push(b as char);
+            if hits(&q) { return Some(q); }
+        }
+    }
+    None
+}
+
+/// `tests settingsmap`: every `prefs::key::ALL` key on exactly one row (`unrowed` counts the keys on none or on more
+/// than one); every row's keys in ALL and declared by the schema, its place on the window, no two rows on one place
+/// (`orphans`); the four keys ALL spells beside their owners' constants equal to them; every row's label reached by
+/// at most two typed keys and Return ([`reach`]); then the hardest row driven LIVE through the search field
+/// (`search_key`: its keys, Return) and the window read back (its tab, the ring, the selected control).
+pub fn selftest_map() {
+    use crate::prefs::key;
+    let keys = key::ALL.len();
+    let unrowed = key::ALL.iter().filter(|&&k| MAP.iter().filter(|r| r.keys.contains(&k)).count() != 1).count();
+    let placed = |r: &MapRow| if r.tab < TABS { r.row < ROWS } else { r.tab == COLUMN };
+    let orphans = MAP.iter().enumerate().filter(|&(i, r)| {
+        r.keys.is_empty()
+            || r.keys.iter().any(|k| !key::ALL.contains(k) || prefs_core::schema::lookup(crate::prefs::NS, k).is_none())
+            || !placed(r)
+            || MAP[..i].iter().any(|o| o.tab == r.tab && o.row == r.row)
+    }).count();
+    let same = key::LOOK == prefs_core::appearance::LOOK_KEY && key::NOTIFY_DND == super::notify::KEY_DND
+        && key::NOTIFY_DND_FROM == super::notifypane::KEY_DND_FROM && key::NOTIFY_DND_UNTIL == super::notifypane::KEY_DND_UNTIL;
+    // The search leg: the hardest row (most keys; the first such in table order), or the first row no text reaches.
+    let mut hard: Option<(usize, String)> = None;
+    let mut unreached: Option<usize> = None;
+    for i in 0..MAP.len() {
+        match reach(i) {
+            Some(q) => { if hard.as_ref().map_or(true, |(_, h)| q.len() > h.len()) { hard = Some((i, q)); } }
+            None => { if unreached.is_none() { unreached = Some(i); } }
+        }
+    }
+    let search = match (unreached, &hard) {
+        (Some(i), _) => alloc::format!("bad({}:none)", MAP[i].label),
+        (None, Some((i, q))) => alloc::format!("ok({}:{})", MAP[*i].label, q.len()),
+        (None, None) => String::from("bad(empty)"),
+    };
+    // The live leg: type the hardest row's text into the open window's search field and press Return.
+    let live = match (&hard, unreached) {
+        (Some((i, q)), None) => {
+            let was_open = is_open();
+            if was_open || open().is_ok() {
+                let tab0 = cur_tab();
+                if let Some(x) = STATE.lock().as_mut() { x.query.clear(); x.search = true; x.found = None; }
+                for b in q.bytes() { search_key(crate::pal::Event::Key(b)); }
+                search_key(crate::pal::Event::Key(0x0D));
+                let r = MAP[*i];
+                let (found, strip, sel) = STATE.lock().as_ref().map_or((None, true, usize::MAX), |x| (x.found, x.strip, x.sel));
+                let ok = if r.tab < TABS {
+                    cur_tab() == r.tab && found == Some((r.tab as u8, r.row as u8))
+                        && (if tab_ctrls(r.tab).contains(&r.ctrl) { !strip && sel == r.ctrl } else { strip })
+                } else {
+                    strip && found.is_none() && cur_tab() == tab0
+                };
+                if let Some(x) = STATE.lock().as_mut() { x.query.clear(); x.search = false; x.found = None; }
+                if cur_tab() != tab0 { switch_tab(tab0); }
+                if !was_open { close(); }
+                if ok { "ok" } else { "bad" }
+            } else {
+                "skip(no-window)"
+            }
+        }
+        _ => "bad",
+    };
+    let ok = unrowed == 0 && orphans == 0 && same && search.starts_with("ok(") && live != "bad";
+    serial_println!(
+        ":: SETTINGSMAP: keys={} rows={} orphans={} unrowed={} search={} -> {} :: live={} owners_same={}",
+        keys, MAP.len(), orphans, unrowed, search, if ok { "PASS" } else { "FAIL" }, live, same as u8
+    );
 }

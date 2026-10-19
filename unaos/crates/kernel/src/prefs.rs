@@ -108,7 +108,7 @@ pub mod key {
     pub const TP_SECONDARY: &str = "trackpad.secondary_click";
     pub const TP_THREE_DRAG: &str = "trackpad.three_finger_drag";
     /// DRAGDROP (B440): the folders the user dropped on Quarry's sidebar Favorites (R79: a preference is Principia's).
-    pub const QUARRY_FAVORITES: &str = "quarry.favorites"; pub const A11Y_REDUCE_MOTION: &str = "accessibility.reduce_motion"; pub const A11Y_INCREASE_CONTRAST: &str = "accessibility.increase_contrast"; pub const A11Y_CURSOR_SIZE: &str = "accessibility.cursor_size"; pub const A11Y_TEXT_SIZE: &str = "accessibility.text_size"; // A11YPANE (B655): the Accessibility pane's four keys (LINE-NEUTRAL fold, code first: this file is lexed into every image)
+    pub const QUARRY_FAVORITES: &str = "quarry.favorites"; pub const A11Y_REDUCE_MOTION: &str = "accessibility.reduce_motion"; pub const A11Y_INCREASE_CONTRAST: &str = "accessibility.increase_contrast"; pub const A11Y_CURSOR_SIZE: &str = "accessibility.cursor_size"; pub const A11Y_TEXT_SIZE: &str = "accessibility.text_size"; pub const LOOK: &str = "look"; pub const NOTIFY_DND: &str = "notify.dnd"; pub const NOTIFY_DND_FROM: &str = "notify.dnd_from"; pub const NOTIFY_DND_UNTIL: &str = "notify.dnd_until"; pub const PRIVACY_REMEMBER: &str = "privacy.remember"; pub const ALL: [&str; 33] = [BRIGHTNESS, IDLE_MIN, WALLPAPER, VOLUME, MUTE, POINTER, LOWBAT_PCT, DOCK_PINS, SETTINGS_TAB, FONT, FONT_SIZE, LOGIN_ITEMS, DISPLAY_MODE, DOCK_POSITION, DOCK_AUTOHIDE, APPEARANCE_MODE, APPEARANCE_ACCENT, APPEARANCE_HIGHLIGHT, TP_SPEED, TP_TAP, TP_NATURAL, TP_SECONDARY, TP_THREE_DRAG, QUARRY_FAVORITES, A11Y_REDUCE_MOTION, A11Y_INCREASE_CONTRAST, A11Y_CURSOR_SIZE, A11Y_TEXT_SIZE, LOOK, NOTIFY_DND, NOTIFY_DND_FROM, NOTIFY_DND_UNTIL, PRIVACY_REMEMBER]; // REASK (B681): PRIVACY_REMEMBER, Settings > Privacy's row (does a new answer get kept). SETTINGSMAP (B673): the keys Settings owns a row for (LOOK = prefs_core::appearance::LOOK_KEY, NOTIFY_* = notify/notifypane's, held equal by `tests settingsmap`) and ALL, the iterable table of every key here (LINE-NEUTRAL fold, code first). A11YPANE (B655): the Accessibility pane's four keys (LINE-NEUTRAL fold, code first: this file is lexed into every image)
 }
 
 static TREE: crate::sync::Mutex<PrefTree> = crate::sync::Mutex::new(PrefTree::new());
@@ -1553,10 +1553,17 @@ pub fn decided_quiet(domain: &str, who: &str, bind: &str) -> Option<String> {
     consult(domain, who, bind, false)
 }
 
-/// Record the user's `answer` to the `(domain, who)` ask, bound to `bind` (`-` = nothing). QUEUE-ONLY (no I/O: the
+/// Record the user's `answer` to the `(domain, who)` ask, bound to `bind` (`-` = nothing) — unless the user switched
+/// `system.privacy.remember` off (then nothing is kept and the ask asks every time). QUEUE-ONLY (no I/O: the
 /// press route calls it); [`decided`] answers it at once and [`service`] persists it. Replaces an earlier answer.
 pub fn decide(domain: &str, who: &str, bind: &str, answer: &str) {
     let key = decision_key(domain, who);
+    // The user's own switch (Settings > Privacy, `system.privacy.remember`, default on): off = this answer is not kept.
+    // try_lock: a busy tree reads as the default (this runs on the press route and the refusal router).
+    if TREE.try_lock().and_then(|t| t.get(NS, key::PRIVACY_REMEMBER).and_then(|v| v.as_bool())) == Some(false) {
+        serial_println!("[decision] record domain={} key={} answer={} kept=0 (privacy.remember=false)", domain, key, field_word(answer));
+        return;
+    }
     let at = decision_now().unwrap_or(0);
     let aw = field_word(answer);
     let v = alloc::format!("{} {} {} {}", aw, at, field_word(bind), subject(who));
