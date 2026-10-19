@@ -24,6 +24,7 @@
 | BP-storage-12 | Once the root is bound, every prefs read/write/stat resolves against the root (no re-walk of other disks per call). | commit `715c69ff` (DONGLEBOOT B658) | `tests dongleboot` |
 | BP-storage-13 | The users table is `/USERS.DAT` at the root of the root volume, swapped through `/USERS.NEW`; at most 8 users, names ≤ 8 bytes; homes are `/home/<name>`, spelt by `users::home_of`, never a literal. | `unaos/crates/kernel/src/fs/users.rs:140-157` `unaos/crates/kernel/src/fs/users.rs:740`; `unaos/crates/kernel/src/prefs.rs:26-28` | `tests login` family (unverified names) |
 | BP-storage-14 | Trash is `/home/<user>/.Trash/` through the mount table; `trash_core` is the one Trash both rings share (seam `shared-core`, owner Matrix). | `unaos/crates/kernel/src/fs/trash.rs:1-10` | `tests trash` (unverified name) |
+| BP-storage-15 | An app is its `/apps` entry (the folder `/apps/<name>/`, or today's flat `/apps/<NAME>.ELF`) plus its settings domain `settings/<name>`; `uninstall` removes the entry as the administrator (ROOTACL decides), the domain file under EVERY settings folder (the no-session store's and each user's `<home>/settings`, as the user's own Quarry delete, which prefs' delete watch resets in RAM), and its dock pin; a system domain or a name with no `/apps` entry is refused and nothing is removed (BP-bar-11). | `unaos/crates/kernel/src/install/uninstall.rs:1-25` | `tests uninstall` (`:: UNINSTALL: … leftover=0 … -> PASS ::`), unflown |
 
 ## 3. Seams
 - May call storage: VFS clients (shell verbs, `SYS_OPEN`/`SYS_PATH_*`, Quarry, prefs, users, wallpaper, apptrust), the installer.
@@ -32,7 +33,7 @@
 
 ## 4. Wire
 `:: UNAFSX86: root=unafs src=<ahci:<p>|card> … ::` · `[boot] step=root-mount …` · `[boot] fat write refused path= by= (R99: sacred)` · `[boot] fat unlocked by=<installer|updater> for=` ·
-`[prefs] settings/<d> absent -> defaults …` · `[prefs] save held` · `[unafs] name-index built names= ms= chunks=` · `AHCI: selfcheck port=0`.
+`[prefs] settings/<d> absent -> defaults …` · `[prefs] save held` · `[uninstall] app=<n> apps_files=<n> apps_dirs=<n> settings_removed=<n> pin_removed=<0|1> by=<p>` · `[unafs] name-index built names= ms= chunks=` · `AHCI: selfcheck port=0`.
 
 ## 5. Ruled, unbuilt / open
 - R94's hot swap of the root volume: design only (`unaos/crates/kernel/src/fs/rootdisk.rs:24`).
