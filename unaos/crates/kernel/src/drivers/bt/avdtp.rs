@@ -17,10 +17,11 @@
 //!   DELAYREPORT; anything else gets a general reject. Fragmented signalling packets are not reassembled.
 //! * THE MEDIA TRANSPORT: the second L2CAP channel on PSM 0x0019 carries RTP (version 2, payload type 96, sequence,
 //!   timestamp in samples, SSRC 1) + the one-byte SBC media payload header (frame count) + `fpp` SBC frames from
-//!   [`sbc::Encoder`] (the `sbc_core` source, included by path). One packet fits one ACL packet
-//!   ([`super::l2cap::payload_fit`]): 248 bytes on the BCM radio, so bitpool 52 and two frames a packet.
+//!   [`sbc::Encoder`] (the `sbc_core` source, included by path). One packet is at most two ACL packets
+//!   ([`super::l2cap::payload_fit`], fragmented by [`super::l2cap::fragment`], A2DPKNOB B750): 500 bytes on the BCM
+//!   radio, so bitpool 53 and four frames a packet.
 //! * PACING ([`tick`], once per BTHID pass): samples due = elapsed x 44100 / 1000 + a 40 ms lead; at most four packets
-//!   a pass and never more than six PDUs queued. The clock starts when PCM arrives and stops when the ring runs dry
+//!   a pass and never more than six ACL packets (fragments) queued. The clock starts when PCM arrives and stops when the ring runs dry
 //!   with no writer: nothing is sent while nothing plays (BP-audio-3).
 //! * THE SINK: [`begin`] / [`write`] (PCM 16-bit LE stereo 44.1 kHz) / [`finish`] / [`queued`] / [`counters`] — the
 //!   USB class driver's shape, so `audio::tone_on(Sink::Bt, ..)` feeds it as it feeds UAC. The mixer (AUDIOMIX) is
@@ -29,7 +30,7 @@
 //! Wire: `[a2dp] dev=<addr> link up -> sdp`, `[a2dp] sdp dev= sink=<yes|no> psm= avdtp= a2dp=`, `[a2dp] dev=
 //! signalling channel …`, `[a2dp] dev= media channel …`, `[a2dp] dev=<addr> codec=sbc 44100 js bitpool=<n> mtu=<n>
 //! -> streaming`, `[a2dp] dev= -> FAILED reason=`, `[a2dp] dev= gone`; `tests a2dp`: `:: A2DP: sbc_kat=ok avdtp=ok
-//! stream=<ok|no-device> -> PASS|SKIP|FAIL ::`.
+//! frag=ok stream=<ok|no-device> -> PASS|SKIP|FAIL ::`. Compiled only under the `a2dp` knob (A2DPKNOB B750).
 
 use super::l2cap::{self, AvdtpRole};
 use super::sdp;
@@ -737,7 +738,8 @@ pub(super) fn tick(bt: &mut Bt, now: u64) {
     };
     let due = now.saturating_sub(start) * RATE as u64 / 1000 + LEAD_FRAMES;
     let mut k = 0;
-    while *sent + (n * spf) as u64 <= due && bt.acltx.len() < 6 && k < 4 {
+    let nf = l2cap::frag_count(4 + MEDIA_HDR + n * flen, bt.acl_len); // A2DPKNOB (B750): the queue bound counts fragments
+    while *sent + (n * spf) as u64 <= due && bt.acltx.len() + nf <= 6 && k < 4 {
         let mut pkt = Vec::with_capacity(MEDIA_HDR + n * flen);
         pkt.extend_from_slice(&media_header(*seq, *ts, n as u8));
         let mut short = 0u32;
@@ -898,7 +900,7 @@ fn step_is(p: &mut Peer, msg: &[u8], want: &[u8], leg: &'static str) -> Result<V
 /// The AVDTP state machine against a synthetic peer, both roles, byte for byte; SDP's record walk; L2CAP's fit.
 fn avdtp_legs() -> Result<(), &'static str> {
     // Below AVDTP: L2CAP's decisions and the SDP sink record.
-    let l2 = l2cap::payload_fit(1021, 672) == 248 && l2cap::payload_fit(200, 672) == 196 && l2cap::payload_fit(1021, 100) == 100 && l2cap::inbound_served(0x0019) && !l2cap::inbound_served(0x0001) && l2cap::avdtp_role(false) == AvdtpRole::Signalling && l2cap::avdtp_role(true) == AvdtpRole::Media;
+    let l2 = l2cap::payload_fit(1021, 672) == 500 && l2cap::payload_fit(200, 672) == 396 && l2cap::payload_fit(1021, 100) == 100 && l2cap::inbound_served(0x0019) && !l2cap::inbound_served(0x0001) && l2cap::avdtp_role(false) == AvdtpRole::Signalling && l2cap::avdtp_role(true) == AvdtpRole::Media;
     if !l2 {
         return Err("l2cap");
     }
@@ -983,20 +985,75 @@ fn avdtp_legs() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Reassemble queued ACL payloads by `on_acl`'s rules (bthid.rs): PB 0b10 starts a PDU whose basic header gives its
+/// length, PB 0b01 continues it; a continuation with no PDU open, or a PDU longer than declared, is a failure.
+fn reassemble(frags: &[(u16, Vec<u8>)]) -> Option<Vec<u8>> {
+    let (mut rx, mut want) = (Vec::new(), 0usize);
+    for (h, data) in frags {
+        match (l2cap::acl_hdr(*h) >> 12) & 0x3 {
+            0b01 if want > 0 => rx.extend_from_slice(data),
+            0b10 if data.len() >= 4 => {
+                rx.clear();
+                rx.extend_from_slice(data);
+                want = 4 + u16::from_le_bytes([data[0], data[1]]) as usize;
+            }
+            _ => return None,
+        }
+    }
+    (want > 0 && rx.len() == want).then_some(rx)
+}
+
+/// Outbound L2CAP fragmentation (A2DPKNOB B750): the fragments' sizes and boundary flags, their reassembly by the
+/// inbound rules byte for byte, a short PDU left whole, a small-buffer radio, and the media packet the new bound picks.
+fn frag_legs() -> Result<(), &'static str> {
+    let body: Vec<u8> = (0..600u32).map(|i| (i * 7 + 3) as u8).collect();
+    let mut pdu = Vec::new();
+    pdu.extend_from_slice(&600u16.to_le_bytes());
+    pdu.extend_from_slice(&0x0041u16.to_le_bytes());
+    pdu.extend_from_slice(&body);
+    let f = l2cap::fragment(0x002A, 0x0041, &body, 1021);
+    let sizes: Vec<usize> = f.iter().map(|x| x.1.len()).collect();
+    let hdrs: Vec<u16> = f.iter().map(|x| l2cap::acl_hdr(x.0)).collect();
+    if sizes != [252, 252, 100] || hdrs != [0x202A, 0x102A, 0x102A] || l2cap::frag_count(604, 1021) != 3 || !l2cap::needs_frag(604, 1021) {
+        return Err("frag-split");
+    }
+    if reassemble(&f).as_deref() != Some(&pdu[..]) {
+        return Err("frag-reassembly");
+    }
+    let short = l2cap::fragment(0x002A, 0x0041, &body[..10], 1021);
+    let whole: Vec<u8> = [&10u16.to_le_bytes()[..], &[0x41, 0x00][..], &body[..10]].concat(); // what `l2_send` queues
+    if short.len() != 1 || short[0].0 != 0x002A || short[0].1 != whole || l2cap::needs_frag(14, 1021) || l2cap::needs_frag(604, 0) {
+        return Err("frag-short");
+    }
+    let tiny = l2cap::fragment(0x0001, 0x0041, &body, 27);
+    if tiny.len() != 23 || l2cap::frag_count(604, 27) != 23 || tiny.iter().any(|x| x.1.len() > 27) || reassemble(&tiny).as_deref() != Some(&pdu[..]) {
+        return Err("frag-small-buffer");
+    }
+    let fit = l2cap::payload_fit(1021, 672);
+    let flen = Config { bitpool: 53, ..Config::A2DP_HQ }.frame_len();
+    if pick_bitpool(2, 53, fit) != Some((53, 4)) || l2cap::frag_count(4 + MEDIA_HDR + 4 * flen, 1021) != 2 {
+        return Err("frag-media-packet");
+    }
+    Ok(())
+}
+
 /// `tests a2dp`: the SBC KAT (`sbc_core::kat`, the same function the host test runs), the AVDTP state machine over a
-/// synthetic peer (and the SDP record and L2CAP fit below it), and whether a stream runs now.
+/// synthetic peer (and the SDP record and L2CAP fit below it), outbound L2CAP fragmentation, and whether a stream
+/// runs now.
 pub fn fixture() {
     let kat = sbc::kat();
     let av = avdtp_legs();
+    let frag = frag_legs();
     let stream = if streaming() { "ok" } else { "no-device" };
-    for (leg, r) in [("sbc_kat", kat), ("avdtp", av)] {
+    for (leg, r) in [("sbc_kat", kat), ("avdtp", av), ("frag", frag)] {
         match r {
             Ok(()) => serial_println!("[a2dp] fixture {} -> PASS", leg),
             Err(why) => serial_println!("[a2dp] fixture {} -> FAIL at {}", leg, why),
         }
     }
-    let verdict = if kat.is_err() || av.is_err() { "FAIL" } else if stream == "ok" { "PASS" } else { "SKIP" };
-    serial_println!(":: A2DP: sbc_kat={} avdtp={} stream={} -> {} ::", if kat.is_ok() { "ok" } else { "FAIL" }, if av.is_ok() { "ok" } else { "FAIL" }, stream, verdict);
+    let ok = |r: Result<(), &'static str>| if r.is_ok() { "ok" } else { "FAIL" };
+    let verdict = if kat.is_err() || av.is_err() || frag.is_err() { "FAIL" } else if stream == "ok" { "PASS" } else { "SKIP" };
+    serial_println!(":: A2DP: sbc_kat={} avdtp={} frag={} stream={} -> {} ::", ok(kat), ok(av), ok(frag), stream, verdict);
     if verdict == "SKIP" {
         serial_println!(":: A2DP: SKIP = both fixtures passed but no A2DP stream runs (`bt audio <addr>` with a headset in pairing mode, then `tests a2dp`) ::");
     }

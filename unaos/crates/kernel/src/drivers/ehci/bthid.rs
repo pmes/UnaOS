@@ -611,7 +611,7 @@ impl Bt {
 
     // ── L2CAP send side ─────────────────────────────────────────────────────────────────────────
 
-    fn l2_send(&mut self, handle: u16, cid: u16, body: &[u8]) {
+    fn l2_send(&mut self, handle: u16, cid: u16, body: &[u8]) { #[cfg(feature = "a2dp")] if l2cap::needs_frag(4 + body.len(), self.acl_len) { return self.l2_send_frag(handle, cid, body); } // A2DPKNOB (B750): a PDU longer than one ACL packet goes out as fragments (LINE-NEUTRAL fold, code first)
         if self.acltx.len() >= 8 {
             serial_println!(":: bthid: l2cap tx queue full — PDU on cid={:#06x} dropped ::", cid);
             return;
@@ -644,7 +644,7 @@ impl Bt {
     }
 
     fn open_chan(&mut self, li: usize, psm: u16, now: u64) {
-        if self.links[li].chan_psm(psm).is_some() && psm != l2cap::PSM_AVDTP {
+        #[cfg(feature = "a2dp")] let solo = psm != l2cap::PSM_AVDTP; #[cfg(not(feature = "a2dp"))] let solo = true; if self.links[li].chan_psm(psm).is_some() && solo { // A2DPKNOB (B750): AVDTP carries two channels on one PSM (LINE-NEUTRAL fold, code first)
             return;
         }
         if self.links[li].chans.len() >= MAX_CHANS {
@@ -897,7 +897,7 @@ impl Bt {
                 let h = le16(p, 1) & 0x0FFF;
                 if let Some(li) = self.link_handle(h) {
                     let l = self.links.remove(li);
-                    avdtp::link_gone(&l.addr); // A2DP (B739): the stream ends with its link
+                    #[cfg(feature = "a2dp")] avdtp::link_gone(&l.addr); // A2DP (B739): the stream ends with its link
                     if l.hid_up {
                         self.connected = self.connected.saturating_sub(1);
                     }
@@ -1180,7 +1180,7 @@ impl Bt {
         for ci in pend {
             self.accept_chan(li, ci, now);
         }
-        if self.a2dp_link(li) {
+        #[cfg(feature = "a2dp")] if self.a2dp_link(li) {
             return self.a2dp_link_up(li, now); // A2DP (B739): an audio device gets the AudioSink query, then AVDTP
         }
         let have_desc = self.desc_for(&addr).is_some();
@@ -1252,7 +1252,7 @@ impl Bt {
             match psm {
                 PSM_SDP => self.on_sdp(li, body, now),
                 PSM_HID_INTR => self.on_hid_intr(li, body),
-                l2cap::PSM_AVDTP => self.a2dp_rx(li, ci, body, now),
+                #[cfg(feature = "a2dp")] l2cap::PSM_AVDTP => self.a2dp_rx(li, ci, body, now),
                 PSM_HID_CTRL => {
                     if let Some(&b) = body.first() {
                         if b >> 4 == 0x0 && b & 0x0F != 0 {
@@ -1294,7 +1294,7 @@ impl Bt {
                 let lcid = self.links[li].next_lcid;
                 // Only the two HID channels and AVDTP (A2DP B739) are served: this host runs no SDP SERVER, so an inbound SDP
                 // connection (a device asking about US) is refused rather than accepted and left mute.
-                if !l2cap::inbound_served(psm) || self.links[li].chans.len() >= MAX_CHANS {
+                #[cfg(feature = "a2dp")] let served = l2cap::inbound_served(psm); #[cfg(not(feature = "a2dp"))] let served = psm == PSM_HID_CTRL || psm == PSM_HID_INTR; if !served || self.links[li].chans.len() >= MAX_CHANS {
                     let mut r = [0u8; 8];
                     r[2..4].copy_from_slice(&scid.to_le_bytes());
                     r[4..6].copy_from_slice(&(if self.links[li].chans.len() >= MAX_CHANS { 0x0004u16 } else { 0x0002u16 }).to_le_bytes()); // no resources / PSM not supported
@@ -1394,7 +1394,7 @@ impl Bt {
                 if let Some(ci) = self.links[li].chans.iter().position(|c| c.lcid == dcid && c.rcid == scid) {
                     let c = self.links[li].chans.remove(ci);
                     serial_println!(":: BTHID: l2cap {} psm={:#06x} closed by the peer ::", fmt_addr(&addr), c.psm);
-                    if c.psm == l2cap::PSM_AVDTP {
+                    #[cfg(feature = "a2dp")] if c.psm == l2cap::PSM_AVDTP {
                         return self.a2dp_chan_closed(li, c.lcid, now);
                     }
                     if c.psm != PSM_SDP && self.links[li].hid_up {
@@ -1448,7 +1448,7 @@ impl Bt {
                     self.hid_connected(li);
                 }
             }
-            l2cap::PSM_AVDTP => return self.a2dp_chan_open(li, ci, now),
+            #[cfg(feature = "a2dp")] l2cap::PSM_AVDTP => return self.a2dp_chan_open(li, ci, now),
             _ => {}
         }
         if c.psm == PSM_HID_CTRL && self.links[li].open_rcid(PSM_HID_INTR).is_some() {
@@ -1464,8 +1464,8 @@ impl Bt {
         self.links[li].sdp_tid = self.links[li].sdp_tid.wrapping_add(1).max(1);
         let tid = self.links[li].sdp_tid;
         let mut params = Vec::with_capacity(32);
-        if self.a2dp_link(li) {
-            sdp::a2dp_params(&mut params); // A2DP (B739): DES { UUID16 0x110B AudioSink }, 0x0280, DES { 0x0004..0x0009 }
+        #[cfg(feature = "a2dp")] let audio = self.a2dp_link(li); #[cfg(not(feature = "a2dp"))] let audio = false; if audio { // A2DPKNOB (B750) (LINE-NEUTRAL fold, code first)
+            #[cfg(feature = "a2dp")] sdp::a2dp_params(&mut params); // A2DP (B739): DES { UUID16 0x110B AudioSink }, 0x0280, DES { 0x0004..0x0009 }
         } else {
             params.extend_from_slice(&[0x35, 0x03, 0x19, 0x11, 0x24]); // DES { UUID16 0x1124 HID }
             params.extend_from_slice(&0x0280u16.to_be_bytes()); // MaximumAttributeByteCount
@@ -1513,7 +1513,7 @@ impl Bt {
             return;
         }
         let acc = core::mem::take(&mut self.links[li].sdp_acc);
-        if self.a2dp_link(li) {
+        #[cfg(feature = "a2dp")] if self.a2dp_link(li) {
             self.a2dp_sdp(li, &acc);
             return self.finish_sdp(li, now);
         }
@@ -1547,7 +1547,7 @@ impl Bt {
     }
 
     fn after_sdp(&mut self, li: usize, now: u64) {
-        if self.a2dp_link(li) {
+        #[cfg(feature = "a2dp")] if self.a2dp_link(li) {
             return self.a2dp_after_sdp(li, now); // A2DP (B739): AVDTP signalling, not HID control
         }
         let l = &self.links[li];
@@ -1710,17 +1710,17 @@ impl Bt {
             // Channels that never finished opening.
             let stale = self.links[i].chans.iter().position(|c| matches!(c.st, ChanSt::WaitConnRsp | ChanSt::Config | ChanSt::WaitDiscRsp) && now.saturating_sub(c.t) > CHAN_MS);
             if let Some(ci) = stale {
-                let c = self.links[i].chans.remove(ci);
+                let c = self.links[i].chans.remove(ci); #[cfg(feature = "a2dp")] let hid = c.psm != l2cap::PSM_AVDTP; #[cfg(not(feature = "a2dp"))] let hid = true; // A2DPKNOB (B750): an AVDTP channel is not a HID one (LINE-NEUTRAL fold, code first)
                 serial_println!(":: BTHID: l2cap {} psm={:#06x} did not finish within {} s — abandoned ::", fmt_addr(&addr), c.psm, CHAN_MS / 1000);
                 if c.psm == PSM_SDP && !self.links[i].sdp_done {
                     self.links[i].sdp_done = true;
                     self.after_sdp(i, now);
-                } else if c.psm != PSM_SDP && c.psm != l2cap::PSM_AVDTP && !self.links[i].hid_up {
+                } else if c.psm != PSM_SDP && hid && !self.links[i].hid_up {
                     self.disconnect(i, "a HID channel never opened");
                 }
             }
             // An inbound device that came up but opened no HID channel within 3 s: open it ourselves.
-            if self.links[i].st == LinkSt::Up && !self.links[i].outbound && !self.a2dp_link(i) && self.links[i].sdp_done && !self.links[i].hid_up && self.links[i].chan_psm(PSM_HID_CTRL).is_none() && age > 3000 {
+            #[cfg(feature = "a2dp")] let audio = self.a2dp_link(i); #[cfg(not(feature = "a2dp"))] let audio = false; if self.links[i].st == LinkSt::Up && !self.links[i].outbound && !audio && self.links[i].sdp_done && !self.links[i].hid_up && self.links[i].chan_psm(PSM_HID_CTRL).is_none() && age > 3000 {
                 self.open_chan(i, PSM_HID_CTRL, now);
             }
             i += 1;
@@ -2323,7 +2323,7 @@ unsafe fn step(bt: &mut Bt, c: &mut Controller, radio: &BtRadio, e: &BtEvtEp) {
             }
         }
     }
-    avdtp::tick(bt, now); // A2DP (B739): the acceptor-side waits and the media clock, before the transmit drains the queue
+    #[cfg(feature = "a2dp")] avdtp::tick(bt, now); // A2DP (B739): the acceptor-side waits and the media clock, before the transmit drains the queue
     // ACL transmit, within the controller's buffer credits; one PDU per ACL packet.
     let mut sent = 0;
     while sent < 4 && bt.credits > 0 && !bt.acltx.is_empty() {
@@ -2333,7 +2333,7 @@ unsafe fn step(bt: &mut Bt, c: &mut Controller, radio: &BtRadio, e: &BtEvtEp) {
             serial_println!(":: BTHID: ACL PDU of {} bytes exceeds one packet (limit {}) — not sent ::", pdu.len(), (bt.acl_len as usize).min(252));
             continue;
         }
-        let hdr = (h & 0x0FFF) | (0b10 << 12);
+        #[cfg(not(feature = "a2dp"))] let hdr = (h & 0x0FFF) | (0b10 << 12); #[cfg(feature = "a2dp")] let hdr = l2cap::acl_hdr(h); // A2DPKNOB (B750): a queued continuation fragment carries PB=0b01 (LINE-NEUTRAL fold, code first)
         let head = [hdr as u8, (hdr >> 8) as u8, pdu.len() as u8, (pdu.len() >> 8) as u8];
         for (i, &b) in head.iter().chain(pdu.iter()).enumerate() {
             c.data_buf.add(i).write(b);
@@ -2555,7 +2555,7 @@ pub fn verb(args: &[&str], out: &mut dyn FnMut(&str)) {
                 Err(e) => out(&format!("bt: {} refused — {}", sub, e)),
             }
         }
-        "audio" => {
+        #[cfg(feature = "a2dp")] "audio" => {
             let Some(a) = args.get(1).and_then(|s| resolve(bt, s)) else { return out("usage: bt audio <aa:bb:cc:dd:ee:ff | #n>") };
             avdtp::verb_audio(bt, a, now, out);
         }
@@ -2581,7 +2581,7 @@ pub fn verb(args: &[&str], out: &mut dyn FnMut(&str)) {
                 out("bt: not bonded");
             }
         }
-        _ => out("usage: bt [list] | bt scan | bt pair <addr|#n> [yes|no] | bt connect <addr|#n> | bt audio <addr|#n> | bt disconnect <addr> | bt forget <addr> | bt reset"),
+        #[cfg(feature = "a2dp")] _ => out("usage: bt [list] | bt scan | bt pair <addr|#n> [yes|no] | bt connect <addr|#n> | bt audio <addr|#n> | bt disconnect <addr> | bt forget <addr> | bt reset"), #[cfg(not(feature = "a2dp"))] _ => out("usage: bt [list] | bt scan | bt pair <addr|#n> [yes|no] | bt connect <addr|#n> | bt disconnect <addr> | bt forget <addr> | bt reset"),
     }
 }
 
@@ -2615,7 +2615,7 @@ fn list(bt: &Bt, now: u64, out: &mut dyn FnMut(&str)) {
             out(&format!("bt: >>> type {:06} then Enter on {}{}", v, if kb { "the keyboard " } else { "" }, fmt_addr(&l.addr)));
         }
     }
-    avdtp::list_line(out);
+    #[cfg(feature = "a2dp")] avdtp::list_line(out);
 }
 
 // ── `tests bt` ──────────────────────────────────────────────────────────────────────────────────
@@ -2854,14 +2854,14 @@ pub fn btkeyseal_selftest() {
     serial_println!(":: BTKEYSEAL: sealed={} plain_left={} objects={} pending={} unsealed={} holocron={} codec={} -> {} ::", sealed, plain_left, objects, pe, q, holo, if codec { "ok" } else { "FAIL" }, verdict);
 }
 
-// ── A2DP (rmbp-ledger B739): the profile layers above this host's L2CAP, in their own files under `drivers/bt/` ──────
+// ── A2DP (rmbp-ledger B739; its own knob `a2dp` since A2DPKNOB B750): the profile layers above this host's L2CAP, in their own files under `drivers/bt/` ──────
 // Children of `bthid` (declared here, at the TAIL) so they drive its `Bt` state under the same lock and per-pass step:
 // `l2cap` (what A2DP added to the channels above: AVDTP's PSM, two channels on it, the one-ACL-packet bound), `sdp`
 // (the AudioSink query and its record), `avdtp` (signalling, the SBC media transport, the sink the audio seam writes;
 // it includes `unaos/libs/media/sbc_core/src/sbc.rs` by path). `tests a2dp` is registered in `tests.rs`.
-#[path = "../bt/l2cap.rs"]
+#[cfg(feature = "a2dp")] #[path = "../bt/l2cap.rs"]
 pub mod l2cap;
-#[path = "../bt/sdp.rs"]
+#[cfg(feature = "a2dp")] #[path = "../bt/sdp.rs"]
 pub mod sdp;
-#[path = "../bt/avdtp.rs"]
+#[cfg(feature = "a2dp")] #[path = "../bt/avdtp.rs"]
 pub mod avdtp;
