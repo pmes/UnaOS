@@ -111,7 +111,7 @@ fn grow_to_a_tebibyte_appends_holes() {
     std::fs::OpenOptions::new().write(true).open(&img.0).unwrap().set_len(1 << 40).unwrap();
     let (mut fs, rep) = unafs::grow(FileDevice::open(&img.0).unwrap(), 1 << 28).unwrap();
     assert_eq!(rep.to, 1 << 28);
-    assert!(rep.free_after + 16 >= rep.free_before + (1 << 28) - 16384, "{rep:?}");
+    assert!(rep.free_after + fs.reserve_blocks() + 16 >= rep.free_before + unafs::refmap::reserve_for(1 << 14) + (1 << 28) - 16384, "{rep:?}");
     let _ = before;
     assert!(fs.map_block_total() < 16);
     assert!(fs.fsck(false).unwrap().is_clean());

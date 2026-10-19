@@ -71,6 +71,7 @@ pub static DOCS: &[VerbDoc] = &[
     d("dd", "files", "raw 512-byte block: read one (`if=`) or patch one byte (`of=` `byte=`)", "dd if=<lba> | dd of=<lba> byte=<0xNN>", &["dd if=0", "dd of=2048 byte=0xAA"]),
     d("fdisk", "files", "list block devices (read-only; no partition editor)", "fdisk -l", &["fdisk -l"]),
     d("lsusb", "files", "list the USB devices the bus enumerated", "lsusb", &["lsusb"]),
+    d("hw", "system", "every device the kernel enumerated: bus, ids, the driver that claimed it (or none) and its state", "hw", &["hw"]),
     d("which", "files", "say whether a word is a verb, a program, or neither", "which <word>", &["which ls", "which HELLO"]),
     // ── windows ──
     d("view", "windows", "open a text file in the read-only viewer window", "view <path>", &["view README.TXT"]),

@@ -500,7 +500,7 @@ pub fn service() {
         let pa = BRIGHT_PERSIST_AT.load(Ordering::Acquire); // BRIGHTSLIDER M2: the slider's store write, debounced off the press
         if pa != 0 && crate::arch::ms() >= pa && BRIGHT_PERSIST_AT.compare_exchange(pa, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() { let _s = super::loginrender::stamp(super::loginrender::W_S_PERSIST); persist(0); }
     }
-    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); kbd_service(); security_service(); #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] sysimg::service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
+    { let _s = super::loginrender::stamp(super::loginrender::W_S_MODE); mode_service(); tp_service(); bus_changes(); a11y_service(); lowbat_service(); privacy_service(); kbd_service(); security_service(); about_service(); #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] sysimg::service(); if crate::clock::locale::service() && is_open() && cur_tab() == DT_TAB { repaint(); } } if OPEN_REQ.swap(false, Ordering::AcqRel) { // PREFSUI: a chosen mode is applied here, off the click router
         if let Err(e) = open() {
             serial_println!("[settings] refuse reason={}", e);
         }
@@ -1057,13 +1057,13 @@ fn paint_about(st: &mut State) { #[cfg(all(target_arch = "x86_64", feature = "in
     }
     let (tf, uf) = (super::text::Face::Title, super::text::Face::Ui); // FONTSCRAFT (B640): the About card's name in the title face
     let (tc, uc) = (super::metrics::lcell_h(tf), super::metrics::lcell_h(uf));
-    let mut y = y0 + 24 + mark + 12;
-    let tw = super::metrics::ladvance(b"UnaOS", true, tf);
-    text_at(st, cx - tw / 2, y, CTRL_R, "UnaOS", theme::text_primary(), true, tf);
-    y += tc + 4;
-    let vw = super::metrics::ladvance(ver.as_bytes(), false, uf);
-    text_at(st, cx.saturating_sub(vw / 2).max(LABEL_X), y, CTRL_R, ver, theme::ink_secondary(), false, uf);
-    y += uc + 20;
+    let nx = LABEL_X + mark + 12;
+    text_at(st, nx, y0 + 16, cx - 8, "UnaOS", theme::text_primary(), true, tf);
+    text_at(st, nx, y0 + 16 + tc + 2, cx - 8, ver, theme::ink_secondary(), false, uf);
+    let mut y = y0 + 16 + mark + 14;
+    text_at(st, LABEL_X, y, cx - 8, "Safe mode: hold Shift after login", theme::ink_secondary(), false, uf);
+    y += uc + 4;
+    text_at(st, LABEL_X, y, cx - 8, "(display prefs reset; or an UNAOS_PREFS_RESET=1 image)", theme::ink_secondary(), false, uf);
     #[cfg(target_arch = "x86_64")]
     let cpus = alloc::format!("{}", crate::arch::x86_64::acpi::cpu_count());
     #[cfg(not(target_arch = "x86_64"))]
@@ -1072,20 +1072,18 @@ fn paint_about(st: &mut State) { #[cfg(all(target_arch = "x86_64", feature = "in
     let mem = alloc::format!("{} MiB kernel heap", b.saturating_sub(a) >> 20);
     let up = crate::clock::uptime_secs().map(|u| alloc::format!("{}h {}m {}s", u / 3600, (u / 60) % 60, u % 60)).unwrap_or_else(|| String::from("n/a"));
     let board = if cfg!(target_arch = "x86_64") { "x86_64 (UEFI)" } else { "aarch64" };
-    let facts: [(&str, &str); 6] = [
-        ("Board", board),
-        ("CPUs", &cpus),
-        ("Memory", &mem),
-        ("Uptime", &up),
-        ("Safe mode", "hold Shift after login: display prefs reset"),
-        ("", "(or boot an UNAOS_PREFS_RESET=1 image)"),
+    let facts: [(&str, &str); 4] = [
+        ("Board", board), ("CPUs", &cpus),
+        ("Memory", &mem), ("Uptime", &up),
     ];
+    let mut y = y0 + 16;
     for (k, val) in facts {
         let kw = super::metrics::ladvance(k.as_bytes(), false, uf);
         text_at(st, (cx - 8).saturating_sub(kw), y, cx, k, theme::ink_secondary(), false, uf);
         text_at(st, cx + 8, y, CTRL_R, val, theme::text_primary(), false, uf);
         y += uc + 10; #[cfg(all(target_arch = "x86_64", feature = "installdemo"))] { y -= sysimg::FACT_TIGHTEN; } // UPDATEUI (B726): the compact card's facts. LINE-NEUTRAL fold
     }
+    #[cfg(not(all(target_arch = "x86_64", feature = "installdemo")))] paint_hardware(st); // the fold: UPDATEUI (B726) holds About rows 5..8 on the image line; the list gets its own tab (HWTAB, owed)
 }
 
 // ── Users tab (M2) ────────────────────────────────────────────────────────────────────────────
@@ -1505,7 +1503,7 @@ fn wheel(d: i8) -> bool {
         FT_PAGE.store(next, Ordering::Relaxed);
         ("pane", next != page)
     } else {
-        ("pane", false)
+        if cur_tab() == ABOUT_TAB { hw_wheel(d, step) } else { ("pane", false) } // HWREPORT (B725): the Hardware list scrolls under the wheel
     };
     serial_println!("[settings] wheel area={} d={} moved={}", area, d, moved as u8);
     if moved { repaint(); }
@@ -4428,5 +4426,100 @@ pub(crate) mod sysimg {
             run_in(&crate::shell::vfs_mount_table(), None);
             super::repaint();
         }
+    }
+}
+// ── HWREPORT (rmbp-ledger B725, BP-bar-25) — About's Hardware list — TAIL-APPENDED ──────────────────────────────────
+// Under the About card, one line per device `hw::census` found: what it is, its bus, ids and place, the driver's module
+// name and its state; a device no driver claimed says `No driver yet`. The paint reads `hw::last` (`try_lock`, never a
+// census, never a register): a missing or stale census (older than [`HW_STALE_MS`]) is asked for, and the settings
+// service pass ([`about_service`]) builds it without waiting (a held USB loan = ask again next pass). The wheel over
+// the pane scrolls the list ([`hw_wheel`]); a thumb shows where the visible lines sit.
+
+/// The About tab's index on the strip.
+const ABOUT_TAB: usize = 3;
+/// The About card's rows; the Hardware list takes the rows under them.
+const ABOUT_ROWS: usize = 4;
+/// A census older than this is asked for again while About is shown.
+const HW_STALE_MS: u64 = 15_000;
+static HW_TOP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static HW_WANT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static HW_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The list's geometry: `(heading top, box top, box bottom, line pitch, visible lines)`, logical px.
+fn hw_geom() -> (usize, usize, usize, usize, usize) {
+    let uc = super::metrics::lcell_h(super::text::Face::Ui);
+    let head = row_top(ABOUT_ROWS) + GAP;
+    let top = head + uc + 8;
+    let bot = row_top(ROWS) - GAP;
+    let lh = uc + 8;
+    (head, top, bot, lh, (bot.saturating_sub(top + 8) / lh).max(1))
+}
+
+fn paint_hardware(st: &mut State) {
+    let c = crate::hw::last();
+    let now = crate::arch::ms();
+    if c.is_none() || now.saturating_sub(HW_AT.load(Ordering::Relaxed)) >= HW_STALE_MS {
+        HW_WANT.store(true, Ordering::Relaxed);
+    }
+    let face = super::text::Face::Ui;
+    let (head, top, bot, lh, vis) = hw_geom();
+    text_at(st, LABEL_X, head, CTRL_R, "Hardware", theme::text_primary(), true, face);
+    {
+        let mut s = sf(st);
+        draw::group_box(&mut s, Rect::new(e(BOX_X), e(top), ew(BOX_X, BOX_W), e(bot) - e(top)), b"");
+    }
+    let Some(c) = c else {
+        text_at(st, LABEL_X, top + 8, CTRL_R, "Reading the devices...", theme::ink_secondary(), false, face);
+        return;
+    };
+    let n = c.rows.len();
+    let d = c.driven();
+    let sum = alloc::format!("{} devices  -  {} with a driver  -  {} without", n, d, n - d);
+    let sw = super::metrics::ladvance(sum.as_bytes(), false, face);
+    text_at(st, CTRL_R.saturating_sub(sw).max(LABEL_X + 120), head, CTRL_R, &sum, theme::ink_secondary(), false, face);
+    let first = HW_TOP.load(Ordering::Relaxed).min(n.saturating_sub(vis));
+    HW_TOP.store(first, Ordering::Relaxed);
+    let (where_x, drv_x, st_x) = (LABEL_X + 230, CTRL_R - 190, CTRL_R - 96);
+    for (k, r) in c.rows.iter().enumerate().skip(first).take(vis) {
+        let y = top + 8 + (k - first) * lh;
+        text_at(st, LABEL_X, y, where_x - 8, &r.name, theme::text_primary(), false, face);
+        text_at(st, where_x, y, drv_x - 8, &alloc::format!("{} {}  {}", r.bus, r.id, r.at), theme::ink_secondary(), false, face);
+        if r.driver == "none" {
+            text_at(st, drv_x, y, CTRL_R, "No driver yet", theme::ink_secondary(), false, face);
+        } else {
+            text_at(st, drv_x, y, st_x - 8, r.driver, theme::text_primary(), false, face);
+            let ink = if r.state == "up" { theme::ink_positive() } else if r.state.starts_with("refused") { theme::ink_warning() } else { theme::ink_secondary() };
+            text_at(st, st_x, y, CTRL_R, r.state, ink, false, face);
+        }
+    }
+    if n > vis {
+        // The scroll thumb: where the visible lines sit in the whole list.
+        let track = bot - top - 8;
+        let (ty, th) = (top + 4 + first * track / n, (vis * track / n).max(8));
+        let r = Rect::new(e(BOX_X + BOX_W - 6), e(ty), ew(BOX_X + BOX_W - 6, 3), ew(ty, th));
+        draw::fill_rrect(&mut sf(st), r, r.w / 2, Ink::argb(theme::control_edge()));
+    }
+}
+
+/// A wheel detent over the About pane: scroll the Hardware list (positive = toward the top, QSCROLL's sign).
+fn hw_wheel(d: i8, step: usize) -> (&'static str, bool) {
+    let n = crate::hw::last().map(|c| c.rows.len()).unwrap_or(0);
+    let vis = hw_geom().4;
+    let cur = HW_TOP.load(Ordering::Relaxed);
+    let next = (if d > 0 { cur.saturating_sub(step) } else { cur + step }).min(n.saturating_sub(vis));
+    HW_TOP.store(next, Ordering::Relaxed);
+    ("hardware", next != cur)
+}
+
+/// The service pass: a census the About pane asked for, built without waiting (a held registry asks again next pass).
+fn about_service() {
+    if !HW_WANT.load(Ordering::Relaxed) || !is_open() || cur_tab() != ABOUT_TAB {
+        return;
+    }
+    let c = crate::hw::census(false);
+    if !c.busy {
+        HW_WANT.store(false, Ordering::Relaxed);
+        HW_AT.store(crate::arch::ms(), Ordering::Relaxed);
+        repaint();
     }
 }

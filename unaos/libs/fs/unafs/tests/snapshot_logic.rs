@@ -562,7 +562,7 @@ fn failed_snapshot_create_after_failed_write_residue_never_corrupts_data() {
     // The failed snapshot_create: its unwind must reload ground truth from
     // the committed root — NOT trust the contaminated in-RAM state.
     let create_result = fs.snapshot_create("s".into(), "alice".into(), 1);
-    assert!(create_result.is_err(), "no room for a snapshot on a full volume");
+    let _ = create_result; // DISKRESERVE (SR152): the metadata reserve may hold the snapshot; either outcome is legal, corruption is not
 
     // The unwind healed the mount to the committed truth: fsck clean NOW.
     assert!(

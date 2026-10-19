@@ -295,7 +295,7 @@ pub const HOST_VERBS: &[(&str, Avail)] = &[
     // the way `git` / `ip` / `systemctl` spell a family. `snap list|create|drop|ls|cat`.
     ("snap", Avail::Always),
     // block / device
-    ("fdisk", Avail::Always), ("lsusb", Avail::Always), ("dd", Avail::Always),
+    ("fdisk", Avail::Always), ("lsusb", Avail::Always), ("hw", Avail::Always), ("dd", Avail::Always),
     // network
     ("ifconfig", Avail::Always), ("ping", Avail::Always), ("arp", Avail::Always),
     ("nc", Avail::Always), ("curl", Avail::Always), ("fetch", Avail::Always),

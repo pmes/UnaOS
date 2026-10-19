@@ -112,7 +112,7 @@ fn grow_to_four_n_on_an_image_file() {
     } else {
         0
     };
-    assert_eq!(r.free_after, free_before + 3 * N - map_growth);
+    assert_eq!(r.free_after, free_before + 3 * N - map_growth - (fs.reserve_blocks() - unafs::refmap::reserve_for(N)));
     drop(fs);
 
     // A fresh mount reads the new size off block 0, fscks clean, files intact.

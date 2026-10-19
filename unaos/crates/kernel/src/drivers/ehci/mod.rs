@@ -19981,3 +19981,15 @@ fn tp_mode_ok(idx: usize, latched: bool) {
         idx, crate::arch::ms(), n, if latched { "vendor" } else { "other" }
     );
 }
+
+/// HWREPORT (rmbp-ledger B725): the EHCI registry read back for `hw::census` — per controller its PCI function and, per
+/// interrupt endpoint this driver armed, its HID kind (0 keyboard, 1 relative mouse, 2 report-protocol pointer — the
+/// trackpad path, 3 other) and whether it was given up (`dead`). `None` while the table is held (`try_lock`; the
+/// caller retries). Reads only. Tail-appended, so no line above moves.
+pub fn census() -> Option<Vec<((u8, u8, u8), Vec<(u8, bool)>)>> {
+    let g = EHCI_HID.try_lock()?;
+    Some(g.as_ref().map(|cs| cs.iter().map(|c| {
+        let eps = c.int_eps.iter().map(|e| (if e.is_kbd { 0 } else if e.is_rel_mouse { 1 } else if e.layout.is_some() { 2 } else { 3 }, e.dead)).collect();
+        ((c.bus, c.dev, c.func), eps)
+    }).collect()).unwrap_or_default())
+}

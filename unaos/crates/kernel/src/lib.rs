@@ -346,3 +346,5 @@ pub mod aether;
 pub mod pointerfeel;
 // RING3PIPE (rmbp-ledger B609): a launcher reads its child's console output — the arch-neutral pipe table `SYS_SPAWN_PATH`'s SPAWN_PIPE and `SYS_PIPE_READ` meet in. Tail statement, so no existing line moves.
 pub mod pipe; #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] pub mod striaapp; // STRIAMETAL (LEDGER SR139): `tests stria` — APPS/STRIA.ELF (Stria, the A/V handler, as a ring-3 program) validated, spawned on the staged TEST.WEBM, its end line read back; both arches through the launch facade (ARMTESTS A109). SAME-LINE fold, so no existing line moves.
+// HWREPORT (rmbp-ledger B725): `hw::census` — every device the kernel enumerated, read from the drivers' registries; Settings > About lists it, `tests hwreport`. Tail statement, so no existing line moves.
+pub mod hw;
