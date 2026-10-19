@@ -1666,14 +1666,14 @@ fn stream_arm(addr: u8, w: u16, h: u16, cc: [u8; 4], expect: u32) -> bool {
     STREAM_ADDR.store(addr as u32, Ordering::Relaxed);
     STREAM_WH.store(((w as u32) << 16) | h as u32, Ordering::Relaxed);
     STREAM_CC.store(u32::from_le_bytes(cc), Ordering::Relaxed);
-    STREAM_ARMED.store(true, Ordering::Release);
+    STREAM_ARMED.store(true, Ordering::Release); crate::drivers::xhci::uvc::arm(addr, w, h, cc); // UVCCAM (rmbp-ledger B686): the viewer learns the committed geometry and FourCC
     stores
 }
 
 /// The stream is gone (unwind, or the device left). The assembler and its buffers are dropped here, in the
 /// service context — never on the claim path.
 pub fn stream_disarm() {
-    STREAM_ARMED.store(false, Ordering::Release);
+    STREAM_ARMED.store(false, Ordering::Release); crate::drivers::xhci::uvc::disarm(); // UVCCAM (B686): the viewer closes its window on its next pass
     let _ = STREAM.lock().take();
 }
 
@@ -1746,7 +1746,7 @@ pub fn probe_iso(idx: usize, addr: u8, cfg: &[u8], config_value: u8, h: &mut dyn
     // `full` is read only until the next transfer, which reuses the buffer.
     let full = unsafe { core::slice::from_raw_parts(buf as *const u8, n) };
     let call = parse(full);
-    print_census(idx, addr, &call);
+    print_census(idx, addr, &call); crate::drivers::xhci::uvc::census(addr, &call); // UVCCAM (B686): the one-line census (`addr` is the xHCI slot here, the key `note_dev` recorded)
     let cut = first_function_len(full);
     let c = if cut < full.len() { parse(&full[..cut]) } else { call }; #[cfg(feature = "sonde")] let c = multi::depth_fn(full, c); // SONDE2 (LEDGER SR105): a camera whose census has a DEPTH function (first format `Z16 `, probe_core's classification) streams THAT function, not the first one — `parse` of its own interface run in `full`. LINE-NEUTRAL append, before this comment; knob off erases it.
     if cut < full.len() {
@@ -1773,11 +1773,34 @@ pub fn probe_iso(idx: usize, addr: u8, cfg: &[u8], config_value: u8, h: &mut dyn
             continue;
         }
         let fr = f.frames[..f.nframes].iter().find(|fr| fr.index == f.default_frame).unwrap_or(&f.frames[0]);
+        if (fr.width as usize) * (fr.height as usize) * (f.bits_per_pixel as usize) / 8 > STREAM_STORE_MAX {
+            continue; // UVCCAM (B686): a default frame past the double-buffer store would be count-only — no picture
+        }
         pick = Some((f.index, fr.index, fr.default_interval, fr.width, fr.height, [f.guid[0], f.guid[1], f.guid[2], f.guid[3]]));
         break;
     }
+    // UVCCAM (rmbp-ledger B686): no uncompressed format fits the store (or there is none) — commit the first
+    // Motion-JPEG format's default frame. MJPEG payload §3.1.1 carries no GUID, so the FourCC is named `MJPG`;
+    // the assembler is unchanged (a JPEG shorter than `dwMaxVideoFrameSize` is counted `short` and still published)
+    // and `drivers/xhci/uvc.rs` decodes it with `pixel_core::decode_jpeg`.
+    if pick.is_none() {
+        for f in c.fmts[..c.nfmt].iter() {
+            #[cfg(feature = "sonde")]
+            {
+                if multi::skip_for_z16(&c, f) {
+                    continue;
+                }
+            }
+            if f.kind != Kind::Mjpeg || f.nframes == 0 {
+                continue;
+            }
+            let fr = f.frames[..f.nframes].iter().find(|fr| fr.index == f.default_frame).unwrap_or(&f.frames[0]);
+            pick = Some((f.index, fr.index, fr.default_interval, fr.width, fr.height, *b"MJPG"));
+            break;
+        }
+    }
     let Some((fmt_i, frame_i, interval, fw, fh, cc4)) = pick else {
-        serial_println!("[uvc] probe skipped addr={} host={} reason=no-uncompressed-format", addr, h.name());
+        serial_println!("[uvc] probe skipped addr={} host={} reason=no-streamable-format(uncompressed-in-store|mjpeg)", addr, h.name());
         return;
     };
     if neps == 0 {
