@@ -2067,11 +2067,11 @@ fn autolock_selftest() {
     let reopened = entered && !lock::active() && !login::is_open() && is_una(&mut nb); let (painted, hole_ms) = lock2_unlocked(l2); let resumed = lock::last_resumed(); // LOCK2 (B728): it paints within one frame of the unlock, then is closed before the fingerprint (file tail). LINE-NEUTRAL fold, code first.
     let after = lock::fingerprint();
     let same = before == after;
-    let ms = lock::last_open_ms();
-    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1; // LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
+    let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); // LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
+    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0; // LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
     serial_println!(
-        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} -> {} :: chord={} wrong={} windows_hidden={} painted={}",
-        entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), resumed, hole_ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), "owed",
+        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={}",
+        entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), resumed, hole_ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), "owed", prefs.1,
         if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8
     );
 }
@@ -4136,4 +4136,40 @@ fn keychars_wake() -> bool {
 fn keychars_repeat_byte() -> bool {
     use crate::drivers::xhci as hx;
     hx::hid_layout_claim(0x1C, 0, false) == Some(b'z') && hx::hid_layout_claim(0x2F, 0, false) == Some(0)
+}
+
+// LOCKPREFS (rmbp-ledger B748, BP-security-18) — TAIL-APPENDED, so no line above moves. `tests autolock`'s `prefs=` leg,
+// folded onto its lines: the lock's policy is Principia's, read over the bus on a PrefChanged (`lock::prefs_pass`). The
+// fixture writes `system.lock.after_idle_min` through the bus client (`prefs_client::pref_set`, the path Settings'
+// `lock::persist` takes; inline here, the fixture is not the render task) to a value no idle stretch reaches (1440 or
+// 1439 minutes: the pass may not idle-lock the fixture), runs ONE `lock::prefs_pass`, and asks that `lock::policy()`
+// moved to it (the render task's own pass may have taken the edge first: the value is still asked of `policy()`); the
+// operator's value is put back the same way and the lock follows it in one more pass. `prefs=client` = seen and
+// restored; `prefs=skip` (the home not writable: the write would be refused, the SETTINGSBUS shape) does not fail the
+// line; anything else is `prefs=FAIL`.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn lockprefs_leg() -> (bool, &'static str) {
+    use crate::prefs::key;
+    use crate::prefs_client::{pref_set, sys_int, PrefValue};
+    use crate::video::lock;
+    if crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &crate::prefs::path()).is_some() {
+        serial_println!("[lock] prefs leg skipped: the home is not writable (a set would be refused)");
+        return (true, "skip");
+    }
+    let _ = lock::prefs_pass(); // the policy is the store's before the write
+    let orig = sys_int(key::LOCK_AFTER_IDLE_MIN, 0, 1440).unwrap_or(lock::IDLE_MIN_DEFAULT as i64);
+    let want: i64 = if orig == 1440 { 1439 } else { 1440 };
+    let before = lock::policy().0;
+    let set_ok = pref_set(crate::prefs::NS, key::LOCK_AFTER_IDLE_MIN, PrefValue::Int(want)).is_ok();
+    let reread = lock::prefs_pass();
+    let seen = lock::policy().0;
+    let back_ok = pref_set(crate::prefs::NS, key::LOCK_AFTER_IDLE_MIN, PrefValue::Int(orig)).is_ok();
+    let _ = lock::prefs_pass();
+    let restored = lock::policy().0 as i64 == orig;
+    let ok = set_ok && before as i64 != want && seen as i64 == want && back_ok && restored;
+    serial_println!(
+        "[lock] prefs leg want={} before={} seen={} reread={} restored={} via={} -> {}",
+        want, before, seen, reread as u8, restored as u8, crate::prefs_client::last_via(), if ok { "ok" } else { "bad" }
+    );
+    (ok, if ok { "client" } else { "FAIL" })
 }
