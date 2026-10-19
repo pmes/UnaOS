@@ -23,9 +23,9 @@
 //! then remove the stage it made; then the same through the `stage` verb (its printed line and the record it left).
 //!
 //! KELFSTAGE (rmbp-ledger B720, BP-boot-17): `KELF.SHA` follows the slots. The stage writes the slot-B row (sha256 of
-//! the RE-READ `KERNEL.NEW`, `kelfsha::kelf_of`'s `kelf=`) before `STAGE.REC`; the promotion, AFTER both renames,
-//! respells it as the slot-A row (`kelfsha::promoted`) so `hash=ok` survives an update; a failed rename leaves the old
-//! row; the unstage drops the B row. The promotion is decided by [`should_promote`]: a trial that the running kernel
+//! the RE-READ `KERNEL.NEW`, keyed — STAGEWINDOW) before `STAGE.REC`; the promotion respells it as the slot-A row
+//! (`kelfsha::promoted`; STAGEWINDOW: as `KELF.SHA.NEW` before the renames, committed after) so `hash=ok` survives an
+//! update; a failed rename leaves the old row; the unstage drops the B row. The promotion is decided by [`should_promote`]: a trial that the running kernel
 //! is slot B (the loader's verdict) — which is also how the loader's A->B hash fallback (`why=trial`, no stage) ends.
 //! `tests kelfstage` (tests.rs tail).
 //! UPDATEUI (rmbp-ledger B726, BP-bar-8) — the FACE of the above, for Settings > About > System image:
@@ -40,6 +40,14 @@
 //!   records; written before `STAGE.REC`, read only when its `kelf=` matches; the loader never reads it. `fell=` is
 //!   written once, at the first DESKTOPBUILT after the loader's fallback ([`desktop_built`] -> `settle`).
 //! * [`remove_set_aside`]: the pane's Remove — [`unstage`], said on the wire.
+//!
+//! STAGEWINDOW (rmbp-ledger B733, BP-boot-17): the record write is ATOMIC with the promotion. [`promote_on`] writes
+//! `KELF.SHA.NEW` (`kelfsha::NEXT`: the promoted A row, no B row) and reads it back BEFORE the kernel renames, and
+//! renames it over `KELF.SHA` after them; the loader takes `KELF.SHA.NEW` as the record whenever it is present, so
+//! every power cut boots `ok` or `unverified`, never the halt. [`heal_on`] settles a cut (stage, unstage, and
+//! [`desktop_built`] when `KELF.SHA.NEW` is present). Both run over [`Esp`], so `tests kelfstage` runs THE sequence on
+//! a RAM directory that loses power after N writes. Rows are keyed (`kelf=`, `size=`, `head=`), one spelling
+//! (`kelfsha::row`).
 
 use alloc::format;
 use alloc::string::String;
@@ -103,6 +111,41 @@ fn kelf_of(head: &[u8]) -> Option<u64> {
     segs[..n].iter().map(|s| s.vaddr.checked_add(s.memsz)).try_fold(0u64, |m, e| e.map(|e| m.max(e)))
 }
 
+/// STAGEWINDOW (B733): the ESP as the promotion and the heal see it — five verbs over 8.3/VFAT names in its root, so
+/// the one sequence runs on the boot FAT ([`Fat`]) and on `tests kelfstage`'s RAM directory, which loses power after N
+/// mutations. `rm` of an absent file is `Ok` and mutates nothing; `mv` onto an existing name is refused (FAT's rule).
+pub(crate) trait Esp {
+    fn has(&mut self, name: &str) -> bool;
+    /// A small record, whole (at most `kelfsha::MAX` bytes); `None` when absent.
+    fn get(&mut self, name: &str) -> Option<Vec<u8>>;
+    fn put(&mut self, name: &str, bytes: &[u8]) -> Result<(), &'static str>;
+    fn mv(&mut self, from: &str, to: &str) -> Result<(), &'static str>;
+    fn rm(&mut self, name: &str) -> Result<(), &'static str>;
+}
+
+/// The boot FAT through the namespace (`/boot/<name>`), the caller holding the updater's unlock.
+struct Fat<'a>(&'a MountTable);
+
+impl Esp for Fat<'_> {
+    fn has(&mut self, name: &str) -> bool {
+        exists(self.0, name)
+    }
+    fn get(&mut self, name: &str) -> Option<Vec<u8>> {
+        let p = esp(name);
+        let st = self.0.stat(&p).ok()?;
+        self.0.read(&p, 0, (st.size as usize).min(kelfsha::MAX)).ok()
+    }
+    fn put(&mut self, name: &str, bytes: &[u8]) -> Result<(), &'static str> {
+        put(self.0, name, bytes)
+    }
+    fn mv(&mut self, from: &str, to: &str) -> Result<(), &'static str> {
+        self.0.rename(&esp(from), &esp(to), KERNEL_PRINCIPAL).map_err(|_| "rename")
+    }
+    fn rm(&mut self, name: &str) -> Result<(), &'static str> {
+        drop_file(self.0, name)
+    }
+}
+
 /// What a stage wrote.
 #[derive(Clone, Copy, Debug)]
 pub struct Staged {
@@ -139,19 +182,27 @@ fn kelf_put_row(mt: &MountTable, slot: u8, row: Option<&[u8]>) -> Result<(), &'s
 /// KELFSTAGE: the record after KERNEL.NEW became KERNEL.ELF — the B row respelled as A; with no B row the A row would
 /// describe the outgoing image, so the record is removed (`no-record` = `unverified`, never a lockout). The word says
 /// which.
-fn kelf_promote(mt: &MountTable) -> &'static str {
-    let Some(old) = read_kelf(mt) else { return "none" };
+/// STAGEWINDOW: the heal's path for a torn promotion that wrote no `KELF.SHA.NEW` (a kernel before STAGEWINDOW).
+fn kelf_promote_on<E: Esp>(e: &mut E) -> &'static str {
+    let Some(old) = e.get(kelfsha::NAME) else { return "none" };
     let mut out = [0u8; kelfsha::MAX];
     match kelfsha::promoted(&old, &mut out) {
-        Some(n) => match put(mt, kelfsha::NAME, &out[..n]) {
+        Some(n) => match e.put(kelfsha::NAME, &out[..n]) {
             Ok(()) => "row-A",
             Err(_) => "write-FAILED",
         },
-        None => match drop_file(mt, kelfsha::NAME) {
+        None => match e.rm(kelfsha::NAME) {
             Ok(()) => "dropped-no-B-row",
             Err(_) => "drop-FAILED",
         },
     }
+}
+
+/// STAGEWINDOW: the commit — `KELF.SHA.NEW` becomes `KELF.SHA`. The FAT refuses a rename onto an existing name, so the
+/// old record goes first; between the two the loader reads `KELF.SHA.NEW` alone, which is the record either way.
+fn commit_on<E: Esp>(e: &mut E) -> Result<(), &'static str> {
+    e.rm(kelfsha::NAME).map_err(|_| "kelfsha-commit-drop")?;
+    e.mv(kelfsha::NEXT, kelfsha::NAME).map_err(|_| "kelfsha-commit-rename")
 }
 
 /// KELFSTAGE: THE PROMOTION DECISION. `booted` is the slot the loader jumped to (`BootInfo::kelf`, 0 = A, 1 = B;
@@ -213,10 +264,14 @@ fn stage_core(src: &MountTable, path: &str, from: &str, src_sha: &str) -> Result
     let crc = crc.finish();
     let mut back = crate::hash::Crc32::new();
     let mut sha = crypto_core::sha2::Sha256::new();
+    let mut key = None; // STAGEWINDOW: the B row's key, from the RE-READ first chunk (phdrs and the 4 KiB head)
     let mut off = 0u64;
     while off < st.size {
         let want = ((st.size - off) as usize).min(CHUNK);
         let buf = mt.read(&new, off, want).map_err(|_| "new-reread")?;
+        if off == 0 {
+            key = kelfsha::key_of(&buf, st.size, &crypto_core::sha2::sha256(kelfsha::head(&buf)));
+        }
         back.update(&buf);
         sha.update(&buf);
         off += want as u64;
@@ -224,11 +279,12 @@ fn stage_core(src: &MountTable, path: &str, from: &str, src_sha: &str) -> Result
     if back.finish() != crc || mt.stat(&new).map(|s| s.size).ok() != Some(st.size) {
         return Err("new-verify");
     }
+    let key = key.ok_or("new-verify")?;
     let sha = sha.finalize();
     put(&mt, abslot::SHUTDOWN, abslot::REC_STAGED)?;
     // KELFSTAGE (B720): the slot-B row, BEFORE STAGE.REC (a stage whose row is not written is no stage).
     let mut row = [0u8; kelfsha::ROW_MAX];
-    let rn = kelfsha::row(&sha, abslot::NEW, kelfsha::SLOT_B, kelfsha::kelf_of(&head).unwrap_or(kelf), &mut row);
+    let rn = kelfsha::row(&kelfsha::Row::new(sha, kelfsha::SLOT_B, key), &mut row); // STAGEWINDOW: the one keyed spelling
     kelf_put_row(&mt, kelfsha::SLOT_B, Some(&row[..rn]))?;
     let side = format!("src={} sha={} at={} kelf={:#x}\n", clean(from, 40), clean(src_sha, 8), crate::clock::unix_now().unwrap_or(0), kelf);
     put(&mt, SIDECAR, side.as_bytes())?; // UPDATEUI (B726): before STAGE.REC, so the record stays the stage's last write
@@ -286,6 +342,15 @@ pub fn note_user_shutdown(action: &str) {
 /// The boot's DESKTOPBUILT verdict. A PASS on the loader's TRIAL boot of `KERNEL.NEW` promotes it to `KERNEL.ELF`.
 pub fn desktop_built(pass: bool) {
     let mt = crate::shell::vfs_mount_table();
+    if exists(&mt, kelfsha::NEXT) {
+        // STAGEWINDOW: a promotion was cut between its record write and its commit — settle it before anything reads it.
+        let _unlock = bootfat::fat_unlock(Writer::Updater, "settle KELF.SHA.NEW");
+        if bootfat::allows() {
+            if let Err(e) = heal(&mt) {
+                serial_println!("[update] settle KELF.SHA.NEW -> FAILED {}", e);
+            }
+        }
+    }
     settle(&mt);
     let stage = read_rec(&mt, abslot::STAGE);
     let staged = abslot::staged(stage.as_deref());
@@ -311,35 +376,115 @@ pub fn desktop_built(pass: bool) {
     }
 }
 
-/// Finish a promotion torn between its two renames (no `KERNEL.ELF`, `KERNEL.NEW` present — the image the loader
-/// booted in that state) BEFORE anything overwrites or removes `KERNEL.NEW`, which is then the only kernel.
-fn heal(mt: &MountTable) -> Result<(), &'static str> {
-    if exists(mt, abslot::ELF) || !exists(mt, abslot::NEW) {
-        return Ok(());
-    }
-    mt.rename(&esp(abslot::NEW), &esp(abslot::ELF), KERNEL_PRINCIPAL).map_err(|_| "heal-rename")?;
-    let k = kelf_promote(mt); // KELFSTAGE: the record follows the rename
-    serial_println!("[update] healed a torn promotion: KERNEL.NEW -> KERNEL.ELF kelfsha={}", k);
-    drop_file(mt, abslot::OLD)
+/// What [`heal_on`] did (the word on the wire).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Healed {
+    Nothing,
+    /// A promotion torn between its two renames finished: `KERNEL.NEW -> KERNEL.ELF`, then the record (the word).
+    Renamed(&'static str),
+    /// `KELF.SHA.NEW` beside a `KERNEL.NEW`: the promotion never reached its renames — the next record dropped.
+    NextDropped,
+    /// `KELF.SHA.NEW` with no `KERNEL.NEW`: the renames held — the next record committed over `KELF.SHA`.
+    NextCommitted,
 }
 
-/// Ok carries the KELF.SHA rewrite's word (KELFSTAGE): the record is rewritten only AFTER both renames held.
+/// Finish a promotion torn between its two renames (no `KERNEL.ELF`, `KERNEL.NEW` present — the image the loader
+/// booted in that state) BEFORE anything overwrites or removes `KERNEL.NEW`, which is then the only kernel; and
+/// (STAGEWINDOW) settle a `KELF.SHA.NEW` the promotion was cut beside.
+pub(crate) fn heal_on<E: Esp>(e: &mut E) -> Result<Healed, &'static str> {
+    let next = e.has(kelfsha::NEXT);
+    if !e.has(abslot::ELF) && e.has(abslot::NEW) {
+        e.mv(abslot::NEW, abslot::ELF).map_err(|_| "heal-rename")?;
+        // KELFSTAGE: the record follows the rename. STAGEWINDOW: the next record was written before the renames.
+        let k = if next {
+            commit_on(e)?;
+            "row-A-next"
+        } else {
+            kelf_promote_on(e)
+        };
+        e.rm(abslot::OLD)?;
+        return Ok(Healed::Renamed(k));
+    }
+    if !next {
+        return Ok(Healed::Nothing);
+    }
+    if e.has(abslot::NEW) {
+        e.rm(kelfsha::NEXT)?;
+        Ok(Healed::NextDropped)
+    } else {
+        commit_on(e)?;
+        Ok(Healed::NextCommitted)
+    }
+}
+
+fn heal(mt: &MountTable) -> Result<(), &'static str> {
+    match heal_on(&mut Fat(mt))? {
+        Healed::Nothing => {}
+        Healed::Renamed(k) => serial_println!("[update] healed a torn promotion: KERNEL.NEW -> KERNEL.ELF kelfsha={}", k),
+        Healed::NextDropped => serial_println!("[update] healed a cut promotion: renames never ran, KELF.SHA.NEW dropped (KELF.SHA stands)"),
+        Healed::NextCommitted => serial_println!("[update] healed a cut promotion: renames held, KELF.SHA.NEW -> KELF.SHA"),
+    }
+    Ok(())
+}
+
+/// THE PROMOTION (STAGEWINDOW B733: the record write is atomic with it). P1 `KELF.SHA.NEW` := the promoted record
+/// (the B row as the A row, no B row), read back — or, with no B row, `KELF.SHA` dropped (`no-record`, never stale);
+/// P2 ELF->OLD; P3 NEW->ELF (a failed rename drops `KELF.SHA.NEW`, so the old record stands beside the slots it
+/// describes); P4 commit `KELF.SHA.NEW` over `KELF.SHA`; P5 drop OLD and STAGE.REC, `SHUTDOWN.REC := why=promoted`.
+/// The loader reads `KELF.SHA.NEW` as the record while it exists: every cut boots `ok` or `unverified` (the state
+/// table is in the STAGEWINDOW commit; `tests kelfstage` cuts power after every write). Ok carries the record's word.
+pub(crate) fn promote_on<E: Esp>(e: &mut E) -> Result<&'static str, &'static str> {
+    if !e.has(abslot::NEW) {
+        return Err("new-missing");
+    }
+    e.rm(abslot::OLD)?;
+    let word = match e.get(kelfsha::NAME) {
+        None => {
+            e.rm(kelfsha::NEXT)?;
+            "none"
+        }
+        Some(cur) => {
+            let mut out = [0u8; kelfsha::MAX];
+            match kelfsha::promoted(&cur, &mut out) {
+                Some(n) => {
+                    let next = &out[..n];
+                    if e.put(kelfsha::NEXT, next).is_err() || e.get(kelfsha::NEXT).as_deref() != Some(next) {
+                        let _ = e.rm(kelfsha::NEXT);
+                        return Err("kelfsha-next-write");
+                    }
+                    "row-A"
+                }
+                None => {
+                    e.rm(kelfsha::NEXT)?;
+                    e.rm(kelfsha::NAME).map_err(|_| "kelfsha-drop")?;
+                    "dropped-no-B-row"
+                }
+            }
+        }
+    };
+    let renamed = e
+        .mv(abslot::ELF, abslot::OLD)
+        .map_err(|_| "rename-elf-old")
+        .and_then(|()| e.mv(abslot::NEW, abslot::ELF).map_err(|_| "rename-new-elf"));
+    if let Err(w) = renamed {
+        let _ = e.rm(kelfsha::NEXT);
+        return Err(w);
+    }
+    if word == "row-A" {
+        commit_on(e)?;
+    }
+    e.rm(abslot::OLD)?;
+    e.rm(abslot::STAGE)?;
+    e.put(abslot::SHUTDOWN, abslot::REC_PROMOTED).map(|()| word)
+}
+
 fn promote(mt: &MountTable) -> Result<&'static str, &'static str> {
     let _unlock = bootfat::fat_unlock(Writer::Updater, "promote KERNEL.NEW -> KERNEL.ELF");
     if !bootfat::allows() {
         return Err("esp-locked");
     }
-    if !exists(mt, abslot::NEW) {
-        return Err("new-missing");
-    }
-    drop_file(mt, abslot::OLD)?;
-    mt.rename(&esp(abslot::ELF), &esp(abslot::OLD), KERNEL_PRINCIPAL).map_err(|_| "rename-elf-old")?;
-    mt.rename(&esp(abslot::NEW), &esp(abslot::ELF), KERNEL_PRINCIPAL).map_err(|_| "rename-new-elf")?;
-    let k = kelf_promote(mt);
-    drop_file(mt, abslot::OLD)?;
-    drop_file(mt, abslot::STAGE)?;
-    drop_file(mt, SIDECAR)?; // UPDATEUI (B726)
-    put(mt, abslot::SHUTDOWN, abslot::REC_PROMOTED).map(|()| k)
+    drop_file(mt, SIDECAR)?; // UPDATEUI (B726): the kernel's note goes with the stage
+    promote_on(&mut Fat(mt))
 }
 
 /// `tests abimage` — stage a copy of the running kernel, assert the record, assert the loader's decision function's

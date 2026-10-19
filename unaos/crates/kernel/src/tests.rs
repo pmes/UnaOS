@@ -2372,7 +2372,8 @@ fn fontkit_selftest() {
 // DESKTOPBUILT PASS promotes (`install/abimage.rs`, `crates/bootloader/src/kelfsha.rs`). `tests kelfstage`: stage the
 // running image's own `/boot/KERNEL.ELF`, check the two rows, simulate the promotion on the record (the pure rewrite;
 // the boot volume's kernel is never renamed by a fixture), check the trial rules, unstage and check the B row went.
-// `:: KELFSTAGE: rows=2 promoted_row=ok fallback_trial=ok -> PASS ::`
+// `:: KELFSTAGE: rows=2 promoted_row=ok fallback_trial=ok cuts=<n> halts=0 healed=<n>/<n> keyed=ok -> PASS ::` (STAGEWINDOW
+// B733 adds the cut leg, `kelfstage_cuts` at the file tail).
 
 /// KELFSTAGE: the slot the loader jumped to (0 = A, 1 = B), from the verdict `kelf_note` kept; `None` for a loader
 /// older than KELFHASH (`install::abimage::should_promote` then keeps ABIMAGE's rule).
@@ -2403,7 +2404,7 @@ fn kelfstage_selftest() {
             let b = kelfsha::find(r, kelfsha::SLOT_B);
             let a_kept = a_before.is_none() || kelfsha::find(r, kelfsha::SLOT_A) == a_before;
             let ok = b.is_some_and(|b| b.sha == sha && b.sha == st.sha)
-                && kelfsha::check(Some(r), kelfsha::SLOT_B, &sha, nb) == kelfsha::Check::Ok
+                && kelf_chk(Some(r), kelfsha::SLOT_B, nb) == kelfsha::Check::Ok
                 && a_kept
                 && n == if a_before.is_some() { 2 } else { 1 };
             (n, ok, Some(sha))
@@ -2421,7 +2422,7 @@ fn kelfstage_selftest() {
                     && kelfsha::find(p, kelfsha::SLOT_B).is_none()
                     && kelfsha::find(p, kelfsha::SLOT_A).is_some_and(|a| a.sha == sha)
                     && p.windows(16).any(|w| w == b"file=KERNEL.ELF ")
-                    && kelfsha::check(Some(p), kelfsha::SLOT_A, &sha, nb) == kelfsha::Check::Ok
+                    && kelf_chk(Some(p), kelfsha::SLOT_A, nb) == kelfsha::Check::Ok
             })
         }
         _ => false,
@@ -2455,11 +2456,12 @@ fn kelfstage_selftest() {
         if a_before.is_some() { "builder" } else { "absent" },
         unstaged_ok as u8
     );
-    let pass = rows == 2 && rows_ok && promoted_ok && fallback_ok && unstaged_ok;
+    let cut = kelfstage_cuts(); // STAGEWINDOW (B733): every power cut of THE promotion, on a RAM directory
+    let pass = rows == 2 && rows_ok && promoted_ok && fallback_ok && unstaged_ok && cut.pass();
     let w = |b: bool| if b { "ok" } else { "bad" };
     serial_println!(
-        ":: KELFSTAGE: rows={} promoted_row={} fallback_trial={} -> {} ::",
-        rows, w(rows_ok && promoted_ok), w(fallback_ok && unstaged_ok), if pass { "PASS" } else { "FAIL" }
+        ":: KELFSTAGE: rows={} promoted_row={} fallback_trial={} cuts={} halts={} healed={}/{} keyed={} -> {} ::",
+        rows, w(rows_ok && promoted_ok), w(fallback_ok && unstaged_ok), cut.cuts, cut.halts, cut.healed, cut.cuts, w(cut.keyed), if pass { "PASS" } else { "FAIL" }
     );
 }
 
@@ -3187,4 +3189,238 @@ fn audiomix_selftest() {
     crate::audio::mixer::selftest();
     #[cfg(not(any(feature = "uvc", feature = "hda-tone")))]
     serial_println!(":: AUDIOMIX: sources=0 mixed=- underruns=0 mute=- -> SKIP reason=no-audio-path ::");
+}
+
+// STAGEWINDOW (rmbp-ledger B733, BP-boot-17, BP-bar-8) — TAIL-APPENDED, the body of `tests kelfstage`'s cut leg. THE
+// promotion (`install::abimage::promote_on`) runs on a RAM directory (`RamEsp`: case-blind names, a rename onto an
+// existing name refused — the FAT's rules) seeded as a passed trial whose two images SHARE one `kelf=` max, with the
+// power lost after k writes (k = 0 .. done) and, when the cut write is a file write, half its bytes landed. At every
+// cut the loader is modelled with its own shared fns (`abslot::decide`, the missing-file open, `kelfsha::record`,
+// `kelfsha::check`, the other-slot fallback) and must read ok or unverified — never the halt; then
+// `abimage::heal_on` runs with the power back and the loader must read slot A ok. keyed: another build with the
+// same `kelf=` max reads stale, an appended byte stale, a byte flipped past the 4 KiB head a mismatch.
+
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+fn kelf_chk(rec: Option<&[u8]>, slot: u8, bytes: &[u8]) -> crate::install::abimage::kelfsha::Check {
+    use crate::install::abimage::kelfsha;
+    let sha = crypto_core::sha2::sha256(bytes);
+    let key = kelfsha::key_of(bytes, bytes.len() as u64, &crypto_core::sha2::sha256(kelfsha::head(bytes)));
+    kelfsha::check(rec, slot, &sha, key.as_ref())
+}
+
+/// The ESP's root directory in RAM, losing power after `budget` mutations (`torn`: the cut write lands half).
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+#[derive(Clone)]
+struct RamEsp {
+    files: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<u8>)>,
+    budget: u32,
+    torn: bool,
+    dead: bool,
+    tore: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+impl RamEsp {
+    fn at(&self, name: &str) -> Option<usize> {
+        self.files.iter().position(|(n, _)| n.eq_ignore_ascii_case(name))
+    }
+    fn file(&self, name: &str) -> Option<&[u8]> {
+        self.at(name).map(|i| self.files[i].1.as_slice())
+    }
+    fn land(&mut self, name: &str, bytes: alloc::vec::Vec<u8>) {
+        match self.at(name) {
+            Some(i) => self.files[i].1 = bytes,
+            None => self.files.push((alloc::string::String::from(name), bytes)),
+        }
+    }
+    fn spend(&mut self) -> Result<(), &'static str> {
+        if self.dead || self.budget == 0 {
+            self.dead = true;
+            return Err("power-lost");
+        }
+        self.budget -= 1;
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+impl crate::install::abimage::Esp for RamEsp {
+    fn has(&mut self, name: &str) -> bool {
+        self.at(name).is_some()
+    }
+    fn get(&mut self, name: &str) -> Option<alloc::vec::Vec<u8>> {
+        let max = crate::install::abimage::kelfsha::MAX;
+        self.file(name).map(|b| b[..b.len().min(max)].to_vec())
+    }
+    fn put(&mut self, name: &str, bytes: &[u8]) -> Result<(), &'static str> {
+        if !self.dead && self.budget == 0 && self.torn {
+            self.land(name, bytes[..bytes.len() / 2].to_vec());
+            self.dead = true;
+            self.tore = true;
+            return Err("power-lost");
+        }
+        self.spend()?;
+        self.land(name, bytes.to_vec());
+        Ok(())
+    }
+    fn mv(&mut self, from: &str, to: &str) -> Result<(), &'static str> {
+        let Some(i) = self.at(from) else { return Err("not-found") };
+        if self.at(to).is_some() {
+            return Err("exists");
+        }
+        self.spend()?;
+        self.files[i].0 = alloc::string::String::from(to);
+        Ok(())
+    }
+    fn rm(&mut self, name: &str) -> Result<(), &'static str> {
+        let Some(i) = self.at(name) else { return Ok(()) };
+        self.spend()?;
+        self.files.remove(i);
+        Ok(())
+    }
+}
+
+/// The loader on a RAM directory: the slot it boots and the verdict, `None` = the halt (both slots Bad or absent).
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+fn kelf_loader_reads(e: &RamEsp) -> Option<(u8, crate::install::abimage::kelfsha::Check)> {
+    use crate::install::abimage::kelfsha::{self, Check};
+    use crate::install::abslot;
+    let letter = |s: u8| if s == 0 { kelfsha::SLOT_A } else { kelfsha::SLOT_B };
+    let d = abslot::decide(e.file(abslot::STAGE), e.file(abslot::SHUTDOWN));
+    let first: u8 = if d.slot == abslot::Slot::Elf { 0 } else { 1 };
+    let (slot, bytes) = match e.file(kelfsha::file_of(letter(first))) {
+        Some(b) => (first, b),
+        None => (1 - first, e.file(kelfsha::file_of(letter(1 - first)))?),
+    };
+    let rec = kelfsha::record(e.file(kelfsha::NAME), e.file(kelfsha::NEXT));
+    let c = kelf_chk(rec, letter(slot), bytes);
+    if c != Check::Bad {
+        return Some((slot, c));
+    }
+    let other = 1 - slot;
+    let c2 = kelf_chk(rec, letter(other), e.file(kelfsha::file_of(letter(other)))?);
+    if c2 != Check::Bad { Some((other, c2)) } else { None }
+}
+
+/// A little-endian ELF64 of `len` bytes, one PT_LOAD (so `KELF max=` 0x300000 for every `fill`), body bytes `i ^ fill`.
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+fn kelf_image(fill: u8, len: usize) -> alloc::vec::Vec<u8> {
+    let mut e = alloc::vec![0u8; len];
+    e[..4].copy_from_slice(crate::install::abimage::kelfsha::ELF_MAGIC);
+    e[4] = 2;
+    e[5] = 1;
+    e[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+    e[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    e[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+    e[64..68].copy_from_slice(&1u32.to_le_bytes());
+    e[64 + 0x10..64 + 0x18].copy_from_slice(&0x20_0000u64.to_le_bytes());
+    e[64 + 0x28..64 + 0x30].copy_from_slice(&0x10_0000u64.to_le_bytes());
+    for (i, b) in e[120..].iter_mut().enumerate() {
+        *b = (i as u8) ^ fill;
+    }
+    e
+}
+
+/// One keyed row through THE spelling (`kelfsha::row`).
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+fn kelf_row_of(slot: u8, img: &[u8]) -> alloc::vec::Vec<u8> {
+    use crate::install::abimage::kelfsha;
+    let sha = crypto_core::sha2::sha256(img);
+    let Some(key) = kelfsha::key_of(img, img.len() as u64, &crypto_core::sha2::sha256(kelfsha::head(img))) else {
+        return alloc::vec::Vec::new();
+    };
+    let mut out = [0u8; kelfsha::ROW_MAX];
+    let n = kelfsha::row(&kelfsha::Row::new(sha, slot, key), &mut out);
+    out[..n].to_vec()
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+struct KelfCuts {
+    cuts: u32,
+    halts: u32,
+    healed: u32,
+    keyed: bool,
+    done: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+impl KelfCuts {
+    fn pass(&self) -> bool {
+        self.done && self.cuts > 0 && self.halts == 0 && self.healed == self.cuts && self.keyed
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "ahci"))]
+fn kelfstage_cuts() -> KelfCuts {
+    use crate::install::abimage::{self, kelfsha::{self, Check}};
+    use crate::install::abslot;
+    let old = kelf_image(0x5a, 8192);
+    let new = kelf_image(0xa5, 8192); // another build: the same `kelf=` max and size, another head
+    // keyed: the same-max build never aliases; a size change is stale; a tear past the head is a mismatch.
+    let rec_old = kelf_row_of(kelfsha::SLOT_A, &old);
+    let mut longer = old.clone();
+    longer.push(0);
+    let mut torn = old.clone();
+    torn[6000] ^= 1;
+    let keyed = kelfsha::kelf_of(&old) == kelfsha::kelf_of(&new)
+        && kelf_chk(Some(rec_old.as_slice()), kelfsha::SLOT_A, &old) == Check::Ok
+        && kelf_chk(Some(rec_old.as_slice()), kelfsha::SLOT_A, &new) == Check::Stale
+        && kelf_chk(Some(rec_old.as_slice()), kelfsha::SLOT_A, &longer) == Check::Stale
+        && kelf_chk(Some(rec_old.as_slice()), kelfsha::SLOT_A, &torn) == Check::Bad;
+    // The seed: a trial of `new` that passed — ELF=old, NEW=new, KELF.SHA {A:old, B:new}, STAGE.REC, why=trial.
+    let mut r1 = [0u8; kelfsha::MAX];
+    let mut r2 = [0u8; kelfsha::MAX];
+    let n1 = kelfsha::with_row(&[], kelfsha::SLOT_A, Some(rec_old.as_slice()), &mut r1).unwrap_or(0);
+    let n2 = kelfsha::with_row(&r1[..n1], kelfsha::SLOT_B, Some(kelf_row_of(kelfsha::SLOT_B, &new).as_slice()), &mut r2).unwrap_or(0);
+    let mut sr = [0u8; abslot::REC_MAX];
+    let sn = abslot::stage_record(kelfsha::kelf_of(&new).unwrap_or(0), new.len() as u64, 0, &mut sr);
+    let seed = RamEsp {
+        files: alloc::vec![
+            (alloc::string::String::from(abslot::ELF), old.clone()),
+            (alloc::string::String::from(abslot::NEW), new.clone()),
+            (alloc::string::String::from(kelfsha::NAME), r2[..n2].to_vec()),
+            (alloc::string::String::from(abslot::STAGE), sr[..sn].to_vec()),
+            (alloc::string::String::from(abslot::SHUTDOWN), abslot::REC_TRIAL.to_vec()),
+        ],
+        budget: u32::MAX,
+        torn: false,
+        dead: false,
+        tore: false,
+    };
+    let mut out = KelfCuts { cuts: 0, halts: 0, healed: 0, keyed, done: false };
+    for k in 0..32u32 {
+        for tear in [false, true] {
+            let mut e = seed.clone();
+            e.budget = k;
+            e.torn = tear;
+            let r = abimage::promote_on(&mut e);
+            if !e.dead {
+                if tear {
+                    continue; // ran to the end: the clean pass already counts it
+                }
+                out.done = r.is_ok();
+            } else if tear && !e.tore {
+                continue; // the cut fell on a rename or an unlink: nothing to tear
+            }
+            out.cuts += 1;
+            let v = kelf_loader_reads(&e);
+            out.halts += v.is_none() as u32;
+            let mut h = e.clone();
+            h.budget = u32::MAX;
+            h.dead = false;
+            h.torn = false;
+            let hv = abimage::heal_on(&mut h).ok().and_then(|_| kelf_loader_reads(&h));
+            let healed = hv == Some((0, Check::Ok));
+            out.healed += healed as u32;
+            let say = |v: Option<(u8, Check)>| match v {
+                None => alloc::string::String::from("HALT"),
+                Some((s, c)) => alloc::format!("{}:{}", if s == 0 { "A" } else { "B" }, c.why_word()),
+            };
+            serial_println!("[kelfstage] cut writes={} torn={} loader={} healed={} -> {}", k, tear as u8, say(v), say(hv), if v.is_some() && healed { "ok" } else { "WRONG" });
+        }
+        if out.done {
+            break;
+        }
+    }
+    out
 }
