@@ -3702,3 +3702,28 @@ pub fn read_version(path: &str, n: usize) -> Option<Vec<u8>> {
 pub fn restore_version(path: &str, n: usize) -> bool {
     matches!(with_unafs(|fs| restore_version_on(fs, path, n).is_ok()), Ok(true))
 }
+
+// =================================================================================================
+// GEODEBACKUP (rmbp-ledger B740, BP-storage-26) — TAIL-APPENDED, so no line above moves. The record read seam the
+// kernel's `.geode` writer (`geodew`, below) archives: an inode's WHOLE attribute set — its small `attributes` and
+// every spilled `large_attributes` value read back (the host crate's `entry_of` rule, handlers/geode). The module
+// is declared here, under this file's cfg, because `fs/mod.rs` is outside the arc's files.
+// =================================================================================================
+
+/// GEODEBACKUP (B740): every attribute of inode `id` (`ino` = its record), small and spilled, keys ascending.
+pub fn record_attrs_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, id: u64, ino: &::unafs::Inode) -> Result<alloc::collections::BTreeMap<String, AttributeValue>, FileSystemError> {
+    let mut a = ino.attributes.clone();
+    for key in ino.large_attributes.keys() {
+        match fs.get_attribute(id, key)? {
+            Some(v) => {
+                a.insert(key.clone(), v);
+            }
+            None => return Err(FileSystemError::InvalidAttributeData),
+        }
+    }
+    Ok(a)
+}
+
+/// GEODEBACKUP (B740): the kernel's `.geode` v1 writer and reader, and the Settings face's worker.
+#[path = "geodew.rs"]
+pub mod geodew;
