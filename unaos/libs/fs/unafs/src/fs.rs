@@ -124,6 +124,13 @@ pub enum FileSystemError {
     SnapshotCapReached(usize),
     #[error("Snapshot not found (generation {0})")]
     SnapshotNotFound(u64),
+    /// VOLKEY (B684): the volume carries a key slot (unafs-records.md §R2a) and the mount was given no key —
+    /// [`UnaFS::mount`] refuses every keyed volume; [`UnaFS::mount_with`] opens one.
+    #[error("The volume is keyed: it opens only with its password or recovery key")]
+    KeyRequired,
+    /// VOLKEY (B684): the key slot refused (wrong key, unreadable slot, KDF memory).
+    #[error("Key slot: {0}")]
+    KeySlot(crate::keyslot::KeySlotError),
 }
 
 /// A directory entry pointing to an inode (by stable LOGICAL id).
@@ -332,6 +339,9 @@ pub struct UnaFS<D: BlockDevice> {
     migrate_pending: bool,
     /// UNAFSMAP: the refcount map's leaf-page cache budget (bytes).
     map_budget: usize,
+    /// VOLKEY (B684): the key slot read from block 0 sector 1 at mount (`None` = unkeyed). Every rewrite of
+    /// block 0 (grow, migration) carries it, so neither can drop a volume's key.
+    key_slot: Option<crate::keyslot::KeySlot>,
 }
 
 impl<D: BlockDevice> UnaFS<D> {
@@ -422,6 +432,7 @@ impl<D: BlockDevice> UnaFS<D> {
             root_flags: 0,
             migrate_pending: false,
             map_budget: crate::refmap::DEFAULT_CACHE_BYTES,
+            key_slot: None,
         };
 
         // The reserved system objects, in id order (1..=4).
@@ -461,10 +472,34 @@ impl<D: BlockDevice> UnaFS<D> {
     /// Mount an existing UnaFS (K8) filesystem: read the static superblock,
     /// pick the newer valid root slot, load the inode map and refcount map
     /// the root points at, and drain any pending reclaim-queue entries.
-    pub fn mount(mut device: D) -> Result<Self, FileSystemError> {
+    ///
+    /// VOLKEY (B684): a KEYED volume (a key slot in block 0 sector 1, §R2a) is refused here with
+    /// [`FileSystemError::KeyRequired`] before anything past block 0 is read — it opens only through
+    /// [`mount_with`](Self::mount_with). An unkeyed volume mounts exactly as before.
+    pub fn mount(device: D) -> Result<Self, FileSystemError> {
+        Self::mount_keyed(device, None)
+    }
+
+    /// VOLKEY (B684): mount with the volume's key — its password (Argon2id at the slot's recorded costs) or
+    /// its 24 recovery words. A keyed volume opens only when the key unwraps the slot's data key (the
+    /// AEAD tag decides; a wrong key reads [`KeySlotError::KeyRefused`](crate::keyslot::KeySlotError)); the
+    /// unwrapped key is dropped (wiped) at once — M1's data blocks are plaintext, so nothing holds it. An
+    /// unkeyed volume mounts as [`mount`](Self::mount) does and the key is not consulted.
+    pub fn mount_with(device: D, unlock: &crate::keyslot::Unlock<'_>) -> Result<Self, FileSystemError> {
+        Self::mount_keyed(device, Some(unlock))
+    }
+
+    fn mount_keyed(mut device: D, unlock: Option<&crate::keyslot::Unlock<'_>>) -> Result<Self, FileSystemError> {
         let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
         device.read_block(0, &mut sb_block)?;
         let superblock = Superblock::from_bytes(&sb_block)?;
+        let key_slot = crate::keyslot::KeySlot::parse(&sb_block).map_err(FileSystemError::KeySlot)?;
+        if let Some(slot) = &key_slot {
+            let Some(u) = unlock else {
+                return Err(FileSystemError::KeyRequired);
+            };
+            drop(slot.unwrap(u).map_err(FileSystemError::KeySlot)?);
+        }
 
         let loaded = Self::load_committed(&mut device, &superblock)?;
 
@@ -484,6 +519,7 @@ impl<D: BlockDevice> UnaFS<D> {
             root_flags: if loaded.grow_lag { crate::root::ROOT_FLAG_GROW } else { 0 },
             migrate_pending: loaded.migrate,
             map_budget: crate::refmap::DEFAULT_CACHE_BYTES,
+            key_slot,
         };
 
         // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
@@ -811,12 +847,51 @@ impl<D: BlockDevice> UnaFS<D> {
     /// Rewrite block 0 (grow and migration only — the superblock is
     /// otherwise written once) and flush.
     fn write_superblock(&mut self, sb: &Superblock) -> Result<(), FileSystemError> {
-        let sb_bytes = sb.to_bytes()?;
-        let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
-        sb_block[..sb_bytes.len()].copy_from_slice(&sb_bytes);
+        let sb_block = self.block0(sb)?;
         self.device.write_block(0, &sb_block)?;
         self.device.flush()?;
         Ok(())
+    }
+
+    /// VOLKEY (B684): block 0 as it must be on disk — the superblock in sector 0 and, on a keyed volume, the
+    /// key slot in sector 1 (§R2a). The ONE builder every block-0 rewrite uses, so a grow or a migration
+    /// keeps the slot.
+    fn block0(&self, sb: &Superblock) -> Result<Vec<u8>, FileSystemError> {
+        let sb_bytes = sb.to_bytes()?;
+        let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
+        sb_block[..sb_bytes.len()].copy_from_slice(&sb_bytes);
+        if let Some(slot) = &self.key_slot {
+            slot.encode_into(&mut sb_block);
+        }
+        Ok(sb_block)
+    }
+
+    /// VOLKEY (B684): the volume's key slot, `None` when unkeyed.
+    pub fn key_slot(&self) -> Option<&crate::keyslot::KeySlot> {
+        self.key_slot.as_ref()
+    }
+
+    /// VOLKEY (B684): KEY an unkeyed volume — write `slot` (made by
+    /// [`KeySlot::seal`](crate::keyslot::KeySlot::seal)) into block 0 sector 1 and flush. Sector 0 (the
+    /// superblock) is rewritten byte-identical, so a torn write cannot reach it; a cut before the write lands
+    /// leaves the volume unkeyed. From the next mount on, [`mount`](Self::mount) refuses the volume and
+    /// [`mount_with`](Self::mount_with) opens it. A keyed volume is refused (`AlreadyKeyed`): changing the
+    /// password re-wraps the slot, a separate operation.
+    pub fn set_key_slot(&mut self, slot: crate::keyslot::KeySlot) -> Result<(), FileSystemError> {
+        if self.key_slot.is_some() {
+            return Err(FileSystemError::KeySlot(crate::keyslot::KeySlotError::AlreadyKeyed));
+        }
+        let sb = self.superblock.clone();
+        self.key_slot = Some(slot);
+        let wrote = self.block0(&sb).and_then(|b| {
+            self.device.write_block(0, &b)?;
+            self.device.flush()?;
+            Ok(())
+        });
+        if wrote.is_err() {
+            self.key_slot = None;
+        }
+        wrote
     }
 
     /// One commit; a failure re-derives RAM from the committed disk state
@@ -3617,7 +3692,9 @@ impl<D: BlockDevice> UnaFS<D> {
         let mut grown = self.superblock.clone();
         grown.block_count = new_block_count;
         grown.validate()?;
-        let sb_bytes = grown.to_bytes()?;
+        // VOLKEY (B684): block 0 is built here, before any write, through `block0` — a keyed volume keeps
+        // its slot across the grow.
+        let sb_block = self.block0(&grown)?;
         let dev_blocks = self.device.block_count();
         if dev_blocks != 0 && dev_blocks < new_block_count {
             return Err(SuperblockError::Geometry("grow past the end of the device").into());
@@ -3636,8 +3713,6 @@ impl<D: BlockDevice> UnaFS<D> {
             return Err(e);
         }
         // 4: the superblock, last.
-        let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
-        sb_block[..sb_bytes.len()].copy_from_slice(&sb_bytes);
         let wrote = self
             .device
             .write_block(0, &sb_block)

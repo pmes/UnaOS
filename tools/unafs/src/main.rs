@@ -28,12 +28,101 @@ mod dump;
 #[command(name = "unafs")]
 #[command(about = "The Operator Tool for the UnaOS Virtual Filesystem")]
 struct Cli {
+    /// VOLKEY (B684): open a KEYED volume with its password, read from the first line of stdin (for `key`:
+    /// the password the new key slot is wrapped by).
+    #[arg(long, global = true)]
+    password_stdin: bool,
+    /// VOLKEY (B684): open a KEYED volume with its 24 recovery words, read from the first line of stdin.
+    #[arg(long, global = true, conflicts_with = "password_stdin")]
+    recovery_stdin: bool,
     #[command(subcommand)]
     command: Commands,
 }
 
+/// VOLKEY (B684): the key the operator passed (never an argument on the command line, never printed).
+enum Key {
+    None,
+    Password(Vec<u8>),
+    Recovery(String),
+}
+
+impl Drop for Key {
+    fn drop(&mut self) {
+        match self {
+            Key::Password(p) => p.iter_mut().for_each(|b| *b = 0),
+            Key::Recovery(w) => {
+                let n = w.len();
+                w.clear();
+                w.extend(std::iter::repeat_n(' ', n));
+            }
+            Key::None => {}
+        }
+    }
+}
+
+impl Key {
+    fn read(cli: &Cli) -> Result<Key> {
+        if !cli.password_stdin && !cli.recovery_stdin {
+            return Ok(Key::None);
+        }
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).context("reading the key from stdin")?;
+        let t = line.trim_end_matches(['\r', '\n']).to_string();
+        line.clear();
+        anyhow::ensure!(!t.is_empty(), "an empty key on stdin");
+        Ok(if cli.password_stdin { Key::Password(t.into_bytes()) } else { Key::Recovery(t) })
+    }
+
+    fn unlock(&self) -> Option<unafs::Unlock<'_>> {
+        match self {
+            Key::None => None,
+            Key::Password(p) => Some(unafs::Unlock::Password(p)),
+            Key::Recovery(w) => Some(unafs::Unlock::Recovery(w)),
+        }
+    }
+}
+
+/// VOLKEY (B684): mount `device` — an unkeyed volume as it always mounted; a KEYED volume (unafs-records.md
+/// §R2a) only with the key passed on stdin. Without it: refused, with the way to pass it.
+fn mount_dev(device: FileDevice, key: &Key) -> Result<FileSystem> {
+    let r = match key.unlock() {
+        None => FileSystem::mount(device),
+        Some(u) => FileSystem::mount_with(device, &u),
+    };
+    r.map_err(|e| match e {
+        unafs::fs::FileSystemError::KeyRequired => anyhow::anyhow!(
+            "this volume is KEYED (VOLKEY): it opens only with its key — pass --password-stdin or --recovery-stdin and the key on stdin"
+        ),
+        e => anyhow::Error::new(e),
+    })
+}
+
+/// VOLKEY (B684): a keyed volume's raw views (`dump`) need the key too: the slot in block 0 is read and, when
+/// present, unwrapped with the key on stdin before anything else is read.
+fn key_gate_raw(img: &str, key: &Key) -> Result<()> {
+    use std::io::Read;
+    let mut b0 = vec![0u8; unafs::BLOCK_SIZE as usize];
+    std::fs::File::open(img).and_then(|mut f| f.read_exact(&mut b0)).context("reading block 0")?;
+    let slot = unafs::KeySlot::parse(&b0).map_err(|e| anyhow::anyhow!("key slot: {e}"))?;
+    if let Some(slot) = slot {
+        let Some(u) = key.unlock() else {
+            anyhow::bail!("this volume is KEYED (VOLKEY): it opens only with its key — pass --password-stdin or --recovery-stdin and the key on stdin");
+        };
+        drop(slot.unwrap(&u).map_err(|e| anyhow::anyhow!("key slot: {e}"))?);
+    }
+    Ok(())
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    /// VOLKEY (B684): KEY an unkeyed volume with the password on stdin (`--password-stdin`): a fresh data key
+    /// is wrapped by Argon2id(password) and by a fresh recovery key, the slot goes into block 0 sector 1, and
+    /// the 24 recovery words are printed ONCE (never written anywhere). From then on every command refuses the
+    /// volume without its key. M1: the data blocks are NOT encrypted yet (unafs-records.md §R2a).
+    Key {
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
     /// Initialize a new unafs.img vault
     Init {
         #[arg(short, long, default_value = "unafs.img")]
@@ -689,8 +778,33 @@ fn split_parent(path: &str) -> Result<(&str, &str)> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let vkey = Key::read(&cli)?; // VOLKEY: not `key` — attribute commands bind a field of that name
 
     match &cli.command {
+        Commands::Key { img } => {
+            let Key::Password(pw) = &vkey else {
+                anyhow::bail!("key: pass the new password with --password-stdin");
+            };
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = FileSystem::mount(device).map_err(|e| match e {
+                unafs::fs::FileSystemError::KeyRequired => anyhow::anyhow!("'{img}' is already keyed"),
+                e => anyhow::Error::new(e),
+            })?;
+            let mut urandom = std::fs::File::open("/dev/urandom").context("opening /dev/urandom")?;
+            let mut fill = |b: &mut [u8]| {
+                use std::io::Read;
+                urandom.read_exact(b).expect("/dev/urandom read");
+            };
+            let (slot, words) = unafs::KeySlot::seal(pw, unafs::KdfParams::HOST, &mut fill)
+                .map_err(|e| anyhow::anyhow!("key slot: {e}"))?;
+            fs.set_key_slot(slot).context("writing the key slot")?;
+            println!("'{img}' is keyed (argon2id m=64MiB t=3 p=4). Its RECOVERY KEY, shown this once and stored nowhere:");
+            println!();
+            println!("    {}", words.as_str());
+            println!();
+            println!("Write it down. It opens the volume (--recovery-stdin) if the password is lost.");
+            println!("M1: the slot gates every UnaFS reader; the data blocks are not encrypted yet.");
+        }
         Commands::Init { path, size_mb } => {
             println!(
                 "⚡ [OPERATOR] Initializing Vault at '{}' ({} MB)...",
@@ -725,7 +839,7 @@ async fn main() -> Result<()> {
         }
         Commands::Ls { path, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             let id = fs.resolve_path(path).context("Path not found")?;
             let entries = fs.ls(id).context("Failed to list directory")?;
@@ -737,7 +851,7 @@ async fn main() -> Result<()> {
         }
         Commands::Mkdir { path, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
             let mut at = String::new();
             let mut parent = fs.resolve_path("/").context("No root")?;
             let mut made = 0usize;
@@ -760,7 +874,7 @@ async fn main() -> Result<()> {
             img,
         } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             if Path::new(source).is_dir() {
                 let (dirs, files, bytes) = put_tree(&mut fs, Path::new(source), destination)?;
@@ -799,7 +913,7 @@ async fn main() -> Result<()> {
             img,
         } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             let id = fs.resolve_path(source).context("Source file not found")?;
             let inode = fs.read_inode(id).context("Failed to read inode")?;
@@ -818,7 +932,7 @@ async fn main() -> Result<()> {
             img,
         } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             let id = fs.resolve_path(path).context("Path not found")?;
             let val = parse_value(value).map_err(|e| anyhow::anyhow!(e))?;
@@ -829,7 +943,7 @@ async fn main() -> Result<()> {
         }
         Commands::AttrGet { path, key, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             let id = fs.resolve_path(path).context("Path not found")?;
             if let Some(val) = fs
@@ -843,7 +957,7 @@ async fn main() -> Result<()> {
         }
         Commands::Stat { path, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
             let id = fs.resolve_path(path).context("Path not found")?;
             let st = fs.stat(id).map_err(|e| anyhow::anyhow!(e))?;
             println!(
@@ -860,7 +974,7 @@ async fn main() -> Result<()> {
         }
         Commands::Query { query, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             let results = fs.query(query).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -874,7 +988,7 @@ async fn main() -> Result<()> {
         }
         Commands::Rm { path, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             let (parent, name) = split_parent(path)?;
             let parent_id = fs
@@ -892,7 +1006,7 @@ async fn main() -> Result<()> {
             img,
         } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             let (src_parent, src_name) = split_parent(source)?;
             let src_parent_id = fs
@@ -925,7 +1039,7 @@ async fn main() -> Result<()> {
         }
         Commands::Rmattr { path, key, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             let id = fs.resolve_path(path).context("Path not found")?;
             fs.remove_attribute(id, key).map_err(|e| {
@@ -971,11 +1085,12 @@ async fn main() -> Result<()> {
         }
         Commands::Dump { records, img } => {
             anyhow::ensure!(*records, "dump: pass --records (the only view today)");
+            key_gate_raw(img, &vkey)?; // VOLKEY (B684): a keyed volume's records need its key too
             print!("{}", dump::dump_records(img)?);
         }
         Commands::Fsck { img, repair } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             if *repair {
                 let report = fs
@@ -1013,7 +1128,7 @@ async fn main() -> Result<()> {
         }
         Commands::Reindex { img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
             let t0 = std::time::Instant::now();
             let names = fs.reindex_names().map_err(|e| anyhow::anyhow!("reindex failed: {:?}", e))?;
             let keys = fs.name_index_count().map_err(|e| anyhow::anyhow!("reindex count failed: {:?}", e))?;
@@ -1021,7 +1136,7 @@ async fn main() -> Result<()> {
         }
         Commands::Snaps { img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
             let snaps = fs
                 .snapshot_index()
                 .map_err(|e| anyhow::anyhow!("Failed to read snapshot index: {:?}", e))?;
@@ -1040,7 +1155,7 @@ async fn main() -> Result<()> {
         }
         Commands::Snap { name, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -1055,7 +1170,7 @@ async fn main() -> Result<()> {
         }
         Commands::Snapdrop { generation, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
             fs.snapshot_drop(*generation)
                 .map_err(|e| anyhow::anyhow!("Failed to drop snapshot {}: {:?}", generation, e))?;
             println!(
@@ -1070,7 +1185,7 @@ async fn main() -> Result<()> {
             img,
         } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
-            let mut fs = FileSystem::mount(device).context("Failed to mount filesystem")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
 
             // Phase 1: resolve the object's logical id in the SNAPSHOT.
             let sid = {

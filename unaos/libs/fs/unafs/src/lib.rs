@@ -45,6 +45,7 @@ pub mod fsck;
 pub mod hash;
 pub mod index;
 pub mod inode;
+pub mod keyslot; // VOLKEY (B684): the volume key slot, block 0 sector 1 (unafs-records.md §R2a)
 #[cfg(feature = "std")]
 pub mod io;
 pub mod legacy;
@@ -74,6 +75,7 @@ pub use index::CatalogRecord;
 pub use fs::nameindex::{NAME_KEY, NAME_SRC, NameFind, NameHit, NameIndexCheck, name_keys, name_match}; // NAMEINDEX (B432)
 pub use format::{FormatParams, Formatted, format, format_partition};
 pub use fsck::FsckReport;
+pub use keyslot::{KdfParams, KeySlot, KeySlotError, RecoveryWords, Unlock, VolumeKey};
 pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
 pub use query::{Expr, Predicate, Query, QueryOp, parse_value};
 pub use root::{ROOT_RECORD_SIZE, RootRecord, RootSlot};
