@@ -7,6 +7,7 @@
 #   ./arroyo x86           Build & boot x86_64 (GUI window + serial on stdio)
 #   ./arroyo arm           Build & boot aarch64
 #   ./arroyo test [secs]   Headless x86_64 run; serial captured to target/serial.log
+#                          (x86 images stage APPS/MICRING3.ELF, B744: `UNAOS_UAC=1 UNAOS_WC=1 ./arroyo test` + `tests micring3`)
 #   ./arroyo test-arm [s]  Headless aarch64 run; serial -> target/serial-arm.log
 #   ./arroyo test-splash [s]
 #                          SPLASHGATE: headless x86_64 run of the SHIPPED polarity — witness,
@@ -4653,6 +4654,33 @@ build_user_big_x86() {
     echo -e "${COLOR_GREEN}✅ x86 ring-3 ELF-window proof program: BIG-X86.ELF${COLOR_RESET}"
 }
 
+# MICSTAGE (rmbp-ledger B744, BP-audio-12): build MICRING3.ELF — the `tests micring3` fixture program (crates/user-micring3,
+# B736 → target/MICRING3-X86.ELF), staged as APPS/MICRING3.ELF by the builder beside BIG.ELF on the ESP and the DATA
+# volume. build_user_big_x86's shape exactly: the ELF window (user-micring3-x86.ld, absolute VA, no PHDRS), a 256 KiB
+# PT_GNU_STACK, symbols BEFORE the strip, the same magic/e_machine/window gates. x86 only; tiny (no alloc). The fixture
+# runs it under `uac` on an x86 `wc` image; without a microphone capture alternate (QEMU's usb-audio) it SKIPs
+# `reason=no-capture-device`, and without this ELF on the volume it SKIPs `reason=no-fixture`.
+build_user_micring3_x86() {
+    local TOOLBIN; TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
+    echo -e "${COLOR_YELLOW}⚡ Building x86 ring-3 microphone fixture program (crates/user-micring3 → target/MICRING3-X86.ELF)...${COLOR_RESET}"
+    mkdir -p "${WORKSPACE_DIR}/target"
+    cd "$WORKSPACE_DIR/crates/user-micring3"
+    RUSTFLAGS="-C link-arg=-T${WORKSPACE_DIR}/crates/user-micring3/user-micring3-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000" \
+      cargo +nightly build --release -Z json-target-spec --target "${WORKSPACE_DIR}/x86_64-unknown-none.json"
+    cd "$WORKSPACE_DIR"
+    emit_user_syms "${WORKSPACE_DIR}/crates/user-micring3/target/x86_64-unknown-none/release/user-micring3" MICRING3  # PROFILE2 M3: target/APPS/<NAME>.syms, BEFORE the strip
+    "$TOOLBIN/llvm-objcopy" --strip-all \
+      "${WORKSPACE_DIR}/crates/user-micring3/target/x86_64-unknown-none/release/user-micring3" \
+      "${WORKSPACE_DIR}/target/MICRING3-X86.ELF"
+    [ -s "${WORKSPACE_DIR}/target/MICRING3-X86.ELF" ] || { echo -e "${COLOR_RED}ERROR: MICRING3-X86.ELF missing/empty — x86 MICRING3 build failed${COLOR_RESET}"; exit 1; }
+    local mmag; mmag="$(head -c 4 "${WORKSPACE_DIR}/target/MICRING3-X86.ELF" | od -An -tx1 | tr -d ' \n')"
+    [ "$mmag" = "7f454c46" ] || { echo -e "${COLOR_RED}ERROR: MICRING3-X86.ELF does not start with the ELF magic; first 4 bytes = ${mmag}${COLOR_RESET}"; exit 1; }
+    local mmach; mmach="$(od -An -tx1 -j18 -N2 "${WORKSPACE_DIR}/target/MICRING3-X86.ELF" | tr -d ' \n')"
+    [ "$mmach" = "3e00" ] || { echo -e "${COLOR_RED}ERROR: MICRING3-X86.ELF e_machine is ${mmach}, want 3e00 (EM_X86_64=62 LE)${COLOR_RESET}"; exit 1; }
+    user_elf_window_check "${WORKSPACE_DIR}/target/MICRING3-X86.ELF" "MICRING3-X86.ELF"
+    echo -e "${COLOR_GREEN}✅ x86 ring-3 microphone fixture program: MICRING3-X86.ELF${COLOR_RESET}"
+}
+
 # ABIELF (rmbp-ledger B693, BP-bar-13, BP-ring3-15): build ABIPROBE.ELF (crates/user-abiprobe → target/ABIPROBE-X86.ELF),
 # build_user_big_x86's shape. NOT part of any image flow: the image stages the COMMITTED fixture
 # (unaos/fixtures/ABIPROBE-v<N>.ELF, pinned by its .sha256 — builder/src/main.rs checks the pin) so `tests abielf`
@@ -4724,7 +4752,7 @@ launch_x86_64() {
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
+    build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
     build_kernel_x86_64
 
     echo -e "${COLOR_CYAN}⚡ Launching x86_64 via Builder (kernel + bootloader + QEMU)...${COLOR_RESET}"
@@ -5745,7 +5773,7 @@ test_x86_64() {
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
+    build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
     build_kernel_x86_64
 
     # VPERF: UNAOS_QMP_SHOT=<png path> arms a QMP framebuffer screendump of the headless x86 run
@@ -6214,6 +6242,7 @@ USER_CHECK_MATRIX=(
   "user-stria    x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-stria/user-stria-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-net      x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-net/user-net-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-diag     x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-diag/user-diag-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
+  "user-micring3 x86_64  ${WORKSPACE_DIR}/x86_64-unknown-none.json -C link-arg=-T${WORKSPACE_DIR}/crates/user-micring3/user-micring3-x86.ld -C link-arg=-z -C link-arg=max-page-size=0x1000 -C link-arg=-z -C link-arg=stack-size=0x40000"
   "user-blob     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-blob/user-blob.ld"
   "user-elf      aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-elf/user-elf.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
   "user-stat     aarch64 -                                        -C link-arg=-T${WORKSPACE_DIR}/crates/user-stat/user-stat.ld -C link-arg=-z -C link-arg=max-page-size=0x1000"
@@ -9848,7 +9877,7 @@ esp_x86() {
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
+    build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
     ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363): the Noto script faces on the builder host first
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -9913,7 +9942,7 @@ vm_image() {
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
+    build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
     ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363)
     UNAOS_VM_IMAGE=1 UNAOS_VM_GIT7="$git7" cargo +nightly run --release
     cd "$WORKSPACE_DIR"
@@ -9962,7 +9991,7 @@ fat_img() {
     build_user_net_x86     # NETRING3: target/NET-X86.ELF — staged as APPS/NET.ELF
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
-    build_user_prefs_x86; build_user_big_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF
+    build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
     if [ ! -d "${WORKSPACE_DIR}/target/x86_64_esp" ]; then
         echo -e "${COLOR_YELLOW}⚡ Packaging the x86 ESP first (payload for the FAT image)...${COLOR_RESET}"
         esp_x86
@@ -10160,7 +10189,7 @@ install_ssd_leg() { # $1 = blank|beside, $2 = wall seconds
     local log="${tgt}/serial-install-ssd-${mode}.log" tlog="${tgt}/install-ssd-${mode}-typist.log"
     build_user_hello_x86; build_user_stat_x86; build_user_vug_x86; build_user_pulse_x86; build_user_lumen_x86
     build_user_midden_x86; build_user_una_x86; build_user_aether_x86; build_user_net_x86; build_user_diag_x86
-    build_user_holocron_x86; build_user_prefs_x86; build_user_big_x86
+    build_user_holocron_x86; build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86
     build_kernel_x86_64
     port="${UNAOS_QMP_PORT:-4484}"
     while lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; do port=$((port + 1)); done
