@@ -2880,8 +2880,8 @@ fn shadow_dark_look(buf: &mut [u32], w: usize, h: usize, dark: bool, bases: (boo
 /// the dock's plate with nine tiles. It asserts the invariants and prints the paint cost on the running machine
 /// against the 60 Hz frame (16 667 us):
 ///
-/// `:: DESKTOPCRAFT: corners=ok shadow=ok edge=ok(1px) shadow_dark=ok(outer=eq inner=-<n>) hairline=ok black=ok windows=3 surface=<w>x<h> -> PASS ::`
-/// `:: DESKTOPCRAFT: cost clock=<tsc|ms> frame_us=<n> budget_us=16667 backdrop_us=<n> chrome_us=<n> bar_us=<n> dock_us=<n> wall_ms=<n> veil_ms=<n> shadow_us=<n> tiles_us=<n> tiles_kib=<n> margin=<t>/<s>/<b> idle_margin=<t>/<s>/<b> ramp_a=<first>/<last> ramp_dark=<first>/<last> frame=<n> track_fills=<n> black_runs=<n> shimmer_us=<n> -> UNDER|OVER ::`
+/// `:: DESKTOPCRAFT: corners=ok shadow=ok edge=ok(1px) shadow_dark=ok(outer=eq inner=-<n>) hairline=ok black=ok veil=ok(<veil_us>/<fill_us>) windows=3 surface=<w>x<h> -> PASS ::`
+/// `:: DESKTOPCRAFT: cost clock=<tsc|ms> frame_us=<n> budget_us=16667 backdrop_us=<n> chrome_us=<n> bar_us=<n> dock_us=<n> wall_ms=<n> veil_ms=<n> shadow_us=<n> tiles_us=<n> tiles_kib=<n> margin=<t>/<s>/<b> idle_margin=<t>/<s>/<b> ramp_a=<first>/<last> ramp_dark=<first>/<last> frame=<n> track_fills=<n> black_runs=<n> shimmer_us=<n> veil_us=<n> fill_us=<n> -> UNDER|OVER ::`
 ///
 /// * **corners** — the focused window's top-left box pixel (outside the rounded head) is the desktop under the
 ///   shadows (exactly the fill's value there), and the head's face one radius in is not;
@@ -2908,7 +2908,12 @@ fn shadow_dark_look(buf: &mut [u32], w: usize, h: usize, dark: bool, bases: (boo
 ///   lighter). Printed `shadow_dark=ok(outer=eq inner=-<n>)` (`n`, the weaker look's mean channel darkening), else
 ///   `shadow_dark=FAIL(look=<light|dark> outer=<eq|ne> inner=<+-n> bases=<wall|flat>/<wall|flat>)`;
 /// * **hairline** — the dock plate's top edge is a line over the plate;
-/// * **black** — no run of pure `#000000` longer than 2 px outside a glyph zone.
+/// * **black** — no run of pure `#000000` longer than 2 px outside a glyph zone;
+/// * **veil** — VEILCOST (rmbp-ledger B690, BP-bar-23: beauty costs no more than a solid fill): the menu bar's box
+///   repainted as a strip repaints it (each row composed into the scratch row, then copied out — `strip::paint`'s
+///   shape, here into the staged frame) once over the VEIL ([`bar_row`]) and once as a solid `surface.window` fill;
+///   best of 3, interleaved. Asserted `veil_us <= fill_us x 1.05 + 50` (in ns); printed `veil=ok(<veil>/<fill>)` or
+///   `veil=OVER(<veil>/<fill>)`, and both on the cost line.
 pub fn selftest() {
     let mut dims = [(2880usize, 1800usize), (1440, 900)].into_iter();
     let (pw, ph, mut wall, mut frame) = loop {
@@ -3167,6 +3172,27 @@ pub fn selftest() {
     if runs > 0 {
         black = false;
     }
+    // veil (VEILCOST B690): one veiled strip repaint of the bar's box against a solid fill of the same box; the
+    // bar's rows end veiled, as the frame had them.
+    let face = theme::surface_window();
+    let (mut veil_ns, mut fill_ns) = (u64::MAX, u64::MAX);
+    for _ in 0..3 {
+        let (a, _) = now_ns();
+        for j in 0..bar_h {
+            row[..pw].fill(face);
+            frame[j * pw..(j + 1) * pw].copy_from_slice(&row[..pw]);
+        }
+        let (b, _) = now_ns();
+        for j in 0..bar_h {
+            bar_row(&mut row, 0, 0, pw, bar_h, j, Some(&back));
+            frame[j * pw..(j + 1) * pw].copy_from_slice(&row[..pw]);
+        }
+        let (c, _) = now_ns();
+        fill_ns = fill_ns.min(b.saturating_sub(a));
+        veil_ns = veil_ns.min(c.saturating_sub(b));
+    }
+    let veil_ok = veil_ns.saturating_mul(100) <= fill_ns.saturating_mul(105).saturating_add(5_000_000);
+    let veil_s = alloc::format!("{}({}/{})", if veil_ok { "ok" } else { "OVER" }, veil_ns / 1000, fill_ns / 1000);
     // shadow_dark (WINEDGE2 B668): both looks, the margin against the backdrop beside it, on this boot's two bases.
     let bases = live_bases();
     let (sw, sh) = (720usize, 480usize);
@@ -3203,11 +3229,11 @@ pub fn selftest() {
         ),
         Some((d, None)) => alloc::format!("FAIL(look={} no-probe)", lk(*d)),
     };
-    let ok = corners && shadow && edge && sd_fail.is_none() && hairline && black;
+    let ok = corners && shadow && edge && sd_fail.is_none() && hairline && black && veil_ok;
     let fl = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!(
-        ":: DESKTOPCRAFT: corners={} shadow={} edge={} shadow_dark={} hairline={} black={} windows={} surface={}x{} -> {} ::",
-        fl(corners), fl(shadow), if edge { "ok(1px)" } else { "FAIL" }, shadow_dark_s, fl(hairline), fl(black), wins.len(), pw, ph, if ok { "PASS" } else { "FAIL" }
+        ":: DESKTOPCRAFT: corners={} shadow={} edge={} shadow_dark={} hairline={} black={} veil={} windows={} surface={}x{} -> {} ::",
+        fl(corners), fl(shadow), if edge { "ok(1px)" } else { "FAIL" }, shadow_dark_s, fl(hairline), fl(black), veil_s, wins.len(), pw, ph, if ok { "PASS" } else { "FAIL" }
     );
     let frame_us = f4.saturating_sub(f0) / 1000;
     // STARFIELD (B661): the shimmer's worst tick over these windows (after every check: it re-tints `wall`).
@@ -3217,7 +3243,7 @@ pub fn selftest() {
     let (mt, ms, mb) = margins(ELEV_WINDOW, dark, s2);
     let (it, is, ib) = margins(ELEV_IDLE, dark, s2);
     serial_println!(
-        ":: DESKTOPCRAFT: cost clock={} frame_us={} budget_us={} backdrop_us={} chrome_us={} bar_us={} dock_us={} wall_ms={} veil_ms={} shadow_us={} tiles_us={} tiles_kib={} margin={}/{}/{} idle_margin={}/{}/{} ramp_a={}/{} ramp_dark={}/{} frame={} track_fills={} black_runs={} shimmer_us={} -> {} ::",
+        ":: DESKTOPCRAFT: cost clock={} frame_us={} budget_us={} backdrop_us={} chrome_us={} bar_us={} dock_us={} wall_ms={} veil_ms={} shadow_us={} tiles_us={} tiles_kib={} margin={}/{}/{} idle_margin={}/{}/{} ramp_a={}/{} ramp_dark={}/{} frame={} track_fills={} black_runs={} shimmer_us={} veil_us={} fill_us={} -> {} ::",
         clock,
         frame_us,
         BUDGET_US,
@@ -3244,6 +3270,8 @@ pub fn selftest() {
         TRACK_FILLS.load(Ordering::Relaxed),
         runs,
         shim_us,
+        veil_ns / 1000,
+        fill_ns / 1000,
         if frame_us <= BUDGET_US { "UNDER" } else { "OVER" }
     );
 }
