@@ -2305,10 +2305,10 @@ fn fileversions_selftest() {
                 && read_version_on(&mut m, "/big.bin", 0).is_ok_and(|d| d.len() == big.len() && d[0] == 1)
                 && m.fsck(false).is_ok_and(|r| r.is_clean() && r.versions == 1)
         });
-    let pass = writes == 10 && kept == 8 && bytes_ok && restore && bound && v7reader;
+    let face = fileversions_face(); let pass = writes == 10 && kept == 8 && bytes_ok && restore && bound && v7reader && face.0; // QUARRYVERSIONS (B732): the Quarry face's legs (`fileversions_face`, file tail). LINE-NEUTRAL fold, code before the comment.
     serial_println!(
-        ":: FILEVERSIONS: writes={} kept={} restore={} bound={} v7reader={} -> {} ::",
-        writes, kept, if restore { "ok" } else { "FAIL" }, if bound { "ok" } else { "FAIL" }, if v7reader { "ok" } else { "FAIL" },
+        ":: FILEVERSIONS: writes={} kept={} restore={} bound={} v7reader={} {} -> {} ::",
+        writes, kept, if restore { "ok" } else { "FAIL" }, if bound { "ok" } else { "FAIL" }, if v7reader { "ok" } else { "FAIL" }, face.1,
         if pass { "PASS" } else { "FAIL" }
     );
 }
@@ -2341,4 +2341,58 @@ fn fontkit_selftest() {
         "FAIL"
     };
     serial_println!(":: FONTKIT: roles={} variable={} wght_ok={} opsz_ok={} -> {} ::", p.roles, p.variable as u8, wght_ok as u8, opsz_ok as u8, verdict);
+}
+
+// QUARRYVERSIONS (rmbp-ledger B732, BP-bar-14) — TAIL-APPENDED. `tests fileversions`' Quarry legs, through the face on
+// THE mount (the session home on the native volume): menu — 'Previous versions…' is in the file menu right after Get
+// Info; listed — a file written once then overwritten 3 times lists 3 rows in the inspector (`getinfo::open_versions`);
+// restored_via_face — the oldest row's Restore (`ops::version_press`, what the button runs) makes the first contents
+// current again, re-lists 4 (the replaced contents kept: a restore is itself a versioned write) and the newest version
+// is those replaced contents; Open's copy (version 1, under `<home>/.Trash/.versions/`) reads back byte-equal. A home
+// that is not on the native volume keeps no versions: `listed=skip restored_via_face=skip`.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+#[allow(unreachable_code)]
+fn fileversions_face() -> (bool, alloc::string::String) {
+    #[cfg(all(feature = "quarry", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
+        use crate::video::quarry::live::{getinfo, ops};
+        let okf = |b: bool| if b { "ok" } else { "FAIL" };
+        let t = crate::shell::vfs_mount_table();
+        let home = crate::fs::trash::home_base();
+        if t.stat(&home).is_err() {
+            let _ = t.create(&home, NodeKind::Dir, P);
+        }
+        let path = format!("{}/VersionsFace.txt", home);
+        let menu = ops::versions_item_probe();
+        if ops::native_path(&path).is_none() {
+            return (menu, format!("menu={} listed=skip restored_via_face=skip", okf(menu)));
+        }
+        let _ = ops::op_delete(&path);
+        let body = |k: u8| -> alloc::vec::Vec<u8> { (0..3000u32).map(|i| k.wrapping_mul(37).wrapping_add(i as u8)).collect() };
+        let made = t.create(&path, NodeKind::File, P).is_ok() && t.write(&path, 0, &body(0), P).is_ok();
+        let writes = (1..=3u8).filter(|&k| t.write(&path, 0, &body(k), P).is_ok()).count();
+        getinfo::open_versions(&path);
+        let n = getinfo::version_count();
+        let listed_ok = made && writes == 3 && n == Some(3);
+        let oldest = n.and_then(|n| n.checked_sub(1)).and_then(getinfo::version_seq);
+        if let Some(seq) = oldest {
+            ops::version_press(&path, seq, true);
+        }
+        let back = t.read(&path, 0, 4096).is_ok_and(|d| d == body(0));
+        let relisted = getinfo::version_count() == Some(4);
+        let newest = ops::native_path(&path).and_then(|np| crate::fs::unafs::read_version(&np, 0)).is_some_and(|d| d == body(3));
+        let restored = oldest.is_some() && back && relisted && newest;
+        let copy = getinfo::version_seq(1).and_then(|s| ops::op_open_version(&path, s).ok());
+        let open_ok = copy.as_deref().is_some_and(|c| c.starts_with(ops::versions_scratch().as_str()) && t.read(c, 0, 4096).is_ok_and(|d| d == body(2)));
+        serial_println!("[fileversions] face listed={:?} back={} relisted={} newest={} open_copy={} path={}", n, back, relisted, newest, okf(open_ok), copy.as_deref().unwrap_or("-"));
+        if let Some(c) = copy.as_deref() {
+            let _ = t.unlink(c, P);
+        }
+        getinfo::dismiss();
+        let _ = ops::op_delete(&path);
+        let ok = menu && listed_ok && restored && open_ok;
+        return (ok, format!("menu={} listed={} restored_via_face={}", okf(menu), n.unwrap_or(0), okf(restored)));
+    }
+    (true, alloc::string::String::from("menu=- listed=- restored_via_face=-"))
 }
