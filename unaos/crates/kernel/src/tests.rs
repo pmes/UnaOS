@@ -1098,7 +1098,7 @@ pub fn appfault_selftest() {
 /// on exactly one Settings row.
 /// CLOCKPAINTERS (B719) extends it: the painters are at least 8, and the clock menu's time line in Berlin
 /// (`14:34 Europe/Berlin +02:00 daylight`, desktop builds) — the `menu=` tail.
-/// `:: TZLOCALE: zones=52 dst_edges_ok=8/8 painted_ok=<n>/<n> painters=10 seen=<bits> orphans=0 -> PASS :: … menu=ok`
+/// `:: TZLOCALE: zones=52 dst_edges_ok=8/8 painted_ok=<n>/<n> painters=13 seen=<bits> orphans=0 -> PASS :: … menu=ok`
 pub fn tzlocale_selftest() {
     use crate::clock::{locale, locale::Locale, tz, unix_from_civil as at};
     let faults = tz::table_faults();
@@ -2883,12 +2883,18 @@ const CLOCK_UTC_SPLITS: usize = {
         + src_count(include_bytes!("video/quarry/getinfo.rs"), N)
         + src_count(include_bytes!("video/notify.rs"), N)
         + src_count(include_bytes!("video/login.rs"), N)
+        + src_count(include_bytes!("fs/attrfacts.rs"), N) // CIVILREST (B738): the Taken date, the Privacy dates, the
+        + src_count(include_bytes!("video/settings.rs"), N) // appearance hour (whose split was the anchor's own hour,
+        + src_count(include_bytes!("video/appearance.rs"), N) // counted by its spelling below)
+        + src_count(include_bytes!("video/appearance.rs"), b"/ 3600) % 24")
 };
 
 /// The retired display-offset knob: named by no kernel reader and no arroyo line (compile time, as above).
+#[allow(long_running_const_eval)]
 const CLOCK_KNOB_SITES: usize = {
     const N: &[u8] = b"UNAOS_TZ_MIN";
     src_count(include_bytes!("clock.rs"), N) + src_count(include_bytes!("arch/x86_64/rtc.rs"), N) + src_count(include_bytes!("../../../arroyo"), N)
+        + src_count(include_bytes!("../../../scripts/k8-reach.registry"), N) + src_count(include_bytes!("../../../builder/src/main.rs"), N) // CIVILREST (B738)
 };
 
 /// CLOCKPAINTERS (rmbp-ledger B719, BP-bar-17, BP-boot-18) — `tests clockpainters`: every civil painter prints through
@@ -2898,7 +2904,7 @@ const CLOCK_KNOB_SITES: usize = {
 /// Saturday-first locale); the `date -s` seed is local and round-trips to UTC (Berlin summer, Los Angeles' spring gap
 /// reads as standard time); and the build knob is gone. Fixture-local locales only: the live locale and the store are
 /// never written.
-/// `:: CLOCKPAINTERS: painters=10 utc_splits_left=0 first_day=ok knob_gone=1 -> PASS :: seed=ok`
+/// `:: CLOCKPAINTERS: painters=13 utc_splits_left=0 first_day=ok knob_gone=1 -> PASS :: seed=ok` (CIVILREST B738: 13)
 pub fn clockpainters_selftest() {
     use crate::clock::{locale, locale::Locale, unix_from_civil as at};
     let [mon, sun, sat] = [Some("mon"), Some("sun"), Some("sat")].map(|f| Locale::parse(None, None, f));

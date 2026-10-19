@@ -39,9 +39,10 @@ static LOADED: AtomicBool = AtomicBool::new(false);
 /// `auto` re-reads the clock this often.
 const CLOCK_MS: u64 = 60_000;
 
-/// The local hour (the civil anchor already carries the display offset; `None` until a clock is set).
+/// The local hour in Principia's zone (CIVILREST B738: the anchor is UTC and sunset is local, so the hour is
+/// `clock::locale`'s, never the anchor's own; `None` until a clock is set).
 pub fn local_hour() -> Option<u32> {
-    crate::clock::try_unix_now().map(|s| ((s / 3600) % 24) as u32)
+    crate::clock::try_unix_now().map(|s| crate::clock::locale::civil(crate::clock::locale::Painter::Appearance, s).h)
 }
 
 /// The stored mode.

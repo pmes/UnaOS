@@ -3525,8 +3525,9 @@ fn paint_privacy(st: &mut State) {
         let when = if x.at == 0 {
             String::from("date unknown")
         } else {
-            let (y, mo, dd, _, _, _) = crate::clock::civil_from_unix(x.at);
-            alloc::format!("{:04}-{:02}-{:02}", y, mo, dd)
+            let mut b = [0u8; 10]; // CIVILREST (B738): the answer's date in Principia's locale
+            let n = crate::clock::locale::fmt_date(crate::clock::locale::Painter::Privacy, x.at, &mut b);
+            String::from(core::str::from_utf8(&b[..n]).unwrap_or(""))
         };
         txt2(st, TRACK_X, 1 + k, &alloc::format!("{} ({})", x.answer, when));
         btn(st, 1 + k, PRIV_REVOKE_X, "Revoke");

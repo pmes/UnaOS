@@ -303,7 +303,7 @@ pub fn fmt_value(key: &str, v: &AttrValue) -> String {
     match v {
         AttrValue::Int(i) if key == DURATION => fmt_duration(*i),
         AttrValue::Int(i) if key == ANIMATED => String::from(if *i != 0 { "yes" } else { "no" }),
-        AttrValue::Int(i) if key == TAKEN => fmt_when(*i as u64),
+        AttrValue::Int(i) if key == TAKEN => crate::clock::locale::fmt_stamp(crate::clock::locale::Painter::Taken, *i as u64), // CIVILREST (B738): the locale's
         AttrValue::Int(i) => alloc::format!("{}", i),
         AttrValue::Float(f) => alloc::format!("{:.3}", f),
         AttrValue::Str(s) => s.replace('\n', " "),
@@ -312,10 +312,11 @@ pub fn fmt_value(key: &str, v: &AttrValue) -> String {
     }
 }
 
-/// `YYYY-MM-DD HH:MM` (UTC) for unix seconds.
+/// `YYYY-MM-DD HH:MM` (UTC) for unix seconds: the serial `[getinfo]` / `[attrcolumns]` change-time form, never a
+/// painted date (CIVILREST B738: the split is `clock::locale`'s, on its UTC `ymd-24` default; a painted Taken date is
+/// [`fmt_value`]'s, through the live locale).
 pub fn fmt_when(secs: u64) -> String {
-    let (y, mo, d, h, mi, _) = crate::clock::civil_from_unix(secs);
-    alloc::format!("{:04}-{:02}-{:02} {:02}:{:02}", y, mo, d, h, mi)
+    crate::clock::locale::fmt_stamp_in(&crate::clock::locale::Locale::DEFAULT, secs)
 }
 
 /// One Get Info row: the key, its type word, the value as read, and when it last changed (when recorded).
