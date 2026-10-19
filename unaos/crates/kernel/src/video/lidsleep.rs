@@ -16,13 +16,25 @@
 //! * **[`sleep_request`]** (LOGINWINDOW's Sleep button): blanks the backlight only and says so; the next key or
 //!   pointer event restores it ([`service`] watches `dimidle`'s activity clock). S3 is NOT this arc.
 //! * **`tests lidsleep`** (R80: registered, never at boot): `:: LIDSLEEP: msld=… flips=… backlight_off=… ::`.
+//!
+//! SLEEP (rmbp-ledger B691, BP-bar-20, `docs/dev/blueprint/power.md`) — the ladder is ARMED and the blank is a STATE:
+//! [`sleep_request`] (the lid closing, LOGINWINDOW's Sleep) turns the backlight off AND holds the panel (`asleep()` is
+//! a refusal term of `video::panel_refuse_term`, so the compositor and the cursor decline and every core idles in
+//! `hlt`); the service pass then fills the panel black and has `power::sleep` read the S3 census and the battery.
+//! Wakers, each named: `lid` (MSLD back to 0, polled every [`SLEEP_POLL_MS`] while asleep), `power-key` (the fixed
+//! ACPI power button), `input` (a key or pointer event). [`wake`] restores the level; the next service pass repaints
+//! (the DIMIDLE repaint) and `power::sleep::first_frame` prints `[power] sleep … wake src=… ms=` and `:: SLEEP: ::`.
+//! `tests lidsleep` keeps its backlight-only blink (it never enters the state); `tests sleep` enters and leaves it.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-/// Rung 2 (lid → blank) is applied only after rung 0 is confirmed on metal. Reopens: a flight's `[smc] lid=` flips.
-pub const LADDER_ARMED: bool = false;
+/// Rung 2 (lid → sleep). ARMED by SLEEP (B691): the bench's lid close is rung 0's confirmation and the state's entry in
+/// one step; a wrong polarity costs a dark panel that the next key wakes (`input`), never a lost machine.
+pub const LADDER_ARMED: bool = true;
 /// Rung 0's poll period (ms).
 pub const POLL_MS: u64 = 1000;
+/// The lid poll while asleep (ms): the lid waker's latency bound inside BP-bar-20's 1000 ms lid-open → first frame.
+pub const SLEEP_POLL_MS: u64 = 200;
 
 /// MSLD's last raw byte (`u32::MAX` = never read).
 static LID_RAW: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -36,6 +48,12 @@ static SLEPT: AtomicBool = AtomicBool::new(false);
 static SLEPT_AT_MS: AtomicU64 = AtomicU64::new(0);
 /// The register's value before the blank (restored on wake).
 static PRIOR_RAW: AtomicU32 = AtomicU32::new(0);
+/// The sleep's blank reached a backlight (a gmux answered).
+static SLEPT_HW: AtomicBool = AtomicBool::new(false);
+/// The service pass owes the entry's black fill (and the power record's slow half).
+static FILL_OWED: AtomicBool = AtomicBool::new(false);
+/// The service pass owes the wake's repaint (and the SLEEP line).
+static REPAINT_OWED: AtomicBool = AtomicBool::new(false);
 
 /// `nonzero = closed` — rung 0's hypothesis (polarity unpinned, decided by the glass). Pure.
 pub const fn lid_closed(raw: u8) -> bool { raw != 0 }
@@ -76,21 +94,41 @@ pub fn read_msld() -> Msld {
 /// Lid changes seen since boot.
 pub fn flips() -> u32 { FLIPS.load(Ordering::Relaxed) }
 
-/// A sleep blank is in force.
+/// The sleep state is in force: the panel is held (a refusal term of `video::panel_refuse_term`).
 pub fn asleep() -> bool { SLEPT.load(Ordering::Relaxed) }
 
-/// One service pass (called from `dimidle::service`): rung 0's 1 s MSLD poll, and the wake from a [`sleep_request`].
+/// One service pass (called from `dimidle::service`): the entry's fill, the wakers (input, power key, lid), rung 0's
+/// MSLD poll (1 s awake, [`SLEEP_POLL_MS`] asleep), and the wake's repaint.
 pub fn service() {
     let now = crate::arch::ms();
+    if FILL_OWED.swap(false, Ordering::AcqRel) && SLEPT.load(Ordering::Acquire) {
+        if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) { fb.fill_screen(0); fb.flush_all(); }
+        #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] crate::power::sleep::measure_enter();
+    }
     if SLEPT.load(Ordering::Acquire) {
         let act = crate::video::dimidle::last_activity_ms();
         if act > SLEPT_AT_MS.load(Ordering::Relaxed) { wake("input"); }
     }
-    if POLL_STATE.load(Ordering::Relaxed) == 1 { return; }
-    let last = LAST_POLL_MS.load(Ordering::Relaxed);
-    if last != 0 && now.wrapping_sub(last) < POLL_MS { return; }
-    LAST_POLL_MS.store(now.max(1), Ordering::Relaxed);
-    poll(now);
+    #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
+    if SLEPT.load(Ordering::Acquire) && crate::power::sleep::power_key() { wake("power-key"); }
+    if POLL_STATE.load(Ordering::Relaxed) != 1 {
+        let last = LAST_POLL_MS.load(Ordering::Relaxed);
+        let period = if SLEPT.load(Ordering::Relaxed) { SLEEP_POLL_MS } else { POLL_MS };
+        if last == 0 || now.wrapping_sub(last) >= period {
+            LAST_POLL_MS.store(now.max(1), Ordering::Relaxed);
+            poll(now);
+        }
+    }
+    if REPAINT_OWED.swap(false, Ordering::AcqRel) {
+        if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) {
+            fb.fill_screen(super::wm::DESKTOP_BG);
+            fb.flush_all();
+            let (w, h) = (fb.width(), fb.height());
+            let _ = super::wm::damage_intersecting(0, 0, w, h);
+        }
+        super::wm::composite();
+        #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] crate::power::sleep::first_frame(SLEPT_HW.load(Ordering::Relaxed));
+    }
 }
 
 fn poll(now: u64) {
@@ -143,27 +181,41 @@ fn opt(v: Option<u32>) -> alloc::string::String {
     match v { Some(x) => alloc::format!("{}", x), None => alloc::string::String::from("-") }
 }
 
-/// LOGINWINDOW's Sleep (and the lid ladder once armed): the backlight goes off, nothing else. The display engine keeps
-/// running; the next key or pointer event restores the prior level. S3 is not this arc, and the line says so.
-pub fn sleep_request(via: &str) -> Blank {
+/// The backlight off, nothing else (the gmux write and its readback). `tests lidsleep`'s blink and the state's first step.
+fn blank(via: &str) -> Blank {
     let prior = super::backlight::readback_now().or(Some(super::backlight::cur_raw()));
     let (_, readback, hw) = super::backlight::off_via(via);
-    let b = Blank { prior, readback, hw };
-    if !SLEPT.load(Ordering::Relaxed) { PRIOR_RAW.store(prior.unwrap_or(0), Ordering::Relaxed); }
+    Blank { prior, readback, hw }
+}
+
+/// The sleep state (the lid closing, LOGINWINDOW's Sleep): the backlight off and the panel held, every core left to idle
+/// in `hlt`; the service pass fills the panel black. The display engine keeps scanning out (no Kepler PM rung); S3 is
+/// unreachable from this tree and `power::sleep` says why. Idempotent: a second request keeps the first prior level.
+pub fn sleep_request(via: &str) -> Blank {
+    let b = blank(via);
+    if !SLEPT.load(Ordering::Relaxed) { PRIOR_RAW.store(b.prior.unwrap_or(0), Ordering::Relaxed); }
+    SLEPT_HW.store(b.hw, Ordering::Relaxed);
     SLEPT_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
-    SLEPT.store(true, Ordering::Release);
+    let first = !SLEPT.swap(true, Ordering::AcqRel);
     serial_println!(
-        "[lidsleep] sleep_request via={} backlight_off={} prior={} readback={} engine=running s3=not-this-arc wake=input",
-        via, b.word(), opt(prior), opt(readback)
+        "[lidsleep] sleep_request via={} backlight_off={} prior={} readback={} engine=running panel=held wake=lid,power-key,input",
+        via, b.word(), opt(b.prior), opt(b.readback)
     );
+    if first {
+        FILL_OWED.store(true, Ordering::Release);
+        #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] crate::power::sleep::enter(via, b.word());
+    }
     b
 }
 
-/// Restore the level the blank took. Returns the readback.
+/// Leave the sleep state from `via` (a named waker): restore the level the blank took, release the panel, and owe the
+/// service pass its repaint. Returns the readback.
 pub fn wake(via: &str) -> Option<u32> {
     if !SLEPT.swap(false, Ordering::AcqRel) { return None; }
     let prior = PRIOR_RAW.load(Ordering::Relaxed);
     let a = super::backlight::set_raw_via(prior, "lidsleep-wake");
+    #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] crate::power::sleep::woke(via);
+    REPAINT_OWED.store(true, Ordering::Release);
     serial_println!("[lidsleep] wake via={} restored={} readback={}", via, prior, opt(a.readback));
     a.readback
 }
@@ -174,8 +226,9 @@ pub fn wake(via: &str) -> Option<u32> {
 pub fn selftest() {
     let m = read_msld();
     let raw = match m { Msld::Ok(r, _) => alloc::format!("{}", r), _ => alloc::string::String::from("-") };
-    let b = sleep_request("tests");
-    let restore_rb = wake("tests");
+    let b = blank("tests");
+    let restore_rb = super::backlight::set_raw_via(b.prior.unwrap_or(0), "lidsleep-wake").readback;
+    serial_println!("[lidsleep] blink via=tests backlight_off={} restore_rb={} (the state is `tests sleep`'s)", b.word(), opt(restore_rb));
     let restored = match (b.hw, b.prior) { (true, Some(p)) => restore_rb == Some(p), _ => true };
     let verdict = match (m, b.word()) {
         (Msld::Ok(..), "ok") if restored => "PASS",
@@ -186,4 +239,19 @@ pub fn selftest() {
         ":: LIDSLEEP: msld={} raw={} flips={} backlight_off={} prior={} off_rb={} restore_rb={} armed={} -> {} ::",
         m.word(), raw, flips(), b.word(), opt(b.prior), opt(b.readback), opt(restore_rb), LADDER_ARMED as u8, verdict
     );
+}
+
+/// `tests sleep` (SLEEP B691, R80: registered, never at boot): enter the state, hold it 1.5 s (the service pass fills the
+/// panel and reads the census and the battery), leave it as `tests`, and wait (bounded 3 s) for the service pass's
+/// repaint, which prints `:: SLEEP: … ::` (`SKIP reason=no-gmux` under QEMU). The panel goes dark for the hold.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
+pub fn sleep_selftest() {
+    let _ = sleep_request("tests");
+    crate::arch::sched::sleep_ms(1500);
+    let _ = wake("tests");
+    let t0 = crate::arch::ms();
+    while REPAINT_OWED.load(Ordering::Acquire) && crate::arch::ms().wrapping_sub(t0) < 3000 { crate::arch::sched::sleep_ms(50); }
+    if REPAINT_OWED.load(Ordering::Acquire) {
+        serial_println!(":: SLEEP: state={} wake_ms=- drain_pct_per_h=unmeasured wakes=- unexplained=0 -> FAIL :: reason=no-service-pass-in-3000ms", crate::power::sleep::STATE);
+    }
 }

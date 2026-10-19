@@ -357,7 +357,7 @@ pub fn going(action: &str) {
 // ladder in this tree; the caller greys the button and says so on the wire.
 /// Sleep the machine (LIDSLEEP's ladder). Returns the lane's word: `unarmed` until LIDSLEEP's fold.
 pub fn sleep_request() -> &'static str {
-    // LIDSLEEP (B431) at the merge18 fold: the backlight-only sleep; S3 is not this arc and the line says so.
+    // SLEEP (B691): the sleep STATE (`idle`: backlight off, panel held, cores in hlt; S3 unreachable, `power::sleep` says why).
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     { return crate::video::lidsleep::sleep_request("loginwindow").word(); }
     #[allow(unreachable_code)]
@@ -367,4 +367,133 @@ pub fn sleep_request() -> &'static str {
 /// `true` when [`sleep_request`] would act (the login window's Sleep button is live, not greyed).
 pub fn sleep_armed() -> bool {
     cfg!(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))) // LIDSLEEP (B431): the lane blanks the backlight today; the lid ladder itself arms after rung 0 flies
+}
+
+// ── SLEEP (rmbp-ledger B691, BP-bar-20, docs/dev/blueprint/power.md) — the sleep state's record and its line ──────
+//
+// FILE-TAIL append under `lidsleep` + `wc` (x86; the panel half is a `wc` module), so no line above moves and a knob-off build carries none of it.
+// The state is `idle`, not `s3`: ACPI S3 is unreachable from this tree (no AML interpreter for `_PTS`/`_WAK`, no BSP
+// resume path through the FACS waking vector, no Kepler re-POST, no xHCI/AHCI save/restore) and the first entry each
+// boot prints the firmware's half (`acpi_power::s3_census`) so the walls are named by fact. `idle` is the deepest
+// state the tree holds honestly: the backlight off (gmux), the compositor and the cursor refused (`video::
+// panel_refuse_term` term `sleep-panel-off`), so every core sits in the scheduler's `sti; hlt` (C1) between ticks;
+// the 1 kHz APIC tick stays (the ms clock, the lid poll and every sleeper ride it; a tickless idle is unbuilt) and
+// USB stays up (the FTDI cable is the wire and the keyboard is the input waker). Wakers, each NAMED: `lid` (MSLD back
+// to 0, polled every `video::lidsleep::SLEEP_POLL_MS` while asleep), `power-key` (the fixed-feature PWRBTN_STS,
+// `acpi_power::pwrbtn_take`), `input` (a key or pointer event; the Sleep button's route with the lid open).
+// The owner of the panel half is `video/lidsleep.rs`; this module only records and prints.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+pub mod sleep {
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+    /// The state this tree enters.
+    pub const STATE: &str = "idle";
+    /// BP-bar-20: lid open -> first frame.
+    pub const WAKE_BAR_MS: u64 = 1000;
+    /// The named wakers (and `tests`, the fixture's own); any other source is unexplained.
+    const SRCS: [&str; 4] = ["lid", "power-key", "input", "tests"];
+
+    static ASLEEP: AtomicBool = AtomicBool::new(false);
+    static ENTER_MS: AtomicU64 = AtomicU64::new(0);
+    /// Battery at entry: `full << 16 | rem` (mAh); `u32::MAX` = not read.
+    static ENTER_BATT: AtomicU32 = AtomicU32::new(u32::MAX);
+    static WAKE_SRC: AtomicU32 = AtomicU32::new(0);
+    static WAKE_AT_MS: AtomicU64 = AtomicU64::new(0);
+    static WAKES: AtomicU32 = AtomicU32::new(0);
+    static UNEXPLAINED: AtomicU32 = AtomicU32::new(0);
+    static CENSUS: AtomicBool = AtomicBool::new(false);
+    static STALE_PB: AtomicU32 = AtomicU32::new(0);
+
+    /// The sleep state is in force (between [`enter`] and [`woke`]).
+    pub fn asleep() -> bool { ASLEEP.load(Ordering::Acquire) }
+
+    /// The state is entered (`via`: lid, loginwindow, tests …). Atomics and one line; the SMC and ACPI reads are
+    /// [`measure_enter`]'s, on the service pass.
+    pub fn enter(via: &str, backlight: &str) {
+        if ASLEEP.swap(true, Ordering::AcqRel) { return; }
+        ENTER_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
+        ENTER_BATT.store(u32::MAX, Ordering::Relaxed);
+        serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=1khz usb=up s3=unreachable", STATE, via, backlight);
+    }
+
+    /// The entry's slow half, from the service pass after the panel is dark: the S3 census (once per boot), a stale
+    /// power-button latch cleared (so it cannot wake the state it predates), and the battery at entry.
+    pub fn measure_enter() {
+        if !CENSUS.swap(true, Ordering::AcqRel) {
+            match crate::arch::acpi_power::s3_census() {
+                Some(c) => {
+                    let s3 = match c.s3 { Some((a, b)) => alloc::format!("{},{}", a, b), None => alloc::string::String::from("absent") };
+                    serial_println!(
+                        "[power] s3 census facs={:#x} waking_vec={:#x} s3_pkg={} pts={} wak={} pwrbtn={} aml_interp=none bsp_resume=unwritten kepler_post=unwritten xhci_restore=unwritten -> s3=unreachable state={}",
+                        c.facs, c.waking_vec, s3, c.pts as u8, c.wak as u8, crate::arch::acpi_power::pwrbtn_kind(), STATE
+                    );
+                }
+                None => serial_println!("[power] s3 census acpi=absent -> s3=unreachable state={}", STATE),
+            }
+        }
+        if crate::arch::acpi_power::pwrbtn_take() == Some(true) { STALE_PB.fetch_add(1, Ordering::Relaxed); }
+        let (_, _, full, rem) = crate::drivers::smc::battery::extras();
+        if let (Some(f), Some(r)) = (full, rem) { ENTER_BATT.store((f as u32) << 16 | r as u32, Ordering::Relaxed); }
+        serial_println!("[power] sleep measured full_mah={} rem_mah={} stale_pwrbtn={}", opt(full), opt(rem), STALE_PB.load(Ordering::Relaxed));
+    }
+
+    /// A latched power-button press (the fixed-feature PWRBTN_STS), taken.
+    pub fn power_key() -> bool { crate::arch::acpi_power::pwrbtn_take() == Some(true) }
+
+    /// The state is left by `src`. Records the detect time; the line waits for [`first_frame`].
+    pub fn woke(src: &str) {
+        if !ASLEEP.swap(false, Ordering::AcqRel) { return; }
+        let i = SRCS.iter().position(|s| *s == src);
+        if i.is_none() { UNEXPLAINED.fetch_add(1, Ordering::Relaxed); }
+        WAKE_SRC.store(i.map(|i| i as u32).unwrap_or(u32::MAX), Ordering::Relaxed);
+        WAKE_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
+        WAKES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The wake's first composite has returned: print the wake line and the SLEEP verdict. The battery is read
+    /// AFTER the frame, so the SMC never sits inside `wake_ms`. `hw`: the backlight answered (a gmux is there).
+    pub fn first_frame(hw: bool) {
+        let at = WAKE_AT_MS.swap(0, Ordering::AcqRel);
+        if at == 0 { return; }
+        let now = crate::arch::ms();
+        let wake_ms = now.saturating_sub(at);
+        let slept_ms = at.saturating_sub(ENTER_MS.load(Ordering::Relaxed));
+        let src = SRCS.get(WAKE_SRC.load(Ordering::Relaxed) as usize).copied().unwrap_or("unexplained");
+        let poll = crate::video::lidsleep::SLEEP_POLL_MS;
+        serial_println!("[power] sleep enter={} wake src={} ms={} slept_ms={} lid_poll_ms={}", STATE, src, wake_ms, slept_ms, poll);
+        let e = ENTER_BATT.load(Ordering::Relaxed);
+        let (_, _, full, rem) = crate::drivers::smc::battery::extras();
+        // Hundredths of a percent per hour: (rem0 - rem1) / full over the slept hours. Measured only across ≥ 60 s of
+        // sleep with both reads and a falling or flat charge (on the adapter the pack charges: not a drain).
+        let drain = match (e, full, rem) {
+            (e, Some(f), Some(r1)) if e != u32::MAX && f != 0 && slept_ms >= 60_000 && (e & 0xFFFF) >= r1 as u32 => {
+                let r0 = (e & 0xFFFF) as u64;
+                Some((r0 - r1 as u64) * 10_000 * 3_600_000 / (f as u64 * slept_ms))
+            }
+            _ => None,
+        };
+        let why = match (e, full, rem) {
+            _ if drain.is_some() => "measured",
+            (u32::MAX, _, _) | (_, None, _) | (_, _, None) => "no-battery-keys",
+            _ if slept_ms < 60_000 => "under-60s",
+            _ => "charging",
+        };
+        let d = match drain { Some(h) => alloc::format!("{}.{:02}", h / 100, h % 100), None => alloc::string::String::from("unmeasured") };
+        let unexpl = UNEXPLAINED.load(Ordering::Relaxed);
+        let verdict = if !hw && crate::video::backlight::gmux_absent() {
+            "SKIP reason=no-gmux (QEMU: no backlight, no lid key, no battery keys)"
+        } else if unexpl == 0 && hw && wake_ms <= WAKE_BAR_MS {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        serial_println!(
+            ":: SLEEP: state={} wake_ms={} drain_pct_per_h={} wakes={} unexplained={} -> {} :: src={} slept_ms={} drain={} rem_mah={} lid_poll_ms={}",
+            STATE, wake_ms, d, WAKES.load(Ordering::Relaxed), unexpl, verdict, src, slept_ms, why, opt(rem), poll
+        );
+    }
+
+    fn opt(v: Option<u16>) -> alloc::string::String {
+        match v { Some(x) => alloc::format!("{}", x), None => alloc::string::String::from("-") }
+    }
 }

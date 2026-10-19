@@ -845,7 +845,7 @@ pub(crate) fn panel_refuse_term() -> Option<&'static str> {
     } else if crate::serial_ring::in_panic_mode() {
         Some("serial-panic-mode")
     } else {
-        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if crate::video::dimidle::blanked() { return Some("idle-blank"); } None // DIMIDLE — the idle blank is a third refusal term (same-line fold)
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if crate::video::dimidle::blanked() { return Some("idle-blank"); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if crate::video::lidsleep::asleep() { return Some("sleep-panel-off"); } None // DIMIDLE — the idle blank is a third refusal term (same-line fold). SLEEP (B691): the sleep state holds the panel, a fourth term (same-line fold, code before the comment)
     }
 }
 
