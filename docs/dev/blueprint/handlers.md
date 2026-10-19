@@ -29,6 +29,8 @@
 | Comscan | Signals | `comscan` | none found |
 | Facet | Images | `facet` | kernel viewer `unaos/crates/kernel/src/video/facet.rs` (charter Facet) |
 | Geode | Archives | `geode` | none found (host crate `handlers/geode`: the `.geode` v1 archive carrying UnaFS records whole, GEODEMETA SR148) |
+| Facet | Images | `facet` | kernel viewer `unaos/crates/kernel/src/video/facet.rs` (charter Facet); camera raw through `unaos/libs/media/raw_core` (shared-core) in `unaos/crates/kernel/src/video/facet_raw.rs`: the embedded preview FAST, the half-size white-balanced develop when a file has none (B711), CR2/NEF typed-only |
+| Geode | Archives | `geode` | none found |
 | Helm | Control | `helm` | `unaos/libs/sys/helm` (host workspace only) |
 | Holocron | Secrets | `holocron` | `APPS/HOLOCRON.ELF`; login screen charter (`unaos/crates/kernel/src/video/login.rs`) |
 | Matrix | Files | `matrix` | Quarry (`video/quarry*.rs`, charter Matrix) |

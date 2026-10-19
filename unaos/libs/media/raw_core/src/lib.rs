@@ -19,8 +19,10 @@
 //! ([`MAX_PIXELS`]) before any allocation. Allocation of image-sized buffers is fallible.
 //!
 //! The output surface is pixel_core's: straight RGBA8, row-major, sRGB-encoded ([`color`]).
-//! Owed until a real file has been read: the per-model colour matrix, white balance, `Compression 7`
-//! (lossless JPEG) and the A100's ARW1. Design: `docs/dev/evidence/rmbp-1005/rawcore.md`.
+//! RAWVIEW (B711): a raw with NO embedded preview still shows — [`half_rgba`] / [`Binner`] at `k = 2` with a
+//! [`WbTone`]: each 2x2 cell one RGB, the as-shot white balance ([`wb`]: AsShotNeutral, else Sony's SR2 levels),
+//! a pure 2.2 gamma. Owed until a real file has been read: the per-model colour matrix, `Compression 7`
+//! (lossless JPEG), packed 12-bit and the A100's ARW1. Design: `docs/dev/evidence/rmbp-1005/rawcore.md`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -35,9 +37,11 @@ pub mod demosaic;
 pub mod exif;
 pub mod synth;
 pub mod tiff;
+pub mod wb;
 
 pub use decode::RowDecoder;
-pub use demosaic::{bilinear_linear, bilinear_rgba, Binner, Tone};
+pub use demosaic::{bilinear_linear, bilinear_rgba, half_rgba, Binner, Tone, ToneMap, WbTone};
+pub use wb::{Wb, WbSource};
 pub use exif::Facts;
 pub use tiff::{parse, RawInfo, Strip};
 

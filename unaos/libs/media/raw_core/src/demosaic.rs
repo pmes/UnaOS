@@ -10,8 +10,11 @@
 //!   sample of each colour in its `k x k` block — any 2x2 window holds all three colours, so no interpolation
 //!   is needed — fed one row at a time, holding one accumulator row (the kernel's streaming path).
 //!
-//! Means are taken in LINEAR light, then [`Tone`] maps black..white to sRGB. No white balance and no colour
-//! matrix yet (owed): the image is the camera's native RGB, flat and greenish.
+//! Means are taken in LINEAR light, then a [`ToneMap`] maps black..white to bytes: [`Tone`] (sRGB, no white
+//! balance — Facet's FULL path, the camera's native RGB, flat and greenish) or [`WbTone`] (RAWVIEW, B711: the
+//! as-shot white balance per channel, then a pure 2.2 gamma). [`half_rgba`] is the half-size demosaic: the
+//! [`Binner`] at `k = 2`, each 2x2 CFA cell one RGB pixel (R and B their own sample, G the mean of the two), so a
+//! raw with no embedded preview still shows. No colour matrix yet (owed).
 
 use alloc::vec::Vec;
 
@@ -46,6 +49,80 @@ impl Tone {
         let i = (v as usize).min(self.lut.len() - 1);
         self.lut[i]
     }
+}
+
+/// A raw sample of colour `c` (0 R, 1 G, 2 B) -> a display byte.
+pub trait ToneMap {
+    fn map_c(&self, c: usize, v: u32) -> u8;
+}
+
+impl ToneMap for Tone {
+    #[inline]
+    fn map_c(&self, _c: usize, v: u32) -> u8 {
+        self.map(v)
+    }
+}
+
+/// White-balanced tone (RAWVIEW, B711): channel `c`'s `black..=white` stretched to `0..1` in linear light, times
+/// its gain (the [`crate::Wb`] multipliers normalised so the SMALLEST is one — highlights clip, as dcraw's
+/// do), then encoded by a pure 2.2 power curve. One table per channel, `white + 1` entries each.
+pub struct WbTone {
+    lut: [Vec<u8>; 3],
+    /// The gains applied, Q10, smallest = 1024 (the wire's and the KAT's).
+    pub gain: [u32; 3],
+}
+
+impl WbTone {
+    /// `white == 0` takes `max_code`; `wb == None` is unity gains.
+    pub fn new(black: u16, white: u16, max_code: u16, wb: Option<&crate::Wb>) -> Result<Self, Error> {
+        let white = if white == 0 { max_code } else { white }.max(1);
+        let black = if black >= white { 0 } else { black };
+        let mul = wb.map(|w| w.mul).unwrap_or([crate::wb::ONE; 3]);
+        let lo = mul.iter().copied().min().unwrap_or(crate::wb::ONE).max(1) as u64;
+        let gain = mul.map(|m| ((m as u64 * crate::wb::ONE as u64 + lo / 2) / lo) as u32);
+        let t = color::gamma22_thresholds();
+        let span = (white - black) as f64;
+        let mut lut = [crate::zeroed::<u8>(white as usize + 1)?, crate::zeroed::<u8>(white as usize + 1)?, crate::zeroed::<u8>(white as usize + 1)?];
+        for (c, l) in lut.iter_mut().enumerate() {
+            let g = mul[c] as f64 / lo as f64;
+            let mut code = 0usize;
+            for v in black as usize..=white as usize {
+                // (v - black) * g first: an exact product when the gain is a short binary fraction (the KAT's
+                // grey cell lands every channel on the same code).
+                let lin = ((v - black as usize) as f64 * g) / span;
+                while code < 255 && t[code] <= lin {
+                    code += 1;
+                }
+                l[v] = code as u8;
+            }
+        }
+        Ok(WbTone { lut, gain })
+    }
+}
+
+impl ToneMap for WbTone {
+    #[inline]
+    fn map_c(&self, c: usize, v: u32) -> u8 {
+        let l = &self.lut[c.min(2)];
+        l[(v as usize).min(l.len() - 1)]
+    }
+}
+
+/// The half-size demosaic of a `w x h` mosaic: `(rgba, w / 2, h / 2)`, each 2x2 CFA cell one pixel (an odd last
+/// row or column is dropped). Bounds-checked; the output is reserved fallibly.
+pub fn half_rgba<T: ToneMap>(m: &[u16], w: usize, h: usize, cfa: &[u8; 4], tone: &T) -> Result<(Vec<u8>, usize, usize), Error> {
+    let (ow, oh) = (w / 2, h / 2);
+    if ow == 0 || oh == 0 {
+        return Err(Error::Malformed("mosaic below one 2x2 cell"));
+    }
+    if m.len() < w.checked_mul(h).ok_or(Error::TooLarge)? {
+        return Err(Error::Truncated);
+    }
+    let mut bin = Binner::new(2, ow, oh, *cfa)?;
+    for y in 0..oh * 2 {
+        bin.row(y, &m[y * w..(y + 1) * w], tone);
+    }
+    Ok((bin.rgba, ow, oh))
 }
 
 /// The colour (0 R, 1 G, 2 B) at `(x, y)` of a 2x2 pattern.
@@ -140,7 +217,7 @@ impl Binner {
     }
 
     /// Accumulate mosaic row `y`.
-    pub fn row(&mut self, y: usize, r: &[u16], tone: &Tone) {
+    pub fn row<T: ToneMap>(&mut self, y: usize, r: &[u16], tone: &T) {
         let oy = y / self.k;
         if oy >= self.oh {
             return;
@@ -157,13 +234,13 @@ impl Binner {
         }
     }
 
-    fn flush(&mut self, oy: usize, tone: &Tone) {
+    fn flush<T: ToneMap>(&mut self, oy: usize, tone: &T) {
         for ox in 0..self.ow {
             let o = (oy * self.ow + ox) * 4;
             for c in 0..3 {
                 let n = self.cnt[ox][c] as u64;
                 let v = if n > 0 { (self.acc[ox][c] + n / 2) / n } else { 0 };
-                self.rgba[o + c] = tone.map(v as u32);
+                self.rgba[o + c] = tone.map_c(c, v as u32);
             }
             self.rgba[o + 3] = 255;
             self.acc[ox] = [0; 3];

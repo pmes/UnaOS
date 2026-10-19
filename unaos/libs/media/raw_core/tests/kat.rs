@@ -3,7 +3,8 @@
 //! go in `tests/fixtures` when one is dropped.
 
 use raw_core::synth::{self, Coding};
-use raw_core::{color, parse, Binner, Error, RowDecoder, Tone};
+use raw_core::synth::Opts;
+use raw_core::{color, half_rgba, parse, Binner, Error, RowDecoder, Tone, Wb, WbSource, WbTone};
 
 #[test]
 fn srgb_encoder_matches_std_powf() {
@@ -146,4 +147,106 @@ fn hostile_inputs_fail_closed() {
     for n in 0..f.len().min(600) {
         let _ = parse(&f[..n]);
     }
+}
+
+// ── RAWVIEW (B711): the delta block by its documented layout, the half-size develop, the white balance ────────
+
+#[test]
+fn craw_delta_block_by_layout() {
+    // One 32-column row = two 16-byte blocks: the even columns, then the odd ones. Each block: bits 0..11 max,
+    // 11..22 min, 22..26 imax, 26..30 imin, then fourteen 7-bit deltas above min (sh = 0: the span is < 128).
+    let block = |px: &[u32; 16]| -> [u8; 16] {
+        let imax = (0..16).max_by_key(|&i| (px[i], 16 - i)).unwrap();
+        let imin = (0..16).filter(|&i| i != imax).min_by_key(|&i| (px[i], i)).unwrap();
+        let (max, min) = (px[imax], px[imin]);
+        assert!(max - min < 128);
+        let mut v: u128 = (max | min << 11 | (imax as u32) << 22 | (imin as u32) << 26) as u128;
+        let mut bit = 30;
+        for i in (0..16).filter(|&i| i != imax && i != imin) {
+            v |= ((px[i] - min) as u128) << bit;
+            bit += 7;
+        }
+        v.to_le_bytes()
+    };
+    let mut even = [0u32; 16];
+    for (i, p) in even.iter_mut().enumerate() {
+        *p = 900 + 5 * i as u32;
+    }
+    even[3] = 1000;
+    even[7] = 890;
+    let odd = [500u32; 16];
+    let mut row = block(&even).to_vec();
+    row.extend_from_slice(&block(&odd));
+    let s = raw_core::Strip { width: 32, height: 1, bits: 8, compression: 32767, offset: 0, len: 32, cfa: [0, 1, 1, 2], black: 0, white: 0, curve: None, le: true };
+    let d = RowDecoder::new(&s).unwrap();
+    assert_eq!(d.coding(), "craw");
+    let mut out = [0u16; 32];
+    d.row(&row, &mut out).unwrap();
+    let curve = raw_core::decode::sony_curve(None);
+    for i in 0..16 {
+        assert_eq!(out[2 * i], curve[(even[i] as usize) << 1] >> 2, "even column {}", 2 * i);
+        assert_eq!(out[2 * i + 1], curve[500 << 1] >> 2, "odd column {}", 2 * i + 1);
+    }
+}
+
+#[test]
+fn gamma22_encoder_matches_std_powf() {
+    let t = color::gamma22_thresholds();
+    for i in 0..=4096u32 {
+        let lin = i as f64 / 4096.0;
+        let want = (lin.powf(1.0 / 2.2) * 255.0).round() as i32;
+        let got = color::encode(lin, &t) as i32;
+        assert!((want - got).abs() <= 1, "lin={lin} want={want} got={got}");
+    }
+}
+
+#[test]
+fn white_balance_sources() {
+    // AsShotNeutral (1/2, 1, 2/3): gains 2, 1, 1.5.
+    assert_eq!(Wb::from_neutral([(1, 2), (1, 1), (2, 3)]), Some(Wb { mul: [2048, 1024, 1536], src: WbSource::AsShotNeutral }));
+    assert_eq!(Wb::from_neutral([(0, 1), (1, 1), (1, 1)]), None);
+    assert_eq!(Wb::from_levels(1, 1024, 1024, WbSource::Sony), None, "a gain below 1/16 is refused");
+    // The SR2 cipher is an XOR stream: twice is the identity, once is not.
+    let plain: Vec<u8> = (0..64u8).collect();
+    let mut b = plain.clone();
+    raw_core::wb::sony_decrypt(&mut b, 0x1234_5678);
+    assert_ne!(b, plain);
+    raw_core::wb::sony_decrypt(&mut b, 0x1234_5678);
+    assert_eq!(b, plain);
+    // A preview-carrying file with no SR2 names no white balance.
+    let f = synth::arw(16, 16, &synth::ramp(16, 16), Coding::Plain14);
+    assert_eq!(parse(&f).unwrap().wb, None);
+}
+
+#[test]
+fn half_size_develop_no_preview() {
+    let lv = [2048u16, 1024, 1024, 1536];
+    let (w, h) = (64u32, 32u32);
+    let f = synth::arw_with(w, h, &synth::grey(w, h, lv), Coding::Plain14, Opts { preview: false, wb_rggb: Some(lv), ..Opts::default() });
+    let info = parse(&f).unwrap();
+    assert!(info.preview.is_none(), "no embedded JPEG: Quick Look must develop");
+    assert_eq!(info.ifds, 4, "the SR2Private IFD is read for the white balance, not walked");
+    assert_eq!(info.wb, Some(Wb { mul: [2048, 1024, 1536], src: WbSource::Sony }), "decrypted SR2SubIFD WB_RGGBLevels");
+    let s = info.strip.clone().unwrap();
+    let d = RowDecoder::new(&s).unwrap();
+    assert_eq!(d.coding(), "plain");
+    let m = d.all(&f[s.offset as usize..(s.offset + s.len) as usize]).unwrap();
+    assert_eq!(m, synth::grey(w, h, lv), "uncompressed 14-bit mosaic");
+    let tone = WbTone::new(s.black, s.white, d.max_code, info.wb.as_ref()).unwrap();
+    assert_eq!(tone.gain, [2048, 1024, 1536]);
+    let (rgba, ow, oh) = half_rgba(&m, w as usize, h as usize, &s.cfa, &tone).unwrap();
+    assert_eq!((ow, oh, rgba.len()), (32, 16, 32 * 16 * 4));
+    let lin = synth::GREY_G as f64 / (synth::WHITE - synth::BLACK) as f64;
+    let want = (lin.powf(1.0 / 2.2) * 255.0).round() as i32;
+    for p in rgba.chunks_exact(4) {
+        assert_eq!((p[0], p[1], p[3]), (p[2], p[2], 255), "white-balanced grey renders R = G = B");
+        assert!((p[1] as i32 - want).abs() <= 1, "gamma 2.2: got {} want {want}", p[1]);
+    }
+    // Unity gains on the same scene: not grey (the camera's native RGB).
+    let flat = WbTone::new(s.black, s.white, d.max_code, None).unwrap();
+    let (rgba, ..) = half_rgba(&m, w as usize, h as usize, &s.cfa, &flat).unwrap();
+    assert!(rgba[0] < rgba[1] && rgba[2] < rgba[1]);
+    // Too small to halve, and a short mosaic: refused, never a panic.
+    assert!(half_rgba(&m[..1], 1, 1, &s.cfa, &tone).is_err());
+    assert_eq!(half_rgba(&m[..10], 64, 32, &s.cfa, &tone).err(), Some(Error::Truncated));
 }
