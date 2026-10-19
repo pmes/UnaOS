@@ -8214,9 +8214,12 @@ pub fn gatesteal2_ensure_tests() {
     }
 }
 
-/// `:: GATESTEAL2: death=c<n> current=<tid> moved_current=<0|1> rehome=<watch|none> pump_alive_ms=<n>
-/// gate_released_steps=<n> -> PASS|FAIL|SKIP :: new_tid= live=c<n> was=<parked|running> door=<alive|stale>
-/// revenant=<exited|stuck> hold=<parked|none>`. The pump parks at the end of its store-services step after one
+/// `:: GATESTEAL2: death=c<n> current=<tid> moved_current=<0|1> rehome=<steal|watch|none> pump_alive_ms=<n>
+/// gate_released_steps=<n> -> PASS|FAIL|SKIP :: new_tid= live=c<n> was=parked door=<alive|stale> revenant=<exited|stuck>
+/// wedge_rehome=<wedge|none|unparked> wedge_current=<tid> wedge_from=c<n> wedge_live=c<n> wedge_restart_ms=<n>
+/// wedge_revenant=<exited|stuck> deaths=<n>`. LEG 2 (M2) parks the fresh pump again and lets the watch's PUMPWEDGE edge
+/// restart it with no death published (`rehome=wedge`); `wedge_restart_ms` runs from the park, so it carries the 2 s
+/// wedge bound. The pump parks at the end of its store-services step after one
 /// composite (declined by the pump-lane rule: `gate=released`); the fixture publishes a death of the pump's core through
 /// the steal's own gauges (`wm::comp_death_publish_fixture`) and drives the watch (`sessionwedge::look`), which re-homes
 /// through [`rehome_dead_core`] -> [`singleton_restart`]. PASS iff the restart superseded the parked tid, the fresh
@@ -8264,14 +8267,41 @@ fn gatesteal2_selftest() {
     let door = SGL_STAMPS.load(Ordering::Relaxed) > s1 && crate::drivers::xhci::poll_task_armed();
     HOLD2_SEM.post();
     let revenant = hold2_wait(1_500, || SGL_REVENANTS.load(Ordering::Acquire) != rev0);
+    let by1 = crate::sessionwedge::gatesteal2_rehome().0;
+    // LEG 2 — M2, the wedge with NO steal (flight 36 boot 2): park the fresh pump again and let the watch's PUMPWEDGE
+    // edge (2 s of silence, `sessionwedge::look`) restart it — no death is published. The leg's wedge reads
+    // `-> SEEN :: fixture=1`.
+    crate::sessionwedge::gatesteal2_wedge_leg(true);
+    let restarts1 = SGL_RESTARTS.load(Ordering::Acquire);
+    let rev1 = SGL_REVENANTS.load(Ordering::Acquire);
+    let old2 = SGL_TID.load(Ordering::Acquire);
+    let from2 = SGL_HOME.load(Ordering::Acquire);
+    HOLD2_STATE.store(0, Ordering::Release);
+    HOLD2_ARMED.store(true, Ordering::Release);
+    let held2 = hold2_wait(3_000, || HOLD2_STATE.load(Ordering::Acquire) == 1);
+    HOLD2_ARMED.store(false, Ordering::Release);
+    let t_park2 = crate::arch::ms();
+    let wedged = held2
+        && hold2_wait(4_000, || {
+            crate::sessionwedge::look(crate::arch::ms());
+            SGL_RESTARTS.load(Ordering::Acquire) != restarts1 && SGL_FRESH_MS.load(Ordering::Acquire) != 0
+        });
+    let (by2, deaths) = crate::sessionwedge::gatesteal2_rehome();
+    let wedge_ok = wedged && by2 == 2 && SGL_RESTART_OLD.load(Ordering::Relaxed) == old2 && SGL_HOME.load(Ordering::Acquire) != from2;
+    let wedge_ms = if wedged { SGL_FRESH_MS.load(Ordering::Acquire).saturating_sub(t_park2) } else { 0 };
+    if held2 {
+        HOLD2_SEM.post();
+    }
+    let revenant2 = held2 && hold2_wait(1_500, || SGL_REVENANTS.load(Ordering::Acquire) != rev1);
+    crate::sessionwedge::gatesteal2_wedge_leg(false);
     let steps = crate::video::wm::pump_gate_released_steps();
-    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1;
+    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1 && wedge_ok && revenant2;
     serial_println!(
-        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} revenant={} hold={}",
+        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} revenant={} wedge_rehome={} wedge_current={} wedge_from=c{} wedge_live=c{} wedge_restart_ms={} wedge_revenant={} deaths={}",
         dead,
         old,
         moved_current as u8,
-        if restarted { "watch" } else { "none" },
+        if restarted { if by1 == 1 { "steal" } else { "watch" } } else { "none" },
         alive_ms,
         steps,
         if ok { "PASS" } else { "FAIL" },
@@ -8279,6 +8309,12 @@ fn gatesteal2_selftest() {
         if restarted { live as i64 } else { -1 },
         if door { "alive" } else { "stale" },
         if revenant { "exited" } else { "stuck" },
-        match HOLD2_STATE.load(Ordering::Acquire) { 1 => "parked", 2 => "released", _ => "none" }
+        if wedge_ok { "wedge" } else if held2 { "none" } else { "unparked" },
+        old2,
+        from2 as i64,
+        if wedge_ok { SGL_HOME.load(Ordering::Acquire) as i64 } else { -1 },
+        wedge_ms,
+        if revenant2 { "exited" } else { "stuck" },
+        deaths
     );
 }

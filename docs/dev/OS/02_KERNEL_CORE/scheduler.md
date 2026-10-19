@@ -3946,8 +3946,10 @@ step a one-shot latch or an idempotent service; the prologue's task starts are l
 Beside it, the pump lane releases the compositor gate around its long steps (`wm::pump_gate_off`/`pump_gate_on`, cores
 sheet BP-cores-16), and `tests gatesteal2` parks the pump on a semaphore at the end of store-services, publishes a
 synthetic death through the steal's gauges, drives the watch and measures the fresh instance's first stamp:
-`:: GATESTEAL2: death=c<n> current=<tid> moved_current=1 rehome=watch pump_alive_ms=<n> gate_released_steps=<n> -> PASS ::`.
-Owed: the watch's trigger on a wedge with no steal (sessionwedge.rs) — the scheduler half is here.
+`:: GATESTEAL2: death=c<n> current=<tid> moved_current=1 rehome=steal pump_alive_ms=<n> gate_released_steps=<n> -> PASS :: … wedge_rehome=wedge …`.
+A wedge with NO steal (flight 36 boot 2) takes the same restart from the pump watch: `sessionwedge::wedge_rehome` on
+the PUMPWEDGE edge calls `singleton_restart` (the core is not parked by name; the service role follows), and PUMPWEDGE
+prints `rehome=<steal|wedge>(pump=<tid>@cpu<n>) deaths=<n>`; `tests gatesteal2`'s second leg drives it (`wedge_rehome=wedge`).
 
 ---
 
