@@ -71,6 +71,12 @@ use unaos_boot_info::FrameBufferInfo;
 
 use super::FrameBuffer;
 
+// PINCHZOOM (B735): the trackpad's gesture recogniser lives in the input tree (`input/gestures.rs`) and is declared
+// here, beside its first route, so it compiles exactly where the lens does (x86 `wc`) — `keymap.rs`'s idiom for
+// `input/layouts.rs`.
+#[path = "../input/gestures.rs"]
+pub mod gestures;
+
 /// The largest factor (the schema's `accessibility.zoom` range is `0..=4`; 1 reads as off).
 pub const Z_MAX: u8 = 4;
 /// The present's budget at 1920x1200, z=2 (the arc's bar; reported, never enforced).
@@ -96,6 +102,9 @@ static PERSIST: AtomicBool = AtomicBool::new(false);
 static OWED: AtomicBool = AtomicBool::new(false);
 /// The focused window's centre, packed `x << 32 | y` ([`NONE`] = no focus).
 static FOCUS_C: AtomicU64 = AtomicU64::new(NONE);
+/// PINCHZOOM (B735): a panel point the lens centres on (packed `x << 32 | y`, [`NONE`] = none) until the pointer next
+/// moves or a chord / Settings sets the factor ([`set_factor_at`]).
+static AT: AtomicU64 = AtomicU64::new(NONE);
 /// The last pointer move (ms) — nearest while moving, bilinear once settled.
 static MOVE_MS: AtomicU64 = AtomicU64::new(0);
 /// The last present's end (ms and cycles), its cost, its kind, its origin.
@@ -145,6 +154,7 @@ pub fn stepped(z: u8, step: i8) -> u8 {
 
 /// Settings (the login's load, a PrefChanged, a press): the factor and what it follows. Applied by [`service`].
 pub fn set(z: u8, follow: u8) {
+    AT.store(NONE, Relaxed);
     WANT.store(normalize(z as i64), Relaxed);
     FOLLOW.store(follow.min(1), Relaxed);
     OWED.store(true, Release);
@@ -154,8 +164,23 @@ pub fn set(z: u8, follow: u8) {
 /// the engage, the store write and the line are the service pass's.
 pub fn chord(step: i8) {
     let z = stepped(WANT.load(Relaxed), step);
+    AT.store(NONE, Relaxed);
     WANT.store(z, Relaxed);
     PERSIST.store(true, Release);
+    OWED.store(true, Release);
+}
+
+/// PINCHZOOM (B735): the pinch's route (`gestures::feed`, the trackpad decoder's one call) and `tests pinchzoom` —
+/// the factor `z` (normalised as Settings' is) centred on the panel point `at` until the pointer next moves (`None`:
+/// the pointer, or the focus with follow=focus). Atomics only, the chord's regime: the engage, the present and the
+/// `[zoom]` line are [`service`]'s; `keep` = Settings stores the factor as it stores a chord's (the fixture keeps
+/// nothing).
+pub fn set_factor_at(z: u8, at: Option<(u32, u32)>, keep: bool) {
+    AT.store(at.map_or(NONE, |(x, y)| ((x as u64) << 32) | y as u64), Relaxed);
+    WANT.store(normalize(z as i64), Relaxed);
+    if keep {
+        PERSIST.store(true, Release);
+    }
     OWED.store(true, Release);
 }
 
@@ -174,6 +199,9 @@ pub fn take_persist() -> Option<(u8, u8)> {
 pub fn on_pointer() {
     if LIVE.load(Relaxed) == 0 {
         return;
+    }
+    if AT.load(Relaxed) != NONE {
+        AT.store(NONE, Relaxed);
     }
     MOVE_MS.store(crate::arch::ms(), Relaxed);
     kick(false);
@@ -232,8 +260,10 @@ fn present(smooth: Option<bool>) -> Option<u64> {
 
 /// The lens's centre: the focused rect's (follow=focus, when one is focused), else the pointer's. Clamped to the panel.
 fn centre(w: usize, h: usize) -> (usize, usize) {
-    let f = FOCUS_C.load(Relaxed);
-    let (x, y) = if FOLLOW.load(Relaxed) == 1 && f != NONE {
+    let (f, at) = (FOCUS_C.load(Relaxed), AT.load(Relaxed));
+    let (x, y) = if at != NONE {
+        ((at >> 32) as usize, (at & 0xFFFF_FFFF) as usize)
+    } else if FOLLOW.load(Relaxed) == 1 && f != NONE {
         ((f >> 32) as usize, (f & 0xFFFF_FFFF) as usize)
     } else {
         let (x, y) = crate::pal::cursor::pos(w as i32, h as i32);

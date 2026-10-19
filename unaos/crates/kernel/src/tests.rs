@@ -174,7 +174,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); #[cfg(feature = "uac")] register("uacmic", uacmic_fixture); register("clockpainters", clockpainters_selftest); register("hwreport", hwreport_selftest); register("audiomix", audiomix_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); register("pinchzoom", pinchzoom_selftest); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -3446,4 +3446,120 @@ fn hwtab_leg(n: usize) -> (bool, alloc::string::String, alloc::string::String) {
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn hwtab_leg(_n: usize) -> (bool, alloc::string::String, alloc::string::String) {
     (true, alloc::string::String::from("tab=- rows_painted=-"), alloc::string::String::from("press=- (no Settings window in this build)"))
+}
+
+/// PINCHZOOM (rmbp-ledger B735) — `tests pinchzoom`: synthetic contact streams through the gesture recogniser
+/// (`video::zoom::gestures::Recogniser`) and the routes' targets (not the swipe latch, so the device-service pass never
+/// acts twice): (1) two contacts spreading 1000 -> 1640 sensor units lock as a pinch, step once, and
+/// `zoom::set_factor_at` asks z = 2 (stepped from the user's own z when a lens is on; restored, never stored);
+/// (2) two contacts stroking 800 units together lock as a scroll whose deltas sum to the stroke, never claimed;
+/// (3) on three fixture windows a left three-finger swipe brings the least-recent row to the front with the focus
+/// (`wm::gesture_swipe(+1)`) and a right one brings the row under the top back (`-1`).
+/// `:: PINCHZOOM: pinch=ok scroll=ok swipe=ok contacts=<real|synthetic> -> PASS ::`
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+fn pinchzoom_selftest() {
+    use crate::video::wm;
+    use crate::video::zoom::{self, gestures::{self as g, Contact, Out, Recogniser, Sample}};
+    static SURF: [u32; 64] = [0; 64];
+    const OWNERS: [u64; 3] = [0x735A, 0x735B, 0x735C];
+    const _: () = assert!(!wm::is_kernel_owner(0x735A) && !wm::is_kernel_owner(0x735B) && !wm::is_kernel_owner(0x735C));
+    let c = |id: u8, x: i32, y: i32| Some(Contact { id, x, y, touch: 400 });
+    let lift = |ms: u64| Sample { n: 0, c: [None, None], ms, pressed: false, swipe_on: true };
+    // (1) the pinch
+    let mut r = Recogniser::new();
+    let (mut steps, mut scale, mut claimed, mut scrolled) = (0i32, 0u32, true, false);
+    for i in 0..=16i32 {
+        let h = 500 + i * 20;
+        let s = Sample { n: 2, c: [c(0, -h, 3000), c(1, h, 3000)], ms: i as u64 * 8, pressed: false, swipe_on: true };
+        match r.step(&s) {
+            Out::Pinch { step, scale_pct, .. } => {
+                steps += step as i32;
+                scale = scale_pct;
+                claimed &= r.claims();
+            }
+            Out::Scroll { .. } => scrolled = true,
+            _ => {}
+        }
+    }
+    let _ = r.step(&lift(200));
+    let (z0, f0) = zoom::want();
+    let zw = zoom::stepped(z0, steps.clamp(-1, 1) as i8);
+    let at = crate::video::panel_info_nonblocking().map_or((320, 240), |i| ((i.width / 2) as u32, (i.height / 2) as u32));
+    zoom::set_factor_at(zw, Some(at), false);
+    let z = zoom::want().0;
+    zoom::set(z0, f0);
+    let pinch_ok = steps == 1 && scale == 164 && claimed && !scrolled && z == zw && (z0 != 0 || z == 2);
+    // (2) the scroll
+    let mut r = Recogniser::new();
+    let (mut sum, mut end, mut sc_claim, mut pinched) = ((0i32, 0i32), None, false, false);
+    for i in 0..=20i32 {
+        let y = 2000 + i * 40;
+        let s = Sample { n: 2, c: [c(0, -500, y), c(1, 500, y)], ms: i as u64 * 8, pressed: false, swipe_on: true };
+        match r.step(&s) {
+            Out::Scroll { dx, dy } => sum = (sum.0 + dx, sum.1 + dy),
+            Out::Pinch { .. } => pinched = true,
+            _ => {}
+        }
+        sc_claim |= r.claims();
+    }
+    if let Out::ScrollEnd { dx, dy, .. } = r.step(&lift(200)) {
+        end = Some((dx, dy));
+    }
+    let scroll_ok = sum == (0, 800) && end == Some((0, 800)) && !sc_claim && !pinched;
+    // (3) the swipe
+    let stream = |r: &mut Recogniser, dx: i32| -> (i8, u32, bool) {
+        let (mut dir, mut fired, mut claim) = (0i8, 0u32, true);
+        for i in 0..=16i32 {
+            let x = 2000 + i * dx;
+            let s = Sample { n: 3, c: [c(0, x, 3000), c(1, x + 900, 3100)], ms: i as u64 * 8, pressed: false, swipe_on: true };
+            if let Out::Swipe { dir: d, .. } = r.step(&s) {
+                dir = d;
+                fired += 1;
+            }
+            claim &= r.claims();
+        }
+        let _ = r.step(&lift(300));
+        (dir, fired, claim)
+    };
+    let surf = &raw const SURF as usize;
+    let len = core::mem::size_of_val(&SURF);
+    let saved = wm::focus_asid();
+    let ring = crate::arch::x86_64::syscall::user_input_active();
+    let mut ids = [wm::WIN_NONE; 3];
+    for (i, o) in OWNERS.iter().enumerate() {
+        ids[i] = wm::create(*o, surf, len, 8, 8, 32, b"pz-swipe");
+    }
+    let swipe = if ids.contains(&wm::WIN_NONE) {
+        "skip"
+    } else {
+        let mut r = Recogniser::new();
+        let (d1, n1, c1) = stream(&mut r, -100);
+        let mut o0 = alloc::vec::Vec::new();
+        let n0 = wm::cycle_order(&mut o0);
+        let want1 = if n0 >= 2 { o0[n0 - 1] } else { wm::WIN_NONE };
+        let got1 = if d1 != 0 { wm::gesture_swipe(d1) } else { None };
+        let mut o1 = alloc::vec::Vec::new();
+        let m1 = wm::cycle_order(&mut o1);
+        let next_ok = d1 == 1 && n1 == 1 && c1 && got1 == Some(want1) && m1 >= 2 && o1[0] == want1 && wm::wl_focused().map(|f| f.0) == Some(want1);
+        let want2 = if m1 >= 2 { o1[1] } else { wm::WIN_NONE };
+        let (d2, n2, c2) = stream(&mut r, 100);
+        let got2 = if d2 != 0 { wm::gesture_swipe(d2) } else { None };
+        let mut o2 = alloc::vec::Vec::new();
+        let m2 = wm::cycle_order(&mut o2);
+        let prev_ok = d2 == -1 && n2 == 1 && c2 && got2 == Some(want2) && m2 >= 1 && o2[0] == want2 && wm::wl_focused().map(|f| f.0) == Some(want2);
+        serial_println!("[input] pinchzoom swipe windows={} next={}->{} prev={}->{}", n0, want1, next_ok as u8, want2, prev_ok as u8);
+        if next_ok && prev_ok { "ok" } else { "bad" }
+    };
+    for o in OWNERS {
+        wm::close_owner(o);
+    }
+    crate::arch::x86_64::syscall::user_input_set_active(ring);
+    wm::focus_changed(saved);
+    let contacts = if g::real_samples() > 0 { "real" } else { "synthetic" };
+    let ok = |b: bool| if b { "ok" } else { "bad" };
+    let verdict = if swipe == "skip" { "SKIP" } else if pinch_ok && scroll_ok && swipe == "ok" { "PASS" } else { "FAIL" };
+    serial_println!(
+        ":: PINCHZOOM: pinch={} scroll={} swipe={} contacts={} -> {} :: z={} steps={} scale={}.{:02} scroll_dy={} end={:?}",
+        ok(pinch_ok), ok(scroll_ok), swipe, contacts, verdict, z, steps, scale / 100, scale % 100, sum.1, end
+    );
 }
