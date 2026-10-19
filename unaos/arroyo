@@ -14329,7 +14329,7 @@ GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.
 # login) calls smolnet / net_fetch / net_dns / netring3 — a call walk over `use` aliases and paths (nonet-check.py).
 # NONETREACH (B697 NOTELEMETRY, BP-bar-10): no fn under video/** REACHES an outbound act (a socket opened, a connect, the
 # stack's outbound ledger, a DNS query built, http_core/tls_core) — the same walker, every video fn a root (nonet-reach.py).
-# TOOLING1 (2026-10-13; ARCH-CONFORMANCE 14, rmbp-ledger B107): the last two rows are the bench's two SCORERS'
+# TOOLING1 (2026-10-13; ARCH-CONFORMANCE 14, rmbp-ledger B107): the mbench-selftest and specscore rows are the bench's two SCORERS'
 # own self-tests, headless and seconds-long (mbench ~4 s, of which most is its FIFO round-trip; specscore ~1 s).
 # `mbench --self-test` was reachable only through `check`'s GATE-HOSTTESTS (behind the cargo legs) and
 # `orin-specscore.py` through NOTHING — `grep -c orin-specscore unaos/arroyo` was 0. Both write their fixtures

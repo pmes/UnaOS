@@ -192,7 +192,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Gated on intel-ivb + x86_64 too, not just unaos_ivb: drivers::gpu does not exist on
     // aarch64 (this exact gate was dropped once before and broke the aarch64 check — keep it).
     #[cfg(all(feature = "unaos_ivb", feature = "intel-ivb", target_arch = "x86_64"))]
-    if boot_info.igpu_trace_valid {
+    if boot_info.igpu_trace_valid && boot_info.kelf.present() { // CRAWLC: the ivb tail sits after `kelf` (464..); a loader older than KELFHASH wrote it at 424, so without the loader's verdict the tail is absent
         unaos_kernel::drivers::gpu::igpu::set_boot_traces(
             boot_info.igpu_trace_0,
             boot_info.igpu_trace_1, 

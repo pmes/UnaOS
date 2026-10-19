@@ -709,7 +709,7 @@ mod view {
             }
             crate::arch::sched::sleep_ms(if ptp_src { 1 } else { PASS_MS });
         };
-        close(&mut win);
+        close(&mut win); if ptp_src && why != "stream-rearmed" { disarm_ptp(); } // CRAWLC: a PTP viewer that ends on its own (ptp-session-closed, alloc-copy, create-failed) drops ARMED, else `pump` respawns it every pass and the dot stays lit
         if why == "revoked" || why == "not-now" {
             stop_stream(why); // CAMDOT (B702): the user's No / Revoke ends the stream itself, so the dot goes out with it
         }
@@ -860,7 +860,7 @@ pub fn revoked(key: &str) {
 /// End the stream (the class driver's own disarm: the assembler and its buffers go, the count drops, the dot goes
 /// out). Task / service context only — never the claim path.
 fn stop_stream(why: &str) {
-    class::stream_disarm();
+    if SOURCE.load(Ordering::Relaxed) == SRC_PTP { disarm_ptp(); } else { class::stream_disarm(); } // CRAWLC: source-aware — a PTP live view's stop is `disarm_ptp` (the class disarm no-ops on it and would end a UVC stream instead)
     if REVOKED.swap(false, Ordering::AcqRel) {
         let ms = crate::arch::ms().wrapping_sub(REVOKE_AT.load(Ordering::Relaxed));
         REVOKE_MS.store(ms, Ordering::Relaxed);

@@ -139,8 +139,8 @@ pub fn parse_ident(buf: &[u8; SECTOR_BYTES], sectors: u64) -> Ident {
     ata_string(buf, 10, &mut serial);
     ata_string(buf, 23, &mut firmware);
     let reported = |w: u16| w != 0 && w != 0xFFFF;
-    let (w82, w85, w169) = (id_word(buf, 82), id_word(buf, 85), id_word(buf, 169));
-    let smart_supported = reported(w82) && w82 & 1 != 0;
+    let (w82, w85, w169) = (id_word(buf, 82), id_word(buf, 85), id_word(buf, 169)); let valid = |w: u16| w & 0xC000 == 0x4000; // CRAWLC: ATA8-ACS — word 82 holds only when word 83 bits 15:14 = 01, word 85 only when word 87's do
+    let smart_supported = reported(w82) && valid(id_word(buf, 83)) && w82 & 1 != 0;
     Ident {
         model,
         serial,
@@ -148,7 +148,7 @@ pub fn parse_ident(buf: &[u8; SECTOR_BYTES], sectors: u64) -> Ident {
         sectors,
         trim: reported(w169) && w169 & 1 != 0,
         smart_supported,
-        smart_enabled: smart_supported && reported(w85) && w85 & 1 != 0,
+        smart_enabled: smart_supported && reported(w85) && valid(id_word(buf, 87)) && w85 & 1 != 0,
     }
 }
 

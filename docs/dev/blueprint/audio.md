@@ -8,6 +8,9 @@
 - Settings > General, the Sound box's Mute row: the output picker `HDA internal | USB <vid:pid>` (`unaos/crates/kernel/src/video/settings.rs:952` paint, `:1718` press).
 - The decoders (WAV/FLAC/Ogg/MP3/AAC) are `audio_core` (shared, no_std); the kernel Player feeds the HDA stream (`drivers/hda_play.rs`).
 - THE MIXER (AUDIOMIX, rmbp-ledger B731): `unaos/crates/kernel/src/audio/mixer.rs` — N sources (a ring-3 program's `SYS_AUDIO_*` stream, a kernel source), each PCM16/2/48k with its own gain, mixed per 10 ms period (saturating add, master volume and mute) into the current sink; `tests audiomix`.
+- USB Audio Class 1 playback (cfg `uvc`): `unaos/crates/kernel/src/drivers/usb/uac.rs` over the host-neutral `uvc::IsoHost`, carried by xHCI isochronous OUT in `unaos/crates/kernel/src/drivers/xhci/isoch.rs` (the XHCIISO engine, B534, now both directions).
+- Settings > General, the Sound box's Mute row: the output picker `HDA internal | USB <vid:pid>` (`unaos/crates/kernel/src/video/settings.rs:984` paint, `:1753` press).
+- The decoders (WAV/FLAC/Ogg/MP3/AAC) are `audio_core` (shared, no_std); the Player and Stria feed the HDA stream (`drivers/hda_play.rs`).
 
 ## 2. Invariants
 | id | statement | anchor | held by |
@@ -28,6 +31,7 @@
 - `audio` may call: `drivers::hda` (one call), `drivers::usb::uac` (begin/write/finish/queued/counters), `prefs` (the one key).
 - `uac` may call: `uvc::IsoHost` (its host), `audio::usb_arrived` / `usb_gone`. `isoch` calls (through its `ac` door) `uac::pull` / `out_td_len` / `cfg_has_audio` / `probe`, and for capture `push_capture` / `capture_due` / `capture_service` / `capture_lost`.
 - `audio::source` may call `uac::capture_open` / `read_capture` / `capture_close` and `prefs::decided` / `decide` (the microphone domain); the menu bar reads `uac::capture_armed` only.
+- `uac` may call: `uvc::IsoHost` (its host), `audio::usb_arrived` / `usb_gone`. `isoch` calls `uac::pull` / `out_td_len` / `cfg_has_audio` / `probe` / `cfg_has_hid` / `disconnect`.
 - Settings calls `audio::picker` and `audio::sink` only.
 ## 4. Wire
 `[usb-iso] audio candidate slot= path= queued` · `[uac] dev=<vid:pid> … alts=` · `[uac] alt … ours=` · `[usb-iso] cfg-ep … type=isoch-out` · `[uac] stream … -> streaming` · `[audio] usb vid=<x> pid=<x> fmt=pcm16/2/48000 isoch_pkt=<n> underruns=<n>` · `[audio] sink=<label> chosen` · `:: UAC1: enumerated=<0|1> stream=<ok|…> frames=<n> underruns=<n> -> PASS|SKIP|FAIL ::` · `:: HDA-TONE: … ::` · `[uac] capture ready … -> idle` · `[uac] capture … -> streaming` · `[audio] usb capture vid= pid= fmt=pcm16/<ch>/<rate> frames= overruns= state=` · `[audio] source app= grant= … opened` · `[mic] ask app= domain=microphone posted=` · `[mic] answer=allow|not-now` · `[mic] dot painted=<on|off> open= x=` · `:: UACMIC: enumerated= capture= frames= dot_on= dot_off= grant= -> PASS|SKIP|FAIL ::`.

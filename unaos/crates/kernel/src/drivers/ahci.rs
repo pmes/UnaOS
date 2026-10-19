@@ -584,7 +584,7 @@ fn issue_f(p: &AhciPort, cmd: u8, feat: u8, lba: u64, count: u16, bytes: usize, 
             "[ahci] port {} command {:#04x} task-file error (PxIS={:#010x} PxTFD={:#010x} err={:#04x} [{}] PxSERR={:#010x})",
             port, cmd, is, tfd, (tfd >> 8) & 0xFF, ata_error_names(((tfd >> 8) & 0xFF) as u8), pr32(abar, port, P_SERR)
         );
-        return Err(());
+        if port_stop(abar, port) { pw32(abar, port, P_SERR, pr32(abar, port, P_SERR)); pw32(abar, port, P_IS, pr32(abar, port, P_IS)); let _ = port_start(abar, port); } return Err(()); // CRAWLC: AHCI 1.3.1 §6.2.2.1 — on TFES the HBA halts with PxCI bit 0 still set; ST=0 (clears PxCI), clear SERR and IS, ST=1, so one ABORTed command (a SMART the drive refuses) does not refuse every later one as "slot 0 still busy"
     }
     Ok(())
 }

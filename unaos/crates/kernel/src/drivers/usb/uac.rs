@@ -432,9 +432,9 @@ pub fn probe(slot: u8, vid: u16, pid: u16, win: &[u8], cfg_value: u8, h: &mut dy
         serial_println!("[uac] skip slot={} {:04x}:{:04x} reason=one-stream-already-armed", slot, vid, pid);
         return;
     }
-    ENUMERATED.store(true, Ordering::Release);
-    SLOT.store(slot, Ordering::Release);
-    VIDPID.store((vid as u32) << 16 | pid as u32, Ordering::Relaxed);
+    // CRAWLC: ENUMERATED / SLOT / VIDPID are stored after `pick` (below): a hubbed webcam's microphone (IN only, no
+    // OUT alternate in our format) is not ours, so it neither flips `tests uac1` to enumerated=1 nor takes the slot
+    // `disconnect` keys on.
     let cap = h.cap();
     let wtotal = if win.len() >= 4 { le16(win, 2) } else { 0 };
     let want = (wtotal as usize).min(cap) as u16;
@@ -470,6 +470,7 @@ pub fn probe(slot: u8, vid: u16, pid: u16, win: &[u8], cfg_value: u8, h: &mut dy
     if play.is_none() && cap.is_none() {
         return fail(slot, "pick", "no-pcm16-alternate");
     }
+    ENUMERATED.store(true, Ordering::Release); SLOT.store(slot, Ordering::Release); VIDPID.store((vid as u32) << 16 | pid as u32, Ordering::Relaxed); // CRAWLC (finding 9): the device is ours only once an alternate of ours was picked (playback or capture)
     if h.control(0x00, 9, cfg_value as u16, 0, 0, false).is_err() {
         return fail(slot, "set-configuration", "stalled-or-timeout");
     }
@@ -515,7 +516,7 @@ pub fn probe(slot: u8, vid: u16, pid: u16, win: &[u8], cfg_value: u8, h: &mut dy
         let r = h.control(0x22, RQ_SET_CUR, SAMPLING_FREQ_CONTROL << 8, a.ep.addr as u16, 3, false);
         serial_println!("[uac] set-cur sampling_freq={} ep={:#04x} result={}", RATE, a.ep.addr, match r { Ok(_) => "ok", Err(e) => e });
     }
-    match h.iso_start(&a.ep) {
+    TAIL.store(HEAD.load(Ordering::Acquire), Ordering::Release); match h.iso_start(&a.ep) { // CRAWLC: an aborted tone's bytes left in the ring are dropped before the first TD fill (no consumer runs yet)
         Ok((tds, lead, sched)) => {
             STREAMING.store(true, Ordering::Release);
             *WHY.lock() = "ok";

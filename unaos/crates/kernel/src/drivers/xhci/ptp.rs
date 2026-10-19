@@ -899,11 +899,26 @@ impl XhciController {
         HUBBED.store(false, Ordering::Relaxed);
         let Some((ia, im, oa, om)) = walk_candidate(slot) else { return false };
         if VENDOR.load(Ordering::Relaxed) {
+            // CRAWLC: an AX88179 is 0xFF/0xFF/0x00 too — when usbnet's walk took the slot, the PTP walk lets go
+            // and the usbnet arm (after this one in mod.rs) configures it.
+            #[cfg(feature = "usbnet")]
+            if super::usbnet::walk_is_candidate(slot) {
+                STATE.store(ST_ABSENT, Ordering::Relaxed);
+                SLOT.store(0, Ordering::Relaxed);
+                walk_reset();
+                return false;
+            }
             // MTPPHONE: no synchronous EP0 inside the event dispatch — park the candidate; the service
-            // pass asks its OS descriptor and configures it then. The root FSM goes on as before.
+            // pass asks its OS descriptor and configures it then. CRAWLC: the parked slot is ours (`true`
+            // gates the usbnet and UAC1 arms), and a root-port phone with no HID interface releases the
+            // port here — nothing else would, and the root FSM's watchdog would dispose the parked slot.
             STATE.store(ST_VENDOR, Ordering::Relaxed);
             serial_println!("[mtp] vendor interface slot={} iface={} — the OS descriptor is asked on the service pass", slot, IFACE.load(Ordering::Relaxed));
-            return false;
+            let s = &self.slots[slot as usize];
+            if !s.is_downstream && !s.is_keyboard && !s.is_mouse {
+                self.start_next_port();
+            }
+            return true;
         }
         STATE.store(ST_CONFIGURING, Ordering::Relaxed);
         PENDING_CFG.store(slot, Ordering::Relaxed);
@@ -982,7 +997,7 @@ impl XhciController {
         }
         match STATE.load(Ordering::Relaxed) {
             ST_CONFIGURED if crate::boot::services_up() => self.ptp_bringup(slot),
-            ST_VENDOR if crate::boot::services_up() => self.mtp_vendor_claim(slot),
+            ST_VENDOR if crate::boot::services_up() && !self.enum_active => self.mtp_vendor_claim(slot), // CRAWLC: the root port was released at the walk, so its synchronous EP0 waits out any enumeration in flight (the one-port-at-a-time rule `service_uvc` keeps)
             ST_OPEN => {
                 self.ptp_events(slot);
                 self.ptp_fill(slot);
