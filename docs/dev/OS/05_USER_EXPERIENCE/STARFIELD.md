@@ -167,10 +167,19 @@ box and the furniture, and handles the cursor. A group whose box meets any visib
 extent) is skipped: **the shimmer stops where a window covers it**, and no window is re-damaged by it. At most 11
 boxes per tick (`MAX_DEFER` is 16).
 
-**The cadence it gets.** The compositor runs passes on demand: with the pointer moving or anything drawing, the shimmer
-runs at up to 30 Hz; on a desktop where nothing draws, `wm::service_damage` is the only taker (the dock's once-a-second
-service pass), so the twinkle steps about once a second. A steady 30 Hz on an idle desktop needs a timer-driven pass
-from the compositor's owner (`wm.rs`, outside this arc's files) — owed, named in the report.
+**The cadence it gets (SHIMMERIDLE, rmbp-ledger B663).** The compositor runs passes on demand: with the pointer
+moving or anything drawing, the shimmer rides those passes at up to 30 Hz. On a desktop where nothing draws, the timer
+is the ~1 kHz device-service pass (`desktop_uefi::desktop_app_service`, beside `pace_service` and
+`splash::hold_service`), which calls `desktop::shimmer_idle` on every iteration: one clock read until a tick is due
+(33 ms after the last tick of any seat). A due tick runs only when the compositor gate is free and nothing is owed (no
+declined pass, no queued erase box, no menu paint, no damaged row: a window that moved or drew hands the shimmer to the
+pass that follows), never while the splash hold covers the panel and never under reduce motion (DESIGN-LANGUAGE §2.6).
+It then runs ONE ordinary `wm::composite`: that pass's `track` runs the tick with fresh occluders and its drain
+presents the boxes, the same seam and present as above. On the service core the pass is GATESTEAL's one-pass holder
+(no re-runs, no re-acquire), and since the gate was free it never declines or steals. A tick that queued no box (the
+desktop covered) backs the idle floor off to 8 x 33 ms. `tests shimmeridle`: two 200 ms windows with the fixture
+asleep: 4..=7 ticks, each idle tick's re-tint under 800 us, no gate steal; then, with reduce motion forced, zero idle
+ticks. `:: SHIMMERIDLE: idle_ms=<n> ticks=<n> max_us=<n> reduce_motion_ticks=0 gate_steals=0 -> PASS ::`.
 
 ## 9. From the first frame (STARTSCENE, rmbp-ledger B662)
 

@@ -695,7 +695,7 @@ pub fn desktop_app_service() {
     // drain is an ordinary unmasked composite, the same call `service_damage` and the paygo taker
     // already make from this lane. See `wm::pace_service`.
     super::wm::pace_service();
-    crate::splash::hold_service(); // SPLASHX86: the 5 s bound on the boot splash hold
+    crate::splash::hold_service(); #[cfg(all(target_arch = "x86_64", feature = "facet"))] super::wm::desktop::shimmer_idle(); // SPLASHX86: the 5 s bound on the boot splash hold. SHIMMERIDLE (B663): the idle desktop's twinkle — at most one tick per 33 ms, only when the gate is free and nothing is owed, never under reduce motion or the hold (desktop.rs `shimmer_idle`). ⚠ LINE-NEUTRAL append, code before this line's first `//`
     #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::dock::dockpin_service(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::desktopbuild::service(); // DESKTOPBUILT (B387): the desktop's build at login, its first paint's read-back, the battery follow. DOCKPIN — the owed `<home>/.dock` load (login) and save (a Keep/Remove press), VFS work that cannot run in the click router.
     #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::fs::assoc::service(); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "quarry"))] super::dnd::service(); // FILETYPES (B423): the registry `login ok` owes, built off the click path
 
