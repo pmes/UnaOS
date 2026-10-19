@@ -56,6 +56,10 @@
 //! kept in Principia's store, `prefs::decisions`), each with a Revoke; the revoke is latched and run on [`service`]
 //! (`prefs::revoke`): `[settings] privacy revoke key=<k> ok=<0|1>`. The next time that ask arises, it asks.
 //!
+//! SMARTLINE (rmbp-ledger B708, BP-bar-1): the Storage tab (the last) — one card per disk, read-only: the model, size,
+//! firmware, TRIM; power-on hours, wear, temperature, power cycles; `Health: OK|WARN` with the attribute that tripped.
+//! It reads `drivers::ahci::smart`'s boot snapshot (`try_lock`, never a disk command from the render task).
+//!
 //! Witness: `:: SETTINGS: controls=<n> tabs=<n> loaded=<n> saved=<n> -> PASS ::` on open and on save, and the
 //! `tests` fixture `settings` ([`selftest`]: set idle to 5, save, re-read the file, compare).
 
@@ -120,8 +124,8 @@ const TOP: usize = PANE_Y;
 const ROW_H: usize = 48;
 const ROWS: usize = 10;
 /// The tabs, in the column's order.
-pub const TABS: usize = 13;
-pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy", "Date & Time", "Keyboard"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE · TZLOCALE (B701) 11 · KEYMAPS (B704) 12
+pub const TABS: usize = 14;
+pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy", "Date & Time", "Keyboard", "Storage"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE · TZLOCALE (B701) 11 · KEYMAPS (B704) 12 · SMARTLINE (B708) 13
 const WIN_H: usize = TOP + ROWS * ROW_H + PAD;
 /// Tab rows the column shows at once; more than this and it scrolls (the wheel, or the selection kept in view).
 const COL_VIS: usize = (WIN_H - COL_PAD - 8) / COL_ROW;
@@ -716,7 +720,7 @@ fn avatar(st: &mut State, x: usize, y: usize, d: usize, name: &str) {
 
 /// A tab's tile colour: the accents table and the ink — no literal (General, About, Login Items, Trackpad and File
 /// Types the slate; Users and Display the first accent; Appearance the ink itself; Notifications the rose;
-/// Accessibility and Privacy the slate).
+/// Accessibility, Privacy and Storage the slate).
 fn icon_tile(tab: usize) -> u32 {
     match tab {
         1 | 2 => theme::ACCENTS[0],
@@ -817,6 +821,12 @@ fn tab_icon(s: &mut draw::Surf, tab: usize, x: i32, y: i32, t: i32, tile: Option
                 fill_rrect(s, Rect::new(x + f(29 + 15 * i), y + f(49), f(9).max(1), f(8).max(1)), f(2), ink);
             }
             fill_rrect(s, Rect::new(x + f(30), y + f(61), f(40), f(6).max(1)), f(3), ink);
+        }
+        STORAGE_TAB => {
+            // Storage: a drive — the body, its activity light and the seam, in the tile's colour (SMARTLINE B708).
+            fill_rrect(s, Rect::new(x + f(14), y + f(30), f(72), f(40)), f(8), ink);
+            fill_circle(s, x + f(70), y + f(50), f(6).max(1), bg);
+            fill_rrect(s, Rect::new(x + f(24), y + f(48), f(30), sw), 0, bg);
         }
         9 => {
             // Accessibility: the universal-access figure — a ring, the head, the arms across, the two legs (A11YPANE B655).
@@ -950,6 +960,7 @@ fn paint(st: &mut State, v: &Values) {
         t if t as usize == PRIV_TAB => paint_privacy(st), // REASK (B681)
         t if t as usize == DT_TAB => paint_datetime(st), // TZLOCALE (B701)
         t if t as usize == KB_TAB => paint_keyboard(st), // KEYMAPS (B704)
+        t if t as usize == STORAGE_TAB => paint_storage(st), // SMARTLINE (B708)
         _ => paint_about(st),
     }
     if let Some((t, r)) = st.found { if t as usize == tab { found_ring(st, r as usize); } } // SETTINGSMAP (B673): the row the search opened
@@ -3265,9 +3276,11 @@ pub fn selftest_a11y() {
 // date, a Revoke at the right); the row after them `+<n> more`. Revoke is LATCHED in the click router and run by
 // [`privacy_service`] on the service pass (`prefs::revoke` saves a domain file — never in the router).
 
-/// The Privacy tab's index on the strip: Date & Time (TZLOCALE B701) then Keyboard (KEYMAPS B704) follow it.
+/// The Privacy tab's index on the strip: Date & Time (TZLOCALE B701), Keyboard (KEYMAPS B704) and Storage (SMARTLINE B708) follow it.
 pub const PRIV_TAB: usize = 10;
-const _: () = assert!(KB_TAB == TABS - 1 && DT_TAB + 1 == KB_TAB && PRIV_TAB + 1 == DT_TAB && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB); // the fold: Date & Time 11, Keyboard 12
+/// SMARTLINE (B708): the Storage tab, the last.
+pub const STORAGE_TAB: usize = 13;
+const _: () = assert!(STORAGE_TAB == TABS - 1 && KB_TAB + 1 == STORAGE_TAB && DT_TAB + 1 == KB_TAB && PRIV_TAB + 1 == DT_TAB && A11Y_TAB + 1 == PRIV_TAB && NP_TAB + 1 == A11Y_TAB); // the fold: 11, 12, 13
 /// Decision rows shown.
 const PRIV_ROWS: usize = 8;
 /// The Revoke button's x (right-aligned in the row).
@@ -3816,5 +3829,85 @@ fn press_keyboard(row: usize, cx: usize) {
         0 => { if cx >= TRACK_X && cx < TRACK_X + TRACK_W { kbd_set(0, ((cx - TRACK_X) / (TRACK_W / n)).min(n - 1)); } }
         1 => kbd_set(1, (!kl::compose_on()) as usize),
         _ => {}
+    }
+}
+
+// ── SMARTLINE (rmbp-ledger B708, BP-bar-1) — the Storage tab ─────────────────────────────────────────────────────
+// One card (a group box of three rows) per disk the AHCI probe published, at most STORAGE_CARDS and `+<n> more`:
+// row 0 the model (bold), size, firmware and TRIM; row 1 power-on hours, wear, temperature, power cycles; row 2 the
+// verdict — `Health: OK` (ink.positive), `Health: WARN - <attribute> <value>` (ink.warning), or `Health: not reported`
+// with SMART's reason. Read-only: the pane edits no key (no MAP row, BP-video-16) and has no press arm. The data is
+// `drivers::ahci::smart`'s boot snapshot, copied under `try_lock` — the render task never issues a disk command.
+
+/// Cards the pane shows (three rows each, inside ROWS).
+const STORAGE_CARDS: usize = 3;
+
+/// One disk's card, as text: the head, the facts, the verdict and its level (0 not reported, 1 OK, 2 WARN).
+struct StorageCard {
+    head: String,
+    facts: String,
+    health: String,
+    level: u8,
+}
+
+/// The cards, from the AHCI SMART snapshot (none on a build without the driver).
+fn storage_cards() -> Vec<StorageCard> {
+    #[cfg(all(target_arch = "x86_64", feature = "ahci"))]
+    {
+        use crate::drivers::ahci::smart::{self, Health, Smart};
+        smart::disks().iter().map(|d| {
+            let bytes = d.ident.sectors.saturating_mul(512);
+            let size = if bytes >= 1_000_000_000_000 {
+                alloc::format!("{}.{} TB", bytes / 1_000_000_000_000, (bytes / 100_000_000_000) % 10)
+            } else {
+                alloc::format!("{} GB", bytes / 1_000_000_000)
+            };
+            let fw = d.ident.firmware();
+            let head = alloc::format!("{}  -  {}{}{}", d.ident.model(), size,
+                if fw.is_empty() { String::new() } else { alloc::format!("  -  firmware {}", fw) },
+                if d.ident.trim { "  -  TRIM" } else { "" });
+            let s = &d.sum;
+            let mut facts: Vec<String> = Vec::new();
+            if let Some(h) = s.hours { facts.push(alloc::format!("{} h powered on", h)); }
+            if let Some(w) = s.wear_pct { facts.push(alloc::format!("wear {}%", w)); }
+            if let Some(c) = s.temp_c { facts.push(alloc::format!("{} C", c)); }
+            if let Some(n) = s.cycles { facts.push(alloc::format!("{} power cycles", n)); }
+            let facts = if facts.is_empty() { String::from("No health counters reported") } else { facts.join("  -  ") };
+            let (health, level) = match (&d.smart, s.health) {
+                (_, Health::Ok) => (String::from("Health: OK"), 1),
+                (_, Health::Warn(t)) => (alloc::format!("Health: WARN - {}", t.label()), 2),
+                (Smart::Unsupported(why), Health::Na) => (alloc::format!("Health: not reported - SMART {}", why), 0),
+                (Smart::Read(..), Health::Na) => (String::from("Health: not reported"), 0),
+            };
+            StorageCard { head, facts, health, level }
+        }).collect()
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "ahci")))]
+    {
+        Vec::new()
+    }
+}
+
+fn paint_storage(st: &mut State) {
+    let cards = storage_cards();
+    if cards.is_empty() {
+        groups(st, &[(0, 0)]);
+        txt2(st, LABEL_X, 0, "No disk on this machine reports its health (SATA disks are read at startup)");
+        return;
+    }
+    let shown = cards.len().min(STORAGE_CARDS);
+    let g: Vec<(usize, usize)> = (0..shown).map(|i| (i * 3, i * 3 + 2)).collect();
+    groups(st, &g);
+    let face = super::text::Face::Ui;
+    let ch = super::metrics::lcell_h(face);
+    for (i, c) in cards.iter().take(shown).enumerate() {
+        let r = i * 3;
+        text_at(st, LABEL_X, row_top(r) + (ROW_H - ch) / 2, CTRL_R, &c.head, theme::text_primary(), true, face);
+        txt2(st, LABEL_X, r + 1, &c.facts);
+        let ink = match c.level { 1 => theme::ink_positive(), 2 => theme::ink_warning(), _ => theme::ink_secondary() };
+        txt_ink(st, LABEL_X, r + 2, &c.health, ink);
+    }
+    if cards.len() > shown {
+        txt2(st, LABEL_X, ROWS - 1, &alloc::format!("+{} more", cards.len() - shown));
     }
 }
