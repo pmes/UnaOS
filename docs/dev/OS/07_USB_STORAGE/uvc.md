@@ -530,18 +530,17 @@ viewer's counters. Wire:
 
 A failed check prints `failures=<n> first=<field> got=<v> want=<v> -> FAIL`.
 
-### 12.2 Owed by `drivers/uvc.rs` (the arc does not name that file; the seat folds these)
-
-Until these four same-line folds land, the viewer never arms on the bench and the census line never prints
-there; `tests uvccam` proves every pure half either way.
+### 12.2 The four changes in `drivers/uvc.rs` (added to the arc by the seat)
 
 1. `stream_arm`, after `STREAM_ARMED.store(true, …)`: `crate::drivers::xhci::uvc::arm(addr, w, h, cc);`
 2. `stream_disarm`, after `STREAM_ARMED.store(false, …)`: `crate::drivers::xhci::uvc::disarm();`
 3. `probe_iso`, after `print_census(idx, addr, &call);`: `crate::drivers::xhci::uvc::census(addr, &call);`
    (`addr` is the xHCI slot on this path — `service_uvc` passes it — which is what `note_dev` keyed.)
-4. `probe_iso`'s format pick commits only an UNCOMPRESSED format, so a camera offering MJPEG alone (or an
-   uncompressed default frame past the 4 MiB store, e.g. 4K NV12) never streams. The change: when the
-   uncompressed loop finds nothing, take the first `Kind::Mjpeg` format's default frame with `cc4 = *b"MJPG"`.
+4. `probe_iso`'s format pick committed only an UNCOMPRESSED format, so a camera offering MJPEG alone (or an
+   uncompressed default frame past the 4 MiB store, e.g. 4K NV12, which streamed count-only) showed nothing.
+   Now an uncompressed default frame past `STREAM_STORE_MAX` is skipped, and when no uncompressed format is
+   left the first `Kind::Mjpeg` format's default frame is committed with `cc4 = *b"MJPG"`; with neither the
+   line reads `[uvc] probe skipped … reason=no-streamable-format(uncompressed-in-store|mjpeg)`.
    The assembler needs no change (an MJPEG frame shorter than `dwMaxVideoFrameSize` is counted `short` and
    still published).
 
@@ -556,5 +555,5 @@ there; `tests uvccam` proves every pure half either way.
 4. `tests uvccam` on the console: `stream=live fps=<n> frames=<n> dropped=<n> -> PASS`; `tests uvc` for the
    transport's own counters (missed / overrun / bad_hdr).
 5. The first line that does not appear is the wall: §11.3's tree up to `commit=armed`; after it,
-   `view armed` missing = §12.2's folds; `view open` missing with `stream fps>0` = `[uvc] view decode refused`
+   `view armed` missing after `commit=armed` = the §12.2 fold in `stream_arm`; `view open` missing with `stream fps>0` = `[uvc] view decode refused`
    or `unsupported fourcc` (the line names the FourCC); `fps=0` = §11.3 R6.

@@ -42,12 +42,11 @@
 //! never touches a register. The viewer is x86 `wc` only: the rMBP is the bench; an aarch64 image compiles the
 //! census, the converters and the fixture, and its stream is counted by `tests uvc`.
 //!
-//! # WHAT IS OWED BY ANOTHER FILE (reported, not made — the arc names `drivers/uvc.rs` nowhere)
+//! # THE CALLERS IN `drivers/uvc.rs`
 //!
 //! `arm` / `disarm` / `census` are called from `drivers/uvc.rs` (`stream_arm`, `stream_disarm`, after
-//! `print_census` in `probe_iso`) by three same-line folds the seat applies; until then the viewer never arms and
-//! the census line never prints on the bench, and `tests uvccam` still proves every pure half. `probe_iso` commits
-//! only an UNCOMPRESSED format; the MJPEG path here runs when it commits MJPEG (the fourth proposed fold).
+//! `print_census` in `probe_iso`) by same-line folds; `probe_iso` commits an uncompressed format whose default
+//! frame fits the 4 MiB store, else the first MJPEG format (FourCC `MJPG`), which this file decodes.
 
 use crate::drivers::uvc::{self as class, Census, Kind};
 use alloc::string::String;
