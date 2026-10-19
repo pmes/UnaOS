@@ -508,8 +508,9 @@ fn ram_block(pa: u64, el: u64) -> u64 {
     if el == 2 {
         pa | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_BLOCK | EL2_AP1_RES1
     } else {
-        // EL1&0 (Pi recipe): AP[7:6]=0b00 → EL1 read-write, no EL0, executable at EL1.
-        pa | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_BLOCK
+        // EL1&0 (Pi recipe): AP[7:6]=0b00 → EL1 read-write, no EL0, executable at EL1 — until the WXN64
+        // carve (B685) arms in `init`; every EL1 RAM block written after it is PXN|UXN (`ram_xn`).
+        pa | DESC_AF | SH_INNER | ATTR_NORMAL | DESC_BLOCK | super::mmu_wxn::ram_xn()
     }
 }
 /// NET-4B: Normal Inner/Outer **Non-Cacheable**, execute-never block (used at L2 = 2 MiB granularity for
@@ -664,6 +665,12 @@ pub fn init(boot_info: &BootInfo) -> MmuInfo {
     #[cfg(not(feature = "tegra"))]
     let (hole_base, hole_size, hole_source, holes_arr, hole_count, hole_dropped) =
         (0u64, 0u64, 0u8, [(0u64, 0u64, 0u8); MMU_MAX_HOLES], 0usize, 0usize);
+    // WXN64 (B685): carve the image's RX span out of the EL1 root (`L1_EL1`, or `L1` itself at the EL1
+    // fallback) and make every other leaf execute-never — AFTER the carveout holes are punched (the carve
+    // demotes the image GiB to an L2, and `install_carveout_holes` only splits plain RAM blocks), BEFORE
+    // any EL1 root is live and before the cleans below publish the pool tables it hardens. Silent; a
+    // refusal writes nothing and leaves WXN off (`tests wxaudit` names why).
+    unsafe { super::mmu_wxn::carve(ttbr0_el1 as *mut u64) };
     unsafe { clean_table_to_poc(ttbr0) };
     // The L2 pool tables are walked by the table descriptors `install_carveout_holes` wrote into L1, so
     // each used slot must reach RAM before the data cache is dropped for the switch — clean like the L1s.
@@ -901,7 +908,7 @@ unsafe fn enable_el1(ttbr0: u64) -> (u64, u64) {
             new = out(reg) sctlr_new,
             tmp = out(reg) _,
             mc = in(reg) SCTLR_M | SCTLR_C,
-            mci = in(reg) SCTLR_M | SCTLR_C | SCTLR_I,
+            mci = in(reg) SCTLR_M | SCTLR_C | SCTLR_I | super::mmu_wxn::sctlr_wxn(), // WXN64 (B685)
             mair = in(reg) MAIR_VAL,
             tcr = in(reg) TCR_EL1_ACTIVE,
             ttbr = in(reg) ttbr0,

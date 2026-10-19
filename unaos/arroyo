@@ -12651,7 +12651,7 @@ kernel8() {
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/K3HELLO.TXT" / -i "$UNAFS_K3_IMG"
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/K3PAT.BIN" / -i "$UNAFS_K3_IMG"
 
-    bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 64 "$UNAFS_K3_IMG"
+    bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 128 "$UNAFS_K3_IMG"
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
     # BUILD-2: release the coarse build lock now that the image is complete — any QEMU phase that
     # follows (kernel8-test / -run / install) uses per-run ports/logs and may overlap other runs.

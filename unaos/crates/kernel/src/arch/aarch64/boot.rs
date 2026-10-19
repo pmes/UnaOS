@@ -299,6 +299,11 @@ fn build_l1() {
         l1.add(1).write_volatile(ram_block(0x4000_0000));
         l1.add(2).write_volatile(ram_block(0x8000_0000));
         l1.add(3).write_volatile(device_block(0xC000_0000));
+        // WXN64 (B685): carve [_start, __rx_end) EL1-RO + executable out of the image's 2 MiB blocks and
+        // make every other leaf execute-never (`mmu_wxn::carve`). MMU still OFF, no core walks these yet,
+        // and the secondaries copy nothing — they point TTBR0 at this finished table. A refusal writes
+        // nothing and leaves WXN off (`tests wxaudit` names why).
+        super::mmu_wxn::carve(l1);
     }
 }
 
@@ -326,7 +331,7 @@ pub unsafe fn enable_mmu() {
             mair = in(reg) MAIR_VAL,
             tcr = in(reg) TCR_EL1_VAL,
             ttbr = in(reg) ttbr0,
-            sctlr = in(reg) SCTLR_EL1_VAL,
+            sctlr = in(reg) SCTLR_EL1_VAL | super::mmu_wxn::sctlr_wxn(), // WXN64 (B685): +WXN once `build_l1` carved — every core
             options(nostack, preserves_flags),
         );
     }

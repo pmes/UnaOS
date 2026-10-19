@@ -545,6 +545,9 @@ pub fn install() -> bool {
         USER_GIB,
         backing
     );
+    // WXN64 (B685): the EL0 window is the last boot-time map on this root — census it now (QUIETBOOT shape:
+    // runs here under `tests-at-boot`, otherwise registers `tests wxaudit`).
+    super::mmu_wxn::wxaudit_fixture();
     true
 }
 

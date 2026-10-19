@@ -804,9 +804,9 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 
 ## 8. Communication with Peter
 
-- **THE ONE CHECK, before every reply to Peter** (Peter 2026-10-19: "would Alonso Ferrari approve of this high
+- **THE ONE CHECK, before every reply to Peter** (Peter 2026-10-19: "would Enzo Ferrari approve of this high
   performance thing? all it is, is win" / "you are often incorrectly assertive. not hallucinating. incorrect. there is
-  a massive difference"): would the man who built the machine approve this reply, and is every assertion in it
+  a massive difference"): would the man who built the machine (Enzo Ferrari, not the driver) approve this reply, and is every assertion in it
   something a command run THIS TURN proved? If either is no, the reply is not sent: the command is run, or the
   assertion is removed. The failure is never "hallucination" (the fact was available); it is asserting what was not
   checked — a push said absent without `git log HEAD..origin/<branch>`, an executor said running without `ps`, a

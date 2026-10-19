@@ -59,6 +59,10 @@ pub mod xwin;
 // `map_mmio_window` reach ceiling there; on virt the L1 statics are inert, not the active regime.)
 #[cfg(any(feature = "tegra", feature = "pcie3"))]
 pub mod mmu_tegra;
+// WXN64 (rmbp-ledger B685): the aarch64 W^X carve (the kernel image's PF_X pages EL1-RO+X, every other
+// EL1&0 leaf execute-never, SCTLR_EL1.WXN) and `tests wxaudit` — one implementation for the Pi, QEMU
+// virt and the Orin, so it is ungated.
+pub mod mmu_wxn;
 // JETSON-EL0 (M1b): the EL0 user address-space machinery for an EL1 regime whose low GiB is a Device
 // window — the M6d slot system (`boot.rs`) re-implemented against the LIVE `TTBR0_EL1` root instead of
 // the Pi's BCM2711 identity map. See the module header for the three places it necessarily diverges

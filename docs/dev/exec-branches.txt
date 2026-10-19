@@ -562,7 +562,7 @@ refs/heads/exec-rmbp-reask fffed25f FOLDED-BY-HAND (batch 2, legs at this commit
 refs/heads/exec-rmbp-oldest afe12146 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-abimage d218b9bc FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-volkey     2303f8fb FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-wxn64 5e9b7026 IN-FLIGHT cloud wave36 WXN64
+refs/heads/exec-rmbp-wxn64 f2650f66 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-shimmeridle 72f50c42 FOLDED-BY-HAND (batch, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-uvccam f232a34e FOLDED-BY-HAND (batch 2, legs at this commit) 2026-10-19
 refs/heads/exec-rmbp-ptpcam 5e9b7026 IN-FLIGHT cloud wave36 PTPCAM
