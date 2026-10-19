@@ -191,7 +191,7 @@ A volume whose key slot (§R2a) says `cipher = 1`. Every block but block 0 is XT
 ## §R3 Inode block (one 4096 B block per inode)
 
 ```
- [ Inode record §R6 ][ meta trailer §R7 (v6+) ][ spill trailer §R8 (v4+, only if spilled) ][ zeros ]
+ [ Inode record §R6 ][ meta trailer §R7 (v6+) ][ spill trailer §R8 (v4+, only if spilled) ][ versions trailer §R17 (only if any) ][ zeros ]
 ```
 
 The inode map (§R13) names each inode's current block by its LOGICAL id. The trailers are
@@ -362,3 +362,61 @@ held_max_ms=<n> io_under_lock=0 -> PASS ::` (every MOUNT hold of the read and of
 loop ≤ 5 ms, bytes equal to a reference read). Built under `wc` on x86; the call site in
 `NativeBackend::read` (`fs/vfs.rs`) is the seat's fold. Writes and directory listings still hold
 MOUNT across their I/O.
+
+## §R17 The `una:versions` trailer (FILEVERSIONS, rmbp-ledger B714)
+
+An overwrite is never the only copy (BP-bar-14; research B §6): when a write replaces a file's data, the
+OLD extent list is kept as a VERSION of the inode instead of reclaimed. ADDITIVE: a new record kind, the
+§R6 record and the superblock stamp unchanged (a v7 volume with versions is still v7, BP-storage-6).
+
+**Placement.** Hand-packed, LAST in the inode block (§R3): right after the spill trailer when the inode is
+spilled (its length is `32 + 24 × |index|`), else right after the meta trailer (or the §R6 record on
+v3–v5). A reader built before B714 checks for the spill magic right after the meta trailer and stops after
+the spill trailer, so it never reads this trailer: it mounts, reads and writes the volume as before.
+Zero padding can never spell the magic, so an inode without versions is byte-identical to before.
+
+| off | len | field |
+| ---: | ---: | :--- |
+| 0 | 8 | magic `"UNAFSVR1"` (`u64` LE `0x3152565346414e55`) |
+| 8 | 4 | `form` `u32`: 0 = inline, 1 = extent-backed; any other refused |
+| 12 | 4 | reserved `u32`, must be 0 |
+| 16 | 8 | `len` `u64`: payload bytes, ≤ 4 MiB (the extent-backed budget, §R1) |
+| 24 | … | form 0: the payload (`len` bytes, inside the block). Form 1: `n u64` ‖ `n` × `Extent` (§R5) — the payload's storage blocks |
+
+Form 1 storage belongs to the inode BLOCK, like the spill index (§R8): every inode write re-encodes the
+trailer (inline when it fits beside the record, else fresh storage) and releases the old block's storage.
+
+**Payload, file inode — the RING** (oldest first): `"RING"` ‖ `count u32` (≤ 8) ‖ per version: `seq u64` ‖
+`mtime u64` ‖ `size u64` ‖ `kept u64` ‖ `n u64` ‖ `n` × `Extent`. `seq` is the volume-monotone capture
+number; `mtime`/`size` are the replaced contents'; `kept` = the blocks the capturing write released from the
+live file (what the version costs). A version holds ONE reference on every block its extent list covers, so
+a block shared by the live file and N versions has refcount N + 1; fsck's walk (`fsck.rs`) and a snapshot's
+pin (`snapshot_blocks`) count each version once, matching.
+
+**Payload, reclaim-queue inode (id 4) — the LEDGER**: `"LDGR"` ‖ reserved `u32` ‖ `next_seq u64` ‖ `n u64` ‖
+`n` × (`inode u64` ‖ `oldest_seq u64` ‖ `count u64` ‖ `kept u64`), ascending by inode — one row per file with
+versions, the sum of `kept` the volume's version cost.
+
+**Rules** (`unafs::fs::versions`, policy on via `UnaFS::set_versioning`; the kernel's bound mount and
+`tools/unafs` set it):
+* A version is made by `write_data` starting below the old size, by `truncate_data` shrinking, and by
+  `restore_version` (of the current contents; their references MOVE to the version, the live file takes
+  new references on the restored blocks — no data block is written). Appends make none. File inodes only.
+* Per file at most 8 (the oldest is dropped, its references released). Per volume: past 10 % of the
+  volume's blocks (the ledger's `kept` sum), the version with the lowest `seq` ANYWHERE is dropped, until
+  the sum fits.
+* `unlink` releases every version with the inode; a Trash move is a rename, so the versions travel.
+* fsck reports `versions` / `version_blocks` off the rings and `version_ledger_stale` when the ledger
+  disagrees; repair rewrites the ledger from the rings.
+
+**What an older reader does to it** (honest edges of an additive record): a pre-B714 build that REWRITES a
+versioned file's inode drops the trailer (the versions' blocks keep their references: a leak its own
+`fsck --repair` reclaims — never a wrong read); one that rewrites the reclaim-queue inode drops the ledger
+(this build's fsck reports it stale and repair rebuilds it). A pre-B714 `fsck --repair` frees the blocks of
+versions whose trailer it cannot see — after that, a version read on this build would return reused blocks.
+Run fsck with the build that wrote the versions.
+
+Proofs: `unaos/libs/fs/unafs/tests/versions.rs` (ten writes keep eight with their bytes; the bound drops the
+oldest anywhere; remount; restore round-trips; unlink releases all; a reproduction of the pre-B714 inode
+decode opens every inode block of a versioned volume — inline and extent-backed-after-spill — stamped 7);
+kernel `tests fileversions` (`:: FILEVERSIONS: writes=10 kept=8 restore=ok bound=ok v7reader=ok -> PASS ::`).

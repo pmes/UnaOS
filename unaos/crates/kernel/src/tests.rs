@@ -225,7 +225,7 @@ fn ensure_unafsx86() {
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {
         static GROW: AtomicBool = AtomicBool::new(false);
-        if !GROW.swap(true, Ordering::AcqRel) { register("unafsgrow", crate::fs::unafsgrow::selftest); } // UNAFSGROW (B347) M4: the native module's builds (aarch64 always, x86 under `unafs`)
+        if !GROW.swap(true, Ordering::AcqRel) { register("unafsgrow", crate::fs::unafsgrow::selftest); register("fileversions", fileversions_selftest); } // UNAFSGROW (B347) M4: the native module's builds (aarch64 always, x86 under `unafs`)
     }
 }
 
@@ -937,5 +937,74 @@ fn abielf_selftest() {
     serial_println!(
         ":: ABIELF: elf=ABIPROBE.ELF bytes={} abi={} kernel_abi={} syscalls={} ok={} outcome={} -> {} ::",
         bytes.len(), abi, k, n, ok, outcome, if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+// FILEVERSIONS (rmbp-ledger B714, BP-bar-14) — TAIL-APPENDED. `tests fileversions`: the file system keeps the
+// previous contents of a file when a write replaces them — on a scratch RAM volume, through the kernel seam
+// (`fs::unafs::versions_arm` = the bound mount's policy, `versions_on` / `read_version_on` / `restore_version_on`).
+// writes: ten writes of /doc.txt keep 8 versions with their bytes (the ring's cap); restore: version 7 becomes
+// the contents and the replaced contents are the newest version; bound: a 60-block file written three times
+// passes 10 % of the volume, so the oldest versions anywhere (the doc's) go first and the kept blocks fit the
+// bound; v7reader: the stamp is still 7 and a plain mount (no versioning: the older readers' view) opens the
+// image, reads the kept version and fscks clean. `[fs] version inode= kept= bytes=` comes from the seam.
+// `:: FILEVERSIONS: writes=10 kept=8 restore=ok bound=ok v7reader=ok -> PASS|FAIL ::`
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+fn fileversions_selftest() {
+    use ::unafs::{MemDevice, UnaFS, BLOCK_SIZE};
+    use crate::fs::unafs::{read_version_on, restore_version_on, versions_arm, versions_on};
+    const BLOCKS: u64 = 1024;
+    let content = |tag: u8, len: usize| -> alloc::vec::Vec<u8> { (0..len).map(|i| tag.wrapping_mul(31).wrapping_add(i as u8)).collect() };
+    let mut fs = match UnaFS::format(MemDevice::with_blocks(BLOCKS), 0) {
+        Ok(f) => f,
+        Err(e) => {
+            serial_println!(":: FILEVERSIONS: writes=0 kept=0 restore=- bound=- v7reader=- -> FAIL reason=format({:?}) ::", e);
+            return;
+        }
+    };
+    versions_arm(&mut fs);
+    let root = fs.superblock.root_inode;
+    let mut writes = 0u32;
+    if let Ok(id) = fs.create_file(root, "doc.txt".into()) {
+        for i in 0..10u8 {
+            writes += fs.write_data(id, 0, &content(i, 5000)).is_ok() as u32;
+        }
+    }
+    let kept = versions_on(&mut fs, "/doc.txt").map(|v| v.len()).unwrap_or(0);
+    let bytes_ok = (0..kept).all(|n| read_version_on(&mut fs, "/doc.txt", n).is_ok_and(|d| d == content(8 - n as u8, 5000)));
+    // restore: the oldest kept (contents 1) back; the replaced contents (9) are now the newest version.
+    let restore = restore_version_on(&mut fs, "/doc.txt", 7).is_ok()
+        && fs.resolve_path("/doc.txt").and_then(|id| fs.read_data(id, 0, 5000)).is_ok_and(|d| d == content(1, 5000))
+        && read_version_on(&mut fs, "/doc.txt", 0).is_ok_and(|d| d == content(9, 5000))
+        && fs.fsck(false).is_ok_and(|r| r.is_clean());
+    // bound: 60 blocks x 2 kept versions = 120 > 102 — the doc's versions (the oldest) go, then the big file's first.
+    let big = alloc::vec![0x5au8; 60 * BLOCK_SIZE as usize];
+    let mut wrote_big = fs.create_file(root, "big.bin".into()).is_ok();
+    for t in 0..3u8 {
+        let mut b = big.clone();
+        b[0] = t;
+        wrote_big &= fs.resolve_path("/big.bin").and_then(|id| fs.write_data(id, 0, &b)).is_ok();
+    }
+    let ledger_kept = fs.version_ledger().map(|l| l.kept()).unwrap_or(u64::MAX);
+    let bound = wrote_big
+        && ledger_kept <= fs.version_bound_blocks()
+        && versions_on(&mut fs, "/doc.txt").is_ok_and(|v| v.is_empty())
+        && versions_on(&mut fs, "/big.bin").is_ok_and(|v| v.len() == 1)
+        && fs.fsck(false).is_ok_and(|r| r.is_clean());
+    // v7reader: stamp 7; a plain mount opens it, reads the kept version, fscks clean.
+    let raw = fs.device.as_bytes().to_vec();
+    drop(fs);
+    let stamped = raw.len() > 9 && &raw[0..5] == b"UNAFS" && u32::from_le_bytes([raw[5], raw[6], raw[7], raw[8]]) == 7;
+    let v7reader = stamped
+        && UnaFS::mount(MemDevice::from_bytes(raw)).is_ok_and(|mut m| {
+            !m.versioning()
+                && read_version_on(&mut m, "/big.bin", 0).is_ok_and(|d| d.len() == big.len() && d[0] == 1)
+                && m.fsck(false).is_ok_and(|r| r.is_clean() && r.versions == 1)
+        });
+    let pass = writes == 10 && kept == 8 && bytes_ok && restore && bound && v7reader;
+    serial_println!(
+        ":: FILEVERSIONS: writes={} kept={} restore={} bound={} v7reader={} -> {} ::",
+        writes, kept, if restore { "ok" } else { "FAIL" }, if bound { "ok" } else { "FAIL" }, if v7reader { "ok" } else { "FAIL" },
+        if pass { "PASS" } else { "FAIL" }
     );
 }

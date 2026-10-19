@@ -89,6 +89,11 @@ fn mount_dev(device: FileDevice, key: &Key) -> Result<FileSystem> {
         None => FileSystem::mount(device),
         Some(u) => FileSystem::mount_with(device, &u),
     };
+    // FILEVERSIONS (B714): the operator's writes keep versions, as the kernel's do (one crate, one policy).
+    let r = r.map(|mut fs| {
+        fs.set_versioning(true);
+        fs
+    });
     r.map_err(|e| match e {
         unafs::fs::FileSystemError::KeyRequired => anyhow::anyhow!(
             "this volume is KEYED (VOLKEY): it opens only with its key — pass --password-stdin or --recovery-stdin and the key on stdin"
@@ -168,6 +173,16 @@ enum Commands {
     Get {
         source: String,
         destination: String,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+        /// FILEVERSIONS (B714): extract kept version `n` instead (0 = the newest; see `versions`).
+        #[arg(long)]
+        version: Option<usize>,
+    },
+    /// FILEVERSIONS (B714): list a file's kept versions, newest first — `n  mtime  size  kept_blocks`
+    /// (unafs-records.md §R17). `get --version <n>` extracts one.
+    Versions {
+        path: String,
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
@@ -948,6 +963,7 @@ async fn main() -> Result<()> {
             source,
             destination,
             img,
+            version,
         } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
             let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
@@ -955,12 +971,30 @@ async fn main() -> Result<()> {
             let id = fs.resolve_path(source).context("Source file not found")?;
             let inode = fs.read_inode(id).context("Failed to read inode")?;
 
-            let data = fs
-                .read_data(id, 0, inode.size)
-                .context("Failed to read data")?;
+            let data = match version {
+                None => fs.read_data(id, 0, inode.size).context("Failed to read data")?,
+                Some(n) => {
+                    let v = fs.versions(id).map_err(|e| anyhow::anyhow!(e))?;
+                    let info = v.get(*n).with_context(|| format!("no version {} ({} kept)", n, v.len()))?;
+                    fs.read_version(id, *n, 0, info.size).map_err(|e| anyhow::anyhow!(e))?
+                }
+            };
             std::fs::write(destination, data).context("Failed to write destination file")?;
 
-            println!("✅ [OPERATOR] Extracted '{}' to '{}'", source, destination);
+            match version {
+                None => println!("✅ [OPERATOR] Extracted '{}' to '{}'", source, destination),
+                Some(n) => println!("✅ [OPERATOR] Extracted version {} of '{}' to '{}'", n, source, destination),
+            }
+        }
+        Commands::Versions { path, img } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
+            let id = fs.resolve_path(path).context("Path not found")?;
+            let v = fs.versions(id).map_err(|e| anyhow::anyhow!(e))?;
+            println!("Versions of '{}' (inode {}): {} kept", path, id, v.len());
+            for info in &v {
+                println!("  {:>2}  mtime {}  size {}  kept_blocks {}", info.n, info.mtime, info.size, info.kept_blocks);
+            }
         }
         Commands::AttrSet {
             path,
@@ -1153,6 +1187,12 @@ async fn main() -> Result<()> {
                 println!("  leaked blocks        : {}", report.leaked_blocks.len());
                 println!("  stale index inodes   : {}", report.orphan_inodes.len());
                 println!("  bad parent links     : {}", report.bad_parent_links.len());
+                println!(
+                    "  versions             : kept={} blocks={} ledger={}",
+                    report.versions,
+                    report.version_blocks,
+                    if report.version_ledger_stale { "stale" } else { "ok" }
+                );
                 let names = fs.name_index_check().map_err(|e| anyhow::anyhow!("name index check failed: {:?}", e))?;
                 println!(
                     "  name index           : ready={} keys={} expected={} missing={} stale={}",

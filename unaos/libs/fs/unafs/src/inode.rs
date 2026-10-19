@@ -159,7 +159,37 @@ pub struct Inode {
     /// Unix seconds of the last access WRITE (noatime: stamped at create and
     /// write only — under CoW a read that wrote would cost a commit).
     pub atime: u64,
+    /// FILEVERSIONS (rmbp-ledger B714): the payload of the inode block's `una:versions` trailer
+    /// (unafs-records.md §R17) — empty = no trailer. NOT part of the §R6 record (an older reader stops
+    /// before it); the crate's `fs::versions` module owns its meaning (a file's version ring, or the
+    /// volume's version ledger on the reclaim-queue inode). Filled by `decode_block` for the inline form
+    /// and by the mount's inode reconstruction for the extent-backed form.
+    pub versions: Vec<u8>,
+    /// FILEVERSIONS (B714): where an extent-backed `una:versions` payload sat in the block this inode was
+    /// decoded from (`None` for none or inline). Read-side only: every inode write re-encodes the trailer
+    /// fresh (inline, or new storage), and the old block's storage is released with the old block, exactly
+    /// like the spill trailer's indirect blocks.
+    pub versions_store: Option<VersionsStore>,
 }
+
+/// FILEVERSIONS (B714): an extent-backed `una:versions` payload (§R17 form 1): `len` bytes across `index`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VersionsStore {
+    /// The payload's exact byte length.
+    pub len: u64,
+    /// The blocks holding it (coalesced).
+    pub index: ExtentList,
+}
+
+/// FILEVERSIONS (B714): magic opening the `una:versions` trailer ("UNAFSVR1", little-endian u64). It sits
+/// LAST in the inode block — after the meta trailer, and after the spill trailer when one is present — so a
+/// reader built before it (which looks for the spill magic right after the meta trailer and stops after
+/// the spill trailer) never meets it: the record is additive and the version stamp does not move.
+pub const INODE_VERSIONS_MAGIC: u64 = u64::from_le_bytes(*b"UNAFSVR1");
+/// Fixed bytes of the versions trailer: magic, form `u32`, reserved `u32`, payload length `u64`.
+pub const INODE_VERSIONS_FIXED: usize = 24;
+/// The largest payload the trailer may name (the extent-backed record budget, §R1).
+pub const INODE_VERSIONS_MAX: u64 = 4 * 1024 * 1024;
 
 /// Magic tag opening a v6 inode's META TRAILER ("UNAFSMT1", little-endian
 /// u64). Like [`INODE_SPILL_MAGIC`] it can never collide with the zero
@@ -188,7 +218,85 @@ impl Inode {
             ctime: 0,
             mtime: 0,
             atime: 0,
+            versions: Vec::new(),
+            versions_store: None,
         }
+    }
+
+    /// FILEVERSIONS (B714): the `una:versions` trailer, inline form (0): the fixed part, then the payload.
+    pub fn versions_inline_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(INODE_VERSIONS_FIXED + payload.len());
+        out.extend_from_slice(&INODE_VERSIONS_MAGIC.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// FILEVERSIONS (B714): the `una:versions` trailer, extent-backed form (1): the fixed part, then the
+    /// storage index as a §R1 `Vec<Extent>`.
+    pub fn versions_store_bytes(len: u64, index: &ExtentList) -> Vec<u8> {
+        let mut out = Vec::with_capacity(INODE_VERSIONS_FIXED + 8 + index.len() * EXTENT_ENC_LEN);
+        out.extend_from_slice(&INODE_VERSIONS_MAGIC.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(index.len() as u64).to_le_bytes());
+        for e in index {
+            out.extend_from_slice(&e.logical_offset.to_le_bytes());
+            out.extend_from_slice(&e.physical_block.to_le_bytes());
+            out.extend_from_slice(&e.length.to_le_bytes());
+        }
+        out
+    }
+
+    /// FILEVERSIONS (B714): parse a versions trailer at the head of `bytes` into this inode
+    /// (`versions` for the inline form, `versions_store` for the extent-backed one). `Ok(false)` when the
+    /// magic is absent; bounded refusals otherwise (form, reserved word, lengths against the bytes left and
+    /// the record budget) — never a panic, never an allocation past the block.
+    pub fn apply_versions(&mut self, bytes: &[u8]) -> Result<bool, InodeError> {
+        if bytes.len() < 8 || u64::from_le_bytes(bytes[0..8].try_into().unwrap()) != INODE_VERSIONS_MAGIC {
+            return Ok(false);
+        }
+        if bytes.len() < INODE_VERSIONS_FIXED {
+            return Err(InodeError::BadMeta("truncated versions trailer"));
+        }
+        let form = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let reserved = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let len = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        if reserved != 0 || len > INODE_VERSIONS_MAX {
+            return Err(InodeError::BadMeta("versions trailer header"));
+        }
+        let rest = &bytes[INODE_VERSIONS_FIXED..];
+        match form {
+            0 => {
+                if len as usize > rest.len() {
+                    return Err(InodeError::BadMeta("versions payload past the block"));
+                }
+                self.versions = rest[..len as usize].to_vec();
+                self.versions_store = None;
+            }
+            1 => {
+                if rest.len() < 8 {
+                    return Err(InodeError::BadMeta("truncated versions index"));
+                }
+                let n = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                if n > ((rest.len() - 8) / EXTENT_ENC_LEN) as u64 {
+                    return Err(InodeError::BadMeta("versions index past the block"));
+                }
+                let rd = |o: usize| u64::from_le_bytes(rest[o..o + 8].try_into().unwrap());
+                let mut index = Vec::with_capacity(n as usize);
+                for i in 0..n as usize {
+                    let o = 8 + i * EXTENT_ENC_LEN;
+                    index.push(Extent { logical_offset: rd(o), physical_block: rd(o + 8), length: rd(o + 16) });
+                }
+                self.versions = Vec::new();
+                self.versions_store = Some(VersionsStore { len, index });
+            }
+            _ => return Err(InodeError::BadMeta("versions trailer form")),
+        }
+        Ok(true)
     }
 
     /// The hand-packed v6 META TRAILER (little-endian):
@@ -297,6 +405,9 @@ impl Inode {
     ///
     /// A v6 block carries the META TRAILER first (at the inline inode's end);
     /// the spill trailer, if any, follows it.
+    ///
+    /// FILEVERSIONS (B714): the `una:versions` trailer (§R17), when present, is the LAST part — right after
+    /// the spill trailer, or after the meta trailer when the inode is inline.
     pub fn decode_block(bytes: &[u8]) -> Result<(Self, Option<IndirectTrailer>), InodeError> {
         let (mut inode, mut len): (Self, usize) = crate::codec::deserialize_block_prefix(bytes)?;
         if bytes.len() > len
@@ -304,14 +415,19 @@ impl Inode {
         {
             len += m;
         }
+        let mut spill = None;
         if bytes.len() >= len + 8 {
             let tag = u64::from_le_bytes(bytes[len..len + 8].try_into().unwrap());
             if tag == INODE_SPILL_MAGIC {
                 let trailer: IndirectTrailer = crate::codec::deserialize_block(&bytes[len..])?;
-                return Ok((inode, Some(trailer)));
+                len = len.saturating_add(32 + trailer.index.len() * EXTENT_ENC_LEN);
+                spill = Some(trailer);
             }
         }
-        Ok((inode, None))
+        if bytes.len() > len {
+            inode.apply_versions(&bytes[len..])?;
+        }
+        Ok((inode, spill))
     }
 
     /// The number of leading extents that stay inline when this inode spills:
@@ -485,6 +601,8 @@ impl Decode for Inode {
             ctime: 0,
             mtime: 0,
             atime: 0,
+            versions: Vec::new(),
+            versions_store: None,
         })
     }
 }
