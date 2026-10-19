@@ -177,9 +177,50 @@ pub fn enter(cause: Cause) -> bool {
     ENTER_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
     ENTERS.fetch_add(1, Ordering::Relaxed);
     ACTIVE.store(true, Ordering::Release);
+    if super::look::is_softy() {
+        centre_card(); // SOFTYDOTS (B721): the look's one branch — the Softy lock view centres the card (its taskbar is gone)
+    }
     wipe();
     serial_println!("[lock] enter cause={} windows_hidden={}", cause.word(), n);
     true
+}
+
+/// SOFTYDOTS (rmbp-ledger B721, M2) — ONE lock, two paints. Under the Softy look the locked view has no taskbar (the
+/// band vacates itself while [`veiled`], `softy::taskbar::compose`) and the card — the SAME login screen row, the same
+/// password field — sits at the panel's centre instead of the upper third the Una view keeps under its menu bar.
+/// Moved once, here, before the veil's first frame; the shake records its origin after this, so it ends centred.
+fn centre_card() {
+    let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) else { return };
+    let ph = fb.height();
+    let Some((id, (fx, fy, _, fh))) = card() else {
+        serial_println!("[lock] card centre look=softy -> no-row");
+        return;
+    };
+    let ty = ph.saturating_sub(fh) / 2;
+    if fy == ty {
+        return;
+    }
+    let ok = super::wm::move_to(id, fx + super::wm::BORDER(), ty + super::wm::TITLE_H() + super::wm::BORDER());
+    serial_println!("[lock] card centre look=softy y={}->{} ok={}", fy, ty, ok as u8);
+}
+
+/// The locked card's row and its outer frame `(x, y, w, h)`, found from the shared password field's panel rect
+/// (`login::field_rect_panel` = `(x, y + top + q, w, q)` with `top = TITLE_H`, `q = (h - top) / 3`): the shell-band row
+/// (owner 0, the login screen's) whose frame gives back exactly that field. `None` while no card is up.
+pub fn card() -> Option<(super::wm::WinId, (usize, usize, usize, usize))> {
+    let (fx, fy, fw, fh) = super::crystal::login::field_rect_panel()?;
+    let top = super::wm::TITLE_H();
+    let y = fy.checked_sub(top + fh)?;
+    for id in 1..=super::wm::slots() as super::wm::WinId {
+        if super::wm::owner_of(id) != Some(0) {
+            continue;
+        }
+        let Some(f) = super::wm::frame_of(id) else { continue };
+        if f.0 == fx && f.1 == y && f.2 == fw && f.3 >= top && (f.3 - top) / 3 == fh {
+            return Some((id, f));
+        }
+    }
+    None
 }
 
 /// The app windows on the glass now (the count the veil hides).
