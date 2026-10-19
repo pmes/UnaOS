@@ -49,13 +49,13 @@ Audio (`drivers/hda*.rs`, the doc in `docs/dev/OS/11_AUDIO/`), GPU driver ladder
 rungs: R101, R127), the compatibility box (`unaos/crates/kernel/src/arch/x86_64/linuxabi/`, `docs/dev/OS/03_COMPATIBILITY_BOX/`), selfhost
 (`unaos/crates/kernel/src/selfhost/`), power/SMC (`unaos/crates/kernel/src/power.rs`, `unaos/crates/kernel/src/drivers/smc.rs`). Each is a candidate sheet.
 
-## Open architecture questions for Peter (found while drafting; none is answered by a ruling at HEAD)
+## Seat decisions on the drafter's open points (LAWS §8: engineering is the seat's; Peter is asked what to build and how it looks)
 
-1. FPU/SSE for UnaOS ring 3 on x86: today CR4.OSFXSR is cleared for every UnaOS program (ring3.md BP-ring3-11). TEMPLE
-   measured fixed point 5594 ms against a 3000 ms bar, f32 2127 ms (commit `d92a36b7`). Give UnaOS programs an FXSAVE context?
-2. R128's scope — being built: STARTSCENE (rmbp-ledger B662, wave 36) puts the one scene under the splash hold, the login
-   screen and the desktop, generated once; boot.md BP-boot-5 is re-anchored by that fold.
-3. Helm in Ring 0: CODEX §2 names a kernel core (`unaos/libs/sys/helm`); the kernel does not link it. In the kernel, and when?
-4. Sonde: CODEX still reads The 21; Amendment IV waits on your signature (R112).
-5. Which arch do the sheets bind? They are read from the x86 path; the Pi and Orin tracks run far behind trunk. Do the
-   invariants bind aarch64 code now, or from the next track sync?
+1. FPU/SSE for UnaOS ring 3: DECIDED — built by FPU (rmbp-ledger B666, wave 36): an FXSAVE context per task and the SSE
+   target for every ring-3 ELF; ring3.md BP-ring3-11 is rewritten by that fold.
+2. R128's scope: being built by STARTSCENE (B662): one scene under the splash hold, the login screen and the desktop.
+3. Helm in Ring 0: the kernel links `unaos/libs/sys/helm` when TALUS's drive service lands (ROADMAP §4), not before;
+   CODEX's "kernel core" names that seam, not a present link. security.md says so.
+4. Sonde (CODEX Amendment IV, R112): what to build is Peter's — stays open in CODEX until he signs it.
+5. Which arch the sheets bind: x86 and the shared code at HEAD. aarch64-only code binds from the next track sync
+   (the Pi and Orin tracks are behind trunk); an arc on those tracks reads the sheet and re-anchors on landing.
