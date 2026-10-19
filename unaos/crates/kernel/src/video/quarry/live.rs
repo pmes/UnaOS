@@ -1533,7 +1533,7 @@ fn launch(path: &str) -> String {
     // (A console program on a build whose render body does not drain the line seam — every aarch64 build
     // today, `dock::LINE_LAUNCH_DRAINED` — still detaches, as every double-click did before M6.)
     let n = bytes.len();
-    match crate::origin::with(crate::origin::Origin::Glass, || crate::arch::syscall::spawn_user_image_bg(&bytes)) { // DIALOG2 (B404): a Quarry double-click is the GLASS's launch
+    match crate::origin::with(crate::origin::Origin::Glass, || { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { crate::arch::syscall::spawn_user_image_bg_argv(&bytes, &[path]) } #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] { crate::arch::syscall::spawn_user_image_bg(&bytes) } }) { // DIALOG2 (B404): a Quarry double-click is the GLASS's launch. QUARRYLAUNCH (rmbp-ledger B754): with the one-instance gate armed it spawns with argv [path] (`bg <path>`'s shape) so the gate sees it; knob-off the old call; LINE-NEUTRAL fold
         Ok((pid, asid, entry)) => {
             // WINTITLE — a double-click launch names its windows exactly as `bg` does; the file
             // manager knows the path, so the window it opens carries the program's name rather than
@@ -1556,7 +1556,7 @@ fn launch(path: &str) -> String {
             );
             alloc::format!("started pid {}", pid)
         }
-        Err(e) => {
+        Err(e) => { #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] if e == crate::arch::syscall::ONEINSTANCE_RAISED { serial_println!("[quarry] launch path={} -> running; raised (one instance)", path); return String::from(e); } // QUARRYLAUNCH (B754): the gate raised the running instance — no job, no REFUSED line; LINE-NEUTRAL fold
             serial_println!("[quarry] launch REFUSED path={} reason=spawn ({})", path, e);
             String::from(e)
         }
@@ -4909,4 +4909,13 @@ fn select_leaf(m: &mut Model, leaf: &str) -> bool {
     m.focus = Pane::List;
     m.settle();
     m.list.get(m.list_sel).is_some_and(|e| e.name.eq_ignore_ascii_case(leaf))
+}
+
+// QUARRYLAUNCH (rmbp-ledger B754; BP-ring3-18) — TAIL-APPENDED, so no line above moves. `tests oneinstance`'s
+// `quarry_launch=` leg drives the double-click's own body ([`launch`]) on a program that is already running: with the
+// gate armed the launch spawns with argv `[path]`, so the gate raises the instance and the reply is its text.
+/// [`launch`] for the fixture (witness builds only).
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+pub fn launch_probe(path: &str) -> String {
+    launch(path)
 }
