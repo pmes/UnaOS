@@ -188,7 +188,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("focussteal", focussteal_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("veilcost", veilcost_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))] register("aging", aging_selftest); register("a11yfilters", crate::video::settings::selftest_a11yfilters); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("zoom", zoom_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("perfhud", crate::video::perfhud::selftest); register("undomove", undomove_selftest); register("fontkit", fontkit_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("raiseverb", raiseverb_selftest); register("keychars", keychars_selftest); register("softydots", softydots_selftest); }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("focussteal", focussteal_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("veilcost", veilcost_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))] register("aging", aging_selftest); register("a11yfilters", crate::video::settings::selftest_a11yfilters); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("zoom", zoom_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("perfhud", crate::video::perfhud::selftest); register("undomove", undomove_selftest); register("fontkit", fontkit_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("raiseverb", raiseverb_selftest); register("keychars", keychars_selftest); register("softydots", softydots_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "unafs"))] register("filesearch", filesearch_selftest); }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -3175,4 +3175,135 @@ fn lock2_unlocked(l: (crate::video::wm::WinId, bool)) -> (bool, Option<u64>) {
     let _ = wm::close_owner(LOCK2_OWNER);
     serial_println!("[lock] fixture row={} suppressed_while_locked={} clean_ms={} presents_again={}", id, suppressed as u8, hole.map_or(-1i64, |m| m as i64), again as u8);
     (suppressed && hole.is_some() && again, hole)
+}
+
+// ══════════════ FILESEARCH (rmbp-ledger B741, BP-video-34, BP-storage-26) — `tests filesearch` — TAIL-APPENDED ══════════════
+/// The Launcher's Files engine (`video::launcher::filesearch::answer`, the SAME function the field runs per keystroke)
+/// over a RAM UnaFS volume (`MemDevice`, formatted here, never the user's disk): 2000 names in 20 folders of 100, each
+/// created by `create_files_batch` with its `una:type` (and a photo's `media:taken`) in the same transaction, so the
+/// name index and the facts are the core's own (NAMEINDEXTX B680). Three name queries — `beach` (one exact, two leaf
+/// prefixes, two word prefixes, in that order), `img_0` (248 prefix hits, cut to 20), `qqq` (none); the recent-first
+/// rule through the opener's own `push_recent` (40 pushes keep 32, a recent name leads its rank and never crosses a
+/// rank); the filters on the stored facts (`beach kind:photo` = 3, `kind:pdf` alone = 20 PDF rows via the attribute
+/// catalog, `img taken:2026` and `taken:2026` alone = 20 rows all taken in 2026). `ms` = the slowest of the three
+/// name queries (whole ms; `us` on the detail line, read against the 2 ms budget — not a verdict leg in QEMU).
+/// `:: FILESEARCH: index=2000 hits_ok=3 recent=ok kind=ok ms=<n> -> PASS ::`
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))]
+fn filesearch_selftest() {
+    use crate::video::launcher::filesearch as fsr;
+    use ::unafs::{AttributeValue, BatchFile, MemDevice, UnaFS, BLOCK_SIZE};
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    const DIRS: usize = 20;
+    const PER: usize = 100;
+    const BLOCKS: u64 = 8192;
+    let fail = |why: &str| serial_println!(":: FILESEARCH: index=0 hits_ok=0 recent=FAIL kind=FAIL ms=0 -> FAIL :: reason={} ::", why);
+    let mut bytes: Vec<u8> = Vec::new();
+    if bytes.try_reserve_exact((BLOCKS * BLOCK_SIZE) as usize).is_err() {
+        return fail("heap");
+    }
+    bytes.resize((BLOCKS * BLOCK_SIZE) as usize, 0);
+    let mut fs = match UnaFS::format(MemDevice::from_bytes(bytes), 0) {
+        Ok(f) => f,
+        Err(_) => return fail("format"),
+    };
+    let (y2025, y2026) = (fsr::year_start(2025) + 150 * 86400, fsr::year_start(2026) + 150 * 86400);
+    // Name i: the five beach names first, then IMG_/report-/notes_/song by i % 4.
+    let spec = |i: usize| -> (String, &'static str, Option<i64>) {
+        match i {
+            0 => (String::from("Beach"), "text/plain", None),
+            1 => (String::from("beach-day.jpg"), "image/jpeg", Some(y2026)),
+            2 => (String::from("beachball.png"), "image/png", Some(y2025)),
+            3 => (String::from("summer_beach.jpg"), "image/jpeg", Some(y2026)),
+            4 => (String::from("old beach.pdf"), "application/pdf", None),
+            _ => match i % 4 {
+                0 => (format!("IMG_{:04}.jpg", i), "image/jpeg", Some(if i % 8 == 0 { y2026 } else { y2025 })),
+                1 => (format!("report-{:04}.pdf", i), "application/pdf", None),
+                2 => (format!("notes_{:04}.txt", i), "text/plain", None),
+                _ => (format!("song {:04}.mp3", i), "audio/mpeg", None),
+            },
+        }
+    };
+    let t_build = crate::arch::ms();
+    let root = fs.superblock.root_inode;
+    let mut index = 0usize;
+    for d in 0..DIRS {
+        let Ok(dir) = fs.mkdir(root, format!("d{:02}", d)) else { return fail("mkdir") };
+        let batch: Vec<BatchFile> = (d * PER..(d + 1) * PER)
+            .map(|i| {
+                let (name, mime, taken) = spec(i);
+                let mut attributes = BTreeMap::new();
+                attributes.insert(String::from(una_abi::attr_keys::TYPE), AttributeValue::String(String::from(mime)));
+                if let Some(t) = taken {
+                    attributes.insert(String::from(una_abi::attr_keys::MEDIA_TAKEN), AttributeValue::Int(t));
+                }
+                BatchFile { name, data: Vec::new(), attributes }
+            })
+            .collect();
+        match fs.create_files_batch(dir, batch) {
+            Ok(ids) => index += ids.len(),
+            Err(_) => return fail("create"),
+        }
+    }
+    let build_ms = crate::arch::ms().saturating_sub(t_build);
+    let ask = |fs: &mut UnaFS<MemDevice>, q: &str, recent: &[String]| -> (Vec<fsr::Row>, u64) {
+        let t0 = crate::hidstall::now_us();
+        let rows = match fsr::answer(fs, &fsr::parse(q), recent) {
+            Ok(Some(a)) => a.rows,
+            _ => Vec::new(),
+        };
+        (rows, crate::hidstall::now_us().saturating_sub(t0))
+    };
+    let leaves = |rows: &[fsr::Row]| rows.iter().map(|r| String::from(r.leaf())).collect::<Vec<String>>();
+    // The three name queries.
+    let (r1, us1) = ask(&mut fs, "beach", &[]);
+    let (r2, us2) = ask(&mut fs, "img_0", &[]);
+    let (r3, us3) = ask(&mut fs, "qqq", &[]);
+    let tiers1: Vec<u8> = r1.iter().map(|r| r.tier).collect();
+    let q1 = tiers1 == [0, 1, 1, 2, 2] && r1[0].leaf() == "Beach" && r1[0].folder() == "/d00";
+    let q2 = r2.len() == fsr::ROWS_MAX && r2.iter().all(|r| r.tier == 1 && r.leaf().starts_with("IMG_0") && r.mime == "image/jpeg");
+    let q3 = r3.is_empty();
+    let hits_ok = q1 as u32 + q2 as u32 + q3 as u32;
+    // The recent-first rule, through the opener's own list rule.
+    let mut recent: Vec<String> = Vec::new();
+    for i in 0..40 {
+        fsr::push_recent(&mut recent, &format!("/d19/filler-{}", i));
+    }
+    fsr::push_recent(&mut recent, "/d00/beachball.png");
+    fsr::push_recent(&mut recent, "/d00/summer_beach.jpg");
+    let (rr, _) = ask(&mut fs, "beach", &recent);
+    let lr = leaves(&rr);
+    let recent_ok = recent.len() == fsr::RECENT_MAX
+        && recent[0] == "/d00/summer_beach.jpg"
+        && lr.len() == 5
+        && lr[0] == "Beach"
+        && lr[1] == "beachball.png"
+        && lr[3] == "summer_beach.jpg";
+    // The filters on the stored facts.
+    let tk = crate::hidstall::now_us();
+    let (k1, _) = ask(&mut fs, "beach kind:photo", &[]);
+    let (k2, _) = ask(&mut fs, "kind:pdf", &[]);
+    let (k3, _) = ask(&mut fs, "img taken:2026", &[]);
+    let (k4, _) = ask(&mut fs, "taken:2026", &[]);
+    let kind_us = crate::hidstall::now_us().saturating_sub(tk);
+    let n_of = |leaf: &str| leaf.get(4..8).and_then(|n| n.parse::<usize>().ok());
+    let l1 = leaves(&k1);
+    let kind1 = l1.len() == 3 && ["beach-day.jpg", "beachball.png", "summer_beach.jpg"].iter().all(|w| l1.iter().any(|l| l == w));
+    let kind2 = k2.len() == fsr::ROWS_MAX && k2.iter().all(|r| r.mime == "application/pdf" && r.tier == 3);
+    let kind3 = k3.len() == fsr::ROWS_MAX && k3.iter().all(|r| r.leaf().starts_with("IMG_") && n_of(r.leaf()).is_some_and(|n| n % 8 == 0));
+    let kind4 = k4.len() == fsr::ROWS_MAX && k4.iter().all(|r| r.mime == "image/jpeg" && (r.leaf().ends_with("beach-day.jpg") || r.leaf().ends_with("summer_beach.jpg") || n_of(r.leaf()).is_some_and(|n| n % 8 == 0)));
+    let kind_ok = kind1 && kind2 && kind3 && kind4;
+    let worst_us = us1.max(us2).max(us3);
+    let ms = worst_us / 1000;
+    serial_println!(
+        "[filesearch] detail build_ms={} blocks={} q_us={}/{}/{} kind_us={} budget_ms={} under={} q1={} q2={} q3={} kinds={}{}{}{} beach={:?}",
+        build_ms, BLOCKS, us1, us2, us3, kind_us, fsr::BUDGET_MS, (worst_us <= fsr::BUDGET_MS * 1000) as u8,
+        q1 as u8, q2 as u8, q3 as u8, kind1 as u8, kind2 as u8, kind3 as u8, kind4 as u8, leaves(&r1)
+    );
+    let ok = index == DIRS * PER && hits_ok == 3 && recent_ok && kind_ok;
+    serial_println!(
+        ":: FILESEARCH: index={} hits_ok={} recent={} kind={} ms={} -> {} ::",
+        index, hits_ok, if recent_ok { "ok" } else { "FAIL" }, if kind_ok { "ok" } else { "FAIL" }, ms, if ok { "PASS" } else { "FAIL" }
+    );
 }
