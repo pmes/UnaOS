@@ -24,10 +24,11 @@
 | BP-storage-12 | Once the root is bound, every prefs read/write/stat resolves against the root (no re-walk of other disks per call). | commit `715c69ff` (DONGLEBOOT B658) | `tests dongleboot` |
 | BP-storage-13 | The users table is `/USERS.DAT` at the root of the root volume, swapped through `/USERS.NEW`; at most 8 users, names ≤ 8 bytes; homes are `/home/<name>`, spelt by `users::home_of`, never a literal. | `unaos/crates/kernel/src/fs/users.rs:140-157` `unaos/crates/kernel/src/fs/users.rs:740`; `unaos/crates/kernel/src/prefs.rs:26-28` | `tests login` family (unverified names) |
 | BP-storage-14 | Trash is `/home/<user>/.Trash/` through the mount table; `trash_core` is the one Trash both rings share (seam `shared-core`, owner Matrix). | `unaos/crates/kernel/src/fs/trash.rs:1-10` | `tests trash` (unverified name) |
+| BP-storage-15 | A device-held volume (a PTP camera's card, PTPCAM B687, R130 law 3) is a mount like any other: it is bound only through the VFS hot-plug seam (`register_hotplug`, asked by every `MountTable::new()`), at `/volumes/<model>`, read-only (`write_veto`), absent from the next table once the device detaches; its listing reads the driver's object table and never waits on the cable. | `unaos/crates/kernel/src/fs/vfs.rs` (file tail, `register_hotplug`); `unaos/crates/kernel/src/fs/ptpfs.rs`; `docs/dev/OS/07_USB_STORAGE/ptp.md` §4 | `tests ptp` (codec + fixture); the bench camera (`[ptp] volume /volumes/<name> mounted`) |
 
 ## 3. Seams
 - May call storage: VFS clients (shell verbs, `SYS_OPEN`/`SYS_PATH_*`, Quarry, prefs, users, wallpaper, apptrust), the installer.
-- Storage may call: `amber_core::gpt` (all GPT reads), `unafs`, `exfat_core`, `trash_core`, `type_core`, the block layer. The render task touches storage only through bounded accessors (cores.md BP-cores-15).
+- Storage may call: `amber_core::gpt` (all GPT reads), `unafs`, `exfat_core`, `trash_core`, `type_core`, the block layer; the camera volume (`fs/ptpfs.rs`) calls the PTP class driver's read surface (`drivers/xhci/ptp.rs`: `lookup`/`list` without I/O, `read_object`/`liveview_frame` under the controller loan) — BP-storage-15. The render task touches storage only through bounded accessors (cores.md BP-cores-15).
 - A new kernel store needs a CHARTER and an owner (`gates` arch row `store` leg, `unaos/scripts/arch-check.py:23-24`).
 
 ## 4. Wire
