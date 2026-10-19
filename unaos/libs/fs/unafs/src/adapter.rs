@@ -162,6 +162,8 @@ pub struct BlockAdapter<S: SectorDevice> {
     dev: S,
     base_lba: u64,
     block_count: u64,
+    /// XTS (B689): the volume cipher of a mounted `cipher = 1` volume (§R2b) — the medium holds ciphertext.
+    cipher: Option<crate::storage::VolumeCipher>,
 }
 
 impl<S: SectorDevice> BlockAdapter<S> {
@@ -174,6 +176,7 @@ impl<S: SectorDevice> BlockAdapter<S> {
             dev,
             base_lba,
             block_count,
+            cipher: None,
         }
     }
 
@@ -185,6 +188,7 @@ impl<S: SectorDevice> BlockAdapter<S> {
             dev,
             base_lba: 0,
             block_count,
+            cipher: None,
         }
     }
 
@@ -194,6 +198,7 @@ impl<S: SectorDevice> BlockAdapter<S> {
             dev,
             base_lba: span.base_lba,
             block_count: span.block_count,
+            cipher: None,
         }
     }
 
@@ -226,7 +231,11 @@ impl<S: SectorDevice> BlockDevice for BlockAdapter<S> {
         let first = self.first_lba(id)?;
         first.checked_add(SECTORS_PER_BLOCK).ok_or(StorageError::OutOfBounds(id))?;
         // BOOT80: the block's eight sectors in ONE device call (one CMD18 on the SD card).
-        self.dev.read_sectors(first, buf).map_err(map_sector_err)
+        self.dev.read_sectors(first, buf).map_err(map_sector_err)?;
+        match &self.cipher {
+            Some(c) => c.open(id, 0, buf),
+            None => Ok(()),
+        }
     }
 
     fn write_block(&mut self, id: u64, buf: &[u8]) -> Result<(), StorageError> {
@@ -238,6 +247,10 @@ impl<S: SectorDevice> BlockDevice for BlockAdapter<S> {
         }
         let first = self.first_lba(id)?;
         first.checked_add(SECTORS_PER_BLOCK).ok_or(StorageError::OutOfBounds(id))?;
+        let buf = match self.cipher.as_mut() {
+            Some(c) => c.seal(id, 0, buf)?,
+            None => buf,
+        };
         // BOOT80: one device call per block (one CMD25 on the SD card).
         self.dev.write_sectors(first, buf).map_err(map_sector_err)
     }
@@ -273,7 +286,18 @@ impl<S: SectorDevice> BlockDevice for BlockAdapter<S> {
             .first_lba(id)?
             .checked_add(sector as u64)
             .ok_or(StorageError::OutOfBounds(id))?;
+        // XTS (B689): the sector alone, at its offset in the block — the same bytes the whole block would
+        // carry there, so the flip stays ONE sector write on a ciphered volume.
+        let buf = match self.cipher.as_mut() {
+            Some(c) => c.seal(id, sector * SECTOR_SIZE as usize, buf)?,
+            None => buf,
+        };
         self.dev.write_sector(lba, buf).map_err(map_sector_err)
+    }
+
+    fn set_cipher(&mut self, cipher: Option<crate::storage::VolumeCipher>) -> Result<(), StorageError> {
+        self.cipher = cipher;
+        Ok(())
     }
 }
 

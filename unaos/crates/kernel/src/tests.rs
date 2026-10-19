@@ -243,7 +243,7 @@ fn ensure_lumen() {
     #[cfg(feature = "lumen")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("lumenfast", crate::lumen::lumenfast); register("holocron", crate::keyring::selftest); register("ringlogin", crate::keyring::ringlogin_selftest); #[cfg(all(target_arch = "x86_64", feature = "btc"))] register("btkeyseal", crate::drivers::ehci::bthid::btkeyseal_selftest); #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("volkey", crate::keyring::volkey_selftest); /* VOLKEY (B684): the volume key slot on a RAM volume (LINE-NEUTRAL append) */ }
+        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("lumenfast", crate::lumen::lumenfast); register("holocron", crate::keyring::selftest); register("ringlogin", crate::keyring::ringlogin_selftest); #[cfg(all(target_arch = "x86_64", feature = "btc"))] register("btkeyseal", crate::drivers::ehci::bthid::btkeyseal_selftest); #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("volkey", crate::keyring::volkey_selftest); /* VOLKEY (B684): the volume key slot on a RAM volume (LINE-NEUTRAL append) */ #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("xts", xts_selftest); /* XTS (B689): the volume cipher on a scratch RAM volume, `tests.rs` tail (LINE-NEUTRAL append) */ }
     }
 }
 
@@ -788,4 +788,112 @@ pub fn applaunch_selftest() {
         alloc::string::String::from("PASS")
     };
     serial_println!(":: APPLAUNCH: app={} n={} p50_ms={} p99_ms={} bar_ms={} -> {} ::", name, N, show(p50), show(p99), BAR_MS, verdict);
+}
+
+// XTS (rmbp-ledger B689, VOLKEY M2) — `tests xts`: the volume cipher on a scratch RAM volume. TAIL-APPENDED.
+// The cipher, the copy that makes a ciphered volume and the mount that carries it are the crates' (`crypto_core::xts`,
+// `unafs::storage::VolumeCipher`, `unafs::fs::encipher`, unafs-records.md §R2b); this is their kernel witness. It
+// prints counts and words like `ok` only — no key, no password, no recovery word on the wire.
+#[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+fn xts_selftest() {
+    use ::unafs::fs::{encipher, FileSystemError};
+    use ::unafs::{KdfParams, KeySlot, MemDevice, UnaFS, Unlock, BLOCK_SIZE};
+    const PW: &[u8] = b"xts-fixture-pw";
+    const BLOCKS: u64 = 512;
+    const MB: u64 = 4;
+    let fail = |why: &str| serial_println!(":: XTS: vectors=FAIL roundtrip=FAIL raw_plain=- ms_per_mb=- -> FAIL ({}) ::", why);
+    let hx = |s: &str| -> alloc::vec::Vec<u8> { (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap_or(0)).collect() };
+    let count = |hay: &[u8], n: &[u8]| hay.windows(n.len()).filter(|w| *w == n).count();
+    // ── IEEE Std 1619-2007 Annex B vectors 10 and 14: XTS-AES-256, 512 B data units numbered ff and ffffffffff,
+    //    plaintext 00..ff twice; the ciphertext's SHA-256 (of the standard's 512 bytes), then decrypted back ──────
+    let key = hx("27182818284590452353602874713526624977572470936999595749669676273141592653589793238462643383279502884197169399375105820974944592");
+    let pt: alloc::vec::Vec<u8> = (0..512u32).map(|i| i as u8).collect();
+    let mut vectors = false;
+    if let Ok(x) = crypto_core::xts::Xts::new(&key) {
+        vectors = true;
+        for (unit, digest) in [
+            (0xffu64, "e97e974fa393af794f7a4684395814cf820de60a01eaec677d87b452e316b364"),
+            (0xff_ffff_ffffu64, "afba71abc4e95b186d89a63a5437c1bafcfd1a18ca273970c534aba4f8d05282"),
+        ] {
+            let mut b = pt.clone();
+            let enc = x.encrypt_unit(unit, &mut b).is_ok();
+            let mut h = crypto_core::sha2::Sha256::new();
+            h.update(&b);
+            let same = h.finalize()[..] == hx(digest)[..];
+            let dec = x.decrypt_unit(unit, &mut b).is_ok() && b == pt;
+            vectors &= enc && same && dec;
+        }
+    }
+    // ── a plaintext v7 volume with a witness, enciphered under a fresh ciphered slot (kernel DRBG) ─────────────
+    let t0 = crate::arch::ms();
+    let witness = |tag: &str| -> alloc::vec::Vec<u8> {
+        let mut v = alloc::vec::Vec::new();
+        for i in 0..512 {
+            v.extend_from_slice(format!("XTS kernel witness {} line {:05}\n", tag, i).as_bytes());
+        }
+        v
+    };
+    let (w1, w2) = (witness("one"), witness("two"));
+    let (n1, n2) = (b"XTS kernel witness one line".as_slice(), b"XTS kernel witness two line".as_slice());
+    let mut fs = match UnaFS::format(MemDevice::with_blocks(BLOCKS), 0) {
+        Ok(f) => f,
+        Err(_) => return fail("format refused"),
+    };
+    let root = fs.superblock.root_inode;
+    let wrote = fs.create_file(root, "a.txt".into()).and_then(|id| fs.write_data(id, 0, &w1)).is_ok();
+    let plain = core::mem::take(&mut fs.device).into_bytes();
+    drop(fs);
+    let (slot, words, vkey) = match KeySlot::seal_ciphered(PW, KdfParams::FLOOR, &mut |b: &mut [u8]| {
+        let _ = crate::rand::drbg_fill(b);
+    }) {
+        Ok(x) => x,
+        Err(_) => return fail("seal refused"),
+    };
+    let mut dst = MemDevice::new();
+    let made = encipher(&mut MemDevice::from_bytes(plain.clone()), &mut dst, &slot, &vkey).is_ok_and(|n| n == BLOCKS);
+    drop(vkey);
+    let raw = dst.into_bytes();
+    // ── no key: refused; the words open it; a write goes through the cipher; a re-mount reads both ─────────────
+    let nokey = matches!(UnaFS::mount(MemDevice::from_bytes(raw.clone())), Err(FileSystemError::KeyRequired));
+    let read = |m: &mut UnaFS<MemDevice>, p: &str, w: &[u8]| m.resolve_path(p).and_then(|id| m.read_data(id, 0, w.len() as u64)).is_ok_and(|d| d == w);
+    let rc = Unlock::Recovery(words.as_str());
+    let (mut first, mut raw2) = (false, alloc::vec::Vec::new());
+    if let Ok(mut m) = UnaFS::mount_with(MemDevice::from_bytes(raw.clone()), &rc) {
+        first = read(&mut m, "/a.txt", &w1) && m.create_file(root, "b.txt".into()).and_then(|id| m.write_data(id, 0, &w2)).is_ok();
+        raw2 = m.device.as_bytes().to_vec();
+        m.device = MemDevice::new();
+    }
+    let second = UnaFS::mount_with(MemDevice::from_bytes(raw2.clone()), &rc)
+        .is_ok_and(|mut m| read(&mut m, "/a.txt", &w1) && read(&mut m, "/b.txt", &w2) && m.fsck(false).is_ok_and(|r| r.is_clean()));
+    let stamped = raw.len() > 9 && u32::from_le_bytes([raw[5], raw[6], raw[7], raw[8]]) == ::unafs::keyslot::VERSION_CIPHERED;
+    let roundtrip = wrote && made && nokey && first && second && stamped;
+    // ── the medium: no witness run in either ciphered image (the plaintext image has them: the scan works) ─────
+    let plain_hits = count(&plain, n1);
+    let raw_plain = count(&raw, n1) + count(&raw2, n1) + count(&raw2, n2);
+    let rt_ms = crate::arch::ms().saturating_sub(t0);
+    // ── cost: the write path's cipher over MB MiB of 4 KiB blocks ─────────────────────────────────────────────────
+    let mut ms_per_mb = u64::MAX;
+    if let Some(Ok(mut c)) = slot.unwrap(&rc).ok().map(|k| ::unafs::storage::VolumeCipher::new(&k)) {
+        let blk = alloc::vec![0x5au8; BLOCK_SIZE as usize];
+        let n = MB * 1024 * 1024 / BLOCK_SIZE;
+        let t = crate::arch::ms();
+        let mut ok = true;
+        for id in 1..=n {
+            ok &= c.seal(id, 0, &blk).is_ok();
+        }
+        if ok {
+            ms_per_mb = (crate::arch::ms().saturating_sub(t) + MB / 2) / MB;
+        }
+    }
+    drop(words);
+    serial_println!(
+        "[xts] fx cipher=aes-256-xts unit=4096 tweak=block kdf=hkdf-sha256 blocks={} stamp={} plain_hits={} nokey={} ms={}",
+        BLOCKS, if stamped { "v8" } else { "WRONG" }, plain_hits, if nokey { "refused" } else { "OPENED" }, rt_ms
+    );
+    let pass = vectors && roundtrip && plain_hits > 0 && raw_plain == 0 && ms_per_mb != u64::MAX;
+    serial_println!(
+        ":: XTS: vectors={} roundtrip={} raw_plain={} ms_per_mb={} -> {} ::",
+        if vectors { "ok" } else { "FAIL" }, if roundtrip { "ok" } else { "FAIL" }, raw_plain,
+        if ms_per_mb == u64::MAX { alloc::string::String::from("-") } else { format!("{}", ms_per_mb) }, if pass { "PASS" } else { "FAIL" }
+    );
 }

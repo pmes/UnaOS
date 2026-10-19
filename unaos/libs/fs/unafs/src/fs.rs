@@ -483,8 +483,13 @@ impl<D: BlockDevice> UnaFS<D> {
     /// VOLKEY (B684): mount with the volume's key — its password (Argon2id at the slot's recorded costs) or
     /// its 24 recovery words. A keyed volume opens only when the key unwraps the slot's data key (the
     /// AEAD tag decides; a wrong key reads [`KeySlotError::KeyRefused`](crate::keyslot::KeySlotError)); the
-    /// unwrapped key is dropped (wiped) at once — M1's data blocks are plaintext, so nothing holds it. An
-    /// unkeyed volume mounts as [`mount`](Self::mount) does and the key is not consulted.
+    /// unwrapped key is dropped (wiped) at once. An unkeyed volume mounts as [`mount`](Self::mount) does and
+    /// the key is not consulted.
+    ///
+    /// XTS (B689): a `cipher = 1` slot (§R2b) — its superblock stamped [`VERSION_CIPHERED`](crate::keyslot::VERSION_CIPHERED)
+    /// — expands the key into a [`VolumeCipher`](crate::storage::VolumeCipher) that the DEVICE carries from
+    /// then on (decrypt on read, encrypt on write), installed before anything past block 0 is read; a device
+    /// that cannot carry it refuses ([`StorageError::NoCipher`]).
     pub fn mount_with(device: D, unlock: &crate::keyslot::Unlock<'_>) -> Result<Self, FileSystemError> {
         Self::mount_keyed(device, Some(unlock))
     }
@@ -492,13 +497,26 @@ impl<D: BlockDevice> UnaFS<D> {
     fn mount_keyed(mut device: D, unlock: Option<&crate::keyslot::Unlock<'_>>) -> Result<Self, FileSystemError> {
         let mut sb_block = alloc::vec![0u8; BLOCK_SIZE as usize];
         device.read_block(0, &mut sb_block)?;
-        let superblock = Superblock::from_bytes(&sb_block)?;
+        // XTS (B689): a ciphered slot sits under a v8 stamp and the layout beneath is v7's; any other pairing
+        // (a v8 stamp without the slot, a ciphered slot under 3..=7) is refused, never read.
         let key_slot = crate::keyslot::KeySlot::parse(&sb_block).map_err(FileSystemError::KeySlot)?;
+        let ciphered = key_slot.as_ref().is_some_and(|s| s.cipher == crate::keyslot::CIPHER_AES256_XTS);
+        if ciphered {
+            if stamp_of(&sb_block) != crate::keyslot::VERSION_CIPHERED {
+                return Err(FileSystemError::CorruptVolume("a ciphered key slot under a superblock not stamped v8"));
+            }
+            set_stamp(&mut sb_block, crate::superblock::VERSION_PAGED_MAPS);
+        }
+        let superblock = Superblock::from_bytes(&sb_block)?;
         if let Some(slot) = &key_slot {
             let Some(u) = unlock else {
                 return Err(FileSystemError::KeyRequired);
             };
-            drop(slot.unwrap(u).map_err(FileSystemError::KeySlot)?);
+            let key = slot.unwrap(u).map_err(FileSystemError::KeySlot)?;
+            if ciphered {
+                device.set_cipher(Some(crate::storage::VolumeCipher::new(&key)?))?;
+            }
+            drop(key);
         }
 
         let loaded = Self::load_committed(&mut device, &superblock)?;
@@ -862,6 +880,10 @@ impl<D: BlockDevice> UnaFS<D> {
         sb_block[..sb_bytes.len()].copy_from_slice(&sb_bytes);
         if let Some(slot) = &self.key_slot {
             slot.encode_into(&mut sb_block);
+            // XTS (B689): a ciphered volume's superblock carries the v8 stamp on the disk on every rewrite.
+            if slot.cipher == crate::keyslot::CIPHER_AES256_XTS {
+                set_stamp(&mut sb_block, crate::keyslot::VERSION_CIPHERED);
+            }
         }
         Ok(sb_block)
     }
@@ -877,9 +899,15 @@ impl<D: BlockDevice> UnaFS<D> {
     /// leaves the volume unkeyed. From the next mount on, [`mount`](Self::mount) refuses the volume and
     /// [`mount_with`](Self::mount_with) opens it. A keyed volume is refused (`AlreadyKeyed`): changing the
     /// password re-wraps the slot, a separate operation.
+    ///
+    /// XTS (B689): a `cipher = 1` slot is refused here (`Unsupported`) — this volume's blocks are plaintext and
+    /// keying writes block 0 only; a ciphered volume is made by [`encipher`].
     pub fn set_key_slot(&mut self, slot: crate::keyslot::KeySlot) -> Result<(), FileSystemError> {
         if self.key_slot.is_some() {
             return Err(FileSystemError::KeySlot(crate::keyslot::KeySlotError::AlreadyKeyed));
+        }
+        if slot.cipher != crate::keyslot::CIPHER_NONE {
+            return Err(FileSystemError::KeySlot(crate::keyslot::KeySlotError::Unsupported));
         }
         let sb = self.superblock.clone();
         self.key_slot = Some(slot);
@@ -3619,6 +3647,65 @@ impl<D: BlockDevice> UnaFS<D> {
             atime: inode.atime,
         })
     }
+}
+
+/// XTS (B689): the superblock's `version` field (§R2: bytes 5..9 of block 0, after the 5-byte magic) as it
+/// sits on the disk.
+fn stamp_of(block0: &[u8]) -> u32 {
+    u32::from_le_bytes([block0[5], block0[6], block0[7], block0[8]])
+}
+
+/// XTS (B689): write the superblock's `version` field in place.
+fn set_stamp(block0: &mut [u8], version: u32) {
+    block0[5..9].copy_from_slice(&version.to_le_bytes());
+}
+
+/// XTS (rmbp-ledger B689, VOLKEY M2): ENCIPHER — copy the UNKEYED v7 volume on `src`, block for block, into
+/// `dst` as a KEYED, CIPHERED volume (unafs-records.md §R2b): every block but block 0 AES-256-XTS under `key`
+/// (tweak = block number, [`VolumeCipher`](crate::storage::VolumeCipher)), then block 0 LAST — the
+/// superblock byte-identical but for its stamp ([`VERSION_CIPHERED`](crate::keyslot::VERSION_CIPHERED)) and
+/// `slot` in sector 1 — then a flush. `slot` and `key` come from one
+/// [`KeySlot::seal_ciphered`](crate::keyslot::KeySlot::seal_ciphered).
+///
+/// A copy, never in place: a cut mid-way leaves `src` whole and `dst` without a superblock (block 0 is
+/// written last), so no crash can leave a half-ciphered volume. The caller makes `dst` the volume
+/// afterwards (`tools/unafs key --cipher`: a sibling file, then an atomic rename). `src` must be
+/// committed (unmounted, or mounted and idle) and v7: an older volume migrates first. Returns the blocks
+/// written.
+pub fn encipher<S: BlockDevice, T: BlockDevice>(
+    src: &mut S,
+    dst: &mut T,
+    slot: &crate::keyslot::KeySlot,
+    key: &crate::keyslot::VolumeKey,
+) -> Result<u64, FileSystemError> {
+    if slot.cipher != crate::keyslot::CIPHER_AES256_XTS {
+        return Err(FileSystemError::KeySlot(crate::keyslot::KeySlotError::Unsupported));
+    }
+    let mut b0 = alloc::vec![0u8; BLOCK_SIZE as usize];
+    src.read_block(0, &mut b0)?;
+    let sb = Superblock::from_bytes(&b0)?;
+    if crate::keyslot::KeySlot::parse(&b0).map_err(FileSystemError::KeySlot)?.is_some() {
+        return Err(FileSystemError::KeySlot(crate::keyslot::KeySlotError::AlreadyKeyed));
+    }
+    if sb.version != crate::superblock::VERSION_PAGED_MAPS {
+        return Err(SuperblockError::InvalidVersion(sb.version).into());
+    }
+    let n = sb.block_count;
+    let room = dst.block_count();
+    if room != 0 && room < n {
+        return Err(SuperblockError::Geometry("encipher: the destination is smaller than the volume").into());
+    }
+    let mut cipher = crate::storage::VolumeCipher::new(key)?;
+    let mut buf = alloc::vec![0u8; BLOCK_SIZE as usize];
+    for id in 1..n {
+        src.read_block(id, &mut buf)?;
+        dst.write_block(id, cipher.seal(id, 0, &buf)?)?;
+    }
+    set_stamp(&mut b0, crate::keyslot::VERSION_CIPHERED);
+    slot.encode_into(&mut b0);
+    dst.write_block(0, &b0)?;
+    dst.flush()?;
+    Ok(n)
 }
 
 // =========================================================================
