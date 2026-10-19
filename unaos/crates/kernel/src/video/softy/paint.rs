@@ -215,6 +215,25 @@ pub fn under(s: &mut Surf, px0: usize, py0: usize) {
     }
 }
 
+/// SOFTYDARK (B694): one band row's FACE, `w` px from panel `(px0, py)` into `out`: `face` at straight alpha `a` over
+/// the wallpaper's VEIL (blurred once per picture, `wm::desktop::Back::soft`; the desktop colour with no wallpaper);
+/// at `a == 255` a plain fill, no sample taken. The band's signature carries the wallpaper generation (`strip::seal`).
+pub fn veil_row(out: &mut [u32], w: usize, px0: usize, py: usize, face: u32, a: u8) {
+    let n = w.min(out.len());
+    let row = &mut out[..n];
+    if a == 255 {
+        row.fill(face);
+        return;
+    }
+    match crate::video::wm::desktop::live_back() {
+        Some(b) => b.soft(row, px0, py),
+        None => row.fill(super::palette::DESKTOP),
+    }
+    for p in row.iter_mut() {
+        *p = blend(*p, face, a);
+    }
+}
+
 /// Text with its line TOP at `(x, y)`, clipped at `x + max_w`; returns the pen x. Each covered pixel blends `ink`
 /// over what the surface already holds (the glass's text faces, `video::text`).
 #[allow(clippy::too_many_arguments)]

@@ -7,7 +7,8 @@
 //! DESIGN-LANGUAGE alignment). Colours are logical `0x00RRGGBB`; dimensions are LOGICAL px (96 ppi) and reach the
 //! glass through [`px`] — the panel's UI scale (`ui::px`), so a 2x panel draws them twice as large.
 //!
-//! The tone: a light neutral surface, one dark ink, ONE accent. Alphas are straight `0..=255`.
+//! The tone: a light neutral surface, one dark ink, ONE accent; in Dark (SOFTYDARK B694) a near-black band under the
+//! VEIL, light ink, the same accent. Alphas are straight `0..=255`.
 
 /// A logical length at the panel's scale.
 #[inline]
@@ -20,8 +21,9 @@ pub fn px(n: usize) -> usize {
 //
 // SOFTY2 (B641): the colours are FUNCTIONS now, resolved per paint from the live appearance (`theme::is_dark`, the
 // accent index): LIGHT is Softy's own table (`palette_core::softy`, unchanged) with the accent from the ACCENT TABLE
-// (`theme::accent()` — `#0067C0` is gone); DARK is DESIGN-LANGUAGE §2.3's semantic table, read by its token NAMES
-// through [`Sem`] / [`dark`] — the one seam DESIGNAPPLY (B639) repoints when its tokens land in `palette_core`.
+// (`theme::accent()` — `#0067C0` is gone); DARK was DESIGN-LANGUAGE §2.3's semantic table, read by its token NAMES
+// through [`Sem`] / [`dark`]. SOFTYDARK (B694): DARK is Softy's OWN set now (`palette_core::softy::dark`, [`role`]);
+// [`dark`] keeps the accent's derivations (pressed, ink) and the §2.3 names `tests softy` still reports (`dark=`).
 pub use crate::video::theme::softy::{ON_ACCENT, CLOSE_INK, APP_HUES};
 use crate::video::theme::softy as light;
 
@@ -131,34 +133,130 @@ fn pick(l: u32, t: Sem) -> u32 {
     if is_dark() { dark(t) } else { l }
 }
 
-// ── colour (SOFTY2: functions, light | dark) ───────────────────────────────────────────────────────────────────
+// SOFTYDARK (rmbp-ledger B694): Softy's colours resolve through its OWN two sets — `palette_core::softy` (Light) and
+// `palette_core::softy::dark` (Dark, derived in OKLCH, the derivation at its head) — picked by `appearance.mode`
+// (`theme::is_dark`) exactly as the Una look's columns are, each with its increase-contrast twins
+// (`palette_core::contrast::softy` and `::softy::dark`). The §2.3 seam [`dark`] keeps the ACCENT's derivations only.
+use crate::video::theme::softy::dark as dk;
+use palette_core::contrast::softy::dark as hcd;
+
+/// Softy's colour ROLES, one each (the fixture walks [`ROLES`] on the Dark set whatever mode is live).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    Surface,
+    SurfaceIdle,
+    Flyout,
+    FlyoutFoot,
+    Text,
+    Text2,
+    TextIdle,
+    Stroke,
+    EdgeIdle,
+    Hover,
+    Press,
+    CloseHot,
+    Field,
+    FieldLine,
+    Pip,
+}
+
+/// Every role, in [`Role`] order.
+#[cfg(feature = "witness")]
+pub const ROLES: [Role; 15] = [
+    Role::Surface, Role::SurfaceIdle, Role::Flyout, Role::FlyoutFoot, Role::Text, Role::Text2, Role::TextIdle, Role::Stroke,
+    Role::EdgeIdle, Role::Hover, Role::Press, Role::CloseHot, Role::Field, Role::FieldLine, Role::Pip,
+];
+
+/// Role `r` in the Light (`dark == false`) or Dark set, under the live increase-contrast switch.
+pub fn role(r: Role, dark: bool) -> u32 {
+    let hi = crate::video::theme::contrast();
+    let two = |l: u32, d: u32| if dark { d } else { l };
+    let hc = |l: (u32, u32), d: (u32, u32)| if dark { if hi { d.1 } else { d.0 } } else if hi { l.1 } else { l.0 };
+    match r {
+        Role::Surface => two(light::SURFACE, dk::SURFACE),
+        Role::SurfaceIdle => two(light::SURFACE_IDLE, dk::SURFACE_IDLE),
+        Role::Flyout => two(light::FLYOUT, dk::FLYOUT),
+        Role::FlyoutFoot => two(light::FLYOUT_FOOT, dk::FLYOUT_FOOT),
+        Role::Text => hc((light::TEXT, hcl::TEXT), (dk::TEXT, hcd::TEXT)),
+        Role::Text2 => hc((light::TEXT_2, hcl::TEXT_2), (dk::TEXT_2, hcd::TEXT_2)),
+        Role::TextIdle => hc((light::TEXT_IDLE, hcl::TEXT_IDLE), (dk::TEXT_IDLE, hcd::TEXT_IDLE)),
+        Role::Stroke => two(light::STROKE, dk::STROKE),
+        Role::EdgeIdle => hc((light::EDGE_IDLE, hcl::EDGE_IDLE), (dk::EDGE_IDLE, hcd::EDGE_IDLE)),
+        Role::Hover => two(light::HOVER, dk::HOVER),
+        Role::Press => two(light::PRESS, dk::PRESS),
+        Role::CloseHot => two(light::CLOSE_HOT, dk::CLOSE_HOT),
+        Role::Field => two(light::FIELD, dk::FIELD),
+        Role::FieldLine => hc((light::FIELD_LINE, hcl::FIELD_LINE), (dk::FIELD_LINE, hcd::FIELD_LINE)),
+        Role::Pip => hc((light::PIP, hcl::PIP), (dk::PIP, hcd::PIP)),
+    }
+}
+
+#[inline]
+fn live(r: Role) -> u32 {
+    role(r, is_dark())
+}
+
+/// SOFTYDARK fixture (`tests softy`, `own=<n>/<n>`): how many of Softy's [`ROLES`] hold on its DARK set (read whatever
+/// mode is live, under the live contrast switch): the grounds rise (field < idle < surface < footer < flyout) and stay
+/// dark, the inks read lightest-first and meet their floors on all five Dark grounds (text 6:1 / 4.5:1 / 4.5:1,
+/// 7:1 / 9:1 / 7:1 with increase contrast; the underline 3:1; the idle edge 1.6:1 on its head), the washes and the
+/// hairline are lighter than the band, the close fill takes its white glyph at 4.5:1. Returns `(held, ROLES.len())`.
+#[cfg(feature = "witness")]
+pub fn dark_own() -> (usize, usize) {
+    use palette_core::contrast::ratio_x100 as rx;
+    let d = |r: Role| role(r, true);
+    let hi = crate::video::theme::contrast();
+    let grounds = [d(Role::Surface), d(Role::SurfaceIdle), d(Role::Flyout), d(Role::FlyoutFoot), d(Role::Field)];
+    let min = |ink: u32| grounds.iter().map(|&g| rx(ink, g)).min().unwrap_or(0);
+    let lum = palette_core::contrast::luminance;
+    let dim = |c: u32| lum(c) < 0.05;
+    let held = ROLES.iter().filter(|&&r| match r {
+        Role::Field => dim(d(r)) && lum(d(r)) < lum(d(Role::SurfaceIdle)),
+        Role::SurfaceIdle => dim(d(r)) && lum(d(r)) < lum(d(Role::Surface)),
+        Role::Surface => dim(d(r)) && lum(d(r)) < lum(d(Role::FlyoutFoot)),
+        Role::FlyoutFoot => dim(d(r)) && lum(d(r)) < lum(d(Role::Flyout)),
+        Role::Flyout => dim(d(r)),
+        Role::Text => min(d(r)) >= if hi { 700 } else { 1200 } && lum(d(r)) > lum(d(Role::Text2)),
+        Role::Text2 => min(d(r)) >= if hi { 900 } else { 600 } && lum(d(r)) > lum(d(Role::TextIdle)),
+        Role::TextIdle | Role::Pip => min(d(r)) >= if hi { 700 } else { 450 },
+        Role::FieldLine => min(d(r)) >= if hi { 450 } else { 300 },
+        Role::EdgeIdle => rx(d(r), d(Role::SurfaceIdle)) >= if hi { 300 } else { 160 },
+        Role::Stroke | Role::Hover | Role::Press => lum(d(r)) > lum(d(Role::Flyout)),
+        Role::CloseHot => rx(d(r), CLOSE_INK) >= 450,
+    }).count();
+    (held, ROLES.len())
+}
+
+// ── colour (SOFTY2: functions, light | dark; SOFTYDARK: Softy's own sets) ─────────────────────────────────────
 // Uppercase like `theme::FRAME()`: each was a `const` of the same name before SOFTY2, and every painter calls it so.
-#[allow(non_snake_case)] #[inline] pub fn SURFACE() -> u32 { pick(light::SURFACE, Sem::SurfaceWindow) }
-#[allow(non_snake_case)] #[inline] pub fn SURFACE_IDLE() -> u32 { pick(light::SURFACE_IDLE, Sem::SurfaceSunken) }
-#[allow(non_snake_case)] #[inline] pub fn FLYOUT() -> u32 { pick(light::FLYOUT, Sem::SurfaceOverlay) }
-#[allow(non_snake_case)] #[inline] pub fn FLYOUT_FOOT() -> u32 { pick(light::FLYOUT_FOOT, Sem::SurfaceWindow) }
-#[allow(non_snake_case)] #[inline] pub fn TEXT() -> u32 { pick(hc(light::TEXT, hcl::TEXT), Sem::TextPrimary) }
-#[allow(non_snake_case)] #[inline] pub fn TEXT_2() -> u32 { pick(hc(light::TEXT_2, hcl::TEXT_2), Sem::TextSecondary) }
-#[allow(non_snake_case)] #[inline] pub fn TEXT_IDLE() -> u32 { pick(hc(light::TEXT_IDLE, hcl::TEXT_IDLE), Sem::TextTertiary) }
+#[allow(non_snake_case)] #[inline] pub fn SURFACE() -> u32 { live(Role::Surface) }
+#[allow(non_snake_case)] #[inline] pub fn SURFACE_IDLE() -> u32 { live(Role::SurfaceIdle) }
+#[allow(non_snake_case)] #[inline] pub fn FLYOUT() -> u32 { live(Role::Flyout) }
+#[allow(non_snake_case)] #[inline] pub fn FLYOUT_FOOT() -> u32 { live(Role::FlyoutFoot) }
+#[allow(non_snake_case)] #[inline] pub fn TEXT() -> u32 { live(Role::Text) }
+#[allow(non_snake_case)] #[inline] pub fn TEXT_2() -> u32 { live(Role::Text2) }
+#[allow(non_snake_case)] #[inline] pub fn TEXT_IDLE() -> u32 { live(Role::TextIdle) }
 /// THE accent — the accent table's FILL for the chosen accent (`system.appearance.accent`), in both modes.
 #[allow(non_snake_case)] #[inline] pub fn ACCENT() -> u32 { crate::video::theme::accent() }
 /// The accent pressed (§2.3 `accent.pressed`).
 #[allow(non_snake_case)] #[inline] pub fn ACCENT_PRESSED() -> u32 { dark(Sem::AccentPressed) }
 /// The accent as an INK on a surface (a pip, the focused window's border): the fill in light, §2.3 `accent.ink` in dark.
 #[allow(non_snake_case)] #[inline] pub fn ACCENT_INK() -> u32 { pick(ACCENT(), Sem::AccentInk) }
-/// The hairline's colour: black in light; `rim.dark` (white) in dark.
-#[allow(non_snake_case)] #[inline] pub fn STROKE() -> u32 { pick(light::STROKE, Sem::RimDark) }
-#[allow(non_snake_case)] #[inline] pub fn EDGE_IDLE() -> u32 { pick(hc(light::EDGE_IDLE, hcl::EDGE_IDLE), Sem::LineStrong) }
+/// The hairline's colour: black in light; white in dark.
+#[allow(non_snake_case)] #[inline] pub fn STROKE() -> u32 { live(Role::Stroke) }
+#[allow(non_snake_case)] #[inline] pub fn EDGE_IDLE() -> u32 { live(Role::EdgeIdle) }
 /// A hovered control's wash: white over the light surface; white at a whisper over the dark one.
-#[allow(non_snake_case)] #[inline] pub fn HOVER() -> u32 { pick(light::HOVER, Sem::RimDark) }
+#[allow(non_snake_case)] #[inline] pub fn HOVER() -> u32 { live(Role::Hover) }
 /// A pressed control's wash: a touch of ink in light; a lighter whisper in dark.
-#[allow(non_snake_case)] #[inline] pub fn PRESS() -> u32 { pick(light::PRESS, Sem::RimDark) }
-#[allow(non_snake_case)] #[inline] pub fn CLOSE_HOT() -> u32 { pick(light::CLOSE_HOT, Sem::StatusCritical) }
+#[allow(non_snake_case)] #[inline] pub fn PRESS() -> u32 { live(Role::Press) }
+#[allow(non_snake_case)] #[inline] pub fn CLOSE_HOT() -> u32 { live(Role::CloseHot) }
 /// The close button held down: the hot fill a step darker.
 #[allow(non_snake_case)] #[inline] pub fn CLOSE_PRESSED() -> u32 { palette_core::mix(CLOSE_HOT(), light::PRESS, 1, 5) }
-#[allow(non_snake_case)] #[inline] pub fn FIELD() -> u32 { pick(light::FIELD, Sem::SurfaceContent) }
-#[allow(non_snake_case)] #[inline] pub fn FIELD_LINE() -> u32 { pick(hc(light::FIELD_LINE, hcl::FIELD_LINE), Sem::LineControl) }
-#[allow(non_snake_case)] #[inline] pub fn PIP() -> u32 { pick(hc(light::PIP, hcl::PIP), Sem::TextTertiary) }
+#[allow(non_snake_case)] #[inline] pub fn FIELD() -> u32 { live(Role::Field) }
+#[allow(non_snake_case)] #[inline] pub fn FIELD_LINE() -> u32 { live(Role::FieldLine) }
+#[allow(non_snake_case)] #[inline] pub fn PIP() -> u32 { live(Role::Pip) }
+/// The taskbar's VEIL tint: opaque (a flat band) in light; `SURFACE` at 78 % over the blurred wallpaper in dark.
+#[allow(non_snake_case)] #[inline] pub fn VEIL_A() -> u8 { if is_dark() { dk::VEIL_A } else { 255 } }
 
 /// The hairline's alpha (about 10 % in light; `rim.dark`'s 8 % in dark).
 #[allow(non_snake_case)] #[inline] pub fn STROKE_A() -> u8 { if is_dark() { 20 } else { 26 } }
@@ -258,11 +356,7 @@ pub const QS_TILE_R: usize = 6;
 // ── CONTRAST (rmbp-ledger B664) — Softy's own high-contrast pairs ──────────────────────────────────────────────────
 // Under Settings → Accessibility → Increase contrast (`theme::contrast`), Softy's Light inks and edges take
 // `palette_core::contrast::softy` (solved against Softy's five grounds: TEXT >= 7:1, TEXT_2 >= 9:1, TEXT_IDLE >= 7:1,
-// EDGE_IDLE >= 3:1, FIELD_LINE >= 4.5:1); its Dark reads the increase-contrast Dark row through [`dark`].
+// EDGE_IDLE >= 3:1, FIELD_LINE >= 4.5:1); its Dark takes their Dark twins (`contrast::softy::dark`, SOFTYDARK B694,
+// solved against Softy's five Dark grounds) through [`role`].
 use palette_core::contrast::softy as hcl;
 
-/// `base`, or its high-contrast pair while the switch is on.
-#[inline]
-fn hc(base: u32, high: u32) -> u32 {
-    if crate::video::theme::contrast() { high } else { base }
-}
