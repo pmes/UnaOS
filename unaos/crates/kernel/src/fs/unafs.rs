@@ -446,7 +446,7 @@ pub fn mount_on(handle: block::BlockHandle) -> Result<KernelUnaFS, MountError> {
     install_warn_hook();
     crate::fs::unafstime::install_clock_hook(); // UNAFSTIME (B308): the kernel clock stamps inodes
     let span = locate_on(handle)?;
-    partition_witness(handle, &span);
+    partition_witness(handle, &span); #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitread::note_span(handle, &span); // HIDSTALL2 (B670): the span this handle's volume sits at, for the split read (LINE-NEUTRAL append, before this comment)
     let dev = SdSectorDevice::open_on(handle)?;
     let adapter = BlockAdapter::for_partition(dev, &span);
     UnaFS::mount(adapter).map_err(MountError::Fs)
@@ -804,7 +804,7 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R
             // UNAFSBIND: the lazy bind DISCOVERS its handle (Global first and unchanged; probes only
             // on proven global absence) instead of assuming `Global` — see [`bind_mount`].
             match bind_mount() {
-                Ok(m) => *guard = Some(m),
+                Ok(m) => { #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitread::note_bound(m.handle); *guard = Some(m) } // HIDSTALL2 (B670): a new bound mount = a new epoch; a split read planned on the old one re-runs under the hold (LINE-NEUTRAL append, before this comment)
                 Err(e) => {
                     // UNAFSTXN: the MOUNT itself reads sectors (`locate`, the superblock, the
                     // reclaim drain), so contention can defeat it before the closure ever runs.
@@ -2976,5 +2976,384 @@ impl RaSet {
         });
         self.slots.insert(0, s);
         r
+    }
+}
+
+// =================================================================================================
+// HIDSTALL2 (rmbp-ledger B670) — MOUNT guards the bound mount; a file's DATA is read outside it.
+// TAIL-APPENDED (this file's panic Locations are line-pinned). The two hooks are same-line folds at
+// :449 (`note_span`, in `mount_on`) and :807 (`note_bound`, the lazy bind in `with_unafs_attempt`),
+// both under this module's cfg, so an image without `wc` is byte-identical.
+//
+// THE WIRE (flight 36 boot 3): `[vfs] tx what=read path=/apps/AETHER.ELF list_ms=1092 blocks=101`
+// (f36-boot3.log:1945). `NativeBackend::read` (fs/vfs.rs:1813-1824) runs `resolve_path`, `read_inode`
+// and `read_data` (3.2 MB: 101 32 KiB windows on the 1-bit SD) inside ONE `with_unafs` closure, i.e.
+// MOUNT (:567) taken at :794 with IRQs masked (:793) for 1092 ms. LOCKREG: `held_max_ms=1091 …
+// held_max_at=unafs.rs:567`; HIDSTALL: `masked_max_ms=1092` (the attempt's masked span, :900). The
+// waiter the capture names is the render task (`spin-wait name=unafs.rs:567 at=unafs.rs:639
+// waiter=9@cpu7`, f36-boot3.log:219).
+//
+// THE SPLIT. A committed block is never rewritten in place (K8a, this file's header): the bytes of a
+// committed file change only after a commit that unreferences them flips the root (generation + 1),
+// and the inode's extents name every byte a read needs. So:
+//   1. PLAN under MOUNT: resolve, read the inode, copy its extents; note the root generation and the
+//      bound mount's identity (epoch, handle, partition span).
+//   2. READ the data blocks with MOUNT released, through the block-layer calls the mount's own device
+//      makes (`handle_read`, `read_blocks_sdhc` on the card), unmasked unless the caller is masked.
+//   3. CHECK under MOUNT that the generation and the epoch are unchanged. Then no commit ran and no
+//      other volume was bound, the extents still name those bytes, and the result is what the one
+//      long hold would have returned.
+// A changed generation or epoch, an unaligned extent, a block past the volume or any device error
+// (a `Busy` loan included) runs the read again the old way, in one hold (`fallbacks=` counts these).
+// Writes stay whole transactions under MOUNT: the allocator and the refcount map sit behind the
+// crate's `&mut self`, and K5B's persisters serialise on this lock.
+// =================================================================================================
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod splitread {
+    use super::*;
+    use core::sync::atomic::AtomicU64;
+
+    /// The bound mount's identity, as the split read plans against it.
+    #[derive(Clone, Copy)]
+    struct Bound {
+        epoch: u64,
+        handle: block::BlockHandle,
+        span: PartitionSpan,
+    }
+
+    /// The span `mount_on` located per handle (a property of the medium, not of one mount).
+    static SPANS: Mutex<Vec<(block::BlockHandle, PartitionSpan)>> = Mutex::new(Vec::new());
+    /// The live bound mount's identity; written only inside the MOUNT hold (the :807 fold).
+    static BOUND: Mutex<Option<Bound>> = Mutex::new(None);
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    /// Split reads this boot, the longest MOUNT hold one of them took (us), the medium fetches made
+    /// under MOUNT by a fallback, and the fallbacks.
+    static OPS: AtomicU64 = AtomicU64::new(0);
+    static HELD_MAX_US: AtomicU64 = AtomicU64::new(0);
+    static IO_UNDER_LOCK: AtomicU64 = AtomicU64::new(0);
+    static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+    /// One block-layer op per this many 4 KiB blocks of a contiguous run (64 KiB).
+    const RUN_BLOCKS: u64 = 16;
+    /// A split read slower than this prints its `[unafslock]` line.
+    const LINE_MS: u64 = 100;
+
+    /// :449 fold — `mount_on` located `span` on `handle`.
+    pub fn note_span(handle: block::BlockHandle, span: &PartitionSpan) {
+        crate::arch::without_interrupts(|| {
+            let mut t = SPANS.lock();
+            match t.iter_mut().find(|(h, _)| *h == handle) {
+                Some(e) => e.1 = *span,
+                None => t.push((handle, *span)),
+            }
+        });
+    }
+
+    /// :807 fold — the lazy bind just bound a mount on `handle` (inside the masked MOUNT hold).
+    pub fn note_bound(handle: block::BlockHandle) {
+        let span = SPANS.lock().iter().find(|(h, _)| *h == handle).map(|e| e.1);
+        let epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+        *BOUND.lock() = span.map(|span| Bound { epoch, handle, span });
+    }
+
+    /// Why a split read returned no bytes (the caller maps these to its own error type).
+    #[derive(Debug)]
+    pub enum ReadMiss {
+        NoSuchPath,
+        IsADirectory,
+        Failed,
+        Mount(MountError),
+    }
+
+    struct Plan {
+        root_gen: u64,
+        bound: Bound,
+        chunks: ::unafs::ExtentList,
+        size: u64,
+    }
+
+    /// Read `len` bytes at `offset` of the file at absolute unafs `path`: the plan and the check hold
+    /// MOUNT, the data blocks are read without it. Same bytes and same refusals as the one-hold
+    /// `resolve_path` + `read_inode` + `read_data` it replaces.
+    pub fn read(path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadMiss> {
+        OPS.fetch_add(1, Ordering::Relaxed);
+        let t0 = crate::hidstall::now_us();
+        let (plan, held_plan) = with_unafs(|fs| {
+            let h0 = crate::hidstall::now_us();
+            let r = (|| -> Result<Option<Plan>, ReadMiss> {
+                let id = fs.resolve_path(path).map_err(|_| ReadMiss::NoSuchPath)?;
+                let ino = fs.read_inode(id).map_err(|_| ReadMiss::NoSuchPath)?;
+                if ino.kind == ::unafs::FileKind::Directory {
+                    return Err(ReadMiss::IsADirectory);
+                }
+                let root_gen = fs.root_generation();
+                Ok(BOUND.lock().as_ref().copied().map(|bound| Plan { root_gen, bound, chunks: ino.chunks, size: ino.size }))
+            })();
+            (r, crate::hidstall::now_us().saturating_sub(h0))
+        })
+        .map_err(ReadMiss::Mount)?;
+        HELD_MAX_US.fetch_max(held_plan, Ordering::Relaxed);
+        let Some(plan) = plan? else {
+            return locked(path, offset, len); // no bound identity noted: the one-hold read
+        };
+        let t1 = crate::hidstall::now_us();
+        let data = read_extents(&plan, offset, len);
+        let t2 = crate::hidstall::now_us();
+        let (same, held_check) = with_unafs(|fs| {
+            let h0 = crate::hidstall::now_us();
+            let same = fs.root_generation() == plan.root_gen && BOUND.lock().as_ref().map(|b| b.epoch) == Some(plan.bound.epoch);
+            (same, crate::hidstall::now_us().saturating_sub(h0))
+        })
+        .map_err(ReadMiss::Mount)?;
+        HELD_MAX_US.fetch_max(held_check, Ordering::Relaxed);
+        let (out, how) = match data {
+            Some(d) if same => (Ok(d), "split"),
+            _ => (locked(path, offset, len), "fallback"),
+        };
+        let t3 = crate::hidstall::now_us();
+        if t3.saturating_sub(t0) >= LINE_MS * 1000 {
+            serial_println!(
+                "[unafslock] read path={} bytes={} held_us={} data_ms={} total_ms={} -> {}",
+                path,
+                out.as_ref().map(|d| d.len()).unwrap_or(0),
+                held_plan.max(held_check),
+                t2.saturating_sub(t1) / 1000,
+                t3.saturating_sub(t0) / 1000,
+                how
+            );
+        }
+        out
+    }
+
+    /// The pre-split read: one `with_unafs` hold, data I/O under MOUNT. Counted.
+    fn locked(path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadMiss> {
+        FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        let (f0, _) = tx_io();
+        let r = with_unafs(|fs| -> Result<Vec<u8>, ReadMiss> {
+            let id = fs.resolve_path(path).map_err(|_| ReadMiss::NoSuchPath)?;
+            let ino = fs.read_inode(id).map_err(|_| ReadMiss::NoSuchPath)?;
+            if ino.kind == ::unafs::FileKind::Directory {
+                return Err(ReadMiss::IsADirectory);
+            }
+            fs.read_data(id, offset, len).map_err(|_| ReadMiss::Failed)
+        });
+        IO_UNDER_LOCK.fetch_add(tx_io().0.wrapping_sub(f0), Ordering::Relaxed);
+        r.map_err(ReadMiss::Mount)?
+    }
+
+    /// The crate's extent walk (`unafs::fs::read_from_extents_via`), step for step, with the block
+    /// fetches batched into contiguous runs and issued with MOUNT released. `None` = take the one-hold
+    /// path (it reproduces the crate's own refusal, if there is one).
+    fn read_extents(p: &Plan, offset: u64, len: u64) -> Option<Vec<u8>> {
+        let bs = ::unafs::BLOCK_SIZE;
+        if p.size > p.bound.span.block_count.saturating_mul(bs) {
+            return None;
+        }
+        let total = len.min(p.size.saturating_sub(offset));
+        let end = offset.checked_add(total)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(usize::try_from(total).ok()?).ok()?;
+        let mut buf = alloc::vec![0u8; (RUN_BLOCKS * bs) as usize];
+        let mut cur = offset;
+        while cur < end {
+            let mut hit = None;
+            let mut next = u64::MAX;
+            for e in &p.chunks {
+                let e_end = e.logical_offset.checked_add(e.length)?;
+                if cur >= e.logical_offset && cur < e_end {
+                    hit = Some((e, e_end));
+                    break;
+                }
+                if e.logical_offset > cur && e.logical_offset < next {
+                    next = e.logical_offset;
+                }
+            }
+            let Some((e, e_end)) = hit else {
+                let gap = (end - cur).min(next.saturating_sub(cur));
+                out.resize(out.len() + gap as usize, 0);
+                cur += gap;
+                continue;
+            };
+            if e.logical_offset % bs != 0 {
+                return None;
+            }
+            let first = e.physical_block.checked_add((cur - e.logical_offset) / bs)?;
+            // The run: blocks first.. while the walk stays in this extent and under `end`.
+            let mut n = 0u64;
+            let mut c = cur;
+            while c < end && c < e_end && n < RUN_BLOCKS {
+                c = (c / bs + 1) * bs;
+                n += 1;
+            }
+            if first.checked_add(n)? > p.bound.span.block_count {
+                return None;
+            }
+            let lba = p.bound.span.base_lba.checked_add(first.checked_mul(8)?)?;
+            let run = &mut buf[..(n * bs) as usize];
+            if !read_run(p.bound.handle, lba, run) {
+                return None;
+            }
+            for i in 0..n {
+                let off = (cur % bs) as usize;
+                let take = (bs as usize - off).min((end - cur) as usize);
+                let at = (i * bs) as usize + off;
+                out.extend_from_slice(&run[at..at + take]);
+                cur += take as u64;
+            }
+        }
+        Some(out)
+    }
+
+    /// `buf.len() / 512` sectors from `lba` on `handle`, the device's own calls, no `TXN_BUSY` latch
+    /// (no transaction is open: a `Busy` here only sends this read to the one-hold path).
+    fn read_run(handle: block::BlockHandle, lba: u64, buf: &mut [u8]) -> bool {
+        #[cfg(feature = "sdhcblk")]
+        if let block::BlockHandle::Sdhc = handle {
+            let per = block::MAX_BLOCKS_PER_OP * 512;
+            for (i, c) in buf.chunks_mut(per).enumerate() {
+                if block::read_blocks_sdhc(lba + (i * block::MAX_BLOCKS_PER_OP) as u64, c).is_err() {
+                    return false;
+                }
+            }
+            return true;
+        }
+        buf.chunks_mut(512).enumerate().all(|(i, c)| matches!(handle_read(handle, lba + i as u64, c), Ok(512)))
+    }
+
+    /// `(ops, held_max_us, io_under_lock, fallbacks)` this boot.
+    pub fn census() -> (u64, u64, u64, u64) {
+        (
+            OPS.load(Ordering::Relaxed),
+            HELD_MAX_US.load(Ordering::Relaxed),
+            IO_UNDER_LOCK.load(Ordering::Relaxed),
+            FALLBACKS.load(Ordering::Relaxed),
+        )
+    }
+
+    // ── `tests unafslock`: a ≤ 4 MiB split read on a worker core against a metadata loop here ────────
+
+    static T_PATH: Mutex<String> = Mutex::new(String::new());
+    static T_LEN: AtomicU64 = AtomicU64::new(0);
+    static T_DONE: AtomicBool = AtomicBool::new(false);
+    static T_OK: AtomicBool = AtomicBool::new(false);
+    static T_HASH: AtomicU64 = AtomicU64::new(0);
+    static T_BYTES: AtomicU64 = AtomicU64::new(0);
+    static T_MS: AtomicU64 = AtomicU64::new(0);
+
+    fn fnv(h: u64, d: &[u8]) -> u64 {
+        d.iter().fold(h, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+    }
+    const FNV0: u64 = 0xcbf2_9ce4_8422_2325;
+
+    fn worker(_: usize) {
+        let path = crate::arch::without_interrupts(|| T_PATH.lock().clone());
+        let t0 = crate::hidstall::now_us();
+        let r = read(&path, 0, T_LEN.load(Ordering::Relaxed));
+        T_MS.store(crate::hidstall::now_us().saturating_sub(t0) / 1000, Ordering::Relaxed);
+        if let Ok(d) = r {
+            T_BYTES.store(d.len() as u64, Ordering::Relaxed);
+            T_HASH.store(fnv(FNV0, &d), Ordering::Relaxed);
+            T_OK.store(true, Ordering::Relaxed);
+        }
+        T_DONE.store(true, Ordering::Release);
+    }
+
+    /// `tests unafslock` (HIDSTALL2, B670): the largest file in `/apps`, up to 4 MiB, read split on a
+    /// worker core while this task runs metadata ops (`resolve_path` + `read_inode`) on the same mount.
+    /// PASS = every MOUNT hold of both ≤ 5 ms, no fetch under MOUNT by the read, at least one
+    /// metadata op completed while the read ran, and the bytes equal a reference read taken first.
+    pub fn selftest() {
+        const CAP: u64 = 4 << 20;
+        let pick = with_unafs(|fs| -> Option<(String, u64)> {
+            let dir = fs.resolve_path("/apps").ok()?;
+            let mut best: Option<(String, u64)> = None;
+            for e in fs.ls(dir).ok()? {
+                if e.kind != ::unafs::FileKind::File {
+                    continue;
+                }
+                if let Ok(i) = fs.read_inode(e.inode_id) {
+                    if best.as_ref().map_or(true, |b| i.size > b.1) {
+                        best = Some((e.name, i.size));
+                    }
+                }
+            }
+            best
+        });
+        let Ok(Some((name, size))) = pick else {
+            serial_println!(":: UNAFSLOCK: SKIP (no native unafs volume, or no file in /apps) ::");
+            return;
+        };
+        let path = format!("/apps/{}", name);
+        let len = size.min(CAP);
+        // The reference: the same bytes in 32 KiB holds (also warms the metadata windows the plan walks).
+        let mut want = FNV0;
+        let mut at = 0u64;
+        while at < len {
+            let n = (len - at).min(32 << 10);
+            let p = path.as_str();
+            match with_unafs(|fs| fs.resolve_path(p).and_then(|id| fs.read_data(id, at, n))) {
+                Ok(Ok(d)) if d.len() as u64 == n => want = fnv(want, &d),
+                _ => {
+                    serial_println!(":: UNAFSLOCK: ops=0 held_max_ms=0 io_under_lock=0 -> FAIL :: why=reference-read path={} at={}", path, at);
+                    return;
+                }
+            }
+            at += n;
+        }
+        let (_, _, io0, fb0) = census();
+        HELD_MAX_US.store(0, Ordering::Relaxed);
+        crate::arch::without_interrupts(|| *T_PATH.lock() = path.clone());
+        T_LEN.store(len, Ordering::Relaxed);
+        T_OK.store(false, Ordering::Relaxed);
+        T_DONE.store(false, Ordering::Release);
+        let here = crate::arch::percpu::this_cpu().cpu_index as usize;
+        let cpu = crate::arch::smp::worker_cpu(0).unwrap_or(here);
+        crate::arch::sched::spawn("unafslock-read", worker, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+        let (mut ops, mut meta_held_max, mut meta_wait_max) = (0u64, 0u64, 0u64);
+        let t0 = crate::arch::ms();
+        while !T_DONE.load(Ordering::Acquire) && crate::arch::ms().saturating_sub(t0) < 30_000 {
+            let s = crate::hidstall::now_us();
+            let h = with_unafs(|fs| {
+                let h0 = crate::hidstall::now_us();
+                let _ = fs.resolve_path("/apps").and_then(|d| fs.read_inode(d));
+                crate::hidstall::now_us().saturating_sub(h0)
+            });
+            let total = crate::hidstall::now_us().saturating_sub(s);
+            if let Ok(h) = h {
+                if !T_DONE.load(Ordering::Acquire) {
+                    ops += 1;
+                }
+                meta_held_max = meta_held_max.max(h);
+                meta_wait_max = meta_wait_max.max(total.saturating_sub(h));
+            }
+            let until = crate::hidstall::now_us() + 2000;
+            while crate::hidstall::now_us() < until {
+                if crate::arch::irqs_masked() { core::hint::spin_loop() } else { crate::hlt() }
+            }
+        }
+        let done = T_DONE.load(Ordering::Acquire);
+        let (_, read_held, io1, fb1) = census();
+        let held_us = read_held.max(meta_held_max);
+        let io_under = io1.wrapping_sub(io0);
+        let fallbacks = fb1.wrapping_sub(fb0);
+        let same = T_OK.load(Ordering::Relaxed) && T_BYTES.load(Ordering::Relaxed) == len && T_HASH.load(Ordering::Relaxed) == want;
+        let pass = done && same && held_us <= 5000 && io_under == 0 && fallbacks == 0 && ops >= 1;
+        serial_println!(
+            ":: UNAFSLOCK: ops={} held_max_ms={} io_under_lock={} -> {} :: path={} bytes={} read_ms={} read_held_us={} meta_held_us={} meta_wait_max_ms={} fallbacks={} match={} done={}",
+            ops,
+            held_us.div_ceil(1000),
+            io_under,
+            if pass { "PASS" } else { "FAIL" },
+            path,
+            len,
+            T_MS.load(Ordering::Relaxed),
+            read_held,
+            meta_held_max,
+            meta_wait_max / 1000,
+            fallbacks,
+            if same { "yes" } else { "no" },
+            if done { "yes" } else { "no" }
+        );
     }
 }
