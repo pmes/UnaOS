@@ -3653,32 +3653,84 @@ fn helpsearch_selftest() {
 
 // ══════════════ FILESEARCH (rmbp-ledger B741, BP-video-36, BP-storage-27) — `tests filesearch` — TAIL-APPENDED ══════════════
 /// The Launcher's Files engine (`video::launcher::filesearch::answer`, the SAME function the field runs per keystroke)
-/// over a RAM UnaFS volume (`MemDevice`, formatted here, never the user's disk): 2000 names in 20 folders of 100, each
+/// over a RAM UnaFS volume (formatted here, never the user's disk): 10 000 names in 100 folders of 100 (FILESEARCH2
+/// B745: a SPARSE RAM device — only the blocks written non-zero are held, so the volume costs its metadata, not its
+/// 256 MiB span; was 2000 names on a 32 MiB `MemDevice`), each
 /// created by `create_files_batch` with its `una:type` (and a photo's `media:taken`) in the same transaction, so the
 /// name index and the facts are the core's own (NAMEINDEXTX B680). Three name queries — `beach` (one exact, two leaf
-/// prefixes, two word prefixes, in that order), `img_0` (248 prefix hits, cut to 20), `qqq` (none); the recent-first
+/// prefixes, two word prefixes, in that order), `img_0` (~250 prefix hits at any index size, cut to 20), `qqq` (none); the recent-first
 /// rule through the opener's own `push_recent` (40 pushes keep 32, a recent name leads its rank and never crosses a
 /// rank); the filters on the stored facts (`beach kind:photo` = 3, `kind:pdf` alone = 20 PDF rows via the attribute
 /// catalog, `img taken:2026` and `taken:2026` alone = 20 rows all taken in 2026). `ms` = the slowest of the three
-/// name queries (whole ms; `us` on the detail line, read against the 2 ms budget — not a verdict leg in QEMU).
-/// `:: FILESEARCH: index=2000 hits_ok=3 recent=ok kind=ok ms=<n> -> PASS ::`
+/// name queries (whole ms; `us` on the detail line); `under=1` = the slowest name query is within the 2 ms budget, a
+/// VERDICT leg (FILESEARCH2). The reveal (Shift-Return) is the Launcher's own `pick` on the first file the root's walk
+/// finds: `[search] reveal path= folder= -> shown=1 selected=1` (`reveal=ok`; `skip` when Quarry declines or is absent;
+/// shown without the selection FAILS).
+/// `:: FILESEARCH: index=10000 hits_ok=3 recent=ok kind=ok ms=<n> under=1 -> PASS ::`
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))]
 fn filesearch_selftest() {
     use crate::video::launcher::filesearch as fsr;
-    use ::unafs::{AttributeValue, BatchFile, MemDevice, UnaFS, BLOCK_SIZE};
+    use ::unafs::storage::Error as DevError;
+    use ::unafs::{AttributeValue, BatchFile, BlockDevice, UnaFS, BLOCK_SIZE};
     use alloc::collections::BTreeMap;
     use alloc::string::String;
     use alloc::vec::Vec;
-    const DIRS: usize = 20;
+    const DIRS: usize = 100;
     const PER: usize = 100;
-    const BLOCKS: u64 = 8192;
-    let fail = |why: &str| serial_println!(":: FILESEARCH: index=0 hits_ok=0 recent=FAIL kind=FAIL ms=0 -> FAIL :: reason={} ::", why);
-    let mut bytes: Vec<u8> = Vec::new();
-    if bytes.try_reserve_exact((BLOCKS * BLOCK_SIZE) as usize).is_err() {
-        return fail("heap");
+    const BLOCKS: u64 = 65536;
+    /// Blocks the sparse device may hold (64 MiB): past it a write is refused, never an abort.
+    const HELD_MAX: usize = 16384;
+    /// FILESEARCH2 (B745): a RAM device that keeps only the blocks written non-zero; an unwritten (or re-zeroed) block
+    /// reads as zeros, which is what a formatted span reads as.
+    struct Sparse {
+        map: BTreeMap<u64, Vec<u8>>,
     }
-    bytes.resize((BLOCKS * BLOCK_SIZE) as usize, 0);
-    let mut fs = match UnaFS::format(MemDevice::from_bytes(bytes), 0) {
+    impl BlockDevice for Sparse {
+        fn read_block(&mut self, id: u64, buf: &mut [u8]) -> Result<(), DevError> {
+            if buf.len() as u64 != BLOCK_SIZE {
+                return Err(DevError::BadBlockSize(buf.len(), BLOCK_SIZE));
+            }
+            if id >= BLOCKS {
+                return Err(DevError::OutOfBounds(id));
+            }
+            match self.map.get(&id) {
+                Some(b) => buf.copy_from_slice(b),
+                None => buf.fill(0),
+            }
+            Ok(())
+        }
+        fn write_block(&mut self, id: u64, buf: &[u8]) -> Result<(), DevError> {
+            if buf.len() as u64 != BLOCK_SIZE {
+                return Err(DevError::BadBlockSize(buf.len(), BLOCK_SIZE));
+            }
+            if id >= BLOCKS {
+                return Err(DevError::OutOfBounds(id));
+            }
+            if buf.iter().all(|&b| b == 0) {
+                self.map.remove(&id);
+                return Ok(());
+            }
+            if let Some(b) = self.map.get_mut(&id) {
+                b.copy_from_slice(buf);
+                return Ok(());
+            }
+            let mut b: Vec<u8> = Vec::new();
+            if self.map.len() >= HELD_MAX || b.try_reserve_exact(BLOCK_SIZE as usize).is_err() {
+                return Err(DevError::AllocRefused(BLOCK_SIZE));
+            }
+            b.extend_from_slice(buf);
+            self.map.insert(id, b);
+            Ok(())
+        }
+        fn block_count(&self) -> u64 {
+            BLOCKS
+        }
+        fn flush(&mut self) -> Result<(), DevError> {
+            Ok(())
+        }
+    }
+    let fail = |why: &str| serial_println!(":: FILESEARCH: index=0 hits_ok=0 recent=FAIL kind=FAIL ms=0 under=0 -> FAIL :: reason={} ::", why);
+    let mut fs = match UnaFS::format(Sparse { map: BTreeMap::new() }, 0) {
         Ok(f) => f,
         Err(_) => return fail("format"),
     };
@@ -3721,7 +3773,8 @@ fn filesearch_selftest() {
         }
     }
     let build_ms = crate::arch::ms().saturating_sub(t_build);
-    let ask = |fs: &mut UnaFS<MemDevice>, q: &str, recent: &[String]| -> (Vec<fsr::Row>, u64) {
+    let held_kb = fs.device.map.len() * (BLOCK_SIZE as usize / 1024);
+    let ask = |fs: &mut UnaFS<Sparse>, q: &str, recent: &[String]| -> (Vec<fsr::Row>, u64) {
         let t0 = crate::hidstall::now_us();
         let rows = match fsr::answer(fs, &fsr::parse(q), recent) {
             Ok(Some(a)) => a.rows,
@@ -3770,15 +3823,32 @@ fn filesearch_selftest() {
     let kind_ok = kind1 && kind2 && kind3 && kind4;
     let worst_us = us1.max(us2).max(us3);
     let ms = worst_us / 1000;
+    let under = worst_us <= fsr::BUDGET_MS * 1000;
+    // The reveal (FILESEARCH2 M1): the Launcher's own pick, Shift latched, on the first file the root's walk finds.
+    #[allow(unused_mut)]
+    let mut reveal = "skip";
+    #[cfg(feature = "quarry")]
+    {
+        let was_open = crate::video::quarry::is_open();
+        let snap = crate::fs::search::snapshot(256);
+        if let Some(h) = snap.hits.iter().find(|h| !h.dir) {
+            fsr::latch_reveal(true);
+            let said = fsr::pick(&h.path, false).unwrap_or_default();
+            reveal = if said.contains("shown=1 selected=1") { "ok" } else if said.contains("shown=1") { "FAIL" } else { "skip" };
+            if !was_open {
+                crate::video::quarry::close();
+            }
+        }
+    }
     serial_println!(
-        "[filesearch] detail build_ms={} blocks={} q_us={}/{}/{} kind_us={} budget_ms={} under={} q1={} q2={} q3={} kinds={}{}{}{} beach={:?}",
-        build_ms, BLOCKS, us1, us2, us3, kind_us, fsr::BUDGET_MS, (worst_us <= fsr::BUDGET_MS * 1000) as u8,
+        "[filesearch] detail build_ms={} blocks={} held_kb={} q_us={}/{}/{} kind_us={} budget_ms={} under={} reveal={} q1={} q2={} q3={} kinds={}{}{}{} beach={:?}",
+        build_ms, BLOCKS, held_kb, us1, us2, us3, kind_us, fsr::BUDGET_MS, under as u8, reveal,
         q1 as u8, q2 as u8, q3 as u8, kind1 as u8, kind2 as u8, kind3 as u8, kind4 as u8, leaves(&r1)
     );
-    let ok = index == DIRS * PER && hits_ok == 3 && recent_ok && kind_ok;
+    let ok = index == DIRS * PER && hits_ok == 3 && recent_ok && kind_ok && under && reveal != "FAIL";
     serial_println!(
-        ":: FILESEARCH: index={} hits_ok={} recent={} kind={} ms={} -> {} ::",
-        index, hits_ok, if recent_ok { "ok" } else { "FAIL" }, if kind_ok { "ok" } else { "FAIL" }, ms, if ok { "PASS" } else { "FAIL" }
+        ":: FILESEARCH: index={} hits_ok={} recent={} kind={} ms={} under={} -> {} ::",
+        index, hits_ok, if recent_ok { "ok" } else { "FAIL" }, if kind_ok { "ok" } else { "FAIL" }, ms, under as u8, if ok { "PASS" } else { "FAIL" }
     );
 }
 

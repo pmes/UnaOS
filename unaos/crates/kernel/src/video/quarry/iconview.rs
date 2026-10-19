@@ -83,8 +83,8 @@ pub(super) fn tag_of(name: &str) -> String {
 }
 
 /// Draw the icon for `path` (`dir` = a folder) `s` px square at `(x, y)` into a `stride`-wide surface of `h`
-/// rows. Shared with Quick Look's card. Returns the source: `appres`, `folder` or `document`.
-pub(super) fn draw_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: usize, s: usize, path: &str, dir: bool, face: crate::video::text::Face) -> &'static str {
+/// rows. Shared with Quick Look's card and the Launcher's Files rows (FILESEARCH2 B745: one painter). Returns the source: `appres`, `folder` or `document`.
+pub(crate) fn draw_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: usize, s: usize, path: &str, dir: bool, face: crate::video::text::Face) -> &'static str {
     if !dir && crate::fs::appres::blit_path_icon(px, stride, h, x, y, s, path) {
         return "appres";
     }
