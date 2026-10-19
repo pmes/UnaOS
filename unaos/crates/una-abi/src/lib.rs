@@ -2943,7 +2943,6 @@ mod a11ytree_tests {
         assert_eq!(a11y_u16(70_000), u16::MAX);
     }
 }
-=======
 // ABIELF (rmbp-ledger B693, BP-bar-13, BP-ring3-15) — THE ABI VERSION. A program built against this crate at
 // version N runs unchanged on every later build: `unaos/fixtures/ABIPROBE-v<N>.ELF` is that program, built ONCE
 // and committed (with its .sha256), staged by the builder as APPS/ABIPROBE.ELF and run by `tests abielf`. The
