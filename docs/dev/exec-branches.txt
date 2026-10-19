@@ -581,7 +581,7 @@ refs/heads/exec-rmbp-focussteal   96ed4711 IN-FLIGHT cloud wave36 FOCUSSTEAL
 refs/heads/exec-rmbp-diskfull     96ed4711 IN-FLIGHT cloud wave36 DISKFULL
 refs/heads/exec-rmbp-appfault     96ed4711 IN-FLIGHT cloud wave36 APPFAULT
 refs/heads/exec-rmbp-tzlocale     96ed4711 IN-FLIGHT cloud wave36 TZLOCALE
-refs/heads/exec-rmbp-camdot       96ed4711 IN-FLIGHT cloud wave36 CAMDOT
+refs/heads/exec-rmbp-camdot       d23b5a72 DONE-awaiting-fold cloud wave36 CAMDOT (B702)
 refs/heads/exec-rmbp-unplug       96ed4711 IN-FLIGHT cloud wave36 UNPLUG
 refs/heads/exec-rmbp-keymaps      96ed4711 IN-FLIGHT cloud wave36 KEYMAPS
 refs/heads/exec-rmbp-a11yfilters  96ed4711 IN-FLIGHT cloud wave36 A11YFILTERS
@@ -595,3 +595,4 @@ refs/heads/exec-rmbp-perfhud      96ed4711 IN-FLIGHT cloud wave36 PERFHUD
 refs/heads/exec-rmbp-autolock     363d83a9 IN-FLIGHT cloud wave36 AUTOLOCK (B712)
 refs/heads/exec-rmbp-zoom         c7bf61ed IN-FLIGHT cloud wave36 ZOOM (B713)
 refs/heads/exec-rmbp-fileversions 73acb28b IN-FLIGHT cloud wave36 FILEVERSIONS (B714)
+refs/heads/exec-rmbp-mtpphone     4312754e IN-FLIGHT cloud wave36 MTPPHONE (B715)
