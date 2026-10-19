@@ -4877,3 +4877,36 @@ pub fn unplug_click() -> bool {
 // UNDOMOVE (rmbp-ledger B716): the one undo journal — every namespace verb's inverse; Ctrl+Z / Ctrl+Shift+Z in `key_route`.
 #[path = "undo.rs"]
 pub mod undo;
+
+// ── FILESEARCH2 (rmbp-ledger B745, BP-video-36) — the reveal selects ─────────────────────────────
+
+/// The Launcher's Shift-Return (`launcher::filesearch::pick`, its service pass): open (or raise) Quarry AT `dir` —
+/// [`open_at`]'s path — AND select `leaf` in the list through the selection model (`list_sel`, the list pane given the
+/// keyboard, `settle` scrolls it into view). `(shown, selected)`: `selected` = the row under the selection after the
+/// settle IS `leaf` (a name past `MAX_LIST`, or gone, selects nothing and says so).
+pub fn open_at_select(dir: &str, leaf: &str) -> (bool, bool) {
+    open();
+    if !is_open() {
+        return (false, false);
+    }
+    let selected = match MODEL.lock().as_mut() {
+        Some(m) => {
+            m.navigate(dir);
+            select_leaf(m, leaf)
+        }
+        None => false,
+    };
+    repaint();
+    wm::focus_changed(OWNER);
+    (true, selected)
+}
+
+/// Select `leaf` in the open folder's list (its exact name first, then ASCII case-insensitive for a FAT name).
+fn select_leaf(m: &mut Model, leaf: &str) -> bool {
+    let at = m.list.iter().position(|e| e.name == leaf).or_else(|| m.list.iter().position(|e| e.name.eq_ignore_ascii_case(leaf)));
+    let Some(i) = at else { return false };
+    m.list_sel = i;
+    m.focus = Pane::List;
+    m.settle();
+    m.list.get(m.list_sel).is_some_and(|e| e.name.eq_ignore_ascii_case(leaf))
+}

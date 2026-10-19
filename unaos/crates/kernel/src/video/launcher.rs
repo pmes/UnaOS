@@ -555,7 +555,7 @@ fn paint(st: &mut St) {
         }
         let ix = pad + 8;
         let iy = y + (lh - ch) / 2;
-        let drew = (it.kind == Kind::Program && crate::fs::appres::blit_key_icon(buf, w, h, ix, iy, ch, &it.icon)) || (it.kind == Kind::File && filesearch::icon(buf, w, h, ix, iy, ch, &it.icon, it.dir)); // FILESEARCH (B741): the kit icon for the file type
+        let drew = (it.kind == Kind::Program && crate::fs::appres::blit_key_icon(buf, w, h, ix, iy, ch, &it.icon)) || (it.kind == Kind::File && filesearch::icon(buf, w, h, ix, iy, ch, &it.target, it.dir)); // FILESEARCH (B741): the file's type icon — FILESEARCH2 (B745): Quarry's painter, by path
         if !drew {
             let mark = match it.kind {
                 Kind::Program => "P",

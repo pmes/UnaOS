@@ -14,19 +14,20 @@
 //!   `taken:<yyyy>` read the facts already stored on the file (`una:type`, `media:taken`, ATTRCOLUMNS B402 /
 //!   RAWCORE B444); a name hit is kept only when its facts agree. A query of filters alone asks the attribute
 //!   catalog (`UnaFS::query`, the same store, R79) — no second index anywhere.
-//! * THE ROW — the kit icon for its type ([`icon`], `draw` primitives over theme tokens), the leaf, its folder.
-//!   Return opens it (the opener dispatch; a folder opens Quarry AT it), Shift-Return reveals it in Quarry
-//!   (Quarry opened at its folder).
+//! * THE ROW — Quarry's own type icon ([`icon`] -> `quarry::live::iconview::draw_icon`, FILESEARCH2 B745: ONE
+//!   painter for a file's icon, the program's sighted icon else the folder / the page with its type tag), the
+//!   leaf, its folder. Return opens it (the opener dispatch; a folder opens Quarry AT it), Shift-Return reveals
+//!   it in Quarry (`quarry::live::open_at_select`: Quarry opened at its folder WITH the file selected).
 //!
 //! Wire: `[search] q=<n chars> hits=<n> ms=<n> us=<n> src=<una-name-index|attr-query|walk|none> cand=<n>` per
-//! keystroke; `[search] reveal path=<p> folder=<f> -> shown=<0|1>`; `[search] open folder=<p> -> shown=<0|1>`.
-//! `tests filesearch` (tests.rs tail) → `:: FILESEARCH: index=2000 hits_ok=3 recent=ok kind=ok ms=<n> -> PASS ::`.
+//! keystroke; `[search] reveal path=<p> folder=<f> -> shown=<0|1> selected=<0|1>`; `[search] open folder=<p> ->
+//! shown=<0|1>`. `tests filesearch` (tests.rs) →
+//! `:: FILESEARCH: index=10000 hits_ok=3 recent=ok kind=ok ms=<n> under=1 -> PASS ::`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::video::theme;
 use crate::fs::search;
 
 /// Rows the Files section shows at most.
@@ -187,7 +188,8 @@ pub fn tier(leaf: &str, words: &[&str]) -> Option<u8> {
 pub struct Row {
     pub path: String,
     pub dir: bool,
-    /// The stored `una:type`, else the extension table's, else empty (the icon's and `kind:`'s input).
+    /// `kind:`'s input: on a filtered query the stored `una:type`, else the extension table's, else empty; on a
+    /// name-only query the extension table's (FILESEARCH2: the icon reads the path, so no per-row attribute read).
     pub mime: String,
     /// 0 exact · 1 prefix · 2 word · 3 filters only.
     pub tier: u8,
@@ -327,14 +329,9 @@ pub fn answer<D: ::unafs::BlockDevice>(fs: &mut ::unafs::UnaFS<D>, p: &Parsed, r
         }
         c.push((row, i));
     }
+    // FILESEARCH2 (B745): no per-row attribute read on a name-only query — the row's icon is Quarry's painter, which
+    // reads the PATH (the program's icon, else the page and its type tag); the keystroke costs the one range scan.
     let mut rows = order(c, recent);
-    if !p.filtered() {
-        // The shown rows' types, for their icons: one attribute read each, at most ROWS_MAX.
-        for r in rows.iter_mut().filter(|r| !r.dir) {
-            let id = fs.resolve_path(&r.path)?;
-            r.mime = facts(fs, id, false)?.0;
-        }
-    }
     for r in rows.iter_mut().filter(|r| !r.dir && r.mime.is_empty()) {
         r.mime = String::from(type_core::by_extension(r.leaf()).unwrap_or(""));
     }
@@ -429,7 +426,8 @@ pub fn latch_reveal(on: bool) {
     REVEAL.store(on, Ordering::Release);
 }
 
-/// Act on a Files row (the Launcher's pass): Shift-Return reveals it in Quarry (Quarry opened at its folder); a
+/// Act on a Files row (the Launcher's pass): Shift-Return reveals it in Quarry (Quarry opened at its folder, the
+/// file selected — FILESEARCH2 B745); a
 /// folder opens Quarry AT it. `None` = an ordinary open: the caller hands the file to the ONE opener dispatch.
 pub fn pick(path: &str, dir: bool) -> Option<String> {
     let reveal = REVEAL.swap(false, Ordering::AcqRel);
@@ -438,9 +436,9 @@ pub fn pick(path: &str, dir: bool) -> Option<String> {
         Some(i) => &path[..i],
     };
     if reveal {
-        let shown = quarry_at(folder);
-        serial_println!("[search] reveal path={} folder={} -> shown={}", path, folder, shown as u8);
-        return Some(alloc::format!("reveal folder={} shown={}", folder, shown as u8));
+        let (shown, selected) = quarry_reveal(folder, search::leaf(path));
+        serial_println!("[search] reveal path={} folder={} -> shown={} selected={}", path, folder, shown as u8, selected as u8);
+        return Some(alloc::format!("reveal folder={} shown={} selected={}", folder, shown as u8, selected as u8));
     }
     if dir {
         let shown = quarry_at(path);
@@ -463,52 +461,32 @@ fn quarry_at(_dir: &str) -> bool {
     false
 }
 
-// ── The kit icon ────────────────────────────────────────────────────────────────────────────────
+/// FILESEARCH2 (B745): the reveal — Quarry at `dir` with `leaf` selected. `(shown, selected)`.
+#[cfg(feature = "quarry")]
+fn quarry_reveal(dir: &str, leaf: &str) -> (bool, bool) {
+    crate::video::quarry::live::open_at_select(dir, leaf)
+}
 
-/// Draw the type icon for a row (`mime`, `dir`) `s` px square at `(x, y)` into a `w`-wide surface of `h` rows,
-/// with the glass kit (`draw`) and theme tokens only: a folder, else a page with its kind's mark.
-pub fn icon(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, s: usize, mime: &str, dir: bool) -> bool {
-    use crate::video::draw::{fill, fill_circle, fill_rrect, line_aa, Rect, Surf, SUB};
+#[cfg(not(feature = "quarry"))]
+fn quarry_reveal(_dir: &str, _leaf: &str) -> (bool, bool) {
+    (false, false)
+}
+
+// ── The icon: Quarry's painter ──────────────────────────────────────────────────────────────────
+
+/// Draw the type icon for a row (`path`, `dir`) `s` px square at `(x, y)` into a `w`-wide surface of `h` rows —
+/// Quarry's own painter (`quarry::live::iconview::draw_icon`, FILESEARCH2 B745: one painter for a file's icon, not
+/// a second one here). `false` = nothing drawn (a build without Quarry, or no room): the Launcher draws its mark.
+#[cfg(feature = "quarry")]
+pub fn icon(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, s: usize, path: &str, dir: bool) -> bool {
     if s < 8 || buf.len() < w * h || x + s > w || y + s > h {
         return false;
     }
-    let mut sf = Surf::new(&mut buf[..w * h], w);
-    let (x, y, s) = (x as i32, y as i32, s as i32);
-    let u = (s / 16).max(1);
-    if dir {
-        fill_rrect(&mut sf, Rect::new(x + u, y + 3 * u, 6 * u, 3 * u), u, theme::accent());
-        fill_rrect(&mut sf, Rect::new(x + u, y + 4 * u, 14 * u, 10 * u), u, theme::accent());
-        fill_rrect(&mut sf, Rect::new(x + u, y + 6 * u, 14 * u, 8 * u), u, theme::accent_tint());
-        return true;
-    }
-    let page = Rect::new(x + 3 * u, y + u, 10 * u, 14 * u);
-    fill_rrect(&mut sf, page, u, theme::line_subtle());
-    fill_rrect(&mut sf, page.inset(1), u, theme::surface_raised());
-    let ink = theme::accent();
-    let (cx, cy) = (x + 8 * u, y + 9 * u);
-    match kind_of(mime, "", false) {
-        FileKind::Photo => {
-            fill_circle(&mut sf, x + 10 * u, y + 5 * u, u + u / 2, ink);
-            line_aa(&mut sf, (x + 4 * u) * SUB, (y + 12 * u) * SUB, (x + 7 * u) * SUB, (y + 8 * u) * SUB, u * SUB, ink);
-            line_aa(&mut sf, (x + 7 * u) * SUB, (y + 8 * u) * SUB, (x + 12 * u) * SUB, (y + 12 * u) * SUB, u * SUB, ink);
-        }
-        FileKind::Pdf => {
-            fill(&mut sf, Rect::new(x + 4 * u, y + 9 * u, 8 * u, 3 * u), ink);
-        }
-        FileKind::Audio => {
-            fill_circle(&mut sf, cx - u, cy + 2 * u, u + u / 2, ink);
-            fill(&mut sf, Rect::new(cx, cy - 4 * u, (u / 2).max(1), 6 * u), ink);
-        }
-        FileKind::Video => {
-            for i in 0..4 * u {
-                fill(&mut sf, Rect::new(cx - 2 * u + i / 2, cy - 2 * u + i / 2, 1, 4 * u - i), ink);
-            }
-        }
-        FileKind::Text | FileKind::Other | FileKind::Folder => {
-            for r in 0..3 {
-                fill(&mut sf, Rect::new(x + 5 * u, y + (5 + 3 * r) * u, 6 * u, (u / 2).max(1)), theme::text_secondary());
-            }
-        }
-    }
+    crate::video::quarry::live::iconview::draw_icon(&mut buf[..w * h], w, h, x, y, s, path, dir, crate::video::text::Face::Ui);
     true
+}
+
+#[cfg(not(feature = "quarry"))]
+pub fn icon(_buf: &mut [u32], _w: usize, _h: usize, _x: usize, _y: usize, _s: usize, _path: &str, _dir: bool) -> bool {
+    false
 }
