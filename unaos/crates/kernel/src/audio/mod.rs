@@ -34,7 +34,7 @@ pub mod mixer;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sink {
     Hda,
-    Usb, #[cfg(all(target_arch = "x86_64", feature = "btc"))] Bt, // A2DP (rmbp-ledger B739): the paired headset, `drivers/bt/avdtp.rs`'s sink (LINE-NEUTRAL fold, code first)
+    Usb, #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] Bt, // A2DP (rmbp-ledger B739): the paired headset, `drivers/bt/avdtp.rs`'s sink (LINE-NEUTRAL fold, code first)
 }
 
 /// Principia key (namespace `system`): `"hda"` or `"usb"`.
@@ -67,7 +67,7 @@ fn chosen() -> u8 {
     match CHOSEN.load(Ordering::Acquire) {
         0 => {
             let v = match crate::prefs::text(PREF_KEY) {
-                Some(s) if s.starts_with("usb") => 2, #[cfg(all(target_arch = "x86_64", feature = "btc"))] Some(s) if s.starts_with("bt") => 3, // A2DP (B739): `bt` (LINE-NEUTRAL fold, code first)
+                Some(s) if s.starts_with("usb") => 2, #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] Some(s) if s.starts_with("bt") => 3, // A2DP (B739): `bt` (LINE-NEUTRAL fold, code first)
                 Some(_) => 1, None => return 1, // CRAWLC: nothing read (the store not loaded yet, or the key unset) is answered, never cached — a kept `usb` read later still counts (BP-audio-2)
             };
             CHOSEN.store(v, Ordering::Release);
@@ -79,7 +79,7 @@ fn chosen() -> u8 {
 
 /// The sink sound goes to now.
 pub fn current() -> Sink {
-    let usb = USB_PRESENT.load(Ordering::Acquire); #[cfg(all(target_arch = "x86_64", feature = "btc"))] if chosen() == 3 && bt_ready() { return Sink::Bt; } // A2DP (B739): a `bt` choice holds while a stream runs (LINE-NEUTRAL fold, code first)
+    let usb = USB_PRESENT.load(Ordering::Acquire); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] if chosen() == 3 && bt_ready() { return Sink::Bt; } // A2DP (B739): a `bt` choice holds while a stream runs (LINE-NEUTRAL fold, code first)
     if usb && (chosen() == 2 || !hda_built()) {
         Sink::Usb
     } else {
@@ -90,7 +90,7 @@ pub fn current() -> Sink {
 /// The sink's name as Settings shows it.
 pub fn label(s: Sink) -> String {
     match s {
-        Sink::Hda => String::from("HDA internal"), #[cfg(all(target_arch = "x86_64", feature = "btc"))] Sink::Bt => bt_label(), // A2DP (B739) (LINE-NEUTRAL fold, code first)
+        Sink::Hda => String::from("HDA internal"), #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] Sink::Bt => bt_label(), // A2DP (B739) (LINE-NEUTRAL fold, code first)
         Sink::Usb => {
             if USB_PRESENT.load(Ordering::Acquire) {
                 let v = USB_ID.load(Ordering::Relaxed);
@@ -106,7 +106,7 @@ pub fn label(s: Sink) -> String {
 pub fn sink(name: &str) -> Result<Sink, &'static str> {
     let s = match name {
         "hda" | "internal" => Sink::Hda,
-        n if n == "usb" || n.starts_with("usb:") => Sink::Usb, #[cfg(all(target_arch = "x86_64", feature = "btc"))] n if n == "bt" || n.starts_with("bt:") => return bt_choose(n), // A2DP (B739): `bt` / `bt:<addr>` (LINE-NEUTRAL fold, code first)
+        n if n == "usb" || n.starts_with("usb:") => Sink::Usb, #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] n if n == "bt" || n.starts_with("bt:") => return bt_choose(n), // A2DP (B739): `bt` / `bt:<addr>` (LINE-NEUTRAL fold, code first)
         _ => return Err("unknown-sink"),
     };
     if s == Sink::Hda && !hda_built() {
@@ -138,7 +138,7 @@ pub fn tone_on(s: Sink, hz: u32, ms: u32) -> Result<(u64, u32), &'static str> {
     serial_println!("[audio] tone sink={} hz={} ms={}", label(s), hz, ms);
     match s {
         Sink::Hda => hda_tone(),
-        Sink::Usb => usb_tone(hz, ms), #[cfg(all(target_arch = "x86_64", feature = "btc"))] Sink::Bt => bt_tone(hz, ms), // A2DP (B739) (LINE-NEUTRAL fold, code first)
+        Sink::Usb => usb_tone(hz, ms), #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] Sink::Bt => bt_tone(hz, ms), // A2DP (B739) (LINE-NEUTRAL fold, code first)
     }
 }
 
@@ -173,7 +173,7 @@ fn sin_q15(phase: u64) -> i32 {
     if quad >= 2 { -s } else { s }
 }
 
-#[cfg(any(feature = "uac", all(target_arch = "x86_64", feature = "btc")))]
+#[cfg(any(feature = "uac", all(target_arch = "x86_64", feature = "a2dp")))]
 pub(crate) fn nap(ms: u64) {
     #[cfg(target_arch = "x86_64")]
     crate::arch::sched::sleep_ms(ms);
@@ -608,20 +608,20 @@ pub fn slot_gone(s: usize) {
 // `audio::sink`'s existing shape, one more arm. Settings > General's Sound picker reads [`outputs`] and presses
 // [`choose`] (a third segment while the device is on a link).
 
-#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
 use crate::drivers::ehci::bthid::avdtp as a2dp;
 
-#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
 fn bt_ready() -> bool {
     a2dp::streaming()
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
 fn bt_label() -> String {
     a2dp::device().unwrap_or_else(|| String::from("BT (none)"))
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
 fn bt_choose(name: &str) -> Result<Sink, &'static str> {
     if !bt_ready() {
         serial_println!("[audio] sink={} REFUSED reason=no-a2dp-stream", name);
@@ -635,7 +635,7 @@ fn bt_choose(name: &str) -> Result<Sink, &'static str> {
 
 /// Settings > General's Sound picker: the labels (HDA, USB, and the A2DP device while one is on a link) and the
 /// selected segment.
-#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
 pub fn outputs() -> (alloc::vec::Vec<String>, usize) {
     let mut v = alloc::vec![label(Sink::Hda), label(Sink::Usb)];
     if let Some(d) = a2dp::device() {
@@ -651,7 +651,7 @@ pub fn outputs() -> (alloc::vec::Vec<String>, usize) {
 }
 
 /// The picker's segment `i` pressed.
-#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
 pub fn choose(i: usize) -> Result<Sink, &'static str> {
     sink(match i {
         0 => "hda",
@@ -662,7 +662,7 @@ pub fn choose(i: usize) -> Result<Sink, &'static str> {
 
 /// The Bluetooth sink: `ms` of an `hz` sine at -18 dBFS with 20 ms fades into the A2DP ring at 44.1 kHz, then the
 /// drain awaited — `usb_tone`'s shape.
-#[cfg(all(target_arch = "x86_64", feature = "btc"))]
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
 fn bt_tone(hz: u32, ms: u32) -> Result<(u64, u32), &'static str> {
     const AMP: i32 = 4096;
     const CHUNK: usize = 245; // frames = 5.6 ms

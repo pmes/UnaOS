@@ -190,3 +190,30 @@ fn round_trip_other_modes() {
         assert!(r[0] > 25.0 && r[1] > 25.0, "{:?} SNR {:?}", mode, r);
     }
 }
+
+/// A2DPKNOB (rmbp-ledger B750): the A2DP specification's recommended SBC encoder settings, the 48 kHz column (the
+/// 44.1 kHz column is in [`kat`], which the kernel runs too): (channel mode, bitpool) -> frame length in bytes and bit
+/// rate in kb/s — middle quality mono 18 -> 44 / 132 and joint stereo 33 -> 79 / 237, high quality mono 29 -> 66 / 198
+/// and joint stereo 51 -> 115 / 345 (16 blocks, 8 subbands, loudness). Each length is also the SBC frame_length
+/// formula worked by hand here, and the header byte is the frame syntax's bit fields. NOT BYTE-EXACT: no
+/// SIG-published SBC frame's bytes are in the tree or on the bench, and none are invented; a byte-exact KAT
+/// against a published frame stays owed.
+#[test]
+fn a2dp_recommended_set_48k() {
+    let set = |mode, bitpool| Config { freq: Freq::F48000, mode, bitpool, ..Config::A2DP_HQ };
+    for (cfg, len, kbps) in [(set(Mode::Mono, 18), 44, 132), (set(Mode::Joint, 33), 79, 237), (set(Mode::Mono, 29), 66, 198), (set(Mode::Joint, 51), 115, 345)] {
+        // frame_length = 4 + (4 x subbands x channels) / 8 + ceil(data bits / 8); data = blocks x channels x bitpool
+        // (mono), subbands + blocks x bitpool (joint stereo).
+        let data = if cfg.mode == Mode::Joint { 8 + 16 * cfg.bitpool as usize } else { 16 * cfg.bitpool as usize };
+        let by_hand = 4 + (4 * 8 * cfg.channels()) / 8 + data.div_ceil(8);
+        assert_eq!((cfg.frame_len(), by_hand), (len, len), "{:?} bitpool {} frame length", cfg.mode, cfg.bitpool);
+        assert_eq!((cfg.bit_rate() + 500) / 1000, kbps, "{:?} bitpool {} bit rate", cfg.mode, cfg.bitpool);
+    }
+    // 48 kHz = 0b11, 16 blocks = 0b11, joint stereo = 0b11, loudness = 0, 8 subbands = 1.
+    let hq = set(Mode::Joint, 51);
+    assert_eq!(hq.header(), [0x9C, 0b1111_1101, 51]);
+    let mut enc = Encoder::new(hq);
+    let mut f = [0u8; 128];
+    assert_eq!(enc.encode(&[0i16; 256], &mut f), 115);
+    assert_eq!(f[..3], [0x9C, 0xFD, 0x33]);
+}
