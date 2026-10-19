@@ -928,3 +928,9 @@ impl XhciController {
         }
     }
 }
+
+/// HWREPORT (rmbp-ledger B725): the slot the isochronous IN pipe (the UVC stream) is open on, 0 = none — `hw::census`'s
+/// read of which device the camera driver holds. Tail-appended.
+pub fn in_slot() -> u8 {
+    PIPE_SLOT.load(core::sync::atomic::Ordering::Relaxed)
+}

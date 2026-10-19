@@ -1170,7 +1170,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         );
         #[cfg(feature = "intel-ivb")]
         crate::drivers::gpu::igpu::print_blt_stats();
-    } // SECSTA2's call site WAS here (rmbp-ledger A1/B113, shut-out register §6 P7) and WIFISWEEP MOVED IT OUT, to `main.rs` immediately after `unaos_kernel::wifi::service()` at each of the three storage-ready passes. The claim that justified this site — "every enumeration walk is above it, and `init_network` → `find_device` is the last of them" — is true of THIS FUNCTION and false of the BOOT: `wifi::bus::census` (`wifi/bus.rs:125`, buses 0..=255, knob `UNAOS_WIFI`) sweeps config space from the main loop, and flight 8 measured it at 23516 ms against this clear at 23263 ms — 253 ms LATER — so the baseline the rung stored was taken before the last walk and `relatch=secsta:2000` could not be attributed. Nothing is left here on purpose: a THIRD clear at this point would print a second `relatch=` that a reader would have to be told to ignore. The move costs this site nothing else — GPACE samples `span` inside this function, so a call that now runs outside it cannot land in `resid` at all; the BSP, the CF8 accessors and the `bar1wedge` knob are unchanged. ⚠ THIS LINE STAYS ONE LINE, statement or no statement: `panic::Location` records embed line numbers, knob-off x86 image byte-identity is this rung's stated invariant, and deleting the line would shift every line below it exactly as adding a cfg'd-OFF block would.
+    } record_functions(); // SECSTA2's call site WAS here (rmbp-ledger A1/B113, shut-out register §6 P7) and WIFISWEEP MOVED IT OUT, to `main.rs` immediately after `unaos_kernel::wifi::service()` at each of the three storage-ready passes. The claim that justified this site — "every enumeration walk is above it, and `init_network` → `find_device` is the last of them" — is true of THIS FUNCTION and false of the BOOT: `wifi::bus::census` (`wifi/bus.rs:125`, buses 0..=255, knob `UNAOS_WIFI`) sweeps config space from the main loop, and flight 8 measured it at 23516 ms against this clear at 23263 ms — 253 ms LATER — so the baseline the rung stored was taken before the last walk and `relatch=secsta:2000` could not be attributed. Nothing is left here on purpose: a THIRD clear at this point would print a second `relatch=` that a reader would have to be told to ignore. The move costs this site nothing else — GPACE samples `span` inside this function, so a call that now runs outside it cannot land in `resid` at all; the BSP, the CF8 accessors and the `bar1wedge` knob are unchanged. ⚠ THIS LINE STAYS ONE LINE, statement or no statement: `panic::Location` records embed line numbers, knob-off x86 image byte-identity is this rung's stated invariant, and deleting the line would shift every line below it exactly as adding a cfg'd-OFF block would.
 }
 
 /// PORTROUTE helper: a USB2 root-port bit set as a comma list without the heap. `invert` lists the
@@ -1190,4 +1190,57 @@ impl core::fmt::Display for PortBits {
         }
         Ok(())
     }
+}
+
+// ── HWREPORT (rmbp-ledger B725) — the PCI registry — TAIL-APPENDED, so no line above moves ──────────────────────────
+// The kernel kept no table of the functions it walked: `PciScanner::scan` returns on the first xHCI, the storage, audio,
+// GPU and radio passes each keep only their class. `record_functions` is the ONE recording walk, run once at the end of
+// `init` on the boot core (outside every GPACE accumulator; the `[PCI-CENSUS]` sweep measured 6 ms for the same reads),
+// with `full_census`'s gate: function 0 absent = device absent, functions 1..7 only under the multi-function bit, config
+// READS only (no BAR sizing, no write). [`functions`] reads the table back for `hw::census`; nothing walks CF8/CFC again.
+
+/// One PCI function the boot's walk saw.
+#[derive(Clone, Copy)]
+pub struct PciFn {
+    pub bus: u8,
+    pub dev: u8,
+    pub func: u8,
+    pub vendor: u16,
+    pub device: u16,
+    pub class: u8,
+    pub sub: u8,
+    pub progif: u8,
+}
+
+static FUNCTIONS: crate::sync::Mutex<alloc::vec::Vec<PciFn>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
+
+/// The functions the boot recorded, in walk order (empty before `init` ran).
+pub fn functions() -> alloc::vec::Vec<PciFn> {
+    FUNCTIONS.lock().clone()
+}
+
+fn record_functions() {
+    let mut out = alloc::vec::Vec::new();
+    for bus in 0u16..256 {
+        for dev in 0u8..32 {
+            if unsafe { read_config_16(bus as u8, dev, 0, 0x00) } == 0xFFFF {
+                continue;
+            }
+            let hdr0 = ((unsafe { read_config_32(bus as u8, dev, 0, 0x0C) } >> 16) & 0xFF) as u8;
+            let max_func: u8 = if (hdr0 & 0x80) != 0 { 7 } else { 0 };
+            for func in 0..=max_func {
+                let vendor = unsafe { read_config_16(bus as u8, dev, func, 0x00) };
+                if vendor == 0xFFFF {
+                    continue;
+                }
+                let device = unsafe { read_config_16(bus as u8, dev, func, 0x02) };
+                let cr = unsafe { read_config_32(bus as u8, dev, func, 0x08) };
+                out.push(PciFn {
+                    bus: bus as u8, dev, func, vendor, device,
+                    class: (cr >> 24) as u8, sub: (cr >> 16) as u8, progif: (cr >> 8) as u8,
+                });
+            }
+        }
+    }
+    *FUNCTIONS.lock() = out;
 }

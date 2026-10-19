@@ -17998,3 +17998,20 @@ fn ptp_dev_class(desc_type: u8, c: u8) -> bool { desc_type == 0x01 && c == 0x06 
 #[cfg(not(feature = "uvc"))]
 #[inline(always)]
 fn ptp_dev_class(_desc_type: u8, _c: u8) -> bool { false }
+// HWREPORT (rmbp-ledger B725): the slot table read back for `hw::census` — TAIL-APPENDED, so no panic `Location` above
+// moves (this file is in the Pi's kernel8.img). One `(slot, port, vid, pid, roles)` per ACTIVE slot; `roles` are the
+// claims the controller itself keeps: bit 0 hub, bit 1 keyboard, bit 2 pointer, bit 3 BOT storage (`storage_ix`). A
+// NON-WAITING loan (`claim`): `Busy` while a transaction holds it (the caller retries off the path), `NotReady` when
+// no controller was installed. Reads only; no transfer is issued.
+pub fn census_slots() -> Result<Vec<(u8, u8, u16, u16, u8)>, XhciClaimError> {
+    let x = claim()?;
+    let mut out = Vec::new();
+    for (i, s) in x.slots.iter().enumerate() {
+        if !s.active {
+            continue;
+        }
+        let roles = (s.is_hub as u8) | ((s.is_keyboard as u8) << 1) | ((s.is_mouse as u8) << 2) | ((x.storage_ix(i as u8).is_some() as u8) << 3);
+        out.push((i as u8, s.port_id, s.vid, s.pid, roles));
+    }
+    Ok(out)
+}
