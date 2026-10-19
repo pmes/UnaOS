@@ -108,9 +108,7 @@ def main():
     if not control(root):
         print("BLUEPRINT: control FAILED — the scanner did not catch the synthetic sheet -> NO VERDICT"); return 2
     if not os.path.isdir(bdir):
-        # The sheets land in the commit after the gate (2026-10-19); until then the gate says so and does not red the
-        # tree. The sheets' commit removes this arm: from then on a missing directory is NO VERDICT (rc=2).
-        print("BLUEPRINT: no docs/dev/blueprint/ directory yet -> OWED (the sheets' commit makes this NO VERDICT)"); return 0
+        print("BLUEPRINT: no docs/dev/blueprint/ directory -> NO VERDICT"); return 2
     names = sorted(n for n in os.listdir(bdir) if n.endswith(".md"))
     sheets = [n for n in names if n != "INDEX.md"]
     if not sheets:
