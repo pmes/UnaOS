@@ -66,10 +66,8 @@ pub fn stamp() {
     let now = crate::arch::ms();
     let prev = LAST_MS.swap(now.max(1), Relaxed);
     PASSES.fetch_add(1, Relaxed);
-    if PUMP_TID.load(Relaxed) == 0 {
-        if let Some(t) = crate::arch::sched::current_id() {
-            PUMP_TID.store(t, Relaxed);
-        }
+    if let Some(t) = crate::arch::sched::current_id() {
+        PUMP_TID.store(t, Relaxed); // GATESTEAL2 (B667): every pass — a restart at the loop head changes the pump's tid
     }
     PUMP_CPU.store(crate::arch::percpu::this_cpu().cpu_index as u64, Relaxed); // GATESTEAL (B657): every pass, not once — the re-home MOVES the pump, and `pump=<tid>@cpu<n>` must read the core it stamps from
     let ig = crate::boot::ignite_ms();
@@ -141,13 +139,14 @@ pub fn look(now: u64) {
         if !FIRED.swap(true, AcqRel) {
             WEDGES.fetch_add(1, Relaxed);
             NEXT_PAINT.store(now + PAINT_EVERY_MS, Relaxed);
-            say(age, GATESTEAL_ACTIVE.load(Acquire)); // GATESTEAL (B657): a wedge the fixture's forced long step makes reads `-> SEEN :: fixture=1`, never a live FAIL
+            say(age, GATESTEAL_ACTIVE.load(Acquire) || WEDGE2_ACTIVE.load(Acquire)); // GATESTEAL (B657): a wedge the fixture's forced long step makes reads `-> SEEN :: fixture=1`, never a live FAIL
             let t = PUMP_TID.load(Relaxed);
             if t != 0 {
                 crate::sync::name_task(t, "PUMPWEDGE: the usb-pump, stopped"); // LOCKREG: its holds and the lock it spins on
             }
             census("wedge"); // SETTERWEDGE (B553): every core's running task and the lock it spins on, once per wedge
             gatesteal_probe(PUMP_CPU.load(Relaxed) as usize); // GATESTEAL (B657): a second NMI sample of the pump's core at the wedge — is it still on the instruction the steal found it on, and masked?
+            wedge_rehome(now); // GATESTEAL2 (B667) M2: a wedge with no steal (flight 36 boot 2, `rehome=none`) restarts the pump too
         } else if now >= NEXT_PAINT.load(Relaxed) {
             NEXT_PAINT.store(now + PAINT_EVERY_MS, Relaxed);
             let mut ln = Line::new();
@@ -607,6 +606,52 @@ static REHOME_TRIES: AtomicU32 = AtomicU32::new(0);
 static REHOME_DEAD: AtomicU64 = AtomicU64::new(u64::MAX);
 static REHOME_LIVE: AtomicU64 = AtomicU64::new(u64::MAX);
 static REHOME_AT: AtomicU64 = AtomicU64::new(0);
+/// GATESTEAL2 (B667) — pump deaths the watch acted on (a steal of its core, or a wedge with no steal).
+static DEATHS: AtomicU32 = AtomicU32::new(0);
+/// GATESTEAL2 — what re-homed the pump last: 0 none, 1 steal, 2 wedge.
+static REHOME_BY: AtomicU32 = AtomicU32::new(0);
+/// GATESTEAL2 — `tests gatesteal2`'s wedge leg is running: its forced wedge reads `-> SEEN :: fixture=1` and still
+/// re-homes (GATESTEAL_ACTIVE, by contrast, keeps the wedge path off GATESTEAL's own fixture).
+static WEDGE2_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// GATESTEAL2 (B667) M2 — the PUMPWEDGE edge's re-home: the steal is not the only way the pump dies (flight 36 boot 2:
+/// parked in net-hda, no gate, no steal, `rehome=none`). Restart it at its loop head on a live core through the
+/// scheduler (`sched::singleton_restart`); the core it left is NOT parked by name — it dispatches — but the service role
+/// follows the pump exactly as after a steal.
+fn wedge_rehome(now: u64) {
+    if !GATESTEAL_REHOME || GATESTEAL_ACTIVE.load(Acquire) {
+        return;
+    }
+    let from = PUMP_CPU.load(Relaxed) as usize;
+    let render = crate::arch::smp::render_cpu();
+    let Some(live) = pick_live(from, render) else { return };
+    if let Some((old, new)) = crate::arch::sched::singleton_restart(from, live) {
+        DEATHS.fetch_add(1, Relaxed);
+        REHOME_BY.store(2, Relaxed);
+        REHOME_DEAD.store(from as u64, Relaxed);
+        REHOME_LIVE.store(live as u64, Relaxed);
+        REHOME_AT.store(now.max(1), Release);
+        if crate::arch::smp::service_cpu() == Some(from) {
+            if let Some(rc) = render {
+                crate::arch::smp::publish_sched_split(rc, live);
+            }
+        }
+        serial_println!(
+            ":: [pump] REHOME: the usb-pump (tid {}) silent on c{} with no steal -> tid {} on c{} at its loop head (GATESTEAL2 B667: rehome=wedge deaths={}) == tripwire ::",
+            old, from, new, live, DEATHS.load(Relaxed)
+        );
+    }
+}
+
+/// GATESTEAL2 — `tests gatesteal2`'s wedge leg on/off (see [`WEDGE2_ACTIVE`]).
+pub fn gatesteal2_wedge_leg(on: bool) {
+    WEDGE2_ACTIVE.store(on, Release);
+}
+
+/// GATESTEAL2 — `(rehome_by, deaths)`: 0 none, 1 steal, 2 wedge.
+pub fn gatesteal2_rehome() -> (u32, u32) {
+    (REHOME_BY.load(Relaxed), DEATHS.load(Relaxed))
+}
 
 /// GATESTEAL — the PAYGO taker (`wm::paygo_service`, bootpace.rs's bootlog step) runs on a `paygo-take` task on a
 /// sibling core, never on the pump. Spawned once, from a scheduled task (the pump); the BSP's inline loop and a leg
@@ -705,29 +750,35 @@ fn gatesteal_rehome_maybe(now: u64) {
         }
     }
     let tries = REHOME_TRIES.fetch_add(1, Relaxed) + 1;
+    if tries == 1 {
+        DEATHS.fetch_add(1, Relaxed); // GATESTEAL2 (B667): one death per steal generation
+        REHOME_BY.store(1, Relaxed);
+    }
     REHOME_DEAD.store(dead as u64, Relaxed);
     REHOME_LIVE.store(live as u64, Relaxed);
     REHOME_AT.store(now.max(1), Release);
     let pump_stuck = r.current == Some(tid);
     serial_println!(
-        ":: [pump] REHOME: c{} is dead and carried the usb-pump (tid {}): moved ready={} sleeping={} left={} current={} -> c{} svc=c{} try={} (GATESTEAL B657: the mailbox's consumer ran on the corpse; the watch re-homes from a live core; the current task is in no queue and stays) == tripwire ::",
-        dead, tid, r.ready, r.sleeping, r.left, r.current.map_or(-1i64, |t| t as i64), live, live, tries
+        ":: [pump] REHOME: c{} is dead and carried the usb-pump (tid {}): moved ready={} sleeping={} left={} current={} moved_current={} -> c{} svc=c{} try={} (GATESTEAL B657: the mailbox's consumer ran on the corpse; the watch re-homes from a live core; GATESTEAL2 B667: the pump in no queue restarts at its loop head) == tripwire ::",
+        dead, tid, r.ready, r.sleeping, r.left, r.current.map_or(-1i64, |t| t as i64), r.moved_current as u8, live, live, tries
     );
     if !pump_stuck || tries >= GATESTEAL_REHOME_TRIES {
         REHOME_GEN_DONE.store(sgen, Release);
     }
 }
 
-/// GATESTEAL — `rehome=` for the PUMPWEDGE line: `ok(pump=<tid>@cpu<n>)` once the pump has STAMPED from a core that
-/// is not the one the steal declared dead, else `none`.
+/// GATESTEAL — `rehome=` for the PUMPWEDGE line: `<steal|wedge>(pump=<tid>@cpu<n>) deaths=<n>` once the pump has
+/// STAMPED from a core that is not the one it was re-homed from, else `none deaths=<n>` (GATESTEAL2 B667).
 fn rehome_word(out: &mut Line) {
     use core::fmt::Write;
     let dead = REHOME_DEAD.load(Relaxed);
     let cpu = PUMP_CPU.load(Relaxed);
+    let deaths = DEATHS.load(Relaxed);
     if REHOME_AT.load(Acquire) != 0 && dead != u64::MAX && cpu != dead {
-        let _ = write!(out, "ok(pump={}@cpu{})", PUMP_TID.load(Relaxed), cpu as i64);
+        let by = if REHOME_BY.load(Relaxed) == 2 { "wedge" } else { "steal" };
+        let _ = write!(out, "{}(pump={}@cpu{}) deaths={}", by, PUMP_TID.load(Relaxed), cpu as i64, deaths);
     } else {
-        let _ = out.write_str("none");
+        let _ = write!(out, "none deaths={}", deaths);
     }
 }
 

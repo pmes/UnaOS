@@ -3924,6 +3924,33 @@ dump, so `./arroyo esp-x86` media carries neither symbol. The probe hangs off
 rather than aarch64's word-then-byte scan: an x86 kernel stack is a `Box<[u8]>`
 with `align: 1`, so an unaligned `read_volatile::<u64>` would be UB.
 
+### 2.ab GATESTEAL2 — the singleton the re-home cannot move restarts at its loop head (x86_64, rmbp-ledger B667)
+
+Flight 36 boot 1: `[pump] REHOME: c7 is dead and carried the usb-pump (tid 9): moved ready=0 sleeping=4 left=0
+current=-1`. `current=-1` is `SCHED[c7].current_tid == 0` (published at dispatch, cleared at every switch-back), so c7
+ran no task at the look, and the pump was in neither queue `rehome_dead_core` drains: it was PARKED on a wait queue
+(`park_blocked`, PARK_WAITQ), holding the compositor gate. It woke on c7 a pass later — c7 dispatches. Boot 2 parked the
+same pump in its net-hda step with no gate and no steal.
+
+The scheduler cannot move such a task: a CURRENT task's registers are live on its CPU (the W5 NMI returns to the same
+rip; there is no stopped frame to copy), and a PARKED task's Box is owned by a waiter list another core may `post()`.
+So the usb-pump registers itself (`singleton_register`, its prologue) and `singleton_restart(from, live)` spawns a
+fresh instance — same name, entry and priority, pinned to `live`, arg = `live` — CASing the registered home so one death
+restarts once. `rehome_dead_core` calls it when the singleton lived on the dead core and was not among the tasks it
+moved; `Rehomed` carries `moved_current` and `restarted`, and `[smpbal] rehome` prints `current=<tid> moved_current=1
+was=<running|parked> new=<tid>`. The old instance is fenced, not killed: `singleton_superseded()` at the pump's loop top
+and at the end of each long step returns `true` to it and it returns from `usb_pump` — a normal exit — printing `[sched]
+singleton revenant tid=<old> exits at its loop head`. The pump's loop allows this because it is a stateless poll (each
+step a one-shot latch or an idempotent service; the prologue's task starts are latched).
+
+Beside it, the pump lane releases the compositor gate around its long steps (`wm::pump_gate_off`/`pump_gate_on`, cores
+sheet BP-cores-16), and `tests gatesteal2` parks the pump on a semaphore at the end of store-services, publishes a
+synthetic death through the steal's gauges, drives the watch and measures the fresh instance's first stamp:
+`:: GATESTEAL2: death=c<n> current=<tid> moved_current=1 rehome=steal pump_alive_ms=<n> gate_released_steps=<n> -> PASS :: … wedge_rehome=wedge …`.
+A wedge with NO steal (flight 36 boot 2) takes the same restart from the pump watch: `sessionwedge::wedge_rehome` on
+the PUMPWEDGE edge calls `singleton_restart` (the core is not parked by name; the service role follows), and PUMPWEDGE
+prints `rehome=<steal|wedge>(pump=<tid>@cpu<n>) deaths=<n>`; `tests gatesteal2`'s second leg drives it (`wedge_rehome=wedge`).
+
 ---
 
 ## 3. Blocking and synchronization primitives

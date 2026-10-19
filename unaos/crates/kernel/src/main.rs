@@ -5878,11 +5878,11 @@ fn x86_typematic_pump() {
 /// per tick — so this is a faithful translation of the service rate and not a boot-pace regression.
 #[cfg(target_arch = "x86_64")]
 fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, two cfg-EXCLUSIVE definitions — this x86 body and the Pi body above; `usb_pump` is gone.
-    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu); #[cfg(feature = "ehcihid")] unaos_kernel::drivers::ehci::hid_task_start(cpu); unaos_kernel::drivers::xhci::poll_task_start(cpu); // QUEUESLEEP (B512): the xHCI input poll gets its own task too, so no step of this loop can hold an xHCI key, click or serial-door byte.  INPUTSTALL2 M2 (B388): the EHCI HID pass gets its own task, so no step of this loop can hold the keyboard and the pad (same-line fold)
+    unaos_kernel::bootlog_println!(":: SCHED-X86: usb-pump task dispatched on core {} ::", cpu); #[cfg(feature = "ehcihid")] unaos_kernel::drivers::ehci::hid_task_start(cpu); unaos_kernel::drivers::xhci::poll_task_start(cpu); unaos_kernel::arch::sched::singleton_register("usb-pump", usb_pump, unaos_kernel::arch::sched::PRIO_NORMAL); // QUEUESLEEP (B512): the xHCI input poll gets its own task too, so no step of this loop can hold an xHCI key, click or serial-door byte.  INPUTSTALL2 M2 (B388): the EHCI HID pass gets its own task, so no step of this loop can hold the keyboard and the pad (same-line fold)
     loop {
         // Nap first: `spawn` puts us on the run queue immediately, and the framebuffer handoff on the
         // BSP is still finishing. One tick costs nothing and keeps the first pass off that seam.
-        unaos_kernel::video::lag::pump_nap(); unaos_kernel::arch::sched::sleep_ticks(1); unaos_kernel::video::lag::pump_top(); #[cfg(feature = "wc")] unaos_kernel::sessionwedge::stamp(); // SESSIONWEDGE (B525): the pump's liveness stamp, every pass — RENDERWEDGE's watch reads it (same-line fold, code first).  QUEUESLEEP (B512): the nap is measured (`pump_what=nap pump_wait=hlt` when the core kept the loop past the tick).  INPUTSTALL2 M1 (B388): each pump step is named by a mark after it (same-line folds), so a stall second says which step held the loop
+        unaos_kernel::video::lag::pump_nap(); unaos_kernel::arch::sched::sleep_ticks(1); if unaos_kernel::arch::sched::singleton_superseded() { return; } unaos_kernel::video::lag::pump_top(); #[cfg(feature = "wc")] unaos_kernel::sessionwedge::stamp(); // SESSIONWEDGE (B525): the pump's liveness stamp, every pass — RENDERWEDGE's watch reads it (same-line fold, code first).  QUEUESLEEP (B512): the nap is measured (`pump_what=nap pump_wait=hlt` when the core kept the loop past the tick).  INPUTSTALL2 M1 (B388): each pump step is named by a mark after it (same-line folds), so a stall second says which step held the loop
         // Poll xHCI, then run any deferred storage work (synchronous BOT transactions run here, in a
         // safe non-event context).
         //
@@ -5937,7 +5937,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // `ui_tick_service()` lands this moves there; the call belongs on a per-pass service body
         // either way, and this task is that body.
         #[cfg(all(target_arch = "x86_64", feature = "smc"))]
-        unaos_kernel::drivers::smc::battery_post(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_TYPEMATIC); // PUMPWITNESS (B518): the SMC accountant runs on its own `smc-batt` task (smc.rs tail); the pump only posts it once
+        unaos_kernel::drivers::smc::battery_post(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_TYPEMATIC); unaos_kernel::video::wm::pump_gate_off(unaos_kernel::video::lag::P_STORE); // PUMPWITNESS (B518): the SMC accountant runs on its own `smc-batt` task (smc.rs tail); the pump only posts it once
         // STOR-1 (irqstorage knob): bring up the interrupt-driven storage service task once a block
         // device is present, then run the `bx-blockreq` self-test once. Both one-shot + gated.
         #[cfg(feature = "irqstorage")]
@@ -5962,7 +5962,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // Like `fatverb_storage_witness`, it sits at ALL THREE storage-ready passes this file carries,
         // because which pass a given build reaches depends on its knobs.
         #[cfg(feature = "holocron")]
-        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); unaos_kernel::pwwire::refresh(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ /* CONSOLEFIX M3: the raw-key echoes' cached LOGIN13 state */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_STORE); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
+        unaos_kernel::fs::holocron::service(); #[cfg(feature = "login")] unaos_kernel::fs::users::service(); #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] unaos_kernel::video::crystal::login::notice_service(); unaos_kernel::pwwire::refresh(); /* CONSOLEFIX M2 (B365): a session notice closes itself on time, a queued one opens without waiting for a key */ /* CONSOLEFIX M3: the raw-key echoes' cached LOGIN13 state */ #[cfg(all(target_arch = "x86_64", feature = "btc"))] unaos_kernel::drivers::ehci::bthid::store_service(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_STORE); if unaos_kernel::arch::sched::singleton_hold_armed() { unaos_kernel::video::wm::composite(); unaos_kernel::arch::sched::singleton_hold_maybe(); } if unaos_kernel::arch::sched::singleton_superseded() { return; } unaos_kernel::video::wm::pump_gate_on(); unaos_kernel::video::wm::pump_gate_off(unaos_kernel::video::lag::P_PRTSCR); // BTHID (B339): the bond store (attributes on <home>/.config/unaos/bt/<addr12>) loads and flushes HERE, outside the EHCI lock, beside holocron. LOGIN M1 — see the first pass. ⚠ LINE-NEUTRAL append.
         // PRTSCR: perform a pending Print Screen capture (`video::prtscr`). Here, beside
         // `probe_once` and `holocron::service`, and for the SAME reason those are here rather
         // than in a driver: the HID decoders detect the key edge while holding their controller
@@ -5972,7 +5972,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // decoder sets a flag; THIS call site does the work. Ungated and arch-neutral, at all
         // THREE storage-ready passes this file carries, because which pass a given build reaches
         // depends on its knobs. Idle cost: one relaxed atomic load per iteration.
-        unaos_kernel::video::prtscr::service(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_PRTSCR);
+        unaos_kernel::video::prtscr::service(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_PRTSCR); if unaos_kernel::arch::sched::singleton_superseded() { return; } unaos_kernel::video::wm::pump_gate_on();
         // PRTSCR-ST (prtscrst knob, default OFF): the capture's BOOT-TIME-WRITE witness — one
         // real capture through the same `capture()` the verb and the key call, then a read-back
         // of what landed on the medium. Here for the same reason `service` is here: it writes the
@@ -6010,7 +6010,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // site. Third of the three storage-ready passes; the forward-only state machine inside makes
         // it speak exactly once whichever pass a given build reaches. Read-only in arc 1.
         #[cfg(all(target_arch = "x86_64", feature = "wifi"))] unaos_kernel::wifi::service();
-        #[cfg(all(target_arch = "x86_64", feature = "wifi", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::note_wifi_census(); #[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::sticky_clear_post_enum(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_WIFI); // WIFISWEEP (rmbp-ledger B113, shut-out register §6 P7): SECSTA2's post-enumeration sticky clear, MOVED here from the tail of `pci::init` — see the note at the second loop site. Third of the three storage-ready passes; both calls latch inside `pcihealth`, so whichever pass a given build reaches, each speaks exactly once. Appended to THIS line, before the comment: knob-off both are cfg-erased and no panic `Location` below moves.
+        #[cfg(all(target_arch = "x86_64", feature = "wifi", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::note_wifi_census(); #[cfg(all(target_arch = "x86_64", feature = "bar1wedge"))] unaos_kernel::drivers::gpu::pcihealth::sticky_clear_post_enum(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_WIFI); unaos_kernel::video::wm::pump_gate_off(unaos_kernel::video::lag::P_BOOTLOG); // WIFISWEEP (rmbp-ledger B113, shut-out register §6 P7): SECSTA2's post-enumeration sticky clear, MOVED here from the tail of `pci::init` — see the note at the second loop site. Third of the three storage-ready passes; both calls latch inside `pcihealth`, so whichever pass a given build reaches, each speaks exactly once. Appended to THIS line, before the comment: knob-off both are cfg-erased and no panic `Location` below moves.
         // GUI-WITNESS M3 (witness knob): re-dump the boot-milestone ring to serial on growth.
         //
         // USBDBG-INVERT — and on `usbdebug` too, which is the ONE service the terminal loop provided
@@ -6023,7 +6023,7 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         // BPACE: re-emit the boot-phase timing ledger whenever it grows. Deliberately NOT under the
         // witness gate — the media `./arroyo esp-x86` writes carries neither `witness` nor
         // `usbdebug`, and this is the only build that reaches the bench.
-        unaos_kernel::bootpace::service_dump(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_BOOTLOG);
+        unaos_kernel::bootpace::service_dump(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_BOOTLOG); if unaos_kernel::arch::sched::singleton_superseded() { return; } unaos_kernel::video::wm::pump_gate_on();
         // FBCON-PACE: retire held console damage on THIS lane too. The usbdebug loop got this call
         // first, but the bench media carries `wc` without `usbdebug` — the console routes and THIS
         // pump is its only always-running service loop, so without the paced hook here a burst's
@@ -6051,9 +6051,9 @@ fn usb_pump(cpu: usize) { // ONEOS5 (R16, LEDGER S7-class row SR21): ONE name, t
         unaos_kernel::drivers::xhci::log_summary_once();
         // FBCON-PACE: the console's present census, once, beside the xHCI summary — same placement
         // and reasoning as the usbdebug loop's copy, because THIS is the loop the bench media runs.
-        unaos_kernel::video::fbcon::console_pace_census_once(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_SUMMARY);
+        unaos_kernel::video::fbcon::console_pace_census_once(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_SUMMARY); unaos_kernel::video::wm::pump_gate_off(unaos_kernel::video::lag::P_NET);
         // Drain any frames the NIC has received into the network stack (no-op with no NIC).
-        unaos_kernel::drivers::e1000::service_net(); #[cfg(all(target_arch = "x86_64", feature = "hda"))] unaos_kernel::drivers::hda::probe_after_root(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_NET); // BOOTSLOW (rmbp-ledger B201): the HDA bring-up and its 1.2 s tone, MOVED here from `arch/x86_64/pci.rs` (flight 12: 7116 -> 8325 ms on the boot core, between the SD card registering and the service loop that binds the root). One-shot, late in the pass, and only once the root pass has its verdict (`fs::bootdisk::root_pass_open`); at all THREE x86 service loops for the root pass's reason. ⚠ LINE-NEUTRAL append on its own cfg (GATE-FC2 lexes one cfg per line).
+        unaos_kernel::drivers::e1000::service_net(); #[cfg(all(target_arch = "x86_64", feature = "hda"))] unaos_kernel::drivers::hda::probe_after_root(); unaos_kernel::video::lag::pump_seg(unaos_kernel::video::lag::P_NET); if unaos_kernel::arch::sched::singleton_superseded() { return; } unaos_kernel::video::wm::pump_gate_on(); // BOOTSLOW (rmbp-ledger B201): the HDA bring-up and its 1.2 s tone, MOVED here from `arch/x86_64/pci.rs` (flight 12: 7116 -> 8325 ms on the boot core, between the SD card registering and the service loop that binds the root). One-shot, late in the pass, and only once the root pass has its verdict (`fs::bootdisk::root_pass_open`); at all THREE x86 service loops for the root pass's reason. ⚠ LINE-NEUTRAL append on its own cfg (GATE-FC2 lexes one cfg per line).
     }
 }
 
