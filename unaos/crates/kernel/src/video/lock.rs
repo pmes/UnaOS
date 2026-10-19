@@ -72,9 +72,12 @@ static CLOCK_MIN: AtomicU64 = AtomicU64::new(0);
 static AFTER_IDLE_MIN: AtomicU32 = AtomicU32::new(IDLE_MIN_DEFAULT);
 static ON_LID: AtomicBool = AtomicBool::new(true);
 static ON_SLEEP: AtomicBool = AtomicBool::new(true);
-/// LOCKPREFS (B748): the PrefChanged count (`prefs_client::CHANGED_N`) and the login generation
-/// (`fs::users::SESSION_GEN`) the policy was last read under; [`prefs_pass`] re-reads when either moved.
+/// LOCKPREFS (B748): the PrefChanged mark (LOCKCHANGED B758: `prefs_client::changed_mark`'s sequence, kept beside
+/// `CHANGED_N`) and the login generation (`fs::users::SESSION_GEN`) the policy was last read under; [`prefs_pass`]
+/// re-reads when the generation moved or a change since the mark named one of the lock's three keys.
 static SEEN_CHANGED: AtomicU32 = AtomicU32::new(0);
+/// LOCKCHANGED (B758): bus GETs [`refresh`] has made (three per re-read; the fixture's `gets=`).
+static GETS: AtomicU32 = AtomicU32::new(0);
 static SEEN_GEN: AtomicU32 = AtomicU32::new(0);
 static PRIMED: AtomicBool = AtomicBool::new(false);
 /// Store writes owed by a Settings press: bit 0 after_idle_min, bit 1 on_lid, bit 2 on_sleep. While any is owed the
@@ -161,29 +164,49 @@ pub fn persist() {
 }
 
 /// LOCKPREFS (B748): the policy's half of a service pass. Re-reads the three keys over the bus when a PrefChanged
-/// landed since the last read (`prefs_client::CHANGED_N`: every accepted store write, whoever wrote it, while a kernel
-/// subscriber is registered — the lock registers itself on its first pass) or the session moved (a login or logout
-/// swaps the store's home and fires no PrefChanged); otherwise three atomic loads and out. While a Settings press is
-/// owed the press is newer than the store: nothing is read and the edge is kept for the pass after [`persist`].
-/// The mark is taken BEFORE the read, so a write that lands mid-read moves the count again and the next pass re-reads.
-/// `true` = it re-read.
+/// landed since the last read (every accepted store write, whoever wrote it, while a kernel subscriber is registered —
+/// the lock registers itself on its first pass) or the session moved (a login or logout swaps the store's home and
+/// fires no PrefChanged); otherwise a few atomic loads and out. While a Settings press is owed the press is newer than
+/// the store: nothing is read and the edge is kept for the pass after [`persist`]. The mark is taken BEFORE the read,
+/// so a write that lands mid-read moves it again and the next pass re-reads. LOCKCHANGED (B758): a change re-reads only
+/// when it named one of the three keys (`prefs_client::changed_since`, the last-changed keys kept beside `CHANGED_N`; a
+/// change the ring lost counts as a hit); any other key's change moves the mark and costs no GET. The edge is CLAIMED
+/// (compare-exchange on the mark, swap on the generation), so two passes never read the same edge. `true` = it re-read.
 pub fn prefs_pass() -> bool {
-    if !PRIMED.load(Ordering::Acquire) {
+    let primed = PRIMED.load(Ordering::Acquire);
+    if !primed {
         crate::prefs_client::subscribe();
     }
     if OWED.load(Ordering::Acquire) != 0 {
         return false;
     }
-    let n = crate::prefs_client::CHANGED_N.load(Ordering::Acquire);
+    let mark = SEEN_CHANGED.load(Ordering::Acquire);
+    let (n, hit) = crate::prefs_client::changed_since(mark, is_lock_key);
     let g = crate::fs::users::SESSION_GEN.load(Ordering::Acquire);
-    if PRIMED.load(Ordering::Acquire) && SEEN_CHANGED.load(Ordering::Relaxed) == n && SEEN_GEN.load(Ordering::Relaxed) == g {
+    if primed && n == mark && SEEN_GEN.load(Ordering::Acquire) == g {
         return false;
     }
-    SEEN_CHANGED.store(n, Ordering::Relaxed);
-    SEEN_GEN.store(g, Ordering::Relaxed);
+    if n != mark && SEEN_CHANGED.compare_exchange(mark, n, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return false; // another pass claimed this edge (and reads it if it was ours)
+    }
+    let gen_moved = SEEN_GEN.swap(g, Ordering::AcqRel) != g;
     PRIMED.store(true, Ordering::Release);
+    if primed && !hit && !gen_moved {
+        return false; // LOCKCHANGED (B758): another key's change — the policy cannot have moved
+    }
     refresh();
     true
+}
+
+/// LOCKCHANGED (B758): `<ns>.<key>` is one of the three keys the lock reads.
+fn is_lock_key(ns: &str, k: &str) -> bool {
+    use crate::prefs::key;
+    ns == crate::prefs::NS && (k == key::LOCK_AFTER_IDLE_MIN || k == key::LOCK_ON_LID || k == key::LOCK_ON_SLEEP)
+}
+
+/// LOCKCHANGED (B758): bus GETs the policy reads have made since boot (three per re-read).
+pub fn gets() -> u32 {
+    GETS.load(Ordering::Relaxed)
 }
 
 /// Read the three keys over the bus (Principia's client; the schema's defaults where unset or out of range) and make
@@ -194,6 +217,7 @@ fn refresh() {
     let m = sys_int(key::LOCK_AFTER_IDLE_MIN, 0, 1440).map_or(IDLE_MIN_DEFAULT, |v| v as u32);
     let lid = sys_flag(key::LOCK_ON_LID).unwrap_or(true);
     let slp = sys_flag(key::LOCK_ON_SLEEP).unwrap_or(true);
+    GETS.fetch_add(3, Ordering::Relaxed);
     if OWED.load(Ordering::Acquire) != 0 {
         return; // a Settings press landed during the read: it is newer than what the store answered
     }
