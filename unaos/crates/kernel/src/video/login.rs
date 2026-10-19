@@ -997,9 +997,9 @@ pub fn consume_key(c: u8) -> bool {
             match f.focus {
                 Focus::Name if LOCKED.load(Ordering::Relaxed) => {} // SCREENLOCK: read-only name
                 Focus::Name => f.name_len = f.name_len.saturating_sub(1),
-                Focus::Password => f.pw_len = f.pw_len.saturating_sub(1),
-                Focus::Retype => f.pw2_len = f.pw2_len.saturating_sub(1),
-                Focus::Old => f.old_len = f.old_len.saturating_sub(1),
+                Focus::Password => f.pw_len = utf8_back(&f.pw, f.pw_len), // KEYCHARS (B718): a whole UTF-8 character
+                Focus::Retype => f.pw2_len = utf8_back(&f.pw2, f.pw2_len),
+                Focus::Old => f.old_len = utf8_back(&f.old, f.old_len),
             }
         }
         b'\n' | b'\r' => submit(),
@@ -3280,7 +3280,7 @@ fn kb_key(c: u8) -> bool {
                         k.wlen = k.wlen.saturating_sub(1);
                     } else {
                         let mut f = FORM.lock();
-                        f.pw_len = f.pw_len.saturating_sub(1);
+                        f.pw_len = utf8_back(&f.pw, f.pw_len); // KEYCHARS (B718)
                     }
                 }
                 0x20..=0x7e => {
@@ -3463,4 +3463,60 @@ fn kb_continue() {
         take_down();
         FORM.lock().state = State::Closed;
     }
+}
+
+// KEYCHARS (rmbp-ledger B718) — TAIL-APPENDED. The PASSWORD fields take a layout CHARACTER (`pal::Event::Char`, at or
+// above U+0080 — `ü`, a dead-key `é`, AltGr `€`), stored as its UTF-8 bytes (the secret is bytes; the hash reads them
+// as typed). Asked by `wc_route_event`'s screen arm, the one that takes every key while the screen is up (BP-input-4),
+// so a character never reaches a ring or the wire. The name field takes ASCII only (account names are), so a
+// character there is swallowed. Backspace drops a whole character ([`utf8_back`]).
+
+/// The length `n` of `buf` after one Backspace: the last UTF-8 character (its continuation bytes and its lead) removed.
+fn utf8_back(buf: &[u8], n: usize) -> usize {
+    let mut n = n.min(buf.len());
+    while n > 0 {
+        n -= 1;
+        if buf[n] & 0xC0 != 0x80 {
+            break;
+        }
+    }
+    n
+}
+
+/// One typed character for the screen; `true` = consumed (the screen is up). Mirrors [`consume_key`]'s belt (the row
+/// heal, the latency stamp, the submit drain and busy check); a power button holding the keyboard takes no text.
+pub fn consume_char(ch: char) -> bool {
+    if !is_open() {
+        return false;
+    }
+    heal_if_row_gone();
+    crate::boot::key_taken();
+    submit_drain();
+    if submit_busy() || PFOCUS.load(Ordering::Relaxed) != 0 {
+        return true;
+    }
+    let mut b = [0u8; 4];
+    let enc = ch.encode_utf8(&mut b).as_bytes();
+    let st = FORM.lock().state;
+    if st == State::Words || (st == State::Unlock && KB.lock().recovery) {
+        return true; // the words screen swallows every key; the recovery words are ASCII
+    }
+    {
+        let mut g = FORM.lock();
+        let f = &mut *g;
+        let unlock = st == State::Unlock;
+        let (buf, len): (&mut [u8; FIELD_MAX], &mut usize) = match f.focus {
+            _ if unlock => (&mut f.pw, &mut f.pw_len),
+            Focus::Password => (&mut f.pw, &mut f.pw_len),
+            Focus::Retype => (&mut f.pw2, &mut f.pw2_len),
+            Focus::Old => (&mut f.old, &mut f.old_len),
+            Focus::Name => return true,
+        };
+        if *len + enc.len() <= FIELD_MAX {
+            buf[*len..*len + enc.len()].copy_from_slice(enc);
+            *len += enc.len();
+        }
+    }
+    repaint();
+    true
 }

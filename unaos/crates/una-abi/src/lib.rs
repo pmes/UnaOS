@@ -1948,7 +1948,7 @@ const _: () = assert!(BUS_VERB_PREF_DECLARE > BUS_VERB_TOAST && BUS_VERB_PREF_DE
 /// Every input-ring event type (`INPUT_EV_*` the ring carries).
 pub const INPUT_EV_ALL: &[u64] = &[
     INPUT_EV_KEY_DOWN, INPUT_EV_KEY_UP, INPUT_EV_MOUSE_REL, INPUT_EV_MOUSE_ABS, INPUT_EV_BUTTON, INPUT_EV_WHEEL,
-    INPUT_EV_ACTION, INPUT_EV_MENU_PICK, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, INPUT_EV_DIALOG_ANSWER, INPUT_EV_DROP,
+    INPUT_EV_ACTION, INPUT_EV_MENU_PICK, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, INPUT_EV_DIALOG_ANSWER, INPUT_EV_DROP, INPUT_EV_CHAR, // KEYCHARS (B718): appended on the list's last line
 ];
 /// Every kernel bus verb tag (the registrable range `>= BUS_VERB_FULFIL_MIN` is the bus's, not listed). The
 /// HOLOCRON band is listed by its two ends; [`codes_unique_u8`] also refuses any other tag inside the band.
@@ -2954,3 +2954,22 @@ mod a11ytree_tests {
 
 /// The una-abi version the tree speaks. `tests abielf` refuses a fixture that claims a higher one.
 pub const ABI_VERSION: u32 = 1;
+
+// KEYCHARS (rmbp-ledger B718, BP-input-19, BP-ring3-16) — A TYPED CHARACTER. Appended at the file tail; no line above
+// moves. ADDITIVE (the ABIELF rule above, BP-ring3-15): a new event code, so ABI_VERSION stays 1 — a program built
+// before it sees an unknown type and falls through its dispatch, exactly as it does for INPUT_EV_WHEEL.
+
+/// Input-ring event: one CHARACTER the live keyboard layout typed (a press edge through the layout's tables, its dead
+/// keys, AltGr and Compose — KEYMAPS B704), at or above U+0080. Payload = the Unicode scalar value (<= 0x10FFFF, so
+/// bit 63 stays clear). A layout character below 0x80 arrives as [`INPUT_EV_KEY_DOWN`] carrying that byte, as every
+/// key did before, so an ASCII reader needs no change. Numbered 13: 12 is [`INPUT_EV_DROP`].
+pub const INPUT_EV_CHAR: u64 = 13;
+
+/// The character an [`INPUT_EV_CHAR`] event carries (`None` for another type or a payload that is not a scalar value).
+pub const fn input_ev_char(ev: u64) -> Option<char> {
+    if input_ev_type(ev) != INPUT_EV_CHAR {
+        return None;
+    }
+    char::from_u32((ev & 0x1F_FFFF) as u32)
+}
+const _: () = assert!(input_ev_pack(INPUT_EV_CHAR, 0x10_FFFF) < (1u64 << 63));

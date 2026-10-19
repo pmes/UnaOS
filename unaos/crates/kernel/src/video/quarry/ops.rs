@@ -1014,3 +1014,45 @@ pub(super) fn cancel_attr_edit() {
 pub(super) fn home_dir() -> String {
     home_base()
 }
+
+// KEYCHARS (rmbp-ledger B718) — TAIL-APPENDED. The edit field takes a layout CHARACTER (`pal::Event::Char`, at or above
+// U+0080) the way `key_pre` takes a printable byte: into the open field, the same 100-byte bound, then a repaint.
+
+/// One typed character into the open edit field (rename, new folder, attribute cell); `false` when no field is open
+/// (the character is not Quarry's). The body `tests keychars` drives is [`edit_char`].
+pub fn key_char(ch: char) -> bool {
+    let took = edit_char(ch);
+    if took {
+        repaint();
+    }
+    took
+}
+
+/// [`key_char`] without the repaint: push `ch` into the open field.
+fn edit_char(ch: char) -> bool {
+    match EDIT.lock().as_mut() {
+        Some(e) => {
+            if e.buf.len() + ch.len_utf8() <= 100 {
+                e.buf.push(ch);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// KEYCHARS fixture: type `chars` into a SCRATCH rename field through [`edit_char`] and hand back what it holds; the
+/// field is closed again. `None` while a person has a field open (it is theirs; nothing is touched).
+pub fn key_char_fixture(chars: &[char]) -> Option<String> {
+    {
+        let mut g = EDIT.lock();
+        if g.is_some() {
+            return None;
+        }
+        *g = Some(Edit { buf: String::new(), target: Target::Rename(String::from("/keychars")) });
+    }
+    for &c in chars {
+        let _ = edit_char(c);
+    }
+    EDIT.lock().take().map(|e| e.buf)
+}

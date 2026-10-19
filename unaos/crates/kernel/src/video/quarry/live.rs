@@ -2234,7 +2234,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     if let crate::pal::Event::Action(a) = ev {
         return is_open() && wm::focus_asid() == OWNER && on_glass() && ops::action(a);
     }
-    let crate::pal::Event::Key(c) = ev else {
+    if let crate::pal::Event::Char(ch) = ev { return is_open() && wm::focus_asid() == OWNER && on_glass() && ops::key_char(ch); } let crate::pal::Event::Key(c) = ev else { // KEYCHARS (B718): a layout character goes to the open edit field (rename, new folder, attribute cell) under the same focus+glass gate as a key; LINE-NEUTRAL, code first
         return false;
     };
     // SO9 — the two facts, read once each, in the order that makes the witness readable.
