@@ -73,10 +73,11 @@ pub use fs::{
 };
 pub use index::CatalogRecord;
 pub use fs::nameindex::{NAME_KEY, NAME_SRC, NameFind, NameHit, NameIndexCheck, name_keys, name_match}; // NAMEINDEX (B432)
+pub use fs::versions::{BOUND_PCT, RING_MAX, VersionCensus, VersionInfo}; // FILEVERSIONS (B714)
 pub use format::{FormatParams, Formatted, format, format_partition};
 pub use fsck::FsckReport;
 pub use keyslot::{KdfParams, KeySlot, KeySlotError, RecoveryWords, Unlock, VolumeKey};
-pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
+pub use inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError, VersionsStore};
 pub use query::{Expr, Predicate, Query, QueryOp, parse_value};
 pub use root::{ROOT_RECORD_SIZE, RootRecord, RootSlot};
 #[cfg(feature = "std")]

@@ -62,6 +62,8 @@ use crate::query::{Expr, Predicate, Query, QueryOp};
 
 #[path = "nameindex.rs"]
 pub mod nameindex; // NAMEINDEX (B432): the volume-wide name index — a child module, so it reaches the private core
+#[path = "versions.rs"]
+pub mod versions; // FILEVERSIONS (B714): an overwrite keeps the old extents as a version of the inode — a child module, so it reaches the private core
 use alloc::collections::BTreeSet;
 #[cfg(feature = "std")]
 use bandy::{BandyMember, SMessage};
@@ -342,6 +344,10 @@ pub struct UnaFS<D: BlockDevice> {
     /// VOLKEY (B684): the key slot read from block 0 sector 1 at mount (`None` = unkeyed). Every rewrite of
     /// block 0 (grow, migration) carries it, so neither can drop a volume's key.
     key_slot: Option<crate::keyslot::KeySlot>,
+    /// FILEVERSIONS (B714): keep a VERSION of a file when a write replaces its data
+    /// ([`set_versioning`](Self::set_versioning); off on a fresh mount — the kernel's bound mount and
+    /// `tools/unafs` turn it on).
+    versioning: bool,
 }
 
 impl<D: BlockDevice> UnaFS<D> {
@@ -433,6 +439,7 @@ impl<D: BlockDevice> UnaFS<D> {
             migrate_pending: false,
             map_budget: crate::refmap::DEFAULT_CACHE_BYTES,
             key_slot: None,
+            versioning: false,
         };
 
         // The reserved system objects, in id order (1..=4).
@@ -553,6 +560,7 @@ impl<D: BlockDevice> UnaFS<D> {
             migrate_pending: loaded.migrate,
             map_budget: crate::refmap::DEFAULT_CACHE_BYTES,
             key_slot,
+            versioning: false,
         };
 
         // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
@@ -1181,7 +1189,7 @@ impl<D: BlockDevice> UnaFS<D> {
         block: &[u8],
     ) -> Result<(Inode, ExtentList), FileSystemError> {
         let (mut inode, trailer) = Inode::decode_block(block)?;
-        let index = match trailer {
+        let mut index = match trailer {
             None => ExtentList::new(),
             Some(t) => {
                 if t.magic != crate::inode::INODE_SPILL_MAGIC {
@@ -1203,6 +1211,16 @@ impl<D: BlockDevice> UnaFS<D> {
                 t.index
             }
         };
+        // FILEVERSIONS (B714): an extent-backed `una:versions` payload is read back here (bounded like the
+        // spill overflow), and its storage joins the returned index — it is inode metadata a snapshot pins.
+        if let Some(store) = &inode.versions_store {
+            inode.versions =
+                Self::read_from_extents_via(device, block_count, &store.index, 0, store.len, store.len)?;
+            if inode.versions.len() as u64 != store.len {
+                return Err(FileSystemError::CorruptVolume("versions payload short"));
+            }
+            index.extend(store.index.iter().cloned());
+        }
         Ok((inode, index))
     }
 
@@ -1210,11 +1228,19 @@ impl<D: BlockDevice> UnaFS<D> {
     /// (empty if inline). Used to release an inode's indirect blocks when its
     /// block is dropped (CoW rewrite or unlink), so the extent list's overflow
     /// storage is never leaked.
+    ///
+    /// FILEVERSIONS (B714): an extent-backed `una:versions` trailer's storage is part of the same set — it
+    /// belongs to the inode BLOCK (every inode write re-encodes it), so it is released, counted and pinned
+    /// exactly where the spill index is.
     pub(crate) fn inode_index_extents_at(&mut self, pb: u64) -> Result<ExtentList, FileSystemError> {
         let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
         self.device.read_block(pb, &mut block)?;
-        let (_inode, trailer) = Inode::decode_block(&block)?;
-        Ok(trailer.map(|t| t.index).unwrap_or_default())
+        let (inode, trailer) = Inode::decode_block(&block)?;
+        let mut out = trailer.map(|t| t.index).unwrap_or_default();
+        if let Some(store) = inode.versions_store {
+            out.extend(store.index);
+        }
+        Ok(out)
     }
 
     /// CoW-write an Inode: fresh block, remap, release the old block (and any
@@ -1260,42 +1286,76 @@ impl<D: BlockDevice> UnaFS<D> {
         } else {
             Vec::new()
         };
+        // FILEVERSIONS (B714): the `una:versions` trailer rides LAST (§R17): inline when it fits beside the
+        // record, else its payload goes to fresh storage blocks and the trailer names them. An inode with no
+        // versions payload has no trailer — its block is byte-identical to before.
+        let inline_vt = if inode.versions.is_empty() { Vec::new() } else { Inode::versions_inline_bytes(&inode.versions) };
         // Fast path: the whole inode fits one block → inline, unchanged bytes.
         match inode.to_bytes() {
-            Ok(bytes) if bytes.len() + meta.len() <= BLOCK_SIZE as usize => {
+            Ok(bytes) if bytes.len() + meta.len() + inline_vt.len() <= BLOCK_SIZE as usize => {
                 let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
                 block[..bytes.len()].copy_from_slice(&bytes);
                 block[bytes.len()..bytes.len() + meta.len()].copy_from_slice(&meta);
+                let at = bytes.len() + meta.len();
+                block[at..at + inline_vt.len()].copy_from_slice(&inline_vt);
                 Ok(block)
             }
-            Ok(_) => {
+            Ok(bytes) if bytes.len() + meta.len() <= BLOCK_SIZE as usize => {
+                let (vt, store) = self.versions_store_trailer(inode)?;
+                if bytes.len() + meta.len() + vt.len() <= BLOCK_SIZE as usize {
+                    let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
+                    let mut off = 0;
+                    for part in [&bytes[..], &meta[..], &vt[..]] {
+                        block[off..off + part.len()].copy_from_slice(part);
+                        off += part.len();
+                    }
+                    return Ok(block);
+                }
                 if !self.superblock.spill_capable() {
+                    self.decref_extents(&store);
                     return Err(InodeError::InodeTooLarge(0, BLOCK_SIZE).into());
                 }
-                self.encode_spilled_inode_block(inode, &meta)
+                self.encode_spilled_inode_block(inode, &meta, vt, store)
             }
-            Err(InodeError::InodeTooLarge(_, _)) => {
+            Ok(_) | Err(InodeError::InodeTooLarge(_, _)) => {
                 if !self.superblock.spill_capable() {
                     // v3 volume: no spill format is declared — reject as before.
                     return Err(InodeError::InodeTooLarge(0, BLOCK_SIZE).into());
                 }
-                self.encode_spilled_inode_block(inode, &meta)
+                let (vt, store) = self.versions_store_trailer(inode)?;
+                self.encode_spilled_inode_block(inode, &meta, vt, store)
             }
             Err(e) => Err(e.into()),
         }
     }
 
+    /// FILEVERSIONS (B714): the extent-backed `una:versions` trailer for `inode` — its payload written to
+    /// fresh blocks (part of the transaction) — and those blocks (for an undo). Empty for no payload.
+    fn versions_store_trailer(&mut self, inode: &Inode) -> Result<(Vec<u8>, ExtentList), FileSystemError> {
+        if inode.versions.is_empty() {
+            return Ok((Vec::new(), ExtentList::new()));
+        }
+        let store = self.allocate_and_write_extents(&inode.versions)?;
+        Ok((Inode::versions_store_bytes(inode.versions.len() as u64, &store), store))
+    }
+
     /// Encode a spilled inode: keep the leading extents inline, serialize the
     /// overflow into indirect blocks, and append the [`IndirectTrailer`].
+    ///
+    /// FILEVERSIONS (B714): `vt` (the extent-backed versions trailer, empty for none) is placed LAST, after
+    /// the spill trailer, and its room is reserved from the inline extents; `vstore` is released on refusal.
     fn encode_spilled_inode_block(
         &mut self,
         inode: &Inode,
         meta: &[u8],
+        vt: Vec<u8>,
+        vstore: ExtentList,
     ) -> Result<Vec<u8>, FileSystemError> {
-        let k = inode.inline_extent_count_with(meta.len())?;
+        let k = inode.inline_extent_count_with(meta.len() + vt.len())?;
         if k >= inode.chunks.len() {
             // The inode is oversized for a reason other than extent count
             // (e.g. attributes) — spilling extents cannot help.
+            self.decref_extents(&vstore);
             return Err(InodeError::InodeTooLarge(0, BLOCK_SIZE).into());
         }
 
@@ -1318,12 +1378,13 @@ impl<D: BlockDevice> UnaFS<D> {
         let inode_bytes = crate::codec::serialize(&stub)?;
         let trailer_bytes = crate::codec::serialize(&trailer)?;
 
-        if inode_bytes.len() + meta.len() + trailer_bytes.len() > BLOCK_SIZE as usize {
+        if inode_bytes.len() + meta.len() + trailer_bytes.len() + vt.len() > BLOCK_SIZE as usize {
             // The index fragmented past the reserve — undo the just-written
             // indirect blocks so nothing leaks, and fail gracefully.
             self.decref_extents(&index);
+            self.decref_extents(&vstore);
             return Err(InodeError::InodeTooLarge(
-                inode_bytes.len() + meta.len() + trailer_bytes.len(),
+                inode_bytes.len() + meta.len() + trailer_bytes.len() + vt.len(),
                 BLOCK_SIZE,
             )
             .into());
@@ -1331,7 +1392,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
         let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
         let mut off = 0;
-        for part in [&inode_bytes[..], meta, &trailer_bytes[..]] {
+        for part in [&inode_bytes[..], meta, &trailer_bytes[..], &vt[..]] {
             block[off..off + part.len()].copy_from_slice(part);
             off += part.len();
         }
@@ -1481,6 +1542,11 @@ impl<D: BlockDevice> UnaFS<D> {
         }
         let blocks = new_size.div_ceil(BLOCK_SIZE);
         let mut map = self.file_block_map(&inode, blocks)?;
+        // FILEVERSIONS (B714): a write that replaces bytes of a file (it starts below the old size) keeps
+        // the old contents as a version — its references are taken BEFORE the loop releases the live ones.
+        let keep = self.versioning && inode.kind == FileKind::File && offset < inode.size;
+        let held = if keep { Some(self.version_hold(&inode)) } else { None };
+        let mut released = 0u64;
 
         let first_touched = offset / BLOCK_SIZE;
         let last_touched = (end - 1) / BLOCK_SIZE;
@@ -1504,6 +1570,7 @@ impl<D: BlockDevice> UnaFS<D> {
             self.write_fresh(nb, &buf)?;
             if old != 0 {
                 self.refmap.decref(&mut self.device, old);
+                released += 1;
             }
             map[idx as usize] = nb;
         }
@@ -1511,7 +1578,13 @@ impl<D: BlockDevice> UnaFS<D> {
         inode.chunks = Self::emit_extents(&map, new_size);
         inode.size = new_size;
         stamp_data(&mut inode);
+        if let Some(h) = held {
+            self.version_keep(&mut inode, h, released)?;
+        }
         self.write_inode(&inode)?;
+        if keep {
+            self.versions_bound()?;
+        }
         Ok(())
     }
 
@@ -1550,10 +1623,16 @@ impl<D: BlockDevice> UnaFS<D> {
         let old_blocks = inode.size.div_ceil(BLOCK_SIZE);
         let keep = new_size.div_ceil(BLOCK_SIZE);
         let mut map = self.file_block_map(&inode, old_blocks)?;
+        // FILEVERSIONS (B714): a shrink replaces the file's contents — keep them as a version (references
+        // taken before the release below).
+        let versioned = self.versioning && inode.kind == FileKind::File;
+        let held = if versioned { Some(self.version_hold(&inode)) } else { None };
+        let mut released = 0u64;
         for idx in keep..old_blocks {
             let pb = map[idx as usize];
             if pb != 0 {
                 self.refmap.decref(&mut self.device, pb);
+                released += 1;
             }
         }
         map.truncate(keep as usize);
@@ -1568,13 +1647,20 @@ impl<D: BlockDevice> UnaFS<D> {
                 let nb = self.alloc_block()?; // NEVER overwrite in place
                 self.write_fresh(nb, &buf)?;
                 self.refmap.decref(&mut self.device, old);
+                released += 1;
                 map[last] = nb;
             }
         }
         inode.chunks = Self::emit_extents(&map, new_size);
         inode.size = new_size;
         stamp_data(&mut inode);
+        if let Some(h) = held {
+            self.version_keep(&mut inode, h, released)?;
+        }
         self.write_inode(&inode)?;
+        if versioned {
+            self.versions_bound()?;
+        }
         self.maybe_commit()
     }
 
@@ -2163,6 +2249,7 @@ impl<D: BlockDevice> UnaFS<D> {
             self.decref_extents(extents);
         }
         self.decref_extents(&inode.chunks);
+        self.versions_release(&inode)?; // FILEVERSIONS (B714): its versions go with it (the ring's storage goes with the inode block below)
         let pb = self.imap.get(inode_id as usize).copied().unwrap_or(0);
         if pb != 0 {
             // Release the inode's indirect (extent-spill) blocks before the
@@ -2556,6 +2643,9 @@ impl<D: BlockDevice> UnaFS<D> {
                 for extents in inode.large_attributes.values() {
                     Self::push_extent_blocks(extents, block_count, &mut blocks)?;
                 }
+                // FILEVERSIONS (B714): a retained root pins its files' versions too (one entry per version,
+                // matching the one reference each holds; the ring's storage is in `index`).
+                Self::push_extent_blocks(&versions::ring_extents(&inode.versions)?, block_count, &mut blocks)?;
                 // v6: the catalog inode owns its two index trees' nodes — a
                 // snapshot pins the index AS-OF, exactly like file data.
                 if inode.id == CATALOG_INODE_ID && self.superblock.indexed() {

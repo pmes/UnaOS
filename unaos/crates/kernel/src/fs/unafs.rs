@@ -449,7 +449,7 @@ pub fn mount_on(handle: block::BlockHandle) -> Result<KernelUnaFS, MountError> {
     partition_witness(handle, &span); #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitread::note_span(handle, &span); // HIDSTALL2 (B670): the span this handle's volume sits at, for the split read (LINE-NEUTRAL append, before this comment)
     let dev = SdSectorDevice::open_on(handle)?;
     let adapter = BlockAdapter::for_partition(dev, &span);
-    keyboot_mount(handle, adapter).map_err(MountError::Fs) // KEYBOOT (B688): the unlocked keyed root re-opens with the key its open mount carries (body at the tail); every other volume is `UnaFS::mount` as before
+    keyboot_mount(handle, adapter).map(versions_armed).map_err(MountError::Fs) // KEYBOOT (B688): the unlocked keyed root re-opens with the key its open mount carries (body at the tail); every other volume is `UnaFS::mount` as before
 }
 
 /// PARTITION (GR9): cross-check the located UnaFS span against the kernel block layer's own MBR
@@ -3451,7 +3451,7 @@ pub fn unlock_root(u: &::unafs::Unlock<'_>) -> Result<(), MountError> {
     let slot = ::unafs::KeySlot::parse(&b0).map_err(|e| MountError::Fs(FileSystemError::KeySlot(e)))?.ok_or(MountError::NoVolume)?;
     let key = slot.unwrap(u).map_err(|e| MountError::Fs(FileSystemError::KeySlot(e)))?;
     let dev = SdSectorDevice::open_on(handle)?;
-    let mut fs = Some(UnaFS::mount_with_key(BlockAdapter::for_partition(dev, &span), &key).map_err(MountError::Fs)?);
+    let mut fs = Some(UnaFS::mount_with_key(BlockAdapter::for_partition(dev, &span), &key).map(versions_armed).map_err(MountError::Fs)?);
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) {
         return Err(MountError::Busy); // RENDERWEDGE's bounded pre-wait, as every MOUNT taker on the render task
@@ -3633,4 +3633,72 @@ pub mod diskfull {
         serial_println!("[fs] full toast vol={} free_mb={} -> {}", vol, kb / 1024, how);
         true
     }
+}
+
+// =================================================================================================
+// FILEVERSIONS (rmbp-ledger B714) — TAIL-APPENDED. The file system keeps the previous contents of a file
+// when a write replaces them (the unafs crate's `fs::versions`, unafs-records.md §R17): BP-bar-14 / research B
+// §6 — an overwrite is never the only copy; local, no cloud, no app support. The kernel's part is the policy
+// and three calls:
+//
+// * the policy: every mount this file builds — `mount_on` (the lazy bind and every rebind) and the keyed
+//   root's `unlock_root` — keeps versions ([`versions_armed`], folded onto those lines);
+// * [`versions_on`] lists a file's versions newest first and prints `[fs] version inode=<n> kept=<n>
+//   bytes=<n>` (bytes = the blocks they cost x 4096); [`read_version_on`] reads one whole;
+//   [`restore_version_on`] makes one the contents again (itself a write that keeps the current contents).
+//
+// The `_on` forms take any mount (the RAM volume of `tests fileversions`); the bare forms run on THE mount
+// under [`with_unafs`]. Paths are the native volume's (the VFS strips its mount prefix).
+// =================================================================================================
+
+pub use ::unafs::VersionInfo;
+
+/// FILEVERSIONS (B714): the kernel's versioning policy on a mount (on).
+pub fn versions_arm<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>) {
+    fs.set_versioning(true);
+}
+
+/// FILEVERSIONS (B714): `mount_on` / `unlock_root`'s fold — the bound mount keeps versions.
+fn versions_armed(mut fs: KernelUnaFS) -> KernelUnaFS {
+    versions_arm(&mut fs);
+    fs
+}
+
+/// FILEVERSIONS (B714): the versions of the file at `path`, newest first; prints the `[fs] version` line.
+pub fn versions_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, path: &str) -> Result<Vec<VersionInfo>, FileSystemError> {
+    let id = fs.resolve_path(path)?;
+    let v = fs.versions(id)?;
+    let blocks = v.iter().fold(0u64, |a, i| a.saturating_add(i.kept_blocks));
+    serial_println!("[fs] version inode={} kept={} bytes={}", id, v.len(), blocks.saturating_mul(::unafs::BLOCK_SIZE));
+    Ok(v)
+}
+
+/// FILEVERSIONS (B714): the whole contents of version `n` (0 = newest) of the file at `path`.
+pub fn read_version_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, path: &str, n: usize) -> Result<Vec<u8>, FileSystemError> {
+    let id = fs.resolve_path(path)?;
+    let size = fs.versions(id)?.get(n).map(|i| i.size).ok_or(FileSystemError::NotFound)?;
+    fs.read_version(id, n, 0, size)
+}
+
+/// FILEVERSIONS (B714): make version `n` (0 = newest) the contents of the file at `path` again.
+pub fn restore_version_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, path: &str, n: usize) -> Result<(), FileSystemError> {
+    let id = fs.resolve_path(path)?;
+    let r = fs.restore_version(id, n);
+    serial_println!("[fs] version restore inode={} n={} ok={}", id, n, r.is_ok() as u8);
+    r
+}
+
+/// FILEVERSIONS (B714): [`versions_on`] on THE mount (`None`: no volume, or no such file).
+pub fn versions(path: &str) -> Option<Vec<VersionInfo>> {
+    with_unafs(|fs| versions_on(fs, path).ok()).ok().flatten()
+}
+
+/// FILEVERSIONS (B714): [`read_version_on`] on THE mount.
+pub fn read_version(path: &str, n: usize) -> Option<Vec<u8>> {
+    with_unafs(|fs| read_version_on(fs, path, n).ok()).ok().flatten()
+}
+
+/// FILEVERSIONS (B714): [`restore_version_on`] on THE mount (`true` once committed).
+pub fn restore_version(path: &str, n: usize) -> bool {
+    matches!(with_unafs(|fs| restore_version_on(fs, path, n).is_ok()), Ok(true))
 }

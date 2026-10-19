@@ -76,6 +76,14 @@ pub struct FsckReport {
     /// are missing / stale (repair reindexes). Empty when the index is unbuilt.
     pub name_index_missing: Vec<u64>,
     pub name_index_stale: Vec<u64>,
+    /// FILEVERSIONS (B714): versions kept, counted off every file's ring (each holds one reference on
+    /// every block it names — the walk counts them, so a kept version is never a leak).
+    pub versions: u64,
+    /// FILEVERSIONS (B714): the blocks those versions cost (the rings' `kept` summed).
+    pub version_blocks: u64,
+    /// FILEVERSIONS (B714): the volume's version ledger disagrees with the rings (an older build rewrote
+    /// the reclaim-queue inode and dropped it); repair rewrites it from the rings.
+    pub version_ledger_stale: bool,
 }
 
 impl FsckReport {
@@ -86,6 +94,7 @@ impl FsckReport {
             && self.bad_parent_links.is_empty()
             && self.name_index_missing.is_empty()
             && self.name_index_stale.is_empty()
+            && !self.version_ledger_stale
             && !self.dirty_journal
     }
 }
@@ -148,6 +157,8 @@ impl<D: BlockDevice> UnaFS<D> {
 
         let link_faults = self.parent_link_faults()?;
         let names = self.name_index_check()?;
+        let census = self.version_census()?; // FILEVERSIONS (B714)
+        let ledger_stale = self.version_ledger().map(|l| l.rows != census.rows).unwrap_or(true);
 
         let mut report = FsckReport {
             dirty_journal: false,
@@ -161,6 +172,9 @@ impl<D: BlockDevice> UnaFS<D> {
             bad_parent_links: link_faults.iter().map(|f| f.0).collect(),
             name_index_missing: names.missing.clone(),
             name_index_stale: names.stale.clone(),
+            versions: census.versions,
+            version_blocks: census.kept,
+            version_ledger_stale: ledger_stale,
         };
 
         if !repair {
@@ -183,6 +197,12 @@ impl<D: BlockDevice> UnaFS<D> {
         // names is rebuilt (one commit of its own; the refcount rebuild below re-walks after it).
         if !names.missing.is_empty() || !names.stale.is_empty() {
             self.reindex_names()?; // its own commit: a consistent root either side
+        }
+
+        // Phase 1d (FILEVERSIONS B714): the ledger rewritten from the rings (before the refcount rebuild,
+        // which re-walks after it — the rewrite moves the reclaim inode's block).
+        if ledger_stale {
+            self.version_ledger_rebuild(&census)?;
         }
 
         // Phase 2: re-walk and rebuild the refcount map to the computed
@@ -265,6 +285,11 @@ impl<D: BlockDevice> UnaFS<D> {
                 for e in extents {
                     Self::bump_extent(e, block_count, &mut counts);
                 }
+            }
+            // FILEVERSIONS (B714): every kept version holds one reference on each block it names (the
+            // ring's own storage is in the index above).
+            for e in &crate::fs::versions::ring_extents(&inode.versions)? {
+                Self::bump_extent(e, block_count, &mut counts);
             }
         }
         // v6: the catalog's two index trees are owned by the catalog inode.
