@@ -165,7 +165,7 @@ pub enum Action {
     WinSizeLeft,
     WinSizeRight,
     WinSizeUp,
-    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */, QuitApp /* APPMENU2: ⌘Q, code 42 */, CloseWindow /* APPMENU2: ⌘W, code 43 */, HideApp /* APPMENU2: ⌘H, code 44 */, OpenSettings /* APPMENU2: ⌘, code 45 */, ForceQuit /* APPMENU2: ⌘⌥Esc, code 46 */, ClearView /* LUMENBIN: ⌘K — clear the focused view (LUMEN.ELF's transcript), code 41 */, GetInfo /* ATTRCOLUMNS (B402): ⌘I — Quarry's Get Info, code 47 */, Launcher /* LAUNCHER (B417): ⌘Space, code 48 (the arc wrote 47; renumbered at merge17) */, Interrupt /* SHELLTASK2 (B474): ⌘. — abort the shell window's running command (Ctrl-C's twin), code 49 */,
+    WinSizeDown, Minimize /* WINDOWLIST: ⌘M, code 39 */, CycleApp /* WINDOWLIST: ⌘` — next window of the SAME app, code 40 */, QuitApp /* APPMENU2: ⌘Q, code 42 */, CloseWindow /* APPMENU2: ⌘W, code 43 */, HideApp /* APPMENU2: ⌘H, code 44 */, OpenSettings /* APPMENU2: ⌘, code 45 */, ForceQuit /* APPMENU2: ⌘⌥Esc, code 46 */, ClearView /* LUMENBIN: ⌘K — clear the focused view (LUMEN.ELF's transcript), code 41 */, GetInfo /* ATTRCOLUMNS (B402): ⌘I — Quarry's Get Info, code 47 */, Launcher /* LAUNCHER (B417): ⌘Space, code 48 (the arc wrote 47; renumbered at merge17) */, Interrupt /* SHELLTASK2 (B474): ⌘. — abort the shell window's running command (Ctrl-C's twin), code 49 */, Start /* WINKEY (B665): the Windows key ALONE — RING-3 DELIVERY ONLY, code 50; no row binds it, no decoder emits it yet, and it is NOT Start's trigger (the tap counter below is: `tap_track` → `startmenu::key_service`) */,
 }
 
 impl Action {
@@ -209,7 +209,7 @@ impl Action {
             Action::WinSizeLeft => "win-size-left",
             Action::WinSizeRight => "win-size-right",
             Action::WinSizeUp => "win-size-up",
-            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", Action::ClearView => "clear-view", Action::QuitApp => "quit-app", Action::CloseWindow => "close-window", Action::HideApp => "hide-app", Action::OpenSettings => "open-settings", Action::ForceQuit => "force-quit", Action::GetInfo => "get-info", Action::Launcher => "launcher", Action::Interrupt => "interrupt", // WINDOWLIST · LUMENBIN · APPMENU2 · ATTRCOLUMNS
+            Action::WinSizeDown => "win-size-down", Action::Minimize => "minimize", Action::CycleApp => "cycle-app", Action::ClearView => "clear-view", Action::QuitApp => "quit-app", Action::CloseWindow => "close-window", Action::HideApp => "hide-app", Action::OpenSettings => "open-settings", Action::ForceQuit => "force-quit", Action::GetInfo => "get-info", Action::Launcher => "launcher", Action::Interrupt => "interrupt", Action::Start => "start", // WINKEY (B665) · WINDOWLIST · LUMENBIN · APPMENU2 · ATTRCOLUMNS
         }
     }
 
@@ -546,9 +546,9 @@ pub fn command_held() -> bool {
 // THE WINDOWS KEY is a bare TAP of the key that plays it (down and up with no other modifier and no key between):
 // [`tap_track`] (from `note_mods`, every HID report) and [`note_keys`] (from `resolve_edge`) count it, and the look's
 // service pass (`softy::startmenu::key_service`) toggles Start — never the decoder, which runs where a window may
-// not open. A key edge while it is held spoils the tap (Win+E is a chord, not Start). No `Action` variant carries
-// it: three exhaustive matches outside this lane (smallfix3.rs `ACTIONS`/`listed`, clipboard.rs `terminal_action`
-// and `action_code`, a ring-3 ABI number) would each need a row — SOFTY2's report names them.
+// not open. A key edge while it is held spoils the tap (Win+E is a chord, not Start). WINKEY (B665, seat's path (b)):
+// `Action::Start` (ring-3 code 50) now exists for RING-3 DELIVERY ONLY — the decoders do not emit it (a tap completes on a
+// modifier-only report, where no key edged and the non-capture arm never runs); THIS COUNTER stays Start's one trigger.
 
 /// Softy is the look (`video::look`, a desktop image's module; Una everywhere else).
 #[inline]
@@ -724,4 +724,27 @@ pub fn softy2_selftest() -> (bool, bool, bool, bool) {
     HID_MODS_LAST.store(mods0, Relaxed);
     START_TAPS.store(taps0, Relaxed);
     (softy_mac_ok, una_pc_ok, tap_ok, spoil_ok)
+}
+
+// ══════════════ WINKEY (rmbp-ledger B665) — the fixture's driver — TAIL-APPENDED ══════════════
+
+/// WINKEY's fixture driver: ONE press of the key that plays the Windows role on the live look and keyboard
+/// ([`start_role`]), driven through [`note_mods`] (and, for `chord`, [`resolve_edge`] with an `e` edge between the down
+/// and the up) exactly as a decoder drives them. The counted tap (if any) is LEFT for the caller's service pass; the
+/// last modifier byte and the detector's state are restored. Under the Una look the role is 0 and nothing is counted.
+pub fn winkey_drive(chord: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mods0 = HID_MODS_LAST.load(Relaxed);
+    let role = start_role();
+    let none = [0u8; 6];
+    let mut e = [0u8; 6];
+    e[0] = 0x08; // `e`
+    note_mods(0);
+    note_mods(role);
+    if chord {
+        let _ = resolve_edge(active(), &e, &none, role);
+    }
+    note_mods(0);
+    TAP.store(0, Relaxed);
+    HID_MODS_LAST.store(mods0, Relaxed);
 }

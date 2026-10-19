@@ -883,7 +883,8 @@ fn act(t: u16) {
     }
 }
 
-/// **The key door** (owed in x86's `wc_route_event`, SOFTY.md): Esc closes an open flyout. `true` = consumed.
+/// **The key door** (asked from x86's `wc_route_event` door chain since WINKEY, B665): Esc closes an open flyout. `true` =
+/// consumed. ESC ONLY — it never toggles Start (the Windows-key tap reaches Start through [`key_service`] alone).
 pub fn key_door(ev: crate::pal::Event) -> bool {
     if open_kind() == 0 {
         return false;
@@ -968,4 +969,68 @@ fn key_service() {
     if was != 0 && was != p {
         crate::video::keymap::announce("look");
     }
+}
+
+/// WINKEY (rmbp-ledger B665) — `tests winkey`, on the running desktop with Softy on the glass; restores the look it found.
+/// Start's ONE trigger is the tap counter (`keymap::tap_track` → [`key_service`]); the door ([`key_door`]) is Esc only.
+///
+/// * `tap=` — one bare press-and-release of the Windows-role key (`keymap::winkey_drive`), then one service pass: Start
+///   is open (`open`), exactly once.
+/// * `tap2=` — a second tap and pass: closed.
+/// * `chord=` — the key down, an `e` edge, the key up (Win+E): the pass leaves Start closed (`ignored`).
+/// * `esc=` — a tap opens Start; the door refuses `Action::Start` (it never toggles) and takes Esc (`Key(0x1B)`), which
+///   closes it (`closed`).
+/// * `una=` — under the Una look the same tap counts nothing and the pass opens nothing (`ignored`).
+/// * `action_code=` — `clipboard::action_code(Action::Start)`, the ring-3 `INPUT_EV_ACTION` payload (50).
+///
+/// `:: WINKEY: tap=open tap2=closed chord=ignored esc=closed una=ignored action_code=50 -> PASS ::`.
+#[cfg(feature = "witness")]
+pub fn winkey_selftest() {
+    use crate::video::{keymap, look};
+    if panel().is_none() {
+        serial_println!(":: WINKEY: -> SKIP :: reason=no-panel");
+        return;
+    }
+    #[cfg(feature = "login")]
+    if !crate::video::desktopbuild::built() {
+        serial_println!(":: WINKEY: -> SKIP :: reason=no-desktop (the furniture is built at login)");
+        return;
+    }
+    let was = look::current();
+    let _ = close("tests");
+    let _ = look::set(look::Look::Softy, "tests");
+    let role = keymap::start_role_name();
+    let _ = keymap::take_start_taps();
+    let _ = keymap::take_esc_edges();
+    let tap = |chord: bool| {
+        keymap::winkey_drive(chord);
+        key_service();
+        open_kind()
+    };
+    let tap_ok = tap(false) == 1;
+    let tap2_ok = tap(false) == 0;
+    let chord_ok = tap(true) == 0;
+    let esc_open = tap(false) == 1;
+    let door_no_toggle = !key_door(crate::pal::Event::Action(keymap::Action::Start)) && open_kind() == 1;
+    let esc_ok = esc_open && door_no_toggle && key_door(crate::pal::Event::Key(0x1B)) && open_kind() == 0;
+    let _ = close("tests");
+    let _ = look::set(look::Look::Una, "tests");
+    let una_ok = tap(false) == 0;
+    let _ = close("tests");
+    let _ = look::set(was, "tests");
+    let _ = keymap::take_start_taps();
+    let _ = keymap::take_esc_edges();
+    let code = crate::video::clipboard::action_code(keymap::Action::Start);
+    let pass = tap_ok && tap2_ok && chord_ok && esc_ok && una_ok && code == 50;
+    serial_println!(
+        ":: WINKEY: tap={} tap2={} chord={} esc={} una={} action_code={} -> {} :: role={}",
+        if tap_ok { "open" } else { "no" },
+        if tap2_ok { "closed" } else { "no" },
+        if chord_ok { "ignored" } else { "opened" },
+        if esc_ok { "closed" } else { "no" },
+        if una_ok { "ignored" } else { "opened" },
+        code,
+        if pass { "PASS" } else { "FAIL" },
+        role
+    );
 }
