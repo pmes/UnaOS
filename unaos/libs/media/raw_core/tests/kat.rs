@@ -177,7 +177,7 @@ fn craw_delta_block_by_layout() {
     let odd = [500u32; 16];
     let mut row = block(&even).to_vec();
     row.extend_from_slice(&block(&odd));
-    let s = raw_core::Strip { width: 32, height: 1, bits: 8, compression: 32767, offset: 0, len: 32, cfa: [0, 1, 1, 2], black: 0, white: 0, curve: None, le: true };
+    let s = raw_core::Strip { width: 32, height: 1, bits: 8, compression: 32767, offset: 0, len: 32, cfa: [0, 1, 1, 2], black: 0, white: 0, curve: None, le: true, ..Default::default() };
     let d = RowDecoder::new(&s).unwrap();
     assert_eq!(d.coding(), "craw");
     let mut out = [0u16; 32];
@@ -249,4 +249,167 @@ fn half_size_develop_no_preview() {
     // Too small to halve, and a short mosaic: refused, never a panic.
     assert!(half_rgba(&m[..1], 1, 1, &s.cfa, &tone).is_err());
     assert_eq!(half_rgba(&m[..10], 64, 32, &s.cfa, &tone).err(), Some(Error::Truncated));
+}
+
+// ── RAWCOLOR (B724): the colour matrix, Canon CR2, Nikon NEF ──────────────────────────────────────────────────
+
+use raw_core::synth::{Cr2Opts, NefCoding};
+use raw_core::{matrix, Fmt, MatrixSource, SliceSource};
+
+#[test]
+fn colour_matrix_sources_and_inverse() {
+    // The table: the synthetic ARW's ILCE-7M3 takes dcraw's first prefix match, the ILCE-7 row.
+    let f = synth::arw(16, 16, &synth::ramp(16, 16), Coding::Plain14);
+    let i = parse(&f).unwrap();
+    assert_eq!(i.fmt, Fmt::Arw);
+    assert_eq!(i.matrix_source, Some(MatrixSource::Table));
+    let row7 = matrix::table(Some("SONY"), Some("ILCE-7")).unwrap();
+    assert_eq!(row7, [5271, -712, -347, -6153, 13653, 2763, -1601, 2366, 7242]);
+    assert_eq!(i.matrix, matrix::from_table(&row7));
+    assert_eq!(matrix::table(Some("SONY"), Some("ILCE-7RM3")), matrix::table(Some("SONY"), Some("ILCE-7R")), "prefix-first, as dcraw");
+    assert_eq!(matrix::table(Some("Canon"), Some("ILCE-7")), None, "Sony rows only");
+    // Every carried row: rows sum to exactly Q, and rgb_cam inverts the row-normalised cam_rgb.
+    for (name, row) in matrix::SONY {
+        let m = matrix::from_table(row).unwrap_or_else(|| panic!("{name}"));
+        let mut cam_rgb = [[0.0f64; 3]; 3];
+        for r in 0..3 {
+            for c in 0..3 {
+                cam_rgb[r][c] = (0..3).map(|k| row[r * 3 + k] as f64 / 10000.0 * matrix::XYZ_RGB[k][c]).sum();
+            }
+            let n: f64 = cam_rgb[r].iter().sum();
+            cam_rgb[r].iter_mut().for_each(|v| *v /= n);
+        }
+        for r in 0..3 {
+            assert_eq!(m[r].iter().sum::<i32>(), matrix::Q, "{name} row {r}");
+            for c in 0..3 {
+                let p: f64 = (0..3).map(|k| m[r][k] as f64 / matrix::Q as f64 * cam_rgb[k][c]).sum();
+                let want = if r == c { 1.0 } else { 0.0 };
+                assert!((p - want).abs() < 4e-3, "{name} ({r},{c}) = {p}");
+            }
+        }
+    }
+    // The DNG tag outranks the table: ColorMatrix2 = the ILCE-7R row -> matrix=dng, the 7R matrix.
+    let row7r = matrix::table(Some("SONY"), Some("ILCE-7R")).unwrap();
+    let f = synth::arw_with(16, 16, &synth::ramp(16, 16), Coding::Plain14, Opts { color_matrix2: Some(row7r.map(|v| v as i32)), ..Opts::default() });
+    let i = parse(&f).unwrap();
+    assert_eq!((i.matrix_source, i.matrix), (Some(MatrixSource::Dng), matrix::from_table(&row7r)));
+    assert_eq!(MatrixSource::name(i.matrix_source), "dng");
+    assert_eq!(MatrixSource::name(None), "none");
+    // A singular matrix is refused.
+    assert_eq!(matrix::from_table(&[0; 9]), None);
+}
+
+#[test]
+fn colour_matrix_develop_keeps_grey_and_saturates() {
+    let lv = [2048u16, 1024, 1024, 1536];
+    let (w, h) = (64u32, 32u32);
+    let f = synth::arw_with(w, h, &synth::grey(w, h, lv), Coding::Plain14, Opts { preview: false, wb_rggb: Some(lv), ..Opts::default() });
+    let info = parse(&f).unwrap();
+    let s = info.strip.clone().unwrap();
+    let d = RowDecoder::new(&s).unwrap();
+    let m = d.all(&f[s.offset as usize..(s.offset + s.len) as usize]).unwrap();
+    let mat = info.matrix.expect("table matrix");
+    let tone = WbTone::with_matrix(s.black, s.white, d.max_code, info.wb.as_ref(), Some(&mat)).unwrap();
+    let plain = WbTone::new(s.black, s.white, d.max_code, info.wb.as_ref()).unwrap();
+    let (a, ..) = half_rgba(&m, w as usize, h as usize, &s.cfa, &tone).unwrap();
+    let (b, ..) = half_rgba(&m, w as usize, h as usize, &s.cfa, &plain).unwrap();
+    for (p, q) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        assert_eq!((p[0], p[1]), (p[2], p[2]), "a white-balanced grey stays grey through the matrix (rows sum to Q)");
+        assert!((p[1] as i32 - q[1] as i32).abs() <= 1);
+    }
+    // Camera red alone: the matrix pushes R up (its diagonal is above one) and a negative off-diagonal clips to zero.
+    let red: Vec<u16> = (0..w * h).map(|i| if (i / w) % 2 == 0 && i % 2 == 0 { synth::BLACK + 4000 } else { synth::BLACK }).collect();
+    let (a, ..) = half_rgba(&red, w as usize, h as usize, &s.cfa, &tone).unwrap();
+    let (b, ..) = half_rgba(&red, w as usize, h as usize, &s.cfa, &WbTone::new(s.black, s.white, d.max_code, None).unwrap()).unwrap();
+    assert!(mat[0][0] > matrix::Q);
+    assert!(a[0] > b[0], "matrix {:?} vs plain {:?}", &a[..3], &b[..3]);
+    for k in 1..3 {
+        if mat[k][0] < 0 {
+            assert_eq!(a[k], 0, "channel {k}");
+        }
+    }
+}
+
+#[test]
+fn cr2_lossless_jpeg_sliced_and_plain() {
+    let (w, h) = (64u32, 32u32);
+    let m = synth::ramp_even(w, h);
+    for slices in [None, Some([1u16, 40, 24]), Some([2, 24, 16])] {
+        let f = synth::cr2(w, h, &m, Cr2Opts { preview: true, slices });
+        let info = parse(&f).unwrap();
+        assert_eq!(info.fmt, Fmt::Cr2);
+        assert_eq!(raw_core::mime_of(&f), Some(raw_core::MIME_CR2));
+        assert_eq!(info.facts.camera().as_deref(), Some(synth::MODEL_CR2));
+        assert_eq!(info.matrix_source, None, "no Canon table rows: matrix=none");
+        let s = info.strip.clone().unwrap();
+        assert_eq!((s.width, s.height, s.bits, s.compression, s.slices), (64, 32, 14, 6, slices));
+        let (po, pl) = info.preview_in(f.len() as u64).expect("IFD0's JPEG strip");
+        assert_eq!(&f[po as usize..(po + pl) as usize], synth::PREVIEW_JPEG);
+        let d = RowDecoder::new(&s).unwrap();
+        assert_eq!((d.coding(), d.sequential(), d.row_bytes()), ("ljpeg", true, 0));
+        let strip = &f[s.offset as usize..(s.offset + s.len) as usize];
+        assert_eq!(d.all(strip).unwrap(), m, "slices {slices:?}");
+        // A parse that never reached the strip: `open` reads the geometry from the strip's head.
+        let s0 = raw_core::Strip { width: 0, height: 0, ..s.clone() };
+        let d0 = RowDecoder::open(&s0, &mut SliceSource(strip)).unwrap();
+        assert_eq!((d0.dims(), d0.max_code), ((64, 32), 16383));
+        let mut rows = 0;
+        d0.stream(&mut SliceSource(strip), 32, |y, r| {
+            assert_eq!(r, &m[y * 64..(y + 1) * 64], "row {y} in order");
+            rows += 1;
+        })
+        .unwrap();
+        assert_eq!(rows, 32);
+        assert!(d0.row(&[0; 8], &mut [0; 64]).is_err(), "a sequential coding has no row by itself");
+    }
+    // The head alone (the strip past it): still typed, geometry left to the decoder.
+    let f = synth::cr2(w, h, &m, Cr2Opts { preview: false, slices: Some([1, 40, 24]) });
+    let s = parse(&f).unwrap().strip.unwrap();
+    let i = parse(&f[..s.offset as usize]).unwrap();
+    assert_eq!((i.fmt, i.preview), (Fmt::Cr2, None));
+    let st = i.strip.unwrap();
+    assert_eq!((st.width, st.height), (0, 0));
+    // A slice table that does not add up, and a damaged scan: refused, never a panic.
+    let strip = &f[s.offset as usize..(s.offset + s.len) as usize];
+    let bad = raw_core::Strip { slices: Some([1, 40, 20]), ..s.clone() };
+    assert_eq!(RowDecoder::open(&bad, &mut SliceSource(strip)).err(), Some(Error::Malformed("CR2 slice table")));
+    for n in [0usize, 2, 10, 40, strip.len() / 2] {
+        let _ = RowDecoder::new(&s).and_then(|d| d.all(&strip[..n]));
+    }
+}
+
+#[test]
+fn nef_huffman_curve_and_packed() {
+    let (w, h) = (64u32, 32u32);
+    let m = synth::ramp_even(w, h);
+    let small: Vec<u16> = m.iter().map(|v| v / 2).collect();
+    for (c, want, coding, bits, tree, white) in [
+        (NefCoding::Lossless14, &m, "nikon", 14u16, Some(5u8), 16383u16),
+        (NefCoding::Curve12, &m, "nikon", 12, Some(0), 8190),
+        (NefCoding::Packed12, &small, "packed", 12, None, 4095),
+    ] {
+        let f = synth::nef(w, h, want, c);
+        let info = parse(&f).unwrap();
+        assert_eq!(info.fmt, Fmt::Nef);
+        assert_eq!(raw_core::mime_of(&f), Some(raw_core::MIME_NEF));
+        let s = info.strip.clone().unwrap();
+        assert_eq!((s.width, s.height, s.bits), (64, 32, bits));
+        assert_eq!(s.nikon.as_ref().map(|n| n.tree), tree, "{c:?}");
+        let d = RowDecoder::new(&s).unwrap();
+        assert_eq!((d.coding(), d.max_code), (coding, white), "{c:?}");
+        let strip = &f[s.offset as usize..(s.offset + s.len) as usize];
+        assert_eq!(&d.all(strip).unwrap(), want, "{c:?}: the mosaic through the linearisation curve");
+    }
+    // The curve variant's table: 4096 entries, curve[i] = 2 i.
+    let f = synth::nef(w, h, &m, NefCoding::Curve12);
+    let n = parse(&f).unwrap().strip.unwrap().nikon.unwrap();
+    assert_eq!((n.curve[1], n.curve[4095], n.vpred, n.split), (2, 8190, synth::NEF_VPRED, 0));
+    // A Huffman strip whose maker note lost tag 0x96: refused by name.
+    let mut s = parse(&f).unwrap().strip.unwrap();
+    s.nikon = None;
+    assert_eq!(RowDecoder::new(&s).err(), Some(Error::Unsupported("NEF without its linearisation table")));
+    // dcraw's six trees are all canonical.
+    for t in 0..6 {
+        raw_core::nef::tree(t).unwrap();
+    }
 }
