@@ -3492,3 +3492,145 @@ pub fn root_unlocked() -> bool {
 pub fn root_locked() -> bool {
     KB_KEYED.load(Ordering::Acquire) && !KB_UNLOCKED.load(Ordering::Acquire)
 }
+
+/// DISKFULL (rmbp-ledger B699; BP-storage-18, BP-bar-26; research B §6: a full disk must never wedge the OS or lose the
+/// file being written) — the ONE place a UnaFS write that found the volume full becomes `-ENOSPC`.
+///
+/// - **The mapping.** [`write_or_full`] is the only caller of `UnaFS::write_data` on the VFS write path: the crate's
+///   `FileSystemError::NoSpace` (`unaos/libs/fs/unafs/src/fs.rs:92`, raised by `alloc_block` at `fs.rs:1036` and the
+///   span check at `fs.rs:1419-1421`) becomes `VfsError::Backend(NOSPACE)`, which `attrsys::errno_of` — the one VFS
+///   refusal -> errno table every path syscall reads (`SYS_PATH_WRITE`'s `path_write_as`) — renders `-ENOSPC`. Every
+///   other write failure keeps its old spelling (`unafs-write` -> `-EIO`). Never a panic: no unwrap on the path.
+/// - **The rollback, read in the crate.** A failed `write_data` (`fs.rs:1460-1468`) returns `write_data_inner`'s error
+///   BEFORE `maybe_commit`: the root never flips, so the committed tree is untouched (K8a CoW: `write_data_inner`
+///   writes only fresh blocks, `fs.rs:1440-1446`, and the inode last, `fs.rs:1452`) — but unlike `create_files_batch`
+///   (`fs.rs:1752`/`:1761`) and `commit_inner` (`fs.rs:900-906`) it does NOT call `txn_unwind`, so the allocations
+///   it made stay in the mount's in-RAM refcount view. A later commit on the same mount would persist that residue
+///   as leaked blocks. So the KERNEL rolls it back: on the root mount [`write_root`] asks the enclosing `with_unafs`
+///   hold to discard the cached mount ([`request_mount_discard`], consumed inside the same hold above), which
+///   re-mounts from the committed root — the crate's own `txn_unwind` semantics (reload from disk, trust nothing in
+///   RAM), done one layer up. The fixture does the same on its RAM volume by re-mounting the device.
+/// - **The user sees it once.** [`after_hold`] (outside any hold) posts `Disk full: <volume> - <n> MB free` with an
+///   `Open Trash` action at most once per [`TOAST_EVERY_MS`]; [`low_pct`] is the status model's disk fact (free under
+///   [`LOW_PCT`] % of the root volume, published by every root write).
+///
+/// Wire: `[fs] full vol=<name> free_kb=<n> op=write -> ENOSPC`, `[fs] full toast vol=<name> free_mb=<n> ->
+/// posted|dropped|headless|suppressed`, `tests diskfull` -> `:: DISKFULL: enospc=1 panics=0 tx_rolled=1
+/// after_delete=ok toasts=1 -> PASS :: …`.
+pub mod diskfull {
+    use crate::fs::vfs::VfsError;
+    use ::unafs::fs::FileSystemError;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// The `VfsError::Backend` spelling of a full volume (`attrsys::errno_of` -> `-ENOSPC`).
+    pub const NOSPACE: &str = "nospace";
+    /// The toast's floor: one per minute.
+    pub const TOAST_EVERY_MS: u64 = 60_000;
+    /// The status bar's disk item shows below this much free (percent of the volume).
+    pub const LOW_PCT: u64 = 5;
+    const KB_PER_BLOCK: u64 = ::unafs::storage::BLOCK_SIZE / 1024;
+
+    static ENOSPC: AtomicU64 = AtomicU64::new(0);
+    static TOASTS: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+    /// `crate::arch::ms()` of the last toast; `u64::MAX` = never.
+    static LAST_TOAST_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// A full event waiting for [`after_hold`]: its `free_kb`, `u64::MAX` = none.
+    static PEND_KB: AtomicU64 = AtomicU64::new(u64::MAX);
+    static PEND_VOL: crate::sync::Mutex<([u8; 24], usize)> = crate::sync::Mutex::new(([0; 24], 0));
+    /// The root volume's free/total blocks as the last root write left them (0 total = not yet measured).
+    static ROOT_FREE: AtomicU64 = AtomicU64::new(0);
+    static ROOT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+    /// `Some(free %)` when `free` is under [`LOW_PCT`] % of `total` (pure: the fixture and [`low_pct`] share it).
+    pub fn low_of(free: u64, total: u64) -> Option<u8> {
+        if total == 0 || free.saturating_mul(100) >= total.saturating_mul(LOW_PCT) {
+            return None;
+        }
+        Some((free.saturating_mul(100) / total) as u8)
+    }
+
+    /// The status model's read: the root volume is under [`LOW_PCT`] % free (relaxed loads only — paint-path legal).
+    pub fn low_pct() -> Option<u8> {
+        low_of(ROOT_FREE.load(Ordering::Relaxed), ROOT_TOTAL.load(Ordering::Relaxed))
+    }
+
+    /// `(enospc, toasts, suppressed)` since boot (or the fixture's reset).
+    pub fn counts() -> (u64, u64, u64) {
+        (ENOSPC.load(Ordering::Relaxed), TOASTS.load(Ordering::Relaxed), SUPPRESSED.load(Ordering::Relaxed))
+    }
+
+    /// Fixture hook: zero the counters and forget the last toast (so the once-per-minute floor starts fresh).
+    pub fn reset() {
+        ENOSPC.store(0, Ordering::Relaxed);
+        TOASTS.store(0, Ordering::Relaxed);
+        SUPPRESSED.store(0, Ordering::Relaxed);
+        LAST_TOAST_MS.store(u64::MAX, Ordering::Relaxed);
+        PEND_KB.store(u64::MAX, Ordering::Relaxed);
+    }
+
+    /// THE write: `write_data`, with a full volume mapped to `Backend(NOSPACE)` and said on the wire. The caller
+    /// rolls the failed transaction back (see the module docs): [`write_root`] on the root, a re-mount in the fixture.
+    pub fn write_or_full<D: ::unafs::BlockDevice>(fs: &mut ::unafs::UnaFS<D>, vol: &str, id: u64, off: u64, data: &[u8]) -> Result<(), VfsError> {
+        let free_kb = fs.free_blocks().saturating_mul(KB_PER_BLOCK);
+        match fs.write_data(id, off, data) {
+            Ok(()) => Ok(()),
+            Err(FileSystemError::NoSpace) => {
+                ENOSPC.fetch_add(1, Ordering::Relaxed);
+                serial_println!("[fs] full vol={} free_kb={} op=write -> ENOSPC", vol, free_kb);
+                {
+                    let mut p = PEND_VOL.lock();
+                    let n = vol.len().min(p.0.len());
+                    p.0[..n].copy_from_slice(&vol.as_bytes()[..n]);
+                    p.1 = n;
+                }
+                PEND_KB.store(free_kb, Ordering::Relaxed);
+                Err(VfsError::Backend(NOSPACE))
+            }
+            Err(_) => Err(VfsError::Backend("unafs-write")),
+        }
+    }
+
+    /// The root mount's write (`NativeBackend::write`, inside the `with_unafs` hold): [`write_or_full`], then ANY
+    /// failure discards the cached mount inside this same hold (the crate left the failed write's allocations in
+    /// RAM; the discard re-mounts from the committed root), and the free count is published for the status bar.
+    pub fn write_root(fs: &mut super::KernelUnaFS, vol: &str, id: u64, off: u64, data: &[u8]) -> Result<(), VfsError> {
+        let free0 = fs.free_blocks();
+        let r = write_or_full(fs, vol, id, off, data);
+        let free = if r.is_err() {
+            super::request_mount_discard();
+            free0 // the committed free count the discard restores
+        } else {
+            fs.free_blocks()
+        };
+        ROOT_FREE.store(free, Ordering::Relaxed);
+        ROOT_TOTAL.store(fs.superblock.block_count, Ordering::Relaxed);
+        r
+    }
+
+    /// After the hold (never inside it: the toast reads the session's Trash path): post the pending full event's
+    /// toast, at most once per [`TOAST_EVERY_MS`]. `true` when a toast was posted by this call.
+    pub fn after_hold() -> bool {
+        let kb = PEND_KB.swap(u64::MAX, Ordering::Relaxed);
+        if kb == u64::MAX {
+            return false;
+        }
+        let (buf, n) = *PEND_VOL.lock();
+        let vol = core::str::from_utf8(&buf[..n]).unwrap_or("volume");
+        let now = crate::arch::ms();
+        let last = LAST_TOAST_MS.load(Ordering::Relaxed);
+        if last != u64::MAX && now.saturating_sub(last) < TOAST_EVERY_MS {
+            SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            serial_println!("[fs] full toast vol={} free_mb={} -> suppressed last_ms_ago={}", vol, kb / 1024, now.saturating_sub(last));
+            return false;
+        }
+        LAST_TOAST_MS.store(now, Ordering::Relaxed);
+        TOASTS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+        let how = if crate::video::notify::disk_full(vol, kb / 1024, &crate::fs::trash::trash_dir()) { "posted" } else { "dropped" };
+        #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+        let how = "headless";
+        serial_println!("[fs] full toast vol={} free_mb={} -> {}", vol, kb / 1024, how);
+        true
+    }
+}

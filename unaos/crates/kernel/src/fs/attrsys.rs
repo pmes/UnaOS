@@ -27,6 +27,7 @@ pub fn errno_of(e: &VfsError) -> i64 {
         VfsError::Unsupported => una_abi::ENOTSUP,
         VfsError::Backend("no-attr") => una_abi::ENODATA,
         VfsError::Backend("bad-query") | VfsError::Backend("bad-key") | VfsError::Backend("attr-too-big") => una_abi::EINVAL,
+        VfsError::Backend("nospace") => una_abi::ENOSPC, // DISKFULL (B699): a full volume (`fs::unafs::diskfull::NOSPACE`) — the one VFS -> errno point every path syscall reads
         VfsError::Backend(_) => una_abi::EIO,
     }
 }
@@ -44,6 +45,7 @@ pub fn errno_name(e: i64) -> &'static str {
         una_abi::EINVAL => "-EINVAL",
         una_abi::ERANGE => "-ERANGE",
         una_abi::EFAULT => "-EFAULT",
+        una_abi::ENOSPC => "-ENOSPC",
         _ => "-EIO",
     }
 }
@@ -59,6 +61,7 @@ pub fn refusal(e: &VfsError) -> String {
         una_abi::EACCES => "permission denied",
         una_abi::ENOTSUP => "this volume carries no typed attributes",
         una_abi::ENODATA => "no such attribute",
+        una_abi::ENOSPC => "the volume is full",
         una_abi::EINVAL => match e { VfsError::Backend(s) => s, _ => "invalid argument" },
         _ => match e { VfsError::Backend(s) => s, _ => "i/o error" },
     };
