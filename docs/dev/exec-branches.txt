@@ -621,3 +621,11 @@ refs/heads/exec-rmbp-crawlc       394e9c16 IN-FLIGHT cloud wave36 CRAWLC (the dr
 refs/heads/exec-rmbp-pinchzoom    996f1f6f IN-FLIGHT cloud wave36 PINCHZOOM (B735)
 refs/heads/exec-rmbp-crawla       bc6f934b IN-FLIGHT cloud wave36 CRAWLA (the video/settings/prefs crawl fixes)
 refs/heads/exec-rmbp-micring3     2e8a3cd1 IN-FLIGHT cloud wave36 MICRING3 (B736)
+refs/heads/exec-rmbp-hwtab         e448dc14 IN-FLIGHT cloud wave36 HWTAB
+refs/heads/exec-rmbp-keycharsarm   e448dc14 IN-FLIGHT cloud wave36 KEYCHARSARM
+refs/heads/exec-rmbp-civilrest     e448dc14 IN-FLIGHT cloud wave36 CIVILREST
+refs/heads/exec-rmbp-versionscompat e448dc14 IN-FLIGHT cloud wave36 VERSIONSCOMPAT
+refs/heads/exec-rmbp-a2dp          e448dc14 IN-FLIGHT cloud wave36 A2DP
+refs/heads/exec-rmbp-geodebackup   e448dc14 IN-FLIGHT cloud wave36 GEODEBACKUP
+refs/heads/exec-rmbp-filesearch    e448dc14 IN-FLIGHT cloud wave36 FILESEARCH
+refs/heads/exec-rmbp-grantnames    e448dc14 IN-FLIGHT cloud wave36 GRANTNAMES
