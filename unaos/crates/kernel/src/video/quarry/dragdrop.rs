@@ -501,6 +501,35 @@ fn selection(mk: &Marks, list: &[String], i: usize) -> Vec<usize> {
     (0..list.len()).filter(|&j| j == i || mk.names.iter().any(|x| *x == list[j])).collect()
 }
 
+/// TRASHTOAST (B747): the rows the Trash verb carries — the marks of the shown folder plus `list_sel`, in display
+/// order (the set a drag from the selected row carries); no marks = the selected row alone. Lock order MODEL -> MARKS.
+pub(super) fn selected_paths(m: &Model) -> Vec<String> {
+    if m.list_sel >= m.list.len() {
+        return Vec::new();
+    }
+    let g = MARKS.lock();
+    let idx = match g.as_ref() {
+        Some(mk) if !mk.names.is_empty() && mk.cwd.eq_ignore_ascii_case(&m.cwd) => {
+            let names: Vec<String> = m.list.iter().map(|e| e.name.clone()).collect();
+            selection(mk, &names, m.list_sel)
+        }
+        _ => {
+            let mut v = Vec::new();
+            v.push(m.list_sel);
+            v
+        }
+    };
+    idx.into_iter().map(|j| join(&m.cwd, &m.list[j].name)).collect()
+}
+
+/// TRASHTOAST (B747): the verb moved the marked rows away — the marks go with them.
+pub(super) fn marks_clear() {
+    if let Some(mk) = MARKS.lock().as_mut() {
+        mk.names.clear();
+        mk.anchor = None;
+    }
+}
+
 /// The ghost's label: the item's name, or `<n> items`.
 fn label_for(paths: &[String]) -> String {
     if paths.len() == 1 { leaf(&paths[0]) } else { alloc::format!("{} items", paths.len()) }

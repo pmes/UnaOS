@@ -64,6 +64,7 @@
 `[fontkit] face= size= title_axes=ok ink_600= ink_400= w_opsz14= w_opsz28= rows=10` · `:: FONTKIT: roles=<n> variable=<0|1> wght_ok=<0|1> opsz_ok=<0|1> -> PASS|SKIP|FAIL ::` (BP-video-30).
 `[hw] census devices=<n> driven=<n> none=<n>` · `:: HWREPORT: devices=<n> driven=<n> none=<n> rows_ok=1 tab=15 rows_painted=<n> -> PASS :: listed=<n> press=ok note="…"` · `[hw] row <line>` per press · `[hw] refresh asked` (BP-video-32, BP-shape-13).
 `[quarry] versions path=<p> native=<p|-> listed=<n>` · `[quarry] version restored path=<p> seq=<k> from=<date>` · `[fileversions] face listed= back= relisted= newest= open_copy= path=` (BP-video-31).
+`[quarry] trash batch add path=<p> name=<n> n=<k>` · `[quarry] trash batch items=<n> toasts=1 seq=<s>` · `:: TRASHTOAST: items=3 toasts=1 undone=3 -> PASS ::` (one Trash verb = one journal entry and one `Undo` toast, BP-video-29; TRASHTOAST B747).
 `[help] index pages=<n> words=<n> bytes=<n> src=<path>` · `[help] open page=<slug> win=<id> rows=<n> links=<n>` · `[help] link key=system.<k> tab=<t> control=<c>` · `[launcher] query=<q> hits=p<n>/f<n>/s<n>[/m1]/h<n>/v<n>` · `:: HELPSEARCH: pages=<n> hits=3/3 open=ok -> PASS ::`.
 `[search] q=<n chars> hits=<n> ms=<n> us=<n> src=<una-name-index|attr-query|walk|none> cand=<n>` · `[search] reveal path=<p> folder=<f> -> shown=<0|1>` · `[search] open folder=<p> -> shown=<0|1>` · `:: FILESEARCH: index= hits_ok= recent= kind= ms= -> PASS ::` (BP-video-36).
 
