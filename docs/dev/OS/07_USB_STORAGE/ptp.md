@@ -169,9 +169,23 @@ GetPartialObject (0x101B) in chunks of at most 64 MiB (`mtp::read_partial`), els
 **Writes.** `mtp::write_file(dir, name, data)` = SendObjectInfo (0x100C, storage + parent; 0xFFFFFFFF = the storage root;
 format by extension) then SendObject (0x100D); `mtp::delete(path)` = DeleteObject (0x100B; a folder takes its subtree). The
 OUT data phase streams a container longer than one TD (32 KiB TDs, a ZLP only after the last when the container is a
-multiple of wMaxPacketSize). OWED: `fs/ptpfs.rs` still answers `write_veto` for every device volume, so Quarry's copy onto the
-phone reaches `write_file` only when ptpfs maps `create`/`write`/`unlink` onto it for an MTP session (B715's row);
-SendObjectPropList (0x9808, its dataset encoder exists) for a file of 4 GiB or more; GetPartialObject64 past 4 GiB.
+multiple of wMaxPacketSize).
+
+**Writes through the VFS (MTPWRITE, rmbp-ledger B727).** `fs/ptpfs.rs` answers `write_veto` = None and `authorize_write` = Ok
+exactly while `ptp::is_mtp_session()`; a PTP camera keeps `camera volume (PTP) is read-only`. MTP cannot append (the size is in
+SendObjectInfo, the bytes in one SendObject) and the VFS has no close, so ptpfs holds ONE pending file in RAM (cap 256 MiB):
+`create(File)` = an empty buffer, listed at once; `write(off <= len)` fills it; a SEND (`mtp::write_file`, once per send; a
+file the phone already holds is DeleteObject'd first — a rewrite) happens on CLOSE (a stat or read of that path, a write
+shorter than the one before it = a copy loop's tail, any other mutation on the volume) and on the 4 MiB chunk boundaries
+4, 8, 16 … MiB (doubling: a never-closed file is on the phone up to its last boundary, the cable carries <= ~2x the file).
+A listing never sends; it overlays the pending row. `create(Dir)` = `mtp::make_folder` = SendObjectInfo with format 0x3001
+(association) and no SendObject; `unlink` = DeleteObject; `remove_dir` = DeleteObject of an EMPTY folder (non-empty =
+`not-empty`). 64 bits: `mtp::announce` sends SendObjectPropList (0x9808: storage, parent, format, size high, size low; the
+two-property dataset) for an object of 4 GiB or more; `mtp::read_partial` asks GetPartialObject64 (0x95C1, Android's MTP
+extension: handle, offset low, offset high, max bytes) for a chunk starting past 4 GiB, and ptpfs reads MTP files through
+`mtp::read_object` so a range past 4 GiB never falls back to GetObject-whole. (0x95C4 in that table is BeginEditObject.)
+OWED: streaming a SendObject from its source (a file over the 256 MiB buffer is refused by name); rename (SetObjectPropValue
+0xDC07).
 
 | code | name | used for | source |
 |---|---|---|---|
@@ -181,7 +195,8 @@ SendObjectPropList (0x9808, its dataset encoder exists) for a file of 4 GiB or m
 | 0x1015 | GetDevicePropValue (0xD402 DeviceFriendlyName) | the volume's name | §10.5.21; MTP 1.1 Appendix C |
 | 0x9801 | GetObjectPropsSupported (0x3000) | counted on the session line | MTP 1.1 §5.3.1.1 |
 | 0x9805 | GetObjectPropList (0, 0, 0xFFFFFFFF, 0, 0xFFFFFFFF) | the tree in one transaction | MTP 1.1 §5.3.1.6, dataset Appendix E.2.1.1 |
-| 0x9808 | SendObjectPropList | recognised (>= 4 GiB writes owed) | MTP 1.1 §5.3.1.9 |
+| 0x9808 | SendObjectPropList (storage, parent, format, size hi, size lo) | a write of 4 GiB or more | MTP 1.1 §5.3.1.9 |
+| 0x95C1 | GetPartialObject64 (handle, offset lo, offset hi, max) | a read past 4 GiB | Android MTP extensions; libmtp `ptp.h` `PTP_OC_ANDROID_GetPartialObject64` |
 | 0xA807 / 0xA808 | Specification_By_Group / _By_Depth_Unsupported | retry with the all-objects form | MTP 1.1 Appendix F |
 | 0xDC01 0xDC02 0xDC04 0xDC07 0xDC08 0xDC09 0xDC0B 0xDC44 | StorageID, ObjectFormat, ObjectSize (UINT64), ObjectFileName, DateCreated, DateModified, ParentObject, Name | the rows | MTP 1.1 Appendix B |
 | string 0xEE, wIndex 4 | "MSFT100" + vendor code; Extended Compat ID "MTP" | admits a vendor-class interface | Microsoft OS 1.0 Descriptors Specification; libmtp `libusb1-glue.c` |
@@ -189,7 +204,11 @@ SendObjectPropList (0x9808, its dataset encoder exists) for a file of 4 GiB or m
 Wire: `[mtp] vendor interface slot= iface= …` · `[mtp] slot= iface= os-descriptor=MSFT100 vendor_code= compat=<MTP|other>` ·
 `[mtp] ep0 un-halt slot= reset= cc= set_deq=` · `[mtp] session storages=[…] friendly= props_supported= list=` ·
 `[mtp] dev=<vid:pid> name=<s> storages=<n> objects=<n> props=<fast|walk> ms=<n>` · `[mtp] write name= bytes= storage= parent=
-handle= ms=` · `[mtp] delete path= handle= rows_removed=`. `tests mtpphone` (QEMU has no MTP device): the driver against a
-synthetic responder over an in-RAM transport (two storages, 40 objects, a 3 MB object):
-`:: MTPPHONE: enumerated=1 storages=2 objects=40 read=ok write=ok delete=ok ms=<n> -> PASS ::`. The bench: a phone in
+handle= ms=` · `[mtp] delete path= handle= rows_removed=` · `[mtp] mkdir name= storage= parent= handle=` ·
+`[ptpfs] send path= bytes= handle= why=<close|tail|mark> rewrite=<0|1>`. `tests mtpphone` (QEMU has no MTP device): the driver
+against a synthetic responder over an in-RAM transport (two storages, 40 objects, a 3 MB object), then the same responder
+ATTACHED as the session's phone (`mtp::fixture::attach`, only with no PTP/MTP device present; the controller is never asked)
+and driven through `MountTable::new()` and `fs/ptpfs.rs` — a 100 000-byte copy in 32 KiB writes, a folder, a delete, a 5 GiB
+sparse object read at 4 GiB + 1: `[mtpwrite] vol= veto_open= wrote= id= back= …` and
+`:: MTPPHONE: enumerated=1 storages=2 objects=40 read=ok write=ok delete=ok ms=<n> vfs_write=ok mkdir=ok big_read=ok -> PASS ::`. The bench: a phone in
 File-transfer mode on the rMBP's USB port.
