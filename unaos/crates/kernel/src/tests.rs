@@ -172,7 +172,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
-    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); register("uac1", uac1_fixture); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
+    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment).
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
@@ -2123,4 +2123,123 @@ fn undomove_selftest() {
         ":: UNDOMOVE: pushed={} undone={} redone={} refused={} leftovers={} -> {} ::",
         pushed, undone, redone, refused, leftovers, if pass { "PASS" } else { "FAIL" }
     );
+}
+
+// MTPPHONE (rmbp-ledger B715, BP-bar-25): `tests mtpphone` — the MTP class driver (`drivers/xhci/mtp.rs`) against a
+// SYNTHETIC responder over an in-RAM transport (`mtp::fixture::Responder`): every transaction's command, data and response
+// containers cross `ptp::codec` both ways. The responder is a phone: an MTP DeviceInfo (VendorExtensionID 6, "microsoft.com:
+// 1.0"), two storages, 40 objects (5 folders, a 3 MB picture). Legs: the Microsoft OS descriptor codecs (string 0xEE, the
+// Extended Compat ID "MTP", and a non-MTP twin refused); enumerate -> the tree in ONE GetObjectPropList; a responder that
+// refuses 0x9805 -> the per-folder walk -> the same 40 rows; the 3 MB object read by 64 KiB GetPartialObject chunks, byte for
+// byte; a 100 000-byte SendObjectInfo + SendObject into Download, read back; DeleteObject and the handle gone.
+// `:: MTPPHONE: enumerated=1 storages=2 objects=40 read=ok write=ok delete=ok ms=<n> -> PASS ::`
+#[cfg(feature = "uvc")]
+fn mtpphone_selftest() {
+    use crate::drivers::xhci::ptp::mtp::{self, fixture, Transport};
+    use crate::drivers::xhci::ptp::{codec, op, rc, Phase};
+    let t0 = crate::arch::ms();
+    let mut why: Option<&'static str> = None;
+    let mut miss = |w: &'static str, ok: bool| {
+        if !ok && why.is_none() {
+            why = Some(w);
+        }
+        ok
+    };
+    // M1: the OS descriptor and the DeviceInfo.
+    let (s, x) = fixture::os_descriptors();
+    let mut other = x;
+    other[18] = b'N'; // "NTP": a compatibleID that is not MTP
+    let os = miss("os-descriptor", mtp::os_string_vendor_code(&s) == Some(0x54) && mtp::compat_id_is_mtp(&x) && !mtp::compat_id_is_mtp(&other) && mtp::os_string_vendor_code(&s[..17]).is_none());
+    let mut r = fixture::Responder::new(false);
+    let opened = r.txn(op::OPEN_SESSION, &[1], Phase::None).map(|v| v.code == rc::OK).unwrap_or(false);
+    let mut raw = alloc::vec::Vec::new();
+    let di = match r.txn(op::GET_DEVICE_INFO, &[], Phase::In { cap: 64 << 10, into: &mut raw }) {
+        Ok(v) if v.code == rc::OK => codec::device_info(&raw),
+        _ => None,
+    };
+    let Some(di) = di else {
+        serial_println!(":: MTPPHONE: enumerated=0 storages=0 objects=0 read=- write=- delete=- ms={} -> FAIL why=deviceinfo ::", crate::arch::ms().saturating_sub(t0));
+        return;
+    };
+    let ext_ops = [mtp::mop::GET_OBJECT_PROPS_SUPPORTED, mtp::mop::GET_OBJECT_PROP_LIST, mtp::mop::SEND_OBJECT_PROP_LIST].iter().all(|o| di.ops.contains(o));
+    let enumerated = miss("enumerate", opened && os && mtp::is_mtp(&di, false) && ext_ops);
+    let mut raw = alloc::vec::Vec::new();
+    let sids = match r.txn(op::GET_STORAGE_IDS, &[], Phase::In { cap: 4096, into: &mut raw }) {
+        Ok(v) if v.code == rc::OK => codec::u32_array(&raw).unwrap_or_default(),
+        _ => alloc::vec::Vec::new(),
+    };
+    // M2: the tree in one pass, and the walk that must agree with it.
+    let (nst, nobj, fast_rows) = match mtp::enumerate(&mut r, &di, &sids) {
+        Ok(l) => {
+            let names_ok = l.storages.len() == 2 && l.storages[0].1 == "Internal shared storage" && l.storages[1].1 == "SD card";
+            miss("storage-names", names_ok);
+            miss("friendly", l.friendly.as_deref() == Some("Una Phone"));
+            miss("props-fast", l.fast && l.props_supported == 8);
+            let big = l.objs.iter().find(|o| o.handle == fixture::BIG);
+            miss("prop-row", big.map(|o| o.size == fixture::BIG_SIZE && o.parent == 2 && o.storage == fixture::S1 && o.mtime.is_some()).unwrap_or(false));
+            let mut rows: alloc::vec::Vec<(u32, alloc::string::String, u32, u64, u32)> = l.objs.iter().map(|o| (o.handle, o.name.clone(), o.parent, o.size, o.storage)).collect();
+            rows.sort();
+            (l.storages.len(), l.objs.len(), rows)
+        }
+        Err(e) => {
+            serial_println!("[mtp] fixture enumerate error {}", e);
+            miss("enumerate-error", false);
+            (0, 0, alloc::vec::Vec::new())
+        }
+    };
+    let mut w = fixture::Responder::new(true);
+    let _ = w.txn(op::OPEN_SESSION, &[1], Phase::None);
+    let mut walk_rows = alloc::vec::Vec::new();
+    if let Ok(l) = mtp::enumerate(&mut w, &di, &sids) {
+        miss("walk-chosen", !l.fast && l.walker.is_some());
+        if let Some(mut wk) = l.walker {
+            for _ in 0..1000 {
+                if wk.done() {
+                    break;
+                }
+                match wk.step(&mut w, 32) {
+                    Ok(v) => walk_rows.extend(v.into_iter().map(|o| (o.handle, o.name, o.parent, o.size, o.storage))),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    walk_rows.sort();
+    miss("walk-agrees", walk_rows == fast_rows);
+    // Reads: the 3 MB object in 64 KiB chunks, a range inside it, a range across its end.
+    let want = r.bytes_of(fixture::BIG).unwrap_or_default();
+    let whole = mtp::read_partial(&mut r, fixture::BIG, 0, fixture::BIG_SIZE as usize, 64 << 10).unwrap_or_default();
+    let range = mtp::read_partial(&mut r, fixture::BIG, 1_000_000, 4096, 64 << 10).unwrap_or_default();
+    let tail = mtp::read_partial(&mut r, fixture::BIG, fixture::BIG_SIZE - 100, 4096, 64 << 10).unwrap_or_default();
+    let read_ok = miss("read", whole.len() as u64 == fixture::BIG_SIZE && whole == want && range[..] == want[1_000_000..1_004_096] && tail.len() == 100);
+    // M3: a write into Download, read back whole; the SendObjectPropList dataset round-trips; the delete.
+    let data: alloc::vec::Vec<u8> = (0..100_000u32).map(|i| (i.wrapping_mul(13) >> 3) as u8).collect();
+    let h = mtp::send_object(&mut r, fixture::S1, fixture::DOWNLOAD, "UNA-COPY.TXT", &data).ok();
+    let mut back = alloc::vec::Vec::new();
+    let got = h.map(|h| r.txn(op::GET_OBJECT, &[h], Phase::In { cap: 1 << 20, into: &mut back }).map(|v| v.code == rc::OK).unwrap_or(false)).unwrap_or(false);
+    let props = mtp::prop_list(&mtp::enc_send_props("BIG.MOV", 5_000_000_000)).unwrap_or_default();
+    let props_ok = props.len() == 1 && props[0].name == "BIG.MOV" && props[0].size == 5_000_000_000;
+    let write_ok = miss("write", got && back == data && h.map(|h| r.bytes_of(h).as_deref() == Some(&data[..])).unwrap_or(false) && props_ok);
+    let delete_ok = match h {
+        Some(h) => {
+            let del = mtp::delete_object(&mut r, h).is_ok();
+            let mut sink = alloc::vec::Vec::new();
+            let gone = r.txn(op::GET_OBJECT_INFO, &[h], Phase::In { cap: 4096, into: &mut sink }).map(|v| v.code == rc::INVALID_OBJECT_HANDLE).unwrap_or(false);
+            miss("delete", del && gone && !r.holds(h))
+        }
+        None => miss("delete", false),
+    };
+    let counts = miss("counts", nst == 2 && nobj == fixture::OBJECTS);
+    let ms = crate::arch::ms().saturating_sub(t0);
+    serial_println!("[mtp] fixture txns={} walk_txns={} fast_rows={} walk_rows={} whole={} written={}", r.txns, w.txns, fast_rows.len(), walk_rows.len(), whole.len(), data.len());
+    let pass = enumerated && counts && read_ok && write_ok && delete_ok && why.is_none();
+    let okf = |b: bool| if b { "ok" } else { "fail" };
+    if pass {
+        serial_println!(":: MTPPHONE: enumerated=1 storages={} objects={} read=ok write=ok delete=ok ms={} -> PASS ::", nst, nobj, ms);
+    } else {
+        serial_println!(
+            ":: MTPPHONE: enumerated={} storages={} objects={} read={} write={} delete={} ms={} -> FAIL why={} ::",
+            enumerated as u8, nst, nobj, okf(read_ok), okf(write_ok), okf(delete_ok), ms, why.unwrap_or("-")
+        );
+    }
 }
