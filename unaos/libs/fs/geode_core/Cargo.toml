@@ -1,0 +1,13 @@
+[package]
+name = "geode_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Geode's core: the .geode v1 archive's ONE encoder and decoder (streamed and whole), shared by Ring 0 (fs/geodew.rs) and the host handler handlers/geode."
+
+# GEODEMOD (LEDGER SR157, BP-storage-28, BP-handlers-4): the midden_core/trash_core shape — `#![no_std]` + `alloc`,
+# `#![forbid(unsafe_code)]`, a member of the ROOT host workspace (handlers/geode links it, the host tests run here).
+# The kernel compiles `src/archive.rs` by path (the KELFSTAGE shape, install/abimage.rs), so the codec is one file.
+# Its only dependency is the store's own §R1 codec and FNV-1a (`unafs`, no_std): never a second encoder.
+[dependencies]
+unafs = { path = "../unafs", default-features = false }

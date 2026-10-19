@@ -1,30 +1,28 @@
-//! CHARTER: Geode — owed B740 (the `.geode` v1 format is `handlers/geode`'s; the kernel writes and reads it with the shared core's codec, `unafs::codec` + `unafs::hash`; a no_std `geode_core` both rings link is owed)
+//! CHARTER: Geode — shared-core (the `.geode` v1 codec is `unaos/libs/fs/geode_core`, compiled here by path from the file `handlers/geode` links: ONE encoder, ONE decoder; GEODEMOD SR157)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //!
 //! GEODEBACKUP (rmbp-ledger B740, BP-bar-1/14, BP-storage-28). The user's files outlive any one disk: the home goes
-//! to a removable volume as ONE `.geode` v1 archive (GEODEMETA SR148, `handlers/geode/src/lib.rs`), and comes back
-//! from one, every record whole — kind, bytes, every attribute (small and spilled) and the three §R7 times.
+//! to a removable volume as ONE `.geode` v1 archive (GEODEMETA SR148), and comes back from one, every record whole —
+//! kind, bytes, every attribute (small and spilled) and the three §R7 times.
 //!
-//! The host crate is std and cannot be linked here; the bytes are the same because both sides encode with the
-//! shared core's §R1 codec (`unafs::codec::Writer`) and check with its FNV-1a (`unafs::hash`):
-//!
-//! ```text
-//! header   "GEODEAR1" (8) ‖ version u32 (= 1) ‖ entries u64
-//! entry    path String ‖ kind u32 (0 File · 1 Directory) ‖ ctime u64 ‖ mtime u64 ‖ atime u64
-//!          ‖ attrs Map<String, AttributeValue> (keys ascending) ‖ data len u64 ‖ bytes
-//! trailer  "GEODEEND" (8) ‖ FNV-1a 64 of every byte before the trailer
-//! ```
+//! GEODEMOD (LEDGER SR157): the format — header, entry heads, trailer, the bounded streaming decoder and the
+//! archive's structural rules — is [`geode_core`], the very file the host handler (`handlers/geode`) links
+//! (`unaos/libs/fs/geode_core/src/archive.rs`, compiled here by `#[path]`: the KELFSTAGE shape,
+//! `install/abimage.rs`). This module keeps only what is the kernel's: the volume walk, the mount holds and the
+//! Settings face's worker.
 //!
 //! * **The writer streams.** [`plan`] walks the directory in the crate's order (pre-order, siblings in `ls` order)
-//!   keeping names and inode ids only, and measures the exact archive length; [`write`] then emits each entry from
-//!   its own hold and the file's bytes in [`CHUNK`]-sized holds, so the home is never in RAM and the IRQ-masked
-//!   mount lock is never held for the volume (BP-storage-8).
+//!   keeping names and inode ids only, and measures the exact archive length (`geode_core::entry_len`); [`write`]
+//!   then emits each entry head from its own hold through `geode_core::Encoder` and the file's bytes in
+//!   [`CHUNK`]-sized holds, so the home is never in RAM and the IRQ-masked mount lock is never held for the volume
+//!   (BP-storage-8).
 //! * **Versions are NOT carried in v1.** A file's previous versions (`una:versions`, §R17, BP-storage-24) are not
 //!   attributes and the format has no field for them: a backup carries each file's current bytes only.
-//! * **The reader restores** by the crate's `unpack` rules: the archive is checked whole first (streamed: names
-//!   only in RAM), every top-level name is checked free in the target (a taken name writes nothing), then each
-//!   entry is created, written and given its attributes in order, and the times are set last, deepest first.
+//! * **The reader restores** by the crate's `unpack` rules: the archive is checked whole first (`geode_core::check`,
+//!   streamed: names only in RAM), every top-level name is checked free in the target (a taken name writes
+//!   nothing), then each entry is created, written and given its attributes in order (`geode_core::Decoder`), and
+//!   the times are set last, deepest first.
 //!
 //! The volume is a [`Vol`]: any `UnaFS<D>` (the fixture's RAM volumes) or [`Bound`] (THE mount, one `with_unafs`
 //! per hold). The Settings face and its worker task are [`job`] (x86). Fixture: `tests geodebackup`.
@@ -34,27 +32,19 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use ::unafs::codec::{Encode, Writer};
 use ::unafs::fs::{DirEntry, FileSystemError};
-use ::unafs::hash::FnvHasher;
-use ::unafs::{AttributeValue, BlockDevice, FileKind, UnaFS};
+use ::unafs::{BlockDevice, FileKind, UnaFS};
 
-/// The header magic.
-pub const MAGIC: &[u8; 8] = b"GEODEAR1";
-/// The trailer magic.
-pub const END: &[u8; 8] = b"GEODEEND";
-/// The format version this build writes and reads.
-pub const VERSION: u32 = 1;
-/// One hold's worth of file bytes (read on backup, written on restore).
-pub const CHUNK: usize = 64 * 1024;
+/// GEODEMOD (SR157): the shared `.geode` v1 codec — the host handler's own file.
+#[allow(dead_code)]
+#[path = "../../../../libs/fs/geode_core/src/archive.rs"]
+pub mod geode_core;
+
+pub use self::geode_core::{Bytes, Sink, Src, Why, CHUNK};
+use self::geode_core::{leaf, parent_of, Decoder, Encoder, HEADER_LEN, TRAILER_LEN};
+
 /// Deepest nesting walked before the volume is called corrupt (the crate's bound).
 const MAX_DEPTH: usize = ::unafs::fs::MAX_PATH_DEPTH;
-/// The longest path, and the largest single attribute value, a restore accepts.
-const PATH_MAX: u64 = 4096;
-const VALUE_MAX: u64 = 16 * 1024 * 1024;
-
-/// Why a backup or restore refused: a word for the wire (`refused:<why>`).
-pub type Why = &'static str;
 
 fn fse(e: FileSystemError) -> Why {
     match e {
@@ -85,7 +75,7 @@ impl<D: BlockDevice> Vol for UnaFS<D> {
         Ok(f(self))
     }
     fn put(fs: &mut UnaFS<D>, id: u64, off: u64, data: &[u8]) -> Result<(), Why> {
-        super::diskfull::write_or_full(fs, "ram", id, off, data).map_err(|_| "nospace")
+        super::unafs::diskfull::write_or_full(fs, "ram", id, off, data).map_err(|_| "nospace")
     }
 }
 
@@ -93,12 +83,12 @@ impl<D: BlockDevice> Vol for UnaFS<D> {
 pub struct Bound;
 
 impl Vol for Bound {
-    type D = ::unafs::adapter::BlockAdapter<super::SdSectorDevice>;
+    type D = ::unafs::adapter::BlockAdapter<super::unafs::SdSectorDevice>;
     fn run<R>(&mut self, f: &mut dyn FnMut(&mut UnaFS<Self::D>) -> R) -> Result<R, Why> {
-        super::with_unafs(|fs| f(fs)).map_err(|_| "busy")
+        super::unafs::with_unafs(|fs| f(fs)).map_err(|_| "busy")
     }
     fn put(fs: &mut UnaFS<Self::D>, id: u64, off: u64, data: &[u8]) -> Result<(), Why> {
-        super::diskfull::write_root(fs, "native", id, off, data).map_err(|_| "nospace")
+        super::unafs::diskfull::write_root(fs, "native", id, off, data).map_err(|_| "nospace")
     }
 }
 
@@ -121,23 +111,16 @@ pub struct Plan {
     pub data_bytes: u64,
 }
 
-/// The encoded length of an attribute map (the §R1 `map`).
-fn attrs_len(a: &BTreeMap<String, AttributeValue>) -> u64 {
-    let mut w = Writer::new();
-    w.map(a);
-    w.into_bytes().len() as u64
-}
-
 /// Walk directory `dir` (what it holds, not itself) in the crate's archive order: one hold per node.
 pub fn plan<V: Vol>(v: &mut V, dir: &str) -> Result<Plan, Why> {
     let top = v.run(&mut |fs| fs.resolve_path(dir))?.map_err(fse)?;
-    let mut p = Plan { items: Vec::new(), files: 0, archive_bytes: (MAGIC.len() + 4 + 8 + END.len() + 8) as u64, data_bytes: 0 };
+    let mut p = Plan { items: Vec::new(), files: 0, archive_bytes: HEADER_LEN + TRAILER_LEN, data_bytes: 0 };
     let mut stack: Vec<(u64, String, usize)> = alloc::vec![(top, String::new(), 0)];
     while let Some((id, rel, depth)) = stack.pop() {
         let (kind, size, alen, kids) = v
             .run(&mut |fs| -> Result<(FileKind, u64, u64, Vec<DirEntry>), FileSystemError> {
                 let ino = fs.read_inode(id)?;
-                let alen = if rel.is_empty() { 0 } else { attrs_len(&super::record_attrs_on(fs, id, &ino)?) };
+                let alen = if rel.is_empty() { 0 } else { geode_core::attrs_len(&super::unafs::record_attrs_on(fs, id, &ino)?) };
                 let kids = if ino.kind == FileKind::Directory { fs.ls(id)? } else { Vec::new() };
                 Ok((ino.kind, ino.size, alen, kids))
             })?
@@ -150,7 +133,7 @@ pub fn plan<V: Vol>(v: &mut V, dir: &str) -> Result<Plan, Why> {
                 return Err("kind"); // the crate's Unsupported: a symlink or system record is not archived
             }
             let data = if kind == FileKind::File { size } else { 0 };
-            p.archive_bytes += 8 + rel.len() as u64 + 4 + 24 + alen + 8 + data;
+            p.archive_bytes += geode_core::entry_len(rel.len(), alen, data);
             p.data_bytes += data;
             p.files += (kind == FileKind::File) as u32;
             p.items.push(Item { path: rel.clone(), id, kind });
@@ -169,42 +152,10 @@ pub fn plan<V: Vol>(v: &mut V, dir: &str) -> Result<Plan, Why> {
     Ok(p)
 }
 
-/// Where the archive's bytes go (a file on a removable volume; the fixture's RAM stick).
-pub trait Sink {
-    fn put(&mut self, b: &[u8]) -> Result<(), Why>;
-}
-
-impl Sink for Vec<u8> {
-    fn put(&mut self, b: &[u8]) -> Result<(), Why> {
-        self.extend_from_slice(b);
-        Ok(())
-    }
-}
-
-/// The hashing, counting front of a sink.
-struct Out<'a, S: Sink> {
-    s: &'a mut S,
-    h: FnvHasher,
-    n: u64,
-}
-
-impl<S: Sink> Out<'_, S> {
-    fn put(&mut self, b: &[u8]) -> Result<(), Why> {
-        self.h.write(b);
-        self.n += b.len() as u64;
-        self.s.put(b)
-    }
-}
-
-/// Stream `plan`'s entries from `v` into `sink` as a `.geode` v1 archive; `tick(done_files, total_files)` after
-/// each file. The archive's length on success.
+/// Stream `plan`'s entries from `v` into `sink` as a `.geode` v1 archive (`geode_core::Encoder`);
+/// `tick(done_files, total_files)` after each file. The archive's length on success.
 pub fn write<V: Vol, S: Sink>(v: &mut V, plan: &Plan, sink: &mut S, tick: &mut dyn FnMut(u32, u32)) -> Result<u64, Why> {
-    let mut o = Out { s: sink, h: FnvHasher::new(), n: 0 };
-    let mut w = Writer::new();
-    w.raw(MAGIC);
-    w.u32(VERSION);
-    w.u64(plan.items.len() as u64);
-    o.put(&w.into_bytes())?;
+    let mut enc = Encoder::new(sink, plan.items.len() as u64)?;
     let mut done = 0u32;
     for it in &plan.items {
         let id = it.id;
@@ -214,20 +165,12 @@ pub fn write<V: Vol, S: Sink>(v: &mut V, plan: &Plan, sink: &mut S, tick: &mut d
                 if ino.kind != it.kind {
                     return Err(FileSystemError::NotFound); // re-identified: refused as `changed`
                 }
-                let attrs = super::record_attrs_on(fs, id, &ino)?;
+                let attrs = super::unafs::record_attrs_on(fs, id, &ino)?;
                 let size = if ino.kind == FileKind::File { ino.size } else { 0 };
-                let mut w = Writer::new();
-                w.str(&it.path);
-                ino.kind.encode(&mut w);
-                w.u64(ino.ctime);
-                w.u64(ino.mtime);
-                w.u64(ino.atime);
-                w.map(&attrs);
-                w.u64(size);
-                Ok((w.into_bytes(), size))
+                Ok((geode_core::entry_head(&it.path, ino.kind, ino.ctime, ino.mtime, ino.atime, &attrs, size), size))
             })?
             .map_err(fse)?;
-        o.put(&head)?;
+        enc.put(&head)?;
         let mut off = 0u64;
         while off < size {
             let n = (size - off).min(CHUNK as u64);
@@ -235,7 +178,7 @@ pub fn write<V: Vol, S: Sink>(v: &mut V, plan: &Plan, sink: &mut S, tick: &mut d
             if b.len() as u64 != n {
                 return Err("changed"); // the file shrank between its head and its bytes
             }
-            o.put(&b)?;
+            enc.put(&b)?;
             off += n;
         }
         if it.kind == FileKind::File {
@@ -243,11 +186,7 @@ pub fn write<V: Vol, S: Sink>(v: &mut V, plan: &Plan, sink: &mut S, tick: &mut d
             tick(done, plan.files);
         }
     }
-    let sum = o.h.finish();
-    let n = o.n;
-    o.s.put(END)?;
-    o.s.put(&sum.to_le_bytes())?;
-    Ok(n + 16)
+    enc.finish()
 }
 
 /// [`plan`] then [`write`]: the whole backup of `dir` into `sink`. `(files, archive bytes)`.
@@ -261,262 +200,6 @@ pub fn backup_to<V: Vol, S: Sink>(v: &mut V, dir: &str, sink: &mut S) -> Result<
 // Restore: check the archive whole (streamed), then unpack (streamed)
 // ---------------------------------------------------------------------------------------------------------------
 
-/// Where an archive's bytes come from (a file on a removable volume; the fixture's RAM stick).
-pub trait Src {
-    fn len(&self) -> u64;
-    fn read_at(&mut self, off: u64, n: usize) -> Result<Vec<u8>, Why>;
-}
-
-/// An archive held in RAM.
-pub struct Bytes<'a>(pub &'a [u8]);
-
-impl Src for Bytes<'_> {
-    fn len(&self) -> u64 {
-        self.0.len() as u64
-    }
-    fn read_at(&mut self, off: u64, n: usize) -> Result<Vec<u8>, Why> {
-        let a = off as usize;
-        self.0.get(a..a + n).map(|s| s.to_vec()).ok_or("truncated")
-    }
-}
-
-/// The streaming cursor over the archive body (everything before the trailer); every byte read is hashed once.
-struct Cur<'a, S: Src> {
-    s: &'a mut S,
-    off: u64,
-    end: u64,
-    buf: Vec<u8>,
-    at: usize,
-    h: FnvHasher,
-}
-
-impl<'a, S: Src> Cur<'a, S> {
-    fn new(s: &'a mut S, end: u64) -> Self {
-        Cur { s, off: 0, end, buf: Vec::new(), at: 0, h: FnvHasher::new() }
-    }
-    fn remaining(&self) -> u64 {
-        (self.end - self.off) + (self.buf.len() - self.at) as u64
-    }
-    fn fill(&mut self, need: usize) -> Result<(), Why> {
-        if self.buf.len() - self.at >= need {
-            return Ok(());
-        }
-        self.buf.drain(..self.at);
-        self.at = 0;
-        while self.buf.len() < need {
-            let left = self.end - self.off;
-            if left == 0 {
-                return Err("truncated");
-            }
-            let n = (CHUNK.max(need - self.buf.len()) as u64).min(left) as usize;
-            let b = self.s.read_at(self.off, n)?;
-            if b.len() != n {
-                return Err("truncated");
-            }
-            self.h.write(&b);
-            self.off += n as u64;
-            self.buf.extend_from_slice(&b);
-        }
-        Ok(())
-    }
-    fn take(&mut self, n: u64) -> Result<&[u8], Why> {
-        if n > self.remaining() {
-            return Err("truncated");
-        }
-        self.fill(n as usize)?;
-        let a = self.at;
-        self.at += n as usize;
-        Ok(&self.buf[a..a + n as usize])
-    }
-    fn u32(&mut self) -> Result<u32, Why> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-    fn u64(&mut self) -> Result<u64, Why> {
-        let b = self.take(8)?;
-        let mut a = [0u8; 8];
-        a.copy_from_slice(b);
-        Ok(u64::from_le_bytes(a))
-    }
-    fn string(&mut self, max: u64) -> Result<String, Why> {
-        let n = self.u64()?;
-        if n > max {
-            return Err("too-long");
-        }
-        let b = self.take(n)?;
-        core::str::from_utf8(b).map(String::from).map_err(|_| "utf8")
-    }
-    /// At most `max` bytes of the next `left` (a file's data, streamed).
-    fn chunk(&mut self, left: u64, max: usize) -> Result<Vec<u8>, Why> {
-        let n = left.min(max as u64);
-        Ok(self.take(n)?.to_vec())
-    }
-    /// Read past `n` bytes (still hashed).
-    fn skip(&mut self, mut n: u64) -> Result<(), Why> {
-        while n > 0 {
-            let k = n.min(CHUNK as u64);
-            self.take(k)?;
-            n -= k;
-        }
-        Ok(())
-    }
-}
-
-/// One entry's head: everything but its bytes, which follow (`data_len` of them).
-struct Head {
-    path: String,
-    kind: FileKind,
-    ctime: u64,
-    mtime: u64,
-    atime: u64,
-    attrs: BTreeMap<String, AttributeValue>,
-    data_len: u64,
-}
-
-fn value<S: Src>(c: &mut Cur<S>) -> Result<AttributeValue, Why> {
-    Ok(match c.u32()? {
-        0 => AttributeValue::Int(c.u64()? as i64),
-        1 => AttributeValue::Float(f64::from_bits(c.u64()?)),
-        2 => AttributeValue::String(c.string(VALUE_MAX)?),
-        3 => {
-            let n = c.u64()?;
-            if n > VALUE_MAX {
-                return Err("too-long");
-            }
-            AttributeValue::Blob(c.take(n)?.to_vec())
-        }
-        4 => {
-            let n = c.u64()?;
-            if n.saturating_mul(4) > VALUE_MAX.min(c.remaining()) {
-                return Err("too-long");
-            }
-            let mut v = Vec::with_capacity(n as usize);
-            for _ in 0..n {
-                v.push(f32::from_bits(c.u32()?));
-            }
-            AttributeValue::Vector(v)
-        }
-        _ => return Err("format"),
-    })
-}
-
-fn head<S: Src>(c: &mut Cur<S>) -> Result<Head, Why> {
-    let path = c.string(PATH_MAX)?;
-    let kind = match c.u32()? {
-        0 => FileKind::File,
-        1 => FileKind::Directory,
-        2 | 3 => return Err("kind"),
-        _ => return Err("format"),
-    };
-    let (ctime, mtime, atime) = (c.u64()?, c.u64()?, c.u64()?);
-    let n = c.u64()?;
-    if n.saturating_mul(8 + 12) > c.remaining() {
-        return Err("count");
-    }
-    let mut attrs = BTreeMap::new();
-    for _ in 0..n {
-        let k = c.string(PATH_MAX)?;
-        let v = value(c)?;
-        attrs.insert(k, v);
-    }
-    let data_len = c.u64()?;
-    if data_len > c.remaining() {
-        return Err("truncated");
-    }
-    Ok(Head { path, kind, ctime, mtime, atime, attrs, data_len })
-}
-
-/// A path the archive may name: relative, '/'-joined, every component a real name (the crate's `check_path`).
-fn path_ok(p: &str) -> bool {
-    !p.is_empty() && p.split('/').all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains('\0') && !c.contains('\\'))
-}
-
-fn parent_of(p: &str) -> &str {
-    p.rsplit_once('/').map(|(a, _)| a).unwrap_or("")
-}
-
-fn leaf(p: &str) -> &str {
-    p.rsplit_once('/').map(|(_, l)| l).unwrap_or(p)
-}
-
-/// What a checked archive holds.
-pub struct Summary {
-    pub entries: u64,
-    pub files: u32,
-    pub data_bytes: u64,
-    /// The top-level names (the ones a target must not already hold).
-    pub tops: Vec<String>,
-}
-
-/// Open the body: the trailer's sum, and a cursor past the header with the entry count.
-fn open<'a, S: Src>(src: &'a mut S) -> Result<(Cur<'a, S>, u64, u64), Why> {
-    let len = src.len();
-    if len < (MAGIC.len() + 4 + 8 + END.len() + 8) as u64 {
-        return Err("short");
-    }
-    let t = src.read_at(len - 16, 16)?;
-    if t.len() != 16 || &t[..8] != END {
-        return Err("trailer");
-    }
-    let mut s = [0u8; 8];
-    s.copy_from_slice(&t[8..]);
-    let want = u64::from_le_bytes(s);
-    let mut c = Cur::new(src, len - 16);
-    if c.take(8)? != MAGIC {
-        return Err("magic");
-    }
-    if c.u32()? != VERSION {
-        return Err("version");
-    }
-    let count = c.u64()?;
-    if count > c.remaining() / 52 {
-        return Err("count");
-    }
-    Ok((c, want, count))
-}
-
-/// Check an archive whole without keeping its bytes: checksum, magic, version, every record, every path and its
-/// parent, no repeat, no data on a directory, nothing after the last entry.
-pub fn check<S: Src>(src: &mut S) -> Result<Summary, Why> {
-    let (mut c, want, count) = open(src)?;
-    let mut dirs: BTreeSet<String> = BTreeSet::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut sum = Summary { entries: count, files: 0, data_bytes: 0, tops: Vec::new() };
-    for _ in 0..count {
-        let h = head(&mut c)?;
-        if !path_ok(&h.path) {
-            return Err("path");
-        }
-        if h.kind == FileKind::Directory && h.data_len != 0 {
-            return Err("dirdata");
-        }
-        let parent = parent_of(&h.path);
-        if !parent.is_empty() && !dirs.contains(parent) {
-            return Err("parent");
-        }
-        if !seen.insert(h.path.clone()) {
-            return Err("repeated");
-        }
-        if parent.is_empty() {
-            sum.tops.push(h.path.clone());
-        }
-        if h.kind == FileKind::Directory {
-            dirs.insert(h.path);
-        } else {
-            sum.files += 1;
-            sum.data_bytes += h.data_len;
-        }
-        c.skip(h.data_len)?;
-    }
-    if c.remaining() != 0 {
-        return Err("trailing");
-    }
-    if c.h.finish() != want {
-        return Err("checksum");
-    }
-    Ok(sum)
-}
-
 /// What a restore did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Restored {
@@ -528,9 +211,10 @@ pub struct Restored {
 
 /// Restore an archive under directory `dir` of `v`. `make`: `dir` must not exist and is created (its name taken =
 /// `taken`); else it must exist and hold none of the archive's top-level names (`taken`). The archive is checked
-/// whole first and nothing is written before every check passes. `tick(done_files, total_files)` after each file.
+/// whole first (`geode_core::check`) and nothing is written before every check passes. `tick(done_files,
+/// total_files)` after each file.
 pub fn restore<V: Vol, S: Src>(v: &mut V, src: &mut S, dir: &str, make: bool, tick: &mut dyn FnMut(u32, u32)) -> Result<Restored, Why> {
-    let sum = check(src)?;
+    let sum = geode_core::check(src)?;
     let top = if make {
         let (pdir, name) = match dir.rsplit_once('/') {
             Some(("", n)) => ("/", n),
@@ -562,12 +246,13 @@ pub fn restore<V: Vol, S: Src>(v: &mut V, src: &mut S, dir: &str, make: bool, ti
         })?
         .map_err(fse)??
     };
-    let (mut c, _, count) = open(src)?;
+    let mut d = Decoder::open(src)?;
+    let count = d.count();
     let mut ids: BTreeMap<String, u64> = BTreeMap::new();
     let mut made: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(count as usize);
     let mut r = Restored { files: 0, dirs: 0, attrs: 0, bytes: 0 };
     for _ in 0..count {
-        let h = head(&mut c)?;
+        let h = d.head()?;
         let parent = match parent_of(&h.path) {
             "" => top,
             p => *ids.get(p).ok_or("parent")?,
@@ -585,7 +270,7 @@ pub fn restore<V: Vol, S: Src>(v: &mut V, src: &mut S, dir: &str, make: bool, ti
         r.attrs += h.attrs.len() as u32;
         let mut off = 0u64;
         while off < h.data_len {
-            let b = c.chunk(h.data_len - off, CHUNK)?;
+            let b = d.chunk(h.data_len - off, CHUNK)?;
             v.run(&mut |fs| V::put(fs, id, off, &b))??;
             off += b.len() as u64;
         }
