@@ -67,7 +67,7 @@ pub fn measure() -> Option<(u32, u32)> {
     let out = &mut g[..pw];
     let t0 = crate::arch::now_cycles();
     for j in 0..bar_h {
-        crate::video::wm::desktop::bar_row(out, 0, 0, pw, bar_h, j, Some(&back));
+        crate::video::wm::desktop::bar_row_live(out, 0, 0, pw, bar_h, j, Some(&back)); // the fold: STAGEVERB's cached row, the live path
         core::hint::black_box(&mut *out);
     }
     let t1 = crate::arch::now_cycles();

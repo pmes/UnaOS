@@ -114,3 +114,7 @@ otherwise, and the OTHER platform's queue when it touches it. Commit as you go; 
 ## 8. Close
 The queues say everything (state, what flew, what is open, what may be wrong, the push line). No file
 outside git. Never push: Peter pushes. Say the push line once.
+
+## The RESCUE BATTERY (end of day, Peter's machine)
+
+On the pushed tip, once: `cd unaos && ./arroyo check` (both arches), `./arroyo gates`, `./arroyo foldleg`, then with `scripts/image-line-pi.env` sourced `./arroyo kernel8`, and `./arroyo esp-jetson` on the Orin line. A red is a fold that was not measured (LAWS §8): the seat fixes it the next morning before any new arc is cut. Nothing in this section runs on the cloud (R113 holds for the seat: compile legs and doc gates only, and after 2026-10-19 the compile legs run once per fold batch, not per fold).

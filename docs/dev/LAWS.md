@@ -804,6 +804,7 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
 
 ## 8. Communication with Peter
 
+- **MEASURED TWICE, CUT ONCE; THE RESCUE BATTERY (Peter, 2026-10-19: "this rescue battery needs to be a check on soundness not a crutch" / "it is to rescue us from unseen accidents (which should not happen because nothing should be shit thrown on the wall. it should be 'measured twice and cut once.')").** The seat's folds are right by construction: every hunk read, braces and tokens counted, tab indexes, key lists and sheet ids reconciled by hand, the owed seat-side lines applied, before the commit. The RESCUE BATTERY (the x86 line, the Orin and Pi lines, the host crates, `./arroyo gates`, `kernel8`) runs ONCE, at the end of the day, on Peter's machine, never on the cloud; it is named for what it is — a rescue from an unseen accident — and a red there is a fold that was not measured. No battery per fold, no battery as a crutch.
 - **THE ONE CHECK, before every reply to Peter** (Peter 2026-10-19: "would Enzo Ferrari approve of this high
   performance thing? all it is, is win" / "you are often incorrectly assertive. not hallucinating. incorrect. there is
   a massive difference"): would the man who built the machine (Enzo Ferrari, not the driver) approve this reply, and is every assertion in it

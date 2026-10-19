@@ -574,26 +574,26 @@ refs/heads/exec-rmbp-trashrm    82d87f97 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-abielf     87e7cb92 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-geodemeta  f410d189 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-softydark  3171a098 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-aging        11b1cb6f DONE-awaiting-fold cloud wave36 AGING (B695)
-refs/heads/exec-rmbp-veilcost     d332b763 DONE-awaiting-fold cloud wave36 VEILCOST (B696)
-refs/heads/exec-rmbp-notelemetry  96ed4711 IN-FLIGHT cloud wave36 NOTELEMETRY
-refs/heads/exec-rmbp-focussteal   f75e26a3 DONE-awaiting-fold cloud wave36 FOCUSSTEAL (B698)
-refs/heads/exec-rmbp-diskfull     96ed4711 IN-FLIGHT cloud wave36 DISKFULL
-refs/heads/exec-rmbp-appfault     96ed4711 IN-FLIGHT cloud wave36 APPFAULT
-refs/heads/exec-rmbp-tzlocale     96ed4711 IN-FLIGHT cloud wave36 TZLOCALE
-refs/heads/exec-rmbp-camdot       d23b5a72 DONE-awaiting-fold cloud wave36 CAMDOT (B702)
-refs/heads/exec-rmbp-unplug       96ed4711 IN-FLIGHT cloud wave36 UNPLUG
-refs/heads/exec-rmbp-keymaps      96ed4711 IN-FLIGHT cloud wave36 KEYMAPS
-refs/heads/exec-rmbp-a11yfilters  96ed4711 IN-FLIGHT cloud wave36 A11YFILTERS
-refs/heads/exec-rmbp-uac1         96ed4711 IN-FLIGHT cloud wave36 UAC1
-refs/heads/exec-rmbp-rawview      2fd11c9a DONE-awaiting-fold cloud wave36 RAWVIEW (B711)
-refs/heads/exec-rmbp-fvar         5ef17eba DONE-awaiting-fold cloud wave36 FVAR (SR150)
-refs/heads/exec-rmbp-netgrant     96ed4711 IN-FLIGHT cloud wave36 NETGRANT
-refs/heads/exec-rmbp-smartline    96ed4711 IN-FLIGHT cloud wave36 SMARTLINE
-refs/heads/exec-rmbp-kelfhash     10534083 DONE-awaiting-fold cloud wave36 KELFHASH (B709)
-refs/heads/exec-rmbp-perfhud      96ed4711 IN-FLIGHT cloud wave36 PERFHUD
+refs/heads/exec-rmbp-aging        11b1cb6f FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-veilcost     d332b763 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-notelemetry  d46d46e6 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-focussteal   f75e26a3 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-diskfull     ce1d015a FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-appfault     a57540b6 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-tzlocale     f29eb7f8 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-camdot       d23b5a72 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-unplug       acc69407 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-keymaps      7650d799 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-a11yfilters  7e80a870 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-uac1         703628e4 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-rawview      2fd11c9a FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-fvar         5ef17eba FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-netgrant     67ffe991 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-smartline    eeb134db FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-kelfhash     10534083 FOLDED-BY-HAND (this commit) 2026-10-19
+refs/heads/exec-rmbp-perfhud      1fe0ccda FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-autolock     363d83a9 IN-FLIGHT cloud wave36 AUTOLOCK (B712)
-refs/heads/exec-rmbp-zoom         c7bf61ed IN-FLIGHT cloud wave36 ZOOM (B713)
+refs/heads/exec-rmbp-zoom         8369dd06 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-fileversions 73acb28b IN-FLIGHT cloud wave36 FILEVERSIONS (B714)
 refs/heads/exec-rmbp-mtpphone     4312754e IN-FLIGHT cloud wave36 MTPPHONE (B715)
 refs/heads/exec-rmbp-undomove     2f265fa0 IN-FLIGHT cloud wave36 UNDOMOVE (B716)

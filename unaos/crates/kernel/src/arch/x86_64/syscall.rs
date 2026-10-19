@@ -3704,7 +3704,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
             slot
         );
         true
-    } else if USER_INPUT_ACTIVE
+    } else if !crate::video::wm::focussteal::held_now(owner) && USER_INPUT_ACTIVE
         .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {

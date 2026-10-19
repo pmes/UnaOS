@@ -3185,7 +3185,7 @@ fn tray_sig(t: &Option<super::status::Tray>) -> u64 {
     let Some(t) = t else { return 0 };
     let v = match t.volume { None => 0u64, Some((lv, m)) => 1 | ((lv as u64) << 1) | ((m as u64) << 6) };
     let n = match t.net { None => 0u64, Some(n) => 1 | ((n.medium as u64) << 1) | ((n.up as u64) << 4) };
-    1 | (v << 1) | (n << 9) | ((t.pc as u64) << 15)
+    1 | (v << 1) | (n << 9) | ((t.pc as u64) << 15) | ((super::status::disk_low().map_or(0, |p| 1 | (p as u64) << 1)) << 16) // DISKFULL (B699): the disk item repaints on change
 }
 
 /// One glyph-band scanline (`sy` in `0..CELL_H`) of the tray's TEXT item: the input label. MENUSCRAFT (B642): the
@@ -3198,6 +3198,15 @@ fn tray_paint(out: &mut [u32], w: usize, sy: usize, t: &Option<super::status::Tr
         let label: &[u8] = if t.pc { b"PC" } else { b"US" };
         let tw = super::text::advance(label, false, FACE);
         super::text::draw_row(out, w, label, (x0 + sw).saturating_sub(tw), sy, ink, false, FACE);
+    }
+    // DISKFULL (B699): the disk item's text, "<free>%" while the root is under 5 % free; absent otherwise.
+    if let Some(pct) = super::status::disk_low() {
+        if let Some((x0, sw)) = tray_slot(super::status::ITEM_DISK, w) {
+            let mut buf = [0u8; 4];
+            let n = if pct >= 10 { buf[0] = b'0' + pct / 10; buf[1] = b'0' + pct % 10; buf[2] = b'%'; 3 } else { buf[0] = b'0' + pct; buf[1] = b'%'; 2 };
+            let tw = super::text::advance(&buf[..n], false, FACE);
+            super::text::draw_row(out, w, &buf[..n], (x0 + sw).saturating_sub(tw), sy, ink, false, FACE);
+        }
     }
 }
 
@@ -3289,16 +3298,16 @@ enum Glyph {
 /// **THE status-item table** — one row per item, RIGHT to left in the Mac's order: the item and its glyph. The
 /// glyph decides the item's width ([`flow_w`]), so the press router's slots ([`flow_slot`] -> `tray_box_abs`,
 /// `bell_box_abs`, `batt_box_abs`) and the painter ([`status_glyphs_row`]) are read off ONE table and cannot drift.
-const STATUS: [(u8, Glyph); 6] = {
-    use super::status::{ITEM_BATTERY, ITEM_CLOCK, ITEM_INPUT, ITEM_NET, ITEM_NOTIFY, ITEM_VOLUME};
-    [(ITEM_CLOCK, Glyph::Clock), (ITEM_NOTIFY, Glyph::Bell), (ITEM_BATTERY, Glyph::Battery), (ITEM_NET, Glyph::Net), (ITEM_VOLUME, Glyph::Speaker), (ITEM_INPUT, Glyph::Label)]
+const STATUS: [(u8, Glyph); 7] = {
+    use super::status::{ITEM_BATTERY, ITEM_CLOCK, ITEM_DISK, ITEM_INPUT, ITEM_NET, ITEM_NOTIFY, ITEM_VOLUME};
+    [(ITEM_CLOCK, Glyph::Clock), (ITEM_NOTIFY, Glyph::Bell), (ITEM_BATTERY, Glyph::Battery), (ITEM_NET, Glyph::Net), (ITEM_VOLUME, Glyph::Speaker), (ITEM_INPUT, Glyph::Label), (ITEM_DISK, Glyph::Label)] // DISKFULL (B699): the disk item, leftmost, only while the root is under 5 % free (`status::item_known`)
 };
 
 /// The status items, RIGHT to left: [`STATUS`]'s ids.
-const FLOW: [u8; 6] = {
-    let mut f = [0u8; 6];
+const FLOW: [u8; 7] = {
+    let mut f = [0u8; 7];
     let mut k = 0;
-    while k < 6 {
+    while k < 7 {
         f[k] = STATUS[k].0;
         k += 1;
     }
@@ -3360,7 +3369,7 @@ pub fn slots_selftest() {
     let mut overlaps = 0usize;
     let mut xs = alloc::string::String::new();
     for (pass, w) in [live, FLOOR_W(), FLOOR_W() + 6 * 64].into_iter().enumerate() {
-        let mut r: [Option<(usize, usize)>; 6] = [None; 6];
+        let mut r: [Option<(usize, usize)>; 7] = [None; 7];
         for (k, &i) in FLOW.iter().enumerate() {
             r[k] = match i {
                 super::status::ITEM_CLOCK => clock_slot(w).map(|x| (x, CLOCK_GLYPHS * CELL_W())),
@@ -3369,8 +3378,8 @@ pub fn slots_selftest() {
                 _ => tray_slot(i, w),
             };
         }
-        for a in 0..6 {
-            for b in a + 1..6 {
+        for a in 0..7 {
+            for b in a + 1..7 {
                 if let (Some((xa, wa)), Some((xb, wb))) = (r[a], r[b]) {
                     if xa < xb + wb && xb < xa + wa {
                         overlaps += 1;
@@ -3386,7 +3395,7 @@ pub fn slots_selftest() {
             }
         }
         if pass == 0 {
-            for k in (0..6).rev() {
+            for k in (0..7).rev() {
                 if let Some((x, _)) = r[k] {
                     items += 1;
                     if !xs.is_empty() {

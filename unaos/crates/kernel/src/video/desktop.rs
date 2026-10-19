@@ -1153,6 +1153,15 @@ pub fn bar_row(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usi
     }
 }
 
+/// VEILCOST (B696): [`bar_row`] through the live cache when it is free (STAGEVERB B690's row copy), else uncached —
+/// what the menu bar's compose costs, for the cost line's sample.
+pub fn bar_row_live(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usize, back: Option<&Back>) {
+    match BAR_VEIL.try_lock() {
+        Some(mut c) => { bar_row_cached(&mut c, out, x0, y0, w, h, j, back); }
+        None => bar_row(out, x0, y0, w, h, j, back),
+    }
+}
+
 /// [`bar_row`] over the live wallpaper (the menu bar's compose).
 pub fn bar_field_row(out: &mut [u32], x0: usize, y0: usize, w: usize, h: usize, j: usize) {
     let back = live_back();
