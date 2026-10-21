@@ -5276,7 +5276,7 @@ fn scrollview_selftest() {
     #[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
     let ring3: Result<usize, &'static str> = Ok(0);
     let ring3_word = if cfg!(any(target_arch = "x86_64", feature = "aarch64_el0")) { word(&ring3) } else { alloc::string::String::from("none(no-el0)") };
-    let (panes, panes_ok) = scrollpanes_legs(); // SCROLLPANES (B777): the six pane words, before the verdict
+    let (panes, panes_ok) = scrollpanes_legs(); // SCROLLPANES (B777): the eight pane words (tree icons columns tabs types overlay sidebar cols), before the verdict
     let pass = steps == 200 && clamp_ok && reached_ends && blit_ok && thumb_ok && quarry.is_ok() && hw.is_ok() && panes_ok && ring3.is_ok();
     serial_println!(
         ":: SCROLLVIEW: steps={} clamp={} blit={} thumb={} quarry={} hw={} {} -> {} :: ring3={}",
@@ -5865,25 +5865,26 @@ fn sinkall_pause(sink: &str) -> u64 {
 }
 
 /// SCROLLPANES (rmbp-ledger B777) — `tests scrollview`'s pane legs, printed at the END of its pass line:
-/// `tree=ok icons=ok columns=ok tabs=ok types=ok overlay=ok sidebar=ok`. Quarry's tree, Icons grid and Columns focus pane walked
+/// `tree=ok icons=ok columns=ok tabs=ok types=ok overlay=ok sidebar=ok cols=ok`. Quarry's tree, Icons grid and Columns focus pane walked
 /// through their live step bodies against a full paint; Settings' tab column and File Types rows stepped through
 /// their models against an independent clamp; the overlay gate (the context menu or a mark stops the blit); Quarry's
-/// sidebar walked through its live step body (SIDEBARWHEEL rmbp-ledger B792). `(words, all ok)`.
+/// sidebar walked through its live step body (SIDEBARWHEEL rmbp-ledger B792); every non-focus Columns column walked through
+/// its live step body (MILLERWHEEL rmbp-ledger B798, `cols_steps` = the sum over the columns). `(words, all ok)`.
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn scrollpanes_legs() -> (alloc::string::String, bool) {
     let word = |r: &Result<usize, &'static str>| -> alloc::string::String { match r { Ok(_) => alloc::string::String::from("ok"), Err(e) => alloc::format!("FAIL({})", e) } };
     #[cfg(feature = "quarry")]
-    let [tree, icons, columns, overlay, sidebar] = crate::video::quarry::live::scrollpanes_probe();
+    let [tree, icons, columns, overlay, sidebar, cols] = crate::video::quarry::live::scrollpanes_probe();
     #[cfg(not(feature = "quarry"))]
-    let [tree, icons, columns, overlay, sidebar]: [Result<usize, &'static str>; 5] = [Err("no-quarry"); 5];
+    let [tree, icons, columns, overlay, sidebar, cols]: [Result<usize, &'static str>; 6] = [Err("no-quarry"); 6];
     let [tabs, types] = crate::video::settings::scrollpanes_probe();
-    let all = [&tree, &icons, &columns, &tabs, &types, &overlay, &sidebar];
+    let all = [&tree, &icons, &columns, &tabs, &types, &overlay, &sidebar, &cols];
     serial_println!(
-        "[scrollview] panes tree_steps={} icons_steps={} columns_steps={} tabs_steps={} types_steps={} overlay_legs={} sidebar_steps={}",
-        tree.as_ref().copied().unwrap_or(0), icons.as_ref().copied().unwrap_or(0), columns.as_ref().copied().unwrap_or(0), tabs.as_ref().copied().unwrap_or(0), types.as_ref().copied().unwrap_or(0), overlay.as_ref().copied().unwrap_or(0), sidebar.as_ref().copied().unwrap_or(0)
+        "[scrollview] panes tree_steps={} icons_steps={} columns_steps={} tabs_steps={} types_steps={} overlay_legs={} sidebar_steps={} cols_steps={}",
+        tree.as_ref().copied().unwrap_or(0), icons.as_ref().copied().unwrap_or(0), columns.as_ref().copied().unwrap_or(0), tabs.as_ref().copied().unwrap_or(0), types.as_ref().copied().unwrap_or(0), overlay.as_ref().copied().unwrap_or(0), sidebar.as_ref().copied().unwrap_or(0), cols.as_ref().copied().unwrap_or(0)
     );
     (
-        alloc::format!("tree={} icons={} columns={} tabs={} types={} overlay={} sidebar={}", word(&tree), word(&icons), word(&columns), word(&tabs), word(&types), word(&overlay), word(&sidebar)),
+        alloc::format!("tree={} icons={} columns={} tabs={} types={} overlay={} sidebar={} cols={}", word(&tree), word(&icons), word(&columns), word(&tabs), word(&types), word(&overlay), word(&sidebar), word(&cols)),
         all.iter().all(|r| r.is_ok()),
     )
 }
