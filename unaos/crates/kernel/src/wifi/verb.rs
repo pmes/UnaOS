@@ -118,7 +118,7 @@ fn join(ssid: Option<&str>, console: &mut Console) {
 /// `tests wifi` — the fixture. One verdict line in the brief's shape.
 pub fn selftest() {
     // WIFI5 (B415): the ladder's state as a line, before the WIFI1 verdict (which returns early).
-    #[cfg(feature = "wifi9")] super::bringup::wifi9(); #[cfg(feature = "wifi10")] super::bringup::wifi10(crate::tests::arg(), super::data::ipv4(crate::tests::arg2().as_deref())); #[cfg(feature = "wifi10")] super::assoc::witness(); #[cfg(feature = "wifi10")] super::data::witness(); super::ladder::witness(); // WIFI9 (B625): S5i/S5c/S6 run first, so WIFI5's live rows and WIFI1's scan= read this boot's verdicts (LINE-NEUTRAL append, before this comment)
+    #[cfg(feature = "wifi9")] super::bringup::wifi9(); #[cfg(feature = "wifi10")] super::bringup::wifi10(crate::tests::arg(), super::data::ipv4(crate::tests::arg2().as_deref())); #[cfg(feature = "wifi10")] super::assoc::witness(); #[cfg(feature = "wifi10")] super::data::witness(); #[cfg(feature = "wifi10")] wifidhcp(); super::ladder::witness(); // WIFI9 (B625): S5i/S5c/S6 run first, so WIFI5's live rows and WIFI1's scan= read this boot's verdicts (LINE-NEUTRAL append, before this comment)
     let present = radio_present();
     let ucode = if status::ucode_ok() { "ok" } else { "refused" };
     let d11 = if status::d11_up() { "up" } else { "down" };
@@ -142,4 +142,66 @@ pub fn selftest() {
         ":: WIFI1: ucode={} d11={} scan={} -> {} ::",
         ucode, d11, scan, if pass { "PASS" } else { "FAIL" }
     );
+}
+
+/// WIFIDHCP (rmbp-ledger B831) — rung S10b, from `tests wifi` after S10a's witness (R80: nothing at boot). The KAT
+/// line (`data::kat_dhcp`: the 342-octet DISCOVER fits the ring, the Link stub carries it both ways), then, when
+/// S10a kept the station (`data::kept`) and the Desktop services gate is open (BP-net-4): smolnet's own stack and
+/// its ONE DHCP client (`smolnet::init` -> `dhcp_acquire`, the same client every link uses) over the station,
+/// which `drivers/e1000.rs`'s accessor triple reaches as the fallback after e1000 and usbnet. Waits up to
+/// `WAIT_MS` for the lease (`service_poll` applies a late one), no lock held while it sleeps.
+#[cfg(feature = "wifi10")]
+fn wifidhcp() {
+    let (kat, stub, len, first) = super::data::kat_dhcp();
+    serial_println!(
+        ":: wifidhcp: kat={} nic={} discover_len={} -> {}{} ::",
+        if kat { "ok" } else { "FAIL" }, if stub { "stub" } else { "stub-FAIL" }, len,
+        if first.is_none() { "PASS" } else { "FAIL" }, first.map(|f| alloc::format!(" first={}", f)).unwrap_or_default()
+    );
+    let absent = |why: &str| {
+        super::data::set_dhcp(3);
+        serial_println!(":: WIFIDHCP: dhcp=NOT ATTEMPTED reason={} -> ABSENT ::", why);
+    };
+    if !super::data::kept() {
+        return absent("no-station-link");
+    }
+    #[cfg(not(feature = "smolnet"))]
+    return absent("no-stack(smolnet off)");
+    #[cfg(feature = "smolnet")]
+    {
+        const WAIT_MS: u64 = 12_000;
+        if !crate::boot::services_gate("net") {
+            return absent("services-gate-closed");
+        }
+        let t0 = crate::arch::now_cycles();
+        let hz = crate::bootpace::origin_hz().max(1);
+        let ms = || crate::arch::now_cycles().wrapping_sub(t0) / (hz / 1000).max(1);
+        {
+            let _s = crate::net_tick::scope(crate::net_tick::Who::Dhcp);
+            let _ = crate::smolnet::init();
+            while !crate::smolnet::leased() && ms() < WAIT_MS {
+                crate::smolnet::service_poll();
+                crate::arch::sched::sleep_ms(5);
+            }
+        }
+        if !super::data::bound() {
+            return absent("stack-on-other-link");
+        }
+        let ip4 = |o: [u8; 4]| if o == [0; 4] { alloc::string::String::from("-") } else { alloc::format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]) };
+        let waited = ms();
+        match crate::smolnet::lease_ip() {
+            Some(ip) => {
+                let (gw, dns) = crate::smolnet::route_view();
+                super::data::set_dhcp(1);
+                serial_println!(
+                    ":: WIFIDHCP: dhcp=bound ip={} gw={} dns={} lease=unread waited={}ms -> PASS ::",
+                    ip4(ip), ip4(gw), ip4(dns), waited
+                );
+            }
+            None => {
+                super::data::set_dhcp(2);
+                serial_println!(":: WIFIDHCP: dhcp=none ip=- gw=- dns=- lease=- waited={}ms -> SILENT ::", waited);
+            }
+        }
+    }
 }

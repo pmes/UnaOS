@@ -208,8 +208,9 @@ pub(super) fn run(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::Seen
 /// `data::Link` sends ONE ARP probe (RFC 826 / RFC 5227, sender 0.0.0.0) for the gateway the operator named
 /// (`tests wifi <ssid> <gw>`) as a ToDS data frame on ring frame 3, then drains S6's receiver for up to
 /// `REPLY_MS`, judging every kept data frame with `data::from_air` and the reply with `data::arp_reply_parse`.
-/// Gates: S9 read ASSOCIATED; a gateway was named. Returns the data frames sent (0 or 1).
-pub(super) fn link(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::Seen, ch: u16, gw: Option<[u8; 4]>, w: &mut rx::Writes) -> u32 {
+/// Gates: S9 read ASSOCIATED; a gateway was named. Returns the data frames sent (0 or 1) and, on LINKED only, the
+/// Link for `keep` (WIFIDHCP B831: the station then outlives the pass).
+pub(super) fn link(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::Seen, ch: u16, gw: Option<[u8; 4]>, w: &mut rx::Writes) -> (u32, Option<super::super::data::Link>) {
     use super::super::data;
     let skip = |why: String| {
         data::set_link(3);
@@ -218,11 +219,11 @@ pub(super) fn link(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::See
     let (_, s9, _) = super::super::status::join();
     let (Some(bss), 1) = (seen.join.bss, s9) else {
         skip(String::from(if s9 == 0 || s9 == 3 { "s9-absent" } else { "s9-NOT-ASSOCIATED" }));
-        return 0;
+        return (0, None);
     };
     let Some(gw) = gw else {
         skip(String::from("no-gateway(type tests wifi <ssid> <gw-ip>)"));
-        return 0;
+        return (0, None);
     };
     let gw_text = alloc::format!("{}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]);
     let mut l = data::Link::new(seen.join.me, bss.bssid);
@@ -260,5 +261,67 @@ pub(super) fn link(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::See
         ssid_text(&seen.join.target), gw_text, if r.sent() { "SENT" } else { "NOT-SENT" }, r.acked as u8, l.rx_data,
         reply.map(|m| alloc::format!("reply mac={}", mac_text(m))).unwrap_or_else(|| String::from("none")), waited, verdict
     );
-    sent
+    (sent, if reply.is_some() { Some(l) } else { None })
+}
+
+// ── WIFIDHCP (rmbp-ledger B831): the kept station ────────────────────────────────────────────────────────────
+
+/// Everything the pass armed, kept past it on LINKED: the TX ring, the receiver and its state, the Link.
+struct Station {
+    bar0: u64,
+    ch: u16,
+    prep: tx::Prep,
+    rxr: rx::Rx,
+    seen: rx::Seen,
+    link: super::super::data::Link,
+    w: rx::Writes,
+}
+
+/// THE station. Lock order: smolnet's `STACK` -> `STATION` (smoltcp's poll calls the accessor triple); nothing
+/// takes `STATION` then `STACK`. No sleep is taken under it (`rx::drain`, `tx::fire_frame`'s status spin).
+static STATION: crate::sync::Mutex<Option<Station>> = crate::sync::Mutex::new(None);
+
+/// From `wifi10()` after its end line, when `link` returned the Link (S10a LINKED): the engines stay armed and
+/// move here; from now on only the station's fns below touch them.
+pub(super) fn keep(bar0: u64, prep: tx::Prep, rxr: rx::Rx, mut seen: rx::Seen, ch: u16, w: rx::Writes, link: super::super::data::Link) {
+    seen.data.clear();
+    let next = link.tx_next();
+    *STATION.lock() = Some(Station { bar0, ch, prep, rxr, seen, link, w });
+    serial_println!("[wifi10] station kept tx_next={} — the TX ring and the receiver stay armed for the stack (WIFIDHCP B831)", next);
+}
+
+/// `data::raw_tx`: one Ethernet frame out as a ToDS data frame on the station's next ring frame. `true` = SENT.
+pub(in crate::wifi) fn station_tx(eth: &[u8]) -> bool {
+    let mut g = STATION.lock();
+    let Some(st) = g.as_mut() else { return false };
+    match st.link.send(eth) {
+        Ok((air, n)) => tx::fire_frame(st.bar0, &st.prep, &air, st.ch, n, "data", &mut st.w).sent(),
+        Err(_) => false,
+    }
+}
+
+/// `data::raw_rx`: the next kept data frame to us as Ethernet; the receiver is drained once when none is kept.
+pub(in crate::wifi) fn station_rx(out: &mut [u8]) -> Option<usize> {
+    let mut g = STATION.lock();
+    let st = g.as_mut()?;
+    if let Some(n) = st.link.recv(&mut st.seen.data, out) {
+        return Some(n);
+    }
+    rx::drain(st.bar0, &mut st.rxr, &mut st.seen, st.ch, &mut st.w);
+    st.link.recv(&mut st.seen.data, out)
+}
+
+/// `data::rx_ready`: the receiver drained once; a data frame is kept. Never waits on the lock.
+pub(in crate::wifi) fn station_pending() -> bool {
+    let Some(mut g) = STATION.try_lock() else { return false };
+    let Some(st) = g.as_mut() else { return false };
+    if st.seen.data.is_empty() {
+        rx::drain(st.bar0, &mut st.rxr, &mut st.seen, st.ch, &mut st.w);
+    }
+    !st.seen.data.is_empty()
+}
+
+/// `data::hw_addr` / `data::kept`: the station MAC while a station is kept.
+pub(in crate::wifi) fn station_mac() -> Option<Mac> {
+    STATION.lock().as_ref().map(|st| st.link.mac())
 }

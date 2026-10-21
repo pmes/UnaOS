@@ -151,10 +151,17 @@ const SHM_SC_SRLIMIT: u32 = 0x0006;
 const SHM_SC_LRLIMIT: u32 = 0x0007;
 const RETRY_SHORT: u16 = 7;
 const RETRY_LONG: u16 = 4;
-/// Frames per boot this ring carries: `buf` is 4096 bytes, 512 per frame (header, then the body at +256).
+/// WIFIDHCP (B831): a frame's header and its body each own one `FRAME_STRIDE` region of `buf` (header region at
+/// `2i * FRAME_STRIDE`, body region right after it), so the body cap IS the stride: a 342-octet DHCP DISCOVER is
+/// 360 octets of air and fits. `buf` holds `BUF_FRAMES` such pairs (8 KiB).
 const FRAME_STRIDE: u64 = 512;
-const FRAME_MAX: usize = 256;
-const FRAMES: usize = 8;
+pub(in crate::wifi) const FRAME_MAX: usize = FRAME_STRIDE as usize;
+const BUF_FRAMES: usize = 8;
+const BUF_BYTES: usize = BUF_FRAMES * 2 * FRAME_STRIDE as usize;
+/// Frame numbers on the descriptor ring: two slots each, 32 per lap. Frame `n` uses buffer pair `n % BUF_FRAMES`
+/// (free again once `fire_frame` returned: it waits for the frame's status) and slots `2n`/`2n+1`; the index wraps
+/// to slot 0 after slot 63, which carries DTABLEEND (`fill`; b43 `dma.c` next_slot).
+pub(in crate::wifi) const FRAMES: usize = SLOTS / TX_SLOTS_PER_FRAME;
 
 /// How long the TX-status FIFO is polled after the poke (1 ms steps).
 const TXSTAT_WAIT_MS: u32 = 200;
@@ -379,7 +386,7 @@ fn txhdr(frame: &[u8], ch: u16, cookie: u16) -> [u8; TXH_SIZE] {
 /// transmitted here; the engine has no descriptor to read until `fire` pokes `TXINDEX`.
 pub(super) fn prep(bar0: u64, mac: [u8; 6], w: &mut Writes) -> Result<Prep, String> {
     let ring_l = core::alloc::Layout::from_size_align(RINGMEM, RINGMEM).ok();
-    let buf_l = core::alloc::Layout::from_size_align(4096, 4096).ok();
+    let buf_l = core::alloc::Layout::from_size_align(BUF_BYTES, 4096).ok();
     let (Some(rl), Some(bl)) = (ring_l, buf_l) else {
         return Err(String::from("layout — nothing programmed"));
     };
@@ -421,7 +428,7 @@ pub(super) fn fire(bar0: u64, p: &Prep, mac: [u8; 6], ch: u16, w: &mut Writes) -
     fire_frame(bar0, p, &probe_request(mac, ch), ch, 0, "probe-req", w)
 }
 
-/// Frame `n` (0..FRAMES) of this boot's ring out. Precondition: `prep` done and the MAC ENABLED (S6's
+/// Frame `n` (0..FRAMES) of the ring out. Precondition: `prep` done and the MAC ENABLED (S6's
 /// `rx::arm`, which also wakes the ucode). The header on slot 2n (FRAMESTART), the frame on slot 2n+1
 /// (FRAMEEND | IRQ), `TXINDEX` <- the slot after (`dma.c:1186-1286`, `:213-217`), the cookie
 /// `(controller + 1) << 12 | 2n` (`dma.c:1133-1150`); then the TX-status FIFO is drained for up to
@@ -438,8 +445,8 @@ pub(super) fn fire_frame(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, k
     let cookie = COOKIE_RING1 | slot as u16;
     let hdr = txhdr(frame, ch, cookie);
     r.cookie = cookie;
-    let hbuf = p.buf + n as u64 * FRAME_STRIDE;
-    let fbuf = hbuf + 256;
+    let hbuf = p.buf + (n % BUF_FRAMES) as u64 * 2 * FRAME_STRIDE;
+    let fbuf = hbuf + FRAME_STRIDE;
     for (i, b) in hdr.iter().enumerate() {
         unsafe { core::ptr::write_volatile((hbuf + i as u64) as *mut u8, *b) };
     }
@@ -451,9 +458,9 @@ pub(super) fn fire_frame(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, k
         fill(p.ring, slot + 1, fbuf, frame.len(), DCTL0_FRAMEEND | DCTL0_IRQ, w);
     }
     r.dptr_before = unsafe { r32(bar0, TXSTATUS) } & TXSTATDPTR;
-    // dma.c:1284-1285: wmb, then poke the slot AFTER the frame's last one.
+    // dma.c:1284-1285: wmb, then poke the slot AFTER the frame's last one (slot 0 after slot 63, the table end).
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    let txindex = (slot + TX_SLOTS_PER_FRAME) * DESC_BYTES;
+    let txindex = ((slot + TX_SLOTS_PER_FRAME) % SLOTS) * DESC_BYTES;
     unsafe { w32(bar0, TXINDEX, txindex as u32) };
     w.dma += 1;
     let mut hx = String::new();
@@ -501,7 +508,9 @@ pub(super) fn fire_frame(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, k
             }
             continue;
         }
-        crate::arch::sched::sleep_ms(1);
+        // WIFIDHCP (B831): a spin, not a sleep — the kept station sends from inside smolnet's STACK hold, which must
+        // never park its holder.
+        let _ = settle(1000);
         waited += 1;
     }
     r.waited_ms = waited;
