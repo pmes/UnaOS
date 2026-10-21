@@ -56,7 +56,16 @@
 //! MUTE_CONTROL, 0x02 VOLUME_CONTROL).
 //! USB 2.0 Table 9-12/9-13 (interface, endpoint; the audio endpoint is 9 bytes with bRefresh/bSynchAddress). QEMU's
 //! `hw/usb/dev-audio.c` (recalled, not re-read on this arc) is the fixture's shape: full-speed, AC interface 0, AS
-//! interface 1 alt 1, OUT 0x01 adaptive, 192-byte packets at 48 kHz stereo, no sampling-frequency control.
+//! interface 1 alt 1, OUT 0x01 SYNCHRONOUS (bmAttributes 0x0d, sync type 11 — re-read by UACFEEDBACK B789 at
+//! dev-audio.c:227; an earlier line here said adaptive), 192-byte packets at 48 kHz stereo, no sampling-frequency
+//! control, no feedback endpoint (bNumEndpoints 1), and every OUT packet that is not exactly 192 bytes is dropped
+//! (`streambuf_put`).
+//!
+//! * **Feedback** (UACFEEDBACK, rmbp-ledger B789; USB 2.0 §5.12.4.2, UAC1 §3.7.2.2 / §4.6.2) — an asynchronous sink's
+//!   OUT data endpoint names its feedback (synch) endpoint in bSynchAddress; [`probe`] opens it after the OUT pipe as
+//!   the engine's feedback pipe ([`feedback_open`]); each completed value is decoded by [`fb_decode`] into ONE atomic
+//!   word ([`push_feedback`], lock-free), and each OUT TD's frame count is [`meter`]'s accumulator of it
+//!   ([`out_next_len`]) — 48 per ms while no value has arrived, so a synchronous device gets today's packets.
 
 use crate::drivers::uvc::{IsoEp, IsoHost};
 use alloc::string::String;
@@ -157,6 +166,15 @@ pub struct Alt {
     pub have_ep: bool,
     /// The class-specific endpoint's bmAttributes bit 0: the sampling frequency is settable (§4.6.1.2).
     pub freq_ctl: bool,
+    /// UACFEEDBACK (B789): the data endpoint's sync type (bmAttributes 3:2: 0 none, 1 async, 2 adaptive, 3 sync).
+    pub sync: u8,
+    /// The data endpoint's bSynchAddress (UAC1 §4.6.1.1, byte 8 of the 9-byte audio endpoint; 0 = none).
+    pub synch_addr: u8,
+    /// The feedback (synch) endpoint: an isochronous IN with usage 01, or the address bSynchAddress names.
+    pub fb: IsoEp,
+    pub have_fb: bool,
+    /// The feedback endpoint's bRefresh: its value is refreshed every 2^refresh ms.
+    pub refresh: u8,
 }
 
 impl Alt {
@@ -309,10 +327,24 @@ pub fn parse(cfg: &[u8]) -> Parsed {
             DT_ENDPOINT if len >= 7 => {
                 if let Some(i) = cur {
                     let a = &mut p.alts[i];
-                    if !a.have_ep && (d[3] & 0x03) == 0x01 {
+                    // UACFEEDBACK (B789): bmAttributes 5:4 = usage (01 feedback), 3:2 = sync type; a 9-byte audio
+                    // endpoint carries bRefresh[7] bSynchAddress[8]. The first non-feedback isochronous endpoint is the
+                    // data endpoint (as before); a later IN with usage 01, or at the address bSynchAddress names, is
+                    // its feedback endpoint (UAC1-era synch endpoints carry bmAttributes 0x01: no usage bits).
+                    let usage = (d[3] >> 4) & 0x03;
+                    if (d[3] & 0x03) == 0x01 {
                         let w = le16(d, 4);
-                        a.ep = IsoEp { intf: a.intf, alt: a.alt, addr: d[2], mps: w & 0x07FF, hs_extra: ((w >> 11) & 0x03) as u8, interval: d[6], ..IsoEp::default() };
-                        a.have_ep = true;
+                        let ep = IsoEp { intf: a.intf, alt: a.alt, addr: d[2], mps: w & 0x07FF, hs_extra: ((w >> 11) & 0x03) as u8, interval: d[6], ..IsoEp::default() };
+                        if !a.have_ep && usage != 1 {
+                            a.ep = ep;
+                            a.have_ep = true;
+                            a.sync = (d[3] >> 2) & 0x03;
+                            a.synch_addr = if len >= 9 { d[8] } else { 0 };
+                        } else if !a.have_fb && d[2] & 0x80 != 0 && (usage == 1 || (a.synch_addr != 0 && d[2] == a.synch_addr)) {
+                            a.fb = ep;
+                            a.have_fb = true;
+                            a.refresh = if len >= 9 { d[7] } else { 0 };
+                        }
                     }
                 }
             }
@@ -566,11 +598,13 @@ pub fn probe(slot: u8, vid: u16, pid: u16, win: &[u8], cfg_value: u8, h: &mut dy
         let r = h.control(0x22, RQ_SET_CUR, SAMPLING_FREQ_CONTROL << 8, a.ep.addr as u16, 3, false);
         serial_println!("[uac] set-cur sampling_freq={} ep={:#04x} result={}", RATE, a.ep.addr, match r { Ok(_) => "ok", Err(e) => e });
     }
+    feedback_reset(); // UACFEEDBACK (B789): the first OUT fill is nominal; no value from an earlier device carries over
     TAIL.store(HEAD.load(Ordering::Acquire), Ordering::Release); match h.iso_start(&a.ep) { // CRAWLC: an aborted tone's bytes left in the ring are dropped before the first TD fill (no consumer runs yet)
         Ok((tds, lead, sched)) => {
             STREAMING.store(true, Ordering::Release);
             *WHY.lock() = "ok";
             volume_arm(p.ac_intf, p.fu);
+            feedback_open(h, slot, &a); // UACFEEDBACK (B789): an asynchronous sink's feedback endpoint, after the OUT pipe
             serial_println!("[uac] stream slot={} intf={} alt={} ep={:#04x} tds={} lead_uframes={} sched={} -> streaming", slot, a.intf, a.alt, a.ep.addr, tds, lead, sched);
             wire();
             crate::audio::usb_arrived(vid, pid);
@@ -590,6 +624,7 @@ pub fn disconnect(slot: u8) {
     capture_lost(slot, "gone"); // UACMIC: the capture device goes with it (the pipe went in `isoch::disconnect`)
     SLOT.store(0, Ordering::Release);
     FU.store(0, Ordering::Release); // SINKALL: the feature unit goes with the device
+    feedback_reset(); // UACFEEDBACK (B789): the feedback value goes too (its pipe went in `isoch::disconnect`)
     let was = STREAMING.swap(false, Ordering::AcqRel);
     ENUMERATED.store(false, Ordering::Release);
     *WHY.lock() = "gone";
@@ -813,7 +848,7 @@ pub fn capture_lost(slot: u8, why: &'static str) {
 
 /// QEMU `usb-audio`'s stereo configuration as this driver expects it (110 bytes): AC interface 0 (header bcdADC
 /// 1.00, input terminal 0x0101 USB streaming, feature unit, output terminal 0x0301 speaker), AS interface 1 alt 0
-/// (no endpoint) and alt 1 (PCM, Type I 2 x 16-bit, 48 kHz; OUT 0x01 isochronous adaptive, 192 bytes, every frame).
+/// (no endpoint) and alt 1 (PCM, Type I 2 x 16-bit, 48 kHz; OUT 0x01 isochronous synchronous (0x0d), 192 bytes, every frame).
 const FIXTURE: [u8; 110] = [
     0x09, 0x02, 0x6e, 0x00, 0x02, 0x01, 0x00, 0x80, 0x32, //
     0x09, 0x04, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, //
@@ -876,6 +911,7 @@ pub fn fixture() {
     let mut mono = FIXTURE;
     mono[FIXTURE_NCH] = 1;
     sc.check("mono.refused", pick(&parse(&mono)).is_none() as u64, 1);
+    feedback_kats(&mut sc); // UACFEEDBACK (B789): the feedback endpoint's walk, its decode and the meter
     let (iso_tds, iso_missed, iso_underrun, iso_events) = crate::drivers::xhci::isoch::out_stats();
     if sc.fails != 0 {
         let (w, g, x) = sc.first;
@@ -897,8 +933,9 @@ pub fn fixture() {
             let (t1, m1, u1, e1) = crate::drivers::xhci::isoch::out_stats();
             let pass = frames >= RATE as u64 && und == 0;
             serial_println!(
-                ":: UAC1: enumerated=1 stream=ok frames={} underruns={} -> {} :: hz=440 ms=1000 want_frames>={} iso_tds={} iso_missed={} iso_ring_underrun={} iso_events={} ::",
-                frames, und, if pass { "PASS" } else { "FAIL" }, RATE, t1.wrapping_sub(iso_tds), m1.wrapping_sub(iso_missed), u1.wrapping_sub(iso_underrun), e1.wrapping_sub(iso_events)
+                ":: UAC1: enumerated=1 stream=ok frames={} underruns={} -> {} :: hz=440 ms=1000 want_frames>={} iso_tds={} iso_missed={} iso_ring_underrun={} iso_events={} sync={} feedback={} metered={} ::",
+                frames, und, if pass { "PASS" } else { "FAIL" }, RATE, t1.wrapping_sub(iso_tds), m1.wrapping_sub(iso_missed), u1.wrapping_sub(iso_underrun), e1.wrapping_sub(iso_events),
+                sync_name(SYNC.load(Ordering::Relaxed)), fb_text(FB_Q16.load(Ordering::Acquire)), METERED.load(Ordering::Relaxed)
             );
         }
         Err(e) => serial_println!(":: UAC1: enumerated=1 stream=ok frames=0 underruns=0 -> FAIL :: tone={} ::", e),
@@ -1203,4 +1240,202 @@ pub fn fu_fixture() -> bool {
     let ok = p.fu == Fu { unit: 2, mute: 0b001, vol: 0b110 } && level_db(0, -0x7f00, 0) == -0x7f00 && level_db(16, -0x7f00, 0) == 0 && level_db(8, -0x7f00, 0) == -0x3f80;
     serial_println!("[uac] fixture feature unit={} mute={:#04x} vol={:#04x} level_db(8)={:#06x} -> {}", p.fu.unit, p.fu.mute, p.fu.vol, level_db(8, -0x7f00, 0) as u16, if ok { "ok" } else { "FAIL" });
     ok
+}
+
+// ── UACFEEDBACK (rmbp-ledger B789): the asynchronous sink's feedback endpoint ───────────────────────────────────────────
+// USB 2.0 §5.12.4.2: Ff = samples per (micro)frame — full-speed 10.10 left-justified in 3 bytes (10.14), high-speed 16.16
+// in 4 bytes per microframe. UAC1 §3.7.2.2 / §4.6.2: an asynchronous OUT endpoint names its synch endpoint in
+// bSynchAddress; the host meters the next OUT packets to the value so the device's FIFO neither drains nor overflows.
+// The value is ONE atomic word: written lock-free by [`push_feedback`] from the engine's feedback claim (under the
+// feedback pipe's own lock), read by [`out_next_len`] from the OUT TD fill (under the OUT pipe's own lock).
+
+/// The latest feedback value, Q16 frames per ms (0 = none: the stream plays the nominal 48).
+static FB_Q16: AtomicU32 = AtomicU32::new(0);
+/// The fractional frames carried between OUT packets (one context: the OUT pipe's fill).
+static METER_ACC: AtomicU64 = AtomicU64::new(0);
+/// The feedback endpoint's address while the stream holds one (0 = none) — the `ac` door's routing word.
+static FB_EP: AtomicU8 = AtomicU8::new(0);
+/// The stream's sync type (data endpoint bmAttributes 3:2).
+static SYNC: AtomicU8 = AtomicU8::new(0);
+/// OUT packets sized from a feedback value; values taken; values refused.
+static METERED: AtomicU32 = AtomicU32::new(0);
+static FB_READS: AtomicU32 = AtomicU32::new(0);
+static FB_BAD: AtomicU32 = AtomicU32::new(0);
+/// The window a value must lie in: nominal 48 frames per ms +/- 1/8 (42..54), Q16.
+const FB_LO: u32 = 42 << 16;
+const FB_HI: u32 = 54 << 16;
+
+/// The alternate's feedback endpoint: an OUT data endpoint of sync type 01 (asynchronous) that has one.
+pub fn feedback_of(a: &Alt) -> Option<IsoEp> {
+    (a.have_ep && a.ep.addr & 0x80 == 0 && a.sync == 1 && a.have_fb).then_some(a.fb)
+}
+
+/// One feedback value to Q16 frames per ms: 3 bytes = 10.14 frames per ms (full-speed), 4 bytes = 16.16 frames per
+/// microframe (high-speed, x 8). Any other length, or a value outside 42..54 frames per ms, is refused.
+pub fn fb_decode(raw: &[u8]) -> Option<u32> {
+    let q = match raw.len() {
+        3 => le24(raw, 0) << 2,
+        4 => u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]).checked_mul(8)?,
+        _ => return None,
+    };
+    (FB_LO..=FB_HI).contains(&q).then_some(q)
+}
+
+/// THE METER — frames for the next packet of `interval_uf` microframes at `q16_ms` frames per ms: the integral part of
+/// the accumulator (`acc` = the carried fraction, Q19 = Q16 frames x 8 microframes), the remainder carried.
+pub fn meter(acc: u64, q16_ms: u32, interval_uf: u32) -> (u32, u64) {
+    let t = acc + q16_ms as u64 * interval_uf as u64;
+    ((t >> 19) as u32, t & ((1 << 19) - 1))
+}
+
+/// THE FEEDBACK PRODUCER — one completed feedback TD's bytes (the engine's claim path; lock-free). A zero-length
+/// completion (the device had no new value) is ignored; a value [`fb_decode`] refuses is counted and dropped.
+pub fn push_feedback(src: &[u8]) {
+    if src.is_empty() {
+        return;
+    }
+    match fb_decode(src) {
+        Some(q) => {
+            FB_Q16.store(q, Ordering::Release);
+            FB_READS.fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            FB_BAD.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The `ac` door's routing question: `addr` is the streaming device's feedback endpoint (the engine's feedback pipe).
+pub fn feedback_ep(addr: u8) -> bool {
+    addr != 0 && FB_EP.load(Ordering::Acquire) == addr
+}
+
+/// The OUT TD's bytes (the engine's `Pipe::produce`, under the OUT pipe's lock): `nominal` while no feedback value has
+/// arrived (a synchronous or adaptive device: today's packet), else [`meter`]'s frames x 4, within the endpoint's ESIT.
+pub fn out_next_len(nominal: u32, interval_uf: u32, esit: u32) -> u32 {
+    let q = FB_Q16.load(Ordering::Acquire);
+    if q == 0 {
+        return nominal;
+    }
+    let (frames, acc) = meter(METER_ACC.load(Ordering::Relaxed), q, interval_uf);
+    METER_ACC.store(acc, Ordering::Relaxed);
+    METERED.fetch_add(1, Ordering::Relaxed);
+    (frames * FRAME_BYTES).min(esit / FRAME_BYTES * FRAME_BYTES)
+}
+
+/// A stream starts or its device leaves: no value, no carried fraction, no feedback endpoint.
+fn feedback_reset() {
+    FB_EP.store(0, Ordering::Release);
+    FB_Q16.store(0, Ordering::Release);
+    METER_ACC.store(0, Ordering::Relaxed);
+    METERED.store(0, Ordering::Relaxed);
+}
+
+/// After the OUT pipe started: open the alternate's feedback endpoint on the host's feedback pipe. A refusal leaves the
+/// stream unmetered (48 frames per ms), never failed.
+fn feedback_open(h: &mut dyn IsoHost, slot: u8, a: &Alt) {
+    SYNC.store(a.sync, Ordering::Relaxed);
+    let Some(fb) = feedback_of(a) else {
+        serial_println!("[uac] sync={} feedback=none -> unmetered (48 frames per ms)", sync_name(a.sync));
+        return;
+    };
+    FB_EP.store(fb.addr, Ordering::Release);
+    if let Err((cc, name)) = h.iso_configure(&fb) {
+        FB_EP.store(0, Ordering::Release);
+        serial_println!("[uac] feedback slot={} ep={:#04x} refused stage=configure-endpoint reason=cc{}-{} -> unmetered", slot, fb.addr, cc, name);
+        return;
+    }
+    match h.iso_start(&fb) {
+        Ok((tds, _, _)) => serial_println!(
+            "[uac] feedback slot={} ep={:#04x} mps={} interval={} refresh_ms={} tds={} -> metering",
+            slot, fb.addr, fb.mps, fb.interval, 1u32 << a.refresh.min(15), tds
+        ),
+        Err(e) => {
+            h.iso_drop(&fb);
+            FB_EP.store(0, Ordering::Release);
+            serial_println!("[uac] feedback slot={} ep={:#04x} refused stage=iso-start reason={} -> unmetered", slot, fb.addr, e);
+        }
+    }
+}
+
+/// `n.nnnn` frames per ms, or `none`.
+fn fb_text(q: u32) -> String {
+    if q == 0 {
+        return String::from("none");
+    }
+    alloc::format!("{}.{:04}", q >> 16, ((q & 0xFFFF) as u64 * 10_000 / 65_536))
+}
+
+fn sync_name(s: u8) -> &'static str {
+    match s & 3 {
+        1 => "async",
+        2 => "adaptive",
+        3 => "sync",
+        _ => "none",
+    }
+}
+
+/// Offsets in [`FIXTURE`]: alt 1's bNumEndpoints, the data endpoint's bmAttributes and bSynchAddress.
+const FIXTURE_NEP: usize = 71;
+const FIXTURE_EP_ATTR: usize = 97;
+const FIXTURE_EP_SYNCH: usize = 102;
+/// A UAC1-era synch endpoint: IN 0x81, bmAttributes 0x01 (no usage bits), 3 bytes, every frame, bRefresh 5 (32 ms).
+const FB_DESC: [u8; 9] = [0x09, 0x05, 0x81, 0x01, 0x03, 0x00, 0x01, 0x05, 0x00];
+
+/// `tests uac1`'s feedback KATs: QEMU's synchronous endpoint has none; an asynchronous variant of [`FIXTURE`] finds
+/// its synch endpoint by bSynchAddress and by usage bits; [`fb_decode`] in both widths; [`meter`] at 47.75 / 48 / 48.5.
+fn feedback_kats(sc: &mut Score) {
+    match pick(&parse(&FIXTURE)) {
+        Some(a) => {
+            sc.check("fb.qemu.sync", a.sync as u64, 3);
+            sc.check("fb.qemu.have_fb", a.have_fb as u64, 0);
+            sc.check("fb.qemu.none", feedback_of(&a).is_none() as u64, 1);
+        }
+        None => sc.check("fb.qemu.pick", 0, 1),
+    }
+    let mut v = [0u8; 119];
+    v[..110].copy_from_slice(&FIXTURE);
+    v[110..].copy_from_slice(&FB_DESC);
+    v[2] = 119;
+    v[FIXTURE_NEP] = 2;
+    v[FIXTURE_EP_ATTR] = 0x05;
+    v[FIXTURE_EP_SYNCH] = 0x81;
+    match pick(&parse(&v)) {
+        Some(a) => {
+            sc.check("fb.async.sync", a.sync as u64, 1);
+            sc.check("fb.async.synch_addr", a.synch_addr as u64, 0x81);
+            sc.check("fb.async.ep", feedback_of(&a).map(|e| e.addr as u64).unwrap_or(0), 0x81);
+            sc.check("fb.async.mps", a.fb.mps as u64, 3);
+            sc.check("fb.async.refresh", a.refresh as u64, 5);
+            sc.check("fb.async.data_ep", a.ep.addr as u64, 0x01);
+        }
+        None => sc.check("fb.async.pick", 0, 1),
+    }
+    v[FIXTURE_EP_SYNCH] = 0;
+    v[110 + 3] = 0x11; // usage 01: found by the usage bits alone
+    sc.check("fb.usage.ep", pick(&parse(&v)).and_then(|a| feedback_of(&a)).map(|e| e.addr as u64).unwrap_or(0), 0x81);
+    let d = |r: &[u8]| fb_decode(r).map(|q| q as u64).unwrap_or(0);
+    sc.check("fb.decode.fs48", d(&[0x00, 0x00, 0x0C]), 0x30_0000);
+    sc.check("fb.decode.fs47_5", d(&[0x00, 0xE0, 0x0B]), 0x2F_8000);
+    sc.check("fb.decode.hs48", d(&[0x00, 0x00, 0x06, 0x00]), 0x30_0000);
+    sc.check("fb.decode.hs48_5", d(&[0x00, 0x10, 0x06, 0x00]), 0x30_8000);
+    sc.check("fb.decode.zero", d(&[0x00, 0x00, 0x00]), 0);
+    sc.check("fb.decode.96", d(&[0x00, 0x00, 0x18]), 0);
+    sc.check("fb.decode.2byte", d(&[0x00, 0x0C]), 0);
+    let run = |q: u32, uf: u32| {
+        let (mut acc, mut out) = (0u64, [0u32; 4]);
+        for f in out.iter_mut() {
+            let (n, a) = meter(acc, q, uf);
+            *f = n;
+            acc = a;
+        }
+        out
+    };
+    let m = run(0x30_8000, 8);
+    sc.check("fb.meter.48_5", (m == [48, 49, 48, 49]) as u64, 1);
+    let m = run(0x2F_C000, 8);
+    sc.check("fb.meter.47_75.first", m[0] as u64, 47);
+    sc.check("fb.meter.47_75.sum", m.iter().sum::<u32>() as u64, 191);
+    sc.check("fb.meter.hs", run(0x30_0000, 1)[0] as u64, 6);
+    sc.check("fb.meter.fs", run(0x30_0000, 8)[0] as u64, 48);
 }
