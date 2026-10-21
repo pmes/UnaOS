@@ -311,7 +311,7 @@ const MIX_GEN: u64 = u64::MAX;
 /// The master stage the sink needs: (gain Q8, mute, level 0..16 for the wire). HDA's codec amp carries the level; a USB
 /// device's feature unit carries it when it has one (SINKALL M2); otherwise — and always on BT — the mixer scales.
 fn master(kind: u8) -> (u16, bool, u8) {
-    let (lv, muted) = crate::video::status::volume();
+    let (lv, muted) = crate::video::status::volume(); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] if kind == OUT_BT && bt_hw_volume() { return (UNITY, muted, lv); }
     if kind == OUT_HDA || (kind == OUT_USB && usb_hw_volume(lv, muted)) { (UNITY, false, lv) } else { (lv.min(16) as u16 * 16, muted, lv) }
 }
 
@@ -891,4 +891,14 @@ pub fn bt_synthetic(pcm: &[u8]) -> (usize, usize, u64, u64, bool) {
     let ok = took == pcm.len() && fout.abs_diff(want) <= 1 && pout <= pin / 2 + 2 && pout * 5 >= pin * 2; // nearest-sample may skip the peak sample: half, within 20 % below
     serial_println!("[sinkall] bt synthetic frames_in={} frames_out={} want={} peak_in={} peak_out={} -> {}", fin, fout, want, pin, pout, if ok { "ok" } else { "FAIL" });
     (open, after, fin, fout, ok)
+}
+
+// ── AVRCPCT (rmbp-ledger B780) — TAIL-APPENDED: the headset carries the BT level ──────────────────────────────────────
+// `master`'s BT arm (folded onto its first line, LINE-NEUTRAL): while the headset has accepted AVRCP SetAbsoluteVolume
+// (`avctp::ct_volume`, an atomic), it applies the level, so the mixer plays BT at unity and keeps only the mute
+// (BP-audio-14: the master applied once); otherwise the mixer scales, as before.
+
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
+fn bt_hw_volume() -> bool {
+    crate::drivers::ehci::bthid::avctp::ct_volume()
 }

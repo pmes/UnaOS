@@ -30,8 +30,8 @@
 //! Wire: `[a2dp] dev=<addr> link up -> sdp`, `[a2dp] sdp dev= sink=<yes|no> psm= avdtp= a2dp=`, `[a2dp] dev=
 //! signalling channel …`, `[a2dp] dev= media channel …`, `[a2dp] dev=<addr> codec=sbc 44100 js bitpool=<n> mtu=<n>
 //! -> streaming`, `[a2dp] dev= -> FAILED reason=`, `[a2dp] dev= gone`; `tests a2dp`: `:: A2DP: sbc_kat=ok avdtp=ok
-//! frag=ok stream=<ok|no-device> sdp_server=<ok|FAIL> inbound=<ok|FAIL> avrcp=<ok|FAIL> -> PASS|SKIP|FAIL ::` (`sdp_server`, `inbound`: SDPSERVER
-//! B769; `avrcp=` AVRCP B774); `[a2dp] dev= the peer opened the link -> acceptor …` (a reconnecting headset drives AVDTP, [`acp_due`]). Compiled only under the `a2dp` knob (A2DPKNOB B750).
+//! frag=ok stream=<ok|no-device> sdp_server=<ok|FAIL> inbound=<ok|FAIL> avrcp=<ok|FAIL> avrcp_ct=<ok|FAIL> -> PASS|SKIP|FAIL ::` (`sdp_server`, `inbound`: SDPSERVER
+//! B769; `avrcp=` AVRCP B774; `avrcp_ct=` AVRCPCT B780); `[a2dp] dev= the peer opened the link -> acceptor …` (a reconnecting headset drives AVDTP, [`acp_due`]). Compiled only under the `a2dp` knob (A2DPKNOB B750).
 
 use super::l2cap::{self, AvdtpRole};
 use super::sdp;
@@ -95,7 +95,7 @@ const SSRC: u32 = 1;
 /// The send clock's lead over real time.
 const LEAD_FRAMES: u64 = RATE as u64 * 40 / 1000;
 /// An acceptor-side wait before this host takes the initiative (discover, or start an opened stream).
-const ACP_WAIT_MS: u64 = 1500;
+pub(super) const ACP_WAIT_MS: u64 = 1500;
 
 /// (bitpool, frames per packet) for a peer offering `min_bp..=max_bp` when one packet carries `fit` bytes: the
 /// highest bitpool up to 53 that still puts TWO frames in a packet if that keeps it at 35 or more (the
@@ -679,6 +679,7 @@ impl Bt {
                         serial_println!("[a2dp] dev={} frame_len={} frames_per_packet={} alloc={} role={}", fmt_addr(&addr), cfg.frame_len(), s.peer.fpp, if s.peer.snr { "snr" } else { "loudness" }, if s.peer.int { "initiator" } else { "acceptor" });
                     }
                     STREAMING.store(true, Ordering::Release);
+                    super::avctp::ct_arm(addr, now); // AVRCPCT (B780): the AVRCP controller is bound to the streaming headset
                 }
                 Out::Stopped => {
                     STREAMING.store(false, Ordering::Release);
@@ -728,9 +729,11 @@ fn acp_due(bt: &mut Bt, now: u64) {
     }
 }
 
-/// Once per BTHID pass (`step`, under the `BT` lock): the acceptor-side waits, then the media clock.
+/// Once per BTHID pass (`step`, under the `BT` lock): the acceptor-side waits, the AVRCP watch on the master, then the
+/// media clock.
 pub(super) fn tick(bt: &mut Bt, now: u64) {
     acp_due(bt, now);
+    bt.avrcp_watch(now); // AVRCPCT (B780): the CT's outbound AVCTP open, the TG's CHANGED and the CT's SetAbsoluteVolume
     let mut outs = Vec::new();
     let li = {
         let mut g = A2.lock();
@@ -1090,7 +1093,8 @@ fn frag_legs() -> Result<(), &'static str> {
 /// `tests a2dp`: the SBC KAT (`sbc_core::kat`, the same function the host test runs), the AVDTP state machine over a
 /// synthetic peer (and the SDP record and L2CAP fit below it), outbound L2CAP fragmentation, whether a stream runs
 /// now, and (SDPSERVER B769, at the END) the SDP server and the inbound acceptor ([`sdp::server_legs`], [`inbound_legs`]),
-/// then (AVRCP B774, at the END) the AVRCP target over a synthetic controller ([`super::avctp::legs`]).
+/// then (AVRCP B774, at the END) the AVRCP target over a synthetic controller ([`super::avctp::legs`]), then (AVRCPCT
+/// B780, at the END) the AVRCP controller and the master watch over a synthetic headset ([`super::avctp::legs_ct`]).
 pub fn fixture() {
     let kat = sbc::kat();
     let av = avdtp_legs();
@@ -1098,16 +1102,17 @@ pub fn fixture() {
     let srv = sdp::server_legs();
     let inb = inbound_legs();
     let avrcp = super::avctp::legs();
+    let avrcp_ct = super::avctp::legs_ct();
     let stream = if streaming() { "ok" } else { "no-device" };
-    for (leg, r) in [("sbc_kat", kat), ("avdtp", av), ("frag", frag), ("sdp_server", srv), ("inbound", inb), ("avrcp", avrcp)] {
+    for (leg, r) in [("sbc_kat", kat), ("avdtp", av), ("frag", frag), ("sdp_server", srv), ("inbound", inb), ("avrcp", avrcp), ("avrcp_ct", avrcp_ct)] {
         match r {
             Ok(()) => serial_println!("[a2dp] fixture {} -> PASS", leg),
             Err(why) => serial_println!("[a2dp] fixture {} -> FAIL at {}", leg, why),
         }
     }
     let ok = |r: Result<(), &'static str>| if r.is_ok() { "ok" } else { "FAIL" };
-    let verdict = if kat.is_err() || av.is_err() || frag.is_err() || srv.is_err() || inb.is_err() || avrcp.is_err() { "FAIL" } else if stream == "ok" { "PASS" } else { "SKIP" };
-    serial_println!(":: A2DP: sbc_kat={} avdtp={} frag={} stream={} sdp_server={} inbound={} avrcp={} -> {} ::", ok(kat), ok(av), ok(frag), stream, ok(srv), ok(inb), ok(avrcp), verdict);
+    let verdict = if kat.is_err() || av.is_err() || frag.is_err() || srv.is_err() || inb.is_err() || avrcp.is_err() || avrcp_ct.is_err() { "FAIL" } else if stream == "ok" { "PASS" } else { "SKIP" };
+    serial_println!(":: A2DP: sbc_kat={} avdtp={} frag={} stream={} sdp_server={} inbound={} avrcp={} avrcp_ct={} -> {} ::", ok(kat), ok(av), ok(frag), stream, ok(srv), ok(inb), ok(avrcp), ok(avrcp_ct), verdict);
     if verdict == "SKIP" {
         serial_println!(":: A2DP: SKIP = both fixtures passed but no A2DP stream runs (`bt audio <addr>` with a headset in pairing mode, then `tests a2dp`) ::");
     }

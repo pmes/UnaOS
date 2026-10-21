@@ -17,19 +17,32 @@
 //!   PDUs GetCapabilities (company ID, events {volume changed}), SetAbsoluteVolume and RegisterNotification
 //!   (volume changed: INTERIM now, one CHANGED on the kept label at the next AVRCP volume change, [`VOL_NOTE`]).
 //!   Everything else is refused: NOT IMPLEMENTED (other opcodes and pass-through ops), REJECTED (other vendor PDUs,
-//!   other events). Browsing (PSM 0x001B), the controller role and metadata are not built.
+//!   other events). Browsing (PSM 0x001B) and metadata are not built.
+//! * AVRCP CONTROLLER (AVRCPCT, rmbp-ledger B780; [`Ct`], pure): on the A2DP headset's AVCTP channel (opened by either
+//!   side; ours after [`super::avdtp::ACP_WAIT_MS`] once the stream is up and the headset opened none, [`ct_arm`]) the CT
+//!   sends RegisterNotification(volume changed) and SetAbsoluteVolume, on its own labels beside the TG's; the
+//!   headset's CHANGED moves the master (then re-registers), a refused SetAbsoluteVolume stops the pushes.
+//! * THE WATCH ([`Watch::step`], once per BTHID pass from `avdtp::tick`): the master read each pass; when it moved, a
+//!   kept TG RegisterNotification gets its CHANGED (every writer: F-keys, the slider, Settings, AVRCP) and the CT pushes
+//!   SetAbsoluteVolume unless the headset itself set that level. While the headset has accepted one, it carries the
+//!   level and the mixer plays BT at unity ([`ct_volume`]; mute stays the mixer's).
 //! * THE EFFECTS ([`apply`]): play/pause/next/prev go to the Player's media-key door (`video::player::media_key`, the
 //!   F7/F8/F9 router; atomics only, so safe under `BT`) — PLAY flips only a stream that is not playing, PAUSE and STOP
 //!   only one that is (`hda::play::busy`/`paused`, read); the volume goes to the one master model through
 //!   `audio::bt_master` (0..=127 onto the 0..=16 level).
 //!
-//! Locks: `BT`, then [`VOL_NOTE`] alone (never with `avdtp`'s `A2` or `ACP_DUE`); `audio::bt_master` reaches
+//! Locks: `BT`, then [`VOL_NOTE`] alone or [`WATCH`] alone (never both, never with `avdtp`'s `A2` or `ACP_DUE`); `audio::bt_master` reaches
 //! `hda::vol`'s ring lock, which never takes `BT`. Wire: `[avrcp] cmd=<op> from=<addr> -> <play-pause|next|prev|none|
-//! volume=<n>|refused=<why>>`; `tests a2dp`: `avrcp=<ok|FAIL>` at the END of the `:: A2DP: … ::` verdict ([`legs`]).
+//! volume=<n>|refused=<why>>` · `[avrcp] ct cmd=<set-volume|register> to=<addr> -> <sent[ volume=<n>]|interim volume=<n>|
+//! changed volume=<n>|accepted volume=<n>|rejected|not-implemented>` · `[avrcp] ct open to=<addr> …` · `[avrcp] tg changed
+//! to=<addr> -> volume=<n>`; `tests a2dp`: `avrcp=<ok|FAIL>` then `avrcp_ct=<ok|FAIL>` at the END of the `:: A2DP: … ::`
+//! verdict ([`legs`], [`legs_ct`]).
 //! Compiled only under the `a2dp` knob.
 
-use super::{fmt_addr, Bt};
+use super::avdtp::ACP_WAIT_MS;
+use super::{fmt_addr, Bt, LinkSt};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// AVCTP's PSM (the control channel; browsing's 0x001B is not served).
 pub use super::l2cap::PSM_AVCTP;
@@ -318,11 +331,11 @@ fn apply(act: Act) -> (alloc::string::String, Option<u8>) {
 }
 
 impl Bt {
-    /// A PDU on an AVCTP channel: the target's answer on that channel, its effect, and the CHANGED a kept
-    /// RegisterNotification is owed when the volume moved.
+    /// A PDU on an AVCTP channel: the target's answer on that channel and its effect (a response goes to the CT,
+    /// [`Bt::ct_rx`]; the CHANGED a kept RegisterNotification is owed goes from the watch, [`Bt::avrcp_watch`]).
     pub(super) fn avrcp_rx(&mut self, li: usize, ci: usize, body: &[u8]) {
         let (addr, h, rcid) = (self.links[li].addr, self.links[li].handle, self.links[li].chans[ci].rcid);
-        let Some(r) = target(body, playing(), master()) else { return };
+        let Some(r) = target(body, playing(), master()) else { return self.ct_rx(li, ci, body) };
         if !r.rsp.is_empty() {
             self.l2_send(h, rcid, &r.rsp);
         }
@@ -335,12 +348,7 @@ impl Bt {
         if let Some(label) = r.note {
             *VOL_NOTE.lock() = Some((addr, label));
         } else if let Some(v) = moved {
-            let kept = VOL_NOTE.lock().take();
-            if let Some((a, label)) = kept {
-                if a == addr {
-                    self.l2_send(h, rcid, &changed(label, v));
-                }
-            }
+            ct_heard(addr, v); // the headset set this level: the CT pushes nothing back; the watch sends the CHANGED
         }
     }
 }
@@ -392,6 +400,345 @@ pub fn legs() -> Result<(), &'static str> {
         if v != Some(abs_of(8)) || lv != 8 {
             return Err("master");
         }
+    }
+    Ok(())
+}
+
+// ── AVRCPCT (rmbp-ledger B780): the CONTROLLER role and the one watch on the master ─────────────────────────────
+
+/// A SetAbsoluteVolume with no response this long is given up (the next move sends again).
+const CT_RSP_MS: u64 = 1000;
+
+/// The AVRCP controller toward the A2DP headset (the stream's device, [`ct_arm`]).
+#[derive(Clone, Copy)]
+pub struct Ct {
+    addr: [u8; 6],
+    /// When the stream came up with no AVCTP channel: this host opens one after [`ACP_WAIT_MS`] (ACP_DUE's shape).
+    due: Option<u64>,
+    /// The open AVCTP channel the CT runs on (0: none).
+    rcid: u16,
+    /// The CT's next transaction label (0..=15; the headset's labels on its commands are the TG's, [`VOL_NOTE`]).
+    next: u8,
+    /// The RegisterNotification(volume changed) awaiting its CHANGED: its label.
+    reg: Option<u8>,
+    /// The SetAbsoluteVolume awaiting its response: (label, sent at).
+    set: Option<(u8, u64)>,
+    /// The absolute volume the headset was last given (or set itself): the watch pushes only a different one.
+    pushed: Option<u8>,
+    /// The headset has not refused SetAbsoluteVolume.
+    abs_ok: bool,
+    /// The headset accepted one: it carries the level ([`ct_volume`]).
+    carries: bool,
+}
+
+/// What the headset answered the CT.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CtEv {
+    Interim(u8),
+    Changed(u8),
+    Accepted(u8),
+    Refused(&'static str),
+}
+
+impl Ct {
+    pub fn new(addr: [u8; 6], now: u64) -> Ct {
+        Ct { addr, due: Some(now), rcid: 0, next: 0, reg: None, set: None, pushed: None, abs_ok: true, carries: false }
+    }
+
+    fn label(&mut self) -> u8 {
+        let l = self.next;
+        self.next = (l + 1) & 0x0F;
+        l
+    }
+
+    /// The outbound open's wait ran out (once).
+    pub fn open_due(&mut self, now: u64) -> bool {
+        match self.due {
+            Some(t) if now.saturating_sub(t) > ACP_WAIT_MS => {
+                self.due = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A RegisterNotification(volume changed) on a fresh label.
+    pub fn register(&mut self) -> Vec<u8> {
+        let l = self.label();
+        self.reg = Some(l);
+        ct_register(l)
+    }
+
+    /// A response PDU from the headset on one of the CT's open labels: (the command it answers, what it said).
+    pub fn on_rsp(&mut self, pdu: &[u8]) -> Option<(&'static str, CtEv)> {
+        let (label, rsp, pid) = header(pdu)?;
+        let avc = pdu.get(3..)?;
+        if !rsp || pid != PID_AVRCP || avc.len() < 7 || avc[2] != VENDOR || avc[3..6] != BT_SIG {
+            return None;
+        }
+        let (code, id, p) = (avc[0] & 0x0F, avc[6], avc.get(10..).unwrap_or(&[]));
+        let vol = (p.len() >= 2 && p[0] == EV_VOLUME).then(|| p[1] & 0x7F);
+        if self.reg == Some(label) && id == REGISTER_NOTE {
+            let ev = match (code, vol) {
+                (INTERIM, Some(v)) => return Some(("register", CtEv::Interim(v))),
+                (CHANGED, Some(v)) => CtEv::Changed(v),
+                (REJECTED, _) => CtEv::Refused("rejected"),
+                (NOT_IMPLEMENTED, _) => CtEv::Refused("not-implemented"),
+                _ => return None,
+            };
+            self.reg = None;
+            return Some(("register", ev));
+        }
+        if self.set.is_some_and(|(l, _)| l == label) && id == SET_ABS_VOL {
+            self.set = None;
+            let ev = match code {
+                ACCEPTED if !p.is_empty() => CtEv::Accepted(p[0] & 0x7F),
+                REJECTED => CtEv::Refused("rejected"),
+                NOT_IMPLEMENTED => CtEv::Refused("not-implemented"),
+                _ => CtEv::Refused("unexpected"),
+            };
+            match ev {
+                CtEv::Accepted(v) => {
+                    self.carries = true;
+                    self.pushed = Some(v);
+                }
+                _ => {
+                    self.abs_ok = false;
+                    self.carries = false;
+                }
+            }
+            return Some(("set-volume", ev));
+        }
+        None
+    }
+}
+
+/// The CT's RegisterNotification(volume changed) command on `label` (playback interval 0).
+pub fn ct_register(label: u8) -> Vec<u8> {
+    command(label, &vendor(NOTIFY, REGISTER_NOTE, &[EV_VOLUME, 0, 0, 0, 0]))
+}
+
+/// The CT's SetAbsoluteVolume command on `label`.
+pub fn ct_set_volume(label: u8, abs: u8) -> Vec<u8> {
+    command(label, &vendor(CONTROL, SET_ABS_VOL, &[abs & 0x7F]))
+}
+
+/// A single-packet AVCTP COMMAND (C/R = 0) on `label` carrying `avc` ([`frame`] is the response's).
+fn command(label: u8, avc: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(3 + avc.len());
+    v.push(label << 4);
+    v.extend_from_slice(&PID_AVRCP.to_be_bytes());
+    v.extend_from_slice(avc);
+    v
+}
+
+/// One PDU the watch sends: to whom, which (`changed` the TG's, `register` / `set-volume` the CT's), the volume.
+pub struct Push {
+    pub to: [u8; 6],
+    pub cmd: &'static str,
+    pub pdu: Vec<u8>,
+    pub abs: u8,
+}
+
+/// The watch's state: the master at the last pass, and the CT.
+pub struct Watch {
+    seen: Option<u8>,
+    ct: Option<Ct>,
+}
+
+impl Watch {
+    /// One pass, pure: the master is `abs`, `note` the TG's kept RegisterNotification, `chan` the open AVCTP channel
+    /// to the CT's headset. A moved master closes the note with CHANGED; a new channel starts the CT (register); the
+    /// CT pushes SetAbsoluteVolume when the master differs from what the headset has and none is in flight.
+    pub fn step(&mut self, abs: u8, now: u64, note: &mut Option<([u8; 6], u8)>, chan: Option<u16>) -> Vec<Push> {
+        let mut out = Vec::new();
+        let moved = self.seen.is_some_and(|s| s != abs);
+        self.seen = Some(abs);
+        if moved {
+            if let Some((to, label)) = note.take() {
+                out.push(Push { to, cmd: "changed", pdu: changed(label, abs), abs });
+            }
+        }
+        let Some(ct) = self.ct.as_mut() else { return out };
+        let chan = chan.unwrap_or(0);
+        if ct.rcid != chan {
+            *ct = Ct { rcid: chan, due: None, ..Ct::new(ct.addr, now) };
+            if chan != 0 {
+                out.push(Push { to: ct.addr, cmd: "register", pdu: ct.register(), abs });
+            }
+        }
+        if ct.rcid == 0 || !ct.abs_ok {
+            return out;
+        }
+        if ct.set.is_some_and(|(_, t)| now.saturating_sub(t) > CT_RSP_MS) {
+            ct.set = None;
+        }
+        if ct.set.is_none() && ct.pushed != Some(abs) {
+            let l = ct.label();
+            ct.set = Some((l, now));
+            ct.pushed = Some(abs);
+            out.push(Push { to: ct.addr, cmd: "set-volume", pdu: ct_set_volume(l, abs), abs });
+        }
+        out
+    }
+
+    /// The headset carries the level now.
+    fn carries(&self) -> bool {
+        self.ct.as_ref().is_some_and(|c| c.carries && c.abs_ok && c.rcid != 0)
+    }
+}
+
+/// The watch and the CT. Lock order: `BT`, then this alone (never with [`VOL_NOTE`], `A2` or `ACP_DUE`).
+static WATCH: crate::sync::Mutex<Watch> = crate::sync::Mutex::new(Watch { seen: None, ct: None });
+/// [`Watch::carries`], published for the mixer (an atomic: the mixer never takes a Bluetooth lock).
+static CARRIES: AtomicBool = AtomicBool::new(false);
+
+/// The A2DP stream to `addr` is up (`avdtp`'s Out::Streaming): the CT is bound to that headset; with no AVCTP channel
+/// yet, the outbound open's wait starts.
+pub(super) fn ct_arm(addr: [u8; 6], now: u64) {
+    let mut w = WATCH.lock();
+    match w.ct.as_mut() {
+        Some(c) if c.addr == addr => {
+            if c.rcid == 0 {
+                c.due = Some(now);
+            }
+        }
+        _ => w.ct = Some(Ct::new(addr, now)),
+    }
+}
+
+/// The headset at `addr` set the master itself (the TG's SetAbsoluteVolume / volume keys): nothing is pushed back.
+fn ct_heard(addr: [u8; 6], abs: u8) {
+    if let Some(c) = WATCH.lock().ct.as_mut().filter(|c| c.addr == addr) {
+        c.pushed = Some(abs);
+    }
+}
+
+/// The headset has accepted SetAbsoluteVolume on a live CT: it carries the level, so the mixer plays BT at unity
+/// (BP-audio-14: the master is applied once).
+pub fn ct_volume() -> bool {
+    CARRIES.load(Ordering::Acquire)
+}
+
+impl Bt {
+    /// THE WATCH, once per BTHID pass (`avdtp::tick`): the CT's outbound AVCTP open when due, then [`Watch::step`]'s
+    /// PDUs sent on their links' AVCTP channels.
+    pub(super) fn avrcp_watch(&mut self, now: u64) {
+        let ct_addr = WATCH.lock().ct.map(|c| c.addr);
+        let li = ct_addr.and_then(|a| self.link_addr(&a));
+        let chan = li.and_then(|li| self.links[li].open_rcid(PSM_AVCTP));
+        if let (Some(li), None) = (li, chan) {
+            let due = WATCH.lock().ct.as_mut().is_some_and(|c| c.open_due(now));
+            if due && self.links[li].st == LinkSt::Up && self.links[li].chan_psm(PSM_AVCTP).is_none() {
+                serial_println!("[avrcp] ct open to={} (the peer opened no AVCTP within {} ms)", fmt_addr(&self.links[li].addr), ACP_WAIT_MS);
+                self.open_chan(li, PSM_AVCTP, now);
+            }
+        }
+        let mut note = VOL_NOTE.lock().take();
+        let sends = {
+            let mut w = WATCH.lock();
+            let s = w.step(master(), now, &mut note, chan);
+            CARRIES.store(w.carries(), Ordering::Release);
+            s
+        };
+        if let Some(n) = note {
+            VOL_NOTE.lock().get_or_insert(n);
+        }
+        for s in sends {
+            self.avrcp_send(&s);
+        }
+    }
+
+    /// One watch PDU on the AVCTP channel of the link to `s.to`, and its wire line.
+    fn avrcp_send(&mut self, s: &Push) {
+        let Some(li) = self.link_addr(&s.to) else { return };
+        let Some(rcid) = self.links[li].open_rcid(PSM_AVCTP) else { return };
+        let h = self.links[li].handle;
+        self.l2_send(h, rcid, &s.pdu);
+        match s.cmd {
+            "changed" => serial_println!("[avrcp] tg changed to={} -> volume={}", fmt_addr(&s.to), s.abs),
+            "register" => serial_println!("[avrcp] ct cmd=register to={} -> sent", fmt_addr(&s.to)),
+            cmd => serial_println!("[avrcp] ct cmd={} to={} -> sent volume={}", cmd, fmt_addr(&s.to), s.abs),
+        }
+    }
+
+    /// A RESPONSE on an AVCTP channel: the CT's. The headset's CHANGED moves the master (nothing pushed back) and the
+    /// CT registers again on the same channel.
+    fn ct_rx(&mut self, li: usize, ci: usize, body: &[u8]) {
+        let (addr, h, rcid) = (self.links[li].addr, self.links[li].handle, self.links[li].chans[ci].rcid);
+        let ev = {
+            let mut w = WATCH.lock();
+            let ev = w.ct.as_mut().filter(|c| c.addr == addr).and_then(|c| c.on_rsp(body));
+            CARRIES.store(w.carries(), Ordering::Release);
+            ev
+        };
+        let Some((cmd, ev)) = ev else { return };
+        let tail = match ev {
+            CtEv::Interim(v) => alloc::format!("interim volume={}", v),
+            CtEv::Changed(v) => alloc::format!("changed volume={}", v),
+            CtEv::Accepted(v) => alloc::format!("accepted volume={}", v),
+            CtEv::Refused(why) => alloc::string::String::from(why),
+        };
+        serial_println!("[avrcp] ct cmd={} to={} -> {}", cmd, fmt_addr(&addr), tail);
+        if let CtEv::Changed(v) = ev {
+            ct_heard(addr, set_master(v));
+            let again = WATCH.lock().ct.as_mut().filter(|c| c.addr == addr).map(|c| c.register());
+            if let Some(pdu) = again {
+                self.l2_send(h, rcid, &pdu);
+                serial_println!("[avrcp] ct cmd=register to={} -> sent", fmt_addr(&addr));
+            }
+        }
+    }
+}
+
+/// `tests a2dp` `avrcp_ct` leg — a synthetic headset: the outbound open's wait; on the channel, RegisterNotification
+/// then SetAbsoluteVolume out byte for byte; INTERIM and ACCEPTED parsed (the headset carries the level); the master
+/// moves -> the TG's kept note gets CHANGED on its label and SetAbsoluteVolume goes out; the headset's CHANGED is
+/// followed; a REJECTED stops the pushes; a stray label is ignored.
+pub fn legs_ct() -> Result<(), &'static str> {
+    const A: [u8; 6] = [1, 2, 3, 4, 5, 6];
+    let mut w = Watch { seen: None, ct: Some(Ct::new(A, 0)) };
+    let mut note = None;
+    if !w.step(64, 0, &mut note, None).is_empty() {
+        return Err("no-channel");
+    }
+    let c = w.ct.as_mut().ok_or("ct")?;
+    if c.open_due(ACP_WAIT_MS) || !c.open_due(ACP_WAIT_MS + 1) || c.open_due(ACP_WAIT_MS + 2) {
+        return Err("open-due");
+    }
+    let out = w.step(64, 1700, &mut note, Some(0x0041));
+    let want_reg: &[u8] = &[0x00, 0x11, 0x0E, 0x03, 0x48, 0x00, 0x00, 0x19, 0x58, 0x31, 0x00, 0x00, 0x05, 0x0D, 0x00, 0x00, 0x00, 0x00];
+    let want_set: &[u8] = &[0x10, 0x11, 0x0E, 0x00, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x40];
+    if out.len() != 2 || out[0].cmd != "register" || out[0].pdu != want_reg || out[1].cmd != "set-volume" || out[1].pdu != want_set {
+        return Err("register-and-set");
+    }
+    let c = w.ct.as_mut().ok_or("ct")?;
+    if c.on_rsp(&[0x02, 0x11, 0x0E, 0x0F, 0x48, 0x00, 0x00, 0x19, 0x58, 0x31, 0x00, 0x00, 0x02, 0x0D, 0x30]) != Some(("register", CtEv::Interim(0x30))) {
+        return Err("interim");
+    }
+    if c.on_rsp(&[0x12, 0x11, 0x0E, 0x09, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x40]) != Some(("set-volume", CtEv::Accepted(0x40))) || !w.carries() {
+        return Err("accepted");
+    }
+    if !w.step(64, 1800, &mut note, Some(0x0041)).is_empty() {
+        return Err("still");
+    }
+    note = Some((A, 9));
+    let out = w.step(abs_of(9), 1900, &mut note, Some(0x0041));
+    if out.len() != 2 || out[0].cmd != "changed" || out[0].pdu != changed(9, abs_of(9)) || out[1].pdu != ct_set_volume(2, abs_of(9)) || note.is_some() {
+        return Err("move");
+    }
+    let c = w.ct.as_mut().ok_or("ct")?;
+    if c.on_rsp(&[0x72, 0x11, 0x0E, 0x09, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x40]).is_some() {
+        return Err("stray-label");
+    }
+    if c.on_rsp(&[0x02, 0x11, 0x0E, 0x0D, 0x48, 0x00, 0x00, 0x19, 0x58, 0x31, 0x00, 0x00, 0x02, 0x0D, 0x50]) != Some(("register", CtEv::Changed(0x50))) || c.reg.is_some() {
+        return Err("changed");
+    }
+    if c.on_rsp(&[0x22, 0x11, 0x0E, 0x0A, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x00]) != Some(("set-volume", CtEv::Refused("rejected"))) || w.carries() {
+        return Err("rejected");
+    }
+    if !w.step(80, 2000, &mut note, Some(0x0041)).is_empty() {
+        return Err("refused-pushes");
     }
     Ok(())
 }
