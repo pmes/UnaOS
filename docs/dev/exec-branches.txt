@@ -695,3 +695,6 @@ refs/heads/exec-rmbp-layoutroot   9305af82 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-ehcihubchain   65c6e794 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-xhciholddci   65c6e794 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-subscribekeep   65c6e794 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-raisearm64   9a1134d7 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-pihome   9a1134d7 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-mailboxkeep   9a1134d7 IN-FLIGHT cut 2026-10-21
