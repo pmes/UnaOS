@@ -2648,7 +2648,8 @@ fn wheel_scroll(m: &mut Model, sx: usize, sy: usize, detents: i32) -> Option<Whe
 /// QUARRYHOVER (B647): [`wheel_scroll`] with the list pane's view named — every scrolling pane under the pointer:
 /// the SIDEBAR (SIDEBARWHEEL B792: its model, `sidebar::view`, stepped as wm steps it), the tree, the list (rows), the ICONS grid
 /// (whole grid rows, `list_scroll` kept on a row boundary as `iconview::follow` keeps it; `settle` is not called
-/// there because its row clamp is the List view's) and the Miller columns (`millercols::wheel`).
+/// there because its row clamp is the List view's) and the Miller columns (MILLERWHEEL B798: the column under the pointer,
+/// `millercols::view_at`, stepped as wm steps it — the focus pane's offset is the list's, another column's is its own).
 fn wheel_scroll_view(m: &mut Model, sx: usize, sy: usize, detents: i32, view: toolbar::View) -> Option<WheelHit> {
     let g = m.geom;
     if sidebar::rect(&g).contains(sx, sy) {
@@ -2667,7 +2668,18 @@ fn wheel_scroll_view(m: &mut Model, sx: usize, sy: usize, detents: i32, view: to
         return None;
     }
     if !tree && view == toolbar::View::Columns {
-        return millercols::wheel(m, sx, sy, detents); // SMALLFIX4 (COLUMNSVIEW owed): the wheel moves the pane under the pointer
+        return Some(match millercols::view_at(m, sx, sy) {
+            Some((slot, v)) => {
+                let line = v.line.max(1);
+                let st = v.step(-(detents as isize).saturating_mul((WHEEL_ROWS * line) as isize)); // MILLERWHEEL (B798): wm's one model, the live wheel's ratio
+                match slot {
+                    None => list_pull(m, st.off / line),
+                    Some(s) => millercols::col_set_top(m, s, st.off / line),
+                }
+                WheelHit { pane: "columns", scroll: st.off / line, max: v.max_offset() / line, moved: st.moved != 0 }
+            }
+            None => WheelHit { pane: "columns", scroll: 0, max: 0, moved: false },
+        });
     }
     if !tree && view == toolbar::View::Icons {
         let (cols, vis) = iconview::grid(&g, g.list_pane().inner());
@@ -4835,7 +4847,8 @@ fn pane_register(id: wm::WinId, pane: u8, v: Option<(wm::ScrollView, usize)>, f:
 }
 
 /// SCROLLPANES (B777): every pane's model after a full paint — the content pane as the view shows it (List rows,
-/// the Icons grid, the Columns focus pane), the tree and the sidebar (SIDEBARWHEEL B792; its ground is the window's).
+/// the Icons grid, the Columns focus pane), the tree and the sidebar (SIDEBARWHEEL B792; its ground is the window's),
+/// then every on-glass Columns slot (MILLERWHEEL B798: pane `PANE_COL0 + slot`, registered or dropped each paint).
 fn panes_register(id: wm::WinId, m: &Model, px: &mut [u32]) {
     if id == wm::WIN_NONE {
         return;
@@ -4848,6 +4861,10 @@ fn panes_register(id: wm::WinId, m: &Model, px: &mut [u32]) {
     pane_register(id, PANE_CONTENT, v, f, px, m.geom.w, theme::surface_content());
     pane_register(id, PANE_TREE, tree_view(m), tree_scrolled, px, m.geom.w, theme::surface_content());
     pane_register(id, PANE_SIDEBAR, sidebar::view(&m.geom), side_scrolled, px, m.geom.w, theme::surface_window());
+    let cv = if toolbar::view() == toolbar::View::Columns { millercols::col_views(m) } else { [None; COL_SLOTS] };
+    for (s, v) in cv.into_iter().enumerate() {
+        pane_register(id, PANE_COL0 + s as u8, v, COL_FNS[s], px, m.geom.w, theme::surface_content());
+    }
 }
 
 /// Paint body rows `[r0, r1)` of the viewport (view-relative) exactly as a full paint draws them: the ground, then
@@ -4956,8 +4973,8 @@ fn pane_step(
             core(m, px, st)
         };
         if full {
-            for p in [PANE_CONTENT, PANE_TREE, PANE_SIDEBAR] {
-                wm::scrollbar_paint(id, p, px, w); // the repaint laid the ground over every gutter
+            for p in [PANE_CONTENT, PANE_TREE, PANE_SIDEBAR].into_iter().chain(PANE_COL0..PANE_COL0 + COL_SLOTS as u8) {
+                wm::scrollbar_paint(id, p, px, w); // the repaint laid the ground over every gutter (MILLERWHEEL B798: the columns' too)
             }
         } else {
             wm::scrollbar_paint(id, pane, px, w);
@@ -5053,6 +5070,13 @@ const PANE_CONTENT: u8 = 0;
 const PANE_TREE: u8 = 1;
 /// SIDEBARWHEEL (B792): the sidebar (Favorites, Locations) above the tree.
 const PANE_SIDEBAR: u8 = 2;
+/// MILLERWHEEL (B798): the Columns view's on-glass column at slot `s` (leftmost shown = 0) is pane `PANE_COL0 + s`
+/// (the focus column stays [`PANE_CONTENT`]: its model is the list's). `COL_SLOTS` bounds it by the column count: the
+/// surface is at most `CEIL_W` (1152 base px) wide and a list column at least 160 (`millercols::col_w`), so at most 7
+/// whole columns and one cut show.
+const PANE_COL0: u8 = 3;
+const COL_SLOTS: usize = 8;
+const _: () = assert!(COL_SLOTS * 160 > 1152 && PANE_COL0 as usize + COL_SLOTS <= u8::MAX as usize);
 
 /// One step of `d` rows on a row offset whose largest value is `max` — wm's model in row units (`line` 1).
 fn rows_step(cur: usize, max: usize, d: isize) -> usize {
@@ -5341,11 +5365,12 @@ fn pane_walk(
     Ok(walk.len())
 }
 
-/// `tests scrollview`'s SCROLLPANES legs: `(tree, icons, columns, overlay, sidebar)` (SIDEBARWHEEL B792: the sidebar
-/// walked through `sidebar::step_in` over 60 synthetic rows, never the live ones). The tree, the Icons grid and the Columns
+/// `tests scrollview`'s SCROLLPANES legs: `(tree, icons, columns, overlay, sidebar, cols)` (SIDEBARWHEEL B792: the sidebar
+/// walked through `sidebar::step_in` over 60 synthetic rows, never the live ones; MILLERWHEEL B798: `cols`, every
+/// non-focus column of a synthetic Columns plan walked through `millercols::col_step_in`, [`cols_probe`]). The tree, the Icons grid and the Columns
 /// focus pane walked through their live step bodies against a full paint; the overlay gate: a clean model blits, the
 /// context menu up or a mark on the folder does not (each raised and put back; nothing painted).
-pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 5] {
+pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 6] {
     let tree = match probe_model(200, false, "/scrollpanes") {
         Some(mut m) => {
             let v = tree_view(&m);
@@ -5411,7 +5436,7 @@ pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 5] {
         }
         None => Err("geometry declined 1024x768"),
     };
-    [tree, icons, columns, overlay, sidebar]
+    [tree, icons, columns, overlay, sidebar, cols_probe()]
 }
 
 // ── SIDEBARWHEEL (rmbp-ledger B792) — the sidebar's step on the one model ──
@@ -5424,4 +5449,78 @@ fn side_strip_ok(m: &Model, st: &wm::ScrollStep) -> bool {
 /// The sidebar's `wm::ScrollFn`: [`pane_step`] keyed, its strip body `sidebar::step`.
 fn side_scrolled(id: wm::WinId, st: &wm::ScrollStep) -> usize {
     pane_step(id, PANE_SIDEBAR, st, side_strip_ok, |m, px, st| sidebar::step(m, px, st), |m, st| sidebar::set_scroll(st.off / m.geom.row_h().max(1)))
+}
+
+// ── MILLERWHEEL (rmbp-ledger B798) — every Columns column a pane on the one model ──
+// The slot rides the ScrollFn as a const generic (wm's `ScrollFn` carries no pane): one body, [`COL_FNS`] the id
+// scheme written down. Each is [`pane_step`] keyed, its strip body `millercols::col_step`.
+
+/// Can on-glass slot `S`'s band be blitted? (The view is Columns, its model is the picture the step started from, and
+/// nothing is over it.)
+fn col_strip_ok<const S: u8>(m: &Model, st: &wm::ScrollStep) -> bool {
+    toolbar::view() == toolbar::View::Columns
+        && millercols::col_view(m, S as usize).is_some_and(|(v, _)| v.viewport == st.viewport && v.offset == st.was)
+        && overlay_free(m)
+}
+
+fn col_step_core<const S: u8>(m: &mut Model, px: &mut [u32], st: &wm::ScrollStep) -> usize {
+    millercols::col_step(m, px, S as usize, st)
+}
+
+fn col_pull<const S: u8>(m: &mut Model, st: &wm::ScrollStep) {
+    millercols::col_set_top(m, S as usize, st.off / m.geom.row_h().max(1));
+}
+
+/// On-glass Columns slot `S`'s `wm::ScrollFn`.
+fn col_scrolled<const S: u8>(id: wm::WinId, st: &wm::ScrollStep) -> usize {
+    pane_step(id, PANE_COL0 + S, st, col_strip_ok::<S>, col_step_core::<S>, col_pull::<S>)
+}
+
+/// Slot `s`'s ScrollFn (pane `PANE_COL0 + s`).
+const COL_FNS: [wm::ScrollFn; COL_SLOTS] =
+    [col_scrolled::<0>, col_scrolled::<1>, col_scrolled::<2>, col_scrolled::<3>, col_scrolled::<4>, col_scrolled::<5>, col_scrolled::<6>, col_scrolled::<7>];
+
+/// `tests scrollview`'s `cols` leg: a synthetic plan `[Up 200 rows sel 5, Up 120 rows sel 90, Focus 4 rows, Next 200
+/// rows]` laid in the list pane of a 1920x1200 panel's geometry; the focus column (it fits) has no model, the three
+/// others each have one with its own viewport, and each is walked through `millercols::col_step_in` against
+/// `millercols::probe_rows_paint` ([`pane_walk`]). Never touches the live model, the listing cache or the column
+/// offsets. `Ok(steps)` = the sum over the columns.
+fn cols_probe() -> Result<usize, &'static str> {
+    use millercols::{Col, Kind};
+    let sz = crate::video::metrics::size;
+    let mut m = probe_model(4, false, "/a/b").ok_or("geometry declined 1024x768")?;
+    m.geom = geometry(sz(1920), sz(1200)).ok_or("geometry declined 1920x1200")?;
+    let rows = |n: usize, tag: &str| -> Vec<(String, bool)> { (0..n).map(|k| (alloc::format!("{}{:04}", tag, k), k % 3 == 0)).collect() };
+    let cols = [
+        Col { kind: Kind::Up, path: String::from("/"), rows: rows(200, "ROOT"), sel: Some(5) },
+        Col { kind: Kind::Up, path: String::from("/a"), rows: rows(120, "A"), sel: Some(90) },
+        Col { kind: Kind::Focus, path: String::from("/a/b"), rows: rows(4, "B"), sel: Some(1) },
+        Col { kind: Kind::Next, path: String::from("/a/b/B0000"), rows: rows(200, "N"), sel: None },
+    ];
+    let views = millercols::probe_views(&m, &cols);
+    if views[2].is_some() {
+        return Err("the focus column took a column slot model");
+    }
+    let xs: Vec<usize> = views.iter().flatten().map(|(_, v)| v.viewport.0).collect();
+    if xs.len() != 3 || xs.windows(2).any(|w| w[0] >= w[1]) {
+        return Err("a column is off the glass or two columns share a viewport");
+    }
+    let mut steps = 0usize;
+    for (i, c) in cols.iter().enumerate() {
+        let Some((r, v)) = views[i] else { continue };
+        let line = v.line.max(1);
+        let top = core::cell::Cell::new(v.offset / line);
+        steps += pane_walk(
+            &mut m,
+            Some((v, SBW())),
+            |m, px, st| {
+                top.set(st.off / line);
+                millercols::col_step_in(m, px, c, r, st)
+            },
+            |m, px| {
+                let _ = millercols::probe_rows_paint(m, px, c, r, top.get());
+            },
+        )?;
+    }
+    Ok(steps)
 }

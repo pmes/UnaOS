@@ -208,6 +208,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
     let g = &m.geom;
     fill(px, g, li.x, li.y, li.w, li.h, theme::surface_content());
     let cols = plan(m);
+    tops_prune(&cols); // MILLERWHEEL (B798): the full paint keeps the column offsets to the folders it shows
     let l = lay(g, li, &cols);
     let live = m.focus == Pane::List;
     let mut shown = 0usize;
@@ -515,26 +516,6 @@ pub(super) fn right_select(m: &mut Model, sx: usize, sy: usize) -> bool {
     true
 }
 
-/// SMALLFIX4 (COLUMNSVIEW owed) -> SCROLLPANES (B777): the wheel over the Columns view SCROLLS the focus pane on wm's
-/// one model (QSCROLL's `wheel_next`, three rows a detent, positive = away = toward row 0), the selection pulled inside
-/// it (the list's rule, `live::list_pull`); an ancestor's selection IS the path and the next pane has none, so their
-/// wheel scrolls nothing (consumed, `moved=false`).
-pub(super) fn wheel(m: &mut Model, sx: usize, sy: usize, detents: i32) -> Option<super::WheelHit> {
-    let cols = plan(m);
-    let (i, _) = pane_row_at(m, &cols, sx, sy)?;
-    let Some((v, _)) = focus_view(m) else {
-        return Some(super::WheelHit { pane: "columns", scroll: 0, max: 0, moved: false });
-    };
-    if cols[i].kind != Kind::Focus {
-        return Some(super::WheelHit { pane: "columns", scroll: 0, max: 0, moved: false });
-    }
-    let rh = v.line.max(1);
-    let (was, max) = (v.offset / rh, v.max_offset() / rh);
-    let next = super::wheel_next(was, max, detents);
-    super::list_pull(m, next);
-    Some(super::WheelHit { pane: "columns", scroll: next, max, moved: next != was })
-}
-
 // ── SCROLLPANES (rmbp-ledger B777) — the focus pane on wm's one scroll model — TAIL-APPENDED ───────────────────────
 // The focus pane's rows scroll: its first row is the list's offset (`Model::list_scroll`, the selection kept in view
 // by `settle`), its viewport the pane's rows left of a `SBW()` gutter that stops one pixel short of the pane's
@@ -547,9 +528,18 @@ fn pane_vis(m: &Model, c: &Col, r: Rect) -> usize {
     if c.kind == Kind::Focus { n.min(m.list_visible()).max(1) } else { n }
 }
 
-/// A pane's first row: the focus pane's is the model's offset, the others centre their selection.
+/// A pane's first row: the focus pane's is the model's offset; another column's is the row its wheel left it at
+/// (MILLERWHEEL B798: [`TOPS`], while its folder and selection are the ones it was taken at), else its selection kept
+/// on the glass.
 fn pane_top(m: &Model, c: &Col, vis: usize) -> usize {
-    if c.kind == Kind::Focus { super::scroll_follow(m.list_scroll, m.list_sel, c.rows.len(), vis) } else { top(c.sel, c.rows.len(), vis) }
+    if c.kind == Kind::Focus {
+        return super::scroll_follow(m.list_scroll, m.list_sel, c.rows.len(), vis);
+    }
+    let held = TOPS.lock().iter().find(|(p, s, _)| *p == c.path && *s == c.sel).map(|e| e.2);
+    match held {
+        Some(t) => t.min(c.rows.len().saturating_sub(vis)),
+        None => top(c.sel, c.rows.len(), vis),
+    }
 }
 
 /// The focus pane's rect and whether its rows overflow (a gutter is reserved).
@@ -558,14 +548,20 @@ fn focus_rect(m: &Model, cols: &[Col]) -> Option<(usize, Rect, bool)> {
     let l = lay(&m.geom, li, cols);
     let f = cols.iter().position(|c| c.kind == Kind::Focus)?;
     let r = l.rects[f]?;
-    let over = cols[f].rows.len() > pane_vis(m, &cols[f], r) && r.w > super::SBW() + 2;
-    Some((f, r, over))
+    Some((f, r, overflows(m, &cols[f], r)))
 }
 
-/// Pane rows `[r0, r1)` (view-relative) of `c` in `r`, exactly as the full paint draws them: the ground, the
-/// selection fill, the name and a folder's chevron, clipped at the gutter when the focus pane overflows. Returns the
-/// pixels painted.
+/// Pane rows `[r0, r1)` (view-relative) of `c` in `r` from the pane's own first row ([`rows_paint_at`]).
 fn rows_paint(m: &Model, px: &mut [u32], c: &Col, r: Rect, r0: usize, r1: usize, live: bool) -> usize {
+    let t = pane_top(m, c, pane_vis(m, c, r));
+    rows_paint_at(m, px, c, r, t, r0, r1, live)
+}
+
+/// THE column row painter: pane rows `[r0, r1)` (view-relative) of `c` in `r` with row `t` at the top, exactly as the
+/// full paint draws them: the ground, the selection fill, the name and a folder's chevron, clipped at the gutter when
+/// the column overflows (MILLERWHEEL B798: every list column, not the focus pane alone). Returns the pixels painted.
+#[allow(clippy::too_many_arguments)]
+fn rows_paint_at(m: &Model, px: &mut [u32], c: &Col, r: Rect, t: usize, r0: usize, r1: usize, live: bool) -> usize {
     let g = &m.geom;
     let rh = g.row_h();
     let vis = pane_vis(m, c, r);
@@ -573,12 +569,11 @@ fn rows_paint(m: &Model, px: &mut [u32], c: &Col, r: Rect, r0: usize, r1: usize,
     if r0 >= r1 || rh == 0 {
         return 0;
     }
-    let gut = c.kind == Kind::Focus && c.rows.len() > vis && r.w > super::SBW() + 2;
+    let gut = overflows(m, c, r);
     // The row's right edge (exclusive of the divider column; left of the gutter when there is one).
     let right = r.x + r.w - 1 - if gut { super::SBW() } else { 0 };
     let rw = right - r.x;
     fill(px, g, r.x, r.y + r0 * rh, rw, (r1 - r0) * rh, theme::surface_content());
-    let t = pane_top(m, c, vis);
     let chev = 2 * g.cell_w();
     for (j, (name, dir)) in c.rows.iter().enumerate().skip(t + r0).take(r1 - r0) {
         let y = r.y + (j - t) * rh;
@@ -602,16 +597,8 @@ pub(super) fn focus_view(m: &Model) -> Option<(crate::video::wm::ScrollView, usi
         return None;
     }
     let cols = plan(m);
-    let (f, r, over) = focus_rect(m, &cols)?;
-    if !over {
-        return None;
-    }
-    let rh = m.geom.row_h().max(1);
-    let vis = pane_vis(m, &cols[f], r);
-    let len = cols[f].rows.len();
-    let top = pane_top(m, &cols[f], vis);
-    let vp = (r.x, r.y, r.w - 1 - super::SBW(), vis * rh);
-    Some((crate::video::wm::ScrollView { offset: top * rh, extent: len * rh, viewport: vp, line: rh }, super::SBW()))
+    let (f, r, _) = focus_rect(m, &cols)?;
+    view_for(m, &cols[f], r, pane_top(m, &cols[f], pane_vis(m, &cols[f], r)))
 }
 
 /// Focus pane rows `[r0, r1)` (view-relative) repainted through [`rows_paint`]. Returns the pixels painted.
@@ -619,4 +606,127 @@ pub(super) fn focus_rows_paint(m: &Model, px: &mut [u32], r0: usize, r1: usize) 
     let cols = plan(m);
     let Some((f, r, _)) = focus_rect(m, &cols) else { return 0 };
     rows_paint(m, px, &cols[f], r, r0, r1, m.focus == Pane::List)
+}
+
+// ── MILLERWHEEL (rmbp-ledger B798) — every Columns column on wm's one scroll model — TAIL-APPENDED ─────────────────
+// SCROLLPANES put the focus pane on the model (PANE_CONTENT, the list's offset); the columns left of it (ancestors)
+// and the next column join it here, one pane per ON-GLASS SLOT (`live::PANE_COL0 + slot`, `slot < live::COL_SLOTS`,
+// re-registered or dropped by every full paint). A column's first row lives in [`TOPS`]; it steps by the one
+// rect-scoped blit and the strip through THE column row painter ([`rows_paint_at`]); its selection (an ancestor's IS
+// the path, the next column has none) never moves with a scroll. There is no column wheel arithmetic: wm steps the model.
+
+/// A non-focus column's first row `(folder, the selection it was taken at, row)`. Leaf lock (MODEL -> SURF -> TOPS),
+/// never held across a call; pruned to the plan's folders by every full paint ([`tops_prune`]).
+static TOPS: spin::Mutex<Vec<(String, Option<usize>, usize)>> = spin::Mutex::new(Vec::new());
+
+/// Keep [`TOPS`] to the folders `cols` shows.
+fn tops_prune(cols: &[Col]) {
+    TOPS.lock().retain(|(p, _, _)| cols.iter().any(|c| c.kind != Kind::Focus && c.path == *p));
+}
+
+/// Does column `c` in `r` scroll (its rows overflow and a gutter fits)? The preview never does.
+fn overflows(m: &Model, c: &Col, r: Rect) -> bool {
+    c.kind != Kind::Preview && c.rows.len() > pane_vis(m, c, r) && r.w > super::SBW() + 2
+}
+
+/// THE column model `(view, gutter_w)` with row `t` at the top: the rows left of a `SBW()` gutter that stops one pixel
+/// short of the column's divider, line = the row pitch. `None` when the rows fit (no model).
+fn view_for(m: &Model, c: &Col, r: Rect, t: usize) -> Option<(crate::video::wm::ScrollView, usize)> {
+    if !overflows(m, c, r) {
+        return None;
+    }
+    let rh = m.geom.row_h().max(1);
+    let vis = pane_vis(m, c, r);
+    let vp = (r.x, r.y, r.w - 1 - super::SBW(), vis * rh);
+    Some((crate::video::wm::ScrollView { offset: t * rh, extent: c.rows.len() * rh, viewport: vp, line: rh }, super::SBW()))
+}
+
+/// The plan, its layout and the plan index of on-glass `slot` when that column is a scrolling non-focus list column.
+fn slot_col(m: &Model, slot: usize) -> Option<(Vec<Col>, Rect, usize)> {
+    let cols = plan(m);
+    let l = lay(&m.geom, m.geom.list_pane().inner(), &cols);
+    let i = l.first + slot;
+    let r = (*l.rects.get(i)?)?;
+    matches!(cols[i].kind, Kind::Up | Kind::Next).then_some((cols, r, i))
+}
+
+/// Every on-glass slot's model (the focus and the preview slots, and the slots past the glass, have none): the plan
+/// and the layout read once. `panes_register` registers slot `s` as pane `PANE_COL0 + s`, or drops it.
+pub(super) fn col_views(m: &Model) -> [Option<(crate::video::wm::ScrollView, usize)>; super::COL_SLOTS] {
+    let mut out = [None; super::COL_SLOTS];
+    let cols = plan(m);
+    let l = lay(&m.geom, m.geom.list_pane().inner(), &cols);
+    for (s, o) in out.iter_mut().enumerate() {
+        let i = l.first + s;
+        if let (Some(c), Some(Some(r))) = (cols.get(i), l.rects.get(i)) {
+            if matches!(c.kind, Kind::Up | Kind::Next) {
+                *o = view_for(m, c, *r, pane_top(m, c, pane_vis(m, c, *r)));
+            }
+        }
+    }
+    out
+}
+
+/// On-glass `slot`'s model, if that column scrolls.
+pub(super) fn col_view(m: &Model, slot: usize) -> Option<(crate::video::wm::ScrollView, usize)> {
+    let (cols, r, i) = slot_col(m, slot)?;
+    view_for(m, &cols[i], r, pane_top(m, &cols[i], pane_vis(m, &cols[i], r)))
+}
+
+/// Store on-glass `slot`'s first row (the step's offset applied), keyed by its folder and selection.
+pub(super) fn col_set_top(m: &Model, slot: usize, top: usize) {
+    let Some((cols, _, i)) = slot_col(m, slot) else { return };
+    let c = &cols[i];
+    let mut t = TOPS.lock();
+    t.retain(|(p, _, _)| *p != c.path);
+    t.push((c.path.clone(), c.sel, top));
+}
+
+/// The scrolling column under surface `(sx, sy)` and its model: `(None, view)` = the focus pane (the list's offset),
+/// `(Some(slot), view)` = another column. For the fixture-facing wheel (`live::wheel_scroll_view`), which steps it.
+pub(super) fn view_at(m: &Model, sx: usize, sy: usize) -> Option<(Option<usize>, crate::video::wm::ScrollView)> {
+    let cols = plan(m);
+    let l = lay(&m.geom, m.geom.list_pane().inner(), &cols);
+    let i = (l.first..cols.len()).find(|&i| l.rects[i].is_some_and(|r| r.contains(sx, sy)))?;
+    if cols[i].kind == Kind::Focus {
+        return focus_view(m).map(|(v, _)| (None, v));
+    }
+    col_view(m, i - l.first).map(|(v, _)| (Some(i - l.first), v))
+}
+
+/// The step body on column `c` in `r`, pure: row `st.off / line` at the top, the one rect-scoped blit, the strip rows
+/// through [`rows_paint_at`]. No selection pull. Returns the pixels painted. The probe drives this same body.
+pub(super) fn col_step_in(m: &Model, px: &mut [u32], c: &Col, r: Rect, st: &crate::video::wm::ScrollStep) -> usize {
+    let rh = m.geom.row_h().max(1);
+    if st.moved == 0 {
+        return 0;
+    }
+    let _ = crate::video::wm::scroll_blit(px, m.geom.w, st);
+    let (r0, r1) = super::strip_rows(st, rh);
+    rows_paint_at(m, px, c, r, st.off / rh, r0, r1, m.focus == Pane::List)
+}
+
+/// On-glass `slot`'s live step: its first row stored, then [`col_step_in`].
+pub(super) fn col_step(m: &Model, px: &mut [u32], slot: usize, st: &crate::video::wm::ScrollStep) -> usize {
+    col_set_top(m, slot, st.off / m.geom.row_h().max(1));
+    let Some((cols, r, i)) = slot_col(m, slot) else { return 0 };
+    col_step_in(m, px, &cols[i], r, st)
+}
+
+/// The probe's columns: `cols` laid in the list pane, `Some((rect, model))` per column, `None` for one that fits or is
+/// not on the glass, the model's first row `top(sel)` (never [`TOPS`]).
+pub(super) fn probe_views(m: &Model, cols: &[Col]) -> Vec<Option<(Rect, crate::video::wm::ScrollView)>> {
+    let l = lay(&m.geom, m.geom.list_pane().inner(), cols);
+    cols.iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let r = l.rects[i]?;
+            view_for(m, c, r, top(c.sel, c.rows.len(), pane_vis(m, c, r))).map(|(v, _)| (r, v))
+        })
+        .collect()
+}
+
+/// [`rows_paint_at`] for the probe: column `c` in `r`, row `t` at the top, every visible row.
+pub(super) fn probe_rows_paint(m: &Model, px: &mut [u32], c: &Col, r: Rect, t: usize) -> usize {
+    rows_paint_at(m, px, c, r, t, 0, usize::MAX, m.focus == Pane::List)
 }
