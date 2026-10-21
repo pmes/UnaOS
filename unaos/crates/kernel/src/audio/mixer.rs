@@ -909,3 +909,17 @@ pub fn bt_synthetic(pcm: &[u8]) -> (usize, usize, u64, u64, bool) {
 fn bt_hw_volume() -> bool {
     crate::drivers::ehci::bthid::avctp::ct_volume()
 }
+
+// ── MIXERPUMP (rmbp-ledger B787) — TAIL-APPENDED: a level change runs the master stage now ───────────────────────────
+// Every writer of the master model (`video::status`'s `volkey_usage` and `set_volume`: the F-row key, Settings' slider,
+// the status menu, Softy, the Player's control, AVRCP CHANGED through `audio::bt_master`) calls [`level_changed`]: the
+// same [`master`] the pump runs, for the output in force (`OUT_KIND`, OUT's atomic mirror). It reads and stores atomics
+// only (`status::volume`, `uac::volume_want`, `avctp::ct_volume`): no OUT, no MIX, no mix, no sink write — so it is
+// safe from the BTHID pass under `BT`. A USB device's Feature Unit then takes the level at the next EP0 service pass,
+// the HDA amp in the writer itself, a headset at the next AVRCP watch pass; a mixer-scaled output at its next period.
+// With no output held nothing is handed: the first period after `acquire` runs `master` (audio.md §5).
+
+/// MIXERPUMP: the master level moved — hand it to its carrier now (atomics only; any context).
+pub fn level_changed() {
+    let _ = master(OUT_KIND.load(Ordering::Acquire));
+}

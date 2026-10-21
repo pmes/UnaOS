@@ -5387,7 +5387,7 @@ fn trashtoast_empty_leg(base: &str) -> bool {
 // not opened by the mixer. usb_volume = the device's Feature Unit took SET_CUR (ok), or with no device the descriptor
 // walk of QEMU's unit (fixture).
 // Wire: `[sinkall] leg …`, `[audio] source=<player|video|alert> sink=<hda|usb|bt> frames=<n>`,
-// `:: SINKALL: sources=<n> direct_writes=<n> usb_volume=<ok|fixture|mixer|FAIL|not-built> -> PASS|SKIP|FAIL :: hda= usb= bt= overlap= pause_ms=<n> ::` (SINKALLDOCS B781: -1 when not measured; PASS needs <= 250; the leg is `sinkall_pause`, file tail).
+// `:: SINKALL: sources=<n> direct_writes=<n> usb_volume=<ok|fixture|mixer|FAIL|not-built> -> PASS|SKIP|FAIL :: hda= usb= bt= overlap= pause_ms=<n> slider_ms=<n> ::` (SINKALLDOCS B781: -1 when not measured; PASS needs <= 250; the leg is `sinkall_pause`, file tail; MIXERPUMP B787: slider_ms <= 20, `sinkall_slider`, file tail).
 #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
 fn sinkall_selftest() {
     use crate::audio::{self, mixer, Sink};
@@ -5416,14 +5416,14 @@ fn sinkall_selftest() {
         sources += sinkall_player("video", s, k) as u32;
         overlap = if sinkall_overlap(s) { "ok" } else { "FAIL" }; pause_ms = sinkall_pause(s); // SINKALLDOCS (B781): the Player's pause lands within the sink's queue (file tail)
     }
-    let usb_volume = sinkall_usb_volume(usb);
+    let usb_volume = sinkall_usb_volume(usb); let slider_ms = sinkall_slider(hda, usb); // MIXERPUMP (B787): a set through `status::set_volume` reaches its carrier within one period + 10 ms (file tail)
     let direct = play::epoch().wrapping_sub(e0) as i64 - mixer::hda_opens().wrapping_sub(o0) as i64;
     let _ = audio::sink(if was == Sink::Usb { "usb" } else if was == Sink::Hda { "hda" } else { "bt" });
     let failed = [hda, usb, bt_live, bt, overlap, usb_volume].iter().any(|v| *v == "FAIL");
-    let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 && pause_ms <= SINKALL_PAUSE_MS { "PASS" } else { "FAIL" };
+    let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 && pause_ms <= SINKALL_PAUSE_MS && slider_ms <= SINKALL_SLIDER_MS { "PASS" } else { "FAIL" };
     serial_println!(
-        ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} pause_ms={} ::",
-        sources, direct, usb_volume, verdict, hda, usb, bt, overlap, pause_ms as i64
+        ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} pause_ms={} slider_ms={} ::",
+        sources, direct, usb_volume, verdict, hda, usb, bt, overlap, pause_ms as i64, slider_ms as i64
     );
 }
 
@@ -5884,4 +5884,81 @@ fn scrollpanes_legs() -> (alloc::string::String, bool) {
         alloc::format!("tree={} icons={} columns={} tabs={} types={} overlay={}", word(&tree), word(&icons), word(&columns), word(&tabs), word(&types), word(&overlay)),
         all.iter().all(|r| r.is_ok()),
     )
+}
+
+// MIXERPUMP (rmbp-ledger B787; BP-audio-16) — TAIL-APPENDED: `tests sinkall`'s slider leg. A level set through
+// `status::set_volume` (Settings' slider, the status menu, Softy, AVRCP) reaches its carrier by the master stage's one
+// hand-off (`mixer::level_changed`): HDA = the codec amp verb `set_volume` issues (`by=amp`); USB = the device's Feature
+// Unit SET_CUR (`uac::volume_state`'s count moves, `by=set-cur`); a USB device with no Volume control is the mixer's
+// (`by=mixer`, no device write, not measured). slider_ms = ms from the call to the carrier holding the level, with a
+// Player source playing on that sink; the worst over the live sinks; PASS in `sinkall_selftest` needs <= SINKALL_SLIDER_MS
+// (one 10 ms period + 10 ms). Wire: `[sinkall] leg slider sink= by=<amp|set-cur|mixer> level=<a>-><b> slider_ms= closed=`.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+const SINKALL_SLIDER_MS: u64 = crate::audio::mixer::PERIOD_US as u64 / 1000 + 10;
+
+/// The worst slider latency over the sinks whose alert leg was `ok` (u64::MAX when a carrier did not take the level,
+/// a source did not close, or nothing was measured).
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_slider(hda: &str, usb: &str) -> u64 {
+    let (mut worst, mut measured) = (0u64, false);
+    for (s, k, st) in [("hda", 0usize, hda), ("usb", 1usize, usb)] {
+        if st != "ok" || crate::audio::sink(s).is_err() {
+            continue;
+        }
+        if let Some(ms) = sinkall_slider_on(s, k) {
+            worst = worst.max(ms);
+            measured = true;
+        }
+    }
+    if measured { worst } else { u64::MAX }
+}
+
+/// (SET_CUR rounds the USB device took, its Feature Unit carries the volume now); (0, false) without `uac`.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_usb_sets() -> (u32, bool) {
+    #[cfg(feature = "uac")]
+    return (crate::drivers::usb::uac::volume_state().0, crate::drivers::usb::uac::volume_on_device());
+    #[cfg(not(feature = "uac"))]
+    (0, false)
+}
+
+/// One sink's slider leg: Some(ms) measured (u64::MAX when the carrier did not take it or the source did not close),
+/// None when the sink's level is the mixer's own (no device write to measure).
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_slider_on(sink: &str, k: usize) -> Option<u64> {
+    use crate::audio::mixer;
+    use crate::drivers::hda::play;
+    use crate::video::status;
+    const LONG: u64 = 48_000 * 4;
+    if play::fixture_source("player").is_err() {
+        return Some(u64::MAX);
+    }
+    let steady = play::pump_until(1_000, || play::fixture_feed(LONG) >= 9_600 && mixer::output() == Some(sink));
+    let (l0, m0) = status::volume();
+    let lv = if l0 >= 16 { 15 } else { l0 + 1 };
+    let by = if k == 0 { "amp" } else if sinkall_usb_sets().1 { "set-cur" } else { "mixer" };
+    let s0 = sinkall_usb_sets().0;
+    let t0 = crate::arch::ms();
+    let amp = status::set_volume(lv, m0);
+    let held = steady
+        && match by {
+            "amp" => amp,
+            "set-cur" => play::pump_until(1_000, || {
+                let _ = play::fixture_feed(LONG);
+                sinkall_usb_sets().0 != s0
+            }),
+            _ => false,
+        };
+    let ms = if held { crate::arch::ms().saturating_sub(t0) } else { u64::MAX };
+    let _ = status::set_volume(l0, m0);
+    play::stop();
+    let closed = play::pump_until(500, || mixer::sources() == 0);
+    serial_println!(
+        "[sinkall] leg slider sink={} by={} level={}->{} slider_ms={} closed={}",
+        sink, by, l0, lv, if by == "mixer" { -1 } else { ms as i64 }, closed as u8
+    );
+    if by == "mixer" {
+        return if closed { None } else { Some(u64::MAX) };
+    }
+    Some(if closed { ms } else { u64::MAX })
 }
