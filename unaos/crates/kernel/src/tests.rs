@@ -324,7 +324,7 @@ fn ensure_brightfloor() {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", crate::video::lidsleep::sleep_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("usbsuspend", usbsuspend_selftest); } // USBSUSPEND (B766): `tests usbsuspend` (the file-tail fn; same gate as `sleep`). AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
+        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", crate::video::lidsleep::sleep_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("usbsuspend", usbsuspend_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))] register("ehci", ehci_hub_selftest); } // EHCIHUBDISC (B801): `tests ehci` (the file-tail fn; the hub status-change leg). USBSUSPEND (B766): `tests usbsuspend` (the file-tail fn; same gate as `sleep`). AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
     }
 }
 
@@ -6071,4 +6071,13 @@ fn settingsmap_ring_leg() {
         changed, queued, on as u8, if look_hit { "hit" } else { "miss" }, if locale_hit { "hit" } else { "miss" },
         na(look_gets), na(locale_gets), if ok { "PASS" } else { "FAIL" }, if ok { "owned" } else { "lost" }
     );
+}
+
+/// EHCIHUBDISC (rmbp-ledger B801, BP-input-21): `tests ehci` (R80: registered, never at boot) — the EHCI hub
+/// status-change leg. The pure halves (bitmap decode, a port's subtree) run on every image; the live census needs a hub
+/// on an EHCI bus, which QEMU cannot attach (its usb-hub is full speed, its EHCI ports high speed only), so QEMU reads
+/// `SKIP(no-hub)` and the metal reads PASS once a hub's status endpoint is armed. `hub_change=` counts serviced changes.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))]
+fn ehci_hub_selftest() {
+    crate::drivers::ehci::hubchange::selftest();
 }
