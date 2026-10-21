@@ -152,3 +152,23 @@ pub fn set_wifi10(tx: u8, heard: u8) {
 pub fn wifi10() -> (u8, u8) {
     (W10_TX.load(Ordering::Relaxed), W10_HEARD.load(Ordering::Relaxed))
 }
+
+// ── WIFIAUTH (B788): rungs S8 (open-system auth) and S9 (association) this boot — for `tests wifi`. ─────
+/// `s8`/`s9`: 0 not run, 1 AUTHENTICATED / ASSOCIATED, 2 NOT-AUTHENTICATED / NOT-ASSOCIATED, 3 not attempted.
+/// `aid`: the AID the association response granted (valid only when `s9 == 1`).
+#[cfg(feature = "wifi10")]
+static JOIN_S8: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(feature = "wifi10")]
+static JOIN_S9: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(feature = "wifi10")]
+static JOIN_AID: AtomicU16 = AtomicU16::new(0);
+#[cfg(feature = "wifi10")]
+pub fn set_join(s8: u8, s9: u8, aid: u16) {
+    JOIN_S8.store(s8, Ordering::Relaxed);
+    JOIN_S9.store(s9, Ordering::Relaxed);
+    JOIN_AID.store(aid, Ordering::Relaxed);
+}
+#[cfg(feature = "wifi10")]
+pub fn join() -> (u8, u8, u16) {
+    (JOIN_S8.load(Ordering::Relaxed), JOIN_S9.load(Ordering::Relaxed), JOIN_AID.load(Ordering::Relaxed))
+}

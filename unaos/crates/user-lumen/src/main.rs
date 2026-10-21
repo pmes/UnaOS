@@ -317,6 +317,7 @@ struct App {
     geo: Geo,
     /// RING3SCROLL (B778): the scroll model last registered with the window system.
     sv: una_abi::ScrollSet,
+    sv_live: bool, // SCROLLARM64 + crawl E R3: wm holds a model for the transcript (the SCROLL_SET reply); only then is the gutter band wm's to paint
 }
 
 /// RING3SCROLL (B778): the scrollbar's gutter at the window's right edge, surface px (the transcript's text ends at
@@ -390,6 +391,7 @@ static mut APP: App = App {
     usage: None,
     geo: GEO0,
     sv: SV0,
+    sv_live: false,
 };
 /// The one App. The program is single-threaded: the main loop and the network wait hook (`tick`, run
 /// from inside vein_ring3's socket waits) are never live at the same time, so each takes it in turn.
@@ -1076,7 +1078,7 @@ impl App {
             return;
         }
         let rx = unsafe { &mut *core::ptr::addr_of_mut!(SV_RX) };
-        let _ = una_abi::scroll_set(&want, rx, sys);
+        self.sv_live = una_abi::scroll_set(&want, rx, sys).unwrap_or(false);
         self.sv = want;
     }
 

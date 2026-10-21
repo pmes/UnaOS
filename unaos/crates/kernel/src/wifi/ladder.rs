@@ -25,7 +25,7 @@ enum St {
 }
 
 /// bcm4331.md §7, in table order. `(rung, status, where it was read)`.
-const LEDGER: [(&str, St, &str); 27] = [
+const LEDGER: [(&str, St, &str); 29] = [
     ("R0", St::Confirmed, "f13 33884ms -> UPLOADED rev=666 verify MATCH ready=1"),
     ("S0", St::Confirmed, "f25 radio 04:00.0 device=0x4331 MATCH"),
     ("S1", St::Confirmed, "f25 RESTORE cfg:0x80 restored=MATCH"),
@@ -51,7 +51,7 @@ const LEDGER: [(&str, St, &str); 27] = [
     ("S5c", St::Parked, "tables pinned (R110); the tune is a receive-only rung after S5r flies"),
     ("S6", St::Open, "DMA rings unbuilt"),
     ("S7", St::Open, "WIFI10: the probe-request half built (TX ring, b43 dma.c/xmit.c; probe responses heard by S6); auth/assoc unbuilt"),
-    ("S8", St::Open, "WPA2 unbuilt"),
+    ("S8", St::Open, "WIFIAUTH: open-system auth built (tests wifi <ssid>), no capture yet"), ("S9", St::Open, "WIFIAUTH: association built, no capture yet"), ("S10", St::Open, "WPA2 unbuilt"),
     ("F", St::Open, "firmware on the medium: live"),
 ];
 
@@ -120,7 +120,7 @@ fn wifi9_row(id: &str, st: St) -> St {
         "S5r" => status::phy_reset_token() == "done",
         "S5i" => reinit == 1,
         "S5c" => tune == 1,
-        "S6" => matches!(beacons, Some(n) if n > 0), #[cfg(feature = "wifi10")] "S7" => status::wifi10().1 == 1, // WIFI10 (B646): S7 live when a probe response answered our MAC (LINE-NEUTRAL append, before this comment)
+        "S6" => matches!(beacons, Some(n) if n > 0), #[cfg(feature = "wifi10")] "S7" => status::wifi10().1 == 1, #[cfg(feature = "wifi10")] "S8" => status::join().0 == 1, #[cfg(feature = "wifi10")] "S9" => status::join().1 == 1, // WIFI10 (B646): S7 live when a probe response answered our MAC (LINE-NEUTRAL append, before this comment)
         _ => false,
     };
     if live { St::Confirmed } else { st }

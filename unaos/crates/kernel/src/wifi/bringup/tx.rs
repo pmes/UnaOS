@@ -33,7 +33,7 @@
 //! rung's end line counts every write class that made it possible.
 
 use super::rx::{shm_r16, shm_w16, w16, Writes};
-use super::{r32, settle, w32};
+use super::{r32, settle, w32, D11_SHM_CONTROL, D11_SHM_DATA};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -126,6 +126,9 @@ const TXH_PLCP_598: usize = 112; // format_598.plcp
 const TXH_MAC_HWSEQ: u32 = 0x0000_0010;
 const TXH_MAC_STMSDU: u32 = 0x0000_0008;
 const TXH_MAC_LONGFRAME: u32 = 0x0000_0002;
+/// `xmit.h:128` — immediate ACK expected; b43 sets it on every frame mac80211 does not mark NO_ACK
+/// (`xmit.c:399-400`), i.e. every unicast frame (WIFIAUTH B788: the auth and association requests).
+const TXH_MAC_ACK: u32 = 0x0000_0001;
 /// `xmit.h:149`, `:157`, `:160` — PHY control: CCK encoding, antenna 0/1 auto, the TX-power field.
 const TXH_PHY_ENC_CCK: u16 = 0x0000;
 const TXH_PHY_ANT01AUTO: u16 = 0x00C0;
@@ -139,6 +142,19 @@ const PLCP_RATECODE_CCK_1MB: u8 = 0x0A;
 const CCK_RATE_1MB: u32 = 2;
 /// `xmit.c:688` — the FCS the hardware appends is in the PLCP length.
 const FCS_LEN: usize = 4;
+
+// ── The retry limits (WIFIAUTH B788; b43.h:229, :345-346, :608-609; main.c:3972-3985, called at core init :4909) ──
+/// `b43.h:229` — the SHM routing enum's third entry, SCRATCH. Scratch is WORD-addressed (`main.c:555-569`:
+/// only the SHARED routing shifts the offset).
+const SHM_ROUTE_SCRATCH: u32 = 0x0002;
+const SHM_SC_SRLIMIT: u32 = 0x0006;
+const SHM_SC_LRLIMIT: u32 = 0x0007;
+const RETRY_SHORT: u16 = 7;
+const RETRY_LONG: u16 = 4;
+/// Frames per boot this ring carries: `buf` is 4096 bytes, 512 per frame (header, then the body at +256).
+const FRAME_STRIDE: u64 = 512;
+const FRAME_MAX: usize = 256;
+const FRAMES: usize = 8;
 
 /// How long the TX-status FIFO is polled after the poke (1 ms steps).
 const TXSTAT_WAIT_MS: u32 = 200;
@@ -262,6 +278,19 @@ fn rate_memory_init(bar0: u64, w: &mut Writes) -> u32 {
     n
 }
 
+/// `main.c:3972-3985` — the ucode's short and long retry limits into SHM scratch (b43's defaults 7/4,
+/// `b43.h:608-609`). The first unicast frames this tree sends; without a written limit the counter reads
+/// whatever the upload left.
+fn retry_limits(bar0: u64, w: &mut Writes) {
+    unsafe {
+        w32(bar0, D11_SHM_CONTROL, (SHM_ROUTE_SCRATCH << 16) | SHM_SC_SRLIMIT);
+        w16(bar0, D11_SHM_DATA, RETRY_SHORT);
+        w32(bar0, D11_SHM_CONTROL, (SHM_ROUTE_SCRATCH << 16) | SHM_SC_LRLIMIT);
+        w16(bar0, D11_SHM_DATA, RETRY_LONG);
+    }
+    w.shm += 4;
+}
+
 /// `main.c:3206-3216` — the PHY TX control words the ucode uses for its own frames (beacon, ACK/CTS,
 /// probe response): CCK, antenna auto, full TX-power field.
 fn phytxctl_defaults(bar0: u64, w: &mut Writes) {
@@ -288,7 +317,7 @@ unsafe fn fill(ring: u64, slot: usize, buf: u64, len: usize, ctl0_flags: u32, w:
     w.tx_desc += 4;
 }
 
-/// IEEE Std 802.11 §9.3.3.10 — a probe request: FC type 0 subtype 4, duration 0, DA broadcast, SA the
+/// IEEE Std 802.11 §9.3.3.9 — a probe request: FC type 0 subtype 4, duration 0, DA broadcast, SA the
 /// station, BSSID wildcard, sequence 0 (the ucode assigns it, `TXH_MAC_HWSEQ`); SSID IE wildcard
 /// (§9.4.2.2), Supported Rates 1/2/5.5/11 basic (§9.4.2.3), DS Parameter Set = `ch` (§9.4.2.4).
 pub(super) fn probe_request(sa: [u8; 6], ch: u16) -> Vec<u8> {
@@ -321,12 +350,13 @@ fn plcp_cck(out: &mut [u8], octets: usize) {
 /// `xmit.c:235-567` for a management frame at CCK 1 Mbit/s, no key, no RTS/CTS, no short preamble:
 /// phy_rate, the FC copy, the receiver, dur_fb = the frame's own duration (0: `:279-286`), both PLCPs,
 /// extra_ft CCK fallback, chan_radio_code = the channel (`:360-364`), phy_ctl CCK + ANT01AUTO
-/// (`:367-392`), mac_ctl HWSEQ + STMSDU + LONGFRAME (`:396-421`; no ACK on a broadcast), phy_ctl1 and
+/// (`:367-392`), mac_ctl HWSEQ + STMSDU + LONGFRAME (`:396-421`) + ACK on a unicast addr1 (`:399-400`), phy_ctl1 and
 /// its fallback = BW_20 (`:554-558`, `:167-181`), the cookie (`:541-552`). Everything else stays 0 (`:263`).
 fn txhdr(frame: &[u8], ch: u16, cookie: u16) -> [u8; TXH_SIZE] {
     let mut h = [0u8; TXH_SIZE];
     let octets = frame.len() + FCS_LEN;
-    let mac_ctl = TXH_MAC_HWSEQ | TXH_MAC_STMSDU | TXH_MAC_LONGFRAME;
+    let unicast = frame[4] & 0x01 == 0;
+    let mac_ctl = TXH_MAC_HWSEQ | TXH_MAC_STMSDU | TXH_MAC_LONGFRAME | if unicast { TXH_MAC_ACK } else { 0 };
     h[TXH_MAC_CTL..TXH_MAC_CTL + 4].copy_from_slice(&mac_ctl.to_le_bytes());
     h[TXH_MAC_FRAME_CTL..TXH_MAC_FRAME_CTL + 2].copy_from_slice(&frame[0..2]);
     let phy_ctl = TXH_PHY_ENC_CCK | TXH_PHY_ANT01AUTO;
@@ -362,6 +392,7 @@ pub(super) fn prep(bar0: u64, mac: [u8; 6], w: &mut Writes) -> Result<Prep, Stri
     }
     let rate_mem = rate_memory_init(bar0, w);
     phytxctl_defaults(bar0, w);
+    retry_limits(bar0, w);
     macfilter_self(bar0, mac, w);
     let reset_ok = tx_reset(bar0, w);
     // dma.c:681-694 — TXCTL (enable, address extension, parity off on BCMA: dma.c:1076-1081), RINGLO, RINGHI.
@@ -378,26 +409,37 @@ pub(super) fn prep(bar0: u64, mac: [u8; 6], w: &mut Writes) -> Result<Prep, Stri
     w.dma += 3;
     let txstatus0 = unsafe { r32(bar0, TXSTATUS) };
     serial_println!(
-        "[wifi10] tx-setup ctl=1 ring={:#x} buf={:#x} slots={} txctl={:#010x} ringhi={:#010x} txstatus={:#010x}({}) reset={} rate_mem={} phytxctl=3 macfilter_self={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — dma.c:478-530, :681-694; main.c:3162-3216, :657-677",
-        ring, buf, SLOTS, txctl, hi, txstatus0, txstat_name(txstatus0), reset_ok as u8, rate_mem,
+        "[wifi10] tx-setup ctl=1 ring={:#x} buf={:#x} slots={} txctl={:#010x} ringhi={:#010x} txstatus={:#010x}({}) reset={} rate_mem={} phytxctl=3 retry={}/{} macfilter_self={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} — dma.c:478-530, :681-694; main.c:3162-3216, :657-677",
+        ring, buf, SLOTS, txctl, hi, txstatus0, txstat_name(txstatus0), reset_ok as u8, rate_mem, RETRY_SHORT, RETRY_LONG,
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
     Ok(Prep { ring, buf, rate_mem, reset_ok, txstatus0 })
 }
 
-/// The frame out. Precondition: `prep` done and the MAC ENABLED (S6's `rx::arm`, which also wakes the
-/// ucode). The header on slot 0 (FRAMESTART), the frame on slot 1 (FRAMEEND | IRQ), `TXINDEX` <- the
-/// slot after (`dma.c:1186-1286`, `:213-217`); then the TX-status FIFO is drained for up to
-/// `TXSTAT_WAIT_MS` and the entry carrying our cookie decoded (`main.c:1334-1360`).
+/// S7's probe request: frame 0 of the boot's ring (`fire_frame`).
 pub(super) fn fire(bar0: u64, p: &Prep, mac: [u8; 6], ch: u16, w: &mut Writes) -> Report {
+    fire_frame(bar0, p, &probe_request(mac, ch), ch, 0, "probe-req", w)
+}
+
+/// Frame `n` (0..FRAMES) of this boot's ring out. Precondition: `prep` done and the MAC ENABLED (S6's
+/// `rx::arm`, which also wakes the ucode). The header on slot 2n (FRAMESTART), the frame on slot 2n+1
+/// (FRAMEEND | IRQ), `TXINDEX` <- the slot after (`dma.c:1186-1286`, `:213-217`), the cookie
+/// `(controller + 1) << 12 | 2n` (`dma.c:1133-1150`); then the TX-status FIFO is drained for up to
+/// `TXSTAT_WAIT_MS` and the entry carrying our cookie decoded (`main.c:1334-1360`).
+pub(super) fn fire_frame(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, kind: &str, w: &mut Writes) -> Report {
     let mut r = Report::default();
-    let frame = probe_request(mac, ch);
-    let cookie = COOKIE_RING1; // slot 0
-    let hdr = txhdr(&frame, ch, cookie);
     r.frame_len = frame.len();
+    if n >= FRAMES || frame.len() > FRAME_MAX || frame.len() < 24 {
+        r.cookie = 0;
+        serial_println!("[wifi10] tx-poke kind={} REFUSED reason=frame-slot(n={} len={}) — nothing written", kind, n, frame.len());
+        return r;
+    }
+    let slot = n * TX_SLOTS_PER_FRAME;
+    let cookie = COOKIE_RING1 | slot as u16;
+    let hdr = txhdr(frame, ch, cookie);
     r.cookie = cookie;
-    let hbuf = p.buf;
-    let fbuf = p.buf + 256;
+    let hbuf = p.buf + n as u64 * FRAME_STRIDE;
+    let fbuf = hbuf + 256;
     for (i, b) in hdr.iter().enumerate() {
         unsafe { core::ptr::write_volatile((hbuf + i as u64) as *mut u8, *b) };
     }
@@ -405,21 +447,22 @@ pub(super) fn fire(bar0: u64, p: &Prep, mac: [u8; 6], ch: u16, w: &mut Writes) -
         unsafe { core::ptr::write_volatile((fbuf + i as u64) as *mut u8, *b) };
     }
     unsafe {
-        fill(p.ring, 0, hbuf, TXH_SIZE, DCTL0_FRAMESTART, w);
-        fill(p.ring, 1, fbuf, frame.len(), DCTL0_FRAMEEND | DCTL0_IRQ, w);
+        fill(p.ring, slot, hbuf, TXH_SIZE, DCTL0_FRAMESTART, w);
+        fill(p.ring, slot + 1, fbuf, frame.len(), DCTL0_FRAMEEND | DCTL0_IRQ, w);
     }
     r.dptr_before = unsafe { r32(bar0, TXSTATUS) } & TXSTATDPTR;
     // dma.c:1284-1285: wmb, then poke the slot AFTER the frame's last one.
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-    unsafe { w32(bar0, TXINDEX, (TX_SLOTS_PER_FRAME * DESC_BYTES) as u32) };
+    let txindex = (slot + TX_SLOTS_PER_FRAME) * DESC_BYTES;
+    unsafe { w32(bar0, TXINDEX, txindex as u32) };
     w.dma += 1;
     let mut hx = String::new();
     for b in hdr.iter().take(24) {
         hx.push_str(&alloc::format!("{:02x}", b));
     }
     serial_println!(
-        "[wifi10] tx-poke kind=probe-req len={} plcp_octets={} cookie={:#06x} txindex={} hdr[0..24]={} — xmit.c:235-567, dma.c:1186-1286",
-        frame.len(), frame.len() + FCS_LEN, cookie, TX_SLOTS_PER_FRAME * DESC_BYTES, hx
+        "[wifi10] tx-poke kind={} len={} plcp_octets={} cookie={:#06x} txindex={} hdr[0..24]={} — xmit.c:235-567, dma.c:1186-1286",
+        kind, frame.len(), frame.len() + FCS_LEN, cookie, txindex, hx
     );
     // The status FIFO (main.c:1341-1356): bit 0 of XMITSTAT_0 = an entry is there; reading both words consumes it.
     let mut waited = 0u32;
