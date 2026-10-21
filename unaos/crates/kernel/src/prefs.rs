@@ -1281,7 +1281,7 @@ impl SessionSeen {
         self.seen.store(k | some as u64, Ordering::Release);
     }
 
-    #[allow(dead_code)] // used by the selftest and login items, absent on some arms
+    /// Move this consumer's key (call AFTER clearing its record): its next [`check`](Self::check) compares again.
     pub(crate) fn forget(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
     }
@@ -1660,8 +1660,8 @@ pub fn reload_from_store() -> usize {
 
 // ══════════════ PREFSDELETED (rmbp-ledger B755, BP-security-18, BP-storage-15) — TAIL-APPENDED ══════════════
 // A deleted domain file (R98's delete watch, `watch_deleted`) and `reload_from_store` reset keys in the tree without a
-// write, so no `changed()` ran and no PrefChanged was made: the lock (`lock::prefs_pass`, which re-reads only when
-// `prefs_client::CHANGED_N` moves) and Settings (`bus_changes_inner`) kept the old value until something else moved.
+// write, so no `changed()` ran and no PrefChanged was made: the lock (`lock::prefs_pass`, which re-reads only on a
+// PrefChanged naming its keys, `prefs_client::changed_since`) and Settings (`bus_changes_inner`) kept the old value.
 // Now each cleared key posts the SAME frame of record `changed()` posts (`prefs_client::on_changed`, under its cfg),
 // carrying the value the key answers once unset: its declared default — the schema's static default, a derived one
 // evaluated against the store (the kernel has no environment variables and no local models, so those rule inputs

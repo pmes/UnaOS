@@ -408,9 +408,9 @@ pub fn service() -> bool {
 
 // ── PREFSCLIENTKEYS (rmbp-ledger B779) — the keyed PrefChanged edge — TAIL-APPENDED, so no line above moves ─────────
 // [`service`] re-reads its three keys only when a PrefChanged since its mark named one of them (`prefs_client::
-// changed_take`, the last-changed ring kept beside `CHANGED_N`); any other key's change moves the mark at zero GETs.
-// Outside the desktop families there is no kernel subscriber (Settings and the lock register one), so no PrefChanged
-// edge ever moved there: the twins answer 0 / false, as `CHANGED_N` did.
+// changed_take` on the client's last-changed ring, on at its first reader and sticky, SUBSCRIBEKEEP B796); any other
+// key's change moves the mark at zero GETs. Outside the desktop families the ring is not built (`prefs_client`'s
+// `lastkey` / `ringkeep` carry this cfg), so no PrefChanged edge is ever noted there: the twins answer 0 / false.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn locale_mark() -> u32 {
     crate::prefs_client::changed_mark()

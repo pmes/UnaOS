@@ -7,9 +7,9 @@
 //! ladder). It REPORTS the recorded verdict of the bring-up (`status.rs`) and names, honestly and by
 //! reason, every device leg this tree carries no legal source to build. It never re-runs the
 //! destructive upload — that is the `UNAOS_WIFI3=1` boot, Peter's to schedule (R80: nothing runs at
-//! boot but the boot). The beacon/auth/assoc codec it would drive is real and host-tested
-//! (`wifi_core::ieee80211`); what is owed is the DMA RX/TX path and the HT-PHY channel tune
-//! (`bcm4331.md` §S5(c)/§S6), which no source legal for `src/wifi/` records.
+//! boot but the boot). The beacon/auth/assoc codec is real and host-tested (`wifi_core::ieee80211`);
+//! the device legs that drive it (S5c tune, S6 receiver, S7 TX ring, S8 auth, S9 assoc) run only inside
+//! `tests wifi [<ssid>]` on `wifi9` / `wifi10` images (`bcm4331.md` §7), never from this verb.
 
 use crate::console::Console;
 use super::status;
@@ -101,16 +101,16 @@ fn join(ssid: Option<&str>, console: &mut Console) {
     if !radio_present() {
         return report(console);
     }
-    // The open-system auth + association frames are built and host-tested in the shared core; the
-    // station MAC is the SPROM il0macaddr the board carries (bcm4331.md §S2r), not yet read on this
-    // build, so a real exchange is not attempted. Refuse by reason, not by silence.
+    // The join is not this verb's: rungs S8 (open-system auth) and S9 (association) run once per boot in
+    // `bringup::wifi10` from `tests wifi <ssid>` (bringup/join.rs, WIFIAUTH B788), over WIFI10's TX ring
+    // and the SPROM station MAC. This verb transmits nothing (R80); it names that door, by reason.
     console.println(&alloc::format!(
-        "wifi: join '{}' — the open-system auth and association-request frames are built and \
-         host-tested (wifi_core::ieee80211::build_auth_open / build_assoc_req), and the data-frame \
-         <-> Ethernet path for smoltcp is too. What is owed before a frame reaches the air: the TX \
-         DMA rings (§S6/S7) and the station MAC read from the SPROM (§S2r). WPA2 is refused by \
-         design on an OPEN join and owed to CRYPTOCORE (PBKDF2-HMAC-SHA1, HMAC-SHA1, AES-CCMP). \
-         Not attempted.",
+        "wifi: join '{}' — this verb transmits nothing. Open-system authentication (S8) and \
+         association (S9) are built and run once per boot from `tests wifi <ssid>` on a wifi10 image \
+         (wifi_core::ieee80211::build_auth_open / build_assoc_req over the WIFI10 TX ring, the replies \
+         judged by wifi::assoc), no capture yet; the data-frame <-> Ethernet path for smoltcp is \
+         host-tested. WPA2 is S10, unbuilt, owed to CRYPTOCORE (PBKDF2-HMAC-SHA1, HMAC-SHA1, \
+         AES-CCMP): an open BSS only. Not attempted here.",
         ssid
     ));
 }
