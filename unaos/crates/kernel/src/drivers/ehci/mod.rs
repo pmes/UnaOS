@@ -4287,7 +4287,7 @@ impl Controller {
                 );
                 return;
             }
-            self.bring_up_hub(&t, depth);
+            self.bring_up_hub(&t, depth); #[cfg(all(feature = "lidsleep", feature = "wc"))] suspend::note_hub(self.idx, t); // EHCIWAKE (B776): record the hub so the sleep state can arm its remote wake; the body is `suspend` at the file tail. LINE-NEUTRAL fold, code first
         } else {
             #[cfg(all(feature = "usbnet", feature = "ehcihid"))] { if vid == 0x0b95 && pid == 0x1790 { self.usbnet_ehci_front(&t); return; } } let hidcfg_t0 = crate::arch::now_cycles();
             self.configure_hid(&t);
@@ -19996,19 +19996,32 @@ pub fn census() -> Option<Vec<((u8, u8, u8), Vec<(u8, bool)>)>> {
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 // USBSUSPEND (rmbp-ledger B766, docs/dev/blueprint/power.md BP-power-7) — the EHCI root ports' SUSPEND for the sleep state.
-// FILE-TAIL append under the `power::sleep` cfg, so no `panic::Location` above moves and a knob-off build carries none of it.
+// EHCIWAKE (rmbp-ledger B776) — remote wake armed on the HID devices and the hubs above them, the periodic schedule
+// stopped around SUSP. FILE-TAIL append under the `power::sleep` cfg, so no `panic::Location` above moves and a
+// knob-off build carries none of it.
 #[cfg(all(feature = "lidsleep", feature = "wc"))]
 pub mod suspend {
-    //! CHARTER: Kernel — driver (the EHCI root ports' suspend/resume; `power::sleep` asks, the `EHCI_HID` holder acts).
+    //! CHARTER: Kernel — driver (the EHCI root ports' suspend/resume and remote wake; `power::sleep` asks, the `EHCI_HID` holder acts).
     //!
-    //! `power::sleep` writes ONE word, [`request`]; every PORTSC write is made inside `service_ehci_hid`'s walk, under
-    //! `EHCI_HID`, by [`Controller::port_suspend_service`]. EHCI 1.0 §4.3.1: SUSP (bit 7) on an enabled port; the
-    //! resume is FPR (bit 6) held 20 ms (TDRSMDN), FPR cleared, 10 ms recovery (TRSMRCY) — deadlines, never a wait.
-    //! A device's own resume sets FPR on a suspended port: that is its remote wake, and the whole controller resumes.
-    //! A controller with a live interrupt endpoint keeps its ports up (`why=int-ep`): EHCI remote wake is unarmed (an
-    //! `IntEp` carries no device address to SET_FEATURE) and its periodic qTDs are not quiesced — owed, B766. So the
-    //! rMBP's internal keyboard (EHCI, behind the RMH) stays the `input` waker it is.
-    use super::{mmio_read32, mmio_write32, read_config_32, Controller, OP_PORTSC0, PORT_CCS, PORT_OWNER, PORT_PED, PORT_RW1C};
+    //! `power::sleep` writes ONE word, [`request`]; every PORTSC/USBCMD write and every EP0 request is made inside
+    //! `service_ehci_hid`'s walk, under `EHCI_HID`, by [`Controller::port_suspend_service`]. EHCI 1.0 §4.3.1: SUSP
+    //! (bit 7) on an enabled port; the resume is FPR (bit 6) held 20 ms (TDRSMDN), FPR cleared, 10 ms recovery
+    //! (TRSMRCY) — deadlines, never a wait. A device's own resume sets FPR on a suspended port: that is its remote
+    //! wake, and the whole controller resumes.
+    //!
+    //! EHCIWAKE (B776): before SUSP each live HID device (its `IntEp::kbd_target`, which every endpoint carries) and
+    //! every hub this controller brought up ([`note_hub`]) gets SET_FEATURE(DEVICE_REMOTE_WAKEUP) when its
+    //! configuration declares it (USB 2.0 §9.4.9; a hub forwards a downstream resume only when armed, §11.4.4) —
+    //! while the periodic schedule still runs, because EP0 rides the periodic engine on this silicon (`control_txn`,
+    //! PROBE-8). Then USBCMD.PSE off with the STS.PSS handshake (§4.6, `set_periodic_schedule`), then SUSP; PSE back
+    //! on when the recovery ends. A controller keeps its ports up only when a live keyboard or a recorded hub could not
+    //! be armed (`why=wake-unarmed`): that keyboard stays the `input` waker it was.
+    use super::qh::QTD_HALTED;
+    use super::{
+        mmio_read32, mmio_write32, read_config_32, Controller, Target, EHCI_HID, OP_PORTSC0, OP_USBSTS, PORT_CCS,
+        PORT_OWNER, PORT_PED, PORT_RW1C, STS_PSS,
+    };
+    use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
     const UP: u8 = 0;
@@ -20022,26 +20035,79 @@ pub mod suspend {
     /// PCI BAR0 and the EHCI capability registers (EHCI 1.0 §2.2): CAPLENGTH at +0, HCSPARAMS at +4.
     const CFG_BAR0: u8 = 0x10;
     const CTRLS: usize = 4;
+    /// Hubs recorded per controller (the RMH and the internal tier below it; `HUB_DEPTH_CAP` bounds the tree).
+    const HUBS_PER: usize = 4;
+    /// USB 2.0 §9.4: SET_FEATURE, DEVICE_REMOTE_WAKEUP, and the configuration's bmAttributes Remote Wakeup bit.
+    const REQ_SET_FEATURE: u8 = 3;
+    const FEAT_REMOTE_WAKEUP: u16 = 1;
+    const CFG_ATT_REMOTE_WAKEUP: u8 = 1 << 5;
 
     static WANT: AtomicBool = AtomicBool::new(false);
     static PHASE: [AtomicU8; CTRLS] = [const { AtomicU8::new(UP) }; CTRLS];
     static DUE_MS: [AtomicU64; CTRLS] = [const { AtomicU64::new(0) }; CTRLS];
     /// Ports this driver suspended, per controller (bit = port index).
     static SUSP_MASK: [AtomicU32; CTRLS] = [const { AtomicU32::new(0) }; CTRLS];
-    /// Census across controllers, for `tests usbsuspend`: ports with an enabled device, suspended, kept.
+    /// EHCIWAKE: the periodic schedule this driver stopped for the suspend, per controller (restarted at UP).
+    static PSE_OFF: [AtomicBool; CTRLS] = [const { AtomicBool::new(false) }; CTRLS];
+    /// EHCIWAKE: targets armed for remote wake at the last entry, per controller (the `wake_armed=` term).
+    static ARMED: [AtomicU32; CTRLS] = [const { AtomicU32::new(0) }; CTRLS];
+    /// Controllers the service walk has stepped (bit = idx), so the test's waits know whom to wait for.
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    /// EHCIWAKE: every hub `bring_up_hub` configured, by controller — written at enumeration, read by the arming.
+    static HUBS: crate::sync::Mutex<[[Option<Target>; HUBS_PER]; CTRLS]> = crate::sync::Mutex::new([[None; HUBS_PER]; CTRLS]);
+    /// Census across controllers, for `tests usbsuspend`.
     static PORTS: AtomicU32 = AtomicU32::new(0);
     static SUSPENDED_N: AtomicU32 = AtomicU32::new(0);
     static KEPT_N: AtomicU32 = AtomicU32::new(0);
+    static RESUMED_N: AtomicU32 = AtomicU32::new(0);
+    static WAKE_ARMED_N: AtomicU32 = AtomicU32::new(0);
+
+    /// At the last entry: ports with an enabled device, suspended, kept, resumed ok, remote-wake targets armed.
+    #[derive(Clone, Copy, Default)]
+    pub struct Census { pub ports: u32, pub suspended: u32, pub kept: u32, pub resumed: u32, pub wake_armed: u32 }
 
     /// The sleep state's one word: `true` at entry, `false` at the wake. Any context; touches no register.
     pub fn request(suspend: bool) {
-        if suspend { for c in [&PORTS, &SUSPENDED_N, &KEPT_N] { c.store(0, Ordering::Relaxed); } }
+        if suspend { for c in [&PORTS, &SUSPENDED_N, &KEPT_N, &RESUMED_N, &WAKE_ARMED_N] { c.store(0, Ordering::Relaxed); } }
         WANT.store(suspend, Ordering::Release);
     }
 
-    /// (ports with an enabled device, ports suspended, ports kept) at the last entry.
-    pub fn census() -> (u32, u32, u32) {
-        (PORTS.load(Ordering::Relaxed), SUSPENDED_N.load(Ordering::Relaxed), KEPT_N.load(Ordering::Relaxed))
+    pub fn census() -> Census {
+        let g = |c: &AtomicU32| c.load(Ordering::Relaxed);
+        Census { ports: g(&PORTS), suspended: g(&SUSPENDED_N), kept: g(&KEPT_N), resumed: g(&RESUMED_N), wake_armed: g(&WAKE_ARMED_N) }
+    }
+
+    /// Every controller the walk has stepped is in `phase` (vacuously true with none).
+    fn all_in(phase: u8) -> bool {
+        let seen = SEEN.load(Ordering::Acquire);
+        (0..CTRLS).filter(|i| seen & (1 << i) != 0).all(|i| PHASE[i].load(Ordering::Acquire) == phase)
+    }
+    pub fn suspended() -> bool { all_in(SUSPENDED) }
+    pub fn up() -> bool { all_in(UP) }
+
+    /// EHCIWAKE: `bring_up_hub`'s fold — remember a configured hub's EP0 target (once per address).
+    pub(super) fn note_hub(idx: usize, t: Target) {
+        if idx >= CTRLS { return; }
+        let mut g = HUBS.lock();
+        let row = &mut g[idx];
+        if row.iter().flatten().any(|h| h.addr == t.addr) { return; }
+        if let Some(free) = row.iter_mut().find(|h| h.is_none()) { *free = Some(t); }
+    }
+
+    /// `tests usbsuspend`: a keyboard report after the resume — HID GET_REPORT(Input) over EP0 (HID 1.11 §7.2.1) to the
+    /// first live EHCI keyboard, and whether its interrupt QH is still un-halted. `None` = `EHCI_HID` busy;
+    /// `Some(None)` = no EHCI keyboard; `Some(Some((len, ep_ok)))`.
+    pub fn kbd_report_probe() -> Option<Option<(u32, bool)>> {
+        let mut g = EHCI_HID.try_lock()?;
+        let Some(ctrls) = g.as_mut() else { return Some(None) };
+        for c in ctrls.iter_mut() {
+            let Some(e) = c.int_eps.iter().find(|e| e.is_kbd && !e.dead) else { continue };
+            let (t, intf, qh) = (e.kbd_target, e.kbd_intf, e.qh);
+            let len = unsafe { c.control(&t, 0xA1, 0x01, 0x0100, intf as u16, 8, true) }.unwrap_or(0);
+            let halted = unsafe { core::ptr::read_volatile(&(*qh).overlay[2]) } & QTD_HALTED != 0;
+            return Some(Some((len, !halted)));
+        }
+        Some(None)
     }
 
     impl Controller {
@@ -20050,6 +20116,7 @@ pub mod suspend {
         pub(super) fn port_suspend_service(&mut self) {
             let i = self.idx;
             if i >= CTRLS { return; }
+            SEEN.fetch_or(1 << i, Ordering::AcqRel);
             let now = crate::arch::ms();
             match PHASE[i].load(Ordering::Acquire) {
                 UP if WANT.load(Ordering::Acquire) => { self.ports_suspend(); PHASE[i].store(SUSPENDED, Ordering::Release); }
@@ -20061,12 +20128,15 @@ pub mod suspend {
                     }
                 }
                 RESUMING if now >= DUE_MS[i].load(Ordering::Relaxed) => self.ports_resume_finish(now),
-                RECOVERING if now >= DUE_MS[i].load(Ordering::Relaxed) => PHASE[i].store(UP, Ordering::Release),
+                RECOVERING if now >= DUE_MS[i].load(Ordering::Relaxed) => self.schedule_restart(),
                 _ => {}
             }
         }
 
         fn portsc_addr(&self, port: u32) -> u64 { self.op + OP_PORTSC0 + 4 * port as u64 }
+
+        /// STS.PSS as the controller reports it now (the `pse=` term).
+        fn pss(&self) -> u8 { (unsafe { mmio_read32(self.op + OP_USBSTS) }.unwrap_or(0) & STS_PSS != 0) as u8 }
 
         /// HCSPARAMS.N_PORTS, read from BAR0 as `ehci_scout::wake_run` derives it; `None` unless BAR0 + CAPLENGTH is
         /// this controller's operational base (the cross-check that the BAR read is this function's).
@@ -20082,22 +20152,35 @@ pub mod suspend {
             Some((unsafe { mmio_read32(bar0 + 4) }? & 0xF).min(15))
         }
 
-        /// SUSP on every enabled, EHCI-owned root port — unless an interrupt endpoint is live on this controller.
+        /// Arm remote wake, stop the periodic schedule, SUSP every enabled, EHCI-owned root port — unless a live
+        /// keyboard (or a hub above it) could not be armed, then keep them up (`why=wake-unarmed`).
         fn ports_suspend(&mut self) {
             let i = self.idx;
-            let live = self.int_eps.iter().any(|e| !e.dead);
             let n = self.port_count().unwrap_or(0);
+            let enabled: Vec<u32> = (0..n).filter(|&port| {
+                let v = unsafe { mmio_read32(self.portsc_addr(port)) }.unwrap_or(0);
+                v & (PORT_CCS | PORT_PED) == (PORT_CCS | PORT_PED) && v & PORT_OWNER == 0 && v & PORT_SUSP == 0
+            }).collect();
+            PORTS.fetch_add(enabled.len() as u32, Ordering::Relaxed);
+            SUSP_MASK[i].store(0, Ordering::Relaxed);
+            let (armed, unarmed) = if enabled.is_empty() { (0, false) } else { self.arm_remote_wake() };
+            ARMED[i].store(armed, Ordering::Relaxed);
+            WAKE_ARMED_N.fetch_add(armed, Ordering::Relaxed);
+            if enabled.is_empty() { return; }
+            if unarmed {
+                for port in &enabled {
+                    KEPT_N.fetch_add(1, Ordering::Relaxed);
+                    serial_println!("[usb] ehci={} port={} keep why=wake-unarmed", i, port + 1);
+                }
+                serial_println!("[usb] ehci ctrl={} pse={} susp=0 wake_armed={}", i, self.pss(), armed);
+                return;
+            }
+            let _ = unsafe { self.set_periodic_schedule(false) };
+            PSE_OFF[i].store(true, Ordering::Release);
             let mut mask = 0u32;
-            for port in 0..n {
+            for &port in &enabled {
                 let a = self.portsc_addr(port);
                 let v = unsafe { mmio_read32(a) }.unwrap_or(0);
-                if v & (PORT_CCS | PORT_PED) != (PORT_CCS | PORT_PED) || v & PORT_OWNER != 0 || v & PORT_SUSP != 0 { continue; }
-                PORTS.fetch_add(1, Ordering::Relaxed);
-                if live {
-                    KEPT_N.fetch_add(1, Ordering::Relaxed);
-                    serial_println!("[usb] ehci={} port={} keep why=int-ep", i, port + 1);
-                    continue;
-                }
                 let _ = unsafe { mmio_write32(a, (v & !PORT_RW1C) | PORT_SUSP) };
                 let back = unsafe { mmio_read32(a) }.unwrap_or(0);
                 mask |= 1 << port;
@@ -20105,6 +20188,51 @@ pub mod suspend {
                 serial_println!("[usb] ehci={} port={} suspend -> susp={}", i, port + 1, (back & PORT_SUSP != 0) as u8);
             }
             SUSP_MASK[i].store(mask, Ordering::Relaxed);
+            serial_println!("[usb] ehci ctrl={} pse={} susp={} wake_armed={}", i, self.pss(), mask.count_ones(), armed);
+        }
+
+        /// EHCIWAKE: SET_FEATURE(DEVICE_REMOTE_WAKEUP) on each live HID device (one per address, from the target its
+        /// endpoints carry) and on each recorded hub. Returns (targets armed, a keyboard's wake path left unarmed).
+        /// Nothing is asked of a controller with no live interrupt endpoint (nothing on it is a waker).
+        fn arm_remote_wake(&mut self) -> (u32, bool) {
+            let mut devs: Vec<(Target, bool)> = Vec::new();
+            for e in self.int_eps.iter().filter(|e| !e.dead) {
+                match devs.iter_mut().find(|(t, _)| t.addr == e.kbd_target.addr) {
+                    Some(d) => d.1 |= e.is_kbd,
+                    None => devs.push((e.kbd_target, e.is_kbd)),
+                }
+            }
+            if devs.is_empty() { return (0, false); }
+            let has_kbd = devs.iter().any(|d| d.1);
+            let hubs: Vec<Target> = if self.idx < CTRLS { HUBS.lock()[self.idx].iter().flatten().copied().collect() } else { Vec::new() };
+            let (mut armed, mut unarmed) = (0u32, false);
+            for (t, kbd, hub) in devs.iter().map(|&(t, k)| (t, k, false)).chain(hubs.iter().map(|&t| (t, false, true))) {
+                if self.remote_wake_one(&t, hub) {
+                    armed += 1;
+                } else if kbd || (hub && has_kbd) {
+                    unarmed = true;
+                }
+            }
+            (armed, unarmed)
+        }
+
+        /// One target: its configuration header's bmAttributes (the read `configure_hid` makes), then the SET_FEATURE
+        /// when Remote Wakeup is declared. `[usb] ehci=<i> addr=<a> kind=dev|hub remote_wake=armed|undeclared|refused`.
+        fn remote_wake_one(&mut self, t: &Target, hub: bool) -> bool {
+            let word = match unsafe { self.control(t, 0x80, 6, 0x0200, 0, 9, true) } {
+                Ok(n) if n >= 8 => {
+                    if unsafe { *self.data_buf.add(7) } & CFG_ATT_REMOTE_WAKEUP == 0 {
+                        "undeclared"
+                    } else if unsafe { self.control(t, 0x00, REQ_SET_FEATURE, FEAT_REMOTE_WAKEUP, 0, 0, false) }.is_ok() {
+                        "armed"
+                    } else {
+                        "refused"
+                    }
+                }
+                _ => "refused",
+            };
+            serial_println!("[usb] ehci={} addr={} kind={} remote_wake={}", self.idx, t.addr, if hub { "hub" } else { "dev" }, word);
+            word == "armed"
         }
 
         /// A suspended port the controller put FPR on itself (the device's resume signalling).
@@ -20145,6 +20273,7 @@ pub mod suspend {
                 }
                 let ms = crate::arch::ms().saturating_sub(t0);
                 if back & PORT_SUSP == 0 {
+                    RESUMED_N.fetch_add(1, Ordering::Relaxed);
                     serial_println!("[usb] ehci={} port={} resume ms={} -> ok", i, port + 1, ms);
                 } else {
                     serial_println!("[usb] ehci={} port={} resume ms={} -> susp=1", i, port + 1, ms);
@@ -20153,6 +20282,17 @@ pub mod suspend {
             SUSP_MASK[i].store(0, Ordering::Relaxed);
             DUE_MS[i].store(crate::arch::ms() + RECOVERY_MS, Ordering::Relaxed);
             PHASE[i].store(RECOVERING, Ordering::Release);
+        }
+
+        /// EHCIWAKE: the recovery is over — the periodic schedule this driver stopped runs again (§4.6 handshake), and
+        /// the interrupt QHs it left linked and Active resume where they were (no re-arm, toggles untouched).
+        fn schedule_restart(&mut self) {
+            let i = self.idx;
+            if PSE_OFF[i].swap(false, Ordering::AcqRel) {
+                let _ = unsafe { self.set_periodic_schedule(true) };
+                serial_println!("[usb] ehci ctrl={} pse={} susp=0 wake_armed={}", i, self.pss(), ARMED[i].load(Ordering::Relaxed));
+            }
+            PHASE[i].store(UP, Ordering::Release);
         }
     }
 }
