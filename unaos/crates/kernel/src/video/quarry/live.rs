@@ -283,8 +283,6 @@ const BASE_CELL: usize = 8;
 /// Scrollbar gutter width — [`theme::SCROLLBAR_WIDTH`], the role that has existed since the theme
 /// table landed and has never had a consumer. Quarry is the first.
 #[allow(non_snake_case)] #[inline] fn SBW() -> usize { theme::SCROLLBAR_WIDTH() }
-/// Shortest thumb we will draw, so a 10 000-row directory still leaves something to aim at.
-#[allow(non_snake_case)] #[inline] fn THUMB_MIN() -> usize { crate::ui::px(16) }
 
 /// Smallest content surface Quarry will accept. Below this the two panes cannot both carry a usable
 /// column set and the honest answer is to decline rather than to draw an unreadable window.
@@ -892,20 +890,6 @@ const WHEEL_ROWS: usize = 3;
 #[inline]
 fn wheel_next(scroll: usize, smax: usize, detents: i32) -> usize {
     rows_step(scroll, smax, -(detents as isize).saturating_mul(WHEEL_ROWS as isize))
-}
-
-/// Scrollbar thumb geometry inside a `track_h`-tall gutter, or `None` when everything fits.
-///
-/// Returns `(thumb_y_offset, thumb_h)` relative to the top of the track.
-fn thumb(track_h: usize, len: usize, visible: usize, scroll: usize) -> Option<(usize, usize)> {
-    if visible == 0 || len <= visible || track_h < THUMB_MIN() {
-        return None;
-    }
-    let th = (track_h * visible / len).max(THUMB_MIN()).min(track_h);
-    let span = track_h - th;
-    let smax = scroll_max(len, visible);
-    let ty = if smax == 0 { 0 } else { span * scroll.min(smax) / smax };
-    Some((ty, th))
 }
 
 // ── Model transitions ───────────────────────────────────────────────────────────────────────────
@@ -2662,13 +2646,21 @@ fn wheel_scroll(m: &mut Model, sx: usize, sy: usize, detents: i32) -> Option<Whe
 }
 
 /// QUARRYHOVER (B647): [`wheel_scroll`] with the list pane's view named — every scrolling pane under the pointer:
-/// the SIDEBAR (`sidebar::wheel`, one row a detent — it is short), the tree, the list (rows), the ICONS grid
+/// the SIDEBAR (SIDEBARWHEEL B792: its model, `sidebar::view`, stepped as wm steps it), the tree, the list (rows), the ICONS grid
 /// (whole grid rows, `list_scroll` kept on a row boundary as `iconview::follow` keeps it; `settle` is not called
 /// there because its row clamp is the List view's) and the Miller columns (`millercols::wheel`).
 fn wheel_scroll_view(m: &mut Model, sx: usize, sy: usize, detents: i32, view: toolbar::View) -> Option<WheelHit> {
     let g = m.geom;
     if sidebar::rect(&g).contains(sx, sy) {
-        return Some(sidebar::wheel(m, detents));
+        return Some(match sidebar::view(&g) {
+            Some((v, _)) => {
+                let line = v.line.max(1);
+                let st = v.step(-(detents as isize).saturating_mul((WHEEL_ROWS * line) as isize)); // SIDEBARWHEEL (B792): wm's one model, the live wheel's ratio
+                sidebar::set_scroll(st.off / line);
+                WheelHit { pane: "sidebar", scroll: st.off / line, max: v.max_offset() / line, moved: st.moved != 0 }
+            }
+            None => WheelHit { pane: "sidebar", scroll: 0, max: 0, moved: false },
+        });
     }
     let tree = g.tree_pane().contains(sx, sy);
     if !tree && !g.list_pane().contains(sx, sy) {
@@ -3196,24 +3188,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         }
     }
 
-    // ── leg 3: thumb — absent when everything fits, inside the track when it does not ─────────────
-    if thumb(100, 5, 10, 0).is_some() {
-        return Err("a thumb was drawn for a list that fits");
-    }
-    let (ty, th) = thumb(100, 1000, 10, 0).ok_or("no thumb for an overflowing list")?;
-    if ty != 0 || th < THUMB_MIN() {
-        return Err("thumb floor not honoured at scroll 0");
-    }
-    let (ty2, th2) = thumb(100, 1000, 10, 990).ok_or("no thumb at the tail")?;
-    if ty2 + th2 != 100 {
-        return Err("thumb did not reach the end of the track at max scroll");
-    }
-    for scroll in [0usize, 1, 250, 500, 989, 990] {
-        let (a, b) = thumb(100, 1000, 10, scroll).ok_or("thumb vanished mid-range")?;
-        if a + b > 100 {
-            return Err("thumb overran its track");
-        }
-    }
+    // ── leg 3 (thumb) retired — SIDEBARWHEEL (B792): wm's `ScrollView::thumb` is the one thumb (`tests scrollview` thumb=)
 
     // ── leg 4: the tree splice — expand/collapse is an exact inverse ──────────────────────────────
     // Driven against a hand-built model rather than a volume, so the leg is honest on a machine with
@@ -4848,10 +4823,10 @@ fn list_view(m: &Model) -> Option<(wm::ScrollView, usize)> {
 }
 
 /// Register (or drop) one pane's model after a full paint, and paint its bar into the gutter.
-fn pane_register(id: wm::WinId, pane: u8, v: Option<(wm::ScrollView, usize)>, f: wm::ScrollFn, px: &mut [u32], stride: usize) {
+fn pane_register(id: wm::WinId, pane: u8, v: Option<(wm::ScrollView, usize)>, f: wm::ScrollFn, px: &mut [u32], stride: usize, ground: u32) {
     match v {
         Some((v, gw)) => {
-            if wm::scroll_set(id, pane, v, gw, theme::surface_content(), f) {
+            if wm::scroll_set(id, pane, v, gw, ground, f) {
                 wm::scrollbar_paint(id, pane, px, stride);
             }
         }
@@ -4860,7 +4835,7 @@ fn pane_register(id: wm::WinId, pane: u8, v: Option<(wm::ScrollView, usize)>, f:
 }
 
 /// SCROLLPANES (B777): every pane's model after a full paint — the content pane as the view shows it (List rows,
-/// the Icons grid, the Columns focus pane) and the tree.
+/// the Icons grid, the Columns focus pane), the tree and the sidebar (SIDEBARWHEEL B792; its ground is the window's).
 fn panes_register(id: wm::WinId, m: &Model, px: &mut [u32]) {
     if id == wm::WIN_NONE {
         return;
@@ -4870,8 +4845,9 @@ fn panes_register(id: wm::WinId, m: &Model, px: &mut [u32]) {
         toolbar::View::Columns => (cols_view(m), cols_scrolled),
         _ => (list_view(m), list_scrolled),
     };
-    pane_register(id, PANE_CONTENT, v, f, px, m.geom.w);
-    pane_register(id, PANE_TREE, tree_view(m), tree_scrolled, px, m.geom.w);
+    pane_register(id, PANE_CONTENT, v, f, px, m.geom.w, theme::surface_content());
+    pane_register(id, PANE_TREE, tree_view(m), tree_scrolled, px, m.geom.w, theme::surface_content());
+    pane_register(id, PANE_SIDEBAR, sidebar::view(&m.geom), side_scrolled, px, m.geom.w, theme::surface_window());
 }
 
 /// Paint body rows `[r0, r1)` of the viewport (view-relative) exactly as a full paint draws them: the ground, then
@@ -4980,7 +4956,7 @@ fn pane_step(
             core(m, px, st)
         };
         if full {
-            for p in [PANE_CONTENT, PANE_TREE] {
+            for p in [PANE_CONTENT, PANE_TREE, PANE_SIDEBAR] {
                 wm::scrollbar_paint(id, p, px, w); // the repaint laid the ground over every gutter
             }
         } else {
@@ -5075,6 +5051,8 @@ pub fn scrollview_probe() -> Result<usize, &'static str> {
 /// The window's content pane (List / Icons / Columns) and its tree, as wm's pane keys.
 const PANE_CONTENT: u8 = 0;
 const PANE_TREE: u8 = 1;
+/// SIDEBARWHEEL (B792): the sidebar (Favorites, Locations) above the tree.
+const PANE_SIDEBAR: u8 = 2;
 
 /// One step of `d` rows on a row offset whose largest value is `max` — wm's model in row units (`line` 1).
 fn rows_step(cur: usize, max: usize, d: isize) -> usize {
@@ -5323,8 +5301,8 @@ fn probe_model(n: usize, dirs: bool, cwd: &str) -> Option<Model> {
 fn pane_walk(
     m: &mut Model,
     v: Option<(wm::ScrollView, usize)>,
-    core: fn(&mut Model, &mut [u32], &wm::ScrollStep) -> usize,
-    full: fn(&mut Model, &mut [u32]),
+    mut core: impl FnMut(&mut Model, &mut [u32], &wm::ScrollStep) -> usize,
+    mut full: impl FnMut(&mut Model, &mut [u32]),
 ) -> Result<usize, &'static str> {
     let (mut view, _) = v.ok_or("the pane did not overflow")?;
     let g = m.geom;
@@ -5363,10 +5341,11 @@ fn pane_walk(
     Ok(walk.len())
 }
 
-/// `tests scrollview`'s SCROLLPANES legs: `(tree, icons, columns, overlay)`. The tree, the Icons grid and the Columns
+/// `tests scrollview`'s SCROLLPANES legs: `(tree, icons, columns, overlay, sidebar)` (SIDEBARWHEEL B792: the sidebar
+/// walked through `sidebar::step_in` over 60 synthetic rows, never the live ones). The tree, the Icons grid and the Columns
 /// focus pane walked through their live step bodies against a full paint; the overlay gate: a clean model blits, the
 /// context menu up or a mark on the folder does not (each raised and put back; nothing painted).
-pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 4] {
+pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 5] {
     let tree = match probe_model(200, false, "/scrollpanes") {
         Some(mut m) => {
             let v = tree_view(&m);
@@ -5405,5 +5384,44 @@ pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 4] {
         }
         None => Err("geometry declined 1024x768"),
     };
-    [tree, icons, columns, overlay]
+    let sidebar = match probe_model(4, false, "/s/0003") {
+        Some(mut m) => {
+            let rows: Vec<sidebar::Ent> = (0..60usize)
+                .map(|k| sidebar::Ent {
+                    label: alloc::format!("SIDE{:04}", k),
+                    path: if k % 10 == 0 { String::new() } else { alloc::format!("/s/{:04}", k) },
+                    removable: k % 7 == 0,
+                    present: k % 5 != 0,
+                })
+                .collect();
+            let v = sidebar::view_for(&m.geom, rows.len(), 0);
+            let top = core::cell::Cell::new(0usize);
+            pane_walk(
+                &mut m,
+                v,
+                |m, px, st| {
+                    let (t, n) = sidebar::step_in(m, px, &rows, st);
+                    top.set(t);
+                    n
+                },
+                |m, px| {
+                    let _ = sidebar::rows_paint_in(m, px, &rows, top.get(), 0, usize::MAX);
+                },
+            )
+        }
+        None => Err("geometry declined 1024x768"),
+    };
+    [tree, icons, columns, overlay, sidebar]
+}
+
+// ── SIDEBARWHEEL (rmbp-ledger B792) — the sidebar's step on the one model ──
+
+/// Can the sidebar's band be blitted? (The model is the picture the step started from, and nothing is over it.)
+fn side_strip_ok(m: &Model, st: &wm::ScrollStep) -> bool {
+    sidebar::view(&m.geom).is_some_and(|(v, _)| v.viewport == st.viewport && v.offset == st.was) && overlay_free(m)
+}
+
+/// The sidebar's `wm::ScrollFn`: [`pane_step`] keyed, its strip body `sidebar::step`.
+fn side_scrolled(id: wm::WinId, st: &wm::ScrollStep) -> usize {
+    pane_step(id, PANE_SIDEBAR, st, side_strip_ok, |m, px, st| sidebar::step(m, px, st), |m, st| sidebar::set_scroll(st.off / m.geom.row_h().max(1)))
 }

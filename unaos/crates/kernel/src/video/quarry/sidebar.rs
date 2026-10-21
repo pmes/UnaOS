@@ -40,13 +40,19 @@ static SIDE: crate::sync::Mutex<Vec<Ent>> = crate::sync::Mutex::new(Vec::new());
 static ROWS: AtomicUsize = AtomicUsize::new(10);
 /// The volume generation the rows were derived against. `u64::MAX` = never.
 static GEN: AtomicU64 = AtomicU64::new(u64::MAX);
-/// QUARRYHOVER (B647): the first row shown — the sidebar scrolls under the wheel when its rows outgrow its height
-/// (`h` is capped at half the panes'). Clamped at every read ([`scroll_of`]), so a re-derive needs no reset.
+/// QUARRYHOVER (B647): the first row shown — the sidebar scrolls when its rows outgrow its height (`h` is capped at
+/// half the panes'). Clamped at every read ([`scroll_of`]), so a re-derive needs no reset. SIDEBARWHEEL (B792): the
+/// offset store of the sidebar's pane on wm's one model ([`view`]); the step applies it, nothing else computes it.
 static SCROLL: AtomicUsize = AtomicUsize::new(0);
 
 /// Rows the sidebar can show at this geometry (the painter's own cut-off: a row must fit whole).
 pub(super) fn vis(g: &Geom) -> usize {
-    h(g).saturating_sub(g.ts) / g.row_h().max(1)
+    vis_for(g, ROWS.load(Ordering::Relaxed))
+}
+
+/// [`vis`] for a sidebar of `n` rows.
+fn vis_for(g: &Geom, n: usize) -> usize {
+    h_for(g, n).saturating_sub(g.ts) / g.row_h().max(1)
 }
 
 /// The first row shown, clamped so the last page is full.
@@ -60,17 +66,6 @@ pub(super) fn scroll() -> usize {
 }
 pub(super) fn set_scroll(s: usize) {
     SCROLL.store(s, Ordering::Relaxed);
-}
-
-/// QUARRYHOVER (B647): the wheel over the sidebar — one row a detent (QSCROLL's sign: positive = toward row 0).
-pub(super) fn wheel(m: &Model, detents: i32) -> super::WheelHit {
-    let g = &m.geom;
-    let max = ROWS.load(Ordering::Relaxed).saturating_sub(vis(g));
-    let cur = scroll_of(g);
-    let step = detents.unsigned_abs() as usize;
-    let next = if detents > 0 { cur.saturating_sub(step) } else { cur.saturating_add(step).min(max) };
-    SCROLL.store(next, Ordering::Relaxed);
-    super::WheelHit { pane: "sidebar", scroll: next, max, moved: next != cur }
 }
 
 /// QUARRYHOVER (B647): the row under surface `(sx, sy)` — a real row (never a header), by the press's arithmetic.
@@ -102,14 +97,23 @@ pub(super) fn favorites() -> [(&'static str, String); 6] {
 
 /// The sidebar's height in surface px: its rows plus a little air, never more than half the panes' height.
 pub(super) fn h(g: &Geom) -> usize {
-    let rows = ROWS.load(Ordering::Relaxed);
-    let want = rows * g.row_h() + 2 * g.ts;
+    h_for(g, ROWS.load(Ordering::Relaxed))
+}
+
+/// [`h`] for a sidebar of `n` rows.
+fn h_for(g: &Geom, n: usize) -> usize {
+    let want = n * g.row_h() + 2 * g.ts;
     want.min(g.h.saturating_sub(g.bar_h()) / 2)
 }
 
 /// The sidebar's rectangle (left column, between the toolbar and the tree).
 pub(super) fn rect(g: &Geom) -> Rect {
-    Rect { x: 0, y: g.bar_h(), w: g.tree_w(), h: h(g) }
+    rect_for(g, ROWS.load(Ordering::Relaxed))
+}
+
+/// [`rect`] for a sidebar of `n` rows.
+fn rect_for(g: &Geom, n: usize) -> Rect {
+    Rect { x: 0, y: g.bar_h(), w: g.tree_w(), h: h_for(g, n) }
 }
 
 /// Re-derive the rows when the volume generation moved (or never ran). Called on the listing pass.
@@ -173,7 +177,8 @@ fn eject_glyph(px: &mut [u32], g: &Geom, x: usize, y: usize, s: usize, c: u32) {
     fill(px, g, x, y + tri + s / 6, s, (s / 6).max(1), c);
 }
 
-/// Paint the sidebar over its rectangle (after the panes are drawn).
+/// Paint the sidebar over its rectangle (after the panes are drawn): the ground, the keyline, then the rows through
+/// the one row painter ([`rows_paint`]). The bar is wm's (`live::panes_register`).
 pub(super) fn paint(m: &Model, px: &mut [u32]) {
     let g = &m.geom;
     let r = rect(g);
@@ -182,38 +187,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
     }
     fill(px, g, r.x, r.y, r.w, r.h, theme::surface_window());
     fill(px, g, r.x, r.y + r.h - 1, r.w, 1, theme::line_subtle());
-    let row_h = g.row_h();
-    let side = SIDE.lock();
-    let top = scroll_of(g); // QUARRYHOVER (B647): the rows above the offset are scrolled off
-    for (i, e) in side.iter().enumerate().skip(top) {
-        let y = r.y + g.ts + (i - top) * row_h;
-        if y + row_h > r.y + r.h {
-            break;
-        }
-        if e.path.is_empty() {
-            text(px, g, r.x + PAD(), y + g.ts, e.label.as_bytes(), r.x + r.w, theme::text_secondary());
-            continue;
-        }
-        let here = m.cwd == e.path;
-        if here {
-            fill(px, g, r.x + PAD() / 2, y, r.w - PAD(), row_h, theme::accent());
-        } else if m.hover == super::Hover::Side(i) {
-            super::hover_wash(px, g, r.x + PAD() / 2, y, r.w - PAD(), row_h); // QUARRYHOVER (B647): the kit's hover wash under the pointer
-        }
-        let ink = if here {
-            theme::surface_window()
-        } else if e.present {
-            theme::text_primary()
-        } else {
-            theme::text_secondary()
-        };
-        let ej = if e.removable { row_h } else { 0 };
-        text(px, g, r.x + 3 * PAD(), y + g.ts, e.label.as_bytes(), r.x + r.w - ej, ink);
-        if e.removable {
-            let s = row_h.saturating_sub(4 * g.ts).max(4);
-            eject_glyph(px, g, r.x + r.w - row_h, y + (row_h - s) / 2, s, ink);
-        }
-    }
+    let _ = rows_paint(m, px, 0, vis(g));
 }
 
 /// A press inside the sidebar: navigate to the row's place, or eject a removable. `None` = not ours.
@@ -228,7 +202,8 @@ pub(super) fn press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
     if e.path.is_empty() {
         return Some(Act::None);
     }
-    if e.removable && sx >= r.x + r.w - g.row_h() {
+    let w = r.w.saturating_sub(if view(&g).is_some() { super::SBW() } else { 0 }); // SIDEBARWHEEL (B792): the glyph sits left of the gutter
+    if e.removable && sx >= r.x + w - g.row_h() && sx < r.x + w {
         let ok = crate::fs::removable::eject(&e.label);
         serial_println!("[quarry3] eject volume={} -> {}", e.label, if ok { "ok" } else { "not-mounted" });
         m.invalidate();
@@ -249,4 +224,108 @@ pub(super) fn press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
     m.status = None;
     serial_println!("[quarry3] sidebar press row={} -> {}", e.label, e.path);
     Some(Act::None)
+}
+
+// ── SIDEBARWHEEL (rmbp-ledger B792) — the sidebar is a pane on wm's one scroll model — TAIL-APPENDED ───────────────
+// SCROLLPANES (B777) owed item 1: the sidebar kept its own wheel. Now it registers a `wm::ScrollView` like the tree
+// ([`view`]: viewport = its rows left of the `SBW()` gutter, line = the row pitch, offset = [`SCROLL`] x pitch) from
+// `live::panes_register`; the wheel, the gutter press and the thumb drag are wm's, and the step (`live::side_scrolled`
+// -> `live::pane_step`) runs [`step_in`]: `wm::scroll_blit` and the strip rows through THE row painter
+// ([`rows_paint_in`]). Lock order MODEL -> SURF -> SIDE (repaint's). No arithmetic of its own.
+
+/// The sidebar's model for `n` rows with `top` the first shown: `(view, gutter_w)`, `None` when they fit.
+pub(super) fn view_for(g: &Geom, n: usize, top: usize) -> Option<(crate::video::wm::ScrollView, usize)> {
+    let (rh, vis) = (g.row_h(), vis_for(g, n));
+    if rh == 0 || vis == 0 || n <= vis {
+        return None;
+    }
+    let r = rect_for(g, n);
+    let vp = (r.x, r.y + g.ts, r.w.saturating_sub(super::SBW()), vis * rh);
+    Some((crate::video::wm::ScrollView { offset: top.min(n - vis) * rh, extent: n * rh, viewport: vp, line: rh }, super::SBW()))
+}
+
+/// The live sidebar's model (its rows, its offset).
+pub(super) fn view(g: &Geom) -> Option<(crate::video::wm::ScrollView, usize)> {
+    view_for(g, ROWS.load(Ordering::Relaxed), SCROLL.load(Ordering::Relaxed))
+}
+
+/// Rows `[r0, r1)` of the viewport (view-relative) exactly as the full paint draws them, `top` the first row shown: the
+/// ground left of the gutter (the keyline put back when the band covers it), then each row — a header, the here
+/// accent or the hover wash, the label, the eject glyph. THE sidebar row painter. Returns the pixels painted.
+pub(super) fn rows_paint_in(m: &Model, px: &mut [u32], rows: &[Ent], top: usize, r0: usize, r1: usize) -> usize {
+    let g = &m.geom;
+    let n = rows.len();
+    let r = rect_for(g, n);
+    let (row_h, vis) = (g.row_h(), vis_for(g, n));
+    let (r0, r1) = (r0.min(vis), r1.min(vis));
+    if r.h == 0 || row_h == 0 || r0 >= r1 {
+        return 0;
+    }
+    let w = r.w.saturating_sub(if n > vis { super::SBW() } else { 0 });
+    let (y0, y1) = (r.y + g.ts + r0 * row_h, r.y + g.ts + r1 * row_h);
+    fill(px, g, r.x, y0, w, y1 - y0, theme::surface_window());
+    let line = r.y + r.h - 1;
+    if line >= y0 && line < y1 {
+        fill(px, g, r.x, line, w, 1, theme::line_subtle());
+    }
+    for k in r0..r1 {
+        let i = top + k;
+        let Some(e) = rows.get(i) else { break };
+        let y = r.y + g.ts + k * row_h;
+        if e.path.is_empty() {
+            text(px, g, r.x + PAD(), y + g.ts, e.label.as_bytes(), r.x + w, theme::text_secondary());
+            continue;
+        }
+        let here = m.cwd == e.path;
+        if here {
+            fill(px, g, r.x + PAD() / 2, y, w - PAD(), row_h, theme::accent());
+        } else if m.hover == super::Hover::Side(i) {
+            super::hover_wash(px, g, r.x + PAD() / 2, y, w - PAD(), row_h); // QUARRYHOVER (B647): the kit's hover wash under the pointer
+        }
+        let ink = if here {
+            theme::surface_window()
+        } else if e.present {
+            theme::text_primary()
+        } else {
+            theme::text_secondary()
+        };
+        let ej = if e.removable { row_h } else { 0 };
+        text(px, g, r.x + 3 * PAD(), y + g.ts, e.label.as_bytes(), r.x + w - ej, ink);
+        if e.removable {
+            let s = row_h.saturating_sub(4 * g.ts).max(4);
+            eject_glyph(px, g, r.x + w - row_h, y + (row_h - s) / 2, s, ink);
+        }
+    }
+    (y1 - y0) * w
+}
+
+/// [`rows_paint_in`] over the live rows at the live offset.
+pub(super) fn rows_paint(m: &Model, px: &mut [u32], r0: usize, r1: usize) -> usize {
+    let top = scroll_of(&m.geom);
+    let side = SIDE.lock();
+    rows_paint_in(m, px, &side, top, r0, r1)
+}
+
+/// The step on the surface: the first row shown after it, and the pixels painted (the one rect-scoped blit, then the
+/// strip rows through [`rows_paint_in`]). The sidebar has no selection to pull. The probe drives this same body.
+pub(super) fn step_in(m: &Model, px: &mut [u32], rows: &[Ent], st: &crate::video::wm::ScrollStep) -> (usize, usize) {
+    let rh = m.geom.row_h().max(1);
+    let top = st.off / rh;
+    if st.moved == 0 {
+        return (top, 0);
+    }
+    let _ = crate::video::wm::scroll_blit(px, m.geom.w, st);
+    let y0 = st.viewport.1;
+    let (r0, r1) = ((st.strip.0 - y0) / rh, (st.strip.1 - y0).div_ceil(rh));
+    (top, rows_paint_in(m, px, rows, top, r0, r1))
+}
+
+/// The live step ([`step_in`] over the live rows), its offset stored.
+pub(super) fn step(m: &Model, px: &mut [u32], st: &crate::video::wm::ScrollStep) -> usize {
+    let (top, n) = {
+        let side = SIDE.lock();
+        step_in(m, px, &side, st)
+    };
+    SCROLL.store(top, Ordering::Relaxed);
+    n
 }
