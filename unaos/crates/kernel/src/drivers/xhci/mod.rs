@@ -3899,7 +3899,7 @@ impl XhciController {
     }
 
     pub fn ring_doorbell(&mut self, slot_id: u8, target: u32) {
-        unsafe {
+        #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] { if suspend::doorbell_held(slot_id) { return; } } unsafe { // STOPENDPOINT (B775): a slot on a port the sleep state suspended rings nothing; the TRB stays queued and `suspend::endpoints_restart` rings it after the recovery. LINE-NEUTRAL fold, code first
             // 1. Find Doorbell Offset (Offset 0x14 in Cap Regs)
             let dboff_ptr = (self.base_addr + 0x14) as *const u32;
             let dboff = core::ptr::read_volatile(dboff_ptr) & !0x03; // 4-byte aligned
@@ -4444,7 +4444,7 @@ impl XhciController {
                         // storage slot, so slot_id + out_dci disambiguate it from any BOT transfer.
                         // Matched by TRB address (or any error) so the drain pump claims exactly its
                         // own Normal-TRB completion before the async FSM below.
-                        if endpoint_id > 1 && slot_id > 0 {
+                        #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] { if suspend::stopped_keep(slot_id as u8, endpoint_id as u8, completion_code as u8) { return; } } if endpoint_id > 1 && slot_id > 0 { // STOPENDPOINT (B775): a Stopped (26/27) TD on a DCI the suspend holds is KEPT (xHCI 1.2 §4.6.9: the xHC re-executes it on the restart doorbell), never retired or re-armed by any claim below (FTDI, usbnet, hub, the HID re-arm). LINE-NEUTRAL fold, code first
                             if let Some(p) = self.ftdi_pending {
                                 if p.slot_id == slot_id as u8 && endpoint_id as u8 == p.out_dci {
                                     let is_match = param == p.wait_trb_phys;
@@ -18030,8 +18030,14 @@ pub mod suspend {
     //! (TRSMRCY) as DEADLINES the next passes check (the pump runs every 1 ms tick).
     //!
     //! Kept up and named: the FTDI console's port (`why=wire`) and every storage record's port (`why=storage`: the BOT
-    //! pump has no auto-resume). No Stop Endpoint: the dispatch's non-halting re-arm would restart a stopped endpoint
-    //! (owed, B766); endpoints stay Running with their TDs queued and the resume line prints the keyboard's EP state.
+    //! pump has no auto-resume).
+    //!
+    //! STOPENDPOINT (B775): before U3 every Running DCI of every slot on the port gets Stop Endpoint with SP=1
+    //! ([`XhciController::endpoints_stop`], xHCI 1.2 §4.6.9, §4.15.1); after the resume's recovery (USB 2.0 §7.1.7.7
+    //! TRSMRCY: no traffic before it ends) each one's doorbell is rung ([`XhciController::endpoints_restart`]). One
+    //! per-slot word, `HELD`, written only by the loan holder, is what the two shared sites read: `ring_doorbell` rings
+    //! nothing for a held slot ([`doorbell_held`]) and the transfer dispatch keeps a Stopped TD on a held DCI
+    //! ([`stopped_keep`]) — the xHC re-executes it on the restart, so no claim may retire or re-arm it.
     use super::{XhciController, PORT_CHANGE_BITS};
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -18068,13 +18074,23 @@ pub mod suspend {
     static RESUMED_N: AtomicU32 = AtomicU32::new(0);
     static KEPT_N: AtomicU32 = AtomicU32::new(0);
     static REMOTE_WAKES: AtomicU32 = AtomicU32::new(0);
+    /// Per slot: bit 0 = the slot's root port is suspended by this driver, bit `dci` = this driver stopped that DCI.
+    /// Set BEFORE each Stop is pushed (`run_command_sync` pumps the event ring, so the cc=26 Transfer Event is
+    /// dispatched ahead of the Command Completion); cleared by `endpoints_restart` before it rings. Loan holder only.
+    static HELD: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
+    /// DCIs read Stopped(3) after their Stop; of those, DCIs read Running(1) after the restart doorbell.
+    static EP_STOPPED_N: AtomicU32 = AtomicU32::new(0);
+    static EP_RUNNING_N: AtomicU32 = AtomicU32::new(0);
+    /// Stop Endpoint Command TRB (xHCI 1.2 §6.4.3.8): type 15, SP bit 23 (the endpoint is stopped for a suspend).
+    const TRB_STOP_EP: u32 = 15 << 10;
+    const STOP_SP: u32 = 1 << 23;
 
     /// The sleep state's one word: `true` at entry, `false` at the wake. Any context; touches no register.
     pub fn request(suspend: bool) { WANT.store(suspend, Ordering::Release); }
 
     /// One cycle's numbers, for `tests usbsuspend`.
     #[derive(Clone, Copy)]
-    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32 }
+    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32 }
 
     /// `true` while the ports are in U3 (the last request has been applied); `false` once fully back in U0.
     pub fn suspended() -> bool { PHASE.load(Ordering::Acquire) == SUSPENDED }
@@ -18084,7 +18100,18 @@ pub mod suspend {
         Census {
             ports: PORTS.load(Ordering::Relaxed), suspended: SUSPENDED_N.load(Ordering::Relaxed), pls3: PLS3_N.load(Ordering::Relaxed),
             resumed: RESUMED_N.load(Ordering::Relaxed), kept: KEPT_N.load(Ordering::Relaxed), remote_wakes: REMOTE_WAKES.load(Ordering::Relaxed),
+            ep_stopped: EP_STOPPED_N.load(Ordering::Relaxed), ep_running: EP_RUNNING_N.load(Ordering::Relaxed),
         }
+    }
+
+    /// `ring_doorbell`'s guard: a slot on a port this driver suspended rings nothing (slot 0, the command ring, is never
+    /// held). The TRB the caller queued stays on its ring for `endpoints_restart`'s doorbell.
+    pub(super) fn doorbell_held(slot: u8) -> bool { HELD[slot as usize].load(Ordering::Relaxed) != 0 }
+
+    /// The transfer dispatch's keep: a Stopped (26) or Stopped - Length Invalid (27) event on a DCI this driver stopped
+    /// names a TD the xHC resumes on the restart doorbell (xHCI 1.2 §4.6.9), so it is neither retired nor re-armed.
+    pub(super) fn stopped_keep(slot: u8, dci: u8, cc: u8) -> bool {
+        matches!(cc, 26 | 27) && dci < 32 && HELD[slot as usize].load(Ordering::Relaxed) & (1u32 << dci) != 0
     }
 
     fn bit(port: u8) -> u64 { if (1..=64).contains(&port) { 1u64 << (port - 1) } else { 0 } }
@@ -18098,6 +18125,7 @@ pub mod suspend {
                 SUSPENDED if !WANT.load(Ordering::Acquire) => self.ports_resume_begin(0),
                 RESUMING if now >= DUE_MS.load(Ordering::Relaxed) => self.ports_resume_finish(now),
                 RECOVERING if now >= DUE_MS.load(Ordering::Relaxed) => {
+                    self.endpoints_restart();
                     PHASE.store(UP, Ordering::Release);
                 }
                 _ => {}
@@ -18114,6 +18142,8 @@ pub mod suspend {
             for r in self.storage.iter() { if r.slot != 0 { keep_storage |= bit(self.slots[r.slot as usize].port_id); } }
             let (mut ports, mut kept, mut done, mut pls3) = (0u32, 0u32, 0u32, 0u32);
             let (mut mask, mut usb2) = (0u64, 0u64);
+            EP_STOPPED_N.store(0, Ordering::Relaxed);
+            EP_RUNNING_N.store(0, Ordering::Relaxed);
             for port in 1..=self.max_ports.min(64) {
                 let portsc = self.read_portsc(port);
                 if portsc & 0b11 != 0b11 { continue; } // CCS and PED: an enabled device
@@ -18126,6 +18156,8 @@ pub mod suspend {
                 }
                 if (portsc & PLS_MASK) >> PLS_SHIFT > 2 { continue; } // not U0..U2: not ours to suspend
                 let rwe = self.arm_remote_wake(port);
+                let stopped = self.endpoints_stop(port);
+                EP_STOPPED_N.fetch_add(stopped, Ordering::Relaxed);
                 self.set_link_state(port, PLS_U3);
                 let t0 = crate::arch::ms();
                 let mut pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
@@ -18193,6 +18225,55 @@ pub mod suspend {
             SUSP_MASK.store(0, Ordering::Relaxed);
             DUE_MS.store(crate::arch::ms() + RECOVERY_MS, Ordering::Relaxed);
             PHASE.store(RECOVERING, Ordering::Release);
+        }
+
+        /// Stop Endpoint (SP=1) on every Running DCI of every active slot on `port` (root and downstream slots carry the
+        /// root port's number), before U3 (xHCI 1.2 §4.15.1). A DCI that is not Running is left exactly as it is. Each
+        /// slot is marked held first; each DCI's bit is set before its command and cleared again if the Stop fails or
+        /// the state does not read Stopped(3). Returns the DCIs read Stopped.
+        fn endpoints_stop(&mut self, port: u8) -> u32 {
+            let mut stopped = 0u32;
+            for slot in 1..self.slots.len().min(HELD.len()) {
+                if !self.slots[slot].active || self.slots[slot].port_id != port { continue; }
+                HELD[slot].fetch_or(1, Ordering::Relaxed);
+                for dci in 1..=31u8 {
+                    if self.ep_state_of(slot as u8, dci) != 1 { continue; }
+                    HELD[slot].fetch_or(1u32 << dci, Ordering::Relaxed);
+                    let ctx = ((dci as u32) << 16) | ((slot as u32) << 24);
+                    let (ok, cc, why) = self.recover_cmd(super::Trb { parameter: 0, status: 0, control: TRB_STOP_EP | STOP_SP | ctx });
+                    let state = self.ep_state_of(slot as u8, dci);
+                    if ok && state == 3 {
+                        stopped += 1;
+                        serial_println!("[usb] slot={} dci={} stop -> state={}", slot, dci, state);
+                    } else {
+                        HELD[slot].fetch_and(!(1u32 << dci), Ordering::Relaxed);
+                        serial_println!("[usb] slot={} dci={} stop -> state={} cc={} why={}", slot, dci, state, cc, why);
+                    }
+                }
+            }
+            stopped
+        }
+
+        /// After the resume's recovery: every held slot's word is taken (so `doorbell_held` opens) and each stopped
+        /// DCI's doorbell is rung (Stopped -> Running, xHCI 1.2 §4.8.3), then its state read, bounded 5 ms.
+        fn endpoints_restart(&mut self) {
+            let mut running = 0u32;
+            for slot in 1..self.slots.len().min(HELD.len()) {
+                let held = HELD[slot].swap(0, Ordering::Relaxed);
+                for dci in 1..=31u8 {
+                    if held & (1u32 << dci) == 0 { continue; }
+                    self.ring_doorbell(slot as u8, dci as u32);
+                    let t0 = crate::arch::ms();
+                    let mut state = self.ep_state_of(slot as u8, dci);
+                    while state != 1 && crate::arch::ms().wrapping_sub(t0) < 5 {
+                        core::hint::spin_loop();
+                        state = self.ep_state_of(slot as u8, dci);
+                    }
+                    if state == 1 { running += 1; }
+                    serial_println!("[usb] slot={} dci={} ring -> state={}", slot, dci, state);
+                }
+            }
+            EP_RUNNING_N.store(running, Ordering::Relaxed);
         }
 
         /// Write PLS with LWS on `clear_port_change`'s mask: never a 1 to PED (write-1-to-disable), PR (reset) or a

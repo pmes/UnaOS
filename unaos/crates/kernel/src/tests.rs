@@ -5319,7 +5319,7 @@ fn usbsuspend_selftest() {
     let (e, e_kbd) = usbsuspend_ehci_leg(kbd == "none");
     let verdict = if !in_u3 || !up {
         "FAIL reason=phase-timeout"
-    } else if c.pls3 != c.suspended || r.resumed < c.suspended || e.resumed < e.suspended { "FAIL"
+    } else if c.pls3 != c.suspended || r.resumed < c.suspended || e.resumed < e.suspended || r.ep_running < r.ep_stopped { "FAIL"
     } else if kbd != "none" { if kbd != "ok" || c.suspended == 0 { "FAIL" } else { "PASS" }
     } else if e_kbd == "none" {
         "SKIP reason=no-kbd"
@@ -5330,8 +5330,8 @@ fn usbsuspend_selftest() {
     };
     let (kbd_on, kbd_word) = if kbd != "none" { ("xhci", kbd) } else { ("ehci", e_kbd) };
     serial_println!(
-        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={}",
-        c.ports, c.suspended, r.resumed, kbd_word, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on
+        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={}",
+        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on
     );
 }
 
