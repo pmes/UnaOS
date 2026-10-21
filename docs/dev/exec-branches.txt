@@ -692,3 +692,6 @@ refs/heads/exec-rmbp-ring3scrollpress   28d01e8c IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-sidebarwheel   28d01e8c IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-sessionedge   28d01e8c IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-layoutroot   28d01e8c IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-ehcihubchain   65c6e794 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-xhciholddci   65c6e794 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-subscribekeep   65c6e794 IN-FLIGHT cut 2026-10-21
