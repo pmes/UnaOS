@@ -803,16 +803,17 @@ pub fn quarryio_selftest() {
         let st = COLS.lock();
         g.as_ref().map_or(0, |m| m.list.iter().zip(st.meta.iter()).filter(|(e, mm)| mm.name == e.name && !mm.pending && !mm.type_name.is_empty()).count())
     };
+    let rl = relist_leg(&dir); // QUARRYRELIST (B824): the live relist reads off MODEL (file tail)
     if was_open {
         let _ = super::open_at(&base);
     } else {
         super::close();
     }
     let _ = super::ops::op_delete(&dir);
-    let ok = in_paint == 0 && in_svc > 0 && cols == 0 && pending == 0 && paints >= QIO_PAINTS;
+    let ok = in_paint == 0 && in_svc > 0 && cols == 0 && pending == 0 && paints >= QIO_PAINTS && rl.ok;
     serial_println!(
-        ":: QUARRYIO: paints={} io_in_paint={} io_in_service={} holds_max={} cols_in_io={} pending={} -> {} :: dir={} passes={} pending_at_open={} typed={} io_other={}",
-        paints, in_paint, in_svc, holds, cols, pending, if ok { "PASS" } else { "FAIL" }, dir, passes, pend0, typed, other
+        ":: QUARRYIO: paints={} io_in_paint={} io_in_service={} holds_max={} cols_in_io={} pending={} -> {} :: dir={} passes={} pending_at_open={} typed={} io_other={} {}",
+        paints, in_paint, in_svc, holds, cols, pending, if ok { "PASS" } else { "FAIL" }, dir, passes, pend0, typed, other, rl.terms
     );
 }
 
@@ -1297,4 +1298,51 @@ fn lock_glyph(px: &mut [u32], g: &Geom, x: usize, y: usize, max_x: usize, ink: u
 /// the next service pass (the same latched write QUARRY2's header press used to make).
 pub(super) fn persist_default() {
     PERSIST.store(true, Ordering::Release);
+}
+
+// ── QUARRYRELIST (rmbp-ledger B824): `tests quarryio`'s relist leg ──────────────────────────────────────────────
+
+/// Rows in the relist leg's probe folder, and the bound on the install's MODEL hold.
+const RELIST_ROWS: usize = 200;
+const RELIST_HELD_US: u64 = 5_000;
+
+/// The leg's verdict and its line terms.
+struct RelistLeg {
+    ok: bool,
+    terms: String,
+}
+
+/// `<dir>/RELIST` with [`RELIST_ROWS`] files, opened in the window, then `livedir::relist_probe`: declined under a
+/// PaintMark, a read the generation outlived dropped, a relist read off the lock with its MODEL hold under the bound.
+/// `relist_rows=<n> relist_held_us=<n> off_lock=<ok|FAIL> paint_defer=<ok|FAIL> stale=<dropped|FAIL>`.
+fn relist_leg(dir: &str) -> RelistLeg {
+    use crate::fs::vfs::KERNEL_PRINCIPAL as P;
+    let t = crate::shell::vfs_mount_table();
+    let sub = join(dir, "RELIST");
+    if super::ops::op_mkdir(&sub).is_err() {
+        return RelistLeg { ok: false, terms: String::from("relist=FAIL(mkdir)") };
+    }
+    for i in 0..RELIST_ROWS {
+        let _ = t.create(&join(&sub, &alloc::format!("R{:03}", i)), NodeKind::File, P);
+    }
+    if !super::open_at(&sub) {
+        return RelistLeg { ok: false, terms: String::from("relist=FAIL(open)") };
+    }
+    let bump_at = join(&sub, "BUMP");
+    let bump = || {
+        let _ = crate::shell::vfs_mount_table().create(&bump_at, NodeKind::File, P);
+    };
+    let p = super::livedir::relist_probe(&bump);
+    let (rows, held, locked) = p.done.as_ref().map_or((0, u64::MAX, usize::MAX), |d| (d.rows, d.held_us, d.locked_reads));
+    let off_lock = p.done.is_some() && locked == 0;
+    let ok = off_lock && p.paint_defer && p.stale_dropped && rows > RELIST_ROWS && held <= RELIST_HELD_US;
+    let terms = alloc::format!(
+        "relist_rows={} relist_held_us={} off_lock={} paint_defer={} stale={}",
+        rows,
+        if held == u64::MAX { String::from("-") } else { alloc::format!("{}", held) },
+        if off_lock { "ok" } else { "FAIL" },
+        if p.paint_defer { "ok" } else { "FAIL" },
+        if p.stale_dropped { "dropped" } else { "FAIL" }
+    );
+    RelistLeg { ok, terms }
 }
