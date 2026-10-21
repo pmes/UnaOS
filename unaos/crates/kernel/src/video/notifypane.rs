@@ -9,7 +9,7 @@
 //! ([`rule_at_post`], [`dnd_now`]) — no bus, no heap on the read.
 //!
 //! The alert sound: one per NOTIFY pass (a post, or a dialog's alert latched by [`alert`]), asked of the hda tone path ([`sound_for`] →
-//! `drivers::hda::play::request_alert`), refused while the output is already sounding.
+//! `drivers::hda::play::request_alert`), mixed over a playing sound; refused only while an alert sounds.
 //!
 //! Wire: `[notifypane] loaded apps=<n> dnd=<0|1> dnd_window=<f>-<u> via=login`, `[notifypane] set app=<a>
 //! <field>=<v> applied=1`, `[notifypane] saved <key> ok=<0|1>`, `[notifypane] window <f>-<u> applied=1`,

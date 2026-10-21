@@ -30,7 +30,7 @@
 //!   and carries PCM, Type I, 16-bit in 2-byte subframes, mono or stereo, at 48 kHz (else 44.1 kHz) ([`pick_capture`]),
 //!   and leaves that interface at alt 0: the microphone is NOT sampled at enumeration. A capture source opening
 //!   (`audio::source`, [`capture_open`]) raises the wanted count; the service pass (`isoch::service_uvc`, the one
-//!   context that may run EP0 and Configure Endpoint) sees [`capture_due`] and runs [`capture_service`]: Configure
+//!   context that may run EP0 and Configure Endpoint) sees [`ep0_due`] and runs [`ep0_service`]: Configure
 //!   Endpoint (the audio IN pipe, `APIPE`), SET_INTERFACE(alt), the sampling-frequency SET_CUR when declared,
 //!   `iso_start`. The last source closing runs it the other way: SET_INTERFACE(0), drop the endpoint. [`capture_armed`]
 //!   — the IN pipe runs — is the ONE count the menu bar's mic dot paints from (`video::menubar::micdot`). Completed
@@ -41,7 +41,7 @@
 //!   channel 1-2 Mute / Volume controls); while the playback stream runs, the mixer hands the person's level to
 //!   [`volume_want`] and the service pass applies it ([`volume_service`]: GET_MIN / GET_MAX once, then SET_CUR Mute and
 //!   Volume on EP0), so the mixer plays unity into a device that carries its own volume. It rides the class driver's
-//!   one EP0 door from `isoch::service_uvc` ([`capture_due`] / [`capture_service`]: one EP0 job per pass).
+//!   one EP0 door from `isoch::service_uvc` ([`ep0_due`] / [`ep0_service`]: one EP0 job per pass).
 //!
 //! # SOURCES (DRIVERS-METHOD §5)
 //!
@@ -697,8 +697,9 @@ pub fn capture_counters() -> (u32, u64, u32) {
     (CAP_OPENS.load(Ordering::Relaxed), CFRAMES.load(Ordering::Relaxed), COVERRUNS.load(Ordering::Relaxed))
 }
 
-/// The slot whose capture pipe must open or close on this service pass (the wanted state differs from the armed one).
-pub fn capture_due() -> Option<u8> {
+/// THE EP0 DOOR (SINKALLDOCS, was `capture_due`): the slot with an EP0 job on this service pass — the playback volume
+/// waiting for SET_CUR, or the capture pipe to open or close (the wanted state differs from the armed one).
+pub fn ep0_due() -> Option<u8> {
     if volume_due() {
         return Some(SLOT.load(Ordering::Acquire)).filter(|&s| s != 0); // SINKALL: the playback volume's EP0 job first
     }
@@ -727,9 +728,10 @@ fn cap_fail(slot: u8, stage: &str, why: &'static str) {
     serial_println!("[uac] capture abort slot={} stage={} reason={}", slot, stage, why);
 }
 
-/// The service pass's half (task context, EP0 free): open the capture pipe while a source wants it, close it when the
+/// THE EP0 DOOR (SINKALLDOCS, was `capture_service`), the service pass's half (task context, EP0 free): the playback
+/// volume first; else open the capture pipe while a source wants it, close it when the
 /// last source left. One direction per call.
-pub fn capture_service(h: &mut dyn IsoHost) {
+pub fn ep0_service(h: &mut dyn IsoHost) {
     if volume_due() {
         return volume_service(h); // SINKALL: one EP0 job per pass — the volume, then the capture pipe on the next
     }
@@ -1080,7 +1082,7 @@ pub fn mic_fixture() {
 // The mixer (`audio::mixer::master`) calls [`volume_want`] with the F-row level 0..16 and the mute flag whenever it
 // mixes for the USB sink; a device whose Feature Unit has a Volume control takes it (the mixer then plays unity — the
 // level is applied once, as the HDA codec amp does). The SET_CUR runs in the service pass ([`volume_service`], reached
-// through [`capture_due`] / [`capture_service`], the class driver's one EP0 door). One audio device at a time (`probe`'s
+// through [`ep0_due`] / [`ep0_service`], the class driver's one EP0 door). One audio device at a time (`probe`'s
 // guard), so the door's slot is the playback device's. A refused request leaves the device to the mixer's scale.
 
 /// The playback device's Feature Unit: unit | ac_intf << 8 | mute << 16 | vol << 24 (0 = none).

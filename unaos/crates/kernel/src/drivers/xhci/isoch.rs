@@ -35,7 +35,7 @@
 //!   side: an `XhciUvc` built for an audio slot (`audio: true`) configures an IN `IsoEp` as EP Type 5 at DCI ep*2+1
 //!   with the OUT pipe's short lead, each completed TD's bytes go to `drivers::usb::uac::push_capture` (the class
 //!   driver's 64 KiB capture ring) from `claim_ain`, and the pipe exists only while a capture source is open:
-//!   `service_uvc` asks `uac::capture_due` first on every pass and hands `uac::capture_service` the slot's host.
+//!   `service_uvc` asks `uac::ep0_due` first on every pass and hands `uac::ep0_service` the slot's host.
 //!
 //! # SOURCES (DRIVERS-METHOD §5 — each constant on its line carries what it has)
 //!
@@ -78,12 +78,12 @@ mod ac {
     pub fn out_td_len(_: u32) -> u32 {
         0
     }
-    pub fn capture_due() -> Option<u8> {
+    pub fn ep0_due() -> Option<u8> {
         None
     }
     pub fn probe(_: u8, _: u16, _: u16, _: &[u8], _: u8, _: &mut dyn IsoHost) {}
     pub fn capture_lost(_: u8, _: &str) {}
-    pub fn capture_service(_: &mut dyn IsoHost) {}
+    pub fn ep0_service(_: &mut dyn IsoHost) {}
 }
 
 // ── Constants (xHCI 1.2 unless named) ───────────────────────────────────────────────────────────────────
@@ -1014,8 +1014,8 @@ impl XhciController {
         if self.enum_active {
             return;
         }
-        if let Some(slot) = ac::capture_due() {
-            self.service_capture(slot); // UACMIC (B723): a capture source opened or closed — one per pass, first
+        if let Some(slot) = ac::ep0_due() {
+            self.service_capture(slot); // UACMIC (B723) / SINKALL (B767): the class driver's EP0 job (the playback volume, or a capture source opened or closed) — one per pass, first
             return;
         }
         let slot = pop_candidate();
@@ -1061,8 +1061,8 @@ impl XhciController {
         }
     }
 
-    /// UACMIC (B723): open or close the capture pipe of the audio device on `slot` (the class driver decides which,
-    /// `uac::capture_service`), in the service pass — the only context that may run EP0 and Configure Endpoint.
+    /// UACMIC (B723): the EP0 job of the audio device on `slot` — the playback volume, or open or close its capture pipe (the class driver decides which,
+    /// `uac::ep0_service`), in the service pass — the only context that may run EP0 and Configure Endpoint.
     fn service_capture(&mut self, slot: u8) {
         let s = slot as usize;
         if s >= self.slots.len() || !self.slots[s].active || self.slots[s].ep0_ring.is_none() {
@@ -1074,7 +1074,7 @@ impl XhciController {
             return;
         };
         let mut host = XhciUvc { c: self, slot, buf, built: None, audio: true };
-        ac::capture_service(&mut host);
+        ac::ep0_service(&mut host);
         if let Some(b) = host.built.take() {
             // Configured but neither started nor dropped (an early return): give the bandwidth back.
             let dci = b.pipe.dci;
