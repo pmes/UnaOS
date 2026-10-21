@@ -160,13 +160,14 @@ pub fn subscribe() {
 }
 
 /// PrefChanged: called by the store on every accepted write. Builds the verb-19 frame of record into the
-/// subscription queue (oldest dropped and counted when full). No subscriber = nothing queued.
-pub fn on_changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
+/// subscription queue (oldest dropped and counted when full). No subscriber = nothing queued. PREFSUNSET (SR169):
+/// `a = None` = the key left the store with no preference-level default: the frame carries the unset form.
+pub fn on_changed(ns: &str, k: &str, a: Option<&prefs_core::schema::Applied>) {
     let kq = SUBSCRIBED.load(Ordering::Acquire); if !kq && R3_SUBS.load(Ordering::Acquire) == 0 { // PREFCHANGED (B558): a kernel OR a ring-3 subscriber
         return;
     }
     // PREFSKERNEL (B345): the shared body — `<ns>.<key>` NUL `<literal>` [NUL `clamped=true`].
-    let body = prefs_core::wire::changed_body_applied(ns, k, a);
+    let body = match a { Some(a) => prefs_core::wire::changed_body_applied(ns, k, a), None => prefs_core::wire::unset_body(ns, k) }; // PREFSUNSET (SR169): or `<ns>.<key>` NUL, the empty literal slot
     if body.len() > crate::bus::BUS_BODY_MAX {
         return;
     }
@@ -186,7 +187,9 @@ pub fn on_changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
 }
 
 /// Drain the subscription queue: each frame is parsed through the frozen `frame_parse` (verb 19, kind
-/// REPLY, corr 0) and its body split at the NUL; `f(ns, key)` per change. Returns the frames delivered.
+/// REPLY, corr 0) and its body through the shared `wire::parse_changed` (a value or the unset form, PREFSUNSET
+/// SR169); `f(ns, key)` per change — the consumer re-reads the store, so an unset key answers its default.
+/// Returns the frames delivered.
 pub fn changes_drain(mut f: impl FnMut(&str, &str)) -> usize {
     let frames: Vec<Box<[u8]>> = locked(|| CHANGES.lock().drain(..).collect());
     let mut n = 0usize;
@@ -196,8 +199,7 @@ pub fn changes_drain(mut f: impl FnMut(&str, &str)) -> usize {
             continue;
         }
         let body = &fr[BUS_HDR_LEN..];
-        let addr = match body.iter().position(|&b| b == 0) { Some(z) => &body[..z], None => body };
-        if let Some((ns, k)) = core::str::from_utf8(addr).ok().and_then(crate::prefs::split_addr) {
+        if let Some((ns, k, _, _)) = prefs_core::wire::parse_changed(body) {
             f(ns, k);
             n += 1;
         }

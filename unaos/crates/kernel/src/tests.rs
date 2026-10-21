@@ -4841,16 +4841,17 @@ fn lockdeleted_leg() -> (bool, &'static str) {
     let _ = lock::prefs_pass();
     let moved = lock::policy().0 == want;
     let gone = crate::prefs::delete_domain_watched(&d);
+    let (dk, ds) = crate::prefs::deleted_counts(); // PREFSUNSET (SR169): every cleared key posted (its default or the unset form)
     let reread = lock::prefs_pass();
     let seen = lock::policy();
     let defaults = seen == (lock::IDLE_MIN_DEFAULT as u32, true, true);
     let back_ok = crate::prefs::restore_domain(&d, &bytes);
     let _ = lock::prefs_pass();
     let restored = lock::policy() == orig;
-    let ok = set_ok && moved && gone && defaults && back_ok && restored;
+    let ok = set_ok && moved && gone && defaults && back_ok && restored && dk > 0 && ds == dk;
     serial_println!(
-        "[lock] deleted leg domain={} want={} moved={} gone={} reread={} seen={}/{}/{} restored={} -> {}",
-        d, want, moved as u8, gone as u8, reread as u8, seen.0, seen.1 as u8, seen.2 as u8, restored as u8, if ok { "ok" } else { "bad" }
+        "[lock] deleted leg domain={} want={} moved={} gone={} reread={} seen={}/{}/{} restored={} keys={} unsent={} -> {}",
+        d, want, moved as u8, gone as u8, reread as u8, seen.0, seen.1 as u8, seen.2 as u8, restored as u8, dk, dk.saturating_sub(ds), if ok { "ok" } else { "bad" }
     );
     (ok, if ok { "ok" } else { "FAIL" })
 }
