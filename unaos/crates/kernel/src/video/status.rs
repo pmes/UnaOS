@@ -664,7 +664,7 @@ pub fn volkey_usage(usage: u8) -> Option<(u8, bool)> {
     VOL_LEVEL.store(lv, Ordering::Relaxed);
     VOL_MUTED.store(muted as u8, Ordering::Relaxed);
     #[cfg(all(target_arch = "x86_64", feature = "hda"))]
-    let written = crate::drivers::hda::vol::apply(lv, muted) > 0; #[cfg(any(feature = "uvc", feature = "hda-tone"))] crate::audio::mixer::pump(); // SINKALLDOCS (rmbp-ledger B781): the mixer hands the new level to a USB device now (`master` -> `uac::volume_want`), not at the next period. LINE-NEUTRAL append, code before this comment
+    let written = crate::drivers::hda::vol::apply(lv, muted) > 0; #[cfg(any(feature = "uvc", feature = "hda-tone"))] crate::audio::mixer::level_changed(); // MIXERPUMP (rmbp-ledger B787): the master stage hands the new level to its carrier now (`mixer::level_changed`, atomics only; was SINKALLDOCS B781's pump). LINE-NEUTRAL append, code before this comment
     #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
     let written = false;
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
@@ -719,7 +719,7 @@ pub fn set_volume(level: u8, muted: bool) -> bool {
     VOL_LEVEL.store(lv, Ordering::Relaxed);
     VOL_MUTED.store(muted as u8, Ordering::Relaxed);
     #[cfg(all(target_arch = "x86_64", feature = "hda"))]
-    let written = crate::drivers::hda::vol::apply(lv, muted) > 0;
+    let written = crate::drivers::hda::vol::apply(lv, muted) > 0; #[cfg(any(feature = "uvc", feature = "hda-tone"))] crate::audio::mixer::level_changed(); // MIXERPUMP (rmbp-ledger B787): Settings' slider, the menus, Softy and AVRCP reach the carrier by the key's one path (`mixer::level_changed`, atomics only, safe under BT). LINE-NEUTRAL append, code before this comment
     #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
     let written = false;
     written
