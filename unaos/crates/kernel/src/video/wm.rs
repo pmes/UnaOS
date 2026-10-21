@@ -31774,7 +31774,7 @@ mod scrollview {
         let (_, vy, _, vh) = st.viewport;
         let _ = super::present_rows_outcome_owned(win, vy, vy + vh, owner);
         if st.moved != 0 {
-            serial_println!("[scroll] win={} owner={:#x} ring3 off={} delivered={}", win, owner, st.off, delivered as u8);
+            serial_println!("[scroll] win={} owner={:#x} ring3{} off={} delivered={}", win, owner, ring3_cause(win), st.off, delivered as u8);
         }
         px
     }
@@ -31797,4 +31797,48 @@ mod scrollview {
         bar_paint(&r, dragged, px, row.stride / 4);
         r.gutter_w * r.view.viewport.3
     }
+
+    // RING3SCROLLPRESS (rmbp-ledger B791; BP-video-38) — the ring-3 row's GUTTER PRESS and THUMB DRAG. The x86 click
+    // router asks [`scroll_press_ring3`] on the line where a kernel window's press is claimed (`wc_quarry_press`'s), so a
+    // press in a program's gutter is the window system's before the program's arms see it; the page and the grab are
+    // [`scroll_press`]'s, the drag is [`scroll_service`]'s, the delivery and the bar are [`ring3_scrolled`]'s. Nothing
+    // here re-derives a page, a thumb or a step. Wire: `[scroll] win=<id> owner=<asid> ring3 press=page|drag off=<n> delivered=1`.
+
+    /// A gutter page is in flight through [`scroll_press_ring3`] (the wire word `press=page` only; the drain's one task).
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    static RING3_PRESS: AtomicBool = AtomicBool::new(false);
+
+    /// The x86 click router's door for a RING-3 row: a press at panel `(x, y)` in the gutter of the pane-0 model its owner
+    /// registered pages it or takes its thumb ([`scroll_press`]). Kernel rows are declined (their own press routes claim
+    /// theirs). `Some((window, owner))` = the gutter took the press; one relaxed load when no window has a model.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    pub fn scroll_press_ring3(x: i32, y: i32) -> Option<(WinId, u64)> {
+        if !SCROLL_LIVE.load(Relaxed) {
+            return None;
+        }
+        let (win, owner, sx, sy) = surface_at(x, y)?;
+        if super::is_kernel_owner(owner) || !reg(win, 0).is_some_and(|r| r.owner == owner) {
+            return None;
+        }
+        RING3_PRESS.store(true, Relaxed);
+        let took = scroll_press(win, sx, sy);
+        RING3_PRESS.store(false, Relaxed);
+        took.then_some((win, owner))
+    }
+
+    /// The wire word of a ring-3 step: ` press=drag` while `win`'s thumb is held, ` press=page` during a gutter page,
+    /// else nothing (the wheel's line, unchanged).
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    fn ring3_cause(win: WinId) -> &'static str {
+        if SCROLL_DRAG.lock().is_some_and(|(w, p, _)| w == win && p == 0) {
+            " press=drag"
+        } else if RING3_PRESS.load(Relaxed) {
+            " press=page"
+        } else {
+            ""
+        }
+    }
 }
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub use scrollview::scroll_press_ring3; // RING3SCROLLPRESS (B791): the x86 click router's door (`wc_scroll_press`)

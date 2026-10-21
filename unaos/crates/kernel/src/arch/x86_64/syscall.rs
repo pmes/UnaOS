@@ -7516,7 +7516,7 @@ pub fn wc_click_route_at(ev: crate::pal::Event, x: i32, y: i32) -> bool {
             clickband_witness(x, y, "dock", crate::video::dock::last_press_outcome());
             #[cfg(feature = "quarry")] crate::video::quarry::service(); CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); // QUARRYX86-2 — THE X86 DOOR TO QUARRY, AND IT IS THE DRAIN THAT WAS MISSING, NOT THE LATCH. `dock::press_at`'s QUARRY-PIN arm LATCHES the open (`quarry::request_open`, `video/dock.rs:1067`) and does no directory I/O, deliberately — Pi dsktp boot 11 ran a 16 KiB stack off its bottom with `quarry::open()` at exactly this depth. On aarch64 the latch is drained one call later in the twin arm (`arch/aarch64/syscall.rs:14326`: `strip::press_route(x, y) { quarry::service(); … }`). x86 calls `dock::press_at` DIRECTLY and never reaches that pair, so before this statement a press on the Quarry tile set the latch and NO PASS ON THIS ARCH EVER DRAINED IT — the tile painted and did nothing, which is PARITY §9 cause 2 and QUARRYDOCK's STOP 2. SAME ORDER AS THE TWIN: service FIRST, then the DROP store, then `return true` — the drain must run before the arm returns or the latch survives the press that set it. Gated `quarry` and NOT `desktop_firmware`: `video/mod.rs:685` admits the module on x86 under `wc` (this arm's own gate, one line above) while `desktop_firmware` is absent from the `x86-all` leg (`arroyo:4310`), and `quarry` is IN it — so the aarch64 spelling would have compiled to nothing here and repaired nothing. Knob-off this is the `#[inline(always)]` no-op at `video/quarry.rs:71`, so a `UNAOS_QUARRY`-unset image is untouched by construction. ⚠ STACK: `service()` -> `open()` is a panel read + two VFS `read_dir` + a surface alloc, and on this arch the routers that reach it are `kernel_main` (boot stack) and `x86_render_service`, which is spawned with the BLANKET 16 KiB `TASK_STACK_SIZE` (`main.rs:1581`/`3340`, plain `spawn`) — the Pi cured the same shape by right-sizing to 32 KiB (`PUMP_PATH_STACK_SIZE`). Out of this arc's named files; reported as a STOP, not taken. ⚠ FOLDED onto this pre-existing line, never added below it — this file's panic `Location`s are load-bearing and the line count is 24179 before and after; CODE BEFORE COMMENT, per A10FIX's rule that a folded call written after a `//` is not a call.
             return true;
-        } #[cfg(all(feature = "wc", feature = "quarry"))] if wc_quarry_press(x, y, cur) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // QUARRYCLICK — THE X86 DOOR TO QUARRY'S WINDOW CONTENT, and it is the twin of `arch/aarch64/syscall.rs:14326`'s `… || crate::video::quarry::press_route(x, y) { … }`. QUARRYX86-2 (d889369a) drained the dock tile's OPEN latch one line above, so Quarry now opens on this arch; flight 10 then showed every press INSIDE the opened window dying at the kernel-furniture arm below — `[clickroute] press at (920,604) win=5 owner=0xffffff03 was=0 -> consume deliver=0`, three times, because `0xffffff03` is a kernel owner with no input ring and this router had no arm that named Quarry. POSITION IS THE CONTRACT, and it is the twin's: after the furniture bands (menu, dock — they composite above every window) and AHEAD of WMDIRECT's chrome arm, because `quarry::press_route` re-asks `wm::hit_test` itself and claims ONLY the top-most-is-mine case — so it cannot steal a press that landed on a window above it, it declines title strip/border/minimise/zoom (Quarry stays draggable and parkable through the router's own arms), and it DOES claim its own close disc, which is why it must be asked before `control_hit` reaches `wc_close_furniture` — that path reaps the row without ever calling `quarry::close()`, leaving MODEL/SURF live and `WIN` naming a re-issuable slot. COORDINATES ARE PANEL COORDINATES, unconverted: `press_route` is documented "in PANEL coordinates" and does its own panel->source arithmetic from `wm::info(id)` (`sx = (x - info.x) / scale`), so the window-relative conversion the console/shell arms do is exactly what must NOT be done here. Gated `all(wc, quarry)`: `video/mod.rs:685` admits the module on x86 under `wc` alone, and this statement sits at the function's own statement level rather than inside the `#[cfg(feature = "wc")]` dock block above it, so it names both knobs instead of inheriting one. Knob-off this is nothing at all — `wc_quarry_press` is `#[cfg(all(feature = "wc", feature = "quarry"))]` and lives at the TAIL of this file, so no panic `Location` below it moves and a `UNAOS_QUARRY`-unset image is byte-identical by construction. ⚠ FOLDED onto this pre-existing `}`, never added below it: this file is 24179 lines before and after, and CODE BEFORE COMMENT per A10FIX's rule that a folded call written after a `//` is not a call.
+        } #[cfg(all(feature = "wc", feature = "quarry"))] if wc_quarry_press(x, y, cur) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } #[cfg(feature = "wc")] if wc_scroll_press(x, y, cur) { CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release); return true; } // QUARRYCLICK — THE X86 DOOR TO QUARRY'S WINDOW CONTENT, and it is the twin of `arch/aarch64/syscall.rs:14326`'s `… || crate::video::quarry::press_route(x, y) { … }`. QUARRYX86-2 (d889369a) drained the dock tile's OPEN latch one line above, so Quarry now opens on this arch; flight 10 then showed every press INSIDE the opened window dying at the kernel-furniture arm below — `[clickroute] press at (920,604) win=5 owner=0xffffff03 was=0 -> consume deliver=0`, three times, because `0xffffff03` is a kernel owner with no input ring and this router had no arm that named Quarry. POSITION IS THE CONTRACT, and it is the twin's: after the furniture bands (menu, dock — they composite above every window) and AHEAD of WMDIRECT's chrome arm, because `quarry::press_route` re-asks `wm::hit_test` itself and claims ONLY the top-most-is-mine case — so it cannot steal a press that landed on a window above it, it declines title strip/border/minimise/zoom (Quarry stays draggable and parkable through the router's own arms), and it DOES claim its own close disc, which is why it must be asked before `control_hit` reaches `wc_close_furniture` — that path reaps the row without ever calling `quarry::close()`, leaving MODEL/SURF live and `WIN` naming a re-issuable slot. COORDINATES ARE PANEL COORDINATES, unconverted: `press_route` is documented "in PANEL coordinates" and does its own panel->source arithmetic from `wm::info(id)` (`sx = (x - info.x) / scale`), so the window-relative conversion the console/shell arms do is exactly what must NOT be done here. Gated `all(wc, quarry)`: `video/mod.rs:685` admits the module on x86 under `wc` alone, and this statement sits at the function's own statement level rather than inside the `#[cfg(feature = "wc")]` dock block above it, so it names both knobs instead of inheriting one. Knob-off this is nothing at all — `wc_quarry_press` is `#[cfg(all(feature = "wc", feature = "quarry"))]` and lives at the TAIL of this file, so no panic `Location` below it moves and a `UNAOS_QUARRY`-unset image is byte-identical by construction. ⚠ FOLDED onto this pre-existing `}`, never added below it: this file is 24179 lines before and after, and CODE BEFORE COMMENT per A10FIX's rule that a folded call written after a `//` is not a call. RING3SCROLLPRESS (B791): `wc_scroll_press` (file tail) claims a press in a RING-3 row's scroll gutter for wm (page, thumb grab) on this same line, before any app arm — the kernel window's claim and the program's are one place; LINE-NEUTRAL fold, code before this line's first `//`.
         // WMDIRECT — **CHROME IS JUDGED BEFORE THE APP ARMS, AND THAT IS THE WHOLE ROUTING RULE.**
         //
         // *A press on a window's kernel-drawn chrome — close box, title strip, border — is an
@@ -32291,8 +32291,8 @@ pub fn oneinstance_hold_selftest() -> (usize, usize) {
 // `WINDOWS` exactly as RAISEVERB's arm does (IRQ-masked, held for the read only: a free id -EBADF, another slot's -EPERM)
 // and hands the model to `wm::scroll_set_ring3` with `WINDOWS` released. The step comes back through `scroll_deliver`:
 // the wm id resolved to the program's own id under `WINDOWS`, then ONE `INPUT_EV_SCROLL` pushed by identity
-// (`user_input_push_owner`). Single producer: a MOVING step for a ring-3 row comes only from `wm::scroll_wheel` on the
-// drain (`wc_route_event`'s door chain), the ring's one producer; the bar's hide step moves nothing and pushes nothing.
+// (`user_input_push_owner`). Single producer: every MOVING step for a ring-3 row runs on the render task — the wheel
+// (`scroll_wheel`) and the gutter page (`wc_scroll_press`) on its drain, the thumb drag (`scroll_service`) on its pass.
 
 /// The SCROLL_SET arm: the caller's window `body.win` registered (or updated, or dropped) on wm's model.
 #[cfg(feature = "wc")]
@@ -32337,6 +32337,7 @@ pub fn scroll_deliver(owner: u64, wm_id: crate::video::wm::WinId, off: usize) ->
 /// `SYS_WIN_CREATE` row, registered through the REAL arm (`busx_msend_for`, the reply popped from the slot's mailbox),
 /// one wheel-sized step (`WHEEL_LINES` lines up) from one line down clamps to 0; the ring must hold exactly ONE
 /// `INPUT_EV_SCROLL` naming the bound id and offset 0, and the gutter must carry the thumb's ink. Torn down after.
+/// RING3SCROLLPRESS (B791): then the gutter press and the thumb drag through the click router ([`scroll_ring3_press_legs`]).
 #[cfg(all(feature = "witness", feature = "wc"))]
 pub fn scroll_ring3_probe() -> Result<usize, &'static str> {
     use crate::video::wm;
@@ -32393,6 +32394,9 @@ pub fn scroll_ring3_probe() -> Result<usize, &'static str> {
             (_, Some(_)) if !thumb_ink => Err("bar"),
             _ => Err("offset"),
         };
+        if verdict.is_ok() {
+            verdict = scroll_ring3_press_legs(win, id as u32, owner, &buf).map(|k| k + n); // RING3SCROLLPRESS (B791): page + drag
+        }
     }
     {
         let _irq = IrqGuard::mask_save();
@@ -32405,4 +32409,129 @@ pub fn scroll_ring3_probe() -> Result<usize, &'static str> {
     while user_input_take(owner, &mut scratch) > 0 {}
     drop(buf);
     verdict
+}
+
+// RING3SCROLLPRESS (rmbp-ledger B791; BP-video-38, BP-ring3-4) — TAIL-APPENDED. A press in a RING-3 row's scroll gutter is
+// the window system's: `wc_click_route_at` asks [`wc_scroll_press`] on the line it asks `wc_quarry_press` (a kernel window's
+// claim), ahead of chrome and every app arm, so the program never sees the press it did not own. The page and the thumb grab
+// are `wm::scroll_press`'s, the drag `wm::scroll_service`'s, the delivery `ring3_scrolled`'s — no arithmetic here.
+
+/// The click router's ring-3 gutter claim: `wm::scroll_press_ring3` took the press -> the row is raised and focused through
+/// the chrome arm's own primitives, and the press is consumed (the caller drops its release). `false` = not a gutter press.
+#[cfg(feature = "wc")]
+fn wc_scroll_press(x: i32, y: i32, cur: u64) -> bool {
+    let Some((win, owner)) = crate::video::wm::scroll_press_ring3(x, y) else { return false };
+    if owner_is_focus_exempt(owner) {
+        furniture_keyboard_to_shell(owner, cur);
+    } else if owner != cur {
+        user_input_set_active(owner);
+    }
+    crate::video::wm::focus_changed(owner);
+    clickroute_witness(x, y, win, owner, cur, "scroll", 0);
+    true
+}
+
+/// `tests scrollview`'s ring-3 PRESS legs, on [`scroll_ring3_probe`]'s registered row at offset 0 (`id` its program id):
+/// PAGE — a press in the gutter just below the thumb, through `wc_click_route_at`, is claimed and the ring holds exactly
+/// ONE `INPUT_EV_SCROLL` `(id, one page)`; DRAG — with the button level held, a press on the thumb is claimed with no
+/// event, two pointer moves (+40, +80 surface px) through `wm::scroll_service` each hand ONE `INPUT_EV_SCROLL`, offsets
+/// strictly increasing, the thumb wears the pressed face while held and `line.strong` after the release. Focus, cursor,
+/// press target and ring are restored. `Ok(events)`.
+#[cfg(all(feature = "witness", feature = "wc"))]
+fn scroll_ring3_press_legs(win: crate::video::wm::WinId, id: u32, owner: u64, buf: &[u32]) -> Result<usize, &'static str> {
+    use crate::pal::Event;
+    use crate::video::wm;
+    let (pw, ph) = {
+        let fb = *crate::video::WRITER.lock();
+        if !fb.is_ready() {
+            return Err("no-panel");
+        }
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    let _ = wm::move_to(win, pw / 3, ph / 3 + wm::TITLE_H() + wm::BORDER());
+    let (Some(i), Some(v)) = (wm::info(win), wm::scroll_view(win, 0)) else { return Err("no-row") };
+    let sc = i.scale.max(1);
+    let stride = i.w;
+    let (vx, vy, vw, vh) = v.viewport;
+    let gutter = stride.saturating_sub(vx + vw);
+    let panel = |sx: usize, sy: usize| -> (i32, i32) { ((i.x + sx * sc + sc / 2) as i32, (i.y + sy * sc + sc / 2) as i32) };
+    let hid = |p: i32, span: usize| -> i32 { ((p as i64 * 32767) / (span.max(1) as i64 - 1).max(1)) as i32 };
+    let bw = crate::video::draw::scrollbar_w().min(gutter);
+    let cx = vx + vw + gutter - bw + 1 + bw.saturating_sub(2) / 2;
+    let ink = |sy: usize| -> u32 { buf.get(sy * stride + cx).copied().unwrap_or(0) & 0x00FF_FFFF };
+    let mut scratch = [0u64; 64];
+    while user_input_take(owner, &mut scratch) > 0 {}
+    let saved_focus = user_input_active();
+    let saved_pos = crate::pal::cursor::pos(pw as i32, ph as i32);
+    let legs = (|| -> Result<usize, &'static str> {
+        // PAGE: from offset 0, one page down.
+        let Some((ty, th)) = v.thumb(vh) else { return Err("no-thumb") };
+        let (x, y) = panel(vx + vw + gutter / 2, vy + ty + th + 4);
+        if !wm::hit_test(x, y).is_some_and(|(w, _, _)| w == win) {
+            return Err("press-hit");
+        }
+        if !wc_click_route_at(Event::Button(1), x, y) {
+            return Err("page-claim");
+        }
+        let q = v.line.max(1);
+        let page = ((vh / q).max(1) * q).min(v.max_offset());
+        let n = user_input_take(owner, &mut scratch);
+        match (n, if n == 1 { una_abi::input_ev_scroll(scratch[0]) } else { None }) {
+            (1, Some((w, off))) if w == id && off as usize == page => {}
+            (1, Some(_)) => return Err("page-offset"),
+            _ => return Err("page-events"),
+        }
+        // DRAG: the level held first (so no service pass ends the grab), the press on the thumb's centre.
+        let Some(v) = wm::scroll_view(win, 0) else { return Err("grab") };
+        let Some((ty, th)) = v.thumb(vh) else { return Err("grab") };
+        let gy = vy + ty + th / 2;
+        let (gx, gpy) = panel(vx + vw + gutter / 2, gy);
+        crate::pal::cursor::set_abs(hid(gx, pw), hid(gpy, ph), pw as i32, ph as i32);
+        crate::pal::cursor::set_button_level(true);
+        if !wc_click_route_at(Event::Button(1), gx, gpy) || user_input_take(owner, &mut scratch) != 0 {
+            return Err("grab");
+        }
+        let mut last = page;
+        let mut events = 1usize;
+        for dy in [40usize, 80] {
+            let (_, my) = panel(vx + vw + gutter / 2, gy + dy);
+            crate::pal::cursor::set_abs(hid(gx, pw), hid(my, ph), pw as i32, ph as i32);
+            let mut got = 0usize;
+            for _ in 0..50 {
+                wm::scroll_service();
+                got = user_input_take(owner, &mut scratch);
+                if got > 0 {
+                    break;
+                }
+                crate::arch::sched::sleep_ms(2);
+            }
+            let ev = if got == 1 { una_abi::input_ev_scroll(scratch[0]) } else { None };
+            match ev {
+                Some((w, off)) if w == id && off as usize > last => last = off as usize,
+                Some(_) => return Err("drag-order"),
+                None => return Err("drag-events"),
+            }
+            events += 1;
+        }
+        let Some((ty, th)) = wm::scroll_view(win, 0).and_then(|v| v.thumb(vh)) else { return Err("pressed-tint") };
+        let held = ink(vy + ty + th / 2);
+        if held == crate::video::theme::line_strong() & 0x00FF_FFFF || held == crate::video::theme::surface_sunken() & 0x00FF_FFFF {
+            return Err("pressed-tint");
+        }
+        crate::pal::cursor::set_button_level(false);
+        wm::scroll_service();
+        if ink(vy + ty + th / 2) != crate::video::theme::line_strong() & 0x00FF_FFFF {
+            return Err("release");
+        }
+        Ok(events)
+    })();
+    crate::pal::cursor::set_button_level(false);
+    wm::scroll_service();
+    crate::pal::cursor::set_abs(hid(saved_pos.0, pw), hid(saved_pos.1, ph), pw as i32, ph as i32);
+    user_input_set_active(saved_focus);
+    CLICK_PRESS_TARGET.store(CLICK_TARGET_DROP, Ordering::Release);
+    wm::focus_reset();
+    while user_input_take(owner, &mut scratch) > 0 {}
+    legs
 }
