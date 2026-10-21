@@ -10,7 +10,8 @@
 //! `maybe_open`), PDU reassembly from ACL fragments (`on_acl`) and the ACL transmit (`step`). So no
 //! second L2CAP is written here. What A2DP needed from it, and what this file decides:
 //! * an inbound channel on AVDTP's PSM 0x0019 is accepted beside HID's two, and one on SDP's PSM 0x0001 for the SDP
-//!   server (SDPSERVER B769, [`super::sdp::serve`]) ([`inbound_served`]);
+//!   server (SDPSERVER B769, [`super::sdp::serve`]), and one on AVCTP's PSM 0x0017 for the AVRCP target (AVRCP B774,
+//!   [`super::avctp`]) ([`inbound_served`]);
 //! * AVDTP opens TWO channels on the same PSM — the first is signalling, the one opened after OPEN carries the
 //!   stream ([`avdtp_role`]) — where the HID host allowed one channel per PSM;
 //! * a PDU longer than one ACL packet goes out as FRAGMENTS (A2DPKNOB, rmbp-ledger B750; [`fragment`]): the first
@@ -27,13 +28,17 @@ use alloc::vec::Vec;
 /// AVDTP's PSM (signalling and media both).
 pub const PSM_AVDTP: u16 = 0x0019;
 
+/// AVCTP's control PSM (AVRCP B774; browsing's 0x001B is not served).
+pub const PSM_AVCTP: u16 = 0x0017;
+
 /// The largest ACL packet BTHID's transmit path writes (4-byte ACL header included).
 pub const ACL_PKT_MAX: usize = 256;
 
 /// An inbound Connection Request on `psm` is answered (HID control, HID interrupt, AVDTP, SDP — a device asking
-/// about US is answered by the SDP server, SDPSERVER B769); any other is refused with "PSM not supported".
+/// about US is answered by the SDP server, SDPSERVER B769 — and AVCTP, a headset's buttons, AVRCP B774); any other is
+/// refused with "PSM not supported".
 pub fn inbound_served(psm: u16) -> bool {
-    matches!(psm, 0x0011 | 0x0013 | PSM_AVDTP | PSM_SDP)
+    matches!(psm, 0x0011 | 0x0013 | PSM_AVDTP | PSM_SDP | PSM_AVCTP)
 }
 
 /// The most one ACL packet carries on BTHID's transmit path: the controller's ACL buffer, and the 256-byte packet
