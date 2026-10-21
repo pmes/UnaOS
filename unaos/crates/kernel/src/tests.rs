@@ -5226,11 +5226,10 @@ fn scrollview_selftest() {
     );
 }
 
-/// USBSUSPEND (rmbp-ledger B766, BP-power-7): `tests usbsuspend` (R80: registered, never at boot). Ask both USB
-/// drivers for the sleep state's suspend, wait (bounded 2 s) for the xHCI pass to put its ports in U3, read every
-/// suspended port's PLS, ask for the resume, wait (bounded 2 s) for U0 and the recovery, then a keyboard report over
-/// EP0 (HID GET_REPORT) and the interrupt-IN endpoint's state — the slot was never re-enumerated. The panel stays lit
-/// (the sleep STATE is `tests sleep`'s). Under QEMU's default line the usb-kbd rides EHCI: `UNAOS_XHCIKBD=1` moves it.
+/// USBSUSPEND (rmbp-ledger B766, BP-power-7): `tests usbsuspend` (R80: registered, never at boot). Ask both USB drivers for
+/// the suspend, wait (≤2 s) for both passes, read each suspended xHCI port's PLS, ask for the resume, wait (≤2 s) for UP, then
+/// a keyboard report over EP0 (GET_REPORT) and the interrupt endpoint's state — never re-enumerated; the panel stays lit.
+/// EHCIWAKE (B776): QEMU's default usb-kbd rides EHCI, now suspended too: PASS on it with `ehci=<s>/<n>`, s = n (`usbsuspend_ehci_leg`).
 #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
 fn usbsuspend_selftest() {
     use crate::drivers::xhci::{self, suspend as xs};
@@ -5248,43 +5247,44 @@ fn usbsuspend_selftest() {
         serial_println!(":: USBSUSPEND: ports=0 suspended=0 resumed=0 kbd=none -> SKIP reason=no-xhci ::");
         return;
     }
-    xs::request(true);
-    #[cfg(feature = "ehcihid")] crate::drivers::ehci::suspend::request(true);
-    let in_u3 = wait(2_000, &|| xs::suspended());
+    #[cfg(feature = "ehcihid")] use crate::drivers::ehci::suspend as es; #[cfg(feature = "ehcihid")] let (e_down, e_up): (fn() -> bool, fn() -> bool) = (es::suspended, es::up);
+    #[cfg(not(feature = "ehcihid"))] let (e_down, e_up): (fn() -> bool, fn() -> bool) = (|| true, || true);
+    xs::request(true); #[cfg(feature = "ehcihid")] es::request(true);
+    let in_u3 = wait(2_000, &|| xs::suspended() && e_down());
     let c = xs::census();
-    xs::request(false);
-    #[cfg(feature = "ehcihid")] crate::drivers::ehci::suspend::request(false);
-    let up = wait(2_000, &|| xs::up());
+    xs::request(false); #[cfg(feature = "ehcihid")] es::request(false);
+    let up = wait(2_000, &|| xs::up() && e_up());
     let r = xs::census();
     let mut probe = None;
     let t0 = crate::arch::ms();
     while probe.is_none() && crate::arch::ms().wrapping_sub(t0) < 1_000 {
         match xhci::claim() { Ok(mut x) => probe = Some(x.kbd_report_probe()), Err(_) => crate::arch::sched::sleep_ms(5) }
     }
-    #[cfg(feature = "ehcihid")] let (e_ports, e_susp, e_kept) = crate::drivers::ehci::suspend::census();
-    #[cfg(not(feature = "ehcihid"))] let (e_ports, e_susp, e_kept) = (0u32, 0u32, 0u32);
     let (kbd, ep) = match probe {
         None => ("busy", 0xFF),
         Some(None) => ("none", 0xFF),
         Some(Some((cc, ep, len))) if matches!(cc, 1 | 13) && ep == 1 && len > 0 => ("ok", ep),
         Some(Some((_, ep, _))) => ("fail", ep),
     };
+    let (e, e_kbd) = usbsuspend_ehci_leg(kbd == "none");
     let verdict = if !in_u3 || !up {
         "FAIL reason=phase-timeout"
-    } else if c.pls3 != c.suspended || r.resumed < c.suspended {
-        "FAIL"
-    } else if kbd == "none" {
-        "SKIP reason=no-xhci-kbd"
-    } else if kbd != "ok" || c.suspended == 0 {
+    } else if c.pls3 != c.suspended || r.resumed < c.suspended || e.resumed < e.suspended { "FAIL"
+    } else if kbd != "none" { if kbd != "ok" || c.suspended == 0 { "FAIL" } else { "PASS" }
+    } else if e_kbd == "none" {
+        "SKIP reason=no-kbd"
+    } else if e_kbd != "ok" || e.ports == 0 || e.suspended != e.ports {
         "FAIL"
     } else {
         "PASS"
     };
+    let (kbd_on, kbd_word) = if kbd != "none" { ("xhci", kbd) } else { ("ehci", e_kbd) };
     serial_println!(
-        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={}",
-        c.ports, c.suspended, r.resumed, kbd, verdict, c.pls3, c.kept, ep, r.remote_wakes, e_susp, e_ports, e_kept
+        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={}",
+        c.ports, c.suspended, r.resumed, kbd_word, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on
     );
 }
+
 // ══════════════ TRASHBATCHDOCK (rmbp-ledger B762) — `tests trashtoast`'s `empty=` leg — TAIL-APPENDED ══════════════
 
 /// TRASHBATCHDOCK (B762, BP-video-29): the dock's Empty Trash body (`dock::empty_trash_now`, what the service pass runs
@@ -5318,3 +5318,32 @@ fn trashtoast_empty_leg(base: &str) -> bool {
     serial_println!("[trashtoast] empty before={} items={} bytes={} ms={} after={} journal={}->{} toasts={}", before, n, bytes, ms, after, j0, j1, toasts);
     made && trashed == 3 && before == 3 && r.is_ok() && n == 3 && after == 0 && j0 == 1 && j1 == 0 && toasts == 1 && t.stat(base).is_err()
 }
+// ══════════════ EHCIWAKE (rmbp-ledger B776) — `tests usbsuspend`'s EHCI half — TAIL-APPENDED ══════════════
+
+/// EHCIWAKE (B776): the EHCI half of `tests usbsuspend` — its census after the resume and, when no xHCI keyboard
+/// answered (`probe`), the EHCI keyboard's GET_REPORT (`ok` = a report of bytes and an un-halted interrupt QH).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))]
+fn usbsuspend_ehci_leg(probe: bool) -> (crate::drivers::ehci::suspend::Census, &'static str) {
+    use crate::drivers::ehci::suspend as es;
+    let mut got = None;
+    let t0 = crate::arch::ms();
+    while probe && got.is_none() && crate::arch::ms().wrapping_sub(t0) < 1_000 {
+        match es::kbd_report_probe() { Some(p) => got = Some(p), None => crate::arch::sched::sleep_ms(5) }
+    }
+    let word = match got {
+        None if probe => "busy",
+        None => "none",
+        Some(None) => "none",
+        Some(Some((len, ep_ok))) => if len > 0 && ep_ok { "ok" } else { "fail" },
+    };
+    (es::census(), word)
+}
+
+/// EHCIWAKE (B776): no EHCI driver on this image — the EHCI half is empty.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", not(feature = "ehcihid")))]
+fn usbsuspend_ehci_leg(_probe: bool) -> (UsbsuspendNoEhci, &'static str) {
+    (UsbsuspendNoEhci::default(), "none")
+}
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", not(feature = "ehcihid")))]
+#[derive(Default)]
+struct UsbsuspendNoEhci { ports: u32, suspended: u32, kept: u32, resumed: u32, wake_armed: u32 }
