@@ -40,8 +40,8 @@ pub fn resolve(name: &[u8]) -> Result<[u8; RESOLVE_OUT_LEN], i64> {
         if crate::drivers::e1000::hw_addr().is_none() {
             return Err(ENODEV); // no e1000 and no USB dongle: a dark NIC, not an error of the name
         }
-        let s = core::str::from_utf8(name).map_err(|_| EINVAL)?; let _idl = crate::net_tick::scope(crate::net_tick::Who::Ring3); // IDLENET (B672): ring 3's lookup is Ring3's on the ledger (LINE-NEUTRAL append)
-        return match crate::smolnet::resolve(s) {
+        let s = core::str::from_utf8(name).map_err(|_| EINVAL)?; let _idl = crate::net_tick::scope(crate::net_tick::Who::Ring3); let t0 = crate::arch::now_cycles(); // AETHERNET2 (SR187): t0 for the `[dns]` line (LINE-NEUTRAL append, code before this comment). IDLENET (B672): ring 3's lookup is Ring3's on the ledger (LINE-NEUTRAL append)
+        return match dns_said(name, t0, crate::smolnet::resolve(s)) { // AETHERNET2 (SR187): every lookup says itself (`dns_said`, file tail). LINE-NEUTRAL
             Some(ip) => { crate::fs::apptrust::net_name_note(name, ip); // GRANTNAMES (B742): the answer recorded for the ask (ip -> the name asked), aarch64 sys_resolve's call. LINE-NEUTRAL append, code before this comment
                 let mut out = [0u8; RESOLVE_OUT_LEN];
                 out[..4].copy_from_slice(&ip);
@@ -252,4 +252,24 @@ fn held_across(held: impl Fn() -> bool) -> bool {
         }
         crate::arch::sched::yield_now();
     }
+}
+
+// ---- AETHERNET2 (LEDGER SR187): SYS_RESOLVE says each lookup on the wire --------------------------------------
+// Flight 37 read Aether's https navigation with NO resolver line anywhere: the lookup ran (Aether's refusal came after
+// it) but this body printed nothing — the only `[dns]` line was smolnet's one-shot boot witness. TAIL-APPENDED so no
+// line above moves; the call is folded onto the x86 arm's `return match` line.
+
+/// The x86 arm's witness: `[dns] q=<name> -> a=<a.b.c.d> ms=<n>` or `[dns] q=<name> -> none ms=<n>` (ms since `t0`,
+/// cycles over the calibrated TSC, the NETHANG shape), then the answer unchanged.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn dns_said(name: &[u8], t0: u64, r: Option<[u8; 4]>) -> Option<[u8; 4]> {
+    let el = crate::arch::now_cycles().wrapping_sub(t0);
+    let hz = crate::arch::apic::tsc_hz();
+    let ms = if hz != 0 { el.saturating_mul(1000) / hz } else { 0 };
+    let q = core::str::from_utf8(name).unwrap_or("?");
+    match r {
+        Some(ip) => serial_println!("[dns] q={} -> a={}.{}.{}.{} ms={}", q, ip[0], ip[1], ip[2], ip[3], ms),
+        None => serial_println!("[dns] q={} -> none ms={}", q, ms),
+    }
+    r
 }

@@ -58,6 +58,7 @@
 ## 5. Ruled, unbuilt
 - CODEX Amendment IV (Sonde) signature (R112). Elessar's dynamic layout on UnaOS (CODEX §4): not on UnaOS at HEAD (`unverified`). R108 (Aether in the Una IDE, the 3D work environments): see RULINGS.
 - TEXTSCALE2 owed (B814): Aether's header geometry (`TAB_H`, `BAR_H`, `CTL`, `MENU_ROW`, `CHROME_H`) reflows with the face, and then the `FONT_MAX` cap goes (bounded by the 288x288 surface, BP-video-8; with TEXTSCALE's metrics); Aether's status line and find field (`paint.rs` `STATUS_H` 14, 11 px) follow the same face; Aether's PrefChanged prefixes are at `PREF_SUB_MAX` = 4, so a fifth needs una-abi's cap raised.
+- AETHERLIB (AETHERNET2 LEDGER SR187's owed row): `unaos/crates/user-aether` is a no_std/no_main bin (its own workspace) with no host test target; its fetch sequencing (the resolver cache, the `reason=` mapping in `unaos/crates/user-aether/src/net.rs`) is untested on the host until a lib split lets a resolver stub drive `fetch`. The trust reader and cipher names are tested in `vein_ring3` (`trust::tests`, `tls::tests::cipher_name_kat`).
 
 ## 6. Read further
 - `docs/CODEX.md`; `docs/dev/USERLAND/ARCHITECTURE.md`; each handler's own `README.md` for implementation (not charter).

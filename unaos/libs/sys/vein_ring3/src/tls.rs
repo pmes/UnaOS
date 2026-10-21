@@ -209,6 +209,29 @@ impl<T: Transport + ?Sized> Session<'_, T> {
     pub fn is_h2(&self) -> bool {
         self.alpn() == Some(b"h2")
     }
+
+    /// AETHERNET2 (LEDGER SR187): the cipher suite the handshake negotiated, by [`cipher_name`] — so a caller's wire
+    /// can say it (`cipher=aes128-gcm`). Read-only; additive.
+    pub fn cipher(&self) -> &'static str {
+        cipher_name(self.c.negotiated().cipher_suite)
+    }
+}
+
+/// AETHERNET2 (LEDGER SR187): a short, stable wire name for every suite tls_core speaks — the TLS 1.3 suites by their
+/// AEAD (the key exchange is always (EC)DHE there), the TLS 1.2 ones by key exchange, signature and AEAD.
+pub fn cipher_name(s: tls_core::msgs::CipherSuite) -> &'static str {
+    use tls_core::msgs::CipherSuite as C;
+    match s {
+        C::Aes128GcmSha256 => "aes128-gcm",
+        C::Aes256GcmSha384 => "aes256-gcm",
+        C::ChaCha20Poly1305Sha256 => "chacha20-poly1305",
+        C::EcdheEcdsaAes128GcmSha256 => "ecdhe-ecdsa-aes128-gcm",
+        C::EcdheRsaAes128GcmSha256 => "ecdhe-rsa-aes128-gcm",
+        C::EcdheEcdsaAes256GcmSha384 => "ecdhe-ecdsa-aes256-gcm",
+        C::EcdheRsaAes256GcmSha384 => "ecdhe-rsa-aes256-gcm",
+        C::EcdheEcdsaChaCha20Poly1305Sha256 => "ecdhe-ecdsa-chacha20",
+        C::EcdheRsaChaCha20Poly1305Sha256 => "ecdhe-rsa-chacha20",
+    }
 }
 
 impl<T: Transport + ?Sized> Transport for Session<'_, T> {
@@ -337,6 +360,35 @@ for _ in range(n):
 
     fn have(cmd: &str, arg: &str) -> bool {
         Command::new(cmd).arg(arg).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+    }
+
+    /// AETHERNET2 (LEDGER SR187): the cipher-name KAT — every suite tls_core offers (by its IANA code) maps to its fixed
+    /// wire name, and no two suites share one.
+    #[test]
+    fn cipher_name_kat() {
+        use tls_core::msgs::CipherSuite as C;
+        let want: [(u16, &str); 9] = [
+            (0x1301, "aes128-gcm"),
+            (0x1302, "aes256-gcm"),
+            (0x1303, "chacha20-poly1305"),
+            (0xC02B, "ecdhe-ecdsa-aes128-gcm"),
+            (0xC02F, "ecdhe-rsa-aes128-gcm"),
+            (0xC02C, "ecdhe-ecdsa-aes256-gcm"),
+            (0xC030, "ecdhe-rsa-aes256-gcm"),
+            (0xCCA9, "ecdhe-ecdsa-chacha20"),
+            (0xCCA8, "ecdhe-rsa-chacha20"),
+        ];
+        for (code, name) in want {
+            let s = C::from_code(code).expect("tls_core knows the suite");
+            assert_eq!(s.code(), code);
+            assert_eq!(cipher_name(s), name, "suite {:#06x}", code);
+        }
+        for s in C::TLS13.iter().chain(C::TLS12.iter()) {
+            assert!(want.iter().any(|(c, n)| *c == s.code() && *n == cipher_name(*s)), "suite {:#06x} unnamed", s.code());
+        }
+        for (i, a) in want.iter().enumerate() {
+            assert!(want[i + 1..].iter().all(|b| b.1 != a.1), "{} named twice", a.1);
+        }
     }
 
     #[test]
