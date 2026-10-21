@@ -5219,10 +5219,11 @@ fn scrollview_selftest() {
         "[scrollview] extent=10000 viewport={}x{} stride={} steps={} clamps={} full_strips={} max_repaint_px={} max_blit_px={} thumb_min={} quarry_steps={} hw_steps={}",
         vw, vh, STRIDE, steps, clamps, fulls, max_rep, max_blit, tmin, quarry.as_ref().copied().unwrap_or(0), hw.as_ref().copied().unwrap_or(0)
     );
-    let pass = steps == 200 && clamp_ok && reached_ends && blit_ok && thumb_ok && quarry.is_ok() && hw.is_ok();
+    let (panes, panes_ok) = scrollpanes_legs(); // SCROLLPANES (B777): the six pane words, at the line's end
+    let pass = steps == 200 && clamp_ok && reached_ends && blit_ok && thumb_ok && quarry.is_ok() && hw.is_ok() && panes_ok;
     serial_println!(
-        ":: SCROLLVIEW: steps={} clamp={} blit={} thumb={} quarry={} hw={} -> {} ::",
-        steps, if clamp_ok && reached_ends { "ok" } else { "FAIL" }, if blit_ok { "ok" } else { "FAIL" }, if thumb_ok { "ok" } else { "FAIL" }, word(&quarry), word(&hw), if pass { "PASS" } else { "FAIL" }
+        ":: SCROLLVIEW: steps={} clamp={} blit={} thumb={} quarry={} hw={} {} -> {} ::",
+        steps, if clamp_ok && reached_ends { "ok" } else { "FAIL" }, if blit_ok { "ok" } else { "FAIL" }, if thumb_ok { "ok" } else { "FAIL" }, word(&quarry), word(&hw), panes, if pass { "PASS" } else { "FAIL" }
     );
 }
 
@@ -5317,4 +5318,28 @@ fn trashtoast_empty_leg(base: &str) -> bool {
     let (n, bytes, ms) = r.as_ref().map(|&(n, b, ms, _)| (n, b, ms)).unwrap_or((0, 0, 0));
     serial_println!("[trashtoast] empty before={} items={} bytes={} ms={} after={} journal={}->{} toasts={}", before, n, bytes, ms, after, j0, j1, toasts);
     made && trashed == 3 && before == 3 && r.is_ok() && n == 3 && after == 0 && j0 == 1 && j1 == 0 && toasts == 1 && t.stat(base).is_err()
+}
+
+/// SCROLLPANES (rmbp-ledger B777) — `tests scrollview`'s pane legs, printed at the END of its pass line:
+/// `tree=ok icons=ok columns=ok tabs=ok types=ok overlay=ok`. Quarry's tree, Icons grid and Columns focus pane walked
+/// through their live step bodies against a full paint; Settings' tab column and File Types rows stepped through
+/// their models against an independent clamp; the overlay gate (the context menu or a mark stops the blit).
+/// `(words, all ok)`.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn scrollpanes_legs() -> (alloc::string::String, bool) {
+    let word = |r: &Result<usize, &'static str>| -> alloc::string::String { match r { Ok(_) => alloc::string::String::from("ok"), Err(e) => alloc::format!("FAIL({})", e) } };
+    #[cfg(feature = "quarry")]
+    let [tree, icons, columns, overlay] = crate::video::quarry::live::scrollpanes_probe();
+    #[cfg(not(feature = "quarry"))]
+    let [tree, icons, columns, overlay]: [Result<usize, &'static str>; 4] = [Err("no-quarry"); 4];
+    let [tabs, types] = crate::video::settings::scrollpanes_probe();
+    let all = [&tree, &icons, &columns, &tabs, &types, &overlay];
+    serial_println!(
+        "[scrollview] panes tree_steps={} icons_steps={} columns_steps={} tabs_steps={} types_steps={} overlay_legs={}",
+        tree.as_ref().copied().unwrap_or(0), icons.as_ref().copied().unwrap_or(0), columns.as_ref().copied().unwrap_or(0), tabs.as_ref().copied().unwrap_or(0), types.as_ref().copied().unwrap_or(0), overlay.as_ref().copied().unwrap_or(0)
+    );
+    (
+        alloc::format!("tree={} icons={} columns={} tabs={} types={} overlay={}", word(&tree), word(&icons), word(&columns), word(&tabs), word(&types), word(&overlay)),
+        all.iter().all(|r| r.is_ok()),
+    )
 }

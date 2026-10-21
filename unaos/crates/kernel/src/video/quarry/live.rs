@@ -887,14 +887,11 @@ const WHEEL_ROWS: usize = 3;
 /// is not reachable — `detents` is an `i8` widened to `i32` and `WHEEL_ROWS` is 3, so the step is at
 /// most 384 rows — but it is written saturating anyway, because the alternative is a guard that has
 /// to be re-argued every time the drain's shape changes.
+///
+/// SCROLLPANES (B777): the arithmetic is wm's one model ([`rows_step`]); this keeps QSCROLL's numbers and sign.
 #[inline]
 fn wheel_next(scroll: usize, smax: usize, detents: i32) -> usize {
-    let step = (detents.unsigned_abs() as usize).saturating_mul(WHEEL_ROWS);
-    if detents > 0 {
-        scroll.min(smax).saturating_sub(step)
-    } else {
-        scroll.saturating_add(step).min(smax)
-    }
+    rows_step(scroll, smax, -(detents as isize).saturating_mul(WHEEL_ROWS as isize))
 }
 
 /// Scrollbar thumb geometry inside a `track_h`-tall gutter, or `None` when everything fits.
@@ -1738,43 +1735,12 @@ fn size_field(bytes: u64, w: usize) -> String {
     out
 }
 
-/// The scroll gutter for a pane's inner rect, and the thumb inside it.
-fn paint_scrollbar(
-    px: &mut [u32],
-    g: &Geom,
-    inner: Rect,
-    top: usize,
-    len: usize,
-    visible: usize,
-    scroll: usize,
-) {
-    if len <= visible {
-        return;
-    }
-    // `saturating_sub` on both terms: `geometry`'s floors make a pane narrower than the gutter or
-    // shorter than its header unreachable, but a painter that can underflow on a geometry change is a
-    // painter that will, and the cost of not being able to is nothing.
-    let track = Rect {
-        x: inner.x + inner.w.saturating_sub(SBW()),
-        y: top,
-        w: SBW(),
-        h: (inner.y + inner.h).saturating_sub(top),
-    };
-    fill(px, g, track.x, track.y, track.w, track.h, theme::surface_sunken());
-    fill(px, g, track.x, track.y, 1, track.h, theme::line_subtle());
-    if let Some((ty, th)) = thumb(track.h, len, visible, scroll) {
-        fill(px, g, track.x + 2, track.y + ty, track.w.saturating_sub(4), th, theme::line_strong());
-    }
-}
-
 fn repaint_locked(m: &Model, px: &mut [u32]) {
     let g = &m.geom;
     // QUARRYFONT — the two units, named apart. `cell_w` is the glyph ADVANCE and drives every column
     // count and clip below; `mark_w` is the disclosure triangle's width and drives the indent ladder.
     // They were one number (`cell()`) only because a doubled 8x8 bitmap is square.
     let _cell_w = g.cell_w(); // QUARRY2 (B336): the list columns read it inside `columns::layout` now
-    let mark_w = g.mark_w();
-    let row_h = g.row_h();
 
     // ── the path bar ────────────────────────────────────────────────────────────────────────────
     fill(px, g, 0, 0, g.w, g.bar_h(), theme::surface_window());
@@ -1794,46 +1760,9 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
 
     // ── the tree pane ───────────────────────────────────────────────────────────────────────────
     let tp = g.tree_pane();
-    let ti = tp.inner();
     fill(px, g, tp.x, tp.y, tp.w, tp.h, theme::surface_content());
     keyline(px, g, tp, theme::line_subtle());
-    let tvis = m.tree_visible();
-    let tsb = if m.tree.len() > tvis { SBW() } else { 0 };
-    for r in 0..tvis {
-        let i = m.tree_scroll + r;
-        if i >= m.tree.len() {
-            break;
-        }
-        let row = &m.tree[i];
-        let y = ti.y + r * row_h;
-        let sel = i == m.tree_sel;
-        if sel {
-            let c = if m.focus == Pane::Tree { theme::accent() } else { theme::line_strong() };
-            fill(px, g, ti.x, y, ti.w - tsb, row_h, c);
-        } else if m.hover == Hover::Tree(i) {
-            hover_wash(px, g, ti.x, y, ti.w - tsb, row_h); // QUARRYHOVER (B647): the kit's hover wash under the pointer
-        }
-        let ink = if sel && m.focus == Pane::Tree {
-            theme::surface_window()
-        } else {
-            theme::text_primary()
-        };
-        let indent = PAD() + row.depth * mark_w;
-        // Both triangle forms have their centre at `y + 4 * ts` by construction (column/row `i`
-        // spans `i ..= i + 2*(n-i)`, whose midpoint is `n`, independent of `i`), so this offset
-        // puts the marker's centre exactly on the row's.
-        disclosure(px, g, ti.x + indent, y + row_h / 2 - 4 * g.ts, row.expanded, ink);
-        text(
-            px,
-            g,
-            ti.x + indent + mark_w + g.ts,
-            y + g.ts,
-            row.name.as_bytes(),
-            ti.x + ti.w - tsb,
-            ink,
-        );
-    }
-    paint_scrollbar(px, g, ti, ti.y, m.tree.len(), tvis, m.tree_scroll);
+    tree_rows_paint(m, px, 0, m.tree_visible()); // SCROLLPANES (B777): the one tree row painter (full paint and strip); the bar is wm's
 
     // ── the divider ─────────────────────────────────────────────────────────────────────────────
     fill(px, g, tp.x + tp.w, tp.y, 1, tp.h, theme::line_subtle());
@@ -1871,7 +1800,7 @@ fn repaint() {
         // the view is a plain reborrow — the old `Vec<u8>`-as-`[u32]` cast leaned on an alignment Rust does not promise.
         let px: &mut [u32] = &mut surf[..];
         repaint_locked(m, px);
-        list_register(WIN.load(Ordering::Relaxed), m, px); // SCROLLVIEW (B764): the list's model and its bar
+        panes_register(WIN.load(Ordering::Relaxed), m, px); // SCROLLVIEW (B764) · SCROLLPANES (B777): every pane's model and its bar
     }
     drop(surf);
     let id = WIN.load(Ordering::Relaxed);
@@ -2614,27 +2543,8 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
     if tp.contains(sx, sy) {
         let ti = tp.inner();
         let tvis = m.tree_visible();
-        let sb = m.tree.len() > tvis;
         m.focus = Pane::Tree;
-        // The gutter PAGES — a whole viewport per press. QSCROLL made the wheel the FINE gesture
-        // beside it ([`wheel_scroll`], three rows a detent); the track stays the coarse one, because
-        // it is the only scroll a wheel-less mouse has and the only one that crosses a
-        // thousand-entry directory in a gesture a wrist can complete. The two share this pane's one
-        // offset and the same selection pull, so neither can drift from the other.
-        if sb && sx >= ti.x + ti.w - SBW() {
-            let (ty, th) = thumb(ti.h, m.tree.len(), tvis, m.tree_scroll).unwrap_or((0, 0));
-            let rel = sy.saturating_sub(ti.y);
-            if rel < ty {
-                m.tree_scroll = m.tree_scroll.saturating_sub(tvis);
-            } else if rel >= ty + th {
-                m.tree_scroll = (m.tree_scroll + tvis).min(scroll_max(m.tree.len(), tvis));
-            }
-            // NOT `clamp`: it PANICS when min > max, and a degenerate viewport (`tvis == 0`, a pane
-            // shorter than one row) reaches exactly that shape. `max` then `min` is total.
-            m.tree_sel = m.tree_sel.max(m.tree_scroll).min((m.tree_scroll + tvis).saturating_sub(1));
-            m.settle();
-            return Act::None;
-        }
+        // SCROLLPANES (B777): the tree's gutter is wm's (`wm::scroll_press` in `press_route` pages and drags it).
         if sy < ti.y {
             return Act::None;
         }
@@ -2773,11 +2683,8 @@ fn wheel_scroll_view(m: &mut Model, sx: usize, sy: usize, detents: i32, view: to
         let len = m.list.len();
         let max_row = len.div_ceil(cols).saturating_sub(vis);
         let cur = (m.list_scroll / cols).min(max_row);
-        let step = detents.unsigned_abs() as usize;
-        let next = if detents > 0 { cur.saturating_sub(step) } else { cur.saturating_add(step).min(max_row) };
-        m.list_scroll = next * cols;
-        let hi = ((next + vis) * cols).saturating_sub(1).min(len.saturating_sub(1));
-        m.list_sel = m.list_sel.max(next * cols).min(hi);
+        let next = rows_step(cur, max_row, -(detents as isize)); // SCROLLPANES (B777): wm's one model, one grid row a detent
+        grid_pull(m, next);
         return Some(WheelHit { pane: "icons", scroll: next, max: max_row, moved: next != cur });
     }
     let (len, vis, scroll) = if tree {
@@ -2786,7 +2693,7 @@ fn wheel_scroll_view(m: &mut Model, sx: usize, sy: usize, detents: i32, view: to
         (m.list.len(), m.list_visible(), m.list_scroll)
     };
     let max = scroll_max(len, vis);
-    let next = if tree { wheel_next(scroll, max, detents) } else { wm::ScrollView { offset: scroll, extent: len, viewport: (0, 0, 1, vis), line: 1 }.step(-(detents as isize) * WHEEL_ROWS as isize).off }; // SCROLLVIEW (B764): the list's step is wm's one model (rows as its unit); the live wheel reaches `wm::scroll_wheel` first
+    let next = wheel_next(scroll, max, detents); // SCROLLVIEW (B764) · SCROLLPANES (B777): tree and list step wm's one model (rows as its unit); the live wheel reaches `wm::scroll_wheel` first
     let lo = next;
     let hi = (next + vis).saturating_sub(1);
     if tree {
@@ -4940,19 +4847,31 @@ fn list_view(m: &Model) -> Option<(wm::ScrollView, usize)> {
     Some((wm::ScrollView { offset: m.list_scroll * rh, extent: len * rh, viewport: vp, line: rh }, SBW()))
 }
 
-/// Register (or drop) the list's model after a full paint, and paint its bar into the gutter.
-fn list_register(id: wm::WinId, m: &Model, px: &mut [u32]) {
+/// Register (or drop) one pane's model after a full paint, and paint its bar into the gutter.
+fn pane_register(id: wm::WinId, pane: u8, v: Option<(wm::ScrollView, usize)>, f: wm::ScrollFn, px: &mut [u32], stride: usize) {
+    match v {
+        Some((v, gw)) => {
+            if wm::scroll_set(id, pane, v, gw, theme::surface_content(), f) {
+                wm::scrollbar_paint(id, pane, px, stride);
+            }
+        }
+        None => wm::scroll_drop(id, pane),
+    }
+}
+
+/// SCROLLPANES (B777): every pane's model after a full paint — the content pane as the view shows it (List rows,
+/// the Icons grid, the Columns focus pane) and the tree.
+fn panes_register(id: wm::WinId, m: &Model, px: &mut [u32]) {
     if id == wm::WIN_NONE {
         return;
     }
-    match list_view(m) {
-        Some((v, gw)) => {
-            if wm::scroll_set(id, v, gw, theme::surface_content(), list_scrolled) {
-                wm::scrollbar_paint(id, px, m.geom.w);
-            }
-        }
-        None => wm::scroll_clear(id),
-    }
+    let (v, f): (Option<(wm::ScrollView, usize)>, wm::ScrollFn) = match toolbar::view() {
+        toolbar::View::Icons => (grid_view(m), grid_scrolled),
+        toolbar::View::Columns => (cols_view(m), cols_scrolled),
+        _ => (list_view(m), list_scrolled),
+    };
+    pane_register(id, PANE_CONTENT, v, f, px, m.geom.w);
+    pane_register(id, PANE_TREE, tree_view(m), tree_scrolled, px, m.geom.w);
 }
 
 /// Paint body rows `[r0, r1)` of the viewport (view-relative) exactly as a full paint draws them: the ground, then
@@ -4998,16 +4917,8 @@ fn list_step_core(m: &mut Model, px: &mut [u32], st: &wm::ScrollStep) -> usize {
     let (s0, s1) = st.strip;
     let (r0, r1) = ((s0 - body_y) / rh, (s1 - body_y).div_ceil(rh));
     let mut n = list_rows_paint(m, px, r0, r1);
-    let lvis = m.list_visible();
-    if m.list_sel != old_sel {
-        for i in [old_sel, m.list_sel] {
-            if i >= m.list_scroll && i < m.list_scroll + lvis {
-                let r = i - m.list_scroll;
-                if r < r0 || r >= r1 {
-                    n += list_rows_paint(m, px, r, r + 1);
-                }
-            }
-        }
+    for r in sel_rows(old_sel, m.list_sel, m.list_scroll, m.list_visible(), r0, r1) {
+        n += list_rows_paint(m, px, r, r + 1);
     }
     n
 }
@@ -5019,14 +4930,37 @@ fn list_strip_ok(m: &Model, st: &wm::ScrollStep) -> bool {
         && m.err.is_none()
         && m.list_scroll * rh == st.was
         && list_view(m).is_some_and(|(v, _)| v.viewport == st.viewport)
-        && !getinfo::is_up()
-        && !openwith::is_up()
-        && !attrcols::menu_up()
-        && crate::video::dnd::hover().is_none()
+        && overlay_free(m)
 }
 
 /// The list's `wm::ScrollFn`: wm moved the model; apply it under Quarry's own locks (MODEL, then SURF).
 fn list_scrolled(id: wm::WinId, st: &wm::ScrollStep) -> usize {
+    pane_step(id, PANE_CONTENT, st, list_strip_ok, list_step_core, |m, st| list_pull(m, st.off / m.geom.row_h().max(1)))
+}
+
+/// SCROLLPANES (B777): what nothing may be painted over for a pane's band to be blitted — the inspector, Open With,
+/// the column menu, a drag's hover outline, the context menu / inline edit field (`ops::overlay_up`) and the marks
+/// (`dragdrop::marks_up`). Every Quarry pane's `*_strip_ok` asks it.
+fn overlay_free(m: &Model) -> bool {
+    !getinfo::is_up()
+        && !openwith::is_up()
+        && !attrcols::menu_up()
+        && crate::video::dnd::hover().is_none()
+        && !ops::overlay_up()
+        && !dragdrop::marks_up(m)
+}
+
+/// THE Quarry half of a step, for every pane (SCROLLVIEW's `list_scrolled` body, keyed): under MODEL then SURF, the
+/// pane's strip body when `ok` says the band can move (`core`: pull, blit, strip), else the pane's offset applied
+/// (`pull`) and one full repaint; then the pane's bar, then the present (the viewport rows, or the window).
+fn pane_step(
+    id: wm::WinId,
+    pane: u8,
+    st: &wm::ScrollStep,
+    ok: fn(&Model, &wm::ScrollStep) -> bool,
+    core: fn(&mut Model, &mut [u32], &wm::ScrollStep) -> usize,
+    pull: fn(&mut Model, &wm::ScrollStep),
+) -> usize {
     let mut guard = MODEL.lock();
     let Some(m) = guard.as_mut() else { return 0 };
     let mut surf = SURF.lock();
@@ -5035,22 +4969,23 @@ fn list_scrolled(id: wm::WinId, st: &wm::ScrollStep) -> usize {
     }
     let _paint = columns::PaintMark::new();
     let (w, h) = (m.geom.w, m.geom.h);
-    let full = !list_strip_ok(m, st);
+    let full = !ok(m, st);
     let n = {
         let px: &mut [u32] = &mut surf[..];
         let n = if full {
-            list_pull(m, st.off / m.geom.row_h().max(1));
+            pull(m, st);
             repaint_locked(m, px);
             w * h
         } else {
-            let n = list_step_core(m, px, st);
-            if st.moved != 0 {
-                ops::paint_overlay(m, px);
-                dragdrop::paint(m, px);
-            }
-            n
+            core(m, px, st)
         };
-        wm::scrollbar_paint(id, px, w);
+        if full {
+            for p in [PANE_CONTENT, PANE_TREE] {
+                wm::scrollbar_paint(id, p, px, w); // the repaint laid the ground over every gutter
+            }
+        } else {
+            wm::scrollbar_paint(id, pane, px, w);
+        }
         n
     };
     drop(surf);
@@ -5126,4 +5061,349 @@ pub fn scrollview_probe() -> Result<usize, &'static str> {
         }
     }
     Ok(rows.len())
+}
+
+// ── SCROLLPANES (rmbp-ledger B777) — the tree, the Icons grid and the Columns focus pane on wm's one model ─────────
+// SCROLLVIEW (B764) put the list on `wm::ScrollView`; the other three scrolling panes join it here, keyed by pane
+// (wm's table is `(window, pane)`): the content pane ([`PANE_CONTENT`]: List rows, the Icons grid or the Columns focus
+// pane, whichever the view shows) and the tree ([`PANE_TREE`]). Each is one `*_view` (the model from the picture),
+// one `*_step_core` (pull, `wm::scroll_blit`, the strip rows through the pane's ONE row painter, the selection rows the
+// pull changed) and one `*_strip_ok` (else [`pane_step`]'s full repaint); the ScrollFn is [`pane_step`] keyed.
+// Their own wheel and gutter arithmetic is gone: the live wheel, gutter press and thumb drag are wm's, and the
+// fixture-facing `wheel_scroll_view` steps the same model ([`rows_step`]).
+
+/// The window's content pane (List / Icons / Columns) and its tree, as wm's pane keys.
+const PANE_CONTENT: u8 = 0;
+const PANE_TREE: u8 = 1;
+
+/// One step of `d` rows on a row offset whose largest value is `max` — wm's model in row units (`line` 1).
+fn rows_step(cur: usize, max: usize, d: isize) -> usize {
+    wm::ScrollView { offset: cur.min(max), extent: max + 1, viewport: (0, 0, 1, 1), line: 1 }.step(d).off
+}
+
+/// The rows (view-relative) whose selection ink a pull changed and the strip `[r0, r1)` did not repaint.
+fn sel_rows(old: usize, new: usize, top: usize, vis: usize, r0: usize, r1: usize) -> impl Iterator<Item = usize> {
+    let moved = old != new;
+    [old, new].into_iter().filter(move |&i| moved && i >= top && i < top + vis).map(move |i| i - top).filter(move |&r| r < r0 || r >= r1)
+}
+
+/// The strip rows `[r0, r1)` of a step, in `line` units from the viewport top.
+fn strip_rows(st: &wm::ScrollStep, line: usize) -> (usize, usize) {
+    let y0 = st.viewport.1;
+    ((st.strip.0 - y0) / line, (st.strip.1 - y0).div_ceil(line))
+}
+
+// ── the tree ──
+
+/// Tree rows `[r0, r1)` of the viewport exactly as the full paint draws them: the ground left of the gutter, the
+/// selection or hover wash, the disclosure marker and the name. The one tree row painter. Returns the pixels painted.
+fn tree_rows_paint(m: &Model, px: &mut [u32], r0: usize, r1: usize) -> usize {
+    let g = &m.geom;
+    let (row_h, mark_w) = (g.row_h(), g.mark_w());
+    let ti = g.tree_pane().inner();
+    let tvis = m.tree_visible();
+    let (r0, r1) = (r0.min(tvis), r1.min(tvis));
+    if r0 >= r1 || row_h == 0 {
+        return 0;
+    }
+    let tsb = if m.tree.len() > tvis { SBW() } else { 0 };
+    let w = ti.w.saturating_sub(tsb);
+    fill(px, g, ti.x, ti.y + r0 * row_h, w, (r1 - r0) * row_h, theme::surface_content());
+    for r in r0..r1 {
+        let i = m.tree_scroll + r;
+        if i >= m.tree.len() {
+            break;
+        }
+        let row = &m.tree[i];
+        let y = ti.y + r * row_h;
+        let sel = i == m.tree_sel;
+        if sel {
+            let c = if m.focus == Pane::Tree { theme::accent() } else { theme::line_strong() };
+            fill(px, g, ti.x, y, w, row_h, c);
+        } else if m.hover == Hover::Tree(i) {
+            hover_wash(px, g, ti.x, y, w, row_h); // QUARRYHOVER (B647): the kit's hover wash under the pointer
+        }
+        let ink = if sel && m.focus == Pane::Tree { theme::surface_window() } else { theme::text_primary() };
+        let indent = PAD() + row.depth * mark_w;
+        // Both triangle forms have their centre at `y + 4 * ts` by construction (column/row `i` spans
+        // `i ..= i + 2*(n-i)`, whose midpoint is `n`, independent of `i`), so this offset puts the marker's centre
+        // exactly on the row's.
+        disclosure(px, g, ti.x + indent, y + row_h / 2 - 4 * g.ts, row.expanded, ink);
+        text(px, g, ti.x + indent + mark_w + g.ts, y + g.ts, row.name.as_bytes(), ti.x + w, ink);
+    }
+    (r1 - r0) * row_h * w
+}
+
+/// The tree's model: viewport = its rows left of the `SBW()` gutter, line = the row pitch. `None` = it fits.
+fn tree_view(m: &Model) -> Option<(wm::ScrollView, usize)> {
+    let g = m.geom;
+    let (rh, tvis, len) = (g.row_h(), m.tree_visible(), m.tree.len());
+    if rh == 0 || tvis == 0 || len <= tvis {
+        return None;
+    }
+    let ti = g.tree_pane().inner();
+    let vp = (ti.x, ti.y, ti.w.saturating_sub(SBW()), tvis * rh);
+    Some((wm::ScrollView { offset: m.tree_scroll * rh, extent: len * rh, viewport: vp, line: rh }, SBW()))
+}
+
+/// The tree's offset (rows) applied, the selection pulled inside the viewport (`max` then `min`, never `clamp`).
+fn tree_pull(m: &mut Model, next: usize) {
+    let vis = m.tree_visible();
+    m.tree_scroll = next;
+    m.tree_sel = m.tree_sel.max(next).min((next + vis).saturating_sub(1));
+    m.settle();
+}
+
+fn tree_step_core(m: &mut Model, px: &mut [u32], st: &wm::ScrollStep) -> usize {
+    let rh = m.geom.row_h().max(1);
+    let old = m.tree_sel;
+    tree_pull(m, st.off / rh);
+    if st.moved == 0 {
+        return 0;
+    }
+    let _ = wm::scroll_blit(px, m.geom.w, st);
+    let (r0, r1) = strip_rows(st, rh);
+    let mut n = tree_rows_paint(m, px, r0, r1);
+    for r in sel_rows(old, m.tree_sel, m.tree_scroll, m.tree_visible(), r0, r1) {
+        n += tree_rows_paint(m, px, r, r + 1);
+    }
+    n
+}
+
+fn tree_strip_ok(m: &Model, st: &wm::ScrollStep) -> bool {
+    m.tree_scroll * m.geom.row_h() == st.was && tree_view(m).is_some_and(|(v, _)| v.viewport == st.viewport) && overlay_free(m)
+}
+
+/// The tree's `wm::ScrollFn`.
+fn tree_scrolled(id: wm::WinId, st: &wm::ScrollStep) -> usize {
+    pane_step(id, PANE_TREE, st, tree_strip_ok, tree_step_core, |m, st| tree_pull(m, st.off / m.geom.row_h().max(1)))
+}
+
+// ── the Icons grid ──
+
+/// The grid's model whatever the view (the probe's): viewport = the whole grid rows left of the gutter, line = the
+/// cell height, offset = the first row shown x the cell height. `None` = it fits, or an error is shown.
+fn grid_geom(m: &Model) -> Option<(wm::ScrollView, usize)> {
+    let g = m.geom;
+    let li = g.list_pane().inner();
+    let (_, ch) = iconview::cell(&g);
+    let (cols, vis) = iconview::grid(&g, li);
+    let len = m.list.len();
+    let rows = len.div_ceil(cols.max(1));
+    if m.err.is_some() || ch == 0 || rows <= vis {
+        return None;
+    }
+    let top = iconview::top_row(len, m.list_scroll, cols, vis);
+    let vp = (li.x, li.y, li.w.saturating_sub(SBW()), vis * ch);
+    Some((wm::ScrollView { offset: top * ch, extent: rows * ch, viewport: vp, line: ch }, SBW()))
+}
+
+fn grid_view(m: &Model) -> Option<(wm::ScrollView, usize)> {
+    if toolbar::view() != toolbar::View::Icons {
+        return None;
+    }
+    grid_geom(m)
+}
+
+/// The grid's first row applied (`list_scroll` = its first item), the selection pulled into the visible rows.
+fn grid_pull(m: &mut Model, row: usize) {
+    let (cols, vis) = iconview::grid(&m.geom, m.geom.list_pane().inner());
+    let cols = cols.max(1);
+    let len = m.list.len();
+    m.list_scroll = row * cols;
+    let hi = ((row + vis) * cols).saturating_sub(1).min(len.saturating_sub(1));
+    m.list_sel = m.list_sel.max(row * cols).min(hi);
+}
+
+fn grid_step_core(m: &mut Model, px: &mut [u32], st: &wm::ScrollStep) -> usize {
+    let ch = iconview::cell(&m.geom).1.max(1);
+    let li = m.geom.list_pane().inner();
+    let (cols, vis) = iconview::grid(&m.geom, li);
+    let cols = cols.max(1);
+    let old = m.list_sel / cols;
+    grid_pull(m, st.off / ch);
+    if st.moved == 0 {
+        return 0;
+    }
+    let _ = wm::scroll_blit(px, m.geom.w, st);
+    let (r0, r1) = strip_rows(st, ch);
+    let vw = st.viewport.2;
+    let top = m.list_scroll / cols;
+    let mut rows = r1.min(vis).saturating_sub(r0);
+    let _ = iconview::rows_paint(m, px, li, r0, r1);
+    for r in sel_rows(old, m.list_sel / cols, top, vis, r0, r1) {
+        let _ = iconview::rows_paint(m, px, li, r, r + 1);
+        rows += 1;
+    }
+    rows * ch * vw
+}
+
+fn grid_strip_ok(m: &Model, st: &wm::ScrollStep) -> bool {
+    grid_view(m).is_some_and(|(v, _)| v.viewport == st.viewport && v.offset == st.was) && overlay_free(m)
+}
+
+/// The Icons grid's `wm::ScrollFn`.
+fn grid_scrolled(id: wm::WinId, st: &wm::ScrollStep) -> usize {
+    pane_step(id, PANE_CONTENT, st, grid_strip_ok, grid_step_core, |m, st| {
+        let ch = iconview::cell(&m.geom).1.max(1);
+        grid_pull(m, st.off / ch)
+    })
+}
+
+// ── the Columns focus pane ──
+
+fn cols_view(m: &Model) -> Option<(wm::ScrollView, usize)> {
+    if toolbar::view() != toolbar::View::Columns {
+        return None;
+    }
+    millercols::focus_view(m)
+}
+
+fn cols_step_core(m: &mut Model, px: &mut [u32], st: &wm::ScrollStep) -> usize {
+    let rh = m.geom.row_h().max(1);
+    let old = m.list_sel;
+    list_pull(m, st.off / rh);
+    if st.moved == 0 {
+        return 0;
+    }
+    let _ = wm::scroll_blit(px, m.geom.w, st);
+    let (r0, r1) = strip_rows(st, rh);
+    let mut n = millercols::focus_rows_paint(m, px, r0, r1);
+    for r in sel_rows(old, m.list_sel, m.list_scroll, m.list_visible(), r0, r1) {
+        n += millercols::focus_rows_paint(m, px, r, r + 1);
+    }
+    n
+}
+
+fn cols_strip_ok(m: &Model, st: &wm::ScrollStep) -> bool {
+    cols_view(m).is_some_and(|(v, _)| v.viewport == st.viewport && v.offset == st.was) && overlay_free(m)
+}
+
+/// The Columns focus pane's `wm::ScrollFn`.
+fn cols_scrolled(id: wm::WinId, st: &wm::ScrollStep) -> usize {
+    pane_step(id, PANE_CONTENT, st, cols_strip_ok, cols_step_core, |m, st| list_pull(m, st.off / m.geom.row_h().max(1)))
+}
+
+// ── `tests scrollview`'s pane legs ──
+
+/// An offscreen model at 1024x768 with `n` list entries (`dirs`: folders, so the Icons glyphs read no resource),
+/// `n` tree rows, in `cwd`.
+fn probe_model(n: usize, dirs: bool, cwd: &str) -> Option<Model> {
+    let sz = crate::video::metrics::size;
+    let g = geometry(sz(1024), sz(768))?;
+    let kind = if dirs { NodeKind::Dir } else { NodeKind::File };
+    Some(Model {
+        geom: g,
+        hover: Hover::None,
+        tree: (0..n).map(|k| TreeRow { path: alloc::format!("/t/{:04}", k), name: alloc::format!("TREE{:04}", k), depth: k % 4, expanded: k % 3 == 0 }).collect(),
+        tree_sel: 1,
+        tree_scroll: 0,
+        cwd: String::from(cwd),
+        list: (0..n as u64).map(|k| DirEnt { name: alloc::format!("ROW{:04}.TXT", k), kind, size: k * 37, mtime: None }).collect(),
+        list_truncated: false,
+        list_sel: 1,
+        list_scroll: 0,
+        focus: Pane::List,
+        err: None,
+        mounts: Vec::new(),
+        cache: Vec::new(),
+        cache_gen: 0,
+        reads: 0,
+        hits: 0,
+        read_cycles: 0,
+        click_ms: 0,
+        click_row: 0,
+        click_pane: Pane::List,
+        status: None,
+    })
+}
+
+/// A fixed walk (down 3, down 7, up 5, past a viewport, both clamps, up 3 lines) through a pane's live step body,
+/// the viewport compared pixel for pixel with the pane's full row paint after every step. `Ok(steps)`.
+fn pane_walk(
+    m: &mut Model,
+    v: Option<(wm::ScrollView, usize)>,
+    core: fn(&mut Model, &mut [u32], &wm::ScrollStep) -> usize,
+    full: fn(&mut Model, &mut [u32]),
+) -> Result<usize, &'static str> {
+    let (mut view, _) = v.ok_or("the pane did not overflow")?;
+    let g = m.geom;
+    let (vx, vy, vw, vh) = view.viewport;
+    let line = view.line.max(1);
+    let vis = vh / line;
+    if vis < 2 {
+        return Err("viewport too short for the leg");
+    }
+    let mut a: Vec<u32> = Vec::new();
+    let mut b: Vec<u32> = Vec::new();
+    if a.try_reserve_exact(g.w * g.h).is_err() || b.try_reserve_exact(g.w * g.h).is_err() {
+        return Err("oom");
+    }
+    a.resize(g.w * g.h, 0);
+    b.resize(g.w * g.h, 0);
+    full(m, &mut a);
+    let walk: [isize; 7] = [3, 7, -5, vis as isize + 2, -1000, 1000, -3];
+    for &d in walk.iter() {
+        let st = view.step(d * line as isize);
+        view.offset = st.off;
+        let painted = core(m, &mut a, &st);
+        if st.blit_px > 0 && painted > (st.strip.1 - st.strip.0 + 2 * line) * vw {
+            return Err("a step painted more than its strip and the two selection rows");
+        }
+        b.iter_mut().for_each(|p| *p = 0);
+        full(m, &mut b);
+        for y in vy..vy + vh {
+            let o = y * g.w;
+            if a[o + vx..o + vx + vw] != b[o + vx..o + vx + vw] {
+                serial_println!("[scrollview] pane step d={} off={} row y={} differs from the full paint", d, st.off, y);
+                return Err("the blitted pane differs from a full paint");
+            }
+        }
+    }
+    Ok(walk.len())
+}
+
+/// `tests scrollview`'s SCROLLPANES legs: `(tree, icons, columns, overlay)`. The tree, the Icons grid and the Columns
+/// focus pane walked through their live step bodies against a full paint; the overlay gate: a clean model blits, the
+/// context menu up or a mark on the folder does not (each raised and put back; nothing painted).
+pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 4] {
+    let tree = match probe_model(200, false, "/scrollpanes") {
+        Some(mut m) => {
+            let v = tree_view(&m);
+            pane_walk(&mut m, v, tree_step_core, |m, px| {
+                let _ = tree_rows_paint(m, px, 0, m.tree_visible());
+            })
+        }
+        None => Err("geometry declined 1024x768"),
+    };
+    let icons = match probe_model(400, true, "/scrollpanes") {
+        Some(mut m) => {
+            let v = grid_geom(&m);
+            pane_walk(&mut m, v, grid_step_core, |m, px| {
+                let li = m.geom.list_pane().inner();
+                let _ = iconview::rows_paint(m, px, li, 0, iconview::grid(&m.geom, li).1);
+            })
+        }
+        None => Err("geometry declined 1024x768"),
+    };
+    let columns = match probe_model(200, false, "/") {
+        Some(mut m) => {
+            let _paint = columns::PaintMark::new(); // the plan reads listings from the cache only
+            let v = millercols::focus_view(&m);
+            pane_walk(&mut m, v, cols_step_core, |m, px| {
+                let _ = millercols::focus_rows_paint(m, px, 0, m.list_visible());
+            })
+        }
+        None => Err("geometry declined 1024x768"),
+    };
+    let overlay = match probe_model(4, false, "/scrollpanes") {
+        Some(m) => {
+            let clean = overlay_free(&m);
+            let menu = ops::menu_probe(|| overlay_free(&m));
+            let marks = dragdrop::marks_probe(&m.cwd, "ROW0001.TXT", || overlay_free(&m));
+            if clean && !menu && !marks { Ok(3) } else if !clean { Err("an overlay is up on the clean model") } else { Err("the menu or the marks did not stop the blit") }
+        }
+        None => Err("geometry declined 1024x768"),
+    };
+    [tree, icons, columns, overlay]
 }
