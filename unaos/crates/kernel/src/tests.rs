@@ -439,7 +439,7 @@ fn ensure_fpu() {
     #[cfg(target_arch = "x86_64")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("fpu", crate::arch::sched::fpu::selftest); register("abielf", abielf_selftest); } // ABIELF (B693): `tests abielf` beside it, same cfg (the file-tail fn). LINE-NEUTRAL fold, code before the comment.
+        if !DONE.swap(true, Ordering::AcqRel) { register("fpu", crate::arch::sched::fpu::selftest); register("abielf", abielf_selftest); #[cfg(feature = "tickless")] register("tickless", tickless_selftest); } // TICKLESS (B765): `tests tickless` (the file-tail fn), same x86 block. ABIELF (B693): `tests abielf` beside it, same cfg (the file-tail fn). LINE-NEUTRAL fold, code before the comment.
     }
 }
 
@@ -4744,4 +4744,122 @@ fn softymic_selftest() {
         ":: SOFTYMIC: on={} off={} looks={} privacy={} -> {} :: live={} ::",
         yn(on), yn(off), looks, yn(privacy), if pass { "PASS" } else { "FAIL" }, live
     );
+}
+
+// ── TICKLESS (rmbp-ledger B765, blueprint cores.md BP-cores-18) — `tests tickless` ─────────────────────────────────
+//
+// FILE-TAIL append under the `tickless` knob (x86). Registered beside `tests fpu`, never run at boot (R80).
+// (a) a 2 s window with this task asleep: per online core `[tick] core= wakes_per_s= deadline_us= mode= idle=`, where
+//     idle = no dispatch on that core in the window; the verdict is over the idle TICKLESS-eligible cores (core 0 is
+//     periodic while the ms clock is its tick, and the HID pump core is periodic). (b) sleep_ms accuracy on a task
+//     pinned to an idle eligible core, measured on the system clock (TSC us when the clock is the TSC, else ms).
+//     (c) the quantum: two spinners pinned to that core both progress by the midpoint and the core dispatches >= 20
+//     times in 300 ms (the periodic tick came back while it is busy). The lid poll and DIMIDLE ride the usb-pump's
+//     1-tick sleep (a sleeper deadline), the mechanism leg (b) measures. Detail: the one-shot arm-vs-wake error.
+#[cfg(all(target_arch = "x86_64", feature = "tickless"))]
+mod tickless_t {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static SLEEP_ERR_US: AtomicU64 = AtomicU64::new(0);
+    pub static SLEEP_DONE: AtomicU64 = AtomicU64::new(0);
+    pub static SPIN_END_MS: AtomicU64 = AtomicU64::new(0);
+    pub static SPIN_CNT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+    /// The system clock in us: the TSC when it IS the ms clock, else the ms clock itself.
+    pub fn now_us() -> u64 {
+        let hz = crate::arch::apic::tsc_hz();
+        if crate::arch::clockcore::tsc_clock() && hz != 0 {
+            (crate::arch::now_cycles() as u128 * 1_000_000 / hz as u128) as u64
+        } else {
+            crate::arch::ms() * 1000
+        }
+    }
+
+    /// Leg (b), on the pinned core: each requested sleep against the clock; the worst |error| in us.
+    pub fn sleep_leg(_: usize) {
+        for &n in [1u64, 2, 5, 10, 17, 50, 1, 2, 5, 10, 17, 50].iter() {
+            let t0 = now_us();
+            crate::arch::sched::sleep_ms(n);
+            let el = now_us().saturating_sub(t0);
+            SLEEP_ERR_US.fetch_max(el.abs_diff(n * 1000), Relaxed);
+            SLEEP_DONE.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Leg (c): spin (never yielding) until the end, counting.
+    pub fn spin_leg(i: usize) {
+        while crate::arch::ms() < SPIN_END_MS.load(Relaxed) {
+            SPIN_CNT[i & 1].fetch_add(1, Relaxed);
+            core::hint::spin_loop();
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "tickless"))]
+fn tickless_selftest() {
+    use crate::arch::sched::{self, tickless, JoinResult};
+    use core::sync::atomic::Ordering::Relaxed;
+    use tickless_t::*;
+    if crate::arch::apic::apic_timer_hz() == 0 {
+        serial_println!(":: TICKLESS: cores=0 idle_wakes_per_s<=- sleep_ms_err<=- quantum=- -> SKIP reason=uncalibrated ::");
+        return;
+    }
+    let mut cores = alloc::vec![0usize];
+    for c in crate::arch::smp::online_aps() {
+        if c != 0 && !cores.contains(&c) {
+            cores.push(c);
+        }
+    }
+    // (a) the idle window.
+    let w0: alloc::vec::Vec<(u64, u64)> = cores.iter().map(|&c| (tickless::census(c).0, sched::meter_cpu_ticks(c).0)).collect();
+    let t0 = crate::arch::ms();
+    sched::sleep_ms(2000);
+    let el = (crate::arch::ms() - t0).max(1);
+    let here = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let mut idle = alloc::vec::Vec::new();
+    let mut worst = 0u64;
+    for (i, &c) in cores.iter().enumerate() {
+        let (wakes, arm_us, _) = tickless::census(c);
+        let busy = sched::meter_cpu_ticks(c).0.wrapping_sub(w0[i].1);
+        let wps = wakes.wrapping_sub(w0[i].0) * 1000 / el;
+        let elig = tickless::eligible(c);
+        serial_println!("[tick] core={} wakes_per_s={} deadline_us={} mode={} idle={}", c, wps, arm_us, if elig { "tickless" } else { "periodic" }, (busy == 0) as u8);
+        if busy == 0 && elig {
+            idle.push(c);
+            worst = worst.max(wps);
+        }
+    }
+    let Some(&target) = idle.iter().rev().find(|&&c| c != here) else {
+        serial_println!(":: TICKLESS: cores={} idle_wakes_per_s<=- sleep_ms_err<=- quantum=- -> SKIP reason=no-idle-core ::", cores.len());
+        return;
+    };
+    // (b) sleep accuracy on the idle core.
+    SLEEP_ERR_US.store(0, Relaxed);
+    SLEEP_DONE.store(0, Relaxed);
+    let h = sched::spawn_joinable("tickless-sleep", sleep_leg, 0, target, sched::PRIO_NORMAL);
+    let sleep_ok = h.join_timeout(crate::arch::ms_to_ticks(3000)) == JoinResult::Completed && SLEEP_DONE.load(Relaxed) == 12;
+    let err_us = SLEEP_ERR_US.load(Relaxed);
+    let err_ms = (err_us + 500) / 1000;
+    // (c) the quantum on the same core.
+    SPIN_CNT[0].store(0, Relaxed);
+    SPIN_CNT[1].store(0, Relaxed);
+    let d0 = sched::meter_cpu_ticks(target).0;
+    let k0 = crate::arch::percpu::cpu(target).map_or(0, |p| p.ticks.load(Relaxed));
+    SPIN_END_MS.store(crate::arch::ms() + 300, Relaxed);
+    let a = sched::spawn_joinable("tickless-spin0", spin_leg, 0, target, sched::PRIO_LOW);
+    let b = sched::spawn_joinable("tickless-spin1", spin_leg, 1, target, sched::PRIO_LOW);
+    sched::sleep_ms(150);
+    let (m0, m1) = (SPIN_CNT[0].load(Relaxed), SPIN_CNT[1].load(Relaxed));
+    let ja = a.join_timeout(crate::arch::ms_to_ticks(2000));
+    let jb = b.join_timeout(crate::arch::ms_to_ticks(2000));
+    let disp = sched::meter_cpu_ticks(target).0.wrapping_sub(d0);
+    let ticks = crate::arch::percpu::cpu(target).map_or(0, |p| p.ticks.load(Relaxed)).wrapping_sub(k0);
+    let qok = m0 > 0 && m1 > 0 && disp >= 20 && ja == JoinResult::Completed && jb == JoinResult::Completed;
+    let (late, early) = tickless::arm_err_us();
+    let pass = worst <= 10 && sleep_ok && err_ms <= 1 && qok;
+    serial_println!(
+        ":: TICKLESS: cores={} idle_wakes_per_s<={} sleep_ms_err<={} quantum={} -> {} :: idle_cores={} target=c{} sleep_err_us={} sleep_legs={} spin_mid={}/{} dispatches={} ticks={} arm_err_us late={} early={} slack_us={} beat_ms={} ::",
+        cores.len(), worst, err_ms, if qok { "ok" } else { "FAIL" }, if pass { "PASS" } else { "FAIL" },
+        idle.len(), target, err_us, SLEEP_DONE.load(Relaxed), m0, m1, disp, ticks, late, early, tickless::SLACK_US, tickless::IDLE_BEAT_MS
+    );
+    tally(pass);
 }

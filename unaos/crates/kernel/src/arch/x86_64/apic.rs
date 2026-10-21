@@ -174,29 +174,29 @@ const FIXED_INITCNT: u32 = 50_000;
 /// before ACPI is parsed — it uses the fixed empirical count. Callable by the BSP and each AP;
 /// APs come up after `calibrate` has stored the rate, so they inherit the calibrated count.
 pub fn init_timer() {
-    let vector = crate::arch::interrupts::TIMER_VECTOR as u32;
-    let hz = APIC_TIMER_HZ.load(Ordering::Relaxed);
-    let (initcnt, calibrated) = if hz != 0 {
-        // hz is counts/sec after the ÷16 divider; INITCNT reloads each period, so period = INITCNT
-        // / hz and rate = hz / INITCNT. .max(1) guards a degenerate rate (0 would halt the timer).
-        (((hz / TICK_HZ) as u32).max(1), true)
-    } else {
-        (FIXED_INITCNT, false)
-    };
-    unsafe {
-        // Divide the input clock by 16 (encoding 0b0011).
-        lapic_write(REG_TIMER_DIVIDE, X2_TIMER_DIVIDE, 0x3);
-        // LVT Timer: vector, bit 17 = periodic mode, bit 16 (mask) = 0.
-        lapic_write(REG_LVT_TIMER, X2_LVT_TIMER, vector | (1 << 17));
-        // Writing the initial count (last) arms the countdown; it reloads each period.
-        lapic_write(REG_TIMER_INITCNT, X2_TIMER_INITCNT, initcnt);
-    }
+    let (initcnt, calibrated) = arm_periodic(); // TICKLESS (B765): one arming body, two callers (this + `timer_periodic`)
     crate::bootlog_println!(
         "APIC: timer armed (vector {:#x}, periodic, ÷16, initcnt={} [{}]).",
-        vector,
+        crate::arch::interrupts::TIMER_VECTOR as u32,
         initcnt,
         if calibrated { "1 kHz calibrated" } else { "fixed" }
     );
+}
+/// The periodic arming body (split from `init_timer` by TICKLESS B765, LINE-NEUTRAL: this span keeps its line count):
+/// ÷16, the LVT periodic at the timer vector, then INITCNT (calibrated 1 kHz, else the fixed count; it reloads each
+/// period). hz is counts/sec after the ÷16 divider, so rate = hz / INITCNT; .max(1) guards a 0 (which halts the timer).
+/// `inline(always)` so the boot-time `init_timer` compiles to the body it had before the split (knob-off identity).
+#[inline(always)]
+fn arm_periodic() -> (u32, bool) {
+    let vector = crate::arch::interrupts::TIMER_VECTOR as u32;
+    let hz = APIC_TIMER_HZ.load(Ordering::Relaxed);
+    let (initcnt, calibrated) = if hz != 0 { (((hz / TICK_HZ) as u32).max(1), true) } else { (FIXED_INITCNT, false) };
+    unsafe {
+        lapic_write(REG_TIMER_DIVIDE, X2_TIMER_DIVIDE, 0x3); // ÷16 (encoding 0b0011)
+        lapic_write(REG_LVT_TIMER, X2_LVT_TIMER, vector | (1 << 17)); // bit 17 = periodic, bit 16 (mask) = 0
+        lapic_write(REG_TIMER_INITCNT, X2_TIMER_INITCNT, initcnt); // written last: arms the countdown
+    }
+    (initcnt, calibrated)
 }
 
 /// Calibrate the invariant TSC and the local-APIC timer against the fixed-frequency ACPI PM timer.
@@ -511,5 +511,32 @@ pub fn vector_state(v: u8) -> (bool, bool, u32, u32) {
         let tpr = lapic_read(0x080, 0x808);
         let ppr = lapic_read(0x0A0, 0x80A);
         (isr & (1 << b) != 0, irr & (1 << b) != 0, tpr, ppr)
+    }
+}
+
+/// TICKLESS (rmbp-ledger B765) — put THIS core's timer back on the periodic 1 kHz tick, quietly: the scheduler's
+/// dispatch path calls it when the core leaves a tickless idle (`sched::tickless::on_dispatch`); `init_timer` is the
+/// boot-time, printing caller of the same `arm_periodic` body. File-tail append under the knob.
+#[cfg(feature = "tickless")]
+#[inline]
+pub fn timer_periodic() {
+    let _ = arm_periodic();
+}
+
+/// TICKLESS (B765) — arm THIS core's timer ONE-SHOT, `us` microseconds from now, at the timer vector (LVT bits
+/// 18:17 = 00, unmasked, ÷16 like the tick). The count is the calibrated post-÷16 rate scaled to `us`, clamped to
+/// 1..=u32::MAX (0 would stop the timer). Uncalibrated it does nothing: `sched::tickless` never asks then.
+#[cfg(feature = "tickless")]
+pub fn timer_oneshot_us(us: u64) {
+    let hz = APIC_TIMER_HZ.load(Ordering::Relaxed);
+    if hz == 0 {
+        return;
+    }
+    let vector = crate::arch::interrupts::TIMER_VECTOR as u32;
+    let cnt = ((hz as u128 * us as u128) / 1_000_000).clamp(1, u32::MAX as u128) as u32;
+    unsafe {
+        lapic_write(REG_TIMER_DIVIDE, X2_TIMER_DIVIDE, 0x3);
+        lapic_write(REG_LVT_TIMER, X2_LVT_TIMER, vector); // one-shot, unmasked
+        lapic_write(REG_TIMER_INITCNT, X2_TIMER_INITCNT, cnt); // written last: arms the countdown
     }
 }

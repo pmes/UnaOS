@@ -3750,8 +3750,8 @@ pub fn exit() -> ! {
 
 /// Block the current task for `ticks` of THIS CPU's local-APIC timer, then become runnable again.
 /// Timer-driven (no waker), so it cannot lose a wakeup: the scheduler drains due sleepers at its
-/// loop top, and the free-running periodic timer re-enters that loop every tick (granularity and
-/// worst-case wake latency are one tick). `ticks == 0` wakes on the next loop pass (~0–1 tick).
+/// loop top, and the timer re-enters that loop every tick, or at this deadline under `tickless` (B765)
+/// (granularity and worst-case wake latency are one tick). `ticks == 0` wakes on the next loop pass (~0–1 tick).
 /// No-op outside a scheduled task (a boot-path caller that is not itself a task), like `yield_now`.
 pub fn sleep_ticks(ticks: u64) {
     let was_enabled = x86_64::instructions::interrupts::are_enabled();
@@ -6286,10 +6286,10 @@ fn run() -> ! {
         // ABI-clean DF regardless of what the last switch inherited.
         unsafe { core::arch::asm!("cld", options(nomem, nostack, preserves_flags)) };
 
-        // Wake any sleepers whose deadline has passed. The wake source is the free-running
-        // periodic LVT timer (every tick breaks the idle `hlt` below and re-enters this loop), so
-        // an idle CPU with only a pending sleeper makes progress; worst-case wake latency is one
-        // tick. Same CPU, no IPI — `make_ready` pushes onto this CPU's own run queue.
+        // Wake any sleepers whose deadline has passed. The wake source is the periodic LVT tick, or
+        // under `tickless` (B765) the one-shot `tickless::idle_arm` set for the earliest sleeper (its
+        // `idle_exit` credits the skipped ticks first), so an idle CPU with only a pending sleeper makes
+        // progress within one tick. Same CPU, no IPI — `make_ready` pushes onto this CPU's own run queue.
         drain_due_sleepers(cpu);
 
         // VUGPAUSE-2/x86: release every task parked in `SYS_INPUT_WAIT`, on a coarse cadence. Here for
@@ -6334,7 +6334,7 @@ fn run() -> ! {
                 task.state.store(STATE_RUNNING, Ordering::Release);
                 // Fresh quantum + clear the reschedule signal, and publish the running priority so a
                 // remote waker/spawner can tell whether a newly-ready task should preempt us.
-                SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed);
+                SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed); #[cfg(feature = "tickless")] tickless::on_dispatch(cpu); // TICKLESS (B765): a core leaving a tickless idle gets its 1 kHz tick back (the quantum counts ticks). LINE-NEUTRAL fold, code first
                 SCHED[cpu].need_resched.store(false, Ordering::Relaxed);
                 // R1 / rtpi: publish the EFFECTIVE priority so a remote waker cannot preempt a running
                 // boosted holder with a mid-priority task. Knob-off arm is the pre-arc verbatim.
@@ -6564,8 +6564,8 @@ fn run() -> ! {
                 // over-count of idleness — one interrupt's worth per idle pass, microseconds against a
                 // ~1 ms tick — and it errs in the safe direction: this instrument can under-report a
                 // core's load, never invent load that is not there.
-                let idle_t0 = crate::arch::now_cycles();
-                x86_64::instructions::interrupts::enable_and_hlt();
+                let idle_t0 = crate::arch::now_cycles(); #[cfg(feature = "tickless")] let tl = tickless::idle_arm(cpu); // TICKLESS (B765): one-shot to the nearest deadline. LINE-NEUTRAL fold, code first
+                x86_64::instructions::interrupts::enable_and_hlt(); #[cfg(feature = "tickless")] tickless::idle_exit(cpu, tl); // TICKLESS (B765): credit the skipped ticks BEFORE the loop top's sleeper drain; count the wake. LINE-NEUTRAL fold, code first
                 ACCT[cpu].account(0, crate::arch::now_cycles().wrapping_sub(idle_t0));
             }
         }
@@ -8028,7 +8028,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
             SLEEPERS[dead].lock().push_back(s);
         }
     });
-    let cur = SCHED[dead].current_tid.load(Ordering::Relaxed);
+    let cur = SCHED[dead].current_tid.load(Ordering::Relaxed); #[cfg(feature = "tickless")] poke_cpu(live); // TICKLESS (B765): the moved sleepers' deadlines may be nearer than the live core's armed one-shot; the IPI makes it re-arm. LINE-NEUTRAL fold, code first
     if cur != 0 {
         r.current = Some(cur);
     }
@@ -8759,5 +8759,157 @@ pub fn term_end(s: usize) -> Option<(u64, u64, u64, u64)> {
     match END_AT[s].load(Ordering::Acquire) {
         0 => None,
         q => Some((q, END_CAUSE[s].load(Ordering::Relaxed), END_KB[s].load(Ordering::Relaxed), END_WIN[s].load(Ordering::Relaxed))),
+    }
+}
+
+// ── TICKLESS (rmbp-ledger B765, blueprint cores.md BP-cores-18, power.md BP-power-7) ────────────────────────────────
+//
+// FILE-TAIL module under the `tickless` knob; its three calls are LINE-NEUTRAL folds in `run()` (the dispatch site and
+// the idle `hlt`) and one in `rehome_dead_core`, so a knob-off build carries none of it and nothing above moves.
+#[cfg(feature = "tickless")]
+pub mod tickless {
+    //! CHARTER: Kernel — kernel-by-ruling (seat: wave36 arc TICKLESS, rmbp-ledger B765): the idle core's LAPIC timer.
+    //!
+    //! NO_HZ_IDLE shape. A core that RUNS a task keeps the periodic 1 kHz tick: its nearest deadline is the quantum,
+    //! which `timer_preempt` counts in ticks, and the 1 ms tick-gap instruments (HIDSTALL2's `pump_core_hold`, U3.5's
+    //! IRQ window, aging) keep their meaning. A core whose run queue came up empty (`run()`'s idle arm, IF=0) arms the
+    //! timer ONE-SHOT to its nearest deadline — the earliest of its `SLEEPERS` (ticks are ms), on core 0 the
+    //! input-wait backstop, and the `IDLE_BEAT_MS` beat that keeps the ISR-hosted sibling watches alive on an all-idle
+    //! machine — and halts. On the wake, the ticks the timer did not deliver are CREDITED to `percpu.ticks` before
+    //! the loop top drains sleepers, so every tick-domain reader sees milliseconds as before. On dispatch the
+    //! periodic tick comes back. Periodic always: core 0 while the ms clock IS its tick (BP-cores-5, a non-invariant
+    //! TSC), and the HID pump core (HIDSTALL2 reads its tick gap as a masked hold; its pump naps 1 tick anyway).
+    //!
+    //! Data: every array here is written only by its own core in scheduler context (IF=0) and read cross-core relaxed
+    //! by `census`. `SLEEPERS[cpu]` is read under its own lock, alone, exactly as `drain_due_sleepers` takes it.
+    use super::{apic, percpu, INPUT_WAIT_BACKSTOP_DUE, MAX_CPUS, SCHED_ACTIVE, SLEEPERS};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
+
+    /// The longest an idle core sleeps with nothing due: the beat. 5 wakes/s, inside M2's 10 (one per 100 ms).
+    pub const IDLE_BEAT_MS: u64 = 200;
+    /// Added to every one-shot so a calibration error between the APIC rate and the clock cannot fire it before the
+    /// deadline's millisecond (an early wake finds nothing due and re-arms: one more wake). A calibration GUESS: the
+    /// fixture prints the measured arm-vs-wake error (`arm_err_us late= early=`) so the bench can size it.
+    pub const SLACK_US: u64 = 50;
+
+    static ONESHOT: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+    /// Idle `hlt` exits on this core (both modes): the M2 per-core wake counter.
+    static WAKES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    /// The last one-shot armed on this core, in us (0 = periodic).
+    static ARM_US: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    /// Largest measured timer-wake error against the armed interval, late and early (us), any core.
+    static ERR_LATE_US: AtomicU64 = AtomicU64::new(0);
+    static ERR_EARLY_US: AtomicU64 = AtomicU64::new(0);
+
+    /// What `idle_arm` hands `idle_exit`: the clock, the tick count and the TSC at the halt, and the armed interval
+    /// (0 = this halt was periodic).
+    pub struct Idle {
+        t0_ms: u64,
+        tick0: u64,
+        t0_cyc: u64,
+        armed_us: u64,
+    }
+
+    /// May core `cpu` go tickless? Scheduling live, the LAPIC timer calibrated, not core 0 while the ms clock is its
+    /// tick (BP-cores-5), not the HID pump core.
+    pub fn eligible(cpu: usize) -> bool {
+        SCHED_ACTIVE.load(Acquire)
+            && apic::apic_timer_hz() != 0
+            && !(cpu == 0 && !crate::arch::clockcore::tsc_clock())
+            && cpu != crate::hidstall::pump_cpu()
+    }
+
+    /// The idle arm, IF=0, just before `sti; hlt`: arm the one-shot to the nearest deadline, or keep (restore) the
+    /// periodic tick on an ineligible core.
+    pub(super) fn idle_arm(cpu: usize) -> Idle {
+        let tick0 = percpu::this_cpu().ticks.load(Relaxed);
+        let t0_ms = crate::arch::ms();
+        let t0_cyc = crate::arch::now_cycles();
+        if cpu >= MAX_CPUS || !eligible(cpu) {
+            if cpu < MAX_CPUS && ONESHOT[cpu].swap(false, Relaxed) {
+                apic::timer_periodic();
+                ARM_US[cpu].store(0, Relaxed);
+            }
+            return Idle { t0_ms, tick0, t0_cyc, armed_us: 0 };
+        }
+        let us = nearest_ms(cpu, tick0, t0_ms) * 1000 + SLACK_US;
+        apic::timer_oneshot_us(us);
+        ONESHOT[cpu].store(true, Relaxed);
+        ARM_US[cpu].store(us, Relaxed);
+        Idle { t0_ms, tick0, t0_cyc, armed_us: us }
+    }
+
+    /// Milliseconds to this core's nearest deadline: its earliest sleeper (deadlines are in its tick domain, 1 tick =
+    /// 1 ms), the input-wait backstop on core 0 (one core runs it for the machine), capped by the beat; at least 1.
+    fn nearest_ms(cpu: usize, tick0: u64, now_ms: u64) -> u64 {
+        let mut d = IDLE_BEAT_MS;
+        for s in SLEEPERS[cpu].lock().iter() {
+            d = d.min(s.deadline.saturating_sub(tick0));
+        }
+        if cpu == 0 {
+            d = d.min(INPUT_WAIT_BACKSTOP_DUE.load(Relaxed).saturating_sub(now_ms));
+        }
+        d.max(1)
+    }
+
+    /// Right after the `hlt` returns, IF=0: count the wake, credit the ticks the one-shot did not deliver (elapsed
+    /// ms minus ticks taken, never negative), and on a timer wake note its error against the armed interval.
+    pub(super) fn idle_exit(cpu: usize, t: Idle) {
+        if cpu >= MAX_CPUS {
+            return;
+        }
+        WAKES[cpu].fetch_add(1, Relaxed);
+        if t.armed_us == 0 {
+            return;
+        }
+        let p = percpu::this_cpu();
+        let taken = p.ticks.load(Relaxed).wrapping_sub(t.tick0);
+        let elapsed = crate::arch::ms().saturating_sub(t.t0_ms);
+        if elapsed > taken {
+            p.ticks.fetch_add(elapsed - taken, Relaxed);
+        }
+        if taken == 1 {
+            note_err(t.t0_cyc, t.armed_us); // the timer ISR ticked once: the one-shot fired (an IPI does not tick)
+        }
+    }
+
+    /// The measured arm-vs-wake error of one timer wake (TSC us against the armed interval).
+    fn note_err(t0_cyc: u64, armed_us: u64) {
+        let hz = apic::tsc_hz();
+        if hz == 0 {
+            return;
+        }
+        let el_us = (crate::arch::now_cycles().wrapping_sub(t0_cyc) as u128 * 1_000_000 / hz as u128) as u64;
+        if el_us * 2 < armed_us {
+            return; // a tick latched before the arm, not this one-shot
+        }
+        if el_us >= armed_us {
+            ERR_LATE_US.fetch_max(el_us - armed_us, Relaxed);
+        } else {
+            ERR_EARLY_US.fetch_max(armed_us - el_us, Relaxed);
+        }
+    }
+
+    /// The dispatch site (a task is about to run here): give a core leaving a tickless idle its periodic tick back.
+    #[inline]
+    pub(super) fn on_dispatch(cpu: usize) {
+        if cpu < MAX_CPUS && ONESHOT[cpu].load(Relaxed) {
+            ONESHOT[cpu].store(false, Relaxed);
+            ARM_US[cpu].store(0, Relaxed);
+            apic::timer_periodic();
+        }
+    }
+
+    /// `(wakes, last armed us, one-shot now)` for core `cpu` — the `tests tickless` census.
+    pub fn census(cpu: usize) -> (u64, u64, bool) {
+        if cpu >= MAX_CPUS {
+            return (0, 0, false);
+        }
+        (WAKES[cpu].load(Relaxed), ARM_US[cpu].load(Relaxed), ONESHOT[cpu].load(Relaxed))
+    }
+
+    /// The largest measured timer-wake error, `(late_us, early_us)`.
+    pub fn arm_err_us() -> (u64, u64) {
+        (ERR_LATE_US.load(Relaxed), ERR_EARLY_US.load(Relaxed))
     }
 }

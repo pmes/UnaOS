@@ -3861,6 +3861,12 @@ panic_hold = []
 # k8-reach NA row). Kept in sync with `unaos/arroyo` (the x86 `_feats` arm) and `unaos/builder/src/main.rs`.
 lidsleep = ["smc"]
 
+# TICKLESS (rmbp-ledger B765, blueprint cores.md BP-cores-18): a core with an empty run queue arms its LAPIC timer
+# ONE-SHOT to its nearest deadline (earliest sleeper, the input-wait backstop on core 0, a 200 ms idle beat) and
+# halts; a busy core keeps the 1 kHz tick. Core 0 while the ms clock is its tick, and the HID pump core, stay
+# periodic. x86 only. The env knob and the image line are the seat's follow-up (wave36).
+tickless = []
+
 # SMALLFIX2 (rmbp-ledger B391, R94 §3): UNAOS_SVG=1 — SVG is a picture: pixel_core's `svg` format (UnaOS's own
 # no_std svg_core) is linked, so `fs::filetype` types `image/svg+xml` by its markup and facet renders it (shapes;
 # SVG text needs the faces passed to `decode_at`, owed). Off: an .svg types as the text it is. Both arches. Kept
