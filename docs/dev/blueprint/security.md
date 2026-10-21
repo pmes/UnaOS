@@ -54,6 +54,7 @@ WXN64: `[wxaudit] arm64 el= sctlr= roots= leaves= pages= el1x_pages= el0x_pages=
 - Helm's kernel core linked into Ring 0 (CODEX §2 Helm row says "Its kernel core (`unaos/libs/sys/helm/`)"): not a kernel dependency at HEAD.
 - `permission_model.md` §2 "ask on use" and §3 "Glass Room" mock data: design text; status beyond §4 `unverified`.
 - aarch64 W^X (B685 WXN64): the kernel image's executable pages are carved EL1-RO+X and every other EL1&0 leaf is execute-never, then `SCTLR_EL1.WXN` is set — Pi (`boot::build_l1`, bounds `[_start, __rx_end)` from `pi-baremetal.ld`), QEMU `virt` (`boot_virt::build_l1`) and the Orin (`mmu_tegra::init`), bounds from the image's own phdrs. Compiled; the QEMU and metal `:: WXAUDIT:` lines are owed to the fold.
+- A session switch reaches `look::service` and `clock::locale::service` only through the last-changed ring (SESSIONGENPOLL B782 over PREFSCLIENTKEYS B779), and `prefs_client::on_changed` stamps that ring only while the KERNEL subscriber is on (`unaos/crates/kernel/src/prefs_client.rs:177`, `if !kq { return; }`); today `lock::prefs_pass`'s first-pass subscribe keeps it on (`login` images), and `tests settingsmap`'s switch leg subscribes itself, so it cannot see the dependency. Owed (CRAWLE SR173, A1): stamp the ring on every accepted write, ahead of the `kq` return.
 
 ## 6. Read further
 - `docs/SECURITY.md` (model + hardening ledger), `docs/dev/review/SEC-2026-10-06.md`.
