@@ -65,8 +65,6 @@ static PINS: crate::sync::Mutex<[(u8, u8, u16); MAX_PINS]> = crate::sync::Mutex:
 static RAMP: crate::sync::Mutex<[(u8, u8, bool); PAIR_MAX]> = crate::sync::Mutex::new([(0, 0, false); PAIR_MAX]);
 /// DACs whose ramp capability line has been printed (bit = nid & 31).
 static RAMP_SAID: AtomicU32 = AtomicU32::new(0);
-/// The amp module's own CORB/RIRB pair (allocated once, re-pointed on every out-of-probe use).
-static SVC: crate::sync::Mutex<Option<(u64, u64)>> = crate::sync::Mutex::new(None);
 
 pub fn held() -> bool { HELD.load(Ordering::Acquire) }
 pub(super) fn gpio_now() -> u8 { GPIO_UP.load(Ordering::Relaxed) }
@@ -249,7 +247,7 @@ fn unbind(rings: &mut Rings, cad: u8, t: &[(u8, u8, bool); PAIR_MAX], a: &mut Au
 }
 
 /// [`ramp`] from outside a probe (the player's RUN and STOP run on the service tick, with the probe's rings
-/// stopped): through the amp module's own CORB/RIRB pair, stopped again afterwards.
+/// stopped): through the device's one CORB/RIRB pair (`svc_rings`, HDARING B811), stopped again afterwards.
 pub(super) fn ramp_svc(up: bool) {
     if !RAMP.lock().iter().any(|e| e.0 != 0) { return; }
     let base = BASE.load(Ordering::Relaxed);
@@ -261,34 +259,11 @@ pub(super) fn ramp_svc(up: bool) {
     }
 }
 
-/// The amp module's command rings: allocated by `Rings::init` on first use, then RE-POINTED at the same two
-/// buffers ([HDA-SPEC §4.4.1.3, §4.4.2.2], the same sequence `Rings::init` writes, no allocation).
-fn svc_rings(base: u64, a: &mut Audit) -> Option<Rings> {
-    let mut g = SVC.lock();
-    let Some((corb, rirb)) = *g else {
-        let r = Rings::init(base, a)?;
-        *g = Some((r.corb, r.rirb));
-        return Some(r);
-    };
-    w8(base, REG_CORBCTL, 0);
-    w8(base, REG_RIRBCTL, 0);
-    if !wait_us(1000, || r8(base, REG_CORBCTL) & CORBCTL_RUN == 0) { return None; }
-    w32(base, REG_CORBLBASE, (bus_addr(corb) & 0xFFFF_FFFF) as u32);
-    w32(base, REG_CORBUBASE, (bus_addr(corb) >> 32) as u32);
-    w16(base, REG_CORBRP, CORBRP_RST);
-    let _ = wait_us(5000, || r16(base, REG_CORBRP) & CORBRP_RST != 0);
-    w16(base, REG_CORBRP, 0);
-    if !wait_us(5000, || r16(base, REG_CORBRP) & CORBRP_RST == 0) { return None; }
-    w16(base, REG_CORBWP, 0);
-    w32(base, REG_RIRBLBASE, (bus_addr(rirb) & 0xFFFF_FFFF) as u32);
-    w32(base, REG_RIRBUBASE, (bus_addr(rirb) >> 32) as u32);
-    w16(base, REG_RIRBWP, RIRBWP_RST);
-    w16(base, REG_RINTCNT, 1);
-    w8(base, REG_CORBCTL, CORBCTL_RUN);
-    w8(base, REG_RIRBCTL, RIRBCTL_DMAEN | RIRBCTL_RINTCTL);
-    a.ctrl += 12;
-    if !wait_us(1000, || r8(base, REG_CORBCTL) & CORBCTL_RUN != 0) { return None; }
-    Some(Rings { base, corb, rirb, corb_wp: 0, rirb_rp: 0, traced: true })
+/// The amp module's command rings: the DEVICE's one CORB/RIRB pair (HDARING B811: `super::ring::hold` — allocated
+/// once per boot, re-attached or re-programmed on the same buffers; this module's own pair and its copy of the
+/// register sequence are gone).
+fn svc_rings(base: u64, a: &mut Audit) -> Option<super::ring::Hold> {
+    super::ring::hold(base, a)
 }
 
 /// M4 — printed at the end of every tone run. The window is "since the last `amp=up`": three tone runs in it

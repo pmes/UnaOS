@@ -8387,6 +8387,7 @@ pub fn singleton_restart(from: usize, live: usize) -> Option<(u64, u64)> {
     if SGL_HOME.compare_exchange(from, live, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return None;
     }
+    singleton_death_step(crate::video::lag::pump_step_now(), crate::arch::ms()); // HDARING (B811) M3: every death (steal or wedge) passes here; the step it died in is counted
     // SAFETY: `entry` was stored from a `fn(usize)` in `singleton_register`; fn pointers round-trip through usize.
     let f: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(entry) };
     let name = sgl_name();
@@ -8406,12 +8407,100 @@ pub fn singleton_restart(from: usize, live: usize) -> Option<(u64, u64)> {
     Some((old, new))
 }
 
+// ── HDARING (rmbp-ledger B811) M3 — a step that keeps killing the singleton is PARKED ─────────────────────────────
+// Flight 37 boot 3: 32 restarts, every one `last_step=net-hda` — the restart re-ran the step that killed it, forever.
+// [`singleton_restart`] (the one place every death passes, steal or wedge) records the step in flight
+// (`video::lag::pump_step_now`); STEP_PARK_DEATHS deaths in the same step within STEP_PARK_WINDOW_MS park that step
+// for STEP_PARK_MS — when the step's owner registered it parkable ([`singleton_step_parkable`]; today net-hda's HDA
+// half, `hda::ring::parked`, which honours the park and unparks it when its ring answers a probe verb).
+
+const STEP_PARK_DEATHS: u32 = 3;
+const STEP_PARK_WINDOW_MS: u64 = 30_000;
+const STEP_PARK_MS: u64 = 10_000;
+/// Bit `step` set = an owner honours a park of that pump step.
+static SGL_PARKABLE: AtomicU32 = AtomicU32::new(0);
+static SGL_DEATH_STEP: AtomicU8 = AtomicU8::new(0);
+static SGL_DEATH_RUN: AtomicU32 = AtomicU32::new(0);
+static SGL_DEATH_T0: AtomicU64 = AtomicU64::new(0);
+/// The parked step (0 = none) and the ms its owner may probe it again.
+static SGL_PARK_STEP: AtomicU8 = AtomicU8::new(0);
+static SGL_PARK_UNTIL: AtomicU64 = AtomicU64::new(0);
+static SGL_PARK_AT: AtomicU64 = AtomicU64::new(0);
+
+/// HDARING — count a death in `step` (0 = no step known); park it at the bound.
+fn singleton_death_step(step: u8, now: u64) {
+    let same = step != 0 && SGL_DEATH_STEP.load(Ordering::Relaxed) == step && now.saturating_sub(SGL_DEATH_T0.load(Ordering::Relaxed)) <= STEP_PARK_WINDOW_MS;
+    let run = if same {
+        SGL_DEATH_RUN.fetch_add(1, Ordering::AcqRel) + 1
+    } else {
+        SGL_DEATH_STEP.store(step, Ordering::Relaxed);
+        SGL_DEATH_T0.store(now, Ordering::Relaxed);
+        SGL_DEATH_RUN.store(1, Ordering::Release);
+        1
+    };
+    if run >= STEP_PARK_DEATHS && step < 32 && SGL_PARKABLE.load(Ordering::Acquire) & (1 << step) != 0 && SGL_PARK_STEP.load(Ordering::Acquire) != step {
+        SGL_PARK_UNTIL.store(now + STEP_PARK_MS, Ordering::Release);
+        SGL_PARK_AT.store(now.max(1), Ordering::Relaxed);
+        SGL_PARK_STEP.store(step, Ordering::Release);
+        serial_println!(
+            "[pump] step={} parked deaths={} until={} (HDARING B811: {} deaths in {} within {} ms — the step is off the pump until its owner's probe answers)",
+            crate::video::lag::qs_step_name(step), run, now + STEP_PARK_MS, run, crate::video::lag::qs_step_name(step), STEP_PARK_WINDOW_MS
+        );
+    }
+}
+
+/// HDARING — the owner of pump step `step` honours a park of it (call once).
+pub fn singleton_step_parkable(step: u8) {
+    if step < 32 {
+        SGL_PARKABLE.fetch_or(1 << step, Ordering::AcqRel);
+    }
+}
+
+/// HDARING — `Some(until_ms)` while `step` is parked.
+pub fn singleton_step_parked(step: u8) -> Option<u64> {
+    if step == 0 || SGL_PARK_STEP.load(Ordering::Acquire) != step {
+        return None;
+    }
+    Some(SGL_PARK_UNTIL.load(Ordering::Acquire))
+}
+
+/// HDARING — the owner's probe answered: the step runs again, its death count starts over.
+pub fn singleton_step_unpark(step: u8) {
+    if SGL_PARK_STEP.compare_exchange(step, 0, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    SGL_DEATH_RUN.store(0, Ordering::Release);
+    SGL_DEATH_STEP.store(0, Ordering::Relaxed);
+    serial_println!(
+        "[pump] step={} unparked probe=answered parked_ms={} (HDARING B811)",
+        crate::video::lag::qs_step_name(step),
+        crate::arch::ms().saturating_sub(SGL_PARK_AT.load(Ordering::Relaxed))
+    );
+}
+
+/// HDARING — the owner's probe was silent: parked another STEP_PARK_MS.
+pub fn singleton_step_repark(step: u8, now: u64) {
+    if SGL_PARK_STEP.load(Ordering::Acquire) != step {
+        return;
+    }
+    SGL_PARK_UNTIL.store(now + STEP_PARK_MS, Ordering::Release);
+    serial_println!(
+        "[pump] step={} parked deaths={} until={} probe=silent (HDARING B811)",
+        crate::video::lag::qs_step_name(step),
+        SGL_DEATH_RUN.load(Ordering::Relaxed),
+        now + STEP_PARK_MS
+    );
+}
+
 // ── `tests gatesteal2` — a synthetic W5 death of the pump's core with the pump parked mid-step ─────────────────────
 
 static HOLD2_SEM: Semaphore = Semaphore::new(0);
 static HOLD2_ARMED: AtomicBool = AtomicBool::new(false);
 /// 0 = not held, 1 = parked on the fixture's semaphore, 2 = released.
 static HOLD2_STATE: AtomicU8 = AtomicU8::new(0);
+/// HDARING (B811): the pump step the armed park waits for — 0 = store-services (`singleton_hold_maybe`, main.rs),
+/// else a `video::lag` pump step id (`singleton_hold_in`, e.g. net-hda's park point in `hda::ring::leg_maybe`).
+static HOLD2_AT: AtomicU8 = AtomicU8::new(0);
 
 /// GATESTEAL2 — is the fixture's park armed for the CALLING task (the registered singleton)? One relaxed load when not.
 pub fn singleton_hold_armed() -> bool {
@@ -8421,7 +8510,12 @@ pub fn singleton_hold_armed() -> bool {
 /// GATESTEAL2 — the fixture's mid-step park: the singleton blocks on a semaphore (PARK_WAITQ: in no run queue, in no
 /// sleeper list, not current — flight 36's shape) until `tests gatesteal2` posts it.
 pub fn singleton_hold_maybe() {
-    if !singleton_hold_armed() || !HOLD2_ARMED.swap(false, Ordering::AcqRel) {
+    singleton_hold_in(0);
+}
+
+/// HDARING (B811) — the same park at pump step `step` (0 = store-services): parks only when the armed park names it.
+pub fn singleton_hold_in(step: u8) {
+    if !singleton_hold_armed() || HOLD2_AT.load(Ordering::Acquire) != step || !HOLD2_ARMED.swap(false, Ordering::AcqRel) {
         return;
     }
     HOLD2_STATE.store(1, Ordering::Release);
@@ -8531,11 +8625,19 @@ fn gatesteal2_selftest() {
         HOLD2_SEM.post();
     }
     let revenant2 = held2 && hold2_wait(1_500, || SGL_REVENANTS.load(Ordering::Acquire) != rev1);
+    // LEG 3 — HDARING (B811): the pump killed with an HDA verb IN FLIGHT inside net-hda (flight 37 boot 3's shape). The
+    // pump posts a verb and lets the device's pair go without its answer, parks at its net-hda park point, the watch's
+    // PUMPWEDGE edge restarts it (as leg 2), and the FRESH pump must re-attach to the live pair (drain the orphan) and
+    // read VENDOR_ID right; one death in net-hda must not park the step.
+    #[cfg(feature = "hda")]
+    let hdaring = gatesteal2_hdaring_leg();
+    #[cfg(not(feature = "hda"))]
+    let hdaring = (None::<bool>, alloc::string::String::from("hdaring=skip(not-built) reattach=skip drained=0 parked=0"));
     crate::sessionwedge::gatesteal2_wedge_leg(false);
     let steps = crate::video::wm::pump_gate_released_steps();
-    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1 && wedge_ok && revenant2;
+    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1 && wedge_ok && revenant2 && hdaring.0 != Some(false);
     serial_println!(
-        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} revenant={} wedge_rehome={} wedge_current={} wedge_from=c{} wedge_live=c{} wedge_restart_ms={} wedge_revenant={} deaths={}",
+        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} revenant={} wedge_rehome={} wedge_current={} wedge_from=c{} wedge_live=c{} wedge_restart_ms={} wedge_revenant={} deaths={} {}",
         dead,
         old,
         moved_current as u8,
@@ -8553,8 +8655,61 @@ fn gatesteal2_selftest() {
         if wedge_ok { SGL_HOME.load(Ordering::Acquire) as i64 } else { -1 },
         wedge_ms,
         if revenant2 { "exited" } else { "stuck" },
-        deaths
+        deaths,
+        hdaring.1
     );
+}
+
+/// HDARING (B811) — `tests gatesteal2` LEG 3: `(Some(pass) | None = skip, "hdaring=<ok|fail|skip(<why>)> reattach=<ok|fail|skip>
+/// drained=<n> parked=<0|1> vendor=<hex>")`. Runs inside leg 2's wedge window (`gatesteal2_wedge_leg(true)`). Go-red by
+/// mutation: `hda::ring::attach` without the WP/RP re-read -> the VENDOR_ID verb reads the orphan -> `reattach=fail`.
+#[cfg(all(feature = "wc", feature = "hda"))]
+fn gatesteal2_hdaring_leg() -> (Option<bool>, alloc::string::String) {
+    use crate::drivers::hda::ring;
+    let p_net = crate::video::lag::P_NET;
+    if !ring::leg_ready() {
+        return (None, alloc::string::String::from("hdaring=skip(no-codec) reattach=skip drained=0 parked=0"));
+    }
+    let restarts0 = SGL_RESTARTS.load(Ordering::Acquire);
+    let rev0 = SGL_REVENANTS.load(Ordering::Acquire);
+    HOLD2_AT.store(p_net, Ordering::Release);
+    HOLD2_STATE.store(0, Ordering::Release);
+    ring::leg_arm();
+    HOLD2_ARMED.store(true, Ordering::Release);
+    let held = hold2_wait(3_000, || HOLD2_STATE.load(Ordering::Acquire) == 1);
+    HOLD2_ARMED.store(false, Ordering::Release);
+    let restarted = held
+        && hold2_wait(4_000, || {
+            crate::sessionwedge::look(crate::arch::ms());
+            SGL_RESTARTS.load(Ordering::Acquire) != restarts0 && SGL_FRESH_MS.load(Ordering::Acquire) != 0
+        });
+    if restarted {
+        ring::leg_check_arm();
+    }
+    let checked = restarted && hold2_wait(2_000, || ring::leg_result().0);
+    ring::leg_off();
+    if held {
+        HOLD2_SEM.post();
+    }
+    let revenant = held && hold2_wait(1_500, || SGL_REVENANTS.load(Ordering::Acquire) != rev0);
+    HOLD2_AT.store(0, Ordering::Release);
+    let (_, reattach, drained, vendor) = ring::leg_result();
+    let parked = singleton_step_parked(p_net).is_some();
+    let ok = held && restarted && checked && reattach && revenant && !parked;
+    let why = if !held { "unparked" } else if !restarted { "no-restart" } else if !checked { "no-answer" } else if !revenant { "revenant-stuck" } else { "" };
+    (
+        Some(ok),
+        alloc::format!(
+            "hdaring={}{}{} reattach={} drained={} parked={} vendor={:#010x}",
+            if ok { "ok" } else { "fail" },
+            if why.is_empty() { "" } else { "/" },
+            why,
+            if reattach { "ok" } else { "fail" },
+            drained,
+            parked as u8,
+            vendor
+        ),
+    )
 }
 
 // =================================================================================================

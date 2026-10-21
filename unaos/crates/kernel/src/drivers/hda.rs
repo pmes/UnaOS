@@ -132,7 +132,7 @@ const CORBCTL_RUN: u8 = 1 << 1;
 const CORBRP_RST: u16 = 1 << 15;
 /// `RIRBCTL.RINTCTL` — Response Interrupt Control. [HDA-SPEC §3.3.29] It gates the `RIRBSTS.RINTFL`
 /// LATCH as well as the interrupt, which is why this polled driver sets it — see the measured note
-/// in [`Rings::init`]. No message reaches the CPU regardless: `INTCTL.GIE` is never written.
+/// in [`Rings::program`]. No message reaches the CPU regardless: `INTCTL.GIE` is never written.
 const RIRBCTL_RINTCTL: u8 = 1 << 0;
 /// `RIRBCTL.RIRBDMAEN` — RIRB DMA Engine Enable. [HDA-SPEC §3.3.29]
 const RIRBCTL_DMAEN: u8 = 1 << 1;
@@ -220,6 +220,9 @@ const MAX_NODES: usize = 256;
 /// eight widgets from its pin does not exist in any codec this driver has been shown; the bound is
 /// what makes a malformed or cyclic connection list a printed refusal rather than a hang.
 const MAX_PATH_DEPTH: usize = 8;
+/// HDARING (B811) M2: one verb's answer deadline — the driver's own bound (`[hda] verb TIMEOUT … bound_ms=100`), also
+/// the bound on taking the device's rings (`ring::own`). A timeout latches the device's stall (`ring::stall`).
+const VERB_BOUND_US: u64 = 100_000;
 
 // ── Bounded waits, in TSC units. Same construction as `drivers/ahci.rs` and `drivers/sdhc.rs`:
 // `arch::apic::tsc_hz()` is calibrated against the ACPI PM timer long before `pci::init` runs, and
@@ -346,19 +349,15 @@ struct Rings {
 }
 
 impl Rings {
-    /// [HDA-SPEC §4.4.1.3] CORB initialisation, and §4.4.2.2 RIRB initialisation. Both engines are
-    /// stopped first: a controller the firmware left running would otherwise fetch from a base this
-    /// function is in the middle of rewriting.
-    fn init(base: u64, a: &mut Audit) -> Option<Rings> {
-        let corb = dma_alloc(CORB_BYTES, RING_ALIGN);
-        let rirb = dma_alloc(RIRB_BYTES, RING_ALIGN);
-        if corb == 0 || rirb == 0 {
-            serial_println!(
-                "[hda] rings REFUSED reason=dma-alloc corb={:#x} rirb={:#x} — the controller is left reset and idle",
-                corb, rirb
-            );
-            return None;
-        }
+    /// HDARING (B811): the device's pair before its first allocation (`ring::own` allocates once per boot).
+    const EMPTY: Rings = Rings { base: 0, corb: 0, rirb: 0, corb_wp: 0, rirb_rp: 0, traced: false };
+
+    /// [HDA-SPEC §4.4.1.3] CORB initialisation, and §4.4.2.2 RIRB initialisation, on the device's two buffers
+    /// (HDARING B811: allocated once by `ring::own`; this is the register body `Rings::init` held). Both engines
+    /// are stopped first: a controller the firmware left running would otherwise fetch from a base this function
+    /// is in the middle of rewriting. Called only when the hardware is NOT running on these buffers (`ring::attach`).
+    fn program(&mut self, a: &mut Audit) -> bool {
+        let (base, corb, rirb) = (self.base, self.corb, self.rirb);
 
         // Stop both DMA engines before touching either base. [HDA-SPEC §3.3.22, §3.3.29]
         w8(base, REG_CORBCTL, 0);
@@ -366,7 +365,7 @@ impl Rings {
         a.ctrl += 2;
         if !wait_us(1000, || r8(base, REG_CORBCTL) & CORBCTL_RUN == 0) {
             serial_println!("[hda] rings REFUSED reason=corb-run-stuck corbctl={:#04x}", r8(base, REG_CORBCTL));
-            return None;
+            return false;
         }
 
         // CORBSIZE bits 1:0 select the entry count; bits 7:4 (CORBSZCAP) say which are legal. Bit 6
@@ -377,7 +376,7 @@ impl Rings {
                 "[hda] rings REFUSED reason=no-256-entry-corb corbsize={:#04x} (CORBSZCAP nibble={:#x}) — this driver programs only the 256-entry ring the specification's table 25 makes mandatory for a 1.0 controller",
                 corbsize, corbsize >> 4
             );
-            return None;
+            return false;
         }
         w8(base, REG_CORBSIZE, (corbsize & !0x03) | RING_SIZE_256);
         w32(base, REG_CORBLBASE, (bus_addr(corb) & 0xFFFF_FFFF) as u32);
@@ -397,7 +396,7 @@ impl Rings {
                 "[hda] rings REFUSED reason=corbrp-reset-stuck corbrp={:#06x} set-ack={}",
                 r16(base, REG_CORBRP), rp_set as u8
             );
-            return None;
+            return false;
         }
         w16(base, REG_CORBWP, 0);
         a.ctrl += 1;
@@ -427,7 +426,7 @@ impl Rings {
                 "[hda] rings REFUSED reason=no-256-entry-rirb rirbsize={:#04x} (RIRBSZCAP nibble={:#x})",
                 rirbsize, rirbsize >> 4
             );
-            return None;
+            return false;
         }
         w8(base, REG_RIRBSIZE, (rirbsize & !0x03) | RING_SIZE_256);
         w32(base, REG_RIRBLBASE, (bus_addr(rirb) & 0xFFFF_FFFF) as u32);
@@ -442,14 +441,16 @@ impl Rings {
         a.ctrl += 2;
         if !wait_us(1000, || r8(base, REG_CORBCTL) & CORBCTL_RUN != 0) {
             serial_println!("[hda] rings REFUSED reason=corb-would-not-run corbctl={:#04x}", r8(base, REG_CORBCTL));
-            return None;
+            return false;
         }
 
         serial_println!(
             "[hda] rings corb={:#x} rirb={:#x} entries=256/256 corbctl={:#04x} rirbctl={:#04x} rintcnt=1 intctl={:#010x}(untouched)",
             corb, rirb, r8(base, REG_CORBCTL), r8(base, REG_RIRBCTL), r32(base, REG_INTCTL)
         );
-        Some(Rings { base, corb, rirb, corb_wp: 0, rirb_rp: 0, traced: false })
+        self.corb_wp = 0;
+        self.rirb_rp = 0;
+        true
     }
 
     /// Issue one verb and return its 32-bit response, or `None` on timeout.
@@ -464,26 +465,22 @@ impl Rings {
         self.issue(word, a)
     }
     fn issue(&mut self, word: u32, a: &mut Audit) -> Option<u32> {
-        let next = (self.corb_wp + 1) % (CORB_ENTRIES as u16);
-        unsafe { core::ptr::write_volatile((self.corb + (next as u64) * 4) as *mut u32, word) };
-        // The CORB entry must be visible to the controller's DMA engine before WP advances. On this
-        // arch the heap is write-back and DMA is snooped, so this is a compiler/store ordering
-        // fence, not a cache flush. [TREE]
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        w16(self.base, REG_CORBWP, next);
-        a.ctrl += 1;
-        self.corb_wp = next;
+        if ring::failfast() {
+            return None; // HDARING (B811) M2: the device's ring is STALLED — no second 100 ms bound until a probe verb answers
+        }
+        self.post(word, a);
 
         let want = (self.rirb_rp + 1) % (RIRB_ENTRIES as u16);
-        // 100 ms is a deadline, not an expectation: a codec answers in microseconds. It is short
+        // 100 ms (VERB_BOUND_US) is a deadline, not an expectation: a codec answers in microseconds. It is short
         // enough that a whole widget walk against a dead codec still ends inside a boot.
-        if !wait_us(100_000, || r16(self.base, REG_RIRBWP) & 0xFF == want & 0xFF) {
+        if !wait_us(VERB_BOUND_US, || r16(self.base, REG_RIRBWP) & 0xFF == want & 0xFF) {
             serial_println!(
-                "[hda] verb TIMEOUT word={:#010x} corbwp={:#06x} corbrp={:#06x} rirbwp={:#06x} rirbsts={:#04x} corbctl={:#04x} rirbctl={:#04x} rintcnt={:#06x}",
+                "[hda] verb TIMEOUT word={:#010x} corbwp={:#06x} corbrp={:#06x} rirbwp={:#06x} rirbsts={:#04x} corbctl={:#04x} rirbctl={:#04x} rintcnt={:#06x} bound_ms={}",
                 word, r16(self.base, REG_CORBWP), r16(self.base, REG_CORBRP),
                 r16(self.base, REG_RIRBWP), r8(self.base, REG_RIRBSTS),
-                r8(self.base, REG_CORBCTL), r8(self.base, REG_RIRBCTL), r16(self.base, REG_RINTCNT)
+                r8(self.base, REG_CORBCTL), r8(self.base, REG_RIRBCTL), r16(self.base, REG_RINTCNT), VERB_BOUND_US / 1000
             );
+            ring::stall(word); // HDARING (B811) M2: the bound latches the device's stall; later verbs fail fast
             return None;
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -518,6 +515,20 @@ impl Rings {
             );
         }
         Some(resp)
+    }
+
+    /// HDARING (B811): the first half of [`Rings::issue`] — the command into the CORB at WP+1, then WP advanced.
+    /// Its answer is collected by `issue`'s wait (or, for the gatesteal2 leg's orphan, drained by `ring::attach`).
+    fn post(&mut self, word: u32, a: &mut Audit) {
+        let next = (self.corb_wp + 1) % (CORB_ENTRIES as u16);
+        unsafe { core::ptr::write_volatile((self.corb + (next as u64) * 4) as *mut u32, word) };
+        // The CORB entry must be visible to the controller's DMA engine before WP advances. On this
+        // arch the heap is write-back and DMA is snooped, so this is a compiler/store ordering
+        // fence, not a cache flush. [TREE]
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        w16(self.base, REG_CORBWP, next);
+        a.ctrl += 1;
+        self.corb_wp = next;
     }
 
     /// Stop both DMA engines. Called on every exit path so a controller this driver touched is
@@ -1105,6 +1116,12 @@ pub fn probe() {
             continue;
         }
 
+        // HDARING (B811) M1: the device's rings are taken BEFORE the controller reset, so a reset never runs under
+        // another holder's verb (a pump revenant's, a volume key's); busy past the verb bound -> this probe is skipped.
+        let Some(mut rings) = ring::own(base) else {
+            serial_println!("[hda] rings busy bound_ms={} -> probe skipped (HDARING B811: one owner of the CORB/RIRB pair)", VERB_BOUND_US / 1000);
+            continue;
+        };
         let statests = match reset(base, &mut a) {
             Some(s) => s,
             None => continue,
@@ -1126,10 +1143,9 @@ pub fn probe() {
             continue;
         }
 
-        let mut rings = match Rings::init(base, &mut a) {
-            Some(r) => r,
-            None => continue,
-        };
+        if !ring::bring_up(&mut rings, &mut a) {
+            continue;
+        }
 
         // The widget table is one node-address space per codec, reused across codecs — 256 widgets
         // of a few dozen bytes is ~14 KiB of stack if it were a local, so it is boxed on the heap.
@@ -2273,6 +2289,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 
 /// BOOTSLOW — `probe()` once, from a device-service pass, after the root pass's verdict.
 pub fn probe_after_root() {
+    if ring::parked() { return; } ring::leg_maybe(); // HDARING (B811) M3: net-hda's HDA half is off the pump while its step is parked; the gatesteal2 leg's park point (idle = one load)
     #[cfg(feature = "hda-tone")] play::service(); static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); // PLAYWAV (R75): the stream's refill tick (idle = one atomic load), LINE-NEUTRAL fold
     if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || !crate::boot::services_gate("hda") || bar_holds() { // KVMLAT2 (B576): and not before the bar's first paint (`bar_holds`, file tail). FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
         return;
@@ -2353,8 +2370,8 @@ impl Audit {
 // `vol::capture` (one same-line call at the end of `probe`, before `rings.stop`) records the controller
 // base, the codec address and each path node that declares an OUTPUT amp with its step count (amp caps
 // bits 14:8). `vol::apply(level, muted)` then issues one SET_AMPLIFIER_GAIN_MUTE per such node
-// (both channels): gain = level * steps / 16, mute bit = the mute flag. The rings are re-initialised ONCE,
-// lazily, and kept (the probe's rings were stopped); the apply runs from the device-service pass, never
+// (both channels): gain = level * steps / 16, mute bit = the mute flag. The verbs go through the device's one
+// CORB/RIRB pair (`ring::hold`, HDARING B811: re-attached, or re-programmed after the probe stopped it); the apply runs from the device-service pass, never
 // from the key decoder. Returns the number of verbs the codec answered. [HDA-SPEC §7.3.3.7, §7.3.4.12]
 pub mod vol {
     use super::*;
@@ -2365,7 +2382,6 @@ pub mod vol {
     /// Per path node: bit16 valid, bits15:8 steps, bits7:0 nid.
     const Z: AtomicU32 = AtomicU32::new(0);
     pub(super) static NODES: [AtomicU32; MAX_PATH_DEPTH] = [Z; MAX_PATH_DEPTH];
-    pub(super) static RINGS: crate::sync::Mutex<Option<Rings>> = crate::sync::Mutex::new(None);
 
     pub(super) fn capture(base: u64, walk: Option<&CodecWalk>, ws: &[Widget; MAX_NODES], rings: &mut Rings, a: &mut Audit) {
         let Some(w) = walk else { return };
@@ -2399,11 +2415,7 @@ pub mod vol {
         }
         let cad = CAD.load(Ordering::Relaxed) as u8;
         let mut a = Audit::default();
-        let mut g = RINGS.lock();
-        if g.is_none() {
-            *g = Rings::init(base, &mut a);
-        }
-        let Some(rings) = g.as_mut() else { return 0 };
+        let Some(mut rings) = super::ring::hold(base, &mut a) else { return 0 }; // HDARING (B811): the device's one pair, re-attached
         let mut ok = 0u32;
         for slot in NODES.iter() {
             let v = slot.load(Ordering::Relaxed);
@@ -2658,11 +2670,7 @@ pub fn vol_readback() -> Option<(u8, bool, u8, u8)> {
     let (nid, steps) = ((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8);
     let cad = vol::CAD.load(core::sync::atomic::Ordering::Relaxed) as u8;
     let mut a = Audit::default();
-    let mut g = vol::RINGS.lock();
-    if g.is_none() {
-        *g = Rings::init(base, &mut a);
-    }
-    let rings = g.as_mut()?;
+    let mut rings = ring::hold(base, &mut a)?; // HDARING (B811): the device's one pair, re-attached
     let word = ((cad as u32 & 0xF) << 28) | ((nid as u32) << 20) | (0xB << 16) | (1 << 15) | (1 << 13);
     let r = rings.issue(word, &mut a)?;
     let (muted, gain) = (r & 0x80 != 0, (r & 0x7F) as u8);
@@ -2704,5 +2712,281 @@ fn bar_holds() -> bool {
     #[cfg(not(all(feature = "wc", feature = "unafs")))]
     {
         false
+    }
+}
+
+// ===================== HDARING (rmbp-ledger B811) — THE DEVICE OWNS ITS ONE CORB/RIRB PAIR =====================
+//
+// Flight 37 boot 3 (docs/dev/evidence/rmbp-0915/flight37/FLIGHT37.md §7): after the first pump restart every verb
+// timed out (`[hda] verb TIMEOUT word=0x008f0009 corbwp=0x0013 corbrp=0x0000 … corbctl=0x00`, 69 of them), net-hda
+// overran PUMPWEDGE's 2 s, the pump was restarted again, 32 times. The measured cause: FOUR owners of the one pair —
+// `probe()` (fresh buffers per call, stopped at its end), `vol::RINGS` (initialised once, never re-synced),
+// `amp::svc_rings` (its own buffers, stopped after each use) and a GATESTEAL2 revenant running beside the fresh pump —
+// so a CORB one owner stopped and re-pointed was trusted as running by another. Now the DEVICE owns the pair:
+// [`own`] allocates it once per boot behind ONE lock, [`attach`] RE-ATTACHES to a pair running on its buffers (the
+// hardware's WP/RP are the truth; an orphan answer is drained and its latch acked) and programs only a pair that is
+// not running on them, and a verb's 100 ms bound (VERB_BOUND_US) latches a device stall every later verb fails fast
+// on until ONE probe verb answers (at most once per RETRY_MS). [`parked`] is net-hda's half of the pump's step park
+// (sched.rs `singleton_step_parked`, HDARING M3). Blueprint: audio.md BP-audio-19, cores.md BP-cores-20.
+
+/// CHARTER: Stria — driver (HDARING, rmbp-ledger B811): the controller's ONE command/response ring pair, owned by the device for the boot.
+pub mod ring {
+    use super::*;
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+
+    /// The pair. `corb == 0` until the first [`own`] allocates it; one controller per boot (`probe` claims one).
+    static DEV: crate::sync::Mutex<Rings> = crate::sync::Mutex::new(Rings::EMPTY);
+    /// A held pair: every `fn(.., rings: &mut Rings, ..)` takes `&mut hold` by deref.
+    pub(super) type Hold = crate::sync::MutexGuard<'static, Rings>;
+
+    /// A stalled device retries (re-program + one probe verb) at most this often.
+    const RETRY_MS: u64 = 1000;
+    static STALLED: AtomicBool = AtomicBool::new(false);
+    static EPISODE: AtomicBool = AtomicBool::new(false);
+    static STALL_T0: AtomicU64 = AtomicU64::new(0);
+    static RETRY_AT: AtomicU64 = AtomicU64::new(0);
+    static FAILFAST: AtomicU32 = AtomicU32::new(0);
+    static REATTACH: AtomicU32 = AtomicU32::new(0);
+    static DRAINED: AtomicU32 = AtomicU32::new(0);
+    static DRAINED_LAST: AtomicU32 = AtomicU32::new(0);
+
+    /// Take the device's pair, bounded by the verb bound (never an unbounded spin: a holder that does not come back —
+    /// a revenant on a dead core — costs a caller 100 ms and a skip). Allocates the two buffers on the FIRST call only.
+    /// Touches no register.
+    pub(super) fn own(base: u64) -> Option<Hold> {
+        let start = crate::arch::now_cycles();
+        let budget = cycles_us(VERB_BOUND_US);
+        let mut g = loop {
+            if let Some(g) = DEV.try_lock() {
+                break g;
+            }
+            if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+                return None;
+            }
+            core::hint::spin_loop();
+        };
+        if g.corb == 0 {
+            let corb = dma_alloc(CORB_BYTES, RING_ALIGN);
+            let rirb = dma_alloc(RIRB_BYTES, RING_ALIGN);
+            if corb == 0 || rirb == 0 {
+                serial_println!(
+                    "[hda] rings REFUSED reason=dma-alloc corb={:#x} rirb={:#x} — the controller is left reset and idle",
+                    corb, rirb
+                );
+                return None;
+            }
+            g.corb = corb;
+            g.rirb = rirb;
+        }
+        if g.base != base {
+            g.base = base;
+            g.corb_wp = 0;
+            g.rirb_rp = 0;
+        }
+        Some(g)
+    }
+
+    /// RE-ATTACH to the pair as the hardware holds it, or program it. Running on OUR buffers (CORBCTL.RUN,
+    /// RIRBCTL.DMAEN, both lower bases ours): the shadow WP/RP are re-read from CORBWP/RIRBWP — an answer that landed
+    /// after its verb's bound (a timed-out or orphaned verb) is DRAINED and counted — and RIRBSTS is acked (an unacked
+    /// RINTFL with RINTCNT=1 stops the command fetch); never a program while RUN is set on our buffers. Otherwise (a
+    /// reset's CRST, any `stop`, firmware state, bases elsewhere) [`Rings::program`] on the same buffers.
+    pub(super) fn attach(r: &mut Rings, a: &mut Audit) -> bool {
+        let b = r.base;
+        let ours = r8(b, REG_CORBCTL) & CORBCTL_RUN != 0
+            && r8(b, REG_RIRBCTL) & RIRBCTL_DMAEN != 0
+            && r32(b, REG_CORBLBASE) == (bus_addr(r.corb) & 0xFFFF_FFFF) as u32
+            && r32(b, REG_RIRBLBASE) == (bus_addr(r.rirb) & 0xFFFF_FFFF) as u32;
+        if !ours {
+            return r.program(a);
+        }
+        let hw_wp = r16(b, REG_CORBWP) & 0xFF;
+        let hw_rirb = r16(b, REG_RIRBWP) & 0xFF;
+        let n = hw_rirb.wrapping_sub(r.rirb_rp & 0xFF) & 0xFF;
+        if n != 0 {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            let v = unsafe { core::ptr::read_volatile((r.rirb + (hw_rirb as u64) * 8) as *const u32) };
+            DRAINED.fetch_add(n as u32, Relaxed);
+            DRAINED_LAST.store(v, Relaxed);
+        }
+        r.corb_wp = hw_wp;
+        r.rirb_rp = hw_rirb;
+        w8(b, REG_RIRBSTS, RIRBSTS_RINTFL | RIRBSTS_OIS);
+        a.ctrl += 1;
+        REATTACH.fetch_add(1, Relaxed);
+        true
+    }
+
+    /// `probe()`'s bring-up, after its controller reset: a reset is a fresh start, so a latched stall is cleared, then
+    /// [`attach`] (after CRST that is a program; after `amp::warm`'s no-reset path, a re-attach).
+    pub(super) fn bring_up(r: &mut Rings, a: &mut Audit) -> bool {
+        STALLED.store(false, Release);
+        EPISODE.store(false, Release);
+        attach(r, a)
+    }
+
+    /// The pair for one operation outside `probe` (`vol::apply`, `vol_readback`, `amp::svc_rings`, the step park):
+    /// [`own`] + the stall gate + [`attach`]. A stalled device answers `None` at once until RETRY_MS has passed; then
+    /// ONE recovery — re-program the same buffers, one probe verb — clears the stall when the codec answers.
+    pub(super) fn hold(base: u64, a: &mut Audit) -> Option<Hold> {
+        let mut g = own(base)?;
+        if STALLED.load(Acquire) {
+            let now = crate::arch::ms();
+            if now < RETRY_AT.load(Relaxed) {
+                FAILFAST.fetch_add(1, Relaxed);
+                return None;
+            }
+            RETRY_AT.store(now + RETRY_MS, Relaxed);
+            if !g.program(a) {
+                return None;
+            }
+            STALLED.store(false, Release); // tentatively: the probe verb's own timeout re-latches it
+            let v = g.issue(probe_word(), a)?;
+            EPISODE.store(false, Release);
+            serial_println!(
+                "[hda] ring answered after_stall_ms={} vendor={:#010x} failfast={} reattach={} drained={} (HDARING B811)",
+                now.saturating_sub(STALL_T0.load(Relaxed)), v, FAILFAST.load(Relaxed), REATTACH.load(Relaxed), DRAINED.load(Relaxed)
+            );
+            return Some(g);
+        }
+        if !attach(&mut g, a) {
+            return None;
+        }
+        Some(g)
+    }
+
+    /// `Rings::issue`'s gate: `true` (counted) while the device's stall is latched.
+    pub(super) fn failfast() -> bool {
+        if STALLED.load(Acquire) {
+            FAILFAST.fetch_add(1, Relaxed);
+            return true;
+        }
+        false
+    }
+
+    /// `Rings::issue`'s timeout: latch the device's stall (said once per episode).
+    pub(super) fn stall(word: u32) {
+        STALLED.store(true, Release);
+        if !EPISODE.swap(true, AcqRel) {
+            let now = crate::arch::ms();
+            STALL_T0.store(now, Relaxed);
+            RETRY_AT.store(now + RETRY_MS, Relaxed);
+            serial_println!(
+                "[hda] ring stalled word={:#010x} bound_ms={} -> fail-fast until a probe verb answers (retry_ms={}, HDARING B811)",
+                word, VERB_BOUND_US / 1000, RETRY_MS
+            );
+        }
+    }
+
+    /// GET_PARAMETER VENDOR_ID on the root node of the captured codec.
+    fn probe_word() -> u32 {
+        let cad = vol::CAD.load(Relaxed) & 0xF;
+        (cad << 28) | (VERB_GET_PARAMETER << 8) | PARAM_VENDOR_ID
+    }
+
+    /// ONE probe verb through [`hold`]; `None` = no captured controller, the pair busy, or no answer.
+    fn probe_verb() -> Option<u32> {
+        let base = vol::BASE.load(Relaxed);
+        if base == 0 {
+            return None;
+        }
+        let mut a = Audit::default();
+        let mut g = hold(base, &mut a)?;
+        g.issue(probe_word(), &mut a)
+    }
+
+    /// HDARING M3 — net-hda's HDA half while the pump's step park holds it (sched.rs `singleton_step_parked`): `true`
+    /// = return now (off the pump). Registers net-hda as parkable once. At `until`, ONE probe verb: answered ->
+    /// unparked; silent -> parked again.
+    pub(super) fn parked() -> bool {
+        use crate::video::lag::P_NET;
+        static REG: AtomicBool = AtomicBool::new(false);
+        if !REG.swap(true, Relaxed) {
+            crate::arch::sched::singleton_step_parkable(P_NET);
+        }
+        let Some(until) = crate::arch::sched::singleton_step_parked(P_NET) else { return false };
+        let now = crate::arch::ms();
+        if now < until {
+            return true;
+        }
+        if probe_verb().is_some() {
+            crate::arch::sched::singleton_step_unpark(P_NET);
+            false
+        } else {
+            crate::arch::sched::singleton_step_repark(P_NET, now);
+            true
+        }
+    }
+
+    // ── `tests gatesteal2` LEG 3 (sched.rs): the pump killed with a verb in flight inside net-hda ──────────────────
+    /// 0 idle, 1 post-and-park armed, 2 the fresh instance's check armed.
+    static LEG: AtomicU8 = AtomicU8::new(0);
+    /// 0 none, 1 the check's verb answered, 2 it did not.
+    static LEG_DONE: AtomicU8 = AtomicU8::new(0);
+    static LEG_DRAINED0: AtomicU32 = AtomicU32::new(0);
+    static LEG_REATTACH0: AtomicU32 = AtomicU32::new(0);
+    static LEG_VENDOR: AtomicU32 = AtomicU32::new(0);
+
+    /// The leg's park point (top of `probe_after_root`, idle = one load). Armed 1: the singleton takes the pair,
+    /// POSTS GET_PARAMETER REVISION_ID and lets the pair go WITHOUT its answer (the verb in flight), then parks
+    /// (`singleton_hold_in(P_NET)`). Armed 2: the restarted pump takes the pair (a RE-ATTACH that must drain the
+    /// orphan) and asks GET_PARAMETER VENDOR_ID.
+    pub(super) fn leg_maybe() {
+        match LEG.load(Acquire) {
+            1 => {
+                if !crate::arch::sched::singleton_hold_armed() || LEG.compare_exchange(1, 0, AcqRel, Relaxed).is_err() {
+                    return;
+                }
+                {
+                    let mut a = Audit::default();
+                    if let Some(mut g) = hold(vol::BASE.load(Relaxed), &mut a) {
+                        LEG_DRAINED0.store(DRAINED.load(Relaxed), Relaxed);
+                        LEG_REATTACH0.store(REATTACH.load(Relaxed), Relaxed);
+                        let cad = vol::CAD.load(Relaxed) & 0xF;
+                        g.post((cad << 28) | (VERB_GET_PARAMETER << 8) | PARAM_REVISION_ID, &mut a);
+                    }
+                }
+                crate::arch::sched::singleton_hold_in(crate::video::lag::P_NET);
+            }
+            2 => {
+                if LEG.compare_exchange(2, 0, AcqRel, Relaxed).is_err() {
+                    return;
+                }
+                let r = probe_verb();
+                LEG_VENDOR.store(r.unwrap_or(0), Relaxed);
+                LEG_DONE.store(if r.is_some() { 1 } else { 2 }, Release);
+            }
+            _ => {}
+        }
+    }
+
+    /// The leg runs only on a controller whose output path was captured (`vol::BASE`).
+    #[cfg(feature = "wc")]
+    pub fn leg_ready() -> bool {
+        vol::BASE.load(Relaxed) != 0
+    }
+    #[cfg(feature = "wc")]
+    pub fn leg_arm() {
+        LEG_DONE.store(0, Release);
+        LEG.store(1, Release);
+    }
+    #[cfg(feature = "wc")]
+    pub fn leg_check_arm() {
+        LEG.store(2, Release);
+    }
+    #[cfg(feature = "wc")]
+    pub fn leg_off() {
+        LEG.store(0, Release);
+    }
+    /// `(answered, reattach_ok, drained since the post, vendor)`: reattach_ok iff the pair re-attached and drained
+    /// the orphan since the post and the VENDOR_ID answer is a plausible id that is not the drained REVISION_ID.
+    #[cfg(feature = "wc")]
+    pub fn leg_result() -> (bool, bool, u32, u32) {
+        let done = LEG_DONE.load(Acquire);
+        let v = LEG_VENDOR.load(Relaxed);
+        let drained = DRAINED.load(Relaxed).wrapping_sub(LEG_DRAINED0.load(Relaxed));
+        let reat = REATTACH.load(Relaxed).wrapping_sub(LEG_REATTACH0.load(Relaxed));
+        let ok = done == 1 && reat >= 1 && drained >= 1 && v != 0 && v != u32::MAX && v != DRAINED_LAST.load(Relaxed);
+        (done == 1, ok, drained, v)
     }
 }
