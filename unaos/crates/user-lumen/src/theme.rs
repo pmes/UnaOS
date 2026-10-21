@@ -90,6 +90,14 @@ static mut RX: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
 static mut CORR: u32 = 0x5448_0000;
 /// A PrefChanged frame was met in the mailbox: the next [`due`] answers at once.
 static mut HINT: bool = false;
+/// MAILBOXKEEP (LEDGER SR177): the frames a waiting helper (`una_abi::scroll_set`, `window_raise`) met before its reply;
+/// [`due`]'s drain reads them first (`una_abi::mbox_recv`).
+static mut KEEP: una_abi::MboxKeep = una_abi::MboxKeep::new();
+
+/// This program's mailbox keep, for every `una_abi` helper that waits for a reply.
+pub fn keep() -> &'static mut una_abi::MboxKeep {
+    unsafe { &mut *core::ptr::addr_of_mut!(KEEP) }
+}
 
 /// One PREFS request; the reply body is copied into `out`. `Err` = the bus refused (or `-ENOENT`: unset).
 fn call(verb: u8, body: &[u8], out: &mut [u8]) -> Result<usize, i64> {
@@ -251,7 +259,7 @@ pub fn due(now_ms: u64) -> bool {
         }
         let rx = &mut *core::ptr::addr_of_mut!(RX);
         while SUB <= 0 { // ONEINSTANCE (B734): drained even when the subscription was refused — an OPEN_ARG still arrives
-            let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, una_abi::MRECV_NOWAIT, 0);
+            let n = una_abi::mbox_recv(rx, una_abi::MRECV_NOWAIT, keep(), sys); // MAILBOXKEEP (SR177): kept frames first, then the mailbox
             if n < BUS_HDR_LEN as i64 {
                 break; // -EAGAIN: the mailbox is empty
             }

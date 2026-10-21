@@ -1078,7 +1078,7 @@ impl App {
             return;
         }
         let rx = unsafe { &mut *core::ptr::addr_of_mut!(SV_RX) };
-        self.sv_live = una_abi::scroll_set(&want, rx, sys).unwrap_or(false);
+        self.sv_live = una_abi::scroll_set(&want, rx, theme::keep(), sys).unwrap_or(false); // MAILBOXKEEP (SR177): a frame met before the reply is kept for `theme::due`
         self.sv = want;
     }
 
@@ -3004,7 +3004,7 @@ fn raise_self() {
     }
     let rx = unsafe { &mut *core::ptr::addr_of_mut!(RAISE_RX) };
     let mut l = Line::new(b":: LUMEN: raise ");
-    match una_abi::window_raise(win as u32, rx, sys) {
+    match una_abi::window_raise(win as u32, rx, theme::keep(), sys) { // MAILBOXKEEP (SR177): other frames kept, not dropped
         Ok(true) => {
             l.put(b"given");
         }

@@ -3033,31 +3033,13 @@ pub const fn window_raise_reply(status: i64, body: &[u8]) -> Result<bool, i64> {
 
 /// RAISEVERB's ring-3 helper: ask for window `win` (the caller's own) to come forward. `sys` is the program's own
 /// syscall stub (`n, a0, a1, a2, a3 -> rc`); `rx` receives the reply (at least `BUS_HDR_LEN + 1` bytes; a frame
-/// that is not this ask's reply is skipped, as every synchronous bus client here does). `Ok(true)` = given,
+/// that is not this ask's reply is KEPT in `keep` for the program's reader, [`mbox_recv`] — MAILBOXKEEP SR177). `Ok(true)` = given,
 /// `Ok(false)` = pulsed, `Err(-errno)` = refused or the bus failed.
-pub fn window_raise(win: u32, rx: &mut [u8], sys: fn(u64, u64, u64, u64, u64) -> i64) -> Result<bool, i64> {
+pub fn window_raise(win: u32, rx: &mut [u8], keep: &mut MboxKeep, sys: fn(u64, u64, u64, u64, u64) -> i64) -> Result<bool, i64> {
     let corr = 0x5241_0000 | (win & 0xFFFF);
     let tx = window_raise_frame(win, corr);
-    let s = sys(SYS_MSEND, tx.as_ptr() as u64, tx.len() as u64, 0, 0);
-    if s != 0 {
-        return Err(s);
-    }
-    let mut tries = 0;
-    while tries < 8 {
-        tries += 1;
-        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, 0, 0);
-        if n < 0 {
-            return Err(n);
-        }
-        let n = (n as usize).min(rx.len());
-        if n < BUS_HDR_LEN || rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY || rx[6] != BUS_VERB_WINDOW_RAISE || rx[8..12] != corr.to_le_bytes() {
-            continue; // not this ask's reply
-        }
-        let status = i32::from_le_bytes([rx[12], rx[13], rx[14], rx[15]]) as i64;
-        let blen = (u32::from_le_bytes([rx[48], rx[49], rx[50], rx[51]]) as usize).min(n - BUS_HDR_LEN);
-        return window_raise_reply(status, &rx[BUS_HDR_LEN..BUS_HDR_LEN + blen]);
-    }
-    Err(EIO)
+    let (status, blen) = bus_ask(&tx, BUS_VERB_WINDOW_RAISE, corr, rx, keep, sys)?; // MAILBOXKEEP (SR177): the one wait fn
+    window_raise_reply(status, &rx[BUS_HDR_LEN..BUS_HDR_LEN + blen])
 }
 
 #[cfg(test)]
@@ -3390,32 +3372,14 @@ pub const fn input_ev_scroll(ev: u64) -> Option<(u32, u32)> {
 }
 
 /// RING3SCROLL's ring-3 helper: register `s` for the caller's own window. `sys` is the program's own syscall stub;
-/// `rx` receives the reply (at least `BUS_HDR_LEN + 1` bytes; a frame that is not this ask's reply is skipped, the
-/// [`window_raise`] shape). `Ok(true)` = the window system holds the model, `Ok(false)` = none held, `Err(-errno)` =
+/// `rx` receives the reply (at least `BUS_HDR_LEN + 1` bytes; a frame that is not this ask's reply is KEPT in
+/// `keep` for [`mbox_recv`], the [`window_raise`] shape). `Ok(true)` = the window system holds the model, `Ok(false)` = none held, `Err(-errno)` =
 /// refused or the bus failed (a kernel with no arm for the verb answers -EINVAL).
-pub fn scroll_set(s: &ScrollSet, rx: &mut [u8], sys: fn(u64, u64, u64, u64, u64) -> i64) -> Result<bool, i64> {
+pub fn scroll_set(s: &ScrollSet, rx: &mut [u8], keep: &mut MboxKeep, sys: fn(u64, u64, u64, u64, u64) -> i64) -> Result<bool, i64> {
     let corr = 0x5343_0000 | (s.win & 0xFFFF);
     let tx = scroll_set_frame(s, corr);
-    let st = sys(SYS_MSEND, tx.as_ptr() as u64, tx.len() as u64, 0, 0);
-    if st != 0 {
-        return Err(st);
-    }
-    let mut tries = 0;
-    while tries < 8 {
-        tries += 1;
-        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, 0, 0);
-        if n < 0 {
-            return Err(n);
-        }
-        let n = (n as usize).min(rx.len());
-        if n < BUS_HDR_LEN || rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY || rx[6] != BUS_VERB_SCROLL_SET || rx[8..12] != corr.to_le_bytes() {
-            continue; // not this ask's reply
-        }
-        let status = i32::from_le_bytes([rx[12], rx[13], rx[14], rx[15]]) as i64;
-        let blen = (u32::from_le_bytes([rx[48], rx[49], rx[50], rx[51]]) as usize).min(n - BUS_HDR_LEN);
-        return scroll_set_reply(status, &rx[BUS_HDR_LEN..BUS_HDR_LEN + blen]);
-    }
-    Err(EIO)
+    let (status, blen) = bus_ask(&tx, BUS_VERB_SCROLL_SET, corr, rx, keep, sys)?; // MAILBOXKEEP (SR177): the one wait fn
+    scroll_set_reply(status, &rx[BUS_HDR_LEN..BUS_HDR_LEN + blen])
 }
 
 #[cfg(test)]
@@ -3438,5 +3402,233 @@ mod ring3scroll_tests {
         let ev = input_ev_pack(INPUT_EV_SCROLL, input_ev_scroll_payload(3, 90));
         assert_eq!(input_ev_scroll(ev), Some((3, 90)));
         assert_eq!(input_ev_scroll(input_ev_pack(INPUT_EV_WHEEL, 1)), None);
+    }
+}
+
+// =================================================================================================
+// MAILBOXKEEP (LEDGER SR177; BP-ring3-19) — A HELPER THAT WAITS FOR ITS REPLY NEVER DROPS ANOTHER FRAME. SYS_MRECV pops
+// the HEAD of the caller's mailbox (its third argument knows only `MRECV_NOWAIT`; no peek, no selective receive), and
+// the kernel holds back only an OPEN_ARG while a call is in flight. A helper that waits for ITS reply therefore meets
+// whatever else is queued — a corr-0 PrefChanged push, a NOTICE ack, a late reply, an OPEN_ARG on a knob-off kernel —
+// and used to skip it, which lost it. Now every reply-waiting helper waits through ONE fn, [`bus_ask`], which KEEPS each
+// frame that is not its reply in the program's own [`MboxKeep`] (a caller-owned value: this crate stays static-free),
+// and the program's mailbox reader receives through ONE fn, [`mbox_recv`], which hands the kept frames out first, oldest
+// first, before anything still queued — so the program sees every frame, in the order the kernel queued it. The keep is
+// bounded ([`MBOX_KEEP_BYTES`], two whole frames at the ceiling); a frame that does not fit lets the OLDEST kept frame
+// go and counts it ([`MboxKeep::dropped`]) — bounded and counted, never silent. No kernel line, no new number:
+// `ABI_VERSION` stays 1. Appended at the tail so no line above moves.
+// =================================================================================================
+
+/// The keep's byte budget: two whole frames at [`BUS_FRAME_MAX`], each behind its 2-byte length.
+pub const MBOX_KEEP_BYTES: usize = 2 * (BUS_FRAME_MAX + 2);
+const _: () = assert!(MBOX_KEEP_BYTES >= BUS_FRAME_MAX + 2 && BUS_FRAME_MAX <= u16::MAX as usize);
+/// How many frames [`bus_ask`] receives before it answers `-EIO` (the helpers' bound before MAILBOXKEEP).
+pub const BUS_ASK_TRIES: usize = 8;
+
+/// One program's kept frames: a FIFO of `[len u16 LE][frame]` records, oldest at the front.
+pub struct MboxKeep {
+    buf: [u8; MBOX_KEEP_BYTES],
+    used: usize,
+    dropped: u32,
+}
+
+impl MboxKeep {
+    /// An empty keep (for a program's `static mut`).
+    pub const fn new() -> Self {
+        MboxKeep { buf: [0; MBOX_KEEP_BYTES], used: 0, dropped: 0 }
+    }
+    /// No frame is kept.
+    pub const fn is_empty(&self) -> bool {
+        self.used == 0
+    }
+    /// Kept frames a full keep let go (oldest first), since the keep was made.
+    pub const fn dropped(&self) -> u32 {
+        self.dropped
+    }
+    /// The oldest record's frame length.
+    fn head_len(&self) -> usize {
+        u16::from_le_bytes([self.buf[0], self.buf[1]]) as usize
+    }
+    /// Remove the oldest record (the rest move down).
+    fn pop_head(&mut self) {
+        let rec = 2 + self.head_len();
+        self.buf.copy_within(rec..self.used, 0);
+        self.used -= rec;
+    }
+    /// Keep `frame` at the tail (clamped to [`BUS_FRAME_MAX`]); while it does not fit the OLDEST goes, counted.
+    pub fn keep(&mut self, frame: &[u8]) {
+        let n = frame.len().min(BUS_FRAME_MAX);
+        while self.used + 2 + n > MBOX_KEEP_BYTES && self.used > 0 {
+            self.pop_head();
+            self.dropped = self.dropped.wrapping_add(1);
+        }
+        self.buf[self.used..self.used + 2].copy_from_slice(&(n as u16).to_le_bytes());
+        self.buf[self.used + 2..self.used + 2 + n].copy_from_slice(&frame[..n]);
+        self.used += 2 + n;
+    }
+    /// The oldest kept frame into `out` (at most `out.len()` bytes): `Some(length copied)`, `None` when empty.
+    pub fn take(&mut self, out: &mut [u8]) -> Option<usize> {
+        if self.used == 0 {
+            return None;
+        }
+        let n = self.head_len();
+        let m = n.min(out.len());
+        out[..m].copy_from_slice(&self.buf[2..2 + m]);
+        self.pop_head();
+        Some(m)
+    }
+}
+
+impl Default for MboxKeep {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// THE ONE WAIT: send the REQUEST `tx` and receive until the REPLY of `verb` under `corr` arrives (at most
+/// [`BUS_ASK_TRIES`] frames); every other frame is KEPT in `keep` for [`mbox_recv`]. `Ok((status, body_len))` with the
+/// reply's body at `rx[BUS_HDR_LEN..]`; `Err(-errno)` when the send or a receive failed, `Err(EIO)` after the tries.
+/// `rx` must hold a whole frame ([`BUS_FRAME_MAX`]); `sys` is the program's own syscall stub.
+pub fn bus_ask(tx: &[u8], verb: u8, corr: u32, rx: &mut [u8], keep: &mut MboxKeep, sys: fn(u64, u64, u64, u64, u64) -> i64) -> Result<(i64, usize), i64> {
+    let st = sys(SYS_MSEND, tx.as_ptr() as u64, tx.len() as u64, 0, 0);
+    if st != 0 {
+        return Err(st);
+    }
+    let mut tries = 0;
+    while tries < BUS_ASK_TRIES {
+        tries += 1;
+        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, 0, 0);
+        if n < 0 {
+            return Err(n);
+        }
+        let n = (n as usize).min(rx.len());
+        if n < BUS_HDR_LEN || rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY || rx[6] != verb || rx[8..12] != corr.to_le_bytes() {
+            keep.keep(&rx[..n]); // not this ask's reply: the program's, kept for its reader
+            continue;
+        }
+        let status = i32::from_le_bytes([rx[12], rx[13], rx[14], rx[15]]) as i64;
+        let blen = (u32::from_le_bytes([rx[48], rx[49], rx[50], rx[51]]) as usize).min(n - BUS_HDR_LEN);
+        return Ok((status, blen));
+    }
+    Err(EIO)
+}
+
+/// THE ONE READER: the oldest kept frame first (its length), else `SYS_MRECV(rx, rx.len(), flags)` (a frame length, or
+/// `-EAGAIN` under [`MRECV_NOWAIT`] on an empty mailbox, or `-errno`).
+pub fn mbox_recv(rx: &mut [u8], flags: u64, keep: &mut MboxKeep, sys: fn(u64, u64, u64, u64, u64) -> i64) -> i64 {
+    if let Some(n) = keep.take(rx) {
+        return n as i64;
+    }
+    sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, flags, 0)
+}
+
+#[cfg(test)]
+mod mailboxkeep_tests {
+    extern crate std;
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::vec::Vec;
+
+    std::thread_local! {
+        static Q: RefCell<VecDeque<Vec<u8>>> = RefCell::new(VecDeque::new());
+        static ANSWER: RefCell<u8> = RefCell::new(0);
+    }
+
+    /// A kernel-shaped frame: kind, verb, corr, status, body.
+    fn frame(kind: u8, verb: u8, corr: u32, status: i32, body: &[u8]) -> Vec<u8> {
+        let mut f = std::vec![0u8; BUS_HDR_LEN + body.len()];
+        f[0..4].copy_from_slice(&BUS_MAGIC);
+        f[4] = BUS_VERSION;
+        f[5] = kind;
+        f[6] = verb;
+        f[8..12].copy_from_slice(&corr.to_le_bytes());
+        f[12..16].copy_from_slice(&status.to_le_bytes());
+        f[48..52].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        f[BUS_HDR_LEN..].copy_from_slice(body);
+        f
+    }
+
+    /// The fake kernel: MSEND queues the request's reply BEHIND what is already queued; MRECV pops the head.
+    /// `cfg(test)`, host only: the fake's copy seam reads the helper's buffers by address, as the kernel does.
+    #[allow(unsafe_code)]
+    fn fake(n: u64, a0: u64, a1: u64, a2: u64, _a3: u64) -> i64 {
+        match n {
+            SYS_MSEND => {
+                let tx = unsafe { core::slice::from_raw_parts(a0 as *const u8, a1 as usize) };
+                let corr = u32::from_le_bytes([tx[8], tx[9], tx[10], tx[11]]);
+                let b = ANSWER.with(|a| *a.borrow());
+                Q.with(|q| q.borrow_mut().push_back(frame(BUS_KIND_REPLY, tx[6], corr, 0, &[b])));
+                0
+            }
+            SYS_MRECV => match Q.with(|q| q.borrow_mut().pop_front()) {
+                Some(f) => {
+                    let rx = unsafe { core::slice::from_raw_parts_mut(a0 as *mut u8, a1 as usize) };
+                    rx[..f.len()].copy_from_slice(&f);
+                    f.len() as i64
+                }
+                None => {
+                    assert_eq!(a2, MRECV_NOWAIT, "a blocking receive on an empty fake mailbox");
+                    EAGAIN
+                }
+            },
+            _ => ENOSYS,
+        }
+    }
+
+    fn seed(frames: &[Vec<u8>], answer: u8) {
+        Q.with(|q| *q.borrow_mut() = frames.iter().cloned().collect());
+        ANSWER.with(|a| *a.borrow_mut() = answer);
+    }
+
+    #[test]
+    fn scroll_set_keeps_a_push_queued_before_its_reply() {
+        let pref = frame(BUS_KIND_REPLY, BUS_VERB_PREF_CHANGED, 0, 0, b"system.appearance.mode\0\"dark\"");
+        let open = frame(BUS_KIND_REPLY, BUS_VERB_OPEN_ARG, 0, 0, b"a.txt");
+        seed(&[pref.clone(), open.clone()], SCROLL_SET_LIVE);
+        let mut keep = MboxKeep::new();
+        let mut rx = std::vec![0u8; BUS_FRAME_MAX];
+        let s = ScrollSet { win: 3, offset: 0, extent: 4000, viewport: (0, 3, 282, 260), line: 10, gutter: 6, ground: 0 };
+        assert_eq!(scroll_set(&s, &mut rx, &mut keep, fake), Ok(true));
+        let n = mbox_recv(&mut rx, MRECV_NOWAIT, &mut keep, fake);
+        assert_eq!(&rx[..n as usize], &pref[..]);
+        let n = mbox_recv(&mut rx, MRECV_NOWAIT, &mut keep, fake);
+        assert_eq!(open_arg_body(&rx[..n as usize]), Some(&b"a.txt"[..]));
+        assert_eq!(mbox_recv(&mut rx, MRECV_NOWAIT, &mut keep, fake), EAGAIN);
+        assert!(keep.is_empty());
+        assert_eq!(keep.dropped(), 0);
+    }
+
+    #[test]
+    fn window_raise_keeps_a_notice_ack_and_reads_in_order() {
+        let ack = frame(BUS_KIND_REPLY, BUS_VERB_NOTICE, 0, 0, &[]);
+        let late = frame(BUS_KIND_REPLY, BUS_VERB_PREF_CHANGED, 0, 0, b"system.appearance.accent\0\"blue\"");
+        seed(&[ack.clone()], WINDOW_RAISE_PULSED);
+        let mut keep = MboxKeep::new();
+        let mut rx = std::vec![0u8; BUS_FRAME_MAX];
+        assert_eq!(window_raise(7, &mut rx, &mut keep, fake), Ok(false));
+        Q.with(|q| q.borrow_mut().push_back(late.clone())); // queued after the helper returned
+        let n = mbox_recv(&mut rx, MRECV_NOWAIT, &mut keep, fake);
+        assert_eq!(&rx[..n as usize], &ack[..]); // the kept frame first ...
+        let n = mbox_recv(&mut rx, MRECV_NOWAIT, &mut keep, fake);
+        assert_eq!(&rx[..n as usize], &late[..]); // ... then the queue
+        assert_eq!(mbox_recv(&mut rx, MRECV_NOWAIT, &mut keep, fake), EAGAIN);
+    }
+
+    #[test]
+    fn a_full_keep_lets_the_oldest_go_and_counts_it() {
+        let mut keep = MboxKeep::new();
+        let big = |t: u8| frame(BUS_KIND_REPLY, BUS_VERB_NOTICE, t as u32, 0, &std::vec![t; BUS_BODY_MAX]);
+        keep.keep(&big(1));
+        keep.keep(&big(2));
+        assert_eq!(keep.dropped(), 0);
+        keep.keep(&big(3));
+        assert_eq!(keep.dropped(), 1);
+        let mut out = std::vec![0u8; BUS_FRAME_MAX];
+        assert_eq!(keep.take(&mut out), Some(BUS_FRAME_MAX));
+        assert_eq!(&out[..], &big(2)[..]);
+        assert_eq!(keep.take(&mut out), Some(BUS_FRAME_MAX));
+        assert_eq!(&out[..], &big(3)[..]);
+        assert_eq!(keep.take(&mut out), None);
     }
 }
