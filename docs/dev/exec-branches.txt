@@ -683,9 +683,9 @@ refs/heads/exec-rmbp-wcpardocs   5b1d5ad1 FOLDED-BY-HAND (this commit) 2026-10-2
 refs/heads/exec-rmbp-ehcitarget   17736895 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-mixerpump   d4b3976c FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-scrollarm64   b5737a03 FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-crawle   6f51ca22 IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-wifiauth   594cf289 IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-uacfeedback   594cf289 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-crawle   eb6e0d4c FOLDED-BY-HAND (this commit) 2026-10-21
+refs/heads/exec-rmbp-wifiauth   d139f9fd FOLDED-BY-HAND (this commit) 2026-10-21
+refs/heads/exec-rmbp-uacfeedback   4b34aa7f FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-avrcpmute   2ce57de5 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-scrollpanes   73c7e89c FOLDED-BY-HAND (this commit) 2026-10-21 (cut 10-21 from 87e82a82; the cut was not registered)
 refs/heads/exec-rmbp-ring3scrollpress   28d01e8c IN-FLIGHT cut 2026-10-21
