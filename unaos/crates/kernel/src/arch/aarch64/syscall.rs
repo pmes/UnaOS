@@ -23109,7 +23109,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "desktop_firmware")] { crate::video::dialog::bus_fulfil(hdr.verb, asid as u64, body) } #[cfg(not(feature = "desktop_firmware"))] { EINVAL } } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(ppid), asid as u64, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal_of(&ppid), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "desktop_firmware", feature = "quarry"))] { crate::video::dnd::bus_drop_get(asid as u64, body, &mut text) } #[cfg(not(all(feature = "desktop_firmware", feature = "quarry")))] { EINVAL } } una_abi::BUS_VERB_PREF_CHANGED => crate::prefs_client::subscribe_owner(asid as usize, agen, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_SCROLL_SET => bus_scroll_set(asid, body, &mut text), // PREFCHANGED (B558): verb 19 as a REQUEST registers a key prefix for this ASID (prefs_client.rs tail); LINE-NEUTRAL append. ATTRSURF (B299): the attribute verbs under the STAMPED principal. PREFS (B300): Principia's verbs over the one store. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid SCROLLARM64 (SR172): verb 28, the caller's window on wm's one scroll model (`bus_scroll_set`, file tail; x86 `busx_scroll_set`'s body); LINE-NEUTRAL fold, code before this line's first `//`.
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "desktop_firmware")] { crate::video::dialog::bus_fulfil(hdr.verb, asid as u64, body) } #[cfg(not(feature = "desktop_firmware"))] { EINVAL } } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(ppid), asid as u64, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal_of(&ppid), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "desktop_firmware", feature = "quarry"))] { crate::video::dnd::bus_drop_get(asid as u64, body, &mut text) } #[cfg(not(all(feature = "desktop_firmware", feature = "quarry")))] { EINVAL } } una_abi::BUS_VERB_PREF_CHANGED => crate::prefs_client::subscribe_owner(asid as usize, agen, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_SCROLL_SET => bus_scroll_set(asid, body, &mut text), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_WINDOW_RAISE => bus_window_raise(asid, body, &mut text), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_A11Y_TREE => crate::video::wm::a11y::bus_tree(pref_caller_in_session(ppid), body, &mut text), // PREFCHANGED (B558): verb 19 as a REQUEST registers a key prefix for this ASID (prefs_client.rs tail); LINE-NEUTRAL append. ATTRSURF (B299): the attribute verbs under the STAMPED principal. PREFS (B300): Principia's verbs over the one store. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid SCROLLARM64 (SR172): verb 28, the caller's window on wm's one scroll model (`bus_scroll_set`, file tail; x86 `busx_scroll_set`'s body); LINE-NEUTRAL fold, code before this line's first `//`. RAISEARM64 (SR175): verbs 26 and 25, x86's bodies keyed by ASID (`bus_window_raise`, file tail; `wm::a11y::bus_tree`); LINE-NEUTRAL fold, code before this line's first `//`.
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)
@@ -27716,4 +27716,37 @@ pub fn scroll_ring3_probe() -> Result<usize, &'static str> {
     bus_mbox_clear(asid);
     drop(buf);
     verdict
+}
+
+// RAISEARM64 (LEDGER SR175; BP-ring3-4, BP-video-23, BP-bar-18) — TAIL-APPENDED, so no line above moves. The aarch64 twin of
+// RAISEVERB's x86 arm (rmbp-ledger B722), under `desktop_firmware` (knob off, every statement is cfg-erased). The body names a
+// window id (`SYS_WIN_CREATE`'s), resolved under `WINDOWS` (IRQ-masked, held for the read only) to its owner, the ASID on this
+// arch; the policy is wm's one `focussteal::raise_verb`, called with `WINDOWS` released. A grant is both halves, in the order
+// every focus owner uses (`user_input_set_active`, then `wm::focus_changed`); the ring is reset only on a real focus arrival.
+
+/// The WINDOW_RAISE arm: the caller's window `body` asks for focus; the reply byte says given or pulsed.
+#[cfg(feature = "desktop_firmware")]
+fn bus_window_raise(asid: u64, body: &[u8], text: &mut alloc::vec::Vec<u8>) -> i64 {
+    let Some(win) = una_abi::window_raise_body_parse(body) else { return EINVAL };
+    let win_owner = {
+        let _irq = IrqGuard::mask_save();
+        let t = WINDOWS.lock();
+        match t.get(win as usize) {
+            Some(e) if e.owner != 0 => e.owner,
+            _ => 0,
+        }
+    };
+    match crate::video::wm::focussteal::raise_verb(asid, win_owner) {
+        Ok(given) => {
+            if given {
+                if USER_INPUT_ACTIVE.load(Ordering::Acquire) != asid {
+                    user_input_set_active(asid);
+                }
+                crate::video::wm::focus_changed(asid);
+            }
+            text.push(if given { una_abi::WINDOW_RAISE_GIVEN } else { una_abi::WINDOW_RAISE_PULSED });
+            0
+        }
+        Err(e) => e,
+    }
 }

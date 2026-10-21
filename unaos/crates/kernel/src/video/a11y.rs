@@ -6,8 +6,8 @@
 //! focus-visible ring, reduce-motion and RTL come from the rows the compositor paints."* This module is the tree.
 //!
 //! Declared at `wm.rs`'s tail with `#[path]` (fbdirect's and desktop's precedent), so it is `wm::a11y`, reads the
-//! window rows' own fields and `video/mod.rs` does not move. x86 `wc` only (the rMBP desktop; an aarch64 kernel
-//! answers the verb `-EINVAL` from its dispatcher's fall-through, the una-abi rule for a verb an arch does not build).
+//! window rows' own fields and `video/mod.rs` does not move. Both desktops (x86 `wc`, aarch64 `desktop_firmware`;
+//! RAISEARM64 LEDGER SR175): each arch's `sys_msend` dispatcher answers the verb through [`bus_tree`].
 //!
 //! THE TREE (one flat list, a parent before its children, ids 1-based in that order):
 //! * `1` the DESKTOP — the panel's rect;
