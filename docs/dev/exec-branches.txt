@@ -698,3 +698,7 @@ refs/heads/exec-rmbp-subscribekeep   65c6e794 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-raisearm64   9a1134d7 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-pihome   4ba143fc FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-mailboxkeep   acb9969b FOLDED-BY-HAND (this commit) 2026-10-21
+refs/heads/exec-rmbp-scrollservicewc   865d91a7 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-piunafs   865d91a7 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-droploops   865d91a7 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-focusarm64   865d91a7 IN-FLIGHT cut 2026-10-21
