@@ -146,7 +146,7 @@ pub(super) fn shape(f: Wsp2Frame, buttons: u8, dx: i32, dy: i32, len: usize, _id
     if !touching && s.touching {
         let ms = now.saturating_sub(s.down_ms);
         if tap_on && !s.clicked && ms <= TAP_MS && s.travel <= TAP_TRAVEL_PX {
-            let b = if sec_on && s.max_f >= 2 { 0x02 } else { 0x01 };
+            let b = tap_button(s.max_f, sec_on); // TRACKPADMT (B818): the tap map, named so `tests trackpadmt` reads the same rule
             evs[ne] = Some(Event::Button(b)); ne += 1;
             evs[ne] = Some(Event::Button(0x00)); ne += 1;
             let mf = s.max_f;
@@ -164,4 +164,10 @@ pub(super) fn shape(f: Wsp2Frame, buttons: u8, dx: i32, dy: i32, len: usize, _id
         }
     }
     (out_btn, ox, oy)
+}
+
+/// TRACKPADMT (rmbp-ledger B818) — a tap's button from the most CONTACTS seen during the touch: two or more is the
+/// secondary click (when the pane allows it), else the primary. Pure; `shape` and `tests trackpadmt` both call it.
+pub(super) fn tap_button(max_f: u8, sec_on: bool) -> u8 {
+    if sec_on && max_f >= 2 { 0x02 } else { 0x01 }
 }

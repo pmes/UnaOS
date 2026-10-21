@@ -324,7 +324,7 @@ fn ensure_brightfloor() {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", crate::video::lidsleep::sleep_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("usbsuspend", usbsuspend_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))] register("ehci", ehci_hub_selftest); } // EHCIHUBDISC (B801): `tests ehci` (the file-tail fn; the hub status-change leg). USBSUSPEND (B766): `tests usbsuspend` (the file-tail fn; same gate as `sleep`). AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
+        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", crate::video::lidsleep::sleep_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("usbsuspend", usbsuspend_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))] register("ehci", ehci_hub_selftest); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] register("trackpadmt", trackpadmt_selftest); } // TRACKPADMT (B818): `tests trackpadmt` (the file-tail fn; the Wellspring contacts KAT). EHCIHUBDISC (B801): `tests ehci` (the file-tail fn; the hub status-change leg). USBSUSPEND (B766): `tests usbsuspend` (the file-tail fn; same gate as `sleep`). AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
     }
 }
 
@@ -6228,3 +6228,11 @@ static ARG2: crate::sync::Mutex<Option<alloc::string::String>> = crate::sync::Mu
 fn arg2_set(a: Option<&str>) { *ARG2.lock() = a.map(alloc::string::String::from); }
 #[cfg(feature = "wifi10")]
 pub fn arg2() -> Option<alloc::string::String> { ARG2.lock().clone() }
+
+/// TRACKPADMT (rmbp-ledger B818, BP-input-20) — TAIL-APPENDED: `tests trackpadmt` (R80: registered, never at boot). The
+/// Wellspring TYPE2 contacts KAT: flight 37's TPRAW2 frame and frames derived from it through the live route
+/// (`ehci::mtreport::selftest`). QEMU has no pad: the KAT is the leg, metal is the measure.
+#[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
+fn trackpadmt_selftest() {
+    crate::drivers::ehci::mtreport::selftest();
+}

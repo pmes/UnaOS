@@ -14230,7 +14230,7 @@ impl Controller {
                                         idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, finemotion::Scale, TP_MT_CURVE_KNEE, e.tp.mt_frames
                                     );
                                 }
-                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); crate::hidstall::note_button_edge(press, release); if f.fingers > 0 && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=vendor ep={} fingers={} mover={} x={} y={} dx={} dy={} buttons={:#04x} frames={} ids=02:{},44:{},other:{} (HIDSTALL2: one line per 10 s while a finger is down)", idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, buttons, e.tp.mt_frames, e.tp.n[0], e.tp.n[1], e.tp.n[2]); tp_stream_row(idx, e.isr_slot, e.qh, e.tp.mt_frames, self.op); } crate::pointerfeel::note(now_ms, true, f.fingers > 0); // POINTERFEEL (B535): the vendor frame counted for `tests pointerfeel` (LINE-NEUTRAL append, code first). HIDSTALL2 (B509): as the 0x02 arm — the edge's push time, and `[tp] mt` back on the serial wire at one line per 10 s
+                                let (press, release) = e.note_buttons(buttons, dx != 0 || dy != 0, idx); crate::hidstall::note_button_edge(press, release); if f.fingers > 0 && crate::hidstall::tp_wire_due(crate::arch::ms()) { serial_println!("[tp] mt route=vendor ep={} fingers={} mover={} x={} y={} dx={} dy={} buttons={:#04x} frames={} ids=02:{},44:{},other:{} records={} parsed={} layout=type2 (HIDSTALL2: one line per 10 s while a finger is down; TRACKPADMT B818: fingers= counts contacts, records= the header's nfinger)", idx, f.fingers, e.tp.mt_mover, f.x0, f.y0, dx, dy, buttons, e.tp.mt_frames, e.tp.n[0], e.tp.n[1], e.tp.n[2], report.get(WSP2_NFINGER_OFF).copied().unwrap_or(0), e.tp.mt_frames); tp_stream_row(idx, e.isr_slot, e.qh, e.tp.mt_frames, self.op); } crate::pointerfeel::note(now_ms, true, f.fingers > 0); // POINTERFEEL (B535): the vendor frame counted for `tests pointerfeel` (LINE-NEUTRAL append, code first). HIDSTALL2 (B509): as the 0x02 arm — the edge's push time, and `[tp] mt` back on the serial wire at one line per 10 s
                                 crate::pal::push_pointer_report(
                                     if dx != 0 || dy != 0 {
                                         Some(crate::pal::Event::Mouse { x: dx, y: dy })
@@ -17558,7 +17558,7 @@ impl TpCensus {
             let p0 = (f.x0, -f.y0); let now_ms = crate::arch::ms(); let gap_ms = now_ms.saturating_sub(self.mt_ms); self.mt_ms = now_ms; // POINTERSCALE (B540): the silence since the last touching frame (a stream hole, or a re-touch whose lift frame never came). LINE-NEUTRAL fold, code first.
             let two = f.fingers >= 2 && f.touch1 != 0;
             let was_two = self.mt_prev1.is_some();
-            let mut prev = self.mt_prev;
+            let mut prev = if two && !was_two { self.mt_res = (0, 0); None } else { self.mt_prev }; // TRACKPADMT (B818): a 1->2 contact step re-baselines, as 2->1 does below (wsp.c: "Ignore movement if ntouch changed") — the new contact may hold slot 0
             let mut cur = p0;
             if two {
                 // TPDRAG (B219): the mover is the finger whose delta is larger this frame; ties keep the last mover.
@@ -17625,9 +17625,9 @@ fn tp_census_rollup(e: &mut IntEp, idx: usize, now_ms: u64) {
     let f1 = e.tp.first_len[1] as usize;
     let f2 = e.tp.first_len[2] as usize;
     crate::bootlog_println!(
-        ":: EHCI-HID: [{}] [tp] ids=02:{},44:{},other:{} sizes={}/{} first_bytes=02[{}] 44[{}] other[{}] == witness ::",
+        ":: EHCI-HID: [{}] [tp] ids=02:{},44:{},other:{} parsed={} layout=type2 sizes={}/{} first_bytes=02[{}] 44[{}] other[{}] == witness ::",
         idx,
-        e.tp.n[0], e.tp.n[1], e.tp.n[2],
+        e.tp.n[0], e.tp.n[1], e.tp.n[2], e.tp.mt_frames,
         if e.tp.min_len == u16::MAX { 0 } else { e.tp.min_len },
         e.tp.max_len,
         tp_hex(&mut h0, &e.tp.first[0][..f0]),
@@ -17679,7 +17679,7 @@ fn trackpad_dispatch(report: &[u8]) -> TpRoute {
             }
         }
         _ => match decode_wellspring_type2(report) {
-            Some(f) => TpRoute::Vendor(f),
+            Some(f) => TpRoute::Vendor(mtreport::contacts(report, f)), // TRACKPADMT (B818): the frame every consumer reads is its CONTACTS (touch_major >= 50), never the header's nfinger records
             None => TpRoute::None,
         },
     }
@@ -20838,5 +20838,148 @@ pub mod intpool {
             }
             back
         }
+    }
+}
+
+/// TRACKPADMT (rmbp-ledger B818, BP-input-20; FLIGHT37 §3.1/§3.5) — the Wellspring TYPE2 frame's CONTACTS. Tail append.
+/// `decode_wellspring_type2` names the header's `nfinger` records; flight 37's one raw frame (`:: TPRAW2:` at 19:02:28Z)
+/// carries a finger (record 0, `touch_major` 423) AND a bottom-edge record that is not a finger (record 1: origin 0,
+/// abs -4746/-126, rel 0, `touch_major` 46). Counted by index, such records read one finger as 3/4/7, hand the pointer
+/// a still point or a cross-record jump (`clamped=`, `moved=` frozen), make a one-finger tap button 2 and a one-finger
+/// click secondary. [`contacts`] keeps only the records in contact, the frame every consumer then reads.
+pub mod mtreport {
+    //! CHARTER: Kernel — driver (the Wellspring TYPE2 frame's contacts: which records are fingers on the pad; TRACKPADMT B818).
+    //!
+    //! RULE (cleanroom: FreeBSD `sys/dev/usb/input/wsp.c`, BSD-2-Clause, the provenance the WSP2_* table cites; the
+    //! GPLv2 Linux driver is not consulted): a record is a CONTACT when its `touch_major` is at least wsp's
+    //! `pressure_touch_threshold` (50) — the value wsp compares `touch_major` against before it moves anything. The
+    //! wire agrees: fingers read 231..423 (flight 12's corpus 234/231/243, flight 37's TPRAW2 423), the edge records
+    //! 34/45 (flight 12, x=5280) and 46 (flight 37).
+    use super::{read_le16, tpgest, trackpad_dispatch, TpCensus, TpRoute, Wsp2Frame};
+    use super::{WSP2_BUTTON_OFF, WSP2_FSIZE, WSP2_F_ABS_X, WSP2_F_ABS_Y, WSP2_F_TOUCH_MAJOR, WSP2_HDR_LEN, WSP2_NFINGER_OFF};
+
+    /// wsp.c `wsp_tuning.pressure_touch_threshold`: the least `touch_major` of a record in contact.
+    pub(super) const CONTACT_TOUCH_MIN: i32 = 50;
+
+    /// The decoded frame `f` (its `fingers` = the records the decoder bounded) with `fingers` = the CONTACTS among
+    /// them and records 0/1 = the first two contacts in record order. Total: every read is `read_le16`; a record the
+    /// frame cannot hold ends the walk.
+    pub(super) fn contacts(frame: &[u8], f: Wsp2Frame) -> Wsp2Frame {
+        let mut out = Wsp2Frame { fingers: 0, button: f.button, x0: 0, y0: 0, touch0: 0, x1: 0, y1: 0, touch1: 0 };
+        for i in 0..f.fingers as usize {
+            let r = WSP2_HDR_LEN + i * WSP2_FSIZE;
+            let rd = |o: usize| read_le16(frame, r + o).map(|v| v as i16 as i32);
+            let (Some(x), Some(y), Some(t)) = (rd(WSP2_F_ABS_X), rd(WSP2_F_ABS_Y), rd(WSP2_F_TOUCH_MAJOR)) else { break };
+            if t < CONTACT_TOUCH_MIN {
+                continue;
+            }
+            match out.fingers {
+                0 => { out.x0 = x; out.y0 = y; out.touch0 = t; }
+                1 => { out.x1 = x; out.y1 = y; out.touch1 = t; }
+                _ => {}
+            }
+            out.fingers = out.fingers.saturating_add(1);
+        }
+        out
+    }
+
+    /// Flight 37's TPRAW2 frame, verbatim (86 B: header, the finger, the edge record).
+    const K1: [u8; 86] = [
+        0x74, 0xe8, 0x1c, 0x03, 0x1b, 0xa4, 0x06, 0x00, 0x00, 0x01, 0x07, 0x97, 0x38, 0x00, 0x02, 0x00,
+        0x10, 0x01, 0x00, 0x00, 0xfc, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x04, 0x02, 0x01,
+        0x9c, 0x04, 0xc4, 0x0a, 0xd2, 0xff, 0x33, 0x00, 0x62, 0x04, 0x0c, 0x04, 0x00, 0x40, 0xa7, 0x01,
+        0x99, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x01, 0x00, 0x00, 0x76, 0xed, 0x82, 0xff,
+        0x00, 0x00, 0x00, 0x00, 0xd0, 0x02, 0x91, 0x02, 0x53, 0x47, 0x2e, 0x00, 0x6c, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x18, 0x10,
+    ];
+
+    /// `n` records (each a copy of K1's record `src[k]`) behind K1's header, with `nfinger`/`wLength` set to match.
+    fn frame(src: &[usize], buf: &mut [u8; WSP2_HDR_LEN + 3 * WSP2_FSIZE]) -> usize {
+        buf[..WSP2_HDR_LEN].copy_from_slice(&K1[..WSP2_HDR_LEN]);
+        for (k, &s) in src.iter().enumerate() {
+            let (d, o) = (WSP2_HDR_LEN + k * WSP2_FSIZE, WSP2_HDR_LEN + s * WSP2_FSIZE);
+            buf[d..d + WSP2_FSIZE].copy_from_slice(&K1[o..o + WSP2_FSIZE]);
+        }
+        buf[WSP2_NFINGER_OFF] = src.len() as u8;
+        buf[12] = (src.len() * WSP2_FSIZE) as u8; // wLength
+        buf[13] = 0;
+        WSP2_HDR_LEN + src.len() * WSP2_FSIZE
+    }
+
+    /// Write a record's abs_x / abs_y in place.
+    fn place(buf: &mut [u8], rec: usize, x: i16, y: i16) {
+        let r = WSP2_HDR_LEN + rec * WSP2_FSIZE;
+        buf[r + WSP2_F_ABS_X..r + WSP2_F_ABS_X + 2].copy_from_slice(&x.to_le_bytes());
+        buf[r + WSP2_F_ABS_Y..r + WSP2_F_ABS_Y + 2].copy_from_slice(&y.to_le_bytes());
+    }
+
+    fn vendor(fr: &[u8]) -> Option<Wsp2Frame> {
+        match trackpad_dispatch(fr) {
+            TpRoute::Vendor(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// TRACKPADMT KAT (`tests trackpadmt`, R80: registered, never at boot). QEMU has no Wellspring pad: the frames are
+    /// flight 37's TPRAW2 capture (K1) and frames derived from it, fed through the LIVE route (`trackpad_dispatch`,
+    /// `TpCensus::mt_step`, `tpgest::tap_button`). GO-RED: return `f` unchanged from [`contacts`] -> `-> FAIL`.
+    pub fn selftest() {
+        let raw = super::decode_wellspring_type2(&K1).map_or(0, |f| f.fingers);
+        let k1 = vendor(&K1);
+        let k1_ok = k1.map_or(false, |f| f.fingers == 1 && f.x0 == 1180 && f.y0 == 2756 && f.touch0 == 423 && f.touch1 == 0);
+        // K2: the edge record first (flight 37's `fingers=3 x=-4218 y=-147` shape).
+        let mut b2 = [0u8; WSP2_HDR_LEN + 3 * WSP2_FSIZE];
+        let n2 = frame(&[1, 0], &mut b2);
+        let k2 = vendor(&b2[..n2]);
+        let swapped = k2.map_or(false, |f| f.fingers == 1 && f.x0 == 1180 && f.y0 == 2756);
+        // K3: 114 B (the flight's `len=114`): edge, the finger moved +30/+12, edge.
+        let mut b3 = [0u8; WSP2_HDR_LEN + 3 * WSP2_FSIZE];
+        let n3 = frame(&[1, 0, 1], &mut b3);
+        place(&mut b3, 1, 1180 + 30, 2756 + 12);
+        let k3 = vendor(&b3[..n3]);
+        let three = n3 == 114 && k3.map_or(false, |f| f.fingers == 1 && f.x0 == 1210 && f.y0 == 2768);
+        // Motion K1 -> K3: the finger's own abs delta, y negated (mt_step's orientation), through the curve.
+        let mut c = TpCensus::EMPTY;
+        let (mut d, mut jump) = ((0, 0), true);
+        if let (Some(a), Some(b)) = (k1, k3) {
+            let _ = c.mt_step(a);
+            let (_, dx, dy, _) = c.mt_step(b);
+            let mut res = (0, 0);
+            let (want, _) = super::finemotion::step2((30, -12), &mut res);
+            d = (dx, dy);
+            jump = (dx, dy) != want || c.mt_last.0 != 30 || c.mt_last.1 != -12;
+        }
+        // K4: a click with the edge record present is ONE contact (tpgest: n < 2 -> the primary press).
+        let mut b4 = K1;
+        b4[WSP2_BUTTON_OFF] = 0x01;
+        let press = vendor(&b4).map_or(false, |f| f.fingers == 1 && f.button != 0);
+        // K5: the lift (header only).
+        let mut b5 = [0u8; WSP2_HDR_LEN + 3 * WSP2_FSIZE];
+        let n5 = frame(&[], &mut b5);
+        let lift = vendor(&b5[..n5]).map_or(255, |f| f.fingers);
+        // Tap: the most contacts over the touch is the tap's button.
+        let max_f = [k1, k2, k3].iter().flatten().map(|f| f.fingers).max().unwrap_or(0);
+        let tap = tpgest::tap_button(max_f, true);
+        let tap2 = tpgest::tap_button(2, true);
+        // 1 -> 2 contacts with the new finger in slot 0 (a copy of the finger 2000 units away): moves nothing.
+        let mut b6 = [0u8; WSP2_HDR_LEN + 3 * WSP2_FSIZE];
+        let n6 = frame(&[0, 0], &mut b6);
+        place(&mut b6, 0, 1180 - 2000, 2756);
+        let mut c2 = TpCensus::EMPTY;
+        let rebase12 = match (k1, vendor(&b6[..n6])) {
+            (Some(a), Some(b)) if b.fingers == 2 => {
+                let _ = c2.mt_step(a);
+                let (_, dx, dy, _) = c2.mt_step(b);
+                dx == 0 && dy == 0
+            }
+            _ => false,
+        };
+        let ok = raw == 2 && k1_ok && swapped && three && !jump && press && lift == 0 && tap == 1 && tap2 == 2 && rebase12;
+        let w = |b: bool| if b { "ok" } else { "FAIL" };
+        serial_println!(
+            ":: TRACKPADMT: raw={} contacts={} swapped={} three={} d={}/{} jump={} press={} lift={} tap={} tap2={} rebase12={} -> {} ::",
+            raw, k1.map_or(0, |f| f.fingers), w(swapped), w(three), d.0, d.1, if jump { "yes" } else { "no" },
+            if press { "primary" } else { "FAIL" }, lift, tap, tap2, w(rebase12), if ok { "PASS" } else { "FAIL" }
+        );
     }
 }
