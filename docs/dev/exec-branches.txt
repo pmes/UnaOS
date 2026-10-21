@@ -654,7 +654,7 @@ refs/heads/exec-rmbp-orinsupchar    82432432 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-undodocs       677f3802 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-lockchanged    c68b67f0 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-hwtab2         ba1c1b81 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-fsearchicons   5582f4a8 IN-FLIGHT cloud wave36 FSEARCHICONS
+refs/heads/exec-rmbp-fsearchicons   e05221f9 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-sbcframe       6f79b4d5 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-orinrepeat     76408458 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-openargqueue   fc4fba86 FOLDED-BY-HAND (this commit) 2026-10-21
@@ -670,3 +670,4 @@ refs/heads/exec-rmbp-sdpserver      abc14cd7 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-wcpar2         8ab5da61 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-gateneutral    742c45e8 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-ring3undo      d79e8dfa IN-FLIGHT cloud wave36 RING3UNDO
+refs/heads/exec-rmbp-crawld         c542e05c FOLDED-BY-HAND (this commit) 2026-10-21 CRAWLD (crawl D fixes)
