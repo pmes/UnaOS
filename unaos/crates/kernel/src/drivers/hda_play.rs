@@ -10,6 +10,11 @@
 //! BCIS latch reaches no CPU — HDASIE is a latch experiment) and refills each entry as it completes.
 //! Internally the stream is ALWAYS 16-bit stereo: `feed()` widens 8-bit and duplicates mono, and resamples by
 //! nearest-sample to 48 kHz when the codec's PCM-rates word (or the format readback) refuses the rate.
+//!
+//! SINKALL (rmbp-ledger B767): the stream above has ONE client — the mixer (`audio::mixer`'s HDA output, through the
+//! ring-3 door at the tail); `start` / `feed` / `finish` are private to this file and reached only from that door. The
+//! Player (a WAV, a coded file, the video player's sound through `play-dec`) and the alert are mixer SOURCES (the
+//! "THE PLAYER'S SOURCE" section): the sink the person chose — HDA, USB or Bluetooth — is the only writer of a speaker.
 use super::tone::*;
 use super::*;
 use alloc::collections::VecDeque;
@@ -27,7 +32,7 @@ const FIFO_CAP: usize = 2 * RING_BYTES;
 static REQ_RATE: AtomicU32 = AtomicU32::new(0);
 static RING_ADDR: AtomicU64 = AtomicU64::new(0);
 static BDL_ADDR: AtomicU64 = AtomicU64::new(0);
-static ACTIVE: AtomicBool = AtomicBool::new(false); // cheap idle test for `service()`
+static ACTIVE: AtomicBool = AtomicBool::new(false); // cheap idle test for `service()`: the HDA ring is armed (SINKALL: the Player's own flag is PLAY_LIVE)
 
 struct St {
     armed: bool, running: bool, ended: bool, done: bool,
@@ -135,11 +140,12 @@ pub(super) fn gate(base: u64, sd: u64, iss: u8, rings: &mut Rings, cad: u8, path
 
 /// Begin a stream of `rate` Hz / `channels` / `bits` source samples. Returns the EFFECTIVE codec rate
 /// (equal to `rate` unless it is being resampled to 48 kHz). The stream starts once `feed()` primes the ring.
-pub fn start(rate: u32, channels: u8, bits: u8) -> Result<u32, &'static str> {
+/// SINKALL: called only by the ring-3 door's tick (`r3_tick`), i.e. for the mixer.
+fn start(rate: u32, channels: u8, bits: u8) -> Result<u32, &'static str> {
     if !(8_000..=48_000).contains(&rate) { return Err("rate outside 8000..48000"); }
     if channels != 1 && channels != 2 { return Err("channels must be 1 or 2"); }
     if bits != 8 && bits != 16 { return Err("bits must be 8 or 16"); }
-    stop(); EPOCH.fetch_add(1, Ordering::AcqRel); // STRIAMETAL (B618): every stream `start` arms is a new epoch, so a ring-3 stream sees the kernel player take the output (file tail). LINE-NEUTRAL fold.
+    stream_stop(); EPOCH.fetch_add(1, Ordering::AcqRel); // STRIAMETAL (B618): every stream `start` arms is a new epoch, so a ring-3 stream sees the kernel player take the output (file tail). LINE-NEUTRAL fold.
     *ST.lock() = { let mut s = St::new(); s.src_rate = rate; s.src_ch = channels as usize; s.src_bits = bits as usize; s };
     REQ_RATE.store(rate, Ordering::Release);
     TONE_NOW.store(true, Ordering::Relaxed);
@@ -156,7 +162,7 @@ pub fn start(rate: u32, channels: u8, bits: u8) -> Result<u32, &'static str> {
 
 /// Queue source-format PCM bytes. Returns the bytes accepted: all of them, or 0 when the ring's FIFO has no
 /// room yet (retry on the next tick). Format conversion and nearest-sample resampling happen here.
-pub fn feed(data: &[u8]) -> usize {
+fn feed(data: &[u8]) -> usize {
     let mut s = ST.lock();
     if !s.armed || s.ended || data.is_empty() { return 0; }
     let fin = s.src_ch * s.src_bits / 8;
@@ -189,18 +195,26 @@ pub fn feed(data: &[u8]) -> usize {
 }
 
 /// The producer has no more bytes: the ring drains to silence and the stream stops itself.
-pub fn finish() { ST.lock().ended = true; }
+fn finish() { ST.lock().ended = true; }
 
-/// Stop the stream now (idempotent).
+/// The PLAYER's stop (idempotent): its mixer source closes now, and the WAV / coded play state goes with it. The HDA
+/// stream is the mixer's and is left alone (SINKALL: the stop split — a re-armed output never ends a play).
 pub fn stop() {
+    let _ = src_close();
+    PAUSED.store(false, Ordering::Release);
+    PLAY_LIVE.store(false, Ordering::Release);
+    *WAV.lock() = None; *CODED.lock() = None;
+}
+
+/// SINKALL: the HDA STREAM's stop (idempotent) — its one client is the mixer's door (`start`, `r3_end`, `r3_tick`).
+fn stream_stop() {
     {
         let mut s = ST.lock();
         if s.armed { hw_stop(&mut s); }
         s.armed = false; s.running = false; s.done = true;
     }
-    PAUSED.store(false, Ordering::Release); super::amp::amp_release(super::amp::PLAY); // AUDIO8 (B329): idempotent — a stop with nothing armed still closes the owner bit
+    super::amp::amp_release(super::amp::PLAY); // AUDIO8 (B329): idempotent — a stop with nothing armed still closes the owner bit
     ACTIVE.store(false, Ordering::Release);
-    *WAV.lock() = None; *CODED.lock() = None; // after the ST guard drops: wav_pump takes WAV then ST, so never the other order
 }
 
 fn hw_stop(s: &mut St) {
@@ -228,7 +242,7 @@ fn refill(s: &mut St, i: usize, prefill: bool) {
 }
 
 fn ring_pump(s: &mut St) {
-    if !s.armed || s.done || PAUSED.load(Ordering::Acquire) { return; } // PLAYER (B419): a paused stream is left alone (RUN is clear)
+    if !s.armed || s.done { return; } // SINKALL: the Player's pause holds its mixer source; the stream keeps running
     let (b, sd) = (s.base, s.sd);
     if !s.running {
         // AUDIO7 M3: start once a whole ring is queued, OR the producer is done, OR another chunk could not fit.
@@ -309,14 +323,14 @@ pub fn open_wav(path: &str) -> Result<(), String> {
         Ok(w) => w,
         Err(r) => { return open_coded(path, r); }
     };
-    let eff = match start(w.rate, w.ch as u8, w.bits as u8) {
+    let eff = match src_open("player", w.rate, w.ch as u8, w.bits as u8) {
         Ok(e) => e,
         Err(r) => { serial_println!(":: PLAYWAV: path={} reason={} -> REFUSED ::", path, r); return Err(String::from(r)); }
     };
     serial_println!("[play] route type={} via=riff dec=pcm rate={} ch={}", crate::fs::filetype::type_of(path).0, w.rate, w.ch); // SOUNDOPENERS (B500) M2: a PCM RIFF is read directly — no demuxer
     serial_println!("[play] open path={} rate={} ch={} bits={} bytes={} chunk={} eff_rate={} resampled={}", path, w.rate, w.ch, w.bits, w.data_len, w.chunk, eff, (eff != w.rate) as u8);
     *WAV.lock() = Some(w);
-    ACTIVE.store(true, Ordering::Release);
+    PLAY_LIVE.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -325,43 +339,43 @@ fn wav_pump() {
         let mut g = WAV.lock();
         let Some(w) = g.as_mut() else { return };
         if w.fed_end { return; }
-        if w.pos >= w.data_len { w.fed_end = true; drop(g); finish(); return; }
+        if w.pos >= w.data_len { w.fed_end = true; drop(g); src_end(); return; }
         let n = (w.data_len - w.pos).min(w.chunk as u64) as usize;
         let data = crate::shell::vfs_mount_table().read(&w.path, w.data_off + w.pos, n);
         match data {
             Ok(d) if !d.is_empty() => {
-                if feed(&d) == 0 { return; } // no room: retry next tick
-                w.pos += d.len() as u64;
+                let took = src_feed(&d); // SINKALL: the Player's mixer source takes whole frames, maybe fewer than read
+                if took == 0 { return; } // no room: retry next tick
+                w.pos += took as u64;
             }
             _ => { serial_println!("[play] read error at pos={} — ending the stream", w.pos); w.pos = w.data_len; }
         }
     }
 }
 
-fn report() {
+/// The WAV play's verdict, judged on its mixer source's final account (SINKALL): every frame written, played out by
+/// `sink`, no underrun.
+fn report(p: &crate::audio::mixer::Played, sink: &str) {
     let w = WAV.lock().take();
     let Some(w) = w else { return };
-    let s = ST.lock();
-    let frames = s.in_frames;
+    let frames = p.written;
     let want = (w.data_len - w.start) / (w.ch * w.bits / 8) as u64; // PLAYER (B419): a seek starts the stream at `start`
     let ms = frames * 1000 / w.rate as u64;
-    let ok = frames == want && s.underruns == 0 && s.err == 0 && s.completed >= 1 && s.lpib_moved && s.done;
-    serial_println!("[play] done resampled={} eff_rate={} entries={} fifoe_dese={} run_bit={} lpib_moved={} level={}", s.resampled as u8, s.eff_rate, s.completed, s.err, s.run_bit as u8, s.lpib_moved as u8, s.level);
-    // AUDIO7 M4: `done=` is the ring's own drain (LPIB walked past the last data entry and every entry refilled with silence).
-    serial_println!(":: PLAYWAV: path={} rate={} frames={} lpib_moved={} done={} -> {} :: ch={} bits={} secs={}.{} under={} ::", w.path, w.rate, frames, s.lpib_moved as u8, s.done as u8, if ok { "PASS" } else { "FAIL" }, w.ch, w.bits, ms / 1000, (ms % 1000) / 100, s.underruns);
+    let ok = frames == want && p.underruns == 0 && p.drained;
+    serial_println!("[play] done source=player sink={} written={} played={} underruns={} drained={}", sink, p.written, p.played, p.underruns, p.drained as u8);
+    serial_println!(":: PLAYWAV: path={} rate={} frames={} played={} done={} -> {} :: ch={} bits={} secs={}.{} under={} sink={} ::", w.path, w.rate, frames, p.played, p.drained as u8, if ok { "PASS" } else { "FAIL" }, w.ch, w.bits, ms / 1000, (ms % 1000) / 100, p.underruns, sink);
 }
 
 /// The service tick (folded at the top of `probe_after_root`): latched opens, file pump, ring refill.
 pub fn service() {
     super::amp::tick(); // AUDIO8 (B329) M1: the amp's idle hold-off (idle cost: one atomic load)
-    if ALERT.load(Ordering::Acquire) { alert_play(); } // NOTIFYPANE (B435): a latched alert sound (idle cost: one atomic load)
+    if ALERT.load(Ordering::Acquire) { alert_play(); } if ALERT_SRC.load(Ordering::Acquire) != 0 { alert_poll(); } // NOTIFYPANE (B435): a latched alert sound (idle cost: one atomic load); SINKALL: the sounding alert's source closed once drained
     if TQ_LIVE.load(Ordering::Acquire) { tq_tick(); } if R3_LIVE.load(Ordering::Acquire) { r3_tick(); } // STRIAMETAL (B618): the ring-3 stream's arm and its owner's reap (idle cost: one atomic load; file tail; LINE-NEUTRAL append, code before this comment). DECJOBHANG M3: `tests play`'s queue (idle cost: one atomic load)
-    if !ACTIVE.load(Ordering::Acquire) { return; }
+    if !ACTIVE.load(Ordering::Acquire) && !PLAY_LIVE.load(Ordering::Acquire) { return; }
     if let Some(p) = PENDING.try_lock().and_then(|mut g| g.take()) { let _ = open_wav(&p); }
-    wav_pump(); coded_pump();
+    wav_pump(); coded_pump(); play_poll();
     let fin = { let Some(mut s) = ST.try_lock() else { return }; ring_pump(&mut s); s.done && s.armed };
     if fin {
-        report(); coded_report();
         let mut s = ST.lock();
         s.armed = false;
         ACTIVE.store(false, Ordering::Release);
@@ -369,7 +383,7 @@ pub fn service() {
 }
 
 /// Quarry: latch a `.WAV` open for the next tick (click-router stack depth).
-pub fn request_open(path: &str) { *PENDING.lock() = Some(String::from(path)); ACTIVE.store(true, Ordering::Release); }
+pub fn request_open(path: &str) { *PENDING.lock() = Some(String::from(path)); PLAY_LIVE.store(true, Ordering::Release); }
 
 /// `play <path.wav>` / `play stop`. `path` is the cwd-resolved argument.
 pub fn shell_verb(args: &[&str], path: &str, console: &mut crate::console::Console) {
@@ -440,21 +454,20 @@ pub fn selftest() {
         if let Some(k) = crate::fs::vfs::home_unwritable(&mt, "/home") { serial_println!(":: PLAYWAV: path=- -> SKIP reason=home-not-writable({}) ::", k); } else { serial_println!(":: PLAYWAV: path=- reason=no-writable-path -> FAIL ::"); } // QEMUSKIP (B613): a home the volume refuses is SKIP, never FAIL
         return;
     };
-    // AUDIO7 M4: the completion is the ring's drain (`report()` from `service()`), not a wall clock. The loop
-    // ends on that, or on a STALL (LPIB still for 1 s while running, or no RUN 2 s after the arm). No codec = SKIP.
+    // AUDIO7 M4 / SINKALL: the completion is the source's drain (`report` from `play_poll`), not a wall clock. The loop
+    // ends on that, or on a STALL (`play_stalled`: frames written, none played for 2 s). No codec = SKIP.
     match open_wav(path) {
         Ok(()) => {
             let mut stalled = false;
-            while ACTIVE.load(Ordering::Acquire) {
+            while busy() {
                 service();
-                let (_done, _moved, st) = progress();
-                if st { stalled = true; break; }
+                if play_stalled() { stalled = true; break; }
                 delay_us(2_000);
             }
             if stalled {
-                let (lp, run_bit, fifo) = { let s = ST.lock(); (s.lpib_last, s.run_bit as u8, s.fifo.len()) };
+                let (w, pl) = play_counts();
                 stop();
-                serial_println!(":: PLAYWAV: path={} reason=stalled lpib={} run_bit={} fifo={} -> FAIL ::", path, lp, run_bit, fifo);
+                serial_println!(":: PLAYWAV: path={} reason=stalled written={} played={} sink={} -> FAIL ::", path, w, pl, crate::audio::mixer::output().unwrap_or("none"));
             }
         }
         Err(r) => serial_println!(":: PLAYWAV: path={} reason=no-codec ({}) -> SKIP ::", path, r),
@@ -499,14 +512,6 @@ fn track(s: &mut St) {
     }
 }
 
-/// `tests playwav` completion state: (done by the ring's own drain, LPIB moved, stalled).
-fn progress() -> (bool, bool, bool) {
-    let Some(s) = ST.try_lock() else { return (false, false, false) };
-    let now = crate::arch::ms();
-    let stalled = s.armed && !s.done && ((s.running && now.saturating_sub(s.moved_ms) > 1000)
-        || (!s.running && s.armed_ms != 0 && now.saturating_sub(s.armed_ms) > 2000));
-    (s.done, s.lpib_moved, stalled)
-}
 
 // ── AUDIOCODEC (SR30) M5 — `play <any file>`: audio_core sniffs and decodes, `feed()` takes the 16-bit PCM ──────
 // Reached from `open_wav` when the WAV parse refuses a file (any non-RIFF file, and WAVs it does not take: 24/32-bit,
@@ -534,7 +539,7 @@ impl audio_core::Read for VfsSrc {
 // render task, 32 KiB, run off its stack by a 92.5 KiB `Decoder::open` frame). These three keep their names.
 fn open_coded(path: &str, wav_reason: String) -> Result<(), String> { dec_open(path, wav_reason) }
 fn coded_pump() { dec_pump() }
-fn coded_report() { dec_report() }
+fn coded_report(p: &crate::audio::mixer::Played, sink: &str) { dec_report(p, sink) }
 
 /// `tests play [fmt]` (and `tests playflac` … through `crate::tests::arg()`): play `TEST.<EXT>` from the user's home,
 /// /home or / for each format; a format with no such file SKIPs. The completion is the ring's drain, as in `tests playwav`.
@@ -628,6 +633,8 @@ struct DecOut {
     decoded: u64, fed: u64, eos: bool, err: Option<audio_core::Error>,
     /// `dec_pump` has armed (or refused) this play — it is never armed twice.
     consumed: bool,
+    /// SINKALL: the sound is a video's (`vplay`'s demuxer share): the mixer source is named `video`.
+    video: bool,
 }
 static DEC_OUT: crate::sync::Mutex<Option<DecOut>> = crate::sync::Mutex::new(None);
 
@@ -646,7 +653,7 @@ fn dec_open(path: &str, wav_reason: String) -> Result<(), String> {
     stop();
     let jid = DEC_GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     *DEC_OUT.lock() = Some(DecOut { jid, path: String::from(path), info: None, open_err: None, wav_reason, out_ch: 1, step: 1,
-                                    pcm: VecDeque::new(), decoded: 0, fed: 0, eos: false, err: None, consumed: false });
+                                    pcm: VecDeque::new(), decoded: 0, fed: 0, eos: false, err: None, consumed: false, video: false });
     *CODED.lock() = None;
     DEC_ABORT.store(false, Ordering::Release);
     DEC_ARMED.store(false, Ordering::Release);
@@ -662,7 +669,7 @@ fn dec_open(path: &str, wav_reason: String) -> Result<(), String> {
     dj_spawned(on == "worker", jid); DEC_CPU.store(if cpu == crate::arch::sched::CPU_AUTO { u32::MAX } else { cpu as u32 }, Ordering::Release);
     serial_println!("[play] dec spawn path={} jid={} stack={} cpu={} on={}", path, jid, DEC_STACK, if cpu == crate::arch::sched::CPU_AUTO { -1 } else { cpu as i64 }, on);
     crate::arch::sched::spawn_stack("play-dec", dec_task, jid as usize, cpu, crate::arch::sched::PRIO_NORMAL, DEC_STACK);
-    ACTIVE.store(true, Ordering::Release);
+    PLAY_LIVE.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -685,9 +692,13 @@ fn dec_task(arg: usize) {
     let shared = crate::video::vplay::shared_audio(&path).map(audio_core::Decoder::from_source); // VPLAYAUDIO (B475): the live picture job's Demuxer share — one read, one parse — through audio_core::container::open_demuxed
     #[cfg(not(all(feature = "wc", feature = "videoplayer")))]
     let shared: Option<audio_core::Decoder> = None;
+    let video = shared.is_some(); // SINKALL: the video player's sound is the mixer source `video`, a file's is `player`
     let opened = match shared { Some(d) => Ok(d), None => audio_core::Decoder::open(alloc::boxed::Box::new(VfsSrc { path: path.clone(), off: 0 })) };
     #[cfg(all(feature = "wc", feature = "videoplayer"))]
-    let opened = opened.or_else(|e| crate::video::vplay::container_audio(&path).map(audio_core::Decoder::from_source).ok_or(e)); // VIDEOPLAYER (B434) / VPLAYAUDIO (B475): a Matroska file with no picture job, through the same open_demuxed
+    let (opened, video) = match opened { // VIDEOPLAYER (B434) / VPLAYAUDIO (B475): a Matroska file with no picture job, through the same open_demuxed
+        Ok(d) => (Ok(d), video),
+        Err(e) => match crate::video::vplay::container_audio(&path).map(audio_core::Decoder::from_source) { Some(d) => (Ok(d), true), None => (Err(e), video) },
+    };
     let mut dec = match opened {
         Ok(d) => d,
         Err(e) => {
@@ -700,7 +711,7 @@ fn dec_task(arg: usize) {
     route_line(&path, &info); // SOUNDOPENERS (B500) M2: the core that opened it, named
     let step = (info.rate as usize).div_ceil(48_000).max(1);
     let out_ch = if info.channels >= 2 { 2 } else { 1 };
-    if let Some(o) = DEC_OUT.lock().as_mut().filter(|o| o.jid == jid) { o.info = Some(info); o.step = step; o.out_ch = out_ch; }
+    if let Some(o) = DEC_OUT.lock().as_mut().filter(|o| o.jid == jid) { o.info = Some(info); o.step = step; o.out_ch = out_ch; o.video = video; }
     // `[play] open` is printed by `dec_pump` when it arms the stream: no frame is decoded before it is on the wire.
     dec_beat(STAGE_ARM);
     while mine() && !DEC_ARMED.load(Ordering::Acquire) {
@@ -815,12 +826,12 @@ fn dec_pump() {
     // 1) the decoder's open finished: arm the HDA stream here, on the service side, and say so BEFORE any frame
     let need_arm = CODED.lock().is_none();
     if need_arm {
-        let (path, info, open_err, step, out_ch) = {
+        let (path, info, open_err, step, out_ch, video) = {
             let mut g = DEC_OUT.lock();
             let Some(o) = g.as_mut().filter(|o| o.jid == jid && !o.consumed) else { return };
             if o.open_err.is_none() && o.info.is_none() { drop(g); dec_watch(jid); return; } // still in the demux
             o.consumed = true;
-            (o.path.clone(), o.info, o.open_err.clone(), o.step, o.out_ch)
+            (o.path.clone(), o.info, o.open_err.clone(), o.step, o.out_ch, o.video)
         };
         if let Some(r) = open_err {
             serial_println!(":: PLAYWAV: path={} reason={} -> REFUSED ::", path, r);
@@ -829,12 +840,12 @@ fn dec_pump() {
         }
         if let Some(info) = info {
             let rate = info.rate / step as u32;
-            match start(rate, out_ch as u8, 16) {
+            match src_open(if video { "video" } else { "player" }, rate, out_ch as u8, 16) {
                 Ok(eff) => {
-                    serial_println!("[play] open path={} format={} codec={:?} rate={} ch={} bits={} frames={:?} decim={} out_ch={} eff_rate={} resampled={}",
-                        path, info.format.name(), info.codec, info.rate, info.channels, info.bits, info.frames, step, out_ch, eff, (eff != rate) as u8);
+                    serial_println!("[play] open path={} format={} codec={:?} rate={} ch={} bits={} frames={:?} decim={} out_ch={} eff_rate={} resampled={} source={}",
+                        path, info.format.name(), info.codec, info.rate, info.channels, info.bits, info.frames, step, out_ch, eff, (eff != rate) as u8, if video { "video" } else { "player" });
                     *CODED.lock() = Some(Coded { path, info, step, armed: true, fed_end: false, open_ms: crate::arch::ms() });
-                    ACTIVE.store(true, Ordering::Release);
+                    PLAY_LIVE.store(true, Ordering::Release);
                     DEC_ARMED.store(true, Ordering::Release);
                 }
                 Err(r) => {
@@ -847,7 +858,7 @@ fn dec_pump() {
     }
     // 2) the watchdog
     if dec_watch(jid) { return; }
-    // 3) PCM across: whole chunks of at most 16 KiB, all-or-nothing as `feed()` takes them
+    // 3) PCM across into the play's mixer source (`src_feed`, SINKALL): chunks of at most 16 KiB, as much as it takes
     let armed = CODED.lock().as_ref().map(|c| c.armed && !c.fed_end).unwrap_or(false);
     if !armed { return; }
     dec_feed(jid);
@@ -878,7 +889,7 @@ fn dec_watch(jid: u32) -> bool {
     false
 }
 
-/// Decoded PCM into `feed()`: whole chunks of at most 16 KiB, all-or-nothing as `feed()` takes them.
+/// Decoded PCM into the play's mixer source (`src_feed`, SINKALL): chunks of at most 16 KiB, drained by what it took.
 fn dec_feed(jid: u32) {
     for _ in 0..8 {
         let (chunk, eos_empty) = {
@@ -889,14 +900,15 @@ fn dec_feed(jid: u32) {
             (o.pcm.iter().take(n).copied().collect::<Vec<u8>>(), o.eos && o.pcm.len() == n)
         };
         if chunk.is_empty() {
-            if eos_empty { if let Some(c) = CODED.lock().as_mut() { c.fed_end = true; } finish(); }
+            if eos_empty { if let Some(c) = CODED.lock().as_mut() { c.fed_end = true; } src_end(); }
             return;
         }
-        if feed(&chunk) == 0 { return; } // no room: retry next tick
+        let took = src_feed(&chunk); // SINKALL: the Player's mixer source takes whole frames, maybe fewer than offered
+        if took == 0 { return; } // no room: retry next tick
         let mut g = DEC_OUT.lock();
-        if let Some(o) = g.as_mut().filter(|o| o.jid == jid) { o.pcm.drain(..chunk.len()); }
+        if let Some(o) = g.as_mut().filter(|o| o.jid == jid) { o.pcm.drain(..took); }
         drop(g);
-        if eos_empty { if let Some(c) = CODED.lock().as_mut() { c.fed_end = true; } finish(); return; }
+        if eos_empty && took == chunk.len() { if let Some(c) = CODED.lock().as_mut() { c.fed_end = true; } src_end(); return; }
     }
 }
 
@@ -904,27 +916,26 @@ fn dec_feed(jid: u32) {
 fn dec_end_play() {
     DEC_ABORT.store(true, Ordering::Release);
     *CODED.lock() = None;
-    ACTIVE.store(false, Ordering::Release);
+    PLAY_LIVE.store(false, Ordering::Release);
 }
 
-/// `coded_report`: the coded player's verdict, once the ring has drained (`service()`, after `report()`).
-fn dec_report() {
+/// `coded_report`: the coded player's verdict, once its mixer source has drained (`play_poll`, after `report`),
+/// judged on that source's final account (SINKALL).
+fn dec_report(p: &crate::audio::mixer::Played, sink: &str) {
     let c = CODED.lock().take();
     let Some(c) = c else { return };
     let (decoded, fed, err) = {
         let g = DEC_OUT.lock();
         match g.as_ref() { Some(o) => (o.decoded, o.fed, o.err.clone()), None => (0, 0, None) }
     };
-    let s = ST.lock();
     let rate = c.info.rate / c.step as u32;
     let stated_ok = c.info.frames.map(|f| f == decoded).unwrap_or(true);
-    let ok = s.in_frames == fed && err.is_none() && stated_ok && s.underruns == 0 && s.err == 0 && s.completed >= 1 && s.lpib_moved && s.done;
+    let ok = p.written == fed && err.is_none() && stated_ok && p.underruns == 0 && p.drained;
     let ms = fed * 1000 / rate.max(1) as u64;
-    serial_println!("[play] done resampled={} eff_rate={} entries={} fifoe_dese={} run_bit={} lpib_moved={} level={} play_ms={}", s.resampled as u8, s.eff_rate, s.completed, s.err, s.run_bit as u8, s.lpib_moved as u8, s.level, crate::arch::ms().saturating_sub(c.open_ms));
-    serial_println!(":: PLAYCODEC: path={} format={} codec={:?} rate={} frames={} lpib_moved={} done={} -> {} :: ch={} decoded={} stated={:?} decim={} err={:?} secs={}.{} under={} ::",
-        c.path, c.info.format.name(), c.info.codec, c.info.rate, s.in_frames, s.lpib_moved as u8, s.done as u8, if ok { "PASS" } else { "FAIL" },
-        c.info.channels, decoded, c.info.frames, c.step, err, ms / 1000, (ms % 1000) / 100, s.underruns);
-    drop(s);
+    serial_println!("[play] done sink={} written={} played={} underruns={} drained={} play_ms={}", sink, p.written, p.played, p.underruns, p.drained as u8, crate::arch::ms().saturating_sub(c.open_ms));
+    serial_println!(":: PLAYCODEC: path={} format={} codec={:?} rate={} frames={} played={} done={} -> {} :: ch={} decoded={} stated={:?} decim={} err={:?} secs={}.{} under={} sink={} ::",
+        c.path, c.info.format.name(), c.info.codec, c.info.rate, p.written, p.played, p.drained as u8, if ok { "PASS" } else { "FAIL" },
+        c.info.channels, decoded, c.info.frames, c.step, err, ms / 1000, (ms % 1000) / 100, p.underruns, sink);
     DEC_ABORT.store(true, Ordering::Release); // the task has exited at eos; a straggler stops at its next step
 }
 
@@ -1046,13 +1057,12 @@ fn tq_tick() {
     if TQ_IN.swap(true, Ordering::AcqRel) { return; }
     let cur = TQ_CUR.lock().clone();
     if let Some((fmt, path, jid0)) = cur {
-        let (_done, _moved, st) = progress();
-        if st {
-            let (lp, run_bit, fifo) = { let s = ST.lock(); (s.lpib_last, s.run_bit as u8, s.fifo.len()) };
+        if play_stalled() {
+            let (w, pl) = play_counts();
             stop(); dec_stop();
-            serial_println!(":: PLAYCODEC: fmt={} path={} reason=stalled lpib={} run_bit={} fifo={} -> FAIL ::", fmt, path, lp, run_bit, fifo);
+            serial_println!(":: PLAYCODEC: fmt={} path={} reason=stalled written={} played={} sink={} -> FAIL ::", fmt, path, w, pl, crate::audio::mixer::output().unwrap_or("none"));
         }
-        if ACTIVE.load(Ordering::Acquire) { TQ_IN.store(false, Ordering::Release); return; }
+        if busy() { TQ_IN.store(false, Ordering::Release); return; }
         if DEC_GEN.load(Ordering::Acquire) != jid0 { dec_guard(fmt, &path, TQ_SHELL_MS.load(Ordering::Acquire)); }
         *TQ_CUR.lock() = None;
     }
@@ -1100,48 +1110,41 @@ fn seek_skip(jid: u32, rate: u32) -> u64 {
     frames
 }
 
-/// Pause (`on`) or resume the stream. `Some(run_bit readback)` while a stream is armed; `None` when nothing is.
+/// Pause (`on`) or resume the play: its mixer source is held out of the mix (SINKALL — the sink keeps running for any
+/// other source). `Some(run_bit())` while a play's source is open; `None` when none is.
 pub fn pause(on: bool) -> Option<bool> {
     PAUSED.store(on, Ordering::Release);
-    let mut s = ST.lock();
-    if !s.armed || s.done { return None; }
-    if !s.running {
-        serial_println!("[play] pause on={} run_bit=0 (stream not yet running)", on as u8);
-        return Some(false);
+    let id = src_id()?;
+    crate::audio::mixer::pause(id, on);
+    if !on {
+        if let Some(s) = PLAY.lock().as_mut() { s.moved_ms = crate::arch::ms(); }
     }
-    let (b, sd) = (s.base, s.sd);
-    if on {
-        super::amp::ramp_svc(false);
-        w8(b, sd + SD_CTL, r8(b, sd + SD_CTL) & !(SDCTL_RUN as u8));
-        wait_us(10_000, || r8(b, sd + SD_CTL) & SDCTL_RUN as u8 == 0);
-    } else {
-        w8(b, sd + SD_CTL, r8(b, sd + SD_CTL) | SDCTL_RUN as u8);
-        super::amp::ramp_svc(true);
-        s.moved_ms = crate::arch::ms();
-    }
-    let rb = r8(b, sd + SD_CTL) & SDCTL_RUN as u8 != 0;
-    serial_println!("[play] pause on={} run_bit={}", on as u8, rb as u8);
+    let rb = run_bit();
+    serial_println!("[play] pause on={} run_bit={} source={} sink={}", on as u8, rb as u8, id, crate::audio::mixer::output().unwrap_or("none"));
     Some(rb)
 }
 
-/// Is the stream paused?
+/// Is the play paused?
 pub fn paused() -> bool { PAUSED.load(Ordering::Acquire) }
 
-/// Is a play in flight (decoder opening, stream armed or draining)?
-pub fn busy() -> bool { ACTIVE.load(Ordering::Acquire) }
+/// Is a play in flight (an open latched, the decoder opening, its source playing or draining)?
+pub fn busy() -> bool { PLAY_LIVE.load(Ordering::Acquire) }
 
-/// The stream's RUN bit, read back (false when nothing is armed).
+/// The play is sounding: its source is open and not paused, and the mixer drives a sink.
 pub fn run_bit() -> bool {
-    let s = ST.lock();
-    s.armed && !s.done && s.running && r8(s.base, s.sd + SD_CTL) & SDCTL_RUN as u8 != 0
+    src_id().is_some() && !PAUSED.load(Ordering::Acquire) && crate::audio::mixer::output().is_some()
 }
 
-/// Milliseconds the ring has played since this stream's RUN (entries completed + LPIB within the current one).
+/// Milliseconds of this play's source the sink has played (the A/V clock): 0 with no source open, u64::MAX when the
+/// account is busy this instant (paint-context safe: `try_lock` only, never a pump).
 pub fn position_ms() -> u64 {
-    let Some(s) = ST.try_lock() else { return u64::MAX };
-    if !s.running { return 0; }
-    let bytes = s.completed * ENTRY_BYTES as u64 + (s.lpib_last as u64 % ENTRY_BYTES as u64);
-    bytes / 4 * 1000 / s.eff_rate.max(1) as u64
+    let Some(g) = PLAY.try_lock() else { return u64::MAX };
+    let Some((id, rate)) = g.as_ref().map(|s| (s.id, s.rate)) else { return 0 };
+    drop(g);
+    match crate::audio::mixer::played_now(id) {
+        Some(f) => f * 1000 / rate.max(1) as u64,
+        None => u64::MAX,
+    }
 }
 
 /// What the file is, from the player's own parse: a WAV's `(rate, ch, bits, frames)` header facts, or for a coded
@@ -1168,12 +1171,12 @@ pub fn seek_to(path: &str, ms: u64) -> Result<(u64, &'static str), String> {
         let frame = (ms * w.rate as u64 / 1000).min(total);
         let landed = frame * 1000 / w.rate.max(1) as u64;
         if DEC_LIVE.load(Ordering::Acquire) { dec_stop(); }
-        let eff = start(w.rate, w.ch as u8, w.bits as u8).map_err(String::from)?;
+        let eff = src_open("player", w.rate, w.ch as u8, w.bits as u8).map_err(String::from)?;
         w.pos = frame * fin;
         w.start = w.pos;
         serial_println!("[play] seek to_ms={} landed_ms={} method=table table=pcm exact=1 byte={} sample={} of {} eff_rate={} path={}", ms, landed, frame * fin, frame, total, eff, path);
         *WAV.lock() = Some(w);
-        ACTIVE.store(true, Ordering::Release);
+        PLAY_LIVE.store(true, Ordering::Release);
         return Ok((landed, "table"));
     }
     // coded: supersede the live job (its `mine()` goes false at its next step; its exit leaves the new job's liveness)
@@ -1214,17 +1217,19 @@ pub fn fixture_wav() -> Vec<u8> { synth_wav() }
 
 // ── NOTIFYPANE (rmbp-ledger B435, MACPARITY row 26) — the alert sound ───────────────────────────────────────────
 // Our own chime (not a copied system sound): 880 Hz + 1320 Hz (a fifth), 180 ms, a fast attack and a squared
-// decay, mono 16-bit at 48 kHz through this file's own `start` / `feed` / `finish`. NOTIFY asks with
-// [`request_alert`] (an atomic latch, safe from its pass); the device-service tick plays it. Never while the
-// output is already sounding (a player, a WAV, a decoder, another alert): refused `busy`, nothing stacked.
+// decay, mono 16-bit at 48 kHz. NOTIFY asks with [`request_alert`] (an atomic latch, safe from its pass); the
+// device-service tick plays it. SINKALL: it is a mixer source (`alert`), mixed over whatever plays (the Player, a
+// video's sound, a ring-3 program) into the chosen sink; refused `busy` only while another alert is latched or sounding.
 
 static ALERT: AtomicBool = AtomicBool::new(false);
+/// SINKALL: the sounding alert's mixer source (0 = none), closed by `alert_poll` once drained.
+static ALERT_SRC: AtomicU32 = AtomicU32::new(0);
 const ALERT_RATE: u32 = 48_000;
 const ALERT_MS: usize = 180;
 
-/// Ask for one alert sound on the next service tick. `Err("busy")` while the output is sounding or one is latched.
+/// Ask for one alert sound on the next service tick. `Err("busy")` while an alert is latched or sounding.
 pub fn request_alert() -> Result<(), &'static str> {
-    if busy() || DEC_LIVE.load(Ordering::Acquire) || ALERT.load(Ordering::Acquire) {
+    if alert_sounding() {
         return Err("busy");
     }
     ALERT.store(true, Ordering::Release);
@@ -1256,22 +1261,39 @@ fn alert_pcm() -> Vec<u8> {
     v
 }
 
+/// An alert latched or sounding (its source still open).
+pub fn alert_sounding() -> bool {
+    ALERT.load(Ordering::Acquire) || ALERT_SRC.load(Ordering::Acquire) != 0
+}
+
+/// The latched alert as ONE mixer source: open, the whole chime written (180 ms fits the source's 200 ms ring), ended.
 fn alert_play() {
     if !ALERT.swap(false, Ordering::AcqRel) {
         return;
     }
-    if busy() {
-        serial_println!("[play] alert -> busy (the output is sounding)");
-        return;
-    }
     let pcm = alert_pcm();
-    match start(ALERT_RATE, 1, 16) {
-        Ok(eff) => {
-            let took = feed(&pcm);
-            finish();
-            serial_println!("[play] alert hz=880+1320 ms={} bytes={} fed={} eff_rate={} -> started", ALERT_MS, pcm.len(), took, eff);
+    match crate::audio::mixer::open_fmt("alert", ALERT_RATE, 1, 16, crate::audio::mixer::UNITY) {
+        Ok(id) => {
+            ALERT_SRC.store(id, Ordering::Release);
+            let took = crate::audio::mixer::write(id, &pcm);
+            crate::audio::mixer::end(id);
+            serial_println!("[play] alert hz=880+1320 ms={} bytes={} fed={} source={} sink={} -> started", ALERT_MS, pcm.len(), took, id, crate::audio::mixer::output().unwrap_or("pending"));
         }
         Err(r) => serial_println!("[play] alert -> REFUSED reason={}", r),
+    }
+}
+
+/// The service tick's half: the alert's source closes once the sink has played it out (or it is gone).
+fn alert_poll() {
+    let id = ALERT_SRC.load(Ordering::Acquire);
+    if id == 0 {
+        return;
+    }
+    if matches!(crate::audio::mixer::state(id), Some(p) if !p.drained) {
+        return;
+    }
+    if ALERT_SRC.compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        let _ = crate::audio::mixer::close(id);
     }
 }
 
@@ -1473,7 +1495,7 @@ fn r3_end(s: R3, reason: &str) {
     let ours = s.state == R3_ARMED && EPOCH.load(Ordering::Acquire) == s.epoch;
     let (frames, under) = if ours { r3_counts() } else { (0, 0) };
     if ours {
-        stop();
+        stream_stop();
     }
     serial_println!("[audio] close handle={} pid={} reason={} frames={} underruns={}", s.handle, s.pid, reason, frames, under);
 }
@@ -1495,9 +1517,6 @@ pub fn r3_open(row: usize, tgen: u64, alive: fn(usize, u64) -> bool, pid: u64, r
     };
     if let Some(s) = stale {
         r3_end(s, "owner-exited");
-    }
-    if busy() || DEC_LIVE.load(Ordering::Acquire) {
-        return Err((una_abi::EBUSY, "output-sounding"));
     }
     let handle = R3_HANDLE.fetch_add(1, Ordering::AcqRel).wrapping_add(1).max(1);
     *R3S.lock() = Some(R3 { handle, row, tgen, alive, pid, rate: rate as u32, ch: ch as u8, bits: bits as u8, state: R3_PENDING, epoch: 0 });
@@ -1526,7 +1545,7 @@ fn r3_tick() {
     if !pending {
         return;
     }
-    let r = if busy() || DEC_LIVE.load(Ordering::Acquire) { Err("output-sounding") } else { start(rate, ch, bits) };
+    let r = start(rate, ch, bits); // SINKALL: the Player is a mixer source now, never a second client of this stream
     let epoch = EPOCH.load(Ordering::Acquire);
     let mut g = R3S.lock();
     match g.as_mut().filter(|s| s.handle == handle) {
@@ -1544,7 +1563,7 @@ fn r3_tick() {
         None => {
             drop(g);
             if r.is_ok() {
-                stop(); // closed while it came up
+                stream_stop(); // closed while it came up
             }
         }
     }
@@ -1619,4 +1638,141 @@ pub fn r3_pos(handle: u64, row: usize, tgen: u64, what: u64) -> i64 {
             if what == una_abi::AUDIO_POS_PLAYED { played as i64 } else { under as i64 }
         }
     }
+}
+
+// ── SINKALL (rmbp-ledger B767) — THE PLAYER'S SOURCE: the Player, the video's sound and `tests sinkall` ───────────────
+// The Player's producers (`wav_pump`, `dec_feed`) write ONE mixer source (`audio::mixer::open_fmt`, named `player`, or
+// `video` for a video's sound) instead of the HDA stream; the mixer takes it to the chosen sink. [`PLAY`] is that
+// source's id and the A/V clock's rate; [`PLAY_LIVE`] is "a play is in flight" (`busy`). `play_poll` (the service tick)
+// reads the source's account and, once drained, closes it and gives the verdict (`report` / `dec_report`). Every lock
+// here is held for a copy, never across a mixer call.
+
+struct Src {
+    id: u32,
+    rate: u32,
+    written: u64,
+    played: u64,
+    /// The last time the sink played a frame of this source (the stall guard's clock).
+    moved_ms: u64,
+}
+static PLAY: crate::sync::Mutex<Option<Src>> = crate::sync::Mutex::new(None);
+static PLAY_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Open the play's mixer source (a previous one is closed: the new play supersedes it). The mixer resamples: the
+/// effective rate is its 48 kHz.
+fn src_open(name: &'static str, rate: u32, ch: u8, bits: u8) -> Result<u32, &'static str> {
+    let _ = src_close();
+    let id = crate::audio::mixer::open_fmt(name, rate, ch, bits, crate::audio::mixer::UNITY)?;
+    *PLAY.lock() = Some(Src { id, rate, written: 0, played: 0, moved_ms: crate::arch::ms() });
+    PLAY_LIVE.store(true, Ordering::Release);
+    Ok(crate::audio::mixer::RATE)
+}
+
+fn src_id() -> Option<u32> {
+    PLAY.lock().as_ref().map(|s| s.id)
+}
+
+/// Source-format bytes into the play's source: the bytes taken (whole frames; 0 = full, or no play).
+fn src_feed(data: &[u8]) -> usize {
+    match src_id() {
+        Some(id) => crate::audio::mixer::write(id, data),
+        None => 0,
+    }
+}
+
+/// The play has no more frames: what its source holds plays out.
+fn src_end() {
+    if let Some(id) = src_id() {
+        crate::audio::mixer::end(id);
+    }
+}
+
+/// Close the play's source now: its final account.
+fn src_close() -> Option<crate::audio::mixer::Played> {
+    let s = PLAY.lock().take()?;
+    crate::audio::mixer::close(s.id)
+}
+
+/// The service tick's half: follow the play's source; once the sink has played it out, close it and give the verdict.
+fn play_poll() {
+    let Some(id) = src_id() else { return };
+    let st = crate::audio::mixer::state(id);
+    if let Some(p) = st.filter(|p| !p.drained) {
+        if let Some(s) = PLAY.lock().as_mut().filter(|s| s.id == id) {
+            if p.played != s.played {
+                s.moved_ms = crate::arch::ms();
+            }
+            s.written = p.written;
+            s.played = p.played;
+        }
+        return;
+    }
+    let mine = {
+        let mut g = PLAY.lock();
+        if g.as_ref().map(|s| s.id) == Some(id) { g.take() } else { None }
+    };
+    if mine.is_none() {
+        return;
+    }
+    let sink = crate::audio::mixer::output().unwrap_or("none");
+    let p = crate::audio::mixer::close(id).or(st).unwrap_or_default();
+    report(&p, sink);
+    coded_report(&p, sink);
+    PLAY_LIVE.store(false, Ordering::Release);
+}
+
+/// The play is stuck: frames written that the sink has not played, not paused, and none played for 2 s.
+fn play_stalled() -> bool {
+    let Some(g) = PLAY.try_lock() else { return false };
+    let Some(s) = g.as_ref() else { return false };
+    !PAUSED.load(Ordering::Acquire) && s.written > s.played && crate::arch::ms().saturating_sub(s.moved_ms) > 2_000
+}
+
+/// (source frames written, played) of the play, as last polled.
+fn play_counts() -> (u64, u64) {
+    PLAY.lock().as_ref().map_or((0, 0), |s| (s.written, s.played))
+}
+
+/// The HDA stream's epoch: bumped by every `start` (the test's direct-write count: every bump is the mixer's open).
+pub fn epoch() -> u32 {
+    EPOCH.load(Ordering::Acquire)
+}
+
+/// `tests sinkall`'s Player leg: the Player's source fns minus the file read — [`fixture_source`] opens it (48 kHz
+/// stereo 16-bit) as `name` (`player` | `video`), [`fixture_feed`] writes a 440 Hz sine into it up to `upto` frames
+/// (as far as the source takes now), [`fixture_end`] ends it; `play_poll` closes it as it closes a file's.
+static FIX_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+pub fn fixture_source(name: &'static str) -> Result<u32, &'static str> {
+    FIX_FRAMES.store(0, Ordering::Release);
+    src_open(name, 48_000, 2, 16)
+}
+
+/// Frames of the fixture written so far, after writing up to `upto`.
+pub fn fixture_feed(upto: u64) -> u64 {
+    let mut f = FIX_FRAMES.load(Ordering::Acquire);
+    let mut chunk = [0u8; 480 * 4];
+    while f < upto {
+        let n = (upto - f).min(480) as usize;
+        for i in 0..n {
+            let b = (alert_partial(f as usize + i, 440, 6000) as i16).to_le_bytes();
+            chunk[i * 4..i * 4 + 4].copy_from_slice(&[b[0], b[1], b[0], b[1]]);
+        }
+        let took = src_feed(&chunk[..n * 4]);
+        f += (took / 4) as u64;
+        if took < n * 4 {
+            break;
+        }
+    }
+    FIX_FRAMES.store(f, Ordering::Release);
+    f
+}
+
+pub fn fixture_end() {
+    src_end();
+}
+
+/// The alert's chime as the mixer source takes it (mono 16-bit, 48 kHz) — `tests sinkall`'s synthetic BT leg.
+pub fn alert_fixture_pcm() -> Vec<u8> {
+    alert_pcm()
 }

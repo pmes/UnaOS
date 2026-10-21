@@ -37,6 +37,12 @@
 //!   TDs land in a 64 KiB single-producer single-consumer ring ([`push_capture`] from the claim path, lock-free;
 //!   [`read_capture`] from the one reader); a push that does not fit counts an overrun and drops the newest bytes.
 //!
+//! * **Volume** (SINKALL, rmbp-ledger B767) — [`parse`] records the AC interface's first Feature Unit (its master and
+//!   channel 1-2 Mute / Volume controls); while the playback stream runs, the mixer hands the person's level to
+//!   [`volume_want`] and the service pass applies it ([`volume_service`]: GET_MIN / GET_MAX once, then SET_CUR Mute and
+//!   Volume on EP0), so the mixer plays unity into a device that carries its own volume. It rides the class driver's
+//!   one EP0 door from `isoch::service_uvc` ([`capture_due`] / [`capture_service`]: one EP0 job per pass).
+//!
 //! # SOURCES (DRIVERS-METHOD §5)
 //!
 //! USB Device Class Definition for Audio Devices 1.0: §4.3.2 (class-specific AC interface header, bcdADC), §4.5.2
@@ -44,6 +50,10 @@
 //! Sampling Frequency control), §5.2.3.2.3.1 (Sampling Frequency Control: SET_CUR, bmRequestType 0x22, wValue
 //! 0x0100, wIndex = endpoint, 3-byte rate), A.5/A.6 (descriptor subtypes). Audio Data Formats 1.0: §2.2.5 (Type I
 //! format descriptor: bNrChannels, bSubframeSize, bBitResolution, bSamFreqType, tSamFreq), A.1.1 (wFormatTag 1 = PCM).
+//! SINKALL: UAC1 §4.3.2.5 (Feature Unit descriptor: bUnitID[3] bSourceID[4] bControlSize[5] bmaControls(0..)[6..]; bit 0
+//! Mute, bit 1 Volume), §5.2.2.4.3.1-2 (Mute / Volume Control: SET_CUR 0x21 / GET_MIN 0xA1 0x82 / GET_MAX 0x83, wValue =
+//! CS << 8 | channel, wIndex = UnitID << 8 | interface; Volume in 1/256 dB, signed, 0x8000 = -inf), A.10.2 (CS 0x01
+//! MUTE_CONTROL, 0x02 VOLUME_CONTROL).
 //! USB 2.0 Table 9-12/9-13 (interface, endpoint; the audio endpoint is 9 bytes with bRefresh/bSynchAddress). QEMU's
 //! `hw/usb/dev-audio.c` (recalled, not re-read on this arc) is the fixture's shape: full-speed, AC interface 0, AS
 //! interface 1 alt 1, OUT 0x01 adaptive, 192-byte packets at 48 kHz stereo, no sampling-frequency control.
@@ -71,6 +81,15 @@ const FORMAT_PCM: u16 = 0x0001; // Frmts A.1.1
 const FORMAT_TYPE_I: u8 = 0x01; // Frmts A.1.2
 const RQ_SET_CUR: u8 = 0x01; // UAC1 A.9
 const SAMPLING_FREQ_CONTROL: u16 = 0x01; // UAC1 A.10.2 (endpoint control selector)
+const AC_FEATURE_UNIT: u8 = 0x06; // UAC1 A.5 (SINKALL)
+const RQ_GET_MIN: u8 = 0x82; // UAC1 A.9
+const RQ_GET_MAX: u8 = 0x83;
+const MUTE_CONTROL: u16 = 0x01; // UAC1 A.10.2 (feature unit control selectors)
+const VOLUME_CONTROL: u16 = 0x02;
+/// Volume's -inf (UAC1 §5.2.2.4.3.2): a mute on a unit with no Mute control.
+const VOL_SILENT: i16 = -0x8000;
+/// The range assumed when GET_MIN / GET_MAX fail: -60 dB .. 0 dB.
+const VOL_FALLBACK: (i16, i16) = (-60 * 256, 0);
 /// The one format this arc plays: PCM 16-bit, two channels, 48 kHz.
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 2;
@@ -174,12 +193,40 @@ impl Alt {
     }
 }
 
+/// SINKALL: a Feature Unit (UAC1 §4.3.2.5): its id and which of master (bit 0), channel 1 (bit 1), channel 2 (bit 2)
+/// carry Mute and Volume. `unit` 0 = none.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Fu {
+    pub unit: u8,
+    pub mute: u8,
+    pub vol: u8,
+}
+
+/// The Feature Unit descriptor `d` (bLength >= 7; bmaControls(0..n) of bControlSize bytes, then iFeature).
+fn feature_unit(d: &[u8]) -> Fu {
+    let size = (d[5] as usize).max(1);
+    let n = (d.len() - 7) / size;
+    let mut fu = Fu { unit: d[3], ..Fu::default() };
+    for ch in 0..n.min(3) {
+        let b = d[6 + ch * size];
+        if b & 0x01 != 0 {
+            fu.mute |= 1 << ch;
+        }
+        if b & 0x02 != 0 {
+            fu.vol |= 1 << ch;
+        }
+    }
+    fu
+}
+
 /// The configuration as this driver reads it.
 #[derive(Clone, Copy, Default)]
 pub struct Parsed {
     pub have_ac: bool,
     pub ac_intf: u8,
     pub bcd_adc: u16,
+    /// SINKALL: the AC interface's first Feature Unit.
+    pub fu: Fu,
     pub as_seen: u8,
     pub alts: [Alt; MAX_ALTS],
     pub nalt: usize,
@@ -224,6 +271,9 @@ pub fn parse(cfg: &[u8]) -> Parsed {
                 // §4.3.2: HEADER bcdADC[3..5].
                 if in_ac && d[2] == AC_HEADER && len >= 5 {
                     p.bcd_adc = le16(d, 3);
+                }
+                if in_ac && d[2] == AC_FEATURE_UNIT && len >= 7 && p.fu.unit == 0 {
+                    p.fu = feature_unit(d); // SINKALL: the volume the device carries itself
                 }
                 if let Some(i) = cur {
                     let a = &mut p.alts[i];
@@ -520,6 +570,7 @@ pub fn probe(slot: u8, vid: u16, pid: u16, win: &[u8], cfg_value: u8, h: &mut dy
         Ok((tds, lead, sched)) => {
             STREAMING.store(true, Ordering::Release);
             *WHY.lock() = "ok";
+            volume_arm(p.ac_intf, p.fu);
             serial_println!("[uac] stream slot={} intf={} alt={} ep={:#04x} tds={} lead_uframes={} sched={} -> streaming", slot, a.intf, a.alt, a.ep.addr, tds, lead, sched);
             wire();
             crate::audio::usb_arrived(vid, pid);
@@ -538,6 +589,7 @@ pub fn disconnect(slot: u8) {
     }
     capture_lost(slot, "gone"); // UACMIC: the capture device goes with it (the pipe went in `isoch::disconnect`)
     SLOT.store(0, Ordering::Release);
+    FU.store(0, Ordering::Release); // SINKALL: the feature unit goes with the device
     let was = STREAMING.swap(false, Ordering::AcqRel);
     ENUMERATED.store(false, Ordering::Release);
     *WHY.lock() = "gone";
@@ -647,6 +699,9 @@ pub fn capture_counters() -> (u32, u64, u32) {
 
 /// The slot whose capture pipe must open or close on this service pass (the wanted state differs from the armed one).
 pub fn capture_due() -> Option<u8> {
+    if volume_due() {
+        return Some(SLOT.load(Ordering::Acquire)).filter(|&s| s != 0); // SINKALL: the playback volume's EP0 job first
+    }
     let want = CAP_WANT.load(Ordering::Acquire) != 0;
     let armed = CAP_ARMED.load(Ordering::Acquire);
     if want == armed || (want && CAP_FAIL.load(Ordering::Acquire)) {
@@ -675,6 +730,9 @@ fn cap_fail(slot: u8, stage: &str, why: &'static str) {
 /// The service pass's half (task context, EP0 free): open the capture pipe while a source wants it, close it when the
 /// last source left. One direction per call.
 pub fn capture_service(h: &mut dyn IsoHost) {
+    if volume_due() {
+        return volume_service(h); // SINKALL: one EP0 job per pass — the volume, then the capture pipe on the next
+    }
     let Some(c) = *CAP.lock() else { return };
     let want = CAP_WANT.load(Ordering::Acquire) != 0;
     let armed = CAP_ARMED.load(Ordering::Acquire);
@@ -1016,4 +1074,131 @@ pub fn mic_fixture() {
         f1.wrapping_sub(f0), o1.wrapping_sub(o0),
         ain1.0.wrapping_sub(ain0.0), ain1.1.wrapping_sub(ain0.1), ain1.2.wrapping_sub(ain0.2), ain1.3.wrapping_sub(ain0.3)
     );
+}
+
+// ── SINKALL (rmbp-ledger B767): the playback device's Feature Unit — volume and mute on the device ─────────────────────
+// The mixer (`audio::mixer::master`) calls [`volume_want`] with the F-row level 0..16 and the mute flag whenever it
+// mixes for the USB sink; a device whose Feature Unit has a Volume control takes it (the mixer then plays unity — the
+// level is applied once, as the HDA codec amp does). The SET_CUR runs in the service pass ([`volume_service`], reached
+// through [`capture_due`] / [`capture_service`], the class driver's one EP0 door). One audio device at a time (`probe`'s
+// guard), so the door's slot is the playback device's. A refused request leaves the device to the mixer's scale.
+
+/// The playback device's Feature Unit: unit | ac_intf << 8 | mute << 16 | vol << 24 (0 = none).
+static FU: AtomicU32 = AtomicU32::new(0);
+/// The level wanted: 1 << 16 | mute << 8 | level (0 = none yet); the one last applied; the device's range (min | max << 16
+/// as u16 pairs; 0 = unread).
+static VOL_WANT: AtomicU32 = AtomicU32::new(0);
+static VOL_DONE: AtomicU32 = AtomicU32::new(0);
+static VOL_RANGE: AtomicU32 = AtomicU32::new(0);
+static VOL_FAIL: AtomicBool = AtomicBool::new(false);
+static VOL_SETS: AtomicU32 = AtomicU32::new(0);
+
+/// The stream started: record its device's Feature Unit (if any) and forget the last device's volume state.
+fn volume_arm(ac_intf: u8, fu: Fu) {
+    let w = if fu.unit == 0 || (fu.mute | fu.vol) == 0 { 0 } else { fu.unit as u32 | (ac_intf as u32) << 8 | (fu.mute as u32) << 16 | (fu.vol as u32) << 24 };
+    VOL_DONE.store(0, Ordering::Release);
+    VOL_RANGE.store(0, Ordering::Release);
+    VOL_FAIL.store(false, Ordering::Release);
+    FU.store(w, Ordering::Release);
+    serial_println!("[uac] feature unit={} intf={} mute={:#04x} vol={:#04x} -> {}", fu.unit, ac_intf, fu.mute, fu.vol, if fu.vol != 0 { "device-volume" } else { "mixer-volume" });
+}
+
+/// The mixer's level for the device: true when the device's Feature Unit carries volume (the mixer plays unity), false
+/// when the mixer must scale (no unit, no Volume control, no stream, or the device refused a SET_CUR).
+pub fn volume_want(level: u8, muted: bool) -> bool {
+    let fu = FU.load(Ordering::Acquire);
+    if fu >> 24 == 0 || !STREAMING.load(Ordering::Acquire) || VOL_FAIL.load(Ordering::Acquire) {
+        return false;
+    }
+    VOL_WANT.store(1 << 16 | (muted as u32) << 8 | level.min(16) as u32, Ordering::Release);
+    true
+}
+
+/// A level is wanted that the device does not hold yet.
+fn volume_due() -> bool {
+    let w = VOL_WANT.load(Ordering::Acquire);
+    w != 0 && w != VOL_DONE.load(Ordering::Acquire) && FU.load(Ordering::Acquire) != 0 && STREAMING.load(Ordering::Acquire) && !VOL_FAIL.load(Ordering::Acquire)
+}
+
+/// Level 0..16 to the unit's Volume, linear in dB between its min and max (as `hda::vol::apply` scales its steps).
+fn level_db(level: u8, min: i16, max: i16) -> i16 {
+    (min as i32 + (max as i32 - min as i32) * level.min(16) as i32 / 16) as i16
+}
+
+/// One class-specific request to the Feature Unit (`idx` = UnitID << 8 | interface) with `data` (SET) or into `data` (GET).
+fn fu_request(h: &mut dyn IsoHost, get: Option<u8>, cs: u16, ch: u16, idx: u16, data: &mut [u8]) -> bool {
+    let n = data.len();
+    let r = match get {
+        Some(rq) => h.control(0xA1, rq, cs << 8 | ch, idx, n as u16, true),
+        None => {
+            // SAFETY: the EP0 buffer, `cap` >= 2 bytes; no transfer in flight.
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), h.buf(), n) };
+            h.control(0x21, RQ_SET_CUR, cs << 8 | ch, idx, n as u16, false)
+        }
+    };
+    if get.is_some() && matches!(r, Ok(got) if got as usize >= n) {
+        // SAFETY: the EP0 buffer, just written by the device (`n` <= its length).
+        unsafe { core::ptr::copy_nonoverlapping(h.buf() as *const u8, data.as_mut_ptr(), n) };
+    }
+    r.is_ok() && (get.is_none() || matches!(r, Ok(got) if got as usize >= n))
+}
+
+/// The unit's Volume range on channel `ch`, read once per stream (GET_MIN / GET_MAX), else the fallback.
+fn vol_range(h: &mut dyn IsoHost, idx: u16, ch: u16) -> (i16, i16) {
+    let r = VOL_RANGE.load(Ordering::Acquire);
+    if r != 0 {
+        return (r as u16 as i16, (r >> 16) as u16 as i16);
+    }
+    let (mut lo, mut hi) = ([0u8; 2], [0u8; 2]);
+    let got = fu_request(h, Some(RQ_GET_MIN), VOLUME_CONTROL, ch, idx, &mut lo) && fu_request(h, Some(RQ_GET_MAX), VOLUME_CONTROL, ch, idx, &mut hi);
+    let (min, max) = if got && i16::from_le_bytes(lo) < i16::from_le_bytes(hi) { (i16::from_le_bytes(lo), i16::from_le_bytes(hi)) } else { VOL_FALLBACK };
+    VOL_RANGE.store(min as u16 as u32 | (max as u16 as u32) << 16, Ordering::Release); // never 0: min < max
+    (min, max)
+}
+
+/// The service pass's volume job: Mute on every channel that has it, Volume on every channel that has it.
+pub fn volume_service(h: &mut dyn IsoHost) {
+    let (want, fu) = (VOL_WANT.load(Ordering::Acquire), FU.load(Ordering::Acquire));
+    let (unit, intf, mute, vol) = (fu & 0xFF, (fu >> 8) & 0xFF, (fu >> 16) & 0xFF, (fu >> 24) & 0xFF);
+    let (level, muted) = ((want & 0xFF) as u8, want & 0x100 != 0);
+    let idx = (unit << 8 | intf) as u16;
+    let first = (0..3u16).find(|c| vol & 1 << c != 0).unwrap_or(0);
+    let (min, max) = vol_range(h, idx, first);
+    let mut ok = true;
+    for ch in (0..3u16).filter(|c| mute & 1 << c != 0) {
+        ok &= fu_request(h, None, MUTE_CONTROL, ch, idx, &mut [muted as u8]);
+    }
+    let v = if muted && mute == 0 { VOL_SILENT } else { level_db(level, min, max) };
+    for ch in (0..3u16).filter(|c| vol & 1 << c != 0) {
+        ok &= fu_request(h, None, VOLUME_CONTROL, ch, idx, &mut v.to_le_bytes());
+    }
+    VOL_DONE.store(want, Ordering::Release);
+    if ok {
+        VOL_SETS.fetch_add(1, Ordering::AcqRel);
+    } else {
+        VOL_FAIL.store(true, Ordering::Release); // the mixer scales from now on (`volume_want` answers false)
+    }
+    serial_println!(
+        "[uac] set-cur feature unit={} level={} mute={} vol={:#06x} min={:#06x} max={:#06x} chans_mute={:#04x} chans_vol={:#04x} result={}",
+        unit, level, muted as u8, v as u16, min as u16, max as u16, mute, vol, if ok { "ok" } else { "refused (the mixer scales)" }
+    );
+}
+
+/// `(SET_CUR rounds the device took, a request refused)` since the stream started — `tests sinkall`'s `usb_volume=`.
+pub fn volume_state() -> (u32, bool) {
+    (VOL_SETS.load(Ordering::Acquire), VOL_FAIL.load(Ordering::Acquire))
+}
+
+/// The device's Feature Unit carries the volume now.
+pub fn volume_on_device() -> bool {
+    FU.load(Ordering::Acquire) >> 24 != 0 && STREAMING.load(Ordering::Acquire) && !VOL_FAIL.load(Ordering::Acquire)
+}
+
+/// QEMU `usb-audio`'s Feature Unit as [`parse`] reads it from [`FIXTURE`]: unit 2, Mute on the master, Volume on
+/// channels 1 and 2 — and the level map's ends and middle.
+pub fn fu_fixture() -> bool {
+    let p = parse(&FIXTURE);
+    let ok = p.fu == Fu { unit: 2, mute: 0b001, vol: 0b110 } && level_db(0, -0x7f00, 0) == -0x7f00 && level_db(16, -0x7f00, 0) == 0 && level_db(8, -0x7f00, 0) == -0x3f80;
+    serial_println!("[uac] fixture feature unit={} mute={:#04x} vol={:#04x} level_db(8)={:#06x} -> {}", p.fu.unit, p.fu.mute, p.fu.vol, level_db(8, -0x7f00, 0) as u16, if ok { "ok" } else { "FAIL" });
+    ok
 }

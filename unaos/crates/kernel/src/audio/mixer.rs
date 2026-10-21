@@ -25,8 +25,18 @@
 //! * **Who pumps** — every source write, every position read and the tone's own loop; no new task. Lock order: OUT
 //!   then MIX, and neither is held across a call into `hda::play` that takes MIX (its liveness probe uses `try_lock`).
 //!
+//! * **SINKALL (rmbp-ledger B767)** — the kernel Player (`hda::play`: a WAV, a coded file, the video player's sound
+//!   through `play-dec`) and the alert are KERNEL sources here ([`open_fmt`] / [`write`] / [`end`] / [`close`], named
+//!   `player` / `video` / `alert`); a kernel source leaves by its opener's [`close`] (it reads the final [`Played`]),
+//!   a ring-3 source by the reap. `hda::play`'s stream has ONE client: this file's HDA output. A third output, the
+//!   A2DP stream (`OUT_BT`, cfg `a2dp`), takes each period through [`to_bt_rate`] (48 -> 44.1 kHz). The master: HDA by
+//!   the codec amp, USB by the device's feature unit when it has one (`uac::volume_want`, SET_CUR on EP0), else — and
+//!   always on BT (no AVRCP) — scaled here. A clip shorter than the HDA ring's prime is flushed (end of stream once
+//!   every source has ended). A paused source ([`pause`]) is skipped, never an underrun.
+//!
 //! Wire: `[audio] mix open id= name= rate= ch= bits= gain=` · `[audio] mix sink=<usb|hda> -> ok|refused=<why>` ·
-//! `[audio] close handle= pid= reason= frames= underruns=` · `[audio] mix sources=<n> period_us=<n> underruns=<n>
+//! `[audio] close handle= pid= reason= frames= underruns=` · `[audio] source=<player|video|alert> sink=<hda|usb|bt|none>
+//! frames=<n> underruns=<n>` (a kernel source's close) · `[audio] mix sources=<n> period_us=<n> underruns=<n>
 //! master=<n>` · `:: AUDIOMIX: sources=2 mixed=ok underruns=0 mute=ok -> PASS ::` (`tests audiomix`, [`selftest`]).
 
 use alloc::collections::VecDeque;
@@ -69,13 +79,25 @@ pub struct Source {
     last_e: u64,
     primed: bool,
     ended: bool,
+    /// SINKALL: held out of the mix (the Player's pause): no frame taken, no underrun counted.
+    paused: bool,
     underruns: u32,
     owner: Option<Owner>,
 }
 
+/// SINKALL: a source's account: source frames written and played (capped), its underruns, and drained = ended with
+/// every frame played by the sink.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Played {
+    pub written: u64,
+    pub played: u64,
+    pub underruns: u32,
+    pub drained: bool,
+}
+
 impl Source {
     fn live(&self) -> bool {
-        self.primed && !self.ended
+        self.primed && !self.ended && !self.paused
     }
     /// 48 kHz frames of this source the sink has played, given the sink's play position in emitted frames.
     fn played48(&self, sink_played: u64) -> u64 {
@@ -84,6 +106,11 @@ impl Source {
     /// The same, in source frames, capped at the frames written (a padded underrun is never counted as played).
     fn played_src(&self, sink_played: u64) -> u64 {
         (self.played48(sink_played) * self.rate as u64 / RATE as u64).min(self.in_n)
+    }
+    /// The account at the sink's play position.
+    fn account(&self, sink_played: u64) -> Played {
+        let drained = self.ended && self.ring.is_empty() && self.played48(sink_played) >= self.taken;
+        Played { written: self.in_n, played: self.played_src(sink_played), underruns: self.underruns, drained }
     }
 }
 
@@ -130,7 +157,7 @@ impl Mix {
         let id = self.next_id;
         self.srcs.push(Source {
             id, name, gain, ring: VecDeque::new(), rate, ch, bits, in_n: 0, out_n: 0, taken: 0, last_e: self.emitted,
-            primed: false, ended: false, underruns: 0, owner,
+            primed: false, ended: false, paused: false, underruns: 0, owner,
         });
         Ok(id)
     }
@@ -184,6 +211,11 @@ impl Mix {
         self.at(id).map(|s| s.gain = gain).is_some()
     }
 
+    /// SINKALL: hold source `id` out of the mix (`on`) or put it back.
+    pub fn set_paused(&mut self, id: u32, on: bool) -> bool {
+        self.at(id).map(|s| s.paused = on).is_some()
+    }
+
     pub fn remove(&mut self, id: u32) -> Option<Source> {
         let i = self.srcs.iter().position(|s| s.id == id)?;
         Some(self.srcs.remove(i))
@@ -191,7 +223,7 @@ impl Mix {
 
     /// Some source holds a frame.
     pub fn has_data(&self) -> bool {
-        self.srcs.iter().any(|s| !s.ring.is_empty())
+        self.srcs.iter().any(|s| !s.paused && !s.ring.is_empty())
     }
 
     /// Every live source holds a whole period (mixing now would underrun nobody).
@@ -206,6 +238,9 @@ impl Mix {
         let mut acc: Vec<[i32; 2]> = alloc::vec![[0i32; 2]; n];
         let e = self.emitted + n as u64;
         for s in self.srcs.iter_mut() {
+            if s.paused {
+                continue;
+            }
             let have = s.ring.len().min(n);
             if have < n && s.live() {
                 s.underruns += 1;
@@ -237,6 +272,19 @@ static MIX: crate::sync::Mutex<Mix> = crate::sync::Mutex::new(Mix::new());
 const OUT_NONE: u8 = 0;
 const OUT_USB: u8 = 1;
 const OUT_HDA: u8 = 2;
+/// SINKALL: the A2DP stream (`drivers/bt/avdtp.rs`'s PCM ring, 44.1 kHz).
+const OUT_BT: u8 = 3;
+/// The A2DP stream's rate (`avdtp::RATE`), named here so the synthetic leg builds without `a2dp`.
+const BT_RATE: u32 = 44_100;
+
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
+use crate::drivers::ehci::bthid::avdtp as a2dp;
+
+/// SINKALL witnesses: the output kind now (`Out.kind`'s mirror, read without OUT), frames handed to each output kind,
+/// and the mixer's acquisitions of the HDA door (the test's direct-write count compares them with `hda::play`'s epoch).
+static OUT_KIND: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(OUT_NONE);
+static DELIVERED: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+static HDA_OPENS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 struct Out {
     kind: u8,
@@ -248,9 +296,11 @@ struct Out {
     pend: Vec<u8>,
     pend_off: usize,
     said: &'static str,
+    /// SINKALL: the BT rate converter's two clocks (48 kHz frames in, 44.1 kHz frames out).
+    rs: (u64, u64),
 }
 static OUT: crate::sync::Mutex<Out> =
-    crate::sync::Mutex::new(Out { kind: OUT_NONE, hda: 0, draining: false, delivered: 0, pend: Vec::new(), pend_off: 0, said: "" });
+    crate::sync::Mutex::new(Out { kind: OUT_NONE, hda: 0, draining: false, delivered: 0, pend: Vec::new(), pend_off: 0, said: "", rs: (0, 0) });
 /// The sink's play position in emitted frames (the A/V clock's base), refreshed by every pump.
 static SINK_PLAYED: AtomicU64 = AtomicU64::new(0);
 
@@ -258,10 +308,31 @@ static SINK_PLAYED: AtomicU64 = AtomicU64::new(0);
 const MIX_ROW: usize = usize::MAX;
 const MIX_GEN: u64 = u64::MAX;
 
-/// The master stage the sink needs: (gain Q8, mute, level 0..16 for the wire). HDA's codec amp carries the level.
+/// The master stage the sink needs: (gain Q8, mute, level 0..16 for the wire). HDA's codec amp carries the level; a USB
+/// device's feature unit carries it when it has one (SINKALL M2); otherwise — and always on BT — the mixer scales.
 fn master(kind: u8) -> (u16, bool, u8) {
     let (lv, muted) = crate::video::status::volume();
-    if kind == OUT_HDA { (UNITY, false, lv) } else { (lv.min(16) as u16 * 16, muted, lv) }
+    if kind == OUT_HDA || (kind == OUT_USB && usb_hw_volume(lv, muted)) { (UNITY, false, lv) } else { (lv.min(16) as u16 * 16, muted, lv) }
+}
+
+/// SINKALL M2: hand the level to the USB device's feature unit; true when it carries it (the mixer is then unity).
+#[cfg(feature = "uac")]
+fn usb_hw_volume(lv: u8, muted: bool) -> bool {
+    crate::drivers::usb::uac::volume_want(lv, muted)
+}
+
+#[cfg(not(feature = "uac"))]
+fn usb_hw_volume(_: u8, _: bool) -> bool {
+    false
+}
+
+fn kind_name(kind: u8) -> &'static str {
+    match kind {
+        OUT_USB => "usb",
+        OUT_HDA => "hda",
+        OUT_BT => "bt",
+        _ => "none",
+    }
 }
 
 /// The sink `audio::current()` names, as an output kind this image can drive.
@@ -269,6 +340,8 @@ fn wanted() -> u8 {
     match super::current() {
         super::Sink::Usb if cfg!(feature = "uvc") => OUT_USB,
         super::Sink::Hda if super::hda_built() => OUT_HDA,
+        #[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
+        super::Sink::Bt => OUT_BT,
         _ => OUT_NONE,
     }
 }
@@ -297,9 +370,12 @@ fn release(o: &mut Out) {
         OUT_HDA => {
             let _ = crate::drivers::hda::play::r3_close(o.hda as u64, MIX_ROW, MIX_GEN);
         }
+        #[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
+        OUT_BT => a2dp::finish(),
         _ => {}
     }
     o.kind = OUT_NONE;
+    OUT_KIND.store(OUT_NONE, Ordering::Release);
     o.draining = false;
 }
 
@@ -309,15 +385,22 @@ fn acquire(o: &mut Out, kind: u8) -> bool {
         OUT_USB => crate::drivers::usb::uac::begin().map(|_| 0),
         #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
         OUT_HDA => crate::drivers::hda::play::r3_open(MIX_ROW, MIX_GEN, mix_alive, 0, RATE as u64, 2, 16).map_err(|(_, why)| why),
+        #[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
+        OUT_BT => a2dp::begin().map(|_| 0),
         _ => Err("no-sink"),
     };
-    let name = if kind == OUT_USB { "usb" } else { "hda" };
+    let name = kind_name(kind);
     match r {
         Ok(h) => {
             o.kind = kind;
+            OUT_KIND.store(kind, Ordering::Release);
+            if kind == OUT_HDA {
+                HDA_OPENS.fetch_add(1, Ordering::AcqRel);
+            }
             o.hda = h;
             o.draining = false;
             o.delivered = 0;
+            o.rs = (0, 0);
             o.said = "";
             serial_println!("[audio] mix sink={} -> ok", name);
             true
@@ -340,6 +423,8 @@ fn queued(o: &Out) -> u64 {
             let p = crate::drivers::hda::play::r3_pos(o.hda as u64, MIX_ROW, MIX_GEN, una_abi::AUDIO_POS_PLAYED);
             o.delivered.saturating_sub(p.max(0) as u64)
         }
+        #[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
+        OUT_BT => a2dp::queued() as u64 * RATE as u64 / BT_RATE as u64,
         _ => 0,
     };
     pend + held
@@ -359,11 +444,14 @@ fn deliver(o: &mut Out) -> bool {
             OUT_USB => crate::drivers::usb::uac::write(&o.pend[o.pend_off..]) as i64,
             #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
             OUT_HDA => crate::drivers::hda::play::r3_write(o.hda as u64, MIX_ROW, MIX_GEN, &o.pend[o.pend_off..]),
+            #[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
+            OUT_BT => a2dp::write(&o.pend[o.pend_off..]) as i64,
             _ => 0,
         };
         if took > 0 {
             o.pend_off += took as usize;
             o.delivered += took as u64 / 4;
+            DELIVERED[o.kind as usize & 3].fetch_add(took as u64 / 4, Ordering::Relaxed);
         } else {
             if took != una_abi::EAGAIN && took != 0 {
                 // the kernel player took the HDA stream (its `start` bumped the epoch): the handle is gone
@@ -378,13 +466,14 @@ fn deliver(o: &mut Out) -> bool {
     true
 }
 
-/// Drop sources whose owner exited and ended sources the sink has played out.
+/// Drop ring-3 sources whose owner exited and ended ring-3 sources the sink has played out. A KERNEL source (no owner)
+/// leaves by its opener's [`close`], which reads its final [`Played`] (SINKALL).
 fn reap(m: &mut Mix, sink_played: u64) {
     let mut i = 0;
     while i < m.srcs.len() {
         let s = &m.srcs[i];
         let dead = s.owner.as_ref().is_some_and(|o| !(o.alive)(o.row, o.tgen));
-        let done = s.ended && s.ring.is_empty() && s.played48(sink_played) >= s.taken;
+        let done = s.owner.is_some() && s.ended && s.ring.is_empty() && s.played48(sink_played) >= s.taken;
         if dead || done {
             let s = m.srcs.remove(i);
             closed(&s, if dead { "owner-exited" } else { "drained" }, sink_played, m);
@@ -395,8 +484,10 @@ fn reap(m: &mut Mix, sink_played: u64) {
 }
 
 fn closed(s: &Source, reason: &str, sink_played: u64, m: &Mix) {
-    let pid = s.owner.as_ref().map_or(0, |o| o.pid);
-    serial_println!("[audio] close handle={} pid={} name={} reason={} frames={} underruns={}", s.id, pid, s.name, reason, s.played_src(sink_played), s.underruns);
+    match s.owner.as_ref() {
+        Some(o) => serial_println!("[audio] close handle={} pid={} name={} reason={} frames={} underruns={}", s.id, o.pid, s.name, reason, s.played_src(sink_played), s.underruns),
+        None => serial_println!("[audio] source={} sink={} frames={} underruns={}", s.name, kind_name(OUT_KIND.load(Ordering::Acquire)), s.played_src(sink_played), s.underruns),
+    }
     status(m, OUT_NONE);
 }
 
@@ -417,7 +508,11 @@ pub fn pump() {
             let p = m.emitted.saturating_sub(q);
             SINK_PLAYED.store(p, Ordering::Release);
             reap(&mut *m, p);
-            if m.srcs.is_empty() && o.pend_off >= o.pend.len() {
+            // SINKALL: nothing more will come once every source has ENDED and holds nothing (not only when none is
+            // open): HDA gets its end of stream then, so a clip shorter than the ring's prime still runs and drains.
+            let quiet = m.srcs.iter().all(|s| s.ended && s.ring.is_empty());
+            if quiet && o.pend_off >= o.pend.len() {
+                let empty = m.srcs.is_empty();
                 drop(m);
                 match o.kind {
                     #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
@@ -426,7 +521,8 @@ pub fn pump() {
                         o.draining = true;
                     }
                     OUT_HDA => {}
-                    _ => release(o),
+                    _ if empty => release(o),
+                    _ => {}
                 }
                 return;
             }
@@ -452,11 +548,7 @@ pub fn pump() {
             }
             m.period(&mut buf, gain, mute);
         }
-        o.pend.clear();
-        o.pend_off = 0;
-        for v in buf.iter() {
-            o.pend.extend_from_slice(&v.to_le_bytes());
-        }
+        fill_pend(o, &buf);
         if !deliver(o) {
             return;
         }
@@ -465,20 +557,108 @@ pub fn pump() {
 
 // ── Kernel sources ────────────────────────────────────────────────────────────────────────────────────
 
+/// The mixed period into the output's pending bytes: as is (48 kHz), or through [`to_bt_rate`] for the A2DP stream.
+fn fill_pend(o: &mut Out, buf: &[i16]) {
+    o.pend.clear();
+    o.pend_off = 0;
+    if o.kind == OUT_BT {
+        to_bt_rate(&mut o.rs, buf, &mut o.pend);
+    } else {
+        for v in buf.iter() {
+            o.pend.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// SINKALL: interleaved 48 kHz stereo frames to the A2DP stream's 44.1 kHz, nearest-sample (out frame k plays in frame
+/// k x 48000 / 44100 — `Mix::write`'s arithmetic the other way), `rs` = (frames in, frames out) across periods.
+pub fn to_bt_rate(rs: &mut (u64, u64), period: &[i16], out: &mut Vec<u8>) {
+    for f in period.chunks_exact(2) {
+        let gi = rs.0;
+        rs.0 += 1;
+        while rs.1 * RATE as u64 / BT_RATE as u64 <= gi {
+            out.extend_from_slice(&f[0].to_le_bytes());
+            out.extend_from_slice(&f[1].to_le_bytes());
+            rs.1 += 1;
+        }
+    }
+}
+
 /// A kernel source (48 kHz / 2 / 16) at `gain`.
 pub fn open(name: &'static str, gain: u16) -> Result<u32, &'static str> {
+    open_fmt(name, RATE, 2, 16, gain)
+}
+
+/// SINKALL: a kernel source in any `SYS_AUDIO_OPEN` format (8..48 kHz, 1|2 ch, 8|16 bit; widened and resampled on the
+/// way in): the Player (`player` / `video`) and the alert open here. Its opener [`close`]s it.
+pub fn open_fmt(name: &'static str, rate: u32, ch: u8, bits: u8, gain: u16) -> Result<u32, &'static str> {
     let r = {
         let mut m = MIX.lock();
-        let r = m.open(name, RATE, 2, 16, gain, None);
+        let r = m.open(name, rate, ch, bits, gain, None);
         if r.is_ok() {
             status(&m, wanted());
         }
         r
     };
     if let Ok(id) = r {
-        serial_println!("[audio] mix open id={} name={} rate={} ch=2 bits=16 gain={}", id, name, RATE, gain);
+        serial_println!("[audio] mix open id={} name={} rate={} ch={} bits={} gain={}", id, name, rate, ch, bits, gain);
     }
     r.map_err(|(_, why)| why)
+}
+
+/// SINKALL: kernel source `id`'s account now (after a pump), None once it is closed.
+pub fn state(id: u32) -> Option<Played> {
+    pump();
+    let m = MIX.lock();
+    let sp = SINK_PLAYED.load(Ordering::Acquire);
+    m.srcs.iter().find(|s| s.id == id).map(|s| s.account(sp))
+}
+
+/// SINKALL: source frames of `id` the sink has played — the A/V clock. Paint-context safe: `try_lock`, never a pump;
+/// None when the mixer is busy this instant or `id` is closed.
+pub fn played_now(id: u32) -> Option<u64> {
+    let m = MIX.try_lock()?;
+    let sp = SINK_PLAYED.load(Ordering::Acquire);
+    m.srcs.iter().find(|s| s.id == id).map(|s| s.played_src(sp))
+}
+
+/// SINKALL: the opener's close of kernel source `id` (its unmixed frames dropped): its final account.
+pub fn close(id: u32) -> Option<Played> {
+    let r = {
+        let mut m = MIX.lock();
+        let sp = SINK_PLAYED.load(Ordering::Acquire);
+        let s = m.remove(id)?;
+        let p = s.account(sp);
+        closed(&s, "close", sp, &m);
+        p
+    };
+    pump();
+    Some(r)
+}
+
+/// SINKALL: hold source `id` out of the mix (the Player's pause) or put it back.
+pub fn pause(id: u32, on: bool) -> bool {
+    let r = MIX.lock().set_paused(id, on);
+    pump();
+    r
+}
+
+/// SINKALL: the output the mixer drives now (`hda` / `usb` / `bt`), None when none.
+pub fn output() -> Option<&'static str> {
+    match OUT_KIND.load(Ordering::Acquire) {
+        OUT_NONE => None,
+        k => Some(kind_name(k)),
+    }
+}
+
+/// SINKALL: frames handed to the HDA, USB and BT outputs since boot (BT in its 44.1 kHz frames).
+pub fn delivered() -> [u64; 3] {
+    [DELIVERED[OUT_HDA as usize].load(Ordering::Relaxed), DELIVERED[OUT_USB as usize].load(Ordering::Relaxed), DELIVERED[OUT_BT as usize].load(Ordering::Relaxed)]
+}
+
+/// SINKALL: the mixer's acquisitions of the HDA stream since boot.
+pub fn hda_opens() -> u32 {
+    HDA_OPENS.load(Ordering::Acquire)
 }
 
 /// PCM16/2/48k bytes into kernel source `id`, then a pump: the bytes taken (0 = full; retry).
@@ -682,4 +862,33 @@ pub fn selftest() {
     let pass = n == 2 && mixed && mute_ok && under == 0;
     let ok = |b: bool| if b { "ok" } else { "fail" };
     serial_println!(":: AUDIOMIX: sources={} mixed={} underruns={} mute={} -> {} ::", n, ok(mixed), under, ok(mute_ok), if pass { "PASS" } else { "FAIL" });
+}
+
+// ── SINKALL (rmbp-ledger B767): `tests sinkall`'s synthetic Bluetooth leg ─────────────────────────────────────────────
+
+/// The BT output's path offline (QEMU has no Bluetooth; the live sink untouched): `pcm` (48 kHz mono 16-bit, the alert)
+/// as ONE source of an offline [`Mix`], mixed at master level 8 (the mixer's own scale: BT has no AVRCP volume) and
+/// taken through [`to_bt_rate`]. Returns (sources while open, sources after the close, 48 kHz frames mixed, 44.1 kHz
+/// frames out, ok = the frame count is 44.1/48 of the mix within one and the peak is half the input's).
+pub fn bt_synthetic(pcm: &[u8]) -> (usize, usize, u64, u64, bool) {
+    let mut m = Mix::new();
+    let Ok(id) = m.open("alert", RATE, 1, 16, UNITY, None) else { return (0, 0, 0, 0, false) };
+    let open = m.srcs.len();
+    let took = m.write(id, pcm).unwrap_or(0);
+    m.end(id);
+    let (mut rs, mut out, mut buf) = ((0u64, 0u64), Vec::new(), [0i16; PERIOD_FRAMES * 2]);
+    while m.has_data() {
+        m.period(&mut buf, 8 * 16, false);
+        to_bt_rate(&mut rs, &buf, &mut out);
+    }
+    m.remove(id);
+    let after = m.srcs.len();
+    let fin = m.emitted;
+    let fout = (out.len() / 4) as u64;
+    let want = fin * BT_RATE as u64 / RATE as u64;
+    let pin = pcm.chunks_exact(2).map(|b| (i16::from_le_bytes([b[0], b[1]]) as i32).abs()).max().unwrap_or(0);
+    let pout = out.chunks_exact(2).map(|b| (i16::from_le_bytes([b[0], b[1]]) as i32).abs()).max().unwrap_or(0);
+    let ok = took == pcm.len() && fout.abs_diff(want) <= 1 && pout <= pin / 2 + 2 && pout * 5 >= pin * 2; // nearest-sample may skip the peak sample: half, within 20 % below
+    serial_println!("[sinkall] bt synthetic frames_in={} frames_out={} want={} peak_in={} peak_out={} -> {}", fin, fout, want, pin, pout, if ok { "ok" } else { "FAIL" });
+    (open, after, fin, fout, ok)
 }

@@ -173,7 +173,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
-    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); #[cfg(feature = "uvc")] register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); #[cfg(feature = "uac")] register("uacmic", uacmic_fixture); register("clockpainters", clockpainters_selftest); register("hwreport", hwreport_selftest); register("audiomix", audiomix_selftest); register("micring3", micring3_selftest); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] register("a2dp", a2dp_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); #[cfg(all(target_arch = "aarch64", not(feature = "busreg")))] register("hwreport", hwreport_selftest); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment). HWCENSUSARM (SR165): `tests hwreport` on an aarch64 image with no busreg (the tegra line) (LINE-NEUTRAL append, before this comment).
+    ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); #[cfg(feature = "uvc")] register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); #[cfg(feature = "uac")] register("uacmic", uacmic_fixture); register("clockpainters", clockpainters_selftest); register("hwreport", hwreport_selftest); register("audiomix", audiomix_selftest); register("micring3", micring3_selftest); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] register("a2dp", a2dp_selftest); register("sinkall", sinkall_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); #[cfg(all(target_arch = "aarch64", not(feature = "busreg")))] register("hwreport", hwreport_selftest); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment). HWCENSUSARM (SR165): `tests hwreport` on an aarch64 image with no busreg (the tegra line) (LINE-NEUTRAL append, before this comment).
     crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); register("pinchzoom", pinchzoom_selftest); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
@@ -5318,4 +5318,140 @@ fn trashtoast_empty_leg(base: &str) -> bool {
     let (n, bytes, ms) = r.as_ref().map(|&(n, b, ms, _)| (n, b, ms)).unwrap_or((0, 0, 0));
     serial_println!("[trashtoast] empty before={} items={} bytes={} ms={} after={} journal={}->{} toasts={}", before, n, bytes, ms, after, j0, j1, toasts);
     made && trashed == 3 && before == 3 && r.is_ok() && n == 3 && after == 0 && j0 == 1 && j1 == 0 && toasts == 1 && t.stat(base).is_err()
+}
+
+// SINKALL (rmbp-ledger B767; BP-audio-14/15/16) — TAIL-APPENDED. `tests sinkall`: the Player, the video's sound and the
+// alert are mixer sources and the chosen sink is the only writer. For each sink (HDA, USB with `UNAOS_UAC=1`, BT when
+// an A2DP stream runs) chosen through `audio::sink` (the person's choice restored after): the alert through its real
+// latch (`hda::play::request_alert`, the service tick) — the mixer's source count goes 0 -> 1 -> 0 and the alert's
+// frames reach that sink's output. On the first live sink, the Player's source fns as `player` and as `video`
+// (`hda::play::fixture_source`), and the alert over a running Player (the Player's source survives the alert's close).
+// QEMU has no Bluetooth: the BT output's path runs offline (`mixer::bt_synthetic`). direct_writes = HDA stream epochs
+// not opened by the mixer. usb_volume = the device's Feature Unit took SET_CUR (ok), or with no device the descriptor
+// walk of QEMU's unit (fixture).
+// Wire: `[sinkall] leg …`, `[audio] source=<player|video|alert> sink=<hda|usb|bt> frames=<n>`,
+// `:: SINKALL: sources=<n> direct_writes=<n> usb_volume=<ok|fixture|mixer|FAIL|not-built> -> PASS|SKIP|FAIL :: hda= usb= bt= overlap= ::`.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_selftest() {
+    use crate::audio::{self, mixer, Sink};
+    use crate::drivers::hda::play;
+    if mixer::sources() != 0 || play::busy() || play::alert_sounding() {
+        serial_println!(":: SINKALL: sources=- direct_writes=- usb_volume=- -> SKIP reason=output-in-use ::");
+        return;
+    }
+    let was = audio::current();
+    let (e0, o0) = (play::epoch(), mixer::hda_opens());
+    let hda = sinkall_alert("hda", 0);
+    let usb = sinkall_alert("usb", 1);
+    let bt_live = sinkall_alert("bt", 2);
+    let bt = if bt_live != "absent" {
+        bt_live
+    } else {
+        let (open, after, _, _, ok) = mixer::bt_synthetic(&play::alert_fixture_pcm());
+        if open == 1 && after == 0 && ok { "synthetic" } else { "FAIL" }
+    };
+    let live = if hda == "ok" { Some(("hda", 0usize)) } else if usb == "ok" { Some(("usb", 1usize)) } else { None };
+    let (mut sources, mut overlap) = (0u32, "-");
+    if let Some((s, k)) = live {
+        sources = 1; // the alert reached a sink
+        let _ = audio::sink(s);
+        sources += sinkall_player("player", s, k) as u32;
+        sources += sinkall_player("video", s, k) as u32;
+        overlap = if sinkall_overlap(s) { "ok" } else { "FAIL" };
+    }
+    let usb_volume = sinkall_usb_volume(usb);
+    let direct = play::epoch().wrapping_sub(e0) as i64 - mixer::hda_opens().wrapping_sub(o0) as i64;
+    let _ = audio::sink(if was == Sink::Usb { "usb" } else if was == Sink::Hda { "hda" } else { "bt" });
+    let failed = [hda, usb, bt_live, bt, overlap, usb_volume].iter().any(|v| *v == "FAIL");
+    let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 { "PASS" } else { "FAIL" };
+    serial_println!(
+        ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} ::",
+        sources, direct, usb_volume, verdict, hda, usb, bt, overlap
+    );
+}
+
+/// One sink's alert leg: `ok`, `absent` (the sink cannot be chosen on this image or bench) or `FAIL`.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_alert(sink: &str, k: usize) -> &'static str {
+    use crate::audio::mixer;
+    use crate::drivers::hda::play;
+    if crate::audio::sink(sink).is_err() {
+        serial_println!("[sinkall] leg source=alert sink={} -> absent", sink);
+        return "absent";
+    }
+    let d0 = mixer::delivered()[k];
+    let n0 = mixer::sources();
+    let asked = play::request_alert().is_ok();
+    let one = asked && play::pump_until(1_000, || mixer::sources() == 1);
+    let zero = one && play::pump_until(4_000, || mixer::sources() == 0 && !play::alert_sounding());
+    let frames = mixer::delivered()[k].wrapping_sub(d0);
+    let alert = (play::alert_fixture_pcm().len() / 2) as u64; // mono 16-bit, 48 kHz
+    let want = if k == 2 { alert * 44_100 / 48_000 } else { alert };
+    let ok = n0 == 0 && one && zero && frames + 2 >= want;
+    serial_println!("[sinkall] leg source=alert sink={} sources={}->{}->{} frames={} want={} -> {}", sink, n0, one as u8, if zero { 0 } else { 1 }, frames, want, if ok { "ok" } else { "FAIL" });
+    if ok { "ok" } else { "FAIL" }
+}
+
+/// The Player's source as `name` on `sink`: 200 ms through the Player's fns, played out, closed by the service tick.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_player(name: &'static str, sink: &str, k: usize) -> bool {
+    use crate::audio::mixer;
+    use crate::drivers::hda::play;
+    const N: u64 = 9_600;
+    let d0 = mixer::delivered()[k];
+    let opened = play::fixture_source(name).is_ok();
+    let fed = opened && play::pump_until(2_000, || play::fixture_feed(N) >= N);
+    play::fixture_end();
+    let done = fed && play::pump_until(4_000, || !play::busy());
+    let frames = mixer::delivered()[k].wrapping_sub(d0);
+    let ok = done && frames >= N;
+    serial_println!("[sinkall] leg source={} sink={} fed={} done={} frames={} -> {}", name, sink, fed as u8, done as u8, frames, if ok { "ok" } else { "FAIL" });
+    if !done {
+        play::stop();
+    }
+    ok
+}
+
+/// The alert over a running Player on `sink`: both sources mixed, the alert closes, the Player's source is still open
+/// (the stop split: the alert's close and any re-arm of the output never end the play); then the Player is stopped.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_overlap(sink: &str) -> bool {
+    use crate::audio::mixer;
+    use crate::drivers::hda::play;
+    const LONG: u64 = 48_000 * 4;
+    if play::fixture_source("player").is_err() {
+        return false;
+    }
+    let primed = play::pump_until(1_000, || play::fixture_feed(LONG) >= 9_600);
+    let asked = primed && play::request_alert().is_ok();
+    let two = asked && play::pump_until(1_000, || play::fixture_feed(LONG) > 0 && mixer::sources() == 2);
+    let gone = two && play::pump_until(4_000, || play::fixture_feed(LONG) > 0 && !play::alert_sounding());
+    let survived = gone && play::busy() && mixer::sources() == 1;
+    play::stop();
+    let closed = play::pump_until(500, || mixer::sources() == 0);
+    let ok = survived && closed;
+    serial_println!("[sinkall] leg overlap sink={} two={} alert_closed={} player_survived={} closed={} -> {}", sink, two as u8, gone as u8, survived as u8, closed as u8, if ok { "ok" } else { "FAIL" });
+    ok
+}
+
+/// The USB sink's volume: the live device's Feature Unit took SET_CUR (`ok`), has no Volume control (`mixer`: the mixer
+/// scales), refused (`FAIL`); with no device, QEMU's unit through the descriptor walk (`fixture`).
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_usb_volume(usb: &str) -> &'static str {
+    #[cfg(feature = "uac")]
+    {
+        use crate::drivers::usb::uac;
+        if usb != "ok" {
+            return if uac::fu_fixture() { "fixture" } else { "FAIL" };
+        }
+        let took = crate::drivers::hda::play::pump_until(1_500, || uac::volume_state().0 > 0 || uac::volume_state().1);
+        let (sets, refused) = uac::volume_state();
+        serial_println!("[sinkall] usb volume sets={} refused={} on_device={} waited={}", sets, refused as u8, uac::volume_on_device() as u8, took as u8);
+        if refused { "FAIL" } else if sets > 0 { "ok" } else if !uac::volume_on_device() { "mixer" } else { "FAIL" }
+    }
+    #[cfg(not(feature = "uac"))]
+    {
+        let _ = usb;
+        "not-built"
+    }
 }
