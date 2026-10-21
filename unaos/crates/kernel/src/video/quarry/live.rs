@@ -3080,7 +3080,7 @@ pub fn service() {
     }
     {
         let _s = lr::stamp(lr::W_Q_SETTINGS);
-        crate::video::settings::service(); crate::video::settings::hover_poll(); hover_poll(); wm::scroll_service(); // SCROLLVIEW (B764): the thumb drag and the bar's hide, both desktops. // QUARRYHOVER (B647): Quarry's hover pass beside Settings', same shape (line-neutral, code before the comment). SETTINGSCRAFT (B630): the Settings window's hover + pressed-face pass (reads the cursor like the dock's hover; repaints only when the pointer crosses a control). Folded, line-neutral: code before the comment.
+        crate::video::settings::service(); crate::video::settings::hover_poll(); hover_poll(); #[cfg(not(target_arch = "x86_64"))] wm::scroll_service(); // SCROLLVIEW (B764): the thumb drag and the bar's hide — on aarch64 here; SCROLLSERVICEWC (B797): x86's one caller is the render pass (main.rs `x86_render_service`, after `console_launch_drain`), so this x86 call is deleted. // QUARRYHOVER (B647): Quarry's hover pass beside Settings', same shape (line-neutral, code before the comment). SETTINGSCRAFT (B630): the Settings window's hover + pressed-face pass (reads the cursor like the dock's hover; repaints only when the pointer crosses a control). Folded, line-neutral: code before the comment.
     }
     {
         let _s = lr::stamp(lr::W_Q_FONT);
