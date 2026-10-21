@@ -5310,8 +5310,10 @@ fn usbsuspend_selftest() {
     xs::request(true); #[cfg(feature = "ehcihid")] es::request(true);
     let in_u3 = wait(2_000, &|| xs::suspended() && e_down());
     let c = xs::census();
+    let held = usbsuspend_held_queue(in_u3);
     xs::request(false); #[cfg(feature = "ehcihid")] es::request(false);
     let up = wait(2_000, &|| xs::up() && e_up());
+    let held_word = usbsuspend_held_collect(held);
     let r = xs::census();
     let mut probe = None;
     let t0 = crate::arch::ms();
@@ -5328,7 +5330,7 @@ fn usbsuspend_selftest() {
     let verdict = if !in_u3 || !up {
         "FAIL reason=phase-timeout"
     } else if c.pls3 != c.suspended || r.resumed < c.suspended || e.resumed < e.suspended || r.ep_running < r.ep_stopped { "FAIL"
-    } else if kbd != "none" { if kbd != "ok" || c.suspended == 0 { "FAIL" } else { "PASS" }
+    } else if kbd != "none" { if kbd != "ok" || c.suspended == 0 || held_word != "ok" { "FAIL" } else { "PASS" }
     } else if e_kbd == "none" {
         "SKIP reason=no-kbd"
     } else if e_kbd != "ok" || e.ports == 0 || e.suspended != e.ports {
@@ -5338,8 +5340,8 @@ fn usbsuspend_selftest() {
     };
     let (kbd_on, kbd_word) = if kbd != "none" { ("xhci", kbd) } else { ("ehci", e_kbd) };
     serial_println!(
-        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={}",
-        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on
+        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={}",
+        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings
     );
 }
 
@@ -5961,4 +5963,47 @@ fn sinkall_slider_on(sink: &str, k: usize) -> Option<u64> {
         return if closed { None } else { Some(u64::MAX) };
     }
     Some(if closed { ms } else { u64::MAX })
+}
+
+// ══════════════ XHCIHOLDDCI (rmbp-ledger B795) — `tests usbsuspend`'s held leg — TAIL-APPENDED ══════════════
+
+/// XHCIHOLDDCI (B795, BP-power-7): while the ports are SUSPENDED, queue the xHCI keyboard's GET_REPORT over EP0
+/// (`held_report_queue`: its doorbell is held and remembered). `Err` = the leg's word (`phase`, `none`, `unheld`, `busy`).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_held_queue(in_u3: bool) -> Result<u64, &'static str> {
+    if !in_u3 {
+        return Err("phase");
+    }
+    let t0 = crate::arch::ms();
+    loop {
+        match crate::drivers::xhci::claim() {
+            Ok(mut x) => return x.held_report_queue(),
+            Err(_) if crate::arch::ms().wrapping_sub(t0) < 1_000 => crate::arch::sched::sleep_ms(5),
+            Err(_) => return Err("busy"),
+        }
+    }
+}
+
+/// XHCIHOLDDCI (B795): after UP, the held GET_REPORT's completion (`held_report_collect`): `ok` = a report of bytes,
+/// `fail` = an error or no bytes, `lost` = its pending was replaced; a queue refusal passes its own word through.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_held_collect(queued: Result<u64, &'static str>) -> &'static str {
+    let phys = match queued {
+        Ok(p) => p,
+        Err(w) => return w,
+    };
+    let t0 = crate::arch::ms();
+    loop {
+        match crate::drivers::xhci::claim() {
+            Ok(mut x) => {
+                return match x.held_report_collect(phys) {
+                    Some((cc, len)) if matches!(cc, 1 | 13) && len > 0 => "ok",
+                    Some(_) => "fail",
+                    None => "lost",
+                };
+            }
+            Err(_) if crate::arch::ms().wrapping_sub(t0) < 1_000 => crate::arch::sched::sleep_ms(5),
+            Err(_) => return "busy",
+        }
+    }
 }

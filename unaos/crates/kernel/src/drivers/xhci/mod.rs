@@ -3899,7 +3899,7 @@ impl XhciController {
     }
 
     pub fn ring_doorbell(&mut self, slot_id: u8, target: u32) {
-        #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] { if suspend::doorbell_held(slot_id) { return; } } unsafe { // STOPENDPOINT (B775): a slot on a port the sleep state suspended rings nothing; the TRB stays queued and `suspend::endpoints_restart` rings it after the recovery. LINE-NEUTRAL fold, code first
+        #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] { if suspend::doorbell_held(slot_id, target) { return; } } unsafe { // STOPENDPOINT (B775): a slot on a port the sleep state suspended rings nothing; the TRB stays queued, its DCI is remembered (XHCIHOLDDCI B795) and `suspend::endpoints_restart` rings it after the recovery. LINE-NEUTRAL fold, code first
             // 1. Find Doorbell Offset (Offset 0x14 in Cap Regs)
             let dboff_ptr = (self.base_addr + 0x14) as *const u32;
             let dboff = core::ptr::read_volatile(dboff_ptr) & !0x03; // 4-byte aligned
@@ -18038,6 +18038,10 @@ pub mod suspend {
     //! per-slot word, `HELD`, written only by the loan holder, is what the two shared sites read: `ring_doorbell` rings
     //! nothing for a held slot ([`doorbell_held`]) and the transfer dispatch keeps a Stopped TD on a held DCI
     //! ([`stopped_keep`]) — the xHC re-executes it on the restart, so no claim may retire or re-arm it.
+    //!
+    //! XHCIHOLDDCI (B795): a held doorbell is REMEMBERED per DCI (`RANG`) and `endpoints_restart` rings every remembered DCI
+    //! the stop did not stop as well. xHCI 1.2 §4.15.1: software rings the doorbells after the resume; §4.15.2.2: the resume
+    //! is software's PORTSC write — no doorbell resumes a U3 port, so a ring there would put the TD on a suspended link.
     use super::{XhciController, PORT_CHANGE_BITS};
     use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -18078,6 +18082,11 @@ pub mod suspend {
     /// Set BEFORE each Stop is pushed (`run_command_sync` pumps the event ring, so the cc=26 Transfer Event is
     /// dispatched ahead of the Command Completion); cleared by `endpoints_restart` before it rings. Loan holder only.
     static HELD: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
+    /// XHCIHOLDDCI (B795): per slot, bit `dci` = a doorbell for that DCI was held (`HELD` is full: bit 0 + bits 1..31).
+    /// Written by `doorbell_held` (`ring_doorbell` is `&mut self`: the loan holder), taken by `endpoints_restart`.
+    static RANG: [AtomicU32; 256] = [const { AtomicU32::new(0) }; 256];
+    /// Doorbells the hold suppressed this cycle (zeroed by `ports_suspend`).
+    static HELD_RINGS: AtomicU32 = AtomicU32::new(0);
     /// DCIs read Stopped(3) after their Stop; of those, DCIs read Running(1) after the restart doorbell.
     static EP_STOPPED_N: AtomicU32 = AtomicU32::new(0);
     static EP_RUNNING_N: AtomicU32 = AtomicU32::new(0);
@@ -18090,7 +18099,7 @@ pub mod suspend {
 
     /// One cycle's numbers, for `tests usbsuspend`.
     #[derive(Clone, Copy)]
-    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32 }
+    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32, pub held_rings: u32 }
 
     /// `true` while the ports are in U3 (the last request has been applied); `false` once fully back in U0.
     pub fn suspended() -> bool { PHASE.load(Ordering::Acquire) == SUSPENDED }
@@ -18101,12 +18110,20 @@ pub mod suspend {
             ports: PORTS.load(Ordering::Relaxed), suspended: SUSPENDED_N.load(Ordering::Relaxed), pls3: PLS3_N.load(Ordering::Relaxed),
             resumed: RESUMED_N.load(Ordering::Relaxed), kept: KEPT_N.load(Ordering::Relaxed), remote_wakes: REMOTE_WAKES.load(Ordering::Relaxed),
             ep_stopped: EP_STOPPED_N.load(Ordering::Relaxed), ep_running: EP_RUNNING_N.load(Ordering::Relaxed),
+            held_rings: HELD_RINGS.load(Ordering::Relaxed),
         }
     }
 
     /// `ring_doorbell`'s guard: a slot on a port this driver suspended rings nothing (slot 0, the command ring, is never
-    /// held). The TRB the caller queued stays on its ring for `endpoints_restart`'s doorbell.
-    pub(super) fn doorbell_held(slot: u8) -> bool { HELD[slot as usize].load(Ordering::Relaxed) != 0 }
+    /// held). The TRB the caller queued stays on its ring for `endpoints_restart`'s doorbell: the DCI (DB Target, bits 7:0,
+    /// xHCI 1.2 §5.6; no caller passes a Stream ID) is remembered in `RANG` and the suppression counted (XHCIHOLDDCI B795).
+    pub(super) fn doorbell_held(slot: u8, target: u32) -> bool {
+        if HELD[slot as usize].load(Ordering::Relaxed) == 0 { return false; }
+        let dci = target & 0xFF;
+        if (1..=31).contains(&dci) { RANG[slot as usize].fetch_or(1u32 << dci, Ordering::Relaxed); }
+        HELD_RINGS.fetch_add(1, Ordering::Relaxed);
+        true
+    }
 
     /// The transfer dispatch's keep: a Stopped (26) or Stopped - Length Invalid (27) event on a DCI this driver stopped
     /// names a TD the xHC resumes on the restart doorbell (xHCI 1.2 §4.6.9), so it is neither retired nor re-armed.
@@ -18144,6 +18161,7 @@ pub mod suspend {
             let (mut mask, mut usb2) = (0u64, 0u64);
             EP_STOPPED_N.store(0, Ordering::Relaxed);
             EP_RUNNING_N.store(0, Ordering::Relaxed);
+            HELD_RINGS.store(0, Ordering::Relaxed);
             for port in 1..=self.max_ports.min(64) {
                 let portsc = self.read_portsc(port);
                 if portsc & 0b11 != 0b11 { continue; } // CCS and PED: an enabled device
@@ -18255,11 +18273,13 @@ pub mod suspend {
         }
 
         /// After the resume's recovery: every held slot's word is taken (so `doorbell_held` opens) and each stopped
-        /// DCI's doorbell is rung (Stopped -> Running, xHCI 1.2 §4.8.3), then its state read, bounded 5 ms.
+        /// DCI's doorbell is rung (Stopped -> Running, xHCI 1.2 §4.8.3), then its state read, bounded 5 ms. Then each DCI
+        /// whose doorbell the hold remembered and the stop did not stop is rung (XHCIHOLDDCI B795, xHCI 1.2 §4.15.1).
         fn endpoints_restart(&mut self) {
             let mut running = 0u32;
             for slot in 1..self.slots.len().min(HELD.len()) {
                 let held = HELD[slot].swap(0, Ordering::Relaxed);
+                let rang = RANG[slot].swap(0, Ordering::Relaxed) & !held;
                 for dci in 1..=31u8 {
                     if held & (1u32 << dci) == 0 { continue; }
                     self.ring_doorbell(slot as u8, dci as u32);
@@ -18271,6 +18291,11 @@ pub mod suspend {
                     }
                     if state == 1 { running += 1; }
                     serial_println!("[usb] slot={} dci={} ring -> state={}", slot, dci, state);
+                }
+                for dci in 1..=31u8 {
+                    if rang & (1u32 << dci) == 0 { continue; }
+                    self.ring_doorbell(slot as u8, dci as u32);
+                    serial_println!("[usb] slot={} dci={} ring held -> state={}", slot, dci, self.ep_state_of(slot as u8, dci));
                 }
             }
             EP_RUNNING_N.store(running, Ordering::Relaxed);
@@ -18343,6 +18368,41 @@ pub mod suspend {
             if buf == 0 { return None; }
             let cc = self.sync_control(slot, 0xA1, 0x01, 0x0100, intf as u16, 8, buf, true).unwrap_or(0);
             Some((cc, self.ep_state_of(slot, dci), self.last_control_len))
+        }
+
+        /// XHCIHOLDDCI (B795), `tests usbsuspend`'s held leg, front half: while the ports are SUSPENDED, the keyboard's
+        /// GET_REPORT(Input) (HID 1.11 §7.2.1, the request `kbd_report_probe` sends) queued on its EP0 as `sync_control`
+        /// queues it (`push_ep0` Setup/Data/Status, the `ep0_pending` the transfer dispatch claims) but NOT waited for:
+        /// `ring_doorbell` holds it and remembers DCI 1. `Ok(status TRB phys)`; `Err` word: `phase` (not SUSPENDED),
+        /// `none` (no keyboard), `unheld` (its slot is not held), `busy` (EP0 pending in flight).
+        pub fn held_report_queue(&mut self) -> Result<u64, &'static str> {
+            if !suspended() { return Err("phase"); }
+            let (slot, _dci, intf) = self.kbd_slot_on(0).ok_or("none")?;
+            let buf = self.slots[slot as usize].descriptor_buffer as u64;
+            if buf == 0 { return Err("none"); }
+            if HELD[slot as usize].load(Ordering::Relaxed) == 0 { return Err("unheld"); }
+            if self.ep0_pending.is_some() { return Err("busy"); }
+            let setup: u64 = 0xA1 | (0x01 << 8) | (0x0100u64 << 16) | ((intf as u64) << 32) | (8u64 << 48);
+            self.push_ep0(slot, super::Trb { parameter: setup, status: 8, control: (2 << 10) | (1 << 6) | (3 << 16) });
+            let data_trb_phys = self.push_ep0(slot, super::Trb { parameter: buf, status: 8, control: (3 << 10) | (1 << 5) | (1 << 16) });
+            let status_phys = self.push_ep0(slot, super::Trb { parameter: 0, status: 0, control: (4 << 10) | (1 << 5) });
+            if status_phys == 0 { return Err("none"); }
+            self.ep0_pending = Some(super::Ep0Pending {
+                slot_id: slot, wait_trb_phys: status_phys, done: false, completion_code: 0,
+                data_trb_phys, data_residual: 0, data_seen: false,
+            });
+            self.ring_doorbell(slot, 1);
+            Ok(status_phys)
+        }
+
+        /// The held leg's back half, after UP: `None` = the parked `ep0_pending` is no longer this transfer (lost);
+        /// else pump until the dispatch claimed its Status TRB (`pump_until_ep0_done`) and `Some((cc, bytes))`.
+        pub fn held_report_collect(&mut self, status_phys: u64) -> Option<(u8, u32)> {
+            if self.ep0_pending.map(|p| p.wait_trb_phys) != Some(status_phys) { return None; }
+            let pumped = self.pump_until_ep0_done();
+            let p = self.ep0_pending.take()?;
+            if pumped.is_err() || !p.done { return Some((0, 0)); }
+            Some((p.completion_code, if p.data_seen { 8u32.saturating_sub(p.data_residual) } else { 0 }))
         }
     }
 }
