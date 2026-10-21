@@ -541,7 +541,7 @@ fn restack(st: &mut St, pw: usize) {
 fn close_card(st: &mut St, i: usize, by: &str) -> Option<Note> {
     let c = st.cards[i].take()?;
     if c.win != wm::WIN_NONE {
-        wm::close(c.win);
+        row_unpub(c.surf, c.win); wm::close(c.win); // TOASTFLICKER (B815): out of the occluder sets before the row goes, so its vacated box is erased
     }
     if wire() {
         serial_println!("[notify] closed by={} title={}", by, s(c.n.title()));
@@ -575,7 +575,7 @@ fn promote(st: &mut St, pw: usize, now: u64) {
 }
 
 fn show_now(st: &mut St, n: Note, pw: usize, now: u64) {
-    let sf = free_surf(st);
+    let sf = free_surf(st); let p0 = wm::comp_scratch_counts().0; // TOASTFLICKER (B815): the passes this show takes
     paint_card(sf, &n);
     // newest on top: shift the stack down one slot, then open the new card at slot 0
     for i in (1..STACK_MAX).rev() {
@@ -584,7 +584,7 @@ fn show_now(st: &mut St, n: Note, pw: usize, now: u64) {
     st.cards[0] = None;
     let f0 = wm::focus_asid();
     let (x, y, _, _) = card_rect(pw, 0);
-    let win = open_row(sf, x, y);
+    let win = open_row(sf, x, y); row_pub(sf, win); // TOASTFLICKER (B815): the row joins the compositor's occluder sets (`wm::toast_occludes`)
     st.cards[0] = Some(Card { n, win, until: now.saturating_add(CARD_MS).max(1), surf: sf, at: now, left: 0 }); // NOTICEFIX (B491): the pass's clock, never a second read of it
     SHOWN.fetch_add(1, Ordering::Relaxed);
     restack(st, pw);
@@ -592,7 +592,7 @@ fn show_now(st: &mut St, n: Note, pw: usize, now: u64) {
     if !kept {
         FOCUS_MOVED.fetch_add(1, Ordering::Relaxed);
     }
-    if wire() { serial_println!("[notify] show win={} slot=0 app={} title={} line={} ms={} focus={}", win, s(n.app()), s(n.title()), s(n.line()), CARD_MS, if kept { "kept" } else { "MOVED" }); }
+    if wire() { serial_println!("[notify] show win={} slot=0 app={} title={} line={} ms={} focus={}", win, s(n.app()), s(n.title()), s(n.line()), CARD_MS, if kept { "kept" } else { "MOVED" }); } if wire() && win != wm::WIN_NONE { serial_println!("[notify] toast present bracket={} passes={}", owns_row(win) as u8, wm::comp_scratch_counts().0.wrapping_sub(p0)); } // TOASTFLICKER (B815) M2: bracket=1 = the card is in the occluder sets the desktop present, the erase drain and the window blit subtract
 }
 
 fn center_close(st: &mut St, by: &str) {
@@ -601,7 +601,7 @@ fn center_close(st: &mut St, by: &str) {
     }
     let w = core::mem::replace(&mut st.center, wm::WIN_NONE);
     if w != wm::WIN_NONE {
-        wm::close(w);
+        row_unpub(STACK_MAX, w); wm::close(w); // TOASTFLICKER (B815)
     }
     ROW_N.store(0, Ordering::Release);
     serial_println!("[notify] center close by={}", by);
@@ -612,7 +612,7 @@ fn center_close(st: &mut St, by: &str) {
 fn center_show(st: &mut St, pw: usize, now: u64) -> (usize, usize, usize) {
     let w = core::mem::replace(&mut st.center, wm::WIN_NONE);
     if w != wm::WIN_NONE {
-        wm::close(w);
+        row_unpub(STACK_MAX, w); wm::close(w); // TOASTFLICKER (B815)
     }
     let (items, apps, shown) = paint_center(&st.ring, now);
     for &k in shown.iter() {
@@ -620,7 +620,7 @@ fn center_show(st: &mut St, pw: usize, now: u64) -> (usize, usize, usize) {
     }
     recount(&st.ring);
     let (x, y, _, _) = center_rect(pw);
-    st.center = open_row(STACK_MAX, x, y);
+    st.center = open_row(STACK_MAX, x, y); row_pub(STACK_MAX, st.center); // TOASTFLICKER (B815)
     CENTER_OPEN.store(true, Ordering::Release);
     (items, apps, shown.len())
 }
@@ -1193,13 +1193,14 @@ pub fn toastcap_selftest() {
     MUTE.store(false, Ordering::Relaxed);
     restore(h);
     let (dialogs, primary_max, ret_ok, esc_ok) = super::dialog::toastcap_leg();
-    let toast_ok = posted == N && shown_max == STACK_MAX && queued == N - STACK_MAX && dropped == 0 && hover_ok && shown == N && drained;
+    let (readback, leaks, flicker) = toastflicker_leg(); // TOASTFLICKER (B815) M3: the live read-back leg (file tail)
+    let toast_ok = flicker != "FAIL" && posted == N && shown_max == STACK_MAX && queued == N - STACK_MAX && dropped == 0 && hover_ok && shown == N && drained;
     let ok = toast_ok && dialogs > 0 && primary_max == 1 && ret_ok && esc_ok;
     let w = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!(
-        ":: TOASTCAP: posted={} shown_max={} queued={} dropped={} hover_pause={} dialogs={} primary_max={} return={} esc={} -> {} :: shown={} drained={} card_ms={} held={} resumed={} left={}",
+        ":: TOASTCAP: posted={} shown_max={} queued={} dropped={} hover_pause={} dialogs={} primary_max={} return={} esc={} -> {} :: shown={} drained={} card_ms={} held={} resumed={} left={} readback={} backdrop_leaks={} flicker={}",
         posted, shown_max, queued, dropped, w(hover_ok), dialogs, primary_max, w(ret_ok), w(esc_ok), if ok { "PASS" } else { "FAIL" },
-        shown, w(drained), CARD_MS, w(held), w(resumed), w(left)
+        shown, w(drained), CARD_MS, w(held), w(resumed), w(left), readback, leaks, flicker
     );
 }
 
@@ -1471,4 +1472,148 @@ fn softy_center_at(pw: usize, sw: usize, sh: usize) -> Option<(usize, usize)> {
         _ => pw.saturating_sub(sw + gap),
     };
     Some((x, y))
+}
+
+// ── TOASTFLICKER (rmbp-ledger B815) — the cards are in the compositor's occluder sets ────────────────────────────
+// Flight 37 (Peter: "notification pop-up getting leak through flickers of the background"). The cards present INSIDE
+// the one bracketed pass already (`open_row`, `wm::move_to`, `wm::close`, `wm::present` each end in `composite`); the
+// leak was that a card is a COMPAT row and every backdrop painter's occluder set skipped compat rows — the desktop
+// present (`wm::occluders`, subtracted by `Screen::flush`), the erase drain (`erase_clip`) and the window blit
+// (`occ_clip`) — so the desktop's rects, a shadow or vacate fill, or a window below published over a live card and
+// nothing re-blitted it until its next present. `wm::toast_occludes` (wm.rs tail) admits notify's rows to all three,
+// with the box read from the same table snapshot the set is built from; this module only says which rows are its own.
+// Writer: the pass under `ST` (`row_pub` after a real `open_row`, `row_unpub` before `wm::close`). Reader: wm's set
+// builders under their own table hold — atomics only, no lock taken, so no lock-order edge.
+
+/// The live overlay row ids, by surface index (`STACK_MAX` = the Center); `WIN_NONE` = none.
+static ROW_WIN: [AtomicU32; SURF_N] = [const { AtomicU32::new(wm::WIN_NONE) }; SURF_N];
+
+fn row_pub(i: usize, win: wm::WinId) {
+    if win != wm::WIN_NONE && i < SURF_N {
+        ROW_WIN[i].store(win, Ordering::Release);
+    }
+}
+
+/// CAS, so a headless fixture's close (its `win` is `WIN_NONE`) never clears a live card's id.
+fn row_unpub(i: usize, win: wm::WinId) {
+    if win != wm::WIN_NONE && i < SURF_N {
+        let _ = ROW_WIN[i].compare_exchange(win, wm::WIN_NONE, Ordering::AcqRel, Ordering::Relaxed);
+    }
+}
+
+/// Is `id` one of notify's live rows (a card or the Center)? Read by `wm::toast_occludes`.
+pub fn owns_row(id: wm::WinId) -> bool {
+    id != wm::WIN_NONE && ROW_WIN.iter().any(|w| w.load(Ordering::Acquire) == id)
+}
+
+/// The leg's line on its cards (the cleanup's key).
+const FIX_LINE: &[u8] = b"toastflicker fixture";
+
+/// `tests toastcap`'s M3 leg (TOASTFLICKER B815), LIVE (never headless): three real cards shift through the stack
+/// (each show opens a row and re-seats the others: `move_to` -> reclaim + `request_present_rect(old, new)` +
+/// composite), then 48 samples ~25 ms apart (past the render task's 1 Hz floor, so the queued desktop rects flush
+/// mid-run; every 8th sample re-queues them over every live card) each run a composite (the erase drain) and read
+/// back 3 points per card from the panel against the card's own surface. `(readback, backdrop_leaks, verdict)`:
+/// `ok`, `FAIL` (a point differed), or `skip(<why>)`. Go-red: `wm::toast_occludes` -> `false`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn toastflicker_leg() -> (usize, usize, &'static str) {
+    if HEADLESS.load(Ordering::Relaxed) {
+        return (0, 0, "skip(headless)");
+    }
+    {
+        let g = ST.lock();
+        if g.cards.iter().any(|c| c.is_some()) || !g.wait.is_empty() || CENTER_OPEN.load(Ordering::Relaxed) {
+            return (0, 0, "skip(busy)");
+        }
+    }
+    let (pw, ph) = panel();
+    if pw == 0 || ph == 0 {
+        return (0, 0, "skip(panel)");
+    }
+    if super::blitter::a11yfilter::active() {
+        return (0, 0, "skip(filter)");
+    }
+    if super::zoom::want().0 >= 2 {
+        return (0, 0, "skip(zoom)");
+    }
+    super::notifypane::bypass(true, true);
+    let dnd0 = DND.swap(false, Ordering::Relaxed);
+    for k in 0..STACK_MAX {
+        let t = [b'F', b'L', b'0' + k as u8];
+        let _ = post_full(b"system", &t, FIX_LINE, b"", ACT_NONE, b"");
+        // the pass that shows it (the live service may take the inbound queue first: wait for the card either way)
+        for _ in 0..40 {
+            pass(crate::arch::ms());
+            let up = ST.lock().cards[0].map(|c| c.n.title() == &t[..]).unwrap_or(false);
+            if up {
+                break;
+            }
+            crate::arch::sched::sleep_ms(5);
+        }
+    }
+    let (sw, sh) = (metrics::size(W), metrics::size(H));
+    let pts = [(sw / 2, metrics::size(6)), (metrics::size(20), sh / 2), (sw - metrics::size(20), sh - metrics::size(6))];
+    let (mut readback, mut leaks) = (0usize, 0usize);
+    for k in 0..48 {
+        let live: Vec<(usize, wm::WinId)> = {
+            let g = ST.lock();
+            g.cards.iter().flatten().filter(|c| c.n.line() == FIX_LINE && c.win != wm::WIN_NONE).map(|c| (c.surf, c.win)).collect()
+        };
+        if k % 8 == 0 {
+            for &(_, win) in live.iter() {
+                if let Some(i) = wm::info(win) {
+                    super::screen::request_present_rect(i.x, i.y, i.w, i.h);
+                }
+            }
+        }
+        wm::composite();
+        let sprite = super::cursor::sprite_box();
+        for &(sf, win) in live.iter() {
+            let Some(i) = wm::info(win) else { continue };
+            let px = surf(sf);
+            for &(sx, sy) in pts.iter() {
+                let (gx, gy) = (i.x + sx, i.y + sy);
+                if sprite.map(|b| gx >= b.0 && gy >= b.1 && gx < b.0 + b.2 && gy < b.1 + b.3).unwrap_or(false) {
+                    continue; // the arrow's pixels are the cursor's, not the card's
+                }
+                let want = px.get(sy * sw + sx).copied();
+                let got = {
+                    let fb = *super::WRITER.lock();
+                    fb.read_pixel(gx, gy)
+                };
+                if let (Some(a), Some(b)) = (want, got) {
+                    readback += 1;
+                    if (a ^ b) & 0x00ff_ffff != 0 {
+                        leaks += 1;
+                    }
+                }
+            }
+        }
+        crate::arch::sched::sleep_ms(25);
+    }
+    {
+        let mut g = ST.lock();
+        let mut closed = false;
+        for i in 0..STACK_MAX {
+            if g.cards[i].map(|c| c.n.line() == FIX_LINE).unwrap_or(false) {
+                let _ = close_card(&mut g, i, "fixture");
+                closed = true;
+            }
+        }
+        if closed {
+            restack(&mut g, pw);
+        }
+        g.wait.retain(|n| n.line() != FIX_LINE);
+        g.ring.retain(|n| n.line() != FIX_LINE);
+        recount(&g.ring);
+    }
+    DND.store(dnd0, Ordering::Relaxed);
+    super::notifypane::bypass(false, false);
+    let verdict = if leaks > 0 { "FAIL" } else if readback == 0 { "skip(unread)" } else { "ok" };
+    (readback, leaks, verdict)
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+fn toastflicker_leg() -> (usize, usize, &'static str) {
+    (0, 0, "skip(arch)") // aarch64: `open_row` opens no overlay row there (wire-only), so there is no card to read back
 }
