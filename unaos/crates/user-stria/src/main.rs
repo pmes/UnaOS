@@ -71,7 +71,7 @@ use una_abi::{
     input_ev_payload, input_ev_type, input_ev_xy, AUDIO_POS_PLAYED, AUDIO_POS_UNDERRUNS, AUDIO_WRITE_MAX, BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY,
     BUS_MAGIC, BUS_VERB_NOTICE, CURSOR_ARROW, CURSOR_HAND, EAGAIN, INPUT_EV_BUTTON, INPUT_EV_CLOSE_REQ, INPUT_EV_KEY_DOWN, INPUT_EV_MOUSE_ABS, KEY_DOWN,
     KEY_ESC, KEY_LEFT, KEY_RIGHT, KEY_UP, MRECV_NOWAIT, SYS_AUDIO_CLOSE, SYS_AUDIO_OPEN, SYS_AUDIO_POS, SYS_AUDIO_WRITE, SYS_CURSOR_SHAPE, SYS_INPUT_POLL,
-    SYS_MRECV, SYS_WIN_CREATE, SYS_WIN_PRESENT,
+    SYS_WIN_CREATE, SYS_WIN_PRESENT,
 };
 
 #[global_allocator]
@@ -735,19 +735,27 @@ fn notice_path() -> Option<String> {
     static mut RX: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
     // SAFETY: one thread; nothing else borrows RX.
     let rx = unsafe { &mut *core::ptr::addr_of_mut!(RX) };
-    loop {
-        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, MRECV_NOWAIT, 0);
+    loop { // BUSKEEPCRATE (LEDGER SR186; BP-ring3-19): the program's ONE reader, KEEPREADERS' shape — drained every pass
+        let n = una_abi::mbox_recv(rx, MRECV_NOWAIT, vein_ring3::bus::keep(), sys); // the program's kept frames first, then the mailbox
         if n < BUS_HDR_LEN as i64 {
-            return None;
+            return None; // -EAGAIN: the mailbox is empty
         }
-        if rx[0..4] == BUS_MAGIC && rx[5] == BUS_KIND_REPLY && rx[6] == BUS_VERB_NOTICE {
-            let blen = u32::from_le_bytes([rx[48], rx[49], rx[50], rx[51]]) as usize;
-            let body = &rx[BUS_HDR_LEN..(BUS_HDR_LEN + blen).min(n as usize)];
-            if let Ok(p) = core::str::from_utf8(body) {
-                if p.starts_with('/') {
-                    return Some(String::from(p));
+        if rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY {
+            continue; // not a kernel delivery: nothing of this program reads it
+        }
+        match rx[6] {
+            BUS_VERB_NOTICE => {
+                let blen = u32::from_le_bytes([rx[48], rx[49], rx[50], rx[51]]) as usize;
+                let body = &rx[BUS_HDR_LEN..(BUS_HDR_LEN + blen).min(n as usize)];
+                if let Ok(p) = core::str::from_utf8(body) {
+                    if p.starts_with('/') {
+                        return Some(String::from(p)); // a Quarry open: the file's absolute path
+                    }
                 }
             }
+            una_abi::BUS_VERB_OPEN_ARG => {} // a running instance's launch argument: not read yet (owed, LEDGER SR186's proposal)
+            una_abi::BUS_VERB_PREF_CHANGED => {} // Stria subscribes to no key
+            _ => {} // a reply no ask waits for (Stria asks nothing through `bus_ask` today)
         }
     }
 }

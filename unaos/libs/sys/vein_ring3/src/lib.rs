@@ -21,39 +21,56 @@
 //! * [`holocron`] (HOLOCRON2 B355) — the key from Holocron first (SecretGet over the bus, `keysource::decide`).
 //! * [`key`] — the key file: read only when it stats with an inode id (UnaFS); refused on FAT.
 //! * [`send`] / [`exchange_over`] — one exchange end to end: resolve, connect, TLS, encode, stream.
+//!
+//! BUSKEEPCRATE (LEDGER SR186): everything but `bus`, `drop`, `files`, `heap` and `sys` is feature `tls` (default on);
+//! a program that needs only its bus keep (STRIA.ELF) links `default-features = false` and no TLS crate.
 #![no_std]
 
 extern crate alloc;
 
 pub mod bus; // DROPLOOPS (SR179): the program's ONE mailbox keep and bus::ask (BP-ring3-19)
+#[cfg(feature = "tls")]
 pub mod clock;
 pub mod drop; // DRAGDROP2 (B470): the ring-3 drop protocol's client (BUS_VERB_DROP_GET)
 pub mod heap;
 pub mod files;
+#[cfg(feature = "tls")]
 pub mod holocron;
+#[cfg(feature = "tls")]
 pub mod key;
+#[cfg(feature = "tls")]
 pub mod net;
+#[cfg(feature = "tls")]
 pub mod prefs;
 #[cfg(feature = "cryptocore")]
 pub mod provider;
 pub mod sys;
+#[cfg(feature = "tls")]
 pub mod tls;
+#[cfg(feature = "tls")]
 pub mod trust;
 
-use alloc::boxed::Box;
-use tls_core::x509::{LoadReport, TrustStore};
-use tls_core::CryptoProvider;
-use vein_core::claude::{self, Event, Msg, Params};
-use vein_core::client::{self, Fail, Outcome, Transport};
-use vein_core::prefs::{Endpoint, Verify};
+// BUSKEEPCRATE (SR186): everything below is the `tls` half (the exchange and its TLS setup), one cfg per item.
+#[cfg(feature = "tls")]
+use {
+    alloc::boxed::Box,
+    tls_core::x509::{LoadReport, TrustStore},
+    tls_core::CryptoProvider,
+    vein_core::claude::{self, Event, Msg, Params},
+    vein_core::client::{self, Fail, Outcome, Transport},
+    vein_core::prefs::{Endpoint, Verify},
+};
 
+#[cfg(feature = "tls")]
 pub use tls::{TlsContext, TlsFail, Verified};
 
 /// Every TLS connection this library opens verifies the server (there is no other kind).
+#[cfg(feature = "tls")]
 pub const VERIFIES_CERTS: bool = true;
 
 /// The buffers one exchange needs, owned by the caller (a ring-3 program keeps them in a static). The TLS
 /// record buffers are on the heap now (tls_core allocates them).
+#[cfg(feature = "tls")]
 pub struct Buffers {
     pub body: [u8; 48 * 1024],
     pub head: [u8; 1024],
@@ -61,12 +78,14 @@ pub struct Buffers {
     pub line: [u8; 16 * 1024],
 }
 
+#[cfg(feature = "tls")]
 impl Buffers {
     pub const fn new() -> Self {
         Buffers { body: [0; 48 * 1024], head: [0; 1024], rx: [0; 4096], line: [0; 16 * 1024] }
     }
 }
 
+#[cfg(feature = "tls")]
 impl Default for Buffers {
     fn default() -> Self {
         Self::new()
@@ -74,6 +93,7 @@ impl Default for Buffers {
 }
 
 /// Where an exchange failed before or around the HTTP layer.
+#[cfg(feature = "tls")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Encode,
@@ -88,6 +108,7 @@ pub enum Stage {
     Exchange(Fail),
 }
 
+#[cfg(feature = "tls")]
 impl Stage {
     pub fn name(&self) -> &'static str {
         match self {
@@ -124,6 +145,7 @@ impl Stage {
 }
 
 /// The answer: the HTTP outcome and, over TLS, the issuer the handshake verified.
+#[cfg(feature = "tls")]
 #[derive(Debug, Clone, Copy)]
 pub struct Sent {
     pub out: Outcome,
@@ -131,6 +153,7 @@ pub struct Sent {
 }
 
 /// The encoded request, ready in [`Buffers`]: head and body lengths.
+#[cfg(feature = "tls")]
 #[derive(Debug, Clone, Copy)]
 pub struct Prepared {
     head: usize,
@@ -140,6 +163,7 @@ pub struct Prepared {
 /// Encode the request into `bufs` (head + body). Split from [`send`] so the caller's conversation is
 /// borrowed only while it is encoded, and free again while the answer streams into it. A key for a
 /// plain-HTTP endpoint is refused here (the rule never asks for one; this is the belt to its braces).
+#[cfg(feature = "tls")]
 pub fn prepare<'m>(ep: &Endpoint<'_>, p: &Params<'_>, msgs: impl Iterator<Item = Msg<'m>> + Clone, key: Option<&str>, bufs: &mut Buffers) -> Result<Prepared, Stage> {
     if key.is_some() && !ep.tls {
         return Err(Stage::KeyOverPlain);
@@ -164,6 +188,7 @@ pub fn prepare<'m>(ep: &Endpoint<'_>, p: &Params<'_>, msgs: impl Iterator<Item =
 /// Resolve, connect, (verified TLS), send the prepared request and stream the answer to `on`. While it
 /// waits it runs the hook set with [`net::set_tick`] (input, repaint, cancel). The request head (it may
 /// hold the key) is zeroed before this returns.
+#[cfg(feature = "tls")]
 pub fn send(ep: &Endpoint<'_>, req: Prepared, bufs: &mut Buffers, tls: Option<&TlsContext<'_>>, on: &mut dyn FnMut(Event<'_>)) -> Result<Sent, Stage> {
     let ip = match net::resolve(ep.host) {
         Ok(ip) => ip,
@@ -187,12 +212,14 @@ pub fn send(ep: &Endpoint<'_>, req: Prepared, bufs: &mut Buffers, tls: Option<&T
 /// The exchange over an already-connected transport: TLS (verified) when `ep.tls`, then the request and the
 /// streamed answer. The transport-agnostic heart of [`send`]; the host test drives it over a std socket.
 /// The request head is zeroed before this returns, whatever happened.
+#[cfg(feature = "tls")]
 pub fn exchange_over<T: Transport + ?Sized>(t: &mut T, ep: &Endpoint<'_>, req: Prepared, bufs: &mut Buffers, tls: Option<&TlsContext<'_>>, on: &mut dyn FnMut(Event<'_>)) -> Result<Sent, Stage> {
     let r = exchange_inner(t, ep, req, bufs, tls, on);
     bufs.head.fill(0);
     r
 }
 
+#[cfg(feature = "tls")]
 fn exchange_inner<T: Transport + ?Sized>(t: &mut T, ep: &Endpoint<'_>, req: Prepared, bufs: &mut Buffers, tls: Option<&TlsContext<'_>>, on: &mut dyn FnMut(Event<'_>)) -> Result<Sent, Stage> {
     let (hlen, blen) = (req.head, req.body);
     let Buffers { body, head, rx, line } = bufs;
@@ -215,6 +242,7 @@ fn exchange_inner<T: Transport + ?Sized>(t: &mut T, ep: &Endpoint<'_>, req: Prep
 
 /// What a program needs to verify servers, gathered once at start: the crypto provider, the trust store
 /// and the clock. [`TlsSetup::verify`] is the key rule's input; [`TlsSetup::context`] feeds [`send`].
+#[cfg(feature = "tls")]
 pub struct TlsSetup {
     pub provider: Option<Box<dyn CryptoProvider>>,
     /// Why there is no provider (when `provider` is `None`).
@@ -225,6 +253,7 @@ pub struct TlsSetup {
     clock: clock::SysClock,
 }
 
+#[cfg(feature = "tls")]
 impl TlsSetup {
     /// A setup from parts (the host test; a program with its own provider).
     pub fn new(provider: Option<Box<dyn CryptoProvider>>, store: Result<(TrustStore, LoadReport), trust::TrustFail>) -> Self {
