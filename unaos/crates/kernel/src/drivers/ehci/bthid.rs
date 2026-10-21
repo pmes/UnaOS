@@ -433,7 +433,7 @@ impl Link {
             kleds: 0,
         }
     }
-    fn chan_psm(&self, psm: u16) -> Option<usize> {
+    fn chan_psm(&self, psm: u16) -> Option<usize> { #[cfg(feature = "a2dp")] if psm == PSM_SDP { return sdp::client_chan(&self.chans); } // SDPSERVER (B769): the SDP CLIENT channel is the one this host opened, never the peer's (LINE-NEUTRAL fold, code first)
         self.chans.iter().position(|c| c.psm == psm && c.st != ChanSt::WaitDiscRsp)
     }
     fn open_rcid(&self, psm: u16) -> Option<u16> {
@@ -1250,7 +1250,7 @@ impl Bt {
         } else if let Some(ci) = self.links[li].chans.iter().position(|c| c.lcid == cid && c.st == ChanSt::Open) {
             let psm = self.links[li].chans[ci].psm;
             match psm {
-                PSM_SDP => self.on_sdp(li, body, now),
+                PSM_SDP => { #[cfg(feature = "a2dp")] if !self.links[li].chans[ci].ours { return self.sdp_serve(li, ci, body); } self.on_sdp(li, body, now) } // SDPSERVER (B769): a channel the peer opened carries requests to the SDP server (LINE-NEUTRAL fold, code first)
                 PSM_HID_INTR => self.on_hid_intr(li, body),
                 #[cfg(feature = "a2dp")] l2cap::PSM_AVDTP => self.a2dp_rx(li, ci, body, now),
                 PSM_HID_CTRL => {
@@ -1292,8 +1292,8 @@ impl Bt {
                 let psm = le16(d, 0);
                 let scid = le16(d, 2);
                 let lcid = self.links[li].next_lcid;
-                // Only the two HID channels and AVDTP (A2DP B739) are served: this host runs no SDP SERVER, so an inbound SDP
-                // connection (a device asking about US) is refused rather than accepted and left mute.
+                // Only the two HID channels and AVDTP (A2DP B739) are served; under `a2dp` SDP too (SDPSERVER B769: a device
+                // asking about US is answered by `sdp::serve`), else an inbound SDP connection is refused, not left mute.
                 #[cfg(feature = "a2dp")] let served = l2cap::inbound_served(psm); #[cfg(not(feature = "a2dp"))] let served = psm == PSM_HID_CTRL || psm == PSM_HID_INTR; if !served || self.links[li].chans.len() >= MAX_CHANS {
                     let mut r = [0u8; 8];
                     r[2..4].copy_from_slice(&scid.to_le_bytes());
@@ -1431,7 +1431,7 @@ impl Bt {
         let addr = self.links[li].addr;
         serial_println!(":: BTHID: l2cap {} psm={:#06x} lcid={:#06x} rcid={:#06x} OPEN peer_mtu={} ::", fmt_addr(&addr), c.psm, c.lcid, c.rcid, c.rmtu);
         match c.psm {
-            PSM_SDP => {
+            PSM_SDP => { #[cfg(feature = "a2dp")] if !c.ours { return; } // SDPSERVER (B769): no client request on the channel the peer opened (LINE-NEUTRAL fold, code first)
                 if self.links[li].sdp_tid == 0 {
                     self.sdp_request(li, &[]);
                 }
