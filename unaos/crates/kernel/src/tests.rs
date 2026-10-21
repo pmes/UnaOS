@@ -5863,25 +5863,25 @@ fn sinkall_pause(sink: &str) -> u64 {
 }
 
 /// SCROLLPANES (rmbp-ledger B777) — `tests scrollview`'s pane legs, printed at the END of its pass line:
-/// `tree=ok icons=ok columns=ok tabs=ok types=ok overlay=ok`. Quarry's tree, Icons grid and Columns focus pane walked
+/// `tree=ok icons=ok columns=ok tabs=ok types=ok overlay=ok sidebar=ok`. Quarry's tree, Icons grid and Columns focus pane walked
 /// through their live step bodies against a full paint; Settings' tab column and File Types rows stepped through
-/// their models against an independent clamp; the overlay gate (the context menu or a mark stops the blit).
-/// `(words, all ok)`.
+/// their models against an independent clamp; the overlay gate (the context menu or a mark stops the blit); Quarry's
+/// sidebar walked through its live step body (SIDEBARWHEEL rmbp-ledger B792). `(words, all ok)`.
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn scrollpanes_legs() -> (alloc::string::String, bool) {
     let word = |r: &Result<usize, &'static str>| -> alloc::string::String { match r { Ok(_) => alloc::string::String::from("ok"), Err(e) => alloc::format!("FAIL({})", e) } };
     #[cfg(feature = "quarry")]
-    let [tree, icons, columns, overlay] = crate::video::quarry::live::scrollpanes_probe();
+    let [tree, icons, columns, overlay, sidebar] = crate::video::quarry::live::scrollpanes_probe();
     #[cfg(not(feature = "quarry"))]
-    let [tree, icons, columns, overlay]: [Result<usize, &'static str>; 4] = [Err("no-quarry"); 4];
+    let [tree, icons, columns, overlay, sidebar]: [Result<usize, &'static str>; 5] = [Err("no-quarry"); 5];
     let [tabs, types] = crate::video::settings::scrollpanes_probe();
-    let all = [&tree, &icons, &columns, &tabs, &types, &overlay];
+    let all = [&tree, &icons, &columns, &tabs, &types, &overlay, &sidebar];
     serial_println!(
-        "[scrollview] panes tree_steps={} icons_steps={} columns_steps={} tabs_steps={} types_steps={} overlay_legs={}",
-        tree.as_ref().copied().unwrap_or(0), icons.as_ref().copied().unwrap_or(0), columns.as_ref().copied().unwrap_or(0), tabs.as_ref().copied().unwrap_or(0), types.as_ref().copied().unwrap_or(0), overlay.as_ref().copied().unwrap_or(0)
+        "[scrollview] panes tree_steps={} icons_steps={} columns_steps={} tabs_steps={} types_steps={} overlay_legs={} sidebar_steps={}",
+        tree.as_ref().copied().unwrap_or(0), icons.as_ref().copied().unwrap_or(0), columns.as_ref().copied().unwrap_or(0), tabs.as_ref().copied().unwrap_or(0), types.as_ref().copied().unwrap_or(0), overlay.as_ref().copied().unwrap_or(0), sidebar.as_ref().copied().unwrap_or(0)
     );
     (
-        alloc::format!("tree={} icons={} columns={} tabs={} types={} overlay={}", word(&tree), word(&icons), word(&columns), word(&tabs), word(&types), word(&overlay)),
+        alloc::format!("tree={} icons={} columns={} tabs={} types={} overlay={} sidebar={}", word(&tree), word(&icons), word(&columns), word(&tabs), word(&types), word(&overlay), word(&sidebar)),
         all.iter().all(|r| r.is_ok()),
     )
 }
