@@ -1,11 +1,13 @@
 //! CHARTER: Vein — shared-core
 //!
 //! DROPLOOPS (LEDGER SR179; BP-ring3-19) — THE PROGRAM'S BUS CLIENT. Every ring-3 program that links this crate (LUMEN,
-//! MIDDEN, UNA, AETHER, NET, DIAG) has exactly ONE mailbox keep, [`keep`], and asks a plain bus REQUEST through ONE fn,
+//! MIDDEN, UNA, AETHER, NET, DIAG, STRIA) has exactly ONE mailbox keep, [`keep`], and asks a plain bus REQUEST through ONE fn,
 //! [`ask`], which waits through `una_abi::bus_ask` (MAILBOXKEEP SR177): a frame met before the reply is KEPT for the
 //! program's reader (`theme::due`, which receives through `una_abi::mbox_recv` with the same keep), never dropped. The
 //! keep lives here, not in una-abi, because una-abi stays static-free (BP-ring3-1) and this crate is each program's
 //! ring-3 runtime. Single-threaded program state behind `static mut`, as every static of this crate.
+//! BUSKEEPCRATE (LEDGER SR186): this module needs no feature — a program that links the crate with
+//! `default-features = false` (STRIA.ELF) gets its keep without the `tls` half's crates.
 
 use crate::sys::sys;
 use una_abi::{MboxKeep, BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REQUEST, BUS_MAGIC, BUS_VERSION};

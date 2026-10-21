@@ -43,6 +43,9 @@ av1_core = { path = "../../libs/media/av1_core", optional = true }
 h264_core = { path = "../../libs/media/h264_core", optional = true }
 audio_core = { path = "../../libs/media/audio_core" }
 font8x8 = { version = "0.3.1", default-features = false }
+# BUSKEEPCRATE (LEDGER SR186; BP-ring3-19): the program's ONE bus keep, `vein_ring3::bus::keep()`, read by `notice_path`.
+# `default-features = false` leaves out the `tls` half (tls_core, holocron_core, vein_core): STRIA.ELF links no TLS transport.
+vein_ring3 = { path = "../../libs/sys/vein_ring3", default-features = false }
 
 [features]
 default = ["av1", "h264"]

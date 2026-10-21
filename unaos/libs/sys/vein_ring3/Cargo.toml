@@ -24,17 +24,21 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 
 [features]
-default = []
+default = ["tls"]
+# BUSKEEPCRATE (LEDGER SR186; BP-ring3-19): the transport half — DNS/TCP, TLS (tls_core), the Vein exchange and prefs
+# (vein_core), the Holocron key path (holocron_core). Off (`default-features = false`) the crate is the program's ring-3
+# runtime only: `bus` (the ONE mailbox keep and `ask`), `drop`, `files`, `heap`, `sys` over una-abi — what STRIA.ELF links.
+tls = ["dep:tls_core", "dep:holocron_core", "dep:vein_core"]
 # The product crypto provider (CRYPTOCORE). Ring-3 programs enable it; host tests never do.
-cryptocore = ["tls_core/cryptocore", "dep:crypto_core"]
+cryptocore = ["tls", "tls_core/cryptocore", "dep:crypto_core"]
 
 [dependencies]
 una-abi = { path = "../../../crates/una-abi" }
-vein_core = { path = "../vein_core", default-features = false }
-tls_core = { path = "../tls_core" }
+vein_core = { path = "../vein_core", default-features = false, optional = true }
+tls_core = { path = "../tls_core", optional = true }
 # HOLOCRON2 (rmbp-ledger B355): the key comes from Holocron first — its frame codec and the consumer rule
 # (`keysource::decide`), the SAME crate the host daemon and HOLOCRON.ELF link. no_std, CRYPTOCORE only.
-holocron_core = { path = "../holocron_core" }
+holocron_core = { path = "../holocron_core", optional = true }
 crypto_core = { path = "../crypto_core", optional = true, default-features = false, features = ["alloc"] }
 
 [dev-dependencies]

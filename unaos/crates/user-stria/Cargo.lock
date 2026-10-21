@@ -41,8 +41,16 @@ dependencies = [
  "font8x8",
  "h264_core",
  "una-abi",
+ "vein_ring3",
  "vp8_core",
  "vp9_core",
+]
+
+[[package]]
+name = "vein_ring3"
+version = "0.1.0"
+dependencies = [
+ "una-abi",
 ]
 
 [[package]]
