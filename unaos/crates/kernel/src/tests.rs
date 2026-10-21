@@ -189,7 +189,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("focussteal", focussteal_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("veilcost", veilcost_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))] register("aging", aging_selftest); register("a11yfilters", crate::video::settings::selftest_a11yfilters); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("zoom", zoom_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("perfhud", crate::video::perfhud::selftest); register("undomove", undomove_selftest); #[cfg(all(feature = "quarry", target_arch = "x86_64", feature = "wc"))] register("undokeys", undokeys_selftest); register("fontkit", fontkit_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("raiseverb", raiseverb_selftest); register("keychars", keychars_selftest); register("softydots", softydots_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpsearch", helpsearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))] register("filesearch", filesearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("oneinstance", oneinstance_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpf1", helpf1_selftest); register("trashtoast", trashtoast_selftest); #[cfg(feature = "uac")] register("softymic", softymic_selftest); }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); register("scrollview", scrollview_selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("focussteal", focussteal_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("veilcost", veilcost_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))] register("aging", aging_selftest); register("a11yfilters", crate::video::settings::selftest_a11yfilters); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("zoom", zoom_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("perfhud", crate::video::perfhud::selftest); register("undomove", undomove_selftest); #[cfg(all(feature = "quarry", target_arch = "x86_64", feature = "wc"))] register("undokeys", undokeys_selftest); register("fontkit", fontkit_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("raiseverb", raiseverb_selftest); register("keychars", keychars_selftest); register("softydots", softydots_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpsearch", helpsearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))] register("filesearch", filesearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("oneinstance", oneinstance_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpf1", helpf1_selftest); register("trashtoast", trashtoast_selftest); #[cfg(feature = "uac")] register("softymic", softymic_selftest); }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -4743,5 +4743,139 @@ fn softymic_selftest() {
     serial_println!(
         ":: SOFTYMIC: on={} off={} looks={} privacy={} -> {} :: live={} ::",
         yn(on), yn(off), looks, yn(privacy), if pass { "PASS" } else { "FAIL" }, live
+    );
+}
+
+/// SCROLLVIEW (rmbp-ledger B764) — `tests scrollview`: wm's one scroll model, measured. (1) A 10 000-px extent in a
+/// 56 x 300 viewport of a 72-px-stride surface (sentinels around it) scrolled 200 steps of a fixed pseudo-random walk
+/// (small moves, moves past a viewport, runs into both ends): each step's offset is the independent clamp, the
+/// surface after `wm::scroll_blit` + the strip painted equals the content at the new offset, nothing outside the
+/// viewport moved, and the repaint is the strip alone (`repaint_px <= |dy| x w`, `blit + repaint = viewport` on a
+/// move). (2) The thumb: exact at both ends, its length the formula's, monotonic, its inverse within a line, and
+/// `draw::scrollbar` paints the thumb and track inks where the model says. (3) Quarry's list and (4) Settings'
+/// Hardware list: the live strip bodies against a full paint, pixel for pixel.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn scrollview_selftest() {
+    use crate::video::wm::{scroll_blit, ScrollView};
+    const STRIDE: usize = 72;
+    const H: usize = 320;
+    const SENT: u32 = 0x00A5_5A5A;
+    let (vx, vy, vw, vh) = (8usize, 10usize, 56usize, 300usize);
+    let content = |x: usize, cy: usize| -> u32 { ((cy as u32).wrapping_mul(0x9E37_79B1) ^ (x as u32).wrapping_mul(0x85EB_CA77)) & 0x00FF_FFFF };
+    let mut px: alloc::vec::Vec<u32> = alloc::vec![SENT; STRIDE * H];
+    let mut view = ScrollView { offset: 0, extent: 10_000, viewport: (vx, vy, vw, vh), line: 1 };
+    let paint_rows = |px: &mut [u32], off: usize, y0: usize, y1: usize| {
+        for y in y0..y1 {
+            for x in vx..vx + vw {
+                px[y * STRIDE + x] = content(x, off + (y - vy));
+            }
+        }
+    };
+    paint_rows(&mut px, 0, vy, vy + vh);
+    let max = view.extent - vh;
+    let (mut clamp_ok, mut blit_ok) = (true, true);
+    let (mut clamps, mut fulls, mut max_rep, mut max_blit) = (0usize, 0usize, 0usize, 0usize);
+    let mut seed: u32 = 0x5C01_1E55;
+    let mut steps = 0usize;
+    for k in 0..200usize {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let r = (seed >> 8) as isize;
+        let dy: isize = match k % 10 {
+            0 => if (r & 1) == 0 { vh as isize + 41 } else { -(vh as isize) - 77 },
+            1 if k < 40 => -2_000,
+            2 if k > 160 => 3_000,
+            _ => (r % 801) - 400,
+        };
+        let want = (view.offset as isize + dy).clamp(0, max as isize) as usize;
+        let st = view.step(dy);
+        if st.off != want || st.off > max {
+            clamp_ok = false;
+        }
+        if st.off as isize != view.offset as isize + dy {
+            clamps += 1;
+        }
+        let blit = scroll_blit(&mut px, STRIDE, &st);
+        paint_rows(&mut px, st.off, st.strip.0, st.strip.1);
+        let repaint = (st.strip.1 - st.strip.0) * vw;
+        let n = st.moved.unsigned_abs();
+        if blit != st.blit_px || repaint > n * vw || (n > 0 && blit + repaint != vw * vh) || (n == 0 && repaint + blit != 0) {
+            blit_ok = false;
+        }
+        if n >= vh {
+            fulls += 1;
+        }
+        max_rep = max_rep.max(repaint);
+        max_blit = max_blit.max(blit);
+        view.offset = st.off;
+        for y in 0..H {
+            for x in 0..STRIDE {
+                let inside = x >= vx && x < vx + vw && y >= vy && y < vy + vh;
+                let want = if inside { content(x, st.off + (y - vy)) } else { SENT };
+                if px[y * STRIDE + x] != want {
+                    blit_ok = false;
+                }
+            }
+        }
+        steps += 1;
+    }
+    let reached_ends = clamps > 0;
+    // (2) the thumb.
+    let track = vh;
+    let tmin = crate::ui::px(24).min(track);
+    let th_want = (track * vh / 10_000).max(tmin).min(track);
+    let mut thumb_ok = true;
+    let mut last = 0usize;
+    for off in (0..=max).step_by(97).chain(core::iter::once(max)) {
+        let v = ScrollView { offset: off, ..view };
+        match v.thumb(track) {
+            Some((ty, th)) => {
+                if th != th_want || ty + th > track || ty < last || (off == 0 && ty != 0) || (off == max && ty + th != track) {
+                    thumb_ok = false;
+                }
+                let back = v.offset_at_thumb(track, ty);
+                let span = track - th;
+                if back.abs_diff(off) > max.div_ceil(span.max(1)) + 1 {
+                    thumb_ok = false;
+                }
+                last = ty;
+            }
+            None => thumb_ok = false,
+        }
+    }
+    if (ScrollView { offset: 0, extent: 200, viewport: (0, 0, 10, 300), line: 1 }).thumb(300).is_some() {
+        thumb_ok = false;
+    }
+    {
+        use crate::video::draw;
+        let bw = draw::scrollbar_w();
+        let (sw, sh) = (bw + 4, 200usize);
+        let mut buf: alloc::vec::Vec<u32> = alloc::vec![0; sw * sh];
+        let v = ScrollView { offset: 5_000, extent: 10_000, viewport: (0, 0, 10, sh), line: 1 };
+        let (ty, th) = v.thumb(sh).unwrap_or((0, 0));
+        let mut s = draw::Surf::new(&mut buf, sw);
+        draw::scrollbar(&mut s, draw::Rect::new(2, 0, bw as i32, sh as i32), Some((ty as i32, th as i32)), draw::ControlState::NORMAL);
+        let cx = 2 + bw / 2;
+        let at = |y: usize| buf[y * sw + cx] & 0x00FF_FFFF;
+        let thumb_in = at(ty + th / 2) == crate::video::theme::line_strong() & 0x00FF_FFFF;
+        let track_in = (ty > bw + 2 && at(ty / 2) == crate::video::theme::surface_sunken() & 0x00FF_FFFF) || (ty + th + bw + 2 < sh && at((ty + th + sh) / 2) == crate::video::theme::surface_sunken() & 0x00FF_FFFF);
+        if !(thumb_in && track_in && buf[0] == 0) {
+            thumb_ok = false;
+        }
+    }
+    // (3) Quarry's list, (4) the Hardware list.
+    #[cfg(feature = "quarry")]
+    let quarry = crate::video::quarry::live::scrollview_probe();
+    #[cfg(not(feature = "quarry"))]
+    let quarry: Result<usize, &'static str> = Err("no-quarry");
+    let hw = crate::video::settings::scrollview_probe();
+    let word = |r: &Result<usize, &'static str>| -> alloc::string::String { match r { Ok(_) => alloc::string::String::from("ok"), Err(e) => alloc::format!("FAIL({})", e) } };
+    serial_println!(
+        "[scrollview] extent=10000 viewport={}x{} stride={} steps={} clamps={} full_strips={} max_repaint_px={} max_blit_px={} thumb_min={} quarry_steps={} hw_steps={}",
+        vw, vh, STRIDE, steps, clamps, fulls, max_rep, max_blit, tmin, quarry.as_ref().copied().unwrap_or(0), hw.as_ref().copied().unwrap_or(0)
+    );
+    let pass = steps == 200 && clamp_ok && reached_ends && blit_ok && thumb_ok && quarry.is_ok() && hw.is_ok();
+    serial_println!(
+        ":: SCROLLVIEW: steps={} clamp={} blit={} thumb={} quarry={} hw={} -> {} ::",
+        steps, if clamp_ok && reached_ends { "ok" } else { "FAIL" }, if blit_ok { "ok" } else { "FAIL" }, if thumb_ok { "ok" } else { "FAIL" }, word(&quarry), word(&hw), if pass { "PASS" } else { "FAIL" }
     );
 }

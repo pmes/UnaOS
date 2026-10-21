@@ -1846,7 +1846,7 @@ fn repaint_locked(m: &Model, px: &mut [u32]) {
     let lvis = m.list_visible();
     let lsb = if m.list.len() > lvis { SBW() } else { 0 };
     let body_y = columns::paint_list(m, px, li, lsb, lvis); // QUARRY2 (B336): the header (sortable, with a chevron) and the NAME SIZE MODIFIED TYPE ORIGIN columns
-    paint_scrollbar(px, g, li, body_y, m.list.len(), lvis, m.list_scroll);
+    let _ = body_y; // SCROLLVIEW (B764): the list's bar is wm's one widget (`wm::scrollbar_paint`, from `repaint`)
     q3_paint(m, px, li); ops::paint_overlay(m, px); // QUARRY3 (B413): icon view, sidebar, toolbar + path bar; then QUARRYOPS — the context menu and the inline edit field, over the finished frame
 }
 
@@ -1871,6 +1871,7 @@ fn repaint() {
         // the view is a plain reborrow — the old `Vec<u8>`-as-`[u32]` cast leaned on an alignment Rust does not promise.
         let px: &mut [u32] = &mut surf[..];
         repaint_locked(m, px);
+        list_register(WIN.load(Ordering::Relaxed), m, px); // SCROLLVIEW (B764): the list's model and its bar
     }
     drop(surf);
     let id = WIN.load(Ordering::Relaxed);
@@ -2141,7 +2142,7 @@ pub fn close() {
     }
     // `wm::close` first: the row must stop naming the buffer before the buffer goes away. It spins on
     // the drain barrier, so it is called with no lock of ours held.
-    wm::close(id);
+    wm::scroll_clear(id); wm::close(id); // SCROLLVIEW (B764): the list's model goes with the window
     *MODEL.lock() = None;
     SURF.lock().clear();
     // QUITLEAK — latch the SHAPE of this close where a fixture can read it, and count the close. Both
@@ -2212,7 +2213,7 @@ pub fn close() {
 pub fn key_route(ev: crate::pal::Event) -> bool {
     // FILEVIEW — the text viewer's arrows / wheel / paging, asked first; it consumes only while ITS
     // window holds focus, so a closed viewer changes nothing below.
-    if crate::video::dnd::key(ev) || crate::video::fileview::key_route(ev) || crate::video::player::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) || crate::flightring::console_route(ev) || { #[cfg(feature = "uvc")] { crate::drivers::xhci::uvc::key_route(ev) } #[cfg(not(feature = "uvc"))] { false } } {
+    if crate::video::dnd::key(ev) || crate::video::wm::scroll_wheel_ev(ev) || crate::video::fileview::key_route(ev) || crate::video::player::key_route(ev) || crate::video::textedit::key_route(ev) || crate::video::settings::key_route(ev) || crate::video::activity::key_route(ev) || crate::flightring::console_route(ev) || { #[cfg(feature = "uvc")] { crate::drivers::xhci::uvc::key_route(ev) } #[cfg(not(feature = "uvc"))] { false } } {
         return true;
     }
     #[cfg(feature = "facet")]
@@ -2480,8 +2481,8 @@ pub fn press_route(x: i32, y: i32) -> bool {
     // The press is ours: raise so the operator's click also brings Quarry forward, exactly as the
     // router's own select arm would have.
     wm::focus_changed(OWNER);
-    if removed_click() {
-        return true; // UNPLUG (B703): a window over a removed volume closes on a click
+    if removed_click() || wm::scroll_press(id, sx, sy) {
+        return true; // UNPLUG (B703): a window over a removed volume closes on a click. SCROLLVIEW (B764): the list's gutter (page, thumb drag) is wm's
     }
     let act = {
         let mut guard = MODEL.lock();
@@ -2674,19 +2675,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
         let sb = m.list.len() > lvis;
         m.focus = Pane::List;
         let body_y = li.y + row_h;
-        if sb && sx >= li.x + li.w - SBW() && sy >= body_y {
-            let track_h = li.y + li.h - body_y;
-            let (ty, th) = thumb(track_h, m.list.len(), lvis, m.list_scroll).unwrap_or((0, 0));
-            let rel = sy - body_y;
-            if rel < ty {
-                m.list_scroll = m.list_scroll.saturating_sub(lvis);
-            } else if rel >= ty + th {
-                m.list_scroll = (m.list_scroll + lvis).min(scroll_max(m.list.len(), lvis));
-            }
-            m.list_sel = m.list_sel.max(m.list_scroll).min((m.list_scroll + lvis).saturating_sub(1));
-            m.settle();
-            return Act::None;
-        }
+        let _ = sb; // SCROLLVIEW (B764): the list's gutter is wm's (`wm::scroll_press` in `press_route` pages and drags it)
         if sy < body_y && columns::header_press(m, sx) { m.settle(); return Act::None; } // QUARRY2 (B336): a header press sorts by its column
         if sy < body_y {
             return Act::None; // the header is not a row
@@ -2797,7 +2786,7 @@ fn wheel_scroll_view(m: &mut Model, sx: usize, sy: usize, detents: i32, view: to
         (m.list.len(), m.list_visible(), m.list_scroll)
     };
     let max = scroll_max(len, vis);
-    let next = wheel_next(scroll, max, detents);
+    let next = if tree { wheel_next(scroll, max, detents) } else { wm::ScrollView { offset: scroll, extent: len, viewport: (0, 0, 1, vis), line: 1 }.step(-(detents as isize) * WHEEL_ROWS as isize).off }; // SCROLLVIEW (B764): the list's step is wm's one model (rows as its unit); the live wheel reaches `wm::scroll_wheel` first
     let lo = next;
     let hi = (next + vis).saturating_sub(1);
     if tree {
@@ -3192,7 +3181,7 @@ pub fn service() {
     }
     {
         let _s = lr::stamp(lr::W_Q_SETTINGS);
-        crate::video::settings::service(); crate::video::settings::hover_poll(); hover_poll(); // QUARRYHOVER (B647): Quarry's hover pass beside Settings', same shape (line-neutral, code before the comment). SETTINGSCRAFT (B630): the Settings window's hover + pressed-face pass (reads the cursor like the dock's hover; repaints only when the pointer crosses a control). Folded, line-neutral: code before the comment.
+        crate::video::settings::service(); crate::video::settings::hover_poll(); hover_poll(); wm::scroll_service(); // SCROLLVIEW (B764): the thumb drag and the bar's hide, both desktops. // QUARRYHOVER (B647): Quarry's hover pass beside Settings', same shape (line-neutral, code before the comment). SETTINGSCRAFT (B630): the Settings window's hover + pressed-face pass (reads the cursor like the dock's hover; repaints only when the pointer crosses a control). Folded, line-neutral: code before the comment.
     }
     {
         let _s = lr::stamp(lr::W_Q_FONT);
@@ -4909,4 +4898,223 @@ fn select_leaf(m: &mut Model, leaf: &str) -> bool {
     m.focus = Pane::List;
     m.settle();
     m.list.get(m.list_sel).is_some_and(|e| e.name.eq_ignore_ascii_case(leaf))
+}
+
+// ── SCROLLVIEW (rmbp-ledger B764) — the list pane on wm's one scroll model — TAIL-APPENDED ─────────────────────────
+// The list registers a `wm::ScrollView` from every full paint ([`list_register`]): viewport = the body rows (below
+// the header, left of the gutter), extent = rows x pitch, line = the row pitch (so every offset is a whole row and
+// `list_scroll = off / row_h`), gutter = `SBW()` (the width `columns::layout_with` already reserves). `wm` routes the
+// wheel, the gutter press and the thumb drag to `wm::scroll_by`, which calls [`list_scrolled`]: under MODEL then
+// SURF (repaint's order) it applies the offset with the selection pull the old wheel arm made ([`list_pull`]),
+// runs `wm::scroll_blit` on the surface and paints ONLY the uncovered rows (+ the old and new selection rows when the
+// pull moved it) through [`list_rows_paint`], then the bar, then presents the viewport rows. A step it cannot blit
+// exactly — another view than List, an error line, Get Info / Open With / the column menu up, a drag hovering, or a
+// model that is not the picture the step started from — is one full repaint instead (`repaint_px` says so).
+
+/// The list's offset (in rows) applied: the selection pulled inside the viewport (`max` then `min`, never `clamp`).
+fn list_pull(m: &mut Model, next: usize) {
+    let vis = m.list_visible();
+    m.list_scroll = next;
+    m.list_sel = m.list_sel.max(next).min((next + vis).saturating_sub(1));
+    m.settle();
+}
+
+/// The list's model for this picture: `(view, gutter_w)`, or `None` when the List view's rows fit (no model).
+fn list_view(m: &Model) -> Option<(wm::ScrollView, usize)> {
+    let g = m.geom;
+    let (rh, lvis, len) = (g.row_h(), m.list_visible(), m.list.len());
+    if toolbar::view() != toolbar::View::List || m.err.is_some() || rh == 0 || lvis == 0 || len <= lvis {
+        return None;
+    }
+    let li = g.list_pane().inner();
+    let vp = (li.x, li.y + rh, li.w.saturating_sub(SBW()), lvis * rh);
+    Some((wm::ScrollView { offset: m.list_scroll * rh, extent: len * rh, viewport: vp, line: rh }, SBW()))
+}
+
+/// Register (or drop) the list's model after a full paint, and paint its bar into the gutter.
+fn list_register(id: wm::WinId, m: &Model, px: &mut [u32]) {
+    if id == wm::WIN_NONE {
+        return;
+    }
+    match list_view(m) {
+        Some((v, gw)) => {
+            if wm::scroll_set(id, v, gw, theme::surface_content(), list_scrolled) {
+                wm::scrollbar_paint(id, px, m.geom.w);
+            }
+        }
+        None => wm::scroll_clear(id),
+    }
+}
+
+/// Paint body rows `[r0, r1)` of the viewport (view-relative) exactly as a full paint draws them: the ground, then
+/// `columns::paint_list` aimed at those rows (its header lands on the band above them and is put back). Returns
+/// the pixels painted.
+fn list_rows_paint(m: &mut Model, px: &mut [u32], r0: usize, r1: usize) -> usize {
+    let g = m.geom;
+    let (rh, lvis) = (g.row_h(), m.list_visible());
+    let (r0, r1) = (r0.min(lvis), r1.min(lvis));
+    if r0 >= r1 || rh == 0 {
+        return 0;
+    }
+    let li = g.list_pane().inner();
+    let lsb = if m.list.len() > lvis { SBW() } else { 0 };
+    let y0 = li.y + rh + r0 * rh;
+    let y1 = li.y + rh + r1 * rh;
+    if y1 * g.w > px.len() {
+        return 0;
+    }
+    let vw = li.w.saturating_sub(lsb);
+    fill(px, &g, li.x, y0, vw, y1 - y0, theme::surface_content());
+    let hy = y0 - rh;
+    let saved: Vec<u32> = px[hy * g.w..y0 * g.w].to_vec();
+    let keep = m.list_scroll;
+    m.list_scroll = keep + r0;
+    let _ = columns::paint_list(m, px, Rect { x: li.x, y: hy, w: li.w, h: li.h }, lsb, r1 - r0);
+    m.list_scroll = keep;
+    px[hy * g.w..y0 * g.w].copy_from_slice(&saved);
+    (y1 - y0) * vw
+}
+
+/// The step on the model and the surface, nothing else: the pull, the one rect-scoped blit, the strip rows, and the
+/// selection rows the pull changed. Returns the pixels painted. The probe drives this same body.
+fn list_step_core(m: &mut Model, px: &mut [u32], st: &wm::ScrollStep) -> usize {
+    let rh = m.geom.row_h().max(1);
+    let old_sel = m.list_sel;
+    list_pull(m, st.off / rh);
+    if st.moved == 0 {
+        return 0;
+    }
+    let _ = wm::scroll_blit(px, m.geom.w, st);
+    let body_y = st.viewport.1;
+    let (s0, s1) = st.strip;
+    let (r0, r1) = ((s0 - body_y) / rh, (s1 - body_y).div_ceil(rh));
+    let mut n = list_rows_paint(m, px, r0, r1);
+    let lvis = m.list_visible();
+    if m.list_sel != old_sel {
+        for i in [old_sel, m.list_sel] {
+            if i >= m.list_scroll && i < m.list_scroll + lvis {
+                let r = i - m.list_scroll;
+                if r < r0 || r >= r1 {
+                    n += list_rows_paint(m, px, r, r + 1);
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Can the step be blitted, or does it need a full repaint? (An overlay over the body would move with the band.)
+fn list_strip_ok(m: &Model, st: &wm::ScrollStep) -> bool {
+    let rh = m.geom.row_h();
+    toolbar::view() == toolbar::View::List
+        && m.err.is_none()
+        && m.list_scroll * rh == st.was
+        && list_view(m).is_some_and(|(v, _)| v.viewport == st.viewport)
+        && !getinfo::is_up()
+        && !openwith::is_up()
+        && !attrcols::menu_up()
+        && crate::video::dnd::hover().is_none()
+}
+
+/// The list's `wm::ScrollFn`: wm moved the model; apply it under Quarry's own locks (MODEL, then SURF).
+fn list_scrolled(id: wm::WinId, st: &wm::ScrollStep) -> usize {
+    let mut guard = MODEL.lock();
+    let Some(m) = guard.as_mut() else { return 0 };
+    let mut surf = SURF.lock();
+    if surf.is_empty() {
+        return 0;
+    }
+    let _paint = columns::PaintMark::new();
+    let (w, h) = (m.geom.w, m.geom.h);
+    let full = !list_strip_ok(m, st);
+    let n = {
+        let px: &mut [u32] = &mut surf[..];
+        let n = if full {
+            list_pull(m, st.off / m.geom.row_h().max(1));
+            repaint_locked(m, px);
+            w * h
+        } else {
+            let n = list_step_core(m, px, st);
+            if st.moved != 0 {
+                ops::paint_overlay(m, px);
+                dragdrop::paint(m, px);
+            }
+            n
+        };
+        wm::scrollbar_paint(id, px, w);
+        n
+    };
+    drop(surf);
+    drop(guard);
+    let (_, vy, _, vh) = st.viewport;
+    let _ = if full { wm::present(id) } else { wm::present_rows(id, vy, vy + vh) };
+    PAINTS.fetch_add(1, Ordering::Relaxed);
+    n
+}
+
+/// `tests scrollview`'s Quarry leg: a 200-row list painted offscreen, then scrolled through the live step body
+/// ([`list_step_core`]: the blit, the strip, the selection rows) by down 3, down 7, up 5, a jump past a viewport,
+/// the two clamps and up 3 rows; after every step the viewport is compared pixel for pixel with a full paint of the
+/// same model. `Ok(steps)` = every step exact; `Err(why)` = the first that was not.
+pub fn scrollview_probe() -> Result<usize, &'static str> {
+    let sz = crate::video::metrics::size;
+    let g = geometry(sz(1024), sz(768)).ok_or("geometry declined 1024x768")?;
+    let mut m = Model {
+        geom: g,
+        hover: Hover::None,
+        tree: Vec::new(),
+        tree_sel: 0,
+        tree_scroll: 0,
+        cwd: String::from("/scrollview"),
+        list: (0..200u64).map(|k| DirEnt { name: alloc::format!("ROW{:04}.TXT", k), kind: NodeKind::File, size: k * 37, mtime: None }).collect(),
+        list_truncated: false,
+        list_sel: 1,
+        list_scroll: 0,
+        focus: Pane::List,
+        err: None,
+        mounts: Vec::new(),
+        cache: Vec::new(),
+        cache_gen: 0,
+        reads: 0,
+        hits: 0,
+        read_cycles: 0,
+        click_ms: 0,
+        click_row: 0,
+        click_pane: Pane::List,
+        status: None,
+    };
+    let (rh, lvis, len) = (g.row_h(), m.list_visible(), m.list.len());
+    if lvis < 4 || len <= lvis {
+        return Err("viewport too short for the leg");
+    }
+    let li = g.list_pane().inner();
+    let vp = (li.x, li.y + rh, li.w - SBW(), lvis * rh);
+    let mut view = wm::ScrollView { offset: 0, extent: len * rh, viewport: vp, line: rh };
+    let mut a: Vec<u32> = Vec::new();
+    let mut b: Vec<u32> = Vec::new();
+    if a.try_reserve_exact(g.w * g.h).is_err() || b.try_reserve_exact(g.w * g.h).is_err() {
+        return Err("oom");
+    }
+    a.resize(g.w * g.h, 0);
+    b.resize(g.w * g.h, 0);
+    list_rows_paint(&mut m, &mut a, 0, lvis);
+    let rows: [isize; 7] = [3, 7, -5, lvis as isize + 2, -1000, 1000, -3];
+    for (k, &dr) in rows.iter().enumerate() {
+        let st = view.step(dr * rh as isize);
+        view.offset = st.off;
+        let painted = list_step_core(&mut m, &mut a, &st);
+        if st.blit_px > 0 && painted > st.blit_px + (st.strip.1 - st.strip.0) * vp.2 + 2 * rh * vp.2 {
+            return Err("a step painted more than its strip and the two selection rows");
+        }
+        b.iter_mut().for_each(|p| *p = 0);
+        list_rows_paint(&mut m, &mut b, 0, lvis);
+        for y in vp.1..vp.1 + vp.3 {
+            let o = y * g.w;
+            if a[o + vp.0..o + vp.0 + vp.2] != b[o + vp.0..o + vp.0 + vp.2] {
+                serial_println!("[scrollview] quarry step={} dr={} off={} row y={} differs from the full paint", k, dr, st.off, y);
+                return Err("the blitted list differs from a full paint");
+            }
+        }
+    }
+    Ok(rows.len())
 }

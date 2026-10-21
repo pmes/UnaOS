@@ -1294,6 +1294,7 @@ fn repaint() {
     let mut g = STATE.lock();
     let Some(st) = g.as_mut() else { return };
     paint(st, &v);
+    hw_scroll_sync(id, st, v.tab as usize); // SCROLLVIEW (B764): the Hardware list's model and its bar
     drop(g);
     let _ = wm::present(id);
 }
@@ -1330,7 +1331,7 @@ pub fn open() -> Result<(), String> {
     WIN.store(id, Ordering::Relaxed);
     wm::winid_register_holder(&WIN, "settings");
     wm::focus_changed(OWNER);
-    let _ = wm::present(id);
+    if let Some(st) = STATE.lock().as_mut() { hw_scroll_sync(id, st, tab0); } let _ = wm::present(id); // SCROLLVIEW (B764): a window opened on Hardware has its model before the first wheel
     serial_println!("[settings] open win={}", id);
     serial_println!("[settings] tabs=left col_w={} rows={} sel={}", COL_W, TABS, TAB_NAMES[tab0.min(TABS - 1)]); // SETTINGSTABS (B623)
     witness(true);
@@ -1342,7 +1343,7 @@ pub fn close() {
     let id = WIN.swap(wm::WIN_NONE, Ordering::Relaxed);
     if id == wm::WIN_NONE { return; }
     if DRAG.lock().take().is_some() | TPD.lock().take().is_some() { super::capture::cancel(); } // PREFSUI: a drag dies with its window (TRACKPADPANE: the speed slider's too)
-    wm::close(id);
+    wm::scroll_clear(id); wm::close(id); // SCROLLVIEW (B764)
     *STATE.lock() = None;
     serial_println!("[settings] closed win={}", id);
 }
@@ -1503,7 +1504,7 @@ fn wheel(d: i8) -> bool {
         FT_PAGE.store(next, Ordering::Relaxed);
         ("pane", next != page)
     } else {
-        if cur_tab() == HW_TAB { hw_wheel(d, step) } else { ("pane", false) } // HWREPORT (B725) -> HWTAB (B737): the Hardware list scrolls under the wheel, on its own tab
+        ("pane", false) // SCROLLVIEW (B764): the Hardware list scrolls on wm's one model (`wm::scroll_wheel`, asked first in the chain); HWTAB's own wheel arm is gone
     };
     serial_println!("[settings] wheel area={} d={} moved={}", area, d, moved as u8);
     if moved { repaint(); }
@@ -1695,7 +1696,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
     let sc = info.scale.max(1);
     let (cx, cy) = (super::metrics::to_logical((x as usize - info.x) / sc), super::metrics::to_logical((y as usize - info.y) / sc)); // UIMETRICS: a native surface's physical px -> the logical layout
     let lw = super::metrics::to_logical(info.w);
-    if cx >= lw || cy >= super::metrics::to_logical(info.h) { return false; }
+    if cx >= lw || cy >= super::metrics::to_logical(info.h) { return false; } if wm::scroll_press(id, (x as usize - info.x) / sc, (y as usize - info.y) / sc) { return true; } // SCROLLVIEW (B764): the Hardware list's gutter (page, thumb drag) is wm's
     wm::focus_changed(OWNER);
     // SETTINGSCRAFT: the press shows its control's pressed face for PRESS_MS (the action's own repaint draws it); a
     // press anywhere but the search field takes the keys back from it; the focus ring hides until the next key.
@@ -4435,7 +4436,7 @@ pub(crate) mod sysimg {
 // device no driver claimed says `No driver yet`; row 9 the note. The paint reads `hw::last` (`try_lock`, never a
 // census, never a register): a missing or stale census (older than [`HW_STALE_MS`]) is asked for, and the settings
 // service pass ([`hw_service`]) builds it without waiting (a held USB loan = ask again next pass). The wheel over the
-// pane scrolls the list ([`hw_wheel`]); a thumb shows where the visible lines sit. A press on a line copies it to the
+// pane scrolls the list on wm's one model (SCROLLVIEW B764: `hw_scrolled`); wm's bar shows where the visible lines sit. A press on a line copies it to the
 // console as `[hw] row <line>` and says on the note line what to do with it ([`hw_press`], BP-bar-25's honest line).
 
 /// HWTAB (B737): the Hardware tab's index on the strip, the last.
@@ -4497,36 +4498,11 @@ fn paint_hardware(st: &mut State) {
     txt(st, LABEL_X, HW_SUM_ROW, &alloc::format!("{} devices  -  {} with a driver  -  {} without", n, d, n - d));
     let first = hw_first(n);
     HW_TOP.store(first, Ordering::Relaxed);
-    let (where_x, drv_x, st_x) = (LABEL_X + 230, CTRL_R - 190, CTRL_R - 96);
+    HW_N.store(n, Ordering::Relaxed);
+    let _ = (bot, face);
     for (k, r) in c.rows.iter().enumerate().skip(first).take(vis) {
-        let y = top + 8 + (k - first) * lh;
-        text_at(st, LABEL_X, y, where_x - 8, &r.name, theme::text_primary(), false, face);
-        text_at(st, where_x, y, drv_x - 8, &alloc::format!("{} {}  {}", r.bus, r.id, r.at), theme::ink_secondary(), false, face);
-        if r.driver == "none" {
-            text_at(st, drv_x, y, CTRL_R, "No driver yet", theme::ink_secondary(), false, face);
-        } else {
-            text_at(st, drv_x, y, st_x - 8, r.driver, theme::text_primary(), false, face);
-            let ink = if r.state == "up" { theme::ink_positive() } else if r.state.starts_with("refused") { theme::ink_warning() } else { theme::ink_secondary() };
-            text_at(st, st_x, y, CTRL_R, r.state, ink, false, face);
-        }
+        hw_line(st, r, top + 8 + (k - first) * lh); // SCROLLVIEW (B764): one line painter for the full paint and the strip; the bar is wm's
     }
-    if n > vis {
-        // The scroll thumb: where the visible lines sit in the whole list.
-        let track = bot - top - 8;
-        let (ty, th) = (top + 4 + first * track / n, (vis * track / n).max(8));
-        let r = Rect::new(e(BOX_X + BOX_W - 6), e(ty), ew(BOX_X + BOX_W - 6, 3), ew(ty, th));
-        draw::fill_rrect(&mut sf(st), r, r.w / 2, Ink::argb(theme::control_edge()));
-    }
-}
-
-/// A wheel detent over the Hardware pane: scroll the list (positive = toward the top, QSCROLL's sign).
-fn hw_wheel(d: i8, step: usize) -> (&'static str, bool) {
-    let n = crate::hw::last().map(|c| c.rows.len()).unwrap_or(0);
-    let vis = hw_geom().3;
-    let cur = HW_TOP.load(Ordering::Relaxed);
-    let next = (if d > 0 { cur.saturating_sub(step) } else { cur + step }).min(n.saturating_sub(vis));
-    HW_TOP.store(next, Ordering::Relaxed);
-    ("hardware", next != cur)
 }
 
 /// The census line under the logical `(cx, cy)` in a list of `n`, if a line is painted there.
@@ -4879,4 +4855,158 @@ pub mod softymic {
             super::repaint();
         }
     }
+}
+
+// ── SCROLLVIEW (rmbp-ledger B764) — the Hardware list on wm's one scroll model — TAIL-APPENDED ─────────────────────
+// The list registers a `wm::ScrollView` while the Hardware tab is shown ([`hw_scroll_sync`], from every full paint and
+// the open): viewport = the list's lines inside the group box (device px), line = the device line pitch (offset =
+// first line x pitch), gutter = the 8 logical px right of it (`HW_GX`), ground = the box's `group.fill`. The wheel,
+// the gutter press and the thumb drag reach `wm::scroll_by`, which calls [`hw_scrolled`]: under STATE it blits the
+// band (`wm::scroll_blit`), paints ONLY the uncovered lines ([`hw_strip_paint`], the same [`hw_line`] the full paint
+// draws), paints the bar and presents the viewport rows. Text stops at the gutter (`HW_GX`), so the bar never covers
+// a glyph and its hide never erases one.
+
+/// The list viewport's left edge and the gutter (logical px): 8 px inside the box, the bar's 8 px right of the lines.
+const HW_VX: usize = BOX_X + 8;
+const HW_GW: usize = draw::SCROLLBAR_W;
+const HW_GX: usize = BOX_X + BOX_W - 8 - HW_GW;
+/// The census rows the last paint listed (the model's extent).
+static HW_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// One census line with its top at logical `y`: the device, its bus/id/place, the driver and its state, clipped at
+/// the gutter.
+fn hw_line(st: &mut State, r: &crate::hw::Row, y: usize) {
+    let face = super::text::Face::Ui;
+    let (where_x, drv_x, st_x) = (LABEL_X + 230, CTRL_R - 190, CTRL_R - 96);
+    text_at(st, LABEL_X, y, where_x - 8, &r.name, theme::text_primary(), false, face);
+    text_at(st, where_x, y, drv_x - 8, &alloc::format!("{} {}  {}", r.bus, r.id, r.at), theme::ink_secondary(), false, face);
+    if r.driver == "none" {
+        text_at(st, drv_x, y, HW_GX, "No driver yet", theme::ink_secondary(), false, face);
+    } else {
+        text_at(st, drv_x, y, st_x - 8, r.driver, theme::text_primary(), false, face);
+        let ink = if r.state == "up" { theme::ink_positive() } else if r.state.starts_with("refused") { theme::ink_warning() } else { theme::ink_secondary() };
+        text_at(st, st_x, y, HW_GX, r.state, ink, false, face);
+    }
+}
+
+/// The list's model geometry in device px for `n` lines from line `first`: `(view, gutter_w)`.
+fn hw_view(n: usize, first: usize) -> (wm::ScrollView, usize) {
+    let (top, _, lh, vis) = hw_geom();
+    let y0 = e(top + 8).max(0) as usize;
+    let dlh = ((e(top + 8 + lh) - e(top + 8)).max(1)) as usize;
+    let x0 = e(HW_VX).max(0) as usize;
+    let gx = e(HW_GX).max(0) as usize;
+    let vp = (x0, y0, gx.saturating_sub(x0), vis * dlh);
+    (wm::ScrollView { offset: first * dlh, extent: n * dlh, viewport: vp, line: dlh }, ew(HW_GX, HW_GW).max(1) as usize)
+}
+
+/// Register (or drop) the list's model for the live window and paint its bar (Hardware shown, more lines than room).
+fn hw_scroll_sync(id: wm::WinId, st: &mut State, tab: usize) {
+    if id == wm::WIN_NONE {
+        return;
+    }
+    let n = HW_N.load(Ordering::Relaxed);
+    if tab != HW_TAB || n <= hw_geom().3 {
+        wm::scroll_clear(id);
+        return;
+    }
+    let (v, gw) = hw_view(n, hw_first(n));
+    if wm::scroll_set(id, v, gw, theme::group_fill(), hw_scrolled) {
+        let pw = super::metrics::size(st.w);
+        wm::scrollbar_paint(id, &mut st.surf, pw);
+    }
+}
+
+/// The step on the surface: the one rect-scoped blit, then the uncovered lines painted on the box's ground. The probe
+/// drives this same body. Returns the pixels painted.
+fn hw_strip_paint(st: &mut State, rows: &[crate::hw::Row], s: &wm::ScrollStep) -> usize {
+    if s.moved == 0 {
+        return 0;
+    }
+    let (top, _, lh, vis) = hw_geom();
+    let (x0, y0, vw, _) = s.viewport;
+    let dlh = hw_view(rows.len(), 0).0.line;
+    let first = s.off / dlh;
+    let pw = super::metrics::size(st.w);
+    let _ = wm::scroll_blit(&mut st.surf, pw, s);
+    let (i0, i1) = ((s.strip.0 - y0) / dlh, (s.strip.1 - y0).div_ceil(dlh).min(vis));
+    for i in i0..i1 {
+        let mut sfc = sf(st);
+        draw::fill(&mut sfc, Rect::new(x0 as i32, (y0 + i * dlh) as i32, vw as i32, dlh as i32), theme::group_fill());
+        drop(sfc);
+        if let Some(r) = rows.get(first + i) {
+            hw_line(st, r, top + 8 + i * lh);
+        }
+    }
+    (i1.saturating_sub(i0)) * dlh * vw
+}
+
+/// The Hardware list's `wm::ScrollFn`: wm moved the model; apply it under STATE (a held census = one full repaint).
+fn hw_scrolled(id: wm::WinId, s: &wm::ScrollStep) -> usize {
+    let tab = cur_tab();
+    let c = crate::hw::last();
+    let dlh = s.viewport.3.max(1) / hw_geom().3.max(1);
+    HW_TOP.store(s.off / dlh.max(1), Ordering::Relaxed);
+    let Some(c) = c.filter(|c| tab == HW_TAB && c.rows.len() == HW_N.load(Ordering::Relaxed)) else {
+        repaint();
+        return super::metrics::size(WIN_W) * super::metrics::size(WIN_H);
+    };
+    let mut g = STATE.lock();
+    let Some(st) = g.as_mut() else { return 0 };
+    let n = hw_strip_paint(st, &c.rows, s);
+    let pw = super::metrics::size(st.w);
+    wm::scrollbar_paint(id, &mut st.surf, pw);
+    drop(g);
+    let (_, vy, _, vh) = s.viewport;
+    let _ = wm::present_rows(id, vy, vy + vh);
+    n
+}
+
+/// `tests scrollview`'s Hardware leg: 60 synthetic census lines painted offscreen (a fresh `State`, the live window
+/// untouched), scrolled through [`hw_strip_paint`] by down 3, down 5, up 2, a jump past a viewport, the two clamps
+/// and up 1 line; after every step the viewport is compared pixel for pixel with a full paint of the lines at that
+/// offset. `Ok(steps)` = every step exact.
+pub fn scrollview_probe() -> Result<usize, &'static str> {
+    let rows: Vec<crate::hw::Row> = (0..60usize)
+        .map(|k| crate::hw::Row { bus: "pci", id: alloc::format!("8086:{:04x}", k), at: alloc::format!("00:{:02x}.0", k), name: alloc::format!("Device {}", k), driver: if k % 3 == 0 { "none" } else { "xhci" }, state: if k % 3 == 0 { "absent" } else { "up" } })
+        .collect();
+    let (top, _, lh, vis) = hw_geom();
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let full = |first: usize| -> Option<State> {
+        let mut buf: Vec<u32> = Vec::new();
+        buf.try_reserve_exact(pw * ph).ok()?;
+        buf.resize(pw * ph, 0);
+        let mut st = State::new(WIN_W, WIN_H, buf, 1, true, 0);
+        let (v, _) = hw_view(rows.len(), first);
+        let (x0, y0, vw, vh) = v.viewport;
+        draw::fill(&mut sf(&mut st), Rect::new(x0 as i32, y0 as i32, vw as i32, vh as i32), theme::group_fill());
+        for (i, r) in rows.iter().skip(first).take(vis).enumerate() {
+            hw_line(&mut st, r, top + 8 + i * lh);
+        }
+        Some(st)
+    };
+    let mut a = full(0).ok_or("oom")?;
+    let (mut view, _) = hw_view(rows.len(), 0);
+    if vis < 3 || rows.len() <= vis {
+        return Err("viewport too short for the leg");
+    }
+    let steps: [isize; 7] = [3, 5, -2, vis as isize + 1, -1000, 1000, -1];
+    for (k, &dl) in steps.iter().enumerate() {
+        let s = view.step(dl * view.line as isize);
+        view.offset = s.off;
+        let painted = hw_strip_paint(&mut a, &rows, &s);
+        if s.moved != 0 && painted != (s.strip.1 - s.strip.0) * s.viewport.2 {
+            return Err("a step painted more than its strip");
+        }
+        let b = full(s.off / view.line).ok_or("oom")?;
+        let (x0, y0, vw, vh) = s.viewport;
+        for y in y0..y0 + vh {
+            let o = y * pw;
+            if a.surf[o + x0..o + x0 + vw] != b.surf[o + x0..o + x0 + vw] {
+                serial_println!("[scrollview] hw step={} dl={} off={} row y={} differs from the full paint", k, dl, s.off, y);
+                return Err("the blitted list differs from a full paint");
+            }
+        }
+    }
+    Ok(steps.len())
 }

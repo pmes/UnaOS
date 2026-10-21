@@ -31294,3 +31294,399 @@ pub fn gesture_swipe(dir: i8) -> Option<WinId> {
     serial_println!("[wm-act] action=swipe dir=prev win={} owner={:#x} windows={}", id, owner, n);
     Some(id)
 }
+
+// =================================================================================================
+// SCROLLVIEW (rmbp-ledger B764) — ONE scroll model for every window — TAIL-APPENDED
+// =================================================================================================
+// `docs/PRODUCT.md`'s Scrolling row said what was missing: no content offset in `wm`, no scrollbar widget, no
+// rect-scoped blit (input.md §5). This is the three of them. A window that has more content than room REGISTERS a
+// [`ScrollView`] — its content offset, its content extent and the viewport rectangle of its surface the content
+// shows through — with [`scroll_set`]; a window that never registers costs one relaxed load on each of the wheel,
+// press and service doors ([`SCROLL_LIVE`]) and nothing else: the model is a side table keyed by window id, never a
+// field of the table row. Every scroll then goes through ONE function, [`scroll_by`]: it clamps the offset (to the
+// window's line, so a row list stays on its rows), and hands the step to the window's owner, whose callback runs
+// [`scroll_blit`] on its own surface under its own lock — ONE rect-scoped copy that moves the already-painted
+// viewport band by the step — and paints only the uncovered strip [`ScrollStep::strip`]; the present is banded to
+// the viewport rows (`present_rows`), never the whole window. The wheel ([`scroll_wheel`]: scroll-under-pointer,
+// three lines a detent, QSCROLL's sign), the gutter press and the thumb drag ([`scroll_press`], [`scroll_service`])
+// all land on [`scroll_by`]. The one scrollbar widget (`draw::scrollbar`, track + thumb from this model, theme inks,
+// 8 px) is painted by THIS module into the window's reserved gutter ([`scrollbar_paint`]), so it composites, occludes
+// and filters exactly as the window does; it auto-hides [`SCROLL_HIDE_MS`] after the last scroll.
+// Wire: `[scroll] win=<id> dy=<n> off=<n> blit_px=<n> repaint_px=<n>` per step. Fixture: `tests scrollview`.
+// Desktop gate (both arches, no x86-only cfg): the owners (Quarry, Settings) and `draw` live under it.
+
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub use scrollview::{scroll_blit, scroll_by, scroll_clear, scroll_press, scroll_service, scroll_set, scroll_view, scroll_wheel, scroll_wheel_ev, scrollbar_paint, ScrollFn, ScrollStep, ScrollView, SCROLL_HIDE_MS, WHEEL_LINES};
+
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+mod scrollview {
+    use super::WinId;
+    use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    /// Lines one wheel detent moves (QSCROLL's ratio: a tenth of a viewport, unmistakably a scroll, never a nudge).
+    pub const WHEEL_LINES: usize = 3;
+    /// The bar hides this long after the last scroll, drag or gutter press.
+    pub const SCROLL_HIDE_MS: u64 = 800;
+    /// The thumb's shortest length, logical px (a 10 000-row list still has a thumb a hand can take).
+    const THUMB_MIN: usize = 24;
+
+    /// One window's scroll model. Surface (source) px throughout.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub struct ScrollView {
+        /// The content row at the viewport's top edge.
+        pub offset: usize,
+        /// The content's whole height.
+        pub extent: usize,
+        /// `(x, y, w, h)` of the surface rectangle the content shows through. The gutter (the bar's) is right of it.
+        pub viewport: (usize, usize, usize, usize),
+        /// The step every offset is a multiple of (a row list's row pitch; 1 = any px).
+        pub line: usize,
+    }
+
+    /// What one step did: the offset before and after, the signed move, and the surface rows the owner repaints.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub struct ScrollStep {
+        pub was: usize,
+        pub off: usize,
+        /// `off - was`: positive = the content moved UP (the view went down the content).
+        pub moved: isize,
+        pub viewport: (usize, usize, usize, usize),
+        /// Surface rows `[y0, y1)` the blit left uncovered (empty when nothing moved): the only rows painted.
+        pub strip: (usize, usize),
+        /// Pixels the one rect-scoped copy moves (0 when the step is a viewport or more: all strip).
+        pub blit_px: usize,
+    }
+
+    impl ScrollView {
+        /// The largest offset (the last line fully in view), on the line grid.
+        pub fn max_offset(&self) -> usize {
+            let q = self.line.max(1);
+            self.extent.saturating_sub(self.viewport.3).div_ceil(q) * q
+        }
+        /// `o` on the line grid (nearest) and inside `0 ..= max_offset`.
+        pub fn clamp(&self, o: usize) -> usize {
+            let q = self.line.max(1);
+            (o.saturating_add(q / 2) / q * q).min(self.max_offset())
+        }
+        /// The step `dy` px asks for (positive = down the content), clamped.
+        pub fn step(&self, dy: isize) -> ScrollStep {
+            let t = if dy < 0 { self.offset.saturating_sub(dy.unsigned_abs()) } else { self.offset.saturating_add(dy as usize) };
+            self.step_to(t)
+        }
+        /// The step to offset `t`, clamped. The strip is the band the move uncovered; a move of a viewport or more
+        /// uncovers it all and blits nothing.
+        pub fn step_to(&self, t: usize) -> ScrollStep {
+            let off = self.clamp(t);
+            let (_, y, w, h) = self.viewport;
+            let moved = off as isize - self.offset as isize;
+            let n = moved.unsigned_abs();
+            let (strip, blit_px) = if moved == 0 {
+                ((y, y), 0)
+            } else if n >= h {
+                ((y, y + h), 0)
+            } else if moved > 0 {
+                ((y + h - n, y + h), (h - n) * w)
+            } else {
+                ((y, y + n), (h - n) * w)
+            };
+            ScrollStep { was: self.offset, off, moved, viewport: self.viewport, strip, blit_px }
+        }
+        /// The thumb `(top, length)` inside a `track`-tall track, or `None` when everything fits.
+        pub fn thumb(&self, track: usize) -> Option<(usize, usize)> {
+            let vh = self.viewport.3;
+            if vh == 0 || track == 0 || self.extent <= vh {
+                return None;
+            }
+            let th = (track * vh / self.extent).max(crate::ui::px(THUMB_MIN)).min(track);
+            let span = track - th;
+            let max = self.max_offset();
+            let ty = if max == 0 { 0 } else { span * self.offset.min(max) / max };
+            Some((ty, th))
+        }
+        /// The offset whose thumb top is `ty` (the drag's inverse), clamped to the line grid.
+        pub fn offset_at_thumb(&self, track: usize, ty: usize) -> usize {
+            let Some((_, th)) = self.thumb(track) else { return 0 };
+            let span = track - th;
+            if span == 0 {
+                return 0;
+            }
+            self.clamp((ty.min(span) * self.max_offset() + span / 2) / span)
+        }
+        /// The step that moves nothing (a bar-only repaint: shown, hidden, pressed).
+        pub fn still(&self) -> ScrollStep {
+            self.step_to(self.offset)
+        }
+    }
+
+    /// THE rect-scoped copy: the viewport band of `px` (stride `stride`) moved by `st.moved` rows, the strip left as
+    /// it was (the owner paints it next). One `copy_within` when the viewport spans the stride, else one per row in
+    /// the order that never reads a row it already wrote. Pixels outside the viewport rectangle are never touched.
+    /// Returns the pixels moved (`st.blit_px`), 0 when the step blits nothing or the rectangle is not inside `px`.
+    pub fn scroll_blit(px: &mut [u32], stride: usize, st: &ScrollStep) -> usize {
+        let (x, y, w, h) = st.viewport;
+        let n = st.moved.unsigned_abs();
+        if st.blit_px == 0 || n >= h || stride == 0 || x + w > stride || (y + h) * stride > px.len() {
+            return 0;
+        }
+        let rows = h - n;
+        let (from, to) = if st.moved > 0 { (y + n, y) } else { (y, y + n) };
+        if x == 0 && w == stride {
+            px.copy_within(from * stride..(from + rows) * stride, to * stride);
+        } else if st.moved > 0 {
+            for r in 0..rows {
+                let s = (from + r) * stride + x;
+                px.copy_within(s..s + w, (to + r) * stride + x);
+            }
+        } else {
+            for r in (0..rows).rev() {
+                let s = (from + r) * stride + x;
+                px.copy_within(s..s + w, (to + r) * stride + x);
+            }
+        }
+        rows * w
+    }
+
+    /// The owner's half of a step, called by [`scroll_by`] with no `wm` lock held: under the owner's own locks it runs
+    /// [`scroll_blit`] on its surface, paints `step.strip` (and anything its model moved with the step), calls
+    /// [`scrollbar_paint`] and presents the viewport rows. Returns the pixels it painted. A `moved == 0` step is a
+    /// bar-only repaint (shown, hidden, pressed). It must not call [`scroll_by`].
+    pub type ScrollFn = fn(WinId, &ScrollStep) -> usize;
+
+    #[derive(Clone, Copy)]
+    struct Reg {
+        win: WinId,
+        owner: u64,
+        view: ScrollView,
+        /// The gutter right of the viewport the bar is painted in (surface px), and the window's ground under it.
+        gutter_w: usize,
+        ground: u32,
+        on_scroll: ScrollFn,
+        shown_ms: u64,
+        visible: bool,
+    }
+
+    /// The registered windows. Held only for a lookup or an update — never across a callback, a table read or a print.
+    static SCROLLS: crate::sync::Mutex<alloc::vec::Vec<Reg>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
+    /// Some window has a model: the doors' one relaxed load when none has.
+    static SCROLL_LIVE: AtomicBool = AtomicBool::new(false);
+    /// The thumb being dragged: `(window, grab offset inside the thumb)`.
+    static SCROLL_DRAG: crate::sync::Mutex<Option<(WinId, usize)>> = crate::sync::Mutex::new(None);
+
+    fn reg(win: WinId) -> Option<Reg> {
+        SCROLLS.lock().iter().find(|r| r.win == win).copied()
+    }
+
+    /// Register (or update) `win`'s model — the owner calls it from its paint, so the owner's offset is the truth
+    /// after every full paint. `gutter_w` px right of the viewport are the bar's. A view whose content fits (or a
+    /// rectangle outside the surface) is no model at all: the registration is dropped. `true` = registered.
+    pub fn scroll_set(win: WinId, view: ScrollView, gutter_w: usize, ground: u32, on_scroll: ScrollFn) -> bool {
+        let (x, y, w, h) = view.viewport;
+        let fits = match super::info(win) {
+            Some(i) => x + w + gutter_w <= i.w && y + h <= i.h && w > 0 && h > 0 && view.extent > h,
+            None => false,
+        };
+        let owner = super::owner_of(win).unwrap_or(0);
+        let mut g = SCROLLS.lock();
+        let at = g.iter().position(|r| r.win == win);
+        match (fits, at) {
+            (true, Some(k)) => {
+                let r = &mut g[k];
+                r.owner = owner;
+                r.view = ScrollView { offset: view.offset.min(view.max_offset()), ..view };
+                r.gutter_w = gutter_w;
+                r.ground = ground;
+                r.on_scroll = on_scroll;
+            }
+            (true, None) => g.push(Reg { win, owner, view: ScrollView { offset: view.offset.min(view.max_offset()), ..view }, gutter_w, ground, on_scroll, shown_ms: 0, visible: false }),
+            (false, Some(k)) => {
+                g.swap_remove(k);
+            }
+            (false, None) => {}
+        }
+        SCROLL_LIVE.store(!g.is_empty(), Relaxed);
+        fits
+    }
+
+    /// Drop `win`'s model (its owner closed it, or its content fits again).
+    pub fn scroll_clear(win: WinId) {
+        let mut g = SCROLLS.lock();
+        g.retain(|r| r.win != win);
+        SCROLL_LIVE.store(!g.is_empty(), Relaxed);
+        drop(g);
+        let mut d = SCROLL_DRAG.lock();
+        if d.is_some_and(|(w, _)| w == win) {
+            *d = None;
+        }
+    }
+
+    /// `win`'s model, if it has one.
+    pub fn scroll_view(win: WinId) -> Option<ScrollView> {
+        reg(win).map(|r| r.view)
+    }
+
+    /// THE scroll: move `win`'s content by `dy` px (positive = down the content), clamped to its line grid; the owner
+    /// blits the band and paints the strip ([`ScrollFn`]). The bar shows (and its hide clock restarts) on every
+    /// call, a clamped one included — the hand learns it is at the end. `None` = `win` has no model.
+    pub fn scroll_by(win: WinId, dy: isize) -> Option<ScrollStep> {
+        let now = crate::arch::ms().max(1);
+        let (st, f) = {
+            let mut g = SCROLLS.lock();
+            let r = g.iter_mut().find(|r| r.win == win)?;
+            let st = r.view.step(dy);
+            r.view.offset = st.off;
+            r.visible = true;
+            r.shown_ms = now;
+            (st, r.on_scroll)
+        };
+        let painted = f(win, &st);
+        serial_println!("[scroll] win={} dy={} off={} blit_px={} repaint_px={}", win, dy, st.off, st.blit_px, painted);
+        Some(st)
+    }
+
+    /// Show the bar and repaint it (a press on the gutter, a drag's start and end).
+    fn touch(win: WinId) {
+        let now = crate::arch::ms().max(1);
+        let hit = {
+            let mut g = SCROLLS.lock();
+            g.iter_mut().find(|r| r.win == win).map(|r| {
+                r.visible = true;
+                r.shown_ms = now;
+                (r.view.still(), r.on_scroll)
+            })
+        };
+        if let Some((st, f)) = hit {
+            let _ = f(win, &st);
+        }
+    }
+
+    /// Panel point -> `(window, owner, surface x, surface y)` of the window under it.
+    fn surface_at(x: i32, y: i32) -> Option<(WinId, u64, usize, usize)> {
+        let (win, owner, _) = super::hit_test(x, y)?;
+        let i = super::info(win)?;
+        let sc = i.scale.max(1);
+        if x < i.x as i32 || y < i.y as i32 {
+            return None;
+        }
+        let (sx, sy) = ((x as usize - i.x) / sc, (y as usize - i.y) / sc);
+        (sx < i.w && sy < i.h).then_some((win, owner, sx, sy))
+    }
+
+    /// The WHEEL, scroll-under-pointer (never focus-gated, QSCROLL's rule): over a registered window's viewport or
+    /// gutter, `WHEEL_LINES` of its lines a detent, positive = away = toward the top. `true` = consumed.
+    pub fn scroll_wheel(d: i8) -> bool {
+        if d == 0 || !SCROLL_LIVE.load(Relaxed) {
+            return false;
+        }
+        // LOCKFIX: the input path's one panel door (masked, non-blocking); a refusal declines the event.
+        let Some(p) = super::super::panel_info_nonblocking() else { return false };
+        let (x, y) = crate::pal::cursor::pos(p.width as i32, p.height as i32);
+        let Some((win, owner, sx, sy)) = surface_at(x, y) else { return false };
+        let Some(r) = reg(win) else { return false };
+        let (vx, vy, vw, vh) = r.view.viewport;
+        if r.owner != owner || sx < vx || sx >= vx + vw + r.gutter_w || sy < vy || sy >= vy + vh {
+            return false;
+        }
+        let step = (WHEEL_LINES * r.view.line.max(1)) as isize;
+        let _ = scroll_by(win, -(d as isize) * step);
+        true
+    }
+
+    /// [`scroll_wheel`] for the event chain: anything but a wheel declines.
+    pub fn scroll_wheel_ev(ev: crate::pal::Event) -> bool {
+        match ev {
+            crate::pal::Event::Wheel(d) => scroll_wheel(d),
+            _ => false,
+        }
+    }
+
+    /// A press at surface `(sx, sy)` of `win`: on the thumb it takes the thumb (the drag runs on [`scroll_service`]),
+    /// on the track it pages (a viewport, on the line grid). `true` = the gutter took it.
+    pub fn scroll_press(win: WinId, sx: usize, sy: usize) -> bool {
+        if !SCROLL_LIVE.load(Relaxed) {
+            return false;
+        }
+        let Some(r) = reg(win) else { return false };
+        let (vx, vy, vw, vh) = r.view.viewport;
+        let gx = vx + vw;
+        if sx < gx || sx >= gx + r.gutter_w || sy < vy || sy >= vy + vh {
+            return false;
+        }
+        let rel = sy - vy;
+        match r.view.thumb(vh) {
+            Some((ty, th)) if rel >= ty && rel < ty + th => {
+                *SCROLL_DRAG.lock() = Some((win, rel - ty));
+                touch(win);
+            }
+            Some((ty, _)) => {
+                let q = r.view.line.max(1);
+                let page = (vh / q).max(1) * q;
+                let _ = scroll_by(win, if rel < ty { -(page as isize) } else { page as isize });
+            }
+            None => {}
+        }
+        true
+    }
+
+    /// The desktop service pass: the thumb follows the pointer while the button is held (the button LEVEL, DRAGREL's
+    /// belt), and a bar unused for [`SCROLL_HIDE_MS`] hides (a bar-only repaint by its owner). Idle: one relaxed load.
+    pub fn scroll_service() {
+        if !SCROLL_LIVE.load(Relaxed) {
+            return;
+        }
+        let drag = *SCROLL_DRAG.lock();
+        if let Some((win, grab)) = drag {
+            if !crate::pal::cursor::button_down() {
+                *SCROLL_DRAG.lock() = None;
+                touch(win);
+            } else if let (Some(p), Some(i), Some(r)) = (super::super::panel_info_nonblocking(), super::info(win), reg(win)) {
+                let (_, y) = crate::pal::cursor::pos(p.width as i32, p.height as i32);
+                let sy = (y.max(i.y as i32) as usize - i.y) / i.scale.max(1);
+                let (_, vy, _, vh) = r.view.viewport;
+                let off = r.view.offset_at_thumb(vh, sy.saturating_sub(vy).saturating_sub(grab));
+                if off != r.view.offset {
+                    let _ = scroll_by(win, off as isize - r.view.offset as isize);
+                } else if let Some(m) = SCROLLS.lock().iter_mut().find(|m| m.win == win) {
+                    m.shown_ms = crate::arch::ms().max(1);
+                }
+            }
+        }
+        let now = crate::arch::ms();
+        let held = SCROLL_DRAG.lock().map(|(w, _)| w);
+        for _ in 0..8 {
+            let due = {
+                let mut g = SCROLLS.lock();
+                g.iter_mut().find(|r| r.visible && Some(r.win) != held && now.saturating_sub(r.shown_ms) >= SCROLL_HIDE_MS).map(|r| {
+                    r.visible = false;
+                    (r.win, r.view.still(), r.on_scroll)
+                })
+            };
+            let Some((win, st, f)) = due else { break };
+            let _ = f(win, &st);
+        }
+    }
+
+    /// Paint `win`'s bar into its gutter on `px` (stride `stride`, the owner's surface, called under the owner's lock):
+    /// the ground across the gutter, then — while shown — `draw::scrollbar` right-aligned in it (8 px), the thumb from
+    /// the model (pressed while dragged). A hidden bar is the ground. No model: nothing.
+    pub fn scrollbar_paint(win: WinId, px: &mut [u32], stride: usize) {
+        let Some(r) = reg(win) else { return };
+        let (vx, vy, vw, vh) = r.view.viewport;
+        let (gx, gw) = (vx + vw, r.gutter_w);
+        if gw == 0 || stride == 0 || gx + gw > stride || (vy + vh) * stride > px.len() {
+            return;
+        }
+        for y in vy..vy + vh {
+            px[y * stride + gx..y * stride + gx + gw].fill(r.ground);
+        }
+        if !r.visible {
+            return;
+        }
+        use super::super::draw;
+        let bw = draw::scrollbar_w().min(gw);
+        let thumb = r.view.thumb(vh).map(|(ty, th)| (ty as i32, th as i32));
+        let dragged = SCROLL_DRAG.lock().is_some_and(|(w, _)| w == win);
+        let mut s = draw::Surf::new(px, stride);
+        let track = draw::Rect::new((gx + gw - bw) as i32, vy as i32, bw as i32, vh as i32);
+        draw::scrollbar(&mut s, track, thumb, if dragged { draw::ControlState::PRESSED } else { draw::ControlState::NORMAL });
+    }
+}
