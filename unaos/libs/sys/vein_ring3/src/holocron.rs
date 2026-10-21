@@ -16,7 +16,7 @@ use holocron_core::frame;
 use holocron_core::keysource::{self, Answer, KeySource};
 use holocron_core::wire::{self, status, Request};
 use holocron_core::zero::SecretBytes;
-use una_abi::{BUS_FRAME_MAX, SYS_MRECV, SYS_MSEND};
+use una_abi::{BUS_FRAME_MAX, BUS_HDR_LEN};
 
 static mut RX: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
 static mut CORR: u32 = 0x484F_0000;
@@ -32,24 +32,15 @@ fn call(r: &Request) -> Result<(i32, alloc::vec::Vec<u8>), i64> {
     let f = frame::request(r.verb(), corr, &body);
     holocron_core::zero::wipe(&mut body);
     let Some(mut f) = f else { return Err(una_abi::EINVAL) };
-    let s = sys(SYS_MSEND, f.as_ptr() as u64, f.len() as u64, 0, 0);
+    // DROPLOOPS (SR179): wait through `una_abi::bus_ask` with the program's ONE keep (`crate::bus::keep`): a frame met
+    // before this reply is kept for the program's reader, never dropped. The reply stays in THIS module's RX (it may
+    // carry the secret) and is wiped once copied.
+    let asked = una_abi::bus_ask(&f, r.verb(), corr, rx, crate::bus::keep(), sys);
     holocron_core::zero::wipe(&mut f);
-    if s != 0 {
-        return Err(s);
-    }
-    for _ in 0..8 {
-        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, 0, 0);
-        if n < 0 {
-            return Err(n);
-        }
-        let Some(p) = frame::parse(&rx[..n as usize]) else { continue };
-        if p.kind == frame::KIND_REPLY && p.corr == corr {
-            let out = (p.status, p.body.to_vec());
-            rx[..n as usize].fill(0);
-            return Ok(out);
-        }
-    }
-    Err(una_abi::EIO)
+    let (st, blen) = asked?;
+    let out = (st as i32, rx[BUS_HDR_LEN..BUS_HDR_LEN + blen].to_vec());
+    rx[..BUS_HDR_LEN + blen].fill(0);
+    Ok(out)
 }
 
 /// Where the key came from.
