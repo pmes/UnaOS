@@ -431,10 +431,17 @@ fn queued(o: &Out) -> u64 {
 }
 
 /// (starve, high) water in frames: mix while below high; below starve a short source is padded (an underrun). The
-/// HDA stream runs only once its 128 KiB ring is primed (hda_play's threshold, 32 768 frames), so its high sits above.
+/// HDA stream runs only once its ring is primed, so its high is the stream's own number, the prime plus one entry
+/// (SINKALLDOCS: `hda::play::HIGH_FRAMES`, 10 752 frames = 224 ms — a Player pause on HDA lands within it).
 fn marks(kind: u8) -> (u64, u64) {
-    if kind == OUT_HDA { (2 * PERIOD_FRAMES as u64, 40_960) } else { (2 * PERIOD_FRAMES as u64, 10 * PERIOD_FRAMES as u64) }
+    if kind == OUT_HDA { (2 * PERIOD_FRAMES as u64, HDA_HIGH) } else { (2 * PERIOD_FRAMES as u64, 10 * PERIOD_FRAMES as u64) }
 }
+
+/// The HDA output's high water: the stream's (`hda::play` owns the ring); no HDA output without it.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+const HDA_HIGH: u64 = crate::drivers::hda::play::HIGH_FRAMES;
+#[cfg(not(all(target_arch = "x86_64", feature = "hda-tone")))]
+const HDA_HIGH: u64 = 0;
 
 /// Hand the pending period to the output: true when it was all taken.
 fn deliver(o: &mut Out) -> bool {

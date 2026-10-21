@@ -5,7 +5,7 @@
 //! Shape: `start(rate, ch, bits)` re-runs the tone's own bring-up (`hda_tone_test`'s probe) with `REQ_RATE`
 //! set; `run_tone` — after it has done the power/amp/GPIO/EAPD/converter-format/stream-bind work itself —
 //! calls `gate()` (one same-line fold before the SDnCTL reset) which swaps the 192 KB / 2-entry tone buffer for
-//! a 4 x 32 KiB IOC ring and returns early. The stream is NOT run until `feed()` has primed the ring; the
+//! a 20 x 2 KiB IOC ring and returns early. The stream is NOT run until `feed()` has primed the ring; the
 //! service tick (`service()`, folded at the top of `probe_after_root`) polls `LPIB` (INTCTL is never written, the
 //! BCIS latch reaches no CPU — HDASIE is a latch experiment) and refills each entry as it completes.
 //! Internally the stream is ALWAYS 16-bit stereo: `feed()` widens 8-bit and duplicates mono, and resamples by
@@ -22,9 +22,17 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-const ENTRIES: usize = 4;
-const ENTRY_BYTES: usize = 32 * 1024;
+// SINKALLDOCS (rmbp-ledger B781): THE RING IS THE PRIME. A refilled entry is committed audio (`refill` writes entry j as
+// soon as LPIB leaves it) and a prime short of the ring zero-pads an entry (a gap), so a pause on HDA lands after the
+// ring plus what the mixer keeps above it. Was 4 x 32 KiB (683 ms). Now 20 x 2 KiB = 40 KiB = 213 ms at 48 kHz stereo
+// 16-bit (192 B/ms): an entry must be refilled within the other 19 (203 ms) — the slowest steady service pass on the
+// bench's HDA is 176 ms (rmbp flight 36 boot 3, `[play] t=165 -> t=341`), a 27 ms margin.
+const ENTRIES: usize = 20;
+const ENTRY_BYTES: usize = 2 * 1024;
 const RING_BYTES: usize = ENTRIES * ENTRY_BYTES;
+/// The mixer's HDA high water in 48 kHz frames (`audio::mixer::marks` reads it; this stream owns the number): the prime
+/// plus one entry, so at every entry boundary the FIFO still holds a whole entry (HIGH - 19 entries = 2 entries).
+pub const HIGH_FRAMES: u64 = ((RING_BYTES + ENTRY_BYTES) / 4) as u64;
 // AUDIO7 (B313) M3: was 128 KiB = RING_BYTES — with feed()'s 2x frame estimate the FIFO topped out at 96 KiB
 // (90312 bytes at 44.1 kHz) and never reached the RING_BYTES prime threshold: armed, never RUN, silent (PLAY2).
 const FIFO_CAP: usize = 2 * RING_BYTES;

@@ -5330,7 +5330,7 @@ fn trashtoast_empty_leg(base: &str) -> bool {
 // not opened by the mixer. usb_volume = the device's Feature Unit took SET_CUR (ok), or with no device the descriptor
 // walk of QEMU's unit (fixture).
 // Wire: `[sinkall] leg …`, `[audio] source=<player|video|alert> sink=<hda|usb|bt> frames=<n>`,
-// `:: SINKALL: sources=<n> direct_writes=<n> usb_volume=<ok|fixture|mixer|FAIL|not-built> -> PASS|SKIP|FAIL :: hda= usb= bt= overlap= ::`.
+// `:: SINKALL: sources=<n> direct_writes=<n> usb_volume=<ok|fixture|mixer|FAIL|not-built> -> PASS|SKIP|FAIL :: hda= usb= bt= overlap= pause_ms=<n> ::` (SINKALLDOCS B781: -1 when not measured; PASS needs <= 250; the leg is `sinkall_pause`, file tail).
 #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
 fn sinkall_selftest() {
     use crate::audio::{self, mixer, Sink};
@@ -5351,22 +5351,22 @@ fn sinkall_selftest() {
         if open == 1 && after == 0 && ok { "synthetic" } else { "FAIL" }
     };
     let live = if hda == "ok" { Some(("hda", 0usize)) } else if usb == "ok" { Some(("usb", 1usize)) } else { None };
-    let (mut sources, mut overlap) = (0u32, "-");
+    let (mut sources, mut overlap, mut pause_ms) = (0u32, "-", u64::MAX);
     if let Some((s, k)) = live {
         sources = 1; // the alert reached a sink
         let _ = audio::sink(s);
         sources += sinkall_player("player", s, k) as u32;
         sources += sinkall_player("video", s, k) as u32;
-        overlap = if sinkall_overlap(s) { "ok" } else { "FAIL" };
+        overlap = if sinkall_overlap(s) { "ok" } else { "FAIL" }; pause_ms = sinkall_pause(s); // SINKALLDOCS (B781): the Player's pause lands within the sink's queue (file tail)
     }
     let usb_volume = sinkall_usb_volume(usb);
     let direct = play::epoch().wrapping_sub(e0) as i64 - mixer::hda_opens().wrapping_sub(o0) as i64;
     let _ = audio::sink(if was == Sink::Usb { "usb" } else if was == Sink::Hda { "hda" } else { "bt" });
     let failed = [hda, usb, bt_live, bt, overlap, usb_volume].iter().any(|v| *v == "FAIL");
-    let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 { "PASS" } else { "FAIL" };
+    let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 && pause_ms <= SINKALL_PAUSE_MS { "PASS" } else { "FAIL" };
     serial_println!(
-        ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} ::",
-        sources, direct, usb_volume, verdict, hda, usb, bt, overlap
+        ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} pause_ms={} ::",
+        sources, direct, usb_volume, verdict, hda, usb, bt, overlap, pause_ms as i64
     );
 }
 
@@ -5497,4 +5497,56 @@ fn settingsmap_selftest() {
         NS, k, changed, arrived.map_or(alloc::string::String::from("na"), |a| format!("{}", a)),
         if wrote.is_ok() { "ok" } else { "refused" }, if ok { "PASS" } else { "FAIL" }, if ok { "ok" } else { "bad" }
     );
+}
+
+// SINKALLDOCS (rmbp-ledger B781; BP-audio-17) — TAIL-APPENDED: `tests sinkall`'s pause leg. A Player pause holds its
+// source out of the mix (`mixer::pause`); what already left the mixer still plays, so the Player's position (the A/V
+// clock, `hda::play::position_ms`) keeps moving until the sink's queue drains. pause_ms = the last move of that position
+// after `pause(true)` (a position still for 150 ms is stopped). On HDA the queue is `hda::play::HIGH_FRAMES` (224 ms);
+// PASS in `sinkall_selftest` needs <= SINKALL_PAUSE_MS. Wire: `[sinkall] leg pause sink= steady= stopped= pause_ms= closed=`.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+const SINKALL_PAUSE_MS: u64 = 250;
+
+/// The Player's pause latency on `sink` in ms (u64::MAX when it could not be measured).
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_pause(sink: &str) -> u64 {
+    use crate::audio::mixer;
+    use crate::drivers::hda::play;
+    use core::cell::Cell;
+    const LONG: u64 = 48_000 * 6;
+    if play::fixture_source("player").is_err() {
+        return u64::MAX;
+    }
+    let steady = play::pump_until(3_000, || {
+        let _ = play::fixture_feed(LONG);
+        let p = play::position_ms();
+        p != u64::MAX && p >= 300
+    });
+    let mut p0 = play::position_ms();
+    for _ in 0..1_000 {
+        if p0 != u64::MAX {
+            break;
+        }
+        p0 = play::position_ms();
+    }
+    let t0 = crate::arch::ms();
+    let _ = play::pause(true);
+    let last = Cell::new((p0, t0));
+    let stopped = steady
+        && play::pump_until(2_000, || {
+            let now = crate::arch::ms();
+            let p = play::position_ms();
+            if p != u64::MAX && p != last.get().0 {
+                last.set((p, now));
+            }
+            now.saturating_sub(last.get().1) >= 150
+        });
+    let pause_ms = if stopped { last.get().1.saturating_sub(t0) } else { u64::MAX };
+    play::stop();
+    let closed = play::pump_until(500, || mixer::sources() == 0);
+    serial_println!(
+        "[sinkall] leg pause sink={} steady={} stopped={} pause_ms={} closed={}",
+        sink, steady as u8, stopped as u8, pause_ms as i64, closed as u8
+    );
+    if closed { pause_ms } else { u64::MAX }
 }

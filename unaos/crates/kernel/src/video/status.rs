@@ -664,7 +664,7 @@ pub fn volkey_usage(usage: u8) -> Option<(u8, bool)> {
     VOL_LEVEL.store(lv, Ordering::Relaxed);
     VOL_MUTED.store(muted as u8, Ordering::Relaxed);
     #[cfg(all(target_arch = "x86_64", feature = "hda"))]
-    let written = crate::drivers::hda::vol::apply(lv, muted) > 0;
+    let written = crate::drivers::hda::vol::apply(lv, muted) > 0; #[cfg(any(feature = "uvc", feature = "hda-tone"))] crate::audio::mixer::pump(); // SINKALLDOCS (rmbp-ledger B781): the mixer hands the new level to a USB device now (`master` -> `uac::volume_want`), not at the next period. LINE-NEUTRAL append, code before this comment
     #[cfg(not(all(target_arch = "x86_64", feature = "hda")))]
     let written = false;
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
