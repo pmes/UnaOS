@@ -1,0 +1,119 @@
+# neutral.allow — the ruled exceptions to GATE-NEUTRAL (tools/neutral-check.py; LEDGER.md SR166; BP-shape-4, R16).
+# One row per <repo-relative file> <token> found in a shared kernel file (unaos/crates/kernel/src minus arch/):
+#   <file>  <token>  <reason>
+# The reason is required (a row without one is a CONTROL failure, exit 2). A row that no longer matches the tree is
+# STALE and fails the gate: the list only SHRINKS. A NEW board name in a shared file gets a subsystem name, not a row,
+# unless it is data (a board IS the value) or a wire string the specs and evidence quote.
+# Seeded by GATENEUTRAL at fb8ad2f4: every finding on that tip, none renamed (no kernel compile in the arc); each
+# reason names the rename owed. Re-derive the list with `tools/neutral-check.py --emit`.
+
+unaos/crates/kernel/src/boot.rs  orin  data: the per-board support floor table (`OLDEST`, one cfg-gated const per image line); the board IS the value, read by the login face
+unaos/crates/kernel/src/boot.rs  pi4  data: the per-board support floor table (`OLDEST`, one cfg-gated const per image line); the board IS the value, read by the login face
+unaos/crates/kernel/src/boot.rs  rmbp12  data: the per-board support floor table (`OLDEST`, one cfg-gated const per image line); the board IS the value, read by the login face
+unaos/crates/kernel/src/drivers/block.rs  NATIVE_TEGRA_SD_VETO  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  Orin  prose in the SDMMC write-refused wire line, naming the arch file that owns the writer; rewords with the sdmmc rename (SR166)
+unaos/crates/kernel/src/drivers/block.rs  TEGRA  the SD source vendor string `TEGRA-SD` in BlockDeviceInfo; renames with the source name (SR166)
+unaos/crates/kernel/src/drivers/block.rs  TEGRA_SD_BLOCK_DEVICE  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  TEGRA_SD_PUBLISHED  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  TEGRA_SD_WRITE_REFUSED  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  read_block_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  read_blocks_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  register_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  sdmmc_tegra  prose in the SDMMC write-refused wire line, naming the arch file that owns the writer; rewords with the sdmmc rename (SR166)
+unaos/crates/kernel/src/drivers/block.rs  tegra  the wire source name `tegra-sd` (`BlockHandle::SdMmc`), quoted by the SDMMC specs and evidence; renames with them (SR166)
+unaos/crates/kernel/src/drivers/block.rs  tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  tegra_sd_info  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  tegra_sd_read_block_512  a fn defined in arch/aarch64/sdmmc_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/drivers/block.rs  tegra_sd_read_blocks_512  a fn defined in arch/aarch64/sdmmc_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/drivers/block.rs  tegra_sd_write_block_512  a fn defined in arch/aarch64/sdmmc_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/drivers/block.rs  tegra_sd_write_blocks_through  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  tegra_sd_write_through  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  tegra_sd_writes_admitted  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  write_block_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/drivers/block.rs  write_blocks_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/bootdisk.rs  Tegra  prose in the SDWRITE-POSTURE wire line (no QEMU machine models that SDHCI); rewords with the sdmmc rename (SR166)
+unaos/crates/kernel/src/fs/bootdisk.rs  tegra  the wire source name `tegra-sd` (`BlockHandle::SdMmc`), quoted by the SDMMC specs and evidence; renames with them (SR166)
+unaos/crates/kernel/src/fs/bootdisk.rs  tegra_sd_state  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/bootdisk.rs  tegra_sd_writes_admitted  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/fat.rs  Orin  prose in the SDMMC write-veto message (`TEGRA_SD_VETO`); rewords with the sdmmc rename (SR166)
+unaos/crates/kernel/src/fs/fat.rs  TEGRA  prose in the SDMMC write-veto message (`TEGRA_SD_VETO`); rewords with the sdmmc rename (SR166)
+unaos/crates/kernel/src/fs/fat.rs  TEGRA_SD_VETO  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/fat.rs  read_block_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/fat.rs  read_blocks_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/fat.rs  sdmmc_tegra  prose in the SDMMC write-veto message (`TEGRA_SD_VETO`); rewords with the sdmmc rename (SR166)
+unaos/crates/kernel/src/fs/fat.rs  tegra  the wire source name `tegra-sd` (`BlockHandle::SdMmc`), quoted by the SDMMC specs and evidence; renames with them (SR166)
+unaos/crates/kernel/src/fs/fat.rs  tegra_sd_info  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/fat.rs  tegra_sd_writes_admitted  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/fat.rs  write_block_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/fat.rs  write_blocks_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/jobs.rs  orin  data: a queue TRACK name (`docs/dev/OS/<track>-queue.md`), the value the jobs verb filters by
+unaos/crates/kernel/src/fs/jobs.rs  rmbp  data: a queue TRACK name (`docs/dev/OS/<track>-queue.md`), the value the jobs verb filters by
+unaos/crates/kernel/src/fs/unafs.rs  read_block_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/unafs.rs  tegra  the wire source name `tegra-sd` (`BlockHandle::SdMmc`), quoted by the SDMMC specs and evidence; renames with them (SR166)
+unaos/crates/kernel/src/fs/unafs.rs  tegra_sd_info  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/unafs.rs  write_block_tegra_sd  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/fs/users.rs  m_rmbp  locals of a selftest modelling the flight-13 machine shape; a one-fn rename owed (e.g. `two_disk`)
+unaos/crates/kernel/src/fs/users.rs  old_guard_rmbp  locals of a selftest modelling the flight-13 machine shape; a one-fn rename owed (e.g. `two_disk`)
+unaos/crates/kernel/src/fs/users.rs  old_mount_rmbp  locals of a selftest modelling the flight-13 machine shape; a one-fn rename owed (e.g. `two_disk`)
+unaos/crates/kernel/src/fs/users.rs  rmbp  locals of a selftest modelling the flight-13 machine shape; a one-fn rename owed (e.g. `two_disk`)
+unaos/crates/kernel/src/install/partition.rs  tegra  the wire source name `tegra-sd` (`BlockHandle::SdMmc`), quoted by the SDMMC specs and evidence; renames with them (SR166)
+unaos/crates/kernel/src/main.rs  Jetson  the tegra image banner line (cfg tegra) names the board it booted on; the wire the Orin specs match
+unaos/crates/kernel/src/main.rs  ORIN  prose in the `[deskseam]` REFUSE line citing the ORIN-WM1 arc by name; rewords with that arc
+unaos/crates/kernel/src/main.rs  ORINCONWIN  a knob or feature named in a wire line as Cargo.toml spells it; renames with the knob
+unaos/crates/kernel/src/main.rs  ORINFURN_ENTERED  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  ORINRENDER_ARMED  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  ORINSTK_ANCHOR_SP  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  ORINTENANT  a knob or feature named in a wire line as Cargo.toml spells it; renames with the knob
+unaos/crates/kernel/src/main.rs  Orin  the tegra image banner line (cfg tegra) names the board it booted on; the wire the Orin specs match
+unaos/crates/kernel/src/main.rs  TEGRA  the `:: TEGRA-EL0:` wire tag (cfg tegra_el0), matched by the Orin specs; renames with the knob
+unaos/crates/kernel/src/main.rs  TEGRADESK_CASCADE_OK  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  TEGRADESK_CLICK_ROUTED  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  TEGRADESK_ENTERED  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  TEGRA_BOOT_FOCUS_DONE  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  TEGRA_JD2_STACK_SIZE  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  Tegra  the tegra MMU-live wire line (`:: tegra: mmu live`), matched by the Orin specs; renames with them
+unaos/crates/kernel/src/main.rs  Tegra234  the tegra image banner line (cfg tegra) names the board it booted on; the wire the Orin specs match
+unaos/crates/kernel/src/main.rs  UNAOS_ORINDESK  a knob or feature named in a wire line as Cargo.toml spells it; renames with the knob
+unaos/crates/kernel/src/main.rs  orin  the `orin-render` task name (cfg tegra), shown in the task table; renames with `orin_render_service`
+unaos/crates/kernel/src/main.rs  orin_click  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orin_click_census  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orin_conwin  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orin_desk_scene_up  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  orin_drag_steer  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orin_ladder_arm  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orin_ladder_census  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orin_rast_census  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orin_rast_console_owns  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orin_render_service  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  orin_tenant_arm  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orin_tenant_census  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orin_wm1  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  orinconwin  a knob or feature named in a wire line as Cargo.toml spells it; renames with the knob
+unaos/crates/kernel/src/main.rs  orinfurn  a knob or feature named in a wire line as Cargo.toml spells it; renames with the knob
+unaos/crates/kernel/src/main.rs  orinuvc_service  a fn defined in arch/aarch64/xusb_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  run_bsp_tegra  a fn defined in arch/aarch64/sched.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  tegra  the tegra MMU-live wire line (`:: tegra: mmu live`), matched by the Orin specs; renames with them
+unaos/crates/kernel/src/main.rs  tegra_boot_focus  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_cascade_stk_post  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_cascade_stk_pre  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_conwin_live  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_darkwin_witness  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_desk_arm  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_desk_cascade  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_desk_furn  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_early_stop  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_el0_start_maybe  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_el0_verdict  a fn defined in arch/aarch64/syscall.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/main.rs  tegra_quarry_seat  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_render_arm  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/main.rs  tegra_sd_info  the SDMMC block source still names the SoC (`BlockHandle::SdMmc` is already neutral); rename to `sdmmc_*` owed with its callers in block.rs, fat.rs, unafs.rs, bootdisk.rs, main.rs (SR166)
+unaos/crates/kernel/src/main.rs  tegra_stk_anchor  the aarch64 Jetson boot path kept in main.rs (cfg tegra, `tegra_early_stop` and its desk/render/el0 ladder, BP-boot-14); owed: move to arch/aarch64/boot_tegra.rs or name it for the subsystem
+unaos/crates/kernel/src/rast_demo.rs  orin_rast_glass_post  a fn defined in arch/aarch64/display_tegra.rs (board-specific, where R16 lets it live), called by path under its cfg; renames with its definition
+unaos/crates/kernel/src/video/fbcon.rs  ORINFACE_ARMED  the aarch64 console face arm (ORIN-FACE, cfg orinface) and its `[conface]` wire line; renames with the `orinface` knob
+unaos/crates/kernel/src/video/fbcon.rs  ORINFACE_RUNS  the aarch64 console face arm (ORIN-FACE, cfg orinface) and its `[conface]` wire line; renames with the `orinface` knob
+unaos/crates/kernel/src/video/fbcon.rs  Orin  the aarch64 console face arm (ORIN-FACE, cfg orinface) and its `[conface]` wire line; renames with the `orinface` knob
+unaos/crates/kernel/src/video/fbcon.rs  orin_face_arm  the aarch64 console face arm (ORIN-FACE, cfg orinface) and its `[conface]` wire line; renames with the `orinface` knob
+unaos/crates/kernel/src/video/login.rs  tegra_opened  a local of the login selftest naming its desktop-exists-but-activate-false case after the board; a one-fn rename owed (e.g. `desk_opened`)
+unaos/crates/kernel/src/video/quarry/live.rs  tegra_el0  a knob or feature named in a wire line as Cargo.toml spells it; renames with the knob
+unaos/crates/kernel/src/vugras.rs  TEGRA_DRAM_TOP  the Tegra234 DRAM window top (8 GiB) that caps the VUGRAS above-heap span, and its wire line; owed: read it from the memory map (BP-shape-7)
+unaos/crates/kernel/src/vugras.rs  tegra  the Tegra234 DRAM window top (8 GiB) that caps the VUGRAS above-heap span, and its wire line; owed: read it from the memory map (BP-shape-7)
