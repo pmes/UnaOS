@@ -61,8 +61,8 @@
 //! the glass is exact the instant the handle is the panel's again.
 //!
 //! WIRE: `[zoom] z=<n> follow=<p|f> origin=<x>,<y> present_us=<n>` on each change (rate-limited to 1/s, from the
-//! service pass); `[zoom] refused z=<n> reason=<why>`; `tests zoom`:
-//! `:: ZOOM: z=2 px_ok=3 present_us=<n> -> PASS ::` (+ `panel= smooth_us= engage_us= budget_us= under=`).
+//! service pass); `[zoom] engage refused z=<n> why=<why>` (printed by [`engage`] itself, ZOOM2 B829); `tests zoom`:
+//! `:: ZOOM: z=2 px_ok=3 present_us=<n> -> PASS ::` (+ `panel= smooth_us= engage_us= budget_us= under= lost= why=`).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::*};
@@ -354,9 +354,18 @@ fn present_locked(l: &mut Lens, smooth: bool) -> Option<u64> {
     Some(us)
 }
 
+/// Engage at `z` ([`engage_at`]); a refusal is named on the wire here, once, never a silent `Err` (ZOOM2 B829).
+fn engage(z: u8) -> Result<u64, &'static str> {
+    let r = engage_at(z);
+    if let Err(why) = r {
+        serial_println!("[zoom] engage refused z={} why={}", z, why);
+    }
+    r
+}
+
 /// Engage at `z`: the RAM frame (allocated once, kept), seeded from the glass, `WRITER` retargeted at it, every
 /// window and the desktop damaged so whatever raced the seed is re-composed into RAM. Task context only.
-fn engage(z: u8) -> Result<u64, &'static str> {
+fn engage_at(z: u8) -> Result<u64, &'static str> {
     let mut g = LENS.lock();
     let real = *super::WRITER.lock();
     if g.as_ref().is_some_and(|l| l.sfb.base_addr() == real.base_addr()) {
@@ -448,9 +457,8 @@ pub fn service() {
         if want == 0 {
             disengage();
         } else if live == 0 {
-            if let Err(why) = engage(want) {
-                WANT.store(0, Relaxed);
-                serial_println!("[zoom] refused z={} reason={}", want, why);
+            if engage(want).is_err() {
+                WANT.store(0, Relaxed); // the refusal's line is engage's own
             }
         } else {
             LIVE.store(want, Release);
@@ -506,36 +514,25 @@ pub fn selftest() {
         serial_println!(":: ZOOM: -> SKIP :: reason={}", why);
         return;
     }
-    let ram = super::panel_snapshot().map_or(0, |f| f.base_addr());
     let abs = |v: usize, n: usize| ((v * 32767) / (n - 1).max(1)) as i32;
     let mut px_ok = 0u32;
     let mut worst = 0u64;
+    let mut why = "-";
     for (cx, cy) in [(0usize, 0usize), (w - 1, 0), (0, h - 1)] {
-        crate::pal::cursor::set_abs(abs(cx, w), abs(cy, h), w as i32, h as i32);
-        let mut us = None;
-        for _ in 0..8 {
-            us = present(Some(false));
-            if us.is_some() { break; }
-        }
-        let Some(us) = us else { continue };
-        worst = worst.max(us);
-        let (x, y) = crate::pal::cursor::pos(w as i32, h as i32);
-        let (x, y) = (x.max(0) as usize, y.max(0) as usize);
-        let o = ORIGIN.load(Relaxed);
-        let (ox, oy) = ((o >> 32) as usize, (o & 0xFFFF_FFFF) as usize);
-        let (dx, dy) = ((x - ox.min(x)) * 2, (y - oy.min(y)) * 2);
-        if ram == 0 || x >= w || y >= h || dx >= w || dy >= h {
-            continue;
-        }
-        // SAFETY: both offsets are inside their frames (bounded above); 4-byte pixels on both.
-        let (want_px, got_px) = unsafe {
-            (core::ptr::read_volatile((ram + (y * w + x) * 4) as *const u32), core::ptr::read_volatile((real.base_addr() + (dy * info.stride + dx) * 4) as *const u32))
-        };
-        if want_px == got_px {
-            px_ok += 1;
+        match probe(cx, cy, w, h, real.info().stride) {
+            Ok(us) => {
+                worst = worst.max(us);
+                px_ok += 1;
+            }
+            Err((us, miss)) => {
+                worst = worst.max(us);
+                if why == "-" {
+                    why = miss;
+                }
+            }
         }
     }
-    let smooth_us = present(Some(true)).unwrap_or(0);
+    let smooth_us = LENS.lock().as_mut().and_then(|l| present_locked(l, true)).unwrap_or(0);
     let o = ORIGIN.load(Relaxed);
     serial_println!("[zoom] z=2 follow=p origin={},{} present_us={}", o >> 32, o & 0xFFFF_FFFF, worst);
     crate::pal::cursor::set_abs(abs(px0.max(0) as usize, w), abs(py0.max(0) as usize, h), w as i32, h as i32);
@@ -549,9 +546,36 @@ pub fn selftest() {
     }
     let pass = px_ok == 3;
     serial_println!(
-        ":: ZOOM: z=2 px_ok={} present_us={} -> {} :: panel={}x{} smooth_us={} engage_us={} budget_us={} under={} lost={}",
-        px_ok, worst, if pass { "PASS" } else { "FAIL" }, w, h, smooth_us, ENGAGE_US.load(Relaxed), BUDGET_US, (worst <= BUDGET_US) as u8, PANEL_LOST.load(Relaxed)
+        ":: ZOOM: z=2 px_ok={} present_us={} -> {} :: panel={}x{} smooth_us={} engage_us={} budget_us={} under={} lost={} why={}",
+        px_ok, worst, if pass { "PASS" } else { "FAIL" }, w, h, smooth_us, ENGAGE_US.load(Relaxed), BUDGET_US, (worst <= BUDGET_US) as u8, PANEL_LOST.load(Relaxed), why
     );
+}
+
+/// ZOOM2 (B829): one fixture present + its read-back under ONE waiting `LENS` hold. The pointer is moved to the corner
+/// `(cx, cy)` OUTSIDE the hold (the cursor's `on_pointer` kick try-locks the lens), then the hold is TAKEN — the
+/// waiting acquire `engage` / `disengage` take from task context — so a present running on another core (a
+/// composite pass's `on_damage`) is waited out, never lost to, and no other present moves `ORIGIN` or the glass
+/// between `present_locked` and the two probe reads: the RAM frame's pixel under the pointer (`p`) and the scan-out's
+/// at `(p - origin) * 2`. `Ok(us)` on a match; `Err((us, why))` names the miss (`no-lens`, `no-present`, `edge`,
+/// `pixel`).
+fn probe(cx: usize, cy: usize, w: usize, h: usize, stride: usize) -> Result<u64, (u64, &'static str)> {
+    let abs = |v: usize, n: usize| ((v * 32767) / (n - 1).max(1)) as i32;
+    crate::pal::cursor::set_abs(abs(cx, w), abs(cy, h), w as i32, h as i32);
+    let mut g = LENS.lock();
+    let Some(l) = g.as_mut() else { return Err((0, "no-lens")) };
+    let Some(us) = present_locked(l, false) else { return Err((0, "no-present")) };
+    let (x, y) = crate::pal::cursor::pos(w as i32, h as i32);
+    let (x, y) = (x.max(0) as usize, y.max(0) as usize);
+    let o = ORIGIN.load(Relaxed);
+    let (ox, oy) = ((o >> 32) as usize, (o & 0xFFFF_FFFF) as usize);
+    let (dx, dy) = ((x - ox.min(x)) * 2, (y - oy.min(y)) * 2);
+    if x >= l.w || y >= l.h || dx >= l.w || dy >= l.h || l.shadow.len() < l.w * l.h {
+        return Err((us, "edge"));
+    }
+    let want_px = l.shadow[y * l.w + x];
+    // SAFETY: `(dx, dy)` is inside the scan-out (bounded above by its geometry, `stride` its pitch); 4-byte pixels.
+    let got_px = unsafe { core::ptr::read_volatile((l.real.base_addr() + (dy * stride + dx) * 4) as *const u32) };
+    if want_px == got_px { Ok(us) } else { Err((us, "pixel")) }
 }
 
 // crawl A 8 (BP-video-26) — TAIL-APPENDED. The render service's panel `Screen` copied the REAL `WRITER` handle once at
