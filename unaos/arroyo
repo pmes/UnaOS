@@ -8284,6 +8284,7 @@ KERNEL_CFG_MATRIX=(
   # configurations those files produce, so the fold type-checks the line it flies:
   #   arm-tegra-image = arm-tegra-desk's list + login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet
   #   arm-pi-image    = arm-pi's list + lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet (holocron, login: on arm-pi already)
+  #   arm-tegra-image-supstate = arm-tegra-image's list + orindesk,orinclick,orinconwin,orinrender,supstate (SUPSTATELEG SR168, below the x86-image row)
   # uvc/sonde compile on aarch64 only once ARMSONDE lifts their x86 module gates; until it folds these
   # two legs red on those names (the seat knows — the brief's own caveat).
   #
@@ -8296,6 +8297,24 @@ KERNEL_CFG_MATRIX=(
   "arm-tegra-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet,login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria"
   "arm-pi-image ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,skip_xhci,bootlog,pi,baremetal,vugpar,smp7,smp7_retry,k2_leave,smp8,core3probe,v3d,v3d_deep,v3d_qpu,v3d_dispdone,v3d69_reenable,v3d79_minimal,v3d81,v3d81_qpu,v3d81_display,v3d_firstkick,piusb,genet,nettest,nsspan,piinstall,piinstall_arm,piinstall_confirm,pirast,desktop_firmware,v3d_unarmclose,quarry,v3d_basedaim,v3d_tsaim,v3d_armedclose,v3d_bincontent,v3d_dispatchdisc,v3d_hfirst,v3d_vpmprobe,fatperf,livecon,holocron,hcronst,deadman,wcg-paygo,prtscrst,facet,v3d_singleseg,login,loginst,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria"
   "x86-image ../../x86_64-unaos.json witness,unafs,login,holocron,lumen,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria"   # STRIAMETAL (SR139): + stria on the three image legs (the image lines carry UNAOS_STRIA)
+  # ── SUPSTATELEG (appended 2026-10-21, LEDGER SR168, wave36) — the Orin image line WITH `supstate` ──
+  #
+  # THE HOLE, MEASURED (awk over this matrix's third field at e3c98fcd): seven rows carry `supstate`
+  # (arm-tegra-orinrx, -tcurx, -supstate, -supstate-el0, -supstate-el0-click, -supstate-el0-desk,
+  # -supstate-el0-smpmark) and NONE carries `login` or the image-24 knobs; `arm-tegra-image` (the leg
+  # image-line-orin.env names) carries the image line but not `supstate`. So `jd2_supstate_phase2`
+  # (main.rs, cfg tegra + supstate) crossed with the image line — ORINSUPCHAR's (SR162) login `Char` arm
+  # (cfg login + desktop_firmware), and every holocron/lumen/uvc/sonde/usbnet/stria/orinrender site
+  # reached from it — was type-checked by no leg; its only compile was an executor's hand line.
+  #   arm-tegra-image-supstate = arm-tegra-image's list VERBATIM + orindesk,orinclick,orinconwin,orinrender
+  #                              (the four MANIFEST knobs image-line-orin.env sets) + supstate
+  # A red here names the `supstate` polarity of the line the Orin flies, nothing else.
+  # NO Pi twin: the Pi's baremetal arms (CHARREPEAT's `pump_usb_into_gui`, the shell drain's and
+  # `render_pass`'s `Char` arms, tests.rs `keychars_repeat_tracker`) are all compiled by `arm-pi-image`
+  # and `arm-pi` above (pi, baremetal, desktop_firmware, login, witness); a second Pi leg would be a copy.
+  # UNIVERSE SIDE EFFECT: none — every feature here is already on an arm-* row and on no x86-* row, so
+  # `x86_cfg_universe` and the mix-leg count are unchanged. Board legs +1.
+  "arm-tegra-image-supstate ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet,login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria,orindesk,orinclick,orinconwin,orinrender,supstate"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
