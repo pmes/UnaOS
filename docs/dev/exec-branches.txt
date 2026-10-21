@@ -689,13 +689,13 @@ refs/heads/exec-rmbp-uacfeedback   4b34aa7f FOLDED-BY-HAND (this commit) 2026-10
 refs/heads/exec-rmbp-avrcpmute   2ce57de5 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-scrollpanes   73c7e89c FOLDED-BY-HAND (this commit) 2026-10-21 (cut 10-21 from 87e82a82; the cut was not registered)
 refs/heads/exec-rmbp-ring3scrollpress   70d644d8 FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-sidebarwheel   28d01e8c IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-sidebarwheel   71bbb3c5 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-sessionedge   93003df9 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-layoutroot   9305af82 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-ehcihubchain   590f627d FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-xhciholddci   ac802663 FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-subscribekeep   65c6e794 IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-raisearm64   9a1134d7 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-subscribekeep   5598d0f8 FOLDED-BY-HAND (this commit) 2026-10-21
+refs/heads/exec-rmbp-raisearm64   32117758 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-pihome   4ba143fc FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-mailboxkeep   acb9969b FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-scrollservicewc   865d91a7 IN-FLIGHT cut 2026-10-21
