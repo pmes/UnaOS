@@ -138,23 +138,23 @@ pub const PBKDF2_ITERS_MAX: u32 = 4_000_000;
 pub const PBKDF2_TARGET_MS: u64 = 250;
 /// SECLOGIN M2: the first uid a fresh store issues (0 is "no user" everywhere a uid is read).
 pub const FIRST_UID: u32 = 1;
-/// Bounds. `NAME_MAX` is 8 since M2: the home directory is a FAT 8.3 leaf (`HOME/<NAME>`) on the EL0
-/// volume, so a name is at most 8 bytes (the on-disk row keeps its 24-byte field; `user:<name>` is at
-/// most 13, inside the 30-byte principal value field).
+/// Bounds. `NAME_MAX` is 8 since M2: a FAT-store home is an 8.3 leaf (`HOME/<NAME>` on `store_mount`'s volume, [`ensure_home`]);
+/// a native UnaFS root's `/home/<name>` (`ensure_home_native`) keeps the one bound, the same on either root volume,
+/// so a name is at most 8 bytes (the on-disk row keeps its 24-byte field; `user:<name>` is at most 13, inside the 30-byte principal value field).
 pub const MAX_USERS: usize = 8;
 pub const NAME_MAX: usize = 8;
 pub const HOME_MAX: usize = 32;
 pub const SALT_LEN: usize = 16;
 const HASH_LEN: usize = 32;
-/// The live leaf, the swap temp, and the mount-table spellings of each (root of the root volume).
+/// The live leaf, the swap temp, and the FAT root's mount-table spellings (a native root's are `/system/<leaf>`, `seat_with`).
 pub const USERS_FILE: &str = "USERS.DAT";
 pub const USERS_TMP_FILE: &str = "USERS.NEW";
 pub const USERS_PATH: &str = "/USERS.DAT";
 pub const USERS_TMP_PATH: &str = "/USERS.NEW";
 /// The image bound: header + a full table.
 pub const USERS_IMAGE_MAX: usize = USERS_HDR_LEN + USERS_ROW_LEN * MAX_USERS;
-/// Where a home lands: `/home/<name>` — `HOME/<NAME>` on the EL0 FAT volume, created at the first login
-/// ([`ensure_home`], M2).
+/// Where a home lands: `/home/<name>` (`home_of`) — a UnaFS directory through the mount table on a native root
+/// (`ensure_home_native`), else `HOME/<NAME>` on `store_mount`'s FAT volume; made at the first login ([`ensure_home`], M2).
 pub const HOME_ROOT: &str = "/home";
 
 // =========================================================================================
@@ -897,10 +897,10 @@ pub fn login(name: &[u8], password: &[u8]) -> Result<(), UsersError> {
     Ok(())
 }
 
-/// M2: make `/home/<name>` exist on the EL0 FAT volume — `HOME/` at the root, `<NAME>` inside it —
-/// idempotent. Returns `"created"` or `"exists"`. FAT carries no owner attribute: the DIRECTORY has no
-/// ACL row (LEDGER SO35); the FILES a program creates inside it are owned through the SYS_OPEN
-/// owner/grants rows exactly as any private create, and that is what the home ACL proof exercises.
+/// M2: make `/home/<name>` exist — on a native root through `ensure_home_native` (cfg `unafs`), else on `store_mount`'s
+/// FAT volume, `HOME/` at the root and `<NAME>` inside it — idempotent. Returns `"created"` or `"exists"`. FAT carries
+/// no owner attribute: a FAT home DIRECTORY has no ACL row (LEDGER SO35); the FILES a program creates inside it are
+/// owned through the SYS_OPEN owner/grants rows exactly as any private create, and that is what the home ACL proof exercises.
 pub fn ensure_home(name: &[u8]) -> Result<&'static str, UsersError> {
     #[cfg(feature = "unafs")] if let Some(v) = ensure_home_native(name) { return v; } // UNAFSX86 (B298): a UnaFS `/` owns /home; the FAT body below is the fallback
     let fs = store_mount().map_err(|_| UsersError::Volume)?;

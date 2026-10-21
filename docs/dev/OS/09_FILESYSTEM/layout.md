@@ -514,15 +514,19 @@ Stays in the **volume root**, in three groups:
 2. **Data the fixtures read or write** — `SCRATCH.BIN` (U9), `GROW.BIN` (U10), `S8W.BIN`,
    `BLOCK.TXT`, `hello.txt`, `readme.txt`, `SRC.TGZ`/`SRC.SHA`, and everything EL0 creates at run
    time (`K2PRIV.BIN`, `SLTF/SLTG.BIN`, `MIDCPY.TXT`, `A11.BIN`, …).
-3. **THE FLAT EL0 FIXTURE BLOBS** — `HELLO.BIN`, `K2OWN.BIN`, `K2IMP.BIN`, `MIDDEN.BIN`. This
-   group is the interesting one and it is measured, not assumed. These are spawned by the kernel
-   *and* opened **by EL0, by name**, through `sys_open` — whose namespace is a **flat 8.3 volume
-   root with no directory component at all** (`MAX_NAME`, `find_located`;
-   `arch/aarch64/syscall.rs:9016`). Staged under `APPS/`, the kernel loaded them fine and every
-   EL0 `SYS_OPEN("HELLO.BIN")` answered `-ENOENT`: `kernel8-test` reported
-   `:: U6b: real File handles FAIL — witness=0x18 … (want 0x1f) ::` and the whole U7 chain behind
-   it (K1/K2/K3/K4/K8/K9/IMG-SIG/FATDIRS/FATMOVE/BANDY, 84 required witnesses) fell over.
-   Moving them is a **syscall-ABI change, not a layout change**. See §5.2.
+3. **THE FLAT EL0 FIXTURE BLOBS** — `HELLO.BIN`, `K2OWN.BIN`, `K2IMP.BIN`, `MIDDEN.BIN`. These are
+   spawned by the kernel *and* opened **by EL0, by name**, through `sys_open`. When they were staged
+   under `APPS/` (pre-DIRNS) that namespace was a flat 8.3 volume root with no directory component, so
+   the kernel loaded them fine and every EL0 `SYS_OPEN("HELLO.BIN")` answered `-ENOENT`: `kernel8-test`
+   reported `:: U6b: real File handles FAIL — witness=0x18 … (want 0x1f) ::` and the whole U7 chain
+   behind it (K1/K2/K3/K4/K8/K9/IMG-SIG/FATDIRS/FATMOVE/BANDY, 84 required witnesses) fell over. What
+   `sys_open` takes now is `docs/dev/blueprint/ring3.md` §7 (PATHNS, read at 43d1dca8): aarch64 walks a
+   `/`-separated path of at most 40 bytes on the EL0 FAT volume (`fs::fat::mount()`) through
+   `fs::vfs::el0_locate`, a relative name starting at the session's home, `..` refused; x86 opens a root
+   leaf (the staged set and the U10 created names) and walks a path only under the `irqstorage` feature,
+   which `unaos/scripts/image-line.env` does not arm. On x86, then, moving them is still a syscall-ABI
+   change, not a layout change; whether the aarch64 fixtures would find them under `APPS/` now:
+   unverified. See §5.2.
 
 ### 2.2 How a program is reached
 
@@ -585,17 +589,22 @@ that is not a change to make under a boot deadline. The defaulted accessors abov
 
 ### 2.4 `/home` — from the day a user exists (LOGIN M2)
 
-RULINGS R51 ("login, get a home folder and all"). `HOME/` at the root of the EL0 FAT volume — the
-volume `SYS_OPEN` names files on, so a user's programs can reach their files — and `HOME/<NAME>` inside
-it, created by `fs::users::ensure_home` at that user's first login (`[users] home=/home/<name> created
-volume=el0-fat`) and idempotent after (`exists`). Nothing is created for a user who has never logged
-in, and `HOME/` itself appears with the first one. User names are 8.3 leaves (1-8 bytes, `[a-z0-9_-]`,
-first a letter) because the directory is. FAT carries no owner attribute: the DIRECTORY has no ACL row
-(LEDGER SO35); the FILES a program creates inside it are owned by `user:<name>` through the SYS_OPEN
-owner/grants rows like any private create, and the knob-on aarch64 `sys_open` walks a `/`-separated
-path (`HOME/UNA/NOTES.TXT`) to reach them — the first step on SO20 (x86 still opens its static root
-table). On a Pi whose `/` is native UnaFS the home still lives on the FAT boot volume for the same
-reason (EL0 opens FAT); the native, owner-attributed home moves with the native-EL0 namespace.
+RULINGS R51 ("login, get a home folder and all"). A user's home is `/home/<name>` (the row's string,
+`fs::users::home_of`), made by `fs::users::ensure_home` at that user's first login (`login` calls it) and
+idempotent after (`exists`). Where it lands (`fs/users.rs` `ensure_home`, `ensure_home_native`): with the
+`unafs` feature and a mount table whose `/` is the `native` volume, `/home` and `/home/<name>` are UnaFS
+directories made through `MountTable::create`, the leaf owned by its user (HOMEPRIV B528; `[users]
+home=/home/<name> created volume=unafs`); otherwise `HOME/` at the root of the users store's FAT volume
+(`store_mount`: the global block slot, else the SDHC card, else the first AHCI entry) and `HOME/<NAME>`
+inside it (`[users] home=/home/<name> created volume=<FAT volume serial>`). Nothing is created for a user
+who has never logged in. User names are 1-8 bytes, `[a-z0-9_-]`, first a letter (`name_ok`, `NAME_MAX`),
+the bound an 8.3 leaf on a FAT home sets. FAT carries no owner attribute: a FAT home DIRECTORY has no ACL
+row (LEDGER SO35); the FILES a program creates inside it are owned by `user:<name>` through the SYS_OPEN
+owner/grants rows like any private create. What EL0 reaches by name is `docs/dev/blueprint/ring3.md` §7:
+aarch64 `sys_open` walks a relative path from the session's home on the EL0 FAT volume (DIRNS, LEDGER
+SO20); x86 `sys_open` opens a root leaf (a path only under `irqstorage`); `SYS_STAT`, `SYS_ATTR_*`,
+`SYS_PATH_READ/WRITE` and `SYS_SPAWN_PATH` take an absolute path through the mount table. Which aarch64
+image lines arm `unafs` (and so a native home on a Pi): unverified.
 
 ## 3. Nothing empty was created
 
@@ -704,8 +713,8 @@ collapses `/X` to `X` and opens a staged or created root leaf; it walks a path o
 `irqstorage` feature (`sys_open_dynamic`), which `unaos/scripts/image-line.env` does not arm, so on the
 image a multi-component name answers `-ENOENT`. `SYS_RENAME` stays a root leaf on both arches.
 `SYS_ATTR_*`, `SYS_STAT`, `SYS_PATH_READ/WRITE` (aarch64 only under `selfdiag`) and `SYS_SPAWN_PATH`
-take an absolute path in the VFS mount table. §2.1 group 3 and §2.4 above predate DIRNS (owed, storage
-sheet §5); the loader's `find_app`-then-`find_in_root` order is unchanged.
+take an absolute path in the VFS mount table. §2.1 group 3 and §2.4 above read the same (LAYOUTROOT,
+LEDGER SR174); the loader's `find_app`-then-`find_in_root` order is unchanged.
 
 ---
 
