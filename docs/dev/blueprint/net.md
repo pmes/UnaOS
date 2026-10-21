@@ -37,7 +37,7 @@
 - NETCORE (the hand-rolled stack as the default): gated on R111's condition.
 - Wi-Fi association, WPA, a usable link: beyond the WIFI10 rung (`unaos/crates/kernel/src/wifi/mod.rs` ladder). WIFI11's TX power control folded (`8997dbde`); flight result `unverified` here.
 - The first DHCP lease on the rMBP is recorded in commit `d08a5d06`'s message (flight 35); no `ST<n>` row was read for it.
-- Bluetooth beyond HID: A2DP source (B739) rows BP-net-14 and audio.md BP-audio-13; the rest of `drivers/ehci/bt*.rs` (the legacy LE chain, BTDIR) not read for this sheet. an SDP server, and more than one A2DP device are unbuilt.
+- Bluetooth beyond HID: A2DP source (B739) rows BP-net-14 and audio.md BP-audio-13; the rest of `drivers/ehci/bt*.rs` (the legacy LE chain, BTDIR) not read for this sheet. An SDP server and more than one A2DP device are unbuilt.
 
 ## 6. Read further
 - `unaos/docs/dev/OS/08_NET/networking.md` (the live stack's doc of record).

@@ -2331,7 +2331,7 @@ unsafe fn step(bt: &mut Bt, c: &mut Controller, radio: &BtRadio, e: &BtEvtEp) {
         let total = pdu.len() + 4;
         if total > 256 || pdu.len() > bt.acl_len as usize {
             serial_println!(":: BTHID: ACL PDU of {} bytes exceeds one packet (limit {}) — not sent ::", pdu.len(), (bt.acl_len as usize).min(252));
-            continue;
+            #[cfg(feature = "a2dp")] drop_orphan_frags(&mut bt.acltx); continue; // crawl D 6: the dropped PDU's queued continuations go with it (LINE-NEUTRAL fold, code first)
         }
         #[cfg(not(feature = "a2dp"))] let hdr = (h & 0x0FFF) | (0b10 << 12); #[cfg(feature = "a2dp")] let hdr = l2cap::acl_hdr(h); // A2DPKNOB (B750): a queued continuation fragment carries PB=0b01 (LINE-NEUTRAL fold, code first)
         let head = [hdr as u8, (hdr >> 8) as u8, pdu.len() as u8, (pdu.len() >> 8) as u8];
@@ -2347,7 +2347,7 @@ unsafe fn step(bt: &mut Bt, c: &mut Controller, radio: &BtRadio, e: &BtEvtEp) {
                 }
             }
             Err(why) => {
-                serial_println!(":: BTHID: ACL OUT{} failed ({}) — PDU lost ::", bulk_out, why);
+                serial_println!(":: BTHID: ACL OUT{} failed ({}) — PDU lost ::", bulk_out, why); #[cfg(feature = "a2dp")] drop_orphan_frags(&mut bt.acltx); // crawl D 6: the lost PDU's queued continuations go with it (LINE-NEUTRAL fold, code first)
             }
         }
         sent += 1;
@@ -2865,3 +2865,15 @@ pub mod l2cap;
 pub mod sdp;
 #[cfg(feature = "a2dp")] #[path = "../bt/avdtp.rs"]
 pub mod avdtp;
+
+/// A2DP fragmentation (crawl D 6, `l2cap::l2_send_frag`'s other half): the head of the ACL queue was dropped or lost, so
+/// every queued entry right after it that CONTINUES that PDU (`l2cap::CONT` in its handle word) is dropped too — sent
+/// alone, the peer would join them onto the wrong PDU. One line when any went.
+#[cfg(feature = "a2dp")]
+fn drop_orphan_frags(q: &mut Vec<(u16, Vec<u8>)>) {
+    let n = q.iter().take_while(|(h, _)| h & l2cap::CONT != 0).count();
+    if n > 0 {
+        q.drain(..n);
+        serial_println!(":: BTHID: {} continuation fragment(s) of the lost PDU dropped ::", n);
+    }
+}
