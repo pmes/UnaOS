@@ -900,7 +900,7 @@ fn net5_fixture() {
 // ══════════════════════════════════════════════════════════════════════════════════════════════════
 
 #[cfg(feature = "tegra")]
-pub use metal::net4_bringup;
+pub use metal::{census, net4_bringup}; // ORINPCIEROWS (LEDGER SR170): `census` is the hardware census's reader (metal tail). LINE-NEUTRAL, code before the comment.
 
 #[cfg(feature = "tegra")]
 mod metal {
@@ -5766,4 +5766,17 @@ mod metal {
     #[cfg(not(feature = "net6"))]
     #[inline(always)]
     fn net6_start() {}
+
+    /// ORINPCIEROWS (LEDGER SR170, BP-bar-25): the RTL8168 as `hw::census` lists it, read under ONE `try_lock` of the
+    /// registry (never a spin: the socket path short-holds it). `None` = held this instant (the census retries,
+    /// bounded, or marks itself busy); `Some(None)` = no NIC registered; `Some(Some(link))` = PHYstatus.LinkSts.
+    pub fn census() -> Option<Option<bool>> {
+        NET4_DEVICE.try_lock().map(|g| g.as_ref().map(|n| n.link_up()))
+    }
+}
+
+/// ORINPCIEROWS (LEDGER SR170): the no-Tegra-RC twin (QEMU virt) — no NIC is ever registered here.
+#[cfg(not(feature = "tegra"))]
+pub fn census() -> Option<Option<bool>> {
+    Some(None)
 }

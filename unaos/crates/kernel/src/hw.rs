@@ -142,7 +142,7 @@ fn retry<T>(wait: bool, mut f: impl FnMut() -> Option<T>) -> Option<T> {
 // ── PCI ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /// The class in words (PCI Code and ID Assignment, the classes this kernel meets).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", feature = "pcie2"))] // ORINPCIEROWS (LEDGER SR170): the aarch64 PCIe rows name their class here too. LINE-NEUTRAL, code before the comment.
 fn pci_class_name(class: u8, sub: u8, progif: u8) -> &'static str {
     match (class, sub) {
         (0x01, 0x06) => "SATA controller",
@@ -390,8 +390,8 @@ fn other_rows(_c: &mut Census) {}
 // the xHCI host the shared controller slot holds (`xhci::claim` not `NotReady` — the Orin's XUSB, the Pi's VL805, a
 // virt ECAM xHCI; its devices come from `usb_rows`' slot walk, usbnet included), the Pi's GENET (`genet::netinfo`),
 // the panel (`video::WRITER`'s geometry, one masked `try_lock`), and the SD card the block layer was given (the Orin's
-// `sdmmc_tegra::tegra_sd_card_blocks`, the Pi's `emmc2::card_num_blocks`). OWED (outside this arc's files): the
-// Tegra PCIe functions (pcie_probe.rs keeps no table) and the RTL8168 (`NET4_DEVICE` is private to its `mod metal`).
+// `sdmmc_tegra::tegra_sd_card_blocks`, the Pi's `emmc2::card_num_blocks`). The Tegra PCIe functions and the RTL8168
+// are ORINPCIEROWS's (LEDGER SR170): `pcie_probe::functions` and `rtl8168_tegra::census`, read by `arm_pcie_rows` below.
 
 /// Is a controller installed in the shared xHCI slot (`Busy` = installed and on loan)?
 #[cfg(not(target_arch = "x86_64"))]
@@ -401,7 +401,7 @@ fn arm_xhci_installed() -> bool {
 
 /// The aarch64 host controller, NIC and panel rows. PCI rows count in `reg.pci`; platform and panel rows in `reg.other`.
 #[cfg(not(target_arch = "x86_64"))]
-fn arm_rows(c: &mut Census, wait: bool) {
+fn arm_rows(c: &mut Census, wait: bool) { #[cfg(feature = "pcie2")] arm_pcie_rows(c, wait); // ORINPCIEROWS (LEDGER SR170): the recorded PCIe functions (file tail). LINE-NEUTRAL, code before the comment.
     if arm_xhci_installed() {
         #[cfg(feature = "tegra")]
         {
@@ -453,5 +453,42 @@ fn arm_block_rows(c: &mut Census) {
     if let Some(n) = crate::drivers::emmc2::card_num_blocks() {
         c.reg.block += 1;
         push(c, "sd", String::from("card"), String::from("emmc2"), alloc::format!("SD card ({})", size_words(n.saturating_mul(512))), "emmc2", "up");
+    }
+}
+
+// ── ORINPCIEROWS (LEDGER SR170, BP-bar-25) — the Tegra PCIe rows — TAIL-APPENDED, so no line above moves ─────────────
+// One `pci` row per function the PCIe recon recorded where it already read config space (`pcie_probe::functions`;
+// hw.rs walks nothing): the root port is the PCI layer's own (`pci up`), the RTL8168 is claimed from its driver's
+// registry (`rtl8168_tegra::census`: `up` with link, `held` without; a held registry = this census is busy, as the USB
+// loan), any other function says `refused:no-driver`. Counted in `reg.pci`.
+
+/// The aarch64 PCIe function rows (the root port, the NIC below it).
+#[cfg(all(not(target_arch = "x86_64"), feature = "pcie2"))]
+#[allow(unused_variables)]
+fn arm_pcie_rows(c: &mut Census, wait: bool) {
+    let fns = crate::arch::aarch64::pcie_probe::functions();
+    c.reg.pci += fns.len();
+    for f in &fns {
+        let (mut driver, mut state) = (NONE, NO_DRIVER);
+        match (f.class, f.vid, f.did) {
+            (0x06, _, _) => (driver, state) = ("pci", "up"),
+            #[cfg(feature = "net4")]
+            (_, 0x10EC, 0x8168) => match retry(wait, crate::arch::aarch64::rtl8168_tegra::census) {
+                Some(Some(link)) => (driver, state) = ("rtl8168", if link { "up" } else { "held" }),
+                Some(None) => {}
+                None => {
+                    c.busy = true;
+                    (driver, state) = ("rtl8168", "held");
+                }
+            },
+            _ => {}
+        }
+        push(
+            c, "pci",
+            alloc::format!("{:04x}:{:04x}", f.vid, f.did),
+            alloc::format!("{}:{}.{}", f.bus, f.dev, f.func),
+            String::from(pci_class_name(f.class, f.sub, f.progif)),
+            driver, state,
+        );
     }
 }

@@ -997,7 +997,7 @@ fn net2_link_and_device(
         return;
     };
     serial_println!("{}   RP LIVE: vendor={:#06x} device={:#06x} ::", P2, vendor, device);
-    let cr = unsafe { core::ptr::read_volatile((dbi_base + 0x08) as *const u32) };
+    let cr = unsafe { core::ptr::read_volatile((dbi_base + 0x08) as *const u32) }; record(0, 0, 0, 0, vendor, device, cr); // ORINPCIEROWS (LEDGER SR170): the root port into the function table (file tail), from the dword just read. LINE-NEUTRAL, code before the comment.
     if !is_poison(cr) {
         serial_println!(
             "{}   RP class={:#04x} subclass={:#04x} progif={:#04x} rev={:#04x} ::",
@@ -1125,7 +1125,7 @@ fn net2_link_and_device(
         "{}   DEVICE FOUND below RP: vendor={:#06x} device={:#06x} ::",
         P2, dvendor, ddevice
     );
-    let dcr = unsafe { core::ptr::read_volatile((cfg_base + 0x08) as *const u32) };
+    let dcr = unsafe { core::ptr::read_volatile((cfg_base + 0x08) as *const u32) }; record(0, 1, 0, 0, dvendor, ddevice, dcr); // ORINPCIEROWS (LEDGER SR170): the downstream function into the table (file tail). LINE-NEUTRAL, code before the comment.
     if !is_poison(dcr) {
         serial_println!(
             "{}   device class={:#04x} subclass={:#04x} progif={:#04x} rev={:#04x} ::",
@@ -1305,7 +1305,7 @@ fn net3_enumerate_and_size(ecam_base: Option<u64>, cfg_base: Option<u64>) {
         return;
     };
     serial_println!("{}   DEVICE FOUND: vendor={:#06x} device={:#06x} ::", P3, vendor, device);
-    let cr = unsafe { core::ptr::read_volatile((dev + 0x08) as *const u32) };
+    let cr = unsafe { core::ptr::read_volatile((dev + 0x08) as *const u32) }; record(0, 1, 0, 0, vendor, device, cr); // ORINPCIEROWS (LEDGER SR170): the downstream function into the table (file tail). LINE-NEUTRAL, code before the comment.
     if !is_poison(cr) {
         serial_println!(
             "{}   class={:#04x} subclass={:#04x} progif={:#04x} rev={:#04x} ::",
@@ -1391,4 +1391,47 @@ fn net3_enumerate_and_size(ecam_base: Option<u64>, cfg_base: Option<u64>) {
         "{}   M3 DONE — device identified + BARs sized (originals restored); no decode-enable / no driver bind (NIC driver arc is next). ::",
         P3
     );
+}
+
+// ── ORINPCIEROWS (LEDGER SR170, BP-bar-25) — the recorded function table — TAIL-APPENDED, so no line above moves ──────
+// The PCIe functions NET-2 and NET-3 already read (the root port's DBI identity and class dwords; the downstream
+// function's through the ECAM, or the iATU config window on a pcie2-only build). `record` is called on the line that
+// read the class dword, so the table costs no config read of its own; [`functions`] reads it back for `hw::census`
+// (the x86 `arch::pci::functions` shape). Nothing re-reads config space.
+
+/// One PCIe function the recon read: its controller, `bus:dev.func`, ids and class.
+#[cfg(feature = "pcie2")]
+#[derive(Clone, Copy)]
+pub struct PcieFn {
+    pub ctrl: u8,
+    pub bus: u8,
+    pub dev: u8,
+    pub func: u8,
+    pub vid: u16,
+    pub did: u16,
+    pub class: u8,
+    pub sub: u8,
+    pub progif: u8,
+}
+
+/// Written once per function by `census2` on the boot core; read by [`functions`].
+#[cfg(feature = "pcie2")]
+static FUNCS: crate::sync::Mutex<alloc::vec::Vec<PcieFn>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
+
+/// The functions the recon recorded, in read order (empty before `census2`, and on a build with no Tegra RC).
+#[cfg(feature = "pcie2")]
+pub fn functions() -> alloc::vec::Vec<PcieFn> {
+    FUNCS.lock().clone()
+}
+
+/// Record one function from the class/revision dword `cr` its caller already read; a function already in the
+/// table (same controller and `bus:dev.func`) is replaced, never listed twice.
+#[cfg(all(feature = "pcie2", feature = "tegra"))]
+fn record(ctrl: u8, bus: u8, dev: u8, func: u8, vid: u16, did: u16, cr: u32) {
+    let f = PcieFn { ctrl, bus, dev, func, vid, did, class: (cr >> 24) as u8, sub: (cr >> 16) as u8, progif: (cr >> 8) as u8 };
+    let mut t = FUNCS.lock();
+    match t.iter_mut().find(|e| (e.ctrl, e.bus, e.dev, e.func) == (ctrl, bus, dev, func)) {
+        Some(e) => *e = f,
+        None => t.push(f),
+    }
 }
