@@ -135,7 +135,7 @@ struct Target {
     mps0: u16,
     eps: u32, // one of QH_EPS_FULL/LOW/HIGH
     hub_addr: u8,
-    hub_port: u8,
+    hub_port: u8, #[cfg(any(all(feature = "lidsleep", feature = "wc"), feature = "bt"))] parent: (u8, u8), // EHCIHUBCHAIN (B794): the device's ACTUAL parent (hub address, its downstream port), (0, 0) at the root — the ONE record of it (`bt_parent` retired into it); the parent gate PARENT = `any(all(lidsleep, wc), bt)` on this field, `enumerate_at_zero`'s parameter and its two call arguments, so a knob-off build carries none of it. LINE-NEUTRAL fold, code first
 }
 
 /// One armed HID interrupt-IN endpoint: its periodic QH, single re-armed qTD and report buffer.
@@ -761,15 +761,15 @@ pub struct Controller {
     /// MT-INVESTIGATION: reports hex-dumped so far in the raw capture window.
     #[cfg(feature = "mtraw")]
     mt_dumped: u32,
-    /// BT-L0 — the ACTUAL parent (hub address, downstream port) of the device currently being
-    /// enumerated, as opposed to the split-transaction TT it is reached through. They are the
-    /// same thing only below a high-speed hub, which is precisely the assumption the recon's
-    /// §3 note 1 caught the M1 witness making. Carried on the controller rather than added to
-    /// `enumerate_at_zero`'s signature so the knob-off build is untouched: the field, its one
-    /// writer in `bring_up_hub` and its one reader in the M1 witness all vanish with the knob.
-    /// `(0, 0)` at depth 0, where the root witness prints no parent at all.
-    #[cfg(feature = "bt")]
-    bt_parent: (u8, u8),
+    // BT-L0 — the ACTUAL parent (hub address, downstream port) of the device being enumerated,
+    // as opposed to the split-transaction TT it is reached through, was carried here as
+    // `bt_parent` (stamped by `bring_up_hub`, read by the M1 and reachability witnesses).
+    // EHCIHUBCHAIN (B794) retired it into `Target::parent`, passed by `enumerate_at_zero`'s
+    // recursion: one record of the parent, which the sleep state's hub-chain arming reads too.
+    //
+    //
+    //
+    //
     /// MTFIX — has this controller's single `bt_slot` already been handed to a radio? The slot's
     /// QH stays linked in the periodic chain for the life of the boot, so it can be armed exactly
     /// once; see `bt_arm_events`.
@@ -778,7 +778,7 @@ pub struct Controller {
     /// BT-L4 — the claimed radio's ACL data pair: `(bulk_in, bulk_out, in_mps, out_mps)`, endpoint
     /// numbers only (no direction bit), `(0, 0, 0, 0)` until a radio is claimed.
     ///
-    /// Carried on the controller for the same reason `bt_parent` is: the ACL exchange runs deep
+    /// Carried on the controller for the reason BT-L0's parent was (now `Target::parent`): the ACL exchange runs deep
     /// inside `bt_l3_connect`, four call frames below the descriptor walk that learned these
     /// numbers, and threading four more parameters through `bt_le_scan` -> `bt_l3_connect` would
     /// change three signatures to move a fact that never varies within a radio. Written exactly
@@ -4101,13 +4101,13 @@ impl Controller {
     /// Enumerate the device currently answering address 0 (one at a time, strictly). `depth`
     /// bounds the hub recursion at the RMH tier (root=0; children of the RMH=1; deeper hubs are
     /// out of this arc's scope and traced as skipped).
-    unsafe fn enumerate_at_zero(&mut self, eps: u32, hub_addr: u8, hub_port: u8, depth: u8) {
+    unsafe fn enumerate_at_zero(&mut self, eps: u32, hub_addr: u8, hub_port: u8, depth: u8, #[cfg(any(all(feature = "lidsleep", feature = "wc"), feature = "bt"))] parent: (u8, u8)) { // EHCIHUBCHAIN (B794): `parent` (PARENT gate, see `Target::parent`)
         let mut t = Target {
             addr: 0,
             mps0: if eps == QH_EPS_HIGH { 64 } else { 8 },
             eps,
             hub_addr,
-            hub_port,
+            hub_port, #[cfg(any(all(feature = "lidsleep", feature = "wc"), feature = "bt"))] parent,
         };
 
         // 8-byte device-descriptor header first: learns the real bMaxPacketSize0 before any
@@ -4245,7 +4245,7 @@ impl Controller {
             // which are the split-transaction TT fields and are DELIBERATELY ZERO for a
             // high-speed child — so `addr=4 0424:2512 ... (hub 0 port 0)` has always read as
             // "on hub 0" when that device is on hub 1. Under `bt` the line names the actual
-            // PARENT (tracked in `bt_parent`, stamped by `bring_up_hub` immediately before the
+            // PARENT (`t.parent`, passed by `bring_up_hub` as the argument of the
             // recursion) and labels the TT separately, which is also what makes the recon's P3
             // (TT must be the SMSC hub 4, never the FS Broadcom hub 5) readable straight off
             // this line for every device, not just the Bluetooth one.
@@ -4258,7 +4258,7 @@ impl Controller {
             crate::bootlog_println!(
                 ":: EHCI-HID: [{}] M1 hub-downstream device addr={} {:04x}:{:04x} class={:#04x} speed={} depth={} (parent hub {} port {}) tt=(hub {} port {}) == witness ::",
                 self.idx, addr, vid, pid, class, speed, depth,
-                self.bt_parent.0, self.bt_parent.1, hub_addr, hub_port
+                t.parent.0, t.parent.1, hub_addr, hub_port
             );
         }
 
@@ -4497,19 +4497,19 @@ impl Controller {
             } else {
                 (hub.hub_addr, hub.hub_port) // FS/LS hub — no TT here; carry the ancestor's down
             };
-            // BT-L0 instrument fix (recon §3 note 1): stamp the ACTUAL parent for the M1 witness,
-            // which until now printed the TT fields under a topology label. Set immediately
-            // before the recursion so it is never stale.
-            #[cfg(feature = "bt")]
-            {
-                self.bt_parent = (hub.addr, port as u8);
-            }
+            // BT-L0 instrument fix (recon §3 note 1): the ACTUAL parent for the M1 witness, which
+            // until then printed the TT fields under a topology label. EHCIHUBCHAIN (B794): the
+            // parent is no longer stamped on the controller (`bt_parent`, retired) — it is the
+            // recursion's last argument below, `(hub.addr, port)`, stored as `Target::parent`, so
+            // it can never be stale and the sleep state's hub-chain walk reads the same record.
+            //
+            //
             // T_RSTRCY (USB 2.0 §7.1.7.5): the 10 ms of reset recovery owed before the device is
             // addressed. Correctly placed — the only traffic between the reset completing and
             // here is hub-addressed ClearPortFeature. EPACE-TRIM M5 shortened the pre-poll sleep
             // above; this interval is what keeps the recovery paid, and it predates M5.
             settle_ms(10);
-            self.enumerate_at_zero(child_eps, ha, hp, depth + 1);
+            self.enumerate_at_zero(child_eps, ha, hp, depth + 1, #[cfg(any(all(feature = "lidsleep", feature = "wc"), feature = "bt"))] (hub.addr, port as u8));
         }
     }
 
@@ -5455,10 +5455,10 @@ impl Controller {
             ":: bt-l0: [{}] reachability addr={} spd={} intf={} class={:#04x}/{:#04x}/{:#04x} evt_ep=IN{} mps={} interval={} bulk_in=IN{}/{} bulk_out=OUT{}/{} parent=(hub {} port {}) tt=(hub {} port {}) -> {} == witness ::",
             self.idx, t.addr, spd, intf, sel.cls, sel.sub, sel.pro, evt_ep, evt_mps, evt_interval,
             bulk_in, sel.bulk_in_mps, bulk_out, sel.bulk_out_mps,
-            self.bt_parent.0, self.bt_parent.1, t.hub_addr, t.hub_port,
+            t.parent.0, t.parent.1, t.hub_addr, t.hub_port,
             if t.eps == QH_EPS_HIGH {
                 "TT-NONE(high-speed device)"
-            } else if t.hub_addr == self.bt_parent.0 {
+            } else if t.hub_addr == t.parent.0 {
                 "TT-IS-PARENT(parent hub is high speed)"
             } else {
                 "TT-INHERITED(parent hub is not high speed; TT is the nearest HS ancestor)"
@@ -18582,10 +18582,10 @@ pub fn init() {
                         mt_probe: None,
                         #[cfg(feature = "mtraw")]
                         mt_dumped: 0,
-                        // BT-L0: no parent until `bring_up_hub` stamps one; the depth-0 M1
-                        // witness never reads it.
-                        #[cfg(feature = "bt")]
-                        bt_parent: (0, 0),
+                        // BT-L0's parent stamp `bt_parent` is retired: the parent is
+                        // `Target::parent` (EHCIHUBCHAIN, B794), passed by the recursion.
+                        //
+                        //
                         // MTFIX: the dedicated HCI-event slot is free until a radio claims it.
                         #[cfg(feature = "bt")]
                         bt_evt_armed: false,
@@ -18852,7 +18852,7 @@ pub fn init() {
                     // re-init; the s58 split priced that pair at ~2.6 s.
                     if !c.overlay_mode {
                         let probe_t = Target {
-                            addr: 0, mps0: 64, eps: QH_EPS_HIGH, hub_addr: 0, hub_port: 0,
+                            addr: 0, mps0: 64, eps: QH_EPS_HIGH, hub_addr: 0, hub_port: 0, #[cfg(any(all(feature = "lidsleep", feature = "wc"), feature = "bt"))] parent: (0, 0),
                         };
                         let hseprobe_t0 = crate::arch::now_cycles();
                         let probe_res = c.control(&probe_t, 0x80, 6, 0x0100, 0, 8, true);
@@ -18897,7 +18897,7 @@ pub fn init() {
                     }
                     let _ = (&cg_cleared, rcba); // probe-13 levers retired (smokes all passed)
                     let enum_t0 = crate::arch::now_cycles();
-                    c.enumerate_at_zero(QH_EPS_HIGH, 0, 0, 0);
+                    c.enumerate_at_zero(QH_EPS_HIGH, 0, 0, 0, #[cfg(any(all(feature = "lidsleep", feature = "wc"), feature = "bt"))] (0, 0));
                     c.pace.add(EP_ENUM, enum_t0);
                 }
             }
@@ -20010,12 +20010,17 @@ pub mod suspend {
     //! wake, and the whole controller resumes.
     //!
     //! EHCIWAKE (B776): before SUSP each live HID device (its `IntEp::target`, which every endpoint carries) and
-    //! every hub this controller brought up ([`note_hub`]) gets SET_FEATURE(DEVICE_REMOTE_WAKEUP) when its
+    //! every hub on a live keyboard's parent chain (EHCIHUBCHAIN B794: [`hub_chain`] walks `Target::parent` up the
+    //! hubs [`note_hub`] recorded to the root) gets SET_FEATURE(DEVICE_REMOTE_WAKEUP) when its
     //! configuration declares it (USB 2.0 §9.4.9; a hub forwards a downstream resume only when armed, §11.4.4) —
     //! while the periodic schedule still runs, because EP0 rides the periodic engine on this silicon (`control_txn`,
     //! PROBE-8). Then USBCMD.PSE off with the STS.PSS handshake (§4.6, `set_periodic_schedule`), then SUSP; PSE back
-    //! on when the recovery ends. A controller keeps its ports up only when a live keyboard or a recorded hub could not
-    //! be armed (`why=wake-unarmed`): that keyboard stays the `input` waker it was.
+    //! on when the recovery ends. A controller keeps its ports up only when a live keyboard or a hub on its chain could not
+    //! be armed (`why=wake-unarmed addr=<a>`, naming it): that keyboard stays the `input` waker it was.
+    //!
+    //! EHCIHUBCHAIN (B794), the forget: this driver has no hub-disconnect handler (no hot-plug rescan, `next_addr`
+    //! never handed back, a hub carries no `IntEp`); a dead interrupt endpoint is the only "gone" signal it has. So a
+    //! recorded hub that no live endpoint's chain reaches is forgotten at the arming pass ([`forget_hubs`]).
     use super::qh::QTD_HALTED;
     use super::{
         mmio_read32, mmio_write32, read_config_32, Controller, Target, EHCI_HID, OP_PORTSC0, OP_USBSTS, PORT_CCS,
@@ -20085,13 +20090,42 @@ pub mod suspend {
     pub fn suspended() -> bool { all_in(SUSPENDED) }
     pub fn up() -> bool { all_in(UP) }
 
-    /// EHCIWAKE: `bring_up_hub`'s fold — remember a configured hub's EP0 target (once per address).
+    /// EHCIWAKE: `bring_up_hub`'s fold — remember a configured hub's EP0 target (once per address). EHCIHUBCHAIN
+    /// (B794): the target carries `parent`, so the record is (addr, parent) — what [`hub_chain`] walks.
     pub(super) fn note_hub(idx: usize, t: Target) {
         if idx >= CTRLS { return; }
         let mut g = HUBS.lock();
         let row = &mut g[idx];
         if row.iter().flatten().any(|h| h.addr == t.addr) { return; }
         if let Some(free) = row.iter_mut().find(|h| h.is_none()) { *free = Some(t); }
+    }
+
+    /// EHCIHUBCHAIN (B794): the hubs from a device's parent up to the root, nearest first, through the recorded
+    /// hubs' own `parent`. `Some(a)` = hub `a` on the way up is not recorded (the walk stops there). Bounded: a
+    /// controller records at most `HUBS_PER` hubs, so a longer walk is a broken record, not a chain.
+    fn hub_chain(hubs: &[Target], parent: u8) -> (Vec<u8>, Option<u8>) {
+        let (mut chain, mut at) = (Vec::new(), parent);
+        while at != 0 && chain.len() <= HUBS_PER {
+            let Some(h) = hubs.iter().find(|h| h.addr == at) else { return (chain, Some(at)) };
+            chain.push(at);
+            at = h.parent.0;
+        }
+        (chain, None)
+    }
+
+    /// EHCIHUBCHAIN (B794), A3: forget every recorded hub of controller `idx` that is not in `reached` (no live
+    /// endpoint's chain passes through it — its devices are gone, as far as this driver can know).
+    fn forget_hubs(idx: usize, reached: &[u8]) {
+        if idx >= CTRLS { return; }
+        let mut g = HUBS.lock();
+        for slot in g[idx].iter_mut() {
+            if let Some(h) = *slot {
+                if !reached.contains(&h.addr) {
+                    *slot = None;
+                    serial_println!("[usb] ehci={} addr={} kind=hub forgotten why=no-live-device", idx, h.addr);
+                }
+            }
+        }
     }
 
     /// `tests usbsuspend`: a keyboard report after the resume — HID GET_REPORT(Input) over EP0 (HID 1.11 §7.2.1) to the
@@ -20108,6 +20142,19 @@ pub mod suspend {
             return Some(Some((len, !halted)));
         }
         Some(None)
+    }
+
+    /// EHCIHUBCHAIN (B794): a keyboard's hub chain as the wire prints it, `<a1>,<a2>` nearest first (an unrecorded
+    /// hub where the walk stopped is the last term).
+    struct ChainList<'a>(&'a [u8], Option<u8>);
+    impl core::fmt::Display for ChainList<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            for (n, a) in self.0.iter().copied().chain(self.1).enumerate() {
+                if n > 0 { f.write_str(",")?; }
+                write!(f, "{}", a)?;
+            }
+            Ok(())
+        }
     }
 
     impl Controller {
@@ -20153,7 +20200,7 @@ pub mod suspend {
         }
 
         /// Arm remote wake, stop the periodic schedule, SUSP every enabled, EHCI-owned root port — unless a live
-        /// keyboard (or a hub above it) could not be armed, then keep them up (`why=wake-unarmed`).
+        /// keyboard (or a hub on its chain) could not be armed, then keep them up (`why=wake-unarmed addr=<a>`).
         fn ports_suspend(&mut self) {
             let i = self.idx;
             let n = self.port_count().unwrap_or(0);
@@ -20163,14 +20210,14 @@ pub mod suspend {
             }).collect();
             PORTS.fetch_add(enabled.len() as u32, Ordering::Relaxed);
             SUSP_MASK[i].store(0, Ordering::Relaxed);
-            let (armed, unarmed) = if enabled.is_empty() { (0, false) } else { self.arm_remote_wake() };
+            let (armed, unarmed) = if enabled.is_empty() { (0, None) } else { self.arm_remote_wake() };
             ARMED[i].store(armed, Ordering::Relaxed);
             WAKE_ARMED_N.fetch_add(armed, Ordering::Relaxed);
             if enabled.is_empty() { return; }
-            if unarmed {
+            if let Some(by) = unarmed {
                 for port in &enabled {
                     KEPT_N.fetch_add(1, Ordering::Relaxed);
-                    serial_println!("[usb] ehci={} port={} keep why=wake-unarmed", i, port + 1);
+                    serial_println!("[usb] ehci={} port={} keep why=wake-unarmed addr={}", i, port + 1, by);
                 }
                 serial_println!("[usb] ehci ctrl={} pse={} susp=0 wake_armed={}", i, self.pss(), armed);
                 return;
@@ -20192,9 +20239,11 @@ pub mod suspend {
         }
 
         /// EHCIWAKE: SET_FEATURE(DEVICE_REMOTE_WAKEUP) on each live HID device (one per address, from the target its
-        /// endpoints carry) and on each recorded hub. Returns (targets armed, a keyboard's wake path left unarmed).
-        /// Nothing is asked of a controller with no live interrupt endpoint (nothing on it is a waker).
-        fn arm_remote_wake(&mut self) -> (u32, bool) {
+        /// endpoints carry) and — EHCIHUBCHAIN (B794) — on each hub of each live keyboard's chain ([`hub_chain`]),
+        /// once, every hub on it and none off it. Returns (targets armed, the first keyboard or chain hub left
+        /// unarmed). Nothing is asked of a controller with no live interrupt endpoint (nothing on it is a waker).
+        /// First the A3 forget: a recorded hub no live endpoint's chain reaches leaves the record ([`forget_hubs`]).
+        fn arm_remote_wake(&mut self) -> (u32, Option<u8>) {
             let mut devs: Vec<(Target, bool)> = Vec::new();
             for e in self.int_eps.iter().filter(|e| !e.dead) {
                 match devs.iter_mut().find(|(t, _)| t.addr == e.target.addr) {
@@ -20202,23 +20251,43 @@ pub mod suspend {
                     None => devs.push((e.target, e.is_kbd)),
                 }
             }
-            if devs.is_empty() { return (0, false); }
-            let has_kbd = devs.iter().any(|d| d.1);
-            let hubs: Vec<Target> = if self.idx < CTRLS { HUBS.lock()[self.idx].iter().flatten().copied().collect() } else { Vec::new() };
-            let (mut armed, mut unarmed) = (0u32, false);
-            for (t, kbd, hub) in devs.iter().map(|&(t, k)| (t, k, false)).chain(hubs.iter().map(|&t| (t, false, true))) {
-                if self.remote_wake_one(&t, hub) {
+            let mut hubs: Vec<Target> = if self.idx < CTRLS { HUBS.lock()[self.idx].iter().flatten().copied().collect() } else { Vec::new() };
+            let reached: Vec<u8> = devs.iter().flat_map(|(t, _)| hub_chain(&hubs, t.parent.0).0).collect();
+            forget_hubs(self.idx, &reached);
+            hubs.retain(|h| reached.contains(&h.addr));
+            if devs.is_empty() { return (0, None); }
+            let (mut armed, mut unarmed) = (0u32, None);
+            for &(t, kbd) in &devs {
+                if self.remote_wake_one(&t, None) {
                     armed += 1;
-                } else if kbd || (hub && has_kbd) {
-                    unarmed = true;
+                } else if kbd {
+                    unarmed.get_or_insert(t.addr);
+                }
+            }
+            let mut done: Vec<u8> = Vec::new();
+            for &(t, _) in devs.iter().filter(|d| d.1) {
+                let (chain, missing) = hub_chain(&hubs, t.parent.0);
+                for &a in &chain {
+                    if done.contains(&a) { continue; }
+                    done.push(a);
+                    let Some(h) = hubs.iter().find(|h| h.addr == a).copied() else { continue };
+                    if self.remote_wake_one(&h, Some(&chain)) { armed += 1; } else { unarmed.get_or_insert(a); }
+                }
+                if let Some(a) = missing {
+                    if !done.contains(&a) {
+                        done.push(a);
+                        serial_println!("[usb] ehci={} addr={} kind=hub chain={} remote_wake=unrecorded", self.idx, a, ChainList(&chain, Some(a)));
+                    }
+                    unarmed.get_or_insert(a);
                 }
             }
             (armed, unarmed)
         }
 
         /// One target: its configuration header's bmAttributes (the read `configure_hid` makes), then the SET_FEATURE
-        /// when Remote Wakeup is declared. `[usb] ehci=<i> addr=<a> kind=dev|hub remote_wake=armed|undeclared|refused`.
-        fn remote_wake_one(&mut self, t: &Target, hub: bool) -> bool {
+        /// when Remote Wakeup is declared. `[usb] ehci=<i> addr=<a> kind=dev remote_wake=armed|undeclared|refused`, or
+        /// for a hub on a keyboard's chain `[usb] ehci=<i> addr=<a> kind=hub chain=<a1>,<a2> remote_wake=…`.
+        fn remote_wake_one(&mut self, t: &Target, chain: Option<&[u8]>) -> bool {
             let word = match unsafe { self.control(t, 0x80, 6, 0x0200, 0, 9, true) } {
                 Ok(n) if n >= 8 => {
                     if unsafe { *self.data_buf.add(7) } & CFG_ATT_REMOTE_WAKEUP == 0 {
@@ -20231,7 +20300,10 @@ pub mod suspend {
                 }
                 _ => "refused",
             };
-            serial_println!("[usb] ehci={} addr={} kind={} remote_wake={}", self.idx, t.addr, if hub { "hub" } else { "dev" }, word);
+            match chain {
+                None => serial_println!("[usb] ehci={} addr={} kind=dev remote_wake={}", self.idx, t.addr, word),
+                Some(c) => serial_println!("[usb] ehci={} addr={} kind=hub chain={} remote_wake={}", self.idx, t.addr, ChainList(c, None), word),
+            }
             word == "armed"
         }
 
