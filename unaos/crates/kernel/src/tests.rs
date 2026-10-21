@@ -6077,7 +6077,7 @@ fn settingsmap_ring_leg() {
 /// EHCIHUBDISC (rmbp-ledger B801, BP-input-21): `tests ehci` (R80: registered, never at boot) — the EHCI hub
 /// status-change leg. The pure halves (bitmap decode, a port's subtree) run on every image; the live census needs a hub
 /// on an EHCI bus, which QEMU cannot attach (its usb-hub is full speed, its EHCI ports high speed only), so QEMU reads
-/// `SKIP(no-hub)` and the metal reads PASS once a hub's status endpoint is armed. `hub_change=` counts serviced changes.
+/// `SKIP(no-hub)` and the metal reads PASS once a hub's status endpoint is armed. `hub_change=` counts serviced changes; `recycled=` the pool slots a retired endpoint gave back (EHCIPOOLRECYCLE B807; its pure round-trip gates `subtree=`).
 #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))]
 fn ehci_hub_selftest() {
     crate::drivers::ehci::hubchange::selftest();
