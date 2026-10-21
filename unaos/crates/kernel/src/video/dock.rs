@@ -3810,7 +3810,10 @@ const PULSE_MS: u64 = 300;
 static TRASH_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
 
 static TRASH_FULL: AtomicBool = AtomicBool::new(false);
+/// TRASHBATCHDOCK (B762): the Trash's item count and bytes, from the off-pump read (`trash_read`, `fs::trash::usage`);
+/// the glyph and the Empty Trash confirm read them, the router never reads the volume. (It was the 2 s poll's clock.)
 static TRASH_POLLED: AtomicU64 = AtomicU64::new(0);
+static TRASH_BYTES: AtomicU64 = AtomicU64::new(0);
 static TRASH_OPEN_OWED: AtomicBool = AtomicBool::new(false);
 static REVEAL_OWED: crate::sync::Mutex<Option<alloc::string::String>> = crate::sync::Mutex::new(None);
 static POSITION: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -3992,7 +3995,7 @@ fn dock2_overlay(out: &mut [u32], l: &Layout, rows: &[wm::DockEntry], j: usize) 
         if j < by + 2 || j + 2 >= by + th { continue; }
         let v = j - by - 2;
         if r.id == TRASH_PIN_ID {
-            let (kx, kw, kh, kr) = (bx + 2, tw.saturating_sub(4), th.saturating_sub(4), super::draw::icon_radius(th.saturating_sub(4))); let keep = super::draw::row_keep(out, kx, kw, kr); trash_glyph_row(out, bx, tw, th, j - by, TRASH_FULL.load(Ordering::Relaxed), ceramic::shade_gain(dnd_face(), j, ceramic::CONTROL_GAIN_Q16)); super::draw::row_round(out, &keep, kx, kw, kh, j - by - 2, kr); // GLASSKIT (B628): the Trash tile's plate rounded and anti-aliased by the kit — the glyph itself untouched (LINE-NEUTRAL, code before comment). DRAGDROP (B440): the selection face while a drag hovers it
+            let (kx, kw, kh, kr) = (bx + 2, tw.saturating_sub(4), th.saturating_sub(4), super::draw::icon_radius(th.saturating_sub(4))); let keep = super::draw::row_keep(out, kx, kw, kr); trash_glyph_row(out, bx, tw, th, j - by, TRASH_POLLED.load(Ordering::Relaxed) > 0, ceramic::shade_gain(dnd_face(), j, ceramic::CONTROL_GAIN_Q16)); super::draw::row_round(out, &keep, kx, kw, kh, j - by - 2, kr); // GLASSKIT (B628): the Trash tile's plate rounded and anti-aliased by the kit — the glyph itself untouched (LINE-NEUTRAL, code before comment). DRAGDROP (B440): the selection face while a drag hovers it
         } else if dock2_group(r) == 1 {
             if let Some(g) = thumbs.as_ref() {
                 if let Some((_, w, h, px)) = g.iter().find(|e| e.0 == r.id) {
@@ -4200,8 +4203,11 @@ static TRASH_READER: AtomicBool = AtomicBool::new(false);
 /// The Trash's full/empty read, its glass relight and its line.
 fn trash_read(first: bool, on: &str) {
     let t0 = crate::arch::ms();
-    let full = crate::fs::trash::count() > 0;
-    if TRASH_FULL.swap(full, Ordering::Relaxed) != full { PASS_OWED.store(true, Ordering::Release); }
+    let (items, bytes) = crate::fs::trash::usage(); // TRASHBATCHDOCK (B762): the count and bytes, one walk, for the glyph and the confirm
+    let full = items > 0;
+    TRASH_BYTES.store(bytes, Ordering::Relaxed);
+    let moved = TRASH_POLLED.swap(items as u64, Ordering::Relaxed) != items as u64;
+    if TRASH_FULL.swap(full, Ordering::Relaxed) != full || moved { PASS_OWED.store(true, Ordering::Release); }
     serial_println!("[dock] trash state why={} full={} took_ms={} on={} (HIDSTALL2: read on a change, off the hid pump's core)", if first { "first" } else { "change" }, full as u8, crate::arch::ms().saturating_sub(t0), on);
 }
 
@@ -4464,9 +4470,12 @@ fn pin_release(x: i32, y: i32) {
 
 static EMPTY_OWED: AtomicBool = AtomicBool::new(false);
 
-/// The Trash menu's one item: the confirm (DIALOG's alert, Cancel left, Empty Trash the default on the right).
+/// The Trash menu's one item: the confirm (DIALOG's alert, Cancel left, Empty Trash the default on the right). It names
+/// what goes (TRASHBATCHDOCK B762): the count and bytes the off-pump read left (`TRASH_POLLED`, `TRASH_BYTES`).
 fn empty_trash_ask() {
-    let mut d = crate::video::dialog::Dlg::new(crate::video::dialog::Icon::Caution, b"Trash", b"Are you sure you want to permanently erase the items in the Trash?", b"You can't undo this action.", &[b"Cancel", b"Empty Trash"]);
+    let n = TRASH_POLLED.load(Ordering::Relaxed);
+    let msg = alloc::format!("Permanently erase {} {} ({}) in the Trash?", n, if n == 1 { "item" } else { "items" }, size_words(TRASH_BYTES.load(Ordering::Relaxed)));
+    let mut d = crate::video::dialog::Dlg::new(crate::video::dialog::Icon::Caution, b"Trash", msg.as_bytes(), b"You can't undo this action.", &[b"Cancel", b"Empty Trash"]);
     d.user = true;
     d.act = crate::video::dialog::Act::Hook(empty_trash_answer as fn(bool) as usize);
     let posted = crate::video::dialog::post(d);
@@ -4481,11 +4490,54 @@ fn empty_trash_answer(ok: bool) {
 /// The service pass's Empty Trash (a directory walk; never in the router). Called from [`dockpin_service`].
 fn empty_trash_service() {
     if !EMPTY_OWED.swap(false, Ordering::AcqRel) { return; }
-    match crate::fs::trash::empty() {
-        Ok(n) => serial_println!("[dock] menu empty-trash answer=ok removed={}", n),
-        Err(e) => serial_println!("[dock] menu empty-trash answer=ok removed=0 error={}", e),
+    if let Err(e) = empty_trash_now() {
+        serial_println!("[dock] menu empty-trash answer=ok removed=0 error={}", e);
     }
+}
+
+/// Toasts `Trash emptied` posted this boot — `tests trashtoast`'s `empty=` leg.
+static EMPTIED_TOASTS: AtomicU64 = AtomicU64::new(0);
+
+/// TRASHBATCHDOCK (B762) — THE Empty Trash body (the service pass after the confirm, and `tests trashtoast`): empty
+/// through `fs::trash::empty_counted` (the one `[trash] emptied items= bytes= ms=` line), drop the undo journal's
+/// entries that reach into the Trash (nothing there can be undone), zero the tile's state, and post ONE toast
+/// `Trash emptied` with no action. Returns `(items, bytes, ms, journal entries dropped)`.
+pub(crate) fn empty_trash_now() -> Result<(usize, u64, u64, usize), alloc::string::String> {
+    let (n, bytes, ms) = crate::fs::trash::empty_counted()?;
+    #[cfg(feature = "quarry")]
+    let dropped = crate::video::quarry::undo::drop_trash_entries();
+    #[cfg(not(feature = "quarry"))]
+    let dropped = 0usize;
     TRASH_POLLED.store(0, Ordering::Relaxed);
+    TRASH_BYTES.store(0, Ordering::Relaxed);
+    TRASH_FULL.store(false, Ordering::Relaxed);
+    PASS_OWED.store(true, Ordering::Release);
+    let line = alloc::format!("{} {}, {} erased", n, if n == 1 { "item" } else { "items" }, size_words(bytes));
+    EMPTIED_TOASTS.fetch_add(1, Ordering::Relaxed);
+    let _ = crate::video::notify::post_full(b"Trash", b"Trash emptied", line.as_bytes(), b"", crate::video::notify::ACT_NONE, &[]);
+    Ok((n, bytes, ms, dropped))
+}
+
+/// `Trash emptied` toasts posted so far this boot.
+pub(crate) fn emptied_toasts() -> u64 {
+    EMPTIED_TOASTS.load(Ordering::Relaxed)
+}
+
+/// Bytes in the words a person reads: `512 bytes`, `12 KB`, `3.4 MB`, `1.2 GB`.
+fn size_words(b: u64) -> alloc::string::String {
+    const K: u64 = 1024;
+    let tenth = |unit: u64| (b * 10 + unit / 2) / unit;
+    if b < K {
+        alloc::format!("{} {}", b, if b == 1 { "byte" } else { "bytes" })
+    } else if b < K * K {
+        alloc::format!("{} KB", (b + K / 2) / K)
+    } else if b < K * K * K {
+        let t = tenth(K * K);
+        alloc::format!("{}.{} MB", t / 10, t % 10)
+    } else {
+        let t = tenth(K * K * K);
+        alloc::format!("{}.{} GB", t / 10, t % 10)
+    }
 }
 
 /// The fixture's leg for the Trash menu: one row, the right label.
@@ -4533,8 +4585,10 @@ fn dnd_face() -> u32 {
 pub(crate) fn dnd_drop(path: &str) -> Result<alloc::string::String, alloc::string::String> {
     let r = crate::fs::trash::trash(path);
     if r.is_ok() {
-        TRASH_POLLED.store(0, Ordering::Relaxed);
+        TRASH_POLLED.fetch_add(1, Ordering::Relaxed); // TRASHBATCHDOCK (B762): one more item until the generation's re-read gives the exact count and bytes
+        TRASH_FULL.store(true, Ordering::Relaxed);
         PASS_OWED.store(true, Ordering::Release);
+
     }
     r
 }

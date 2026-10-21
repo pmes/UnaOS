@@ -448,3 +448,39 @@ pub fn generation() -> u64 {
     }
     ((TRASH_GEN.load(core::sync::atomic::Ordering::Relaxed) as u64) << 32) | h as u64
 }
+
+// ── TRASHBATCHDOCK (rmbp-ledger B762): what the Trash holds in bytes, and the counted empty ──────────────────────────
+// Appended at the file's tail (nothing above moves). The dock's off-pump read asks [`usage`] for its confirm's words;
+// its Empty Trash runs [`empty_counted`], the one `[trash] emptied` line. The shell verb and the fixtures keep `empty`.
+
+/// The bytes of the tree at `p` (a file's size; a folder walked to the depth `empty` descends to).
+fn tree_bytes(t: &MountTable, p: &str, depth: usize) -> u64 {
+    let Ok(st) = t.stat(p) else { return 0 };
+    if !matches!(st.kind, NodeKind::Dir) {
+        return st.size;
+    }
+    if depth >= MAX_TREE_DEPTH {
+        return 0;
+    }
+    t.read_dir(p).map(|v| v.iter().filter(|e| e.name != "." && e.name != "..").map(|e| tree_bytes(t, &join(p, &e.name), depth + 1)).sum()).unwrap_or(0)
+}
+
+/// What the Trash holds: `(items, bytes)` — trash_core's listing, each entry's tree measured where it lies.
+pub fn usage() -> (usize, u64) {
+    let t = mt();
+    let td = trash_dir();
+    let es = entries();
+    let bytes = es.iter().map(|e| tree_bytes(&t, &join(&td, &e.name), 0)).sum();
+    (es.len(), bytes)
+}
+
+/// Empty the Trash through [`empty`] and say it on ONE line: `[trash] emptied items=<n> bytes=<n> ms=<n>`.
+/// Returns `(items, bytes, ms)`.
+pub fn empty_counted() -> Result<(usize, u64, u64), String> {
+    let t0 = crate::arch::ms();
+    let (_, bytes) = usage();
+    let n = empty()?;
+    let ms = crate::arch::ms().saturating_sub(t0);
+    serial_println!("[trash] emptied items={} bytes={} ms={}", n, bytes, ms);
+    Ok((n, bytes, ms))
+}

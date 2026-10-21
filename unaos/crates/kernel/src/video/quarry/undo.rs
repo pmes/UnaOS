@@ -529,3 +529,16 @@ pub fn clear() {
     drop(j);
     *BATCH.lock() = None;
 }
+
+/// TRASHBATCHDOCK (rmbp-ledger B762) — the Trash was emptied (the dock's Empty Trash): drop every entry whose replay
+/// would reach into the Trash, since nothing there can come back. Undo stack: every Trash (one item or a TRASHTOAST
+/// batch). Redo stack: every Restore (its redo restores from the Trash) and every Copy/Duplicate whose undone copy is
+/// parked there (`held`). An undone Trash — its items back where they were — stays redoable. Returns how many dropped.
+pub fn drop_trash_entries() -> usize {
+    let mut j = JOURNAL.lock();
+    let before = j.undo.len() + j.redo.len();
+    j.undo.retain(|e| e.verb != Verb::Trash);
+    j.redo.retain(|e| !(e.verb == Verb::Restore || (matches!(e.verb, Verb::Copy | Verb::Duplicate) && !e.held.is_empty())));
+    mirror(&j);
+    before - (j.undo.len() + j.redo.len())
+}
