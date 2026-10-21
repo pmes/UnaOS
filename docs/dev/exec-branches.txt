@@ -726,7 +726,7 @@ refs/heads/exec-rmbp-hdaring   d88a9c18 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-sleep2   d88a9c18 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-aethernet2   d88a9c18 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-textscale   d88a9c18 IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-textscale2   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-textscale2   f9a46a3d FOLDED-BY-HAND (this commit) 2026-10-21 B814
 refs/heads/exec-rmbp-toastflicker   d88a9c18 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-a11yshadow   d88a9c18 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-bootlist   d88a9c18 IN-FLIGHT cut 2026-10-21
