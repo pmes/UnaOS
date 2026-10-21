@@ -698,10 +698,10 @@ refs/heads/exec-rmbp-subscribekeep   5598d0f8 FOLDED-BY-HAND (this commit) 2026-
 refs/heads/exec-rmbp-raisearm64   32117758 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-pihome   4ba143fc FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-mailboxkeep   acb9969b FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-scrollservicewc   865d91a7 IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-piunafs   865d91a7 IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-droploops   865d91a7 IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-focusarm64   865d91a7 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-scrollservicewc   9c9e59e5 FOLDED-BY-HAND (this commit) 2026-10-21
+refs/heads/exec-rmbp-piunafs   a39da9cb FOLDED-BY-HAND (this commit) 2026-10-21
+refs/heads/exec-rmbp-droploops   27fd8af8 FOLDED-BY-HAND (this commit) 2026-10-21
+refs/heads/exec-rmbp-focusarm64   336af5f1 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-pirenderscroll   ac9460ec IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-millerwheel   ac9460ec IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-staletext2   ac9460ec IN-FLIGHT cut 2026-10-21
