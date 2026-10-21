@@ -2615,7 +2615,7 @@ mod tx;
 /// (`tx::fire`), a 2 s response window, both engines stopped. Once per boot; a second `tests wifi`
 /// prints the recorded verdict.
 #[cfg(feature = "wifi10")]
-pub fn wifi10(ssid: Option<alloc::string::String>) {
+pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
     static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if RAN.swap(true, core::sync::atomic::Ordering::Relaxed) {
         let (t, h) = super::status::wifi10();
@@ -2723,6 +2723,8 @@ pub fn wifi10(ssid: Option<alloc::string::String>) {
     rx::poll(bar0, &mut rxr, &mut seen, CH, WINDOW_US, &mut w);
     // WIFIAUTH (B788): S8 then S9 while both engines are armed (bringup/join.rs).
     let joined = join::run(bar0, &prep, &mut rxr, &mut seen, CH, &mut w);
+    // WIFIDATA (B803): S10a, one ARP over the open link, still inside the pass that owns the engines (bringup/join.rs).
+    let data = join::link(bar0, &prep, &mut rxr, &mut seen, CH, gw, &mut w);
     let (mac_off, rx_off) = rx::finish(bar0, &rxr, &mut w);
     let tx_off = tx::stop(bar0, &mut w);
     unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
@@ -2746,11 +2748,12 @@ pub fn wifi10(ssid: Option<alloc::string::String>) {
         CH, WINDOW_US / 1000, if heard { "HEARD" } else { "SILENT" }, reason
     );
     serial_println!(
-        ":: wifi10: end mac-suspended-first={} cookie_pre={:#06x} wifi9_beacons={} rx2tx={} rst2rx={} tx_pwr_ctl={} tx-reset={} rx-reset={} mac-suspended={} wrote-macctl={} wrote-shm={} wrote-dma={} wrote-tx-desc={} wrote-macfilter={} wrote-irq-ack={} wrote-pci-cmd={} wrote-core-regs={} wrote-wrapper={} shm-ctl-restored={} transmit={}(probe-req{}; MACFILTER_SELF set, so the ucode ACKs unicast to it) ::",
+        ":: wifi10: end mac-suspended-first={} cookie_pre={:#06x} wifi9_beacons={} rx2tx={} rst2rx={} tx_pwr_ctl={} tx-reset={} rx-reset={} mac-suspended={} wrote-macctl={} wrote-shm={} wrote-dma={} wrote-tx-desc={} wrote-macfilter={} wrote-irq-ack={} wrote-pci-cmd={} wrote-core-regs={} wrote-wrapper={} shm-ctl-restored={} transmit={}(probe-req{}{}; MACFILTER_SELF set, so the ucode ACKs unicast to it) ::",
         suspended as u8, cookie_pre, beacons.map(|n| alloc::format!("{}", n)).unwrap_or_else(|| alloc::string::String::from("none")),
         tp.rx2tx as u8, tp.rst2rx as u8, if pctl_on { "on" } else { "off" }, tx_off as u8, rx_off as u8, mac_off as u8,
         w.macctl, w.shm, w.dma, w.tx_desc, w.macfilter, w.irq_ack, w.pci_cmd, h.c.core_regs, h.c.wrapper,
-        if shm_ok { "MATCH" } else { "FAILED" }, 1 + joined, ["", "+auth", "+auth+assoc-req"][joined.min(2) as usize]
+        if shm_ok { "MATCH" } else { "FAILED" }, 1 + joined + data, ["", "+auth", "+auth+assoc-req"][joined.min(2) as usize],
+        if data > 0 { "+arp" } else { "" }
     );
     let _ = (prep.rate_mem, prep.reset_ok, prep.txstatus0, tp.pctl_en, pctl.as_ref().map(|r| (r.cmd, r.targ, r.idle_regs, r.samp_stat, r.c.timeouts)));
 }
