@@ -56,6 +56,7 @@
 
 ## 5. Ruled, unbuilt
 - CODEX Amendment IV (Sonde) signature (R112). Elessar's dynamic layout on UnaOS (CODEX §4): not on UnaOS at HEAD (`unverified`). R108 (Aether in the Una IDE, the 3D work environments): see RULINGS.
+- AETHERLIB (AETHERNET2 LEDGER SR187's owed row): `unaos/crates/user-aether` is a no_std/no_main bin (its own workspace) with no host test target; its fetch sequencing (the resolver cache, the `reason=` mapping in `unaos/crates/user-aether/src/net.rs`) is untested on the host until a lib split lets a resolver stub drive `fetch`. The trust reader and cipher names are tested in `vein_ring3` (`trust::tests`, `tls::tests::cipher_name_kat`).
 
 ## 6. Read further
 - `docs/CODEX.md`; `docs/dev/USERLAND/ARCHITECTURE.md`; each handler's own `README.md` for implementation (not charter).

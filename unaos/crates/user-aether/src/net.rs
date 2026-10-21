@@ -8,7 +8,9 @@
 // 1. URL — `http_core::url` (= html_core::url, URLCORE SR87, the one WHATWG parser). Only http/https; IPv6 refused.
 // 2. NAME — `vein_ring3::net::resolve` = SYS_RESOLVE (57, una-abi), the kernel resolver over the DHCP-leased DNS
 //    (netring3.rs → smolnet::resolve on x86; aarch64 answers -ENODEV until the NET6 resolver is bound, owed there).
-//    The way crates/user-net resolves names; no new verb. A small answer cache (60 s) saves a lookup per hop.
+//    The way crates/user-net resolves names; no new verb. A small answer cache (60 s) saves a lookup per hop. The
+//    kernel says each lookup (`[dns] q=<name> -> a=<ip>|none ms=<n>`, AETHERNET2 SR187); a refusal is `reason=dns
+//    code=<errno>` (-19 no link, -2 no answer).
 // 3. SOCKET — `vein_ring3::net::Tcp` over SYS_SOCKET 40 / SYS_CONNECT 44 / SYS_SEND 45 / SYS_SOCK_RECV 46 / SYS_CLOSE
 //    17 (non-blocking verbs polled, connect bounded at 15 s, I/O idle at 120 s), plus this file's per-navigation
 //    deadline (`FETCH_MS`) through `vein_ring3::net::set_tick`: past it every wait answers ECANCELED → `timeout`.
@@ -16,6 +18,8 @@
 //    `vein_ring3::TlsSetup::load()` (VEINTLS SR36: tls_core on CRYPTOCORE, the chain built to /system/trust/roots.pem,
 //    checked at SYS_TIME, RFC 6125 name match; the CT list and CCADB intermediates when staged). Exactly NET.ELF's and
 //    LUMEN.ELF's root pinning — loaded once, on the first https navigation. No provider / no trust store / no clock = a named refusal; there is no insecure mode.
+//    AETHERNET2 (SR187): the store is read through SYS_PATH_READ (the VFS — /system is on the UnaFS root), so the
+//    `tls-no-trust-store` refusal's `code=` is the reader's errno (-2 = no bundle staged on the volume).
 // 5. HTTP — over TLS the handshake offers ALPN `h2, http/1.1` and `Session::alpn` says what the server chose
 //    (NETDEBT2 SR113). `h2`: `http_core::h2::H2Conn` (no_std, the SAME client the host transport multiplexes with) —
 //    preface + SETTINGS, one stream per navigation (HEADERS with :method/:scheme/:authority/:path, the fields below
@@ -43,9 +47,9 @@
 // redirect credential rule (redirect.rs). Nothing is re-implemented here, so there is no second switch.
 //
 // WIRE, one line per navigation:
-// `:: AETHER: net url=<final url> status=<n> bytes=<decoded body> ms=<n> tls=<1.3|1.2|off> proto=<h2|h1>
+// `:: AETHER: net url=<final url> status=<n> bytes=<decoded body> ms=<n> tls=<1.3|1.2|off> [cipher=<name>] proto=<h2|h1>
 //  hops=<n> conn=<new|reused> coding=<identity|gzip|deflate|br> [issuer=<CN>] -> PASS|FAIL [reason=<why> code=<n>] ::`
-// — PASS when a final answer arrived (any status: a 404 page is a page); FAIL names the stage (`resolve`, `connect`,
+// — PASS when a final answer arrived (any status: a 404 page is a page); FAIL names the stage (`dns`, `connect`,
 // `tls-<why>`, `h2-protocol`, `timeout`, ...).
 
 use alloc::string::String;
@@ -245,7 +249,7 @@ fn address(n: &mut Net, url: &Url) -> Result<[u8; 4], Fail> {
             if let Some((_, ip, _)) = n.dns.iter().find(|(h, _, _)| h == d) {
                 return Ok(*ip);
             }
-            let ip = vein_ring3::net::resolve(d).map_err(|e| fail(if e == una_abi::ENODEV { "resolve-no-link" } else if e == una_abi::ENOENT { "resolve-no-answer" } else { "resolve" }, e))?;
+            let ip = vein_ring3::net::resolve(d).map_err(|e| fail("dns", e))?; // AETHERNET2 (SR187): the errno names why (-19 no link, -2 no answer)
             if n.dns.len() >= 32 {
                 n.dns.remove(0);
             }
@@ -287,6 +291,8 @@ fn park(n: &mut Net, origin: String, tcp: Tcp) {
 /// What one hop learned beyond the response.
 struct Hop {
     tls: u16,
+    /// AETHERNET2 (SR187): the negotiated cipher suite's wire name (`vein_ring3::tls::cipher_name`), "" without TLS.
+    cipher: &'static str,
     /// The page came over HTTP/2 (ALPN `h2`); otherwise HTTP/1.1.
     h2: bool,
     reused: bool,
@@ -322,7 +328,7 @@ fn hop(n: &mut Net, url: &Url, ctx: &CookieContext) -> Result<(Resp, Hop), Fail>
                 if r.keep {
                     park(n, origin, t);
                 }
-                return Ok((r, Hop { tls: 0, h2: false, reused: true, issuer: None }));
+                return Ok((r, Hop { tls: 0, cipher: "", h2: false, reused: true, issuer: None }));
             }
         }
         let mut t = Tcp::connect(ip, port).map_err(|e| fail(if e == ECANCELED { "timeout" } else { "connect" }, e))?;
@@ -330,7 +336,7 @@ fn hop(n: &mut Net, url: &Url, ctx: &CookieContext) -> Result<(Resp, Hop), Fail>
         if r.keep {
             park(n, origin, t);
         }
-        return Ok((r, Hop { tls: 0, h2: false, reused: false, issuer: None }));
+        return Ok((r, Hop { tls: 0, cipher: "", h2: false, reused: false, issuer: None }));
     }
 
     if n.tls.is_none() {
@@ -340,7 +346,7 @@ fn hop(n: &mut Net, url: &Url, ctx: &CookieContext) -> Result<(Resp, Hop), Fail>
     match setup.verify() {
         Verify::Ready => {}
         Verify::NoProvider => return Err(fail("tls-no-provider", 0)),
-        Verify::NoTrustStore => return Err(fail("tls-no-trust-store", 0)),
+        Verify::NoTrustStore => return Err(fail("tls-no-trust-store", setup.trust_fail.map_or(0, |f| f.errno()))),
         Verify::NoClock => return Err(fail("tls-clock-unset", una_abi::EAGAIN)),
     }
     let ctx_tls = setup.context().ok_or(fail("tls-no-context", 0))?;
@@ -351,13 +357,13 @@ fn hop(n: &mut Net, url: &Url, ctx: &CookieContext) -> Result<(Resp, Hop), Fail>
     let done = vein_ring3::tls::with_session_alpn(&mut t, &host, &ctx_tls, vein_ring3::tls::ALPN_H2_HTTP1, |s, v| {
         let h2 = s.is_h2();
         let r = if h2 { exchange_h2(s, &authority, &target, &h) } else { exchange(s, &head, true) };
-        (r, s.version(), v, h2)
+        (r, s.version(), v, h2, s.cipher())
     });
     match done {
         Err(f) => Err(fail(tls_why(f.why), f.errno)),
-        Ok(((Ok(r), ver, v, h2), _)) => Ok((r, Hop { tls: ver, h2, reused: false, issuer: Some(v) })),
-        Ok(((Err(e), _, _, _), Some(tf))) if e.why != "timeout" => Err(fail(tls_why(tf.why), tf.errno)),
-        Ok(((Err(e), _, _, _), _)) => Err(e),
+        Ok(((Ok(r), ver, v, h2, cipher), _)) => Ok((r, Hop { tls: ver, cipher, h2, reused: false, issuer: Some(v) })),
+        Ok(((Err(e), _, _, _, _), Some(tf))) if e.why != "timeout" => Err(fail(tls_why(tf.why), tf.errno)),
+        Ok(((Err(e), _, _, _, _), _)) => Err(e),
     }
 }
 
@@ -471,6 +477,9 @@ pub fn fetch(url: &str) -> Result<(Vec<u8>, String), i64> {
         Some(0x0303) => b"1.2",
         _ => b"off",
     });
+    if let Some(h) = last.as_ref().filter(|h| h.tls != 0) {
+        l.put(b" cipher=").put(h.cipher.as_bytes()); // AETHERNET2 (SR187)
+    }
     // `h2`/`h1`, short: the line buffer is 240 bytes.
     l.put(b" proto=").put(if last.as_ref().is_some_and(|h| h.h2) { b"h2" as &[u8] } else { b"h1" });
     l.put(b" hops=").dec(hops as i64);
