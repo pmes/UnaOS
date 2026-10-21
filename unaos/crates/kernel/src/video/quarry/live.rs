@@ -3080,7 +3080,7 @@ pub fn service() {
     }
     {
         let _s = lr::stamp(lr::W_Q_SETTINGS);
-        crate::video::settings::service(); crate::video::settings::hover_poll(); hover_poll(); wm::scroll_service(); // SCROLLVIEW (B764): the thumb drag and the bar's hide, both desktops. // QUARRYHOVER (B647): Quarry's hover pass beside Settings', same shape (line-neutral, code before the comment). SETTINGSCRAFT (B630): the Settings window's hover + pressed-face pass (reads the cursor like the dock's hover; repaints only when the pointer crosses a control). Folded, line-neutral: code before the comment.
+        crate::video::settings::service(); crate::video::settings::hover_poll(); hover_poll(); #[cfg(target_arch = "x86_64")] wm::scroll_service(); // SCROLLVIEW (B764): the thumb drag and the bar's hide -- x86 only here; PIRENDERSCROLL (LEDGER SR181): aarch64's one caller per desktop is the render pass's drain tail (main.rs `render_pass` on the Pi, `orin_render_service` on the Orin). SCROLLSERVICEWC (B797) cfgs this same statement to the complement, so their fold deletes it. // QUARRYHOVER (B647): Quarry's hover pass beside Settings', same shape (line-neutral, code before the comment). SETTINGSCRAFT (B630): the Settings window's hover + pressed-face pass (reads the cursor like the dock's hover; repaints only when the pointer crosses a control). Folded, line-neutral: code before the comment.
     }
     {
         let _s = lr::stamp(lr::W_Q_FONT);
