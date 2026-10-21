@@ -71,7 +71,8 @@ PREFSRELOAD (B763): `[prefs] reload gen=<SESSION_GEN> changed=<n> sent=<n> unsen
 - `unaos/crates/kernel/src/fs/users.rs:30-40` header still places `USERS.DAT` on "the EL0 FAT volume"; the constants say root of the root volume. Stale comment, owed.
 - Pi storage (emmc2/SD root on bare metal) at HEAD: `unverified` (not read for this sheet).
 - FILEVERSIONS' §R17 record is ADDITIVE under the unchanged v7 stamp, so a pre-B714 `fsck --repair` rebuilds refcounts without the rings' references and can free blocks a version still names (crawl B finding 5). Stopgap built (the restore guard, BP-storage-24); the fix is a format change and a STOP for the crawl (VERSIONSCOMPAT, LEDGER SR154, owns it): (a) a ROCOMPAT bit (`RootRecord::flags` bit 2, set by the first version capture) with the rule, from that build on, that a reader refuses `--repair` and writes over a root flag it does not know — closes the gap for every LATER reader but not the pre-B714 ones, which read `flags` (`unaos/libs/fs/unafs/src/root.rs:109`) and ignore unknown bits; (b) for the readers that already exist the only refusal is the stamp: a versioned volume stamped past 7 (INCOMPAT), which costs pre-B714 builds the mount entirely.
-- `layout.md` §5.2 EL0 path namespace (ring3.md §5).
+- EL0 name verbs: ring3.md §7 (PATHNS SR171): the attribute, stat, path-I/O and spawn verbs take an absolute VFS path; `SYS_OPEN` a path on aarch64 (EL0 FAT) and a root leaf on x86 unless `irqstorage`; `SYS_RENAME` a root leaf; `layout.md` §5.2 says the same.
+- Owed: `docs/dev/OS/09_FILESYSTEM/layout.md` §2.1 group 3 and §2.4 still call EL0's `sys_open` namespace a flat 8.3 volume root (pre-DIRNS text); ring3.md §7 is the current reading.
 
 ## 6. Read further
 - `docs/dev/OS/09_FILESYSTEM/vfs.md` (mechanism), `layout.md` (names), `unafs-records.md`, `btree.md`, `partitions.md`.
