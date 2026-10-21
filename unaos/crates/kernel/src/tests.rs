@@ -189,7 +189,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("focussteal", focussteal_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("veilcost", veilcost_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))] register("aging", aging_selftest); register("a11yfilters", crate::video::settings::selftest_a11yfilters); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("zoom", zoom_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("perfhud", crate::video::perfhud::selftest); register("undomove", undomove_selftest); #[cfg(all(feature = "quarry", target_arch = "x86_64", feature = "wc"))] register("undokeys", undokeys_selftest); register("fontkit", fontkit_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("raiseverb", raiseverb_selftest); register("keychars", keychars_selftest); register("softydots", softydots_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpsearch", helpsearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))] register("filesearch", filesearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("oneinstance", oneinstance_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpf1", helpf1_selftest); register("trashtoast", trashtoast_selftest); #[cfg(feature = "uac")] register("softymic", softymic_selftest); }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("focussteal", focussteal_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("veilcost", veilcost_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))] register("aging", aging_selftest); register("a11yfilters", crate::video::settings::selftest_a11yfilters); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("zoom", zoom_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("perfhud", crate::video::perfhud::selftest); register("undomove", undomove_selftest); #[cfg(all(feature = "quarry", target_arch = "x86_64", feature = "wc"))] register("undokeys", undokeys_selftest); register("fontkit", fontkit_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("raiseverb", raiseverb_selftest); register("keychars", keychars_selftest); register("softydots", softydots_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpsearch", helpsearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))] register("filesearch", filesearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("oneinstance", oneinstance_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpf1", helpf1_selftest); register("trashtoast", trashtoast_selftest); #[cfg(feature = "uac")] register("softymic", softymic_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("wcpar", wcpar_selftest); }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -4743,5 +4743,138 @@ fn softymic_selftest() {
     serial_println!(
         ":: SOFTYMIC: on={} off={} looks={} privacy={} -> {} :: live={} ::",
         yn(on), yn(off), looks, yn(privacy), if pass { "PASS" } else { "FAIL" }, live
+    );
+}
+
+// ---- WCPAR2 (rmbp-ledger B770) M3 — `tests wcpar`: the compose fan-out against the serial loop ----------------
+
+/// `tests wcpar`: 60 frames of 8 overlapping windows composed back-to-front into a heap back buffer, once
+/// serially (N=1, `FrameBuffer::blit` per row — the CPU blitter's own fallback loop) and once through
+/// `wcpar::par_blit_bands` (N = online APs, max 3; the presenter composes alongside the pool and joins).
+/// Every frame's two buffers are compared and the last is CRC'd; then one frame with an injected late
+/// worker band (`inject_stall_once`, past the 2 ms deadline) must still be pixel-identical. Heap
+/// buffers only — the panel is never touched. Wire:
+/// `[wc] par bands=<n> compose_us=<n> serial_us=<n> crc_eq=<0|1> frames=60 windows=8 late=<n> busy=<n> stall_late=<n> stall_eq=<0|1> crc=<hex>`
+/// `:: WCPAR: bands=<n> crc_eq=<0|1> speedup=<a.bc> bar=1.50 -> PASS|FAIL|SKIP ::`
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "facet"))]
+fn wcpar_selftest() {
+    use crate::video::wcpar;
+    const BW: usize = 1280;
+    const BH: usize = 800;
+    const WW: usize = 480;
+    const WH: usize = 360;
+    const NWIN: usize = 8;
+    const FRAMES: usize = 60;
+    const BPP: usize = 4;
+    let n = wcpar::workers().min(3);
+    if n < 2 {
+        serial_println!(":: WCPAR: bands={} crc_eq=0 speedup=0.00 bar=1.50 -> SKIP :: reason=workers={} (no APs to fan out to)", n, wcpar::workers());
+        return;
+    }
+    let heap = |len: usize| -> Option<alloc::vec::Vec<u8>> {
+        let mut v = alloc::vec::Vec::new();
+        v.try_reserve_exact(len).ok()?;
+        v.resize(len, 0);
+        Some(v)
+    };
+    let (Some(b1), Some(b3)) = (heap(BW * BH * BPP), heap(BW * BH * BPP)) else {
+        serial_println!(":: WCPAR: bands={} crc_eq=0 speedup=0.00 bar=1.50 -> SKIP :: reason=heap-short", n);
+        return;
+    };
+    let mut wins: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    for k in 0..NWIN {
+        let Some(mut s) = heap(WW * WH * BPP) else {
+            serial_println!(":: WCPAR: bands={} crc_eq=0 speedup=0.00 bar=1.50 -> SKIP :: reason=heap-short", n);
+            return;
+        };
+        for y in 0..WH {
+            for x in 0..WW {
+                let o = (y * WW + x) * BPP;
+                s[o] = (x * 3 + k * 29) as u8;
+                s[o + 1] = (y * 5 ^ (k * 47)) as u8;
+                s[o + 2] = (x ^ y ^ (k * 13)) as u8;
+                s[o + 3] = 0xFF;
+            }
+        }
+        wins.push(s);
+    }
+    let mk = |v: &alloc::vec::Vec<u8>| {
+        let mut f = crate::video::FrameBuffer::new();
+        f.init(v.as_ptr() as usize, v.len(), unaos_boot_info::FrameBufferInfo { width: BW, height: BH, stride: BW, bytes_per_pixel: BPP, pixel_format: unaos_boot_info::PixelFormat::Bgr });
+        f
+    };
+    let (f1, f3) = (mk(&b1), mk(&b3));
+    let (rb, pitch) = (WW * BPP, BW * BPP);
+    // Window k's origin on frame `fr`: a cascade that slides a little each frame (always inside the buffer).
+    let origin = |k: usize, fr: usize| (40 + k * 96 + (fr % 8) * 4, 30 + k * 52 + (fr % 5) * 3);
+    let clear = |f: &crate::video::FrameBuffer, fr: usize| {
+        let row = [(fr as u8) ^ 0x5A; BW * BPP];
+        for y in 0..BH {
+            f.blit(y * pitch, &row);
+        }
+    };
+    // One frame, serial: the CPU blitter's per-row loop.
+    let serial = |fr: usize| {
+        for (k, s) in wins.iter().enumerate() {
+            let (x, y) = origin(k, fr);
+            let d0 = (y * BW + x) * BPP;
+            for r in 0..WH {
+                f1.blit(d0 + r * pitch, &s[r * rb..(r + 1) * rb]);
+            }
+        }
+    };
+    // One frame, fanned out: each window's rows in `n` bands; a refused job (pool busy) runs serially.
+    let fanned = |fr: usize, late: &mut u32, busy: &mut u32| {
+        for (k, s) in wins.iter().enumerate() {
+            let (x, y) = origin(k, fr);
+            let d0 = (y * BW + x) * BPP;
+            match wcpar::par_blit_bands(&f3, s, rb, d0, pitch, WH, n) {
+                Some(l) => *late += l,
+                None => {
+                    *busy += 1;
+                    for r in 0..WH {
+                        f3.blit(d0 + r * pitch, &s[r * rb..(r + 1) * rb]);
+                    }
+                }
+            }
+        }
+    };
+    let (mut serial_cyc, mut par_cyc, mut late, mut busy) = (0u64, 0u64, 0u32, 0u32);
+    let mut eq = true;
+    for fr in 0..FRAMES {
+        clear(&f1, fr);
+        clear(&f3, fr);
+        let t0 = crate::arch::now_cycles();
+        serial(fr);
+        let t1 = crate::arch::now_cycles();
+        fanned(fr, &mut late, &mut busy);
+        let t2 = crate::arch::now_cycles();
+        serial_cyc += t1.saturating_sub(t0);
+        par_cyc += t2.saturating_sub(t1);
+        eq &= b1 == b3;
+    }
+    let (c1, c3) = (crate::hash::crc32(&b1), crate::hash::crc32(&b3));
+    let crc_eq = eq && c1 == c3;
+    // The deadline leg: a worker band stalls 5 ms (past the 2 ms deadline); the presenter takes it late.
+    let fr = FRAMES;
+    clear(&f1, fr);
+    clear(&f3, fr);
+    serial(fr);
+    wcpar::inject_stall_once(5_000);
+    let (mut stall_late, mut stall_busy) = (0u32, 0u32);
+    fanned(fr, &mut stall_late, &mut stall_busy);
+    wcpar::inject_stall_once(0);
+    let stall_eq = b1 == b3 && crate::hash::crc32(&b1) == crate::hash::crc32(&b3);
+    let serial_us = crate::video::blitter::cycles_to_us(serial_cyc) / FRAMES as u64;
+    let compose_us = crate::video::blitter::cycles_to_us(par_cyc) / FRAMES as u64;
+    let x100 = if compose_us == 0 { 0 } else { serial_us * 100 / compose_us };
+    serial_println!(
+        "[wc] par bands={} compose_us={} serial_us={} crc_eq={} frames={} windows={} late={} busy={} stall_late={} stall_eq={} crc={:#010x}",
+        n, compose_us, serial_us, crc_eq as u8, FRAMES, NWIN, late, busy + stall_busy, stall_late, stall_eq as u8, c3
+    );
+    let pass = crc_eq && stall_eq;
+    serial_println!(
+        ":: WCPAR: bands={} crc_eq={} speedup={}.{:02} bar=1.50 -> {} ::",
+        n, crc_eq as u8, x100 / 100, x100 % 100, if pass { "PASS" } else { "FAIL" }
     );
 }
