@@ -208,6 +208,16 @@ struct State {
     tab: usize,
     /// SETTINGSMAP (B673): the `(tab, row)` the search's Return opened, ringed until the next press, key or tab switch.
     found: Option<(u8, u8)>,
+    /// PICKERKEYS (rmbp-ledger B768): every control's keyboard word, parallel to `hits` (`[kind, a, b, id]`: a seg's
+    /// count and committed segment, a slider's position and max, a NAMES control id or [`NO_ID`]); the first pane
+    /// control's index in `hits` (the column's card and search field come before it); the pane's keyboard stop (an
+    /// index past `pane0`); a segmented control's PENDING segment (arrows move it, Space/Return chooses it); the id
+    /// the next `cs` records.
+    meta: Vec<[u16; 4]>,
+    pane0: usize,
+    kf: usize,
+    pend: Option<usize>,
+    cid: u16,
 }
 
 impl State {
@@ -216,6 +226,7 @@ impl State {
             sel, strip, col_top, col_hover: None, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf,
             query: String::new(), search: false, kbd: false, ptr: None, press: None, hits: Vec::new(), hot: None,
             glides: draw::motion::Glides::new(), frame: draw::motion::Frame::new(), now: 0, tab: 0, found: None,
+            meta: Vec::new(), pane0: usize::MAX, kf: 0, pend: None, cid: NO_ID,
         }
     }
 }
@@ -567,10 +578,201 @@ fn sidebar_bg() -> u32 {
 }
 
 /// A control's state at the logical rect `(x, y, w, h)` (hover / pressed from the pointer); records the rect.
+/// PICKERKEYS (B768): and its keyboard word (`meta`, a press by default; the id [`State::cid`] names, then cleared);
+/// a pane control holds the keyboard — its ring drawn — when it is the stop [`State::kf`] names.
 fn cs(st: &mut State, x: usize, y: usize, w: usize, h: usize, focused: bool) -> draw::ControlState {
+    let i = st.hits.len();
     st.hits.push([x as u16, y as u16, w as u16, h as u16]);
+    let id = core::mem::replace(&mut st.cid, NO_ID);
+    st.meta.push([K_PRESS, 0, 0, id]);
     let inside = |p: Option<(usize, usize)>| p.is_some_and(|(px, py)| px >= x && px < x + w && py >= y && py < y + h);
+    let focused = focused || keyed_at(st, i);
     draw::ControlState { hover: inside(st.ptr), pressed: inside(st.press.map(|(a, b, _)| (a, b))), disabled: false, focused }
+}
+
+// ── PICKERKEYS (rmbp-ledger B768) — every control a keyboard stop ──────────────────────────────────────────────────
+// ONE index for every control: its place in the paint's control list (`State::hits`, recorded by `cs` in paint order).
+// The pane's stops are `hits[pane0..]`; `kf` is the one holding the keyboard. Down/Up walk them, Space/Return makes ONE
+// synthetic press at the stop through the press router's own body ([`press_at`]), so the action, its line and its store
+// latch are the mouse's; a segmented control's arrows move a pending segment first, a slider's step it.
+
+/// A control's keyboard kind (`meta[0]`).
+const K_PRESS: u16 = 0;
+const K_SEG: u16 = 1;
+const K_SLIDER: u16 = 2;
+const K_FIELD: u16 = 3;
+const K_LINE: u16 = 4;
+const K_ENTRY: u16 = 5;
+const K_NAMES: [&str; 6] = ["press", "seg", "slider", "field", "line", "entry"];
+/// No NAMES control id on this hit.
+const NO_ID: u16 = u16::MAX;
+/// No keyboard stop (the probes' rest paint).
+const KF_NONE: usize = usize::MAX;
+/// `sel` while the stop is a control with no NAMES id (matches no explicit verb).
+const SEL_NONE: usize = CONTROLS + 1;
+
+/// Is hit `i` the pane's keyboard stop, shown (a key was the last move, focus in the pane)?
+fn keyed_at(st: &State, i: usize) -> bool {
+    st.kbd && !st.strip && st.kf != KF_NONE && i >= st.pane0 && i - st.pane0 == st.kf
+}
+
+/// The last recorded control's keyboard word: its kind and two numbers.
+fn kmeta(st: &mut State, kind: u16, a: usize, b: usize) {
+    if let Some(m) = st.meta.last_mut() { m[0] = kind; m[1] = a.min(0xFFFF) as u16; m[2] = b.min(0xFFFF) as u16; }
+}
+
+/// The kit's focus ring around the logical rect `(x, y, w, h)` (DESIGN-LANGUAGE §2.7, `draw::focus_ring`'s arithmetic),
+/// for the controls the kit does not draw (a File Types row, a Resolution entry, a Hardware line, the footer link).
+fn ring_box(st: &mut State, x: usize, y: usize, w: usize, h: usize) {
+    let rr = Rect::new(e(x), e(y), ew(x, w), ew(y, h));
+    let rw = dp(draw::DIMS.focus_ring);
+    draw::stroke_rrect(&mut sf(st), rr.inset(-rw), dp(draw::DIMS.row_radius) + rw, rw, Ink::argb(theme::focus_ring()));
+}
+
+/// A press target the kit does not draw (a Hardware line, the footer link): recorded as a control of `kind`, ringed
+/// when it holds the keyboard.
+fn hit_line(st: &mut State, x: usize, y: usize, w: usize, h: usize, kind: u16) {
+    let c = cs(st, x, y, w, h, false);
+    kmeta(st, kind, 0, 0);
+    if c.focused { ring_box(st, x, y, w, h); }
+}
+
+/// The pane's stops as the last paint drew them: `(pane0, n)`.
+fn stops(st: &State) -> (usize, usize) {
+    let p = st.pane0.min(st.hits.len());
+    (p, st.hits.len() - p)
+}
+
+/// The NAMES id of stop `k` as `sel` (or [`SEL_NONE`]).
+fn sel_of(st: &State, k: usize) -> usize {
+    match st.meta.get(st.pane0.saturating_add(k)) { Some(m) if m[3] != NO_ID => m[3] as usize, _ => SEL_NONE }
+}
+
+/// Put the keyboard on stop `k` of tab `tab`: `sel` follows its id, a pending segment is dropped; on Users the row
+/// (`u.sel`, its wash and ring) or the form's field (`u.focus`) follows.
+fn stop_set(st: &mut State, tab: usize, k: usize) {
+    st.kf = k;
+    st.pend = None;
+    st.strip = false;
+    st.sel = sel_of(st, k);
+    if tab == 1 {
+        if st.u.form {
+            if k < 3 { st.u.focus = k as u8; }
+        } else if let Some(h) = st.hits.get(st.pane0.saturating_add(k)) {
+            let r = (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H;
+            if r >= 1 { st.u.sel = r - 1; }
+        }
+    }
+}
+
+/// The stop whose control carries NAMES id `ctrl`.
+fn stop_of_ctrl(st: &State, ctrl: usize) -> Option<usize> {
+    let (p0, n) = stops(st);
+    (0..n).find(|&k| st.meta[p0 + k][3] as usize == ctrl)
+}
+
+/// The stop a search hit or a launcher pick lands on in row `r`: the row's control `ctrl` when it is painted there,
+/// else the first control painted in the row.
+fn stop_in_row(st: &State, r: usize, ctrl: usize) -> Option<usize> {
+    let (p0, n) = stops(st);
+    let row_of_hit = |k: usize| { let h = st.hits[p0 + k]; (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H };
+    stop_of_ctrl(st, ctrl).filter(|&k| row_of_hit(k) == r).or_else(|| (0..n).find(|&k| row_of_hit(k) == r))
+}
+
+/// Down / Up in the pane: the next / previous stop (Down wraps; Up from the first gives the keyboard to the column).
+/// From the column, Down/Tab takes the first stop. While the Resolution popup is open the walk is its entries; in the
+/// Users form it wraps both ways; on Hardware a step past the shown lines scrolls the list one line.
+fn walk(tab: usize, down: bool) {
+    {
+        let mut g = STATE.lock();
+        let Some(st) = g.as_mut() else { return };
+        let (p0, n) = stops(st);
+        let only = tab == 2 && st.modes_open;
+        let form = tab == 1 && st.u.form;
+        let ok: Vec<bool> = (0..n).map(|k| !only || st.meta[p0 + k][0] == K_ENTRY).collect();
+        let line: Vec<bool> = (0..n).map(|k| st.meta[p0 + k][0] == K_LINE).collect();
+        let first = (0..n).find(|&k| ok[k]);
+        // `Some(Some(k))` = take stop k, `Some(None)` = give the keyboard to the column, `None` = stay.
+        let to: Option<Option<usize>> = if st.strip || n == 0 {
+            first.map(Some)
+        } else {
+            let cur = st.kf.min(n - 1);
+            let next = if down { (cur + 1..n).find(|&k| ok[k]) } else { (0..cur).rev().find(|&k| ok[k]) };
+            let edge = line[cur] && next.is_none_or(|k| !line[k]);
+            if tab == HW_TAB && edge && hw_key_scroll(down) {
+                None // the list moved one line under the stop; the stop stays
+            } else {
+                match (next, down) {
+                    (Some(k), _) => Some(Some(k)),
+                    (None, true) => first.map(Some),
+                    (None, false) if form || only => (0..n).rev().find(|&k| ok[k]).map(Some),
+                    (None, false) => Some(None),
+                }
+            }
+        };
+        match to {
+            Some(Some(k)) => stop_set(st, tab, k),
+            Some(None) => { st.strip = true; st.pend = None; }
+            None => {}
+        }
+    }
+    repaint();
+}
+
+/// The stop's action: `d` = 0 chooses it (Space / Return), -1 / +1 is Left / Right. A segmented control's arrows move
+/// its pending segment and its choice presses that segment; a slider's arrows step it (one press at the new knob, then
+/// the capture's release there: the drag's own commit); any other control's choice is one press at its centre. `false`
+/// = nothing to do here (the caller keeps its own meaning for the key).
+fn key_act(tab: usize, d: isize) -> bool {
+    let (kind, a, b, h, k, n) = {
+        let mut g = STATE.lock();
+        let Some(st) = g.as_mut() else { return false };
+        let (p0, n) = stops(st);
+        if st.strip || n == 0 { return false; }
+        let k = st.kf.min(n - 1);
+        let (m, h) = (st.meta[p0 + k], st.hits[p0 + k]);
+        let (kind, a, b) = (m[0], m[1] as usize, m[2] as usize);
+        if kind == K_SEG && d != 0 {
+            let p = (st.pend.unwrap_or(b) as isize + d).clamp(0, a.saturating_sub(1) as isize) as usize;
+            st.pend = Some(p);
+            drop(g);
+            serial_println!("[settings] key tab={} stop={}/{} kind=seg verb=step pending={}/{}", TAB_NAMES[tab.min(TABS - 1)], k, n, p, a);
+            repaint();
+            return true;
+        }
+        let pend = st.pend.take();
+        (kind, a, if kind == K_SEG { pend.unwrap_or(b) } else { b }, h, k, n)
+    };
+    let (x, y, w, hh) = (h[0] as usize, h[1] as usize, h[2] as usize, h[3] as usize);
+    let cy = y + hh / 2;
+    let (cx, verb) = match (kind, d) {
+        (K_SEG, _) => { let sw = w / a.max(1); (x + b.min(a.saturating_sub(1)) * sw + sw / 2, "choose") }
+        (K_SLIDER, 0) => return true,
+        (K_SLIDER, _) => {
+            let (pos, max) = (a, b.max(1));
+            let np = (pos as isize + d * (max / 16).max(1) as isize).clamp(0, max as isize) as usize;
+            (x + np * w / max, "step")
+        }
+        (_, 0) => (x + w / 2, "press"),
+        _ => return false,
+    };
+    serial_println!("[settings] key tab={} stop={}/{} kind={} verb={} at={},{}", TAB_NAMES[tab.min(TABS - 1)], k, n, K_NAMES[(kind as usize).min(5)], verb, cx, cy);
+    press_at(cx, cy, true);
+    if kind == K_SLIDER && (DRAG.lock().is_some() || TPD.lock().is_some()) {
+        if let Some(info) = wm::info(WIN.load(Ordering::Relaxed)) {
+            super::capture::release((info.x + super::metrics::size(cx) * info.scale.max(1)) as i32, 0);
+        }
+    }
+    true
+}
+
+/// Hardware: a step past the shown lines scrolls the list one line (`true` = it moved).
+fn hw_key_scroll(down: bool) -> bool {
+    let n = crate::hw::last().map(|c| c.rows.len()).unwrap_or(0);
+    let cur = HW_TOP.load(Ordering::Relaxed);
+    let next = if down { (cur + 1).min(n.saturating_sub(hw_geom().3)) } else { cur.saturating_sub(1) };
+    HW_TOP.store(next, Ordering::Relaxed);
+    next != cur
 }
 
 /// The topmost recorded control under `p`.
@@ -627,6 +829,7 @@ fn btn_f(st: &mut State, r: usize, x: usize, t: &str, default: bool, focus: bool
 fn field(st: &mut State, r: usize, t: &str, focus: bool) {
     let (y, w) = (mid_y(r, FIELD_H), CTRL_R - TRACK_X);
     let c = cs(st, TRACK_X, y, w, FIELD_H, focus);
+    kmeta(st, K_FIELD, 0, 0); // PICKERKEYS (B768): typed into, never pressed by a key
     draw::text_field(&mut sf(st), e(TRACK_X), e(y), ew(TRACK_X, w), t.as_bytes(), c);
 }
 
@@ -636,6 +839,8 @@ fn slider(st: &mut State, r: usize, pos: usize, max: usize, focus: bool) {
     let kd = draw::DIMS.slider_knob;
     let y = mid_y(r, kd);
     let c = cs(st, TRACK_X, y, TRACK_W, kd, focus);
+    let (kp, km) = if max > 0xFFFF { (pos * 0xFFFF / max, 0xFFFF) } else { (pos, max) }; // PICKERKEYS (B768): the arrows' step (a raw backlight range scaled into the word)
+    kmeta(st, K_SLIDER, kp, km);
     let k = dp(kd);
     draw::slider(&mut sf(st), e(TRACK_X) - k / 2, e(y), ew(TRACK_X, TRACK_W) + k, pos as u32, max as u32, c);
 }
@@ -674,10 +879,15 @@ fn check(st: &mut State, r: usize, x: usize, on: bool) {
 
 /// The kit's segmented control over the track in row `r` (equal segments: the press map is `x / (TRACK_W / n)`);
 /// its thumb glides to segment `sel`.
+/// PICKERKEYS (B768): holding the keyboard, the thumb shows the PENDING segment (the arrows moved it; Space/Return
+/// chooses it); the committed one is what the press map and `meta` keep.
 fn seg(st: &mut State, r: usize, labels: &[&[u8]], sel: usize, focus: bool) {
     let h = draw::DIMS.seg_h;
     let y = mid_y(r, h);
+    let committed = sel;
+    let sel = if keyed_at(st, st.hits.len()) { st.pend.unwrap_or(sel) } else { sel };
     let c = cs(st, TRACK_X, y, TRACK_W, h, focus);
+    kmeta(st, K_SEG, labels.len(), committed);
     let (x0, w) = (e(TRACK_X), ew(TRACK_X, TRACK_W));
     let target = x0 + (w / labels.len().max(1) as i32) * sel.min(labels.len().saturating_sub(1)) as i32;
     let (now, tab) = (st.now, st.tab);
@@ -934,8 +1144,20 @@ fn paint_column(st: &mut State, tab: usize) {
 }
 
 fn paint(st: &mut State, v: &Values) {
+    paint_once(st, v);
+    // PICKERKEYS (B768): a press that changed the pane (a Delete's Yes/No, a page) can leave the stop past the last
+    // control: it lands on the last one and the pane is painted once more with its ring.
+    let n = st.hits.len().saturating_sub(st.pane0);
+    if st.kf != KF_NONE && n > 0 && st.kf >= n {
+        st.kf = n - 1;
+        st.sel = sel_of(st, n - 1);
+        paint_once(st, v);
+    }
+}
+
+fn paint_once(st: &mut State, v: &Values) {
     let w = st.w;
-    st.hits.clear();
+    st.hits.clear(); st.meta.clear(); st.pane0 = usize::MAX; st.cid = NO_ID; // PICKERKEYS (B768): the column's controls are not stops
     st.now = crate::arch::ms(); st.tab = (v.tab as usize).min(TABS - 1); // MOTIONKIT (B648): this frame's clock and tab, read once
     {
         let mut s = sf(st);
@@ -944,6 +1166,7 @@ fn paint(st: &mut State, v: &Values) {
     }
     let tab = (v.tab as usize).min(TABS - 1);
     paint_column(st, tab);
+    st.pane0 = st.hits.len(); // PICKERKEYS (B768): every control from here on is a pane stop
     // The pane's title band: the tab's name in the title face, bold (DESIGN-LANGUAGE §3.4: the pane title).
     let tf = super::text::Face::Title; // FONTSCRAFT (B640): the pane title in the title face (owed from the fold, A11YPANE)
     let tc = super::metrics::lcell_h(tf);
@@ -968,6 +1191,9 @@ fn paint(st: &mut State, v: &Values) {
     // SETTINGSFILES (B407, R98): the pane's file, as a link (the accent ink) that reveals `<home>/settings` in Quarry.
     if let Some((r, x, t)) = super::settingsfiles::footer(v.tab as usize, ROWS, CTRL_R, LABEL_X) {
         txt_ink(st, x, r, &t, theme::accent());
+        let lw = super::metrics::ladvance(t.as_bytes(), false, super::text::Face::Ui).clamp(1, CTRL_R.saturating_sub(x).max(1));
+        let lh = super::metrics::lcell_h(super::text::Face::Ui);
+        hit_line(st, x, row_top(r) + (ROW_H - lh) / 2, lw, lh, K_PRESS); // PICKERKEYS (B768): the link is a stop
     }
     st.hot = hit_at(&st.hits, st.ptr);
 }
@@ -975,41 +1201,39 @@ fn paint(st: &mut State, v: &Values) {
 fn paint_general(st: &mut State, v: &Values) {
     // BRIGHTFLOOR M5: Brightness moved to the Display tab. SETTINGSCRAFT: Sound · Desktop · Account · Dock, four boxes.
     groups(st, &[(0, 1), (2, 4), (5, 5), (6, 8)]); // SETTINGSMAP (B673): the Dock box holds the pins row (8)
-    let (k, sel) = (st.kbd && !st.strip, st.sel);
-    let fo = move |i: usize| k && sel == i;
+    // PICKERKEYS (B768): every control is a stop (`cs`); `st.cid` names the NAMES control a stop is, for the verbs
+    // General keeps (Left/Right adjust, Return activate, typing into the path).
     txt(st, LABEL_X, 0, "Volume");
-    slider(st, 0, v.vol as usize, 16, fo(1));
+    st.cid = 1; slider(st, 0, v.vol as usize, 16, false);
     txt2(st, VAL_X, 0, &alloc::format!("{}/16", v.vol));
     txt(st, LABEL_X, 1, "Mute");
-    tog(st, 1, TOG_X, v.mute, fo(2)); #[cfg(all(any(feature = "uvc", feature = "hda-tone"), not(all(target_arch = "x86_64", feature = "a2dp"))))] { let (a, b, k) = crate::audio::picker(); seg(st, 1, &[a.as_bytes(), b.as_bytes()], k, false); } #[cfg(all(any(feature = "uvc", feature = "hda-tone"), target_arch = "x86_64", feature = "a2dp"))] { let (l, k) = crate::audio::outputs(); let segs: Vec<&[u8]> = l.iter().map(|x| x.as_bytes()).collect(); seg(st, 1, &segs, k, false); } // A2DP (B739): HDA | USB | BT <device> while a headset is on a link (LINE-NEUTRAL append, code first). UAC1 (rmbp-ledger B706): the Sound box's output picker, HDA internal | USB <vid:pid>, in the Mute row's free track (LINE-NEUTRAL append, code first)
+    st.cid = 2; tog(st, 1, TOG_X, v.mute, false); #[cfg(all(any(feature = "uvc", feature = "hda-tone"), not(all(target_arch = "x86_64", feature = "a2dp"))))] { let (a, b, k) = crate::audio::picker(); seg(st, 1, &[a.as_bytes(), b.as_bytes()], k, false); } #[cfg(all(any(feature = "uvc", feature = "hda-tone"), target_arch = "x86_64", feature = "a2dp"))] { let (l, k) = crate::audio::outputs(); let segs: Vec<&[u8]> = l.iter().map(|x| x.as_bytes()).collect(); seg(st, 1, &segs, k, false); } // A2DP (B739): HDA | USB | BT <device> while a headset is on a link (LINE-NEUTRAL append, code first). UAC1 (rmbp-ledger B706): the Sound box's output picker, HDA internal | USB <vid:pid>, in the Mute row's free track (LINE-NEUTRAL append, code first)
     txt(st, LABEL_X, 2, "Pointer");
-    btn_f(st, 2, TRACK_X, "Trackpad", false, fo(4)); // TRACKPADPANE (B412): the R75 3-step became the Trackpad tab's speed slider
+    btn_f(st, 2, TRACK_X, "Trackpad", false, false); // TRACKPADPANE (B412): the R75 3-step became the Trackpad tab's speed slider
     txt2(st, TRACK_X + BTN_W + 12, 2, &alloc::format!("speed {}/10", TPV.lock().speed));
     txt(st, LABEL_X, 3, "Wallpaper");
     let (focus, wall) = (!st.strip && st.sel == 5, v.wall.clone());
-    field(st, 3, &wall, focus);
-    btn_f(st, 4, TRACK_X, "Apply", false, fo(6));
-    btn_f(st, 4, TRACK_X + BTN_W + 10, "Off", false, fo(7));
+    st.cid = 5; field(st, 3, &wall, focus);
+    st.cid = 6; btn_f(st, 4, TRACK_X, "Apply", false, false);
+    st.cid = 7; btn_f(st, 4, TRACK_X + BTN_W + 10, "Off", false, false);
     txt(st, LABEL_X, 5, "Account");
     let who = user_name().unwrap_or_else(|| String::from("(no session)"));
     txt2(st, TRACK_X, 5, &who);
-    btn_f(st, 5, VAL_X - 30, "Password", false, fo(8));
+    st.cid = 8; btn_f(st, 5, VAL_X - 30, "Password", false, false);
     paint_dock_rows(st); // NOTIFYPANE (B435): Do Not Disturb moved to the Notifications tab. DOCK2 (B394): rows 6/7 — the dock's edge and auto-hide
 }
 
 fn paint_display(st: &mut State, v: &Values) {
-    groups(st, &[(0, 1), (2, 2), (3, 3), (4, 7), (8, 8)]);
-    let (k, sel) = (st.kbd && !st.strip, st.sel);
-    let fo = move |i: usize| k && sel == i;
+    groups(st, &[(0, 1), (2, 2), (3, 3), (4, 7), (8, 8)]); // PICKERKEYS (B768): `st.cid` as on General
     // BRIGHTFLOOR M5: Brightness lives here (row 0) — where Peter looked for it on flight 19.
     txt(st, LABEL_X, 0, "Brightness");
     // BRIGHTSLIDER M2 (B377): the knob and the % are the REGISTER's (its last readback), never the window's copy.
     let (braw, bmax) = (crate::video::backlight::cur_raw(), crate::video::backlight::panel_range());
     PAINTED_RAW.store(braw, Ordering::Relaxed);
-    slider(st, 0, braw.min(bmax) as usize, bmax as usize, fo(0));
+    st.cid = 0; slider(st, 0, braw.min(bmax) as usize, bmax as usize, false);
     txt2(st, VAL_X, 0, &alloc::format!("{}%", crate::video::backlight::pct_of(braw, bmax)));
     txt(st, LABEL_X, 1, "Blank screen");
-    slider(st, 1, idle_index(v.idle_min), IDLE_STEPS.len() - 1, fo(3));
+    st.cid = 3; slider(st, 1, idle_index(v.idle_min), IDLE_STEPS.len() - 1, false);
     let it = if v.idle_min == 0 { String::from("never") } else { alloc::format!("{} min", v.idle_min) };
     txt2(st, VAL_X, 1, &it);
     txt(st, LABEL_X, 2, "Resolution"); // PREFSUI (R93): the popup of the modes the display path can set (was the read-only UI scale row)
@@ -1026,11 +1250,11 @@ fn paint_display(st: &mut State, v: &Values) {
     // second and every window repaints once); the faces drawing now and a sample line IN the UI face below.
     txt(st, LABEL_X, 4, "Font");
     let (fam, size) = (font_fam(), font_size());
-    seg(st, 4, &[FONT_FAMS[0].as_bytes(), FONT_FAMS[1].as_bytes(), FONT_FAMS[2].as_bytes()], fam, fo(9));
+    st.cid = 9; seg(st, 4, &[FONT_FAMS[0].as_bytes(), FONT_FAMS[1].as_bytes(), FONT_FAMS[2].as_bytes()], fam, false);
     txt2(st, VAL_X, 4, &super::text::face_name(super::text::Face::Ui));
     txt(st, LABEL_X, 5, "Font size");
-    btn_f(st, 5, TRACK_X, "-", false, fo(10));
-    btn_f(st, 5, TRACK_X + BTN_W + 10, "+", false, fo(10));
+    st.cid = 10; btn_f(st, 5, TRACK_X, "-", false, false);
+    st.cid = 10; btn_f(st, 5, TRACK_X + BTN_W + 10, "+", false, false);
     txt2(st, TRACK_X + 2 * BTN_W + 24, 5, &alloc::format!("{} px", size));
     txt(st, LABEL_X, 6, "Console");
     let (cw, chh) = super::text::grid_cell();
@@ -1324,6 +1548,7 @@ pub fn open() -> Result<(), String> {
     let mut st = State::new(w, h, surf, sel0, strip0, col_scrolled(0, tab0, TABS));
     LAST_PTR.store(u64::MAX, Ordering::Relaxed); // SETTINGSCRAFT: the hover pass reads the pointer afresh over the new window
     paint(&mut st, &CUR.lock().clone());
+    if !strip0 { if let Some(k) = stop_of_ctrl(&st, sel0) { st.kf = k; } } // PICKERKEYS (B768): a launcher pick's control holds the stop
     let base = st.surf.as_ptr() as usize;
     let id = wm::create_at_native(OWNER, base, len * 4, sw as u32, sh as u32, (sw * 4) as u32, b"Settings", ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE { return Err(String::from("window create failed")); }
@@ -1366,6 +1591,7 @@ fn switch_tab(t: usize) {
         st.strip = true;
         st.modes_open = false;
         st.found = None;
+        st.kf = 0; st.pend = None; // PICKERKEYS (B768): the new pane's first stop
         if let Some(&c) = tab_ctrls(t).first() { st.sel = c; }
         let (list, n) = col_list(&st.query); // SETTINGSCRAFT: the chosen row is kept in view of the (filtered) column
         if let Some(p) = list[..n].iter().position(|&k| k as usize == t) { st.col_top = col_scrolled(st.col_top, p, n); }
@@ -1521,55 +1747,39 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
     let (s, strip) = STATE.lock().as_ref().map(|x| (x.sel, x.strip)).unwrap_or((0, true));
     let tab = cur_tab();
     let form = tab == 1 && STATE.lock().as_ref().map(|x| x.u.form).unwrap_or(false);
-    let ctrls = tab_ctrls(tab);
     let horiz = !strip && ((tab == 0 && matches!(s, 1 | 2 | 4)) || (tab == 2 && matches!(s, 0 | 3 | 9 | 10))); // BRIGHTFLOOR M5: Brightness adjusts on the Display tab; KERNELFONT2: the Font picker
+    // PICKERKEYS (B768): the pane's keys walk its stops (`walk`) and act on the one holding the keyboard (`key_act`);
+    // General/Display's NAMES controls keep their verbs through `sel`, which follows the stop.
     match ev {
         crate::pal::Event::Action(Action::CursorLeft) | crate::pal::Event::Action(Action::CursorRight) => {
             let d: isize = if matches!(ev, crate::pal::Event::Action(Action::CursorLeft)) { -1 } else { 1 };
             if form { return true; }
-            if horiz { adjust(s, d); } else { switch_tab((tab as isize + d).clamp(0, TABS as isize - 1) as usize); }
+            if horiz { adjust(s, d); } else if strip || !key_act(tab, d) { switch_tab((tab as isize + d).clamp(0, TABS as isize - 1) as usize); }
             true
         }
         crate::pal::Event::Key(c) => {
             if form {
-                return users_form_key(c);
+                // The Users form: the walk wraps over its fields and buttons; Return/Space on a button presses it, any
+                // other key is the field's (`users_form_key`: typing, Backspace, Return to the next field, Escape).
+                let on_btn = STATE.lock().as_ref().is_some_and(|x| !x.strip && x.kf >= 3);
+                return match c {
+                    0x09 | 0x1F => { walk(tab, true); true }
+                    0x1E => { walk(tab, false); true }
+                    0x0A | 0x0D | 0x20 if on_btn => { key_act(tab, 0); true }
+                    _ => users_form_key(c),
+                };
             }
             match c {
                 0x1C | 0x1D => true,
-                0x1E => {
-                    // Up: previous control; from the first one, the tab column. SETTINGSTABS: on the column, the previous tab.
-                    if strip {
-                        strip_step(tab, false);
-                    } else if tab == 1 {
-                        let mut g = STATE.lock();
-                        if let Some(x) = g.as_mut() { if x.strip { } else if x.u.sel > 0 { x.u.sel -= 1; } else { x.strip = true; } }
-                        drop(g);
-                        repaint();
-                    } else {
-                        let p = ctrls.iter().position(|&k| k == s).unwrap_or(0);
-                        if p == 0 { if let Some(x) = STATE.lock().as_mut() { x.strip = true; } repaint(); } else { select(ctrls[p - 1]); }
-                    }
-                    true
-                }
+                0x1E => { if strip { strip_step(tab, false); } else { walk(tab, false); } true } // Up: previous stop; from the first, the column
                 0x1F if strip => { strip_step(tab, true); true } // SETTINGSTABS: Down on the column, the next tab (SETTINGSCRAFT: of those the search lists)
-                0x09 if !strip => { if let Some(x) = STATE.lock().as_mut() { x.strip = true; } repaint(); true } // SETTINGSTABS: Tab, pane -> column
-                0x1F | 0x09 => {
-                    if tab == 1 {
-                        let n = user_list().len();
-                        if let Some(x) = STATE.lock().as_mut() { if x.strip { x.strip = false; } else if x.u.sel + 1 < n { x.u.sel += 1; } }
-                        repaint();
-                    } else if strip { if let Some(&f) = ctrls.first() { select(f); } else { repaint(); } }
-                    else {
-                        let p = ctrls.iter().position(|&k| k == s).unwrap_or(0);
-                        select(ctrls[if p + 1 >= ctrls.len() { 0 } else { p + 1 }]);
-                    }
-                    true
-                }
-                0x0A | 0x0D if tab == 1 && !strip => { users_key_enter(); true }
-                0x0A | 0x0D if tab == 0 && !strip => { activate(s); true }
+                0x09 if !strip => { if let Some(x) = STATE.lock().as_mut() { x.strip = true; x.pend = None; } repaint(); true } // SETTINGSTABS: Tab, pane -> column
+                0x1F | 0x09 => { walk(tab, true); true } // Tab from the column: the first stop; Down in the pane: the next
+                0x1B if tab == 2 && STATE.lock().as_ref().is_some_and(|x| x.modes_open) => { if let Some(x) = STATE.lock().as_mut() { x.modes_open = false; } repaint(); true } // PICKERKEYS: Escape closes the Resolution popup
                 0x1B if tab == 1 => { if let Some(x) = STATE.lock().as_mut() { x.u.confirm = None; } repaint(); true }
+                0x1B if !strip && STATE.lock().as_ref().is_some_and(|x| x.pend.is_some()) => { if let Some(x) = STATE.lock().as_mut() { x.pend = None; } repaint(); true } // PICKERKEYS: Escape drops a pending segment
                 b'a' if tab == 1 && !strip && is_root() => {
-                    if let Some(x) = STATE.lock().as_mut() { x.u = UsersUi::new(); x.u.form = true; }
+                    if let Some(x) = STATE.lock().as_mut() { x.u = UsersUi::new(); x.u.form = true; x.kf = 0; }
                     repaint();
                     true
                 }
@@ -1580,6 +1790,8 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                     repaint();
                     true
                 }
+                0x0A | 0x0D if tab == 0 && !strip && matches!(s, 2 | 6 | 7 | 8) => { activate(s); true }
+                0x0A | 0x0D | 0x20 if !strip => { if !key_act(tab, 0) && tab == 1 { users_key_enter(); } true } // PICKERKEYS: Space/Return chooses the stop
                 _ => false,
             }
         }
@@ -1673,6 +1885,7 @@ fn users_form_key(c: u8) -> bool {
             }
             _ => {}
         }
+        if !u.form { x.kf = 0; } else if x.kf < 3 { x.kf = x.u.focus as usize; } // PICKERKEYS (B768): the stop follows the field
     }
     if submit { users_form_submit(); } else { repaint(); }
     true
@@ -1698,11 +1911,32 @@ pub fn press_route(x: i32, y: i32) -> bool {
     let lw = super::metrics::to_logical(info.w);
     if cx >= lw || cy >= super::metrics::to_logical(info.h) { return false; } if wm::scroll_press(id, (x as usize - info.x) / sc, (y as usize - info.y) / sc) { return true; } // SCROLLVIEW (B764): the Hardware list's gutter (page, thumb drag) is wm's
     wm::focus_changed(OWNER);
+    press_at(cx, cy, false)
+}
+
+/// The press at the window's logical `(cx, cy)`: the pointer's (`key` false) or a key's on its stop (`key` true,
+/// PICKERKEYS B768 — the ring stays, the stop is the key's). A pointer press puts the keyboard stop on the control
+/// under it; after the action `sel` is read back from the stop, so a row handler's `select` never leaves an arrow
+/// key adjusting a control the stop is not.
+fn press_at(cx: usize, cy: usize, key: bool) -> bool {
+    let synced = {
+        let mut g = STATE.lock();
+        let Some(s) = g.as_mut() else { return true };
+        let hit = hit_at(&s.hits, Some((cx, cy))).filter(|&i| s.pane0 != usize::MAX && i >= s.pane0);
+        if !key { if let Some(i) = hit { s.kf = i - s.pane0; s.pend = None; } }
+        key || hit.is_some()
+    };
+    let r = press_dispatch(cx, cy, key);
+    if synced { if let Some(s) = STATE.lock().as_mut() { if !s.strip { s.sel = sel_of(s, s.kf); } } }
+    r
+}
+
+fn press_dispatch(cx: usize, cy: usize, key: bool) -> bool {
     // SETTINGSCRAFT: the press shows its control's pressed face for PRESS_MS (the action's own repaint draws it); a
     // press anywhere but the search field takes the keys back from it; the focus ring hides until the next key.
     let in_search = cx >= SEARCH_X && cx < SEARCH_X + SEARCH_W && cy >= SEARCH_Y && cy < SEARCH_Y + SEARCH_H;
     let (top, query) = match STATE.lock().as_mut() {
-        Some(s) => { s.press = Some((cx, cy, crate::arch::ms().max(1))); s.kbd = false; s.search = in_search; s.found = None; (s.col_top, s.query.clone()) }
+        Some(s) => { s.press = Some((cx, cy, crate::arch::ms().max(1))); s.kbd = key; s.search = in_search; s.found = None; (s.col_top, s.query.clone()) }
         None => return true,
     };
     if cx < COL_W { // SETTINGSTABS (B623): a press in the column selects by row
@@ -1779,7 +2013,7 @@ fn press_users(row: usize, cx: usize) {
     }
     if row == 0 {
         if is_root() && in_b(TRACK_X) {
-            if let Some(s) = STATE.lock().as_mut() { s.u = UsersUi::new(); s.u.form = true; s.strip = false; }
+            if let Some(s) = STATE.lock().as_mut() { s.u = UsersUi::new(); s.u.form = true; s.strip = false; s.kf = 0; }
             repaint();
         }
         return;
@@ -2455,6 +2689,8 @@ fn mode_list(st: &mut State) {
     for (k, m) in ms.iter().enumerate().take(n) {
         let ry = row_top(3 + k);
         let c = cs(st, x, ry, w, ROW_H, false);
+        kmeta(st, K_ENTRY, 0, 0);
+        if c.focused { ring_box(st, x + 6, ry + 6, w - 12, ROW_H - 12); } // PICKERKEYS (B768): the entry holding the keyboard
         let on = k == cur;
         if on || c.hover {
             let (px, py) = (x + 6, ry + 6);
@@ -2596,6 +2832,7 @@ fn swatch(st: &mut State, r: usize, k: usize, c: u32, on: bool) {
     let mut s = sf(st);
     let rad = ew(x, SW) / 2;
     let (cx, cy) = (e(x) + rad, e(y) + rad);
+    if state.focused { let rw = dp(draw::DIMS.focus_ring); draw::stroke_circle(&mut s, cx, cy, rad + dp(3) + rw, rw, Ink::argb(theme::focus_ring())); } // PICKERKEYS (B768): the swatch holding the keyboard
     if on {
         draw::stroke_circle(&mut s, cx, cy, rad + dp(3), dp(2).max(1), theme::text_primary());
     } else if state.hover {
@@ -3022,7 +3259,8 @@ fn paint_filetypes(st: &mut State) {
         let row = 1 + k;
         // A type's row is one press target (it hands the type to its next app): it lights under the pointer.
         let c = cs(st, BOX_X, row_top(row), BOX_W, ROW_H, false);
-        if c.hover || c.pressed { row_wash(st, row); }
+        if c.hover || c.pressed || c.focused { row_wash(st, row); }
+        if c.focused { row_ring(st, row); } // PICKERKEYS (B768): the type row holding the keyboard
         let t = 20;
         tab_icon(&mut sf(st), FT_TAB, e(LABEL_X), e(mid_y(row, t)), ew(LABEL_X, t), None);
         let app = if r.preferred.is_empty() { String::from("(no app)") } else { r.preferred_name.clone() };
@@ -3755,9 +3993,11 @@ fn open_hit(h: Hit, typed: usize) {
     let r = MAP[i];
     if r.tab < TABS && r.tab != cur_tab() { switch_tab(r.tab); }
     if let Some(st) = STATE.lock().as_mut() {
-        let keyed = r.tab < TABS && tab_ctrls(r.tab).contains(&r.ctrl);
-        st.strip = !keyed;
-        if keyed { st.sel = r.ctrl; }
+        // PICKERKEYS (B768): the row's control takes the keyboard stop (its NAMES control when it has one, else the
+        // first control painted in the row); a row with no control leaves the keyboard on the column.
+        let k = if r.tab < TABS { stop_in_row(st, r.row, r.ctrl) } else { None };
+        st.strip = true;
+        if let Some(k) = k { stop_set(st, r.tab, k); }
         st.found = (r.tab < TABS).then_some((r.tab as u8, r.row as u8));
     }
     let tn = if r.tab < TABS { TAB_NAMES[r.tab] } else { "column" };
@@ -3867,10 +4107,10 @@ pub fn selftest_map() {
                 for b in q.bytes() { search_key(crate::pal::Event::Key(b)); }
                 search_key(crate::pal::Event::Key(0x0D));
                 let r = MAP[*i];
-                let (found, strip, sel) = STATE.lock().as_ref().map_or((None, true, usize::MAX), |x| (x.found, x.strip, x.sel));
+                let (found, strip, sel, stop) = STATE.lock().as_ref().map_or((None, true, usize::MAX, false), |x| (x.found, x.strip, x.sel, match stop_in_row(x, r.row, r.ctrl) { Some(k) => !x.strip && x.kf == k, None => x.strip })); // PICKERKEYS (B768): the row's control holds the stop
                 let ok = if r.tab < TABS {
-                    cur_tab() == r.tab && found == Some((r.tab as u8, r.row as u8))
-                        && (if tab_ctrls(r.tab).contains(&r.ctrl) { !strip && sel == r.ctrl } else { strip })
+                    cur_tab() == r.tab && found == Some((r.tab as u8, r.row as u8)) && stop
+                        && (!tab_ctrls(r.tab).contains(&r.ctrl) || (!strip && sel == r.ctrl))
                 } else {
                     strip && found.is_none() && cur_tab() == tab0
                 };
@@ -3884,11 +4124,66 @@ pub fn selftest_map() {
         }
         _ => "bad",
     };
-    let ok = unrowed == 0 && orphans == 0 && same && search.starts_with("ok(") && live != "bad";
+    let (rung, stops_all) = keys_probe(); // PICKERKEYS (B768): every control a keyboard stop with its ring
+    let ok = unrowed == 0 && orphans == 0 && same && search.starts_with("ok(") && live != "bad" && stops_all > 0 && rung == stops_all;
     serial_println!(
-        ":: SETTINGSMAP: keys={} rows={} orphans={} unrowed={} search={} -> {} :: live={} owners_same={}",
-        keys, MAP.len(), orphans, unrowed, search, if ok { "PASS" } else { "FAIL" }, live, same as u8
+        ":: SETTINGSMAP: keys={} rows={} orphans={} unrowed={} search={} -> {} :: live={} owners_same={} keys={}/{}",
+        keys, MAP.len(), orphans, unrowed, search, if ok { "PASS" } else { "FAIL" }, live, same as u8, rung, stops_all
     );
+}
+
+/// PICKERKEYS (rmbp-ledger B768) — `tests settingsmap`'s `keys=<rung>/<total>`: every tab painted OFFSCREEN with the
+/// keyboard in the pane and no stop (the rest), then once per stop; `total` = the pane's controls summed over the tabs
+/// (every press target `cs` recorded), and a stop is RUNG when, around ITS control's rect (grown by the ring and half
+/// a knob), pixels of the ring's colour (`theme::focus_ring`, +-3 a channel) changed from the rest. Equal = every
+/// control is reached by the keyboard and shows it. A fresh `State` per paint (no glide carries); one surface pair.
+pub fn keys_probe() -> (usize, usize) {
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let (mut a, mut b): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    if a.try_reserve_exact(pw * ph).is_err() || b.try_reserve_exact(pw * ph).is_err() { return (0, 0); }
+    a.resize(pw * ph, 0);
+    b.resize(pw * ph, 0);
+    let v0 = CUR.lock().clone();
+    let paint_one = |buf: Vec<u32>, tab: usize, kf: usize| -> (Vec<u32>, Vec<[u16; 4]>, usize) {
+        let mut st = State::new(WIN_W, WIN_H, buf, 1, false, 0);
+        st.kbd = true;
+        st.kf = kf;
+        let mut v = v0.clone();
+        v.tab = tab as u8;
+        paint(&mut st, &v);
+        let p0 = st.pane0.min(st.hits.len());
+        (core::mem::take(&mut st.surf), core::mem::take(&mut st.hits), p0)
+    };
+    let ring = theme::focus_ring() & 0x00FF_FFFF;
+    let near = |p: u32| (0..3).all(|k| ((p >> (8 * k)) & 0xFF).abs_diff((ring >> (8 * k)) & 0xFF) <= 3);
+    let pad = draw::DIMS.focus_ring + draw::DIMS.slider_knob / 2 + 4;
+    let (mut rung, mut total) = (0usize, 0usize);
+    let mut miss: Option<(usize, usize)> = None;
+    for tab in 0..TABS {
+        let (bb, hits, p0) = paint_one(b, tab, KF_NONE);
+        b = bb;
+        let n = hits.len() - p0;
+        total += n;
+        for k in 0..n {
+            let (aa, hk, p0k) = paint_one(a, tab, k);
+            a = aa;
+            let Some(h) = hk.get(p0k + k) else { continue };
+            let (x, y, w, hh) = (h[0] as usize, h[1] as usize, h[2] as usize, h[3] as usize);
+            let (x0, y0) = (e(x.saturating_sub(pad)).max(0) as usize, e(y.saturating_sub(pad)).max(0) as usize);
+            let (x1, y1) = ((e(x + w + pad).max(0) as usize).min(pw), (e(y + hh + pad).max(0) as usize).min(ph));
+            let mut px = 0usize;
+            for yy in y0..y1 {
+                for xx in x0..x1 {
+                    let i = yy * pw + xx;
+                    if (a[i] & 0x00FF_FFFF) != (b[i] & 0x00FF_FFFF) && near(a[i]) { px += 1; }
+                }
+            }
+            if px >= 4 { rung += 1; } else if miss.is_none() { miss = Some((tab, k)); }
+        }
+    }
+    if let Some((t, k)) = miss { serial_println!("[settings] keys miss tab={} stop={}", TAB_NAMES[t], k); }
+    serial_println!("[settings] keys tabs={} stops={} rung={}", TABS, total, rung);
+    (rung, total)
 }
 
 // ── A11YTREE (rmbp-ledger B675; BP-bar-22: "Tab through Settings shows a ≥ 2 px ring at every stop") ──────────────
@@ -3906,8 +4201,8 @@ fn row_ring(st: &mut State, r: usize) {
     draw::stroke_rrect(&mut sf(st), rr.inset(-w), dp(draw::DIMS.row_radius) + w, w, Ink::argb(theme::focus_ring()));
 }
 
-/// `tests a11ytree`'s ring leg. Every stop Tab reaches — on each tab the column (stop 0), then the pane's keyboard
-/// controls (`tab_ctrls`) or, on Users, each listed row — is painted OFFSCREEN holding the keyboard (`kbd`), and the
+/// `tests a11ytree`'s ring leg. Every stop Tab reaches — on each tab the column (stop 0), then every pane control
+/// (PICKERKEYS B768: the pane's stops, `hits[pane0..]`) — is painted OFFSCREEN holding the keyboard (`kbd`), and the
 /// same tab is painted at rest (focus on the column, no key pressed). The ring is read from the difference: in the
 /// first changed run of its top row, at the run's middle, the changed pixels downward that are the ring's colour (one
 /// anti-aliased pixel skipped at the top). Returns `(stops, rung, ring_px, first stop without a ring as (tab, stop))`,
@@ -3923,29 +4218,30 @@ pub fn ring_probe() -> (usize, usize, usize, Option<(usize, usize)>) {
     a.resize(pw * ph, 0);
     b.resize(pw * ph, 0);
     let v0 = CUR.lock().clone();
-    let users = user_list().len().min(8);
-    let paint_one = |buf: Vec<u32>, tab: usize, stop: Option<usize>| -> Vec<u32> {
+    // PICKERKEYS (B768): each paint also returns the pane's stops (the rest paint's count is the tab's)
+    let paint_one = |buf: Vec<u32>, tab: usize, stop: Option<usize>| -> (Vec<u32>, usize) {
         let mut st = State::new(WIN_W, WIN_H, buf, 1, true, 0);
         if let Some(k) = stop {
             st.kbd = true;
             if k > 0 {
                 st.strip = false;
-                if tab == 1 { st.u.sel = k - 1; } else { st.sel = tab_ctrls(tab)[k - 1]; }
+                st.kf = k - 1;
             }
         }
         let mut v = v0.clone();
         v.tab = tab as u8;
         paint(&mut st, &v);
-        core::mem::take(&mut st.surf)
+        (core::mem::take(&mut st.surf), stops(&st).1)
     };
     let ring = theme::focus_ring() & 0x00FF_FFFF;
     let near = |p: u32| (0..3).all(|k| ((p >> (8 * k)) & 0xFF).abs_diff((ring >> (8 * k)) & 0xFF) <= 3);
     let (mut stops, mut rung, mut thin, mut fail) = (0usize, 0usize, usize::MAX, None);
     for tab in 0..TABS {
-        b = paint_one(b, tab, None);
-        let n = 1 + if tab == 1 { users } else { tab_ctrls(tab).len() };
+        let (bb, n_pane) = paint_one(b, tab, None);
+        b = bb;
+        let n = 1 + n_pane;
         for k in 0..n {
-            a = paint_one(a, tab, Some(k));
+            a = paint_one(a, tab, Some(k)).0;
             stops += 1;
             let ch = |i: usize| (a[i] & 0x00FF_FFFF) != (b[i] & 0x00FF_FFFF);
             let px = match (0..pw * ph).find(|&i| ch(i)) {
@@ -4507,7 +4803,9 @@ fn paint_hardware(st: &mut State) {
     HW_N.store(n, Ordering::Relaxed);
     let _ = (bot, face);
     for (k, r) in c.rows.iter().enumerate().skip(first).take(vis) {
-        hw_line(st, r, top + 8 + (k - first) * lh); // SCROLLVIEW (B764): one line painter for the full paint and the strip; the bar is wm's
+        let y = top + 8 + (k - first) * lh;
+        hit_line(st, BOX_X + GAP, y.saturating_sub(4), BOX_W - 2 * GAP, lh, K_LINE); // PICKERKEYS (B768): a line is a stop; its centre resolves to it in `hw_line_at`
+        hw_line(st, r, y); // SCROLLVIEW (B764): one line painter for the full paint and the strip; the bar is wm's
     }
 }
 
