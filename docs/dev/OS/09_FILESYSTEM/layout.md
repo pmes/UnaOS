@@ -525,8 +525,15 @@ Stays in the **volume root**, in three groups:
    `fs::vfs::el0_locate`, a relative name starting at the session's home, `..` refused; x86 opens a root
    leaf (the staged set and the U10 created names) and walks a path only under the `irqstorage` feature,
    which `unaos/scripts/image-line.env` does not arm. On x86, then, moving them is still a syscall-ABI
-   change, not a layout change; whether the aarch64 fixtures would find them under `APPS/` now:
-   unverified. See §5.2.
+   change, not a layout change. On aarch64 (read, PIHOME LEDGER SR176, at 9a1134d7) they would not be found
+   under `APPS/`: of the four, only `HELLO.BIN` is a name EL0 opens (U6b's `.ascii "HELLO.BIN"`,
+   `arch/aarch64/syscall.rs:1615-1619`, `:1673`; `K2OWN.BIN`/`K2IMP.BIN` open `K2PRIV.BIN`), and `open_locate`
+   → `el0_locate` starts a bare leaf at the session's FAT home or, with none, the volume root
+   (`fs/vfs.rs:3250-3274`, `:3313`) and never looks in `APPS/` — only the loader does (`find_app` then
+   `find_in_root`, `arch/aarch64/syscall.rs:7634-7637`). The walk would reach `APPS/HELLO.BIN` if the fixture
+   spelled that path, so on aarch64 the move is a fixture-name change, not a syscall-ABI change; the staging
+   keeps all four in the root (`unaos/arroyo:12636-12648` kernel8, `:10659-10661` esp-jetson). Whether the
+   other three's readers would find them under `APPS/`: not read. See §5.2.
 
 ### 2.2 How a program is reached
 
@@ -604,7 +611,10 @@ owner/grants rows like any private create. What EL0 reaches by name is `docs/dev
 aarch64 `sys_open` walks a relative path from the session's home on the EL0 FAT volume (DIRNS, LEDGER
 SO20); x86 `sys_open` opens a root leaf (a path only under `irqstorage`); `SYS_STAT`, `SYS_ATTR_*`,
 `SYS_PATH_READ/WRITE` and `SYS_SPAWN_PATH` take an absolute path through the mount table. Which aarch64
-image lines arm `unafs` (and so a native home on a Pi): unverified.
+image lines arm `unafs` (read, PIHOME LEDGER SR176): none — `image-line-pi.env` and `image-line-orin.env` carry
+no `UNAOS_UNAFS`, so the Pi and the Orin, which bind a native UnaFS `/`, make the home as FAT `HOME/<NAME>`
+(`ensure_home`'s native arm is `cfg(feature = "unafs")`); the per-line table is
+`docs/dev/blueprint/storage.md` §2.1 and the fix is owed there (§5).
 
 ## 3. Nothing empty was created
 
