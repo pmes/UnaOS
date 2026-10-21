@@ -15,6 +15,7 @@
 //!   insecure mode exists; the key crosses the wire only on a verified connection (`vein_core::prefs::plan`).
 //! * [`heap`] — the size-class `#[global_allocator]` over SYS_SBRK that a TLS-linking program declares.
 //! * `provider` (feature `cryptocore`) — CRYPTOCORE's provider, seeded from SYS_GETRANDOM.
+//! * [`bus`] (DROPLOOPS SR179) — the program's bus client: its ONE mailbox keep and [`bus::ask`] over `una_abi::bus_ask`.
 //! * [`prefs`] — Principia reads (BUS_VERB_PREF_GET) and the whole Vein configuration in one call.
 //! * [`files`] (LUMENUX B348) — whole-file read / create / append over SYS_PATH_* or home-relative SYS_OPEN.
 //! * [`holocron`] (HOLOCRON2 B355) — the key from Holocron first (SecretGet over the bus, `keysource::decide`).
@@ -24,6 +25,7 @@
 
 extern crate alloc;
 
+pub mod bus; // DROPLOOPS (SR179): the program's ONE mailbox keep and bus::ask (BP-ring3-19)
 pub mod clock;
 pub mod drop; // DRAGDROP2 (B470): the ring-3 drop protocol's client (BUS_VERB_DROP_GET)
 pub mod heap;

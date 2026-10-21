@@ -3,61 +3,18 @@
 //
 //! Principia reads over the bus: BUS_VERB_PREF_GET `<ns>.<key>` → the TOML scalar literal (fulfilled
 //! in-kernel by PREFS over the ONE store, `<home>/.config/unaos/preferences.toml`). Synchronous: one
-//! request, then block for its reply. The caller must not have another reader on its mailbox.
+//! request, then block for its reply (`crate::bus::ask`: a frame met first is kept for the program's reader).
 
-use crate::sys::sys;
-use una_abi::{BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY, BUS_KIND_REQUEST, BUS_MAGIC, BUS_VERB_PREF_GET, BUS_VERSION, SYS_MRECV, SYS_MSEND};
+use una_abi::{BUS_VERB_PREF_DECLARE, BUS_VERB_PREF_GET};
 use vein_core::prefs::{self as rules, Endpoint, KeyState, Plan, ProviderPref, Verify};
 
-static mut TX: [u8; BUS_HDR_LEN + 128] = [0; BUS_HDR_LEN + 128];
-static mut RX: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
-static mut CORR: u32 = 0x5645_0000;
-
 /// One preference into `out` (the raw literal, quotes included). `Ok(None)` = unset; `Err` = the bus refused.
+/// DROPLOOPS (SR179): one ask through `crate::bus::ask` (`una_abi::bus_ask`): a frame met before the reply is kept.
 pub fn get(key: &str, out: &mut [u8]) -> Result<Option<usize>, i64> {
-    let (tx, rx) = unsafe { (&mut *core::ptr::addr_of_mut!(TX), &mut *core::ptr::addr_of_mut!(RX)) };
-    let k = key.as_bytes();
-    if k.len() > tx.len() - BUS_HDR_LEN {
-        return Err(una_abi::EINVAL);
+    match crate::bus::ask(BUS_VERB_PREF_GET, key.as_bytes(), out) {
+        Err(una_abi::ENOENT) => Ok(None),
+        r => r.map(Some),
     }
-    let corr = unsafe {
-        CORR = CORR.wrapping_add(1);
-        CORR
-    };
-    tx[..BUS_HDR_LEN].fill(0);
-    tx[0..4].copy_from_slice(&BUS_MAGIC);
-    tx[4] = BUS_VERSION;
-    tx[5] = BUS_KIND_REQUEST;
-    tx[6] = BUS_VERB_PREF_GET;
-    tx[8..12].copy_from_slice(&corr.to_le_bytes());
-    tx[48..52].copy_from_slice(&(k.len() as u32).to_le_bytes());
-    tx[BUS_HDR_LEN..BUS_HDR_LEN + k.len()].copy_from_slice(k);
-    let s = sys(SYS_MSEND, tx.as_ptr() as u64, (BUS_HDR_LEN + k.len()) as u64, 0, 0);
-    if s != 0 {
-        return Err(s);
-    }
-    for _ in 0..8 {
-        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, 0, 0);
-        if n < 0 {
-            return Err(n);
-        }
-        let n = n as usize;
-        if n < BUS_HDR_LEN || rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY || rx[8..12] != corr.to_le_bytes() {
-            continue; // a stale frame: not ours
-        }
-        let status = i32::from_le_bytes([rx[12], rx[13], rx[14], rx[15]]) as i64;
-        if status == una_abi::ENOENT {
-            return Ok(None);
-        }
-        if status != 0 {
-            return Err(status);
-        }
-        let blen = (u32::from_le_bytes([rx[48], rx[49], rx[50], rx[51]]) as usize).min(n - BUS_HDR_LEN);
-        let m = blen.min(out.len());
-        out[..m].copy_from_slice(&rx[BUS_HDR_LEN..BUS_HDR_LEN + m]);
-        return Ok(Some(m));
-    }
-    Err(una_abi::EIO)
 }
 
 /// The `vein` namespace, read once.
@@ -141,8 +98,6 @@ impl Config {
 
 // ── SETTINGSFILES (rmbp-ledger B407, R98): a program's own settings stanza ─────────────────────────────
 
-static mut DTX: [u8; BUS_HDR_LEN + 512] = [0; BUS_HDR_LEN + 512];
-
 /// Lumen's stanza (`app.lumen.*`, stored in `<home>/settings/lumen`): the window frame MACPARITY row 12
 /// (WINMEMORY) remembers per app. The body is `prefs_core::declare::body`'s shape, spelled as bytes.
 pub const LUMEN_STANZA: &[u8] = b"lumen\0window.frame\tstr:32\t\"\"\tLumen's window frame as x,y,w,h in logical px; empty = centred (MACPARITY row 12)\n";
@@ -150,37 +105,5 @@ pub const LUMEN_STANZA: &[u8] = b"lumen\0window.frame\tstr:32\t\"\"\tLumen's win
 /// PrefDeclare: declare this program's stanza ONCE (`<name>` NUL `<key>\t<spec>\t<default>\t<doc>` lines).
 /// `Ok(())` = held by Principia for the session; `Err` = the bus refused (an older kernel: -EINVAL).
 pub fn declare(body: &[u8]) -> Result<(), i64> {
-    let (tx, rx) = unsafe { (&mut *core::ptr::addr_of_mut!(DTX), &mut *core::ptr::addr_of_mut!(RX)) };
-    if body.len() > tx.len() - BUS_HDR_LEN {
-        return Err(una_abi::EINVAL);
-    }
-    let corr = unsafe {
-        CORR = CORR.wrapping_add(1);
-        CORR
-    };
-    tx[..BUS_HDR_LEN].fill(0);
-    tx[0..4].copy_from_slice(&BUS_MAGIC);
-    tx[4] = BUS_VERSION;
-    tx[5] = BUS_KIND_REQUEST;
-    tx[6] = una_abi::BUS_VERB_PREF_DECLARE;
-    tx[8..12].copy_from_slice(&corr.to_le_bytes());
-    tx[48..52].copy_from_slice(&(body.len() as u32).to_le_bytes());
-    tx[BUS_HDR_LEN..BUS_HDR_LEN + body.len()].copy_from_slice(body);
-    let s = sys(SYS_MSEND, tx.as_ptr() as u64, (BUS_HDR_LEN + body.len()) as u64, 0, 0);
-    if s != 0 {
-        return Err(s);
-    }
-    for _ in 0..8 {
-        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, 0, 0);
-        if n < 0 {
-            return Err(n);
-        }
-        let n = n as usize;
-        if n < BUS_HDR_LEN || rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY || rx[8..12] != corr.to_le_bytes() {
-            continue;
-        }
-        let status = i32::from_le_bytes([rx[12], rx[13], rx[14], rx[15]]) as i64;
-        return if status == 0 { Ok(()) } else { Err(status) };
-    }
-    Err(una_abi::EIO)
+    crate::bus::ask(BUS_VERB_PREF_DECLARE, body, &mut []).map(|_| ())
 }

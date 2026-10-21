@@ -16,14 +16,17 @@
 // WHEN. [`load`] once at start; [`due`] from the frame loop, then [`load`] again. Ring-3 delivery of PrefChanged (verb 19) is OWED
 // (kernel `prefs_client.rs` header: "Ring-3 delivery of verb 19 … is OWED"), and SYS_MRECV blocks on an empty
 // mailbox, so a program cannot wait for it beside its input ring: [`due`] answers every [`POLL_MS`] instead, and a
-// PrefChanged frame met in the mailbox while a reply is awaited (kind REPLY, verb 19, corr 0) re-reads at once. A
+// PrefChanged frame met in the mailbox while a reply is awaited (kind REPLY, verb 19, corr 0) is KEPT by `bus::ask`
+// (DROPLOOPS SR179) and re-reads at the next [`due`], whose drain reads the kept frames first. A
 // re-read that moves the look answers `true` and the caller repaints everything.
 
 use una_abi::{
-    BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY, BUS_KIND_REQUEST, BUS_MAGIC, BUS_VERB_PREF_CHANGED, BUS_VERB_PREF_GET,
-    BUS_VERSION, SYS_MRECV, SYS_MSEND, SYS_TIME,
+    BUS_FRAME_MAX, BUS_HDR_LEN, BUS_KIND_REPLY, BUS_MAGIC, BUS_VERB_PREF_CHANGED, BUS_VERB_PREF_GET,
+    SYS_TIME,
 };
 use crate::sys::sys;
+// DROPLOOPS (SR179): the program's bus client — `bus::ask` (one wait, `una_abi::bus_ask`) and its ONE keep.
+use vein_ring3::bus;
 
 /// How often [`due`] asks for a re-read of the store (ms) while PrefChanged has no ring-3 delivery.
 pub const POLL_MS: u64 = 2000;
@@ -105,65 +108,9 @@ impl Theme {
 
 // ---- the bus client ----------------------------------------------------------------------------------------
 
-static mut TX: [u8; BUS_HDR_LEN + 64] = [0; BUS_HDR_LEN + 64];
 static mut RX: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
-static mut CORR: u32 = 0x5448_0000;
 /// A PrefChanged frame was met in the mailbox: the next [`due`] answers at once.
 static mut HINT: bool = false;
-
-/// One PREFS request; the reply body is copied into `out`. `Err` = the bus refused (or `-ENOENT`: unset).
-fn call(verb: u8, body: &[u8], out: &mut [u8]) -> Result<usize, i64> {
-    let (tx, rx) = unsafe { (&mut *core::ptr::addr_of_mut!(TX), &mut *core::ptr::addr_of_mut!(RX)) };
-    if body.len() > tx.len() - BUS_HDR_LEN {
-        return Err(una_abi::EINVAL);
-    }
-    let corr = unsafe {
-        CORR = CORR.wrapping_add(1);
-        CORR
-    };
-    tx[..BUS_HDR_LEN].fill(0);
-    tx[0..4].copy_from_slice(&BUS_MAGIC);
-    tx[4] = BUS_VERSION;
-    tx[5] = BUS_KIND_REQUEST;
-    tx[6] = verb;
-    tx[8..12].copy_from_slice(&corr.to_le_bytes());
-    tx[48..52].copy_from_slice(&(body.len() as u32).to_le_bytes());
-    tx[BUS_HDR_LEN..BUS_HDR_LEN + body.len()].copy_from_slice(body);
-    let s = sys(SYS_MSEND, tx.as_ptr() as u64, (BUS_HDR_LEN + body.len()) as u64, 0, 0);
-    if s != 0 {
-        return Err(s);
-    }
-    for _ in 0..8 {
-        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, 0, 0);
-        if n < 0 {
-            return Err(n);
-        }
-        let n = (n as usize).min(rx.len());
-        if let Some(a) = una_abi::open_arg_body(&rx[..n]) {
-            open_arg_keep(a); // ONEINSTANCE (B734): a launch's argument met while waiting for this reply is kept, not lost
-            continue;
-        }
-        if n < BUS_HDR_LEN || rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY {
-            continue;
-        }
-        if rx[6] == BUS_VERB_PREF_CHANGED && rx[8..12] == [0; 4] {
-            unsafe { HINT = true };
-            continue;
-        }
-        if rx[8..12] != corr.to_le_bytes() {
-            continue; // a stale frame: not ours
-        }
-        let status = i32::from_le_bytes([rx[12], rx[13], rx[14], rx[15]]) as i64;
-        if status != 0 {
-            return Err(status);
-        }
-        let blen = (u32::from_le_bytes([rx[48], rx[49], rx[50], rx[51]]) as usize).min(n - BUS_HDR_LEN);
-        let m = blen.min(out.len());
-        out[..m].copy_from_slice(&rx[BUS_HDR_LEN..BUS_HDR_LEN + m]);
-        return Ok(m);
-    }
-    Err(una_abi::EIO)
-}
 
 /// A TOML scalar literal without its quotes and blanks.
 fn unquote(b: &[u8]) -> &[u8] {
@@ -184,7 +131,7 @@ fn unquote(b: &[u8]) -> &[u8] {
 /// than unset lands in `err`).
 fn word<'a>(key: &str, buf: &'a mut [u8; 16], err: &mut i64) -> Option<&'a [u8]> {
     let mut raw = [0u8; 32];
-    match call(BUS_VERB_PREF_GET, key.as_bytes(), &mut raw) {
+    match bus::ask(BUS_VERB_PREF_GET, key.as_bytes(), &mut raw) {
         Ok(n) => {
             let w = unquote(&raw[..n]);
             let m = w.len().min(16);
@@ -229,7 +176,7 @@ pub fn read_look() -> (Look, i64) {
 /// `aether.search` template (Principia's row, prefs_core::schema, the host chrome's own read). `None` unset or refused.
 pub fn pref_text(key: &str) -> Option<alloc::string::String> {
     let mut raw = [0u8; 256];
-    let n = call(BUS_VERB_PREF_GET, key.as_bytes(), &mut raw).ok()?;
+    let n = bus::ask(BUS_VERB_PREF_GET, key.as_bytes(), &mut raw).ok()?;
     let w = unquote(&raw[..n]);
     if w.is_empty() {
         return None;
@@ -276,7 +223,7 @@ pub fn due(now_ms: u64) -> bool {
         if SUB == 1 {
             SUB = 0;
             for p in SUBSCRIBE {
-                if let Err(e) = call(BUS_VERB_PREF_CHANGED, p.as_bytes(), &mut []) {
+                if let Err(e) = bus::ask(BUS_VERB_PREF_CHANGED, p.as_bytes(), &mut []) {
                     SUB = e;
                 }
             }
@@ -284,7 +231,7 @@ pub fn due(now_ms: u64) -> bool {
         }
         let rx = &mut *core::ptr::addr_of_mut!(RX);
         while SUB <= 0 { // ONEINSTANCE (B734): drained even when the subscription was refused — an OPEN_ARG still arrives
-            let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, una_abi::MRECV_NOWAIT, 0);
+            let n = una_abi::mbox_recv(rx, una_abi::MRECV_NOWAIT, bus::keep(), sys); // DROPLOOPS (SR179): the program's kept frames first, then the mailbox
             if n < BUS_HDR_LEN as i64 {
                 break; // -EAGAIN: the mailbox is empty
             }
