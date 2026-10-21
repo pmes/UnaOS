@@ -1311,3 +1311,33 @@ fn cost() {
 // desktop gate and no line above it moves. The tween, the curves, the glides, the frame gate and `tests motion`.
 #[path = "motion.rs"]
 pub mod motion;
+
+// ── (10) SCROLLVIEW (rmbp-ledger B764): the ONE scrollbar widget ───────────────────────────────────────────────────
+// Every scrolling window's bar is this painter, fed by `wm::ScrollView` (the model owns the geometry: `thumb`), painted
+// by `wm::scrollbar_paint` into the window's gutter while shown. Track `surface.sunken`, thumb `line.strong` (theme
+// inks; the thumb takes the kit's pressed tint while dragged), both pills, 8 logical px wide.
+
+/// The bar's width, logical px (scaled by `ui::px` at paint time).
+pub const SCROLLBAR_W: usize = 8;
+
+/// The bar's width at the panel's scale, device px.
+#[inline]
+pub fn scrollbar_w() -> usize {
+    crate::ui::px(SCROLLBAR_W)
+}
+
+/// Paint a scrollbar: the track pill filling `track`, and the thumb pill (inset 1 px across) at `thumb` =
+/// `(top, length)` relative to the track's top, clipped to it; `st.pressed` tints the thumb (the drag). No thumb
+/// (`None`) = a bar whose content fits: the track alone.
+pub fn scrollbar(s: &mut Surf, track: Rect, thumb: Option<(i32, i32)>, st: ControlState) {
+    if track.is_empty() {
+        return;
+    }
+    fill_rrect(s, track, track.w / 2, theme::surface_sunken());
+    if let Some((ty, th)) = thumb {
+        let t = Rect::new(track.x + 1, track.y + ty, (track.w - 2).max(1), th).intersect(track);
+        if !t.is_empty() {
+            fill_rrect(s, t, t.w / 2, st.face(theme::line_strong()));
+        }
+    }
+}
