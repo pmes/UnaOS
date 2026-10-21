@@ -152,8 +152,7 @@ static LOADED_N: AtomicU32 = AtomicU32::new(0);
 static SAVED_N: AtomicU32 = AtomicU32::new(0);
 static OPEN_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
-/// The session user the file was last loaded for (empty = never loaded).
-static LOADED_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new()); static SESSION_SEEN: crate::prefs::SessionSeen = crate::prefs::SessionSeen::new(); // SESSIONGEN (B462). SESSIONGENPOLL (B782): KEPT — the session-OPEN edge for `load_for_login` (safe mode, login_keep, mode_at_login), which runs at every login even when no key differs; not a prefs poll — Settings' prefs view follows PrefChanged only (`bus_changes_inner`)
+static SESSION_SEEN: crate::prefs::SessionSeen = crate::prefs::SessionSeen::new(); // SESSIONGEN (B462). SESSIONEDGE (B793): the one session record (no user-name copy). SESSIONGENPOLL (B782): KEPT — the session-OPEN edge for `load_for_login` (safe mode, login_keep, mode_at_login), which runs at every login even when no key differs; not a prefs poll — Settings' prefs view follows PrefChanged only (`bus_changes_inner`)
 static CUR: crate::sync::Mutex<Values> = crate::sync::Mutex::new(Values::DEFAULT);
 
 /// The persisted values.
@@ -480,7 +479,7 @@ pub fn service() {
     if la != 0 { let on = apply_bright_via(la, "prefchanged"); say("brightness", &alloc::format!("{}", la), on); if is_open() { repaint(); } } // BRIGHTSLIDER M3: only another client's PrefSet lands here now (the login writes nothing)
     let mut wb = [0u8; crate::prefs::WHO_BUF]; let (sk, sq) = SESSION_SEEN.check(); let who = if sq.is_none() { let _s = super::loginrender::stamp(super::loginrender::W_S_SESSION); crate::prefs::user_name_in(&mut wb) } else { None }; let has = sq.unwrap_or(who.is_some()); if sq.is_none() { SESSION_SEEN.mark(sk, has); } // SESSIONGEN (B462): the session is compared only when the login generation moved; PERFREVIEW F3 (B443): the per-pass session reads go on the stack
     if has {
-        let fresh = match who { Some(u) => { let mut g = LOADED_FOR.lock(); if *g != u { *g = String::from(u); true } else { false } } None => false }; // SESSIONGEN: quiet => this generation was compared (and recorded) already
+        let fresh = who.is_some(); // SESSIONEDGE (B793): `who` is read only on a moved key, so every login loads (a same-user relogin too); quiet => this generation was compared (and recorded) already
         // BRIGHTFLOOR M5: the session opened — the load (and the safe-mode Shift check) waits for the
         // first desktop pass SAFE_SETTLE_MS later, so a Shift still down from the password's last
         // character at Enter is never read as the reset.
@@ -495,7 +494,7 @@ pub fn service() {
     // The brightness keys (F1/F2) and the volume keys (F10-F12) change the live level from the input
     // paths, where no VFS work may run: this pass notices the change and persists it (PREFS B300).
     // BRIGHTFLOOR M5: only once the login's load has run (a key before it must not overwrite the store).
-    if has && LOAD_DONE.load(Ordering::Acquire) { // SESSIONGEN (B462): `has` => LOADED_FOR holds this session's (non-empty) name
+    if has && LOAD_DONE.load(Ordering::Acquire) { // SESSIONGEN (B462): `has` => this session's load is owed or done (SESSIONEDGE B793)
         let (lv, m) = crate::video::status::volume();
         let bl = crate::video::brightkeys::level();
         let (dv, db) = {
@@ -1532,7 +1531,7 @@ pub fn open() -> Result<(), String> {
     surf.resize(len, theme::surface_content());
     if is_open() { close(); }
     // Pick up the file's values (and apply them) if the login hook has not yet.
-    if user_name().is_some() && LOADED_FOR.lock().is_empty() { service(); }
+    if user_name().is_some() && SESSION_SEEN.check().1.is_none() { service(); } // SESSIONEDGE (B793): this session not yet compared by the pass
     let (_s, ow, oh) = wm::spawn_geometry_native(sw, sh).ok_or_else(|| String::from("geometry unavailable"))?;
     let wtop = crate::ui_status::top_chrome_h(pw, ph);
     let ox = pw.saturating_sub(ow) / 2;
