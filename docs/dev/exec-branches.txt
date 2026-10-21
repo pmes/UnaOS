@@ -687,3 +687,4 @@ refs/heads/exec-rmbp-crawle   6f51ca22 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-wifiauth   594cf289 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-uacfeedback   594cf289 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-avrcpmute   594cf289 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-scrollpanes   73c7e89c FOLDED-BY-HAND (this commit) 2026-10-21 (cut 10-21 from 87e82a82; the cut was not registered)
