@@ -80,7 +80,6 @@ static STALL_US: AtomicU64 = AtomicU64::new(0);
 // Witness accumulators (drained by `emit`).
 static W_JOBS: AtomicU64 = AtomicU64::new(0);
 static W_BANDS: AtomicU64 = AtomicU64::new(0);
-static W_BANDS_FAILED: AtomicU64 = AtomicU64::new(0);
 static W_BANDS_LATE: AtomicU64 = AtomicU64::new(0);
 static W_WALL_CYC: AtomicU64 = AtomicU64::new(0);
 static W_WORK_CYC: AtomicU64 = AtomicU64::new(0);
@@ -351,7 +350,6 @@ pub fn emit() {
         return;
     }
     let bands = W_BANDS.swap(0, Relaxed);
-    let failed = W_BANDS_FAILED.swap(0, Relaxed);
     let late = W_BANDS_LATE.swap(0, Relaxed);
     let wall = super::wcg::cycles_to_us(W_WALL_CYC.swap(0, Relaxed));
     let work = super::wcg::cycles_to_us(W_WORK_CYC.swap(0, Relaxed));
@@ -366,7 +364,7 @@ pub fn emit() {
     }
     // serial_us = Σ band time (what one core would have spent); pass_us = wall inside par_blit.
     let speedup = if wall == 0 { 0 } else { (work.saturating_mul(100) / wall).saturating_sub(100) };
-    // PTRSTUTTER M3 — the verdict is about COMPLETION: every band ran (a speedup of 14-28% under six vug
+    // PTRSTUTTER M3 — the verdict is about LOAD, not completion (every band runs, below; a speedup of 14-28% under six vug
     // windows is the machine being busy, not a defect). Only an IDLE machine is held to a speedup floor.
     let busy = cores_busy();
     if !crate::census::on(crate::census::WCPAR) { return; } // QUIETBOOT (R80): a census, OFF until `census start wcpar` (merge10 fold: the verdict line itself is TESTFIX3's below)
@@ -374,9 +372,9 @@ pub fn emit() {
     // (`bands=126 pass_us=1559 serial_us=1821 speedup_pct=16 load=idle`, right after `tests` closed its
     // windows) is 14 us of blit per band, the same order as a claim + wake, so no speedup is owed there;
     // every idle rollup at >= 20 us/band on that flight cleared the floor (34..498 %). Completion
-    // (`failed == 0`) is still held on every rollup.
+    // holds by construction: `join` returns only with every band done or composed by `take_late`, before `close` (`late=` counts those).
     let light = bands > 0 && work / bands < LIGHT_BAND_US;
-    let ok = failed == 0 && (busy || light || speedup >= 20);
+    let ok = busy || light || speedup >= 20;
     serial_println!(
         ":: WCPAR: cores={} workers={} bands={} pass_us={} serial_us={} speedup_pct={} load={} late={} -> {} ::",
         cores,
@@ -392,7 +390,7 @@ pub fn emit() {
 }
 
 /// PTRSTUTTER M3: the machine is BUSY when at least half of the online CPUs ran >= 70% over the recent window
-/// (the SMPLOAD feed). Workers only spin 20 ms after a band, so on an idle desktop they do not trip it.
+/// (the SMPLOAD feed). Workers spin <= 1 ms after a band, then sleep (PTRSTUTTER), so on an idle desktop they do not trip it.
 #[cfg(feature = "witness")]
 fn cores_busy() -> bool {
     let n = crate::arch::sched::online_cpu_count();
