@@ -207,13 +207,13 @@ struct IntEp {
     /// the state a freshly-configured HID device is in (SET_CONFIGURATION resets its LEDs), so the
     /// software state and the hardware agree from the first report without an explicit sync.
     kbd_leds: u8,
-    /// ALLKEYS P1: the EP0 addressing tuple and interface number for THIS endpoint's device —
+    /// ALLKEYS P1 (EHCITARGET: EVERY interrupt endpoint carries these — hub, pointer, keyboard): the EP0 addressing tuple and interface number for THIS endpoint's device —
     /// everything `set_hid_leds` needs to send SET_REPORT back to it. Captured at arm time because
     /// the service loop, where a lock-key press is detected, has no other route to them: it walks
     /// `int_eps` and the enumeration `Target` is long out of scope by then. `Target` is `Copy` and
     /// eight bytes, so carrying it costs nothing.
-    kbd_target: Target,
-    kbd_intf: u8,
+    target: Target,
+    intf: u8,
     /// ALLKEYS P1: does this keyboard still accept the LED SET_REPORT? Latched FALSE by the first
     /// refusal and never retried.
     ///
@@ -13555,8 +13555,8 @@ impl Controller {
             // ALLKEYS P1: locks off at arm time — the state SET_CONFIGURATION just left the
             // device in, so software and hardware agree without an explicit sync request.
             kbd_leds: 0,
-            kbd_target: *t,
-            kbd_intf: intf,
+            target: *t,
+            intf,
             kbd_led_ok: true,
             last_report_ms: 0,
             // EHCIDARK — the census clock starts at the moment the endpoint becomes armed, for the
@@ -13664,7 +13664,7 @@ impl Controller {
         // toggle came to have two owners in the first place.
         ISR_EPS[slot].toggle.store(1, Ordering::Relaxed);
         isr_rearm(&ISR_EPS[slot]);
-        isr_release_poll(slot); crate::hidstall::note_recovered(self.idx, self.int_eps[ep_i].kbd_target.addr, ((core::ptr::read_volatile(&(*self.int_eps[ep_i].qh).ep_chars) >> 8) & 0xF) as u8, ep_i); // HIDSTALL (B485): `[hid] recovered addr= ep= after_ms=`
+        isr_release_poll(slot); crate::hidstall::note_recovered(self.idx, self.int_eps[ep_i].target.addr, ((core::ptr::read_volatile(&(*self.int_eps[ep_i].qh).ep_chars) >> 8) & 0xF) as u8, ep_i); // HIDSTALL (B485): `[hid] recovered addr= ep= after_ms=`
     }
 
     /// Main-loop poll: ack USBSTS, then for each armed endpoint consume a completed report,
@@ -13907,7 +13907,7 @@ impl Controller {
                                 // bumps `pal::note_keyboard_detached()`, and this keyboard is not detached. If
                                 // the clear fails, the post-loop stage does both, so nothing is skipped, only
                                 // deferred by one pass of the ~1 kHz poll.
-                                clear_halts[n_clr] = Some((ep_i, e.kbd_target, h_ep as u8));
+                                clear_halts[n_clr] = Some((ep_i, e.target, h_ep as u8));
                                 n_clr += 1;
                                 e.halt_clears += 1;
                                 break;
@@ -14134,7 +14134,7 @@ impl Controller {
                                 serial_println!(
                                     ":: EHCI-HID: [{}] [tp] mode-mismatch readback={} stream={} -> route={} (the wire beats the register) == witness ::",
                                     idx, rb, st, st
-                                ); if rb == "vendor" && st == "legacy" && crate::pointerfeel::reassert_due() { tp_reassert = Some((ep_i, e.kbd_target, e.kbd_intf)); } // POINTERFEEL (B535): the pad latched the vendor selector and still streams HID-mode reports — ask for the mode again after the walk (bounded: pointerfeel::REASSERT_MAX). LINE-NEUTRAL fold, code first.
+                                ); if rb == "vendor" && st == "legacy" && crate::pointerfeel::reassert_due() { tp_reassert = Some((ep_i, e.target, e.intf)); } // POINTERFEEL (B535): the pad latched the vendor selector and still streams HID-mode reports — ask for the mode again after the walk (bounded: pointerfeel::REASSERT_MAX). LINE-NEUTRAL fold, code first.
                             }
                             match route {
                               TpRoute::Rel { buttons, dx, dy } => {
@@ -14318,7 +14318,7 @@ impl Controller {
                         ) && e.kbd_led_ok
                             && n_led < led_pushes.len()
                         {
-                            led_pushes[n_led] = Some((ep_i, e.kbd_target, e.kbd_intf, e.kbd_leds));
+                            led_pushes[n_led] = Some((ep_i, e.target, e.intf, e.kbd_leds));
                             n_led += 1;
                         }
                         if e.reports == 1 || e.reports % 32 == 0 {
@@ -14467,7 +14467,7 @@ impl Controller {
                     continue;
                 }
                 if survivors == 0 {
-                    s_addr = s.kbd_target.addr;
+                    s_addr = s.target.addr;
                     s_ep = (core::ptr::read_volatile(&(*s.qh).ep_chars) >> 8) & 0xF;
                 }
                 survivors += 1;
@@ -20009,7 +20009,7 @@ pub mod suspend {
     //! (TRSMRCY) — deadlines, never a wait. A device's own resume sets FPR on a suspended port: that is its remote
     //! wake, and the whole controller resumes.
     //!
-    //! EHCIWAKE (B776): before SUSP each live HID device (its `IntEp::kbd_target`, which every endpoint carries) and
+    //! EHCIWAKE (B776): before SUSP each live HID device (its `IntEp::target`, which every endpoint carries) and
     //! every hub this controller brought up ([`note_hub`]) gets SET_FEATURE(DEVICE_REMOTE_WAKEUP) when its
     //! configuration declares it (USB 2.0 §9.4.9; a hub forwards a downstream resume only when armed, §11.4.4) —
     //! while the periodic schedule still runs, because EP0 rides the periodic engine on this silicon (`control_txn`,
@@ -20102,7 +20102,7 @@ pub mod suspend {
         let Some(ctrls) = g.as_mut() else { return Some(None) };
         for c in ctrls.iter_mut() {
             let Some(e) = c.int_eps.iter().find(|e| e.is_kbd && !e.dead) else { continue };
-            let (t, intf, qh) = (e.kbd_target, e.kbd_intf, e.qh);
+            let (t, intf, qh) = (e.target, e.intf, e.qh);
             let len = unsafe { c.control(&t, 0xA1, 0x01, 0x0100, intf as u16, 8, true) }.unwrap_or(0);
             let halted = unsafe { core::ptr::read_volatile(&(*qh).overlay[2]) } & QTD_HALTED != 0;
             return Some(Some((len, !halted)));
@@ -20197,9 +20197,9 @@ pub mod suspend {
         fn arm_remote_wake(&mut self) -> (u32, bool) {
             let mut devs: Vec<(Target, bool)> = Vec::new();
             for e in self.int_eps.iter().filter(|e| !e.dead) {
-                match devs.iter_mut().find(|(t, _)| t.addr == e.kbd_target.addr) {
+                match devs.iter_mut().find(|(t, _)| t.addr == e.target.addr) {
                     Some(d) => d.1 |= e.is_kbd,
-                    None => devs.push((e.kbd_target, e.is_kbd)),
+                    None => devs.push((e.target, e.is_kbd)),
                 }
             }
             if devs.is_empty() { return (0, false); }
