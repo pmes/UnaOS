@@ -1,0 +1,79 @@
+# TESTS.LIST — the flight's fixture list (BOOTLIST, rmbp-ledger B817, R132). `./arroyo esp-x86` stages it at the ESP root;
+# the kernel reads /boot/TESTS.LIST at the boot's first [desktop] built and runs it on one worker, one verb at a time.
+# One verb per line (`tests` optional, one argument word kept), `#` comments, `@<s>` = the fixture's budget (default 60 s;
+# an overrun prints `:: <VERB>: -> SKIP(budget <s>s) ::` and the list moves on). Lines under `HEAVY:` (and nameindextx /
+# abimage anywhere) run after the light tier's summary — or on a boot after the first-user boot when /boot/TESTS.HEAVY
+# says `boot2`. Edit this file (or the card's copy) to change the list; no rebuild.
+# Flight 37's list (docs/dev/evidence/rmbp-0915/flight37/FLIGHT37.md §4, §7), in the order the bench typed it.
+kgr
+gatesteal2
+unafslock
+hidstall
+fpu
+clock
+gen7
+wifi
+startscene
+contrast
+winkey
+settingsmap
+toastcap
+uninstall
+applaunch
+shimmeridle
+memline
+glyphs
+k2p
+volkey
+reask
+uvccam
+idlenet
+nicabsent
+xts
+keyboot
+a11ytree
+# sleep — OUT until SLEEP2 lands: it suspends xHCI and cannot restore it (FLIGHT37 §5, the wire died); remove the `#` then.
+trash
+abielf
+kelfhash
+appfault
+tzlocale
+keymaps
+smartline
+notelemetry
+focussteal
+veilcost
+aging
+camdot
+unplug
+a11yfilters
+zoom
+perfhud
+diskfull
+autolock
+undomove
+mtpphone
+fileversions
+desktopcraft
+starfield
+softy
+dragmouse
+winresize
+menuscraft
+menubar
+statustray
+dockpins
+notify
+doorsplit
+filetypes
+stria
+quarryhover
+motion
+stackroom
+lockreg
+pointerfeel
+a2dp
+HEAVY:
+# The card-heavy fixtures (FLIGHT37 §4): NAMEINDEXTX held MOUNT+CARD 5 min, ABIMAGE copied 2 x 21.8 MB in 9 min.
+nameindextx @600
+abimage @900

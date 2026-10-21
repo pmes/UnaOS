@@ -87,6 +87,9 @@ for every family the flight needs, and a control string that must be 0.
    The second writes the FLIGHTID; score every boot by `KELF min=0x0 max=<max_vaddr>` and the boot volume
    serial FIRST. The Orin boots our MBR card from the native microSD slot only when the FAT32 is FAT32 by
    cluster count; from a USB reader it always did.
+7. The list (BOOTLIST B817, R132): the flight's fixtures ride the card as `TESTS.LIST` (`unaos/fixtures/TESTS.LIST`, staged by `esp-x86`;
+   `TESTS.HEAVY` = `boot2` moves the HEAVY tier to boot 2); the kernel runs it at `[desktop] built`. Nobody types fixtures over the door:
+   the seat edits the list before staging and reads `:: BOOTLIST: ran= pass= fail= skip= heavy= ms= ::` and the per-fixture lines off the wire.
 
 ## 5. Read the wire
 `LC_ALL=C tail -c +<mark byte+1> ~/unaos-bench/capture/line-acm0/raw.log | tr -d '\000' > <scratch>/wire.txt`,

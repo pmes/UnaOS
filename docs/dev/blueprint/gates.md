@@ -59,11 +59,12 @@
 
 ## 4. Verbs (`unaos/arroyo` tail `case`)
 `check` · `state` · `gates [--list|--selftest]` · `test` / `test-arm` / `test-fat` / `test-install` / `test-ptr` / `test-splash` / `test-selfhost` (QEMU) · `x86` / `arm` (QEMU GUI) ·
-`esp-x86` / `esp-arm` / `esp-jetson` / `esp-jetson-img` (media) · `kernel8` / `kernel8-run` / `kernel8-test` / `kernel8-install` (Pi) · `foldleg` · `twoboot` · `knoboff` · `bootleg` · `battery` · `mbench` · `jobs-image` · `vm-image` · `fat-img` · `selfup-pak` · `clean`.
+`esp-x86` (stages `unaos/fixtures/TESTS.LIST` + `TESTS.HEAVY` onto the ESP when present, the media verb only — BOOTLIST B817, `unaos/arroyo:14559`) / `esp-arm` / `esp-jetson` / `esp-jetson-img` (media) · `kernel8` / `kernel8-run` / `kernel8-test` / `kernel8-install` (Pi) · `foldleg` · `twoboot` · `knoboff` · `bootleg` · `battery` · `mbench` · `jobs-image` · `vm-image` · `fat-img` · `selfup-pak` · `clean`.
 
 ## 5. Ruled, unbuilt / open
 - GATE-NEUTRAL (BP-shape-4): built as the `neutral` row (SR166); 110 findings at fb8ad2f4 sit on `tools/neutral.allow`, each reason naming its owed rename.
 - The firmware census (BP-shape-11): built as the `firmware` row (SR166); GATE-LEDGER (`unaos/scripts/ledger-check.sh`, after the branch census) runs it too, its exit folded the same way (LEDGERFW).
+- BOOTLIST (B817, R132): the flight's list is `unaos/fixtures/TESTS.LIST` (flight 37's, light then `HEAVY:`), run by the kernel at `[desktop] built` (boot.md BP-boot-4); its probe `tests bootlist` is pinned in `unaos/scripts/specs/x86-wc.spec`. Owed: a list generator from the ledger's open rows (the seat's), and `esp-arm`/`kernel8` staging.
 
 ## 6. Read further
 - `docs/dev/LAWS.md` §5, `docs/dev/PLAYBOOK.md` §1-§3, `docs/dev/EXECUTOR-BRIEF.md`.
