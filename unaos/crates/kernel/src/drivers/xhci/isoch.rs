@@ -36,6 +36,11 @@
 //!   with the OUT pipe's short lead, each completed TD's bytes go to `drivers::usb::uac::push_capture` (the class
 //!   driver's 64 KiB capture ring) from `claim_ain`, and the pipe exists only while a capture source is open:
 //!   `service_uvc` asks `uac::ep0_due` first on every pass and hands `uac::ep0_service` the slot's host.
+//! * **Audio feedback IN** (UACFEEDBACK, rmbp-ledger B789) — an asynchronous sink's feedback (synch) endpoint is the
+//!   engine's FOURTH pipe (`FPIPE`, its own armed word), so it never lands in the microphone's: `iso_configure` routes
+//!   an audio slot's IN endpoint there when the class driver names it (`ac::feedback_ep`); `claim_ain` (shared with the
+//!   capture pipe) hands its completed values to `uac::push_feedback`, and every OUT TD's length is the class
+//!   driver's (`ac::out_next_len`: the nominal until a value arrives, then metered to it).
 //!
 //! # SOURCES (DRIVERS-METHOD §5 — each constant on its line carries what it has)
 //!
@@ -74,6 +79,13 @@ mod ac {
         d.fill(0)
     }
     pub fn push_capture(_: &[u8]) {}
+    pub fn push_feedback(_: &[u8]) {}
+    pub fn feedback_ep(_: u8) -> bool {
+        false
+    }
+    pub fn out_next_len(n: u32, _: u32, _: u32) -> u32 {
+        n
+    }
     pub fn disconnect(_: u8) {}
     pub fn out_td_len(_: u32) -> u32 {
         0
@@ -227,6 +239,8 @@ struct Pipe {
     out: bool,
     /// UACMIC (B723): an audio isochronous IN pipe — each completed TD goes to `uac::push_capture`.
     ain: bool,
+    /// UACFEEDBACK (B789): an audio feedback IN pipe — each completed TD goes to `uac::push_feedback`.
+    fb: bool,
     /// Ring: `nslots` TRBs, data slots 0..nslots-1, the Link at `nslots`.
     ring: *mut Trb,
     ring_phys: u64,
@@ -241,6 +255,8 @@ struct Pipe {
     bufs: *mut u8,
     stride: usize,
     td_len: u32,
+    /// UACFEEDBACK (B789): the largest TD the endpoint context reserves (the ESIT) — a metered OUT TD's bound.
+    esit: u32,
     mps: u32,
     ss_burst: u32,
     ss: bool,
@@ -272,10 +288,16 @@ static ST_O_EVENTS: AtomicU64 = AtomicU64::new(0); static ST_O_DUP: AtomicU32 = 
 static APIPE: crate::sync::Mutex<Option<Pipe>> = crate::sync::Mutex::new(None);
 static APIPE_SLOT: AtomicU8 = AtomicU8::new(0);
 static APIPE_DCI: AtomicU8 = AtomicU8::new(0);
+// UACFEEDBACK (B789): the audio feedback IN pipe — its own armed word beside the capture pipe's.
+static FPIPE: crate::sync::Mutex<Option<Pipe>> = crate::sync::Mutex::new(None);
+static FPIPE_SLOT: AtomicU8 = AtomicU8::new(0);
+static FPIPE_DCI: AtomicU8 = AtomicU8::new(0);
 static ST_A_TDS: AtomicU32 = AtomicU32::new(0);
 static ST_A_MISSED: AtomicU32 = AtomicU32::new(0);
 static ST_A_OVERRUN: AtomicU32 = AtomicU32::new(0);
 static ST_A_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// UACFEEDBACK (B789): events on the feedback pipe (its first few are witnessed by line, as every pipe's).
+static ST_F_EVENTS: AtomicU64 = AtomicU64::new(0);
 
 /// UACMIC: the audio IN pipe's counters (TDs retired, retired-not-received, controller ring overruns, events).
 pub fn ain_stats() -> (u32, u32, u32, u64) {
@@ -393,8 +415,8 @@ impl Pipe {
     /// TBC / TLBPC for one TD of `td_len` bytes (§6.4.1.3 · Linux xhci_get_burst_count /
     /// xhci_get_last_burst_packet_count [recalled]): high-speed TBC 0, TLBPC = packets - 1; SuperSpeed
     /// TBC = ceil(packets / (bMaxBurst+1)) - 1, TLBPC = the last burst's packets - 1.
-    fn burst_fields(&self) -> u32 {
-        let packets = ((self.td_len + self.mps - 1) / self.mps.max(1)).max(1);
+    fn burst_fields(&self, len: u32) -> u32 {
+        let packets = ((len + self.mps - 1) / self.mps.max(1)).max(1);
         let (tbc, tlbpc) = if self.ss {
             let b = self.ss_burst + 1;
             let r = packets % b;
@@ -424,17 +446,20 @@ impl Pipe {
     fn produce(&mut self) {
         let i = self.enq;
         let buf = self.bufs as u64 + (i * self.stride) as u64;
+        // UACFEEDBACK (B789): an OUT TD's length is the class driver's (metered to an asynchronous sink's feedback,
+        // else the nominal `td_len`); an IN TD is `td_len` as before.
+        let len = if self.out { ac::out_next_len(self.td_len, self.interval_uf, self.esit) } else { self.td_len };
         if self.out {
             // UAC1 (B706): the TD's payload, from the class driver's ring (silence where it is short).
-            // SAFETY: TD buffer `i` is `stride` >= td_len bytes inside the pipe's allocation, and slot `i` is free
+            // SAFETY: TD buffer `i` is `stride` >= esit >= len bytes inside the pipe's allocation, and slot `i` is free
             // (the controller retired its previous TD before `outstanding` dropped below the target).
-            ac::pull(unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, self.td_len as usize) });
+            ac::pull(unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len as usize) });
         }
-        dma_coherency::clean(buf as usize, self.td_len as usize);
+        dma_coherency::clean(buf as usize, len as usize);
         let bei = if i % 8 != 7 { ISO_BEI } else { 0 };
         let isp = if self.out { 0 } else { ISO_ISP }; // §6.4.1.3: Interrupt-on-Short-Packet is an IN notion
-        let ctl = (TRB_ISOCH << 10) | isp | ISO_IOC | bei | self.burst_fields() | self.schedule() | (self.cycle as u32);
-        self.write_trb(i, Trb { parameter: buf, status: self.td_len & 0x1FFFF, control: ctl });
+        let ctl = (TRB_ISOCH << 10) | isp | ISO_IOC | bei | self.burst_fields(len) | self.schedule() | (self.cycle as u32);
+        self.write_trb(i, Trb { parameter: buf, status: len & 0x1FFFF, control: ctl });
         self.enq += 1;
         if self.enq == self.nslots {
             // Arm the Link for the lap now ending (its cycle = this lap's), THEN adopt the new colour (§4.9.2.2).
@@ -466,8 +491,11 @@ pub fn claim(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
     if slot != 0 && OPIPE_SLOT.load(Ordering::Acquire) == slot && OPIPE_DCI.load(Ordering::Relaxed) == dci {
         return claim_out(slot, dci, param, cc, residual); // UAC1 (B706): the isochronous OUT pipe
     }
+    if slot != 0 && FPIPE_SLOT.load(Ordering::Acquire) == slot && FPIPE_DCI.load(Ordering::Relaxed) == dci {
+        return claim_ain(&FPIPE, slot, dci, param, cc, residual); // UACFEEDBACK (B789): the audio feedback IN pipe
+    }
     if slot != 0 && APIPE_SLOT.load(Ordering::Acquire) == slot && APIPE_DCI.load(Ordering::Relaxed) == dci {
-        return claim_ain(slot, dci, param, cc, residual); // UACMIC (B723): the audio isochronous IN pipe
+        return claim_ain(&APIPE, slot, dci, param, cc, residual); // UACMIC (B723): the audio isochronous IN pipe
     }
     if slot == 0 || PIPE_SLOT.load(Ordering::Acquire) != slot || PIPE_DCI.load(Ordering::Relaxed) != dci {
         return false;
@@ -575,17 +603,20 @@ fn claim_out(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
 /// through the TRB the event names (the same duplicate/stale guard), hands the completed TD's bytes (`td_len -
 /// residual`, a short packet is the normal case: 44.1 kHz alternates 44 and 45 frames) to the class driver's capture
 /// ring, and tops the ring up. No lock but the pipe's own is taken; `push_capture` is lock-free.
-fn claim_ain(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
-    let n_ev = ST_A_EVENTS.fetch_add(1, Ordering::Relaxed);
-    let mut g = APIPE.lock();
+/// UACFEEDBACK (B789): the same claim serves the feedback pipe (`pipe` = `&FPIPE`, `p.fb`): its values go to
+/// `uac::push_feedback` (lock-free) and the capture counters (`ain_stats`, the microphone's) are not touched.
+fn claim_ain(pipe: &crate::sync::Mutex<Option<Pipe>>, slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
+    let mut g = pipe.lock();
     let Some(p) = g.as_mut() else { return true };
-    if cc == 14 || cc == 15 {
+    let cap = !p.fb;
+    let n_ev = if cap { ST_A_EVENTS.fetch_add(1, Ordering::Relaxed) } else { ST_F_EVENTS.fetch_add(1, Ordering::Relaxed) };
+    if cap && (cc == 14 || cc == 15) {
         ST_A_OVERRUN.fetch_add(1, Ordering::Relaxed);
     }
     if (n_ev as u32) < FIRST_WITNESSED {
         serial_println!(
-            "[usb-iso] event n={} slot={} dci={} dir=in-audio cc={} ({}) trb={:#x} residual={} mfindex={} outstanding={}",
-            n_ev, slot, dci, cc, cc_name(cc), param, residual, p.mfindex(), p.outstanding
+            "[usb-iso] event n={} slot={} dci={} dir={} cc={} ({}) trb={:#x} residual={} mfindex={} outstanding={}",
+            n_ev, slot, dci, if cap { "in-audio" } else { "in-feedback" }, cc, cc_name(cc), param, residual, p.mfindex(), p.outstanding
         );
     }
     if let Some(i) = p.index_of(param) {
@@ -597,17 +628,22 @@ fn claim_ain(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
             }
             for k in 0..=dist {
                 let j = (p.deq + k) % p.nslots;
-                ST_A_TDS.fetch_add(1, Ordering::Relaxed);
+                if cap {
+                    ST_A_TDS.fetch_add(1, Ordering::Relaxed);
+                }
                 if k == dist && (cc == 1 || cc == 13) {
                     let len = p.td_len.saturating_sub(residual) as usize;
                     let b = p.bufs as usize + j * p.stride;
                     dma_coherency::inval(b, len);
                     // SAFETY: TD buffer `j` is `stride` >= td_len >= len bytes inside the pipe's allocation, and the
                     // controller has retired the TD that wrote it.
-                    ac::push_capture(unsafe { core::slice::from_raw_parts(b as *const u8, len) });
+                    let bytes = unsafe { core::slice::from_raw_parts(b as *const u8, len) };
+                    if cap { ac::push_capture(bytes) } else { ac::push_feedback(bytes) }
                     p.delivered = p.delivered.wrapping_add(1);
                 } else {
-                    ST_A_MISSED.fetch_add(1, Ordering::Relaxed);
+                    if cap {
+                        ST_A_MISSED.fetch_add(1, Ordering::Relaxed);
+                    }
                     p.missed_since_start = p.missed_since_start.wrapping_add(1);
                 }
             }
@@ -617,7 +653,7 @@ fn claim_ain(slot: u8, dci: u8, param: u64, cc: u8, residual: u32) -> bool {
     }
     if !p.sia && p.delivered == 0 && p.missed_since_start >= SIA_FALLBACK_MISSED {
         p.sia = true;
-        serial_println!("[usb-iso] sched frameid->sia dir=in-audio reason=missed={} delivered=0 (SIA from the next TD)", p.missed_since_start);
+        serial_println!("[usb-iso] sched frameid->sia dir={} reason=missed={} delivered=0 (SIA from the next TD)", if cap { "in-audio" } else { "in-feedback" }, p.missed_since_start);
     }
     if p.top_up() != 0 || cc == 14 || cc == 15 {
         p.doorbell();
@@ -669,6 +705,13 @@ pub fn disconnect(slot: u8) {
             core::mem::forget(p); // as above
         }
         serial_println!("[usb-iso] disconnect slot={} dir=in-audio — stream disarmed", slot);
+    }
+    if FPIPE_SLOT.load(Ordering::Acquire) == slot {
+        FPIPE_SLOT.store(0, Ordering::Release); // UACFEEDBACK (B789): the feedback pipe forgets the slot too
+        if let Some(p) = FPIPE.lock().take() {
+            core::mem::forget(p); // as above
+        }
+        serial_println!("[usb-iso] disconnect slot={} dir=in-feedback — stream disarmed", slot);
     }
     ac::disconnect(slot);
 }
@@ -807,9 +850,10 @@ impl IsoHost for XhciUvc<'_> {
 
     fn iso_configure(&mut self, ep: &IsoEp) -> Result<(), (u8, &'static str)> {
         let out = ep.addr & 0x80 == 0; // UAC1 (B706): an OUT endpoint is a playback pipe (DCI ep*2, EP Type 1)
-        let ain = !out && self.audio; // UACMIC (B723): an audio slot's IN endpoint is a capture pipe (its own word)
-        let tag = if out || ain { "[usb-iso]" } else { "[uvc-iso]" };
-        if (if out { OPIPE_SLOT.load(Ordering::Acquire) } else if ain { APIPE_SLOT.load(Ordering::Acquire) } else { PIPE_SLOT.load(Ordering::Acquire) }) != 0 {
+        let fb = !out && self.audio && ac::feedback_ep(ep.addr); // UACFEEDBACK (B789): the async sink's feedback IN is its own pipe
+        let ain = !out && self.audio && !fb; // UACMIC (B723): an audio slot's IN endpoint is a capture pipe (its own word)
+        let tag = if out || ain || fb { "[usb-iso]" } else { "[uvc-iso]" };
+        if (if out { OPIPE_SLOT.load(Ordering::Acquire) } else if fb { FPIPE_SLOT.load(Ordering::Acquire) } else if ain { APIPE_SLOT.load(Ordering::Acquire) } else { PIPE_SLOT.load(Ordering::Acquire) }) != 0 {
             return Err((0, "one-stream-already-armed"));
         }
         let speed = self.speed();
@@ -844,7 +888,7 @@ impl IsoHost for XhciUvc<'_> {
         // The ring and TD buffers, before the command: the TR Dequeue Pointer is part of the context.
         let stride = (esit as usize).next_power_of_two().max(64);
         let target = (TD_BUDGET / stride).clamp(8, 255 - RING_SLACK);
-        let target = if out || ain { target.min(OUT_TDS) } else { target }; // UACMIC: audio IN takes the OUT pipe's short lead
+        let target = if out || ain || fb { target.min(OUT_TDS) } else { target }; // UACMIC: audio IN takes the OUT pipe's short lead (UACFEEDBACK: and feedback)
         let nslots = target + RING_SLACK;
         let rl = core::alloc::Layout::from_size_align((nslots + 1) * 16, 4096).map_err(|_| (0u8, "layout"))?;
         let bl = core::alloc::Layout::from_size_align(nslots * stride, stride).map_err(|_| (0u8, "layout"))?;
@@ -881,7 +925,7 @@ impl IsoHost for XhciUvc<'_> {
         let (d0, d1, d4) = self.out_ep(dci);
         serial_println!(
             "{} cfg-ep slot={} dci={} speed={} type={} mps={} burst={} mult={} esit={} interval_enc={} ({} uframes) ring={:#x} slots={} epstate={}({})->{}({}) result={}",
-            tag, self.slot, dci, speed, if out { "isoch-out" } else { "isoch-in" }, mps, burst + 1, mult + 1, esit, ivl, interval_uf, ring_phys, nslots,
+            tag, self.slot, dci, speed, if out { "isoch-out" } else if fb { "isoch-feedback" } else { "isoch-in" }, mps, burst + 1, mult + 1, esit, ivl, interval_uf, ring_phys, nslots,
             before, ep_state_name(before), after, ep_state_name(after),
             match r { Ok(()) => "cc=1 (Success)", Err((_, n)) => n }
         );
@@ -916,6 +960,7 @@ impl IsoHost for XhciUvc<'_> {
                 dci: dci as u8,
                 out,
                 ain,
+                fb,
                 ring,
                 ring_phys,
                 nslots,
@@ -927,6 +972,7 @@ impl IsoHost for XhciUvc<'_> {
                 bufs,
                 stride,
                 td_len,
+                esit,
                 mps,
                 ss_burst: burst,
                 ss,
@@ -956,7 +1002,7 @@ impl IsoHost for XhciUvc<'_> {
         let lead = pipe.target as u32 * pipe.interval_uf;
         serial_println!(
             "{} start slot={} dci={} tds={} slack={} stride={} td_len={} interval_uf={} ist_uf={} mfindex={} first_frame~{} lead_uframes={} sched=frameid ring={:#x} bufs={:#x}",
-            if pipe.out || pipe.ain { "[usb-iso]" } else { "[uvc-iso]" }, pipe.slot, pipe.dci, n, RING_SLACK, pipe.stride, pipe.td_len, pipe.interval_uf, pipe.ist_uf, now, first_frame, lead,
+            if pipe.out || pipe.ain || pipe.fb { "[usb-iso]" } else { "[uvc-iso]" }, pipe.slot, pipe.dci, n, RING_SLACK, pipe.stride, pipe.td_len, pipe.interval_uf, pipe.ist_uf, now, first_frame, lead,
             pipe.ring_phys, pipe.bufs as u64
         );
         let (slot, dci) = (pipe.slot, pipe.dci);
@@ -968,11 +1014,13 @@ impl IsoHost for XhciUvc<'_> {
             self.c.ring_doorbell(slot, dci as u32);
             return Ok((n as u32, lead, "frameid"));
         }
-        if pipe.ain {
+        if pipe.ain || pipe.fb {
             // UACMIC (B723): the audio IN pipe publishes to its own word; the camera's statics are untouched.
-            *APIPE.lock() = Some(pipe);
-            APIPE_DCI.store(dci, Ordering::Relaxed);
-            APIPE_SLOT.store(slot, Ordering::Release);
+            // UACFEEDBACK (B789): the feedback pipe to ITS word, beside the capture pipe's.
+            let (word, dword, cell) = if pipe.fb { (&FPIPE_SLOT, &FPIPE_DCI, &FPIPE) } else { (&APIPE_SLOT, &APIPE_DCI, &APIPE) };
+            *cell.lock() = Some(pipe);
+            dword.store(dci, Ordering::Relaxed);
+            word.store(slot, Ordering::Release);
             self.c.ring_doorbell(slot, dci as u32);
             return Ok((n as u32, lead, "frameid"));
         }
@@ -987,8 +1035,9 @@ impl IsoHost for XhciUvc<'_> {
     fn iso_drop(&mut self, ep: &IsoEp) {
         let out = ep.addr & 0x80 == 0; // UAC1 (B706): the pipe of the endpoint's direction
         let dci = (ep.addr & 0x0F) as u32 * 2 + if out { 0 } else { 1 };
-        let ain = !out && self.audio; // UACMIC (B723): an audio slot's IN endpoint is the capture pipe
-        let (word, pipe) = if out { (&OPIPE_SLOT, &OPIPE) } else if ain { (&APIPE_SLOT, &APIPE) } else { (&PIPE_SLOT, &PIPE) };
+        let fb = !out && self.audio && ac::feedback_ep(ep.addr); // UACFEEDBACK (B789): the feedback pipe
+        let ain = !out && self.audio && !fb; // UACMIC (B723): an audio slot's IN endpoint is the capture pipe
+        let (word, pipe) = if out { (&OPIPE_SLOT, &OPIPE) } else if fb { (&FPIPE_SLOT, &FPIPE) } else if ain { (&APIPE_SLOT, &APIPE) } else { (&PIPE_SLOT, &PIPE) };
         if word.load(Ordering::Acquire) == self.slot {
             word.store(0, Ordering::Release);
             if let Some(p) = pipe.lock().take() {
@@ -1001,7 +1050,7 @@ impl IsoHost for XhciUvc<'_> {
         let r = self.configure(dci, false, [0; 5]);
         serial_println!(
             "{} drop-ep slot={} dci={} result={} epstate={}",
-            if out || ain { "[usb-iso]" } else { "[uvc-iso]" }, self.slot, dci, match r { Ok(()) => "cc=1 (Success)", Err((_, n)) => n }, self.c.ep_state_of(self.slot, dci as u8)
+            if out || ain || fb { "[usb-iso]" } else { "[uvc-iso]" }, self.slot, dci, match r { Ok(()) => "cc=1 (Success)", Err((_, n)) => n }, self.c.ep_state_of(self.slot, dci as u8)
         );
     }
 }
