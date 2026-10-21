@@ -5270,12 +5270,12 @@ fn scrollview_selftest() {
         vw, vh, STRIDE, steps, clamps, fulls, max_rep, max_blit, tmin, quarry.as_ref().copied().unwrap_or(0), hw.as_ref().copied().unwrap_or(0)
     );
     // (5) RING3SCROLL (B778): a ring-3 window through the bus verb — registered, one wheel step, one INPUT_EV_SCROLL with
-    // the clamped offset, the bar in its gutter (x86 `wc`; aarch64's arm is owed, so it reads `owed(aarch64)`).
-    #[cfg(target_arch = "x86_64")]
-    let ring3 = crate::arch::x86_64::syscall::scroll_ring3_probe();
-    #[cfg(not(target_arch = "x86_64"))]
+    // the clamped offset, the bar in its gutter — each arch's own arm (x86 `wc` `busx_scroll_set`; aarch64 `bus_scroll_set`, SCROLLARM64 SR172); an aarch64 desktop with no EL0 has no ring-3 window: `none(no-el0)`.
+    #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+    let ring3 = crate::arch::syscall::scroll_ring3_probe();
+    #[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
     let ring3: Result<usize, &'static str> = Ok(0);
-    let ring3_word = if cfg!(target_arch = "x86_64") { word(&ring3) } else { alloc::string::String::from("owed(aarch64)") };
+    let ring3_word = if cfg!(any(target_arch = "x86_64", feature = "aarch64_el0")) { word(&ring3) } else { alloc::string::String::from("none(no-el0)") };
     let pass = steps == 200 && clamp_ok && reached_ends && blit_ok && thumb_ok && quarry.is_ok() && hw.is_ok() && ring3.is_ok();
     serial_println!(
         ":: SCROLLVIEW: steps={} clamp={} blit={} thumb={} quarry={} hw={} -> {} :: ring3={}",
