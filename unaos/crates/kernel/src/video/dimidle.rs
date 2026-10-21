@@ -61,14 +61,14 @@ pub fn gate(ev: Event) -> bool {
         _ => (false, false),
     };
     if !input { return false; }
-    LAST_ACTIVITY_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
+    LAST_ACTIVITY_MS.store(crate::arch::ms().max(1), Ordering::Relaxed); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] if super::lidsleep::claim_wake(press) && !BLANKED.load(Ordering::Acquire) { return swallow(ev); } // LIDKEYSWALLOW (B784): the sleep state's first input claims its wake; a claimed press is swallowed by the one [`swallow`] (BLANKED too: the branch below swallows it). LINE-NEUTRAL fold, code first
     if BLANKED.swap(false, Ordering::AcqRel) {
         WOKE_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
         WAKE_OWED.store(true, Ordering::Release);
         if press {
-            SWALLOWED.fetch_add(1, Ordering::Relaxed);
-            if let Event::Key(b) = ev { WAKE_KEY_UP.store(b as u32 | 0x100, Ordering::Relaxed); } crate::video::lag::abandon(&ev); // KVMLAT (B574/B575): the swallowed key's timing ends here, not on the next routed key
-            return true;
+            return swallow(ev); // the waking press: counted, a key's release owed once, its timing ended (body at the file tail)
+            // KVMLAT (B574/B575): the swallowed key's timing ends in [`swallow`], not on the next routed key
+            // LIDKEYSWALLOW (B784): the body MOVED to [`swallow`] (line-neutral), which the sleep state's wake claim calls too
         }
         return false;
     }
@@ -229,7 +229,7 @@ static FX_KEY_OWED: AtomicBool = AtomicBool::new(false);
 /// Drain `EVENT_QUEUE` through the shared pop until the owed key is swallowed or the queue is empty (at most 16
 /// events held; they are pushed back in their order).
 #[cfg(feature = "witness")]
-fn drain_own() {
+pub(crate) fn drain_own() {
     let s0 = SWALLOWED.load(Ordering::Relaxed);
     let mut held = [Event::None; 16];
     let mut n = 0;
@@ -242,4 +242,16 @@ fn drain_own() {
     for e in &held[..n] {
         crate::pal::push_event(*e);
     }
+}
+
+// LIDKEYSWALLOW (rmbp-ledger B784) — TAIL-APPENDED. The waking press's swallow, MOVED out of [`gate`]'s blank branch so
+// the sleep state's wake claim (`lidsleep::claim_wake`, folded on [`gate`]'s activity-stamp line) drops its waking key
+// through the same body: one swallow, two callers.
+/// The waking press is dropped at the shared drain: counted, a key's release owed once (swallowed by [`gate`]'s KeyUp
+/// arm), its KVMLAT timing ended (B574/B575). Always `true` (the event is dropped).
+fn swallow(ev: Event) -> bool {
+    SWALLOWED.fetch_add(1, Ordering::Relaxed);
+    if let Event::Key(b) = ev { WAKE_KEY_UP.store(b as u32 | 0x100, Ordering::Relaxed); }
+    crate::video::lag::abandon(&ev);
+    true
 }

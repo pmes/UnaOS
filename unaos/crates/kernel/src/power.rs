@@ -459,8 +459,8 @@ pub mod sleep {
         let wake_ms = now.saturating_sub(at);
         let slept_ms = at.saturating_sub(ENTER_MS.load(Ordering::Relaxed));
         let src = SRCS.get(WAKE_SRC.load(Ordering::Relaxed) as usize).copied().unwrap_or("unexplained");
-        let poll = crate::video::lidsleep::SLEEP_POLL_MS;
-        serial_println!("[power] sleep enter={} wake src={} ms={} slept_ms={} lid_poll_ms={}", STATE, src, wake_ms, slept_ms, poll);
+        let poll = crate::video::lidsleep::SLEEP_POLL_MS; let ks = crate::video::lidsleep::wake_key_swallowed() as u8; // LIDKEYSWALLOW (B784): the waking press swallowed at the pop (1) or none (0: lid, power-key, tests, pointer)
+        serial_println!("[power] sleep enter={} wake src={} ms={} slept_ms={} lid_poll_ms={} key_swallowed={}", STATE, src, wake_ms, slept_ms, poll, ks);
         let e = ENTER_BATT.load(Ordering::Relaxed);
         let (_, _, full, rem) = crate::drivers::smc::battery::extras();
         // Hundredths of a percent per hour: (rem0 - rem1) / full over the slept hours. Measured only across ≥ 60 s of
@@ -488,8 +488,8 @@ pub mod sleep {
             "FAIL"
         };
         serial_println!(
-            ":: SLEEP: state={} wake_ms={} drain_pct_per_h={} wakes={} unexplained={} -> {} :: src={} slept_ms={} drain={} rem_mah={} lid_poll_ms={}",
-            STATE, wake_ms, d, WAKES.load(Ordering::Relaxed), unexpl, verdict, src, slept_ms, why, opt(rem), poll
+            ":: SLEEP: state={} wake_ms={} drain_pct_per_h={} wakes={} unexplained={} wake_key_swallowed={} -> {} :: src={} slept_ms={} drain={} rem_mah={} lid_poll_ms={}",
+            STATE, wake_ms, d, WAKES.load(Ordering::Relaxed), unexpl, ks, verdict, src, slept_ms, why, opt(rem), poll
         );
     }
 
