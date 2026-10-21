@@ -27328,11 +27328,11 @@ pub fn arm_appmenu_selftest() {
 // ONEINSTANCE (x86 B734), under `desktop_firmware` (the aarch64 desktop knob; knob-off every statement is cfg-erased).
 // (a) ONE check at the funnel every aarch64 detached launch shares (`spawn_user_image_bg_piped`: the shell's `bg` and bare
 // name, the dock, Quarry, `SYS_SPAWN_PATH`), before anything is claimed: a launch by the USER'S VERB (`origin::current()`
-// Glass or Door) of a program already running with a window, same session, same user, spawns nothing. `wm::focussteal`
-// is x86's, so the instance is found here with the calls both arches have: an owner (== ASID, `wm::owner_of_launch`)
-// whose armed name (`wm::app_name_of`) is `program_name(argv[0])` or APPRES's launch name (ASCII case folded, MAX_TITLE
-// cut — `raise_instance`'s match), with a live window (`wm::owner_rows`), running as the session's user. The verb names
-// it, so the raise is given (`cause=verb`) and granted as RAISEVERB grants it (`user_input_set_active` only on a real
+// Glass or Door) of a program already running with a window, same session, same user, spawns nothing. FOCUS64B (SR182):
+// the instance AND the verdict are wm's one policy, `wm::focussteal::raise_instance` (x86's gate asks it too): an owner
+// (== ASID) whose armed name (`wm::app_name_of`) is `program_name(argv[0])` or APPRES's launch name (ASCII case folded,
+// MAX_TITLE cut), on a live non-compat row, admitted by this arch's same-user test (`oneinstance_same_user`). The verb
+// names it, so the raise is given (`cause=verb`) and granted as RAISEVERB grants it (`user_input_set_active` only on a real
 // arrival, then `focus_changed`); argv[1] goes to its mailbox as one `BUS_VERB_OPEN_ARG` frame (kind REPLY, corr 0)
 // and the launcher reads `Err(ONEINSTANCE_RAISED)`. A SPAWN_PIPE child and an unscoped (System) spawn are never gated.
 // (b) Quarry's opener asks it first ([`oneinstance_open_arg`]). (c) The OPEN_ARG hold across a call in flight —
@@ -27354,36 +27354,21 @@ fn oneinstance_gate(argv: &[&str], piped: bool) -> Option<i64> {
     let arg = argv.get(1).copied().unwrap_or("");
     let launch_name = crate::fs::appres::launch_name(path);
     let names = [crate::video::wm::program_name(path), launch_name.as_deref().unwrap_or("")];
-    let Some(owner) = (!new).then(|| oneinstance_find(&names)).flatten() else {
+    let keep = |o: u64| oneinstance_same_user(o);
+    let found = if new { None } else { crate::video::wm::focussteal::raise_instance(&names, &keep) };
+    let Some((owner, given)) = found else {
         serial_println!("[app] launch path={} instance=new arg={}{}", path, arg.len(), if new { " new=1" } else { "" });
         return None;
     };
-    if USER_INPUT_ACTIVE.load(Ordering::Acquire) != owner {
-        user_input_set_active(owner);
+    if given {
+        if USER_INPUT_ACTIVE.load(Ordering::Acquire) != owner {
+            user_input_set_active(owner);
+        }
+        crate::video::wm::focus_changed(owner);
     }
-    crate::video::wm::focus_changed(owner);
-    serial_println!("[wm] raise owner={} focus=given cause=verb", owner);
     let rc = if arg.is_empty() { 0 } else { bus_open_arg_to(owner, arg.as_bytes()) };
-    serial_println!("[app] launch path={} instance=raised arg={} owner={} focus=given delivered={}", path, arg.len(), owner, rc);
+    serial_println!("[app] launch path={} instance=raised arg={} owner={} focus={} delivered={}", path, arg.len(), owner, if given { "given" } else { "pulsed" }, rc);
     Some(rc)
-}
-
-/// The running instance for `names`: a live-windowed owner whose armed name matches, as the session's user.
-#[cfg(feature = "desktop_firmware")]
-fn oneinstance_find(names: &[&str]) -> Option<u64> {
-    use crate::video::wm::MAX_TITLE;
-    if names.iter().all(|n| n.is_empty()) {
-        return None;
-    }
-    let cut = |n: &str| n.len().min(MAX_TITLE);
-    let mut buf = [0u8; MAX_TITLE];
-    (1..=crate::procslot::SLOT_ID_MAX as u64).find(|&o| {
-        let n = crate::video::wm::app_name_of(o, &mut buf);
-        n > 0
-            && names.iter().any(|w| cut(w) == n && buf[..n].eq_ignore_ascii_case(&w.as_bytes()[..n]))
-            && crate::video::wm::owner_rows(o) > 0
-            && oneinstance_same_user(o)
-    })
 }
 
 /// Does `asid` run as the session's user? Every launch with a session open is restamped to it (`session_restamp`), and
@@ -27766,6 +27751,7 @@ fn bus_window_raise(asid: u64, body: &[u8], text: &mut alloc::vec::Vec<u8>) -> i
 #[cfg(feature = "desktop_firmware")]
 fn spawn_focus_grant(asid: u64) {
     if !crate::video::wm::spawn_focus_take(asid) {
+        idle_focus_grant(asid); // FOCUS64B (SR182): no token, or held — the weak idle grant (below)
         return;
     }
     if USER_INPUT_ACTIVE.load(Ordering::Acquire) != asid {
@@ -27773,4 +27759,27 @@ fn spawn_focus_grant(asid: u64) {
     }
     crate::video::wm::focus_changed(asid);
     serial_println!(":: wc-arm64: input focus -> asid {} (SPAWN-FOCUS: operator-launched, first window) ::", asid);
+}
+
+// =====================================================================================================
+// FOCUS64B (LEDGER SR182; BP-video-23) — the aarch64 twin of x86 `sys_win_create`'s weak idle grant ("first window,
+// shell was idle"). File tail: nothing above moves. Reached from `spawn_focus_grant` when no SPAWN-FOCUS token
+// granted the window (an app's later window, an unarmed create, or a map wm just held).
+// =====================================================================================================
+
+/// FOCUS64B: x86's exact condition — wm did not just hold this owner (`focussteal::held_now`) AND nobody holds the
+/// keyboard (`USER_INPUT_ACTIVE` CAS from 0, the shell) — so it can never STEAL focus. On the CAS win the arrival is
+/// `user_input_set_active` (this arch's one arrival: ring cleared, pointer arrival, pre-launch drain, cursor shape,
+/// takeover latch, wake; its swap is `asid -> asid`), then the visible half (`wm::focus_changed`). Called with
+/// WINDOWS and the IRQ mask already released, as `spawn_focus_grant` is.
+#[cfg(feature = "desktop_firmware")]
+fn idle_focus_grant(asid: u64) {
+    if crate::video::wm::focussteal::held_now(asid)
+        || USER_INPUT_ACTIVE.compare_exchange(0, asid, Ordering::AcqRel, Ordering::Acquire).is_err()
+    {
+        return;
+    }
+    user_input_set_active(asid);
+    crate::video::wm::focus_changed(asid);
+    serial_println!(":: wc-arm64: input focus -> asid {} (first window, shell was idle) ::", asid);
 }
