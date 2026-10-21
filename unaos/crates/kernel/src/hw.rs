@@ -242,7 +242,7 @@ fn pci_rows(c: &mut Census, wait: bool) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn pci_rows(_c: &mut Census, _wait: bool) {}
+fn pci_rows(c: &mut Census, wait: bool) { arm_rows(c, wait) } // HWCENSUSARM (LEDGER SR165): the aarch64 hosts, NIC and panel (file tail). LINE-NEUTRAL, code before the comment.
 
 // ── USB ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -335,7 +335,7 @@ fn usb_claim(slot: u8, vid: u16, pid: u16, roles: u8) -> (&'static str, &'static
 
 // ── Block, SMC, ACPI ────────────────────────────────────────────────────────────────────────────────────────────
 
-fn size_words(bytes: u64) -> String {
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] fn size_words(bytes: u64) -> String { // HWCENSUSARM (SR165): unused on an aarch64 build with no SD driver. LINE-NEUTRAL fold
     if bytes >= 1_000_000_000 {
         alloc::format!("{} GB", bytes / 1_000_000_000)
     } else {
@@ -366,7 +366,7 @@ fn block_rows(c: &mut Census) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn block_rows(_c: &mut Census) {}
+fn block_rows(c: &mut Census) { arm_block_rows(c) } // HWCENSUSARM (LEDGER SR165): the aarch64 SD card (file tail). LINE-NEUTRAL, code before the comment.
 
 #[cfg(target_arch = "x86_64")]
 fn other_rows(c: &mut Census) {
@@ -384,3 +384,74 @@ fn other_rows(c: &mut Census) {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn other_rows(_c: &mut Census) {}
+
+// ── HWCENSUSARM (LEDGER SR165, BP-bar-25) — the aarch64 census — TAIL-APPENDED, so no x86 line above moves ──────────
+// The Pi and the Orin, from the same kind of registries the x86 rows read (no transfer, no bus walk of hw.rs's own):
+// the xHCI host the shared controller slot holds (`xhci::claim` not `NotReady` — the Orin's XUSB, the Pi's VL805, a
+// virt ECAM xHCI; its devices come from `usb_rows`' slot walk, usbnet included), the Pi's GENET (`genet::netinfo`),
+// the panel (`video::WRITER`'s geometry, one masked `try_lock`), and the SD card the block layer was given (the Orin's
+// `sdmmc_tegra::tegra_sd_card_blocks`, the Pi's `emmc2::card_num_blocks`). OWED (outside this arc's files): the
+// Tegra PCIe functions (pcie_probe.rs keeps no table) and the RTL8168 (`NET4_DEVICE` is private to its `mod metal`).
+
+/// Is a controller installed in the shared xHCI slot (`Busy` = installed and on loan)?
+#[cfg(not(target_arch = "x86_64"))]
+fn arm_xhci_installed() -> bool {
+    !matches!(crate::drivers::xhci::claim(), Err(crate::drivers::xhci::XhciClaimError::NotReady))
+}
+
+/// The aarch64 host controller, NIC and panel rows. PCI rows count in `reg.pci`; platform and panel rows in `reg.other`.
+#[cfg(not(target_arch = "x86_64"))]
+fn arm_rows(c: &mut Census, wait: bool) {
+    if arm_xhci_installed() {
+        #[cfg(feature = "tegra")]
+        {
+            c.reg.other += 1;
+            push(c, "plat", String::from("xhci"), String::from("xusb"), String::from("USB 3 controller (xHCI)"), "xhci", "up");
+        }
+        #[cfg(all(not(feature = "tegra"), feature = "piusb"))]
+        {
+            c.reg.pci += 1;
+            push(c, "pci", String::from("1106:3483"), String::from("1:0.0"), String::from("USB 3 controller (xHCI)"), "xhci", "up");
+        }
+        #[cfg(not(any(feature = "tegra", feature = "piusb")))]
+        {
+            c.reg.pci += 1;
+            push(c, "pci", String::from("xhci"), String::from("ecam"), String::from("USB 3 controller (xHCI)"), "xhci", "up");
+        }
+    }
+    #[cfg(feature = "genet")]
+    if let Some(n) = crate::arch::aarch64::genet::netinfo() {
+        c.reg.other += 1;
+        push(c, "plat", String::from("genet"), String::from("soc"), String::from("Ethernet controller"), "genet", if n.link_up { "up" } else { "held" });
+    }
+    // The panel: one masked, non-blocking read of the panel handle's geometry (never `panel_info_nonblocking`: its
+    // refusal count is the `[inwedge]` witness's). Held = retried when the caller may wait, else the census is busy.
+    let info = retry(wait, || crate::arch::without_interrupts(|| crate::video::WRITER.try_lock().map(|fb| fb.info())));
+    match info {
+        None => c.busy = true,
+        Some(i) if i.width > 0 && i.height > 0 => {
+            c.reg.other += 1;
+            push(c, "disp", String::from("fb"), String::from("scanout"), alloc::format!("Display panel ({}x{})", i.width, i.height), "fb", "up");
+        }
+        Some(_) => {}
+    }
+}
+
+/// The aarch64 SD card the block layer was given (counted in `reg.block`, like the x86 SD host's card).
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(unused_variables)]
+fn arm_block_rows(c: &mut Census) {
+    #[cfg(all(feature = "sdmmc", feature = "tegra"))]
+    {
+        let n = crate::arch::aarch64::sdmmc_tegra::tegra_sd_card_blocks();
+        if n > 0 {
+            c.reg.block += 1;
+            push(c, "sd", String::from("card"), String::from("sdmmc"), alloc::format!("SD card ({})", size_words(n.saturating_mul(512))), "sdmmc", "up");
+        }
+    }
+    #[cfg(feature = "baremetal")]
+    if let Some(n) = crate::drivers::emmc2::card_num_blocks() {
+        c.reg.block += 1;
+        push(c, "sd", String::from("card"), String::from("emmc2"), alloc::format!("SD card ({})", size_words(n.saturating_mul(512))), "emmc2", "up");
+    }
+}
