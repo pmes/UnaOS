@@ -412,8 +412,8 @@ pub mod sleep {
     pub fn enter(via: &str, backlight: &str) {
         if ASLEEP.swap(true, Ordering::AcqRel) { return; } #[cfg(feature = "login")] crate::video::lock::before_sleep(via); // AUTOLOCK (B712): the lid (system.lock.on_lid) or another sleep (on_sleep) locks the glass BEFORE the state's line; `tests` never locks. LINE-NEUTRAL fold, code first.
         ENTER_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
-        ENTER_BATT.store(u32::MAX, Ordering::Relaxed);
-        serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=1khz usb=up s3=unreachable", STATE, via, backlight);
+        ENTER_BATT.store(u32::MAX, Ordering::Relaxed); #[cfg(not(feature = "tickless"))]
+        serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=1khz usb=up s3=unreachable", STATE, via, backlight); #[cfg(feature = "tickless")] serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=tickless-idle usb=up s3=unreachable", STATE, via, backlight); // TICKLESS (B765): idle cores halt to their nearest deadline, not between 1 kHz ticks (the attribute on the line above gates the knob-off line; LINE-NEUTRAL)
     }
 
     /// The entry's slow half, from the service pass after the panel is dark: the S3 census (once per boot), a stale
