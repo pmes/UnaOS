@@ -1057,6 +1057,14 @@ rc=$?
 brc=$?
 [ "$brc" = 2 ] && exit 2
 [ "$brc" = 0 ] || rc=1
+# GATE-FIRMWARE — THE THIRD POPULATION (LEDGERFW; GATENEUTRAL SR166, BP-shape-11, LAWS.md §3 R52). The census of
+# unaos/firmware/ (tools/firmware-census.py, also the `gates` row `firmware`) is folded in the same way as the branch census:
+# a 2 (no verdict) wins, a 1 reds this script. TMPDIR is pinned the way `_gates_one` pins it: its selftest uses tempfile.
+mkdir -p "$ROOT/unaos/target/gates-tmp" 2>/dev/null
+TMPDIR="$ROOT/unaos/target/gates-tmp" python3 "$(dirname "${BASH_SOURCE[0]}")/../../tools/firmware-census.py" "$ROOT"
+frc=$?
+[ "$frc" = 2 ] && exit 2
+[ "$frc" = 0 ] || rc=1
 exit "$rc"
 # GO-RED PROOF (tree mutation, run before shipping; each reverted after):
 #   duplicate id           -> RED naming the line       status "standing"      -> RED (outside the enum)
@@ -1073,6 +1081,8 @@ exit "$rc"
 #   the same under UNAOS_LEDGER_STRICT=1 -> RED, exit 1   (the landing's setting)
 #   `→ SR2` on hw-rmbp     -> resolves, neither red nor deferred (the control: the check still fires
 #                             where the target is local, which is the half a blanket skip would lose)
+#   a NUL blob unaos/firmware/zz_gateplant.bin -> RED, exit 1 (`FIRMWARE: … binary file under unaos/firmware
+#                             … (R52)`); unaos/firmware/ absent -> exit 2 (`FIRMWARE: CONTROL`), never a green (LEDGERFW)
 #
 # GO-RED PROOF, SECOND CUT (LEDGERGATES 2026-09-15; every case below executed, then reverted, and
 # `git status` clean of the mutations afterwards. The two detached worktrees were throwaways under

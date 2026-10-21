@@ -2722,3 +2722,56 @@ fn`/`#[cfg(test)]`/a `*selftest*`/`*fixture*`/`*sanity*` fn; (S2) `ignite` calli
 (S3) `metrics::SANITY_CONST_ASSERTS` disagreeing with the `const _` asserts in the `uimetrics_sanity*` fns.
 `--selftest` proves each refusal and each allowed shape. The metric relations run under `tests sanity`:
 `:: SANITY: const_asserts=<n> runtime_moved=<n> left=<n> -> PASS ::`.
+
+## GATE-NEUTRAL — a file both arches compile names subsystems, never boards (SR166, 2026-10-21)
+
+**The hole.** BP-shape-4 (R16; Peter 2026-09-03, LAWS.md:185: `[pwrreboot]`, not `[orinreboot]`) was held by no gate:
+the blueprint's gates sheet said "no implementation found". A board name in a shared kernel file compiled green on
+every leg and was caught by review, or not caught.
+
+**The gate.** `python3 tools/neutral-check.py <repo root>`, the `gates` row `neutral`. Scope: every `.rs` under
+`unaos/crates/kernel/src` minus `arch/` (arch/<isa>/ holds the board files R16 allows). A finding is a word part that
+starts with orin/rmbp/pi4/jetson/tegra (or ends with rmbp/pi4/jetson/tegra plus digits and a letter) in a code
+identifier or an identifier-shaped word in a string literal; comments, the string after `feature =`, ledger/round/
+capture citations inside strings and the stem of an arch/ module are not findings. Key `<file>  <token>` (no line
+number). Ruled exceptions are `tools/neutral.allow`, one row per key with its reason, SHRINK-ONLY: a key with no row
+is NEW (exit 1), a row that matches nothing is STALE (exit 1). Controls (exit 2): the scope enumerates >= 200 files,
+arch/ holds >= 1 board-named module, every allowlist row parses with a non-empty reason, and the `--selftest` fixture
+(run first by main) behaves.
+
+**Go-red (measured LEDGERFW at e3c98fcd, on a scratch copy of the kernel src and the allowlist).** The plant
+`gates --selftest` uses (`_gates_plant` neutral): `pub fn orinzzgateplant() {}` as `video/zz_gateplant_neutral.rs` ->
+exit 1, `NEUTRAL: NEW   unaos/crates/kernel/src/video/zz_gateplant_neutral.rs:1 ident orinzzgateplant — name it for
+the subsystem (R16), or add a tools/neutral.allow row with the reason`, summary `files=346 findings=111 allowed=110
+new=1 stale=0 -> FAIL`. Plant removed: `files=345 findings=110 allowed=110 new=0 stale=0 -> PASS`, exit 0.
+
+**What it does not do.** It reads names, not behaviour: board-specific LOGIC under a neutral name passes. The 110
+allowlisted findings are owed renames, each named in its row's reason.
+
+## GATE-FIRMWARE — no vendor firmware in the tree, only pinned facts about it (SR166, 2026-10-21)
+
+**The hole.** BP-shape-11 (R52, R127; LAWS.md:292-299): a vendor firmware set is STAGED on media and loaded as data,
+never committed. The enforcer LAWS named, "a `git ls-files` census in ledger-check.sh", was owed; a blob committed
+under `unaos/` would have passed every gate.
+
+**The gate.** `python3 tools/firmware-census.py <repo root>`, the `gates` row `firmware`, and called by GATE-LEDGER
+(`unaos/scripts/ledger-check.sh`, after the branch census, its exit folded the same way: 2 exits 2, 1 sets rc=1;
+TMPDIR pinned to `unaos/target/gates-tmp` like `_gates_one`). The census is `git ls-files --cached --others
+--exclude-standard -- unaos/firmware` (a walk, `census=walk`, when the root is not a git top level, e.g. the GATEPATH
+scratch copy). A `<set>.pins` file must be NUL-free text whose rows are `<name> <64 lowercase hex>`, with at least one
+such row and a ledger id that resolves to a row of LEDGER.md or OS/*-ledger.md. Any other file fails if it holds a
+NUL byte (vendor bytes, R52), else needs its sha256 as a pins digest row and its file name in a ledger row. Controls
+(exit 2): `unaos/firmware/` exists and the census holds >= 1 file; a ledger file reads; the `--selftest` fixture
+(binary blob, unpinned text, pins with no digest, malformed row, unresolving ledger id: red; a clean set: green).
+
+**Go-red (measured LEDGERFW at e3c98fcd, on a scratch copy of unaos/firmware and the ledgers).** The plant `gates
+--selftest` uses (`_gates_plant` firmware): `\177ELF\000\000zzgateplant` as `unaos/firmware/zz_gateplant.bin` ->
+exit 1, `FIRMWARE: unaos/firmware/zz_gateplant.bin: binary file under unaos/firmware — vendor firmware is staged on
+media, never committed (R52)`, summary `census=walk files=4 pins=3 digests=10 other=1 findings=1 -> FAIL`. Plant
+removed: `files=3 pins=3 digests=10 other=0 findings=0 -> PASS`. `unaos/firmware/` moved aside: exit 2, `FIRMWARE:
+CONTROL — unaos/firmware missing or the census is empty (walk)`. On the tree: `census=git files=3 pins=3 digests=10
+other=0 findings=0 -> PASS`.
+
+**What it does not do.** It cannot see a blob committed OUTSIDE `unaos/firmware/` (the census's corpus is that one
+directory), nor tell a pins digest written from the bench's measurement from a hand-typed one; the ledger row that
+names the set is the record review reads.

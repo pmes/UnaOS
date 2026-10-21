@@ -295,8 +295,8 @@ seat. Peter's own words are never paraphrased here: they live verbatim in
   boot media beside the vendor's licence agreement and loaded by the kernel as data from that
   volume. It is never linked into any UnaOS artifact, never embedded, never committed to the
   repository, and never modified; the flight's ledger row names each file, its size, its sha256
-  and the licence it ships under. Enforcer: no binary firmware under `unaos/` (a `git ls-files`
-  census in ledger-check.sh, owed); the ledger row's file list.
+  and the licence it ships under. Enforcer: no binary firmware under `unaos/` (the git ls-files
+  census, tools/firmware-census.py, the gates row firmware, SR166); the ledger row's file list.
 
 ## 4. Executors
 

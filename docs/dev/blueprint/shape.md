@@ -42,7 +42,6 @@
 
 ## 5. Ruled, unbuilt
 - CODEX Amendment IV (Sonde as the 22nd handler) is drafted, not signed: `docs/CODEX.md:15` still says The 21 (R112).
-- The firmware census (BP-shape-11) runs as the `firmware` gates row; its call from ledger-check is owed (SR166).
 
 ## 6. Read further
 - `docs/dev/LAWS.md` §3 — the cross-cutting rules this sheet cites.

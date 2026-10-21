@@ -54,7 +54,7 @@
 
 ## 5. Ruled, unbuilt / open
 - GATE-NEUTRAL (BP-shape-4): built as the `neutral` row (SR166); 110 findings at fb8ad2f4 sit on `tools/neutral.allow`, each reason naming its owed rename.
-- The firmware census (BP-shape-11): built as the `firmware` row (SR166); a call from `unaos/scripts/ledger-check.sh` (GATE-LEDGER) is owed.
+- The firmware census (BP-shape-11): built as the `firmware` row (SR166); GATE-LEDGER (`unaos/scripts/ledger-check.sh`, after the branch census) runs it too, its exit folded the same way (LEDGERFW).
 
 ## 6. Read further
 - `docs/dev/LAWS.md` §5, `docs/dev/PLAYBOOK.md` §1-§3, `docs/dev/EXECUTOR-BRIEF.md`.
