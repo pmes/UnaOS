@@ -24,8 +24,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static ITEMS: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
-/// The session user the cache was read for (empty = not read).
-static LOADED_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new()); static SEEN: crate::prefs::SessionSeen = crate::prefs::SessionSeen::new(); // SESSIONGEN (B462)
+static SEEN: crate::prefs::SessionSeen = crate::prefs::SessionSeen::new(); // SESSIONGEN (B462). SESSIONEDGE (B793): the one session record — a moved key with a session is a login (no user-name copy)
 static SAVE_OWED: AtomicBool = AtomicBool::new(false);
 static LAUNCH_OWED: AtomicBool = AtomicBool::new(false);
 /// Items launched at the last login (the witness reads it).
@@ -33,7 +32,7 @@ static LAUNCHED_N: AtomicU32 = AtomicU32::new(0);
 
 /// `users::login`: the session opened — read this user's list and launch it once the desktop is built.
 pub fn post_login() {
-    LOADED_FOR.lock().clear(); SEEN.forget(); // SESSIONGEN (B462): after the clear
+    SEEN.forget(); // SESSIONGEN (B462). SESSIONEDGE (B793): the login's own edge — the next pass reads the list
     LAUNCH_OWED.store(true, Ordering::Release);
 }
 
@@ -85,12 +84,11 @@ pub fn edit(op: &str, name: &str, via: &str) -> bool {
 /// login's launch once the desktop is built.
 pub fn service() {
     let mut wb = [0u8; crate::prefs::WHO_BUF]; let (sk, sq) = SEEN.check(); let who = if sq.is_none() { crate::prefs::user_name_in(&mut wb) } else { None }; if sq.is_none() { SEEN.mark(sk, who.is_some()); } // SESSIONGEN (B462): compared only when the login generation (or post_login) moved; PERFREVIEW F3 (B443): on the stack
-    if !sq.unwrap_or(who.is_some()) { return } let u = who.unwrap_or("");
-    let fresh = who.is_some() && { let g = LOADED_FOR.lock(); *g != u }; // SESSIONGEN: quiet => compared (and recorded) under this key already
+    if !sq.unwrap_or(who.is_some()) { return }
+    let fresh = who.is_some(); // SESSIONEDGE (B793): `who` is read only on a moved key — quiet => compared (and recorded) under this key already
     if fresh {
         let l = crate::prefs_client::sys_text(crate::prefs::key::LOGIN_ITEMS).map(|t| prefs_core::login::parse(&t)).unwrap_or_default();
         *ITEMS.lock() = l;
-        *LOADED_FOR.lock() = String::from(u);
         SAVE_OWED.store(false, Ordering::Release);
     }
     if SAVE_OWED.swap(false, Ordering::AcqRel) {
