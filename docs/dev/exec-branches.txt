@@ -711,12 +711,22 @@ refs/heads/exec-rmbp-focus64b   dcb54c09 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-keepreaders   fd22dc1d FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-el0home   09ab5e1d FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-settingssub   d3cf1707 FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-wifidata   7bcc5652 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-wifidata   f58e9fe0 FOLDED-BY-HAND (this commit) 2026-10-21 B803
 refs/heads/exec-rmbp-heldslotep0   f3b744ca FOLDED-BY-HAND (this commit) 2026-10-21 B804
 refs/heads/exec-rmbp-staletext3   14af7415 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-playstartgap   d727711a FOLDED-BY-HAND (this commit) 2026-10-21 B805
-refs/heads/exec-rmbp-columnshover   b95a948a IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-buskeepcrate   5fff6848 IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-ehcipoolrecycle   5fff6848 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-columnshover   930a37bf FOLDED-BY-HAND (this commit) 2026-10-21 B806
+refs/heads/exec-rmbp-buskeepcrate   64cad5e1 FOLDED-BY-HAND (this commit) 2026-10-21 SR186
+refs/heads/exec-rmbp-ehcipoolrecycle   d6b61ec8 FOLDED-BY-HAND (this commit) 2026-10-21 B807
 refs/heads/exec-rmbp-idleusblevel   a3e46cc1 FOLDED-BY-HAND (this commit) 2026-10-21 B808
-refs/heads/exec-rmbp-uacimplicit   5fff6848 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-uacimplicit   f95367c2 FOLDED-BY-HAND (this commit) 2026-10-21 B809
+refs/heads/exec-rmbp-trackpadmt   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-keyboot2   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-hdaring   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-sleep2   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-aethernet2   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-textscale   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-textscale2   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-toastflicker   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-a11yshadow   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-bootlist   d88a9c18 IN-FLIGHT cut 2026-10-21
