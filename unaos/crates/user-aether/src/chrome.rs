@@ -130,9 +130,10 @@ use sidetabs::{SideHit, SideStrip, TabLayout};
 pub const TAB_H: i32 = 26;
 pub const BAR_H: i32 = 30;
 pub const CHROME_H: i32 = TAB_H + BAR_H;
-/// The type: the BODY size (tab titles, the address field) and one step down (the zoom badge, the letter tile).
-const FONT: f32 = 11.0;
-const FONT_SMALL: f32 = 9.5;
+/// The type: the BODY size (tab titles, the address field) and one step down (the zoom badge, the letter tile), at the
+/// default `system.display.font_size`; TEXTSCALE2 (B814): the live sizes are [`font`] / [`font_small`] (file tail).
+const FONT_BASE: f32 = 11.0;
+const FONT_SMALL_BASE: f32 = 9.5;
 /// The header's inset from the window's left and right edges, and the gap between neighbouring controls.
 const EDGE: i32 = 8;
 const GAP: i32 = 4;
@@ -514,6 +515,7 @@ pub fn prefs(app: &mut App, moved: bool) {
     if !moved {
         return;
     }
+    restyle(app); // TEXTSCALE2 (B814): the chrome face follows `system.display.font_size` (file tail)
     let want = crate::theme::pref_text(LAYOUT_PREF).map(|t| TabLayout::parse(&t)).unwrap_or_default();
     if want == app.ch.layout {
         return;
@@ -1121,7 +1123,7 @@ fn caret_at(fonts: &Fonts, text: &str, x: f32) -> usize {
     let mut t = fonts.0.borrow_mut();
     let mut best = (0usize, f32::MAX);
     for (i, _) in text.char_indices().chain(core::iter::once((text.len(), ' '))) {
-        let d = (t.measure(&text[..i], FontSel::default(), FONT) - x).abs();
+        let d = (t.measure(&text[..i], FontSel::default(), font()) - x).abs();
         if d < best.1 {
             best = (i, d);
         }
@@ -1534,19 +1536,19 @@ fn label_at(cv: &mut Canvas, fonts: &Fonts, s: &str, x: f32, top: i32, h: i32, i
 /// [`label_at`] at the body size.
 #[allow(clippy::too_many_arguments)]
 fn label(cv: &mut Canvas, fonts: &Fonts, s: &str, x: f32, top: i32, h: i32, ink: u32, x0: i32, x1: i32) -> f32 {
-    label_at(cv, fonts, s, x, top, h, ink, x0, x1, FONT)
+    label_at(cv, fonts, s, x, top, h, ink, x0, x1, font())
 }
 
 /// `s` cut (with an ellipsis) to fit `w` px.
 fn fit(fonts: &Fonts, s: &str, w: f32) -> String {
     let mut t = fonts.0.borrow_mut();
-    if t.measure(s, FontSel::default(), FONT) <= w {
+    if t.measure(s, FontSel::default(), font()) <= w {
         return String::from(s);
     }
     let mut out = String::new();
     for c in s.chars() {
         out.push(c);
-        if t.measure(&out, FontSel::default(), FONT) + t.measure("\u{2026}", FontSel::default(), FONT) > w {
+        if t.measure(&out, FontSel::default(), font()) + t.measure("\u{2026}", FontSel::default(), font()) > w {
             out.pop();
             break;
         }
@@ -1613,8 +1615,8 @@ fn tab_tile(cv: &mut Canvas, ch: &Chrome, fonts: &Fonts, sk: &Skin, t: &tabs::Ta
     rrect(cv, x, y, s, s, TILE_R, if on { sk.tile } else { sk.tile_dim }, false);
     let mut letter = [0u8; 4];
     let letter: &str = t.initial().encode_utf8(&mut letter);
-    let lw = fonts.0.borrow_mut().measure(letter, FontSel::default(), FONT_SMALL);
-    label_at(cv, fonts, letter, x as f32 + (s as f32 - lw) / 2.0, y, s, sk.bar, x, x + s, FONT_SMALL);
+    let lw = fonts.0.borrow_mut().measure(letter, FontSel::default(), font_small());
+    label_at(cv, fonts, letter, x as f32 + (s as f32 - lw) / 2.0, y, s, sk.bar, x, x + s, font_small());
 }
 
 /// AETHERSIDETABS2 (SR143): the side column — `SideStrip::layout`'s rows under the toggle row, the column's width
@@ -1680,9 +1682,9 @@ fn paint_side(ch: &Chrome, cv: &mut Canvas, fonts: &Fonts, sk: &Skin) {
                 let count = alloc::format!("{}", ch.strip.group_tabs(gid).len());
                 let cx = (cw - 8 - CTL / 2) as f32;
                 glyph(cv, if g.collapsed { Glyph::Fwd } else { Glyph::Down }, cx, (y + rh / 2) as f32, sk.dim);
-                let nw = fonts.0.borrow_mut().measure(&count, FontSel::default(), FONT_SMALL);
+                let nw = fonts.0.borrow_mut().measure(&count, FontSel::default(), font_small());
                 let nx = cx - CTL as f32 / 2.0 - nw;
-                label_at(cv, fonts, &count, nx, y, rh, sk.dim, 0, cw, FONT_SMALL);
+                label_at(cv, fonts, &count, nx, y, rh, sk.dim, 0, cw, font_small());
                 let t0 = bx + 10 + SIDE_TILE + TILE_GAP;
                 let t1 = nx as i32 - GAP;
                 if t1 > t0 + 4 {
@@ -1732,9 +1734,9 @@ fn paint_menu(ch: &Chrome, cv: &mut Canvas, fonts: &Fonts, sk: &Skin) {
         let x1 = mx + mw - 2 * MENU_PAD;
         let mut t1 = x1;
         if !key.is_empty() {
-            let kw = fonts.0.borrow_mut().measure(key, FontSel::default(), FONT_SMALL);
+            let kw = fonts.0.borrow_mut().measure(key, FontSel::default(), font_small());
             let kx = x1 as f32 - kw;
-            label_at(cv, fonts, key, kx, ry, MENU_ROW, sk.dim, mx, x1, FONT_SMALL);
+            label_at(cv, fonts, key, kx, ry, MENU_ROW, sk.dim, mx, x1, font_small());
             t1 = kx as i32 - GAP;
         }
         let t0 = mx + 3 * MENU_PAD;
@@ -1832,7 +1834,7 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
             }
         }
         let s = if on { "\u{2605}" } else { "\u{2606}" };
-        let gw = fonts.0.borrow_mut().measure(s, FontSel::default(), FONT);
+        let gw = fonts.0.borrow_mut().measure(s, FontSel::default(), font());
         let ink = if on { sk.accent } else if enabled { sk.ink } else { sk.dim };
         label(cv, fonts, s, star.0 as f32 + (star.1 as f32 - gw) / 2.0, by, CTL, ink, star.0, star.0 + star.1);
     }
@@ -1849,9 +1851,9 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
     let mut x1 = fx + fw - FIELD_PAD;
     if ch.zoom != 100 {
         let z = alloc::format!("{}%", ch.zoom);
-        let zw = fonts.0.borrow_mut().measure(&z, FontSel::default(), FONT_SMALL);
+        let zw = fonts.0.borrow_mut().measure(&z, FontSel::default(), font_small());
         let zx = (fx + fw - FIELD_PAD) as f32 - zw;
-        label_at(cv, fonts, &z, zx, ft, fh, sk.dim, fx, fx + fw - FIELD_PAD / 2, FONT_SMALL);
+        label_at(cv, fonts, &z, zx, ft, fh, sk.dim, fx, fx + fw - FIELD_PAD / 2, font_small());
         x1 = zx as i32 - GAP;
     }
     let tx0 = fx + FIELD_PAD;
@@ -1861,7 +1863,7 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
             let sel = o.buf.selections()[0];
             let (caret, s0, s1) = {
                 let mut t = fonts.0.borrow_mut();
-                let m = |t: &mut crate::txt::Txt, b: usize| t.measure(&text[..b.min(text.len())], FontSel::default(), FONT);
+                let m = |t: &mut crate::txt::Txt, b: usize| t.measure(&text[..b.min(text.len())], FontSel::default(), font());
                 (m(&mut *t, sel.head), m(&mut *t, sel.start()), m(&mut *t, sel.end()))
             };
             let vw = (x1 - tx0).max(8) as f32;
@@ -1965,4 +1967,48 @@ pub fn open_arg_tab(app: &mut App, page: &mut Page, fonts: &mut Fonts, arg: &str
     crate::follow(app, page, fonts, arg, b"open-arg");
     app.dirty = true;
     Line::new(b":: AETHER: open_arg n=").dec(arg.len() as i64).put(b" tabs=").dec(app.ch.strip.len() as i64).put(b" ::").wire();
+}
+
+// ---- TEXTSCALE2 (rmbp-ledger B814): the chrome face follows the display font size --------------------------------
+// Flight 37: "aether input font size did not increase" — the chrome drew a constant 11 px while the text step moved
+// `system.display.font_size` (Principia's; theme.rs subscribes `system.display.` / `system.accessibility.` on its ONE
+// subscribe and `prefs` above re-reads on its answer). The tab titles, the omnibox field (and its caret), the menu and
+// the badges draw [`font`] / [`font_small`]: the base size x font_size / DEFAULT_CSS_PX, capped at [`FONT_MAX`] — what
+// the 22 px control holds while the header geometry (TAB_H, BAR_H, CTL) stays (its reflow is owed, BP-handlers §5).
+// The page's own faces follow the page's CSS, unchanged.
+
+/// The largest chrome face the control box holds: the field's inner height over a 1.25 line.
+const FONT_MAX: f32 = (CTL - 2 * RING) as f32 / 1.25;
+/// The live body face (f32 bits; 0 = not restyled yet: the base) and the font size it was derived from (0 = none yet).
+static FACE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static FACE_PX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The chrome's body size now, px.
+fn font() -> f32 {
+    match FACE.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => FONT_BASE,
+        b => f32::from_bits(b),
+    }
+}
+
+/// One step down, in the same proportion.
+fn font_small() -> f32 {
+    font() * FONT_SMALL_BASE / FONT_BASE
+}
+
+/// Re-read the type preferences; a moved font size re-derives the face, repaints the chrome and says
+/// `[aether] restyle font_size=<px> text_size=<step> chrome_px=<n>` (the default size at start says nothing).
+fn restyle(app: &mut App) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let (px, step) = crate::theme::read_type();
+    let was = FACE_PX.swap(px as u32, Relaxed);
+    if was == px as u32 || (was == 0 && px == font_core::ui::DEFAULT_CSS_PX) {
+        return;
+    }
+    let face = (FONT_BASE * px as f32 / font_core::ui::DEFAULT_CSS_PX as f32).min(FONT_MAX);
+    FACE.store(face.to_bits(), Relaxed);
+    app.dirty = true;
+    let mut l = Line::new(b"[aether] restyle font_size=");
+    l.dec(px).put(b" text_size=").put(step.as_bytes()).put(b" chrome_px=").dec((face + 0.5) as i64);
+    l.wire();
 }

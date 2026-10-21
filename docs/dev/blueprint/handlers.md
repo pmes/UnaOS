@@ -20,6 +20,7 @@
 | BP-handlers-8 | Vein runs when a caller needs it; no always-on system service (R82). | R82 | unheld |
 | BP-handlers-9 | The host bus (`bandy`, in-process `SMessage` broadcast) is not the on-UnaOS wire; it migrates to the v1 format in a host arc. | `unaos/crates/kernel/src/bus.rs:12-18` | unheld |
 | BP-handlers-10 | Help has no CODEX handler (the manifest is LOCKED and names none): the in-OS manual is kernel furniture (`CHARTER: Kernel — wm`, HELPSEARCH B729), its corpus is a tree directory packed at build time, never a handler's store or a server; the shell verbs' docs stay ONE table, `help::DOCS`, read by `help`, `man`, the Launcher and the Help window. | `docs/help/help.md`; `unaos/crates/kernel/src/help/index.rs:1`; `unaos/crates/kernel/src/help.rs:30` | `gates` row `charter`; `tests helpdoc`, `tests helpsearch` |
+| BP-handlers-11 | Aether's chrome type follows Principia's display font size (TEXTSCALE2 rmbp-ledger B814, the seat's MEASURE line): AETHER.ELF subscribes `system.display.` and `system.accessibility.` beside `system.appearance.` and `aether.tabs.` on its ONE subscribe (`theme::due`, 4 = `PREF_SUB_MAX`), and its ONE re-read hook (`chrome::prefs`) restyles the tab titles, the omnibox field and caret, the menu and the badges: 11 px x font_size / 13, capped at what the 22 px control holds while the header geometry stays; `[aether] restyle font_size=<px> text_size=<step> chrome_px=<n>`. The page's faces follow the page's CSS, unchanged. | `unaos/crates/user-aether/src/theme.rs` (`due`'s `SUBSCRIBE`, `read_type` at the tail); `unaos/crates/user-aether/src/chrome.rs` (`prefs`; TEXTSCALE2 at the tail: `FONT_MAX`, `font`, `font_small`, `restyle`) | `tests textscale2` (`aether=ok`, under `UNAOS_AETHER`), unflown |
 
 ## 3. The manifest (CODEX §2) and where each one is
 | handler | domain | `handlers/` dir | on UnaOS at HEAD |
@@ -56,6 +57,7 @@
 
 ## 5. Ruled, unbuilt
 - CODEX Amendment IV (Sonde) signature (R112). Elessar's dynamic layout on UnaOS (CODEX §4): not on UnaOS at HEAD (`unverified`). R108 (Aether in the Una IDE, the 3D work environments): see RULINGS.
+- TEXTSCALE2 owed (B814): Aether's header geometry (`TAB_H`, `BAR_H`, `CTL`, `MENU_ROW`, `CHROME_H`) reflows with the face, and then the `FONT_MAX` cap goes (bounded by the 288x288 surface, BP-video-8; with TEXTSCALE's metrics); Aether's status line and find field (`paint.rs` `STATUS_H` 14, 11 px) follow the same face; Aether's PrefChanged prefixes are at `PREF_SUB_MAX` = 4, so a fifth needs una-abi's cap raised.
 
 ## 6. Read further
 - `docs/CODEX.md`; `docs/dev/USERLAND/ARCHITECTURE.md`; each handler's own `README.md` for implementation (not charter).
