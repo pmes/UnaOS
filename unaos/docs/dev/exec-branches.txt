@@ -4,3 +4,9 @@ refs/heads/exec-rmbp-depsbump       e3c98fcd IN-FLIGHT cloud wave36 DEPSBUMP
 refs/heads/exec-rmbp-wcparcomment   e3c98fcd IN-FLIGHT cloud wave36 WCPARCOMMENT
 refs/heads/exec-rmbp-ledgerfw       e3c98fcd IN-FLIGHT cloud wave36 LEDGERFW
 refs/heads/exec-rmbp-prefsunset     e3c98fcd IN-FLIGHT cloud wave36 PREFSUNSET
+refs/heads/exec-rmbp-stopendpoint   87e82a82 IN-FLIGHT cloud wave36 STOPENDPOINT
+refs/heads/exec-rmbp-ehciwake       87e82a82 IN-FLIGHT cloud wave36 EHCIWAKE
+refs/heads/exec-rmbp-scrollpanes    87e82a82 IN-FLIGHT cloud wave36 SCROLLPANES
+refs/heads/exec-rmbp-ring3scroll    87e82a82 IN-FLIGHT cloud wave36 RING3SCROLL
+refs/heads/exec-rmbp-prefsclientkeys 87e82a82 IN-FLIGHT cloud wave36 PREFSCLIENTKEYS
+refs/heads/exec-rmbp-orinpcierows   87e82a82 IN-FLIGHT cloud wave36 ORINPCIEROWS
