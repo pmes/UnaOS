@@ -2653,7 +2653,7 @@ pub fn close(id: WinId) -> bool {
     // WMDIRECT — the drag does not survive the window. Ahead of the row free (and of the WEDGE
     // token) so the gesture is cancelled while the id still means something; after this point the
     // slot may be re-issued and a live drag would be steering a stranger's window.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closing(id); drag_forget(id); winid_close_teardown(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closing(id); drag_forget(id); winid_close_teardown(id); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] scroll_clear(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path. RING3SCROLL (B778): `scroll_clear(id)` — the window's scroll model goes with the row (a ring-3 window closes here, never through an owner's own clear), folded before this line's first `//`.
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`. `close` reaches its barrier through a `TABLE` critical
     // section, so the token has to precede the lock to cover the death that happens ON it.
     crate::wedge2::mark_composite("<D1>", "<d1>");
@@ -2733,7 +2733,7 @@ pub fn close_owner(owner_asid: u64) -> usize {
     crate::wedge2::mark_composite("<D1>", "<d1>");
     // WMDIRECT — see `close`. Keyed on the OWNER here because this path clears every row the ASID
     // holds under one lock and no longer knows their ids by the time it returns.
-    drag_forget_owner(owner_asid); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] super::appmenu::reap(owner_asid);
+    drag_forget_owner(owner_asid); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] super::appmenu::reap(owner_asid); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] scroll_clear_owner(owner_asid); // RING3SCROLL (B778): an ending address space takes its windows' scroll models with it (LINE-NEUTRAL append, code before this comment).
     let mut vacated: alloc::vec::Vec<(usize, usize, usize, usize)> = alloc::vec::Vec::new(); // WINDOWCAP-2
     // CLOSEISO — WHICH ids, not merely how many. A count cannot be falsified against the panel: the
     // Boot AR line `closed=1` was true and told the reader nothing about which window went. The list
@@ -31316,7 +31316,10 @@ pub fn gesture_swipe(dir: i8) -> Option<WinId> {
 // Desktop gate (both arches, no x86-only cfg): the owners (Quarry, Settings) and `draw` live under it.
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub use scrollview::{scroll_blit, scroll_by, scroll_clear, scroll_press, scroll_service, scroll_set, scroll_view, scroll_wheel, scroll_wheel_ev, scrollbar_paint, ScrollFn, ScrollStep, ScrollView, SCROLL_HIDE_MS, WHEEL_LINES};
+pub use scrollview::{scroll_blit, scroll_by, scroll_clear, scroll_clear_owner, scroll_press, scroll_service, scroll_set, scroll_view, scroll_wheel, scroll_wheel_ev, scrollbar_paint, ScrollFn, ScrollStep, ScrollView, SCROLL_HIDE_MS, WHEEL_LINES};
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub use scrollview::scroll_set_ring3; // RING3SCROLL (B778): the bus arm's door (x86 `busx_scroll_set`)
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 mod scrollview {
@@ -31519,6 +31522,25 @@ mod scrollview {
         }
     }
 
+    /// Drop every model `owner` holds (its address space is ending: `close_owner`, the ring-3 exit). One relaxed load
+    /// when no window has a model.
+    pub fn scroll_clear_owner(owner: u64) {
+        if !SCROLL_LIVE.load(Relaxed) {
+            return;
+        }
+        let held = *SCROLL_DRAG.lock();
+        let gone_drag = {
+            let mut g = SCROLLS.lock();
+            let gone = held.is_some_and(|(w, _)| g.iter().any(|r| r.win == w && r.owner == owner));
+            g.retain(|r| r.owner != owner);
+            SCROLL_LIVE.store(!g.is_empty(), Relaxed);
+            gone
+        };
+        if gone_drag {
+            *SCROLL_DRAG.lock() = None;
+        }
+    }
+
     /// `win`'s model, if it has one.
     pub fn scroll_view(win: WinId) -> Option<ScrollView> {
         reg(win).map(|r| r.view)
@@ -31670,6 +31692,13 @@ mod scrollview {
     /// the model (pressed while dragged). A hidden bar is the ground. No model: nothing.
     pub fn scrollbar_paint(win: WinId, px: &mut [u32], stride: usize) {
         let Some(r) = reg(win) else { return };
+        let dragged = SCROLL_DRAG.lock().is_some_and(|(w, _)| w == win);
+        bar_paint(&r, dragged, px, stride);
+    }
+
+    /// The one bar painter, lock-free (RING3SCROLL B778): [`scrollbar_paint`]'s body over a snapshot of the model, so a
+    /// caller that must hold `TABLE` while it writes (a ring-3 surface, [`ring3_bar`]) takes no spin lock under it.
+    fn bar_paint(r: &Reg, dragged: bool, px: &mut [u32], stride: usize) {
         let (vx, vy, vw, vh) = r.view.viewport;
         let (gx, gw) = (vx + vw, r.gutter_w);
         if gw == 0 || stride == 0 || gx + gw > stride || (vy + vh) * stride > px.len() {
@@ -31684,9 +31713,60 @@ mod scrollview {
         use super::super::draw;
         let bw = draw::scrollbar_w().min(gw);
         let thumb = r.view.thumb(vh).map(|(ty, th)| (ty as i32, th as i32));
-        let dragged = SCROLL_DRAG.lock().is_some_and(|(w, _)| w == win);
         let mut s = draw::Surf::new(px, stride);
         let track = draw::Rect::new((gx + gw - bw) as i32, vy as i32, bw as i32, vh as i32);
         draw::scrollbar(&mut s, track, thumb, if dragged { draw::ControlState::PRESSED } else { draw::ControlState::NORMAL });
+    }
+
+    // RING3SCROLL (rmbp-ledger B778; BP-video-38, BP-ring3-4) — the RING-3 OWNER. A program registers its window over the
+    // bus (`BUS_VERB_SCROLL_SET`, x86 `busx_scroll_set`) and gets the same model, wheel and bar as a kernel window; its
+    // ScrollFn is [`ring3_scrolled`]: the content pixels are the program's, so instead of a blit the step's NEW offset is
+    // handed to the program as one `INPUT_EV_SCROLL` (it repaints its viewport at it), and the bar is painted into the
+    // program's gutter by [`ring3_bar`] under `TABLE` — the compositor's own fence on a slot's surface pages.
+    // Wire: `[scroll] win=<id> owner=<asid> ring3 off=<n> delivered=<0|1>` per move.
+
+    /// The bus arm's door: register `win` (a ring-3 row) with the ring-3 owner's ScrollFn, and paint its gutter now (the
+    /// registration comes from the program's paint, the moment a kernel owner paints its bar). `true` = a model is held.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    pub fn scroll_set_ring3(win: WinId, view: ScrollView, gutter_w: usize, ground: u32) -> bool {
+        let live = scroll_set(win, view, gutter_w, ground, ring3_scrolled);
+        if live {
+            let _ = ring3_bar(win);
+        }
+        live
+    }
+
+    /// The ring-3 owner's [`ScrollFn`]: a move hands the program its new offset (ONE `INPUT_EV_SCROLL`); every step
+    /// repaints the gutter and presents the viewport rows. Returns the gutter pixels painted.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    fn ring3_scrolled(win: WinId, st: &ScrollStep) -> usize {
+        let Some(owner) = reg(win).map(|r| r.owner) else { return 0 };
+        let delivered = st.moved != 0 && crate::arch::x86_64::syscall::scroll_deliver(owner, win, st.off);
+        let px = ring3_bar(win);
+        let (_, vy, _, vh) = st.viewport;
+        let _ = super::present_rows_outcome_owned(win, vy, vy + vh, owner);
+        if st.moved != 0 {
+            serial_println!("[scroll] win={} owner={:#x} ring3 off={} delivered={}", win, owner, st.off, delivered as u8);
+        }
+        px
+    }
+
+    /// Paint `win`'s bar into the ring-3 surface: the model and the drag flag are snapshotted FIRST (their locks taken
+    /// and released), then under `TABLE` the row — still `win`, still the registering owner — names the surface, and the
+    /// lock-free [`bar_paint`] writes the gutter. Returns the gutter pixels (0 = no model, no row, or a recycled id).
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    fn ring3_bar(win: WinId) -> usize {
+        let Some(r) = reg(win) else { return 0 };
+        let dragged = SCROLL_DRAG.lock().is_some_and(|(w, _)| w == win);
+        let t = super::table();
+        let Some(row) = super::row(&t, win) else { return 0 };
+        if row.owner_asid != r.owner || row.surf == 0 || row.stride < 4 || row.surf_len < 4 {
+            return 0;
+        }
+        // SAFETY: `surf .. surf + surf_len` is the row's mapped surface (wm::create's F1 extent contract), and `TABLE`
+        // held keeps the row — and with it the slot's pages, freed only after `close_owner` empties the row — alive.
+        let px = unsafe { core::slice::from_raw_parts_mut(row.surf as *mut u32, row.surf_len / 4) };
+        bar_paint(&r, dragged, px, row.stride / 4);
+        r.gutter_w * r.view.viewport.3
     }
 }

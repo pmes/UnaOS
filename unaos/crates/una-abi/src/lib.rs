@@ -1948,7 +1948,7 @@ const _: () = assert!(BUS_VERB_PREF_DECLARE > BUS_VERB_TOAST && BUS_VERB_PREF_DE
 /// Every input-ring event type (`INPUT_EV_*` the ring carries).
 pub const INPUT_EV_ALL: &[u64] = &[
     INPUT_EV_KEY_DOWN, INPUT_EV_KEY_UP, INPUT_EV_MOUSE_REL, INPUT_EV_MOUSE_ABS, INPUT_EV_BUTTON, INPUT_EV_WHEEL,
-    INPUT_EV_ACTION, INPUT_EV_MENU_PICK, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, INPUT_EV_DIALOG_ANSWER, INPUT_EV_DROP, INPUT_EV_CHAR, // KEYCHARS (B718): appended on the list's last line
+    INPUT_EV_ACTION, INPUT_EV_MENU_PICK, INPUT_EV_WIN_RESIZE, INPUT_EV_CLOSE_REQ, INPUT_EV_DIALOG_ANSWER, INPUT_EV_DROP, INPUT_EV_CHAR, INPUT_EV_SCROLL, // RING3SCROLL (B778): INPUT_EV_SCROLL appended before this comment. KEYCHARS (B718): appended on the list's last line
 ];
 /// Every kernel bus verb tag (the registrable range `>= BUS_VERB_FULFIL_MIN` is the bus's, not listed). The
 /// HOLOCRON band is listed by its two ends; [`codes_unique_u8`] also refuses any other tag inside the band.
@@ -1957,7 +1957,7 @@ pub const BUS_VERB_ALL: &[u8] = &[
     BUS_VERB_MENU_CLEAR, BUS_VERB_MENU_GET, BUS_VERB_NOTICE, BUS_VERB_ATTR_SET, BUS_VERB_ATTR_GET, BUS_VERB_ATTR_LIST,
     BUS_VERB_ATTR_QUERY, BUS_VERB_ATTR_STAT, BUS_VERB_PREF_GET, BUS_VERB_PREF_SET, BUS_VERB_PREF_LIST,
     BUS_VERB_PREF_CHANGED, BUS_VERB_REGISTER, BUS_VERB_HOLOCRON_FIRST, BUS_VERB_HOLOCRON_LAST, BUS_VERB_DIALOG,
-    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE, BUS_VERB_DROP_GET, BUS_VERB_A11Y_TREE,
+    BUS_VERB_SHEET, BUS_VERB_TOAST, BUS_VERB_PREF_DECLARE, BUS_VERB_DROP_GET, BUS_VERB_A11Y_TREE, BUS_VERB_SCROLL_SET, // RING3SCROLL (B778): verb 28 appended on the last line
 ];
 /// No two entries equal (and none zero). `const` so the assertion below runs in the compiler.
 pub const fn codes_unique_u64(v: &[u64]) -> bool {
@@ -3240,5 +3240,203 @@ mod oneinstance_tests {
         assert_eq!(open_arg_body(&f), None);
         f[6] = BUS_VERB_OPEN_ARG;
         assert_eq!(open_arg_body(&f[..BUS_HDR_LEN + 4]), None);
+    }
+}
+
+// =================================================================================================
+// RING3SCROLL (rmbp-ledger B778; BP-ring3-4, BP-input-10, BP-video-38) — A PROGRAM'S WINDOW ON THE WINDOW SYSTEM'S ONE
+// SCROLL MODEL. A program whose content overflows a rectangle of its window REGISTERS that rectangle with the kernel —
+// the content offset, the content extent, the viewport, the line grid, the gutter right of the viewport the scrollbar
+// owns, and the ground under the bar — exactly as a kernel window calls `wm::scroll_set` from its paint. The window
+// system then scrolls it the way it scrolls every window: the wheel over the viewport steps the model (three lines a
+// detent, clamped to the line grid), the compositor paints the one scrollbar into the gutter, and the program is handed
+// the NEW offset as one [`INPUT_EV_SCROLL`] event in its input ring; it repaints its viewport at that offset. A program
+// re-registers from its paint whenever its offset, extent or viewport changed (its offset is the truth after a paint).
+//
+// REQUEST body: [`SCROLL_SET_BODY_LEN`] bytes, LE — `win u32` (SYS_WIN_CREATE's id), `offset u32`, `extent u32`,
+// `vx u16, vy u16, vw u16, vh u16` (surface px), `line u16` (>= 1), `gutter u16` (>= 1, columns right of the viewport),
+// `ground u32` (the program's ground colour under the bar). Any other length, line 0 or gutter 0 is -EINVAL; a free id
+// is -EBADF; another program's window is -EPERM.
+// REPLY body (status 0): one byte, [`SCROLL_SET_LIVE`] (the window system holds the model) or [`SCROLL_SET_NONE`] (the
+// content fits, or the window has no compositor row: no model is held).
+// ADDITIVE (a new verb number and a new event code at the tail): `ABI_VERSION` stays 1; a kernel with no arm for the verb
+// answers -EINVAL; a program built before the event falls through the unknown type. Appended at the tail so no line
+// above moves.
+// =================================================================================================
+
+/// Bus verb: register (or update, or drop) the caller's window's scroll model (see the block above).
+pub const BUS_VERB_SCROLL_SET: u8 = 28; // 27 is BUS_VERB_OPEN_ARG; 40..=42 are the AUDIO_SOURCE verbs
+const _: () = assert!(BUS_VERB_SCROLL_SET > BUS_VERB_OPEN_ARG && BUS_VERB_SCROLL_SET < BUS_VERB_AUDIO_SOURCE_OPEN);
+/// The request body's length.
+pub const SCROLL_SET_BODY_LEN: usize = 28;
+/// The request frame's length.
+pub const SCROLL_SET_FRAME_LEN: usize = BUS_HDR_LEN + SCROLL_SET_BODY_LEN;
+/// Reply byte: the window system holds the model (the wheel scrolls it, the bar is painted).
+pub const SCROLL_SET_LIVE: u8 = 1;
+/// Reply byte: no model is held (the content fits, or the window has no compositor row).
+pub const SCROLL_SET_NONE: u8 = 0;
+
+/// Input-ring event: the window system scrolled one of this program's registered windows. Payload `[31:0]` = the NEW
+/// content offset (surface px, already clamped to the registered line grid), `[47:32]` = the program's window id (the
+/// id `SYS_WIN_CREATE` returned); bit 63 clear. Read it with [`input_ev_scroll`] on the WHOLE event ([`input_ev_payload`]
+/// keeps only the low 32 bits). Numbered 14: 13 is [`INPUT_EV_CHAR`].
+pub const INPUT_EV_SCROLL: u64 = 14;
+
+/// One program's scroll model as it crosses the boundary (surface px).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ScrollSet {
+    pub win: u32,
+    pub offset: u32,
+    pub extent: u32,
+    pub viewport: (u16, u16, u16, u16),
+    pub line: u16,
+    pub gutter: u16,
+    pub ground: u32,
+}
+
+/// The SCROLL_SET request frame for `s` under correlation id `corr`.
+pub const fn scroll_set_frame(s: &ScrollSet, corr: u32) -> [u8; SCROLL_SET_FRAME_LEN] {
+    let mut f = [0u8; SCROLL_SET_FRAME_LEN];
+    f[0] = BUS_MAGIC[0];
+    f[1] = BUS_MAGIC[1];
+    f[2] = BUS_MAGIC[2];
+    f[3] = BUS_MAGIC[3];
+    f[4] = BUS_VERSION;
+    f[5] = BUS_KIND_REQUEST;
+    f[6] = BUS_VERB_SCROLL_SET;
+    let c = corr.to_le_bytes();
+    let l = (SCROLL_SET_BODY_LEN as u32).to_le_bytes();
+    let w32 = [s.win, s.offset, s.extent];
+    let w16 = [s.viewport.0, s.viewport.1, s.viewport.2, s.viewport.3, s.line, s.gutter];
+    let g = s.ground.to_le_bytes();
+    let b = BUS_HDR_LEN;
+    let mut i = 0;
+    while i < 4 {
+        f[8 + i] = c[i];
+        f[48 + i] = l[i];
+        f[b + 24 + i] = g[i];
+        let mut k = 0;
+        while k < 3 {
+            f[b + 4 * k + i] = w32[k].to_le_bytes()[i];
+            k += 1;
+        }
+        i += 1;
+    }
+    let mut k = 0;
+    while k < 6 {
+        let v = w16[k].to_le_bytes();
+        f[b + 12 + 2 * k] = v[0];
+        f[b + 13 + 2 * k] = v[1];
+        k += 1;
+    }
+    f
+}
+
+/// The model from a SCROLL_SET request body; `None` for another length, a line of 0 or a gutter of 0.
+pub const fn scroll_set_body_parse(body: &[u8]) -> Option<ScrollSet> {
+    if body.len() != SCROLL_SET_BODY_LEN {
+        return None;
+    }
+    let s = ScrollSet {
+        win: scroll_le32(body, 0),
+        offset: scroll_le32(body, 4),
+        extent: scroll_le32(body, 8),
+        viewport: (scroll_le16(body, 12), scroll_le16(body, 14), scroll_le16(body, 16), scroll_le16(body, 18)),
+        line: scroll_le16(body, 20),
+        gutter: scroll_le16(body, 22),
+        ground: scroll_le32(body, 24),
+    };
+    if s.line == 0 || s.gutter == 0 {
+        return None;
+    }
+    Some(s)
+}
+
+const fn scroll_le32(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+const fn scroll_le16(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+
+/// The verdict from a reply: `Ok(true)` live, `Ok(false)` none, `Err(status)` refused (`-EIO` for a body that is
+/// neither byte).
+pub const fn scroll_set_reply(status: i64, body: &[u8]) -> Result<bool, i64> {
+    if status != 0 {
+        return Err(status);
+    }
+    if body.len() != 1 {
+        return Err(EIO);
+    }
+    match body[0] {
+        SCROLL_SET_LIVE => Ok(true),
+        SCROLL_SET_NONE => Ok(false),
+        _ => Err(EIO),
+    }
+}
+
+/// The packed payload of an [`INPUT_EV_SCROLL`] event: window `win` (low 16 bits) scrolled to offset `off`.
+pub const fn input_ev_scroll_payload(win: u32, off: u32) -> u64 {
+    (((win & 0xFFFF) as u64) << 32) | off as u64
+}
+const _: () = assert!(input_ev_pack(INPUT_EV_SCROLL, input_ev_scroll_payload(0xFFFF, u32::MAX)) < (1u64 << 63));
+
+/// `(window id, new offset)` from an [`INPUT_EV_SCROLL`] event (`None` for another type).
+pub const fn input_ev_scroll(ev: u64) -> Option<(u32, u32)> {
+    if input_ev_type(ev) != INPUT_EV_SCROLL {
+        return None;
+    }
+    Some((((ev >> 32) & 0xFFFF) as u32, (ev & 0xFFFF_FFFF) as u32))
+}
+
+/// RING3SCROLL's ring-3 helper: register `s` for the caller's own window. `sys` is the program's own syscall stub;
+/// `rx` receives the reply (at least `BUS_HDR_LEN + 1` bytes; a frame that is not this ask's reply is skipped, the
+/// [`window_raise`] shape). `Ok(true)` = the window system holds the model, `Ok(false)` = none held, `Err(-errno)` =
+/// refused or the bus failed (a kernel with no arm for the verb answers -EINVAL).
+pub fn scroll_set(s: &ScrollSet, rx: &mut [u8], sys: fn(u64, u64, u64, u64, u64) -> i64) -> Result<bool, i64> {
+    let corr = 0x5343_0000 | (s.win & 0xFFFF);
+    let tx = scroll_set_frame(s, corr);
+    let st = sys(SYS_MSEND, tx.as_ptr() as u64, tx.len() as u64, 0, 0);
+    if st != 0 {
+        return Err(st);
+    }
+    let mut tries = 0;
+    while tries < 8 {
+        tries += 1;
+        let n = sys(SYS_MRECV, rx.as_mut_ptr() as u64, rx.len() as u64, 0, 0);
+        if n < 0 {
+            return Err(n);
+        }
+        let n = (n as usize).min(rx.len());
+        if n < BUS_HDR_LEN || rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY || rx[6] != BUS_VERB_SCROLL_SET || rx[8..12] != corr.to_le_bytes() {
+            continue; // not this ask's reply
+        }
+        let status = i32::from_le_bytes([rx[12], rx[13], rx[14], rx[15]]) as i64;
+        let blen = (u32::from_le_bytes([rx[48], rx[49], rx[50], rx[51]]) as usize).min(n - BUS_HDR_LEN);
+        return scroll_set_reply(status, &rx[BUS_HDR_LEN..BUS_HDR_LEN + blen]);
+    }
+    Err(EIO)
+}
+
+#[cfg(test)]
+mod ring3scroll_tests {
+    use super::*;
+    #[test]
+    fn scroll_set_wire_round_trip() {
+        let s = ScrollSet { win: 3, offset: 120, extent: 4000, viewport: (0, 3, 282, 260), line: 10, gutter: 6, ground: 0x00FF_EEDD };
+        let f = scroll_set_frame(&s, 0x5343_0003);
+        assert_eq!(&f[0..4], &BUS_MAGIC);
+        assert_eq!(f[6], BUS_VERB_SCROLL_SET);
+        assert_eq!(scroll_set_body_parse(&f[BUS_HDR_LEN..]), Some(s));
+        assert_eq!(scroll_set_body_parse(&f[BUS_HDR_LEN + 1..]), None);
+        assert_eq!(scroll_set_body_parse(&scroll_set_frame(&ScrollSet { line: 0, ..s }, 0)[BUS_HDR_LEN..]), None);
+        assert_eq!(scroll_set_body_parse(&scroll_set_frame(&ScrollSet { gutter: 0, ..s }, 0)[BUS_HDR_LEN..]), None);
+        assert_eq!(scroll_set_reply(0, &[SCROLL_SET_LIVE]), Ok(true));
+        assert_eq!(scroll_set_reply(0, &[SCROLL_SET_NONE]), Ok(false));
+        assert_eq!(scroll_set_reply(EPERM, &[]), Err(EPERM));
+        assert_eq!(scroll_set_reply(0, &[7]), Err(EIO));
+        let ev = input_ev_pack(INPUT_EV_SCROLL, input_ev_scroll_payload(3, 90));
+        assert_eq!(input_ev_scroll(ev), Some((3, 90)));
+        assert_eq!(input_ev_scroll(input_ev_pack(INPUT_EV_WHEEL, 1)), None);
     }
 }
