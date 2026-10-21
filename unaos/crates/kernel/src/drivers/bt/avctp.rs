@@ -498,9 +498,11 @@ impl Ct {
                 _ => CtEv::Refused("unexpected"),
             };
             match ev {
-                CtEv::Accepted(v) => {
+                CtEv::Accepted(_) => {
+                    // CRAWLE (LEDGER SR173): the headset carries the level now. `pushed` stays the value `Watch::step`
+                    // SENT: an ACCEPTED carries the volume the headset actually set (AVRCP 1.6 §6.13.2), which a headset
+                    // with coarser steps rounds — storing that would make `step` push the master again, forever.
                     self.carries = true;
-                    self.pushed = Some(v);
                 }
                 _ => {
                     self.abs_ok = false;
@@ -739,6 +741,20 @@ pub fn legs_ct() -> Result<(), &'static str> {
     }
     if !w.step(80, 2000, &mut note, Some(0x0041)).is_empty() {
         return Err("refused-pushes");
+    }
+    // CRAWLE (LEDGER SR173): a headset that ROUNDS — ACCEPTED 0x48 for a sent 0x47 — is answered once, not pushed again.
+    let mut w = Watch { seen: None, ct: Some(Ct::new(A, 0)) };
+    let mut note = None;
+    let out = w.step(0x47, 1700, &mut note, Some(0x0041));
+    if out.len() != 2 || out[1].pdu != ct_set_volume(1, 0x47) {
+        return Err("quantized-set");
+    }
+    let c = w.ct.as_mut().ok_or("ct")?;
+    if c.on_rsp(&[0x12, 0x11, 0x0E, 0x09, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x48]) != Some(("set-volume", CtEv::Accepted(0x48))) || !w.carries() {
+        return Err("quantized-accepted");
+    }
+    if !w.step(0x47, 1800, &mut note, Some(0x0041)).is_empty() {
+        return Err("quantized");
     }
     Ok(())
 }

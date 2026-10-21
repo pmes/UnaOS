@@ -5613,13 +5613,13 @@ fn settingsmap_switch_leg() {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn prefsclientkeys_leg() -> (bool, alloc::string::String) {
     use crate::prefs::key;
-    use crate::prefs_client::{changed_mark, gets_total, last_changed, pref_set, sys_flag, PrefValue};
+    use crate::prefs_client::{changed_mark, gets_total, last_changed, pref_set, PrefValue};
     if crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &crate::prefs::path()).is_some() {
         serial_println!("[prefsbus] keys leg skipped: the home is not writable (a set would be refused)");
         return (true, alloc::string::String::from("skip"));
     }
     prefchanged_passes(); // settle: every earlier change is behind each pass's mark
-    let was = sys_flag(key::PRIVACY_REMEMBER).unwrap_or(true);
+    let was = match crate::prefs_client::pref_get(crate::prefs::NS, key::PRIVACY_REMEMBER) { Ok(v) => v.as_bool().unwrap_or(true), Err(e) if e == una_abi::ENOENT => true, Err(e) => { serial_println!("[prefsbus] keys leg skipped: the key's GET failed errno={} (the fixture never writes a value it did not read)", e); return (true, alloc::string::String::from("skip")); } }; // CRAWLE (LEDGER SR173): unset = the default; a FAILED GET is `skip`, never a flip of the person's key. LINE-NEUTRAL, code first
     let (g0, m0) = (gets_total(), changed_mark());
     let a = pref_set(crate::prefs::NS, key::PRIVACY_REMEMBER, PrefValue::Bool(!was)).is_ok();
     prefchanged_passes();

@@ -2353,7 +2353,9 @@ fn render(a: &App, s: &Surf) -> (i32, i32, Geo) {
     // rows [3, 3 + rows x lh) at the right edge are the window system's (`wm` paints the one scrollbar there when Lumen
     // registers, `sv_sync`); Lumen fills the rest of the gutter, and all of it when the transcript fits.
     s.fill(0, 0, w - SB_GUTTER, h, th.bg);
-    if n > rows {
+    if n > rows && a.sv_live {
+        // CRAWLE (LEDGER SR173): only while wm holds the model; with none (aarch64 has no arm for the verb, or a NONE
+        // reply) nothing else paints the band, so Lumen fills it below.
         let band = 3 + rows as i32 * lh;
         s.fill(w - SB_GUTTER, 0, SB_GUTTER, 3, th.bg);
         s.fill(w - SB_GUTTER, band, SB_GUTTER, h - band, th.bg);
