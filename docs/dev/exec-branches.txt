@@ -721,7 +721,7 @@ refs/heads/exec-rmbp-ehcipoolrecycle   d6b61ec8 FOLDED-BY-HAND (this commit) 202
 refs/heads/exec-rmbp-idleusblevel   a3e46cc1 FOLDED-BY-HAND (this commit) 2026-10-21 B808
 refs/heads/exec-rmbp-uacimplicit   f95367c2 FOLDED-BY-HAND (this commit) 2026-10-21 B809
 refs/heads/exec-rmbp-trackpadmt   4fddcf83 FOLDED-BY-HAND (this commit) 2026-10-21 B818
-refs/heads/exec-rmbp-keyboot2   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-keyboot2   f5a1d32b FOLDED-BY-HAND (this commit) 2026-10-21 B810
 refs/heads/exec-rmbp-hdaring   b6a60a4f FOLDED-BY-HAND (this commit) 2026-10-21 B811
 refs/heads/exec-rmbp-sleep2   2333b0bb FOLDED-BY-HAND (this commit) 2026-10-21 B812
 refs/heads/exec-rmbp-aethernet2   be46ddcd FOLDED-BY-HAND (this commit) 2026-10-21 SR187
