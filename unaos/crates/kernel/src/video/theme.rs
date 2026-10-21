@@ -435,7 +435,7 @@ pub static CRISPY_ROWS: &[Binding] = &[ // SMALLFIX3 (B416): a slice — the cou
     Binding { roles: CMD, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CMD_L },
     Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CTRL_ALT_L },
     // SHORTCUTS — ⌘/ opens the help overlay (usage 0x38 = `/`; no other row watches it).
-    Binding { roles: CMD, usage: 0x38, action: Action::ShowShortcuts, token: super::shortcuts::C_CMD_SLASH },
+    Binding { roles: CMD | SHIFT, usage: 0x38, action: Action::Help, token: super::shortcuts::C_CMD_QUESTION }, Binding { roles: CMD, usage: 0x38, action: Action::ShowShortcuts, token: super::shortcuts::C_CMD_SLASH }, // HELPVERBDOC (B756): ⌘? (⌘⇧/) is Help, ABOVE ⌘/ (`no_shadow`); bare F1 stays BrightnessDown on this table (R60)
     // LAUNCHER (B417) — ⌘Space opens the Launcher (usage 0x2C = Space; no other row watches it).
     Binding { roles: CMD, usage: 0x2C, action: Action::Launcher, token: super::shortcuts::C_CMD_SPACE },
     // SHELLTASK2 (B474) — ⌘. interrupts the shell window's running command (usage 0x37 = `.`; no other row watches it).
@@ -500,7 +500,7 @@ pub static PC_ROWS: &[Binding] = &[ // SMALLFIX3 (B416): a slice — the count i
     Binding { roles: 0, usage: 0x4F, action: Action::CursorRight, token: "right" },
     Binding { roles: 0, usage: 0x4A, action: Action::CursorLineStart, token: "home" },
     Binding { roles: 0, usage: 0x4D, action: Action::CursorLineEnd, token: "end" },
-    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CTRL_ALT_L }, // SCREENLOCK — Ctrl+Alt+L
+    Binding { roles: CTRL | ALT, usage: 0x0F, action: Action::LockScreen, token: super::shortcuts::C_CTRL_ALT_L }, Binding { roles: 0, usage: 0x3A, action: Action::Help, token: super::shortcuts::C_F1 }, // SCREENLOCK — Ctrl+Alt+L. HELPVERBDOC (B756): F1 is Help on the PC rows (no other row watches 0x3A here; the fn-row router yields to it, `fnrow::help_key`)
 ];
 
 /// The PC table. `cmd_role` is `HID_MOD_ALT` — R61's *"(alt-c on pc)"*, and the one field that
