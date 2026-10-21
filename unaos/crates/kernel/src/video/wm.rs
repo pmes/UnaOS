@@ -9465,6 +9465,7 @@ static SIDEBYSIDE_WITNESSED: core::sync::atomic::AtomicBool =
 // `composite_inner` into a parallel-compose / serial-present split, which reads `occ_clip`,
 // `above_shell`/`SHELL_Z` and `ctrls_for` — three predicates under concurrent edit — so it is a
 // FOLLOW-ON arc after those land, not this one. See the `STAGE` static for step 1's per-core seam.
+// LANDED: the band fan-out of the no-clip present (WCPAR 9ade9074 + WCPAR2 8ab5da61, B770, BP-cores-19: `blitter::present_band` -> `wcpar::par_blit`); the per-window parallel compose into per-core `STAGE` remains the follow-on (engine.md §8 step 3).
 #[cfg(target_arch = "x86_64")]
 static COMP_GATE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
