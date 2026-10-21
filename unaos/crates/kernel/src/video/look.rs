@@ -15,7 +15,7 @@
 //! * [`set`] — the switch: flyouts closed, the leaving look's furniture vacated, every window's head damaged and
 //!   one composite run, then `[look] switch to=<l> from=<l> ms=<n> windows_rechromed=<n> via=<who>`.
 //! * [`service`] — the settings service pass (ONE line in `settings::service`): the login's load (a new session
-//!   generation re-reads the key), PrefChanged (verb 19: `prefs_client::CHANGED_N` moved, so the key is re-read —
+//!   generation re-reads the key), PrefChanged (verb 19: a change naming `system.look`, `prefs_client::changed_take`, so the key is re-read —
 //!   another client's `PrefSet system.look softy` switches the glass with no reboot), a Settings choice owed by
 //!   [`choose`] (stored here, off the click router), and the Start menu's hover pass.
 
@@ -45,7 +45,8 @@ impl Look {
 static LOOK: AtomicU8 = AtomicU8::new(0);
 /// The session generation the key was last read for (`u32::MAX` = never).
 static READ_GEN: AtomicU32 = AtomicU32::new(u32::MAX);
-/// The PrefChanged count the key was last read at.
+/// The PrefChanged mark the key was last read at (PREFSCLIENTKEYS B779: `prefs_client::changed_mark`'s sequence, claimed
+/// by [`service`] through `prefs_client::changed_take`).
 static SEEN_CHANGES: AtomicU32 = AtomicU32::new(0);
 /// A Settings choice owed to the service pass: 0 none, else `look index + 1`.
 static CHOSEN: AtomicU8 = AtomicU8::new(0);
@@ -105,22 +106,24 @@ pub fn service() {
     if c != 0 {
         let to = Look::from_index(c as usize - 1);
         crate::prefs_client::sys_set(ap::LOOK_KEY, crate::prefs::PrefValue::Str(String::from(to.name())));
-        SEEN_CHANGES.store(crate::prefs_client::CHANGED_N.load(Ordering::Acquire), Ordering::Relaxed);
+        SEEN_CHANGES.store(crate::prefs_client::changed_mark(), Ordering::Relaxed);
         set(to, "settings");
     }
     let g = crate::prefs::session_gen();
-    let ch = crate::prefs_client::CHANGED_N.load(Ordering::Acquire);
     let login = READ_GEN.load(Ordering::Relaxed) != g;
-    if login || SEEN_CHANGES.load(Ordering::Relaxed) != ch {
+    let bus = crate::prefs_client::changed_take(&SEEN_CHANGES, is_look_key); // PREFSCLIENTKEYS (B779): only a change naming `system.look`
+    if login || bus {
         let mut wb = [0u8; crate::prefs::WHO_BUF];
         if crate::prefs::user_name_in(&mut wb).is_some() {
             READ_GEN.store(g, Ordering::Relaxed);
-            SEEN_CHANGES.store(ch, Ordering::Relaxed);
             let v = crate::prefs_client::sys_text(ap::LOOK_KEY);
             set(Look::from_index(ap::look_index(v.as_deref())), if login { "login" } else { "bus" });
-        } else if !login {
-            SEEN_CHANGES.store(ch, Ordering::Relaxed);
         }
     }
     super::softy::startmenu::service();
+}
+
+/// PREFSCLIENTKEYS (rmbp-ledger B779): `<ns>.<key>` is the one key the look reads (`system.look`).
+fn is_look_key(ns: &str, k: &str) -> bool {
+    ns == crate::prefs::NS && k == ap::LOOK_KEY
 }

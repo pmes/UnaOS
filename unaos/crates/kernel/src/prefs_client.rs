@@ -312,7 +312,7 @@ pub fn last_via() -> &'static str {
 
 /// PrefGet `ns.key` over the bus: the value, or the reply's errno (-ENOENT unset).
 pub fn pref_get(ns: &str, k: &str) -> Result<PrefValue, i64> {
-    let a = call(una_abi::BUS_VERB_PREF_GET, alloc::format!("{}.{}", ns, k).as_bytes());
+    let a = call(una_abi::BUS_VERB_PREF_GET, alloc::format!("{}.{}", ns, k).as_bytes()); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] note_get(); // PREFSCLIENTKEYS (B779): every bus GET counted (`gets_total`, file tail). LINE-NEUTRAL append.
     if a.status != 0 {
         return Err(a.status);
     }
@@ -763,9 +763,9 @@ mod fx;
 // consumer asks [`changed_since`] whether a change after its mark named a key it reads. A change the ring no longer
 // holds answers `true`: a lost key is a re-read, never a skipped change.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub use lastkey::{changed_mark, changed_since, last_changed};
+pub use lastkey::{changed_mark, changed_since, changed_take, gets_total, last_changed};
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-use lastkey::note_changed;
+use lastkey::{note_changed, note_get};
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 mod lastkey {
@@ -852,5 +852,33 @@ mod lastkey {
             }
             core::str::from_utf8(&r.addr[i][..l as usize]).ok().map(|a| (r.seq, String::from(a)))
         })
+    }
+
+    // ── PREFSCLIENTKEYS (rmbp-ledger B779): the consumer's claimed edge and the one GET count ──────────────────────
+    // CHARTER: Principia — fulfiller (the kernel bus client). Every PrefChanged poller (look, locale; the lock keeps its
+    // own claim beside its login generation) keys its re-read on the ring above through [`changed_take`], so a change to
+    // a key it does not read costs no GET; [`gets_total`] counts every bus GET `pref_get` makes, whoever asked.
+
+    /// Every PrefGet the client has sent since boot (`pref_get`, the one GET door: `sys_get`/`sys_int`/`sys_flag`/`sys_text`).
+    static GETS_TOTAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// `pref_get`'s half: one bus GET is on its way.
+    pub(super) fn note_get() {
+        GETS_TOTAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Bus GETs since boot (the fixtures' `gets_other=`).
+    pub fn gets_total() -> u32 {
+        GETS_TOTAL.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A consumer's edge, keyed: CLAIM `mark` (compare-exchange to the sequence now, the lock's shape, so two passes never
+    /// read one edge) and answer whether a change since it named an address `hit` accepts. `false` = no change, another
+    /// pass claimed it, or every change named another key: no re-read owed.
+    pub fn changed_take(mark: &core::sync::atomic::AtomicU32, hit: impl Fn(&str, &str) -> bool) -> bool {
+        use core::sync::atomic::Ordering;
+        let m = mark.load(Ordering::Acquire);
+        let (n, h) = changed_since(m, hit);
+        n != m && mark.compare_exchange(m, n, Ordering::AcqRel, Ordering::Acquire).is_ok() && h
     }
 }
