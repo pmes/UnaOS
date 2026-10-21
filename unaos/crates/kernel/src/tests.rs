@@ -4639,12 +4639,12 @@ fn undokeys_selftest() {
     let _ = zoom::take_persist();
     zoom::set_factor_at(want0.0, None, persist0);
     let zoom_ok = control_routed && control_n == 1 && chord.is_none() && zoom_step && swallowed && chord_n == 0;
-    let pass = undo_ok && redo_ok && zoom_ok && codes_ok && leftovers == 0;
+    let (ring3, r3_ok) = undokeys_ring3(); let pass = undo_ok && redo_ok && zoom_ok && codes_ok && leftovers == 0 && r3_ok;
     serial_println!(
-        ":: UNDOKEYS: undo={} redo={} zoom_consumed={} codes={}/{} -> {} :: table={} renamed={} cmd_z={} cmd_shift_z={} control_ring={} chord={} zoom_step={} release=0x{:02x} chord_ring={} leftovers={}",
+        ":: UNDOKEYS: undo={} redo={} zoom_consumed={} codes={}/{} -> {} :: table={} renamed={} cmd_z={} cmd_shift_z={} control_ring={} chord={} zoom_step={} release=0x{:02x} chord_ring={} leftovers={} ring3={}",
         yn(undo_ok), yn(redo_ok), yn(zoom_ok), c_undo, c_redo, if pass { "PASS" } else { "FAIL" },
         table.name, renamed, z_act.map(Action::name).unwrap_or("none"), sz_act.map(Action::name).unwrap_or("none"),
-        control_n, chord.map(|(a, _)| a.name()).unwrap_or("consumed"), zoom_step, up, chord_n, leftovers
+        control_n, chord.map(|(a, _)| a.name()).unwrap_or("consumed"), zoom_step, up, chord_n, leftovers, ring3
     );
 }
 
@@ -4744,4 +4744,16 @@ fn softymic_selftest() {
         ":: SOFTYMIC: on={} off={} looks={} privacy={} -> {} :: live={} ::",
         yn(on), yn(off), looks, yn(privacy), if pass { "PASS" } else { "FAIL" }, live
     );
+}
+
+// RING3UNDO (rmbp-ledger B771) — TAIL-APPENDED, so no line above moves.
+/// CHARTER: RING3UNDO (B771): the ring-3 leg of `tests undokeys`, Una's when the image carries it (`unaapp::undo_leg`);
+/// `("skip", true)` on a kernel without `una`.
+#[cfg(all(feature = "una", feature = "witness", feature = "quarry", target_arch = "x86_64", feature = "wc"))]
+fn undokeys_ring3() -> (&'static str, bool) {
+    crate::unaapp::undo_leg()
+}
+#[cfg(all(not(feature = "una"), feature = "witness", feature = "quarry", target_arch = "x86_64", feature = "wc"))]
+fn undokeys_ring3() -> (&'static str, bool) {
+    ("skip", true)
 }

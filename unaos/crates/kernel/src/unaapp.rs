@@ -627,3 +627,53 @@ pub fn selftest() {
     let saved_word = if laid.is_err() { "skip" } else if saved { "1" } else { "0" };
     verdict_ide(window, panes, rows, saved_word, spans, ide, run, if ok { "PASS" } else { "FAIL" });
 }
+
+/// CHARTER: RING3UNDO (rmbp-ledger B771) — `tests undokeys`'s ring-3 leg: UNA.ELF spawned bare, one edit typed,
+/// INPUT_EV_ACTION 51 pushed, `:: UNA: undo code=51 -> ok ::` awaited; the slot killed and reaped. `("ok", true)`;
+/// `("skip", true)` with no UNA.ELF on the volume; else `(<step>, false)`, step one of spawn/start/ring-full/timeout.
+pub fn undo_leg() -> (&'static str, bool) {
+    const W_UNDO: &str = ":: UNA: undo code=51 -> ok ";
+    let Ok(fs) = crate::fs::rootdisk::program_source() else {
+        return ("skip", true);
+    };
+    let cap = sc::user_image_cap();
+    let mut img = alloc::vec::Vec::new();
+    match fs.find_app("UNA.ELF") {
+        Ok(de) if de.size != 0 && de.size as usize <= cap && fs.read_file(&de, &mut img, cap).is_ok() => {}
+        _ => return ("skip", true),
+    }
+    crate::serial_line::line_watch_arm(START);
+    let (pid, slot, _) = match sc::spawn_user_image_bg_argv(&img, &["UNA.ELF"]) {
+        Ok(t) => {
+            crate::video::wm::app_name_arm_launch(sc::owner_of_launch(t.1), IMAGE);
+            t
+        }
+        Err(_) => {
+            crate::serial_line::line_watch_disarm();
+            return ("spawn", false);
+        }
+    };
+    let step: Option<&'static str> = if wait_line(pid, START_MS).is_err() {
+        Some("start")
+    } else if !push(slot, una_abi::INPUT_EV_KEY_DOWN, b'x') {
+        Some("ring-full")
+    } else {
+        crate::serial_line::line_watch_arm(W_UNDO);
+        if !push(slot, una_abi::INPUT_EV_ACTION, 51) {
+            Some("ring-full")
+        } else {
+            wait_line(pid, LINE_MS).err().map(|_| "timeout")
+        }
+    };
+    crate::serial_line::line_watch_disarm();
+    // No Ctrl+Q: the tab is dirty (the undo keeps `dirty`), so the slot is killed and reaped.
+    let _ = sc::bg_kill(pid, slot);
+    let t0 = crate::arch::ticks();
+    while crate::arch::ticks() < t0 + EXIT_MS && matches!(sc::bg_poll(pid, true), BgPoll::Running) {
+        crate::arch::sched::yield_now();
+    }
+    match step {
+        Some(s) => (s, false),
+        None => ("ok", true),
+    }
+}
