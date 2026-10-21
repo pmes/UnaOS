@@ -251,7 +251,7 @@ impl Console {
         // composites above every window). A backdrop shell keeps the reservation, so this is the old
         // expression unchanged on every surface where [`in_window`] is `false`. TERMSEL2: the body
         // is [`Self::top_y_for`], so the pointer's cell lookup and the painter share it.
-        self.top_y_for(pal.metrics(), pal.width() as usize, pal.height() as usize)
+        self.top_y_for(self.face_m(pal), pal.width() as usize, pal.height() as usize)
     }
 
     /// Rows of history shown above the prompt: everything that fits from `TOP` down, reserving the
@@ -260,14 +260,14 @@ impl Console {
     /// for a backdrop shell this is identical to [`Self::page_rows`] by construction.
     #[allow(dead_code)] // TERMWRAP: superseded by `layout_for` (visual rows); kept as the entry-count budget's name
     fn history_rows(&self, pal: &TargetPal) -> usize {
-        self.history_rows_for(pal.metrics(), pal.width() as usize, pal.height() as usize)
+        self.history_rows_for(self.face_m(pal), pal.width() as usize, pal.height() as usize)
     }
 
     /// The y of the prompt/input line: directly below the last shown history line (so on a fresh
     /// screen the prompt sits at the top and walks down as output arrives; once full it pins to the
     /// last usable row because the history is scrolled).
     fn prompt_y(&self, pal: &TargetPal) -> usize {
-        let m = pal.metrics();
+        let m = self.face_m(pal);
         // TERMWRAP M2 — the history above costs VISUAL rows (a long line wraps), not one per entry.
         let (_, vrows) = self.layout_for(m, pal.width() as usize, pal.height() as usize);
         self.top_y(pal) + vrows * m.line_h
@@ -279,7 +279,7 @@ impl Console {
     /// always precisely one character in size, at every scale (the old hardcoded 8×16 block stood
     /// twice the 8×8 text height).
     fn draw_prompt_line(&self, pal: &mut TargetPal, prompt_y: usize) {
-        let m = pal.metrics();
+        let m = self.face_m(pal);
         let prompt = format!("{}@unaos:~$ ", self.session.username);
         // TERMWRAP M1 — the prompt + input is ONE run of cells wrapped at the window's column count.
         let cols = self.cols_for(m, pal.width() as usize);
@@ -290,11 +290,11 @@ impl Console {
             let (lo, hi) = (r * cols, r * cols + cols);
             let y = prompt_y + r * m.line_h;
             if lo < pc {
-                pal.draw_text(m.margin, y, prompt.get(lo..hi.min(pc)).unwrap_or(""), crate::video::theme::TERM_ACCENT); // TERMCOLOR: the prompt in the accent colour
+                self.face_text(pal, m.margin, y, prompt.get(lo..hi.min(pc)).unwrap_or(""), crate::video::theme::TERM_ACCENT); // TERMCOLOR: the prompt in the accent colour
             }
             let (a, b) = (lo.max(pc), hi.min(pc + len));
             if a < b {
-                pal.draw_text(m.margin + m.text_w(a - lo), y, self.current_input.get(a - pc..b - pc).unwrap_or(""), crate::video::theme::CONSOLE_BRIGHT);
+                self.face_text(pal, m.margin + m.text_w(a - lo), y, self.current_input.get(a - pc..b - pc).unwrap_or(""), crate::video::theme::CONSOLE_BRIGHT);
             }
         }
 
@@ -318,7 +318,7 @@ impl Console {
     }
 
     pub fn draw(&self, pal: &mut TargetPal) {
-        let m = pal.metrics();
+        let m = self.face_m(pal);
         pal.clear_screen(Self::BG);
         GEOM_COLS.store(self.cols_for(m, pal.width() as usize), core::sync::atomic::Ordering::Relaxed); // TERMCOLOR M3 — TIOCGWINSZ's answer
         GEOM_ROWS.store(self.history_rows_for(m, pal.width() as usize, pal.height() as usize) + 1, core::sync::atomic::Ordering::Relaxed);
@@ -334,9 +334,9 @@ impl Console {
             let spans: &[crate::termcolor::Span] = self.attrs.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
             for r in 0..rows {
                 if spans.is_empty() {
-                    pal.draw_text(m.margin, y + r * m.line_h, crate::video::termsel::row_slice(line, r, cols), crate::video::theme::TERM_FG);
+                    self.face_text(pal, m.margin, y + r * m.line_h, crate::video::termsel::row_slice(line, r, cols), crate::video::theme::TERM_FG);
                 } else {
-                    Self::draw_span_row(pal, m, y + r * m.line_h, line, spans, r, cols); // TERMCOLOR
+                    self.draw_span_row(pal, m, y + r * m.line_h, line, spans, r, cols); // TERMCOLOR
                 }
             }
             // TERMSEL2 — a selection's band on a SCROLLBACK row, the same inverse video the editable
@@ -361,7 +361,7 @@ impl Console {
     /// the difference between snappy and unusable at native resolution. Use `draw()` for the full
     /// repaint after command output (history changes).
     pub fn draw_input_line(&self, pal: &mut TargetPal) {
-        let m = pal.metrics();
+        let m = self.face_m(pal);
         // TERMWRAP: a change in the edit line's row count moves the history budget, so it owes the
         // full repaint; otherwise clear the whole (possibly multi-row) strip.
         let er = self.edit_rows_for(self.cols_for(m, pal.width() as usize));
@@ -466,7 +466,7 @@ impl Console {
 
     /// [`Self::pointer_at`] on the surface `pal` draws.
     pub fn pointer(&mut self, p: &crate::video::termsel::Press, pal: &TargetPal) -> u8 {
-        self.pointer_at(p, pal.metrics(), pal.width() as usize, pal.height() as usize)
+        self.pointer_at(p, self.face_m(pal), pal.width() as usize, pal.height() as usize)
     }
 
     /// Pay a repaint the selection model asked for: 1 the input line, 2 the whole terminal (a band
@@ -488,7 +488,7 @@ impl Console {
     /// The selection's band on scrollback row `row` (text `line`, drawn at `y`): the selected cells
     /// filled with the text colour and their characters redrawn in the background colour.
     fn draw_row_band(&self, pal: &mut TargetPal, y: usize, row: u64, line: &str) {
-        let m = pal.metrics();
+        let m = self.face_m(pal);
         let cells = line.chars().count();
         if let Some((lo, hi)) = self.sel.cols_on(row, cells, self.current_input.len()) {
             let cols = self.cols_for(m, pal.width() as usize);
@@ -576,14 +576,14 @@ impl Console {
         if lo >= hi {
             return;
         }
-        let m = pal.metrics();
+        let m = self.face_m(pal);
         for r in (lo / cols)..=((hi - 1) / cols) {
             let (a, b) = (lo.max(r * cols), hi.min(r * cols + cols));
             let x = m.margin + m.text_w(a - r * cols);
             let y = y0 + r * m.line_h;
             pal.draw_rect(x, y, m.text_w(b - a), m.cell_h, crate::video::theme::CONSOLE_BRIGHT);
             let part: String = line.chars().skip(a - base).take(b - a).collect();
-            pal.draw_text(x, y, &part, Self::BG);
+            self.face_text(pal, x, y, &part, Self::BG);
         }
     }
 }
@@ -657,14 +657,14 @@ impl Console {
 
     /// Wheel detents (positive = up, as `Event::Wheel`): 3 entries each. PLAIN wheel scrolls the shell window — it reaches this console only when no ring-3 window took it, so the pointer-focus rule already made it the shell's; Shift is not visible at the event, so Shift+wheel is not a separate route. Returns whether anything was painted.
     pub fn wheel(&mut self, d: i8, pal: &mut TargetPal) -> bool {
-        let (m, w, h) = (pal.metrics(), pal.width() as usize, pal.height() as usize);
+        let (m, w, h) = (self.face_m(pal), pal.width() as usize, pal.height() as usize);
         if self.scroll_by_at(d as isize * 3, m, w, h) { self.draw(pal); true } else { false }
     }
 
     /// The four scroll ACTIONS (Shift+PgUp/PgDn, Cmd/Ctrl+Home/End). `None` = not a scroll action.
     pub fn scroll_action(&mut self, a: crate::video::keymap::Action, pal: &mut TargetPal) -> Option<bool> {
         use crate::video::keymap::Action;
-        let (m, w, h) = (pal.metrics(), pal.width() as usize, pal.height() as usize);
+        let (m, w, h) = (self.face_m(pal), pal.width() as usize, pal.height() as usize);
         let moved = match a {
             Action::ScrollPageUp => { let s = self.page_step_at(m, w, h); self.scroll_by_at(s, m, w, h) }
             Action::ScrollPageDown => { let s = self.page_step_at(m, w, h); self.scroll_by_at(-s, m, w, h) }
@@ -692,7 +692,7 @@ impl Console {
             let y = top + rows * m.line_h;
             pal.draw_rect(0, y, w, m.line_h, crate::video::theme::painter::CONSOLE_BAND);
             let msg = format!("[{} new lines]", self.new_lines);
-            pal.draw_text(m.margin, y, &msg, crate::video::theme::CONSOLE_BRIGHT);
+            self.face_text(pal, m.margin, y, &msg, crate::video::theme::CONSOLE_BRIGHT);
         }
     }
 }
@@ -771,7 +771,7 @@ fn push_parsed(
 
 impl Console {
     /// Paint visual row `r` of `line` as attribute runs (bg rect first, then the glyph run).
-    fn draw_span_row(pal: &mut TargetPal, m: crate::ui::Metrics, y: usize, line: &str, spans: &[crate::termcolor::Span], r: usize, cols: usize) {
+    fn draw_span_row(&self, pal: &mut TargetPal, m: crate::ui::Metrics, y: usize, line: &str, spans: &[crate::termcolor::Span], r: usize, cols: usize) {
         use crate::termcolor as tc;
         let (lo, hi) = (r * cols, r * cols + cols);
         let mut cuts: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(spans.len() + 2);
@@ -789,7 +789,7 @@ impl Console {
             }
             let mut fg = tc::resolve(at.fg, if at.bold { crate::video::theme::CONSOLE_BRIGHT } else { crate::video::theme::TERM_FG });
             if at.bold && at.fg & tc::SET != 0 { fg = tc::lighten(fg); }
-            pal.draw_text(x, y, &seg, fg);
+            self.face_text(pal, x, y, &seg, fg);
         }
     }
 
@@ -821,5 +821,121 @@ impl Console {
     pub fn place_from_task(&mut self, text: &str) {
         self.drain_output();
         self.place(text);
+    }
+}
+
+// ── TEXTSCALE2 (rmbp-ledger B814, BP-video-39) — the windowed shell draws the ONE console face — TAIL-APPENDED ──────────
+// CHARTER: Midden — wm (the kernel's windowed shell is furniture; its face is `video::text`'s, BP-video-19/-22/-30).
+// Flight 37: "shell font size did not increase." Measured: the `Shell` row's console laid out on `ui::Metrics::panel()`
+// (dpi only) and drew font8x8 through `GneissPal::draw_text`, so `system.display.font_size` (the text step writes it)
+// never reached it, and `[kfont] repaint … console_rows=` counted the BOOT-LOG console (`fbcon::font_repaint`). Now a
+// console in a window takes the console's ONE cell (`video::text::grid_cell`, which follows font_size) as its metrics
+// and draws `Face::Grid` per cell through `video::text::draw_with` (the seam for painters that know each pixel's
+// background: it is read back), so every layout fn above re-lays out its rows at the new cell; `font_follow` is the
+// render task's per-pass question — `video::text::epoch` (KERNELFONT2 M4, the one restyle signal) moved since this
+// shell last painted -> one full repaint, `[kfont] repaint shell epoch= console_rows= cols= cell= face=`. At the
+// default size the shell is on the JetBrains Mono grid too (FONTSCRAFT's direction: one console face). x86 `wc` only;
+// every other console (the knob-off image, aarch64's shells, the backdrop shell, the pager) draws as before.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+mod textscale2 {
+    use core::sync::atomic::{AtomicU32, AtomicUsize};
+    /// The face epoch the windowed shell last repainted at (0 = never).
+    pub(super) static SHELL_EPOCH: AtomicU32 = AtomicU32::new(0);
+    /// Its rows (history + the prompt row) and its cell `(w << 16) | h` at that repaint.
+    pub(super) static SHELL_ROWS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static SHELL_CELL: AtomicU32 = AtomicU32::new(0);
+}
+
+/// The windowed shell's last restyle repaint: `(face epoch, rows, cell w, cell h)` (`tests textscale2`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn shell_face() -> (u32, usize, usize, usize) {
+    use core::sync::atomic::Ordering::Acquire;
+    let e = textscale2::SHELL_EPOCH.load(Acquire);
+    let c = textscale2::SHELL_CELL.load(Acquire);
+    (e, textscale2::SHELL_ROWS.load(Acquire), (c >> 16) as usize, (c & 0xFFFF) as usize)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+impl Console {
+    /// The metrics this console lays out and paints with: the surface's, with the console's grid cell
+    /// (`video::text::grid_cell`) as the text cell and the line pitch when it renders into a window.
+    fn face_m(&self, pal: &TargetPal) -> crate::ui::Metrics {
+        let mut m = pal.metrics();
+        if self.in_window {
+            let (gw, gh) = crate::video::text::grid_cell();
+            if gw != 0 && gh != 0 {
+                m.cell_w = gw;
+                m.cell_h = gh;
+                m.line_h = gh;
+            }
+        }
+        m
+    }
+
+    /// Draw `s` with its first cell at `(x, y)`: in a window, `Face::Grid` one cell per character (the grid stays exact
+    /// under the caret and the bands), each covered pixel blended over the pixel read back; else the surface's text.
+    fn face_text(&self, pal: &mut TargetPal, x: usize, y: usize, s: &str, ink: u32) {
+        if !self.in_window {
+            pal.draw_text(x, y, s, ink);
+            return;
+        }
+        let cw = crate::video::text::grid_cell().0.max(1);
+        let (w, h) = (pal.width() as usize, pal.height() as usize);
+        for (i, c) in s.chars().enumerate() {
+            if !c.is_ascii_graphic() {
+                continue; // a blank (or a character the cell set has no glyph for) keeps its cell, as font8x8 did
+            }
+            let cx = x + i * cw;
+            if cx + cw > w {
+                break;
+            }
+            crate::video::text::draw_with(&[c as u8], false, crate::video::text::Face::Grid, cx, y as isize, cw, ink, &mut |px, py, a| {
+                if px < 0 || py < 0 || px as usize >= w || py as usize >= h {
+                    return;
+                }
+                let (px, py) = (px as u32, py as u32);
+                let under = pal.read_pixel(px, py).unwrap_or(Self::BG);
+                pal.draw_pixel(px, py, crate::video::font::blend(under, ink, a));
+            });
+        }
+    }
+
+    /// The render task's per-pass question: the face epoch moved since this shell last painted -> repaint it whole
+    /// at the new cell (the caller presents). `true` when it painted.
+    pub fn font_follow(&self, pal: &mut TargetPal) -> bool {
+        use core::sync::atomic::Ordering::{Acquire, Release};
+        let e = crate::video::text::epoch();
+        if !self.in_window || e == 0 || textscale2::SHELL_EPOCH.load(Acquire) == e {
+            return false;
+        }
+        self.draw(pal);
+        let m = self.face_m(pal);
+        let (w, h) = (pal.width() as usize, pal.height() as usize);
+        let (rows, cols) = (self.history_rows_for(m, w, h) + 1, self.cols_for(m, w));
+        textscale2::SHELL_ROWS.store(rows, Release);
+        textscale2::SHELL_CELL.store(((m.cell_w as u32) << 16) | (m.cell_h as u32 & 0xFFFF), Release);
+        textscale2::SHELL_EPOCH.store(e, Release);
+        serial_println!(
+            "[kfont] repaint shell epoch={} console_rows={} cols={} cell={}x{} face={}",
+            e, rows, cols, m.cell_w, m.cell_h, crate::video::text::face_name(crate::video::text::Face::Grid)
+        );
+        true
+    }
+}
+
+// The knob-off twins: every other build draws exactly what it drew.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+impl Console {
+    #[inline(always)]
+    fn face_m(&self, pal: &TargetPal) -> crate::ui::Metrics {
+        pal.metrics()
+    }
+    #[inline(always)]
+    fn face_text(&self, pal: &mut TargetPal, x: usize, y: usize, s: &str, ink: u32) {
+        pal.draw_text(x, y, s, ink)
+    }
+    #[inline(always)]
+    pub fn font_follow(&self, _pal: &mut TargetPal) -> bool {
+        false
     }
 }

@@ -216,7 +216,9 @@ pub fn load() -> bool {
 /// civil hour alone is checked (an `auto` look turns on the hour without a write).
 pub fn due(now_ms: u64) -> bool {
     // AETHERSIDETABS2 (SR143): `aether.tabs.` too — where the tabs stand (`chrome::prefs` re-reads on this answer).
-    const SUBSCRIBE: &[&str] = &["system.appearance.", "aether.tabs."];
+    // TEXTSCALE2 (rmbp-ledger B814): `system.display.` (the font size the text step writes) and `system.accessibility.`
+    // (the step's name) — the chrome face follows them (`chrome::restyle`). Four = una-abi's `PREF_SUB_MAX`.
+    const SUBSCRIBE: &[&str] = &["system.appearance.", "aether.tabs.", "system.display.", "system.accessibility."];
     static mut SUB: i64 = 1; // 1 = not yet asked; 0 = subscribed; < 0 = refused (the poll fallback)
     static mut HOUR: i64 = -1; // the civil hour at the last clock check
     unsafe {
@@ -289,4 +291,24 @@ pub fn take_open_arg(out: &mut [u8; una_abi::OPEN_ARG_MAX]) -> usize {
         out[..n].copy_from_slice(&(&*core::ptr::addr_of!(OPEN_ARG))[..n]);
         n
     }
+}
+
+// TEXTSCALE2 (rmbp-ledger B814) — the type preferences the chrome face follows. Principia owns both: the display font
+// size (`system.display.font_size`, CSS px, the schema's 9..=32; the Accessibility text step writes its px there) and
+// the step's name (`system.accessibility.text_size`, reported only). Read through the ONE bus client above.
+
+/// `(system.display.font_size in CSS px, system.accessibility.text_size's word)`; unset or refused = the defaults
+/// (`font_core::ui::DEFAULT_CSS_PX`, `default`).
+pub fn read_type() -> (i64, alloc::string::String) {
+    let px = pref_text("system.display.font_size")
+        .and_then(|t| t.trim().parse::<i64>().ok())
+        .unwrap_or(font_core::ui::DEFAULT_CSS_PX)
+        .clamp(9, 32);
+    let mut err = 0;
+    let mut b = [0u8; 16];
+    let step = match word("system.accessibility.text_size", &mut b, &mut err) {
+        Some(w) if !w.is_empty() => alloc::string::String::from_utf8_lossy(w).into_owned(),
+        _ => alloc::string::String::from("default"),
+    };
+    (px, step)
 }
