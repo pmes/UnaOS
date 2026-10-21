@@ -135,7 +135,7 @@ fn say(bar_ms: u64) {
 
 /// Log Out: the desktop object goes — the bar off, unbuilt, one composite vacates the bar's and the dock's pixels.
 pub fn teardown(why: &'static str) {
-    OWED_AT.store(0, Release); #[cfg(feature = "quarry")] super::quarry::undo::clear(); // crawl A 1: the undo journal goes with the session
+    OWED_AT.store(0, Release); #[cfg(feature = "quarry")] super::quarry::undo::clear(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::launcher::filesearch::icon_cache_clear(); // FSEARCHICONS (B760): the Files icons' type cache goes with the session (LINE-NEUTRAL, code before comment). crawl A 1: the undo journal goes with the session
     probe_reset();
     PAINT_AT.store(0, Release);
     LAST_BATT.store(u32::MAX, Relaxed);

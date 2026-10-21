@@ -18,15 +18,19 @@
 //!   painter for a file's icon, the program's sighted icon else the folder / the page with its type tag), the
 //!   leaf, its folder. Return opens it (the opener dispatch; a folder opens Quarry AT it), Shift-Return reveals
 //!   it in Quarry (`quarry::live::open_at_select`: Quarry opened at its folder WITH the file selected).
+//! * THE TYPE CACHE — FSEARCHICONS B760: a row paints its STORED `una:type` when the session already knows it
+//!   ([`TYPE_CACHE_MAX`] paths, LRU, RAM; filled by the opener's [`note_opened`] and by the rows a filtered query
+//!   shows — both already read the fact), else its extension's icon. A keystroke reads nothing for an icon; Log Out
+//!   (`desktopbuild::teardown`) clears it. A display memo only: `kind:` / `taken:` always read the stored facts.
 //!
 //! Wire: `[search] q=<n chars> hits=<n> ms=<n> us=<n> src=<una-name-index|attr-query|walk|none> cand=<n>` per
 //! keystroke; `[search] reveal path=<p> folder=<f> -> shown=<0|1> selected=<0|1>`; `[search] open folder=<p> ->
 //! shown=<0|1>`. `tests filesearch` (tests.rs) →
-//! `:: FILESEARCH: index=10000 hits_ok=3 recent=ok kind=ok ms=<n> under=1 -> PASS ::`.
+//! `:: FILESEARCH: index=10000 hits_ok=3 recent=ok kind=ok ms=<n> under=1 icons=ok -> PASS ::`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::fs::search;
 
@@ -259,6 +263,7 @@ fn attr_expr(p: &Parsed) -> Option<String> {
 pub fn answer<D: ::unafs::BlockDevice>(fs: &mut ::unafs::UnaFS<D>, p: &Parsed, recent: &[String]) -> Result<Option<Answer>, ::unafs::fs::FileSystemError> {
     use ::unafs::AttributeValue as V;
     let facts = |fs: &mut ::unafs::UnaFS<D>, id: u64, want_taken: bool| -> Result<(String, Option<i64>), ::unafs::fs::FileSystemError> {
+        ENGINE_READS.fetch_add(1 + want_taken as u32, Ordering::Relaxed);
         let mime = match fs.get_attribute(id, TYPE_KEY)? {
             Some(V::String(s)) => s,
             _ => String::new(),
@@ -301,7 +306,9 @@ pub fn answer<D: ::unafs::BlockDevice>(fs: &mut ::unafs::UnaFS<D>, p: &Parsed, r
             let (mime, _) = facts(fs, h.inode_id, false)?;
             c.push((Row { path: h.path, dir: false, mime, tier: 3 }, i));
         }
-        return Ok(Some(Answer { rows: order(c, recent), cand, src: "attr-query" }));
+        let rows = order(c, recent);
+        cache_shown(&rows); // FSEARCHICONS (B760): the shown rows' stored types, for their icons
+        return Ok(Some(Answer { rows, cand, src: "attr-query" }));
     }
     let f = fs.find_names(p.words[0], ASK)?;
     if !f.indexed {
@@ -332,6 +339,9 @@ pub fn answer<D: ::unafs::BlockDevice>(fs: &mut ::unafs::UnaFS<D>, p: &Parsed, r
     // FILESEARCH2 (B745): no per-row attribute read on a name-only query — the row's icon is Quarry's painter, which
     // reads the PATH (the program's icon, else the page and its type tag); the keystroke costs the one range scan.
     let mut rows = order(c, recent);
+    if p.filtered() {
+        cache_shown(&rows); // FSEARCHICONS (B760): only a filtered query's mime is the stored one (read above)
+    }
     for r in rows.iter_mut().filter(|r| !r.dir && r.mime.is_empty()) {
         r.mime = String::from(type_core::by_extension(r.leaf()).unwrap_or(""));
     }
@@ -371,12 +381,100 @@ pub fn note_opened(path: &str) {
         return;
     }
     let home = home_now();
-    let mut g = RECENT.lock();
-    if g.0 != home {
-        g.0 = home;
-        g.1.clear();
+    {
+        let mut g = RECENT.lock();
+        if g.0 != home {
+            g.0 = home;
+            g.1.clear();
+        }
+        push_recent(&mut g.1, path);
     }
-    push_recent(&mut g.1, path);
+    // FSEARCHICONS (B760): the opened file's stored type, read once per OPEN (the same mount-table read the
+    // dispatch's `assoc::override_refusal` makes), so its Files row paints it with no read per keystroke.
+    if let Ok(crate::fs::vfs::AttrValue::Str(m)) = crate::shell::vfs_mount_table().get_attr(path, TYPE_KEY, crate::fs::vfs::KERNEL_PRINCIPAL) {
+        note_type(path, &m);
+    }
+}
+
+// ── The type cache (FSEARCHICONS B760) ──────────────────────────────────────────────────────────
+
+/// Paths whose stored `una:type` the session keeps for the Files icons (LRU).
+pub const TYPE_CACHE_MAX: usize = 64;
+
+/// `(path, stored una:type)`, most recently used first; at most [`TYPE_CACHE_MAX`].
+static TYPES: crate::sync::Mutex<Vec<(String, String)>> = crate::sync::Mutex::new(Vec::new());
+
+/// The engine's `get_attribute` calls since boot (the fixture's `key_reads`: a name-only keystroke adds 0).
+static ENGINE_READS: AtomicU32 = AtomicU32::new(0);
+
+/// The engine's attribute reads so far.
+pub fn attr_reads() -> u32 {
+    ENGINE_READS.load(Ordering::Relaxed)
+}
+
+/// THE cache's one rule: `(path, mime)` to the front, once, at most [`TYPE_CACHE_MAX`] (the oldest falls off).
+pub fn put_type(list: &mut Vec<(String, String)>, path: &str, mime: &str) {
+    list.retain(|e| e.0 != path);
+    list.insert(0, (String::from(path), String::from(mime)));
+    list.truncate(TYPE_CACHE_MAX);
+}
+
+/// Keep `path`'s stored type (an empty type or path keeps nothing).
+pub fn note_type(path: &str, mime: &str) {
+    if path.is_empty() || mime.is_empty() {
+        return;
+    }
+    put_type(&mut TYPES.lock(), path, mime);
+}
+
+/// A filtered query's shown rows: their `mime` is the stored `una:type` (empty = none stored).
+fn cache_shown(rows: &[Row]) {
+    let mut g = TYPES.lock();
+    for r in rows.iter().filter(|r| !r.dir && !r.mime.is_empty()) {
+        put_type(&mut g, &r.path, &r.mime);
+    }
+}
+
+/// `path`'s cached stored type (a hit becomes the newest). `None` = not cached, or the cache is busy (never waits).
+pub fn cached_type(path: &str) -> Option<String> {
+    let mut g = TYPES.try_lock()?;
+    let i = g.iter().position(|e| e.0 == path)?;
+    let e = g.remove(i);
+    let m = e.1.clone();
+    g.insert(0, e);
+    Some(m)
+}
+
+/// Entries held (the fixture's bound leg).
+pub fn icon_cache_len() -> usize {
+    TYPES.lock().len()
+}
+
+/// Log Out (`desktopbuild::teardown`): the session's types go with it.
+pub fn icon_cache_clear() {
+    TYPES.lock().clear();
+}
+
+/// The path Quarry's painter is handed for a file of stored type `mime`: `None` when the leaf's own extension is
+/// one of the type's (the extension icon already IS the type's) or the table names no extension for it; else
+/// `<path>.<the type's first extension>`, whose tag is the stored type's.
+pub fn typed_path(path: &str, mime: &str) -> Option<String> {
+    let first = type_core::extensions_of(mime).next()?;
+    if let Some(own) = type_core::ext_of(search::leaf(path)) {
+        if type_core::extensions_of(mime).any(|e| e.eq_ignore_ascii_case(own)) {
+            return None;
+        }
+    }
+    Some(alloc::format!("{}.{}", path, first))
+}
+
+/// The painter's input for a Files row: the typed path when the stored type is cached and differs from the
+/// extension's, else `None` (paint the row's own path). RAM only — no read.
+pub fn icon_path(path: &str, dir: bool) -> Option<String> {
+    if dir {
+        return None;
+    }
+    typed_path(path, &cached_type(path)?)
 }
 
 /// The session's recent list, newest first.
@@ -475,14 +573,23 @@ fn quarry_reveal(_dir: &str, _leaf: &str) -> (bool, bool) {
 // ── The icon: Quarry's painter ──────────────────────────────────────────────────────────────────
 
 /// Draw the type icon for a row (`path`, `dir`) `s` px square at `(x, y)` into a `w`-wide surface of `h` rows —
-/// Quarry's own painter (`quarry::live::iconview::draw_icon`, FILESEARCH2 B745: one painter for a file's icon, not
+/// the cached stored type's when known ([`icon_path`], FSEARCHICONS B760), else the path's — Quarry's own painter (`quarry::live::iconview::draw_icon`, FILESEARCH2 B745: one painter for a file's icon, not
 /// a second one here). `false` = nothing drawn (a build without Quarry, or no room): the Launcher draws its mark.
 #[cfg(feature = "quarry")]
 pub fn icon(buf: &mut [u32], w: usize, h: usize, x: usize, y: usize, s: usize, path: &str, dir: bool) -> bool {
     if s < 8 || buf.len() < w * h || x + s > w || y + s > h {
         return false;
     }
-    crate::video::quarry::live::iconview::draw_icon(&mut buf[..w * h], w, h, x, y, s, path, dir, crate::video::text::Face::Ui);
+    let px = &mut buf[..w * h];
+    // FSEARCHICONS (B760): a cached stored type paints its tag; a program keeps its sighted icon (by the real path,
+    // draw_icon's own first step); uncached paints the path (the extension's icon), as before.
+    if let Some(typed) = icon_path(path, dir) {
+        if !crate::fs::appres::blit_path_icon(px, w, h, x, y, s, path) {
+            crate::video::quarry::live::iconview::draw_icon(px, w, h, x, y, s, &typed, false, crate::video::text::Face::Ui);
+        }
+        return true;
+    }
+    crate::video::quarry::live::iconview::draw_icon(px, w, h, x, y, s, path, dir, crate::video::text::Face::Ui);
     true
 }
 

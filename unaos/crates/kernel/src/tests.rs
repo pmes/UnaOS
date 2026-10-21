@@ -3682,7 +3682,8 @@ fn helpsearch_selftest() {
 /// VERDICT leg (FILESEARCH2). The reveal (Shift-Return) is the Launcher's own `pick` on the first file the root's walk
 /// finds: `[search] reveal path= folder= -> shown=1 selected=1` (`reveal=ok`; `skip` when Quarry declines or is absent;
 /// shown without the selection FAILS).
-/// `:: FILESEARCH: index=10000 hits_ok=3 recent=ok kind=ok ms=<n> under=1 -> PASS ::`
+/// FSEARCHICONS (B760): `icons=` is [`filesearch_icons`] (tail) — the type cache leg.
+/// `:: FILESEARCH: index=10000 hits_ok=3 recent=ok kind=ok ms=<n> under=1 icons=ok -> PASS ::`
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))]
 fn filesearch_selftest() {
     use crate::video::launcher::filesearch as fsr;
@@ -3745,7 +3746,7 @@ fn filesearch_selftest() {
             Ok(())
         }
     }
-    let fail = |why: &str| serial_println!(":: FILESEARCH: index=0 hits_ok=0 recent=FAIL kind=FAIL ms=0 under=0 -> FAIL :: reason={} ::", why);
+    let fail = |why: &str| serial_println!(":: FILESEARCH: index=0 hits_ok=0 recent=FAIL kind=FAIL ms=0 under=0 icons=FAIL -> FAIL :: reason={} ::", why);
     let mut fs = match UnaFS::format(Sparse { map: BTreeMap::new() }, 0) {
         Ok(f) => f,
         Err(_) => return fail("format"),
@@ -3856,15 +3857,16 @@ fn filesearch_selftest() {
             }
         }
     }
+    let (icons, icons_detail) = filesearch_icons(&mut fs); // FSEARCHICONS (B760)
     serial_println!(
-        "[filesearch] detail build_ms={} blocks={} held_kb={} q_us={}/{}/{} kind_us={} budget_ms={} under={} reveal={} q1={} q2={} q3={} kinds={}{}{}{} beach={:?}",
+        "[filesearch] detail build_ms={} blocks={} held_kb={} q_us={}/{}/{} kind_us={} budget_ms={} under={} reveal={} q1={} q2={} q3={} kinds={}{}{}{} {} beach={:?}",
         build_ms, BLOCKS, held_kb, us1, us2, us3, kind_us, fsr::BUDGET_MS, under as u8, reveal,
-        q1 as u8, q2 as u8, q3 as u8, kind1 as u8, kind2 as u8, kind3 as u8, kind4 as u8, leaves(&r1)
+        q1 as u8, q2 as u8, q3 as u8, kind1 as u8, kind2 as u8, kind3 as u8, kind4 as u8, icons_detail, leaves(&r1)
     );
-    let ok = index == DIRS * PER && hits_ok == 3 && recent_ok && kind_ok && under && reveal != "FAIL";
+    let ok = index == DIRS * PER && hits_ok == 3 && recent_ok && kind_ok && under && reveal != "FAIL" && icons;
     serial_println!(
-        ":: FILESEARCH: index={} hits_ok={} recent={} kind={} ms={} under={} -> {} ::",
-        index, hits_ok, if recent_ok { "ok" } else { "FAIL" }, if kind_ok { "ok" } else { "FAIL" }, ms, under as u8, if ok { "PASS" } else { "FAIL" }
+        ":: FILESEARCH: index={} hits_ok={} recent={} kind={} ms={} under={} icons={} -> {} ::",
+        index, hits_ok, if recent_ok { "ok" } else { "FAIL" }, if kind_ok { "ok" } else { "FAIL" }, ms, under as u8, if icons { "ok" } else { "FAIL" }, if ok { "PASS" } else { "FAIL" }
     );
 }
 
@@ -4887,4 +4889,74 @@ fn oneinstance_quarry_launch_leg(path: &str, owner1: u64) -> &'static str {
         let _ = (path, owner1);
         "skip"
     }
+}
+
+// FSEARCHICONS (rmbp-ledger B760, BP-video-36, BP-storage-27) — TAIL-APPENDED, so no line above moves. The `icons=` leg of
+// `tests filesearch`, over the fixture's own RAM volume (the same `filesearch::answer` the Launcher runs): the type cache
+// cleared; `beach kind:text` (a FILTERED query, which reads the stored facts) caches exactly the row it shows,
+// `/d00/Beach` = text/plain (`icons_fill=1`, reads > 0); the name-only `beach` reads no attribute (`key_reads=0`); the
+// cached `Beach` (no extension) is handed to the painter as `typed_path` (`/d00/Beach.txt`, `typed=1`), the uncached
+// `old beach.pdf` as its own path (`plain=1`); with Quarry the pixels agree (`paint=ok`: cached == draw_icon(typed) !=
+// draw_icon(path), uncached == draw_icon(path); `skip` without Quarry); 64 inserts, the first touched, one more: 64
+// held, the touched kept, the second dropped (`lru=1`); cleared at the end (the live session's cache keeps no test row).
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))]
+fn filesearch_icons<D: ::unafs::BlockDevice>(fs: &mut ::unafs::UnaFS<D>) -> (bool, alloc::string::String) {
+    use crate::video::launcher::filesearch as fsr;
+    use alloc::vec::Vec;
+    let ask = |fs: &mut ::unafs::UnaFS<D>, q: &str| -> Vec<fsr::Row> {
+        match fsr::answer(fs, &fsr::parse(q), &[]) {
+            Ok(Some(a)) => a.rows,
+            _ => Vec::new(),
+        }
+    };
+    fsr::icon_cache_clear();
+    let r0 = fsr::attr_reads();
+    let f = ask(fs, "beach kind:text");
+    let fill_reads = fsr::attr_reads().wrapping_sub(r0);
+    let filled = fill_reads > 0 && f.len() == 1 && f[0].leaf() == "Beach" && fsr::icon_cache_len() == 1 && fsr::cached_type("/d00/Beach").as_deref() == Some("text/plain");
+    let r1 = fsr::attr_reads();
+    let rows = ask(fs, "beach");
+    let key_reads = fsr::attr_reads().wrapping_sub(r1);
+    let beach = rows.iter().find(|r| r.leaf() == "Beach");
+    let pdf = rows.iter().find(|r| r.leaf() == "old beach.pdf");
+    let typed = beach.and_then(|r| fsr::icon_path(&r.path, r.dir));
+    let typed_ok = typed.as_deref().is_some_and(|t| t.starts_with("/d00/Beach.") && fsr::typed_path("/d00/Beach", "text/plain").as_deref() == Some(t));
+    let plain_ok = pdf.is_some_and(|r| fsr::icon_path(&r.path, r.dir).is_none());
+    #[allow(unused_mut)]
+    let mut paint = "skip";
+    #[cfg(feature = "quarry")]
+    if let (Some(b), Some(p), Some(t)) = (beach, pdf, typed.as_deref()) {
+        const S: usize = 32;
+        let draw = |path: &str| -> Vec<u32> {
+            let mut v = alloc::vec![0u32; S * S];
+            crate::video::quarry::live::iconview::draw_icon(&mut v, S, S, 0, 0, S, path, false, crate::video::text::Face::Ui);
+            v
+        };
+        let row = |path: &str| -> Vec<u32> {
+            let mut v = alloc::vec![0u32; S * S];
+            fsr::icon(&mut v, S, S, 0, 0, S, path, false);
+            v
+        };
+        let (cb, cp) = (row(&b.path), row(&p.path));
+        paint = if cb == draw(t) && cb != draw(&b.path) && cp == draw(&p.path) { "ok" } else { "FAIL" };
+    }
+    let paint_reads = fsr::attr_reads().wrapping_sub(r1);
+    fsr::icon_cache_clear();
+    for i in 0..fsr::TYPE_CACHE_MAX {
+        fsr::note_type(&format!("/lru/{}", i), "text/plain");
+    }
+    let _ = fsr::cached_type("/lru/0");
+    fsr::note_type("/lru/new", "text/plain");
+    let lru = fsr::icon_cache_len() == fsr::TYPE_CACHE_MAX
+        && fsr::cached_type("/lru/0").is_some()
+        && fsr::cached_type("/lru/1").is_none()
+        && fsr::cached_type("/lru/new").is_some();
+    fsr::icon_cache_clear();
+    let cleared = fsr::icon_cache_len() == 0;
+    let ok = filled && key_reads == 0 && paint_reads == 0 && typed_ok && plain_ok && paint != "FAIL" && lru && cleared;
+    let detail = format!(
+        "icons_fill={} fill_reads={} key_reads={} typed={} plain={} paint={} lru={} cleared={} typed_path={}",
+        filled as u8, fill_reads, key_reads + paint_reads, typed_ok as u8, plain_ok as u8, paint, lru as u8, cleared as u8, typed.as_deref().unwrap_or("-")
+    );
+    (ok, detail)
 }
