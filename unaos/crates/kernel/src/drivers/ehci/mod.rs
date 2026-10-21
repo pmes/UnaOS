@@ -19071,7 +19071,7 @@ pub fn service_ehci_hid() {
     let mut g = EHCI_HID.lock(); crate::pointerfeel::note_pass(crate::arch::ms()); // PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {
-        unsafe { c.service() };
+        unsafe { c.service() }; #[cfg(all(feature = "lidsleep", feature = "wc"))] c.port_suspend_service(); // USBSUSPEND (B766): the sleep state's SUSPEND/resume of this controller's root ports, under this lock; the body is `suspend` at the file tail. LINE-NEUTRAL fold, code first
     }
     // ISRARM: the completion interrupt's own rollup, and its DEAD verdict. Emitted from here — the
     // polled pass — and never from the ISR, which does not print at all. Placed after the walk so a
@@ -19992,4 +19992,167 @@ pub fn census() -> Option<Vec<((u8, u8, u8), Vec<(u8, bool)>)>> {
         let eps = c.int_eps.iter().map(|e| (if e.is_kbd { 0 } else if e.is_rel_mouse { 1 } else if e.layout.is_some() { 2 } else { 3 }, e.dead)).collect();
         ((c.bus, c.dev, c.func), eps)
     }).collect()).unwrap_or_default())
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// USBSUSPEND (rmbp-ledger B766, docs/dev/blueprint/power.md BP-power-7) — the EHCI root ports' SUSPEND for the sleep state.
+// FILE-TAIL append under the `power::sleep` cfg, so no `panic::Location` above moves and a knob-off build carries none of it.
+#[cfg(all(feature = "lidsleep", feature = "wc"))]
+pub mod suspend {
+    //! CHARTER: Kernel — driver (the EHCI root ports' suspend/resume; `power::sleep` asks, the `EHCI_HID` holder acts).
+    //!
+    //! `power::sleep` writes ONE word, [`request`]; every PORTSC write is made inside `service_ehci_hid`'s walk, under
+    //! `EHCI_HID`, by [`Controller::port_suspend_service`]. EHCI 1.0 §4.3.1: SUSP (bit 7) on an enabled port; the
+    //! resume is FPR (bit 6) held 20 ms (TDRSMDN), FPR cleared, 10 ms recovery (TRSMRCY) — deadlines, never a wait.
+    //! A device's own resume sets FPR on a suspended port: that is its remote wake, and the whole controller resumes.
+    //! A controller with a live interrupt endpoint keeps its ports up (`why=int-ep`): EHCI remote wake is unarmed (an
+    //! `IntEp` carries no device address to SET_FEATURE) and its periodic qTDs are not quiesced — owed, B766. So the
+    //! rMBP's internal keyboard (EHCI, behind the RMH) stays the `input` waker it is.
+    use super::{mmio_read32, mmio_write32, read_config_32, Controller, OP_PORTSC0, PORT_CCS, PORT_OWNER, PORT_PED, PORT_RW1C};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+
+    const UP: u8 = 0;
+    const SUSPENDED: u8 = 1;
+    const RESUMING: u8 = 2;
+    const RECOVERING: u8 = 3;
+    const RESUME_MS: u64 = 20;
+    const RECOVERY_MS: u64 = 10;
+    const PORT_FPR: u32 = 1 << 6;
+    const PORT_SUSP: u32 = 1 << 7;
+    /// PCI BAR0 and the EHCI capability registers (EHCI 1.0 §2.2): CAPLENGTH at +0, HCSPARAMS at +4.
+    const CFG_BAR0: u8 = 0x10;
+    const CTRLS: usize = 4;
+
+    static WANT: AtomicBool = AtomicBool::new(false);
+    static PHASE: [AtomicU8; CTRLS] = [const { AtomicU8::new(UP) }; CTRLS];
+    static DUE_MS: [AtomicU64; CTRLS] = [const { AtomicU64::new(0) }; CTRLS];
+    /// Ports this driver suspended, per controller (bit = port index).
+    static SUSP_MASK: [AtomicU32; CTRLS] = [const { AtomicU32::new(0) }; CTRLS];
+    /// Census across controllers, for `tests usbsuspend`: ports with an enabled device, suspended, kept.
+    static PORTS: AtomicU32 = AtomicU32::new(0);
+    static SUSPENDED_N: AtomicU32 = AtomicU32::new(0);
+    static KEPT_N: AtomicU32 = AtomicU32::new(0);
+
+    /// The sleep state's one word: `true` at entry, `false` at the wake. Any context; touches no register.
+    pub fn request(suspend: bool) {
+        if suspend { for c in [&PORTS, &SUSPENDED_N, &KEPT_N] { c.store(0, Ordering::Relaxed); } }
+        WANT.store(suspend, Ordering::Release);
+    }
+
+    /// (ports with an enabled device, ports suspended, ports kept) at the last entry.
+    pub fn census() -> (u32, u32, u32) {
+        (PORTS.load(Ordering::Relaxed), SUSPENDED_N.load(Ordering::Relaxed), KEPT_N.load(Ordering::Relaxed))
+    }
+
+    impl Controller {
+        /// One controller's step of `service_ehci_hid`'s walk (under `EHCI_HID`): apply [`request`], notice a
+        /// device's resume, run the deadlines.
+        pub(super) fn port_suspend_service(&mut self) {
+            let i = self.idx;
+            if i >= CTRLS { return; }
+            let now = crate::arch::ms();
+            match PHASE[i].load(Ordering::Acquire) {
+                UP if WANT.load(Ordering::Acquire) => { self.ports_suspend(); PHASE[i].store(SUSPENDED, Ordering::Release); }
+                SUSPENDED if !WANT.load(Ordering::Acquire) => self.ports_resume_begin(now),
+                SUSPENDED => {
+                    if let Some(p) = self.remote_wake_port() {
+                        serial_println!("[usb] ehci={} port={} remote-wake fpr=1 -> resume", i, p);
+                        self.ports_resume_begin(now);
+                    }
+                }
+                RESUMING if now >= DUE_MS[i].load(Ordering::Relaxed) => self.ports_resume_finish(now),
+                RECOVERING if now >= DUE_MS[i].load(Ordering::Relaxed) => PHASE[i].store(UP, Ordering::Release),
+                _ => {}
+            }
+        }
+
+        fn portsc_addr(&self, port: u32) -> u64 { self.op + OP_PORTSC0 + 4 * port as u64 }
+
+        /// HCSPARAMS.N_PORTS, read from BAR0 as `ehci_scout::wake_run` derives it; `None` unless BAR0 + CAPLENGTH is
+        /// this controller's operational base (the cross-check that the BAR read is this function's).
+        fn port_count(&self) -> Option<u32> {
+            let raw = unsafe { read_config_32(self.bus, self.dev, self.func, CFG_BAR0) };
+            let bar0 = if raw & 0x06 == 0x04 {
+                (raw as u64 & 0xFFFF_FFF0) | ((unsafe { read_config_32(self.bus, self.dev, self.func, CFG_BAR0 + 4) } as u64) << 32)
+            } else {
+                (raw & 0xFFFF_FFF0) as u64
+            };
+            let caplength = (unsafe { mmio_read32(bar0) }? & 0xFF) as u64;
+            if bar0 + caplength != self.op { return None; }
+            Some((unsafe { mmio_read32(bar0 + 4) }? & 0xF).min(15))
+        }
+
+        /// SUSP on every enabled, EHCI-owned root port — unless an interrupt endpoint is live on this controller.
+        fn ports_suspend(&mut self) {
+            let i = self.idx;
+            let live = self.int_eps.iter().any(|e| !e.dead);
+            let n = self.port_count().unwrap_or(0);
+            let mut mask = 0u32;
+            for port in 0..n {
+                let a = self.portsc_addr(port);
+                let v = unsafe { mmio_read32(a) }.unwrap_or(0);
+                if v & (PORT_CCS | PORT_PED) != (PORT_CCS | PORT_PED) || v & PORT_OWNER != 0 || v & PORT_SUSP != 0 { continue; }
+                PORTS.fetch_add(1, Ordering::Relaxed);
+                if live {
+                    KEPT_N.fetch_add(1, Ordering::Relaxed);
+                    serial_println!("[usb] ehci={} port={} keep why=int-ep", i, port + 1);
+                    continue;
+                }
+                let _ = unsafe { mmio_write32(a, (v & !PORT_RW1C) | PORT_SUSP) };
+                let back = unsafe { mmio_read32(a) }.unwrap_or(0);
+                mask |= 1 << port;
+                SUSPENDED_N.fetch_add(1, Ordering::Relaxed);
+                serial_println!("[usb] ehci={} port={} suspend -> susp={}", i, port + 1, (back & PORT_SUSP != 0) as u8);
+            }
+            SUSP_MASK[i].store(mask, Ordering::Relaxed);
+        }
+
+        /// A suspended port the controller put FPR on itself (the device's resume signalling).
+        fn remote_wake_port(&self) -> Option<u32> {
+            let mask = SUSP_MASK[self.idx].load(Ordering::Relaxed);
+            (0..15u32).filter(|p| mask & (1 << p) != 0)
+                .find(|p| unsafe { mmio_read32(self.portsc_addr(*p)) }.unwrap_or(0) & PORT_FPR != 0)
+                .map(|p| p + 1)
+        }
+
+        /// FPR on every suspended port (one already in FPR stays), 20 ms deadline.
+        fn ports_resume_begin(&mut self, now: u64) {
+            let i = self.idx;
+            let mask = SUSP_MASK[i].load(Ordering::Relaxed);
+            for port in (0..15u32).filter(|p| mask & (1 << p) != 0) {
+                let a = self.portsc_addr(port);
+                let v = unsafe { mmio_read32(a) }.unwrap_or(0);
+                let _ = unsafe { mmio_write32(a, (v & !PORT_RW1C) | PORT_FPR) };
+            }
+            DUE_MS[i].store(now + RESUME_MS, Ordering::Relaxed);
+            WANT.store(false, Ordering::Release);
+            PHASE[i].store(RESUMING, Ordering::Release);
+        }
+
+        /// The 20 ms are up: FPR cleared, SUSP read back (the controller clears it as the resume ends), 10 ms recovery.
+        fn ports_resume_finish(&mut self, now: u64) {
+            let i = self.idx;
+            let mask = SUSP_MASK[i].load(Ordering::Relaxed);
+            let t0 = now.saturating_sub(RESUME_MS);
+            for port in (0..15u32).filter(|p| mask & (1 << p) != 0) {
+                let a = self.portsc_addr(port);
+                let v = unsafe { mmio_read32(a) }.unwrap_or(0);
+                let _ = unsafe { mmio_write32(a, v & !PORT_RW1C & !PORT_FPR) };
+                let mut back = unsafe { mmio_read32(a) }.unwrap_or(0);
+                while back & PORT_SUSP != 0 && crate::arch::ms().wrapping_sub(now) < 3 {
+                    core::hint::spin_loop();
+                    back = unsafe { mmio_read32(a) }.unwrap_or(0);
+                }
+                let ms = crate::arch::ms().saturating_sub(t0);
+                if back & PORT_SUSP == 0 {
+                    serial_println!("[usb] ehci={} port={} resume ms={} -> ok", i, port + 1, ms);
+                } else {
+                    serial_println!("[usb] ehci={} port={} resume ms={} -> susp=1", i, port + 1, ms);
+                }
+            }
+            SUSP_MASK[i].store(0, Ordering::Relaxed);
+            DUE_MS[i].store(crate::arch::ms() + RECOVERY_MS, Ordering::Relaxed);
+            PHASE[i].store(RECOVERING, Ordering::Release);
+        }
+    }
 }

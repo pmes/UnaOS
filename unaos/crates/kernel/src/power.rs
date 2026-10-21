@@ -378,7 +378,7 @@ pub fn sleep_armed() -> bool {
 // state the tree holds honestly: the backlight off (gmux), the compositor and the cursor refused (`video::
 // panel_refuse_term` term `sleep-panel-off`), so every core sits in the scheduler's `sti; hlt` (C1) between ticks;
 // the 1 kHz APIC tick stays (the ms clock, the lid poll and every sleeper ride it; a tickless idle is unbuilt) and
-// USB stays up (the FTDI cable is the wire and the keyboard is the input waker). Wakers, each NAMED: `lid` (MSLD back
+// USB root ports are suspended (USBSUSPEND B766: `usb_ports`; the FTDI wire and storage stay up, an xHCI keyboard is armed for remote wake). Wakers, each NAMED: `lid` (MSLD back
 // to 0, polled every `video::lidsleep::SLEEP_POLL_MS` while asleep), `power-key` (the fixed-feature PWRBTN_STS,
 // `acpi_power::pwrbtn_take`), `input` (a key or pointer event; the Sleep button's route with the lid open).
 // The owner of the panel half is `video/lidsleep.rs`; this module only records and prints.
@@ -411,9 +411,9 @@ pub mod sleep {
     /// [`measure_enter`]'s, on the service pass.
     pub fn enter(via: &str, backlight: &str) {
         if ASLEEP.swap(true, Ordering::AcqRel) { return; } #[cfg(feature = "login")] crate::video::lock::before_sleep(via); // AUTOLOCK (B712): the lid (system.lock.on_lid) or another sleep (on_sleep) locks the glass BEFORE the state's line; `tests` never locks. LINE-NEUTRAL fold, code first.
-        ENTER_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
+        ENTER_MS.store(crate::arch::ms().max(1), Ordering::Relaxed); usb_ports(true); // USBSUSPEND (B766): both USB drivers are ASKED for their ports' suspend (one word each; the drivers' own passes write the registers). LINE-NEUTRAL fold, code first
         ENTER_BATT.store(u32::MAX, Ordering::Relaxed);
-        serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=1khz usb=up s3=unreachable", STATE, via, backlight);
+        serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=1khz usb=suspend s3=unreachable", STATE, via, backlight);
     }
 
     /// The entry's slow half, from the service pass after the panel is dark: the S3 census (once per boot), a stale
@@ -447,7 +447,7 @@ pub mod sleep {
         if i.is_none() { UNEXPLAINED.fetch_add(1, Ordering::Relaxed); }
         WAKE_SRC.store(i.map(|i| i as u32).unwrap_or(u32::MAX), Ordering::Relaxed);
         WAKE_AT_MS.store(crate::arch::ms().max(1), Ordering::Relaxed);
-        WAKES.fetch_add(1, Ordering::Relaxed);
+        WAKES.fetch_add(1, Ordering::Relaxed); usb_ports(false); // USBSUSPEND (B766): the ports' resume is asked at the wake's detect. LINE-NEUTRAL fold, code first
     }
 
     /// The wake's first composite has returned: print the wake line and the SLEEP verdict. The battery is read
@@ -495,5 +495,12 @@ pub mod sleep {
 
     fn opt(v: Option<u16>) -> alloc::string::String {
         match v { Some(x) => alloc::format!("{}", x), None => alloc::string::String::from("-") }
+    }
+
+    /// USBSUSPEND (B766, BP-power-7): ask both USB host drivers to suspend (`true`) or resume (`false`) their root
+    /// ports. One word per driver; each driver's own pass (the xHCI loan holder, the `EHCI_HID` holder) writes PORTSC.
+    fn usb_ports(suspend: bool) {
+        crate::drivers::xhci::suspend::request(suspend);
+        #[cfg(feature = "ehcihid")] crate::drivers::ehci::suspend::request(suspend);
     }
 }
