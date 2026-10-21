@@ -31805,7 +31805,7 @@ mod scrollview {
     // here re-derives a page, a thumb or a step. Wire: `[scroll] win=<id> owner=<asid> ring3 press=page|drag off=<n> delivered=1`.
 
     /// A gutter page is in flight through [`scroll_press_ring3`] (the wire word `press=page` only; the drain's one task).
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] // SCROLLARM64 fold: ring3_scrolled reads it on both desktops; the press door that sets it is x86 wc
     static RING3_PRESS: AtomicBool = AtomicBool::new(false);
 
     /// The x86 click router's door for a RING-3 row: a press at panel `(x, y)` in the gutter of the pane-0 model its owner
@@ -31828,7 +31828,7 @@ mod scrollview {
 
     /// The wire word of a ring-3 step: ` press=drag` while `win`'s thumb is held, ` press=page` during a gutter page,
     /// else nothing (the wheel's line, unchanged).
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] // SCROLLARM64 fold: ring3_scrolled reads it on both desktops; the press door that sets it is x86 wc
     fn ring3_cause(win: WinId) -> &'static str {
         if SCROLL_DRAG.lock().is_some_and(|(w, p, _)| w == win && p == 0) {
             " press=drag"
