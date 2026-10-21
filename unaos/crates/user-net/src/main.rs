@@ -93,6 +93,7 @@ impl Line {
 }
 
 fn verdict(l: &mut Line, tail: &[u8]) -> ! {
+    mailbox(); // KEEPREADERS (SR183): the one reader, at the one end every run passes
     l.s(b" -> ").s(tail).s(b" ::").print();
     exit(0)
 }
@@ -239,3 +240,27 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[used]
 #[link_section = ".note.unaos.app"]
 static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(0);
+
+// KEEPREADERS (LEDGER SR183; BP-ring3-19) — THIS PROGRAM'S ONE MAILBOX READER. NET has no frame loop; it reads its mailbox once, at `verdict`, the one end every run passes. Frames a
+// `vein_ring3` ask kept (`bus::keep()`, DROPLOOPS SR179) come first, then the mailbox (`una_abi::mbox_recv`). NET
+// acts on none of them, so each verb is ignored by name here — never by not reading.
+fn mailbox() {
+    static mut RX: [u8; una_abi::BUS_FRAME_MAX] = [0; una_abi::BUS_FRAME_MAX];
+    // SAFETY: one thread; nothing else borrows RX.
+    let rx = unsafe { &mut *core::ptr::addr_of_mut!(RX) };
+    loop {
+        let n = una_abi::mbox_recv(rx, una_abi::MRECV_NOWAIT, vein_ring3::bus::keep(), sys);
+        if n < una_abi::BUS_HDR_LEN as i64 {
+            break; // -EAGAIN: the mailbox is empty
+        }
+        if rx[0..4] != una_abi::BUS_MAGIC || rx[5] != una_abi::BUS_KIND_REPLY {
+            continue; // not a kernel delivery: nothing of this program reads it
+        }
+        match rx[6] {
+            una_abi::BUS_VERB_PREF_CHANGED => {} // NET subscribes to no prefix: a PrefChanged here is no news to it
+            una_abi::BUS_VERB_OPEN_ARG => {} // a console program: no window to raise, no launch argument handed over
+            una_abi::BUS_VERB_NOTICE => {} // Quarry's file NOTICE: NET registers no file type
+            _ => {} // a reply no ask waits for any more (its `bus_ask` gave up after BUS_ASK_TRIES)
+        }
+    }
+}

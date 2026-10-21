@@ -17,7 +17,8 @@
 // (kernel `prefs_client.rs` header: "Ring-3 delivery of verb 19 … is OWED"), and SYS_MRECV blocks on an empty
 // mailbox, so a program cannot wait for it beside its input ring: [`due`] answers every [`POLL_MS`] instead, and a
 // PrefChanged frame met in the mailbox while a reply is awaited (kind REPLY, verb 19, corr 0) is KEPT by `bus::ask`
-// (DROPLOOPS SR179) and re-reads at the next [`due`], whose drain reads the kept frames first. A
+// (DROPLOOPS SR179) and re-reads at the next [`due`], whose drain reads the kept frames first — every pass, subscribed
+// or not, one `match` naming each verb it ignores (KEEPREADERS SR183). A
 // re-read that moves the look answers `true` and the caller repaints everything.
 
 use una_abi::{
@@ -91,11 +92,6 @@ impl Theme {
 static mut RX: [u8; BUS_FRAME_MAX] = [0; BUS_FRAME_MAX];
 /// A PrefChanged frame was met in the mailbox: the next [`due`] answers at once.
 static mut HINT: bool = false;
-/// This program's mailbox keep, for every `una_abi` helper that waits for a reply (MAILBOXKEEP SR177): the program's
-/// ONE keep, `vein_ring3::bus::keep()` (DROPLOOPS SR179), which [`due`]'s drain reads first (`una_abi::mbox_recv`).
-pub fn keep() -> &'static mut una_abi::MboxKeep {
-    bus::keep()
-}
 
 /// A TOML scalar literal without its quotes and blanks.
 fn unquote(b: &[u8]) -> &[u8] {
@@ -202,15 +198,23 @@ pub fn due(now_ms: u64) -> bool {
             HINT = true;
         }
         let rx = &mut *core::ptr::addr_of_mut!(RX);
-        while SUB <= 0 { // ONEINSTANCE (B734): drained even when the subscription was refused — an OPEN_ARG still arrives
+        loop { // KEEPREADERS (LEDGER SR183): the program's ONE reader — drained every pass, subscribed or not (an OPEN_ARG still arrives)
             let n = una_abi::mbox_recv(rx, una_abi::MRECV_NOWAIT, bus::keep(), sys); // MAILBOXKEEP (SR177): kept frames first, then the mailbox
             if n < BUS_HDR_LEN as i64 {
                 break; // -EAGAIN: the mailbox is empty
             }
-            if rx[0..4] == BUS_MAGIC && rx[5] == BUS_KIND_REPLY && rx[6] == BUS_VERB_PREF_CHANGED && rx[8..12] == [0; 4] {
-                HINT = true;
-            } else if let Some(a) = una_abi::open_arg_body(&rx[..(n as usize).min(BUS_FRAME_MAX)]) {
-                open_arg_keep(a); // ONEINSTANCE (B734): the loop arm — the main loop takes it ([`take_open_arg`])
+            if rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY {
+                continue; // not a kernel delivery: nothing of this program reads it
+            }
+            match rx[6] {
+                BUS_VERB_PREF_CHANGED if rx[8..12] == [0; 4] => HINT = true, // a delivered PrefChanged: re-read at this answer
+                una_abi::BUS_VERB_OPEN_ARG => {
+                    if let Some(a) = una_abi::open_arg_body(&rx[..(n as usize).min(BUS_FRAME_MAX)]) {
+                        open_arg_keep(a); // ONEINSTANCE (B734): the loop arm — the main loop takes it ([`take_open_arg`])
+                    }
+                }
+                una_abi::BUS_VERB_NOTICE => {} // Quarry's file NOTICE: Lumen registers no file type (a file reaches it as OPEN_ARG or a drop)
+                _ => {} // a reply no ask waits for any more (its `bus_ask` gave up after BUS_ASK_TRIES)
             }
         }
         if now_ms >= NEXT {
