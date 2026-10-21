@@ -553,15 +553,25 @@ fn focus_rect(m: &Model, cols: &[Col]) -> Option<(usize, Rect, bool)> {
 
 /// Pane rows `[r0, r1)` (view-relative) of `c` in `r` from the pane's own first row ([`rows_paint_at`]).
 fn rows_paint(m: &Model, px: &mut [u32], c: &Col, r: Rect, r0: usize, r1: usize, live: bool) -> usize {
-    let t = pane_top(m, c, pane_vis(m, c, r));
-    rows_paint_at(m, px, c, r, t, r0, r1, live)
+    let top = pane_top(m, c, pane_vis(m, c, r));
+    rows_paint_at(m, px, ColPane { col: c, rect: r, top }, r0, r1, live)
 }
 
-/// THE column row painter: pane rows `[r0, r1)` (view-relative) of `c` in `r` with row `t` at the top, exactly as the
-/// full paint draws them: the ground, the selection fill, the name and a folder's chevron, clipped at the gutter when
-/// the column overflows (MILLERWHEEL B798: every list column, not the focus pane alone). Returns the pixels painted.
-#[allow(clippy::too_many_arguments)]
-fn rows_paint_at(m: &Model, px: &mut [u32], c: &Col, r: Rect, t: usize, r0: usize, r1: usize, live: bool) -> usize {
+/// COLUMNSHOVER (rmbp-ledger B806): one Columns column AS A PANE (MILLERWHEEL B798's word) — the column, the rect it
+/// is laid in on the glass and the row at its top: what [`rows_paint_at`] paints.
+#[derive(Clone, Copy)]
+struct ColPane<'a> {
+    col: &'a Col,
+    rect: Rect,
+    top: usize,
+}
+
+/// THE column row painter: pane rows `[r0, r1)` (view-relative) of `p.col` in `p.rect` with row `p.top` at the top,
+/// exactly as the full paint draws them: the ground, the selection fill, the name and a folder's chevron, clipped at
+/// the gutter when the column overflows (MILLERWHEEL B798: every list column, not the focus pane alone). Returns the
+/// pixels painted.
+fn rows_paint_at(m: &Model, px: &mut [u32], p: ColPane, r0: usize, r1: usize, live: bool) -> usize {
+    let ColPane { col: c, rect: r, top: t } = p;
     let g = &m.geom;
     let rh = g.row_h();
     let vis = pane_vis(m, c, r);
@@ -703,7 +713,7 @@ pub(super) fn col_step_in(m: &Model, px: &mut [u32], c: &Col, r: Rect, st: &crat
     }
     let _ = crate::video::wm::scroll_blit(px, m.geom.w, st);
     let (r0, r1) = super::strip_rows(st, rh);
-    rows_paint_at(m, px, c, r, st.off / rh, r0, r1, m.focus == Pane::List)
+    rows_paint_at(m, px, ColPane { col: c, rect: r, top: st.off / rh }, r0, r1, m.focus == Pane::List)
 }
 
 /// On-glass `slot`'s live step: its first row stored, then [`col_step_in`].
@@ -728,5 +738,5 @@ pub(super) fn probe_views(m: &Model, cols: &[Col]) -> Vec<Option<(Rect, crate::v
 
 /// [`rows_paint_at`] for the probe: column `c` in `r`, row `t` at the top, every visible row.
 pub(super) fn probe_rows_paint(m: &Model, px: &mut [u32], c: &Col, r: Rect, t: usize) -> usize {
-    rows_paint_at(m, px, c, r, t, 0, usize::MAX, m.focus == Pane::List)
+    rows_paint_at(m, px, ColPane { col: c, rect: r, top: t }, 0, usize::MAX, m.focus == Pane::List)
 }
