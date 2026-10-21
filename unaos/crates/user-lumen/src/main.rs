@@ -315,7 +315,17 @@ struct App {
     usage: Option<u32>,
     /// LUMEN2: where the last paint put things (the pointer's hit test reads it).
     geo: Geo,
+    /// RING3SCROLL (B778): the scroll model last registered with the window system, and whether it holds one.
+    sv: una_abi::ScrollSet,
+    sv_live: bool,
 }
+
+/// RING3SCROLL (B778): the scrollbar's gutter at the window's right edge, surface px (the transcript's text ends at
+/// `w - 8` and a code block's band at `w - 6`, so nothing of Lumen's is painted in it).
+const SB_GUTTER: i32 = 6;
+const SV0: una_abi::ScrollSet = una_abi::ScrollSet { win: u32::MAX, offset: 0, extent: 0, viewport: (0, 0, 0, 0), line: 1, gutter: 1, ground: 0 };
+/// RING3SCROLL: the registration's reply buffer.
+static mut SV_RX: [u8; una_abi::BUS_FRAME_MAX] = [0; una_abi::BUS_FRAME_MAX];
 
 /// LUMEN2: the last paint's layout, for the pointer.
 #[derive(Clone, Copy)]
@@ -380,6 +390,8 @@ static mut APP: App = App {
     conv_title_n: 0,
     usage: None,
     geo: GEO0,
+    sv: SV0,
+    sv_live: false,
 };
 /// The one App. The program is single-threaded: the main loop and the network wait hook (`tick`, run
 /// from inside vein_ring3's socket waits) are never live at the same time, so each takes it in turn.
@@ -757,8 +769,16 @@ impl App {
                 if self.side.open && self.ptr.0 >= 0 && self.ptr.0 < side::SIDE_W {
                     let g = side::geom(self.geo.lh, self.geo.iy - 6);
                     self.side.scroll_by(d * 3, g.rows);
-                } else {
+                } else if !self.sv_live {
+                    // RING3SCROLL (B778): the transcript's wheel is the window system's (`INPUT_EV_SCROLL` below). This
+                    // line is the aarch64 arm's ABSENCE only (its dispatcher answers BUS_VERB_SCROLL_SET with -EINVAL, the
+                    // ONEINSTANCE2 shape): delete it when aarch64 fulfils the verb.
                     self.scroll_by(d * 3);
+                }
+            }
+            una_abi::INPUT_EV_SCROLL => {
+                if let Some((win, off)) = una_abi::input_ev_scroll(ev) {
+                    self.scrolled(win, off);
                 }
             }
             INPUT_EV_MOUSE_ABS => {
@@ -1037,6 +1057,46 @@ impl App {
         }
     }
 
+    /// RING3SCROLL (B778): register the transcript with the window system's one scroll model (`BUS_VERB_SCROLL_SET`)
+    /// whenever its offset, extent or viewport changed since the last registration — called from the paint, before the
+    /// present, so the bar `wm` paints into the gutter rides the same frame. Model: line = the line box; extent = every
+    /// ring row; the viewport = the transcript rows left of the gutter (right of the sidebar while it is open, so a
+    /// wheel over the sidebar still reaches Lumen); offset = the first row drawn, from the top.
+    fn sv_sync(&mut self) {
+        if self.win < 0 {
+            return;
+        }
+        let g = self.geo;
+        let lh = g.lh.max(1) as u32;
+        let vx = if self.side.open { side::SIDE_W } else { 0 };
+        let rows = self.rows_vis.max(1) as u32;
+        let want = una_abi::ScrollSet {
+            win: self.win as u32,
+            offset: g.first as u32 * lh,
+            extent: self.ring.len() as u32 * lh,
+            viewport: (vx as u16, 3, (self.w - SB_GUTTER - vx).max(1) as u16, (rows * lh) as u16),
+            line: lh as u16,
+            gutter: SB_GUTTER as u16,
+            ground: theme::cur().bg,
+        };
+        if want == self.sv {
+            return;
+        }
+        let rx = unsafe { &mut *core::ptr::addr_of_mut!(SV_RX) };
+        self.sv_live = matches!(una_abi::scroll_set(&want, rx, sys), Ok(true));
+        self.sv = want;
+    }
+
+    /// RING3SCROLL (B778): the window system scrolled the transcript to `off` (px from the top, on the line grid).
+    fn scrolled(&mut self, win: u32, off: u32) {
+        if self.win < 0 || win != self.win as u32 {
+            return;
+        }
+        let first = (off / self.geo.lh.max(1) as u32) as i32;
+        self.scroll = (self.max_scroll - first).clamp(0, self.max_scroll.max(0));
+        self.sv.offset = off; // the model already holds it: the repaint registers nothing
+    }
+
     /// Repaint now if something changed and the window is visible.
     fn paint(&mut self) {
         if !self.dirty || unsafe { self.flags.read_volatile() } & 2 != 0 {
@@ -1052,6 +1112,7 @@ impl App {
         self.rows_vis = rows;
         self.max_scroll = maxs;
         self.geo = geo;
+        self.sv_sync();
         sys(SYS_WIN_PRESENT, self.win as u64, 0, 0, 0);
     }
 
@@ -2262,29 +2323,10 @@ fn render(a: &App, s: &Surf) -> (i32, i32, Geo) {
     let th = theme::cur();
     let (w, h) = (a.w, a.h);
     let lh = lh();
-    s.fill(0, 0, w, h, th.bg);
     let tw = (w - 8) as f32; // the text width, px
     // the footer: two status rows, each with its button at the right (LUMEN2: [chats], and [stop] while answering)
     let fy2 = h - lh - 2;
     let fy1 = fy2 - lh;
-    s.fill(0, fy1 - 3, w, 1, th.rule);
-    let chats: &[u8] = if a.side.open { b"[chats x]" } else { b"[chats]" };
-    let chats_x = w - 4 - width(chats, Kind::Sans) as i32;
-    let st1 = &a.st1[..a.st1_n];
-    s.text(4, fy1, &st1[..fit(st1, Kind::Sans, (chats_x - 10) as f32)], th.ok_ink);
-    s.text(chats_x, fy1, chats, th.link_ink);
-    let mut stop_x = i32::MAX;
-    let (sc, st): (u32, &[u8]) = if a.busy {
-        stop_x = w - 4 - width(b"[stop]", Kind::Sans) as i32;
-        s.text(stop_x, fy2, b"[stop]", th.caret);
-        (th.caret, b"... answering (Esc stops)")
-    } else if a.flash_n > 0 && now_ms() < a.flash_until {
-        (th.caret, &a.flash[..a.flash_n])
-    } else {
-        (th.note_ink, &a.st2[..a.st2_n])
-    };
-    let room2 = if a.busy { (stop_x - 10) as f32 } else { tw };
-    s.text(4, fy2, &st[..fit(st, Kind::Sans, room2)], sc);
     // the input: broken into rows of at most `iw` px (by character, not word: it is being typed)
     let iw = (tw - 16.0).max(16.0);
     let mut starts: alloc::vec::Vec<usize> = alloc::vec![0];
@@ -2305,6 +2347,37 @@ fn render(a: &App, s: &Surf) -> (i32, i32, Geo) {
     let crow = if crow + 1 < total && starts[crow + 1] == a.caret { crow + 1 } else { crow };
     let top = (crow + 1).saturating_sub(shown);
     let iy = fy1 - 6 - shown as i32 * lh;
+    let rows = ((iy - 6 - 4) / lh).max(1) as usize;
+    let n = a.ring.len();
+    // RING3SCROLL (B778): the ground, all but the scrollbar's gutter band. While the transcript overflows, the gutter
+    // rows [3, 3 + rows x lh) at the right edge are the window system's (`wm` paints the one scrollbar there when Lumen
+    // registers, `sv_sync`); Lumen fills the rest of the gutter, and all of it when the transcript fits.
+    s.fill(0, 0, w - SB_GUTTER, h, th.bg);
+    if n > rows {
+        let band = 3 + rows as i32 * lh;
+        s.fill(w - SB_GUTTER, 0, SB_GUTTER, 3, th.bg);
+        s.fill(w - SB_GUTTER, band, SB_GUTTER, h - band, th.bg);
+    } else {
+        s.fill(w - SB_GUTTER, 0, SB_GUTTER, h, th.bg);
+    }
+    s.fill(0, fy1 - 3, w, 1, th.rule);
+    let chats: &[u8] = if a.side.open { b"[chats x]" } else { b"[chats]" };
+    let chats_x = w - 4 - width(chats, Kind::Sans) as i32;
+    let st1 = &a.st1[..a.st1_n];
+    s.text(4, fy1, &st1[..fit(st1, Kind::Sans, (chats_x - 10) as f32)], th.ok_ink);
+    s.text(chats_x, fy1, chats, th.link_ink);
+    let mut stop_x = i32::MAX;
+    let (sc, st): (u32, &[u8]) = if a.busy {
+        stop_x = w - 4 - width(b"[stop]", Kind::Sans) as i32;
+        s.text(stop_x, fy2, b"[stop]", th.caret);
+        (th.caret, b"... answering (Esc stops)")
+    } else if a.flash_n > 0 && now_ms() < a.flash_until {
+        (th.caret, &a.flash[..a.flash_n])
+    } else {
+        (th.note_ink, &a.st2[..a.st2_n])
+    };
+    let room2 = if a.busy { (stop_x - 10) as f32 } else { tw };
+    s.text(4, fy2, &st[..fit(st, Kind::Sans, room2)], sc);
     s.fill(0, iy - 3, w, 1, th.rule);
     let mut r = 0;
     while r < shown {
@@ -2323,8 +2396,6 @@ fn render(a: &App, s: &Surf) -> (i32, i32, Geo) {
         r += 1;
     }
     // the transcript: the ring's rows, scrolled back `scroll` from the bottom
-    let rows = ((iy - 6 - 4) / lh).max(1) as usize;
-    let n = a.ring.len();
     let maxs = n.saturating_sub(rows);
     let sc = (a.scroll.max(0) as usize).min(maxs);
     let first = n - rows.min(n) - sc;
@@ -2403,14 +2474,7 @@ fn render(a: &App, s: &Surf) -> (i32, i32, Geo) {
         }
         i += 1;
     }
-    // M1: the position indicator — a scrollbar on the right edge when there is more than a screen
-    if n > rows {
-        let track = rows as i32 * lh;
-        let thumb = (track * rows as i32 / n as i32).max(6);
-        let ty = 3 + ((track - thumb) as i64 * first as i64 / maxs.max(1) as i64) as i32;
-        s.fill(w - 3, 3, 2, track, th.rule);
-        s.fill(w - 3, ty, 2, thumb, th.caret);
-    }
+    // RING3SCROLL (B778): the position indicator is the window system's one scrollbar now (`sv_sync`), in the gutter.
     // LUMEN2: the conversations sidebar, over the transcript's left edge
     if a.side.open {
         draw_side(a, s, lh, iy - 6);
