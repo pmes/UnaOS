@@ -712,13 +712,14 @@ pub fn set_sys(k: &str, v: PrefValue) {
 ///         principal = the kernel reply record, body_len = n
 /// body:   <ns> "." <key> NUL <value as a TOML literal (prefs_core::PrefValue::to_literal)>
 ///         [NUL "clamped=true"]   (PREFSKERNEL: when the schema clamped the write; wire::changed_body_applied)
+///   or:   <ns> "." <key> NUL     (PREFSUNSET SR169: the key left the store with no preference-level default; wire::unset_body)
 /// ```
 ///
 /// (the PREF_SET request body, unsolicited). Also the ATTRSURF hook: the key is mirrored as an attribute
 /// on the preferences file once the VFS can set one ([`mirror_attr`]).
 fn changed(ns: &str, k: &str, a: &prefs_core::schema::Applied) {
     let v = &a.value;
-    serial_println!("[prefs] changed {}.{}", ns, k); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::prefs_client::on_changed(ns, k, a); // SETTINGSBUS (B337): the verb-19 frame to the kernel's subscribers. PREFSKERNEL (B345): it carries `clamped`. ARMNOEL0: widened with the prefs_client cfg (lib.rs).
+    serial_println!("[prefs] changed {}.{}", ns, k); #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::prefs_client::on_changed(ns, k, Some(a)); // SETTINGSBUS (B337): the verb-19 frame to the kernel's subscribers. PREFSKERNEL (B345): it carries `clamped`. ARMNOEL0: widened with the prefs_client cfg (lib.rs).
     mirror_attr(ns, k, v);
 }
 
@@ -1661,8 +1662,8 @@ pub fn reload_from_store() -> usize {
 // carrying the value the key answers once unset: its declared default — the schema's static default, a derived one
 // evaluated against the store (the kernel has no environment variables and no local models, so those rule inputs
 // answer no), or the program's `PrefDeclare` default for `app.<name>.<key>`. A key with no preference-level default
-// (`Default::Consumer`, an undeclared key) has no value the frame can carry: it is counted `unsent=` and owed an
-// unset form of verb 19 (prefs_core::wire, outside this arc).
+// (`Default::Consumer`, an undeclared key) has no value the frame can carry: PREFSUNSET (SR169) posts it in verb 19's
+// unset form (`prefs_core::wire::unset_body`, `<ns>.<key>` NUL), counted `unset=`, so `unsent=` is 0.
 
 /// The kernel's rule inputs: the store's stored values, no environment variable, no local model.
 struct StoreEnv;
@@ -1690,41 +1691,40 @@ fn default_applied(ns: &str, k: &str) -> Option<prefs_core::schema::Applied> {
     Some(prefs_core::schema::Applied { value, clamped: false })
 }
 
-/// Post one PrefChanged per `(ns, key, value)`. Called with no prefs lock held (`on_changed` takes the bus queue's
-/// and the ring-3 subscribers' locks only). Returns the frames handed to `on_changed`.
-fn post_changes(changes: &[(String, String, prefs_core::schema::Applied)]) -> usize {
+/// Post one PrefChanged per `(ns, key, value)`; a `None` value posts the unset form (PREFSUNSET SR169). Called with no
+/// prefs lock held (`on_changed` takes the bus queue's and the ring-3 subscribers' locks only). Returns the frames
+/// handed to `on_changed`.
+fn post_changes(changes: &[(String, String, Option<prefs_core::schema::Applied>)]) -> usize {
     for (ns, k, a) in changes {
         #[cfg(any(feature = "aarch64_el0", target_arch = "x86_64", all(target_arch = "aarch64", feature = "desktop_firmware")))]
-        crate::prefs_client::on_changed(ns, k, a); // the `changed()` cfg: no bus on this build, no frame
+        crate::prefs_client::on_changed(ns, k, a.as_ref()); // the `changed()` cfg: no bus on this build, no frame
         let _ = (ns, k, a);
     }
     changes.len()
 }
 
-/// `watch_deleted`'s keys, after its locks are dropped: each answers its default now, said once per run.
+/// `watch_deleted`'s keys, after its locks are dropped: each answers its default now (its declared default, else the
+/// unset form), said once per run.
 fn deleted_post(cleared: &[(String, String)]) {
     if cleared.is_empty() {
         return;
     }
-    let mut out: Vec<(String, String, prefs_core::schema::Applied)> = Vec::new();
-    for (ns, k) in cleared {
-        if let Some(a) = default_applied(ns, k) {
-            out.push((ns.clone(), k.clone(), a));
-        }
-    }
+    let out: Vec<(String, String, Option<prefs_core::schema::Applied>)> = cleared.iter().map(|(ns, k)| (ns.clone(), k.clone(), default_applied(ns, k))).collect();
+    let unset = out.iter().filter(|c| c.2.is_none()).count();
     let sent = post_changes(&out);
-    serial_println!("[prefs] deleted -> changed keys={} sent={} unsent={} (unsent: no declared default)", cleared.len(), sent, cleared.len() - sent);
+    deleted_note(cleared.len(), sent);
+    serial_println!("[prefs] deleted -> changed keys={} sent={} unsent={} unset={}", cleared.len(), sent, cleared.len() - sent, unset);
 }
 
 /// `reload_from_store`'s diff: every key whose value the reload moved (added, changed, or gone -> its default).
 fn reload_post(old: &PrefTree) {
-    let mut out: Vec<(String, String, prefs_core::schema::Applied)> = Vec::new();
+    let mut out: Vec<(String, String, Option<prefs_core::schema::Applied>)> = Vec::new();
     let mut gone: Vec<(String, String)> = Vec::new();
     {
         let t = TREE.lock();
         for (ns, k, v) in t.entries() {
             if old.get(ns, k) != Some(v) {
-                out.push((String::from(ns), String::from(k), prefs_core::schema::Applied { value: v.clone(), clamped: false }));
+                out.push((String::from(ns), String::from(k), Some(prefs_core::schema::Applied { value: v.clone(), clamped: false })));
             }
         }
         for (ns, k, _) in old.entries() {
@@ -1734,14 +1734,10 @@ fn reload_post(old: &PrefTree) {
         }
     }
     let n = out.len() + gone.len();
-    for (ns, k) in &gone {
-        if let Some(a) = default_applied(ns, k) {
-            out.push((ns.clone(), k.clone(), a));
-        }
-    }
+    let unset = gone.iter().filter(|(ns, k)| { let a = default_applied(ns, k); let none = a.is_none(); out.push((ns.clone(), k.clone(), a)); none }).count();
     let sent = post_changes(&out);
     if n > 0 {
-        serial_println!("[prefs] reload -> changed keys={} sent={} unsent={} (unsent: no declared default)", n, sent, n - sent);
+        serial_println!("[prefs] reload -> changed keys={} sent={} unsent={} unset={}", n, sent, n - sent, unset);
     }
 }
 
@@ -1803,8 +1799,26 @@ pub fn restore_domain(d: &str, bytes: &[u8]) -> bool {
             od.push(String::from(d));
         }
     }
-    let out: Vec<(String, String, prefs_core::schema::Applied)> =
-        t.entries().map(|(ns, k, v)| (String::from(ns), String::from(k), prefs_core::schema::Applied { value: v.clone(), clamped: false })).collect();
+    let out: Vec<(String, String, Option<prefs_core::schema::Applied>)> =
+        t.entries().map(|(ns, k, v)| (String::from(ns), String::from(k), Some(prefs_core::schema::Applied { value: v.clone(), clamped: false }))).collect();
     let _ = post_changes(&out);
     true
+}
+
+// ══════════════ PREFSUNSET (LEDGER SR169, BP-storage-15) — TAIL-APPENDED ══════════════
+// The last non-empty delete-watch run's counts (`deleted_post`): keys cleared and frames handed to `on_changed`. With
+// the unset form every cleared key posts, so `tests autolock`'s `deleted=` leg expects sent == keys (unsent=0).
+static DELETED_KEYS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static DELETED_SENT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `deleted_post`'s half: one run's counts.
+fn deleted_note(keys: usize, sent: usize) {
+    DELETED_KEYS.store(keys, Ordering::Relaxed);
+    DELETED_SENT.store(sent, Ordering::Relaxed);
+}
+
+/// `tests autolock`'s `deleted=` leg: `(keys, sent)` of the last delete-watch run that cleared keys.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] // the fixture's cfg (tests.rs `autolock_selftest`)
+pub fn deleted_counts() -> (usize, usize) {
+    (DELETED_KEYS.load(Ordering::Relaxed), DELETED_SENT.load(Ordering::Relaxed))
 }

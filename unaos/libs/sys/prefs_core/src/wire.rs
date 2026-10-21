@@ -23,6 +23,10 @@
 //!
 //! `PREF_CHANGED` (19): body = the SET request body of the stored value ([`changed_body`]); when the
 //! schema clamped the write, `NUL clamped=true` follows ([`changed_body_applied`], [`parse_changed`]).
+//! PREFSUNSET (SR169): a key that left the store with no preference-level default posts the UNSET form,
+//! `<ns>.<key>` NUL and an EMPTY literal slot ([`unset_body`]). No stored value has an empty literal and
+//! `PrefValue::from_literal("")` errs, so a parser older than this form drops the frame (never misreads it), and
+//! [`parse_set`] refuses it (an unset frame never replays as a SET).
 
 use alloc::format;
 use alloc::string::String;
@@ -132,18 +136,33 @@ pub fn changed_body_applied(ns: &str, key: &str, a: &Applied) -> Vec<u8> {
     b
 }
 
-/// Parse a PREF_CHANGED body: `(ns, key, stored value, clamped)`.
-pub fn parse_changed(body: &[u8]) -> Option<(&str, &str, PrefValue, bool)> {
+/// PREFSUNSET (SR169): the PREF_CHANGED (19) body for a key that left the store with no preference-level default:
+/// `<ns>.<key>` NUL, the literal slot empty — every reader answers the schema's (or the consumer's) default.
+pub fn unset_body(ns: &str, key: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(ns.as_bytes());
+    b.push(b'.');
+    b.extend_from_slice(key.as_bytes());
+    b.push(0);
+    b
+}
+
+/// Parse a PREF_CHANGED body: `(ns, key, stored value, clamped)`; the value is `None` for the unset form
+/// ([`unset_body`], never clamped).
+pub fn parse_changed(body: &[u8]) -> Option<(&str, &str, Option<PrefValue>, bool)> {
     let z = body.iter().position(|&b| b == 0)?;
     let (ns, k) = parse_get(&body[..z])?;
     let rest = &body[z + 1..];
+    if rest.is_empty() {
+        return Some((ns, k, None, false));
+    }
     let (lit, clamped) = match rest.iter().position(|&b| b == 0) {
         Some(z2) if &rest[z2 + 1..] == b"clamped=true" => (&rest[..z2], true),
         Some(_) => return None,
         None => (rest, false),
     };
     let v = PrefValue::from_literal(core::str::from_utf8(lit).ok()?).ok()?;
-    Some((ns, k, v, clamped))
+    Some((ns, k, Some(v), clamped))
 }
 
 /// The SET reply body: empty when stored as sent, else `<stored literal>` NUL `clamped=true`.
@@ -449,9 +468,26 @@ system.trackpad.three_finger_drag = false\n";
         assert_eq!(changed_body_applied("system", "display.brightness", &c), b"system.display.brightness\x001\x00clamped=true".to_vec());
         let u = Applied { value: PrefValue::Int(9), clamped: false };
         assert_eq!(changed_body_applied("system", "display.brightness", &u), changed_body("system", "display.brightness", &PrefValue::Int(9)));
-        assert_eq!(parse_changed(b"system.display.brightness\x001\x00clamped=true"), Some(("system", "display.brightness", PrefValue::Int(1), true)));
-        assert_eq!(parse_changed(b"system.display.brightness\x009"), Some(("system", "display.brightness", PrefValue::Int(9), false)));
+        assert_eq!(parse_changed(b"system.display.brightness\x001\x00clamped=true"), Some(("system", "display.brightness", Some(PrefValue::Int(1)), true)));
+        assert_eq!(parse_changed(b"system.display.brightness\x009"), Some(("system", "display.brightness", Some(PrefValue::Int(9)), false)));
         assert_eq!(parse_changed(b"system.display.brightness\x009\x00bogus"), None);
+    }
+
+    /// PREFSUNSET (SR169): the unset form — frozen bytes, its parse arm, and why an older parser cannot misread it.
+    #[test]
+    fn kat_unset_body() {
+        assert_eq!(unset_body("system", "trackpad.speed"), b"system.trackpad.speed\x00".to_vec());
+        assert_eq!(parse_changed(b"system.trackpad.speed\x00"), Some(("system", "trackpad.speed", None, false)));
+        assert_eq!(parse_changed(&unset_body("app", "lumen.zoom")), Some(("app", "lumen.zoom", None, false)));
+        // The empty literal is no value (the pre-PREFSUNSET parse answered None), and never a SET.
+        assert!(PrefValue::from_literal("").is_err());
+        assert_eq!(parse_set(&unset_body("system", "trackpad.speed")), None);
+        // An unset key is never clamped; a bare address with no NUL is not a PrefChanged.
+        assert_eq!(parse_changed(b"system.trackpad.speed\x00\x00clamped=true"), None);
+        assert_eq!(parse_changed(b"system.trackpad.speed"), None);
+        // The value forms are unchanged: an empty string stored is `""`, never the empty slot.
+        assert_eq!(changed_body("system", "display.wallpaper", &PrefValue::Str("".into())), b"system.display.wallpaper\x00\"\"".to_vec());
+        assert_eq!(parse_changed(b"system.display.wallpaper\x00\"\""), Some(("system", "display.wallpaper", Some(PrefValue::Str("".into())), false)));
     }
 
     #[test]
