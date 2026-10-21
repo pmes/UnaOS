@@ -30480,7 +30480,7 @@ type ShadowCasts = ();
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 #[inline]
 fn shadow_track() {
-    desktop::track()
+    a11yshadow::track() // A11YSHADOW (rmbp-ledger B816): the shadow pass keys on the looks epoch (`theme::epoch`), so a colour-filter / contrast / accent change re-lays every shadow extent; body at this file's tail. ⚠ LINE-NEUTRAL: edited in place, call before the comment.
 }
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 #[inline(always)]
@@ -31842,3 +31842,59 @@ mod scrollview {
 
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub use scrollview::scroll_press_ring3; // RING3SCROLLPRESS (B791): the x86 click router's door (`wc_scroll_press`)
+
+// A11YSHADOW (rmbp-ledger B816; BP-video-25, flight 37 §3.3: "window shadow fails to update all windows on
+// accessibility color inversion") — TAIL-APPENDED so no line above moves; the one call is `shadow_track`'s body.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod a11yshadow {
+    //! CHARTER: Kernel — wm. The shadow pass keys on the ONE looks epoch (`theme::epoch`, which CONTRAST, the
+    //! colour filter's `settings::a11y_filter_moved`, a set/accent change and the lens all bump).
+    //!
+    //! WHY. The colour filter is applied at the copy (BP-video-25), and a window shadow's pixels reach the panel only
+    //! through `desktop::track`'s fills (the erase drain: `stage_fill` -> `bg_row` -> `shade_bytes` -> the filter's
+    //! `in_place`). `track` re-queues a cast only when its box or tiles moved or `STALE` is set, and the desktop
+    //! layer's own present (`Screen::flush`) skips the occluder boxes, which ARE the shadow extents — so a filter
+    //! change re-filtered every pixel but the shadows. Here the pass compares the epoch it last laid at with the live
+    //! one and, on a move, takes the existing re-lay (`shadows_stale`, the wallpaper reload's) before `track`.
+    //! The strips (`strip::seal`) and the VEIL cache (`VeilKey.epoch`) already key on the same epoch.
+    use core::sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed};
+
+    /// The epoch the shadow pass last laid at (0 = never changed, the theme's own start).
+    static SHADOW_EPOCH: AtomicU32 = AtomicU32::new(0);
+    /// The filter word (`mode | invert << 7`) the last wire line named.
+    static SAID: AtomicU8 = AtomicU8::new(0);
+    /// Epoch re-lays since boot (the fixture's `relaid=`).
+    static RELAYS: AtomicU32 = AtomicU32::new(0);
+
+    /// `wm::shadow_track`'s body: the epoch follow, then the shadow pass. Runs at `composite_inner`'s head, no TABLE
+    /// held (`shadows_stale`'s damage and `track` each take it and let it go).
+    pub(super) fn track() {
+        let e = crate::video::theme::epoch();
+        let moved = SHADOW_EPOCH.swap(e, Relaxed) != e;
+        if moved {
+            super::shadows_stale();
+            RELAYS.fetch_add(1, Relaxed);
+        }
+        super::desktop::track();
+        if moved {
+            said(e);
+        }
+    }
+
+    /// The wire line, once per re-lay that finds the filter moved since the last line:
+    /// `[a11y] filter=<label> epoch=<n> relaid=shadow,strips,veil casts=<n>`.
+    fn said(e: u32) {
+        use crate::video::blitter::a11yfilter as af;
+        let (m, inv) = (af::mode(), af::invert());
+        let w = (m as u8) | ((inv as u8) << 7);
+        if SAID.swap(w, Relaxed) == w {
+            return;
+        }
+        serial_println!("[a11y] filter={} epoch={} relaid=shadow,strips,veil casts={}", af::label(m, inv), e, super::desktop::casts_now().n);
+    }
+
+    /// Epoch re-lays since boot.
+    pub fn relays() -> u32 {
+        RELAYS.load(Relaxed)
+    }
+}
