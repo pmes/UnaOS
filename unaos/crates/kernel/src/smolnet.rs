@@ -88,7 +88,7 @@ impl RawNic for E1000Nic {
     fn tx_ready() -> bool {
         #[cfg(feature = "usbnet")]
         if !e1000::nic_present() {
-            return crate::drivers::xhci::usbnet::tx_room();
+            #[cfg(feature = "wifi10")] if crate::wifi::data::bound() { return true; } return crate::drivers::xhci::usbnet::tx_room(); // WIFIDHCP (B831): the kept station's TX is synchronous (LINE-NEUTRAL)
         }
         true
     }
@@ -654,7 +654,7 @@ fn rx_ready(drive: bool) -> bool {
     if crate::drivers::xhci::usbnet::rx_ready(drive) {
         return true;
     }
-    let _ = drive;
+    #[cfg(feature = "wifi10")] if crate::wifi::data::rx_ready() { return true; } let _ = drive; // WIFIDHCP (B831): a data frame kept by the Wi-Fi station (LINE-NEUTRAL)
     false
 }
 
@@ -2325,4 +2325,11 @@ fn connect_said(own: Option<crate::net_tick::Who>, ip: [u8; 4], port: u16) {
     crate::net_tick::note_connect(own);
     let (cause, by) = connect_cause(&crate::net_tick::LEDGER.census().since(&before));
     serial_println!("[net] connect cause={} dst={}.{}.{}.{}:{} by={}", cause, ip[0], ip[1], ip[2], ip[3], port, by);
+}
+
+/// WIFIDHCP (rmbp-ledger B831) — TAIL-APPENDED. The live default gateway and DNS server (big-endian octets, 0 = none),
+/// for `tests wifi`'s S10b line (`wifi/verb.rs::wifidhcp`) after a lease over the kept station.
+#[cfg(feature = "wifi10")]
+pub fn route_view() -> ([u8; 4], [u8; 4]) {
+    (CURRENT_GW.load(Ordering::Relaxed).to_be_bytes(), CURRENT_DNS.load(Ordering::Relaxed).to_be_bytes())
 }

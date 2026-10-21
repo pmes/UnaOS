@@ -2724,9 +2724,11 @@ pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
     // WIFIAUTH (B788): S8 then S9 while both engines are armed (bringup/join.rs).
     let joined = join::run(bar0, &prep, &mut rxr, &mut seen, CH, &mut w);
     // WIFIDATA (B803): S10a, one ARP over the open link, still inside the pass that owns the engines (bringup/join.rs).
-    let data = join::link(bar0, &prep, &mut rxr, &mut seen, CH, gw, &mut w);
-    let (mac_off, rx_off) = rx::finish(bar0, &rxr, &mut w);
-    let tx_off = tx::stop(bar0, &mut w);
+    let (data, link) = join::link(bar0, &prep, &mut rxr, &mut seen, CH, gw, &mut w);
+    // WIFIDHCP (B831): on LINKED the engines are NOT stopped — the station is kept for the stack (`join::keep` below).
+    let kept = link.is_some();
+    let (mac_off, rx_off) = if kept { (false, false) } else { rx::finish(bar0, &rxr, &mut w) };
+    let tx_off = !kept && tx::stop(bar0, &mut w);
     unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
     let shm_ok = unsafe { r32(bar0, D11_SHM_CONTROL) } == shm_pre;
     let heard = seen.resp_to_us > 0;
@@ -2748,16 +2750,24 @@ pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
         CH, WINDOW_US / 1000, if heard { "HEARD" } else { "SILENT" }, reason
     );
     serial_println!(
-        ":: wifi10: end mac-suspended-first={} cookie_pre={:#06x} wifi9_beacons={} rx2tx={} rst2rx={} tx_pwr_ctl={} tx-reset={} rx-reset={} mac-suspended={} wrote-macctl={} wrote-shm={} wrote-dma={} wrote-tx-desc={} wrote-macfilter={} wrote-irq-ack={} wrote-pci-cmd={} wrote-core-regs={} wrote-wrapper={} shm-ctl-restored={} transmit={}(probe-req{}{}; MACFILTER_SELF set, so the ucode ACKs unicast to it) ::",
+        ":: wifi10: end mac-suspended-first={} cookie_pre={:#06x} wifi9_beacons={} rx2tx={} rst2rx={} tx_pwr_ctl={} tx-reset={} rx-reset={} mac-suspended={} wrote-macctl={} wrote-shm={} wrote-dma={} wrote-tx-desc={} wrote-macfilter={} wrote-irq-ack={} wrote-pci-cmd={} wrote-core-regs={} wrote-wrapper={} shm-ctl-restored={} transmit={}(probe-req{}{}; MACFILTER_SELF set, so the ucode ACKs unicast to it) station={} ::",
         suspended as u8, cookie_pre, beacons.map(|n| alloc::format!("{}", n)).unwrap_or_else(|| alloc::string::String::from("none")),
         tp.rx2tx as u8, tp.rst2rx as u8, if pctl_on { "on" } else { "off" }, tx_off as u8, rx_off as u8, mac_off as u8,
         w.macctl, w.shm, w.dma, w.tx_desc, w.macfilter, w.irq_ack, w.pci_cmd, h.c.core_regs, h.c.wrapper,
         if shm_ok { "MATCH" } else { "FAILED" }, 1 + joined + data, ["", "+auth", "+auth+assoc-req"][joined.min(2) as usize],
-        if data > 0 { "+arp" } else { "" }
+        if data > 0 { "+arp" } else { "" }, if kept { "kept" } else { "down" }
     );
     let _ = (prep.rate_mem, prep.reset_ok, prep.txstatus0, tp.pctl_en, pctl.as_ref().map(|r| (r.cmd, r.targ, r.idle_regs, r.samp_stat, r.c.timeouts)));
+    if let Some(l) = link {
+        join::keep(bar0, prep, rxr, seen, CH, w, l);
+    }
 }
 
 // WIFIAUTH (B788, R110): rungs S8 (open-system auth) and S9 (association) inside wifi10's pass. See bringup/join.rs.
 #[cfg(feature = "wifi10")]
 mod join;
+// WIFIDHCP (B831): the kept station's device fns and the TX ring's caps, for `wifi/data.rs` (the accessor triple).
+#[cfg(feature = "wifi10")]
+pub(super) use join::{station_mac, station_pending, station_rx, station_tx};
+#[cfg(feature = "wifi10")]
+pub(super) use tx::{FRAMES, FRAME_MAX};

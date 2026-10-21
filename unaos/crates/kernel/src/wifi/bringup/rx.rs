@@ -455,19 +455,7 @@ pub(super) fn poll(bar0: u64, rx: &mut Rx, s: &mut Seen, ch: u16, window_us: u64
     let t0 = unsafe { tsf(bar0) };
     let mut t1 = t0;
     while t1.wrapping_sub(t0) < window_us && crate::arch::now_cycles().wrapping_sub(c0) < cap {
-        let cur = ((unsafe { r32(bar0, RXSTATUS) } & RXSTATDPTR) as usize / DESC_BYTES) % SLOTS; // dma.c:231-239
-        while rx.slot != cur {
-            rx.moves += 1;
-            let n = take(rx.bufs + (rx.slot * BUFSIZE) as u64, s, ch, &mut rx.raw_rows, rx.tag);
-            for _ in 0..n {
-                unsafe { fill(rx.ring, rx.slot, rx.bufs + (rx.slot * BUFSIZE) as u64, w) };
-                rx.slot = (rx.slot + 1) % SLOTS;
-                if rx.slot == cur { break; }
-            }
-        }
-        // dma.c:1699-1700 with the dma.c:1679-1681 back-off: RXINDEX = the slot before the hardware's.
-        unsafe { w32(bar0, RXINDEX, (((cur + SLOTS - 1) % SLOTS) * DESC_BYTES) as u32) };
-        w.dma += 1;
+        drain(bar0, rx, s, ch, w);
         crate::arch::sched::sleep_ms(5);
         t1 = unsafe { tsf(bar0) };
     }
@@ -501,4 +489,22 @@ pub(super) fn run(bar0: u64, bus: u8, dev: u8, func: u8, ch: u16, w: &mut Writes
     poll(bar0, &mut rx, &mut s, ch, WATCH_US, w);
     let _ = finish(bar0, &rx, w);
     s
+}
+
+/// One pass over the ring, no sleep (`poll`'s body, and WIFIDHCP's kept station from inside smolnet's poll, B831):
+/// every slot the hardware filled since the last pass is counted into `s` and re-armed, then RXINDEX is backed off.
+pub(super) fn drain(bar0: u64, rx: &mut Rx, s: &mut Seen, ch: u16, w: &mut Writes) {
+    let cur = ((unsafe { r32(bar0, RXSTATUS) } & RXSTATDPTR) as usize / DESC_BYTES) % SLOTS; // dma.c:231-239
+    while rx.slot != cur {
+        rx.moves += 1;
+        let n = take(rx.bufs + (rx.slot * BUFSIZE) as u64, s, ch, &mut rx.raw_rows, rx.tag);
+        for _ in 0..n {
+            unsafe { fill(rx.ring, rx.slot, rx.bufs + (rx.slot * BUFSIZE) as u64, w) };
+            rx.slot = (rx.slot + 1) % SLOTS;
+            if rx.slot == cur { break; }
+        }
+    }
+    // dma.c:1699-1700 with the dma.c:1679-1681 back-off: RXINDEX = the slot before the hardware's.
+    unsafe { w32(bar0, RXINDEX, (((cur + SLOTS - 1) % SLOTS) * DESC_BYTES) as u32) };
+    w.dma += 1;
 }
