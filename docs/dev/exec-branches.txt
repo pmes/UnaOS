@@ -671,3 +671,5 @@ refs/heads/exec-rmbp-wcpar2         8ab5da61 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-gateneutral    742c45e8 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-ring3undo      dea48c2b FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-crawld         c542e05c FOLDED-BY-HAND (this commit) 2026-10-21 CRAWLD (crawl D fixes)
+refs/heads/exec-rmbp-ticklessenv    9d84258c IN-FLIGHT cloud wave36 TICKLESSENV
+refs/heads/exec-rmbp-avrcp          9d84258c IN-FLIGHT cloud wave36 AVRCP
