@@ -2034,7 +2034,7 @@ fn autolock_selftest() {
         serial_println!(":: AUTOLOCK: entered=0 leaked_keys=0 reopened=- table_same=- ms=- -> SKIP reason=screen-up ::");
         return;
     }
-    let feed = |s: &[u8]| { for &b in s { let _ = crate::fs::users::screen_key(b); } };
+    let feed = |s: &[u8]| { for &b in s { let _ = crate::fs::users::screen_key(b); } }; let Some(kdf_ms) = autolock_credential(NAME, PW) else { return }; // AUTOLOCK2 (B819): the credential held to `users::verify` (the screen's one verdict) BEFORE the lock; a human's `una` SKIPs, never locked (file tail). LINE-NEUTRAL fold, code first.
     let settle = || {
         let t0 = crate::arch::ms();
         loop {
@@ -2070,9 +2070,9 @@ fn autolock_selftest() {
     let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); let gets = lockchanged_leg(); let deleted = lockdeleted_leg(); // PREFSDELETED (B755): the deleted-domain leg (file tail). // LOCKCHANGED (B758): the lock's GETs per lock-key and per other-key change (file tail). LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
     let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0 && gets.0 && deleted.0; // PREFSDELETED (B755): + deleted. // LOCKCHANGED (B758): + gets. LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
     serial_println!(
-        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={} gets={} deleted={}",
+        ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={} gets={} deleted={} verify={} kdf_ms={}",
         entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), resumed, hole_ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), "owed", prefs.1,
-        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8, gets.1, deleted.1
+        if pass { "PASS" } else { "FAIL" }, token, wrong, hidden, painted as u8, gets.1, deleted.1, "users", kdf_ms
     );
 }
 
@@ -3187,7 +3187,7 @@ fn lock2_unlocked(l: (crate::video::wm::WinId, bool)) -> (bool, Option<u64>) {
     let mut hole = None;
     loop {
         let el = crate::arch::ms().wrapping_sub(t0);
-        if wm::info(id).map_or(false, |i| !i.damaged) {
+        if !crate::video::lock::active() && wm::info(id).map_or(false, |i| !i.damaged) {
             hole = Some(el);
             break;
         }
@@ -3198,7 +3198,7 @@ fn lock2_unlocked(l: (crate::video::wm::WinId, bool)) -> (bool, Option<u64>) {
     }
     let again = !crate::video::lock::active() && wm::present_outcome(id) != wm::Presented::Suppressed;
     let _ = wm::close_owner(LOCK2_OWNER);
-    serial_println!("[lock] fixture row={} suppressed_while_locked={} clean_ms={} presents_again={}", id, suppressed as u8, hole.map_or(-1i64, |m| m as i64), again as u8);
+    serial_println!("[lock] fixture row={} suppressed_while_locked={} clean_ms={} presents_again={} locked={}", id, suppressed as u8, hole.map_or(-1i64, |m| m as i64), again as u8, crate::video::lock::active() as u8);
     (suppressed && hole.is_some() && again, hole)
 }
 
@@ -6228,3 +6228,20 @@ static ARG2: crate::sync::Mutex<Option<alloc::string::String>> = crate::sync::Mu
 fn arg2_set(a: Option<&str>) { *ARG2.lock() = a.map(alloc::string::String::from); }
 #[cfg(feature = "wifi10")]
 pub fn arg2() -> Option<alloc::string::String> { ARG2.lock().clone() }
+
+// AUTOLOCK2 (rmbp-ledger B819, BP-security-18) — TAIL-APPENDED, so no line above moves. CHARTER: the fixture's credential
+// is held to the lock's ONE verdict (`users::verify`, the same fn the screen's `Job::Unlock` calls; the users record's
+// PBKDF2, never the keyed root's KDF) before `tests autolock` raises the screen. FLIGHT 37 boot 3: the bench's first user
+// was a human's `una`, the name guard passed, the fixture typed the QEMU credential, was refused and left the machine
+// locked. Now a credential the session does not hold SKIPs and the screen is never raised. `Some(kdf_ms)` = it holds.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn autolock_credential(name: &[u8], pw: &[u8]) -> Option<u64> {
+    let t0 = crate::arch::ms();
+    let held = crate::fs::users::verify(name, pw);
+    let kdf_ms = crate::arch::ms().saturating_sub(t0);
+    if held {
+        return Some(kdf_ms);
+    }
+    serial_println!(":: AUTOLOCK: entered=0 leaked_keys=0 reopened=- table_same=- ms=- -> SKIP reason=credential-not-fixture verify=users kdf_ms={} ::", kdf_ms);
+    None
+}
