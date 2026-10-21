@@ -30862,7 +30862,7 @@ pub mod k2p {
 // tables — `BUS_VERB_A11Y_TREE`'s body and `tests a11ytree`. Declared at this file's tail with `#[path]` (fbdirect's
 // and desktop's precedent) so `video/mod.rs` does not move and it reads the rows' fields: a read-only walk (`table()`
 // dereferenced immutably — no `DMG_GEN` bump — into a buffer reserved before the hold; no WCSER); cfg-erased knob-off.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 #[path = "a11y.rs"]
 pub mod a11y;
 
@@ -30964,7 +30964,7 @@ pub fn attention_tick(now: u64) -> bool {
 ///
 /// Locks: `ARMS` is a leaf. `hold_under` takes it under TABLE; `judge` takes it under SPAWN_FOCUS and
 /// releases it before printing; nothing holds it while taking another lock.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod focussteal {
     use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -31013,7 +31013,7 @@ pub mod focussteal {
 
     /// `spawn_focus_arm`'s fold: record the arming with its cause. The spawner is the caller's slot when
     /// the spawn runs on a ring-3 process's CR3 (`SYS_SPAWN_PATH`); a kernel spawn has none.
-    pub fn note_arm(owner: u64) {
+    #[cfg(target_arch = "x86_64")] pub fn note_arm(owner: u64) { // RAISEARM64 (SR175): x86 only — its door `arch::memory::current_slot` is x86-only (aarch64's is private in xwin.rs); its one caller (`spawn_focus_arm`) is x86 `wc`
         let s = crate::arch::memory::current_slot().map(|s| s as u64 + 1).unwrap_or(0);
         note_arm_by(owner, if s == owner { 0 } else { s });
     }
