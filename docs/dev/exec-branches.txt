@@ -659,12 +659,12 @@ refs/heads/exec-rmbp-sbcframe       6f79b4d5 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-orinrepeat     76408458 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-openargqueue   fc4fba86 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-trashbatchdock fc03f4b8 FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-prefsreload    ac54e385 IN-FLIGHT cloud wave36 PREFSRELOAD
+refs/heads/exec-rmbp-prefsreload    d27218bc FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-hwcensusarm    169c2eb1 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-scrollview     229aceda FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-tickless       045cb41a FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-usbsuspend     f7dd6702 FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-sinkall        fb8ad2f4 IN-FLIGHT cloud wave36 SINKALL
+refs/heads/exec-rmbp-sinkall        e1379bf5 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-pickerkeys     e6252391 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-sdpserver      abc14cd7 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-wcpar2         8ab5da61 FOLDED-BY-HAND (this commit) 2026-10-21
@@ -672,4 +672,4 @@ refs/heads/exec-rmbp-gateneutral    742c45e8 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-ring3undo      dea48c2b FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-crawld         c542e05c FOLDED-BY-HAND (this commit) 2026-10-21 CRAWLD (crawl D fixes)
 refs/heads/exec-rmbp-ticklessenv    9d84258c IN-FLIGHT cloud wave36 TICKLESSENV
-refs/heads/exec-rmbp-avrcp          9d84258c IN-FLIGHT cloud wave36 AVRCP
+refs/heads/exec-rmbp-avrcp          19b7034d FOLDED-BY-HAND (this commit) 2026-10-21
