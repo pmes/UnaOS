@@ -115,7 +115,7 @@ pub fn run(name: Option<&str>) -> usize {
         serial_println!(":: TESTS: already running — refused ::");
         return 0;
     }
-    BOOT_OVER.store(true, Ordering::Release); let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed)); // SMALLFIX7 (B501): a `tests` run ends the boot's verdict window
+    BOOT_OVER.store(true, Ordering::Release); let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed)); let my_gen = RUN_GEN.load(Ordering::Acquire); /* BOOTLIST (B817): the run's generation — a list fixture abandoned at its budget touches neither CUR nor RUNNING when it returns (LINE-NEUTRAL) */ // SMALLFIX7 (B501): a `tests` run ends the boot's verdict window
     *FAILED.lock() = [None; 16]; skip_reset(); RESULTS.lock().clear(); // QUIETBOOT3 (B352): same-line fold.
     let mut ran = 0usize;
     let mut i = 0usize;
@@ -128,14 +128,14 @@ pub fn run(name: Option<&str>) -> usize {
         serial_println!(":: TESTS: run {} ::", n);
         *CUR.lock() = n;
         crate::serial_line::tail_arm(); let vb = verdicts(); f(); skip_note(n, vb); verdict_note(n); // QUIETBOOT3 (B352): the fixture's own wire tail, for the glass.
-        *CUR.lock() = "";
+        if RUN_GEN.load(Ordering::Acquire) == my_gen { *CUR.lock() = ""; } // BOOTLIST (B817): a superseded run leaves CUR to the run that replaced it (LINE-NEUTRAL)
         ran += 1;
     }
     let (p, f) = (PASS.load(Ordering::Relaxed).wrapping_sub(p0), FAIL.load(Ordering::Relaxed).wrapping_sub(f0));
     let mut names = alloc::string::String::new();
     for n in FAILED.lock().iter().flatten() { if !names.is_empty() { names.push(','); } names.push_str(n); }
     crate::smallfix6::not_found(name, ran); serial_println!(":: TESTS: ran={} pass={} fail={} failed=[{}] skipped=[{}] ::", ran, p, f, names, skipped_names());
-    RUNNING.store(false, Ordering::Release);
+    if RUN_GEN.load(Ordering::Acquire) == my_gen { RUNNING.store(false, Ordering::Release); } // BOOTLIST (B817): a superseded run never releases the guard the next run holds (LINE-NEUTRAL)
     ran
 }
 
@@ -174,7 +174,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); #[cfg(feature = "uvc")] register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); #[cfg(feature = "uac")] register("uacmic", uacmic_fixture); register("clockpainters", clockpainters_selftest); register("hwreport", hwreport_selftest); register("audiomix", audiomix_selftest); register("micring3", micring3_selftest); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] register("a2dp", a2dp_selftest); register("sinkall", sinkall_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); #[cfg(all(target_arch = "aarch64", not(feature = "busreg")))] register("hwreport", hwreport_selftest); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment). HWCENSUSARM (SR165): `tests hwreport` on an aarch64 image with no busreg (the tegra line) (LINE-NEUTRAL append, before this comment).
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); register("pinchzoom", pinchzoom_selftest); } /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); register("pinchzoom", pinchzoom_selftest); } #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("bootlist", bootlist::selftest); /* BOOTLIST (B817, R132): `tests bootlist`, the list runner's probe (file tail; LINE-NEUTRAL) */ /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -6533,5 +6533,369 @@ fn a11yshadow_leg() {
             ":: A11YSHADOW: shadow_follows={} relaid={} -> {} ::",
             if ok { "ok" } else { "FAIL" }, relaid, if ok { "PASS" } else { "FAIL" }
         );
+    }
+}
+
+// BOOTLIST (rmbp-ledger B817, R132) — TAIL-APPENDED. Peter (flight 37): "we need a better way to run these tests". The
+// bench typed 71 verbs one by one over the serial door at 40–90 s a verb; the list went dark twice behind a slow fixture
+// and the typer typed into a dead door and into a lock screen. Now the kernel runs the flight's list ITSELF from the ESP
+// at the boot's first `[desktop] built` ([`bootlist`]). `run`'s budget hook: a list fixture abandoned at its budget is
+// still inside `run` when it returns; [`RUN_GEN`] keeps that late return off `CUR` and `RUNNING` (the folds at `run`).
+
+/// BOOTLIST (B817): `run`'s generation — bumped by [`supersede`]; a run whose generation moved touches neither CUR nor RUNNING.
+static RUN_GEN: AtomicU32 = AtomicU32::new(0);
+
+/// BOOTLIST (B817): the list fixture `name` overran its budget. Only when `run` is executing THAT fixture now (never the
+/// seat's own run, never an outer `tests bootlist`): retire the run — CUR and RUNNING free for the next fixture. `true` when retired.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn supersede(name: &str) -> bool {
+    if !(RUNNING.load(Ordering::Acquire) && running_is(name)) {
+        return false;
+    }
+    RUN_GEN.fetch_add(1, Ordering::AcqRel);
+    *CUR.lock() = "";
+    RUNNING.store(false, Ordering::Release);
+    true
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod bootlist {
+    //! CHARTER: Kernel — kernel-by-ruling R132 (BOOTLIST: the kernel runs the flight's fixture list from the ESP at the first [desktop] built; seam: kernel-only)
+    //!
+    //! BOOTLIST (rmbp-ledger B817). [`start`] (from `boot::oldest_say`, the boot's first `[desktop] built`) spawns ONE
+    //! `bootlist` worker. It waits for the services and the session, reads `/boot/TESTS.LIST` through the mount table
+    //! (absent: one line, nothing runs; no rebuild changes the list), [`parse`]s it, and [`run_list`]s it: one verb at a
+    //! time, each on its own `bootlist-fx` child through `tests::shell_verb` — the path a typed `tests <v>` takes, so the
+    //! fixture's own `::` lines and `:: TESTS: run` / `:: TESTS: ran=` are unchanged — watched by TESTWATCH, with a
+    //! per-fixture budget (default 60 s, `@<s>` per line). An overrun prints `:: <VERB>: -> SKIP(budget <s>s) ::` and the
+    //! list moves on; the child is left where it is, never killed. The HEAVY tier (`HEAVY:` lines, and nameindextx /
+    //! abimage wherever they sit) runs after the light tier's summary, or only on a boot after the first-user boot when
+    //! `/boot/TESTS.HEAVY` says `boot2`. Before each fixture the worker waits out a lock, the login screen and a `tests`
+    //! the seat typed (`[bootlist] paused why=<lock|login|tests-busy>`). The door is never taken.
+    //!
+    //! HONEST LIMITS: pass/fail/skip is the verdict tap's PASS/FAIL delta across the fixture, so an abandoned fixture's
+    //! late verdict lands in the delta of whichever fixture runs then; an abandoned fixture keeps running beside the next.
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+    use core::sync::atomic::{AtomicBool, AtomicU32};
+
+    pub const LIST_PATH: &str = "/boot/TESTS.LIST";
+    pub const HEAVY_PATH: &str = "/boot/TESTS.HEAVY";
+    const LIST_CAP: usize = 64 * 1024;
+    pub const BUDGET_DEFAULT_S: u32 = 60;
+    const BUDGET_MAX_S: u32 = 3600;
+    /// Heavy wherever they appear (flight 37: NAMEINDEXTX 5 min under MOUNT+CARD, ABIMAGE 9 min on the card).
+    const HEAVY_ALWAYS: &[&str] = &["nameindextx", "abimage"];
+    /// The child's stack: the shell-job's (`shelltask.rs` STACK).
+    const STACK: usize = 64 * 1024;
+    const POLL_MS: u64 = 50;
+    const PROBE: &str = "# probe (BOOTLIST B817)\nprobefast\nprobeslow @1\nHEAVY:\nprobeheavy\n";
+
+    /// One list line.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    pub struct Entry {
+        /// The fixture name, and its one argument when the line carries one (`play flac`).
+        pub words: Vec<String>,
+        pub budget_s: u32,
+        pub heavy: bool,
+    }
+
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    struct Tally {
+        ran: u32,
+        pass: u32,
+        fail: u32,
+        skip: u32,
+        budget_skips: u32,
+    }
+
+    struct Job {
+        seq: u32,
+        words: Vec<String>,
+        exec: Option<fn(&[String])>,
+    }
+
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    static GEN: AtomicU32 = AtomicU32::new(0);
+    /// The highest generation whose child returned (generations only grow, so a late child never hides a newer one).
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    /// Children inside their fixture now (abandoned ones included).
+    static LIVE: AtomicU32 = AtomicU32::new(0);
+    static JOB: crate::sync::Mutex<Job> = crate::sync::Mutex::new(Job { seq: 0, words: Vec::new(), exec: None });
+
+    fn ms() -> u64 {
+        crate::arch::ms()
+    }
+
+    fn place() -> usize {
+        crate::arch::smp::worker_cpu(0).unwrap_or(crate::arch::sched::CPU_AUTO)
+    }
+
+    /// The list's text -> its entries. PURE. One verb per line (a leading `tests` is allowed, one argument word kept),
+    /// `#` starts a comment, blank lines skipped, `HEAVY:` puts every later line in the heavy tier, `@<s>` is the budget.
+    pub fn parse(text: &str) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let mut heavy_tier = false;
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.eq_ignore_ascii_case("HEAVY:") {
+                heavy_tier = true;
+                continue;
+            }
+            let mut words: Vec<String> = Vec::new();
+            let mut budget_s = BUDGET_DEFAULT_S;
+            for w in line.split_whitespace() {
+                if let Some(s) = w.strip_prefix('@') {
+                    if let Ok(n) = s.trim_end_matches('s').parse::<u32>() {
+                        budget_s = n.clamp(1, BUDGET_MAX_S);
+                    }
+                    continue;
+                }
+                if words.is_empty() && w == "tests" {
+                    continue;
+                }
+                if words.len() < 2 {
+                    words.push(String::from(w));
+                }
+            }
+            if words.is_empty() {
+                continue;
+            }
+            let heavy = heavy_tier || HEAVY_ALWAYS.contains(&words[0].as_str());
+            out.push(Entry { words, budget_s, heavy });
+        }
+        out
+    }
+
+    /// Does the heavy tier run on THIS boot? PURE. `boot2` mode: only on a boot whose desktop came from the login
+    /// screen (`boot::ignite_from`), never the first-user boot.
+    pub fn heavy_now(boot2: bool, from: &str) -> bool {
+        !boot2 || from == "login-screen"
+    }
+
+    /// The first [desktop] built of the boot (`boot::oldest_say`): spawn the one worker and return.
+    pub fn start() {
+        if STARTED.swap(true, AcqRel) {
+            return;
+        }
+        crate::arch::sched::spawn("bootlist", worker, 0, place(), crate::arch::sched::PRIO_NORMAL);
+    }
+
+    fn worker(_arg: usize) {
+        while !crate::boot::services_up() {
+            crate::arch::sched::sleep_ms(250);
+        }
+        wait_clear();
+        let mt = crate::shell::vfs_mount_table();
+        let bytes = match mt.read(LIST_PATH, 0, LIST_CAP) {
+            Ok(b) => b,
+            Err(_) => {
+                serial_println!("[bootlist] list=absent path={} (nothing runs)", LIST_PATH);
+                return;
+            }
+        };
+        let boot2 = matches!(mt.read(HEAVY_PATH, 0, 64), Ok(b) if String::from_utf8_lossy(&b).split_whitespace().next() == Some("boot2"));
+        drop(mt);
+        let text = String::from_utf8_lossy(&bytes);
+        let entries = parse(&text);
+        let from = crate::boot::ignite_from();
+        let heavy = entries.iter().filter(|e| e.heavy).count();
+        serial_println!(
+            "[bootlist] list src={} bytes={} light={} heavy={} heavy_mode={} boot={} cpu={}",
+            LIST_PATH, bytes.len(), entries.len() - heavy, heavy, if boot2 { "boot2" } else { "after" }, from, crate::arch::percpu::this_cpu().cpu_index
+        );
+        let _ = run_list(&entries, exec_tests, true, heavy_now(boot2, from));
+    }
+
+    /// The light tier, the light summary, then (when `heavy_now`) the heavy tier and the final summary. Returns the
+    /// cumulative tally and every summary it printed.
+    fn run_list(entries: &[Entry], exec: fn(&[String]), gated: bool, heavy_now: bool) -> (Tally, Vec<(Tally, &'static str)>) {
+        let t0 = ms();
+        let mut t = Tally::default();
+        let mut said = Vec::new();
+        for e in entries.iter().filter(|e| !e.heavy) {
+            one(e, exec, gated, &mut t);
+        }
+        let n_heavy = entries.iter().filter(|e| e.heavy).count();
+        let word = if n_heavy == 0 { "none" } else { "deferred" };
+        summary(&t, word, t0);
+        said.push((t, word));
+        if n_heavy == 0 || !heavy_now {
+            return (t, said);
+        }
+        serial_println!("[bootlist] tier=heavy n={} (after the light tier's summary)", n_heavy);
+        for e in entries.iter().filter(|e| e.heavy) {
+            one(e, exec, gated, &mut t);
+        }
+        summary(&t, "ran", t0);
+        said.push((t, "ran"));
+        (t, said)
+    }
+
+    fn summary(t: &Tally, heavy: &str, t0: u64) {
+        serial_println!(":: BOOTLIST: ran={} pass={} fail={} skip={} heavy={} ms={} ::", t.ran, t.pass, t.fail, t.skip, heavy, ms().saturating_sub(t0));
+    }
+
+    /// One entry on its own child, bounded by its budget.
+    fn one(e: &Entry, exec: fn(&[String]), gated: bool, t: &mut Tally) {
+        if gated {
+            wait_clear();
+        }
+        let seq = GEN.fetch_add(1, AcqRel).wrapping_add(1);
+        {
+            let mut j = JOB.lock();
+            j.seq = seq;
+            j.words = e.words.clone();
+            j.exec = Some(exec);
+        }
+        let before = super::verdicts();
+        t.ran += 1;
+        crate::arch::sched::spawn_stack("bootlist-fx", child, seq as usize, place(), crate::arch::sched::PRIO_NORMAL, STACK);
+        let t0 = ms();
+        let budget_ms = e.budget_s as u64 * 1000;
+        loop {
+            if DONE.load(Acquire) >= seq {
+                break;
+            }
+            let age = ms().saturating_sub(t0);
+            if age >= budget_ms {
+                super::supersede(&e.words[0]);
+                serial_println!(":: {}: -> SKIP(budget {}s) ::", e.words[0].to_ascii_uppercase(), e.budget_s);
+                t.skip += 1;
+                t.budget_skips += 1;
+                return;
+            }
+            crate::arch::sched::sleep_ms(if age < 200 { 5 } else { POLL_MS });
+        }
+        let after = super::verdicts();
+        if after.1 != before.1 {
+            t.fail += 1;
+        } else if after.0 != before.0 {
+            t.pass += 1;
+        } else {
+            t.skip += 1;
+        }
+    }
+
+    /// The `bootlist-fx` child: its job's words (if its generation is still the current one), TESTWATCH around the fixture.
+    fn child(arg: usize) {
+        let seq = arg as u32;
+        let (words, exec) = {
+            let j = JOB.lock();
+            if j.seq != seq {
+                return;
+            }
+            (j.words.clone(), j.exec)
+        };
+        let Some(exec) = exec else { return };
+        let mut line = String::from("tests");
+        for w in &words {
+            line.push(' ');
+            line.push_str(w);
+        }
+        LIVE.fetch_add(1, AcqRel);
+        crate::tests_watch::arm(&line);
+        exec(&words);
+        crate::tests_watch::disarm();
+        LIVE.fetch_sub(1, AcqRel);
+        DONE.fetch_max(seq, AcqRel);
+    }
+
+    /// The list's exec: the path a typed `tests <v>` takes (the registration chain, `run`), on a scratch console.
+    fn exec_tests(words: &[String]) {
+        let args: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+        let mut con = crate::console::Console::new();
+        super::shell_verb(&args, &mut con);
+    }
+
+    /// What holds the list before its next fixture: the lock, the login screen, a `tests` the seat typed.
+    fn blocker() -> Option<&'static str> {
+        #[cfg(feature = "login")]
+        {
+            if crate::video::lock::active() {
+                return Some("lock");
+            }
+            if crate::video::crystal::login::is_open() {
+                return Some("login");
+            }
+        }
+        if super::RUNNING.load(Acquire) {
+            return Some("tests-busy");
+        }
+        None
+    }
+
+    fn wait_clear() {
+        let Some(mut why) = blocker() else { return };
+        let t0 = ms();
+        serial_println!("[bootlist] paused why={}", why);
+        loop {
+            crate::arch::sched::sleep_ms(250);
+            match blocker() {
+                None => break,
+                Some(w) if w != why => {
+                    serial_println!("[bootlist] paused why={}", w);
+                    why = w;
+                }
+                Some(_) => {}
+            }
+        }
+        serial_println!("[bootlist] resumed why={} after_ms={}", why, ms().saturating_sub(t0));
+    }
+
+    /// `tests bootlist`: inline under the verb; spawned on its own task when a boot source registers it (`tests-at-boot`).
+    pub fn selftest() {
+        if super::RUNNING.load(Acquire) && super::running_is("bootlist") {
+            probe();
+        } else {
+            crate::arch::sched::spawn("bootlist-probe", probe_task, 0, place(), crate::arch::sched::PRIO_NORMAL);
+        }
+    }
+
+    fn probe_task(_arg: usize) {
+        probe();
+    }
+
+    /// The RAM list through the same [`parse`] and [`run_list`]: one budget SKIP and both summaries.
+    fn probe() {
+        let entries = parse(PROBE);
+        let heavy = entries.iter().filter(|e| e.heavy).count();
+        let parsed_ok = entries.len() == 3
+            && heavy == 1
+            && entries.get(1).map(|e| e.words[0] == "probeslow" && e.budget_s == 1).unwrap_or(false)
+            && entries.get(2).map(|e| e.heavy && e.budget_s == BUDGET_DEFAULT_S).unwrap_or(false);
+        serial_println!("[bootlist] list src=ram bytes={} light={} heavy={} heavy_mode=after boot=probe", PROBE.len(), entries.len() - heavy, heavy);
+        let (t, said) = run_list(&entries, probe_exec, false, true);
+        let tl = |t: &Tally| (t.ran, t.pass, t.fail, t.skip);
+        let summary_ok = said.len() == 2
+            && tl(&said[0].0) == (2, 1, 0, 1)
+            && said[0].1 == "deferred"
+            && tl(&said[1].0) == (3, 2, 0, 1)
+            && said[1].1 == "ran";
+        let w0 = ms();
+        while LIVE.load(Acquire) > 0 && ms().saturating_sub(w0) < 4000 {
+            crate::arch::sched::sleep_ms(POLL_MS);
+        }
+        let pass = parsed_ok && t.budget_skips == 1 && summary_ok;
+        serial_println!(
+            ":: BOOTLIST: probe entries={} heavy={} budget_skips={} summary={} -> {} ::",
+            entries.len(), heavy, t.budget_skips, if summary_ok { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" }
+        );
+    }
+
+    /// The probe's fixtures: fast and heavy print a PASS; slow sleeps past its 1 s budget and prints no verdict.
+    fn probe_exec(words: &[String]) {
+        match words.first().map(|s| s.as_str()) {
+            Some("probeslow") => {
+                crate::arch::sched::sleep_ms(2500);
+                serial_println!("[bootlist] probe verb=probeslow woke after its budget (abandoned; no verdict)");
+            }
+            Some(v) => serial_println!("[bootlist] probe verb={} -> PASS", v),
+            None => {}
+        }
     }
 }

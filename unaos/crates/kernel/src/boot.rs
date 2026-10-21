@@ -455,5 +455,5 @@ pub fn oldest_say() {
         OLDEST.1,
         crate::fs::bootdisk::BUILD_SHA,
         oldest_net()
-    );
+    ); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::tests::bootlist::start(); // BOOTLIST (rmbp-ledger B817, R132): the boot's first [desktop] built starts the ESP list's one worker (tests.rs tail). LINE-NEUTRAL append, code first
 }

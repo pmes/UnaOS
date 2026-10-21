@@ -996,3 +996,8 @@ FORBID :: POWER-UI: .* -> FAIL ::
 # ── WINDOWLIST (R75) — `tests windowlist`: the bar's Window menu opened through the press router, the second window's row picked (focus asserted), Show Desktop minimises every live app window and a second pick restores them.
 REQUIRE :: WINDOWLIST: rows=[0-9]+ live=[0-9]+ focused=[1-9][0-9]* minimised=[0-9]+ show_desktop_ok=true -> PASS ::
 FORBID :: WINDOWLIST: .* -> FAIL ::
+# ── BOOTLIST (rmbp-ledger B817, R132), TAIL-APPENDED — `tests bootlist` (tests-at-boot registers it from the boot source and it runs on its own task): a RAM list (`probefast`, `probeslow @1`, `HEAVY:`, `probeheavy`) through the runner's own parse and run_list — one budget SKIP, the light summary, then the heavy tier's cumulative summary.
+REQUIRE :: PROBESLOW: -> SKIP\(budget 1s\) ::
+REQUIRE :: BOOTLIST: ran=3 pass=2 fail=0 skip=1 heavy=ran ms=[0-9]+ ::
+REQUIRE :: BOOTLIST: probe entries=3 heavy=1 budget_skips=1 summary=ok -> PASS ::
+FORBID :: BOOTLIST: .* -> FAIL ::
