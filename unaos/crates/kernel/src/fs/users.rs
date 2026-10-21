@@ -3922,6 +3922,9 @@ pub fn keyboot_hold() -> bool {
 fn keyboot_key_root(name: &[u8], password: &[u8]) {
     #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
+        if !KB_FIRSTUSER { // KEYBOOT2 (B810): the image may defer the first-user keying (UNAOS_KEYBOOT_FIRSTUSER=0; the const at the file tail)
+            return serial_println!("[keyboot] first-user keying=deferred user={} (UNAOS_KEYBOOT_FIRSTUSER=0: the root stays unkeyed; keying from Settings > Security is owed)", wire_name(name));
+        }
         let why = |r: &str| serial_println!("[keyboot] root not keyed user={} reason={} (the volume is unchanged)", wire_name(name), r);
         if role_of(name) != Some(Role::Admin) {
             return why("not-the-administrator");
@@ -4039,3 +4042,10 @@ pub fn session_gen_read() -> u32 {
 pub fn session_gen_reads() -> u32 {
     SESSION_GEN_READS.load(core::sync::atomic::Ordering::Relaxed)
 }
+
+// KEYBOOT2 (rmbp-ledger B810) — TAIL-APPENDED. Until the keyed root's unlock is flown on metal (FLIGHT 37 §6: Enter hung
+// the machine on the first boot of a keyed root), an image can keep the root unkeyed at the first-user form:
+// `UNAOS_KEYBOOT_FIRSTUSER=0` in the build environment defers `keyboot_key_root` (`[keyboot] first-user keying=deferred`).
+// Unset or any other value keys as KEYBOOT built it. The seat decides the image line.
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+const KB_FIRSTUSER: bool = match option_env!("UNAOS_KEYBOOT_FIRSTUSER") { Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'0'), None => true };

@@ -2356,7 +2356,7 @@ fn dispatch_old(job: Job, n: &[u8], p: &[u8], o: &[u8]) {
     w.name[..w.nlen].copy_from_slice(&n[..w.nlen]);
     w.pw[..w.plen].copy_from_slice(&p[..w.plen]);
     w.old[..w.olen].copy_from_slice(&o[..w.olen]);
-    let windowed = FORM.lock().windowed;
+    let windowed = FORM.lock().windowed || kb_off_render(job); // KEYBOOT2 (B810): the unlock's KDF takes the worker windowed or headless, never the render/input task (LINE-NEUTRAL fold, code first; body at the tail)
     if windowed && worker_core().is_some() && !BUSY.swap(true, Ordering::AcqRel) {
         let _ = DONE.lock().take(); // a late outcome of a released submit is never applied to this one
         *WORK.lock() = Some(w);
@@ -2413,9 +2413,9 @@ pub fn submit_drain() { crate::video::lock::service(); civil_tick(); // CLOCKPAI
     let Some(d) = DONE.lock().take() else {
         // A worker that never answers must not leave the form dead: past the bound the form is released and
         // says so (the late outcome, if it ever lands, is dropped with the busy flag already down).
-        let t0 = BUSY_T0_MS.load(Ordering::Relaxed);
+        let t0 = BUSY_T0_MS.load(Ordering::Relaxed); kb_tick(); // KEYBOOT2 (B810): the unlock form's progress repaints each pulse (LINE-NEUTRAL fold, code first; body at the tail)
         if crate::arch::ms().saturating_sub(t0) > SUBMIT_BOUND_MS {
-            let _ = WORK.lock().take();
+            let _ = WORK.lock().take(); kb_released(); // KEYBOOT2 (B810): a parked unlock key no outcome will bind is dropped, wiped (LINE-NEUTRAL fold, code first)
             serial_println!("[login] submit on=worker NO OUTCOME after {} ms — the form is released (INPUTSTALL M5)", SUBMIT_BOUND_MS);
             BUSY.store(false, Ordering::Release);
             let mut f = FORM.lock();
@@ -3211,7 +3211,7 @@ fn kb_paint(px: &mut [u32], f: &Form) {
     kb_button(px, Ctl::Kb(0), State::Unlock, if k.recovery { b"Use password" } else { b"Use recovery key" }, false);
     let hint: &[u8] = if k.recovery { b"Enter unlocks   Tab: password" } else { b"Enter unlocks   Tab: recovery key" };
     text(px, LX, 186, hint, theme::text_secondary());
-    if !f.message.is_empty() {
+    if submit_busy() { kb_progress(px); } else if !f.message.is_empty() { // KEYBOOT2 (B810): the unlock's progress while the worker runs
         text(px, LX, 212, f.message.as_bytes(), theme::accent());
     }
 }
@@ -3342,7 +3342,7 @@ fn kb_submit() -> bool {
                 FORM.lock().message = "Type your password";
             } else {
                 let secret: &[u8] = if recovery { &[] } else { &pw[..plen] }; // the words travel in `KB`, never in the work item
-                dispatch(Job::VolUnlock { words: recovery }, b"", secret);
+                kb_dispatch(recovery, secret); // KEYBOOT2 (B810): `[login] unlock submit …`, then the same dispatch
             }
         }
         _ => return false,
@@ -3369,18 +3369,19 @@ fn kb_compute(w: &Work, words: bool) -> (Outcome, u64, u64) {
                 k.wlen
             };
             let r = match core::str::from_utf8(&buf[..n]) {
-                Ok(s) => crate::fs::unafs::unlock_root(&::unafs::Unlock::Recovery(s)),
+                Ok(s) => crate::fs::unafs::keyboot_unwrap(&::unafs::Unlock::Recovery(s)),
                 Err(_) => Err(MountError::Fs(FileSystemError::KeySlot(KeySlotError::BadRecovery))),
             };
             // SAFETY: our own stack buffer; volatile so the scrub of the words copy is not elided.
             unsafe { core::ptr::write_volatile(&mut buf, [0; KB_WORDS_MAX]) };
             r
         } else {
-            crate::fs::unafs::unlock_root(&::unafs::Unlock::Password(&w.pw[..w.plen]))
+            crate::fs::unafs::keyboot_unwrap(&::unafs::Unlock::Password(&w.pw[..w.plen]))
         };
         match r {
             Ok(()) => (true, ""),
-            Err(MountError::Fs(FileSystemError::KeySlot(KeySlotError::KeyRefused | KeySlotError::BadRecovery))) => (false, "refused"),
+            Err(MountError::Fs(FileSystemError::KeySlot(KeySlotError::KeyRefused))) => (false, "refused"),
+            Err(MountError::Fs(FileSystemError::KeySlot(KeySlotError::BadRecovery))) => (false, "words"),
             Err(MountError::Fs(FileSystemError::KeySlot(KeySlotError::Unsupported))) => (false, "unsupported"),
             Err(MountError::Fs(FileSystemError::KeySlot(KeySlotError::NoMemory))) => (false, "memory"),
             Err(_) => (false, "disk"),
@@ -3394,26 +3395,37 @@ fn kb_compute(w: &Work, words: bool) -> (Outcome, u64, u64) {
     (Outcome::VolUnlock { ok, why }, crate::arch::ms().saturating_sub(t), 0)
 }
 
-/// KEYBOOT: the render task's half. Opened: the form goes and the hold releases on the next storage pass. Refused:
-/// ONE text for a wrong password and wrong words, the field cleared, the form kept (the words stay for a typo fix).
+/// KEYBOOT: the render task's half. Unwrapped: KEYBOOT2's bind runs HERE, on the render task (`unafs::keyboot_bind`,
+/// RENDERWEDGE-bounded), then the form goes and the hold releases on the next storage pass. Refused: ONE text for a
+/// wrong password and wrong words, the field cleared, the form kept (the words stay for a typo fix). The form is
+/// touched only while it is up (`tests keyboot`'s leg runs this with no form).
 fn kb_apply(ok: bool, why: &'static str) {
+    let (ok, why) = if ok { kb_bind() } else { (false, why) };
+    kb_wire(ok, why);
+    let form = FORM.lock().state == State::Unlock;
     if ok {
-        {
-            let mut k = KB.lock();
-            kb_wipe_words(&mut k);
-            k.recovery = false;
+        if form {
+            {
+                let mut k = KB.lock();
+                kb_wipe_words(&mut k);
+                k.recovery = false;
+            }
+            take_down();
+            FORM.lock().state = State::Closed;
+            serial_println!("[login] unlock form closed kdf_ms={} (KEYBOOT: the root is open; the boot goes on)", kb_kdf_ms());
         }
-        take_down();
-        FORM.lock().state = State::Closed;
-        serial_println!("[login] unlock form closed (KEYBOOT: the root is open; the boot goes on)");
+        return;
+    }
+    if !form {
         return;
     }
     serial_println!("[login] unlock refused reason={} (one text on the glass for a wrong password and wrong words)", if why == "refused" { "key" } else { why });
     let mut f = FORM.lock();
     f.message = match why {
-        "refused" => KB_REFUSED,
+        "refused" | "words" => KB_REFUSED,
         "unsupported" => "This disk's key needs a newer UnaOS",
         "memory" => "Not enough memory - try again",
+        "busy" => "The disk is busy - try again",
         _ => "Could not read the disk - try again",
     };
     clear_passwords(&mut f);
@@ -3554,4 +3566,114 @@ fn civil_tick() {
     if crate::clock::try_unix_now().is_some_and(|u| u / 60 != last) {
         repaint();
     }
+}
+
+// ── KEYBOOT2 (rmbp-ledger B810) — THE UNLOCK OFF THE RENDER TASK, ON THE WIRE ──────────────────────────────────────────
+// FLIGHT 37 §6: Enter on the unlock form hung the machine. The form's submit is INPUTSTALL M5's hand-off as before, with
+// three changes: an unlock always takes the worker when a worker core exists (`kb_off_render`, folded onto
+// `dispatch_old`'s `windowed` line — never the KDF inline on the render/input task); the worker half is
+// `unafs::keyboot_unwrap` (the slot read, then the ONE Argon2id with interrupts live) and the bind half
+// `unafs::keyboot_bind` runs from `kb_apply` on the render task (RENDERWEDGE-bounded); the form shows the elapsed time
+// while the worker runs. Wire: `[login] unlock submit mode= on=` · `[keyboot] unlock kdf_ms= read_ms= bind_ms=
+// masked_max_us= kdf_if= target= -> ok|refused why=` · `[login] unlock form closed kdf_ms=`. `tests keyboot`'s unlock
+// leg enters through [`kb_leg_submit`], the same [`kb_dispatch`] the form's Enter makes.
+
+/// KEYBOOT2: the jobs whose slow half never runs on the render task, windowed or headless.
+fn kb_off_render(job: Job) -> bool {
+    matches!(job, Job::VolUnlock { .. })
+}
+
+/// KEYBOOT2: where an unlock's slow half runs — `worker` (a worker core exists) or `inline`.
+pub fn kb_on() -> &'static str {
+    if worker_core().is_some() { "worker" } else { "inline" }
+}
+
+/// KEYBOOT2: the unlock form's submit (and the fixture's): said on the wire, then INPUTSTALL's dispatch.
+fn kb_dispatch(words: bool, secret: &[u8]) {
+    serial_println!(
+        "[login] unlock submit mode={} on={} (KEYBOOT2: the KDF on the worker; nothing typed is printed)",
+        if words { "words" } else { "password" },
+        kb_on()
+    );
+    dispatch(Job::VolUnlock { words }, b"", secret);
+}
+
+/// KEYBOOT2 (`tests keyboot`): submit `pw` exactly as the unlock form's Enter does. `false` while a submit is busy.
+pub fn kb_leg_submit(pw: &[u8]) -> bool {
+    if submit_busy() {
+        return false;
+    }
+    kb_dispatch(false, pw);
+    true
+}
+
+/// KEYBOOT2: the render pulse while a submit is on the worker — the unlock form repaints its elapsed line (5 Hz at most).
+fn kb_tick() {
+    static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if FORM.lock().state != State::Unlock {
+        return;
+    }
+    let now = crate::arch::ms();
+    if now.saturating_sub(LAST.load(Ordering::Relaxed)) < 200 {
+        return;
+    }
+    LAST.store(now, Ordering::Relaxed);
+    repaint();
+}
+
+/// KEYBOOT2: INPUTSTALL's bound released a submit — an unlock key the worker parked is dropped (wiped).
+fn kb_released() {
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    crate::fs::unafs::keyboot_pending_drop();
+}
+
+/// KEYBOOT2: the unlock form's message row while the worker runs: `Unlocking the disk... <s>.<d> s`.
+fn kb_progress(px: &mut [u32]) {
+    let el = crate::arch::ms().saturating_sub(BUSY_T0_MS.load(Ordering::Relaxed));
+    let s = alloc::format!("Unlocking the disk... {}.{} s", el / 1000, (el % 1000) / 100);
+    text(px, LX, 212, s.as_bytes(), theme::text_secondary());
+}
+
+/// KEYBOOT2: the bind half on the render task — `(true, "")` bound, else the refusal's word.
+fn kb_bind() -> (bool, &'static str) {
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        match crate::fs::unafs::keyboot_bind() {
+            Ok(_) => (true, ""),
+            Err(crate::fs::unafs::MountError::Busy) => (false, "busy"),
+            Err(_) => (false, "disk"),
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
+    {
+        (false, "unbuilt")
+    }
+}
+
+/// KEYBOOT2: the last unlock's KDF ms (0 where the unlock is not built).
+fn kb_kdf_ms() -> u64 {
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        crate::fs::unafs::keyboot_report().kdf_ms
+    }
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
+    {
+        0
+    }
+}
+
+/// KEYBOOT2: `[keyboot] unlock kdf_ms= read_ms= bind_ms= masked_max_us= kdf_if= target= -> ok|refused why=` — once per
+/// unlock outcome (a wrong password is `why=mac`: the slot's tag refused the key).
+fn kb_wire(ok: bool, why: &'static str) {
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        let r = crate::fs::unafs::keyboot_report();
+        let w = if why == "refused" { "mac" } else { why };
+        serial_println!(
+            "[keyboot] unlock kdf_ms={} read_ms={} bind_ms={} masked_max_us={} kdf_if={} target={} -> {}{}",
+            r.kdf_ms, r.read_ms, if ok { r.bind_ms } else { 0 }, r.masked_max_us, r.kdf_if, r.target, if ok { "ok" } else { "refused why=" }, if ok { "" } else { w }
+        );
+    }
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
+    let _ = (ok, why);
 }
