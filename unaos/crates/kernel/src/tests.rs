@@ -5318,3 +5318,50 @@ fn trashtoast_empty_leg(base: &str) -> bool {
     serial_println!("[trashtoast] empty before={} items={} bytes={} ms={} after={} journal={}->{} toasts={}", before, n, bytes, ms, after, j0, j1, toasts);
     made && trashed == 3 && before == 3 && r.is_ok() && n == 3 && after == 0 && j0 == 1 && j1 == 0 && toasts == 1 && t.stat(base).is_err()
 }
+
+// PREFSCLIENTKEYS (rmbp-ledger B779) — TAIL-APPENDED, so no line above moves. `tests settingsmap`'s `gets_other=` leg (the
+// line's LAST field): a PrefChanged for a key no poller reads costs ZERO bus GETs across every PrefChanged consumer — the
+// Settings drain (`settings::bus_changes`: `from_prefs` only on a shown key, the keyboard / accessibility / appearance
+// re-reads only on their own prefix), `appearance::service`, `look::service` and `clock::locale::service` (keyed through
+// `prefs_client::changed_take`), and `lock::prefs_pass` (LOCKCHANGED's claim). `system.privacy.remember` (read straight
+// from the store where it is used, never over the bus by a pass) is flipped over the bus client and put back, every pass
+// run once after each write; `gets_total()` (every `pref_get`) must not move, and the ring must have seen both changes
+// (`edges>=2`, so a 0 is a measured 0, not a missed change). Home not writable -> `skip` (the SETTINGSBUS shape).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn prefsclientkeys_leg() -> (bool, alloc::string::String) {
+    use crate::prefs::key;
+    use crate::prefs_client::{changed_mark, gets_total, last_changed, pref_set, sys_flag, PrefValue};
+    if crate::fs::vfs::home_unwritable(&crate::shell::vfs_mount_table(), &crate::prefs::path()).is_some() {
+        serial_println!("[prefsbus] keys leg skipped: the home is not writable (a set would be refused)");
+        return (true, alloc::string::String::from("skip"));
+    }
+    prefchanged_passes(); // settle: every earlier change is behind each pass's mark
+    let was = sys_flag(key::PRIVACY_REMEMBER).unwrap_or(true);
+    let (g0, m0) = (gets_total(), changed_mark());
+    let a = pref_set(crate::prefs::NS, key::PRIVACY_REMEMBER, PrefValue::Bool(!was)).is_ok();
+    prefchanged_passes();
+    let b = pref_set(crate::prefs::NS, key::PRIVACY_REMEMBER, PrefValue::Bool(was)).is_ok();
+    prefchanged_passes();
+    let other = gets_total().wrapping_sub(g0);
+    let edges = changed_mark().wrapping_sub(m0);
+    let ok = a && b && edges >= 2 && other == 0;
+    serial_println!(
+        "[prefsbus] keys leg other_key=system.{} sets={}/{} edges={} gets={} last={} via={} -> {}",
+        key::PRIVACY_REMEMBER, a as u8, b as u8, edges, other,
+        last_changed().map_or(alloc::string::String::from("-"), |(_, s)| s), crate::prefs_client::last_via(), if ok { "ok" } else { "bad" }
+    );
+    (ok, alloc::format!("{}", other))
+}
+
+/// PREFSCLIENTKEYS (B779): one run of every PrefChanged consumer's pass (the leg above).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn prefchanged_passes() {
+    let _ = crate::video::settings::bus_changes();
+    crate::video::appearance::service();
+    crate::video::look::service();
+    let _ = crate::clock::locale::service();
+    #[cfg(feature = "login")]
+    {
+        let _ = crate::video::lock::prefs_pass();
+    }
+}

@@ -4124,11 +4124,11 @@ pub fn selftest_map() {
         }
         _ => "bad",
     };
-    let (rung, stops_all) = keys_probe(); // PICKERKEYS (B768): every control a keyboard stop with its ring
-    let ok = unrowed == 0 && orphans == 0 && same && search.starts_with("ok(") && live != "bad" && stops_all > 0 && rung == stops_all;
+    let (rung, stops_all) = keys_probe(); let (gets_ok, gets_other) = crate::tests::prefsclientkeys_leg(); // PREFSCLIENTKEYS (B779): an unrelated key's PrefChanged costs 0 GETs across every pass (tests.rs tail). PICKERKEYS (B768): every control a keyboard stop with its ring
+    let ok = unrowed == 0 && orphans == 0 && same && search.starts_with("ok(") && live != "bad" && stops_all > 0 && rung == stops_all && gets_ok;
     serial_println!(
-        ":: SETTINGSMAP: keys={} rows={} orphans={} unrowed={} search={} -> {} :: live={} owners_same={} keys={}/{}",
-        keys, MAP.len(), orphans, unrowed, search, if ok { "PASS" } else { "FAIL" }, live, same as u8, rung, stops_all
+        ":: SETTINGSMAP: keys={} rows={} orphans={} unrowed={} search={} -> {} :: live={} owners_same={} keys={}/{} gets_other={}",
+        keys, MAP.len(), orphans, unrowed, search, if ok { "PASS" } else { "FAIL" }, live, same as u8, rung, stops_all, gets_other
     );
 }
 

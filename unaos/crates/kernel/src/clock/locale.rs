@@ -385,12 +385,12 @@ pub fn service() -> bool {
         if o & OWE_TZ != 0 { crate::prefs_client::sys_set(key::LOCALE_TZ, P::Str(String::from(l.zone().name))); }
         if o & OWE_REGION != 0 { crate::prefs_client::sys_set(key::LOCALE_REGION, P::Str(String::from(l.region_name()))); }
         if o & OWE_FIRST != 0 { crate::prefs_client::sys_set(key::LOCALE_FIRST_DAY, P::Str(String::from(l.first_day_name()))); }
-        SEEN_CHANGES.store(crate::prefs_client::CHANGED_N.load(Ordering::Acquire), Ordering::Relaxed);
+        SEEN_CHANGES.store(locale_mark(), Ordering::Relaxed); // PREFSCLIENTKEYS (B779): the ring's mark (file tail)
     }
     let g = crate::prefs::session_gen();
-    let ch = crate::prefs_client::CHANGED_N.load(Ordering::Acquire);
+    let bus = locale_changed(); // PREFSCLIENTKEYS (B779): only a change naming a `system.locale.*` key (file tail)
     let login = READ_GEN.load(Ordering::Relaxed) != g;
-    if !(login || SEEN_CHANGES.load(Ordering::Relaxed) != ch) {
+    if !(login || bus) {
         return false;
     }
     let mut wb = [0u8; crate::prefs::WHO_BUF];
@@ -398,7 +398,7 @@ pub fn service() -> bool {
         return false;
     }
     READ_GEN.store(g, Ordering::Relaxed);
-    SEEN_CHANGES.store(ch, Ordering::Relaxed);
+    // the edge was claimed by `locale_changed` (PREFSCLIENTKEYS B779)
     let (t, r, f) = (crate::prefs_client::sys_text(key::LOCALE_TZ), crate::prefs_client::sys_text(key::LOCALE_REGION), crate::prefs_client::sys_text(key::LOCALE_FIRST_DAY));
     let l = Locale::parse(t.as_deref(), r.as_deref(), f.as_deref());
     if l == current() && !login {
@@ -406,4 +406,26 @@ pub fn service() -> bool {
     }
     apply(l, if login { "login" } else { "bus" });
     true
+}
+
+// ── PREFSCLIENTKEYS (rmbp-ledger B779) — the keyed PrefChanged edge — TAIL-APPENDED, so no line above moves ─────────
+// [`service`] re-reads its three keys only when a PrefChanged since its mark named one of them (`prefs_client::
+// changed_take`, the last-changed ring kept beside `CHANGED_N`); any other key's change moves the mark at zero GETs.
+// Outside the desktop families there is no kernel subscriber (Settings and the lock register one), so no PrefChanged
+// edge ever moved there: the twins answer 0 / false, as `CHANGED_N` did.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn locale_mark() -> u32 {
+    crate::prefs_client::changed_mark()
+}
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn locale_changed() -> bool {
+    crate::prefs_client::changed_take(&SEEN_CHANGES, |ns, k| ns == crate::prefs::NS && k.starts_with("locale."))
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn locale_mark() -> u32 {
+    0
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn locale_changed() -> bool {
+    false
 }
