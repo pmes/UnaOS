@@ -737,7 +737,7 @@ refs/heads/exec-rmbp-lockreg2   9901e426 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-filetypes3   423f4009 FOLDED-BY-HAND (this commit) 2026-10-21 B820
 refs/heads/exec-rmbp-quarryrelist   d7b45709 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-unafswrite   d7b45709 IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-finemotion2   d7b45709 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-finemotion2   bc299c48 FOLDED-BY-HAND (this commit) 2026-10-21 B826
 refs/heads/exec-rmbp-overlayocc   13ca547f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-perfhud2   13ca547f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-zoom2   13ca547f IN-FLIGHT cut 2026-10-21
