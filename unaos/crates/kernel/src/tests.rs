@@ -4294,8 +4294,10 @@ fn a2dp_selftest() {
 ///  3. ONEINSTANCE2 (rmbp-ledger B751): Quarry's program opener on the running program (`openers::program_running`):
 ///     raised, the file delivered as OPEN_ARG to the same owner (rc 0), nothing launched (`quarry=`); and the mailbox's
 ///     OPEN_ARG hold across a call in flight over a local mailbox (`syscall::oneinstance_pending_selftest`, `pending=`).
+///  4. OPENARGQUEUE (rmbp-ledger B761): four OPEN_ARGs met during one blocking call all drain, in order, after its reply
+///     (`syscall::oneinstance_hold_selftest`, local mailbox, `hold=<in order>/4`).
 /// Every slot it made is killed and reaped. SKIP with no panel, no windowed program, or that program already running.
-/// `:: ONEINSTANCE: slots=1 raised=1 arg=ok new_flag=2 quarry=ok pending=ok -> PASS ::`
+/// `:: ONEINSTANCE: slots=1 raised=1 arg=ok new_flag=2 quarry=ok pending=ok hold=4/4 -> PASS ::`
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
 fn oneinstance_selftest() {
     use crate::arch::syscall as sc;
@@ -4303,7 +4305,7 @@ fn oneinstance_selftest() {
     use crate::video::wm;
     const WAIT_MS: u64 = 5_000;
     const ARG: &str = "/home/oneinstance-arg.txt";
-    let skip = |why: &str| serial_println!(":: ONEINSTANCE: slots=- raised=- arg=- new_flag=- quarry=- pending=- -> SKIP reason={} ::", why);
+    let skip = |why: &str| serial_println!(":: ONEINSTANCE: slots=- raised=- arg=- new_flag=- quarry=- pending=- hold=- -> SKIP reason={} ::", why);
     if !crate::video::WRITER.lock().is_ready() {
         return skip("no-panel");
     }
@@ -4374,6 +4376,7 @@ fn oneinstance_selftest() {
     #[cfg(not(feature = "quarry"))]
     let quarry = "skip";
     let pending = if sc::oneinstance_pending_selftest() { "ok" } else { "FAIL" };
+    let (held_in_order, held_sent) = sc::oneinstance_hold_selftest(); // 4 — OPENARGQUEUE: four held, four out in order
     // 2 — new=1: another copy.
     let new_flag = match launch(&[path.as_str()], true) {
         Ok((p, s, _)) => {
@@ -4387,11 +4390,11 @@ fn oneinstance_selftest() {
         let _ = sc::bg_poll(p, true);
         wm::app_name_forget(wm::owner_of_launch(s));
     }
-    let ok = up && raised && slots == 1 && focus_ok && arg_ok && new_flag == 2 && quarry != "FAIL" && pending == "ok";
+    let ok = up && raised && slots == 1 && focus_ok && arg_ok && new_flag == 2 && quarry != "FAIL" && pending == "ok" && held_in_order == held_sent;
     let arg = if arg_ok { alloc::string::String::from("ok") } else { format!("rc{}", rc) };
     serial_println!(
-        ":: ONEINSTANCE: slots={} raised={} arg={} new_flag={} quarry={} pending={} -> {} ::",
-        slots, raised as u8, arg, new_flag, quarry, pending, if ok { "PASS" } else { "FAIL" }
+        ":: ONEINSTANCE: slots={} raised={} arg={} new_flag={} quarry={} pending={} hold={}/{} -> {} ::",
+        slots, raised as u8, arg, new_flag, quarry, pending, held_in_order, held_sent, if ok { "PASS" } else { "FAIL" }
     );
     if !ok {
         serial_println!(
