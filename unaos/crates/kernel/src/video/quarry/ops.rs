@@ -1336,3 +1336,21 @@ pub fn versions_item_probe() -> bool {
     let info = ITEMS.iter().position(|&i| i == Item::Info);
     matches!((at, info), (Some(a), Some(i)) if a == i + 1) && Item::Versions.label() == "Previous versions\u{2026}"
 }
+
+// ── SCROLLPANES (rmbp-ledger B777) — the overlay gate a blitted scroll step asks — TAIL-APPENDED ───────────────────
+// A scroll step that blits the painted band moves everything ON the band; the context menu and the inline edit
+// field are painted over the rows by [`paint_overlay`] and must not ride the band, so a pane's strip path asks this
+// first and takes its full repaint instead (`live::overlay_free`). Lock order MODEL -> EDIT, as `paint_overlay`.
+
+/// Is the context menu or the inline edit field up (painted over the rows)?
+pub(super) fn overlay_up() -> bool {
+    MENU_UP.load(Ordering::Acquire) || EDIT.lock().is_some()
+}
+
+/// `tests scrollview`'s overlay leg: `f` asked with the menu flag raised, the flag put back. No menu is painted.
+pub(super) fn menu_probe(f: impl FnOnce() -> bool) -> bool {
+    let was = MENU_UP.swap(true, Ordering::AcqRel);
+    let r = f();
+    MENU_UP.store(was, Ordering::Release);
+    r
+}

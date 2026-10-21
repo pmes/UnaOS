@@ -209,7 +209,6 @@ pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
     fill(px, g, li.x, li.y, li.w, li.h, theme::surface_content());
     let cols = plan(m);
     let l = lay(g, li, &cols);
-    let rh = g.row_h();
     let live = m.focus == Pane::List;
     let mut shown = 0usize;
     for (i, c) in cols.iter().enumerate() {
@@ -228,22 +227,8 @@ pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
                 continue;
             }
         }
-        let vis = (r.h / rh).max(1);
-        let t = top(c.sel, c.rows.len(), vis);
-        let chev = 2 * g.cell_w();
-        for (j, (name, dir)) in c.rows.iter().enumerate().skip(t).take(vis) {
-            let y = r.y + (j - t) * rh;
-            let sel = c.sel == Some(j);
-            let hot = sel && live && c.kind == Kind::Focus;
-            if sel {
-                fill(px, g, r.x, y, r.w - 1, rh, if hot { theme::accent() } else { theme::line_strong() });
-            }
-            let ink = if hot { theme::surface_window() } else { theme::text_primary() };
-            text(px, g, r.x + PAD(), y + g.ts, name.as_bytes(), (r.x + r.w).saturating_sub(chev), ink);
-            if *dir {
-                text(px, g, (r.x + r.w).saturating_sub(chev) + g.ts, y + g.ts, b">", r.x + r.w - 1, ink);
-            }
-        }
+        let vis = pane_vis(m, c, r);
+        let _ = rows_paint(m, px, c, r, 0, vis, live); // SCROLLPANES (B777): the one row painter (full paint and strip)
     }
     if l.first > 0 && l.total > 0 {
         let y = li.y + li.h.saturating_sub(strip_h());
@@ -330,7 +315,7 @@ pub(super) fn press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
         return Some(Act::None);
     }
     let rh = m.geom.row_h();
-    let j = top(c.sel, c.rows.len(), (r.h / rh).max(1)) + (sy - r.y) / rh;
+    let j = pane_top(m, c, pane_vis(m, c, r)) + (sy - r.y) / rh; // SCROLLPANES (B777): the focus pane's top is the model's
     let Some((name, _)) = c.rows.get(j) else {
         m.click_ms = 0;
         return Some(Act::None);
@@ -502,7 +487,7 @@ fn pane_row_at(m: &Model, cols: &[Col], sx: usize, sy: usize) -> Option<(usize, 
         return Some((i, None));
     }
     let rh = m.geom.row_h();
-    let j = top(c.sel, c.rows.len(), (r.h / rh).max(1)) + (sy - r.y) / rh;
+    let j = pane_top(m, c, pane_vis(m, c, r)) + (sy - r.y) / rh; // SCROLLPANES (B777)
     Some((i, (j < c.rows.len()).then_some(j)))
 }
 
@@ -530,20 +515,108 @@ pub(super) fn right_select(m: &mut Model, sx: usize, sy: usize) -> bool {
     true
 }
 
-/// SMALLFIX4 (COLUMNSVIEW owed): the wheel over the Columns view moves the PANE under the pointer. A pane
-/// shows the rows around its selection (`top`), so the focus pane's wheel steps the selection by QSCROLL's
-/// `wheel_next` (three rows a detent, positive = away = toward row 0) and the pane follows; an ancestor's selection IS the
-/// path and the next pane has none, so their wheel scrolls nothing (consumed, `moved=false`).
+/// SMALLFIX4 (COLUMNSVIEW owed) -> SCROLLPANES (B777): the wheel over the Columns view SCROLLS the focus pane on wm's
+/// one model (QSCROLL's `wheel_next`, three rows a detent, positive = away = toward row 0), the selection pulled inside
+/// it (the list's rule, `live::list_pull`); an ancestor's selection IS the path and the next pane has none, so their
+/// wheel scrolls nothing (consumed, `moved=false`).
 pub(super) fn wheel(m: &mut Model, sx: usize, sy: usize, detents: i32) -> Option<super::WheelHit> {
     let cols = plan(m);
     let (i, _) = pane_row_at(m, &cols, sx, sy)?;
-    let len = m.list.len();
-    if cols[i].kind != Kind::Focus || len == 0 {
+    let Some((v, _)) = focus_view(m) else {
+        return Some(super::WheelHit { pane: "columns", scroll: 0, max: 0, moved: false });
+    };
+    if cols[i].kind != Kind::Focus {
         return Some(super::WheelHit { pane: "columns", scroll: 0, max: 0, moved: false });
     }
-    let was = m.list_sel.min(len - 1);
-    let next = super::wheel_next(was, len - 1, detents.signum());
-    m.list_sel = next;
-    m.settle();
-    Some(super::WheelHit { pane: "columns", scroll: next, max: len - 1, moved: next != was })
+    let rh = v.line.max(1);
+    let (was, max) = (v.offset / rh, v.max_offset() / rh);
+    let next = super::wheel_next(was, max, detents);
+    super::list_pull(m, next);
+    Some(super::WheelHit { pane: "columns", scroll: next, max, moved: next != was })
+}
+
+// ── SCROLLPANES (rmbp-ledger B777) — the focus pane on wm's one scroll model — TAIL-APPENDED ───────────────────────
+// The focus pane's rows scroll: its first row is the list's offset (`Model::list_scroll`, the selection kept in view
+// by `settle`), its viewport the pane's rows left of a `SBW()` gutter that stops one pixel short of the pane's
+// divider, its line the row pitch. Ancestors and the next pane keep their selection-centred `top`.
+
+/// Rows a pane shows. The focus pane shows at most the list's own count (`list_visible`), so the list's `settle` is
+/// the focus pane's follow and the two can never disagree about the first row.
+fn pane_vis(m: &Model, c: &Col, r: Rect) -> usize {
+    let n = (r.h / m.geom.row_h().max(1)).max(1);
+    if c.kind == Kind::Focus { n.min(m.list_visible()).max(1) } else { n }
+}
+
+/// A pane's first row: the focus pane's is the model's offset, the others centre their selection.
+fn pane_top(m: &Model, c: &Col, vis: usize) -> usize {
+    if c.kind == Kind::Focus { super::scroll_follow(m.list_scroll, m.list_sel, c.rows.len(), vis) } else { top(c.sel, c.rows.len(), vis) }
+}
+
+/// The focus pane's rect and whether its rows overflow (a gutter is reserved).
+fn focus_rect(m: &Model, cols: &[Col]) -> Option<(usize, Rect, bool)> {
+    let li = m.geom.list_pane().inner();
+    let l = lay(&m.geom, li, cols);
+    let f = cols.iter().position(|c| c.kind == Kind::Focus)?;
+    let r = l.rects[f]?;
+    let over = cols[f].rows.len() > pane_vis(m, &cols[f], r) && r.w > super::SBW() + 2;
+    Some((f, r, over))
+}
+
+/// Pane rows `[r0, r1)` (view-relative) of `c` in `r`, exactly as the full paint draws them: the ground, the
+/// selection fill, the name and a folder's chevron, clipped at the gutter when the focus pane overflows. Returns the
+/// pixels painted.
+fn rows_paint(m: &Model, px: &mut [u32], c: &Col, r: Rect, r0: usize, r1: usize, live: bool) -> usize {
+    let g = &m.geom;
+    let rh = g.row_h();
+    let vis = pane_vis(m, c, r);
+    let (r0, r1) = (r0.min(vis), r1.min(vis));
+    if r0 >= r1 || rh == 0 {
+        return 0;
+    }
+    let gut = c.kind == Kind::Focus && c.rows.len() > vis && r.w > super::SBW() + 2;
+    // The row's right edge (exclusive of the divider column; left of the gutter when there is one).
+    let right = r.x + r.w - 1 - if gut { super::SBW() } else { 0 };
+    let rw = right - r.x;
+    fill(px, g, r.x, r.y + r0 * rh, rw, (r1 - r0) * rh, theme::surface_content());
+    let t = pane_top(m, c, vis);
+    let chev = 2 * g.cell_w();
+    for (j, (name, dir)) in c.rows.iter().enumerate().skip(t + r0).take(r1 - r0) {
+        let y = r.y + (j - t) * rh;
+        let sel = c.sel == Some(j);
+        let hot = sel && live && c.kind == Kind::Focus;
+        if sel {
+            fill(px, g, r.x, y, rw, rh, if hot { theme::accent() } else { theme::line_strong() });
+        }
+        let ink = if hot { theme::surface_window() } else { theme::text_primary() };
+        text(px, g, r.x + PAD(), y + g.ts, name.as_bytes(), (right + 1).saturating_sub(chev), ink);
+        if *dir {
+            text(px, g, (right + 1).saturating_sub(chev) + g.ts, y + g.ts, b">", right, ink);
+        }
+    }
+    (r1 - r0) * rh * rw
+}
+
+/// The focus pane's scroll model `(view, gutter_w)`, or `None` when its rows fit (or there is no focus pane).
+pub(super) fn focus_view(m: &Model) -> Option<(crate::video::wm::ScrollView, usize)> {
+    if m.err.is_some() {
+        return None;
+    }
+    let cols = plan(m);
+    let (f, r, over) = focus_rect(m, &cols)?;
+    if !over {
+        return None;
+    }
+    let rh = m.geom.row_h().max(1);
+    let vis = pane_vis(m, &cols[f], r);
+    let len = cols[f].rows.len();
+    let top = pane_top(m, &cols[f], vis);
+    let vp = (r.x, r.y, r.w - 1 - super::SBW(), vis * rh);
+    Some((crate::video::wm::ScrollView { offset: top * rh, extent: len * rh, viewport: vp, line: rh }, super::SBW()))
+}
+
+/// Focus pane rows `[r0, r1)` (view-relative) repainted through [`rows_paint`]. Returns the pixels painted.
+pub(super) fn focus_rows_paint(m: &Model, px: &mut [u32], r0: usize, r1: usize) -> usize {
+    let cols = plan(m);
+    let Some((f, r, _)) = focus_rect(m, &cols) else { return 0 };
+    rows_paint(m, px, &cols[f], r, r0, r1, m.focus == Pane::List)
 }

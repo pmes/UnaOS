@@ -31312,11 +31312,14 @@ pub fn gesture_swipe(dir: i8) -> Option<WinId> {
 // all land on [`scroll_by`]. The one scrollbar widget (`draw::scrollbar`, track + thumb from this model, theme inks,
 // 8 px) is painted by THIS module into the window's reserved gutter ([`scrollbar_paint`]), so it composites, occludes
 // and filters exactly as the window does; it auto-hides [`SCROLL_HIDE_MS`] after the last scroll.
+// SCROLLPANES (B777): the table is keyed by `(window, pane)` — one window holds several scrolling panes (Quarry's
+// tree beside its content pane, Settings' tab column beside its pane); the owner names the pane (0 = the window's
+// content pane) and the doors resolve it by POINT ([`reg_at`]: the pane whose viewport or gutter holds the pixel).
 // Wire: `[scroll] win=<id> dy=<n> off=<n> blit_px=<n> repaint_px=<n>` per step. Fixture: `tests scrollview`.
 // Desktop gate (both arches, no x86-only cfg): the owners (Quarry, Settings) and `draw` live under it.
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-pub use scrollview::{scroll_blit, scroll_by, scroll_clear, scroll_clear_owner, scroll_press, scroll_service, scroll_set, scroll_view, scroll_wheel, scroll_wheel_ev, scrollbar_paint, ScrollFn, ScrollStep, ScrollView, SCROLL_HIDE_MS, WHEEL_LINES};
+pub use scrollview::{scroll_blit, scroll_by, scroll_clear, scroll_clear_owner, scroll_drop, scroll_press, scroll_service, scroll_set, scroll_view, scroll_wheel, scroll_wheel_ev, scrollbar_paint, ScrollFn, ScrollStep, ScrollView, SCROLL_HIDE_MS, WHEEL_LINES};
 
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub use scrollview::scroll_set_ring3; // RING3SCROLL (B778): the bus arm's door (x86 `busx_scroll_set`)
@@ -31458,6 +31461,8 @@ mod scrollview {
     #[derive(Clone, Copy)]
     struct Reg {
         win: WinId,
+        /// SCROLLPANES (B777): which of the window's scrolling panes (owner-chosen; 0 = the content pane).
+        pane: u8,
         owner: u64,
         view: ScrollView,
         /// The gutter right of the viewport the bar is painted in (surface px), and the window's ground under it.
@@ -31472,17 +31477,29 @@ mod scrollview {
     static SCROLLS: crate::sync::Mutex<alloc::vec::Vec<Reg>> = crate::sync::Mutex::new(alloc::vec::Vec::new());
     /// Some window has a model: the doors' one relaxed load when none has.
     static SCROLL_LIVE: AtomicBool = AtomicBool::new(false);
-    /// The thumb being dragged: `(window, grab offset inside the thumb)`.
-    static SCROLL_DRAG: crate::sync::Mutex<Option<(WinId, usize)>> = crate::sync::Mutex::new(None);
+    /// The thumb being dragged: `(window, pane, grab offset inside the thumb)`.
+    static SCROLL_DRAG: crate::sync::Mutex<Option<(WinId, u8, usize)>> = crate::sync::Mutex::new(None);
 
-    fn reg(win: WinId) -> Option<Reg> {
-        SCROLLS.lock().iter().find(|r| r.win == win).copied()
+    fn reg(win: WinId, pane: u8) -> Option<Reg> {
+        SCROLLS.lock().iter().find(|r| r.win == win && r.pane == pane).copied()
     }
 
-    /// Register (or update) `win`'s model — the owner calls it from its paint, so the owner's offset is the truth
-    /// after every full paint. `gutter_w` px right of the viewport are the bar's. A view whose content fits (or a
-    /// rectangle outside the surface) is no model at all: the registration is dropped. `true` = registered.
-    pub fn scroll_set(win: WinId, view: ScrollView, gutter_w: usize, ground: u32, on_scroll: ScrollFn) -> bool {
+    /// SCROLLPANES (B777): the pane of `win` whose viewport or gutter holds surface `(sx, sy)`.
+    fn reg_at(win: WinId, sx: usize, sy: usize) -> Option<Reg> {
+        SCROLLS
+            .lock()
+            .iter()
+            .find(|r| {
+                let (vx, vy, vw, vh) = r.view.viewport;
+                r.win == win && sx >= vx && sx < vx + vw + r.gutter_w && sy >= vy && sy < vy + vh
+            })
+            .copied()
+    }
+
+    /// Register (or update) `win`'s model for `pane` — the owner calls it from its paint, so the owner's offset is the
+    /// truth after every full paint. `gutter_w` px right of the viewport are the bar's. A view whose content fits (or
+    /// a rectangle outside the surface) is no model at all: the registration is dropped. `true` = registered.
+    pub fn scroll_set(win: WinId, pane: u8, view: ScrollView, gutter_w: usize, ground: u32, on_scroll: ScrollFn) -> bool {
         let (x, y, w, h) = view.viewport;
         let fits = match super::info(win) {
             Some(i) => x + w + gutter_w <= i.w && y + h <= i.h && w > 0 && h > 0 && view.extent > h,
@@ -31490,7 +31507,7 @@ mod scrollview {
         };
         let owner = super::owner_of(win).unwrap_or(0);
         let mut g = SCROLLS.lock();
-        let at = g.iter().position(|r| r.win == win);
+        let at = g.iter().position(|r| r.win == win && r.pane == pane);
         match (fits, at) {
             (true, Some(k)) => {
                 let r = &mut g[k];
@@ -31500,7 +31517,7 @@ mod scrollview {
                 r.ground = ground;
                 r.on_scroll = on_scroll;
             }
-            (true, None) => g.push(Reg { win, owner, view: ScrollView { offset: view.offset.min(view.max_offset()), ..view }, gutter_w, ground, on_scroll, shown_ms: 0, visible: false }),
+            (true, None) => g.push(Reg { win, pane, owner, view: ScrollView { offset: view.offset.min(view.max_offset()), ..view }, gutter_w, ground, on_scroll, shown_ms: 0, visible: false }),
             (false, Some(k)) => {
                 g.swap_remove(k);
             }
@@ -31517,7 +31534,7 @@ mod scrollview {
         SCROLL_LIVE.store(!g.is_empty(), Relaxed);
         drop(g);
         let mut d = SCROLL_DRAG.lock();
-        if d.is_some_and(|(w, _)| w == win) {
+        if d.is_some_and(|(w, _, _)| w == win) {
             *d = None;
         }
     }
@@ -31531,7 +31548,7 @@ mod scrollview {
         let held = *SCROLL_DRAG.lock();
         let gone_drag = {
             let mut g = SCROLLS.lock();
-            let gone = held.is_some_and(|(w, _)| g.iter().any(|r| r.win == w && r.owner == owner));
+            let gone = held.is_some_and(|(w, _, _)| g.iter().any(|r| r.win == w && r.owner == owner));
             g.retain(|r| r.owner != owner);
             SCROLL_LIVE.store(!g.is_empty(), Relaxed);
             gone
@@ -31541,19 +31558,31 @@ mod scrollview {
         }
     }
 
-    /// `win`'s model, if it has one.
-    pub fn scroll_view(win: WinId) -> Option<ScrollView> {
-        reg(win).map(|r| r.view)
+    /// SCROLLPANES (B777): drop one pane's model (its content fits again, or its tab is not shown).
+    pub fn scroll_drop(win: WinId, pane: u8) {
+        let mut g = SCROLLS.lock();
+        g.retain(|r| !(r.win == win && r.pane == pane));
+        SCROLL_LIVE.store(!g.is_empty(), Relaxed);
+        drop(g);
+        let mut d = SCROLL_DRAG.lock();
+        if d.is_some_and(|(w, p, _)| w == win && p == pane) {
+            *d = None;
+        }
+    }
+
+    /// `win`'s model for `pane`, if it has one.
+    pub fn scroll_view(win: WinId, pane: u8) -> Option<ScrollView> {
+        reg(win, pane).map(|r| r.view)
     }
 
     /// THE scroll: move `win`'s content by `dy` px (positive = down the content), clamped to its line grid; the owner
     /// blits the band and paints the strip ([`ScrollFn`]). The bar shows (and its hide clock restarts) on every
     /// call, a clamped one included — the hand learns it is at the end. `None` = `win` has no model.
-    pub fn scroll_by(win: WinId, dy: isize) -> Option<ScrollStep> {
+    pub fn scroll_by(win: WinId, pane: u8, dy: isize) -> Option<ScrollStep> {
         let now = crate::arch::ms().max(1);
         let (st, f) = {
             let mut g = SCROLLS.lock();
-            let r = g.iter_mut().find(|r| r.win == win)?;
+            let r = g.iter_mut().find(|r| r.win == win && r.pane == pane)?;
             let st = r.view.step(dy);
             r.view.offset = st.off;
             r.visible = true;
@@ -31566,11 +31595,11 @@ mod scrollview {
     }
 
     /// Show the bar and repaint it (a press on the gutter, a drag's start and end).
-    fn touch(win: WinId) {
+    fn touch(win: WinId, pane: u8) {
         let now = crate::arch::ms().max(1);
         let hit = {
             let mut g = SCROLLS.lock();
-            g.iter_mut().find(|r| r.win == win).map(|r| {
+            g.iter_mut().find(|r| r.win == win && r.pane == pane).map(|r| {
                 r.visible = true;
                 r.shown_ms = now;
                 (r.view.still(), r.on_scroll)
@@ -31603,13 +31632,12 @@ mod scrollview {
         let Some(p) = super::super::panel_info_nonblocking() else { return false };
         let (x, y) = crate::pal::cursor::pos(p.width as i32, p.height as i32);
         let Some((win, owner, sx, sy)) = surface_at(x, y) else { return false };
-        let Some(r) = reg(win) else { return false };
-        let (vx, vy, vw, vh) = r.view.viewport;
-        if r.owner != owner || sx < vx || sx >= vx + vw + r.gutter_w || sy < vy || sy >= vy + vh {
+        let Some(r) = reg_at(win, sx, sy) else { return false };
+        if r.owner != owner {
             return false;
         }
         let step = (WHEEL_LINES * r.view.line.max(1)) as isize;
-        let _ = scroll_by(win, -(d as isize) * step);
+        let _ = scroll_by(win, r.pane, -(d as isize) * step);
         true
     }
 
@@ -31627,22 +31655,21 @@ mod scrollview {
         if !SCROLL_LIVE.load(Relaxed) {
             return false;
         }
-        let Some(r) = reg(win) else { return false };
+        let Some(r) = reg_at(win, sx, sy) else { return false };
         let (vx, vy, vw, vh) = r.view.viewport;
-        let gx = vx + vw;
-        if sx < gx || sx >= gx + r.gutter_w || sy < vy || sy >= vy + vh {
+        if sx < vx + vw {
             return false;
         }
         let rel = sy - vy;
         match r.view.thumb(vh) {
             Some((ty, th)) if rel >= ty && rel < ty + th => {
-                *SCROLL_DRAG.lock() = Some((win, rel - ty));
-                touch(win);
+                *SCROLL_DRAG.lock() = Some((win, r.pane, rel - ty));
+                touch(win, r.pane);
             }
             Some((ty, _)) => {
                 let q = r.view.line.max(1);
                 let page = (vh / q).max(1) * q;
-                let _ = scroll_by(win, if rel < ty { -(page as isize) } else { page as isize });
+                let _ = scroll_by(win, r.pane, if rel < ty { -(page as isize) } else { page as isize });
             }
             None => {}
         }
@@ -31656,28 +31683,28 @@ mod scrollview {
             return;
         }
         let drag = *SCROLL_DRAG.lock();
-        if let Some((win, grab)) = drag {
+        if let Some((win, pane, grab)) = drag {
             if !crate::pal::cursor::button_down() {
                 *SCROLL_DRAG.lock() = None;
-                touch(win);
-            } else if let (Some(p), Some(i), Some(r)) = (super::super::panel_info_nonblocking(), super::info(win), reg(win)) {
+                touch(win, pane);
+            } else if let (Some(p), Some(i), Some(r)) = (super::super::panel_info_nonblocking(), super::info(win), reg(win, pane)) {
                 let (_, y) = crate::pal::cursor::pos(p.width as i32, p.height as i32);
                 let sy = (y.max(i.y as i32) as usize - i.y) / i.scale.max(1);
                 let (_, vy, _, vh) = r.view.viewport;
                 let off = r.view.offset_at_thumb(vh, sy.saturating_sub(vy).saturating_sub(grab));
                 if off != r.view.offset {
-                    let _ = scroll_by(win, off as isize - r.view.offset as isize);
-                } else if let Some(m) = SCROLLS.lock().iter_mut().find(|m| m.win == win) {
+                    let _ = scroll_by(win, pane, off as isize - r.view.offset as isize);
+                } else if let Some(m) = SCROLLS.lock().iter_mut().find(|m| m.win == win && m.pane == pane) {
                     m.shown_ms = crate::arch::ms().max(1);
                 }
             }
         }
         let now = crate::arch::ms();
-        let held = SCROLL_DRAG.lock().map(|(w, _)| w);
+        let held = SCROLL_DRAG.lock().map(|(w, p, _)| (w, p));
         for _ in 0..8 {
             let due = {
                 let mut g = SCROLLS.lock();
-                g.iter_mut().find(|r| r.visible && Some(r.win) != held && now.saturating_sub(r.shown_ms) >= SCROLL_HIDE_MS).map(|r| {
+                g.iter_mut().find(|r| r.visible && Some((r.win, r.pane)) != held && now.saturating_sub(r.shown_ms) >= SCROLL_HIDE_MS).map(|r| {
                     r.visible = false;
                     (r.win, r.view.still(), r.on_scroll)
                 })
@@ -31687,12 +31714,12 @@ mod scrollview {
         }
     }
 
-    /// Paint `win`'s bar into its gutter on `px` (stride `stride`, the owner's surface, called under the owner's lock):
+    /// Paint the bar of `win`'s `pane` into its gutter on `px` (stride `stride`, the owner's surface, called under the owner's lock):
     /// the ground across the gutter, then — while shown — `draw::scrollbar` right-aligned in it (8 px), the thumb from
     /// the model (pressed while dragged). A hidden bar is the ground. No model: nothing.
-    pub fn scrollbar_paint(win: WinId, px: &mut [u32], stride: usize) {
-        let Some(r) = reg(win) else { return };
-        let dragged = SCROLL_DRAG.lock().is_some_and(|(w, _)| w == win);
+    pub fn scrollbar_paint(win: WinId, pane: u8, px: &mut [u32], stride: usize) {
+        let Some(r) = reg(win, pane) else { return };
+        let dragged = SCROLL_DRAG.lock().is_some_and(|(w, p, _)| w == win && p == pane);
         bar_paint(&r, dragged, px, stride);
     }
 
@@ -31729,7 +31756,7 @@ mod scrollview {
     /// registration comes from the program's paint, the moment a kernel owner paints its bar). `true` = a model is held.
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     pub fn scroll_set_ring3(win: WinId, view: ScrollView, gutter_w: usize, ground: u32) -> bool {
-        let live = scroll_set(win, view, gutter_w, ground, ring3_scrolled);
+        let live = scroll_set(win, 0, view, gutter_w, ground, ring3_scrolled);
         if live {
             let _ = ring3_bar(win);
         }
@@ -31740,7 +31767,7 @@ mod scrollview {
     /// repaints the gutter and presents the viewport rows. Returns the gutter pixels painted.
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     fn ring3_scrolled(win: WinId, st: &ScrollStep) -> usize {
-        let Some(owner) = reg(win).map(|r| r.owner) else { return 0 };
+        let Some(owner) = reg(win, 0).map(|r| r.owner) else { return 0 };
         let delivered = st.moved != 0 && crate::arch::x86_64::syscall::scroll_deliver(owner, win, st.off);
         let px = ring3_bar(win);
         let (_, vy, _, vh) = st.viewport;
@@ -31756,8 +31783,8 @@ mod scrollview {
     /// lock-free [`bar_paint`] writes the gutter. Returns the gutter pixels (0 = no model, no row, or a recycled id).
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     fn ring3_bar(win: WinId) -> usize {
-        let Some(r) = reg(win) else { return 0 };
-        let dragged = SCROLL_DRAG.lock().is_some_and(|(w, _)| w == win);
+        let Some(r) = reg(win, 0) else { return 0 };
+        let dragged = SCROLL_DRAG.lock().is_some_and(|(w, p, _)| w == win && p == 0);
         let t = super::table();
         let Some(row) = super::row(&t, win) else { return 0 };
         if row.owner_asid != r.owner || row.surf == 0 || row.stride < 4 || row.surf_len < 4 {

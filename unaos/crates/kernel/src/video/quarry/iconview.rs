@@ -30,14 +30,16 @@ pub(super) fn cell(g: &Geom) -> (usize, usize) {
     (w, icon_px() + 2 * PAD() + g.cell_h() + g.ts)
 }
 
-/// `(columns, visible rows)` of the grid inside `li`.
+/// `(columns, visible rows)` of the grid inside `li`. SCROLLPANES (B777): the right `SBW()` of `li` is the scroll
+/// gutter (wm's bar), so the columns are counted left of it — every grid reader (paint, hit, centre, follow, the
+/// wheel, the scroll model) goes through here, so the geometry stays one.
 pub(super) fn grid(g: &Geom, li: Rect) -> (usize, usize) {
     let (cw, ch) = cell(g);
-    ((li.w / cw).max(1), (li.h / ch).max(1))
+    ((li.w.saturating_sub(super::SBW()) / cw).max(1), (li.h / ch).max(1))
 }
 
 /// The first row shown, from `list_scroll` (an item index), clamped so the last page is full.
-fn top_row(len: usize, scroll: usize, cols: usize, vis: usize) -> usize {
+pub(super) fn top_row(len: usize, scroll: usize, cols: usize, vis: usize) -> usize {
     let rows = len.div_ceil(cols);
     (scroll / cols).min(rows.saturating_sub(vis))
 }
@@ -123,12 +125,25 @@ pub(super) fn paint(m: &Model, px: &mut [u32], li: Rect) -> usize {
         text(px, g, li.x + PAD(), li.y + PAD(), e.as_bytes(), li.x + li.w, theme::text_primary());
         return 0;
     }
+    rows_paint(m, px, li, 0, grid(g, li).1)
+}
+
+/// SCROLLPANES (B777): grid rows `[r0, r1)` of the viewport (view-relative) exactly as the full paint draws them —
+/// the ground left of the gutter, then each cell. The one cell painter for the full paint and a scroll step's strip.
+/// Returns the cells drawn.
+pub(super) fn rows_paint(m: &Model, px: &mut [u32], li: Rect, r0: usize, r1: usize) -> usize {
+    let g = &m.geom;
     let (cw, ch) = cell(g);
     let (cols, vis) = grid(g, li);
+    let (r0, r1) = (r0.min(vis), r1.min(vis));
+    if r0 >= r1 {
+        return 0;
+    }
+    fill(px, g, li.x, li.y + r0 * ch, li.w.saturating_sub(super::SBW()), (r1 - r0) * ch, theme::surface_content());
     let t = top_row(m.list.len(), m.list_scroll, cols, vis);
     let s = icon_px();
     let mut drawn = 0usize;
-    for r in 0..vis {
+    for r in r0..r1 {
         for c in 0..cols {
             let i = (t + r) * cols + c;
             let Some(e) = m.list.get(i) else { return drawn };

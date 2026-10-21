@@ -1134,13 +1134,7 @@ fn paint_column(st: &mut State, tab: usize) {
     if n == 0 {
         text_at(st, ICON_X, pill_y(0, 0) + (PILL_H - ch) / 2, COL_W - PILL_X, "No results", theme::ink_secondary(), false, face);
     }
-    if n > COL_VIS {
-        // The scroll thumb: where the visible rows sit in the whole column.
-        let track = h - COL_PAD - 8;
-        let (ty, th) = (COL_PAD + top * track / n, (COL_VIS * track / n).max(8));
-        let r = Rect::new(e(COL_W - 6), e(ty), ew(COL_W - 6, 3), ew(ty, th));
-        draw::fill_rrect(&mut sf(st), r, r.w / 2, Ink::argb(theme::control_edge()));
-    }
+    // SCROLLPANES (B777): the column's bar is wm's one widget (`col_scroll_sync`, from the full paint).
 }
 
 fn paint(st: &mut State, v: &Values) {
@@ -1518,7 +1512,7 @@ fn repaint() {
     let mut g = STATE.lock();
     let Some(st) = g.as_mut() else { return };
     paint(st, &v);
-    hw_scroll_sync(id, st, v.tab as usize); // SCROLLVIEW (B764): the Hardware list's model and its bar
+    panes_sync(id, st, v.tab as usize); // SCROLLVIEW (B764) · SCROLLPANES (B777): every pane's model and its bar
     drop(g);
     let _ = wm::present(id);
 }
@@ -1556,7 +1550,7 @@ pub fn open() -> Result<(), String> {
     WIN.store(id, Ordering::Relaxed);
     wm::winid_register_holder(&WIN, "settings");
     wm::focus_changed(OWNER);
-    if let Some(st) = STATE.lock().as_mut() { hw_scroll_sync(id, st, tab0); } let _ = wm::present(id); // SCROLLVIEW (B764): a window opened on Hardware has its model before the first wheel
+    if let Some(st) = STATE.lock().as_mut() { panes_sync(id, st, tab0); } let _ = wm::present(id); // SCROLLVIEW (B764) · SCROLLPANES (B777): a window opens with its panes' models before the first wheel
     serial_println!("[settings] open win={}", id);
     serial_println!("[settings] tabs=left col_w={} rows={} sel={}", COL_W, TABS, TAB_NAMES[tab0.min(TABS - 1)]); // SETTINGSTABS (B623)
     witness(true);
@@ -1699,9 +1693,10 @@ pub fn hover_poll() {
 }
 
 /// SETTINGSCRAFT: a wheel detent over the window (`pal::Event::Wheel`, reaching [`key_route`] first in
-/// `quarry::live::key_route`'s chain — scroll-under-pointer, never focus-gated, as QSCROLL rules). Over the column it
-/// scrolls the rows (positive = away = toward the top, QSCROLL's sign); over the File Types pane it pages. `true` when
-/// the pointer is over this window (consumed), `false` otherwise (the event falls through untouched).
+/// `quarry::live::key_route`'s chain — scroll-under-pointer, never focus-gated, as QSCROLL rules). SCROLLPANES (B777):
+/// the column, the File Types rows and the Hardware list scroll on wm's one model (`wm::scroll_wheel`, asked first in
+/// the chain), so a detent that reaches here is over no scrolling pane: consumed, nothing moved. `true` when the
+/// pointer is over this window (consumed), `false` otherwise (the event falls through untouched).
 fn wheel(d: i8) -> bool {
     let id = WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE || d == 0 { return false; }
@@ -1714,26 +1709,8 @@ fn wheel(d: i8) -> bool {
     let Some(info) = wm::info(id) else { return true };
     if x < info.x as i32 || y < info.y as i32 { return true; }
     let cx = super::metrics::to_logical((x as usize - info.x) / info.scale.max(1));
-    let step = d.unsigned_abs() as usize;
-    let (area, moved) = if cx < COL_W {
-        let mut g = STATE.lock();
-        let Some(s) = g.as_mut() else { return true };
-        let n = col_list(&s.query).1;
-        let top = s.col_top;
-        let next = col_clamp(if d > 0 { top.saturating_sub(step) } else { top + step }, n);
-        s.col_top = next;
-        ("column", next != top)
-    } else if cur_tab() == FT_TAB {
-        let pages = crate::fs::assoc::view().len().div_ceil(FT_ROWS).max(1);
-        let page = FT_PAGE.load(Ordering::Relaxed).min(pages - 1);
-        let next = if d > 0 { page.saturating_sub(step) } else { (page + step).min(pages - 1) };
-        FT_PAGE.store(next, Ordering::Relaxed);
-        ("pane", next != page)
-    } else {
-        ("pane", false) // SCROLLVIEW (B764): the Hardware list scrolls on wm's one model (`wm::scroll_wheel`, asked first in the chain); HWTAB's own wheel arm is gone
-    };
-    serial_println!("[settings] wheel area={} d={} moved={}", area, d, moved as u8);
-    if moved { repaint(); }
+    let area = if cx < COL_W { "column" } else { "pane" };
+    serial_println!("[settings] wheel area={} d={} moved=0", area, d);
     true
 }
 
@@ -3236,7 +3213,8 @@ const FT_FAV_ROW: usize = 8;
 const FT_NAV_ROW: usize = 9;
 const FT_PREV_X: usize = TRACK_X;
 const FT_NEXT_X: usize = TRACK_X + 2 * BTN_W + 40;
-static FT_PAGE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// SCROLLPANES (B777): the first type row shown (was a page); wm's model moves it (`ft_scrolled`).
+static FT_TOP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 fn paint_filetypes(st: &mut State) {
     // SETTINGSMAP (B673): `system.quarry.favorites`' row — Quarry's sidebar folders, added by a drag onto the sidebar.
@@ -3248,14 +3226,13 @@ fn paint_filetypes(st: &mut State) {
     let preferred = v.iter().filter(|r| !r.preferred.is_empty()).count();
     txt2(st, LABEL_X, 0, &alloc::format!("File types ({}, {} with an app). Click a type to change its app:", v.len(), preferred));
     if v.is_empty() { crate::fs::assoc::owe_view(); txt2(st, LABEL_X, 1, "Reading /system/filetypes ..."); return; }
-    let pages = v.len().div_ceil(FT_ROWS).max(1);
-    let page = FT_PAGE.load(Ordering::Relaxed).min(pages - 1);
-    let shown = v.len().saturating_sub(page * FT_ROWS).min(FT_ROWS);
+    let first = ft_first(v.len());
+    let shown = v.len().saturating_sub(first).min(FT_ROWS);
     groups(st, &[(1, shown.max(1))]);
     let face = super::text::Face::Ui;
     let ch = super::metrics::lcell_h(face);
     let app_x = CTRL_R - 140;
-    for (k, r) in v.iter().skip(page * FT_ROWS).take(FT_ROWS).enumerate() {
+    for (k, r) in v.iter().skip(first).take(FT_ROWS).enumerate() {
         let row = 1 + k;
         // A type's row is one press target (it hands the type to its next app): it lights under the pointer.
         let c = cs(st, BOX_X, row_top(row), BOX_W, ROW_H, false);
@@ -3268,25 +3245,24 @@ fn paint_filetypes(st: &mut State) {
         let ty = row_top(row) + (ROW_H - ch) / 2;
         let pen = text_at(st, LABEL_X + t + 10, ty, app_x - 8, &r.description, theme::text_primary(), false, face);
         text_at(st, pen + 8, ty, app_x - 8, &alloc::format!("{}{}", r.mime, ext), theme::ink_secondary(), false, face);
-        text_at(st, app_x, ty, CTRL_R, &alloc::format!("{} ({})", app, r.registrants), theme::ink_secondary(), false, face);
+        text_at(st, app_x, ty, FT_GX, &alloc::format!("{} ({})", app, r.registrants), theme::ink_secondary(), false, face); // SCROLLPANES (B777): clipped at the gutter
     }
     btn(st, FT_NAV_ROW, FT_PREV_X, "< Prev");
-    txt2(st, FT_PREV_X + BTN_W + 14, FT_NAV_ROW, &alloc::format!("{}/{}", page + 1, pages));
+    txt2(st, FT_PREV_X + BTN_W + 14, FT_NAV_ROW, &alloc::format!("{}-{} of {}", first + 1, first + shown, v.len()));
     btn(st, FT_NAV_ROW, FT_NEXT_X, "Next >");
 }
 
 fn press_filetypes(row: usize, cx: usize) {
     let in_b = |x0: usize| cx >= x0 && cx < x0 + BTN_W;
     let n = crate::fs::assoc::view().len();
-    let pages = n.div_ceil(FT_ROWS).max(1);
-    let page = FT_PAGE.load(Ordering::Relaxed).min(pages - 1);
+    let first = ft_first(n);
     if (1..=FT_ROWS).contains(&row) {
-        let i = page * FT_ROWS + row - 1;
+        let i = first + row - 1;
         if i < n { crate::fs::assoc::owe_cycle(i); }
     } else if row == FT_NAV_ROW {
-        if in_b(FT_PREV_X) { FT_PAGE.store((page + pages - 1) % pages, Ordering::Relaxed); }
-        else if in_b(FT_NEXT_X) { FT_PAGE.store((page + 1) % pages, Ordering::Relaxed); }
-        else { return; }
+        // SCROLLPANES (B777): Prev / Next page through wm's model (a viewport of rows); its step repaints.
+        let dir: isize = if in_b(FT_PREV_X) { -1 } else if in_b(FT_NEXT_X) { 1 } else { return };
+        if ft_page(dir) { return; }
     } else { return; }
     repaint();
 }
@@ -5384,13 +5360,13 @@ fn hw_scroll_sync(id: wm::WinId, st: &mut State, tab: usize) {
     }
     let n = HW_N.load(Ordering::Relaxed);
     if tab != HW_TAB || n <= hw_geom().3 {
-        wm::scroll_clear(id);
+        wm::scroll_drop(id, PANE_CONTENT); // SCROLLPANES (B777): the content pane only; the column keeps its model
         return;
     }
     let (v, gw) = hw_view(n, hw_first(n));
-    if wm::scroll_set(id, v, gw, theme::group_fill(), hw_scrolled) {
+    if wm::scroll_set(id, PANE_CONTENT, v, gw, theme::group_fill(), hw_scrolled) {
         let pw = super::metrics::size(st.w);
-        wm::scrollbar_paint(id, &mut st.surf, pw);
+        wm::scrollbar_paint(id, PANE_CONTENT, &mut st.surf, pw);
     }
 }
 
@@ -5432,7 +5408,7 @@ fn hw_scrolled(id: wm::WinId, s: &wm::ScrollStep) -> usize {
     let Some(st) = g.as_mut() else { return 0 };
     let n = hw_strip_paint(st, &c.rows, s);
     let pw = super::metrics::size(st.w);
-    wm::scrollbar_paint(id, &mut st.surf, pw);
+    wm::scrollbar_paint(id, PANE_CONTENT, &mut st.surf, pw);
     drop(g);
     let (_, vy, _, vh) = s.viewport;
     let _ = wm::present_rows(id, vy, vy + vh);
@@ -5486,4 +5462,215 @@ pub fn scrollview_probe() -> Result<usize, &'static str> {
         }
     }
     Ok(steps.len())
+}
+
+// ── SCROLLPANES (rmbp-ledger B777) — the tab column and the File Types rows on wm's one scroll model — TAIL-APPENDED ─
+// wm's table is keyed by `(window, pane)`: Settings' content pane ([`PANE_CONTENT`]: the Hardware list or the File Types
+// rows, whichever tab is shown) and the tab column ([`PANE_COL`]). Both new panes step by ONE full Settings paint
+// (`col_scrolled_fn`, `ft_scrolled`): the paint rebuilds the press targets and the keyboard stops (`State::hits`,
+// PICKERKEYS) and the column's pill GLIDES (MOTIONKIT), so a blitted band would leave a moved row's target, stop or
+// pill behind — the full arm `hw_scrolled` takes with a held census. A bar-only step (shown, hidden, pressed) paints
+// the bar alone. Their own wheel arithmetic, the column's own thumb and the File Types page arithmetic are gone.
+
+/// Settings' pane keys in wm's table.
+const PANE_CONTENT: u8 = 0;
+const PANE_COL: u8 = 1;
+/// The column's gutter: right of the pills, up to the column's hairline (logical px).
+const COL_GX: usize = COL_W - PILL_X;
+const COL_GW: usize = COL_W - 1 - COL_GX;
+/// The File Types rows' gutter: inside the box, right of the text (as the Hardware list's `HW_GX`).
+const FT_GW: usize = draw::SCROLLBAR_W;
+const FT_GX: usize = BOX_X + BOX_W - 8 - FT_GW;
+
+/// Every pane's model after a full paint: the content pane as the tab shows it, then the column.
+fn panes_sync(id: wm::WinId, st: &mut State, tab: usize) {
+    if tab == FT_TAB { ft_scroll_sync(id, st) } else { hw_scroll_sync(id, st, tab) }
+    col_scroll_sync(id, st);
+}
+
+/// A bar-only step (`moved == 0`): the pane's bar repainted and its rows presented, nothing else.
+fn bar_only(id: wm::WinId, pane: u8, s: &wm::ScrollStep) -> usize {
+    if let Some(st) = STATE.lock().as_mut() {
+        let pw = super::metrics::size(st.w);
+        wm::scrollbar_paint(id, pane, &mut st.surf, pw);
+    }
+    let (_, vy, _, vh) = s.viewport;
+    let _ = wm::present_rows(id, vy, vy + vh);
+    0
+}
+
+// ── the tab column ──
+
+/// The column's model for `n` listed tabs from row `top`, device px: `(view, gutter_w)`.
+fn col_view(n: usize, top: usize) -> (wm::ScrollView, usize) {
+    let y0 = e(COL_PAD).max(0) as usize;
+    let dl = ew(COL_PAD, COL_ROW).max(1) as usize;
+    let vp = (0, y0, e(COL_GX).max(0) as usize, COL_VIS * dl);
+    (wm::ScrollView { offset: top * dl, extent: n * dl, viewport: vp, line: dl }, ew(COL_GX, COL_GW).max(1) as usize)
+}
+
+/// Register (or drop) the column's model and paint its bar (more listed tabs than rows).
+fn col_scroll_sync(id: wm::WinId, st: &mut State) {
+    if id == wm::WIN_NONE {
+        return;
+    }
+    let n = col_list(&st.query).1;
+    if n <= COL_VIS {
+        wm::scroll_drop(id, PANE_COL);
+        return;
+    }
+    let (v, gw) = col_view(n, col_clamp(st.col_top, n));
+    if wm::scroll_set(id, PANE_COL, v, gw, sidebar_bg(), col_scrolled_fn) {
+        let pw = super::metrics::size(st.w);
+        wm::scrollbar_paint(id, PANE_COL, &mut st.surf, pw);
+    }
+}
+
+/// The column's first row for a step to offset `off` over `n` listed tabs (the step body; the probe drives it).
+fn col_step_top(off: usize, n: usize) -> usize {
+    col_clamp(off / col_view(n, 0).0.line.max(1), n)
+}
+
+/// The column's `wm::ScrollFn`: the first row applied under STATE, then one full paint.
+fn col_scrolled_fn(id: wm::WinId, s: &wm::ScrollStep) -> usize {
+    if s.moved == 0 {
+        return bar_only(id, PANE_COL, s);
+    }
+    if let Some(st) = STATE.lock().as_mut() {
+        let n = col_list(&st.query).1;
+        st.col_top = col_step_top(s.off, n);
+    }
+    repaint();
+    super::metrics::size(WIN_W) * super::metrics::size(WIN_H)
+}
+
+// ── the File Types rows ──
+
+/// The first type row shown for `n` types (FT_TOP held to the last full viewport).
+fn ft_first(n: usize) -> usize {
+    FT_TOP.load(Ordering::Relaxed).min(n.saturating_sub(FT_ROWS))
+}
+
+/// The rows' model for `n` types from row `first`, device px: the band of the [`FT_ROWS`] type rows inside their
+/// box (inset `GAP` top and bottom, so the gutter stays inside the box), line = the device row pitch; the extent is
+/// short by the same inset, so the last offset still shows the last [`FT_ROWS`] types.
+fn ft_view(n: usize, first: usize) -> (wm::ScrollView, usize) {
+    let dl = ew(row_top(1), ROW_H).max(1) as usize;
+    let y0 = e(row_top(1) + GAP).max(0) as usize;
+    let y1 = e(row_top(1 + FT_ROWS) - GAP).max(0) as usize;
+    let vh = y1.saturating_sub(y0);
+    let x0 = e(BOX_X + GAP).max(0) as usize;
+    let vp = (x0, y0, (e(FT_GX).max(0) as usize).saturating_sub(x0), vh);
+    let extent = (n * dl).saturating_sub(FT_ROWS * dl - vh);
+    (wm::ScrollView { offset: first * dl, extent, viewport: vp, line: dl }, ew(FT_GX, FT_GW).max(1) as usize)
+}
+
+/// Register (or drop) the rows' model and paint its bar (File Types shown, more types than rows).
+fn ft_scroll_sync(id: wm::WinId, st: &mut State) {
+    if id == wm::WIN_NONE {
+        return;
+    }
+    let n = crate::fs::assoc::view().len();
+    if n <= FT_ROWS {
+        wm::scroll_drop(id, PANE_CONTENT);
+        return;
+    }
+    let (v, gw) = ft_view(n, ft_first(n));
+    if wm::scroll_set(id, PANE_CONTENT, v, gw, theme::group_fill(), ft_scrolled) {
+        let pw = super::metrics::size(st.w);
+        wm::scrollbar_paint(id, PANE_CONTENT, &mut st.surf, pw);
+    }
+}
+
+/// The rows' first type for a step to offset `off` over `n` types (the step body; the probe drives it).
+fn ft_step_first(off: usize, n: usize) -> usize {
+    (off / ft_view(n, 0).0.line.max(1)).min(n.saturating_sub(FT_ROWS))
+}
+
+/// The File Types rows' `wm::ScrollFn`: the first row applied, then one full paint.
+fn ft_scrolled(id: wm::WinId, s: &wm::ScrollStep) -> usize {
+    if s.moved == 0 {
+        return bar_only(id, PANE_CONTENT, s);
+    }
+    let n = crate::fs::assoc::view().len();
+    FT_TOP.store(ft_step_first(s.off, n), Ordering::Relaxed);
+    repaint();
+    super::metrics::size(WIN_W) * super::metrics::size(WIN_H)
+}
+
+/// Prev / Next: a viewport of rows through wm's model. `true` = the model took it (its step repainted).
+fn ft_page(dir: isize) -> bool {
+    let id = WIN.load(Ordering::Relaxed);
+    let line = ft_view(0, 0).0.line as isize;
+    id != wm::WIN_NONE && wm::scroll_by(id, PANE_CONTENT, dir * FT_ROWS as isize * line).is_some()
+}
+
+/// `tests scrollview`'s Settings legs: `(tabs, types)`. A fixed walk of steps through each pane's model (the column
+/// over all 16 tabs, the rows over 40 types): the step body's first row equals an independent clamp of the walk,
+/// the model's viewport sits inside the window and left of its gutter, the column's paint at that row puts the
+/// expected tab first (an offscreen `State`), and a Prev / Next page is exactly [`FT_ROWS`] rows.
+pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 2] {
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let walk: [isize; 7] = [3, 5, -2, 40, -1000, 1000, -1];
+    let inside = |v: &wm::ScrollView, gw: usize| {
+        let (x, y, w, h) = v.viewport;
+        w > 0 && h > 0 && x + w + gw <= pw && y + h <= ph
+    };
+    // The column.
+    let tabs = (|| -> Result<usize, &'static str> {
+        let n = TABS;
+        if n <= COL_VIS {
+            return Err("the column fits: nothing to scroll");
+        }
+        let (mut v, gw) = col_view(n, 0);
+        if !inside(&v, gw) {
+            return Err("the column's viewport leaves the window");
+        }
+        let mut want: isize = 0;
+        let max = (n - COL_VIS) as isize;
+        let mut buf: Vec<u32> = Vec::new();
+        buf.try_reserve_exact(pw * ph).map_err(|_| "oom")?;
+        buf.resize(pw * ph, 0);
+        let mut st = State::new(WIN_W, WIN_H, buf, 0, true, 0);
+        for &d in walk.iter() {
+            let s = v.step(d * v.line as isize);
+            v.offset = s.off;
+            want = (want + d).clamp(0, max);
+            let top = col_step_top(s.off, n);
+            if top as isize != want {
+                return Err("the column's step is not the clamp");
+            }
+            st.col_top = top;
+            paint_column(&mut st, 0);
+            if st.col_top != top || col_tab_at(COL_PAD + COL_ROW / 2, st.col_top, &col_list("").0, n) != Some(top) {
+                return Err("the column's paint does not start at the step's row");
+            }
+        }
+        Ok(walk.len())
+    })();
+    // The File Types rows.
+    let types = (|| -> Result<usize, &'static str> {
+        let n = 40usize;
+        let (mut v, gw) = ft_view(n, 0);
+        if !inside(&v, gw) || e(FT_GX) as usize + gw > e(BOX_X + BOX_W) as usize {
+            return Err("the rows' viewport leaves the box");
+        }
+        let max = (n - FT_ROWS) as isize;
+        let mut want: isize = 0;
+        for &d in walk.iter() {
+            let s = v.step(d * v.line as isize);
+            v.offset = s.off;
+            want = (want + d).clamp(0, max);
+            if ft_step_first(s.off, n) as isize != want {
+                return Err("the rows' step is not the clamp");
+            }
+        }
+        let line = v.line.max(1);
+        let paged = wm::ScrollView { offset: 0, ..v }.step(FT_ROWS as isize * line as isize).off / line;
+        if paged != FT_ROWS {
+            return Err("a Next page is not FT_ROWS rows");
+        }
+        Ok(walk.len())
+    })();
+    [tabs, types]
 }

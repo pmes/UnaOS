@@ -32377,10 +32377,10 @@ pub fn scroll_ring3_probe() -> Result<usize, &'static str> {
     let live = rc == 0 && reply.as_ref().is_some_and(|(st, b)| una_abi::scroll_set_reply(*st, b) == Ok(true));
     let mut verdict: Result<usize, &'static str> = if live { Ok(0) } else { Err("not-registered") };
     if live {
-        let st = wm::scroll_by(win, -((wm::WHEEL_LINES * LINE) as isize));
+        let st = wm::scroll_by(win, 0, -((wm::WHEEL_LINES * LINE) as isize));
         let n = user_input_take(owner, &mut scratch);
         let ev = if n == 1 { una_abi::input_ev_scroll(scratch[0]) } else { None };
-        let thumb_ink = wm::scroll_view(win).and_then(|v| v.thumb(v.viewport.3).map(|(ty, th)| (v.viewport, ty, th))).is_some_and(|((vx, vy, vw, _), ty, th)| {
+        let thumb_ink = wm::scroll_view(win, 0).and_then(|v| v.thumb(v.viewport.3).map(|(ty, th)| (v.viewport, ty, th))).is_some_and(|((vx, vy, vw, _), ty, th)| {
             let bw = crate::video::draw::scrollbar_w().min(GUTTER);
             let cx = vx + vw + GUTTER - bw + 1 + (bw.saturating_sub(2)) / 2;
             buf[(vy + ty + th / 2) * W + cx] & 0x00FF_FFFF == crate::video::theme::line_strong() & 0x00FF_FFFF

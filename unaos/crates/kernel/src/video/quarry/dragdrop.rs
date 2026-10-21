@@ -720,3 +720,23 @@ fn droptypes_probe() -> (bool, &'static str) {
     };
     (rule && word && lumen != "FAIL", lumen)
 }
+
+// ── SCROLLPANES (rmbp-ledger B777) — the marks gate a blitted scroll step asks — TAIL-APPENDED ─────────────────────
+// The marks' outlines are painted over the finished rows ([`paint_marks`]); a blitted band would carry them, so a
+// pane's strip path asks this first and takes its full repaint instead (`live::overlay_free`).
+
+/// Are marks of the shown folder painted? A busy MARKS lock answers `true` (the full repaint is always correct).
+pub(super) fn marks_up(m: &Model) -> bool {
+    match MARKS.try_lock() {
+        Some(g) => g.as_ref().is_some_and(|mk| !mk.names.is_empty() && mk.cwd.eq_ignore_ascii_case(&m.cwd)),
+        None => true,
+    }
+}
+
+/// `tests scrollview`'s overlay leg: `f` asked with `name` marked in `cwd`, the marks put back afterwards.
+pub(super) fn marks_probe(cwd: &str, name: &str, f: impl FnOnce() -> bool) -> bool {
+    let was = MARKS.lock().replace(Marks { cwd: String::from(cwd), names: alloc::vec![String::from(name)], anchor: None });
+    let r = f();
+    *MARKS.lock() = was;
+    r
+}
