@@ -285,6 +285,12 @@ fi
 # libs/. Its caller is shell.rs's `bt` verb under `all(target_arch = "x86_64", feature = "btc")`, which `a2dp` implies
 # (Cargo.toml `a2dp = ["btc"]`), so cond `-` (rule 7(a): no second knob in the chain). The registry's pipe delimiter
 # forbids the rest of the literal (` | #n>`). unmeasured-here: no ELF built for this row; the seat's fold measures it.
+#
+# `tickless` (TICKLESSENV, rmbp-ledger B773): token `[tick] core=`, the piece before the first hole of `tests tickless`'s
+# per-core line (tests.rs `tickless_selftest`, cfg all(x86_64, tickless)); it occurs exactly once in crates/ + libs/.
+# Its caller is the registration folded onto `ensure_fpu`'s line under `#[cfg(feature = "tickless")]` inside that fn's
+# `#[cfg(target_arch = "x86_64")]` block, and `ensure_fpu` is called unconditionally by `tests::shell_verb` — so no
+# second knob (rule 7(a)); cond `@arch:x86_64` names the arch gate. unmeasured-here: the seat's fold measures it.
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
@@ -308,6 +314,7 @@ irqstorage|:: bx-blockreq: no block device|-|measured(1)
 bt|vendor-classed: RF/Bluetooth subclass+protocol|-|measured
 btc|REACHED — a BR/EDR link was established|-|measured
 a2dp|usage: bt audio <aa:bb:cc:dd:ee:ff|-|unmeasured-here
+tickless|[tick] core=|@arch:x86_64|unmeasured-here
 smolnet|:: SOCK-1: smoltcp icmp echo|-|measured(1)
 wifi|:: wifi: firmware NOT staged — no program-source block device; searched|-|measured
 wifi2|:: wifi2: upload NOT ATTEMPTED uploaded-bytes=|-|measured

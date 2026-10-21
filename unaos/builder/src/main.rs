@@ -795,6 +795,10 @@ fn main() {
     // `bt` sink, `tests a2dp`). `a2dp` implies `btc` in Cargo.toml (A2DPKNOB B750). THIS list is what reaches the
     // media kernel, so arroyo's mapping alone would ship A2DP disabled under a banner naming it. Kept in sync.
     if std::env::var("UNAOS_A2DP").is_ok() { feats.push("a2dp"); }
+    // TICKLESSENV (rmbp-ledger B773): UNAOS_TICKLESS=1 arms TICKLESS (B765): an idle core arms its LAPIC timer one-shot to
+    // its nearest deadline and halts; busy cores, core 0 while it is the clock, and the HID pump core keep the 1 kHz tick.
+    // THIS list is what reaches the media kernel, so arroyo's mapping alone would ship it disabled. Kept in sync.
+    if std::env::var("UNAOS_TICKLESS").is_ok() { feats.push("tickless"); }
     // BT-DIR: UNAOS_BTDIR=1 arms THE DIRECTION TEST — after the outbound page stage has printed its
     // tally, write HCI_Write_Scan_Enable (0x0C1A) = 0x03 so the peer can page THIS host, hold one
     // 6400 ms page window, report whether a Connection Request (event 0x04) arrived, then write

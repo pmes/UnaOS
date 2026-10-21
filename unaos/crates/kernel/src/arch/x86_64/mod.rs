@@ -73,8 +73,8 @@ pub fn hlt_loop() -> ! {
 }
 
 /// NETHANG (B327 re-aim, boot 20): the WAIT-LOOP yield. With IF set this is `hlt` exactly as before:
-/// sleep until the next interrupt (the 1 kHz APIC tick at worst). With IF CLEAR, `hlt` wakes only on
-/// NMI/SMI/INIT, so a wait loop that yields this way NEVER comes back to check its deadline. That is
+/// sleep until the next interrupt (the 1 kHz APIC tick at worst: a core running a task keeps it under `tickless`, B765).
+/// With IF CLEAR, `hlt` wakes only on NMI/SMI/INIT, so a wait loop that yields this way NEVER comes back to check its deadline. That is
 /// what froze boot 20: `SYS_RESOLVE` runs IF-masked (SFMASK), the smolnet pump's `usbnet::raw_tx`
 /// took the xHCI loan and waited in `pump_until_ftdi_done`, and the first empty event-ring pass hit
 /// `hlt` with IF=0. That core stopped for good holding the xHCI loan (so the FTDI console, the wire,
