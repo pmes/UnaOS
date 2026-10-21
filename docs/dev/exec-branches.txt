@@ -667,7 +667,7 @@ refs/heads/exec-rmbp-usbsuspend     f7dd6702 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-sinkall        e1379bf5 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-pickerkeys     e6252391 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-sdpserver      abc14cd7 FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-wcpar2         8ab5da61 FOLDED-BY-HAND (this commit) 2026-10-21
+refs/heads/exec-rmbp-wcpar2         8ab5da61 FOLDED-BY-HAND (this commit) 2026-10-21 (first registration e84d3e88 recorded a fold that never merged; merged here; BP-cores-19)
 refs/heads/exec-rmbp-gateneutral    742c45e8 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-ring3undo      dea48c2b FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-crawld         c542e05c FOLDED-BY-HAND (this commit) 2026-10-21 CRAWLD (crawl D fixes)
@@ -676,3 +676,6 @@ refs/heads/exec-rmbp-avrcp          19b7034d FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-avrcpct        987287a7 IN-FLIGHT cloud wave36 AVRCPCT
 refs/heads/exec-rmbp-sinkalldocs    987287a7 IN-FLIGHT cloud wave36 SINKALLDOCS
 refs/heads/exec-rmbp-sessiongenpoll 987287a7 IN-FLIGHT cloud wave36 SESSIONGENPOLL
+refs/heads/exec-rmbp-staleheaders   43d1dca8 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-lidkeyswallow   43d1dca8 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-pathns   43d1dca8 IN-FLIGHT cut 2026-10-21

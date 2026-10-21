@@ -80,7 +80,7 @@
 - R121: the Una look's full refinement waits on 3D acceleration (Kepler GR, gen7 R10+); R101 keeps one executor on each GPU.
 - R127: GK107 ctxsw firmware cut into the bunker, digests in `unaos/firmware/kepler.pins`; GR golden context generated (fold `269cc521`); 3D composite on the Kepler is `unverified` at HEAD.
 - R128 game tier (TEMPLE): `unaos/libs/media/temple_core` measured, bar NOT reached in fixed point; stopped as ruled (commit `d92a36b7`). See ring3.md (FPU).
-- WCPAR (cores.md §5).
+- WCPAR is landed as BP-cores-19 (WCPAR2 B770: the 2 ms band deadline, the close fence, `tests wcpar`); the parallel per-WINDOW compose into per-core `STAGE` (`unaos/crates/kernel/src/video/wm.rs:9455`) is still unbuilt.
 
 ## 6. Read further
 - `docs/dev/OS/05_USER_EXPERIENCE/DESIGN-LANGUAGE.md` §2 (unit, type, colour, depth) and §3 (component catalogue).
