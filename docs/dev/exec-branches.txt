@@ -648,7 +648,7 @@ refs/heads/exec-rmbp-geodedep       82481d69 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-dndtrash       9b171dff FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-quarrylaunch   3e6379b1 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-prefsdeleted   98881810 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-helpverbdoc    253f0c2c IN-FLIGHT cloud wave36 HELPVERBDOC
+refs/heads/exec-rmbp-helpverbdoc    65afe774 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-restoreresult  ba143e98 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-orinsupchar    82432432 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-undodocs       677f3802 FOLDED-BY-HAND (this commit) 2026-10-19
