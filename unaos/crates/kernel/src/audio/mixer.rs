@@ -917,9 +917,23 @@ fn bt_hw_volume() -> bool {
 // only (`status::volume`, `uac::volume_want`, `avctp::ct_volume`): no OUT, no MIX, no mix, no sink write — so it is
 // safe from the BTHID pass under `BT`. A USB device's Feature Unit then takes the level at the next EP0 service pass,
 // the HDA amp in the writer itself, a headset at the next AVRCP watch pass; a mixer-scaled output at its next period.
-// With no output held nothing is handed: the first period after `acquire` runs `master` (audio.md §5).
+// IDLEUSBLEVEL (B808): a UAC device's Feature Unit takes the level held or not ([`usb_level`], file tail).
 
 /// MIXERPUMP: the master level moved — hand it to its carrier now (atomics only; any context).
 pub fn level_changed() {
-    let _ = master(OUT_KIND.load(Ordering::Acquire));
+    let _ = master(OUT_KIND.load(Ordering::Acquire)); #[cfg(feature = "uac")] usb_level(); // IDLEUSBLEVEL (rmbp-ledger B808): the USB device takes the level held or not (file tail). LINE-NEUTRAL append, before this comment.
+}
+
+// ── IDLEUSBLEVEL (rmbp-ledger B808) — TAIL-APPENDED: a level change reaches the USB device held or not ───────────────
+// Owner: the audio handler (CODEX §2), the master stage's hand-off to the USB carrier. The class driver's EP0 door runs on every
+// service pass whether or not a writer holds the stream (`isoch::service_uvc` -> `uac::ep0_due`, gated on the stream
+// and the wanted level only), so the level is handed whenever a device's Feature Unit carries it — idle, or while HDA
+// or BT is the output — and the first period after the next `acquire` plays at it (no stale level; audio.md §5).
+// Unconditional on `OUT_KIND`: while USB is held it repeats `master`'s identical store. Atomics only (§3's lock order).
+
+/// IDLEUSBLEVEL: hand the master level to the USB device's Feature Unit, whatever the mixer's output (atomics only).
+#[cfg(feature = "uac")]
+fn usb_level() {
+    let (lv, muted) = crate::video::status::volume();
+    let _ = usb_hw_volume(lv, muted);
 }

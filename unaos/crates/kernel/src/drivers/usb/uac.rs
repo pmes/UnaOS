@@ -1439,3 +1439,13 @@ fn feedback_kats(sc: &mut Score) {
     sc.check("fb.meter.hs", run(0x30_0000, 1)[0] as u64, 6);
     sc.check("fb.meter.fs", run(0x30_0000, 8)[0] as u64, 48);
 }
+
+// ── IDLEUSBLEVEL (rmbp-ledger B808) — TAIL-APPENDED: the level the device holds ──────────────────────────────────────
+// The witness `tests sinkall`'s `idle_level=` leg reads: what the Feature Unit took last (VOL_DONE), not what is wanted.
+
+/// IDLEUSBLEVEL: the level (0..16) and mute the device's Feature Unit took last; None before this stream's first
+/// SET_CUR or once a request was refused (the mixer scales then).
+pub fn volume_held() -> Option<(u8, bool)> {
+    let d = VOL_DONE.load(Ordering::Acquire);
+    (d != 0 && !VOL_FAIL.load(Ordering::Acquire)).then(|| ((d & 0xFF) as u8, d & 0x100 != 0))
+}

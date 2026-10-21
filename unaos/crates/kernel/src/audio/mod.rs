@@ -54,7 +54,7 @@ pub fn hda_built() -> bool {
 pub fn usb_arrived(vid: u16, pid: u16) {
     USB_ID.store((vid as u32) << 16 | pid as u32, Ordering::Relaxed);
     USB_PRESENT.store(true, Ordering::Release);
-    serial_println!("[audio] sink usb:{:04x}:{:04x} registered current={}", vid, pid, label(current()));
+    serial_println!("[audio] sink usb:{:04x}:{:04x} registered current={}", vid, pid, label(current())); #[cfg(feature = "uac")] mixer::level_changed(); // IDLEUSBLEVEL (rmbp-ledger B808): a device that arrives takes the level in force now, not at its first play. LINE-NEUTRAL append, before this comment.
 }
 
 /// The USB device left.
