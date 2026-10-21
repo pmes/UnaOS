@@ -376,8 +376,8 @@ pub fn sleep_armed() -> bool {
 // resume path through the FACS waking vector, no Kepler re-POST, no xHCI/AHCI save/restore) and the first entry each
 // boot prints the firmware's half (`acpi_power::s3_census`) so the walls are named by fact. `idle` is the deepest
 // state the tree holds honestly: the backlight off (gmux), the compositor and the cursor refused (`video::
-// panel_refuse_term` term `sleep-panel-off`), so every core sits in the scheduler's `sti; hlt` (C1) between ticks;
-// the 1 kHz APIC tick stays (the ms clock, the lid poll and every sleeper ride it; a tickless idle is unbuilt) and
+// panel_refuse_term` term `sleep-panel-off`), so every core sits in the scheduler's `sti; hlt` (C1) between 1 kHz ticks, or
+// under `tickless` (B765, BP-cores-18) an idle core halts one-shot to its nearest deadline (every sleeper and the lid poll's; the ms clock is the TSC) and
 // USB root ports are suspended (USBSUSPEND B766: `usb_ports`; the FTDI wire and storage stay up, an xHCI keyboard is armed for remote wake). Wakers, each NAMED: `lid` (MSLD back
 // to 0, polled every `video::lidsleep::SLEEP_POLL_MS` while asleep), `power-key` (the fixed-feature PWRBTN_STS,
 // `acpi_power::pwrbtn_take`), `input` (a key or pointer event; the Sleep button's route with the lid open).

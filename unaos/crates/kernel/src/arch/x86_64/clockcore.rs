@@ -8,11 +8,11 @@
 //! Now: once `apic::calibrate` has measured the TSC and CPUID says it is INVARIANT, `ms()` is the TSC
 //! scaled by that rate, continuous with the tick count at the switch, monotonic across cores (one
 //! `fetch_max`), with a per-core offset measured at AP bring-up and applied only if an AP is out of
-//! sync. The per-core LAPIC tick stays — for scheduling — but it no longer is the clock.
+//! sync. The per-core LAPIC tick stays the scheduler's — one-shot on an idle AP under `tickless` (B765) — but it is not the clock.
 //!
 //! Masked sections are NAMED: the outermost `IrqMask`/`without_interrupts` records (cpu, t0, site);
 //! a span over 10 ms prints `[irq] masked section fn=<name> ms=<n> cpu=<c> live=0` once per site, and
-//! any OTHER core's tick names a section still masked past 10 ms (`live=1`) — the wedge seen from
+//! any OTHER core's tick (core 0 and every busy core tick at 1 kHz under `tickless` too) names a section still masked past 10 ms (`live=1`) — the wedge seen from
 //! outside the wedged core. `tests clock` is the witness (registered, never run at boot — R80).
 
 use core::panic::Location;
@@ -216,7 +216,7 @@ fn name_once(site: &'static Location<'static>, span: u64, cpu: u32, live: bool) 
     }
 }
 
-/// Timer ISR, every core (after `note_tick`): every 50 ms one ticking core scans the OTHERS for a
+/// Timer ISR, every core (after `note_tick`; a tickless idle AP enters it at its one-shot, core 0 stays periodic): every 50 ms one ticking core scans the OTHERS for a
 /// section still masked past 10 ms and names it `live=1` — the core that is stuck cannot say so.
 #[inline]
 pub fn isr_tick() {
@@ -304,7 +304,7 @@ pub fn ensure_tests() {
 
 /// `tests clock`: (1) the TSC ms clock against the ACPI PM timer over 250 ms (no HPET driver in this
 /// tree — `ref=pm`); (2) a deliberate 20 ms masked spin on THIS core must still see `ms()` advance
-/// 20 ms, and the watch must have named it; (3) every online core's LAPIC tick advanced in the window.
+/// 20 ms, and the watch must have named it; (3) every online core's LAPIC tick advanced in the window (a tickless idle AP's by `tickless::idle_exit`'s credit at its <= 200 ms beat).
 pub fn selftest() {
     const WIN_MS: u64 = 250; if !tsc_clock() && !crate::arch::apic::tsc_invariant() { serial_println!(":: CLOCKCORE: source=apic invariant=0 ref=pm -> SKIP reason=no-invariant-tsc ::"); return; } // QEMUSKIP (B613): `start` keeps the tick clock on a non-invariant TSC (line 79), so the TSC clock this fixture certifies is not the clock
     let hz = crate::arch::apic::tsc_hz();
