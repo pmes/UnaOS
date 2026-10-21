@@ -6171,7 +6171,7 @@ impl XhciController {
         if changes == 0 {
             return;
         }
-        self.clear_port_change(port_id, changes);
+        self.clear_port_change(port_id, changes); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] self.port_wake_note(port_id, portsc, changes); // USBSUSPEND (B766): PLC with PLS=Resume on a port the sleep state suspended is the device's remote wake; the body is `suspend::port_wake_note` at the file tail. LINE-NEUTRAL fold, code first
         if changes & !((1 << 17) | (1 << 19) | (1 << 21)) != 0 {
             crate::bootlog_println!(
                 "xHCI: [Port {}] change bits {:#x} cleared (PORTSC={:#010x}).",
@@ -14071,7 +14071,7 @@ impl XhciController {
         // PIUSB-39 F1: drain any halted HID interrupt-IN endpoints first — they are dead until
         // un-halted, and the recovery is synchronous like everything else in this hook. Hooked
         // here so no caller outside the driver changes.
-        self.service_hid_halts(); self.service_hid_leds(); #[cfg(feature = "witness")] self.xhcihub_score(); #[cfg(feature = "witness")] self.ptrpress_score(); // PTRPRESS — the scorer's only hook, beside its sibling and for the same reason: the counters are final only after the injected stream has ended, so the score is a DEADLINE off the first button edge rather than a condition on any one report. A no-op on every boot whose pointer is never clicked. ⚠ FOLDED. // XHCIHUB — the scorer's only hook. This pass runs every main loop in the same safe polled context, which is what the fixture needs: the hub facts are recorded during bring-up but the downstream pointer's report count is not final until the device has had time to speak, so the score waits for the first report or for XHCIHUB_SETTLE_MS, whichever comes first, and prints exactly once. A no-op on every boot with no hub. ⚠ FOLDED. // HIDLEDDEFER — push any lock-LED bitmap a completion toggled since the last pass (the SET_REPORT that used to run inside the completion branch). Same safe polled context as the halts drain. ⚠ FOLDED.
+        #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] self.port_suspend_service(); self.service_hid_halts(); self.service_hid_leds(); #[cfg(feature = "witness")] self.xhcihub_score(); #[cfg(feature = "witness")] self.ptrpress_score(); // PTRPRESS — the scorer's only hook, beside its sibling and for the same reason: the counters are final only after the injected stream has ended, so the score is a DEADLINE off the first button edge rather than a condition on any one report. A no-op on every boot whose pointer is never clicked. ⚠ FOLDED. // XHCIHUB — the scorer's only hook. This pass runs every main loop in the same safe polled context, which is what the fixture needs: the hub facts are recorded during bring-up but the downstream pointer's report count is not final until the device has had time to speak, so the score waits for the first report or for XHCIHUB_SETTLE_MS, whichever comes first, and prints exactly once. A no-op on every boot with no hub. ⚠ FOLDED. // HIDLEDDEFER — push any lock-LED bitmap a completion toggled since the last pass (the SET_REPORT that used to run inside the completion branch). Same safe polled context as the halts drain. ⚠ FOLDED.
         while let Some(slot) = self.hid_setproto_pending.pop() {
             // Only BOOT interfaces accept SET_PROTOCOL: proto 1 (keyboard) and proto 2 (relative
             // boot mouse). The absolute-pointer path (proto 0, e.g. usb-tablet / consumer-control)
@@ -18014,4 +18014,254 @@ pub fn census_slots() -> Result<Vec<(u8, u8, u16, u16, u8)>, XhciClaimError> {
         out.push((i as u8, s.port_id, s.vid, s.pid, roles));
     }
     Ok(out)
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// USBSUSPEND (rmbp-ledger B766, docs/dev/blueprint/power.md BP-power-7) — the root ports' U3 for the sleep state.
+// FILE-TAIL append under the `power::sleep` cfg, so no `panic::Location` above moves and a knob-off build carries none of it.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+pub mod suspend {
+    //! CHARTER: Kernel — driver (the xHCI root ports' suspend/resume; `power::sleep` asks, the loan holder acts).
+    //!
+    //! `power::sleep` writes ONE word, [`request`]. Every PORTSC write is the controller loan holder's: the pump's
+    //! `service_hid_setproto` pass runs [`XhciController::port_suspend_service`], and `handle_port_status` hands a
+    //! device's remote wake (PLC with PLS=Resume, xHCI 1.2 §4.15.2.1) to [`XhciController::port_wake_note`]. The
+    //! phase machine never waits with the loan held: USB2 resume signalling holds 20 ms (TDRSMDN) and recovery 10 ms
+    //! (TRSMRCY) as DEADLINES the next passes check (the pump runs every 1 ms tick).
+    //!
+    //! Kept up and named: the FTDI console's port (`why=wire`) and every storage record's port (`why=storage`: the BOT
+    //! pump has no auto-resume). No Stop Endpoint: the dispatch's non-halting re-arm would restart a stopped endpoint
+    //! (owed, B766); endpoints stay Running with their TDs queued and the resume line prints the keyboard's EP state.
+    use super::{XhciController, PORT_CHANGE_BITS};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+
+    const UP: u8 = 0;
+    const SUSPENDED: u8 = 1;
+    const RESUMING: u8 = 2;
+    const RECOVERING: u8 = 3;
+    /// USB 2.0 §7.1.7.7 TDRSMDN: resume signalling held by the host.
+    const RESUME_MS: u64 = 20;
+    /// USB 2.0 §7.1.7.7 TRSMRCY: recovery before the first transaction.
+    const RECOVERY_MS: u64 = 10;
+    /// xHCI 1.2 §5.4.8: PLS 8:5, LWS 16; PLS values.
+    const PLS_SHIFT: u32 = 5;
+    const PLS_MASK: u32 = 0xF << PLS_SHIFT;
+    const LWS: u32 = 1 << 16;
+    const PLS_U0: u32 = 0;
+    const PLS_U3: u32 = 3;
+    const PLS_RESUME: u32 = 15;
+
+    /// The sleep state wants the bus suspended (written by `power::sleep` only).
+    static WANT: AtomicBool = AtomicBool::new(false);
+    /// The phase (written by the loan holder only).
+    static PHASE: AtomicU8 = AtomicU8::new(UP);
+    static DUE_MS: AtomicU64 = AtomicU64::new(0);
+    static T0_MS: AtomicU64 = AtomicU64::new(0);
+    /// Root ports this driver put in U3 (bit `port - 1`; ports 1..=64).
+    static SUSP_MASK: AtomicU64 = AtomicU64::new(0);
+    /// USB2 ports among them (they take resume signalling; a SuperSpeed port takes U0 at once).
+    static USB2_MASK: AtomicU64 = AtomicU64::new(0);
+    /// The last cycle's census: ports with a device, ports written to U3, ports whose PLS read 3, ports back in U0.
+    static PORTS: AtomicU32 = AtomicU32::new(0);
+    static SUSPENDED_N: AtomicU32 = AtomicU32::new(0);
+    static PLS3_N: AtomicU32 = AtomicU32::new(0);
+    static RESUMED_N: AtomicU32 = AtomicU32::new(0);
+    static KEPT_N: AtomicU32 = AtomicU32::new(0);
+    static REMOTE_WAKES: AtomicU32 = AtomicU32::new(0);
+
+    /// The sleep state's one word: `true` at entry, `false` at the wake. Any context; touches no register.
+    pub fn request(suspend: bool) { WANT.store(suspend, Ordering::Release); }
+
+    /// One cycle's numbers, for `tests usbsuspend`.
+    #[derive(Clone, Copy)]
+    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32 }
+
+    /// `true` while the ports are in U3 (the last request has been applied); `false` once fully back in U0.
+    pub fn suspended() -> bool { PHASE.load(Ordering::Acquire) == SUSPENDED }
+    pub fn up() -> bool { PHASE.load(Ordering::Acquire) == UP }
+
+    pub fn census() -> Census {
+        Census {
+            ports: PORTS.load(Ordering::Relaxed), suspended: SUSPENDED_N.load(Ordering::Relaxed), pls3: PLS3_N.load(Ordering::Relaxed),
+            resumed: RESUMED_N.load(Ordering::Relaxed), kept: KEPT_N.load(Ordering::Relaxed), remote_wakes: REMOTE_WAKES.load(Ordering::Relaxed),
+        }
+    }
+
+    fn bit(port: u8) -> u64 { if (1..=64).contains(&port) { 1u64 << (port - 1) } else { 0 } }
+
+    impl XhciController {
+        /// The pump's pass (folded into `service_hid_setproto`): apply [`request`], and run the resume deadlines.
+        pub(crate) fn port_suspend_service(&mut self) {
+            let now = crate::arch::ms();
+            match PHASE.load(Ordering::Acquire) {
+                UP if WANT.load(Ordering::Acquire) => { if self.ports_suspend() { PHASE.store(SUSPENDED, Ordering::Release); } }
+                SUSPENDED if !WANT.load(Ordering::Acquire) => self.ports_resume_begin(0),
+                RESUMING if now >= DUE_MS.load(Ordering::Relaxed) => self.ports_resume_finish(now),
+                RECOVERING if now >= DUE_MS.load(Ordering::Relaxed) => {
+                    PHASE.store(UP, Ordering::Release);
+                }
+                _ => {}
+            }
+        }
+
+        /// Every root port with an enabled device in U0..U2 goes to U3 (LWS), except the wire and storage.
+        /// `false` = deferred (an enumeration is in flight; its EP0 and the descriptor buffers are busy).
+        fn ports_suspend(&mut self) -> bool {
+            if self.enum_active { return false; }
+            let mut keep_wire = 0u64;
+            let mut keep_storage = 0u64;
+            if self.ftdi_slot != 0 { keep_wire |= bit(self.slots[self.ftdi_slot as usize].port_id); }
+            for r in self.storage.iter() { if r.slot != 0 { keep_storage |= bit(self.slots[r.slot as usize].port_id); } }
+            let (mut ports, mut kept, mut done, mut pls3) = (0u32, 0u32, 0u32, 0u32);
+            let (mut mask, mut usb2) = (0u64, 0u64);
+            for port in 1..=self.max_ports.min(64) {
+                let portsc = self.read_portsc(port);
+                if portsc & 0b11 != 0b11 { continue; } // CCS and PED: an enabled device
+                ports += 1;
+                let why = if keep_wire & bit(port) != 0 { Some("wire") } else if keep_storage & bit(port) != 0 { Some("storage") } else { None };
+                if let Some(why) = why {
+                    kept += 1;
+                    serial_println!("[usb] port={} keep why={}", port, why);
+                    continue;
+                }
+                if (portsc & PLS_MASK) >> PLS_SHIFT > 2 { continue; } // not U0..U2: not ours to suspend
+                let rwe = self.arm_remote_wake(port);
+                self.set_link_state(port, PLS_U3);
+                let t0 = crate::arch::ms();
+                let mut pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
+                while pls != PLS_U3 && crate::arch::ms().wrapping_sub(t0) < 5 {
+                    core::hint::spin_loop();
+                    pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
+                }
+                mask |= bit(port);
+                if self.port_major(port) < 3 { usb2 |= bit(port); }
+                done += 1;
+                if pls == PLS_U3 { pls3 += 1; }
+                serial_println!("[usb] port={} suspend -> pls={} usb{} remote_wake={}", port, pls, self.port_major(port), rwe);
+            }
+            SUSP_MASK.store(mask, Ordering::Relaxed);
+            USB2_MASK.store(usb2, Ordering::Relaxed);
+            PORTS.store(ports, Ordering::Relaxed);
+            KEPT_N.store(kept, Ordering::Relaxed);
+            SUSPENDED_N.store(done, Ordering::Relaxed);
+            PLS3_N.store(pls3, Ordering::Relaxed);
+            RESUMED_N.store(0, Ordering::Relaxed);
+            true
+        }
+
+        /// Begin the resume of every port this driver suspended (`remote` = the port whose device signalled, already in
+        /// Resume and driven by the controller; 0 = host-initiated). USB2 ports get PLS=Resume and a 20 ms deadline;
+        /// SuperSpeed ports get U0 now (xHCI 1.2 §4.15.2.2).
+        fn ports_resume_begin(&mut self, remote: u8) {
+            let mask = SUSP_MASK.load(Ordering::Relaxed);
+            let usb2 = USB2_MASK.load(Ordering::Relaxed);
+            let now = crate::arch::ms();
+            T0_MS.store(now, Ordering::Relaxed);
+            for port in 1..=self.max_ports.min(64) {
+                if mask & bit(port) == 0 { continue; }
+                if usb2 & bit(port) == 0 { self.set_link_state(port, PLS_U0); } else if port != remote { self.set_link_state(port, PLS_RESUME); }
+            }
+            DUE_MS.store(now + RESUME_MS, Ordering::Relaxed);
+            PHASE.store(RESUMING, Ordering::Release);
+        }
+
+        /// The 20 ms are up: USB2 ports to U0, each port's PLS read and printed, then the 10 ms recovery.
+        fn ports_resume_finish(&mut self, now: u64) {
+            let mask = SUSP_MASK.load(Ordering::Relaxed);
+            let usb2 = USB2_MASK.load(Ordering::Relaxed);
+            for port in 1..=self.max_ports.min(64) {
+                if mask & bit(port) != 0 && usb2 & bit(port) != 0 { self.set_link_state(port, PLS_U0); }
+            }
+            let t0 = T0_MS.load(Ordering::Relaxed);
+            let mut resumed = 0u32;
+            for port in 1..=self.max_ports.min(64) {
+                if mask & bit(port) == 0 { continue; }
+                let mut pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
+                while pls != PLS_U0 && crate::arch::ms().wrapping_sub(now) < 5 {
+                    core::hint::spin_loop();
+                    pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
+                }
+                let ms = crate::arch::ms().saturating_sub(t0);
+                if pls == PLS_U0 {
+                    resumed += 1;
+                    serial_println!("[usb] port={} resume ms={} -> ok{}", port, ms, self.kbd_ep_word(port));
+                } else {
+                    serial_println!("[usb] port={} resume ms={} -> pls={}{}", port, ms, pls, self.kbd_ep_word(port));
+                }
+            }
+            RESUMED_N.store(resumed, Ordering::Relaxed);
+            SUSP_MASK.store(0, Ordering::Relaxed);
+            DUE_MS.store(crate::arch::ms() + RECOVERY_MS, Ordering::Relaxed);
+            PHASE.store(RECOVERING, Ordering::Release);
+        }
+
+        /// Write PLS with LWS on `clear_port_change`'s mask: never a 1 to PED (write-1-to-disable), PR (reset) or a
+        /// change bit (RW1C).
+        fn set_link_state(&self, port: u8, pls: u32) {
+            let portsc = self.read_portsc(port);
+            let neutral = portsc & !(PORT_CHANGE_BITS | (1 << 1) | (1 << 4) | PLS_MASK);
+            self.write_portsc(port, neutral | (pls << PLS_SHIFT) | LWS);
+        }
+
+        /// Remote wakeup armed on every keyboard and hub slot on `port` whose configuration declares it (bmAttributes
+        /// bit 5, USB 2.0 §9.6.3): GET_DESCRIPTOR(config, 9) into the slot's own descriptor buffer, then
+        /// SET_FEATURE(DEVICE_REMOTE_WAKEUP) (§9.4.9: a device that declares it accepts it). The word: armed slots / asked.
+        fn arm_remote_wake(&mut self, port: u8) -> alloc::string::String {
+            let (mut asked, mut armed) = (0u32, 0u32);
+            for slot in 1..self.slots.len() {
+                let s = &self.slots[slot];
+                if !s.active || s.port_id != port || !(s.is_keyboard || s.is_hub) || s.descriptor_buffer.is_null() { continue; }
+                let buf = s.descriptor_buffer as u64;
+                asked += 1;
+                unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 9) };
+                let declared = matches!(self.sync_control(slot as u8, 0x80, 0x06, 0x0200, 0, 9, buf, true), Ok(1) | Ok(13))
+                    && self.last_control_len >= 8
+                    && unsafe { core::ptr::read_volatile((buf + 7) as *const u8) } & 0x20 != 0;
+                if declared && matches!(self.sync_control(slot as u8, 0x00, 0x03, 0x0001, 0, 0, 0, false), Ok(1)) { armed += 1; }
+            }
+            alloc::format!("{}/{}", armed, asked)
+        }
+
+        /// From `handle_port_status` (the event dispatch, loan held), after it cleared the change bits: PLC with
+        /// PLS=Resume on a port this driver suspended is the device's remote wake (xHCI 1.2 §4.15.2.1). Every
+        /// suspended port resumes with it and the request is dropped, so the pass does not re-suspend; the report
+        /// that follows reaches the sleep state through the decoder's `pal::push_event` (the `input` waker).
+        pub(crate) fn port_wake_note(&mut self, port: u8, portsc: u32, changes: u32) {
+            if changes & (1 << 22) == 0 || (portsc & PLS_MASK) >> PLS_SHIFT != PLS_RESUME { return; }
+            if PHASE.load(Ordering::Acquire) != SUSPENDED || SUSP_MASK.load(Ordering::Relaxed) & bit(port) == 0 { return; }
+            REMOTE_WAKES.fetch_add(1, Ordering::Relaxed);
+            WANT.store(false, Ordering::Release);
+            serial_println!("[usb] port={} remote-wake pls=15 -> resume", port);
+            self.ports_resume_begin(port);
+        }
+
+        /// ` kbd_ep=<state>` for the keyboard slot on `port` (its interrupt-IN endpoint context: 1 Running, 2 Halted,
+        /// 3 Stopped, 4 Error); empty when no keyboard is there.
+        fn kbd_ep_word(&self, port: u8) -> alloc::string::String {
+            match self.kbd_slot_on(port) {
+                Some((slot, dci, _)) => alloc::format!(" kbd_ep={}", self.ep_state_of(slot, dci)),
+                None => alloc::string::String::new(),
+            }
+        }
+
+        /// The first active keyboard slot (on `port`, or anywhere for 0): (slot, interrupt-IN DCI, interface).
+        fn kbd_slot_on(&self, port: u8) -> Option<(u8, u8, u8)> {
+            self.slots.iter().enumerate().skip(1).find_map(|(i, s)| {
+                (s.active && s.is_keyboard && s.keyboard_ep != 0 && (port == 0 || s.port_id == port)).then(|| {
+                    (i as u8, (s.keyboard_ep & 0x0F) * 2 + ((s.keyboard_ep & 0x80) != 0) as u8, s.keyboard_intf)
+                })
+            })
+        }
+
+        /// `tests usbsuspend`: a keyboard report still arrives after the resume — HID GET_REPORT(Input) over EP0
+        /// (HID 1.11 §7.2.1) into the slot's descriptor buffer — and the interrupt-IN endpoint's context state.
+        /// `None` = no keyboard on this controller; `Some((cc, ep_state, len))`.
+        pub fn kbd_report_probe(&mut self) -> Option<(u8, u8, u32)> {
+            let (slot, dci, intf) = self.kbd_slot_on(0)?;
+            let buf = self.slots[slot as usize].descriptor_buffer as u64;
+            if buf == 0 { return None; }
+            let cc = self.sync_control(slot, 0xA1, 0x01, 0x0100, intf as u16, 8, buf, true).unwrap_or(0);
+            Some((cc, self.ep_state_of(slot, dci), self.last_control_len))
+        }
+    }
 }

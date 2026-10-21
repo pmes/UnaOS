@@ -324,7 +324,7 @@ fn ensure_brightfloor() {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", crate::video::lidsleep::sleep_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); } // AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
+        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", crate::video::lidsleep::sleep_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("usbsuspend", usbsuspend_selftest); } // USBSUSPEND (B766): `tests usbsuspend` (the file-tail fn; same gate as `sleep`). AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
     }
 }
 
@@ -5222,5 +5222,65 @@ fn scrollview_selftest() {
     serial_println!(
         ":: SCROLLVIEW: steps={} clamp={} blit={} thumb={} quarry={} hw={} -> {} ::",
         steps, if clamp_ok && reached_ends { "ok" } else { "FAIL" }, if blit_ok { "ok" } else { "FAIL" }, if thumb_ok { "ok" } else { "FAIL" }, word(&quarry), word(&hw), if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+/// USBSUSPEND (rmbp-ledger B766, BP-power-7): `tests usbsuspend` (R80: registered, never at boot). Ask both USB
+/// drivers for the sleep state's suspend, wait (bounded 2 s) for the xHCI pass to put its ports in U3, read every
+/// suspended port's PLS, ask for the resume, wait (bounded 2 s) for U0 and the recovery, then a keyboard report over
+/// EP0 (HID GET_REPORT) and the interrupt-IN endpoint's state — the slot was never re-enumerated. The panel stays lit
+/// (the sleep STATE is `tests sleep`'s). Under QEMU's default line the usb-kbd rides EHCI: `UNAOS_XHCIKBD=1` moves it.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_selftest() {
+    use crate::drivers::xhci::{self, suspend as xs};
+    let wait = |ms: u64, f: &dyn Fn() -> bool| -> bool {
+        let t0 = crate::arch::ms();
+        while !f() {
+            if crate::arch::ms().wrapping_sub(t0) >= ms {
+                return false;
+            }
+            crate::arch::sched::sleep_ms(5);
+        }
+        true
+    };
+    if matches!(xhci::claim(), Err(xhci::XhciClaimError::NotReady)) {
+        serial_println!(":: USBSUSPEND: ports=0 suspended=0 resumed=0 kbd=none -> SKIP reason=no-xhci ::");
+        return;
+    }
+    xs::request(true);
+    #[cfg(feature = "ehcihid")] crate::drivers::ehci::suspend::request(true);
+    let in_u3 = wait(2_000, &|| xs::suspended());
+    let c = xs::census();
+    xs::request(false);
+    #[cfg(feature = "ehcihid")] crate::drivers::ehci::suspend::request(false);
+    let up = wait(2_000, &|| xs::up());
+    let r = xs::census();
+    let mut probe = None;
+    let t0 = crate::arch::ms();
+    while probe.is_none() && crate::arch::ms().wrapping_sub(t0) < 1_000 {
+        match xhci::claim() { Ok(mut x) => probe = Some(x.kbd_report_probe()), Err(_) => crate::arch::sched::sleep_ms(5) }
+    }
+    #[cfg(feature = "ehcihid")] let (e_ports, e_susp, e_kept) = crate::drivers::ehci::suspend::census();
+    #[cfg(not(feature = "ehcihid"))] let (e_ports, e_susp, e_kept) = (0u32, 0u32, 0u32);
+    let (kbd, ep) = match probe {
+        None => ("busy", 0xFF),
+        Some(None) => ("none", 0xFF),
+        Some(Some((cc, ep, len))) if matches!(cc, 1 | 13) && ep == 1 && len > 0 => ("ok", ep),
+        Some(Some((_, ep, _))) => ("fail", ep),
+    };
+    let verdict = if !in_u3 || !up {
+        "FAIL reason=phase-timeout"
+    } else if c.pls3 != c.suspended || r.resumed < c.suspended {
+        "FAIL"
+    } else if kbd == "none" {
+        "SKIP reason=no-xhci-kbd"
+    } else if kbd != "ok" || c.suspended == 0 {
+        "FAIL"
+    } else {
+        "PASS"
+    };
+    serial_println!(
+        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={}",
+        c.ports, c.suspended, r.resumed, kbd, verdict, c.pls3, c.kept, ep, r.remote_wakes, e_susp, e_ports, e_kept
     );
 }
