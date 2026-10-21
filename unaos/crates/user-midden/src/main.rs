@@ -148,7 +148,7 @@ const STDIN_IDLE_MS: u64 = 10_000;
 /// SHELLABI: the prefix of this program's own wire lines (a one-shot child's ride its pipe; not pipeline data).
 const WIRE_PREFIX: &str = ":: MIDDEN: ";
 const ACT_TOP: u64 = 24;
-const ACT_BOTTOM: u64 = 25;
+const ACT_BOTTOM: u64 = 25; const ACT_UNDO: u64 = 51; // RING3UNDO (rmbp-ledger B771): ⌘Z, the keymap's Undo row (LINE-NEUTRAL append)
 
 /// MIDDEN2: what is left of a line when its pipeline's first stage is a program: the later stages (run over the
 /// program's collected output at EOF), the commands after it, and the operator that joins them.
@@ -1654,6 +1654,9 @@ impl App {
                     let s = &s[..s.len().min(room)];
                     self.ed.insert(s);
                 }
+            }
+            ACT_UNDO => {
+                self.ed.undo();
             }
             _ => return,
         }

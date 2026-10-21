@@ -15,7 +15,7 @@
 //
 // KEYS (focused). Printable ASCII inserts; Enter = `newline` (the core's auto-indent); Backspace = delete one
 // grapheme back; Tab = four spaces; arrows = `move_cursors`; Ctrl+A / Ctrl+E line start / end; Ctrl+K delete the
-// line; Ctrl+Z undo, Ctrl+Y redo. Selection rides the desktop's
+// line; Ctrl+Z undo, Ctrl+Y redo; ⌘Z / ⌘⇧Z (INPUT_EV_ACTION 51/52). Selection rides the desktop's
 // resolved actions (INPUT_EV_ACTION, APPCLIP/TERMSEL): select-all, select-left/right, select-line-start/end,
 // deselect, and TERMSEL2's caret moves — the ring carries no modifier bits, so Shift+arrow arrives that way.
 //
@@ -481,6 +481,8 @@ impl Editor {
             14 => self.buf.move_cursors(Motion::Right, false),
             15 => self.buf.move_cursors(Motion::LineStart, false),
             16 => self.buf.move_cursors(Motion::LineEnd, false),
+            51 => self.history(false, 51),
+            52 => self.history(true, 52),
             _ => return,
         }
         self.repaint = true;
@@ -526,22 +528,8 @@ impl Editor {
                 let c = self.buf.delete_lines();
                 self.edited(c);
             }
-            0x1A => match self.buf.undo() {
-                Some(c) => {
-                    self.edited(c);
-                    self.dirty = true;
-                    self.msg = String::from("undo");
-                }
-                None => self.msg = String::from("nothing to undo"),
-            },
-            0x19 => match self.buf.redo() {
-                Some(c) => {
-                    self.edited(c);
-                    self.dirty = true;
-                    self.msg = String::from("redo");
-                }
-                None => self.msg = String::from("nothing to redo"),
-            },
+            0x1A => self.history(false, 0x1A),
+            0x19 => self.history(true, 0x19),
             0x06 => self.ask(Field::Find),
             0x0C => self.ask(Field::Repl),
             0x07 => self.ask(Field::Line),
@@ -552,6 +540,24 @@ impl Editor {
             }
             _ => self.repaint = false,
         }
+    }
+
+    /// CHARTER: RING3UNDO (rmbp-ledger B771) — one undo/redo step of the core's journal, from a Ctrl byte or a keymap
+    /// action; status, dirty and one wire line: `:: UNA: <undo|redo> code=<code> -> <ok|empty> ::`.
+    fn history(&mut self, redo: bool, code: u8) {
+        let (step, word) = if redo { (self.buf.redo(), "redo") } else { (self.buf.undo(), "undo") };
+        let hit = step.is_some();
+        match step {
+            Some(c) => {
+                self.edited(c);
+                self.dirty = true;
+                self.msg = String::from(word);
+            }
+            None => self.msg = alloc::format!("nothing to {}", word),
+        }
+        let mut l = Line::new(b":: UNA: ");
+        l.put(word.as_bytes()).put(b" code=").dec(code as i64).put(b" -> ").put(if hit { b"ok" as &[u8] } else { b"empty" }).put(b" ::");
+        l.wire();
     }
 }
 
