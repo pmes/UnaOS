@@ -117,3 +117,4 @@ unaos/crates/kernel/src/video/login.rs  tegra_opened  a local of the login selft
 unaos/crates/kernel/src/video/quarry/live.rs  tegra_el0  a knob or feature named in a wire line as Cargo.toml spells it; renames with the knob
 unaos/crates/kernel/src/vugras.rs  TEGRA_DRAM_TOP  the Tegra234 DRAM window top (8 GiB) that caps the VUGRAS above-heap span, and its wire line; owed: read it from the memory map (BP-shape-7)
 unaos/crates/kernel/src/vugras.rs  tegra  the Tegra234 DRAM window top (8 GiB) that caps the VUGRAS above-heap span, and its wire line; owed: read it from the memory map (BP-shape-7)
+unaos/crates/kernel/src/hw.rs  tegra_sd_card_blocks  call into arch: the Tegra SD block source (`arch::aarch64::sdmmc_tegra::tegra_sd_card_blocks`) is named for the board in arch/; its rename to `sdmmc_*` is ARCHSPLIT (the shared caller follows). HWCENSUSARM SR165.

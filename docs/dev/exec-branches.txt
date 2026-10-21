@@ -658,14 +658,14 @@ refs/heads/exec-rmbp-fsearchicons   e05221f9 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-sbcframe       6f79b4d5 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-orinrepeat     76408458 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-openargqueue   fc4fba86 FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-trashbatchdock ac54e385 IN-FLIGHT cloud wave36 TRASHBATCHDOCK
+refs/heads/exec-rmbp-trashbatchdock fc03f4b8 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-prefsreload    ac54e385 IN-FLIGHT cloud wave36 PREFSRELOAD
 refs/heads/exec-rmbp-hwcensusarm    169c2eb1 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-scrollview     229aceda FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-tickless       045cb41a FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-usbsuspend     fb8ad2f4 IN-FLIGHT cloud wave36 USBSUSPEND
+refs/heads/exec-rmbp-usbsuspend     f7dd6702 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-sinkall        fb8ad2f4 IN-FLIGHT cloud wave36 SINKALL
-refs/heads/exec-rmbp-pickerkeys     fb8ad2f4 IN-FLIGHT cloud wave36 PICKERKEYS
+refs/heads/exec-rmbp-pickerkeys     e6252391 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-sdpserver      abc14cd7 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-wcpar2         8ab5da61 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-gateneutral    742c45e8 FOLDED-BY-HAND (this commit) 2026-10-21
