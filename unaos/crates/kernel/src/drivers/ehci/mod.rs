@@ -213,7 +213,7 @@ struct IntEp {
     /// `int_eps` and the enumeration `Target` is long out of scope by then. `Target` is `Copy` and
     /// eight bytes, so carrying it costs nothing.
     target: Target,
-    intf: u8,
+    intf: u8, #[cfg(all(feature = "lidsleep", feature = "wc"))] hub: Option<hubchange::HubEp>, // EHCIHUBDISC (B801): Some = this endpoint is a hub's status-change endpoint (`hubchange`, file tail), None on every HID endpoint; gate HUBREC = all(lidsleep, wc), the gate of the one hub record (`suspend::HUBS`). LINE-NEUTRAL fold, code first
     /// ALLKEYS P1: does this keyboard still accept the LED SET_REPORT? Latched FALSE by the first
     /// refusal and never retried.
     ///
@@ -4287,7 +4287,7 @@ impl Controller {
                 );
                 return;
             }
-            self.bring_up_hub(&t, depth); #[cfg(all(feature = "lidsleep", feature = "wc"))] suspend::note_hub(self.idx, t); // EHCIWAKE (B776): record the hub so the sleep state can arm its remote wake; the body is `suspend` at the file tail. LINE-NEUTRAL fold, code first
+            self.bring_up_hub(&t, depth, #[cfg(all(feature = "lidsleep", feature = "wc"))] 0); #[cfg(all(feature = "lidsleep", feature = "wc"))] suspend::note_hub(self.idx, t); // EHCIWAKE (B776): record the hub so the sleep state can arm its remote wake; the body is `suspend` at the file tail. LINE-NEUTRAL fold, code first
         } else {
             #[cfg(all(feature = "usbnet", feature = "ehcihid"))] { if vid == 0x0b95 && pid == 0x1790 { self.usbnet_ehci_front(&t); return; } } let hidcfg_t0 = crate::arch::now_cycles();
             self.configure_hid(&t);
@@ -4297,8 +4297,8 @@ impl Controller {
 
     /// Topology A: enumerate the hub (the RMH on metal), walk its downstream ports, and
     /// enumerate each connected child through the hub's TT.
-    unsafe fn bring_up_hub(&mut self, hub: &Target, depth: u8) {
-        if self.control(hub, 0x00, 9, 1, 0, 0, false).is_err() {
+    unsafe fn bring_up_hub(&mut self, hub: &Target, depth: u8, #[cfg(all(feature = "lidsleep", feature = "wc"))] only: u16) { #[cfg(all(feature = "lidsleep", feature = "wc"))] let walk = only == 0; #[cfg(not(all(feature = "lidsleep", feature = "wc")))] let walk = true; // EHCIHUBDISC (B801): `only` = 0 for the boot walk, else the ONE port a status change named (`hubchange::service_one_hub_change` re-walks it through this same per-port body); a re-walk does not re-SET_CONFIGURATION the hub (USB 2.0 §9.1.1.5 would reset its armed status endpoint's toggle). Knob-off `walk` is the constant `true` and `true &&` folds away. LINE-NEUTRAL fold, code first
+        if walk && self.control(hub, 0x00, 9, 1, 0, 0, false).is_err() {
             serial_println!(":: EHCI-HID: [{}] hub addr {} SET_CONFIGURATION failed ::", self.idx, hub.addr);
             return;
         }
@@ -4332,7 +4332,7 @@ impl Controller {
         settle_ms(pwr2good_ms + 100);
         self.pace.add(EP_HUBPWR, hubpwr_t0);
 
-        for port in 1..=nbr_ports as u16 {
+        for port in 1..=nbr_ports as u16 { #[cfg(all(feature = "lidsleep", feature = "wc"))] { if only != 0 && port != only { continue; } } // EHCIHUBDISC (B801): a re-walk visits only the named port. LINE-NEUTRAL fold, code first
             // GET_PORT_STATUS: wPortStatus (lo16) + wPortChange (hi16).
             let Ok(4) = self.control(hub, 0xA3, 0, 0, port, 4, true) else { continue };
             let st = (*self.data_buf as u32)
@@ -13556,7 +13556,7 @@ impl Controller {
             // device in, so software and hardware agree without an explicit sync request.
             kbd_leds: 0,
             target: *t,
-            intf,
+            intf, #[cfg(all(feature = "lidsleep", feature = "wc"))] hub: None, // EHCIHUBDISC (B801): `configure_hub_interrupt_ep` sets it on a hub's status-change endpoint. LINE-NEUTRAL fold, code first
             kbd_led_ok: true,
             last_report_ms: 0,
             // EHCIDARK — the census clock starts at the moment the endpoint becomes armed, for the
@@ -14059,7 +14059,7 @@ impl Controller {
                     // the hand-off arm `len` is additionally bounded by `ISR_SLOT_LEN` at the producer,
                     // so the slice can never run off either allocation.
                     let report = core::slice::from_raw_parts(rpt_ptr, cap); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::pal::k2p::decode(); // K2P (B671, BP-input-13): the HID report's decode instant (boot mouse, keyboard, Wellspring pad) — the first event it pushes carries this stamp to the compositor (`pal::k2p`). ⚠ LINE-NEUTRAL fold, code before the comment.
-                    e.reports = e.reports.wrapping_add(1);
+                    e.reports = e.reports.wrapping_add(1); #[cfg(all(feature = "lidsleep", feature = "wc"))] hubchange::note(e, report, idx); // EHCIHUBDISC (B801): a hub status-change bitmap is OR-ed into `e.hub.pending` (no-op on a HID endpoint); it then falls through every decode arm (no kind) to the one re-arm below. LINE-NEUTRAL fold, code first
                     if let Some(l) = e.layout {
                         if l.vendor_mt {
                             // TRACKPAD (B139) — CHARGE THE CENSUS FIRST, before any decode, any
@@ -14498,7 +14498,7 @@ impl Controller {
             if n >= MT_RAW_DUMP_MAX {
                 self.bcm5974_mt_restore();
             }
-        }
+        } #[cfg(all(feature = "lidsleep", feature = "wc"))] self.service_hub_changes(); // EHCIHUBDISC (B801): the endpoint borrow is released and EP0 is usable — one hub port change per pass (`hubchange`, file tail). LINE-NEUTRAL fold, code first
     }
 }
 
@@ -15504,7 +15504,7 @@ fn int_ep_kind(e: &IntEp) -> &'static str {
         Some(l) if l.relative => "rptr-rel",
         Some(_) => "rptr-abs",
         None if e.is_kbd => "kbd",
-        None if e.is_rel_mouse => "boot-mouse",
+        #[cfg(all(feature = "lidsleep", feature = "wc"))] None if e.hub.is_some() => "hub", None if e.is_rel_mouse => "boot-mouse", // EHCIHUBDISC (B801): a hub status-change endpoint. LINE-NEUTRAL fold, code first
         None => "unknown",
     }
 }
@@ -18898,7 +18898,7 @@ pub fn init() {
                     let _ = (&cg_cleared, rcba); // probe-13 levers retired (smokes all passed)
                     let enum_t0 = crate::arch::now_cycles();
                     c.enumerate_at_zero(QH_EPS_HIGH, 0, 0, 0, #[cfg(any(all(feature = "lidsleep", feature = "wc"), feature = "bt"))] (0, 0));
-                    c.pace.add(EP_ENUM, enum_t0);
+                    c.pace.add(EP_ENUM, enum_t0); #[cfg(all(feature = "lidsleep", feature = "wc"))] c.arm_hub_status_eps(); // EHCIHUBDISC (B801): AFTER the root port's whole walk, so every HID endpoint holds its pool slot before any hub status endpoint takes one (MTFIX). LINE-NEUTRAL fold, code first
                 }
             }
         }
@@ -20018,9 +20018,10 @@ pub mod suspend {
     //! on when the recovery ends. A controller keeps its ports up only when a live keyboard or a hub on its chain could not
     //! be armed (`why=wake-unarmed addr=<a>`, naming it): that keyboard stays the `input` waker it was.
     //!
-    //! EHCIHUBCHAIN (B794), the forget: this driver has no hub-disconnect handler (no hot-plug rescan, `next_addr`
-    //! never handed back, a hub carries no `IntEp`); a dead interrupt endpoint is the only "gone" signal it has. So a
-    //! recorded hub that no live endpoint's chain reaches is forgotten at the arming pass ([`forget_hubs`]).
+    //! EHCIHUBDISC (B801), the forget: a hub's status-change endpoint is an `IntEp` (`super::hubchange`), and a
+    //! disconnect on a hub port retires the port's subtree there and forgets the hubs in it ([`forget_hubs`], the one
+    //! forget). The arming pass no longer sweeps the record (EHCIHUBCHAIN B794's interim answer to having no
+    //! disconnect handler).
     use super::qh::QTD_HALTED;
     use super::{
         mmio_read32, mmio_write32, read_config_32, Controller, Target, EHCI_HID, OP_PORTSC0, OP_USBSTS, PORT_CCS,
@@ -20103,7 +20104,7 @@ pub mod suspend {
     /// EHCIHUBCHAIN (B794): the hubs from a device's parent up to the root, nearest first, through the recorded
     /// hubs' own `parent`. `Some(a)` = hub `a` on the way up is not recorded (the walk stops there). Bounded: a
     /// controller records at most `HUBS_PER` hubs, so a longer walk is a broken record, not a chain.
-    fn hub_chain(hubs: &[Target], parent: u8) -> (Vec<u8>, Option<u8>) {
+    pub(super) fn hub_chain(hubs: &[Target], parent: u8) -> (Vec<u8>, Option<u8>) {
         let (mut chain, mut at) = (Vec::new(), parent);
         while at != 0 && chain.len() <= HUBS_PER {
             let Some(h) = hubs.iter().find(|h| h.addr == at) else { return (chain, Some(at)) };
@@ -20113,20 +20114,29 @@ pub mod suspend {
         (chain, None)
     }
 
-    /// EHCIHUBCHAIN (B794), A3: forget every recorded hub of controller `idx` that is not in `reached` (no live
-    /// endpoint's chain passes through it — its devices are gone, as far as this driver can know).
-    fn forget_hubs(idx: usize, reached: &[u8]) {
+    /// EHCIHUBDISC (B801): forget every recorded hub of controller `idx` whose address is in `gone` — the subtree a
+    /// hub-port disconnect retired (`hubchange::disconnect_hub_port`, the one caller).
+    pub(super) fn forget_hubs(idx: usize, gone: &[u8]) {
         if idx >= CTRLS { return; }
         let mut g = HUBS.lock();
         for slot in g[idx].iter_mut() {
             if let Some(h) = *slot {
-                if !reached.contains(&h.addr) {
+                if gone.contains(&h.addr) {
                     *slot = None;
-                    serial_println!("[usb] ehci={} addr={} kind=hub forgotten why=no-live-device", idx, h.addr);
+                    serial_println!("[usb] ehci={} addr={} kind=hub forgotten why=hub-port-disconnect", idx, h.addr);
                 }
             }
         }
     }
+
+    /// EHCIHUBDISC (B801): a snapshot of controller `idx`'s recorded hubs (the lock is released on return).
+    pub(super) fn hubs_of(idx: usize) -> Vec<Target> {
+        if idx >= CTRLS { return Vec::new(); }
+        HUBS.lock()[idx].iter().flatten().copied().collect()
+    }
+
+    /// EHCIHUBDISC (B801): controller `idx` is UP (not suspending, suspended or resuming) — hub changes wait otherwise.
+    pub(super) fn is_up(idx: usize) -> bool { idx >= CTRLS || PHASE[idx].load(Ordering::Acquire) == UP }
 
     /// `tests usbsuspend`: a keyboard report after the resume — HID GET_REPORT(Input) over EP0 (HID 1.11 §7.2.1) to the
     /// first live EHCI keyboard, and whether its interrupt QH is still un-halted. `None` = `EHCI_HID` busy;
@@ -20242,19 +20252,16 @@ pub mod suspend {
         /// endpoints carry) and — EHCIHUBCHAIN (B794) — on each hub of each live keyboard's chain ([`hub_chain`]),
         /// once, every hub on it and none off it. Returns (targets armed, the first keyboard or chain hub left
         /// unarmed). Nothing is asked of a controller with no live interrupt endpoint (nothing on it is a waker).
-        /// First the A3 forget: a recorded hub no live endpoint's chain reaches leaves the record ([`forget_hubs`]).
+        /// A hub's own status-change endpoint is not a device here (EHCIHUBDISC B801).
         fn arm_remote_wake(&mut self) -> (u32, Option<u8>) {
             let mut devs: Vec<(Target, bool)> = Vec::new();
-            for e in self.int_eps.iter().filter(|e| !e.dead) {
+            for e in self.int_eps.iter().filter(|e| !e.dead && e.hub.is_none()) {
                 match devs.iter_mut().find(|(t, _)| t.addr == e.target.addr) {
                     Some(d) => d.1 |= e.is_kbd,
                     None => devs.push((e.target, e.is_kbd)),
                 }
             }
-            let mut hubs: Vec<Target> = if self.idx < CTRLS { HUBS.lock()[self.idx].iter().flatten().copied().collect() } else { Vec::new() };
-            let reached: Vec<u8> = devs.iter().flat_map(|(t, _)| hub_chain(&hubs, t.parent.0).0).collect();
-            forget_hubs(self.idx, &reached);
-            hubs.retain(|h| reached.contains(&h.addr));
+            let hubs: Vec<Target> = hubs_of(self.idx);
             if devs.is_empty() { return (0, None); }
             let (mut armed, mut unarmed) = (0u32, None);
             for &(t, kbd) in &devs {
@@ -20366,5 +20373,284 @@ pub mod suspend {
             }
             PHASE[i].store(UP, Ordering::Release);
         }
+    }
+}
+
+/// EHCIHUBDISC (rmbp-ledger B801, BP-input-21): every EHCI hub's status-change endpoint, armed, serviced and
+/// disconnected — xHCI XENUM-2's mechanism (`configure_hub_interrupt_ep`, the pending changes,
+/// `service_hub_changes` -> `service_one_hub_change`, `disconnect_hub_port`) in this driver's vocabulary.
+#[cfg(all(feature = "lidsleep", feature = "wc"))]
+pub mod hubchange {
+    //! CHARTER: Kernel — driver (EHCI hub status-change endpoints: arm, service, disconnect; under `EHCI_HID`).
+    //!
+    //! ARM: a hub's status-change endpoint (USB 2.0 §11.12.4: interrupt IN, a bitmap — bit 0 the hub, bit n port n)
+    //! is ONE `IntEp`, armed by the existing `arm_interrupt_ep` (same QH, qTD, ISR registry, `isr_rearm` and toggle as
+    //! a keyboard) with `IntEp::hub` set. [`Controller::arm_hub_status_eps`] arms every hub `suspend::note_hub`
+    //! recorded, AFTER the root port's whole walk, so every HID endpoint holds its slot of the fixed `MAX_INT_EPS`
+    //! pool first (MTFIX); a hub that finds the pool full is named `-> pool-full` and has no hot-plug.
+    //! CAPTURE: `service` hands every report to [`note`], which ORs the port bits into `HubEp::pending`; the report
+    //! then falls through the HID decode arms (no kind) to the one re-arm.
+    //! SERVICE: after the walk, [`Controller::service_hub_changes`] takes ONE pending port per pass (enumeration is
+    //! synchronous under `EHCI_HID`; the ISR keeps filling the hand-off rings meanwhile, BP-input-11), only while the
+    //! controller is UP. GET_PORT_STATUS; on C_PORT_CONNECTION the port's subtree is retired first
+    //! ([`Controller::disconnect_hub_port`]: `e.dead`, held keys released, `suspend::forget_hubs` — the one forget),
+    //! then with CCS the boot walk's own per-port body re-walks that port (`bring_up_hub(.., only = port)`); every
+    //! set change bit is acked last so the endpoint quiesces.
+    use super::{flush_held_releases, int_ep_kind, suspend, Controller, IntEp, Target, EHCI_HID};
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// A hub status-change endpoint's state, carried on its `IntEp` (`IntEp::hub`).
+    #[derive(Clone, Copy)]
+    pub struct HubEp {
+        /// bNbrPorts (at most 15, `bring_up_hub`'s clamp).
+        pub ports: u8,
+        /// The hub's own enumeration depth (`bring_up_hub`'s `depth`; the root hub is 0).
+        pub depth: u8,
+        /// Ports the hub reported changed and not yet serviced (bit n = port n).
+        pub pending: u16,
+    }
+
+    /// Changes serviced per `service` pass (xHCI's is 8 per wake; EHCI enumerates synchronously under `EHCI_HID`).
+    const HUB_CHANGE_BUDGET: usize = 1;
+
+    static CHANGES: AtomicU32 = AtomicU32::new(0);
+    static CONNECTS: AtomicU32 = AtomicU32::new(0);
+    static DISCONNECTS: AtomicU32 = AtomicU32::new(0);
+    static RETIRED: AtomicU32 = AtomicU32::new(0);
+
+    /// The status-change bitmap's port bits 1..=`ports` (bits past the hub's ports ignored), and bit 0 (hub-local).
+    pub(super) fn change_ports(bitmap: &[u8], ports: u8) -> (u16, bool) {
+        let mut m = 0u16;
+        for p in 1..=ports.min(15) as usize {
+            if bitmap.get(p / 8).is_some_and(|b| b & (1 << (p % 8)) != 0) {
+                m |= 1 << p;
+            }
+        }
+        (m, bitmap.first().is_some_and(|b| b & 1 != 0))
+    }
+
+    /// `service`'s capture: OR a hub endpoint's report into its pending ports (a no-op on a HID endpoint).
+    pub(super) fn note(e: &mut IntEp, report: &[u8], idx: usize) {
+        let Some(h) = e.hub.as_mut() else { return };
+        let (m, local) = change_ports(report, h.ports);
+        h.pending |= m;
+        if local {
+            serial_println!("[usb] ehci={} addr={} kind=hub change=hub-local", idx, e.target.addr);
+        }
+    }
+
+    /// The addresses on or below hub `hub`'s downstream `port`: a node whose parent is (hub, port), closed over a
+    /// node whose parent hub is already in the set (a nested hub's subtree goes with it). Bounded: one round per node.
+    pub(super) fn below(nodes: &[(u8, (u8, u8))], hub: u8, port: u8) -> Vec<u8> {
+        let mut set: Vec<u8> = Vec::new();
+        for _ in 0..=nodes.len() {
+            let mut grew = false;
+            for &(a, (ph, pp)) in nodes {
+                if a == 0 || a == hub || set.contains(&a) {
+                    continue;
+                }
+                if (ph == hub && pp == port) || (ph != 0 && set.contains(&ph)) {
+                    set.push(a);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        set
+    }
+
+    /// USB 2.0 §11.24.2.7.2: the ClearPortFeature selector for wPortChange bit `bit` (C_PORT_CONNECTION 16 ..
+    /// C_PORT_RESET 20); other bits are reserved. The USB 2.0 half of xHCI's `hub_port_change_feature_selector`.
+    fn hub_change_selector(bit: u16) -> Option<u16> {
+        (bit <= 4).then_some(16 + bit)
+    }
+
+    /// The first interrupt-IN endpoint descriptor of a hub's configuration: (endpoint number, wMaxPacketSize).
+    fn parse_hub_int_ep(cfg: &[u8]) -> Option<(u8, u16)> {
+        let mut off = 0usize;
+        while off + 2 <= cfg.len() {
+            let len = cfg[off] as usize;
+            if len == 0 {
+                break;
+            }
+            if cfg[off + 1] == 0x05 && off + 7 <= cfg.len() && cfg[off + 2] & 0x80 != 0 && cfg[off + 3] & 0x3 == 3 {
+                return Some((cfg[off + 2] & 0xF, ((cfg[off + 4] as u16) | ((cfg[off + 5] as u16) << 8)) & 0x7FF));
+            }
+            off += len;
+        }
+        None
+    }
+
+    impl Controller {
+        /// Arm the status-change endpoint of every recorded hub of this controller that has no hub `IntEp` yet (a
+        /// retired one is not re-armed: its pool slot is spent). Called after a root port's walk and after a connect.
+        pub(super) unsafe fn arm_hub_status_eps(&mut self) {
+            let hubs: Vec<Target> = suspend::hubs_of(self.idx);
+            for h in hubs.iter() {
+                if self.int_eps.iter().any(|e| e.hub.is_some() && e.target.addr == h.addr) {
+                    continue;
+                }
+                let depth = suspend::hub_chain(&hubs, h.parent.0).0.len() as u8;
+                self.configure_hub_interrupt_ep(h, depth);
+            }
+        }
+
+        /// One hub: its configuration's interrupt-IN endpoint and bNbrPorts, then `arm_interrupt_ep`.
+        /// `[usb] ehci=<i> addr=<h> kind=hub status_ep=IN<n> mps=<m> ports=<p> -> armed|no-endpoint|pool-full`.
+        unsafe fn configure_hub_interrupt_ep(&mut self, hub: &Target, depth: u8) -> bool {
+            let idx = self.idx;
+            let total = match self.control(hub, 0x80, 6, 0x0200, 0, 9, true) {
+                Ok(n) if n >= 4 => ((*self.data_buf.add(2) as u16) | ((*self.data_buf.add(3) as u16) << 8)).min(64),
+                _ => 0,
+            };
+            let found = if total >= 9 {
+                match self.control(hub, 0x80, 6, 0x0200, 0, total, true) {
+                    Ok(n) => parse_hub_int_ep(core::slice::from_raw_parts(self.data_buf, (n as usize).min(total as usize))),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let ports = match self.control(hub, 0xA0, 6, 0x2900, 0, 9, true) {
+                Ok(n) if n >= 3 => (*self.data_buf.add(2)).min(15),
+                _ => 0,
+            };
+            let Some((ep, mps)) = found.filter(|_| ports > 0) else {
+                serial_println!("[usb] ehci={} addr={} kind=hub status_ep=none ports={} -> no-endpoint", idx, hub.addr, ports);
+                return false;
+            };
+            if !self.arm_interrupt_ep(hub, ep, mps, false, false, None, 0) {
+                serial_println!("[usb] ehci={} addr={} kind=hub status_ep=IN{} mps={} ports={} -> pool-full", idx, hub.addr, ep, mps, ports);
+                return false;
+            }
+            if let Some(e) = self.int_eps.last_mut() {
+                e.hub = Some(HubEp { ports, depth, pending: 0 });
+            }
+            serial_println!("[usb] ehci={} addr={} kind=hub status_ep=IN{} mps={} ports={} -> armed", idx, hub.addr, ep, mps, ports);
+            true
+        }
+
+        /// `service`'s post-walk step: at most `HUB_CHANGE_BUDGET` pending hub ports, lowest first, while UP.
+        pub(super) unsafe fn service_hub_changes(&mut self) {
+            if !suspend::is_up(self.idx) {
+                return;
+            }
+            for _ in 0..HUB_CHANGE_BUDGET {
+                let next = self.int_eps.iter().enumerate().find_map(|(i, e)| {
+                    let h = e.hub?;
+                    if e.dead || h.pending == 0 { None } else { Some((i, h.pending.trailing_zeros() as u8)) }
+                });
+                let Some((ep_i, port)) = next else { return };
+                if let Some(h) = self.int_eps[ep_i].hub.as_mut() {
+                    h.pending &= !(1u16 << port);
+                }
+                self.service_one_hub_change(ep_i, port);
+            }
+        }
+
+        /// One downstream-port change on the hub whose status endpoint is `int_eps[ep_i]`.
+        unsafe fn service_one_hub_change(&mut self, ep_i: usize, port: u8) {
+            let (hub, h) = {
+                let e = &self.int_eps[ep_i];
+                let Some(h) = e.hub else { return };
+                (e.target, h)
+            };
+            let Ok(4) = self.control(&hub, 0xA3, 0, 0, port as u16, 4, true) else {
+                // Nothing acked: the hub keeps the change latched and reports the port again.
+                serial_println!("[usb] ehci={} hub={} port={} change get_port_status=failed", self.idx, hub.addr, port);
+                return;
+            };
+            let st = (*self.data_buf as u16) | ((*self.data_buf.add(1) as u16) << 8);
+            let chg = (*self.data_buf.add(2) as u16) | ((*self.data_buf.add(3) as u16) << 8);
+            CHANGES.fetch_add(1, Ordering::Relaxed);
+            serial_println!("[usb] ehci={} hub={} port={} change status={:#06x} change={:#06x}", self.idx, hub.addr, port, st, chg);
+            if chg & 1 != 0 {
+                // Disconnect, or a coalesced re-plug: whatever this port carried is gone either way.
+                self.disconnect_hub_port(hub.addr, port);
+                if st & 1 != 0 {
+                    CONNECTS.fetch_add(1, Ordering::Relaxed);
+                    self.bring_up_hub(&hub, h.depth, port as u16);
+                    self.arm_hub_status_eps();
+                } else {
+                    DISCONNECTS.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            for bit in 0..16u16 {
+                if chg & (1 << bit) != 0 {
+                    if let Some(sel) = hub_change_selector(bit) {
+                        let _ = self.control(&hub, 0x23, 1, sel, port as u16, 0, false);
+                    }
+                }
+            }
+        }
+
+        /// Retire every device record on or below hub `hub`'s `port`: each live `IntEp` there goes `dead` with its
+        /// held keys released (`flush_held_releases`), and every recorded hub there is forgotten
+        /// (`suspend::forget_hubs`). The QH stays linked, as on every retire; the gone address halts it.
+        pub(super) unsafe fn disconnect_hub_port(&mut self, hub: u8, port: u8) -> u32 {
+            let idx = self.idx;
+            let mut nodes: Vec<(u8, (u8, u8))> =
+                self.int_eps.iter().filter(|e| !e.dead).map(|e| (e.target.addr, e.target.parent)).collect();
+            nodes.extend(suspend::hubs_of(idx).iter().map(|t| (t.addr, t.parent)));
+            let gone = below(&nodes, hub, port);
+            if gone.is_empty() {
+                return 0;
+            }
+            let mut n = 0u32;
+            for e in self.int_eps.iter_mut() {
+                if e.dead || !gone.contains(&e.target.addr) {
+                    continue;
+                }
+                e.dead = true;
+                let ep = (core::ptr::read_volatile(&(*e.qh).ep_chars) >> 8) & 0xF;
+                serial_println!(
+                    "[usb] ehci={} addr={} ep=IN{} kind={} retired why=hub-port-disconnect hub={} port={}",
+                    idx, e.target.addr, ep, int_ep_kind(e), hub, port
+                );
+                flush_held_releases(e, idx);
+                n += 1;
+            }
+            RETIRED.fetch_add(n, Ordering::Relaxed);
+            suspend::forget_hubs(idx, &gone);
+            n
+        }
+    }
+
+    /// `tests ehci`: the pure halves on synthetic input (every image), then the live census.
+    /// `:: EHCIHUB: hubs= armed= hub_change= connects= disconnects= retired= decode= subtree= -> PASS|SKIP(no-hub)|FAIL ::`
+    pub fn selftest() {
+        // Ports 1 and 3 of 4 with bit 0 (hub-local); then bit 5 past a 4-port hub, ignored.
+        let decode = change_ports(&[0b0000_1011], 4) == ((1 << 1) | (1 << 3), true)
+            && change_ports(&[0b0010_0100, 0xFF], 4) == (1 << 2, false);
+        // root hub 1; hub 3 on 1.1; kbd 6 on 3.2; hub 5 on 3.1; radio 7 on 5.1; camera 2 on 1.2.
+        let nodes = [(1, (0, 0)), (3, (1, 1)), (6, (3, 2)), (5, (3, 1)), (7, (5, 1)), (2, (1, 2))];
+        let sorted = |mut v: Vec<u8>| { v.sort_unstable(); v };
+        let subtree = sorted(below(&nodes, 3, 1)) == [5, 7] && sorted(below(&nodes, 1, 1)) == [3, 5, 6, 7]
+            && below(&nodes, 5, 2).is_empty();
+        let (mut hubs, mut armed) = (0usize, 0usize);
+        if let Some(ctrls) = EHCI_HID.lock().as_ref() {
+            for c in ctrls.iter() {
+                hubs += suspend::hubs_of(c.idx).len();
+                armed += c.int_eps.iter().filter(|e| e.hub.is_some() && !e.dead).count();
+            }
+        }
+        let g = |c: &AtomicU32| c.load(Ordering::Relaxed);
+        let verdict = if !(decode && subtree) {
+            "FAIL"
+        } else if hubs == 0 {
+            "SKIP(no-hub)"
+        } else if armed > 0 {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        let ok = |b: bool| if b { "ok" } else { "FAIL" };
+        serial_println!(
+            ":: EHCIHUB: hubs={} armed={} hub_change={} connects={} disconnects={} retired={} decode={} subtree={} -> {} ::",
+            hubs, armed, g(&CHANGES), g(&CONNECTS), g(&DISCONNECTS), g(&RETIRED), ok(decode), ok(subtree), verdict
+        );
     }
 }
