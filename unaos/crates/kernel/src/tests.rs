@@ -5554,7 +5554,7 @@ fn settingsmap_selftest() {
         NS, k, changed, arrived.map_or(alloc::string::String::from("na"), |a| format!("{}", a)),
         if wrote.is_ok() { "ok" } else { "refused" }, if ok { "PASS" } else { "FAIL" }, if ok { "ok" } else { "bad" }
     );
-    settingsmap_switch_leg(); // SESSIONGENPOLL (B782): the switch leg (file tail)
+    settingsmap_switch_leg(); settingsmap_ring_leg(); // SESSIONGENPOLL (B782): the switch leg (file tail). SUBSCRIBEKEEP (B796): the ring leg (file tail)
 }
 
 // SESSIONGENPOLL (rmbp-ledger B782) — TAIL-APPENDED: `tests settingsmap`'s switch leg. Settings, the lock, the clock and the
@@ -5884,4 +5884,69 @@ fn scrollpanes_legs() -> (alloc::string::String, bool) {
         alloc::format!("tree={} icons={} columns={} tabs={} types={} overlay={}", word(&tree), word(&icons), word(&columns), word(&tabs), word(&types), word(&overlay)),
         all.iter().all(|r| r.is_ok()),
     )
+}
+
+// SUBSCRIBEKEEP (rmbp-ledger B796, BP-security-18) — TAIL-APPENDED: `tests settingsmap`'s ring leg. The last-changed ring is
+// `prefs_client`'s own (on at its first reader, sticky), so a session switch reaches the look and the locale with NO kernel
+// subscriber at all. The leg holds every subscriber off (`prefs_client::subscriber_hold`: the lock's, Settings' and this
+// fixture's `subscribe()` are no-ops), runs one settle pass of the consumers, and reads `on=` BEFORE the fixture touches the
+// ring (a consumer, not the fixture, switched it on). The switch is `prefs::reload_session` against a COPY of the tree with
+// `system.look` and `system.locale.first_day` flipped (the store is never written: nothing to put back, no glass switch), so
+// exactly those two keys' PrefChanged are posted (`changed=2`). `look=` / `locale=` are the ring's answer for each consumer's
+// own keys (`changed_since` from the fixture's mark); with a user session open the consumers' own passes run and their bus
+// GETs are counted (look >= 1, locale >= 3 — the re-read the switch caused); no session -> `na` (both read nothing without
+// one). The re-read is counted by its GETs and not by its `via=` word: a switch's re-read prints `via=bus` (look.rs:118,
+// locale.rs:405); `via=login` is only each consumer's first-ever read (`SEEN_CHANGES == u32::MAX`). `queued=0`: with the
+// subscribers held, the Settings queue took no frame (`CHANGED_N` did not move).
+// `:: SETTINGSMAP: ring leg subscriber=held changed=<n> queued=<n> on=<0|1> look=<hit|miss> locale=<hit|miss> look_gets=<n|na> locale_gets=<n|na> -> PASS|FAIL :: ring=<owned|lost> ::`
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn settingsmap_ring_leg() {
+    use crate::prefs::{key, PrefValue, NS};
+    use crate::prefs_client as pc;
+    use prefs_core::appearance as ap;
+    fn settle() {
+        let _ = crate::video::settings::bus_changes();
+        crate::video::look::service();
+        let _ = crate::clock::locale::service();
+        #[cfg(feature = "login")]
+        let _ = crate::video::lock::prefs_pass();
+    }
+    let mut wb = [0u8; crate::prefs::WHO_BUF];
+    let session = crate::prefs::user_name_in(&mut wb).is_some();
+    let _ = pc::subscriber_hold(true);
+    settle(); // every earlier change behind each consumer's mark
+    let on = pc::ring_on(); // read before the fixture's own ring read below
+    let m0 = pc::changed_mark();
+    let q0 = pc::CHANGED_N.load(Ordering::Acquire);
+    let mut old = crate::prefs::snapshot();
+    let lv = if old.get(NS, ap::LOOK_KEY).and_then(|v| v.as_str()) == Some(ap::LOOKS[1]) { ap::LOOKS[0] } else { ap::LOOKS[1] };
+    let fv = if old.get(NS, key::LOCALE_FIRST_DAY).and_then(|v| v.as_str()) == Some("sun") { "sat" } else { "sun" };
+    let staged = old.set(NS, ap::LOOK_KEY, PrefValue::Str(alloc::string::String::from(lv))).is_ok()
+        && old.set(NS, key::LOCALE_FIRST_DAY, PrefValue::Str(alloc::string::String::from(fv))).is_ok();
+    let changed = if staged { crate::prefs::reload_session(&old) } else { 0 };
+    let (_, look_hit) = pc::changed_since(m0, |ns, k| ns == NS && k == ap::LOOK_KEY);
+    let (_, locale_hit) = pc::changed_since(m0, |ns, k| ns == NS && k.starts_with("locale."));
+    let (look_gets, locale_gets) = if session {
+        let g0 = pc::gets_total();
+        crate::video::look::service();
+        let g1 = pc::gets_total();
+        let _ = crate::clock::locale::service();
+        let g2 = pc::gets_total();
+        (Some(g1.wrapping_sub(g0)), Some(g2.wrapping_sub(g1)))
+    } else {
+        (None, None)
+    };
+    #[cfg(feature = "login")]
+    let _ = crate::video::lock::prefs_pass();
+    let queued = pc::CHANGED_N.load(Ordering::Acquire).wrapping_sub(q0);
+    let _ = pc::subscriber_hold(false);
+    let need_on = cfg!(feature = "login") || session;
+    let ok = staged && changed == 2 && queued == 0 && look_hit && locale_hit && (on || !need_on)
+        && look_gets.map_or(true, |g| g >= 1) && locale_gets.map_or(true, |g| g >= 3);
+    let na = |g: Option<u32>| g.map_or(alloc::string::String::from("na"), |g| format!("{}", g));
+    serial_println!(
+        ":: SETTINGSMAP: ring leg subscriber=held changed={} queued={} on={} look={} locale={} look_gets={} locale_gets={} -> {} :: ring={} ::",
+        changed, queued, on as u8, if look_hit { "hit" } else { "miss" }, if locale_hit { "hit" } else { "miss" },
+        na(look_gets), na(locale_gets), if ok { "PASS" } else { "FAIL" }, if ok { "owned" } else { "lost" }
+    );
 }

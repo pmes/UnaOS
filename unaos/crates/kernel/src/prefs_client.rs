@@ -156,14 +156,14 @@ fn take_reply(corr: u32) -> Option<Box<[u8]>> {
 
 /// Register the kernel subscriber (the Settings window). Idempotent.
 pub fn subscribe() {
-    SUBSCRIBED.store(true, Ordering::Release);
+    #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] if ringkeep::held() { return; } SUBSCRIBED.store(true, Ordering::Release); // SUBSCRIBEKEEP (B796): a fixture's hold makes every subscribe a no-op (file tail)
 }
 
 /// PrefChanged: called by the store on every accepted write. Builds the verb-19 frame of record into the
 /// subscription queue (oldest dropped and counted when full). No subscriber = nothing queued. PREFSUNSET (SR169):
 /// `a = None` = the key left the store with no preference-level default: the frame carries the unset form.
 pub fn on_changed(ns: &str, k: &str, a: Option<&prefs_core::schema::Applied>) {
-    let kq = SUBSCRIBED.load(Ordering::Acquire); if !kq && R3_SUBS.load(Ordering::Acquire) == 0 { // PREFCHANGED (B558): a kernel OR a ring-3 subscriber
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] ringkeep::note(ns, k); let kq = SUBSCRIBED.load(Ordering::Acquire); if !kq && R3_SUBS.load(Ordering::Acquire) == 0 { // PREFCHANGED (B558): a kernel OR a ring-3 subscriber
         return;
     }
     // PREFSKERNEL (B345): the shared body — `<ns>.<key>` NUL `<literal>` [NUL `clamped=true`].
@@ -174,7 +174,7 @@ pub fn on_changed(ns: &str, k: &str, a: Option<&prefs_core::schema::Applied>) {
     let mut f = alloc::vec![0u8; BUS_HDR_LEN + body.len()];
     let n = crate::bus::build_reply(una_abi::BUS_VERB_PREF_CHANGED, 0, 0, kernel_reply_principal(), &body, &mut f);
     f.truncate(n);
-    let frame = f.into_boxed_slice(); r3_deliver(ns, k, &frame); if !kq { return; } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] note_changed(ns, k); // LOCKCHANGED (B758): the key beside CHANGED_N (file tail). PREFCHANGED (B558): the same frame of record into every subscribed ring-3 owner's mailbox (file tail). LINE-NEUTRAL append.
+    let frame = f.into_boxed_slice(); r3_deliver(ns, k, &frame); if !kq { return; } // LOCKCHANGED (B758): the key beside CHANGED_N is noted at this fn's head now, on the ring's own switch (SUBSCRIBEKEEP B796, file tail). PREFCHANGED (B558): the same frame of record into every subscribed ring-3 owner's mailbox (file tail). LINE-NEUTRAL append.
     locked(|| {
         let mut q = CHANGES.lock();
         if q.len() >= Q_CAP {
@@ -759,7 +759,7 @@ mod fx;
 // ══════════════ LOCKCHANGED (rmbp-ledger B758, BP-security-18) — the last-changed key — TAIL-APPENDED ══════════════
 // The kernel PrefChanged queue has ONE drainer (Settings' `bus_changes_inner`), so a second consumer (the lock) cannot
 // read the frames; it learned only that SOMETHING changed (`CHANGED_N`) and paid three bus GETs per change. `on_changed`
-// now also stamps the frame's `<ns>.<key>` into a small ring beside `CHANGED_N` (same moment, same `kq` gate), and a
+// now also stamps the frame's `<ns>.<key>` into a small ring beside `CHANGED_N` (same moment; on the ring's own switch since SUBSCRIBEKEEP B796, never `kq`), and a
 // consumer asks [`changed_since`] whether a change after its mark named a key it reads. A change the ring no longer
 // holds answers `true`: a lost key is a re-read, never a skipped change.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
@@ -807,14 +807,14 @@ mod lastkey {
 
     /// The change sequence now (a consumer's starting mark).
     pub fn changed_mark() -> u32 {
-        super::locked(|| RING.lock().seq)
+        super::ringkeep::register(); super::locked(|| RING.lock().seq) // SUBSCRIBEKEEP (B796): reading the ring registers its reader
     }
 
     /// Did any PrefChanged after `mark` name an address `hit(ns, key)` accepts? Returns the new mark (the sequence now)
     /// and the answer. More changes since `mark` than the ring holds, or an address too long for its slot, answer
     /// `true`. Same mark = no change = `false`.
     pub fn changed_since(mark: u32, hit: impl Fn(&str, &str) -> bool) -> (u32, bool) {
-        super::locked(|| {
+        super::ringkeep::register(); super::locked(|| { // SUBSCRIBEKEEP (B796): reading the ring registers its reader
             let r = RING.lock();
             let gap = r.seq.wrapping_sub(mark);
             if gap == 0 {
@@ -880,5 +880,81 @@ mod lastkey {
         let m = mark.load(Ordering::Acquire);
         let (n, h) = changed_since(m, hit);
         n != m && mark.compare_exchange(m, n, Ordering::AcqRel, Ordering::Acquire).is_ok() && h
+    }
+}
+
+// ══════════════ SUBSCRIBEKEEP (rmbp-ledger B796, BP-security-18) — the ring is the client's — TAIL-APPENDED ══════════════
+// CHARTER: Principia — fulfiller (the kernel bus client). The last-changed ring above moved only while a kernel subscriber
+// (`SUBSCRIBED`, the Settings queue's flag) was registered, so look and locale — which subscribe nowhere — read a ring
+// another consumer (the lock, Settings) had switched on. Now the ring is owned here: READING it is the registration
+// (`changed_mark` / `changed_since`, and `changed_take` through it, call [`ringkeep::register`]), so no reader can forget
+// it and none depends on another's subscribe. STICKY: the readers are boot-lifetime statics with no teardown (a count
+// would have no release door), and a logout is the very edge the ring carries (the reload's PrefChanged, PREFSRELOAD
+// B763) — an off at logout would drop it. Before the first read nothing is noted and nothing is owed: every reader's
+// first read is unconditional. `on_changed` notes the key at its head, before the subscriber gates; `SUBSCRIBED` now
+// gates only the Settings queue and `CHANGED_N`.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub use ringkeep::ring_on;
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+pub use ringkeep::subscriber_hold;
+
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+mod ringkeep {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// The ring is on (set by its first reader; never cleared).
+    static ON: AtomicBool = AtomicBool::new(false);
+
+    /// A reader's half: the first call turns the ring on and says so once.
+    pub(super) fn register() {
+        if !ON.load(Ordering::Acquire) && ON.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            let seq = super::changed_mark(); // ON is already set: no second line
+            serial_println!("[prefsbus] ring on owner=prefs_client mode=sticky seq={} (SUBSCRIBEKEEP B796)", seq);
+        }
+    }
+
+    /// `on_changed`'s half: an accepted write's `<ns>.<key>` enters the ring while it is on, whoever subscribed.
+    pub(super) fn note(ns: &str, k: &str) {
+        if ON.load(Ordering::Acquire) {
+            super::note_changed(ns, k);
+        }
+    }
+
+    /// Is the ring on (has any reader registered)? The `tests settingsmap` ring leg's `on=`.
+    pub fn ring_on() -> bool {
+        ON.load(Ordering::Acquire)
+    }
+
+    /// The fixture's hold: while set, [`super::subscribe`] is a no-op.
+    #[cfg(feature = "witness")]
+    static HOLD: AtomicBool = AtomicBool::new(false);
+    /// `SUBSCRIBED` as the hold found it (restored on release).
+    #[cfg(feature = "witness")]
+    static WAS: AtomicBool = AtomicBool::new(false);
+
+    /// TEST ONLY (`tests settingsmap`'s ring leg): `true` = hold — save and clear `SUBSCRIBED` and make every
+    /// `subscribe()` (the lock's, Settings', a fixture's) a no-op; `false` = release — put `SUBSCRIBED` back. Returns
+    /// `SUBSCRIBED` as the hold found it.
+    #[cfg(feature = "witness")]
+    pub fn subscriber_hold(hold: bool) -> bool {
+        if hold {
+            HOLD.store(true, Ordering::Release);
+            let was = super::SUBSCRIBED.swap(false, Ordering::AcqRel);
+            WAS.store(was, Ordering::Release);
+            was
+        } else {
+            let was = WAS.load(Ordering::Acquire);
+            HOLD.store(false, Ordering::Release);
+            if was {
+                super::SUBSCRIBED.store(true, Ordering::Release);
+            }
+            was
+        }
+    }
+
+    /// `subscribe()`'s half: a fixture holds the subscribers off.
+    #[cfg(feature = "witness")]
+    pub(super) fn held() -> bool {
+        HOLD.load(Ordering::Acquire)
     }
 }

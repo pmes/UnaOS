@@ -166,8 +166,8 @@ pub fn persist() {
 }
 
 /// LOCKPREFS (B748): the policy's half of a service pass. Re-reads the three keys over the bus when a PrefChanged
-/// landed since the last read (every accepted store write, whoever wrote it, while a kernel subscriber is registered —
-/// the lock registers itself on its first pass — and, SESSIONGENPOLL B782, every key a login or logout moved: the
+/// landed since the last read (every accepted store write, whoever wrote it, once the ring is on —
+/// its first `changed_since` registers it with the client's ring, SUBSCRIBEKEEP B796 — and, SESSIONGENPOLL B782, every key a login or logout moved: the
 /// reload's PrefChanged); otherwise a few atomic loads and out. While a Settings press is owed the press is newer than
 /// the store: nothing is read and the edge is kept for the pass after [`persist`]. The mark is taken BEFORE the read,
 /// so a write that lands mid-read moves it again and the next pass re-reads. LOCKCHANGED (B758): a change re-reads only
@@ -178,9 +178,9 @@ pub fn persist() {
 /// policy as it was, and one that moved any posts that key's PrefChanged (PREFSUNSET's unset form included).
 pub fn prefs_pass() -> bool {
     let primed = PRIMED.load(Ordering::Acquire);
-    if !primed {
-        crate::prefs_client::subscribe();
-    }
+    // SUBSCRIBEKEEP (B796): no subscribe here — the lock drains no PrefChanged queue; its read of the ring below
+    // (`prefs_client::changed_since`) is its registration, and the ring is the client's, on from its first reader
+    // and sticky (prefs_client.rs tail, `ringkeep`), so no other consumer's subscribe is owed to the lock or by it.
     if OWED.load(Ordering::Acquire) != 0 {
         return false;
     }
