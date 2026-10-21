@@ -2938,8 +2938,10 @@ fn hover_now() -> Hover {
 /// absolute report every HID tablet sends) over a tree row, a sidebar row and a toolbar button, run [`hover_poll`]
 /// after each, read the hovered state and the repaint count (exactly one per crossing; a second poll with the
 /// pointer still repaints nothing); then wheel every scrolling pane through [`wheel_scroll_view`] (tree, list,
-/// sidebar, the Icons grid) and count the panes that took the detent. The model's scroll and selection are put
-/// back, the pointer and the focus owner restored, a window this fixture opened closed.
+/// sidebar, the Icons grid on the live model; COLUMNSHOVER B806: the Columns view over a synthetic folder with
+/// children, [`probe_model`]'s 200 rows in `/`, the plan [Focus, Preview] read from no listing) and count the panes
+/// that took the detent. The model's scroll and selection are put back, the pointer and the focus owner restored, a
+/// window this fixture opened closed.
 ///
 /// `:: QUARRYHOVER: rows=ok sidebar=ok toolbar=ok repaints=<n> wheel_panes=<n> -> PASS ::`
 pub fn hover_selftest() {
@@ -3019,11 +3021,28 @@ pub fn hover_selftest() {
         ];
         let mut n = 0usize;
         let mut names: Vec<String> = Vec::new();
-        for (name, (sx, sy), v) in legs.iter() {
-            match wheel_scroll_view(m, *sx, *sy, -1, *v) {
-                Some(h) if h.pane == *name => { n += 1; names.push(alloc::format!("{}:{}/{}{}", h.pane, h.scroll, h.max, if h.moved { "" } else { "=" })); }
-                Some(h) => names.push(alloc::format!("{}->{}", name, h.pane)),
-                None => names.push(alloc::format!("{}:none", name)),
+        // One leg: a detent over `(sx, sy)` with the list pane's view `v`, counted when the pane named took it.
+        let mut leg = |m: &mut Model, name: &str, (sx, sy): (usize, usize), v: toolbar::View| match wheel_scroll_view(m, sx, sy, -1, v) {
+            Some(h) if h.pane == name => { n += 1; names.push(alloc::format!("{}:{}/{}{}", h.pane, h.scroll, h.max, if h.moved { "" } else { "=" })); }
+            Some(h) => names.push(alloc::format!("{}->{}", name, h.pane)),
+            None => names.push(alloc::format!("{}:none", name)),
+        };
+        for (name, pt, v) in legs.iter() {
+            leg(m, *name, *pt, *v);
+        }
+        // COLUMNSHOVER (B806): the Columns leg over `tests scrollview`'s synthetic folder (200 files in `/`: no
+        // ancestor, the selection a file, so the plan reads no listing; the cache only under the mark), the point
+        // the focus column's row 1 (the column sits at the list pane's left edge, `millercols::lay`).
+        {
+            let _paint = columns::PaintMark::new();
+            match probe_model(200, false, "/") {
+                Some(mut pm) => {
+                    let pg = pm.geom;
+                    let pli = pg.list_pane().inner();
+                    let pt = (pli.x + millercols::col_w(&pg).min(pli.w) / 2, pli.y + pg.row_h() + pg.row_h() / 2);
+                    leg(&mut pm, "columns", pt, toolbar::View::Columns);
+                }
+                None => names.push(String::from("columns:no-geometry")),
             }
         }
         m.tree_scroll = saved.0;
@@ -3043,7 +3062,7 @@ pub fn hover_selftest() {
         repaint();
     }
     wm::focus_changed(saved_focus);
-    let ok = rows_ok && side_ok && tool_ok && wheel_panes == 4;
+    let ok = rows_ok && side_ok && tool_ok && wheel_panes == 5;
     let w = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!("[quarryhover] seen tree={:?} sidebar={:?} toolbar={:?} paints={},{},{},{} idle_repaint={} wheel={}", h1, h2, h3, p0, p1, p2, p3, p1b - p1, wheel_hits);
     serial_println!(
