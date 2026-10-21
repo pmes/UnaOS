@@ -5314,7 +5314,7 @@ fn usbsuspend_selftest() {
     xs::request(false); #[cfg(feature = "ehcihid")] es::request(false);
     let up = wait(2_000, &|| xs::up() && e_up());
     let held_word = usbsuspend_held_collect(held);
-    let r = xs::census();
+    let r = xs::census(); let (ep0_word, ep0_refused, ep0_replayed) = usbsuspend_held_ep0_leg(up && held_word != "none", &wait); // HELDSLOTEP0 (B804): the second, xHCI-only cycle (file-tail fn), after this cycle's census; LINE-NEUTRAL fold, code first
     let mut probe = None;
     let t0 = crate::arch::ms();
     while probe.is_none() && crate::arch::ms().wrapping_sub(t0) < 1_000 {
@@ -5330,7 +5330,7 @@ fn usbsuspend_selftest() {
     let verdict = if !in_u3 || !up {
         "FAIL reason=phase-timeout"
     } else if c.pls3 != c.suspended || r.resumed < c.suspended || e.resumed < e.suspended || r.ep_running < r.ep_stopped { "FAIL"
-    } else if kbd != "none" { if kbd != "ok" || c.suspended == 0 || held_word != "ok" { "FAIL" } else { "PASS" }
+    } else if kbd != "none" { if kbd != "ok" || c.suspended == 0 || held_word != "ok" || ep0_word != "ok" { "FAIL" } else { "PASS" }
     } else if e_kbd == "none" {
         "SKIP reason=no-kbd"
     } else if e_kbd != "ok" || e.ports == 0 || e.suspended != e.ports {
@@ -5340,8 +5340,8 @@ fn usbsuspend_selftest() {
     };
     let (kbd_on, kbd_word) = if kbd != "none" { ("xhci", kbd) } else { ("ehci", e_kbd) };
     serial_println!(
-        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={}",
-        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings
+        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={} held_ep0_refused={} replayed={}",
+        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings, ep0_refused, ep0_replayed
     );
 }
 
@@ -6071,4 +6071,47 @@ fn settingsmap_ring_leg() {
         changed, queued, on as u8, if look_hit { "hit" } else { "miss" }, if locale_hit { "hit" } else { "miss" },
         na(look_gets), na(locale_gets), if ok { "PASS" } else { "FAIL" }, if ok { "owned" } else { "lost" }
     );
+}
+
+// ══════════════ HELDSLOTEP0 (rmbp-ledger B804) — `tests usbsuspend`'s held-EP0 leg — TAIL-APPENDED ══════════════
+
+/// HELDSLOTEP0 (B804, BP-power-7): a SECOND, xHCI-only suspend cycle (in the first, the LED push replayed in the restart pass
+/// would replace the parked GET_REPORT, so the legs do not share a cycle). While SUSPENDED the held keyboard's lock-LED
+/// bitmap is marked owed (`held_leds_probe`); `service_hid_leds`' SET_REPORT is refused by `ep0_control`'s one check and
+/// owed; after the resume `endpoints_restart` replays it. `(word, refused, replayed)`: `ok` iff refused >= 1 and
+/// replayed >= 1; `phase` (a phase timed out), `none` (no held xHCI keyboard), `busy` (no claim), else `fail`.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_held_ep0_leg(run: bool, wait: &dyn Fn(u64, &dyn Fn() -> bool) -> bool) -> (&'static str, u32, u32) {
+    use crate::drivers::xhci::{self, suspend as xs};
+    if !run {
+        return ("phase", 0, 0);
+    }
+    xs::request(true);
+    if !wait(2_000, &|| xs::suspended()) {
+        xs::request(false);
+        let _ = wait(2_000, &|| xs::up());
+        return ("phase", 0, 0);
+    }
+    let t0 = crate::arch::ms();
+    let marked = loop {
+        match xhci::claim() {
+            Ok(mut x) => break Some(x.held_leds_probe()),
+            Err(_) if crate::arch::ms().wrapping_sub(t0) < 1_000 => crate::arch::sched::sleep_ms(5),
+            Err(_) => break None,
+        }
+    };
+    if marked == Some(true) {
+        let _ = wait(500, &|| xs::census().held_ep0_refused >= 1);
+    }
+    xs::request(false);
+    let up = wait(2_000, &|| xs::up());
+    let c = xs::census();
+    let word = match marked {
+        None => "busy",
+        Some(false) => "none",
+        Some(true) if !up => "phase",
+        Some(true) if c.held_ep0_refused >= 1 && c.replayed >= 1 => "ok",
+        Some(true) => "fail",
+    };
+    (word, c.held_ep0_refused, c.replayed)
 }

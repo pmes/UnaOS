@@ -13880,10 +13880,10 @@ impl XhciController {
     }
 
     /// Synchronous EP0 control transfer, for hub-class requests in bring-up and other main-loop contexts (like the BOT pump):
-    /// the queue half `ep0_queue` then the wait half `ep0_wait` (SYNCCONTROLSPLIT B800). Returns the completion code (1 = success).
+    /// `ep0_control` (queue half `ep0_queue` + wait half `ep0_wait`, SYNCCONTROLSPLIT B800; the hold's one check, HELDSLOTEP0 B804) with its failure unnamed. Returns the completion code (1 = success).
     fn sync_control(&mut self, slot_id: u8, bm_req: u8, b_req: u8, w_value: u16, w_index: u16, w_length: u16, data_phys: u64, dir_in: bool) -> Result<u8, ()> {
-        self.ep0_queue(slot_id, bm_req, b_req, w_value, w_index, w_length, data_phys, dir_in)?;
-        self.ep0_wait(slot_id, w_length, data_phys, dir_in)
+        self.ep0_control(slot_id, bm_req, b_req, w_value, w_index, w_length, data_phys, dir_in)
+            .map_err(|_| ())
     }
 
     /// sync_control's queue half: Setup/[Data]/Status on the slot's EP0 ring, the transfer parked in the slot's own
@@ -13899,7 +13899,7 @@ impl XhciController {
         }
         // Setup stage. TRT: 0 = no data, 2 = OUT data, 3 = IN data.
         let trt: u32 = if w_length == 0 { 0 } else if dir_in { 3 } else { 2 };
-        self.push_ep0(slot_id, Trb { parameter: setup, status: 8, control: (2 << 10) | (1 << 6) | (trt << 16) });
+        if self.push_ep0(slot_id, Trb { parameter: setup, status: 8, control: (2 << 10) | (1 << 6) | (trt << 16) }) == 0 { return Err(()); } // HELDSLOTEP0 (B804) M2: Setup, Data and Status all on the ring BEFORE the park and the doorbell, so a held doorbell (`suspend::doorbell_held`) is remembered only for a whole TD
         // Data stage (if any). XENUM-3 M1: set IOC (bit 5) so the DATA stage posts its OWN transfer
         // event carrying the TRB Transfer Length residual — without it only the Status TRB (IOC)
         // reports, and the actual transferred length is invisible. The extra event is claimed and
@@ -13907,7 +13907,7 @@ impl XhciController {
         // drives completion. This lets the downstream enumerator reject a short (partial) read.
         let data_trb_phys = if w_length > 0 {
             let dir: u32 = if dir_in { 1 } else { 0 };
-            self.push_ep0(slot_id, Trb { parameter: data_phys, status: w_length as u32, control: (3 << 10) | (1 << 5) | (dir << 16) })
+            match self.push_ep0(slot_id, Trb { parameter: data_phys, status: w_length as u32, control: (3 << 10) | (1 << 5) | (dir << 16) }) { 0 => return Err(()), p => p }
         } else {
             0
         };
@@ -13916,7 +13916,7 @@ impl XhciController {
         let status_phys = {
             let ring = self.slots[slot_id as usize].ep0_ring.as_mut().ok_or(())?;
             let base = ring.get_ptr();
-            let idx = ring.push(Trb { parameter: 0, status: 0, control: (4 << 10) | (1 << 5) | (status_dir << 16) }).unwrap_or(0);
+            let idx = ring.push(Trb { parameter: 0, status: 0, control: (4 << 10) | (1 << 5) | (status_dir << 16) }).map_err(|_| ())?;
             base + (idx as u64) * 16
         };
 
@@ -14117,10 +14117,10 @@ impl XhciController {
     /// caller (a NAK/STALL/timeout here is expected on some devices and is harmless — the decoders
     /// still work, just without idle suppression).
     fn set_hid_idle(&mut self, slot: u8, intf: u8) {
-        match self.sync_control(slot, 0x21, 0x0A, 0x0000, intf as u16, 0, 0, false) {
+        match self.ep0_control(slot, 0x21, 0x0A, 0x0000, intf as u16, 0, 0, false) {
             Ok(1) => serial_println!("[hidkeys] set-idle ok slot={} iface={}", slot, intf),
             Ok(code) => serial_println!("[hidkeys] set-idle nak slot={} iface={} (code {})", slot, intf, code),
-            Err(()) => serial_println!("[hidkeys] set-idle nak slot={} iface={} (EP0 timeout)", slot, intf),
+            Err(Ep0Err::NoCompletion) => serial_println!("[hidkeys] set-idle nak slot={} iface={} (EP0 timeout)", slot, intf), #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] Err(Ep0Err::Held) => { suspend::owe(slot, suspend::OWE_SETPROTO); serial_println!("[hidkeys] set-idle held slot={} iface={} -> deferred", slot, intf) } // HELDSLOTEP0 (B804): refused on a held slot, owed to the resume (`endpoints_restart` puts the slot back on `hid_setproto_pending`)
         }
     }
 
@@ -14141,10 +14141,10 @@ impl XhciController {
         }
         unsafe { core::ptr::write(buf, leds); }
         let buf_phys = buf as u64;
-        match self.sync_control(slot, 0x21, 0x09, 0x0200, intf as u16, 1, buf_phys, false) {
+        match self.ep0_control(slot, 0x21, 0x09, 0x0200, intf as u16, 1, buf_phys, false) {
             Ok(1) => serial_println!("[hidled] caps={} set-report ok slot={}", caps, slot),
             Ok(code) => serial_println!("[hidled] caps={} set-report nak slot={} (code {})", caps, slot, code),
-            Err(()) => serial_println!("[hidled] caps={} set-report nak slot={} (EP0 timeout)", caps, slot),
+            Err(Ep0Err::NoCompletion) => serial_println!("[hidled] caps={} set-report nak slot={} (EP0 timeout)", caps, slot), #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] Err(Ep0Err::Held) => { suspend::owe(slot, suspend::OWE_LEDS); serial_println!("[hidled] caps={} set-report held slot={} -> deferred", caps, slot) } // HELDSLOTEP0 (B804): refused on a held slot, owed to the resume (`endpoints_restart` sets `keyboard_leds_dirty` again, HIDLEDDEFER pushes it)
         }
     }
 
@@ -14153,7 +14153,7 @@ impl XhciController {
     /// interface number, no data stage. Returns true on success (completion code 1); a STALL/other
     /// code or an EP0 pump timeout returns false (the caller stops touching this device's EP0).
     fn set_hid_boot_protocol(&mut self, slot: u8, intf: u8, what: &str) -> bool {
-        match self.sync_control(slot, 0x21, 0x0B, 0x0000, intf as u16, 0, 0, false) {
+        match self.ep0_control(slot, 0x21, 0x0B, 0x0000, intf as u16, 0, 0, false) {
             Ok(1) => {
                 crate::bootlog_println!("xHCI: SET_PROTOCOL(boot) OK for {} (slot {}, iface {}).", what, slot, intf);
                 true
@@ -14165,7 +14165,7 @@ impl XhciController {
                 );
                 false
             }
-            Err(()) => {
+            #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] Err(Ep0Err::Held) => { suspend::owe(slot, suspend::OWE_SETPROTO); serial_println!("xHCI: SET_PROTOCOL(boot) for {} (slot {}, iface {}) held -> deferred.", what, slot, intf); false } Err(Ep0Err::NoCompletion) => { // HELDSLOTEP0 (B804): a held slot's refusal is owed to the resume
                 serial_println!("xHCI: SET_PROTOCOL(boot) for {} (slot {}, iface {}) FAILED (EP0 pump timeout).", what, slot, intf);
                 false
             }
@@ -14734,10 +14734,10 @@ impl XhciController {
         }
         let buf = self.slots[hub_slot as usize].descriptor_buffer as u64;
         // M1: GET_PORT_STATUS (class request, bmRequestType 0xA3, wIndex = port), 4 bytes.
-        if self.sync_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true).is_err() {
+        if let Err(e) = self.ep0_control(hub_slot, 0xA3, 0x00, 0, port as u16, 4, buf, true) {
             // Intentionally returns WITHOUT clearing change features: the hub keeps the change
             // latched and re-raises it on the status-change endpoint, so this self-heals next wake.
-            serial_println!("xHCI: HUB slot {} port {} GET_PORT_STATUS failed", hub_slot, port);
+            serial_println!("xHCI: HUB slot {} port {} GET_PORT_STATUS failed ({:?})", hub_slot, port, e); // HELDSLOTEP0 (B804): `Held` = refused on a suspended port; the change stays latched and the hub re-raises it once its endpoint is restarted
             return;
         }
         let (wstatus, wchange) = unsafe {
@@ -16034,7 +16034,7 @@ impl XhciController {
                 }
             }
             // 3) Device-side CLEAR_FEATURE(ENDPOINT_HALT); wIndex = full endpoint address.
-            match self.sync_control(slot, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
+            match self.ep0_control(slot, 0x02, 0x01, 0x0000, ep_addr as u16, 0, 0, false) {
                 Ok(1) => {}
                 other => crate::bootlog_println!("xHCI: [usb39] CLEAR_FEATURE(HALT) unexpected {:?}", other),
             }
@@ -18099,7 +18099,7 @@ pub mod suspend {
 
     /// One cycle's numbers, for `tests usbsuspend`.
     #[derive(Clone, Copy)]
-    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32, pub held_rings: u32 }
+    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32, pub held_rings: u32, pub held_ep0_refused: u32, pub replayed: u32 } // HELDSLOTEP0 (B804): the last two
 
     /// `true` while the ports are in U3 (the last request has been applied); `false` once fully back in U0.
     pub fn suspended() -> bool { PHASE.load(Ordering::Acquire) == SUSPENDED }
@@ -18110,7 +18110,7 @@ pub mod suspend {
             ports: PORTS.load(Ordering::Relaxed), suspended: SUSPENDED_N.load(Ordering::Relaxed), pls3: PLS3_N.load(Ordering::Relaxed),
             resumed: RESUMED_N.load(Ordering::Relaxed), kept: KEPT_N.load(Ordering::Relaxed), remote_wakes: REMOTE_WAKES.load(Ordering::Relaxed),
             ep_stopped: EP_STOPPED_N.load(Ordering::Relaxed), ep_running: EP_RUNNING_N.load(Ordering::Relaxed),
-            held_rings: HELD_RINGS.load(Ordering::Relaxed),
+            held_rings: HELD_RINGS.load(Ordering::Relaxed), held_ep0_refused: HELD_EP0_REFUSED_N.load(Ordering::Relaxed), replayed: HELD_EP0_REPLAYED_N.load(Ordering::Relaxed),
         }
     }
 
@@ -18161,7 +18161,7 @@ pub mod suspend {
             let (mut mask, mut usb2) = (0u64, 0u64);
             EP_STOPPED_N.store(0, Ordering::Relaxed);
             EP_RUNNING_N.store(0, Ordering::Relaxed);
-            HELD_RINGS.store(0, Ordering::Relaxed);
+            HELD_RINGS.store(0, Ordering::Relaxed); HELD_EP0_REFUSED_N.store(0, Ordering::Relaxed); HELD_EP0_REPLAYED_N.store(0, Ordering::Relaxed); // HELDSLOTEP0 (B804): per-cycle counts
             for port in 1..=self.max_ports.min(64) {
                 let portsc = self.read_portsc(port);
                 if portsc & 0b11 != 0b11 { continue; } // CCS and PED: an enabled device
@@ -18297,7 +18297,7 @@ pub mod suspend {
                     self.ring_doorbell(slot as u8, dci as u32);
                     serial_println!("[usb] slot={} dci={} ring held -> state={}", slot, dci, self.ep_state_of(slot as u8, dci));
                 }
-            }
+                self.ep0_replay(slot as u8); } // HELDSLOTEP0 (B804): what the hold refused this slot is replayed after its rings
             EP_RUNNING_N.store(running, Ordering::Relaxed);
         }
 
@@ -18398,5 +18398,90 @@ pub mod suspend {
                 Err(()) => Some((0, 0)),
             }
         }
+    }
+
+    // ══════════════ HELDSLOTEP0 (rmbp-ledger B804, BP-power-7) — the hold's EP0 refusal and its replay ══════════════
+    // A SYNCHRONOUS EP0 transfer on a held slot can never complete inside its own wait (`ring_doorbell` holds the slot's
+    // doorbell) and its queue would replace the slot's parked `ep0_pending`, so `ep0_control` (THE one check every
+    // `sync_control` passes through) asks [`ep0_refuse`] before it queues anything. The parked async queue
+    // (`held_report_queue`) is the one EP0 a held slot takes (xHCI 1.2 §4.15.1: queued, rung after the resume). A caller that
+    // can be served after the resume records the debt in `OWED` ([`owe`]); `endpoints_restart` replays it per slot
+    // ([`XhciController::ep0_replay`]) before the phase reads UP, so the same pass serves it. Loan holder only.
+
+    /// Per slot, what the hold refused and the resume owes: bit `OWE_LEDS` (the lock-LED SET_REPORT), `OWE_SETPROTO`
+    /// (SET_PROTOCOL(boot) + SET_IDLE). Written by the refused caller and taken by `endpoints_restart` (both the loan holder).
+    static OWED: [AtomicU8; 256] = [const { AtomicU8::new(0) }; 256];
+    pub(super) const OWE_LEDS: u8 = 1;
+    pub(super) const OWE_SETPROTO: u8 = 2;
+    /// EP0 transfers refused on a held slot, and owed requests replayed at the restart, this cycle (zeroed by `ports_suspend`).
+    static HELD_EP0_REFUSED_N: AtomicU32 = AtomicU32::new(0);
+    static HELD_EP0_REPLAYED_N: AtomicU32 = AtomicU32::new(0);
+
+    /// `ep0_control`'s one check: `true` = the slot is held (its port suspended by this driver), so the synchronous transfer is
+    /// refused before anything is queued — no TRB, no doorbell, no wait. Counted and named on the wire.
+    pub(super) fn ep0_refuse(slot: u8, bm_req: u8, b_req: u8) -> bool {
+        if HELD[slot as usize].load(Ordering::Relaxed) == 0 { return false; }
+        HELD_EP0_REFUSED_N.fetch_add(1, Ordering::Relaxed);
+        serial_println!("[usb] slot={} ep0 req={:#04x}/{:#04x} -> refused why=held", slot, bm_req, b_req);
+        true
+    }
+
+    /// A refused caller's debt to the resume (`OWE_LEDS` / `OWE_SETPROTO`).
+    pub(super) fn owe(slot: u8, what: u8) { OWED[slot as usize].fetch_or(what, Ordering::Relaxed); }
+
+    impl XhciController {
+        /// `endpoints_restart`'s per-slot replay of what the hold refused: the lock-LED bitmap is owed to the device again
+        /// (`keyboard_leds_dirty`, HIDLEDDEFER's own push in `service_hid_leds`), the slot goes back on `hid_setproto_pending`.
+        fn ep0_replay(&mut self, slot: u8) {
+            let owed = OWED[slot as usize].swap(0, Ordering::Relaxed);
+            if owed == 0 { return; }
+            let (leds, setproto) = (owed & OWE_LEDS != 0, owed & OWE_SETPROTO != 0);
+            if leds {
+                self.slots[slot as usize].keyboard_leds_dirty = true;
+                HELD_EP0_REPLAYED_N.fetch_add(1, Ordering::Relaxed);
+            }
+            if setproto {
+                if !self.hid_setproto_pending.contains(&slot) { self.hid_setproto_pending.push(slot); }
+                HELD_EP0_REPLAYED_N.fetch_add(1, Ordering::Relaxed);
+            }
+            serial_println!("[usb] slot={} ep0 replay leds={} setproto={}", slot, leds as u8, setproto as u8);
+        }
+
+        /// `tests usbsuspend`'s held-EP0 leg: while SUSPENDED, the held xHCI keyboard's lock-LED bitmap is marked owed to the
+        /// device (`keyboard_leds_dirty`), so the next pass's `service_hid_leds` issues its SET_REPORT on the held slot.
+        /// `false` = not SUSPENDED, no keyboard, or its slot not held.
+        pub fn held_leds_probe(&mut self) -> bool {
+            if !suspended() { return false; }
+            let Some((slot, _, _)) = self.kbd_slot_on(0) else { return false };
+            if HELD[slot as usize].load(Ordering::Relaxed) == 0 { return false; }
+            self.slots[slot as usize].keyboard_leds_dirty = true;
+            true
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// HELDSLOTEP0 (rmbp-ledger B804, docs/dev/blueprint/power.md BP-power-7) — the synchronous EP0 transfer with its failure NAMED.
+// FILE-TAIL append (unconditional: `sync_control` calls it on both arches), so no `panic::Location` above moves.
+// `sync_control` is this with the name dropped (`Err(())`), for the callers that treat every failure alike.
+
+/// Why a synchronous EP0 transfer failed: `NoCompletion` = no EP0 ring, a stage not on the ring, or no Status event inside
+/// the pump budget; `Held` = refused before anything was queued, the slot's port is suspended (`suspend::ep0_refuse`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ep0Err {
+    NoCompletion,
+    #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+    Held,
+}
+
+impl XhciController {
+    /// The checked synchronous EP0 transfer: the hold's ONE check (`suspend::ep0_refuse`), then `ep0_queue` + `ep0_wait`.
+    fn ep0_control(&mut self, slot_id: u8, bm_req: u8, b_req: u8, w_value: u16, w_index: u16, w_length: u16, data_phys: u64, dir_in: bool) -> Result<u8, Ep0Err> {
+        #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+        if suspend::ep0_refuse(slot_id, bm_req, b_req) {
+            return Err(Ep0Err::Held);
+        }
+        self.ep0_queue(slot_id, bm_req, b_req, w_value, w_index, w_length, data_phys, dir_in).map_err(|()| Ep0Err::NoCompletion)?;
+        self.ep0_wait(slot_id, w_length, data_phys, dir_in).map_err(|()| Ep0Err::NoCompletion)
     }
 }
