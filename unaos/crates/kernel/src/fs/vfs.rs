@@ -3160,7 +3160,8 @@ pub fn nsgen_mock_table() -> MountTable {
 // WHAT A PATH MEANS. The literal FAT directory tree of the EL0 volume, walked from its root.
 // `/a/b/c` and `a/b/c` are the same name (empty components are dropped), so a BARE LEAF walks
 // exactly the old root-only path and every pre-DIRNS fixture is untouched by construction. `..` is
-// REFUSED, never normalised (see `el0_locate`). Note the one asymmetry a reader must not trip over:
+// REFUSED, never normalised (see `el0_locate`). EL0HOME (SR184): this walk is the VOLUME's; which volume
+// a name lands on is `MountTable::resolve`'s (`el0_resolve`, file tail). Note the one asymmetry a reader must not trip over:
 // `/apps/STAT.ELF` resolves because `APPS` is a REAL directory on that volume, while `/boot/X` does
 // NOT — `/boot` is a shell MOUNT PREFIX for the volume root, not a directory in it. EL0's namespace
 // is the tree; the mount table's prefixes are the shell's. See `vfs.md` §13.
@@ -3179,7 +3180,7 @@ pub enum El0LocateError {
     /// No leaf at all, a leaf not representable as 8.3, or a refused `..` (`-EINVAL`).
     Invalid,
     /// The directory (or the volume) is full (`-ENOSPC`).
-    NoSpace,
+    NoSpace, #[doc = "EL0HOME (SR184): no mount claims the name (`MountTable::resolve` -> NoSuchVolume) — `-ENODEV`."] NoVolume, #[doc = "EL0HOME (SR184): an ABSOLUTE name the mount table puts on a volume other than the EL0 FAT volume — SYS_OPEN holds FAT descriptors only (`-ENOTSUP`)."] OtherVolume,
     /// WEDGE-8: the driver loan is busy — retryable, nothing mutated (`-EAGAIN`).
     Busy,
     /// Any other FAT error (`-EIO`).
@@ -3251,27 +3252,7 @@ fn el0_walk<'p>(
     fs: &crate::fs::fat::FatFs,
     path: &'p str,
 ) -> Result<(u32, &'p str), El0LocateError> {
-    el0_walk_from(fs, path, el0_session_base(fs)) // DIRNS M2: a relative path starts at the session's home (0 = root when there is none)
-}
-
-/// DIRNS M2: the first cluster of the open session's `/home/<user>` on `fs`, or `0` (the volume root)
-/// when there is no session, no `login` store, or the home directory is not on this volume yet — the
-/// fallback is the pre-M2 root-only behaviour, so an image with no session resolves exactly as before.
-pub fn el0_session_base(fs: &crate::fs::fat::FatFs) -> u32 {
-    #[cfg(feature = "login")]
-    {
-        let mut nb = [0u8; crate::fs::users::NAME_MAX];
-        let mut hb = [0u8; crate::fs::users::HOME_MAX];
-        if let Some(n) = crate::fs::users::whoami(&mut nb) {
-            if let Some(h) = crate::fs::users::home_of(&nb[..n], &mut hb) {
-                if let Ok(hp) = core::str::from_utf8(&hb[..h]) {
-                    return el0_dir_cluster(fs, hp).unwrap_or(0);
-                }
-            }
-        }
-    }
-    let _ = fs;
-    0
+    el0_walk_from(fs, path, 0) // EL0HOME (SR184): the VOLUME walk starts at the volume root; the session home is the namespace's question (`el0_resolve`, file tail), never a FAT-cluster guess
 }
 
 /// DIRNS M2: the first cluster of the directory `path` names, walked downward from the root
@@ -3309,22 +3290,14 @@ fn el0_walk_from<'p>(
     base: u32,
 ) -> Result<(u32, &'p str), El0LocateError> {
     use crate::fs::fat::FatError;
-    use core::sync::atomic::Ordering;
-    let mut parent: u32 = if path.starts_with('/') { 0 } else { base }; // the volume root, or the home for a relative path
+    let mut parent: u32 = if path.starts_with('/') { 0 } else { base }; // the volume root, or the caller's explicit base for a relative path (`el0_locate_in`)
     let mut it = path.split('/').filter(|c| !c.is_empty()).peekable();
     let mut leaf: &str = "";
     while let Some(c) = it.next() {
         // The escape guard runs BEFORE the "is this the leaf" test, so `A/..` is refused too — the
         // leaf position is not a hole in it.
         if c == ".." {
-            let n = EL0_ESCAPE_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
-            if !EL0_ESCAPE_SAID.swap(true, Ordering::Relaxed) {
-                serial_println!(
-                    "[el0ns] escape refused: `..` is not a component of the EL0 namespace (first of n={} this boot)",
-                    n
-                );
-            }
-            return Err(El0LocateError::Invalid);
+            return Err(el0_escape()); // EL0HOME: the guard's body is one fn, shared with `el0_resolve`
         }
         if it.peek().is_none() {
             leaf = c;
@@ -3904,5 +3877,117 @@ fn hotplug_attach(t: &mut MountTable) {
                 t.mounts.push(Mount { prefix, backend });
             }
         }
+    }
+}
+
+// =========================================================================================
+// EL0HOME (LEDGER SR184) — the ONE EL0 name resolver on aarch64. CHARTER: fs-core (BP-storage-1:
+// the mount table is the only place a name is decided). Appended at the file tail (line-pinned file).
+//
+// `MountTable::resolve` decides WHICH volume an EL0 name lands on; `el0_locate` (above) is the FAT
+// volume's own walk and yields the slot `(dir_lba, dir_off)` SYS_OPEN's descriptor and the U6 ACL
+// are keyed by. The table is used for NAMING only (built, resolved and dropped here, no lock held);
+// `FatBackend`'s mount-wide authorize is never consulted, so the per-file owner ACL is unchanged.
+// =========================================================================================
+
+/// EL0HOME: `..` refused by the EL0 namespace — announced once per boot, counted every time (the
+/// DIRNS witness). The one body both `el0_walk_from` and [`el0_resolve`] call.
+fn el0_escape() -> El0LocateError {
+    use core::sync::atomic::Ordering;
+    let n = EL0_ESCAPE_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if !EL0_ESCAPE_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[el0ns] escape refused: `..` is not a component of the EL0 namespace (first of n={} this boot)",
+            n
+        );
+    }
+    El0LocateError::Invalid
+}
+
+/// EL0HOME: absolute EL0 names refused because the table put them off the EL0 volume.
+#[cfg(target_arch = "aarch64")]
+static EL0_OTHER_VOLUME: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// EL0HOME: the off-volume refusal and the off-volume home are each said once per boot.
+#[cfg(target_arch = "aarch64")]
+static EL0_OTHER_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(all(target_arch = "aarch64", feature = "login"))]
+static EL0_HOME_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// EL0HOME: how many absolute EL0 names were refused `OtherVolume` this boot.
+#[cfg(target_arch = "aarch64")]
+pub fn el0_other_volume_refusals() -> u32 {
+    EL0_OTHER_VOLUME.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// EL0HOME (SR184): an EL0 name -> the path it names ON THE EL0 FAT VOLUME (`fat::mount()`, the
+/// `Default` source), for `el0_locate`'s walk. `..` is refused before anything (the DIRNS guard).
+/// An ABSOLUTE name goes through the mount table: on the EL0 volume it becomes `on_volume(rel)`
+/// (`/apps/X` on a FAT root is `/APPS/X`); on another volume it is `OtherVolume` (-ENOTSUP), with
+/// no mount `NoVolume` (-ENODEV). A RELATIVE name starts at the session's home (`users::home_of`)
+/// when the table puts that home on the EL0 volume (a FAT-root boot: `HOME/<NAME>`), else — no
+/// session, or a home off the EL0 volume (a native UnaFS `/home/<name>`) — at the EL0 volume root,
+/// the latter said once per boot naming where the home is. SYS_OPEN holds EL0 FAT descriptors; a
+/// UnaFS-backed descriptor is owed (SR184).
+#[cfg(target_arch = "aarch64")]
+pub fn el0_resolve(name: &str) -> Result<alloc::borrow::Cow<'_, str>, El0LocateError> {
+    use alloc::borrow::Cow;
+    use core::sync::atomic::Ordering;
+    if name.split('/').any(|c| c == "..") {
+        return Err(el0_escape());
+    }
+    let relative = !name.starts_with('/');
+    let abs: String = if relative {
+        match el0_session_home() {
+            Some(h) => alloc::format!("{}/{}", h, name),
+            None => return Ok(Cow::Borrowed(name)), // no session: the EL0 volume root
+        }
+    } else {
+        name.to_string()
+    };
+    let mt = crate::shell::vfs_mount_table();
+    let el0 = FatBackend::new_source("el0", KERNEL_PRINCIPAL, false, crate::fs::fat::BlockSource::Default);
+    let landed = match mt.resolve(&abs) {
+        Ok((b, rel)) if same_storage(b, &el0) => return Ok(Cow::Owned(b.on_volume(rel))),
+        Ok((b, _)) => Some(b.volume_name().to_string()),
+        Err(VfsError::NoSuchVolume) => None,
+        Err(_) => return Err(El0LocateError::Io),
+    };
+    if relative {
+        #[cfg(feature = "login")]
+        if !EL0_HOME_SAID.swap(true, Ordering::Relaxed) {
+            serial_println!(
+                "[el0ns] home={} volume={} off the EL0 volume: relative names start at its root (SYS_OPEN holds EL0 FAT descriptors; UnaFS descriptor owed)",
+                abs.rsplit_once('/').map(|(h, _)| h).unwrap_or(""),
+                landed.as_deref().unwrap_or("none")
+            );
+        }
+        return Ok(Cow::Borrowed(name));
+    }
+    let Some(vol) = landed else { return Err(El0LocateError::NoVolume) };
+    let n = EL0_OTHER_VOLUME.fetch_add(1, Ordering::Relaxed) + 1;
+    if !EL0_OTHER_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!(
+            "[el0ns] open refused path={} volume={} -> ENOTSUP (SYS_OPEN holds EL0 FAT descriptors; first of n={} this boot)",
+            abs, vol, n
+        );
+    }
+    Err(El0LocateError::OtherVolume)
+}
+
+/// EL0HOME: the open session's home as `users::home_of` spells it (`/home/<name>`), or `None` with
+/// no session (or no `login` store).
+#[cfg(target_arch = "aarch64")]
+fn el0_session_home() -> Option<String> {
+    #[cfg(feature = "login")]
+    {
+        let mut nb = [0u8; crate::fs::users::NAME_MAX];
+        let mut hb = [0u8; crate::fs::users::HOME_MAX];
+        let n = crate::fs::users::whoami(&mut nb)?;
+        let h = crate::fs::users::home_of(&nb[..n], &mut hb)?;
+        core::str::from_utf8(&hb[..h]).ok().map(|s| s.to_string())
+    }
+    #[cfg(not(feature = "login"))]
+    {
+        None
     }
 }
