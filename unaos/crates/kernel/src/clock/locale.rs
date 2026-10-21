@@ -12,7 +12,7 @@
 //! * The live locale is three `AtomicU8` (zero = UTC, `ymd-24`, `mon`): a painter on the composite tail reads it with
 //!   relaxed loads and never a lock.
 //! * [`service`] — one call on the settings service pass: a Settings choice's owed store write (never in the click
-//!   router), the login generation's read and PrefChanged's re-read (look.rs's shape). Each applied change prints
+//!   router), the first read with a session and PrefChanged's re-read, a login or logout included (look.rs's shape). Each applied change prints
 //!   `[locale] tz=<name> off_min=<n> dst=<0|1> region=<r> first_day=<d> via=<login|bus|settings>`.
 //! * The pure `_in(&Locale, …)` twins are the same arithmetic on a caller's [`Locale`]: `tests tzlocale` drives them,
 //!   so no fixture writes the live locale or the store.
@@ -346,9 +346,10 @@ const OWE_TZ: u8 = 1;
 const OWE_REGION: u8 = 2;
 const OWE_FIRST: u8 = 4;
 static OWED: AtomicU8 = AtomicU8::new(0);
-/// The session generation the keys were last read for (`u32::MAX` = never), and the PrefChanged count read at.
-static READ_GEN: AtomicU32 = AtomicU32::new(u32::MAX);
-static SEEN_CHANGES: AtomicU32 = AtomicU32::new(0);
+/// The PrefChanged count the keys were last read at (`u32::MAX` = never read: the first pass that sees a session reads).
+/// SESSIONGENPOLL (B782): a login or logout reaches the locale as the reload's PrefChanged (PREFSRELOAD B763), never as a
+/// session-generation poll.
+static SEEN_CHANGES: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Settings chose zone `i` (wrapped into the table).
 pub fn choose_tz(i: usize) {
@@ -374,8 +375,8 @@ pub fn choose_first(i: usize) {
     OWED.fetch_or(OWE_FIRST, Ordering::Release);
 }
 
-/// The settings service pass: write a Settings choice's owed keys; read the three keys at a new login generation
-/// and on PrefChanged. `true` = the live locale moved this pass (the caller repaints an open Date & Time pane).
+/// The settings service pass: write a Settings choice's owed keys; read the three keys at the first pass with a session
+/// and on PrefChanged (a login or logout included, SESSIONGENPOLL B782). `true` = the live locale moved this pass (the caller repaints an open Date & Time pane).
 /// Cheap when nothing moved: three relaxed loads.
 pub fn service() -> bool {
     use crate::prefs::{key, PrefValue as P};
@@ -387,17 +388,16 @@ pub fn service() -> bool {
         if o & OWE_FIRST != 0 { crate::prefs_client::sys_set(key::LOCALE_FIRST_DAY, P::Str(String::from(l.first_day_name()))); }
         SEEN_CHANGES.store(crate::prefs_client::CHANGED_N.load(Ordering::Acquire), Ordering::Relaxed);
     }
-    let g = crate::prefs::session_gen();
     let ch = crate::prefs_client::CHANGED_N.load(Ordering::Acquire);
-    let login = READ_GEN.load(Ordering::Relaxed) != g;
-    if !(login || SEEN_CHANGES.load(Ordering::Relaxed) != ch) {
+    let seen = SEEN_CHANGES.load(Ordering::Relaxed);
+    let login = seen == u32::MAX; // SESSIONGENPOLL (B782): the first read with a session; every later switch is PrefChanged
+    if seen == ch {
         return false;
     }
     let mut wb = [0u8; crate::prefs::WHO_BUF];
     if crate::prefs::user_name_in(&mut wb).is_none() {
-        return false;
+        return false; // no session: the change is left unconsumed for the next login's first pass
     }
-    READ_GEN.store(g, Ordering::Relaxed);
     SEEN_CHANGES.store(ch, Ordering::Relaxed);
     let (t, r, f) = (crate::prefs_client::sys_text(key::LOCALE_TZ), crate::prefs_client::sys_text(key::LOCALE_REGION), crate::prefs_client::sys_text(key::LOCALE_FIRST_DAY));
     let l = Locale::parse(t.as_deref(), r.as_deref(), f.as_deref());

@@ -5497,4 +5497,50 @@ fn settingsmap_selftest() {
         NS, k, changed, arrived.map_or(alloc::string::String::from("na"), |a| format!("{}", a)),
         if wrote.is_ok() { "ok" } else { "refused" }, if ok { "PASS" } else { "FAIL" }, if ok { "ok" } else { "bad" }
     );
+    settingsmap_switch_leg(); // SESSIONGENPOLL (B782): the switch leg (file tail)
+}
+
+// SESSIONGENPOLL (rmbp-ledger B782) — TAIL-APPENDED: `tests settingsmap`'s switch leg. Settings, the lock, the clock and the
+// look no longer poll `fs::users::SESSION_GEN`: a session switch reaches them only as the reload's PrefChanged
+// (PREFSRELOAD B763). The leg: one key Settings' view shows (`system.display.idle_min`) is written to a differing value
+// and the session is switched against the tree held before (`prefs::reload_session`). Pass 1 runs the four consumers'
+// service halves (`settings::bus_changes_idle` — Settings' view —, `look::service`, `clock::locale::service`,
+// `lock::prefs_pass`): the key's frame reaches Settings' drain. Pass 2 runs them again with nothing new pending and
+// counts the login-generation reads (`fs::users::session_gen_reads`, the counted gateway `prefs::session_gen` uses):
+// a poll would read it every pass, so the poll's absence is `gen_reads=0`. The key is put back afterwards.
+// `:: SETTINGSMAP: switch leg key=system.display.idle_min changed=<n> frames=<n> gen_reads=<n> -> PASS|FAIL :: switch=<ok|bad> ::`
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn settingsmap_switch_leg() {
+    use crate::prefs::{key, PrefValue, NS};
+    fn consumers_pass() -> usize {
+        let (_, idle, _) = crate::video::settings::bus_changes_idle();
+        crate::video::look::service();
+        let _ = crate::clock::locale::service();
+        #[cfg(feature = "login")]
+        let _ = crate::video::lock::prefs_pass();
+        idle
+    }
+    crate::prefs_client::subscribe();
+    let _ = consumers_pass(); // the queue and the marks settled before the switch
+    let k = key::IDLE_MIN;
+    let old = crate::prefs::snapshot();
+    let was = crate::prefs::int(k, 0, 1440);
+    let want = if was == Some(15) { 30 } else { 15 };
+    let wrote = crate::prefs::set(NS, k, PrefValue::Int(want));
+    let (changed, frames, reads) = if wrote.is_ok() {
+        let _ = crate::video::settings::bus_changes_idle(); // the write's own frame drained: only the switch's is counted
+        let n = crate::prefs::reload_session(&old);
+        let frames = consumers_pass();
+        let r0 = crate::fs::users::session_gen_reads();
+        let _ = consumers_pass();
+        (n, frames, crate::fs::users::session_gen_reads().wrapping_sub(r0))
+    } else {
+        (0, 0, 0)
+    };
+    let _ = crate::prefs::set(NS, k, PrefValue::Int(was.unwrap_or(prefs_core::display::IDLE_MIN_DEFAULT)));
+    let ok = wrote.is_ok() && changed == 1 && frames >= 1 && reads == 0;
+    serial_println!(
+        ":: SETTINGSMAP: switch leg key={}.{} changed={} frames={} gen_reads={} wrote={} -> {} :: switch={} ::",
+        NS, k, changed, frames, reads, if wrote.is_ok() { "ok" } else { "refused" }, if ok { "PASS" } else { "FAIL" }, if ok { "ok" } else { "bad" }
+    );
 }
