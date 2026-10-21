@@ -218,7 +218,7 @@ pub(super) struct Seen {
     pub resp_to_us: u32,
     pub bssids: Vec<String>,
     /// The station MAC a probe response must name in addr1 to count as `resp_to_us` (zeros = none).
-    pub me: [u8; 6],
+    pub me: [u8; 6], #[cfg(feature = "wifi10")] pub join: super::join::Heard,
 }
 
 /// An SSID as printable text: bytes outside 0x20..0x7e and the list's own `,[]` become `?`; empty =
@@ -329,7 +329,7 @@ fn take(buf: u64, s: &mut Seen, ch: u16, raw_rows: &mut u32, tag: &str) -> usize
     if len < start + 24 + FCS_LEN {
         return 1;
     }
-    let frame = copy_out(buf + (FRAMEOFFSET + start) as u64, len - start - FCS_LEN);
+    let frame = copy_out(buf + (FRAMEOFFSET + start) as u64, len - start - FCS_LEN); #[cfg(feature = "wifi10")] super::join::hear(&frame, &mut s.join);
     // FC byte 0: type bits 3:2 = 0 (management), subtype bits 7:4 = 8 (beacon) — IEEE 802.11 §9.2.4.1.
     if (frame[0] >> 2) & 0x3 == 0 && (frame[0] >> 4) == 0x8 {
         if let Some(b) = wifi_core::ieee80211::parse_beacon(&frame) {
@@ -341,7 +341,7 @@ fn take(buf: u64, s: &mut Seen, ch: u16, raw_rows: &mut u32, tag: &str) -> usize
         }
     } else if (frame[0] >> 2) & 0x3 == 0 && (frame[0] >> 4) == 0x5 {
         // WIFI10 (B646): subtype 5, a probe response — the same fixed fields + IEs as a beacon
-        // (IEEE 802.11 §9.3.3.11); `parse_beacon` accepts both. addr1 (bytes 4..10) names the station it answers.
+        // (IEEE 802.11 §9.3.3.10); `parse_beacon` accepts both. addr1 (bytes 4..10) names the station it answers.
         if let Some(b) = wifi_core::ieee80211::parse_beacon(&frame) {
             s.probe_resp += 1;
             if frame[4..10] == s.me {

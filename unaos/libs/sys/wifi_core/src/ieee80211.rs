@@ -22,11 +22,17 @@ pub const SUBTYPE_PROBE_RESP: u8 = 0b0101;
 pub const SUBTYPE_BEACON: u8 = 0b1000;
 pub const SUBTYPE_AUTH: u8 = 0b1011;
 pub const SUBTYPE_DATA: u8 = 0b0000;
+/// WIFIAUTH (B788): the AP's two refusals (§9.3.3.4 Disassociation, §9.3.3.12 Deauthentication).
+pub const SUBTYPE_DISASSOC: u8 = 0b1010;
+pub const SUBTYPE_DEAUTH: u8 = 0b1100;
 
 /// Information-element ids this station reads or writes.
 pub const EID_SSID: u8 = 0;
 pub const EID_DS_PARAM: u8 = 3; // the channel
 pub const EID_RSN: u8 = 48;
+/// Supported Rates (§9.4.2.3) and Extended Supported Rates (§9.4.2.13).
+pub const EID_SUPP_RATES: u8 = 1;
+pub const EID_EXT_RATES: u8 = 50;
 
 /// A 48-bit MAC address.
 pub type Mac = [u8; 6];
@@ -111,9 +117,18 @@ pub fn build_auth_open(sta: Mac, bssid: Mac, seq: u16) -> Vec<u8> {
     f
 }
 
-/// Parse an authentication response: `Some(status)` when it is one for us, else `None`. Status 0 is
-/// success.
-pub fn parse_auth(frame: &[u8]) -> Option<u16> {
+/// The fixed fields of an authentication frame (§9.3.3.11): algorithm (§9.4.1.1, 0 = Open System),
+/// transaction sequence (§9.4.1.2; an AP's answer to ours is 2) and status (§9.4.1.9, 0 = success).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthResult {
+    pub alg: u16,
+    pub seq: u16,
+    pub status: u16,
+}
+
+/// Parse an authentication frame's fixed fields; `None` unless it is a management/authentication frame
+/// long enough to carry them. Addressing is the caller's to check.
+pub fn parse_auth(frame: &[u8]) -> Option<AuthResult> {
     if frame.len() < 24 + 6 {
         return None;
     }
@@ -121,10 +136,16 @@ pub fn parse_auth(frame: &[u8]) -> Option<u16> {
     if ty != FC_TYPE_MGMT || sub != SUBTYPE_AUTH {
         return None;
     }
-    Some(u16::from_le_bytes([frame[24 + 4], frame[24 + 5]]))
+    Some(AuthResult {
+        alg: u16::from_le_bytes([frame[24], frame[24 + 1]]),
+        seq: u16::from_le_bytes([frame[24 + 2], frame[24 + 3]]),
+        status: u16::from_le_bytes([frame[24 + 4], frame[24 + 5]]),
+    })
 }
 
-/// Build an association request carrying the SSID and a minimal supported-rates set.
+/// Build an association request (§9.3.3.5) carrying the SSID, Supported Rates (eight: the four CCK
+/// rates as basic + 6/9/12/18) and Extended Supported Rates (24/36/48/54) — an AP whose basic set holds
+/// OFDM rates refuses an 11b-only request.
 pub fn build_assoc_req(sta: Mac, bssid: Mac, ssid: &[u8], seq: u16) -> Vec<u8> {
     let mut f = Vec::new();
     push_mgmt_header(&mut f, SUBTYPE_ASSOC_REQ, bssid, sta, bssid, seq);
@@ -133,10 +154,14 @@ pub fn build_assoc_req(sta: Mac, bssid: Mac, ssid: &[u8], seq: u16) -> Vec<u8> {
     f.push(EID_SSID);
     f.push(ssid.len() as u8);
     f.extend_from_slice(ssid);
-    // Supported Rates (1,2,5.5,11 Mbit, in 500 kbit units, with the "basic" bit set).
-    f.push(1);
+    // Supported Rates (§9.4.2.3, 500 kbit/s units): 1,2,5.5,11 Mbit with the "basic" bit, then 6,9,12,18.
+    f.push(EID_SUPP_RATES);
+    f.push(8);
+    f.extend_from_slice(&[0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]);
+    // Extended Supported Rates (§9.4.2.13, element 50): 24,36,48,54 Mbit.
+    f.push(EID_EXT_RATES);
     f.push(4);
-    f.extend_from_slice(&[0x82, 0x84, 0x8b, 0x96]);
+    f.extend_from_slice(&[0x30, 0x48, 0x60, 0x6c]);
     f
 }
 
@@ -159,6 +184,19 @@ pub fn parse_assoc_resp(frame: &[u8]) -> Option<AssocResult> {
     let status = u16::from_le_bytes([frame[24 + 2], frame[24 + 3]]);
     let aid = u16::from_le_bytes([frame[24 + 4], frame[24 + 5]]) & 0x3FFF;
     Some(AssocResult { status, aid })
+}
+
+/// Parse a Deauthentication (§9.3.3.12) or Disassociation (§9.3.3.4) frame: `(subtype, reason code)`
+/// (§9.4.1.7). `None` for anything else or a frame too short to carry the reason.
+pub fn parse_reason(frame: &[u8]) -> Option<(u8, u16)> {
+    if frame.len() < 24 + 2 {
+        return None;
+    }
+    let (ty, sub) = subtype_of(frame[0]);
+    if ty != FC_TYPE_MGMT || (sub != SUBTYPE_DEAUTH && sub != SUBTYPE_DISASSOC) {
+        return None;
+    }
+    Some((sub, u16::from_le_bytes([frame[24], frame[25]])))
 }
 
 /// LLC/SNAP header for an Ethernet-typed payload (RFC 1042): AA-AA-03-00-00-00 then the EtherType.
@@ -270,6 +308,12 @@ mod tests {
         // header 24 + capability 2 + listen 2 = 28; SSID eid+len = 2; body at 30.
         assert_eq!(r[28], EID_SSID);
         assert_eq!(&r[30..30 + 6], b"UnaNet");
+        assert_eq!(&r[36..38], &[EID_SUPP_RATES, 8]);
+        assert_eq!(&r[46..52], &[EID_EXT_RATES, 4, 0x30, 0x48, 0x60, 0x6c]);
+        let mut resp = a.clone();
+        resp[26] = 2; // transaction 2
+        resp[28] = 13; // status 13
+        assert_eq!(parse_auth(&resp), Some(AuthResult { alg: 0, seq: 2, status: 13 }));
     }
 
     #[test]

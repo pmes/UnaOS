@@ -122,7 +122,7 @@ pub mod bus;
 pub mod firmware;
 pub mod ladder;
 pub mod status;
-pub mod verb;
+pub mod verb; #[cfg(feature = "wifi10")] pub mod assoc;
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
