@@ -855,9 +855,9 @@ mod lastkey {
     }
 
     // ── PREFSCLIENTKEYS (rmbp-ledger B779): the consumer's claimed edge and the one GET count ──────────────────────
-    // CHARTER: Principia — fulfiller (the kernel bus client). Every PrefChanged poller (look, locale; the lock keeps its
-    // own claim beside its login generation) keys its re-read on the ring above through [`changed_take`], so a change to
-    // a key it does not read costs no GET; [`gets_total`] counts every bus GET `pref_get` makes, whoever asked.
+    // CHARTER: Principia — fulfiller (the kernel bus client). Every PrefChanged poller keys its re-read on the ring above
+    // (look, locale through [`changed_take`]; the lock claims its own edge through [`changed_since`], no login generation
+    // since SESSIONGENPOLL B782), so a change to a key it does not read costs no GET; [`gets_total`] counts every bus GET.
 
     /// Every PrefGet the client has sent since boot (`pref_get`, the one GET door: `sys_get`/`sys_int`/`sys_flag`/`sys_text`).
     static GETS_TOTAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
