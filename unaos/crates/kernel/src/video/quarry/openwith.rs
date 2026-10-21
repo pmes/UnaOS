@@ -29,7 +29,7 @@ struct List {
     foreign: Vec<(Registrant, String)>,
 }
 
-static LIST: spin::Mutex<Option<List>> = spin::Mutex::new(None);
+static LIST: crate::sync::Mutex<Option<List>> = crate::sync::Mutex::new(None);
 static UP: AtomicBool = AtomicBool::new(false);
 
 pub fn is_up() -> bool {

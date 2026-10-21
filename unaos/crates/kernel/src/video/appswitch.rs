@@ -133,7 +133,7 @@ struct St {
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static WIN: AtomicU32 = AtomicU32::new(0);
-static ST: spin::Mutex<Option<St>> = spin::Mutex::new(None);
+static ST: crate::sync::Mutex<Option<St>> = crate::sync::Mutex::new(None);
 static SHOW_OWED: AtomicBool = AtomicBool::new(false);
 static PAINT_OWED: AtomicBool = AtomicBool::new(false);
 static COMMIT_OWED: AtomicBool = AtomicBool::new(false);

@@ -265,7 +265,7 @@ struct Fv {
     frame_moved_at: Option<u64>,
 }
 
-static FV: spin::Mutex<Fv> = spin::Mutex::new(Fv {
+static FV: crate::sync::Mutex<Fv> = crate::sync::Mutex::new(Fv {
     dir: String::new(),
     src: String::new(),
     writable: false,

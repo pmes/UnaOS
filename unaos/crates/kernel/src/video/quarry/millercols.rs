@@ -52,7 +52,7 @@ pub(super) struct Col {
 
 /// Listings held for the ancestor and next panes (FIFO), keyed by path, cleared on a new volume generation.
 const LCACHE_MAX: usize = 12;
-static LCACHE: spin::Mutex<(u64, Vec<(String, Vec<(String, bool)>)>)> = spin::Mutex::new((0, Vec::new()));
+static LCACHE: crate::sync::Mutex<(u64, Vec<(String, Vec<(String, bool)>)>)> = crate::sync::Mutex::new((0, Vec::new()));
 
 /// The rendered preview card, and the request the painter latched for the service pass.
 struct Prev {
@@ -61,13 +61,13 @@ struct Prev {
     h: usize,
     surf: Vec<u32>,
 }
-static PREV: spin::Mutex<Option<Prev>> = spin::Mutex::new(None);
-static WANT: spin::Mutex<Option<(String, usize, usize)>> = spin::Mutex::new(None);
+static PREV: crate::sync::Mutex<Option<Prev>> = crate::sync::Mutex::new(None);
+static WANT: crate::sync::Mutex<Option<(String, usize, usize)>> = crate::sync::Mutex::new(None);
 /// The last `(panes, path)` the glass witness printed.
-static SAID: spin::Mutex<(usize, String)> = spin::Mutex::new((0, String::new()));
+static SAID: crate::sync::Mutex<(usize, String)> = crate::sync::Mutex::new((0, String::new()));
 
 /// QUARRYIO (B660): listings the painter missed in [`LCACHE`], read on the next service pass.
-static WANT_LS: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static WANT_LS: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 
 /// A directory's rows, sorted and de-duplicated as the list pane sorts them by default. QUARRYIO (B660): inside
 /// Quarry's paint it answers from the cache only — a miss paints the pane empty and is read on the service pass.
@@ -627,7 +627,7 @@ pub(super) fn focus_rows_paint(m: &Model, px: &mut [u32], r0: usize, r1: usize) 
 
 /// A non-focus column's first row `(folder, the selection it was taken at, row)`. Leaf lock (MODEL -> SURF -> TOPS),
 /// never held across a call; pruned to the plan's folders by every full paint ([`tops_prune`]).
-static TOPS: spin::Mutex<Vec<(String, Option<usize>, usize)>> = spin::Mutex::new(Vec::new());
+static TOPS: crate::sync::Mutex<Vec<(String, Option<usize>, usize)>> = crate::sync::Mutex::new(Vec::new());
 
 /// Keep [`TOPS`] to the folders `cols` shows.
 fn tops_prune(cols: &[Col]) {

@@ -599,7 +599,7 @@ pub struct TypeRow {
     pub registrants: usize,
 }
 
-static VIEW: spin::Mutex<Vec<TypeRow>> = spin::Mutex::new(Vec::new());
+static VIEW: crate::sync::Mutex<Vec<TypeRow>> = crate::sync::Mutex::new(Vec::new());
 static VIEW_OWED: AtomicBool = AtomicBool::new(false);
 /// Row index + 1 whose preferred app the pane asked to advance (0 = none).
 static CYCLE_OWED: AtomicUsize = AtomicUsize::new(0);
@@ -781,7 +781,7 @@ pub fn trusted_override_in(mt: &MountTable, v: &str, mime: &str) -> Option<Strin
 }
 
 /// The last path whose override was refused (the resolver runs per row and per frame; one line per file).
-static REFUSED_LAST: spin::Mutex<String> = spin::Mutex::new(String::new());
+static REFUSED_LAST: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new());
 
 fn refused_wire(path: &str, v: &str, mime: &str) {
     let mut last = REFUSED_LAST.lock();

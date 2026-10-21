@@ -30,7 +30,7 @@ use super::{r16, r32, w32};
 use alloc::string::String;
 use core::fmt::Write as _;
 use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 use wifi_core::sprom::{self, Identity, Verdict};
 
 /// cc+0x800. [ONE-SOURCE: bcm4331.md §S2r] — the same value `drivers/bcma.rs` `CC_SPROM` carries.

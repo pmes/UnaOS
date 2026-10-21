@@ -7,7 +7,10 @@
 //! [`Mutex<T>`] is spin's mutex with the same API (`new` const, `lock`, `try_lock`, `is_locked`, `force_unlock`,
 //! `get_mut`, `into_inner`), built as a `spin::Mutex<()>` raw lock beside an `UnsafeCell<T>` so the raw lock can
 //! be released WITHOUT knowing `T` (a dead task's locks, by address). `new` is `#[track_caller]`: the
-//! construction site is the lock's NAME (its class). Every kernel `spin::Mutex` is this type (the sweep).
+//! construction site is the lock's NAME (its class). Every kernel `spin::Mutex` is this type (the sweep; LOCKREG2 B823
+//! swept the 38 raw statics that crept back). A hold past 50 ms is named on the wire in flight (the scan) or at its
+//! release (`released=1`); the longest hold carries its lock, acquire site and holder; an acquire the registry cannot
+//! name or time counts in `overflow=` (BP-cores-20).
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
@@ -272,9 +275,22 @@ mod reg {
     static NEXT_SCAN: AtomicU64 = AtomicU64::new(0);
     static LINES: AtomicU32 = AtomicU32::new(0); static LINES_MIN: AtomicU64 = AtomicU64::new(0); // TRASHLOCK (B523): the minute LINES and SAID were last reset in (the cap is per minute, not per boot) — LINE-NEUTRAL append
     static SAID: [AtomicUsize; 64] = [const { AtomicUsize::new(0) }; 64];
-    /// The last lock NAME the scan saw held past 50 ms (for `tests lockreg`), and the test's own name (never capped).
-    static SEEN_LONG: AtomicPtr<Loc> = AtomicPtr::new(core::ptr::null_mut());
+    /// The test's own lock name (never capped), and whether the registry NAMED it past 50 ms since the run began —
+    /// in flight (the scan) or at its release (`drain_long`); sticky, so no other lock's sighting overwrites it (LOCKREG2 B823).
+    static TEST_SEEN: AtomicBool = AtomicBool::new(false);
     static TEST_NAME: AtomicPtr<Loc> = AtomicPtr::new(core::ptr::null_mut());
+    /// LOCKREG2 (B823): the longest hold's acquire site and holder tag (beside `HELD_MAX_CLASS`); acquires the registry
+    /// could not name or time (class table full, partition full); the release-side long holds pending for the scan
+    /// (the `INV` shape: written lock-free in `release`, drained and printed only by `scan`).
+    static HELD_MAX_AT: AtomicPtr<Loc> = AtomicPtr::new(core::ptr::null_mut());
+    static HELD_MAX_TAG: AtomicU64 = AtomicU64::new(0);
+    static OVERFLOW: AtomicU64 = AtomicU64::new(0);
+    const LONG_SLOTS: usize = 16;
+    static LONG_TAG: [AtomicU64; LONG_SLOTS] = [const { AtomicU64::new(0) }; LONG_SLOTS];
+    static LONG_AT: [AtomicPtr<Loc>; LONG_SLOTS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; LONG_SLOTS];
+    static LONG_MS: [AtomicU32; LONG_SLOTS] = [const { AtomicU32::new(0) }; LONG_SLOTS];
+    static LONG_N: AtomicU32 = AtomicU32::new(0);
+    static LONG_SAID: AtomicU32 = AtomicU32::new(0);
 
     #[inline]
     fn rdtsc() -> u64 {
@@ -403,6 +419,9 @@ mod reg {
             0 => {
                 let c = class_of(site);
                 class.store(c, Relaxed);
+                if c == 0 {
+                    OVERFLOW.fetch_add(1, Relaxed); // LOCKREG2 (B823): the class table is full — this hold would be unnamed
+                }
                 c
             }
             c => c,
@@ -425,6 +444,7 @@ mod reg {
         let i = loop {
             let free = !m;
             if free == 0 {
+                OVERFLOW.fetch_add(1, Relaxed); // LOCKREG2 (B823): this core's partition is full — this hold goes untimed
                 return NONE;
             }
             let i = free.trailing_zeros();
@@ -450,8 +470,12 @@ mod reg {
         let (cpu, i) = (slot as usize / PER, slot as usize % PER);
         let p = &PARTS[cpu];
         let span = rdtsc().wrapping_sub(p.t0[i].load(Relaxed));
+        let (tag, at) = (p.tag[i].load(Relaxed), p.at[i].load(Relaxed));
         if span < u64::MAX / 2 && span > p.held_max.load(Relaxed) {
-            p.held_max.fetch_max(span, Relaxed); if HELD_MAX_SPAN.fetch_max(span, Relaxed) < span { HELD_MAX_CLASS.store(tag_class(p.tag[i].load(Relaxed)), Relaxed); } // KVMLAT (B578): name the longest hold (LINE-NEUTRAL fold)
+            p.held_max.fetch_max(span, Relaxed); if HELD_MAX_SPAN.fetch_max(span, Relaxed) < span { note_max(tag, at); } // KVMLAT (B578): name the longest hold (LINE-NEUTRAL fold); LOCKREG2 (B823): with its acquire site and holder
+        }
+        if span < u64::MAX / 2 {
+            note_long(tag, at, span); // LOCKREG2 (B823): a hold past 50 ms is named at its end even when no scan saw it in flight
         }
         p.tag[i].store(0, Release);
         p.mask.fetch_and(!(1u32 << i), Release);
@@ -640,11 +664,9 @@ mod reg {
                 if span > (u64::MAX >> 1) || ms(span) <= HELD_MS || p.tag[i].load(Acquire) != tag {
                     continue;
                 }
-                p.held_max.fetch_max(span, Relaxed); if HELD_MAX_SPAN.fetch_max(span, Relaxed) < span { HELD_MAX_CLASS.store(tag_class(tag), Relaxed); } // KVMLAT (B578): an in-flight hold past 50 ms names the max too (LINE-NEUTRAL fold)
+                p.held_max.fetch_max(span, Relaxed); if HELD_MAX_SPAN.fetch_max(span, Relaxed) < span { note_max(tag, at); } // KVMLAT (B578): an in-flight hold past 50 ms names the max too (LINE-NEUTRAL fold); LOCKREG2 (B823): site and holder
                 let name = class_site(tag_class(tag));
-                if let Some(n) = name {
-                    SEEN_LONG.store(n as *const Loc as *mut Loc, Release);
-                }
+                note_test_seen(name);
                 if say_ok(name, 0) {
                     let waiters = PARTS.iter().filter(|q| q.w_lock.load(Relaxed) == addr).count();
                     // SAFETY: `at` is a `&'static Location` or null.
@@ -683,6 +705,7 @@ mod reg {
             let (a, b) = ((v >> 48) as u16, ((v >> 32) & 0xFFFF) as u16);
             serial_println!("[lock] order-inversion a={} b={} by={}@cpu{}", Site(class_site(a)), Site(class_site(b)), (v >> 8) & 0xFF_FFFF, v & 0xFF);
         }
+        drain_long();
     }
 
     /// Up to 16 names for one line.
@@ -837,12 +860,13 @@ mod reg {
         let on = ON.load(Acquire);
         let hold_name = HOLD.site() as *const Loc as *mut Loc;
         TEST_NAME.store(hold_name, Release);
-        SEEN_LONG.store(core::ptr::null_mut(), Release);
+        TEST_SEEN.store(false, Release);
         HOLD_DONE.store(false, Release);
         crate::arch::sched::spawn("lockreg-hold", hold_task, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL);
         let held_done = wait_flag(&HOLD_DONE, 1000);
-        // The scan runs every 50 ms: a 60 ms hold is seen at least once while live.
-        let named = SEEN_LONG.load(Acquire) == hold_name;
+        // LOCKREG2 (B823): the 60 ms hold is named in flight by a scan that lands in its last ~10 ms, or else at its
+        // release (`note_long` -> the next scan's `drain_long`): one scan period after the release it is named either way.
+        let named = held_done && wait_flag(&TEST_SEEN, 2 * SCAN_MS + 50);
         DIE_DONE.store(false, Release);
         crate::arch::sched::spawn("lockreg-die", die_task, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL);
         let died = wait_flag(&DIE_DONE, 1000);
@@ -859,9 +883,14 @@ mod reg {
         }
         let hz = crate::arch::apic::tsc_hz().max(1000);
         let inv = INV_N.load(Acquire);
-        let pass = on && held_done && named && released && inv == 0;
+        let overflow = OVERFLOW.load(Relaxed);
+        let max_tag = HELD_MAX_TAG.load(Relaxed);
+        let max_at = HELD_MAX_AT.load(Relaxed);
+        // SAFETY: `max_at` is a `&'static Location` or null.
+        let max_at = if max_at.is_null() { None } else { Some(unsafe { &*max_at }) };
+        let pass = on && held_done && named && released && inv == 0 && overflow == 0;
         serial_println!(
-            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} named={} -> {} :: held_max_at={}",
+            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{}",
             CLASS_N.load(Relaxed),
             tracked,
             acq,
@@ -869,7 +898,72 @@ mod reg {
             inv,
             if released { "ok" } else if !died { "no-task" } else if freed != 1 { "not-found" } else { "still-held" },
             if named { "ok" } else if !on { "unarmed" } else if !held_done { "no-task" } else { "missed" },
-            if pass { "PASS" } else { "FAIL" }, Site(class_site(HELD_MAX_CLASS.load(Relaxed))) // KVMLAT (B578): the longest hold's lock, by name (`?` = none recorded)
+            overflow,
+            if pass { "PASS" } else { "FAIL" }, Site(class_site(HELD_MAX_CLASS.load(Relaxed))), // KVMLAT (B578): the longest hold's lock, by name (`?` = none recorded)
+            Site(max_at),
+            tag_tid(max_tag),
+            tag_cpu(max_tag)
         );
+    }
+
+    // ── LOCKREG2 (B823): every hold past 50 ms is NAMED — in flight by the scan, or at its release through the pending
+    // ring below (the `INV` shape) — and the boot's longest hold carries its lock, its acquire site and its holder. ──
+
+    /// A new longest hold: its lock's class (`held_max_at=`), its acquire site (`held_max_via=`), its holder (`held_max_by=`).
+    #[inline]
+    fn note_max(tag: u64, at: *mut Loc) {
+        HELD_MAX_CLASS.store(tag_class(tag), Relaxed);
+        HELD_MAX_AT.store(at, Relaxed);
+        HELD_MAX_TAG.store(tag, Relaxed);
+    }
+
+    /// `release`'s hand-off: a hold that ended past `HELD_MS` is queued for the scan (lock-free; never prints here).
+    #[inline]
+    fn note_long(tag: u64, at: *mut Loc, span: u64) {
+        let per_ms = crate::arch::apic::tsc_hz() / 1000;
+        if tag == 0 || per_ms == 0 || span <= HELD_MS * per_ms {
+            return;
+        }
+        let k = LONG_N.fetch_add(1, AcqRel) as usize % LONG_SLOTS;
+        LONG_AT[k].store(at, Relaxed);
+        LONG_MS[k].store((span / per_ms).min(u32::MAX as u64) as u32, Relaxed);
+        LONG_TAG[k].store(tag, Release);
+    }
+
+    /// The test's own lock was named past 50 ms (sticky until the next `tests lockreg`).
+    #[inline]
+    fn note_test_seen(name: Option<&'static Loc>) {
+        if let Some(n) = name {
+            if n as *const Loc as *mut Loc == TEST_NAME.load(Relaxed) {
+                TEST_SEEN.store(true, Release);
+            }
+        }
+    }
+
+    /// The scan's drain of the released long holds: each named once per site per minute (`say_ok` kind 2) as
+    /// `[lock] held-too-long name= at= by= ms= released=1`; a slot not yet written waits for the next scan.
+    fn drain_long() {
+        let n = LONG_N.load(Acquire);
+        let mut k = LONG_SAID.load(Relaxed);
+        if n.wrapping_sub(k) > LONG_SLOTS as u32 {
+            k = n.wrapping_sub(LONG_SLOTS as u32); // overrun: the oldest are gone, the newest 16 are said
+        }
+        while k != n {
+            let s = k as usize % LONG_SLOTS;
+            let tag = LONG_TAG[s].swap(0, AcqRel);
+            if tag == 0 {
+                break;
+            }
+            k = k.wrapping_add(1);
+            let (at, ms) = (LONG_AT[s].load(Relaxed), LONG_MS[s].load(Relaxed));
+            let name = class_site(tag_class(tag));
+            note_test_seen(name);
+            if say_ok(name, 2) {
+                // SAFETY: `at` is a `&'static Location` or null.
+                let at = if at.is_null() { None } else { Some(unsafe { &*at }) };
+                serial_println!("[lock] held-too-long name={} at={} by={}@cpu{} ms={} released=1", Site(name), Site(at), tag_tid(tag), tag_cpu(tag), ms);
+            }
+        }
+        LONG_SAID.store(k, Relaxed);
     }
 }
