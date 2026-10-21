@@ -25,7 +25,11 @@
 //! * THE WATCH ([`Watch::step`], once per BTHID pass from `avdtp::tick`): the master read each pass; when it moved, a
 //!   kept TG RegisterNotification gets its CHANGED (every writer: F-keys, the slider, Settings, AVRCP) and the CT pushes
 //!   SetAbsoluteVolume unless the headset itself set that level. While the headset has accepted one, it carries the
-//!   level and the mixer plays BT at unity ([`ct_volume`]; mute stays the mixer's).
+//!   level and the mixer plays BT at unity ([`ct_volume`]; mute stays the mixer's too).
+//! * MUTE ON THE WIRE (AVRCPMUTE, rmbp-ledger B790): AVRCP 1.6 §6.13.2 has no mute, so a muted master is
+//!   SetAbsoluteVolume(0) through the same one-in-flight path ([`Watch::step`]'s wire value) and the level again on
+//!   unmute; the level is the master's own (kept across the mute). A headset CHANGED while muted moves that kept level
+//!   and sends nothing ([`Watch::heard`]); `ct_volume` stays true while muted.
 //! * THE EFFECTS ([`apply`]): play/pause/next/prev go to the Player's media-key door (`video::player::media_key`, the
 //!   F7/F8/F9 router; atomics only, so safe under `BT`) — PLAY flips only a stream that is not playing, PAUSE and STOP
 //!   only one that is (`hda::play::busy`/`paused`, read); the volume goes to the one master model through
@@ -33,10 +37,10 @@
 //!
 //! Locks: `BT`, then [`VOL_NOTE`] alone or [`WATCH`] alone (never both, never with `avdtp`'s `A2` or `ACP_DUE`); `audio::bt_master` reaches
 //! `hda::vol`'s ring lock, which never takes `BT`. Wire: `[avrcp] cmd=<op> from=<addr> -> <play-pause|next|prev|none|
-//! volume=<n>|refused=<why>>` · `[avrcp] ct cmd=<set-volume|register> to=<addr> -> <sent[ volume=<n>]|interim volume=<n>|
+//! volume=<n>|refused=<why>>` · `[avrcp] ct cmd=<set-volume|register> to=<addr> -> <sent[ volume=<n>[ muted=1]]|interim volume=<n>|
 //! changed volume=<n>|accepted volume=<n>|rejected|not-implemented>` · `[avrcp] ct open to=<addr> …` · `[avrcp] tg changed
-//! to=<addr> -> volume=<n>`; `tests a2dp`: `avrcp=<ok|FAIL>` then `avrcp_ct=<ok|FAIL>` at the END of the `:: A2DP: … ::`
-//! verdict ([`legs`], [`legs_ct`]).
+//! to=<addr> -> volume=<n>`; `tests a2dp`: `avrcp=<ok|FAIL>`, `avrcp_ct=<ok|FAIL>` then `avrcp_mute=<ok|FAIL>` at the END of
+//! the `:: A2DP: … ::` verdict ([`legs`], [`legs_ct`], [`legs_mute`]).
 //! Compiled only under the `a2dp` knob.
 
 use super::avdtp::ACP_WAIT_MS;
@@ -281,6 +285,14 @@ fn master() -> u8 {
     return crate::audio::bt_master(None);
     #[cfg(not(any(feature = "uvc", feature = "hda-tone")))]
     0
+}
+
+/// The master is muted (AVRCPMUTE B790: the wire then carries 0, the level stays the master's); false with no audio seam.
+fn muted() -> bool {
+    #[cfg(any(feature = "uvc", feature = "hda-tone"))]
+    return crate::video::status::volume().1;
+    #[cfg(not(any(feature = "uvc", feature = "hda-tone")))]
+    false
 }
 
 /// Set the master to `abs` (0..=127) through the one master fn; the absolute volume now in force.
@@ -538,6 +550,8 @@ pub struct Push {
     pub cmd: &'static str,
     pub pdu: Vec<u8>,
     pub abs: u8,
+    /// A set-volume carrying the master's mute (`abs` is then 0, AVRCPMUTE B790).
+    pub muted: bool,
 }
 
 /// The watch's state: the master at the last pass, and the CT.
@@ -549,14 +563,16 @@ pub struct Watch {
 impl Watch {
     /// One pass, pure: the master is `abs`, `note` the TG's kept RegisterNotification, `chan` the open AVCTP channel
     /// to the CT's headset. A moved master closes the note with CHANGED; a new channel starts the CT (register); the
-    /// CT pushes SetAbsoluteVolume when the master differs from what the headset has and none is in flight.
-    pub fn step(&mut self, abs: u8, now: u64, note: &mut Option<([u8; 6], u8)>, chan: Option<u16>) -> Vec<Push> {
+    /// CT pushes SetAbsoluteVolume when the master differs from what the headset has and none is in flight. A `muted`
+    /// master is 0 on the wire (AVRCPMUTE B790); the TG's CHANGED stays on the level.
+    pub fn step(&mut self, abs: u8, muted: bool, now: u64, note: &mut Option<([u8; 6], u8)>, chan: Option<u16>) -> Vec<Push> {
         let mut out = Vec::new();
+        let wire = if muted { 0 } else { abs };
         let moved = self.seen.is_some_and(|s| s != abs);
         self.seen = Some(abs);
         if moved {
             if let Some((to, label)) = note.take() {
-                out.push(Push { to, cmd: "changed", pdu: changed(label, abs), abs });
+                out.push(Push { to, cmd: "changed", pdu: changed(label, abs), abs, muted: false });
             }
         }
         let Some(ct) = self.ct.as_mut() else { return out };
@@ -564,7 +580,7 @@ impl Watch {
         if ct.rcid != chan {
             *ct = Ct { rcid: chan, due: None, ..Ct::new(ct.addr, now) };
             if chan != 0 {
-                out.push(Push { to: ct.addr, cmd: "register", pdu: ct.register(), abs });
+                out.push(Push { to: ct.addr, cmd: "register", pdu: ct.register(), abs, muted: false });
             }
         }
         if ct.rcid == 0 || !ct.abs_ok {
@@ -573,11 +589,11 @@ impl Watch {
         if ct.set.is_some_and(|(_, t)| now.saturating_sub(t) > CT_RSP_MS) {
             ct.set = None;
         }
-        if ct.set.is_none() && ct.pushed != Some(abs) {
+        if ct.set.is_none() && ct.pushed != Some(wire) {
             let l = ct.label();
             ct.set = Some((l, now));
-            ct.pushed = Some(abs);
-            out.push(Push { to: ct.addr, cmd: "set-volume", pdu: ct_set_volume(l, abs), abs });
+            ct.pushed = Some(wire);
+            out.push(Push { to: ct.addr, cmd: "set-volume", pdu: ct_set_volume(l, wire), abs: wire, muted });
         }
         out
     }
@@ -585,6 +601,16 @@ impl Watch {
     /// The headset carries the level now.
     fn carries(&self) -> bool {
         self.ct.as_ref().is_some_and(|c| c.carries && c.abs_ok && c.rcid != 0)
+    }
+
+    /// The headset at `addr` set the master to `abs` itself, pure: nothing is pushed back. While `muted` the headset was
+    /// told 0 and that stays what it has (AVRCPMUTE B790): the new level is the master's, kept for the unmute.
+    pub fn heard(&mut self, addr: [u8; 6], abs: u8, muted: bool) {
+        if let Some(c) = self.ct.as_mut().filter(|c| c.addr == addr) {
+            if !muted {
+                c.pushed = Some(abs);
+            }
+        }
     }
 }
 
@@ -609,9 +635,7 @@ pub(super) fn ct_arm(addr: [u8; 6], now: u64) {
 
 /// The headset at `addr` set the master itself (the TG's SetAbsoluteVolume / volume keys): nothing is pushed back.
 fn ct_heard(addr: [u8; 6], abs: u8) {
-    if let Some(c) = WATCH.lock().ct.as_mut().filter(|c| c.addr == addr) {
-        c.pushed = Some(abs);
-    }
+    WATCH.lock().heard(addr, abs, muted());
 }
 
 /// The headset has accepted SetAbsoluteVolume on a live CT: it carries the level, so the mixer plays BT at unity
@@ -637,7 +661,7 @@ impl Bt {
         let mut note = VOL_NOTE.lock().take();
         let sends = {
             let mut w = WATCH.lock();
-            let s = w.step(master(), now, &mut note, chan);
+            let s = w.step(master(), muted(), now, &mut note, chan);
             CARRIES.store(w.carries(), Ordering::Release);
             s
         };
@@ -658,7 +682,7 @@ impl Bt {
         match s.cmd {
             "changed" => serial_println!("[avrcp] tg changed to={} -> volume={}", fmt_addr(&s.to), s.abs),
             "register" => serial_println!("[avrcp] ct cmd=register to={} -> sent", fmt_addr(&s.to)),
-            cmd => serial_println!("[avrcp] ct cmd={} to={} -> sent volume={}", cmd, fmt_addr(&s.to), s.abs),
+            cmd => serial_println!("[avrcp] ct cmd={} to={} -> sent volume={}{}", cmd, fmt_addr(&s.to), s.abs, if s.muted { " muted=1" } else { "" }),
         }
     }
 
@@ -699,14 +723,14 @@ pub fn legs_ct() -> Result<(), &'static str> {
     const A: [u8; 6] = [1, 2, 3, 4, 5, 6];
     let mut w = Watch { seen: None, ct: Some(Ct::new(A, 0)) };
     let mut note = None;
-    if !w.step(64, 0, &mut note, None).is_empty() {
+    if !w.step(64, false, 0, &mut note, None).is_empty() {
         return Err("no-channel");
     }
     let c = w.ct.as_mut().ok_or("ct")?;
     if c.open_due(ACP_WAIT_MS) || !c.open_due(ACP_WAIT_MS + 1) || c.open_due(ACP_WAIT_MS + 2) {
         return Err("open-due");
     }
-    let out = w.step(64, 1700, &mut note, Some(0x0041));
+    let out = w.step(64, false, 1700, &mut note, Some(0x0041));
     let want_reg: &[u8] = &[0x00, 0x11, 0x0E, 0x03, 0x48, 0x00, 0x00, 0x19, 0x58, 0x31, 0x00, 0x00, 0x05, 0x0D, 0x00, 0x00, 0x00, 0x00];
     let want_set: &[u8] = &[0x10, 0x11, 0x0E, 0x00, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x40];
     if out.len() != 2 || out[0].cmd != "register" || out[0].pdu != want_reg || out[1].cmd != "set-volume" || out[1].pdu != want_set {
@@ -719,11 +743,11 @@ pub fn legs_ct() -> Result<(), &'static str> {
     if c.on_rsp(&[0x12, 0x11, 0x0E, 0x09, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x40]) != Some(("set-volume", CtEv::Accepted(0x40))) || !w.carries() {
         return Err("accepted");
     }
-    if !w.step(64, 1800, &mut note, Some(0x0041)).is_empty() {
+    if !w.step(64, false, 1800, &mut note, Some(0x0041)).is_empty() {
         return Err("still");
     }
     note = Some((A, 9));
-    let out = w.step(abs_of(9), 1900, &mut note, Some(0x0041));
+    let out = w.step(abs_of(9), false, 1900, &mut note, Some(0x0041));
     if out.len() != 2 || out[0].cmd != "changed" || out[0].pdu != changed(9, abs_of(9)) || out[1].pdu != ct_set_volume(2, abs_of(9)) || note.is_some() {
         return Err("move");
     }
@@ -737,8 +761,52 @@ pub fn legs_ct() -> Result<(), &'static str> {
     if c.on_rsp(&[0x22, 0x11, 0x0E, 0x0A, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x00]) != Some(("set-volume", CtEv::Refused("rejected"))) || w.carries() {
         return Err("rejected");
     }
-    if !w.step(80, 2000, &mut note, Some(0x0041)).is_empty() {
+    if !w.step(80, false, 2000, &mut note, Some(0x0041)).is_empty() {
         return Err("refused-pushes");
+    }
+    Ok(())
+}
+
+// ── AVRCPMUTE (rmbp-ledger B790): the master's mute on the wire ─────────────────────────────────────────────────────
+
+/// `tests a2dp` `avrcp_mute` leg — a synthetic headset that carries the level: mute -> SetAbsoluteVolume(0) sent (and
+/// accepted, the headset still carries); the headset's CHANGED while muted -> the level remembered, nothing sent; unmute
+/// -> the remembered level sent; a mute while a set is in flight waits for it (the one-in-flight path), then 0.
+pub fn legs_mute() -> Result<(), &'static str> {
+    const A: [u8; 6] = [1, 2, 3, 4, 5, 6];
+    const CH: Option<u16> = Some(0x0041);
+    let mut w = Watch { seen: None, ct: Some(Ct::new(A, 0)) };
+    let mut note = None;
+    let out = w.step(64, false, 0, &mut note, CH);
+    if out.len() != 2 || out[1].cmd != "set-volume" || out[1].pdu != ct_set_volume(1, 64) || out[1].muted {
+        return Err("setup");
+    }
+    let c = w.ct.as_mut().ok_or("ct")?;
+    if c.on_rsp(&[0x12, 0x11, 0x0E, 0x09, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x40]) != Some(("set-volume", CtEv::Accepted(0x40))) {
+        return Err("setup-accepted");
+    }
+    let out = w.step(64, true, 100, &mut note, CH);
+    if out.len() != 1 || out[0].cmd != "set-volume" || out[0].pdu != ct_set_volume(2, 0) || out[0].abs != 0 || !out[0].muted {
+        return Err("mute-sent");
+    }
+    let c = w.ct.as_mut().ok_or("ct")?;
+    if c.on_rsp(&[0x22, 0x11, 0x0E, 0x09, 0x48, 0x00, 0x00, 0x19, 0x58, 0x50, 0x00, 0x00, 0x01, 0x00]) != Some(("set-volume", CtEv::Accepted(0))) || !w.carries() {
+        return Err("mute-accepted");
+    }
+    w.heard(A, 80, true);
+    if !w.step(80, true, 200, &mut note, CH).is_empty() || !w.step(80, true, 300, &mut note, CH).is_empty() {
+        return Err("changed-while-muted");
+    }
+    let out = w.step(80, false, 400, &mut note, CH);
+    if out.len() != 1 || out[0].pdu != ct_set_volume(3, 80) || out[0].abs != 80 || out[0].muted {
+        return Err("unmute-sent");
+    }
+    if !w.step(80, true, 500, &mut note, CH).is_empty() {
+        return Err("in-flight");
+    }
+    let out = w.step(80, true, 500 + CT_RSP_MS + 1, &mut note, CH);
+    if out.len() != 1 || out[0].pdu != ct_set_volume(4, 0) || !out[0].muted {
+        return Err("mute-after-flight");
     }
     Ok(())
 }
