@@ -17995,8 +17995,9 @@ fn dump_type2_frame(idx: usize, mps: u16, frame: &[u8]) {
 /// TPFRAME (B197) — per-frame delta clamp, carried verbatim from the retired `mtraw_inject` path
 /// (its reasoning: the TYPE2 sensor spans a few thousand units edge to edge and streams at ~100 Hz,
 /// so a real swipe moves tens of units per frame — flight 12's corpus moves 30 and 3). Hard against
-/// a garbled coordinate, and against a re-touch no lift frame announced (`unverified` on metal).
-const TP_MT_MAX_STEP: i32 = 128;
+/// a garbled coordinate, and against a re-touch no lift frame announced (`unverified` on metal). FINEMOTION2 (B826): ONE
+/// source — the derived `finemotion::MAX_STEP` (the pad's diagonal in 100 ms at 125 Hz = 976 units per frame).
+const TP_MT_MAX_STEP: i32 = finemotion::MAX_STEP;
 /// TPSCALE (rmbp-ledger B214, flight 13 §2) — the vendor route's deltas are RAW Wellspring sensor units
 /// (flight 13: x0 from -3503 to 2051, y0 from 414 to 4923 across one finger's travel — roughly ten
 /// thousand units over a 1440-logical-pixel pad), and TPFRAME handed them to the router as pixels: a
@@ -19300,14 +19301,14 @@ impl core::fmt::Display for IsrVia {
 /// divisor (7 → 0, -7 → 0: toward zero, both signs), and the sign is preserved. GO-RED: `TP_MT_DIV = 1`
 /// (the 1:1 scale flight 13 flew) reads `128,88,-60,7,-7 -> 128,88,-60,7,-7 … -> FAIL`.
 fn tpscale_selftest() {
-    let raw = [TP_MT_MAX_STEP, 88, -60, 7, -7];
+    let raw = [128, 88, -60, 7, -7];
     let got = [tp_scale(raw[0]), tp_scale(raw[1]), tp_scale(raw[2]), tp_scale(raw[3]), tp_scale(raw[4])];
     // TPSPEED (B225): curve 8/3@24 — |raw|<=24 -> /8 (24 -> 3), above: 3 + excess/3 (128 -> 37, 88 -> 24, -60 -> -15). The knee is continuous
     // (24 -> 3, 25 -> 3, 27 -> 4), sign-preserving, and the high slope must be steeper than the low one (128 -> more than 128/8 = 16).
     let knee = [tp_scale(24), tp_scale(25), tp_scale(27), tp_scale(-27), tp_scale(30)];
     let ok = got[0] == 37 && got[1] == 24 && got[2] == -15 && got[3] == 0 && got[4] == 0
         && knee[0] == 3 && knee[1] == 3 && knee[2] == 4 && knee[3] == -4 && knee[4] == 5
-        && TP_MT_DIV_LOW > 1 && TP_MT_DIV_HIGH < TP_MT_DIV_LOW && got[0] > TP_MT_MAX_STEP / TP_MT_DIV_LOW;
+        && TP_MT_DIV_LOW > 1 && TP_MT_DIV_HIGH < TP_MT_DIV_LOW && got[0] > raw[0] / TP_MT_DIV_LOW;
     crate::bootlog_println!(
         ":: EHCI-HID: TPSCALE self-test: curve={}/{}@{} raw={},{},{},{},{} -> px={},{},{},{},{} knee={},{},{},{},{} (clamp-step={}px/frame, toward-zero) -> {} ::",
         TP_MT_DIV_LOW, TP_MT_DIV_HIGH, TP_MT_CURVE_KNEE, raw[0], raw[1], raw[2], raw[3], raw[4], got[0], got[1], got[2], got[3], got[4],
@@ -20974,12 +20975,47 @@ pub mod mtreport {
             }
             _ => false,
         };
-        let ok = raw == 2 && k1_ok && swapped && three && !jump && press && lift == 0 && tap == 1 && tap2 == 2 && rebase12;
+        // FINEMOTION2 (B826): the derived bound. H0 = K1's finger alone; H1 = H0 moved by the fastest honest step
+        // (MAX_STEP on x) passes unclamped; J1 = H0 moved by 2x MAX_STEP is a JUMP (dropped, counted), and the next
+        // frame moves from J1 (the baseline followed the jump).
+        let max = super::finemotion::MAX_STEP;
+        let mut h = [0u8; WSP2_HDR_LEN + 3 * WSP2_FSIZE];
+        let nh = frame(&[0], &mut h);
+        let h0 = vendor(&h[..nh]);
+        place(&mut h, 0, (1180 + max) as i16, 2756);
+        let h1 = vendor(&h[..nh]);
+        let mut c3 = TpCensus::EMPTY;
+        let honest = match (h0, h1) {
+            (Some(a), Some(b)) => {
+                let _ = c3.mt_step(a);
+                let (_, dx, dy, _) = c3.mt_step(b);
+                let (want, _) = super::finemotion::step2((max, 0), &mut (0, 0));
+                (dx, dy) == want && c3.mt_last.0 == max && c3.mt_last.1 == 0
+            }
+            _ => false,
+        };
+        place(&mut h, 0, (1180 + 2 * max) as i16, 2756);
+        let j1 = vendor(&h[..nh]);
+        place(&mut h, 0, (1180 + 2 * max + 30) as i16, 2756);
+        let j2 = vendor(&h[..nh]);
+        let mut c4 = TpCensus::EMPTY;
+        let over = match (h0, j1, j2) {
+            (Some(a), Some(b), Some(n)) => {
+                let _ = c4.mt_step(a);
+                let j0 = super::finemotion::jumps();
+                let (_, dx, dy, _) = c4.mt_step(b);
+                let dropped = dx == 0 && dy == 0 && c4.mt_last == (0, 0, 0, 0) && super::finemotion::jumps() > j0;
+                let _ = c4.mt_step(n);
+                dropped && c4.mt_last.0 == 30
+            }
+            _ => false,
+        };
+        let ok = raw == 2 && k1_ok && swapped && three && !jump && press && lift == 0 && tap == 1 && tap2 == 2 && rebase12 && honest && over;
         let w = |b: bool| if b { "ok" } else { "FAIL" };
         serial_println!(
-            ":: TRACKPADMT: raw={} contacts={} swapped={} three={} d={}/{} jump={} press={} lift={} tap={} tap2={} rebase12={} -> {} ::",
+            ":: TRACKPADMT: raw={} contacts={} swapped={} three={} d={}/{} jump={} press={} lift={} tap={} tap2={} rebase12={} honest={} over={} max_step={} -> {} ::",
             raw, k1.map_or(0, |f| f.fingers), w(swapped), w(three), d.0, d.1, if jump { "yes" } else { "no" },
-            if press { "primary" } else { "FAIL" }, lift, tap, tap2, w(rebase12), if ok { "PASS" } else { "FAIL" }
+            if press { "primary" } else { "FAIL" }, lift, tap, tap2, w(rebase12), w(honest), if over { "jump" } else { "FAIL" }, max, if ok { "PASS" } else { "FAIL" }
         );
     }
 }

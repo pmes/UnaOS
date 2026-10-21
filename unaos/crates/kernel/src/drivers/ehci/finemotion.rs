@@ -40,6 +40,14 @@
 //! CLAMPED ([`clamp`]): magnitude capped at [`MAX_STEP`], direction kept, the pointer moves; `rebase=` counts only a
 //! true re-touch, the first frame after [`JUMP_GAP_MS`] of silence with no lift frame. Wire: `[ptr] fine … rebase=<n>
 //! clamped=<n> div=… range=x<min>..<max>,y<min>..<max> range_seen=x<min>..<max>,y<min>..<max>`.
+//!
+//! FINEMOTION2 (rmbp-ledger B826, flight 37 after TRACKPADMT B818). The clamp was TUNED (`PAD_SPAN / 8` = 999, "a pad
+//! width in 80 ms at ~100 Hz") against a stream whose big steps were cross-record jumps (f37-boot1 19:15:21Z..19:16:51Z:
+//! `clamped=` 14 -> 194 while `moved=` froze), not fingers. It is now DERIVED: [`MAX_STEP`] = the pad's diagonal crossed
+//! in 100 ms at the measured 125 Hz = 976 units per frame (the fastest real finger frame on flight 37's wire is
+//! `in=39,166`, |v| = 170). A step beyond it is a JUMP ([`is_jump`] via [`over`]): DROPPED — no pixels, remainder
+//! zeroed, the baseline moves to the new position — counted `jump=`. Nothing moves a capped amount any more: `clamped=`
+//! is gone from the wire. Wire: `[ptr] fine … rebase=<n> jump=<n> max_step=976 div=… range=… range_seen=…`.
 
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering::Relaxed};
 
@@ -64,11 +72,25 @@ pub(super) const PAD_RANGE_X: (i32, i32) = (-3243, 4751);
 pub(super) const PAD_RANGE_Y: (i32, i32) = (-141, 6165);
 /// The x span the one scale is derived from: 7994 units = [`PAD_PX`] px below the knee, 5.55 units/px.
 const PAD_SPAN: i32 = PAD_RANGE_X.1 - PAD_RANGE_X.0;
-/// POINTERSCALE2: the largest raw step one frame may carry, as a vector MAGNITUDE — an eighth of the pad, i.e. a full
-/// pad width in 80 ms at the pad's ~100 Hz frame rate, faster than any deliberate stroke. A bigger step (a burst after
-/// a stream hole, a flick) is CLAMPED to this length with its direction kept: the pointer moves, fast, the way the
-/// finger went — never discarded (B540's quarter-range rebase threw it away) and never bent (B540's per-axis clamp did).
-pub(super) const MAX_STEP: i32 = PAD_SPAN / 8;
+/// FINEMOTION2: the SENSOR's electrical x extent (every record the pad reported, contacts and edge records): the union of
+/// flight 37's `range_seen=` — x -4786 (f37-boot1 19:15:24Z) .. 5302 (f37-boot3 20:27:02Z). Not the scale's span
+/// ([`PAD_RANGE_X`] stays the gain); wsp.c's 7-series table (-4828..5345) agrees within 1 %.
+const SENSOR_X: (i32, i32) = (-4786, 5302);
+/// FINEMOTION2: the sensor's y extent, the same union — y -154 (f37-boot1 19:15:24Z) .. 6726 (f37-boot3 20:26:52Z).
+const SENSOR_Y: (i32, i32) = (-154, 6726);
+/// FINEMOTION2: the pad's report rate, measured — `[ptr] fine vendor=` 2741 -> 2867 -> 2992 -> 3117 -> 3242 on the
+/// one-second summaries of f37-boot3 20:28:01Z..05Z (126/125/125/125 per s; f37-boot1 18:56:25Z->26Z: 0 -> 124).
+const REPORT_HZ: i64 = 125;
+/// FINEMOTION2: the fastest HONEST stroke crosses the pad's longest straight line in this many milliseconds.
+const SWIPE_MS: i64 = 100;
+/// FINEMOTION2: the largest raw step one frame may carry, as a vector MAGNITUDE, DERIVED (not tuned): the pad's diagonal
+/// crossed in [`SWIPE_MS`] at [`REPORT_HZ`] —
+/// `isqrt(10088^2 + 6880^2) * 1000 / (125 * 100) = 12210 * 1000 / 12500 = 976` units per frame, 5.7x flight 37's
+/// fastest real finger frame (`in=39,166`, |v| = 170). A step beyond it is a JUMP ([`is_jump`]): dropped, counted `jump=`.
+pub(super) const MAX_STEP: i32 = {
+    let (sx, sy) = ((SENSOR_X.1 - SENSOR_X.0) as i64, (SENSOR_Y.1 - SENSOR_Y.0) as i64);
+    (isqrt(sx * sx + sy * sy) * 1000 / (REPORT_HZ * SWIPE_MS)) as i32
+};
 /// A coordinate beyond this magnitude is garbled and never enters `range_seen=`.
 const COORD_SANE: i32 = 16_384;
 /// POINTERSCALE: a frame after this much stream silence (with no lift frame between) is a RE-TOUCH and re-baselines.
@@ -81,7 +103,7 @@ static X_MAX: AtomicI32 = AtomicI32::new(i32::MIN);
 static Y_MIN: AtomicI32 = AtomicI32::new(i32::MAX);
 static Y_MAX: AtomicI32 = AtomicI32::new(i32::MIN);
 static REBASE: AtomicU32 = AtomicU32::new(0);
-static CLAMPED: AtomicU32 = AtomicU32::new(0);
+static JUMP: AtomicU32 = AtomicU32::new(0);
 
 /// One touching frame's raw sensor position into `range_seen=` (live endpoint only — the fixtures' censuses never call
 /// it). POINTERSCALE2: a witness only; the scale never reads it.
@@ -100,26 +122,22 @@ pub(super) fn span() -> i32 {
     PAD_SPAN
 }
 
-/// POINTERSCALE2: one frame's raw step with its MAGNITUDE capped at [`MAX_STEP`], direction kept (both legs scaled by
-/// the same factor). Pure; `true` when it cut.
-fn cap(r: (i32, i32)) -> ((i32, i32), bool) {
+/// FINEMOTION2: is one frame's raw step's MAGNITUDE beyond [`MAX_STEP`] (faster than any honest finger)? Pure.
+fn over(r: (i32, i32)) -> bool {
     let (rx, ry) = (r.0 as i64, r.1 as i64);
-    let m2 = rx * rx + ry * ry;
     let lim = MAX_STEP as i64;
-    if m2 <= lim * lim {
-        return (r, false);
-    }
-    let m = isqrt(m2).max(1);
-    (((rx * lim / m) as i32, (ry * lim / m) as i32), true)
+    rx * rx + ry * ry > lim * lim
 }
 
-/// [`cap`] on the decode path (`TpCensus::mt_step`), counted (`clamped=` on `[ptr] fine`) when it cuts.
+/// FINEMOTION2: nothing left to cut — [`is_jump`] refused every step over [`MAX_STEP`] before this call, so the step is
+/// returned unchanged. Kept only so `TpCensus::mt_step`'s call line is unchanged (owed: remove the call and this fn).
 pub(super) fn clamp(r: (i32, i32)) -> (i32, i32) {
-    let (out, cut) = cap(r);
-    if cut {
-        CLAMPED.fetch_add(1, Relaxed);
-    }
-    out
+    r
+}
+
+/// FINEMOTION2: the over-bound steps dropped since boot (`jump=`), for `tests trackpadmt`.
+pub(super) fn jumps() -> u32 {
+    JUMP.load(Relaxed)
 }
 
 /// Sensor units per pixel below the knee, Q8 — ONE number for both axes.
@@ -144,7 +162,7 @@ pub(super) fn curve_q8(raw: i32) -> i32 {
 }
 
 /// Integer square root (floor), for the frame's vector magnitude.
-fn isqrt(n: i64) -> i64 {
+const fn isqrt(n: i64) -> i64 {
     if n <= 0 {
         return 0;
     }
@@ -169,13 +187,17 @@ pub(super) fn step2(r: (i32, i32), res: &mut (i32, i32)) -> ((i32, i32), (i32, i
     ((px, py), q)
 }
 
-/// POINTERSCALE: is this frame a RE-TOUCH to re-baseline on rather than motion to move by? POINTERSCALE2: ONLY the
-/// first frame after [`JUMP_GAP_MS`] or more of silence — the size of the step no longer decides it (a big step is
-/// [`clamp`]ed and moves). `_r` is kept so the call site's shape is unchanged. Counts it when it says yes.
-pub(super) fn is_jump(_r: (i32, i32), gap_ms: u64) -> bool {
-    let jump = gap_ms >= JUMP_GAP_MS;
-    if jump {
+/// POINTERSCALE: is this frame one to re-baseline on rather than motion to move by? FINEMOTION2: yes for the first frame
+/// after [`JUMP_GAP_MS`] or more of silence (a RE-TOUCH, counted `rebase=`), and yes for a step whose magnitude is beyond
+/// the derived [`MAX_STEP`] (a JUMP, counted `jump=`). The caller drops the frame and re-baselines on its position.
+pub(super) fn is_jump(r: (i32, i32), gap_ms: u64) -> bool {
+    if gap_ms >= JUMP_GAP_MS {
         REBASE.fetch_add(1, Relaxed);
+        return true;
+    }
+    let jump = over(r);
+    if jump {
+        JUMP.fetch_add(1, Relaxed);
     }
     jump
 }
@@ -270,9 +292,9 @@ fn summary_tick(idx: usize) {
     LOGGED.store(n, Relaxed);
     let lost = LOST.load(Relaxed);
     serial_println!(
-        "[ptr] fine ep={} n={} moved={} carried={} lost={} floor={} rel={} vendor={} rebase={} clamped={} div={}u/px {} -> {} (route evidence: reports by stream since boot; POINTERSCALE2: one FIXED scale from the pad's observed range, range_seen= changes nothing; a fast step clamped with its direction kept, rebase= only a re-touch after 250 ms silence)",
+        "[ptr] fine ep={} n={} moved={} carried={} lost={} floor={} rel={} vendor={} rebase={} jump={} max_step={} div={}u/px {} -> {} (route evidence: reports by stream since boot; POINTERSCALE2: one FIXED scale from the pad's observed range, range_seen= changes nothing; FINEMOTION2: a step over max_step (the pad's diagonal in 100 ms at 125 Hz) is dropped as a jump, rebase= only a re-touch after 250 ms silence)",
         idx, n, MOVED.load(Relaxed), CARRIED.load(Relaxed), lost, if lost == 0 { "none" } else { "LOST" },
-        REL.load(Relaxed), VENDOR.load(Relaxed), REBASE.load(Relaxed), CLAMPED.load(Relaxed), Q8(div_q8()), Extent, if lost == 0 { "OK" } else { "FAIL" }
+        REL.load(Relaxed), VENDOR.load(Relaxed), REBASE.load(Relaxed), JUMP.load(Relaxed), MAX_STEP, Q8(div_q8()), Extent, if lost == 0 { "OK" } else { "FAIL" }
     );
 }
 
@@ -314,18 +336,18 @@ pub(super) fn selftest() {
     let legacy_ok = super::trackpad_dispatch(&[super::TRACKPAD_REPORT_ID, 0, 1, 0, 0, 0, 0, 0])
         == super::TpRoute::Rel { buttons: 0, dx: 1, dy: 0 };
     // POINTERSCALE (B540): flight 32's own diagonal frame gets ONE gain on both legs (qx/qy == rx/ry within a Q8
-    // unit). POINTERSCALE2 (B554): a quarter-range step inside the silence rule is CLAMPED, not rebased — it moves the
-    // pointer by exactly curve(MAX_STEP) along its own direction (`jump=clamped`); a frame after JUMP_GAP_MS of silence
-    // with no lift re-baselines (no pixels, remainder dropped) and the next frame moves again (`retouch=rebased`).
+    // unit). FINEMOTION2 (B826): a quarter-range step (1999 > MAX_STEP) inside the silence rule is a JUMP — DROPPED: no
+    // pixels, no remainder, no `mt_last` (`jump=dropped`); the bound's edges: MAX_STEP passes, MAX_STEP + 1 is over, a
+    // diagonal under it passes. A frame after JUMP_GAP_MS of silence with no lift re-baselines (no pixels, remainder
+    // dropped) and the next frame moves again (`retouch=rebased`).
     let (_, qd) = step2((-18, -51), &mut (0, 0));
     let iso_ok = qd.0 < 0 && qd.1 < 0 && ((qd.0 as i64) * 51 - (qd.1 as i64) * 18).abs() <= 51;
     let _ = c.mt_step(fr(0, 0));
     let _ = c.mt_step(fr(0, 1));
     let jump_x = span() / 4 + 1;
     let (_, jx, _, _) = c.mt_step(fr(jump_x, 1));
-    let jump_ok = jx >= 1 && c.mt_last.0 == MAX_STEP && c.mt_last.2 == curve_q8(MAX_STEP) && cap((jump_x, 0)) == ((MAX_STEP, 0), true);
-    let ((cx, cy), _) = cap((-3 * MAX_STEP, -4 * MAX_STEP)); // a 3-4-5 diagonal: clamped to length MAX_STEP, the 3:4 kept
-    let dir_ok = cx < 0 && cy < 0 && ((cx as i64) * 4 - (cy as i64) * 3).abs() <= 4 && (cx * cx + cy * cy) as i64 <= (MAX_STEP as i64) * (MAX_STEP as i64);
+    let jump_ok = jump_x > MAX_STEP && jx == 0 && c.mt_last == (0, 0, 0, 0) && c.mt_res == (0, 0);
+    let dir_ok = !over((MAX_STEP, 0)) && over((MAX_STEP + 1, 0)) && !over((-3 * (MAX_STEP / 5), -4 * (MAX_STEP / 5)));
     let now = crate::arch::ms();
     let retouch_ok = if now > 2 * JUMP_GAP_MS {
         c.mt_ms = now - JUMP_GAP_MS - 10; // the stream went silent 260 ms ago with the finger never lifted
@@ -341,6 +363,6 @@ pub(super) fn selftest() {
     serial_println!(
         ":: FINEMOTION: one_count_moved={}/200 ten_count_moved={}/20 floor={} stall_s={} iso={} jump={} retouch={} max_step={} {} -> {} ::",
         one, ten, if floor_ok && legacy_ok { "none" } else { "FLOORED" }, stall_s, if iso_ok { "ok" } else { "BENT" },
-        if jump_ok && dir_ok { "clamped" } else { "DISCARDED" }, if retouch_ok { "rebased" } else { "MOVED" }, MAX_STEP, Scale, if pass { "PASS" } else { "FAIL" }
+        if jump_ok && dir_ok { "dropped" } else { "MOVED" }, if retouch_ok { "rebased" } else { "MOVED" }, MAX_STEP, Scale, if pass { "PASS" } else { "FAIL" }
     );
 }
