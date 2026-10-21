@@ -727,7 +727,7 @@ refs/heads/exec-rmbp-sleep2   2333b0bb FOLDED-BY-HAND (this commit) 2026-10-21 B
 refs/heads/exec-rmbp-aethernet2   be46ddcd FOLDED-BY-HAND (this commit) 2026-10-21 SR187
 refs/heads/exec-rmbp-textscale   d88a9c18 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-textscale2   f9a46a3d FOLDED-BY-HAND (this commit) 2026-10-21 B814
-refs/heads/exec-rmbp-toastflicker   d88a9c18 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-toastflicker   3026c5f1 FOLDED-BY-HAND (this commit) 2026-10-21 B815
 refs/heads/exec-rmbp-a11yshadow   d88a9c18 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-bootlist   d88a9c18 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-autolock2   6171f3b1 IN-FLIGHT cut 2026-10-21
@@ -735,3 +735,6 @@ refs/heads/exec-rmbp-memline2   6171f3b1 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-a11ytree2   6171f3b1 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-lockreg2   6171f3b1 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-filetypes3   6171f3b1 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-quarryrelist   d7b45709 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-unafswrite   d7b45709 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-finemotion2   d7b45709 IN-FLIGHT cut 2026-10-21
