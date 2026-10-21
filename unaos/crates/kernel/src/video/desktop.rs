@@ -710,6 +710,7 @@ pub fn shadows_stale() {
 /// old and new extent when its box, level, theme or scale moved, its extent when it appeared or went. The same pass
 /// drains the queue (`drain_deferred`), so the shadow lands with the move that caused it.
 pub(super) fn track() {
+    shim_note_pass(); // SHIMMERIDLE2 (B830): every pass counts, so the idle seat can tell a busy glass from a stranded one
     let Some(pi) = crate::video::panel_info_nonblocking() else { return };
     let (pw, ph) = (pi.width as i32, pi.height as i32);
     if pw == 0 || ph == 0 {
@@ -2521,6 +2522,11 @@ static SHIM_BUSY: AtomicBool = AtomicBool::new(false);
 static SHIM_TICK_US: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "facet")]
 static SHIM_TICK_NB: AtomicU32 = AtomicU32::new(0);
+/// SHIMMERIDLE2 (B830): the last tick's glints written and px in its boxes (the `[shimmer] tick` line).
+#[cfg(feature = "facet")]
+static SHIM_TICK_GL: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "facet")]
+static SHIM_TICK_PX: AtomicU64 = AtomicU64::new(0);
 
 /// The live seat (from [`track`], at the head of the composite pass, before the erase drain): at most once per
 /// [`SHIMMER_MS`], only when the erase queue is empty and the pass queued no shadow fill, only while the desktop scene
@@ -2542,9 +2548,9 @@ fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
     let t0 = now_ns().0;
     let next = crate::video::wallpaper::shimmer_with(|s, buf, w, h| {
         if w != pw || h != ph || s.w != w || s.h != h {
-            return (cur, 0);
+            return (cur, 0, 0, 0);
         }
-        let (c, _, nb, _) = shimmer_tick(
+        let (c, gl, nb, px) = shimmer_tick(
             s,
             now,
             occ,
@@ -2556,13 +2562,15 @@ fn shimmer_live(occ: &[(usize, usize, usize, usize)], pw: usize, ph: usize) {
             |x, y, c| unsafe { core::ptr::write_volatile(buf.add(y * w + x), c) },
             |x, y, bw, bh| super::defer_erase(x, y, bw, bh, super::DEFER_ROUTE, false),
         );
-        (c, nb)
+        (c, nb, gl, px)
     });
-    if let Some((c, nb)) = next {
+    if let Some((c, nb, gl, px)) = next {
         SHIM_CURSOR.store(c, Ordering::Relaxed);
         // SHIMMERIDLE (B663): this tick's cost (re-tint + queue) and its boxes, read by the idle seat.
         SHIM_TICK_US.store(now_ns().0.saturating_sub(t0) / 1000, Ordering::Relaxed);
         SHIM_TICK_NB.store(nb, Ordering::Relaxed);
+        SHIM_TICK_GL.store(gl, Ordering::Relaxed);
+        SHIM_TICK_PX.store(px, Ordering::Relaxed);
         SHIM_TICKS.fetch_add(1, Ordering::Relaxed);
     }
     SHIM_BUSY.store(false, Ordering::Release);
@@ -2615,14 +2623,15 @@ static SHIM_RM_FORCE: AtomicBool = AtomicBool::new(false);
 
 /// THE GATE CHECK: the compositor gate is free and nothing is owed — no declined pass (`COMP_PENDING`), no queued
 /// erase box, no menu paint, no damaged row (a window that moved or drew since the last pass). Read-only; the window
-/// table is taken once, for the scan.
+/// table is taken once, for the scan. SHIMMERIDLE2 (B830): returns the refusing terms, one bit each (`WHY_*`, file
+/// tail); 0 = the glass is idle.
 #[cfg(all(target_arch = "x86_64", feature = "facet"))]
-fn idle_glass() -> bool {
-    !super::COMP_GATE.load(Ordering::Acquire)
-        && !super::COMP_PENDING.load(Ordering::Acquire)
-        && super::DEFER_N.load(Ordering::Relaxed) == 0
-        && !super::menu_paint_owed()
-        && !super::any_damaged()
+fn idle_why() -> u8 {
+    (if super::COMP_GATE.load(Ordering::Acquire) { WHY_GATE } else { 0 })
+        | (if super::COMP_PENDING.load(Ordering::Acquire) { WHY_PENDING } else { 0 })
+        | (if super::DEFER_N.load(Ordering::Relaxed) != 0 { WHY_ERASE } else { 0 })
+        | (if super::menu_paint_owed() { WHY_MENU } else { 0 })
+        | (if super::any_damaged() { WHY_DAMAGED } else { 0 })
 }
 
 /// **The idle tick** (SHIMMERIDLE, B663) — from the device-service pass on every iteration. See the block above.
@@ -2637,28 +2646,37 @@ pub fn shimmer_idle() {
         return;
     }
     SHIM_IDLE_LAST.store(now, Ordering::Relaxed);
-    if !idle_glass() {
+    let why = idle_why();
+    if why != 0 {
         SHIM_IDLE_SKIPS.fetch_add(1, Ordering::Relaxed);
-        return;
+        if !shim_stranded(why) {
+            return;
+        }
+    } else {
+        SHIM_OWED_AT.store(0, Ordering::Relaxed);
     }
+    let carry = why != 0; // SHIMMERIDLE2 (B830): a carried pass services owed work; its tick-less outcome is no backoff
     let n0 = SHIM_TICKS.load(Ordering::Relaxed);
     let t0 = now_ns().0;
     super::composite();
     let pass_us = now_ns().0.saturating_sub(t0) / 1000;
     let ticked = SHIM_TICKS.load(Ordering::Relaxed) != n0;
-    SHIM_IDLE_EMPTY.store(!ticked || SHIM_TICK_NB.load(Ordering::Relaxed) == 0, Ordering::Relaxed);
+    if !carry || ticked {
+        SHIM_IDLE_EMPTY.store(!ticked || SHIM_TICK_NB.load(Ordering::Relaxed) == 0, Ordering::Relaxed);
+    }
     if ticked {
         SHIM_IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
         SHIM_IDLE_MAX_US.fetch_max(SHIM_TICK_US.load(Ordering::Relaxed), Ordering::Relaxed);
         SHIM_IDLE_PASS_US.fetch_max(pass_us, Ordering::Relaxed);
+        shim_wire_once();
     }
 }
 
 /// **`tests shimmeridle`** (R80: a verb, never at boot). Two 200 ms windows with the fixture's own task asleep (it
-/// draws nothing): (1) the shimmer's ticks in the window (all seats) must be 4..=7 — the 33 ms floor caps it at 7, the
-/// idle seat must lift it to at least 4 — each idle tick under STARFIELD's bound (800 us), and no gate steal;
+/// draws nothing), after a settle of at most 1 s for the first tick (SHIMMERIDLE2 B830): (1) the shimmer's ticks in the
+/// window (all seats) must be 3..=7 — the 33 ms floor caps it at 7, the idle seat must lift it to at least 3 — each idle tick under STARFIELD's bound (800 us), and no gate steal;
 /// (2) with reduce motion forced, the idle seat ticks zero times.
-/// `:: SHIMMERIDLE: detail idle_ticks=<n> pass_max_us=<n> skips=<n> backdrop=<0|1> ::`
+/// `:: SHIMMERIDLE: detail idle_ticks=<n> pass_max_us=<n> skips=<n> backdrop=<0|1> why=<terms|none> carried=<n> settle_ms=<n> ::`
 /// `:: SHIMMERIDLE: idle_ms=<n> ticks=<n> max_us=<n> reduce_motion_ticks=<n> gate_steals=<n> -> PASS|FAIL ::`
 #[cfg(all(target_arch = "x86_64", feature = "facet"))]
 pub fn shimmeridle_selftest() {
@@ -2667,6 +2685,14 @@ pub fn shimmeridle_selftest() {
         serial_println!(":: SHIMMERIDLE: reduce motion is set (the idle tick is off by design) -> SKIP ::");
         return;
     }
+    // SHIMMERIDLE2 (B830): SETTLE first — the premise is an idle desktop; wait (<= 1 s) for any shimmer tick.
+    let (s0, n0) = (crate::arch::ms(), SHIM_TICKS.load(Ordering::Relaxed));
+    while SHIM_TICKS.load(Ordering::Relaxed) == n0 && crate::arch::ms().saturating_sub(s0) < 1000 {
+        crate::arch::sched::sleep_ms(5);
+    }
+    let settle_ms = crate::arch::ms().saturating_sub(s0);
+    SHIM_IDLE_WHY.store(0, Ordering::Relaxed);
+    let carried0 = SHIM_IDLE_CARRIED.load(Ordering::Relaxed);
     let steal0 = super::comp_steal_gen();
     let (skip0, i0) = (SHIM_IDLE_SKIPS.load(Ordering::Relaxed), SHIM_IDLE_TICKS.load(Ordering::Relaxed));
     SHIM_IDLE_MAX_US.store(0, Ordering::Relaxed);
@@ -2683,10 +2709,12 @@ pub fn shimmeridle_selftest() {
     let rm_ticks = SHIM_IDLE_TICKS.load(Ordering::Relaxed).wrapping_sub(r0);
     SHIM_RM_FORCE.store(false, Ordering::Relaxed);
     let steals = super::comp_steal_gen().wrapping_sub(steal0);
-    let ok = (4..=7).contains(&ticks) && idle_ticks > 0 && max_us <= 800 && rm_ticks == 0 && steals == 0;
+    let ok = (3..=7).contains(&ticks) && idle_ticks > 0 && max_us <= 800 && rm_ticks == 0 && steals == 0;
+    shim_wire();
     serial_println!(
-        ":: SHIMMERIDLE: detail idle_ticks={} pass_max_us={} skips={} backdrop={} ::",
-        idle_ticks, pass_us, SHIM_IDLE_SKIPS.load(Ordering::Relaxed).wrapping_sub(skip0), crate::video::wallpaper::owns_backdrop() as u8
+        ":: SHIMMERIDLE: detail idle_ticks={} pass_max_us={} skips={} backdrop={} why={} carried={} settle_ms={} ::",
+        idle_ticks, pass_us, SHIM_IDLE_SKIPS.load(Ordering::Relaxed).wrapping_sub(skip0), crate::video::wallpaper::owns_backdrop() as u8,
+        WhyLabel(SHIM_IDLE_WHY.load(Ordering::Relaxed)), SHIM_IDLE_CARRIED.load(Ordering::Relaxed).wrapping_sub(carried0), settle_ms
     );
     serial_println!(
         ":: SHIMMERIDLE: idle_ms={} ticks={} max_us={} reduce_motion_ticks={} gate_steals={} -> {} ::",
@@ -3423,4 +3451,113 @@ pub fn selftest() {
         if vc_hit { "hit" } else { "miss" },
         if frame_us <= BUDGET_US { "UNDER" } else { "OVER" }
     );
+}
+
+// ── SHIMMERIDLE2 (rmbp-ledger B830): the idle tick named, never starved by stranded work, its cost read as the tick ──
+//
+// Handler: Kernel — wm (the shimmer's idle seat, `shimmer_idle`, extended; no second tick source, no new present).
+// Flight 37 boot 1: `skips=6 ticks=0` — the idle seat came due every 33 ms and `idle_why` refused all six with no pass
+// between them. The refusal is now NAMED (`why=` on the fixture's detail line), and owed work the gate is free to
+// service but no pass is servicing (only ERASE / MENU / DAMAGED, at two consecutive due attempts with no composite
+// pass between — [`track`] counts them) is CARRIED: the idle seat runs its one ordinary `wm::composite` anyway, which
+// services that work; the next due attempt finds the glass idle and ticks. A busy glass (passes running) still skips.
+// The source: the device-service pass (`usb_pump`'s 1-tick nap, a sleeper the tickless idle arms its one-shot to).
+
+/// The refusing terms of [`idle_why`], one bit each.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+const WHY_GATE: u8 = 1;
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+const WHY_PENDING: u8 = 2;
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+const WHY_ERASE: u8 = 4;
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+const WHY_MENU: u8 = 8;
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+const WHY_DAMAGED: u8 = 16;
+
+/// Composite passes since boot (one relaxed increment at [`track`]'s head).
+static TRACK_PASSES: AtomicU32 = AtomicU32::new(0);
+
+/// [`track`]'s head: count the pass.
+fn shim_note_pass() {
+    TRACK_PASSES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The refusals the idle seat met (OR of `WHY_*`, reset by the fixture), the pass count at the last owed refusal + 1
+/// (0 = none), the passes it carried, and the `[shimmer] tick` line said once.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_IDLE_WHY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_OWED_AT: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_IDLE_CARRIED: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_WIRE_SAID: AtomicBool = AtomicBool::new(false);
+
+/// A refusal by `why`: note it, and answer whether the owed work is STRANDED — the gate free, no pass pending, and no
+/// composite pass since the previous due attempt that also found work owed. Counts a carry when it is.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn shim_stranded(why: u8) -> bool {
+    SHIM_IDLE_WHY.fetch_or(why, Ordering::Relaxed);
+    if why & (WHY_GATE | WHY_PENDING) != 0 {
+        SHIM_OWED_AT.store(0, Ordering::Relaxed);
+        return false;
+    }
+    let mark = TRACK_PASSES.load(Ordering::Relaxed).wrapping_add(1).max(1);
+    if SHIM_OWED_AT.swap(mark, Ordering::Relaxed) != mark {
+        return false;
+    }
+    SHIM_OWED_AT.store(0, Ordering::Relaxed);
+    SHIM_IDLE_CARRIED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// `[shimmer] tick src=timer lane=device-service period_ms=<n> backoff_ms=<n> glints=<n> boxes=<n> px=<n> tick_us=<n>`
+/// — the named source and the last tick's size and cost.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn shim_wire() {
+    serial_println!(
+        "[shimmer] tick src=timer lane=device-service period_ms={} backoff_ms={} glints={} boxes={} px={} tick_us={}",
+        SHIMMER_MS,
+        SHIMMER_MS * SHIM_IDLE_BACKOFF,
+        SHIM_TICK_GL.load(Ordering::Relaxed),
+        SHIM_TICK_NB.load(Ordering::Relaxed),
+        SHIM_TICK_PX.load(Ordering::Relaxed),
+        SHIM_TICK_US.load(Ordering::Relaxed)
+    );
+}
+
+/// The line once per boot, on the idle seat's first tick.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn shim_wire_once() {
+    if !SHIM_WIRE_SAID.swap(true, Ordering::Relaxed) {
+        shim_wire();
+    }
+}
+
+/// The last shimmer tick's own cost (us: re-tint + queue) — VEILCOST's `shimmer_idle_us` reads it.
+#[cfg(feature = "facet")]
+pub fn shimmer_tick_us() -> u64 {
+    SHIM_TICK_US.load(Ordering::Relaxed)
+}
+
+/// `why=` — the refusing terms joined by `+`, or `none`.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+struct WhyLabel(u8);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+impl core::fmt::Display for WhyLabel {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == 0 {
+            return f.write_str("none");
+        }
+        let mut sep = "";
+        for (b, n) in [(WHY_GATE, "gate"), (WHY_PENDING, "pending"), (WHY_ERASE, "erase"), (WHY_MENU, "menu"), (WHY_DAMAGED, "damaged")] {
+            if self.0 & b != 0 {
+                f.write_str(sep)?;
+                f.write_str(n)?;
+                sep = "+";
+            }
+        }
+        Ok(())
+    }
 }
