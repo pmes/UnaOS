@@ -711,3 +711,6 @@ refs/heads/exec-rmbp-focus64b   3f44cf6f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-keepreaders   fd22dc1d FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-el0home   3f44cf6f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-settingssub   3f44cf6f IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-wifidata   7bcc5652 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-heldslotep0   7bcc5652 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-staletext3   7bcc5652 IN-FLIGHT cut 2026-10-21
