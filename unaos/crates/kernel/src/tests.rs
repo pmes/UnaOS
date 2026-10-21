@@ -5418,10 +5418,10 @@ fn sinkall_selftest() {
         sources += sinkall_player("video", s, k) as u32;
         overlap = if sinkall_overlap(s) { "ok" } else { "FAIL" }; pause_ms = sinkall_pause(s); start_gap = sinkall_start(s); // SINKALLDOCS (B781): the Player's pause lands within the sink's queue (file tail). PLAYSTARTGAP (B805): a file play's start gap on the HDA ring (file tail)
     }
-    let usb_volume = sinkall_usb_volume(usb); let slider_ms = sinkall_slider(hda, usb); // MIXERPUMP (B787): a set through `status::set_volume` reaches its carrier within one period + 10 ms (file tail)
+    let usb_volume = sinkall_usb_volume(usb); let slider_ms = sinkall_slider(hda, usb); let idle_level = sinkall_idle_level(usb); // MIXERPUMP (B787): a set through `status::set_volume` reaches its carrier within one period + 10 ms (file tail)
     let direct = play::epoch().wrapping_sub(e0) as i64 - mixer::hda_opens().wrapping_sub(o0) as i64;
     let _ = audio::sink(if was == Sink::Usb { "usb" } else if was == Sink::Hda { "hda" } else { "bt" });
-    let failed = [hda, usb, bt_live, bt, overlap, usb_volume].iter().any(|v| *v == "FAIL");
+    let failed = [hda, usb, bt_live, bt, overlap, usb_volume, idle_level].iter().any(|v| *v == "FAIL");
     let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 && pause_ms <= SINKALL_PAUSE_MS && slider_ms <= SINKALL_SLIDER_MS && start_gap.map_or(true, |g| g <= play::REFILL_MS) { "PASS" } else { "FAIL" };
     serial_println!(
         ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} pause_ms={} slider_ms={} start_gap_ms={} ::",
@@ -6159,4 +6159,62 @@ fn usbsuspend_held_ep0_leg(run: bool, wait: &dyn Fn(u64, &dyn Fn() -> bool) -> b
         Some(true) => "fail",
     };
     (word, c.held_ep0_refused, c.replayed)
+}
+
+// IDLEUSBLEVEL (rmbp-ledger B808; BP-audio-16) — TAIL-APPENDED: `tests sinkall`'s idle-level leg. A level set while the
+// mixer holds no output reaches the USB device's Feature Unit (`mixer::level_changed` -> `usb_level`, the EP0 door's
+// SET_CUR on the next service pass), and the first period after the next `acquire` plays at it: the device's held level
+// (`uac::volume_held`) is the new one when the first period is handed, and no SET_CUR raced it (`resent=0`). Runs before
+// `sinkall_selftest` restores the person's sink. Wire: `[sinkall] leg idle-level sink=usb level=<a>-><b> idle_held=
+// first_period= held_at_first= resent= closed= idle_level=<ok|FAIL>` or `… -> idle_level=skip reason=<no-device|no-unit|busy>`.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_idle_level(usb: &str) -> &'static str {
+    #[cfg(feature = "uac")]
+    {
+        use crate::audio::mixer;
+        use crate::drivers::hda::play;
+        use crate::drivers::usb::uac;
+        use crate::video::status;
+        const LONG: u64 = 48_000 * 4;
+        let skip = |why: &str| {
+            serial_println!("[sinkall] leg idle-level sink=usb -> idle_level=skip reason={}", why);
+            "skip"
+        };
+        if usb != "ok" || crate::audio::sink("usb").is_err() {
+            return skip("no-device");
+        }
+        if !uac::volume_on_device() {
+            return skip("no-unit");
+        }
+        if !play::pump_until(1_000, || mixer::sources() == 0 && mixer::output().is_none()) {
+            return skip("busy");
+        }
+        let (l0, m0) = status::volume();
+        let lv = if l0 >= 8 { l0 - 4 } else { l0 + 4 };
+        let _ = status::set_volume(lv, m0);
+        let took = play::pump_until(1_000, || uac::volume_held() == Some((lv, m0)));
+        let idle = mixer::output().is_none();
+        let (s0, d0) = (uac::volume_state().0, mixer::delivered()[1]);
+        let first = play::fixture_source("player").is_ok()
+            && play::pump_until(1_000, || {
+                let _ = play::fixture_feed(LONG);
+                mixer::delivered()[1] > d0
+            });
+        let held = uac::volume_held();
+        let resent = uac::volume_state().0 != s0;
+        play::stop();
+        let closed = play::pump_until(500, || mixer::sources() == 0);
+        let _ = status::set_volume(l0, m0);
+        let ok = took && idle && first && held == Some((lv, m0)) && !resent && closed;
+        serial_println!(
+            "[sinkall] leg idle-level sink=usb level={}->{} idle_held={} first_period={} held_at_first={} resent={} closed={} idle_level={}",
+            l0, lv, (took && idle) as u8, first as u8, held.map_or(-1, |(l, _)| l as i32), resent as u8, closed as u8, if ok { "ok" } else { "FAIL" }
+        );
+        if ok { "ok" } else { "FAIL" }
+    }
+    #[cfg(not(feature = "uac"))]
+    {
+        let _ = usb;
+        "not-built"
+    }
 }
