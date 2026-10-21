@@ -4445,7 +4445,7 @@ pub fn clear_handle_row(asid: u64) {
     // deposit stamped for the dying tenant is dead-on-arrival for the ASID's next tenant even if it lands
     // after the sweep passed its slot (RECV verifies the stamp; the sender's post-check re-reads this word).
     // This closes the U7-documented sys_xfer TOCTOU (exit + recycle + consume inside the deposit window).
-    ASID_GEN[asid as usize].fetch_add(1, Ordering::AcqRel); net6_free_owner(asid); // NET6 — close every socket this dying address space still owns, so an EL0 program that exits with sockets open frees its registry slots instead of leaking them for the boot's life. Placed with the generation bump, before the handle sweep, for the same reason that bump is first: past this point nothing the dying tenant held can be resolved. ⚠ LINE-NEUTRAL append — `#[inline(always)]`-empty knob-off, body at the FILE TAIL.
+    ASID_GEN[asid as usize].fetch_add(1, Ordering::AcqRel); net6_free_owner(asid); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_forget(asid); // FOCUSARM64 (SR180): the unconsumed SPAWN-FOCUS token and focussteal's record die with the tenant, x86 `clear_handle_row`'s twin (LINE-NEUTRAL fold, code before this comment). NET6 — close every socket this dying address space still owns, so an EL0 program that exits with sockets open frees its registry slots instead of leaking them for the boot's life. Placed with the generation bump, before the handle sweep, for the same reason that bump is first: past this point nothing the dying tenant held can be resolved. ⚠ LINE-NEUTRAL append — `#[inline(always)]`-empty knob-off, body at the FILE TAIL.
     for i in 0..NHANDLE {
         // Clear the value first (Empty => `handle_resolve` bails as NoHandle before reading rights/kind), then
         // the rights and kind — so no intermediate state is ever a live handle with wrong rights/kind.
@@ -7869,7 +7869,7 @@ pub fn run_user_image_argv(
             });
         }
     };
-    let asid = mapped.ttbr0 >> 48; super::xwin::args_write(mapped.slot, argv); // RING3ABI2 M2: the words, before the task exists
+    let asid = mapped.ttbr0 >> 48; super::xwin::args_write(mapped.slot, argv); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_arm(asid); // FOCUSARM64 (SR180): the operator's `run` arms its first window's focus token before the task exists, x86 `run_user_image_argv`'s twin (LINE-NEUTRAL fold). RING3ABI2 M2: the words, before the task exists
     // VUG-BG: this is the FOREGROUND launcher, so the new address space is explicitly NOT detached.
     // Cleared rather than merely "not set": ASIDs recycle, and a slot last used by a `bg` spawn would
     // otherwise hand its stale detached bit to the next foreground program that inherits the number.
@@ -8349,7 +8349,7 @@ pub fn spawn_user_image_bg_argv(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64
             });
         }
     };
-    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); // ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
+    let asid = mapped.ttbr0 >> 48; spawn_path_bind(asid, bytes, pipe, ring3); super::xwin::args_write(mapped.slot, argv); #[cfg(feature = "desktop_firmware")] crate::video::wm::spawn_focus_arm(asid); // FOCUSARM64 (SR180): every launch through this funnel arms its first window's focus token before the task can run, x86 `spawn_user_image_bg_inner`'s twin (aarch64 has no desktop-app exemption to make; LINE-NEUTRAL fold). ARMPIPE (A108): the pipe bound and the principal ruled BEFORE the task can run (fn at the FILE TAIL). RING3ABI2 M2
     // VUG-BG: mark the address space DETACHED before the task can be dispatched, so the program observes
     // the bit on its very first info-page read rather than racing the launcher. See `set_detached`.
     set_detached(asid, true);
@@ -12479,7 +12479,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
         }
     }
     fb_info_write_win(slot, id, &e);
-    { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_create(asid, id as u64, w32, h32, e.wm_id != crate::video::wm::WIN_NONE); id as i64 } // ORIN-TENANT: the create's wire witness. Printed UNDER the WINDOWS hold deliberately — global order WINDOWS ⊃ wm::TABLE ⊃ WRITER, a routed console's println descends exactly that way, and a create is program-rate (the same masked-hold class sys_win_present takes per frame). Line-NEUTRAL per this file's PANIC-Location rule.
+    { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_create(asid, id as u64, w32, h32, e.wm_id != crate::video::wm::WIN_NONE); #[cfg(feature = "desktop_firmware")] { drop(t); drop(_irq); spawn_focus_grant(asid); } id as i64 } // FOCUSARM64 (SR180): WINDOWS and the mask released, then the SPAWN-FOCUS take and both halves of the grant (`spawn_focus_grant`, file tail), x86 `sys_win_create`'s twin; LINE-NEUTRAL fold, code before this comment. ORIN-TENANT: the create's wire witness. Printed UNDER the WINDOWS hold deliberately — global order WINDOWS ⊃ wm::TABLE ⊃ WRITER, a routed console's println descends exactly that way, and a create is program-rate (the same masked-hold class sys_win_present takes per frame). Line-NEUTRAL per this file's PANIC-Location rule.
 }
 
 /// SYS_WIN_PRESENT(win): damage-mark + composite the caller's window. Ownership-gated (`-EBADF`/`-EACCES`).
@@ -27749,4 +27749,28 @@ fn bus_window_raise(asid: u64, body: &[u8], text: &mut alloc::vec::Vec<u8>) -> i
         }
         Err(e) => e,
     }
+}
+
+// =====================================================================================================
+// FOCUSARM64 (LEDGER SR180; BP-video-23) — the aarch64 seam of SPAWN-FOCUS / FOCUSSTEAL. File tail: nothing
+// above moves. The policy is wm's (`spawn_focus_take` -> `focussteal::judge`); this is only the grant, both
+// halves, exactly as x86 `sys_win_create` performs it. Reached from `sys_win_create`'s return line.
+// =====================================================================================================
+
+/// FOCUSARM64: an app's window was just created (WINDOWS and the IRQ mask already released, so the global order
+/// WINDOWS ⊃ wm::TABLE is never entered in reverse). If its launch armed a SPAWN-FOCUS token and wm's policy
+/// gives it the focus (the user's verb within 2000 ms, or the focused window's own spawn), grant BOTH halves in
+/// the order every focus owner uses: the keyboard (`user_input_set_active`, skipped when it already names the
+/// app — the foreground `run` set it before the spawn) and the visible half (`wm::focus_changed`). A held map
+/// was already placed behind the focused window by `focussteal::hold_under` and pulsed by `judge`.
+#[cfg(feature = "desktop_firmware")]
+fn spawn_focus_grant(asid: u64) {
+    if !crate::video::wm::spawn_focus_take(asid) {
+        return;
+    }
+    if USER_INPUT_ACTIVE.load(Ordering::Acquire) != asid {
+        user_input_set_active(asid);
+    }
+    crate::video::wm::focus_changed(asid);
+    serial_println!(":: wc-arm64: input focus -> asid {} (SPAWN-FOCUS: operator-launched, first window) ::", asid);
 }

@@ -52,3 +52,7 @@ pub fn init(boot_info: &'static mut BootInfo) {
         }
     }
 }
+
+/// FOCUSARM64 (SR180): the caller's address-space slot, at the path x86 names it (`arch::memory::current_slot`) — `wm::focussteal::note_arm` reads it on both desktops. The body is `xwin`'s (TTBR0_EL1's ASID).
+#[cfg(feature = "aarch64_el0")]
+pub use super::xwin::current_slot;
