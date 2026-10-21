@@ -3366,8 +3366,8 @@ pub mod splitread {
 //
 // [`keyboot_probe`] names the ROOT CANDIDATE — the first handle, in the bind's own order (the AHCI root grant,
 // then `Global`, then the admitted probes), whose partition table carries a UnaFS volume — and says whether its
-// block 0 carries a key slot (§R2a), reading two sectors and mounting nothing. [`unlock_root`] opens THAT volume
-// with the typed secret — `KeySlot::unwrap` (the Argon2id, UNMASKED, on the caller's thread: the login worker), then
+// block 0 carries a key slot (§R2a), reading two sectors and mounting nothing. [`keyboot_unwrap`] + [`keyboot_bind`] (KEYBOOT2) open THAT volume
+// with the typed secret — `KeySlot::unwrap` (the Argon2id, UNMASKED, on the login worker), then, on the render task,
 // `UnaFS::mount_with_key` — and only then takes the masked `MOUNT` hold to install it as the bound mount. Building the
 // mount outside the hold is sound for exactly this volume: while it is keyed and locked every other bind stops at
 // block 0, so no second live mount of it exists (K4). The unwrapped data key stays with the open root (below).
@@ -3380,7 +3380,7 @@ pub mod splitread {
 // `bootdisk::survey` does not cache an answer while [`root_locked`] (the hold) is true.
 // =================================================================================================
 
-/// KEYBOOT: the root candidate [`keyboot_probe`] named (the volume [`unlock_root`] opens).
+/// KEYBOOT: the root candidate [`keyboot_probe`] named (the volume [`keyboot_unwrap`] opens).
 static KB_HANDLE: Mutex<Option<block::BlockHandle>> = Mutex::new(None);
 /// KEYBOOT: the probe saw a key slot on the root candidate.
 static KB_KEYED: AtomicBool = AtomicBool::new(false);
@@ -3425,38 +3425,196 @@ pub fn keyboot_probe() -> Option<(block::BlockHandle, bool)> {
         let mut b = [0u8; 1024];
         let read = handle_read(h, span.base_lba, &mut b[..512]).is_ok() && handle_read(h, span.base_lba + 1, &mut b[512..]).is_ok();
         let keyed = read && !matches!(::unafs::KeySlot::parse(&b), Ok(None));
-        crate::arch::without_interrupts(|| *KB_HANDLE.lock() = Some(h)); // crawl B 7: IRQ-masked, as `keyboot_mount` takes it inside the masked MOUNT hold (a holder preempted here would deadlock it)
+        kb_masked(|| *KB_HANDLE.lock() = Some(h)); // crawl B 7: IRQ-masked, as `keyboot_mount` takes it inside the masked MOUNT hold (a holder preempted here would deadlock it)
         KB_KEYED.store(keyed, Ordering::Release);
         return Some((h, keyed));
     }
     None
 }
 
-/// KEYBOOT: open the probed keyed root with `u` (the password or the 24 recovery words) and bind it as THE mount.
-/// `Ok(())` once bound (or when a mount is already bound: the unlock is then moot); otherwise the crate's answer —
-/// `Fs(KeySlot(KeyRefused))` for a wrong key, `Fs(KeySlot(BadRecovery))` for words that fail their checksum.
-pub fn unlock_root(u: &::unafs::Unlock<'_>) -> Result<(), MountError> {
-    let handle = crate::arch::without_interrupts(|| *KB_HANDLE.lock()).ok_or(MountError::NoVolume)?; // crawl B 7: IRQ-masked (see `keyboot_probe`)
+// KEYBOOT2 (rmbp-ledger B810) — the unlock SPLIT IN PLACE (it was `unlock_root`, one fn on the login worker). FLIGHT 37
+// §6: Enter on the metal form hung the machine twice. The boot's FIRST mount (`locate_on`, the first
+// `partition_witness`, `mount_with_key`) ran on the 16 KiB `login-submit` stack (sched.rs `TASK_STACK_SIZE`), where an
+// overflow inside a masked driver hold leaves CARD or the heap lock held (stackguard.rs: the task halts, its locks stay),
+// and the bind's MOUNT take had no bound off the render task (RENDERWEDGE's wait is a no-op there). Now TWO halves:
+// [`keyboot_unwrap`] — the WORKER half: the slot read off the medium through the block layer's normal path (no masked
+// hold of ours), then the ONE Argon2id with interrupts live; the key parked in [`KB_PENDING`] (wiped on drop);
+// [`keyboot_bind`] — the RENDER half (`login::kb_apply`): the mount built outside any hold of ours on the render stack,
+// where every bind ran before, then RENDERWEDGE's bounded wait and a short masked MOUNT install. Every masked span the
+// two halves take goes through [`kb_masked`] (`masked_max_us=`). `tests keyboot` lends a RAM volume
+// ([`keyboot_lend_ram`]) and drives the same two halves through the form's own dispatch (`login::kb_leg_submit`).
+
+/// KEYBOOT2: what the unlock opens — the probed root, or a RAM volume a fixture lent ([`keyboot_lend_ram`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum KbTarget {
+    Root(block::BlockHandle),
+    Ram,
+}
+
+/// KEYBOOT2: one unlock's measures — the `[keyboot] unlock …` line and the fixture's.
+#[derive(Clone, Copy)]
+pub struct KbReport {
+    pub target: &'static str,
+    pub via: &'static str,
+    pub read_ms: u64,
+    pub kdf_ms: u64,
+    pub bind_ms: u64,
+    pub masked_max_us: u64,
+    pub kdf_if: &'static str,
+    /// `unwrapped` / `mac` / `words` / `error` from the worker half, then `ok` / `busy` / `disk` from the bind.
+    pub outcome: &'static str,
+}
+
+const KB_REPORT0: KbReport = KbReport { target: "-", via: "-", read_ms: 0, kdf_ms: 0, bind_ms: 0, masked_max_us: 0, kdf_if: "na", outcome: "-" };
+/// KEYBOOT2: the key the worker unwrapped, until the render task binds with it (or drops it: wiped).
+static KB_PENDING: Mutex<Option<(KbTarget, ::unafs::VolumeKey)>> = Mutex::new(None);
+/// KEYBOOT2: the last unlock's measures.
+static KB_REPORT: Mutex<KbReport> = Mutex::new(KB_REPORT0);
+/// KEYBOOT2: a RAM volume `tests keyboot` lent as the unlock target (never set on a real boot).
+static KB_RAM: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// KEYBOOT2: where the lent RAM volume's bind lands (the fixture takes it back).
+static KB_RAM_MOUNT: Mutex<Option<UnaFS<::unafs::MemDevice>>> = Mutex::new(None);
+/// KEYBOOT2: the longest masked span the unlock's two halves took (µs), since the last unwrap began.
+static KB_MASKED_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// KEYBOOT2: `without_interrupts` for the unlock path, its span folded into [`KB_MASKED_MAX_US`].
+fn kb_masked<R>(f: impl FnOnce() -> R) -> R {
+    let t0 = crate::hidstall::now_us();
+    let r = crate::arch::without_interrupts(f);
+    KB_MASKED_MAX_US.fetch_max(crate::hidstall::now_us().saturating_sub(t0), Ordering::Relaxed);
+    r
+}
+
+/// KEYBOOT2: interrupts live at this instant (`1`/`0`; `na` where the arch has no cheap read).
+fn kb_if_word() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86_64::instructions::interrupts::are_enabled() { "1" } else { "0" }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        "na"
+    }
+}
+
+fn kb_report(f: impl FnOnce(&mut KbReport)) {
+    kb_masked(|| f(&mut *KB_REPORT.lock()));
+}
+
+/// KEYBOOT2: the last unlock's measures (the wire line's and the fixture's).
+pub fn keyboot_report() -> KbReport {
+    let mut r = kb_masked(|| *KB_REPORT.lock());
+    r.masked_max_us = KB_MASKED_MAX_US.load(Ordering::Relaxed);
+    r
+}
+
+/// KEYBOOT2 — the WORKER half (`login::kb_compute`, on `login-submit`): read the target's key slot (the root's two
+/// sectors through `handle_read`, before the KDF; the lent RAM volume's first 1 KiB), run the ONE Argon2id (or the
+/// words' HKDF) with interrupts live, and park the unwrapped key for [`keyboot_bind`]. `Fs(KeySlot(KeyRefused))` for a
+/// wrong key (the slot's MAC), `Fs(KeySlot(BadRecovery))` for words that fail their checksum.
+pub fn keyboot_unwrap(u: &::unafs::Unlock<'_>) -> Result<(), MountError> {
+    KB_MASKED_MAX_US.store(0, Ordering::Relaxed);
+    kb_report(|r| *r = KB_REPORT0);
+    let stale = kb_masked(|| KB_PENDING.lock().take());
+    drop(stale); // a key a released submit never bound: wiped
+    let t = crate::arch::ms();
+    let ram = kb_masked(|| {
+        KB_RAM.lock().as_ref().map(|b| {
+            let mut s = [0u8; 1024];
+            let n = b.len().min(1024);
+            s[..n].copy_from_slice(&b[..n]);
+            s
+        })
+    });
+    let (target, b0) = match ram {
+        Some(s) => (KbTarget::Ram, s),
+        None => {
+            let handle = kb_masked(|| *KB_HANDLE.lock()).ok_or(MountError::NoVolume)?;
+            let span = locate_on(handle)?;
+            let mut b = [0u8; 1024];
+            if handle_read(handle, span.base_lba, &mut b[..512]).is_err() || handle_read(handle, span.base_lba + 1, &mut b[512..]).is_err() {
+                return Err(MountError::NoVolume);
+            }
+            (KbTarget::Root(handle), b)
+        }
+    };
+    let read_ms = crate::arch::ms().saturating_sub(t);
+    let via = match u {
+        ::unafs::Unlock::Password(_) => "password",
+        ::unafs::Unlock::Recovery(_) => "words",
+    };
+    let tw = match target {
+        KbTarget::Root(h) => handle_kind_name(h),
+        KbTarget::Ram => "ram",
+    };
+    kb_report(|r| {
+        r.target = tw;
+        r.via = via;
+        r.read_ms = read_ms;
+    });
+    let slot = ::unafs::KeySlot::parse(&b0).map_err(|e| MountError::Fs(FileSystemError::KeySlot(e)))?.ok_or(MountError::NoVolume)?;
+    let kdf_if = kb_if_word();
+    let t = crate::arch::ms();
+    let key = slot.unwrap(u);
+    let kdf_ms = crate::arch::ms().saturating_sub(t);
+    let outcome = match &key {
+        Ok(_) => "unwrapped",
+        Err(::unafs::KeySlotError::KeyRefused) => "mac",
+        Err(::unafs::KeySlotError::BadRecovery) => "words",
+        Err(_) => "error",
+    };
+    kb_report(|r| {
+        r.kdf_ms = kdf_ms;
+        r.kdf_if = kdf_if;
+        r.outcome = outcome;
+    });
+    let key = key.map_err(|e| MountError::Fs(FileSystemError::KeySlot(e)))?;
+    kb_masked(move || *KB_PENDING.lock() = Some((target, key)));
+    Ok(())
+}
+
+/// KEYBOOT2 — the RENDER half (`login::kb_apply`): bind the target with the parked key. The root: the mount is built
+/// first (its sector reads outside any hold of ours), then RENDERWEDGE's bounded wait and ONE short masked MOUNT
+/// install. `Ok(true)` bound now, `Ok(false)` already bound (moot), `Busy` when MOUNT stayed held past the bound or
+/// ANOTHER volume holds it (the key goes, wiped; the hold stays).
+pub fn keyboot_bind() -> Result<bool, MountError> {
+    let t = crate::arch::ms();
+    let Some((target, key)) = kb_masked(|| KB_PENDING.lock().take()) else {
+        return Err(MountError::NoVolume);
+    };
+    let r = match target {
+        KbTarget::Ram => kb_bind_ram(key),
+        KbTarget::Root(h) => kb_bind_root(h, key),
+    };
+    let bind_ms = crate::arch::ms().saturating_sub(t);
+    let outcome = match &r {
+        Ok(_) => "ok",
+        Err(MountError::Busy) => "busy",
+        Err(_) => "disk",
+    };
+    kb_report(|rep| {
+        rep.bind_ms = bind_ms;
+        rep.outcome = outcome;
+    });
+    r
+}
+
+/// KEYBOOT2: the root's bind (the bind half of the former `unlock_root`, moved, not copied).
+fn kb_bind_root(handle: block::BlockHandle, key: ::unafs::VolumeKey) -> Result<bool, MountError> {
     install_warn_hook();
     crate::fs::unafstime::install_clock_hook();
     let span = locate_on(handle)?;
     partition_witness(handle, &span);
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     splitread::note_span(handle, &span);
-    // The slot, read off the medium and unwrapped HERE (the one Argon2id), then the mount with that key.
-    let mut b0 = [0u8; 1024];
-    if handle_read(handle, span.base_lba, &mut b0[..512]).is_err() || handle_read(handle, span.base_lba + 1, &mut b0[512..]).is_err() {
-        return Err(MountError::NoVolume);
-    }
-    let slot = ::unafs::KeySlot::parse(&b0).map_err(|e| MountError::Fs(FileSystemError::KeySlot(e)))?.ok_or(MountError::NoVolume)?;
-    let key = slot.unwrap(u).map_err(|e| MountError::Fs(FileSystemError::KeySlot(e)))?;
     let dev = SdSectorDevice::open_on(handle)?;
     let mut fs = Some(UnaFS::mount_with_key(BlockAdapter::for_partition(dev, &span), &key).map(versions_armed).map_err(|e| { if let FileSystemError::Incompatible(bits) = &e { serial_println!("[unafs] mount refused incompat={:#x}", bits); } MountError::Fs(e) })?); // ROOTINCOMPAT (SR159): the keyed mount says the refusal too
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) {
-        return Err(MountError::Busy); // RENDERWEDGE's bounded pre-wait, as every MOUNT taker on the render task
+        return Err(MountError::Busy); // RENDERWEDGE's bounded pre-wait: this half runs on the render task, where it is armed
     }
-    let prev = crate::arch::without_interrupts(|| KB_KEY.lock().replace(key)); let bound = crate::arch::without_interrupts(|| { // crawl B 8 + 7: the open root's key is parked BEFORE the bind (a discard or remount right after it rebinds WITH the key, `keyboot_mount`), IRQ-masked; wiped on drop
+    let prev = kb_masked(move || KB_KEY.lock().replace(key)); // crawl B 8 + 7: the open root's key parked BEFORE the bind (a rebind right after it opens WITH the key, `keyboot_mount`)
+    let bound = kb_masked(|| {
         let mut g = MOUNT.lock();
         if let Some(b) = g.as_ref() {
             return if b.handle == handle { Some(false) } else { None }; // crawl B 4: this root already bound = moot; ANOTHER volume bound = refused below
@@ -3469,18 +3627,64 @@ pub fn unlock_root(u: &::unafs::Unlock<'_>) -> Result<(), MountError> {
         Some(true)
     });
     drop(fs);
-    let Some(bound) = bound else { crate::arch::without_interrupts(|| *KB_KEY.lock() = prev); return Err(MountError::Busy); }; // crawl B 4: another volume holds MOUNT — the key goes (wiped, BP-security-11) and the hold stays; the boot never releases onto the wrong root
+    let Some(bound) = bound else {
+        let k = kb_masked(|| core::mem::replace(&mut *KB_KEY.lock(), prev));
+        drop(k); // crawl B 4: another volume holds MOUNT — the key goes (wiped, BP-security-11); the boot never releases onto the wrong root
+        return Err(MountError::Busy);
+    };
+    drop(prev);
     KB_UNLOCKED.store(true, Ordering::Release);
     serial_println!(
         "[keyboot] root unlocked handle={} via={} bound={} (the data key lives only with the open root, in RAM, wiped on drop)",
         handle_kind_name(handle),
-        match u {
-            ::unafs::Unlock::Password(_) => "password",
-            ::unafs::Unlock::Recovery(_) => "words",
-        },
+        keyboot_report().via,
         if bound { "now" } else { "already" }
     );
-    Ok(())
+    Ok(bound)
+}
+
+/// KEYBOOT2: the lent RAM volume's bind — the same key, `UnaFS::mount_with_key` on its bytes, the mount kept for the
+/// fixture ([`keyboot_ram_take`]).
+fn kb_bind_ram(key: ::unafs::VolumeKey) -> Result<bool, MountError> {
+    let Some(bytes) = kb_masked(|| KB_RAM.lock().take()) else {
+        return Err(MountError::NoVolume);
+    };
+    let m = UnaFS::mount_with_key(::unafs::MemDevice::from_bytes(bytes), &key).map_err(MountError::Fs)?;
+    let old = kb_masked(move || KB_RAM_MOUNT.lock().replace(m));
+    drop(old);
+    Ok(true)
+}
+
+/// KEYBOOT2: drop a parked key no bind will take (INPUTSTALL's 15 s release of a submit): wiped.
+pub fn keyboot_pending_drop() {
+    let k = kb_masked(|| KB_PENDING.lock().take());
+    drop(k);
+}
+
+/// KEYBOOT2 (`tests keyboot`): lend a keyed RAM volume as the unlock target. `false` (nothing lent) while the root's
+/// hold is open or a volume is already lent.
+pub fn keyboot_lend_ram(bytes: Vec<u8>) -> bool {
+    if root_locked() {
+        return false;
+    }
+    let refused = kb_masked(move || {
+        let mut g = KB_RAM.lock();
+        if g.is_some() {
+            return Some(bytes);
+        }
+        *g = Some(bytes);
+        None
+    });
+    let ok = refused.is_none();
+    drop(refused);
+    ok
+}
+
+/// KEYBOOT2 (`tests keyboot`): take back the lent volume — its bound mount, if the unlock bound it — and end the lend.
+pub fn keyboot_ram_take() -> Option<UnaFS<::unafs::MemDevice>> {
+    let (m, b) = kb_masked(|| (KB_RAM_MOUNT.lock().take(), KB_RAM.lock().take()));
+    drop(b);
+    m
 }
 
 /// KEYBOOT: the keyed root was opened with its key this boot.
@@ -3642,7 +3846,7 @@ pub mod diskfull {
 // and three calls:
 //
 // * the policy: every mount this file builds — `mount_on` (the lazy bind and every rebind) and the keyed
-//   root's `unlock_root` — keeps versions ([`versions_armed`], folded onto those lines);
+//   root's `keyboot_bind` (KEYBOOT2) — keeps versions ([`versions_armed`], folded onto those lines);
 // * [`versions_on`] lists a file's versions newest first and prints `[fs] version inode=<n> kept=<n>
 //   bytes=<n>` (bytes = the blocks they cost x 4096); [`read_version_on`] reads one whole;
 //   [`restore_version_on`] makes one the contents again (itself a write that keeps the current contents).
@@ -3658,7 +3862,7 @@ pub fn versions_arm<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>) {
     fs.set_versioning(true);
 }
 
-/// FILEVERSIONS (B714): `mount_on` / `unlock_root`'s fold — the bound mount keeps versions.
+/// FILEVERSIONS (B714): `mount_on` / `keyboot_bind`'s fold — the bound mount keeps versions.
 fn versions_armed(mut fs: KernelUnaFS) -> KernelUnaFS {
     versions_arm(&mut fs);
     fs

@@ -38,7 +38,7 @@
 
 ## 4. Wire, in order (a healthy x86 first boot)
 `[loader] kelf slot=A hash=ok …` → `KELF min=… max=…` → `:: SPLASH: stage=gop …` (`unaos/crates/kernel/src/splash.rs:834`) → BPACE rungs → `:: SCHED-X86 PLACE: …` (cores.md) →
-`:: SPLASH: arch=… painted` (`unaos/crates/kernel/src/splash.rs:760`) → `[splash] hold OPEN` (`:781`) → `[keyboot] root=unkeyed hold=none` | (keyed: `[keyboot] hold OPEN` + `[login] unlock form open` … `[keyboot] root unlocked` + `[keyboot] hold released held_ms=`) → `[boot] step=users-load|root-mount|stage-resolve …` →
+`:: SPLASH: arch=… painted` (`unaos/crates/kernel/src/splash.rs:760`) → `[splash] hold OPEN` (`:781`) → `[keyboot] root=unkeyed hold=none` | (keyed: `[keyboot] hold OPEN` + `[login] unlock form open` … `[login] unlock submit` + `[keyboot] unlock kdf_ms= … -> ok` + `[keyboot] root unlocked` + `[keyboot] hold released held_ms=`) → `[boot] step=users-load|root-mount|stage-resolve …` →
 `[splash] held_ms=… released_by=` → `[login] installer: first-user form open` (boot 1) | `[login] boot 2: …` + `[login] screen open …` (boot 2) →
 `[login] session open user=<n> [role=admin]` → `[boot] phase=desktop from=<setter|login-screen> why=session …` (`unaos/crates/kernel/src/boot.rs:161`) →
 `[boot] services up first=… held_starters=…` + `:: BOOT: phase=desktop … login->desktop=…` (`unaos/crates/kernel/src/boot.rs:132-142`) → `[desktop] built at=login ok bar_ms=…` (`unaos/crates/kernel/src/video/desktopbuild.rs:118`).

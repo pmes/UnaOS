@@ -244,7 +244,7 @@ fn ensure_lumen() {
     #[cfg(feature = "lumen")]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("lumenfast", crate::lumen::lumenfast); register("holocron", crate::keyring::selftest); register("ringlogin", crate::keyring::ringlogin_selftest); #[cfg(all(target_arch = "x86_64", feature = "btc"))] register("btkeyseal", crate::drivers::ehci::bthid::btkeyseal_selftest); #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("volkey", crate::keyring::volkey_selftest); /* VOLKEY (B684): the volume key slot on a RAM volume (LINE-NEUTRAL append) */ #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("xts", xts_selftest); /* XTS (B689): the volume cipher on a scratch RAM volume, `tests.rs` tail (LINE-NEUTRAL append) */ #[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))] register("keyboot", crate::keyring::keyboot_selftest); /* crawl B 21: keyboot_selftest's own cfg (LINE-NEUTRAL) */ }
+        if !DONE.swap(true, Ordering::AcqRel) { register("lumen", crate::lumen::selftest); register("lumenfast", crate::lumen::lumenfast); register("holocron", crate::keyring::selftest); register("ringlogin", crate::keyring::ringlogin_selftest); #[cfg(all(target_arch = "x86_64", feature = "btc"))] register("btkeyseal", crate::drivers::ehci::bthid::btkeyseal_selftest); #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("volkey", crate::keyring::volkey_selftest); /* VOLKEY (B684): the volume key slot on a RAM volume (LINE-NEUTRAL append) */ #[cfg(any(target_arch = "aarch64", feature = "unafs"))] register("xts", xts_selftest); /* XTS (B689): the volume cipher on a scratch RAM volume, `tests.rs` tail (LINE-NEUTRAL append) */ #[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))] register("keyboot", keyboot_tests); /* crawl B 21: keyboot_selftest's own cfg (LINE-NEUTRAL) */ }
     }
 }
 
@@ -6217,4 +6217,92 @@ fn sinkall_idle_level(usb: &str) -> &'static str {
         let _ = usb;
         "not-built"
     }
+}
+
+// ── KEYBOOT2 (rmbp-ledger B810) — `tests keyboot` gains the UNLOCK LEG (folded onto the registration line: the token
+// `keyboot_tests`). KEYBOOT's fixture ran the slot on a RAM volume and never the unlock the metal form runs; FLIGHT 37
+// §6's hang was in that unlock. The leg lends a keyed RAM volume (m=19 MiB, `KdfParams::FLOOR`) as the unlock target
+// and submits through `login::kb_leg_submit` — the same `kb_dispatch` -> `dispatch` -> `login-submit` -> `kb_compute`
+// -> `unafs::keyboot_unwrap` the form's Enter takes, and the render pulse's `submit_drain` -> `kb_apply` ->
+// `unafs::keyboot_bind`. A wrong password is refused by the slot's tag (`why=mac`); the right one binds the RAM volume
+// and its witness file reads back; the unlock path's own masked spans stay under 2 ms and the KDF runs with
+// interrupts live. `SKIP` while a real hold is open (the root's unlock owns the target).
+
+/// KEYBOOT2: `tests keyboot` — KEYBOOT's fixture, then the unlock leg.
+#[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))]
+fn keyboot_tests() {
+    crate::keyring::keyboot_selftest();
+    keyboot_unlock_leg();
+}
+
+/// KEYBOOT2: the unlock leg (see the section head).
+#[cfg(all(feature = "login", any(target_arch = "aarch64", feature = "unafs")))]
+fn keyboot_unlock_leg() {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        use crate::fs::unafs;
+        use crate::video::crystal::login;
+        use ::unafs::{KdfParams, MemDevice, UnaFS};
+        const PW: &[u8] = b"keyboot2-fixture-pw";
+        const WRONG: &[u8] = b"keyboot2-fixture-pX";
+        const WITNESS: &[u8] = b"KEYBOOT2 witness: the RAM volume bound through the form's own unlock";
+        const MASKED_BOUND_US: u64 = 2_000;
+        let line = |wrong: &str, unlock: &str, bind: &str, r: &unafs::KbReport, verdict: &str| {
+            serial_println!(
+                ":: KEYBOOT2: wrong={} unlock={} bind={} on={} kdf_ms={} read_ms={} bind_ms={} masked_max_us={} kdf_if={} m={}KiB -> {} ::",
+                wrong, unlock, bind, login::kb_on(), r.kdf_ms, r.read_ms, r.bind_ms, r.masked_max_us, r.kdf_if, KdfParams::FLOOR.m_kib, verdict
+            )
+        };
+        let mut fs = match UnaFS::format(MemDevice::with_blocks(512), 0) {
+            Ok(f) => f,
+            Err(_) => return serial_println!(":: KEYBOOT2: wrong=none unlock=none bind=none -> FAIL (format refused) ::"),
+        };
+        let root = fs.superblock.root_inode;
+        let wrote = fs.create_file(root, "w.txt".into()).and_then(|id| fs.write_data(id, 0, WITNESS)).is_ok();
+        let Ok((slot, _words)) = crate::keyring::volkey_seal(PW, KdfParams::FLOOR) else {
+            return serial_println!(":: KEYBOOT2: wrong=none unlock=none bind=none -> FAIL (seal refused) ::");
+        };
+        if !(wrote && fs.set_key_slot(slot).is_ok()) {
+            return serial_println!(":: KEYBOOT2: wrong=none unlock=none bind=none -> FAIL (keying refused) ::");
+        }
+        let bytes = core::mem::take(&mut fs.device).into_bytes();
+        drop(fs);
+        if !unafs::keyboot_lend_ram(bytes) {
+            return serial_println!(":: KEYBOOT2: wrong=none unlock=none bind=none -> SKIP (the root's hold is open or a volume is lent) ::");
+        }
+        // One submit through the form's own path, then the outcome applied by the render pulse (bounded).
+        let run = |pw: &[u8]| -> bool {
+            if !login::kb_leg_submit(pw) {
+                return false;
+            }
+            let t0 = crate::arch::ms();
+            while login::submit_busy() {
+                if crate::arch::ms().saturating_sub(t0) > 20_000 {
+                    return false;
+                }
+                #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+                login::submit_drain();
+                core::hint::spin_loop();
+            }
+            true
+        };
+        let wrong_ran = run(WRONG);
+        let rw = unafs::keyboot_report();
+        let refused_mac = wrong_ran && rw.outcome == "mac";
+        let right_ran = run(PW);
+        let r = unafs::keyboot_report();
+        let mounted = unafs::keyboot_ram_take();
+        let landed = mounted.is_some_and(|mut m| m.resolve_path("/w.txt").and_then(|id| m.read_data(id, 0, WITNESS.len() as u64)).is_ok_and(|d| d == WITNESS));
+        let kdf_ok = r.kdf_if != "0" && rw.kdf_if != "0";
+        let pass = refused_mac && right_ran && landed && r.masked_max_us.max(rw.masked_max_us) <= MASKED_BOUND_US && kdf_ok;
+        line(
+            if refused_mac { "refused(mac)" } else if wrong_ran { "OPENED" } else { "timeout" },
+            if right_ran { "ok" } else { "timeout" },
+            if landed { "landed" } else { "FAIL" },
+            &unafs::KbReport { masked_max_us: r.masked_max_us.max(rw.masked_max_us), ..r },
+            if pass { "PASS" } else { "FAIL" },
+        );
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    serial_println!(":: KEYBOOT2: unlock=not-built -> SKIP (no unlock form in this build) ::");
 }
