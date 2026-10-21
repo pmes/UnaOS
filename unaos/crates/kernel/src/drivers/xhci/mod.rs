@@ -2797,13 +2797,12 @@ struct FtdiPending {
     completion_code: u8,
 }
 
-/// In-flight SYNCHRONOUS EP0 control transfer, used during hub bring-up (a main-loop, non-event
-/// context). Like `BotPending` but for EP0: the awaited Status TRB is matched by its physical
-/// address so the sync pump claims exactly its own completion before the async descriptor FSM
-/// runs. Inert (None) during normal root-port enumeration, so that path is untouched.
+/// In-flight SYNCHRONOUS EP0 control transfer (`sync_control`: hub bring-up and other main-loop contexts), one per
+/// slot, held in `DeviceSlot::ep0_pending` (SYNCCONTROLSPLIT B800). Like `BotPending` but for EP0: the awaited Status
+/// TRB is matched by its physical address so the sync pump claims exactly its own completion before the async
+/// descriptor FSM runs. Inert (None) during normal root-port enumeration, so that path is untouched.
 #[derive(Clone, Copy)]
 struct Ep0Pending {
-    slot_id: u8,
     wait_trb_phys: u64,
     done: bool,
     completion_code: u8,
@@ -3096,6 +3095,9 @@ pub struct DeviceSlot {
     /// (0 = none). Matched in the transfer dispatch to reject a Panther-Point dup-Success for an
     /// already-consumed TD — the same guard `mouse_expect_phys` applies to the pointer read.
     pub hub_int_expect_phys: u64,
+    /// SYNCCONTROLSPLIT (B800): this device's in-flight EP0 control transfer, claimed in the transfer dispatch by
+    /// Status/Data TRB address (see `Ep0Pending`). Per slot: a transfer parked by the held leg survives another slot's.
+    ep0_pending: Option<Ep0Pending>,
 }
 
 unsafe impl Send for DeviceSlot {}
@@ -3163,6 +3165,7 @@ impl DeviceSlot {
             hub_int_ring: None,
             hub_change_buffer: None,
             hub_int_expect_phys: 0,
+            ep0_pending: None,
         }
     }
 
@@ -3480,8 +3483,6 @@ pub struct XhciController {
     bot_self_cycle_port: u8,
     bot_self_cycle_route: u32,
 
-    /// In-flight synchronous EP0 control transfer (hub bring-up). See `Ep0Pending`.
-    ep0_pending: Option<Ep0Pending>,
     /// XENUM-3 M1: bytes actually transferred by the most recent `sync_control` IN read (requested
     /// length minus the DATA-stage residual). Only meaningful immediately after a `sync_control`
     /// call returns Ok; the downstream enumerator reads it to detect a short descriptor read.
@@ -3665,7 +3666,6 @@ impl XhciController {
             bot_self_cycle_until: 0,
             bot_self_cycle_port: 0,
             bot_self_cycle_route: 0,
-            ep0_pending: None,
             last_control_len: 0,
             cmd_pending: None,
             hubs_pending: Vec::new(),
@@ -4294,50 +4294,50 @@ impl XhciController {
                             _ => {}
                         }
 
-                        // Synchronous EP0 control transfer (hub bring-up) claims its OWN Status-TRB
+                        // Synchronous EP0 control transfer (`sync_control`) claims its OWN Status-TRB
                         // completion here, before the async descriptor FSM below — matched by TRB
-                        // address (or any error), so it never disturbs other slots' enumeration.
+                        // address (or any error), so it never disturbs other slots' enumeration. The
+                        // pending is the event's own slot's (`DeviceSlot::ep0_pending`, one control
+                        // transfer per device — SYNCCONTROLSPLIT B800), so a parked one outlives others.
                         if endpoint_id == 1 && slot_id > 0 {
-                            if let Some(p) = self.ep0_pending {
-                                if p.slot_id == slot_id as u8 {
-                                    let is_match = param == p.wait_trb_phys;
-                                    let is_error = completion_code != 1 && completion_code != 13;
-                                    // Only consume the event if it is actually ours (the awaited
-                                    // Status TRB, or an error). A same-slot non-matching success
-                                    // must fall through to the async FSM rather than be dropped.
-                                    if is_match || is_error {
-                                        if let Some(ep) = self.ep0_pending.as_mut() {
-                                            ep.completion_code = completion_code as u8;
-                                            ep.done = true;
-                                        }
-                                        return; // consumed by the sync EP0 pump
+                            if let Some(p) = self.slots.get(slot_id as usize).and_then(|s| s.ep0_pending) {
+                                let is_match = param == p.wait_trb_phys;
+                                let is_error = completion_code != 1 && completion_code != 13;
+                                // Only consume the event if it is actually ours (the awaited
+                                // Status TRB, or an error). A same-slot non-matching success
+                                // must fall through to the async FSM rather than be dropped.
+                                if is_match || is_error {
+                                    if let Some(ep) = self.slots[slot_id as usize].ep0_pending.as_mut() {
+                                        ep.completion_code = completion_code as u8;
+                                        ep.done = true;
                                     }
-                                    // XENUM-3 M1: this sync transfer's DATA stage, matched by the
-                                    // DATA TRB's physical address (like wait_trb_phys for Status)
-                                    // AND first-write latched on data_seen. Both guards defend
-                                    // against Panther Point's XHCI_SPURIOUS_SUCCESS quirk (device
-                                    // 0x1e31): a duplicate Success after a Short Packet for the same
-                                    // TD would otherwise overwrite a real short-read residual with 0,
-                                    // last_control_len would read full, and the zeroed-descriptor
-                                    // strand M1 exists to catch would go undetected on the exact
-                                    // target hardware. Record the residual (TRB Transfer Length
-                                    // remaining) so the enumerator learns the ACTUAL transferred
-                                    // length, then consume the event — previously it fell through to
-                                    // the async FSM and was dropped as "stale/spurious". A matching
-                                    // dup (param == data_trb_phys, data_seen already set) is consumed
-                                    // without recording; QEMU posts no dup, so gates are
-                                    // no-regression only for the latch.
-                                    if (completion_code == 1 || completion_code == 13)
-                                        && p.data_trb_phys != 0 && param == p.data_trb_phys
-                                    {
-                                        if let Some(ep) = self.ep0_pending.as_mut() {
-                                            if !ep.data_seen {
-                                                ep.data_residual = transfer_len;
-                                                ep.data_seen = true;
-                                            }
+                                    return; // consumed by the sync EP0 pump
+                                }
+                                // XENUM-3 M1: this sync transfer's DATA stage, matched by the
+                                // DATA TRB's physical address (like wait_trb_phys for Status)
+                                // AND first-write latched on data_seen. Both guards defend
+                                // against Panther Point's XHCI_SPURIOUS_SUCCESS quirk (device
+                                // 0x1e31): a duplicate Success after a Short Packet for the same
+                                // TD would otherwise overwrite a real short-read residual with 0,
+                                // last_control_len would read full, and the zeroed-descriptor
+                                // strand M1 exists to catch would go undetected on the exact
+                                // target hardware. Record the residual (TRB Transfer Length
+                                // remaining) so the enumerator learns the ACTUAL transferred
+                                // length, then consume the event — previously it fell through to
+                                // the async FSM and was dropped as "stale/spurious". A matching
+                                // dup (param == data_trb_phys, data_seen already set) is consumed
+                                // without recording; QEMU posts no dup, so gates are
+                                // no-regression only for the latch.
+                                if (completion_code == 1 || completion_code == 13)
+                                    && p.data_trb_phys != 0 && param == p.data_trb_phys
+                                {
+                                    if let Some(ep) = self.slots[slot_id as usize].ep0_pending.as_mut() {
+                                        if !ep.data_seen {
+                                            ep.data_residual = transfer_len;
+                                            ep.data_seen = true;
                                         }
-                                        return; // DATA stage claimed by the sync EP0 pump
                                     }
+                                    return; // DATA stage claimed by the sync EP0 pump
                                 }
                             }
                         }
@@ -13879,18 +13879,17 @@ impl XhciController {
         }
     }
 
-    /// Synchronous EP0 control transfer: queue Setup/[Data]/Status on the slot's EP0 ring, ring
-    /// the doorbell, and pump the event ring until the Status TRB retires (matched by address).
-    /// Used for hub-class requests during hub bring-up (a safe, main-loop, non-event context —
-    /// like the synchronous BOT pump). Returns the completion code (1 = success).
-    fn sync_control(&mut self, slot_id: u8, bm_req: u8, b_req: u8, w_value: u16, w_index: u16,
-                    w_length: u16, data_phys: u64, dir_in: bool) -> Result<u8, ()> {
-        let setup: u64 = (bm_req as u64)
-            | ((b_req as u64) << 8)
-            | ((w_value as u64) << 16)
-            | ((w_index as u64) << 32)
-            | ((w_length as u64) << 48);
+    /// Synchronous EP0 control transfer, for hub-class requests in bring-up and other main-loop contexts (like the BOT pump):
+    /// the queue half `ep0_queue` then the wait half `ep0_wait` (SYNCCONTROLSPLIT B800). Returns the completion code (1 = success).
+    fn sync_control(&mut self, slot_id: u8, bm_req: u8, b_req: u8, w_value: u16, w_index: u16, w_length: u16, data_phys: u64, dir_in: bool) -> Result<u8, ()> {
+        self.ep0_queue(slot_id, bm_req, b_req, w_value, w_index, w_length, data_phys, dir_in)?;
+        self.ep0_wait(slot_id, w_length, data_phys, dir_in)
+    }
 
+    /// sync_control's queue half: Setup/[Data]/Status on the slot's EP0 ring, the transfer parked in the slot's own
+    /// `ep0_pending` (one control transfer per device, USB 2.0 §8.5.3), the doorbell rung. `Ok(status TRB phys)`.
+    fn ep0_queue(&mut self, slot_id: u8, bm_req: u8, b_req: u8, w_value: u16, w_index: u16, w_length: u16, data_phys: u64, dir_in: bool) -> Result<u64, ()> {
+        let setup: u64 = (bm_req as u64) | ((b_req as u64) << 8) | ((w_value as u64) << 16) | ((w_index as u64) << 32) | ((w_length as u64) << 48);
         // XHCI-COHERENCE: producer-side eviction for the data buffer. Some callers pre-zero the buffer
         // (e.g. the 8-byte MPS0-learn) or reuse it, leaving dirty CPU lines; clean them to DRAM BEFORE
         // the controller DMAs so a delayed eviction can't later clobber its write (IN) or so it reads
@@ -13898,11 +13897,9 @@ impl XhciController {
         if w_length > 0 {
             dma_coherency::clean(data_phys as usize, w_length as usize);
         }
-
         // Setup stage. TRT: 0 = no data, 2 = OUT data, 3 = IN data.
         let trt: u32 = if w_length == 0 { 0 } else if dir_in { 3 } else { 2 };
         self.push_ep0(slot_id, Trb { parameter: setup, status: 8, control: (2 << 10) | (1 << 6) | (trt << 16) });
-
         // Data stage (if any). XENUM-3 M1: set IOC (bit 5) so the DATA stage posts its OWN transfer
         // event carrying the TRB Transfer Length residual — without it only the Status TRB (IOC)
         // reports, and the actual transferred length is invisible. The extra event is claimed and
@@ -13914,7 +13911,6 @@ impl XhciController {
         } else {
             0
         };
-
         // Status stage (IOC). Direction is opposite the data stage; with no data it is IN.
         let status_dir: u32 = if w_length == 0 { 1 } else if dir_in { 0 } else { 1 };
         let status_phys = {
@@ -13924,14 +13920,18 @@ impl XhciController {
             base + (idx as u64) * 16
         };
 
-        self.ep0_pending = Some(Ep0Pending {
-            slot_id, wait_trb_phys: status_phys, done: false, completion_code: 0,
+        self.slots[slot_id as usize].ep0_pending = Some(Ep0Pending {
+            wait_trb_phys: status_phys, done: false, completion_code: 0,
             data_trb_phys, data_residual: 0, data_seen: false,
         });
         self.ring_doorbell(slot_id, 1);
+        Ok(status_phys)
+    }
 
-        let pump = self.pump_until_ep0_done();
-        let pending = self.ep0_pending.take();
+    /// sync_control's wait half: pump until the dispatch claims the slot's pending Status TRB, then read it back.
+    fn ep0_wait(&mut self, slot_id: u8, w_length: u16, data_phys: u64, dir_in: bool) -> Result<u8, ()> {
+        let pump = self.pump_until_ep0_done(slot_id);
+        let pending = self.slots[slot_id as usize].ep0_pending.take();
         pump?;
         // XHCI-COHERENCE: consumer boundary (one chokepoint for every control-IN reader — device /
         // config / hub-status descriptors all land here). The controller DMA-wrote `data_phys`;
@@ -13962,7 +13962,7 @@ impl XhciController {
     /// deadline for exactly this reason; EP0 and the command pump now follow, so no wait on the path
     /// to a hub-routed block device is denominated in yields. Still strictly bounded — a free-running
     /// counter deadline, never unbounded.
-    fn pump_until_ep0_done(&mut self) -> Result<(), ()> {
+    fn pump_until_ep0_done(&mut self, slot_id: u8) -> Result<(), ()> {
         let start = crate::arch::now_cycles();
         let budget = crate::arch::hw_wait_budget(); #[cfg(feature = "usbnet")] let budget = usbnet::sync_budget(budget); // PUMPRETRY (B537): inside the link's service pass the EP0 wait is capped (budget/4, and never past the pass deadline) so a dongle that stops answering cannot hold the pump past PUMPWEDGE's bound; outside it, unchanged. LINE-NEUTRAL append (knob-off: the cfg erases it)
         // BOOTPACE M3: the ~200 µs pre-hlt spin window, hoisted (see `spin_window`). EP0 matters
@@ -13970,7 +13970,7 @@ impl XhciController {
         // used to cost a full APIC tick no matter how fast the device answered.
         let spin_window = Self::spin_window();
         loop {
-            match &self.ep0_pending {
+            match self.slots.get(slot_id as usize).and_then(|s| s.ep0_pending) {
                 Some(p) if p.done => return Ok(()),
                 None => return Ok(()),
                 _ => {}
@@ -18371,38 +18371,32 @@ pub mod suspend {
         }
 
         /// XHCIHOLDDCI (B795), `tests usbsuspend`'s held leg, front half: while the ports are SUSPENDED, the keyboard's
-        /// GET_REPORT(Input) (HID 1.11 §7.2.1, the request `kbd_report_probe` sends) queued on its EP0 as `sync_control`
-        /// queues it (`push_ep0` Setup/Data/Status, the `ep0_pending` the transfer dispatch claims) but NOT waited for:
+        /// GET_REPORT(Input) (HID 1.11 §7.2.1, the request `kbd_report_probe` sends) queued by `ep0_queue` (sync_control's
+        /// queue half, SYNCCONTROLSPLIT B800) and parked in the slot's own `ep0_pending`, but NOT waited for:
         /// `ring_doorbell` holds it and remembers DCI 1. `Ok(status TRB phys)`; `Err` word: `phase` (not SUSPENDED),
-        /// `none` (no keyboard), `unheld` (its slot is not held), `busy` (EP0 pending in flight).
+        /// `none` (no keyboard), `unheld` (its slot is not held), `busy` (that slot's EP0 transfer in flight).
         pub fn held_report_queue(&mut self) -> Result<u64, &'static str> {
             if !suspended() { return Err("phase"); }
             let (slot, _dci, intf) = self.kbd_slot_on(0).ok_or("none")?;
             let buf = self.slots[slot as usize].descriptor_buffer as u64;
             if buf == 0 { return Err("none"); }
             if HELD[slot as usize].load(Ordering::Relaxed) == 0 { return Err("unheld"); }
-            if self.ep0_pending.is_some() { return Err("busy"); }
-            let setup: u64 = 0xA1 | (0x01 << 8) | (0x0100u64 << 16) | ((intf as u64) << 32) | (8u64 << 48);
-            self.push_ep0(slot, super::Trb { parameter: setup, status: 8, control: (2 << 10) | (1 << 6) | (3 << 16) });
-            let data_trb_phys = self.push_ep0(slot, super::Trb { parameter: buf, status: 8, control: (3 << 10) | (1 << 5) | (1 << 16) });
-            let status_phys = self.push_ep0(slot, super::Trb { parameter: 0, status: 0, control: (4 << 10) | (1 << 5) });
-            if status_phys == 0 { return Err("none"); }
-            self.ep0_pending = Some(super::Ep0Pending {
-                slot_id: slot, wait_trb_phys: status_phys, done: false, completion_code: 0,
-                data_trb_phys, data_residual: 0, data_seen: false,
-            });
-            self.ring_doorbell(slot, 1);
+            if self.slots[slot as usize].ep0_pending.is_some() { return Err("busy"); }
+            let status_phys = self.ep0_queue(slot, 0xA1, 0x01, 0x0100, intf as u16, 8, buf, true).map_err(|_| "none")?;
+            if status_phys == 0 { self.slots[slot as usize].ep0_pending = None; return Err("none"); }
             Ok(status_phys)
         }
 
-        /// The held leg's back half, after UP: `None` = the parked `ep0_pending` is no longer this transfer (lost);
-        /// else pump until the dispatch claimed its Status TRB (`pump_until_ep0_done`) and `Some((cc, bytes))`.
+        /// The held leg's back half, after UP: `None` = no slot's parked `ep0_pending` is this transfer any more (lost);
+        /// else `ep0_wait` (sync_control's wait half) on that slot and `Some((cc, bytes))`, `Some((0, 0))` on its `Err`.
         pub fn held_report_collect(&mut self, status_phys: u64) -> Option<(u8, u32)> {
-            if self.ep0_pending.map(|p| p.wait_trb_phys) != Some(status_phys) { return None; }
-            let pumped = self.pump_until_ep0_done();
-            let p = self.ep0_pending.take()?;
-            if pumped.is_err() || !p.done { return Some((0, 0)); }
-            Some((p.completion_code, if p.data_seen { 8u32.saturating_sub(p.data_residual) } else { 0 }))
+            let (slot, buf) = self.slots.iter().enumerate().find_map(|(i, s)| {
+                (s.ep0_pending.map(|p| p.wait_trb_phys) == Some(status_phys)).then(|| (i as u8, s.descriptor_buffer as u64))
+            })?;
+            match self.ep0_wait(slot, 8, buf, true) {
+                Ok(cc) => Some((cc, self.last_control_len)),
+                Err(()) => Some((0, 0)),
+            }
         }
     }
 }
