@@ -2775,3 +2775,39 @@ other=0 findings=0 -> PASS`.
 **What it does not do.** It cannot see a blob committed OUTSIDE `unaos/firmware/` (the census's corpus is that one
 directory), nor tell a pins digest written from the bench's measurement from a hand-typed one; the ledger row that
 names the set is the record review reads.
+
+## GATE-LOCKTYPE — every kernel spin lock is the registry's (SR188, 2026-10-21)
+
+**The hole.** BP-cores-20 (B414 LOCKREG, rmbp-ledger B823 LOCKREG2): every kernel spin lock is `crate::sync::Mutex`,
+whose construction site is its name, so the registry can name a hold past 50 ms, a spin-wait and an inversion. A raw
+`spin::Mutex` compiles green and is invisible to it. LOCKREG2 found 38 raw statics in 15 files that had crept back
+after the B414 sweep because no gate stopped them, swept them, and left this gate owed (cores §5).
+
+**The gate.** `python3 unaos/scripts/lock-type.py <unaos dir>`, the `gates` row `locktype`. Scope: every `.rs` under
+`unaos/crates/kernel/src`, arch/ and sync.rs included. Comments and string literals are stripped by
+`tools/neutral-check.py`'s `lex`, imported, not copied. A finding in CODE: the Mutex family (`spin::Mutex`,
+`spin::MutexGuard`, `spin::mutex::{Mutex,SpinMutex,TicketMutex,FairMutex}`; the twin is `sync::Mutex`, sync.rs:21/:34),
+the RwLock family (`spin::RwLock*`, `spin::rwlock::…`; no twin, a spin lock LOCKREG cannot see), a `use spin::{…}` brace
+group naming one, and the glob `use spin::*`. Not findings: `spin::Once` (an init cell, no hold) and
+`spin::Spin`/`spin::relax::Spin` (the relax parameter `sync::MutexGuard` mirrors). The ruled exceptions are the
+registry's own inner lock, six rows by exact path+line in the script's `ALLOW` (sync.rs :22 :38 :49 :60 :67 :768 at
+13ca547f), each with its reason, SHRINK-ONLY: a finding with no row is RAW (exit 1), a row matching nothing is STALE
+(exit 1), so an edit that moves one of those lines re-rules it in the same commit. Controls (exit 2, `LOCKTYPE: NO
+VERDICT — …`): the scope enumerates >= 200 files and holds sync.rs; the lexer imports; the `--selftest` fixture (run
+first by main) goes red on a raw static, `use spin::{Mutex, Once};`, `spin::RwLock`, `use spin::*;` and
+`spin::mutex::SpinMutex`, green on the token in a comment and a string, `spin::Once`, `crate::sync::MutexGuard<'_, T,
+spin::Spin>` and `use spin::relax::Spin`, green on an allowlisted line, red on a stale row. On the tree the six allow
+rows matching are the proof the pattern fires.
+
+**Go-red (measured GATELOCKTYPE at 13ca547f, on a scratch copy of the kernel src, the script and the lexer).** The plant
+`gates --selftest` uses (`_gates_plant` locktype): `pub static P: spin::Mutex<u8> = spin::Mutex::new(0);` as
+`video/zz_gateplant_locktype.rs` -> exit 1, `LOCKTYPE: RAW   unaos/crates/kernel/src/video/zz_gateplant_locktype.rs:1
+spin::Mutex — use crate::sync::Mutex (BP-cores-20: LOCKREG names it by its site), or rule a sync.rs twin first` (twice:
+the type and the constructor), summary `files=431 raw=2 allowed=6 stale=0 -> FAIL`. A line inserted at the top of
+sync.rs -> exit 1, six RAW at :23 … :769 and six STALE at :22 … :768, `files=430 raw=6 allowed=0 stale=6 -> FAIL`.
+sync.rs removed -> exit 2, `LOCKTYPE: NO VERDICT — unaos/crates/kernel/src/sync.rs is not in the scope`. On the tree:
+`LOCKTYPE: files=430 raw=0 allowed=6 stale=0 -> PASS`.
+
+**What it does not do.** It reads type paths, not behaviour: a lock built by hand on atomics (a CAS gate such as
+`COMP_GATE`) is not a `spin` type and passes, and a raw lock reached through a type alias defined OUTSIDE the kernel
+src (a dependency re-export) is not seen. `spin::Once` stays unregistered by design.

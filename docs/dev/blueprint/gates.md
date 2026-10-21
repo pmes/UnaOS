@@ -56,6 +56,7 @@
 | nonetreach (B697) | `unaos/scripts/nonet-reach.py` (imports nonet-check.py's walker) | BP-gates-14 |
 | neutral (SR166) | `tools/neutral-check.py`; ruled exceptions `tools/neutral.allow` (row + reason, shrink-only) | BP-shape-4: no board word part in an identifier or string of `unaos/crates/kernel/src` minus `arch/` (no drivers/ dir is board-specific today) |
 | firmware (SR166) | `tools/firmware-census.py` | BP-shape-11: the `git ls-files` census of `unaos/firmware/` (pins digest rows + a resolving ledger row; no binary) |
+| locktype (SR188) | `unaos/scripts/lock-type.py` (imports `tools/neutral-check.py`'s lexer) | BP-cores-20: no raw `spin::Mutex`/`MutexGuard`/`spin::mutex::*`/`spin::RwLock*` in the code of `unaos/crates/kernel/src`, save sync.rs's six allow rows (the registry's inner lock, exact path+line, shrink-only); `spin::Once` and `spin::Spin` pass |
 
 ## 4. Verbs (`unaos/arroyo` tail `case`)
 `check` · `state` · `gates [--list|--selftest]` · `test` / `test-arm` / `test-fat` / `test-install` / `test-ptr` / `test-splash` / `test-selfhost` (QEMU) · `x86` / `arm` (QEMU GUI) ·
