@@ -706,13 +706,13 @@ refs/heads/exec-rmbp-pirenderscroll   30d6c74d FOLDED-BY-HAND (this commit) 2026
 refs/heads/exec-rmbp-millerwheel   cdc025fc FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-staletext2   82abbcc8 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-synccontrolsplit   f3c1794c FOLDED-BY-HAND (this commit) 2026-10-21
-refs/heads/exec-rmbp-ehcihubdisc   ac9460ec IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-ehcihubdisc   208ba95c FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-focus64b   3f44cf6f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-keepreaders   fd22dc1d FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-el0home   3f44cf6f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-settingssub   d3cf1707 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-wifidata   7bcc5652 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-heldslotep0   7bcc5652 IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-staletext3   7bcc5652 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-staletext3   14af7415 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-playstartgap   b95a948a IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-columnshover   b95a948a IN-FLIGHT cut 2026-10-21
