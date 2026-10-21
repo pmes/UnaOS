@@ -359,7 +359,7 @@ fn witness(ok: bool) {
 
 /// Load the store for the session user and apply the keys it carries.
 fn load_for_login() {
-    crate::prefs_client::subscribe();
+    // SETTINGSSUB (B802): no subscribe here — the queue is on from the first service pass (`bus_subscribe_once`) and a logout never turns it off
     safe_mode_check();
     let mut v = CUR.lock().clone();
     let (mask, n) = from_prefs(&mut v);
@@ -2250,7 +2250,7 @@ pub fn bus_changes_idle() -> (usize, usize, u32) {
 }
 
 fn bus_changes_inner() -> (usize, usize, usize) {
-    crate::prefs_client::subscribe();
+    bus_subscribe_once(); // SETTINGSSUB (B802): the registration is the first pass's edge (file tail); this pass is the drain only
     let mut keys: Vec<&'static str> = Vec::new();
     let mut idle = 0usize;
     let frames = crate::prefs_client::changes_drain(|ns, k| {
@@ -5672,4 +5672,20 @@ pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 2] {
         Ok(walk.len())
     })();
     [tabs, types]
+}
+
+// ── SETTINGSSUB (rmbp-ledger B802, BP-security-18) — Settings subscribes once, at its first service pass — TAIL-APPENDED ──
+// CHARTER: Principia — fulfiller (the kernel bus client `prefs_client`); Settings is the one drainer of its PrefChanged queue.
+// Measured: `prefs_client::subscribe` registers for the boot (nothing clears `SUBSCRIBED` but the witness hold, which
+// restores it), and a logout neither unsubscribes nor clears the queue — the reload's PrefChanged (PREFSRELOAD B763)
+// lands in it. So the edge is the FIRST pass, not the session-open edge: without `login` that edge never fires, and with
+// it the load runs SAFE_SETTLE_MS after the login, too late for a PrefChanged before the first login.
+static BUS_SUB: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The kernel subscriber's one registration: the first call subscribes, every later call is nothing.
+fn bus_subscribe_once() {
+    if !BUS_SUB.swap(true, Ordering::AcqRel) {
+        crate::prefs_client::subscribe();
+        serial_println!("[settings] prefchanged subscribe once (SETTINGSSUB B802)");
+    }
 }
