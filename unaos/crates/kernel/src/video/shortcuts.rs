@@ -48,7 +48,7 @@ pub const C_CMD_ALT_ESC: &str = "cmd-alt-esc";
 pub const C_CTRL_CMD_Q: &str = "ctrl-cmd-q";
 pub const C_CMD_I: &str = "cmd-i"; // ATTRCOLUMNS (B402)
 pub const C_CMD_SPACE: &str = "cmd-space"; // LAUNCHER (B417)
-pub const C_CMD_PERIOD: &str = "cmd-."; pub const C_CMD_Z: &str = "cmd-z"; pub const C_CMD_SHIFT_Z: &str = "cmd-shift-z"; // SHELLTASK2 (B474) · UNDOKEYS (B743): Undo / Redo
+pub const C_CMD_PERIOD: &str = "cmd-."; pub const C_CMD_Z: &str = "cmd-z"; pub const C_CMD_SHIFT_Z: &str = "cmd-shift-z"; pub const C_CMD_QUESTION: &str = "cmd-?"; pub const C_F1: &str = "f1"; // HELPVERBDOC (B756): Help. SHELLTASK2 (B474) · UNDOKEYS (B743): Undo / Redo
 
 const fn s(chord: &'static str, scope: &'static str, action: &'static str, arc: &'static str) -> Shortcut {
     Shortcut { chord, scope, action, arc }
@@ -64,7 +64,7 @@ pub static SHORTCUTS: &[Shortcut] = &[
     s(C_CTRL_CMD_Q, "Desktop", "Lock Screen", "APPMENU2"),
     s(C_CMD_ALT_ESC, "Desktop", "Force Quit...", "APPMENU2"),
     s(C_CMD_SPACE, "Desktop", "Launcher", "LAUNCHER"),
-    s("F1 / F2", "Desktop", "Brightness down / up", "BRIGHTKEYS"),
+    s("F1 / F2", "Desktop", "Brightness down / up", "BRIGHTKEYS"), s(C_CMD_QUESTION, "Desktop", "Help for this app", "HELPVERBDOC"), s("F1 (PC) / Shift-F1", "Desktop", "Help for this app", "HELPF1"), // HELPVERBDOC (B756)
     s("F10 / F11 / F12", "Desktop", "Volume", "AUDIOKEYS"),
     s(C_CMD_SHIFT_3, "Capture", "Screenshot", "PRTSCR"),
     s(C_CMD_SHIFT_4, "Capture", "Screenshot region", "SHOTREGION"),
@@ -289,7 +289,7 @@ pub fn close() -> bool {
 
 /// The key door: while the overlay is up ANY key (or action) closes it and is consumed; a key-up is swallowed.
 pub fn overlay_key(ev: crate::pal::Event) -> bool {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] if super::keymap::zoom_swallow(ev) { return true; } if !is_open() { // UNDOKEYS (B743): the zoom chord's key-up is consumed at this door (ahead of the focused ring), overlay or not. LINE-NEUTRAL, code first
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] if super::keymap::zoom_swallow(ev) { return true; } #[cfg(all(target_arch = "x86_64", feature = "wc"))] if help_action(ev) { return true; } if !is_open() { // HELPVERBDOC (B756): `Action::Help` is acted on here (file tail), consumed. UNDOKEYS (B743): the zoom chord's key-up is consumed at this door (ahead of the focused ring), overlay or not. LINE-NEUTRAL, code first
         return false;
     }
     match ev {
@@ -328,4 +328,23 @@ pub fn selftest() {
         }
     }
     serial_println!(":: SHORTCUTS: entries={} scopes={} shown={} -> {} ::", entries, scopes, shown_n, if ok { "PASS" } else { "FAIL" });
+}
+
+// ══════════════ HELPVERBDOC (rmbp-ledger B756, BP-video-35, BP-input-2) — TAIL-APPENDED: the router acts on Help ══════════════
+// `Action::Help` is a keymap row (⌘? on the Una tables, F1 on the Softy tables); the decoder pushes it as
+// `pal::Event::Action` like every non-capture row, and the x86 route's door chain asks `overlay_key` (folded there)
+// before the focus ring and ring 3. The door only latches HELPF1's `help::window::request_for_focus()` (R88); the
+// Help window's pass opens the focused app's page. Wire: `[help] chord action=help table=<t> -> latched`.
+
+/// The router's Help door: `true` = `ev` was `Action::Help`; the shortcut overlay (if up) is closed, the focused app's
+/// page latched, the event consumed.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn help_action(ev: crate::pal::Event) -> bool {
+    if !matches!(ev, crate::pal::Event::Action(super::keymap::Action::Help)) {
+        return false;
+    }
+    let _ = close();
+    crate::help::window::request_for_focus();
+    serial_println!("[help] chord action=help table={} -> latched", super::keymap::active().name);
+    true
 }

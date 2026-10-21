@@ -4457,7 +4457,10 @@ fn helpf1_selftest() {
     use crate::drivers::xhci::HID_MOD_SHIFT;
     use crate::help::{index, window};
     use crate::video::{fnrow, theme, wm};
-    let decide_ok = fnrow::help_key(theme::PC_BINDINGS, fnrow::USAGE_F1, 0)
+    use crate::video::keymap::{self, Action};
+    // HELPVERBDOC (B756): the PC rows NAME F1 as Help now, so the fn-row arm yields to the table there.
+    let decide_ok = !fnrow::help_key(theme::PC_BINDINGS, fnrow::USAGE_F1, 0)
+        && keymap::resolve(theme::PC_BINDINGS, 0, fnrow::USAGE_F1) == Some(Action::Help)
         && !fnrow::help_key(theme::CRISPY_BINDINGS, fnrow::USAGE_F1, 0)
         && fnrow::help_key(theme::CRISPY_BINDINGS, fnrow::USAGE_F1, HID_MOD_SHIFT)
         && !fnrow::help_key(theme::PC_BINDINGS, 0x3B, 0)
@@ -4469,7 +4472,15 @@ fn helpf1_selftest() {
     window::close();
     let before = wm::front_of_owner(window::OWNER).is_some() as usize;
     let want = window::page_for_app(window::app_of(wm::focus_asid()));
-    let routed = fnrow::fn_row_usage(fnrow::PATH_XHCI, fnrow::USAGE_F1, HID_MOD_SHIFT) == Some(fnrow::FnAct::Help);
+    // HELPVERBDOC (B756): where the live table names F1 as Help (the Softy tables) the press is the decoder's Action
+    // through the route, and the fn-row router declines it; elsewhere Shift+F1 is the fn-row arm.
+    let row_f1 = keymap::resolve(keymap::active(), HID_MOD_SHIFT, fnrow::USAGE_F1) == Some(Action::Help);
+    let routed = if row_f1 {
+        fnrow::fn_row_usage(fnrow::PATH_XHCI, fnrow::USAGE_F1, HID_MOD_SHIFT).is_none()
+            && matches!(crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Action(Action::Help)), crate::pal::Event::Unknown)
+    } else {
+        fnrow::fn_row_usage(fnrow::PATH_XHCI, fnrow::USAGE_F1, HID_MOD_SHIFT) == Some(fnrow::FnAct::Help)
+    };
     window::service();
     let t0 = crate::arch::ms();
     while !window::is_open() && crate::arch::ms().wrapping_sub(t0) < 500 {
@@ -4501,8 +4512,46 @@ fn helpf1_selftest() {
         decide_ok as u8, routed as u8, before, after, front.map(|w| w as i64).unwrap_or(-1), if shown.is_empty() { "-" } else { shown.as_str() }, want,
         q_ok as u8, top.first().map(|t| t.0.as_str()).unwrap_or("-"), if zoom_page.is_empty() { "-" } else { zoom_page.as_str() }, top.len()
     );
-    let ok = f1 != "FAIL" && shell_ok;
-    serial_println!(":: HELPF1: f1={} shell={} -> {} ::", f1, if shell_ok { "ok" } else { "FAIL" }, if ok { "PASS" } else { "FAIL" });
+    // HELPVERBDOC (B756): `Action::Help` is a keymap row on all four tables and the route acts on it.
+    let gui = crate::drivers::xhci::HID_MOD_GUI;
+    let alt = crate::drivers::xhci::HID_MOD_ALT;
+    let rows_ok = keymap::resolve(theme::CRISPY_BINDINGS, gui | HID_MOD_SHIFT, 0x38) == Some(Action::Help)
+        && keymap::resolve(theme::CRISPY_BINDINGS, gui, 0x38) == Some(Action::ShowShortcuts)
+        && keymap::resolve(keymap::softy2_table(true, false), alt | HID_MOD_SHIFT, 0x38) == Some(Action::Help)
+        && keymap::resolve(keymap::softy2_table(false, true), 0, fnrow::USAGE_F1) == Some(Action::Help)
+        && keymap::resolve(theme::PC_BINDINGS, 0, fnrow::USAGE_F1) == Some(Action::Help)
+        && keymap::resolve(theme::CRISPY_BINDINGS, 0, fnrow::USAGE_F1) == Some(Action::BrightnessDown)
+        && Action::Help.name() == "help"
+        && crate::smallfix3::listed(Action::Help)
+        && crate::smallfix3::ACTIONS.contains(&Action::Help);
+    window::service();
+    window::close();
+    let c_before = wm::front_of_owner(window::OWNER).is_some() as usize;
+    let c_want = window::page_for_app(window::app_of(wm::focus_asid()));
+    let c_routed = matches!(crate::arch::x86_64::syscall::wc_route_event(crate::pal::Event::Action(Action::Help)), crate::pal::Event::Unknown);
+    window::service();
+    let t1 = crate::arch::ms();
+    while !window::is_open() && crate::arch::ms().wrapping_sub(t1) < 500 {
+        core::hint::spin_loop();
+    }
+    let c_after = wm::front_of_owner(window::OWNER).is_some() as usize;
+    let c_shown = window::shown();
+    let chord = if !rows_ok || !c_routed {
+        "FAIL"
+    } else if c_after == c_before + 1 && window::is_open() && c_shown == c_want {
+        "ok"
+    } else if !loaded || crate::video::panel_info_nonblocking().is_none() {
+        "skip(no-panel)"
+    } else {
+        "FAIL"
+    };
+    window::close();
+    serial_println!(
+        "[help] fixture chord rows={} routed={} rows={}->{} page={} want={} table={}",
+        rows_ok as u8, c_routed as u8, c_before, c_after, if c_shown.is_empty() { "-" } else { c_shown.as_str() }, c_want, keymap::active().name
+    );
+    let ok = f1 != "FAIL" && shell_ok && chord != "FAIL";
+    serial_println!(":: HELPF1: f1={} shell={} chord={} -> {} ::", f1, if shell_ok { "ok" } else { "FAIL" }, chord, if ok { "PASS" } else { "FAIL" });
 }
 
 /// TRASHTOAST (rmbp-ledger B747; crawl A 26, BP-video-29): `:: TRASHTOAST: items=3 toasts=1 undone=3 -> PASS ::` — the
