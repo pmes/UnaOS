@@ -708,6 +708,6 @@ refs/heads/exec-rmbp-staletext2   82abbcc8 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-synccontrolsplit   f3c1794c FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-ehcihubdisc   ac9460ec IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-focus64b   3f44cf6f IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-keepreaders   3f44cf6f IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-keepreaders   fd22dc1d FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-el0home   3f44cf6f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-settingssub   3f44cf6f IN-FLIGHT cut 2026-10-21
