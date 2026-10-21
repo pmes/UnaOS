@@ -284,6 +284,7 @@ pub extern "C" fn _start() -> ! {
     // boot has a FAIL line to ask about AND the plan would send the key over TLS; Echo never needs it.
     let mut t = vein_ring3::sys::now_ms();
     let cfg = vein_ring3::prefs::Config::read();
+    mailbox(); // KEEPREADERS (SR183): the one reader, right after the only bus asks this program makes
     t = waited("prefs", t);
     let (key, key_n) = vein_ring3::key::read(cfg.key_file(), &mut m.key);
     t = waited("key", t);
@@ -644,3 +645,27 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 #[used]
 #[link_section = ".note.unaos.app"]
 static APP_NOTE: una_abi::AppNote = una_abi::AppNote::new(0);
+
+// KEEPREADERS (LEDGER SR183; BP-ring3-19) — THIS PROGRAM'S ONE MAILBOX READER. DIAG has no frame loop; it reads its mailbox once, right after `Config::read` — its four PREF_GETs are the only bus asks it makes. Frames a
+// `vein_ring3` ask kept (`bus::keep()`, DROPLOOPS SR179) come first, then the mailbox (`una_abi::mbox_recv`). DIAG
+// acts on none of them, so each verb is ignored by name here — never by not reading.
+fn mailbox() {
+    static mut RX: [u8; una_abi::BUS_FRAME_MAX] = [0; una_abi::BUS_FRAME_MAX];
+    // SAFETY: one thread; nothing else borrows RX.
+    let rx = unsafe { &mut *core::ptr::addr_of_mut!(RX) };
+    loop {
+        let n = una_abi::mbox_recv(rx, una_abi::MRECV_NOWAIT, vein_ring3::bus::keep(), sys);
+        if n < una_abi::BUS_HDR_LEN as i64 {
+            break; // -EAGAIN: the mailbox is empty
+        }
+        if rx[0..4] != una_abi::BUS_MAGIC || rx[5] != una_abi::BUS_KIND_REPLY {
+            continue; // not a kernel delivery: nothing of this program reads it
+        }
+        match rx[6] {
+            una_abi::BUS_VERB_PREF_CHANGED => {} // DIAG subscribes to no prefix: a PrefChanged here is no news to it
+            una_abi::BUS_VERB_OPEN_ARG => {} // a console program: no window to raise, no launch argument handed over
+            una_abi::BUS_VERB_NOTICE => {} // Quarry's file NOTICE: DIAG registers no file type
+            _ => {} // a reply no ask waits for any more (its `bus_ask` gave up after BUS_ASK_TRIES)
+        }
+    }
+}

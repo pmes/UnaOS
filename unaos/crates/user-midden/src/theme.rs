@@ -17,7 +17,8 @@
 // (kernel `prefs_client.rs` header: "Ring-3 delivery of verb 19 … is OWED"), and SYS_MRECV blocks on an empty
 // mailbox, so a program cannot wait for it beside its input ring: [`due`] answers every [`POLL_MS`] instead, and a
 // PrefChanged frame met in the mailbox while a reply is awaited (kind REPLY, verb 19, corr 0) is KEPT by `bus::ask`
-// (DROPLOOPS SR179) and re-reads at the next [`due`], whose drain reads the kept frames first. A
+// (DROPLOOPS SR179) and re-reads at the next [`due`], whose drain reads the kept frames first — every pass, subscribed
+// or not, one `match` naming each verb it ignores (KEEPREADERS SR183). A
 // re-read that moves the look answers `true` and the caller repaints everything.
 
 use una_abi::{
@@ -178,13 +179,19 @@ pub fn due(now_ms: u64) -> bool {
             HINT = true;
         }
         let rx = &mut *core::ptr::addr_of_mut!(RX);
-        while SUB == 0 {
+        loop { // KEEPREADERS (LEDGER SR183): the program's ONE reader — drained every pass, subscribed or not
             let n = una_abi::mbox_recv(rx, una_abi::MRECV_NOWAIT, bus::keep(), sys); // DROPLOOPS (SR179): the program's kept frames first, then the mailbox
             if n < BUS_HDR_LEN as i64 {
                 break; // -EAGAIN: the mailbox is empty
             }
-            if rx[0..4] == BUS_MAGIC && rx[5] == BUS_KIND_REPLY && rx[6] == BUS_VERB_PREF_CHANGED && rx[8..12] == [0; 4] {
-                HINT = true;
+            if rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY {
+                continue; // not a kernel delivery: nothing of this program reads it
+            }
+            match rx[6] {
+                BUS_VERB_PREF_CHANGED if rx[8..12] == [0; 4] => HINT = true, // a delivered PrefChanged: re-read at this answer
+                una_abi::BUS_VERB_OPEN_ARG => {} // Midden takes no launch argument: the second launch already raised this window
+                una_abi::BUS_VERB_NOTICE => {} // Quarry's file NOTICE: Midden registers no file type
+                _ => {} // a reply no ask waits for any more (its `bus_ask` gave up after BUS_ASK_TRIES)
             }
         }
         if now_ms >= NEXT {
