@@ -14380,12 +14380,15 @@ jobs_image() {
 # plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
 # `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
 #   GATEPATH selftest: plants=<n> caught=<n> -> PASS
-GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py nonetreach:unaos/scripts/nonet-reach.py neutral:tools/neutral-check.py firmware:tools/firmware-census.py"
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py nonetreach:unaos/scripts/nonet-reach.py neutral:tools/neutral-check.py firmware:tools/firmware-census.py locktype:unaos/scripts/lock-type.py"
 # NEUTRAL (SR166 GATENEUTRAL, BP-shape-4, R16): no board name (orin/rmbp/pi4/jetson/tegra word parts) in an identifier or a
 # string of a shared kernel file (crates/kernel/src minus arch/); comments, `feature = "…"` gates, arch board-module paths
 # and ledger/round citations excepted; the ruled exceptions are tools/neutral.allow, one row + reason each, shrink-only.
 # FIRMWARE (SR166, BP-shape-11, R52): the `git ls-files` census of unaos/firmware/ — every file a .pins set with digest rows
 # and a resolving ledger row, or a non-binary file whose sha256 is pinned and whose name a ledger row carries.
+# LOCKTYPE (SR188 GATELOCKTYPE, BP-cores-20, B414/B823): every kernel spin lock is crate::sync::Mutex (the registry names it by
+# its site); a raw spin::Mutex / MutexGuard / spin::mutex::* / spin::RwLock* in the code of crates/kernel/src reds, save the
+# registry's own inner lock in sync.rs (exact path+line rows in the script, shrink-only); spin::Once and spin::Spin pass.
 # BLUEPRINT (2026-10-19, Peter: "a set of blueprints … a front-side gate"): docs/dev/blueprint/ sheets — every anchor
 # exists at its line, BP-ids unique and stem-named, every sheet listed and ≤ 120 lines, no claim words (blueprint-check.py).
 # NONET (B672, BP-bar-10): no fn reachable from the video/ furniture (menubar, dock, crystal, notify, strip, settings,
@@ -14413,6 +14416,7 @@ _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary li
         blueprint) e=("$R") ;;   # BLUEPRINT: the repo root (the sheets are docs/dev/blueprint/, the anchors are tree paths)
         nonet) e=("$R/unaos") ;;   # NONET (B672): the unaos dir (the walk reads crates/kernel/src)
         nonetreach) e=("$R/unaos") ;;   # NONETREACH (B697): the unaos dir (the walk reads crates/kernel/src; imports nonet-check.py beside it)
+        locktype) e=("$R/unaos") ;;   # LOCKTYPE (SR188): the unaos dir (the walk reads crates/kernel/src; the lexer is tools/neutral-check.py, imported)
         neutral|firmware) e=("$R") ;;   # NEUTRAL / FIRMWARE (SR166): the repo root (tools/neutral.allow, unaos/firmware, the ledgers)
         *) e=() ;;
     esac
@@ -14449,6 +14453,7 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         nonetreach) printf 'pub fn fetch_feed() { let _ = crate::smolnet::stack_open_tcp(0); }\n' > "$K/zz_gateplant_reachhop.rs" && printf 'pub fn paint() { crate::zz_gateplant_reachhop::fetch_feed(); }\n' > "$K/video/zz_gateplant_reach.rs"; echo zz_gateplant_reachhop ;; # NONETREACH (B697): a video fn reaching a socket open through a helper OUTSIDE video/ (the hop is not a root; only the walk sees it)
         neutral)    printf 'pub fn orinzzgateplant() {}\n' > "$K/video/zz_gateplant_neutral.rs"; echo zz_gateplant_neutral ;; # NEUTRAL (SR166): a board-named fn in a shared file with no allowlist row
         firmware)   printf '\177ELF\000\000zzgateplant' > "$C/unaos/firmware/zz_gateplant.bin"; echo zz_gateplant.bin ;; # FIRMWARE (SR166): a binary blob committed under unaos/firmware (R52)
+        locktype)   printf 'pub static P: spin::Mutex<u8> = spin::Mutex::new(0);\n' > "$K/video/zz_gateplant_locktype.rs"; echo zz_gateplant_locktype ;; # LOCKTYPE (SR188): a raw spin::Mutex static outside sync.rs (the 38 LOCKREG2 swept)
         *) return 1 ;;
     esac
 }
@@ -14676,7 +14681,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|jobs-image|twoboot [--judge <log1> [<log2>]]|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|gates [--list|--selftest]|jobs-image|twoboot [--judge <log1> [<log2>]]|clean]"
         exit 1
         ;;
 esac
