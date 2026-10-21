@@ -4571,10 +4571,11 @@ fn trashtoast_selftest() {
     }
     let _ = ops::op_delete(&base);
     let leftovers = at(&base) as usize + crate::fs::trash::entries().iter().filter(|e| e.orig.starts_with(&base)).count();
+    let empty = trashtoast_empty_leg(&base); // TRASHBATCHDOCK (B762): the dock's Empty Trash, at the END (file tail)
     undo::fixture_put(saved);
     serial_println!("[trashtoast] made={} entries={} gone={} pressed={} single={} leftovers={} base={} dnd_toasts={} dnd_entries={} dnd_gone={} dnd_undone={} dnd_single={}", made, entries, gone, pressed, single, leftovers, base, d_toasts, d_entries, d_gone, d_undone, d_single);
-    let pass = made && items == 3 && toasts == 1 && entries == 1 && gone && pressed == "quarry-undone" && undone == 3 && single && leftovers == 0 && dnd;
-    serial_println!(":: TRASHTOAST: items={} toasts={} undone={} -> {} :: dnd={}", items, toasts, undone, if pass { "PASS" } else { "FAIL" }, if dnd { "ok" } else { "FAIL" });
+    let pass = made && items == 3 && toasts == 1 && entries == 1 && gone && pressed == "quarry-undone" && undone == 3 && single && leftovers == 0 && dnd && empty;
+    serial_println!(":: TRASHTOAST: items={} toasts={} undone={} empty={} -> {} :: dnd={}", items, toasts, undone, if empty { "ok" } else { "FAIL" }, if pass { "PASS" } else { "FAIL" }, if dnd { "ok" } else { "FAIL" });
 }
 // ══════════════ UNDOKEYS (rmbp-ledger B743) — `tests undokeys` — TAIL-APPENDED ══════════════
 
@@ -5283,4 +5284,37 @@ fn usbsuspend_selftest() {
         ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={}",
         c.ports, c.suspended, r.resumed, kbd, verdict, c.pls3, c.kept, ep, r.remote_wakes, e_susp, e_ports, e_kept
     );
+}
+// ══════════════ TRASHBATCHDOCK (rmbp-ledger B762) — `tests trashtoast`'s `empty=` leg — TAIL-APPENDED ══════════════
+
+/// TRASHBATCHDOCK (B762, BP-video-29): the dock's Empty Trash body (`dock::empty_trash_now`, what the service pass runs
+/// after the confirm). A clean Trash (the TRASH fixture's own `empty()` slate), three scratch files trashed as ONE batch
+/// (one journal entry), then the empty: the Trash holds 0, the undo stack holds 0 (`undo::drop_trash_entries`), and
+/// exactly one `Trash emptied` toast was posted. Runs on `trashtoast_selftest`'s set-aside journal; the scratch folder
+/// is removed. `[trashtoast] empty before=3 items=3 bytes=<n> ms=<n> after=0 journal=1->0 toasts=1`.
+#[cfg(all(feature = "quarry", feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn trashtoast_empty_leg(base: &str) -> bool {
+    use alloc::{string::String, vec::Vec};
+    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
+    use crate::video::quarry::live::ops;
+    use crate::video::quarry::undo;
+    let t = crate::shell::vfs_mount_table();
+    let _ = ops::op_delete(base);
+    let _ = crate::fs::trash::empty();
+    let files: Vec<String> = ["E1.TXT", "E2.TXT", "E3.TXT"].iter().map(|n| format!("{}/{}", base, n)).collect();
+    let made = ops::op_mkdir(base).is_ok() && files.iter().all(|p| t.create(p, NodeKind::File, P).and_then(|_| t.write(p, 0, p.as_bytes(), P)).is_ok());
+    undo::batch_begin();
+    let trashed = files.iter().filter(|p| undo::trash(p).is_ok()).count();
+    let _ = undo::batch_end();
+    let before = crate::fs::trash::count();
+    let j0 = undo::depth().0;
+    let t0 = crate::video::dock::emptied_toasts();
+    let r = crate::video::dock::empty_trash_now();
+    let toasts = crate::video::dock::emptied_toasts() - t0;
+    let after = crate::fs::trash::count();
+    let j1 = undo::depth().0;
+    let _ = ops::op_delete(base);
+    let (n, bytes, ms) = r.as_ref().map(|&(n, b, ms, _)| (n, b, ms)).unwrap_or((0, 0, 0));
+    serial_println!("[trashtoast] empty before={} items={} bytes={} ms={} after={} journal={}->{} toasts={}", before, n, bytes, ms, after, j0, j1, toasts);
+    made && trashed == 3 && before == 3 && r.is_ok() && n == 3 && after == 0 && j0 == 1 && j1 == 0 && toasts == 1 && t.stat(base).is_err()
 }
