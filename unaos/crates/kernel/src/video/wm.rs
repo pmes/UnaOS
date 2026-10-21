@@ -30885,8 +30885,8 @@ pub fn owner_rows(owner_asid: u64) -> usize {
 // FOCUSSTEAL (rmbp-ledger B698; BP-video-23, BP-bar-18) — TAIL-APPENDED: a definition inserted higher
 // up renumbers every `core::panic::Location` below it. Reached only from same-line folds:
 // `spawn_focus_arm` (note_arm), `spawn_focus_take` (judge), `spawn_focus_forget` (forget) and
-// `create_inner`'s publish line (hold_under). Knob-off (`wc` off, and every aarch64 build) compiles
-// none of the decision; the attention pulse below is compiled wherever the dock is.
+// `create_inner`'s publish line (hold_under). Knob-off (`wc` off on x86, `desktop_firmware` off on aarch64)
+// compiles none of the decision; both desktops run it (FOCUSARM64 SR180, FOCUS64B SR182); the pulse below likewise.
 // =================================================================================================
 
 /// FOCUSSTEAL — how long the dock tile of a window that was REFUSED focus pulses (one dim beat).
