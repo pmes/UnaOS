@@ -257,11 +257,18 @@ fn retree(m: &mut Model) {
     m.tree_sel = sel.and_then(|p| m.tree.iter().position(|r| r.path == p)).unwrap_or(0);
 }
 
-/// Re-list the open window's folder after a namespace change. Returns the rows now listed.
+/// Re-list the open window's folder after a namespace change, reading afresh under the caller's MODEL hold (the
+/// `tests unplug` door). The live pass reads off the lock instead ([`relist_now`]). Returns the rows now listed.
 pub(super) fn relist(m: &mut Model) -> usize {
+    m.invalidate();
+    relist_cached(m)
+}
+
+/// [`relist`]'s body over the model's cache as it stands: QUARRYRELIST (B824) pre-fills it off the lock, so every
+/// `collect_cached` below is a hit.
+fn relist_cached(m: &mut Model) -> usize {
     let sel = m.list.get(m.list_sel).map(|e| e.name.clone());
     let (scroll, focus) = (m.list_scroll, m.focus);
-    m.invalidate();
     retree(m);
     let cwd = m.cwd.clone();
     m.show(&cwd);
@@ -298,19 +305,16 @@ pub fn service() {
     relist_now(ng, now);
 }
 
+/// QUARRYRELIST (B824): plan under one short MODEL take, read with no Quarry lock, install under one short take —
+/// never inside a paint (the change stays pending), and a read the generation outlived is dropped (retried next pass).
 fn relist_now(ng: u64, now: u64) -> Option<(String, usize)> {
-    SEEN.store(ng, Ordering::Release);
+    if super::columns::painting() {
+        return None;
+    }
     LAST_MS.store(now, Ordering::Relaxed);
-    let out = {
-        let mut g = MODEL.lock();
-        let m = g.as_mut()?;
-        let n = relist(m);
-        (m.cwd.clone(), n)
-    };
-    RELISTS.fetch_add(1, Ordering::Relaxed);
-    serial_println!("[quarry] live dir={} gen={} relisted={}", out.0, ng, out.1);
-    repaint();
-    Some(out)
+    let plan = relist_plan(ng)?;
+    let r = relist_install(relist_read(plan))?;
+    relist_done(ng, r)
 }
 
 // ── The fixture ─────────────────────────────────────────────────────────────────────────────────
@@ -388,4 +392,164 @@ pub fn selftest() {
         changed as u8, relisted as u8, if expand { "ok" } else { "no" }, if ok { "PASS" } else { "FAIL" },
         scratch, if toolbar::view() == View::List { "list" } else { "other" }
     );
+}
+
+// ── QUARRYRELIST (rmbp-ledger B824): the relist's reads off MODEL ───────────────────────────────────────────────
+//
+// CHARTER: the live relist reads its folders with Quarry's MODEL released and installs them into the model's own
+// cache (`Model::collect_cached`) in one short take; the existing relist body then lists from that cache. Flight 37:
+// `relist_now` held MODEL 2175 ms on the render task around a directory read (LOCKREG `held_max_at=live.rs:521`).
+
+/// What one relist reads, snapshotted under MODEL (no read): the generation the pass saw, the folder, the paths —
+/// the cwd first, then the expanded inline folders (List view), then every expanded tree row; at most `MAX_CACHE`.
+struct RelistPlan {
+    at_gen: u64,
+    cwd: String,
+    paths: Vec<String>,
+}
+
+/// What the plan read, with no Quarry lock held.
+struct RelistRead {
+    plan: RelistPlan,
+    ents: Vec<CacheEnt>,
+    read_ms: u64,
+    read_cycles: u64,
+}
+
+/// One relist's account (the wire's and the fixture's). `locked_reads` = directory reads the install still made under
+/// MODEL (a failed read is not cacheable: a vanished cwd or tree row is re-read there once).
+pub(super) struct Relisted {
+    pub dir: String,
+    pub rows: usize,
+    pub read_ms: u64,
+    pub held_us: u64,
+    pub locked_reads: usize,
+}
+
+/// The install's outcome: done, or dropped because the generation or the folder moved under the read (folder, planned
+/// generation, generation now).
+enum Install {
+    Done(Relisted),
+    Dropped(String, u64, u64),
+}
+
+fn relist_plan(ng: u64) -> Option<RelistPlan> {
+    let g = MODEL.lock();
+    let m = g.as_ref()?;
+    let cwd = m.cwd.clone();
+    let mut paths: Vec<String> = alloc::vec![cwd.clone()];
+    if toolbar::view() == View::List {
+        for rel in open_set(&cwd) {
+            paths.push(join(&cwd, &rel));
+        }
+    }
+    for r in m.tree.iter().filter(|r| r.expanded) {
+        paths.push(r.path.clone());
+    }
+    let mut seen: Vec<String> = Vec::new();
+    paths.retain(|p| if seen.iter().any(|s| s == p) { false } else { seen.push(p.clone()); true });
+    paths.truncate(MAX_CACHE);
+    Some(RelistPlan { at_gen: ng, cwd, paths })
+}
+
+/// The reads — no Quarry lock is taken here. The sidebar re-derives its rows now (its own lock), so the install's
+/// `toolbar::after_show` finds the generation already seen.
+fn relist_read(plan: RelistPlan) -> RelistRead {
+    let (t0, c0) = (crate::arch::ms(), crate::arch::now_cycles());
+    super::sidebar::refresh(false);
+    let mut ents: Vec<CacheEnt> = Vec::new();
+    let mut extra: Option<String> = None;
+    for (k, p) in plan.paths.iter().enumerate() {
+        match collect(p) {
+            Ok((is_dir, rows)) => ents.push(CacheEnt { path: String::from(p.as_str()), is_dir, rows }),
+            Err(_) if k == 0 && plan.cwd != "/" => extra = Some(parent(&plan.cwd)), // the fallback `navigate` target
+            Err(_) => {}
+        }
+    }
+    if let Some(p) = extra.filter(|p| !plan.paths.iter().any(|q| q == p)) {
+        if let Ok((is_dir, rows)) = collect(&p) {
+            ents.push(CacheEnt { path: p, is_dir, rows });
+        }
+    }
+    ents.truncate(MAX_CACHE);
+    let read_cycles = crate::arch::now_cycles().saturating_sub(c0);
+    RelistRead { plan, ents, read_ms: crate::arch::ms().saturating_sub(t0), read_cycles }
+}
+
+/// ONE MODEL take: the read installs only into the generation and folder it was planned in.
+fn relist_install(r: RelistRead) -> Option<Install> {
+    let mut g = MODEL.lock();
+    let c0 = crate::arch::now_cycles();
+    let m = g.as_mut()?;
+    let now_gen = volume_gen();
+    if now_gen != r.plan.at_gen || m.cwd != r.plan.cwd {
+        return Some(Install::Dropped(r.plan.cwd, r.plan.at_gen, now_gen));
+    }
+    m.reads += r.ents.len();
+    m.read_cycles = m.read_cycles.saturating_add(r.read_cycles);
+    m.cache = r.ents;
+    m.cache_gen = r.plan.at_gen;
+    let reads0 = m.reads;
+    let rows = relist_cached(m);
+    let locked_reads = m.reads.saturating_sub(reads0);
+    let dir = m.cwd.clone();
+    let held_us = crate::video::strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(c0));
+    drop(g);
+    Some(Install::Done(Relisted { dir, rows, read_ms: r.read_ms, held_us, locked_reads }))
+}
+
+/// The pass's tail: the generation is seen, the wire, the repaint — or the drop line (SEEN unmoved: the next pass after
+/// `SETTLE_MS` re-lists at the new generation).
+fn relist_done(ng: u64, r: Install) -> Option<(String, usize)> {
+    match r {
+        Install::Done(d) => {
+            SEEN.store(ng, Ordering::Release);
+            RELISTS.fetch_add(1, Ordering::Relaxed);
+            serial_println!("[quarry] live dir={} gen={} relisted={}", d.dir, ng, d.rows);
+            serial_println!(
+                "[quarry] relist dir={} rows={} read_ms={} held_us={} on={} locked_reads={}",
+                d.dir, d.rows, d.read_ms, d.held_us, crate::arch::sched::current_name().unwrap_or("?"), d.locked_reads
+            );
+            let out = (d.dir.clone(), d.rows);
+            *LAST.lock() = Some(d);
+            repaint();
+            Some(out)
+        }
+        Install::Dropped(dir, a, b) => {
+            serial_println!("[quarry] relist dropped dir={} gen={}->{}", dir, a, b);
+            None
+        }
+    }
+}
+
+/// The last installed relist's account (the fixture reads it; a leaf lock).
+static LAST: crate::sync::Mutex<Option<Relisted>> = crate::sync::Mutex::new(None);
+
+/// `tests quarryio`'s relist leg (columns.rs `relist_leg`).
+pub(super) struct RelistProbe {
+    pub paint_defer: bool,
+    pub stale_dropped: bool,
+    pub done: Option<Relisted>,
+}
+
+/// (a) under a PaintMark `relist_now` declines with no relist; (b) a read whose generation `bump` moves before the
+/// install is dropped; (c) a relist of the open folder, read off the lock.
+pub(super) fn relist_probe(bump: &dyn Fn()) -> RelistProbe {
+    let r0 = RELISTS.load(Ordering::Relaxed);
+    let paint_defer = {
+        let _paint = super::columns::PaintMark::new();
+        relist_now(volume_gen(), crate::arch::ms()).is_none() && RELISTS.load(Ordering::Relaxed) == r0
+    };
+    let stale_dropped = match relist_plan(volume_gen()) {
+        Some(plan) => {
+            let read = relist_read(plan);
+            bump();
+            matches!(relist_install(read), Some(Install::Dropped(..)))
+        }
+        None => false,
+    };
+    *LAST.lock() = None;
+    let ok = relist_now(volume_gen(), crate::arch::ms()).is_some();
+    let done = if ok { LAST.lock().take() } else { None };
+    RelistProbe { paint_defer, stale_dropped, done }
 }
