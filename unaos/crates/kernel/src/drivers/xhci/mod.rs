@@ -599,7 +599,7 @@ const HUB_CHANGE_BUDGET: usize = 8;
 /// The old `16 + i` loop never reached bits 5..7, so an SS non-connection change — metal rMBP: a
 /// card-reader-with-no-card raising C_PORT_LINK_STATE (`wPortChange=0x0040`) — was never acked and
 /// the SS hub's Status Change Endpoint stormed the interrupt-IN forever (observed 1158+×).
-fn hub_port_change_feature_selector(bit: u16, is_ss: bool) -> Option<u16> {
+pub(crate) fn hub_port_change_feature_selector(bit: u16, is_ss: bool) -> Option<u16> {
     match (bit, is_ss) {
         (0, _) => Some(16),     // C_PORT_CONNECTION
         (1, false) => Some(17), // C_PORT_ENABLE     (USB 2.0 only)

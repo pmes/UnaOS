@@ -738,7 +738,7 @@ pub struct Controller {
     data_buf_phys: u64,
     frame_list: *mut u32,
     frame_list_phys: u64,
-    int_next: usize,
+    int_next: usize, #[cfg(all(feature = "lidsleep", feature = "wc"))] int_used: u8, // EHCIPOOLRECYCLE (B807): bit n = `int_slots[n]` held (`intpool`, file tail); a dead endpoint's bit is given back only by `retire_int_ep`; gate HUBREC = all(lidsleep, wc), the hub record's. LINE-NEUTRAL fold, code first
     periodic_on: bool,
     /// Probe-14 self-adaptation: false = standard qTD-chain transfers (QEMU's model requires
     /// fetched qTDs); true = overlay-direct (this metal HSEs on the qTD-fetch burst write —
@@ -13407,7 +13407,7 @@ impl Controller {
         // just been skipped. A witness that fires when the thing it witnesses did not happen is
         // worse than no witness: it is what made "the trackpad is armed and silent" the working
         // theory for a whole sitting. The verdict now comes from the arming path itself.
-    ) -> bool {
+    ) -> bool { #[cfg(all(feature = "lidsleep", feature = "wc"))] { self.int_next = intpool::slot_take(self.int_used).unwrap_or(MAX_INT_EPS); } // EHCIPOOLRECYCLE (B807): under HUBREC `int_next` is the slot THIS arm takes — the lowest free one (`intpool::slot_take`), MAX_INT_EPS when all are held; the bound, the index, `+= 1` and the `isr_slot` derivation below read it unchanged. LINE-NEUTRAL fold, code first
         if self.int_next >= MAX_INT_EPS {
             serial_println!(
                 ":: EHCI-HID: [{}] STOP-NOTE static int-EP pool exhausted ({}) — addr {} intf {} ep=IN{} NOT armed ::",
@@ -13435,7 +13435,7 @@ impl Controller {
             );
             return false;
         };
-        self.int_next += 1;
+        self.int_next += 1; #[cfg(all(feature = "lidsleep", feature = "wc"))] { self.int_used = intpool::slot_mark(self.int_used, self.int_next - 1); } // EHCIPOOLRECYCLE (B807): the slot is held until `intpool`'s `retire_int_ep` gives it back. LINE-NEUTRAL fold, code first
         // ISRARM: this endpoint's registry index, DERIVED rather than allocated. `int_next` was just
         // bounds-checked against `MAX_INT_EPS` above and `idx` against `MAX_CONTROLLERS` at
         // construction, so this is unique and in range by construction — which is what lets the
@@ -14498,7 +14498,7 @@ impl Controller {
             if n >= MT_RAW_DUMP_MAX {
                 self.bcm5974_mt_restore();
             }
-        } #[cfg(all(feature = "lidsleep", feature = "wc"))] self.service_hub_changes(); // EHCIHUBDISC (B801): the endpoint borrow is released and EP0 is usable — one hub port change per pass (`hubchange`, file tail). LINE-NEUTRAL fold, code first
+        } #[cfg(all(feature = "lidsleep", feature = "wc"))] self.reap_dead_eps(); #[cfg(all(feature = "lidsleep", feature = "wc"))] self.service_hub_changes(); // EHCIPOOLRECYCLE (B807): every endpoint this pass retired leaves the pool here, after every index-holding stage (`intpool::reap_dead_eps`, file tail). EHCIHUBDISC (B801): the endpoint borrow is released and EP0 is usable — one hub port change per pass (`hubchange`, file tail). LINE-NEUTRAL fold, code first
     }
 }
 
@@ -18565,7 +18565,7 @@ pub fn init() {
                         data_buf_phys: db_phys,
                         frame_list: pool.frame_list.as_mut_ptr(),
                         frame_list_phys: fl_phys,
-                        int_next: 0,
+                        int_next: 0, #[cfg(all(feature = "lidsleep", feature = "wc"))] int_used: 0, // EHCIPOOLRECYCLE (B807): no slot held at construction. LINE-NEUTRAL fold, code first
                         periodic_on: false,
                         // EPACE-TRIM M1 + BUY-1: constructed in chain mode; phase 2 sets this
                         // from CHAIN_HSE_SEEN just before the probe it gates (see above).
@@ -20462,12 +20462,6 @@ pub mod hubchange {
         set
     }
 
-    /// USB 2.0 §11.24.2.7.2: the ClearPortFeature selector for wPortChange bit `bit` (C_PORT_CONNECTION 16 ..
-    /// C_PORT_RESET 20); other bits are reserved. The USB 2.0 half of xHCI's `hub_port_change_feature_selector`.
-    fn hub_change_selector(bit: u16) -> Option<u16> {
-        (bit <= 4).then_some(16 + bit)
-    }
-
     /// The first interrupt-IN endpoint descriptor of a hub's configuration: (endpoint number, wMaxPacketSize).
     fn parse_hub_int_ep(cfg: &[u8]) -> Option<(u8, u16)> {
         let mut off = 0usize;
@@ -20486,7 +20480,7 @@ pub mod hubchange {
 
     impl Controller {
         /// Arm the status-change endpoint of every recorded hub of this controller that has no hub `IntEp` yet (a
-        /// retired one is not re-armed: its pool slot is spent). Called after a root port's walk and after a connect.
+        /// retired one left the pool through `intpool`'s `retire_int_ep`). Called after a root port's walk and after a connect.
         pub(super) unsafe fn arm_hub_status_eps(&mut self) {
             let hubs: Vec<Target> = suspend::hubs_of(self.idx);
             for h in hubs.iter() {
@@ -20580,7 +20574,8 @@ pub mod hubchange {
             }
             for bit in 0..16u16 {
                 if chg & (1 << bit) != 0 {
-                    if let Some(sel) = hub_change_selector(bit) {
+                    // EHCIPOOLRECYCLE (B807): the one selector table, xHCI's; an EHCI hub is USB 2.0 (C_PORT_* 16..20).
+                    if let Some(sel) = crate::drivers::xhci::hub_port_change_feature_selector(bit, false) {
                         let _ = self.control(&hub, 0x23, 1, sel, port as u16, 0, false);
                     }
                 }
@@ -20589,7 +20584,8 @@ pub mod hubchange {
 
         /// Retire every device record on or below hub `hub`'s `port`: each live `IntEp` there goes `dead` with its
         /// held keys released (`flush_held_releases`), and every recorded hub there is forgotten
-        /// (`suspend::forget_hubs`). The QH stays linked, as on every retire; the gone address halts it.
+        /// (`suspend::forget_hubs`); then `reap_dead_eps` unlinks each one's QH and gives its pool slot back, before
+        /// the caller's `bring_up_hub` re-walks the port (EHCIPOOLRECYCLE B807).
         pub(super) unsafe fn disconnect_hub_port(&mut self, hub: u8, port: u8) -> u32 {
             let idx = self.idx;
             let mut nodes: Vec<(u8, (u8, u8))> =
@@ -20615,12 +20611,13 @@ pub mod hubchange {
             }
             RETIRED.fetch_add(n, Ordering::Relaxed);
             suspend::forget_hubs(idx, &gone);
+            self.reap_dead_eps();
             n
         }
     }
 
     /// `tests ehci`: the pure halves on synthetic input (every image), then the live census.
-    /// `:: EHCIHUB: hubs= armed= hub_change= connects= disconnects= retired= decode= subtree= -> PASS|SKIP(no-hub)|FAIL ::`
+    /// `:: EHCIHUB: hubs= armed= hub_change= connects= disconnects= retired= recycled= decode= subtree= -> PASS|SKIP(no-hub)|FAIL ::`
     pub fn selftest() {
         // Ports 1 and 3 of 4 with bit 0 (hub-local); then bit 5 past a 4-port hub, ignored.
         let decode = change_ports(&[0b0000_1011], 4) == ((1 << 1) | (1 << 3), true)
@@ -20629,7 +20626,8 @@ pub mod hubchange {
         let nodes = [(1, (0, 0)), (3, (1, 1)), (6, (3, 2)), (5, (3, 1)), (7, (5, 1)), (2, (1, 2))];
         let sorted = |mut v: Vec<u8>| { v.sort_unstable(); v };
         let subtree = sorted(below(&nodes, 3, 1)) == [5, 7] && sorted(below(&nodes, 1, 1)) == [3, 5, 6, 7]
-            && below(&nodes, 5, 2).is_empty();
+            && below(&nodes, 5, 2).is_empty()
+            && super::intpool::selftest_pure();
         let (mut hubs, mut armed) = (0usize, 0usize);
         if let Some(ctrls) = EHCI_HID.lock().as_ref() {
             for c in ctrls.iter() {
@@ -20649,8 +20647,196 @@ pub mod hubchange {
         };
         let ok = |b: bool| if b { "ok" } else { "FAIL" };
         serial_println!(
-            ":: EHCIHUB: hubs={} armed={} hub_change={} connects={} disconnects={} retired={} decode={} subtree={} -> {} ::",
-            hubs, armed, g(&CHANGES), g(&CONNECTS), g(&DISCONNECTS), g(&RETIRED), ok(decode), ok(subtree), verdict
+            ":: EHCIHUB: hubs={} armed={} hub_change={} connects={} disconnects={} retired={} recycled={} decode={} subtree={} -> {} ::",
+            hubs, armed, g(&CHANGES), g(&CONNECTS), g(&DISCONNECTS), g(&RETIRED), super::intpool::recycled(), ok(decode), ok(subtree), verdict
         );
+    }
+}
+
+/// EHCIPOOLRECYCLE (rmbp-ledger B807, BP-input-21) — the interrupt-endpoint pool gives a dead endpoint's slot back, so
+/// repeated hub-port re-plugs no longer exhaust the fixed `MAX_INT_EPS` (MTFIX) pool. Gate HUBREC, the hub record's:
+/// hot-plug exists only there, and a knob-off image compiles none of this.
+#[cfg(all(feature = "lidsleep", feature = "wc"))]
+pub mod intpool {
+    //! CHARTER: Kernel — driver (the EHCI interrupt-endpoint pool: take, retire (unlink + frame wait), give; under `EHCI_HID`).
+    //!
+    //! TAKE: `arm_interrupt_ep`'s two folds pick the lowest free `int_slots` slot ([`slot_take`]) and hold it
+    //! ([`slot_mark`]) in `Controller::int_used`; the rest of the arm (QH, qTD, the `isr_slot` derivation) is unchanged.
+    //! RETIRE: `e.dead = true` stays the DECISION at its three sites (`service`'s unrecoverable halt, its refused
+    //! ClearFeature, `hubchange::disconnect_hub_port`); [`Controller::retire_int_ep`] is the ONLY exit from the pool,
+    //! reached through [`Controller::reap_dead_eps`] where no `int_eps` index is live: the end of `service`'s pass and
+    //! the end of `disconnect_hub_port` (before `bring_up_hub` re-walks the port, so the re-plugged device finds its slots).
+    //! UNLINK RULE: the periodic list has no doorbell (EHCI 1.0 §4.8.2's Interrupt-on-Async-Advance is the async
+    //! list's); the QH leaves by its predecessor's link (the 1024 frame-list entries when it heads the chain), and its
+    //! memory is reused only after the controller crosses a frame boundary — the frame in progress may already hold it
+    //! (its complete-splits, C-mask 0x1C, run in µframes 2-4 of that frame). GIVE: [`slot_give`] after that wait; a
+    //! wait that times out HOLDS the slot (`why=frame-stuck`).
+    use super::qh::{phys_of, Qh, PTR_TERMINATE, PTR_TYPE_QH};
+    use super::{int_ep_kind, isr_claim_poll, isr_release_poll, mmio_read32, wait_bounded, Controller, ISR_EPS};
+    use super::{MAX_INT_EPS, OP_USBSTS, STS_PSS};
+    use alloc::vec::Vec;
+    use core::ptr::{read_volatile, write_volatile};
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// FRINDEX (EHCI 1.0 §2.3.4); the driver's other copy (`KBDWIT_OP_FRINDEX`) is `kbdwit`-gated.
+    const OP_FRINDEX: u64 = 0x0C;
+    /// Frames FRINDEX's frame number (bits 13:3) must advance past the unlink: the boundary the rule requires, plus one
+    /// whole frame against periodic prefetch.
+    const UNLINK_FRAMES: u32 = 2;
+
+    static RECYCLED: AtomicU32 = AtomicU32::new(0);
+
+    /// Slots given back this boot (`tests ehci`'s `recycled=`).
+    pub(super) fn recycled() -> u32 {
+        RECYCLED.load(Ordering::Relaxed)
+    }
+
+    /// The lowest free slot of a held-mask (bit n = `int_slots[n]` held), or `None` when all `MAX_INT_EPS` are held.
+    pub(super) fn slot_take(used: u8) -> Option<usize> {
+        (0..MAX_INT_EPS).find(|&n| used & (1 << n) == 0)
+    }
+
+    /// Hold slot `n`.
+    pub(super) fn slot_mark(used: u8, n: usize) -> u8 {
+        used | (1 << n)
+    }
+
+    /// Give slot `n` back.
+    pub(super) fn slot_give(used: u8, n: usize) -> u8 {
+        used & !(1 << n)
+    }
+
+    /// Where a periodic QH's unlink writes.
+    #[derive(PartialEq, Eq, Debug)]
+    pub(super) enum Unlink {
+        /// It heads the chain: every frame-list entry takes its horizontal link.
+        Head,
+        /// The `i`th candidate's horizontal link names it: that link takes its horizontal link.
+        Pred(usize),
+        /// Not on the chain: nothing to rewrite.
+        Absent,
+    }
+
+    /// The predecessor rule on link words: `head` = FL[0] (every entry holds the same word), `horiz` = the other
+    /// pool QHs' horizontal links, `target` = the QH's own link word (`phys | PTR_TYPE_QH`). Pure: `tests ehci` runs it.
+    pub(super) fn unlink_at(head: u32, horiz: &[u32], target: u32) -> Unlink {
+        if head == target {
+            return Unlink::Head;
+        }
+        horiz.iter().position(|&h| h == target).map_or(Unlink::Absent, Unlink::Pred)
+    }
+
+    /// `tests ehci`'s pool half (folded into `subtree=`): a synthetic endpoint is taken and given back on a pool holding
+    /// three slots, twice, and the mask and its count return to the start; a full pool takes nothing; the unlink rule
+    /// on a synthetic chain FL -> A -> B -> C -> TERMINATE names the head, each predecessor and an absent QH.
+    pub(super) fn selftest_pure() -> bool {
+        let start: u8 = 0b00_0111;
+        let mut used = start;
+        let mut ok = true;
+        for _ in 0..2 {
+            match slot_take(used) {
+                Some(3) => used = slot_give(slot_mark(used, 3), 3),
+                _ => ok = false,
+            }
+        }
+        ok = ok && used == start && used.count_ones() == start.count_ones() && slot_take(0b11_1111).is_none();
+        let (a, b, c) = (0x100 | PTR_TYPE_QH, 0x200 | PTR_TYPE_QH, 0x300 | PTR_TYPE_QH);
+        let horiz = [b, c, PTR_TERMINATE];
+        ok && unlink_at(a, &horiz, a) == Unlink::Head
+            && unlink_at(a, &horiz, b) == Unlink::Pred(0)
+            && unlink_at(a, &horiz, c) == Unlink::Pred(1)
+            && unlink_at(a, &horiz, 0x400 | PTR_TYPE_QH) == Unlink::Absent
+    }
+
+    impl Controller {
+        /// Every `dead` endpoint through [`Self::retire_int_ep`], from the back so no unvisited index moves.
+        pub(super) unsafe fn reap_dead_eps(&mut self) {
+            while let Some(i) = self.int_eps.iter().rposition(|e| e.dead) {
+                self.retire_int_ep(i);
+            }
+        }
+
+        /// THE ONE PLACE a dead endpoint leaves the pool: (a) the ISR fenced, (b) the QH unlinked, (c) the frame
+        /// boundary waited, (d) QH and qTD deactivated, (e) the slot given back, (f) the record dropped. Returns
+        /// whether the slot went back. `[usb] ehci=<i> addr=<a> ep=IN<n> kind=<k> slot=<s> -> recycled pool=<held>/<max>`
+        /// or `-> held why=frame-stuck|isr-busy`.
+        pub(super) unsafe fn retire_int_ep(&mut self, ep_i: usize) -> bool {
+            let idx = self.idx;
+            let (qh, qtd, isr, addr, kind) = {
+                let e = &self.int_eps[ep_i];
+                (e.qh, e.qtd, e.isr_slot, e.target.addr, int_ep_kind(e))
+            };
+            let n = isr - idx * MAX_INT_EPS;
+            let ep = (read_volatile(&(*qh).ep_chars) >> 8) & 0xF;
+            // (a) No new ISR entry (`isr_service_ep` reads `live` first), then wait out one already inside.
+            ISR_EPS[isr].live.store(0, Ordering::Release);
+            let fenced = wait_bounded(|| isr_claim_poll(isr));
+            // (b) Unlink from the one chain: FL[*] -> newest ... -> oldest -> TERMINATE (`arm_interrupt_ep`,
+            // `bt_arm_events`). Candidates: every other held `int_slots` QH, and the BT event QH once spliced.
+            let own = read_volatile(&(*qh).horiz);
+            let target = phys_of(qh as *const Qh, 32).map_or(0, |p| (p as u32) | PTR_TYPE_QH);
+            let pool = self.pool();
+            let mut cands: Vec<*mut Qh> = (0..MAX_INT_EPS)
+                .filter(|&m| m != n && self.int_used & (1 << m) != 0)
+                .map(|m| core::ptr::addr_of_mut!((*pool).int_slots[m].qh))
+                .collect();
+            #[cfg(feature = "bt")]
+            if self.bt_evt_armed {
+                cands.push(core::ptr::addr_of_mut!((*pool).bt_slot.qh));
+            }
+            let horiz: Vec<u32> = cands.iter().map(|&q| read_volatile(&(*q).horiz)).collect();
+            let fl = self.frame_list;
+            let at = if target == 0 { Unlink::Absent } else { unlink_at(read_volatile(fl), &horiz, target) };
+            match at {
+                Unlink::Head => {
+                    for i in 0..1024 {
+                        write_volatile(fl.add(i), own);
+                    }
+                }
+                Unlink::Pred(i) => write_volatile(&mut (*cands[i]).horiz, own),
+                Unlink::Absent => {}
+            }
+            // (c) The frame boundary: FRINDEX's frame number must move UNLINK_FRAMES past its value after the unlink.
+            // No periodic walk (USBSTS.PSS = 0: never enabled, or the EHCIWAKE quiesce) holds nothing to wait out.
+            let op = self.op;
+            let frame_ok = if mmio_read32(op + OP_USBSTS).unwrap_or(0) & STS_PSS == 0 {
+                true
+            } else {
+                let frame = || mmio_read32(op + OP_FRINDEX).map(|v| (v >> 3) & 0x7FF);
+                match frame() {
+                    Some(f0) => wait_bounded(|| frame().is_some_and(|f| f.wrapping_sub(f0) & 0x7FF >= UNLINK_FRAMES)),
+                    None => false,
+                }
+            };
+            // (d) Inactive and unlinked, so a stale fetch finds no work; the claim goes back for the next publish.
+            if fenced {
+                write_volatile(&mut (*qh).overlay[2], 0);
+                write_volatile(&mut (*qh).overlay[0], PTR_TERMINATE);
+                write_volatile(&mut (*qh).current_qtd, 0);
+                write_volatile(&mut (*qtd).token, 0);
+                write_volatile(&mut (*qh).horiz, PTR_TERMINATE);
+                isr_release_poll(isr);
+            }
+            // (e) The slot goes back only past the fence and the frame boundary.
+            let back = fenced && frame_ok;
+            if back {
+                self.int_used = slot_give(self.int_used, n);
+                RECYCLED.fetch_add(1, Ordering::Relaxed);
+            }
+            // (f) The record leaves `int_eps`.
+            self.int_eps.remove(ep_i);
+            if back {
+                serial_println!(
+                    "[usb] ehci={} addr={} ep=IN{} kind={} slot={} -> recycled pool={}/{}",
+                    idx, addr, ep, kind, n, self.int_used.count_ones(), MAX_INT_EPS
+                );
+            } else {
+                serial_println!(
+                    "[usb] ehci={} addr={} ep=IN{} kind={} slot={} -> held why={}",
+                    idx, addr, ep, kind, n, if fenced { "frame-stuck" } else { "isr-busy" }
+                );
+            }
+            back
+        }
     }
 }
