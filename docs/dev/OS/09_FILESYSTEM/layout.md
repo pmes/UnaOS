@@ -695,11 +695,17 @@ not exist. **Deferred to Peter, with the current placement stated so the deferra
   nothing: a name-derived `same_volume` compares two `&str` and touches no block device. That
   matters for the same measured reason the oracle is lazy (above).
 
-### 5.2 EL0 has no directory namespace
+### 5.2 EL0's name verbs — which take a path (PATHNS, LEDGER SR171; was "EL0 has no directory namespace")
 
-`sys_open` takes an 8.3 leaf, not a path (§2.1 group 3). Until that changes, any file EL0 opens by
-name is pinned to the volume root, and the loader's `find_app`-then-`find_in_root` order is what
-lets the layout be honest about it rather than pretend. Not this arc's lane.
+The per-verb table is `docs/dev/blueprint/ring3.md` §7 (read at 43d1dca8). Since DIRNS (LEDGER SO20)
+aarch64 `sys_open` walks a `/`-separated path of at most 40 bytes on the EL0 FAT volume through
+`fs::vfs::el0_locate` (`..` refused; a relative path starts at the session's home). x86 `sys_open`
+collapses `/X` to `X` and opens a staged or created root leaf; it walks a path only under the
+`irqstorage` feature (`sys_open_dynamic`), which `unaos/scripts/image-line.env` does not arm, so on the
+image a multi-component name answers `-ENOENT`. `SYS_RENAME` stays a root leaf on both arches.
+`SYS_ATTR_*`, `SYS_STAT`, `SYS_PATH_READ/WRITE` (aarch64 only under `selfdiag`) and `SYS_SPAWN_PATH`
+take an absolute path in the VFS mount table. §2.1 group 3 and §2.4 above predate DIRNS (owed, storage
+sheet §5); the loader's `find_app`-then-`find_in_root` order is unchanged.
 
 ---
 
