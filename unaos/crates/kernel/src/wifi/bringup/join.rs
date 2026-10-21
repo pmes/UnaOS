@@ -203,3 +203,62 @@ pub(super) fn run(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::Seen
     }
     2
 }
+
+/// WIFIDATA (B803) — rung S10a, from `wifi10()` after `run` with both engines still armed: the station's
+/// `data::Link` sends ONE ARP probe (RFC 826 / RFC 5227, sender 0.0.0.0) for the gateway the operator named
+/// (`tests wifi <ssid> <gw>`) as a ToDS data frame on ring frame 3, then drains S6's receiver for up to
+/// `REPLY_MS`, judging every kept data frame with `data::from_air` and the reply with `data::arp_reply_parse`.
+/// Gates: S9 read ASSOCIATED; a gateway was named. Returns the data frames sent (0 or 1).
+pub(super) fn link(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::Seen, ch: u16, gw: Option<[u8; 4]>, w: &mut rx::Writes) -> u32 {
+    use super::super::data;
+    let skip = |why: String| {
+        data::set_link(3);
+        serial_println!(":: wifidata: s10a link NOT ATTEMPTED reason={} -> ABSENT ::", why);
+    };
+    let (_, s9, _) = super::super::status::join();
+    let (Some(bss), 1) = (seen.join.bss, s9) else {
+        skip(String::from(if s9 == 0 || s9 == 3 { "s9-absent" } else { "s9-NOT-ASSOCIATED" }));
+        return 0;
+    };
+    let Some(gw) = gw else {
+        skip(String::from("no-gateway(type tests wifi <ssid> <gw-ip>)"));
+        return 0;
+    };
+    let gw_text = alloc::format!("{}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]);
+    let mut l = data::Link::new(seen.join.me, bss.bssid);
+    let (r, sent) = match l.send(&data::arp_request(l.mac(), [0; 4], gw)) {
+        Ok((air, n)) => (tx::fire_frame(bar0, p, &air, ch, n, "data", w), 1),
+        Err(why) => {
+            serial_println!("[wifi10] tx-poke kind=data REFUSED reason={} — nothing written", why);
+            (tx::Report::default(), 0)
+        }
+    };
+    seen.data.clear();
+    let mut buf = [0u8; 256];
+    let mut reply = None;
+    let mut waited = 0u32;
+    while sent == 1 && reply.is_none() && waited < REPLY_MS {
+        rx::poll(bar0, rxr, seen, ch, SLICE_US, w);
+        waited += (SLICE_US / 1000) as u32;
+        while let Some(n) = l.recv(&mut seen.data, &mut buf) {
+            if let Some((mac, ip)) = data::arp_reply_parse(&buf[..n]) {
+                if ip == gw {
+                    reply = Some(mac);
+                    break;
+                }
+            }
+        }
+    }
+    let verdict = match reply {
+        Some(_) => String::from("LINKED"),
+        None if !r.sent() => alloc::format!("NOT-LINKED reason=tx:{}", if sent == 1 { r.reason() } else { String::from("refused") }),
+        None => alloc::format!("NOT-LINKED reason=no-arp-reply(acked={} rx_data={})", r.acked as u8, l.rx_data),
+    };
+    data::set_link(if reply.is_some() { 1 } else { 2 });
+    serial_println!(
+        ":: wifidata: s10a link ssid={} gw={} tx={} acked={} rx_data={} arp={} waited={}ms -> {} ::",
+        ssid_text(&seen.join.target), gw_text, if r.sent() { "SENT" } else { "NOT-SENT" }, r.acked as u8, l.rx_data,
+        reply.map(|m| alloc::format!("reply mac={}", mac_text(m))).unwrap_or_else(|| String::from("none")), waited, verdict
+    );
+    sent
+}

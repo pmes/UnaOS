@@ -158,7 +158,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println(&format!("{} deferred, {} ran at boot", deferred_count(), AT_BOOT.load(Ordering::Relaxed))); serial_println!(":: TESTS: list n={} deferred={} at_boot={} ::", t.iter().flatten().count(), deferred_count(), AT_BOOT.load(Ordering::Relaxed)); // QEMUSKIP (B558/B613): the list's tail on the wire (LINE-NEUTRAL append, before this comment)
         return;
     }
-    let name = args.first().copied(); *ARG.lock() = args.get(1).map(|a| alloc::string::String::from(*a)); // AUDIOCODEC (SR30): `tests play <fmt>` reads its <fmt> via `arg()`
+    let name = args.first().copied(); *ARG.lock() = args.get(1).map(|a| alloc::string::String::from(*a)); #[cfg(feature = "wifi10")] arg2_set(args.get(2).copied()); // AUDIOCODEC (SR30): `tests play <fmt>` reads its <fmt> via `arg()`
     let (p0, f0) = (PASS.load(Ordering::Relaxed), FAIL.load(Ordering::Relaxed));
     let ran = run(name);
     let (p, f) = (PASS.load(Ordering::Relaxed).wrapping_sub(p0), FAIL.load(Ordering::Relaxed).wrapping_sub(f0));
@@ -6218,3 +6218,14 @@ fn sinkall_idle_level(usb: &str) -> &'static str {
         "not-built"
     }
 }
+}
+
+/// WIFIDATA (rmbp-ledger B803) — TAIL-APPENDED: the SECOND word after the fixture name (`tests wifi <ssid> <gw>`:
+/// the gateway S10a's ARP asks for), read by `wifi::verb` through `arg2()`; `None` when absent. Set on `run`'s
+/// argument line beside `ARG`, under the same knob as its one reader.
+#[cfg(feature = "wifi10")]
+static ARG2: crate::sync::Mutex<Option<alloc::string::String>> = crate::sync::Mutex::new(None);
+#[cfg(feature = "wifi10")]
+fn arg2_set(a: Option<&str>) { *ARG2.lock() = a.map(alloc::string::String::from); }
+#[cfg(feature = "wifi10")]
+pub fn arg2() -> Option<alloc::string::String> { ARG2.lock().clone() }
