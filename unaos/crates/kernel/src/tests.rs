@@ -5271,7 +5271,7 @@ fn usbsuspend_selftest() {
     };
     let verdict = if !in_u3 || !up {
         "FAIL reason=phase-timeout"
-    } else if c.pls3 != c.suspended || r.resumed < c.suspended {
+    } else if c.pls3 != c.suspended || r.resumed < c.suspended || r.ep_running < r.ep_stopped {
         "FAIL"
     } else if kbd == "none" {
         "SKIP reason=no-xhci-kbd"
@@ -5281,8 +5281,8 @@ fn usbsuspend_selftest() {
         "PASS"
     };
     serial_println!(
-        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={}",
-        c.ports, c.suspended, r.resumed, kbd, verdict, c.pls3, c.kept, ep, r.remote_wakes, e_susp, e_ports, e_kept
+        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={}",
+        c.ports, c.suspended, r.resumed, kbd, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e_susp, e_ports, e_kept
     );
 }
 // ══════════════ TRASHBATCHDOCK (rmbp-ledger B762) — `tests trashtoast`'s `empty=` leg — TAIL-APPENDED ══════════════
