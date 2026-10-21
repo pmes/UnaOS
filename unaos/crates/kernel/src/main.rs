@@ -8184,7 +8184,7 @@ fn jd2_supstate_phase2(
                         #[cfg(feature = "orinclick")]
                         unaos_kernel::arch::display_tegra::orin_click(mask);
                     }
-                    _ => {}
+                    #[cfg(all(feature = "login", feature = "desktop_firmware"))] Event::Char(ch) => { if unaos_kernel::fs::users::screen_up() && !unaos_kernel::video::dialog::over_screen() { let _ = unaos_kernel::video::crystal::login::consume_char(ch); } } _ => {} // ORINSUPCHAR (LEDGER SR162): the `supstate` twin of CHARREPEAT's Char arm in `jd2_console_pump` (:3006) — this function never returns, so on a `supstate` image that arm is dead code and a typed `ü` never reached the login password. Offered while `users::screen_up` and no dialog is over the screen; otherwise dropped, as `_` did (BP-input-4). No cursor erase and no repaint flags here: the pointer and the present are the board's (`sup_frame_pointer`, the presenter), and the screen paints itself on a consumed character exactly as it does on the Key arm's `screen_key` above. The Char is not put on the key seam (`sup_key_push` carries a bare u8). ⚠ LINE-NEUTRAL fold, code first.
                 }
             }
         }

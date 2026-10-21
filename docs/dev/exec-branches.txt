@@ -650,7 +650,7 @@ refs/heads/exec-rmbp-quarrylaunch   3e6379b1 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-prefsdeleted   98881810 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-helpverbdoc    253f0c2c IN-FLIGHT cloud wave36 HELPVERBDOC
 refs/heads/exec-rmbp-restoreresult  ba143e98 FOLDED-BY-HAND (this commit) 2026-10-19
-refs/heads/exec-rmbp-orinsupchar    5582f4a8 IN-FLIGHT cloud wave36 ORINSUPCHAR
+refs/heads/exec-rmbp-orinsupchar    82432432 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-undodocs       677f3802 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-lockchanged    c68b67f0 FOLDED-BY-HAND (this commit) 2026-10-19
 refs/heads/exec-rmbp-hwtab2         ba1c1b81 FOLDED-BY-HAND (this commit) 2026-10-19
@@ -666,7 +666,7 @@ refs/heads/exec-rmbp-tickless       fb8ad2f4 IN-FLIGHT cloud wave36 TICKLESS
 refs/heads/exec-rmbp-usbsuspend     fb8ad2f4 IN-FLIGHT cloud wave36 USBSUSPEND
 refs/heads/exec-rmbp-sinkall        fb8ad2f4 IN-FLIGHT cloud wave36 SINKALL
 refs/heads/exec-rmbp-pickerkeys     fb8ad2f4 IN-FLIGHT cloud wave36 PICKERKEYS
-refs/heads/exec-rmbp-sdpserver      fb8ad2f4 IN-FLIGHT cloud wave36 SDPSERVER
+refs/heads/exec-rmbp-sdpserver      abc14cd7 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-wcpar2         8ab5da61 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-gateneutral    742c45e8 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-ring3undo      d79e8dfa IN-FLIGHT cloud wave36 RING3UNDO
