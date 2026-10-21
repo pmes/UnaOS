@@ -161,8 +161,8 @@ fn flush_va(s: usize, va: u64) {
         )
     };
 }
-/// The slot the CALLER runs in (from `TTBR0_EL1`'s ASID), `None` on the boot/shared root.
-fn current_slot() -> Option<usize> {
+/// The slot the CALLER runs in (from `TTBR0_EL1`'s ASID), `None` on the boot/shared root — the twin of x86's `arch::memory::current_slot` (a syscall runs with the caller's root live, so it names the CALLER's address space; `slot + 1` IS the ASID, the wm owner). FOCUSARM64 (SR180): pub, re-exported as `arch::memory::current_slot` for `wm::focussteal::note_arm` (the spawner of a ring-3 `SYS_SPAWN_PATH`).
+pub fn current_slot() -> Option<usize> {
     let t: u64;
     unsafe { core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) t, options(nomem, nostack, preserves_flags)) };
     let asid = (t >> 48) as usize;
