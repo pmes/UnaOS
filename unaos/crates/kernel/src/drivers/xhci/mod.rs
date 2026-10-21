@@ -13986,7 +13986,7 @@ impl XhciController {
             crate::hlt(); // yield to QEMU so it can DMA the completion into the event ring
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
-                serial_println!("xHCI: EP0 sync pump TIMEOUT after {} cycles (budget {})", elapsed, budget); #[cfg(feature = "usbnet")] usbnet::note_ep0_timeout(); // PUMPRETRY (B537): counted into the bring-up try that saw it (`ep0_timeouts=`), which also arms the EP0 ring reset before the retry. LINE-NEUTRAL append
+                serial_println!("xHCI: EP0 sync pump TIMEOUT after {} cycles (budget {})", elapsed, budget); #[cfg(feature = "usbnet")] usbnet::note_ep0_timeout(); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] suspend::note_ep0_timeout(); // PUMPRETRY (B537): counted into the bring-up try that saw it (`ep0_timeouts=`), which also arms the EP0 ring reset before the retry. LINE-NEUTRAL append
                 return Err(());
             }
         }
@@ -18093,13 +18093,27 @@ pub mod suspend {
     /// Stop Endpoint Command TRB (xHCI 1.2 §6.4.3.8): type 15, SP bit 23 (the endpoint is stopped for a suspend).
     const TRB_STOP_EP: u32 = 15 << 10;
     const STOP_SP: u32 = 1 << 23;
+    /// SLEEP2 (B812): the bound on a port's wait for U0 after its U0 write (USB3: from the write at the resume's start;
+    /// USB2: after the 20 ms TDRSMDN). Polled across the pump's passes, never a spin; a miss is `stuck`.
+    const RESUME_BOUND_MS: u64 = 100;
+    /// SLEEP2 (B812): root ports whose resume missed its bound (bit `port - 1`). Their slots stay `HELD` (so the
+    /// HELDSLOTEP0 refusal keeps every synchronous EP0 off the dead link) and [`refusal`] refuses the next sleep's USB
+    /// suspend. Never cleared this boot (owed: the port's disconnect). Written by the loan holder, read anywhere.
+    static STUCK: AtomicU64 = AtomicU64::new(0);
+    /// SLEEP2 (B812): ports of this resume not yet judged, and the USB2 ports whose U0 has been written. Loan holder only.
+    static PENDING: AtomicU64 = AtomicU64::new(0);
+    static U0W: AtomicU64 = AtomicU64::new(0);
+    /// SLEEP2 (B812): each port's PLS read at the resume's start (`pls=<before>->`). Loan holder only.
+    static PLS_BEFORE: [AtomicU8; 64] = [const { AtomicU8::new(0) }; 64];
+    /// SLEEP2 (B812): synchronous EP0 transfers that ran out their pump budget (`pump_until_ep0_done`), this boot.
+    static EP0_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
 
     /// The sleep state's one word: `true` at entry, `false` at the wake. Any context; touches no register.
     pub fn request(suspend: bool) { WANT.store(suspend, Ordering::Release); }
 
     /// One cycle's numbers, for `tests usbsuspend`.
     #[derive(Clone, Copy)]
-    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32, pub held_rings: u32, pub held_ep0_refused: u32, pub replayed: u32 } // HELDSLOTEP0 (B804): the last two
+    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32, pub held_rings: u32, pub held_ep0_refused: u32, pub replayed: u32, pub stuck: u32 } // HELDSLOTEP0 (B804): held_ep0_refused, replayed; SLEEP2 (B812): stuck
 
     /// `true` while the ports are in U3 (the last request has been applied); `false` once fully back in U0.
     pub fn suspended() -> bool { PHASE.load(Ordering::Acquire) == SUSPENDED }
@@ -18110,9 +18124,21 @@ pub mod suspend {
             ports: PORTS.load(Ordering::Relaxed), suspended: SUSPENDED_N.load(Ordering::Relaxed), pls3: PLS3_N.load(Ordering::Relaxed),
             resumed: RESUMED_N.load(Ordering::Relaxed), kept: KEPT_N.load(Ordering::Relaxed), remote_wakes: REMOTE_WAKES.load(Ordering::Relaxed),
             ep_stopped: EP_STOPPED_N.load(Ordering::Relaxed), ep_running: EP_RUNNING_N.load(Ordering::Relaxed),
-            held_rings: HELD_RINGS.load(Ordering::Relaxed), held_ep0_refused: HELD_EP0_REFUSED_N.load(Ordering::Relaxed), replayed: HELD_EP0_REPLAYED_N.load(Ordering::Relaxed),
+            held_rings: HELD_RINGS.load(Ordering::Relaxed), held_ep0_refused: HELD_EP0_REFUSED_N.load(Ordering::Relaxed), replayed: HELD_EP0_REPLAYED_N.load(Ordering::Relaxed), stuck: STUCK.load(Ordering::Relaxed).count_ones(),
         }
     }
+
+    /// SLEEP2 (B812): `power::sleep`'s gate. `Some(why)` = a port this driver would suspend has no way back (a prior
+    /// cycle's resume left it stuck), so the sleep keeps USB up and names it. Any context; touches no register.
+    pub fn refusal() -> Option<&'static str> {
+        if STUCK.load(Ordering::Acquire) != 0 { Some("xhci-port-stuck") } else { None }
+    }
+
+    /// SLEEP2 (B812): synchronous EP0 timeouts this boot (the fixtures' `ep0_timeouts=` deltas).
+    pub fn ep0_timeouts() -> u32 { EP0_TIMEOUTS.load(Ordering::Relaxed) }
+
+    /// SLEEP2 (B812): from `pump_until_ep0_done`'s timeout line.
+    pub(super) fn note_ep0_timeout() { EP0_TIMEOUTS.fetch_add(1, Ordering::Relaxed); }
 
     /// `ring_doorbell`'s guard: a slot on a port this driver suspended rings nothing (slot 0, the command ring, is never
     /// held). The TRB the caller queued stays on its ring for `endpoints_restart`'s doorbell: the DCI (DB Target, bits 7:0,
@@ -18140,7 +18166,7 @@ pub mod suspend {
             match PHASE.load(Ordering::Acquire) {
                 UP if WANT.load(Ordering::Acquire) => { if self.ports_suspend() { PHASE.store(SUSPENDED, Ordering::Release); } }
                 SUSPENDED if !WANT.load(Ordering::Acquire) => self.ports_resume_begin(0),
-                RESUMING if now >= DUE_MS.load(Ordering::Relaxed) => self.ports_resume_finish(now),
+                RESUMING => self.ports_resume(now),
                 RECOVERING if now >= DUE_MS.load(Ordering::Relaxed) => {
                     self.endpoints_restart();
                     PHASE.store(UP, Ordering::Release);
@@ -18166,7 +18192,7 @@ pub mod suspend {
                 let portsc = self.read_portsc(port);
                 if portsc & 0b11 != 0b11 { continue; } // CCS and PED: an enabled device
                 ports += 1;
-                let why = if keep_wire & bit(port) != 0 { Some("wire") } else if keep_storage & bit(port) != 0 { Some("storage") } else { None };
+                let why = if keep_wire & bit(port) != 0 { Some("wire") } else if keep_storage & bit(port) != 0 { Some("storage") } else if self.port_major(port) == 0 { Some("resume-unwritten") } else { None }; // SLEEP2 (B812): a port of no known kind has no written resume
                 if let Some(why) = why {
                     kept += 1;
                     serial_println!("[usb] port={} keep why={}", port, why);
@@ -18200,8 +18226,9 @@ pub mod suspend {
         }
 
         /// Begin the resume of every port this driver suspended (`remote` = the port whose device signalled, already in
-        /// Resume and driven by the controller; 0 = host-initiated). USB2 ports get PLS=Resume and a 20 ms deadline;
-        /// SuperSpeed ports get U0 now (xHCI 1.2 §4.15.2.2).
+        /// Resume and driven by the controller; 0 = host-initiated). USB2 ports get PLS=Resume (TDRSMDN runs from now);
+        /// SuperSpeed ports get U0 now (xHCI 1.2 §4.15.2.2). Each port's PLS before the write is kept for its line, and
+        /// every port is left PENDING for [`XhciController::ports_resume`] (SLEEP2 B812).
         fn ports_resume_begin(&mut self, remote: u8) {
             let mask = SUSP_MASK.load(Ordering::Relaxed);
             let usb2 = USB2_MASK.load(Ordering::Relaxed);
@@ -18209,37 +18236,50 @@ pub mod suspend {
             T0_MS.store(now, Ordering::Relaxed);
             for port in 1..=self.max_ports.min(64) {
                 if mask & bit(port) == 0 { continue; }
+                PLS_BEFORE[port as usize - 1].store(((self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT) as u8, Ordering::Relaxed);
                 if usb2 & bit(port) == 0 { self.set_link_state(port, PLS_U0); } else if port != remote { self.set_link_state(port, PLS_RESUME); }
             }
-            DUE_MS.store(now + RESUME_MS, Ordering::Relaxed);
+            PENDING.store(mask, Ordering::Relaxed);
+            U0W.store(0, Ordering::Relaxed);
             PHASE.store(RESUMING, Ordering::Release);
         }
 
-        /// The 20 ms are up: USB2 ports to U0, each port's PLS read and printed, then the 10 ms recovery.
-        fn ports_resume_finish(&mut self, now: u64) {
-            let mask = SUSP_MASK.load(Ordering::Relaxed);
+        /// SLEEP2 (rmbp-ledger B812, BP-power-7) — the one resume of every port the sleep suspended, one step per pump
+        /// pass (never a wait with the loan held). USB2 (xHCI 1.2 §4.15.2.2, USB 2.0 §7.1.7.7): Resume held 20 ms
+        /// (TDRSMDN) from the begin, then U0 written once. USB3: U0 was written at the begin (the xHC drives the U3
+        /// exit). Then each pass reads PLS — PLS is the state; PLC is the event dispatch's (`handle_port_status`
+        /// clears the change bits) — and judges the port: U0 = `ok`; past its bound (`RESUME_BOUND_MS` after its U0
+        /// write) = `stuck`: recorded in `STUCK`, so `endpoints_restart` leaves its slots HELD (the HELDSLOTEP0
+        /// refusal keeps EP0 off the dead link) and the next sleep keeps USB up. Every port judged: the 10 ms
+        /// recovery (TRSMRCY) begins.
+        fn ports_resume(&mut self, now: u64) {
             let usb2 = USB2_MASK.load(Ordering::Relaxed);
-            for port in 1..=self.max_ports.min(64) {
-                if mask & bit(port) != 0 && usb2 & bit(port) != 0 { self.set_link_state(port, PLS_U0); }
-            }
             let t0 = T0_MS.load(Ordering::Relaxed);
-            let mut resumed = 0u32;
+            let elapsed = now.saturating_sub(t0);
+            let mut pending = PENDING.load(Ordering::Relaxed);
             for port in 1..=self.max_ports.min(64) {
-                if mask & bit(port) == 0 { continue; }
-                let mut pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
-                while pls != PLS_U0 && crate::arch::ms().wrapping_sub(now) < 5 {
-                    core::hint::spin_loop();
-                    pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
+                let b = bit(port);
+                if pending & b == 0 { continue; }
+                let is2 = usb2 & b != 0;
+                if is2 && elapsed < RESUME_MS { continue; }
+                if is2 && U0W.load(Ordering::Relaxed) & b == 0 {
+                    self.set_link_state(port, PLS_U0);
+                    U0W.fetch_or(b, Ordering::Relaxed);
+                    continue;
                 }
-                let ms = crate::arch::ms().saturating_sub(t0);
-                if pls == PLS_U0 {
-                    resumed += 1;
-                    serial_println!("[usb] port={} resume ms={} -> ok{}", port, ms, self.kbd_ep_word(port));
-                } else {
-                    serial_println!("[usb] port={} resume ms={} -> pls={}{}", port, ms, pls, self.kbd_ep_word(port));
-                }
+                let pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
+                let ok = pls == PLS_U0;
+                let bound = if is2 { RESUME_MS + RESUME_BOUND_MS } else { RESUME_BOUND_MS };
+                if !ok && elapsed < bound { continue; }
+                pending &= !b;
+                if ok { RESUMED_N.fetch_add(1, Ordering::Relaxed); } else { STUCK.fetch_or(b, Ordering::Release); }
+                serial_println!(
+                    "[usb] port={} resume pls={}->{} ms={} -> {}{}",
+                    port, PLS_BEFORE[port as usize - 1].load(Ordering::Relaxed), pls, elapsed, if ok { "ok" } else { "stuck" }, self.kbd_ep_word(port)
+                );
             }
-            RESUMED_N.store(resumed, Ordering::Relaxed);
+            PENDING.store(pending, Ordering::Relaxed);
+            if pending != 0 { return; }
             SUSP_MASK.store(0, Ordering::Relaxed);
             DUE_MS.store(crate::arch::ms() + RECOVERY_MS, Ordering::Relaxed);
             PHASE.store(RECOVERING, Ordering::Release);
@@ -18277,7 +18317,9 @@ pub mod suspend {
         /// whose doorbell the hold remembered and the stop did not stop is rung (XHCIHOLDDCI B795, xHCI 1.2 §4.15.1).
         fn endpoints_restart(&mut self) {
             let mut running = 0u32;
+            let stuck = STUCK.load(Ordering::Relaxed);
             for slot in 1..self.slots.len().min(HELD.len()) {
+                if stuck & bit(self.slots[slot].port_id) != 0 { continue; } // SLEEP2 (B812): a stuck port's slots stay HELD
                 let held = HELD[slot].swap(0, Ordering::Relaxed);
                 let rang = RANG[slot].swap(0, Ordering::Relaxed) & !held;
                 for dci in 1..=31u8 {

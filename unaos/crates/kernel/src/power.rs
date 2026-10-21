@@ -411,9 +411,9 @@ pub mod sleep {
     /// [`measure_enter`]'s, on the service pass.
     pub fn enter(via: &str, backlight: &str) {
         if ASLEEP.swap(true, Ordering::AcqRel) { return; } #[cfg(feature = "login")] crate::video::lock::before_sleep(via); // AUTOLOCK (B712): the lid (system.lock.on_lid) or another sleep (on_sleep) locks the glass BEFORE the state's line; `tests` never locks. LINE-NEUTRAL fold, code first.
-        ENTER_MS.store(crate::arch::ms().max(1), Ordering::Relaxed); usb_ports(true); // USBSUSPEND (B766): both USB drivers are ASKED for their ports' suspend (one word each; the drivers' own passes write the registers)
+        ENTER_MS.store(crate::arch::ms().max(1), Ordering::Relaxed); let usb = usb_ports(true); // SLEEP2 (B812): `suspend`, or `kept why=` when a port could not come back. USBSUSPEND (B766): both USB drivers are ASKED for their ports' suspend (one word each; the drivers' own passes write the registers)
         ENTER_BATT.store(u32::MAX, Ordering::Relaxed); #[cfg(not(feature = "tickless"))]
-        serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=1khz usb=suspend s3=unreachable", STATE, via, backlight); #[cfg(feature = "tickless")] serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=tickless-idle usb=suspend s3=unreachable", STATE, via, backlight); // TICKLESS (B765): idle cores halt to their nearest deadline, not between 1 kHz ticks (the attribute on the line above gates the knob-off line; LINE-NEUTRAL)
+        serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=1khz usb={} s3=unreachable", STATE, via, backlight, usb); #[cfg(feature = "tickless")] serial_println!("[power] sleep enter={} via={} backlight={} panel=refused cores=hlt-c1 tick=tickless-idle usb={} s3=unreachable", STATE, via, backlight, usb); // TICKLESS (B765): idle cores halt to their nearest deadline, not between 1 kHz ticks (the attribute on the line above gates the knob-off line; LINE-NEUTRAL)
     }
 
     /// The entry's slow half, from the service pass after the panel is dark: the S3 census (once per boot), a stale
@@ -499,8 +499,14 @@ pub mod sleep {
 
     /// USBSUSPEND (B766, BP-power-7): ask both USB host drivers to suspend (`true`) or resume (`false`) their root
     /// ports. One word per driver; each driver's own pass (the xHCI loan holder, the `EHCI_HID` holder) writes PORTSC.
-    fn usb_ports(suspend: bool) {
+    /// SLEEP2 (B812): the suspend is REFUSED (neither driver asked) when the xHCI driver names a port with no way back
+    /// (`suspend::refusal`: a prior resume left it stuck); the word is the enter line's `usb=`.
+    fn usb_ports(suspend: bool) -> &'static str {
+        if suspend {
+            if crate::drivers::xhci::suspend::refusal().is_some() { return "kept why=xhci-port-stuck"; }
+        }
         crate::drivers::xhci::suspend::request(suspend);
         #[cfg(feature = "ehcihid")] crate::drivers::ehci::suspend::request(suspend);
+        "suspend"
     }
 }
