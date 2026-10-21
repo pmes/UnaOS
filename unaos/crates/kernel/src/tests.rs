@@ -189,7 +189,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE2: AtomicBool = AtomicBool::new(false);
-        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] register("focussteal", focussteal_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("veilcost", veilcost_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))] register("aging", aging_selftest); register("a11yfilters", crate::video::settings::selftest_a11yfilters); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("zoom", zoom_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("perfhud", crate::video::perfhud::selftest); #[cfg(feature = "quarry")] register("undomove", undomove_selftest); #[cfg(all(feature = "quarry", target_arch = "x86_64", feature = "wc"))] register("undokeys", undokeys_selftest); register("fontkit", fontkit_selftest); #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] register("raiseverb", raiseverb_selftest); register("keychars", keychars_selftest); register("softydots", softydots_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpsearch", helpsearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))] register("filesearch", filesearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("oneinstance", oneinstance_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpf1", helpf1_selftest); #[cfg(feature = "quarry")] register("trashtoast", trashtoast_selftest); #[cfg(feature = "uac")] register("softymic", softymic_selftest); register("scrollview", scrollview_selftest); register("settingsmap", settingsmap_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "facet"))] register("wcpar", wcpar_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("textscale2", textscale2_selftest); }
+        if !DONE2.swap(true, Ordering::AcqRel) { #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("dongleboot", crate::video::desktopbuild::dongleboot_selftest); /* DONGLEBOOT (B658): the prefs stat, the AHCI bound, the render task on a held disk, the starter release */ register("settings", crate::video::settings::selftest_all); register("appearance", crate::video::appearance::selftest); /* APPEARANCE (B408) */ register("softy", crate::video::softy::selftest); /* SOFTY (B629): the look switch, the taskbar, Start, the caption buttons */ register("winkey", crate::video::softy::startmenu::winkey_selftest); /* WINKEY (B665): the Windows-key tap toggles Start once (counter path), Esc through the door closes it */ register("trackpad", crate::video::settings::selftest_trackpad); /* TRACKPADPANE (B412) */ register("prefs", crate::prefs::selftest); register("prefscap", crate::prefs::prefscap_selftest); register("appmenu", crate::video::sysmenu::selftest); /* APPMENU2 (B393) */ #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("windowlist", crate::video::winlist::selftest); /* WINDOWLIST (R75) */ register("glasskit", crate::video::draw::selftest); /* GLASSKIT (B628): the drawing kit's invariants and per-op cost (LINE-NEUTRAL append) */ register("desktopcraft", crate::video::wm::desktop::selftest); /* DESKTOPCRAFT (B631): the Una desktop painted offscreen at the panel size, its invariants and the frame cost (LINE-NEUTRAL append) */ register("starfield", crate::video::wm::desktop::starfield_selftest); /* STARFIELD (B661, R128): the generated scene offscreen — gen time, the lens on three stars, the zircon, the beam, the shimmer's cost and occlusion (LINE-NEUTRAL append) */ register("quarryhover", crate::video::quarry::live::hover_selftest); /* QUARRYHOVER (B647): Quarry's hover on the service pass and the wheel into every pane (LINE-NEUTRAL append) */  register("motion", crate::video::draw::motion::selftest); register("a11y", crate::video::settings::selftest_a11y); /* A11YPANE (B655): the Accessibility pane, its four keys and the reduce-motion snap (LINE-NEUTRAL append) */ #[cfg(feature = "facet")] register("startscene", crate::video::wallpaper::startscene_selftest); /* STARTSCENE (B662, R128): one picture from the splash to the desktop — gen_count=1, the splash scene, the hold shimmer, the GOP stars, the login backdrop (LINE-NEUTRAL append) */ register("contrast", crate::video::theme::contrast_selftest); /* CONTRAST (B664): the increase-contrast set on both looks, >= 7:1 text-on-surface, two epoch bumps (LINE-NEUTRAL append) */ register("settingsmap", crate::video::settings::selftest_map); /* SETTINGSMAP (B673): every prefs::key on one Settings row, every row on a key, each label reached by <= 2 keys + Return (LINE-NEUTRAL append) */ register("toastcap", crate::video::notify::toastcap_selftest); /* TOASTCAP (B674): DESIGN-LANGUAGE §3.6/§3.8 — three toasts at most, the rest wait, 5 s paused on hover; one primary per dialog, Return/Escape on every view (LINE-NEUTRAL append) */ #[cfg(all(target_arch = "x86_64", feature = "facet"))] register("shimmeridle", crate::video::wm::desktop::shimmeridle_selftest); /* SHIMMERIDLE (B663): the idle desktop's twinkle from the device-service pass — 4..=7 ticks in 200 ms, each under 800 us, none under reduce motion, no gate steal (LINE-NEUTRAL append) */ register("memline", crate::video::desktopbuild::memline_selftest); /* MEMLINE (B677): the desktop's memory line at `[desktop] built` and the Log Out round trip's high-water (LINE-NEUTRAL append) */ register("reask", crate::fs::apptrust::reask_selftest); /* REASK (B681, R130 law 2): an answered ask is kept in Principia's store — 3 reboots and 90 days ask 0 times, a revoke asks once (LINE-NEUTRAL append) */ #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] register("a11ytree", crate::video::wm::a11y::selftest); /* A11YTREE (B675, BP-bar-22): the role/name tree from the window table through the verb's own body, unnamed=0, focus = wm's, Settings' ring at every Tab stop (LINE-NEUTRAL append) */ register("keymaps", keymaps_selftest); #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] register("focussteal", focussteal_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] register("veilcost", veilcost_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))] register("aging", aging_selftest); register("a11yfilters", a11yfilters_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("zoom", zoom_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("perfhud", crate::video::perfhud::selftest); #[cfg(feature = "quarry")] register("undomove", undomove_selftest); #[cfg(all(feature = "quarry", target_arch = "x86_64", feature = "wc"))] register("undokeys", undokeys_selftest); register("fontkit", fontkit_selftest); #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] register("raiseverb", raiseverb_selftest); register("keychars", keychars_selftest); register("softydots", softydots_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpsearch", helpsearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "unafs"))] register("filesearch", filesearch_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("oneinstance", oneinstance_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("helpf1", helpf1_selftest); #[cfg(feature = "quarry")] register("trashtoast", trashtoast_selftest); #[cfg(feature = "uac")] register("softymic", softymic_selftest); register("scrollview", scrollview_selftest); register("settingsmap", settingsmap_selftest); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "facet"))] register("wcpar", wcpar_selftest); #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("textscale2", textscale2_selftest); }
     }
     // POWERMENU (R75): `tests power` — battery panel open/close + the NOTICE thresholds on a forced percent (no shutdown).
     #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -6403,4 +6403,135 @@ fn autolock_credential(name: &[u8], pw: &[u8]) -> Option<u64> {
     }
     serial_println!(":: AUTOLOCK: entered=0 leaked_keys=0 reopened=- table_same=- ms=- -> SKIP reason=credential-not-fixture verify=users kdf_ms={} ::", kdf_ms);
     None
+}
+
+/// **`tests a11yfilters`** (A11YFILTERS B705, then A11YSHADOW rmbp-ledger B816, BP-video-25): the settings fixture
+/// unchanged, then [`a11yshadow_leg`].
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn a11yfilters_selftest() {
+    crate::video::settings::selftest_a11yfilters();
+    a11yshadow_leg();
+}
+
+/// A11YSHADOW (B816) — a window that did NOT present keeps no stale shadow under a colour filter. One 8x8 window
+/// (focussteal's idiom: the user's verb, so it is mapped focused and on top) at the panel's centre casts; with the
+/// filter off a scanout word in its bottom shadow margin (alpha > 0, no window box over it, clear of the sprite) is
+/// read; then the filter changes EXACTLY as `settings::a11y_filter_moved` changes it (the latch, the looks epoch,
+/// damage-all, a full present) and the window presents nothing; up to 8 composite passes, and the word must be the
+/// inverted one (`before ^ 0xFFFFFF` — invert is exact on the same unfiltered source). Without the epoch follow the
+/// shadow extent is never re-laid (the occluders keep the desktop layer off it) and the word stays `before`: FAIL.
+/// Every latch, the focus and the window are restored.
+/// `[a11y] shadow_follows=<ok|FAIL> win=<id> at=<x>,<y> alpha=<a> before=<hex> after=<hex> want=<hex> passes=<n>`
+/// `:: A11YSHADOW: shadow_follows=ok relaid=<n> -> PASS ::`
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn a11yshadow_leg() {
+    use crate::origin::{with, Origin};
+    use crate::video::blitter::a11yfilter as af;
+    use crate::video::wm::{self, desktop};
+    static SURF: [u32; 64] = [0; 64];
+    const OWNER: u64 = 0xA115;
+    const _: () = assert!(!wm::is_kernel_owner(OWNER));
+    const PASSES: usize = 8;
+    let read = |x: usize, y: usize| crate::video::WRITER.lock().read_pixel(x, y);
+    // The filter change as the Settings seam makes it (`a11y_filter_moved`): latch, looks epoch, damage-all, present.
+    let change = |m: usize, inv: bool| {
+        af::set(m, inv);
+        crate::video::theme::bump_epoch();
+        let _ = wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+        crate::video::screen::request_full_present();
+    };
+    let pause = || {
+        let t = crate::arch::ms() + 5;
+        while crate::arch::ms() < t {
+            crate::arch::sched::yield_now();
+        }
+    };
+    let Some(pi) = crate::video::panel_info_nonblocking().filter(|p| p.width != 0 && p.height != 0) else {
+        serial_println!(":: A11YSHADOW: -> SKIP (no panel) ::");
+        return;
+    };
+    let (m0, i0) = (af::mode(), af::invert());
+    let saved = wm::focus_asid();
+    with(Origin::Glass, || wm::spawn_focus_arm(OWNER));
+    let win = wm::create(OWNER, &raw const SURF as usize, core::mem::size_of_val(&SURF), 8, 8, 32, b"a11ysh");
+    if win == wm::WIN_NONE {
+        wm::spawn_focus_forget(OWNER);
+        serial_println!(":: A11YSHADOW: -> SKIP (window table full) ::");
+        return;
+    }
+    if wm::spawn_focus_take(OWNER) {
+        wm::focus_changed(OWNER);
+    }
+    let _ = wm::move_to(win, pi.width / 2, pi.height / 2);
+    if m0 != 0 || i0 {
+        change(0, false);
+    }
+    wm::composite();
+    // The probe point: the bottom margin of this window's cast, alpha > 0, no window box over it, clear of the sprite.
+    let sprite = crate::video::cursor::sprite_box();
+    let clear_of_sprite = |x: i32, y: i32| match sprite {
+        Some((bx, by, bw, bh)) => {
+            let (bx, by) = (bx as i32 - 4, by as i32 - 4);
+            x < bx || y < by || x >= bx + bw as i32 + 8 || y >= by + bh as i32 + 8
+        }
+        None => true,
+    };
+    let mut at: Option<(i32, i32, u32)> = None;
+    if let Some(c) = desktop::casts_now().iter().find(|c| c.id == win).copied() {
+        let (_, _, _, ey1) = c.extent();
+        let mid = (c.x0 + c.x1) / 2;
+        'rows: for y in c.y1..ey1.min(pi.height as i32) {
+            for x in [mid, mid - 8, mid + 8, c.x0 + 2, c.x1 - 3] {
+                if x < 0 || x >= pi.width as i32 || wm::hit_test(x, y).is_some() || !clear_of_sprite(x, y) {
+                    continue;
+                }
+                let mut al = 0u32;
+                c.for_each_alpha(y, x, x + 1, |_, a| al = a);
+                if al >= 8 {
+                    at = Some((x, y, al));
+                    break 'rows;
+                }
+            }
+        }
+    }
+    let (verdict, relaid) = match at {
+        None => {
+            serial_println!(":: A11YSHADOW: -> SKIP (no shadow pixel clear of the windows and the sprite) ::");
+            (None, 0)
+        }
+        Some((x, y, al)) => {
+            let (ux, uy) = (x as usize, y as usize);
+            let before = read(ux, uy).unwrap_or(0);
+            let want = before ^ 0x00FF_FFFF;
+            let r0 = wm::a11yshadow::relays();
+            change(0, true);
+            let (mut after, mut passes) = (before, 0usize);
+            while passes < PASSES {
+                wm::composite();
+                passes += 1;
+                after = read(ux, uy).unwrap_or(0);
+                if after == want {
+                    break;
+                }
+                pause();
+            }
+            let relaid = wm::a11yshadow::relays().wrapping_sub(r0);
+            let ok = after == want && before != want;
+            serial_println!(
+                "[a11y] shadow_follows={} win={} at={},{} alpha={} before={:06x} after={:06x} want={:06x} passes={}",
+                if ok { "ok" } else { "FAIL" }, win, x, y, al, before, after, want, passes
+            );
+            (Some(ok), relaid)
+        }
+    };
+    change(m0, i0);
+    wm::focus_changed(saved);
+    wm::close(win);
+    wm::composite();
+    if let Some(ok) = verdict {
+        serial_println!(
+            ":: A11YSHADOW: shadow_follows={} relaid={} -> {} ::",
+            if ok { "ok" } else { "FAIL" }, relaid, if ok { "PASS" } else { "FAIL" }
+        );
+    }
 }
