@@ -20,8 +20,8 @@
 //! **Owed at LOGIN, built AFTER THE BAR** (R93; R80: nothing at boot; FILETYPES2 B513): `login ok` reads the stamp
 //! ([`owe`]) and builds nothing — a match publishes the stored registry, a miss leaves it unpublished (the resolver
 //! answers from the facts) and the `jobs-scan` worker builds it after the bar ([`build_owed`]; the device-service
-//! pass [`service`] when no worker took it; inline off x86), publishing it with one store when done — every known type's object created in its OWN
-//! bounded transaction (REGISTRYCHUNK B508: per object, the task yielding between), a present object's MISSING keys filled, a present key never overwritten (the user's amendment
+//! pass [`service`] when no worker took it; inline off x86), publishing it with one store when done — every missing type's object created WITH its keys,
+//! a group of objects per commit (FILETYPES3 B820, [`create_grouped`]; was one object and five commits, REGISTRYCHUNK B508), the task yielding between, a present object's MISSING keys filled, a present key never overwritten (the user's amendment
 //! sticks). Known types = [`TYPE_FACTS`] ∪ every type a registrant declares ∪ what the directory already holds.
 //! Descriptions and glyphs are type FACTS (Be's MIME database shipped them); extensions are
 //! `filetype::EXT_TABLE`'s, listed.
@@ -256,8 +256,9 @@ fn sig_decls(mt: &MountTable) -> Vec<SigDecl> {
     out
 }
 
-/// Build the registry: `/system`, `/system/filetypes`, every known type's object that does not exist yet (one
-/// bounded transaction PER OBJECT — REGISTRYCHUNK B508, was one for all), and on a present object every MISSING key (a present
+/// Build the registry: `/system`, `/system/filetypes`, every known type's object that does not exist yet (created
+/// with its keys, a GROUP of objects per commit — FILETYPES3 B820's [`create_grouped`]; REGISTRYCHUNK B508 took five
+/// commits per object), and on a present object every MISSING key (a present
 /// key is the user's or an earlier build's and is never overwritten). `Ok((created, filled))`;
 /// `Err(Unsupported)` on a root that takes no attributes (the registrants answer there).
 pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
@@ -277,83 +278,57 @@ pub fn seed_in(mt: &MountTable) -> Result<(usize, usize), VfsError> {
     let scoped = crate::fs::bootstep::scope_word() != "global";
     let sio = || if scoped { crate::fs::bootstep::scope_io() } else { crate::fs::bootstep::io() };
     let (mut made, mut filled) = (0usize, 0usize);
+    let mut commits = 0u32; // FILETYPES3 (B820): every commit this build took (the swap line's `commits=`)
+    let mut missing: Vec<(String, Vec<(String, AttrValue)>)> = Vec::new(); // FILETYPES3 (B820): created after the walk, grouped
     let sigs = sig_decls(mt); // FILETYPES2 (B513): who declares the uncovered types (their objects name that program)
     for mime in seed_types_in(mt) { // SMALLFIX5 (B480): + the types only a ring-3 program's signature object declares
-        let (t0, io0) = (crate::arch::ms(), sio());
         let obj = object_path(&mime);
         let leaf = String::from(&obj[TYPES_DIR.len() + 1..]);
         let exists = present.iter().any(|n| *n == leaf);
         let want = keys_for_obj(mt, &mime, exists, &sigs);
-        let (mut m1, mut f1, mut txs, mut mm) = (0usize, 0usize, 0u32, 0u64);
-        // FIRSTLOGIN (rmbp-ledger B636): flight 34 boot 2 `type=text/html made=1 blocks=344 masked_ms=183` — the boot's first
-        // write to the volume read its cold directory and index blocks INSIDE the create's IRQ-masked UnaFS transaction
-        // (every UnaFS op is one masked `MOUNT` hold, fs/unafs.rs `with_unafs_attempt`). The object's path is read first in
-        // short read-only transactions of their own (a yield between), so the create and the stamp find those blocks
-        // cached; each transaction kind's masked span is said on the per-type row (`masked_pre/create/stamp_max`).
-        let (mut m_pre, mut m_create, mut m_stamp) = (crate::hidstall::scope_masked_take(), 0u64, 0u64); // keys_for_obj's reads count as pre
         if !exists {
-            let _ = mt.stat(TYPES_DIR);
-            breathe_between();
-            let _ = mt.stat(&obj); // the miss walks the same lookup the create walks
-            breathe_between();
-            m_pre = m_pre.max(crate::hidstall::scope_masked_take());
-            mm = mm.max(m_pre);
-            // FILETYPES (JOBSCAN2, B551): the object is created BARE (one small transaction: the inode, the directory
-            // rewrite, its name facts), then its keys are stamped in groups (`stamp_grouped`). Flight 32's 275 ms
-            // masked hold was the one-object create carrying every key (each key two index B-tree inserts, cmds=62 in
-            // one IRQ-masked transaction). The stamp is written only after every object, so a build cut between the
-            // create and its keys is finished by the next build's fill arm below.
-            match mt.create_files_batch(TYPES_DIR, alloc::vec![(leaf, Vec::new())], k) {
-                Ok(n) => {
-                    m1 = n;
-                    txs += 1;
-                    m_create = crate::hidstall::scope_masked_take();
-                    mm = mm.max(m_create);
-                    breathe_between();
-                    let _ = mt.list_attrs(&obj, k); // FIRSTLOGIN (B636): the new inode's attribute blocks, read before the stamp
-                    breathe_between();
-                    m_pre = m_pre.max(crate::hidstall::scope_masked_take());
-                    mm = mm.max(m_pre);
-                    let keys: Vec<(String, Option<AttrValue>)> = want.into_iter().map(|(key, v)| (key, Some(v))).collect();
-                    txs += stamp_grouped(mt, &obj, &keys, k, &mut group, &mut m_stamp)?;
-                    mm = mm.max(m_stamp);
-                }
-                Err(VfsError::Unsupported) => { // no batch on this volume: the plain create, then its keys
-                    mt.create(&obj, NodeKind::File, k)?;
-                    for (key, v) in want {
-                        mt.set_attr(&obj, &key, v, k)?;
-                    }
-                    m1 = 1;
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            let have: Vec<(String, AttrValue)> = mt.list_attrs(&obj, k).unwrap_or_default();
-            breathe_between(); // FIRSTLOGIN (B636): the read is its own transaction; the stamp's groups follow
-            m_pre = m_pre.max(crate::hidstall::scope_masked_take());
-            mm = mm.max(m_pre);
-            let fill: Vec<(String, Option<AttrValue>)> = want
-                .into_iter()
-                .filter(|(key, _)| !have.iter().any(|(h, v)| h == key && !matches!(v, AttrValue::Str(s) if s.is_empty())))
-                .map(|(key, v)| (key, Some(v)))
-                .collect();
-            if !fill.is_empty() {
-                f1 = fill.len();
-                txs += stamp_grouped(mt, &obj, &fill, k, &mut group, &mut m_stamp)?; // JOBSCAN2 (B551): grouped like a new object's keys
-                mm = mm.max(m_stamp);
-            }
+            // FILETYPES3 (B820): flight 37 boot 3 (a fresh card, `stamp=absent`): 32 objects × 5 commits (the bare create,
+            // then one key per `set_attrs`) = 160 IRQ-masked commits, `cmds=3013 ms=9861`. The object is created WITH its
+            // keys, G objects per commit, by [`create_grouped`] after the walk; no per-object pre-read transactions (the one
+            // listing above decided presence; the group's own transaction reads the cold blocks once for G objects).
+            missing.push((leaf, want));
+            continue;
         }
-        made += m1;
+        let (t0, io0) = (crate::arch::ms(), sio());
+        let (mut f1, mut txs, mut mm) = (0usize, 0u32, 0u64);
+        let (mut m_pre, mut m_stamp) = (crate::hidstall::scope_masked_take(), 0u64); // keys_for_obj's reads count as pre
+        let have: Vec<(String, AttrValue)> = mt.list_attrs(&obj, k).unwrap_or_default();
+        breathe_between(); // FIRSTLOGIN (B636): the read is its own transaction; the stamp's groups follow
+        m_pre = m_pre.max(crate::hidstall::scope_masked_take());
+        mm = mm.max(m_pre);
+        let fill: Vec<(String, Option<AttrValue>)> = want
+            .into_iter()
+            .filter(|(key, _)| !have.iter().any(|(h, v)| h == key && !matches!(v, AttrValue::Str(s) if s.is_empty())))
+            .map(|(key, v)| (key, Some(v)))
+            .collect();
+        if !fill.is_empty() {
+            f1 = fill.len();
+            txs += stamp_grouped(mt, &obj, &fill, k, &mut group, &mut m_stamp)?; // JOBSCAN2 (B551): grouped like a new object's keys
+            mm = mm.max(m_stamp);
+        }
         filled += f1;
+        commits += txs;
         let mm = mm.max(crate::hidstall::scope_masked_take()); // every object's span, said or not
         PER_TYPE_MASKED.fetch_max(mm, Ordering::Relaxed);
-        if m1 + f1 > 0 {
+        if f1 > 0 {
             let d = sio().since(io0);
-            serial_println!("[filetypes] type={} made={} filled={} blocks={} cmds={} ms={} masked_ms={} txs={} group={} masked_pre={} masked_create={} masked_stamp_max={}", mime, m1, f1, d.blocks_read(), d.cmds(),
-                crate::arch::ms().saturating_sub(t0), mm, txs, group, m_pre, m_create, m_stamp); // FIRSTLOGIN (B636): each transaction kind's masked span
+            serial_println!("[filetypes] type={} made=0 filled={} blocks={} cmds={} ms={} masked_ms={} txs={} group={} masked_pre={} masked_create=0 masked_stamp_max={}", mime, f1, d.blocks_read(), d.cmds(),
+                crate::arch::ms().saturating_sub(t0), mm, txs, group, m_pre, m_stamp); // FIRSTLOGIN (B636): each transaction kind's masked span
         }
         breathe_between(); // between objects, never inside a hold: the HID pump and the render lane run (JOBSCAN's worker runs this build)
     }
+    let mut og = OBJ_GROUP_START;
+    let mut mm = 0u64;
+    let (m1, c1) = create_grouped(mt, missing, &mut og, &mut mm)?;
+    PER_TYPE_MASKED.fetch_max(mm, Ordering::Relaxed);
+    made += m1;
+    commits += c1;
+    SEED_COMMITS.store(commits as usize, Ordering::Relaxed);
     Ok((made, filled))
 }
 
@@ -392,6 +367,74 @@ fn stamp_grouped(mt: &MountTable, obj: &str, keys: &[(String, Option<AttrValue>)
         breathe_between();
     }
     Ok(txs)
+}
+
+/// FILETYPES3 (B820): the first objects-per-commit of a build's grouped create, and the most.
+const OBJ_GROUP_START: usize = 4;
+const OBJ_GROUP_MAX: usize = 16;
+/// FILETYPES3 (B820): the commits the last `seed_in` took (group creates + fill groups).
+static SEED_COMMITS: AtomicUsize = AtomicUsize::new(0);
+
+/// FILETYPES3 (B820) — CHARTER: the registry's missing objects, created WITH their keys, `group` objects per
+/// `create_files_batch` (BOOT80 B350's shape: one transaction, the index facts applied once, one root flip — what
+/// [`set_preferred_in`] does for one); `group` sized by the last commit's masked span, [`stamp_grouped`]'s rule over
+/// objects (doubling to [`OBJ_GROUP_MAX`] at or under [`MASKED_MS_BOUND`], halving past twice it). A group refused
+/// `exists` (a racing creator) is created one object at a time (a present one skipped); a volume with no batch takes
+/// the plain create and its keys. A yield after every commit, never inside a hold. `(made, commits)`; `mm` takes every
+/// commit's masked span. One line per group: `[filetypes] group objects= blocks= cmds= ms= masked_ms= next=`.
+fn create_grouped(mt: &MountTable, mut rest: Vec<(String, Vec<(String, AttrValue)>)>, group: &mut usize, mm: &mut u64) -> Result<(usize, u32), VfsError> {
+    let k = KERNEL_PRINCIPAL;
+    let scoped = crate::fs::bootstep::scope_word() != "global";
+    let sio = || if scoped { crate::fs::bootstep::scope_io() } else { crate::fs::bootstep::io() };
+    let (mut made, mut commits) = (0usize, 0u32);
+    while !rest.is_empty() {
+        let n = (*group).clamp(1, OBJ_GROUP_MAX).min(rest.len());
+        let batch: Vec<(String, Vec<(String, AttrValue)>)> = rest.drain(..n).collect();
+        let (t0, io0) = (crate::arch::ms(), sio());
+        *mm = (*mm).max(crate::hidstall::scope_masked_take()); // what came before this group stays the build's
+        let m = match mt.create_files_batch(TYPES_DIR, batch.clone(), k) {
+            Ok(c) => {
+                made += c;
+                commits += 1;
+                crate::hidstall::scope_masked_take()
+            }
+            Err(VfsError::Backend("exists")) => {
+                let mut m = 0u64;
+                for one in batch {
+                    breathe_between();
+                    match mt.create_files_batch(TYPES_DIR, alloc::vec![one], k) {
+                        Ok(c) => { made += c; commits += 1; }
+                        Err(VfsError::Backend("exists")) => {}
+                        Err(e) => return Err(e),
+                    }
+                    m = m.max(crate::hidstall::scope_masked_take());
+                }
+                m
+            }
+            Err(VfsError::Unsupported) => { // no batch on this volume: the plain create, then its keys
+                for (leaf, keys) in batch {
+                    let obj = alloc::format!("{}/{}", TYPES_DIR, leaf);
+                    mt.create(&obj, NodeKind::File, k)?;
+                    for (key, v) in keys {
+                        mt.set_attr(&obj, &key, v, k)?;
+                    }
+                    made += 1;
+                }
+                crate::hidstall::scope_masked_take()
+            }
+            Err(e) => return Err(e),
+        };
+        *mm = (*mm).max(m);
+        if m > MASKED_MS_BOUND * 2 {
+            *group = (*group / 2).max(1);
+        } else if m <= MASKED_MS_BOUND && n == *group {
+            *group = (*group * 2).min(OBJ_GROUP_MAX);
+        }
+        let d = sio().since(io0);
+        serial_println!("[filetypes] group objects={} blocks={} cmds={} ms={} masked_ms={} next={}", n, d.blocks_read(), d.cmds(), crate::arch::ms().saturating_sub(t0), m, group);
+        breathe_between();
+    }
+    Ok((made, commits))
 }
 
 /// `/system` and [`TYPES_DIR`], created when absent.
@@ -637,7 +680,8 @@ pub fn view_service() -> bool {
 /// a rebuild, the sniff never overwriting a set `una:type` (ATTRCOLUMNS's refresh), and Open With's list for text.
 ///
 /// `:: FILETYPES: types=<n> build_ms=<n> blocks=<n> masked_max_ms=<n> -> PASS|FAIL :: login=<stamp|none|full|-> worker=<none|pending|built|failed>
-/// on=<worker|service|login|-> login_ms=<n> login_blocks=<n> bound_ms=20000 masked_bound_ms=50 bar_ms=<n|none> preferred=<n> resolved=<ok|why>
+/// on=<worker|service|login|-> login_ms=<n> login_blocks=<n> medium=<sdhc|global|usb|ahci|none> bound_ms=500 masked_bound_ms=50 masked_goal_ms=20
+/// masked_at=unafs-commit records=<n> commits=<n> bar_ms=<n|none> preferred=<n> resolved=<ok|why>
 /// registry=<dir|none> objects=<n> source=<db|registrants> sticky=<ok|skip|why> amend=<ok|skip|why> openwith=<n> builds=<n>`
 /// FILETYPES2 (B513): the head is the OWED build's cost (the worker's, after the bar; zeros on a stamp hit), read
 /// BEFORE this test's own forced build (which is not recorded); [`verdict`] decides.
@@ -648,6 +692,7 @@ pub fn selftest() {
     let (login, login_ms, login_blocks) = login_cost(); // FILETYPES2 (B513): the boot's record, before this test builds
     let (wstate, won, build_ms, blocks, masked) = build_cost();
     let cost_ok = verdict(login, wstate, won, build_ms, masked);
+    let (records, commits) = build_shape(); // FILETYPES3 (B820): the owed build's shape, before this test builds
     build("tests");
     let types = known_types_in(&mt);
     let mut objects = 0usize;
@@ -715,8 +760,8 @@ pub fn selftest() {
     let bar_ms: Option<u64> = None;
     let bar = bar_ms.map_or(String::from("none"), |b| alloc::format!("{}", b));
     serial_println!(
-        ":: FILETYPES: types={} build_ms={} blocks={} masked_max_ms={} -> {} :: login={} worker={} on={} login_ms={} login_blocks={} bound_ms={} masked_bound_ms={} bar_ms={} preferred={} resolved={} registry={} objects={} source={} sticky={} amend={} openwith={} builds={}",
-        types.len(), build_ms, blocks, masked, word, login, wstate, won, login_ms, login_blocks, BUILD_MS_BOUND, MASKED_MS_BOUND, bar,
+        ":: FILETYPES: types={} build_ms={} blocks={} masked_max_ms={} -> {} :: login={} worker={} on={} login_ms={} login_blocks={} medium={} bound_ms={} masked_bound_ms={} masked_goal_ms={} masked_at=unafs-commit records={} commits={} bar_ms={} preferred={} resolved={} registry={} objects={} source={} sticky={} amend={} openwith={} builds={}",
+        types.len(), build_ms, blocks, masked, word, login, wstate, won, login_ms, login_blocks, medium_word(), BUILD_MS_BOUND, MASKED_MS_BOUND, MASKED_GOAL_MS, records, commits, bar,
         preferred, resolved, if attrs { TYPES_DIR } else { "none" }, objects, if attrs { "db" } else { "registrants" }, sticky, amend, openwith, builds()
     );
 }
@@ -917,6 +962,11 @@ pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
             let mm = done(masked_max.max(PER_TYPE_MASKED.swap(0, Ordering::Relaxed)));
             let ms = crate::arch::ms().saturating_sub(t0);
             note_cost(why, ms, d.blocks_read(), mm, true);
+            let commits = SEED_COMMITS.swap(0, Ordering::Relaxed);
+            if on_code(why) != 0 { // FILETYPES3 (B820): the owed build's records and commits, for the fixture
+                BUILD_RECORDS.store((n + f) as u64, Ordering::Relaxed);
+                BUILD_COMMITS.store(commits as u64, Ordering::Relaxed);
+            }
             crate::fs::bootstep::note_span("filetypes-build", t0, crate::arch::ms()); // SMALLFIX6 (B495): the full build's span, beside the boot steps
             serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} stamp={} blocks_read={} cmds={} ms={} io={} masked_max_ms={}", why, TYPES_DIR, n, f,
                 known_types_in(&mt).len(), st, d.blocks_read(), d.cmds(), ms, iow, mm);
@@ -926,7 +976,7 @@ pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
                 // registry — old or new, never a half-built directory.
                 let was = REG.swap(REG_LIVE, Ordering::AcqRel);
                 if was == REG_NONE {
-                    serial_println!("[filetypes] swap registry=live on={} build_ms={} blocks_read={} masked_max_ms={}", why, ms, d.blocks_read(), mm);
+                    serial_println!("[filetypes] swap registry=live on={} build_ms={} blocks_read={} records={} commits={} masked_max_ms={} medium={}", why, ms, d.blocks_read(), n + f, commits, mm, medium_word()); // FILETYPES3 (B820)
                 }
             }
             (n, false)
@@ -986,6 +1036,9 @@ static BUILD_ON: AtomicU8 = AtomicU8::new(0);
 static BUILD_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BUILD_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BUILD_MASKED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// FILETYPES3 (B820): the owed build's records (objects created + filled) and commits.
+static BUILD_RECORDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BUILD_COMMITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn on_code(why: &str) -> u8 {
     match why { "worker" => 1, "service" => 2, "login" => 3, _ => 0 }
@@ -1038,17 +1091,38 @@ pub fn build_cost() -> (&'static str, &'static str, u64, u64, u64) {
     (st, on, BUILD_MS.load(Ordering::Relaxed), BUILD_BLOCKS.load(Ordering::Relaxed), BUILD_MASKED.load(Ordering::Relaxed))
 }
 
-/// The arc's bounds: the owed build finishes under 20 s with no interrupts-off span over 50 ms.
-pub const BUILD_MS_BOUND: u64 = 20_000;
+/// The arc's bounds: the owed build finishes within 500 ms (FILETYPES3 B820, was FILETYPES2's 20 s; the medium is
+/// named on the fixture line) with no interrupts-off span over 50 ms.
+pub const BUILD_MS_BOUND: u64 = 500;
 pub const MASKED_MS_BOUND: u64 = 50;
+/// FILETYPES3 (B820): M2's goal, PRINTED and not judged: one UnaFS commit's card writes run inside the IRQ-masked MOUNT
+/// hold (fs/unafs.rs `with_unafs_attempt`), ~40 ms on the rMBP card, so no build shape in this file reaches it; the
+/// write path's split (UNAFSWRITE, storage.md §5) owns it.
+pub const MASKED_GOAL_MS: u64 = 20;
+
+/// FILETYPES3 (B820): the medium the bound mount rides (`sdhc`, `global`, `usb`, `ahci`), `none` when unbound.
+pub fn medium_word() -> String {
+    match crate::fs::unafs::mount_bound_handle() {
+        Some(h) => {
+            let w = alloc::format!("{:?}", h).to_lowercase();
+            String::from(w.split(|c: char| c == ' ' || c == '{').next().unwrap_or("none"))
+        }
+        None => String::from("none"),
+    }
+}
+
+/// FILETYPES3 (B820): the owed build's `(records, commits)`.
+pub fn build_shape() -> (u64, u64) {
+    (BUILD_RECORDS.load(Ordering::Relaxed), BUILD_COMMITS.load(Ordering::Relaxed))
+}
 
 /// FILETYPES2 (B513): PASS iff the login did no full build, and the owed build (when one was owed) finished off the
-/// login under [`BUILD_MS_BOUND`] with masked_max_ms ≤ [`MASKED_MS_BOUND`]. A stamp hit owes nothing and passes.
+/// login within [`BUILD_MS_BOUND`] with masked_max_ms ≤ [`MASKED_MS_BOUND`]. A stamp hit owes nothing and passes.
 pub fn verdict(login: &str, build: &str, on: &str, ms: u64, masked: u64) -> bool {
     login != "full"
         && match build {
             "none" => true,
-            "built" => on != "login" && ms < BUILD_MS_BOUND && masked <= MASKED_MS_BOUND,
+            "built" => on != "login" && ms <= BUILD_MS_BOUND && masked <= MASKED_MS_BOUND,
             _ => false,
         }
 }
