@@ -4166,6 +4166,10 @@ pub fn keys_probe() -> (usize, usize) {
 // `focus_ring` token, `DIMS.focus_ring` logical px device-scaled), and the column's pill does (`st.strip && st.kbd`).
 // The one stop that showed none was a Users row: Tab walks `u.sel` down the list and the row got only its wash.
 // [`row_ring`] is that ring, the kit's arithmetic on the wash's rect. [`ring_probe`] is `tests a11ytree`'s ring leg.
+// A11YTREE2 (rmbp-ledger B822), ONE rule: a stop exists iff the paint recorded its control (`cs`), so an absent control
+// declares none; its ring is read on the paint the glass would show (the column scrolled by `col_scrolled`, as `open`
+// and `switch_tab` scroll it — tabs 14 and 15 sit past `COL_VIS`); the thinnest ring is >= 2 logical px at the
+// panel's scale (`a11y::selftest`), and every miss prints `[a11y] ring missing tab= stop= row=`.
 
 /// The kit's focus ring outside a Users row's wash (row `r`): width `DIMS.focus_ring` at the panel's scale, the radius
 /// the wash's plus that width — what `draw::focus_ring` draws around a control.
@@ -4180,22 +4184,23 @@ fn row_ring(st: &mut State, r: usize) {
 /// (PICKERKEYS B768: the pane's stops, `hits[pane0..]`) — is painted OFFSCREEN holding the keyboard (`kbd`), and the
 /// same tab is painted at rest (focus on the column, no key pressed). The ring is read from the difference: in the
 /// first changed run of its top row, at the run's middle, the changed pixels downward that are the ring's colour (one
-/// anti-aliased pixel skipped at the top). Returns `(stops, rung, ring_px, first stop without a ring as (tab, stop))`,
-/// `ring_px` the thinnest ring seen, in device px. One reused pair of surfaces; a fresh `State` per paint, so no glide
-/// carries between paints.
+/// anti-aliased pixel skipped at the top). Returns `(stops, rung, ring_px, every stop without a ring as (tab, stop,
+/// row name))`, `ring_px` the thinnest ring seen, in device px. One reused pair of surfaces; a fresh `State` per paint,
+/// so no glide carries between paints. A11YTREE2 (B822): each paint's column is scrolled as the live window scrolls it
+/// (`col_scrolled`, `open`'s rule), so a tab past [`COL_VIS`] shows its pill and its ring as on the glass.
 #[cfg(feature = "witness")]
-pub fn ring_probe() -> (usize, usize, usize, Option<(usize, usize)>) {
+pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str)>) {
     let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
     let (mut a, mut b): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     if a.try_reserve_exact(pw * ph).is_err() || b.try_reserve_exact(pw * ph).is_err() {
-        return (0, 0, 0, Some((usize::MAX, 0)));
+        return (0, 0, 0, alloc::vec![(usize::MAX, 0, "-")]);
     }
     a.resize(pw * ph, 0);
     b.resize(pw * ph, 0);
     let v0 = CUR.lock().clone();
     // PICKERKEYS (B768): each paint also returns the pane's stops (the rest paint's count is the tab's)
-    let paint_one = |buf: Vec<u32>, tab: usize, stop: Option<usize>| -> (Vec<u32>, usize) {
-        let mut st = State::new(WIN_W, WIN_H, buf, 1, true, 0);
+    let paint_one = |buf: Vec<u32>, tab: usize, stop: Option<usize>| -> (Vec<u32>, usize, Option<[u16; 4]>) {
+        let mut st = State::new(WIN_W, WIN_H, buf, 1, true, col_scrolled(0, tab, TABS)); // A11YTREE2 (B822): the live column
         if let Some(k) = stop {
             st.kbd = true;
             if k > 0 {
@@ -4206,17 +4211,19 @@ pub fn ring_probe() -> (usize, usize, usize, Option<(usize, usize)>) {
         let mut v = v0.clone();
         v.tab = tab as u8;
         paint(&mut st, &v);
-        (core::mem::take(&mut st.surf), stops(&st).1)
+        let hit = stop.filter(|&k| k > 0).and_then(|k| st.hits.get(st.pane0.saturating_add(k - 1)).copied());
+        (core::mem::take(&mut st.surf), stops(&st).1, hit)
     };
     let ring = theme::focus_ring() & 0x00FF_FFFF;
     let near = |p: u32| (0..3).all(|k| ((p >> (8 * k)) & 0xFF).abs_diff((ring >> (8 * k)) & 0xFF) <= 3);
-    let (mut stops, mut rung, mut thin, mut fail) = (0usize, 0usize, usize::MAX, None);
+    let (mut stops, mut rung, mut thin, mut fail) = (0usize, 0usize, usize::MAX, Vec::new());
     for tab in 0..TABS {
-        let (bb, n_pane) = paint_one(b, tab, None);
+        let (bb, n_pane, _) = paint_one(b, tab, None);
         b = bb;
         let n = 1 + n_pane;
         for k in 0..n {
-            a = paint_one(a, tab, Some(k)).0;
+            let (aa, _, hit) = paint_one(a, tab, Some(k));
+            a = aa;
             stops += 1;
             let ch = |i: usize| (a[i] & 0x00FF_FFFF) != (b[i] & 0x00FF_FFFF);
             let px = match (0..pw * ph).find(|&i| ch(i)) {
@@ -4233,10 +4240,20 @@ pub fn ring_probe() -> (usize, usize, usize, Option<(usize, usize)>) {
                     run
                 }
             };
-            if px >= 2 { rung += 1; thin = thin.min(px); } else if fail.is_none() { fail = Some((tab, k)); }
+            if px >= 2 { rung += 1; thin = thin.min(px); } else { fail.push((tab, k, ring_row_name(tab, k, hit))); }
         }
     }
     (stops, rung, if thin == usize::MAX { 0 } else { thin }, fail)
+}
+
+/// A11YTREE2 (B822): the name of `ring_probe`'s stop `stop` on tab `tab` — `column` for stop 0 (the tab's pill), else
+/// the [`MAP`] row label whose row holds the stop's control's centre (`hit`, logical px), else `-`.
+#[cfg(feature = "witness")]
+fn ring_row_name(tab: usize, stop: usize, hit: Option<[u16; 4]>) -> &'static str {
+    if stop == 0 { return "column"; }
+    let Some(h) = hit else { return "-" };
+    let r = (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H;
+    MAP.iter().find(|m| m.tab == tab && m.row == r).map_or("-", |m| m.label)
 }
 
 // ── KEYMAPS (rmbp-ledger B704) — the Keyboard tab ─────────────────────────────────────────────────────────────────────
