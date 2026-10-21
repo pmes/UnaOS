@@ -708,6 +708,19 @@ fn bt_tone(hz: u32, ms: u32) -> Result<(u64, u32), &'static str> {
 }
 
 
+/// AVRCP (rmbp-ledger B774): the Bluetooth sink's master is the ONE master (BP-audio-14: `video::status::volume`, the
+/// F-row level 0..=16). A headset's absolute volume (0..=127, `drivers/bt/avctp.rs`) is mapped onto it: `Some(abs)` sets
+/// the level `avctp::level_of` names (mute untouched), `None` only reads. Returns the absolute volume in force,
+/// `avctp::abs_of` of the level (one mapping, avctp's; every level round-trips).
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
+pub fn bt_master(set: Option<u8>) -> u8 {
+    if let Some(abs) = set {
+        let (_, muted) = crate::video::status::volume();
+        crate::video::status::set_volume(crate::drivers::ehci::bthid::avctp::level_of(abs), muted);
+    }
+    crate::drivers::ehci::bthid::avctp::abs_of(crate::video::status::volume().0)
+}
+
 // ── SOFTYMIC (rmbp-ledger B749, BP-video-24, BP-audio-12) — TAIL-APPENDED: who holds the microphone ──────────────────────
 // The in-use light paints from the driver's fact (`uac::capture_armed`, BP-audio-10); the NAME beside it (the light's
 // wire, Settings > Privacy's `in use by <app>`) comes from here: the live kernel `Source`s ([`KSRC`], raised in `open`,

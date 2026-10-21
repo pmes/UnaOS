@@ -1252,7 +1252,7 @@ impl Bt {
             match psm {
                 PSM_SDP => { #[cfg(feature = "a2dp")] if !self.links[li].chans[ci].ours { return self.sdp_serve(li, ci, body); } self.on_sdp(li, body, now) } // SDPSERVER (B769): a channel the peer opened carries requests to the SDP server (LINE-NEUTRAL fold, code first)
                 PSM_HID_INTR => self.on_hid_intr(li, body),
-                #[cfg(feature = "a2dp")] l2cap::PSM_AVDTP => self.a2dp_rx(li, ci, body, now),
+                #[cfg(feature = "a2dp")] l2cap::PSM_AVDTP => self.a2dp_rx(li, ci, body, now), #[cfg(feature = "a2dp")] l2cap::PSM_AVCTP => self.avrcp_rx(li, ci, body),
                 PSM_HID_CTRL => {
                     if let Some(&b) = body.first() {
                         if b >> 4 == 0x0 && b & 0x0F != 0 {
@@ -2858,13 +2858,16 @@ pub fn btkeyseal_selftest() {
 // Children of `bthid` (declared here, at the TAIL) so they drive its `Bt` state under the same lock and per-pass step:
 // `l2cap` (what A2DP added to the channels above: AVDTP's PSM, two channels on it, the one-ACL-packet bound), `sdp`
 // (the AudioSink query and its record), `avdtp` (signalling, the SBC media transport, the sink the audio seam writes;
-// it includes `unaos/libs/media/sbc_core/src/sbc.rs` by path). `tests a2dp` is registered in `tests.rs`.
+// it includes `unaos/libs/media/sbc_core/src/sbc.rs` by path), `avctp` (AVCTP on PSM 0x0017 and the AVRCP target, AVRCP
+// B774). `tests a2dp` is registered in `tests.rs`.
 #[cfg(feature = "a2dp")] #[path = "../bt/l2cap.rs"]
 pub mod l2cap;
 #[cfg(feature = "a2dp")] #[path = "../bt/sdp.rs"]
 pub mod sdp;
 #[cfg(feature = "a2dp")] #[path = "../bt/avdtp.rs"]
 pub mod avdtp;
+#[cfg(feature = "a2dp")] #[path = "../bt/avctp.rs"]
+pub mod avctp;
 
 /// A2DP fragmentation (crawl D 6, `l2cap::l2_send_frag`'s other half): the head of the ACL queue was dropped or lost, so
 /// every queued entry right after it that CONTINUES that PDU (`l2cap::CONT` in its handle word) is dropped too — sent

@@ -18,7 +18,7 @@
 //! THE SERVER (SDPSERVER, rmbp-ledger B769): a device that asks about US (a headset reconnecting on power-on looks for
 //! the source before it opens AVDTP) is answered on the SDP channel it opened ([`Bt::sdp_serve`], [`serve`]):
 //! ServiceSearch, ServiceAttribute and ServiceSearchAttribute over the records this host offers ([`records`]: A2DP
-//! Source 0x110A, an AVRCP Target 0x110C stub, PnP Information 0x1200). The server holds NO state: the records are built
+//! Source 0x110A, the AVRCP Target 0x110C served by `avctp` (AVRCP B774), PnP Information 0x1200). The server holds NO state: the records are built
 //! per request and the continuation state is two bytes, the offset into the (deterministic) full answer, so a long
 //! answer is cut at min(MaximumAttributeByteCount, peer MTU) and resumed where the peer says. The same [`element`] walk
 //! reads the request's search pattern and attribute ID list. Wire: `[sdp] server req=<search|attr|search-attr|error>
@@ -178,8 +178,9 @@ pub struct Rec {
     attrs: Vec<(u16, Vec<u8>)>,
 }
 
-/// The records this host offers: A2DP Source (AVDTP on PSM 0x0019, AVDTP 1.3, A2DP 1.3, player), an AVRCP Target stub
-/// (AVCTP's PSM 0x0017 is not served yet: the record lets a headset see the target role), PnP Information.
+/// The records this host offers: A2DP Source (AVDTP on PSM 0x0019, AVDTP 1.3, A2DP 1.3, player), the AVRCP Target (AVCTP
+/// on PSM 0x0017, served by [`super::avctp`], AVRCP B774: category 1 player + category 2 amplifier, the volume keys),
+/// PnP Information.
 pub fn records() -> [Rec; 3] {
     let browse = seq(&[&uuid16(UUID_BROWSE_ROOT)]);
     let source = Rec {
@@ -201,7 +202,7 @@ pub fn records() -> [Rec; 3] {
             (0x0004, seq(&[&seq(&[&uuid16(UUID_L2CAP), &uint16(UUID_AVCTP)]), &seq(&[&uuid16(UUID_AVCTP), &uint16(0x0104)])])),
             (0x0005, browse.clone()),
             (0x0009, seq(&[&seq(&[&uuid16(UUID_AVRCP), &uint16(0x0106)])])),
-            (0x0311, uint16(0x0001).to_vec()), // SupportedFeatures: category 1
+            (0x0311, uint16(0x0003).to_vec()), // SupportedFeatures: category 1 (player) + category 2 (amplifier: volume up/down)
         ],
     };
     let pnp = Rec {
