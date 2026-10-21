@@ -31322,8 +31322,8 @@ pub fn gesture_swipe(dir: i8) -> Option<WinId> {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub use scrollview::{scroll_blit, scroll_by, scroll_clear, scroll_clear_owner, scroll_drop, scroll_press, scroll_service, scroll_set, scroll_view, scroll_wheel, scroll_wheel_ev, scrollbar_paint, ScrollFn, ScrollStep, ScrollView, SCROLL_HIDE_MS, WHEEL_LINES};
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
-pub use scrollview::scroll_set_ring3; // RING3SCROLL (B778): the bus arm's door (x86 `busx_scroll_set`)
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware", feature = "aarch64_el0")))]
+pub use scrollview::scroll_set_ring3; // RING3SCROLL (B778): the bus arm's door (x86 `busx_scroll_set`; aarch64 `bus_scroll_set`, SCROLLARM64 SR172)
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 mod scrollview {
@@ -31747,7 +31747,7 @@ mod scrollview {
     }
 
     // RING3SCROLL (rmbp-ledger B778; BP-video-38, BP-ring3-4) — the RING-3 OWNER. A program registers its window over the
-    // bus (`BUS_VERB_SCROLL_SET`, x86 `busx_scroll_set`) and gets the same model, wheel and bar as a kernel window; its
+    // bus (`BUS_VERB_SCROLL_SET`, x86 `busx_scroll_set`, aarch64 `bus_scroll_set`) and gets the same model, wheel and bar as a kernel window; its
     // ScrollFn is [`ring3_scrolled`]: the content pixels are the program's, so instead of a blit the step's NEW offset is
     // handed to the program as one `INPUT_EV_SCROLL` (it repaints its viewport at it), and the bar is painted into the
     // program's gutter by [`ring3_bar`] under `TABLE` — the compositor's own fence on a slot's surface pages.
@@ -31755,7 +31755,7 @@ mod scrollview {
 
     /// The bus arm's door: register `win` (a ring-3 row) with the ring-3 owner's ScrollFn, and paint its gutter now (the
     /// registration comes from the program's paint, the moment a kernel owner paints its bar). `true` = a model is held.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
     pub fn scroll_set_ring3(win: WinId, view: ScrollView, gutter_w: usize, ground: u32) -> bool {
         let live = scroll_set(win, 0, view, gutter_w, ground, ring3_scrolled);
         if live {
@@ -31766,10 +31766,10 @@ mod scrollview {
 
     /// The ring-3 owner's [`ScrollFn`]: a move hands the program its new offset (ONE `INPUT_EV_SCROLL`); every step
     /// repaints the gutter and presents the viewport rows. Returns the gutter pixels painted.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
     fn ring3_scrolled(win: WinId, st: &ScrollStep) -> usize {
         let Some(owner) = reg(win, 0).map(|r| r.owner) else { return 0 };
-        let delivered = st.moved != 0 && crate::arch::x86_64::syscall::scroll_deliver(owner, win, st.off);
+        let delivered = st.moved != 0 && crate::arch::syscall::scroll_deliver(owner, win, st.off);
         let px = ring3_bar(win);
         let (_, vy, _, vh) = st.viewport;
         let _ = super::present_rows_outcome_owned(win, vy, vy + vh, owner);
@@ -31782,7 +31782,7 @@ mod scrollview {
     /// Paint `win`'s bar into the ring-3 surface: the model and the drag flag are snapshotted FIRST (their locks taken
     /// and released), then under `TABLE` the row — still `win`, still the registering owner — names the surface, and the
     /// lock-free [`bar_paint`] writes the gutter. Returns the gutter pixels (0 = no model, no row, or a recycled id).
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
     fn ring3_bar(win: WinId) -> usize {
         let Some(r) = reg(win, 0) else { return 0 };
         let dragged = SCROLL_DRAG.lock().is_some_and(|(w, p, _)| w == win && p == 0);

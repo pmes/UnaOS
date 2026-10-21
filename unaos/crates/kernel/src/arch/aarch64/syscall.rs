@@ -23109,7 +23109,7 @@ fn sys_msend_for(asid: u64, agen: u64, ppid: PrincipalRecord, frame: &[u8]) -> i
             },
             Err(_) => return EINVAL,
         },
-        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "desktop_firmware")] { crate::video::dialog::bus_fulfil(hdr.verb, asid as u64, body) } #[cfg(not(feature = "desktop_firmware"))] { EINVAL } } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(ppid), asid as u64, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal_of(&ppid), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "desktop_firmware", feature = "quarry"))] { crate::video::dnd::bus_drop_get(asid as u64, body, &mut text) } #[cfg(not(all(feature = "desktop_firmware", feature = "quarry")))] { EINVAL } } una_abi::BUS_VERB_PREF_CHANGED => crate::prefs_client::subscribe_owner(asid as usize, agen, body), // PREFCHANGED (B558): verb 19 as a REQUEST registers a key prefix for this ASID (prefs_client.rs tail); LINE-NEUTRAL append. ATTRSURF (B299): the attribute verbs under the STAMPED principal. PREFS (B300): Principia's verbs over the one store. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid
+        crate::bus::BUS_VERB_NOTICE => { #[cfg(feature = "login")] crate::fs::users::screen_notice_from(asid as u64, body); 0 } una_abi::BUS_VERB_DIALOG..=una_abi::BUS_VERB_TOAST => { #[cfg(feature = "desktop_firmware")] { crate::video::dialog::bus_fulfil(hdr.verb, asid as u64, body) } #[cfg(not(feature = "desktop_firmware"))] { EINVAL } } #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_PUBLISH => crate::video::appmenu::verb_publish(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_CLEAR => crate::video::appmenu::verb_clear(asid as usize, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_MENU_GET => crate::video::appmenu::verb_get(asid as usize, body, &mut text), una_abi::BUS_VERB_PREF_GET | una_abi::BUS_VERB_PREF_SET | una_abi::BUS_VERB_PREF_LIST | una_abi::BUS_VERB_PREF_DECLARE => crate::prefs::bus_fulfil_from(hdr.verb, body, pref_caller_in_session(ppid), asid as u64, &mut text), una_abi::BUS_VERB_ATTR_SET..=una_abi::BUS_VERB_ATTR_STAT => crate::fs::attrsys::bus_fulfil(hdr.verb, body, &attrsurf_principal_of(&ppid), &mut text), una_abi::BUS_VERB_DROP_GET => { #[cfg(all(feature = "desktop_firmware", feature = "quarry"))] { crate::video::dnd::bus_drop_get(asid as u64, body, &mut text) } #[cfg(not(all(feature = "desktop_firmware", feature = "quarry")))] { EINVAL } } una_abi::BUS_VERB_PREF_CHANGED => crate::prefs_client::subscribe_owner(asid as usize, agen, body), #[cfg(feature = "desktop_firmware")] una_abi::BUS_VERB_SCROLL_SET => bus_scroll_set(asid, body, &mut text), // PREFCHANGED (B558): verb 19 as a REQUEST registers a key prefix for this ASID (prefs_client.rs tail); LINE-NEUTRAL append. ATTRSURF (B299): the attribute verbs under the STAMPED principal. PREFS (B300): Principia's verbs over the one store. ARMROUTER — APPMENU (R73) verb arms, the x86 `busx` trio over the same `appmenu` registry (owner = asid). NOTICE: aarch64 wm owner IS the asid SCROLLARM64 (SR172): verb 28, the caller's window on wm's one scroll model (`bus_scroll_set`, file tail; x86 `busx_scroll_set`'s body); LINE-NEUTRAL fold, code before this line's first `//`.
         _ => return EINVAL, // unreachable (frame_parse validated the verb) — fail closed
     };
     bus_reply_enqueue(asid, hdr.corr, hdr.verb, status, &text)
@@ -27589,4 +27589,131 @@ pub fn spawn_user_image_bg_argv_new(bytes: &[u8], argv: &[&str]) -> Result<(u64,
     let r = spawn_user_image_bg_piped(bytes, argv, None, false);
     ONEINST_NEW.store(false, Ordering::Release);
     r
+}
+
+// SCROLLARM64 (LEDGER SR172; BP-ring3-4, BP-video-38, BP-input-10) — TAIL-APPENDED, so no line above moves. The aarch64
+// twin of RING3SCROLL's x86 arm (rmbp-ledger B778), under `desktop_firmware` (knob off, every statement is cfg-erased).
+// `BUS_VERB_SCROLL_SET` (28) resolves the body's window id under `WINDOWS` (IRQ-masked, held for the read only: a free or
+// out-of-table id -EBADF, another ASID's -EPERM, a malformed body -EINVAL) and hands the model to `wm::scroll_set_ring3`
+// with `WINDOWS` released, so the global order WINDOWS ⊃ wm::TABLE is never entered from the arm. The step comes back
+// through `scroll_deliver` (wm's `ring3_scrolled` calls it as `crate::arch::syscall::scroll_deliver`): the wm id resolved
+// to the program's own id under `WINDOWS`, then ONE `INPUT_EV_SCROLL` pushed by identity (`user_input_push_owner`; on this
+// arch the wm owner IS the ASID). Single producer: a MOVING step for a ring-3 row comes only from `wm::scroll_wheel`,
+// asked inside `user_input_enqueue`'s door chain (`quarry::key_route`), the ring's one producer.
+
+/// The SCROLL_SET arm: the caller's window `body.win` registered (or updated, or dropped) on wm's model.
+#[cfg(feature = "desktop_firmware")]
+fn bus_scroll_set(asid: u64, body: &[u8], text: &mut alloc::vec::Vec<u8>) -> i64 {
+    let Some(s) = una_abi::scroll_set_body_parse(body) else { return EINVAL };
+    let wm_id = {
+        let _irq = IrqGuard::mask_save();
+        let t = WINDOWS.lock();
+        match t.get(s.win as usize) {
+            Some(e) if e.owner == 0 => return EBADF,
+            Some(e) if e.owner != asid => return una_abi::EPERM,
+            Some(e) => e.wm_id,
+            None => return EBADF,
+        }
+    };
+    let (vx, vy, vw, vh) = s.viewport;
+    let view = crate::video::wm::ScrollView { offset: s.offset as usize, extent: s.extent as usize, viewport: (vx as usize, vy as usize, vw as usize, vh as usize), line: s.line as usize };
+    let live = crate::video::wm::scroll_set_ring3(wm_id, view, s.gutter as usize, s.ground);
+    text.push(if live { una_abi::SCROLL_SET_LIVE } else { una_abi::SCROLL_SET_NONE });
+    0
+}
+
+/// Hand `owner`'s window `wm_id` its new offset: ONE `INPUT_EV_SCROLL` carrying the program's own window id and `off`.
+/// `false` = no live row of `owner`'s binds that wm id, or the ring was full (drop-newest, BP-input-7).
+#[cfg(feature = "desktop_firmware")]
+pub fn scroll_deliver(owner: u64, wm_id: crate::video::wm::WinId, off: usize) -> bool {
+    if owner == 0 || wm_id == crate::video::wm::WIN_NONE {
+        return false;
+    }
+    let id = {
+        let _irq = IrqGuard::mask_save();
+        let t = WINDOWS.lock();
+        t.iter().position(|e| e.owner != 0 && e.owner == owner && e.wm_id == wm_id)
+    };
+    let Some(id) = id else { return false };
+    let off = off.min(u32::MAX as usize) as u32;
+    user_input_push_owner(owner, una_abi::input_ev_pack(una_abi::INPUT_EV_SCROLL, una_abi::input_ev_scroll_payload(id as u32, off)))
+}
+
+/// `tests scrollview`'s ring-3 leg on this arch, x86's `scroll_ring3_probe` on this arch's idioms: a Lumen-shaped window
+/// (a 288 x 288 surface, the transcript viewport left of a 6-px gutter, a 10-px line) owned by a scratch ASID
+/// (APPMENUARM's rule: the first unstamped ASID in 7..=SLOT_ID_MAX) and bound in `WINDOWS` like a `SYS_WIN_CREATE` row,
+/// registered through the REAL arm (`sys_msend_for`, the reply popped from the ASID's mailbox); one wheel-sized step
+/// (`WHEEL_LINES` lines up) from one line down clamps to 0; the ring must gain exactly ONE `INPUT_EV_SCROLL` naming the
+/// bound id and offset 0 (read APPMENUARM's way, by the TAIL delta), and the gutter must carry the thumb's ink. Torn down.
+#[cfg(all(feature = "witness", feature = "desktop_firmware"))]
+pub fn scroll_ring3_probe() -> Result<usize, &'static str> {
+    use crate::video::wm;
+    const W: usize = 288;
+    const LINE: usize = 10;
+    const GUTTER: usize = 6;
+    let free = |a: u64| *SLOT_PPID[a as usize].lock() == PrincipalRecord::NONE;
+    let Some(asid) = (7..=crate::procslot::SLOT_ID_MAX as u64).find(|&a| free(a)) else { return Err("no-asid") };
+    let a = asid as usize;
+    let mut buf: alloc::vec::Vec<u32> = alloc::vec![0; W * W];
+    let win = wm::create(asid, buf.as_mut_ptr() as usize, buf.len() * 4, W as u32, W as u32, (W * 4) as u32, b"ring3scroll");
+    if win == wm::WIN_NONE {
+        return Err("no-wm-row");
+    }
+    let id = {
+        let _irq = IrqGuard::mask_save();
+        let mut t = WINDOWS.lock();
+        let i = match t.iter().position(|e| e.owner == 0) {
+            Some(i) => Some(i),
+            None => win_table_grow(&mut t),
+        };
+        if let Some(i) = i {
+            t[i] = WinEntry { owner: asid, rslot: 0, pages: 0, w: W as u16, h: W as u16, x: 0, y: 0, wm_id: win };
+        }
+        i
+    };
+    let Some(id) = id else {
+        wm::close(win);
+        return Err("no-windows-row");
+    };
+    bus_sem_init_once();
+    let agen = ASID_GEN[a].load(Ordering::Acquire);
+    bus_mbox_clear(asid);
+    clear_input_row(asid);
+    let s = una_abi::ScrollSet { win: id as u32, offset: LINE as u32, extent: 400 * LINE as u32, viewport: (0, 3, (W - GUTTER) as u16, 260), line: LINE as u16, gutter: GUTTER as u16, ground: crate::video::theme::surface_content() };
+    let frame = una_abi::scroll_set_frame(&s, 0x5343_0000 | id as u32);
+    let rc = sys_msend_for(asid, agen, PrincipalRecord::program(b"prog:SCROLLARM"), &frame);
+    let reply = bus_mbox_pop(asid).and_then(|m| crate::bus::frame_parse(&m.frame).ok().map(|h| (h.status as i64, m.frame[crate::bus::BUS_HDR_LEN..].to_vec())));
+    let live = rc == 0 && reply.as_ref().is_some_and(|(st, b)| una_abi::scroll_set_reply(*st, b) == Ok(true));
+    let mut verdict: Result<usize, &'static str> = if live { Ok(0) } else { Err("not-registered") };
+    if live {
+        let before = USER_INPUT_TAIL[a].load(Ordering::Acquire);
+        let st = wm::scroll_by(win, 0, -((wm::WHEEL_LINES * LINE) as isize));
+        let n = USER_INPUT_TAIL[a].load(Ordering::Acquire).wrapping_sub(before) as usize;
+        let ev = if n == 1 { una_abi::input_ev_scroll(USER_INPUT_BUF[a][(before as usize) & (INPUT_RING_CAP - 1)].load(Ordering::Acquire)) } else { None };
+        let thumb_ink = wm::scroll_view(win, 0).and_then(|v| v.thumb(v.viewport.3).map(|(ty, th)| (v.viewport, ty, th))).is_some_and(|((vx, vy, vw, _), ty, th)| {
+            let bw = crate::video::draw::scrollbar_w().min(GUTTER);
+            let cx = vx + vw + GUTTER - bw + 1 + (bw.saturating_sub(2)) / 2;
+            buf[(vy + ty + th / 2) * W + cx] & 0x00FF_FFFF == crate::video::theme::line_strong() & 0x00FF_FFFF
+        });
+        verdict = match (st, ev) {
+            (Some(st), Some((w, 0))) if st.off == 0 && w == id as u32 && thumb_ink => Ok(n),
+            (None, _) => Err("no-step"),
+            (_, None) => Err("events"),
+            (_, Some((w, _))) if w != id as u32 => Err("window-id"),
+            (_, Some(_)) if !thumb_ink => Err("bar"),
+            _ => Err("offset"),
+        };
+    }
+    {
+        let _irq = IrqGuard::mask_save();
+        let mut t = WINDOWS.lock();
+        if t.get(id).is_some_and(|e| e.owner == asid && e.wm_id == win) {
+            t[id] = WinEntry::FREE;
+        }
+    }
+    wm::close(win);
+    clear_input_row(asid);
+    bus_mbox_clear(asid);
+    drop(buf);
+    verdict
 }
