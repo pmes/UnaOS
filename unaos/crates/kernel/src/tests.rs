@@ -4293,9 +4293,9 @@ fn a2dp_selftest() {
 ///  2. again with `new=1` (`spawn_user_image_bg_argv_new`, the dock's Shift-click / `New Window`): a second slot.
 ///  3. ONEINSTANCE2 (rmbp-ledger B751): Quarry's program opener on the running program (`openers::program_running`):
 ///     raised, the file delivered as OPEN_ARG to the same owner (rc 0), nothing launched (`quarry=`); and the mailbox's
-///     OPEN_ARG hold across a call in flight over a local mailbox (`syscall::oneinstance_pending_selftest`, `pending=`).
+///     OPEN_ARG hold across a call in flight over a local mailbox (`syscall::oneinstance_pending_selftest`, `pending=`); QUARRYLAUNCH (B754): Quarry's double-click body on the running program is raised too (`quarry_launch=`, file tail).
 /// Every slot it made is killed and reaped. SKIP with no panel, no windowed program, or that program already running.
-/// `:: ONEINSTANCE: slots=1 raised=1 arg=ok new_flag=2 quarry=ok pending=ok -> PASS ::`
+/// `:: ONEINSTANCE: slots=1 raised=1 arg=ok new_flag=2 quarry=ok pending=ok quarry_launch=ok -> PASS ::`
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
 fn oneinstance_selftest() {
     use crate::arch::syscall as sc;
@@ -4303,7 +4303,7 @@ fn oneinstance_selftest() {
     use crate::video::wm;
     const WAIT_MS: u64 = 5_000;
     const ARG: &str = "/home/oneinstance-arg.txt";
-    let skip = |why: &str| serial_println!(":: ONEINSTANCE: slots=- raised=- arg=- new_flag=- quarry=- pending=- -> SKIP reason={} ::", why);
+    let skip = |why: &str| serial_println!(":: ONEINSTANCE: slots=- raised=- arg=- new_flag=- quarry=- pending=- quarry_launch=- -> SKIP reason={} ::", why);
     if !crate::video::WRITER.lock().is_ready() {
         return skip("no-panel");
     }
@@ -4373,7 +4373,7 @@ fn oneinstance_selftest() {
     };
     #[cfg(not(feature = "quarry"))]
     let quarry = "skip";
-    let pending = if sc::oneinstance_pending_selftest() { "ok" } else { "FAIL" };
+    let quarry_launch = oneinstance_quarry_launch_leg(&path, owner1); let pending = if sc::oneinstance_pending_selftest() { "ok" } else { "FAIL" }; // QUARRYLAUNCH (B754): Quarry's double-click on the running program (file tail); LINE-NEUTRAL fold
     // 2 — new=1: another copy.
     let new_flag = match launch(&[path.as_str()], true) {
         Ok((p, s, _)) => {
@@ -4387,11 +4387,11 @@ fn oneinstance_selftest() {
         let _ = sc::bg_poll(p, true);
         wm::app_name_forget(wm::owner_of_launch(s));
     }
-    let ok = up && raised && slots == 1 && focus_ok && arg_ok && new_flag == 2 && quarry != "FAIL" && pending == "ok";
+    let ok = up && raised && slots == 1 && focus_ok && arg_ok && new_flag == 2 && quarry != "FAIL" && pending == "ok" && quarry_launch != "FAIL";
     let arg = if arg_ok { alloc::string::String::from("ok") } else { format!("rc{}", rc) };
     serial_println!(
-        ":: ONEINSTANCE: slots={} raised={} arg={} new_flag={} quarry={} pending={} -> {} ::",
-        slots, raised as u8, arg, new_flag, quarry, pending, if ok { "PASS" } else { "FAIL" }
+        ":: ONEINSTANCE: slots={} raised={} arg={} new_flag={} quarry={} pending={} quarry_launch={} -> {} ::",
+        slots, raised as u8, arg, new_flag, quarry, pending, quarry_launch, if ok { "PASS" } else { "FAIL" }
     );
     if !ok {
         serial_println!(
@@ -4859,4 +4859,28 @@ fn lockdeleted_leg() -> (bool, &'static str) {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn hwtab2_leg() -> (alloc::string::String, alloc::string::String) {
     crate::video::settings::hwtab2_probe()
+}
+
+// QUARRYLAUNCH (rmbp-ledger B754; BP-ring3-18) — TAIL-APPENDED, so no line above moves. `tests oneinstance`'s
+// `quarry_launch=` leg, folded onto its lines: Quarry's double-click body (`quarry::live::launch`, through the witness
+// wrapper `launch_probe`) on the program the fixture already runs. With the gate armed the launch spawns with argv
+// `[path]`, so the reply is `ONEINSTANCE_RAISED` and the last raise names the running owner with rc 0 (no argument).
+// `ok`, `FAIL` (a second copy started, or another refusal; the reply is printed), `skip` on a build without `quarry`.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+fn oneinstance_quarry_launch_leg(path: &str, owner1: u64) -> &'static str {
+    #[cfg(feature = "quarry")]
+    {
+        let reply = crate::video::quarry::live::launch_probe(path);
+        let (owner, _, rc) = crate::arch::syscall::oneinstance_last();
+        if reply == crate::arch::syscall::ONEINSTANCE_RAISED && owner == owner1 && rc == 0 {
+            return "ok";
+        }
+        serial_println!("[app] oneinstance quarry_launch reply={} raised_owner={} rc={}", reply, owner, rc);
+        "FAIL"
+    }
+    #[cfg(not(feature = "quarry"))]
+    {
+        let _ = (path, owner1);
+        "skip"
+    }
 }

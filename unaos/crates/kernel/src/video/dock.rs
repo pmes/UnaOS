@@ -4891,7 +4891,7 @@ fn dp_path_launch(pin: Option<usize>, path: &str, on: &str) -> Result<(u64, u64)
 
 /// aarch64: never reached ([`dp_is_direct`] is false there); the verb seam is that desktop's launch.
 #[cfg(not(target_arch = "x86_64"))]
-fn dp_path_launch(_pin: Option<usize>, _path: &str, _on: &str) -> Result<(u64, u64), &'static str> { Err("no-direct-spawn") }
+fn dp_path_launch(_pin: Option<usize>, _path: &str, _on: &str) -> Result<(u64, u64), &'static str> { #[cfg(feature = "aarch64_el0")] if let Some(i) = _pin.filter(|&i| DP_DIRECT_NEW.load(Ordering::Acquire) & (1 << i) != 0) { return dp_new_launch(i, _path, _on); } Err("no-direct-spawn") } // QUARRYLAUNCH (B754): a pin posted `new=1` (Shift-click, `New Window`) launches directly (file tail); every other aarch64 pin stays on the verb seam; LINE-NEUTRAL fold
 
 /// Register `tests dockpins` once (from the service pass, DOCKGONE's shape).
 fn dockpins_register() {
@@ -5172,7 +5172,7 @@ fn dp_direct_of_owner(o: u64) -> Option<usize> {
     if o == 0 || (o >= DP_PIN_OWNER && o < DP_PIN_OWNER + DP_PINS.len() as u64) {
         return None;
     }
-    if let Some(i) = dp_spec_of_owner(o).filter(|&i| dp_is_direct(i)) {
+    if let Some(i) = dp_spec_of_owner(o).filter(|&i| dp_new_capable(i)) { // QUARRYLAUNCH (B754): `dp_new_capable` (file tail) — x86's `dp_is_direct`, plus aarch64's path pins
         return Some(i);
     }
     let mut b = [0u8; wm::MAX_TITLE];
@@ -5180,7 +5180,7 @@ fn dp_direct_of_owner(o: u64) -> Option<usize> {
     if n == 0 {
         return None;
     }
-    (0..DP_PINS.len()).find(|&i| dp_available(i) && dp_is_direct(i) && DP_PINS[i].name.as_bytes().eq_ignore_ascii_case(&b[..n]))
+    (0..DP_PINS.len()).find(|&i| dp_available(i) && dp_new_capable(i) && DP_PINS[i].name.as_bytes().eq_ignore_ascii_case(&b[..n]))
 }
 
 /// POST path pin `i`'s launch as `new=1`.
@@ -5191,22 +5191,22 @@ fn dp_new_post(i: usize) -> &'static str {
 }
 
 /// The direct launch's spawn: `new=1` when pin `pin`'s bit is set (taken), else the ordinary launch.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "aarch64_el0")))] // QUARRYLAUNCH (B754): aarch64's `new=1` launch (`dp_new_launch`, file tail) spawns here too
 fn dp_spawn(pin: Option<usize>, bytes: &[u8], path: &str) -> Result<(u64, u64, u64), &'static str> {
-    #[cfg(feature = "wc")]
+    #[cfg(any(feature = "wc", target_arch = "aarch64"))]
     if let Some(i) = pin {
         if DP_DIRECT_NEW.fetch_and(!(1u32 << i), Ordering::AcqRel) & (1 << i) != 0 {
             return crate::arch::syscall::spawn_user_image_bg_argv_new(bytes, &[path]);
         }
     }
-    #[cfg(not(feature = "wc"))]
+    #[cfg(not(any(feature = "wc", target_arch = "aarch64")))]
     let _ = pin;
     crate::arch::syscall::spawn_user_image_bg_argv(bytes, &[path])
 }
 
 /// Shift held on a running program's tile: `new=1` (the press is consumed; nothing is raised).
 fn shift_new_press(r: &wm::DockEntry, x: i32, y: i32, t: usize, n: usize) -> bool {
-    if !cfg!(feature = "wc") || !row_running(r) || !crate::video::keymap::shift_held() {
+    if !cfg!(any(feature = "wc", all(target_arch = "aarch64", feature = "aarch64_el0"))) || !row_running(r) || !crate::video::keymap::shift_held() { // QUARRYLAUNCH (B754): aarch64 with the EL0 layer too
         return false;
     }
     let Some(i) = dp_direct_of_owner(r.owner_asid) else { return false };
@@ -5218,7 +5218,7 @@ fn shift_new_press(r: &wm::DockEntry, x: i32, y: i32, t: usize, n: usize) -> boo
 
 /// The tile menu's `New Window` row: 1 for a running path-pin program, else 0.
 fn menu_new_rows(owner: u64) -> usize {
-    if cfg!(feature = "wc") && owner != TRASH_OWNER && dp_direct_of_owner(owner).is_some() { 1 } else { 0 }
+    if cfg!(any(feature = "wc", all(target_arch = "aarch64", feature = "aarch64_el0"))) && owner != TRASH_OWNER && dp_direct_of_owner(owner).is_some() { 1 } else { 0 } // QUARRYLAUNCH (B754): aarch64 with the EL0 layer too
 }
 
 /// `New Window` pressed: `new=1`.
@@ -5239,4 +5239,56 @@ fn menu_new_window(owner: u64) {
 pub(crate) fn dnd_trashed() {
     TRASH_POLLED.store(0, Ordering::Relaxed);
     PASS_OWED.store(true, Ordering::Release);
+}
+
+// QUARRYLAUNCH (rmbp-ledger B754; BP-ring3-18) — TAIL-APPENDED, so no line above moves. `new=1` on aarch64. The aarch64
+// dock launches its pins through the verb seam (`dp_is_direct` is x86's), so ONEINSTANCE's Shift-click and `New Window`
+// had no launch to post there. With the EL0 layer a Ring3Program PATH pin is now new-capable (the Shift-click and the
+// menu row exist), and its `new=1` post reaches [`dp_new_launch`] from the aarch64 `dp_path_launch` line: the shell's
+// path-launch checks, then `dp_spawn` (which takes the `DP_DIRECT_NEW` bit and calls the arch's
+// `spawn_user_image_bg_argv_new`) under the glass's origin, then the name arm. The pin's ordinary launch is unchanged.
+// Wire: `[dock] direct app=<a> path=<p> bytes=<n> pid=<p> slot=<s> on=<on> new=1 -> started` (or `-> refused=<why>`),
+// after the kernel's `[app] launch path=<p> instance=new arg=0 new=1`.
+
+/// Can path pin `i` take a `new=1` launch? x86: exactly the direct pins. aarch64 with the EL0 layer: a Ring3Program pin
+/// whose verb is a program path (the direct shape, launched directly only for `new=1`).
+fn dp_new_capable(i: usize) -> bool {
+    dp_is_direct(i) || (cfg!(all(target_arch = "aarch64", feature = "aarch64_el0")) && i < DP_PINS.len() && DP_PINS[i].kind == DpKind::Ring3Program && DP_PINS[i].verb.starts_with('/'))
+}
+
+/// aarch64's `new=1` launch of path pin `i` (see the block above). `Ok((pid, slot))` once the copy is running and named.
+#[cfg(all(target_arch = "aarch64", feature = "aarch64_el0"))]
+fn dp_new_launch(i: usize, path: &str, on: &str) -> Result<(u64, u64), &'static str> {
+    use crate::fs::vfs::NodeKind;
+    let name = DP_PINS[i].name;
+    let refuse = |why: &'static str| -> Result<(u64, u64), &'static str> {
+        DP_DIRECT_NEW.fetch_and(!(1u32 << i), Ordering::AcqRel);
+        serial_println!("[dock] direct app={} path={} on={} new=1 -> refused={}", name, path, on, why);
+        Err(why)
+    };
+    let mt = crate::shell::vfs_mount_table();
+    let st = match mt.stat(path) { Ok(s) => s, Err(_) => return refuse("stat") };
+    if matches!(st.kind, NodeKind::Dir) { return refuse("is-a-directory"); }
+    if st.size == 0 { return refuse("empty"); }
+    if st.size > crate::arch::syscall::user_image_cap() as u64 { return refuse("over-image-cap"); }
+    if !crate::fs::apptrust::launch_gate(&mt, path) { return refuse("apptrust"); }
+    let bytes = match mt.read(path, 0, st.size as usize) { Ok(b) => b, Err(_) => return refuse("read") };
+    if bytes.len() as u64 != st.size { return refuse("short-read"); }
+    if !(bytes.len() >= 20 && bytes[0..4] == [0x7F, b'E', b'L', b'F'] && bytes[4] == 2 && bytes[5] == 1 && u16::from_le_bytes([bytes[18], bytes[19]]) == 183) {
+        return refuse("not-aarch64-elf64");
+    }
+    if midden_core::launch_mode(midden_core::app_note_flags(&bytes).unwrap_or(0)) != midden_core::LaunchMode::Detach {
+        return refuse("foreground");
+    }
+    match crate::origin::with(crate::origin::Origin::Glass, || dp_spawn(Some(i), &bytes, path)) {
+        Ok((pid, slot, _entry)) => {
+            wm::app_name_arm_launch(wm::owner_of_launch(slot), path);
+            serial_println!("[dock] direct app={} path={} bytes={} pid={} slot={} on={} new=1 -> started", name, path, bytes.len(), pid, slot, on);
+            Ok((pid, slot))
+        }
+        Err(e) => {
+            serial_println!("[dock] direct app={} path={} on={} new=1 -> refused=spawn ({})", name, path, on, e);
+            Err("spawn")
+        }
+    }
 }

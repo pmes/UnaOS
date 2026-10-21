@@ -27347,15 +27347,15 @@ pub const ONEINSTANCE_RAISED: &str = "already running: its window was raised";
 /// The check (see the block above). `Some(delivered rc)` = the running instance was raised: the launch must not spawn.
 #[cfg(feature = "desktop_firmware")]
 fn oneinstance_gate(argv: &[&str], piped: bool) -> Option<i64> {
-    let path = argv.first().copied().unwrap_or("");
+    let new = ONEINST_NEW.swap(false, Ordering::AcqRel); let path = argv.first().copied().unwrap_or(""); // QUARRYLAUNCH (B754): `new=1` for the launch in flight (file tail), taken first as x86's gate takes it
     if piped || path.is_empty() || !matches!(crate::origin::current(), crate::origin::Origin::Glass | crate::origin::Origin::Door) {
         return None; // not the user's verb: spawned as before, no line
     }
     let arg = argv.get(1).copied().unwrap_or("");
     let launch_name = crate::fs::appres::launch_name(path);
     let names = [crate::video::wm::program_name(path), launch_name.as_deref().unwrap_or("")];
-    let Some(owner) = oneinstance_find(&names) else {
-        serial_println!("[app] launch path={} instance=new arg={}", path, arg.len());
+    let Some(owner) = (!new).then(|| oneinstance_find(&names)).flatten() else {
+        serial_println!("[app] launch path={} instance=new arg={}{}", path, arg.len(), if new { " new=1" } else { "" });
         return None;
     };
     if USER_INPUT_ACTIVE.load(Ordering::Acquire) != owner {
@@ -27518,4 +27518,22 @@ fn bus_open_pop(asid: u64, nowait: bool) -> Option<BusMsg> {
         }
     }
     None
+}
+
+// QUARRYLAUNCH (rmbp-ledger B754; BP-ring3-18) — TAIL-APPENDED, so no line above moves. `new=1` on aarch64: the user
+// asked for ANOTHER copy (the dock's Shift-click on a running tile, the tile menu's `New Window` — `dock::dp_new_launch`),
+// so the one-instance check spawns it even while one runs. The flag is set around the funnel call and swapped by
+// [`oneinstance_gate`] on its first line (x86's `ONEINST_NEW` shape). Wire: `[app] launch path=<p> instance=new arg=0 new=1`.
+
+/// `new=1` for the launch in flight: armed by [`spawn_user_image_bg_argv_new`], consumed by [`oneinstance_gate`].
+#[cfg(feature = "desktop_firmware")]
+static ONEINST_NEW: AtomicBool = AtomicBool::new(false);
+
+/// [`spawn_user_image_bg_argv`] with `new=1`.
+#[cfg(feature = "desktop_firmware")]
+pub fn spawn_user_image_bg_argv_new(bytes: &[u8], argv: &[&str]) -> Result<(u64, u64, u64), &'static str> {
+    ONEINST_NEW.store(true, Ordering::Release);
+    let r = spawn_user_image_bg_piped(bytes, argv, None, false);
+    ONEINST_NEW.store(false, Ordering::Release);
+    r
 }
