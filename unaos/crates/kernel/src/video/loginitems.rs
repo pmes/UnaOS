@@ -32,7 +32,7 @@ static LAUNCHED_N: AtomicU32 = AtomicU32::new(0);
 
 /// `users::login`: the session opened — read this user's list and launch it once the desktop is built.
 pub fn post_login() {
-    SEEN.forget(); // SESSIONGEN (B462). SESSIONEDGE (B793): the login's own edge — the next pass reads the list
+    // SESSIONEDGE (B793), STALETEXT2 (B799): no forget — `users::login` moves SESSION_GEN (users.rs:883) before it posts this, so SEEN's key has moved
     LAUNCH_OWED.store(true, Ordering::Release);
 }
 
@@ -83,7 +83,7 @@ pub fn edit(op: &str, name: &str, via: &str) -> bool {
 /// The settings service pass: read the session's list (once per login), drain an owed store write, and run the
 /// login's launch once the desktop is built.
 pub fn service() {
-    let mut wb = [0u8; crate::prefs::WHO_BUF]; let (sk, sq) = SEEN.check(); let who = if sq.is_none() { crate::prefs::user_name_in(&mut wb) } else { None }; if sq.is_none() { SEEN.mark(sk, who.is_some()); } // SESSIONGEN (B462): compared only when the login generation (or post_login) moved; PERFREVIEW F3 (B443): on the stack
+    let mut wb = [0u8; crate::prefs::WHO_BUF]; let (sk, sq) = SEEN.check(); let who = if sq.is_none() { crate::prefs::user_name_in(&mut wb) } else { None }; if sq.is_none() { SEEN.mark(sk, who.is_some()); } // SESSIONGEN (B462): compared only when the login generation moved (`users::login` moves it before [`post_login`]); PERFREVIEW F3 (B443): on the stack
     if !sq.unwrap_or(who.is_some()) { return }
     let fresh = who.is_some(); // SESSIONEDGE (B793): `who` is read only on a moved key — quiet => compared (and recorded) under this key already
     if fresh {

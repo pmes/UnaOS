@@ -8,8 +8,8 @@
 //! * **One key set** (Principia, `system.lock.*`, Settings > Security, one row each): `after_idle_min` (0 = never,
 //!   default 10), `on_lid` (default on), `on_sleep` (default on). LOCKPREFS (B748): read over the bus
 //!   (`prefs_client::sys_int` / `sys_flag`, Principia's client, never `crate::prefs`) on the service pass that first sees
-//!   a PrefChanged (`prefs_client::CHANGED_N` moved) or a login-generation move ([`prefs_pass`]) — no clock poll; the
-//!   Settings rows write through [`set_policy`] / [`persist`] (`prefs_client::sys_set`).
+//!   a PrefChanged naming one of the three keys ([`prefs_pass`]: `prefs_client::changed_since` on the client's ring; a
+//!   login or logout is the reload's PrefChanged) — no clock poll; the Settings rows write through [`set_policy`] / [`persist`] (`prefs_client::sys_set`).
 //! * **The LOCK state** is a VEIL, not a teardown: [`veiled`] is a term of `wm::above_shell` (one fold, `lock_veiled`
 //!   at the file tail), so the compositor, the desktop's occluders, the hit test and the a11y tree all read every row
 //!   but the modal one (the login screen in its locked mode) as below the shell — the rows, their surfaces, their z
@@ -68,11 +68,11 @@ static RESUMED: AtomicU32 = AtomicU32::new(0);
 /// LOCK2 (B728): the civil minute the locked card last painted its clock for (`unix / 60`; 0 = none yet).
 static CLOCK_MIN: AtomicU64 = AtomicU64::new(0);
 
-/// The policy in force (the store's, read once a second; a Settings press sets it at once).
+/// The policy in force (the store's, re-read by [`prefs_pass`] on a PrefChanged naming its keys; a Settings press sets it at once).
 static AFTER_IDLE_MIN: AtomicU32 = AtomicU32::new(IDLE_MIN_DEFAULT);
 static ON_LID: AtomicBool = AtomicBool::new(true);
 static ON_SLEEP: AtomicBool = AtomicBool::new(true);
-/// LOCKPREFS (B748): the PrefChanged mark (LOCKCHANGED B758: `prefs_client::changed_mark`'s sequence, kept beside
+/// LOCKPREFS (B748): the PrefChanged mark (LOCKCHANGED B758: the sequence of `prefs_client`'s last-changed ring, never
 /// `CHANGED_N`) the policy was last read under; [`prefs_pass`] re-reads when a change since the mark named one of the
 /// lock's three keys. SESSIONGENPOLL (B782): a login or logout is such a change (the reload's PrefChanged, PREFSRELOAD
 /// B763, posts every key the switch moved), so no login generation is kept.
@@ -83,7 +83,7 @@ static PRIMED: AtomicBool = AtomicBool::new(false);
 /// The last policy read failed (its one line is said; cleared by the next good read).
 static READ_FAILED: AtomicBool = AtomicBool::new(false);
 /// Store writes owed by a Settings press: bit 0 after_idle_min, bit 1 on_lid, bit 2 on_sleep. While any is owed the
-/// once-a-second read does not overwrite the press with the store's older value.
+/// [`prefs_pass`] read does not overwrite the press with the store's older value (it returns while any is owed).
 static OWED: AtomicU8 = AtomicU8::new(0);
 /// The activity stamp an idle lock was last tried for (one try per idle stretch, never a loop of refusals).
 static IDLE_TRIED: AtomicU64 = AtomicU64::new(0);
@@ -171,7 +171,7 @@ pub fn persist() {
 /// reload's PrefChanged); otherwise a few atomic loads and out. While a Settings press is owed the press is newer than
 /// the store: nothing is read and the edge is kept for the pass after [`persist`]. The mark is taken BEFORE the read,
 /// so a write that lands mid-read moves it again and the next pass re-reads. LOCKCHANGED (B758): a change re-reads only
-/// when it named one of the three keys (`prefs_client::changed_since`, the last-changed keys kept beside `CHANGED_N`; a
+/// when it named one of the three keys (`prefs_client::changed_since`, the client's last-changed ring, not `CHANGED_N`; a
 /// change the ring lost counts as a hit); any other key's change moves the mark and costs no GET. The edge is CLAIMED
 /// (compare-exchange on the mark), so two passes never read the same edge. `true` = it re-read.
 /// SESSIONGENPOLL (B782): no login generation is read here — a switch that moved none of the three keys left the
