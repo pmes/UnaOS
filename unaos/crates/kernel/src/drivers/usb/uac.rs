@@ -1,15 +1,15 @@
 //! CHARTER: Stria — driver
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
-#![cfg(feature = "uac")] // UACMIC (B723) M1: the class is the `uac` feature's alone — a `uvc` image declares `drivers::usb` and compiles none of this file
+#![cfg(feature = "uac")] // UACMIC (B723) M1: the class is the `uac` feature's alone — drivers/mod.rs declares `drivers::usb` under `uac` too, so this is the second guard and a `uvc`-only image compiles none of this file
 
 //! UAC1 (rmbp-ledger B706) — USB Audio Class 1 PLAYBACK: a USB speaker, headset or DAC plays what the kernel writes.
 //! UACMIC (rmbp-ledger B723) — and CAPTURE: a USB microphone or a headset's mic is read through `audio::source`.
 //!
 //! The class is the `uac` feature (UACMIC M1; `uac` implies `uvc`, whose isochronous engine it rides: XHCIISO,
 //! `drivers/xhci/isoch.rs`, reached only through that file's `ac` door). Declared from `drivers/mod.rs` on the existing
-//! `uvc` line (`pub mod usb { pub mod uac; }`) and erased by its own inner `#![cfg(feature = "uac")]` above, so a
-//! `uvc`-without-`uac` image compiles none of it (the declaration's cfg word moving to `uac` is owed, cosmetic). Host-neutral like `drivers/uvc.rs`: every transfer goes through
+//! `uvc` line under its own `#[cfg(feature = "uac")]` (`pub mod usb { pub mod uac; }`, word moved at the UACMIC fold
+//! 2e8a3cd1) and erased again by the inner cfg above, so a `uvc`-without-`uac` image compiles none of it. Host-neutral like `drivers/uvc.rs`: every transfer goes through
 //! `uvc::IsoHost` (EP0 `control`, `iso_configure` / `iso_start` / `iso_drop`); the xHCI host is `isoch::XhciUvc`.
 //!
 //! # THE SHAPE
