@@ -3712,7 +3712,7 @@ pub fn occluders(out: &mut alloc::vec::Vec<(usize, usize, usize, usize)>) -> usi
     let t = table();
     let mut n = 0usize;
     for r in t.rows.iter() {
-        if !r.used || r.compat || !above_shell(r, shell) {
+        if !r.used || (r.compat && !toast_occludes(r)) || !above_shell(r, shell) {
             continue;
         }
         let b = occluder_box(r, shell, focus); // DESIGNAPPLY (B639): the box AND its shadow margin — the desktop layer's presents never paint over a shadow (only the fill does)
@@ -18083,7 +18083,7 @@ fn occ_clip(rows: &[Window], i: usize, shell: u32, pw: usize, ph: usize) -> OccC
         let (z, id) = (rows[i].z, rows[i].id);
         let me = outer_box(&rows[i]);
         for r in rows.iter() {
-            if !r.used || r.compat || !above_shell(r, shell) || (r.z, r.id) <= (z, id) {
+            if !r.used || (r.compat && !toast_occludes(r)) || !above_shell(r, shell) || (r.z, r.id) <= (z, id) {
                 continue;
             }
             let b = outer_box(r);
@@ -18445,7 +18445,7 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
             // path: its box is the panel, so admitting it would suppress every desktop erase there
             // is, on a path this arc has no evidence about and whose own present republishes the
             // whole screen anyway. The status quo for compat is what ships.
-            if !r.used || r.compat || !above_shell(r, shell) {
+            if !r.used || (r.compat && !toast_occludes(r)) || !above_shell(r, shell) {
                 continue;
             }
             if !c.push(outer_box(r)) {
@@ -31842,3 +31842,26 @@ mod scrollview {
 
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub use scrollview::scroll_press_ring3; // RING3SCROLLPRESS (B791): the x86 click router's door (`wc_scroll_press`)
+
+/// CHARTER: TOASTFLICKER (rmbp-ledger B815) — notify's cards and Center join the occluder sets (`occluders`, `occ_clip`, `erase_clip`).
+///
+/// A card is a compat overlay row (`overlay_open` -> `splash_open`), and the three sets skip compat rows, so the
+/// desktop present (`Screen::flush` subtracts [`occluders`]), the erase drain ([`erase_clip`]) and a lower window's
+/// blit ([`occ_clip`]) published over a live card and nothing re-blitted it (flight 37: "notification pop-up getting
+/// leak through flickers of the background"). This admits exactly notify's live rows — `notify::owns_row`, atomics
+/// the notify pass publishes — with the box each set reads from its own table snapshot, so a card that moves or
+/// closes is never withheld at a stale rect. Every other compat row keeps today's exclusion. Called inside the
+/// sets' table hold; takes no lock. Witness: `[cursor11] … toast_withheld=` counts the admissions.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn toast_occludes(r: &Window) -> bool {
+    let own = super::notify::owns_row(r.id);
+    #[cfg(feature = "witness")]
+    if own {
+        super::cursor::note_toast_withheld();
+    }
+    own
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn toast_occludes(_r: &Window) -> bool {
+    false
+}
