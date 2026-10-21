@@ -735,12 +735,12 @@ refs/heads/exec-rmbp-memline2   6171f3b1 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-a11ytree2   53673d2f FOLDED-BY-HAND (this commit) 2026-10-21 B822
 refs/heads/exec-rmbp-lockreg2   9901e426 FOLDED-BY-HAND (this commit) 2026-10-21 B823
 refs/heads/exec-rmbp-filetypes3   423f4009 FOLDED-BY-HAND (this commit) 2026-10-21 B820
-refs/heads/exec-rmbp-quarryrelist   d7b45709 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-quarryrelist   558c5312 FOLDED-BY-HAND (this commit) 2026-10-21 B824
 refs/heads/exec-rmbp-unafswrite   d7b45709 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-finemotion2   bc299c48 FOLDED-BY-HAND (this commit) 2026-10-21 B826
 refs/heads/exec-rmbp-overlayocc   13ca547f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-perfhud2   13ca547f IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-zoom2   13ca547f IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-zoom2   edbfdb44 FOLDED-BY-HAND (this commit) 2026-10-21 B829
 refs/heads/exec-rmbp-shimmeridle2   13ca547f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-wifidhcp   13ca547f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-gatelocktype   13ca547f IN-FLIGHT cut 2026-10-21
