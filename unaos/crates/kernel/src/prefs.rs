@@ -398,17 +398,17 @@ static LOAD_CLAMPED: AtomicU32 = AtomicU32::new(0);
 pub fn ensure_loaded() { let (sk, sq) = PREFS_SEEN.check(); if sq.is_some() { return; } PREFS_SEEN.mark(sk, true); // SESSIONGEN (B462): the session and this load's state are unchanged since the last compare — one load, no lock
     let mut wb = [0u8; WHO_BUF];
     let u = user_name_in(&mut wb).unwrap_or(""); // PERFREVIEW F3 (B443): compared on the stack; a String only when the session changed
-    let fresh = {
+    let (fresh, was) = { // PREFSRELOAD (B763): `was` = a tree was loaded for another session (a login or logout moved SESSION_GEN) — that switch is diffed and posted below (LINE-NEUTRAL fold)
         let mut g = LOADED_FOR.lock();
         if g.as_deref() != Some(u) {
-            *g = Some(String::from(u));
-            true
+            let was = g.is_some(); *g = Some(String::from(u));
+            (true, was)
         } else {
-            false
+            (false, false)
         }
     };
     if fresh {
-        load();
+        let (t0, old) = (crate::arch::ms(), if was { Some(TREE.lock().clone()) } else { None }); load(); if let Some(old) = old { let _ = reload_posted(&old, t0); } // PREFSRELOAD (B763): the old session's tree against the new store, one PrefChanged per differing key (same-line fold, code first)
     }
 }
 
@@ -1643,12 +1643,77 @@ pub fn revoke(key: &str) -> bool {
 
 /// `tests reask`'s reboot: the RAM a reboot loses (the tree, the unpersisted queue, the session's load record) is
 /// cleared and the store is read back from its files by the one [`load`]. Returns the keys loaded.
+///
+/// PREFSRELOAD (B763): the tree the RAM held is diffed against the store read back ([`reload_posted`]), so a value the
+/// store no longer holds (an unpersisted write) reaches its subscribers as a PrefChanged like any other move.
 pub fn reload_from_store() -> usize {
+    let t0 = crate::arch::ms();
     DECIDE_Q.lock().clear();
     DECIDE_OWED.store(false, Ordering::Release);
-    *TREE.lock() = PrefTree::new();
+    let old = core::mem::replace(&mut *TREE.lock(), PrefTree::new());
     *LOADED_FOR.lock() = None;
     PREFS_SEEN.forget();
     ensure_loaded();
+    let _ = reload_posted(&old, t0);
     TREE.lock().len()
+}
+
+// ── PREFSRELOAD (rmbp-ledger B763) — a session switch is a set of PrefChanged ──────────────────────────────────
+//
+// A login or a logout moves `fs::users::SESSION_GEN` and changes the session user; the next [`ensure_loaded`] reads the
+// new user's store into the tree. Before this arc that load was silent: Settings, the lock, the clock and the look each
+// polled SESSION_GEN to notice. Now the load is followed by ONE diff of the tree the old session held against the tree
+// the new store gave, and every key whose value differs is posted through [`changed`] — the same `[prefs] changed`
+// line and the same verb-19 frame (`prefs_client::on_changed`) a write sends — schema rows first in `SCHEMA` order, then
+// the keys no row declares (`app.*`, `system.notify.*`, decisions) in tree order, set-or-moved before removed. A key the
+// new store does not hold carries its schema default (`Default::{Int,Float,Bool,Str}`), else an empty string: the
+// subscriber re-reads through its client and answers its own default. One line per reload:
+// `[prefs] reload gen=<SESSION_GEN> changed=<keys posted> ms=<load + diff + posts>`.
+
+/// The value a PrefChanged carries for a key the new store does not hold.
+fn reload_absent(ns: &str, k: &str) -> PrefValue {
+    match prefs_core::schema::lookup(ns, k).map(|r| r.default) {
+        Some(prefs_core::schema::Default::Int(i)) => PrefValue::Int(i),
+        Some(prefs_core::schema::Default::Float(f)) => PrefValue::Float(f),
+        Some(prefs_core::schema::Default::Bool(b)) => PrefValue::Bool(b),
+        Some(prefs_core::schema::Default::Str(s)) => PrefValue::Str(String::from(s)),
+        _ => PrefValue::Str(String::new()),
+    }
+}
+
+/// Diff `old` (the tree before the reload) against the tree now loaded and post one PrefChanged per differing key, in
+/// schema order; says the reload line. `t0` = when the reload began. Returns the keys posted.
+fn reload_posted(old: &PrefTree, t0: u64) -> usize {
+    let new = TREE.lock().clone();
+    let mut moved: Vec<(String, String, PrefValue)> = Vec::new();
+    for r in prefs_core::schema::SCHEMA.iter() {
+        let b = new.get(r.ns, r.key);
+        if old.get(r.ns, r.key) != b {
+            moved.push((String::from(r.ns), String::from(r.key), b.cloned().unwrap_or_else(|| reload_absent(r.ns, r.key))));
+        }
+    }
+    for (ns, k, v) in new.entries() {
+        if prefs_core::schema::lookup(ns, k).is_none() && old.get(ns, k) != Some(v) {
+            moved.push((String::from(ns), String::from(k), v.clone()));
+        }
+    }
+    for (ns, k, _) in old.entries() {
+        if prefs_core::schema::lookup(ns, k).is_none() && new.get(ns, k).is_none() {
+            moved.push((String::from(ns), String::from(k), reload_absent(ns, k)));
+        }
+    }
+    for (ns, k, v) in &moved {
+        changed(ns, k, &prefs_core::schema::Applied { value: v.clone(), clamped: false });
+    }
+    serial_println!("[prefs] reload gen={} changed={} ms={}", session_gen(), moved.len(), crate::arch::ms().saturating_sub(t0));
+    moved.len()
+}
+
+/// `tests settingsmap`'s reload leg (B763): the session switch with `old` as the tree the previous session held — the
+/// store is re-read by the one [`load`] and every key that differs from `old` is posted. Returns the keys posted.
+pub fn reload_session(old: &PrefTree) -> usize {
+    let t0 = crate::arch::ms();
+    ensure_loaded();
+    load();
+    reload_posted(old, t0)
 }
