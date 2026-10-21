@@ -743,4 +743,8 @@ refs/heads/exec-rmbp-perfhud2   13ca547f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-zoom2   edbfdb44 FOLDED-BY-HAND (this commit) 2026-10-21 B829
 refs/heads/exec-rmbp-shimmeridle2   13ca547f IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-wifidhcp   13ca547f IN-FLIGHT cut 2026-10-21
-refs/heads/exec-rmbp-gatelocktype   13ca547f IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-gatelocktype   18393b58 FOLDED-BY-HAND (this commit) 2026-10-21 SR188
+refs/heads/exec-rmbp-stackguard3   8aef7df2 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-cardregistry   8aef7df2 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-navread   8aef7df2 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-zoomcost   8aef7df2 IN-FLIGHT cut 2026-10-21
