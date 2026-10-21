@@ -716,3 +716,7 @@ refs/heads/exec-rmbp-heldslotep0   7bcc5652 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-staletext3   14af7415 FOLDED-BY-HAND (this commit) 2026-10-21
 refs/heads/exec-rmbp-playstartgap   b95a948a IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-columnshover   b95a948a IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-buskeepcrate   5fff6848 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-ehcipoolrecycle   5fff6848 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-idleusblevel   5fff6848 IN-FLIGHT cut 2026-10-21
+refs/heads/exec-rmbp-uacimplicit   5fff6848 IN-FLIGHT cut 2026-10-21
