@@ -60,12 +60,12 @@ pub struct Mem {
 
 /// Live remembered rows: `(id, app name, last frame written or restored)`. A leaf mutex (never held across
 /// `TABLE`, `WRITER` or a print).
-static TRACK: spin::Mutex<Vec<(WinId, String, String)>> = spin::Mutex::new(Vec::new());
+static TRACK: crate::sync::Mutex<Vec<(WinId, String, String)>> = crate::sync::Mutex::new(Vec::new());
 /// Writes waiting for the worker: `(app name, frame literal, on)`; the latest per app wins.
-static QUEUE: spin::Mutex<Vec<(String, String, &'static str)>> = spin::Mutex::new(Vec::new());
+static QUEUE: crate::sync::Mutex<Vec<(String, String, &'static str)>> = crate::sync::Mutex::new(Vec::new());
 static FLUSHER: AtomicBool = AtomicBool::new(false);
 /// `tests winmemory`: the injected saved frame of [`TEST_APP`].
-static TEST_SAVED: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+static TEST_SAVED: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
 
 // ── pure ─────────────────────────────────────────────────────────────────────────────────────────
 

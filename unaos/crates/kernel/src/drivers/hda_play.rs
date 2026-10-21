@@ -1415,7 +1415,7 @@ fn alert_poll() {
 // docs/dev/evidence/rmbp-1005/seektable.md.
 
 /// The last coded seek's verdict: (jid, method, table, landed_ms, exact).
-static SEEK_DONE: spin::Mutex<Option<(u32, &'static str, &'static str, u64, bool)>> = spin::Mutex::new(None);
+static SEEK_DONE: crate::sync::Mutex<Option<(u32, &'static str, &'static str, u64, bool)>> = crate::sync::Mutex::new(None);
 
 /// `play-dec`'s seek for job `jid`: the table seek (0 frames left to drop) or, without a table, the decode-skip.
 fn seek_table(jid: u32, dec: &mut audio_core::Decoder, rate: u32) -> u64 {
@@ -1450,7 +1450,7 @@ pub fn seek_result() -> Option<(&'static str, &'static str, u64, bool)> {
 // kernel's own file read; the verdict is the table the core answered with. No ring, no feed.
 
 /// (path, ms, verdict): verdict = (table, exact, landed_ms, byte, sample) or the refusal.
-static PROBE: spin::Mutex<Option<(String, u64, Option<Result<(&'static str, bool, u64, u64, u64), String>>)>> = spin::Mutex::new(None);
+static PROBE: crate::sync::Mutex<Option<(String, u64, Option<Result<(&'static str, bool, u64, u64, u64), String>>)>> = crate::sync::Mutex::new(None);
 
 /// Start the probe of `path` at `ms` (replaces any earlier one that finished). SMALLFIX5 (B480) item 7: `false` and
 /// nothing spawned while an earlier probe has no verdict yet — a hung `play-probe` (DECJOBHANG) is never joined by a

@@ -84,7 +84,7 @@ impl JobOut {
 /// The ring + sentinel pages (8 KiB, allocated once, held for the boot: they are GGTT-reachable and a
 /// register with no read decode is never the sole reason a page goes back to the heap, gen7.md §2.6).
 /// The lock is also the engine's: a second job while one runs is `busy`.
-static PAGES: spin::Mutex<usize> = spin::Mutex::new(0);
+static PAGES: crate::sync::Mutex<usize> = crate::sync::Mutex::new(0);
 
 fn span_pages(p: &Plane) -> (usize, usize) {
     let first = p.va & !0xFFF;
@@ -399,7 +399,7 @@ fn dst_seed(i: usize) -> u32 {
 }
 
 /// The first run's three lines, replayed on a second `tests gen7` (the pages are held, gen7.md §2.6).
-static DONE: spin::Mutex<Option<[alloc::string::String; 3]>> = spin::Mutex::new(None);
+static DONE: crate::sync::Mutex<Option<[alloc::string::String; 3]>> = crate::sync::Mutex::new(None);
 
 fn mk_fb(base: usize, len: usize, w: usize, h: usize) -> FrameBuffer {
     let mut f = FrameBuffer::new();

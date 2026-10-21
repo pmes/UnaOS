@@ -111,7 +111,7 @@ struct Src {
 }
 
 const SRC_NONE: Src = Src { name: [0; crate::fs::users::NAME_MAX], nl: 0, key: [0; KEY_MAX], kl: 0 };
-static SRC: spin::Mutex<[Src; crate::fs::users::MAX_USERS]> = spin::Mutex::new([SRC_NONE; crate::fs::users::MAX_USERS]);
+static SRC: crate::sync::Mutex<[Src; crate::fs::users::MAX_USERS]> = crate::sync::Mutex::new([SRC_NONE; crate::fs::users::MAX_USERS]);
 
 /// One drawing step a tile's avatar asks of its caller (which owns the surface and its clipping).
 pub enum Draw<'a> {

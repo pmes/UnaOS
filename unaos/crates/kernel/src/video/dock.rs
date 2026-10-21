@@ -4602,7 +4602,7 @@ pub(crate) fn dnd_drop(path: &str) -> Result<alloc::string::String, alloc::strin
 /// The hovered app tile's row id + 1 (`0` = none).
 static DND_APP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// The last answer, so a drag resting on a tile reads the types once: `(tile id, first path, n, answer)`.
-static DND_APP_MEMO: spin::Mutex<Option<(wm::WinId, alloc::string::String, usize, Option<(alloc::string::String, alloc::string::String)>)>> = spin::Mutex::new(None);
+static DND_APP_MEMO: crate::sync::Mutex<Option<(wm::WinId, alloc::string::String, usize, Option<(alloc::string::String, alloc::string::String)>)>> = crate::sync::Mutex::new(None);
 
 fn dnd_app_lit(id: wm::WinId) -> bool {
     DND_APP.load(Ordering::Relaxed) == id as u64 + 1

@@ -24,7 +24,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 use crate::video::wm;
 

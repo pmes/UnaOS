@@ -234,7 +234,7 @@ struct Job {
     seek_ms: u64,
 }
 
-static JOB: spin::Mutex<Option<Job>> = spin::Mutex::new(None);
+static JOB: crate::sync::Mutex<Option<Job>> = crate::sync::Mutex::new(None);
 static GEN: AtomicU32 = AtomicU32::new(0);
 static LIVE: AtomicBool = AtomicBool::new(false);
 static SPAWN_MS: AtomicU64 = AtomicU64::new(0);
@@ -258,7 +258,7 @@ struct Play {
     audio_seen: bool,
 }
 
-static PLAY: spin::Mutex<Play> = spin::Mutex::new(Play::new());
+static PLAY: crate::sync::Mutex<Play> = crate::sync::Mutex::new(Play::new());
 
 impl Play {
     const fn new() -> Play {
@@ -654,7 +654,7 @@ struct Poster {
     done: bool,
 }
 
-static POSTER: spin::Mutex<Option<Poster>> = spin::Mutex::new(None);
+static POSTER: crate::sync::Mutex<Option<Poster>> = crate::sync::Mutex::new(None);
 static POSTER_GEN: AtomicU32 = AtomicU32::new(0);
 static POSTER_FRESH: AtomicBool = AtomicBool::new(false);
 

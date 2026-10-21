@@ -51,7 +51,7 @@ struct Cell {
     n: usize,
 }
 
-static CELL: spin::Mutex<Cell> = spin::Mutex::new(Cell { e: [Ent::EMPTY; APPS], n: 0 });
+static CELL: crate::sync::Mutex<Cell> = crate::sync::Mutex::new(Cell { e: [Ent::EMPTY; APPS], n: 0 });
 static LOADED: AtomicBool = AtomicBool::new(false);
 static FROM: AtomicU32 = AtomicU32::new(0);
 static UNTIL: AtomicU32 = AtomicU32::new(0);

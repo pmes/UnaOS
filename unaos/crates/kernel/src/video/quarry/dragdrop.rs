@@ -253,7 +253,7 @@ pub fn drop(p: &Payload, t: &Target, option: bool) -> (Action, bool) {
 
 // ── favorites (Principia's, R79) ────────────────────────────────────────────────────────────────
 
-static FAVS: spin::Mutex<Option<Vec<String>>> = spin::Mutex::new(None);
+static FAVS: crate::sync::Mutex<Option<Vec<String>>> = crate::sync::Mutex::new(None);
 
 /// The favorites the user added, in order (`system.quarry.favorites`; read once, then kept with every add).
 pub(super) fn user_favorites() -> Vec<String> {
@@ -356,7 +356,7 @@ pub(super) fn paint(m: &Model, px: &mut [u32]) {
 
 // ── `tests dragdrop` ────────────────────────────────────────────────────────────────────────────
 
-static FIX_T: spin::Mutex<Option<Target>> = spin::Mutex::new(None);
+static FIX_T: crate::sync::Mutex<Option<Target>> = crate::sync::Mutex::new(None);
 
 /// The fixture's resolver: right of x=100 the fixture target, left of it nothing.
 fn fix_resolve(x: i32, _y: i32, _p: &Payload) -> Option<Target> {
@@ -457,7 +457,7 @@ struct Marks {
     anchor: Option<String>,
 }
 
-static MARKS: spin::Mutex<Option<Marks>> = spin::Mutex::new(None);
+static MARKS: crate::sync::Mutex<Option<Marks>> = crate::sync::Mutex::new(None);
 
 /// A press on row `i` of `list` (names in display order) with Cmd/Shift: edit the marks. `true` = a plain press
 /// (the caller arms a drag of [`selection`]); `false` = the press edited the selection only.
@@ -579,7 +579,7 @@ pub fn spring_to(dir: &str) -> Option<String> {
     Some(prev)
 }
 
-static SPRUNG: spin::Mutex<Vec<String>> = spin::Mutex::new(Vec::new());
+static SPRUNG: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
 
 /// The fixture's spring: records the folder, answers a fixed "before".
 fn fix_spring(dir: &str) -> Option<String> {
