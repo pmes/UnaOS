@@ -4279,7 +4279,7 @@ fn keychars_repeat_tracker(_tz: u32, _tu: u32) -> Option<bool> {
 // A2DP (rmbp-ledger B739) — TAIL-APPENDED. `tests a2dp`: the SBC known-answer test (`sbc_core::kat`, the function the
 // host `cargo test -p sbc_core` runs), the AVDTP state machine over a synthetic peer in both roles (with the SDP sink
 // record and the L2CAP fit below it), and whether a stream runs now. Registered on the `ensure_shellux` line.
-// Wire: `[a2dp] fixture <leg> -> PASS|FAIL`, `:: A2DP: sbc_kat=<ok|FAIL> avdtp=<ok|FAIL> frag=<ok|FAIL> stream=<ok|no-device> -> PASS|SKIP|FAIL ::`.
+// Wire: `[a2dp] fixture <leg> -> PASS|FAIL`, `:: A2DP: sbc_kat=<ok|FAIL> avdtp=<ok|FAIL> frag=<ok|FAIL> stream=<ok|no-device> sdp_server=<ok|FAIL> inbound=<ok|FAIL> -> PASS|SKIP|FAIL ::` (the last two SDPSERVER B769).
 #[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
 fn a2dp_selftest() {
     crate::drivers::ehci::bthid::avdtp::fixture();

@@ -30,7 +30,8 @@
 //! Wire: `[a2dp] dev=<addr> link up -> sdp`, `[a2dp] sdp dev= sink=<yes|no> psm= avdtp= a2dp=`, `[a2dp] dev=
 //! signalling channel …`, `[a2dp] dev= media channel …`, `[a2dp] dev=<addr> codec=sbc 44100 js bitpool=<n> mtu=<n>
 //! -> streaming`, `[a2dp] dev= -> FAILED reason=`, `[a2dp] dev= gone`; `tests a2dp`: `:: A2DP: sbc_kat=ok avdtp=ok
-//! frag=ok stream=<ok|no-device> -> PASS|SKIP|FAIL ::`. Compiled only under the `a2dp` knob (A2DPKNOB B750).
+//! frag=ok stream=<ok|no-device> sdp_server=<ok|FAIL> inbound=<ok|FAIL> -> PASS|SKIP|FAIL ::` (the last two SDPSERVER
+//! B769); `[a2dp] dev= the peer opened the link -> acceptor …` (a reconnecting headset drives AVDTP, [`acp_due`]). Compiled only under the `a2dp` knob (A2DPKNOB B750).
 
 use super::l2cap::{self, AvdtpRole};
 use super::sdp;
@@ -516,6 +517,9 @@ static WRITER: AtomicBool = AtomicBool::new(false);
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 static PACKETS: AtomicU64 = AtomicU64::new(0);
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+/// SDPSERVER (B769): a link the PEER opened whose SDP is done (address, when): AVDTP signalling is the peer's to open
+/// for [`ACP_WAIT_MS`], then [`acp_due`] opens it. Lock order: BTHID's `BT`, then this alone (never held with `A2`).
+static ACP_DUE: crate::sync::Mutex<Option<([u8; 6], u64)>> = crate::sync::Mutex::new(None);
 
 impl Bt {
     /// This link is an A2DP link: `bt audio` named it, a stream already rides it, or its Class of Device is
@@ -544,11 +548,17 @@ impl Bt {
         }
     }
 
-    /// SDP finished (or failed): open AVDTP signalling unless the peer already did.
+    /// SDP finished (or failed): open AVDTP signalling unless the peer already did — on a link the PEER opened (a
+    /// headset reconnecting on power-on reads our source record and opens AVDTP itself), only after [`acp_due`]'s wait.
     pub(super) fn a2dp_after_sdp(&mut self, li: usize, now: u64) {
         let a = self.links[li].addr;
         let have = A2.lock().as_ref().is_some_and(|s| s.addr == a);
         if !have && self.links[li].chan_psm(l2cap::PSM_AVDTP).is_none() {
+            if !self.links[li].outbound {
+                *ACP_DUE.lock() = Some((a, now)); // SDPSERVER (B769): the acceptor role; two signalling opens at once would make the second "media"
+                serial_println!("[a2dp] dev={} the peer opened the link -> acceptor (AVDTP is the peer's to open for {} ms)", fmt_addr(&a), ACP_WAIT_MS);
+                return;
+            }
             self.open_chan(li, l2cap::PSM_AVDTP, now);
         }
     }
@@ -696,8 +706,31 @@ pub(super) fn link_gone(addr: &[u8; 6]) {
     }
 }
 
+/// SDPSERVER (B769): the acceptor's wait on a link the peer opened ran out with no stream: this host opens AVDTP
+/// signalling itself (the initiator path, as after its own SDP query).
+fn acp_due(bt: &mut Bt, now: u64) {
+    let due = {
+        let mut g = ACP_DUE.lock();
+        match *g {
+            Some((a, t)) if now.saturating_sub(t) > ACP_WAIT_MS => {
+                *g = None;
+                Some(a)
+            }
+            _ => None,
+        }
+    };
+    let Some(a) = due else { return };
+    let Some(li) = bt.link_addr(&a) else { return };
+    let have = A2.lock().as_ref().is_some_and(|s| s.addr == a);
+    if !have && bt.links[li].st == LinkSt::Up && bt.links[li].chan_psm(l2cap::PSM_AVDTP).is_none() {
+        serial_println!("[a2dp] dev={} the peer opened no AVDTP within {} ms -> signalling opened by this host", fmt_addr(&a), ACP_WAIT_MS);
+        bt.open_chan(li, l2cap::PSM_AVDTP, now);
+    }
+}
+
 /// Once per BTHID pass (`step`, under the `BT` lock): the acceptor-side waits, then the media clock.
 pub(super) fn tick(bt: &mut Bt, now: u64) {
+    acp_due(bt, now);
     let mut outs = Vec::new();
     let li = {
         let mut g = A2.lock();
@@ -900,7 +933,7 @@ fn step_is(p: &mut Peer, msg: &[u8], want: &[u8], leg: &'static str) -> Result<V
 /// The AVDTP state machine against a synthetic peer, both roles, byte for byte; SDP's record walk; L2CAP's fit.
 fn avdtp_legs() -> Result<(), &'static str> {
     // Below AVDTP: L2CAP's decisions and the SDP sink record.
-    let l2 = l2cap::payload_fit(1021, 672) == 500 && l2cap::payload_fit(200, 672) == 396 && l2cap::payload_fit(1021, 100) == 100 && l2cap::inbound_served(0x0019) && !l2cap::inbound_served(0x0001) && l2cap::avdtp_role(false) == AvdtpRole::Signalling && l2cap::avdtp_role(true) == AvdtpRole::Media;
+    let l2 = l2cap::payload_fit(1021, 672) == 500 && l2cap::payload_fit(200, 672) == 396 && l2cap::payload_fit(1021, 100) == 100 && l2cap::inbound_served(0x0019) && l2cap::inbound_served(0x0001) && !l2cap::inbound_served(0x0003) && l2cap::avdtp_role(false) == AvdtpRole::Signalling && l2cap::avdtp_role(true) == AvdtpRole::Media;
     if !l2 {
         return Err("l2cap");
     }
@@ -985,6 +1018,23 @@ fn avdtp_legs() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// SDPSERVER (B769) `inbound` leg — a headset that reconnects and drives: its SDP and AVDTP channels are served
+/// inbound, the first AVDTP channel is signalling, and the acceptor accepts its DISCOVER, SET_CONFIGURATION and OPEN
+/// without opening the media channel itself (the peer that opened the stream opens its transport).
+fn inbound_legs() -> Result<(), &'static str> {
+    if !(l2cap::inbound_served(PSM_SDP) && l2cap::inbound_served(l2cap::PSM_AVDTP) && l2cap::avdtp_role(false) == AvdtpRole::Signalling) {
+        return Err("inbound-psm");
+    }
+    let mut q = Peer::new(l2cap::payload_fit(1021, 672));
+    step_is(&mut q, &[0x10, 0x01], &[0x12, 0x01, 0x04, 0x00], "inbound-discover")?;
+    step_is(&mut q, &[0x20, 0x03, 0x04, 0x08, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35], &[0x22, 0x03], "inbound-set-configuration")?;
+    let o = step_is(&mut q, &[0x30, 0x06, 0x04], &[0x32, 0x06], "inbound-open")?;
+    if q.st != St::Open || q.int || q.bitpool != 53 || q.fpp != 4 || o.contains(&Out::OpenMedia) {
+        return Err("inbound-open-state");
+    }
+    Ok(())
+}
+
 /// Reassemble queued ACL payloads by `on_acl`'s rules (bthid.rs): PB 0b10 starts a PDU whose basic header gives its
 /// length, PB 0b01 continues it; a continuation with no PDU open, or a PDU longer than declared, is a failure.
 fn reassemble(frags: &[(u16, Vec<u8>)]) -> Option<Vec<u8>> {
@@ -1038,22 +1088,24 @@ fn frag_legs() -> Result<(), &'static str> {
 }
 
 /// `tests a2dp`: the SBC KAT (`sbc_core::kat`, the same function the host test runs), the AVDTP state machine over a
-/// synthetic peer (and the SDP record and L2CAP fit below it), outbound L2CAP fragmentation, and whether a stream
-/// runs now.
+/// synthetic peer (and the SDP record and L2CAP fit below it), outbound L2CAP fragmentation, whether a stream runs
+/// now, and (SDPSERVER B769, at the END) the SDP server and the inbound acceptor ([`sdp::server_legs`], [`inbound_legs`]).
 pub fn fixture() {
     let kat = sbc::kat();
     let av = avdtp_legs();
     let frag = frag_legs();
+    let srv = sdp::server_legs();
+    let inb = inbound_legs();
     let stream = if streaming() { "ok" } else { "no-device" };
-    for (leg, r) in [("sbc_kat", kat), ("avdtp", av), ("frag", frag)] {
+    for (leg, r) in [("sbc_kat", kat), ("avdtp", av), ("frag", frag), ("sdp_server", srv), ("inbound", inb)] {
         match r {
             Ok(()) => serial_println!("[a2dp] fixture {} -> PASS", leg),
             Err(why) => serial_println!("[a2dp] fixture {} -> FAIL at {}", leg, why),
         }
     }
     let ok = |r: Result<(), &'static str>| if r.is_ok() { "ok" } else { "FAIL" };
-    let verdict = if kat.is_err() || av.is_err() || frag.is_err() { "FAIL" } else if stream == "ok" { "PASS" } else { "SKIP" };
-    serial_println!(":: A2DP: sbc_kat={} avdtp={} frag={} stream={} -> {} ::", ok(kat), ok(av), ok(frag), stream, verdict);
+    let verdict = if kat.is_err() || av.is_err() || frag.is_err() || srv.is_err() || inb.is_err() { "FAIL" } else if stream == "ok" { "PASS" } else { "SKIP" };
+    serial_println!(":: A2DP: sbc_kat={} avdtp={} frag={} stream={} sdp_server={} inbound={} -> {} ::", ok(kat), ok(av), ok(frag), stream, ok(srv), ok(inb), verdict);
     if verdict == "SKIP" {
         serial_println!(":: A2DP: SKIP = both fixtures passed but no A2DP stream runs (`bt audio <addr>` with a headset in pairing mode, then `tests a2dp`) ::");
     }
