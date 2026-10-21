@@ -27422,17 +27422,54 @@ pub fn oneinstance_open_arg(prog: &str, file: &str) -> Option<i64> {
     oneinstance_gate(&[prog, file], false)
 }
 
-/// One ASID's hold: the generation it belongs to, its calls in flight, and the one OPEN_ARG held across them.
+/// OPENARGQUEUE (rmbp-ledger B761): how many OPEN_ARGs one ASID holds across a call in flight (a FIFO; a fifth drops
+/// the OLDEST, with the `[bus] open_arg hold full` line) — x86's `BUSX_HOLD_DEPTH`.
+#[cfg(feature = "desktop_firmware")]
+const BUS_HOLD_DEPTH: usize = 4;
+
+/// One ASID's hold: the generation it belongs to, its calls in flight, and the OPEN_ARGs held across them (a bounded
+/// FIFO, oldest at `head`; `dropped` counts the oldest frames a full hold let go).
 #[cfg(feature = "desktop_firmware")]
 struct BusOpenHold {
     tenancy: u64,
     inflight: u32,
-    held: Option<BusMsg>,
+    head: usize,
+    count: usize,
+    held: [Option<BusMsg>; BUS_HOLD_DEPTH],
+    dropped: u32,
 }
 
 #[cfg(feature = "desktop_firmware")]
 impl BusOpenHold {
-    const EMPTY: Self = BusOpenHold { tenancy: 0, inflight: 0, held: None };
+    const EMPTY: Self = BusOpenHold { tenancy: 0, inflight: 0, head: 0, count: 0, held: [const { None }; BUS_HOLD_DEPTH], dropped: 0 };
+
+    /// Hold one more OPEN_ARG at the tail; a full hold lets its OLDEST go first (`dropped` + 1).
+    fn hold(&mut self, m: BusMsg) {
+        if self.count == BUS_HOLD_DEPTH {
+            self.held[self.head] = None;
+            self.head = (self.head + 1) % BUS_HOLD_DEPTH;
+            self.count -= 1;
+            self.dropped = self.dropped.wrapping_add(1);
+        }
+        let tail = (self.head + self.count) % BUS_HOLD_DEPTH;
+        self.held[tail] = Some(m);
+        self.count += 1;
+    }
+
+    /// The oldest held OPEN_ARG of generation `cur` (a stale one is discarded on the way).
+    fn release(&mut self, cur: u64) -> Option<BusMsg> {
+        while self.count > 0 {
+            let m = self.held[self.head].take();
+            self.head = (self.head + 1) % BUS_HOLD_DEPTH;
+            self.count -= 1;
+            if let Some(m) = m {
+                if m.agen == cur {
+                    return Some(m);
+                }
+            }
+        }
+        None
+    }
 }
 
 #[cfg(feature = "desktop_firmware")]
@@ -27445,7 +27482,8 @@ static BUS_OPEN: crate::procslot::SlotVec<SpinMutex<BusOpenHold>> = crate::procs
 #[cfg(feature = "desktop_firmware")]
 fn bus_open_fresh(h: &mut BusOpenHold, cur: u64) {
     if h.tenancy != cur {
-        *h = BusOpenHold { tenancy: cur, inflight: 0, held: None };
+        *h = BusOpenHold::EMPTY;
+        h.tenancy = cur;
     }
 }
 
@@ -27459,10 +27497,17 @@ fn bus_answers_ask(frame: &[u8]) -> bool {
     !push
 }
 
-/// SYS_MSEND's fold: an accepted REQUEST (rc 0) is one call in flight.
+/// A corr-0 NOTICE or PREF_CHANGED REQUEST: its answer reads as a kernel push to [`bus_answers_ask`], so it is never
+/// counted (OPENARGQUEUE M1, rmbp-ledger B761; x86's `busx_unanswered_ask`).
+#[cfg(feature = "desktop_firmware")]
+fn bus_unanswered_ask(frame: &[u8]) -> bool {
+    frame[8..12] == [0u8; 4] && matches!(frame[6], crate::bus::BUS_VERB_NOTICE | una_abi::BUS_VERB_PREF_CHANGED)
+}
+
+/// SYS_MSEND's fold: an accepted REQUEST (rc 0) is one call in flight, unless it is a corr-0 NOTICE/PREF_CHANGED.
 #[cfg(feature = "desktop_firmware")]
 fn bus_open_sent(asid: u64, frame: &[u8], rc: i64) {
-    if rc != 0 || frame.len() < crate::bus::BUS_HDR_LEN || frame[5] != crate::bus::BUS_KIND_REQUEST || (asid as usize) >= BUS_MBOX.len() {
+    if rc != 0 || frame.len() < crate::bus::BUS_HDR_LEN || frame[5] != crate::bus::BUS_KIND_REQUEST || (asid as usize) >= BUS_MBOX.len() || bus_unanswered_ask(frame) {
         return;
     }
     let cur = ASID_GEN[asid as usize].load(Ordering::Acquire);
@@ -27477,16 +27522,28 @@ fn bus_open_sent(asid: u64, frame: &[u8], rc: i64) {
 #[cfg(feature = "desktop_firmware")]
 fn bus_open_pop(asid: u64, nowait: bool) -> Option<BusMsg> {
     let cur = ASID_GEN[asid as usize].load(Ordering::Acquire);
-    let cell = &BUS_OPEN[asid as usize];
-    let _irq = IrqGuard::mask_save();
-    let mut mb = BUS_MBOX[asid as usize].lock();
-    let mut h = cell.lock();
-    bus_open_fresh(&mut h, cur);
+    let (msg, dropped) = {
+        let cell = &BUS_OPEN[asid as usize];
+        let _irq = IrqGuard::mask_save();
+        let mut mb = BUS_MBOX[asid as usize].lock();
+        let mut h = cell.lock();
+        let d0 = h.dropped;
+        let msg = bus_open_take(&mut mb, &mut h, cur, nowait);
+        (msg, h.dropped.wrapping_sub(d0))
+    };
+    if dropped != 0 {
+        serial_println!("[bus] open_arg hold full asid={} depth={} dropped={} kept=newest", asid, BUS_HOLD_DEPTH, dropped); // OPENARGQUEUE (B761): the oldest held OPEN_ARG let go, printed outside the locks
+    }
+    msg
+}
+
+/// The pop rule over one ASID's queue and hold (generation `cur`) — x86's `busx_open_take`.
+#[cfg(feature = "desktop_firmware")]
+fn bus_open_take(mb: &mut BusMbox, h: &mut BusOpenHold, cur: u64, nowait: bool) -> Option<BusMsg> {
+    bus_open_fresh(h, cur);
     if h.inflight == 0 {
-        if let Some(m) = h.held.take() {
-            if m.agen == cur {
-                return Some(m);
-            }
+        if let Some(m) = h.release(cur) {
+            return Some(m);
         }
     }
     while mb.count > 0 {
@@ -27500,7 +27557,7 @@ fn bus_open_pop(asid: u64, nowait: bool) -> Option<BusMsg> {
         }
         if una_abi::open_arg_body(&m.frame).is_some() {
             if h.inflight > 0 {
-                h.held = Some(m);
+                h.hold(m);
                 continue;
             }
             return Some(m);
@@ -27511,11 +27568,7 @@ fn bus_open_pop(asid: u64, nowait: bool) -> Option<BusMsg> {
         return Some(m);
     }
     if nowait {
-        if let Some(m) = h.held.take() {
-            if m.agen == cur {
-                return Some(m);
-            }
-        }
+        return h.release(cur);
     }
     None
 }

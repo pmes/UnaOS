@@ -32025,9 +32025,9 @@ fn busx_open_arg_to(row: usize, body: &[u8]) -> i64 {
 // (b) An OPEN_ARG enqueued while its program is INSIDE a blocking bus call (it sent a REQUEST and waits in SYS_MRECV for
 // that reply; its skip loop drops every other frame) is HELD, not lost: `BUSX_OPEN` counts each row's calls in flight
 // (+1 when SYS_MSEND accepts a REQUEST, -1 when SYS_MRECV hands out a REPLY that answers an ask); while one is in
-// flight a popped OPEN_ARG waits in the row's one-frame hold (a newer one replaces it — the bound), and it goes out
-// on the first receive with nothing in flight, or on a NOWAIT receive that finds the queue empty (the frame loop's
-// drain, never inside a call). Generation-stamped: a new tenant starts with nothing held and nothing in flight.
+// flight a popped OPEN_ARG waits in the row's hold (OPENARGQUEUE B761: a four-frame FIFO, a fifth drops the oldest
+// with a wire line — the bound), and the held frames go out in order on the receives with nothing in flight, or on
+// NOWAIT receives that find the queue empty (the frame loop's drain, never inside a call). Generation-stamped: a new tenant starts with nothing held and nothing in flight.
 
 /// [`oneinstance_gate`] for Quarry's opener (`quarry::live::openers::program_running`): `Some(delivered rc)` = `prog`
 /// was running and is raised, `file` handed to it as one OPEN_ARG; `None` = not running (the opener launches it).
@@ -32041,17 +32041,54 @@ pub fn oneinstance_open_arg(prog: &str, file: &str) -> Option<i64> {
     }
 }
 
-/// One row's hold: the generation it belongs to, its calls in flight, and the one OPEN_ARG held across them.
+/// OPENARGQUEUE (rmbp-ledger B761): how many OPEN_ARGs one row holds across a call in flight (a FIFO; a fifth drops
+/// the OLDEST, with the `[bus] open_arg hold full` line).
+#[cfg(feature = "wc")]
+const BUSX_HOLD_DEPTH: usize = 4;
+
+/// One row's hold: the generation it belongs to, its calls in flight, and the OPEN_ARGs held across them (a bounded
+/// FIFO, oldest at `head`; `dropped` counts the oldest frames a full hold let go).
 #[cfg(feature = "wc")]
 struct BusxOpenHold {
     tenancy: u64,
     inflight: u32,
-    held: Option<BusxMsg>,
+    head: usize,
+    count: usize,
+    held: [Option<BusxMsg>; BUSX_HOLD_DEPTH],
+    dropped: u32,
 }
 
 #[cfg(feature = "wc")]
 impl BusxOpenHold {
-    const EMPTY: Self = BusxOpenHold { tenancy: 0, inflight: 0, held: None };
+    const EMPTY: Self = BusxOpenHold { tenancy: 0, inflight: 0, head: 0, count: 0, held: [const { None }; BUSX_HOLD_DEPTH], dropped: 0 };
+
+    /// Hold one more OPEN_ARG at the tail; a full hold lets its OLDEST go first (`dropped` + 1).
+    fn hold(&mut self, m: BusxMsg) {
+        if self.count == BUSX_HOLD_DEPTH {
+            self.held[self.head] = None;
+            self.head = (self.head + 1) % BUSX_HOLD_DEPTH;
+            self.count -= 1;
+            self.dropped = self.dropped.wrapping_add(1);
+        }
+        let tail = (self.head + self.count) % BUSX_HOLD_DEPTH;
+        self.held[tail] = Some(m);
+        self.count += 1;
+    }
+
+    /// The oldest held OPEN_ARG of generation `cur` (a stale one is discarded on the way).
+    fn release(&mut self, cur: u64) -> Option<BusxMsg> {
+        while self.count > 0 {
+            let m = self.held[self.head].take();
+            self.head = (self.head + 1) % BUSX_HOLD_DEPTH;
+            self.count -= 1;
+            if let Some(m) = m {
+                if m.rgen == cur {
+                    return Some(m);
+                }
+            }
+        }
+        None
+    }
 }
 
 /// The count's ceiling (a count past it only releases the hold early — the trunk's behaviour, never a loss of a reply).
@@ -32066,7 +32103,8 @@ static BUSX_OPEN: crate::procslot::SlotVec<SpinMutex<BusxOpenHold>> = crate::pro
 #[cfg(feature = "wc")]
 fn busx_open_fresh(h: &mut BusxOpenHold, cur: u64) {
     if h.tenancy != cur {
-        *h = BusxOpenHold { tenancy: cur, inflight: 0, held: None };
+        *h = BusxOpenHold::EMPTY;
+        h.tenancy = cur;
     }
 }
 
@@ -32080,10 +32118,19 @@ fn busx_answers_ask(frame: &[u8]) -> bool {
     !push
 }
 
-/// SYS_MSEND's fold: an accepted REQUEST (rc 0 — its reply is queued, or relayed to a fulfiller) is one call in flight.
+/// A corr-0 NOTICE or PREF_CHANGED REQUEST: its answer is a corr-0 REPLY of the same verb, which
+/// [`busx_answers_ask`] reads as a kernel push — nothing would ever take its count down, so it is never counted
+/// (OPENARGQUEUE M1, rmbp-ledger B761).
+#[cfg(feature = "wc")]
+fn busx_unanswered_ask(frame: &[u8]) -> bool {
+    frame[8..12] == [0u8; 4] && matches!(frame[6], crate::bus::BUS_VERB_NOTICE | una_abi::BUS_VERB_PREF_CHANGED)
+}
+
+/// SYS_MSEND's fold: an accepted REQUEST (rc 0 — its reply is queued, or relayed to a fulfiller) is one call in flight,
+/// unless it is a corr-0 NOTICE/PREF_CHANGED ([`busx_unanswered_ask`]).
 #[cfg(feature = "wc")]
 fn busx_open_sent(row: usize, frame: &[u8], rc: i64) {
-    if rc != 0 || frame.len() < crate::bus::BUS_HDR_LEN || frame[5] != crate::bus::BUS_KIND_REQUEST || row >= BUSX_MBOX.len() {
+    if rc != 0 || frame.len() < crate::bus::BUS_HDR_LEN || frame[5] != crate::bus::BUS_KIND_REQUEST || row >= BUSX_MBOX.len() || busx_unanswered_ask(frame) {
         return;
     }
     let cur = SLOT_GEN[row].load(Ordering::Acquire);
@@ -32099,10 +32146,8 @@ fn busx_open_sent(row: usize, frame: &[u8], rc: i64) {
 fn busx_open_take(mb: &mut BusxMbox, h: &mut BusxOpenHold, cur: u64, nowait: bool) -> Option<BusxMsg> {
     busx_open_fresh(h, cur);
     if h.inflight == 0 {
-        if let Some(m) = h.held.take() {
-            if m.rgen == cur {
-                return Some(m); // the receive after the call: the held OPEN_ARG, before anything queued behind it
-            }
+        if let Some(m) = h.release(cur) {
+            return Some(m); // the receive after the call: the oldest held OPEN_ARG, before anything queued behind it
         }
     }
     while mb.count > 0 {
@@ -32116,7 +32161,7 @@ fn busx_open_take(mb: &mut BusxMbox, h: &mut BusxOpenHold, cur: u64, nowait: boo
         }
         if una_abi::open_arg_body(&m.frame).is_some() {
             if h.inflight > 0 {
-                h.held = Some(m); // a call is in flight: held (one frame; the newer replaces the older)
+                h.hold(m); // a call is in flight: held in order (four frames; a fifth drops the oldest)
                 continue;
             }
             return Some(m);
@@ -32127,11 +32172,7 @@ fn busx_open_take(mb: &mut BusxMbox, h: &mut BusxOpenHold, cur: u64, nowait: boo
         return Some(m);
     }
     if nowait {
-        if let Some(m) = h.held.take() {
-            if m.rgen == cur {
-                return Some(m); // the frame loop's drain: never inside a call
-            }
-        }
+        return h.release(cur); // the frame loop's drain: never inside a call
     }
     None
 }
@@ -32140,16 +32181,25 @@ fn busx_open_take(mb: &mut BusxMbox, h: &mut BusxOpenHold, cur: u64, nowait: boo
 #[cfg(feature = "wc")]
 fn busx_open_pop(row: usize, nowait: bool) -> Option<BusxMsg> {
     let cur = SLOT_GEN[row].load(Ordering::Acquire);
-    let cell = &BUSX_OPEN[row];
-    let _irq = IrqGuard::mask_save();
-    let mut mb = BUSX_MBOX[row].lock();
-    let mut h = cell.lock();
-    busx_open_take(&mut mb, &mut h, cur, nowait)
+    let (msg, dropped) = {
+        let cell = &BUSX_OPEN[row];
+        let _irq = IrqGuard::mask_save();
+        let mut mb = BUSX_MBOX[row].lock();
+        let mut h = cell.lock();
+        let d0 = h.dropped;
+        let msg = busx_open_take(&mut mb, &mut h, cur, nowait);
+        (msg, h.dropped.wrapping_sub(d0))
+    };
+    if dropped != 0 {
+        serial_println!("[bus] open_arg hold full row={} depth={} dropped={} kept=newest", row, BUSX_HOLD_DEPTH, dropped); // OPENARGQUEUE (B761): the oldest held OPEN_ARG let go, printed outside the locks
+    }
+    msg
 }
 
 /// `tests oneinstance` `pending=`: the pop rule over a LOCAL mailbox (no live row is touched). A call in flight, then
-/// two OPEN_ARGs and the call's reply queued: the reply comes first, then the newer OPEN_ARG, then nothing — and the
-/// count is back to 0. And with nothing in flight an OPEN_ARG goes straight out.
+/// two OPEN_ARGs and the call's reply queued: the reply comes first, then both OPEN_ARGs in order (OPENARGQUEUE: the
+/// hold is a FIFO now, no longer newest-wins), then nothing — and the count is back to 0. A corr-0 NOTICE ask is not
+/// counted (M1). And with nothing in flight an OPEN_ARG goes straight out.
 #[cfg(all(feature = "witness", feature = "wc"))]
 pub fn oneinstance_pending_selftest() -> bool {
     let reply = |verb: u8, corr: u32, body: &[u8]| -> BusxMsg {
@@ -32174,9 +32224,12 @@ pub fn oneinstance_pending_selftest() -> bool {
     let r1 = busx_open_take(&mut mb, &mut h, 7, false);
     let first_is_reply = r1.as_ref().is_some_and(|m| m.frame.len() >= crate::bus::BUS_HDR_LEN && m.frame[6] == una_abi::BUS_VERB_PREF_GET);
     let r2 = busx_open_take(&mut mb, &mut h, 7, false);
-    let second_is_arg = arg_of(&r2).as_deref() == Some(&b"/home/b.txt"[..]);
+    let r2b = busx_open_take(&mut mb, &mut h, 7, false);
+    let second_is_arg = arg_of(&r2).as_deref() == Some(&b"/home/a.txt"[..]) && arg_of(&r2b).as_deref() == Some(&b"/home/b.txt"[..]);
     let r3 = busx_open_take(&mut mb, &mut h, 7, true);
-    let drained = r3.is_none() && h.inflight == 0 && h.held.is_none();
+    let mut notice = alloc::vec![0u8; crate::bus::BUS_HDR_LEN];
+    let _ = crate::bus::build_reply(crate::bus::BUS_VERB_NOTICE, 0, 0, [0u8; 32], &[], &mut notice);
+    let drained = r3.is_none() && h.inflight == 0 && h.count == 0 && busx_unanswered_ask(&notice);
     // Nothing in flight: straight out.
     push(&mut mb, reply(una_abi::BUS_VERB_OPEN_ARG, 0, b"/home/c.txt"));
     let r4 = busx_open_take(&mut mb, &mut h, 7, false);
@@ -32186,4 +32239,49 @@ pub fn oneinstance_pending_selftest() -> bool {
         serial_println!("[bus] open_arg hold first_reply={} second_arg={} drained={} direct={}", first_is_reply as u8, second_is_arg as u8, drained as u8, direct as u8);
     }
     ok
+}
+
+// OPENARGQUEUE (rmbp-ledger B761; BP-ring3-18) — TAIL-APPENDED. `tests oneinstance` `hold=`: four OPEN_ARGs met during
+// one blocking call over a LOCAL mailbox (no live row is touched) — the call's reply first, then all four in the order
+// they were sent, then nothing, the count back to 0. Returns (drained in order, sent).
+#[cfg(all(feature = "witness", feature = "wc"))]
+pub fn oneinstance_hold_selftest() -> (usize, usize) {
+    const FILES: [&[u8]; BUSX_HOLD_DEPTH] = [b"/home/h0.txt", b"/home/h1.txt", b"/home/h2.txt", b"/home/h3.txt"];
+    let reply = |verb: u8, corr: u32, body: &[u8]| -> BusxMsg {
+        let mut f = alloc::vec![0u8; crate::bus::BUS_HDR_LEN + body.len()];
+        let _ = crate::bus::build_reply(verb, corr, 0, [0u8; 32], body, &mut f);
+        BusxMsg { rgen: 9, frame: f.into_boxed_slice() }
+    };
+    let mut mb = BusxMbox::EMPTY;
+    let mut h = BusxOpenHold::EMPTY;
+    busx_open_fresh(&mut h, 9);
+    h.inflight = 1; // the program sent PREF_GET (corr 0x52) and waits for it
+    let mut queue = |m: BusxMsg| {
+        let tail = (mb.head + mb.count) % BUSX_MBOX_DEPTH;
+        mb.slots[tail] = Some(m);
+        mb.count += 1;
+    };
+    for f in FILES.iter() {
+        queue(reply(una_abi::BUS_VERB_OPEN_ARG, 0, f));
+    }
+    queue(reply(una_abi::BUS_VERB_PREF_GET, 0x52, b"v"));
+    let first = busx_open_take(&mut mb, &mut h, 9, false);
+    let reply_first = first.as_ref().is_some_and(|m| m.frame.len() >= crate::bus::BUS_HDR_LEN && m.frame[6] == una_abi::BUS_VERB_PREF_GET);
+    let mut in_order = 0usize;
+    for f in FILES.iter() {
+        let m = busx_open_take(&mut mb, &mut h, 9, false);
+        if reply_first && m.as_ref().and_then(|m| una_abi::open_arg_body(&m.frame)) == Some(*f) {
+            in_order += 1;
+        } else {
+            break;
+        }
+    }
+    let empty = busx_open_take(&mut mb, &mut h, 9, true).is_none() && h.inflight == 0 && h.count == 0 && h.dropped == 0;
+    if !empty && in_order == FILES.len() {
+        in_order -= 1; // a straggler or a count left standing is not a clean drain
+    }
+    if in_order != FILES.len() {
+        serial_println!("[bus] open_arg hold reply_first={} in_order={} empty={}", reply_first as u8, in_order, empty as u8);
+    }
+    (in_order, FILES.len())
 }
