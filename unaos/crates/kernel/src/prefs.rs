@@ -1245,7 +1245,7 @@ pub fn prefscap_selftest() {
 pub fn session_gen() -> u32 {
     #[cfg(feature = "login")]
     {
-        crate::fs::users::SESSION_GEN.load(Ordering::Acquire)
+        crate::fs::users::session_gen_read() // SESSIONGENPOLL (B782): the one counted read (`users::session_gen_reads`)
     }
     #[cfg(not(feature = "login"))]
     {

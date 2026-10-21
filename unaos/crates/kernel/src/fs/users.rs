@@ -4016,3 +4016,26 @@ pub fn keyboot_rekey(name: &[u8], old: &[u8], new: &[u8]) {
     #[cfg(not(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware")))))]
     let _ = (name, old, new);
 }
+
+// =========================================================================================
+// SESSIONGENPOLL (rmbp-ledger B782) — TAIL-APPENDED: the login generation's one counted read. `prefs::session_gen` (the
+// gateway every reader outside this file uses: prefs' own `SessionSeen`s, renderwedge, svclatch) calls it; the
+// counter exists under `witness` only, so `tests settingsmap`'s switch leg can show that no prefs consumer read the
+// generation while a session switch reached it (the switch is the reload's PrefChanged, PREFSRELOAD B763).
+
+#[cfg(feature = "witness")]
+static SESSION_GEN_READS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// [`SESSION_GEN`] (Acquire), counted under `witness` ([`session_gen_reads`]).
+#[inline]
+pub fn session_gen_read() -> u32 {
+    #[cfg(feature = "witness")]
+    SESSION_GEN_READS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    SESSION_GEN.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Reads of the login generation through [`session_gen_read`] since boot (`tests settingsmap`'s `gen_reads=`).
+#[cfg(feature = "witness")]
+pub fn session_gen_reads() -> u32 {
+    SESSION_GEN_READS.load(core::sync::atomic::Ordering::Relaxed)
+}

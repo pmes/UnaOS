@@ -14,8 +14,8 @@
 //!   look exactly as it was.
 //! * [`set`] — the switch: flyouts closed, the leaving look's furniture vacated, every window's head damaged and
 //!   one composite run, then `[look] switch to=<l> from=<l> ms=<n> windows_rechromed=<n> via=<who>`.
-//! * [`service`] — the settings service pass (ONE line in `settings::service`): the login's load (a new session
-//!   generation re-reads the key), PrefChanged (verb 19: a change naming `system.look`, `prefs_client::changed_take`, so the key is re-read —
+//! * [`service`] — the settings service pass (ONE line in `settings::service`): the first pass with a session reads
+//!   the key, a login or logout arrives as the reload's PrefChanged (SESSIONGENPOLL B782), PrefChanged (verb 19: a change naming `system.look`, `prefs_client::changed_take`, so the key is re-read —
 //!   another client's `PrefSet system.look softy` switches the glass with no reboot), a Settings choice owed by
 //!   [`choose`] (stored here, off the click router), and the Start menu's hover pass.
 
@@ -43,11 +43,11 @@ impl Look {
 }
 
 static LOOK: AtomicU8 = AtomicU8::new(0);
-/// The session generation the key was last read for (`u32::MAX` = never).
-static READ_GEN: AtomicU32 = AtomicU32::new(u32::MAX);
-/// The PrefChanged mark the key was last read at (PREFSCLIENTKEYS B779: `prefs_client::changed_mark`'s sequence, claimed
-/// by [`service`] through `prefs_client::changed_take`).
-static SEEN_CHANGES: AtomicU32 = AtomicU32::new(0);
+/// The PrefChanged mark the key was last read at (`u32::MAX` = never read: the first pass that sees a session reads;
+/// PREFSCLIENTKEYS B779: `prefs_client::changed_mark`'s sequence, claimed by [`service`] through `prefs_client::changed_take`).
+/// SESSIONGENPOLL (B782): a login or logout reaches the look as the reload's PrefChanged (PREFSRELOAD B763), never as a
+/// session-generation poll.
+static SEEN_CHANGES: AtomicU32 = AtomicU32::new(u32::MAX);
 /// A Settings choice owed to the service pass: 0 none, else `look index + 1`.
 static CHOSEN: AtomicU8 = AtomicU8::new(0);
 static SWITCHES: AtomicU32 = AtomicU32::new(0);
@@ -109,16 +109,15 @@ pub fn service() {
         SEEN_CHANGES.store(crate::prefs_client::changed_mark(), Ordering::Relaxed);
         set(to, "settings");
     }
-    let g = crate::prefs::session_gen();
-    let login = READ_GEN.load(Ordering::Relaxed) != g;
-    let bus = crate::prefs_client::changed_take(&SEEN_CHANGES, is_look_key); // PREFSCLIENTKEYS (B779): only a change naming `system.look`
-    if login || bus {
-        let mut wb = [0u8; crate::prefs::WHO_BUF];
-        if crate::prefs::user_name_in(&mut wb).is_some() {
-            READ_GEN.store(g, Ordering::Relaxed);
+    let login = SEEN_CHANGES.load(Ordering::Relaxed) == u32::MAX; // SESSIONGENPOLL (B782): never read; a switch arrives as the reload's PrefChanged
+    let mut wb = [0u8; crate::prefs::WHO_BUF];
+    if crate::prefs::user_name_in(&mut wb).is_some() {
+        let bus = crate::prefs_client::changed_take(&SEEN_CHANGES, is_look_key); // PREFSCLIENTKEYS (B779): only a change naming `system.look`; claims the edge
+        if login || bus {
             let v = crate::prefs_client::sys_text(ap::LOOK_KEY);
             set(Look::from_index(ap::look_index(v.as_deref())), if login { "login" } else { "bus" });
         }
+    } // SESSIONGENPOLL (B782): no session = the change is left unconsumed (the mark untouched), so the next login's first pass reads it
     }
     super::softy::startmenu::service();
 }

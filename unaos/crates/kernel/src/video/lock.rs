@@ -73,12 +73,12 @@ static AFTER_IDLE_MIN: AtomicU32 = AtomicU32::new(IDLE_MIN_DEFAULT);
 static ON_LID: AtomicBool = AtomicBool::new(true);
 static ON_SLEEP: AtomicBool = AtomicBool::new(true);
 /// LOCKPREFS (B748): the PrefChanged mark (LOCKCHANGED B758: `prefs_client::changed_mark`'s sequence, kept beside
-/// `CHANGED_N`) and the login generation (`fs::users::SESSION_GEN`) the policy was last read under; [`prefs_pass`]
-/// re-reads when the generation moved or a change since the mark named one of the lock's three keys.
+/// `CHANGED_N`) the policy was last read under; [`prefs_pass`] re-reads when a change since the mark named one of the
+/// lock's three keys. SESSIONGENPOLL (B782): a login or logout is such a change (the reload's PrefChanged, PREFSRELOAD
+/// B763, posts every key the switch moved), so no login generation is kept.
 static SEEN_CHANGED: AtomicU32 = AtomicU32::new(0);
 /// LOCKCHANGED (B758): bus GETs [`refresh`] has made (three per re-read; the fixture's `gets=`).
 static GETS: AtomicU32 = AtomicU32::new(0);
-static SEEN_GEN: AtomicU32 = AtomicU32::new(0);
 static PRIMED: AtomicBool = AtomicBool::new(false);
 /// The last policy read failed (its one line is said; cleared by the next good read).
 static READ_FAILED: AtomicBool = AtomicBool::new(false);
@@ -167,13 +167,15 @@ pub fn persist() {
 
 /// LOCKPREFS (B748): the policy's half of a service pass. Re-reads the three keys over the bus when a PrefChanged
 /// landed since the last read (every accepted store write, whoever wrote it, while a kernel subscriber is registered —
-/// the lock registers itself on its first pass) or the session moved (a login or logout swaps the store's home and
-/// fires no PrefChanged); otherwise a few atomic loads and out. While a Settings press is owed the press is newer than
+/// the lock registers itself on its first pass — and, SESSIONGENPOLL B782, every key a login or logout moved: the
+/// reload's PrefChanged); otherwise a few atomic loads and out. While a Settings press is owed the press is newer than
 /// the store: nothing is read and the edge is kept for the pass after [`persist`]. The mark is taken BEFORE the read,
 /// so a write that lands mid-read moves it again and the next pass re-reads. LOCKCHANGED (B758): a change re-reads only
 /// when it named one of the three keys (`prefs_client::changed_since`, the last-changed keys kept beside `CHANGED_N`; a
 /// change the ring lost counts as a hit); any other key's change moves the mark and costs no GET. The edge is CLAIMED
-/// (compare-exchange on the mark, swap on the generation), so two passes never read the same edge. `true` = it re-read.
+/// (compare-exchange on the mark), so two passes never read the same edge. `true` = it re-read.
+/// SESSIONGENPOLL (B782): no login generation is read here — a switch that moved none of the three keys left the
+/// policy as it was, and one that moved any posts that key's PrefChanged (PREFSUNSET's unset form included).
 pub fn prefs_pass() -> bool {
     let primed = PRIMED.load(Ordering::Acquire);
     if !primed {
@@ -184,16 +186,14 @@ pub fn prefs_pass() -> bool {
     }
     let mark = SEEN_CHANGED.load(Ordering::Acquire);
     let (n, hit) = crate::prefs_client::changed_since(mark, is_lock_key);
-    let g = crate::fs::users::SESSION_GEN.load(Ordering::Acquire);
-    if primed && n == mark && SEEN_GEN.load(Ordering::Acquire) == g {
+    if primed && n == mark {
         return false;
     }
     if n != mark && SEEN_CHANGED.compare_exchange(mark, n, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return false; // another pass claimed this edge (and reads it if it was ours)
     }
-    let gen_moved = SEEN_GEN.swap(g, Ordering::AcqRel) != g;
     PRIMED.store(true, Ordering::Release);
-    if primed && !hit && !gen_moved {
+    if primed && !hit {
         return false; // LOCKCHANGED (B758): another key's change — the policy cannot have moved
     }
     refresh();

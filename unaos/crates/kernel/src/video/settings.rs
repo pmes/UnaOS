@@ -153,7 +153,7 @@ static SAVED_N: AtomicU32 = AtomicU32::new(0);
 static OPEN_REQ: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static STATE: crate::sync::Mutex<Option<State>> = crate::sync::Mutex::new(None);
 /// The session user the file was last loaded for (empty = never loaded).
-static LOADED_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new()); static SESSION_SEEN: crate::prefs::SessionSeen = crate::prefs::SessionSeen::new(); // SESSIONGEN (B462)
+static LOADED_FOR: crate::sync::Mutex<String> = crate::sync::Mutex::new(String::new()); static SESSION_SEEN: crate::prefs::SessionSeen = crate::prefs::SessionSeen::new(); // SESSIONGEN (B462). SESSIONGENPOLL (B782): KEPT — the session-OPEN edge for `load_for_login` (safe mode, login_keep, mode_at_login), which runs at every login even when no key differs; not a prefs poll — Settings' prefs view follows PrefChanged only (`bus_changes_inner`)
 static CUR: crate::sync::Mutex<Values> = crate::sync::Mutex::new(Values::DEFAULT);
 
 /// The persisted values.
