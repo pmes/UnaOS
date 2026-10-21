@@ -64,7 +64,6 @@ MTPPHONE: `[mtp] dev=<vid:pid> name=<s> storages=<n> objects=<n> props=<fast|wal
 FILEVERSIONS: `[fs] version inode=<n> kept=<n> bytes=<n>` · `[fs] version restore inode= n= ok=`.
 `[backup] to=<vol> files=<n> bytes=<n> ms=<n> -> ok|refused:<why>` · `[backup] restore from=<vol>/<file> into=<dir> files= bytes= ms= -> ok|refused:<why>` · `[backup] survey need= vols= archives=` · `[fs] version inode=<n> kept=<n> bytes=<n>` · `[fs] version restore inode= n= ok=` · `[quarry] versions path=<p> native=<p|-> listed=<n> refused=<n>` · `[quarry] version refused path=<p> seq=<k> greyed=1 reason=<why>` · `[quarry] op=version-restore src=<p> dst=seq<k> ok=<0|1> reason=` · `[quarry] version restored path=<p> seq=<k> from=<date>` · `[quarry] op=version-open src=<p> dst=<copy> ok=<0|1> reason=`.
 ROOTINCOMPAT: `[unafs] mount refused incompat=0x<bits>`.
-`[backup] to=<vol> files=<n> bytes=<n> ms=<n> -> ok|refused:<why>` · `[backup] restore from=<vol>/<file> into=<dir> files= bytes= ms= -> ok|refused:<why>` · `[backup] survey need= vols= archives=` · `[fs] version inode=<n> kept=<n> bytes=<n>` · `[fs] version restore inode= n= ok=` · `[quarry] versions path=<p> native=<p|-> listed=<n>` · `[quarry] op=version-restore src=<p> dst=seq<k> ok=<0|1> reason=` · `[quarry] version restored path=<p> seq=<k> from=<date>` · `[quarry] op=version-open src=<p> dst=<copy> ok=<0|1> reason=`.
 
 ## 5. Ruled, unbuilt / open
 - R94's hot swap of the root volume: design only (`unaos/crates/kernel/src/fs/rootdisk.rs:24`).

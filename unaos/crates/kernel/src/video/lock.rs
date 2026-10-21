@@ -80,6 +80,8 @@ static SEEN_CHANGED: AtomicU32 = AtomicU32::new(0);
 static GETS: AtomicU32 = AtomicU32::new(0);
 static SEEN_GEN: AtomicU32 = AtomicU32::new(0);
 static PRIMED: AtomicBool = AtomicBool::new(false);
+/// The last policy read failed (its one line is said; cleared by the next good read).
+static READ_FAILED: AtomicBool = AtomicBool::new(false);
 /// Store writes owed by a Settings press: bit 0 after_idle_min, bit 1 on_lid, bit 2 on_sleep. While any is owed the
 /// once-a-second read does not overwrite the press with the store's older value.
 static OWED: AtomicU8 = AtomicU8::new(0);
@@ -209,15 +211,16 @@ pub fn gets() -> u32 {
     GETS.load(Ordering::Relaxed)
 }
 
-/// Read the three keys over the bus (Principia's client; the schema's defaults where unset or out of range) and make
-/// them the policy in force. One line when a value moved.
+/// Read the three keys over the bus (Principia's client; the schema's defaults where unset, of another type or out of
+/// range) and make them the policy in force. One line when a value moved. A read that FAILED (any errno but -ENOENT: a
+/// relay timeout, EIO) is not an unset key: the policy in force is kept and the edge is left unclaimed
+/// ([`read_failed`]), so the next pass reads again.
 fn refresh() {
-    use crate::prefs::key;
-    use crate::prefs_client::{sys_flag, sys_int};
-    let m = sys_int(key::LOCK_AFTER_IDLE_MIN, 0, 1440).map_or(IDLE_MIN_DEFAULT, |v| v as u32);
-    let lid = sys_flag(key::LOCK_ON_LID).unwrap_or(true);
-    let slp = sys_flag(key::LOCK_ON_SLEEP).unwrap_or(true);
-    GETS.fetch_add(3, Ordering::Relaxed);
+    let (m, lid, slp) = match read_policy() {
+        Ok(p) => p,
+        Err(e) => return read_failed(e),
+    };
+    READ_FAILED.store(false, Ordering::Relaxed);
     if OWED.load(Ordering::Acquire) != 0 {
         return; // a Settings press landed during the read: it is newer than what the store answered
     }
@@ -226,6 +229,37 @@ fn refresh() {
     let slp0 = ON_SLEEP.swap(slp, Ordering::Relaxed);
     if (m0, lid0, slp0) != (m, lid, slp) {
         serial_println!("[lock] policy after_idle_min={} on_lid={} on_sleep={} via={} (prefs_client, PrefChanged)", m, lid as u8, slp as u8, crate::prefs_client::last_via());
+    }
+}
+
+/// The policy as the store holds it: `(after_idle_min, on_lid, on_sleep)`, each the schema's default where unset (-ENOENT),
+/// of another type or out of range; `Err(errno)` = a key could not be read at all.
+fn read_policy() -> Result<(u32, bool, bool), i64> {
+    use crate::prefs::key;
+    let m = read_key(key::LOCK_AFTER_IDLE_MIN)?.and_then(|v| v.as_int()).filter(|x| (0..=1440).contains(x)).map_or(IDLE_MIN_DEFAULT, |v| v as u32);
+    let lid = read_key(key::LOCK_ON_LID)?.and_then(|v| v.as_bool()).unwrap_or(true);
+    let slp = read_key(key::LOCK_ON_SLEEP)?.and_then(|v| v.as_bool()).unwrap_or(true);
+    Ok((m, lid, slp))
+}
+
+/// One lock key over the bus (`prefs_client::pref_get`, counted in [`gets`]): `Ok(Some(v))` set, `Ok(None)` unset
+/// (-ENOENT, the only errno that means "use the default"), `Err(errno)` not read.
+fn read_key(k: &str) -> Result<Option<crate::prefs_client::PrefValue>, i64> {
+    const ENOENT: i64 = -2;
+    GETS.fetch_add(1, Ordering::Relaxed);
+    match crate::prefs_client::pref_get(crate::prefs::NS, k) {
+        Ok(v) => Ok(Some(v)),
+        Err(ENOENT) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// A policy read failed (`errno`): keep the values in force and un-prime, so [`prefs_pass`] reads again on its next pass
+/// whatever the marks say. One line per failing stretch.
+fn read_failed(errno: i64) {
+    PRIMED.store(false, Ordering::Release);
+    if !READ_FAILED.swap(true, Ordering::Relaxed) {
+        serial_println!("[lock] policy read failed errno={} kept", errno);
     }
 }
 
