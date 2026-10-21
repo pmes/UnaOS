@@ -2711,7 +2711,7 @@ fi
 # kernel (fs/unafs.rs, the VFS NativeBackend, bootdisk's native `/`), and `esp-x86` additionally lays
 # target/unaos-x86-card.img — GPT p1 = the EFI System FAT (ESP + data trees), p2 = a `tools/unafs init`
 # volume. The boot prints `:: UNAFSX86: root=unafs|fat disk=... -> PASS|SKIP ::`. aarch64 carries the
-# module unconditionally, so this knob changes nothing there (its K8_FEATS arm is harmless by design).
+# module + native `/` unconditionally; the knob arms there the bare-`unafs` consumers (UnaFS home, /jobs, catalog search, root witness) — both aarch64 lines arm it (PIUNAFS SR178).
 # Default OFF => the x86 image is byte-identical. Kept in sync with builder/src/main.rs and Cargo.toml.
 [ -n "${UNAOS_UNAFS:-}" ] && _feats="${_feats}unafs,"
 # AHCIROOT (rmbp-ledger B332, R82): UNAOS_AHCIROOT=1 makes the internal SSD's UnaFS p2 the root when the disk
@@ -11617,9 +11617,9 @@ kernel8() {
     # DEFAULT-QUIET: `kernel8-test` (the battery) arms UNAOS_WITNESS so the Pi bare-metal image carries the
     # M6b..U7 fixture cascade (CAPSTONE + all -> PASS lines). The plain `kernel8` media build leaves it unset,
     # so the flashed image is quiet — reaches the shell with CAPSTONE + device honesty lines only.
-    # UNAFSX86 (B298): the Pi image carries fs::unafs unconditionally (every gate is `any(target_arch =
-    # "aarch64", feature = "unafs")`), so this arm arms nothing new there — it exists so the knob reaches
-    # every image by one name (GATE-K8REACH) and a Pi build with the knob set is the same kernel.
+    # UNAFSX86 (B298): the Pi image carries fs::unafs and the native `/` unconditionally (`any(target_arch =
+    # "aarch64", feature = "unafs")`); this arm adds the bare-`unafs` consumers (UnaFS home, /jobs, catalog search,
+    # the `:: UNAFSX86:` root witness), the rMBP rule — image-line-pi.env arms it (PIUNAFS SR178, GATE-K8REACH).
     if [ -n "${UNAOS_UNAFS:-}" ]; then
         K8_FEATS="${K8_FEATS},unafs"
     fi
