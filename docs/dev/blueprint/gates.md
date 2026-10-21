@@ -5,6 +5,15 @@
 - `./arroyo check` type-checks both arches (every kernel cfg leg) and runs GATE-LEDGER (`unaos/arroyo:8854`, `unaos/arroyo:9480-9517`).
 - `./arroyo gates` runs every host gate in `GATES_SET` (no cargo, ~30 s), one `gate=<name> rc=<n>` line each, then `GATES: <n> run <n> green -> PASS|FAIL`; exit = the worst rc (`unaos/arroyo:14426-14443`).
 - Fold legs beside the compile legs: `foldleg` (the x86 kernel + loader built under `image-line.env`), `twoboot` (the image booted twice under QEMU), `knoboff <feature>` (knob-off byte identity, `unaos/arroyo:13888`).
+- The image legs of `./arroyo check` (KERNEL_CFG_MATRIX tail): each is the knob line a card flies, so the fold type-checks it.
+
+  | leg | the line it compiles | anchor |
+  |---|---|---|
+  | `arm-tegra-image` | `unaos/scripts/image-line-orin.env` minus the four MANIFEST knobs | `unaos/arroyo:8297` |
+  | `arm-pi-image` | `unaos/scripts/image-line-pi.env`; with `arm-pi` it compiles the Pi's `baremetal` arms (no separate Pi leg: SUPSTATELEG measured it) | `unaos/arroyo:8298` |
+  | `x86-image` | the image-24 set on a literal x86 leg (keeps `x86_cfg_universe` whole) | `unaos/arroyo:8299` |
+  | `arm-tegra-image-supstate` | the Orin line + orindesk/orinclick/orinconwin/orinrender + `supstate` (SR168) | `unaos/arroyo:8317` |
+
 - Records: ledgers (`docs/dev/LEDGER.md`, `docs/dev/OS/rmbp-ledger.md` and its pi/orin siblings), queues (`docs/dev/QUEUE.md`, `docs/dev/OS/rmbp-queue.md` …), status rows (`docs/dev/STATUS.tsv`), evidence (`docs/dev/evidence/`).
 
 ## 2. Invariants
