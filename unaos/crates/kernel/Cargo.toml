@@ -3618,8 +3618,8 @@ root-prefer-sdhc = []
 # UNAFSX86 (rmbp-ledger B298, SH-2 rung 1): `UNAOS_UNAFS=1` compiles the native UnaFS volume into the x86
 # kernel — `fs/unafs.rs`, the VFS `NativeBackend`, and `bootdisk::bind_root`'s native `/` — so a boot disk
 # carrying a UnaFS partition (`UNAOS_UNAFS=1 ./arroyo esp-x86` lays one as GPT p2) roots on it and FAT is
-# demoted to `/boot` + `/apps` (the ESP). aarch64 carries the module UNCONDITIONALLY (every cfg reads
-# `any(target_arch = "aarch64", feature = "unafs")`), so Pi/Orin images are unchanged with or without it;
+# demoted to `/boot` + `/apps` (the ESP). aarch64 carries the module UNCONDITIONALLY (its deps below, every module cfg
+# `any(target_arch = "aarch64", feature = "unafs")`); the bare-`unafs` consumers (UnaFS home, /jobs, root witness) arm there too (PIUNAFS SR178: both aarch64 lines);
 # on x86 the dependency is `optional` and default OFF keeps the x86 image byte-identical (the K3-N1 size
 # band). See docs/dev/evidence/rmbp-1001/UNAFSX86.md.
 unafs = ["dep:unafs", "dep:geode_core"] # GEODEDEP (SR160): the .geode v1 codec rides the same knob
