@@ -118,7 +118,6 @@ pub fn service() {
             set(Look::from_index(ap::look_index(v.as_deref())), if login { "login" } else { "bus" });
         }
     } // SESSIONGENPOLL (B782): no session = the change is left unconsumed (the mark untouched), so the next login's first pass reads it
-    }
     super::softy::startmenu::service();
 }
 
