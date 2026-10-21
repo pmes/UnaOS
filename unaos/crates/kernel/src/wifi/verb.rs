@@ -83,9 +83,9 @@ fn scan(console: &mut Console) {
     status::set_scan(0);
     console.println(
         "wifi: scan — the beacon/probe-response parser is live and host-tested (wifi_core::ieee80211), \
-         but a passive scan needs a receive path: the d11 DMA RX rings and a channel tune for the \
-         HT-PHY. Neither is built — bcm4331.md §S5(c) records that the HT-PHY (type 7) channel tables \
-         exist in no source legal for src/wifi/, and §S6 the RX rings. scan=0, nothing on the air yet.",
+         and on wifi9 images the receive path is built (the S5c HT-PHY channel tune over htphy_tables.rs, \
+         the S6 d11 DMA RX rings), but it runs only inside `tests wifi` (bcm4331.md §7); this verb drives \
+         none of it. scan=0, nothing heard from this verb.",
     );
     console.println(&alloc::format!(
         "wifi: scan=0 (d11={}, ucode={})",

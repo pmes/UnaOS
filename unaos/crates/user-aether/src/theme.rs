@@ -230,15 +230,23 @@ pub fn due(now_ms: u64) -> bool {
             HINT = true;
         }
         let rx = &mut *core::ptr::addr_of_mut!(RX);
-        while SUB <= 0 { // ONEINSTANCE (B734): drained even when the subscription was refused — an OPEN_ARG still arrives
+        loop { // KEEPREADERS (LEDGER SR183; STALETEXT3 SR185): the program's ONE reader — drained every pass, subscribed or not (an OPEN_ARG still arrives)
             let n = una_abi::mbox_recv(rx, una_abi::MRECV_NOWAIT, bus::keep(), sys); // DROPLOOPS (SR179): the program's kept frames first, then the mailbox
             if n < BUS_HDR_LEN as i64 {
                 break; // -EAGAIN: the mailbox is empty
             }
-            if rx[0..4] == BUS_MAGIC && rx[5] == BUS_KIND_REPLY && rx[6] == BUS_VERB_PREF_CHANGED && rx[8..12] == [0; 4] {
-                HINT = true;
-            } else if let Some(a) = una_abi::open_arg_body(&rx[..(n as usize).min(BUS_FRAME_MAX)]) {
-                open_arg_keep(a); // ONEINSTANCE (B734): the loop arm — the main loop takes it ([`take_open_arg`])
+            if rx[0..4] != BUS_MAGIC || rx[5] != BUS_KIND_REPLY {
+                continue; // not a kernel delivery: nothing of this program reads it
+            }
+            match rx[6] {
+                BUS_VERB_PREF_CHANGED if rx[8..12] == [0; 4] => HINT = true, // a delivered PrefChanged: re-read at this answer
+                una_abi::BUS_VERB_OPEN_ARG => {
+                    if let Some(a) = una_abi::open_arg_body(&rx[..(n as usize).min(BUS_FRAME_MAX)]) {
+                        open_arg_keep(a); // ONEINSTANCE (B734): the loop arm — the main loop takes it ([`take_open_arg`])
+                    }
+                }
+                una_abi::BUS_VERB_NOTICE => {} // Quarry's file NOTICE: Aether registers no file type (a file reaches it as OPEN_ARG)
+                _ => {} // a reply no ask waits for any more (its `bus_ask` gave up after BUS_ASK_TRIES)
             }
         }
         if now_ms >= NEXT {
