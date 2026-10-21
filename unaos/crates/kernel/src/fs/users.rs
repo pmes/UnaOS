@@ -29,15 +29,15 @@
 //!
 //! # Where the record lives, and why (the decision the brief asked for)
 //!
-//! A dedicated file, `USERS.DAT` in the ROOT DIRECTORY of the EL0 FAT VOLUME — the one
-//! `fs::fat::mount()` answers, the same volume `SYS_OPEN` names files on (SO20: the EL0 namespace
-//! is that volume's root), the same volume the K1 `UNAFS.ATR` sidecar lived on. It exists on every
-//! platform the kernel boots from (the Pi's boot FAT, the Orin's ESP, x86's data volume, QEMU
-//! virt's stick), which the VFS root does not: on virt no block device carries this kernel, so
-//! `bootdisk` answers `[vfs] root -> NONE` and — LEDGER SO33 — caches that for the boot for every
-//! caller. A user's home has to be where the user's programs can open files, and today that is
-//! this volume; the native `/` placement (owner attributes on the Pi) moves with the native-EL0
-//! namespace gap, not before it. NOT a class in the Holocron classed-record store
+//! A dedicated file, `USERS.DAT` (swapped through `USERS.NEW`). It LOADS from the ROOT DIRECTORY of the FAT
+//! volume `store_mount` mounts (`try_load`; the ladder: the global slot, else the SDHC card, else the first AHCI
+//! entry, LOGIN16 001521db; that volume pinned for the boot at the first load, STOREMOVE B530). The first pass
+//! after the root binds SEATS it (`seat_on_root` -> `seat_with`, the `[users] seat store=` line): a FAT-root boot
+//! keeps that leaf, which `USERS_PATH` (`/USERS.DAT`) spells as the mount table does; an x86 native UnaFS root (the
+//! boot FAT sacred, R99) moves it to the kernel-owned leaf `/system/USERS.DAT` (`fs::sysleaf`, BOOTFATSEAM a2852510)
+//! and the FAT copy stays read-only. It WAS (LOGIN M1 0a04c01b) the root of the EL0 FAT volume `fs::fat::mount()`
+//! answered (SO20), chosen because on QEMU virt `bootdisk` answered `[vfs] root -> NONE` and cached it for the boot
+//! (LEDGER SO33); SO20's and SO33's state at this tip: unverified (not read). NOT a class in the Holocron classed-record store
 //! (`fs/holocron.rs`), for three reasons stated rather than implied:
 //!   1. Holocron is the BT-BOND store: its file is `/HCRON/BTBOND.DAT`, its bound is 8 records of
 //!      64 bytes, and its arming knob means "this boot may write its boot medium for a bond". A
