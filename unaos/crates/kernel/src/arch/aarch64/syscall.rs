@@ -9037,6 +9037,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
         return EACCES;
     }
     // 2. Read-only lookups — nothing claimed yet, so each failure returns cleanly.
+    let vol = match crate::fs::vfs::el0_resolve(name) { Ok(v) => v, Err(e) => return el0_errno(e) }; // EL0HOME (SR184): the name through the mount table -> its path on the EL0 FAT volume (table built and dropped here, no lock held)
     let fs = match crate::fs::fat::mount() {
         Ok(fs) => fs,
         Err(crate::fs::fat::FatError::NoDisk) => return ENODEV,
@@ -9066,7 +9067,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // `create_in_root(..)`. That identity is why the root-pinned behaviour survives as the trivial
     // case and why every pre-DIRNS fixture (U1a..U11, U6/U6g, SOCK, VFSROUTE, RMDIR-UNAFS) passes
     // unchanged — they all name bare leaves. `..` is refused, not normalised (see `el0_locate`).
-    let (de, dir_lba, dir_off) = match open_locate(&fs, name, mode, &mut created) {
+    let (de, dir_lba, dir_off) = match open_locate(&fs, &vol, mode, &mut created) {
         Ok(t) => t,
         Err(e) => return e,
     };
@@ -9157,7 +9158,7 @@ fn sys_open(name_ptr: u64, name_len: u64, mode: u64) -> i64 {
     // row of a path-created file lives for THIS BOOT only and reverts to public at the next mount.
     // That residual is LEDGER SO35, stated by LOGIN M2 and unchanged here; it closes when the native
     // volume carries path-keyed owner attributes, which is not this arc.
-    if name.contains('/') { return h as i64; }
+    if vol.contains('/') { return h as i64; } // EL0HOME: the path ON THE VOLUME decides (a home-relative leaf is a path there)
     if created && asid != 0 && mode & O_PUBLIC == 0 && caller_ppid.kind != PRIN_NONE {
         let _ = native_persist_create(name, de.first_cluster(), dir_lba, dir_off as u32, caller_ppid);
     }
@@ -24673,7 +24674,7 @@ fn el0_errno(e: crate::fs::vfs::El0LocateError) -> i64 {
         E::Invalid => EINVAL, // no leaf, a name not representable as 8.3, or a refused `..`
         E::NoSpace => ENOSPC,
         E::Busy => EAGAIN, // WEDGE-8: retryable, nothing mutated
-        E::Io => EIO, #[cfg(feature = "login")] E::KernelOwned => EACCES, // LOGIN13 M4 — the credential file, typed; `open_locate`'s own guard answers the same errno first
+        E::Io => EIO, E::NoVolume => ENODEV, E::OtherVolume => una_abi::ENOTSUP, #[cfg(feature = "login")] E::KernelOwned => EACCES, // LOGIN13 M4 — the credential file, typed; `open_locate`'s own guard answers the same errno first
     }
 }
 
