@@ -33,6 +33,10 @@ const RING_BYTES: usize = ENTRIES * ENTRY_BYTES;
 /// The mixer's HDA high water in 48 kHz frames (`audio::mixer::marks` reads it; this stream owns the number): the prime
 /// plus one entry, so at every entry boundary the FIFO still holds a whole entry (HIGH - 19 entries = 2 entries).
 pub const HIGH_FRAMES: u64 = ((RING_BYTES + ENTRY_BYTES) / 4) as u64;
+/// PLAYSTARTGAP (rmbp-ledger B805): the ring's refill window in ms — an entry must be refilled within the other 19
+/// (19 x 2 KiB at 192 B/ms, rounded up = 203). A service pass slower than this underruns the stream (`tests sinkall`'s
+/// `start_gap_ms` is held to it).
+pub const REFILL_MS: u64 = (((ENTRIES - 1) * ENTRY_BYTES) as u64).div_ceil(192);
 // AUDIO7 (B313) M3: was 128 KiB = RING_BYTES — with feed()'s 2x frame estimate the FIFO topped out at 96 KiB
 // (90312 bytes at 44.1 kHz) and never reached the RING_BYTES prime threshold: armed, never RUN, silent (PLAY2).
 const FIFO_CAP: usize = 2 * RING_BYTES;
@@ -52,17 +56,21 @@ struct St {
     // AUDIO7 (B313) M3 — the run witness: RUN readback, LPIB at RUN and as it moves, the first buffer's level.
     run_bit: bool, run_ms: u64, lpib0: u32, lpib_last: u32, lpib_moved: bool, moved_ms: u64, next_print: u64,
     level: u32, witnessed: bool, tag: u32, armed_ms: u64,
+    // PLAYSTARTGAP (B805): the last service pass that tracked the running stream, and the longest interval between two
+    // of them in its first 1000 ms (`gap_note`; the flights' `[play] t=` cadence).
+    pass_ms: u64, gap_max: u64,
 }
 impl St {
     const fn new() -> St {
         St { armed: false, running: false, ended: false, done: false, base: 0, sd: 0, eff_rate: 48_000,
              src_rate: 48_000, src_ch: 2, src_bits: 16, fifo: VecDeque::new(), carry: Vec::new(),
              prev_cur: 0, silent: 0, underruns: 0, completed: 0, err: 0, in_frames: 0, out_n: 0, resampled: false,
-             run_bit: false, run_ms: 0, lpib0: 0, lpib_last: 0, lpib_moved: false, moved_ms: 0, next_print: 0, level: 0, witnessed: false, tag: 0, armed_ms: 0 }
+             run_bit: false, run_ms: 0, lpib0: 0, lpib_last: 0, lpib_moved: false, moved_ms: 0, next_print: 0, level: 0, witnessed: false, tag: 0, armed_ms: 0, pass_ms: 0, gap_max: 0 }
     }
 }
 static ST: crate::sync::Mutex<St> = crate::sync::Mutex::new(St::new());
 
+#[derive(Clone)]
 struct Wav { path: String, rate: u32, ch: usize, bits: usize, data_off: u64, data_len: u64, pos: u64, chunk: usize, fed_end: bool, start: u64 }
 static WAV: crate::sync::Mutex<Option<Wav>> = crate::sync::Mutex::new(None);
 static PENDING: crate::sync::Mutex<Option<String>> = crate::sync::Mutex::new(None);
@@ -262,7 +270,7 @@ fn ring_pump(s: &mut St) {
         s.lpib_last = s.lpib0;
         let (ctl, on) = super::stream::run(b, sd, s.tag);
         super::amp::ramp_svc(true); // AUDIO8 (B329) M2
-        s.run_bit = on; s.run_ms = crate::arch::ms(); s.moved_ms = s.run_ms; s.next_print = s.run_ms + 100;
+        s.run_bit = on; s.run_ms = crate::arch::ms(); s.moved_ms = s.run_ms; s.next_print = s.run_ms + 100; s.pass_ms = s.run_ms;
         serial_println!("[play] run ctl={:#08x} run_bit={} lpib0={} level={} fifo={}", ctl, on as u8, s.lpib0, s.level, s.fifo.len());
         s.running = true;
         return;
@@ -325,40 +333,11 @@ fn parse(path: &str) -> Result<Wav, String> {
     Err(String::from("no data chunk"))
 }
 
-/// Parse `path`, start the stream and arm the tick-driven file pump. Prints the witness arm itself on refusal.
+/// Open `path` for play: a fresh `play-dec` job (PLAYSTARTGAP B805: EVERY play — a PCM WAV read, a coded file decoded —
+/// opens there; the RIFF parse and every file read run on that job, never on the caller or the service pass). The
+/// source is armed by `dec_pump` once the job has the facts; a refusal is printed there.
 pub fn open_wav(path: &str) -> Result<(), String> {
-    let w = match parse(path) {
-        Ok(w) => w,
-        Err(r) => { return open_coded(path, r); }
-    };
-    let eff = match src_open("player", w.rate, w.ch as u8, w.bits as u8) {
-        Ok(e) => e,
-        Err(r) => { serial_println!(":: PLAYWAV: path={} reason={} -> REFUSED ::", path, r); return Err(String::from(r)); }
-    };
-    serial_println!("[play] route type={} via=riff dec=pcm rate={} ch={}", crate::fs::filetype::type_of(path).0, w.rate, w.ch); // SOUNDOPENERS (B500) M2: a PCM RIFF is read directly — no demuxer
-    serial_println!("[play] open path={} rate={} ch={} bits={} bytes={} chunk={} eff_rate={} resampled={}", path, w.rate, w.ch, w.bits, w.data_len, w.chunk, eff, (eff != w.rate) as u8);
-    *WAV.lock() = Some(w);
-    PLAY_LIVE.store(true, Ordering::Release);
-    Ok(())
-}
-
-fn wav_pump() {
-    for _ in 0..4 {
-        let mut g = WAV.lock();
-        let Some(w) = g.as_mut() else { return };
-        if w.fed_end { return; }
-        if w.pos >= w.data_len { w.fed_end = true; drop(g); src_end(); return; }
-        let n = (w.data_len - w.pos).min(w.chunk as u64) as usize;
-        let data = crate::shell::vfs_mount_table().read(&w.path, w.data_off + w.pos, n);
-        match data {
-            Ok(d) if !d.is_empty() => {
-                let took = src_feed(&d); // SINKALL: the Player's mixer source takes whole frames, maybe fewer than read
-                if took == 0 { return; } // no room: retry next tick
-                w.pos += took as u64;
-            }
-            _ => { serial_println!("[play] read error at pos={} — ending the stream", w.pos); w.pos = w.data_len; }
-        }
-    }
+    dec_open(path)
 }
 
 /// The WAV play's verdict, judged on its mixer source's final account (SINKALL): every frame written, played out by
@@ -381,7 +360,7 @@ pub fn service() {
     if TQ_LIVE.load(Ordering::Acquire) { tq_tick(); } if R3_LIVE.load(Ordering::Acquire) { r3_tick(); } // STRIAMETAL (B618): the ring-3 stream's arm and its owner's reap (idle cost: one atomic load; file tail; LINE-NEUTRAL append, code before this comment). DECJOBHANG M3: `tests play`'s queue (idle cost: one atomic load)
     if !ACTIVE.load(Ordering::Acquire) && !PLAY_LIVE.load(Ordering::Acquire) { return; }
     if let Some(p) = PENDING.try_lock().and_then(|mut g| g.take()) { let _ = open_wav(&p); }
-    wav_pump(); coded_pump(); play_poll();
+    coded_pump(); play_poll(); // PLAYSTARTGAP (B805): `wav_pump`'s file read is `play-dec`'s now (`wav_job`): this pass never reads a file
     let fin = { let Some(mut s) = ST.try_lock() else { return }; ring_pump(&mut s); s.done && s.armed };
     if fin {
         let mut s = ST.lock();
@@ -430,8 +409,9 @@ fn synth_wav() -> Vec<u8> {
     v
 }
 
-/// `tests playwav`.
-pub fn selftest() {
+/// The PLAYWAV fixture (`synth_wav`) written to the first writable of the user's home, /home, / as `TEST.WAV` (an
+/// earlier one replaced); None when none takes it. `fixture_drop` unlinks it.
+pub fn fixture_file() -> Option<String> {
     use crate::fs::vfs::NodeKind;
     let mut cands: Vec<String> = Vec::new();
     #[cfg(feature = "login")]
@@ -458,12 +438,24 @@ pub fn selftest() {
         if ok { written = Some(c); break; }
         let _ = mt.unlink(c, p);
     }
-    let Some(path) = written else {
+    written.cloned()
+}
+
+/// Unlink a `fixture_file`.
+pub fn fixture_drop(path: &str) {
+    let _ = crate::shell::vfs_mount_table().unlink(path, crate::fs::vfs::KERNEL_PRINCIPAL);
+}
+
+/// `tests playwav`.
+pub fn selftest() {
+    let mt = crate::shell::vfs_mount_table();
+    let Some(path) = fixture_file() else {
         if let Some(k) = crate::fs::vfs::home_unwritable(&mt, "/home") { serial_println!(":: PLAYWAV: path=- -> SKIP reason=home-not-writable({}) ::", k); } else { serial_println!(":: PLAYWAV: path=- reason=no-writable-path -> FAIL ::"); } // QEMUSKIP (B613): a home the volume refuses is SKIP, never FAIL
         return;
     };
     // AUDIO7 M4 / SINKALL: the completion is the source's drain (`report` from `play_poll`), not a wall clock. The loop
     // ends on that, or on a STALL (`play_stalled`: frames written, none played for 2 s). No codec = SKIP.
+    let path = &path;
     match open_wav(path) {
         Ok(()) => {
             let mut stalled = false;
@@ -474,13 +466,13 @@ pub fn selftest() {
             }
             if stalled {
                 let (w, pl) = play_counts();
-                stop();
+                stop_all(); // PLAYSTARTGAP (B805): the WAV's read job ends too
                 serial_println!(":: PLAYWAV: path={} reason=stalled written={} played={} sink={} -> FAIL ::", path, w, pl, crate::audio::mixer::output().unwrap_or("none"));
             }
         }
         Err(r) => serial_println!(":: PLAYWAV: path={} reason=no-codec ({}) -> SKIP ::", path, r),
     }
-    let _ = mt.unlink(path, p);
+    fixture_drop(path);
 }
 
 // ── AUDIO7 (B313) M3 — the play witness ──────────────────────────────────────────────────────────────
@@ -508,6 +500,7 @@ fn track(s: &mut St) {
     let now = crate::arch::ms();
     let l = r32(b, sd + SD_LPIB);
     if l != s.lpib_last { s.lpib_moved = true; s.lpib_last = l; s.moved_ms = now; }
+    gap_note(s, now);
     if now >= s.next_print {
         let el = now.saturating_sub(s.run_ms);
         serial_println!("[play] t={} lpib={} sts={:#04x} ctl={:#04x} completed={} fifo={} under={}", el, l, r8(b, sd + SD_STS), r8(b, sd + SD_CTL), s.completed, s.fifo.len(), s.underruns);
@@ -520,6 +513,20 @@ fn track(s: &mut St) {
     }
 }
 
+/// PLAYSTARTGAP (B805): the interval since the last pass that tracked this stream, kept as the start gap while the
+/// stream is in its first 1000 ms (the window where a play's start used to read its file on this pass).
+fn gap_note(s: &mut St, now: u64) {
+    if now.saturating_sub(s.run_ms) <= 1000 { s.gap_max = s.gap_max.max(now.saturating_sub(s.pass_ms)); }
+    s.pass_ms = now;
+}
+
+/// PLAYSTARTGAP (B805): the HDA stream's start gap — the longest interval between two service passes in its first
+/// second after RUN (`gap_note`); None before a RUN, or while the stream is busy this instant.
+pub fn start_gap_ms() -> Option<u64> {
+    let s = ST.try_lock()?;
+    if s.run_ms == 0 { return None; }
+    Some(s.gap_max)
+}
 
 // ── AUDIOCODEC (SR30) M5 — `play <any file>`: audio_core sniffs and decodes, `feed()` takes the 16-bit PCM ──────
 // Reached from `open_wav` when the WAV parse refuses a file (any non-RIFF file, and WAVs it does not take: 24/32-bit,
@@ -544,8 +551,8 @@ impl audio_core::Read for VfsSrc {
 
 // MP3HANG (rmbp B373): the coded player's state, its decode and its verdict live at the file TAIL (`dec_*`):
 // the decoder runs on its own `play-dec` task, never on the caller of `open_wav`/`service()` (flight 23: the
-// render task, 32 KiB, run off its stack by a 92.5 KiB `Decoder::open` frame). These three keep their names.
-fn open_coded(path: &str, wav_reason: String) -> Result<(), String> { dec_open(path, wav_reason) }
+// render task, 32 KiB, run off its stack by a 92.5 KiB `Decoder::open` frame). These two keep their names
+// (PLAYSTARTGAP B805: `open_coded` went — `open_wav` opens every play through `dec_open`).
 fn coded_pump() { dec_pump() }
 fn coded_report(p: &crate::audio::mixer::Played, sink: &str) { dec_report(p, sink) }
 
@@ -612,9 +619,10 @@ const STAGE_SYNTH: u8 = 4; // our side: downmix / decimate / pack to 16-bit
 const STAGE_DMA: u8 = 5; // the queue is full: waiting on the ring to drain (not a decoder stall)
 const STAGE_DONE: u8 = 6;
 const STAGE_QUEUED: u8 = 7; // DECJOBHANG (B386): spawned, its first instruction not yet run
+const STAGE_READ: u8 = 8; // PLAYSTARTGAP (B805): a PCM WAV's chunk read (`wav_job`), off the service pass
 
 fn stage_name(s: u8) -> &'static str {
-    match s { STAGE_QUEUED => "queued", STAGE_DEMUX => "demux", STAGE_ARM => "arm", STAGE_FRAME => "frame", STAGE_SYNTH => "synth", STAGE_DMA => "dma", STAGE_DONE => "done", _ => "idle" }
+    match s { STAGE_QUEUED => "queued", STAGE_DEMUX => "demux", STAGE_ARM => "arm", STAGE_FRAME => "frame", STAGE_SYNTH => "synth", STAGE_DMA => "dma", STAGE_DONE => "done", STAGE_READ => "read", _ => "idle" }
 }
 
 static DEC_STAGE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(STAGE_IDLE);
@@ -643,6 +651,9 @@ struct DecOut {
     consumed: bool,
     /// SINKALL: the sound is a video's (`vplay`'s demuxer share): the mixer source is named `video`.
     video: bool,
+    /// PLAYSTARTGAP (B805): a PCM WAV's facts as `play-dec` parsed them — the job READS its data, never decodes it;
+    /// `dec_pump` takes them to arm the source (`wav_arm`).
+    wav: Option<Wav>,
 }
 static DEC_OUT: crate::sync::Mutex<Option<DecOut>> = crate::sync::Mutex::new(None);
 
@@ -650,9 +661,10 @@ static DEC_OUT: crate::sync::Mutex<Option<DecOut>> = crate::sync::Mutex::new(Non
 struct Coded { path: String, info: audio_core::Info, step: usize, armed: bool, fed_end: bool, open_ms: u64 }
 static CODED: crate::sync::Mutex<Option<Coded>> = crate::sync::Mutex::new(None);
 
-/// `open_coded`: hand `path` to a fresh `play-dec` task. Returns at once; the stream is armed by `dec_pump` once the
-/// decoder has read the headers. One decoder at a time: a live (or wedged) one refuses the next open, by name.
-fn dec_open(path: &str, wav_reason: String) -> Result<(), String> {
+/// `open_wav`: hand `path` to a fresh `play-dec` task. Returns at once; the source is armed by `dec_pump` once the
+/// job has read the headers (a WAV's RIFF parse or the decoder's open). One job at a time: a live (or wedged) one
+/// refuses the next open, by name (the Player's `open_player` / `seek_to` supersede it first).
+fn dec_open(path: &str) -> Result<(), String> {
     if DEC_LIVE.load(Ordering::Acquire) {
         let st = stage_name(DEC_STAGE.load(Ordering::Acquire));
         serial_println!(":: PLAYWAV: path={} reason=decoder busy (stage={}) -> REFUSED ::", path, st);
@@ -660,8 +672,8 @@ fn dec_open(path: &str, wav_reason: String) -> Result<(), String> {
     }
     stop();
     let jid = DEC_GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-    *DEC_OUT.lock() = Some(DecOut { jid, path: String::from(path), info: None, open_err: None, wav_reason, out_ch: 1, step: 1,
-                                    pcm: VecDeque::new(), decoded: 0, fed: 0, eos: false, err: None, consumed: false, video: false });
+    *DEC_OUT.lock() = Some(DecOut { jid, path: String::from(path), info: None, open_err: None, wav_reason: String::new(), out_ch: 1, step: 1,
+                                    pcm: VecDeque::new(), decoded: 0, fed: 0, eos: false, err: None, consumed: false, video: false, wav: None });
     *CODED.lock() = None;
     DEC_ABORT.store(false, Ordering::Release);
     DEC_ARMED.store(false, Ordering::Release);
@@ -691,11 +703,14 @@ fn dec_beat(stage: u8) {
 fn dec_task(arg: usize) {
     use audio_core::AudioDecoder;
     let jid = arg as u32; #[cfg(target_arch = "x86_64")] DEC_TID.store(crate::sync::here_tid(), Ordering::Release); // LOCKREG (B414): the decoder's task id, so an abort can NAME what it holds and waits on
-    let mine = || DEC_GEN.load(Ordering::Acquire) == jid && !DEC_ABORT.load(Ordering::Acquire);
+    let mine = || dec_mine(jid);
     let paint = dec_stack_paint();
     let path = match DEC_OUT.lock().as_ref() { Some(o) if o.jid == jid => o.path.clone(), _ => { dec_exit(jid, paint, "superseded"); return; } };
     dec_ran(jid);
     dec_beat(STAGE_DEMUX);
+    // PLAYSTARTGAP (B805): a PCM RIFF is READ here (`wav_job`), never on the service pass; anything else is decoded
+    let wav_reason = match parse(&path) { Ok(w) => { wav_job(jid, paint, &path, w); return; } Err(r) => r };
+    if let Some(o) = DEC_OUT.lock().as_mut().filter(|o| o.jid == jid) { o.wav_reason = wav_reason; }
     #[cfg(all(feature = "wc", feature = "videoplayer"))]
     let shared = crate::video::vplay::shared_audio(&path).map(audio_core::Decoder::from_source); // VPLAYAUDIO (B475): the live picture job's Demuxer share — one read, one parse — through audio_core::container::open_demuxed
     #[cfg(not(all(feature = "wc", feature = "videoplayer")))]
@@ -722,10 +737,7 @@ fn dec_task(arg: usize) {
     if let Some(o) = DEC_OUT.lock().as_mut().filter(|o| o.jid == jid) { o.info = Some(info); o.step = step; o.out_ch = out_ch; o.video = video; }
     // `[play] open` is printed by `dec_pump` when it arms the stream: no frame is decoded before it is on the wire.
     dec_beat(STAGE_ARM);
-    while mine() && !DEC_ARMED.load(Ordering::Acquire) {
-        if tms().saturating_sub(DEC_BEAT_MS.load(Ordering::Acquire)) > DEC_ORPHAN_MS { dec_exit(jid, paint, "never-armed"); return; }
-        crate::arch::sched::sleep_ms(2);
-    }
+    if !dec_armed_wait(jid, paint) { return; }
     let ch = info.channels as usize;
     let mut buf: Vec<i32> = alloc::vec![0; 4096 * step * ch.max(1)];
     let mut phase = 0usize;
@@ -736,16 +748,7 @@ fn dec_task(arg: usize) {
     let mut skip = seek_table(jid, &mut dec, info.rate); // PLAYER (B419): a seek's decode-skip (0 for every other open)
     loop {
         if !mine() { dec_exit(jid, paint, "aborted"); return; }
-        // the bounded queue: decode ahead no further than DEC_QUEUE; a consumer gone for DEC_ORPHAN_MS ends the task
-        let queued = DEC_OUT.lock().as_ref().map(|o| o.pcm.len()).unwrap_or(0);
-        if queued >= DEC_QUEUE {
-            dec_beat(STAGE_DMA);
-            crate::arch::sched::sleep_ms(2);
-            waited_ms += 2;
-            if waited_ms > DEC_ORPHAN_MS && !PAUSED.load(Ordering::Acquire) { dec_exit(jid, paint, "consumer-gone"); return; } // PLAYER (B419): a paused consumer is not gone
-            continue;
-        }
-        waited_ms = 0;
+        match dec_room(jid, paint, &mut waited_ms) { Some(true) => {} Some(false) => continue, None => return }
         dec_beat(STAGE_FRAME);
         let (n, err) = match dec.next_i32(&mut buf) { Ok(n) => (n, None), Err(e) => (0, Some(e)) };
         calls += 1;
@@ -787,6 +790,110 @@ fn dec_task(arg: usize) {
         }
         if eos { dec_exit(jid, paint, "eos"); return; }
         crate::arch::sched::yield_now();
+    }
+}
+
+/// `play-dec`'s job `jid` is still the current one and not aborted.
+fn dec_mine(jid: u32) -> bool {
+    DEC_GEN.load(Ordering::Acquire) == jid && !DEC_ABORT.load(Ordering::Acquire)
+}
+
+/// `play-dec` after its open: wait for `dec_pump` to arm the source (so `[play] open` is on the wire before any frame).
+/// False when the job ended instead (superseded, or never armed within `DEC_ORPHAN_MS`).
+fn dec_armed_wait(jid: u32, paint: Option<(u64, u64)>) -> bool {
+    while dec_mine(jid) && !DEC_ARMED.load(Ordering::Acquire) {
+        if tms().saturating_sub(DEC_BEAT_MS.load(Ordering::Acquire)) > DEC_ORPHAN_MS { dec_exit(jid, paint, "never-armed"); return false; }
+        crate::arch::sched::sleep_ms(2);
+    }
+    true
+}
+
+/// The bounded queue: produce no further than `DEC_QUEUE` ahead. Some(true) = room now; Some(false) = it waited one
+/// step (the caller loops); None = the consumer was gone for `DEC_ORPHAN_MS` and the job ended.
+fn dec_room(jid: u32, paint: Option<(u64, u64)>, waited_ms: &mut u64) -> Option<bool> {
+    let queued = DEC_OUT.lock().as_ref().map(|o| o.pcm.len()).unwrap_or(0);
+    if queued < DEC_QUEUE { *waited_ms = 0; return Some(true); }
+    dec_beat(STAGE_DMA);
+    crate::arch::sched::sleep_ms(2);
+    *waited_ms += 2;
+    if *waited_ms > DEC_ORPHAN_MS && !PAUSED.load(Ordering::Acquire) { dec_exit(jid, paint, "consumer-gone"); return None; } // PLAYER (B419): a paused consumer is not gone
+    Some(false)
+}
+
+/// PLAYSTARTGAP (rmbp-ledger B805) — a PCM WAV's play on `play-dec`: its chunk reads, which `wav_pump` ran on the HDA
+/// service pass (flight 28: four 32 KiB UnaFS reads under `WAV`, `t=467 -> t=946`), go through the same bounded queue,
+/// heartbeat and watchdog as a decode. The bytes stay in the file's format; the mixer source converts them.
+fn wav_job(jid: u32, paint: Option<(u64, u64)>, path: &str, mut w: Wav) {
+    wav_seek(jid, &mut w);
+    serial_println!("[play] route type={} via=riff dec=pcm rate={} ch={}", crate::fs::filetype::type_of(path).0, w.rate, w.ch); // SOUNDOPENERS (B500) M2: a PCM RIFF is read directly — no demuxer
+    let (fin, chunk, end) = ((w.ch * w.bits / 8) as u64, w.chunk as u64, w.data_len);
+    let mut pos = w.pos;
+    if let Some(o) = DEC_OUT.lock().as_mut().filter(|o| o.jid == jid) { o.wav = Some(w.clone()); }
+    dec_beat(STAGE_ARM);
+    if !dec_armed_wait(jid, paint) { return; }
+    let t0 = crate::arch::ms();
+    let (mut calls, mut waited_ms) = (0u32, 0u64);
+    loop {
+        if !dec_mine(jid) { dec_exit(jid, paint, "aborted"); return; }
+        match dec_room(jid, paint, &mut waited_ms) { Some(true) => {} Some(false) => continue, None => return }
+        dec_beat(STAGE_READ);
+        let n = (end - pos).min(chunk) as usize;
+        let data = if n == 0 { Ok(Vec::new()) } else { crate::shell::vfs_mount_table().read(&w.path, w.data_off + pos, n) };
+        let got = match data {
+            Ok(d) if !d.is_empty() || n == 0 => d,
+            _ => { serial_println!("[play] read error at pos={} — ending the stream", pos); Vec::new() }
+        };
+        pos = if got.is_empty() { end } else { pos + got.len() as u64 };
+        calls += 1;
+        DEC_CALLS.store(calls as u64, Ordering::Release);
+        let (frames, eos) = {
+            let mut g = DEC_OUT.lock();
+            let Some(o) = g.as_mut().filter(|o| o.jid == jid) else { drop(g); dec_exit(jid, paint, "superseded"); return; };
+            o.pcm.extend(got.iter().copied());
+            o.decoded += got.len() as u64 / fin;
+            o.fed += got.len() as u64 / fin;
+            if pos >= end { o.eos = true; }
+            (o.decoded, o.eos)
+        };
+        if eos || calls % DEC_PRINT_EVERY == 0 {
+            DEC_BEATS.fetch_add(1, Ordering::AcqRel);
+            serial_println!("[play] pcm frames={} calls={} ms={}{}", frames, calls, crate::arch::ms().saturating_sub(t0), if eos { " eos=1" } else { "" });
+        }
+        if eos { dec_exit(jid, paint, "eos"); return; }
+        crate::arch::sched::yield_now();
+    }
+}
+
+/// A WAV seek's frame: `ms` into the data, clamped to its end — `(frame, total frames)`.
+fn wav_frame(w: &Wav, ms: u64) -> (u64, u64) {
+    let total = w.data_len / (w.ch * w.bits / 8) as u64;
+    ((ms * w.rate as u64 / 1000).min(total), total)
+}
+
+/// `wav_job`'s start for a seek minted for `jid` (`seek_to`): the exact PCM frame, and the seek line.
+fn wav_seek(jid: u32, w: &mut Wav) {
+    if SEEK_JID.load(Ordering::Acquire) != jid || jid == 0 { return; }
+    let ms = SEEK_MS.load(Ordering::Acquire);
+    let fin = (w.ch * w.bits / 8) as u64;
+    let (frame, total) = wav_frame(w, ms);
+    w.pos = frame * fin;
+    w.start = w.pos;
+    serial_println!("[play] seek to_ms={} landed_ms={} method=table table=pcm exact=1 byte={} sample={} of {} eff_rate={} path={}", ms, frame * 1000 / w.rate.max(1) as u64, w.pos, frame, total, crate::audio::mixer::RATE, w.path);
+}
+
+/// `dec_pump`'s arm for a WAV job: its mixer source, the `[play] open` line, the play's facts for `report`.
+fn wav_arm(w: Wav) {
+    match src_open("player", w.rate, w.ch as u8, w.bits as u8) {
+        Ok(eff) => {
+            serial_println!("[play] open path={} rate={} ch={} bits={} bytes={} chunk={} eff_rate={} resampled={}", w.path, w.rate, w.ch, w.bits, w.data_len, w.chunk, eff, (eff != w.rate) as u8);
+            *WAV.lock() = Some(w);
+            PLAY_LIVE.store(true, Ordering::Release);
+            DEC_ARMED.store(true, Ordering::Release);
+        }
+        Err(r) => {
+            serial_println!(":: PLAYWAV: path={} reason={} -> REFUSED ::", w.path, r);
+            dec_end_play();
+        }
     }
 }
 
@@ -832,15 +939,16 @@ fn dec_stack_high(paint: Option<(u64, u64)>) -> u64 {
 fn dec_pump() {
     let jid = DEC_GEN.load(Ordering::Acquire);
     // 1) the decoder's open finished: arm the HDA stream here, on the service side, and say so BEFORE any frame
-    let need_arm = CODED.lock().is_none();
+    let need_arm = CODED.lock().is_none() && WAV.lock().is_none();
     if need_arm {
-        let (path, info, open_err, step, out_ch, video) = {
+        let (path, info, open_err, step, out_ch, video, wav) = {
             let mut g = DEC_OUT.lock();
             let Some(o) = g.as_mut().filter(|o| o.jid == jid && !o.consumed) else { return };
-            if o.open_err.is_none() && o.info.is_none() { drop(g); dec_watch(jid); return; } // still in the demux
+            if o.open_err.is_none() && o.info.is_none() && o.wav.is_none() { drop(g); dec_watch(jid); return; } // still in the demux
             o.consumed = true;
-            (o.path.clone(), o.info, o.open_err.clone(), o.step, o.out_ch, o.video)
+            (o.path.clone(), o.info, o.open_err.clone(), o.step, o.out_ch, o.video, o.wav.take())
         };
+        if let Some(w) = wav { wav_arm(w); return; } // PLAYSTARTGAP (B805): a WAV job's facts arm the source
         if let Some(r) = open_err {
             serial_println!(":: PLAYWAV: path={} reason={} -> REFUSED ::", path, r);
             dec_end_play();
@@ -867,9 +975,13 @@ fn dec_pump() {
     // 2) the watchdog
     if dec_watch(jid) { return; }
     // 3) PCM across into the play's mixer source (`src_feed`, SINKALL): chunks of at most 16 KiB, as much as it takes
-    let armed = CODED.lock().as_ref().map(|c| c.armed && !c.fed_end).unwrap_or(false);
-    if !armed { return; }
-    dec_feed(jid);
+    let coded = CODED.lock().as_ref().map(|c| c.armed && !c.fed_end).unwrap_or(false);
+    let wav = WAV.lock().as_ref().is_some_and(|w| !w.fed_end);
+    if !(coded || wav) { return; }
+    if dec_feed(jid) {
+        if let Some(c) = CODED.lock().as_mut() { c.fed_end = true; }
+        if let Some(w) = WAV.lock().as_mut() { w.fed_end = true; }
+    }
 }
 
 /// The watchdog: a decoder silent in a CPU stage (demux/frame/synth) for `DEC_STALL_MS` is named on the wire and
@@ -877,7 +989,7 @@ fn dec_pump() {
 fn dec_watch(jid: u32) -> bool {
     let stage = DEC_STAGE.load(Ordering::Acquire);
     if DEC_LIVE.load(Ordering::Acquire) && stage == STAGE_QUEUED && dec_queued_watch(jid) { return true; }
-    if DEC_LIVE.load(Ordering::Acquire) && matches!(stage, STAGE_DEMUX | STAGE_FRAME | STAGE_SYNTH) {
+    if DEC_LIVE.load(Ordering::Acquire) && matches!(stage, STAGE_DEMUX | STAGE_FRAME | STAGE_SYNTH | STAGE_READ) {
         let silent = tms().saturating_sub(DEC_BEAT_MS.load(Ordering::Acquire));
         if silent > DEC_STALL_MS {
             let (codec, frames) = {
@@ -897,27 +1009,29 @@ fn dec_watch(jid: u32) -> bool {
     false
 }
 
-/// Decoded PCM into the play's mixer source (`src_feed`, SINKALL): chunks of at most 16 KiB, drained by what it took.
-fn dec_feed(jid: u32) {
+/// The job's PCM (decoded, or a WAV's bytes) into the play's mixer source (`src_feed`, SINKALL): chunks of at most
+/// 16 KiB, drained by what it took. True when the queue is spent at eos and the source was ended (`src_end`).
+fn dec_feed(jid: u32) -> bool {
     for _ in 0..8 {
         let (chunk, eos_empty) = {
             let mut g = DEC_OUT.lock();
-            let Some(o) = g.as_mut().filter(|o| o.jid == jid) else { return };
+            let Some(o) = g.as_mut().filter(|o| o.jid == jid) else { return false };
             let n = o.pcm.len().min(16 * 1024) & !3usize;
             let n = if n == 0 && o.eos { o.pcm.len() } else { n };
             (o.pcm.iter().take(n).copied().collect::<Vec<u8>>(), o.eos && o.pcm.len() == n)
         };
         if chunk.is_empty() {
-            if eos_empty { if let Some(c) = CODED.lock().as_mut() { c.fed_end = true; } src_end(); }
-            return;
+            if eos_empty { src_end(); }
+            return eos_empty;
         }
         let took = src_feed(&chunk); // SINKALL: the Player's mixer source takes whole frames, maybe fewer than offered
-        if took == 0 { return; } // no room: retry next tick
+        if took == 0 { return false; } // no room: retry next tick
         let mut g = DEC_OUT.lock();
         if let Some(o) = g.as_mut().filter(|o| o.jid == jid) { o.pcm.drain(..took); }
         drop(g);
-        if eos_empty && took == chunk.len() { if let Some(c) = CODED.lock().as_mut() { c.fed_end = true; } src_end(); return; }
+        if eos_empty && took == chunk.len() { src_end(); return true; }
     }
+    false
 }
 
 /// A coded play that ends without a verdict from the ring (refused open, a stall): the player goes idle.
@@ -1173,25 +1287,14 @@ pub fn facts(path: &str) -> Option<(u32, u16, u16, Option<u64>, &'static str)> {
 
 /// Seek `path` to `ms`: re-arm the play there. `Ok((landed_ms, method))`. Whatever was playing stops first.
 pub fn seek_to(path: &str, ms: u64) -> Result<(u64, &'static str), String> {
-    if let Ok(mut w) = parse(path) {
-        let fin = (w.ch * w.bits / 8) as u64;
-        let total = w.data_len / fin;
-        let frame = (ms * w.rate as u64 / 1000).min(total);
-        let landed = frame * 1000 / w.rate.max(1) as u64;
-        if DEC_LIVE.load(Ordering::Acquire) { dec_stop(); }
-        let eff = src_open("player", w.rate, w.ch as u8, w.bits as u8).map_err(String::from)?;
-        w.pos = frame * fin;
-        w.start = w.pos;
-        serial_println!("[play] seek to_ms={} landed_ms={} method=table table=pcm exact=1 byte={} sample={} of {} eff_rate={} path={}", ms, landed, frame * fin, frame, total, eff, path);
-        *WAV.lock() = Some(w);
-        PLAY_LIVE.store(true, Ordering::Release);
-        return Ok((landed, "table"));
-    }
-    // coded: supersede the live job (its `mine()` goes false at its next step; its exit leaves the new job's liveness)
+    // PLAYSTARTGAP (B805): a WAV's landing is its exact frame (`wav_frame`, the arithmetic `wav_seek` runs on `play-dec`)
+    let wav = parse(path).ok().map(|w| { let (f, _) = wav_frame(&w, ms); f * 1000 / w.rate.max(1) as u64 });
+    // supersede the live job (its `mine()` goes false at its next step; its exit leaves the new job's liveness)
     DEC_LIVE.store(false, Ordering::Release);
     SEEK_MS.store(ms, Ordering::Release);
     SEEK_JID.store(DEC_GEN.load(Ordering::Acquire).wrapping_add(1), Ordering::Release);
-    dec_open(path, String::from("seek: not a PCM WAV"))?;
+    dec_open(path)?;
+    if let Some(landed) = wav { return Ok((landed, "table")); }
     Ok((ms, "coded")) // SEEKTABLE (B433): the `play-dec` job seeks (its `[play] seek … method=` line); `seek_result` reads it
 }
 
@@ -1649,7 +1752,7 @@ pub fn r3_pos(handle: u64, row: usize, tgen: u64, what: u64) -> i64 {
 }
 
 // ── SINKALL (rmbp-ledger B767) — THE PLAYER'S SOURCE: the Player, the video's sound and `tests sinkall` ───────────────
-// The Player's producers (`wav_pump`, `dec_feed`) write ONE mixer source (`audio::mixer::open_fmt`, named `player`, or
+// The Player's producer (`dec_feed`, from `play-dec`'s queue — PLAYSTARTGAP B805) writes ONE mixer source (`audio::mixer::open_fmt`, named `player`, or
 // `video` for a video's sound) instead of the HDA stream; the mixer takes it to the chosen sink. [`PLAY`] is that
 // source's id and the A/V clock's rate; [`PLAY_LIVE`] is "a play is in flight" (`busy`). `play_poll` (the service tick)
 // reads the source's account and, once drained, closes it and gives the verdict (`report` / `dec_report`). Every lock

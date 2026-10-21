@@ -5389,7 +5389,7 @@ fn trashtoast_empty_leg(base: &str) -> bool {
 // not opened by the mixer. usb_volume = the device's Feature Unit took SET_CUR (ok), or with no device the descriptor
 // walk of QEMU's unit (fixture).
 // Wire: `[sinkall] leg …`, `[audio] source=<player|video|alert> sink=<hda|usb|bt> frames=<n>`,
-// `:: SINKALL: sources=<n> direct_writes=<n> usb_volume=<ok|fixture|mixer|FAIL|not-built> -> PASS|SKIP|FAIL :: hda= usb= bt= overlap= pause_ms=<n> slider_ms=<n> ::` (SINKALLDOCS B781: -1 when not measured; PASS needs <= 250; the leg is `sinkall_pause`, file tail; MIXERPUMP B787: slider_ms <= 20, `sinkall_slider`, file tail).
+// `:: SINKALL: sources=<n> direct_writes=<n> usb_volume=<ok|fixture|mixer|FAIL|not-built> -> PASS|SKIP|FAIL :: hda= usb= bt= overlap= pause_ms=<n> slider_ms=<n> start_gap_ms=<n> ::` (PLAYSTARTGAP B805: start_gap_ms -1 = not measured, else PASS needs <= `hda::play::REFILL_MS` = 203, `sinkall_start`, file tail; SINKALLDOCS B781: -1 when not measured; PASS needs <= 250; the leg is `sinkall_pause`, file tail; MIXERPUMP B787: slider_ms <= 20, `sinkall_slider`, file tail).
 #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
 fn sinkall_selftest() {
     use crate::audio::{self, mixer, Sink};
@@ -5410,22 +5410,22 @@ fn sinkall_selftest() {
         if open == 1 && after == 0 && ok { "synthetic" } else { "FAIL" }
     };
     let live = if hda == "ok" { Some(("hda", 0usize)) } else if usb == "ok" { Some(("usb", 1usize)) } else { None };
-    let (mut sources, mut overlap, mut pause_ms) = (0u32, "-", u64::MAX);
+    let (mut sources, mut overlap, mut pause_ms) = (0u32, "-", u64::MAX); let mut start_gap: Option<u64> = None; // PLAYSTARTGAP (B805): None = not measured
     if let Some((s, k)) = live {
         sources = 1; // the alert reached a sink
         let _ = audio::sink(s);
         sources += sinkall_player("player", s, k) as u32;
         sources += sinkall_player("video", s, k) as u32;
-        overlap = if sinkall_overlap(s) { "ok" } else { "FAIL" }; pause_ms = sinkall_pause(s); // SINKALLDOCS (B781): the Player's pause lands within the sink's queue (file tail)
+        overlap = if sinkall_overlap(s) { "ok" } else { "FAIL" }; pause_ms = sinkall_pause(s); start_gap = sinkall_start(s); // SINKALLDOCS (B781): the Player's pause lands within the sink's queue (file tail). PLAYSTARTGAP (B805): a file play's start gap on the HDA ring (file tail)
     }
     let usb_volume = sinkall_usb_volume(usb); let slider_ms = sinkall_slider(hda, usb); // MIXERPUMP (B787): a set through `status::set_volume` reaches its carrier within one period + 10 ms (file tail)
     let direct = play::epoch().wrapping_sub(e0) as i64 - mixer::hda_opens().wrapping_sub(o0) as i64;
     let _ = audio::sink(if was == Sink::Usb { "usb" } else if was == Sink::Hda { "hda" } else { "bt" });
     let failed = [hda, usb, bt_live, bt, overlap, usb_volume].iter().any(|v| *v == "FAIL");
-    let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 && pause_ms <= SINKALL_PAUSE_MS && slider_ms <= SINKALL_SLIDER_MS { "PASS" } else { "FAIL" };
+    let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 && pause_ms <= SINKALL_PAUSE_MS && slider_ms <= SINKALL_SLIDER_MS && start_gap.map_or(true, |g| g <= play::REFILL_MS) { "PASS" } else { "FAIL" };
     serial_println!(
-        ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} pause_ms={} slider_ms={} ::",
-        sources, direct, usb_volume, verdict, hda, usb, bt, overlap, pause_ms as i64, slider_ms as i64
+        ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} pause_ms={} slider_ms={} start_gap_ms={} ::",
+        sources, direct, usb_volume, verdict, hda, usb, bt, overlap, pause_ms as i64, slider_ms as i64, start_gap.map_or(-1, |g| g as i64)
     );
 }
 
@@ -6081,4 +6081,39 @@ fn settingsmap_ring_leg() {
 #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))]
 fn ehci_hub_selftest() {
     crate::drivers::ehci::hubchange::selftest();
+}
+
+// PLAYSTARTGAP (rmbp-ledger B805; BP-audio-17) — TAIL-APPENDED: `tests sinkall`'s start leg. A FILE play (the PLAYWAV
+// fixture, `hda::play::fixture_file`) through the Player's open (`open_player`): its reads run on `play-dec`, so the HDA
+// service pass never reads the file. start_gap_ms = the longest interval between two service passes of the HDA stream in
+// its first second (`hda::play::start_gap_ms`, the flights' `[play] t=` cadence; f28 showed 479 ms on TEST.WAV), counted
+// only when the stream's epoch moved (the stream is this play's). None (-1) = not measured: the live sink is not HDA, no
+// home takes the fixture, or the stream was not this play's. PASS in `sinkall_selftest` needs <= `REFILL_MS` (203). QEMU's
+// VFS is fast: this leg cannot tell the old service-pass read from the new; the rmbp TEST.WAV flight is the measure.
+// Wire: `[sinkall] leg start sink= done= epoch_moved= start_gap_ms= refill_ms=`.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_start(sink: &str) -> Option<u64> {
+    use crate::drivers::hda::play;
+    if sink != "hda" {
+        serial_println!("[sinkall] leg start sink={} -> not-measured (the ring is the HDA stream's)", sink);
+        return None;
+    }
+    let Some(path) = play::fixture_file() else {
+        serial_println!("[sinkall] leg start sink={} -> not-measured (no writable home for the fixture)", sink);
+        return None;
+    };
+    let e0 = play::epoch();
+    let opened = play::open_player(&path).is_ok();
+    let done = opened && play::pump_until(6_000, || !play::busy());
+    let moved = play::epoch() != e0;
+    let gap = if !done { Some(u64::MAX) } else if moved { play::start_gap_ms() } else { None };
+    if !done {
+        play::stop_all();
+    }
+    play::fixture_drop(&path);
+    serial_println!(
+        "[sinkall] leg start sink={} done={} epoch_moved={} start_gap_ms={} refill_ms={}",
+        sink, done as u8, moved as u8, gap.map_or(-1, |g| g as i64), play::REFILL_MS
+    );
+    gap
 }
