@@ -6218,7 +6218,6 @@ fn sinkall_idle_level(usb: &str) -> &'static str {
         "not-built"
     }
 }
-}
 
 /// WIFIDATA (rmbp-ledger B803) — TAIL-APPENDED: the SECOND word after the fixture name (`tests wifi <ssid> <gw>`:
 /// the gateway S10a's ARP asks for), read by `wifi::verb` through `arg2()`; `None` when absent. Set on `run`'s

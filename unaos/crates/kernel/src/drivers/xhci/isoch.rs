@@ -80,6 +80,7 @@ mod ac {
     }
     pub fn push_capture(_: &[u8]) {}
     pub fn push_feedback(_: &[u8]) {}
+    pub fn capture_clock(_: usize, _: u32) {}
     pub fn feedback_ep(_: u8) -> bool {
         false
     }
@@ -638,7 +639,7 @@ fn claim_ain(pipe: &crate::sync::Mutex<Option<Pipe>>, slot: u8, dci: u8, param: 
                     // SAFETY: TD buffer `j` is `stride` >= td_len >= len bytes inside the pipe's allocation, and the
                     // controller has retired the TD that wrote it.
                     let bytes = unsafe { core::slice::from_raw_parts(b as *const u8, len) };
-                    if cap { ac::push_capture(bytes) } else { ac::push_feedback(bytes) }
+                    if cap { ac::push_capture(bytes); ac::capture_clock(len, p.interval_uf) } else { ac::push_feedback(bytes) } // UACIMPLICIT (B809): the delivered length is an implicit-feedback sink's clock
                     p.delivered = p.delivered.wrapping_add(1);
                 } else {
                     if cap {

@@ -66,6 +66,10 @@
 //!   the engine's feedback pipe ([`feedback_open`]); each completed value is decoded by [`fb_decode`] into ONE atomic
 //!   word ([`push_feedback`], lock-free), and each OUT TD's frame count is [`meter`]'s accumulator of it
 //!   ([`out_next_len`]) — 48 per ms while no value has arrived, so a synchronous device gets today's packets.
+//!   UACIMPLICIT (rmbp-ledger B809; USB 2.0 §5.12.4.3): an asynchronous OUT with NO synch endpoint whose capture
+//!   alternate is a 48 kHz asynchronous IN on the neighbouring AS interface at the same alternate is clocked IMPLICITLY:
+//!   the capture claim's delivered frames per interval ([`capture_clock`]) go to the same word and the same [`meter`],
+//!   only while the capture pipe runs (the microphone is never opened as a clock).
 
 use crate::drivers::uvc::{IsoEp, IsoHost};
 use alloc::string::String;
@@ -604,7 +608,7 @@ pub fn probe(slot: u8, vid: u16, pid: u16, win: &[u8], cfg_value: u8, h: &mut dy
             STREAMING.store(true, Ordering::Release);
             *WHY.lock() = "ok";
             volume_arm(p.ac_intf, p.fu);
-            feedback_open(h, slot, &a); // UACFEEDBACK (B789): an asynchronous sink's feedback endpoint, after the OUT pipe
+            feedback_open(h, slot, &a, cap.as_ref()); // UACFEEDBACK (B789): an asynchronous sink's feedback endpoint, after the OUT pipe
             serial_println!("[uac] stream slot={} intf={} alt={} ep={:#04x} tds={} lead_uframes={} sched={} -> streaming", slot, a.intf, a.alt, a.ep.addr, tds, lead, sched);
             wire();
             crate::audio::usb_arrived(vid, pid);
@@ -935,7 +939,7 @@ pub fn fixture() {
             serial_println!(
                 ":: UAC1: enumerated=1 stream=ok frames={} underruns={} -> {} :: hz=440 ms=1000 want_frames>={} iso_tds={} iso_missed={} iso_ring_underrun={} iso_events={} sync={} feedback={} metered={} ::",
                 frames, und, if pass { "PASS" } else { "FAIL" }, RATE, t1.wrapping_sub(iso_tds), m1.wrapping_sub(iso_missed), u1.wrapping_sub(iso_underrun), e1.wrapping_sub(iso_events),
-                sync_name(SYNC.load(Ordering::Relaxed)), fb_text(FB_Q16.load(Ordering::Acquire)), METERED.load(Ordering::Relaxed)
+                sync_name(SYNC.load(Ordering::Relaxed)), fb_wire(), METERED.load(Ordering::Relaxed)
             );
         }
         Err(e) => serial_println!(":: UAC1: enumerated=1 stream=ok frames=0 underruns=0 -> FAIL :: tone={} ::", e),
@@ -1261,13 +1265,55 @@ static SYNC: AtomicU8 = AtomicU8::new(0);
 static METERED: AtomicU32 = AtomicU32::new(0);
 static FB_READS: AtomicU32 = AtomicU32::new(0);
 static FB_BAD: AtomicU32 = AtomicU32::new(0);
+/// UACIMPLICIT (B809): the stream is clocked by the capture pipe's delivered length (no synch endpoint).
+static IMPLICIT: AtomicBool = AtomicBool::new(false);
 /// The window a value must lie in: nominal 48 frames per ms +/- 1/8 (42..54), Q16.
 const FB_LO: u32 = 42 << 16;
 const FB_HI: u32 = 54 << 16;
 
-/// The alternate's feedback endpoint: an OUT data endpoint of sync type 01 (asynchronous) that has one.
-pub fn feedback_of(a: &Alt) -> Option<IsoEp> {
-    (a.have_ep && a.ep.addr & 0x80 == 0 && a.sync == 1 && a.have_fb).then_some(a.fb)
+/// UACIMPLICIT (B809): how a playback alternate is clocked.
+#[derive(Clone, Copy)]
+pub enum Feedback {
+    /// Unmetered: synchronous or adaptive, or asynchronous with no clock found (48 frames per ms).
+    None,
+    /// The synch endpoint (UACFEEDBACK B789).
+    Explicit(IsoEp),
+    /// The capture data endpoint whose delivered length is the clock (USB 2.0 §5.12.4.3).
+    Implicit(IsoEp),
+}
+
+impl Feedback {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Feedback::None => "none",
+            Feedback::Explicit(_) => "explicit",
+            Feedback::Implicit(_) => "implicit",
+        }
+    }
+
+    pub fn ep(&self) -> u8 {
+        match self {
+            Feedback::None => 0,
+            Feedback::Explicit(e) | Feedback::Implicit(e) => e.addr,
+        }
+    }
+}
+
+/// THE CLOCK RULE — an OUT data endpoint of sync type 01 (asynchronous): its synch endpoint when it has one (explicit);
+/// else, UACIMPLICIT (B809), the probe's capture pick `cap` when it is 48 kHz (the same rate) on an asynchronous IN
+/// data endpoint of the neighbouring AS interface (±1) at the same alternate number (implicit; Linux
+/// `sound/usb/implicit.c` `add_generic_implicit_fb`); else none.
+pub fn feedback_of(a: &Alt, cap: Option<&(Alt, u32)>) -> Feedback {
+    if !(a.have_ep && a.ep.addr & 0x80 == 0 && a.sync == 1) {
+        return Feedback::None;
+    }
+    if a.have_fb {
+        return Feedback::Explicit(a.fb);
+    }
+    match cap {
+        Some((c, hz)) if *hz == RATE && c.have_ep && c.ep.addr & 0x80 != 0 && c.sync == 1 && c.alt == a.alt && (c.intf == a.intf.wrapping_add(1) || c.intf.wrapping_add(1) == a.intf) => Feedback::Implicit(c.ep),
+        _ => Feedback::None,
+    }
 }
 
 /// One feedback value to Q16 frames per ms: 3 bytes = 10.14 frames per ms (full-speed), 4 bytes = 16.16 frames per
@@ -1305,6 +1351,37 @@ pub fn push_feedback(src: &[u8]) {
     }
 }
 
+/// UACIMPLICIT (B809): the bytes one capture interval of `interval_uf` microframes delivered, in `frame_bytes`
+/// frames, as Q16 frames per ms. No frame: None (nothing delivered). The window is 42..54 frames per ms widened by one
+/// frame per interval (a single packet's count is the rate +/- 1 frame by nature: 41..55 at full speed).
+pub fn implicit_q16(len: usize, frame_bytes: usize, interval_uf: u32) -> Option<u32> {
+    let frames = (len / frame_bytes.max(1)) as u64;
+    if frames == 0 || interval_uf == 0 {
+        return None;
+    }
+    let q = (frames << 19) / interval_uf as u64;
+    let slack = (1u64 << 19) / interval_uf as u64;
+    (FB_LO as u64 - slack..=FB_HI as u64 + slack).contains(&q).then_some(q as u32)
+}
+
+/// UACIMPLICIT (B809) — THE IMPLICIT PRODUCER: one completed capture TD's delivered length (the engine's capture claim,
+/// before the ring truncates it; lock-free). Only while the stream is implicitly clocked; written to the same word
+/// the explicit feedback writes.
+pub fn capture_clock(len: usize, interval_uf: u32) {
+    if !IMPLICIT.load(Ordering::Acquire) || len == 0 {
+        return;
+    }
+    match implicit_q16(len, cap_frame_bytes(), interval_uf) {
+        Some(q) => {
+            FB_Q16.store(q, Ordering::Release);
+            FB_READS.fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            FB_BAD.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The `ac` door's routing question: `addr` is the streaming device's feedback endpoint (the engine's feedback pipe).
 pub fn feedback_ep(addr: u8) -> bool {
     addr != 0 && FB_EP.load(Ordering::Acquire) == addr
@@ -1314,8 +1391,8 @@ pub fn feedback_ep(addr: u8) -> bool {
 /// arrived (a synchronous or adaptive device: today's packet), else [`meter`]'s frames x 4, within the endpoint's ESIT.
 pub fn out_next_len(nominal: u32, interval_uf: u32, esit: u32) -> u32 {
     let q = FB_Q16.load(Ordering::Acquire);
-    if q == 0 {
-        return nominal;
+    if q == 0 || (IMPLICIT.load(Ordering::Acquire) && !CAP_ARMED.load(Ordering::Acquire)) {
+        return nominal; // UACIMPLICIT (B809): a closed capture pipe's last value never meters the OUT
     }
     let (frames, acc) = meter(METER_ACC.load(Ordering::Relaxed), q, interval_uf);
     METER_ACC.store(acc, Ordering::Relaxed);
@@ -1325,6 +1402,7 @@ pub fn out_next_len(nominal: u32, interval_uf: u32, esit: u32) -> u32 {
 
 /// A stream starts or its device leaves: no value, no carried fraction, no feedback endpoint.
 fn feedback_reset() {
+    IMPLICIT.store(false, Ordering::Release);
     FB_EP.store(0, Ordering::Release);
     FB_Q16.store(0, Ordering::Release);
     METER_ACC.store(0, Ordering::Relaxed);
@@ -1333,11 +1411,22 @@ fn feedback_reset() {
 
 /// After the OUT pipe started: open the alternate's feedback endpoint on the host's feedback pipe. A refusal leaves the
 /// stream unmetered (48 frames per ms), never failed.
-fn feedback_open(h: &mut dyn IsoHost, slot: u8, a: &Alt) {
+fn feedback_open(h: &mut dyn IsoHost, slot: u8, a: &Alt, cap: Option<&(Alt, u32)>) {
     SYNC.store(a.sync, Ordering::Relaxed);
-    let Some(fb) = feedback_of(a) else {
-        serial_println!("[uac] sync={} feedback=none -> unmetered (48 frames per ms)", sync_name(a.sync));
-        return;
+    let fb = match feedback_of(a, cap) {
+        Feedback::Explicit(fb) => fb,
+        Feedback::Implicit(c) => {
+            IMPLICIT.store(true, Ordering::Release); // UACIMPLICIT (B809): `capture_clock` writes the value from here on
+            serial_println!(
+                "[uac] sync=async feedback=implicit clock=capture ep={:#04x} intf={} alt={} -> metering while the capture pipe runs (48 frames per ms until then)",
+                c.addr, c.intf, c.alt
+            );
+            return;
+        }
+        Feedback::None => {
+            serial_println!("[uac] sync={} feedback=none -> unmetered (48 frames per ms)", sync_name(a.sync));
+            return;
+        }
     };
     FB_EP.store(fb.addr, Ordering::Release);
     if let Err((cc, name)) = h.iso_configure(&fb) {
@@ -1366,6 +1455,14 @@ fn fb_text(q: u32) -> String {
     alloc::format!("{}.{:04}", q >> 16, ((q & 0xFFFF) as u64 * 10_000 / 65_536))
 }
 
+/// The `tests uac1` field: `implicit` while the capture pipe is the clock, else the explicit value or `none`.
+fn fb_wire() -> String {
+    if IMPLICIT.load(Ordering::Acquire) {
+        return String::from("implicit");
+    }
+    fb_text(FB_Q16.load(Ordering::Acquire))
+}
+
 fn sync_name(s: u8) -> &'static str {
     match s & 3 {
         1 => "async",
@@ -1389,7 +1486,7 @@ fn feedback_kats(sc: &mut Score) {
         Some(a) => {
             sc.check("fb.qemu.sync", a.sync as u64, 3);
             sc.check("fb.qemu.have_fb", a.have_fb as u64, 0);
-            sc.check("fb.qemu.none", feedback_of(&a).is_none() as u64, 1);
+            sc.check("fb.qemu.none", matches!(feedback_of(&a, None), Feedback::None) as u64, 1);
         }
         None => sc.check("fb.qemu.pick", 0, 1),
     }
@@ -1404,7 +1501,7 @@ fn feedback_kats(sc: &mut Score) {
         Some(a) => {
             sc.check("fb.async.sync", a.sync as u64, 1);
             sc.check("fb.async.synch_addr", a.synch_addr as u64, 0x81);
-            sc.check("fb.async.ep", feedback_of(&a).map(|e| e.addr as u64).unwrap_or(0), 0x81);
+            sc.check("fb.async.ep", matches!(feedback_of(&a, None), Feedback::Explicit(_)) as u64 * feedback_of(&a, None).ep() as u64, 0x81);
             sc.check("fb.async.mps", a.fb.mps as u64, 3);
             sc.check("fb.async.refresh", a.refresh as u64, 5);
             sc.check("fb.async.data_ep", a.ep.addr as u64, 0x01);
@@ -1413,7 +1510,7 @@ fn feedback_kats(sc: &mut Score) {
     }
     v[FIXTURE_EP_SYNCH] = 0;
     v[110 + 3] = 0x11; // usage 01: found by the usage bits alone
-    sc.check("fb.usage.ep", pick(&parse(&v)).and_then(|a| feedback_of(&a)).map(|e| e.addr as u64).unwrap_or(0), 0x81);
+    sc.check("fb.usage.ep", pick(&parse(&v)).map(|a| feedback_of(&a, None).ep() as u64).unwrap_or(0), 0x81);
     let d = |r: &[u8]| fb_decode(r).map(|q| q as u64).unwrap_or(0);
     sc.check("fb.decode.fs48", d(&[0x00, 0x00, 0x0C]), 0x30_0000);
     sc.check("fb.decode.fs47_5", d(&[0x00, 0xE0, 0x0B]), 0x2F_8000);
@@ -1438,6 +1535,73 @@ fn feedback_kats(sc: &mut Score) {
     sc.check("fb.meter.47_75.sum", m.iter().sum::<u32>() as u64, 191);
     sc.check("fb.meter.hs", run(0x30_0000, 1)[0] as u64, 6);
     sc.check("fb.meter.fs", run(0x30_0000, 8)[0] as u64, 48);
+    implicit_kats(sc); // UACIMPLICIT (B809)
+}
+
+/// UACIMPLICIT (B809): [`FIXTURE`] made asynchronous with no synch endpoint, plus a capture AS interface 2 (alt 0 no
+/// endpoint; alt 1 PCM Type I 1 x 16-bit 48 kHz, IN 0x82 asynchronous 0x05, 96 bytes, every frame) — 162 bytes.
+const IMP_CAPTURE: [u8; 52] = [
+    0x09, 0x04, 0x02, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, //
+    0x09, 0x04, 0x02, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00, //
+    0x07, 0x24, 0x01, 0x02, 0x01, 0x01, 0x00, //
+    0x0b, 0x24, 0x02, 0x01, 0x01, 0x02, 0x10, 0x01, 0x80, 0xbb, 0x00, //
+    0x09, 0x05, 0x82, 0x05, 0x60, 0x00, 0x01, 0x00, 0x00, //
+    0x07, 0x25, 0x01, 0x00, 0x00, 0x00, 0x00,
+];
+/// Offsets in the implicit variant: the capture alt's bAlternateSetting, its rate's middle byte, its endpoint's
+/// bmAttributes.
+const IMP_CAP_ALT: usize = 110 + 12;
+const IMP_CAP_RATE: usize = 110 + 25 + 9;
+const IMP_CAP_ATTR: usize = 110 + 36 + 3;
+
+/// `tests uac1`'s implicit KATs: the rule on the descriptor variant and its negatives; the delivered lengths 47, 48,
+/// 49 meter the OUT to the same packets and sum.
+fn implicit_kats(sc: &mut Score) {
+    let mut v = [0u8; 162];
+    v[..110].copy_from_slice(&FIXTURE);
+    v[110..].copy_from_slice(&IMP_CAPTURE);
+    v[2] = 162;
+    v[FIXTURE_EP_ATTR] = 0x05;
+    let kind = |v: &[u8]| {
+        let p = parse(v);
+        pick(&p).map(|a| feedback_of(&a, pick_capture(&p).as_ref())).unwrap_or(Feedback::None)
+    };
+    let p = parse(&v);
+    sc.check("fb.implicit.cap", pick_capture(&p).map(|(c, hz)| (c.intf as u64) << 32 | hz as u64).unwrap_or(0), 2 << 32 | 48_000);
+    match pick(&p) {
+        Some(a) => {
+            let f = feedback_of(&a, pick_capture(&p).as_ref());
+            sc.check("fb.implicit.ep", f.ep() as u64, 0x82);
+            sc.check("fb.implicit.wire", (sync_name(a.sync) == "async" && f.kind() == "implicit") as u64, 1);
+        }
+        None => sc.check("fb.implicit.pick", 0, 1),
+    }
+    let mut w = v;
+    w[IMP_CAP_RATE] = 0xac; // 44 100 = 0x00ac44: another rate
+    w[IMP_CAP_RATE - 1] = 0x44;
+    sc.check("fb.implicit.44k1", (kind(&w).kind() == "none") as u64, 1);
+    let mut w = v;
+    w[IMP_CAP_ATTR] = 0x0d; // a synchronous IN is not the device's clock
+    sc.check("fb.implicit.sync_in", (kind(&w).kind() == "none") as u64, 1);
+    let mut w = v;
+    w[IMP_CAP_ALT] = 2; // another alternate number
+    sc.check("fb.implicit.alt", (kind(&w).kind() == "none") as u64, 1);
+    let run = |lens: [usize; 3], fbytes: usize, uf: u32| {
+        let (mut acc, mut out) = (0u64, [0u32; 3]);
+        for (o, &l) in out.iter_mut().zip(lens.iter()) {
+            let (n, a) = meter(acc, implicit_q16(l, fbytes, uf).unwrap_or(0), uf);
+            *o = n;
+            acc = a;
+        }
+        out
+    };
+    let m = run([188, 192, 196], 4, 8);
+    sc.check("fb.implicit.stereo", (m == [47, 48, 49]) as u64, 1);
+    sc.check("fb.implicit.sum", m.iter().sum::<u32>() as u64, 144);
+    sc.check("fb.implicit.mono", (run([94, 96, 98], 2, 8) == [47, 48, 49]) as u64, 1);
+    sc.check("fb.implicit.hs", (run([20, 24, 28], 4, 1) == [5, 6, 7]) as u64, 1);
+    sc.check("fb.implicit.zero", implicit_q16(0, 4, 8).is_none() as u64, 1);
+    sc.check("fb.implicit.96", implicit_q16(384, 4, 8).is_none() as u64, 1);
 }
 
 // ── IDLEUSBLEVEL (rmbp-ledger B808) — TAIL-APPENDED: the level the device holds ──────────────────────────────────────
