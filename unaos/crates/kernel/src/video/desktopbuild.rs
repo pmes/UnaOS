@@ -135,7 +135,7 @@ fn say(bar_ms: u64) {
 
 /// Log Out: the desktop object goes — the bar off, unbuilt, one composite vacates the bar's and the dock's pixels.
 pub fn teardown(why: &'static str) {
-    OWED_AT.store(0, Release); #[cfg(feature = "quarry")] super::quarry::undo::clear(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::launcher::filesearch::icon_cache_clear(); // FSEARCHICONS (B760): the Files icons' type cache goes with the session (LINE-NEUTRAL, code before comment). crawl A 1: the undo journal goes with the session
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] memcensus::before(); OWED_AT.store(0, Release); #[cfg(feature = "quarry")] super::quarry::undo::clear(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::launcher::filesearch::icon_cache_clear(); // FSEARCHICONS (B760): the Files icons' type cache goes with the session (LINE-NEUTRAL, code before comment). crawl A 1: the undo journal goes with the session
     probe_reset();
     PAINT_AT.store(0, Release);
     LAST_BATT.store(u32::MAX, Relaxed);
@@ -490,7 +490,7 @@ impl core::fmt::Display for Kb {
 
 /// The build's ask: the heap's high-water window opens here.
 fn mem_ask() {
-    let _ = crate::allocator::heap_high_reset();
+    let _ = crate::allocator::heap_high_reset(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::allocator::census::arm(); // MEMLINE2 (B821): the owner census arms at the build's ask. LINE-NEUTRAL append, code first
 }
 
 /// The panel bytes every present furniture strip owns (`None` = the panel writer busy: no geometry to ask with).
@@ -513,7 +513,7 @@ fn delta_pct(first: u64, now: u64) -> i64 {
 fn mem_note() -> MemLine {
     let used = crate::allocator::heap_used() as u64;
     let high = (crate::allocator::heap_high() as u64).max(used);
-    let furn = furniture_bytes();
+    let furn = furniture_bytes(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] memcensus::at_build(); // MEMLINE2 (B821): the census at every build line (the first is the reference). LINE-NEUTRAL append, code first
     let first = match MEM_FIRST_HIGH.compare_exchange(0, high.max(1), AcqRel, Acquire) {
         Ok(_) => high.max(1),
         Err(v) => v,
@@ -554,7 +554,7 @@ pub fn memline_selftest() {
         "rebuild"
     };
     let builds = MEM_BUILDS.load(Acquire);
-    let (used, high, furn, delta) = (MEM_USED.load(Relaxed), MEM_HIGH.load(Relaxed), MEM_FURN.load(Relaxed), MEM_DELTA.load(Relaxed));
+    let (used, high, furn, delta) = (MEM_USED.load(Relaxed), MEM_HIGH.load(Relaxed), MEM_FURN.load(Relaxed), MEM_DELTA.load(Relaxed)); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let delta = memcensus::report(MEM_FIRST_HIGH.load(Relaxed), high, delta); // MEMLINE2 (B821): the census lines; the delta scored is net of the count-once growth (raw printed beside). LINE-NEUTRAL append, code first
     let furn_read = furn != u64::MAX;
     let (high_kb, furn_kb) = (high / 1024, if furn_read { furn / 1024 } else { 0 });
     let measured = builds >= 2 && high > 0 && furn_read;
@@ -581,4 +581,92 @@ pub fn net_starters_held(names: &[&str]) -> u32 {
 #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "login"))]
 pub fn aging_reading() -> (u32, Option<u64>, u64) {
     (MEM_BUILDS.load(Acquire), last_bar_ms(), MEM_HIGH.load(Relaxed) / 1024)
+}
+
+// MEMLINE2 (rmbp-ledger B821, BP-video-18, BP-cores-22) — WHO HOLDS THE SESSION'S HEAP. Flight 37 boot 1: the first build
+// `high_kb=96685`, the fixture's rebuild 37 min later `heap_kb=139000 high_kb=139000` — the rebuild added ~0, the 43 % is
+// what the session accumulated and [`teardown`] does not free (it frees Quarry's undo and the Files icon cache only).
+// The allocator's owner census (`allocator::census`, armed at the first build's ask by [`mem_ask`]) is read three
+// times: FIRST at the boot's first build line, BEFORE at [`teardown`]'s first line, AFTER at every later build line
+// ([`mem_note`]). `tests memline` prints it and scores the round trip NET of the count-once set — the bounded pools
+// that are built once and reused, never a leak: `stage` (wm's STAGE, STAGE_CPUS x MAX_STAGE_BYTES), `shadow`
+// (PACE_SHADOW, pooled per slot), `wallpaper` (WALL + RETIRED, two pictures by the Snap grace), `help` (the index, once
+// per boot). once_bytes = their growth since FIRST; `logout_delta_pct` = delta_pct(first_high, high - once_bytes), and
+// `raw_delta_pct` (the B677 number) is printed beside it. Nothing is freed here. Lines:
+// `[memline] census tag=<name|task:<n>> kb=<before>-><after> first_kb=<n>` (<= 10, by |after - first|) ·
+// `[memline] census untracked_kb=<first>/<before>-><after> dropped=<n>` ·
+// `[memline] top <name>:<+-kb>,… once_kb=<n> once=stage,shadow,wallpaper,help raw_delta_pct=<n>`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+mod memcensus {
+    use crate::allocator::census::{self, Snapshot};
+    use core::fmt::Write;
+
+    const FIRST: usize = 0;
+    const BEFORE: usize = 1;
+    const AFTER: usize = 2;
+    /// The count-once set (census tag names).
+    const ONCE: [&str; 4] = ["stage", "shadow", "wallpaper", "help"];
+    /// FIRST, BEFORE, AFTER. Each snapshot is taken (heap lock) before this lock: the two never nest.
+    static SNAPS: crate::sync::Mutex<[Option<Snapshot>; 3]> = crate::sync::Mutex::new([None; 3]);
+
+    /// A build line: the first is the boot's reference, every later one is AFTER.
+    pub(super) fn at_build() {
+        let s = census::snapshot();
+        let mut g = SNAPS.lock();
+        if g[FIRST].is_none() {
+            g[FIRST] = Some(s);
+        } else {
+            g[AFTER] = Some(s);
+        }
+    }
+
+    /// [`super::teardown`]'s first line: what the session held.
+    pub(super) fn before() {
+        let s = census::snapshot();
+        SNAPS.lock()[BEFORE] = Some(s);
+    }
+
+    /// `tests memline`: print the census and return the delta net of the count-once growth (`raw` when unread).
+    pub(super) fn report(first_high: u64, high: u64, raw: i64) -> i64 {
+        let snaps = *SNAPS.lock();
+        let (Some(f), Some(a)) = (snaps[FIRST], snaps[AFTER]) else {
+            serial_println!("[memline] census absent first={} after={} raw_delta_pct={}", snaps[FIRST].is_some() as u8, snaps[AFTER].is_some() as u8, raw);
+            return raw;
+        };
+        let b = snaps[BEFORE].unwrap_or(a);
+        // Every owner any of the three saw, with its growth since FIRST; largest |growth| first.
+        let mut keys: [Option<(&'static str, bool, i64)>; 3 * census::ROWS] = [None; 3 * census::ROWS];
+        let mut n = 0usize;
+        for s in [&f, &b, &a] {
+            for r in s.rows.iter().flatten() {
+                if n < keys.len() && !keys[..n].iter().flatten().any(|k| k.0 == r.name && k.1 == r.tagged) {
+                    keys[n] = Some((r.name, r.tagged, a.bytes_of(r.name, r.tagged) as i64 - f.bytes_of(r.name, r.tagged) as i64));
+                    n += 1;
+                }
+            }
+        }
+        let keys = &mut keys[..n];
+        keys.sort_unstable_by_key(|k| core::cmp::Reverse(k.map_or(0, |k| k.2.unsigned_abs())));
+        for &(name, tagged, _) in keys.iter().flatten().take(10) {
+            serial_println!(
+                "[memline] census tag={}{} kb={}->{} first_kb={}",
+                if tagged { "" } else { "task:" }, name, b.bytes_of(name, tagged) / 1024, a.bytes_of(name, tagged) / 1024, f.bytes_of(name, tagged) / 1024
+            );
+        }
+        let untracked = |s: &Snapshot| s.used.saturating_sub(s.tracked) / 1024;
+        serial_println!("[memline] census untracked_kb={}/{}->{} dropped={}", untracked(&f), untracked(&b), untracked(&a), a.dropped);
+        let once: u64 = ONCE.iter().map(|t| a.bytes_of(t, true).saturating_sub(f.bytes_of(t, true))).sum();
+        let mut top = alloc::string::String::new();
+        for &(name, tagged, d) in keys.iter().flatten().take(5) {
+            if !top.is_empty() {
+                top.push(',');
+            }
+            let _ = write!(top, "{}{}:{:+}", if tagged { "" } else { "task:" }, name, d / 1024);
+        }
+        if top.is_empty() {
+            top.push('-');
+        }
+        serial_println!("[memline] top {} once_kb={} once=stage,shadow,wallpaper,help raw_delta_pct={}", top, once / 1024, raw);
+        super::delta_pct(first_high, high.saturating_sub(once))
+    }
 }
