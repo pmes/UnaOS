@@ -745,11 +745,11 @@ mod reg {
     /// M3 — a task that will never run its guards' `Drop`s again (halted by STACKGUARD, a panic) gives back EVERY
     /// lock the registry holds in its name: force-unlocked by address, entry freed, all named on one line. Run AFTER
     /// the special releases (`lockowner`: the sink, the UART, the UnaFS mount — which must be leaked, not dropped).
-    pub fn release_task(tid: u64, why: &str) -> usize {
+    pub fn release_task(tid: u64, why: &str) -> usize { let named = crate::lockowner::release_dead(tid); // STACKGUARD3 (B832): THE one release — lockowner's three first (unpoisoned), then the walk. LINE-NEUTRAL fold
         if tid == 0 || !ON.load(Relaxed) {
-            return 0;
+            return say_named(tid, why, named); // STACKGUARD3 (B832): the registry off still releases (and names) lockowner's three
         }
-        let mut names = Names::new();
+        let mut dead = Dead::new(); // STACKGUARD3 (B832): per-lock records, said AFTER the walk
         for p in PARTS.iter() {
             let mut bits = p.mask.load(Acquire);
             while bits != 0 {
@@ -759,7 +759,7 @@ mod reg {
                 if t == 0 || tag_tid(t) != tid {
                     continue;
                 }
-                let addr = p.lock[i].load(Relaxed);
+                let addr = p.lock[i].load(Relaxed); let at = p.at[i].load(Relaxed); let poisoned = addr != 0 && mark_poison(addr); // STACKGUARD3 (B832): the acquire site before the slot frees; the POISON mark BEFORE the force-unlock, so the next taker sees it
                 p.tag[i].store(0, Release);
                 p.mask.fetch_and(!(1u32 << i), Release);
                 if addr != 0 {
@@ -767,11 +767,11 @@ mod reg {
                     // again; the lock outlives the hold (a guard borrows it).
                     unsafe { (*(addr as *const spin::Mutex<()>)).force_unlock() };
                 }
-                names.push(class_site(tag_class(t)));
+                dead.push(t, at, poisoned);
             }
         }
-        serial_println!("[lock] task={} released=[{}] ({})", tid, names, why);
-        names.n + names.more
+        let named_n = say_named(tid, why, named); dead.say(why); // STACKGUARD3 (B832): one `[lock] released-on-death` line per lock (nothing when nothing was held); the summary line is gone
+        named_n + dead.n + dead.more
     }
 
     /// A LIVE task the kernel has given up on (DECJOB's abort): its holds and its wait NAMED, never released —
@@ -874,7 +874,7 @@ mod reg {
         let tid = DIE_TID.load(Acquire);
         let freed = if died && tid != 0 { release_task(tid, "tests lockreg") } else { 0 };
         let back = DIE.try_lock().is_some();
-        let released = died && freed == 1 && back;
+        let _ = DIE.take_poison(); let (gword, poisoned, retake_ms) = guard_leg(); let released = died && freed == 1 && back && gword == "ok"; // STACKGUARD3 (B832): the death leg's mark cleared; the REAL guard leg (file tail) must pass too. LINE-NEUTRAL fold
         let (mut acq, mut tracked, mut held_max) = (EARLY.load(Relaxed), 0u64, 0u64);
         for p in PARTS.iter() {
             acq += p.acq.load(Relaxed);
@@ -890,13 +890,13 @@ mod reg {
         let max_at = if max_at.is_null() { None } else { Some(unsafe { &*max_at }) };
         let pass = on && held_done && named && released && inv == 0 && overflow == 0;
         serial_println!(
-            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{}",
+            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{}",
             CLASS_N.load(Relaxed),
             tracked,
             acq,
             held_max / (hz / 1000),
             inv,
-            if released { "ok" } else if !died { "no-task" } else if freed != 1 { "not-found" } else { "still-held" },
+            if released { "ok" } else if !died { "no-task" } else if freed != 1 { "not-found" } else if !back { "still-held" } else { gword }, poisoned as u8, retake_ms, // STACKGUARD3 (B832): the guard leg's word, its mark and its retake (LINE-NEUTRAL fold)
             if named { "ok" } else if !on { "unarmed" } else if !held_done { "no-task" } else { "missed" },
             overflow,
             if pass { "PASS" } else { "FAIL" }, Site(class_site(HELD_MAX_CLASS.load(Relaxed))), // KVMLAT (B578): the longest hold's lock, by name (`?` = none recorded)
@@ -965,5 +965,147 @@ mod reg {
             }
         }
         LONG_SAID.store(k, Relaxed);
+    }
+
+    // ── STACKGUARD3 (rmbp-ledger B832) — a lock a DEAD task held is released ONCE (`release_task`), named per lock, and
+    // POISONED: the next taker that can check its state (`Mutex::take_poison`, sdhc.rs's `card_lock`) recovers it. ──
+    // KEYBOOT2 (B810) left a guard-page overflow inside a masked CARD hold able to leave the controller mid-command for
+    // every later taker. The mark is by lock ADDRESS in a lock-free table: set by `release_task` BEFORE its force-unlock
+    // (CAS 0 -> addr), cleared by the first `take_poison` (CAS addr -> 0). A full table counts in `POISON_LOST` (that
+    // death-released lock is released unpoisoned). The heap's lock is marked and never checked (owed HEAPPOISON).
+
+    const POISON_SLOTS: usize = 16;
+    static POISON: [AtomicUsize; POISON_SLOTS] = [const { AtomicUsize::new(0) }; POISON_SLOTS];
+    /// Live marks (the fast path of `take_poison`: one load while nothing is poisoned).
+    static POISON_N: AtomicU32 = AtomicU32::new(0);
+    static POISON_LOST: AtomicU32 = AtomicU32::new(0);
+
+    /// Mark lock `addr` poisoned (a dead holder released it). `false` = the table is full (counted, unmarked).
+    fn mark_poison(addr: usize) -> bool {
+        if POISON.iter().any(|s| s.load(Acquire) == addr) {
+            return true;
+        }
+        for s in POISON.iter() {
+            if s.compare_exchange(0, addr, AcqRel, Acquire).is_ok() {
+                POISON_N.fetch_add(1, AcqRel);
+                return true;
+            }
+        }
+        POISON_LOST.fetch_add(1, Relaxed);
+        false
+    }
+
+    /// Was lock `addr` released by a dead holder since its last take? Clears the mark (the caller recovers it).
+    pub fn take_poison(addr: usize) -> bool {
+        if POISON_N.load(Acquire) == 0 {
+            return false;
+        }
+        for s in POISON.iter() {
+            if s.load(Acquire) == addr && s.compare_exchange(addr, 0, AcqRel, Acquire).is_ok() {
+                POISON_N.fetch_sub(1, AcqRel);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `release_task`'s per-lock records: (holder tag, acquire site, poisoned), 16 kept, the rest counted.
+    struct Dead {
+        n: usize,
+        more: usize,
+        v: [(u64, *mut Loc, bool); 16],
+    }
+    impl Dead {
+        fn new() -> Self {
+            Dead { n: 0, more: 0, v: [(0, core::ptr::null_mut(), false); 16] }
+        }
+        fn push(&mut self, tag: u64, at: *mut Loc, poisoned: bool) {
+            if self.n < self.v.len() {
+                self.v[self.n] = (tag, at, poisoned);
+                self.n += 1;
+            } else {
+                self.more += 1;
+            }
+        }
+        /// One `[lock] released-on-death` line per kept record; one `more=` line past 16; nothing when empty.
+        fn say(&self, why: &str) {
+            for k in 0..self.n {
+                let (tag, at, poisoned) = self.v[k];
+                // SAFETY: `at` is a `&'static Location` or null.
+                let at = if at.is_null() { None } else { Some(unsafe { &*at }) };
+                serial_println!("[lock] released-on-death name={} at={} by={}@cpu{} why={} poisoned={}", Site(class_site(tag_class(tag))), Site(at), tag_tid(tag), tag_cpu(tag), why, poisoned as u8);
+            }
+            if self.more > 0 {
+                serial_println!("[lock] released-on-death more={} by={} why={} (past the 16 named)", self.more, tag_tid(self.v[0].0), why);
+            }
+        }
+    }
+
+    /// The lockowner releases (`lockowner::release_dead`'s bit set), one line each, unpoisoned; their count.
+    fn say_named(tid: u64, why: &str, named: u32) -> usize {
+        for (i, n) in crate::lockowner::NAMES.iter().enumerate() {
+            if named & (1 << i) != 0 {
+                serial_println!("[lock] released-on-death name={} at=lockowner by={}@cpu? why={} poisoned=0", n, tid, why);
+            }
+        }
+        named.count_ones() as usize
+    }
+
+    // `tests lockreg`'s GUARD leg: a task on a 16 KiB stack takes GUARD and recurses into its guard page — a REAL guard
+    // hit (`stackguard::overflow_exit` -> `release_task(tid, "guard")`), not the death leg's `mem::forget`.
+    const GUARD_STACK: usize = 16 * 1024;
+    static GUARD: super::Mutex<u32> = super::Mutex::new(0);
+    static GUARD_TOOK: AtomicBool = AtomicBool::new(false);
+
+    fn guard_task(_: usize) {
+        let g = GUARD.lock();
+        GUARD_TOOK.store(true, Release);
+        let n = crate::arch::stackguard::scratch_deep(0);
+        drop(g);
+        serial_println!("[lock] lockreg-guard returned depth={} (the guard did not fire)", n);
+    }
+
+    /// The guard leg: (word, poisoned, retake_ms). `ok` = GUARD was retaken within 100 ms of the take, polled 1 ms
+    /// apart, and its next taker found it poisoned.
+    fn guard_leg() -> (&'static str, bool, u64) {
+        GUARD_TOOK.store(false, Release);
+        let _ = GUARD.take_poison(); // a mark left by an earlier run
+        crate::arch::sched::spawn_stack("lockreg-guard", guard_task, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL, GUARD_STACK);
+        if !wait_flag(&GUARD_TOOK, 1000) {
+            return ("no-guard-task", false, 0);
+        }
+        let t0 = crate::arch::ms();
+        let retake = loop {
+            if let Some(g) = GUARD.try_lock() {
+                drop(g);
+                break Some(crate::arch::ms().saturating_sub(t0));
+            }
+            if crate::arch::ms().saturating_sub(t0) > 1000 {
+                break None;
+            }
+            crate::arch::sched::sleep_ms(1);
+        };
+        let Some(retake_ms) = retake else { return ("guard-held", false, 0) };
+        let poisoned = GUARD.take_poison();
+        let word = if !poisoned { "not-poisoned" } else if retake_ms > 100 { "slow-retake" } else { "ok" };
+        (word, poisoned, retake_ms)
+    }
+}
+
+// ── STACKGUARD3 (rmbp-ledger B832): the poison check, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
+impl<T: ?Sized> Mutex<T> {
+    /// Was this lock force-released on its holder's death (`release_task`) since the last check? Clears the mark: the
+    /// caller, now holding the lock, recovers what it guards. One load while nothing is poisoned; `false` on aarch64
+    /// (no registry).
+    #[inline]
+    pub fn take_poison(&self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            reg::take_poison(self.addr())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
     }
 }

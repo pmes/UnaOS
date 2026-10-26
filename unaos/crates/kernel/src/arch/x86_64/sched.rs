@@ -7866,7 +7866,7 @@ pub fn slot_tables_warm(s: usize) {
 /// [`spawn_stack`] carrying a TEARDOWN-1 [`KillSwitch`]: a KERNEL task the kernel may retire. `kill.request()`
 /// retires it at its next preemption, yield or sleep park (`run()`'s READY arm, `park_blocked`'s PARK_SLEEP arm —
 /// the same `reap_killed` a ring-3 task gets); `kill.is_reaped()` confirms. The reap runs no `Drop` on the task's
-/// frames: the caller frees what it held (`stackguard::release_held`, `sync::release_task`). Returns the task id.
+/// frames: the caller frees what it held (`sync::release_task`, STACKGUARD3 B832's one release). Returns the task id.
 pub fn spawn_stack_killable(
     name: &'static str,
     entry: fn(usize),
@@ -8842,7 +8842,7 @@ pub fn terminate(id: u64, cause: Cause) -> ! {
         doom_address_space(cr3);
         let _ = kill_wake_parked();
     }
-    exit()
+    match cause { Cause::Fault { .. } => { crate::sync::release_task(id, "fault"); } Cause::Oom { .. } => { crate::sync::release_task(id, "oom"); } Cause::Exit | Cause::Kill => {} } exit() // STACKGUARD3 (B832): a fault/OOM end runs no Drop on the dying frames — its locks go back through the ONE release, poisoned (LINE-NEUTRAL fold, code first)
 }
 
 /// A fixed buffer `core::fmt::Write` fills (cut at the end, never refused) — the toast's text without the heap.

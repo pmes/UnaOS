@@ -1534,7 +1534,7 @@ fn identify(base: u64, caps: &HostCaps, bdf: (u8, u8, u8)) -> Option<SdCard> {
 /// handed to a byte-addressed card as if it were a block index reads the wrong 512 bytes without
 /// erroring, which is why that cross-check had to pass before this function could exist.
 pub fn read_block_512(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::without_interrupts(|| read_block_512_held(lba, buf)) } fn read_block_512_held(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
-    let guard = CARD.lock();
+    let guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     if lba >= card.num_blocks {
         return Err(BlockError::BadLba);
@@ -1701,7 +1701,7 @@ fn abort_data_transfer(base: u64) {
 /// Every failure path prints the RAW Interrupt Status word that convicted it and then closes the
 /// card's side with [`abort_data_transfer`], so a failure here cannot poison the next command.
 fn read_blocks_512_pio(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, BlockError> { crate::arch::without_interrupts(|| read_blocks_512_pio_held(lba, count, buf)) } fn read_blocks_512_pio_held(lba: u64, count: u16, buf: &mut [u8]) -> Result<usize, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
-    let guard = CARD.lock();
+    let guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     read_blocks_pio_on(card, lba, count, buf)
 }
@@ -2228,7 +2228,7 @@ fn read_blocks_adma_on(
 
 /// [`read_blocks_adma_on`] against the published card.
 fn read_blocks_512_adma(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, bool), BlockError> { crate::arch::without_interrupts(|| read_blocks_512_adma_held(lba, count, buf)) } fn read_blocks_512_adma_held(lba: u64, count: u16, buf: &mut [u8]) -> Result<(usize, bool), BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
-    let guard = CARD.lock();
+    let guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     if card.adma != Adma2State::Ready {
         return Err(BlockError::NotReady);
@@ -2647,7 +2647,7 @@ pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, 
         return Err(BlockError::Io);
     }
 
-    let mut guard = CARD.lock();
+    let mut guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_mut().ok_or(BlockError::NotReady)?;
     if lba.checked_add(count as u64).is_none_or(|end| end > card.num_blocks) {
         return Err(BlockError::BadLba);
@@ -2770,7 +2770,7 @@ pub fn read_blocks_512(lba: u64, count: usize, buf: &mut [u8]) -> Result<usize, 
 ///   check that only masks for errors reads that as success.
 #[cfg(feature = "sdw")]
 pub fn write_block_512(lba: u64, buf: &[u8]) -> Result<(), BlockError> { crate::arch::without_interrupts(|| write_block_512_held(lba, buf)) } #[cfg(feature = "sdw")] fn write_block_512_held(lba: u64, buf: &[u8]) -> Result<(), BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
-    let guard = CARD.lock();
+    let guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
     if lba >= card.num_blocks {
         return Err(BlockError::BadLba);
@@ -3620,7 +3620,7 @@ fn wait_prog_busy_ms(base: u64, budget_ms: u64) -> Option<u64> {
 /// twin that [`write_block_512`] already carries.
 #[cfg(feature = "sdw")]
 pub fn write_blocks_512(lba: u64, count: u16, buf: &[u8]) -> Result<u64, BlockError> { crate::arch::without_interrupts(|| write_blocks_512_held(lba, count, buf)) } #[cfg(feature = "sdw")] fn write_blocks_512_held(lba: u64, count: u16, buf: &[u8]) -> Result<u64, BlockError> { // TRASHLOCK (B523): CARD only under without_interrupts — a CARD holder is never preemptible, so a masked spin on CARD (the UnaFS mount's sector reads) is bounded by one SD command (sched.rs:32's rule for the mount). LINE-NEUTRAL fold
-    let guard = CARD.lock();
+    let guard = card_lock(); // STACKGUARD3 (B832): a data-path take checks CARD's poison (file tail)
     let card = guard.as_ref().ok_or(BlockError::NotReady)?;
 
     if count == 0 || count > MB_MAX_BLOCKS {
@@ -4243,4 +4243,30 @@ fn w2_selftest() {
             w.count, w.verify, w.busy_ms, w.restore, w.reason, w.verdict
         ),
     }
+}
+
+// ===================================================================================
+// STACKGUARD3 (rmbp-ledger B832) — FILE-TAIL append, NOT `sdw`-gated (the one exception to the Step 9 banner above:
+// the READ paths take it). A CARD holder that died inside its hold (a guard-page overflow under KEYBOOT2's masked
+// reads) had `CARD` force-released by `sync::release_task` and POISONED; the next data-path take finds the mark and
+// closes whatever the dead holder left open — a CMD18 still streaming, a CMD25 waiting — with the driver's own
+// `abort_data_transfer` (CMD12 + CMD/DAT reset + status clear) before its own command. The small masked reads
+// (`num_blocks`, `block_addressing`, …) issue no command and stay `CARD.lock()`: the mark waits for the next data take.
+// ===================================================================================
+
+/// `CARD.lock()` for a data path: the acquire site stays the caller's (`#[track_caller]` through `Mutex::lock`), and a
+/// poisoned take is recovered before the guard is handed back.
+#[track_caller]
+fn card_lock() -> crate::sync::MutexGuard<'static, Option<SdCard>> {
+    let guard = CARD.lock();
+    if CARD.take_poison() {
+        match guard.as_ref().map(|c| c.base) {
+            Some(base) => {
+                abort_data_transfer(base);
+                serial_println!("[sdhc] poisoned take -> recovered=abort (STACKGUARD3 B832: CARD's last holder died inside its hold)");
+            }
+            None => serial_println!("[sdhc] poisoned take -> recovered=none (no card bound)"),
+        }
+    }
+    guard
 }
