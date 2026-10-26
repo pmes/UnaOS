@@ -5478,14 +5478,14 @@ pub const fn shape_count() -> usize {
 }
 
 /// TOASTFLICKER (rmbp-ledger B815) — the toast's CONTROL on `[cursor11]`, `px_absorbed`'s role for the arrow:
-/// notify rows (cards, the Center) an occluder set admitted (`wm::toast_occludes`: the desktop present's
+/// notify rows (cards, the Center) an occluder set admitted (`wm::overlay_occludes`: the desktop present's
 /// `occluders`, the erase drain's `erase_clip`, the window blit's `occ_clip`). The toast's leak class — a backdrop
 /// publication over a live card — is closed by construction (its rows ARE in the subtraction); this says the
 /// subtraction ran. `flicker_frames` keeps its meaning (the arrow).
 #[cfg(feature = "witness")]
 static C11_TOAST_WITHHELD: AtomicU64 = AtomicU64::new(0);
 
-/// TOASTFLICKER (B815): one notify row admitted to an occluder set (`wm::toast_occludes`).
+/// TOASTFLICKER (B815): one notify row admitted to an occluder set (`wm::overlay_occludes`).
 #[cfg(feature = "witness")]
 pub fn note_toast_withheld() {
     C11_TOAST_WITHHELD.fetch_add(1, Ordering::Relaxed);
