@@ -17686,7 +17686,7 @@ fn boxes_overlap(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize
 ///
 /// Declared unconditionally (aarch64 compiles no strip at all and its clip stays empty) and checked
 /// only where the registry exists.
-const FURNITURE_MAX: usize = 2;
+const FURNITURE_MAX: usize = 2 + cfg!(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))) as usize; // PERFHUD2 (B828): the performance overlay is the third strip tenant where the registry exists (`strip::OVERLAY_SLOT`); knob-off stays 2. ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
 
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] // PI-DESK: two arch/knob pairs now
 const _: () = assert!(FURNITURE_MAX == super::strip::STRIP_MAX);
@@ -18148,7 +18148,7 @@ fn occ_clip(rows: &[Window], i: usize, shell: u32, pw: usize, ph: usize) -> OccC
             //
             // Default OFF: `strip_rect` returns `None` after one relaxed load on every boot that has
             // not enabled the bar, so this arm costs one atomic per window and pushes nothing.
-            let bar = super::menubar::strip_rect(pw, ph);
+            let bar = super::menubar::strip_rect(pw, ph); if let Some(b) = super::perfhud::strip_rect(pw, ph) { if b.2 != 0 && b.3 != 0 && boxes_overlap(me, b) { let _ = c.push(b); } } // PERFHUD2 (B828): the performance overlay (`strip::TENANTS[OVERLAY_SLOT]`), on the bar's terms: its accessor reads the rect it last painted from two atomics (no table lock), so a window blit withholds the HUD's columns. ⚠ LINE-NEUTRAL fold, code first.
             #[cfg(feature = "witness")] // WMPAR — DRAGOCC, both arches; see DO_BOX
             {
                 use core::sync::atomic::Ordering::Relaxed;

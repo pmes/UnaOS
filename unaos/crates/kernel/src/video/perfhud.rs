@@ -26,15 +26,21 @@
 //!   frame: a pass with nothing else damaged repaints only the HUD's rect.
 //! * [`compose`] (in the pass, possibly masked) takes no blocking lock and allocates nothing: it copies the cached
 //!   rows through `strip::paint` (the row-run staged painter every furniture strip uses; it takes the sprite down and
-//!   the pass's tail puts it back). It repaints on every pass while visible, because any pass may have drawn a window
-//!   or the shimmer's erase over the rect (the HUD is not an erase-clip tenant). Measured: `paint_us` (budget 300).
+//!   the pass's tail puts it back). PERFHUD2 (B828): the HUD is the THIRD strip tenant (`strip::OVERLAY_SLOT`,
+//!   [`strip_rect`] = the rect it last painted), so the window blits (`wm::occ_clip`), the erase drain and the shimmer
+//!   (`wm::erase_clip`) and the desktop present withhold its rect; the strip writers that do not consult the registry
+//!   latch a full repaint (`strip::overlay_take_hit`). So a pass repaints only what changed: the sampler diffs each new
+//!   image against the cached one into nine field bands, and the pass paints the dirty bands; it paints the WHOLE
+//!   image only on a first paint, a move, a latched hit or a colour-filter change, and nothing at all otherwise.
+//!   Measured: `paint_us` = the steady (band) paint, budget 300; the full paint is reported as `full_us=`/`full_px=`.
 //! * Hidden: the rect is VACATED once (`strip::vacate`: erased and handed back to the scene and the windows under it,
 //!   the furniture's own restore), then [`compose`] costs one relaxed load.
 //!
 //! Wire: `[hud] visible=<0|1> via=<chord|settings|login|test>` on a change; `[hud] shown rect=<w>x<h>+<x>+<y>
-//! paint_us=<n> budget_us=300 -> UNDER|OVER` on the first paint after a show; every 10 s while visible
-//! `[hud] ft_p50=<us> ft_p99=<us> missed=<n> k2p_p99=<us> heap=<kb>/<kb> win=<n> proc=<n>`.
-//! `tests perfhud`: `:: PERFHUD: visible=1 paint_us=<n> fields=9 -> PASS :: pixels=3/3 budget_us=300 under=<0|1> rect=…`.
+//! paint_us=<n> budget_us=300 fields_dirty=9 px=<n> -> UNDER|OVER` (the full paint after a show); every 10 s while
+//! visible `[hud] ft_p50=<us> ft_p99=<us> missed=<n> k2p_p99=<us> heap=<kb>/<kb> win=<n> proc=<n>`.
+//! `tests perfhud`: `:: PERFHUD: visible=1 paint_us=<steady> fields=9 -> PASS :: pixels=3/3 budget_us=300 under=1
+//! fields_dirty=<n> px=<n> full_us=<n> full_px=<n> scale=<s> rect=… max_paint_us=<n>`.
 
 use core::sync::atomic::{AtomicBool, Ordering::{AcqRel, Acquire, Release}};
 
@@ -84,6 +90,16 @@ pub fn take_owed() -> bool {
     OWED.swap(false, AcqRel)
 }
 
+/// PERFHUD2 (B828): the HUD as a strip tenant (`strip::TENANTS[strip::OVERLAY_SLOT]`): the rect it last painted, read
+/// lock-free (two atomics), `None` while nothing is painted — and on a desktop family whose compositor does not paint
+/// it. The panel size is not needed: the rect is the one on the glass.
+pub fn strip_rect(_pw: usize, _ph: usize) -> Option<super::strip::Rect> {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    return glass::painted();
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    None
+}
+
 /// THE CHORD (the fn-row router's one entry, `video::fnrow::fn_row_usage`): `usage` went down under `modifiers`.
 /// Win+F12 toggles the HUD and is consumed (`true`: the F12 volume step does not also run). The Windows key is the
 /// live table's Start key under Softy (`keymap::start_role`) and the GUI key under Una (Command on a Mac, Win on a PC).
@@ -123,6 +139,7 @@ pub fn selftest() {
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 mod glass {
     use super::super::{strip, text, theme, wm};
+    use super::super::blitter::a11yfilter as filt;
     use super::VISIBLE;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -156,6 +173,14 @@ mod glass {
     static PAINTS: AtomicU64 = AtomicU64::new(0);
     static LAST_PAINT_US: AtomicU64 = AtomicU64::new(0);
     static MAX_PAINT_US: AtomicU64 = AtomicU64::new(0);
+    /// PERFHUD2: the last paint's pixels and field bands (9 = a full paint).
+    static LAST_PX: AtomicU64 = AtomicU64::new(0);
+    static LAST_FIELDS: AtomicUsize = AtomicUsize::new(0);
+    /// PERFHUD2: the last FULL paint — its cost, pixels and rect, stored at that paint (the shown line reads these, never
+    /// `SLOT`, which a hide clears).
+    static FULL_US: AtomicU64 = AtomicU64::new(0);
+    static FULL_PX: AtomicU64 = AtomicU64::new(0);
+    static SHOWN_RECT: AtomicU64 = AtomicU64::new(0);
     static SAMPLER: AtomicBool = AtomicBool::new(false);
     /// The paint count at the last show; the first paint past it is reported once ([`SHOWN_DONE`] = reported).
     static SHOWN_AT: AtomicU64 = AtomicU64::new(SHOWN_DONE);
@@ -170,9 +195,17 @@ mod glass {
         w: usize,
         h: usize,
         sig: u64,
+        /// PERFHUD2: per field, the image-local band whose pixels changed since the panel's copy was painted (`None` =
+        /// clean). Unioned by the sampler, cleared by the pass that paints it.
+        dirty: [Option<strip::Rect>; FIELDS],
+        /// The whole image is owed (a first paint, a new size, a change outside the field bands, a hit, a move).
+        full: bool,
+        /// The colour-filter word the panel's copy was last painted under ([`filter_word`]).
+        fw: u32,
     }
 
-    static CACHE: crate::sync::Mutex<Cache> = crate::sync::Mutex::new(Cache { px: Vec::new(), w: 0, h: 0, sig: 0 });
+    static CACHE: crate::sync::Mutex<Cache> =
+        crate::sync::Mutex::new(Cache { px: Vec::new(), w: 0, h: 0, sig: 0, dirty: [None; FIELDS], full: true, fw: 0 });
 
     fn us(dt: u64) -> u64 {
         strip::cycles_to_us(dt)
@@ -182,6 +215,24 @@ mod glass {
         if VISIBLE.load(Relaxed) {
             PASS_T0.store(crate::arch::now_cycles(), Relaxed);
         }
+    }
+
+    /// The rect on the glass ([`super::strip_rect`]): `SLOT`'s, lock-free.
+    pub fn painted() -> Option<strip::Rect> {
+        let p = SLOT.packed();
+        if p == 0 { None } else { Some(strip::unpack_rect(p)) }
+    }
+
+    /// The grid face's cell and the panel's inner pad: `(cw, ch, pad)` — what [`render`] lays out with and the bands
+    /// are cut by.
+    fn geom() -> (usize, usize, usize) {
+        let face = text::Face::Grid;
+        (face.cell_w(), face.cell_h(), strip::PAD() / 2 + 1)
+    }
+
+    /// The colour filter the scan-out copy applies (BP-video-25): a change repaints the whole image.
+    fn filter_word() -> u32 {
+        ((filt::mode() as u32) << 1) | filt::invert() as u32
     }
 
     /// The desktop is built and not held bare (BP-video-9: before a session the furniture owns no pixels).
@@ -227,31 +278,67 @@ mod glass {
             FT[i % FT_N].store(d, Relaxed);
         }
         let Some((pw, ph)) = super::super::WRITER.try_lock().map(|f| *f).filter(|f| f.is_ready()).map(|f| (f.width(), f.height())) else { return false }; // crawl A 16: no blocking WRITER hold inside the pass (BP-video-27)
-        // Never wait in the pass: a cache the sampler is swapping is a skipped paint (the next pass repaints).
-        let Some(c) = CACHE.try_lock() else { return false };
+        // Never wait in the pass: a cache the sampler is swapping is a skipped paint (the bands stay owed).
+        let Some(mut g) = CACHE.try_lock() else { return false };
+        let c = &mut *g;
         let Some(r) = rect(pw, ph, c.w, c.h) else {
-            drop(c);
+            drop(g);
             return vacate_painted();
         };
         let mut owed = false;
         let old = SLOT.packed();
-        if old != 0 && old != strip::pack_rect(Some(r)) {
+        let moved = old != strip::pack_rect(Some(r));
+        if old != 0 && moved {
             owed |= strip::vacate(NAME, strip::unpack_rect(old), Some(r), true);
         }
-        let w = c.w;
-        let tp = crate::arch::now_cycles();
-        let ok = strip::paint(NAME, r, |out, j| {
-            let row = &c.px[j * w..(j + 1) * w];
-            out[..w].copy_from_slice(row);
-        });
-        if ok {
-            let p = us(crate::arch::now_cycles().saturating_sub(tp));
-            LAST_PAINT_US.store(p, Relaxed);
-            MAX_PAINT_US.fetch_max(p, Relaxed);
-            PAINTS.fetch_add(1, Release);
-            SLOT.store(c.sig | 1, Some(r));
+        // PERFHUD2: the whole image on a first paint, a move, a write another strip writer latched (taken AFTER the move's
+        // own vacate, so the HUD's own erase is consumed here), or a filter change; otherwise only the dirty bands.
+        let fw = filter_word();
+        if strip::overlay_take_hit() || old == 0 || moved || c.fw != fw {
+            c.full = true;
         }
-        owed | ok
+        let (w, h) = (c.w, c.h);
+        let tp = crate::arch::now_cycles();
+        let (mut px, mut nf, mut full_paint) = (0usize, 0usize, false);
+        if c.full {
+            let img = &c.px;
+            if strip::paint(NAME, r, |out, j| out[..w].copy_from_slice(&img[j * w..(j + 1) * w])) {
+                c.full = false;
+                c.dirty = [None; FIELDS];
+                c.fw = fw;
+                (px, nf, full_paint) = (w * h, FIELDS, true);
+            }
+        } else {
+            for k in 0..FIELDS {
+                let Some((bx, by, bw, bh)) = c.dirty[k] else { continue };
+                let img = &c.px;
+                let ok = strip::paint(NAME, (r.0 + bx, r.1 + by, bw, bh), |out, j| {
+                    let o = (by + j) * w + bx;
+                    out[..bw].copy_from_slice(&img[o..o + bw]);
+                });
+                if ok {
+                    c.dirty[k] = None;
+                    px += bw * bh;
+                    nf += 1;
+                }
+            }
+        }
+        if nf == 0 {
+            return owed;
+        }
+        let p = us(crate::arch::now_cycles().saturating_sub(tp));
+        LAST_PAINT_US.store(p, Relaxed);
+        MAX_PAINT_US.fetch_max(p, Relaxed);
+        LAST_PX.store(px as u64, Relaxed);
+        LAST_FIELDS.store(nf, Relaxed);
+        if full_paint {
+            FULL_US.store(p, Relaxed);
+            FULL_PX.store(px as u64, Relaxed);
+            SHOWN_RECT.store(strip::pack_rect(Some(r)), Relaxed);
+        }
+        SLOT.store(c.sig | 1, Some(r));
+        PAINTS.fetch_add(1, Release);
+        true
     }
 
     /// One reading of the nine fields.
@@ -372,8 +459,7 @@ mod glass {
     /// grid face, `text.primary` (`ink.warning` past budget). `None` = no memory for it (the old image stays).
     fn render(s: &Snap) -> Option<(Vec<u32>, usize, usize, usize)> {
         let face = text::Face::Grid;
-        let (cw, ch) = (face.cell_w(), face.cell_h());
-        let pad = strip::PAD() / 2 + 1;
+        let (cw, ch, pad) = geom();
         let (w, h) = (COLS * cw + 2 * pad, FIELDS * ch + 2 * pad);
         let ls = lines(s);
         let (bg, line, ink, warn) = (theme::surface_overlay(), theme::line_subtle(), theme::text_primary(), theme::ink_warning());
@@ -400,18 +486,19 @@ mod glass {
         Some((px, w, h, fields))
     }
 
-    /// Sample, and re-render when the text (or the theme, the face, the cell) changed. `true` = a new image is in.
+    /// Sample, and re-render when the text (or the theme, the face, the cell) changed. `true` = a new image is in; its
+    /// changed pixels are owed as field bands ([`diff_bands`]), or the whole image when they cannot be.
     fn refresh() -> (bool, usize) {
         let s = sample();
-        let mut sig = 0xcbf2_9ce4_8422_2325u64;
+        let mut sig = strip::FNV_BASIS;
         for (t, hot) in lines(&s).iter() {
             for b in t.bytes() {
                 sig = strip::fnv1a(sig, b);
             }
             sig = fnv(sig, *hot as u64);
         }
-        let (cw, ch) = (text::Face::Grid.cell_w(), text::Face::Grid.cell_h());
-        sig = fnv(fnv(fnv(fnv(sig, theme::epoch() as u64), text::epoch() as u64), cw as u64), ch as u64);
+        let (cw, ch, pad) = geom();
+        sig = strip::seal(fnv(fnv(fnv(sig, text::epoch() as u64), cw as u64), ch as u64)); // PERFHUD2: the theme epoch and the wallpaper through the one sealer
         sig &= !1;
         let same = { let c = CACHE.lock(); c.sig == sig && c.w != 0 };
         if same {
@@ -419,7 +506,19 @@ mod glass {
         }
         let Some((px, w, h, fields)) = render(&s) else { return (false, 0) };
         let old = {
-            let mut c = CACHE.lock();
+            let mut g = CACHE.lock();
+            let c = &mut *g;
+            // The diff runs under the hold (this task, IRQs on); a pass meanwhile skips its paint and the bands stay owed.
+            if c.full || c.w != w || c.h != h || c.px.len() != w * h {
+                c.full = true;
+            } else {
+                let mut d = c.dirty;
+                if diff_bands(&c.px, &px, w, h, ch, pad, &mut d) {
+                    c.dirty = d;
+                } else {
+                    c.full = true;
+                }
+            }
             let old = core::mem::replace(&mut c.px, px);
             c.w = w;
             c.h = h;
@@ -428,6 +527,43 @@ mod glass {
         };
         drop(old);
         (true, fields)
+    }
+
+    /// PERFHUD2: union the pixels `new` changes from `old` (both `w` x `h`) into the field bands of `dirty`: per changed
+    /// row the first..last differing column, in the band of field `(row - pad) / ch`. `false` = a change outside the nine
+    /// field rows (the border or the padding: a theme change), so the whole image is owed.
+    fn diff_bands(old: &[u32], new: &[u32], w: usize, h: usize, ch: usize, pad: usize, dirty: &mut [Option<strip::Rect>; FIELDS]) -> bool {
+        let mut span: [Option<(usize, usize)>; FIELDS] = [None; FIELDS];
+        for j in 0..h {
+            let (a, b) = (&old[j * w..(j + 1) * w], &new[j * w..(j + 1) * w]);
+            let Some(x0) = (0..w).find(|&i| a[i] != b[i]) else { continue };
+            let x1 = (x0..w).rev().find(|&i| a[i] != b[i]).unwrap_or(x0);
+            let k = if j >= pad && ch != 0 { (j - pad) / ch } else { FIELDS };
+            if k >= FIELDS {
+                return false;
+            }
+            span[k] = Some(match span[k] { Some((l, r)) => (l.min(x0), r.max(x1)), None => (x0, x1) });
+        }
+        for k in 0..FIELDS {
+            if let Some((l, r)) = span[k] {
+                let y0 = pad + k * ch;
+                let band = (l, y0, r + 1 - l, ch.min(h - y0));
+                dirty[k] = Some(match dirty[k] { Some(d) => union(d, band), None => band });
+            }
+        }
+        true
+    }
+
+    /// The smallest rect holding both.
+    fn union(a: strip::Rect, b: strip::Rect) -> strip::Rect {
+        let (x0, y0) = (a.0.min(b.0), a.1.min(b.1));
+        let (x1, y1) = ((a.0 + a.2).max(b.0 + b.2), (a.1 + a.3).max(b.1 + b.3));
+        (x0, y0, x1 - x0, y1 - y0)
+    }
+
+    /// PERFHUD2: is a paint owed that the sampler's tick must drive (a latched hit, or bands/the whole image unpainted)?
+    fn owed() -> bool {
+        desktop_up() && (strip::overlay_pending() || CACHE.try_lock().is_some_and(|c| c.full || c.dirty.iter().any(|d| d.is_some())))
     }
 
     /// One composite for the HUD (the gate may decline it; the holder re-runs, the next tick retries).
@@ -445,17 +581,18 @@ mod glass {
         );
     }
 
-    /// The first paint after a show: its rect and cost, once.
+    /// The first paint after a show — always FULL (the hide's vacate cleared `SLOT`): its rect, cost and pixels as stored
+    /// at that paint, once.
     fn shown_line() {
         let at = SHOWN_AT.load(Relaxed);
         if at == SHOWN_DONE || PAINTS.load(Acquire) <= at {
             return;
         }
-        let (x, y, w, h) = SLOT.rect();
-        let us = LAST_PAINT_US.load(Relaxed);
+        let (x, y, w, h) = strip::unpack_rect(SHOWN_RECT.load(Relaxed));
+        let us = FULL_US.load(Relaxed);
         serial_println!(
-            "[hud] shown rect={}x{}+{}+{} paint_us={} budget_us={} -> {}",
-            w, h, x, y, us, PAINT_BUDGET_US, if us <= PAINT_BUDGET_US { "UNDER" } else { "OVER" }
+            "[hud] shown rect={}x{}+{}+{} paint_us={} budget_us={} fields_dirty={} px={} -> {}",
+            w, h, x, y, us, PAINT_BUDGET_US, FIELDS, FULL_PX.load(Relaxed), if us <= PAINT_BUDGET_US { "UNDER" } else { "OVER" }
         );
         SHOWN_AT.store(SHOWN_DONE, Relaxed);
     }
@@ -485,7 +622,7 @@ mod glass {
                     return;
                 }
             }
-            if refresh().0 {
+            if refresh().0 | owed() {
                 drive();
             }
             shown_line();
@@ -498,8 +635,22 @@ mod glass {
         }
     }
 
-    /// `tests perfhud`: toggle on, render inline, drive composites until the HUD paints (bounded 2 s), read three
-    /// pixels of its margin back from the panel (each must be `surface.overlay`), time the paint, restore the toggle.
+    /// Drive composites until a paint past `p` lands (bounded 2 s).
+    fn wait_paint(p: u64) -> bool {
+        let t_end = crate::arch::ms() + 2_000;
+        while PAINTS.load(Acquire) == p && crate::arch::ms() < t_end {
+            drive();
+            let w = crate::arch::ms() + 17;
+            while PAINTS.load(Acquire) == p && crate::arch::ms() < w {
+                core::hint::spin_loop();
+            }
+        }
+        PAINTS.load(Acquire) > p
+    }
+
+    /// `tests perfhud`: toggle on, render inline. Leg 1: the FULL paint (driven until it lands, bounded 2 s). Leg 2: the
+    /// STEADY paint — line 0's value cells marked dirty, driven until painted. Then three pixels of the margin read back
+    /// from the panel (each must be `surface.overlay` under the applied colour filter, BP-video-25); restore the toggle.
     pub fn selftest() {
         if super::super::panel_snapshot().filter(|f| f.is_ready()).is_none() {
             serial_println!(":: PERFHUD: -> SKIP :: reason=no-panel");
@@ -512,23 +663,30 @@ mod glass {
         let was = super::visible();
         let _ = super::latch(true, "test");
         let vis = super::visible() as u8;
+        // Leg 1: force a fresh image, owed whole (the sampler may not have run yet).
         let p0 = PAINTS.load(Acquire);
-        // Force a fresh image (the sampler may not have run yet).
-        CACHE.lock().sig = 0;
+        {
+            let mut c = CACHE.lock();
+            c.sig = 0;
+            c.full = true;
+        }
         let (_, fields) = refresh();
-        let t_end = crate::arch::ms() + 2_000;
-        while PAINTS.load(Acquire) == p0 && crate::arch::ms() < t_end {
-            drive();
-            let w = crate::arch::ms() + 17;
-            while PAINTS.load(Acquire) == p0 && crate::arch::ms() < w {
-                core::hint::spin_loop();
+        let painted = wait_paint(p0);
+        // Leg 2: the steady paint — line 0's value cells (columns 3..18) owed as one band.
+        let (cw, ch, pad) = geom();
+        let p1 = PAINTS.load(Acquire);
+        {
+            let mut c = CACHE.lock();
+            if c.w >= pad + COLS * cw && c.h >= pad + ch {
+                c.dirty[0] = Some((pad + 3 * cw, pad, (COLS - 3) * cw, ch));
             }
         }
-        let painted = PAINTS.load(Acquire) > p0;
+        let steady = painted && wait_paint(p1);
+        let (paint_us, px, nf) = (LAST_PAINT_US.load(Relaxed), LAST_PX.load(Relaxed), LAST_FIELDS.load(Relaxed));
         let (x, y, w, h) = SLOT.rect();
-        let want = theme::surface_overlay();
+        let want = filt::color(theme::surface_overlay());
         let mut hits = 0;
-        if painted && w > 6 && h > 6 {
+        if steady && w > 6 && h > 6 {
             if let Some(fb) = super::super::panel_snapshot() {
                 for (px, py) in [(x + 2, y + 2), (x + w - 3, y + 2), (x + 2, y + h - 3)] {
                     if fb.read_pixel(px, py) == Some(want) {
@@ -537,15 +695,16 @@ mod glass {
                 }
             }
         }
-        let paint_us = LAST_PAINT_US.load(Relaxed);
         if !was {
             let _ = super::latch(false, "test");
             drive();
         }
-        let ok = painted && hits == 3 && fields == FIELDS && vis == 1;
+        let under = paint_us <= PAINT_BUDGET_US;
+        let ok = painted && steady && hits == 3 && fields == FIELDS && vis == 1 && under;
         serial_println!(
-            ":: PERFHUD: visible={} paint_us={} fields={} -> {} :: pixels={}/3 budget_us={} under={} rect={}x{}+{}+{} max_paint_us={}",
-            vis, paint_us, fields, if ok { "PASS" } else { "FAIL" }, hits, PAINT_BUDGET_US, (paint_us <= PAINT_BUDGET_US) as u8, w, h, x, y,
+            ":: PERFHUD: visible={} paint_us={} fields={} -> {} :: pixels={}/3 budget_us={} under={} fields_dirty={} px={} full_us={} full_px={} scale={} rect={}x{}+{}+{} max_paint_us={}",
+            vis, paint_us, fields, if ok { "PASS" } else { "FAIL" }, hits, PAINT_BUDGET_US, under as u8, nf, px,
+            FULL_US.load(Relaxed), FULL_PX.load(Relaxed), super::super::dpi::scale_str(super::super::dpi::s2()), w, h, x, y,
             MAX_PAINT_US.load(Relaxed)
         );
     }
