@@ -287,6 +287,7 @@ fn relist_cached(m: &mut Model) -> usize {
 
 /// The service pass (rides `live::service`): one atomic compare when nothing changed.
 pub fn service() {
+    let _ = nav_now(); // NAVREAD (B834): a navigation the router deferred reads off MODEL here, before the live compare
     let ng = volume_gen();
     let seen = SEEN.load(Ordering::Acquire);
     if ng == seen || !is_open() {
@@ -455,25 +456,33 @@ fn relist_plan(ng: u64) -> Option<RelistPlan> {
 /// The reads — no Quarry lock is taken here. The sidebar re-derives its rows now (its own lock), so the install's
 /// `toolbar::after_show` finds the generation already seen.
 fn relist_read(plan: RelistPlan) -> RelistRead {
-    let (t0, c0) = (crate::arch::ms(), crate::arch::now_cycles());
     super::sidebar::refresh(false);
+    let up = if plan.cwd != "/" { Some(parent(&plan.cwd)) } else { None }; // the fallback `navigate` target
+    let (ents, read_ms, read_cycles) = read_paths(&plan.paths, up);
+    RelistRead { plan, ents, read_ms, read_cycles }
+}
+
+/// The ONE off-lock directory read (QUARRYRELIST's, shared by NAVREAD): every path through `collect`, no Quarry lock
+/// taken; `up` is read too when the first path fails and it is not already planned. `(entries, read_ms, read_cycles)`.
+fn read_paths(paths: &[String], up: Option<String>) -> (Vec<CacheEnt>, u64, u64) {
+    let (t0, c0) = (crate::arch::ms(), crate::arch::now_cycles());
     let mut ents: Vec<CacheEnt> = Vec::new();
     let mut extra: Option<String> = None;
-    for (k, p) in plan.paths.iter().enumerate() {
+    for (k, p) in paths.iter().enumerate() {
         match collect(p) {
             Ok((is_dir, rows)) => ents.push(CacheEnt { path: String::from(p.as_str()), is_dir, rows }),
-            Err(_) if k == 0 && plan.cwd != "/" => extra = Some(parent(&plan.cwd)), // the fallback `navigate` target
+            Err(_) if k == 0 => extra = up.clone(),
             Err(_) => {}
         }
     }
-    if let Some(p) = extra.filter(|p| !plan.paths.iter().any(|q| q == p)) {
+    if let Some(p) = extra.filter(|p| !paths.iter().any(|q| q == p)) {
         if let Ok((is_dir, rows)) = collect(&p) {
             ents.push(CacheEnt { path: p, is_dir, rows });
         }
     }
     ents.truncate(MAX_CACHE);
     let read_cycles = crate::arch::now_cycles().saturating_sub(c0);
-    RelistRead { plan, ents, read_ms: crate::arch::ms().saturating_sub(t0), read_cycles }
+    (ents, crate::arch::ms().saturating_sub(t0), read_cycles)
 }
 
 /// ONE MODEL take: the read installs only into the generation and folder it was planned in.
@@ -552,4 +561,284 @@ pub(super) fn relist_probe(bump: &dyn Fn()) -> RelistProbe {
     let ok = relist_now(volume_gen(), crate::arch::ms()).is_some();
     let done = if ok { LAST.lock().take() } else { None };
     RelistProbe { paint_defer, stale_dropped, done }
+}
+
+// ── NAVREAD (rmbp-ledger B834): a navigation's read off MODEL ───────────────────────────────────────────────────
+//
+// CHARTER: a navigation the router makes (content_press's tree press and list double-click, key_route's Enter and
+// Backspace) to a folder the model's cache does not hold is DEFERRED: recorded under the router's MODEL hold with the
+// path bar saying `opening <leaf>`, read on the service pass with no Quarry lock (QUARRYRELIST's `read_paths`), and
+// installed in one short take through the existing `Model::navigate` over the warm cache. The glass shows the press at
+// once instead of freezing on the old folder for the length of the read. Toolbar travel (q3_press) is owed NAVTRAVEL.
+
+impl Model {
+    /// The ONE cache insert (`collect_cached`'s miss and the NAVREAD install): an entry read at volume generation `gen`.
+    /// A generation the cache was not filled against starts it over; the same path is replaced; the oldest goes at
+    /// `MAX_CACHE`.
+    pub(super) fn cache_put(&mut self, gen: u64, ent: CacheEnt) {
+        if gen != self.cache_gen {
+            self.cache.clear();
+            self.cache_gen = gen;
+        }
+        self.cache.retain(|e| e.path != ent.path);
+        if self.cache.len() >= MAX_CACHE {
+            self.cache.remove(0);
+        }
+        self.cache.push(ent);
+    }
+}
+
+/// One deferred navigation: its sequence number, the folder it goes to and the folder it left.
+#[derive(Clone)]
+struct NavIntent {
+    seq: u64,
+    path: String,
+    from: String,
+}
+
+/// The pending navigation (a newer one replaces it). A LEAF: taken after MODEL, never holding another lock.
+static NAV: crate::sync::Mutex<Option<NavIntent>> = crate::sync::Mutex::new(None);
+static NAV_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Up only while a router gesture runs under MODEL ([`Door`]); read only inside `Model::navigate` (MODEL held).
+static DOOR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The router's door: while it lives (inside the router's MODEL hold) a cold navigation is deferred.
+pub(super) struct Door;
+impl Door {
+    pub(super) fn raise() -> Door {
+        DOOR.store(true, Ordering::Release);
+        Door
+    }
+}
+impl Drop for Door {
+    fn drop(&mut self) {
+        DOOR.store(false, Ordering::Release);
+    }
+}
+
+/// The path-bar status a deferred navigation shows (worded as `openers`' activation status).
+fn opening(path: &str) -> String {
+    alloc::format!("opening {}", leaf(path))
+}
+
+/// `Model::navigate`'s first statement. `false` (navigate synchronously) unless the Door is up AND `path` is cold;
+/// a warm path also cancels any pending intent. A cold path is recorded, the status set, and `true` returned.
+pub(super) fn nav_defer(m: &mut Model, path: &str) -> bool {
+    if !DOOR.load(Ordering::Acquire) {
+        return false;
+    }
+    let warm = m.cache_gen == volume_gen() && m.cache.iter().any(|e| e.path == path);
+    if warm {
+        if let Some(old) = NAV.lock().take() {
+            if m.status.as_deref() == Some(opening(&old.path).as_str()) {
+                m.status = None;
+            }
+        }
+        return false;
+    }
+    let seq = NAV_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let from = m.cwd.clone();
+    serial_println!("[quarry] navigate pending dir={} seq={} from={}", path, seq, from);
+    m.status = Some(opening(path));
+    *NAV.lock() = Some(NavIntent { seq, path: String::from(path), from });
+    true
+}
+
+/// What one deferred navigation reads: the intent, and the generation it is read at.
+struct NavPlan {
+    intent: NavIntent,
+    at_gen: u64,
+}
+
+/// What the plan read, with no Quarry lock held.
+struct NavRead {
+    plan: NavPlan,
+    ents: Vec<CacheEnt>,
+    read_ms: u64,
+    read_cycles: u64,
+}
+
+/// One installed navigation's account (the wire's and the fixture's).
+pub(super) struct Navigated {
+    pub dir: String,
+    pub rows: usize,
+    pub read_ms: u64,
+    pub held_us: u64,
+    pub locked_reads: usize,
+}
+
+/// The install's outcome.
+enum NavInstall {
+    Done(Navigated),
+    /// (folder, why: superseded | moved | closed)
+    Dropped(String, &'static str),
+    /// (folder, planned generation, generation now): the intent stays, the next pass re-reads.
+    Retry(String, u64, u64),
+}
+
+/// One service pass's NAVREAD step.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum NavStep {
+    Idle,
+    Declined,
+    Done,
+    Dropped,
+    Retry,
+}
+
+/// The pending intent, cloned under NAV only.
+fn nav_plan() -> Option<NavPlan> {
+    let intent = NAV.lock().as_ref().cloned()?;
+    Some(NavPlan { intent, at_gen: volume_gen() })
+}
+
+/// The read — no Quarry lock is taken here.
+fn nav_read(plan: NavPlan) -> NavRead {
+    let (ents, read_ms, read_cycles) = read_paths(core::slice::from_ref(&plan.intent.path), None);
+    NavRead { plan, ents, read_ms, read_cycles }
+}
+
+/// ONE MODEL take, timed: the read installs only for the intent, generation and folder it was planned in.
+fn nav_install(r: NavRead) -> NavInstall {
+    let mut g = MODEL.lock();
+    let c0 = crate::arch::now_cycles();
+    let path = r.plan.intent.path.clone();
+    let Some(m) = g.as_mut() else {
+        *NAV.lock() = None;
+        return NavInstall::Dropped(path, "closed");
+    };
+    {
+        let mut nav = NAV.lock();
+        if nav.as_ref().map(|n| n.seq) != Some(r.plan.intent.seq) {
+            return NavInstall::Dropped(path, "superseded");
+        }
+        let now_gen = volume_gen();
+        if now_gen != r.plan.at_gen {
+            return NavInstall::Retry(path, r.plan.at_gen, now_gen);
+        }
+        *nav = None;
+    }
+    let status = opening(&path);
+    if m.cwd != r.plan.intent.from {
+        if m.status.as_deref() == Some(status.as_str()) {
+            m.status = None;
+        }
+        return NavInstall::Dropped(path, "moved");
+    }
+    m.reads += r.ents.len();
+    m.read_cycles = m.read_cycles.saturating_add(r.read_cycles);
+    for e in r.ents {
+        m.cache_put(r.plan.at_gen, e);
+    }
+    let reads0 = m.reads;
+    m.navigate(&path); // the Door is down here: a warm, synchronous show
+    if m.status.as_deref() == Some(status.as_str()) {
+        m.status = None;
+    }
+    m.settle();
+    let locked_reads = m.reads.saturating_sub(reads0);
+    let (dir, rows) = (m.cwd.clone(), m.list.len());
+    let held_us = crate::video::strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(c0));
+    drop(g);
+    NavInstall::Done(Navigated { dir, rows, read_ms: r.read_ms, held_us, locked_reads })
+}
+
+/// The pass's tail, after the MODEL drop: the wire, the account, the repaint.
+fn nav_done(r: NavInstall) -> NavStep {
+    match r {
+        NavInstall::Done(d) => {
+            serial_println!(
+                "[quarry] navigate dir={} rows={} read_ms={} held_us={} on={} locked_reads={}",
+                d.dir, d.rows, d.read_ms, d.held_us, crate::arch::sched::current_name().unwrap_or("?"), d.locked_reads
+            );
+            *NAV_LAST.lock() = Some(d);
+            repaint();
+            NavStep::Done
+        }
+        NavInstall::Dropped(dir, why) => {
+            serial_println!("[quarry] navigate dropped dir={} why={}", dir, why);
+            if why == "moved" {
+                repaint();
+            }
+            NavStep::Dropped
+        }
+        NavInstall::Retry(dir, a, b) => {
+            serial_println!("[quarry] navigate retry dir={} gen={}->{}", dir, a, b);
+            NavStep::Retry
+        }
+    }
+}
+
+/// The service pass's NAVREAD step: never inside a paint (the intent stays pending); nothing pending is one leaf lock.
+pub(super) fn nav_now() -> NavStep {
+    if super::columns::painting() {
+        return NavStep::Declined;
+    }
+    let Some(plan) = nav_plan() else { return NavStep::Idle };
+    nav_done(nav_install(nav_read(plan)))
+}
+
+/// The last installed navigation's account (the fixture reads it; a leaf lock).
+static NAV_LAST: crate::sync::Mutex<Option<Navigated>> = crate::sync::Mutex::new(None);
+
+/// `tests quarryio`'s navigation leg (columns.rs `nav_leg`).
+pub(super) struct NavProbe {
+    pub deferred: bool,
+    pub paint_defer: bool,
+    pub stale_dropped: bool,
+    pub cwd_ok: bool,
+    pub done: Option<Navigated>,
+}
+
+/// From the open window: (a) under ONE MODEL take, the cache dropped and the Door up, `navigate(to)` defers (cwd
+/// unchanged, status `opening <leaf>`) and the plan is taken in the same hold; (b) in that hold, under a PaintMark,
+/// `nav_now` declines with the intent still pending; (c) read that plan, then under one take a second Door navigation
+/// (cache dropped again, so it is cold whichever pass ran) supersedes it and its install drops; (d) the pass installs
+/// the newer intent (this task's or the render task's own), and the window shows `to`. The legs are ordered so the
+/// render task's concurrent pass cannot change an outcome: (b) runs while MODEL is held (nothing can install), and
+/// NAV_LAST is cleared in (c)'s hold after B is recorded (an install of A after that is superseded, so only B's sets it).
+pub(super) fn nav_probe(to: &str) -> NavProbe {
+    let (deferred, paint_defer, plan_a) = {
+        let mut g = MODEL.lock();
+        match g.as_mut() {
+            Some(m) => {
+                m.invalidate();
+                let was = m.cwd.clone();
+                let ok = {
+                    let _door = Door::raise();
+                    m.navigate(to);
+                    m.cwd == was && m.status.as_deref() == Some(opening(to).as_str())
+                };
+                let plan = nav_plan();
+                let paint_defer = {
+                    let _paint = super::columns::PaintMark::new();
+                    nav_now() == NavStep::Declined
+                } && NAV.lock().is_some();
+                (ok && plan.is_some(), paint_defer, plan)
+            }
+            None => (false, false, None),
+        }
+    };
+    let stale_dropped = match plan_a {
+        Some(a) => {
+            let read = nav_read(a);
+            if let Some(m) = MODEL.lock().as_mut() {
+                m.invalidate();
+                let _door = Door::raise();
+                m.navigate(to);
+                *NAV_LAST.lock() = None;
+            }
+            matches!(nav_install(read), NavInstall::Dropped(_, "superseded"))
+        }
+        None => false,
+    };
+    let t0 = crate::arch::ms();
+    while NAV_LAST.lock().is_none() && crate::arch::ms().saturating_sub(t0) < 2_000 {
+        if nav_now() == NavStep::Idle {
+            crate::arch::sched::yield_now();
+        }
+    }
+    let done = NAV_LAST.lock().take();
+    let cwd_ok = MODEL.lock().as_ref().map_or(false, |m| m.cwd == to);
+    NavProbe { deferred, paint_defer, stale_dropped, cwd_ok, done }
 }

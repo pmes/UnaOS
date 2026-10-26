@@ -997,14 +997,14 @@ impl Model {
             .saturating_add(crate::arch::now_cycles().saturating_sub(t0));
         self.reads += 1;
         if let Ok((is_dir, rows)) = &out {
-            if self.cache.len() >= MAX_CACHE {
-                self.cache.remove(0);
-            }
-            self.cache.push(CacheEnt {
-                path: String::from(path),
-                is_dir: *is_dir,
-                rows: rows.clone(),
-            });
+            self.cache_put(
+                now_gen,
+                CacheEnt {
+                    path: String::from(path),
+                    is_dir: *is_dir,
+                    rows: rows.clone(),
+                },
+            );
         }
         out
     }
@@ -1177,7 +1177,7 @@ impl Model {
     /// Navigate the list pane into `path` AND reveal it in the tree when the tree already carries it,
     /// so the two panes never disagree about where the operator is.
     fn navigate(&mut self, path: &str) {
-        self.show(path);
+        if livedir::nav_defer(self, path) { return; } self.show(path); // NAVREAD (B834): under the router's Door a COLD path is deferred — read off MODEL on the service pass (livedir.rs tail), the path bar says `opening <leaf>`
         if let Some(i) = self.tree.iter().position(|r| r.path == path) {
             self.tree_sel = i;
         }
@@ -1236,9 +1236,9 @@ impl Model {
                     self.expand(t);
                 }
             }
-            self.navigate(&p);
-            self.focus = Pane::List;
             self.status = None;
+            self.focus = Pane::List;
+            self.navigate(&p);
             Act::None
         } else {
             // FILETYPE (B307): OPEN BY TYPE. The type (attribute → sniff → extension table →
@@ -2178,7 +2178,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
             key_witness(c, true, false);
             return false;
         };
-        match c {
+        let _door = livedir::Door::raise(); match c { // NAVREAD (B834): Enter / Backspace navigations through the Door (lowered at the block's end, still under MODEL)
             // Up / Down — move the selection in the focused pane; `settle` does the following.
             0x1F => match m.focus {
                 Pane::Tree => m.tree_sel = m.tree_sel.saturating_sub(1),
@@ -2235,7 +2235,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
                             m.expand(i);
                         }
                         let p = m.tree[i].path.clone();
-                        m.show(&p);
+                        m.navigate(&p);
                     }
                 }
                 // The KEYBOARD twin of the double-click, and deliberately the SAME function: Enter
@@ -2408,7 +2408,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         //
         // QUARRYCLICK — the before/after pair [`press_witness`] reads, taken inside the one lock the
         // press already holds so the reading cannot race a repaint or a second press.
-        match q3_press(m, sx, sy) { Some(a) => a, None => press_and_witness(m, sx, sy).0 } // QUARRY3 (B413): toolbar, path bar, sidebar, icon grid first
+        match q3_press(m, sx, sy) { Some(a) => a, None => { let _door = livedir::Door::raise(); press_and_witness(m, sx, sy).0 } } // NAVREAD (B834): content_press's navigations (tree press, list double-click) through the Door. QUARRY3 (B413): toolbar, path bar, sidebar, icon grid first
     };
     // Outside the lock, always: `run_act` may reach the ELF loader and the scheduler.
     run_act(act); dragdrop::arm_after_press(x, y, sx, sy); // DRAGDROP (B440): a single press on a list row / icon arms a drag (starts past the threshold)
@@ -2557,7 +2557,7 @@ fn content_press(m: &mut Model, sx: usize, sy: usize) -> Act {
             }
         } else {
             let p = m.tree[i].path.clone();
-            m.show(&p); livedir::tree_double(m, i, prev_ms, prev_row, prev_tree); // QUARRYLIVE (B494): Peter, flight 26 — a double-click on a tree row expands it
+            m.navigate(&p); livedir::tree_double(m, i, prev_ms, prev_row, prev_tree); // QUARRYLIVE (B494): Peter, flight 26 — a double-click on a tree row expands it
         }
         m.settle();
         return Act::None;
