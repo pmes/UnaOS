@@ -1335,12 +1335,39 @@ fn relist_leg(dir: &str) -> RelistLeg {
     let p = super::livedir::relist_probe(&bump);
     let (rows, held, locked) = p.done.as_ref().map_or((0, u64::MAX, usize::MAX), |d| (d.rows, d.held_us, d.locked_reads));
     let off_lock = p.done.is_some() && locked == 0;
-    let ok = off_lock && p.paint_defer && p.stale_dropped && rows > RELIST_ROWS && held <= RELIST_HELD_US;
+    let nl = nav_leg(dir, &sub); // NAVREAD (B834): a navigation into RELIST, read off MODEL (file tail)
+    let ok = off_lock && p.paint_defer && p.stale_dropped && rows > RELIST_ROWS && held <= RELIST_HELD_US && nl.ok;
     let terms = alloc::format!(
-        "relist_rows={} relist_held_us={} off_lock={} paint_defer={} stale={}",
+        "relist_rows={} relist_held_us={} off_lock={} paint_defer={} stale={} {}",
         rows,
         if held == u64::MAX { String::from("-") } else { alloc::format!("{}", held) },
         if off_lock { "ok" } else { "FAIL" },
+        if p.paint_defer { "ok" } else { "FAIL" },
+        if p.stale_dropped { "dropped" } else { "FAIL" },
+        nl.terms
+    );
+    RelistLeg { ok, terms }
+}
+
+// ── NAVREAD (rmbp-ledger B834): `tests quarryio`'s navigation leg ───────────────────────────────────────────────
+
+/// From `dir` (QIOTMP) into `sub` (RELIST, [`RELIST_ROWS`] files + BUMP) through `livedir::nav_probe`: deferred under the
+/// Door, declined under a PaintMark, a superseded read dropped, the newer one installed off the lock under the bound.
+/// `nav_rows=<n> nav_held_us=<n> nav_off_lock=<ok|FAIL> nav_deferred=<ok|FAIL> nav_paint_defer=<ok|FAIL> nav_stale=<dropped|FAIL>`.
+fn nav_leg(dir: &str, sub: &str) -> RelistLeg {
+    if !super::open_at(dir) {
+        return RelistLeg { ok: false, terms: String::from("nav=FAIL(open)") };
+    }
+    let p = super::livedir::nav_probe(sub);
+    let (rows, held, locked) = p.done.as_ref().map_or((0, u64::MAX, usize::MAX), |d| (d.rows, d.held_us, d.locked_reads));
+    let off_lock = p.done.is_some() && locked == 0 && p.cwd_ok;
+    let ok = off_lock && p.deferred && p.paint_defer && p.stale_dropped && rows > RELIST_ROWS && held <= RELIST_HELD_US;
+    let terms = alloc::format!(
+        "nav_rows={} nav_held_us={} nav_off_lock={} nav_deferred={} nav_paint_defer={} nav_stale={}",
+        rows,
+        if held == u64::MAX { String::from("-") } else { alloc::format!("{}", held) },
+        if off_lock { "ok" } else { "FAIL" },
+        if p.deferred { "ok" } else { "FAIL" },
         if p.paint_defer { "ok" } else { "FAIL" },
         if p.stale_dropped { "dropped" } else { "FAIL" }
     );
