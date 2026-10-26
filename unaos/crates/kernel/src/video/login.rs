@@ -2367,7 +2367,7 @@ fn dispatch_old(job: Job, n: &[u8], p: &[u8], o: &[u8]) {
         repaint();
         #[cfg(target_arch = "x86_64")]
         if let Some(cpu) = worker_core() {
-            crate::arch::sched::spawn("login-submit", submit_worker, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+            crate::arch::sched::spawn_stack("login-submit", submit_worker, 0, cpu, crate::arch::sched::PRIO_NORMAL, crate::arch::sched::RENDER_PATH_STACK_SIZE); // STACKGUARD3 (B832): the bind path's measured 32 KiB (RENDSTACK's rule; the render task ran it before KEYBOOT2 moved it here), never 16 KiB under a masked CARD/MOUNT hold
         }
         return;
     }

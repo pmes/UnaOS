@@ -22,7 +22,7 @@ pub const UART: usize = 1;
 /// The UnaFS mount (`fs/unafs.rs` `MOUNT`).
 pub const UNAFS: usize = 2;
 const N: usize = 3;
-/// The names `[stack] overflow … released=[…]` prints.
+/// The names `[lock] released-on-death name=<sink|uart|unafs> …` prints (STACKGUARD3 B832; `sync::release_task`).
 pub const NAMES: [&str; N] = ["sink", "uart", "unafs"];
 
 static ON: AtomicBool = AtomicBool::new(false);
@@ -89,4 +89,41 @@ pub fn held_by(lock: usize, tid: u64) -> bool {
 /// Forget `lock`'s holder (after its owner force-released it).
 pub fn clear(lock: usize) {
     OWNER[lock].store(0, Ordering::Release);
+}
+
+// ── STACKGUARD3 (rmbp-ledger B832) — the dead task's tracked locks, released FIRST by `sync::release_task` ──────────
+// `stackguard::release_held`'s body, MOVED here (it was called beside `release_task` at three death sites). Each of the
+// three is a `sync::Mutex` whose `force_unlock` forgets its registry entry, so `release_task`'s walk never sees it again:
+// these three are released UNPOISONED (their owners' releases are their recovery: the sink and the UART restart at a
+// line boundary, the mount is leaked and re-bound from the medium by the next `with_unafs`).
+
+/// Force-release every tracked lock whose recorded holder is `tid` (a task that never runs again); the bit set of what
+/// was released (bit `i` = [`NAMES`]`[i]`). Off on aarch64 (no tracked holder is ever recorded there).
+pub fn release_dead(tid: u64) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut out = 0u32;
+        if held_by(SINK, tid) {
+            clear(SINK);
+            crate::drivers::xhci::ftdi::lockowner_release();
+            out |= 1 << SINK;
+        }
+        if held_by(UART, tid) {
+            clear(UART);
+            crate::arch::serial::lockowner_release();
+            out |= 1 << UART;
+        }
+        #[cfg(feature = "unafs")]
+        if held_by(UNAFS, tid) {
+            clear(UNAFS);
+            crate::fs::unafs::lockowner_release();
+            out |= 1 << UNAFS;
+        }
+        out
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = tid;
+        0
+    }
 }

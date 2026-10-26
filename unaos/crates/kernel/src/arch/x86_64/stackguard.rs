@@ -16,13 +16,13 @@
 //! escalates to when the CPU cannot push the #PF frame on the exhausted stack (#DF runs on its own IST) —
 //! prints `[stack] OVERFLOW task=<name> stack=<base>..<top> fault=<addr> rip=<addr> via=<pf|df>` and halts
 //! THAT TASK (`sched::exit` on a fresh frame at the top of its own slab), not the machine. R83: the first
-//! fault on the wire. A task that overflowed while holding a lock still holds it — the line says which task.
+//! fault on the wire. STACKGUARD3 (B832): its locks go back through `sync::release_task(tid, "guard")`, poisoned, named.
 //!
 //! Boot: one arming line `[stack] guards armed tasks=<n> page=4096` (R80: an arming decision, one line), and
 //! `tests stackroom` — each live guarded task's high mark (the `witness` paint) against its size.
 //! STACKGUARD2 (B403) covers the rest: every AP stack, every IST stack and the BSP's firmware stack get a
 //! guard page ([`arm_cpu`], before the AP runs), the remote flush is an IPI ([`shootdown`]), and a halted task
-//! releases the locks `lockowner` names it the holder of. Design: docs/dev/evidence/rmbp-1005/stackguard2.md.
+//! releases its locks (`sync::release_task`, lockowner's first). Design: docs/dev/evidence/rmbp-1005/stackguard2.md.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -220,10 +220,10 @@ extern "C" fn overflow_exit() -> ! {
     let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
     DF_DEPTH[cpu].store(0, Ordering::Relaxed); // this core left its #DF path for good (we run on the dead task's slab)
     let (fault, rip, df) = (OVF_FAULT[cpu].load(Ordering::Relaxed), OVF_RIP[cpu].load(Ordering::Relaxed), OVF_DF[cpu].load(Ordering::Relaxed));
-    // STACKGUARD2 M3: release what the dead task is KNOWN to hold BEFORE its line, so the line reaches the
-    // wire (the FTDI ring is the rMBP's wire). Replaces the 20M-spin wait on SERIAL1 + machine-wide panic mode.
-    let released = release_held(super::sched::current_task_id(cpu).unwrap_or(0));
-    crate::sync::release_task(super::sched::current_task_id(cpu).unwrap_or(0), "stack-overflow"); // LOCKREG (B414): every OTHER lock the registry holds in the dead task's name, one line
+    // STACKGUARD3 (B832): the ONE release (`sync::release_task`: lockowner's three first — the FTDI ring is the rMBP's wire —
+    // then every registered lock, poisoned, one `[lock] released-on-death` line each) BEFORE the lines below reach the wire.
+    let tid = super::sched::current_task_id(cpu).unwrap_or(0);
+    let holding = crate::sync::release_task(tid, "guard");
     if let Some((name, base, len)) = super::sched::current_named_slab(cpu) {
         serial_println!(
             "[stack] OVERFLOW task={} stack={:#x}..{:#x} fault={:#x} rip={:#x} via={} -> task halted",
@@ -234,7 +234,7 @@ extern "C" fn overflow_exit() -> ! {
             rip,
             if df != 0 { "df" } else { "pf" }
         );
-        serial_println!("[stack] overflow task={} released=[{}]", name, Released(released));
+        serial_println!("[stack] guard hit task={} size={} high={} holding={}", name, len.saturating_sub(super::sched::STACK_GUARD), (base + len as u64).saturating_sub(fault), holding);
         OVF_LAST.store(((cpu as u64) << 8) | df, Ordering::Relaxed);
         OVF_COUNT.fetch_add(1, Ordering::Release);
         // Re-lay the absorber so RENDSTACK's switch-out check does not read the abandoned overflow as a
@@ -533,48 +533,6 @@ fn df_reentry(cpu: usize, cr2: u64, rip: u64) -> ! {
     }
 }
 
-// ── M3: what a halted task is known to hold ───────────────────────────────────────────────────────────
-
-/// Force-release every `lockowner` lock whose recorded holder is `tid`; the bit set of what was released.
-pub(crate) fn release_held(tid: u64) -> u32 {
-    use crate::lockowner as lo;
-    let mut out = 0u32;
-    if lo::held_by(lo::SINK, tid) {
-        lo::clear(lo::SINK);
-        crate::drivers::xhci::ftdi::lockowner_release();
-        out |= 1 << lo::SINK;
-    }
-    if lo::held_by(lo::UART, tid) {
-        lo::clear(lo::UART);
-        super::serial::lockowner_release();
-        out |= 1 << lo::UART;
-    }
-    #[cfg(feature = "unafs")]
-    if lo::held_by(lo::UNAFS, tid) {
-        lo::clear(lo::UNAFS);
-        crate::fs::unafs::lockowner_release();
-        out |= 1 << lo::UNAFS;
-    }
-    out
-}
-
-struct Released(u32);
-impl core::fmt::Display for Released {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let mut first = true;
-        for (i, n) in crate::lockowner::NAMES.iter().enumerate() {
-            if self.0 & (1 << i) != 0 {
-                if !first {
-                    f.write_str(",")?;
-                }
-                f.write_str(n)?;
-                first = false;
-            }
-        }
-        Ok(())
-    }
-}
-
 // ── M4/M5: `tests stackroom` over every kind, and the witness ─────────────────────────────────────────
 
 fn room_line(kind: &str, idx: usize, lo: u64, top: u64, guard: u64) {
@@ -680,7 +638,7 @@ fn scratch_entry(_: usize) {
 
 #[inline(never)]
 #[allow(unconditional_recursion)]
-fn scratch_deep(d: u64) -> u64 {
+pub(crate) fn scratch_deep(d: u64) -> u64 { // STACKGUARD3 (B832): `tests lockreg`'s guard leg recurses through it too
     let mut b = [0u8; 1024];
     core::hint::black_box(&mut b);
     b[(d & 0x3FF) as usize] = d as u8;

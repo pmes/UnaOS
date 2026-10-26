@@ -403,11 +403,11 @@ mod imp {
 
     // ══ SHELLTASK2 (rmbp-ledger B474) — the abort, the dock seam, `tests shelltask2` ══════════════════════
 
-    /// Free what a dead (reaped) task held, the STACKGUARD2 order: the named three (`lockowner`: sink, UART, UnaFS
-    /// mount) first, then every lock LOCKREG holds in its name. The count of locks given back.
+    /// Free what a dead (reaped) task held — STACKGUARD3 (B832): the ONE release, `sync::release_task` (the named three,
+    /// `lockowner`'s sink, UART, UnaFS mount, first; then every lock LOCKREG holds in its name, poisoned). The count given back.
     fn free_dead(tid: u64, why: &str) -> usize {
-        let named = crate::arch::stackguard::release_held(tid).count_ones() as usize;
-        named + crate::sync::release_task(tid, why)
+        // STACKGUARD3 (B832): was `stackguard::release_held` + `release_task`; release_task now runs lockowner's three first.
+        crate::sync::release_task(tid, why)
     }
 
     /// Ctrl-C (`shellux` 0x03) / ⌘. (`Action::Interrupt`) on the render task: abort the shell window's running job.
