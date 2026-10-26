@@ -63,7 +63,7 @@ unsafe impl GlobalAlloc for Locked<Heap> {
         arch::without_interrupts(|| {
             let mut heap = self.inner.lock();
             match heap.allocate_first_fit(layout) {
-                Ok(ptr) => { result = ptr.as_ptr(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] high_note(heap.used()); } // MEMLINE (B677): the window's high-water, under the heap lock. LINE-NEUTRAL append, code first
+                Ok(ptr) => { result = ptr.as_ptr(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] high_note(heap.used()); #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_alloc(result as usize, layout.size()); } // MEMLINE (B677): the window's high-water, under the heap lock. LINE-NEUTRAL append, code first; MEMLINE2 (B821): the owner census, same lock
                 Err(_) => {}
             }
         });
@@ -74,7 +74,7 @@ unsafe impl GlobalAlloc for Locked<Heap> {
         arch::without_interrupts(|| {
             let mut heap = self.inner.lock();
             unsafe {
-                heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout);
+                heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout); #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_free(ptr as usize); // MEMLINE2 (B821): a tracked block leaves the owner census under the heap lock, whoever frees it. LINE-NEUTRAL append, code first
             }
         });
     }
@@ -201,4 +201,279 @@ pub fn heap_high_reset() -> usize {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn heap_high() -> usize {
     HEAP_HIGH.load(Ordering::Relaxed)
+}
+
+// MEMLINE2 (rmbp-ledger B821, BP-cores-22) — THE HEAP'S OWNERS. MEMLINE's line says HOW MUCH the heap holds; flight 37
+// boot 1 (`:: MEMLINE: heap_kb=139000 … logout_delta_pct=43 -> FAIL :: src=rebuild`, the first build's high 96685) could
+// not say WHO holds the 42 MiB a session added. The census is the allocator's own, at the tail so no line above moves:
+// * [`enter`]`(tag)` arms `(task id, tag)` in one of [`SLOTS`] atomic words for the [`Scope`]'s life (a grow site in
+//   wm.rs, wallpaper.rs, help/index.rs); it never allocates and never locks, and a nested enter restores on drop.
+// * Every granted allocation ([`on_alloc`], folded on the grant line) is TRACKED when the census is armed ([`arm`], the
+//   desktop build's ask) and either its task has a tag armed or it is >= [`BIG`] (named by its task, `task:<name>`).
+// * A tracked block sits in a [`CAP`]-entry side table keyed by address, touched ONLY with the heap lock held (no new
+//   lock): [`on_alloc`]/[`on_free`] run inside `GlobalAlloc::alloc`/`dealloc`, [`snapshot`] takes the lock itself. A
+//   free removes the block whoever frees it. Past [`MAX_LIVE`] blocks an insert is refused and counted (`dropped`).
+// * [`snapshot`] aggregates the table by owner into fixed rows (no allocation under the lock). The reader is
+//   `video::desktopbuild`'s MEMLINE fixture. x86 desktop only: every other build links none of it.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod census {
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+
+    pub const STAGE: u8 = 1;
+    pub const SHADOW: u8 = 2;
+    pub const WALLPAPER: u8 = 3;
+    pub const HELP: u8 = 4;
+    /// Tag -> its census name (0 = no tag).
+    pub const NAMES: [&str; 5] = ["-", "stage", "shadow", "wallpaper", "help"];
+    /// An untagged block this large is tracked under its task's name.
+    pub const BIG: usize = 64 * 1024;
+    /// Owner rows a [`Snapshot`] carries (the last one becomes `other` on overflow).
+    pub const ROWS: usize = 24;
+    const SLOTS: usize = 16;
+    const CAP: usize = 4096;
+    const MAX_LIVE: usize = CAP / 4 * 3;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    /// `(tid << 8) | tag`, 0 = free.
+    static ARMED: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+
+    /// One tracked block. All-zero is empty (the table is zero-initialised: `.bss`, not image bytes).
+    #[derive(Clone, Copy)]
+    struct Entry {
+        addr: usize,
+        size: usize,
+        nptr: usize,
+        nlen: usize,
+        tagged: bool,
+    }
+    const EMPTY: Entry = Entry { addr: 0, size: 0, nptr: 0, nlen: 0, tagged: false };
+
+    struct Table {
+        e: UnsafeCell<[Entry; CAP]>,
+        live: UnsafeCell<usize>,
+        tracked: UnsafeCell<usize>,
+        dropped: UnsafeCell<u64>,
+    }
+    // SAFETY: every access is made with the global heap lock held — `on_alloc`/`on_free` are called only from inside
+    // `GlobalAlloc::alloc`/`dealloc`'s critical section, and `snapshot` takes `ALLOCATOR`'s lock — so that lock
+    // serialises the table.
+    unsafe impl Sync for Table {}
+    static TABLE: Table = Table {
+        e: UnsafeCell::new([EMPTY; CAP]),
+        live: UnsafeCell::new(0),
+        tracked: UnsafeCell::new(0),
+        dropped: UnsafeCell::new(0),
+    };
+
+    /// The census starts counting (the desktop build's ask). Never disarmed: a free must always find its block.
+    pub fn arm() {
+        ON.store(true, Release);
+    }
+
+    /// An armed tag; dropping it restores the task's previous tag (or frees the slot). `slot == SLOTS` = inert.
+    pub struct Scope {
+        slot: usize,
+        prev: u64,
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            if self.slot < SLOTS {
+                ARMED[self.slot].store(self.prev, Release);
+            }
+        }
+    }
+
+    /// Tag the calling task's allocations `NAMES[tag]` until the returned [`Scope`] drops. Inert when the census is
+    /// not armed, outside a task, or with all slots taken.
+    pub fn enter(tag: u8) -> Scope {
+        let inert = Scope { slot: SLOTS, prev: 0 };
+        if !ON.load(Acquire) || tag == 0 || tag as usize >= NAMES.len() {
+            return inert;
+        }
+        let Some(tid) = crate::arch::sched::current_id() else { return inert };
+        let packed = (tid << 8) | tag as u64;
+        for (i, s) in ARMED.iter().enumerate() {
+            let v = s.load(Acquire);
+            if v != 0 && v >> 8 == tid {
+                s.store(packed, Release);
+                return Scope { slot: i, prev: v };
+            }
+        }
+        for (i, s) in ARMED.iter().enumerate() {
+            if s.compare_exchange(0, packed, AcqRel, Relaxed).is_ok() {
+                return Scope { slot: i, prev: 0 };
+            }
+        }
+        inert
+    }
+
+    #[inline(always)]
+    fn home(addr: usize) -> usize {
+        ((addr >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) & (CAP - 1)
+    }
+
+    /// A granted allocation (caller holds the heap lock). One relaxed load while unarmed.
+    #[inline(always)]
+    pub(crate) fn on_alloc(addr: usize, size: usize) {
+        if ON.load(Relaxed) {
+            note(addr, size);
+        }
+    }
+
+    #[inline(never)]
+    fn note(addr: usize, size: usize) {
+        // Both reads are lock-free (a published word, a same-core deref): legal under the heap lock (BP-cores-6).
+        let Some(tid) = crate::arch::sched::current_id() else { return };
+        let mut tag = 0u8;
+        for s in ARMED.iter() {
+            let v = s.load(Acquire);
+            if v != 0 && v >> 8 == tid {
+                tag = v as u8;
+                break;
+            }
+        }
+        let (name, tagged): (&'static str, bool) = if tag != 0 && (tag as usize) < NAMES.len() {
+            (NAMES[tag as usize], true)
+        } else if size >= BIG {
+            (crate::arch::sched::current_name().unwrap_or("-"), false)
+        } else {
+            return;
+        };
+        insert(addr, size, name, tagged);
+    }
+
+    /// Caller holds the heap lock.
+    fn insert(addr: usize, size: usize, name: &'static str, tagged: bool) {
+        // SAFETY: the heap lock is held (the table's contract); the three cells are distinct.
+        let (e, live, tracked) = unsafe { (&mut *TABLE.e.get(), &mut *TABLE.live.get(), &mut *TABLE.tracked.get()) };
+        if *live >= MAX_LIVE {
+            // SAFETY: as above.
+            unsafe { *TABLE.dropped.get() += 1 };
+            return;
+        }
+        let mut i = home(addr);
+        while e[i].addr != 0 && e[i].addr != addr {
+            i = (i + 1) & (CAP - 1);
+        }
+        if e[i].addr == addr {
+            *tracked -= e[i].size;
+        } else {
+            *live += 1;
+        }
+        e[i] = Entry { addr, size, nptr: name.as_ptr() as usize, nlen: name.len(), tagged };
+        *tracked += size;
+    }
+
+    /// A freed block (caller holds the heap lock): out of the table if it was tracked.
+    #[inline(always)]
+    pub(crate) fn on_free(addr: usize) {
+        if ON.load(Relaxed) {
+            remove(addr);
+        }
+    }
+
+    /// Caller holds the heap lock. Linear probing with backward-shift deletion (no tombstones).
+    #[inline(never)]
+    fn remove(addr: usize) {
+        // SAFETY: the heap lock is held (the table's contract); the cells are distinct.
+        let (e, live, tracked) = unsafe { (&mut *TABLE.e.get(), &mut *TABLE.live.get(), &mut *TABLE.tracked.get()) };
+        let mut i = home(addr);
+        loop {
+            if e[i].addr == 0 {
+                return;
+            }
+            if e[i].addr == addr {
+                break;
+            }
+            i = (i + 1) & (CAP - 1);
+        }
+        *tracked -= e[i].size;
+        *live -= 1;
+        let mut hole = i;
+        let mut j = i;
+        loop {
+            j = (j + 1) & (CAP - 1);
+            if e[j].addr == 0 {
+                break;
+            }
+            let h = home(e[j].addr);
+            // `e[j]` may fill the hole when the hole lies on its probe path, cyclically in [h, j).
+            if (hole.wrapping_sub(h) & (CAP - 1)) < (j.wrapping_sub(h) & (CAP - 1)) {
+                e[hole] = e[j];
+                hole = j;
+            }
+        }
+        e[hole] = EMPTY;
+    }
+
+    /// One owner's tracked bytes at a [`snapshot`].
+    #[derive(Clone, Copy)]
+    pub struct Row {
+        pub name: &'static str,
+        /// `true` = an armed tag (`stage`, …); `false` = a task name (printed `task:<name>`).
+        pub tagged: bool,
+        pub bytes: u64,
+        pub blocks: u32,
+    }
+
+    /// The heap's `used`, the tracked total, the refused inserts and the owner rows, at one instant.
+    #[derive(Clone, Copy)]
+    pub struct Snapshot {
+        pub used: u64,
+        pub tracked: u64,
+        pub dropped: u64,
+        pub rows: [Option<Row>; ROWS],
+    }
+
+    impl Snapshot {
+        /// The bytes `name` held (0 = no row).
+        pub fn bytes_of(&self, name: &str, tagged: bool) -> u64 {
+            self.rows.iter().flatten().find(|r| r.tagged == tagged && r.name == name).map_or(0, |r| r.bytes)
+        }
+    }
+
+    /// The census now, by owner. Takes the heap lock itself: never call it from inside an allocation.
+    pub fn snapshot() -> Snapshot {
+        let mut s = Snapshot { used: 0, tracked: 0, dropped: 0, rows: [None; ROWS] };
+        crate::arch::without_interrupts(|| {
+            let heap = super::ALLOCATOR.lock();
+            s.used = heap.used() as u64;
+            // SAFETY: the heap lock is held (`heap`), the table's contract.
+            let e = unsafe { &*TABLE.e.get() };
+            // SAFETY: as above.
+            unsafe {
+                s.tracked = *TABLE.tracked.get() as u64;
+                s.dropped = *TABLE.dropped.get();
+            }
+            for x in e.iter().filter(|x| x.addr != 0) {
+                // SAFETY: `nptr`/`nlen` were taken from a `&'static str` at insert.
+                let name: &'static str = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(x.nptr as *const u8, x.nlen)) };
+                let at = match s.rows.iter().position(|r| matches!(r, Some(r) if r.tagged == x.tagged && r.name == name)) {
+                    Some(k) => k,
+                    None => match s.rows.iter().position(|r| r.is_none()) {
+                        Some(k) => {
+                            s.rows[k] = Some(Row { name, tagged: x.tagged, bytes: 0, blocks: 0 });
+                            k
+                        }
+                        None => {
+                            let k = ROWS - 1;
+                            if let Some(r) = s.rows[k].as_mut() {
+                                r.name = "other";
+                                r.tagged = false;
+                            }
+                            k
+                        }
+                    },
+                };
+                if let Some(r) = s.rows[at].as_mut() {
+                    r.bytes += x.size as u64;
+                    r.blocks += 1;
+                }
+            }
+            drop(heap);
+        });
+        s
+    }
 }

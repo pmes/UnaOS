@@ -234,7 +234,7 @@ pub fn ensure_loaded() -> bool {
             serial_println!("[help] index REFUSED src={} read={}/{} reason=short", p, v.len(), n);
             continue;
         }
-        match parse(&v) {
+        let _ct = crate::allocator::census::enter(crate::allocator::census::HELP); match parse(&v) { // MEMLINE2 (B821): the parsed index is tagged for the owner census. LINE-NEUTRAL fold, code first
             Ok(ix) => {
                 serial_println!("[help] index pages={} words={} bytes={} src={}", ix.pages.len(), ix.words.len(), ix.bytes, p);
                 *INDEX.lock() = Some(ix);

@@ -2134,7 +2134,7 @@ fn pace_shadow_refresh(
             // SHELLWIN-OOM — fallible, from present context. A decline leaves the window on the
             // live-read path: paced, correct, text may tear — strictly the pre-fix regime.
             let add = surf_len - buf.len();
-            if buf.try_reserve(add).is_err() {
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _ct = crate::allocator::census::enter(crate::allocator::census::SHADOW); if buf.try_reserve(add).is_err() { // MEMLINE2 (B821): the shadow grow is tagged for the owner census. LINE-NEUTRAL fold, code first
                 #[cfg(feature = "witness")]
                 WPACE_SHDW_OOM.fetch_add(1, Relaxed);
                 return;
@@ -19507,7 +19507,7 @@ pub fn reserve_stage(info: &unaos_boot_info::FrameBufferInfo) -> usize {
             // The one `try_reserve` on this path that runs unmasked by construction. An exhausted
             // heap leaves the shorter buffer rather than panicking; the pass's own declines report
             // the shortfall honestly.
-            if stage.try_reserve(add).is_ok() {
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _ct = crate::allocator::census::enter(crate::allocator::census::STAGE); if stage.try_reserve(add).is_ok() { // MEMLINE2 (B821): the stage grow is tagged for the owner census. LINE-NEUTRAL fold, code first
                 stage.resize(target, 0);
             }
         }
@@ -21054,7 +21054,7 @@ fn stage_window(
     // acquire→release span (the stage fill/flush). No-op inline shim when `rtwit` is off.
     let _sh = crate::rtwit::hold(crate::rtwit::Lock::Stage);
     if stage.len() < need {
-        let add = need - stage.len(); #[cfg(feature = "beam")] let add = { if stage.try_reserve(add).is_err() { while chunk_rows / 2 >= STAGE_MIN_ROWS.min(span) { chunk_rows /= 2; need = row_bytes * chunk_rows; #[cfg(feature = "witness")] super::wcg::stage_shrunk(r.id); let want = need.saturating_sub(stage.len()); if stage.try_reserve(want).is_ok() { break; } } } need.saturating_sub(stage.len()) }; // STAGESHRINK (orin 26, TEAR-DIAG §3.1) — on a refusal the band is HALVED and asked again, down to [`STAGE_MIN_ROWS`], before the `if` below declines. render12 A3 declined 1818+147 presents on `decl_alloc` — every one a `paint_window` straight into the live scan-out at P(tear)~0.88, the largest unmeasured tear population on that wire — because a 3.9 MB band was asked of a heap that could give a fraction of it. A smaller band is the WC-M machinery this loop already runs, one more turn; the direct path is the tearing regime. Counted per halving as `[wc-h] shrunk=`. The reserve the loop won is still standing, so the baseline's `try_reserve(add)` on the next line succeeds and the baseline's `decline!` fires only when the floor was reached — which is why the shrink rides on THIS line and the tearing-era lines below are untouched.
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _ct = crate::allocator::census::enter(crate::allocator::census::STAGE); let add = need - stage.len(); #[cfg(feature = "beam")] let add = { if stage.try_reserve(add).is_err() { while chunk_rows / 2 >= STAGE_MIN_ROWS.min(span) { chunk_rows /= 2; need = row_bytes * chunk_rows; #[cfg(feature = "witness")] super::wcg::stage_shrunk(r.id); let want = need.saturating_sub(stage.len()); if stage.try_reserve(want).is_ok() { break; } } } need.saturating_sub(stage.len()) }; // STAGESHRINK (orin 26, TEAR-DIAG §3.1) — on a refusal the band is HALVED and asked again, down to [`STAGE_MIN_ROWS`], before the `if` below declines. render12 A3 declined 1818+147 presents on `decl_alloc` — every one a `paint_window` straight into the live scan-out at P(tear)~0.88, the largest unmeasured tear population on that wire — because a 3.9 MB band was asked of a heap that could give a fraction of it. A smaller band is the WC-M machinery this loop already runs, one more turn; the direct path is the tearing regime. Counted per halving as `[wc-h] shrunk=`. The reserve the loop won is still standing, so the baseline's `try_reserve(add)` on the next line succeeds and the baseline's `decline!` fires only when the floor was reached — which is why the shrink rides on THIS line and the tearing-era lines below are untouched.
         // `try_reserve` + `resize`: an exhausted heap returns here instead of panicking from present
         // context. The buffer only ever grows, so a steady window size allocates exactly once.
         if stage.try_reserve(add).is_err() {
@@ -21467,7 +21467,7 @@ fn stage_fill(
         let add = row_bytes - stage.len();
         // Same `try_reserve` + `resize` contract as `stage_window`: an exhausted heap declines here
         // rather than panicking from a close path.
-        if stage.try_reserve(add).is_err() {
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _ct = crate::allocator::census::enter(crate::allocator::census::STAGE); if stage.try_reserve(add).is_err() { // MEMLINE2 (B821): the stage grow is tagged for the owner census. LINE-NEUTRAL fold, code first
             // Drop the guard before queueing: `DEFER` must never be taken while `STAGE` is held.
             drop(stage);
             defer!(DEFER_ALLOC);

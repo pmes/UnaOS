@@ -118,7 +118,7 @@ fn generate() -> bool {
 /// The generation itself at `pw` x `ph`; `tap` sees the finished picture before it is installed (STARTSCENE: the boot
 /// splash copies it into its hold store). Returns the generator's `wall_ms`.
 fn generate_sized(pw: usize, ph: usize, tap: Option<&mut dyn FnMut(&[u32])>) -> Option<u64> {
-    let t0 = crate::arch::ms();
+    let t0 = crate::arch::ms(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _ct = crate::allocator::census::enter(crate::allocator::census::WALLPAPER); // MEMLINE2 (B821): the picture is tagged for the owner census. LINE-NEUTRAL append, code first
     let epoch = crate::video::theme::epoch(); // MENUSCRAFT (B642): the accent this picture is drawn in
     let dark = crate::video::theme::is_dark(); // STARTSCENE (B662): the Light/Dark set the scene's pairs were read in
     if pw == 0 || ph == 0 {
@@ -319,7 +319,7 @@ pub fn load_default() -> bool {
 
 /// Decode `path` and make it the backdrop. Emits the witness line either way.
 pub fn load(path: &str) -> Result<(), String> {
-    let t0 = crate::arch::ms();
+    let t0 = crate::arch::ms(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _ct = crate::allocator::census::enter(crate::allocator::census::WALLPAPER); // MEMLINE2 (B821): the picture is tagged for the owner census. LINE-NEUTRAL append, code first
     let Some(pi) = crate::video::panel_info_nonblocking() else {
         return Err(String::from("panel busy"));
     };
