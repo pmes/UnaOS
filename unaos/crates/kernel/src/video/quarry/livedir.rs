@@ -575,10 +575,10 @@ impl Model {
     /// The ONE cache insert (`collect_cached`'s miss and the NAVREAD install): an entry read at volume generation `gen`.
     /// A generation the cache was not filled against starts it over; the same path is replaced; the oldest goes at
     /// `MAX_CACHE`.
-    pub(super) fn cache_put(&mut self, gen: u64, ent: CacheEnt) {
-        if gen != self.cache_gen {
+    pub(super) fn cache_put(&mut self, at_gen: u64, ent: CacheEnt) {
+        if at_gen != self.cache_gen {
             self.cache.clear();
-            self.cache_gen = gen;
+            self.cache_gen = at_gen;
         }
         self.cache.retain(|e| e.path != ent.path);
         if self.cache.len() >= MAX_CACHE {

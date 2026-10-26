@@ -32540,6 +32540,6 @@ fn scroll_ring3_press_legs(win: crate::video::wm::WinId, id: u32, owner: u64, bu
 /// family; the knob-off image has no steal to refuse. `sys_win_create` reads it through this one fn so the plain
 /// `./arroyo check` (image knobs off) compiles.
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-fn focus_held_now(owner: u32) -> bool { crate::video::wm::focussteal::held_now(owner) }
+fn focus_held_now(owner: u64) -> bool { crate::video::wm::focussteal::held_now(owner) }
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-fn focus_held_now(_owner: u32) -> bool { false }
+fn focus_held_now(_owner: u64) -> bool { false }
