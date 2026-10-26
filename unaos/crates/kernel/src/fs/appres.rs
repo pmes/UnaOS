@@ -36,25 +36,10 @@ use midden_core as mc;
 
 const _: () = assert!(una_abi::APP_RES_NOTE_TYPE == mc::APP_RES_NOTE_TYPE);
 
-/// The kernel's own windowed apps and their packed blocks (`una-res pack unaos/res/<app>`).
-const BUILTIN: &[(&str, &[u8])] = &[
-    ("quarry", include_bytes!("../../../../res/quarry/quarry.unares")),
-    ("settings", include_bytes!("../../../../res/settings/settings.unares")),
-    ("console", include_bytes!("../../../../res/console/console.unares")),
-    ("shell", include_bytes!("../../../../res/shell/shell.unares")),
-    ("facet", include_bytes!("../../../../res/facet/facet.unares")),
-    ("player", include_bytes!("../../../../res/player/player.unares")), // PLAYER (B419): the audio player window
-    // FILETYPES (B423): every opener the dispatch runs is a REGISTRANT with resources — its doc types are its
-    // own declaration, not a row in a table. The order is the registrant order (`registrants`): for a type two
-    // declare, the earlier one is the default until the registry's `una:preferred` says otherwise.
-    ("markdown", include_bytes!("../../../../res/markdown/markdown.unares")),
-    ("json", include_bytes!("../../../../res/json/json.unares")),
-    ("textedit", include_bytes!("../../../../res/textedit/textedit.unares")),
-    ("fileview", include_bytes!("../../../../res/fileview/fileview.unares")),
-    ("play", include_bytes!("../../../../res/play/play.unares")),
-    ("launch", include_bytes!("../../../../res/launch/launch.unares")),
-    ("linux", include_bytes!("../../../../res/linux/linux.unares")),
-];
+// The kernel's own windowed apps and their packed blocks (`una-res pack unaos/res/<app>`), in registrant order, and
+// the doc-type rule over them — CARDREGISTRY (B833): moved into the shared core `type_registry_core` (the registry
+// stamp hashes them; `tools/unafs` links the same blocks).
+use type_registry_core::{declares, BUILTIN};
 /// The icon a program without a block is drawn with.
 const GENERIC: &[u8] = include_bytes!("../../../../res/generic/generic.unares");
 
@@ -719,23 +704,8 @@ fn builtin_registrant(key: &str, block: &[u8]) -> Registrant {
     Registrant { opener: String::from(key), signature: s(mc::RES_KEY_SIGNATURE), name: s(mc::RES_KEY_NAME) }
 }
 
-fn declares(block: &[u8], mime: &str) -> bool {
-    mc::res_str(block, mc::RES_KEY_DOCTYPES).map(|d| d.lines().any(|l| l.trim() == mime)).unwrap_or(false)
-}
-
-/// Every MIME type a built-in declares, in registrant order, each once.
-pub fn builtin_doctypes() -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for (_, b) in BUILTIN.iter() {
-        for l in mc::res_str(b, mc::RES_KEY_DOCTYPES).unwrap_or("").lines() {
-            let l = l.trim();
-            if !l.is_empty() && !out.iter().any(|m| m == l) {
-                out.push(String::from(l));
-            }
-        }
-    }
-    out
-}
+/// Every MIME type a built-in declares, in registrant order, each once (CARDREGISTRY B833: the shared core's).
+pub use type_registry_core::builtin_doctypes;
 
 /// The registrants of `mime`: the built-ins that declare it (compiled-in resources, `BUILTIN` order), then the
 /// ring-3 programs APPRES published on the type object (`una:apps` on `type_obj`, sighted order). No I/O beyond
@@ -796,15 +766,8 @@ pub fn knows(key: &str) -> bool {
 }
 
 /// ASSOCSTAMP (rmbp-ledger B460): fold every built-in's key and packed resource block into the FNV-1a 64 state `h`
-/// (the FILETYPES registry's generation stamp: a changed doc type, signature or name changes the hash). Pure.
-pub fn builtin_hash(mut h: u64) -> u64 {
-    for (k, b) in BUILTIN.iter() {
-        for &x in k.as_bytes().iter().chain([0u8].iter()).chain(b.iter()) {
-            h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
-        }
-    }
-    h
-}
+/// (the FILETYPES registry's generation stamp). CARDREGISTRY (B833): the shared core's.
+pub use type_registry_core::builtin_hash;
 // ── APPTRUST (rmbp-ledger B467) — a sight from a foreign volume writes nothing and registers nothing ──────────────────
 
 /// The one admission a sight makes: a ROOT program is cached (its inode, its signature object) and published in
@@ -909,9 +872,3 @@ fn stamp_check(mt: &MountTable, app: &App) {
     }
 }
 
-/// REGISTRYCHUNK (rmbp-ledger B508): [`registrants`] for a type whose registry object does not exist yet — the
-/// built-ins only (an absent object carries no `una:apps` lines), with no VFS read: the per-object build's first-boot
-/// path skips a path-resolve miss per type. Pure.
-pub fn builtin_registrants(mime: &str) -> Vec<Registrant> {
-    BUILTIN.iter().filter(|(_, b)| declares(b, mime)).map(|(k, b)| builtin_registrant(k, b)).collect()
-}

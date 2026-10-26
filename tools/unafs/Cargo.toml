@@ -12,6 +12,8 @@ path = "src/main.rs"
 # The Core Logic
 unafs = { path = "../../unaos/libs/fs/unafs" }
 bandy = { path = "../../libs/bandy" }
+# CARDREGISTRY (B833): the FILETYPES registry's objects and stamp, the kernel's own values (`filetypes`).
+type_registry_core = { path = "../../unaos/libs/sys/type_registry_core" }
 
 # CLI Utilities
 clap = { version = "4.6", features = ["derive"] }

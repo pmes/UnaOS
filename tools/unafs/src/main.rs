@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
-use unafs::{AttributeValue, BatchFile, FileDevice, FileSystem, parse_value};
+use unafs::{AttributeValue, BatchFile, BlockDevice, FileDevice, FileSystem, UnaFS, parse_value};
 
 mod dump;
 
@@ -184,6 +184,14 @@ enum Commands {
     /// VOLUMES (B366): the builder stages `/system/test-f` onto the card's UnaFS root with it.
     Mkdir {
         path: String,
+        #[arg(short, long, default_value = "unafs.img")]
+        img: String,
+    },
+    /// CARDREGISTRY (B833): stage the FILETYPES registry — `/system/filetypes`, every compiled-in type's object with
+    /// the keys the kernel's build writes (one `create_files_batch`), and the stamp the kernel computes — so a fresh
+    /// card's first login reads `login=stamp stamp=match` and builds nothing.
+    /// `[unafs-tool] filetypes staged n=<types> created=<new> stamp=<stamp>`.
+    Filetypes {
         #[arg(short, long, default_value = "unafs.img")]
         img: String,
     },
@@ -746,7 +754,7 @@ fn run_bench_batch(source: &str, out_dir: &str, size_mb: u64) -> Result<()> {
 }
 
 /// `mkdir -p` inside the vault: every missing component of `path` is made; returns the final id.
-fn mkdir_p(fs: &mut FileSystem, path: &str) -> Result<u64> {
+fn mkdir_p<D: BlockDevice>(fs: &mut UnaFS<D>, path: &str) -> Result<u64> {
     let mut at = String::new();
     let mut parent = fs.resolve_path("/").context("No root")?;
     for c in path.split('/').filter(|c| !c.is_empty()) {
@@ -805,6 +813,36 @@ fn put_tree(fs: &mut FileSystem, src: &Path, dest: &str) -> Result<(usize, usize
     }
     fs.set_autocommit(true);
     Ok((dirs, files, bytes))
+}
+
+/// CARDREGISTRY (rmbp-ledger B833): the registry onto the volume as the kernel's first build leaves it — `TYPES_DIR`
+/// (with `/system`), every compiled-in type's object not already there created WITH its keys in ONE
+/// `create_files_batch` (the crate fn the kernel's `fs/vfs.rs` batch create calls; BP-storage-7), then the stamp on
+/// the directory. Values from `type_registry_core` (`fresh_objects`, `stamp`), the kernel's own. A present object is
+/// left as it is. `(types, created, stamp)`.
+fn stage_filetypes<D: BlockDevice>(fs: &mut UnaFS<D>) -> Result<(usize, usize, String)> {
+    use type_registry_core as trc;
+    let dir = mkdir_p(fs, trc::TYPES_DIR)?;
+    let present: Vec<String> = fs.ls(dir).map_err(|e| anyhow::anyhow!("ls {}: {e:?}", trc::TYPES_DIR))?.into_iter().map(|e| e.name).collect();
+    let objs = trc::fresh_objects();
+    let n = objs.len();
+    let batch: Vec<BatchFile> = objs
+        .into_iter()
+        .filter(|(leaf, _)| !present.iter().any(|p| p == leaf))
+        .map(|(name, keys)| BatchFile {
+            name,
+            data: Vec::new(),
+            attributes: keys.into_iter().map(|(k, v)| (k.to_string(), AttributeValue::String(v))).collect(),
+        })
+        .collect();
+    let created = batch.len();
+    if created > 0 {
+        fs.create_files_batch(dir, batch).map_err(|e| anyhow::anyhow!("filetypes batch: {e}"))?;
+    }
+    let stamp = trc::stamp();
+    fs.set_attribute(dir, trc::STAMP_KEY.to_string(), AttributeValue::String(stamp.clone()))
+        .context("filetypes stamp")?;
+    Ok((n, created, stamp))
 }
 
 /// Split a vault path into (parent path, entry name). "/a/b/c" -> ("/a/b", "c").
@@ -919,6 +957,12 @@ async fn main() -> Result<()> {
             for entry in entries {
                 println!("  {:10} {}", format!("({:?})", entry.kind), entry.name);
             }
+        }
+        Commands::Filetypes { img } => {
+            let device = FileDevice::open(img).context("Failed to open device")?;
+            let mut fs = mount_dev(device, &vkey).context("Failed to mount filesystem")?;
+            let (n, created, stamp) = stage_filetypes(&mut fs)?;
+            println!("[unafs-tool] filetypes staged n={} created={} stamp={}", n, created, stamp);
         }
         Commands::Mkdir { path, img } => {
             let device = FileDevice::open(img).context("Failed to open device")?;
@@ -1560,4 +1604,35 @@ fn run_bench_map(out_dir: &str, sizes: &str, version: u32, files: u64) -> Result
         );
     }
     Ok(())
+}
+
+// =============================================================================
+// CARDREGISTRY (B833) — the staged registry is the kernel's fresh build
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unafs::MemDevice;
+
+    #[test]
+    fn filetypes_stage_matches_the_core() {
+        use type_registry_core as trc;
+        let mut fs = UnaFS::format(MemDevice::new(), 64).expect("format");
+        let (n, created, stamp) = stage_filetypes(&mut fs).expect("stage");
+        assert_eq!(n, trc::builtin_type_count());
+        assert_eq!(created, n);
+        assert_eq!(stamp, trc::stamp());
+        let dir = fs.resolve_path(trc::TYPES_DIR).expect("dir");
+        assert_eq!(fs.get_attribute(dir, trc::STAMP_KEY).expect("get"), Some(AttributeValue::String(trc::stamp())));
+        assert_eq!(fs.ls(dir).expect("ls").len(), n);
+        for (leaf, keys) in trc::fresh_objects() {
+            let id = fs.resolve_path(&format!("{}/{}", trc::TYPES_DIR, leaf)).expect("object");
+            for (k, v) in keys {
+                assert_eq!(fs.get_attribute(id, k).expect("attr"), Some(AttributeValue::String(v)), "{leaf} {k}");
+            }
+        }
+        let (_, again, _) = stage_filetypes(&mut fs).expect("restage");
+        assert_eq!(again, 0);
+    }
 }

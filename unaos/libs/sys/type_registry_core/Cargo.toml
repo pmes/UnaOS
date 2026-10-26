@@ -1,0 +1,14 @@
+[package]
+name = "type_registry_core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "CARDREGISTRY's shared core: the FILETYPES registry's type facts, built-in resource blocks and generation stamp — linked by the kernel's fs/assoc.rs + fs/appres.rs and by tools/unafs, so the card builder and the kernel compute one stamp."
+
+# CARDREGISTRY (rmbp-ledger B833, owed by FILETYPES3 B820): the midden_core / type_core shape. `#![no_std]` + `alloc`,
+# `#![forbid(unsafe_code)]`. A member of the ROOT host workspace (`cargo test -p type_registry_core`, the stamp KAT) and a
+# path dep of the kernel and of `tools/unafs`.
+[dependencies]
+type_core = { path = "../type_core" }
+midden_core = { path = "../midden_core", default-features = false }
+una-abi = { path = "../../../crates/una-abi" }

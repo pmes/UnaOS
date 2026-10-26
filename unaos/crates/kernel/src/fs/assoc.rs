@@ -42,52 +42,13 @@ pub const PREFERRED_KEY: &str = una_abi::attr_keys::PREFERRED;
 /// The registry's directory on the system volume (ROOTDISK2: `/system` is UnaFS).
 pub use type_core::TYPES_DIR; // SMALLFIX4 item 12 (TYPECORE fold): the one table owns the registry path
 
-/// `(mime, icon glyph, description)` — the type FACTS. No opener column: who opens a type is its registrants'.
-pub const TYPE_FACTS: &[(&str, &str, &str)] = &[
-    (ft::TEXT_PLAIN, "doc", "Plain text"),
-    (ft::IMAGE_PNG, "image", "PNG image"),
-    (ft::AUDIO_WAV, "sound", "WAV audio"),
-    (ft::UNAOS_ELF, "app", "UnaOS program"),
-    (ft::UNAOS_BIN, "app", "UnaOS flat program"),
-    (ft::LINUX_ELF, "app", "Linux program"),
-    (ft::DIRECTORY, "folder", "Folder"),
-    (ft::GZIP, "archive", "gzip archive"),
-    (ft::TAR, "archive", "tar archive"),
-    (ft::OCTET, "file", "Binary data"),
-    (ft::TEXT_MARKDOWN, "doc", "Markdown"),
-    (ft::APP_JSON, "doc", "JSON"),
-    (ft::IMAGE_GIF, "image", "GIF image"),
-    (ft::IMAGE_JPEG, "image", "JPEG image"),
-    (ft::IMAGE_BMP, "image", "BMP image"),
-    (ft::IMAGE_WEBP, "image", "WebP image"),
-    (ft::IMAGE_QOI, "image", "QOI image"),
-    (ft::IMAGE_SVG, "image", "SVG image"),
-    (ft::AUDIO_FLAC, "sound", "FLAC audio"),
-    (ft::AUDIO_OGG, "sound", "Ogg audio"),
-    (ft::AUDIO_MPEG, "sound", "MP3 audio"),
-    (ft::AUDIO_AAC, "sound", "AAC audio"),
-    (ft::AUDIO_MP4, "sound", "MPEG-4 audio"),
-    (ft::AUDIO_AIFF, "sound", "AIFF audio"),
-    (ft::VIDEO_MP4, "video", "MPEG-4 video"),
-    (ft::VIDEO_WEBM, "video", "WebM video"),
-    (ft::VIDEO_MATROSKA, "video", "Matroska video"),
-    (ft::IMAGE_ARW, "image", "Sony raw image"), (ft::IMAGE_CR2, "image", "Canon raw image"), (ft::IMAGE_NEF, "image", "Nikon raw image"), // RAWCORE (B444)
-    (ft::IMAGE_TIFF, "image", "TIFF image"), // RAWCORE (B444)
-];
-
-/// The facts row for `mime`, if any. Pure.
-pub fn facts(mime: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
-    TYPE_FACTS.iter().find(|r| r.0 == mime)
-}
+/// The type FACTS (`(mime, icon glyph, description)`) and their lookup — CARDREGISTRY (B833): moved into the shared
+/// core `type_registry_core`, which `tools/unafs filetypes` links too (one table, one stamp for the card and the kernel).
+pub use type_registry_core::{facts, TYPE_FACTS};
 
 /// `/system/filetypes/image-png` for `image/png`. Pure.
 pub fn object_path(mime: &str) -> String {
-    let mut s = String::from(TYPES_DIR);
-    s.push('/');
-    for c in mime.chars() {
-        s.push(if c == '/' { '-' } else { c });
-    }
-    s
+    alloc::format!("{}/{}", TYPES_DIR, type_registry_core::leaf(mime)) // CARDREGISTRY (B833): the core's leaf rule
 }
 
 /// The MIME type a registry leaf names (`image-png` → `image/png`; a top-level type never carries a dash). Pure.
@@ -98,8 +59,7 @@ pub fn mime_of_leaf(leaf: &str) -> String {
 /// type_core's one table's extensions for `mime`, comma-separated (`md, markdown`). Pure. SMALLFIX4 item 12: walks
 /// `type_core::extensions_of` (TYPECORE fold), no second filter over the table.
 pub fn extensions_of(mime: &str) -> String {
-    let v: Vec<&str> = type_core::extensions_of(mime).collect();
-    v.join(", ")
+    type_registry_core::extensions_list(mime) // CARDREGISTRY (B833): the shared core's one join
 }
 
 fn str_attr(mt: &MountTable, path: &str, key: &str) -> Option<String> {
@@ -209,17 +169,11 @@ pub fn known_types_in(mt: &MountTable) -> Vec<String> {
 /// declares names that program (`sigs`: its signature object's signature and path) — the built-ins alone named
 /// nobody, so the object stayed without `una:preferred` and SMALLFIX5's sighting invalidated the stamp on every boot.
 fn keys_for_obj(mt: &MountTable, mime: &str, exists: bool, sigs: &[SigDecl]) -> Vec<(String, AttrValue)> {
-    let mut kv = alloc::vec![
-        (String::from(DESCRIPTION_KEY), AttrValue::Str(facts(mime).map(|r| String::from(r.2)).unwrap_or_else(|| String::from(mime)))),
-        (String::from(ICON_KEY), AttrValue::Str(facts(mime).map(|r| String::from(r.1)).unwrap_or_else(|| String::from("file")))),
-    ];
-    let ext = extensions_of(mime);
-    if !ext.is_empty() {
-        kv.push((String::from(EXTENSIONS_KEY), AttrValue::Str(ext)));
-    }
-    let regs = if exists { registrants_in(mt, mime) } else { appres::builtin_registrants(mime) };
-    if let Some(r) = regs.into_iter().next() {
-        kv.push((String::from(PREFERRED_KEY), AttrValue::Str(r.preferred_value())));
+    // CARDREGISTRY (B833): description, icon and extensions from the shared core (the card builder writes the same).
+    let mut kv: Vec<(String, AttrValue)> = type_registry_core::base_keys(mime).into_iter().map(|(k, v)| (String::from(k), AttrValue::Str(v))).collect();
+    let pref = if exists { registrants_in(mt, mime).into_iter().next().map(|r| r.preferred_value()) } else { type_registry_core::builtin_preferred(mime) };
+    if let Some(p) = pref {
+        kv.push((String::from(PREFERRED_KEY), AttrValue::Str(p)));
     } else if let Some(d) = sigs.iter().find(|d| d.types.iter().any(|t| t == mime)) {
         kv.push((String::from(PREFERRED_KEY), AttrValue::Str(d.sig.clone())));
         if !d.path.is_empty() {
@@ -880,42 +834,16 @@ pub fn openertrust_selftest() {
 // ms=1662`). The registry directory carries ONE attribute naming what it was built from; when the compiled-in type
 // set is unchanged the build is a single attribute read.
 
-/// The stamp's key, on [`TYPES_DIR`] itself.
-pub const STAMP_KEY: &str = una_abi::attr_keys::FILETYPES_STAMP;
-/// The builder's version: bump when `seed_in` changes what it writes (the stamp then differs and the build runs once).
-pub const BUILDER_VERSION: u32 = 1;
-
-fn fnv(mut h: u64, b: &[u8]) -> u64 {
-    for &x in b.iter().chain([0u8].iter()) {
-        h = (h ^ x as u64).wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
-/// The compiled-in type count: [`TYPE_FACTS`] ∪ every built-in's declared doc type. Pure.
-pub fn builtin_type_count() -> usize {
-    let mut n = TYPE_FACTS.len();
-    for m in appres::builtin_doctypes() {
-        if facts(&m).is_none() {
-            n += 1;
-        }
-    }
-    n
-}
+/// The stamp's key (on [`TYPES_DIR`] itself), the builder's version and the compiled-in type count ([`TYPE_FACTS`] ∪
+/// every built-in's declared doc type) — CARDREGISTRY (B833): the shared core's, so `tools/unafs` stamps the card with
+/// the value this kernel computes.
+pub use type_registry_core::{builtin_type_count, BUILDER_VERSION, STAMP_KEY};
 
 /// The stamp this build would write: `v<version> h=<FNV-1a 64 of TYPE_FACTS, EXT_TABLE and APPRES's BUILTIN> n=<types>`.
-/// Pure (no I/O): everything `seed_in` derives an object from that is compiled in.
+/// Pure (no I/O): everything `seed_in` derives an object from that is compiled in. CARDREGISTRY (B833): computed by the
+/// shared core (`type_registry_core::stamp`, KAT-pinned on the host).
 pub fn stamp_now() -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    h = fnv(h, &BUILDER_VERSION.to_le_bytes());
-    for (m, g, d) in TYPE_FACTS.iter() {
-        h = fnv(fnv(fnv(h, m.as_bytes()), g.as_bytes()), d.as_bytes());
-    }
-    for (e, m) in ft::EXT_TABLE.iter() {
-        h = fnv(fnv(h, e.as_bytes()), m.as_bytes());
-    }
-    h = appres::builtin_hash(h);
-    alloc::format!("v{} h={:016x} n={}", BUILDER_VERSION, h, builtin_type_count())
+    type_registry_core::stamp()
 }
 
 /// The stamp the registry carries (ONE attribute read on one inode), `None` when absent or unreadable.

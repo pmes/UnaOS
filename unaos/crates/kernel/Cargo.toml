@@ -3955,6 +3955,9 @@ elf_core = { path = "../../libs/sys/elf_core" }
 # TYPECORE (rmbp-ledger B450, R79): the one extension-to-MIME table, the built-in sniff order and the ELF split —
 # `fs/filetype.rs` reads it, and so does the host's `libs/bandy`. no_std, no allocator; depends only on elf_core.
 type_core = { path = "../../libs/sys/type_core" }
+# CARDREGISTRY (rmbp-ledger B833): the FILETYPES type facts, the built-ins' resource blocks and the registry stamp —
+# `fs/assoc.rs` and `fs/appres.rs` delegate; `tools/unafs filetypes` stages the same objects and stamp onto the card.
+type_registry_core = { path = "../../libs/sys/type_registry_core" }
 # SELFBUILD6 (B360): the dynamic loader core (`linuxabi/ldso.rs` fulfils its Space over the process VMAs; the host runner
 # `ldrun` runs the same core). no_std + alloc, no deps; `default-features = false` drops the host runner binary.
 ldso_core = { path = "../../libs/sys/ldso_core", default-features = false }
