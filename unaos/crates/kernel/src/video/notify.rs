@@ -584,7 +584,7 @@ fn show_now(st: &mut St, n: Note, pw: usize, now: u64) {
     st.cards[0] = None;
     let f0 = wm::focus_asid();
     let (x, y, _, _) = card_rect(pw, 0);
-    let win = open_row(sf, x, y); row_pub(sf, win); // TOASTFLICKER (B815): the row joins the compositor's occluder sets (`wm::toast_occludes`)
+    let win = open_row(sf, x, y); row_pub(sf, win); // TOASTFLICKER (B815): the row joins the compositor's occluder sets (`wm::overlay_occludes`)
     st.cards[0] = Some(Card { n, win, until: now.saturating_add(CARD_MS).max(1), surf: sf, at: now, left: 0 }); // NOTICEFIX (B491): the pass's clock, never a second read of it
     SHOWN.fetch_add(1, Ordering::Relaxed);
     restack(st, pw);
@@ -1480,7 +1480,7 @@ fn softy_center_at(pw: usize, sw: usize, sh: usize) -> Option<(usize, usize)> {
 // leak was that a card is a COMPAT row and every backdrop painter's occluder set skipped compat rows — the desktop
 // present (`wm::occluders`, subtracted by `Screen::flush`), the erase drain (`erase_clip`) and the window blit
 // (`occ_clip`) — so the desktop's rects, a shadow or vacate fill, or a window below published over a live card and
-// nothing re-blitted it until its next present. `wm::toast_occludes` (wm.rs tail) admits notify's rows to all three,
+// nothing re-blitted it until its next present. `wm::overlay_occludes` (wm.rs tail) admits notify's rows to all three,
 // with the box read from the same table snapshot the set is built from; this module only says which rows are its own.
 // Writer: the pass under `ST` (`row_pub` after a real `open_row`, `row_unpub` before `wm::close`). Reader: wm's set
 // builders under their own table hold — atomics only, no lock taken, so no lock-order edge.
@@ -1501,7 +1501,7 @@ fn row_unpub(i: usize, win: wm::WinId) {
     }
 }
 
-/// Is `id` one of notify's live rows (a card or the Center)? Read by `wm::toast_occludes`.
+/// Is `id` one of notify's live rows (a card or the Center)? Read by `wm::overlay_occludes`.
 pub fn owns_row(id: wm::WinId) -> bool {
     id != wm::WIN_NONE && ROW_WIN.iter().any(|w| w.load(Ordering::Acquire) == id)
 }
@@ -1514,7 +1514,7 @@ const FIX_LINE: &[u8] = b"toastflicker fixture";
 /// composite), then 48 samples ~25 ms apart (past the render task's 1 Hz floor, so the queued desktop rects flush
 /// mid-run; every 8th sample re-queues them over every live card) each run a composite (the erase drain) and read
 /// back 3 points per card from the panel against the card's own surface. `(readback, backdrop_leaks, verdict)`:
-/// `ok`, `FAIL` (a point differed), or `skip(<why>)`. Go-red: `wm::toast_occludes` -> `false`.
+/// `ok`, `FAIL` (a point differed), or `skip(<why>)`. Go-red: `wm::overlay_occludes` -> `false`.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn toastflicker_leg() -> (usize, usize, &'static str) {
     if HEADLESS.load(Ordering::Relaxed) {

@@ -3712,7 +3712,7 @@ pub fn occluders(out: &mut alloc::vec::Vec<(usize, usize, usize, usize)>) -> usi
     let t = table();
     let mut n = 0usize;
     for r in t.rows.iter() {
-        if !r.used || (r.compat && !toast_occludes(r)) || !above_shell(r, shell) {
+        if !r.used || (r.compat && !overlay_occludes(r)) || !above_shell(r, shell) {
             continue;
         }
         let b = occluder_box(r, shell, focus); // DESIGNAPPLY (B639): the box AND its shadow margin — the desktop layer's presents never paint over a shadow (only the fill does)
@@ -18083,7 +18083,7 @@ fn occ_clip(rows: &[Window], i: usize, shell: u32, pw: usize, ph: usize) -> OccC
         let (z, id) = (rows[i].z, rows[i].id);
         let me = outer_box(&rows[i]);
         for r in rows.iter() {
-            if !r.used || (r.compat && !toast_occludes(r)) || !above_shell(r, shell) || (r.z, r.id) <= (z, id) {
+            if !r.used || (r.compat && !overlay_occludes(r)) || !above_shell(r, shell) || (r.z, r.id) <= (z, id) {
                 continue;
             }
             let b = outer_box(r);
@@ -18445,7 +18445,7 @@ fn erase_clip(pw: usize, ph: usize) -> (OccClip, usize) {
             // path: its box is the panel, so admitting it would suppress every desktop erase there
             // is, on a path this arc has no evidence about and whose own present republishes the
             // whole screen anyway. The status quo for compat is what ships.
-            if !r.used || (r.compat && !toast_occludes(r)) || !above_shell(r, shell) {
+            if !r.used || (r.compat && !overlay_occludes(r)) || !above_shell(r, shell) {
                 continue;
             }
             if !c.push(outer_box(r)) {
@@ -29539,8 +29539,10 @@ fn wcd_heap_tick() {}
 /// SPLASHX86: the boot splash's row — a full-panel, CHROMELESS compat row (no title, no controls, `hit_test`
 /// never names it, `close_all_furniture` spares it, `COMPAT_WIN` is not touched so `close_compat` /
 /// `compat_live` never see it). The caller pins it with [`set_modal_top`] and closes it with [`close`].
-/// `surf` is a `w * h * 4` xRGB buffer that must outlive the row. Returns [`WIN_NONE`] on refusal.
-pub fn splash_open(surf: usize, surf_len: usize, w: usize, h: usize) -> WinId {
+/// `surf` is a `w * h * 4` xRGB buffer that must outlive the row. Returns [`WIN_NONE`] on refusal. [`chromeless_open`] at (0,0).
+pub fn splash_open(surf: usize, surf_len: usize, w: usize, h: usize) -> WinId { chromeless_open(surf, surf_len, w, h, 0, 0) }
+/// OVERLAYENTRY (B827): the chromeless compat row's ONE door — mint, place at `(x, y)` and present under one table hold, then ONE composite.
+fn chromeless_open(surf: usize, surf_len: usize, w: usize, h: usize, x: usize, y: usize) -> WinId {
     let stride = w.saturating_mul(4);
     let id = create_inner(0, surf, surf_len, w, h, stride, b"", true, None, false);
     if id == WIN_NONE {
@@ -29551,12 +29553,10 @@ pub fn splash_open(surf: usize, surf_len: usize, w: usize, h: usize) -> WinId {
         if let Some(r) = row_mut(&mut t, id) {
             r.surf = surf;
             r.surf_len = surf_len;
-            r.w = w;
-            r.h = h;
+            r.w = w; r.h = h;
             r.stride = stride;
             r.scale = 1;
-            r.x = 0;
-            r.y = 0;
+            r.x = x; r.y = y;
             r.damage_all();
             r.presented = true;
         }
@@ -29579,24 +29579,24 @@ pub fn retitle(id: WinId, name: &[u8]) {
     }
 }
 
-/// SHORTCUTS: the help overlay's row — [`splash_open`]'s chromeless compat row, placed at `(x, y)` instead
-/// of the panel origin. Same contract: `surf` is a `w * h * 4` xRGB buffer that must outlive the row; the
-/// caller pins it with [`set_modal_top`] and closes it with [`close`]. [`WIN_NONE`] on refusal.
+/// SHORTCUTS / OVERLAYENTRY (B827): the overlays' row — [`chromeless_open`]'s chromeless compat row at `(x, y)`, minted,
+/// placed and presented under one table hold and composited ONCE there (never first at the panel origin). Same contract:
+/// `surf` is a `w * h * 4` xRGB buffer that must outlive the row; pin with [`set_modal_top`], close with [`close`].
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn overlay_open(surf: usize, surf_len: usize, w: usize, h: usize, x: usize, y: usize) -> WinId {
-    let id = splash_open(surf, surf_len, w, h);
+    // OVERLAYENTRY (rmbp-ledger B827, BP-video-17): this door used to call `splash_open` (a composite with the row
+    // presented at (0,0)) and then move it and composite again, so every overlay painted once at the panel origin
+    // and nothing erased those pixels. Now ONE composite at the caller's origin: `chromeless_open` sets `x`/`y` in
+    // the same hold that sets `presented`, so no pass ever sees the row unplaced and presented.
+    // The wire counts the composite passes the open cost (COMPSCRATCH's counter; >1 only when another core's
+    // pass overlapped the open): `[wm] overlay open id=<n> at=<x>,<y> passes=1`.
+    let p0 = comp_scratch_counts().0;
+    let id = chromeless_open(surf, surf_len, w, h, x, y);
     if id == WIN_NONE {
         return WIN_NONE;
     }
-    {
-        let mut t = table();
-        if let Some(r) = row_mut(&mut t, id) {
-            r.x = x;
-            r.y = y;
-            r.damage_all();
-        }
-    }
-    composite();
+    serial_println!("[wm] overlay open id={} at={},{} passes={}", id, x, y, comp_scratch_counts().0.wrapping_sub(p0));
+    // The row is live and owned by the caller from here (refusal returned above, nothing else to undo).
     id
 }
 // WINSNAP — window snapping lives in its own file; declared HERE (a child module) so it reaches the table, `zoom`, the vacate steps and the DRAG_* cells without widening any of them. See docs/dev/evidence/rmbp-0929/WINSNAP.md.
@@ -31843,26 +31843,26 @@ mod scrollview {
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub use scrollview::scroll_press_ring3; // RING3SCROLLPRESS (B791): the x86 click router's door (`wc_scroll_press`)
 
-/// CHARTER: TOASTFLICKER (rmbp-ledger B815) — notify's cards and Center join the occluder sets (`occluders`, `occ_clip`, `erase_clip`).
+/// CHARTER: OVERLAYOCC (rmbp-ledger B827; was TOASTFLICKER B815) — every kernel overlay row joins the occluder sets (`occluders`, `occ_clip`, `erase_clip`).
 ///
-/// A card is a compat overlay row (`overlay_open` -> `splash_open`), and the three sets skip compat rows, so the
-/// desktop present (`Screen::flush` subtracts [`occluders`]), the erase drain ([`erase_clip`]) and a lower window's
-/// blit ([`occ_clip`]) published over a live card and nothing re-blitted it (flight 37: "notification pop-up getting
-/// leak through flickers of the background"). This admits exactly notify's live rows — `notify::owns_row`, atomics
-/// the notify pass publishes — with the box each set reads from its own table snapshot, so a card that moves or
-/// closes is never withheld at a stale rect. Every other compat row keeps today's exclusion. Called inside the
-/// sets' table hold; takes no lock. Witness: `[cursor11] … toast_withheld=` counts the admissions.
+/// An overlay is a compat row (`overlay_open`/`splash_open` -> `chromeless_open`: notify's cards and Center, the launcher, the
+/// switcher, the dnd ghost, quicklook, the bezel, shortcuts, Start, the splash, shotsel), and the three sets skipped compat
+/// rows, so the desktop present (`Screen::flush` subtracts [`occluders`]), the erase drain ([`erase_clip`]) and a lower
+/// window's blit ([`occ_clip`]) published over a live overlay and nothing re-blitted it (flight 37's toast flicker; B815
+/// closed it for notify's rows only). [`overlay_row`] (file end) admits every presented overlay and keeps the full-screen
+/// canvas (`COMPAT_WIN`) out, with the box each set reads from its own table snapshot. Called inside the sets' table hold;
+/// takes no lock. Witness: `[cursor11] … toast_withheld=` still counts notify's admissions only (`notify::owns_row`).
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
-fn toast_occludes(r: &Window) -> bool {
-    let own = super::notify::owns_row(r.id);
+fn overlay_occludes(r: &Window) -> bool {
+    let own = overlay_row(r);
     #[cfg(feature = "witness")]
-    if own {
+    if own && super::notify::owns_row(r.id) {
         super::cursor::note_toast_withheld();
     }
     own
 }
 #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-fn toast_occludes(_r: &Window) -> bool {
+fn overlay_occludes(_r: &Window) -> bool {
     false
 }
 
@@ -31945,4 +31945,48 @@ fn zoom_note_boxes(boxes: &[(usize, usize, usize, usize)]) {
             super::zoom::note_rows(y, h);
         }
     }
+}
+
+// OVERLAYOCC (rmbp-ledger B827, BP-video-17) — TAIL-APPENDED so no line above moves: the one overlay predicate the three
+// occluder sets ask (through `overlay_occludes`), and `tests overlays`' fixture-only readers.
+
+/// Is `r` a live kernel overlay row — a compat row its opener has placed and presented, and not the full-screen canvas?
+/// `presented` keeps out a row `create_inner` minted that `chromeless_open` has not placed yet (unplaced at (0,0): admitting
+/// it would clip a queued erase there and leave stale pixels); `COMPAT_WIN` is the `SYS_FB_PRESENT` canvas, whose box is
+/// the panel (`erase_clip`'s stated reason to keep it out). Reads the row and one atomic; takes no lock.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn overlay_row(r: &Window) -> bool {
+    r.compat && r.presented && r.id != COMPAT_WIN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// `tests overlays` (fixture only): the live overlay rows' ids into `out` (cleared), by count, under one table hold.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+pub fn overlay_rows(out: &mut alloc::vec::Vec<WinId>) -> usize {
+    out.clear();
+    let t = table();
+    for r in t.rows.iter() {
+        if r.used && overlay_row(r) {
+            out.push(r.id);
+        }
+    }
+    out.len()
+}
+
+/// `tests overlays` (fixture only): pixel `(sx, sy)` of overlay row `id`'s own surface (xRGB), or `None` (no such compat
+/// row, or the point is outside its surface). Read under the table hold, bound-checked against `w`/`h`/`stride`/`surf_len`.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+pub fn surface_pixel(id: WinId, sx: usize, sy: usize) -> Option<u32> {
+    let t = table();
+    let r = row(&t, id)?;
+    if !r.used || !r.compat || sx >= r.w || sy >= r.h || sx.checked_mul(4)?.checked_add(4)? > r.stride {
+        return None;
+    }
+    let off = sy.checked_mul(r.stride)?.checked_add(sx * 4)?;
+    if off.checked_add(4)? > r.surf_len {
+        return None;
+    }
+    // SAFETY: an overlay row's surface is an owner-0 kernel buffer that outlives the row (`chromeless_open`'s contract), the
+    // row is held live by the table hold, and `off + 4 <= surf_len` was checked above (`verify_reference`'s source shape).
+    let p = (r.surf as *const u8).wrapping_add(off) as *const u32;
+    Some(unsafe { core::ptr::read_unaligned(p) })
 }

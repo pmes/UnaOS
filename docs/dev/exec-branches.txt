@@ -755,5 +755,5 @@ refs/heads/exec-rmbp-overlayocc   159f16f6 IN-FLIGHT cut 2026-10-26 (re-cut afte
 refs/heads/exec-rmbp-perfhud2   159f16f6 IN-FLIGHT cut 2026-10-26 (re-cut after the reset)
 refs/heads/exec-rmbp-stackguard3   159f16f6 IN-FLIGHT cut 2026-10-26 (re-cut after the reset)
 refs/heads/exec-rmbp-cardregistry   159f16f6 IN-FLIGHT cut 2026-10-26 (re-cut after the reset)
-refs/heads/exec-rmbp-navread   159f16f6 IN-FLIGHT cut 2026-10-26 (re-cut after the reset)
+refs/heads/exec-rmbp-navread   ad3b4fe55 FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-zoomcost   731d173b0 FOLDED-BY-HAND (this commit) 2026-10-26
