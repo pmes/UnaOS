@@ -373,7 +373,7 @@ fn grid_cell_at(s2: u32) -> (usize, usize) {
     let fs = match GRID_CSS.load(core::sync::atomic::Ordering::Relaxed) {
         0 => GRID_BASE_CSS,
         f => f,
-    } as usize;
+    } as usize; grid_cell_for(fs as u32, s2) } fn grid_cell_for(css: u32, s2: u32) -> (usize, usize) { let fs = css as usize; // TEXTSCALE (B813): split IN PLACE — `grid_cell_for` is the one cell formula at any css (the text-size cap asks it at each candidate); LINE-NEUTRAL fold, code first
     if fs == GRID_BASE_CSS as usize {
         return (crate::video::dpi::px_at(font::CELL_W, s2), crate::video::dpi::px_at(font::CELL_H, s2));
     }
@@ -437,7 +437,7 @@ mod tt {
         pub styles: [(Style, f32); 5],
         pub names: [&'static str; 5],
         pub family: Role,
-        pub css_px: i64,
+        pub css_px: i64, pub cap: i64, // TEXTSCALE (B813): the css size the panel holds (`textscale::cap_now`, computed outside this lock); the faces size from `css_px.min(cap)`. LINE-NEUTRAL fold
         pub ppi: u32,
         pub font_bytes: usize,
         /// UI faces (sans / mono / serif) that did not load — what `fallback=` names.
@@ -451,7 +451,7 @@ mod tt {
     static GAVE_UP: AtomicBool = AtomicBool::new(false);
     static TRIES: AtomicU32 = AtomicU32::new(0);
     static NEXT_TRY: AtomicU64 = AtomicU64::new(0);
-    static NEXT_PREFS: AtomicU64 = AtomicU64::new(0);
+    pub static NEXT_PREFS: AtomicU64 = AtomicU64::new(0);
     pub static CONTENDED: AtomicU64 = AtomicU64::new(0);
 
     pub fn ready() -> bool {
@@ -600,14 +600,14 @@ mod tt {
         let chrome = eng.fit_size_mean(fam, true, ccw as f32, cch as f32).unwrap_or(14.0);
         // KERNELFONT2: the console grid — mono at font_size x ppi / 96, capped by the dpi-scaled cell; UIMETRICS: the
         // cell itself follows font_size (the console regrids, `fbcon::regrid`, after this restyle lands).
-        super::GRID_CSS.store(t.css_px.clamp(1, 64) as u32, Ordering::Relaxed);
+        super::GRID_CSS.store(t.css_px.min(t.cap).clamp(1, 64) as u32, Ordering::Relaxed);
         let (gw, gh) = super::grid_cell();
         // UIMETRICS (B372): the UI face (the native kernel windows) is font_size x ppi / 96 capped by the dpi-scaled
         // cell's height — 40 px at 2.5, so the default 13 CSS px draws its 29.9 px (KERNELFONT's 13.5-px cap is gone).
         let ui_fit = eng.fit_size(fam, None, gh as f32).unwrap_or(12.0);
-        let ui = device_px(t.css_px as f32, t.ppi).min(ui_fit).max(6.0);
+        let ui = device_px(t.css_px.min(t.cap) as f32, t.ppi).min(ui_fit).max(6.0);
         let grid_fit = eng.fit_size(mono, Some(gw as f32), gh as f32).unwrap_or(body);
-        let grid = device_px(t.css_px as f32, t.ppi).min(grid_fit).max(6.0);
+        let grid = device_px(t.css_px.min(t.cap) as f32, t.ppi).min(grid_fit).max(6.0);
         let mk = |role: Role, size: f32, cell: usize| (Style::new(role, false, size), eng.baseline_in_cell(role, size, cell as f32));
         // FONTSCRAFT (B640): the title face — `type.title2` of the look on the glass, in px at the dpi scale.
         let t2 = type_role(TypeRole::Title2, crate::video::look::is_softy());
@@ -618,7 +618,7 @@ mod tt {
         );
         t.styles = [mk(mono, body, font::CELL_H), mk(fam, chrome, cch), mk(fam, ui, gh), mk(mono, grid, gh), title];
         let nm = |r: Role| eng.primary_name(r, false).unwrap_or("none");
-        t.names = [nm(mono), nm(fam), nm(fam), nm(mono), nm(fam)];
+        t.names = [nm(mono), nm(fam), nm(fam), nm(mono), nm(fam)]; let _ = crate::video::theme::text_restyled(crate::video::metrics::to_logical(gh), t.cap.clamp(0, 64) as u32); // TEXTSCALE (B813): publish the UI line (the capped grid cell) for the layouts that grow with it, under this lock and before the caller bumps `text::epoch`. LINE-NEUTRAL fold
     }
 
     pub fn read_face(mt: &crate::fs::vfs::MountTable, p: &str) -> Result<Vec<u8>, &'static str> {
@@ -723,7 +723,7 @@ mod tt {
         let family = family_of(crate::prefs::text(FONT_KEY));
         let css_px = crate::prefs::int(FONT_SIZE_KEY, 9, 32).unwrap_or(DEFAULT_CSS_PX);
         let n = eng.face_count();
-        let mut t = Tt { eng, styles: [(Style::new(Role::Sans, false, 12.0), 12.0); 5], names: ["", "", "", "", ""], family, css_px, ppi, font_bytes: bytes, missing, scripts_missing };
+        let mut t = Tt { eng, styles: [(Style::new(Role::Sans, false, 12.0), 12.0); 5], names: ["", "", "", "", ""], family, css_px, cap: super::textscale::cap_now(), ppi, font_bytes: bytes, missing, scripts_missing };
         restyle(&mut t);
         let fallback = if t.missing.is_empty() { String::from("none") } else { t.missing.clone() };
         let s2 = crate::video::dpi::scale_x2();
@@ -793,15 +793,15 @@ mod tt {
         }
         NEXT_PREFS.store(now + PREFS_MS, Ordering::Relaxed);
         let family = family_of(crate::prefs::text(FONT_KEY));
-        let css_px = crate::prefs::int(FONT_SIZE_KEY, 9, 32).unwrap_or(DEFAULT_CSS_PX);
+        let css_px = super::textscale::override_or(crate::prefs::int(FONT_SIZE_KEY, 9, 32).unwrap_or(DEFAULT_CSS_PX)); let cap = super::textscale::cap_now(); // TEXTSCALE (B813): the fixture's css override and the panel's cap, both read outside the lock. LINE-NEUTRAL fold
         let changed = with(|t| {
-            if t.family == family && t.css_px == css_px {
+            if t.family == family && t.css_px == css_px && t.cap == cap {
                 return None;
             }
             t.family = family;
-            t.css_px = css_px;
+            t.css_px = css_px; t.cap = cap;
             restyle(t);
-            Some(alloc::format!("font={} font_size={} ppi={} chrome={}-{:.2} ui={}-{:.2} console={}-{:.2}", family_name(family), css_px, t.ppi, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size, t.names[3], t.styles[3].0.size))
+            Some(alloc::format!("font={} font_size={} ppi={} chrome={}-{:.2} ui={}-{:.2} console={}-{:.2} metrics=row:{} bar:{} cap={} eff={}", family_name(family), css_px, t.ppi, t.names[1], t.styles[1].0.size, t.names[2], t.styles[2].0.size, t.names[3], t.styles[3].0.size, crate::video::settings::textscale::wire().0, crate::video::settings::textscale::wire().1, t.cap, t.css_px.min(t.cap)))
         })
         .flatten();
         if let Some(line) = changed {
@@ -816,12 +816,12 @@ mod tt {
     /// PREFSUI (B389): the UI scale moved live (`dpi::set_live`) — the faces re-size to the scale's effective ppi,
     /// the console regrids, every window repaints once. `true` when the faces moved.
     pub fn rescale() -> bool {
-        let ppi = crate::video::dpi::ppi();
+        let ppi = crate::video::dpi::ppi(); let cap = super::textscale::cap_now(); // TEXTSCALE (B813): the scale moved, so the cap does; read outside the lock. LINE-NEUTRAL fold
         let moved = with(|t| {
             if ppi == 0 || t.ppi == ppi {
                 return false;
             }
-            t.ppi = ppi;
+            t.ppi = ppi; t.cap = cap;
             restyle(t);
             true
         })
@@ -1357,4 +1357,82 @@ pub fn fontkit_probe() -> Option<FontkitProbe> {
         let face = t.eng.primary_name(Role::Sans, false).unwrap_or("none");
         FontkitProbe { roles, rows: TYPE_RAMP.len(), variable, title_ok, ink_600, ink_400, w_opsz14, w_opsz28, face, size }
     })
+}
+
+// ── TEXTSCALE (rmbp-ledger B813) — the largest text step capped to what the panel holds ───────────────────────────
+// Flight 37: `font_size=26 … ui=inter-52.75` overwrote Settings' rows. The layouts now grow with the UI line
+// (`theme::metrics`, published by `tt::restyle`), so a size whose grown Settings window cannot stand on the panel
+// between the bar and the dock is CAPPED: the faces size from `min(font_size, cap)`. The cap is computed here, OUTSIDE
+// the engine's lock (it reads the panel through `panel_info_nonblocking` and the furniture's reservations), at each
+// candidate size through the one cell formula (`grid_cell_for`) and Settings' own height (`settings::win_h_at`).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub mod textscale {
+    use core::sync::atomic::{AtomicI64, Ordering};
+
+    /// The largest css size the preference takes (Principia's schema bound).
+    const CSS_MAX: i64 = 32;
+    /// `tests textscale`'s css size, 0 = the preference.
+    static OVERRIDE: AtomicI64 = AtomicI64::new(0);
+    /// The last cap computed (a refused panel read answers it, so the poll never flaps); no cap until the panel reads.
+    static CAP: AtomicI64 = AtomicI64::new(CSS_MAX);
+
+    /// The css size `follow_prefs` follows: the fixture's override, else the preference `css`.
+    pub fn override_or(css: i64) -> i64 {
+        match OVERRIDE.load(Ordering::Relaxed) {
+            0 => css,
+            o => o,
+        }
+    }
+
+    /// The UI line (logical px) at css `css` and scale `s2` — the grid cell's height, as `restyle` publishes it.
+    pub fn line_at(css: u32, s2: u32) -> usize {
+        super::grid_cell_for(css, s2).1 * 2 / (s2.max(1) as usize)
+    }
+
+    /// The largest css size in 13..=32 whose grown Settings window (and its title band) stands between the bar and the
+    /// dock of a `pw` x `ph` panel at scale `s2`; none -> the default 13. Below 13 nothing grows, so it never caps there.
+    pub fn cap_for(pw: usize, ph: usize, s2: u32) -> i64 {
+        let avail = ph.saturating_sub(crate::ui_status::top_chrome_h(pw, ph)).saturating_sub(crate::ui_status::chrome_h(ph));
+        let chrome = crate::video::wm::TITLE_H() + 2 * crate::video::wm::BORDER();
+        let wide = crate::video::metrics::size(crate::video::settings::WIN_W) + 2 * crate::video::wm::BORDER() <= pw;
+        let fits = |css: i64| {
+            let m = crate::video::theme::TextMetrics { line: line_at(css as u32, s2), cap_css: 0 };
+            wide && crate::video::metrics::size(crate::video::settings::win_h_at(m)) + chrome <= avail
+        };
+        let base = super::GRID_BASE_CSS as i64;
+        (base..=CSS_MAX).rev().find(|&c| fits(c)).unwrap_or(base)
+    }
+
+    /// The cap for the live panel (call it outside the engine's lock); a busy panel answers the last one.
+    pub fn cap_now() -> i64 {
+        match crate::video::panel_info_nonblocking() {
+            Some(i) if i.width > 0 && i.height > 0 => {
+                let c = cap_for(i.width, i.height, crate::video::dpi::s2());
+                CAP.store(c, Ordering::Relaxed);
+                c
+            }
+            _ => CAP.load(Ordering::Relaxed),
+        }
+    }
+
+    /// `tests textscale`: follow css `css` (0 = back to the preference) through the real `follow_prefs` path and
+    /// return `Some((cap, effective css))` once the engine holds it, `None` when no face is loaded or it never landed.
+    #[cfg(feature = "witness")]
+    pub fn step(css: i64) -> Option<(i64, i64)> {
+        OVERRIDE.store(css, Ordering::Relaxed);
+        for _ in 0..64 {
+            super::tt::NEXT_PREFS.store(0, Ordering::Relaxed);
+            super::tt::service();
+            let want = override_or(crate::prefs::int("display.font_size", 9, 32).unwrap_or(font_core::ui::DEFAULT_CSS_PX));
+            if let Some((have, cap)) = super::tt::with(|t| (t.css_px, t.cap)) {
+                if have == want {
+                    return Some((cap, have.min(cap)));
+                }
+            } else if !super::tt::ready() {
+                return None;
+            }
+            crate::arch::sched::yield_now();
+        }
+        None
+    }
 }

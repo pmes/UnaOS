@@ -816,6 +816,25 @@ pub const DIMS: Dims = Dims {
     press_tint: 28,
 };
 
+/// TEXTSCALE (rmbp-ledger B813): the text-bearing boxes' heights (logical px) — the table's value grown by what the UI
+/// line grew at the live text size (`theme::metrics`); at the default size each is exactly its `DIMS` value. A window
+/// that lays its rows out around a kit control reads these, never `DIMS.*_h`, so its rows and the box agree.
+pub fn button_h() -> usize {
+    theme::metrics().grow(DIMS.button_h)
+}
+/// The segmented control's height ([`button_h`]'s rule).
+pub fn seg_h() -> usize {
+    theme::metrics().grow(DIMS.seg_h)
+}
+/// The text field's height ([`button_h`]'s rule).
+pub fn field_h() -> usize {
+    theme::metrics().grow(DIMS.field_h)
+}
+/// A source-list row's height ([`button_h`]'s rule).
+pub fn row_h() -> usize {
+    theme::metrics().grow(DIMS.row_h)
+}
+
 /// A logical length at the panel's scale, in device px.
 #[inline]
 fn d(n: usize) -> i32 {
@@ -951,7 +970,7 @@ pub fn slider(s: &mut Surf, x: i32, y: i32, w: i32, value: u32, max: u32, st: Co
 pub fn push_button(s: &mut Surf, x: i32, y: i32, w: i32, text: &[u8], default: bool, st: ControlState) -> Rect {
     let lw = label_w(text, false);
     let w = if w > 0 { w } else { (lw + 2 * d(DIMS.button_pad_x)).max(d(DIMS.button_min_w)) };
-    let r = Rect::new(x, y, w, d(DIMS.button_h));
+    let r = Rect::new(x, y, w, d(button_h()));
     let (rad, a) = (d(DIMS.button_radius), st.alpha());
     if !st.disabled {
         shadow_rrect(s, r.offset(0, d(DIMS.button_drop)), rad, d(DIMS.button_blur), theme::shadow_soft());
@@ -962,7 +981,10 @@ pub fn push_button(s: &mut Surf, x: i32, y: i32, w: i32, text: &[u8], default: b
         stroke_rrect(s, r, rad, DIMS.hairline_dev as i32, Ink::argb(theme::control_edge()).fade(a));
     }
     let ink = if default { theme::ink_on_accent() } else { theme::text_primary() };
-    label(s, r.x + (r.w - lw) / 2, label_top(r), text, label_ink(ink, face, st), false);
+    let saved = s.clip; // TEXTSCALE (B813): the label stays inside its box (centred while it fits, else from the left edge)
+    s.set_clip(saved.intersect(r));
+    label(s, r.x + ((r.w - lw) / 2).max(0), label_top(r), text, label_ink(ink, face, st), false);
+    s.clip = saved;
     focus_ring(s, r, rad, st);
     r
 }
@@ -988,7 +1010,7 @@ pub fn segmented_w(s: &mut Surf, x: i32, y: i32, w: i32, labels: &[&[u8]], sel: 
 pub fn segmented_at(s: &mut Surf, x: i32, y: i32, w: i32, labels: &[&[u8]], sel: usize, thumb_x: i32, st: ControlState) -> Rect {
     let n = labels.len().max(1) as i32;
     let sw = w / n;
-    let r = Rect::new(x, y, sw * n, d(DIMS.seg_h));
+    let r = Rect::new(x, y, sw * n, d(seg_h()));
     let (rad, a, i) = (d(DIMS.seg_radius), st.alpha(), d(DIMS.seg_inset));
     let well = theme::control_track();
     fill_rrect_alpha(s, r, rad, well, a);
@@ -1007,7 +1029,10 @@ pub fn segmented_at(s: &mut Surf, x: i32, y: i32, w: i32, labels: &[&[u8]], sel:
         let seg = Rect::new(r.x + sw * k as i32, r.y, sw, r.h);
         let on = k == sel;
         let bg = if on { theme::knob_face() } else { well };
-        label(s, seg.x + (sw - label_w(l, on)) / 2, label_top(seg), l, label_ink(theme::text_primary(), bg, st), on);
+        let saved = s.clip; // TEXTSCALE (B813): each segment's label stays inside its segment
+        s.set_clip(saved.intersect(seg));
+        label(s, seg.x + ((sw - label_w(l, on)) / 2).max(0), label_top(seg), l, label_ink(theme::text_primary(), bg, st), on);
+        s.clip = saved;
     }
     focus_ring(s, r, rad, st);
     r
@@ -1015,7 +1040,7 @@ pub fn segmented_at(s: &mut Surf, x: i32, y: i32, w: i32, labels: &[&[u8]], sel:
 
 /// A text field at `(x, y)`, `w` wide, showing `text`; focused (`st.focused`) it draws the ring and the caret.
 pub fn text_field(s: &mut Surf, x: i32, y: i32, w: i32, text: &[u8], st: ControlState) -> Rect {
-    let r = Rect::new(x, y, w, d(DIMS.field_h));
+    let r = Rect::new(x, y, w, d(field_h()));
     let (rad, a) = (d(DIMS.field_radius), st.alpha());
     let bg = theme::surface_content();
     fill_rrect_alpha(s, r, rad, bg, a);
@@ -1036,7 +1061,7 @@ pub fn text_field(s: &mut Surf, x: i32, y: i32, w: i32, text: &[u8], st: Control
 
 /// A source-list row at `(x, y)`, `w` wide: `selected` is an accent pill with light ink; hover a faint wash.
 pub fn sidebar_row(s: &mut Surf, x: i32, y: i32, w: i32, text: &[u8], selected: bool, st: ControlState) -> Rect {
-    let r = Rect::new(x, y, w, d(DIMS.row_h));
+    let r = Rect::new(x, y, w, d(row_h()));
     let rad = d(DIMS.row_radius);
     let base = theme::surface_window();
     let (ink, bg) = if selected {
