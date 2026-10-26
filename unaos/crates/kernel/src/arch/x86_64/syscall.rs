@@ -3704,7 +3704,7 @@ fn sys_win_create(w: u64, h: u64) -> i64 {
             slot
         );
         true
-    } else if !crate::video::wm::focussteal::held_now(owner) && USER_INPUT_ACTIVE
+    } else if !focus_held_now(owner) && USER_INPUT_ACTIVE
         .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
@@ -17543,7 +17543,7 @@ fn winx_launcher(demo_cpu: usize) {
     #[cfg(feature = "witness")]
     crate::tests::register("ptrdead", || { ptrdead_selftest(); lockfix_b1_selftest(); });// LOCKFIX-B1 — the input band's panel read driven across a HELD `WRITER` (rmbp-ledger B1). A BLOCK under the line above's `cfg`, so no line is added and no panic `Location` below moves — `apppin_selftest`'s fold at this ladder's tail is the pattern. Shares `ptrdead`'s cfg exactly and wants no more: it needs neither `wc` nor a window, only `WRITER` and `click_pointer_pos`, both compiled in every x86 build. PLACED HERE for the same reason `ptrdead` is the least disruptive fixture in the ladder — this one mints no row, touches no window table, moves no pointer and posts no event; it takes one lock, releases it, and reads a counter. The only ordering it needs is "after the pointer position is set", which every fixture above it has already done, and which is why its `(x,y)` is an OBSERVATION rather than an assertion (see the function's own note).
     #[cfg(all(feature = "witness", feature = "wc"))]
-    crate::tests::register("wmdirect", wmdirect_selftest); crate::tests::register("dragmouse", dragmouse_selftest); /* flight 35: `tests dragmouse` NOT-FOUND — DRAGNOMOVE never registered it */ #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("winsnap", crate::video::wm::winsnap::selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("winresize", winresize_selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("dragmouse", dragmouse_selftest); // WINSNAP fixture (video/winsnap.rs). WINRESIZE (R75) — DRAGNOMOVE (B620): its registration sat AFTER this line's `//` (a comment, compiled nothing — LEDGER P7), so `tests winresize` never existed and x86-wc.spec's `:: WINRESIZE: zones=8` REQUIRE had no producer; moved before it. DRAGMOUSE (B620) — the xHCI-mouse drag, press/steer/release through `pal::push_pointer_report` with NO `set_button_level`, file tail.
+    crate::tests::register("wmdirect", wmdirect_selftest); /* flight 35: `tests dragmouse` NOT-FOUND — DRAGNOMOVE never registered it */ #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("winsnap", crate::video::wm::winsnap::selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("winresize", winresize_selftest); #[cfg(all(feature = "witness", feature = "wc"))] crate::tests::register("dragmouse", dragmouse_selftest); // WINSNAP fixture (video/winsnap.rs). WINRESIZE (R75) — DRAGNOMOVE (B620): its registration sat AFTER this line's `//` (a comment, compiled nothing — LEDGER P7), so `tests winresize` never existed and x86-wc.spec's `:: WINRESIZE: zones=8` REQUIRE had no producer; moved before it. DRAGMOUSE (B620) — the xHCI-mouse drag, press/steer/release through `pal::push_pointer_report` with NO `set_button_level`, file tail.
     // DMGOVLP — the overlap-forcing damage leg, and the ladder's new tail. Six kernel-band rows in
     // two overlapping groups, banded seeds driven with the REAL sprite parked on the three-way
     // stack: the boot-8 wedge class (banded drags + cursor-repaint storm under overlap) is only
@@ -32535,3 +32535,11 @@ fn scroll_ring3_press_legs(win: crate::video::wm::WinId, id: u32, owner: u64, bu
     while user_input_take(owner, &mut scratch) > 0 {}
     legs
 }
+
+/// KNOBOFF (seat, 2026-10-26): the map-time focus hold (FOCUSSTEAL B698, `wm::focussteal`) exists only on the desktop
+/// family; the knob-off image has no steal to refuse. `sys_win_create` reads it through this one fn so the plain
+/// `./arroyo check` (image knobs off) compiles.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn focus_held_now(owner: u32) -> bool { crate::video::wm::focussteal::held_now(owner) }
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn focus_held_now(_owner: u32) -> bool { false }

@@ -311,7 +311,7 @@ const MIX_GEN: u64 = u64::MAX;
 /// The master stage the sink needs: (gain Q8, mute, level 0..16 for the wire). HDA's codec amp carries the level; a USB
 /// device's feature unit carries it when it has one (SINKALL M2); otherwise — and always on BT — the mixer scales.
 fn master(kind: u8) -> (u16, bool, u8) {
-    let (lv, muted) = crate::video::status::volume(); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] if kind == OUT_BT && bt_hw_volume() { return (UNITY, muted, lv); }
+    let (lv, muted) = status_volume(); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] if kind == OUT_BT && bt_hw_volume() { return (UNITY, muted, lv); }
     if kind == OUT_HDA || (kind == OUT_USB && usb_hw_volume(lv, muted)) { (UNITY, false, lv) } else { (lv.min(16) as u16 * 16, muted, lv) }
 }
 
@@ -937,3 +937,10 @@ fn usb_level() {
     let (lv, muted) = crate::video::status::volume();
     let _ = usb_hw_volume(lv, muted);
 }
+
+/// KNOBOFF (seat, 2026-10-26): `video::status` (the tray's volume word) exists only on the desktop family; the knob-off
+/// image's mixer plays at unity, unmuted. One reader so the plain `./arroyo check` compiles.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn status_volume() -> (u8, bool) { crate::video::status::volume() }
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn status_volume() -> (u8, bool) { (100, false) }

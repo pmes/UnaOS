@@ -1102,6 +1102,8 @@ pub const MASKED_GOAL_MS: u64 = 20;
 
 /// FILETYPES3 (B820): the medium the bound mount rides (`sdhc`, `global`, `usb`, `ahci`), `none` when unbound.
 pub fn medium_word() -> String {
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))] { return String::from("none"); } // KNOBOFF (seat, 2026-10-26): no UnaFS mount on the knob-off x86 image
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     match crate::fs::unafs::mount_bound_handle() {
         Some(h) => {
             let w = alloc::format!("{:?}", h).to_lowercase();
