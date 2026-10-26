@@ -4908,6 +4908,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "type_registry_core"
+version = "0.1.0"
+dependencies = [
+ "midden_core",
+ "type_core",
+ "una-abi",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4977,6 +4986,7 @@ dependencies = [
  "bandy",
  "clap",
  "tokio",
+ "type_registry_core",
  "unafs",
 ]
 

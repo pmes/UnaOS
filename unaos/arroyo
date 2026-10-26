@@ -9715,6 +9715,12 @@ esp_x86_unafs_card() {
         cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$src" "$dst" -i "$vol" || {
             echo -e "${COLOR_RED}❌ ROOTDISK2: tools/unafs put ${src#${WORKSPACE_DIR}/} -> ${dst} failed — no card image${COLOR_RESET}"; return 1; }
     done
+    # CARDREGISTRY (rmbp-ledger B833): the FILETYPES registry built and stamped on the card — /system/filetypes, every
+    # compiled-in type's object (one create_files_batch, the kernel's crate fn) and the stamp the kernel computes
+    # (type_registry_core, KAT-pinned), so a fresh card's first login reads `[filetypes] login=stamp stamp=match` and
+    # builds nothing. Before ROOTACL: /system takes its owner row after. Witness: `[unafs-tool] filetypes staged n= created= stamp=`.
+    cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- filetypes -i "$vol" || {
+        echo -e "${COLOR_RED}❌ CARDREGISTRY: tools/unafs filetypes failed — no card image${COLOR_RESET}"; return 1; }
     # ROOTACL (rmbp-ledger B456, SECREVIEW F2): every tree the loop put takes the `system` owner row, so the card is
     # system-owned from its first boot — the kernel's native ACL lets only `kernel` and the administrator write there
     # (children carry no row and inherit it; fs/rootacl.rs). The kernel stamps /system/types at the registry build.
