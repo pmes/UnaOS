@@ -60,9 +60,21 @@
 //! raced the seed is re-composed into RAM. A disengage copies the RAM frame back unscaled under the `WRITER` hold, so
 //! the glass is exact the instant the handle is the panel's again.
 //!
-//! WIRE: `[zoom] z=<n> follow=<p|f> origin=<x>,<y> present_us=<n>` on each change (rate-limited to 1/s, from the
-//! service pass); `[zoom] engage refused z=<n> why=<why>` (printed by [`engage`] itself, ZOOM2 B829); `tests zoom`:
-//! `:: ZOOM: z=2 px_ok=3 present_us=<n> -> PASS ::` (+ `panel= smooth_us= engage_us= budget_us= under= lost= why=`).
+//! # Only what moved (ZOOMCOST, rmbp-ledger B835)
+//!
+//! A composite pass names the source rows it wrote: wm reads its own damage set at its own snapshot points
+//! (`zoom_note_pass` over the pass's rows/dirty/bands through `damaged_box`, `zoom_note_boxes` over the erase drain's
+//! boxes) into [`note_rows`] ([`PASS_ROWS`]), and [`on_damage`] commits them to [`OWED_ROWS`] after the pass's pixels.
+//! While the origin, the factor and nearest/bilinear are what the glass already shows ([`Lens::glass`]),
+//! [`present_locked`] writes only the destination rows whose source rows are owed (`sy = oy + dy/z`, and `sy + 1`
+//! while bilinear with `fy != 0`); a moved origin is a WHOLE present (a scroll of the glass would read the uncached
+//! scan-out, BP-video-25). Furniture, the HUD, dropdowns and the cursor reach the pass only as `Owed.dirty`: a whole
+//! owe. The 250 ms sweep stays whole.
+//!
+//! WIRE: `[zoom] z=<n> follow=<p|f> origin=<x>,<y> present_us=<n> rows=<w>/<h> skipped=<0|1>` on each change
+//! (rate-limited to 1/s, from the service pass); `[zoom] engage refused z=<n> why=<why>` (printed by [`engage`]
+//! itself, ZOOM2 B829); `tests zoom`: `:: ZOOM: z=2 px_ok=3 present_us=<n> -> PASS ::` (+ `panel= smooth_us=
+//! engage_us= budget_us= under= lost= why= present_full_us= present_band_us= rows=<w>/<h> skipped=`).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::*};
@@ -119,6 +131,15 @@ static LINE_KEY: AtomicU64 = AtomicU64::new(0);
 /// The last engage's cost (the seed copy from the glass), and panels re-attached under a live lens.
 static ENGAGE_US: AtomicU64 = AtomicU64::new(0);
 static PANEL_LOST: AtomicU64 = AtomicU64::new(0);
+/// ZOOMCOST (B835): one bit a source row of the RAM frame, `ROW_WORDS * 64` rows (a taller panel presents whole).
+const ROW_WORDS: usize = 64;
+/// The source rows the running composite pass wrote ([`note_rows`]), committed by [`on_damage`] after its pixels.
+static PASS_ROWS: [AtomicU64; ROW_WORDS] = [const { AtomicU64::new(0) }; ROW_WORDS];
+/// The source rows owed to the glass; taken at [`present_locked`]'s head.
+static OWED_ROWS: [AtomicU64; ROW_WORDS] = [const { AtomicU64::new(0) }; ROW_WORDS];
+/// The last present's written destination rows, and whether it wrote none (the wire's `rows=` / `skipped=`).
+static PRESENT_ROWS: AtomicU64 = AtomicU64::new(0);
+static SKIPPED: AtomicBool = AtomicBool::new(false);
 
 /// The lens: the RAM frame `WRITER` points at while live, the real panel handle, the one destination row.
 struct Lens {
@@ -129,6 +150,8 @@ struct Lens {
     w: usize,
     h: usize,
     rstride: usize,
+    /// ZOOMCOST (B835): what the glass shows, `(ox, oy, z, smooth)`; `None` = unknown (engage, disengage).
+    glass: Option<(usize, usize, usize, bool)>,
 }
 
 static LENS: crate::sync::Mutex<Option<Lens>> = crate::sync::Mutex::new(None);
@@ -208,19 +231,61 @@ pub fn on_pointer() {
 }
 
 /// A composite pass put pixels in the RAM frame (one call in `wm::composite_once`). One relaxed load when off.
+/// ZOOMCOST (B835): the pass's noted rows are committed to [`OWED_ROWS`] here, after its pixels; `dirty` (the
+/// pass's `Owed.dirty`: furniture, the HUD, dropdowns, the cursor, rects the pass does not name) owes a whole present.
 #[inline]
-pub fn on_damage() {
+pub fn on_damage(dirty: bool) {
     if LIVE.load(Relaxed) == 0 {
         return;
+    }
+    for (p, o) in PASS_ROWS.iter().zip(OWED_ROWS.iter()) {
+        let w = p.swap(0, AcqRel);
+        if w != 0 {
+            o.fetch_or(w, Release);
+        }
+    }
+    if dirty {
+        OWED.store(true, Release);
     }
     kick(true);
 }
 
+/// ZOOMCOST (B835): a composite pass wrote source rows `y..y+h` of the RAM frame (wm's `zoom_note_pass` and
+/// `zoom_note_boxes`, at the pass's own snapshot points). One relaxed load when the lens is off.
+#[inline]
+pub fn note_rows(y: usize, h: usize) {
+    if LIVE.load(Relaxed) == 0 {
+        return;
+    }
+    set_rows(&PASS_ROWS, y, h);
+}
+
+/// Set rows `y..y+h` (clipped to the bitset) in `set`.
+fn set_rows(set: &[AtomicU64; ROW_WORDS], y: usize, h: usize) {
+    let end = y.saturating_add(h).min(ROW_WORDS * 64);
+    let mut r = y;
+    while r < end {
+        let b = r % 64;
+        let n = (64 - b).min(end - r);
+        let mask = if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << b };
+        set[r / 64].fetch_or(mask, Relaxed);
+        r += n;
+    }
+}
+
+/// Any source row owed to the glass.
+fn rows_owed() -> bool {
+    OWED_ROWS.iter().any(|w| w.load(Acquire) != 0)
+}
+
 /// Present now, or owe it: a masked caller owes (the present is milliseconds of row stores); a pointer move inside
-/// the previous present's budget owes (the HID band never queues presents behind each other).
+/// the previous present's budget owes (the HID band never queues presents behind each other). ZOOMCOST (B835): the
+/// pointer path is a whole present (`full`); a damage kick's owe is its rows, already in [`OWED_ROWS`].
 fn kick(damage: bool) {
     if crate::arch::irqs_masked() {
-        OWED.store(true, Release);
+        if !damage {
+            OWED.store(true, Release);
+        }
         return;
     }
     if !damage {
@@ -231,7 +296,7 @@ fn kick(damage: bool) {
             return;
         }
     }
-    let _ = present(None);
+    let _ = present(None, !damage);
 }
 
 /// Bilinear once the pointer has settled.
@@ -239,19 +304,27 @@ fn smooth_now() -> bool {
     crate::arch::ms().saturating_sub(MOVE_MS.load(Relaxed)) >= SETTLE_MS
 }
 
-/// Run the present (`smooth` forced, else by the settle clock), re-running while a caller owed one during it (at most
-/// three rounds). Returns the last round's cost in us; `None` = nothing presented (busy, off, the panel re-attached).
-fn present(smooth: Option<bool>) -> Option<u64> {
+/// Run the present (`smooth` forced, else by the settle clock; `full` = a whole present asked). ZOOMOWE (B835): the
+/// whole owe is swapped at each round's head; another round runs only for rows committed during the round or a
+/// whole owe this call has not paid (at most three rounds), so an owe raised after this call paid one cashes once,
+/// at the next caller or the service pass, never extending this hold. A lost try-lock stores `OWED` only for a whole
+/// owe (a damage owe is its rows, which the holder's loop sees). Returns the last round's cost in us; `None` =
+/// nothing presented (busy, off, the panel re-attached).
+fn present(smooth: Option<bool>, full: bool) -> Option<u64> {
     let Some(mut g) = LENS.try_lock() else {
-        OWED.store(true, Release);
+        if full {
+            OWED.store(true, Release);
+        }
         return None;
     };
     let mut last = None;
+    let mut paid = false;
     for _ in 0..3 {
-        OWED.store(false, Release);
+        let whole = OWED.swap(false, AcqRel) || (full && !paid);
+        paid |= whole;
         let l = g.as_mut()?;
-        last = present_locked(l, smooth.unwrap_or_else(smooth_now));
-        if last.is_none() || !OWED.load(Acquire) {
+        last = present_locked(l, smooth.unwrap_or_else(smooth_now), whole);
+        if last.is_none() || !(rows_owed() || (!paid && OWED.load(Acquire))) {
             break;
         }
     }
@@ -294,7 +367,9 @@ fn bilin(p00: u32, p10: u32, p01: u32, p11: u32, fx: u32, fy: u32, z: u32) -> u3
 }
 
 /// THE PRESENT: the `ceil(W/z) x ceil(H/z)` window at the centre, scaled into the real scan-out. Returns its cost.
-fn present_locked(l: &mut Lens, smooth: bool) -> Option<u64> {
+/// ZOOMCOST (B835): whole when `full`, when the glass shows another `(ox, oy, z, smooth)` or the panel is taller than
+/// the bitset; otherwise only the destination rows whose source rows are owed. No row written: `Some(0)`, skipped.
+fn present_locked(l: &mut Lens, smooth: bool, full: bool) -> Option<u64> {
     let z = LIVE.load(Acquire) as usize;
     if z < 2 {
         return None;
@@ -310,12 +385,23 @@ fn present_locked(l: &mut Lens, smooth: bool) -> Option<u64> {
     let (cx, cy) = centre(w, h);
     let (ox, oy) = (origin_of(cx, w, z), origin_of(cy, h, z));
     ORIGIN.store(((ox as u64) << 32) | oy as u64, Relaxed);
+    let key = (ox, oy, z, smooth);
+    let whole = full || l.glass != Some(key) || h > ROW_WORDS * 64;
+    let mut owed = [0u64; ROW_WORDS];
+    for (o, word) in owed.iter_mut().zip(OWED_ROWS.iter()) {
+        *o = word.swap(0, AcqRel);
+    }
+    let bit = |r: usize| ((owed[r / 64] >> (r % 64)) & 1) != 0;
     let t0 = crate::arch::now_cycles();
     let src = &l.shadow;
     let rb = w * 4;
     let mut built = usize::MAX;
+    let mut written = 0usize;
     for dy in 0..h {
         let (sy, fy) = (oy + dy / z, dy % z);
+        if !whole && !bit(sy) && !(smooth && fy != 0 && bit((sy + 1).min(h - 1))) {
+            continue;
+        }
         if smooth && fy != 0 {
             let (r0, r1) = (sy * w, (sy + 1).min(h - 1) * w);
             let (mut sx, mut fx) = (ox, 0usize);
@@ -344,13 +430,23 @@ fn present_locked(l: &mut Lens, smooth: bool) -> Option<u64> {
         // SAFETY: `row` holds exactly `w` initialised u32s; the slice is its bytes. `blit` bounds the store.
         let bytes = unsafe { core::slice::from_raw_parts(l.row.as_ptr() as *const u8, rb) };
         l.real.blit(dy * l.rstride * 4, bytes);
+        written += 1;
+    }
+    l.glass = Some(key);
+    PRESENT_ROWS.store(written as u64, Relaxed);
+    SKIPPED.store(written == 0, Relaxed);
+    SMOOTH_LAST.store(smooth, Relaxed);
+    if written == 0 {
+        PRESENT_US.store(0, Relaxed);
+        return Some(0);
     }
     let end = crate::arch::now_cycles();
     let us = super::blitter::cycles_to_us(end.saturating_sub(t0));
     PRESENT_US.store(us, Relaxed);
     PRESENT_END_CYC.store(end, Relaxed);
-    PRESENT_MS.store(crate::arch::ms(), Relaxed);
-    SMOOTH_LAST.store(smooth, Relaxed);
+    if whole {
+        PRESENT_MS.store(crate::arch::ms(), Relaxed); // the sweep is dated by WHOLE presents
+    }
     Some(us)
 }
 
@@ -368,7 +464,8 @@ fn engage(z: u8) -> Result<u64, &'static str> {
 fn engage_at(z: u8) -> Result<u64, &'static str> {
     let mut g = LENS.lock();
     let real = *super::WRITER.lock();
-    if g.as_ref().is_some_and(|l| l.sfb.base_addr() == real.base_addr()) {
+    if let Some(l) = g.as_mut().filter(|l| l.sfb.base_addr() == real.base_addr()) {
+        l.glass = None;
         LIVE.store(z, Release); // WRITER is the RAM frame already: only the factor moves
         return Ok(0);
     }
@@ -397,9 +494,10 @@ fn engage_at(z: u8) -> Result<u64, &'static str> {
         row.resize(w, 0);
         let mut sfb = FrameBuffer::new();
         sfb.init(shadow.as_mut_ptr() as usize, w * h * 4, FrameBufferInfo { width: w, height: h, stride: w, bytes_per_pixel: 4, pixel_format: info.pixel_format });
-        *g = Some(Lens { shadow, sfb, real, row, w, h, rstride: info.stride });
+        *g = Some(Lens { shadow, sfb, real, row, w, h, rstride: info.stride, glass: None });
     }
     let l = g.as_mut().ok_or("lens")?;
+    l.glass = None;
     let t0 = crate::arch::now_cycles();
     // crawl A 7: seeded from RAM, never read back from BAR1 (uncached, ~1.7 us a probe: seconds at 1920x1200) — the
     // frame starts as the filtered desktop colour; the theme epoch bump below re-seals every strip and the damage-all
@@ -427,6 +525,7 @@ fn disengage() {
     let mut g = LENS.lock();
     LIVE.store(0, Release);
     let Some(l) = g.as_mut() else { return };
+    l.glass = None;
     let mut wg = super::WRITER.lock();
     if wg.base_addr() == l.sfb.base_addr() {
         for y in 0..l.h {
@@ -468,14 +567,15 @@ pub fn service() {
     if LIVE.load(Acquire) != 0 {
         let now = crate::arch::ms();
         let settle = !SMOOTH_LAST.load(Relaxed) && smooth_now();
-        if OWED.load(Acquire) || settle || now.saturating_sub(PRESENT_MS.load(Relaxed)) >= SWEEP_MS {
-            let _ = present(None);
+        let sweep = now.saturating_sub(PRESENT_MS.load(Relaxed)) >= SWEEP_MS; // ZOOMCOST (B835): the backstop is whole
+        if OWED.load(Acquire) || rows_owed() || settle || sweep {
+            let _ = present(None, sweep);
         }
     }
     line();
 }
 
-/// `[zoom] z= follow= origin= present_us=` when the state moved, at most once a second.
+/// `[zoom] z= follow= origin= present_us= rows=<w>/<h> skipped=` when the state moved, at most once a second.
 fn line() {
     let now = crate::arch::ms();
     if now.saturating_sub(LINE_AT.load(Relaxed)) < LINE_MS {
@@ -488,7 +588,11 @@ fn line() {
         return;
     }
     LINE_AT.store(now, Relaxed);
-    serial_println!("[zoom] z={} follow={} origin={},{} present_us={}", z, if f == 1 { "f" } else { "p" }, o >> 32, o & 0xFFFF_FFFF, PRESENT_US.load(Relaxed));
+    let ph = LENS.try_lock().and_then(|g| g.as_ref().map(|l| l.h)).unwrap_or(0);
+    serial_println!(
+        "[zoom] z={} follow={} origin={},{} present_us={} rows={}/{} skipped={}",
+        z, if f == 1 { "f" } else { "p" }, o >> 32, o & 0xFFFF_FFFF, PRESENT_US.load(Relaxed), PRESENT_ROWS.load(Relaxed), ph, SKIPPED.load(Relaxed) as u8
+    );
 }
 
 /// `tests zoom`: z=2 engaged, the pointer moved to three corners, each nearest present timed and one scan-out pixel
@@ -532,7 +636,8 @@ pub fn selftest() {
             }
         }
     }
-    let smooth_us = LENS.lock().as_mut().and_then(|l| present_locked(l, true)).unwrap_or(0);
+    let smooth_us = LENS.lock().as_mut().and_then(|l| present_locked(l, true, true)).unwrap_or(0);
+    let (full_us, band_us, band_rows, skipped) = band_probe();
     let o = ORIGIN.load(Relaxed);
     serial_println!("[zoom] z=2 follow=p origin={},{} present_us={}", o >> 32, o & 0xFFFF_FFFF, worst);
     crate::pal::cursor::set_abs(abs(px0.max(0) as usize, w), abs(py0.max(0) as usize, h), w as i32, h as i32);
@@ -542,13 +647,34 @@ pub fn selftest() {
         disengage();
     } else {
         LIVE.store(live0, Release);
-        let _ = present(None);
+        let _ = present(None, true);
     }
-    let pass = px_ok == 3;
+    let band_ok = band_us <= BUDGET_US && band_rows > 0 && (band_rows as usize) < h;
+    if px_ok == 3 && !band_ok {
+        why = "band";
+    }
+    let pass = px_ok == 3 && band_ok;
     serial_println!(
-        ":: ZOOM: z=2 px_ok={} present_us={} -> {} :: panel={}x{} smooth_us={} engage_us={} budget_us={} under={} lost={} why={}",
-        px_ok, worst, if pass { "PASS" } else { "FAIL" }, w, h, smooth_us, ENGAGE_US.load(Relaxed), BUDGET_US, (worst <= BUDGET_US) as u8, PANEL_LOST.load(Relaxed), why
+        ":: ZOOM: z=2 px_ok={} present_us={} -> {} :: panel={}x{} smooth_us={} engage_us={} budget_us={} under={} lost={} why={} present_full_us={} present_band_us={} rows={}/{} skipped={}",
+        px_ok, worst, if pass { "PASS" } else { "FAIL" }, w, h, smooth_us, ENGAGE_US.load(Relaxed), BUDGET_US, (worst <= BUDGET_US) as u8, PANEL_LOST.load(Relaxed), why,
+        full_us, band_us, band_rows, h, skipped as u8
     );
+}
+
+/// ZOOMCOST (B835): `tests zoom` M3 under ONE waiting `LENS` hold — a whole present, a 16-source-row band owed at the
+/// lens centre (nearest, so `16 * z` destination rows), then a present with nothing owed (skipped; reported, not
+/// gated). Returns `(present_full_us, present_band_us, band_rows, skipped)`.
+fn band_probe() -> (u64, u64, u64, bool) {
+    let mut g = LENS.lock();
+    let Some(l) = g.as_mut() else { return (0, 0, 0, false) };
+    let full_us = present_locked(l, false, true).unwrap_or(0);
+    let z = (LIVE.load(Acquire) as usize).max(2);
+    let oy = (ORIGIN.load(Relaxed) & 0xFFFF_FFFF) as usize;
+    set_rows(&OWED_ROWS, (oy + l.h.div_ceil(z) / 2).saturating_sub(8), 16);
+    let band = present_locked(l, false, false);
+    let band_rows = if band.is_some() { PRESENT_ROWS.load(Relaxed) } else { 0 };
+    let _ = present_locked(l, false, false);
+    (full_us, band.unwrap_or(0), band_rows, SKIPPED.load(Relaxed))
 }
 
 /// ZOOM2 (B829): one fixture present + its read-back under ONE waiting `LENS` hold. The pointer is moved to the corner
@@ -563,7 +689,7 @@ fn probe(cx: usize, cy: usize, w: usize, h: usize, stride: usize) -> Result<u64,
     crate::pal::cursor::set_abs(abs(cx, w), abs(cy, h), w as i32, h as i32);
     let mut g = LENS.lock();
     let Some(l) = g.as_mut() else { return Err((0, "no-lens")) };
-    let Some(us) = present_locked(l, false) else { return Err((0, "no-present")) };
+    let Some(us) = present_locked(l, false, true) else { return Err((0, "no-present")) };
     let (x, y) = crate::pal::cursor::pos(w as i32, h as i32);
     let (x, y) = (x.max(0) as usize, y.max(0) as usize);
     let o = ORIGIN.load(Relaxed);

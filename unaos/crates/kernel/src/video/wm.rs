@@ -5214,7 +5214,7 @@ fn composite_once() {
     #[cfg(all(target_arch = "x86_64", feature = "wc"))] let k2p_pass = k2p::begin(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::perfhud::pass_begin(); let owed = composite_pass_half(); // K2P (B671): this frame takes its oldest consumed input and judges its vblank deadline (file tail). ⚠ LINE-NEUTRAL fold, code before the comment. PERFHUD (B710): `perfhud::pass_begin` stamps the pass start its frame-time ring reads at the overlay layer (one relaxed store while visible), same-line fold, code before the comment.
     // x86 (and anything not aarch64): cash inline, in the pass, as the trunk always has.
     #[cfg(not(target_arch = "aarch64"))]
-    cash_tail(owed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::on_damage(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::end(k2p_pass); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] crate::video::veilcost::frame(); // ZOOM (B713): the pass's pixels are in the RAM frame while the lens is live — present them through it before the frame is judged on the glass. K2P (B671): the frame is on the glass — its input's age is recorded (file tail). VEILCOST (B696): the sample. ⚠ LINE-NEUTRAL fold, code before the comment.
+    cash_tail(owed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::on_damage(owed.dirty); #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::end(k2p_pass); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] crate::video::veilcost::frame(); // ZOOM (B713): the pass's pixels are in the RAM frame while the lens is live — present them through it before the frame is judged on the glass. K2P (B671): the frame is on the glass — its input's age is recorded (file tail). VEILCOST (B696): the sample. ⚠ LINE-NEUTRAL fold, code before the comment.
     // aarch64: stash and leave — but ONLY when a cash is actually coming, i.e. this pass is a
     // present's, whose epilogue calls `composite_tail_owed` a few instructions from now with IRQs
     // restored. Any other caller cashes inline, exactly as the trunk does. See
@@ -6164,7 +6164,7 @@ fn composite_inner() -> CursorTail {
     // FOCUS-VIS — one snapshot of the shell's z for the whole pass, so every window in it is judged
     // against the same shell position (a concurrent focus change either lands wholly before this pass
     // or is serviced by the composite that change performs itself).
-    let shell = shell_z();
+    let shell = shell_z(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] zoom_note_pass(&rows, &dirty, &bands);
     // FOCUS-HL: one snapshot per pass, for the same reason `shell` is one snapshot per pass — every
     // window in this pass is judged against a single focus owner, so no pass can draw two highlights.
     let focus = focus_asid();
@@ -18900,7 +18900,7 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     // future reorder, on the arm that actually disturbs the sprite.
     #[cfg(feature = "witness")]
     F2W_DRAINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let sprite_hit = super::cursor::sprite_box()
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] zoom_note_boxes(&boxes[..n]); let sprite_hit = super::cursor::sprite_box()
         .map(|sb| boxes[..n].iter().any(|&b| b.2 != 0 && b.3 != 0 && boxes_overlap(sb, b)))
         .unwrap_or(false);
     if sprite_hit {
@@ -31919,5 +31919,30 @@ pub mod a11yshadow {
     /// Epoch re-lays since boot.
     pub fn relays() -> u32 {
         RELAYS.load(Relaxed)
+    }
+}
+
+// ZOOMCOST (rmbp-ledger B835; BP-video-26) — TAIL-APPENDED bodies of two LINE-NEUTRAL folds. The lens presents only the
+// source rows a composite pass wrote, and only this file can read the pass's damage set: `composite_inner` calls
+// `zoom_note_pass` once the occlusion closure has made its rows/dirty/bands final (each dirty row's `damaged_box`, the
+// rect the pass writes), and `drain_deferred` calls `zoom_note_boxes` with the erase boxes it drained. Both only name
+// rows to `zoom::note_rows` (one relaxed load with the lens off); `zoom::on_damage` commits them after the pixels.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn zoom_note_pass(rows: &[Window], dirty: &[bool], bands: &[Option<(usize, usize)>]) {
+    for (i, r) in rows.iter().enumerate() {
+        if !r.used || !dirty.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let (_, y, _, h) = damaged_box(r, bands.get(i).copied().flatten());
+        super::zoom::note_rows(y, h);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn zoom_note_boxes(boxes: &[(usize, usize, usize, usize)]) {
+    for &(_, y, w, h) in boxes {
+        if w != 0 {
+            super::zoom::note_rows(y, h);
+        }
     }
 }
