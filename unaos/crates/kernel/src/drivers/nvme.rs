@@ -13,16 +13,19 @@
 //! (`block::register_nvme`) — the free-function registry shape AHCI's first rung (rmbp-ledger B89)
 //! established. NVMe 1.4 base specification, cleanroom: no driver code from any other OS was consulted.
 //!
-//! **Polled, never interrupted:** every completion queue is created with `IEN=0` and no MSI/MSI-X
-//! vector is touched; a command's completion is polled on the CQ phase bit against a TSC deadline
-//! ([`T_CMD_MS`]). A miss prints `[nvme] cmd timeout opcode=0x<op> ...` and MARKS the controller
+//! **Polled, with one completion vector (NVMEMSIX, zenbook-ledger Z45):** a command's completion is polled on the CQ
+//! phase bit against a TSC deadline ([`T_CMD_MS`]) — the phase bit is the ONLY authority. The I/O CQ is created with
+//! `IEN=1, IV=0` and [`arm_irq`] points MSI-X table entry 0 (else single-message MSI) at a `vectors::alloc`'d vector
+//! whose handler only sets a hint and counts (`irqs=` on the test line); the admin queue shares vector 0 and is idle
+//! after probe, so it stays polled with no INTMS/INTMC write. A miss prints `[nvme] cmd timeout opcode=0x<op> ...` and MARKS the controller
 //! (DONGLEBOOT's rule, rmbp-ledger B658): every later command is refused at once.
 //!
 //! **Rung 2 — NVMEBOOT (zenbook-ledger Z9):** the namespace is `BlockHandle::Nvme` / `fs::fat::BlockSource::Nvme`,
 //! so the root walk sees it; the boot's NVMe root grant (one UnaFS extent, `block::hold_nvme_root_grant`)
 //! admits writes through `block::write_blocks_nvme`; [`flush`] (NVM Flush) is the commit barrier.
 //!
-//! **Does NOT (owed rows, docs/dev/blueprint/storage.md §5):** MSI-X; namespaces other than 1; TRIM; the
+//! **Does NOT (owed rows, docs/dev/blueprint/storage.md §5):** a vector per queue (NVME-MSIX-PERQ) or a wait that sleeps
+//! on the vector (NVME-IRQWAIT); namespaces other than 1; TRIM; the
 //! SMART/Health log page; an installer path onto the NVMe (NVMEINSTALL). NVME4KN (zenbook-ledger Z31): a 4096-byte-LBA
 //! namespace is served through the block layer's 512 B sector view (`block::read_sectors_nvme`, block.rs tail).
 //!
@@ -45,8 +48,8 @@
 //!
 //! ```text
 //! [nvme] bdf <b>:<s>.<f> <vid>:<did> bar0=0x<..> cap=0x<..> ver=<x.y.z> mqes=<n> dstrd=<n> to_ms=<n>   (bootlog)
-//! [nvme] ctrl  (the ready line: mn="<model>" ns=1 lba=<bytes> blocks=<n> -> ready; spelled once, at `probe`)
-//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> rbatch=<n> runs=<n> run_blocks=<n> rblocks=<n> rcmds=<n> lba=<bytes> shift=<9..12> rmw=<n>
+//! [nvme] ctrl  (the ready line: mn="<model>" ns=1 lba=<bytes> blocks=<n> -> ready irq=<msix|msi|none> vector=<0x<v>|->; spelled once, at `probe`)
+//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> rbatch=<n> runs=<n> run_blocks=<n> rblocks=<n> rcmds=<n> lba=<bytes> shift=<9..12> rmw=<n> irqs=<n>
 //! :: NVME: ctrl=ok ns=1 rw=ok -> PASS ::
 //! ```
 //!
@@ -217,6 +220,10 @@ fn submit(c: &mut Ctrl, admin: bool, cmd: &mut [u32; 16]) -> Result<u32, ()> {
     let start = crate::arch::now_cycles();
     let budget = cycles_ms(T_CMD_MS);
     loop {
+        // NVMEMSIX (Z45): the vector's hint is consumed first, then the phase bit decides — a hint never completes a
+        // command (the idle admin CQ shares the vector). Under `with_ctrl`'s masked hold the message latches in the
+        // LAPIC IRR and is delivered at the hold's release, so the hint is seen here only when another CPU took it.
+        let _hint = CQ_PENDING.swap(false, Ordering::AcqRel);
         let dw3 = unsafe { core::ptr::read_volatile((ent + 12) as *const u32) };
         if ((dw3 >> 16) & 1 == 1) == q.phase {
             break;
@@ -533,14 +540,14 @@ fn bring_up(bus: u8, slot: u8, func: u8, vend: u16, devid: u16, bar0: u64) -> Op
     c.nsze = nsze;
     c.lba_shift = lbads;
 
-    // CREATE I/O CQ (qid 1, physically contiguous, interrupts off), then CREATE I/O SQ on it.
+    // CREATE I/O CQ (qid 1, physically contiguous, interrupts on at vector 0 — NVMEMSIX, Z45), then CREATE I/O SQ on it.
     let qsz = ((io_depth - 1) as u32) << 16;
     let mut cmd = [0u32; 16];
     cmd[0] = ADM_CREATE_IO_CQ;
     cmd[6] = iocq as u32;
     cmd[7] = (iocq >> 32) as u32;
     cmd[10] = qsz | IO_QID as u32;
-    cmd[11] = 1; // PC=1, IEN=0
+    cmd[11] = 0b11; // PC=1, IEN=1, IV=0 (NVMEMSIX, Z45: MSI-X entry 0 / the one MSI message, shared with the idle admin CQ)
     submit(&mut c, true, &mut cmd).ok()?;
     let mut cmd = [0u32; 16];
     cmd[0] = ADM_CREATE_IO_SQ;
@@ -573,9 +580,14 @@ pub fn probe() {
         }
     };
     let (mn, lba, blocks) = (c.mn, 1u32 << c.lba_shift, c.nsze); XFER_SECTORS.store((c.max_xfer / 512) as u32, Ordering::Relaxed); // NVMEBATCHREAD (Z24): the read-ahead window `fs::unafs::ra_window` gives the NVMe, set before `c` moves; NVME4KN (Z31): in 512 B view sectors on EVERY namespace (the one unit)
+    let (irq, vector) = arm_irq(bus, slot, func, bar0); // NVMEMSIX (Z45): one completion vector, after every admin command
     crate::arch::without_interrupts(|| *CTRL.lock() = Some(c));
     if crate::drivers::block::register_nvme(blocks, lba, &mn) {
-        serial_println!("[nvme] ctrl mn=\"{}\" ns=1 lba={} blocks={} -> ready", trimmed(&mn), lba, blocks);
+        if irq == "none" {
+            serial_println!("[nvme] ctrl mn=\"{}\" ns=1 lba={} blocks={} -> ready irq=none vector=-", trimmed(&mn), lba, blocks);
+        } else {
+            serial_println!("[nvme] ctrl mn=\"{}\" ns=1 lba={} blocks={} -> ready irq={} vector={:#04x}", trimmed(&mn), lba, blocks, irq, vector);
+        }
     }
 }
 
@@ -617,8 +629,8 @@ pub fn selftest() {
     };
     let (runs, run_blocks) = crate::drivers::block::nvme_run_census(); // NVMEBATCH (Z22)
     serial_println!(
-        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} rbatch={} runs={} run_blocks={} rblocks={} rcmds={} lba={} shift={} rmw={}",
-        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), LAST_RBATCH.load(Ordering::Relaxed), runs, run_blocks, IO_READ_BLOCKS.load(Ordering::Relaxed), IO_READ_CMDS.load(Ordering::Relaxed), dev.block_size, dev.block_size.trailing_zeros(), crate::drivers::block::nvme_rmw_count() // NVME4KN (Z31): the namespace's LBA size, its shift, and the sub-LBA writes served by read-modify-write this boot
+        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} rbatch={} runs={} run_blocks={} rblocks={} rcmds={} lba={} shift={} rmw={} irqs={}",
+        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), LAST_RBATCH.load(Ordering::Relaxed), runs, run_blocks, IO_READ_BLOCKS.load(Ordering::Relaxed), IO_READ_CMDS.load(Ordering::Relaxed), dev.block_size, dev.block_size.trailing_zeros(), crate::drivers::block::nvme_rmw_count(), IRQS.load(Ordering::Relaxed) // NVMEMSIX (Z45): `irqs=` the completion interrupts fired this boot; NVME4KN (Z31): the namespace's LBA size, its shift, and the sub-LBA writes served by read-modify-write this boot
     );
     let ctrl = if identify { "ok" } else { "bad" };
     let root = root_leg();
@@ -776,4 +788,48 @@ fn read_legs(lba: u64, orig: &[u8], expect: u32) -> &'static str {
         }
     }
     "ok"
+}
+
+// ══════════ NVMEMSIX (zenbook-ledger Z45) — one completion vector for the I/O CQ ══════════
+
+/// NVMEMSIX: set by [`nvme_msi_handler`], consumed (swapped false) on each spin of [`submit`]'s poll. A hint only.
+static CQ_PENDING: AtomicBool = AtomicBool::new(false);
+/// NVMEMSIX: completion interrupts delivered this boot (`irqs=` on the test line; > 0 on QEMU = the vector fires).
+static IRQS: AtomicU32 = AtomicU32::new(0);
+
+/// NVMEMSIX: the vector's handler — the xhci1 shape (`drivers/xhci/mod.rs` `xhci1_msi_handler`): lock-free, bounded, no
+/// MMIO (MSI/MSI-X are messages: nothing to ack on the device), no `CTRL`, no print; EOI last.
+extern "x86-interrupt" fn nvme_msi_handler(_f: x86_64::structures::idt::InterruptStackFrame) {
+    CQ_PENDING.store(true, Ordering::Release);
+    IRQS.fetch_add(1, Ordering::Relaxed);
+    crate::arch::apic::eoi();
+}
+
+/// NVMEMSIX: arm the one completion vector, after `bring_up`'s last admin command. MSI-X entry 0 through the existing
+/// `PciScanner::enable_msix` once `msix_map_table` has mapped the table; else single-message MSI (`enable_msi`); else
+/// polled. Returns `("msix"|"msi"|"none", vector)`; every non-MSI-X answer prints its refusal by name. No INTMS/INTMC
+/// write (NVMe 1.4 §3.1.3/§3.1.4: not under MSI-X; under one MSI message the admin and I/O CQs share vector 0, and the
+/// admin queue is idle after probe — NVME-INTMS owed if that changes).
+fn arm_irq(bus: u8, slot: u8, func: u8, bar0: u64) -> (&'static str, u8) {
+    let table = crate::drivers::pci::PciScanner::msix_map_table(bus, slot, func, bar0);
+    let Some(v) = crate::arch::interrupts::vectors::alloc("nvme", nvme_msi_handler) else {
+        serial_println!("[nvme] irq polled why=no-vector — completions stay on the phase-bit poll");
+        return ("none", 0);
+    };
+    let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
+    let msix_why = match table {
+        Ok(()) => {
+            if crate::drivers::pci::PciScanner::enable_msix(bus, slot, func, bar0, msg_addr, v as u32) {
+                return ("msix", v);
+            }
+            "msix-refused"
+        }
+        Err(why) => why,
+    };
+    if crate::drivers::pci::PciScanner::enable_msi(bus, slot, func, msg_addr, v as u32) {
+        serial_println!("[nvme] irq msi why={} — one MSI message, vector={:#04x}", msix_why, v);
+        return ("msi", v);
+    }
+    serial_println!("[nvme] irq polled why={},no-msi — completions stay on the phase-bit poll", msix_why);
+    ("none", 0)
 }
