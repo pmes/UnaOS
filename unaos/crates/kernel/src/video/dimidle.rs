@@ -84,7 +84,7 @@ pub fn service() {
     if WAKE_OWED.swap(false, Ordering::AcqRel) {
         if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) {
             fb.fill_screen(super::wm::DESKTOP_BG);
-            fb.flush_all();
+            fb.flush_all(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::note_unnoted(); // ZOOMFURN (B848): an unnamed RAM-frame write owes the lens one whole present, counted. ⚠ LINE-NEUTRAL fold.
             let (w, h) = (fb.width(), fb.height());
             let _ = super::wm::damage_intersecting(0, 0, w, h);
         }
@@ -97,7 +97,7 @@ pub fn service() {
         if now.wrapping_sub(LAST_ACTIVITY_MS.load(Ordering::Relaxed)) >= th {
             if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) {
                 fb.fill_screen(0);
-                fb.flush_all();
+                fb.flush_all(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::note_unnoted(); // ZOOMFURN (B848): an unnamed RAM-frame write owes the lens one whole present, counted. ⚠ LINE-NEUTRAL fold.
                 BLANKED_AT_MS.store(now.max(1), Ordering::Relaxed);
                 BLANKED.store(true, Ordering::Release);
             }
