@@ -12,7 +12,7 @@ pub use pixel_core::{
     decode_qoi, decode_webp, sniff,
 };
 /// NLE5 (SR204): pixel_core's PNG writer (APPRES B398 / SHOTZIP), the one Stria's editor export encodes with.
-pub use pixel_core::png::encode::{PngError, encode_rgba};
+pub use pixel_core::png::encode::{PngError, encode_rgba}; pub use pixel_core::facts_of; // ADOPTPNG (SR405): the ONE header reader, the PNG export's per-frame readback
 
 /// HEVCHEIC (SR220): is this an HEIF still that may hold HEVC images (brand `heic` / `heix`, or `mif1` without AVIF)?
 /// demux_core's own answer ([`demux_core::heif::is_heic`]).

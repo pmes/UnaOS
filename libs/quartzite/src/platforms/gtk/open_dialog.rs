@@ -15,7 +15,16 @@ use gtk4::prelude::*;
 /// Show the open dialog over `parent`, offering the files whose names end in one of `filters` (extensions without the
 /// dot; empty = any file), and answer the chosen file's path, or `None` when it was dismissed (or failed). Main context.
 pub async fn choose(parent: Option<&gtk4::Window>, filters: &[String]) -> Option<PathBuf> {
+    choose_in(parent, filters, None).await
+}
+
+/// [`choose`], opening in `folder` when given (SAVERECENTOPEN, SR403: the Aether chrome's Ctrl/Cmd+O sends the recent
+/// folder, as the save dialog's `set_initial_folder` does for a Save As).
+pub async fn choose_in(parent: Option<&gtk4::Window>, filters: &[String], folder: Option<&str>) -> Option<PathBuf> {
     let dialog = gtk4::FileDialog::new();
+    if let Some(f) = folder {
+        dialog.set_initial_folder(Some(&gtk4::gio::File::for_path(f)));
+    }
     if !filters.is_empty() {
         let filter = gtk4::FileFilter::new();
         for ext in filters {
@@ -29,12 +38,13 @@ pub async fn choose(parent: Option<&gtk4::Window>, filters: &[String]) -> Option
     dialog.open_future(parent).await.ok().and_then(|f| f.path())
 }
 
-/// Show the open dialog over `widget`'s window and answer `OpenPanelChose { url, path }`: the chosen file's path, or
-/// `None` when the dialog was dismissed (or failed). Main context only.
-pub fn run(widget: &impl IsA<gtk4::Widget>, url: String, filters: Vec<String>, syn: Synapse) {
+/// Show the open dialog over `widget`'s window (opening in `folder` when given: SAVERECENTOPEN, SR403) and answer
+/// `OpenPanelChose { url, path }`: the chosen file's path, or `None` when the dialog was dismissed (or failed). Main
+/// context only.
+pub fn run(widget: &impl IsA<gtk4::Widget>, url: String, filters: Vec<String>, folder: Option<String>, syn: Synapse) {
     let parent = widget.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
     gtk4::glib::spawn_future_local(async move {
-        let path = choose(parent.as_ref(), &filters).await.map(|p| p.to_string_lossy().into_owned());
+        let path = choose_in(parent.as_ref(), &filters, folder.as_deref()).await.map(|p| p.to_string_lossy().into_owned());
         syn.fire(SMessage::OpenPanelChose { url, path });
     });
 }

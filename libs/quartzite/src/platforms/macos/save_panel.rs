@@ -27,13 +27,7 @@ pub fn run(url: String, name: &str, folder: Option<&str>, syn: &bandy::Synapse) 
             let _: () = msg_send![panel, setNameFieldStringValue: &*seed];
             let _: () = msg_send![panel, setCanCreateDirectories: Bool::YES];
             // SAVERECENT (SR391): the initial directory.
-            if let Some(f) = folder {
-                let dir = NSString::from_str(f);
-                let u: *mut AnyObject = msg_send![class!(NSURL), fileURLWithPath: &*dir, isDirectory: Bool::YES];
-                if !u.is_null() {
-                    let _: () = msg_send![panel, setDirectoryURL: u];
-                }
-            }
+            set_directory(panel, folder);
             let response: isize = msg_send![panel, runModal];
             if response != MODAL_OK {
                 None
@@ -49,4 +43,17 @@ pub fn run(url: String, name: &str, folder: Option<&str>, syn: &bandy::Synapse) 
         }
     };
     syn.fire(bandy::SMessage::SavePanelChose { url, path });
+}
+
+/// SAVERECENT (SR391) / SAVERECENTOPEN (SR403): open `panel` (an NSSavePanel, or its subclass NSOpenPanel) in `folder`
+/// when given (`setDirectoryURL:`); the save panel and the open panel share it. Main thread only; `panel` non-null.
+pub(super) unsafe fn set_directory(panel: *mut AnyObject, folder: Option<&str>) {
+    let Some(f) = folder else { return };
+    let dir = NSString::from_str(f);
+    unsafe {
+        let u: *mut AnyObject = msg_send![class!(NSURL), fileURLWithPath: &*dir, isDirectory: Bool::YES];
+        if !u.is_null() {
+            let _: () = msg_send![panel, setDirectoryURL: u];
+        }
+    }
 }

@@ -16,8 +16,9 @@ const MODAL_OK: isize = 1;
 
 /// Show the open panel (app-modal, one file, no folders), offering the files whose names end in one of `filters`
 /// (extensions without the dot; empty = any file), and answer `OpenPanelChose { url, path }`: the chosen file's path,
-/// or `None` when the person cancelled (or no panel could be made). Main thread only.
-pub fn run(url: String, filters: &[String], syn: &bandy::Synapse) {
+/// or `None` when the person cancelled (or no panel could be made). SAVERECENTOPEN (SR403): opening in `folder` when
+/// given (`save_panel::set_directory`, the save panel's own). Main thread only.
+pub fn run(url: String, filters: &[String], folder: Option<&str>, syn: &bandy::Synapse) {
     let path = unsafe {
         let panel: *mut AnyObject = msg_send![class!(NSOpenPanel), openPanel];
         if panel.is_null() {
@@ -26,6 +27,7 @@ pub fn run(url: String, filters: &[String], syn: &bandy::Synapse) {
             let _: () = msg_send![panel, setCanChooseFiles: Bool::YES];
             let _: () = msg_send![panel, setCanChooseDirectories: Bool::NO];
             let _: () = msg_send![panel, setAllowsMultipleSelection: Bool::NO];
+            super::save_panel::set_directory(panel, folder); // SAVERECENTOPEN (SR403)
             if !filters.is_empty() {
                 let exts: Vec<Retained<NSString>> = filters.iter().map(|e| NSString::from_str(e)).collect();
                 let refs: Vec<&NSString> = exts.iter().map(|e| &**e).collect();

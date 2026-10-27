@@ -1037,14 +1037,24 @@ refs/heads/exec-rmbp-nvme4kn   aeeb4db92 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-dwi2cacpi   8c0a22894 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookflightlist   684d7b05a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kernelsizekey   7bf419701 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-saverecentopen   97f2c923f cut 2026-10-27 (wave36 batch 15)
+refs/heads/exec-rmbp-saverecentopen   88eeb65f3 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdf4size   663c8faa7 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-adoptpng   97f2c923f cut 2026-10-27 (wave36 batch 15)
+refs/heads/exec-rmbp-adoptpng   9ee178a2b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-mt7925s7   ca04e8026 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookdocsrefresh   50334f7bb FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootledstest   9a4ea2fd7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aacenctnsdown   b3def5e82 cut 2026-10-27 (wave36 batch 16)
-refs/heads/exec-rmbp-zenbookecgpe   b3def5e82 cut 2026-10-27 (wave36 batch 16)
-refs/heads/exec-rmbp-dsdtone   b3def5e82 cut 2026-10-27 (wave36 batch 16)
-refs/heads/exec-rmbp-flightlistboardtags   b3def5e82 cut 2026-10-27 (wave36 batch 16)
-refs/heads/exec-rmbp-kernelpresentpolicy   b3def5e82 cut 2026-10-27 (wave36 batch 16)
+refs/heads/exec-rmbp-zenbookecgpe   dc1814ec9 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-dsdtone   353c891c8 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-flightlistboardtags   3a52111bd FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kernelpresentpolicy   1e744ddc9 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-mt7925s8   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
+refs/heads/exec-rmbp-zenbookledgerhead   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
+refs/heads/exec-rmbp-nvme4knfixture   b1f383796 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-exportsizepolicypixel   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
+refs/heads/exec-rmbp-pdf4kernel   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
+refs/heads/exec-rmbp-zenbooksci   847b2bd32 cut 2026-10-27 (wave36 batch 18)
+refs/heads/exec-rmbp-dwi2cgpio   847b2bd32 cut 2026-10-27 (wave36 batch 18)
+refs/heads/exec-rmbp-zenbookacpcodec   847b2bd32 cut 2026-10-27 (wave36 batch 18)
+refs/heads/exec-rmbp-pagesavecssurls   847b2bd32 cut 2026-10-27 (wave36 batch 18)
+refs/heads/exec-rmbp-hidbootarm   847b2bd32 cut 2026-10-27 (wave36 batch 18)
