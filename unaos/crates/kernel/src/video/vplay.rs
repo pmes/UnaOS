@@ -51,7 +51,7 @@ use demux_core::{colour::Colour, Codec, Demuxer};
 /// VFS read chain with margin; `[vplay] job exit … stack high=` re-derives it on metal.
 pub const STACK: usize = 256 * 1024;
 /// Frames decoded ahead of the clock.
-const QUEUE: usize = 3;
+const QUEUE: usize = vplay_queue(option_env!("UNAOS_VPLAY_QUEUE")); // KERNELSCALECOLS (rmbp-ledger B978): the build knob, default 3 (file tail)
 /// The largest file the job reads whole (the demuxer takes the bytes).
 const FILE_CAP: u64 = 96 << 20;
 /// The ring has this long to arm before the picture runs on the wall clock.
@@ -388,13 +388,16 @@ struct Play {
     audio_seen: bool,
     /// NLE6 (SR207): `(output tick, ordinal)` of each presented frame that carries one (at most [`SHOWN_CAP`]).
     shown: Vec<(i64, u32)>,
+    /// KERNELSCALECOLS (B978): the presents' blit cycles, summed, and the largest one (`present_us`, file tail).
+    present_cyc: u64,
+    present_max: u64,
 }
 
 static PLAY: crate::sync::Mutex<Play> = crate::sync::Mutex::new(Play::new());
 
 impl Play {
     const fn new() -> Play {
-        Play { presented: 0, dropped: 0, sync_sum: 0, sync_n: 0, sync_max: 0, by_audio: 0, by_wall: 0, media_ms: 0, wall_ms: 0, open_ms: 0, audio_expected: false, audio_seen: false, shown: Vec::new() }
+        Play { presented: 0, dropped: 0, sync_sum: 0, sync_n: 0, sync_max: 0, by_audio: 0, by_wall: 0, media_ms: 0, wall_ms: 0, open_ms: 0, audio_expected: false, audio_seen: false, shown: Vec::new(), present_cyc: 0, present_max: 0 }
     }
 }
 
@@ -552,7 +555,7 @@ pub fn present(dst: &mut [u32], w: usize, vh: usize, audio_ms: Option<u64>, play
             p.shown.push(o); // NLE6 (SR207): the presented frame counter
         }
     }
-    let vh = view_band(dst, w, vh, f.pts_ms); blit_fit(dst, w, 0, 0, w, vh, &f, Some(0)); // NLE6KEYS (rmbp-ledger B961): the EDL's track view in the picture rect's lower band (file tail)
+    let vh = view_band(dst, w, vh, f.pts_ms); let c0 = crate::arch::now_cycles(); blit_fit(dst, w, 0, 0, w, vh, &f, Some(0)); present_cost(c0); // NLE6KEYS (rmbp-ledger B961): the EDL's track view in the picture rect's lower band (file tail)
     (true, media)
 }
 
@@ -2022,8 +2025,9 @@ impl timeline_core::view::Text for ViewLabels {
 // exporter, `edl_mix`, the `coded` and face-preview hashes) calls [`Px::rgb`]: the existing full conversion (`colour_rgba_vp8`
 // / `colour_rgba_av1` -> `pack`), once, cached, so every pin hashes the bytes it hashed before. The present path
 // ([`Frame::rows`]) converts only the rows the window shows: VP8 (Nearest) sampled by `yuv_core::scale::nearest_rows` and
-// converted per output row by `yuv_core::to_rgba`; AV1 (Bilinear) one sampled source row at a time by `yuv_core::to_rgba_rows`
-// (its neighbour chroma rows read from the whole planes), the columns then sampled; every row and column index is the
+// converted per output row by `yuv_core::to_rgba`; AV1 (Bilinear) one sampled source row at a time by `yuv_core::to_rgba_cols`
+// over the distinct sampled columns only (KERNELSCALECOLS B978; its neighbour chroma read from the whole planes), the output
+// gathered from them; every row and column index is the
 // scaler's own. Bit for bit the full conversion then nearest-sampled. A dropped or run-up frame converts nothing. One holder
 // at a time (the job, the queue under `JOB`, the presenting pass, the poster under `POSTER`): no lock of its own.
 
@@ -2095,16 +2099,20 @@ impl Frame {
             }
             (None, Src::Av1(pl, c)) => {
                 let (p, m) = av1_picture(pl, *c);
-                let idx: Vec<u32> = (0..self.h as u32).collect(); // the source row each output row samples: the scaler's own index
-                let (mut one, mut rgba) = ([0u32; 1], alloc::vec![0u8; self.w * 4]);
+                let idx: Vec<u32> = (0..self.h.max(self.w) as u32).collect(); // the source row / column each output row / column samples: the scaler's own index
+                let mut sxs = alloc::vec![0u32; dw];
+                yuv_core::scale::nearest_rows(&mono(self.w, 1, &idx), dw, 1, &mut sxs, &mut [], &mut [], |_, _| {});
+                let (cols, at) = distinct(&sxs); // KERNELSCALECOLS (B978): convert only the distinct sampled source columns
+                let (mut one, mut rgba) = ([0u32; 1], alloc::vec![0u8; cols.len() * 4]);
                 let mut line: (usize, Vec<u32>) = (usize::MAX, Vec::new());
                 yuv_core::scale::nearest_rows(&mono(1, self.h, &idx), 1, dh, &mut one, &mut [], &mut [], |r, s| {
                     let sy = s.y[0] as usize;
                     if line.0 != sy {
-                        yuv_core::to_rgba_rows(&p, sy, sy + 1, m, yuv_core::Chroma::Bilinear, false, &mut rgba);
+                        yuv_core::to_rgba_cols(&p, sy, sy + 1, cols.iter().map(|&x| x as usize), m, yuv_core::Chroma::Bilinear, false, &mut rgba);
                         line = (sy, pack(&rgba));
                     }
-                    yuv_core::scale::nearest_rows(&mono(self.w, 1, &line.1), dw, 1, &mut out, &mut [], &mut [], |_, t| row(r, t.y));
+                    out.iter_mut().zip(&at).for_each(|(o, &i)| *o = line.1[i as usize]);
+                    row(r, &out);
                 });
             }
             (None, Src::Rgb) => {}
@@ -2314,4 +2322,64 @@ pub fn edit_drag_end(path: &str) -> Option<u64> {
 /// Drop a live drag (the Player closed); `true` when one was live (the caller cancels its pointer capture).
 pub fn edit_drag_take() -> bool {
     DRAG.lock().take().is_some()
+}
+
+// ── KERNELSCALECOLS (rmbp-ledger B978): the AV1 present's column list, its cost, the queue knob (handlers.md §5 NLEPROBE-HDR) ──
+// KERNEL-SCALE-BILINEAR-COLS: [`Frame::rows`]' AV1 arm converts each sampled source row over only the DISTINCT sampled source
+// columns (`yuv_core::to_rgba_cols`, the ONE loop; Bilinear's far chroma read from the whole planes as before) and gathers the
+// output row from them: a 1080p picture in a 640x360 fit converts 360 x 640 = 230,400 pixels per present where it converted
+// 691,200; an upscale converts w per row as before; bit for bit the former present. KERNEL-SCALE-PRESENT-COST: [`present`]
+// times its `blit_fit` (the conversion and the scale) into `Play` under `PLAY`, reset by every open; `[player] ended ...
+// present_us=<mean> present_max_us=<max> queue=<n>` prints it. VPLAY-QUEUE-KNOB: `UNAOS_VPLAY_QUEUE=<1..=16>` at BUILD time
+// (`option_env!`, the `UNAOS_PPI` shape: unset or empty = 3, anything else refused by name), [`QUEUE`].
+
+/// The scaler's column map `sxs` (monotone) as its distinct source columns, ascending, and each output column's index into them.
+fn distinct(sxs: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let (mut cols, mut at): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::with_capacity(sxs.len()));
+    for &x in sxs {
+        if cols.last() != Some(&x) {
+            cols.push(x);
+        }
+        at.push(cols.len() as u32 - 1);
+    }
+    (cols, at)
+}
+
+/// One present's blit, started at cycle `c0`, into the play's cost.
+fn present_cost(c0: u64) {
+    let dt = crate::arch::now_cycles().saturating_sub(c0);
+    let mut p = PLAY.lock();
+    p.present_cyc = p.present_cyc.saturating_add(dt);
+    p.present_max = p.present_max.max(dt);
+}
+
+/// `(mean present us, largest present us, queue depth)` of the play: the `[player] ended` line's cost tokens.
+pub fn present_us() -> (u64, u64, usize) {
+    let p = PLAY.lock();
+    let us = crate::video::blitter::cycles_to_us;
+    (us(p.present_cyc) / p.presented.max(1), us(p.present_max), QUEUE)
+}
+
+/// `UNAOS_VPLAY_QUEUE`: unset or empty = 3 frames; a decimal 1..=16 (0 would never let `room` pass, 16 AV1 1080p frames hold
+/// about 100 MB of planes); anything else fails the build by name.
+const fn vplay_queue(s: Option<&str>) -> usize {
+    let b = match s {
+        None => return 3,
+        Some(s) => s.as_bytes(),
+    };
+    if b.is_empty() {
+        return 3;
+    }
+    let (mut v, mut i) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i] < b'0' || b[i] > b'9' || v > 16 {
+            panic!("UNAOS_VPLAY_QUEUE must be 1..=16 frames");
+        }
+        v = v * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    if v == 0 || v > 16 {
+        panic!("UNAOS_VPLAY_QUEUE must be 1..=16 frames");
+    }
+    v
 }

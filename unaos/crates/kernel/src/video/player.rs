@@ -1119,10 +1119,10 @@ mod vid {
         if st.playing && st.vsaid && st.err.is_none() && vplay::finished() && !busy {
             st.playing = false;
             st.ended = true;
-            let (dec, pres, drop, sync, smax, clk) = vplay::stats();
+            let (dec, pres, drop, sync, smax, clk) = vplay::stats(); let pu = vplay::present_us(); // KERNELSCALECOLS (rmbp-ledger B978): the present cost and the queue depth
             serial_println!(
-                "[player] ended path={} at_ms={} frames={} presented={} dropped={} av_sync_ms={} max={} clock={}",
-                st.path, clock, dec, pres, drop, sync, smax, clk
+                "[player] ended path={} at_ms={} frames={} presented={} dropped={} av_sync_ms={} max={} clock={} present_us={} present_max_us={} queue={}",
+                st.path, clock, dec, pres, drop, sync, smax, clk, pu.0, pu.1, pu.2
             );
             controls = true;
         }
