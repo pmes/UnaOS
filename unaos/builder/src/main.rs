@@ -342,7 +342,6 @@ fn main() {
     let mut kernel_cmd = Command::new("cargo");
     kernel_cmd
         .current_dir(workspace_dir.join("crates/kernel"))
-        .arg("+nightly")
         .arg("build")
         .arg("--release")
         .arg("--target").arg("../../x86_64-unaos.json")
@@ -1225,7 +1224,6 @@ fn main() {
     let mut bootloader_cmd = Command::new("cargo");
     bootloader_cmd
         .current_dir(workspace_dir.join("crates/bootloader"))
-        .arg("+nightly")
         .arg("build")
         .arg("--release")
         .arg("--target").arg("x86_64-unknown-uefi")

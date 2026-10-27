@@ -1,4 +1,7 @@
 [toolchain]
-channel = "nightly"
-components = ["rust-src", "rustfmt", "clippy"]
+# TOOLCHAIN-ONE (B1018): THE one pin. Nothing passes `+<toolchain>` (arroyo, builder, scripts); arroyo exports this channel as
+# RUSTUP_TOOLCHAIN. The bench and the seat move it together, by a ledger row. A dated channel is its own toolchain dir:
+# every builder downloads it once (~300 MB with rust-src). llvm-tools: arroyo's TOOLBIN llvm-objcopy / llvm-nm / llvm-strip.
+channel = "nightly-2026-10-26"
+components = ["rust-src", "rustfmt", "clippy", "llvm-tools"]
 # We need the source to compile the core library for the bare-metal kernel
