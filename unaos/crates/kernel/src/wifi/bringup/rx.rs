@@ -389,15 +389,10 @@ pub(super) fn arm(bar0: u64, bus: u8, dev: u8, func: u8, w: &mut Writes, tag: &'
     }
     let cmd_post = unsafe { read_config_16(bus, dev, func, 0x04) };
     // ── Ring + buffers: host memory, VA == PA on this kernel's x86 identity map (ahci.rs's `bus_addr`). ──
-    let ring_l = core::alloc::Layout::from_size_align(RINGMEM, RINGMEM).ok();
-    let bufs_l = core::alloc::Layout::from_size_align(SLOTS * BUFSIZE, 4096).ok();
-    let (Some(rl), Some(bl)) = (ring_l, bufs_l) else {
-        return Err(String::from("layout — nothing programmed"));
-    };
     // Deliberately never freed: the engine owns this memory until RXCTL reads DISABLED, and a failed
-    // reset below would leave it owning it for the rest of the boot.
-    let ring = unsafe { alloc::alloc::alloc_zeroed(rl) } as u64;
-    let bufs = unsafe { alloc::alloc::alloc_zeroed(bl) } as u64;
+    // reset below would leave it owning it for the rest of the boot. DMAALLOCONE (B986): the one DMA allocator.
+    let ring = crate::arch::memory::dma::ident(RINGMEM, RINGMEM);
+    let bufs = crate::arch::memory::dma::ident(SLOTS * BUFSIZE, 4096);
     if ring == 0 || bufs == 0 {
         return Err(String::from("no-memory — nothing programmed"));
     }

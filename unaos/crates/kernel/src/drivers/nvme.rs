@@ -138,13 +138,10 @@ fn db_off(index: u16, dstrd: u32) -> u64 {
 }
 
 /// Zeroed, aligned, DMA-visible memory; 0 on failure. Heap addresses ARE bus addresses (the identity
-/// map, the same standing property `drivers/ahci.rs`'s `bus_addr` names). Never freed: the controller
+/// map, stated once in `arch::memory::dma::ident`, DMAALLOCONE B986). Never freed: the controller
 /// owns these rings for as long as `CC.EN` is set, and this arc has no teardown.
 fn dma_alloc(size: usize) -> u64 {
-    match core::alloc::Layout::from_size_align(size, PAGE) {
-        Ok(l) => unsafe { alloc::alloc::alloc_zeroed(l) as u64 },
-        Err(_) => 0,
-    }
+    crate::arch::memory::dma::ident(size, PAGE)
 }
 
 /// One queue pair: the SQ and CQ rings (one page each), the SQ tail we own, the CQ head we own, and
