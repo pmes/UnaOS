@@ -15,6 +15,7 @@
 //! `#![no_std]`, no `alloc`, no dependencies: the caller owns the RGBA buffer.
 #![no_std]
 #![forbid(unsafe_code)]
+pub mod scale; // KERNELSCALEONE (rmbp-ledger B965): the ONE nearest resampler (`fit`, `nearest_rows`), user-stria's and the kernel Player's
 
 /// (Kr, Kb) x 10000 of BT.601 and BT.709 (H.273 Table 4).
 pub const KR_KB_601: (i64, i64) = (2990, 1140);
