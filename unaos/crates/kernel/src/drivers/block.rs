@@ -3993,10 +3993,10 @@ pub mod wait {
 /// controller lock through.
 #[cfg(all(target_arch = "x86_64", any(feature = "ahci", feature = "nvme")))]
 pub mod hold {
-    /// Interrupts masked for the whole hold (no preemption inside it); `take` (the caller's own `try_lock`, so
+    /// Preempt-off for the whole hold (no preemption inside it; interrupts as the caller had them, PREEMPTOFFAUDIT Z57); `take` (the caller's own `try_lock`, so
     /// LOCKREG names the driver's acquire site) is retried until it yields a guard or `bound_ms` elapses —
     /// `at_once` refuses on the first miss (a caller that never waits, e.g. the render task). A refusal runs
-    /// `refused(<TSC cycles spun>)` inside the mask (the driver's own line and counters); a taken guard runs
+    /// `refused(<TSC cycles spun>)` inside the hold (the driver's own line and counters); a taken guard runs
     /// `held(guard)`. `#[track_caller]` so the masked span (CLOCKCORE) is named at the driver's call.
     #[track_caller]
     pub fn with<G, R>(
@@ -4006,7 +4006,7 @@ pub mod hold {
         refused: impl FnOnce(u64) -> R,
         held: impl FnOnce(G) -> R,
     ) -> R {
-        crate::arch::without_interrupts(move || {
+        crate::arch::sched::preemptoff::scoped(move || { // PREEMPTOFFAUDIT (zenbook-ledger Z57): preempt-off, interrupts LEFT ON (was without_interrupts; the census: no ISR takes CTRL/PORTS)
             let t0 = crate::arch::now_cycles();
             let bound = super::wait::cycles_ms(bound_ms);
             let guard = loop {
