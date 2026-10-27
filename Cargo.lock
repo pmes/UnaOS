@@ -3502,6 +3502,7 @@ name = "pdf_core"
 version = "0.1.0"
 dependencies = [
  "crypto_core",
+ "font_core",
  "pixel_core",
  "svg_core",
 ]

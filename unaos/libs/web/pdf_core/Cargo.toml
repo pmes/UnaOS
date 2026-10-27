@@ -16,6 +16,9 @@ crypto_core = { path = "../../sys/crypto_core" }
 # PDF2 (LEDGER SR313): the renderer paints through svg_core (no_std + alloc): its path filler, stroker, shaders, clip
 # Mask and paint loop — one rasterizer, never a second. pixel_core also decodes DCTDecode images (`jpeg`).
 svg_core = { path = "../../media/svg_core" }
+# PDF3 (LEDGER SR314): font_core reads every embedded font program (TrueType / OpenType, CFF, Type 1) — never a second
+# font parser in pdf_core.
+font_core = { path = "../../text/font_core" }
 
 [features]
 default = ["std"]

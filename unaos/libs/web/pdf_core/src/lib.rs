@@ -24,6 +24,7 @@
 //! * [`content`]: the content-stream TOKENIZER (operands + operator, inline images) — PDF2 interprets it.
 //! * [`render`]: PDF2 (SR313) — the content interpreter (§8: graphics state, paths, clips, colour spaces, functions,
 //!   images, shadings, form XObjects) painting through svg_core's rasterizer; `Page::render`; text goes to a `TextSink`.
+//! * [`font`]: PDF3 (SR314) — font dictionaries, encodings and CMaps, glyph outlines through font_core, text extraction.
 //!
 //! Everything is bounded: nesting and reference chains by [`MAX_DEPTH`], object counts by [`MAX_OBJECTS`], every
 //! decoded stream by [`MAX_DECODED`], the page tree by [`MAX_PAGES`] and a visited set.
@@ -40,6 +41,7 @@ pub mod lexer;
 pub mod object;
 pub mod xref;
 pub mod render;
+pub mod font;
 pub mod crypt;
 
 pub use doc::{Document, Info, Page, XrefKind};
