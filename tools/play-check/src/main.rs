@@ -374,6 +374,7 @@ fn main() {
             }
         }
     }
+    extra += &profile_json(&info.video_profile); // HEVCLEVELLINE (SR368): "profile" / "tier" / "level"
     println!(
         "{{\"file\":\"{}\",\"video\":\"{}\",\"audio\":\"{}\",\"decoder\":\"{}\",\"audio_decoder\":\"{}\",\"sample_rate\":{},\"channels\":{},\"audio_clock\":{},\"real_video\":{},\"audio_note\":\"{}\",\"size\":[{},{}],\"duration\":{:.6},\"hz\":{hz},\"presented\":{},\"dropped\":{},\"repeated\":{},\"av_max_ms\":{:.3},\"pts\":[{}]{extra},\"ok\":{ok}}}",
         file,
@@ -663,5 +664,21 @@ mod tests {
         let av1 = hd.to_rgba_colour(Some(&bt709), Chroma::Bilinear);
         assert_eq!(fnv1a(&hd.to_rgba()), 0x0754_30e0, "the retired to_rgba hash of the HD frame");
         assert_eq!(fnv1a(&av1), 0x72e1_61fd, "an AV1 BT.709 limited bilinear frame_fnv");
+    }
+}
+
+/// HEVCLEVELLINE (LEDGER SR368): the Player's profile tokens (`MediaInfo::video_profile`, `profile=.. tier=.. level=..`)
+/// as JSON fields, one per `key=value` token; "" (no tokens) adds none.
+fn profile_json(tokens: &str) -> String {
+    tokens.split_whitespace().filter_map(|t| t.split_once('=')).map(|(k, v)| format!(",\"{k}\":\"{v}\"")).collect()
+}
+
+#[cfg(test)]
+mod profile_tests {
+    #[test]
+    fn profile_json_kat() {
+        assert_eq!(super::profile_json("profile=Main tier=main level=2"), ",\"profile\":\"Main\",\"tier\":\"main\",\"level\":\"2\"");
+        assert_eq!(super::profile_json("profile=High level=4.1"), ",\"profile\":\"High\",\"level\":\"4.1\"");
+        assert_eq!(super::profile_json(""), "");
     }
 }

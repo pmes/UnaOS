@@ -95,6 +95,9 @@ pub struct ProfileTierLevel {
     pub general_level_idc: u8,
     /// sub_layer_level_idc per sub-layer, when present.
     pub sub_layer_level_idc: Vec<Option<u8>>,
+    /// HEVCLEVELLINE (SR368): the 43 general constraint / reserved bits and general_inbld_flag, read MSB first (bit 43 =
+    /// general_max_12bit_constraint_flag); [`ProfileTierLevel::names`] reads the A.3 profile from them.
+    pub general_constraint_flags: u64,
 }
 
 pub fn parse_ptl(r: &mut BitReader, profile_present: bool, max_sub_layers_minus1: u32) -> ProfileTierLevel {
@@ -108,7 +111,7 @@ pub fn parse_ptl(r: &mut BitReader, profile_present: bool, max_sub_layers_minus1
         p.general_interlaced_source_flag = r.flag();
         p.general_non_packed_constraint_flag = r.flag();
         p.general_frame_only_constraint_flag = r.flag();
-        r.skip(44); // the 43 constraint / reserved bits and general_inbld_flag / reserved
+        p.general_constraint_flags = ((r.u(32) as u64) << 12) | r.u(12) as u64; // the 43 constraint / reserved bits and general_inbld_flag / reserved (HEVCLEVELLINE SR368)
     }
     p.general_level_idc = r.u(8) as u8;
     let n = max_sub_layers_minus1 as usize;
@@ -1237,4 +1240,93 @@ fn parse_pps_scc(r: &mut BitReader) -> Result<PpsScc> {
         e.palette_predictor_initializers = Some(init);
     }
     Ok(e)
+}
+
+// ---------------------------------------------------------------- profile names (A.3) — HEVCLEVELLINE (SR368)
+
+/// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): a profile_tier_level as the Player's info line names it — the A.3
+/// profile (A.3's name with spaces and ':' removed), the tier and the level (major, minor; general_level_idc is 30 times
+/// the level number, 255 is level 8.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ptl {
+    pub profile: &'static str,
+    /// "main" or "high".
+    pub tier: &'static str,
+    pub level: (u8, u8),
+}
+
+impl ProfileTierLevel {
+    /// general_max_12bit_constraint_flag (k 0) .. general_lower_bit_rate_constraint_flag (k 8), then
+    /// general_max_14bit_constraint_flag (k 9) for the profiles that carry it.
+    fn constraint(&self, k: u32) -> bool {
+        (self.general_constraint_flags >> (43 - k)) & 1 != 0
+    }
+
+    /// The A.3 names: general_profile_idc (0: the lowest general_profile_compatibility_flag set), the format range
+    /// extensions (4), high throughput (5) and screen content (9, 11) profiles by Table A.2's constraint flags
+    /// (max_12bit, max_10bit, max_8bit, max_422chroma, max_420chroma, max_monochrome, intra, one_picture_only); a
+    /// combination no row names keeps the family's name ("RExt", "HighThroughput", "SCC", "SCC-HT").
+    pub fn names(&self) -> Ptl {
+        let compat = |j: u32| self.general_profile_compatibility_flags & (1 << (31 - j)) != 0;
+        let idc = if self.general_profile_idc != 0 { self.general_profile_idc as u32 } else { (1..32).find(|&j| compat(j)).unwrap_or(0) };
+        let f: [bool; 8] = core::array::from_fn(|k| self.constraint(k as u32));
+        let b = |s: &str| -> bool { s.bytes().zip(f.iter()).all(|(c, &v)| (c == b'1') == v) };
+        let pick = |rows: &[(&'static str, &'static str)], other: &'static str| rows.iter().find(|r| b(r.0)).map_or(other, |r| r.1);
+        let profile = match idc {
+            1 => "Main",
+            2 if f[7] => "Main10Still",
+            2 => "Main10",
+            3 => "MainStill",
+            4 => pick(
+                &[
+                    ("11111100", "Monochrome"),
+                    ("11011100", "Monochrome10"),
+                    ("10011100", "Monochrome12"),
+                    ("00011100", "Monochrome16"),
+                    ("10011000", "Main12"),
+                    ("11010000", "Main422_10"),
+                    ("10010000", "Main422_12"),
+                    ("11100000", "Main444"),
+                    ("11000000", "Main444_10"),
+                    ("10000000", "Main444_12"),
+                    ("11111010", "MainIntra"),
+                    ("11011010", "Main10Intra"),
+                    ("10011010", "Main12Intra"),
+                    ("11010010", "Main422_10Intra"),
+                    ("10010010", "Main422_12Intra"),
+                    ("11100010", "Main444Intra"),
+                    ("11000010", "Main444_10Intra"),
+                    ("10000010", "Main444_12Intra"),
+                    ("00000010", "Main444_16Intra"),
+                    ("11100011", "Main444Still"),
+                    ("00000011", "Main444_16Still"),
+                ],
+                "RExt",
+            ),
+            5 => pick(
+                &[("11100000", "HighThroughput444"), ("11000000", "HighThroughput444_10"), ("00000000", "HighThroughput444_14"), ("00000010", "HighThroughput444_16Intra")],
+                "HighThroughput",
+            ),
+            6 => "MultiviewMain",
+            7 => "ScalableMain",
+            8 => "3DMain",
+            9 => pick(
+                &[("11111000", "ScreenExtendedMain"), ("11011000", "ScreenExtendedMain10"), ("11100000", "ScreenExtendedMain444"), ("11000000", "ScreenExtendedMain444_10")],
+                "SCC",
+            ),
+            10 => "ScalableRExt",
+            11 => pick(
+                &[
+                    ("11100000", "ScreenExtendedHighThroughput444"),
+                    ("11000000", "ScreenExtendedHighThroughput444_10"),
+                    ("00000000", "ScreenExtendedHighThroughput444_14"),
+                ],
+                "SCC-HT",
+            ),
+            _ => "Unknown",
+        };
+        let l = self.general_level_idc;
+        let level = if l == 255 { (8, 5) } else { (l / 30, (l % 30) / 3) };
+        Ptl { profile, tier: if self.general_tier_flag { "high" } else { "main" }, level }
+    }
 }
