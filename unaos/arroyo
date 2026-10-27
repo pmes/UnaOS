@@ -4002,7 +4002,7 @@ build_selfbuild_x86() {
     # a scratch path — UnaOS passes /apps/HELLO.C, the size its loader sees, <home>/kat2.tmp) before it is staged.
     rm -f "$sb/SYSKAT2.LNX"
     if _lnx_kat "$sb/SYSKAT2.LNX" "$c/syskat2.c" -mno-red-zone \
-        && { _lnx_deferred 2 SYSKAT2.LNX || "$sb/SYSKAT2.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; }; then
+        && { _lnx_deferred 2 SYSKAT2.LNX || "$sb/SYSKAT2.LNX" "$c/hello.c" "$(_fsize "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; }; then
         cp "$sb/SYSKAT2.LNX" "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
     else
         _sb_skip 2 SYSKAT2.LNX "$(_sb_kat_why "$sb/SYSKAT2.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
@@ -4012,7 +4012,7 @@ build_selfbuild_x86() {
     local lib="${WORKSPACE_DIR}/target/LIB"
     if [ ! -f "$lib/libc.a" ]; then
         if _selfbuild_fetch "$sb/musl" "$SELFBUILD_MUSL_URL" "$SELFBUILD_MUSL_REV" \
-            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC="$_LNX_CC" "${_LNX_TOOLS[@]}" CFLAGS="-O2" >/dev/null && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
+            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC="$_LNX_CC" "${_LNX_TOOLS[@]}" CFLAGS="-O2" >/dev/null && make -s -j"$(_ncpu)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
             rm -rf "$lib" && mkdir -p "$lib/include" "$lib/tcc/include" \
                 && cp "$sb/musl-out/lib/crt1.o" "$sb/musl-out/lib/crti.o" "$sb/musl-out/lib/crtn.o" "$sb/musl-out/lib/libc.a" "$lib/" \
                 && cp -r "$sb/musl-out/include/." "$lib/include/" \
@@ -4055,7 +4055,7 @@ build_selfbuild_x86() {
     # madvise), proven on the host kernel before it is staged.
     rm -f "$sb/SYSKAT3.LNX"
     if _lnx_kat "$sb/SYSKAT3.LNX" "$c/syskat3.c" -mno-red-zone \
-        && { _lnx_deferred 3 SYSKAT3.LNX || "$sb/SYSKAT3.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; }; then
+        && { _lnx_deferred 3 SYSKAT3.LNX || "$sb/SYSKAT3.LNX" "$c/hello.c" "$(_fsize "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; }; then
         cp "$sb/SYSKAT3.LNX" "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     else
         _sb_skip 3 SYSKAT3.LNX "$(_sb_kat_why "$sb/SYSKAT3.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
@@ -4065,7 +4065,7 @@ build_selfbuild_x86() {
         if _selfbuild_fetch "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" \
             && ( cd "$sb/busybox" && make -s defconfig >/dev/null 2>&1 \
                  && sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/; s/^# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/; s/^# CONFIG_FEATURE_PREFER_APPLETS is not set/CONFIG_FEATURE_PREFER_APPLETS=y/' .config \
-                 && (yes "" | make -s oldconfig >/dev/null 2>&1) && make -s -j"$(nproc)" >/dev/null 2>&1 ); then
+                 && (yes "" | make -s oldconfig >/dev/null 2>&1) && make -s -j"$(_ncpu)" >/dev/null 2>&1 ); then
             cp "$sb/busybox/busybox" "${WORKSPACE_DIR}/target/PROBE.LNX"
         else
             _sb_skip 1 PROBE.LNX "$(_sb_fetch_why "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" "busybox make" make gcc)"
@@ -4074,7 +4074,7 @@ build_selfbuild_x86() {
     build_selfbuild4_x86   # SELFBUILD4 (B356): SYSKAT4.LNX + RUST.LNX
     build_selfbuild5_x86   # SELFBUILD5 (B357): SYSKAT5.LNX + LLD.LNX + LIB/rust (RUST.LNX's objects, std rlibs, musl crt)
     build_selfbuild6_x86   # SELFBUILD6 (B360): LIB/dyn (libc.so, libgcc_s.so.1, the dyn probe) + LIB/rustc (default on, R87; UNAOS_SELFBUILD6_RUSTC=0 opts out)
-    ( cd "${WORKSPACE_DIR}/target" && sha256sum TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C 2>/dev/null | sed 's/^/   SELFBUILD1: sha256 /' )
+    ( cd "${WORKSPACE_DIR}/target" && for _f in TCC.LNX PROBE.LNX SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX RUST.LNX HELLO.C PRINTF.C; do if [ -f "$_f" ]; then echo "   SELFBUILD1: sha256 $(sha256_of "$_f")  $_f"; fi; done )
     local _p _st="" _ns=""   # SMALLFIX (B380): one summary line; each not_staged entry has its own `not staged … reason=` line above
     for _p in SYSKAT.LNX SYSKAT2.LNX SYSKAT3.LNX SYSKAT4.LNX SYSKAT5.LNX TCC.LNX PROBE.LNX RUST.LNX LLD.LNX LIB/libc.a LIB/rust LIB/dyn LIB/rustc; do
         if [ -e "${WORKSPACE_DIR}/target/$_p" ]; then _st="$_st${_st:+,}$_p"; else _ns="$_ns${_ns:+,}$_p"; fi
@@ -4262,7 +4262,7 @@ PY
         else whyr="build failed python3 staging of the recorded link"; fi
         _sb_skip 5 LIB/rust "$whyr"; rm -rf "$out"
     fi
-    ( cd "${WORKSPACE_DIR}/target" && sha256sum SYSKAT5.LNX LLD.LNX LIB/rust/link.rsp 2>/dev/null | sed 's/^/   SELFBUILD5: sha256 /' )
+    ( cd "${WORKSPACE_DIR}/target" && for _f in SYSKAT5.LNX LLD.LNX LIB/rust/link.rsp; do if [ -f "$_f" ]; then echo "   SELFBUILD5: sha256 $(sha256_of "$_f")  $_f"; fi; done )
 }
 
 # SELFBUILD6 (B360): DYNAMIC Linux programs through the shared loader core (unaos/libs/sys/ldso_core; the kernel's
@@ -10657,7 +10657,7 @@ test_splash() {
 # three), every line held on the previous line's verdict. The spec's COMPLETE is the last verdict. The typist connects to QMP before it reads a marker, and the QMP socket exists only after
 # test_x86_64 has removed the old capture, so it never reads a stale log. Transcript: target/zenbook-typist.log (beside it).
 test_zenbook() {
-    local secs="${1:-200}"   # ZENBOOKSPECPINS (Z54): 180 -> 200 s, the three typed verbs added below cost 18.15 s (3 x 4 s settle + 45 keys x 0.12 s + 3 x 0.25 s poll)
+    local secs="${1:-206}"   # MT7925S10 (Z55): 200 -> 206 s, the typed `tests wpa2` costs 5.6 s (4 s settle + 11 keys x 0.12 + 0.25 poll). ZENBOOKSPECPINS (Z54): 180 -> 200 s, the three typed verbs added below cost 18.15 s (3 x 4 s settle + 45 keys x 0.12 s + 3 x 0.25 s poll)
     if [ -z "${UNAOS_ZENBOOKLANE:-}" ]; then
         local _zk="" _zv
         for _zv in $(compgen -e); do case "$_zv" in UNAOS_QEMU_MACHINE|UNAOS_QMP_PORT|UNAOS_NVME_4K|UNAOS_NVME_DISK) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
@@ -10682,14 +10682,14 @@ zenbook_lane_typed() { # $1 = the wall (s)
     TYPIST_PORT="$zport" TYPIST_LOG="$SERIAL_LOG"
     local -a zph=("$FIRSTUSER_PHASE")
     prev=":: BOOTLIST: ran="   # ZENBOOKLANELIST (Z19): held on the lane list's light summary (it runs at [desktop] built), so no typed `tests` meets a list fixture's RUNNING (`:: TESTS: already running — refused ::`)
-    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID suspend:SUSPEND ecqnames:ECQNAMES dwi2cacpi:DWI2CFAST bootlist:BOOTLIST; do   # ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged). ZENBOOKSPECPINS (Z54): suspend, ecqnames, dwi2cacpi (held on DWI2CFAST, its last of three verdicts), each pinned by x86-zenbook.spec §9
+    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID suspend:SUSPEND ecqnames:ECQNAMES dwi2cacpi:DWI2CFAST wpa2:WPA2KAT bootlist:BOOTLIST; do   # ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged). ZENBOOKSPECPINS (Z54): suspend, ecqnames, dwi2cacpi (held on DWI2CFAST, its last of three verdicts), each pinned by x86-zenbook.spec §9. SPECCOV (zenbook-ledger Z58): this lane's marker, equal to the loop's own verbs — SPEC-COVERAGE: x86-zenbook.spec platform ec nvme i8042 dwi2c hdacensus gopshot eclid suspend ecqnames dwi2cacpi bootlist wpa2
         local done_mark=":: ${v#*:}: "; [ "${v%%:*}" = bootlist ] && done_mark=":: BOOTLIST: probe"
         zph+=("${prev}|tests ${v%%:*}|t:tests spc t:${v%%:*} ret|${done_mark}")
         prev="$done_mark"
     done
     mkdir -p "${WORKSPACE_DIR}/target"; rm -f "$tlog"
     typist_start "$tlog" "$secs" "${zph[@]}"
-    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: typist armed on QMP :${zport} — the first-user form, then tests platform/ec/nvme/i8042/dwi2c/hdacensus/gopshot/eclid/suspend/ecqnames/dwi2cacpi/bootlist (transcript ${tlog#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: typist armed on QMP :${zport} — the first-user form, then tests platform/ec/nvme/i8042/dwi2c/hdacensus/gopshot/eclid/suspend/ecqnames/dwi2cacpi/wpa2/bootlist (transcript ${tlog#${WORKSPACE_DIR}/})${COLOR_RESET}"
     test_x86_64 "$secs" || rc=$?
     wait "$typist" 2>/dev/null || true
     awk '/^\[typist\]/ { print "ZENBOOKLANE:   " $0 }' "$tlog" 2>/dev/null || true
@@ -11519,9 +11519,9 @@ k8_lock_acquire() {
     mkdir -p "${WORKSPACE_DIR}/target"
     while ! mkdir "$K8_LOCKDIR" 2>/dev/null; do
         holder=$(cat "$K8_LOCKDIR/pid" 2>/dev/null || echo "")
-        # BSD stat first, GNU stat second — the `|| echo 0` fallback alone would make every
-        # contended wait on Linux read age=huge and false-reclaim a live holder's lock
-        mtime=$(stat -f %m "$K8_LOCKDIR" 2>/dev/null || stat -c %Y "$K8_LOCKDIR" 2>/dev/null || echo 0)
+        # K8LOCK-STAT (B1023): GNU stat first, BSD second (_fsize's order) — GNU `stat -f` is the FILESYSTEM mode, prints `?` for
+        # %m and exits 0, so the BSD-first order read mtime=? on Linux; `|| echo 0` alone would read age=huge and false-reclaim
+        mtime=$(stat -c %Y "$K8_LOCKDIR" 2>/dev/null || stat -f %m "$K8_LOCKDIR" 2>/dev/null || echo 0)
         now=$(date +%s); age=$(( now - mtime ))
         if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
             echo -e "${COLOR_YELLOW}kernel8: stale build lock reclaimed — holder PID $holder dead (age ${age}s)${COLOR_RESET}" >&2
@@ -14898,7 +14898,7 @@ jobs_image() {
 # plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
 # `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
 #   GATEPATH selftest: plants=<n> caught=<n> -> PASS
-GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py nonetreach:unaos/scripts/nonet-reach.py neutral:tools/neutral-check.py firmware:tools/firmware-census.py locktype:unaos/scripts/lock-type.py knob-parity-zenbook:unaos/scripts/knob-parity.sh"
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py nonetreach:unaos/scripts/nonet-reach.py neutral:tools/neutral-check.py firmware:tools/firmware-census.py locktype:unaos/scripts/lock-type.py knob-parity-zenbook:unaos/scripts/knob-parity.sh speccov:unaos/scripts/spec-coverage.sh"
 # NEUTRAL (SR166 GATENEUTRAL, BP-shape-4, R16): no board name (orin/rmbp/pi4/jetson/tegra word parts) in an identifier or a
 # string of a shared kernel file (crates/kernel/src minus arch/); comments, `feature = "…"` gates, arch board-module paths
 # and ledger/round citations excepted; the ruled exceptions are tools/neutral.allow, one row + reason each, shrink-only.
@@ -14907,6 +14907,11 @@ GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.
 # LOCKTYPE (SR188 GATELOCKTYPE, BP-cores-20, B414/B823): every kernel spin lock is crate::sync::Mutex (the registry names it by
 # its site); a raw spin::Mutex / MutexGuard / spin::mutex::* / spin::RwLock* in the code of crates/kernel/src reds, save the
 # registry's own inner lock in sync.rs (exact path+line rows in the script, shrink-only); spin::Once and spin::Spin pass.
+# SPECCOV (zenbook-ledger Z58 SPECCOVERAGE, BP-gates-15): every `:: TAG: … ->` verdict a typed lane's verbs print (verb -> its
+# register/defer fn -> that fn's same-file callee closure; tags by witness-owners.py's SITE, bodies by neutral-check.py's lex)
+# is named by a REQUIRE/OPTIONAL/FORBID/PENDING/COMPLETE/COUNT of the lane's spec or skipped there by `# COVERAGE-SKIP TAG why`;
+# the lanes are the SPEC-COVERAGE markers in this file's comments (test-zenbook's typist loop, kernel8-test --desk), each
+# held equal to its line's own verb list (spec-coverage.sh; marker-drift is rc 1, a broken resolver or control rc 2).
 # BLUEPRINT (2026-10-19, Peter: "a set of blueprints … a front-side gate"): docs/dev/blueprint/ sheets — every anchor
 # exists at its line, BP-ids unique and stem-named, every sheet listed and ≤ 120 lines, no claim words (blueprint-check.py).
 # NONET (B672, BP-bar-10): no fn reachable from the video/ furniture (menubar, dock, crystal, notify, strip, settings,
@@ -14974,6 +14979,7 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         neutral)    printf 'pub fn orinzzgateplant() {}\n' > "$K/video/zz_gateplant_neutral.rs"; echo zz_gateplant_neutral ;; # NEUTRAL (SR166): a board-named fn in a shared file with no allowlist row
         firmware)   printf '\177ELF\000\000zzgateplant' > "$C/unaos/firmware/zz_gateplant.bin"; echo zz_gateplant.bin ;; # FIRMWARE (SR166): a binary blob committed under unaos/firmware (R52)
         locktype)   printf 'pub static P: spin::Mutex<u8> = spin::Mutex::new(0);\n' > "$K/video/zz_gateplant_locktype.rs"; echo zz_gateplant_locktype ;; # LOCKTYPE (SR188): a raw spin::Mutex static outside sync.rs (the 38 LOCKREG2 swept)
+        speccov)    printf 'COMPLETE :: ZZGATEPLANT: nothing ::\n' > "$C/unaos/scripts/specs/zz_gateplant.spec" && printf '# for v in platform:PLATFORM; do :; done # SPEC-%s: zz_gateplant.spec platform\n' COVERAGE >> "$C/unaos/arroyo"; echo zz_gateplant.spec ;; # SPECCOV (Z58): a marked lane whose spec scores none of its verb's verdicts (PLATFORM unscored; the planted comment carries its own `for v in` list, so it is no marker-drift); arroyo is restored from the selftest's backup, the planted spec is read by no later gate (speccov is the set's last row)
         *) return 1 ;;
     esac
 }
@@ -15041,8 +15047,8 @@ fw_stage_pinned() {
         f="${m%%:*}"
         [ -r "${src}/${f}" ] || { echo -e "${COLOR_RED}❌ ${tag}: ${src}/${f} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
     done
-    local stage="${WORKSPACE_DIR}/target/${tag,,}"
-    rm -rf "$stage"; mkdir -p "$stage" "${esp}/${sub}" || { echo -e "${COLOR_RED}❌ ${tag}: making target/${tag,,} or ${sub}/ on the ESP tree failed — no card image${COLOR_RESET}"; return 1; }
+    local stage; stage="${WORKSPACE_DIR}/target/$(printf '%s' "$tag" | tr '[:upper:]' '[:lower:]')"
+    rm -rf "$stage"; mkdir -p "$stage" "${esp}/${sub}" || { echo -e "${COLOR_RED}❌ ${tag}: making target/${stage##*/} or ${sub}/ on the ESP tree failed — no card image${COLOR_RESET}"; return 1; }
     for m in "$@"; do
         f="${m%%:*}"
         cp "${src}/${f}" "$stage/" && cp "$stage/${f}" "${esp}/${sub}/" || { echo -e "${COLOR_RED}❌ ${tag}: copying ${f} onto the ESP tree at ${sub}/ failed — no card image${COLOR_RESET}"; return 1; }
@@ -15066,11 +15072,11 @@ fw_stage_pinned() {
 # single-file `put` refuses an existing name; the directory form lands the contents in <unafs dir>, made with its parents, and
 # REPLACES what is there — tools/unafs put, ROOTDISK2). An empty <src dir> stages nothing.
 fw_stage_unafs() {
-    local tag="$1" src="$2" img="$3" dir="$4"
+    local tag="$1" src="$2" img="$3" dir="$4"; local ltag; ltag="$(printf '%s' "$tag" | tr '[:upper:]' '[:lower:]')"
     [ -n "$src" ] || return 0
-    cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/unafs/Cargo.toml" -- put "${WORKSPACE_DIR}/target/${tag,,}" "$dir" -i "$img" >/dev/null || {
-        echo -e "${COLOR_RED}❌ ${tag}: tools/unafs put target/${tag,,} -> ${dir} failed — no card image${COLOR_RESET}"; return 1; }
-    echo -e "${COLOR_YELLOW}⚡ ${tag}: target/${tag,,} onto the UnaFS root at ${dir}/ (bench-only, never in-tree)${COLOR_RESET}"
+    cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/unafs/Cargo.toml" -- put "${WORKSPACE_DIR}/target/${ltag}" "$dir" -i "$img" >/dev/null || {
+        echo -e "${COLOR_RED}❌ ${tag}: tools/unafs put target/${ltag} -> ${dir} failed — no card image${COLOR_RESET}"; return 1; }
+    echo -e "${COLOR_YELLOW}⚡ ${tag}: target/${ltag} onto the UnaFS root at ${dir}/ (bench-only, never in-tree)${COLOR_RESET}"
 }
 
 # ARROYOMAC (rmbp-ledger B1011): the host-portable helpers, so a macOS bench builds the flight image (`esp-x86`) without
@@ -15288,7 +15294,7 @@ case "${1:-}" in
     test-zenbook|test_zenbook)
         # ZENBOOKLANE (zenbook-ledger Z13): the Zenbook line under QEMU as zenbook_um5606w. Re-execs itself (see
         # test_zenbook), so this arm is entered twice per invocation. Fold-gate command, not a leg of `check`.
-        test_zenbook "${2:-200}"   # ZENBOOKSPECPINS (Z54): 200 s, twelve typed verbs (+18.15 s measured from typist.sh). ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
+        test_zenbook "${2:-206}"   # MT7925S10 (Z55): 206 s, the default beside test_zenbook's (a dispatcher default of 200 would override it). ZENBOOKSPECPINS (Z54): 200 s, twelve typed verbs (+18.15 s measured from typist.sh). ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
         ;;
     kernel8|baremetal)
         _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do
@@ -15297,7 +15303,7 @@ case "${1:-}" in
         run_kernel8
         ;;
     kernel8-test|test-pi)
-        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; export UNAOS_K8_SCRIPT="${UNAOS_K8_SCRIPT-${WORKSPACE_DIR}/scripts/specs/pi4-desktop.inject}" UNAOS_K8_SPEC="${UNAOS_K8_SPEC:-${PI4_DESKTOP_SPEC}}"; set -- "$1" "${@:3}"; fi   # PIDESKQEMULIST (B894): the desk lane types `tests textscale` (specs/pi4-desktop.inject, `UNAOS_K8_SCRIPT=` opts out) and its typed spec is the desk spec, asserted once by k8_desk_replay. PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec
+        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; export UNAOS_K8_SCRIPT="${UNAOS_K8_SCRIPT-${WORKSPACE_DIR}/scripts/specs/pi4-desktop.inject}" UNAOS_K8_SPEC="${UNAOS_K8_SPEC:-${PI4_DESKTOP_SPEC}}"; set -- "$1" "${@:3}"; fi   # PIDESKQEMULIST (B894): the desk lane types `tests textscale` (specs/pi4-desktop.inject, `UNAOS_K8_SCRIPT=` opts out) and its typed spec is the desk spec, asserted once by k8_desk_replay. PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec. SPECCOV (zenbook-ledger Z58): the desk lane's marker, equal to the inject's typed verbs — SPEC-COVERAGE: pi4-desktop.spec textscale
         test_kernel8 "${2:-60}"   # MBENCH-HONEST: 8 s never finished a pi4 boot — see test_kernel8
         ;;
     kernel8-install|install-pi)

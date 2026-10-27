@@ -523,7 +523,7 @@ pub fn request() {
 /// Costs ONE relaxed load per call when idle (QUEUESLEEP2 B557: [`OWED`], file tail; it was three after PRTSCR-HOME's
 /// [`dir_fixture`] latch plus an AcqRel swap in `defer_fast`), which is why it can still sit unconditionally beside `fat::probe_once()`
 /// at every storage-ready pass this kernel carries.
-pub fn service() { if !OWED.load(Ordering::Relaxed) { return; } service_owed() } fn service_owed() { // QUEUESLEEP2 (B557): the idle pump pays ONE relaxed load; the old body is `service_owed` (same-line fold, no line below moves)
+pub fn service() { if !OWED.load(Ordering::Relaxed) { return; } if capture_post() { return; } service_owed() } fn service_owed() { // QUEUESLEEP2 (B557): the idle pump pays ONE relaxed load; the old body is `service_owed` (same-line fold, no line below moves)
     // PRTSCR-HOME: the destination fixture, once per boot. It is here rather than behind a knob
     // because the no-session refusal it measures is what EVERY board does today — a gate that only
     // runs when someone remembers a knob would never have measured the ordinary case even once.
@@ -2729,5 +2729,94 @@ fn settle() {
     OWED.store(false, Ordering::SeqCst);
     if PENDING.load(Ordering::SeqCst) || SLICING.load(Ordering::SeqCst) {
         OWED.store(true, Ordering::SeqCst);
+    }
+}
+
+// PRTSCROFFPUMP (rmbp-ledger B1024) — the capture's encode + save leave the hid pump. FILE TAIL, so no line above moves.
+// Flight 38 boot 1 (f38-boot1.log on hw-rmbp, cited): a Cmd-Shift-3 capture ran its ~600 sliced units (PRTSCR-ASYNC,
+// ~31 ms each) for 19 s ON THE USB PUMP, every deep UnaFS write and stamp frame on the pump's own stack; the pump
+// overflowed its 16 KiB in unit (5) right after `:: SHOTZIP: … -> PASS ::` (`high=17712 holding=2`) and PUMPWEDGE then
+// read the dead pump. The pump's job is HID. `service()` (its :526 line, same-line fold) now POSTS the open capture:
+// ONE `prtscr-capture` task (PUMPWITNESS's `selftest_post` shape: spawn once, exit when done) on SMALLFIX8's off-pump
+// core rule (`fs::bootlog::off_pump`: `xhci_worker_cpu(0)`, never the pump's core — a FAT rung takes the xHCI storage
+// loan) at PUMPSTACK's measured `PUMP_PATH_STACK_SIZE`, driving the SAME `service_owed` body: `Job`, `JOB`'s
+// twice-per-slice lock, `OWED`/`settle`, the InFlight deferral and every PRTSCR/SHOTZIP/SHOTMOUNT line unchanged. No
+// frame is copied (the rows are read from the panel unit by unit, as before). No such core, or not x86: `false`, and
+// the pump drives the slices inline as before (said once per boot).
+
+/// PRTSCROFFPUMP — a `prtscr-capture` task is driving the capture (set by the post's swap, cleared by the task's exit).
+#[cfg(target_arch = "x86_64")]
+static CAP_POSTED: AtomicBool = AtomicBool::new(false);
+/// PRTSCROFFPUMP — the inline fallback has been said (once per boot).
+#[cfg(target_arch = "x86_64")]
+static CAP_INLINE_SAID: AtomicBool = AtomicBool::new(false);
+
+/// PRTSCROFFPUMP — the pump's door: `true` = a worker drives (or now will drive) the capture, the caller returns.
+#[cfg(target_arch = "x86_64")]
+fn capture_post() -> bool {
+    if CAP_POSTED.load(Ordering::Acquire) {
+        return true;
+    }
+    let pump = crate::hidstall::pump_cpu();
+    let Some(cpu) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != pump) else {
+        if (PENDING.load(Ordering::Relaxed) || SLICING.load(Ordering::Relaxed)) && !CAP_INLINE_SAID.swap(true, Ordering::Relaxed) {
+            serial_println!("[prtscr] capture inline on=pump (no worker core apart from the pump's c{}: the slices stay on the pump as before)", pump);
+        }
+        return false;
+    };
+    if CAP_POSTED.swap(true, Ordering::AcqRel) {
+        return true;
+    }
+    if PENDING.load(Ordering::Relaxed) || SLICING.load(Ordering::Relaxed) {
+        serial_println!(
+            "[prtscr] capture owed on=pump cpu={} -> to=prtscr-capture cpu={} stack={} (PRTSCROFFPUMP: the encode + save leave the hid pump)",
+            pump, cpu, crate::arch::sched::PUMP_PATH_STACK_SIZE
+        );
+    }
+    crate::arch::sched::spawn_stack("prtscr-capture", capture_worker, cpu, cpu, crate::arch::sched::PRIO_NORMAL, crate::arch::sched::PUMP_PATH_STACK_SIZE);
+    true
+}
+
+/// PRTSCROFFPUMP — other arches: the pump drives the slices inline, as before.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+fn capture_post() -> bool {
+    false
+}
+
+/// PRTSCROFFPUMP — `prtscr-capture`: drive `service_owed` until `OWED` settles, then exit. The exit closes its race
+/// as `settle` closes `OWED`'s: clear `CAP_POSTED`, re-check `OWED`, and take the work back only by winning the swap,
+/// so a request that lands after the drain is driven by this task or re-posted by the pump, never stranded.
+#[cfg(target_arch = "x86_64")]
+fn capture_worker(cpu: usize) {
+    let t0 = crate::arch::ms();
+    let (c0, r0) = (CAPTURES.load(Ordering::Relaxed), REFUSALS.load(Ordering::Relaxed));
+    let mut passes: u32 = 0;
+    loop {
+        while OWED.load(Ordering::Acquire) {
+            service_owed();
+            passes = passes.wrapping_add(1);
+            if IN_FLIGHT.load(Ordering::Relaxed) && !SLICING.load(Ordering::Relaxed) {
+                crate::arch::sched::sleep_ms(20); // the door is held by a verb's synchronous capture: wait it out, do not spin
+            } else {
+                crate::arch::sched::yield_now();
+            }
+        }
+        CAP_POSTED.store(false, Ordering::SeqCst);
+        if OWED.load(Ordering::SeqCst) && !CAP_POSTED.swap(true, Ordering::SeqCst) {
+            continue;
+        }
+        break;
+    }
+    let (c1, r1) = (CAPTURES.load(Ordering::Relaxed), REFUSALS.load(Ordering::Relaxed));
+    if c1 != c0 || r1 != r0 {
+        serial_println!(
+            "[prtscr] encode+save on=prtscr-capture cpu={} passes={} wall_ms={} captures={} refused={} -> done",
+            cpu,
+            passes,
+            crate::arch::ms().saturating_sub(t0),
+            c1.wrapping_sub(c0),
+            r1.wrapping_sub(r0)
+        );
     }
 }

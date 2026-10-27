@@ -109,4 +109,92 @@ if [ -n "$trailing" ]; then
   echo "  FIX: move the attribute AND its statement ahead of every comment on the line. The rule for folds in this tree is CODE FIRST, ALL OF IT, THEN THE COMMENTS." >&2
 fi
 [ "$rc" -eq 0 ] && echo "GATE-KNOB: OK — $(printf '%s\n' "$declared" | grep -c .) features declared, $(printf '%s\n' "$used" | grep -c .) named by a cfg, 0 phantom, 0 dead, 0 trailing-comment cfg"
+# HOST-LINT (TOOLCHAINLINT, rmbp-ledger B1023) — the host-portability half of this gate, owed by TOOLCHAIN-ONE (B1018) and
+# ARROYOMAC (B1011). `toolchain`: nothing passes `+<toolchain>` to cargo/rustc/rustup (rust-toolchain.toml is THE pin).
+# `hostidiom`: the GNU-only idioms ARROYOMAC ported must not return to arroyo or scripts/*.sh; a site OFF the flight-image path
+# sits on scripts/host-idiom-allow.txt (`<file>:<fixed substring> — <why>`), SHRINK-ONLY: a row that matches no hit reds.
+# The discipline above: each pattern lives in ONE place used by BOTH the scan and its control; a failed control is exit 2.
+# Escapes are bracket expressions (`[|]`, `[+]`, `[$]`) so BSD and GNU ERE read them alike. Bash-3.2 clean (macOS /bin/bash).
+HL_ROOT="$HERE/.."
+HL_ALLOW="$HERE/host-idiom-allow.txt"
+HL_TC_RE='(^|[^A-Za-z0-9_./-])(cargo|rustc|rustup)[[:space:]]+[+][A-Za-z0-9$"{]|"[+](nightly|stable|beta)[-0-9]*"'
+hl_code() { grep -vE '^[^:]+:[0-9]+:[[:space:]]*(#|//)' || true; }   # drop whole-line comments from `file:n:text` (prose stays green)
+hl_self() { grep -v '^scripts/knob-hygiene[.]sh:' || true; }   # this gate's own fixture lines are not sites
+for _f in "$HL_ROOT/arroyo" "$HL_ROOT/builder/src/main.rs" "$HL_ALLOW"; do
+  [ -r "$_f" ] || { echo "HOST-LINT: control FAILED — $_f unreadable. No verdict." >&2; exit 2; }
+done
+for _t in 'cargo +nightly build' 'rustc +nightly-2026-10-26 -V' '    cargo +"$tc" check' 'Command::new("cargo").arg("+nightly")'; do
+  printf '%s\n' "$_t" | grep -qE -- "$HL_TC_RE" || { echo "HOST-LINT: control FAILED — the toolchain pattern misses its hazard '$_t'. No verdict." >&2; exit 2; }
+done
+for _t in '# Fields: <cargo-feature[+cofeature]> <SPACE> <aarch64|x86_64|any>' 'cargo build --release'; do
+  printf '%s\n' "$_t" | grep -qE -- "$HL_TC_RE" && { echo "HOST-LINT: control FAILED — the toolchain pattern matches the non-hazard '$_t'. No verdict." >&2; exit 2; }
+done
+[ -z "$(printf 'arroyo:1:    # sha256sum x\nm.rs:2:  // cargo +nightly\n' | hl_code)" ] || { echo "HOST-LINT: control FAILED — the comment filter kept a comment line. No verdict." >&2; exit 2; }
+hl_fail="" hl_ntc=0 hl_nid=0 hl_nst=0 hl_allowed=0 hl_seen="" hl_used=""
+hl_tc="$(cd "$HL_ROOT" && LC_ALL=C grep -HnE -- "$HL_TC_RE" arroyo builder/src/main.rs scripts/*.sh scripts/*.py 2>/dev/null | hl_code | hl_self)"
+while IFS= read -r _h; do
+  [ -n "$_h" ] || continue
+  hl_ntc=$((hl_ntc + 1)); _r="${_h#*:}"
+  hl_fail="${hl_fail}✖ HOST-LINT: ${_h%%:*}:${_r%%:*} toolchain — drop the +<toolchain>: rust-toolchain.toml is THE pin (TOOLCHAIN-ONE, B1018)"$'\n'
+done <<EOF
+$hl_tc
+EOF
+hl_rows="$(grep -nvE '^[[:space:]]*(#|$)' "$HL_ALLOW" || true)"   # `<allow line>:<file>:<substring> — <why>`
+# One row per idiom: name~~ERE~~ported-if ERE (the line already carries the portable fallback)~~hazard fixture~~remedy.
+while IFS= read -r _row <&3; do
+  [ -n "$_row" ] || continue
+  _name="${_row%%~~*}"; _r="${_row#*~~}"; _re="${_r%%~~*}"; _r="${_r#*~~}"; _ok="${_r%%~~*}"; _r="${_r#*~~}"; _hz="${_r%%~~*}"; _rem="${_r#*~~}"
+  printf '%s\n' "$_hz" | grep -qE -- "$_re" || { echo "HOST-LINT: control FAILED — row '$_name' no longer matches its own hazard fixture. No verdict." >&2; exit 2; }
+  if [ -n "$_ok" ] && printf '%s\n' "$_hz" | grep -qE -- "$_ok"; then echo "HOST-LINT: control FAILED — row '$_name': its ported-if clears its own hazard fixture. No verdict." >&2; exit 2; fi
+  _hits="$(cd "$HL_ROOT" && LC_ALL=C grep -HnE -- "$_re" arroyo scripts/*.sh 2>/dev/null | hl_code | hl_self)"
+  if [ "$_name" = stat-c ]; then   # WITNESS: arroyo's `_fsize` is a RAW hit (the scan read the file) that the ported-if clears
+    printf '%s\n' "$_hits" | grep -qE '^arroyo:[0-9]+:_fsize[(][)]' || { echo "HOST-LINT: control FAILED — arroyo's _fsize line is not a raw stat-c hit; the scan is broken. No verdict." >&2; exit 2; }
+    printf '%s\n' "$_hits" | grep -E -- "$_ok" | grep -qE '^arroyo:[0-9]+:_fsize[(][)]' || { echo "HOST-LINT: control FAILED — the stat-c ported-if does not clear arroyo's _fsize line. No verdict." >&2; exit 2; }
+  fi
+  [ -n "$_ok" ] && _hits="$(printf '%s\n' "$_hits" | LC_ALL=C grep -vE -- "$_ok" || true)"
+  while IFS= read -r _h; do
+    [ -n "$_h" ] || continue
+    _loc="${_h%%:*}"; _r="${_h#*:}"; _ln="${_r%%:*}"; _text="${_r#*:}"
+    case "$hl_seen" in *"|$_loc:$_ln|"*) continue ;; esac   # one finding per line: the first row wins
+    hl_seen="$hl_seen|$_loc:$_ln|"; _allow=""
+    while IFS= read -r _ar; do
+      [ -n "$_ar" ] || continue
+      _an="${_ar%%:*}"; _a="${_ar#*:}"; _af="${_a%%:*}"; _ap="${_a#*:}"; _ap="${_ap%% — *}"
+      [ "$_af" = "$_loc" ] || continue
+      case "$_text" in *"$_ap"*) _allow=1; hl_used="$hl_used|$_an|"; break ;; esac
+    done <<EOF
+$hl_rows
+EOF
+    if [ -n "$_allow" ]; then hl_allowed=$((hl_allowed + 1))
+    else hl_nid=$((hl_nid + 1)); hl_fail="${hl_fail}✖ HOST-LINT: $_loc:$_ln $_name — $_rem"$'\n'; fi
+  done <<EOF
+$_hits
+EOF
+done 3<<'TABLE'
+stat-c~~(^|[^A-Za-z0-9_-])stat[[:space:]]+-c~~stat[[:space:]]+-c[^|]*[|][|][^|]*stat[[:space:]]+-f~~mtime=$(stat -f %m "$d" 2>/dev/null || stat -c %Y "$d")~~_fsize (GNU `stat -c` FIRST, BSD `stat -f` second: GNU -f is the filesystem mode and exits 0)
+nproc~~(^|[^A-Za-z0-9_-])nproc([^A-Za-z0-9_-]|$)~~hw[.]ncpu~~make -s -j"$(nproc)"~~_ncpu
+sha256sum~~(^|[^A-Za-z0-9_-])sha256sum([^A-Za-z0-9_-]|$)~~shasum|command -v sha256sum~~sum=$(sha256sum "$f" | cut -d' ' -f1)~~sha256_of
+sha512sum~~(^|[^A-Za-z0-9_-])sha512sum([^A-Za-z0-9_-]|$)~~shasum|command -v sha512sum~~sum=$(sha512sum "$f" | cut -d' ' -f1)~~sha512_of
+date-d~~(^|[^A-Za-z0-9_-])date[[:space:]]+(-[A-Za-z]+[[:space:]]+)*(-d|--date)~~~~t=$(date -d "$s" +%s)~~compare YYYY-MM-DD as strings (_rustc_floor's way)
+sed-i~~(^|[^A-Za-z0-9_-])sed[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*i([[:space:]]|$)~~~~sed -i 's/a/b/' "$f"~~sed -i.orig (suffix attached: GNU and BSD both) or a temp file + mv
+readlink-f~~(^|[^A-Za-z0-9_-])readlink[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-[A-Za-z]*f~~~~d=$(readlink -f "$0")~~cd "$(dirname "$f")" && pwd
+grep-P~~(^|[^A-Za-z0-9_-])grep[[:space:]]+(-[A-Za-z]+[[:space:]]+)*(-[A-Za-z]*P|--perl-regexp)~~~~n=$(grep -oP '\d+' "$f")~~grep -E
+timeout~~(^|[;&|({`]|[[:space:]](if|then|do|else|while|until|exec|sudo|!))[[:space:]]*timeout[[:space:]]+(-[A-Za-z]+[[:space:]]+)*[0-9]~~~~    timeout 30 qemu-system-x86_64 -nographic~~a background child and kill after the wall (macOS has no timeout)
+cp-reflink~~(^|[^A-Za-z0-9_-])cp[[:space:]][^|;]*--reflink~~~~cp --reflink=auto a b~~plain cp
+du-b~~(^|[^A-Za-z0-9_-])du[[:space:]]+(-[A-Za-z]+[[:space:]]+)*(-[A-Za-z]*b|--bytes|--apparent-size)~~~~n=$(du -b "$f" | cut -f1)~~_fsize
+bash4-case~~[$][{][A-Za-z_][A-Za-z0-9_]*([[][^]]*[]])?[,^]~~~~d="target/${tag,,}"~~tr '[:upper:]' '[:lower:]' (ARROYO-BASH32: macOS /bin/bash is 3.2)
+truncate~~(^|[^A-Za-z0-9_.-])truncate[[:space:]]+-s~~~~truncate -s 64M "$img"~~dd if=/dev/zero of=<f> bs=1 count=0 seek=<n> (prepare_aarch64's way)
+TABLE
+while IFS= read -r _ar; do
+  [ -n "$_ar" ] || continue
+  case "$hl_used" in *"|${_ar%%:*}|"*) ;; *) hl_nst=$((hl_nst + 1)); hl_fail="${hl_fail}✖ HOST-LINT: scripts/host-idiom-allow.txt:${_ar%%:*} stale — ${_ar#*:} matches no hit (shrink-only: delete the row)"$'\n' ;; esac
+done <<EOF
+$hl_rows
+EOF
+if [ -n "$hl_fail" ]; then
+  rc=1; printf '%s' "$hl_fail" >&2
+  echo "HOST-LINT FAILED — toolchain=$hl_ntc hostidiom=$hl_nid stale=$hl_nst allowed=$hl_allowed" >&2
+else
+  echo "✔ HOST-LINT: toolchain=0 hostidiom=0 allowed=$hl_allowed"
+fi
 exit $rc
