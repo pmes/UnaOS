@@ -31851,13 +31851,13 @@ pub use scrollview::scroll_press_ring3; // RING3SCROLLPRESS (B791): the x86 clic
 /// window's blit ([`occ_clip`]) published over a live overlay and nothing re-blitted it (flight 37's toast flicker; B815
 /// closed it for notify's rows only). [`overlay_row`] (file end) admits every presented overlay and keeps the full-screen
 /// canvas (`COMPAT_WIN`) out, with the box each set reads from its own table snapshot. Called inside the sets' table hold;
-/// takes no lock. Witness: `[cursor11] … toast_withheld=` still counts notify's admissions only (`notify::owns_row`).
+/// takes no lock. Witness: `[cursor11] … overlay_withheld=` counts every overlay row a set admits (OVERLAYARM2 B866).
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn overlay_occludes(r: &Window) -> bool {
     let own = overlay_row(r);
     #[cfg(feature = "witness")]
-    if own && super::notify::owns_row(r.id) {
-        super::cursor::note_toast_withheld();
+    if own {
+        super::cursor::note_overlay_withheld();
     }
     own
 }
@@ -31960,7 +31960,7 @@ fn overlay_row(r: &Window) -> bool {
 }
 
 /// `tests overlays` (fixture only): the live overlay rows' ids into `out` (cleared), by count, under one table hold.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub fn overlay_rows(out: &mut alloc::vec::Vec<WinId>) -> usize {
     out.clear();
     let t = table();
@@ -31974,7 +31974,7 @@ pub fn overlay_rows(out: &mut alloc::vec::Vec<WinId>) -> usize {
 
 /// `tests overlays` (fixture only): pixel `(sx, sy)` of overlay row `id`'s own surface (xRGB), or `None` (no such compat
 /// row, or the point is outside its surface). Read under the table hold, bound-checked against `w`/`h`/`stride`/`surf_len`.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub fn surface_pixel(id: WinId, sx: usize, sy: usize) -> Option<u32> {
     let t = table();
     let r = row(&t, id)?;
@@ -32107,7 +32107,7 @@ pub fn overlay_live(id: WinId) -> bool {
 /// `tests overlays` (fixture only): does `occluders_above` (the read-back excuse set) admit overlay row `id`? Asks the
 /// production snapshot with no table held (`occluders_above(0, 0)`: every row above the bottom), then reads the row's
 /// `outer_box` under one table hold. Retries (at most 4) only when the snapshot was the contention pardon box.
-#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 pub fn verify_admits(id: WinId) -> bool {
     for _ in 0..4 {
         let snap = occluders_above(0, 0);

@@ -792,7 +792,7 @@ refs/heads/exec-rmbp-stationair   baa7d1da6 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-sleepresume   baa7d1da6 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-keyboot4   baa7d1da6 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-shadowdamage   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-overlayarm2   baa7d1da6 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-overlayarm2   149ba4120 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-panelknob2   baa7d1da6 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-zoomflush2   baa7d1da6 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-hdastart   190d2f9b0 FOLDED-BY-HAND (this commit) 2026-10-27

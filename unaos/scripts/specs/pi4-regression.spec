@@ -2513,3 +2513,12 @@ FORBID :: LFNMV: .* -> FAIL ::
 # --- spec) is the owed row that would let this become a REQUIRE.
 OPTIONAL \[kfont\] repaint shell epoch=[1-9][0-9]* console_rows=[1-9]
 FORBID \[textscale\] win=shell css=[0-9]+ grow=[0-9]+ rows_ok=0
+
+# --- ARMOVERLAYS (rmbp-ledger B866, OVERLAYARM2): `tests overlays` on the aarch64 `desktop_firmware` desktop is the
+# --- Start-only leg (the Launcher and the switcher are x86's): Start opens through the one `overlay_open` door, its row
+# --- sits at its origin and reads back with no leak. OPTIONAL + FORBID and not REQUIRE, on the DRAG-PI rule above and
+# --- SHELLFACE's: the default kernel8-test battery is knob-off (`desktop_firmware` arms only under UNAOS_PIDESK). The
+# --- OPTIONAL reports the PASS line on an armed battery; the FORBID reds a leak, a missed bracket/excuse row or a Start
+# --- row off its origin. PIDESK-SPEC (an armed kernel8 spec) is the owed row that would let this become a REQUIRE.
+OPTIONAL :: OVERLAYS: launcher=ok appswitch=skip\(x86\) .* -> PASS ::
+FORBID :: OVERLAYS: .* -> FAIL ::

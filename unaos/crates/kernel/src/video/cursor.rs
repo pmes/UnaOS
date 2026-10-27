@@ -1311,7 +1311,7 @@ pub fn cursor11_desk_tick(live: bool) {
         ^ C11_PASSES.load(Ordering::Relaxed).rotate_left(29)
         ^ C11_BRACKETED.load(Ordering::Relaxed).rotate_left(41)
         ^ C11_PIX_DEFERRED.load(Ordering::Relaxed).rotate_left(53)
-        ^ C11_PIX_REDRAWN.load(Ordering::Relaxed) ^ C11_TOAST_WITHHELD.load(Ordering::Relaxed).rotate_left(11); // TOASTFLICKER (B815): the toast control moves the line too (same-line fold)
+        ^ C11_PIX_REDRAWN.load(Ordering::Relaxed) ^ C11_OVERLAY_WITHHELD.load(Ordering::Relaxed).rotate_left(11); // TOASTFLICKER (B815): the toast control moves the line too (same-line fold)
     // `!= 0` so the FIRST armed sample always prints: a zeroed digest is also the initial value of
     // the static, and a boot whose counters genuinely mix to 0 would otherwise wait out the idle
     // beat for its opening line.
@@ -1489,7 +1489,7 @@ pub fn cursor11_rollup(scope: &str) {
     let redrawn = C11_PIX_REDRAWN.load(Ordering::Relaxed);
     let flicker = C11_FLICKER.load(Ordering::Relaxed);
     let absorbed = C11_PIX_ABSORBED.load(Ordering::Relaxed);
-    let refused = C11_ABSORB_REFUSED.load(Ordering::Relaxed); let toast = C11_TOAST_WITHHELD.load(Ordering::Relaxed); // TOASTFLICKER (B815): same-line fold
+    let refused = C11_ABSORB_REFUSED.load(Ordering::Relaxed); let overlay = C11_OVERLAY_WITHHELD.load(Ordering::Relaxed); // TOASTFLICKER (B815): same-line fold
     let verdict = if flicker != 0 {
         "FLICKER"
     } else if passes == 0 && bracketed == 0 {
@@ -1502,8 +1502,8 @@ pub fn cursor11_rollup(scope: &str) {
         "BRACKETED"
     };
     serial_println!(
-        "[cursor11] compose-through scope={} passes={} bracketed={} px_deferred={} px_installed={} px_redrawn={} flicker_frames={} px_absorbed={} absorb_refused={} toast_withheld={} -> {}",
-        scope, passes, bracketed, deferred, installed, redrawn, flicker, absorbed, refused, toast, verdict
+        "[cursor11] compose-through scope={} passes={} bracketed={} px_deferred={} px_installed={} px_redrawn={} flicker_frames={} px_absorbed={} absorb_refused={} overlay_withheld={} -> {}",
+        scope, passes, bracketed, deferred, installed, redrawn, flicker, absorbed, refused, overlay, verdict
     );
     // WEDGE-9 — chained here rather than given its own call site, on `[cursor8]` → `[cursor11]`'s
     // own precedent: it is this pass's story one layer down, and one seam is easier to keep in step
@@ -5477,16 +5477,16 @@ pub const fn shape_count() -> usize {
     }
 }
 
-/// TOASTFLICKER (rmbp-ledger B815) — the toast's CONTROL on `[cursor11]`, `px_absorbed`'s role for the arrow:
-/// notify rows (cards, the Center) an occluder set admitted (`wm::overlay_occludes`: the desktop present's
+/// TOASTFLICKER (rmbp-ledger B815) — the overlays' CONTROL on `[cursor11]`, `px_absorbed`'s role for the arrow:
+/// overlay rows (`wm::overlay_row`: every kernel overlay, OVERLAYARM2 B866; was notify's rows only) an occluder set admitted (`wm::overlay_occludes`: the desktop present's
 /// `occluders`, the erase drain's `erase_clip`, the window blit's `occ_clip`). The toast's leak class — a backdrop
 /// publication over a live card — is closed by construction (its rows ARE in the subtraction); this says the
 /// subtraction ran. `flicker_frames` keeps its meaning (the arrow).
 #[cfg(feature = "witness")]
-static C11_TOAST_WITHHELD: AtomicU64 = AtomicU64::new(0);
+static C11_OVERLAY_WITHHELD: AtomicU64 = AtomicU64::new(0);
 
-/// TOASTFLICKER (B815): one notify row admitted to an occluder set (`wm::overlay_occludes`).
+/// TOASTFLICKER (B815) / OVERLAYARM2 (B866): one overlay row admitted to an occluder set (`wm::overlay_occludes`).
 #[cfg(feature = "witness")]
-pub fn note_toast_withheld() {
-    C11_TOAST_WITHHELD.fetch_add(1, Ordering::Relaxed);
+pub fn note_overlay_withheld() {
+    C11_OVERLAY_WITHHELD.fetch_add(1, Ordering::Relaxed);
 }

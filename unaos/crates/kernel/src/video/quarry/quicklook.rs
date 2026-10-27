@@ -21,7 +21,7 @@
 //!
 //! THE PANEL is DIALOG's family's chromeless overlay row (`wm::overlay_open`, the toast's and the shortcuts
 //! overlay's shape): it never takes focus, so the keyboard stays with Quarry and the arrows keep moving its
-//! selection. aarch64 has no overlay row yet: there it is a titled native row (owner [`OWNER`]).
+//! selection, on both desktop families (OVERLAYARM2 B866); a build without one gets a titled native row (owner [`OWNER`]).
 //!
 //! The decode is I/O, so the key router only LATCHES a request; the panel renders on Quarry's service pass.
 //! Wire, per preview: `[quarry] quicklook path=<p> type=<mime> via=<viewer> ms=<n>`.
@@ -340,9 +340,9 @@ fn show(path: &str) {
     surf.resize(w * h, theme::surface_content());
     render_into(path, &mut surf, w, h);
     let (x, y) = (pw.saturating_sub(w) / 2, ph.saturating_sub(h) / 3);
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     let win = wm::overlay_open(surf.as_ptr() as usize, w * h * 4, w, h, x, y);
-    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     let win = wm::create_at_native(OWNER, surf.as_ptr() as usize, w * h * 4, w as u32, h as u32, (w * 4) as u32, b"Quick Look", x + wm::BORDER(), y + wm::TITLE_H() + wm::BORDER());
     if win == wm::WIN_NONE {
         serial_println!("[quarry3] quicklook DECLINE reason=no-row");
