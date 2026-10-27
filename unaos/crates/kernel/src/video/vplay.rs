@@ -1920,15 +1920,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let clips: usize = st.timeline.tracks.iter().map(|t| t.clips.len()).sum();
         (at, st.timeline.clone(), clips, st.undo_depth(), (tb.to_ns(at).max(0) as u64) / 1_000_000)
     };
-    let leaf = path.rsplit('/').next().unwrap_or(path);
-    let stem = if is_edl(leaf) { &leaf[..leaf.len() - 4] } else { leaf };
-    let saved = match timeline_core::edl::write(&tl, stem) {
-        Ok(text) => match super::export::write_file(path, text.as_bytes()) {
-            Ok(n) => alloc::format!("{}", n),
-            Err(e) => alloc::format!("refused({})", e),
-        },
-        Err(e) => alloc::format!("refused({})", e),
-    };
+    let saved = edit_save(path, &tl); // NLE6FACEDRAG (rmbp-ledger B975): the ONE save, shared with the drag door (file tail)
     serial_println!("[nle] edit {} at={} clips={} undo={} saved={}", verb, at, clips, undo, saved);
     Some(back)
 }
@@ -1961,7 +1953,7 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: u64) -> usize {
     let l = view::Layout::of_role(view::Role::Tracks, w as u32, band as u32, &e.st);
     let mut lab = ViewLabels(0);
     let px = pack(&view::paint_in(&e.st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None));
-    let y0 = vh - band;
+    let y0 = vh - band; band_note(&live, y0, l); // NLE6FACEDRAG (rmbp-ledger B975): the layout painted is the layout a press hits (file tail)
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
         e.said = true;
@@ -2175,4 +2167,151 @@ fn export_frame(jid: u32, tb: timeline_core::Timebase, total: u64, f: &Frame) ->
         _ => None,
     };
     super::export::frame(jid, tb, total, f.w, f.h, planes, || unpack(f.px.rgb()))
+}
+
+// ── NLE6FACEDRAG (rmbp-ledger B975): pointer drags on the view band — the host's ONE `view::Drag` over the painted layout ─────
+// handlers.md §5 NLE6's NLE6FACE-DRAG. [`view_band`] notes the layout it PAINTED ([`band_note`]: the job's path, the band's top
+// row in the Player's surface, the `Layout`), so a press hits what was drawn (the host face's rule). The Player's pointer door
+// (player.rs `edit_press_route`, the picture arm of `press_route`; the capture seam for the motion and the release) hands
+// surface px to [`edit_press`] (`view::Drag::begin_with`, no snap: NLE6DRAG-SNAP owes the kernel's guide line), the motion
+// to [`edit_drag_move`] (`Drag::update`, router depth, no I/O), and the pass runs [`edit_drag_end`] after the release:
+// `Drag::finish` (the host's ONE commit: `EditorState::trim` / `move_selected` / `move_set`) on the Player's editor state,
+// the EDL saved by [`edit_save`] (the ONE save the keys use too), the playhead handed to the seek door. A ruler press is
+// the scrub (the seek door at the tick released on), a press on an empty track spot the marquee (a selection, no save).
+// Wire: `[nle] drag press <kind> at=<tick> track=<n> clip=<n>`, `[nle] drag <move|trim-in|trim-out> from=<tick> to=<tick>
+// clips=<n> undo=<n> saved=<bytes|refused(..)>`, `[nle] drag <kind> from= to= unchanged|refused (<why>)`, `[nle] drag scrub
+// from= to=`, `[nle] drag marquee from= to= selected=<n>`. Witness: player.rs `tests nle` (`drag=`).
+
+/// The layout [`view_band`] last painted: `(job path, band top row, layout)`.
+static BAND: crate::sync::Mutex<Option<(String, usize, timeline_core::view::Layout)>> = crate::sync::Mutex::new(None);
+/// The live drag: `(band top row at the press, the drag)`.
+static DRAG: crate::sync::Mutex<Option<(usize, timeline_core::view::Drag)>> = crate::sync::Mutex::new(None);
+
+/// [`view_band`]'s note of what it painted (a try: a press reading it skips one frame's note).
+fn band_note(live: &str, y0: usize, l: timeline_core::view::Layout) {
+    let Some(mut b) = BAND.try_lock() else { return };
+    match b.as_mut() {
+        Some(n) if n.0 == live => {
+            n.1 = y0;
+            n.2 = l;
+        }
+        _ => *b = Some((String::from(live), y0, l)),
+    }
+}
+
+/// The view band painted for the EDL at `path`: `(band top row in the Player's surface, layout)` (the witness reads it).
+pub fn band_layout(path: &str) -> Option<(usize, timeline_core::view::Layout)> {
+    let g = BAND.try_lock()?;
+    g.as_ref().filter(|b| b.0 == path).map(|b| (b.1, b.2))
+}
+
+/// The EDL's stem (`/home/NLEKEY.EDL` -> `NLEKEY`): its `TITLE:` and the NLE window's title.
+pub fn edl_stem(path: &str) -> &str {
+    let leaf = path.rsplit('/').next().unwrap_or(path);
+    if is_edl(leaf) { &leaf[..leaf.len() - 4] } else { leaf }
+}
+
+/// THE save of an edited timeline (keys and drags): timeline_core's ONE writer (`edl::write`, titled by the stem) through
+/// export.rs `write_file`; the bytes written, or `refused(<why>)`.
+fn edit_save(path: &str, tl: &timeline_core::Timeline) -> String {
+    match timeline_core::edl::write(tl, edl_stem(path)) {
+        Ok(text) => match super::export::write_file(path, text.as_bytes()) {
+            Ok(n) => alloc::format!("{}", n),
+            Err(e) => alloc::format!("refused({})", e),
+        },
+        Err(e) => alloc::format!("refused({})", e),
+    }
+}
+
+fn drag_word(k: timeline_core::view::DragKind) -> &'static str {
+    use timeline_core::view::DragKind;
+    match k {
+        DragKind::TrimIn => "trim-in",
+        DragKind::TrimOut => "trim-out",
+        DragKind::Move => "move",
+        DragKind::Marquee => "marquee",
+        DragKind::Scrub => "scrub",
+    }
+}
+
+/// **A press at surface px `(x, y)`** on the Player's EDL at `path`: on the painted band a drag begins (`Drag::begin_with`,
+/// which selects a pressed clip as the host's does); `false` off the band, off anything, or with no editor state.
+pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
+    let Some((y0, l)) = band_layout(path) else { return false };
+    if y < y0 || y >= y0 + l.h as usize || x >= l.w as usize {
+        return false;
+    }
+    let d = {
+        let Some(mut g) = EDIT.try_lock() else { return false };
+        let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
+        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, true) else { return false };
+        d
+    };
+    *DRAG.lock() = Some((y0, d));
+    serial_println!("[nle] drag press {} at={} track={} clip={}", drag_word(d.kind), d.origin_tick, d.track, d.idx);
+    true
+}
+
+/// The pointer moved to surface px `(x, y)` during a drag (router depth: locks tried, no I/O).
+pub fn edit_drag_move(x: usize, y: usize) {
+    let Some(mut dg) = DRAG.try_lock() else { return };
+    let Some((y0, d)) = dg.as_mut() else { return };
+    let Some(g) = EDIT.try_lock() else { return };
+    let Some(e) = g.as_ref() else { return };
+    d.update(&e.st, x as f64, y as f64 - *y0 as f64);
+}
+
+/// **The drag's release, on the pass**: the host's ONE commit (`Drag::finish`) on the Player's editor state, the EDL saved
+/// when the timeline changed. `Some(ms)`: the playhead (a scrub: the tick released on) for the seek door; `None`: no drag,
+/// unchanged, refused, a marquee, or no EDL open at `path`.
+pub fn edit_drag_end(path: &str) -> Option<u64> {
+    use timeline_core::view::DragKind;
+    let (_, d) = DRAG.lock().take()?;
+    let word = drag_word(d.kind);
+    let (from, to) = (d.origin_tick, d.origin_tick + d.delta);
+    let (tl, clips, undo, back) = {
+        let mut g = EDIT.lock();
+        let e = g.as_mut().filter(|e| e.path == path)?;
+        let st = &mut e.st;
+        let tb = st.timeline.tb;
+        let ms = move |t: i64| (tb.to_ns(t).max(0) as u64) / 1_000_000;
+        match d.kind {
+            DragKind::Scrub => {
+                serial_println!("[nle] drag scrub from={} to={}", from, to);
+                return Some(ms(to));
+            }
+            DragKind::Marquee => {
+                let _ = d.finish(st);
+                serial_println!("[nle] drag marquee from={} to={} selected={}", from, to, st.set.len());
+                return None;
+            }
+            _ => {}
+        }
+        if !d.moved() {
+            serial_println!("[nle] drag {} from={} to={} unchanged", word, from, to);
+            return None;
+        }
+        let before = st.timeline.clone();
+        match d.finish(st) {
+            Ok(()) if st.timeline != before => {}
+            Ok(()) => {
+                serial_println!("[nle] drag {} from={} to={} unchanged", word, from, to);
+                return None;
+            }
+            Err(why) => {
+                serial_println!("[nle] drag {} from={} to={} refused ({})", word, from, to, why);
+                return None;
+            }
+        }
+        let clips: usize = st.timeline.tracks.iter().map(|t| t.clips.len()).sum();
+        (st.timeline.clone(), clips, st.undo_depth(), ms(st.playhead))
+    };
+    let saved = edit_save(path, &tl);
+    serial_println!("[nle] drag {} from={} to={} clips={} undo={} saved={}", word, from, to, clips, undo, saved);
+    Some(back)
+}
+
+/// Drop a live drag (the Player closed); `true` when one was live (the caller cancels its pointer capture).
+pub fn edit_drag_take() -> bool {
+    DRAG.lock().take().is_some()
 }

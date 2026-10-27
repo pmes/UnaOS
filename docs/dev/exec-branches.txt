@@ -957,4 +957,4 @@ refs/heads/exec-rmbp-aacencshort   d7486c8e3 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-displayiccfile   635961260 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264encplanes   78000a72c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kernelpngicc   d9df44ad7 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-nle6keystab   347233922 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle6keystab   33c9f83bb FOLDED-BY-HAND (this commit) 2026-10-27
