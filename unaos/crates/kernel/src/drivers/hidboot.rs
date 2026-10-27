@@ -628,6 +628,7 @@ struct KatSlots {
     refuse: [bool; 2],
     sends: [u32; 2],
     last: [u8; 2],
+    held: [bool; 2], // HIDBOOTLEDSHELDKAT (B1013): a held EP0 (xHCI's HELDSLOTEP0) answers `held`
 }
 
 #[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
@@ -643,7 +644,7 @@ impl LedSlots for KatSlots {
     fn send(&mut self, i: usize, leds: u8) -> Result<(), &'static str> {
         self.sends[i] += 1;
         self.last[i] = leds;
-        if self.refuse[i] { Err("kat-refuse") } else { Ok(()) }
+        if self.held[i] { Err("held") } else if self.refuse[i] { Err("kat-refuse") } else { Ok(()) }
     }
     fn latch_off(&mut self, i: usize) {
         self.ok[i] = false;
@@ -654,9 +655,11 @@ impl LedSlots for KatSlots {
 /// a fake slot owner: `owed` = `decode_boot_keyboard` under `Transport::Ehci` answers true on a lock-key PRESS EDGE only
 /// (restated, released and short reports answer false); `coalesce` = four owed toggles in one pass ship ONE send with
 /// the latest byte, a dead endpoint's dirty slot is skipped and cleared, a clean pass sends nothing; `latch` = a
-/// refusing endpoint is sent to once, latched off, and never again. The decoder runs under `ehci::EHCI_HID`, as every
+/// refusing endpoint is sent to once, latched off, and never again; `held` (HIDBOOTLEDSHELDKAT B1013) = a `held` refusal
+/// is counted refused and printed `why=held` but NOT latched, is not re-sent before the transport re-dirties the slot, and
+/// is sent on the re-dirty (xHCI's `ep0_replay` after the resume). The decoder runs under `ehci::EHCI_HID`, as every
 /// caller does (the DBLSTROKE atomics and the typematic feed). Lock usages carry no character: no `pal::push_event`.
-/// `:: HIDBOOT: owed=ok|bad coalesce=ok|bad latch=ok|bad -> PASS|FAIL ::`
+/// `:: HIDBOOT: owed=ok|bad coalesce=ok|bad latch=ok|bad held=ok|bad -> PASS|FAIL ::`
 #[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
 pub fn selftest() {
     const CAPS: u8 = 0x39;
@@ -672,9 +675,10 @@ pub fn selftest() {
         refuse: [false; 2],
         sends: [0; 2],
         last: [0; 2],
+        held: [false; 2],
     };
     let (mut prev, mut pm) = ([0u8; 6], 0u8);
-    let (owed_ok, coalesce_ok, latch_ok) = {
+    let (owed_ok, coalesce_ok, latch_ok, held_ok) = {
         #[cfg(feature = "ehcihid")] let _g = crate::drivers::ehci::EHCI_HID.lock(); // HIDBOOTARM (B1000): aarch64 has no EHCI; its KAT runs unserialised (lock keys push no event), HIDBOOT-ARM-KATLOCK owed
         // owed: a press edge owes the slot; a restated level, a release and a short report do not.
         let mut leds = 0u8;
@@ -710,13 +714,31 @@ pub fn selftest() {
         }
         let d4 = drain_led_slots(&mut fake, KT);
         let latch_ok = d3 == (0, 1) && !fake.ok[0] && fake.last[0] == 0x01 && d4 == (0, 0) && fake.sends == [2, 0];
-        (owed_ok, coalesce_ok, latch_ok)
+        // held (HIDBOOTLEDSHELDKAT B1013): slot 1 revived and its EP0 held; a `held` refusal is counted, printed
+        // `why=held` and NOT latched; nothing re-sends it until the transport re-dirties the slot (xHCI's `ep0_replay`
+        // sets `keyboard_leds_dirty` after the resume), and then it is sent.
+        fake.dead[1] = false;
+        fake.held[1] = true;
+        let (mut p1, mut m1) = ([0u8; 6], 0u8);
+        for r in [rep(CAPS), up] {
+            if unsafe { decode_boot_keyboard(KT, &r, &mut p1, &mut m1, &mut fake.leds[1]) } {
+                fake.dirty[1] = true;
+            }
+        }
+        let d5 = drain_led_slots(&mut fake, KT);
+        let refused_kept = d5 == (0, 1) && fake.ok[1] && fake.sends[1] == 1 && fake.last[1] == 0x02 && !fake.dirty[1];
+        let d6 = drain_led_slots(&mut fake, KT);
+        fake.held[1] = false;
+        fake.dirty[1] = true; // `ep0_replay`'s re-dirty
+        let d7 = drain_led_slots(&mut fake, KT);
+        let held_ok = refused_kept && d6 == (0, 0) && d7 == (1, 0) && fake.sends == [2, 2] && fake.last[1] == 0x02 && fake.ok[1];
+        (owed_ok, coalesce_ok, latch_ok, held_ok)
     };
     let w = |b: bool| if b { "ok" } else { "bad" };
     serial_println!(
-        ":: HIDBOOT: owed={} coalesce={} latch={} -> {} ::",
-        w(owed_ok), w(coalesce_ok), w(latch_ok),
-        if owed_ok && coalesce_ok && latch_ok { "PASS" } else { "FAIL" }
+        ":: HIDBOOT: owed={} coalesce={} latch={} held={} -> {} ::",
+        w(owed_ok), w(coalesce_ok), w(latch_ok), w(held_ok),
+        if owed_ok && coalesce_ok && latch_ok && held_ok { "PASS" } else { "FAIL" }
     );
 }
 
