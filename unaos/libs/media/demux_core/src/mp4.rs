@@ -14,14 +14,18 @@
 //! dts + ctts − shift`, where `shift` comes from the edit list: the first non-empty edit's
 //! `media_time` is subtracted and any leading empty edits (`media_time == −1`) add their
 //! duration, converted from the movie timescale to the media timescale. Only that common
-//! "one optional empty edit + one media edit" shape is honoured; dwell edits (rate 0) and
-//! multi-segment edit lists are the ceiling.
+//! "one optional empty edit + one media edit" shape shifts the pts; DEMUXSEEK (SR200) keeps EVERY
+//! entry, dwells (rate 0) and rates included, as the track's [`crate::EditSegment`] list.
+//!
+//! DEMUXSEEK (SR200): `sdtp` §8.6.4 and the sample_flags dependency bits (§8.8.3.1) reach
+//! [`crate::Sample::depends`]; `sidx` §8.16.3 and `mfra` / `tfra` / `mfro` §8.8.9-8.8.11 are the index
+//! [`parse_index`] opens a fragmented file by.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::read::Reader;
-use crate::{Codec, Edit, Error, Format, Parsed, Sample, Timebase, Track, TrackKind};
+use crate::{Codec, Edit, EditSegment, Error, Format, IndexPoint, IndexedOpen, Parsed, Sample, SpanReader, Timebase, Track, TrackKind};
 
 /// One box: its type and where its payload lies in the file.
 #[derive(Debug, Clone, Copy)]
@@ -41,26 +45,31 @@ pub fn boxes(data: &[u8], from: usize, to: usize) -> Result<Vec<BoxHeader>, Erro
             // Trailing padding shorter than a header is tolerated at top level only.
             break;
         }
-        let mut r = Reader::new(&data[p..to]);
-        let size32 = r.u32()?;
-        let kind = r.fourcc()?;
-        let (size, mut hdr) = match size32 {
-            0 => ((to - p) as u64, 8usize),
-            1 => (r.u64()?, 16usize),
-            n => (n as u64, 8usize),
-        };
-        if &kind == b"uuid" {
-            r.skip(16)?;
-            hdr += 16;
-        }
-        if size < hdr as u64 || size > (to - p) as u64 {
-            return Err(Error::Invalid("box size outside its parent"));
-        }
-        let end = p + size as usize;
-        out.push(BoxHeader { kind, start: p, body: p + hdr, end });
-        p = end;
+        let b = box_at(data, p, to)?;
+        p = b.end;
+        out.push(b);
     }
     Ok(out)
+}
+
+/// The one box whose header starts at `p` inside `data[..to]`.
+fn box_at(data: &[u8], p: usize, to: usize) -> Result<BoxHeader, Error> {
+    let mut r = Reader::new(&data[p..to]);
+    let size32 = r.u32()?;
+    let kind = r.fourcc()?;
+    let (size, mut hdr) = match size32 {
+        0 => ((to - p) as u64, 8usize),
+        1 => (r.u64()?, 16usize),
+        n => (n as u64, 8usize),
+    };
+    if &kind == b"uuid" {
+        r.skip(16)?;
+        hdr += 16;
+    }
+    if size < hdr as u64 || size > (to - p) as u64 {
+        return Err(Error::Invalid("box size outside its parent"));
+    }
+    Ok(BoxHeader { kind, start: p, body: p + hdr, end: p + size as usize })
 }
 
 fn child<'a>(list: &'a [BoxHeader], kind: &[u8; 4]) -> Option<&'a BoxHeader> {
@@ -98,6 +107,8 @@ struct TrakState {
     samples: Vec<Sample>,
     /// Next decode time for a fragment with no `tfdt`.
     next_dts: i64,
+    /// DEMUXSEEK (SR200): every `elst` entry.
+    edits: Vec<EditSegment>,
 }
 
 const NON_SYNC: u32 = 0x0001_0000;
@@ -128,9 +139,44 @@ fn boxes_partial(data: &[u8]) -> Vec<BoxHeader> {
     out
 }
 
+/// What `moov` says: the movie timescale and duration, `trex` defaults, `mehd`, and every `trak` with its progressive table.
+struct Moov {
+    movie_ts: u32,
+    movie_dur: u64,
+    trex: Vec<Trex>,
+    fragment_dur: Option<u64>,
+    traks: Vec<TrakState>,
+}
+
 pub(crate) fn parse(data: &[u8], partial: bool) -> Result<Parsed, Error> {
     let top = if partial { boxes_partial(data) } else { boxes(data, 0, data.len())? };
     let moov = child(&top, b"moov").ok_or(Error::Invalid("no moov box"))?;
+    let Moov { movie_ts, movie_dur, trex, fragment_dur, mut traks } = parse_moov(data, moov)?;
+
+    // Fragments, in file order.
+    for m in top.iter().filter(|b| &b.kind == b"moof") {
+        parse_moof(data, m, &mut traks, &trex)?;
+    }
+
+    let declared = declared_ns(movie_ts, movie_dur, fragment_dur);
+    apply_smpb(data, moov, &mut traks);
+
+    let mut tracks = Vec::new();
+    let mut samples = Vec::new();
+    let mut edits = Vec::new();
+    for (i, mut t) in traks.into_iter().enumerate() {
+        for s in &mut t.samples {
+            s.track_index = i;
+        }
+        tracks.push(t.track);
+        samples.push(t.samples);
+        edits.push(t.edits);
+    }
+    Ok(Parsed { format: Format::Mp4, tracks, samples, declared_duration_ns: declared, edits })
+}
+
+/// `moov`: `mvhd`, `mvex` (`trex`, `mehd`) and every `trak` — read once, by the full open and the index open alike.
+fn parse_moov(data: &[u8], moov: &BoxHeader) -> Result<Moov, Error> {
     let moov_kids = children(data, moov)?;
 
     let mvhd = child(&moov_kids, b"mvhd").ok_or(Error::Invalid("no mvhd box"))?;
@@ -176,19 +222,21 @@ pub(crate) fn parse(data: &[u8], partial: bool) -> Result<Parsed, Error> {
     for b in moov_kids.iter().filter(|b| &b.kind == b"trak") {
         traks.push(parse_trak(data, b, movie_ts)?);
     }
+    Ok(Moov { movie_ts, movie_dur, trex, fragment_dur, traks })
+}
 
-    // Fragments, in file order.
-    for m in top.iter().filter(|b| &b.kind == b"moof") {
-        parse_moof(data, m, &mut traks, &trex)?;
-    }
-
-    let declared = match fragment_dur {
+/// The declared duration in ns: `mehd`, else `mvhd`'s when it is a real value.
+fn declared_ns(movie_ts: u32, movie_dur: u64, fragment_dur: Option<u64>) -> Option<u64> {
+    match fragment_dur {
         Some(d) if d > 0 => Some(d),
         _ if movie_dur > 0 && movie_dur != u32::MAX as u64 && movie_dur != u64::MAX => Some(movie_dur),
         _ => None,
     }
-    .map(|d| Timebase { num: 1, den: movie_ts as u64 }.to_ns(d as i64) as u64);
+    .map(|d| Timebase { num: 1, den: movie_ts as u64 }.to_ns(d as i64) as u64)
+}
 
+/// AUDIOTRACK (SR45) / MP4ONE (B464): the iTunSMPB facts on the audio tracks.
+fn apply_smpb(data: &[u8], moov: &BoxHeader, traks: &mut [TrakState]) {
     // AUDIOTRACK (SR45): Apple's gapless tag (`moov/udta/meta/ilst/----` "iTunSMPB") for audio
     // tracks no edit list already trimmed: priming to drop and the presented sample count.
     if let Some((pri, total)) = itunsmpb(&data[moov.body..moov.end]) {
@@ -206,17 +254,6 @@ pub(crate) fn parse(data: &[u8], partial: bool) -> Result<Parsed, Error> {
             }
         }
     }
-
-    let mut tracks = Vec::new();
-    let mut samples = Vec::new();
-    for (i, mut t) in traks.into_iter().enumerate() {
-        for s in &mut t.samples {
-            s.track_index = i;
-        }
-        tracks.push(t.track);
-        samples.push(t.samples);
-    }
-    Ok(Parsed { format: Format::Mp4, tracks, samples, declared_duration_ns: declared })
 }
 
 fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState, Error> {
@@ -257,6 +294,7 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
     // AUDIOTRACK (SR45): the media edit's segment duration is the presented length (gapless end).
     let mut play_ns: Option<u64> = None;
     let mut edit: Option<Edit> = None;
+    let mut raw_edits: Vec<(i64, i64, i32)> = Vec::new();
     if let Some(edts) = child(&kids, b"edts") {
         if let Some(elst) = child(&children(data, edts)?, b"elst") {
             let mut r = body(data, elst);
@@ -264,10 +302,16 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
             let n = r.u32()?;
             let mut empty_movie = 0i64;
             for _ in 0..n {
+                if edit.is_some() && r.remaining() < if v == 1 { 20 } else { 12 } {
+                    break; // past the first media edit a short elst ends the list, as the shift never needed it
+                }
                 let (dur, media_time) =
                     if v == 1 { (r.u64()? as i64, r.i64()?) } else { (r.u32()? as i64, r.i32()? as i64) };
-                r.skip(4)?; // media_rate_integer + fraction
-                if media_time == -1 {
+                let rate = r.i32()?; // media_rate_integer + fraction, 16.16
+                raw_edits.push((dur, media_time, rate)); // DEMUXSEEK (SR200): every entry
+                if edit.is_some() {
+                    // the first media edit set the shift; later entries are the segment list's only
+                } else if media_time == -1 {
                     empty_movie += dur;
                 } else {
                     let empty_media = Timebase { num: 1, den: movie_ts as u64 }
@@ -278,7 +322,6 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
                     if dur > 0 {
                         play_ns = Some(Timebase { num: 1, den: movie_ts as u64 }.to_ns(dur) as u64);
                     }
-                    break;
                 }
             }
         }
@@ -315,7 +358,8 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
 
     let samples = build_table(data, &stbl, shift)?;
     let next_dts = samples.last().map(|s| s.dts + s.duration as i64).unwrap_or(0);
-    Ok(TrakState { track, shift, samples, next_dts })
+    let edits = edit_segments(&raw_edits, movie_ts, shift);
+    Ok(TrakState { track, shift, samples, next_dts, edits })
 }
 
 fn parse_stsd(data: &[u8], stsd: &BoxHeader, track: &mut Track) -> Result<(), Error> {
@@ -637,6 +681,7 @@ fn build_table(data: &[u8], stbl: &[BoxHeader], shift: i64) -> Result<Vec<Sample
                 duration: 0,
                 keyframe: true,
                 discard_ns: 0,
+                depends: 0,
             });
             o += sizes[si] as u64;
             si += 1;
@@ -696,6 +741,18 @@ fn build_table(data: &[u8], stbl: &[BoxHeader], shift: i64) -> Result<Vec<Sample
     }
     for (s, c) in out.iter_mut().zip(cto) {
         s.pts = s.dts + c - shift;
+    }
+
+    // DEMUXSEEK (SR200): sample dependency flags (§8.6.4), one byte per sample.
+    if let Some(b) = child(stbl, b"sdtp") {
+        let mut r = body(data, b);
+        full(&mut r)?;
+        for s in out.iter_mut() {
+            if r.remaining() == 0 {
+                break;
+            }
+            s.depends = r.u8()?;
+        }
     }
 
     // Sync samples.
@@ -790,6 +847,7 @@ fn parse_moof(data: &[u8], moof: &BoxHeader, traks: &mut [TrakState], trex: &[Tr
                     duration: dur as u64,
                     keyframe: !is_video || flags & NON_SYNC == 0,
                     discard_ns: 0,
+                    depends: (flags >> 20) as u8, // DEMUXSEEK (SR200): is_leading .. has_redundancy, bits 27..20
                 });
                 cursor += size as u64;
                 dts += dur as i64;
@@ -799,4 +857,180 @@ fn parse_moof(data: &[u8], moof: &BoxHeader, traks: &mut [TrakState], trex: &[Tr
         prev_traf_end = Some(cursor);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------------
+// DEMUXSEEK (LEDGER SR200): the edit list kept whole, and the open by `sidx` / `mfra`.
+// ---------------------------------------------------------------------------------------------------
+
+/// Every `elst` entry (segment_duration in movie ticks, media_time in media ticks, media_rate 16.16) as an
+/// [`EditSegment`] list: movie-timeline starts summed in ns, media times on the pts axis (less the first media edit's shift).
+fn edit_segments(raw: &[(i64, i64, i32)], movie_ts: u32, shift: i64) -> Vec<EditSegment> {
+    let mtb = Timebase { num: 1, den: movie_ts as u64 };
+    let mut start = 0i64;
+    let mut out = Vec::with_capacity(raw.len());
+    for &(dur, media_time, rate) in raw {
+        let duration_ns = mtb.to_ns(dur).max(0) as u64;
+        out.push(EditSegment { start_ns: mtb.to_ns(start), duration_ns, media_pts: (media_time != -1).then(|| media_time - shift), rate });
+        start = start.saturating_add(dur);
+    }
+    out
+}
+
+/// DEMUXSEEK (SR200): what a span load needs of `moov`.
+#[derive(Clone)]
+pub(crate) struct Spans {
+    trex: Vec<Trex>,
+    tracks: Vec<(Track, i64)>,
+}
+
+/// DEMUXSEEK (SR200): the open by a fragmented file's index. The top level is read only up to the first `moof`; the index
+/// is the `sidx` boxes there (each type-0 reference that starts with a SAP: positions from the box's end plus `first_offset`,
+/// times from `earliest_presentation_time` plus the subsegment durations; a type-1 reference — a hierarchical index — means
+/// none), else
+/// the `mfra` the trailing `mfro` points at (each `tfra` entry's time and `moof_offset`). Every position must begin a `moof`,
+/// and the first `moof` must give every `traf` a `tfdt`. `None` for a progressive file or one without a usable index.
+pub(crate) fn parse_index(data: &[u8]) -> Result<Option<IndexedOpen>, Error> {
+    let len = data.len();
+    let mut top: Vec<BoxHeader> = Vec::new();
+    let mut first_moof: Option<usize> = None;
+    let mut p = 0usize;
+    while len - p >= 8 {
+        let b = box_at(data, p, len)?;
+        if &b.kind == b"moof" {
+            first_moof = Some(p);
+            break;
+        }
+        p = b.end;
+        top.push(b);
+    }
+    let Some(first_moof) = first_moof else { return Ok(None) };
+    let Some(moov) = child(&top, b"moov") else { return Ok(None) };
+    let Moov { movie_ts, movie_dur, trex, fragment_dur, mut traks } = parse_moov(data, moov)?;
+    if traks.iter().any(|t| !t.samples.is_empty()) {
+        return Ok(None);
+    }
+    let ti_of = |id: u32| traks.iter().position(|t| t.track.id == id);
+
+    let mut index: Vec<IndexPoint> = Vec::new();
+    for sx in top.iter().filter(|b| &b.kind == b"sidx") {
+        let mut r = body(data, sx);
+        let (v, _) = full(&mut r)?;
+        let ref_id = r.u32()?;
+        let timescale = r.u32()?.max(1);
+        let (ept, first_offset) = if v == 0 { (r.u32()? as i64, r.u32()? as u64) } else { (r.u64()? as i64, r.u64()?) };
+        r.skip(2)?;
+        let count = r.u16()?;
+        let tb = Timebase { num: 1, den: timescale as u64 };
+        let ti = ti_of(ref_id).unwrap_or(0);
+        let mut pos = (sx.end as u64).saturating_add(first_offset);
+        let mut t = ept;
+        for _ in 0..count {
+            let w = r.u32()?;
+            let dur = r.u32()?;
+            let sap = r.u32()?; // starts_with_SAP, SAP_type, SAP_delta_time
+            if w & 0x8000_0000 != 0 {
+                return Ok(None);
+            }
+            if sap & 0x8000_0000 != 0 {
+                // a subsegment that starts with a stream access point: a sync sample a decode may begin at
+                index.push(IndexPoint { track_index: ti, pts_ns: tb.to_ns(t), pos });
+            }
+            pos = pos.saturating_add((w & 0x7FFF_FFFF) as u64);
+            t = t.saturating_add(dur as i64);
+        }
+    }
+    if index.is_empty() && len >= 16 {
+        if let Ok(mfro) = box_at(data, len - 16, len) {
+            if &mfro.kind == b"mfro" {
+                let mut r = body(data, &mfro);
+                full(&mut r)?;
+                let size = r.u32()? as usize;
+                if size >= 8 && size <= len {
+                    let mfra = box_at(data, len - size, len)?;
+                    if &mfra.kind == b"mfra" {
+                        for tf in children(data, &mfra)?.iter().filter(|b| &b.kind == b"tfra") {
+                            let mut r = body(data, tf);
+                            let (v, _) = full(&mut r)?;
+                            let id = r.u32()?;
+                            let sizes = r.u32()?;
+                            let (lt, lr, ls) = (((sizes >> 4) & 3) as usize + 1, ((sizes >> 2) & 3) as usize + 1, (sizes & 3) as usize + 1);
+                            let n = r.u32()?;
+                            let Some(ti) = ti_of(id) else { continue };
+                            let tb = traks[ti].track.timebase;
+                            for _ in 0..n {
+                                let (time, off) = if v == 1 { (r.u64()? as i64, r.u64()?) } else { (r.u32()? as i64, r.u32()? as u64) };
+                                r.skip(lt + lr + ls)?;
+                                index.push(IndexPoint { track_index: ti, pts_ns: tb.to_ns(time), pos: off });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if index.is_empty() {
+        return Ok(None);
+    }
+    for x in &index {
+        let at = x.pos as usize;
+        if at < first_moof || at >= len || len - at < 8 || &box_at(data, at, len)?.kind != b"moof" {
+            return Ok(None);
+        }
+    }
+    let m0 = box_at(data, first_moof, len)?;
+    if !crate::fragment::moof_has_tfdt(&data[m0.start..m0.end])? {
+        return Ok(None);
+    }
+
+    let mut starts: Vec<u64> = index.iter().map(|x| x.pos).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    if starts[0] > first_moof as u64 {
+        starts.insert(0, first_moof as u64);
+    }
+    let spans: Vec<(u64, u64)> = starts.iter().enumerate().map(|(i, &a)| (a, starts.get(i + 1).copied().unwrap_or(len as u64))).collect();
+
+    let declared = declared_ns(movie_ts, movie_dur, fragment_dur);
+    apply_smpb(data, moov, &mut traks);
+    let sp = Spans { trex, tracks: traks.iter().map(|t| (t.track.clone(), t.shift)).collect() };
+    let n = traks.len();
+    let mut tracks = Vec::with_capacity(n);
+    let mut edits = Vec::with_capacity(n);
+    for t in traks {
+        tracks.push(t.track);
+        edits.push(t.edits);
+    }
+    let parsed = Parsed { format: Format::Mp4, tracks, samples: alloc::vec![Vec::new(); n], declared_duration_ns: declared, edits };
+    Ok(Some(IndexedOpen { parsed, index, spans, reader: SpanReader::Mp4(sp) }))
+}
+
+/// DEMUXSEEK (SR200): one span `[from, to)` of an indexed open — each `moof` through [`parse_moof`] (a `moof` without a
+/// `tfdt` in every `traf` is refused: its decode times would depend on the fragments not read), other boxes skipped.
+pub(crate) fn load_span(data: &[u8], sp: &Spans, from: usize, to: usize) -> Result<Vec<Vec<Sample>>, Error> {
+    let len = data.len();
+    let mut traks: Vec<TrakState> = sp
+        .tracks
+        .iter()
+        .map(|(t, shift)| TrakState { track: t.clone(), shift: *shift, samples: Vec::new(), next_dts: 0, edits: Vec::new() })
+        .collect();
+    let mut p = from;
+    while p < to.min(len) && len - p >= 8 {
+        let b = box_at(data, p, len)?;
+        if &b.kind == b"moof" {
+            if !crate::fragment::moof_has_tfdt(&data[b.start..b.end])? {
+                return Err(Error::Unsupported("a fragment without tfdt cannot be read by the index"));
+            }
+            parse_moof(data, &b, &mut traks, &sp.trex)?;
+        }
+        p = b.end;
+    }
+    let mut out = Vec::with_capacity(traks.len());
+    for (i, mut t) in traks.into_iter().enumerate() {
+        for s in t.samples.iter_mut() {
+            s.track_index = i;
+        }
+        out.push(t.samples);
+    }
+    Ok(out)
 }

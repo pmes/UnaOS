@@ -422,7 +422,7 @@ fn strip_duration(info: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 /// Every `traf` of a `moof` carries a `tfdt` (MSE ISO BMFF byte stream format §"Media Segments").
-fn moof_has_tfdt(moof: &[u8]) -> Result<bool, Error> {
+pub(crate) fn moof_has_tfdt(moof: &[u8]) -> Result<bool, Error> {
     let kids = crate::mp4::boxes(moof, 8, moof.len())?;
     for traf in kids.iter().filter(|b| &b.kind == b"traf") {
         let tk = crate::mp4::boxes(moof, traf.body, traf.end)?;

@@ -1198,6 +1198,7 @@ version = "0.1.0"
 dependencies = [
  "audio_core",
  "av1_core",
+ "h264_core",
  "vp8_core",
 ]
 

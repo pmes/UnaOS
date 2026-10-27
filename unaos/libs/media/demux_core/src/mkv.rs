@@ -16,15 +16,21 @@
 //! Timing: every Matroska track here uses a nanosecond timebase. A block's time is
 //! `(Cluster.Timestamp + Block.relative) × TimestampScale`; frame k of a laced block adds
 //! `k × DefaultDuration`. Matroska stores no decode timestamps — blocks are in decode order — so
-//! `dts = pts` (exact for AV1/VP8/VP9/Opus/Vorbis; for reordering codecs such as AVC the dts is
-//! the ceiling). A frame's duration is BlockDuration, else DefaultDuration, else the gap to the
-//! track's next frame, else (last frame) the remainder of the declared segment duration.
+//! `dts = pts` (exact for AV1/VP8/VP9/Opus/Vorbis) until the caller hands
+//! [`crate::Demuxer::derive_dts`] the codec's reorder depth (DEMUXSEEK SR200: [`derive_dts`] below). A
+//! frame's duration is BlockDuration, else DefaultDuration, else the gap to the track's next frame in
+//! PRESENTATION order ([`fill_durations`]), else (last frame) the remainder of the declared segment
+//! duration.
+//!
+//! DEMUXSEEK (SR200): SeekHead 0x114D9B74 (Seek 0x4DBB → SeekID 0x53AB, SeekPosition 0x53AC) and Cues
+//! 0x1C53BB6B (CuePoint 0xBB → CueTime 0xB3, CueTrackPositions 0xB7 → CueTrack 0xF7,
+//! CueClusterPosition 0xF1; RFC 9559 §5.1.5) are read by [`parse_index`], the open by the file's index.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::read::Reader;
-use crate::{Codec, Error, Format, Parsed, Sample, Timebase, Track, TrackKind};
+use crate::{Codec, Error, Format, IndexPoint, IndexedOpen, Parsed, Sample, SpanReader, Timebase, Track, TrackKind};
 
 const ID_EBML: u32 = 0x1A45_DFA3;
 const ID_DOCTYPE: u32 = 0x4282;
@@ -62,6 +68,17 @@ const ID_BLOCK_DURATION: u32 = 0x9B;
 const ID_REFERENCE_BLOCK: u32 = 0xFB;
 /// BlockGroup DiscardPadding (signed ns; RFC 9559 §5.1.3.5.6) — AUDIOTRACK (SR45).
 const ID_DISCARD_PADDING: u32 = 0x75A2;
+// DEMUXSEEK (SR200): the index elements (RFC 9559 §5.1.1 SeekHead, §5.1.5 Cues).
+const ID_SEEK_HEAD: u32 = 0x114D_9B74;
+const ID_SEEK: u32 = 0x4DBB;
+const ID_SEEK_ID: u32 = 0x53AB;
+const ID_SEEK_POSITION: u32 = 0x53AC;
+const ID_CUES: u32 = 0x1C53_BB6B;
+const ID_CUE_POINT: u32 = 0xBB;
+const ID_CUE_TIME: u32 = 0xB3;
+const ID_CUE_TRACK_POSITIONS: u32 = 0xB7;
+const ID_CUE_TRACK: u32 = 0xF7;
+const ID_CUE_CLUSTER_POSITION: u32 = 0xF1;
 
 /// Top-level Segment children: an unknown-size Cluster ends where one of these begins.
 const SEGMENT_CHILDREN: [u32; 8] = [
@@ -171,7 +188,8 @@ struct TrackState {
     has_duration: Vec<bool>,
 }
 
-pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
+/// The EBML header's DocType and the Segment element (any Void/CRC between skipped) — the start both opens share.
+fn segment(data: &[u8]) -> Result<(Format, El), Error> {
     let header = read_el(data, 0, data.len())?;
     if header.id != ID_EBML {
         return Err(Error::UnknownFormat);
@@ -198,7 +216,33 @@ pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
         }
         p = e.end;
     };
+    Ok((format, seg))
+}
 
+/// Info: TimestampScale and Duration.
+fn info(data: &[u8], e: &El, scale: &mut u64, duration_ticks: &mut Option<f64>) -> Result<(), Error> {
+    for c in kids(data, e.body, e.end)? {
+        match c.id {
+            ID_TIMESTAMP_SCALE => *scale = uint(data, &c)?.max(1),
+            ID_DURATION => *duration_ticks = Some(float(data, &c)?),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Tracks: every TrackEntry.
+fn track_entries(data: &[u8], e: &El, tracks: &mut Vec<TrackState>) -> Result<(), Error> {
+    for te in kids(data, e.body, e.end)? {
+        if te.id == ID_TRACK_ENTRY {
+            tracks.push(parse_track(data, &te)?);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
+    let (format, seg) = segment(data)?;
     let mut scale: u64 = 1_000_000;
     let mut duration_ticks: Option<f64> = None;
     let mut tracks: Vec<TrackState> = Vec::new();
@@ -207,21 +251,11 @@ pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
         let e = read_el(data, p, seg.end)?;
         match e.id {
             ID_INFO => {
-                for c in kids(data, e.body, e.end)? {
-                    match c.id {
-                        ID_TIMESTAMP_SCALE => scale = uint(data, &c)?.max(1),
-                        ID_DURATION => duration_ticks = Some(float(data, &c)?),
-                        _ => {}
-                    }
-                }
+                info(data, &e, &mut scale, &mut duration_ticks)?;
                 p = e.end;
             }
             ID_TRACKS => {
-                for te in kids(data, e.body, e.end)? {
-                    if te.id == ID_TRACK_ENTRY {
-                        tracks.push(parse_track(data, &te)?);
-                    }
-                }
+                track_entries(data, &e, &mut tracks)?;
                 p = e.end;
             }
             ID_CLUSTER => {
@@ -238,31 +272,19 @@ pub(crate) fn parse(data: &[u8]) -> Result<Parsed, Error> {
 
     let declared = duration_ticks.map(|d| round_f64(d * scale as f64));
 
-    // Fill durations a block did not carry: gap to the track's next frame.
+    // Fill durations a block did not carry: gap to the track's next frame in presentation order.
     let mut out_tracks = Vec::new();
     let mut out_samples = Vec::new();
     for (i, mut t) in tracks.into_iter().enumerate() {
-        let n = t.samples.len();
-        for k in 0..n {
-            t.samples[k].track_index = i;
-            if t.has_duration[k] {
-                continue;
-            }
-            let d = if k + 1 < n {
-                (t.samples[k + 1].pts - t.samples[k].pts).max(0) as u64
-            } else {
-                match declared {
-                    Some(end) if end as i64 > t.samples[k].pts => end - t.samples[k].pts as u64,
-                    _ if k > 0 => t.samples[k - 1].duration,
-                    _ => 0,
-                }
-            };
-            t.samples[k].duration = d;
+        for s in t.samples.iter_mut() {
+            s.track_index = i;
         }
+        fill_durations(&mut t.samples, &t.has_duration, declared);
         out_tracks.push(t.track);
         out_samples.push(t.samples);
     }
-    Ok(Parsed { format, tracks: out_tracks, samples: out_samples, declared_duration_ns: declared })
+    let edits = alloc::vec![Vec::new(); out_tracks.len()];
+    Ok(Parsed { format, tracks: out_tracks, samples: out_samples, declared_duration_ns: declared, edits })
 }
 
 fn parse_track(data: &[u8], te: &El) -> Result<TrackState, Error> {
@@ -551,9 +573,235 @@ fn block(
             duration: explicit.unwrap_or(0),
             keyframe: keyframe && k == 0 || (keyframe && ts.track.kind != TrackKind::Video),
             discard_ns: 0,
+            depends: 0,
         });
         ts.has_duration.push(explicit.is_some());
         off += sz;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------------
+// DEMUXSEEK (LEDGER SR200): presentation-order durations, decode times from the reorder depth, the open by Cues.
+// ---------------------------------------------------------------------------------------------------
+
+/// Fill the durations a block did not carry: the gap to the frame that follows in PRESENTATION order (indices stably
+/// sorted by pts — identical to the decode-order gap on a track whose pts never fall), the last such frame the remainder of
+/// the declared duration, else the previous frame's duration.
+fn fill_durations(samples: &mut [Sample], has_duration: &[bool], declared: Option<u64>) {
+    let n = samples.len();
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by_key(|&k| samples[k].pts);
+    for j in 0..n {
+        let k = idx[j];
+        if has_duration.get(k).copied().unwrap_or(false) {
+            continue;
+        }
+        let pts = samples[k].pts;
+        let d = if j + 1 < n {
+            (samples[idx[j + 1]].pts - pts).max(0) as u64
+        } else {
+            match declared {
+                Some(end) if end as i64 > pts => end - pts as u64,
+                _ if j > 0 => samples[idx[j - 1]].duration,
+                _ => 0,
+            }
+        };
+        samples[k].duration = d;
+    }
+}
+
+/// DEMUXSEEK (SR200): one track's decode times from the codec's reorder depth `depth` (see [`crate::DecodeTime`]): the pts
+/// sorted ascending give `dts[i] = sorted[i - depth]`, the first `depth` extrapolated back by the smallest positive pts step.
+/// With reorder depth d at least i-d+1 of the first i+1 decoded frames are presented no later than frame i (H.264 E.2.1
+/// `max_num_reorder_frames`), so `sorted[i-d] <= pts[i]`. A depth the samples contradict (a dts past its pts, or a dts that
+/// does not increase) changes nothing and returns false.
+pub(crate) fn derive_dts(samples: &mut [Sample], depth: u32) -> bool {
+    let n = samples.len();
+    if n == 0 {
+        return true;
+    }
+    let d = depth as usize;
+    let mut sorted: Vec<i64> = samples.iter().map(|s| s.pts).collect();
+    sorted.sort_unstable();
+    let step = sorted
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&g| g > 0)
+        .min()
+        .unwrap_or_else(|| (samples[0].duration as i64).max(1));
+    let dts: Vec<i64> = (0..n)
+        .map(|i| if i >= d { sorted[i - d] } else { sorted[0].saturating_sub(((d - i) as i64).saturating_mul(step)) })
+        .collect();
+    if dts.iter().zip(samples.iter()).any(|(&t, s)| t > s.pts) || dts.windows(2).any(|w| w[1] <= w[0]) {
+        return false;
+    }
+    for (s, t) in samples.iter_mut().zip(dts) {
+        s.dts = t;
+    }
+    true
+}
+
+/// DEMUXSEEK (SR200): what a span load needs of the headers.
+#[derive(Clone)]
+pub(crate) struct Spans {
+    seg_end: usize,
+    scale: u64,
+    tracks: Vec<Track>,
+    default_durations: Vec<u64>,
+    declared: Option<u64>,
+}
+
+/// DEMUXSEEK (SR200): the open by the file's Cues. The Segment's children up to the first Cluster are read (Info, Tracks,
+/// SeekHead, Cues); Cues the head does not hold are read where the SeekHead points. Every CueClusterPosition (relative to
+/// the Segment's body) must begin a Cluster. `None` when the file has no usable Cues (the caller opens it whole).
+pub(crate) fn parse_index(data: &[u8]) -> Result<Option<IndexedOpen>, Error> {
+    let (format, seg) = segment(data)?;
+    let mut scale: u64 = 1_000_000;
+    let mut duration_ticks: Option<f64> = None;
+    let mut tracks: Vec<TrackState> = Vec::new();
+    let mut cues: Option<El> = None;
+    let mut cues_at: Option<usize> = None;
+    let mut first_cluster: Option<usize> = None;
+    let mut p = seg.body;
+    while p < seg.end {
+        let e = read_el(data, p, seg.end)?;
+        match e.id {
+            ID_INFO => info(data, &e, &mut scale, &mut duration_ticks)?,
+            ID_TRACKS => track_entries(data, &e, &mut tracks)?,
+            ID_SEEK_HEAD => {
+                for sk in kids(data, e.body, e.end)?.iter().filter(|x| x.id == ID_SEEK) {
+                    let (mut id, mut pos) = (0u64, None);
+                    for c in kids(data, sk.body, sk.end)? {
+                        match c.id {
+                            ID_SEEK_ID => id = uint(data, &c)?,
+                            ID_SEEK_POSITION => pos = Some(uint(data, &c)?),
+                            _ => {}
+                        }
+                    }
+                    if id == ID_CUES as u64 {
+                        cues_at = pos.and_then(|x| seg.body.checked_add(x as usize));
+                    }
+                }
+            }
+            ID_CUES => cues = Some(e),
+            ID_CLUSTER => {
+                first_cluster = Some(p);
+                break;
+            }
+            _ => {}
+        }
+        if e.unknown {
+            return Ok(None);
+        }
+        p = e.end;
+    }
+    let Some(first_cluster) = first_cluster else { return Ok(None) };
+    if cues.is_none() {
+        if let Some(at) = cues_at.filter(|&at| at < seg.end) {
+            let e = read_el(data, at, seg.end)?;
+            if e.id == ID_CUES && !e.unknown {
+                cues = Some(e);
+            }
+        }
+    }
+    let Some(cues) = cues else { return Ok(None) };
+
+    let mut index: Vec<IndexPoint> = Vec::new();
+    for cp in kids(data, cues.body, cues.end)?.iter().filter(|x| x.id == ID_CUE_POINT) {
+        let mut time: Option<u64> = None;
+        let mut at: Vec<(u64, u64)> = Vec::new();
+        for c in kids(data, cp.body, cp.end)? {
+            match c.id {
+                ID_CUE_TIME => time = Some(uint(data, &c)?),
+                ID_CUE_TRACK_POSITIONS => {
+                    let (mut trk, mut pos) = (None, None);
+                    for x in kids(data, c.body, c.end)? {
+                        match x.id {
+                            ID_CUE_TRACK => trk = Some(uint(data, &x)?),
+                            ID_CUE_CLUSTER_POSITION => pos = Some(uint(data, &x)?),
+                            _ => {}
+                        }
+                    }
+                    if let (Some(t), Some(q)) = (trk, pos) {
+                        at.push((t, q));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(time) = time else { continue };
+        for (trk, rel) in at {
+            let Some(ti) = tracks.iter().position(|t| t.track.id as u64 == trk) else { continue };
+            let pos = seg.body.checked_add(rel as usize).ok_or(Error::Invalid("CueClusterPosition overflow"))?;
+            if pos >= seg.end || pos < first_cluster {
+                return Ok(None);
+            }
+            let mut r = Reader::new(&data[pos..seg.end]);
+            if read_id(&mut r).ok() != Some(ID_CLUSTER) {
+                return Ok(None);
+            }
+            index.push(IndexPoint { track_index: ti, pts_ns: (time as i64).saturating_mul(scale as i64), pos: pos as u64 });
+        }
+    }
+    if index.is_empty() {
+        return Ok(None);
+    }
+    let mut starts: Vec<u64> = index.iter().map(|x| x.pos).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    if starts[0] > first_cluster as u64 {
+        starts.insert(0, first_cluster as u64);
+    }
+    let spans: Vec<(u64, u64)> =
+        starts.iter().enumerate().map(|(i, &a)| (a, starts.get(i + 1).copied().unwrap_or(seg.end as u64))).collect();
+
+    let declared = duration_ticks.map(|d| round_f64(d * scale as f64));
+    let sp = Spans {
+        seg_end: seg.end,
+        scale,
+        tracks: tracks.iter().map(|t| t.track.clone()).collect(),
+        default_durations: tracks.iter().map(|t| t.default_duration).collect(),
+        declared,
+    };
+    let n = tracks.len();
+    let parsed = Parsed {
+        format,
+        tracks: tracks.into_iter().map(|t| t.track).collect(),
+        samples: alloc::vec![Vec::new(); n],
+        declared_duration_ns: declared,
+        edits: alloc::vec![Vec::new(); n],
+    };
+    Ok(Some(IndexedOpen { parsed, index, spans, reader: SpanReader::Mkv(sp) }))
+}
+
+/// DEMUXSEEK (SR200): one span `[from, to)` of an indexed open — its Clusters through [`parse_cluster`] (a Cues, Tags or
+/// Void child skipped), durations by [`fill_durations`] (the declared remainder only in the `last` span).
+pub(crate) fn load_span(data: &[u8], sp: &Spans, from: usize, to: usize, last: bool) -> Result<Vec<Vec<Sample>>, Error> {
+    let mut ts: Vec<TrackState> = sp
+        .tracks
+        .iter()
+        .zip(&sp.default_durations)
+        .map(|(t, &dd)| TrackState { track: t.clone(), default_duration: dd, samples: Vec::new(), has_duration: Vec::new() })
+        .collect();
+    let mut p = from;
+    while p < to.min(sp.seg_end) {
+        let e = read_el(data, p, sp.seg_end)?;
+        if e.id == ID_CLUSTER {
+            p = parse_cluster(data, &e, sp.seg_end, sp.scale, &mut ts)?;
+        } else if e.unknown {
+            return Err(Error::Unsupported("unknown-size element other than Segment/Cluster"));
+        } else {
+            p = e.end;
+        }
+    }
+    let mut out = Vec::with_capacity(ts.len());
+    for (i, mut t) in ts.into_iter().enumerate() {
+        for s in t.samples.iter_mut() {
+            s.track_index = i;
+        }
+        fill_durations(&mut t.samples, &t.has_duration, if last { sp.declared } else { None });
+        out.push(t.samples);
+    }
+    Ok(out)
 }

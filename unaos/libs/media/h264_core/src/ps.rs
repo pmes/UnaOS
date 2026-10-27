@@ -811,3 +811,26 @@ pub fn check_sps(sps: &Sps) -> Result<()> {
     }
     Ok(())
 }
+
+/// DEMUXSEEK (LEDGER SR200): the stream's reorder depth from its `avcC` (ISO/IEC 14496-15 §5.3.3.1) — the number a
+/// container with no decode times (Matroska) needs to derive them (`demux_core::Demuxer::derive_dts`). The first SPS's
+/// VUI `max_num_reorder_frames` when stated; else E.2.1's inference: 0 for profile_idc 44/86/100/110/122/244 with
+/// constraint_set3_flag (intra profiles), else MaxDpbFrames ([`Sps::dpb_frames`]); `pic_order_cnt_type` 2 is 0 (8.2.1.3:
+/// output order is decoding order). `None` when the record or its SPS does not parse.
+pub fn avcc_reorder_depth(avcc: &[u8]) -> Option<u32> {
+    let cfg = crate::nal::parse_avcc(avcc).ok()?;
+    let nal = cfg.sps.first()?;
+    let mut rbsp = Vec::new();
+    crate::nal::unescape(nal.get(1..)?, &mut rbsp);
+    let sps = parse_sps(&rbsp).ok()?;
+    if let Some(n) = sps.max_num_reorder {
+        return Some(n);
+    }
+    if sps.poc_type == 2 {
+        return Some(0);
+    }
+    if sps.constraint_set3 && matches!(sps.profile_idc, 44 | 86 | 100 | 110 | 122 | 244) {
+        return Some(0);
+    }
+    Some(sps.dpb_frames() as u32)
+}
