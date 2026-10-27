@@ -4046,7 +4046,7 @@ fn micring3_selftest() {
     {
         use crate::arch::syscall::BgPoll;
         use crate::video::dialog::{self, Answer};
-        const PATH: &str = "/apps/MICRING3.ELF";
+        const PATH: &str = "/apps/MICRING3.ELF"; let kat = crate::drivers::usb::uac::cursor_kats(); // MICCURSOR (B871): the cursor KAT first, so a SKIP image still runs it
         const APP: &str = "micring3";
         const ASKED: usize = 0;
         const OPENED: usize = 1;
@@ -4055,7 +4055,7 @@ fn micring3_selftest() {
         const TERM: usize = 4;
         const CLOSED: usize = 5;
         const NODEV: usize = 6;
-        let skip = |why: &str| serial_println!(":: MICRING3: asked=- opened=- read_bytes=- revoked=- terminate=- -> SKIP :: reason={} ::", why);
+        let skip = |why: &str| serial_println!(":: MICRING3: asked=- opened=- read_bytes=- revoked=- terminate=- -> {} :: reason={} cursor_kat={} ::", if kat { "SKIP" } else { "FAIL" }, why, if kat { "ok" } else { "FAIL" });
         if dialog::is_up() {
             return skip("dialog-up");
         }
@@ -4122,7 +4122,7 @@ fn micring3_selftest() {
         if d(NODEV) > 0 && opened == 0 {
             forget();
             dialog::headless(was);
-            serial_println!(":: MICRING3: asked={} opened=0 read_bytes=0 revoked=- terminate=- -> SKIP :: reason=no-capture-device (QEMU's usb-audio has no capture alternate) ::", asked);
+            serial_println!(":: MICRING3: asked={} opened=0 read_bytes=0 revoked=- terminate=- -> {} :: reason=no-capture-device (QEMU's usb-audio has no capture alternate) cursor_kat={} ::", asked, if kat { "SKIP" } else { "FAIL" }, if kat { "ok" } else { "FAIL" });
             return;
         }
 
@@ -4168,13 +4168,13 @@ fn micring3_selftest() {
             }
             Err(why) => serial_println!("[micring3] run=exit refused={}", why),
         }
-        forget();
+        let two = micring3_two(&bytes, &key, &wait, &finish, &idle); forget(); // MICCURSOR (B871): (4) two readers, each every frame; one Revoke closes both (file tail)
         dialog::headless(was);
-        let pass = asked == 1 && opened == 1 && read_bytes > 0 && closed == 1 && idle1 && revoked_ok && term_ok && d(ASKED) == 1;
+        let pass = asked == 1 && opened == 1 && read_bytes > 0 && closed == 1 && idle1 && revoked_ok && term_ok && d(ASKED) == 1 && two.ok && kat;
         serial_println!(
-            ":: MICRING3: asked={} opened={} read_bytes={} revoked={} terminate={} -> {} :: revoke_ms={} opens={} after_revoke={} ::",
+            ":: MICRING3: asked={} opened={} read_bytes={} revoked={} terminate={} -> {} :: revoke_ms={} opens={} after_revoke={} readers={} frames_a={} frames_b={} split={} cursor_kat={} ::",
             asked, opened, read_bytes, if revoked_ok { "closed" } else { "open" }, if term_ok { "closed" } else { "open" },
-            if pass { "PASS" } else { "FAIL" }, rv_ms, d(OPENED), after_revoke
+            if pass { "PASS" } else { "FAIL" }, rv_ms, d(OPENED), after_revoke, two.readers, two.a, two.b, two.split, if kat { "ok" } else { "FAIL" }
         );
     }
     #[cfg(not(all(feature = "uac", target_arch = "x86_64", feature = "wc")))]
@@ -7708,4 +7708,75 @@ fn overlays_selftest() {
     let word: alloc::string::String = if ext.legs == 0 { "skip(start)".into() } else { overlays_word(rb, lk) };
     let v = if lk > 0 || ext.bad() { "FAIL" } else if rb == 0 { "SKIP" } else { "PASS" };
     overlays_say(word.as_str(), "skip(x86)", rb, lk, v, &ext);
+}
+
+// ══════════════ MICCURSOR (rmbp-ledger B871, BP-audio-12) — `tests micring3`'s two-reader leg — TAIL-APPENDED ══════════════
+// Run (4), from the final `forget();` line of [`micring3_selftest`] with its own `wait` / `finish` / `idle`: the grant kept,
+// `micring3 hold` launched TWICE (OPEN on one slot answers -EBUSY, so two programs), both sources open, a 1000 ms window
+// in which each slot's READ frames (`audio::ring3_frames`) are measured against what the producer wrote (the ring's head
+// delta / frame bytes); `split=0` iff each reader read at least 3/4 of it (one shared tail gave each about half). Then the
+// Revoke in the Privacy tab's order closes BOTH (`sources_closed=2`), the pipe goes idle, both programs saw -EPERM.
+// Wire: `[micring3] run=two readers=<n> frames_a=<n> frames_b=<n> produced=<n> split=<0|1> sources_closed=<n> idle=<0|1>
+// eperm_a=<0|1> eperm_b=<0|1>`.
+
+#[cfg(all(feature = "uac", target_arch = "x86_64", feature = "wc"))]
+struct MicTwo {
+    readers: u32,
+    a: u64,
+    b: u64,
+    split: u8,
+    ok: bool,
+}
+
+#[cfg(all(feature = "uac", target_arch = "x86_64", feature = "wc"))]
+fn micring3_two(bytes: &[u8], key: &str, wait: &dyn Fn(u64, &dyn Fn() -> bool) -> bool, finish: &dyn Fn(u64, u64) -> Option<i32>, idle: &dyn Fn() -> bool) -> MicTwo {
+    const APP: &str = "micring3";
+    const REVOKED: usize = 3;
+    let mut out = MicTwo { readers: 0, a: 0, b: 0, split: 1, ok: false };
+    crate::prefs::decide(crate::fs::apptrust::MIC_DOMAIN, APP, "-", "allow");
+    let ra = crate::arch::syscall::spawn_user_image_bg_argv(bytes, &[APP, "hold"]);
+    let rb = crate::arch::syscall::spawn_user_image_bg_argv(bytes, &[APP, "hold"]);
+    let ((pa, sa, _), (pb, sb, _)) = match (ra, rb) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            for r in [a, b] {
+                match r {
+                    Ok((p, s, _)) => {
+                        let _ = finish(p, s);
+                    }
+                    Err(why) => serial_println!("[micring3] run=two refused={}", why),
+                }
+            }
+            return out;
+        }
+    };
+    let (ua, ub) = (sa as usize, sb as usize);
+    let r0 = crate::audio::ring3_counts()[REVOKED];
+    if !wait(3_000, &|| crate::audio::ring3_open(ua) != 0 && crate::audio::ring3_open(ub) != 0) {
+        let (st_a, st_b) = (finish(pa, sa), finish(pb, sb));
+        serial_println!("[micring3] run=two status_a={:?} status_b={:?} (both sources not open in 3 s)", st_a, st_b);
+        return out;
+    }
+    out.readers = 2;
+    let fb = crate::drivers::usb::uac::capture_frame_bytes().max(1) as u64;
+    let (a0, b0, h0) = (crate::audio::ring3_frames(ua), crate::audio::ring3_frames(ub), crate::drivers::usb::uac::capture_head());
+    wait(1_000, &|| false);
+    let (a1, b1, h1) = (crate::audio::ring3_frames(ua), crate::audio::ring3_frames(ub), crate::drivers::usb::uac::capture_head());
+    let produced = h1.wrapping_sub(h0) as u64 / fb;
+    out.a = a1 - a0;
+    out.b = b1 - b0;
+    out.split = if produced > 0 && out.a * 4 >= produced * 3 && out.b * 4 >= produced * 3 { 0 } else { 1 };
+    crate::fs::apptrust::mic_revoked(key); // the tab's order: the hook BEFORE the store write
+    let dropped = crate::prefs::revoke(key);
+    let n_closed = crate::audio::ring3_counts()[REVOKED] - r0;
+    let shut = crate::audio::ring3_open(ua) == 0 && crate::audio::ring3_open(ub) == 0 && n_closed == 2;
+    let idle4 = idle();
+    let (st_a, st_b) = (finish(pa, sa), finish(pb, sb));
+    let (ea, eb) = (st_a.is_some_and(|s| s & (1 << 22) != 0), st_b.is_some_and(|s| s & (1 << 22) != 0));
+    out.ok = out.split == 0 && dropped && shut && idle4 && ea && eb;
+    serial_println!(
+        "[micring3] run=two readers={} frames_a={} frames_b={} produced={} split={} sources_closed={} idle={} eperm_a={} eperm_b={}",
+        out.readers, out.a, out.b, produced, out.split, n_closed, idle4 as u8, ea as u8, eb as u8
+    );
+    out
 }
