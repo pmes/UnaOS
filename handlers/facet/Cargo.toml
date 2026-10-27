@@ -20,6 +20,10 @@ log = "0.4"
 # zero dependencies (FACETPIXEL, SR43). Linked by path, not via gneiss_pal (whose default `std` feature
 # pulls an HTTP stack); `gneiss_pal::dsp::image` re-exports this very crate.
 pixel_core = { path = "../../unaos/libs/media/pixel_core" }
+# HEVCHEIC (SR220): HEIC stills decode through `gneiss_pal::dsp::image::decode_heic` (demux_core's HEIF reader +
+# hevc_core). Default features ON: gneiss_pal's `pub mod api` is not gated on `std`, so Facet now links http_core and
+# tokio through gneiss_pal (the seat's ruling, option A); GNEISSPAL-NOSTD (handlers.md §5) owes the gate that drops them.
+gneiss_pal = { path = "../../libs/gneiss_pal", features = ["hevc"] }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }

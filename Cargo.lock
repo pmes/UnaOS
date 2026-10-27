@@ -1498,6 +1498,7 @@ name = "facet"
 version = "0.1.0"
 dependencies = [
  "bandy",
+ "gneiss_pal",
  "image",
  "log",
  "pixel_core",
@@ -2013,6 +2014,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h264_core",
+ "hevc_core",
  "http_core",
  "infer_core",
  "log",

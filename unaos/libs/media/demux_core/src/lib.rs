@@ -59,6 +59,8 @@ pub mod fragment;
 pub mod mkv;
 pub mod mime;
 pub mod facts;
+/// HEVCHEIC (SR220): the HEIF image-item reader (ISO/IEC 23008-12) — items, properties, grids; codec-blind.
+pub mod heif;
 pub mod mp4;
 mod read;
 /// NLEPROBE (SR195): the editor's probe of a file — streams, time bases, keyframe index, composition offsets.

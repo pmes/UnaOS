@@ -72,20 +72,20 @@ fn box_at(data: &[u8], p: usize, to: usize) -> Result<BoxHeader, Error> {
     Ok(BoxHeader { kind, start: p, body: p + hdr, end: p + size as usize })
 }
 
-fn child<'a>(list: &'a [BoxHeader], kind: &[u8; 4]) -> Option<&'a BoxHeader> {
+pub(crate) fn child<'a>(list: &'a [BoxHeader], kind: &[u8; 4]) -> Option<&'a BoxHeader> {
     list.iter().find(|b| &b.kind == kind)
 }
 
-fn children(data: &[u8], b: &BoxHeader) -> Result<Vec<BoxHeader>, Error> {
+pub(crate) fn children(data: &[u8], b: &BoxHeader) -> Result<Vec<BoxHeader>, Error> {
     boxes(data, b.body, b.end)
 }
 
-fn body<'a>(data: &'a [u8], b: &BoxHeader) -> Reader<'a> {
+pub(crate) fn body<'a>(data: &'a [u8], b: &BoxHeader) -> Reader<'a> {
     Reader::new(&data[b.body..b.end])
 }
 
 /// Full box: version byte + 24-bit flags.
-fn full(r: &mut Reader) -> Result<(u8, u32), Error> {
+pub(crate) fn full(r: &mut Reader) -> Result<(u8, u32), Error> {
     let v = r.u8()?;
     let f = r.u24()?;
     Ok((v, f))

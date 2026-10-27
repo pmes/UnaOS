@@ -17,8 +17,12 @@
 //! What pixel_core does not decode is REFUSED, by name, never silently handed to something else: a
 //! container it recognises but cannot read (lossy WebP until VP8CORE, SR40) answers
 //! [`SourceError::Decode`] carrying the format and pixel_core's reason; a container no UnaOS decoder
-//! recognises yet (TIFF, ICO, AVIF, HEIF, JPEG XL, ...) answers [`SourceError::Foreign`] naming it
+//! recognises yet (TIFF, ICO, AVIF, HEIF sequences, JPEG XL, ...) answers [`SourceError::Foreign`] naming it
 //! ([`unrecognised`]).
+//!
+//! HEVCHEIC (SR220): an HEIC still ([`Format::Heic`]: `ftyp` heic / heix, or mif1 without AVIF) is the one container
+//! pixel_core does not own: it decodes through `gneiss_pal::dsp::image::decode_heic` (demux_core's HEIF reader +
+//! hevc_core, 8-bit intra; 10-bit refuses by name until HEVCMAIN10), and its refusals name `heic` the same way.
 
 /// The formats [`ImageSource::sniff`] recognises (PIXELCORE's `Format`, same variants, same order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +36,8 @@ pub enum Format {
     /// SVG markup (pixel_core's `svg` route; the variant exists only when that feature is on, so the
     /// map below takes it through a catch-all — merge19: the workspace test build unifies the feature in).
     Svg,
+    /// HEVCHEIC (SR220): an HEIF still holding HEVC images (not a pixel_core format: [`sniff`] adds it).
+    Heic,
 }
 
 impl Format {
@@ -45,6 +51,7 @@ impl Format {
             Format::Qoi => "qoi",
             Format::WebP => "webp",
             Format::Svg => "svg",
+            Format::Heic => "heic",
         }
     }
 }
@@ -65,9 +72,9 @@ impl From<pixel_core::Format> for Format {
 }
 
 /// Identify a format by its magic bytes — PIXELCORE's own `sniff`, so Facet and its decoder can never
-/// disagree on what a file IS.
+/// disagree on what a file IS; then demux_core's HEIC brand test (HEVCHEIC, SR220).
 pub fn sniff(bytes: &[u8]) -> Option<Format> {
-    pixel_core::sniff(bytes).map(Format::from)
+    pixel_core::sniff(bytes).map(Format::from).or_else(|| gneiss_pal::dsp::image::is_heic(bytes).then_some(Format::Heic))
 }
 
 /// The name of a well-known image container that [`sniff`] does NOT accept, from its magic bytes —
@@ -211,7 +218,8 @@ impl ImageSource for PixelCoreSource {
 
     fn decode(&self, bytes: &[u8]) -> Result<Decoded, SourceError> {
         let format = self.sniff(bytes).ok_or_else(|| unrecognised(bytes))?.name();
-        pixel_core::decode(bytes).map(Decoded::from).map_err(|e| match e {
+        let decoded = if format == "heic" { gneiss_pal::dsp::image::decode_heic(bytes) } else { pixel_core::decode(bytes) };
+        decoded.map(Decoded::from).map_err(|e| match e {
             pixel_core::Error::UnknownFormat => unrecognised(bytes),
             pixel_core::Error::TooLarge => SourceError::TooLarge { format },
             e => SourceError::Decode { format, reason: e.to_string() },
@@ -227,8 +235,10 @@ mod tests {
     fn foreign_containers_are_named() {
         let mut avif = vec![0, 0, 0, 0x1C];
         avif.extend(b"ftypavif\0\0\0\0avifmif1miaf");
-        let mut heic = vec![0, 0, 0, 0x18];
-        heic.extend(b"ftypheic\0\0\0\0mif1heic");
+        // HEVCHEIC (SR220): a heic still is Facet's own now (heic_is_sniffed_and_refusals_name_heic); an HEIF image
+        // SEQUENCE stays foreign.
+        let mut heis = vec![0, 0, 0, 0x18];
+        heis.extend(b"ftypmsf1\0\0\0\0heismsf1");
         let mut mp4 = vec![0, 0, 0, 0x14];
         mp4.extend(b"ftypisom\0\0\0\0mp41");
         let cases: &[(&[u8], Option<&str>)] = &[
@@ -237,7 +247,7 @@ mod tests {
             (b"\0\0\x01\0\x01\0\x10\x10", Some("ico")),
             (b"\0\0\x02\0\x01\0\x10\x10", Some("cur")),
             (&avif, Some("avif")),
-            (&heic, Some("heif")),
+            (&heis, Some("heif")),
             (&mp4, None),
             (b"\xFF\x0A\xFA\x7F", Some("jpeg xl")),
             (b"\0\0\0\x0CJXL \r\n\x87\n", Some("jpeg xl")),
@@ -304,5 +314,54 @@ mod tests {
         let e = PixelCoreSource.decode(&q).unwrap_err();
         assert_eq!(e, SourceError::TooLarge { format: "qoi" });
         assert_eq!(e.to_string(), "qoi: dimensions too large");
+    }
+
+    #[test]
+    fn heic_is_sniffed_and_refusals_name_heic() {
+        let mut heic = vec![0, 0, 0, 0x18];
+        heic.extend(b"ftypheic\0\0\0\0mif1heic");
+        assert_eq!(foreign_format(&heic), Some("heif"), "the name table still knows the container");
+        assert_eq!(sniff(&heic), Some(Format::Heic));
+        // An ftyp and nothing else: no meta box, refused by name as heic.
+        let e = PixelCoreSource.decode(&heic).unwrap_err();
+        assert!(matches!(&e, SourceError::Decode { format: "heic", reason } if reason.contains("no meta")), "{e:?}");
+        assert!(e.to_string().starts_with("heic: "), "{e}");
+        // 10-bit refuses by name until HEVCMAIN10.
+        use gneiss_pal::dsp::image::heic_kat;
+        let mut t = heic_kat::tile(false, vec![]);
+        let mut rec = heic_kat::flat_hvcc();
+        rec[17] = 0xFA;
+        t.props[0] = demux_core_build::hvcc(&rec);
+        let e = PixelCoreSource.decode(&demux_core_build::still(1, &[t])).unwrap_err();
+        assert_eq!(e.to_string(), "heic: unsupported: heic: 10-bit HEVC (HEVCMAIN10)");
+    }
+
+    use gneiss_pal::dsp::demux::heif::build as demux_core_build;
+
+    #[test]
+    fn heic_stills_decode_through_hevc_core() {
+        use gneiss_pal::dsp::image::{decode_heic, heic_kat};
+        let mut f = crate::Facet::new();
+        for (bytes, w, h) in [(heic_kat::flat_heic(), 64, 48), (heic_kat::pcm_heic(), 64, 48), (heic_kat::grid_2x2_heic(), 120, 90)] {
+            let d = PixelCoreSource.decode(&bytes).unwrap();
+            assert_eq!((d.width, d.height, d.frames.is_none(), d.loop_count, d.orientation), (w, h, true, None, 1));
+            assert_eq!(d.rgba, decode_heic(&bytes).unwrap().rgba);
+            let (_, info) = f.open_bytes("kat.heic", &bytes).unwrap();
+            assert_eq!((info.format.as_str(), info.width, info.height), ("heic", w, h));
+        }
+        // The flat picture: Y = Cb = Cr = 128, BT.601 limited -> grey 130.
+        let flat = PixelCoreSource.decode(&heic_kat::flat_heic()).unwrap();
+        assert!(flat.rgba.chunks_exact(4).all(|p| p == [130, 130, 130, 255]));
+        // The PCM picture's gradient: luma 7x + 3y at the top-left block, e.g. (0,0) Y=0 and (31,31) Y=310 mod 256.
+        let pcm = PixelCoreSource.decode(&heic_kat::pcm_heic()).unwrap();
+        let grid = PixelCoreSource.decode(&heic_kat::grid_2x2_heic()).unwrap();
+        // The grid's top-right quadrant is the PCM tile, its bottom-right the flat one.
+        let at = |d: &Decoded, x: usize, y: usize| d.rgba[(y * d.width as usize + x) * 4..][..4].to_vec();
+        for (x, y) in [(0, 0), (31, 31), (10, 40), (55, 47)] {
+            assert_eq!(at(&grid, 64 + x, y), at(&pcm, x, y), "({x},{y})");
+            assert_eq!(at(&grid, x, 48 + y.min(41)), at(&pcm, x, y.min(41)));
+            assert_eq!(at(&grid, 64 + x, 48 + y.min(41)), at(&flat, x, y.min(41)));
+        }
+        assert_ne!(at(&pcm, 0, 0), at(&pcm, 31, 0), "the PCM block is a gradient, not flat");
     }
 }
