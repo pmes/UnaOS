@@ -29,7 +29,7 @@
 // HIDBOOTLEDS (rmbp-ledger B987): the lock LEDs leave the decoder through ONE `Transport::set_leds`
 // call; `[keystat] <tag>` and the PRTSCR `on <transport>` word name the transport (EHCI byte-identical).
 // HIDBOOTLEDSEHCI (B991): EHCI's arm marks the endpoint's LED slot, drained after the walk. Owed (input.md
-// §5 Z3 row): the Fn keys; HIDBOOT-PUMP (the i8042 is pumped only from `ehci::service_ehci_hid`). HIDBOOT-ARM BUILT by HIDBOOTARM (B1000): declared on aarch64, the aarch64 xHCI keyboard calls `decode_noted` (file tail) with `Transport::Xhci`; HIDBOOTXHCIX86 (B1003): the x86 xHCI keyboard calls it too (its inline decode deleted). HIDBOOTLEDSTEST (B995): the slot drain is `drain_led_slots` (file tail), `tests hidboot`.
+// §5 Z3 row): the Fn keys; HIDBOOT-PUMP (the i8042 is pumped only from `ehci::service_ehci_hid`). HIDBOOT-ARM BUILT by HIDBOOTARM (B1000): declared on aarch64, the aarch64 xHCI keyboard calls `decode_noted` (file tail) with `Transport::Xhci`; HIDBOOTXHCIX86 (B1003): the x86 xHCI keyboard calls it too (its inline decode deleted). HIDBOOTLEDSTEST (B995): the slot drain is `drain_led_slots` (file tail), `tests hidboot`. HIDBOOTLEDSXHCI (B1005): xHCI's slots (`XhciController` at xhci/mod.rs's tail) drain through `drain_led_slots` too; a `held` refusal is not latched.
 
 /// The transport that carried a boot keyboard report. Labels the decoder's wire; changes no decode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -561,7 +561,7 @@ fn bt_queue_led(_leds: u8) {}
 // control fn's own answer; "timeout" names itself and every other refusal (stall, hse, ...) reads
 // `ctrl-fail` (the EHCI-HID ALLKEYS witness beside it keeps the exact cause). Human-rate: one line per
 // lock press, and a refusing keyboard's latch makes its refused line once per endpoint.
-#[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // HIDBOOTLEDSXHCI (B1005): the module's own gate, so the xHCI slots drain on an x86 image without `ehcihid`
 pub fn note_leds_sent(t: Transport, leds: u8, addr: u8, intf: u8, r: Result<(), &'static str>) {
     let caps = (leds >> 1) & 1;
     match r {
@@ -569,7 +569,7 @@ pub fn note_leds_sent(t: Transport, leds: u8, addr: u8, intf: u8, r: Result<(), 
             serial_println!("[hidboot] leds via={} leds={:#04x} caps={} addr={} intf={} -> sent", t.tag(), leds, caps, addr, intf);
         }
         Err(e) => {
-            let why = if e == "timeout" { "timeout" } else { "ctrl-fail" };
+            let why = if e == "timeout" || e == "held" { e } else { "ctrl-fail" }; // HIDBOOTLEDSXHCI (B1005): `held` names itself
             serial_println!("[hidboot] leds via={} leds={:#04x} caps={} addr={} intf={} -> refused why={}", t.tag(), leds, caps, addr, intf, why);
         }
     }
@@ -585,7 +585,7 @@ pub fn note_leds_sent(t: Transport, leds: u8, addr: u8, intf: u8, r: Result<(), 
 // endpoint). Best-effort: a refusal costs a dark key, never a keystroke (the case fold already moved with the byte).
 
 /// HIDBOOTLEDSTEST (B995): a transport's per-endpoint LED slots, as the one drain sees them.
-#[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // HIDBOOTLEDSXHCI (B1005): the module's own gate, so the xHCI slots drain on an x86 image without `ehcihid`
 pub trait LedSlots {
     /// How many slots (EHCI: one per interrupt endpoint).
     fn count(&self) -> usize;
@@ -598,7 +598,7 @@ pub trait LedSlots {
 }
 
 /// HIDBOOTLEDSTEST (B995): the ONE LED slot drain (B991's loop body, moved verbatim in logic). Returns `(sent, refused)`.
-#[cfg(any(feature = "ehcihid", target_arch = "aarch64"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))] // HIDBOOTLEDSXHCI (B1005): the module's own gate, so the xHCI slots drain on an x86 image without `ehcihid`
 pub fn drain_led_slots<S: LedSlots>(s: &mut S, t: Transport) -> (u32, u32) {
     let (mut sent, mut refused) = (0u32, 0u32);
     for i in 0..s.count() {
@@ -609,7 +609,7 @@ pub fn drain_led_slots<S: LedSlots>(s: &mut S, t: Transport) -> (u32, u32) {
         let r = s.send(i, leds);
         note_leds_sent(t, leds, addr, intf, r);
         if r.is_err() {
-            s.latch_off(i); // the case fold is untouched
+            if r != Err("held") { s.latch_off(i); } // the case fold is untouched; HIDBOOTLEDSXHCI (B1005): a `held` refusal is a deferral the transport owes to its resume (xHCI's `ep0_replay`), counted refused, never latched
             refused += 1;
         } else {
             sent += 1;

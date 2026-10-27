@@ -3009,7 +3009,7 @@ pub struct DeviceSlot {
     /// the press edge of the corresponding lock key and pushed to the device via SET_REPORT
     /// (0x21/0x09, wValue 0x0200). Caps also feeds the ascii case logic so the lit LED and the
     /// typed case agree. Seeded to zero at enumeration and cleared on slot reuse.
-    pub keyboard_leds: u8, pub keyboard_leds_dirty: bool, // HIDLEDDEFER (B44) — `keyboard_leds` changed on a completion and the device has not been told yet. The completion branch TOGGLES the bitmap and sets this; `service_hid_leds` (the polled service pass, beside `service_hid_setproto`) issues the SET_REPORT and clears it. The synchronous EP0 transfer is thereby off the completion path. ⚠ FOLDED.
+    pub keyboard_leds: u8, pub keyboard_leds_dirty: bool, pub keyboard_led_ok: bool, // HIDBOOTLEDSXHCI (B1005): `keyboard_led_ok` — a refusal latches the slot's LED off (`hidboot::drain_led_slots`). // HIDLEDDEFER (B44) — `keyboard_leds` changed on a completion and the device has not been told yet. The completion branch TOGGLES the bitmap and sets this; `service_hid_leds` (the polled service pass, beside `service_hid_setproto`) issues the SET_REPORT and clears it. The synchronous EP0 transfer is thereby off the completion path. ⚠ FOLDED.
 
     pub descriptor_buffer: *mut u8,
 
@@ -3142,7 +3142,7 @@ impl DeviceSlot {
             keyboard_prev_phys: 0,
             keyboard_report_count: 0,
             keyboard_prev_keys: [0; 6], keyboard_prev_mods: 0, // PRTSCLOST — seeded with its six keycodes. ⚠ FOLDED.
-            keyboard_leds: 0, keyboard_leds_dirty: false, // HIDLEDDEFER — nothing owed at enumeration. ⚠ FOLDED.
+            keyboard_leds: 0, keyboard_leds_dirty: false, keyboard_led_ok: true, // HIDLEDDEFER — nothing owed at enumeration. ⚠ FOLDED.
             descriptor_buffer: desc_buffer,
             ep0_expect_phys: 0,
             is_downstream: false,
@@ -3236,7 +3236,7 @@ impl DeviceSlot {
         self.keyboard_prev_phys = 0;
         self.keyboard_report_count = 0;
         self.keyboard_prev_keys = [0; 6]; self.keyboard_prev_mods = 0; // PRTSCLOST — cleared on slot reuse beside its six keycodes, or a recycled slot's first report would compare against a dead device's. ⚠ FOLDED.
-        self.keyboard_leds = 0; self.keyboard_leds_dirty = false; // HIDLEDDEFER — a recycled slot owes the old device nothing. ⚠ FOLDED.
+        self.keyboard_leds = 0; self.keyboard_leds_dirty = false; self.keyboard_led_ok = true; // HIDLEDDEFER — a recycled slot owes the old device nothing. ⚠ FOLDED.
         self.ep0_expect_phys = 0;
         self.is_downstream = false;
         self.route_string = 0;
@@ -14131,21 +14131,21 @@ impl XhciController {
     /// this slot's descriptor_buffer (idle at report time — enumeration is long done). Best-effort:
     /// logs a single `[hidled] caps=<0|1> set-report <ok|nak> slot=N` witness and tolerates a
     /// NAK/STALL/timeout (some devices lack a settable Output report; the state is still tracked).
-    fn set_hid_leds(&mut self, slot: u8, intf: u8) {
+    fn set_hid_leds(&mut self, slot: u8, intf: u8) -> Result<(), &'static str> {
         let leds = self.slots[slot as usize].keyboard_leds;
         let caps = (leds >> 1) & 1;
         let buf = self.slots[slot as usize].descriptor_buffer;
         if buf.is_null() {
             serial_println!("[hidled] caps={} set-report nak slot={} (no buffer)", caps, slot);
-            return;
+            return Err("no-buffer"); // HIDBOOTLEDSXHCI (B1005): the answer `hidboot::drain_led_slots` reads
         }
         unsafe { core::ptr::write(buf, leds); }
         let buf_phys = buf as u64;
-        match self.ep0_control(slot, 0x21, 0x09, 0x0200, intf as u16, 1, buf_phys, false) {
+        let r = self.ep0_control(slot, 0x21, 0x09, 0x0200, intf as u16, 1, buf_phys, false); match r {
             Ok(1) => serial_println!("[hidled] caps={} set-report ok slot={}", caps, slot),
             Ok(code) => serial_println!("[hidled] caps={} set-report nak slot={} (code {})", caps, slot, code),
             Err(Ep0Err::NoCompletion) => serial_println!("[hidled] caps={} set-report nak slot={} (EP0 timeout)", caps, slot), #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] Err(Ep0Err::Held) => { suspend::owe(slot, suspend::OWE_LEDS); serial_println!("[hidled] caps={} set-report held slot={} -> deferred", caps, slot) } // HELDSLOTEP0 (B804): refused on a held slot, owed to the resume (`endpoints_restart` sets `keyboard_leds_dirty` again, HIDLEDDEFER pushes it)
-        }
+        } led_report_answer(r) // HIDBOOTLEDSXHCI (B1005): the control fn's answer for `hidboot::drain_led_slots` (file tail)
     }
 
     /// HID class request SET_PROTOCOL(boot) for one interface: bmRequestType 0x21 (host->device,
@@ -16566,17 +16566,17 @@ impl XhciController {
     /// context every other synchronous HID request already uses, with the same
     /// disconnected-device guard (a doorbell to a gone device burns the EP0 pump budget).
     fn service_hid_leds(&mut self) {
-        for i in 0..self.slots.len() {
-            let (dirty, kbd, intf, port) = {
-                let s = &self.slots[i];
-                (s.keyboard_leds_dirty, s.is_keyboard, s.keyboard_intf, s.port_id)
-            };
-            if !dirty { continue; }
-            self.slots[i].keyboard_leds_dirty = false;
-            if !kbd { continue; }
-            if port != 0 && (self.read_portsc(port) & 1) == 0 { continue; }
-            self.set_hid_leds(i as u8, intf);
-        }
+        let _ = crate::drivers::hidboot::drain_led_slots(self, crate::drivers::hidboot::Transport::Xhci); // HIDBOOTLEDSXHCI (rmbp-ledger B1005): the loop that stood here is the ONE drain (`impl LedSlots for XhciController` at the file tail); the old lines kept as comments, line count kept:
+        // let (dirty, kbd, intf, port) = {
+        // let s = &self.slots[i];
+        // (s.keyboard_leds_dirty, s.is_keyboard, s.keyboard_intf, s.port_id)
+        // };
+        // if !dirty { continue; }
+        // self.slots[i].keyboard_leds_dirty = false;
+        // if !kbd { continue; }
+        // if port != 0 && (self.read_portsc(port) & 1) == 0 { continue; }
+        // self.set_hid_leds(i as u8, intf);
+        // }
     }
 }
 
@@ -19370,5 +19370,54 @@ impl XhciController {
             self.start_next_port();
         }
         true
+    }
+}
+
+// HIDBOOTLEDSXHCI (rmbp-ledger B1005) — TAIL-APPENDED, below every pre-existing line, so no `panic::Location` above moves
+// (input.md §5 Z3 row's HIDBOOT-LEDS-XHCI, owed by HIDBOOTARM B1000). HIDLEDDEFER's (B44) own loop in `service_hid_leds`
+// is gone: the keyboard slots drain through the ONE `hidboot::drain_led_slots` (HIDBOOTLEDSTEST B995), so the rule —
+// skip a clean slot, a latched-off LED and a gone device; one SET_REPORT per dirty slot with its latest byte; the
+// `[hidboot] leds via=xhci` line; a refusal latches the slot off — is hidboot's, never restated here. `send` is the
+// existing `set_hid_leds` (its `[hidled]` line and the HELDSLOTEP0 owe unchanged). A held slot's refusal answers
+// `held`, which the drain counts but never latches: `ep0_replay` re-dirties the slot after the resume and it is sent then
+// (`tests usbsuspend`'s held-EP0 leg). The slots are the loan holder's (`service_hid_setproto` runs under the xHCI loan): no lock.
+
+/// HIDBOOTLEDSXHCI (B1005): `set_hid_leds`' control-transfer result as the drain's answer. A completion code other than
+/// Success (1) — STALL on a keyboard with no settable Output report — is `nak` (`why=ctrl-fail`).
+fn led_report_answer(r: Result<u8, Ep0Err>) -> Result<(), &'static str> {
+    match r {
+        Ok(1) => Ok(()),
+        Ok(_) => Err("nak"),
+        Err(Ep0Err::NoCompletion) => Err("timeout"),
+        #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+        Err(Ep0Err::Held) => Err("held"),
+    }
+}
+
+/// HIDBOOTLEDSXHCI (B1005): the xHCI keyboard LED slots, one per device slot. `addr` carries the slot id (the name every
+/// `[hidled]` / `[usb]` line uses; `DeviceSlot` keeps no USB address).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl crate::drivers::hidboot::LedSlots for XhciController {
+    fn count(&self) -> usize {
+        self.slots.len()
+    }
+    fn take(&mut self, i: usize) -> (bool, bool, bool, u8, u8, u8) {
+        let (dirty, ok, kbd, port, leds, intf) = {
+            let s = &mut self.slots[i];
+            let d = s.keyboard_leds_dirty;
+            s.keyboard_leds_dirty = false;
+            (d, s.keyboard_led_ok, s.is_keyboard, s.port_id, s.keyboard_leds, s.keyboard_intf)
+        };
+        // HIDLEDDEFER's guards: not a keyboard, or its root port no longer connected (CCS clear; a doorbell to a gone
+        // device burns the EP0 pump budget). PORTSC is read only for a dirty slot.
+        let dead = !kbd || (dirty && port != 0 && (self.read_portsc(port) & 1) == 0);
+        (dirty, ok, dead, leds, i as u8, intf)
+    }
+    fn send(&mut self, i: usize, _leds: u8) -> Result<(), &'static str> {
+        let intf = self.slots[i].keyboard_intf;
+        self.set_hid_leds(i as u8, intf) // reads the slot's `keyboard_leds`: the byte `take` returned (nothing writes it between)
+    }
+    fn latch_off(&mut self, i: usize) {
+        self.slots[i].keyboard_led_ok = false; // the case fold is untouched
     }
 }
