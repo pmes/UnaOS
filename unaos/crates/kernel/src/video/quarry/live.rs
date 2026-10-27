@@ -1087,7 +1087,7 @@ impl Model {
         if depth + 1 > MAX_DEPTH {
             return;
         }
-        let path = self.tree[i].path.clone();
+        if livedir::expand_defer(self, i) { return; } let path = self.tree[i].path.clone(); // EXPANDREAD (B841): under the router's Door a COLD row is deferred — open onto an empty level, read off MODEL on the service pass (livedir.rs tail)
         let kids: Vec<TreeRow> = match self.collect_cached(&path) {
             Ok((true, rows)) => rows
                 .into_iter()
@@ -4525,17 +4525,28 @@ fn q3_key(c: u8) -> bool {
 }
 
 /// QUARRY3 — a press the new furniture takes before the panes: toolbar and path bar, sidebar, the icon grid.
+/// NAVTRAVEL (B841): every branch runs under the router's Door carrying its travel word, so a cold navigation is read
+/// off MODEL (livedir.rs tail) and installs as the same TRAVEL or visit its synchronous path records.
 fn q3_press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
-    if let Some(a) = toolbar::press(m, sx, sy) {
+    use livedir::{Door, Travel};
+    if let Some(a) = {
+        let _door = Door::travel(Travel::PathBar);
+        toolbar::press(m, sx, sy)
+    } {
         return Some(a);
     }
-    if let Some(a) = sidebar::press(m, sx, sy) {
+    if let Some(a) = {
+        let _door = Door::travel(Travel::Sidebar);
+        sidebar::press(m, sx, sy)
+    } {
         return Some(a);
     }
     if toolbar::view() == toolbar::View::Icons {
+        let _door = Door::travel(Travel::Icons);
         return iconview::press(m, sx, sy);
     }
     if toolbar::view() == toolbar::View::Columns {
+        let _door = Door::travel(Travel::Columns);
         return millercols::press(m, sx, sy);
     }
     None

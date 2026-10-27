@@ -336,6 +336,7 @@ pub(super) fn press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
         let (p, name) = (c.path.clone(), name.clone());
         m.navigate(&p);
         select_name(m, &name);
+        super::livedir::nav_select(&p, &name); // NAVTRAVEL (B841): a deferred navigate selects the row on arrival
         m.click_row = m.list_sel;
         m.click_pane = Pane::List;
         m.click_ms = now;

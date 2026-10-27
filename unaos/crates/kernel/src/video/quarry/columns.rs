@@ -1361,15 +1361,26 @@ fn nav_leg(dir: &str, sub: &str) -> RelistLeg {
     let p = super::livedir::nav_probe(sub);
     let (rows, held, locked) = p.done.as_ref().map_or((0, u64::MAX, usize::MAX), |d| (d.rows, d.held_us, d.locked_reads));
     let off_lock = p.done.is_some() && locked == 0 && p.cwd_ok;
-    let ok = off_lock && p.deferred && p.paint_defer && p.stale_dropped && rows > RELIST_ROWS && held <= RELIST_HELD_US;
+    // NAVTRAVEL (B841): Back from `sub` to `dir`, deferred and installed as a TRAVEL; EXPANDREAD: a cold tree row's
+    // expand deferred and spliced off the lock — both under NAVREAD's bound.
+    let tp = super::livedir::travel_probe(dir);
+    let nav_travel = tp.deferred && tp.cwd_ok && tp.history == 1 && tp.done.as_ref().map_or(false, |d| d.locked_reads == 0 && d.held_us <= RELIST_HELD_US);
+    let xp = super::livedir::expand_probe();
+    let (xheld, xlocked) = xp.done.as_ref().map_or((u64::MAX, usize::MAX), |d| (d.held_us, d.locked_reads));
+    let expand_ok = xp.deferred && xlocked == 0 && xheld <= RELIST_HELD_US;
+    let ok = off_lock && p.deferred && p.paint_defer && p.stale_dropped && rows > RELIST_ROWS && held <= RELIST_HELD_US && nav_travel && expand_ok;
     let terms = alloc::format!(
-        "nav_rows={} nav_held_us={} nav_off_lock={} nav_deferred={} nav_paint_defer={} nav_stale={}",
+        "nav_rows={} nav_held_us={} nav_off_lock={} nav_deferred={} nav_paint_defer={} nav_stale={} nav_travel={} history={} expand_deferred={} expand_held_us={}",
         rows,
         if held == u64::MAX { String::from("-") } else { alloc::format!("{}", held) },
         if off_lock { "ok" } else { "FAIL" },
         if p.deferred { "ok" } else { "FAIL" },
         if p.paint_defer { "ok" } else { "FAIL" },
-        if p.stale_dropped { "dropped" } else { "FAIL" }
+        if p.stale_dropped { "dropped" } else { "FAIL" },
+        if nav_travel { "ok" } else { "FAIL" },
+        tp.history,
+        if expand_ok { "ok" } else { "FAIL" },
+        if xheld == u64::MAX { String::from("-") } else { alloc::format!("{}", xheld) }
     );
     RelistLeg { ok, terms }
 }
