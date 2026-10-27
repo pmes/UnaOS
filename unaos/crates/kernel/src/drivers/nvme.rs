@@ -26,7 +26,8 @@
 //! SMART/Health log page; a 4096-byte-LBA root (NVME4KN); an installer path onto the NVMe (NVMEINSTALL).
 //!
 //! **The writes:** WRITE (0x01) is compiled, and [`write_at`] is `pub(crate)` with exactly TWO callers —
-//! `block::write_blocks_nvme` (-EPERM outside the live root grant, every block read back) and the
+//! `block::write_blocks_nvme` (-EPERM outside the live root grant, each run read back with ONE `read_at` —
+//! NVMEBATCH, zenbook-ledger Z22: a UnaFS block is one run, one WRITE per `max_xfer`) and the
 //! `tests nvme` scratch leg ([`selftest`]), which runs it only on QEMU's emulated controller (model
 //! string `QEMU NVMe Ctrl`), never inside the live root grant, and restores the scratch blocks it wrote.
 //! `grep -rn 'nvme::write_at\|write_at(' unaos/crates/kernel/src/drivers` is the audit.
@@ -44,7 +45,7 @@
 //! ```text
 //! [nvme] bdf <b>:<s>.<f> <vid>:<did> bar0=0x<..> cap=0x<..> ver=<x.y.z> mqes=<n> dstrd=<n> to_ms=<n>   (bootlog)
 //! [nvme] ctrl  (the ready line: mn="<model>" ns=1 lba=<bytes> blocks=<n> -> ready; spelled once, at `probe`)
-//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>>
+//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> runs=<n> run_blocks=<n>
 //! :: NVME: ctrl=ok ns=1 rw=ok -> PASS ::
 //! ```
 //!
@@ -300,6 +301,9 @@ fn io_cmd(c: &mut Ctrl, opc: u32, lba: u64, bytes: usize) -> Result<(), ()> {
     cmd[10] = lba as u32;
     cmd[11] = (lba >> 32) as u32;
     cmd[12] = nlb - 1; // 0-based
+    if opc == IO_WRITE {
+        IO_WRITE_CMDS.fetch_add(1, Ordering::Relaxed); // NVMEBATCH (Z22): what `tests nvme`'s `batch=` counts
+    }
     submit(c, false, &mut cmd).map(|_| ())
 }
 
@@ -609,9 +613,10 @@ pub fn selftest() {
     } else {
         scratch_rw(scratch, bs)
     };
+    let (runs, run_blocks) = crate::drivers::block::nvme_run_census(); // NVMEBATCH (Z22)
     serial_println!(
-        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={}",
-        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw
+        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} runs={} run_blocks={}",
+        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), runs, run_blocks
     );
     let ctrl = if identify { "ok" } else { "bad" };
     let root = root_leg();
@@ -639,9 +644,16 @@ fn scratch_rw(lba: u64, bs: usize) -> &'static str {
     for (i, b) in pat.iter_mut().enumerate() {
         *b = (i as u64 ^ lba.wrapping_mul(0x9E37_79B9) ^ (i as u64 >> 9)) as u8;
     }
+    let expect = match with_ctrl(lba, |c| Ok(len.div_ceil((c.max_xfer / bs).max(1) * bs) as u32)) {
+        Ok(n) => n,
+        Err(()) => return "bad:busy",
+    };
+    let w0 = IO_WRITE_CMDS.load(Ordering::Relaxed);
     if write_at(lba, &pat).is_err() {
         return "bad:write";
     }
+    let batch = IO_WRITE_CMDS.load(Ordering::Relaxed).wrapping_sub(w0); // NVMEBATCH (Z22): the 8 blocks' WRITE commands
+    LAST_BATCH.store(batch, Ordering::Relaxed);
     let mut back = alloc::vec![0u8; len];
     if crate::drivers::block::read_blocks_nvme(lba, &mut back).is_err() {
         return "bad:read-back";
@@ -653,7 +665,13 @@ fn scratch_rw(lba: u64, bs: usize) -> &'static str {
     if crate::drivers::block::read_blocks_nvme(lba, &mut back).is_err() || back != orig {
         return "bad:restore-verify";
     }
-    if same { "ok" } else { "bad:mismatch" }
+    if !same {
+        "bad:mismatch"
+    } else if batch != expect {
+        "bad:batch"
+    } else {
+        "ok"
+    }
 }
 
 // ══════════ NVMEBOOT (zenbook-ledger Z9) — the commit barrier and the root leg ══════════
@@ -693,3 +711,11 @@ fn root_leg() -> &'static str {
     }
     "ok"
 }
+
+// ══════════ NVMEBATCH (zenbook-ledger Z22) — the write-command census `tests nvme` reads ══════════
+
+/// NVMEBATCH: I/O WRITE commands submitted this boot (bumped in [`io_cmd`]).
+static IO_WRITE_CMDS: AtomicU32 = AtomicU32::new(0);
+/// NVMEBATCH: the WRITE commands the scratch leg's 8-block `write_at` issued (0 = the leg did not run); it must
+/// equal `ceil(len / max_xfer)` — 1 on every controller for 8 x 512 B — or the leg answers `bad:batch`.
+static LAST_BATCH: AtomicU32 = AtomicU32::new(0);

@@ -2847,7 +2847,7 @@ fn handle_read_multi(handle: block::BlockHandle, lba: u64, buf: &mut [u8]) -> Re
 fn handle_write_multi(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
     if buf.len() % 512 != 0 {
         return Err(SectorError::Io(format!("write span {} not whole sectors", buf.len())));
-    }
+    } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == block::BlockHandle::Nvme { return block::write_blocks_nvme(lba, buf).map_err(|e| map_block_err(lba, e)); } // NVMEBATCH (zenbook-ledger Z22): a 4 KiB block is ONE granted run on the NVMe (one WRITE, one read-back), never eight 512 B writes (LINE-NEUTRAL fold, before this comment)
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     if let block::BlockHandle::Sdhc = handle {
         let per = block::MAX_BLOCKS_PER_OP * 512;
@@ -5006,7 +5006,7 @@ pub fn ensure_nvme_root_grant() -> bool {
     let Some(last) = span.block_count.checked_mul(8).and_then(|n| span.base_lba.checked_add(n)).and_then(|e| e.checked_sub(1)) else {
         return false;
     };
-    block::hold_nvme_root_grant(span.base_lba, last)
+    if !nvme_root_one(&span) { return false; } block::hold_nvme_root_grant(span.base_lba, last) // NVMEROOTONE (zenbook-ledger Z22): a namespace with a second UnaFS volume gets no grant (body at the file tail; LINE-NEUTRAL fold)
 }
 
 /// NVMEBOOT: make the shared UnaFS mount ride `want` — drop a mount bound elsewhere (an earlier lazy bind),
@@ -5019,4 +5019,57 @@ pub fn bind_root_on(want: block::BlockHandle) -> bool {
     }
     let _ = with_unafs(|_| ());
     mount_bound_handle() == Some(want)
+}
+
+// =================================================================================================
+// NVMEROOTONE (zenbook-ledger Z22) — the NVMe root grant only over a namespace with exactly ONE UnaFS volume.
+//
+// TAIL-APPENDED; the call is a LINE-NEUTRAL fold in `ensure_nvme_root_grant`. AHCIROOT's rule ("exactly one UnaFS
+// partition: two would make the root a guess", `install::ahciroot::ours_unafs_part`) for the NVMe, through the SAME
+// locate the grant rides: the crate's `locate_unafs` is asked a second time over [`HideVolume`], a read-only view of
+// the namespace in which the found volume's superblock sectors read as zeros. Same parser, same magic probe as
+// `locate_on`, so the counted set contains the granted volume by construction; no copy of the locate loop.
+
+/// NVMEROOTONE: the namespace as `locate_unafs` sees it, with the 8 sectors of block 0 at `at` (the volume
+/// already found) reading as zeros. Read-only: every write is refused.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+struct HideVolume<'a> {
+    dev: &'a mut SdSectorDevice,
+    at: u64,
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+impl SectorDevice for HideVolume<'_> {
+    fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
+        if lba >= self.at && lba < self.at.saturating_add(8) {
+            buf.fill(0);
+            return Ok(());
+        }
+        self.dev.read_sector(lba, buf)
+    }
+
+    fn write_sector(&mut self, _lba: u64, _buf: &[u8]) -> Result<(), SectorError> {
+        Err(SectorError::Io(alloc::string::String::from("NVMEROOTONE: read-only view")))
+    }
+
+    fn sector_count(&self) -> u64 {
+        self.dev.sector_count()
+    }
+}
+
+/// NVMEROOTONE: `true` when the namespace carries no UnaFS volume besides `span`. A second one is refused ONCE on
+/// the wire and cached in `NVME_ROOT_NONE` (a content verdict, as NoVolume is); an I/O error is `false`, never cached.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_root_one(span: &PartitionSpan) -> bool {
+    let Ok(mut dev) = SdSectorDevice::open_on(block::BlockHandle::Nvme) else { return false };
+    let mut view = HideVolume { dev: &mut dev, at: span.base_lba };
+    match locate_unafs(&mut view) {
+        Ok(None) => true,
+        Ok(Some(second)) => {
+            serial_println!("[nvme] root grant refused why=two-volumes first={} second={}", span.base_lba, second.base_lba);
+            NVME_ROOT_NONE.store(true, Ordering::Release);
+            false
+        }
+        Err(_) => false,
+    }
 }
