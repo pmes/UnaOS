@@ -58,6 +58,7 @@ dependencies = [
  "futures-util",
  "gl_core",
  "gneiss_pal",
+ "holocron",
  "html_core",
  "http_core",
  "icc_core",
@@ -2304,6 +2305,7 @@ version = "0.1.0"
 dependencies = [
  "crypto_core",
  "holocron_core",
+ "tls_core",
 ]
 
 [[package]]

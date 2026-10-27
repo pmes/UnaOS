@@ -14,12 +14,19 @@ default = []
 # The deliberately INSECURE test suite (src/testseal.rs, suite 0xFE): unit tests and fixtures ONLY. Never
 # enabled by a binary; the production sealer refuses its files.
 test-suite = []
+# PDF-KEYSTORE (LEDGER SR382): signing keys held by Holocron (ns `sign`, kind `pkcs8`), parsed by tls_core's ONE key
+# parser at put and used only inside the fulfiller (`src/pkcs8.rs`). OPTIONAL: only a fulfiller turns it on (the host
+# daemon); the kernel and every consumer link holocron_core without tls_core.
+pkcs8 = ["dep:tls_core"]
 
 [dependencies]
 crypto_core = { path = "../crypto_core", default-features = false, features = ["alloc"] }
+tls_core = { path = "../tls_core", optional = true, features = ["cryptocore"] }
 
 # The tests link the crate with its test suite on (a path self-reference, as crypto_core does), and
 # crypto_core's `std` for its /dev/urandom source.
 [dev-dependencies]
-holocron_core = { path = ".", features = ["test-suite"] }
+holocron_core = { path = ".", features = ["test-suite", "pkcs8"] }
 crypto_core = { path = "../crypto_core", features = ["std"] }
+# PDF-KEYSTORE (SR382): the verifier the pkcs8 KATs check Holocron's signatures with (verify_signed, CryptoCoreProvider).
+tls_core = { path = "../tls_core", features = ["cryptocore-std"] }

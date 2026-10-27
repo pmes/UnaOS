@@ -20,6 +20,7 @@
 //! | [`agent`] | the SSH agent protocol framing over the ring's Ed25519 keys |
 //! | [`keysource`] | the consumer rule: ask Holocron first, fall back only on NotFound |
 //! | [`root`] | THE store root (`<home>/.holocron`), named once for both rings, and the one-time legacy migration (B448) |
+//! | `pkcs8` (feature `pkcs8`) | PDF-KEYSTORE (SR382): signing keys (ns `sign`, kind `pkcs8`) read by tls_core's ONE key parser, signed with inside the fulfiller |
 //!
 //! ## The ring unlocks once per session (LUMENFAST2, rmbp-ledger B515)
 //!
@@ -43,7 +44,8 @@
 //! does not.
 //!
 //! Nothing here touches a file, a socket or a syscall; each ring brings its own [`service::Store`] and
-//! transport. One dependency: CRYPTOCORE (UnaOS-built).
+//! transport. One dependency: CRYPTOCORE (UnaOS-built); with feature `pkcs8` (a fulfiller only: the host daemon) also
+//! tls_core (UnaOS-built) for its key parser (PDF-KEYSTORE, LEDGER SR382).
 #![no_std]
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -56,6 +58,8 @@ pub mod format;
 pub mod frame;
 pub mod keysource;
 pub mod name;
+#[cfg(feature = "pkcs8")]
+pub mod pkcs8;
 pub mod ring;
 pub mod root;
 pub mod seal;

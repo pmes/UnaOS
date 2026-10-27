@@ -34,6 +34,7 @@
 
 pub mod forms;
 pub mod select;
+pub mod sign; // PDF-KEYSTORE (SR382): sign with a key Holocron holds
 pub mod thumbs;
 #[cfg(test)]
 mod tests;

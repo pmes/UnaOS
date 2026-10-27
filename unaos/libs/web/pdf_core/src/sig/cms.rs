@@ -12,7 +12,12 @@
 //! PDFSIGNKEYPARSE (LEDGER SR361): [`SignerKey`] signs RSASSA-PKCS1-v1_5, RSASSA-PSS (MGF1 with the same hash, salt
 //! the hash's length), ECDSA P-256 (RFC 6979) over SHA-256 / SHA-384 / SHA-512, and Ed25519 (RFC 8419: pure Ed25519
 //! over the signed attributes, the digest SHA-512); key files are read by tls_core's ONE parser ([`parse_key`]).
+//!
+//! PDF-KEYSTORE (LEDGER SR382): [`SignerKey::Remote`] signs with a key held ELSEWHERE (Holocron): the [`Scheme`] and the
+//! longest signature come from the signer certificate ([`Remote::for_certificate`]), and the signature from a callback
+//! handed the digest of the signed attributes (the message itself for Ed25519) — the key never enters this process.
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -26,7 +31,7 @@ pub use crypto_core::rsa_private::PrivateKey;
 pub use tls_core::key::{Key, KeyError, parse as parse_key};
 use tls_core::x509::build::{self, alg, explicit, octets, oid, seq, set, set_of_content};
 use tls_core::x509::der::{encode_tlv, tag};
-use tls_core::x509::{Certificate, oid as xoid};
+use tls_core::x509::{Certificate, PublicKey, oid as xoid};
 
 pub use super::Hash;
 use super::{ID_CONTENT_TYPE, ID_DATA, ID_MESSAGE_DIGEST, ID_SIGNED_DATA, ID_SIGNING_TIME};
@@ -34,6 +39,63 @@ use crate::Error;
 
 /// id-aa-signingCertificateV2 (RFC 5035 §3).
 const ID_SIGNING_CERTIFICATE_V2: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x02, 0x2f];
+
+/// What a signature is: the algorithm and the digest it is over (PDF-KEYSTORE SR382: the one vocabulary the local keys
+/// and a [`Remote`] signer share).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheme {
+    /// RSASSA-PKCS1-v1_5.
+    Pkcs1(Hash),
+    /// RSASSA-PSS, MGF1 with the same hash, salt length = the hash's length.
+    Pss(Hash),
+    /// ECDSA P-256 (DER Ecdsa-Sig-Value).
+    P256(Hash),
+    /// Ed25519 (pure; the CMS digest is SHA-512, RFC 8419).
+    Ed25519,
+}
+
+impl Scheme {
+    /// The digest algorithm: the chosen one, SHA-512 for Ed25519.
+    pub fn hash(self) -> Hash {
+        match self {
+            Scheme::Pkcs1(h) | Scheme::Pss(h) | Scheme::P256(h) => h,
+            Scheme::Ed25519 => Hash::Sha512,
+        }
+    }
+}
+
+/// The callback a [`Remote`] signer signs through: handed the scheme and the to-be-signed bytes (the digest of the
+/// signed attributes under the scheme's hash; the attributes themselves for Ed25519), it answers the signature (a DER
+/// Ecdsa-Sig-Value for P-256) or why not.
+pub type RemoteSign<'a> = &'a dyn Fn(Scheme, &[u8]) -> Result<Vec<u8>, String>;
+
+/// PDF-KEYSTORE (SR382): a key held elsewhere (Holocron): what it is, how long its signatures can be, its public key, and
+/// the call that signs.
+pub struct Remote<'a> {
+    /// The signature scheme.
+    pub scheme: Scheme,
+    /// The longest signature `sign` may answer (the /Contents placeholder is sized by it).
+    pub max_sig: usize,
+    /// The public key as a SubjectPublicKeyInfo.
+    pub spki: Vec<u8>,
+    /// The call that signs.
+    pub sign: RemoteSign<'a>,
+}
+
+impl<'a> Remote<'a> {
+    /// From the signer certificate's public key: RSA (PKCS#1 v1.5, or PSS with `pss`; k = the modulus length) or P-256
+    /// over `hash`, Ed25519 (`hash` and `pss` ignored); refused by name otherwise.
+    pub fn for_certificate(cert: &[u8], hash: Hash, pss: bool, sign: RemoteSign<'a>) -> Result<Self, Error> {
+        let c = Certificate::parse(cert).map_err(|_| Error::Unsupported("signer certificate"))?;
+        let (scheme, max_sig) = match &c.public_key {
+            PublicKey::Rsa { n, .. } => (if pss { Scheme::Pss(hash) } else { Scheme::Pkcs1(hash) }, n.iter().skip_while(|b| **b == 0).count()),
+            PublicKey::Ec { curve: tls_core::crypto::EcCurve::P256, .. } if !pss => (Scheme::P256(hash), 72),
+            PublicKey::Ed25519(_) => (Scheme::Ed25519, 64),
+            _ => return Err(Error::Unsupported("remote key")),
+        };
+        Ok(Remote { scheme, max_sig, spki: c.spki.clone(), sign })
+    }
+}
 
 /// The caller's signing key (borrowed; never stored) and the hash it signs with.
 pub enum SignerKey<'a> {
@@ -45,22 +107,49 @@ pub enum SignerKey<'a> {
     P256(&'a SecretKey, Hash),
     /// Ed25519 (pure; the CMS digest is SHA-512, RFC 8419).
     Ed25519(&'a SigningKey),
+    /// PDF-KEYSTORE (SR382): a key held elsewhere, signing through its callback.
+    Remote(Remote<'a>),
 }
 
 impl SignerKey<'_> {
+    /// The signature scheme.
+    pub fn scheme(&self) -> Scheme {
+        match self {
+            SignerKey::Rsa(_, h) => Scheme::Pkcs1(*h),
+            SignerKey::RsaPss(_, h) => Scheme::Pss(*h),
+            SignerKey::P256(_, h) => Scheme::P256(*h),
+            SignerKey::Ed25519(_) => Scheme::Ed25519,
+            SignerKey::Remote(r) => r.scheme,
+        }
+    }
+
     /// The digest algorithm: the chosen one, SHA-512 for Ed25519.
     pub fn hash(&self) -> Hash {
-        match self {
-            SignerKey::Rsa(_, h) | SignerKey::RsaPss(_, h) | SignerKey::P256(_, h) => *h,
-            SignerKey::Ed25519(_) => Hash::Sha512,
-        }
+        self.scheme().hash()
     }
 
     /// The key's signature over `msg` (hashed with [`Self::hash`] first, except Ed25519): k bytes for RSA, a DER
     /// Ecdsa-Sig-Value for P-256, 64 bytes for Ed25519. (RSA signing of a digest cannot fail for a valid key; an
-    /// impossible failure yields an empty signature, which no verifier accepts.)
+    /// impossible failure yields an empty signature, which no verifier accepts; so does a [`Remote`] that fails.)
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
-        match self {
+        self.try_sign(msg).unwrap_or_default()
+    }
+
+    /// [`Self::sign`], with a [`Remote`] signer's failure named: `Unsupported("remote signer")` when the callback
+    /// refuses, `Unsupported("remote signature length")` when it answers more than its `max_sig`.
+    fn try_sign(&self, msg: &[u8]) -> Result<Vec<u8>, Error> {
+        Ok(match self {
+            SignerKey::Remote(r) => {
+                let tbs = match r.scheme {
+                    Scheme::Ed25519 => msg.to_vec(),
+                    s => s.hash().digest(&[msg]),
+                };
+                let sig = (r.sign)(r.scheme, &tbs).map_err(|_| Error::Unsupported("remote signer"))?;
+                if sig.len() > r.max_sig {
+                    return Err(Error::Unsupported("remote signature length"));
+                }
+                sig
+            }
             SignerKey::Ed25519(k) => k.sign(msg).to_vec(),
             SignerKey::P256(k, h) => {
                 let raw = k.sign_prehashed(&h.digest(&[msg]));
@@ -78,7 +167,7 @@ impl SignerKey<'_> {
                     Hash::Sha512 => k.sign_pss::<Sha512>(&digest, &salt, out),
                 })
             }
-        }
+        })
     }
 
     /// The public key as a SubjectPublicKeyInfo.
@@ -94,14 +183,15 @@ impl SignerKey<'_> {
             }
             SignerKey::P256(k, _) => build::spki_p256(&k.public_key().to_sec1_uncompressed()),
             SignerKey::Ed25519(k) => seq(&[&alg(xoid::ED25519, false), &build::bits(&k.public_key())]),
+            SignerKey::Remote(r) => r.spki.clone(),
         }
     }
 
     /// The AlgorithmIdentifier of a certificate this key signs: sha{256,384,512}WithRSAEncryption, RSASSA-PSS with
     /// its parameters, ecdsa-with-SHA{256,384,512}, id-Ed25519.
     pub fn cert_alg(&self) -> Vec<u8> {
-        match self {
-            SignerKey::Rsa(_, h) => alg(
+        match self.scheme() {
+            Scheme::Pkcs1(h) => alg(
                 match h {
                     Hash::Sha256 => xoid::SHA256_WITH_RSA,
                     Hash::Sha384 => xoid::SHA384_WITH_RSA,
@@ -109,8 +199,8 @@ impl SignerKey<'_> {
                 },
                 true,
             ),
-            SignerKey::RsaPss(_, h) => pss_alg(*h),
-            SignerKey::P256(_, h) => alg(
+            Scheme::Pss(h) => pss_alg(h),
+            Scheme::P256(h) => alg(
                 match h {
                     Hash::Sha256 => xoid::ECDSA_WITH_SHA256,
                     Hash::Sha384 => xoid::ECDSA_WITH_SHA384,
@@ -118,15 +208,15 @@ impl SignerKey<'_> {
                 },
                 false,
             ),
-            SignerKey::Ed25519(_) => alg(xoid::ED25519, false),
+            Scheme::Ed25519 => alg(xoid::ED25519, false),
         }
     }
 
     /// The SignerInfo's signatureAlgorithm: rsaEncryption for PKCS#1 v1.5 (the reader takes the hash from the digest
     /// algorithm), else the certificate's identifier.
     fn cms_alg(&self) -> Vec<u8> {
-        match self {
-            SignerKey::Rsa(..) => alg(xoid::RSA_ENCRYPTION, true),
+        match self.scheme() {
+            Scheme::Pkcs1(_) => alg(xoid::RSA_ENCRYPTION, true),
             _ => self.cert_alg(),
         }
     }
@@ -137,6 +227,7 @@ impl SignerKey<'_> {
             SignerKey::Rsa(k, _) | SignerKey::RsaPss(k, _) => k.public_key().size(),
             SignerKey::P256(..) => 72,
             SignerKey::Ed25519(_) => 64,
+            SignerKey::Remote(r) => r.max_sig,
         }
     }
 }
@@ -210,10 +301,10 @@ fn assemble(key: &SignerKey<'_>, digest: &[u8], chain: &[&[u8]], signing_time: i
     }
     let content = set_of_content(attrs);
     // RFC 5652 §5.4: the signature is over the attributes with the EXPLICIT SET OF tag.
-    let signature = if dry { vec![0u8; key.max_sig()] } else { key.sign(&encode_tlv(tag::SET, &content)) };
+    let signature = if dry { vec![0u8; key.max_sig()] } else { key.try_sign(&encode_tlv(tag::SET, &content))? };
     let sid = seq(&[&signer.issuer, &encode_tlv(tag::INTEGER, &signer.serial)]);
     // NULL parameters as before for RSA / P-256; ABSENT for Ed25519's SHA-512 (RFC 8419 §3).
-    let digest_alg = alg(hash_oid(key.hash()), !matches!(key, SignerKey::Ed25519(_)));
+    let digest_alg = alg(hash_oid(key.hash()), key.scheme() != Scheme::Ed25519);
     let signer_info =
         seq(&[&build::int(&[1]), &sid, &digest_alg, &explicit(0, &content), &key.cms_alg(), &octets(&signature)]);
     let certs = set_of_content(chain.iter().map(|c| c.to_vec()).collect());

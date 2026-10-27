@@ -61,6 +61,7 @@ icc_core = { path = "../../unaos/libs/media/icc_core" }
 # PDF4 (SR324): a PDF response opens as a document — the ONE PDF reader (pdf_core: PDF1 objects, PDF2 rendering, PDF3
 # fonts and text) both rings link (BP-handlers-4); the engine adds the face only (`src/pdf/`).
 pdf_core = { path = "../../unaos/libs/web/pdf_core" }
+holocron = { path = "../holocron" } # PDF-KEYSTORE (SR382): pdf::sign asks Holocron (its own socket, verb 150's long form) for the signature
 tls_core = { path = "../../unaos/libs/sys/tls_core" } # PDFSIGNKEYPARSE (SR361): WebCrypto's key containers (api/der.rs) are tls_core::key's
 base64 = "0.23"
 resvg = { version = "0.48.1", optional = true }  # EYES bumped to latest stable (R83); PIXELCORE keeps it behind `svg`
