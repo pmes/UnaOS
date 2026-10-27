@@ -9,7 +9,8 @@
 //!
 //! * SURFACE — `SMessage::SurfaceBlit { url == id }` carries the pane's RGBA8 pixels (depth as a colour
 //!   ramp beside the colour stream, composed by the model); they are swizzled to Cairo's native-endian
-//!   ARGB32 and painted aspect-fitted, letterboxed in the window's background.
+//!   ARGB32 by the Surface contract's one converter (`crate::tetra::surface_argb32`, NLE2ORDER SR227) and
+//!   painted aspect-fitted, letterboxed in the window's background.
 //! * INPUT — pointer motion, leave, scroll and keys go out as `SMessage::Input { target: id, text }` in the
 //!   model's grammar (`move <x> <y>` in SURFACE pixels — the inverse of the paint transform — `leave`,
 //!   `scroll <dy>`, `key <name>`).
@@ -34,17 +35,6 @@ fn paint_transform(sw: u32, sh: u32, ww: i32, wh: i32) -> (f64, f64, f64) {
     }
     let s = (ww as f64 / sw as f64).min(wh as f64 / sh as f64);
     (s, (ww as f64 - sw as f64 * s) / 2.0, (wh as f64 - sh as f64 * s) / 2.0)
-}
-
-/// RGBA8 (the bus's pixel order) → Cairo ARGB32, which is a native-endian 32-bit word: B, G, R, A in
-/// memory on a little-endian host. Alpha is opaque in every pane surface, so no premultiply is owed.
-fn rgba_to_cairo(rgba: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rgba.len());
-    for px in rgba.chunks_exact(4) {
-        let word = u32::from_be_bytes([px[3], px[0], px[1], px[2]]);
-        out.extend_from_slice(&word.to_ne_bytes());
-    }
-    out
 }
 
 /// The probe pane's GTK face for the surface `id` (Sonde's `PANE_URL`, `sonde://pane`).
@@ -152,7 +142,7 @@ pub fn bootstrap_probe_view(id: &str, synapse: Synapse) -> NativeView {
             loop {
                 match rx.recv().await {
                     Ok(SMessage::SurfaceBlit { url, width, height, pixels }) if url == target => {
-                        *surface.borrow_mut() = (rgba_to_cairo(&pixels), width, height);
+                        *surface.borrow_mut() = (crate::tetra::surface_argb32(&pixels), width, height);
                         da.queue_draw();
                     }
                     Ok(_) => {}
@@ -176,11 +166,5 @@ mod tests {
         assert_eq!(paint_transform(200, 100, 400, 400), (2.0, 0.0, 100.0));
         assert_eq!(paint_transform(100, 200, 400, 200), (1.0, 150.0, 0.0));
         assert_eq!(paint_transform(0, 0, 10, 10), (1.0, 0.0, 0.0));
-    }
-
-    #[test]
-    fn swizzle_is_native_argb32() {
-        let out = rgba_to_cairo(&[0x11, 0x22, 0x33, 0xFF]);
-        assert_eq!(u32::from_ne_bytes([out[0], out[1], out[2], out[3]]), 0xFF11_2233);
     }
 }
