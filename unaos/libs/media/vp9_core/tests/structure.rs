@@ -291,3 +291,48 @@ fn vp9inbandcolour_header_codes_map_color_space() {
     assert_eq!(header_codes(&[0x00, 0x01]), None, "not a frame");
     println!("vp9inbandcolour: header_codes BT.709 -> 2/2/1, 2020 -> 9, unknown -> None; frame decodes");
 }
+
+// ── VP9INBANDSWITCH (LEDGER SR400; handlers.md §5 NLEPROBE-HDR's VP9-INBAND-SWITCH) ─────────────────────────────────────────────
+// A two-key-frame splice: the decoder already re-reads color_config and the frame size at every key frame (`parse_uncompressed`
+// -> `HeaderState`, `decode_frame` stamps each `FrameBuf`), so every presented `Frame` carries its own colour and size; this pins
+// it. `key_frame_8x8`'s single 8x8 block codes identically for any size 1..=8 (mi_cols = mi_rows = 1), so the size bits
+// (frame_width_minus_1 at bits 36-51, frame_height_minus_1 at 52-67, profile 0) are patched in place.
+fn vp9inbandswitch_key(cs: u8, w: u32, h: u32) -> Vec<u8> {
+    let mut f = vp9inbandcolour_patch(key_frame_8x8(false), cs, false);
+    let mut put = |at: usize, v: u32, n: usize| {
+        for i in 0..n {
+            let (byte, bit) = ((at + i) / 8, 7 - (at + i) % 8);
+            let b = (v >> (n - 1 - i)) & 1;
+            f[byte] = (f[byte] & !(1 << bit)) | ((b as u8) << bit);
+        }
+    };
+    put(36, w - 1, 16);
+    put(52, h - 1, 16);
+    f
+}
+
+/// The bool-coded bytes after the 14-byte uncompressed header (the compressed header, then the one tile) every
+/// `vp9inbandswitch_key` carries; stria's `vp9inbandswitch_` KAT appends the same bytes to its own header.
+const VP9INBANDSWITCH_TAIL: &[u8] = &[0, 0, 59, 0];
+
+#[test]
+fn vp9inbandswitch_second_key_frame_restates_colour_and_size() {
+    use vp9_core::header::{colour_codes, header_codes};
+    let (k709, k601) = (vp9inbandswitch_key(2, 8, 8), vp9inbandswitch_key(1, 6, 4));
+    assert_eq!(&k709[12..14], &[0, 2], "header_size_in_bytes: the compressed header is the tail's first 2 bytes");
+    assert_eq!(&k709[14..], VP9INBANDSWITCH_TAIL, "the bool-coded tail stria pins");
+    assert_eq!(&k601[14..], VP9INBANDSWITCH_TAIL);
+    assert_eq!((header_codes(&k709), header_codes(&k601)), (Some((2, 2, 1, false)), Some((2, 2, 6, false))));
+    let mut d = Decoder::new();
+    let shown: Vec<_> = [k709.clone(), k601.clone(), vec![0b1000_1000], k709.clone()]
+        .iter()
+        .map(|c| d.decode(c).unwrap().expect("shown"))
+        .collect();
+    let got: Vec<_> = shown.iter().map(|f| (f.width, f.height, f.color_space, f.color_range)).collect();
+    assert_eq!(got, vec![(8, 8, 2, 0), (6, 4, 1, 0), (6, 4, 1, 0), (8, 8, 2, 0)], "each key frame restates colour and size; show_existing re-presents its slot");
+    assert_eq!((shown[1].plane_size(0), shown[1].plane_size(1)), ((6, 4), (3, 2)));
+    assert!(shown[1].planes.iter().flatten().all(|&v| v == 128), "the 6x4 crop decodes mid-grey");
+    let codes: Vec<_> = shown.iter().map(|f| colour_codes(f.color_space, f.color_range)).collect();
+    assert_eq!(codes, vec![Some((2, 2, 1, false)), Some((2, 2, 6, false)), Some((2, 2, 6, false)), Some((2, 2, 1, false))]);
+    println!("vp9inbandswitch: key 8x8 bt709 -> key 6x4 bt601 -> show_existing 6x4 bt601 -> key 8x8 bt709");
+}

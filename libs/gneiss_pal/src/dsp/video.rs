@@ -632,3 +632,29 @@ mod profile_tests {
         assert_eq!(profile_tokens("Main422_10", Some("high"), (6, 2)), "profile=Main422_10 tier=high level=6.2");
     }
 }
+
+// ── VP9INBANDSWITCH (LEDGER SR400): the ONE host in-band switch step (handlers.md §5 NLEPROBE-HDR's VP9-INBAND-SWITCH) ─────────
+// AV1INBANDSWITCH (SR373) / AV1INBANDSIZE (SR379) wrote this as `Av1Decoder::inband`; it moved here unchanged so the VP9 arm
+// reports by it too. The rule is `yuv_core::inband::InBand` (av1_core's `StreamDecoder::switch` / `size_switch` and the kernel
+// Player's `inband_colour` / `inband_size` delegate to it). `now` is the code points the picture states (AV1: the current sequence
+// header's color_config; VP9: the frame's color_space / color_range by `vp9_core::header::colour_codes`), `open` the open's
+// colour (`Track::colour`), `chroma` the track's (`chroma_of`). While the codes equal the first stated ones the frame leaves as it
+// came, byte-identical; once they differ it leaves CONVERTED by the switched colour through the ONE conversion
+// (`Frame::to_rgba_colour`), so the bus sink, the editor's `src_rgba` and play-check pass it through. Wire, once per change:
+// `[STRIA] :: video size switch at <pts_ns> <w>x<h>-><w>x<h>`, `[STRIA] :: video colour switch at <pts_ns> matrix=<a>-><b> range=<full|limited>`.
+pub(crate) fn inband_frame(st: &mut yuv_core::inband::InBand, now: Option<(u8, u8, u8, bool)>, open: Option<super::demux::colour::Colour>, chroma: Chroma, f: Frame) -> Frame {
+    use super::demux::colour::Colour;
+    if let Some(((w0, h0), (w1, h1))) = st.size_switch(f.width, f.height) {
+        log::info!("[STRIA] :: video size switch at {} {}x{}->{}x{}", f.pts_ns, w0, h0, w1, h1); // AV1INBANDSIZE (SR379): the ONE size rule, once per change; the frame carries its size
+    }
+    let open4 = open.map(|c| (c.primaries, c.transfer, c.matrix, c.full_range));
+    let (now, changed) = st.switch(now, open4);
+    let range = |r: Option<bool>| if r == Some(true) { "full" } else { "limited" };
+    if let Some((a, b)) = changed {
+        log::info!("[STRIA] :: video colour switch at {} matrix={}->{} range={}", f.pts_ns, a, b, range(now.map_or(open.and_then(|c| c.full_range), |n| n.3)));
+    }
+    let Some((primaries, transfer, matrix, full_range)) = now else { return f };
+    let c = Colour { primaries, transfer, matrix, full_range, mastering: open.and_then(|c| c.mastering), light: open.and_then(|c| c.light) };
+    let rgba = f.to_rgba_colour(Some(&c), chroma);
+    Frame { pixels: Pixels::Rgba(rgba), ..f }
+}

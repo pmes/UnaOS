@@ -208,19 +208,7 @@ mod tests {
 // matrix=<a>-><b> range=<full|limited>`, once per change.
 impl Av1Decoder {
     fn inband(&mut self, f: Frame) -> Frame {
-        use crate::dsp::demux::colour::Colour;
-        if let Some(((w0, h0), (w1, h1))) = self.inner.size_switch(f.width, f.height) {
-            log::info!("[STRIA] :: video size switch at {} {}x{}->{}x{}", f.pts_ns, w0, h0, w1, h1); // AV1INBANDSIZE (SR379): av1_core's ONE size rule, once per change; the frame carries its size
-        }
-        let open = self.open.map(|c| (c.primaries, c.transfer, c.matrix, c.full_range));
-        let (now, changed) = self.inner.switch(open);
-        let range = |r: Option<bool>| if r == Some(true) { "full" } else { "limited" };
-        if let Some((a, b)) = changed {
-            log::info!("[STRIA] :: video colour switch at {} matrix={}->{} range={}", f.pts_ns, a, b, range(now.map_or(self.open.and_then(|c| c.full_range), |n| n.3)));
-        }
-        let Some((primaries, transfer, matrix, full_range)) = now else { return f };
-        let c = Colour { primaries, transfer, matrix, full_range, mastering: self.open.and_then(|c| c.mastering), light: self.open.and_then(|c| c.light) };
-        let rgba = f.to_rgba_colour(Some(&c), super::Chroma::Bilinear);
-        Frame { pixels: Pixels::Rgba(rgba), ..f }
+        let now = self.inner.dec.current_codes().map(|c| c.0);
+        super::inband_frame(&mut self.inner.inband, now, self.open, super::Chroma::Bilinear, f) // VP9INBANDSWITCH (SR400): the ONE host step, moved to video.rs unchanged
     }
 }
