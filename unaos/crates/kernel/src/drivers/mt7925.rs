@@ -1,9 +1,9 @@
-//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23, and S6 the radio backend registered with the data rings armed, Z29, and S7 the scan, Z34; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
+//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23, and S6 the radio backend registered with the data rings armed, Z29, and S7 the scan, Z34, and S8 DEV_INFO/BSS_INFO, the channel and the open-system auth/assoc frames, Z38; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
 //! MT7925 — S1, the probe (ZENBOOKMT7925, zenbook-ledger Z5). The ladder is
-//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17), S5 (MT7925S5, Z23), S6 (MT7925S6, Z29) and S7 (MT7925S7, Z34) are the six file-tail blocks; S8..S10 are owed there by name.
+//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17), S5 (MT7925S5, Z23), S6 (MT7925S6, Z29), S7 (MT7925S7, Z34) and S8 (MT7925S8, Z38) are the seven file-tail blocks; S9..S10 are owed there by name.
 //!
 //! WHAT THIS RUNG DOES. Once per boot, from the three storage-ready passes in `main.rs` (beside `wifi::service()`,
 //! the same forward-only polled shape), and only after `boot::services_gate("wifi")` answers (R86, BP-net-4):
@@ -1583,7 +1583,7 @@ const BAND_5G: u8 = 2;
 const DWELL_MS: u16 = 60;
 /// The unsolicited SCAN_DONE event: its uni event id and the event header's unsolicited option bit.
 const EVT_SCAN_DONE: u8 = 0x0e;
-const OPT_UNSOLICITED: u8 = 1 << 1;
+const OPT_UNSOLICITED: u8 = (1 << 1) | (1 << 2); // MT7925S8 (Z38, S7-UNSOL): linux dispatches unsolicited events on BIT(2); the eid tells SCAN_DONE / ROC from acks
 /// How long one band waits for SCAN_DONE after the ack, and the drain after it (frames still in flight).
 const SCAN_WAIT_MS: u64 = 5000;
 const TAIL_MS: u64 = 100;
@@ -1829,39 +1829,12 @@ pub fn scan(on_frame: &mut dyn FnMut(&[u8]) -> bool) -> Result<u32, &'static str
 /// Everything between the channel's take and its return: the pages, own, `held`, RX ring 2's buffer block, `wake` with the
 /// data rings, RX ring 2's 31 buffers handed, the bands, own given back, the lines.
 fn scan_run(b: u64, h: &mut Hw, tx0: u64, rx2: u64, on_frame: &mut dyn FnMut(&[u8]) -> bool) -> Result<u32, &'static str> {
-    let lp = b + CONN_HOST_CSR_TOP + LPCTL;
-    if !(map_page(b + WFDMA0) && map_page(b + (DMASHDL_SW_CONTROL & !0xfff))) {
-        serial_println!("[mt7925] s7 -> NOT ATTEMPTED why=unmapped rel=found");
-        return Err("unmapped");
-    }
-    let took = match take_own(lp) {
-        Ok(t) => t,
-        Err((last, rel)) => {
-            serial_println!("[mt7925] s7 -> NOT ATTEMPTED why=own lpctl={:#010x} rel={}", last, rel);
-            return Err("own");
-        }
-    };
-    let kept = if r32(h.q15) as u64 == h.wm && r32(h.q0) as u64 == h.rx0 { "kept" } else { "lost" };
-    let mut rxb2 = S7_RXB.load(Ordering::Relaxed);
-    if rxb2 == 0 {
-        let v = crate::arch::memory::dma::ident(RX_BLOCK, 4096);
-        if v != 0 && v + RX_BLOCK as u64 <= DMA_LIMIT {
-            rxb2 = v;
-            S7_RXB.store(v, Ordering::Relaxed);
-        }
-    }
-    let q2 = b + RX_EVENT_RING_BASE + RXQ_DATA * RING_REGS;
-    let pre = if rxb2 == 0 {
-        Err(String::from("no-memory")) // nothing written to a ring register
-    } else {
-        let data = [(b + TX_RING_BASE + TXQ_DATA * RING_REGS, tx0), (q2, rx2)];
-        wake(b, h, &data)
-    };
+    let Run { lp, took, kept, q2, rxb2, pre } = rx_open(b, h, tx0, rx2, "s7")?; // MT7925S8 (Z38): the prologue hoisted unchanged into `rx_open`
     let path = S7_PATH.load(Ordering::Relaxed);
     let mut reps: Vec<BandRep> = Vec::new();
     if pre.is_ok() {
         hand_rx(rx2, rxb2);
-        w32(q2 + 8, RX_BUFS); // RX ring 2's 31 buffers handed (ring 0's convention: descriptor 31 unhanded)
+        w32(q2 + 8, RX_BUFS); dev_bss_once(h); // RX ring 2's 31 buffers handed (ring 0's convention: descriptor 31 unhanded)
         let mut r = Rx2 { q: q2, desc: rx2, bufs: rxb2, ri: 0 };
         if path == PATH_UNREAD || path & PATH_2G != 0 {
             reps.push(band(h, &mut r, "2g", BAND_2G, &CH_2G, true, &mut *on_frame));
@@ -1929,5 +1902,498 @@ pub fn scan_kat() -> bool {
     f[8..12].copy_from_slice(&(1u32 << 13).to_le_bytes());
     f[0..4].copy_from_slice(&((7u32 << 27) | 90).to_le_bytes());
     ok &= rx_frame(&f).is_none();
+    ok
+}
+
+// ── MT7925S8 (zenbook-ledger Z38) — S8: DEV_INFO / BSS_INFO, the channel, the open-system auth and assoc frames ──────────
+// Only from the operator's `tests wifijoin <ssid>` (wifi/verb.rs `wifijoin`), never at boot (BP-net-7), over the channel S6 parked in
+// `MCU_LINK` and the data rings in `RADIO`; open BSSes only (WPA2 is S10). Linux's add_interface sends two acked unified commands before
+// anything else: DEV_INFO_UPDATE (0x01: the own MAC, the device index) and BSS_INFO_UPDATE (0x02: a BASIC TLV, bss 0, connection type STA);
+// `dev_bss_once` sends them once per boot (S7 calls it before its first scan: S7-DEV). A join then sends BSS_INFO with the target BSSID and,
+// per frame, a ROC (0x27, JOIN, 1 s) whose GRANT is an unsolicited event on ring 0 (polled through the ONE consumer `event_take`; the grant
+// carries the band index) and a ROC abort after. The host builds the frame (the station's `wifi_core` builders, handed in as closures: the
+// driver links no codec) and posts it on TX ring 0 as linux does: ONE descriptor, one buffer = a 32-byte connac3 TXD + a 32-byte hw txp whose
+// first pointer names the 802.11 frame (`post` + `tx_done`, S4's); wlan idx 19 = the interface's own wcid (WTBL_RESERVED), fixed rate by table
+// index, queue AC03. The reply is whatever RX ring 2's `drain` hands the station's judge closure (S7's frame filter). No STA_REC (owed S8-STAREC),
+// no key, no interrupt enable, no config write. Hardware facts only; no code copied.
+
+const UNI_DEV_INFO: u16 = 0x01;
+const UNI_BSS_INFO: u16 = 0x02;
+const UNI_ROC: u16 = 0x27;
+const EVT_ROC: u8 = 0x27;
+const ROC_TAG_ACQUIRE: u16 = 0;
+const ROC_TAG_ABORT: u16 = 1;
+/// The interface's own (bmc) wlan index: MT792x_WTBL_RESERVED - 0.
+const WCID_BMC: u16 = 19;
+/// CONNECTION_INFRA_STA: STA_TYPE_STA | NETWORK_INFRA.
+const CONN_INFRA_STA: u32 = 0x0001_0001;
+const BAND_UNSET: u8 = 0xff;
+const ROC_JOIN_MS: u32 = 1000;
+const ROC_WAIT_MS: u64 = 1000;
+const REPLY_MS: u64 = 1000;
+/// The TX block: four 1 KiB slots, each a 64-byte TXD + txp at +0 and the frame at +128 (at most MGMT_MAX bytes).
+const TX_BLOCK: usize = 4096;
+const TX_SLOT: u64 = 1024;
+const TX_SLOTS: u32 = 4;
+const TX_FRAME_OFF: u64 = 128;
+const MGMT_MAX: usize = 800;
+const TXWI_BYTES: u32 = 64;
+/// Management frames ride mac80211's VO queue: wmm 0 * 4 + (3 - 0).
+const MGMT_Q_IDX: u32 = 3;
+const HDR_802_11: u32 = 2;
+/// The fixed-rate TABLE slots (MT792x_BASIC_RATES_TBL): the CCK 1M slot on 2.4 GHz, the OFDM 6M slot (+4) on 5 GHz.
+const RATE_TBL_2G: u32 = 11;
+const RATE_TBL_5G: u32 = 15;
+const PHY_MODE_A: u8 = 1 << 0;
+const PHY_MODE_BG: u8 = (1 << 1) | (1 << 2);
+const NONHT_ERP: u16 = 1;
+const NONHT_OFDM: u16 = 3;
+/// The grant event: the TLV starts after the 44-byte rxd and 4 reserved bytes; status @54, dbdcband @62.
+const GRANT_TLV: usize = RXD_BYTES + 4;
+
+/// DEV_INFO and BSS_INFO acked once this boot.
+static S8_DEV: AtomicBool = AtomicBool::new(false);
+/// The 4 KiB TX block (below 4 GiB, `dma::ident` once, never freed: S3's rule).
+static S8_TXB: AtomicU64 = AtomicU64::new(0);
+/// The last ROC token (1..127).
+static S8_TOK: AtomicU8 = AtomicU8::new(0);
+
+/// The station's answer to one received frame: Ok(0) = authentication accepted / Ok(aid) = associated; Refused(code) = a status
+/// code or a deauth / disassoc reason.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Ok(u16),
+    Refused(u16),
+}
+
+/// How one exchange ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Skipped,
+    Timeout,
+    Tx(&'static str),
+    Ans(Answer),
+}
+
+/// The target the station chose from its scan.
+pub struct JoinPlan<'a> {
+    pub ssid: &'a str,
+    pub bssid: [u8; 6],
+    pub channel: u8,
+}
+
+/// What `join` did.
+pub struct JoinRep {
+    pub auth: Step,
+    pub assoc: Step,
+}
+
+/// What `rx_open` leaves the caller: own, the channel's ring state, RX ring 2's registers and buffer block, `wake`'s verdict.
+struct Run {
+    lp: u64,
+    took: bool,
+    kept: &'static str,
+    q2: u64,
+    rxb2: u64,
+    pre: Result<(), String>,
+}
+
+/// TX ring 0 as one join posts on it: registers, the next CPU index, the TX block, the band index the grant named, 5 GHz.
+struct Tx {
+    q: u64,
+    wi: u32,
+    blk: u64,
+    band: u8,
+    five: bool,
+}
+
+/// What one ROC did: the ack's status byte, the grant (status, band index, ms waited).
+struct Roc {
+    ack: Option<u8>,
+    grant: Option<(u8, u8, u64)>,
+}
+
+/// S7's prologue, hoisted unchanged out of `scan_run` (MT7925S8, Z38; the writes and the s7 lines are the same, the tag is `who`):
+/// the pages, own (`take_own`), `kept`, RX ring 2's 64 KiB buffer block, `wake` with the data rings.
+fn rx_open(b: u64, h: &mut Hw, tx0: u64, rx2: u64, who: &'static str) -> Result<Run, &'static str> {
+    let lp = b + CONN_HOST_CSR_TOP + LPCTL;
+    if !(map_page(b + WFDMA0) && map_page(b + (DMASHDL_SW_CONTROL & !0xfff))) {
+        serial_println!("[mt7925] {} -> NOT ATTEMPTED why=unmapped rel=found", who);
+        return Err("unmapped");
+    }
+    let took = match take_own(lp) {
+        Ok(t) => t,
+        Err((last, rel)) => {
+            serial_println!("[mt7925] {} -> NOT ATTEMPTED why=own lpctl={:#010x} rel={}", who, last, rel);
+            return Err("own");
+        }
+    };
+    let kept = if r32(h.q15) as u64 == h.wm && r32(h.q0) as u64 == h.rx0 { "kept" } else { "lost" };
+    let mut rxb2 = S7_RXB.load(Ordering::Relaxed);
+    if rxb2 == 0 {
+        let v = crate::arch::memory::dma::ident(RX_BLOCK, 4096);
+        if v != 0 && v + RX_BLOCK as u64 <= DMA_LIMIT {
+            rxb2 = v;
+            S7_RXB.store(v, Ordering::Relaxed);
+        }
+    }
+    let q2 = b + RX_EVENT_RING_BASE + RXQ_DATA * RING_REGS;
+    let pre = if rxb2 == 0 {
+        Err(String::from("no-memory")) // nothing written to a ring register
+    } else {
+        let data = [(b + TX_RING_BASE + TXQ_DATA * RING_REGS, tx0), (q2, rx2)];
+        wake(b, h, &data)
+    };
+    Ok(Run { lp, took, kept, q2, rxb2, pre })
+}
+
+/// DEV_INFO body (pure, 16 bytes): header {omac 0, band unset, 2 pad}, TLV {tag 0, len 12, active 1, link 0, the own MAC}.
+fn dev_req(m: [u8; 6]) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    v[1] = BAND_UNSET;
+    v[6] = 12;
+    v[8] = 1;
+    v[10..16].copy_from_slice(&m);
+    v
+}
+
+/// BSS_INFO body (pure, 36 bytes): header {bss 0, 3 pad}, the BASIC TLV (tag 0, len 32): active, omac 0, hw bss 0, `band`, STA/INFRA,
+/// conn_state 1 (not connected), wmm 0, `bssid`, the bmc and sta wlan index 19, link 0. `phy` = Some(5 GHz?) is a join's: beacon
+/// interval 100 (`parse_beacon` does not carry it: S8-BCNINT), the legacy phy mode and the non-HT basic phy of the band.
+fn bss_req(bssid: [u8; 6], band: u8, phy: Option<bool>) -> [u8; 36] {
+    let mut v = [0u8; 36];
+    v[6] = 32;
+    v[8] = 1;
+    v[11] = band;
+    v[12..16].copy_from_slice(&CONN_INFRA_STA.to_le_bytes());
+    v[16] = 1;
+    v[18..24].copy_from_slice(&bssid);
+    v[24..26].copy_from_slice(&WCID_BMC.to_le_bytes());
+    v[30..32].copy_from_slice(&WCID_BMC.to_le_bytes());
+    if let Some(five) = phy {
+        v[26..28].copy_from_slice(&100u16.to_le_bytes());
+        v[29] = if five { PHY_MODE_A } else { PHY_MODE_BG };
+        v[32..34].copy_from_slice(&(if five { NONHT_OFDM } else { NONHT_ERP }).to_le_bytes());
+    }
+    v
+}
+
+/// ROC ACQUIRE body (pure, 28 bytes): 4 reserved, TLV {tag 0, len 24, bss 0, token, control channel `ch`, sco 0, band 1 (2.4) / 2 (5),
+/// width 0, center `ch`, center2 0, width/center from the AP likewise, request type JOIN, 1000 ms, band index unset}.
+fn roc_req(tok: u8, ch: u8, five: bool) -> [u8; 28] {
+    let mut v = [0u8; 28];
+    v[4..6].copy_from_slice(&ROC_TAG_ACQUIRE.to_le_bytes());
+    v[6] = 24;
+    v[9] = tok;
+    v[10] = ch;
+    v[12] = if five { 2 } else { 1 };
+    v[14] = ch;
+    v[17] = ch;
+    v[20..24].copy_from_slice(&ROC_JOIN_MS.to_le_bytes());
+    v[24] = BAND_UNSET;
+    v
+}
+
+/// ROC ABORT body (pure, 16 bytes): 4 reserved, TLV {tag 1, len 12, bss 0, token, band index unset, 5 reserved}.
+fn roc_abort(tok: u8) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    v[4..6].copy_from_slice(&ROC_TAG_ABORT.to_le_bytes());
+    v[6] = 12;
+    v[9] = tok;
+    v[10] = BAND_UNSET;
+    v
+}
+
+/// The grant event's (status, band index) (pure): the TLV after the rxd must be tag 0 and 64 bytes must be there.
+fn roc_grant(ev: &[u8]) -> Option<(u8, u8)> {
+    if ev.len() < GRANT_TLV + 16 || ev[GRANT_TLV] != 0 || ev[GRANT_TLV + 1] != 0 {
+        return None;
+    }
+    Some((ev[GRANT_TLV + 6], ev[GRANT_TLV + 14]))
+}
+
+/// The 64-byte TXD + hw txp of one management frame (pure; `frame` >= 24 bytes at bus address `pa`, `tok` the msdu id): d0 length
+/// + 32, CT, queue 3; d1 wlan 19, own MAC 0, band index (TGID, when not 0), 802.11 header format, header info 12, tid 0, fixed
+/// rate; d2 subtype | type; d3 remaining tx count 15, BA disable (+ BCM for a group address); d6 DAS, DIS_MAT, one MSDU, the
+/// fixed-rate table slot; d4, d5, d7 zero. txp: msdu id | valid, then pointer 0 = (`pa`, length | last).
+fn mgmt_txwi(frame: &[u8], pa: u64, tok: u8, five: bool, band: u8) -> [u8; 64] {
+    let fc = frame[0] as u32;
+    let mut d1 = WCID_BMC as u32 | (HDR_802_11 << 14) | (12 << 16) | (1 << 31);
+    if band != 0 {
+        d1 |= (band as u32) << 12;
+    }
+    let mut d3 = (15u32 << 11) | (1 << 28);
+    if frame[4] & 1 != 0 {
+        d3 |= 1 << 4;
+    }
+    let d = [
+        (frame.len() as u32 + 32) | (MGMT_Q_IDX << 25),
+        d1,
+        (fc >> 4) | (((fc >> 2) & 3) << 4),
+        d3,
+        0,
+        0,
+        (1 << 2) | (1 << 3) | (1 << 4) | ((if five { RATE_TBL_5G } else { RATE_TBL_2G }) << 16),
+        0,
+    ];
+    let mut v = [0u8; 64];
+    for (i, w) in d.iter().enumerate() {
+        v[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    v[32..34].copy_from_slice(&(tok as u16 | 0x8000).to_le_bytes());
+    v[40..44].copy_from_slice(&(pa as u32).to_le_bytes());
+    v[44..46].copy_from_slice(&(frame.len() as u16 | 0x8000).to_le_bytes());
+    v
+}
+
+/// An ack's `0x..` text, `-` when the command did not complete.
+fn ack_text(r: &Result<u8, &'static str>) -> String {
+    match r {
+        Ok(a) => alloc::format!("{:#04x}", a),
+        Err(_) => String::from("-"),
+    }
+}
+
+/// S7-DEV: linux's add_interface pair, once per boot, from the first scan or join: DEV_INFO then BSS_INFO (no BSSID), each acked.
+/// Bounded by `uni_cmd`'s own waits; a refusal is said by name and does not stop the caller (it retries at the next call).
+fn dev_bss_once(h: &mut Hw) {
+    if S8_DEV.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(m) = mac() else {
+        serial_println!("[mt7925] s8 dev -> REFUSED why=no-mac");
+        return;
+    };
+    let d = uni_cmd(h, UNI_DEV_INFO, &dev_req(m));
+    let bs = if d.is_ok() { uni_cmd(h, UNI_BSS_INFO, &bss_req([0u8; 6], BAND_UNSET, None)) } else { Err("skipped") };
+    let ok = d == Ok(0) && bs == Ok(0);
+    if ok {
+        S8_DEV.store(true, Ordering::Relaxed);
+    }
+    let why = match (&d, &bs) {
+        (Err(e), _) | (_, Err(e)) => *e,
+        _ => "ack",
+    };
+    serial_println!(
+        "[mt7925] s8 dev mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} omac=0 wcid={} dev={} bss={} -> {}",
+        m[0], m[1], m[2], m[3], m[4], m[5], WCID_BMC, ack_text(&d), ack_text(&bs),
+        if ok { String::from("parked") } else { alloc::format!("REFUSED why={}", why) }
+    );
+}
+
+/// One management frame out on TX ring 0: the frame into the slot's +128, `mgmt_txwi` at its head, `post` (S4's one-buffer
+/// descriptor, the CPU index last), then `tx_done` (the DMA index caught up). Err = `frame-len` or `tx0`.
+fn tx_mgmt(t: &mut Tx, frame: &[u8], tok: u8) -> Result<(), &'static str> {
+    if frame.len() < 24 || frame.len() > MGMT_MAX {
+        return Err("frame-len");
+    }
+    let slot = t.blk + (t.wi % TX_SLOTS) as u64 * TX_SLOT;
+    let pa = slot + TX_FRAME_OFF;
+    for (i, v) in frame.iter().enumerate() {
+        // SAFETY: inside slot `wi % 4` of the 4 KiB block `join_run` allocated (frame.len() <= MGMT_MAX, offset 128).
+        unsafe { core::ptr::write_volatile((pa + i as u64) as *mut u8, *v) };
+    }
+    let w = mgmt_txwi(frame, pa, tok, t.five, t.band);
+    for (i, v) in w.iter().enumerate() {
+        // SAFETY: the slot's first 64 bytes, same block.
+        unsafe { core::ptr::write_volatile((slot + i as u64) as *mut u8, *v) };
+    }
+    t.wi = post(t.q, t.wi, slot, TXWI_BYTES);
+    if tx_done(t.q, t.wi) { Ok(()) } else { Err("tx0") }
+}
+
+/// ROC ACQUIRE through `uni_cmd`, then up to ROC_WAIT_MS of ring-0 events for the unsolicited GRANT (`event_take`, the ONE consumer;
+/// the matched event's bytes are in `h.last`). No grant is not fatal here: the caller says so and goes on.
+fn roc(h: &mut Hw, tok: u8, ch: u8, five: bool) -> Roc {
+    let a = uni_cmd(h, UNI_ROC, &roc_req(tok, ch, five));
+    let mut r = Roc { ack: a.ok(), grant: None };
+    if a.is_ok() {
+        let want = |eid: u8, _seq: u8, opt: u8| eid == EVT_ROC && opt & OPT_UNSOLICITED != 0;
+        let (got, ms) = spin_long(ROC_WAIT_MS, || matches!(event_take(&mut *h, &want), Some(Some(_))));
+        if got {
+            r.grant = roc_grant(&h.last).map(|(s, b)| (s, b, ms));
+        }
+    }
+    r
+}
+
+/// One request/response exchange: ROC (its line), `build(phase)`, `tx_mgmt`, then up to REPLY_MS of RX ring 2 `drain`s with `judge`
+/// as the frame filter (the first answer wins; ring 0 is drained of strays each round), then ROC ABORT.
+fn exchange(
+    h: &mut Hw, r: &mut Rx2, t: &mut Tx, phase: u8, ch: u8,
+    build: &mut dyn FnMut(u8) -> Vec<u8>, judge: &mut dyn FnMut(u8, &[u8]) -> Option<Answer>,
+) -> Step {
+    let tok = S8_TOK.load(Ordering::Relaxed) % 127 + 1;
+    S8_TOK.store(tok, Ordering::Relaxed);
+    let rc = roc(h, tok, ch, t.five);
+    let grant = rc.grant.map_or(String::from("none"), |(s, b, ms)| alloc::format!("status={} band={} ms={}", s, b, ms));
+    serial_println!(
+        "[mt7925] s8 roc phase={} ch={} band={} ack={} grant={}",
+        if phase == 0 { "auth" } else { "assoc" }, ch, if t.five { "5g" } else { "2g" },
+        rc.ack.map_or(String::from("-"), |a| alloc::format!("{:#04x}", a)), grant
+    );
+    if let Some((_, band, _)) = rc.grant {
+        if band < 2 {
+            t.band = band;
+        }
+    }
+    let frame = build(phase);
+    if let Err(w) = tx_mgmt(t, &frame, tok) {
+        let _ = uni_cmd(h, UNI_ROC, &roc_abort(tok));
+        return Step::Tx(w);
+    }
+    let mut ans: Option<Answer> = None;
+    let mut n = Counts::default();
+    let _ = spin_long(REPLY_MS, || {
+        drain(&mut *r, &mut n, &mut |f: &[u8]| {
+            if ans.is_none() {
+                ans = judge(phase, f);
+            }
+            false
+        });
+        let _ = event_take(&mut *h, &|_: u8, _: u8, _: u8| false);
+        ans.is_some()
+    });
+    let _ = uni_cmd(h, UNI_ROC, &roc_abort(tok));
+    match ans {
+        Some(a) => Step::Ans(a),
+        None => Step::Timeout,
+    }
+}
+
+/// A step's wire word; `assoc` shows an Ok as the AID.
+fn step_text(s: &Step, assoc: bool) -> String {
+    match s {
+        Step::Skipped => String::from("skipped"),
+        Step::Timeout => String::from("timeout"),
+        Step::Tx(w) => alloc::format!("tx:{}", w),
+        Step::Ans(Answer::Ok(v)) => if assoc { alloc::format!("aid={}", v) } else { String::from("ok") },
+        Step::Ans(Answer::Refused(c)) => alloc::format!("refused code={}", c),
+    }
+}
+
+/// S8: the open-system join for the station's `tests wifijoin`. `build(0)` is the authentication request, `build(1)` the association
+/// request; `judge(phase, frame)` answers a received frame (None = not the answer). Err = the refusal word, said on the `[mt7925] s8`
+/// line. The channel goes back to `MCU_LINK` on every path.
+pub fn join(
+    plan: &JoinPlan, build: &mut dyn FnMut(u8) -> Vec<u8>, judge: &mut dyn FnMut(u8, &[u8]) -> Option<Answer>,
+) -> Result<JoinRep, &'static str> {
+    let held = *PROBE.lock();
+    let (Some(p), Some((tx0, rx2)), true) = (held, data_rings(), registered()) else {
+        serial_println!("[mt7925] s8 -> NOT ATTEMPTED why=no-radio rel=found");
+        return Err("no-radio");
+    };
+    let link = MCU_LINK.lock().take();
+    let Some(mut h) = link else {
+        serial_println!("[mt7925] s8 -> NOT ATTEMPTED why=no-link rel=found");
+        return Err("no-link");
+    };
+    let res = join_run(p.bar0, &mut h, tx0, rx2, plan, build, judge);
+    *MCU_LINK.lock() = Some(h); // put back on every path
+    res
+}
+
+/// Everything between the channel's take and its return: the TX block, `rx_open`, RX ring 2's buffers, S7-DEV, BSS_INFO with the
+/// target, the two exchanges, own given back, the line.
+fn join_run(
+    b: u64, h: &mut Hw, tx0: u64, rx2: u64, plan: &JoinPlan,
+    build: &mut dyn FnMut(u8) -> Vec<u8>, judge: &mut dyn FnMut(u8, &[u8]) -> Option<Answer>,
+) -> Result<JoinRep, &'static str> {
+    let mut txb = S8_TXB.load(Ordering::Relaxed);
+    if txb == 0 {
+        let v = crate::arch::memory::dma::ident(TX_BLOCK, 4096);
+        if v != 0 && v + TX_BLOCK as u64 <= DMA_LIMIT {
+            txb = v;
+            S8_TXB.store(v, Ordering::Relaxed);
+        }
+    }
+    if txb == 0 {
+        serial_println!("[mt7925] s8 -> NOT ATTEMPTED why=no-txmem rel=found");
+        return Err("no-txmem");
+    }
+    let Run { lp, took, kept, q2, rxb2, pre } = rx_open(b, h, tx0, rx2, "s8")?;
+    let five = plan.channel >= 36;
+    let mut rep = JoinRep { auth: Step::Skipped, assoc: Step::Skipped };
+    let mut bss: Result<u8, &'static str> = Err("skipped");
+    let mut posted = 0u32;
+    if pre.is_ok() {
+        hand_rx(rx2, rxb2);
+        w32(q2 + 8, RX_BUFS); // RX ring 2's 31 buffers handed (S7's convention)
+        dev_bss_once(h);
+        bss = uni_cmd(h, UNI_BSS_INFO, &bss_req(plan.bssid, BAND_UNSET, Some(five)));
+        let mut r = Rx2 { q: q2, desc: rx2, bufs: rxb2, ri: 0 };
+        let mut t = Tx { q: b + TX_RING_BASE + TXQ_DATA * RING_REGS, wi: 0, blk: txb, band: 0, five };
+        rep.auth = exchange(h, &mut r, &mut t, 0, plan.channel, &mut *build, &mut *judge);
+        if matches!(rep.auth, Step::Ans(Answer::Ok(_))) {
+            rep.assoc = exchange(h, &mut r, &mut t, 1, plan.channel, &mut *build, &mut *judge);
+        }
+        posted = t.wi;
+    }
+    let rel = give_back(lp, took);
+    if let Err(w) = pre {
+        serial_println!("[mt7925] s8 -> NOT ATTEMPTED why={} rel={}", w, rel);
+        return Err("pre");
+    }
+    let m = plan.bssid;
+    serial_println!(
+        "[mt7925] s8 join ssid=\"{}\" bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch={} tx0={} bss={} auth={} assoc={} held={} rel={} -> parked",
+        plan.ssid, m[0], m[1], m[2], m[3], m[4], m[5], plan.channel, posted, ack_text(&bss),
+        step_text(&rep.auth, false), step_text(&rep.assoc, true), kept, rel
+    );
+    Ok(rep)
+}
+
+/// `tests wifijoin`'s known-answer rows (hand-computed from the field table, no capture): the TXD + txp of a 30-byte authentication
+/// frame on 2.4 GHz and 5 GHz and a 52-byte association request, the DEV_INFO, BSS_INFO (idle and a join's on both bands), ROC
+/// ACQUIRE and ABORT bodies, and `roc_grant` over a canned event.
+pub fn join_kat() -> bool {
+    fn u32_at(v: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]])
+    }
+    fn u16_at(v: &[u8], o: usize) -> u16 {
+        u16::from_le_bytes([v[o], v[o + 1]])
+    }
+    let mut auth = alloc::vec![0u8; 30];
+    auth[0] = 0xb0;
+    let a = mgmt_txwi(&auth, 0x1080, 1, false, 0);
+    let mut ok = a.len() == 64
+        && u32_at(&a, 0) == 0x0600_003e && u32_at(&a, 4) == 0x800c_8013 && u32_at(&a, 8) == 0x0b
+        && u32_at(&a, 12) == 0x1000_7800 && u32_at(&a, 16) == 0 && u32_at(&a, 20) == 0
+        && u32_at(&a, 24) == 0x000b_001c && u32_at(&a, 28) == 0
+        && u32_at(&a, 32) == 0x8001 && u32_at(&a, 40) == 0x1080 && u32_at(&a, 44) == 0x801e;
+    let f = mgmt_txwi(&auth, 0x1080, 1, true, 0);
+    ok &= u32_at(&f, 24) == 0x000f_001c && u32_at(&f, 4) == 0x800c_8013;
+    let mut req = alloc::vec![0u8; 52];
+    req[0] = 0x00;
+    let c = mgmt_txwi(&req, 0x1480, 2, false, 0);
+    ok &= u32_at(&c, 0) == 0x0600_0054 && u32_at(&c, 8) == 0 && u32_at(&c, 32) == 0x8002
+        && u32_at(&c, 40) == 0x1480 && u32_at(&c, 44) == 0x8034;
+    let g = mgmt_txwi(&auth, 0x1080, 1, false, 1);
+    ok &= u32_at(&g, 4) == 0x800c_9013;
+    let mac = [0x02, 0x55, 0x4e, 0x41, 0x4f, 0x53];
+    let d = dev_req(mac);
+    ok &= d[..10] == [0, 0xff, 0, 0, 0, 0, 12, 0, 1, 0] && d[10..] == mac;
+    let bssid = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let i = bss_req(bssid, BAND_UNSET, None);
+    ok &= i.len() == 36 && i[6] == 32 && i[8] == 1 && i[11] == 0xff && u32_at(&i, 12) == 0x0001_0001 && i[16] == 1
+        && i[18..24] == bssid && u16_at(&i, 24) == 19 && u16_at(&i, 30) == 19 && i[29] == 0 && u16_at(&i, 26) == 0;
+    let j = bss_req(bssid, BAND_UNSET, Some(false));
+    ok &= u16_at(&j, 26) == 100 && j[29] == 6 && u16_at(&j, 32) == 1;
+    let k = bss_req(bssid, BAND_UNSET, Some(true));
+    ok &= k[29] == 1 && u16_at(&k, 32) == 3;
+    let r = roc_req(7, 6, false);
+    ok &= r.len() == 28 && u16_at(&r, 4) == 0 && r[6] == 24 && r[9] == 7 && r[10] == 6 && r[12] == 1 && r[14] == 6
+        && r[17] == 6 && r[19] == 0 && u32_at(&r, 20) == 1000 && r[24] == 0xff && roc_req(7, 36, true)[12] == 2;
+    let x = roc_abort(7);
+    ok &= x.len() == 16 && u16_at(&x, 4) == 1 && x[6] == 12 && x[9] == 7 && x[10] == 0xff;
+    let mut ev = alloc::vec![0u8; 68];
+    ev[GRANT_TLV + 6] = 0;
+    ev[GRANT_TLV + 14] = 0;
+    ok &= roc_grant(&ev) == Some((0, 0));
+    ev[GRANT_TLV + 6] = 1;
+    ev[GRANT_TLV + 14] = 1;
+    ok &= roc_grant(&ev) == Some((1, 1)) && roc_grant(&ev[..60]).is_none();
+    ev[GRANT_TLV] = 4;
+    ok &= roc_grant(&ev).is_none();
     ok
 }

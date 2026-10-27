@@ -242,12 +242,12 @@ pub fn kat() -> (u32, u32, Option<&'static str>, [bool; 6]) {
     (pass, checks.len() as u32, first, groups)
 }
 
-fn rung_word(v: u8, ok: &'static str, no: &'static str) -> &'static str {
+#[cfg(feature = "wifi10")] fn rung_word(v: u8, ok: &'static str, no: &'static str) -> &'static str {
     match v { 1 => ok, 2 => no, _ => "ABSENT" }
 }
 
 /// `tests wifi` (verb.rs), after `wifi10()`: the KAT line, then the §11.3.1 state this boot's rungs reached.
-pub fn witness() {
+#[cfg(feature = "wifi10")] pub fn witness() {
     let (p, t, first, g) = kat();
     let m = |b: bool| if b { "MATCH" } else { "DIFF" };
     serial_println!(
