@@ -799,7 +799,7 @@ refs/heads/exec-rmbp-hdastart   190d2f9b0 FOLDED-BY-HAND (this commit) 2026-10-2
 refs/heads/exec-rmbp-a2dpkat   baa7d1da6 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-miccursor   d2cb6dd2e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-unafswrite3   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-bindlive   baa7d1da6 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-bindlive   6d79b79b8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle1   6bb942eef IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nleprobe   2c8aa19b1 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethermac   d08ed067e FOLDED-BY-HAND (this commit) 2026-10-27
