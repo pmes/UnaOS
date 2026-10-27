@@ -73,6 +73,7 @@ pub struct JobOut {
     pub ptes_restored: bool,
     pub setup_us: u64,
     pub bcs_us: u64,
+    pub ring_re: bool, // GEN7HELDONE (B1031): `held_take` handed back BLIT_RING_HELD's block from an earlier job
 }
 
 impl JobOut {
@@ -81,10 +82,10 @@ impl JobOut {
     }
 }
 
-/// The ring + sentinel pages (8 KiB, allocated once, held for the boot: they are GGTT-reachable and a
-/// register with no read decode is never the sole reason a page goes back to the heap, gen7.md §2.6).
-/// The lock is also the engine's: a second job while one runs is `busy`.
-static PAGES: crate::sync::Mutex<usize> = crate::sync::Mutex::new(0);
+/// The engine's lock: a second job while one runs is `busy`. The ring + sentinel pages (8 KiB, GGTT-reachable,
+/// gen7.md §2.6) are held in gen7.rs's `BLIT_RING_HELD` slot through `held_take` (GEN7HELDONE, B1031), taken under
+/// this lock (PAGES -> slot, never the reverse).
+static PAGES: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 fn span_pages(p: &Plane) -> (usize, usize) {
     let first = p.va & !0xFFF;
@@ -120,15 +121,17 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
             return Err("coord-not-16bit"); // DW2/DW3/DW5 carry 16-bit X and Y (§1.9.14 p.63)
         }
     }
-    let Some(mut pages) = PAGES.try_lock() else { return Err("busy") };
-    if *pages == 0 {
-        let p = alloc_zeroed(Layout::from_size_align(8192, 4096).unwrap());
-        if p.is_null() {
+    let Some(_engine) = PAGES.try_lock() else { return Err("busy") };
+    let (ring_va, ring_re) = crate::drivers::gpu::gen7::held_take(&crate::drivers::gpu::gen7::BLIT_RING_HELD, 2); // GEN7HELDONE (B1031): B1025's one hold rule (gen7.rs tail)
+    if !ring_re {
+        if ring_va == 0 {
             return Err("alloc-ring");
         }
-        *pages = p as usize; // held for the boot (see PAGES)
-    }
-    let ring_va = *pages;
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+        {
+            crate::allocator::census::retag(ring_va, 2 * 4096, crate::allocator::census::GEN7_HELD); // FIXTURERETAIN (B1017): counted once, never fx:gen7
+        }
+    } // a reused block is not re-zeroed: the ring is NOOP-filled and the sentinel seeded below, every job
     let sent_va = ring_va + 4096;
     let (s0, ns) = span_pages(&src);
     let (d0, nd) = span_pages(&dst);
@@ -239,7 +242,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
     clflush_range(src.va, src.len);
     clflush_range(dst.va, dst.len);
 
-    let mut out = JobOut { cand: "none", win, tail, ..JobOut::default() };
+    let mut out = JobOut { cand: "none", win, tail, ring_re, ..JobOut::default() };
 
     // ---- claim: PTEs, landed check, the pinned flush ------------------------------------------------
     for k in 0..win {
@@ -560,7 +563,7 @@ pub fn test() {
     let l1 = alloc::format!(
         "[gen7blit] job rects=2 fixture={}x{}->{}x{} win={} cand={} landed={} armed={} head={:08X} tail={:08X} sentinel={} idle={} regs_restored={} fw_restored={} ptes_restored={} match={}/{} spill={} setup_us={} bcs_us={} cpu_us={} gpu_us={} reclaim=held reuse={} held_kb={}",
         FW, FH, DW, DH, o.win, o.cand, o.landed as u8, o.armed as u8, o.head, o.tail, o.sentinel as u8, o.idle as u8,
-        o.regs_restored as u8, o.fw_restored as u8, o.ptes_restored as u8, matched, total, spill, o.setup_us, o.bcs_us, cpu_us, gpu_tok, if s_re && d_re { "y" } else { "n" }, super::held_kb()
+        o.regs_restored as u8, o.fw_restored as u8, o.ptes_restored as u8, matched, total, spill, o.setup_us, o.bcs_us, cpu_us, gpu_tok, if s_re && d_re && o.ring_re { "y" } else { "n" }, super::held_kb()
     );
     let (winner, arm) = decide(ok, o.bcs_us, cpu_us, gpu_us, owner);
     PANEL_IGD.store(owner == "igd", AO::Release);
