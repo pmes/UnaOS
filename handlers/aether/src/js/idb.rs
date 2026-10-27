@@ -1169,7 +1169,7 @@ mod tests {
 
     #[test]
     fn transaction_ordering_kat() {
-        let _root = crate::storage::idb::TestRoot::new("aether_idb_page_kat");
+        let _root = crate::storage::test_root::TestRoot::new("aether_idb_page_kat");
         let log = run_ordering("https://idb.kat.example/", false);
         assert_eq!(log, "upgrade,open,put1,put2,rw-complete,count=2,ro-complete,constraint,abort,keys=[1,2]");
     }
@@ -1181,7 +1181,7 @@ mod tests {
     /// A distinct origin: the engine's registry (`storage::idb::reg`) is process-global.
     #[test]
     fn transactions_complete_on_a_frozen_page_clock() {
-        let _root = crate::storage::idb::TestRoot::new("aether_idb_frozen_kat");
+        let _root = crate::storage::test_root::TestRoot::new("aether_idb_frozen_kat");
         let log = run_ordering("https://idb.frozen.example/", true);
         assert_eq!(log, "upgrade,open,put1,put2,rw-complete,count=2,ro-complete,constraint,abort,keys=[1,2]");
     }
