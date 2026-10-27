@@ -46,15 +46,15 @@
 //! rung 1; lifting `ahci::dongle::with_port` into one shared hold is owed row DISKHOLD). One command is
 //! outstanding at a time, so one lock is a correctness requirement. The mask is the holder's NON-PREEMPTION (masked
 //! callers, e.g. the UnaFS MOUNT hold, spin on `CTRL`: WEDGE-8 F3, block.rs). NVMEIRQWAIT (Z49): a holder that sleeps in
-//! [`cq_wait`] is preemptible for that window, so a masked caller on the sleeper's CPU is refused at once and an
-//! unmasked one yields first ([`with_ctrl`]).
+//! [`cq_wait`] has interrupts on for that window; NVMEPREEMPTOFF (Z52): it holds the scheduler's preempt-off count
+//! (`arch::sched::preemptoff`), so it is never preempted and no contender runs on its CPU meanwhile.
 //!
 //! # Wire
 //!
 //! ```text
 //! [nvme] bdf <b>:<s>.<f> <vid>:<did> bar0=0x<..> cap=0x<..> ver=<x.y.z> mqes=<n> dstrd=<n> to_ms=<n>   (bootlog)
 //! [nvme] ctrl  (the ready line: mn="<model>" ns=1 lba=<bytes> blocks=<n> -> ready irq=<msix|msi|none> vector=<0x<v>|->; spelled once, at `probe`)
-//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> rbatch=<n> runs=<n> run_blocks=<n> rblocks=<n> rcmds=<n> lba=<bytes> shift=<9..12> rmw=<n> irqs=<n> waits=<n> wakes=<n> rw_us=<n>
+//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> rbatch=<n> runs=<n> run_blocks=<n> rblocks=<n> rcmds=<n> lba=<bytes> shift=<9..12> rmw=<n> irqs=<n> waits=<n> wakes=<n> rw_us=<n> deferred=<n>
 //! [nvme] irq wait off why=no-wakes waits=<n> — completions back on the spin   (once, NVMEIRQWAIT: a vector that never wakes)
 //! :: NVME: ctrl=ok ns=1 rw=ok -> PASS ::
 //! ```
@@ -271,13 +271,12 @@ fn submit(c: &mut Ctrl, admin: bool, cmd: &mut [u32; 16]) -> Result<u32, ()> {
 
 /// The ONE way [`CTRL`] is held: interrupts masked, a bounded try, never an unbounded spin.
 fn with_ctrl<R>(lba: u64, f: impl FnOnce(&mut Ctrl) -> Result<R, ()>) -> Result<R, ()> {
-    // NVMEIRQWAIT (Z49): the caller's own mask, read before the hold masks. WEDGE-8 F3 on `CTRL`: an unmasked caller
-    // yields while a sleeping holder sits on its CPU; a masked one there is refused at once (the holder cannot run).
+    // NVMEIRQWAIT (Z49): the caller's own mask, read before the hold masks (an unmasked caller's holds may sleep).
+    // NVMEPREEMPTOFF (Z52): a holder asleep in `cq_wait` holds the preempt-off count, so no contender ever runs on its
+    // CPU while it holds `CTRL`: the yield and the at-once refusal are retired; the busy line's bounded path stays.
     let open = !crate::arch::irqs_masked();
-    if open {
-        irqwait_yield();
-    }
-    let at_once = !open && sleeper_here();
+    // if open { irqwait_yield(); }   (NVMEIRQWAIT Z49; retired by NVMEPREEMPTOFF Z52)
+    let at_once = false; // was `!open && sleeper_here()` (NVMEIRQWAIT Z49; retired by NVMEPREEMPTOFF Z52)
     crate::drivers::block::hold::with(
         T_HOLD_MS,
         at_once,
@@ -648,15 +647,15 @@ pub fn selftest() {
     } else if dev.num_blocks < SCRATCH_FROM_END * 2 {
         "bad:small"
     } else {
-        let t0 = crate::arch::now_cycles();
+        let t0 = crate::arch::now_cycles(); let d0 = crate::arch::sched::preemptoff::deferred_total(); // NVMEPREEMPTOFF (Z52): deferred preempts before the leg
         let r = scratch_rw(scratch, bs);
-        RW_US.store(crate::arch::now_cycles().wrapping_sub(t0).saturating_mul(1000) / cycles_ms(1).max(1), Ordering::Relaxed); // NVMEIRQWAIT (Z49): the rw leg's wall time
+        RW_US.store(crate::arch::now_cycles().wrapping_sub(t0).saturating_mul(1000) / cycles_ms(1).max(1), Ordering::Relaxed); RW_DEFERRED.store(crate::arch::sched::preemptoff::deferred_total().wrapping_sub(d0), Ordering::Relaxed); // NVMEIRQWAIT (Z49): the rw leg's wall time; NVMEPREEMPTOFF (Z52): the preempts deferred during it
         r
     };
     let (runs, run_blocks) = crate::drivers::block::nvme_run_census(); // NVMEBATCH (Z22)
     serial_println!(
-        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} rbatch={} runs={} run_blocks={} rblocks={} rcmds={} lba={} shift={} rmw={} irqs={} waits={} wakes={} rw_us={}",
-        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), LAST_RBATCH.load(Ordering::Relaxed), runs, run_blocks, IO_READ_BLOCKS.load(Ordering::Relaxed), IO_READ_CMDS.load(Ordering::Relaxed), dev.block_size, dev.block_size.trailing_zeros(), crate::drivers::block::nvme_rmw_count(), IRQS.load(Ordering::Relaxed), IRQ_WAITS.load(Ordering::Relaxed), IRQ_WAKES.load(Ordering::Relaxed), RW_US.load(Ordering::Relaxed) // NVMEIRQWAIT (Z49): sleeping waits, vector-woken sleeps, the rw leg's microseconds; NVMEMSIX (Z45): `irqs=` the completion interrupts fired this boot; NVME4KN (Z31): the namespace's LBA size, its shift, and the sub-LBA writes served by read-modify-write this boot
+        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} rbatch={} runs={} run_blocks={} rblocks={} rcmds={} lba={} shift={} rmw={} irqs={} waits={} wakes={} rw_us={} deferred={}",
+        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), LAST_RBATCH.load(Ordering::Relaxed), runs, run_blocks, IO_READ_BLOCKS.load(Ordering::Relaxed), IO_READ_CMDS.load(Ordering::Relaxed), dev.block_size, dev.block_size.trailing_zeros(), crate::drivers::block::nvme_rmw_count(), IRQS.load(Ordering::Relaxed), IRQ_WAITS.load(Ordering::Relaxed), IRQ_WAKES.load(Ordering::Relaxed), RW_US.load(Ordering::Relaxed), RW_DEFERRED.load(Ordering::Relaxed) // NVMEPREEMPTOFF (Z52): preempts deferred while a holder slept in the rw leg; NVMEIRQWAIT (Z49): sleeping waits, vector-woken sleeps, the rw leg's microseconds; NVMEMSIX (Z45): `irqs=` the completion interrupts fired this boot; NVME4KN (Z31): the namespace's LBA size, its shift, and the sub-LBA writes served by read-modify-write this boot
     );
     let ctrl = if identify { "ok" } else { "bad" };
     let root = root_leg();
@@ -864,8 +863,8 @@ fn arm_irq(bus: u8, slot: u8, func: u8, bar0: u64) -> (&'static str, u8) {
 
 /// NVMEIRQWAIT: the APIC id `arm_irq`'s message targets (set at [`probe`] for msix|msi); `u32::MAX` = no vector.
 static IRQ_APIC: AtomicU32 = AtomicU32::new(u32::MAX);
-/// NVMEIRQWAIT: the CPU index of a `CTRL` holder asleep in [`cq_wait`] (`u32::MAX` = none). One writer: the holder.
-static SLEEP_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+// NVMEIRQWAIT: `static SLEEP_CPU` (the CPU of a `CTRL` holder asleep in `cq_wait`) — retired by NVMEPREEMPTOFF (Z52): the
+// sleeping holder is never preempted, so no contender on its CPU needs to know it sleeps.
 /// NVMEIRQWAIT: sleeping waits this boot (`waits=`), and those the vector ended (`wakes=`; the rest the tick ended).
 static IRQ_WAITS: AtomicU32 = AtomicU32::new(0);
 static IRQ_WAKES: AtomicU32 = AtomicU32::new(0);
@@ -874,43 +873,32 @@ static WAIT_OFF: AtomicBool = AtomicBool::new(false);
 const WAIT_OFF_AFTER: u32 = 16;
 /// NVMEIRQWAIT: the scratch leg's wall time in microseconds (`rw_us=`; 0 = the leg did not run).
 static RW_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// NVMEPREEMPTOFF (Z52): preempts deferred (`sched::preemptoff`) during the scratch leg (`deferred=`; 0 is legal).
+static RW_DEFERRED: AtomicU32 = AtomicU32::new(0);
 
-#[inline]
-fn this_cpu() -> u32 {
-    crate::arch::percpu::this_cpu().cpu_index as u32
-}
+// NVMEIRQWAIT: `fn this_cpu()` (SLEEP_CPU's index) — retired with it by NVMEPREEMPTOFF (Z52).
 
-/// NVMEIRQWAIT: a `CTRL` holder is asleep (so preemptible) and was on THIS CPU — a masked caller here cannot let it run.
-#[inline]
-fn sleeper_here() -> bool {
-    SLEEP_CPU.load(Ordering::Acquire) == this_cpu()
-}
-
-/// NVMEIRQWAIT: an UNMASKED caller yields while a sleeping holder sits on its CPU (the holder, if preempted here, runs
-/// instead of this caller spinning masked against it), bounded by `T_HOLD_MS`.
-fn irqwait_yield() {
-    let start = crate::arch::now_cycles();
-    let bound = cycles_ms(T_HOLD_MS);
-    while sleeper_here() && crate::arch::now_cycles().wrapping_sub(start) < bound {
-        crate::arch::sched::yield_now();
-    }
-}
+// NVMEIRQWAIT: `fn sleeper_here()` (a sleeping holder on THIS CPU: a masked caller refused at once) — retired by
+// NVMEPREEMPTOFF (Z52): the sleeping holder is never preempted.
+// NVMEIRQWAIT: `fn irqwait_yield()` (an unmasked caller yields to a sleeping holder on its CPU, bounded `T_HOLD_MS`) —
+// retired by NVMEPREEMPTOFF (Z52): the sleeping holder is never preempted.
 
 /// NVMEIRQWAIT: THE wait between two polls of [`submit`]'s loop (the loop keeps the phase bit, the deadline and the
 /// timeout line). It sleeps only when `may_sleep` (an I/O command, an unmasked caller), the vector targets THIS CPU and
 /// the off-latch is clear: `sti; hlt` as one pair (a message latched in the IRR during the masked submit fires right
 /// after `sti` and ends the `hlt`), then masked again; a wake with `CQ_PENDING` set is the vector's. Every other wait is
-/// the old spin. Runs inside `with_ctrl`'s hold (IF=0 on entry and on return).
+/// the old spin. Runs inside `with_ctrl`'s hold (IF=0 on entry and on return). NVMEPREEMPTOFF (Z52): the sleep holds the
+/// scheduler's preempt-off count, so the holder is never switched out while its interrupts are on.
 fn cq_wait(may_sleep: bool) {
     if !may_sleep || WAIT_OFF.load(Ordering::Relaxed) || IRQ_APIC.load(Ordering::Acquire) != crate::arch::apic::apic_id() as u32 {
         core::hint::spin_loop();
         return;
     }
-    SLEEP_CPU.store(this_cpu(), Ordering::Release);
+    crate::arch::sched::preemptoff::disable(); // NVMEPREEMPTOFF (Z52): the holder sleeps with interrupts ON but is never switched out
     let waits = IRQ_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
     x86_64::instructions::interrupts::enable_and_hlt();
     x86_64::instructions::interrupts::disable();
-    SLEEP_CPU.store(u32::MAX, Ordering::Release);
+    crate::arch::sched::preemptoff::enable(); // NVMEPREEMPTOFF (Z52): masked again; a preempt deferred during the sleep fires after the hold
     if CQ_PENDING.load(Ordering::Acquire) {
         IRQ_WAKES.fetch_add(1, Ordering::Relaxed);
     } else if waits >= WAIT_OFF_AFTER && IRQ_WAKES.load(Ordering::Relaxed) == 0 && !WAIT_OFF.swap(true, Ordering::AcqRel) {
