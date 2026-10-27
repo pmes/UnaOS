@@ -4557,7 +4557,7 @@ pub fn poison_leg() -> &'static str {
 // new bind out until that task ends (its late result is installed by the next pre-bind, never a second concurrent bind).
 // At the tail: no line above moves. ──
 
-/// The bind task's usable stack. The arc's figure, not a measured high-water (owed BINDSTACKHIGH).
+/// The bind task's usable stack: 64 KiB until measured; its rule (BINDLIVE B873) is [`bind_stack_rule`] of the printed `high_kib`.
 const BIND_STACK: usize = 64 * 1024;
 /// A caller whose usable stack is at most this binds through the task.
 const BIND_SMALL: usize = 16 * 1024;
@@ -4661,15 +4661,15 @@ fn bind_sized() -> Result<BoundMount, MountError> {
         TXN_BUSY.store(true, Ordering::Relaxed);
         return Err(MountError::Busy);
     }
-    bind_take(bgen).unwrap_or(Err(MountError::Busy))
+    bind_high_say(); bind_take(bgen).unwrap_or(Err(MountError::Busy))
 }
 
 /// `unafs-bind`: one `bind_mount` on the sized stack, the result posted under its generation.
 fn bind_task(bgen: usize) {
-    let r = bind_mount();
+    bind_live_own(); let r = bind_mount(); bind_high_note();
     let stale = crate::arch::without_interrupts(|| BIND_OUT.lock().replace((bgen as u64, r)));
     drop(stale);
-    BIND_LIVE.store(false, Ordering::Release);
+    BIND_TID.store(0, Ordering::Release); BIND_LIVE.store(false, Ordering::Release);
     run_done();
 }
 
@@ -4704,10 +4704,10 @@ fn bind_leg() {
         }
     };
     serial_println!(
-        "[unafslock] bind_task={} on=task stack_kib={} caller_kib={}",
+        "[unafslock] bind_task={} on=task stack_kib={} caller_kib={} high_kib={}",
         word,
         LEG_TASK_KIB.load(Acquire),
-        LEG_CALLER_KIB.load(Acquire)
+        LEG_CALLER_KIB.load(Acquire), BindHigh
     );
 }
 
@@ -4729,4 +4729,152 @@ fn bind_leg_probe(_: usize) {
     let kib = crate::arch::without_interrupts(crate::arch::sched::current_stack_bounds).map_or(0, |(lo, hi)| (hi.saturating_sub(lo) >> 10) as usize);
     LEG_TASK_KIB.store(kib, core::sync::atomic::Ordering::Release);
     run_done();
+}
+
+// ── BINDLIVE (rmbp-ledger B873): the bind task's death and its measured stack. BINDBUSYLIVE: the `unafs-bind` task
+// publishes its task id first thing ([`BIND_TID`]) and clears it before [`BIND_LIVE`]; a task killed by its guard never
+// clears either, so `lockowner::release_dead` (the ONE death release, `sync::release_task`) calls [`bind_release_dead`],
+// which CAS-clears the id and gives `BIND_LIVE` back — named `[lock] released-on-death name=unafs-bind`. BINDSTACKHIGH:
+// the task reads its own slab's high-water (`sched::slab_high`, the `witness` paint) as its last act before posting,
+// and the joined caller prints it with the sizing rule ([`bind_stack_rule`]). `tests lockreg`'s `bind_dead=` leg kills a
+// stand-in bind task in its guard page with the bind's serialiser held (the ticket on x86 `wc`, [`BIND`] elsewhere).
+// At the tail: no line above moves. ──
+
+/// The running bind task's id (0 = none): set by the task, cleared by it or by its death release.
+static BIND_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The last bind task's stack high-water in bytes (0 = no bind measured yet, `usize::MAX` = no paint in this build).
+static BIND_HIGH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Bind tasks released on death (the `bind_dead=` leg reads it rise).
+#[cfg(target_arch = "x86_64")]
+static BIND_DEATHS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The sizing rule for [`BIND_STACK`]: twice the measured high-water, rounded up to 16 KiB.
+pub const fn bind_stack_rule(high: usize) -> usize {
+    (2 * high).div_ceil(16 << 10) * (16 << 10)
+}
+
+/// The bind task's first act: publish its id for the death release.
+fn bind_live_own() {
+    BIND_TID.store(crate::arch::sched::current_id().unwrap_or(0), Ordering::Release);
+}
+
+/// `lockowner::release_dead`'s `unafs-bind` case: `tid` will never run again. `true` = it was the bind task, and
+/// `BIND_LIVE` is given back (its result never posts; the next pre-bind binds afresh). Atomics only: it runs on the dying
+/// core's slab inside `release_task`.
+#[cfg(target_arch = "x86_64")]
+pub fn bind_release_dead(tid: u64) -> bool {
+    if tid == 0 || BIND_TID.compare_exchange(tid, 0, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return false;
+    }
+    BIND_DEATHS.fetch_add(1, Ordering::AcqRel);
+    BIND_LIVE.store(false, Ordering::Release);
+    true
+}
+
+/// The bind task's own stack high-water (x86: masked read of this core's current slab; no paint or aarch64 = unknown).
+fn bind_high_note() {
+    #[cfg(target_arch = "x86_64")]
+    let h = crate::arch::without_interrupts(|| {
+        let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+        let (_, base, len) = crate::arch::sched::current_named_slab(cpu)?;
+        crate::arch::sched::slab_high(base, len)
+    });
+    #[cfg(not(target_arch = "x86_64"))]
+    let h: Option<usize> = None;
+    BIND_HIGH.store(h.map_or(usize::MAX, |b| b.max(1)), Ordering::Release);
+}
+
+/// The joined caller's line: `[unafs] bind on=task stack_kib=<n> high_kib=<n|?> rule_kib=<n>`.
+fn bind_high_say() {
+    let h = BIND_HIGH.load(Ordering::Acquire);
+    if h == 0 || h == usize::MAX {
+        serial_println!("[unafs] bind on=task stack_kib={} high_kib=? (BINDLIVE B873: no paint — a build without witness)", BIND_STACK >> 10);
+    } else {
+        serial_println!("[unafs] bind on=task stack_kib={} high_kib={} rule_kib={} (BINDLIVE B873: the rule is 2x high, rounded up to 16 KiB)", BIND_STACK >> 10, h.div_ceil(1024), bind_stack_rule(h) >> 10);
+    }
+}
+
+/// The last bind's high-water for `tests unafslock`: `none` (no bind ran), `?` (no paint), else KiB.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+struct BindHigh;
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+impl core::fmt::Display for BindHigh {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match BIND_HIGH.load(Ordering::Acquire) {
+            0 => f.write_str("none"),
+            usize::MAX => f.write_str("?"),
+            h => write!(f, "{}", h.div_ceil(1024)),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+static LEG_DEAD_TOOK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(target_arch = "x86_64")]
+static LEG_DEAD_RET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// `tests lockreg`'s `bind_dead=` leg (sync.rs `bind_leg`): with the bind's serialiser held (a real bind in the window
+/// is refused as any second binder is), a 16 KiB `lockreg-bind` task becomes the bind task and recurses into its guard
+/// page — a REAL guard death (`stackguard::overflow_exit` -> `release_task`). `ok` = `BIND_LIVE` came back within
+/// 1000 ms through the death release.
+#[cfg(target_arch = "x86_64")]
+pub fn bind_dead_leg() -> &'static str {
+    let Some(me) = crate::arch::sched::current_id() else { return "skip(no-task)" };
+    #[cfg(feature = "wc")]
+    {
+        let mine = splitwrite::TICKET.load(Ordering::Acquire) == me;
+        if !mine && !splitwrite::ticket_take(me) {
+            return "skip(ticket-busy)";
+        }
+        let word = bind_dead_run();
+        if !mine {
+            splitwrite::TICKET.store(0, Ordering::Release);
+        }
+        word
+    }
+    #[cfg(not(feature = "wc"))]
+    {
+        let _ = me;
+        let Some(_bind) = BIND.try_lock() else { return "skip(bind-busy)" };
+        bind_dead_run()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn bind_dead_run() -> &'static str {
+    if BIND_LIVE.swap(true, Ordering::AcqRel) {
+        return "skip(bind-live)";
+    }
+    LEG_DEAD_TOOK.store(false, Ordering::Release);
+    LEG_DEAD_RET.store(false, Ordering::Release);
+    let n0 = BIND_DEATHS.load(Ordering::Acquire);
+    crate::arch::sched::spawn_stack("lockreg-bind", bind_dead_task, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL, BIND_SMALL);
+    let t0 = crate::arch::ms();
+    while BIND_LIVE.load(Ordering::Acquire) && crate::arch::ms().saturating_sub(t0) <= 1000 {
+        crate::arch::sched::sleep_ms(1);
+    }
+    if BIND_LIVE.load(Ordering::Acquire) {
+        BIND_TID.store(0, Ordering::Release); // a failed leg never leaves binds refused
+        BIND_LIVE.store(false, Ordering::Release);
+        return if LEG_DEAD_TOOK.load(Ordering::Acquire) { "still-live" } else { "no-task" };
+    }
+    if LEG_DEAD_RET.load(Ordering::Acquire) {
+        "returned"
+    } else if BIND_DEATHS.load(Ordering::Acquire) <= n0 {
+        "not-hooked"
+    } else {
+        "ok"
+    }
+}
+
+/// `lockreg-bind`: the bind task's first act, then the guard leg's recursion (`stackguard::scratch_deep`).
+#[cfg(target_arch = "x86_64")]
+fn bind_dead_task(_: usize) {
+    bind_live_own();
+    LEG_DEAD_TOOK.store(true, Ordering::Release);
+    let n = crate::arch::stackguard::scratch_deep(0);
+    LEG_DEAD_RET.store(true, Ordering::Release);
+    serial_println!("[unafs] lockreg-bind returned depth={} (the guard did not fire)", n);
+    BIND_TID.store(0, Ordering::Release);
+    BIND_LIVE.store(false, Ordering::Release);
 }

@@ -21,9 +21,9 @@ pub const SINK: usize = 0;
 pub const UART: usize = 1;
 /// The UnaFS mount (`fs/unafs.rs` `MOUNT`).
 pub const UNAFS: usize = 2;
-const N: usize = 3; #[cfg(all(feature = "unafs", feature = "wc"))] pub const UNAFS_TICKET: usize = 3; // TICKETOWNER (rmbp-ledger B844): the UnaFS commit ticket (`fs::unafs::splitwrite::TICKET`) — its own word records its holder, so it has a NAME but no OWNER slot (LINE-NEUTRAL)
+const N: usize = 3; #[cfg(all(feature = "unafs", feature = "wc"))] pub const UNAFS_TICKET: usize = 3; #[cfg(all(target_arch = "x86_64", feature = "unafs"))] pub const UNAFS_BIND: usize = 4; // BINDLIVE (rmbp-ledger B873): the UnaFS bind task (`fs::unafs::BIND_TID`) — a NAME, no OWNER slot. TICKETOWNER (rmbp-ledger B844): the UnaFS commit ticket (`fs::unafs::splitwrite::TICKET`) — its own word records its holder, so it has a NAME but no OWNER slot (LINE-NEUTRAL)
 /// The names `[lock] released-on-death name=<sink|uart|unafs> …` prints (STACKGUARD3 B832; `sync::release_task`).
-#[cfg(not(all(feature = "unafs", feature = "wc")))] pub const NAMES: [&str; N] = ["sink", "uart", "unafs"]; #[cfg(all(feature = "unafs", feature = "wc"))] pub const NAMES: [&str; N + 1] = ["sink", "uart", "unafs", "unafs-ticket"]; // TICKETOWNER (B844): bit 3 = the ticket (LINE-NEUTRAL)
+#[cfg(not(feature = "unafs"))] pub const NAMES: [&str; N] = ["sink", "uart", "unafs"]; #[cfg(feature = "unafs")] pub const NAMES: [&str; N + 2] = ["sink", "uart", "unafs", "unafs-ticket", "unafs-bind"]; // BINDLIVE (B873): bit 4 = the bind task (a non-`wc` build never sets bit 3). TICKETOWNER (B844): bit 3 = the ticket (LINE-NEUTRAL)
 
 static ON: AtomicBool = AtomicBool::new(false);
 static OWNER: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
@@ -118,7 +118,7 @@ pub fn release_dead(tid: u64) -> u32 {
             clear(UNAFS);
             let poisoned = crate::fs::unafs::lockowner_release(); // POISON2 (B846): the mount is MARKED before its force-unlock
             out |= (1 << UNAFS) | ((poisoned as u32) << (8 + UNAFS)); // POISON2 (B846): bit `8 + i` = lock `i` released POISONED
-        } #[cfg(all(feature = "unafs", feature = "wc"))] if crate::fs::unafs::splitwrite::release_dead(tid) { out |= 1 << UNAFS_TICKET; } // TICKETOWNER (B844): the commit ticket dies with its holder — AFTER the UNAFS case (a holder dead inside a MOUNT hold has had MOUNT force-released and leaked already). LINE-NEUTRAL fold
+        } #[cfg(all(feature = "unafs", feature = "wc"))] if crate::fs::unafs::splitwrite::release_dead(tid) { out |= 1 << UNAFS_TICKET; } #[cfg(feature = "unafs")] if crate::fs::unafs::bind_release_dead(tid) { out |= 1 << UNAFS_BIND; } // BINDLIVE (B873): a dead bind task gives BIND_LIVE back. TICKETOWNER (B844): the commit ticket dies with its holder — AFTER the UNAFS case (a holder dead inside a MOUNT hold has had MOUNT force-released and leaked already). LINE-NEUTRAL fold
         out
     }
     #[cfg(not(target_arch = "x86_64"))]

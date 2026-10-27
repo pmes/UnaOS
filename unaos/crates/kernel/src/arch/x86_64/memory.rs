@@ -4493,7 +4493,7 @@ pub fn selfbuild3_usable_ram() -> alloc::vec::Vec<(u64, u64)> {
     let mut v = alloc::vec::Vec::new();
     if let Some(regions) = REGIONS.get() {
         for r in regions.iter().filter(|r| r.kind == MemoryRegionKind::Usable) {
-            v.push((r.phys_start, r.phys_start + r.page_count * 4096));
+            reserve2_cut(&mut v, r.phys_start, r.phys_start + r.page_count * 4096); // BINDLIVE (B873) HEAPRESERVE2: a non-adjacent heap reserve is cut out (LINE-NEUTRAL, file tail)
         }
     }
     v
@@ -4919,31 +4919,80 @@ pub const HEAP_RESERVE_MIB: usize = 8;
 /// The kernel heap's window length: `HEAP_SIZE` plus the reserve when one was carved (0 before `init`).
 static SB3_HEAP_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Carve `[heap_start + HEAP_SIZE, + HEAP_RESERVE_MIB)` out of the heap's region (`room` bytes long) and hand it to
-/// `heappoison`. Runs once, on the boot path, before SMP and before the window publishes.
+/// Carve the heap's reserve and hand it to `heappoison`: `[heap_start + HEAP_SIZE, + HEAP_RESERVE_MIB)` from the heap's own
+/// region (`room` bytes long) when it fits; else (BINDLIVE B873 HEAPRESERVE2) the tail of another Usable region
+/// ([`reserve_region`]). Runs once, on the boot path, before SMP and before the window publishes.
 fn heap_reserve_carve(heap_start: u64, room: usize) {
     let len = HEAP_RESERVE_MIB << 20;
-    let lo = heap_start + crate::allocator::HEAP_SIZE as u64;
-    let why = if room < crate::allocator::HEAP_SIZE + len {
-        "region-short"
+    let tail = heap_start + crate::allocator::HEAP_SIZE as u64;
+    let (lo, from, why) = if room >= crate::allocator::HEAP_SIZE + len {
+        if reserve_probe(tail, len) { (tail, "tail", "") } else { (0, "", "probe-fail") }
     } else {
-        // SAFETY: `[lo, lo + len)` lies inside the Usable region the heap was chosen from, past the heap's end, on the
-        // firmware's identity map; nothing has been handed it yet. The sentinels are overwritten by a re-init's node.
-        let ok = unsafe {
-            let a = lo as *mut u64;
-            let b = (lo + len as u64 - 8) as *mut u64;
-            core::ptr::write_volatile(a, 0xA55A_1234_DEAD_BEEF);
-            core::ptr::write_volatile(b, 0x0BAD_F00D_5EED_C0DE);
-            core::ptr::read_volatile(a) == 0xA55A_1234_DEAD_BEEF && core::ptr::read_volatile(b) == 0x0BAD_F00D_5EED_C0DE
-        };
-        if ok { "" } else { "probe-fail" }
+        match reserve_region(heap_start, len as u64) {
+            None => (0, "", "region-short"),
+            Some(lo) if reserve_probe(lo, len) => (lo, "region", ""),
+            Some(_) => (0, "", "probe-fail"),
+        }
     };
-    let have = if why.is_empty() { len } else { 0 };
-    SB3_HEAP_LEN.store((crate::allocator::HEAP_SIZE + have) as u64, core::sync::atomic::Ordering::Release);
-    if have != 0 {
-        crate::allocator::heappoison::set_reserve(lo as usize, have);
-        serial_println!("[heap] reserve mib={} at={:#x} (HEAPREGION B854)", HEAP_RESERVE_MIB, lo);
+    let adjacent = lo != 0 && lo == tail;
+    SB3_HEAP_LEN.store((crate::allocator::HEAP_SIZE + if adjacent { len } else { 0 }) as u64, core::sync::atomic::Ordering::Release);
+    if lo != 0 {
+        if !adjacent {
+            RESERVE2.store(lo, core::sync::atomic::Ordering::Release); // cut out of `selfbuild3_usable_ram`, not the window
+        }
+        crate::allocator::heappoison::set_reserve(lo as usize, len);
+        serial_println!("[heap] reserve mib={} at={:#x} from={} (HEAPREGION B854, BINDLIVE B873)", HEAP_RESERVE_MIB, lo, from);
     } else {
         serial_println!("[heap] reserve mib=0 why={} (HEAPREGION B854: a torn heap list is kept)", why);
+    }
+}
+
+/// The heap's one probe, on the reserve: write and read back a sentinel at both ends.
+fn reserve_probe(lo: u64, len: usize) -> bool {
+    // SAFETY: `[lo, lo + len)` lies inside a Usable region of the map, clear of the heap, on the firmware's identity map;
+    // nothing has been handed it yet. The sentinels are overwritten by a re-init's node.
+    unsafe {
+        let a = lo as *mut u64;
+        let b = (lo + len as u64 - 8) as *mut u64;
+        core::ptr::write_volatile(a, 0xA55A_1234_DEAD_BEEF);
+        core::ptr::write_volatile(b, 0x0BAD_F00D_5EED_C0DE);
+        core::ptr::read_volatile(a) == 0xA55A_1234_DEAD_BEEF && core::ptr::read_volatile(b) == 0x0BAD_F00D_5EED_C0DE
+    }
+}
+
+// ── BINDLIVE (rmbp-ledger B873) HEAPRESERVE2: a reserve outside the heap's own region. When the heap's region has no
+// 8 MiB tail, the reserve is the 8 MiB TAIL of the first other Usable region that starts at/above `elf::IMAGE_LIMIT` (= `una_abi::USER_WINDOW_BYTES`, 64 MiB)
+// (so never the fixed-image window below it that `elf.rs`/`ldso.rs` place images in through `region_is_usable`) and
+// ends at/below 4 GiB (the heap is the DMA source). It is NOT added to the heap window (not adjacent); it is cut out of
+// `selfbuild3_usable_ram`, the one RAM list the Linux shim's frame pool draws on. `regrow` widens `heap_bounds()` to the
+// reserve's own bounds. At the tail: no line above moves. ──
+
+/// A non-adjacent reserve's base (0 = none, or the reserve is the heap region's tail).
+static RESERVE2: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The base of an 8 MiB (`len`) reserve in another Usable region (see the block comment), or `None`.
+fn reserve_region(heap_start: u64, len: u64) -> Option<u64> {
+    let regions = REGIONS.get()?;
+    regions.iter().filter(|r| r.kind == MemoryRegionKind::Usable).find_map(|r| {
+        let (s, e) = (r.phys_start, r.phys_start + r.page_count * 4096);
+        let holds_heap = heap_start >= s && heap_start < e;
+        let fits = s >= una_abi::USER_WINDOW_BYTES && e <= 0x1_0000_0000 && e - s >= len; // `elf::IMAGE_LIMIT` is this const (linuxabi is a feature; the bound is not)
+        (!holds_heap && fits).then_some(e - len)
+    })
+}
+
+/// Push `[s, e)` onto the Usable list less the non-adjacent reserve (`selfbuild3_usable_ram`'s one push).
+fn reserve2_cut(v: &mut alloc::vec::Vec<(u64, u64)>, s: u64, e: u64) {
+    let r0 = RESERVE2.load(core::sync::atomic::Ordering::Acquire);
+    let r1 = r0 + ((HEAP_RESERVE_MIB as u64) << 20);
+    if r0 == 0 || r1 <= s || r0 >= e {
+        v.push((s, e));
+        return;
+    }
+    if s < r0 {
+        v.push((s, r0));
+    }
+    if r1 < e {
+        v.push((r1, e));
     }
 }
