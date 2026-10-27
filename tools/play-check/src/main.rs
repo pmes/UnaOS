@@ -40,11 +40,10 @@
 //! `--ref-frames-max`, where ours must not exceed Chromium's (Chromium returns every decoded
 //! Vorbis sample in WebM; the stream's own end trim is not applied there).
 
-mod png;
-
 use std::sync::Arc;
 
 use gneiss_pal::dsp::avsync::{ManualTime, TimeSource};
+use gneiss_pal::dsp::image::encode_rgba;
 use gneiss_pal::dsp::video::{Frame, TestPattern};
 use stria::media::{AudioOut, FrameSink, Player, Tick};
 
@@ -282,12 +281,16 @@ fn main() {
             Some(f) => {
                 let rgba = f.to_rgba();
                 let counter = TestPattern::read_counter(&rgba, f.width, f.height);
-                extra += &format!(",\"frame\":{n},\"frame_pts\":{:.6},\"frame_size\":[{},{}],\"frame_fnv\":\"{:x}\",\"counter\":{}", f.pts_ns as f64 / 1e9, f.width, f.height, png::fnv1a(&rgba), counter.map(|c| c.to_string()).unwrap_or("null".into()));
+                extra += &format!(",\"frame\":{n},\"frame_pts\":{:.6},\"frame_size\":[{},{}],\"frame_fnv\":\"{:x}\",\"counter\":{}", f.pts_ns as f64 / 1e9, f.width, f.height, fnv1a(&rgba), counter.map(|c| c.to_string()).unwrap_or("null".into()));
                 if counter.is_some() && counter != Some(n as u32) {
                     ok = false;
                 }
                 if let Some(out) = arg(&args, "--out") {
-                    std::fs::write(&out, png::encode_rgba(f.width, f.height, &rgba)).unwrap_or_else(|e| {
+                    let png = encode_rgba(f.width, f.height, &rgba).unwrap_or_else(|e| {
+                        eprintln!("play-check: {out}: png {e:?}");
+                        std::process::exit(2)
+                    });
+                    std::fs::write(&out, png).unwrap_or_else(|e| {
                         eprintln!("play-check: {out}: {e}");
                         std::process::exit(2)
                     });
@@ -408,4 +411,42 @@ fn main() {
         pts.join(",")
     );
     std::process::exit(if ok { 0 } else { 1 });
+}
+
+/// FNV-1a over bytes (the same hash the Chromium oracles print).
+pub fn fnv1a(d: &[u8]) -> u32 {
+    let mut h = 0x811c_9dc5u32;
+    for &b in d {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gneiss_pal::dsp::image::decode_png;
+
+    /// PNGONE (LEDGER SR228): `--out` encodes through pixel_core's `encode_rgba` (gneiss_pal's re-export); the
+    /// file decodes back to the exact RGBA. `frame_fnv` hashes the pixels, so the Chromium png-oracle's number is
+    /// unchanged by the writer; the PNG bytes' hash is pinned for the new writer.
+    #[test]
+    fn png_round_trips_through_pixel_core() {
+        assert_eq!(fnv1a(b""), 0x811c_9dc5);
+        assert_eq!(fnv1a(b"a"), 0xe40c_292c);
+        let (w, h) = (37u32, 23u32);
+        let grad: Vec<u8> = (0..h).flat_map(|y| (0..w).flat_map(move |x| [(x * 7) as u8, (y * 11) as u8, (x ^ y) as u8, (x + y * 3) as u8])).collect();
+        assert_eq!(fnv1a(&grad), 0xa1fd_494e);
+        // SR228: the retired stored-deflate writer's bytes were red 73 B fnv 34c82d69, gradient 3495 B fnv 9736d2bf
+        // (pixel_core: red 70 B, gradient 468 B).
+        for (w, h, rgba, want) in [(1u32, 1u32, vec![255u8, 0, 0, 255], 0x2093_7f3a), (w, h, grad, 0xe989_86dc)] {
+            let png = encode_rgba(w, h, &rgba).unwrap();
+            assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+            let img = decode_png(&png).unwrap();
+            assert_eq!((img.width, img.height), (w, h));
+            assert_eq!(img.rgba, rgba);
+            assert_eq!(fnv1a(&png), want, "{w}x{h}: {} B", png.len());
+        }
+    }
 }
