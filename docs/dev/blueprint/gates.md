@@ -4,7 +4,7 @@
 - `unaos/arroyo` is the one build/test entry point (a bash script; verbs at its `case` near the file tail).
 - `./arroyo check` type-checks both arches (every kernel cfg leg) and runs GATE-LEDGER (`unaos/arroyo:8854`, `unaos/arroyo:9480-9517`).
 - `./arroyo gates` runs every host gate in `GATES_SET` (no cargo, ~30 s), one `gate=<name> rc=<n>` line each, then `GATES: <n> run <n> green -> PASS|FAIL`; exit = the worst rc (`unaos/arroyo:14426-14443`).
-- Fold legs beside the compile legs: `foldleg` (the x86 kernel + loader built under `image-line.env`), `twoboot` (the image booted twice under QEMU), `knoboff <feature>` (knob-off byte identity, `unaos/arroyo:13888`).
+- Fold legs beside the compile legs: `foldleg` (the x86 kernel + loader built under `image-line.env`), `twoboot` (the image booted twice under QEMU; `twoboot --card` adds boots 3-4 on a native card, keyed at boot 3's first-user form and unlocked at boot 4 by the typist — KEYBOOT4 B864, `unaos/scripts/specs/x86-twoboot-3.spec` / `-4.spec`; the plain leg stays two boots), `knoboff <feature>` (knob-off byte identity, `unaos/arroyo:13888`).
 - The image legs of `./arroyo check` (KERNEL_CFG_MATRIX tail): each is the knob line a card flies, so the fold type-checks it.
 
   | leg | the line it compiles | anchor |

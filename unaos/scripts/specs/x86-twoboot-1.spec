@@ -14,7 +14,8 @@
 #
 # The leg's typist types `una` / `correct-horse` twice into the form (the store's first user, the administrator: R100).
 # KEYBOOT3 (rmbp-ledger B856): no `[keyboot] unlock form up` / `unlock kdf_ms= ->` REQUIRE here — this volume is FRESH, so its
-# hold reads `[keyboot] root=none hold=none` and never opens the unlock form; a keyed QEMU boot is owed (KEYBOOTSPEC, security.md §5).
+# hold reads `[keyboot] root=none hold=none` and never opens the unlock form. KEYBOOT4 (B864): the keyed QEMU boot is
+# `./arroyo twoboot --card`'s boots 3-4 (x86-twoboot-3.spec keys a native card, x86-twoboot-4.spec unlocks it); this file is unchanged.
 
 # The Installer stage on the fresh volume, and the form the typist types into.
 REQUIRE :: FIRSTBOOT: stage=installer root=locked users=0 desktop_ignited=false why=store-loaded -> coherent ::

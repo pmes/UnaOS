@@ -14730,12 +14730,18 @@ case "${1:-}" in
             case "${3:-}" in
                 1) X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-twoboot-1.spec" ;;
                 2) X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-twoboot-2.spec" ;;
-                *) echo "twoboot: --boot wants 1 or 2"; exit 2 ;;
+                3) X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-twoboot-3.spec" ;;   # KEYBOOT4 (B864): `twoboot --card` only — a fresh native card, keyed at its first-user form
+                4) X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-twoboot-4.spec" ;;   # KEYBOOT4 (B864): `twoboot --card` only — the same card, keyed: the unlock form typed, to the desktop
+                *) echo "twoboot: --boot wants 1, 2, 3 or 4"; exit 2 ;;
             esac
             build_selfbuild_x86() { echo "   TWOBOOT: SELFBUILD staging not entered (build_selfbuild_x86 stubbed by the twoboot arm; no fetch, no LLD, no LIB)"; }
             test_x86_64 "${4:-60}"   # bare, as the `test)` arm calls it: under `||` bash would drop errexit inside the whole path
+        elif [ "${2:-}" = "--build-card" ]; then
+            # KEYBOOT4 (B864): twoboot.sh's re-entry for `twoboot --card` — the ONE x86 card builder, as-is, over the ESP the
+            # boot-1 build staged (target/x86_64_esp): target/unaos-x86-card.img, GPT p1 ESP + p2 UnaFS with /apps /lib /system.
+            esp_x86_unafs_card || exit $?
         else
-            bash "$WORKSPACE_DIR/scripts/twoboot.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # `--judge <log1> [<log2>]` reads captures only. NOT a host gate: a fold leg beside foldleg (PLAYBOOK §2)
+            bash "$WORKSPACE_DIR/scripts/twoboot.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # `--judge <log1> [<log2>]` reads captures only; `--card` adds boots 3-4 on a native card (KEYBOOT4 B864). NOT a host gate: a fold leg beside foldleg (PLAYBOOK §2)
         fi
         ;;
     foldleg)
@@ -14751,7 +14757,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|gates [--list|--selftest]|jobs-image|twoboot [--judge <log1> [<log2>]]|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|gates [--list|--selftest]|jobs-image|twoboot [--card] [--judge <log1> [<log2> [<log3> <log4>]]]|clean]"
         exit 1
         ;;
 esac
