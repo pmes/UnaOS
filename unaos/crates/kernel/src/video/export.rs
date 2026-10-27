@@ -254,7 +254,7 @@ impl Exp {
 }
 
 /// `body` as the whole of `path` (replaced if it exists), through the VFS as the shell writes (`SHELL_PRINCIPAL`).
-fn write_file(path: &str, body: &[u8]) -> Result<u64, String> {
+pub(crate) fn write_file(path: &str, body: &[u8]) -> Result<u64, String> {
     let mt = crate::shell::vfs_mount_table();
     let p = crate::fs::vfs::KERNEL_PRINCIPAL;
     let _ = mt.unlink(path, p);
