@@ -28,7 +28,7 @@ pub mod type1;
 
 pub use dict::{FontKind, PdfFont};
 pub use glyphs::{GlyphSink, Shown, TextParams, Type3Glyph};
-pub use text::{TextCollector, TextSpan, spans_to_string};
+pub use text::{TextCollector, TextSpan, spans_to_string, spans_to_string_mapped};
 
 /// The faces unembedded fonts are drawn with (the standard 14 and any font without a program), handed in by the
 /// caller as file bytes: pdf_core does no I/O, and a kernel caller is not made to embed fonts it does not want.
