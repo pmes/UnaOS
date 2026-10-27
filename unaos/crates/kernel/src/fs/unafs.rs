@@ -897,7 +897,7 @@ pub fn with_unafs<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, Moun
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } #[cfg(all(target_arch = "x86_64", feature = "wc"))] if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked_since(t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked_since(t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
@@ -3263,7 +3263,7 @@ pub mod splitread {
     /// worker core while this task runs metadata ops (`resolve_path` + `read_inode`) on the same mount.
     /// PASS = every MOUNT hold of both ≤ 5 ms, no fetch under MOUNT by the read, at least one
     /// metadata op completed while the read ran, and the bytes equal a reference read taken first.
-    pub fn selftest() { super::splitwrite::write_leg(); // UNAFSWRITE (B825): the write leg runs first and prints its own line
+    pub fn selftest() { super::splitwrite::write_leg(); super::bind_leg(); // HEAPREGION (B854) BINDSTACK: the sized bind task's leg (file tail). UNAFSWRITE (B825): the write leg runs first and prints its own line
         const CAP: u64 = 4 << 20;
         let pick = with_unafs(|fs| -> Option<(String, u64)> {
             let dir = fs.resolve_path("/apps").ok()?;
@@ -4378,45 +4378,72 @@ fn mount_poison_check(g: &mut Option<BoundMount>) {
     }
 }
 
-/// MOUNTSTACK — the bind the attempt's hold would run (:806). x86 `wc` with a task identity: the bind belongs to
-/// [`prebind`] (off the hold, the ticket held), so a hold that finds no mount latches contention and the attempt RESTARTS
-/// (the next attempt pre-binds). Elsewhere (no task identity; no ticket: non-`wc` x86, aarch64) it binds here as before.
+/// MOUNTSTACK — the bind the attempt's hold would run (:806). With a task identity the bind belongs to [`prebind`] (off
+/// the hold; the ticket held on x86 `wc`, the [`BIND`] latch elsewhere — HEAPREGION B854 extended it to every build), so a
+/// hold that finds no mount latches contention and the attempt RESTARTS (the next attempt pre-binds). With no task identity
+/// it binds here as before — where no ticket exists, only under the [`BIND`] latch (one binder at a time).
 fn bind_in_hold() -> Result<BoundMount, MountError> {
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
-    if crate::arch::sched::current_id().is_some() {
-        TXN_BUSY.store(true, Ordering::Relaxed);
+    if crate::arch::sched::current_id().is_some() || BIND_LIVE.load(Ordering::Acquire) {
+        TXN_BUSY.store(true, Ordering::Relaxed); // a task pre-binds; a bind task past its bound still runs: never a second bind
         return Err(MountError::Busy);
     }
-    bind_mount()
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        let Some(_bind) = BIND.try_lock() else {
+            TXN_BUSY.store(true, Ordering::Relaxed);
+            return Err(MountError::Busy);
+        };
+        bind_mount()
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        bind_mount()
+    }
 }
 
-/// MOUNTSTACK — the lazy bind BEFORE the masked hold (`with_unafs`, each attempt): MOUNT unbound -> take the commit ticket
-/// (or it is already this task's, inside `with_unafs_write`), look again, bind UNMASKED with no lock held, install under
-/// one short masked take, give the ticket back. `Err` = the bind's own verdict (not contention), returned as the hold's
-/// bind returned it; contention (Busy, the ticket's bound, a held MOUNT) answers `Ok` and the attempt restarts.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+/// MOUNTSTACK — the lazy bind BEFORE the masked hold (`with_unafs`, each attempt): MOUNT unbound -> become THE binder (x86
+/// `wc`: take the commit ticket, or it is already this task's inside `with_unafs_write`; elsewhere: win the [`BIND`]
+/// latch), look again, bind UNMASKED with no MOUNT hold, install under one short masked take, give the ticket/latch back.
+/// `Err` = the bind's own verdict (not contention), returned as the hold's bind returned it; contention (Busy, the ticket's
+/// bound, a held MOUNT, another binder) answers `Ok` and the attempt restarts.
+///
+/// THE RACE RULE (HEAPREGION B854): the bind COMMITS the volume's reclaim drain, so two binds must never run at once. One
+/// binder at a time — the ticket on x86 `wc`, [`BIND`] elsewhere, and on a no-ticket build the in-hold binder of a caller
+/// with no task identity takes [`BIND`] too; a bind task that outlives its bounded join keeps the next bind out until it
+/// ends ([`BIND_LIVE`]). The binder installs under one short masked MOUNT take; a mount found there wins and the binder's
+/// instance is dropped.
 fn prebind() -> Result<(), MountError> {
     let Some(me) = crate::arch::sched::current_id() else { return Ok(()) };
     if !mount_unbound() {
         return Ok(());
     }
-    let mine = splitwrite::TICKET.load(Ordering::Acquire) == me;
-    if !mine && !splitwrite::ticket_take(me) {
-        return Ok(());
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        let mine = splitwrite::TICKET.load(Ordering::Acquire) == me;
+        if !mine && !splitwrite::ticket_take(me) {
+            return Ok(());
+        }
+        let out = if mount_unbound() { prebind_now() } else { Ok(()) };
+        if !mine {
+            splitwrite::TICKET.store(0, Ordering::Release);
+        }
+        out
     }
-    let out = if mount_unbound() { prebind_now() } else { Ok(()) };
-    if !mine {
-        splitwrite::TICKET.store(0, Ordering::Release);
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    {
+        let _ = me;
+        let Some(_bind) = BIND.try_lock() else { return Ok(()) };
+        if mount_unbound() { prebind_now() } else { Ok(()) }
     }
-    out
 }
 
 /// The pre-bind's peek: MOUNT free (`try_lock`, masked — it never spins) and empty after its poison check. A held MOUNT
 /// answers `false` (its holder may be binding or bound; the attempt waits on it).
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn mount_unbound() -> bool {
     crate::arch::without_interrupts(|| match MOUNT.try_lock() {
+        #[allow(unused_mut)]
         Some(mut g) => {
+            #[cfg(target_arch = "x86_64")]
             mount_poison_check(&mut *g);
             g.is_none()
         }
@@ -4424,20 +4451,23 @@ fn mount_unbound() -> bool {
     })
 }
 
-/// The ticket held: bind, then install under one short masked take (RENDERWEDGE's bounded pre-wait first; a mount bound
-/// meanwhile wins and ours is dropped — `kb_bind_root`'s shape).
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+/// The binder's turn held: bind ([`bind_sized`] — on a sized task when the caller's own stack is small), then install
+/// under one short masked take (x86 `wc`: RENDERWEDGE's bounded pre-wait first; a mount bound meanwhile wins and ours is
+/// dropped — `kb_bind_root`'s shape).
 fn prebind_now() -> Result<(), MountError> {
-    match bind_mount() {
+    match bind_sized() {
         Ok(m) => {
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
             if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) {
                 drop(m);
                 return Ok(());
             }
             let lost = crate::arch::without_interrupts(|| {
                 let mut g = MOUNT.lock();
+                #[cfg(target_arch = "x86_64")]
                 mount_poison_check(&mut *g);
                 if g.is_none() {
+                    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
                     splitread::note_bound(m.handle);
                     *g = Some(m);
                     None
@@ -4485,4 +4515,187 @@ pub fn poison_leg() -> &'static str {
     } else {
         "ok"
     }
+}
+
+// ── HEAPREGION (rmbp-ledger B854) BINDSTACK: the bind off a small caller's stack. `bind_mount` (the volume probe, the
+// superblock, the reclaim drain) is deep; a 16 KiB task that reaches the pre-bind parks in a JOIN while the bind runs on a
+// sized `unafs-bind` task (`sched::spawn_joinable_stack`), its result handed back through [`BIND_OUT`] (gen-checked). The
+// caller keeps the ticket/latch across the join (the bind task holds no lock, so `bind_mount`'s MOUNTSTACK assert holds);
+// the join is BOUNDED (`BIND_BOUND_MS`, splitwrite's TICKET_BOUND_MS figure): a bind task killed by its guard never posts,
+// so past the bound the caller answers Busy `why=bind-died` and gives the ticket/latch back, and [`BIND_LIVE`] keeps any
+// new bind out until that task ends (its late result is installed by the next pre-bind, never a second concurrent bind).
+// At the tail: no line above moves. ──
+
+/// The bind task's usable stack. The arc's figure, not a measured high-water (owed BINDSTACKHIGH).
+const BIND_STACK: usize = 64 * 1024;
+/// A caller whose usable stack is at most this binds through the task.
+const BIND_SMALL: usize = 16 * 1024;
+/// The join's bound: splitwrite's `TICKET_BOUND_MS` (the ticket's own bound), the same 1500 ms.
+const BIND_BOUND_MS: u64 = 1_500;
+
+/// The no-ticket builds' binder latch (non-`wc` x86, aarch64). TRY-locked only — never spun on — so holding it across the
+/// unmasked bind and the join park is sound; `try_lock` records no order edge (no inversion under MOUNT), and x86's
+/// registry releases it if its holder dies.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+static BIND: Mutex<()> = Mutex::new(());
+/// The last bind task's generation, and whether one is still running (set by the spawner, cleared by the task).
+static BIND_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BIND_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The bind task's result, tagged with its generation; a result of a superseded generation is dropped.
+static BIND_OUT: Mutex<Option<(u64, Result<BoundMount, MountError>)>> = Mutex::new(None);
+
+/// `Some(usable KiB)` when the caller should bind on the task: a scheduled task, IRQs unmasked (it must park in the
+/// join), its usable stack span at most [`BIND_SMALL`].
+fn small_caller() -> Option<usize> {
+    crate::arch::sched::current_id()?;
+    if crate::arch::irqs_masked() {
+        return None;
+    }
+    let (lo, hi) = crate::arch::without_interrupts(crate::arch::sched::current_stack_bounds)?;
+    let span = hi.saturating_sub(lo) as usize;
+    (span <= BIND_SMALL).then_some(span >> 10)
+}
+
+/// Take the result of generation `bgen` (the generation) (masked short take; a stale result is dropped outside the hold).
+fn bind_take(bgen: u64) -> Option<Result<BoundMount, MountError>> {
+    let got = crate::arch::without_interrupts(|| BIND_OUT.lock().take());
+    match got {
+        Some((g, r)) if g == bgen => Some(r),
+        other => {
+            drop(other);
+            None
+        }
+    }
+}
+
+/// Spawn `entry(arg)` on a [`BIND_STACK`] task and join it, bounded by [`BIND_BOUND_MS`]. `false` = the bound passed (the
+/// task never posted: killed, or still running). The one spawn+join of the bind and of its `tests unafslock` leg.
+fn run_sized(name: &'static str, entry: fn(usize), arg: usize) -> bool {
+    let h = crate::arch::sched::spawn_joinable_stack(name, entry, arg, crate::arch::sched::CPU_AUTO, BIND_STACK);
+    #[cfg(target_arch = "x86_64")]
+    {
+        h.join_timeout(crate::arch::ms_to_ticks(BIND_BOUND_MS)) == crate::arch::sched::JoinResult::Completed
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // aarch64's JoinHandle has no bounded join: poll the task's own done flag (`RUN_DONE`, set as its last act) on the
+        // clock that runs through a masked span, napping a tick between looks; the handle is dropped unjoined (its Arc
+        // keeps the semaphore alive until the task posts).
+        let t0 = crate::hidstall::now_us();
+        loop {
+            if RUN_DONE.swap(false, Ordering::AcqRel) {
+                drop(h);
+                return true;
+            }
+            if crate::hidstall::now_us().saturating_sub(t0) >= BIND_BOUND_MS * 1000 {
+                drop(h);
+                return false;
+            }
+            crate::arch::sched::sleep_ticks(1);
+        }
+    }
+}
+
+/// aarch64's bounded-join flag (see [`run_sized`]); set by the sized task's entry as its last act.
+#[cfg(not(target_arch = "x86_64"))]
+static RUN_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn run_done() {
+    #[cfg(not(target_arch = "x86_64"))]
+    RUN_DONE.store(true, Ordering::Release);
+}
+
+/// The bind, on the caller or on a sized task. Wire once per bind: `[unafs] bind on=<task|caller> stack_kib=<n>`.
+fn bind_sized() -> Result<BoundMount, MountError> {
+    let bgen = BIND_GEN.load(Ordering::Acquire);
+    if let Some(r) = bind_take(bgen) {
+        return r; // a task that outlived its join finished meanwhile: its bind is this bind
+    }
+    if BIND_LIVE.load(Ordering::Acquire) {
+        TXN_BUSY.store(true, Ordering::Relaxed);
+        return Err(MountError::Busy); // that task still runs (or died): never a second concurrent bind
+    }
+    let Some(kib) = small_caller() else {
+        serial_println!("[unafs] bind on=caller stack_kib={} (HEAPREGION B854)", crate::arch::without_interrupts(crate::arch::sched::current_stack_bounds).map_or(0, |(lo, hi)| (hi.saturating_sub(lo) >> 10) as usize));
+        return bind_mount();
+    };
+    let bgen = BIND_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    BIND_LIVE.store(true, Ordering::Release);
+    #[cfg(not(target_arch = "x86_64"))]
+    RUN_DONE.store(false, Ordering::Release);
+    serial_println!("[unafs] bind on=task stack_kib={} caller_kib={} (HEAPREGION B854)", BIND_STACK >> 10, kib);
+    if !run_sized("unafs-bind", bind_task, bgen as usize) {
+        serial_println!("[unafs] bind on=task why=bind-died bound_ms={} gen={} -> Busy (HEAPREGION B854: the ticket/latch given back; no new bind until the task ends)", BIND_BOUND_MS, bgen);
+        TXN_BUSY.store(true, Ordering::Relaxed);
+        return Err(MountError::Busy);
+    }
+    bind_take(bgen).unwrap_or(Err(MountError::Busy))
+}
+
+/// `unafs-bind`: one `bind_mount` on the sized stack, the result posted under its generation.
+fn bind_task(bgen: usize) {
+    let r = bind_mount();
+    let stale = crate::arch::without_interrupts(|| BIND_OUT.lock().replace((bgen as u64, r)));
+    drop(stale);
+    BIND_LIVE.store(false, Ordering::Release);
+    run_done();
+}
+
+// ── `tests unafslock`'s bind leg (x86 `wc`, folded on `splitread::selftest`'s first line): a 16 KiB `unafslock-bind`
+// worker asks `small_caller` and runs a probe through the SAME `run_sized` on a `BIND_STACK` task. ──
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static LEG_CALLER_KIB: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static LEG_TASK_KIB: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static LEG_WORD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn bind_leg() {
+    use core::sync::atomic::Ordering::{Acquire, Release};
+    let word = if crate::arch::sched::current_id().is_none() || crate::arch::irqs_masked() {
+        "no-task"
+    } else {
+        LEG_WORD.store(0, Release);
+        LEG_CALLER_KIB.store(0, Release);
+        LEG_TASK_KIB.store(0, Release);
+        let h = crate::arch::sched::spawn_joinable_stack("unafslock-bind", bind_leg_worker, 0, crate::arch::sched::CPU_AUTO, BIND_SMALL);
+        if h.join_timeout(crate::arch::ms_to_ticks(2 * BIND_BOUND_MS)) != crate::arch::sched::JoinResult::Completed {
+            "no-task"
+        } else {
+            match LEG_WORD.load(Acquire) {
+                1 => "ok",
+                2 => "caller-not-small",
+                3 => "not-sized",
+                _ => "no-task",
+            }
+        }
+    };
+    serial_println!(
+        "[unafslock] bind_task={} on=task stack_kib={} caller_kib={}",
+        word,
+        LEG_TASK_KIB.load(Acquire),
+        LEG_CALLER_KIB.load(Acquire)
+    );
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn bind_leg_worker(_: usize) {
+    use core::sync::atomic::Ordering::Release;
+    let Some(kib) = small_caller() else {
+        LEG_WORD.store(2, Release);
+        return;
+    };
+    LEG_CALLER_KIB.store(kib, Release);
+    let ran = run_sized("unafs-bind", bind_leg_probe, 0);
+    let task_kib = LEG_TASK_KIB.load(core::sync::atomic::Ordering::Acquire);
+    LEG_WORD.store(if ran && task_kib >= BIND_STACK >> 10 { 1 } else { 3 }, Release);
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn bind_leg_probe(_: usize) {
+    let kib = crate::arch::without_interrupts(crate::arch::sched::current_stack_bounds).map_or(0, |(lo, hi)| (hi.saturating_sub(lo) >> 10) as usize);
+    LEG_TASK_KIB.store(kib, core::sync::atomic::Ordering::Release);
+    run_done();
 }

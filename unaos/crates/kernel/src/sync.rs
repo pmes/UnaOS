@@ -747,7 +747,7 @@ mod reg {
     /// the special releases (`lockowner`: the sink, the UART, the UnaFS mount — which must be leaked, not dropped).
     pub fn release_task(tid: u64, why: &str) -> usize { let named = crate::lockowner::release_dead(tid); // STACKGUARD3 (B832): THE one release — lockowner's three first (unpoisoned), then the walk. LINE-NEUTRAL fold
         if tid == 0 || !ON.load(Relaxed) {
-            return say_named(tid, why, named); // STACKGUARD3 (B832): the registry off still releases (and names) lockowner's three
+            return say_early(tid, why, named); // HEAPREGION (B854) POISONEARLY: the poison table's line too when it named anything (reg tail). STACKGUARD3 (B832): the registry off still releases (and names) lockowner's three
         }
         let mut dead = Dead::new(); // STACKGUARD3 (B832): per-lock records, said AFTER the walk
         for p in PARTS.iter() {
@@ -874,7 +874,7 @@ mod reg {
         let tid = DIE_TID.load(Acquire);
         let freed = if died && tid != 0 { release_task(tid, "tests lockreg") } else { 0 };
         let back = DIE.try_lock().is_some();
-        let _ = DIE.take_poison(); let (gword, poisoned, retake_ms) = guard_leg(); let released = died && freed == 1 && back && gword == "ok"; let (hword, mword) = (heap_leg(), mount_leg()); // POISON2 (B846): the heap's and the mount's synthetic deaths, read released and checked (reg tail). STACKGUARD3 (B832): the death leg's mark cleared; the REAL guard leg (file tail) must pass too. LINE-NEUTRAL fold
+        let _ = DIE.take_poison(); let (gword, poisoned, retake_ms) = guard_leg(); let released = died && freed == 1 && back && gword == "ok"; let ((hword, fword), mword) = (heap_leg(), mount_leg()); let rword = crate::allocator::heappoison::reinit_leg(); // HEAPREGION (B854): the free-first check (`free_first=`) and the scratch re-init (`heap_reinit=`). POISON2 (B846): the heap's and the mount's synthetic deaths, read released and checked (reg tail). STACKGUARD3 (B832): the death leg's mark cleared; the REAL guard leg (file tail) must pass too. LINE-NEUTRAL fold
         let (mut acq, mut tracked, mut held_max) = (EARLY.load(Relaxed), 0u64, 0u64);
         for p in PARTS.iter() {
             acq += p.acq.load(Relaxed);
@@ -888,15 +888,15 @@ mod reg {
         let max_at = HELD_MAX_AT.load(Relaxed);
         // SAFETY: `max_at` is a `&'static Location` or null.
         let max_at = if max_at.is_null() { None } else { Some(unsafe { &*max_at }) };
-        let pass = on && held_done && named && released && inv == 0 && overflow == 0 && leg_ok(hword) && leg_ok(mword);
+        let pass = on && held_done && named && released && inv == 0 && overflow == 0 && leg_ok(hword) && leg_ok(mword) && leg_ok(rword) && leg_ok(fword);
         serial_println!(
-            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} heap_check={} mount_poison={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{} poison_slots={}/16 poison_lost={}",
+            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} heap_check={} mount_poison={} heap_reinit={} free_first={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{} poison_slots={}/16 poison_lost={}",
             CLASS_N.load(Relaxed),
             tracked,
             acq,
             held_max / (hz / 1000),
             inv,
-            if released { "ok" } else if !died { "no-task" } else if freed != 1 { "not-found" } else if !back { "still-held" } else { gword }, poisoned as u8, retake_ms, hword, mword, // STACKGUARD3 (B832): the guard leg's word, its mark and its retake (LINE-NEUTRAL fold)
+            if released { "ok" } else if !died { "no-task" } else if freed != 1 { "not-found" } else if !back { "still-held" } else { gword }, poisoned as u8, retake_ms, hword, mword, rword, fword, // STACKGUARD3 (B832): the guard leg's word, its mark and its retake (LINE-NEUTRAL fold)
             if named { "ok" } else if !on { "unarmed" } else if !held_done { "no-task" } else { "missed" },
             overflow,
             if pass { "PASS" } else { "FAIL" }, Site(class_site(HELD_MAX_CLASS.load(Relaxed))), // KVMLAT (B578): the longest hold's lock, by name (`?` = none recorded)
@@ -1144,14 +1144,19 @@ mod reg {
     /// (`allocator::heappoison::hold_task`); this core, masked and allocating nothing in the window, claims the hold and
     /// gives it back through `release_task` (the mark, then the force-unlock), then allocates once. `ok` = one lock
     /// released, the allocator's poison check ran (the slot cleared) and read the list whole (`torn=0`).
-    fn heap_leg() -> &'static str {
+    /// HEAPREGION (B854) HEAPFREEFIRST: a block allocated BEFORE the window is freed FIRST after the release, so the first
+    /// take after the death is a FREE: the second word is `ok` when the check ran at that free (checks rose before the
+    /// probe's allocation), `skip(heap-leg)` when the leg never reached the release. Returns `(heap_check, free_first)`.
+    fn heap_leg() -> (&'static str, &'static str) {
         use crate::allocator::heappoison as hp;
+        const SKIP: &str = "skip(heap-leg)";
         if !ON.load(Acquire) {
-            return "skip(unarmed)";
+            return ("skip(unarmed)", SKIP);
         }
-        crate::arch::without_interrupts(|| {
+        let mut pre = Some(alloc::boxed::Box::new(0x4845_4150_u64)); // freed first after the release (HEAPFREEFIRST)
+        let out = crate::arch::without_interrupts(|| {
             let me = crate::arch::percpu::this_cpu().cpu_index as usize;
-            let Some(cpu) = (0..MAX_CPUS).map_while(crate::arch::smp::worker_cpu).find(|&c| c != me) else { return "skip(1core)" };
+            let Some(cpu) = (0..MAX_CPUS).map_while(crate::arch::smp::worker_cpu).find(|&c| c != me) else { return ("skip(1core)", SKIP) };
             hp::arm();
             let c0 = hp::checks();
             crate::arch::sched::spawn("lockreg-heap", hp::hold_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
@@ -1159,22 +1164,24 @@ mod reg {
             let t0 = rdtsc();
             while !hp::held() {
                 if rdtsc().wrapping_sub(t0) > hz {
-                    return "no-heap-task";
+                    return ("no-heap-task", SKIP);
                 }
                 core::hint::spin_loop();
             }
             if hp::holder() == 0 {
-                return "untracked"; // no task id to release by: unclaimed, the holder's bound unlocks it (unpoisoned)
+                return ("untracked", SKIP); // no task id to release by: unclaimed, the holder's bound unlocks it (unpoisoned)
             }
             if !hp::claim() {
-                return "no-release"; // the holder's bound passed first: it unlocked itself, unpoisoned
+                return ("no-release", SKIP); // the holder's bound passed first: it unlocked itself, unpoisoned
             }
             let freed = release_task(hp::holder(), "tests lockreg heap");
             if freed == 0 {
                 hp::unlock_claimed(); // the walk did not find the hold (untracked acquire): the claimed hold is ours to end
             }
+            drop(pre.take()); // the first take after the death: a FREE
+            let fword = if freed != 1 { SKIP } else if hp::checks() > c0 { "ok" } else { "not-checked" };
             hp::probe();
-            if freed != 1 {
+            let hword = if freed != 1 {
                 "not-released"
             } else if hp::checks() <= c0 {
                 "not-checked"
@@ -1182,8 +1189,11 @@ mod reg {
                 "torn"
             } else {
                 "ok"
-            }
-        })
+            };
+            (hword, fword)
+        });
+        drop(pre); // an early return's block, freed after the window (the holder's bound has unlocked the heap by then)
+        out
     }
 
     /// The mount leg (`fs::unafs::poison_leg`): the mount marked as a dead holder's release marks it, then one `with_unafs`.
@@ -1196,6 +1206,16 @@ mod reg {
         {
             "skip(no-unafs)"
         }
+    }
+
+    /// HEAPREGION (B854) POISONEARLY: the registry-off release (`release_task`'s early return) says lockowner's names and,
+    /// when it named anything, the poison table's line, as the full walk does. `say_poison` keeps its one body.
+    fn say_early(tid: u64, why: &str, named: u32) -> usize {
+        let n = say_named(tid, why, named);
+        if n > 0 {
+            say_poison();
+        }
+        n
     }
 }
 

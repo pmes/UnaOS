@@ -11223,3 +11223,15 @@ pub fn slot_tables_warm(asid: usize) {
     SLOT_CORE_RES.warm(asid);
     ASID_THREADS.warm(asid);
 }
+
+// ── HEAPREGION (rmbp-ledger B854) BINDSTACK: the x86 twin's SIZED JOINABLE spawn — `spawn_stack`'s caller-sized stack
+// with `spawn_joinable`'s completion handle (the UnaFS bind, `fs::unafs::bind_sized`). At the tail: no line above moves. ──
+
+/// `spawn_joinable` with the USABLE stack span named (the redzone and high guard added by `spawn_inner`, as for every
+/// task). A size passed here MUST come with its reason at the call site (`spawn_stack`'s rule).
+pub fn spawn_joinable_stack(name: &'static str, entry: fn(usize), arg: usize, cpu: usize, stack_bytes: usize) -> JoinHandle {
+    let done = Arc::new(Semaphore::new(0));
+    done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
+    let id = spawn_inner(name, entry, arg, cpu, PRIO_NORMAL, Some(done.clone()), stack_bytes);
+    JoinHandle { done, id }
+}

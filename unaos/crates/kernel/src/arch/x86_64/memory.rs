@@ -61,14 +61,14 @@ pub fn init(boot_info: &'static mut BootInfo) {
     // holes; fall back to the original "anything above 1 MiB" rule if nothing qualifies (keeps
     // QEMU and small-RAM configs working).
     let mut heap_start = 0u64;
-    let mut heap_size = 0usize;
+    let mut heap_size = 0usize; let mut heap_room = 0usize; // HEAPREGION (B854): the chosen region's whole size (the reserve is carved from its tail). LINE-NEUTRAL append
     'pick: for &min_base in &[0x0100_0000u64, 0x0010_0000u64] {
         for region in regions {
             if region.kind == MemoryRegionKind::Usable && region.phys_start >= min_base {
                 let size = (region.page_count * 4096) as usize;
                 if size >= crate::allocator::HEAP_SIZE {
                     heap_start = region.phys_start;
-                    heap_size = crate::allocator::HEAP_SIZE;
+                    heap_size = crate::allocator::HEAP_SIZE; heap_room = size; // HEAPREGION (B854). LINE-NEUTRAL append
                     break 'pick;
                 }
             }
@@ -129,7 +129,7 @@ pub fn init(boot_info: &'static mut BootInfo) {
         unsafe {
             crate::allocator::init_heap_raw(heap_start as *mut u8, heap_size);
         }
-        SB3_HEAP.store(heap_start, core::sync::atomic::Ordering::Release); // SELFBUILD3 (B353): the Linux shim's frame pool steers around it
+        heap_reserve_carve(heap_start, heap_room); SB3_HEAP.store(heap_start, core::sync::atomic::Ordering::Release); // HEAPREGION (B854): the reserve carved and the window's length set BEFORE the window publishes (LINE-NEUTRAL, file tail). SELFBUILD3 (B353): the Linux shim's frame pool steers around it
     } else {
         serial_println!("Available memory regions: {}", regions.len());
         for region in regions.iter().take(15) {
@@ -4485,7 +4485,7 @@ static SB3_HEAP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::
 /// `(physical start, length)` of the kernel heap (length 0 before `init`).
 pub fn selfbuild3_heap_window() -> (u64, u64) {
     let s = SB3_HEAP.load(core::sync::atomic::Ordering::Acquire);
-    if s == 0 { (0, 0) } else { (s, crate::allocator::HEAP_SIZE as u64) }
+    if s == 0 { (0, 0) } else { (s, SB3_HEAP_LEN.load(core::sync::atomic::Ordering::Acquire).max(crate::allocator::HEAP_SIZE as u64)) } // HEAPREGION (B854): the heap AND its reserve (vm.rs/elf.rs never hand the reserve out)
 }
 
 /// Every `Usable` region of the UEFI map as `[start, end)` (empty before `init`).
@@ -4757,4 +4757,47 @@ pub fn xwin_ceiling_next(bytes: u64) {
 /// APPFAULT: frames slot `s` holds in its ELF window now (the `[task] terminate` line's `freed_kb` / 4).
 pub fn xwin_slot_pages(s: usize) -> u64 {
     XWIN_PAGES.peek(s).map_or(0, |p| p.load(Ordering::Acquire))
+}
+
+// ── HEAPREGION (rmbp-ledger B854): the heap's RESERVE — a span the allocator re-initialises onto, once, when a dead holder
+// left the hole list torn (`allocator::heappoison`). Carved from the TAIL of the heap's own Usable region (adjacent, so
+// `heap_bounds()` still covers every live block after the move), probed like the heap, and kept inside
+// `selfbuild3_heap_window` (the Linux shim's frame pool and fixed-image window subtract it). x86 has no frame allocator
+// (the heap IS the frame source), so nothing else hands it out. A region too short for heap + reserve: no reserve, said.
+// At the tail: no line above moves. ──
+
+/// The reserve's size. The old range's LIVE blocks stay valid after a re-init, so the reserve carries only the churn of
+/// NEW allocations until the operator saves and reboots; 8 MiB is the arc's figure.
+pub const HEAP_RESERVE_MIB: usize = 8;
+
+/// The kernel heap's window length: `HEAP_SIZE` plus the reserve when one was carved (0 before `init`).
+static SB3_HEAP_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Carve `[heap_start + HEAP_SIZE, + HEAP_RESERVE_MIB)` out of the heap's region (`room` bytes long) and hand it to
+/// `heappoison`. Runs once, on the boot path, before SMP and before the window publishes.
+fn heap_reserve_carve(heap_start: u64, room: usize) {
+    let len = HEAP_RESERVE_MIB << 20;
+    let lo = heap_start + crate::allocator::HEAP_SIZE as u64;
+    let why = if room < crate::allocator::HEAP_SIZE + len {
+        "region-short"
+    } else {
+        // SAFETY: `[lo, lo + len)` lies inside the Usable region the heap was chosen from, past the heap's end, on the
+        // firmware's identity map; nothing has been handed it yet. The sentinels are overwritten by a re-init's node.
+        let ok = unsafe {
+            let a = lo as *mut u64;
+            let b = (lo + len as u64 - 8) as *mut u64;
+            core::ptr::write_volatile(a, 0xA55A_1234_DEAD_BEEF);
+            core::ptr::write_volatile(b, 0x0BAD_F00D_5EED_C0DE);
+            core::ptr::read_volatile(a) == 0xA55A_1234_DEAD_BEEF && core::ptr::read_volatile(b) == 0x0BAD_F00D_5EED_C0DE
+        };
+        if ok { "" } else { "probe-fail" }
+    };
+    let have = if why.is_empty() { len } else { 0 };
+    SB3_HEAP_LEN.store((crate::allocator::HEAP_SIZE + have) as u64, core::sync::atomic::Ordering::Release);
+    if have != 0 {
+        crate::allocator::heappoison::set_reserve(lo as usize, have);
+        serial_println!("[heap] reserve mib={} at={:#x} (HEAPREGION B854)", HEAP_RESERVE_MIB, lo);
+    } else {
+        serial_println!("[heap] reserve mib=0 why={} (HEAPREGION B854: a torn heap list is kept)", why);
+    }
 }

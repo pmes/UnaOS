@@ -9248,3 +9248,22 @@ fn pumppark_leg(rd0: u32) -> (bool, alloc::string::String) {
         ),
     )
 }
+
+// ── HEAPREGION (rmbp-ledger B854) BINDSTACK: a SIZED JOINABLE spawn — `spawn_stack`'s caller-sized stack with
+// `spawn_joinable`'s completion handle. The one caller is the UnaFS bind (`fs::unafs::bind_sized`): a caller whose own
+// stack is 16 KiB parks in the join while the bind runs on `stack_bytes`. At the tail: no line above moves. ──
+
+/// `spawn_joinable` with the USABLE stack span named (`STACK_GUARD` added below it by `spawn_inner`, as for every task).
+/// A size passed here MUST come with its reason at the call site (`spawn_stack`'s rule).
+pub fn spawn_joinable_stack(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    target_cpu: usize,
+    stack_bytes: usize,
+) -> JoinHandle {
+    let done = Arc::new(Semaphore::new(0));
+    done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
+    let id = spawn_inner(name, entry, arg, target_cpu, PRIO_NORMAL, stack_bytes, Some(done.clone()), None);
+    JoinHandle { done, id }
+}
