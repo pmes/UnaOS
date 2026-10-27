@@ -5214,7 +5214,7 @@ fn composite_once() {
     #[cfg(all(target_arch = "x86_64", feature = "wc"))] let k2p_pass = k2p::begin(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::perfhud::pass_begin(); let owed = composite_pass_half(); // K2P (B671): this frame takes its oldest consumed input and judges its vblank deadline (file tail). ⚠ LINE-NEUTRAL fold, code before the comment. PERFHUD (B710): `perfhud::pass_begin` stamps the pass start its frame-time ring reads at the overlay layer (one relaxed store while visible), same-line fold, code before the comment.
     // x86 (and anything not aarch64): cash inline, in the pass, as the trunk always has.
     #[cfg(not(target_arch = "aarch64"))]
-    cash_tail(owed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::on_damage(owed.dirty); #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::end(k2p_pass); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] crate::video::veilcost::frame(); // ZOOM (B713): the pass's pixels are in the RAM frame while the lens is live — present them through it before the frame is judged on the glass. K2P (B671): the frame is on the glass — its input's age is recorded (file tail). VEILCOST (B696): the sample. ⚠ LINE-NEUTRAL fold, code before the comment.
+    cash_tail(owed); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::on_damage(owed.dirty); #[cfg(all(target_arch = "x86_64", feature = "wc"))] k2p::end(k2p_pass); #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))] crate::video::veilcost::frame(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] pass_owed_redrive(); // ZOOM (B713): the pass's pixels are in the RAM frame while the lens is live — present them through it before the frame is judged on the glass. K2P (B671): the frame is on the glass — its input's age is recorded (file tail). VEILCOST (B696): the sample. SHIMMERPRESENT (B840): SHIMSTRAND — a pass that leaves erase boxes owed publishes COMP_PENDING (file tail). ⚠ LINE-NEUTRAL fold, code before the comment.
     // aarch64: stash and leave — but ONLY when a cash is actually coming, i.e. this pass is a
     // present's, whose epilogue calls `composite_tail_owed` a few instructions from now with IRQs
     // restored. Any other caller cashes inline, exactly as the trunk does. See
@@ -31989,4 +31989,89 @@ pub fn surface_pixel(id: WinId, sx: usize, sy: usize) -> Option<u32> {
     // row is held live by the table hold, and `off + 4 <= surf_len` was checked above (`verify_reference`'s source shape).
     let p = (r.surf as *const u8).wrapping_add(off) as *const u32;
     Some(unsafe { core::ptr::read_unaligned(p) })
+}
+
+// SHIMMERPRESENT (rmbp-ledger B840; BP-video-11) — TAIL-APPENDED so no line above moves. The shimmer's idle seat
+// (`desktop::shimmer_idle`) presents its boxes, not the whole pass: under `COMP_GATE`, with nothing but its own boxes owed,
+// only the head of `composite_inner` runs — `shadow_track` (whose `desktop::track` makes the tick and queues its boxes),
+// the erase drain (`drain_deferred`: the filtered `stage_fill` + `flush_rect` of each box, ZOOMCOST's `zoom_note_boxes`
+// inside it), then `cash_tail`'s cursor tail and `zoom::on_damage`. No window blit, no snapshot, no furniture compose
+// (`erase_clip` keeps every fill off the strips, so the drain owes them nothing). Anything else owed — before the drain or
+// left by it — runs the whole pass (`composite_once`) inside the same hold. The gate is taken and released with
+// `composite`'s own words (CAS, holder stamps, `comp_mark(0, 0)`, `comp_gate_release`) and declines where it declines; it
+// never steals (a held gate is `None`, and nothing was queued: the tick is made inside the hold). Order kept from
+// `composite_inner`: the drain's SPRITE take happens with no BlitGuard held. SHIMSTRAND: `pass_owed_redrive` at every
+// pass's tail publishes `COMP_PENDING` when erase boxes are still queued, so an unmasked holder's re-run loop and the
+// lost-wakeup re-acquire re-drive them; a one-pass holder (masked / the service core) leaves it for `service_damage`, and
+// the idle seat's carry is the backstop (owed SVCREDRIVE, video §5).
+
+/// The shimmer's drain-only present (SHIMMERPRESENT B840). `None`: the gate was not free or the pass declines (nothing
+/// ran). `Some(true)`: the drain present ran. `Some(false)`: the whole pass ran, because something else was owed.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))]
+fn present_drain() -> Option<bool> {
+    use core::sync::atomic::Ordering::{AcqRel, Relaxed};
+    if let Some(term) = super::panel_refuse_term() {
+        super::note_panel_write_refused(super::REFUSE_TIER_PASS, term, "wm::present_drain");
+        return None;
+    }
+    if comp_svc_masked_decline() || pump_lane_decline() || COMP_GATE.compare_exchange(false, true, AcqRel, Relaxed).is_err() {
+        return None;
+    }
+    COMP_HOLD_T0_MS.store(crate::arch::ms(), Relaxed);
+    COMP_HOLDER_CORE.store(crate::arch::sched::meter_current_cpu(), Relaxed);
+    COMP_HOLDER_TID.store(crate::arch::sched::current_id().unwrap_or(0), Relaxed);
+    let pend = COMP_PENDING.swap(false, AcqRel);
+    let drained = !(pend || any_damaged() || deferred_owed() || menu_paint_owed()) && drain_present_once();
+    if !drained {
+        composite_once();
+    }
+    comp_mark(0, 0);
+    comp_gate_release();
+    Some(drained)
+}
+
+/// The drain present's body, under the caller's `COMP_GATE` hold: `composite_inner`'s head, then the cursor tail. `false`:
+/// the drain re-damaged a window or a menu came due — the caller runs the whole pass (which re-establishes the sprite).
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))]
+fn drain_present_once() -> bool {
+    #[cfg(feature = "witness")]
+    let c2_t0 = crate::arch::now_cycles();
+    shadow_track();
+    let mut disturbed = false;
+    match super::panel_snapshot() {
+        Some(fb) => {
+            if fb.is_ready() && drain_deferred(&fb) {
+                disturbed = true;
+            }
+        }
+        None => super::cursor::owe_repaint(),
+    }
+    if any_damaged() || menu_paint_owed() {
+        if disturbed {
+            super::cursor::owe_repaint();
+        }
+        return false;
+    }
+    let dirty = super::cursor::take_present_dirty();
+    cash_tail(Owed {
+        tail: if disturbed || dirty { CursorTail::Repaint } else { CursorTail::Untouched },
+        dirty,
+        #[cfg(feature = "witness")]
+        c2_t0,
+        #[cfg(feature = "witness")]
+        c2_t1: crate::arch::now_cycles(),
+    });
+    super::zoom::on_damage(dirty);
+    pass_owed_redrive();
+    true
+}
+
+/// SHIMSTRAND (B840): a pass (or a drain present) that ends with erase boxes still queued — re-deferred by a contended
+/// stage, skipped under a raised barrier or a refused snapshot — publishes `COMP_PENDING`, so the work is re-driven by
+/// the holder's re-run loop / lost-wakeup re-acquire (unmasked) or `service_damage` (one-pass holders), never stranded.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn pass_owed_redrive() {
+    if deferred_owed() {
+        COMP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+    }
 }
