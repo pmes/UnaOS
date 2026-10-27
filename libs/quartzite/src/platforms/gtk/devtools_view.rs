@@ -143,7 +143,7 @@ pub fn bootstrap_devtools(synapse: Synapse, page: &gtk4::Widget) -> DevtoolsView
         let syn = synapse.clone();
         sizer.connect_resize(move |_, w, h| {
             if w > 0 && h > 0 {
-                syn.fire(SMessage::BrowserResize(w as u32, h as u32));
+                syn.fire(SMessage::BrowserResize(w as u32, h as u32, 0));
             }
         });
     }

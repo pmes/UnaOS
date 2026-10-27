@@ -529,7 +529,7 @@ impl Tab {
             ref m @ (SMessage::MediaOpened { .. } | SMessage::MediaFrame { .. } | SMessage::MediaEnded { .. } | SMessage::MediaError { .. }) => {
                 self.engine.on_media_message(m);
             }
-            SMessage::BrowserResize(w, h) => {
+            SMessage::BrowserResize(w, h, _) => {
                 self.window = (w, h);
                 self.fit_page();
             }
@@ -770,7 +770,7 @@ impl Coordinator {
         self.active.store(id, Ordering::Relaxed);
         self.send(id, TabCmd::Devtools(self.devtools));
         if let Some((w, h)) = self.last_resize {
-            self.send(id, TabCmd::Msg(SMessage::BrowserResize(w, h)));
+            self.send(id, TabCmd::Msg(SMessage::BrowserResize(w, h, 0)));
         }
         self.send(id, TabCmd::Activate);
         self.publish_tabs();
@@ -857,9 +857,9 @@ impl Coordinator {
                     self.publish_bookmarks();
                 }
             }
-            SMessage::BrowserResize(w, h) => {
+            SMessage::BrowserResize(w, h, _) => {
                 self.last_resize = Some((w, h));
-                self.to_active(SMessage::BrowserResize(w, h));
+                self.to_active(SMessage::BrowserResize(w, h, 0));
                 if self.devtools.open {
                     self.bus.fire(devtools_layout(&self.devtools, self.last_resize));
                 }
@@ -1125,14 +1125,14 @@ mod tests {
     #[test]
     fn coalesce_pointer_motion_leaves_scroll_and_resize_rules_alone() {
         let out = coalesce(vec![
-            SMessage::BrowserResize(10, 10),
+            SMessage::BrowserResize(10, 10, 0),
             SMessage::BrowserScroll(0.0, 1.0, 0),
             SMessage::BrowserScroll(0.0, 2.0, 0),
             SMessage::BrowserMouseMove(4.0, 4.0, 0),
-            SMessage::BrowserResize(20, 20),
+            SMessage::BrowserResize(20, 20, 0),
         ]);
         let shape: Vec<String> = out.iter().map(|m| format!("{m:?}")).collect();
-        assert_eq!(shape, ["BrowserScroll(0.0, 3.0, 0)", "BrowserMouseMove(4.0, 4.0, 0)", "BrowserResize(20, 20)"]);
+        assert_eq!(shape, ["BrowserScroll(0.0, 3.0, 0)", "BrowserMouseMove(4.0, 4.0, 0)", "BrowserResize(20, 20, 0)"]);
     }
 
     /// AETHERDEVTOOLS2 (SR112): the face's split/key path through the shell — F12 from the face's hook
