@@ -769,7 +769,7 @@ fn find_path(ws: &[Widget; MAX_NODES], pin: u8) -> Option<Path> {
 }
 
 /// Everything arc 2 needs about one codec, handed over by the walk.
-struct CodecWalk {
+#[derive(Clone, Copy)] struct CodecWalk { // NETSPLIT (B852) M3: Copy, so the kept walk is copied out of `WALKED` before the pair is taken
     cad: u8,
     nodes: u32,
     dacs: u32,
@@ -1082,7 +1082,7 @@ fn reset(base: u64, a: &mut Audit) -> Option<u16> { #[cfg(feature = "hda-tone")]
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The whole driver, in one pass. Every exit path stops the CORB and RIRB DMA engines.
-pub fn probe() {
+pub fn probe() { #[cfg(feature = "hda-tone")] if start_reattach() { return; } // NETSPLIT (B852) M3: a WARM stream open re-attaches (no reset, no walk); the rule is `start_reattach` at the file tail
     let mut a = Audit::default();
     let found = crate::drivers::pci::PciScanner::audio_inventory();
     if found.is_empty() {
@@ -1230,9 +1230,9 @@ pub fn probe() {
             ":: HDA: codecs={} nodes={} dacs={} pins={} path={} -> {} ::",
             ncodecs, total_nodes, total_dacs, total_pins, path_desc,
             if arc1_ok { "armed" } else { "declined" }
-        ); #[cfg(feature = "hda-tone")] run_tone(base, &mut rings, iss as u8, chosen.as_ref(), &ws, &mut a); // ARC 2's ONE call site, and the ONLY `hda-tone` statement above this file's arc-2 banner. HERE because the tone must run on a walked controller and before the rings are stopped. FOLDED onto the arc-1 statement's closing line rather than given lines of its own so that arc 1's line numbering is identical with and without arc 2 — the same LINE-NEUTRAL discipline the hook in `drivers/pci.rs` uses, for the same `panic::Location` reason. The append goes BEFORE this line's first `//` (LEDGER P7 — after it the statement is a comment, compiles nothing, and the check stays green).
+        ); #[cfg(feature = "hda-tone")] run_tone(base, &mut rings, iss as u8, chosen.as_ref(), &ws, &mut a); // ARC 2's ONE call site; above this file's arc-2 banner the only other `hda-tone` statements are NETSPLIT (B852)'s two line-neutral folds (probe's head, the capture line), both calls into the file tail. HERE because the tone must run on a walked controller and before the rings are stopped. FOLDED onto the arc-1 statement's closing line rather than given lines of its own so that arc 1's line numbering is identical with and without arc 2 — the same LINE-NEUTRAL discipline the hook in `drivers/pci.rs` uses, for the same `panic::Location` reason. The append goes BEFORE this line's first `//` (LEDGER P7 — after it the statement is a comment, compiles nothing, and the check stays green).
 
-        vol::capture(base, chosen.as_ref(), &ws, &mut rings, &mut a); rings.stop(&mut a); // VOLKEYS: keep the output path
+        vol::capture(base, chosen.as_ref(), &ws, &mut rings, &mut a); #[cfg(feature = "hda-tone")] walk_keep(base, iss as u8, chosen.as_ref(), &ws, &mut rings, &mut a); rings.stop(&mut a); // VOLKEYS: keep the output path. NETSPLIT (B852) M3: and the walk, for a warm stream open's re-attach
         a.line("end");
         // One controller per boot; see the comment at the top of this loop.
         return;
@@ -1241,7 +1241,7 @@ pub fn probe() {
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // ARC 2 — THE TONE. Everything below this line is `hda-tone`, and above it there is exactly ONE
-// `hda-tone` statement: the call site, FOLDED onto an existing line inside `probe` so arc 1's line
+// `hda-tone` call site (plus NETSPLIT B852's two folded calls), FOLDED onto existing lines inside `probe` so arc 1's line
 // numbering does not move. Knob off, not one line below this banner is lexed — no stream-descriptor
 // constant, no verb this driver needs only in order to make a noise, no sine generator, no BDL and
 // no stream register write exists in the image, and no `core::panic::Location` above it can move.
@@ -2289,7 +2289,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
 
 /// BOOTSLOW — `probe()` once, from a device-service pass, after the root pass's verdict.
 pub fn probe_after_root() {
-    if ring::parked() { return; } ring::leg_maybe(); // HDARING (B811) M3: net-hda's HDA half is off the pump while its step is parked; the gatesteal2 leg's park point (idle = one load)
+    if ring::parked() { return; } ring::leg_maybe(); // HDARING (B811) M3: the hda step (NETSPLIT B852: its own, P_HDA) is off the pump while parked; the gatesteal2 leg's park point (idle = one load)
     #[cfg(feature = "hda-tone")] play::service(); static DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false); // PLAYWAV (R75): the stream's refill tick (idle = one atomic load), LINE-NEUTRAL fold
     if DONE.load(core::sync::atomic::Ordering::Relaxed) || !crate::fs::bootdisk::root_pass_open("hda") || !crate::boot::services_gate("hda") || bar_holds() { // KVMLAT2 (B576): and not before the bar's first paint (`bar_holds`, file tail). FIRSTBOOT (R77): no HDA bring-up (the boot tone) before the Desktop stage. LINE-NEUTRAL fold.
         return;
@@ -2450,9 +2450,9 @@ fn tone_free_amp_payload(mute: bool, gain: u8) -> u32 {
 static TONE_NOW: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 #[cfg(feature = "hda-tone")]
 pub fn hda_tone_test() {
-    TONE_NOW.store(true, core::sync::atomic::Ordering::Relaxed);
+    TONE_NOW.store(true, core::sync::atomic::Ordering::Relaxed); TONE_WALK.store(true, core::sync::atomic::Ordering::Relaxed); // NETSPLIT (B852) M3: `tests hda` keeps its FULL probe (reset + walk), even after a stream open
     probe();
-    TONE_NOW.store(false, core::sync::atomic::Ordering::Relaxed);
+    TONE_NOW.store(false, core::sync::atomic::Ordering::Relaxed); TONE_WALK.store(false, core::sync::atomic::Ordering::Relaxed);
 }
 
 // ===================== HDATONE5 — THE SCREECH SURVIVED THE RATE READBACK (boot 17) =====================
@@ -2683,7 +2683,7 @@ pub fn vol_readback() -> Option<(u8, bool, u8, u8)> {
 // Image 26's KVM boot (docs/dev/evidence/qemu-image26/serial.log): `[boot] phase=desktop … at=12737ms`, then
 // `[hda] probe deferred-start at=12960ms` and the whole codec walk, then `[desktop] built at=login ok bar_ms=425`
 // (12737 + 425 = 13162 ms) and `:: JOBSCAN: … bar_ms=425 … -> FAIL` (bound 200, `fs/jobs.rs`). `probe_after_root`
-// runs in the usb-pump's `net-hda` step and `desktopbuild::service` in its `desktop-app` step of the SAME loop
+// runs in the usb-pump's `hda` step (NETSPLIT B852; was `net-hda`) and `desktopbuild::service` in its `desktop-app` step of the SAME loop
 // (main.rs, the device-service pass), so the walk's ~200 ms sat inside the bar's first paint. The bring-up now
 // waits until `desktopbuild::settled()` (the desktop built and its first paint read back), bounded by JOBSCAN's
 // own fallback, `fs::jobs::BAR_WAIT_MS` after this gate first opened (the services' open): a desktop that never
@@ -2726,7 +2726,7 @@ fn bar_holds() -> bool {
 // [`own`] allocates it once per boot behind ONE lock, [`attach`] RE-ATTACHES to a pair running on its buffers (the
 // hardware's WP/RP are the truth; an orphan answer is drained and its latch acked) and programs only a pair that is
 // not running on them, and a verb's 100 ms bound (VERB_BOUND_US) latches a device stall every later verb fails fast
-// on until ONE probe verb answers (at most once per RETRY_MS). [`parked`] is net-hda's half of the pump's step park
+// on until ONE probe verb answers (at most once per RETRY_MS). [`parked`] is the hda step's half of the pump's step park (NETSPLIT B852: P_HDA, apart from `net`)
 // (sched.rs `singleton_step_parked`, HDARING M3). Blueprint: audio.md BP-audio-19, cores.md BP-cores-21.
 
 /// CHARTER: Stria — driver (HDARING, rmbp-ledger B811): the controller's ONE command/response ring pair, owned by the device for the boot.
@@ -2752,7 +2752,7 @@ pub mod ring {
 
     /// Take the device's pair, bounded by the verb bound (never an unbounded spin: a holder that does not come back —
     /// a revenant on a dead core — costs a caller 100 ms and a skip). Allocates the two buffers on the FIRST call only.
-    /// Touches no register.
+    /// Touches no register — except a POISONED take (the last holder died inside its hold): [`poisoned`] re-attaches.
     pub(super) fn own(base: u64) -> Option<Hold> {
         let start = crate::arch::now_cycles();
         let budget = cycles_us(VERB_BOUND_US);
@@ -2783,7 +2783,7 @@ pub mod ring {
             g.corb_wp = 0;
             g.rirb_rp = 0;
         }
-        Some(g)
+        if DEV.take_poison() { poisoned(&mut g); } Some(g) // NETSPLIT (B852) HDAPOISON: a holder that died inside its hold left the shadow WP/RP stale; re-attach before anyone issues
     }
 
     /// RE-ATTACH to the pair as the hardware holds it, or program it. Running on OUR buffers (CORBCTL.RUN,
@@ -2879,7 +2879,7 @@ pub mod ring {
     }
 
     /// GET_PARAMETER VENDOR_ID on the root node of the captured codec.
-    fn probe_word() -> u32 {
+    pub(super) fn probe_word() -> u32 {
         let cad = vol::CAD.load(Relaxed) & 0xF;
         (cad << 28) | (VERB_GET_PARAMETER << 8) | PARAM_VENDOR_ID
     }
@@ -2895,25 +2895,25 @@ pub mod ring {
         g.issue(probe_word(), &mut a)
     }
 
-    /// PUMPPARK (B839) M2 — net-hda's unpark probe: ONE probe verb ([`probe_verb`]) answered. The pump loop's gate
+    /// PUMPPARK (B839) M2 — hda's unpark probe (NETSPLIT B852: its own step): ONE probe verb ([`probe_verb`]) answered. The pump loop's gate
     /// (sched.rs `singleton_step_go`) runs it at the park's `until`.
     fn probe_answers() -> bool {
         probe_verb().is_some()
     }
 
-    /// HDARING M3, PUMPPARK (B839) M2 — registers net-hda's probe ([`probe_answers`]) once; the pump loop parks the
+    /// HDARING M3, PUMPPARK (B839) M2 — registers the hda step's probe ([`probe_answers`]) once; the pump loop parks the
     /// whole step (sched.rs `singleton_step_go`), so this only honours a park that landed between that gate and here:
     /// `true` = return now (off the pump).
     pub(super) fn parked() -> bool {
-        use crate::video::lag::P_NET;
+        use crate::video::lag::P_HDA;
         static REG: AtomicBool = AtomicBool::new(false);
         if !REG.swap(true, Relaxed) {
-            crate::arch::sched::singleton_step_probe(P_NET, probe_answers);
+            crate::arch::sched::singleton_step_probe(P_HDA, probe_answers);
         }
-        crate::arch::sched::singleton_step_parked(P_NET).is_some()
+        crate::arch::sched::singleton_step_parked(P_HDA).is_some()
     }
 
-    // ── `tests gatesteal2` LEG 3 (sched.rs): the pump killed with a verb in flight inside net-hda ──────────────────
+    // ── `tests gatesteal2` LEG 3 (sched.rs): the pump killed with a verb in flight inside the hda step ──────────────────
     /// 0 idle, 1 post-and-park armed, 2 the fresh instance's check armed.
     static LEG: AtomicU8 = AtomicU8::new(0);
     /// 0 none, 1 the check's verb answered, 2 it did not.
@@ -2924,7 +2924,7 @@ pub mod ring {
 
     /// The leg's park point (top of `probe_after_root`, idle = one load). Armed 1: the singleton takes the pair,
     /// POSTS GET_PARAMETER REVISION_ID and lets the pair go WITHOUT its answer (the verb in flight), then parks
-    /// (`singleton_hold_in(P_NET)`). Armed 2: the restarted pump takes the pair (a RE-ATTACH that must drain the
+    /// (`singleton_hold_in(P_HDA)`). Armed 2: the restarted pump takes the pair (a RE-ATTACH that must drain the
     /// orphan) and asks GET_PARAMETER VENDOR_ID.
     pub(super) fn leg_maybe() {
         match LEG.load(Acquire) {
@@ -2941,7 +2941,7 @@ pub mod ring {
                         g.post((cad << 28) | (VERB_GET_PARAMETER << 8) | PARAM_REVISION_ID, &mut a);
                     }
                 }
-                crate::arch::sched::singleton_hold_in(crate::video::lag::P_NET);
+                crate::arch::sched::singleton_hold_in(crate::video::lag::P_HDA);
             }
             2 => {
                 if LEG.compare_exchange(2, 0, AcqRel, Relaxed).is_err() {
@@ -2984,4 +2984,129 @@ pub mod ring {
         let ok = done == 1 && reat >= 1 && drained >= 1 && v != 0 && v != u32::MAX && v != DRAINED_LAST.load(Relaxed);
         (done == 1, ok, drained, v)
     }
+
+    // ── NETSPLIT (rmbp-ledger B852) HDAPOISON: `DEV`'s poison checked at the take (STACKGUARD3's `take_poison`, sdhc
+    // `card_lock`'s shape). A holder force-released on its death (`release_task`) can leave a verb posted and the
+    // shadow CORB WP / RIRB RP behind the hardware; the recovery is HDARING's own [`attach`] (re-read CORBWP/RIRBWP,
+    // drain the orphan, ack RIRBSTS — or a program on the same buffers). A controller in reset is left to its caller's
+    // reset/bring-up, which programs the pair anyway.
+    fn poisoned(g: &mut Rings) {
+        if g.corb == 0 || g.base == 0 {
+            serial_println!("[hda] ring poisoned -> recovered=none (no pair) (NETSPLIT B852 HDAPOISON)");
+            return;
+        }
+        if r32(g.base, REG_GCTL) & GCTL_CRST == 0 {
+            serial_println!("[hda] ring poisoned -> recovered=reset (controller in reset: the caller's bring-up programs the pair) (NETSPLIT B852 HDAPOISON)");
+            return;
+        }
+        let d0 = DRAINED.load(Relaxed);
+        let mut a = Audit::default();
+        let ok = attach(g, &mut a);
+        serial_println!(
+            "[hda] ring poisoned -> reattached ok={} drained={} stalled={} (NETSPLIT B852 HDAPOISON: DEV's last holder died inside its hold)",
+            ok as u8, DRAINED.load(Relaxed).wrapping_sub(d0), STALLED.load(Acquire) as u8
+        );
+    }
+}
+
+// ── NETSPLIT (rmbp-ledger B852) M3: a WARM stream open re-attaches instead of re-probing ─────────────────────────────
+// `play::start` (hda_play.rs, AUDIOSINK's file, untouched) sets TONE_NOW and calls `probe()`: a full probe — rings, reset,
+// bring-up, walk every codec, then `run_tone` -> `play::gate` -> `stream::rearm`. The rule, decided HERE (probe's head):
+// RE-ATTACH iff (1) the call is a stream open (TONE_NOW && !TONE_WALK: `tests hda` sets TONE_WALK and keeps its full
+// probe, so a `tests hda` after a stream open still resets and walks — the fixture never hides a cold-walk regression);
+// (2) a full probe this boot kept a walk with an output path ([`WALKED`]); (3) `amp::warm(base)` — the amp HELD on that
+// controller with the link out of reset, the exact predicate under which `reset()` already skips CRST, so this never
+// removes a reset the full probe would have done; (4) `ring::hold` takes the pair (re-attach or reprogram + the stall
+// gate); (5) the codec answers VENDOR_ID with the kept vendor. Then `run_tone` on the kept walk (its `play::gate` resets
+// and programs the stream) and `rings.stop`, as probe's end. Otherwise the full probe runs, and says why.
+// LOCKS: [`WALKED`] is a LEAF — written by `walk_keep` under `ring::DEV` (inside probe), read by `start_reattach` ALONE
+// (copied out and dropped before `ring::hold`). Never DEV under WALKED; nothing under WALKED but the heap.
+#[cfg(feature = "hda-tone")]
+static TONE_WALK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "hda-tone")]
+struct Walked {
+    base: u64,
+    iss: u8,
+    vendor: u32,
+    walk: CodecWalk,
+    ws: alloc::boxed::Box<[Widget; MAX_NODES]>,
+}
+#[cfg(feature = "hda-tone")]
+static WALKED: crate::sync::Mutex<Option<Walked>> = crate::sync::Mutex::new(None);
+#[cfg(feature = "hda-tone")]
+static START_REATTACH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "hda-tone")]
+static START_WALK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// probe's end (the capture line): keep the walk that found an output path, with the codec's VENDOR_ID as its witness;
+/// no path (or no answer) forgets any kept walk. `rings` is held (DEV -> WALKED).
+#[cfg(feature = "hda-tone")]
+fn walk_keep(base: u64, iss: u8, walk: Option<&CodecWalk>, ws: &[Widget; MAX_NODES], rings: &mut Rings, a: &mut Audit) {
+    let vendor = match walk.filter(|w| w.path.is_some()) {
+        Some(w) => rings.cmd(w.cad, 0, VERB_GET_PARAMETER, PARAM_VENDOR_ID, a).map(|v| (*w, v)),
+        None => None,
+    };
+    let Some((w, vendor)) = vendor else {
+        *WALKED.lock() = None;
+        return;
+    };
+    let mut k = WALKED.lock();
+    match k.as_mut() {
+        Some(kept) => {
+            kept.ws.copy_from_slice(&ws[..]);
+            (kept.base, kept.iss, kept.vendor, kept.walk) = (base, iss, vendor, w);
+        }
+        None => {
+            let mut b: alloc::boxed::Box<[Widget; MAX_NODES]> = alloc::boxed::Box::new([Widget::default(); MAX_NODES]);
+            b.copy_from_slice(&ws[..]);
+            *k = Some(Walked { base, iss, vendor, walk: w, ws: b });
+        }
+    }
+}
+
+/// probe's head. `true` = the stream open was served by a re-attach (probe returns); `false` = run the full probe.
+#[cfg(feature = "hda-tone")]
+fn start_reattach() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !TONE_NOW.load(Relaxed) || TONE_WALK.load(Relaxed) {
+        return false; // the boot probe, `tests hda`: the full probe, nothing said
+    }
+    let t0 = crate::arch::ms();
+    let mut ws: alloc::boxed::Box<[Widget; MAX_NODES]> = alloc::boxed::Box::new([Widget::default(); MAX_NODES]);
+    let kept = {
+        let k = WALKED.lock();
+        k.as_ref().map(|k| {
+            ws.copy_from_slice(&k.ws[..]);
+            (k.base, k.iss, k.vendor, k.walk)
+        })
+    }; // WALKED dropped here, before the pair is taken
+    let why = 'w: {
+        let Some((base, iss, vendor, walk)) = kept else { break 'w "no-walk" };
+        if amp::warm(base).is_none() {
+            break 'w "amp-cold";
+        }
+        let mut a = Audit::default();
+        let Some(mut g) = ring::hold(base, &mut a) else { break 'w "rings" };
+        if g.issue(ring::probe_word(), &mut a) != Some(vendor) {
+            break 'w "codec";
+        }
+        run_tone(base, &mut g, iss, Some(&walk), &ws, &mut a);
+        g.stop(&mut a);
+        START_REATTACH.fetch_add(1, Relaxed);
+        serial_println!(
+            "[hda] start reattach=1 walk=0 ms={} vendor={:#010x} (NETSPLIT B852 M3: warm amp, kept walk, no CRST, no re-walk)",
+            crate::arch::ms().saturating_sub(t0), vendor
+        );
+        return true;
+    };
+    START_WALK.fetch_add(1, Relaxed);
+    serial_println!("[hda] start reattach=0 walk=1 why={} (NETSPLIT B852 M3: the full probe runs)", why);
+    false
+}
+
+/// `(re-attached stream opens, fully probed stream opens)` since boot (`tests sinkall`'s start leg reads the deltas).
+#[cfg(feature = "hda-tone")]
+pub fn start_counts() -> (u32, u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (START_REATTACH.load(Relaxed), START_WALK.load(Relaxed))
 }

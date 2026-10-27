@@ -8675,18 +8675,18 @@ fn gatesteal2_selftest() {
 }
 
 /// HDARING (B811) — `tests gatesteal2` LEG 3: `(Some(pass) | None = skip, "hdaring=<ok|fail|skip(<why>)> reattach=<ok|fail|skip>
-/// drained=<n> parked=<0|1> vendor=<hex>")`. Runs inside leg 2's wedge window (`gatesteal2_wedge_leg(true)`). Go-red by
+/// drained=<n> parked=<0|1> hda_step=<own|step> net_parked=<0|1> vendor=<hex>")` (NETSPLIT B852: the step is `hda`). Runs inside leg 2's wedge window (`gatesteal2_wedge_leg(true)`). Go-red by
 /// mutation: `hda::ring::attach` without the WP/RP re-read -> the VENDOR_ID verb reads the orphan -> `reattach=fail`.
 #[cfg(all(feature = "wc", feature = "hda"))]
 fn gatesteal2_hdaring_leg() -> (Option<bool>, alloc::string::String) {
     use crate::drivers::hda::ring;
-    let p_net = crate::video::lag::P_NET;
+    let p_hda = crate::video::lag::P_HDA; // NETSPLIT (B852): HDA's park point is its own step now (was P_NET, the shared net-hda step)
     if !ring::leg_ready() {
         return (None, alloc::string::String::from("hdaring=skip(no-codec) reattach=skip drained=0 parked=0"));
     }
     let restarts0 = SGL_RESTARTS.load(Ordering::Acquire);
     let rev0 = SGL_REVENANTS.load(Ordering::Acquire);
-    HOLD2_AT.store(p_net, Ordering::Release);
+    HOLD2_AT.store(p_hda, Ordering::Release);
     HOLD2_STATE.store(0, Ordering::Release);
     ring::leg_arm();
     HOLD2_ARMED.store(true, Ordering::Release);
@@ -8707,20 +8707,20 @@ fn gatesteal2_hdaring_leg() -> (Option<bool>, alloc::string::String) {
     }
     let revenant = held && hold2_wait(1_500, || SGL_REVENANTS.load(Ordering::Acquire) != rev0);
     HOLD2_AT.store(0, Ordering::Release);
-    let (_, reattach, drained, vendor) = ring::leg_result();
-    let parked = singleton_step_parked(p_net).is_some();
-    let ok = held && restarted && checked && reattach && revenant && !parked;
-    let why = if !held { "unparked" } else if !restarted { "no-restart" } else if !checked { "no-answer" } else if !revenant { "revenant-stuck" } else { "" };
+    let (_, reattach, drained, vendor) = ring::leg_result(); let dstep = SGL_DEATH_STEP.load(Ordering::Acquire); let net_parked = singleton_step_parked(crate::video::lag::P_NET).is_some(); // NETSPLIT (B852): the death counted in `hda`, and `net` never parked for it
+    let parked = singleton_step_parked(p_hda).is_some();
+    let ok = held && restarted && checked && reattach && revenant && !parked && dstep == p_hda && !net_parked;
+    let why = if !held { "unparked" } else if !restarted { "no-restart" } else if !checked { "no-answer" } else if !revenant { "revenant-stuck" } else if dstep != p_hda { "death-not-in-hda" } else if net_parked { "net-parked" } else { "" };
     (
         Some(ok),
         alloc::format!(
-            "hdaring={}{}{} reattach={} drained={} parked={} vendor={:#010x}",
+            "hdaring={}{}{} reattach={} drained={} parked={} hda_step={} net_parked={} vendor={:#010x}",
             if ok { "ok" } else { "fail" },
             if why.is_empty() { "" } else { "/" },
             why,
             if reattach { "ok" } else { "fail" },
             drained,
-            parked as u8,
+            parked as u8, if dstep == p_hda { "own" } else { crate::video::lag::qs_step_name(dstep) }, net_parked as u8,
             vendor
         ),
     )
