@@ -11,9 +11,9 @@
 // by the clock is decoded and dropped unconverted), straight from the decoder's planes into the window's video rect:
 // letterboxed, nearest-sampled, never a full-size RGBA copy (the rect is at most 288 x 260). H.264 reorders: its
 // pictures carry their own presentation time (`set_tag`). USERSTRIACOLOURONE (SR363): the private BT.601 table retired
-// onto yuv_core, the kernel Player's and host Stria's ONE converter — scale THEN convert: `nearest_row` (the scaler)
-// gathers one output row's sampled Y / Cb / Cr as a 4:4:4 row, and ONE `yuv_core::to_rgba` (Chroma::Nearest) converts
-// it with `yuv_core::pick` of the track's colour (`Track::colour`, the container's statement; else the size default).
+// onto yuv_core, the kernel Player's and host Stria's ONE converter — scale THEN convert: `yuv_core::scale::nearest_rows`
+// (the scaler, KERNELSCALEONE B965) gathers each output row's sampled Y / Cb / Cr as a 4:4:4 row, and ONE `yuv_core::to_rgba`
+// (Chroma::Nearest) converts it with `yuv_core::pick` of the track's colour (`Track::colour`, the container's statement; else the size default).
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -64,59 +64,29 @@ fn planes<'a, T>(y: &'a [T], u: &'a [T], v: &'a [T], y_stride: usize, uv_stride:
 
 const OPAQUE: u32 = 0xFF00_0000;
 
-/// The letterbox: the `dw x dh` rect of a `w x h` picture inside `ow x oh`, aspect kept, at `(ox, oy)`.
-fn fit(w: usize, h: usize, ow: usize, oh: usize) -> (usize, usize, usize, usize) {
-    let (dw, dh) = if ow * h <= oh * w { (ow, (h * ow / w).clamp(1, oh)) } else { ((w * oh / h).clamp(1, ow), oh) };
-    (dw, dh, (ow - dw) / 2, (oh - dh) / 2)
-}
-
-/// Every sample [`nearest_row`] can read lies inside the planes.
-fn fits<T>(p: &yuv_core::Picture<'_, T>) -> bool {
-    let (cw, ch) = ((p.w + p.ss.0 as usize) >> p.ss.0, (p.h + p.ss.1 as usize) >> p.ss.1);
-    p.y.len() >= (p.h - 1) * p.y_stride + p.w && (p.mono || p.u.len().min(p.v.len()) >= (ch - 1) * p.uv_stride + cw)
-}
-
-/// THE SCALER (nearest): source row `sy` sampled at `dw` columns (`c * w / dw`) into a 4:4:4 row — each output pixel's
-/// luma and the chroma sample that covers it (what `Chroma::Nearest` reads at that luma position).
-fn nearest_row<T: Copy>(p: &yuv_core::Picture<'_, T>, sy: usize, dw: usize, ry: &mut Vec<T>, ru: &mut Vec<T>, rv: &mut Vec<T>) {
-    ry.clear();
-    ru.clear();
-    rv.clear();
-    let (yrow, crow) = (sy * p.y_stride, (sy >> p.ss.1) * p.uv_stride);
-    for c in 0..dw {
-        let sx = (c * p.w / dw).min(p.w - 1);
-        ry.push(p.y[yrow + sx]);
-        if !p.mono {
-            let ci = crow + (sx >> p.ss.0);
-            ru.push(p.u[ci]);
-            rv.push(p.v[ci]);
-        }
-    }
-}
-
-/// `p` into the `ow x oh` rect `out` (0RGB): letterboxed with black bars, each output row [`nearest_row`]-sampled, then
-/// ONE `yuv_core::to_rgba` over that row with the pick of `colour` at the picture's size (the kernel Player's pick).
+/// `p` into the `ow x oh` rect `out` (0RGB): letterboxed with black bars, each output row sampled by yuv_core's ONE
+/// resampler (`yuv_core::scale::nearest_rows`, KERNELSCALEONE B965, the kernel Player's `blit_fit` too), then ONE
+/// `yuv_core::to_rgba` over that row with the pick of `colour` at the picture's size (the kernel Player's pick).
 /// Bit for bit a full-size `to_rgba` (Chroma::Nearest) then nearest-sampled, at `dw x dh` conversions.
 fn scale_then_convert<T: Copy + Into<i32>>(p: &yuv_core::Picture<'_, T>, colour: Option<Colour>, out: &mut [u32], ow: usize, oh: usize) {
     out.fill(OPAQUE);
-    if p.w == 0 || p.h == 0 || ow == 0 || oh == 0 || !fits(p) {
+    if p.w == 0 || p.h == 0 || ow == 0 || oh == 0 || !yuv_core::scale::fits(p) {
         return;
     }
     let (m, full) = yuv_core::pick(colour.map(|c| c.matrix), colour.and_then(|c| c.full_range), p.w as u32, p.h as u32);
-    let (dw, dh, ox, oy) = fit(p.w, p.h, ow, oh);
-    let (mut ry, mut ru, mut rv) = (Vec::with_capacity(dw), Vec::with_capacity(dw), Vec::with_capacity(dw));
+    let fr = yuv_core::scale::fit(p.w, p.h, ow, oh);
+    let (dw, ox, oy) = (fr.w, fr.x, fr.y);
+    let (mut ry, mut ru, mut rv) = (alloc::vec![p.y[0]; dw], alloc::vec![p.y[0]; dw], alloc::vec![p.y[0]; dw]);
     let mut rgba = alloc::vec![0u8; dw * 4];
-    for r in 0..dh {
-        nearest_row(p, (r * p.h / dh).min(p.h - 1), dw, &mut ry, &mut ru, &mut rv);
-        let row = yuv_core::Picture { w: dw, h: 1, y: &ry[..], u: &ru[..], v: &rv[..], y_stride: dw, uv_stride: dw, ss: (0, 0), full, ..*p };
-        yuv_core::to_rgba(&row, m, yuv_core::Chroma::Nearest, false, &mut rgba);
+    yuv_core::scale::nearest_rows(p, dw, fr.h, &mut ry, &mut ru, &mut rv, |r, s| {
+        yuv_core::to_rgba(&yuv_core::Picture { full, ..*s }, m, yuv_core::Chroma::Nearest, false, &mut rgba);
         let orow = (oy + r) * ow + ox;
         if let Some(o) = out.get_mut(orow..orow + dw) {
             for (px, c) in o.iter_mut().zip(rgba.chunks_exact(4)) {
                 *px = OPAQUE | (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
             }
         }
-    }
+    });
 }
 
 /// The picture decoders (the shared cores, one enum — vplay.rs `Pic` with the host registry's VP9 and H.264).
