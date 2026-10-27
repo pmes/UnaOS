@@ -3475,8 +3475,9 @@ mod tests {
     }
     /// AETHERSCALE (SR190): the header's metrics (`chrome::scale`, the bytes AETHER.ELF links by `#[path]`) at each text
     /// step of the font-size schema — today's heights at and below the default, every band holding the face's line,
-    /// the page keeping lines on the 288 px surface, the menu fitted inside the window with its face held to its row;
-    /// and the first font size whose header would leave no page line, found and asserted past the schema's 32.
+    /// the page keeping lines on the 288 px surface, the menu fitted inside the window (AETHERBAR SR192: its grown row
+    /// kept and its rows on view counted, the face no longer held); and the first font size whose header would leave
+    /// no page line, found and asserted past the schema's 32.
     #[test]
     fn aetherscale_header_reflows_kat() {
         use crate::chrome::scale::{self, Metrics};
@@ -3512,20 +3513,114 @@ mod tests {
             // The menu at a full 288 window, under the top layout's header.
             let mu = m.menu(face, MENU_ROWS, MENU_PAD, m.chrome_h(), scale::SURFACE_H);
             assert!(mu.y >= 2, "css {css}: menu top inside");
-            assert!(mu.y + MENU_ROWS * mu.row + 2 * MENU_PAD <= scale::SURFACE_H, "css {css}: menu foot inside");
+            assert!(mu.y + mu.vis * mu.row + 2 * MENU_PAD <= scale::SURFACE_H, "css {css}: menu foot inside");
+            assert!(mu.vis >= 1 && mu.vis <= MENU_ROWS && mu.row == m.menu_row, "css {css}: the grown row, its rows on view");
             assert!(scale::line(mu.face) <= mu.row, "css {css}: a menu row holds its face");
             if css == DEFAULT {
-                assert_eq!((mu.y, mu.row, mu.face), (58, 22, scale::FACE_BASE), "the default menu is today's");
+                assert_eq!((mu.y, mu.row, mu.face, mu.vis), (58, 22, scale::FACE_BASE, MENU_ROWS), "the default menu is today's");
             }
         }
-        // The surface-derived cap: largest (26) holds the menu at 27 px rows and a 21.6 px face.
+        // AETHERBAR (SR192): the surface cap is gone — largest (26) keeps its 36 px rows and its own face, 7 rows on
+        // view on the 288 window (the menu scrolls).
         let (face, m) = at(26);
         let mu = m.menu(face, MENU_ROWS, MENU_PAD, m.chrome_h(), scale::SURFACE_H);
-        assert_eq!(mu.row, 27);
-        assert!((mu.face - 21.6).abs() < 1e-3 && face > mu.face, "largest: the menu face is held ({face} -> {})", mu.face);
+        assert_eq!((mu.row, mu.vis, mu.y), (36, 7, 26), "largest: the grown row, 7 on view, lifted");
+        assert_eq!(mu.face, face, "largest: the menu face is the chrome's");
         // The first font size whose header and status line would leave less than one page line on the surface.
         let first = (9..=200).find(|&css| at(css).1.content_h(scale::SURFACE_H) < scale::PAGE_LINE).unwrap();
         assert_eq!(first, 77, "the header bound sits at css 77");
         assert!(first > 32, "no schema step (9..=32) breaks the header bound");
+    }
+
+    /// AETHERBAR (SR192): the toolbar's optional controls by one rule of `ctl` (`scale::Metrics::bar`), the side
+    /// column's row grown from the face's line (`sidetabs::row_h`, read by the layout and the hit test), and the menu
+    /// (its rows on view and its width bounds) at css 9 / 13 / 32 on 288 x 288 and 1280 x 800 windows.
+    #[test]
+    fn aetherbar_fit_kat() {
+        use crate::chrome::scale::{self, Metrics};
+        use crate::chrome::sidetabs::{self, SideHit, SideStrip};
+        use crate::chrome::tabs::{Row, TabStrip};
+        const DEFAULT: i32 = 13;
+        const MENU_PAD: i32 = 4;
+        let at = |css: i32| (scale::face_for(css, DEFAULT), Metrics::at(scale::face_for(css, DEFAULT)));
+        // M1: the thresholds. (css, bar width, reload, star, zoom): 288 the top layout, 192 / 240 the side column open /
+        // railed on 288, 1280 / 1040 the same on the wide window.
+        let bars = [
+            (9, 288, true, true, false),
+            (13, 288, true, true, false),
+            (13, 192, true, false, false),
+            (13, 1280, true, true, true),
+            (32, 288, true, true, false),
+            (32, 240, true, false, false),
+            (32, 192, false, false, false),
+            (32, 1040, true, true, true),
+        ];
+        for &(css, bw, reload, star, zoom) in &bars {
+            let (_, m) = at(css);
+            let b = m.bar(bw);
+            assert_eq!((b.reload, b.star, b.zoom), (reload, star, zoom), "css {css} bw {bw}: the bar's controls");
+            // The omnibox keeps OMNI_MIN beside what the bar carries, whenever Back + Fwd + the menu fit at all.
+            let (left, right) = (2 + b.reload as i32, 1 + b.star as i32 + 2 * b.zoom as i32);
+            if bw >= scale::bar_need(m.ctl, 2, 1) {
+                assert!(bw >= scale::bar_need(m.ctl, left, right), "css {css} bw {bw}: the omnibox overlaps");
+            }
+        }
+        let (_, m) = at(DEFAULT);
+        assert_eq!((scale::bar_need(m.ctl, 3, 1), scale::bar_need(m.ctl, 3, 2), scale::bar_need(m.ctl, 3, 4)), (152, 178, 230), "the measured rule at ctl 22");
+        let (_, m) = at(32);
+        assert_eq!((m.ctl, scale::bar_need(m.ctl, 3, 1), scale::bar_need(m.ctl, 3, 2), scale::bar_need(m.ctl, 3, 4)), (42, 232, 278, 370), "css 32");
+        // M2: the side row grows from the face's line; the layout and the hit test read the same row.
+        for (css, row) in [(9, 32u32), (13, 32), (32, 52)] {
+            let (face, _) = at(css);
+            let line = scale::line(face);
+            assert_eq!(sidetabs::row_h(line), row, "css {css}: the side row");
+            assert!(sidetabs::row_h(line) as i32 >= line, "css {css}: a side row holds the face's line");
+        }
+        assert_eq!(sidetabs::row_h(0), sidetabs::ROW_H, "line 0 is the default row");
+        let mut s = TabStrip::new();
+        let ids: Vec<u64> = (0..12).map(|_| s.open()).collect();
+        let side = SideStrip { line: scale::line(at(32).0), ..SideStrip::default() };
+        let rh = side.row_h();
+        assert_eq!(rh, 52);
+        let h = 6 * rh;
+        let rows = side.layout(&s, h);
+        assert_eq!(rows[0].row, Row::Tab(ids[0]));
+        for (k, r) in rows.iter().enumerate() {
+            assert_eq!(r.y, (k as u32 + 1) as i32 * rh as i32, "row {k} at its grown top");
+        }
+        assert_eq!(side.hit_w(&s, 240, h, 10, rh as i32 - 1), Some(SideHit::Toggle), "the toggle row is a grown row");
+        assert_eq!(side.hit_w(&s, 240, h, 10, rh as i32 + 5), Some(SideHit::Tab(ids[0])));
+        assert_eq!(side.hit_w(&s, 240, h, 10, 2 * rh as i32 + 5), Some(SideHit::Tab(ids[1])));
+        assert_eq!(side.max_scroll_at(&s, h), (13 - 5) * rh as i32, "13 rows (12 tabs + `+`) in 5 of room");
+        assert_eq!(SideStrip::max_scroll(&s, h), (13 * 32 - (h as i32 - 32)).max(0), "the default-face API keeps 32 px rows");
+        // M3: the menu at each step on both windows (top layout: the page under the whole header).
+        // (css, win_w, win_h, row, vis, y)
+        let menus = [
+            (9, 288, 288, 22, 10, 58),
+            (13, 288, 288, 22, 10, 58),
+            (32, 288, 288, 42, 6, 26),
+            (9, 1280, 800, 22, 10, 58),
+            (13, 1280, 800, 22, 10, 58),
+            (32, 1280, 800, 42, 10, 98),
+        ];
+        for &(css, win_w, win_h, row, vis, y) in &menus {
+            let (face, m) = at(css);
+            let rows = 10 + !m.bar(win_w).reload as i32;
+            let mu = m.menu(face, rows, MENU_PAD, m.chrome_h(), win_h);
+            assert_eq!((mu.row, mu.vis, mu.y), (row, vis, y), "css {css} {win_w}x{win_h}: the menu");
+            assert_eq!(mu.face, face, "css {css} {win_w}x{win_h}: the face is the chrome's (no cap)");
+            assert!(mu.y >= 2 && mu.y + mu.vis * mu.row + 2 * MENU_PAD <= win_h - 2, "css {css} {win_w}x{win_h}: inside");
+            assert!(scale::line(mu.face) <= mu.row, "css {css}: a row holds its face");
+            assert!(scale::menu_w(10_000, win_w) <= win_w - 2 * scale::BAR_EDGE, "css {css}: the width is bounded by the window");
+        }
+        assert_eq!(scale::menu_w(0, 288), scale::MENU_W, "an unmeasured menu is SR143's width");
+        assert_eq!(scale::menu_w(100, 1280), 176);
+        assert_eq!(scale::menu_w(300, 1280), 300, "the widest label sets the width");
+        assert_eq!(scale::menu_w(400, 288), 272, "bounded by the window");
+        // One row that cannot fit: the row and the face are held (the one cap left).
+        let (face, m) = at(32);
+        let mu = m.menu(face, 10, MENU_PAD, 0, 40);
+        assert_eq!((mu.row, mu.vis), (28, 1));
+        assert!(mu.face < face && scale::line(mu.face) <= mu.row);
     }
 }

@@ -115,7 +115,7 @@ pub mod downloads;
 #[path = "../../../../handlers/aether/src/chrome/zoom.rs"]
 pub mod zoom;
 // AETHERSIDETABS2 (SR143): the side column's geometry, the layout pref and the favicon tile (std-free; names only
-// `super::tabs`).
+// `super::tabs` and, AETHERBAR SR192, `super::scale` for the grown row).
 #[allow(dead_code, unused_imports)]
 #[path = "../../../../handlers/aether/src/chrome/sidetabs.rs"]
 pub mod sidetabs;
@@ -135,8 +135,8 @@ pub fn chrome_h() -> i32 { metrics().chrome_h() }
 const FONT_BASE: f32 = scale::FACE_BASE;
 const FONT_SMALL_BASE: f32 = 9.5;
 /// The header's inset from the window's left and right edges, and the gap between neighbouring controls.
-const EDGE: i32 = 8;
-const GAP: i32 = 4;
+const EDGE: i32 = scale::BAR_EDGE;
+const GAP: i32 = scale::BAR_GAP;
 /// A tab: the air above it in the strip, its width range, its top corners' radius, its inner padding (both sides).
 const TAB_TOP: i32 = 4;
 const TAB_MIN_W: i32 = 40;
@@ -164,16 +164,13 @@ const GLYPH: f32 = 4.0;
 const STROKE: f32 = 1.5;
 /// Where the toolbar's controls stand in the bar (their top edge below the bar's top; `Chrome::bar_y`).
 fn bar_inset() -> i32 { (bar_h() - ctl()) / 2 }
-/// AETHERSIDETABS2 (SR143): the narrowest bar that still carries the zoom buttons, and the star (else they are only
-/// in the menu).
-const BAR_ZOOM_MIN: i32 = 360;
-const BAR_STAR_MIN: i32 = 220;
-/// The menu: its width, one row's height, its inner padding, its radius, and its rows.
-const MENU_W: i32 = 176;
+/// The menu: one row's height, its inner padding, its radius, and its rows (its width is the widest row's, at least
+/// `scale::MENU_W`: `menu_need`; AETHERBAR SR192: the bar's optional controls follow `scale::Metrics::bar`, and the
+/// last row, Reload, is listed only when the bar lacks it: `Chrome::menu_n`).
 fn menu_row(ch: &Chrome) -> i32 { ch.menu_m().row }
 const MENU_PAD: i32 = 4;
 const MENU_R: i32 = 8;
-const MENU: [(&str, &str); 10] = [
+const MENU: [(&str, &str); 11] = [
     ("New tab", "Ctrl+T"),
     ("Bookmark this page", "Ctrl+D"),
     ("Bookmarks and history", ""),
@@ -184,6 +181,7 @@ const MENU: [(&str, &str); 10] = [
     ("Actual size", "Ctrl+0"),
     ("Close tab", "Ctrl+W"),
     ("Settings", ""),
+    ("Reload", ""),
 ];
 /// The side column's favicon / letter tile (the model's `FAVICON_PX`) and the group's colour dot.
 const SIDE_TILE: i32 = sidetabs::FAVICON_PX as i32;
@@ -261,6 +259,10 @@ pub struct Chrome {
     side: SideStrip,
     menu: bool,
     icons: Vec<(u64, Vec<u8>)>,
+    /// AETHERBAR (SR192): the open menu's first row on view (it scrolls when the window holds fewer than its rows) and
+    /// its widest row measured at the face (`menu_need`; 0 = `scale::MENU_W`).
+    menu_top: usize,
+    menu_w: Cell<i32>,
 }
 
 impl Chrome {
@@ -288,6 +290,8 @@ impl Chrome {
             side: SideStrip::default(),
             menu: false,
             icons: Vec::new(),
+            menu_top: 0,
+            menu_w: Cell::new(0),
         }
     }
 
@@ -337,8 +341,8 @@ impl Chrome {
 
     /// The open menu's rectangle (x, y, w, h), under the menu button's right edge.
     fn menu_rect(&self) -> (i32, i32, i32, i32) {
-        let (w, m) = (MENU_W.min(self.pw - 2 * EDGE), self.menu_m());
-        let h = MENU.len() as i32 * m.row + 2 * MENU_PAD;
+        let (w, m) = (scale::menu_w(self.menu_w.get(), self.pw), self.menu_m());
+        let h = m.vis * m.row + 2 * MENU_PAD;
         (self.pw - EDGE - w, m.y, w, h)
     }
 
@@ -725,6 +729,7 @@ fn reload(app: &mut App, page: &mut Page, fonts: &mut Fonts) {
 fn menu_item(app: &mut App, page: &mut Page, fonts: &mut Fonts, i: usize) {
     app.ch.menu = false;
     app.dirty = true;
+    app.ch.menu_top = 0;
     match i {
         0 => new_tab(app, page, fonts),
         1 => bookmark(app, page),
@@ -742,7 +747,9 @@ fn menu_item(app: &mut App, page: &mut Page, fonts: &mut Fonts, i: usize) {
         6 => zoom_step(app, -1),
         7 => zoom_step(app, 0),
         8 => close_tab(app, page, fonts),
-        _ => app.flash(alloc::format!("settings: Principia {} = {}, aether.search", LAYOUT_PREF, app.ch.layout.as_str())),
+        9 => app.flash(alloc::format!("settings: Principia {} = {}, aether.search", LAYOUT_PREF, app.ch.layout.as_str())),
+        10 => reload(app, page, fonts),
+        _ => {}
     }
     let mut l = Line::new(b":: AETHER: menu -> PASS item=");
     l.put(MENU.get(i).map_or(b"none" as &[u8], |m| m.0.as_bytes())).put(b" ::");
@@ -999,7 +1006,7 @@ struct Geo {
     plus: (i32, i32),
     back: (i32, i32),
     fwd: (i32, i32),
-    reload: (i32, i32),
+    reload: Option<(i32, i32)>,
     omni: (i32, i32),
     star: Option<(i32, i32)>,
     zout: Option<(i32, i32)>,
@@ -1023,9 +1030,10 @@ fn geo(ch: &Chrome) -> Geo {
     };
     let x0 = ch.page_x();
     let bw = w - x0;
+    let b = metrics().bar(bw); // AETHERBAR (SR192): the optional controls this bar carries at this face
     let menu = w - EDGE - ctl();
     let mut r = menu - GAP;
-    let (zout, zin) = if bw >= BAR_ZOOM_MIN {
+    let (zout, zin) = if b.zoom {
         let zin = r - ctl();
         let zout = zin - GAP - ctl();
         r = zout - GAP;
@@ -1033,7 +1041,7 @@ fn geo(ch: &Chrome) -> Geo {
     } else {
         (None, None)
     };
-    let star = if bw >= BAR_STAR_MIN {
+    let star = if b.star {
         r -= ctl();
         let s = r;
         r -= GAP;
@@ -1043,15 +1051,15 @@ fn geo(ch: &Chrome) -> Geo {
     };
     let back = x0 + EDGE;
     let fwd = back + ctl() + GAP;
-    let reload = fwd + ctl() + GAP;
-    let omni = reload + ctl() + EDGE;
+    let reload = b.reload.then_some((fwd + ctl() + GAP, ctl()));
+    let omni = reload.map_or(fwd, |r| r.0) + ctl() + EDGE;
     Geo {
         tabs,
         plus,
         back: (back, ctl()),
         fwd: (fwd, ctl()),
-        reload: (reload, ctl()),
-        omni: (omni, (r + GAP - EDGE - omni).max(24)),
+        reload,
+        omni: (omni, (r + GAP - EDGE - omni).max(scale::OMNI_MIN)),
         star,
         zout,
         zin,
@@ -1074,7 +1082,8 @@ fn hit(ch: &Chrome, x: i32, y: i32) -> Hot {
         let (mx, my, mw, mh) = ch.menu_rect();
         if x >= mx && x < mx + mw && y >= my && y < my + mh {
             let k = (y - my - MENU_PAD).div_euclid(menu_row(ch));
-            return if k >= 0 && (k as usize) < MENU.len() { Hot::MenuItem(k as usize) } else { Hot::None };
+            let i = ch.menu_top + k.max(0) as usize; // AETHERBAR: the rows on view start at the scroll
+            return if k >= 0 && k < ch.menu_m().vis && i < ch.menu_n() { Hot::MenuItem(i) } else { Hot::None };
         }
     }
     if y < 0 || y >= ch.ph || x < 0 || x >= ch.pw {
@@ -1106,8 +1115,8 @@ fn hit(ch: &Chrome, x: i32, y: i32) -> Hot {
     if y < by || y >= by + ctl() {
         return Hot::None;
     }
-    let opt = [(g.star, Hot::Star), (g.zout, Hot::ZoomOut), (g.zin, Hot::ZoomIn)];
-    for (r, h) in [(g.back, Hot::Back), (g.fwd, Hot::Fwd), (g.reload, Hot::Reload), (g.omni, Hot::Omni), (g.menu, Hot::Menu)]
+    let opt = [(g.reload, Hot::Reload), (g.star, Hot::Star), (g.zout, Hot::ZoomOut), (g.zin, Hot::ZoomIn)];
+    for (r, h) in [(g.back, Hot::Back), (g.fwd, Hot::Fwd), (g.omni, Hot::Omni), (g.menu, Hot::Menu)]
         .into_iter()
         .chain(opt.into_iter().filter_map(|(r, h)| r.map(|r| (r, h))))
     {
@@ -1152,7 +1161,7 @@ fn click(app: &mut App, page: &mut Page, fonts: &mut Fonts, h: Hot) {
         Hot::ZoomIn => zoom_step(app, 1),
         // AETHERSIDETABS2 (SR143): reload, the menu, and the side column.
         Hot::Reload => reload(app, page, fonts),
-        Hot::Menu => app.ch.menu = !app.ch.menu,
+        Hot::Menu => menu_toggle(&mut app.ch, fonts),
         Hot::MenuItem(i) => menu_item(app, page, fonts, i),
         Hot::Side(SideHit::Toggle) => {
             app.ch.side.toggle();
@@ -1173,6 +1182,13 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
     match input_ev_type(ev) {
         INPUT_EV_KEY_DOWN if app.ch.menu && p as u8 == KEY_ESC => {
             app.ch.menu = false; // AETHERSIDETABS2 (SR143): Esc closes the menu first
+            app.ch.menu_top = 0;
+            app.dirty = true;
+            None
+        }
+        // AETHERBAR (SR192): Up / Down scroll the open menu a row.
+        INPUT_EV_KEY_DOWN if app.ch.menu && matches!(p as u8, KEY_UP | KEY_DOWN) => {
+            menu_scroll(&mut app.ch, if p as u8 == KEY_UP { -1 } else { 1 });
             app.dirty = true;
             None
         }
@@ -1219,15 +1235,23 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
         INPUT_EV_WIN_RESIZE => {
             app.ch.pw = (((p >> 16) & 0xffff) as i32).clamp(64, MAX_W);
             app.ch.ph = ((p & 0xffff) as i32).clamp(chrome_h() + 32, MAX_H);
-            app.ch.side.scroll = app.ch.side.scroll.clamp(0, SideStrip::max_scroll(&app.ch.strip, app.ch.ph as u32));
+            app.ch.side.scroll = app.ch.side.scroll.clamp(0, app.ch.side.max_scroll_at(&app.ch.strip, app.ch.ph as u32));
             refit(app);
+            None
+        }
+        // AETHERBAR (SR192): the wheel over the open menu scrolls the menu (positive = toward its top). This arm stands
+        // before the side column's, so a wheel over the open menu never scrolls the side strip (the hit order is the rule).
+        INPUT_EV_WHEEL if app.ch.in_menu(app.ch.ptr.0, app.ch.ptr.1) => {
+            menu_scroll(&mut app.ch, -(p as u8 as i8 as i32));
+            app.ch.hot = hit(&app.ch, app.ch.ptr.0, app.ch.ptr.1);
+            app.dirty = true;
             None
         }
         // AETHERSIDETABS2 (SR143): the wheel over the side column scrolls the tab list (positive = toward the top).
         INPUT_EV_WHEEL if app.ch.ptr.0 >= 0 && app.ch.ptr.0 < app.ch.col_w() => {
             let n = p as u8 as i8 as i32;
             let ch = &mut app.ch;
-            ch.side.scroll_by(&ch.strip, ch.ph.max(0) as u32, -n * sidetabs::ROW_H as i32);
+            ch.side.scroll_by(&ch.strip, ch.ph.max(0) as u32, -n * ch.side.row_h() as i32);
             ch.hot = hit(ch, ch.ptr.0, ch.ptr.1);
             app.dirty = true;
             None
@@ -1268,6 +1292,7 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
                 // AETHERSIDETABS2 (SR143): a press outside the open menu closes it and is spent.
                 app.buttons = m;
                 app.ch.menu = false;
+                app.ch.menu_top = 0;
                 app.dirty = true;
                 return None;
             }
@@ -1623,7 +1648,7 @@ fn tab_tile(cv: &mut Canvas, ch: &Chrome, fonts: &Fonts, sk: &Skin, t: &tabs::Ta
 /// `Chrome::col_w`, the whole window tall.
 fn paint_side(ch: &Chrome, cv: &mut Canvas, fonts: &Fonts, sk: &Skin) {
     let (cw, h) = (ch.col_w(), ch.ph);
-    let rh = sidetabs::ROW_H as i32;
+    let rh = ch.side.row_h() as i32;
     let rail = ch.side.collapsed;
     let active = ch.strip.active();
     cv.fill(0, 0, cw, h, sk.strip);
@@ -1723,11 +1748,13 @@ fn paint_menu(ch: &Chrome, cv: &mut Canvas, fonts: &Fonts, sk: &Skin) {
     if !ch.menu {
         return;
     }
+    ch.menu_w.set(menu_need(ch, fonts)); // AETHERBAR: the width the hit test reads is the one painted
     let (mx, my, mw, mh) = ch.menu_rect();
     rrect(cv, mx - 1, my - 1, mw + 2, mh + 2, MENU_R + 1, sk.field_line, false);
     rrect(cv, mx, my, mw, mh, MENU_R, sk.bar, false);
-    for (i, (name, key)) in MENU.iter().enumerate() {
-        let ry = my + MENU_PAD + i as i32 * menu_row(ch);
+    let top = ch.menu_top;
+    for (i, (name, key)) in MENU.iter().enumerate().take(ch.menu_n()).skip(top).take(ch.menu_m().vis.max(1) as usize) {
+        let ry = my + MENU_PAD + (i - top) as i32 * menu_row(ch);
         if ch.hot == Hot::MenuItem(i) {
             rrect(cv, mx + MENU_PAD, ry, mw - 2 * MENU_PAD, menu_row(ch), CTL_R, sk.ctl_hover, false);
         }
@@ -1812,7 +1839,9 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
     // The toolbar.
     control(cv, ch, &sk, g.back, Hot::Back, app.hist.can_go(-1), Glyph::Back);
     control(cv, ch, &sk, g.fwd, Hot::Fwd, app.hist.can_go(1), Glyph::Fwd);
-    control(cv, ch, &sk, g.reload, Hot::Reload, true, Glyph::Reload);
+    if let Some(r) = g.reload {
+        control(cv, ch, &sk, r, Hot::Reload, true, Glyph::Reload);
+    }
     if let Some(r) = g.zout {
         control(cv, ch, &sk, r, Hot::ZoomOut, ch.zoom > zoom::LEVELS[0], Glyph::Minus);
     }
@@ -2009,13 +2038,52 @@ pub fn metrics() -> scale::Metrics {
 impl Chrome {
     /// AETHERSCALE: the open menu's fit inside the window (its row, its face, its top).
     fn menu_m(&self) -> scale::Menu {
-        metrics().menu(font(), MENU.len() as i32, MENU_PAD, self.page_y(), self.ph)
+        metrics().menu(font(), self.menu_n() as i32, MENU_PAD, self.page_y(), self.ph)
+    }
+
+    /// AETHERBAR (SR192): how many of `MENU`'s rows the menu lists — the last, Reload, only when the bar lacks it
+    /// (`scale::Metrics::bar`, the rule `geo` reads).
+    fn menu_n(&self) -> usize {
+        if metrics().bar(self.pw - self.page_x()).reload { MENU.len() - 1 } else { MENU.len() }
     }
 }
 
+/// AETHERBAR (SR192): the menu's widest listed row at the face — `paint_menu`'s own layout inverted: the name from
+/// `3 * MENU_PAD`, a `GAP`, the chord at the small face, `2 * MENU_PAD` to the edge.
+fn menu_need(ch: &Chrome, fonts: &Fonts) -> i32 {
+    let face = ch.menu_m().face;
+    let small = font_small().min(face);
+    let mut t = fonts.0.borrow_mut();
+    let mut need = 0f32;
+    for (name, key) in MENU.iter().take(ch.menu_n()) {
+        let mut w = 5.0 * MENU_PAD as f32 + t.measure(name, FontSel::default(), face);
+        if !key.is_empty() {
+            w += GAP as f32 + t.measure(key, FontSel::default(), small);
+        }
+        need = need.max(w);
+    }
+    need as i32 + 1
+}
+
+/// AETHERBAR (SR192): the menu button — open (at its first row, its width measured at the face) or close.
+fn menu_toggle(ch: &mut Chrome, fonts: &Fonts) {
+    ch.menu = !ch.menu;
+    ch.menu_top = 0;
+    if ch.menu {
+        ch.menu_w.set(menu_need(ch, fonts));
+    }
+}
+
+/// AETHERBAR (SR192): scroll the open menu `d` rows (positive: further down), clamped to the rows not on view.
+fn menu_scroll(ch: &mut Chrome, d: i32) {
+    let room = ch.menu_n().saturating_sub(ch.menu_m().vis.max(1) as usize) as i64;
+    ch.menu_top = (ch.menu_top as i64 + d as i64).clamp(0, room) as usize;
+}
+
 /// Re-read the type preferences; a moved font size re-derives the face, re-lays the header and the page, and says
-/// `[aether] restyle font_size=<px> text_size=<step> chrome_px=<n> chrome_h=<n> status_h=<n> menu_row=<n>` (the
-/// default size at start says nothing).
+/// `[aether] restyle font_size=<px> text_size=<step> chrome_px=<n> chrome_h=<n> status_h=<n> menu_row=<n> menu_vis=<n>
+/// side_row=<n> bar=<reload><star><zoom>` (the default size at start says nothing; AETHERBAR SR192 appended the last
+/// three: the menu's rows on view, the side column's row, the bar's optional controls as 0/1).
 fn restyle(app: &mut App) {
     use core::sync::atomic::Ordering::Relaxed;
     let (px, step) = crate::theme::read_type();
@@ -2025,11 +2093,15 @@ fn restyle(app: &mut App) {
     }
     let face = scale::face_for(px as i32, font_core::ui::DEFAULT_CSS_PX as i32);
     FACE.store(face.to_bits(), Relaxed);
+    app.ch.side.line = metrics().line; // AETHERBAR (SR192): the side rows grow with the face
     refit(app);
     let m = metrics();
     let mut l = Line::new(b"[aether] restyle font_size=");
     l.dec(px).put(b" text_size=").put(step.as_bytes()).put(b" chrome_px=").dec((face + 0.5) as i64);
     l.put(b" chrome_h=").dec(m.chrome_h() as i64).put(b" status_h=").dec(m.status_h as i64);
     l.put(b" menu_row=").dec(app.ch.menu_m().row as i64);
+    let (mu, b) = (app.ch.menu_m(), m.bar(app.ch.pw - app.ch.page_x()));
+    l.put(b" menu_vis=").dec(mu.vis as i64).put(b" side_row=").dec(app.ch.side.row_h() as i64);
+    l.put(b" bar=").dec(b.reload as i64).dec(b.star as i64).dec(b.zoom as i64);
     l.wire();
 }

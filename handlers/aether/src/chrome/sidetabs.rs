@@ -1,18 +1,21 @@
 //! AETHERSIDETABS (SR140, R118): the VERTICAL tab strip (Chrome's side tabs) — the tab layout preference, the side
 //! column's geometry, and Ctrl+Shift+A's tab search. std-free (core + alloc), like the rest of the chrome model, so
-//! the UnaOS face can link it by `#[path]` beside `tabs.rs` (it names only `super::tabs`).
+//! the UnaOS face can link it by `#[path]` beside `tabs.rs` and `scale.rs` (it names only `super::tabs` and
+//! `super::scale`).
 //!
 //! The layout is Principia's `aether.tabs.layout` (`top` | `side`, default `top`; prefs_core `schema.rs`), read at
 //! face build and again on a `PrefChanged` for it. Switching it re-lays the chrome only: the [`TabStrip`] and every
 //! tab's engine stay as they are.
 //!
 //! The side column is [`SIDE_W`] px wide, or a [`RAIL_W`] px icon rail when collapsed (one control, the top row's
-//! toggle). Below the toggle it lists [`TabStrip::rows`] one per [`ROW_H`] px — a group's header, its tabs (the
+//! toggle). Below the toggle it lists [`TabStrip::rows`] one per [`SideStrip::row_h`] px (AETHERBAR SR192: [`ROW_H`]
+//! grown by the chrome face's line, `scale::grow`) — a group's header, its tabs (the
 //! favicon or the letter tile, the ellipsised title, the close box on hover), the `+` row last — and scrolls when
 //! the list is taller than the window. The page sits right of the column ([`SideStrip::width`]).
 
 use alloc::vec::Vec;
 
+use super::scale;
 use super::tabs::{GroupId, Row, TabStrip};
 
 /// Principia's namespace and key for the layout.
@@ -47,10 +50,17 @@ impl TabLayout {
     }
 }
 
-/// The side column's width, open and collapsed to the icon rail, and one row's height (px at scale 1).
+/// The side column's width, open and collapsed to the icon rail, and one row's base height (px at the default face;
+/// [`row_h`] grows it).
 pub const SIDE_W: u32 = 240;
 pub const RAIL_W: u32 = 48;
 pub const ROW_H: u32 = 32;
+/// AETHERBAR (SR192): a side row's height at a chrome face whose line is `line` (0 or the default's 14: [`ROW_H`]) —
+/// the base grown by the same rule as every header band (`scale::grow`).
+pub fn row_h(line: i32) -> u32 {
+    scale::grow(ROW_H as i32, line) as u32
+}
+
 /// The close box's width at a tab row's right edge.
 pub const CLOSE_W: u32 = 24;
 /// The group header's colour stripe at a row's left edge.
@@ -88,6 +98,8 @@ pub struct SideStrip {
     pub collapsed: bool,
     /// How far the list is scrolled, px (0 = the first row under the toggle).
     pub scroll: i32,
+    /// AETHERBAR (SR192): the chrome face's line (`scale::line`; 0 = the default), which sizes the rows ([`row_h`]).
+    pub line: i32,
 }
 
 impl SideStrip {
@@ -113,47 +125,61 @@ impl SideStrip {
         self.collapsed
     }
 
-    /// The list's full height and the height it has under the toggle row in a column `h` px tall.
-    fn extents(strip: &TabStrip, h: u32) -> (i32, i32) {
-        let total = (strip.rows().len() as u32 * ROW_H) as i32;
-        (total, h.saturating_sub(ROW_H) as i32)
+    /// AETHERBAR (SR192): one row's height at this column's face ([`row_h`] of [`SideStrip::line`]): what the layout,
+    /// the hit test, the scroll and the face's paint all read.
+    pub fn row_h(&self) -> u32 {
+        row_h(self.line)
     }
 
-    /// The furthest the list can scroll in a column `h` px tall.
+    /// The list's full height and the height it has under the toggle row in a column `h` px tall.
+    fn extents(&self, strip: &TabStrip, h: u32) -> (i32, i32) {
+        let rh = self.row_h();
+        let total = (strip.rows().len() as u32 * rh) as i32;
+        (total, h.saturating_sub(rh) as i32)
+    }
+
+    /// The furthest the list can scroll in a column `h` px tall, at the default face.
     pub fn max_scroll(strip: &TabStrip, h: u32) -> i32 {
-        let (total, room) = Self::extents(strip, h);
+        SideStrip::default().max_scroll_at(strip, h)
+    }
+
+    /// The furthest the list can scroll in a column `h` px tall, at this column's face.
+    pub fn max_scroll_at(&self, strip: &TabStrip, h: u32) -> i32 {
+        let (total, room) = self.extents(strip, h);
         (total - room).max(0)
     }
 
     /// Scroll by `dy` px (positive: further down the list), clamped.
     pub fn scroll_by(&mut self, strip: &TabStrip, h: u32, dy: i32) {
-        self.scroll = (self.scroll + dy).clamp(0, Self::max_scroll(strip, h));
+        self.scroll = (self.scroll + dy).clamp(0, self.max_scroll_at(strip, h));
     }
 
     /// Scroll just enough that tab `id`'s row is on view (the active tab after Ctrl+Tab, a search pick).
     pub fn reveal(&mut self, strip: &TabStrip, h: u32, id: u64) {
         let Some(k) = strip.rows().iter().position(|r| *r == Row::Tab(id)) else { return };
-        let (_, room) = Self::extents(strip, h);
-        let top = (k as u32 * ROW_H) as i32;
-        let bottom = top + ROW_H as i32;
+        let (_, room) = self.extents(strip, h);
+        let rh = self.row_h();
+        let top = (k as u32 * rh) as i32;
+        let bottom = top + rh as i32;
         if top < self.scroll {
             self.scroll = top;
         } else if bottom > self.scroll + room {
             self.scroll = bottom - room;
         }
-        self.scroll = self.scroll.clamp(0, Self::max_scroll(strip, h));
+        self.scroll = self.scroll.clamp(0, self.max_scroll_at(strip, h));
     }
 
-    /// The rows on view in a column `h` px tall: each with its top edge (the toggle row is `0..ROW_H`).
+    /// The rows on view in a column `h` px tall: each with its top edge (the toggle row is `0..row_h()`).
     pub fn layout(&self, strip: &TabStrip, h: u32) -> Vec<RowRect> {
-        let scroll = self.scroll.clamp(0, Self::max_scroll(strip, h));
-        let top = ROW_H as i32;
+        let scroll = self.scroll.clamp(0, self.max_scroll_at(strip, h));
+        let rh = self.row_h();
+        let top = rh as i32;
         strip
             .rows()
             .into_iter()
             .enumerate()
-            .map(|(k, row)| RowRect { row, y: top + (k as u32 * ROW_H) as i32 - scroll })
-            .filter(|r| r.y + ROW_H as i32 > top && r.y < h as i32)
+            .map(|(k, row)| RowRect { row, y: top + (k as u32 * rh) as i32 - scroll })
+            .filter(|r| r.y + rh as i32 > top && r.y < h as i32)
             .collect()
     }
 
@@ -168,10 +194,11 @@ impl SideStrip {
         if x < 0 || y < 0 || x >= w || y >= h as i32 {
             return None;
         }
-        if y < ROW_H as i32 {
+        let rh = self.row_h() as i32;
+        if y < rh {
             return Some(SideHit::Toggle);
         }
-        let r = self.layout(strip, h).into_iter().find(|r| y >= r.y && y < r.y + ROW_H as i32)?;
+        let r = self.layout(strip, h).into_iter().find(|r| y >= r.y && y < r.y + rh)?;
         Some(match r.row {
             Row::Group(g) => SideHit::Group(g),
             Row::NewTab => SideHit::NewTab,
