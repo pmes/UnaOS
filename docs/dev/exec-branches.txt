@@ -965,3 +965,7 @@ refs/heads/exec-rmbp-aacencgrouping   16cacfacd FOLDED-BY-HAND (this commit) 202
 refs/heads/exec-rmbp-nle6dragsnap   2e1698471 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-av1inbandsize   2e1698471 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-kernelscalecols   1e5dd1888 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-exportcolourprim   447813eb5 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-kerneliccintlut   447813eb5 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aacenctns   447813eb5 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-kernelscaleonearm   447813eb5 IN-FLIGHT cut 2026-10-27
