@@ -179,6 +179,20 @@ if [ -n "${UNAOS_GOP:-}" ]; then
     esac
     echo "⚡ gop knob: handle=${UNAOS_GOP%%:*} mode=${UNAOS_GOP#*:} (x86 loader only; not the flashable image)"
 fi
+# ZENBOOKXHCIPICK (zenbook-ledger Z7): UNAOS_XHCI_PICK=<index|bus:dev.func> (decimal, the numbering of the kernel's
+# `[xhci] controllers=<n> picked=<i> bdf=<b:d.f>` census line) chooses WHICH xHCI the x86 kernel brings up
+# (drivers/xhci/mod.rs `pick`, option_env!, no plumbing: the builder's cargo inherits this environment). Unset, the
+# first 0C/03/30 in walk order, as always. A pick naming no controller is refused on the census line and the first runs.
+if [ -n "${UNAOS_XHCI_PICK:-}" ]; then
+    case "${UNAOS_XHCI_PICK}" in
+        *[!0-9:.]*) echo "✖ UNAOS_XHCI_PICK='${UNAOS_XHCI_PICK}': the xhci pick knob is <index> or <bus>:<dev>.<func>, decimal"; exit 1 ;;
+        *:*:*|*.*.*) echo "✖ UNAOS_XHCI_PICK='${UNAOS_XHCI_PICK}': the xhci pick knob is <index> or <bus>:<dev>.<func>, decimal"; exit 1 ;;
+        [0-9]*:[0-9]*.[0-9]*) ;;
+        *[:.]*) echo "✖ UNAOS_XHCI_PICK='${UNAOS_XHCI_PICK}': the xhci pick knob is <index> or <bus>:<dev>.<func>, decimal"; exit 1 ;;
+        *) ;;
+    esac
+    echo "⚡ xhci pick knob: ${UNAOS_XHCI_PICK} (x86 kernel only; the census line names the controller that ran)"
+fi
 #
 # RTCCLOCK (R75) / CLOCKPAINTERS (B719): the display-offset build knob is RETIRED. The CMOS RTC is read and anchored
 # as UTC; the zone is Principia's `system.locale.tz` (Settings > Date & Time), applied when a second is printed

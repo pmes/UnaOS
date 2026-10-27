@@ -22,7 +22,7 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
 
 1. **ZENBOOK-FIRSTBOOT** — the card recipe and the bench's first boot. `./arroyo esp-x86` with the ZENBOOK-IMAGELINE
    knobs onto a USB stick, into a USB-A or USB-C port; F2/Esc into the ASUS firmware, Secure Boot OFF, boot the stick.
-   The FTDI serial adapter goes on a port of the FIRST xHCI the kernel walks (ZENBOOK-XHCIPICK: try each port; the
+   The FTDI serial adapter goes on a port of the ONE xHCI the kernel brings up: read `[xhci] controllers=<n> picked=<i>
    wire names the one that bound). Expected first lines and refusals: um5606w.md §6. Bench only, Peter's go.
 2. **ZENBOOK-IMAGELINE** — In flight (ZENBOOKIMAGELINE, Z6): `unaos/scripts/image-line-zenbook.env` (25 kernel knobs +
    the `[media]` UNAOS_MT7925_FW_PATH: the rMBP line without its Mac-only knobs and the SATA set, plus NVME) and
@@ -30,6 +30,7 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
    check leg `x86-zenbook-image`; um5606w.md §5/§6. Owed: ZENBOOK-OLDEST (`boot::OLDEST` is cfg-only, so the image prints
    rmbp12 2012, not 2024), ZENBOOK-QEMULANE (an arroyo `test` lane with the Zenbook knobs), ZENBOOK-LINEGATE (a
    `knob-parity-zenbook` gates row running the x86 `--line` mode on the file); row 1's recipe should name esp-zenbook.
+   bdf=<b:d.f>` off the glass, and if the FTDI did not bind rebuild with `UNAOS_XHCI_PICK=<i>` for the next i (Z7). Expected first lines and refusals: um5606w.md §6. Bench only, Peter's go.
 3. **ZENBOOK-NVME** — `drivers/nvme.rs` (class 0108, vendor varies): the root volume. In flight (ZENBOOKNVME).
 4. **ZENBOOK-I8042** — `drivers/i8042.rs`: the internal keyboard on the EC's 8042 into the input route. In flight
    (ZENBOOKI8042; it asks `hw::platform()`).
@@ -40,6 +41,13 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
    NHIs (151c/151d). Measure which physical ports the first one serves; then bring up every xHCI or pick by port.
 7. **ZENBOOK-MT7925** — `drivers/mt7925.rs` (14c3:7925): probe + firmware pin (Z5, fixed-unflown). In flight (MT7925S2, Z11): S2 driver-own and the chip id through
    the L1 remap, Zenbook only; S3..S10 owed in `docs/dev/OS/06_NETWORK_STACK/mt7925.md`.
+6. **ZENBOOK-XHCIPICK** — BUILT by ZENBOOKXHCIPICK (Z7, fixed-unflown, code-only): the driver is single-instance, so
+   the kernel brings up ONE xHCI — the first class 0C/03/30 in walk order (today's tuple, unchanged) unless the build knob
+   `UNAOS_XHCI_PICK=<index|b:d.f>` (decimal; arroyo validates) names another (`drivers::xhci::pick`, fed the PCI registry
+   at `unaos/crates/kernel/src/arch/x86_64/pci.rs:895`); one census line `[xhci] controllers=<n> picked=<i> bdf=<b:d.f>`
+   (+ `via=knob` / `refused=<v>`), and `hw` labels the picked controller. Strix Point: four (1022:151a/151b/151e/151f).
+   Owed: ZENBOOK-XHCIALL (every controller up; the ring/port/slot statics per instance, one MSI-X vector each), USB
+   tunnelled behind the NHIs (ZENBOOK-USB4), the Fn-key keyboard (ZENBOOK-EC).
 8. **ZENBOOK-EC** — battery, lid and the Fn keys through the ACPI embedded controller (the SMC's job on the rMBP).
 9. **ZENBOOK-TOUCHPAD** — the touchpad over I2C-HID on the AMD DesignWare I2C controller.
 10. **ZENBOOK-ACP** — audio: the ALC294 codec on the Ryzen HD Audio controller (1022:15e3; Linux quirk 1043:1df3

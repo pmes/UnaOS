@@ -195,7 +195,7 @@ fn pci_rows(c: &mut Census, wait: bool) {
         let bdf = (f.bus, f.dev, f.func);
         let (mut driver, mut state) = (NONE, NO_DRIVER);
         match (f.class, f.sub, f.progif) {
-            (0x0C, 0x03, 0x30) if !xhci_seen => {
+            (0x0C, 0x03, 0x30) if !xhci_seen && crate::drivers::xhci::picked().is_none_or(|p| p == bdf) => { // ZENBOOKXHCIPICK (zenbook-ledger Z7): the PICKED controller is the one labelled `xhci` (`xhci::pick`, `UNAOS_XHCI_PICK`); no pick recorded = the first, as before. LINE-NEUTRAL.
                 xhci_seen = true;
                 (driver, state) = ("xhci", if xhci_up { "up" } else { "held" });
             }

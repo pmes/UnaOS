@@ -19131,3 +19131,76 @@ impl XhciController {
         None
     }
 }
+
+// ── ZENBOOKXHCIPICK (zenbook-ledger Z7) — WHICH xHCI is brought up — TAIL-APPENDED, so no line above moves ──────────────
+// The driver is single-instance (one `XHCI_CONTROLLER` slot, one COMMAND/EVENT ring, one IR0/OP base pair, one MSI-X
+// vector), so a machine with several controllers (Strix Point: four, 1022:151a/151b/151e/151f) gets ONE: the first
+// 0C/03/30 in walk order unless `UNAOS_XHCI_PICK=<index|b:d.f>` (decimal, the census's own numbering; `option_env!`,
+// arroyo validates it) names another. Every controller up is ZENBOOK-XHCIALL (owed). The census prints once:
+// `[xhci] controllers=<n> picked=<i> bdf=<b:d.f>` (+ ` via=knob` / ` refused=<v>`).
+
+/// The build's pick, `Some("")` folded to `None` so an EMPTY knob builds the UNSET bytes.
+#[cfg(target_arch = "x86_64")]
+const XHCI_PICK: Option<&str> = match option_env!("UNAOS_XHCI_PICK") {
+    Some(s) if !s.is_empty() => Some(s),
+    _ => None,
+};
+
+/// The controller [`pick`] chose, packed `1<<24 | bus<<16 | dev<<8 | func` (0 = not picked / none present).
+#[cfg(target_arch = "x86_64")]
+static XHCI_PICKED: AtomicU32 = AtomicU32::new(0);
+
+/// The (bus, dev, func) [`pick`] chose; `None` before the pick or with no controller (`hw.rs`'s census label).
+#[cfg(target_arch = "x86_64")]
+pub fn picked() -> Option<(u8, u8, u8)> {
+    let v = XHCI_PICKED.load(Ordering::Relaxed);
+    if v == 0 { None } else { Some(((v >> 16) as u8, (v >> 8) as u8, v as u8)) }
+}
+
+/// `b:d.f`, decimal, as the census prints it.
+#[cfg(target_arch = "x86_64")]
+fn pick_parse_bdf(s: &str) -> Option<(u8, u8, u8)> {
+    let (b, rest) = s.split_once(':')?;
+    let (d, f) = rest.split_once('.')?;
+    Some((b.parse().ok()?, d.parse().ok()?, f.parse().ok()?))
+}
+
+/// ZENBOOKXHCIPICK: choose WHICH xHCI the bring-up at `arch/x86_64/pci.rs:897` runs on. `first` is
+/// `PciScanner::scan`'s tuple (the first 0C/03/30 in walk order), `fns` the boot's PCI registry
+/// (`arch::pci::functions`, the same walk's order). Knob unset: `first` is returned UNCHANGED. A pick that names no
+/// controller is refused on the census line and `first` is returned.
+#[cfg(target_arch = "x86_64")]
+pub fn pick(first: Option<(u64, u8, u8, u8)>, fns: &[crate::arch::pci::PciFn]) -> Option<(u64, u8, u8, u8)> {
+    let list: Vec<(u8, u8, u8)> = fns.iter()
+        .filter(|p| (p.class, p.sub, p.progif) == (0x0C, 0x03, 0x30))
+        .map(|p| (p.bus, p.dev, p.func))
+        .collect();
+    let mut chosen = first;
+    let mut refused: Option<&str> = None;
+    if let Some(v) = XHCI_PICK {
+        let hit = if v.contains(':') {
+            pick_parse_bdf(v).and_then(|bdf| list.iter().position(|&x| x == bdf))
+        } else {
+            v.parse::<usize>().ok().filter(|&i| i < list.len())
+        };
+        match hit {
+            Some(i) => {
+                let (b, d, f) = list[i];
+                chosen = Some((crate::drivers::pci::PciScanner::get_bar_address(b, d, f), b, d, f));
+            }
+            None => refused = Some(v),
+        }
+    }
+    let rtag = if refused.is_some() { " refused=" } else { "" };
+    let rval = refused.unwrap_or("");
+    match chosen {
+        Some((_, b, d, f)) => {
+            XHCI_PICKED.store((1u32 << 24) | ((b as u32) << 16) | ((d as u32) << 8) | (f as u32), Ordering::Relaxed);
+            let idx = list.iter().position(|&x| x == (b, d, f)).unwrap_or(0);
+            let via = if XHCI_PICK.is_some() && refused.is_none() { " via=knob" } else { "" };
+            serial_println!("[xhci] controllers={} picked={} bdf={}:{}.{}{}{}{}", list.len(), idx, b, d, f, via, rtag, rval);
+        }
+        None => serial_println!("[xhci] controllers={} picked=none{}{}", list.len(), rtag, rval),
+    }
+    chosen
+}
