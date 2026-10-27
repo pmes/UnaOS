@@ -915,7 +915,7 @@ pub fn fixture() {
     let mut mono = FIXTURE;
     mono[FIXTURE_NCH] = 1;
     sc.check("mono.refused", pick(&parse(&mono)).is_none() as u64, 1);
-    feedback_kats(&mut sc); // UACFEEDBACK (B789): the feedback endpoint's walk, its decode and the meter
+    feedback_kats(&mut sc); fu_kats(&mut sc); // UACFEEDBACK (B789): the feedback endpoint's walk, its decode and the meter
     let (iso_tds, iso_missed, iso_underrun, iso_events) = crate::drivers::xhci::isoch::out_stats();
     if sc.fails != 0 {
         let (w, g, x) = sc.first;
@@ -1612,4 +1612,34 @@ fn implicit_kats(sc: &mut Score) {
 pub fn volume_held() -> Option<(u8, bool)> {
     let d = VOL_DONE.load(Ordering::Acquire);
     (d != 0 && !VOL_FAIL.load(Ordering::Acquire)).then(|| ((d & 0xFF) as u8, d & 0x100 != 0))
+}
+
+// ── AUDIOSINK (rmbp-ledger B850; BP-audio-16) — TAIL-APPENDED: `tests uac1`'s Feature Unit KAT ─────────────────────────
+// Owner: the audio handler (CODEX §2), the class driver's Feature Unit walk and level map. SINKALL (B767) built the
+// device volume (`feature_unit`, `volume_want`, `volume_service`); its only offline witness was `fu_fixture`, reached from
+// `tests sinkall` with no device. This puts the walk and the level map into the UAC1 fixture's Score (folded on the
+// `feedback_kats` line of [`fixture`]): QEMU's unit, a bControlSize-2 unit with Volume on channel 1 only, a unit with no
+// controls, the map strictly rising over 0..=16 and clamped above 16. A miss fails UAC1 through the Score's own line.
+// Wire: `[uac] fu kat fixture=<ok|FAIL> size2=<ok|FAIL> nounit=<ok|FAIL> monotone=<ok|FAIL> clamp=<ok|FAIL> -> <ok|FAIL>`.
+
+/// AUDIOSINK: the Feature Unit walk and the level map, into the fixture's Score.
+fn fu_kats(sc: &mut Score) {
+    let fixture = fu_fixture();
+    let size2 = feature_unit(&[0x0b, 0x24, AC_FEATURE_UNIT, 0x05, 0x01, 0x02, 0x00, 0x00, 0x02, 0x00, 0x00]);
+    let nounit = feature_unit(&[0x07, 0x24, AC_FEATURE_UNIT, 0x03, 0x01, 0x01, 0x00]);
+    let (min, max) = VOL_FALLBACK;
+    let monotone = (0..16u8).all(|l| level_db(l, min, max) < level_db(l + 1, min, max));
+    let clamp = level_db(20, min, max) == max && level_db(16, min, max) == max;
+    let size2_ok = size2 == Fu { unit: 5, mute: 0, vol: 0b010 };
+    let nounit_ok = nounit == Fu { unit: 3, mute: 0, vol: 0 };
+    sc.check("fu.fixture", fixture as u64, 1);
+    sc.check("fu.size2", size2_ok as u64, 1);
+    sc.check("fu.nounit", nounit_ok as u64, 1);
+    sc.check("fu.monotone", monotone as u64, 1);
+    sc.check("fu.clamp", clamp as u64, 1);
+    let w = |b: bool| if b { "ok" } else { "FAIL" };
+    serial_println!(
+        "[uac] fu kat fixture={} size2={} nounit={} monotone={} clamp={} -> {}",
+        w(fixture), w(size2_ok), w(nounit_ok), w(monotone), w(clamp), w(fixture && size2_ok && nounit_ok && monotone && clamp)
+    );
 }
