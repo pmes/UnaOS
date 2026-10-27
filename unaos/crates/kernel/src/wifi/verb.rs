@@ -288,7 +288,7 @@ pub fn wifijoin() {
         false
     });
     let Some(bss) = best else { return refuse(if !prot { "not-heard" } else if pass.is_empty() { "protected-no-psk" } else { "rsn-unsupported" }) };
-    let (bssid, ch) = (bss.bssid, bss.channel.unwrap_or(0)); let pk = rsn.as_ref().map(|_| super::assoc::wpa_pmk(sb, &pass)); crypto_core::ct::Zeroize::zeroize(&mut pass);
+    let (bssid, ch) = (bss.bssid, bss.channel.unwrap_or(0)); let pk = rsn.as_ref().map(|_| super::assoc::wpa_pmk(sb, &pass)); crypto_core::ct::Zeroize::zeroize(&mut pass[..]);
     let cap = super::assoc::assoc_cap(&bss); let pmk = match pk { Some(Err(e)) => return refuse(e), Some(Ok(k)) => Some(crypto_core::ct::SecretBytes(k)), None => None };
     let mt_ = |m: [u8; 6]| alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
     let (mut auth, mut assoc): (Option<w::AuthResult>, Option<w::AssocResult>) = (None, None);
