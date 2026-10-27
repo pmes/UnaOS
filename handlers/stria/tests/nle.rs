@@ -468,8 +468,8 @@ fn demuxwire_editor_open_indexes_and_derives() {
     src.add(SourceId(1), mkv(false)).unwrap();
     src.add(SourceId(2), synth_source(0, 50, 25)).unwrap();
     let r = src.open_report(SourceId(0)).unwrap();
-    assert_eq!(r.to_string(), "open=indexed dts=derived:2 edits=0", "{r:?}");
-    assert_eq!(src.open_report(SourceId(1)).unwrap().to_string(), "open=full dts=derived:2 edits=0");
+    assert_eq!(r.to_string(), "open=indexed dts=derived:2 edits=0 applied=first-only", "{r:?}");
+    assert_eq!(src.open_report(SourceId(1)).unwrap().to_string(), "open=full dts=derived:2 edits=0 applied=first-only");
     let mp4 = src.open_report(SourceId(2)).unwrap();
     assert!(mp4.to_string().starts_with("open=full dts=stored edits="), "{mp4}");
     // keyframe-before: source time 0 is the first pts (40 ms); the second keyframe is presented at 320 ms. At 300 ms the
@@ -495,4 +495,74 @@ fn demuxwire_player_plays_a_bframe_mkv_in_decode_order() {
     // dts = the sorted pts two frames back: every frame decodes no later than it is presented.
     assert_eq!(v.composition_offsets, [80, 160, 40, 40, 160, 40, 40, 80, 160, 40, 40].map(|o| o * MS).to_vec());
     println!("demuxwire: player dts=derived:2");
+}
+
+// ---------------------------------------------------------------------------------------------------
+// EDITMAP (LEDGER SR223): an edit-listed MP4 is its own timeline (`Sources::from_media`), and the Player maps the same list.
+// ---------------------------------------------------------------------------------------------------
+
+use stria::nle::synth_source_with;
+use timeline_core::EditError;
+
+/// A 50-frame 25 fps synth source (utp1 counters 0..49 + PCM16) whose video and audio edit lists both play 400 ms of the
+/// media from 1.0 s, then 400 ms from 0.2 s (movie timescale 1000; video media 25000 ticks/s, audio 48000), at `rate`.
+fn editmap_file(rate: i32) -> Vec<u8> {
+    let x = build::Mp4Extras {
+        edit_lists: vec![(1, vec![(400, 25_000, rate), (400, 5_000, rate)]), (2, vec![(400, 48_000, rate), (400, 9_600, rate)])],
+        ..Default::default()
+    };
+    synth_source_with(0, 50, 25, &x)
+}
+
+#[test]
+fn editmap_the_editor_plays_the_whole_edit_list() {
+    let (tl, src) = Sources::from_media("AX", &editmap_file(0x1_0000), 25).unwrap().expect("an MP4 is media");
+    let want = vec![Clip::new(SourceId(0), 25, 35, 0), Clip::new(SourceId(0), 5, 15, 10)];
+    assert_eq!((tl.tracks[0].kind, &tl.tracks[0].clips), (Kind::Video, &want));
+    assert_eq!((tl.tracks[1].kind, &tl.tracks[1].clips), (Kind::Audio, &want));
+    assert_eq!((tl.sources[0].reel.as_str(), tl.sources[0].duration), ("AX", 50));
+    let r = src.open_report(SourceId(0)).unwrap();
+    assert_eq!(r.to_string(), "open=full dts=stored edits=2 applied=2");
+
+    // The schedule seeks at each segment boundary only: 1.0 s from the 800 ms keyframe, 0.2 s from the 0 ms one.
+    let steps = schedule(&tl, 0..20, &src).unwrap();
+    let seeks: Vec<_> = steps.iter().filter(|s| s.kind == Kind::Video && s.seek.is_some()).map(|s| (s.out_t, s.src_t, s.seek.unwrap())).collect();
+    assert_eq!(seeks, vec![(0, 25, 800 * MS), (10, 5, 0)]);
+
+    // The render shows the segments' frames and plays their samples.
+    let mut sink = Collect::default();
+    let rr = render(&tl, 0..20, &src, &mut sink).unwrap();
+    let at = |t: usize| TestPattern::read_counter(&sink.frames[t].1, 64, 48);
+    assert_eq!((at(0), at(9), at(10), at(19)), (Some(25), Some(34), Some(5), Some(14)));
+    assert_eq!(sink.pcm.len(), 20 * PER);
+    assert_eq!(sink.pcm[0], synth_sample(0, 25 * PER as u64) as f32 / 32768.0);
+    assert_eq!(sink.pcm[10 * PER], synth_sample(0, 5 * PER as u64) as f32 / 32768.0);
+    assert_eq!(sink.pcm[20 * PER - 1], synth_sample(0, 15 * PER as u64 - 1) as f32 / 32768.0);
+    println!("editmap: reel=AX {r} frames={} seeks={}", rr.frames, rr.seeks);
+}
+
+#[test]
+fn editmap_a_rate_edit_is_refused_and_an_edl_is_not_media() {
+    assert!(matches!(Sources::from_media("AX", &editmap_file(0x2_0000), 25), Err(stria::nle::RenderError::Edit(EditError::Rate))));
+    let edl_text = edl::write(&timeline(), "EDITMAP").unwrap();
+    assert!(Sources::from_media("AX", edl_text.as_bytes(), 25).unwrap().is_none());
+    // A file without an edit list is the whole source.
+    let (tl, src) = Sources::from_media("AX", &synth_source(0, 50, 25), 25).unwrap().unwrap();
+    assert_eq!(tl.tracks[0].clips, vec![Clip::new(SourceId(0), 0, 50, 0)]);
+    assert_eq!(src.open_report(SourceId(0)).unwrap().to_string(), "open=full dts=stored edits=0 applied=1");
+}
+
+#[test]
+fn editmap_the_player_reports_the_same_segment_boundaries() {
+    let file = editmap_file(0x1_0000);
+    let p = Player::open(file.clone(), Arc::new(ManualTime::new()), None, 60).unwrap();
+    let got: Vec<_> = p.edit_segments().iter().map(|c| (c.at, c.src_in, c.src_out)).collect();
+    assert_eq!(got, vec![(0, 1000 * MS, 1400 * MS), (400 * MS, 200 * MS, 600 * MS)]);
+    // The editor's clips at 40 ms ticks are the same boundaries.
+    let (tl, _) = Sources::from_media("AX", &file, 25).unwrap().unwrap();
+    let ed: Vec<_> = tl.tracks[0].clips.iter().map(|c| (c.at * 40 * MS, c.src_in * 40 * MS, c.src_out * 40 * MS)).collect();
+    assert_eq!(got, ed);
+    // A file without an edit list maps nothing.
+    assert!(Player::open(synth_source(0, 50, 25), Arc::new(ManualTime::new()), None, 60).unwrap().edit_segments().is_empty());
+    println!("editmap: player segments={}", got.len());
 }

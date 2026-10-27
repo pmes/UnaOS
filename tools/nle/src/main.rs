@@ -5,14 +5,16 @@
 //! `stria::nle`: argument plumbing and files, no editing or rendering logic.
 //!
 //! ```text
-//! nle schedule <edl> [--fps N] --src REEL=<media> ...
-//! nle render   <edl> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--audio wav|mp4|none]
+//! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
+//! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--audio wav|mp4|none]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! ```
 //!
 //! `schedule` prints one line per reel (`reel=<r> open=<full|indexed> dts=<stored|derived:n|presentation> edits=<n>`,
-//! `stria::nle::Sources::open_report`; DEMUXWIRE SR213), then one line per step (`timeline_core::schedule`).
+//! `stria::nle::Sources::open_report`; DEMUXWIRE SR213; ` applied=<n|first-only>` EDITMAP SR223), then one line per step
+//! (`timeline_core::schedule`). EDITMAP (SR223): a MEDIA file in the `<edl>` place is its own timeline — its edit list
+//! over the one reel `AX` (`stria::nle::Sources::from_media`; `--src` is not read).
 //! `render` writes `<stem>.rgba` (every output frame, `w*h*4` bytes each, in order) and `<stem>.f32`
 //! (interleaved little-endian f32 PCM), then one JSON line: frames, size,
 //! PCM frames, rate, channels, seeks, run-up frames and the FNV-1a 64 of the RGBA stream. `--fps` is the frame rate when
@@ -30,9 +32,9 @@ use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
 fn usage() -> ! {
-    eprintln!("usage: nle schedule <edl> [--fps N] --src REEL=<media> ...");
-    eprintln!("       nle render <edl> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--audio wav|mp4|none]");
+    eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
+    eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--audio wav|mp4|none]");
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     std::process::exit(2)
 }
@@ -67,7 +69,12 @@ impl RenderSink for Files {
 }
 
 fn load(edl_path: &str, fps: u32, srcs: &[(String, String)]) -> (Timeline, Sources) {
-    let text = std::fs::read_to_string(edl_path).unwrap_or_else(|e| die(format!("{edl_path}: {e}")));
+    let bytes = std::fs::read(edl_path).unwrap_or_else(|e| die(format!("{edl_path}: {e}")));
+    // EDITMAP (SR223): a media file is its own timeline (its edit list over one reel); anything else is an EDL.
+    if let Some(opened) = Sources::from_media("AX", &bytes, fps).unwrap_or_else(|e| die(format!("{edl_path}: {e}"))) {
+        return opened;
+    }
+    let text = String::from_utf8(bytes).unwrap_or_else(|e| die(format!("{edl_path}: {e}")));
     let tl = edl::parse(&text, fps).unwrap_or_else(|e| die(format!("{edl_path}: {e}")));
     let mut sources = Sources::new(&tl);
     for s in &tl.sources {

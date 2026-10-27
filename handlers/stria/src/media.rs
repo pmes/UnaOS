@@ -247,6 +247,9 @@ pub struct Player {
     eof: bool,
     start_ns: i64,
     info: MediaInfo,
+    /// EDITMAP (SR223): the stream's whole edit list as clips at ns ticks ([`Player::edit_segments`]); playback still
+    /// follows the first media edit.
+    edit_map: Vec<timeline_core::Clip>,
 }
 
 /// AETHERMEDIA2 (SR134): a live session's resume state.
@@ -422,6 +425,7 @@ impl Player {
             audio_start_ns,
         };
         let early = 500_000_000 / display_hz.max(1) as u64;
+        let edit_map = edit_map_of(demux.as_ref(), vtrack.as_ref());
         Ok(Player {
             demux,
             vtrack,
@@ -458,11 +462,18 @@ impl Player {
             eof: false,
             start_ns,
             info,
+            edit_map,
         })
     }
 
     pub fn info(&self) -> &MediaInfo {
         &self.info
+    }
+    /// EDITMAP (SR223): the file's edit list mapped through `Timeline::lay_edit_list` at ns ticks: each media segment a
+    /// clip (`at` = its movie time, `src_in..src_out` = its media time from the stream's first pts); empty without an edit
+    /// list or when the list was refused. The Player plays the first media edit only (segment playback is owed).
+    pub fn edit_segments(&self) -> &[timeline_core::Clip] {
+        &self.edit_map
     }
     pub fn stats(&self) -> SchedStats {
         self.sched.stats
@@ -986,6 +997,40 @@ impl Player {
             Tick::Ended
         } else {
             Tick::Idle
+        }
+    }
+}
+
+/// EDITMAP (LEDGER SR223): the picture's stream (the video, else the first audio stream) and its edit list laid by the
+/// editor's ONE mapping, `Timeline::lay_edit_list`, on a timeline of ns ticks (source time 0 = the stream's first pts).
+fn edit_map_of(demux: Option<&Demuxer>, vtrack: Option<&Track>) -> Vec<timeline_core::Clip> {
+    let Some(d) = demux else { return Vec::new() };
+    let i = match vtrack {
+        Some(vt) => d.track_index(vt.id),
+        None => d.tracks().iter().position(|t| t.kind == TrackKind::Audio),
+    };
+    let Some(i) = i else { return Vec::new() };
+    let edits = d.edit_list(i);
+    if edits.is_empty() {
+        return Vec::new();
+    }
+    let t = &d.tracks()[i];
+    let origin = d.track_samples(i).map(|s| t.to_ns(s.pts)).min().unwrap_or(0);
+    let mut tl = timeline_core::Timeline::new(1_000_000_000);
+    let src = tl.add_source("PLAY", t.duration_ns as i64);
+    let kind = if t.kind == TrackKind::Video { timeline_core::Kind::Video } else { timeline_core::Kind::Audio };
+    let track = tl.add_track(kind);
+    match tl.lay_edit_list(track, src, edits, t.timebase, origin) {
+        Ok(tl) => {
+            let clips = tl.tracks[track].clips.clone();
+            if clips.len() > 1 {
+                log::info!("[STRIA] :: edit list: {} segments mapped; playback follows the first media edit", clips.len());
+            }
+            clips
+        }
+        Err(e) => {
+            log::info!("[STRIA] :: edit list not mapped: {e}");
+            Vec::new()
         }
     }
 }

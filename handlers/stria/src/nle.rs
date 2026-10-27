@@ -18,6 +18,9 @@
 //!   ([`Demuxer::open_indexed`]) and a Matroska video track gets decode times from its codec's reorder depth
 //!   ([`Demuxer::derive_dts`] through `dsp::video::reorder_depth`); [`Sources::open_report`] says how each reel opened.
 //! * Source time 0 is a stream's first presentation time (vplay's rule).
+//! * A media file is its own timeline (EDITMAP, LEDGER SR223): [`Sources::from_media`] lays each stream's whole edit
+//!   list on its track through `timeline_core`'s `Timeline::lay_edit_list` (each segment a clip, an empty edit a gap),
+//!   so an edit-listed MP4 renders as its author cut it; [`OpenReport`] says `applied=<n>` (else `first-only`).
 //! * Transitions (NLE3, LEDGER SR202): a step carrying `vmix` decodes a second run (the outgoing source, which takes
 //!   over the live run it continues) through the same open-or-continue path ([`vid_frame`]) and mixes the two: a
 //!   dissolve is pixel_core's `blend_nonpremult` of the incoming at alpha `round(255 t)` over the outgoing, a wipe a
@@ -89,6 +92,8 @@ pub enum RenderError {
     Short(SourceId),
     /// Video steps exist but no scheduled source has a video stream to size the frame.
     NoSize,
+    /// EDITMAP (SR223): a media file's edit list could not be laid as a timeline (a rate edit, or a segment past the media).
+    Edit(timeline_core::EditError),
 }
 
 impl std::fmt::Display for RenderError {
@@ -103,6 +108,7 @@ impl std::fmt::Display for RenderError {
             RenderError::Format { src, rate, channels } => write!(f, "source {} audio {rate} Hz x{channels} is not the project format", src.0),
             RenderError::Short(s) => write!(f, "source {} ran out before its clip", s.0),
             RenderError::NoSize => f.write_str("no video source to size the frame"),
+            RenderError::Edit(e) => write!(f, "edit list: {e}"),
         }
     }
 }
@@ -161,11 +167,13 @@ pub struct Sources {
     media: Vec<(SourceId, Media)>,
     /// NLE4: the project's audio rate (0 = the first scheduled audio source's).
     audio_rate: u32,
+    /// EDITMAP (SR223): the sources laid from their own edit list ([`Sources::from_media`]) and how many clips it gave.
+    applied: Vec<(SourceId, usize)>,
 }
 
 impl Sources {
     pub fn new(tl: &Timeline) -> Sources {
-        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0 }
+        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new() }
     }
     /// NLE4: render audio at `hz` (sources at other rates are resampled); 0 = the first scheduled audio source's rate.
     pub fn set_audio_rate(&mut self, hz: u32) {
@@ -186,18 +194,22 @@ impl Sources {
         let m = self.get(id).ok()?;
         let i = m.video.or(m.audio)?;
         let s = m.demux.survey().streams.into_iter().nth(i)?;
-        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len() })
+        let applied = self.applied.iter().find(|a| a.0 == id).map(|a| a.1);
+        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len(), applied })
     }
 }
 
 /// DEMUXWIRE (SR213): one reel's open, as `nle schedule` prints it:
-/// `open=<full|indexed> dts=<stored|derived:n|presentation> edits=<n>`. Only the first media edit is applied (as
-/// playback does); `edits` counts every `elst` entry (DEMUXSEEK-EDITMAP owes the rest).
+/// `open=<full|indexed> dts=<stored|derived:n|presentation> edits=<n> applied=<n|first-only>`. `edits` counts every `elst`
+/// entry; EDITMAP (SR223): `applied` is the clips a reel opened by [`Sources::from_media`] laid from its whole edit list,
+/// `first-only` a reel an EDL cuts (only the first media edit applies, as playback does).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenReport {
     pub indexed: bool,
     pub decode_time: DecodeTime,
     pub edits: usize,
+    /// EDITMAP (SR223): `Some(clips)` when the reel's whole edit list was laid; `None` = the first media edit only.
+    pub applied: Option<usize>,
 }
 
 impl std::fmt::Display for OpenReport {
@@ -209,7 +221,11 @@ impl std::fmt::Display for OpenReport {
             DecodeTime::Derived(d) => write!(f, "derived:{d}")?,
             DecodeTime::Presentation => write!(f, "presentation")?,
         }
-        write!(f, " edits={}", self.edits)
+        write!(f, " edits={}", self.edits)?;
+        match self.applied {
+            Some(n) => write!(f, " applied={n}"),
+            None => write!(f, " applied=first-only"),
+        }
     }
 }
 
@@ -580,6 +596,12 @@ pub fn synth_sample(base: u32, i: u64) -> i16 {
 /// A codec-free test source (MP4): `frames` `utp1` test-pattern frames, 64x48 at `fps`, ordinals `base..`, a keyframe
 /// every 10 frames; plus mono 16-bit PCM at [`SYNTH_RATE`] of [`synth_sample`]s, as long as the video.
 pub fn synth_source(base: u32, frames: u32, fps: u32) -> Vec<u8> {
+    synth_source_with(base, frames, fps, &build::Mp4Extras::default())
+}
+
+/// EDITMAP (SR223): [`synth_source`] written with DEMUXSEEK's [`build::Mp4Extras`] (whole edit lists: track 1 is the video,
+/// track 2 the audio).
+pub fn synth_source_with(base: u32, frames: u32, fps: u32, x: &build::Mp4Extras) -> Vec<u8> {
     let fps = fps.max(1);
     let mut video = build::test_pattern_track(1, 64, 48, fps, frames, 10);
     for (i, s) in video.samples.iter_mut().enumerate() {
@@ -588,7 +610,7 @@ pub fn synth_source(base: u32, frames: u32, fps: u32) -> Vec<u8> {
     let n = frames as u64 * SYNTH_RATE as u64 / fps as u64;
     let pcm: Vec<i16> = (0..n).map(|i| synth_sample(base, i)).collect();
     let audio = build::pcm16_track(2, SYNTH_RATE, 1, &pcm, (SYNTH_RATE / fps / 2).max(1) as usize);
-    build::mp4(&[video, audio], &build::Mp4Options::default())
+    build::mp4_with(&[video, audio], &build::Mp4Options::default(), x)
 }
 
 /// The frame at source tick `src_t` of `src` from the decode run `run`: a step with `seek`, or a run on another
@@ -701,4 +723,33 @@ fn vmix_rgba(kind: timeline_core::TransitionKind, t: timeline_core::schedule::Fr
 fn clock_angle(x: usize, y: usize, w: usize, h: usize) -> f64 {
     let (dx, dy) = (x as f64 + 0.5 - w as f64 / 2.0, y as f64 + 0.5 - h as f64 / 2.0);
     dx.atan2(-dy).rem_euclid(std::f64::consts::TAU)
+}
+
+/// EDITMAP (LEDGER SR223): a media file as its own timeline.
+impl Sources {
+    /// Open `bytes` as the one source of a new timeline at `fps` (reel `reel`) and lay each stream's whole edit list on
+    /// its own track (video V1, audio A1) through `Timeline::lay_edit_list` (source time 0 = the stream's first pts, the
+    /// origin [`Media::open`] keeps; no edit list = the whole source). `Ok(None)` when the bytes are no container
+    /// demux_core knows (`probe`): the caller reads them as an EDL.
+    pub fn from_media(reel: &str, bytes: &[u8], fps: u32) -> Result<Option<(Timeline, Sources)>, RenderError> {
+        if gneiss_pal::dsp::demux::probe(bytes).is_none() {
+            return Ok(None);
+        }
+        let mut tl = Timeline::new(fps);
+        let mut sources = Sources::new(&tl);
+        let id = SourceId(0);
+        sources.add(id, bytes.to_vec())?;
+        let src = tl.add_source(reel, sources.duration(id).unwrap_or(0));
+        let m = sources.get(id)?;
+        let mut applied = None;
+        for kind in [Kind::Video, Kind::Audio] {
+            let Some((i, origin)) = m.stream(kind) else { continue };
+            let track = tl.add_track(kind);
+            let tb = m.demux.tracks()[i].timebase;
+            tl = tl.lay_edit_list(track, src, m.demux.edit_list(i), tb, origin).map_err(RenderError::Edit)?;
+            applied.get_or_insert(tl.tracks[track].clips.len());
+        }
+        sources.applied.push((src, applied.unwrap_or(0)));
+        Ok(Some((tl, sources)))
+    }
 }

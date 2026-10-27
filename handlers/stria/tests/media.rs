@@ -535,6 +535,6 @@ fn hevcpal_editor_derives_hevc_dts() {
     let mut src = stria::nle::Sources::new(&tl);
     src.add(SourceId(0), file).unwrap();
     let r = src.open_report(SourceId(0)).unwrap();
-    assert_eq!(r.to_string(), "open=full dts=derived:0 edits=0", "{r:?}");
+    assert_eq!(r.to_string(), "open=full dts=derived:0 edits=0 applied=first-only", "{r:?}");
     println!("hevcpal: editor {r}");
 }
