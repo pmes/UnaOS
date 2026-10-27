@@ -3510,7 +3510,7 @@ tcurx = ["tegra", "orinrx", "tcuprobe"]
 # `#[cfg]`-erased, and the image is byte-identical to baseline. Witness tokens are subsystem-named
 # (`[facet]`, `FACETPNG`). Carried by the `deskcascade` implication below so the fifteen-knob jetson
 # build reaches it with no sixteenth knob.
-facet = ["quarry"]
+facet = ["quarry", "dep:icc_core"] # KERNEL-FACET-ICC (LEDGER SR367): + icc_core, the viewer converts tagged stills to sRGB; a `dep:` so a knob-off image carries none of it
 # USBLUN-M3 (F2): the WAY BACK from the USB multi-LUN census. `UNAOS_NOUSBLUN=1` => this feature =>
 # `drivers/xhci/mod.rs` compiles no census at all: Get Max LUN (class request 0xFE) is never asked,
 # `usblun_census`/`usblun_probe`/`bot_get_max_lun`/`ep0_resync` and the three census field types are
@@ -3983,6 +3983,9 @@ crypto_core = { path = "../../libs/sys/crypto_core" }
 # inflater + the SHOTZIP PNG encoder, moved here from `selfhost/inflate.rs` and `video/png.rs` (both now
 # re-exports). no_std + alloc, zero deps; arch-neutral; the same crate Aether (via gneiss_pal) links.
 pixel_core = { path = "../../libs/media/pixel_core" }
+# KERNEL-FACET-ICC (LEDGER SR367): Facet's ONE ICC engine (no_std + alloc, its one dep libm, already locked for timeline_core);
+# pulled only by `facet` (the viewer converts a decoded still's `Image::icc` through `apply_icc_to_srgb`).
+icc_core = { path = "../../libs/media/icc_core", optional = true }
 # KERNELFONT (B359): the text core (OpenType, shaping, rasterizer) and its desktop engine `font_core::ui`, behind
 # `video::text`. no_std + alloc, zero deps; only the desktop images reference it, so no other image links it.
 font_core = { path = "../../libs/text/font_core" }

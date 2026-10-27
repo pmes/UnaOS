@@ -1523,7 +1523,7 @@ fn decode_foreign(
         }
         bytes.extend_from_slice(&b);
     }
-    let img = pixel_core::decode_first_frame(&bytes).map_err(FacetError::Pixel)?;
+    let mut img = pixel_core::decode_first_frame(&bytes).map_err(FacetError::Pixel)?; icc_open(path, &mut img);
     drop(bytes);
     reduce_rgba(&img, bw, bh)
 }
@@ -2153,3 +2153,21 @@ pub fn win() -> wm::WinId {
 // through the binning developer), FAST for Quick Look (the embedded JPEG). A child module, so no `video/mod.rs` line.
 #[path = "facet_raw.rs"]
 pub mod raw;
+
+/// KERNEL-FACET-ICC (LEDGER SR367): convert a decoded still tagged with an embedded ICC profile (`pixel_core::Image::icc`)
+/// to sRGB through icc_core's ONE entry, `apply_icc_to_srgb` (the host Facet's conversion, the same crate), before the box
+/// reduction; one `[image] icc <converted|srgb|refused:<why>>` line per open (`srgb`: untagged, or an sRGB profile; a
+/// refusal keeps the decoded pixels, sRGB assumed). The kernel's streaming PNG path (no iCCP read: KERNEL-PNG-ICC) and
+/// the animated / RAW paths (KERNEL-ANIM-ICC) are owed.
+fn icc_open(path: &str, img: &mut pixel_core::Image) {
+    let n = img.icc.as_ref().map_or(0, |p| p.len());
+    let verdict: String = match img.icc.take() {
+        None => String::from("srgb"),
+        Some(icc) => match icc_core::apply_icc_to_srgb(&icc, &mut img.rgba) {
+            Ok(icc_core::Applied::Converted) => String::from("converted"),
+            Ok(icc_core::Applied::Srgb) => String::from("srgb"),
+            Err(e) => alloc::format!("refused:{}", e).chars().map(|c| if c == ' ' { '-' } else { c }).collect(),
+        },
+    };
+    serial_println!("[image] icc {} bytes={} path={}", verdict, n, path);
+}

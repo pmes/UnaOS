@@ -127,8 +127,8 @@ impl Facet {
     /// Open already-read bytes; `path` labels them.
     pub fn open_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<(u64, FacetImageInfo), String> {
         let format = self.source.sniff(bytes).ok_or_else(|| format!("{path}: {}", source::unrecognised(bytes)))?;
-        let meta = meta::read(bytes, format);
-        let decoded = self.source.decode(bytes).map_err(|e| format!("{path}: {e}"))?;
+        let mut meta = meta::read(bytes, format);
+        let decoded = self.source.decode(bytes).map_err(|e| format!("{path}: {e}"))?; meta::icc(&mut meta, format, decoded.icc.as_deref()); // METAICCONE (SR367): the profile label from the one decode's Image::icc
         if decoded.rgba.len() != decoded.width as usize * decoded.height as usize * 4 {
             return Err(format!("{path}: source returned a short pixel buffer"));
         }
