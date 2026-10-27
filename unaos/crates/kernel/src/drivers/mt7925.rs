@@ -88,6 +88,7 @@ pub fn service() {
         S_WAIT_VOL => wait_vol(),
         S_S2 => s2(),
         S_S3 => s3(),
+        S_S4 => s4(), // MT7925S4 (zenbook-ledger Z17): the pass after a clean S3 line (`s3_done`)
         _ => {}
     }
 }
@@ -184,35 +185,17 @@ fn hex32(d: &[u8; 32]) -> String {
 /// as a digest to pin, not a silence.
 fn fw_check() -> Fw {
     let mut out = Fw { word: String::from("absent"), sha: ["-", "-"] };
-    let Ok(fs) = crate::fs::fat::mount_program_source() else {
-        out.word = String::from("no-esp");
-        return out;
+    let (fs, ents) = match fw_dir() {
+        Ok(d) => d,
+        Err(w) => {
+            out.word = String::from(w);
+            return out;
+        }
     };
-    let Ok(root) = fs.read_root() else {
-        out.word = String::from("no-esp");
-        return out;
-    };
-    let Some(d0) = sub(&fs, &root, DIR0) else { return out };
-    let Some(ents) = sub(&fs, &d0, DIR1) else { return out };
     let mut present = 0usize;
     for (i, (role, file)) in SET.iter().enumerate() {
-        let Some(de) = ents.iter().find(|e| !e.is_dir && name_is(e, file)) else { continue };
+        let Some((verdict, hex, size, _)) = fw_read(&fs, &ents, i) else { continue };
         present += 1;
-        let size = de.size as usize;
-        let mut buf = Vec::new();
-        let (verdict, hex): (&'static str, String) = if size > MAX_FILE {
-            ("too-large", String::from("-"))
-        } else if fs.read_file(de, &mut buf, MAX_FILE).is_err() || buf.len() != size {
-            ("unreadable", String::from("-"))
-        } else {
-            let sha = crypto_core::sha2::sha256(&buf);
-            let hex = hex32(&sha);
-            match crate::hash::pins::pin_for(PINS, role) { // FWSTAGEONE (rmbp-ledger B984): the one pins reader
-                None => ("unpinned", hex),
-                Some(p) if p == sha => ("ok", hex),
-                Some(_) => ("mismatch", hex),
-            }
-        };
         out.sha[i] = match verdict {
             "ok" | "mismatch" | "unpinned" => verdict,
             _ => "-",
@@ -226,6 +209,40 @@ fn fw_check() -> Fw {
         out.word = alloc::format!("present:{}", present);
     }
     out
+}
+
+/// The program-source FAT mounted and `FW/MT7925/` listed (MT7925S4, Z17, hoisted out of `fw_check` so S1 and S4 share
+/// ONE reader). Err = the `fw=` word: `no-esp` (no mount or no root) or `absent` (no FW/MT7925 directory).
+fn fw_dir() -> Result<(crate::fs::fat::FatFs, Vec<crate::fs::fat::DirEntry>), &'static str> {
+    let fs = crate::fs::fat::mount_program_source().map_err(|_| "no-esp")?;
+    let root = fs.read_root().map_err(|_| "no-esp")?;
+    let d0 = sub(&fs, &root, DIR0).ok_or("absent")?;
+    let ents = sub(&fs, &d0, DIR1).ok_or("absent")?;
+    Ok((fs, ents))
+}
+
+/// Member `i` of SET read whole and digested against its pin (MT7925S4 hoisted it out of `fw_check`; S1 reads the
+/// verdict, S4 uploads the bytes only when it is `ok`). None = not on the volume; else (verdict, sha256 hex or `-`,
+/// directory size, the bytes read).
+fn fw_read(fs: &crate::fs::fat::FatFs, ents: &[crate::fs::fat::DirEntry], i: usize) -> Option<(&'static str, String, usize, Vec<u8>)> {
+    let (role, file) = SET[i];
+    let de = ents.iter().find(|e| !e.is_dir && name_is(e, file))?;
+    let size = de.size as usize;
+    let mut buf = Vec::new();
+    let (verdict, hex): (&'static str, String) = if size > MAX_FILE {
+        ("too-large", String::from("-"))
+    } else if fs.read_file(de, &mut buf, MAX_FILE).is_err() || buf.len() != size {
+        ("unreadable", String::from("-"))
+    } else {
+        let sha = crypto_core::sha2::sha256(&buf);
+        let hex = hex32(&sha);
+        match crate::hash::pins::pin_for(PINS, role) { // FWSTAGEONE (rmbp-ledger B984): the one pins reader
+            None => ("unpinned", hex),
+            Some(p) if p == sha => ("ok", hex),
+            Some(_) => ("mismatch", hex),
+        }
+    };
+    Some((verdict, hex, size, buf))
 }
 
 fn say(p: &Probe, fw: &Fw) {
@@ -524,10 +541,7 @@ fn s3() {
     }
     let mut rb = true;
     for (q, pa) in [(b + TX_RING_BASE + TXQ_FWDL * RING_REGS, tx), (b + RX_EVENT_RING_BASE + RXQ_MCU * RING_REGS, rx)] {
-        w32(q, pa as u32); // base
-        w32(q + 4, RING_DEPTH); // count
-        w32(q + 8, 0); // CPU index: no TX posted, no RX buffer handed
-        rb &= r32(q) == pa as u32 && r32(q + 4) == RING_DEPTH;
+        rb &= arm(q, pa, 0); // CPU index 0: no TX posted, no RX buffer handed (MT7925S4 hoisted the body into `arm`)
     }
     let glo = dma_on(b);
     let rel = give_back(lp, took);
@@ -535,6 +549,7 @@ fn s3() {
         "[mt7925] s3 wfdma tx={:#x} rx={:#x} cnt={} rb={} glo={:#010x} rel={} -> parked",
         tx, rx, RING_DEPTH, if rb { "ok" } else { "bad" }, glo, rel
     );
+    s3_done(tx, rx, rb, glo, rel); // MT7925S4 (Z17): the rings recorded, S4 on the next pass only after a clean S3 line
 }
 
 /// A BAR0 register read; only on pages `map_page` proved present this boot (S2's, S3's).
