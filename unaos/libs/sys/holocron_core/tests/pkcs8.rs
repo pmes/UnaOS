@@ -5,7 +5,8 @@
 //! parser before it is sealed, and Sign's long form signs with it inside the service; every signature is checked by
 //! tls_core's own `verify_signed` (the product provider). The key files are written by tls_core's key-container writers
 //! (`pkcs8_build`, `rsa_private_build`, `ec_private_build`) from crypto_core keys: RSA-2048 generated deterministically,
-//! P-256 and Ed25519 from fixed scalars.
+//! P-256 and Ed25519 from fixed scalars. KEYSIGNONE (LEDGER SR393): the signatures come from tls_core's ONE signer and
+//! each refusal is named on the wire (`WRONG_KIND`, `BAD_DIGEST_LEN`, `UNSUPPORTED_SCHEME`).
 
 use crypto_core::ed25519::SigningKey;
 use crypto_core::p256::SecretKey;
@@ -152,14 +153,17 @@ fn refusals() {
     assert_eq!(call(&mut h, put(SIGN_NS, "k", "api-key", &ec_file)).status, status::INVALID);
     assert_eq!(call(&mut h, put(SIGN_NS, "ec", KIND_PKCS8, &ec_file)).status, status::OK);
     assert_eq!(holocron_core::pkcs8::check(&ec_file), Ok("p256"));
-    // Algorithm / digest mismatches.
+    // Algorithm / digest mismatches, each named on the wire (KEYSIGNONE SR393).
     let dg = digest::<Sha256>(MSG);
-    assert_eq!(call(&mut h, sign_with("ec", sign_alg::SHA384, &dg)).status, status::INVALID);
-    assert_eq!(call(&mut h, sign_with("ec", sign_alg::SHA256 | sign_alg::PSS, &dg)).status, status::INVALID);
-    assert_eq!(call(&mut h, sign_with("ec", sign_alg::NONE, MSG)).status, status::INVALID);
-    assert_eq!(call(&mut h, sign_with("ec", 0x41, &dg)).status, status::INVALID);
+    assert_eq!(call(&mut h, sign_with("ec", sign_alg::SHA384, &dg)).status, status::BAD_DIGEST_LEN);
+    assert_eq!(call(&mut h, sign_with("ec", sign_alg::SHA256, &dg[..31])).status, status::BAD_DIGEST_LEN);
+    assert_eq!(call(&mut h, sign_with("ec", sign_alg::SHA256 | sign_alg::PSS, &dg)).status, status::WRONG_KIND);
+    assert_eq!(call(&mut h, sign_with("ec", sign_alg::NONE, MSG)).status, status::WRONG_KIND);
+    assert_eq!(call(&mut h, sign_with("ec", 0x41, &dg)).status, status::UNSUPPORTED_SCHEME);
+    assert_eq!(call(&mut h, sign_with("ec", 0x04, &dg)).status, status::UNSUPPORTED_SCHEME);
+    assert_eq!(call(&mut h, sign_with("ec", sign_alg::PSS, &dg)).status, status::UNSUPPORTED_SCHEME);
     assert_eq!(call(&mut h, put(SIGN_NS, "ed", KIND_PKCS8, &ed_file(&[0x22; 32]))).status, status::OK);
-    assert_eq!(call(&mut h, sign_with("ed", sign_alg::SHA256, &dg)).status, status::INVALID);
+    assert_eq!(call(&mut h, sign_with("ed", sign_alg::SHA256, &dg)).status, status::WRONG_KIND);
     // Missing, other namespaces, locked.
     assert_eq!(call(&mut h, sign_with("nope", sign_alg::SHA256, &dg)).status, status::NOT_FOUND);
     let other = Request::SignWith { ns: "vein".into(), key: "ec".into(), alg: sign_alg::SHA256, data: dg.clone() };
@@ -193,5 +197,26 @@ fn ssh_key_through_the_long_form() {
     let long = call(&mut h, Request::SignWith { ns: "ssh".into(), key: "id".into(), alg: sign_alg::NONE, data: MSG.to_vec() });
     assert_eq!(wire::decode_sign(&long.body), Some((key_kind::ED25519, &short.body[..])));
     let hashed = Request::SignWith { ns: "ssh".into(), key: "id".into(), alg: sign_alg::SHA256, data: MSG.to_vec() };
-    assert_eq!(call(&mut h, hashed).status, status::INVALID);
+    assert_eq!(call(&mut h, hashed).status, status::WRONG_KIND);
+}
+
+/// KEYSIGNONE (SR393): the refusal reasons are distinct codes with their own words; INVALID stays the catch-all.
+#[test]
+fn reason_words() {
+    let named = [
+        (status::WRONG_KIND, "wrong-kind"),
+        (status::BAD_DIGEST_LEN, "bad-digest-len"),
+        (status::UNSUPPORTED_SCHEME, "unsupported-scheme"),
+        (status::INVALID, "invalid"),
+        (status::NOT_FOUND, "not-found"),
+        (status::OK, "ok"),
+    ];
+    for (code, word) in named {
+        assert_eq!(status::word(code), word, "{code}");
+    }
+    let codes = [status::WRONG_KIND, status::BAD_DIGEST_LEN, status::UNSUPPORTED_SCHEME, status::INVALID, status::CORRUPT, status::IO];
+    for (i, a) in codes.iter().enumerate() {
+        assert!(codes[i + 1..].iter().all(|b| b != a), "{a} is one reason");
+    }
+    assert_eq!(status::word(-1000), "error");
 }

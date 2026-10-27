@@ -15,6 +15,11 @@
 //!   name: encrypted PKCS#8 and encrypted PEM, P-384, P-521 and other curves, RSASSA-PSS-keyed RSA, multi-prime RSA,
 //!   components that do not describe one key, a carried public key that is not the private key's, several keys.
 //!
+//! * KEYSIGNONE (LEDGER SR393): [`Scheme`] (the one signature vocabulary, over [`HashAlg`]) and [`sign`] (feature
+//!   `cryptocore`): the ONE signer every holder of a parsed key calls — pdf_core's `sig/cms.rs` local keys and
+//!   Holocron's `pkcs8::sign` — with the digest-vs-message rule inside and the RSASSA-PSS salt the caller's
+//!   ([`Salt`]); refusals by the names [`WRONG_KIND`], [`DIGEST_LEN`], [`SALT_LEN`], [`SALT_SOURCE`], [`SIGN_FAILED`].
+//!
 //! The reader is strict DER because key material is attacker-supplied. Decoded key bytes are wiped once parsed.
 
 use alloc::vec;
@@ -244,8 +249,50 @@ pub fn ec_private_build(d: &[u8], public: &[u8]) -> Vec<u8> {
     build::seq(&[&build::int(&[1]), &build::octets(d), &build::explicit(1, &build::bits(public))])
 }
 
+pub use crate::crypto::HashAlg;
+
+/// KEYSIGNONE (SR393): what a signature is — the algorithm and the digest it is over; the one vocabulary pdf_core's
+/// CMS writer and Holocron's Sign share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheme {
+    /// RSASSA-PKCS1-v1_5.
+    Pkcs1(HashAlg),
+    /// RSASSA-PSS, MGF1 with the same hash, salt length = the hash's length.
+    Pss(HashAlg),
+    /// ECDSA P-256 (RFC 6979; DER Ecdsa-Sig-Value).
+    P256(HashAlg),
+    /// Ed25519 (pure; a CMS digest over it is SHA-512, RFC 8419).
+    Ed25519,
+}
+
+impl Scheme {
+    /// The digest algorithm: the chosen one, SHA-512 for Ed25519.
+    pub fn hash(self) -> HashAlg {
+        match self {
+            Scheme::Pkcs1(h) | Scheme::Pss(h) | Scheme::P256(h) => h,
+            Scheme::Ed25519 => HashAlg::Sha512,
+        }
+    }
+
+    /// Whether [`sign`]'s `tbs` is the DIGEST under [`Self::hash`] (RSA, P-256) rather than the message (Ed25519).
+    pub fn tbs_is_digest(self) -> bool {
+        self != Scheme::Ed25519
+    }
+}
+
+/// KEYSIGNONE (SR393): the key cannot make the scheme (an RSA scheme on a P-256 key, ...).
+pub const WRONG_KIND: &str = "key kind";
+/// KEYSIGNONE (SR393): the digest is not the scheme's hash length.
+pub const DIGEST_LEN: &str = "digest length";
+/// KEYSIGNONE (SR393): a given RSASSA-PSS salt is not the hash's length.
+pub const SALT_LEN: &str = "salt length";
+/// KEYSIGNONE (SR393): the caller's salt source failed.
+pub const SALT_SOURCE: &str = "salt source";
+/// KEYSIGNONE (SR393): crypto_core refused to sign (no valid key does this).
+pub const SIGN_FAILED: &str = "signature";
+
 #[cfg(feature = "cryptocore")]
-pub use self::keys::{Key, parse};
+pub use self::keys::{Key, KeyRef, Salt, parse, sign};
 #[cfg(feature = "cryptocore")]
 pub use crypto_core::{ed25519::SigningKey, p256::SecretKey, rsa_private::PrivateKey};
 
@@ -436,5 +483,90 @@ mod keys {
     fn rsa_key(der: &[u8]) -> Result<PrivateKey, KeyError> {
         let [n, e, d, p, q, dp, dq, qi] = rsa_private(der)?;
         PrivateKey::from_components(n, e, d, p, q, dp, dq, qi).map_err(|_| KeyError::Refused("RSA components"))
+    }
+
+    /// KEYSIGNONE (SR393): a borrowed private key — what [`sign`] signs with, so a caller holding crypto_core keys
+    /// (pdf_core's `SignerKey`) and one holding a parsed [`Key`] (Holocron) reach the one signer.
+    #[derive(Clone, Copy)]
+    pub enum KeyRef<'a> {
+        Rsa(&'a PrivateKey),
+        P256(&'a SecretKey),
+        Ed25519(&'a SigningKey),
+    }
+
+    impl<'a> From<&'a Key> for KeyRef<'a> {
+        fn from(k: &'a Key) -> Self {
+            match k {
+                Key::Rsa(k) => KeyRef::Rsa(k),
+                Key::P256(k) => KeyRef::P256(k),
+                Key::Ed25519(k) => KeyRef::Ed25519(k),
+            }
+        }
+    }
+
+    /// KEYSIGNONE (SR393): where an RSASSA-PSS salt (the hash's length) comes from — the caller's bytes (pdf_core's
+    /// salt derived from the key and the message, SR361) or the caller's entropy (Holocron). Ignored by the other
+    /// schemes.
+    pub enum Salt<'a> {
+        Given(&'a [u8]),
+        Random(&'a mut dyn FnMut(&mut [u8]) -> Result<(), ()>),
+    }
+
+    /// KEYSIGNONE (SR393): the ONE signer. `tbs` is the DIGEST under `scheme.hash()` for RSA and P-256 (refused by
+    /// [`DIGEST_LEN`] at any other length) and the MESSAGE for Ed25519 ([`Scheme::tbs_is_digest`]). The signature: k
+    /// bytes for RSA, a DER Ecdsa-Sig-Value for P-256, 64 bytes for Ed25519. A key that cannot make the scheme is
+    /// refused by [`WRONG_KIND`] first, whatever `tbs` is.
+    pub fn sign<'a>(key: impl Into<KeyRef<'a>>, scheme: Scheme, tbs: &[u8], salt: Salt<'_>) -> Result<Vec<u8>, KeyError> {
+        let key = key.into();
+        let fits = matches!(
+            (key, scheme),
+            (KeyRef::Ed25519(_), Scheme::Ed25519) | (KeyRef::P256(_), Scheme::P256(_)) | (KeyRef::Rsa(_), Scheme::Pkcs1(_) | Scheme::Pss(_))
+        );
+        if !fits {
+            return Err(KeyError::Refused(WRONG_KIND));
+        }
+        if scheme.tbs_is_digest() && tbs.len() != scheme.hash().output_len() {
+            return Err(KeyError::Refused(DIGEST_LEN));
+        }
+        match (key, scheme) {
+            (KeyRef::Ed25519(k), Scheme::Ed25519) => Ok(k.sign(tbs).to_vec()),
+            (KeyRef::P256(k), Scheme::P256(_)) => {
+                let raw = k.sign_prehashed(tbs);
+                let mut der = [0u8; 72];
+                let n = p256::signature_to_der(&raw, &mut der);
+                Ok(der[..n].to_vec())
+            }
+            (KeyRef::Rsa(k), Scheme::Pkcs1(_)) => rsa_out(k, |out| k.sign_pkcs1v15(tbs, out)),
+            (KeyRef::Rsa(k), Scheme::Pss(h)) => {
+                let hlen = h.output_len();
+                let mut drawn = vec![0u8; hlen];
+                let s: &[u8] = match salt {
+                    Salt::Given(s) if s.len() == hlen => s,
+                    Salt::Given(_) => return Err(KeyError::Refused(SALT_LEN)),
+                    Salt::Random(fill) => {
+                        if fill(&mut drawn).is_err() {
+                            return Err(KeyError::Refused(SALT_SOURCE));
+                        }
+                        &drawn
+                    }
+                };
+                let r = rsa_out(k, |out| match h {
+                    HashAlg::Sha256 => k.sign_pss::<crypto_core::Sha256>(tbs, s, out),
+                    HashAlg::Sha384 => k.sign_pss::<crypto_core::Sha384>(tbs, s, out),
+                    HashAlg::Sha512 => k.sign_pss::<crypto_core::Sha512>(tbs, s, out),
+                });
+                drawn[..].zeroize();
+                r
+            }
+            _ => Err(KeyError::Refused(WRONG_KIND)),
+        }
+    }
+
+    /// An RSA signature into a k-byte buffer, cut to its length.
+    fn rsa_out(k: &PrivateKey, f: impl FnOnce(&mut [u8]) -> Result<usize, crypto_core::Error>) -> Result<Vec<u8>, KeyError> {
+        let mut out = vec![0u8; k.public_key().size()];
+        let n = f(&mut out).map_err(|_| KeyError::Refused(SIGN_FAILED))?;
+        out.truncate(n);
+        Ok(out)
     }
 }

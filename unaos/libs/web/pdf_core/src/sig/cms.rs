@@ -16,53 +16,34 @@
 //! PDF-KEYSTORE (LEDGER SR382): [`SignerKey::Remote`] signs with a key held ELSEWHERE (Holocron): the [`Scheme`] and the
 //! longest signature come from the signer certificate ([`Remote::for_certificate`]), and the signature from a callback
 //! handed the digest of the signed attributes (the message itself for Ed25519) — the key never enters this process.
+//!
+//! KEYSIGNONE (LEDGER SR393): [`Scheme`] is tls_core's `key::Scheme` and the local keys sign through tls_core's ONE
+//! signer (`tls_core::key::sign`, the signer Holocron's `pkcs8::sign` calls too); the PSS salt policy stays here.
 
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crypto_core::ct::Zeroize;
-use crypto_core::p256;
 use crypto_core::rsa_private::Part;
-use crypto_core::{Sha256, Sha384, Sha512};
 pub use crypto_core::ed25519::SigningKey;
 pub use crypto_core::p256::SecretKey;
 pub use crypto_core::rsa_private::PrivateKey;
-pub use tls_core::key::{Key, KeyError, parse as parse_key};
+pub use tls_core::key::{Key, KeyError, Scheme, parse as parse_key};
+use tls_core::key::{KeyRef, Salt, sign as key_sign};
 use tls_core::x509::build::{self, alg, explicit, octets, oid, seq, set, set_of_content};
 use tls_core::x509::der::{encode_tlv, tag};
 use tls_core::x509::{Certificate, PublicKey, oid as xoid};
 
 pub use super::Hash;
+use super::HashDigest;
 use super::{ID_CONTENT_TYPE, ID_DATA, ID_MESSAGE_DIGEST, ID_SIGNED_DATA, ID_SIGNING_TIME};
 use crate::Error;
 
 /// id-aa-signingCertificateV2 (RFC 5035 §3).
 const ID_SIGNING_CERTIFICATE_V2: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x02, 0x2f];
 
-/// What a signature is: the algorithm and the digest it is over (PDF-KEYSTORE SR382: the one vocabulary the local keys
-/// and a [`Remote`] signer share).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scheme {
-    /// RSASSA-PKCS1-v1_5.
-    Pkcs1(Hash),
-    /// RSASSA-PSS, MGF1 with the same hash, salt length = the hash's length.
-    Pss(Hash),
-    /// ECDSA P-256 (DER Ecdsa-Sig-Value).
-    P256(Hash),
-    /// Ed25519 (pure; the CMS digest is SHA-512, RFC 8419).
-    Ed25519,
-}
-
-impl Scheme {
-    /// The digest algorithm: the chosen one, SHA-512 for Ed25519.
-    pub fn hash(self) -> Hash {
-        match self {
-            Scheme::Pkcs1(h) | Scheme::Pss(h) | Scheme::P256(h) => h,
-            Scheme::Ed25519 => Hash::Sha512,
-        }
-    }
-}
+// KEYSIGNONE (SR393): `Scheme` (PDF-KEYSTORE SR382's vocabulary) is tls_core's `key::Scheme`, re-exported above.
 
 /// The callback a [`Remote`] signer signs through: handed the scheme and the to-be-signed bytes (the digest of the
 /// signed attributes under the scheme's hash; the attributes themselves for Ed25519), it answers the signature (a DER
@@ -138,34 +119,25 @@ impl SignerKey<'_> {
     /// [`Self::sign`], with a [`Remote`] signer's failure named: `Unsupported("remote signer")` when the callback
     /// refuses, `Unsupported("remote signature length")` when it answers more than its `max_sig`.
     fn try_sign(&self, msg: &[u8]) -> Result<Vec<u8>, Error> {
+        // KEYSIGNONE (SR393): one to-be-signed rule for every key (the digest under the scheme's hash, the message for
+        // Ed25519) and the local keys signed by tls_core's ONE signer (`key::sign`; an impossible failure stays an
+        // empty signature).
+        let scheme = self.scheme();
+        let tbs = if scheme.tbs_is_digest() { scheme.hash().digest(&[msg]) } else { msg.to_vec() };
         Ok(match self {
             SignerKey::Remote(r) => {
-                let tbs = match r.scheme {
-                    Scheme::Ed25519 => msg.to_vec(),
-                    s => s.hash().digest(&[msg]),
-                };
                 let sig = (r.sign)(r.scheme, &tbs).map_err(|_| Error::Unsupported("remote signer"))?;
                 if sig.len() > r.max_sig {
                     return Err(Error::Unsupported("remote signature length"));
                 }
                 sig
             }
-            SignerKey::Ed25519(k) => k.sign(msg).to_vec(),
-            SignerKey::P256(k, h) => {
-                let raw = k.sign_prehashed(&h.digest(&[msg]));
-                let mut der = [0u8; 72];
-                let n = p256::signature_to_der(&raw, &mut der);
-                der[..n].to_vec()
-            }
-            SignerKey::Rsa(k, h) => rsa_out(k, |out| k.sign_pkcs1v15(&h.digest(&[msg]), out)),
+            SignerKey::Ed25519(k) => key_sign(KeyRef::Ed25519(*k), scheme, &tbs, Salt::Given(&[])).unwrap_or_default(),
+            SignerKey::P256(k, _) => key_sign(KeyRef::P256(*k), scheme, &tbs, Salt::Given(&[])).unwrap_or_default(),
+            SignerKey::Rsa(k, _) => key_sign(KeyRef::Rsa(*k), scheme, &tbs, Salt::Given(&[])).unwrap_or_default(),
             SignerKey::RsaPss(k, h) => {
-                let digest = h.digest(&[msg]);
                 let salt = pss_salt(k, *h, msg);
-                rsa_out(k, |out| match h {
-                    Hash::Sha256 => k.sign_pss::<Sha256>(&digest, &salt, out),
-                    Hash::Sha384 => k.sign_pss::<Sha384>(&digest, &salt, out),
-                    Hash::Sha512 => k.sign_pss::<Sha512>(&digest, &salt, out),
-                })
+                key_sign(KeyRef::Rsa(*k), scheme, &tbs, Salt::Given(&salt)).unwrap_or_default()
             }
         })
     }
@@ -257,17 +229,6 @@ fn pss_salt(k: &PrivateKey, h: Hash, msg: &[u8]) -> Vec<u8> {
     let salt = h.digest(&[b"PDFSIGN-PSS", &d[..n], msg]);
     d[..].zeroize();
     salt
-}
-
-fn rsa_out(k: &PrivateKey, f: impl FnOnce(&mut [u8]) -> Result<usize, crypto_core::Error>) -> Vec<u8> {
-    let mut out = vec![0u8; k.public_key().size()];
-    match f(&mut out) {
-        Ok(n) => {
-            out.truncate(n);
-            out
-        }
-        Err(_) => Vec::new(),
-    }
 }
 
 /// A detached SignedData over the `digest` (the key's [`SignerKey::hash`]) of the signed bytes, signed by `key`; `chain[0]` is the signer's

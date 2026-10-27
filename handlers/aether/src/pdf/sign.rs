@@ -83,7 +83,7 @@ fn sign_through(
             (*c)(&req).map_err(|e| format!("holocron: {e}"))?
         };
         if reply.status != status::OK {
-            return Err(format!("holocron: {ns}/{name} status {}", reply.status));
+            return Err(format!("holocron: {ns}/{name} {} ({})", status::word(reply.status), reply.status)); // KEYSIGNONE (SR393): the reason named
         }
         match wire::decode_sign(&reply.body) {
             Some((k, sig)) if k == kind(s) => Ok(sig.to_vec()),
@@ -242,6 +242,6 @@ mod tests {
         let original = pdf();
         let doc = Document::parse(&original).unwrap();
         let err = sign_through(&doc, &original, "Signature1", &chain, "sign", "missing", AT, &ENTROPY, &mut fake(file)).unwrap_err();
-        assert_eq!(err, format!("holocron: sign/missing status {}", status::NOT_FOUND));
+        assert_eq!(err, "holocron: sign/missing not-found (-2)");
     }
 }

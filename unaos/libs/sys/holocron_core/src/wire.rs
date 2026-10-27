@@ -24,7 +24,9 @@
 //! `str8` = `u8 len, bytes`; `bytes16` = `u16 len (LE), bytes`. A body with trailing bytes is EINVAL.
 //! Sign's long form ([`Request::SignWith`]) carries the namespace and the algorithm after the short form's fields: ns
 //! `ssh` with alg 0 is the short form's Ed25519 key; ns `sign` names a key file (kind `pkcs8`) and `data` is the DIGEST
-//! for RSA / P-256, the MESSAGE for Ed25519. The short form's bytes are unchanged.
+//! for RSA / P-256, the MESSAGE for Ed25519. The short form's bytes are unchanged. KEYSIGNONE (SR393): a refused long
+//! form names its reason — `status::WRONG_KIND`, `status::BAD_DIGEST_LEN`, `status::UNSUPPORTED_SCHEME` (`INVALID` the
+//! catch-all); `status::word` is the one word for each status.
 //! An error reply is its status and NO body (the BANDY v1 frozen error-reply rule).
 
 use alloc::string::String;
@@ -88,6 +90,38 @@ pub mod status {
     pub const CORRUPT: i32 = -74;
     /// ENOSYS: unknown verb.
     pub const NO_VERB: i32 = -38;
+    /// KEYSIGNONE (SR393) EPROTOTYPE: Sign's long form asked a scheme the key cannot make (a hash of an Ed25519 key,
+    /// PSS of a P-256 key, no hash of an RSA key).
+    pub const WRONG_KIND: i32 = -91;
+    /// KEYSIGNONE (SR393) EMSGSIZE: Sign's long form sent a digest that is not its hash's length.
+    pub const BAD_DIGEST_LEN: i32 = -90;
+    /// KEYSIGNONE (SR393) EOPNOTSUPP: Sign's long form `alg` byte names no scheme (an unknown bit or hash, PSS without
+    /// a hash).
+    pub const UNSUPPORTED_SCHEME: i32 = -95;
+
+    /// KEYSIGNONE (SR393): the ONE word for a status (the user-holocron, kernel keyring and holocron CLI tables are
+    /// owed onto it: STATUS-WORDS-ONE); `error` for a code this table does not name.
+    pub fn word(s: i32) -> &'static str {
+        match s {
+            OK => "ok",
+            BAD_PASSWORD => "bad-password",
+            NOT_FOUND => "not-found",
+            IO => "io",
+            RATE_LIMITED => "rate-limited",
+            DENIED => "denied",
+            EXISTS => "exists",
+            NO_RING => "no-ring",
+            INVALID => "invalid",
+            TOO_BIG => "too-big",
+            LOCKED => "locked",
+            CORRUPT => "corrupt",
+            NO_VERB => "no-verb",
+            WRONG_KIND => "wrong-kind",
+            BAD_DIGEST_LEN => "bad-digest-len",
+            UNSUPPORTED_SCHEME => "unsupported-scheme",
+            _ => "error",
+        }
+    }
 }
 
 /// A decoded request (fields as in the module table).
