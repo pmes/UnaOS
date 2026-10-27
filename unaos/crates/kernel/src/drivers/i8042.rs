@@ -39,7 +39,10 @@
 // fills the scancode ring. Without it: the pump polls the status port and fills the same ring, and
 // the init line says `irq=polled reason=no-ioapic-in-kernel`.
 //
-// Owed (Z3): Fn keys via asus-wmi; scancode set 2 raw; typematic rate (0xF3); lock LEDs (0xED);
+// HIDBOOTLEDS (rmbp-ledger B987): the lock LEDs (0xED + the LED byte, acked through the scancode ring,
+// bounded) are sent by the decoder's `Transport::set_leds`; init sets the slowest typematic (0xF3 0x7F)
+// so the host typematic rules (this keyboard's own repeat makes are dropped in `step`).
+// Owed (Z3): Fn keys via asus-wmi; scancode set 2 raw; 0xFE retry for 0xED/0xF3;
 // Pause (E1, swallowed and counted); the aux port; the FADT 8042 flag as a second witness;
 // ZENBOOK-TOUCHPAD (I2C-HID, not this file). HIDBOOT-SHARED is built (B982): the decoder is
 // `drivers::hidboot`, so this module is gated on x86_64 alone, not on `ehcihid`.
@@ -80,6 +83,13 @@ const K_SET_SCANCODE: u8 = 0xF0;
 const K_GET_ID: u8 = 0xF2;
 const K_ACK: u8 = 0xFA;
 const K_BAT_OK: u8 = 0xAA;
+/// HIDBOOTLEDS (B987): set the lock LEDs (then one LED byte); set typematic rate/delay (then one byte);
+/// the keyboard's "resend" answer.
+const K_SET_LEDS: u8 = 0xED;
+const K_TYPEMATIC: u8 = 0xF3;
+const K_RESEND: u8 = 0xFE;
+/// Delay bits 6-5 = 11 (1000 ms), rate bits 4-0 = 11111 (2.0 cps): the slowest the keyboard offers.
+const TYPEMATIC_SLOWEST: u8 = 0x7F;
 
 /// Bounded waits (ms).
 const WAIT_MS: u64 = 50;
@@ -101,8 +111,6 @@ static STATE: AtomicU8 = AtomicU8::new(0);
 static WHY: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("not-run");
 /// Reports handed to the decoder.
 static DECODED: AtomicU32 = AtomicU32::new(0);
-/// Lock-key LED changes the decoder asked for (0xED is owed: counted, not sent).
-static LED_OWED: AtomicU32 = AtomicU32::new(0);
 /// E1 (Pause) sequences swallowed.
 static PAUSE: AtomicU32 = AtomicU32::new(0);
 /// Makes with all six slots taken.
@@ -304,7 +312,14 @@ pub fn init() {
         verdict(3, "get-id");
         return;
     }
-    serial_println!("[i8042] keyboard reset=fa,aa set=2 id={:02x}{:02x} -> ok", id0, id1);
+    // HIDBOOTLEDS (B987): the slowest typematic, so the host typematic rules. Non-fatal: the repeat
+    // makes are dropped in `step` whatever the rate; a refusal only leaves the bus busier.
+    let tm = kbd_cmd(K_TYPEMATIC) == Some(K_ACK) && kbd_cmd(TYPEMATIC_SLOWEST) == Some(K_ACK);
+    TYPEMATIC.store(if tm { 1 } else { 2 }, Ordering::Release);
+    serial_println!(
+        "[i8042] keyboard reset=fa,aa set=2 id={:02x}{:02x} typematic={} rate={:#04x} -> ok",
+        id0, id1, typematic_word(), TYPEMATIC_SLOWEST
+    );
     flush();
     let routed = route_irq1();
     let want = quiet | CFG_XLAT | if routed { CFG_IRQ1 } else { 0 };
@@ -426,6 +441,7 @@ pub fn pump() {
     if !IRQ_LIVE.load(Ordering::Acquire) {
         harvest();
     }
+    led_expire(); // HIDBOOTLEDS (B987): the 0xED sequence's WAIT_MS bound
     let mut d = DEC.lock();
     while let Some(b) = ring_pop() {
         step(&mut d, b);
@@ -453,6 +469,7 @@ fn step(d: &mut Dec, b: u8) {
         0xFA | 0xFE | 0x00 | 0xFF => {
             // ACK / resend / overrun answers, never key codes.
             d.e0 = false;
+            led_ack(b); // HIDBOOTLEDS (B987): an ACK/resend may answer the 0xED sequence
             return;
         }
         _ => {}
@@ -485,11 +502,8 @@ fn step(d: &mut Dec, b: u8) {
         return; // a typematic make or a release of a key not held: nothing new for the decoder
     }
     let r = d.report;
-    let led = unsafe { decode_boot_keyboard(Transport::Ps2, &r, &mut d.kprev, &mut d.kmods, &mut d.kleds) };
+    let _ = unsafe { decode_boot_keyboard(Transport::Ps2, &r, &mut d.kprev, &mut d.kmods, &mut d.kleds) }; // HIDBOOTLEDS (B987): an LED change leaves through `Transport::set_leds`
     DECODED.fetch_add(1, Ordering::Relaxed);
-    if led {
-        LED_OWED.fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 /// Place `byte` in the controller's output buffer as if the keyboard had sent it (0xD2). It raises
@@ -559,23 +573,139 @@ pub fn selftest() {
     let got_up = up && wait_decoded(base + 2, 500);
     let (m_up, n) = snapshot();
     let dropped = DROPPED.load(Ordering::Relaxed);
-    let pass = table_ok && got_down && got_up && m_down == 0x10 && m_up == 0x00;
+    let leds = leds_round_trip();
+    let pass = table_ok && got_down && got_up && m_down == 0x10 && m_up == 0x00 && leds == "ok" && TYPEMATIC.load(Ordering::Acquire) == 1;
     serial_println!(
-        ":: I8042: init=ready irq={} transport={} table={} inject=e0,1d,e0,9d mods={:02x},{:02x} decoded={} dropped={} -> {} ::",
-        irq, Transport::Ps2.tag(), tbl, m_down, m_up, n - base, dropped,
+        ":: I8042: init=ready irq={} transport={} table={} inject=e0,1d,e0,9d mods={:02x},{:02x} decoded={} dropped={} leds={} typematic={} -> {} ::",
+        irq, Transport::Ps2.tag(), tbl, m_down, m_up, n - base, dropped, leds, typematic_word(),
         if pass { "PASS" } else if !(down && up) { "FAIL reason=inject" } else { "FAIL" }
     );
 }
 
-/// One rollup line for a capture (`[i8042] decoded= dropped= led_owed= pause= rollover=`).
+/// One rollup line for a capture (`[i8042] decoded= dropped= leds_sent= leds_refused= pause= rollover=`).
 pub fn rollup() {
     serial_println!(
-        "[i8042] decoded={} dropped={} led_owed={} pause={} rollover={} irq={}",
+        "[i8042] decoded={} dropped={} leds_sent={} leds_refused={} pause={} rollover={} irq={}",
         DECODED.load(Ordering::Relaxed),
         DROPPED.load(Ordering::Relaxed),
-        LED_OWED.load(Ordering::Relaxed),
+        LED_SENT.load(Ordering::Relaxed),
+        LED_REFUSED.load(Ordering::Relaxed),
         PAUSE.load(Ordering::Relaxed),
         ROLLOVER.load(Ordering::Relaxed),
         if IRQ_LIVE.load(Ordering::Acquire) { "routed" } else { "polled" }
     );
+}
+
+// ── HIDBOOTLEDS (rmbp-ledger B987): the lock LEDs (0xED) and the typematic verdict ─────────────────
+//
+// The decoder (`drivers::hidboot`, under `pump` holding `DEC`) asks `Transport::set_leds`, which lands
+// in `set_leds` below. ASYNC on purpose: with IRQ1 live the ISR's `harvest` may take the keyboard's
+// 0xFA off port 0x60 before a polling wait could see it, so every answer rides the scancode ring like
+// any keyboard byte and `step` hands it to `led_ack`. Bounded by `led_expire` (WAIT_MS) from `pump`.
+// Lock order: EHCI_HID -> DEC -> CTRL (the pump); `inject` / `selftest` take CTRL alone.
+
+/// 0 = idle, 1 = 0xED written (awaiting ACK), 2 = the LED byte written (awaiting ACK).
+static LED_STAGE: AtomicU8 = AtomicU8::new(0);
+/// The newest LED byte the decoder asked for.
+static LED_WANT: AtomicU8 = AtomicU8::new(0);
+/// The LED byte the in-flight (or last) sequence wrote.
+static LED_BYTE_SENT: AtomicU8 = AtomicU8::new(0);
+/// `arch::ms()` of the last write of the sequence.
+static LED_T0: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Sequences the keyboard acked whole / sequences refused (resend, timeout, controller busy).
+static LED_SENT: AtomicU32 = AtomicU32::new(0);
+static LED_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// Init's 0xF3 verdict: 0 = not run, 1 = set, 2 = refused.
+static TYPEMATIC: AtomicU8 = AtomicU8::new(0);
+
+fn typematic_word() -> &'static str {
+    match TYPEMATIC.load(Ordering::Acquire) {
+        1 => "set",
+        2 => "refused",
+        _ => "not-run",
+    }
+}
+
+/// The PS/2 arm of `hidboot::Transport::set_leds`: start 0xED + `leds`, or leave the newest byte for
+/// the sequence already in flight.
+pub(crate) fn set_leds(leds: u8) {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    LED_WANT.store(leds, Ordering::Relaxed);
+    if LED_STAGE.load(Ordering::Acquire) == 0 {
+        LED_T0.store(crate::arch::ms(), Ordering::Relaxed);
+    }
+    if LED_STAGE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        led_out(K_SET_LEDS);
+    }
+}
+
+/// One byte of the sequence to the keyboard; a controller that will not take it ends the sequence.
+fn led_out(b: u8) {
+    let _g = CTRL.lock();
+    LED_T0.store(crate::arch::ms(), Ordering::Relaxed);
+    if !write_data(b) {
+        LED_STAGE.store(0, Ordering::Release);
+        LED_REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// An ACK / resend from the ring (`step`): advance or end the sequence; anything else is ignored.
+fn led_ack(b: u8) {
+    match (LED_STAGE.load(Ordering::Acquire), b) {
+        (1, K_ACK) => {
+            let v = LED_WANT.load(Ordering::Relaxed);
+            LED_BYTE_SENT.store(v, Ordering::Relaxed);
+            LED_STAGE.store(2, Ordering::Release);
+            led_out(v);
+        }
+        (2, K_ACK) => {
+            LED_STAGE.store(0, Ordering::Release);
+            LED_SENT.fetch_add(1, Ordering::Relaxed);
+            // A newer byte arrived while this one was on the wire: send it too.
+            if LED_WANT.load(Ordering::Relaxed) != LED_BYTE_SENT.load(Ordering::Relaxed)
+                && LED_STAGE.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
+            {
+                led_out(K_SET_LEDS);
+            }
+        }
+        (1 | 2, K_RESEND) => {
+            LED_STAGE.store(0, Ordering::Release);
+            LED_REFUSED.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+/// The bound: a sequence unanswered for WAIT_MS is abandoned and counted refused.
+fn led_expire() {
+    let stage = LED_STAGE.load(Ordering::Acquire);
+    if stage != 0
+        && crate::arch::ms().wrapping_sub(LED_T0.load(Ordering::Relaxed)) > WAIT_MS
+        && LED_STAGE.compare_exchange(stage, 0, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    {
+        LED_REFUSED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `tests i8042`'s `leds=`: re-send the CURRENT LED byte (the caps state never desyncs) and wait for
+/// the keyboard's two ACKs to come back through the ring and the pump.
+fn leds_round_trip() -> &'static str {
+    let kleds = DEC.lock().kleds;
+    let (s0, r0) = (LED_SENT.load(Ordering::Relaxed), LED_REFUSED.load(Ordering::Relaxed));
+    set_leds(kleds);
+    let t0 = crate::arch::ms();
+    loop {
+        if LED_SENT.load(Ordering::Relaxed) > s0 {
+            return "ok";
+        }
+        if LED_REFUSED.load(Ordering::Relaxed) > r0 {
+            return "refused";
+        }
+        if crate::arch::ms().wrapping_sub(t0) > 500 {
+            return "timeout";
+        }
+        crate::arch::sched::sleep_ticks(1);
+    }
 }
