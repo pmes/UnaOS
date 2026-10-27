@@ -123,6 +123,10 @@
 //! second writer to tear against. From the moment the console window is created onward, this file
 //! writes the framebuffer zero times.
 //!
+//! GOPIGNITEPIXEL (zenbook-ledger Z28) is the second write in that same pre-window instant, and only on the
+//! GopBoot path: [`gop_ignite`] runs `gop_shot`, which paints five witness squares and reads them straight back
+//! (`read_pixel`) BEFORE [`activate_on`] claims the panel; the clear (or the splash row) then covers them.
+//!
 //! ### SECOND-IGNITION (M-a) — one body, the surface named rather than assumed
 //!
 //! [`activate`] used to BE the activation. It is now a shim over [`activate_on`], which takes a
@@ -1117,6 +1121,8 @@ fn move_vacate_test() {
 /// BootInfo triple at `main.rs` WRITER-SEED, so the reconciliation takes its `adopt SKIP (already live)` arm, and the
 /// aperture is already write-combined by `main.rs`'s generic `set_framebuffer_wc`. A second origin is refused by the
 /// existing `ACTIVATED` latch (`requested=gop`).
+/// GOPIGNITEPIXEL (zenbook-ledger Z28): between the two, `gop_shot` paints the witness squares and reads them back
+/// (`[gop] shot … -> PASS|FAIL`), still before any window exists.
 pub fn gop_ignite() {
     let plat = crate::hw::platform();
     if !matches!(plat, crate::hw::Platform::ZenbookUm5606w) {
@@ -1129,5 +1135,103 @@ pub fn gop_ignite() {
     };
     crate::census_println!("[wc-x] gop-ignite platform={} fb={}x{}", plat.token(), w, h);
     super::fbcon::panel_console_resume();
+    gop_shot();
     activate_on(SurfaceDesc::from_writer(Origin::GopBoot));
+}
+
+// ── GOPIGNITEPIXEL (zenbook-ledger Z28) — the GopBoot surface's pixel witness ───────────────────────────────────────────
+//
+// `[wc-x] gop-ignite` proves the latch path ran and what `WRITER` says the geometry is; it proves no pixel. `gop_shot`
+// paints FIVE s x s squares in named colours (s = 32, bounded to a third of the GOP mode) — the four corners exercise
+// width / height / stride, red / green / blue / orange exercise `put_pixel`'s per-layout encode (the "GOP channel-order
+// survival" check the eviction note above lists as LOST, restored on the wire) — and reads each square's centre back
+// through `FrameBuffer::read_pixel` (WC-D: the volatile, witness-only VRAM read, the exact inverse of the encode). It
+// runs in the one instant this module may write the front buffer directly: after `panel_console_resume`, before
+// `activate_on` claims the panel (no window, no band worker, no pass). The aperture is write-combined, so a full fence
+// drains the WC buffers before the reads. The result is LATCHED; `tests gopshot` re-reports it and never re-paints (a
+// paint under a live compositor is the second writer this module's law forbids). The monitor is the metal witness.
+
+/// Witness colours (0x00RRGGBB), in wire order: centre, tl, tr, bl, br. Orange has R != B, so a channel swap reads 0080ff.
+const GOP_SHOT_COLOURS: [u32; 5] = [0x00FF_8000, 0x00FF_0000, 0x0000_FF00, 0x0000_00FF, 0x00FF_FFFF];
+/// The wire names of the five squares, in [`GOP_SHOT_COLOURS`]'s order.
+const GOP_SHOT_NAMES: [&str; 5] = ["centre", "tl", "tr", "bl", "br"];
+/// The latch: 0 not run, 1 PASS, 2 FAIL, 3 SKIP.
+static GOP_SHOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// The five read-backs (0x00RRGGBB; `u32::MAX` = no read), in [`GOP_SHOT_COLOURS`]'s order.
+static GOP_SHOT_PX: [core::sync::atomic::AtomicU32; 5] = [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; 5];
+
+/// Six hex digits for a read-back, or `------` when the read returned nothing.
+struct Hex6(u32);
+
+impl core::fmt::Display for Hex6 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == u32::MAX {
+            f.write_str("------")
+        } else {
+            write!(f, "{:06x}", self.0 & 0x00FF_FFFF)
+        }
+    }
+}
+
+/// GOPIGNITEPIXEL (Z28) — paint the five witness squares on the GopBoot surface, read them back, latch and print.
+/// Called once, from [`gop_ignite`] (the Zenbook only), between `panel_console_resume` and [`activate_on`].
+fn gop_shot() {
+    use core::sync::atomic::Ordering;
+    let fb = *super::WRITER.lock();
+    let skip = |why: &str| {
+        GOP_SHOT.store(3, Ordering::Release);
+        serial_println!("[gop] shot -> SKIP reason={}", why);
+    };
+    if !fb.is_ready() {
+        return skip("fb-not-ready");
+    }
+    if let Some(term) = super::panel_refuse_term() {
+        return skip(term);
+    }
+    let i = fb.info();
+    if !matches!(i.pixel_format, unaos_boot_info::PixelFormat::Rgb | unaos_boot_info::PixelFormat::Bgr) {
+        return skip("format");
+    }
+    let (w, h) = (i.width, i.height);
+    let s = 32usize.min(w / 3).min(h / 3).max(1);
+    let origins = [((w - s) / 2, (h - s) / 2), (0, 0), (w - s, 0), (0, h - s), (w - s, h - s)];
+    super::cursor::undraw();
+    for (k, &(x, y)) in origins.iter().enumerate() {
+        fb.fill_rect(x, y, s, s, GOP_SHOT_COLOURS[k]);
+    }
+    fb.flush_all();
+    core::sync::atomic::fence(Ordering::SeqCst); // mfence: drain the WC buffers before the volatile reads
+    let mut pass = true;
+    for (k, &(x, y)) in origins.iter().enumerate() {
+        let got = fb.read_pixel(x + s / 2, y + s / 2).map(|v| v & 0x00FF_FFFF).unwrap_or(u32::MAX);
+        pass &= got == GOP_SHOT_COLOURS[k];
+        GOP_SHOT_PX[k].store(got, Ordering::Relaxed);
+    }
+    GOP_SHOT.store(if pass { 1 } else { 2 }, Ordering::Release);
+    let px = |k: usize| Hex6(GOP_SHOT_PX[k].load(Ordering::Relaxed));
+    serial_println!(
+        "[gop] shot {}={} {}={} {}={} {}={} {}={} -> {}",
+        GOP_SHOT_NAMES[0], px(0), GOP_SHOT_NAMES[1], px(1), GOP_SHOT_NAMES[2], px(2),
+        GOP_SHOT_NAMES[3], px(3), GOP_SHOT_NAMES[4], px(4),
+        if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+/// GOPIGNITEPIXEL (Z28) — **`tests gopshot`**: the ignite read-back, re-reported from the latch (never re-painted).
+/// `:: GOPSHOT: ignite=<pass|fail> centre=<rrggbb> tl= tr= bl= br= -> PASS|FAIL ::`, `:: GOPSHOT: ignite=skip -> SKIP ::`,
+/// or `:: GOPSHOT: -> SKIP reason=no-gop-ignite ::` on every boot that is not the GopBoot path (QEMU plain, the rMBP).
+pub fn gopshot_selftest() {
+    use core::sync::atomic::Ordering;
+    let v = GOP_SHOT.load(Ordering::Acquire);
+    let px = |k: usize| Hex6(GOP_SHOT_PX[k].load(Ordering::Relaxed));
+    match v {
+        1 | 2 => serial_println!(
+            ":: GOPSHOT: ignite={} centre={} tl={} tr={} bl={} br={} -> {} ::",
+            if v == 1 { "pass" } else { "fail" },
+            px(0), px(1), px(2), px(3), px(4),
+            if v == 1 { "PASS" } else { "FAIL" }
+        ),
+        3 => serial_println!(":: GOPSHOT: ignite=skip -> SKIP ::"),
+        _ => serial_println!(":: GOPSHOT: -> SKIP reason=no-gop-ignite ::"),
+    }
 }

@@ -27,7 +27,8 @@
 #     so `test_zenbook` stages the LANE list (unaos/fixtures/lanes/zenbook/TESTS.LIST: `platform @zenbook`, `gen7 @rmbp12`)
 #     through the ONE stager `bootlist_stage` and the builder carries it onto the ESP (UNAOS_BOOTLIST_STAGE,
 #     `stage_bootlist_carry`); the typist's first typed verb is held on the list's light summary. Section 8 pins the list.
-#   * no pixel witness: no spec scores pixels (the GOPIGNITE pixel witness is owed: no scorer exists).
+#   * the pixel witness (GOPIGNITEPIXEL, zenbook-ledger Z28): gop_ignite paints five named squares and reads them back before
+#     activate_on (`[gop] shot`, section 4); no QMP screendump is scored (GOPSHOT-QMP owed: the typist holds the one socket).
 
 # ── 1. THE OVERRIDE: the platform's one resolution says the Zenbook, by the knob ──────────────────────────────────────
 REQUIRE \[hw\] platform=zenbook_um5606w dmi=".*" vendor=".*" src=knob
@@ -40,6 +41,7 @@ REQUIRE \[nvme\] ctrl mn=".*" ns=1 lba=\d+ blocks=\d+ -> ready
 
 # ── 4. Z10: the compositor ignites on the GOP framebuffer (no Kepler takeover) — the GopBoot arm's first QEMU run ──────
 REQUIRE \[wc-x\] gop-ignite platform=zenbook_um5606w fb=\d+x\d+
+REQUIRE \[gop\] shot centre=ff8000 tl=ff0000 tr=00ff00 bl=0000ff br=ffffff -> PASS
 
 # ── 5. Z7: the xHCI census (one controller on q35) ─────────────────────────────────────────────────────────────────────
 REQUIRE \[xhci\] controllers=\d+ picked=\d+ bdf=\d+:\d+\.\d+
