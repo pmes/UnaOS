@@ -599,11 +599,9 @@ fn dma_off(b: u64) -> Result<(), String> {
 
 /// One ring's descriptors: zeroed, page-aligned, heap address = bus address (the identity map, nvme.rs `dma_alloc`'s
 /// standing property), every ctrl word DMA_DONE (linux's queue reset, dma.c:209-211). 0 on failure. Never freed: the
-/// device holds the base while GLO_CFG's EN bits are set (DMA-ALLOC-ONE owes the one shared allocator).
+/// device holds the base while GLO_CFG's EN bits are set (the one shared allocator, DMAALLOCONE B986).
 fn ring() -> u64 {
-    let Ok(l) = core::alloc::Layout::from_size_align(RING_BYTES, 4096) else { return 0 };
-    // SAFETY: a non-zero, page-aligned layout; the block is handed to the device and never returned to the allocator.
-    let p = unsafe { alloc::alloc::alloc_zeroed(l) } as u64;
+    let p = crate::arch::memory::dma::ident(RING_BYTES, 4096);
     if p != 0 {
         for i in 0..RING_DEPTH as u64 {
             // SAFETY: inside the RING_BYTES block just allocated; descriptor i's ctrl word at +4.

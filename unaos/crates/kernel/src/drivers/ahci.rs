@@ -243,12 +243,7 @@ fn bus_addr(p: u64) -> u64 {
 /// to the allocator while the HBA still owns it is the one class of bug a port teardown must get
 /// right, and this arc has no teardown at all.
 fn dma_alloc(size: usize, align: usize) -> u64 {
-    let layout = match core::alloc::Layout::from_size_align(size, align) {
-        Ok(l) => l,
-        Err(_) => return 0,
-    };
-    let p = unsafe { alloc::alloc::alloc_zeroed(layout) };
-    p as u64
+    crate::arch::memory::dma::ident(size, align) // DMAALLOCONE (B986): the kernel's one DMA allocator
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════

@@ -494,15 +494,10 @@ fn txhdr(frame: &[u8], ch: u16, cookie: u16, r: TxRate) -> [u8; TXH_SIZE] {
 /// MAC into the filter, the TX engine reset and its ring programmed (`dma.c:681-694`). Nothing is
 /// transmitted here; the engine has no descriptor to read until `fire` pokes `TXINDEX`.
 pub(super) fn prep(bar0: u64, mac: [u8; 6], w: &mut Writes) -> Result<Prep, String> {
-    let ring_l = core::alloc::Layout::from_size_align(RINGMEM, RINGMEM).ok();
-    let buf_l = core::alloc::Layout::from_size_align(BUF_BYTES, 4096).ok();
-    let (Some(rl), Some(bl)) = (ring_l, buf_l) else {
-        return Err(String::from("layout — nothing programmed"));
-    };
     // Deliberately never freed: the engine owns this memory until TXCTL reads DISABLED, and a failed
-    // reset would leave it owning it for the rest of the boot.
-    let ring = unsafe { alloc::alloc::alloc_zeroed(rl) } as u64;
-    let buf = unsafe { alloc::alloc::alloc_zeroed(bl) } as u64;
+    // reset would leave it owning it for the rest of the boot. DMAALLOCONE (B986): the one DMA allocator.
+    let ring = crate::arch::memory::dma::ident(RINGMEM, RINGMEM);
+    let buf = crate::arch::memory::dma::ident(BUF_BYTES, 4096);
     if ring == 0 || buf == 0 {
         return Err(String::from("no-memory — nothing programmed"));
     }

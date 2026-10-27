@@ -305,11 +305,7 @@ fn bus_addr(p: u64) -> u64 {
 /// handing this memory back while the controller still owns it is the one class of bug a teardown
 /// must get right. This arc's teardown stops both engines but does not free.
 fn dma_alloc(size: usize, align: usize) -> u64 {
-    let layout = match core::alloc::Layout::from_size_align(size, align) {
-        Ok(l) => l,
-        Err(_) => return 0,
-    };
-    unsafe { alloc::alloc::alloc_zeroed(layout) as u64 }
+    crate::arch::memory::dma::ident(size, align) // DMAALLOCONE (B986): the kernel's one DMA allocator
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════════
