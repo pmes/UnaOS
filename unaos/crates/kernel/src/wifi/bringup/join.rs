@@ -34,6 +34,8 @@ pub(super) struct Heard {
     pub target: Vec<u8>,
     pub bss: Option<Bss>,
     pub frames: Vec<Vec<u8>>,
+    /// STATIONWATCH (B843): the kept station's link watch, armed by `keep`; while armed every management frame feeds it.
+    pub watch: Option<super::super::data::Watch>,
 }
 
 impl Heard {
@@ -46,6 +48,10 @@ impl Heard {
 /// any other management frame whose addr1 (§9.2.4.3) is our MAC is kept for the rung that waits on it.
 pub(super) fn hear(frame: &[u8], h: &mut Heard) {
     if frame.len() < 24 || (frame[0] >> 2) & 0x3 != 0 {
+        return;
+    }
+    if let Some(wt) = h.watch.as_mut() {
+        wt.frame(frame, h.me, crate::arch::ticks());
         return;
     }
     let sub = frame[0] >> 4;
@@ -266,7 +272,8 @@ pub(super) fn link(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::See
 
 // ── WIFIDHCP (rmbp-ledger B831): the kept station ────────────────────────────────────────────────────────────
 
-/// Everything the pass armed, kept past it on LINKED: the TX ring, the receiver and its state, the Link.
+/// Everything the pass armed, kept past it on LINKED: the TX ring, the receiver and its state, the Link; the station's
+/// asynchronous TX queue and, once the watch dropped the link, why (STATIONWATCH / STATIONTX B843).
 struct Station {
     bar0: u64,
     ch: u16,
@@ -275,6 +282,8 @@ struct Station {
     seen: rx::Seen,
     link: super::super::data::Link,
     w: rx::Writes,
+    q: tx::Queue,
+    lost: Option<&'static str>,
 }
 
 /// THE station. Lock order: smolnet's `STACK` -> `STATION` (smoltcp's poll calls the accessor triple); nothing
@@ -285,43 +294,119 @@ static STATION: crate::sync::Mutex<Option<Station>> = crate::sync::Mutex::new(No
 /// move here; from now on only the station's fns below touch them.
 pub(super) fn keep(bar0: u64, prep: tx::Prep, rxr: rx::Rx, mut seen: rx::Seen, ch: u16, w: rx::Writes, link: super::super::data::Link) {
     seen.data.clear();
+    seen.join.frames.clear();
+    seen.join.watch = seen.join.bss.map(|b| super::super::data::Watch::new(b.bssid, crate::arch::ticks()));
     let next = link.tx_next();
-    *STATION.lock() = Some(Station { bar0, ch, prep, rxr, seen, link, w });
+    *STATION.lock() = Some(Station { bar0, ch, prep, rxr, seen, link, w, q: tx::Queue::default(), lost: None });
     serial_println!("[wifi10] station kept tx_next={} — the TX ring and the receiver stay armed for the stack (WIFIDHCP B831)", next);
 }
 
-/// `data::raw_tx`: one Ethernet frame out as a ToDS data frame on the station's next ring frame. `true` = SENT.
+/// `data::raw_tx`: one Ethernet frame out as a ToDS data frame on the station's next ring frame, posted and not waited
+/// on (STATIONTX B843: the status is reaped on a later pass). `true` = posted. No room = refused BEFORE the Link numbers
+/// the frame, so the ring never carries a gap.
 pub(in crate::wifi) fn station_tx(eth: &[u8]) -> bool {
     let mut g = STATION.lock();
     let Some(st) = g.as_mut() else { return false };
+    if st.lost.is_some() {
+        return false;
+    }
+    let now = crate::arch::ticks();
+    tx::reap(st.bar0, &mut st.q, now);
+    if !st.q.room() {
+        st.q.full += 1;
+        return false;
+    }
     match st.link.send(eth) {
-        Ok((air, n)) => tx::fire_frame(st.bar0, &st.prep, &air, st.ch, n, "data", &mut st.w).sent(),
+        Ok((air, n)) => tx::queue(st.bar0, &st.prep, &mut st.q, &air, st.ch, n, now, &mut st.w),
         Err(_) => false,
     }
 }
 
-/// `data::raw_rx`: the next kept data frame to us as Ethernet; the receiver is drained once when none is kept.
+/// `data::tx_ready`: room on the station's TX ring (statuses reaped first). Never waits on the lock: contended or
+/// lost = no room.
+pub(in crate::wifi) fn station_tx_room() -> bool {
+    let Some(mut g) = STATION.try_lock() else { return false };
+    let Some(st) = g.as_mut() else { return false };
+    if st.lost.is_some() {
+        return false;
+    }
+    tx::reap(st.bar0, &mut st.q, crate::arch::ticks());
+    st.q.room()
+}
+
+/// `data::raw_rx`: the next kept data frame to us as Ethernet; the station is serviced once when none is kept.
 pub(in crate::wifi) fn station_rx(out: &mut [u8]) -> Option<usize> {
     let mut g = STATION.lock();
     let st = g.as_mut()?;
+    if st.lost.is_some() {
+        return None;
+    }
     if let Some(n) = st.link.recv(&mut st.seen.data, out) {
         return Some(n);
     }
-    rx::drain(st.bar0, &mut st.rxr, &mut st.seen, st.ch, &mut st.w);
+    service(st);
     st.link.recv(&mut st.seen.data, out)
 }
 
-/// `data::rx_ready`: the receiver drained once; a data frame is kept. Never waits on the lock.
+/// `data::rx_ready`: the station serviced once; a data frame is kept. Never waits on the lock.
 pub(in crate::wifi) fn station_pending() -> bool {
     let Some(mut g) = STATION.try_lock() else { return false };
     let Some(st) = g.as_mut() else { return false };
+    if st.lost.is_some() {
+        return false;
+    }
     if st.seen.data.is_empty() {
-        rx::drain(st.bar0, &mut st.rxr, &mut st.seen, st.ch, &mut st.w);
+        service(st);
     }
     !st.seen.data.is_empty()
 }
 
-/// `data::hw_addr` / `data::kept`: the station MAC while a station is kept.
-pub(in crate::wifi) fn station_mac() -> Option<Mac> {
-    STATION.lock().as_ref().map(|st| st.link.mac())
+/// `data::hw_addr` / `data::kept`: the station MAC and whether its link is up (not lost), while a station is kept.
+pub(in crate::wifi) fn station_mac() -> Option<(Mac, bool)> {
+    STATION.lock().as_ref().map(|st| (st.link.mac(), st.lost.is_none()))
+}
+
+// ── STATIONWATCH / STATIONTX (rmbp-ledger B843): the station serviced on its own drains, dropped on a loss, re-joined ──
+
+/// One service pass under `STATION` (no sleep): the receiver drained (`hear` feeds the watch), the TX statuses reaped,
+/// the watch ticked; a loss drops the link (`lose`).
+fn service(st: &mut Station) {
+    rx::drain(st.bar0, &mut st.rxr, &mut st.seen, st.ch, &mut st.w);
+    let now = crate::arch::ticks();
+    tx::reap(st.bar0, &mut st.q, now);
+    let why = st.seen.join.watch.as_mut().and_then(|wt| wt.tick(now));
+    if let Some(why) = why {
+        lose(st, why);
+    }
+}
+
+/// The link is gone: every accessor answers link-down from now on (the engines stay as they are — stopping them sleeps,
+/// so `rejoin` does it from the shell task). Said once.
+fn lose(st: &mut Station, why: &'static str) {
+    st.lost = Some(why);
+    st.seen.data.clear();
+    let (reason, beacons, tu) = st.seen.join.watch.as_ref().map_or((0, 0, 0), |wt| (wt.reason, wt.beacons, wt.tu));
+    let q = &st.q;
+    serial_println!(
+        "[wifi10] station lost why={} reason={} beacons={} tu={} tx_posted={} tx_sent={} tx_acked={} tx_failed={} tx_stuck={} tx_full={} tx_q={} rx_data={} — the accessor triple answers link-down; tests wifi <ssid> <gw> re-joins (STATIONWATCH B843)",
+        why, if why == "beacon-loss" { String::from("-") } else { alloc::format!("{}", reason) }, beacons, tu,
+        q.posted, q.sent, q.acked, q.failed, q.stuck, q.full, q.in_flight(), st.link.rx_data
+    );
+}
+
+/// From `wifi10()`'s once-per-boot guard: a LOST station is taken out of `STATION` and its engines stopped here, with
+/// the lock released (`rx::finish` / `tx::stop` sleep), so the pass may run again. `false` = no station, or a live one.
+pub(super) fn rejoin() -> bool {
+    let taken = {
+        let mut g = STATION.lock();
+        if g.as_ref().map_or(false, |st| st.lost.is_some()) { g.take() } else { None }
+    };
+    let Some(mut st) = taken else { return false };
+    let (mac_off, rx_off) = rx::finish(st.bar0, &st.rxr, &mut st.w);
+    let tx_off = tx::stop(st.bar0, &mut st.w);
+    serial_println!(
+        "[wifi10] station rejoin after={} mac-suspended={} rx-reset={} tx-reset={} — the lost station's engines stopped; the pass runs again (STATIONWATCH B843)",
+        st.lost.unwrap_or("-"), mac_off as u8, rx_off as u8, tx_off as u8
+    );
+    true
 }

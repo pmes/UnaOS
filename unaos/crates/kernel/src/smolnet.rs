@@ -88,7 +88,7 @@ impl RawNic for E1000Nic {
     fn tx_ready() -> bool {
         #[cfg(feature = "usbnet")]
         if !e1000::nic_present() {
-            #[cfg(feature = "wifi10")] if crate::wifi::data::bound() { return true; } return crate::drivers::xhci::usbnet::tx_room(); // WIFIDHCP (B831): the kept station's TX is synchronous (LINE-NEUTRAL)
+            #[cfg(feature = "wifi10")] if crate::wifi::data::bound() { return crate::wifi::data::tx_ready(); } return crate::drivers::xhci::usbnet::tx_room(); // STATIONTX (B843): the kept station's asynchronous TX ring answers its own room (WIFIDHCP B831's fold; LINE-NEUTRAL)
         }
         true
     }

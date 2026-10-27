@@ -2617,7 +2617,7 @@ mod tx;
 #[cfg(feature = "wifi10")]
 pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
     static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-    if RAN.swap(true, core::sync::atomic::Ordering::Relaxed) {
+    if RAN.swap(true, core::sync::atomic::Ordering::Relaxed) && !join::rejoin() {
         let (t, h) = super::status::wifi10();
         serial_println!(":: wifi10: already ran this boot tx={} heard={} — one pass per boot ::", t, h);
         return;
@@ -2768,6 +2768,6 @@ pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
 mod join;
 // WIFIDHCP (B831): the kept station's device fns and the TX ring's caps, for `wifi/data.rs` (the accessor triple).
 #[cfg(feature = "wifi10")]
-pub(super) use join::{station_mac, station_pending, station_rx, station_tx};
+pub(super) use join::{station_mac, station_pending, station_rx, station_tx, station_tx_room};
 #[cfg(feature = "wifi10")]
 pub(super) use tx::{FRAMES, FRAME_MAX};

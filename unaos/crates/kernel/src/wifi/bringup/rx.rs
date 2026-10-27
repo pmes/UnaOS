@@ -329,7 +329,7 @@ fn take(buf: u64, s: &mut Seen, ch: u16, raw_rows: &mut u32, tag: &str) -> usize
     if len < start + 24 + FCS_LEN {
         return 1;
     }
-    let frame = copy_out(buf + (FRAMEOFFSET + start) as u64, len - start - FCS_LEN); #[cfg(feature = "wifi10")] super::join::hear(&frame, &mut s.join); #[cfg(feature = "wifi10")] super::super::data::keep(&frame, &mut s.data);
+    let frame = copy_out(buf + (FRAMEOFFSET + start) as u64, len - start - FCS_LEN); #[cfg(feature = "wifi10")] super::join::hear(&frame, &mut s.join); #[cfg(feature = "wifi10")] super::super::data::keep(&frame, s.me, &mut s.data);
     // FC byte 0: type bits 3:2 = 0 (management), subtype bits 7:4 = 8 (beacon) — IEEE 802.11 §9.2.4.1.
     if (frame[0] >> 2) & 0x3 == 0 && (frame[0] >> 4) == 0x8 {
         if let Some(b) = wifi_core::ieee80211::parse_beacon(&frame) {
