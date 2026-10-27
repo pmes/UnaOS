@@ -4635,3 +4635,159 @@ pub fn xhci_loan_shed(rung: &'static str, gate_ms: u64) {
 pub fn xhci_loan_shed_count() -> u32 {
     LOAN_SHED_N.load(core::sync::atomic::Ordering::Relaxed)
 }
+
+// ══════════ XHCILOANSHEDKAT (zenbook-ledger Z71) — `tests preemptaudit` drives the block loan's shed ══════════
+//
+// TAIL-APPENDED after Z66 (no line above moves). `loan_shed=` reads 0 on every healthy boot, so Z66's shed had never run
+// under a test. The honest unit: the KAT takes the block loan through the ONE claim path (`claim_xhci_for_io`) and calls
+// `xhci_loan_shed` on it directly (`XhciController::loan_shed_hook` is a private rung/gate picker over exactly this call
+// and needs a live mid-BOT controller: owed XHCILOAN-SHEDHOOK-KAT). Legs: the gate (a 60 s gate changes nothing), the
+// shed (count back to its pre-take value — 0, read by `preemptoff::witness` false -> true -> false — publication 0, the
+// claim kept, `LOAN_SHED_N` +1), a MASKED contender on a sibling CPU answered Busy why=holder-preemptible inside
+// `LOAN_MASKED_WAIT_MS` while the holder waits preemptible, and the shed-aware Drop under the KAT's own extra `disable`
+// (a double release would read the count free). The KAT gives back what it spent (B1034 `full_kat`'s shape): its
+// `LOAN_SHED_N`, the contender's `LOAN_MASKED_BUSY`, `LOAN_LAST_WHY`, and neither once-line (`[xhci] loan shed`,
+// `[xhci] loan masked claim`) is said by it. The shed statics are written only by the ONE block-loan holder — the KAT
+// for the whole window. A real masked refusal inside the contender's ~ms window is still counted, but its once-line is
+// silenced if it was the boot's first. Owed: XHCILOAN-SHEDKAT-CONTROL (a pre-shed contender go-red leg).
+
+/// XHCILOANSHEDKAT contender handshake: 0 waiting, then the masked claim's outcome — 1 Ok, 2 Busy, 3 NotReady, 4 error.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHEDKAT_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// XHCILOANSHEDKAT: the contender's `LOAN_LAST_WHY` read right after its claim.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHEDKAT_WHY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// XHCILOANSHEDKAT: µs the contender's masked claim took.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHEDKAT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// XHCILOANSHEDKAT contender (a task on a sibling CPU): one MASKED `claim_xhci_for_io` against the KAT's shed loan,
+/// timed; the outcome, the refusal's why and the µs published for the KAT.
+#[cfg(target_arch = "x86_64")]
+fn loan_shed_contender(_: usize) {
+    use core::sync::atomic::Ordering;
+    let (code, why, cycles) = crate::arch::without_interrupts(|| {
+        let t0 = crate::arch::now_cycles();
+        let r = claim_xhci_for_io();
+        let c = crate::arch::now_cycles().wrapping_sub(t0);
+        let code = match &r {
+            Ok(_) => 1u8,
+            Err(BlockError::Busy) => 2,
+            Err(BlockError::NotReady) => 3,
+            Err(_) => 4,
+        };
+        let why = LOAN_LAST_WHY.load(Ordering::Relaxed);
+        drop(r);
+        (code, why, c)
+    });
+    LOAN_SHEDKAT_WHY.store(why, Ordering::Relaxed);
+    LOAN_SHEDKAT_US.store(cycles.saturating_mul(1000) / wait::cycles_ms(1).max(1), Ordering::Relaxed);
+    LOAN_SHEDKAT_STATE.store(code, Ordering::Release);
+}
+
+/// XHCILOANSHEDKAT: `tests preemptaudit`'s shed leg (`loan_shed_kat=`): `ok`, `skip(masked|no-xhci|one-cpu)`, or the
+/// first failed check — `claim-busy` / `claim-notready` / `held-before` / `not-held` / `gate-ignored` / `not-released` /
+/// `still-published` / `claim-lost` / `not-counted` / `contender-got` / `contender-waited` / `contender-late` /
+/// `double-release` / `mark-kept`.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed_kat() -> &'static str {
+    use core::sync::atomic::Ordering;
+    use crate::arch::sched::preemptoff;
+    if crate::arch::irqs_masked() {
+        return "skip(masked)";
+    }
+    if matches!(xhci::claim(), Err(XhciClaimError::NotReady)) {
+        return "skip(no-xhci)";
+    }
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(me);
+    if cpu == me {
+        return "skip(one-cpu)";
+    }
+    if preemptoff::witness().0 {
+        return "held-before";
+    }
+    let loan = match claim_xhci_for_io() {
+        Ok(l) => l,
+        Err(BlockError::NotReady) => return "claim-notready",
+        Err(_) => return "claim-busy",
+    };
+    // The take holds the count (no switch, no migration until the shed); the mask keeps the shed and its reads on
+    // one CPU. The pre-bump keeps the boot's "first shed, once" line for a real shed; every count is given back.
+    let shed: Result<(), &'static str> = crate::arch::without_interrupts(|| {
+        let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+        if !preemptoff::witness().0 || BLOCK_LOAN_CPU.load(Ordering::Acquire) != tag {
+            return Err("not-held");
+        }
+        let n0 = LOAN_SHED_N.fetch_add(1, Ordering::Relaxed);
+        let legs = || -> Result<(), &'static str> {
+            xhci_loan_shed("kat", 60_000);
+            if !preemptoff::witness().0
+                || BLOCK_LOAN_CPU.load(Ordering::Acquire) != tag
+                || LOAN_SHED.load(Ordering::Acquire)
+                || LOAN_SHED_N.load(Ordering::Relaxed) != n0.wrapping_add(1)
+            {
+                return Err("gate-ignored");
+            }
+            xhci_loan_shed("kat", 0);
+            if preemptoff::witness().0 {
+                return Err("not-released");
+            }
+            if BLOCK_LOAN_CPU.load(Ordering::Acquire) != 0 {
+                return Err("still-published");
+            }
+            if !matches!(xhci::claim(), Err(XhciClaimError::Busy)) {
+                return Err("claim-lost");
+            }
+            if LOAN_SHED_N.load(Ordering::Relaxed) != n0.wrapping_add(2) || !LOAN_SHED.load(Ordering::Acquire) {
+                return Err("not-counted");
+            }
+            Ok(())
+        };
+        let r = legs();
+        let n1 = LOAN_SHED_N.load(Ordering::Relaxed);
+        LOAN_SHED_N.fetch_sub(n1.wrapping_sub(n0), Ordering::Relaxed);
+        r
+    });
+    if let Err(w) = shed {
+        return w;
+    }
+    // The masked contender on the sibling CPU; this holder waits PREEMPTIBLE (the shed's point).
+    let prior_said = LOAN_REFUSAL_SAID.swap(true, Ordering::AcqRel);
+    let prior_why = LOAN_LAST_WHY.load(Ordering::Relaxed);
+    LOAN_SHEDKAT_STATE.store(0, Ordering::Release);
+    crate::arch::sched::spawn("loanshed-kat", loan_shed_contender, 0, cpu, crate::arch::sched::PRIO_HIGH);
+    let came = wait::bounded(1000, || LOAN_SHEDKAT_STATE.load(Ordering::Acquire) != 0);
+    let code = LOAN_SHEDKAT_STATE.load(Ordering::Acquire);
+    if code == 2 {
+        LOAN_MASKED_BUSY.fetch_sub(1, Ordering::Relaxed);
+    }
+    LOAN_LAST_WHY.store(prior_why, Ordering::Relaxed);
+    if !prior_said {
+        LOAN_REFUSAL_SAID.store(false, Ordering::Release);
+    }
+    let why = LOAN_SHEDKAT_WHY.load(Ordering::Relaxed);
+    let us = LOAN_SHEDKAT_US.load(Ordering::Relaxed);
+    if !came {
+        return "contender-late";
+    }
+    if code == 1 {
+        return "contender-got";
+    }
+    if !(code == 2 && why == 1 && us < LOAN_MASKED_WAIT_MS.saturating_mul(1000)) {
+        return "contender-waited";
+    }
+    // The shed-aware Drop under this KAT's own hold: the put, and no second release (a double one reads the count free).
+    preemptoff::disable();
+    drop(loan);
+    let (held, _) = preemptoff::witness();
+    let mark = LOAN_SHED.load(Ordering::Acquire);
+    preemptoff::enable();
+    if !held {
+        return "double-release";
+    }
+    if mark {
+        return "mark-kept";
+    }
+    "ok"
+}
