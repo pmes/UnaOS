@@ -319,35 +319,9 @@ fn w32(base: u64, off: u64, val: u32) {
 // Bounded waits, in rdtsc units.
 // ===================================================================================
 
-/// `ms` milliseconds expressed in `arch::now_cycles()` (rdtsc) units. The TSC is calibrated against
-/// the ACPI PM timer by `apic::calibrate`, which runs long before `pci::init` (and therefore before
-/// this probe), so the calibrated leg is the one that executes on both QEMU and metal. The fallback
-/// derives from `arch::HW_WAIT_BUDGET`, which is defined as the ~2-second pre-calibration guess.
-#[inline]
-fn cycles_ms(ms: u64) -> u64 {
-    let hz = crate::arch::apic::tsc_hz();
-    if hz != 0 {
-        hz.saturating_mul(ms) / 1000
-    } else {
-        crate::arch::HW_WAIT_BUDGET.saturating_mul(ms) / 2000
-    }
-}
-
-/// Spin until `pred()` holds or `ms` milliseconds elapse. Returns true if the predicate held.
-/// `wrapping_sub` so a 64-bit TSC wrap mid-wait cannot trip the deadline early.
-fn wait_ms<F: Fn() -> bool>(ms: u64, pred: F) -> bool {
-    let start = crate::arch::now_cycles();
-    let budget = cycles_ms(ms);
-    loop {
-        if pred() {
-            return true;
-        }
-        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-}
+// Bounded waits in `arch::now_cycles()` (rdtsc) units: the ONE shared wait (BOUNDEDWAIT, rmbp-ledger B981, at the
+// tail of `drivers/block.rs`), calibrated against the ACPI PM timer long before this probe.
+use crate::drivers::block::wait::{bounded as wait_ms, cycles_ms};
 
 // ===================================================================================
 // Decoded controller identity

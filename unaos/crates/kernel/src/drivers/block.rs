@@ -3918,3 +3918,79 @@ pub fn write_blocks_nvme(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
     }
     Err(BlockError::Denied)
 }
+
+// ══════════ BOUNDEDWAIT (rmbp-ledger B981) — ONE bounded wait and ONE masked bounded hold for the block drivers ══════════
+//
+// TAIL-APPENDED (no line above moves). `drivers/ahci.rs`, `drivers/sdhc.rs` and `drivers/nvme.rs` each carried a
+// byte-identical `cycles_ms` + `wait_ms`, and ahci's `dongle::with_port` and nvme's `with_ctrl` the same masked
+// bounded try-lock skeleton; the copies are lifted here, and the drivers keep only their own lines and counters.
+// The clock is the TSC (`arch::now_cycles()` against `arch::apic::tsc_hz()`), NOT `arch::ms()`: the probes run inside
+// `pci::init` with interrupts masked, where the APIC tick does not advance. x86_64 only (every user is).
+
+/// BOUNDEDWAIT: the TSC-unit bounded wait every x86 block driver spins on.
+#[cfg(target_arch = "x86_64")]
+pub mod wait {
+    /// `ms` milliseconds in `arch::now_cycles()` (rdtsc) units. The TSC is calibrated against the ACPI PM timer by
+    /// `apic::calibrate`, long before `pci::init`; the uncalibrated fallback derives from `arch::HW_WAIT_BUDGET`
+    /// (the ~2 s pre-calibration guess).
+    #[inline]
+    pub fn cycles_ms(ms: u64) -> u64 {
+        let hz = crate::arch::apic::tsc_hz();
+        if hz != 0 {
+            hz.saturating_mul(ms) / 1000
+        } else {
+            crate::arch::HW_WAIT_BUDGET.saturating_mul(ms) / 2000
+        }
+    }
+
+    /// Spin until `pred()` holds or `ms` milliseconds elapse. Returns true if the predicate held.
+    /// `wrapping_sub` so a 64-bit TSC wrap mid-wait cannot trip the deadline early.
+    pub fn bounded<F: Fn() -> bool>(ms: u64, pred: F) -> bool {
+        let start = crate::arch::now_cycles();
+        let budget = cycles_ms(ms);
+        loop {
+            if pred() {
+                return true;
+            }
+            if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// BOUNDEDWAIT (DISKHOLD): the ONE masked bounded hold (the DONGLEBOOT B658 shape) a block driver takes its
+/// controller lock through.
+#[cfg(all(target_arch = "x86_64", any(feature = "ahci", feature = "nvme")))]
+pub mod hold {
+    /// Interrupts masked for the whole hold (no preemption inside it); `take` (the caller's own `try_lock`, so
+    /// LOCKREG names the driver's acquire site) is retried until it yields a guard or `bound_ms` elapses —
+    /// `at_once` refuses on the first miss (a caller that never waits, e.g. the render task). A refusal runs
+    /// `refused(<TSC cycles spun>)` inside the mask (the driver's own line and counters); a taken guard runs
+    /// `held(guard)`. `#[track_caller]` so the masked span (CLOCKCORE) is named at the driver's call.
+    #[track_caller]
+    pub fn with<G, R>(
+        bound_ms: u64,
+        at_once: bool,
+        mut take: impl FnMut() -> Option<G>,
+        refused: impl FnOnce(u64) -> R,
+        held: impl FnOnce(G) -> R,
+    ) -> R {
+        crate::arch::without_interrupts(move || {
+            let t0 = crate::arch::now_cycles();
+            let bound = super::wait::cycles_ms(bound_ms);
+            let guard = loop {
+                if let Some(g) = take() {
+                    break g;
+                }
+                let spun = crate::arch::now_cycles().wrapping_sub(t0);
+                if at_once || spun >= bound {
+                    return refused(spun);
+                }
+                core::hint::spin_loop();
+            };
+            held(guard)
+        })
+    }
+}

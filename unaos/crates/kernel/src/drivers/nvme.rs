@@ -101,33 +101,10 @@ const QEMU_MN: &[u8] = b"QEMU NVMe Ctrl";
 const SCRATCH_BLOCKS: u64 = 8;
 const SCRATCH_FROM_END: u64 = 72;
 
-// ── Bounded waits, in TSC units. The construction of `drivers/ahci.rs` / `drivers/sdhc.rs` (a third
-// copy; the lift to one shared helper is owed row BOUNDEDWAIT). `arch::ms()` is not usable: the probe
-// runs inside `pci::init` with interrupts masked, where the APIC tick does not advance.
-#[inline]
-fn cycles_ms(ms: u64) -> u64 {
-    let hz = crate::arch::apic::tsc_hz();
-    if hz != 0 {
-        hz.saturating_mul(ms) / 1000
-    } else {
-        crate::arch::HW_WAIT_BUDGET.saturating_mul(ms) / 2000
-    }
-}
-
-/// Spin until `pred()` holds or `ms` milliseconds elapse.
-fn wait_ms<F: Fn() -> bool>(ms: u64, pred: F) -> bool {
-    let start = crate::arch::now_cycles();
-    let budget = cycles_ms(ms);
-    loop {
-        if pred() {
-            return true;
-        }
-        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-}
+// ── Bounded waits, in TSC units: the ONE shared wait (BOUNDEDWAIT, rmbp-ledger B981, at the tail of
+// `drivers/block.rs`). `arch::ms()` is not usable: the probe runs inside `pci::init` with interrupts masked,
+// where the APIC tick does not advance.
+use crate::drivers::block::wait::{bounded as wait_ms, cycles_ms};
 
 #[inline]
 fn elapsed_ms(start: u64) -> u64 {
@@ -275,27 +252,22 @@ fn submit(c: &mut Ctrl, admin: bool, cmd: &mut [u32; 16]) -> Result<u32, ()> {
 
 /// The ONE way [`CTRL`] is held: interrupts masked, a bounded try, never an unbounded spin.
 fn with_ctrl<R>(lba: u64, f: impl FnOnce(&mut Ctrl) -> Result<R, ()>) -> Result<R, ()> {
-    crate::arch::without_interrupts(move || {
-        let t0 = crate::arch::now_cycles();
-        let bound = cycles_ms(T_HOLD_MS);
-        let mut guard = loop {
-            if let Some(g) = CTRL.try_lock() {
-                break g;
+    crate::drivers::block::hold::with(
+        T_HOLD_MS,
+        false,
+        || CTRL.try_lock(),
+        |spun| {
+            let n = BUSY_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 4 {
+                serial_println!("[nvme] busy refused lba={} waited_ms={} bound_ms={} n={}", lba, spun / cycles_ms(1).max(1), T_HOLD_MS, n);
             }
-            if crate::arch::now_cycles().wrapping_sub(t0) >= bound {
-                let n = BUSY_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
-                if n <= 4 {
-                    serial_println!("[nvme] busy refused lba={} waited_ms={} bound_ms={} n={}", lba, elapsed_ms(t0), T_HOLD_MS, n);
-                }
-                return Err(());
-            }
-            core::hint::spin_loop();
-        };
-        match &mut *guard {
+            Err(())
+        },
+        |mut guard| match &mut *guard {
             Some(c) => f(c),
             None => Err(()),
-        }
-    })
+        },
+    )
 }
 
 /// One READ/WRITE of `bytes` (whole blocks, <= `max_xfer`) between the namespace and the bounce.
