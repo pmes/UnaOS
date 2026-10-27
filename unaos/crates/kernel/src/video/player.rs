@@ -280,7 +280,7 @@ pub fn open(path: &str) -> Result<u32, String> {
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 3;
     let base = st.surf.as_ptr() as usize;
-    let title = alloc::format!("Player - {}", st.name);
+    let title = nle_title(&st.path).unwrap_or_else(|| alloc::format!("Player - {}", st.name)); // NLE6KEYSTAB (rmbp-ledger B975): an EDL opens as the NLE, `NLE - <stem>` (file tail)
     let id = wm::create_at_native(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, title.as_bytes(), ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         hw::stop();
@@ -294,7 +294,7 @@ pub fn open(path: &str) -> Result<u32, String> {
     );
     *STATE.lock() = Some(st); PLAYER_OPEN.store(true, Ordering::Release); // SMALLFIX5 (B480): the posted `player open` flag
     WIN.store(id, Ordering::Relaxed);
-    wm::winid_register_holder(&WIN, "player");
+    wm::winid_register_holder(&WIN, "player"); nle_tab(id, path); // NLE6KEYSTAB (rmbp-ledger B975): an EDL's window is LISTED in the wc window list (file tail)
     wm::focus_changed(OWNER);
     let _ = wm::present(id);
     Ok(id)
@@ -568,7 +568,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         Some(s) => (s.w, s.dur_ms, s.oy),
         None => return true,
     };
-    if ly < oy {
+    if ly < oy && edit_press_route(lx, ly) { return true; } if ly < oy { // NLE6FACEDRAG (rmbp-ledger B975): a press on the EDL's view band begins a drag (file tail)
         serial_println!("[player] press video -> {}", if playing() { "pause" } else { "play" }); // VIDEOPLAYER (B434): a click on the picture is play/pause
         post(Act::Toggle);
         return true;
@@ -1399,14 +1399,14 @@ mod nle_fx {
         let kat = MIX_KAT.iter().filter(|k| rep.mixes.contains(*k)).count();
         let mix_ok = rep.mixed == 8 && rep.mix_refused == 0 && kat == MIX_KAT.len(); let mix_ok = mix_ok && face_verdict(&rep, face); // NLE6MIXFACE (rmbp-ledger B957): the fresh outgoing run and the seek preview (module tail)
         let colour = rep.coded.iter().filter(|k| **k == COLOUR_KAT).count(); // KERNELCOLOUR (B952): NLEFXC's middle frame by BT.709
-        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1 && standin_ok(&rep); let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; let (exp_ok, exp_word) = export_verdict(dir); let ok = ok && exp_ok; let (key_ok, key_word) = keys_leg(dir, &put); let ok = ok && key_ok; let aac_ok = export_aac_leg(dir); let ok = ok && aac_ok; // NLE6KEYS (rmbp-ledger B961): the editing keys through the key door (module tail). NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
+        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1 && standin_ok(&rep); let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; let (exp_ok, exp_word) = export_verdict(dir); let ok = ok && exp_ok; let (key_ok, key_word) = keys_leg(dir, &put); let ok = ok && key_ok; let aac_ok = export_aac_leg(dir); let ok = ok && aac_ok; let (drag_ok, drag_word) = drag_leg(dir, &put); let ok = ok && drag_ok; // NLE6FACEDRAG (rmbp-ledger B975): the view band's drags through the pointer door and the NLE tab (module tail). NLE6KEYS (rmbp-ledger B961): the editing keys through the key door (module tail). NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
         serial_println!(
             "[nle] fixture edl={} presented={} dropped={} queued={} gaps={} seek_steps={} ms={}{}",
             path, pres, drop, rep.frames, rep.gaps, seek_steps, crate::arch::ms().saturating_sub(t0), err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default()
         );
         serial_println!(
-            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 env={} xfades={} swaps={} standin={} export={} keys={} -> {} ::",
-            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, env_word, rep.xfades, rep.swaps, rep.stand_in_frames, exp_word, key_word, if ok { "PASS" } else { "FAIL" }
+            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 env={} xfades={} swaps={} standin={} export={} keys={} drag={} -> {} ::",
+            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, env_word, rep.xfades, rep.swaps, rep.stand_in_frames, exp_word, key_word, drag_word, if ok { "PASS" } else { "FAIL" }
         );
     }
 
@@ -1781,6 +1781,73 @@ mod nle_fx {
         );
         ok
     }
+
+    // ── NLE6FACEDRAG (rmbp-ledger B975): the view band's drags through the pointer door, and the NLE tab ─────────────────
+    // NLEDRG.EDL cuts NLEFXA 0..20 at 0 on one video track (an existing reel, no new file). The Player opens it as the NLE
+    // (`NLE - NLEDRG`, LISTED: `wm::wl_rows` carries the row, appswitch's `apps()` names it `nle`). Once a frame painted the view
+    // band, the pointer door (`edit_press_at` / `edit_motion_at` / `edit_release_at` + `edit_pass`: press_route's arm minus the
+    // window hit and the capture seam, which a headless test does not hold) drags the clip body +3 ticks (`move_clip(0, 0, 0,
+    // 3)`), then its out handle -5 ticks (`trim_out(0, 0, 15)`); after each the Player's editor timeline must be that op applied
+    // by hand, and the saved file is `DRAG_EDL`, pinned on the host by timeline_core `view::drag_tests::kernel_drag_pin` through
+    // the SAME `view::Drag` and `edl::write`.
+    const DRAG_EDL: &str = "TITLE: NLEDRG\nFCM: NON-DROP FRAME\n* UNA FPS 25\n* UNA SOURCE NLEFXA 00:00:01:15\n\n001  NLEFXA   V     C        00:00:00:00 00:00:00:15 00:00:00:03 00:00:00:18\n";
+
+    /// The drag leg's verdict and its wire word (`ok`, `FAIL`); the detail line always.
+    fn drag_leg(dir: &str, put: &dyn Fn(&str, &[u8]) -> bool) -> (bool, &'static str) {
+        let mut tl = Timeline::new(FPS);
+        let a = tl.add_source(REELS[0], FRAMES as i64);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let path = alloc::format!("{}/NLEDRG.EDL", dir);
+        let wrote = timeline_core::edl::write(&tl, "NLEDRG").map(|t| put(&path, t.as_bytes())).unwrap_or(false);
+        let Some(id) = (if wrote { super::open(&path).ok() } else { None }) else {
+            serial_println!("[nle] fixture drag path={} wrote={} -> FAIL", path, wrote as u8);
+            super::close("fixture");
+            return (false, "FAIL");
+        };
+        let mut rows = Vec::new();
+        let n = crate::video::wm::wl_rows(&mut rows);
+        let listed = rows[..n].iter().any(|r| r.id == id && &r.title[..r.len] == b"NLE - NLEDRG");
+        let tab = listed && crate::video::appswitch::apps().iter().any(|a| a.owner == super::OWNER && a.name == "nle");
+        let t0 = crate::arch::ms();
+        let band = loop {
+            hw::pump_until(4, || false);
+            super::vid::tick();
+            let b = vplay::band_layout(&path);
+            let err = STATE.lock().as_ref().map(|s| s.err.is_some()).unwrap_or(true);
+            if b.is_some() || err || crate::arch::ms().saturating_sub(t0) > 5_000 {
+                break b;
+            }
+            crate::arch::sched::sleep_ms(4);
+        };
+        let want_move = tl.move_clip(0, 0, 0, 3).ok();
+        let want_trim = want_move.as_ref().and_then(|t| t.trim_out(0, 0, 15).ok());
+        let mut drags = 0usize;
+        if let Some((y0, l)) = band {
+            let z = l.zoom as isize;
+            let y = y0 + (l.row_y(0) + timeline_core::view::ROW_H as i64 / 2) as usize;
+            let body = (l.x_of(5) + l.zoom as i64 / 2) as usize;
+            let edge = (l.x_of(23) - 2) as usize;
+            for (x, dx, w) in [(body, 3 * z, &want_move), (edge, -5 * z, &want_trim)] {
+                let pressed = super::edit_press_at(x, y);
+                let to = (x as isize + dx).max(0) as usize;
+                super::edit_motion_at(to, y);
+                super::edit_release_at(to, y);
+                super::edit_pass();
+                if pressed && w.is_some() && vplay::edit_timeline() == *w {
+                    drags += 1;
+                }
+            }
+        }
+        let saved_ok = vplay::read_all(&path).ok().as_deref() == Some(DRAG_EDL.as_bytes());
+        super::close("fixture");
+        let ok = tab && drags == 2 && saved_ok;
+        serial_println!(
+            "[nle] fixture drag path={} drags={}/2 saved={} tab={} band={} -> {}",
+            path, drags, if saved_ok { "ok" } else { "FAIL" }, if tab { "ok" } else { "FAIL" }, band.is_some() as u8, if ok { "ok" } else { "FAIL" }
+        );
+        (ok, if ok { "ok" } else { "FAIL" })
+    }
 }
 
 // ── NLE6KEYS (rmbp-ledger B961): the Player's editing-key door ─────────────────────────────────────────────────────────
@@ -1806,12 +1873,14 @@ fn edit_post(ev: crate::pal::Event) -> bool {
 /// The pass: the posted key, then the seek door at the playhead it leaves (the facts re-read: the timeline's length moves).
 #[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
 fn edit_pass() {
-    let k = EDIT_KEY.swap(0, Ordering::AcqRel);
-    if k == 0 {
+    let d = EDIT_DRAG.swap(false, Ordering::AcqRel); // NLE6FACEDRAG (rmbp-ledger B975): a released drag first; a key waits a pass
+    let k = if d { 0 } else { EDIT_KEY.swap(0, Ordering::AcqRel) };
+    if k == 0 && !d {
         return;
     }
     let Some((path, ms, playing)) = STATE.lock().as_ref().map(|s| (s.path.clone(), s.shown_ms, s.playing)) else { return };
-    let Some(to) = crate::video::vplay::edit_key(&path, k, ms) else { return };
+    let to = if d { crate::video::vplay::edit_drag_end(&path) } else { crate::video::vplay::edit_key(&path, k, ms) };
+    let Some(to) = to else { return };
     let _ = vid::seek(to);
     if let Some(st) = STATE.lock().as_mut() {
         st.vsaid = false;
@@ -1823,6 +1892,11 @@ fn edit_pass() {
 
 #[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
 fn edit_close() {
+    if crate::video::vplay::edit_drag_take() {
+        super::capture::cancel(); // NLE6FACEDRAG (rmbp-ledger B975): a drag live at the close lets the pointer go
+    }
+    EDIT_DRAG.store(false, Ordering::Release);
+    let _ = wm::list_furniture(OWNER, false); // NLE6KEYSTAB (rmbp-ledger B975): the NLE leaves the wc window list
     crate::video::vplay::edit_close();
 }
 
@@ -1836,3 +1910,89 @@ fn edit_pass() {}
 
 #[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
 fn edit_close() {}
+
+// ── NLE6KEYSTAB + NLE6FACEDRAG (rmbp-ledger B975): the NLE tab and the view band's pointer door ──────────────────────────────
+// handlers.md §5 NLE6's NLE6KEYS-TAB and NLE6FACE-DRAG. THE TAB: the Player opened on an EDL is titled `NLE - <stem>` (the
+// Player's own `Player - <leaf>` shape, ASCII) and its owner is LISTED in the wc window list while it is open
+// (`wm::list_furniture`: `cycle_order` / `wl_rows` then carry it, so appswitch's Cmd-Tab, the Window menu and WINCYCLE see an
+// app `nle`; appswitch activates it through its existing door); `edit_close` unlists it. Wire: `[nle] tab win=<n> title="NLE -
+// <stem>" listed=<0|1>`. THE DRAG: `press_route`'s picture arm asks `edit_press_route` first: a press on the painted view band
+// begins the host's `view::Drag` (`vplay::edit_press`) and takes the pointer (the capture seam, as the scrubber does); the
+// motion updates it (`vplay::edit_drag_move`, no I/O); the release posts `EDIT_DRAG` and the pass (`edit_pass`) runs
+// `vplay::edit_drag_end` (the commit and the save), then the same seek door the keys use. A press off the band stays play/pause.
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+static EDIT_DRAG: AtomicBool = AtomicBool::new(false);
+
+/// The NLE window's title for an EDL (`None`: a plain Player window).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn nle_title(path: &str) -> Option<String> {
+    crate::video::vplay::is_edl(path).then(|| alloc::format!("NLE - {}", crate::video::vplay::edl_stem(path)))
+}
+
+/// An EDL's window joins the wc window list (the tab).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn nle_tab(id: wm::WinId, path: &str) {
+    if !crate::video::vplay::is_edl(path) {
+        return;
+    }
+    let listed = wm::list_furniture(OWNER, true);
+    serial_println!("[nle] tab win={} title=\"NLE - {}\" listed={}", id, crate::video::vplay::edl_stem(path), listed as u8);
+}
+
+/// A press at surface px `(lx, ly)` on the shown EDL's view band began a drag (no pointer capture: the fixture's door).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_press_at(lx: usize, ly: usize) -> bool {
+    let p = shown();
+    crate::video::vplay::edit_live(&p) && crate::video::vplay::edit_press(&p, lx, ly)
+}
+
+/// `press_route`'s picture arm: a drag begun takes the pointer until the release.
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_press_route(lx: usize, ly: usize) -> bool {
+    if !edit_press_at(lx, ly) {
+        return false;
+    }
+    super::capture::begin(edit_motion, edit_release);
+    true
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_motion_at(lx: usize, ly: usize) {
+    crate::video::vplay::edit_drag_move(lx, ly);
+}
+
+/// The release at surface px: the last motion, then the end posted for the pass (the commit saves: never at router depth).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_release_at(lx: usize, ly: usize) {
+    edit_motion_at(lx, ly);
+    EDIT_DRAG.store(true, Ordering::Release);
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_motion(x: i32, y: i32) {
+    if let Some((lx, ly)) = local(x, y) {
+        edit_motion_at(lx, ly);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_release(x: i32, y: i32) {
+    match local(x, y) {
+        Some((lx, ly)) => edit_release_at(lx, ly),
+        None => EDIT_DRAG.store(true, Ordering::Release),
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+fn nle_title(_: &str) -> Option<String> {
+    None
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+fn nle_tab(_: wm::WinId, _: &str) {}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+fn edit_press_route(_: usize, _: usize) -> bool {
+    false
+}

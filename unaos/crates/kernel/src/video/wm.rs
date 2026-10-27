@@ -29340,7 +29340,7 @@ pub fn cycle_order(out: &mut alloc::vec::Vec<WinId>) -> usize { // WINDOWCAP-2: 
     let mut zs = alloc::vec::Vec::new(); // WINDOWCAP-2: growable (was a [_; MAX_WINDOWS] scratch)
     let mut n = 0usize;
     for r in t.rows.iter() {
-        if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) && r.z != PARKED_Z && above_shell(r, shell) {
+        if r.used && !r.compat && r.owner_asid != 0 && (!is_kernel_owner(r.owner_asid) || listed_furniture(r.owner_asid)) && r.z != PARKED_Z && above_shell(r, shell) {
             zs.push((r.z, r.id));
             n += 1;
         }
@@ -29948,7 +29948,7 @@ pub fn wl_rows(out: &mut alloc::vec::Vec<WlRow>) -> usize { // WINDOWCAP-2: clea
     {
         let t = table();
         for r in t.rows.iter() {
-            if r.used && !r.compat && r.owner_asid != 0 && !is_kernel_owner(r.owner_asid) {
+            if r.used && !r.compat && r.owner_asid != 0 && (!is_kernel_owner(r.owner_asid) || listed_furniture(r.owner_asid)) {
                 out.push(WlRow { id: r.id, owner: r.owner_asid, minimised: r.z == PARKED_Z || !above_shell(r, shell), title: r.title, len: r.title_len.min(MAX_TITLE) });
                 n += 1;
             }
@@ -32332,4 +32332,39 @@ pub fn resize_kernel_row(id: WinId, w: usize, h: usize) -> Option<bool> {
         (r.owner_asid, r.x, r.y)
     };
     resize_to_inner(id, Some(owner), x, y, w, h)
+}
+
+// ---- NLE6KEYSTAB (rmbp-ledger B975): kernel furniture that asks to be LISTED -----------------------------------------
+//
+// TAIL-APPENDED. The wc window list (`cycle_order`, `wl_rows`: Cmd-Tab's appswitch, the Window menu, WINCYCLE) drops every
+// kernel-owner row. A furniture owner may opt in while it shows an app-like window (the Player on an EDL, titled
+// `NLE - <stem>`): `list_furniture(owner, true)` while open, `false` on close. Atomics only (read under `TABLE`); four slots,
+// one per opting kind (not a window cap, BP-video-7). Not a second window list: the two readers' filters ask it.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static LISTED: [core::sync::atomic::AtomicU64; 4] = [const { core::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// List (`on`) or unlist a kernel-furniture owner in the wc window list. `false` when `on` found no free slot or `owner` is
+/// not a kernel owner (a ring-3 owner is always listed).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn list_furniture(owner: u64, on: bool) -> bool {
+    use core::sync::atomic::Ordering;
+    if owner == 0 || !is_kernel_owner(owner) {
+        return false;
+    }
+    if !on {
+        for s in LISTED.iter() {
+            let _ = s.compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+        return true;
+    }
+    if listed_furniture(owner) {
+        return true;
+    }
+    LISTED.iter().any(|s| s.compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire).is_ok())
+}
+
+/// Is `owner` a kernel-furniture owner that asked to be listed ([`list_furniture`])?
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn listed_furniture(owner: u64) -> bool {
+    owner != 0 && LISTED.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == owner)
 }
