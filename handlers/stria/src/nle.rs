@@ -48,7 +48,7 @@ use std::sync::Arc;
 use gneiss_pal::dsp::audio::resample;
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
 use gneiss_pal::dsp::demux::{DecodeTime, Demuxer, TrackKind, build};
-use gneiss_pal::dsp::video::{Frame, VideoDecoder, decoder_for, reorder_depth};
+use gneiss_pal::dsp::video::{Frame, VideoDecoder, decoder_for, reorder_depth, colour_of};
 use timeline_core::schedule::{AudioRun, Layer, ScheduleError, audio_runs, schedule};
 use timeline_core::{Kind, SourceId, SourceIndex, Timebase, Timeline};
 
@@ -135,7 +135,7 @@ impl Media {
             drop(demux);
             demux = Demuxer::open(Arc::try_unwrap(data).unwrap_or_else(|a| (*a).clone())).map_err(err)?;
         }
-        demux.derive_dts(reorder_depth);
+        demux.derive_dts(reorder_depth); demux.fill_colour(colour_of);
         let find = |k: TrackKind| demux.tracks().iter().position(|t| t.kind == k);
         let (video, audio) = (find(TrackKind::Video), find(TrackKind::Audio));
         if demux.indexed() {
@@ -195,14 +195,15 @@ impl Sources {
         let i = m.video.or(m.audio)?;
         let s = m.demux.survey().streams.into_iter().nth(i)?;
         let applied = self.applied.iter().find(|a| a.0 == id).map(|a| a.1);
-        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len(), applied })
+        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len(), applied, colour: s.colour })
     }
 }
 
 /// DEMUXWIRE (SR213): one reel's open, as `nle schedule` prints it:
 /// `open=<full|indexed> dts=<stored|derived:n|presentation> edits=<n> applied=<n|first-only>`. `edits` counts every `elst`
 /// entry; EDITMAP (SR223): `applied` is the clips a reel opened by [`Sources::from_media`] laid from its whole edit list,
-/// `first-only` a reel an EDL cuts (only the first media edit applies, as playback does).
+/// `first-only` a reel an EDL cuts (only the first media edit applies, as playback does). NLEPROBEHDRWIRE (SR305): then
+/// ` colour=<token>` (demux_core's `Colour` Display) only when the video track states a colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenReport {
     pub indexed: bool,
@@ -210,6 +211,8 @@ pub struct OpenReport {
     pub edits: usize,
     /// EDITMAP (SR223): `Some(clips)` when the reel's whole edit list was laid; `None` = the first media edit only.
     pub applied: Option<usize>,
+    /// NLEPROBEHDRWIRE (SR305): the reel's colour (container, else the bitstream's through `fill_colour(colour_of)`).
+    pub colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
 }
 
 impl std::fmt::Display for OpenReport {
@@ -223,9 +226,13 @@ impl std::fmt::Display for OpenReport {
         }
         write!(f, " edits={}", self.edits)?;
         match self.applied {
-            Some(n) => write!(f, " applied={n}"),
-            None => write!(f, " applied=first-only"),
+            Some(n) => write!(f, " applied={n}")?,
+            None => write!(f, " applied=first-only")?,
         }
+        if let Some(c) = self.colour {
+            write!(f, " {c}")?;
+        }
+        Ok(())
     }
 }
 

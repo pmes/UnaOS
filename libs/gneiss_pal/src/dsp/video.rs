@@ -143,6 +143,57 @@ pub fn reorder_depth(track: &Track) -> Option<u32> {
     }
 }
 
+/// NLEPROBEHDRWIRE (LEDGER SR305): the bitstream's colour of a video track, read by its codec core from the track's decoder
+/// configuration — what `Demuxer::fill_colour` takes as the fallback for what the container did not say (NLEPROBEHDR SR226;
+/// demux_core links no decoder, the [`reorder_depth`] shape). H.264 → `h264_core::ps::avcc_sps`'s VUI (only when
+/// video_signal_type is present); AV1 → `av1_core::image::av1c_colour` (color_config, plus the METADATA OBUs' content light
+/// levels and mastering display) when the `av1` feature is on. Anything else → `None` (HEVC-VUI is owed: hevc_core's SPS
+/// carries the VUI colour, but its hvcC SPS reader is still the depth's own walk). Both of Stria's opens pass it by name
+/// beside [`reorder_depth`].
+pub fn colour_of(track: &Track) -> Option<super::demux::colour::Colour> {
+    use super::demux::colour::Colour;
+    match &track.codec {
+        Codec::Avc => {
+            let s = h264_core::ps::avcc_sps(&track.config)?;
+            if !s.video_signal_type {
+                return None;
+            }
+            Some(Colour {
+                primaries: s.colour_primaries,
+                transfer: s.transfer_characteristics,
+                matrix: s.matrix_coefficients,
+                full_range: Some(s.full_range),
+                mastering: None,
+                light: None,
+            })
+        }
+        #[cfg(feature = "av1")]
+        Codec::Av1 => {
+            use super::demux::colour::{Light, Mastering};
+            let (cc, meta) = av1_core::image::av1c_colour(&track.config)?;
+            let mut c = Colour {
+                primaries: cc.color_primaries,
+                transfer: cc.transfer_characteristics,
+                matrix: cc.matrix_coefficients,
+                full_range: Some(cc.color_range),
+                mastering: None,
+                light: None,
+            };
+            for m in meta {
+                match m {
+                    av1_core::obu::Metadata::Cll { max_cll, max_fall } => c.light = Some(Light { max_cll, max_fall }),
+                    av1_core::obu::Metadata::Mdcv { primaries, white, luminance_max, luminance_min } => {
+                        c.mastering = Some(Mastering::from_av1(primaries, white, luminance_max, luminance_min))
+                    }
+                    av1_core::obu::Metadata::Other(_) => {}
+                }
+            }
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(feature = "av1")]
 pub mod av1;
 pub mod vp8;
