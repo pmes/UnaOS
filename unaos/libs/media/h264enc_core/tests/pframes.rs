@@ -179,7 +179,7 @@ fn pan_frac(t: usize) -> [Vec<u8>; 3] {
 }
 
 fn cfg(qp: u8, gop: u32, deblock: bool, subpel: u8) -> Config {
-    Config { width: W as u32, height: H as u32, qp, gop, deblock, subpel }
+    Config { width: W as u32, height: H as u32, qp, gop, deblock, subpel, rate: None }
 }
 
 /// H264ENC2 M1 (LEDGER SR211): with the in-loop filter on (idc 0) every I and P frame h264_core

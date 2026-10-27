@@ -46,7 +46,7 @@ impl Encoder {
         info.kind = kind;
         info.cbp = code.cbp;
         info.t8x8 = false;
-        info.qp = self.qp as u8;
+        info.qp = (if code.cbp != 0 || code.kind == Kind::I16 { self.qp } else { self.qp_pred }) as u8; // QPY: a MB without mb_qp_delta keeps QPY,pred
         info.nz = nz;
         let m = self.motion[i];
         let w4 = self.dmo.w4;

@@ -151,10 +151,12 @@ fn aac_fetched_streams() {
 
 /// HEAACSBR (LEDGER SR198): Chromium's implicit HE-AAC streams (fetched, sha256-pinned in vectors.txt) against
 /// FFmpeg 6.1.1's float decode (`he1.ref.flac` 24-bit, `he2.ref.flac` 16-bit; the commands are in expected.txt and
-/// oracle/gen-aac.sh). v1 (SBR): waveform SNR >= 50 dB. v2 (SBR + parametric stereo): FFmpeg synthesises the stereo
-/// image, ours duplicates the mono core (`ps=seen`, PS synthesis owed: handlers.md HEAACSBR-PS), so v2 is held to
-/// the level of the SBR band — third-octave bands above the core's 12 kHz Nyquist, ours vs the reference's mid
-/// (L+R)/2, mean difference within 6 dB.
+/// oracle/gen-aac.sh). v1 (SBR): waveform SNR >= 50 dB. v2 (SBR + parametric stereo, HEAACSBR-PS LEDGER SR214):
+/// both channels through our PS stage, waveform SNR >= 55 dB per channel. Measured (SR214): this stream's PS headers
+/// switch IID and ICC off, so FFmpeg's L and R are equal (bit-equal on 133122 of 139264 float samples, the rest in
+/// blocks under -82 dBFS) and the 16-bit reference caps the SNR at ~59.8 dB; a left/right difference bound would
+/// compare against silence, so the stereo image itself is held by sbr.rs `ps_tests` (a real-stereo HE-AAC v2 vector
+/// is owed: handlers.md HEAACSBR-PSVEC).
 #[test]
 fn heaac_vs_ffmpeg() {
     let mut checked = 0;
@@ -189,24 +191,16 @@ fn heaac_vs_ffmpeg() {
             assert!(snr >= 50.0, "{}: SNR {:.1} dB", name, snr);
         } else {
             assert_eq!(ps, "ps=seen", "{}", name);
-            let ours: Vec<f64> = (0..frames).map(|i| pcm[i * ch] as f64).collect();
-            let mid: Vec<f64> = (0..frames).map(|i| 0.5 * (rf[i * ch] as f64 + rf[i * ch + 1] as f64)).collect();
-            let rate = info.rate as f64;
-            let (mut hi_sum, mut hi_n, mut lo_sum, mut lo_n) = (0f64, 0usize, 0f64, 0usize);
-            for blk in 0..frames / 1024 {
-                let (pa, pb) = (bands(&ours[blk * 1024..], rate), bands(&mid[blk * 1024..], rate));
-                let top = pb.iter().cloned().fold(0.0, f64::max);
-                for k in 0..pb.len() {
-                    if pb[k] < top * 1e-6 || pb[k] < 1e-8 { continue; }
-                    let d = 10.0 * (pa[k] / pb[k]).log10();
-                    if 100.0 * 2f64.powf(k as f64 / 3.0) > 12000.0 { hi_sum += d; hi_n += 1; } else { lo_sum += d; lo_n += 1; }
-                }
-            }
-            let (hi, lo) = (hi_sum / hi_n.max(1) as f64, lo_sum / lo_n.max(1) as f64);
-            let good = hi_n > 0 && hi.abs() < 6.0;
-            eprintln!("HE-AAC v2 {:<44} {}ch {}Hz frames={} {} (PS skipped, mono duplicated) high band (>12 kHz) {:+.2} dB over {} bands, low band {:+.2} dB -> {}",
-                name, ch, info.rate, frames, ps, hi, hi_n, lo, if good { "OK" } else { "FAIL" });
-            assert!(good, "{}: high band {:+.2} dB over {} bands", name, hi, hi_n);
+            assert_eq!(ch, 2, "{}: PS channels", name);
+            let snr: Vec<f64> = (0..ch).map(|c| {
+                let (mut s, mut e) = (0f64, 0f64);
+                for i in 0..frames { let (x, y) = (pcm[i * ch + c] as f64, rf[i * ch + c] as f64); s += y * y; e += (x - y) * (x - y); }
+                10.0 * (s / e).log10()
+            }).collect();
+            let good = snr.iter().all(|&v| v >= 55.0);
+            eprintln!("HE-AAC v2 {:<44} {}ch {}Hz frames={} {} (PS synthesised) SNR L={:.1} dB R={:.1} dB -> {}",
+                name, ch, info.rate, frames, ps, snr[0], snr[1], if good { "OK" } else { "FAIL" });
+            assert!(good, "{}: SNR L {:.1} dB R {:.1} dB", name, snr[0], snr[1]);
         }
         checked += 1;
     }

@@ -7,7 +7,7 @@
 //! CHARTER: Stria (A/V) — seam `shared-core` (a `no_std` lib both rings link, beside h264_core).
 //!
 //! What it writes: Constrained Baseline (profile_idc 66, constraint_set0/1), CAVLC, frames only,
-//! one slice per picture, constant QP (16..=40). An IDR every `gop` frames, P frames between them
+//! one slice per picture, constant QP (16..=40) or rate-controlled ([`Config::rate`], H264ENCRC SR218). An IDR every `gop` frames, P frames between them
 //! against the previous reconstruction (one reference frame). Macroblocks: Intra_4x4 and
 //! Intra_16x16 (the SAD-cheapest mode of each, chroma likewise) in I slices; P_Skip and
 //! P_L0_16x16 by an integer-sample full search in a +-8 window in P slices, optionally refined to
@@ -23,6 +23,7 @@
 //! | `gop`            | >= 1          | (set)   | an IDR every `gop` frames                               |
 //! | `deblock`        | bool          | false   | idc 0 + h264_core's `deblock_picture` over the recon    |
 //! | `subpel`         | 0 / 1 / 2     | 0       | motion refinement: integer / half / quarter (>2 = 2)    |
+//! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP |
 //!
 //! | module          | Recommendation                                                          |
 //! |-----------------|-------------------------------------------------------------------------|
@@ -34,6 +35,7 @@
 //! | [`me`]          | 8.4.1 MV prediction and P_Skip, integer search + sub-sample refinement   |
 //! | [`yuv`]         | RGBA -> I420 input, BT.601 limited range (Rec. ITU-R BT.601), NLE5B      |
 //! | [`deblock`]     | 8.7 the facts h264_core's deblocking filter reads, recorded per MB       |
+//! | [`rc`]          | rate control: picture QP (slice_qp_delta), row QP (7.4.5 mb_qp_delta)   |
 //!
 //! Shared, never copied: h264_core's `transform` (`LevelScale`, `scale4`, `luma_dc`, `chroma_dc`,
 //! `idct4_add`) is the encoder's reconstruction; its `intra` (`pred_nxn`, `pred_16x16`,
@@ -46,7 +48,7 @@
 //! nC, mvp) are decoder-private methods there, so they are mirrored here for one slice per
 //! picture; making them shared free fns is owed (H264ENC-NBSHARE).
 //!
-//! Owed (handlers.md §5): rate control (H264ENC-RC), CABAC / Main / High (H264ENC-CABAC), the
+//! Owed (handlers.md §5): two-pass / scene cuts / activity masking (inside H264ENC-RC), CABAC / Main / High (H264ENC-CABAC), the
 //! 16x8 / 8x16 / 8x8 partitions (inside H264ENC-SUBPEL), per-slice filter offsets (inside
 //! H264ENC-DEBLOCK), B-frames (H264ENC-BFRAMES), hardware encode (H264ENC-HW).
 
@@ -61,6 +63,7 @@ pub mod deblock;
 pub mod intra;
 pub mod me;
 pub mod nal;
+pub mod rc;
 pub mod sps;
 pub mod transform;
 pub mod yuv;
@@ -77,6 +80,7 @@ use h264_core::transform::LevelScale;
 use crate::cavlc::Nnz;
 use crate::me::MbMotion;
 use crate::nal::BitWriter;
+pub use crate::rc::{RateControl, RcMode};
 use crate::sps::SeqParams;
 
 /// Every way the encoder refuses.
@@ -90,6 +94,8 @@ pub enum Error {
     Gop,
     /// A frame whose size or planes do not match the configuration.
     FrameSize,
+    /// A rate control with a zero bit rate or frame rate, or a VBR max below its mean.
+    Rate,
 }
 
 impl core::fmt::Display for Error {
@@ -99,6 +105,7 @@ impl core::fmt::Display for Error {
             Error::Qp => "h264enc: QP outside 16..=40",
             Error::Gop => "h264enc: GOP length 0",
             Error::FrameSize => "h264enc: frame does not match the configured size",
+            Error::Rate => "h264enc: rate control with a zero bit rate / frame rate, or a VBR max below its mean",
         })
     }
 }
@@ -121,6 +128,10 @@ pub struct Config {
     /// Motion refinement after the integer search: 0 integer, 1 half, 2 quarter samples (above 2
     /// is read as 2).
     pub subpel: u8,
+    /// Rate control (H264ENCRC, SR218): None codes every macroblock at `qp`; Some starts at `qp`
+    /// and [`rc`] chooses each picture's QP from the bit budget and each macroblock row's from the
+    /// running bit count.
+    pub rate: Option<RateControl>,
 }
 
 /// One 8-bit 4:2:0 planar input frame, borrowed: the field names of gneiss_pal's
@@ -243,9 +254,17 @@ pub struct Encoder {
     pub(crate) cfg: Config,
     pub(crate) mb_w: usize,
     pub(crate) mb_h: usize,
+    /// QPY of the macroblocks being coded (the constant QP without rate control).
     pub(crate) qp: i32,
-    /// QPc of the constant QP (chroma_qp_index_offset 0, Table 8-15).
+    /// QPc of `qp` (chroma_qp_index_offset 0, Table 8-15).
     pub(crate) qpc: i32,
+    /// QPY,pred (7.4.5): the QPY of the previous macroblock of the slice, as h264_core's decoder
+    /// tracks it (moved only by a written mb_qp_delta).
+    pub(crate) qp_pred: i32,
+    /// The rate controller ([`Config::rate`]).
+    pub(crate) rc: Option<rc::Rc>,
+    /// SliceQPY of the last encoded picture.
+    last_qp: i32,
     log2_max_frame_num: u32,
     sps: Vec<u8>,
     pps: Vec<u8>,
@@ -282,6 +301,10 @@ impl Encoder {
         if cfg.gop == 0 {
             return Err(Error::Gop);
         }
+        let rc = match cfg.rate {
+            Some(r) => Some(rc::Rc::new(r, cfg.gop, cfg.qp as i32)?),
+            None => None,
+        };
         let (mb_w, mb_h) = (cfg.width.div_ceil(16) as usize, cfg.height.div_ceil(16) as usize);
         let qp = cfg.qp as i32;
         let mut log2_max_frame_num = 4;
@@ -299,6 +322,9 @@ impl Encoder {
             mb_h,
             qp,
             qpc: QPC[qp as usize] as i32,
+            qp_pred: qp,
+            rc,
+            last_qp: qp,
             log2_max_frame_num,
             sps,
             pps,
@@ -320,6 +346,11 @@ impl Encoder {
 
     pub fn config(&self) -> Config {
         self.cfg
+    }
+
+    /// SliceQPY of the last encoded picture (the constant QP without rate control).
+    pub fn picture_qp(&self) -> u8 {
+        self.last_qp as u8
     }
 
     /// The SPS NAL unit (header byte first).
@@ -348,13 +379,17 @@ impl Encoder {
         self.load(f)?;
         let idr = self.frames.is_multiple_of(self.cfg.gop as u64);
         self.frame_num = if idr { 0 } else { (self.frame_num + 1) % (1 << self.log2_max_frame_num) };
+        let slice_qp = self.rc_picture(idr);
+        self.qp_pred = slice_qp;
         self.nnz.reset();
         self.modes.fill(2);
         self.motion.fill(MbMotion::NONE);
         let mut w = BitWriter::new();
-        sps::write_slice_header(&mut w, idr, self.frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, self.cfg.deblock);
+        sps::write_slice_header(&mut w, idr, self.frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, self.cfg.deblock, slice_qp - self.cfg.qp as i32);
+        let hdr = w.bits();
         let mut run = 0u32;
         for mby in 0..self.mb_h {
+            self.rc_row(mby, w.bits() - hdr);
             for mbx in 0..self.mb_w {
                 if idr {
                     let code = self.intra_mb(mbx, mby);
@@ -379,6 +414,8 @@ impl Encoder {
         w.trailing();
         let slice = nal::nal_unit(3, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
         let nals = if idr { vec![self.sps.clone(), self.pps.clone(), slice] } else { vec![slice] };
+        self.rc_update(nals.iter().map(|n| n.len() as u64 * 8).sum());
+        self.last_qp = slice_qp;
         self.deblock();
         self.store_crop();
         core::mem::swap(&mut self.rec, &mut self.refp);
@@ -526,7 +563,8 @@ impl Encoder {
             Kind::PSkip => return,
         }
         if code.cbp != 0 || code.kind == Kind::I16 {
-            w.se(0); // mb_qp_delta: QP is constant
+            w.se(self.qp - self.qp_pred); // mb_qp_delta (0 at constant QP); QPY,pred moves as h264_core's mb.rs moves it
+            self.qp_pred = self.qp;
             self.write_residual(w, mbx, mby, code);
         }
     }

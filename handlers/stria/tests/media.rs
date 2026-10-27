@@ -168,10 +168,11 @@ fn poster_is_frame_zero_while_paused() {
 #[test]
 fn codec_without_decoder_plays_the_labelled_stand_in() {
     let mut t = build::test_pattern_track(1, 320, 240, 10, 10, 10);
-    // H.264 has a decoder since H264CORE (SR133); HEVC is the codec with none.
-    t.spec.fourcc = *b"hvc1";
-    t.spec.config_box = Some(*b"hvcC");
-    t.spec.config = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // HEVC has a decoder since HEVCPAL (SR215); MPEG-4 Part 2 Visual (`mp4v`) is mapped by no demux_core arm
+    // (Codec::Other) and decoded by no core.
+    t.spec.fourcc = *b"mp4v";
+    t.spec.config_box = None;
+    t.spec.config = Vec::new();
     let file = build::mp4(&[t], &Mp4Options::default());
     let time = ManualTime::new();
     let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
@@ -457,4 +458,83 @@ fn wsola_time_stretch_keeps_the_pitch() {
         let per_sec = zc as f64 * sr as f64 / m as f64;
         assert!((per_sec - 882.0).abs() <= 15.0, "rate {rate}: {per_sec} zero crossings per second (pitch moved)");
     }
+}
+
+// HEVCPAL (LEDGER SR215): HEVC through the registry Stria's Player and editor share. The four NAL units are what
+// hevc_core's own test kit builds for its KAT `all_intra_dc_64x48_is_flat_128` (unaos/libs/media/hevc_core
+// tests/decode.rs `all_dc_stream(false, None)` over tests/common's VPS / SPS / PPS / CABAC builders; that kit is
+// test-local, so the bytes are embedded — HEVCTESTKIT owes one shared kit): Main profile, 64x48, CTB 64, every CU
+// INTRA_DC with no residual, so every sample of every plane is 128 (8.4.4.2.6 DC with no neighbours is
+// 1 << (BitDepth - 1)). The SPS's sps_max_num_reorder_pics is 0.
+const HEVC_VPS: [u8; 23] = [0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xac, 0x09];
+const HEVC_SPS: [u8; 27] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x16, 0x5f, 0x92, 0x4c, 0x20, 0x80];
+const HEVC_PPS: [u8; 6] = [0x44, 0x01, 0xc0, 0x71, 0x81, 0x12];
+const HEVC_IDR: [u8; 11] = [0x26, 0x01, 0xaf, 0x80, 0x26, 0x1d, 0x2d, 0x2c, 0xbd, 0x47, 0x30];
+
+/// An all-intra HEVC video track of `n` IDR samples (40 ms apart), configured by an hvcC (ISO/IEC 14496-15 8.3.3.1:
+/// Main, level 60, 4:2:0, 8-bit, 4-byte NAL lengths, one VPS / SPS / PPS array each).
+fn hevc_kat_track(n: usize) -> build::MediaTrack {
+    let mut hvcc = vec![1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 60, 0xf0, 0x00, 0xfc, 0xfd, 0xf8, 0xf8, 0, 0, 0x0f, 3];
+    for (ty, unit) in [(32u8, &HEVC_VPS[..]), (33, &HEVC_SPS[..]), (34, &HEVC_PPS[..])] {
+        hvcc.extend_from_slice(&[0x80 | ty, 0, 1]);
+        hvcc.extend_from_slice(&(unit.len() as u16).to_be_bytes());
+        hvcc.extend_from_slice(unit);
+    }
+    let mut sample = (HEVC_IDR.len() as u32).to_be_bytes().to_vec();
+    sample.extend_from_slice(&HEVC_IDR);
+    let mut spec = build::TrackSpec::test_pattern(1, 64, 48, 25);
+    spec.fourcc = *b"hvc1";
+    spec.config_box = Some(*b"hvcC");
+    spec.codec_id = "V_MPEGH/ISO/HEVC";
+    spec.config = hvcc;
+    spec.timescale = 1000;
+    let samples = (0..n)
+        .map(|i| build::SampleSpec { data: sample.clone(), dts: i as i64 * 40, pts: i as i64 * 40, duration: 40, keyframe: true })
+        .collect();
+    build::MediaTrack { spec, samples }
+}
+
+#[test]
+fn hevcpal_intra_mp4_decodes_flat_through_the_registry() {
+    use gneiss_pal::dsp::video::{Pixels, decoder_for};
+    let file = build::mp4(&[hevc_kat_track(3)], &Mp4Options::default());
+    let mut d = gneiss_pal::dsp::demux::Demuxer::open(file.clone()).unwrap();
+    let vt = d.tracks()[0].clone();
+    assert_eq!(vt.codec, gneiss_pal::dsp::demux::Codec::Hevc);
+    let mut dec = decoder_for(&vt).unwrap();
+    assert!(dec.is_real());
+    assert_eq!(dec.name(), "hevc (hevc_core)");
+    let mut frames = Vec::new();
+    while let Some(p) = d.next_packet() {
+        frames.extend(dec.decode(&p).unwrap());
+    }
+    frames.extend(dec.flush());
+    assert_eq!(frames.len(), 3);
+    for (i, f) in frames.iter().enumerate() {
+        assert_eq!((f.width, f.height, f.pts_ns), (64, 48, i as i64 * 40_000_000));
+        let Pixels::I420 { y, u, v, .. } = &f.pixels else { panic!("not I420") };
+        assert_eq!((y.len(), u.len(), v.len()), (64 * 48, 32 * 24, 32 * 24));
+        assert!(y.iter().chain(u).chain(v).all(|&s| s == 128), "frame {i} is not flat 128");
+    }
+    // The Player picks the same decoder: real frames, labelled hevc.
+    let p = Player::open(file, Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().video, "hvc1");
+    assert_eq!(p.info().video_decoder, "hevc (hevc_core)");
+    assert!(p.info().real_video);
+    println!("hevcpal: decoder={} frames={} flat=128", dec.name(), frames.len());
+}
+
+#[test]
+fn hevcpal_editor_derives_hevc_dts() {
+    use timeline_core::{SourceId, Timeline};
+    let file = build::mkv(&[hevc_kat_track(3)], &MkvOptions::default());
+    let d = gneiss_pal::dsp::demux::Demuxer::open(file.clone()).unwrap();
+    assert_eq!(d.tracks()[0].codec, gneiss_pal::dsp::demux::Codec::Hevc);
+    assert_eq!(gneiss_pal::dsp::video::reorder_depth(&d.tracks()[0]), Some(0), "hvcC's sps_max_num_reorder_pics");
+    let tl = Timeline::new(25);
+    let mut src = stria::nle::Sources::new(&tl);
+    src.add(SourceId(0), file).unwrap();
+    let r = src.open_report(SourceId(0)).unwrap();
+    assert_eq!(r.to_string(), "open=full dts=derived:0 edits=0 applied=first-only", "{r:?}");
+    println!("hevcpal: editor {r}");
 }

@@ -13,6 +13,9 @@ std = ["dep:http_core", "tokio", "futures-core", "futures-util"]
 # PLAYBACK (SR26): AVCODEC's AV1 decoder (`unaos/libs/media/av1_core`, LEDGER SR24) behind
 # `dsp::video::av1` (folded on host-merge1: the real adapter, key + intra-only frames today).
 av1 = ["dep:av1_core"]
+# HEVCPAL (SR215): HEVCPARSE's decoder (`unaos/libs/media/hevc_core`, LEDGER SR199) behind `dsp::video::hevc` (8-bit 4:2:0
+# intra pictures; P/B slices refused by name until HEVCINTER); Stria enables it, as it does `av1`.
+hevc = ["dep:hevc_core"]
 local-embed = ["std", "dep:infer_core"]
 
 [dependencies]
@@ -48,6 +51,8 @@ vp8_core = { path = "../../unaos/libs/media/vp8_core" }
 vp9_core = { path = "../../unaos/libs/media/vp9_core" }
 # H264CORE (SR133): the from-spec H.264 / AVC decoder (Baseline, Main, High; 8-bit 4:2:0) behind `dsp::video::h264` (`no_std`, no dependencies).
 h264_core = { path = "../../unaos/libs/media/h264_core" }
+# HEVCPAL (SR215): the from-spec H.265 / HEVC decoder behind `dsp::video::hevc` (`no_std`, its one dependency h264_core).
+hevc_core = { path = "../../unaos/libs/media/hevc_core", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "macros", "time"] }

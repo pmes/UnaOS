@@ -131,6 +131,19 @@ pub fn atan(x: f64) -> f64 {
     if neg { -r } else { r }
 }
 
+/// The modified Bessel function of the first kind, order 0 (NLE4B, SR222: the Kaiser window's), as its power series
+/// `sum_k ((x/2)^2)^k / (k!)^2`, summed until a term no longer moves the sum.
+pub fn bessel_i0(x: f64) -> f64 {
+    let q = x * x / 4.0;
+    let (mut s, mut term) = (1.0f64, 1.0f64);
+    for k in 1..200 {
+        term *= q / (k * k) as f64;
+        s += term;
+        if term <= 1e-17 * s { break; }
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +167,14 @@ mod tests {
         }
         assert!(close(ln(1e-310), (1e-310f64).ln()));
         assert!(close(exp2(-30.5), (-30.5f64).exp2()));
+    }
+    #[test]
+    fn bessel_i0_is_the_series() {
+        // the known values I0(1) = 1.2660658777520082, I0(8) = 427.5641157218048
+        let rel = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b;
+        assert_eq!(bessel_i0(0.0), 1.0);
+        assert!(rel(bessel_i0(1.0), 1.266_065_877_752_008_4), "{}", bessel_i0(1.0));
+        assert!(rel(bessel_i0(8.0), 427.564_115_721_804_8), "{}", bessel_i0(8.0));
+        assert_eq!(bessel_i0(-8.0), bessel_i0(8.0));
     }
 }

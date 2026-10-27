@@ -12,7 +12,7 @@ use gneiss_pal::dsp::demux::{Codec, Demuxer, TrackKind};
 use gneiss_pal::dsp::image::decode_png;
 use gneiss_pal::dsp::video::{Pixels, TestPattern, decoder_for};
 use h264enc_core::yuv::I420;
-use h264enc_core::{Config, Encoder};
+use h264enc_core::{Config, Encoder, RateControl, RcMode};
 use stria::nle::{RenderSink, SYNTH_RATE, Sources, render, synth_sample, synth_source};
 use stria::nle_export::{AudioOut, H264Encoder, PngSequence, RawSequence, export, pcm16, wav_header};
 use timeline_core::schedule::schedule;
@@ -179,7 +179,7 @@ fn mp4_audio_round_trip() {
 /// NLE5B: a fresh H264ENC encoder over the render's frames (the same converter and config): its samples, its avcC and
 /// its reconstruction per frame.
 fn fresh_h264(frames: &[Vec<u8>], gop: u32) -> (Vec<Vec<u8>>, Vec<u8>, Vec<[Vec<u8>; 3]>, Vec<I420>) {
-    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop }).unwrap();
+    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop, ..Default::default() }).unwrap();
     let (mut samples, mut recon, mut input) = (Vec::new(), Vec::new(), Vec::new());
     for f in frames {
         let yuv = I420::from_rgba(64, 48, f).unwrap();
@@ -266,4 +266,32 @@ fn h264_video_plus_wav() {
     assert_eq!((d.tracks()[0].codec.clone(), d.tracks()[0].sample_count), (Codec::Avc, 35));
     let got: Vec<i16> = wav[44..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
     assert_eq!(got, want_pcm(&tl, &src));
+}
+
+/// H264ENCRC (SR218): `H264Encoder::with_bitrate` (`nle export --bitrate`) hands h264enc_core a CBR rate control at
+/// the timeline's fps: the movie's samples are a fresh encoder's under the same `RateControl`, and every frame decodes.
+#[test]
+fn h264_bitrate_export_is_the_rate_controlled_encoder() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let dir = fresh("h264rate");
+    let enc = H264Encoder::new(26, 10).with_bitrate(40, tl.tb.den as u32, tl.tb.num as u32);
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(enc), AudioOut::None).unwrap();
+    assert_eq!(r.frames, 35);
+    let rate = RateControl { bits_per_second: 40_000, fps_num: 25, fps_den: 1, mode: RcMode::Cbr };
+    let mut fresh = Encoder::new(Config { width: 64, height: 48, qp: 26, gop: 10, rate: Some(rate), ..Default::default() }).unwrap();
+    let want: Vec<Vec<u8>> = refr.frames.iter().map(|f| fresh.encode(&I420::from_rgba(64, 48, f).unwrap().as_yuv420()).unwrap().avcc_sample()).collect();
+    let d = Demuxer::open(std::fs::read(dir.join("video.mp4")).unwrap()).unwrap();
+    let mut dec = decoder_for(&d.tracks()[0]).unwrap();
+    let mut frames = Vec::new();
+    for (i, s) in d.track_samples(0).copied().collect::<Vec<_>>().iter().enumerate() {
+        let pk = d.packet_at(s);
+        assert_eq!(pk.data, want[i], "sample {i} is the rate-controlled encoder's access unit");
+        frames.extend(dec.decode(&pk).unwrap());
+    }
+    frames.extend(dec.flush());
+    assert_eq!(frames.len(), 35);
+    let bytes: usize = want.iter().map(|s| s.len()).sum();
+    println!("h264 --bitrate 40 export: {bytes} bytes over 35 frames at 25 fps = {:.1} kbit/s", bytes as f64 * 8.0 * 25.0 / 35.0 / 1000.0);
 }

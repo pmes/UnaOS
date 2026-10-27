@@ -829,7 +829,7 @@ refs/heads/exec-rmbp-textscalereseat2   694417d6a FOLDED-BY-HAND (this commit) 2
 refs/heads/exec-rmbp-sleepresume2   e37ca958d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-leaserenew   7da6faa75 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pidesklist   7a96c024c FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-nle6   5e65a8816 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle6   4af3f1dca FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle2b   9eb029ec7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle3b   93b1f9431 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-onetext   056a7a524 FOLDED-BY-HAND (this commit) 2026-10-27
@@ -837,4 +837,18 @@ refs/heads/exec-rmbp-h264enc2   9f778dc37 FOLDED-BY-HAND (this commit) 2026-10-2
 refs/heads/exec-rmbp-httpfail   d78ff23a7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-wpa2join   1705724a4 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-demuxwire   03ecb5366 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-heaacps   1705724a4 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-heaacps   bb1c77e81 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-hevcpal   7616caccd FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-hevcinter   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-hevcheic   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle2c   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-h264encrc   c456a1b0d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-strip2   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-stationrejoin   fc3028c88 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pideskqemulist   87a0a3af5 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle4b   4782a5a10 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-editmap   3d72565ce FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle3e   fd79422f2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nleprobehdr   fd79422f2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle2order   fd79422f2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pngone   fd79422f2 IN-FLIGHT cut 2026-10-27

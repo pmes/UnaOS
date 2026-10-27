@@ -31,6 +31,11 @@
 //! * Audio (NLE4, LEDGER SR203): a clip carries a gain in centi-dB ([`Clip::gain_cdb`], 0 = unity) and linear fades in
 //!   ticks ([`Clip::fade_in`], [`Clip::fade_out`], 0 = none; `fade_in + fade_out <= len`); [`Timeline::set_gain`] and
 //!   [`Timeline::set_fades`] edit them; [`schedule::audio_runs`] mixes every audio track.
+//! * [`editor`] (NLE6, LEDGER SR207): the editor's state (`EditorState`: selection, playhead, zoom, undo / redo over the ops), one
+//!   model for the host face (`stria::nle_face`) and the on-UnaOS face (the kernel Player's EDL mode).
+//! * Edit lists (EDITMAP, LEDGER SR223): an MP4 `elst` IS a timeline over one source; [`Timeline::lay_edit_list`] lays
+//!   a stream's segments on a track (each media segment a clip, an empty edit a gap, a repeat two clips over one source
+//!   range) and refuses a rate other than 1 by name ([`EditError::Rate`]).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -41,6 +46,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 pub mod edl;
+pub mod editor;
 pub mod schedule;
 
 /// The ONE time-base type (demux_core's): seconds per tick = `num / den`. A timeline's is `1/fps`.
@@ -221,6 +227,9 @@ pub enum EditError {
     Fade,
     /// NLE4: a gain outside `GAIN_MIN_CDB..=GAIN_MAX_CDB`.
     Gain,
+    /// EDITMAP (SR223): an edit-list segment at a rate other than 1 (slow / fast motion, or a rate-0 dwell hold): the
+    /// model has no speed op.
+    Rate,
 }
 
 impl core::fmt::Display for EditError {
@@ -238,6 +247,7 @@ impl core::fmt::Display for EditError {
             EditError::Handle => "transition is longer than a clip's handle",
             EditError::Fade => "fades longer than the clip",
             EditError::Gain => "gain out of range",
+            EditError::Rate => "edit list rate is not 1 (no speed op)",
         })
     }
 }
@@ -537,6 +547,46 @@ impl Timeline {
         let mut tl = self.clone();
         let c = clip_mut(&mut tl, track, idx)?;
         (c.fade_in, c.fade_out) = (fade_in, fade_out);
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// EDITMAP (LEDGER SR223): lay one stream's edit list (demux_core's [`demux_core::EditSegment`]s, every `elst` entry)
+    /// on `track` as clips of `src`. `media` is the stream's time base and `origin_ns` its first presentation time (source
+    /// tick 0, vplay's rule), so a segment's `media_pts` maps to source tick `from_ns(media.to_ns(media_pts) - origin_ns)`.
+    /// An empty edit is a gap (the later segments' `start_ns` already count it); a media segment is a clip at
+    /// `from_ns(start_ns)` lasting to `from_ns(start_ns + duration_ns)` (duration 0 = the rest of the source; a segment
+    /// rounding to no tick is skipped; a `src_out` one tick past the source, rounding, is clamped to it); a rate other
+    /// than 1 (`0x1_0000`) is [`EditError::Rate`]. An empty list is the identity: the whole source at tick 0.
+    pub fn lay_edit_list(&self, track: usize, src: SourceId, edits: &[demux_core::EditSegment], media: Timebase, origin_ns: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let dur = tl.source(src).ok_or(EditError::NoSource)?.duration;
+        let tb = tl.tb;
+        let t = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
+        if edits.is_empty() {
+            t.clips.push(Clip::new(src, 0, dur, 0));
+        }
+        for e in edits {
+            let Some(pts) = e.media_pts else { continue };
+            if e.rate != 0x1_0000 {
+                return Err(EditError::Rate);
+            }
+            let at = tb.from_ns(e.start_ns);
+            let src_in = tb.from_ns(media.to_ns(pts).saturating_sub(origin_ns));
+            let mut src_out = if e.duration_ns == 0 {
+                dur
+            } else {
+                let end = tb.from_ns(e.start_ns.saturating_add(i64::try_from(e.duration_ns).unwrap_or(i64::MAX)));
+                src_in + (end - at)
+            };
+            if src_out == dur + 1 {
+                src_out = dur;
+            }
+            if src_out > src_in {
+                t.clips.push(Clip::new(src, src_in, src_out, at));
+            }
+        }
+        sort(t);
         tl.validate()?;
         Ok(tl)
     }

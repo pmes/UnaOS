@@ -13192,7 +13192,7 @@ test_kernel8() {
         # business reporting "the bare name did not launch" — the typist had nothing to type at.
         # So a non-PASS base verdict short-circuits and is returned unchanged; the typed spec is
         # only ever consulted on a capture the base spec already called complete and clean.
-        if [ -n "$k8_script" ] && [ "$mrc" -eq 0 ]; then
+        if [ -n "$k8_script" ] && [ "$mrc" -eq 0 ] && [ "$k8_spec" != "$PI4_DESKTOP_SPEC" ]; then   # PIDESKQEMULIST (B894): the desk lane's typed spec IS pi4-desktop.spec — k8_desk_replay below asserts it once
             if [ ! -f "$k8_spec" ]; then
                 echo -e "${COLOR_RED}✖ kernel8-test: typed mode armed but ${k8_spec} is missing — nothing gates the typing.${COLOR_RESET}"
                 return 2
@@ -14991,7 +14991,7 @@ case "${1:-}" in
         run_kernel8
         ;;
     kernel8-test|test-pi)
-        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; set -- "$1" "${@:3}"; fi   # PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec
+        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; export UNAOS_K8_SCRIPT="${UNAOS_K8_SCRIPT-${WORKSPACE_DIR}/scripts/specs/pi4-desktop.inject}" UNAOS_K8_SPEC="${UNAOS_K8_SPEC:-${PI4_DESKTOP_SPEC}}"; set -- "$1" "${@:3}"; fi   # PIDESKQEMULIST (B894): the desk lane types `tests textscale` (specs/pi4-desktop.inject, `UNAOS_K8_SCRIPT=` opts out) and its typed spec is the desk spec, asserted once by k8_desk_replay. PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec
         test_kernel8 "${2:-60}"   # MBENCH-HONEST: 8 s never finished a pi4 boot — see test_kernel8
         ;;
     kernel8-install|install-pi)

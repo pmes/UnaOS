@@ -28,6 +28,10 @@
 //! * QUICK LOOK: [`poster`] — the first frame and the facts, decoded on a `vposter` job (never on the 32 KiB render
 //!   task); Quick Look's pass re-renders when it lands ([`poster_fresh`]).
 //!
+//! * THE EDL MODE (NLE6, LEDGER SR207): a `.edl` path plays an edit — timeline_core's editor state and schedule over one
+//!   open per reel, each run's keyframe seek and unseen run-up on this job, the cut's frames through this queue and clock
+//!   (the section at the tail; cut-only, no sound yet).
+//!
 //! Wire: `[vplay] job spawn|run|exit …`, `[player] video codec=<vp8|av1> size=<w>x<h> fps=<n> …` (player.rs),
 //! `:: VIDEOPLAYER: open=ok frames=<n> dropped=<n> fps=<n> av_sync_ms=<n> clock=<audio|wall> -> PASS ::`
 //! (`tests videoplayer`, R80: typed). Not here: video seek (SEEKTABLE B433), hardware decode.
@@ -60,6 +64,9 @@ pub struct Frame {
     pub w: usize,
     pub h: usize,
     pub px: Vec<u32>,
+    /// NLE6 (SR207): a utp1 picture's `(output tick, frame ordinal)` in the EDL mode — the presented frame counter the
+    /// witness compares with the schedule (the kernel has no utp1 renderer: the pixels are a flat field).
+    pub ord: Option<(i64, u32)>,
 }
 
 /// What the container says (and the job measured).
@@ -145,6 +152,8 @@ fn read_all(path: &str) -> Result<Vec<u8>, String> {
 enum Pic {
     Vp8(Box<vp8_core::Decoder>),
     Av1(Box<av1_core::image::StreamDecoder>),
+    /// NLE6 (SR207): demux_core's `utp1` test stream — its packet carries its ordinal (`build::TestPatternPacket`).
+    Utp1,
 }
 
 impl Pic {
@@ -152,7 +161,8 @@ impl Pic {
         match t.codec {
             Codec::Vp8 => Ok(Pic::Vp8(Box::new(vp8_core::Decoder::new()))),
             Codec::Av1 => av1_core::image::StreamDecoder::new(&t.config).map(|d| Pic::Av1(Box::new(d))).map_err(|e| alloc::format!("av1: {:?}", e)),
-            ref c => Err(alloc::format!("no decoder for {} in this tree (vp8, av1)", tok(c))),
+            Codec::TestPattern => Ok(Pic::Utp1),
+            ref c => Err(alloc::format!("no decoder for {} in this tree (vp8, av1, utp1)", tok(c))),
         }
     }
 
@@ -177,6 +187,22 @@ impl Pic {
                 let img = av1_core::image::planes_to_rgba(&planes, av1_core::image::Upsampling::Bilinear);
                 Ok(Some((img.w as usize, img.h as usize, pack(&img.rgba))))
             }
+            Pic::Utp1 => {
+                // the stream's own decoder: the packet names its frame; the picture is a flat field whose level steps
+                // with the ordinal (the host's pattern renderer is gneiss_pal's; NLE6-UTP1 owes its move to a core)
+                let t = demux_core::build::TestPatternPacket::decode(data).ok_or_else(|| String::from("utp1: not a UTP1 packet"))?;
+                let (w, h) = ((t.width as usize).max(1), (t.height as usize).max(1));
+                let l = 28 + t.frame % 200;
+                Ok(Some((w, h, alloc::vec![(l << 16) | (l << 8) | l; w * h])))
+            }
+        }
+    }
+
+    /// NLE6 (SR207): the frame ordinal a utp1 packet carries (`None` for a coded picture).
+    fn ordinal(&self, data: &[u8]) -> Option<u32> {
+        match self {
+            Pic::Utp1 => demux_core::build::TestPatternPacket::decode(data).map(|t| t.frame),
+            _ => None,
         }
     }
 }
@@ -256,13 +282,15 @@ struct Play {
     open_ms: u64,
     audio_expected: bool,
     audio_seen: bool,
+    /// NLE6 (SR207): `(output tick, ordinal)` of each presented frame that carries one (at most [`SHOWN_CAP`]).
+    shown: Vec<(i64, u32)>,
 }
 
 static PLAY: crate::sync::Mutex<Play> = crate::sync::Mutex::new(Play::new());
 
 impl Play {
     const fn new() -> Play {
-        Play { presented: 0, dropped: 0, sync_sum: 0, sync_n: 0, sync_max: 0, by_audio: 0, by_wall: 0, media_ms: 0, wall_ms: 0, open_ms: 0, audio_expected: false, audio_seen: false }
+        Play { presented: 0, dropped: 0, sync_sum: 0, sync_n: 0, sync_max: 0, by_audio: 0, by_wall: 0, media_ms: 0, wall_ms: 0, open_ms: 0, audio_expected: false, audio_seen: false, shown: Vec::new() }
     }
 }
 
@@ -315,7 +343,7 @@ pub fn start_at(path: &str, ms: u64) -> u32 {
     SPAWN_MS.store(t, Ordering::Release);
     DRAIN_MS.store(t, Ordering::Release);
     LIVE.store(true, Ordering::Release);
-    spawn("play-vdec", job_task, jid, path);
+    if is_edl(path) { spawn("play-vedl", edl_task, jid, path) } else { spawn("play-vdec", job_task, jid, path) } // NLE6 (SR207): an EDL plays through the same job, queue and clock
     jid
 }
 
@@ -416,6 +444,9 @@ pub fn present(dst: &mut [u32], w: usize, vh: usize, audio_ms: Option<u64>, play
         p.sync_n += 1;
         p.sync_max = p.sync_max.max(skew);
         if audio_ms.is_some() { p.by_audio += 1 } else { p.by_wall += 1 }
+        if let Some(o) = f.ord.filter(|_| p.shown.len() < SHOWN_CAP) {
+            p.shown.push(o); // NLE6 (SR207): the presented frame counter
+        }
     }
     blit_fit(dst, w, 0, 0, w, vh, &f, Some(0));
     (true, media)
@@ -431,7 +462,6 @@ pub fn first_frame_into(dst: &mut [u32], w: usize, vh: usize) -> bool {
 
 fn job_task(arg: usize) {
     let jid = arg as u32;
-    let mine = || GEN.load(Ordering::Acquire) == jid;
     let paint = stack_paint();
     let (path, seek_ms) = match JOB.lock().as_ref() {
         Some(j) if j.jid == jid => (j.path.clone(), j.seek_ms),
@@ -497,18 +527,8 @@ fn job_task(arg: usize) {
             &prefixed
         };
         // the bounded queue: decode no further ahead than QUEUE frames
-        loop {
-            if !mine() {
-                return job_exit(jid, paint, "aborted", decoded, errs);
-            }
-            let q = JOB.lock().as_ref().map(|j| j.queue.len()).unwrap_or(0);
-            if q < QUEUE {
-                break;
-            }
-            if now().saturating_sub(DRAIN_MS.load(Ordering::Acquire)) > ORPHAN_MS && !PAUSED.load(Ordering::Acquire) {
-                return job_exit(jid, paint, "consumer-gone", decoded, errs);
-            }
-            crate::arch::sched::sleep_ms(2);
+        if let Err(why) = room(jid) {
+            return job_exit(jid, paint, why, decoded, errs);
         }
         let out = pic.decode(data);
         let fp = *first_pts.get_or_insert(p.pts);
@@ -520,7 +540,7 @@ fn job_task(arg: usize) {
                 let mut g = JOB.lock();
                 let Some(j) = g.as_mut().filter(|j| j.jid == jid) else { drop(g); return job_exit(jid, paint, "superseded", decoded, errs) };
                 j.decoded = decoded;
-                j.queue.push_back(Frame { pts_ms, w, h, px });
+                j.queue.push_back(Frame { pts_ms, w, h, px, ord: None });
             }
             Ok(None) => {}
             Err(e) => {
@@ -540,6 +560,25 @@ fn job_task(arg: usize) {
     }
     serial_println!("[vplay] job decode jid={} frames={} err={} ms={}", jid, decoded, errs, now().saturating_sub(t0));
     job_exit(jid, paint, "eos", decoded, errs)
+}
+
+/// The bounded queue: wait until job `jid` may queue one more frame (at most [`QUEUE`] ahead of the clock). `Err` ends
+/// the job: `aborted` (superseded) or `consumer-gone` (nobody drained the queue for [`ORPHAN_MS`], not paused). Shared
+/// by [`job_task`] and the EDL mode's [`edl_task`] (NLE6).
+fn room(jid: u32) -> Result<(), &'static str> {
+    loop {
+        if GEN.load(Ordering::Acquire) != jid {
+            return Err("aborted");
+        }
+        let q = JOB.lock().as_ref().map(|j| j.queue.len()).unwrap_or(0);
+        if q < QUEUE {
+            return Ok(());
+        }
+        if now().saturating_sub(DRAIN_MS.load(Ordering::Acquire)) > ORPHAN_MS && !PAUSED.load(Ordering::Acquire) {
+            return Err("consumer-gone");
+        }
+        crate::arch::sched::sleep_ms(2);
+    }
 }
 
 fn job_exit(jid: u32, paint: Option<(u64, u64)>, why: &str, decoded: u64, errs: u64) {
@@ -695,7 +734,7 @@ fn poster_task(arg: usize) {
         for s in d.track_samples(d.track_index(vt.id).unwrap_or(0)).take(8) {
             let pk = d.packet_at(s);
             if let Some((w, h, px)) = pic.decode(&pk.data)? {
-                return Ok((f, Some(Frame { pts_ms: 0, w, h, px })));
+                return Ok((f, Some(Frame { pts_ms: 0, w, h, px, ord: None })));
             }
         }
         Ok((f, None))
@@ -728,4 +767,239 @@ pub fn fact_lines(f: &Facts) -> [String; 2] {
         alloc::format!("Video: {}  {}x{}  {} fps", f.codec.to_ascii_uppercase(), f.w, f.h, f.fps()),
         alloc::format!("{}.{} s, sound: {}", f.dur_ms / 1000, (f.dur_ms % 1000) / 100, if f.audio == "none" { "none" } else { f.audio }),
     ]
+}
+
+// ── NLE6 (LEDGER SR207): the EDL mode — Stria's editor played through this job, queue, clock and sink ──────────────
+//
+// The Player opens a `.edl` path like a video: [`start_at`] hands it to [`edl_task`] on the same JOB / GEN / LIVE.
+// The EDL is opened as timeline_core's ONE editor state (`editor::EditorState::open`, the model the host face edits),
+// each reel's file is read and demuxed ONCE (`<the EDL's dir>/<REEL>.MP4|.WEBM|.MKV`), and THE schedule
+// (`timeline_core::schedule::schedule`) is walked: a video step that carries `seek` (or cuts to another reel) opens a
+// run at the keyframe (`Demuxer::samples_from`, demux_core's one `key_at_or_before`) on a fresh [`Pic`]; the run-up
+// (`preroll`) is decoded unseen; each step's picture is queued at its output tick through [`room`], a gap as black.
+// [`present`] shows them on the Player's clock. Cut-only: a transition shows its incoming clip; the audio steps are
+// counted, not played (audio_core::container has no PCM door; NLE6-MIX). Wire: `[nle] reel …`, `[nle] open edl=<path>
+// reels=<n> clips=<n> steps=<n>`, `[nle] job exit frames=<n> seeks=<n> runup=<n> gaps=<n>`; the witness is
+// player.rs `tests nle` (`:: NLE: … ::`).
+
+/// The `NLE` report's plan cap (output ticks remembered for the witness) and the presented-counter cap.
+const SHOWN_CAP: usize = 4096;
+
+/// The Player opens `path` in the EDL mode (a `.edl` name, any case).
+pub fn is_edl(path: &str) -> bool {
+    let n = path.len();
+    n > 4 && path.is_char_boundary(n - 4) && path[n - 4..].eq_ignore_ascii_case(".edl")
+}
+
+/// One reel: its file opened once (the demuxer holds the bytes) and its streams as `(track index, origin ns)`; source
+/// time 0 is a stream's first presentation time (vplay's rule, stria::nle's too).
+struct Reel {
+    id: timeline_core::SourceId,
+    d: Demuxer,
+    v: Option<(usize, demux_core::Track, i64)>,
+    a: Option<(usize, i64)>,
+}
+
+fn origin(d: &Demuxer, i: usize) -> i64 {
+    let tb = d.tracks()[i].timebase;
+    d.track_samples(i).map(|s| tb.to_ns(s.pts)).min().unwrap_or(0)
+}
+
+/// The schedule's `SourceIndex` over the reels: the kernel's counterpart of `stria::nle::Sources`, answered by
+/// demux_core's pure keyframe read (`Demuxer::keyframe_before`).
+struct Reels {
+    tb: timeline_core::Timebase,
+    reels: Vec<Reel>,
+}
+
+impl Reels {
+    fn get(&self, id: timeline_core::SourceId) -> Option<&Reel> {
+        self.reels.iter().find(|r| r.id == id)
+    }
+}
+
+impl timeline_core::SourceIndex for Reels {
+    fn duration(&self, src: timeline_core::SourceId) -> Option<i64> {
+        let r = self.get(src)?;
+        let ns = [r.v.as_ref().map(|v| v.0), r.a.map(|a| a.0)].into_iter().flatten().map(|i| r.d.tracks()[i].duration_ns).max()?;
+        // whole ticks only (1 µs of slack for a time base's rounding), stria::nle::Sources' arithmetic
+        Some(((ns as i128 + 1_000) * self.tb.den as i128 / (self.tb.num.max(1) as i128 * 1_000_000_000)) as i64)
+    }
+    fn keyframe_ns(&self, src: timeline_core::SourceId, kind: timeline_core::Kind, t_ns: i64) -> Option<i64> {
+        let r = self.get(src)?;
+        let (i, o) = match kind {
+            timeline_core::Kind::Video => r.v.as_ref().map(|v| (v.0, v.2))?,
+            timeline_core::Kind::Audio => r.a?,
+        };
+        r.d.keyframe_before(i, o + t_ns).map(|(_, p)| p - o)
+    }
+}
+
+/// What the EDL job did (the witness reads it after [`finished`]).
+#[derive(Clone, Default)]
+pub struct EdlReport {
+    pub reels: usize,
+    pub clips: usize,
+    /// Schedule steps, every kind.
+    pub steps: usize,
+    /// Frames queued (pictures and gaps).
+    pub frames: u64,
+    /// Runs opened at a keyframe.
+    pub seeks: u64,
+    /// Pictures decoded unseen (the run-up from a keyframe).
+    pub runup: u64,
+    pub gaps: u64,
+    /// Per video step: `(output tick, (source, source tick), carries a seek)`; at most [`SHOWN_CAP`].
+    pub plan: Vec<(i64, Option<(u32, i64)>, bool)>,
+}
+
+static NLE: crate::sync::Mutex<Option<EdlReport>> = crate::sync::Mutex::new(None);
+
+/// The last EDL job's report (`None` before one ran to its end).
+pub fn edl_report() -> Option<EdlReport> {
+    NLE.lock().clone()
+}
+
+/// `(output tick, ordinal)` of the frames presented since the last start (utp1 pictures only).
+pub fn shown() -> Vec<(i64, u32)> {
+    PLAY.lock().shown.clone()
+}
+
+fn edl_task(arg: usize) {
+    let jid = arg as u32;
+    let paint = stack_paint();
+    let (path, seek_ms) = match JOB.lock().as_ref() {
+        Some(j) if j.jid == jid => (j.path.clone(), j.seek_ms),
+        _ => return job_exit(jid, paint, "superseded", 0, 0),
+    };
+    serial_println!("[vplay] job run jid={} cpu={} wait_ms={} mode=edl", jid, crate::arch::percpu::this_cpu().cpu_index, now().saturating_sub(SPAWN_MS.load(Ordering::Acquire)));
+    *NLE.lock() = None;
+    let mut rep = EdlReport::default();
+    let r = edl_run(jid, &path, seek_ms, &mut rep);
+    serial_println!("[nle] job exit frames={} seeks={} runup={} gaps={}", rep.frames, rep.seeks, rep.runup, rep.gaps);
+    let frames = rep.frames;
+    *NLE.lock() = Some(rep);
+    let why = match r {
+        Ok(()) => {
+            if let Some(j) = JOB.lock().as_mut().filter(|j| j.jid == jid) {
+                j.eos = true;
+            }
+            "eos"
+        }
+        Err((why, e)) => {
+            if let (Some(e), Some(j)) = (e, JOB.lock().as_mut().filter(|j| j.jid == jid)) {
+                serial_println!("[nle] refused edl={} why={} ({})", path, why, e);
+                j.err = Some(e);
+            }
+            why
+        }
+    };
+    job_exit(jid, paint, why, frames, 0)
+}
+
+/// The EDL job's body (see the section head). `Err((why, reason))`: `reason` is the Player's info line, `None` when the
+/// job was superseded.
+fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<(), (&'static str, Option<String>)> {
+    use timeline_core::Kind;
+    let bytes = read_all(path).map_err(|e| ("read-refused", Some(e)))?;
+    let text = core::str::from_utf8(&bytes).map_err(|_| ("edl-refused", Some(String::from("the EDL is not UTF-8 text"))))?;
+    let st = timeline_core::editor::EditorState::open(text, 25).map_err(|e| ("edl-refused", Some(alloc::format!("edl: {}", e))))?;
+    let tl = &st.timeline;
+    let dir = path.rfind('/').map(|i| &path[..i]).unwrap_or("");
+    let mt = crate::shell::vfs_mount_table();
+    let mut reels = Reels { tb: tl.tb, reels: Vec::new() };
+    for s in &tl.sources {
+        let Some(rp) = [".MP4", ".WEBM", ".MKV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else {
+            return Err(("reel-missing", Some(alloc::format!("no file for reel {} beside the EDL ({}/{}.MP4|.WEBM|.MKV)", s.reel, dir, s.reel))));
+        };
+        let d = Demuxer::open(read_all(&rp).map_err(|e| ("read-refused", Some(e)))?).map_err(|e| ("demux-refused", Some(alloc::format!("{}: {}", rp, e))))?;
+        let v = d.video_track().and_then(|t| d.track_index(t.id).map(|i| (i, t.clone()))).map(|(i, t)| (i, t, origin(&d, i)));
+        let a = d.audio_track().and_then(|t| d.track_index(t.id)).map(|i| (i, origin(&d, i)));
+        serial_println!(
+            "[nle] reel {} path={} codec={} frames={}",
+            s.reel, rp, v.as_ref().map(|v| tok(&v.1.codec)).unwrap_or("none"), v.as_ref().map(|v| v.1.sample_count).unwrap_or(0)
+        );
+        reels.reels.push(Reel { id: s.id, d, v, a });
+    }
+    let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?;
+    rep.reels = reels.reels.len();
+    rep.clips = tl.tracks.iter().map(|t| t.clips.len()).sum();
+    rep.steps = steps.len();
+    serial_println!("[nle] open edl={} reels={} clips={} steps={}", path, rep.reels, rep.clips, rep.steps);
+    let audio = steps.iter().filter(|s| s.kind == Kind::Audio).count();
+    if audio > 0 {
+        serial_println!("[nle] audio steps={} -> owed (audio_core::container has no PCM door; NLE6-MIX)", audio);
+    }
+    // the facts: the first scheduled video reel sizes the picture (and the gaps); the EDL's rate is the clock's
+    let first = steps.iter().filter(|s| s.kind == Kind::Video).find_map(|s| s.src).and_then(|id| reels.get(id)).and_then(|r| r.v.as_ref());
+    let Some((fw, fh, codec)) = first.map(|v| (v.1.width, v.1.height, tok(&v.1.codec))) else {
+        return Err(("no-video", Some(String::from("the EDL cuts no video"))));
+    };
+    let out_ms = |t: i64| (tl.tb.to_ns(t).max(0) as u64) / 1_000_000;
+    let vcount = steps.iter().filter(|s| s.kind == Kind::Video).count() as u64;
+    let facts = Facts { codec, w: fw, h: fh, fps_x100: (tl.tb.den * 100 / tl.tb.num.max(1)) as u32, dur_ms: out_ms(tl.end()), frames: vcount, audio: "none", audio_ok: false };
+    match JOB.lock().as_mut().filter(|j| j.jid == jid) {
+        Some(j) => j.facts = Some(facts),
+        None => return Err(("superseded", None)),
+    }
+    struct Run {
+        src: timeline_core::SourceId,
+        reads: Vec<demux_core::SampleRead>,
+        pos: usize,
+        pic: Pic,
+    }
+    let mut run: Option<Run> = None;
+    for s in steps.iter().filter(|s| s.kind == Kind::Video) {
+        let pts_ms = out_ms(s.out_t);
+        if rep.plan.len() < SHOWN_CAP {
+            rep.plan.push((s.out_t, s.src.map(|id| (id.0, s.src_t)), s.seek.is_some()));
+        }
+        let frame = match s.src {
+            None => {
+                rep.gaps += 1;
+                Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize], ord: None }
+            }
+            Some(id) => {
+                let r = reels.get(id).ok_or_else(|| ("reel-missing", Some(alloc::format!("no reel for source {}", id.0))))?;
+                let (ti, vt, o) = r.v.as_ref().ok_or_else(|| ("no-video", Some(alloc::format!("reel {} has no video stream", id.0))))?;
+                if s.seek.is_some() || run.as_ref().map(|x| x.src) != Some(id) {
+                    let reads: Vec<demux_core::SampleRead> = r.d.samples_from(*ti, o + tl.tb.to_ns(s.src_t)).collect();
+                    let pic = Pic::new(vt).map_err(|e| ("codec-refused", Some(e)))?;
+                    run = Some(Run { src: id, reads, pos: 0, pic });
+                    rep.seeks += 1;
+                }
+                let Some(x) = run.as_mut() else { return Err(("superseded", None)) };
+                loop {
+                    let Some(rd) = x.reads.get(x.pos).copied() else {
+                        return Err(("reel-short", Some(alloc::format!("reel {} ran out at source tick {}", id.0, s.src_t))));
+                    };
+                    x.pos += 1;
+                    if rd.skip {
+                        continue; // LEADSKIP: a leading picture the run's keyframe cannot decode
+                    }
+                    let pk = r.d.packet_at(&rd.sample);
+                    let ord = x.pic.ordinal(&pk.data);
+                    match x.pic.decode(&pk.data) {
+                        Ok(Some(_)) if rd.preroll => rep.runup += 1,
+                        Ok(Some((w, h, px))) => break Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) },
+                        Ok(None) => {}
+                        Err(e) => return Err(("decode-refused", Some(e))),
+                    }
+                }
+            }
+        };
+        if pts_ms < seek_ms {
+            continue; // a Player seek: the steps before it decoded unseen (job_task's rule)
+        }
+        room(jid).map_err(|why| (why, None))?;
+        {
+            let mut g = JOB.lock();
+            let Some(j) = g.as_mut().filter(|j| j.jid == jid) else { return Err(("superseded", None)) };
+            j.queue.push_back(frame);
+            rep.frames += 1;
+            j.decoded = rep.frames;
+        }
+        crate::arch::sched::yield_now();
+    }
+    Ok(())
 }

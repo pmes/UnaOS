@@ -5,14 +5,16 @@
 //! `stria::nle`: argument plumbing and files, no editing or rendering logic.
 //!
 //! ```text
-//! nle schedule <edl> [--fps N] --src REEL=<media> ...
-//! nle render   <edl> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--audio wav|mp4|none]
+//! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
+//! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|none]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! ```
 //!
 //! `schedule` prints one line per reel (`reel=<r> open=<full|indexed> dts=<stored|derived:n|presentation> edits=<n>`,
-//! `stria::nle::Sources::open_report`; DEMUXWIRE SR213), then one line per step (`timeline_core::schedule`).
+//! `stria::nle::Sources::open_report`; DEMUXWIRE SR213; ` applied=<n|first-only>` EDITMAP SR223), then one line per step
+//! (`timeline_core::schedule`). EDITMAP (SR223): a MEDIA file in the `<edl>` place is its own timeline — its edit list
+//! over the one reel `AX` (`stria::nle::Sources::from_media`; `--src` is not read).
 //! `render` writes `<stem>.rgba` (every output frame, `w*h*4` bytes each, in order) and `<stem>.f32`
 //! (interleaved little-endian f32 PCM), then one JSON line: frames, size,
 //! PCM frames, rate, channels, seeks, run-up frames and the FNV-1a 64 of the RGBA stream. `--fps` is the frame rate when
@@ -20,7 +22,8 @@
 //! `export` (NLE5, SR204) drives `stria::nle_export::export` into `<dir>` (created): `%06d.png` per frame or
 //! `video.rgba` + `video.json`, and `audio.wav` or `audio.mp4`; one JSON line: codec, frames, files, bytes, the RGBA
 //! fnv (`render`'s) and PCM frames. `--video h264` (NLE5B, SR206) writes `movie.mp4` (H.264 + PCM16) under
-//! `--audio mp4`, else `video.mp4`; `--qp` (16..=40, default 26) and `--gop` (default the timeline's fps).
+//! `--audio mp4`, else `video.mp4`; `--qp` (16..=40, default 26) and `--gop` (default the timeline's fps); `--bitrate`
+//! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP).
 
 use std::io::Write;
 
@@ -30,9 +33,9 @@ use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
 fn usage() -> ! {
-    eprintln!("usage: nle schedule <edl> [--fps N] --src REEL=<media> ...");
-    eprintln!("       nle render <edl> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--audio wav|mp4|none]");
+    eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
+    eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|none]");
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     std::process::exit(2)
 }
@@ -67,7 +70,12 @@ impl RenderSink for Files {
 }
 
 fn load(edl_path: &str, fps: u32, srcs: &[(String, String)]) -> (Timeline, Sources) {
-    let text = std::fs::read_to_string(edl_path).unwrap_or_else(|e| die(format!("{edl_path}: {e}")));
+    let bytes = std::fs::read(edl_path).unwrap_or_else(|e| die(format!("{edl_path}: {e}")));
+    // EDITMAP (SR223): a media file is its own timeline (its edit list over one reel); anything else is an EDL.
+    if let Some(opened) = Sources::from_media("AX", &bytes, fps).unwrap_or_else(|e| die(format!("{edl_path}: {e}"))) {
+        return opened;
+    }
+    let text = String::from_utf8(bytes).unwrap_or_else(|e| die(format!("{edl_path}: {e}")));
     let tl = edl::parse(&text, fps).unwrap_or_else(|e| die(format!("{edl_path}: {e}")));
     let mut sources = Sources::new(&tl);
     for s in &tl.sources {
@@ -90,7 +98,7 @@ fn main() {
     let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() };
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
-    let (mut qp, mut gop) = (26u8, None::<u32>);
+    let (mut qp, mut gop, mut bitrate) = (26u8, None::<u32>, None::<u32>);
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -100,6 +108,7 @@ fn main() {
             "--audio" => audio = it.next().unwrap_or_else(|| usage()).clone(),
             "--qp" => qp = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()),
             "--gop" => gop = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
+            "--bitrate" => bitrate = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
             "--src" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 let Some((r, p)) = v.split_once('=') else { usage() };
@@ -145,7 +154,7 @@ fn main() {
         }
         "export" => {
             let gop = gop.unwrap_or((tl.tb.den / tl.tb.num.max(1)).max(1) as u32);
-            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop)
+            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate)
         }
         _ => usage(),
     }
@@ -153,11 +162,14 @@ fn main() {
 
 /// NLE5 (SR204): the `export` verb — plumbing only; the export is `stria::nle_export`'s.
 #[allow(clippy::too_many_arguments)]
-fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32) {
+fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>) {
     let enc: Box<dyn VideoEncoder> = match video {
         "png" => Box::new(PngSequence),
         "raw" => Box::new(RawSequence),
-        "h264" => Box::new(H264Encoder::new(qp, gop)),
+        "h264" => match bitrate {
+            Some(k) => Box::new(H264Encoder::new(qp, gop).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32)),
+            None => Box::new(H264Encoder::new(qp, gop)),
+        },
         _ => usage(),
     };
     let aud = match audio {
