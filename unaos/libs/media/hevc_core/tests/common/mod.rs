@@ -527,6 +527,11 @@ pub struct InterSps {
 }
 
 pub fn sps_rbsp_ext(c: &SpsCfg, x: &InterSps) -> Vec<u8> {
+    sps_rbsp_scc(c, x, None)
+}
+
+/// HEVCREXTSCC (SR357): [`sps_rbsp_ext`] with sps_scc_extension() (7.3.2.2.3) when `scc` is Some.
+pub fn sps_rbsp_scc(c: &SpsCfg, x: &InterSps, scc: Option<&SpsScc>) -> Vec<u8> {
     let mut b = BitWriter::default();
     b.u(0, 4);
     b.u(0, 3);
@@ -580,20 +585,76 @@ pub fn sps_rbsp_ext(c: &SpsCfg, x: &InterSps) -> Vec<u8> {
     b.flag(x.temporal_mvp); // sps_temporal_mvp_enabled_flag
     b.flag(c.strong);
     b.bit(0); // vui
-    match c.range_ext {
-        Some(f) => {
-            b.bit(1); // sps_extension_present_flag
-            b.bit(1); // sps_range_extension_flag
-            b.u(0, 3); // multilayer, 3d, scc
-            b.u(0, 4); // sps_extension_4bits
-            for v in f {
+    if c.range_ext.is_some() || scc.is_some() {
+        b.bit(1); // sps_extension_present_flag
+        b.flag(c.range_ext.is_some()); // sps_range_extension_flag
+        b.u(0, 2); // multilayer, 3d
+        b.flag(scc.is_some()); // sps_scc_extension_flag
+        b.u(0, 4); // sps_extension_4bits
+        if let Some(fl) = c.range_ext {
+            for v in fl {
                 b.flag(v);
             }
         }
-        None => b.bit(0), // extension
+        if let Some(s) = scc {
+            b.flag(s.curr_pic_ref);
+            b.flag(s.palette.is_some()); // palette_mode_enabled_flag
+            if let Some((max, delta, init)) = &s.palette {
+                b.ue(*max);
+                b.ue(*delta);
+                b.flag(init.is_some());
+                if let Some(v) = init {
+                    b.ue(v.len() as u32 - 1);
+                    let ncomp = if c.chroma_format_idc == 0 { 1 } else { 3 };
+                    for comp in 0..ncomp {
+                        let bd = if comp == 0 { c.bit_depth } else { c.chroma_bit_depth.unwrap_or(c.bit_depth) };
+                        for e in v {
+                            b.u(e[comp] as u64, bd);
+                        }
+                    }
+                }
+            }
+            b.u(s.mv_res_idc as u64, 2);
+            b.flag(s.intra_boundary_filtering_disabled);
+        }
+    } else {
+        b.bit(0); // extension
     }
     b.trailing();
     b.out
+}
+
+/// HEVCREXTSCC (SR357): the sps_scc_extension() fields a KAT sets.
+#[derive(Clone, Default)]
+pub struct SpsScc {
+    pub curr_pic_ref: bool,
+    /// palette_mode_enabled_flag: (palette_max_size, delta_palette_max_predictor_size, the initializers (Y, Cb, Cr)).
+    pub palette: Option<(u32, u32, Option<Vec<[u16; 3]>>)>,
+    pub mv_res_idc: u32,
+    pub intra_boundary_filtering_disabled: bool,
+}
+
+/// HEVCREXTSCC (SR357): the pps_scc_extension() fields a KAT sets, and entropy_coding_sync_enabled_flag for the
+/// wavefront KAT.
+#[derive(Clone, Default)]
+pub struct PpsScc {
+    pub curr_pic_ref: bool,
+    /// residual_adaptive_colour_transform_enabled_flag: (pps_slice_act_qp_offsets_present_flag, PpsActQpOffsetY / Cb / Cr).
+    pub act: Option<(bool, [i32; 3])>,
+    /// pps_palette_predictor_initializers_present_flag: the 8-bit (Y, Cb, Cr) initializers (may be empty).
+    pub initializers: Option<Vec<[u16; 3]>>,
+    pub wpp: bool,
+}
+
+/// HEVCREXTSCC (SR357): the slice header fields of the SCC KATs.
+#[derive(Clone, Default)]
+pub struct SliceScc {
+    /// use_integer_mv_flag (written when motion_vector_resolution_control_idc is 2).
+    pub use_integer_mv: Option<bool>,
+    /// slice_act_y / cb / cr_qp_offset (written when pps_slice_act_qp_offsets_present_flag).
+    pub act_qp_offset: Option<[i32; 3]>,
+    /// (offset_len_minus1, entry_point_offset_minus1) of a wavefront slice.
+    pub entry_points: Option<(u32, Vec<u32>)>,
 }
 
 pub fn sps(c: &SpsCfg) -> Vec<u8> {
@@ -644,6 +705,11 @@ pub struct PpsRext {
 }
 
 pub fn pps_rbsp_rext(c: &PpsCfg, x: &PpsInter, r: &PpsRext) -> Vec<u8> {
+    pps_rbsp_scc(c, x, r, None)
+}
+
+/// HEVCREXTSCC (SR357): [`pps_rbsp_rext`] with pps_scc_extension() (7.3.2.3.3) when `scc` is Some.
+pub fn pps_rbsp_scc(c: &PpsCfg, x: &PpsInter, r: &PpsRext, scc: Option<&PpsScc>) -> Vec<u8> {
     let mut b = BitWriter::default();
     b.ue(0);
     b.ue(0);
@@ -665,7 +731,7 @@ pub fn pps_rbsp_rext(c: &PpsCfg, x: &PpsInter, r: &PpsRext) -> Vec<u8> {
     b.flag(x.weighted_bipred);
     b.flag(r.transquant_bypass); // transquant_bypass_enabled_flag
     b.bit(0); // tiles
-    b.bit(0); // entropy_coding_sync
+    b.flag(scc.is_some_and(|s| s.wpp)); // entropy_coding_sync
     b.bit(1); // pps_loop_filter_across_slices_enabled_flag
     if c.deblocking_disabled {
         b.bit(1); // deblocking_filter_control_present_flag
@@ -678,12 +744,16 @@ pub fn pps_rbsp_rext(c: &PpsCfg, x: &PpsInter, r: &PpsRext) -> Vec<u8> {
     b.flag(x.lists_modification); // lists_modification_present_flag
     b.ue(0);
     b.bit(0);
+    let scc_ext = scc.filter(|s| s.curr_pic_ref || s.act.is_some() || s.initializers.is_some());
+    if r.range.is_some() || scc_ext.is_some() {
+        b.bit(1); // pps_extension_present_flag
+        b.flag(r.range.is_some()); // pps_range_extension_flag
+        b.u(0, 2); // multilayer, 3d
+        b.flag(scc_ext.is_some()); // pps_scc_extension_flag
+        b.u(0, 4); // pps_extension_4bits
+    }
     match &r.range {
         Some(e) => {
-            b.bit(1); // pps_extension_present_flag
-            b.bit(1); // pps_range_extension_flag
-            b.u(0, 3); // multilayer, 3d, scc
-            b.u(0, 4); // pps_extension_4bits
             if r.transform_skip {
                 b.ue(e.log2_max_transform_skip_block_size_minus2);
             }
@@ -700,7 +770,32 @@ pub fn pps_rbsp_rext(c: &PpsCfg, x: &PpsInter, r: &PpsRext) -> Vec<u8> {
             b.ue(e.log2_sao_offset_scale.0);
             b.ue(e.log2_sao_offset_scale.1);
         }
-        None => b.bit(0), // pps_extension_present_flag
+        None if scc_ext.is_none() => b.bit(0), // pps_extension_present_flag
+        None => {}
+    }
+    if let Some(s) = scc_ext {
+        b.flag(s.curr_pic_ref);
+        b.flag(s.act.is_some());
+        if let Some((slice, off)) = s.act {
+            b.flag(slice);
+            b.se(off[0] + 5);
+            b.se(off[1] + 5);
+            b.se(off[2] + 3);
+        }
+        b.flag(s.initializers.is_some());
+        if let Some(v) = &s.initializers {
+            b.ue(v.len() as u32);
+            if !v.is_empty() {
+                b.bit(0); // monochrome_palette_flag
+                b.ue(0); // luma_bit_depth_entry_minus8
+                b.ue(0); // chroma_bit_depth_entry_minus8
+                for comp in 0..3 {
+                    for e in v {
+                        b.u(e[comp] as u64, 8);
+                    }
+                }
+            }
+        }
     }
     b.trailing();
     b.out
@@ -759,6 +854,11 @@ pub struct SliceCfg {
 }
 
 pub fn slice_header(c: &SliceCfg) -> BitWriter {
+    slice_header_scc(c, &SliceScc::default())
+}
+
+/// HEVCREXTSCC (SR357): [`slice_header`] with the SCC fields of `s` and a wavefront slice's entry points.
+pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
     let mut b = BitWriter::default();
     let irap = (16..=23).contains(&c.nal_type);
     let idr = c.nal_type == 19 || c.nal_type == 20;
@@ -843,11 +943,214 @@ pub fn slice_header(c: &SliceCfg) -> BitWriter {
             }
         }
         b.ue(c.five_minus_max_num_merge_cand);
+        if let Some(v) = s.use_integer_mv {
+            b.flag(v);
+        }
     }
     b.se(0); // slice_qp_delta
+    if let Some(o) = s.act_qp_offset {
+        for v in o {
+            b.se(v);
+        }
+    }
     if !c.deblocking_disabled {
         b.bit(1); // slice_loop_filter_across_slices_enabled_flag
     }
+    if let Some((len, offsets)) = &s.entry_points {
+        b.ue(offsets.len() as u32);
+        if !offsets.is_empty() {
+            b.ue(*len);
+            for &o in offsets {
+                b.u(o as u64, len + 1);
+            }
+        }
+    }
     b.trailing();
     b
+}
+
+// ---------------------------------------------------------------- HEVCREXTSCC (LEDGER SR357)
+
+/// One run of a palette coding unit's index map in traverse scan: `len` samples of one index (`copy` false) or copied
+/// from the row above (`copy` true).
+#[derive(Clone, Copy, Debug)]
+pub struct PalRun {
+    pub copy: bool,
+    pub len: usize,
+}
+
+/// A palette coding unit for [`CabacEnc::palette_coding`]: the predictor size and the predictor entries it reuses
+/// (ascending), its new entries, the escape flag, the index map ([y * n + x]) as runs, the escape values per raster
+/// position, and the format.
+pub struct PalCu<'a> {
+    pub log2: u32,
+    pub max_size: usize,
+    pub pred_size: usize,
+    pub reuse: &'a [usize],
+    pub new: &'a [[u16; 3]],
+    pub escape: bool,
+    pub map: &'a [u8],
+    pub runs: &'a [PalRun],
+    pub transpose: bool,
+    pub esc: &'a [(usize, [u32; 3])],
+    pub bypass_cu: bool,
+    pub sub: (usize, usize),
+    pub bit_depth: u32,
+}
+
+/// The traverse scan of the test kit (rows alternately left to right, right to left; transposed: columns).
+pub fn trav(log2: u32, pos: usize, transpose: bool) -> (usize, usize) {
+    let n = 1usize << log2;
+    let (r, i) = (pos / n, pos % n);
+    let c = if r % 2 == 1 { n - 1 - i } else { i };
+    if transpose { (r, c) } else { (c, r) }
+}
+
+impl CabacEnc {
+    /// Truncated binary of `v` with cMax `cmax` in bypass bins.
+    pub fn tb(&mut self, v: u32, cmax: u32) {
+        let n = cmax + 1;
+        if n <= 1 {
+            return;
+        }
+        let mut k = 0;
+        while (2u32 << k) <= n {
+            k += 1;
+        }
+        let u = (2u32 << k) - n;
+        if v < u { self.bypass_bits(v, k) } else { self.bypass_bits(v + u, k + 1) }
+    }
+
+    /// PaletteRunMinus1 `r` under PaletteMaxRunMinus1 `m` > 0: palette_run_prefix (TR, cMax Floor(Log2(m)) + 1, bins 0..4
+    /// in context: copy-above 5 6 6 7 7, index (idx < 1 ? 0 : idx < 3 ? 1 : 2) 3 3 4 4) and palette_run_suffix (TB).
+    pub fn palette_run(&mut self, r: u32, m: u32, copy: bool, idx: u32) {
+        let log2 = |v: u32| 31 - v.leading_zeros();
+        let cmax = log2(m) + 1;
+        let p = if r < 2 { r } else { log2(r) + 1 };
+        let ctx = |b: u32| -> usize {
+            if copy {
+                [5, 6, 6, 7, 7][b as usize]
+            } else if b == 0 {
+                if idx < 1 { 0 } else if idx < 3 { 1 } else { 2 }
+            } else {
+                [0, 3, 3, 4, 4][b as usize]
+            }
+        };
+        for b in 0..p.min(cmax) + if p < cmax { 1 } else { 0 } {
+            let bin = (b < p) as u32;
+            if b < 5 { self.decision(PALETTE_RUN_PREFIX + ctx(b), bin) } else { self.bypass(bin) }
+        }
+        if p > 1 && m != 1 << (p - 1) {
+            let base = 1 << (p - 1);
+            self.tb(r - base, if p == cmax { m - base } else { base - 1 });
+        }
+    }
+
+    /// palette_coding() (7.3.8.13) of `cu` after its palette_mode_flag, as this kit reads H.265 v4 (cu_qp_delta off).
+    /// Panics if the runs do not reproduce the map.
+    pub fn palette_coding(&mut self, cu: &PalCu) {
+        let n = 1usize << cu.log2;
+        let total = n * n;
+        let at = |p: usize| {
+            let (x, y) = trav(cu.log2, p, cu.transpose);
+            y * n + x
+        };
+        let above = |i: usize| if cu.transpose { i - 1 } else { i - n };
+        // palette_predictor_run, then the terminating 1 while the loop would read on.
+        let mut next = 0;
+        for &r in cu.reuse {
+            self.egk(if r == next { 0 } else { (r - next + 1) as u32 }, 0);
+            next = r + 1;
+        }
+        if next < cu.pred_size && cu.reuse.len() < cu.max_size {
+            self.egk(1, 0);
+        }
+        if cu.reuse.len() < cu.max_size {
+            self.egk(cu.new.len() as u32, 0);
+        }
+        let ncomp = 3;
+        for c in 0..ncomp {
+            for e in cu.new {
+                self.bypass_bits(e[c] as u32, cu.bit_depth);
+            }
+        }
+        let size = cu.reuse.len() + cu.new.len();
+        if size != 0 {
+            self.bypass(cu.escape as u32);
+        }
+        let max_idx = (size + (cu.escape || size == 0) as usize).saturating_sub(1) as u32;
+        // The runs reproduce the map; the indices with their adjustment against adjustedRefPaletteIndex.
+        let (mut pos, mut prev_copy) = (0usize, false);
+        let mut idc = Vec::new();
+        for r in cu.runs {
+            let ic = at(pos);
+            if !r.copy {
+                let v = cu.map[ic] as u32;
+                let refi = if pos == 0 { max_idx + 1 } else if prev_copy { cu.map[above(ic)] as u32 } else { cu.map[at(pos - 1)] as u32 };
+                assert_ne!(v, refi, "an index run repeating its reference at {pos}");
+                idc.push(if v > refi { v - 1 } else { v });
+            }
+            for k in 0..r.len {
+                let i = at(pos + k);
+                let want = if r.copy { cu.map[above(i)] } else { cu.map[ic] };
+                assert_eq!(cu.map[i], want, "runs do not reproduce the map at {}", pos + k);
+            }
+            pos += r.len;
+            prev_copy = r.copy;
+        }
+        assert_eq!(pos, total);
+        let final_copy = cu.runs.last().unwrap().copy;
+        if max_idx > 0 {
+            self.remaining(idc.len() as u32 - 1, 3 + ((max_idx + 1) >> 3));
+            for (k, &v) in idc.iter().enumerate() {
+                let cmax = max_idx - (k > 0) as u32;
+                if cmax > 0 {
+                    self.tb(v, cmax);
+                }
+            }
+            self.bypass(final_copy as u32);
+            self.decision(PALETTE_TRANSPOSE, cu.transpose as u32);
+        }
+        let (mut pos, mut prev_copy, mut remaining) = (0usize, false, idc.len());
+        for r in cu.runs {
+            let ic = at(pos);
+            if max_idx > 0 && pos >= n && !prev_copy {
+                if remaining > 0 && pos < total - 1 {
+                    self.decision(PALETTE_COPY_ABOVE, r.copy as u32);
+                } else {
+                    assert_eq!(r.copy, !(pos == total - 1 && remaining > 0));
+                }
+            } else {
+                assert!(!r.copy, "a copy run where none is allowed at {pos}");
+            }
+            if max_idx > 0 {
+                if !r.copy {
+                    remaining -= 1;
+                }
+                if remaining > 0 || r.copy != final_copy {
+                    let m = (total - pos - 1 - remaining - final_copy as usize) as u32;
+                    if m > 0 {
+                        self.palette_run(r.len as u32 - 1, m, r.copy, if r.copy { 0 } else { cu.map[ic] as u32 });
+                    } else {
+                        assert_eq!(r.len, 1);
+                    }
+                } else {
+                    assert_eq!(r.len, total - pos, "the final run runs to the end");
+                }
+            }
+            pos += r.len;
+            prev_copy = r.copy;
+        }
+        if cu.escape {
+            for c in 0..ncomp {
+                for p in 0..total {
+                    let (x, y) = trav(cu.log2, p, cu.transpose);
+                    if cu.map[y * n + x] as u32 == max_idx && (c == 0 || (x % cu.sub.0 == 0 && y % cu.sub.1 == 0)) {
+                        let v = cu.esc.iter().find(|e| e.0 == y * n + x).expect("escape value").1[c];
+                        if cu.bypass_cu { self.bypass_bits(v, cu.bit_depth) } else { self.egk(v, 3) }
+                    }
+                }
+            }
+        }
+    }
 }

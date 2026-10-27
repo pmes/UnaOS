@@ -122,3 +122,15 @@ pub fn add_residual(plane: &mut crate::picture::Plane, x0: usize, y0: usize, log
         }
     }
 }
+
+/// HEVCREXTSCC (LEDGER SR357) 8.6.8: the residual modification of a transform unit with tu_residual_act_flag — the
+/// inverse YCgCo-R lifting of the (Y, Cg, Co) residuals in (rY, rCb, rCr) into the coded colour components:
+/// tmp = rY - (rCb >> 1); rY = tmp + rCb; rCb = tmp - (rCr >> 1); rCr = rCb + rCr.
+pub fn inverse_ycgco_r(ry: &mut [i32], rcb: &mut [i32], rcr: &mut [i32]) {
+    for ((y, cb), cr) in ry.iter_mut().zip(rcb.iter_mut()).zip(rcr.iter_mut()) {
+        let tmp = *y - (*cb >> 1);
+        *y = tmp + *cb;
+        *cb = tmp - (*cr >> 1);
+        *cr += *cb;
+    }
+}

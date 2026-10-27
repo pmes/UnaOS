@@ -79,10 +79,14 @@ pub struct SliceHeader {
     pub collocated_ref_idx: u32,
     pub pred_weights: Option<PredWeights>,
     pub max_num_merge_cand: u32,
+    /// HEVCREXTSCC (SR357): use_integer_mv_flag (inferred motion_vector_resolution_control_idc when absent).
+    pub use_integer_mv_flag: bool,
     pub qp_delta: i32,
     pub cb_qp_offset: i32,
     pub cr_qp_offset: i32,
     pub cu_chroma_qp_offset_enabled_flag: bool,
+    /// HEVCREXTSCC (SR357): slice_act_y_qp_offset / slice_act_cb_qp_offset / slice_act_cr_qp_offset.
+    pub slice_act_qp_offset: [i32; 3],
     pub deblocking_filter_disabled_flag: bool,
     pub beta_offset_div2: i32,
     pub tc_offset_div2: i32,
@@ -103,7 +107,8 @@ impl SliceHeader {
         if self.short_term_ref_pic_set_sps_flag { sps.st_rps.get(self.short_term_ref_pic_set_idx as usize) } else { self.st_rps.as_ref() }
     }
 
-    /// NumPicTotalCurr (7-55) without the screen-content current-picture reference.
+    /// NumPicTotalCurr (7-55) without the screen-content current-picture reference (HEVCREXTSCC SR357: the header
+    /// parser adds pps_curr_pic_ref_enabled_flag).
     pub fn num_pic_total_curr(&self, sps: &Sps) -> u32 {
         let st = self.rps(sps).map_or(0, |r| r.num_used());
         (st + self.long_term.iter().filter(|l| l.used).count()) as u32
@@ -280,7 +285,7 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
             if h.num_ref_idx_l0_active > 15 || h.num_ref_idx_l1_active > 15 {
                 return Err(Error::Invalid("num_ref_idx_active_minus1 above 14"));
             }
-            let total = h.num_pic_total_curr(sps);
+            let total = h.num_pic_total_curr(sps) + pps.scc.curr_pic_ref_enabled_flag as u32;
             if pps.lists_modification_present_flag && total > 1 {
                 let bits = ceil_log2(total);
                 if r.flag() {
@@ -306,6 +311,10 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
                 }
             }
             if (pps.weighted_pred_flag && h.slice_type == SliceType::P) || (pps.weighted_bipred_flag && h.slice_type == SliceType::B) {
+                // HEVCREXTSCC (SR357): 7.3.6.3 skips the weight flags of current-picture entries (HEVCREXT-SCC-WP).
+                if pps.scc.curr_pic_ref_enabled_flag {
+                    return Err(Error::Unsupported("weighted prediction with the current picture as a reference (HEVCREXT-SCC)"));
+                }
                 let chroma = sps.chroma_array_type() != 0;
                 let ld = r.ue();
                 if ld > 7 {
@@ -327,6 +336,9 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
                 return Err(Error::Invalid("five_minus_max_num_merge_cand"));
             }
             h.max_num_merge_cand = 5 - five_minus;
+            // HEVCREXTSCC (SR357) 7.3.6.1 / 7.4.7.1.
+            let idc = sps.scc.motion_vector_resolution_control_idc;
+            h.use_integer_mv_flag = if idc == 2 { r.flag() } else { idc == 1 };
         }
         h.qp_delta = r.se();
         let qp = pps.init_qp + h.qp_delta;
@@ -339,6 +351,16 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
             h.cr_qp_offset = r.se();
             if !(-12..=12).contains(&h.cb_qp_offset) || !(-12..=12).contains(&h.cr_qp_offset) {
                 return Err(Error::Invalid("slice chroma qp offset"));
+            }
+        }
+        // HEVCREXTSCC (SR357) 7.3.6.1: slice_act_{y,cb,cr}_qp_offset.
+        if pps.scc.slice_act_qp_offsets_present_flag {
+            let y = r.se();
+            let cb = r.se();
+            let cr = r.se();
+            h.slice_act_qp_offset = [y, cb, cr];
+            if h.slice_act_qp_offset.iter().any(|v| !(-12..=12).contains(v)) {
+                return Err(Error::Invalid("slice act qp offset"));
             }
         }
         if pps.range_ext.chroma_qp_offset_list_enabled_flag {

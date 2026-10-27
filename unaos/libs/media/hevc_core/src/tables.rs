@@ -311,3 +311,23 @@ pub const REXT_CTX_TABLES: &[CtxTable] = &[
     CtxTable { name: "cu_chroma_qp_offset_flag", slot: CU_CHROMA_QP_OFFSET_FLAG, init: [&[154], &[154], &[154]] },
     CtxTable { name: "cu_chroma_qp_offset_idx", slot: CU_CHROMA_QP_OFFSET_IDX, init: [&[154], &[154], &[154]] },
 ];
+
+// HEVCREXTSCC (LEDGER SR357): the screen content coding extension's syntax elements, in a THIRD table above
+// `REXT_CTX_END` (the base and range extension layouts stand); `cabac::initial_contexts` initialises all three. Written
+// from H.265 v4 without the reference software: initValue 154 for every initType is a SPEC-CHECK for HEVCCONF-SCC.
+pub const PALETTE_MODE: usize = REXT_CTX_END;
+pub const TU_ACT: usize = REXT_CTX_END + 1;
+pub const PALETTE_COPY_ABOVE: usize = REXT_CTX_END + 2;
+pub const PALETTE_TRANSPOSE: usize = REXT_CTX_END + 3;
+pub const PALETTE_RUN_PREFIX: usize = REXT_CTX_END + 4;
+/// One past the last screen content coding slot.
+pub const SCC_CTX_END: usize = REXT_CTX_END + 12;
+
+pub const SCC_CTX_TABLES: &[CtxTable] = &[
+    CtxTable { name: "palette_mode_flag", slot: PALETTE_MODE, init: [&[154], &[154], &[154]] },
+    CtxTable { name: "tu_residual_act_flag", slot: TU_ACT, init: [&[154], &[154], &[154]] },
+    CtxTable { name: "copy_above_palette_indices_flag", slot: PALETTE_COPY_ABOVE, init: [&[154], &[154], &[154]] },
+    CtxTable { name: "palette_transpose_flag", slot: PALETTE_TRANSPOSE, init: [&[154], &[154], &[154]] },
+    // palette_run_prefix bins 0..4: ctxInc 0..7 (palette::run_ctx).
+    CtxTable { name: "palette_run_prefix", slot: PALETTE_RUN_PREFIX, init: [&[154; 8], &[154; 8], &[154; 8]] },
+];

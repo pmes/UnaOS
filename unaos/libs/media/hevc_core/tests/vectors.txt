@@ -102,3 +102,27 @@
 - hevc/rext/WPP_AND_TILE_AND_CABAC_EXT_PREC_1_HIGH_TP_444_14BIT_RExt_Apple_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/RExt/WPP_AND_TILE_AND_CABAC_EXT_PREC_1_HIGH_TP_444_14BIT_RExt_Apple_2.zip 95f0019aed6c9c845fe5e2088aefdc39 WPP_AND_TILE_AND_CABAC_EXT_PREC_1_HIGH_TP_444_14BIT_RExt_Apple_2.bit
 - hevc/rext/WPP_AND_TILE_HIGH_TP_444_8BIT_RExt_Apple_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/RExt/WPP_AND_TILE_HIGH_TP_444_8BIT_RExt_Apple_2.zip e134676d233f3f5b49ab4c252d5d18be WPP_AND_TILE_HIGH_TP_444_8BIT_RExt_Apple_2.bit
 - hevc/rext/WPP_HIGH_TP_444_8BIT_RExt_Apple_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/RExt/WPP_HIGH_TP_444_8BIT_RExt_Apple_2.zip 3c94b5ebc0aed0abae4e619b9dcca9cc WPP_HIGH_TP_444_8BIT_RExt_Apple_2.bit
+# HEVCREXTSCC (LEDGER SR357): the JCT-VC Screen Content Coding suite of ITU-T H.265.1 (draft_conformance/SCC). The rows
+# live under hevc/rext/scc/ so conformance.rs `rext_vectors_decode_or_are_refused_by_name` walks them (no second walker):
+# each decodes to its md5 (yuv444p / yuv420p, yuv444p10le two bytes per sample) or is refused by a name carrying
+# HEVCREXT-SCC; the first run is the bench's (HEVCCONF-SCC; itu.int is refused at the cloud egress, so every row SKIPs
+# there). The palette, intra block copy and colour transform are this crate's reading of H.265 v4 without the reference
+# software (self-consistent, unconformed): these rows settle its SPEC-CHECK points (LEDGER SR357).
+# PROVENANCE: the URL, the bitstream name and the decoded-YUV md5 of each row are those of fluster's
+# test_suites/h.265/JCT-VC-SCC.json (github.com/fluendo/fluster @5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0, the commit
+# HEVCCONF pinned; fetched 2026-10-27: 15 vectors, "test_method": "md5"). sha256 `-`: HEVCCONF-PIN.
+- hevc/rext/scc/Bipred_8by8_A_Qualcomm_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/Bipred_8by8_A_Qualcomm_2.zip 77ca7bf37442cdc5a468797f8597aa07 Bipred_8by8_A_Qualcomm_2.bit
+- hevc/rext/scc/Delta_QP_Chroma_QP_Offsets_A_Qualcomm_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/Delta_QP_Chroma_QP_Offsets_A_Qualcomm_2.zip b5535b153c9ea0a01b22236d9a753e0c Delta_QP_Chroma_QP_Offsets_A_Qualcomm_2.bit
+- hevc/rext/scc/DPB_Loop_Filters_A_MediaTek_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/DPB_Loop_Filters_A_MediaTek_2.zip 8dba33e8843e05bca8eb8c0fb4131a6b DPB_Loop_Filters_A_MediaTek_2.bit
+- hevc/rext/scc/HT_A_SCC_Apple_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/HT_A_SCC_Apple_2.zip ec93dfc5ca3fc54bdc948b6e33f7863d HT_A_SCC_Apple_2.bit
+- hevc/rext/scc/HT_B_SCC_Apple_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/HT_B_SCC_Apple_3.zip eb55b86d87b76690a41f9f7b28fe3bb7 HT_B_SCC_Apple_3.bit
+- hevc/rext/scc/HT_C_SCC_Apple_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/HT_C_SCC_Apple_3.zip 270a7fe953a82fd3ac71d364a85279d0 HT_C_SCC_Apple_3.bit
+- hevc/rext/scc/IBF_Disabled_A_MediaTek_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/IBF_Disabled_A_MediaTek_2.zip cf2d0bf228b256b8f70fe4b4d2e7f90d IBF_Disabled_A_MediaTek_2.bit
+- hevc/rext/scc/IBF_Disabled_B_MediaTek_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/IBF_Disabled_B_MediaTek_2.zip 44bcdae6a7357c23f10dea63769e7598 IBF_Disabled_B_MediaTek_2.bit
+- hevc/rext/scc/MVRESIDC_A_MS_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/MVRESIDC_A_MS_2.zip ea1cd8869c86bf56e89e20516c1abb26 MVRESIDC_A_MS_2.bit
+- hevc/rext/scc/MVRESIDC_B_MS_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/MVRESIDC_B_MS_2.zip 478cb2d63bc753db71abeca08975094e MVRESIDC_B_MS_2.bit
+- hevc/rext/scc/MVRESIDC_C_MS_3.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/MVRESIDC_C_MS_3.zip 2098828aaab226883c4226b6efac85e7 MVRESIDC_C_MS_3.bit
+- hevc/rext/scc/PPI_A_InterDigital_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/PPI_A_InterDigital_2.zip 220400063b5369438ba85b90e7ca0ae3 PPI_A_InterDigital_2.bit
+- hevc/rext/scc/PPI_B_InterDigital_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/PPI_B_InterDigital_2.zip 1b11363ec651d23985dae30033ffb20f PPI_B_InterDigital_2.bit
+- hevc/rext/scc/Slice_ACT_QP_Offsets_A_Qualcomm_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/Slice_ACT_QP_Offsets_A_Qualcomm_2.zip 2d4ffc0354dee7216567c89dc1f20391 Slice_ACT_QP_Offsets_A_Qualcomm_2.bit
+- hevc/rext/scc/Zero_and_One_Palette_Size_A_Canon_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/SCC/Zero_and_One_Palette_Size_A_Canon_2.zip a7794b555c9ba89f7f01bb0ce5b66676 Zero_and_One_Palette_Size_A_Canon_2.bit

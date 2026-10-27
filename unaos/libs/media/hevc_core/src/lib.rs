@@ -63,9 +63,13 @@
 //! uni- and bi-prediction with default or explicit weights, the inter residual, short- and long-term references and
 //! deblocking bS 0 / 1 from motion.
 //!
-//! Refused by name ([`Error::Unsupported`]): constrained_intra_pred_flag in P / B slices (HEVCINTER-CIP), bit depths
-//! above 12, monochrome and separate colour planes (HEVCREXT SR334 decodes 4:2:2 / 4:4:4, 12-bit, unequal depths), each range-extension and screen-content
-//! tool. Layers above the base (nuh_layer_id > 0) are ignored.
+//! Refused by name ([`Error::Unsupported`]): constrained_intra_pred_flag in P / B slices (HEVCINTER-CIP), separate
+//! colour planes and bit depths above 16 (HEVCREXT SR334 decodes 4:2:2 / 4:4:4, 12-bit, unequal depths; HEVCREXTTOOLS
+//! SR345 every range extension tool, monochrome and 16 bits; HEVCREXTSCC SR357 palette, intra block copy and the
+//! adaptive colour transform), and of the screen content coding extension (HEVCREXT-SCC) an SCC body behind the
+//! multilayer / 3D bodies, the colour transform at unequal luma / chroma depths, weighted prediction with the current
+//! picture as a reference and intra block copy outside the decoded region. Layers above the base (nuh_layer_id > 0) are
+//! ignored.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -85,6 +89,7 @@ pub mod dpb;
 pub mod inter;
 pub mod intra;
 pub mod nal;
+pub mod palette;
 pub mod picture;
 pub mod ps;
 pub mod sao;

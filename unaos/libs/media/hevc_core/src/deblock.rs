@@ -95,7 +95,7 @@ fn edge_facts(pic: &Picture, geo: &Geometry, pps: &Pps, pcm_lf_off: bool, p: (us
     if bs == 0 {
         return None;
     }
-    let keep = |i: usize| (pic.flags[i] & F_PCM != 0 && pcm_lf_off) || pic.flags[i] & F_BYPASS != 0;
+    let keep = |i: usize| (pic.flags[i] & F_PCM != 0 && pcm_lf_off) || pic.flags[i] & F_BYPASS != 0 || pic.palette[i]; // HEVCREXTSCC (SR357): palette
     Some(EdgeFacts {
         qp_p: pic.qp[ip] as i32,
         qp_q: pic.qp[iq] as i32,
