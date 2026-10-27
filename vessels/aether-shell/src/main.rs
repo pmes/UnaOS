@@ -663,6 +663,10 @@ impl Tab {
         if let Some(cursor) = self.engine.take_cursor_change() {
             self.show(SMessage::BrowserCursorChanged(cursor));
         }
+        // PDF4FORMSAVE (SR354): Ctrl/Cmd+S staged the PDF's bytes: the coordinator writes them (`Coordinator::on_save`).
+        if let Some(save) = self.engine.take_pending_save() {
+            self.bus.fire(save);
+        }
         // One choke point for the address bar: whatever the turn did — link click, form submit,
         // Back, Forward, Reload, typed url, pushState, or a script-driven navigation run off the tick —
         // the session history's current entry is the truth, mirrored to the chrome exactly once.
@@ -927,7 +931,37 @@ impl Coordinator {
             | SMessage::BrowserDevtoolsEval(_)
             | SMessage::BrowserDevtoolsGoto { .. }
             | SMessage::BrowserA11y(_) | SMessage::SurfaceResend { .. } => self.to_active(m), // SurfaceResend: AETHERMACGPU-ENGINEDAMAGE (SR341)
+            // PDF4FORMSAVE (SR354): a tab's engine handed bytes to save.
+            SMessage::BrowserSave { name, bytes, .. } => self.on_save(&name, &bytes),
             _ => {}
+        }
+    }
+
+    /// PDF4FORMSAVE (SR354): land a `BrowserSave` through the ONE downloads writer (`chrome::host::save_bytes`: the
+    /// download's own unique name, `.part` and rename), list it as a finished download row (the one row path,
+    /// `on_report`), and answer `BrowserSaved` / `BrowserSaveFailed`. Written here, synchronously, as the bookmarks are.
+    fn on_save(&mut self, name: &str, bytes: &[u8]) {
+        let len = bytes.len() as u64;
+        self.next_download += 1;
+        let result = chrome::host::save_bytes(name, bytes);
+        let shown = match &result {
+            Ok(path) => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| name.to_string()),
+            Err(_) => name.to_string(),
+        };
+        let mut d = chrome::downloads::Download::new(self.next_download, &shown, "", Some(len));
+        d.done = true;
+        match result {
+            Ok(path) => {
+                d.received = len;
+                self.on_report(TabReport::Download(d));
+                self.bus.fire(SMessage::BrowserSaved { path: path.to_string_lossy().into_owned() });
+            }
+            Err(why) => {
+                eprintln!("[aether] save failed: {why}");
+                d.error = Some(why.clone());
+                self.on_report(TabReport::Download(d));
+                self.bus.fire(SMessage::BrowserSaveFailed { why });
+            }
         }
     }
 

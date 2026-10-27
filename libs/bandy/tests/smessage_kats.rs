@@ -1553,6 +1553,9 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserA11yLines(_) => "BrowserA11yLines",
         SMessage::BrowserA11yPrefs { .. } => "BrowserA11yPrefs",
         SMessage::BrowserButton { .. } => "BrowserButton", // NLE2B (SR208): the press / release of a surface's button
+        SMessage::BrowserSave { .. } => "BrowserSave", // PDF4FORMSAVE (SR354): the save verb and its two answers
+        SMessage::BrowserSaved { .. } => "BrowserSaved",
+        SMessage::BrowserSaveFailed { .. } => "BrowserSaveFailed",
     }
 }
 
@@ -1744,4 +1747,21 @@ kat!(
         scroll: Some((0, -1)),
     },
     r#"{"SurfaceBlit":{"url":"viewport","width":2,"height":2,"pixels":[5,6,7,8,1,2,3,4],"damage":[[0,1,2,1]],"scroll":[0,-1]}}"#
+);
+
+// PDF4FORMSAVE (SR354): the engine hands bytes + a suggested name to the shell; the shell answers the path, or why not.
+kat!(
+    kat_browser_save,
+    SMessage::BrowserSave { name: "form.pdf".to_string(), mime: "application/pdf".to_string(), bytes: vec![37, 80, 68, 70] },
+    r#"{"BrowserSave":{"name":"form.pdf","mime":"application/pdf","bytes":[37,80,68,70]}}"#
+);
+kat!(
+    kat_browser_saved,
+    SMessage::BrowserSaved { path: "/home/una/Downloads/form (1).pdf".to_string() },
+    r#"{"BrowserSaved":{"path":"/home/una/Downloads/form (1).pdf"}}"#
+);
+kat!(
+    kat_browser_save_failed,
+    SMessage::BrowserSaveFailed { why: "Permission denied".to_string() },
+    r#"{"BrowserSaveFailed":{"why":"Permission denied"}}"#
 );

@@ -6,14 +6,15 @@
 //!   `LocalStorage` already uses (`directories::ProjectDirs::from("", "UnaOS", "Aether")`).
 //! - Downloads land in the person's Downloads folder (`directories::UserDirs::download_dir`, else
 //!   `~/Downloads`), written to `<name>.part` and renamed when complete — a half-written file never
-//!   carries the real name.
+//!   carries the real name. A save (PDF4FORMSAVE, SR354: [`save_bytes`], the bytes an engine hands over as
+//!   `BrowserSave`) lands the same way through the same two steps, [`claim`] and [`land`].
 //! - [`probe`] is the top-level navigation's download decision: a `HEAD` of the URL over gneiss_pal's
 //!   HTTP client (the same cookie jar the page loads use), whose `Content-Disposition` /
 //!   `Content-Type` the model judges ([`super::downloads`]). A failed or refused probe answers
 //!   "document" and the load proceeds exactly as before.
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gneiss_pal::api::http::Client;
@@ -169,13 +170,15 @@ async fn run_download(
     let cancelled = || cancel.as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed));
     let dir = downloads_dir();
     let mut d = Download::new(id, &name, &url, total);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        d.done = true;
-        d.error = Some(e.to_string());
-        report(&d);
-        return d;
+    match claim(&dir, &name) {
+        Ok(n) => d.name = n,
+        Err(e) => {
+            d.done = true;
+            d.error = Some(e.to_string());
+            report(&d);
+            return d;
+        }
     }
-    d.name = downloads::unique_name(&name, |n| dir.join(n).exists() || dir.join(format!("{n}.part")).exists());
     report(&d);
     let part = dir.join(format!("{}.part", d.name));
     let result: Result<(), String> = async {
@@ -201,7 +204,7 @@ async fn run_download(
         }
         file.flush().map_err(|e| e.to_string())?;
         drop(file);
-        std::fs::rename(&part, dir.join(&d.name)).map_err(|e| e.to_string())
+        land(&dir, &d.name).map(|_| ()).map_err(|e| e.to_string())
     }
     .await;
     if let Err(e) = result {
@@ -211,6 +214,38 @@ async fn run_download(
     d.done = true;
     report(&d);
     d
+}
+
+/// PDF4FORMSAVE (SR354): the first of the ONE pair of steps by which a file lands in the Downloads folder `dir`
+/// (a download streams into `<name>.part` between them; [`save_bytes_in`] writes it whole): the folder exists and
+/// `name` is made unique against what is there, a finished file or another landing's `.part`.
+fn claim(dir: &Path, name: &str) -> std::io::Result<String> {
+    std::fs::create_dir_all(dir)?;
+    Ok(downloads::unique_name(name, |n| dir.join(n).exists() || dir.join(format!("{n}.part")).exists()))
+}
+
+/// PDF4FORMSAVE (SR354): the second step: the complete `<name>.part` takes its real name. Answers the file's path.
+fn land(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let to = dir.join(name);
+    std::fs::rename(dir.join(format!("{name}.part")), &to)?;
+    Ok(to)
+}
+
+/// PDF4FORMSAVE (SR354): write `bytes` into the Downloads folder as `name` (sanitized, made unique: `form (1).pdf`
+/// beside an existing `form.pdf`). Answers the path written, or why not. The shell's answer to `BrowserSave`.
+pub fn save_bytes(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    save_bytes_in(&downloads_dir(), name, bytes)
+}
+
+/// [`save_bytes`] into the folder `dir` (the writer's KAT runs it on a scratch folder).
+pub fn save_bytes_in(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let clean = downloads::sanitize(name);
+    let name = claim(dir, if clean.is_empty() { "download" } else { &clean }).map_err(|e| e.to_string())?;
+    let part = dir.join(format!("{name}.part"));
+    std::fs::write(&part, bytes).and_then(|()| land(dir, &name)).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        e.to_string()
+    })
 }
 
 /// The page-info popover's answer for `url`: whether the connection was secure, and the sentence that
@@ -262,4 +297,33 @@ pub fn devtools_frame(
     let damage = tools.timeline.frame(engine);
     let lines = tools.render(engine);
     (damage, Some(lines))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::save_bytes_in;
+
+    /// PDF4FORMSAVE (SR354): the one writer: the path answered, the `(n)` suffix on a collision (a finished file or a
+    /// landing `.part`), a hostile name kept inside the folder, no `.part` left behind.
+    #[test]
+    fn pdf4formsave_writer_suffix() {
+        let dir = std::env::temp_dir().join(format!("aether-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = save_bytes_in(&dir, "form.pdf", b"one").unwrap();
+        assert_eq!(p, dir.join("form.pdf"));
+        assert_eq!(std::fs::read(&p).unwrap(), b"one");
+        let p = save_bytes_in(&dir, "form.pdf", b"two").unwrap();
+        assert_eq!(p, dir.join("form (1).pdf"), "a collision takes the (1) suffix");
+        assert_eq!(std::fs::read(&p).unwrap(), b"two");
+        assert_eq!(std::fs::read(dir.join("form.pdf")).unwrap(), b"one", "the first file is untouched");
+        std::fs::write(dir.join("x.pdf.part"), b"").unwrap();
+        assert_eq!(save_bytes_in(&dir, "x.pdf", b"x").unwrap(), dir.join("x (1).pdf"), "a landing .part is taken too");
+        std::fs::remove_file(dir.join("x.pdf.part")).unwrap();
+        let p = save_bytes_in(&dir, "../evil.pdf", b"e").unwrap();
+        assert_eq!(p.parent(), Some(dir.as_path()), "a hostile name lands inside the folder: {p:?}");
+        assert_eq!(save_bytes_in(&dir, "...", b"d").unwrap(), dir.join("download"));
+        let parts = std::fs::read_dir(&dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".part")).count();
+        assert_eq!(parts, 0, "no .part left behind");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

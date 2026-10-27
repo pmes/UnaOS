@@ -385,3 +385,53 @@ fn pdf4annots_save_update_bytes() {
     assert_eq!(p.bytes, broken);
     assert_eq!(field_value(&p.bytes, "ok"), pdf_core::Object::Name(b"Off".to_vec()));
 }
+
+/// PDF4FORMSAVE (SR354): the staged save's name, type and bytes.
+fn staged_save(e: &mut AetherEngine) -> (String, String, Vec<u8>) {
+    match e.take_pending_save() {
+        Some(bandy::SMessage::BrowserSave { name, mime, bytes }) => (name, mime, bytes),
+        other => panic!("no BrowserSave staged: {other:?}"),
+    }
+}
+
+#[test]
+fn pdf4formsave_filled_form() {
+    let mut e = form_engine_with(form_pdf());
+    let q = user(&e, 0, 20.0, 10.0);
+    click(&mut e, q);
+    e.handle_event(Event::Text("Una".to_string()));
+    e.handle_event(Event::KeyDown("Ctrl+s".to_string()));
+    let (name, mime, bytes) = staged_save(&mut e);
+    assert_eq!((name.as_str(), mime.as_str()), ("test.pdf", "application/pdf"), "the URL's basename, no /Title");
+    let pdf = e.pdf.as_ref().unwrap();
+    assert_eq!(bytes, pdf.bytes, "the file as it stands");
+    assert_eq!(field_value(&bytes, "who"), pdf_core::Object::String(b"Una".to_vec()), "the saved bytes re-parse with the new /V");
+    assert!(pdf.focus.is_some(), "the field keeps its focus");
+    assert_eq!(pdf.focus.as_ref().unwrap().value, "Una", "the s was not typed into the field");
+    assert!(e.take_pending_save().is_none(), "taken once");
+    e.handle_event(Event::KeyDown("Meta+s".to_string()));
+    assert_eq!(staged_save(&mut e).2, bytes, "Cmd+S (the macOS face's key) stages the same");
+}
+
+#[test]
+fn pdf4formsave_plain_pdf() {
+    let mut e = open(400, 300);
+    e.handle_event(Event::KeyDown("Ctrl+s".to_string()));
+    let (name, mime, bytes) = staged_save(&mut e);
+    assert_eq!(name, "PDF4 Test.pdf", "the /Info /Title");
+    assert_eq!(mime, "application/pdf");
+    assert_eq!(bytes, two_pages(), "an unedited PDF saves its original bytes");
+    e.handle_event(Event::KeyDown("Ctrl+Shift+s".to_string()));
+    e.handle_event(Event::KeyDown("s".to_string()));
+    assert!(e.take_pending_save().is_none(), "Shift (Save As) and a bare s stage nothing");
+}
+
+#[test]
+fn pdf4formsave_html_tab_stages_nothing() {
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_html("https://example.com/", "<html><body><p>hi</p></body></html>", true);
+    e.handle_event(Event::KeyDown("Ctrl+s".to_string()));
+    assert!(e.take_pending_save().is_none(), "PAGE-SAVE is owed: an HTML tab stages nothing");
+}
+
