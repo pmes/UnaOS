@@ -514,7 +514,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
         // both Err arms now BOOT HEADLESS: zero the framebuffer info so `fb_addr == 0` tells the kernel
         // to fall back to a serial-only console, and record `mode_action = 4` ("headless, no GOP
         // protocol") for the boot-log readout. `break 'gop` skips the whole display-mode-selection body.
-        let gop_handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
+        let gop_handle = match { #[cfg(target_arch = "x86_64")] let r = gopsel::pick(); #[cfg(not(target_arch = "x86_64"))] let r = boot::get_handle_for_protocol::<GraphicsOutput>(); r } { // ZENBOOKGOP (zenbook-ledger Z4): x86 enumerates EVERY GOP handle (`[boot] gop handle=` per output) and picks one: `UNAOS_GOP=<h>:<m>` > the only one > the first with a usable EDID that is not the internal panel > handle 0 (today's); file tail `mod gopsel`. LINE-NEUTRAL, x86-gated — see the fold note on `fn main`.
             Ok(handle) => handle,
             Err(e) => {
                 log::warn!("No GraphicsOutput handle ({:?}); booting headless (serial only)", e);
@@ -622,7 +622,7 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
         //      linear mode at the firmware's chosen resolution, else the largest linear within budget.
         let by_native = native
             .and_then(|res| gop.modes().find(|m| m.info().resolution() == res && usable(m.info())));
-        let by_knob = panelknob::pick(&gop, &usable); let target_is_native = by_knob.is_none() && by_native.is_some();
+        let by_knob = { #[cfg(target_arch = "x86_64")] let k = gopsel::knob_mode(&gop, &usable).or_else(|| panelknob::pick(&gop, &usable)); #[cfg(not(target_arch = "x86_64"))] let k = panelknob::pick(&gop, &usable); k }; let target_is_native = by_knob.is_none() && by_native.is_some();
         let target: Option<uefi::proto::console::gop::Mode> = if by_knob.is_some() { by_knob } else if by_native.is_some() {
             by_native
         } else if cur_linear {
@@ -1836,4 +1836,200 @@ fn smbios_ptr() -> u64 {
     let addr = if v3 != 0 { v3 } else { v2 };
     log::info!("SMBIOS ep at {:#x} ({})", addr, if v3 != 0 { "smbios3" } else if v2 != 0 { "smbios2" } else { "absent" });
     if addr == 0 || addr >> 48 != 0 { 0 } else { unaos_boot_info::SMBIOS_TAG | addr }
+}
+
+/// ZENBOOKGOP (zenbook-ledger Z4) — the loader picks the GOP OUTPUT, not only its mode. Until this module the loader
+/// looked at `get_handle_for_protocol` alone, i.e. the FIRST GraphicsOutput handle (`locate_handle_buffer[0]`); a
+/// laptop whose firmware publishes one GOP child per connector and whose own panel is dead (the ASUS Zenbook
+/// UM5606W on an external monitor) then drove the dead panel. `pick` enumerates every handle once, prints one
+/// `[boot] gop handle=<i> modes=<n> current=<w>x<h> edid=<yes|no> size_mm=<w>x<h> out=<int|ext|->` per output (and
+/// its mode list, indexed, when there is more than one output or the knob is set), then picks by THE RULE:
+/// `UNAOS_GOP=<h>:<m>` (h in range) > the only handle > the first handle in index order whose EDID has a usable
+/// preferred timing (`parse_edid_native`) and whose ACPI _ADR does not say internal panel > handle 0 (today's). The
+/// mode rule inside the picked handle is the existing one (`panelknob`, the EDID-native mode, the current mode, the
+/// largest linear), and `read_edid(gop_handle)` in `main` now reads the PICKED output's EDID, so the kernel's dpi
+/// (`font_core::ui::edid_ppi` over EDID-CARRY) reads the external monitor's size with no kernel change. One handle
+/// (QEMU's OVMF VGA) -> handle 0, byte-identical to the old pick. `option_env!` lands in rustc's dep-info as
+/// `env-dep`; a build made with `UNAOS_GOP` is NOT the flashable default image. x86 only (the call sites are
+/// x86-gated folds, so the aarch64 loader compiles none of this).
+#[cfg(target_arch = "x86_64")]
+mod gopsel {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType};
+    use uefi::proto::console::gop::{GraphicsOutput, Mode, ModeInfo};
+    use uefi::proto::device_path::{DevicePath, DeviceSubType, DeviceType};
+    use uefi::{Handle, Status};
+
+    /// `UNAOS_GOP=<handle>:<mode>`, decimal indices as the `[boot] gop` lines print them; `(h, m, set)`.
+    const fn parse(v: Option<&str>) -> (usize, usize, bool) {
+        let s = match v {
+            None => return (0, 0, false),
+            Some(s) => s,
+        };
+        let b = s.as_bytes();
+        if b.is_empty() {
+            return (0, 0, false);
+        }
+        let (mut h, mut m, mut i, mut colon, mut digits) = (0usize, 0usize, 0usize, false, 0usize);
+        while i < b.len() {
+            let c = b[i];
+            if c == b':' {
+                if colon || digits == 0 {
+                    panic!("UNAOS_GOP must be <handle>:<mode>, decimal");
+                }
+                colon = true;
+                digits = 0;
+            } else if c >= b'0' && c <= b'9' {
+                let d = (c - b'0') as usize;
+                if colon {
+                    m = m * 10 + d;
+                } else {
+                    h = h * 10 + d;
+                }
+                digits += 1;
+            } else {
+                panic!("UNAOS_GOP must be <handle>:<mode>, decimal");
+            }
+            i += 1;
+        }
+        if !colon || digits == 0 {
+            panic!("UNAOS_GOP must be <handle>:<mode>, decimal");
+        }
+        (h, m, true)
+    }
+
+    const KNOB: (usize, usize, bool) = parse(option_env!("UNAOS_GOP"));
+    /// Set by `pick` when the knob chose the handle; `knob_mode` applies the knob's mode only then.
+    static KNOB_TOOK: AtomicBool = AtomicBool::new(false);
+
+    /// The output kind from the handle's ACPI _ADR device-path node (ACPI 3.0 Table B-2, the scheme bit 31):
+    /// display type (bits 11:8) 4 = internal flat panel -> `int`; 1..=3 (VGA, TV, external digital) -> `ext`;
+    /// no node / no scheme bit -> `-`.
+    fn out_kind(h: Handle) -> &'static str {
+        // Safety: GetProtocol on a firmware handle with our image as agent; read-only, dropped before return.
+        let dp = match unsafe {
+            boot::open_protocol::<DevicePath>(
+                OpenProtocolParams { handle: h, agent: boot::image_handle(), controller: None },
+                OpenProtocolAttributes::GetProtocol,
+            )
+        } {
+            Ok(dp) => dp,
+            Err(_) => return "-",
+        };
+        for node in dp.node_iter() {
+            if node.device_type() == DeviceType::ACPI && node.sub_type() == DeviceSubType::ACPI_ADR {
+                let d = node.data();
+                if d.len() >= 4 {
+                    let adr = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+                    if adr & 0x8000_0000 != 0 {
+                        return match (adr >> 8) & 0xF {
+                            4 => "int",
+                            1..=3 => "ext",
+                            _ => "-",
+                        };
+                    }
+                }
+            }
+        }
+        "-"
+    }
+
+    /// The EDID's physical image size in mm: the first detailed timing's (bytes 66-68), else bytes 21/22 (cm).
+    fn size_mm(b: &[u8; 128]) -> (u32, u32) {
+        if b[54] != 0 || b[55] != 0 {
+            let w = b[66] as u32 | ((b[68] as u32 >> 4) << 8);
+            let h = b[67] as u32 | ((b[68] as u32 & 0xF) << 8);
+            if w != 0 && h != 0 {
+                return (w, h);
+            }
+        }
+        (b[21] as u32 * 10, b[22] as u32 * 10)
+    }
+
+    /// Enumerate every GOP handle, print the census, return the picked one (see the module doc). An error from the
+    /// handle lookup is returned as is, so `main`'s headless arms run exactly as before.
+    pub fn pick() -> uefi::Result<Handle> {
+        let buf = boot::locate_handle_buffer(SearchType::from_proto::<GraphicsOutput>())?;
+        let n = buf.len();
+        if n == 0 {
+            return Err(Status::NOT_FOUND.into());
+        }
+        let list_modes = n > 1 || KNOB.2;
+        let mut edid_pick: Option<usize> = None;
+        for (i, &h) in buf.iter().enumerate() {
+            // Safety: as `out_kind` — GetProtocol, read-only, dropped at the end of this iteration, before `main`
+            // opens the picked handle exclusively.
+            let gop = unsafe {
+                boot::open_protocol::<GraphicsOutput>(
+                    OpenProtocolParams { handle: h, agent: boot::image_handle(), controller: None },
+                    OpenProtocolAttributes::GetProtocol,
+                )
+            };
+            let (modes, cur) = match &gop {
+                Ok(g) => (g.modes().len(), g.current_mode_info().resolution()),
+                Err(_) => (0, (0, 0)),
+            };
+            let edid = super::read_edid(h);
+            let native = edid.as_ref().and_then(|r| super::parse_edid_native(&r.block));
+            let (mw, mh) = edid.as_ref().map_or((0, 0), |r| size_mm(&r.block));
+            let out = out_kind(h);
+            log::info!(
+                "[boot] gop handle={} modes={} current={}x{} edid={} size_mm={}x{} out={}",
+                i, modes, cur.0, cur.1, if edid.is_some() { "yes" } else { "no" }, mw, mh, out
+            );
+            if list_modes {
+                if let Ok(g) = &gop {
+                    for (m, mode) in g.modes().enumerate() {
+                        let mi = mode.info();
+                        let (w, hh) = mi.resolution();
+                        log::info!("[boot] gop handle={} mode={} {}x{} fmt={:?}", i, m, w, hh, mi.pixel_format());
+                    }
+                }
+            }
+            if edid_pick.is_none() && native.is_some() && out != "int" {
+                edid_pick = Some(i);
+            }
+        }
+        let (idx, why) = if KNOB.2 && KNOB.0 < n {
+            KNOB_TOOK.store(true, Ordering::Relaxed);
+            (KNOB.0, "knob")
+        } else {
+            if KNOB.2 {
+                log::info!("[boot] gop knob handle={} absent (handles={}); the rule picks", KNOB.0, n);
+            }
+            if n == 1 {
+                (0, "only")
+            } else if let Some(i) = edid_pick {
+                (i, "edid")
+            } else {
+                (0, "console")
+            }
+        };
+        log::info!("[boot] gop pick handle={}/{} why={}", idx, n, why);
+        Ok(buf[idx])
+    }
+
+    /// The knob's mode on the knob's handle (`None` unless `pick` took the handle by the knob): the `m`-th mode of
+    /// the mode list when usable (linear, inside the back-buffer budget), else today's pick, said once.
+    pub fn knob_mode(gop: &GraphicsOutput, usable: impl Fn(&ModeInfo) -> bool) -> Option<Mode> {
+        if !KNOB.2 || !KNOB_TOOK.load(Ordering::Relaxed) {
+            return None;
+        }
+        let m = gop.modes().nth(KNOB.1);
+        match &m {
+            Some(mode) if usable(mode.info()) => {
+                let (w, h) = mode.info().resolution();
+                log::info!("GOP: gop knob mode {} -> {}x{}", KNOB.1, w, h);
+            }
+            Some(_) => {
+                log::info!("GOP: gop knob mode {} -> not usable (today's pick)", KNOB.1);
+                return None;
+            }
+            None => {
+                log::info!("GOP: gop knob mode {} -> absent (today's pick)", KNOB.1);
+                return None;
+            }
+        }
+        m
+    }
 }
