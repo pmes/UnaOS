@@ -9496,12 +9496,12 @@ pub mod preemptoff {
         })
     }
 
-    /// PREEMPTOFFAUDIT M1: the census of the x86 kernel's `without_interrupts` call sites at 611cf90b9 (cores.md §4, the
-    /// Z57 row): 178 sites — 13 mask for an ISR or CPU state (I), 138 only for holder non-preemption (II), 27 for both
-    /// (III); ONE converted to preempt-off (`drivers::block::hold::with`).
-    pub const AUDIT_SITES: u32 = 178;
+    /// PREEMPTOFFAUDIT M1: the census of the x86 kernel's `without_interrupts` call sites (cores.md §4, the Z57 row): 178
+    /// sites at 611cf90b9, corrected by PREEMPTOFFFAT Z65: fat.rs:1027/:1133 are aarch64-only, so 176 — 13 I (ISR or CPU
+    /// state), 136 II (holder non-preemption only), 27 III (both); ONE converted to preempt-off (`block::hold::with`).
+    pub const AUDIT_SITES: u32 = 176;
     pub const AUDIT_ISR: u32 = 13;
-    pub const AUDIT_HOLDER: u32 = 138;
+    pub const AUDIT_HOLDER: u32 = 136;
     pub const AUDIT_BOTH: u32 = 27;
     pub const AUDIT_CONVERTED: u32 = 1;
 
