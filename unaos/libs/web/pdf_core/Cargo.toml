@@ -1,0 +1,18 @@
+[package]
+name = "pdf_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Aether's PDF core: the PDF 32000-1 reader (lexer, objects, xref tables and streams, object streams, incremental updates, reconstruction, the standard filters, the page tree, the content-stream tokenizer) — no_std + alloc, shared by Ring 0 and Ring 3."
+
+# PDF1 (LEDGER SR300): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the midden_core shape: a shared core under
+# `unaos/libs/web/` beside Aether's other cores, a member of the ROOT host workspace (tools/pdfprobe links it). Its one
+# dependency is pixel_core, for the ONE inflater (`pixel_core::inflate::zlib_inflate` / `inflate_raw`): FlateDecode is
+# never a second DEFLATE decoder.
+[dependencies]
+pixel_core = { path = "../../media/pixel_core" }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (timeline_core's spelling, so a kernel `default-features = false` is honest).
+std = []

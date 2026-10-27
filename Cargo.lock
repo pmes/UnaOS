@@ -3495,6 +3495,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdf_core"
+version = "0.1.0"
+dependencies = [
+ "pixel_core",
+]
+
+[[package]]
+name = "pdfprobe"
+version = "0.1.0"
+dependencies = [
+ "pdf_core",
+]
+
+[[package]]
 name = "phonolite"
 version = "0.1.0"
 dependencies = [
