@@ -1537,14 +1537,14 @@ fn bkat_sci() -> bool {
 // Device's name (the `Scope (\_SB.PCI0.SBRG.EC0) { Method (_Qxx) }` blocks outside it), the EmbeddedControl OperationRegions
 // and their Field unit names, then every `_Q<hex><hex>` Method in those spans with its Notify targets and the fields its body
 // names. The honest claim is "byte xx's handler notifies <device> with <code> and names fields <...>"; what the handler
-// COMPUTES is not read. The AML helpers are DWI2CACPI's (`dwi2c::find_from`/`pkg_len`/`last_seg`/`device_of`, widened to
-// pub(crate) in place; AML-HELPERS-ONE owes their lift to one home). Once per boot from `probe`, past `hw::gate(Probe::Ec)`
+// COMPUTES is not read. The AML helpers (`find_from`/`pkg_len`/`last_seg`/`device_of`, DWI2CACPI's) live at acpi_power.rs's
+// tail (AML-HELPERS-ONE, zenbook-ledger Z53: the ONE home; `aml` below). Once per boot from `probe`, past `hw::gate(Probe::Ec)`
 // (the rMBP and QEMU print nothing): `[ec] qnames n= dev= spans= fields=` + one `[ec] qname 0x<xx> notify= fields=` per
 // method, or `[ec] qnames -> REFUSED why=`; the table is kept write-once in `QNAMES` and the drain's `[ec] q=` line gains
 // ` -> notify=<TGT>:<v>` (or `-`) for a byte it holds. SSDT methods (ZENBOOK-EC-QSSDT) and the calls inside a body
 // (ZENBOOK-EC-QCALLS) are owed. `tests ecqnames`: the live line, then the scan over `QN_KAT` and three refusal mutants.
 
-use crate::drivers::dwi2c as aml;
+use crate::arch::acpi_power as aml;
 
 /// Methods kept (more are counted, ` more=` on the summary line).
 const QN_MAX: usize = 64;
@@ -1604,10 +1604,7 @@ fn name_end(a: &[u8], mut i: usize) -> Option<usize> {
     if e <= a.len() { Some(e) } else { None }
 }
 
-/// A NameSeg character.
-fn seg_char(c: u8) -> bool {
-    c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'
-}
+// AML-HELPERS-ONE (zenbook-ledger Z53): `seg_char` (the NameSeg character test) retired onto `aml::last_seg`, its one caller in `qn_fields`.
 
 /// The ONE PNP0C09 Device and the `Scope` blocks naming it: (its name, the spans, how many).
 fn qn_spans(a: &[u8]) -> Result<([u8; 4], [(usize, usize); QN_SPANS], usize), QNo> {
@@ -1709,7 +1706,7 @@ fn qn_fields(a: &[u8], spans: &[(usize, usize)], regs: &[[u8; 4]], out: &mut [[u
                     0x03 => i += 4,
                     c if c.is_ascii_uppercase() || c == b'_' => {
                         let Some(sg) = a.get(i..i + 4) else { break };
-                        if !sg.iter().all(|&c| seg_char(c)) {
+                        if aml::last_seg(a, i).is_none() {
                             break;
                         }
                         let Some((_, fw)) = aml::pkg_len(a, i + 4) else { break };
