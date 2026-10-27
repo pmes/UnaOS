@@ -7,8 +7,8 @@
 //! LEGACY-ONLY. MD5 is BROKEN (practical collisions since 2004, chosen-prefix since 2007). It is here for reading the
 //! formats that are built on it and for nothing else: never a new security decision, never a MAC, never a signature
 //! digest. It deliberately does NOT implement [`crate::Digest`], so [`crate::hmac`] and the KDFs cannot be handed it.
-//! Its consumers: `pdf_core::crypt` (PDF's standard security handler); MD5-ONE (owed) retires audio_core's FLAC
-//! STREAMINFO checksum onto this module.
+//! Its consumers: `pdf_core::crypt` (PDF's standard security handler) and, MD5-ONE (CRYPTOONE, LEDGER SR330),
+//! audio_core's FLAC STREAMINFO checksum (`audio_core::md5` re-exports this; an integrity check of its own decode).
 //!
 //! Streaming, no allocation. CONSTANT-TIME in the message contents (fixed-schedule ARX); the length is public.
 

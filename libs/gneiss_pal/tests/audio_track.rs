@@ -117,7 +117,7 @@ fn md5_i16(x: &[f32]) -> String {
     let bytes: Vec<u8> = x.iter().flat_map(|&s| ((s * 32768.0) as i16).to_le_bytes()).collect();
     let mut m = Md5::new();
     m.update(&bytes);
-    m.finish().iter().map(|b| format!("{b:02x}")).collect()
+    m.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ------------------------------------------------------------------------------------- Opus
