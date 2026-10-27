@@ -776,7 +776,7 @@ refs/heads/exec-rmbp-audiosink   660e532f1 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-audiocapture   55b818d92 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-netsplit   2879aed46 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-relistread   2879aed46 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-heapregion   2879aed46 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-heapregion   9fcec8da7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherscale   2879aed46 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aetherfit2   2879aed46 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-stationrate   8ad458e8a FOLDED-BY-HAND (this commit) 2026-10-27

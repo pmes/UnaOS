@@ -61,8 +61,8 @@ unsafe impl GlobalAlloc for Locked<Heap> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut result = null_mut();
         arch::without_interrupts(|| {
-            let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner); // POISON2 (B846): a death-released heap lock is CHECKED at its next allocation (body at the tail). LINE-NEUTRAL append
-            match { #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_ALLOC); heap.allocate_first_fit(layout) } {
+            let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner, &mut heap); // HEAPREGION (B854): a torn verdict re-initialises the heap onto its reserve (the guard passed in). POISON2 (B846): a death-released heap lock is CHECKED at its next allocation (body at the tail). LINE-NEUTRAL append
+            match { #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_ALLOC); if heap_dead() { Err(()) } else { heap.allocate_first_fit(layout) } } {
                 Ok(ptr) => { result = ptr.as_ptr(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] high_note(heap.used()); #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_alloc(result as usize, layout.size()); #[cfg(target_arch = "x86_64")] heappoison::op(0); } // MEMLINE (B677): the window's high-water, under the heap lock. LINE-NEUTRAL append, code first; MEMLINE2 (B821): the owner census, same lock
                 Err(_) => { #[cfg(target_arch = "x86_64")] heappoison::op(0); }
             }
@@ -72,11 +72,11 @@ unsafe impl GlobalAlloc for Locked<Heap> {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         arch::without_interrupts(|| {
-            let mut heap = self.inner.lock();
+            let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner, &mut heap); // HEAPREGION (B854) HEAPFREEFIRST: a free that is the first take after a death runs the SAME check (and may re-init). LINE-NEUTRAL append
             unsafe {
-                #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_FREE); heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout); #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_free(ptr as usize); #[cfg(target_arch = "x86_64")] heappoison::op(0); // MEMLINE2 (B821): a tracked block leaves the owner census under the heap lock, whoever frees it. LINE-NEUTRAL append, code first
+                #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_FREE); if heap_free_ok(ptr as usize) { heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout); } #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_free(ptr as usize); #[cfg(target_arch = "x86_64")] heappoison::op(0); // MEMLINE2 (B821): a tracked block leaves the owner census under the heap lock, whoever frees it. LINE-NEUTRAL append, code first. HEAPREGION (B854): a free into the abandoned range is DROPPED (`heap_free_ok`); the census still forgets it
             }
-        });
+        }); #[cfg(target_arch = "x86_64")] heappoison::say(); // HEAPREGION (B854) HEAPFREEFIRST: the free's check is said after the lock drops, as alloc's tail does. LINE-NEUTRAL append
     }
 }
 
@@ -542,7 +542,7 @@ pub mod census {
 #[cfg(target_arch = "x86_64")]
 pub mod heappoison {
     //! CHARTER: Kernel — kernel-by-ruling (B414 LOCKREG): the heap lock's poison check (POISON2 B846).
-    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};
 
     use super::{Heap, Mutex, ALLOCATOR};
 
@@ -556,7 +556,9 @@ pub mod heappoison {
     static CHECKS: AtomicU64 = AtomicU64::new(0);
     static TORN: AtomicU64 = AtomicU64::new(0);
     static LAST_TORN: AtomicBool = AtomicBool::new(false);
-    /// The last check's record for its line: 0 = nothing to say, else `0x80 | op`.
+    /// What to say after the lock drops, a bit set written only with the heap lock held: `0x80` a check (low nibble = the
+    /// torn op, 0 = whole), `0x40` it re-initialised onto the reserve, `0x20` it was FATAL (torn twice), `0x10` a dropped-free
+    /// report is due (HEAPREGION B854).
     static PENDING: AtomicU8 = AtomicU8::new(0);
 
     /// Mark (`kind`) or clear (0) the crate mutation in flight. Caller holds the heap lock.
@@ -565,24 +567,38 @@ pub mod heappoison {
         OP.store(kind, Relaxed);
     }
 
-    /// The take's check (caller holds `heap`): one load while nothing is poisoned.
+    /// The take's check (caller holds `lock`, whose guard is `heap`): one load while nothing is poisoned.
     #[inline(always)]
-    pub(super) fn check(heap: &Mutex<Heap>) {
-        if heap.take_poison() {
-            checked();
+    pub(super) fn check(lock: &Mutex<Heap>, heap: &mut Heap) {
+        if lock.take_poison() {
+            checked(heap);
         }
     }
 
+    /// HEAPREGION (B854): a torn verdict with the reserve unspent RE-INITIALISES the heap onto it (`regrow`); torn again
+    /// after that is FATAL (said after the lock drops, then a panic: no allocation or free walks the list again); torn
+    /// with no reserve carved is kept, as POISON2 kept it.
     #[cold]
     #[inline(never)]
-    fn checked() {
+    fn checked(heap: &mut Heap) {
         let k = OP.swap(0, Relaxed);
         CHECKS.fetch_add(1, AcqRel);
+        let mut r = 0x80 | k;
         if k != 0 {
             TORN.fetch_add(1, Relaxed);
+            if REINITS.load(Relaxed) != 0 {
+                GATE.store(GATE_DEAD, Release);
+                r |= 0x20;
+            } else {
+                let len = RESERVE_LEN.swap(0, Relaxed);
+                if len != 0 {
+                    regrow(heap, RESERVE_LO.load(Relaxed), len);
+                    r |= 0x40;
+                }
+            }
         }
         LAST_TORN.store(k != 0, Release);
-        PENDING.store(0x80 | k, Release);
+        PENDING.store(r | (PENDING.load(Relaxed) & 0x10), Release);
     }
 
     /// Say a pending check's line (alloc's tail, the heap lock released). One load while nothing is pending.
@@ -601,19 +617,28 @@ pub mod heappoison {
             return;
         }
         let checks = CHECKS.load(Relaxed);
-        match r & 0x0F {
-            0 => serial_println!("[heap] poison checked torn=0 -> released checks={} (POISON2 B846: the dead holder was outside the hole-list mutation)", checks),
-            k => serial_println!(
-                "[heap] poison checked torn=1 op={} -> kept (linked_list_allocator 0.10.6 has no hole walk; owed HEAPREGION) checks={} torn_total={}",
-                match k {
-                    OP_ALLOC => "alloc",
-                    OP_FREE => "free",
-                    OP_CENSUS => "census",
-                    _ => "?",
-                },
-                checks,
-                TORN.load(Relaxed)
-            ),
+        if r & 0x80 != 0 {
+            let op = match r & 0x0F {
+                OP_ALLOC => "alloc",
+                OP_FREE => "free",
+                OP_CENSUS => "census",
+                _ => "?",
+            };
+            if r & 0x0F == 0 {
+                serial_println!("[heap] poison checked torn=0 -> released checks={} (POISON2 B846: the dead holder was outside the hole-list mutation)", checks);
+            } else if r & 0x20 != 0 {
+                serial_println!("[heap] poison checked torn=1 op={} -> fatal (HEAPREGION B854: torn twice, the reserve is spent) checks={} torn_total={}", op, checks, TORN.load(Relaxed));
+            } else if r & 0x40 != 0 {
+                serial_println!("[heap] poison checked torn=1 op={} -> reinit reserve={} checks={} torn_total={}", op, REGREW_LEN.load(Relaxed) >> 20, checks, TORN.load(Relaxed));
+            } else {
+                serial_println!("[heap] poison checked torn=1 op={} -> kept reserve=none (HEAPREGION B854: no reserve was carved; linked_list_allocator 0.10.6 has no hole walk) checks={} torn_total={}", op, checks, TORN.load(Relaxed));
+            }
+        }
+        if r & 0x50 != 0 {
+            serial_println!("[heap] reinit reserve={} dropped_frees={} (HEAPREGION B854: frees into the abandoned range are dropped, never walked)", REGREW_LEN.load(Relaxed) >> 20, DROPPED.load(Relaxed));
+        }
+        if r & 0x20 != 0 {
+            panic!("HEAPREGION (B854): the heap's hole list tore twice; the reserve is spent");
         }
     }
 
@@ -686,5 +711,145 @@ pub mod heappoison {
                 core::alloc::GlobalAlloc::dealloc(&ALLOCATOR, p, l);
             }
         }
+    }
+
+    // ── HEAPREGION (rmbp-ledger B854): the reserve, the one re-init, the dropped frees. Every store below except
+    // `set_reserve` (boot, before SMP) is made with the heap lock held, as `OP` is. ──
+
+    const GATE_OPEN: u8 = 0;
+    const GATE_MOVED: u8 = 1;
+    const GATE_DEAD: u8 = 2;
+    /// The free path's one load: 0 no re-init yet, 1 re-initialised (a free into `[OLD_LO, OLD_HI)` is dropped), 2 fatal.
+    static GATE: AtomicU8 = AtomicU8::new(GATE_OPEN);
+    /// The reserve (`arch::x86_64::memory::heap_reserve_carve`); `RESERVE_LEN` swaps to 0 when spent.
+    static RESERVE_LO: AtomicUsize = AtomicUsize::new(0);
+    static RESERVE_LEN: AtomicUsize = AtomicUsize::new(0);
+    /// The abandoned range and the reserve's length once spent.
+    static OLD_LO: AtomicUsize = AtomicUsize::new(0);
+    static OLD_HI: AtomicUsize = AtomicUsize::new(0);
+    static REGREW_LEN: AtomicUsize = AtomicUsize::new(0);
+    static REINITS: AtomicU64 = AtomicU64::new(0);
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// Boot (`memory::init`, before SMP): the span a torn heap re-initialises onto, adjacent to the heap's top.
+    pub fn set_reserve(lo: usize, len: usize) {
+        RESERVE_LO.store(lo, Relaxed);
+        RESERVE_LEN.store(len, Release);
+    }
+
+    /// The re-init itself, on any `Heap` (the global one under its lock; `reinit_leg`'s scratch one): `Heap::init` resets
+    /// the hole list to the new span WITHOUT walking the old one (linked_list_allocator 0.10.6), so it is sound on a torn
+    /// list. Returns the abandoned `[lo, hi)`.
+    fn regrow_onto(heap: &mut Heap, lo: usize, len: usize) -> (usize, usize) {
+        let old = (heap.bottom() as usize, heap.top() as usize);
+        // SAFETY: `[lo, lo + len)` is RAM nothing else owns (the carved reserve, or the leg's own buffer), at least a
+        // hole's size; the old span's live blocks are never handed out again (frees into it are dropped).
+        unsafe { heap.init(lo as *mut u8, len) };
+        old
+    }
+
+    /// A free of `p` must not reach the new list: it lies in the abandoned range.
+    #[inline(always)]
+    fn in_old(p: usize, lo: usize, hi: usize) -> bool {
+        p >= lo && p < hi
+    }
+
+    /// The global re-init (caller holds the heap lock): the abandoned range recorded, `heap_bounds()` raised to the
+    /// reserve's end (the reserve is adjacent, so `[lo, hi)` still covers every live block), the free gate moved.
+    fn regrow(heap: &mut Heap, lo: usize, len: usize) {
+        let (olo, ohi) = regrow_onto(heap, lo, len);
+        OLD_LO.store(olo, Relaxed);
+        OLD_HI.store(ohi, Relaxed);
+        REGREW_LEN.store(len, Relaxed);
+        super::HEAP_HI.fetch_max(lo + len, Relaxed);
+        REINITS.fetch_add(1, Relaxed);
+        GATE.store(GATE_MOVED, Release);
+    }
+
+    /// The free gate (caller holds the heap lock): one load while no re-init happened. After one, a free into the abandoned
+    /// range is DROPPED and counted (a report pended at 1, 2, 4, 8, … drops); after a fatal verdict nothing is freed.
+    #[inline(always)]
+    pub(super) fn free_ok(p: usize) -> bool {
+        match GATE.load(Relaxed) {
+            GATE_OPEN => true,
+            g => free_moved(p, g),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn free_moved(p: usize, g: u8) -> bool {
+        if g == GATE_DEAD {
+            return false;
+        }
+        if !in_old(p, OLD_LO.load(Relaxed), OLD_HI.load(Relaxed)) {
+            return true;
+        }
+        let n = DROPPED.fetch_add(1, Relaxed) + 1;
+        if n.is_power_of_two() {
+            PENDING.fetch_or(0x10, Release);
+        }
+        false
+    }
+
+    /// After a fatal verdict no allocation walks the list (the caller holds the heap lock).
+    #[inline(always)]
+    pub(super) fn dead() -> bool {
+        GATE.load(Relaxed) == GATE_DEAD
+    }
+
+    /// `tests lockreg`'s `heap_reinit=` leg: a scratch `Heap` on a 32 KiB buffer, one block, the SAME `regrow_onto` onto a
+    /// second buffer, the SAME `in_old` test on the block, and a new allocation that must land in the second span. The
+    /// global heap is never touched (the two buffers are ordinary allocations).
+    pub fn reinit_leg() -> &'static str {
+        const SPAN: usize = 32 * 1024;
+        let mut a: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut b: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        if a.try_reserve_exact(SPAN).is_err() || b.try_reserve_exact(SPAN).is_err() {
+            return "skip(scratch-alloc)";
+        }
+        let l = core::alloc::Layout::from_size_align(64, 8).unwrap();
+        let (alo, blo) = (a.as_mut_ptr() as usize, b.as_mut_ptr() as usize);
+        // SAFETY: `a`'s capacity is SPAN bytes this function owns; the scratch heap dies before `a` does.
+        let mut h = unsafe { Heap::new(alo as *mut u8, SPAN) };
+        let Ok(blk) = h.allocate_first_fit(l) else { return "skip(scratch-alloc)" };
+        let (olo, ohi) = regrow_onto(&mut h, blo, SPAN);
+        if (olo, ohi) != (alo, alo + SPAN) || h.bottom() as usize != blo {
+            return "not-reserve";
+        }
+        if !in_old(blk.as_ptr() as usize, olo, ohi) {
+            return "free-kept";
+        }
+        match h.allocate_first_fit(l) {
+            Ok(p) if in_old(p.as_ptr() as usize, blo, blo + SPAN) => "ok",
+            _ => "not-reserve",
+        }
+    }
+}
+
+// HEAPREGION (rmbp-ledger B854): the alloc and free paths' gates, one name on every arch (x86's `heappoison`; elsewhere
+// there is no poison check, so nothing is ever dropped and the heap never dies). At the tail: no line above moves.
+#[inline(always)]
+fn heap_dead() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        heappoison::dead()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[inline(always)]
+#[allow(unused_variables)]
+fn heap_free_ok(p: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        heappoison::free_ok(p)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        true
     }
 }
