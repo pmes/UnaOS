@@ -39,7 +39,7 @@
 //!   before the mount returns — a half-drained queue is crash-safe because
 //!   the drain itself is one commit).
 
-use crate::btree::{Btree, BtreeError, DeviceStore, LexCmp};
+use crate::btree::{Btree, BtreeError, DeviceStore, HeldSet, LexCmp};
 use crate::catalog::{CatalogEntry, deserialize_catalog, serialize_catalog};
 use crate::index::{CatalogRecord, IndexFact, ReadStore};
 use crate::inode::{AttributeValue, Extent, ExtentList, FileKind, Inode, InodeError};
@@ -305,6 +305,9 @@ pub struct CommitStats {
     /// Snapshots dropped since mount/format (K8b: `snapshot_drop` calls that
     /// enqueued + drained a retained root).
     pub snapshots_dropped: u64,
+    /// UNAFSWRITE2 second half (rmbp-ledger B861): blocks written to the device while [`UnaFS::hold_fresh`] was on —
+    /// [`hold_block`]'s spill past [`FRESH_HOLD_MAX`]. Unmoved across an op = it wrote nothing under the caller's lock.
+    pub held_direct: u64,
 }
 
 /// The committed in-RAM state [`UnaFS::load_committed`] reads off the device —
@@ -376,11 +379,14 @@ pub struct UnaFS<D: BlockDevice> {
     /// looks here first ([`read_held`]); a commit writes them before its barrier, a [`stage`](Self::stage) copies them
     /// into its capture; cleared where a commit LANDS (`commit_flip`) and by `txn_unwind`.
     fresh_held: Vec<(u64, Vec<u8>)>,
+    /// UNAFSWRITE2 second half (rmbp-ledger B861): how many of `fresh_held` are btree NODE blocks (the node store's
+    /// [`node_store`](Self::node_store) pushes, less the held copies its releases dropped); cleared with `fresh_held`.
+    fresh_nodes: u64,
 }
 
 /// UNAFSWRITE2 (rmbp-ledger B844): THE read of a write_fresh-class block (inode, extents, data) — the held copy
 /// ([`UnaFS::hold_fresh`]) first, else the device. A snapshot read passes `&[]`.
-fn read_held<D: BlockDevice>(device: &mut D, held: &[(u64, Vec<u8>)], b: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+pub(crate) fn read_held<D: BlockDevice>(device: &mut D, held: &[(u64, Vec<u8>)], b: u64, buf: &mut [u8]) -> Result<(), StorageError> {
     match held.iter().find(|(x, _)| *x == b) {
         Some((_, bytes)) => {
             let n = buf.len().min(bytes.len());
@@ -389,6 +395,59 @@ fn read_held<D: BlockDevice>(device: &mut D, held: &[(u64, Vec<u8>)], b: u64, bu
         }
         None => device.read_block(b, buf),
     }
+}
+
+/// UNAFSWRITE2 second half (rmbp-ledger B861): the most blocks [`hold_block`] keeps in RAM (2048 = 8 MiB). Past it a
+/// block not already held goes to the device — unreferenced until the flip (K8a), exactly the unheld write — so a large
+/// `write` never doubles into the heap (the stage copies the held set). Counted in [`CommitStats::held_direct`].
+pub const FRESH_HOLD_MAX: usize = 2048;
+
+/// UNAFSWRITE2 (B861): what [`hold_block`] did with a block.
+pub(crate) enum Held {
+    /// A held copy of the block was replaced (newest copy per block).
+    Replaced,
+    /// The block joined the held set.
+    New,
+    /// The set was full ([`FRESH_HOLD_MAX`]): the block went to the device.
+    Spilled,
+}
+
+/// UNAFSWRITE2 (B844; B861 extracted it from `write_fresh` so the btree node store shares it — ONE staging path): THE
+/// write of a fresh (K8a-unreferenced) block while the hold is on — the newest copy per block kept in `held`, past
+/// [`FRESH_HOLD_MAX`] a block not yet held written to `device`.
+pub(crate) fn hold_block<D: BlockDevice>(device: &mut D, held: &mut Vec<(u64, Vec<u8>)>, block: u64, buf: &[u8]) -> Result<Held, StorageError> {
+    let at = held.iter().position(|(b, _)| *b == block);
+    if at.is_none() && held.len() >= FRESH_HOLD_MAX {
+        device.write_block(block, buf)?;
+        return Ok(Held::Spilled);
+    }
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(buf.len()).map_err(|_| StorageError::AllocRefused(buf.len() as u64))?;
+    copy.extend_from_slice(buf);
+    match at {
+        Some(i) => {
+            held[i].1 = copy;
+            Ok(Held::Replaced)
+        }
+        None => {
+            held.try_reserve(1).map_err(|_| StorageError::AllocRefused(buf.len() as u64))?;
+            held.push((block, copy));
+            Ok(Held::New)
+        }
+    }
+}
+
+/// UNAFSWRITE2 (B844; B861 extracted it from `free_block` so the btree node store shares it): `refmap.decref`, and a
+/// block whose count reaches 0 loses its held copy — it may be re-allocated inside this transaction, and a stale held
+/// copy must never land over it. `true` = a held copy was dropped.
+pub(crate) fn release_held<D: BlockDevice>(device: &mut D, refmap: &mut RefMap, held: &mut Vec<(u64, Vec<u8>)>, b: u64) -> bool {
+    refmap.decref(device, b);
+    if held.is_empty() || refmap.refcount(device, b) != 0 {
+        return false;
+    }
+    let n = held.len();
+    held.retain(|(x, _)| *x != b);
+    held.len() != n
 }
 
 /// UNAFSWRITE (B825): the next mount instance id (format and mount take one each).
@@ -418,8 +477,10 @@ pub struct StagedCommit {
     next_inode: u64,
     instance: u64,
     unwinds: u64,
-    /// UNAFSWRITE2 (B844): how many of `blocks` are the op's own held write_fresh blocks.
+    /// UNAFSWRITE2 (B844): how many of `blocks` are held blocks (the op's write_fresh blocks and, B861, its node blocks).
     fresh: usize,
+    /// UNAFSWRITE2 second half (B861): how many of the `fresh` held blocks are btree node blocks.
+    nodes: usize,
 }
 
 impl StagedCommit {
@@ -430,7 +491,13 @@ impl StagedCommit {
 
     /// UNAFSWRITE2 (B844): the op's own write_fresh blocks (inode, extents, data) among [`blocks`](Self::blocks).
     pub fn fresh_blocks(&self) -> usize {
-        self.fresh
+        self.fresh - self.nodes
+    }
+
+    /// UNAFSWRITE2 second half (rmbp-ledger B861): the op's btree node blocks (catalog, name index, attribute index)
+    /// among [`blocks`](Self::blocks) — held by the node store, written with the caller's lock released.
+    pub fn node_blocks(&self) -> usize {
+        self.nodes
     }
 
     /// Write every staged block to `device`, then flush — the commit's pre-flip barrier. `device` must address
@@ -554,6 +621,7 @@ impl<D: BlockDevice> UnaFS<D> {
             unwinds: 0,
             fresh_hold: false,
             fresh_held: Vec::new(),
+            fresh_nodes: 0,
         };
 
         // The reserved system objects, in id order (1..=4).
@@ -564,7 +632,7 @@ impl<D: BlockDevice> UnaFS<D> {
         if fs.superblock.indexed() {
             // v6: the catalog is two EMPTY B+trees named by the catalog record.
             let (eq_root, ord_root, written) = {
-                let mut store = DeviceStore::new(&mut fs.device, &mut fs.refmap);
+                let mut store = fs.node_store(); // UNAFSWRITE2 (B861)
                 let eq = Btree::create(&mut store, LexCmp)?;
                 let ord = Btree::create(&mut store, LexCmp)?;
                 (eq.root(), ord.root(), store.written)
@@ -681,6 +749,7 @@ impl<D: BlockDevice> UnaFS<D> {
             unwinds: 0,
             fresh_hold: false,
             fresh_held: Vec::new(),
+            fresh_nodes: 0,
         };
 
         // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
@@ -1312,6 +1381,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
         // 6. The new tree is the committed tree.
         self.fresh_held.clear(); // UNAFSWRITE2 (B844): the held blocks are on the medium and now reachable
+        self.fresh_nodes = 0; // UNAFSWRITE2 (B861)
         self.root = new_root;
         self.active_slot = slot;
         self.imap_tree.finish_commit();
@@ -1339,6 +1409,7 @@ impl<D: BlockDevice> UnaFS<D> {
         }
         let mut blocks = Vec::new();
         let fresh = self.fresh_held.len();
+        let nodes = (self.fresh_nodes as usize).min(fresh); // UNAFSWRITE2 (B861)
         let (root, slot) = match self.commit_stage(Some(&mut blocks)) {
             Ok(r) => r,
             Err(e) => {
@@ -1357,6 +1428,7 @@ impl<D: BlockDevice> UnaFS<D> {
             instance: self.instance,
             unwinds: self.unwinds,
             fresh,
+            nodes,
         }))
     }
 
@@ -1414,10 +1486,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// re-allocated inside this transaction (to the btree store, written straight to the device), and a stale held
     /// copy must never land over it.
     fn free_block(&mut self, b: u64) {
-        self.refmap.decref(&mut self.device, b);
-        if !self.fresh_held.is_empty() && self.refmap.refcount(&mut self.device, b) == 0 {
-            self.fresh_held.retain(|(x, _)| *x != b);
-        }
+        release_held(&mut self.device, &mut self.refmap, &mut self.fresh_held, b); // UNAFSWRITE2 (B861): the shared drop
     }
 
     /// Historical name for "make everything durable" — under CoW that is a
@@ -1458,16 +1527,10 @@ impl<D: BlockDevice> UnaFS<D> {
     /// Write a freshly allocated block, counting it for the bench.
     fn write_fresh(&mut self, block: u64, buf: &[u8]) -> Result<(), FileSystemError> {
         if self.fresh_hold {
-            // UNAFSWRITE2 (B844): held in RAM (newest copy per block) until the commit or the stage takes it.
-            let mut copy = Vec::new();
-            copy.try_reserve_exact(buf.len()).map_err(|_| StorageError::AllocRefused(buf.len() as u64))?;
-            copy.extend_from_slice(buf);
-            match self.fresh_held.iter_mut().find(|(b, _)| *b == block) {
-                Some(slot) => slot.1 = copy,
-                None => {
-                    self.fresh_held.try_reserve(1).map_err(|_| StorageError::AllocRefused(buf.len() as u64))?;
-                    self.fresh_held.push((block, copy));
-                }
+            // UNAFSWRITE2 (B844): held in RAM (newest copy per block) until the commit or the stage takes it — through
+            // the ONE hold the node store shares (B861), which spills to the device past FRESH_HOLD_MAX.
+            if matches!(hold_block(&mut self.device, &mut self.fresh_held, block, buf)?, Held::Spilled) {
+                self.stats.held_direct += 1;
             }
         } else {
             self.device.write_block(block, buf)?;
@@ -1475,6 +1538,17 @@ impl<D: BlockDevice> UnaFS<D> {
         self.txn_blocks += 1;
         self.stats.blocks_written += 1;
         Ok(())
+    }
+
+    /// UNAFSWRITE2 second half (rmbp-ledger B861): the btree node store over this mount. While the hold is on its node
+    /// writes join the held set ([`hold_block`]) and travel in the stage like the op's write_fresh blocks; its reads look
+    /// there first ([`read_held`]); its releases drop a held copy ([`release_held`]). Hold off: the device, as before.
+    fn node_store(&mut self) -> DeviceStore<'_, D> {
+        DeviceStore::held(
+            &mut self.device,
+            &mut self.refmap,
+            HeldSet { blocks: &mut self.fresh_held, hold: self.fresh_hold, nodes: &mut self.fresh_nodes, direct: &mut self.stats.held_direct },
+        )
     }
 
     // =====================================================================
@@ -1988,14 +2062,22 @@ impl<D: BlockDevice> UnaFS<D> {
     /// and `op` runs again — at most [`RING_MAX`](crate::RING_MAX) times. The versions' bound (10 %) is the
     /// overwrite's reserve, never a reason to refuse it. Versioning off, or a caller's open transaction
     /// (autocommit off): `op` once, exactly as before.
+    ///
+    /// UNAFSWRITE2 second half (rmbp-ledger B861): a SPLIT op ([`hold_fresh`](Self::hold_fresh) on, autocommit off) whose
+    /// transaction held nothing before `op` (`own`) is its own attempt, so it unwinds, drops and retries like an autocommit
+    /// one; the drop's commit is whole (only on a full versioned volume), the retry stays staged for the caller.
+    /// INVARIANT: a block freed by a drop (or by anything in a transaction) is never re-allocated before the flip that
+    /// lands its release — `RefMap::allocate` hands out only blocks free in the FROZEN view too (K8a); that is why the drop
+    /// must LAND before the retry can spend its room, and why no second free list exists.
     fn nospace_room(
         &mut self,
         need: u64,
         mut op: impl FnMut(&mut Self) -> Result<(), FileSystemError>,
     ) -> Result<(), FileSystemError> {
+        let own = self.autocommit || (self.fresh_hold && !self.has_staged()); // UNAFSWRITE2 (B861)
         let mut r = op(self);
         let mut tries = 0;
-        while matches!(r, Err(FileSystemError::NoSpace)) && self.versioning && self.autocommit && tries < crate::RING_MAX {
+        while matches!(r, Err(FileSystemError::NoSpace)) && self.versioning && own && tries < crate::RING_MAX {
             self.txn_unwind();
             let room = self.version_ledger().map(|l| l.kept()).unwrap_or(0);
             if room == 0 || self.free_blocks().saturating_add(room) < need {
@@ -3274,6 +3356,7 @@ impl<D: BlockDevice> UnaFS<D> {
         // UNAFSWRITE (B825): a staged commit's RAM is gone — its flip answers `Lost`.
         self.in_flight = false;
         self.fresh_held.clear(); // UNAFSWRITE2 (B844): unreferenced by the reloaded tree — never written
+        self.fresh_nodes = 0; // UNAFSWRITE2 (B861)
         self.unwinds = self.unwinds.wrapping_add(1);
     }
 
@@ -3854,7 +3937,7 @@ impl<D: BlockDevice> UnaFS<D> {
         let mut ord = Btree::open(rec.ord_root, LexCmp);
         let mut entries = rec.entries;
         let written = {
-            let mut store = DeviceStore::new(&mut self.device, &mut self.refmap);
+            let mut store = self.node_store(); // UNAFSWRITE2 (B861)
             for f in removes {
                 // NAMEINDEX (B432): a name fact lives in the ORDERED tree only — `entries` stays the attribute count.
                 if !nameindex::is_name_fact(f) && eq.remove(&mut store, &f.eq_key())?.is_some() {
@@ -3909,7 +3992,7 @@ impl<D: BlockDevice> UnaFS<D> {
         )?;
         let rec = CatalogRecord::from_bytes(&data, block_count)
             .ok_or(FileSystemError::CorruptVolume("catalog record invalid"))?;
-        let mut store = ReadStore { device };
+        let mut store = ReadStore { device, held };
         let mut out = Btree::open(rec.eq_root, LexCmp).reachable_blocks(&mut store)?;
         out.extend(Btree::open(rec.ord_root, LexCmp).reachable_blocks(&mut store)?);
         for &b in &out {
@@ -3938,7 +4021,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 ids.extend(entries.iter().map(|e| e.inode_id));
             }
             Some(CandidateSource::Tree(rec)) => {
-                let mut store = ReadStore { device: &mut self.device };
+                let mut store = ReadStore { device: &mut self.device, held: &self.fresh_held };
                 for root in [rec.eq_root, rec.ord_root] {
                     for (k, _) in Btree::open(root, LexCmp).range(&mut store, None, None, false)? {
                         if let Some(id) = crate::index::inode_of_key(&k) {
@@ -3971,7 +4054,7 @@ impl<D: BlockDevice> UnaFS<D> {
             Some(CandidateSource::Tree(rec)) => {
                 let mut doomed: [Vec<Vec<u8>>; 2] = [Vec::new(), Vec::new()];
                 {
-                    let mut store = ReadStore { device: &mut self.device };
+                    let mut store = ReadStore { device: &mut self.device, held: &self.fresh_held };
                     for (i, root) in [rec.eq_root, rec.ord_root].into_iter().enumerate() {
                         for (k, _) in Btree::open(root, LexCmp).range(&mut store, None, None, false)? {
                             if crate::index::inode_of_key(&k).is_some_and(|id| dead.contains(&id)) {
@@ -3987,7 +4070,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 let mut eq = Btree::open(rec.eq_root, LexCmp);
                 let mut ord = Btree::open(rec.ord_root, LexCmp);
                 let written = {
-                    let mut store = DeviceStore::new(&mut self.device, &mut self.refmap);
+                    let mut store = self.node_store(); // UNAFSWRITE2 (B861)
                     for k in &doomed[0] {
                         eq.remove(&mut store, k)?;
                     }
@@ -4043,7 +4126,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 }
             }
             CandidateSource::Tree(rec) => {
-                let mut store = ReadStore { device: &mut self.device };
+                let mut store = ReadStore { device: &mut self.device, held: &self.fresh_held };
                 let ranges: Vec<(u64, Vec<u8>, Vec<u8>)> = match &p.op {
                     QueryOp::Eq => {
                         let (lo, hi) = crate::index::eq_range(kh, Some(hash_value(&p.value)));

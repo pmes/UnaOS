@@ -201,7 +201,7 @@ impl<D: BlockDevice> UnaFS<D> {
         let Some(k) = self.mark_fact().ord_key() else {
             return Ok(false);
         };
-        let mut store = ReadStore { device: &mut self.device };
+        let mut store = ReadStore { device: &mut self.device, held: &self.fresh_held };
         Ok(Btree::open(rec.ord_root, LexCmp).contains(&mut store, &k)?)
     }
 
@@ -272,7 +272,7 @@ impl<D: BlockDevice> UnaFS<D> {
         ord_lo.push(TAG_STRING);
         let mut ord_hi = kh.to_be_bytes().to_vec();
         ord_hi.push(TAG_STRING + 1);
-        let mut store = ReadStore { device: &mut self.device };
+        let mut store = ReadStore { device: &mut self.device, held: &self.fresh_held };
         let ord: Vec<Vec<u8>> = Btree::open(rec.ord_root, LexCmp)
             .range(&mut store, Some(&ord_lo), Some(&ord_hi), false)?
             .into_iter()
@@ -341,7 +341,7 @@ impl<D: BlockDevice> UnaFS<D> {
         let rec = self.catalog_record()?.ok_or(FileSystemError::CorruptVolume("catalog record invalid"))?;
         let mut ordt = Btree::open(rec.ord_root, LexCmp);
         let written = {
-            let mut store = DeviceStore::new(&mut self.device, &mut self.refmap);
+            let mut store = self.node_store(); // UNAFSWRITE2 (B861)
             for k in &ord {
                 ordt.remove(&mut store, k)?;
             }
@@ -428,7 +428,7 @@ impl<D: BlockDevice> UnaFS<D> {
         let mut ids: Vec<u64> = Vec::new();
         let mut seen: BTreeSet<u64> = BTreeSet::new();
         {
-            let mut store = ReadStore { device: &mut self.device };
+            let mut store = ReadStore { device: &mut self.device, held: &self.fresh_held };
             let t = Btree::open(rec.ord_root, LexCmp);
             let mut c = t.cursor_seek(&mut store, &lo)?;
             while let Some((k, _)) = c.current() {

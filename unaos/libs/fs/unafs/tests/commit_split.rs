@@ -28,13 +28,20 @@
 //!   inside the op, a freed one never landing over a re-allocation), a failed write phase commits them whole, and a cut
 //!   before the write leaves the old tree.
 //!
-//! Every case ends with a remount and a clean fsck.
+//! * UNAFSWRITE2 second half (rmbp-ledger B861): with `hold_fresh` on, the btree node store's writes (catalog, name
+//!   index, attribute index) join the held set too, so an op writes NOTHING to the medium before the stage; `write` and
+//!   `truncate` stage like the rest; a full versioned volume spends its oldest version inside a split write (the drop
+//!   commits whole, the overwrite is staged); a cut before the flip leaves the old tree in every case.
+//!
+//! Every case ends with a remount and a clean fsck. The clock is pinned (inode stamps are wall seconds: two twin
+//! volumes built across a second boundary would differ in bytes).
 
 use unafs::fs::FlipOutcome;
 use unafs::inode::AttributeValue;
 use unafs::{BLOCK_SIZE, BlockDevice, MemDevice, UnaFS};
 
 fn fresh_fs(block_count: u64) -> UnaFS<MemDevice> {
+    unafs::clock::set_clock_hook(|| 1_790_000_000);
     let mut device = MemDevice::new();
     let empty_block = vec![0u8; BLOCK_SIZE as usize];
     device.write_block(block_count - 1, &empty_block).expect("size the disk");
@@ -263,8 +270,8 @@ fn held_fresh_blocks_land_the_bytes_of_one_commit() {
     b.hold_fresh(false);
     assert!(b.fresh_held() > 0);
     let s = b.stage().unwrap().expect("staged");
-    assert_eq!(s.fresh_blocks(), b.fresh_held());
-    assert!(s.fresh_blocks() > 0 && s.blocks() > s.fresh_blocks());
+    assert_eq!(s.fresh_blocks() + s.node_blocks(), b.fresh_held()); // UNAFSWRITE2 (B861): the nodes are held too
+    assert!(s.fresh_blocks() > 0 && s.node_blocks() > 0 && s.blocks() > s.fresh_blocks() + s.node_blocks());
     // None of the held blocks is on the medium before the write phase.
     let after_op = b.device.as_bytes();
     let changed = (0..4000u64)
@@ -280,8 +287,8 @@ fn held_fresh_blocks_land_the_bytes_of_one_commit() {
     assert_eq!(a.root_generation(), b.root_generation());
     assert_eq!(a.free_blocks(), b.free_blocks());
     assert!(a.device.as_bytes() == b.device.as_bytes(), "held + staged wrote different bytes than one commit");
-    // Under the op only the btree store's own node writes reach the medium (UNAFSWRITE2's second half).
-    assert!(changed < s.blocks(), "the op's write_fresh blocks reached the medium under the op: {changed}");
+    // Under the op NOTHING reaches the medium (UNAFSWRITE2's second half, B861: the node writes are held too).
+    assert_eq!(changed, 0, "the op wrote to the medium under the hold: {changed}");
 
     let mut m = remount_clean(b.device.clone());
     held_check(&mut m, ib);
@@ -319,4 +326,204 @@ fn a_cut_before_the_write_leaves_nothing_held_on_disk() {
     assert_eq!(m.free_blocks(), free);
     assert_eq!(attr(&mut m, id, "color"), None);
     assert!(m.resolve_path("/renamed.txt").is_err());
+}
+
+// ---- UNAFSWRITE2 second half (rmbp-ledger B861): the btree node store's writes, write and truncate, all staged ----
+
+/// Blocks whose bytes differ between two images of the medium.
+fn changed_blocks(before: &[u8], after: &[u8]) -> usize {
+    let n = before.len().max(after.len()) as u64 / BLOCK_SIZE;
+    (0..n)
+        .filter(|blk| {
+            let r = (*blk * BLOCK_SIZE) as usize..((*blk + 1) * BLOCK_SIZE) as usize;
+            before.get(r.clone()) != after.get(r)
+        })
+        .count()
+}
+
+/// Run `op` on `b` the way the kernel's HOLD 1 does (autocommit off, `hold_fresh` on): the medium must not move under
+/// the op (no write_fresh block, no btree node, no spill). Returns the stage.
+fn held_op(b: &mut UnaFS<MemDevice>, op: impl FnOnce(&mut UnaFS<MemDevice>)) -> unafs::fs::StagedCommit {
+    b.hold_fresh(true);
+    let before = b.device.as_bytes().to_vec();
+    let d0 = b.commit_stats().held_direct;
+    op(b);
+    b.hold_fresh(false);
+    assert_eq!(changed_blocks(&before, b.device.as_bytes()), 0, "the op wrote to the medium under the hold");
+    assert_eq!(b.commit_stats().held_direct, d0, "nothing spilled past FRESH_HOLD_MAX");
+    b.stage().unwrap().expect("staged")
+}
+
+/// The twin `a` committed whole and `b` staged: same generation, free count and bytes; `b` remounts clean.
+fn land_twin(a: &mut UnaFS<MemDevice>, b: &mut UnaFS<MemDevice>, s: unafs::fs::StagedCommit) -> UnaFS<MemDevice> {
+    a.commit().unwrap();
+    s.write_staged(&mut b.device).unwrap();
+    assert_eq!(b.flip(&s).unwrap(), FlipOutcome::Landed);
+    assert_eq!(b.fresh_held(), 0);
+    assert_eq!(a.root_generation(), b.root_generation());
+    assert_eq!(a.free_blocks(), b.free_blocks());
+    assert!(a.device.as_bytes() == b.device.as_bytes(), "the staged commit wrote different bytes than one commit");
+    remount_clean(b.device.clone())
+}
+
+fn node_op(fs: &mut UnaFS<MemDevice>, id: u64) {
+    let root = fs.superblock.root_inode;
+    let n = fs.create_file(root, "node.txt".into()).unwrap();
+    fs.set_attribute(n, "kind".into(), AttributeValue::String("node".into())).unwrap();
+    fs.set_attribute(id, "rank".into(), AttributeValue::Int(4)).unwrap();
+    fs.rename(root, "node.txt", root, "moved.txt").unwrap();
+    // The index answers from the HELD nodes inside the transaction (the read overlay).
+    assert_eq!(fs.query("kind == \"node\"").unwrap().len(), 1);
+    assert!(fs.find_names("moved", 8).unwrap().hits.iter().any(|h| h.path == "/moved.txt"));
+}
+
+fn node_check(m: &mut UnaFS<MemDevice>, id: u64) {
+    let n = m.resolve_path("/moved.txt").expect("moved");
+    assert_eq!(attr(m, n, "kind"), Some(AttributeValue::String("node".into())));
+    assert_eq!(attr(m, id, "rank"), Some(AttributeValue::Int(4)));
+    assert_eq!(m.query("kind == \"node\"").unwrap().len(), 1);
+    assert!(m.find_names("moved", 8).unwrap().hits.iter().any(|h| h.path == "/moved.txt"));
+}
+
+#[test]
+fn the_node_store_writes_nothing_under_the_op() {
+    let (mut a, mut b) = (fresh_fs(4000), fresh_fs(4000));
+    let (ia, ib) = (baseline(&mut a), baseline(&mut b));
+    node_op(&mut a, ia);
+    let s = held_op(&mut b, |fs| node_op(fs, ib));
+    assert!(s.node_blocks() > 0, "the index nodes travel in the stage");
+    assert!(s.fresh_blocks() > 0);
+    let mut m = land_twin(&mut a, &mut b, s);
+    node_check(&mut m, ib);
+
+    // A cut after the write phase, before the flip: the old tree, its index unchanged.
+    let mut fs = fresh_fs(4000);
+    let id = baseline(&mut fs);
+    let (g0, free) = (fs.root_generation(), fs.free_blocks());
+    let s = held_op(&mut fs, |fs| node_op(fs, id));
+    s.write_staged(&mut fs.device).unwrap();
+    let device = fs.device.clone();
+    drop(fs);
+    let mut m = remount_clean(device);
+    assert_eq!((m.root_generation(), m.free_blocks()), (g0, free));
+    assert!(m.resolve_path("/moved.txt").is_err());
+    assert_eq!(m.query("kind == \"node\"").unwrap().len(), 0);
+    assert_eq!(attr(&mut m, id, "rank"), None);
+}
+
+const BLK: usize = BLOCK_SIZE as usize;
+
+fn bytes(tag: u8, len: usize) -> Vec<u8> {
+    (0..len).map(|i| tag.wrapping_mul(31).wrapping_add(i as u8)).collect()
+}
+
+#[test]
+fn a_write_lands_staged() {
+    let (mut a, mut b) = (fresh_fs(4000), fresh_fs(4000));
+    let (ia, ib) = (baseline(&mut a), baseline(&mut b));
+    a.set_versioning(true);
+    b.set_versioning(true);
+    let op = |fs: &mut UnaFS<MemDevice>, id: u64| {
+        fs.write_data(id, 0, &bytes(5, 3 * BLK + 100)).unwrap(); // an overwrite: keeps a version
+        fs.write_data(id, (3 * BLK + 100) as u64, b"tail").unwrap(); // an append
+        assert_eq!(fs.read_data(id, (3 * BLK + 100) as u64, 4).unwrap(), b"tail"); // read back from the held set
+    };
+    op(&mut a, ia);
+    let s = held_op(&mut b, |fs| op(fs, ib));
+    assert!(s.fresh_blocks() >= 4);
+    let mut m = land_twin(&mut a, &mut b, s);
+    let mut want = bytes(5, 3 * BLK + 100);
+    want.extend_from_slice(b"tail");
+    assert_eq!(m.read_data(ib, 0, want.len() as u64).unwrap(), want);
+    assert_eq!(m.versions(ib).unwrap().len(), 1);
+
+    // A cut before the flip: the old bytes.
+    let mut fs = fresh_fs(4000);
+    let id = baseline(&mut fs);
+    fs.set_versioning(true);
+    let free = fs.free_blocks();
+    let s = held_op(&mut fs, |fs| op(fs, id));
+    s.write_staged(&mut fs.device).unwrap();
+    let device = fs.device.clone();
+    drop(fs);
+    let mut m = remount_clean(device);
+    assert_eq!(m.free_blocks(), free);
+    assert_eq!(m.read_data(id, 0, 9).unwrap(), b"committed");
+    assert_eq!(m.read_inode(id).unwrap().size, 9);
+}
+
+#[test]
+fn a_truncate_lands_staged() {
+    let (mut a, mut b) = (fresh_fs(4000), fresh_fs(4000));
+    let (ia, ib) = (baseline(&mut a), baseline(&mut b));
+    for (fs, id) in [(&mut a, ia), (&mut b, ib)] {
+        fs.set_versioning(true);
+        fs.write_data(id, 0, &bytes(6, 3 * BLK)).unwrap();
+        fs.commit().unwrap();
+    }
+    let op = |fs: &mut UnaFS<MemDevice>, id: u64| {
+        fs.truncate_data(id, 5000).unwrap(); // a shrink to a partial tail block (CoW'd, zeroed past the end)
+        fs.truncate_data(id, 9000).unwrap(); // a grow: zeros
+    };
+    op(&mut a, ia);
+    let s = held_op(&mut b, |fs| op(fs, ib));
+    let mut m = land_twin(&mut a, &mut b, s);
+    let mut want = bytes(6, 5000);
+    want.resize(9000, 0);
+    assert_eq!(m.read_inode(ib).unwrap().size, 9000);
+    assert_eq!(m.read_data(ib, 0, 9000).unwrap(), want);
+
+    // A cut before the flip: the old three blocks.
+    let mut fs = fresh_fs(4000);
+    let id = baseline(&mut fs);
+    fs.set_versioning(true);
+    fs.write_data(id, 0, &bytes(6, 3 * BLK)).unwrap();
+    fs.commit().unwrap();
+    let s = held_op(&mut fs, |fs| op(fs, id));
+    s.write_staged(&mut fs.device).unwrap();
+    let device = fs.device.clone();
+    drop(fs);
+    let mut m = remount_clean(device);
+    assert_eq!(m.read_data(id, 0, 3 * BLK as u64).unwrap(), bytes(6, 3 * BLK));
+}
+
+#[test]
+fn a_full_volume_spends_a_version_inside_a_split_write() {
+    // `nospace_room`'s drop runs in a split op whose transaction is its own attempt: the drop commits WHOLE (its freed
+    // blocks become allocatable only at that flip — K8a), the retried overwrite is staged.
+    let mut fs = UnaFS::format(MemDevice::with_blocks(512), 0).expect("format");
+    fs.set_versioning(true);
+    let root = fs.superblock.root_inode;
+    let doc = fs.create_file(root, "doc.bin".into()).unwrap();
+    fs.write_data(doc, 0, &bytes(1, 30 * BLK)).unwrap();
+    fs.write_data(doc, 0, &bytes(2, 30 * BLK)).unwrap(); // one version: 30 blocks kept
+    fs.set_versioning(false);
+    let fill = fs.create_file(root, "fill.bin".into()).unwrap();
+    let mut at = 0u64;
+    while fs.free_blocks() > 12 {
+        fs.write_data(fill, at, &bytes(9, BLK)).unwrap();
+        at += BLOCK_SIZE;
+    }
+    fs.set_versioning(true);
+    assert!(fs.free_blocks() < 20);
+    let g0 = fs.root_generation();
+    fs.set_autocommit(false);
+    fs.hold_fresh(true);
+    fs.write_data(doc, 0, &bytes(3, 20 * BLK)).expect("the oldest version gives its room to the split overwrite");
+    fs.hold_fresh(false);
+    assert_eq!(fs.root_generation(), g0 + 1, "the drop landed in its own (whole) commit");
+    let s = fs.stage().unwrap().expect("the overwrite is staged");
+    assert!(s.fresh_blocks() >= 20);
+    s.write_staged(&mut fs.device).unwrap();
+    // INVARIANT (nospace_room's doc): no block the overwrite freed was re-allocated before the flip — a cut here
+    // mounts the dropped-version tree with the old contents whole.
+    let mut cut = remount_clean(fs.device.clone());
+    assert_eq!(cut.read_data(doc, 0, 30 * BLK as u64).unwrap(), bytes(2, 30 * BLK));
+    assert_eq!(cut.versions(doc).unwrap().len(), 0, "the drop landed");
+    assert_eq!(fs.flip(&s).unwrap(), FlipOutcome::Landed);
+    let mut want = bytes(3, 20 * BLK);
+    want.extend_from_slice(&bytes(2, 30 * BLK)[20 * BLK..]);
+    let mut m = remount_clean(fs.device.clone());
+    assert_eq!(m.read_data(doc, 0, 30 * BLK as u64).unwrap(), want);
+    assert_eq!(m.versions(doc).unwrap().len(), 1, "the overwrite kept its own version");
 }

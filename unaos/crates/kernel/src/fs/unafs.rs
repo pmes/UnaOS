@@ -3982,10 +3982,10 @@ pub fn record_attrs_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, id: u64, ino:
 // may be preempted on this very core and cannot run until it unmasks. Only an unmasked caller waits (bounded).
 // UNAFSWRITE2 first half (B844; storage.md BP-storage-8): HOLD 1 runs the op under `FreshHold` (autocommit off +
 // the crate's `hold_fresh`): the op's own write_fresh blocks (inode, extents, data) are held in RAM and travel in the
-// `StagedCommit` (`fresh_blocks`), written with MOUNT released like the map blocks. The btree store's node writes
-// (catalog, name index, attribute index) still run under MOUNT. `write`/`truncate` stay WHOLE (plain `with_unafs`):
-// `nospace_room`'s oldest-version drop runs only with autocommit ON, and a split op runs with it off — a full volume
-// would refuse the write instead of spending a version.
+// `StagedCommit` (`fresh_blocks`), written with MOUNT released like the map blocks. UNAFSWRITE2 second half (B861): the
+// btree store's node writes (catalog, name index, attribute index) are held too (`node_blocks`): an op writes nothing
+// under MOUNT. `write`/`truncate` split too (vfs.rs): `nospace_room`'s version drop runs in a split op that is its own
+// attempt, the drop's commit whole (a full versioned volume only; DROPSPLIT owed), the retried write staged.
 // =================================================================================================
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub use splitwrite::with_unafs_write;
@@ -4015,6 +4015,8 @@ pub mod splitwrite {
     static WRITE_MS_MAX: AtomicU64 = AtomicU64::new(0);
     /// UNAFSWRITE2 (B844): the op's own write_fresh blocks carried by flipped split commits (`fresh_blocks`).
     static DATA_STAGED: AtomicU64 = AtomicU64::new(0);
+    /// UNAFSWRITE2 second half (B861): the op's btree node blocks carried by flipped split commits (`node_blocks`).
+    static NODE_STAGED: AtomicU64 = AtomicU64::new(0);
 
     /// The bound on any wait for the ticket: RENDERWEDGE's `MOUNT_BOUND_MS` (`video/renderwedge.rs`, 1500 ms — not
     /// re-exported by that module, so its value is restated here), past which the caller answers `Busy`.
@@ -4240,6 +4242,7 @@ pub mod splitwrite {
                 Flip::Ok => {
                     SPLIT.fetch_add(1, Ordering::Relaxed);
                     DATA_STAGED.fetch_add(s.fresh_blocks() as u64, Ordering::Relaxed);
+                    NODE_STAGED.fetch_add(s.node_blocks() as u64, Ordering::Relaxed); // UNAFSWRITE2 (B861)
                     ("ok", Some(Ok(())))
                 }
                 Flip::Restaged(res) => {
@@ -4290,8 +4293,18 @@ pub mod splitwrite {
         )
     }
 
+    /// UNAFSWRITE2 second half (B861): `op` through `with_unafs_write` landed as exactly ONE split commit (none whole).
+    fn staged_once(mut op: impl FnMut(&mut KernelUnaFS) -> bool) -> bool {
+        let (s0, w0, _, _, _, _) = census();
+        let r = with_unafs_write(|fs| op(fs));
+        let (s1, w1, _, _, _, _) = census();
+        matches!(r, Ok(true)) && s1.wrapping_sub(s0) == 1 && w1 == w0
+    }
+
     /// `tests unafslock` write leg (:3266 fold): 8 attribute commits on a scratch file under `/var`, each through
-    /// `with_unafs_write`. ok = 8 commits, all split, none under MOUNT, none lost, every hold <= 20 ms.
+    /// `with_unafs_write`. ok = 8 commits, all split, none under MOUNT, none lost, every hold <= 20 ms. UNAFSWRITE2 second
+    /// half (B861): then a 3-block `write` and a `truncate` to 5000, each ONE split commit read back; ok also needs a node
+    /// block per attribute commit in the stages and `under_mount_writes` (whole commits + held spills) 0.
     pub fn write_leg() {
         const LEAF: &str = "unafslock.tmp";
         const PATH: &str = "/var/unafslock.tmp";
@@ -4323,6 +4336,8 @@ pub mod splitwrite {
         };
         let (s0, w0, r0, l0, _, _) = census();
         let d0 = DATA_STAGED.load(Ordering::Relaxed);
+        let n0 = NODE_STAGED.load(Ordering::Relaxed); // UNAFSWRITE2 (B861)
+        let hd0 = with_unafs(|fs| fs.commit_stats().held_direct).unwrap_or(0);
         HELD_MAX_US.store(0, Ordering::Relaxed);
         WRITE_MS_MAX.store(0, Ordering::Relaxed);
         let mut commits = 0u64;
@@ -4332,13 +4347,25 @@ pub mod splitwrite {
                 commits += 1;
             }
         }
+        // UNAFSWRITE2 second half (B861): `write` and `truncate` through the same staged path, read back.
+        const WBYTES: usize = 3 * 4096;
+        let wbuf = alloc::vec![0x5au8; WBYTES]; // heap, not the 16 KiB task stack
+        let write_ok = staged_once(|fs| fs.write_data(id, 0, &wbuf).is_ok())
+            && with_unafs(|fs| fs.read_data(id, 0, WBYTES as u64)).ok().and_then(|r| r.ok()).is_some_and(|d| d == wbuf);
+        let trunc_ok = staged_once(|fs| fs.truncate_data(id, 5000).is_ok())
+            && with_unafs(|fs| (fs.read_inode(id).map(|i| i.size), fs.read_data(id, 0, 5000)))
+                .ok()
+                .is_some_and(|(size, d)| matches!(size, Ok(5000)) && d.is_ok_and(|d| d[..] == wbuf[..5000]));
         let (s1, w1, r1, l1, held, wms) = census();
         let data = DATA_STAGED.load(Ordering::Relaxed).wrapping_sub(d0); // UNAFSWRITE2 (B844): each attribute commit's inode travels in its stage
+        let node = NODE_STAGED.load(Ordering::Relaxed).wrapping_sub(n0); // UNAFSWRITE2 (B861): each attribute commit's index path travels too
+        let spilled = with_unafs(|fs| fs.commit_stats().held_direct).unwrap_or(0).wrapping_sub(hd0);
         let _ = with_unafs_write(|fs| fs.resolve_path("/var").and_then(|var| fs.unlink(var, LEAF)));
         let (split, whole, restaged, lost) = (s1.wrapping_sub(s0), w1.wrapping_sub(w0), r1.wrapping_sub(r0), l1.wrapping_sub(l0));
-        let ok = commits == N && split >= N && whole == 0 && lost == 0 && held <= 20_000 && data >= N;
+        let under = whole.wrapping_add(spilled); // UNAFSWRITE2 (B861): card writes under MOUNT — whole commits + held spills
+        let ok = commits == N && split >= N && whole == 0 && lost == 0 && held <= 20_000 && data >= N && node >= N && under == 0 && write_ok && trunc_ok;
         serial_println!(
-            "[unafslock] write commits={} split={} write_held_us={} write_ms_max={} io_under_lock={} restaged={} lost={} data_blocks_staged={} -> {}",
+            "[unafslock] write commits={} split={} write_held_us={} write_ms_max={} io_under_lock={} restaged={} lost={} data_blocks_staged={} node_blocks_staged={} under_mount_writes={} write_staged={} truncate_staged={} -> {}",
             commits,
             split,
             held,
@@ -4347,6 +4374,10 @@ pub mod splitwrite {
             restaged,
             lost,
             data,
+            node,
+            under,
+            if write_ok { "ok" } else { "FAIL" },
+            if trunc_ok { "ok" } else { "FAIL" },
             if ok { "ok" } else { "FAIL" }
         );
     }

@@ -1894,7 +1894,7 @@ impl VfsBackend for NativeBackend {
 
     fn write(&self, rel: &str, offset: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_write(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, id, principal)?;
             let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
@@ -1910,7 +1910,7 @@ impl VfsBackend for NativeBackend {
 
     fn truncate(&self, rel: &str, size: u64, principal: &str) -> Result<(), VfsError> {
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_write(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, id, principal)?;
             let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;

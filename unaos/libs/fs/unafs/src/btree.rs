@@ -313,6 +313,17 @@ pub struct DeviceStore<'a, D: BlockDevice> {
     pub released: u64,
     /// Node blocks written through this store.
     pub written: u64,
+    /// UNAFSWRITE2 second half (rmbp-ledger B861): the mount's held set (`UnaFS::node_store`); `None` = the device only.
+    pub(crate) held: Option<HeldSet<'a>>,
+}
+
+/// UNAFSWRITE2 second half (rmbp-ledger B861): the mount's held set lent to its node store — `blocks` is `UnaFS`'s
+/// `fresh_held` (the ONE staging set), `hold` its `hold_fresh` switch, `nodes` its node count, `direct` the spill count.
+pub(crate) struct HeldSet<'a> {
+    pub(crate) blocks: &'a mut Vec<(u64, Vec<u8>)>,
+    pub(crate) hold: bool,
+    pub(crate) nodes: &'a mut u64,
+    pub(crate) direct: &'a mut u64,
 }
 
 impl<'a, D: BlockDevice> DeviceStore<'a, D> {
@@ -324,7 +335,14 @@ impl<'a, D: BlockDevice> DeviceStore<'a, D> {
             allocated: 0,
             released: 0,
             written: 0,
+            held: None,
         }
+    }
+
+    /// UNAFSWRITE2 second half (B861): pair them with the mount's held set — reads look there first, writes join it while
+    /// `held.hold` is on, releases drop a held copy (the crate's `read_held` / `hold_block` / `release_held`).
+    pub(crate) fn held(device: &'a mut D, refmap: &'a mut RefMap, held: HeldSet<'a>) -> Self {
+        Self { held: Some(held), ..Self::new(device, refmap) }
     }
 }
 
@@ -335,15 +353,34 @@ impl<D: BlockDevice> NodeStore for DeviceStore<'_, D> {
         Ok(b)
     }
     fn release(&mut self, block: u64) {
-        self.refmap.decref(self.device, block);
+        match self.held.as_mut() {
+            // UNAFSWRITE2 (B861): the shared drop — a node block whose count reaches 0 loses its held copy.
+            Some(h) => {
+                if crate::fs::release_held(&mut *self.device, &mut *self.refmap, &mut *h.blocks, block) {
+                    *h.nodes = h.nodes.saturating_sub(1);
+                }
+            }
+            None => self.refmap.decref(self.device, block),
+        }
         self.released = self.released.saturating_add(1);
     }
     fn read(&mut self, block: u64, buf: &mut [u8]) -> Result<(), BtreeError> {
-        self.device.read_block(block, buf)?;
+        match self.held.as_ref() {
+            Some(h) => crate::fs::read_held(&mut *self.device, h.blocks.as_slice(), block, buf)?, // UNAFSWRITE2 (B861)
+            None => self.device.read_block(block, buf)?,
+        }
         Ok(())
     }
     fn write(&mut self, block: u64, buf: &[u8]) -> Result<(), BtreeError> {
-        self.device.write_block(block, buf)?;
+        match self.held.as_mut() {
+            // UNAFSWRITE2 (B861): the ONE hold `UnaFS::write_fresh` uses — the node travels in the stage.
+            Some(h) if h.hold => match crate::fs::hold_block(&mut *self.device, &mut *h.blocks, block, buf)? {
+                crate::fs::Held::New => *h.nodes = h.nodes.saturating_add(1),
+                crate::fs::Held::Spilled => *h.direct = h.direct.saturating_add(1),
+                crate::fs::Held::Replaced => {}
+            },
+            _ => self.device.write_block(block, buf)?,
+        }
         self.written = self.written.saturating_add(1);
         Ok(())
     }

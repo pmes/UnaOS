@@ -363,6 +363,8 @@ fn f64_to_i64_sat(f: f64) -> i64 {
 /// allocate or write.
 pub struct ReadStore<'a, D: BlockDevice> {
     pub device: &'a mut D,
+    /// UNAFSWRITE2 second half (rmbp-ledger B861): the live mount's held blocks, read first (`&[]` for a snapshot).
+    pub held: &'a [(u64, Vec<u8>)],
 }
 
 impl<D: BlockDevice> NodeStore for ReadStore<'_, D> {
@@ -371,7 +373,7 @@ impl<D: BlockDevice> NodeStore for ReadStore<'_, D> {
     }
     fn release(&mut self, _block: u64) {}
     fn read(&mut self, block: u64, buf: &mut [u8]) -> Result<(), BtreeError> {
-        self.device.read_block(block, buf)?;
+        crate::fs::read_held(self.device, self.held, block, buf)?; // UNAFSWRITE2 (B861)
         Ok(())
     }
     fn write(&mut self, _block: u64, _buf: &[u8]) -> Result<(), BtreeError> {
