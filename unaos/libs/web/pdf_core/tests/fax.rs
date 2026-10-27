@@ -13,6 +13,7 @@ mod common;
 
 use common::PdfBuilder;
 use pdf_core::filters::ccitt::{self, Params};
+use pdf_core::filters::jbig2::huffman::{self, Std};
 use pdf_core::filters::jbig2::{self, Bitmap};
 use pdf_core::filters::mq::{MqDecoder, QE};
 use pdf_core::render::{Rendered, TextLog};
@@ -840,6 +841,492 @@ fn jbig2_striped_page_grows() {
     assert!(got.data[256..].iter().all(|&p| p == 0));
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// JBIG2HUFF (LEDGER SR336): Huffman tables and coding, refinement, halftone, unknown-length generic regions
+
+/// A table line, test-side: (prefix length, range length, range low, kind 0 normal / 1 lower / 2 upper / 3 OOB); a lower
+/// line's low is its top value.
+type HLine = (u8, u8, i64, u8);
+
+fn std_lines(t: &Std) -> Vec<HLine> {
+    let mut v: Vec<HLine> = t.lines.iter().map(|&(p, r, l)| (p, r, l as i64, 0)).collect();
+    if let Some((p, l)) = t.lower {
+        v.push((p, 32, l as i64, 1));
+    }
+    if let Some((p, l)) = t.upper {
+        v.push((p, 32, l as i64, 2));
+    }
+    if let Some(p) = t.oob {
+        v.push((p, 0, 0, 3));
+    }
+    v
+}
+
+/// T.88 B.3 written test-side: codes by prefix length, in line order within a length (length 0: no code).
+fn b3(lens: &[u8]) -> Vec<(u32, u8)> {
+    let max = lens.iter().copied().max().unwrap_or(0);
+    let mut out = vec![(0u32, 0u8); lens.len()];
+    let (mut first, mut count) = (0u32, 0u32);
+    for len in 1..=max {
+        first = (first + count) << 1;
+        count = 0;
+        for (i, &l) in lens.iter().enumerate() {
+            if l == len {
+                out[i] = (first + count, len);
+                count += 1;
+            }
+        }
+    }
+    out
+}
+
+fn enc_bits(w: &mut BitW, v: u64, n: u32) {
+    let mut k = n;
+    while k > 0 {
+        let c = k.min(16);
+        w.put((((v >> (k - c)) & ((1u64 << c) - 1)) as u16, c as u8));
+        k -= c;
+    }
+}
+
+/// B.4 in reverse: the line covering `v` (None = OOB), its code, then its range offset.
+fn enc_line(w: &mut BitW, lines: &[HLine], v: Option<i64>) {
+    let codes = b3(&lines.iter().map(|l| l.0).collect::<Vec<_>>());
+    let i = lines
+        .iter()
+        .position(|&(p, r, low, k)| {
+            p > 0
+                && match (k, v) {
+                    (3, None) => true,
+                    (0, Some(v)) => v >= low && v < low + (1i64 << r),
+                    (1, Some(v)) => v <= low,
+                    (2, Some(v)) => v >= low,
+                    _ => false,
+                }
+        })
+        .unwrap_or_else(|| panic!("{v:?} has no line"));
+    enc_bits(w, codes[i].0 as u64, codes[i].1 as u32);
+    let (_, r, low, k) = lines[i];
+    match (k, v) {
+        (0, Some(v)) => enc_bits(w, (v - low) as u64, r as u32),
+        (1, Some(v)) => enc_bits(w, (low - v) as u64, 32),
+        (2, Some(v)) => enc_bits(w, (v - low) as u64, 32),
+        _ => {}
+    }
+}
+
+fn enc_std(w: &mut BitW, t: &Std, v: Option<i64>) {
+    enc_line(w, &std_lines(t), v);
+}
+
+const STD_TABLES: [&Std; 15] = [
+    &huffman::B1,
+    &huffman::B2,
+    &huffman::B3,
+    &huffman::B4,
+    &huffman::B5,
+    &huffman::B6,
+    &huffman::B7,
+    &huffman::B8,
+    &huffman::B9,
+    &huffman::B10,
+    &huffman::B11,
+    &huffman::B12,
+    &huffman::B13,
+    &huffman::B14,
+    &huffman::B15,
+];
+
+#[test]
+fn jbig2_standard_tables_prefix_free() {
+    for (k, t) in STD_TABLES.iter().enumerate() {
+        let lines = std_lines(t);
+        let codes = b3(&lines.iter().map(|l| l.0).collect::<Vec<_>>());
+        assert_eq!(huffman::codes(t), codes, "B.{} codes", k + 1);
+        prefix_free_and_kraft(&codes.iter().map(|&(c, l)| (c as u16, l)).collect::<Vec<_>>());
+        let kraft: f64 = codes.iter().map(|&(_, l)| 1.0 / (1u64 << l) as f64).sum();
+        assert_eq!(kraft, 1.0, "B.{} is a complete code", k + 1);
+        let normal: Vec<&HLine> = lines.iter().filter(|l| l.3 == 0).collect();
+        for p in normal.windows(2) {
+            assert_eq!(p[0].2 + (1i64 << p[0].1), p[1].2, "B.{} ranges are contiguous", k + 1);
+        }
+    }
+}
+
+/// The SR331 symbols as a Huffman symbol dictionary (SDHUFF): DH through `dh` (B.4 or a custom table), DW B.2, BMSIZE
+/// and the export runs B.1; height class 3 (C) an uncompressed collective bitmap, class 7 (B then A) an MMR one.
+fn huff_symbol_dict_data(flags: u16, dh: &[HLine]) -> Vec<u8> {
+    let syms = symbols();
+    let mut d = flags.to_be_bytes().to_vec();
+    d.extend(3u32.to_be_bytes());
+    d.extend(3u32.to_be_bytes());
+    let mut w = BitW::new();
+    enc_line(&mut w, dh, Some(3));
+    enc_std(&mut w, &huffman::B2, Some(3));
+    enc_std(&mut w, &huffman::B2, None);
+    enc_std(&mut w, &huffman::B1, Some(0)); // BMSIZE 0: uncompressed rows
+    w.align();
+    for row in &syms[0] {
+        for &p in row {
+            w.put((p as u16, 1));
+        }
+        w.align();
+    }
+    enc_line(&mut w, dh, Some(4));
+    enc_std(&mut w, &huffman::B2, Some(4));
+    enc_std(&mut w, &huffman::B2, Some(1));
+    enc_std(&mut w, &huffman::B2, None);
+    let coll: Vec<Vec<bool>> = (0..7).map(|y| syms[1][y].iter().chain(&syms[2][y]).map(|&p| p == 1).collect()).collect();
+    let mmr = ccitt_encode(&coll, -1, false, false, false);
+    enc_std(&mut w, &huffman::B1, Some(mmr.len() as i64));
+    w.align();
+    for &b in &mmr {
+        w.put((b as u16, 8));
+    }
+    enc_std(&mut w, &huffman::B1, Some(0)); // no input symbols skipped
+    enc_std(&mut w, &huffman::B1, Some(3)); // all three new ones exported
+    d.extend(w.finish());
+    d
+}
+
+/// The SR331 32 x 16 text region with SBHUFF: FS B.6, DS B.8, DT B.11, and a run-coded symbol ID table
+/// (lengths C 2, B 2, A 1: A '0', C '10', B '11').
+fn huff_text_region_data() -> Vec<u8> {
+    let mut d = region(32, 16, 0, 0, 0);
+    d.extend((1 | TOPLEFT).to_be_bytes());
+    d.extend(0u16.to_be_bytes());
+    d.extend(3u32.to_be_bytes());
+    let mut w = BitW::new();
+    let rl: Vec<u8> = (0..35).map(|i| (i == 1 || i == 2) as u8).collect();
+    for &l in &rl {
+        w.put((l as u16, 4));
+    }
+    let run = b3(&rl);
+    for l in [2usize, 2, 1] {
+        w.put((run[l].0 as u16, run[l].1));
+    }
+    w.align();
+    let ids = b3(&[2, 2, 1]);
+    let id = |w: &mut BitW, s: usize| w.put((ids[s].0 as u16, ids[s].1));
+    enc_std(&mut w, &huffman::B11, Some(1)); // STRIPT = -1
+    enc_std(&mut w, &huffman::B11, Some(3)); // strip T = 2
+    enc_std(&mut w, &huffman::B6, Some(1)); // FIRSTS = 1
+    id(&mut w, 2); // A, 5 wide: CURS 1 -> 5
+    enc_std(&mut w, &huffman::B8, Some(3)); // CURS = 8
+    id(&mut w, 1); // B
+    enc_std(&mut w, &huffman::B8, None);
+    enc_std(&mut w, &huffman::B11, Some(7)); // strip T = 9
+    enc_std(&mut w, &huffman::B6, Some(19)); // FIRSTS = 20
+    id(&mut w, 0); // C
+    enc_std(&mut w, &huffman::B8, None);
+    d.extend(w.finish());
+    d
+}
+
+fn huff_text_stream() -> Vec<u8> {
+    let mut s = seg(0, 48, &[], &page_info(32, 16, 0));
+    s.extend(seg(1, 0, &[], &huff_symbol_dict_data(1, &std_lines(&huffman::B4))));
+    s.extend(seg(2, 6, &[1], &huff_text_region_data()));
+    s.extend(seg(3, 49, &[], &[]));
+    s
+}
+
+#[test]
+fn jbig2_huffman_symbol_dict_and_text_region() {
+    assert_eq!(jbig2::decode(&huff_text_stream(), None).unwrap(), text_expected());
+}
+
+#[test]
+fn jbig2_custom_table_segment() {
+    // B.2: HTOOB 0, HTPS 2, HTRS 2, HTLOW 1, HTHIGH 8; lines (1, 2) for 1-4 and (2, 2) for 5-8, lower and upper at 3.
+    let mut t = vec![(1 << 1) | (1 << 4)];
+    t.extend(1u32.to_be_bytes());
+    t.extend(8u32.to_be_bytes());
+    let mut w = BitW::new();
+    for (p, r) in [(1u16, 2u16), (2, 2)] {
+        w.put((p, 2));
+        w.put((r, 2));
+    }
+    w.put((3, 2));
+    w.put((3, 2));
+    t.extend(w.finish());
+    let custom: Vec<HLine> = vec![(1, 2, 1, 0), (2, 2, 5, 0), (3, 32, 0, 1), (3, 32, 8, 2)];
+    let mut s = seg(0, 48, &[], &page_info(32, 16, 0));
+    s.extend(seg(1, 53, &[], &t));
+    s.extend(seg(2, 0, &[1], &huff_symbol_dict_data(1 | 3 << 2, &custom))); // SDHUFFDH = the table segment
+    s.extend(seg(3, 6, &[2], &huff_text_region_data()));
+    assert_eq!(jbig2::decode(&s, None).unwrap(), text_expected());
+}
+
+/// The refinement context at (x, y), the reference pixel at (x - dx, y - dy), written from T.88 Figures 12-13.
+#[allow(clippy::too_many_arguments)]
+fn ref_context(bm: &[Vec<u8>], r: &[Vec<u8>], x: isize, y: isize, dx: isize, dy: isize, t: u8, at: &[(i8, i8); 2]) -> usize {
+    let p = |ox: isize, oy: isize| get(bm, x + ox, y + oy);
+    let q = |ox: isize, oy: isize| get(r, x - dx + ox, y - dy + oy);
+    let (a1, a2) = ((at[0].0 as isize, at[0].1 as isize), (at[1].0 as isize, at[1].1 as isize));
+    let bits: Vec<u32> = if t == 0 {
+        vec![p(-1, 0), p(1, -1), p(0, -1), p(a1.0, a1.1), q(1, 1), q(0, 1), q(-1, 1), q(1, 0), q(0, 0), q(-1, 0), q(1, -1), q(0, -1), q(a2.0, a2.1)]
+    } else {
+        vec![p(-1, 0), p(1, -1), p(0, -1), p(-1, -1), q(1, 1), q(0, 1), q(1, 0), q(0, 0), q(-1, 0), q(0, -1)]
+    };
+    bits.iter().enumerate().fold(0, |acc, (i, &b)| acc | (b as usize) << i)
+}
+
+/// 6.3.5.6 in reverse; with TPGRON a row is typical when every pixel whose 3 x 3 reference neighbourhood is uniform
+/// equals it. Returns the number of typical rows.
+#[allow(clippy::too_many_arguments)]
+fn enc_refine(enc: &mut MqEnc, cx: &mut [u8], bm: &[Vec<u8>], r: &[Vec<u8>], dx: isize, dy: isize, t: u8, tpgron: bool, at: &[(i8, i8); 2]) -> usize {
+    let sltp = if t == 0 { 0x100 } else { 0x080 };
+    let uniform = |x: isize, y: isize| -> Option<u8> {
+        let v = get(r, x - dx, y - dy);
+        (-1..=1).all(|oy| (-1..=1).all(|ox| get(r, x - dx + ox, y - dy + oy) == v)).then_some(v as u8)
+    };
+    let (mut ltp, mut typical) = (0u8, 0usize);
+    for y in 0..bm.len() {
+        if tpgron {
+            let typ = (0..bm[y].len()).all(|x| uniform(x as isize, y as isize).is_none_or(|v| v == bm[y][x])) as u8;
+            enc.encode(&mut cx[sltp], typ ^ ltp);
+            ltp = typ;
+            typical += typ as usize;
+        }
+        for x in 0..bm[y].len() {
+            if ltp == 1 && uniform(x as isize, y as isize).is_some() {
+                continue;
+            }
+            enc.encode(&mut cx[ref_context(bm, r, x as isize, y as isize, dx, dy, t, at)], bm[y][x]);
+        }
+    }
+    typical
+}
+
+const RAT: [(i8, i8); 2] = [(-1, -1), (-1, -1)];
+
+/// `pattern()` with three pixels flipped (rows 4, 10 and 15).
+fn refined_pattern() -> Vec<Vec<u8>> {
+    let mut p = pattern();
+    for (x, y) in [(14usize, 4usize), (0, 10), (9, 15)] {
+        p[y][x] ^= 1;
+    }
+    p
+}
+
+/// A 16 x 16 refinement region segment of `target` against `reference` (the AT pixels RAT for template 0).
+fn refine_segment(target: &[Vec<u8>], reference: &[Vec<u8>], t: u8, tpgron: bool, op: u8) -> (Vec<u8>, usize) {
+    let mut enc = MqEnc::new();
+    let mut cx = vec![0u8; 1 << 13];
+    let typical = enc_refine(&mut enc, &mut cx, target, reference, 0, 0, t, tpgron, &RAT);
+    let mut d = region(16, 16, 0, 0, op);
+    d.push(t | (tpgron as u8) << 1);
+    if t == 0 {
+        d.extend(RAT.iter().flat_map(|&(x, y)| [x as u8, y as u8]));
+    }
+    d.extend(enc.flush());
+    (d, typical)
+}
+
+#[test]
+fn jbig2_refinement_region() {
+    let (pat, want) = (pattern(), refined_pattern());
+    // Template 0 with AT and TPGRON, refining the intermediate generic region (type 36) it refers to.
+    let (r0, typical) = refine_segment(&want, &pat, 0, true, 0);
+    assert!(typical > 0 && typical < 16, "{typical} typical rows: both TPGRON branches");
+    let mut s = seg(0, 48, &[], &page_info(16, 16, 0));
+    s.extend(seg(1, 36, &[], &generic_segment(&pat, 0, false)));
+    s.extend(seg(2, 42, &[1], &r0));
+    s.extend(seg(3, 49, &[], &[]));
+    assert_eq!(jbig2::decode(&s, None).unwrap(), bitmap(&want));
+    // Template 1 with no referral: the reference is the page under the region; REPLACE.
+    let (r1, _) = refine_segment(&want, &pat, 1, false, 4);
+    let s = jbig2_page(&[(38, generic_segment(&pat, 0, false)), (42, r1)], 16, 16);
+    assert_eq!(jbig2::decode(&s, None).unwrap(), bitmap(&want));
+}
+
+/// D: C with its gap closed. E: two Cs, 7 x 3. F: E widened by two columns (RDW 2, so E sits one column in, 6.4.11):
+/// a blank one before it and (0, 1, 0) after.
+fn d_symbol() -> Vec<Vec<u8>> {
+    vec![vec![1, 1, 1], vec![1, 0, 1], vec![1, 1, 1]]
+}
+
+fn e_symbol() -> Vec<Vec<u8>> {
+    let c = &symbols()[0];
+    (0..3).map(|y| (0..7).map(|x| if x < 3 { c[y][x] } else if x >= 4 { c[y][x - 4] } else { 0 }).collect()).collect()
+}
+
+fn f_symbol() -> Vec<Vec<u8>> {
+    e_symbol().into_iter().enumerate().map(|(y, r)| [vec![0], r, vec![(y == 1) as u8]].concat()).collect()
+}
+
+/// An arithmetic SDREFAGG dictionary over the SR331 one (C, B, A in): D refines C (REFAGGNINST 1), E aggregates two Cs
+/// (REFAGGNINST 2, Table 17's text region); D and E exported.
+fn refagg_dict_data() -> Vec<u8> {
+    let c = symbols()[0].clone();
+    let mut d = 2u16.to_be_bytes().to_vec();
+    d.extend(at_bytes(0));
+    d.extend(RAT.iter().flat_map(|&(x, y)| [x as u8, y as u8]));
+    d.extend(2u32.to_be_bytes());
+    d.extend(2u32.to_be_bytes());
+    let mut enc = MqEnc::new();
+    let ia = || vec![0u8; 512];
+    let (mut iadh, mut iadw, mut iaex, mut iaai) = (ia(), ia(), ia(), ia());
+    let (mut iadt, mut iafs, mut iads, mut iari, mut iardx, mut iardy) = (ia(), ia(), ia(), ia(), ia(), ia());
+    let mut iaid = vec![0u8; 8];
+    let mut gr = vec![0u8; 1 << 13];
+    enc_int(&mut enc, &mut iadh, Some(3));
+    enc_int(&mut enc, &mut iadw, Some(3));
+    enc_int(&mut enc, &mut iaai, Some(1));
+    enc_iaid(&mut enc, &mut iaid, 0, 3);
+    enc_int(&mut enc, &mut iardx, Some(0));
+    enc_int(&mut enc, &mut iardy, Some(0));
+    enc_refine(&mut enc, &mut gr, &d_symbol(), &c, 0, 0, 0, false, &RAT);
+    enc_int(&mut enc, &mut iadw, Some(4));
+    enc_int(&mut enc, &mut iaai, Some(2));
+    enc_int(&mut enc, &mut iadt, Some(0)); // STRIPT
+    enc_int(&mut enc, &mut iadt, Some(0)); // strip T = 0
+    enc_int(&mut enc, &mut iafs, Some(0));
+    enc_iaid(&mut enc, &mut iaid, 0, 3);
+    enc_int(&mut enc, &mut iari, Some(0));
+    enc_int(&mut enc, &mut iads, Some(2)); // CURS 2 -> 4
+    enc_iaid(&mut enc, &mut iaid, 0, 3);
+    enc_int(&mut enc, &mut iari, Some(0));
+    enc_int(&mut enc, &mut iads, None);
+    enc_int(&mut enc, &mut iadw, None);
+    enc_int(&mut enc, &mut iaex, Some(3)); // the three inputs not exported
+    enc_int(&mut enc, &mut iaex, Some(2));
+    d.extend(enc.flush());
+    d
+}
+
+/// A 16 x 8 text region with SBREFINE over (D, E): D at (1, 1) as is, E refined into F (RDW 2) at (5, 1).
+fn refine_text_region_data() -> Vec<u8> {
+    let mut d = region(16, 8, 0, 0, 0);
+    d.extend((2 | TOPLEFT).to_be_bytes());
+    d.extend(RAT.iter().flat_map(|&(x, y)| [x as u8, y as u8]));
+    d.extend(2u32.to_be_bytes());
+    let mut enc = MqEnc::new();
+    let ia = || vec![0u8; 512];
+    let (mut iadt, mut iafs, mut iads, mut iari) = (ia(), ia(), ia(), ia());
+    let (mut iardw, mut iardh, mut iardx, mut iardy) = (ia(), ia(), ia(), ia());
+    let mut iaid = vec![0u8; 2];
+    let mut gr = vec![0u8; 1 << 13];
+    enc_int(&mut enc, &mut iadt, Some(0));
+    enc_int(&mut enc, &mut iadt, Some(1)); // strip T = 1
+    enc_int(&mut enc, &mut iafs, Some(1)); // FIRSTS = 1
+    enc_iaid(&mut enc, &mut iaid, 0, 1);
+    enc_int(&mut enc, &mut iari, Some(0));
+    enc_int(&mut enc, &mut iads, Some(2)); // CURS 3 -> 5
+    enc_iaid(&mut enc, &mut iaid, 1, 1);
+    enc_int(&mut enc, &mut iari, Some(1));
+    enc_int(&mut enc, &mut iardw, Some(2));
+    enc_int(&mut enc, &mut iardh, Some(0));
+    enc_int(&mut enc, &mut iardx, Some(0));
+    enc_int(&mut enc, &mut iardy, Some(0));
+    enc_refine(&mut enc, &mut gr, &f_symbol(), &e_symbol(), 1, 0, 0, false, &RAT); // GRREFERENCEDX = RDW / 2
+    enc_int(&mut enc, &mut iads, None);
+    d.extend(enc.flush());
+    d
+}
+
+#[test]
+fn jbig2_refinement_in_symbols_and_text() {
+    let mut s = seg(0, 48, &[], &page_info(16, 8, 0));
+    s.extend(seg(1, 0, &[], &symbol_dict_data(0)));
+    s.extend(seg(2, 0, &[1], &refagg_dict_data()));
+    s.extend(seg(3, 6, &[2], &refine_text_region_data()));
+    s.extend(seg(4, 49, &[], &[]));
+    let mut rows = vec![vec![0u8; 16]; 8];
+    for (sym, x0, y0) in [(d_symbol(), 1usize, 1usize), (f_symbol(), 5, 1)] {
+        for (y, r) in sym.iter().enumerate() {
+            for (x, &p) in r.iter().enumerate() {
+                rows[y0 + y][x0 + x] |= p;
+            }
+        }
+    }
+    assert_eq!(jbig2::decode(&s, None).unwrap(), bitmap(&rows));
+}
+
+/// One grey-scale plane (C.5) through the generic contexts, skipped cells not coded (USESKIP).
+fn enc_plane(enc: &mut MqEnc, cx: &mut [u8], bm: &[Vec<u8>], at: &[(i8, i8); 4], skip: &[Vec<u8>]) {
+    for y in 0..bm.len() {
+        for x in 0..bm[y].len() {
+            if skip[y][x] == 0 {
+                enc.encode(&mut cx[context(bm, x as isize, y as isize, 0, at)], bm[y][x]);
+            }
+        }
+    }
+}
+
+#[test]
+fn jbig2_halftone_region() {
+    let pats: Vec<Vec<Vec<u8>>> =
+        vec![vec![vec![0, 0], vec![0, 0]], vec![vec![1, 0], vec![0, 0]], vec![vec![1, 0], vec![0, 1]], vec![vec![1, 1], vec![1, 1]]];
+    // The pattern dictionary: 4 patterns of 2 x 2 in one 8 x 2 collective bitmap, template 0, A1 = (-HDPW, 0).
+    let coll: Vec<Vec<u8>> = (0..2).map(|y| pats.iter().flat_map(|p| p[y].clone()).collect()).collect();
+    let mut enc = MqEnc::new();
+    let mut cx = vec![0u8; 1 << 16];
+    enc_generic(&mut enc, &mut cx, &coll, 0, false, &[(-2, 0), (-3, -1), (2, -2), (-2, -2)]);
+    let mut pd = vec![0u8, 2, 2];
+    pd.extend(3u32.to_be_bytes());
+    pd.extend(enc.flush());
+    // A 5 x 4 grid, HRX = 2 pixels: column 4 lands at x = 8, off the 8 x 8 region, so HENABLESKIP skips it.
+    let (gw, gh) = (5usize, 4usize);
+    let skip: Vec<Vec<u8>> = (0..gh).map(|_| (0..gw).map(|ng| (ng == 4) as u8).collect()).collect();
+    let vals: Vec<Vec<u8>> = (0..gh).map(|mg| (0..gw).map(|ng| if ng == 4 { 0 } else { ((mg + ng) % 4) as u8 }).collect()).collect();
+    let mut enc = MqEnc::new();
+    let mut cx = vec![0u8; 1 << 16];
+    for j in [1, 0] {
+        let plane: Vec<Vec<u8>> = vals.iter().map(|r| r.iter().map(|&v| ((v ^ (v >> 1)) >> j) & 1).collect()).collect();
+        enc_plane(&mut enc, &mut cx, &plane, &[(3, -1), (-3, -1), (2, -2), (-2, -2)], &skip);
+    }
+    let mut hr = region(8, 8, 0, 0, 0);
+    hr.push(8); // HENABLESKIP; template 0, HCOMBOP OR, HDEFPIXEL 0
+    for v in [gw as u32, gh as u32, 0, 0] {
+        hr.extend(v.to_be_bytes());
+    }
+    hr.extend(512u16.to_be_bytes());
+    hr.extend(0u16.to_be_bytes());
+    hr.extend(enc.flush());
+    let stream = |hr: &[u8]| {
+        let mut s = seg(0, 48, &[], &page_info(8, 8, 0));
+        s.extend(seg(1, 16, &[], &pd));
+        s.extend(seg(2, 22, &[1], hr));
+        s.extend(seg(3, 49, &[], &[]));
+        s
+    };
+    let mut want = vec![vec![0u8; 8]; 8];
+    for mg in 0..4 {
+        for ng in 0..4 {
+            let p = &pats[vals[mg][ng] as usize];
+            for y in 0..2 {
+                for x in 0..2 {
+                    want[2 * mg + y][2 * ng + x] |= p[y][x];
+                }
+            }
+        }
+    }
+    assert_eq!(jbig2::decode(&stream(&hr), None).unwrap(), bitmap(&want));
+    let mut m = hr.clone();
+    m[17] |= 1; // HMMR with two planes
+    assert!(matches!(jbig2::decode(&stream(&m), None), Err(Error::Unsupported("JBIG2 halftone MMR"))));
+}
+
+#[test]
+fn jbig2_unknown_length_generic_region() {
+    let pat = pattern();
+    let mut g = generic_segment(&pat, 0, true);
+    g[4..8].copy_from_slice(&u32::MAX.to_be_bytes()); // the height: the row count closing the data tells
+    g.extend(16u32.to_be_bytes());
+    let mut unknown = seg(1, 38, &[], &g);
+    unknown[7..11].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut below = generic_segment(&pat, 1, false);
+    below[12..16].copy_from_slice(&16u32.to_be_bytes()); // y = 16
+    let mut s = seg(0, 48, &[], &page_info(16, 32, 0));
+    s.extend(unknown);
+    s.extend(seg(2, 38, &[], &below));
+    s.extend(seg(3, 49, &[], &[]));
+    let rows: Vec<Vec<u8>> = pat.iter().chain(&pat).cloned().collect();
+    assert_eq!(jbig2::decode(&s, None).unwrap(), bitmap(&rows));
+}
+
 #[test]
 fn jbig2_refusals_by_name() {
     let unsupported = |s: &[u8]| match jbig2::decode(s, None) {
@@ -851,17 +1338,24 @@ fn jbig2_refusals_by_name() {
     g[17] |= 0x10;
     assert_eq!(unsupported(&jbig2_page(&[(38, g)], 16, 16)), "JBIG2 extended template");
     let mut s = seg(0, 48, &[], &page_info(32, 16, 0));
-    s.extend(seg(1, 0, &[], &symbol_dict_data(1)));
-    assert_eq!(unsupported(&s), "JBIG2 Huffman");
-    let mut s = seg(0, 48, &[], &page_info(32, 16, 0));
-    s.extend(seg(1, 0, &[], &symbol_dict_data(0)));
-    s.extend(seg(2, 6, &[1], &text_region_data(TOPLEFT | 2)));
-    assert_eq!(unsupported(&s), "JBIG2 refinement");
-    assert_eq!(unsupported(&jbig2_page(&[(22, region(1, 1, 0, 0, 0))], 4, 4)), "JBIG2 halftone region");
-    assert_eq!(unsupported(&jbig2_page(&[(42, region(1, 1, 0, 0, 0))], 4, 4)), "JBIG2 refinement");
+    s.extend(seg(1, 0, &[], &symbol_dict_data(0x100)));
+    assert_eq!(unsupported(&s), "JBIG2 retained contexts");
+    let mut g = generic_segment(&pat, 0, false);
+    g[16] |= 8;
+    assert_eq!(unsupported(&jbig2_page(&[(38, g)], 16, 16)), "JBIG2 colour extension");
     let mut s = seg(0, 48, &[], &page_info(4, 4, 0));
     let n = s.len();
     s[n - 4 - 19..n - 19].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert_eq!(unsupported(&s), "JBIG2 unknown segment length");
+    // An MMR generic region of unknown length (7.2.7 covers MMR 0 only).
+    let rows: Vec<Vec<bool>> = pat.iter().map(|r| r.iter().map(|&p| p == 1).collect()).collect();
+    let mut d = region(16, 16, 0, 0, 0);
+    d.push(1);
+    d.extend(ccitt_encode(&rows, -1, false, false, true));
+    let mut m = seg(1, 38, &[], &d);
+    m[7..11].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut s = seg(0, 48, &[], &page_info(16, 16, 0));
+    s.extend(m);
     assert_eq!(unsupported(&s), "JBIG2 unknown segment length");
     assert!(jbig2::decode(&seg(1, 38, &[], &generic_segment(&pat, 0, false)), None).is_err(), "region before page info");
 }
@@ -869,7 +1363,7 @@ fn jbig2_refusals_by_name() {
 // ---------------------------------------------------------------------------------------------------------------
 // Render: through PDF1's builder and PDF2's renderer (40 x 40 pt at 72 dpi; device y = 40 - user y)
 
-fn render(resources: &str, content: &str, extra: &[(u32, &str, Vec<u8>)]) -> Rendered {
+fn pdf_bytes(resources: &str, content: &str, extra: &[(u32, &str, Vec<u8>)]) -> Vec<u8> {
     let mut b = PdfBuilder::new(1);
     b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
     b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -878,7 +1372,11 @@ fn render(resources: &str, content: &str, extra: &[(u32, &str, Vec<u8>)]) -> Ren
     for (n, d, data) in extra {
         b.stream(*n, d, data);
     }
-    let doc = Document::parse(&b.classic()).unwrap();
+    b.classic()
+}
+
+fn render(resources: &str, content: &str, extra: &[(u32, &str, Vec<u8>)]) -> Rendered {
+    let doc = Document::parse(&pdf_bytes(resources, content, extra)).unwrap();
     let pages = doc.pages().unwrap();
     pages[0].render(&doc, 72.0, &mut TextLog::default()).unwrap()
 }
@@ -954,15 +1452,19 @@ fn render_jbig2_text_with_globals() {
 }
 
 #[test]
-fn render_jbig2_huffman_refused_grey_box() {
-    let mut s = seg(0, 48, &[], &page_info(32, 16, 0));
-    s.extend(seg(1, 0, &[], &symbol_dict_data(1)));
-    let r = render(
-        "/XObject << /Im1 5 0 R >>",
-        "q 10 0 0 10 10 10 cm /Im1 Do Q",
-        &[(5, "/Type /XObject /Subtype /Image /Width 32 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode", s)],
-    );
-    assert_eq!(px(&r, 15, 25), [128, 128, 128, 255]);
-    assert_eq!(px(&r, 25, 25), WHITE);
-    assert_eq!(r.refused, vec!["JBIG2 Huffman"]);
+fn render_jbig2_huffman_text_region() {
+    // The Huffman symbol dictionary and text region (standard tables B.1 / B.2 / B.4 / B.6 / B.8 / B.11) drawn.
+    let extra = [(5, "/Type /XObject /Subtype /Image /Width 32 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode", huff_text_stream())];
+    if let Ok(path) = std::env::var("JBIG2_PDF_OUT") {
+        std::fs::write(path, pdf_bytes("/XObject << /Im1 5 0 R >>", "q 32 0 0 16 4 4 cm /Im1 Do Q", &extra)).unwrap();
+    }
+    let r = render("/XObject << /Im1 5 0 R >>", "q 32 0 0 16 4 4 cm /Im1 Do Q", &extra);
+    assert!(r.refused.is_empty(), "{:?}", r.refused);
+    let want = text_expected();
+    for y in 0..16 {
+        for x in 0..32 {
+            let p = if want.data[y * 32 + x] == 1 { BLACK } else { WHITE };
+            assert_eq!(px(&r, 4 + x, 20 + y), p, "image pixel ({x},{y})");
+        }
+    }
 }
