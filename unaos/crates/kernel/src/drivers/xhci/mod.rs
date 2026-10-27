@@ -18595,6 +18595,8 @@ pub mod suspend {
             if !self.hid_halt_pending.contains(&(slot, false)) { self.hid_halt_pending.push((slot, false)); }
             true
         }
+    }
+
 
     // ══════════════ PORTRESET (rmbp-ledger B837, BP-power-7) — a stuck port is reset and re-enumerated ══════════════
     // SLEEP2 (B812) left a port whose resume missed its bound in `STUCK` for the rest of the boot, its slots `HELD`. The
@@ -18751,6 +18753,9 @@ impl XhciController {
         let trbs = r.rewind(m);
         EP0_REWINDS.fetch_add(1, Ordering::Relaxed);
         serial_println!("[usb] slot={} ep0 rewind trbs={}", slot_id, trbs);
+    }
+}
+
 
 // PORTRESET (rmbp-ledger B837, docs/dev/blueprint/power.md BP-power-7) — EP0's ONE recovery after a dead control transfer.
 // FILE-TAIL append (unconditional: the EP0 sync pump's TIMEOUT line calls it on every board), so no `panic::Location` above

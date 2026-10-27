@@ -271,6 +271,6 @@ mod panelknob {
             return;
         }
         let h = crate::video::panel_info_nonblocking().map_or(0, |i| i.height);
-        crate::serial_println!("[dpi] panel={}x{}@{} src=knob ppi={}", fb_w, h, super::scale_str(s2), PPI);
+        serial_println!("[dpi] panel={}x{}@{} src=knob ppi={}", fb_w, h, super::scale_str(s2), PPI);
     }
 }
