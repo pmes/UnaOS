@@ -7,9 +7,11 @@
 //!
 //! * [`Sbr::read`] — sbr_extension_data (§4.4.2.8 Tables 4.62-4.74): sbr_header (a changed header rebuilds the
 //!   frequency band tables, §4.6.18.3), sbr_single/channel_pair_element: sbr_grid, sbr_dtdf, sbr_invf,
-//!   sbr_envelope, sbr_noise, sinusoidal coding, and sbr_extension: parametric stereo (bs_extension_id 2) is
-//!   RECOGNISED (`ps_seen`) and stepped over by its own size — PS synthesis is owed (handlers.md HEAACSBR-PS), the
-//!   caller duplicates the mono core.
+//!   sbr_envelope, sbr_noise, sinusoidal coding, and sbr_extension: parametric stereo (bs_extension_id 2) sets
+//!   `ps_seen` and, with PS synthesis on (`Sbr::new`'s `ps`), is parsed by [`Ps::read`] (HEAACSBR-PS, LEDGER SR214).
+//! * Parametric stereo (ISO/IEC 14496-3 §8.6.4, the file's tail): on a mono core the PS stage runs on the X matrix
+//!   after HF adjustment and before synthesis — hybrid analysis, decorrelation, IID/ICC/IPD/OPD mixing, hybrid
+//!   synthesis — and the right channel goes through the same 64-band synthesis on a second channel's delay line.
 //! * [`Sbr::apply`] — per channel: the 32-band analysis QMF bank (§4.6.18.4.1), HF generation with the inverse
 //!   filtering chirp (§4.6.18.6), HF adjustment: mapping, envelope estimation, gain with the limiter and boost,
 //!   smoothing, noise floor and sinusoids (§4.6.18.7), then the 64-band synthesis QMF bank (§4.6.18.4.2).
@@ -211,6 +213,9 @@ struct Scratch {
     gain: [[f32; MAXB]; 6],
     x_re: Vec<[f32; 64]>,
     x_im: Vec<[f32; 64]>,
+    /// HEAACSBR-PS: the right channel's X (the PS stage's second output)
+    x2_re: Vec<[f32; 64]>,
+    x2_im: Vec<[f32; 64]>,
 }
 
 pub(crate) struct Sbr {
@@ -228,8 +233,11 @@ pub(crate) struct Sbr {
     syn_pre: Vec<Cx>,
     syn_post: Vec<Cx>,
     s: Box<Scratch>,
-    /// A parametric stereo extension was seen (its synthesis is owed; the caller duplicates the mono core).
+    /// A parametric stereo extension was seen.
     pub(crate) ps_seen: bool,
+    /// HEAACSBR-PS (LEDGER SR214): the parametric stereo state when PS synthesis is on (a mono core, output channel 0;
+    /// the right channel's synthesis delay line is the last `chans` entry).
+    ps: Option<Box<Ps>>,
 }
 
 fn cis(a: f64) -> Cx { let (s, c) = math::sincos(a); [c as f32, s as f32] }
@@ -262,8 +270,9 @@ fn make_bands(bands: &mut [i32], start: usize, stop: usize, num: usize) {
 fn bad() -> Error { Error::Invalid("aac: SBR data") }
 
 impl Sbr {
-    /// SBR for a core decoding at `core_rate` with `channels` output channels.
-    pub(crate) fn new(core_rate: u32, channels: usize) -> Sbr {
+    /// SBR for a core decoding at `core_rate` with `channels` output channels; `ps`: parametric stereo synthesis on
+    /// a mono core (one more output channel, synthesised from the first).
+    pub(crate) fn new(core_rate: u32, channels: usize, ps: bool) -> Sbr {
         let books = (0..10).map(|i| {
             let (c, l): (&[u32], &[u8]) = match i {
                 T_ENV_15 => (&t::SBR_T_HUFFMAN_ENV_1_5DB_CODES, &t::SBR_T_HUFFMAN_ENV_1_5DB_BITS),
@@ -287,7 +296,7 @@ impl Sbr {
         Sbr {
             rate: core_rate * 2,
             elems: Vec::new(),
-            chans: (0..channels).map(|_| Chan::new()).collect(),
+            chans: (0..channels + ps as usize).map(|_| Chan::new()).collect(),
             books,
             fft64: Imdct::new(256, [256, 256]),
             fft128: Imdct::new(512, [512, 512]),
@@ -307,14 +316,18 @@ impl Sbr {
                 gain: [[0.0; MAXB]; 6],
                 x_re: vec![[0.0; 64]; 38],
                 x_im: vec![[0.0; 64]; 38],
+                x2_re: vec![[0.0; 64]; 38],
+                x2_im: vec![[0.0; 64]; 38],
             }),
             ps_seen: false,
+            ps: if ps { Some(Box::new(Ps::new())) } else { None },
         }
     }
 
     /// Start of a raw_data_block: no element has SBR data yet.
     pub(crate) fn begin_frame(&mut self) {
         for e in self.elems.iter_mut() { e.have_data = false; }
+        if let Some(p) = self.ps.as_mut() { p.read_this_frame = false; }
     }
 
     fn elem(&mut self, i: usize) -> &mut Elem {
@@ -408,11 +421,14 @@ impl Sbr {
             let mut cnt = r.read(4)? as usize;
             if cnt == 15 { cnt += r.read(8)? as usize; }
             let mut left = 8 * cnt;
-            if left > 7 {
+            while left > 7 {
                 let id = r.read(2)?;
                 left -= 2;
-                // EXTENSION_ID_PS: parametric stereo, recognised and stepped over (its synthesis is owed)
+                // EXTENSION_ID_PS: parametric stereo, parsed once per frame when PS synthesis is on, else stepped over
                 if id == 2 { self.ps_seen = true; }
+                let used = match self.ps.as_mut() { Some(p) if id == 2 && !p.read_this_frame => p.read(r, left), _ => 0 };
+                if used == 0 { break; }
+                left -= used;
             }
             r.skip(left)?;
         }
@@ -510,7 +526,7 @@ impl Sbr {
                 }
             }
             self.x_gen(&e, c);
-            self.synthesis(c, &mut out[c][..2048]);
+            if self.ps.is_some() && c == 0 && ochs.len() == 1 && out.get(1).map(|o| o.len() >= 2048).unwrap_or(false) { self.ps_synthesis(&e, out); } else { self.synthesis(c, &mut out[c][..2048]); }
         }
         e.have_data = false;
         e.reset = false;
@@ -1309,31 +1325,37 @@ mod tests {
 
     /// HEAACSBR table KAT: each codebook has the spec's size (2·LAV + 1 symbols), is a complete prefix code
     /// (Kraft sum exactly 1, no codeword a prefix of another) and every symbol decodes back through `Huff`.
+    /// HEAACSBR-PS (SR214): the ten PS codebooks are held to the same (sizes 61 61 29 29 15 15 8 8 8 8).
     #[test]
     fn codebooks_are_complete_prefix_codes() {
         for (bi, (codes, lens, size)) in books().iter().enumerate() {
-            assert_eq!(codes.len(), *size, "book {}", bi);
-            assert_eq!(lens.len(), *size, "book {}", bi);
             assert_eq!(*size as i32, 2 * LAV[bi] + 1, "book {} LAV", bi);
-            let max = *lens.iter().max().unwrap() as u32;
-            let kraft: u64 = lens.iter().map(|&l| 1u64 << (max - l as u32)).sum();
-            assert_eq!(kraft, 1u64 << max, "book {}: Kraft sum", bi);
-            for i in 0..*size {
-                for j in 0..*size {
-                    if i == j || lens[i] > lens[j] { continue; }
-                    let pre = codes[j] >> (lens[j] - lens[i]);
-                    assert!(pre != codes[i], "book {}: code {} is a prefix of {}", bi, i, j);
-                }
+            check_book(bi, codes, lens, *size);
+        }
+        for (bi, (codes, lens, size)) in super::ps_tests::books().iter().enumerate() { check_book(100 + bi, codes, lens, *size); }
+    }
+
+    fn check_book(bi: usize, codes: &[u32], lens: &[u8], size: usize) {
+        assert_eq!(codes.len(), size, "book {}", bi);
+        assert_eq!(lens.len(), size, "book {}", bi);
+        let max = *lens.iter().max().unwrap() as u32;
+        let kraft: u64 = lens.iter().map(|&l| 1u64 << (max - l as u32)).sum();
+        assert_eq!(kraft, 1u64 << max, "book {}: Kraft sum", bi);
+        for i in 0..size {
+            for j in 0..size {
+                if i == j || lens[i] > lens[j] { continue; }
+                let pre = codes[j] >> (lens[j] - lens[i]);
+                assert!(pre != codes[i], "book {}: code {} is a prefix of {}", bi, i, j);
             }
-            let h = Huff::new(*codes, *lens);
-            for sym in 0..*size {
-                let l = lens[sym] as u32;
-                let v = (codes[sym] as u64) << (64 - l);
-                let bytes = v.to_be_bytes();
-                let mut r = BitReader::new(&bytes);
-                assert_eq!(h.decode(&mut r).unwrap(), sym, "book {} symbol {}", bi, sym);
-                assert_eq!(r.bit_pos(), l as usize);
-            }
+        }
+        let h = Huff::new(codes, lens);
+        for sym in 0..size {
+            let l = lens[sym] as u32;
+            let v = (codes[sym] as u64) << (64 - l);
+            let bytes = v.to_be_bytes();
+            let mut r = BitReader::new(&bytes);
+            assert_eq!(h.decode(&mut r).unwrap(), sym, "book {} symbol {}", bi, sym);
+            assert_eq!(r.bit_pos(), l as usize);
         }
     }
 
@@ -1346,7 +1368,7 @@ mod tests {
     #[test]
     fn qmf_matches_the_definition() {
         let pi = core::f64::consts::PI;
-        let mut sbr = Sbr::new(22050, 1);
+        let mut sbr = Sbr::new(22050, 1, false);
         let input = noise(1024, 7);
         sbr.analysis(0, &input);
         // the definition, for slot 31 (the newest 320 samples: 288 carried zeros + 1024 → indices 992..1312)
@@ -1371,7 +1393,7 @@ mod tests {
         }
         assert!(err < 1e-4 * mag.max(1.0), "analysis: max err {} (scale {})", err, mag);
         // synthesis of one slot from fresh state: the 128 new entries of v
-        let mut sbr = Sbr::new(22050, 1);
+        let mut sbr = Sbr::new(22050, 1, false);
         let xr = noise(64, 11);
         let xi = noise(64, 13);
         for k in 0..64 { sbr.s.x_re[0][k] = xr[k]; sbr.s.x_im[0][k] = xi[k]; }
@@ -1396,7 +1418,7 @@ mod tests {
     /// input at twice the rate, delayed by the banks' 577 output samples plus the 6-slot (384) HF-adjust offset.
     #[test]
     fn qmf_round_trip() {
-        let mut sbr = Sbr::new(22050, 1);
+        let mut sbr = Sbr::new(22050, 1, false);
         let n = 1024 * 12;
         let x: Vec<f32> = (0..n).map(|i| 0.3 * math::sin(0.05 * i as f64) as f32 + 0.2 * math::sin(1.3 * i as f64) as f32).collect();
         let mut y = Vec::new();
@@ -1447,5 +1469,687 @@ mod tests {
             }
         }
         assert!(built > 500, "only {} headers built", built);
+    }
+}
+
+// ------------------------------------------------------------------ parametric stereo (§8.6.4; HEAACSBR-PS, LEDGER SR214)
+//
+// HE-AAC v2: the mono core's X matrix (after HF adjustment, 38 slots: 32 + the 6-slot lowband lookahead x_gen leaves in
+// slots 32..37) is split by the hybrid filterbank (QMF band 0 into an 8-band complex split merged to 6, bands 1 and 2
+// into 2 real bands each, bands 3..63 passed through: 71 hybrid bands, 20 stereo parameter bands), decorrelated
+// (3-link all-pass with fractional delays below hybrid band 30, a 14-slot delay to band 41, 1 slot above, with the
+// transient attenuation), mixed by the IID/ICC (+IPD/OPD) rotation interpolated across the envelopes, and summed back
+// into the QMF bands: L into X, R into X2. The 20-band bank is used for every stream; parameters coded at 10 or 34
+// band resolution are mapped to 20 (Table 8.46's maps; the 34-band bank is owed, handlers.md HEAACSBR-PS34).
+// Written from the specification's equations; FFmpeg 6.1.1's aacps (LGPL-2.1-or-later) was the cross-reference for
+// the per-frame state order (the H history, the fake final envelope, the IPD/OPD smoothing history) and its decode is
+// the KAT's reference (tests/aac_kat.rs `heaac_vs_ffmpeg`); its code is not ported.
+
+const PS_ENVS: usize = 6;
+const PS_PARS: usize = 34;
+/// hybrid bands (20-band configuration)
+const PS_BANDS: usize = 71;
+const PS_PAR_BANDS: usize = 20;
+const PS_IPD_BANDS: usize = 11;
+const PS_AP_BANDS: usize = 30;
+const PS_DECAY_CUTOFF: f32 = 10.0;
+const PS_DECAY_SLOPE: f32 = 0.05;
+const PS_SHORT_DELAY_BAND: usize = 42;
+const PS_MAX_DELAY: usize = 14;
+const PS_NUM_ENV: [[usize; 4]; 2] = [[0, 1, 2, 4], [1, 2, 3, 4]];
+const PS_NR_IIDICC: [usize; 6] = [10, 20, 34, 10, 20, 34];
+const PS_NR_IPDOPD: [usize; 6] = [5, 11, 17, 5, 11, 17];
+// codebook indices (the tables' order)
+const PS_IID_DF1: usize = 0;
+const PS_IID_DT1: usize = 1;
+const PS_IID_DF0: usize = 2;
+const PS_IID_DT0: usize = 3;
+const PS_ICC_DF: usize = 4;
+const PS_ICC_DT: usize = 5;
+const PS_IPD_DF: usize = 6;
+const PS_IPD_DT: usize = 7;
+const PS_OPD_DF: usize = 8;
+const PS_OPD_DT: usize = 9;
+
+type PsPar = [[i8; PS_PARS]; PS_ENVS];
+
+fn atan2(y: f64, x: f64) -> f64 {
+    let pi = core::f64::consts::PI;
+    if x > 0.0 { math::atan(y / x) } else if x < 0.0 { math::atan(y / x) + if y >= 0.0 { pi } else { -pi } } else if y > 0.0 { pi / 2.0 } else if y < 0.0 { -pi / 2.0 } else { 0.0 }
+}
+
+fn cmul(a: Cx, b: Cx) -> Cx { [a[0] * b[0] - a[1] * b[1], a[0] * b[1] + a[1] * b[0]] }
+
+/// The parametric stereo state of one mono core: the parsed parameters and the filter / mixing history.
+pub(crate) struct Ps {
+    books: Vec<Huff>,
+    /// a PS header was read: synthesis runs (else the mono X is copied to both channels)
+    pub(crate) start: bool,
+    pub(crate) read_this_frame: bool,
+    enable_iid: bool,
+    iid_quant: bool,
+    nr_iid_par: usize,
+    nr_ipdopd_par: usize,
+    enable_icc: bool,
+    icc_mode: usize,
+    nr_icc_par: usize,
+    enable_ext: bool,
+    enable_ipdopd: bool,
+    num_env_old: usize,
+    num_env: usize,
+    border: [i32; PS_ENVS + 1],
+    iid_par: PsPar,
+    icc_par: PsPar,
+    ipd_par: PsPar,
+    opd_par: PsPar,
+    // computed tables
+    ha: Vec<[[f32; 4]; 8]>,
+    hb: Vec<[[f32; 4]; 8]>,
+    pd_smooth: Vec<Cx>,
+    phi_fract: [Cx; PS_AP_BANDS],
+    q_fract: [[Cx; 3]; PS_AP_BANDS],
+    /// the 8-band complex split of QMF band 0: [sub-band][tap 0..6]
+    f20: [[Cx; 7]; 8],
+    // filter and mixing history
+    in_buf: [[Cx; 44]; 3],
+    delay: Vec<[Cx; 32 + PS_MAX_DELAY]>,
+    ap_delay: Vec<[[Cx; 37]; 3]>,
+    peak_decay_nrg: [f32; PS_PAR_BANDS],
+    power_smooth: [f32; PS_PAR_BANDS],
+    peak_decay_diff_smooth: [f32; PS_PAR_BANDS],
+    /// H11, H12, H21, H22 x [real, imaginary (IPD/OPD)] x envelope boundary (0 = the previous frame's last) x band
+    h: [[[[f32; PS_PARS]; PS_ENVS + 1]; 2]; 4],
+    ipd_hist: [i8; PS_IPD_BANDS],
+    opd_hist: [i8; PS_IPD_BANDS],
+    lbuf: Vec<[Cx; 32]>,
+    rbuf: Vec<[Cx; 32]>,
+}
+
+impl Ps {
+    pub(crate) fn new() -> Ps {
+        let books = [
+            (&t::PS_HUFF_IID_DF1_CODES[..], &t::PS_HUFF_IID_DF1_BITS[..]),
+            (&t::PS_HUFF_IID_DT1_CODES[..], &t::PS_HUFF_IID_DT1_BITS[..]),
+            (&t::PS_HUFF_IID_DF0_CODES[..], &t::PS_HUFF_IID_DF0_BITS[..]),
+            (&t::PS_HUFF_IID_DT0_CODES[..], &t::PS_HUFF_IID_DT0_BITS[..]),
+            (&t::PS_HUFF_ICC_DF_CODES[..], &t::PS_HUFF_ICC_DF_BITS[..]),
+            (&t::PS_HUFF_ICC_DT_CODES[..], &t::PS_HUFF_ICC_DT_BITS[..]),
+            (&t::PS_HUFF_IPD_DF_CODES[..], &t::PS_HUFF_IPD_DF_BITS[..]),
+            (&t::PS_HUFF_IPD_DT_CODES[..], &t::PS_HUFF_IPD_DT_BITS[..]),
+            (&t::PS_HUFF_OPD_DF_CODES[..], &t::PS_HUFF_OPD_DF_BITS[..]),
+            (&t::PS_HUFF_OPD_DT_CODES[..], &t::PS_HUFF_OPD_DT_BITS[..]),
+        ].iter().map(|&(c, l)| Huff::new(c, l)).collect();
+        let pi = core::f64::consts::PI;
+        // IPD/OPD smoothing (§8.6.4.6.3.2): the unit phasor of 1/4, 1/2, 1 weighted phases of the last three frames
+        let pd = |k: usize| -> (f64, f64) { let (s, c) = math::sincos(k as f64 * pi / 4.0); (c, s) };
+        let mut pd_smooth = vec![[0.0f32; 2]; 512];
+        for p0 in 0..8 {
+            for p1 in 0..8 {
+                for p2 in 0..8 {
+                    let (a, b, c) = (pd(p0), pd(p1), pd(p2));
+                    let re = 0.25 * a.0 + 0.5 * b.0 + c.0;
+                    let im = 0.25 * a.1 + 0.5 * b.1 + c.1;
+                    let mag = math::sqrt(re * re + im * im);
+                    pd_smooth[p0 * 64 + p1 * 8 + p2] = [(re / mag) as f32, (im / mag) as f32];
+                }
+            }
+        }
+        // mixing matrices (§8.6.4.6.3): A (icc_mode < 3) and B, per dequantised IID (15 default + 31 fine) and ICC
+        let (mut ha, mut hb) = (vec![[[0.0f32; 4]; 8]; 46], vec![[[0.0f32; 4]; 8]; 46]);
+        let sq2 = core::f64::consts::SQRT_2;
+        for iid in 0..46 {
+            let c = t::PS_IID_DEQUANT[iid] as f64;
+            let c1 = sq2 / math::sqrt(1.0 + c * c);
+            let c2 = c * c1;
+            for icc in 0..8 {
+                let alpha = 0.5 * t::PS_ACOS_ICC_INVQ[icc] as f64;
+                let beta = alpha * (c1 - c2) / sq2;
+                let (spa, cpa) = math::sincos(beta + alpha);
+                let (sma, cma) = math::sincos(beta - alpha);
+                ha[iid][icc] = [(c2 * cpa) as f32, (c1 * cma) as f32, (c2 * spa) as f32, (c1 * sma) as f32];
+                let rho = (t::PS_ICC_INVQ[icc] as f64).max(0.05);
+                let mut alpha = 0.5 * atan2(2.0 * c * rho, c * c - 1.0);
+                let mu = c + 1.0 / c;
+                let mu = math::sqrt(1.0 + (4.0 * rho * rho - 4.0) / (mu * mu));
+                let gamma = math::atan(math::sqrt((1.0 - mu) / (1.0 + mu)));
+                if alpha < 0.0 { alpha += pi / 2.0; }
+                let (sa, ca) = math::sincos(alpha);
+                let (sg, cg) = math::sincos(gamma);
+                hb[iid][icc] = [(sq2 * ca * cg) as f32, (sq2 * sa * cg) as f32, (-sq2 * sa * sg) as f32, (sq2 * ca * sg) as f32];
+            }
+        }
+        // decorrelator fractional delays (§8.6.4.5.2) at each all-pass band's centre frequency
+        let (mut phi_fract, mut q_fract) = ([[0.0f32; 2]; PS_AP_BANDS], [[[0.0f32; 2]; 3]; PS_AP_BANDS]);
+        for k in 0..PS_AP_BANDS {
+            let fc = if k < 10 { t::PS_F_CENTER_20[k] as f64 * 0.125 } else { k as f64 - 6.5 };
+            for m in 0..3 { q_fract[k][m] = cis(-pi * t::PS_FRACT_DELAY_LINKS[m] as f64 * fc); }
+            phi_fract[k] = cis(-pi * t::PS_FRACT_DELAY_GAIN as f64 * fc);
+        }
+        // hybrid analysis (§8.6.4.3): g0 modulated to the 8 sub-band centres
+        let mut f20 = [[[0.0f32; 2]; 7]; 8];
+        for (q, row) in f20.iter_mut().enumerate() {
+            for (n, f) in row.iter_mut().enumerate() {
+                let c = cis(-2.0 * pi * (q as f64 + 0.5) * (n as f64 - 6.0) / 8.0);
+                *f = [t::PS_G0_Q8[n] * c[0], t::PS_G0_Q8[n] * c[1]];
+            }
+        }
+        Ps {
+            books, start: false, read_this_frame: false, enable_iid: false, iid_quant: false, nr_iid_par: 0, nr_ipdopd_par: 0,
+            enable_icc: false, icc_mode: 0, nr_icc_par: 0, enable_ext: false, enable_ipdopd: false, num_env_old: 0, num_env: 0,
+            border: [0; PS_ENVS + 1], iid_par: [[0; PS_PARS]; PS_ENVS], icc_par: [[0; PS_PARS]; PS_ENVS],
+            ipd_par: [[0; PS_PARS]; PS_ENVS], opd_par: [[0; PS_PARS]; PS_ENVS],
+            ha, hb, pd_smooth, phi_fract, q_fract, f20,
+            in_buf: [[[0.0; 2]; 44]; 3],
+            delay: vec![[[0.0; 2]; 32 + PS_MAX_DELAY]; PS_BANDS],
+            ap_delay: vec![[[[0.0; 2]; 37]; 3]; PS_AP_BANDS],
+            peak_decay_nrg: [0.0; PS_PAR_BANDS], power_smooth: [0.0; PS_PAR_BANDS], peak_decay_diff_smooth: [0.0; PS_PAR_BANDS],
+            h: [[[[0.0; PS_PARS]; PS_ENVS + 1]; 2]; 4],
+            ipd_hist: [0; PS_IPD_BANDS], opd_hist: [0; PS_IPD_BANDS],
+            lbuf: vec![[[0.0; 2]; 32]; PS_BANDS],
+            rbuf: vec![[[0.0; 2]; 32]; PS_BANDS],
+        }
+    }
+
+    /// ps_data (§8.3.1, Table 8.1) from `r`, at most `left` bits: the bits consumed, or 0 when the data is refused
+    /// (then PS synthesis stops until the next header, the parameters are cleared and `r` is back where it was).
+    pub(crate) fn read(&mut self, r: &mut BitReader, left: usize) -> usize {
+        self.read_this_frame = true;
+        let start = r.bit_pos();
+        if self.read_inner(r).is_ok() && r.bit_pos() - start <= left { return r.bit_pos() - start; }
+        self.start = false;
+        for p in [&mut self.iid_par, &mut self.icc_par, &mut self.ipd_par, &mut self.opd_par] { *p = [[0; PS_PARS]; PS_ENVS]; }
+        r.seek_bits(start);
+        0
+    }
+
+    fn read_inner(&mut self, r: &mut BitReader) -> Result<()> {
+        let header = r.bit()?;
+        if header {
+            self.enable_iid = r.bit()?;
+            if self.enable_iid {
+                let mode = r.read(3)? as usize;
+                if mode > 5 { return Err(bad()); }
+                self.nr_iid_par = PS_NR_IIDICC[mode];
+                self.iid_quant = mode > 2;
+                self.nr_ipdopd_par = PS_NR_IPDOPD[mode];
+            }
+            self.enable_icc = r.bit()?;
+            if self.enable_icc {
+                let mode = r.read(3)? as usize;
+                if mode > 5 { return Err(bad()); }
+                self.icc_mode = mode;
+                self.nr_icc_par = PS_NR_IIDICC[mode];
+            }
+            self.enable_ext = r.bit()?;
+        }
+        let frame_class = r.bit()? as usize;
+        self.num_env_old = self.num_env;
+        self.num_env = PS_NUM_ENV[frame_class][r.read(2)? as usize];
+        let ne = self.num_env;
+        self.border[0] = -1;
+        for e in 1..=ne {
+            self.border[e] = if frame_class == 1 { r.read(5)? as i32 } else { ((e * 32) >> ne.trailing_zeros()) as i32 - 1 };
+            if self.border[e] < self.border[e - 1] { return Err(bad()); }
+        }
+        let old = self.num_env_old;
+        if self.enable_iid {
+            let lim = 7 + 8 * self.iid_quant as i32;
+            for e in 0..ne {
+                let dt = r.bit()?;
+                let book = match (dt, self.iid_quant) { (false, false) => PS_IID_DF0, (false, true) => PS_IID_DF1, (true, false) => PS_IID_DT0, (true, true) => PS_IID_DT1 };
+                read_par(r, &self.books[book], t::PS_HUFF_OFFSET[book], 0, &mut self.iid_par, self.nr_iid_par, e, old, dt, |v| v.abs() <= lim)?;
+            }
+        } else {
+            self.iid_par = [[0; PS_PARS]; PS_ENVS];
+        }
+        if self.enable_icc {
+            for e in 0..ne {
+                let dt = r.bit()?;
+                let book = if dt { PS_ICC_DT } else { PS_ICC_DF };
+                read_par(r, &self.books[book], t::PS_HUFF_OFFSET[book], 0, &mut self.icc_par, self.nr_icc_par, e, old, dt, |v| (0..=7).contains(&v))?;
+            }
+        } else {
+            self.icc_par = [[0; PS_PARS]; PS_ENVS];
+        }
+        if self.enable_ext {
+            let mut cnt = r.read(4)? as i32;
+            if cnt == 15 { cnt += r.read(8)? as i32; }
+            let mut cnt = 8 * cnt;
+            while cnt > 7 {
+                let id = r.read(2)?;
+                let at = r.bit_pos();
+                if id == 0 {
+                    // ps_extension IPD/OPD (Table 8.6)
+                    self.enable_ipdopd = r.bit()?;
+                    if self.enable_ipdopd {
+                        for e in 0..ne {
+                            let dt = r.bit()?;
+                            let book = if dt { PS_IPD_DT } else { PS_IPD_DF };
+                            read_par(r, &self.books[book], 0, 7, &mut self.ipd_par, self.nr_ipdopd_par, e, old, dt, |_| true)?;
+                            let dt = r.bit()?;
+                            let book = if dt { PS_OPD_DT } else { PS_OPD_DF };
+                            read_par(r, &self.books[book], 0, 7, &mut self.opd_par, self.nr_ipdopd_par, e, old, dt, |_| true)?;
+                        }
+                    }
+                    r.skip(1)?;
+                }
+                cnt -= 2 + (r.bit_pos() - at) as i32;
+            }
+            if cnt < 0 { return Err(bad()); }
+            r.skip(cnt as usize)?;
+        }
+        // a frame whose envelopes stop short of the last slot gets a final envelope repeating the last parameters
+        if ne == 0 || self.border[ne] < 31 {
+            let src = if ne > 0 { ne as i32 - 1 } else { old as i32 - 1 };
+            if src >= 0 && src as usize != ne {
+                let s = src as usize;
+                if self.enable_iid { self.iid_par[ne] = self.iid_par[s]; }
+                if self.enable_icc { self.icc_par[ne] = self.icc_par[s]; }
+                if self.enable_ipdopd { self.ipd_par[ne] = self.ipd_par[s]; self.opd_par[ne] = self.opd_par[s]; }
+            }
+            if self.enable_iid && self.iid_par[ne][..self.nr_iid_par].iter().any(|&v| (v as i32).abs() > 7 + 8 * self.iid_quant as i32) { return Err(bad()); }
+            if self.enable_icc && self.icc_par[ne][..self.nr_icc_par].iter().any(|&v| !(0..=7).contains(&v)) { return Err(bad()); }
+            self.num_env += 1;
+            self.border[self.num_env] = 31;
+        }
+        if !self.enable_ipdopd {
+            self.ipd_par = [[0; PS_PARS]; PS_ENVS];
+            self.opd_par = [[0; PS_PARS]; PS_ENVS];
+        }
+        if header { self.start = true; }
+        Ok(())
+    }
+
+    /// The PS stage on one frame: `x` (the mono X, 38 slots) becomes L in its first 32 slots, `x2` becomes R.
+    /// `top`: kx + M, the first QMF band with no signal (the delay lines above it are cleared).
+    pub(crate) fn apply(&mut self, x_re: &mut [[f32; 64]], x_im: &mut [[f32; 64]], x2_re: &mut [[f32; 64]], x2_im: &mut [[f32; 64]], top: usize) {
+        let top = (top + PS_BANDS - 64).min(PS_BANDS);
+        for d in self.delay[top..].iter_mut() { *d = [[0.0; 2]; 32 + PS_MAX_DELAY]; }
+        if top < PS_AP_BANDS { for d in self.ap_delay[top..].iter_mut() { *d = [[[0.0; 2]; 37]; 3]; } }
+        self.hybrid_analysis(x_re, x_im);
+        self.decorrelate();
+        self.stereo_mix();
+        hybrid_synthesis(&self.lbuf, x_re, x_im);
+        hybrid_synthesis(&self.rbuf, x2_re, x2_im);
+    }
+
+    /// Hybrid analysis (§8.6.4.3) into `lbuf`: QMF band 0 through the 8-band complex filters (sub-bands 2+5 and 3+4
+    /// merged), bands 1 and 2 through the 2-band real filter g1, bands 3..63 passed through. Each 13-tap filter is
+    /// centred on tap 6, so slot j reads X slots j-6..j+6: the history is the previous frame's slots 26..31 and
+    /// the lookahead is this frame's slots 32..37.
+    fn hybrid_analysis(&mut self, x_re: &[[f32; 64]], x_im: &[[f32; 64]]) {
+        for b in 0..3 {
+            for j in 0..38 { self.in_buf[b][j + 6] = [x_re[j][b], x_im[j][b]]; }
+        }
+        let g1 = &t::PS_G1_Q2;
+        for i in 0..32 {
+            let w = &self.in_buf[0][i..i + 13];
+            let mut tmp = [[0.0f32; 2]; 8];
+            for (q, o) in tmp.iter_mut().enumerate() {
+                let f = &self.f20[q];
+                let mut acc = [f[6][0] * w[6][0], f[6][0] * w[6][1]];
+                for j in 0..6 {
+                    // taps j and 12 - j carry conjugate coefficients
+                    let (a, b) = (w[j], w[12 - j]);
+                    acc[0] += f[j][0] * (a[0] + b[0]) - f[j][1] * (a[1] - b[1]);
+                    acc[1] += f[j][0] * (a[1] + b[1]) + f[j][1] * (a[0] - b[0]);
+                }
+                *o = acc;
+            }
+            self.lbuf[0][i] = tmp[6];
+            self.lbuf[1][i] = tmp[7];
+            self.lbuf[2][i] = tmp[0];
+            self.lbuf[3][i] = tmp[1];
+            self.lbuf[4][i] = [tmp[2][0] + tmp[5][0], tmp[2][1] + tmp[5][1]];
+            self.lbuf[5][i] = [tmp[3][0] + tmp[4][0], tmp[3][1] + tmp[4][1]];
+            // band 1's sum lands on the upper sub-band (7), band 2's on the lower (8): the bands alternate in direction
+            for (band, (k_sum, k_diff)) in [(1usize, (7usize, 6usize)), (2, (8, 9))] {
+                let w = &self.in_buf[band][i..i + 13];
+                let inp = [g1[6] * w[6][0], g1[6] * w[6][1]];
+                let mut op = [0.0f32; 2];
+                for j in (0..6).step_by(2) {
+                    op[0] += g1[j + 1] * (w[j + 1][0] + w[11 - j][0]);
+                    op[1] += g1[j + 1] * (w[j + 1][1] + w[11 - j][1]);
+                }
+                self.lbuf[k_sum][i] = [inp[0] + op[0], inp[1] + op[1]];
+                self.lbuf[k_diff][i] = [inp[0] - op[0], inp[1] - op[1]];
+            }
+            for k in 3..64 { self.lbuf[k + 7][i] = [x_re[i][k], x_im[i][k]]; }
+        }
+        for b in 0..3 { self.in_buf[b].copy_within(32..38, 0); }
+    }
+
+    /// Decorrelation (§8.6.4.5) of `lbuf` into `rbuf`, with the transient attenuation per parameter band.
+    fn decorrelate(&mut self) {
+        const PEAK_DECAY: f32 = 0.76592833836465;
+        const A_SMOOTH: f32 = 0.25;
+        const TRANSIENT_IMPACT: f32 = 1.5;
+        let mut power = [[0.0f32; 32]; PS_PAR_BANDS];
+        for k in 0..PS_BANDS {
+            let i = t::PS_K_TO_I_20[k] as usize;
+            for n in 0..32 { let v = self.lbuf[k][n]; power[i][n] += v[0] * v[0] + v[1] * v[1]; }
+        }
+        let mut gain = [[0.0f32; 32]; PS_PAR_BANDS];
+        for i in 0..PS_PAR_BANDS {
+            for n in 0..32 {
+                self.peak_decay_nrg[i] = (PEAK_DECAY * self.peak_decay_nrg[i]).max(power[i][n]);
+                self.power_smooth[i] += A_SMOOTH * (power[i][n] - self.power_smooth[i]);
+                self.peak_decay_diff_smooth[i] += A_SMOOTH * (self.peak_decay_nrg[i] - power[i][n] - self.peak_decay_diff_smooth[i]);
+                let denom = TRANSIENT_IMPACT * self.peak_decay_diff_smooth[i];
+                gain[i][n] = if denom > self.power_smooth[i] { self.power_smooth[i] / denom } else { 1.0 };
+            }
+        }
+        for k in 0..PS_BANDS {
+            let i = t::PS_K_TO_I_20[k] as usize;
+            let d = &mut self.delay[k];
+            d.copy_within(32..32 + PS_MAX_DELAY, 0);
+            d[PS_MAX_DELAY..].copy_from_slice(&self.lbuf[k]);
+            if k < PS_AP_BANDS {
+                // H(z) = z^-2 phi_fract Π_m (Q_fract z^-d(m) - a(m) g) / (1 - a(m) g Q_fract z^-d(m)), d = 3, 4, 5
+                let g_decay = (1.0 - PS_DECAY_SLOPE * (k as f32 - PS_DECAY_CUTOFF)).clamp(0.0, 1.0);
+                let ag = [t::PS_ALLPASS_A[0] * g_decay, t::PS_ALLPASS_A[1] * g_decay, t::PS_ALLPASS_A[2] * g_decay];
+                let ap = &mut self.ap_delay[k];
+                for m in 0..3 { ap[m].copy_within(32..37, 0); }
+                for n in 0..32 {
+                    let mut v = cmul(d[PS_MAX_DELAY - 2 + n], self.phi_fract[k]);
+                    for m in 0..3 {
+                        let link = cmul(ap[m][n + 2 - m], self.q_fract[k][m]);
+                        let next = [link[0] - ag[m] * v[0], link[1] - ag[m] * v[1]];
+                        ap[m][n + 5] = [v[0] + ag[m] * next[0], v[1] + ag[m] * next[1]];
+                        v = next;
+                    }
+                    self.rbuf[k][n] = [gain[i][n] * v[0], gain[i][n] * v[1]];
+                }
+            } else {
+                let lag = if k < PS_SHORT_DELAY_BAND { 14 } else { 1 };
+                for n in 0..32 { let v = d[PS_MAX_DELAY - lag + n]; self.rbuf[k][n] = [gain[i][n] * v[0], gain[i][n] * v[1]]; }
+            }
+        }
+    }
+
+    /// Stereo mixing (§8.6.4.6): per envelope and parameter band the rotation from IID/ICC (+ IPD/OPD phases),
+    /// interpolated slot by slot from the previous envelope's, applied to (s = lbuf, d = rbuf) -> (L, R).
+    fn stereo_mix(&mut self) {
+        let (mut iid, mut icc, mut ipd, mut opd) = ([[0i8; PS_PARS]; PS_ENVS], [[0i8; PS_PARS]; PS_ENVS], [[0i8; PS_PARS]; PS_ENVS], [[0i8; PS_PARS]; PS_ENVS]);
+        let ne = self.num_env.min(PS_ENVS - 1);
+        if self.num_env_old > 0 {
+            let o = self.num_env_old.min(PS_ENVS);
+            for hm in self.h.iter_mut() { for part in hm.iter_mut() { part[0] = part[o]; } }
+        }
+        for e in 0..ne {
+            remap20(&mut iid[e], &self.iid_par[e], self.nr_iid_par, true);
+            remap20(&mut icc[e], &self.icc_par[e], self.nr_icc_par, true);
+            if self.enable_ipdopd {
+                remap20(&mut ipd[e], &self.ipd_par[e], self.nr_ipdopd_par, false);
+                remap20(&mut opd[e], &self.opd_par[e], self.nr_ipdopd_par, false);
+            }
+        }
+        let lut = if self.icc_mode < 3 { &self.ha } else { &self.hb };
+        let ipdopd = self.enable_ipdopd;
+        for e in 0..ne {
+            for b in 0..PS_PAR_BANDS {
+                let idx = (iid[e][b] as i32 + 7 + 23 * self.iid_quant as i32).clamp(0, 45) as usize;
+                let mut hh = lut[idx][(icc[e][b] as usize).min(7)];
+                if ipdopd && b < PS_IPD_BANDS {
+                    let oi = self.opd_hist[b] as usize * 8 + (opd[e][b] as usize & 7);
+                    let ii = self.ipd_hist[b] as usize * 8 + (ipd[e][b] as usize & 7);
+                    let (o, p) = (self.pd_smooth[oi], self.pd_smooth[ii]);
+                    self.opd_hist[b] = (oi & 0x3f) as i8;
+                    self.ipd_hist[b] = (ii & 0x3f) as i8;
+                    let adj = [o[0] * p[0] + o[1] * p[1], o[1] * p[0] - o[0] * p[1]];
+                    let im = [hh[0] * o[1], hh[1] * adj[1], hh[2] * o[1], hh[3] * adj[1]];
+                    hh = [hh[0] * o[0], hh[1] * adj[0], hh[2] * o[0], hh[3] * adj[0]];
+                    for j in 0..4 { self.h[j][1][e + 1][b] = im[j]; }
+                }
+                for j in 0..4 { self.h[j][0][e + 1][b] = hh[j]; }
+            }
+            let (start, stop) = (self.border[e], self.border[e + 1]);
+            if stop <= start { continue; }
+            let len = (stop - start) as usize;
+            let width = 1.0 / len as f32;
+            for k in 0..PS_BANDS {
+                let b = t::PS_K_TO_I_20[k] as usize;
+                let mut h0 = [0.0f32; 4];
+                let mut h1 = [0.0f32; 4];
+                let mut s0 = [0.0f32; 4];
+                let mut s1 = [0.0f32; 4];
+                for j in 0..4 {
+                    h0[j] = self.h[j][0][e][b];
+                    s0[j] = (self.h[j][0][e + 1][b] - h0[j]) * width;
+                    if ipdopd {
+                        // the two lowest hybrid bands carry negative frequencies: their phase turns the other way
+                        h1[j] = if k <= 1 { -self.h[j][1][e][b] } else { self.h[j][1][e][b] };
+                        s1[j] = (self.h[j][1][e + 1][b] - h1[j]) * width;
+                    }
+                }
+                let first = (start + 1) as usize;
+                for n in first..(first + len).min(32) {
+                    for j in 0..4 { h0[j] += s0[j]; h1[j] += s1[j]; }
+                    let (l, r) = (self.lbuf[k][n], self.rbuf[k][n]);
+                    self.lbuf[k][n] = [h0[0] * l[0] + h0[2] * r[0] - h1[0] * l[1] - h1[2] * r[1], h0[0] * l[1] + h0[2] * r[1] + h1[0] * l[0] + h1[2] * r[0]];
+                    self.rbuf[k][n] = [h0[1] * l[0] + h0[3] * r[0] - h1[1] * l[1] - h1[3] * r[1], h0[1] * l[1] + h0[3] * r[1] + h1[1] * l[0] + h1[3] * r[0]];
+                }
+            }
+        }
+    }
+}
+
+/// One envelope's parameters (iid/icc/ipd/opd) of `num` bands, delta coded in frequency or in time (`dt`: against the
+/// previous envelope, or the previous frame's last); symbol - `offset`, `mask` (IPD/OPD: modulo 8), refused unless `ok`.
+#[allow(clippy::too_many_arguments)]
+fn read_par(r: &mut BitReader, book: &Huff, offset: i32, mask: i32, par: &mut PsPar, num: usize, e: usize, num_env_old: usize, dt: bool, ok: impl Fn(i32) -> bool) -> Result<()> {
+    let prev = if e > 0 { e - 1 } else { num_env_old.saturating_sub(1) };
+    let mut acc = 0i32;
+    for b in 0..num.min(PS_PARS) {
+        let d = book.decode(r)? as i32 - offset;
+        let v = if dt { par[prev][b] as i32 + d } else { acc + d };
+        let v = if mask != 0 { v & mask } else { v };
+        acc = v;
+        if !ok(v) { return Err(bad()); }
+        par[e][b] = v as i8;
+    }
+    Ok(())
+}
+
+/// Parameters at 10 or 34 band resolution (IID/ICC; 5 or 17 for IPD/OPD) on the 20-band grid (Table 8.46); `full`
+/// false maps only the IPD/OPD bands.
+fn remap20(out: &mut [i8; PS_PARS], par: &[i8; PS_PARS], num: usize, full: bool) {
+    let p = |i: usize| par[i] as i32;
+    match num {
+        34 | 17 => {
+            let m: [i32; 11] = [(2 * p(0) + p(1)) / 3, (p(1) + 2 * p(2)) / 3, (2 * p(3) + p(4)) / 3, (p(4) + 2 * p(5)) / 3, (p(6) + p(7)) / 2,
+                (p(8) + p(9)) / 2, p(10), p(11), (p(12) + p(13)) / 2, (p(14) + p(15)) / 2, p(16)];
+            for (o, v) in out.iter_mut().zip(m) { *o = v as i8; }
+            if full {
+                let m: [i32; 9] = [p(17), p(18), p(19), (p(20) + p(21)) / 2, (p(22) + p(23)) / 2, (p(24) + p(25)) / 2, (p(26) + p(27)) / 2,
+                    (p(28) + p(29) + p(30) + p(31)) / 4, (p(32) + p(33)) / 2];
+                for (o, v) in out[11..].iter_mut().zip(m) { *o = v as i8; }
+            }
+        }
+        10 | 5 => {
+            let n = if full { 10 } else { out[10] = 0; 5 };
+            for b in (0..n).rev() { out[2 * b] = par[b]; out[2 * b + 1] = par[b]; }
+        }
+        _ => *out = *par,
+    }
+}
+
+/// Hybrid synthesis (§8.6.4.7): the sub-bands of QMF bands 0..2 summed, bands 3..63 passed back, into X's 32 slots.
+fn hybrid_synthesis(buf: &[[Cx; 32]], x_re: &mut [[f32; 64]], x_im: &mut [[f32; 64]]) {
+    for n in 0..32 {
+        let sum = |a: usize, b: usize| -> Cx { buf[a..b].iter().fold([0.0f32; 2], |s, v| [s[0] + v[n][0], s[1] + v[n][1]]) };
+        for (k, v) in [sum(0, 6), sum(6, 8), sum(8, 10)].into_iter().enumerate() { x_re[n][k] = v[0]; x_im[n][k] = v[1]; }
+        for k in 3..64 { x_re[n][k] = buf[k + 7][n][0]; x_im[n][k] = buf[k + 7][n][1]; }
+    }
+}
+
+impl Sbr {
+    /// HEAACSBR-PS: the mono channel's X through the PS stage (or, before the first PS header, copied: the duplicate),
+    /// L synthesised on channel 0 into `out[0]`, R on the last channel's delay line into `out[1]`.
+    fn ps_synthesis(&mut self, e: &Elem, out: &mut [Vec<f32>]) {
+        let top = (e.kx[1] + e.m[1]).min(64);
+        {
+            let s = &mut *self.s;
+            let Some(ps) = self.ps.as_mut() else { return };
+            if ps.start {
+                ps.apply(&mut s.x_re, &mut s.x_im, &mut s.x2_re, &mut s.x2_im, top);
+            } else {
+                s.x2_re.copy_from_slice(&s.x_re);
+                s.x2_im.copy_from_slice(&s.x_im);
+            }
+        }
+        self.synthesis(0, &mut out[0][..2048]);
+        core::mem::swap(&mut self.s.x_re, &mut self.s.x2_re);
+        core::mem::swap(&mut self.s.x_im, &mut self.s.x2_im);
+        let rc = self.chans.len() - 1;
+        self.synthesis(rc, &mut out[1][..2048]);
+        core::mem::swap(&mut self.s.x_re, &mut self.s.x2_re);
+        core::mem::swap(&mut self.s.x_im, &mut self.s.x2_im);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod ps_tests {
+    use super::*;
+
+    /// The ten PS codebooks with the spec's sizes (held to complete prefix codes by tests::codebooks_are_complete_prefix_codes).
+    pub(crate) fn books() -> [(&'static [u32], &'static [u8], usize); 10] {
+        [
+            (&t::PS_HUFF_IID_DF1_CODES, &t::PS_HUFF_IID_DF1_BITS, 61),
+            (&t::PS_HUFF_IID_DT1_CODES, &t::PS_HUFF_IID_DT1_BITS, 61),
+            (&t::PS_HUFF_IID_DF0_CODES, &t::PS_HUFF_IID_DF0_BITS, 29),
+            (&t::PS_HUFF_IID_DT0_CODES, &t::PS_HUFF_IID_DT0_BITS, 29),
+            (&t::PS_HUFF_ICC_DF_CODES, &t::PS_HUFF_ICC_DF_BITS, 15),
+            (&t::PS_HUFF_ICC_DT_CODES, &t::PS_HUFF_ICC_DT_BITS, 15),
+            (&t::PS_HUFF_IPD_DF_CODES, &t::PS_HUFF_IPD_DF_BITS, 8),
+            (&t::PS_HUFF_IPD_DT_CODES, &t::PS_HUFF_IPD_DT_BITS, 8),
+            (&t::PS_HUFF_OPD_DF_CODES, &t::PS_HUFF_OPD_DF_BITS, 8),
+            (&t::PS_HUFF_OPD_DT_CODES, &t::PS_HUFF_OPD_DT_BITS, 8),
+        ]
+    }
+
+    struct Lcg(u32);
+    impl Lcg {
+        fn next(&mut self) -> f32 { self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223); (self.0 >> 8) as f32 / (1u32 << 24) as f32 - 0.5 }
+    }
+
+    /// One envelope over the whole frame with every parameter band at (`iid`, `icc`), as a parsed header leaves it.
+    fn set_params(ps: &mut Ps, iid: i8, icc: i8, quant: bool, icc_mode: usize) {
+        ps.start = true;
+        ps.enable_iid = true;
+        ps.enable_icc = true;
+        ps.iid_quant = quant;
+        ps.icc_mode = icc_mode;
+        ps.nr_iid_par = 20;
+        ps.nr_icc_par = 20;
+        ps.num_env = 1;
+        ps.border[0] = -1;
+        ps.border[1] = 31;
+        for b in 0..PS_PARS { ps.iid_par[0][b] = iid; ps.icc_par[0][b] = icc; }
+    }
+
+    /// L/R power ratio (dB) and normalised coherence Re(Σ L R*) / sqrt(Σ|L|² Σ|R|²).
+    fn ratio_coherence(l: &[Cx], r: &[Cx]) -> (f64, f64) {
+        let (mut pl, mut pr, mut x) = (0f64, 0f64, 0f64);
+        for (a, b) in l.iter().zip(r) {
+            pl += (a[0] * a[0] + a[1] * a[1]) as f64;
+            pr += (b[0] * b[0] + b[1] * b[1]) as f64;
+            x += (a[0] * b[0] + a[1] * b[1]) as f64;
+        }
+        (10.0 * math::log10(pl / pr), x / math::sqrt(pl * pr))
+    }
+
+    /// HEAACSBR-PS unit KAT (mixing): with s and d of equal power and orthogonal (d = i s, unit modulus, random phase),
+    /// every IID (15 default, 31 fine steps) x ICC (8) on mixing A and B gives L/R the IID's level difference within
+    /// 0.5 dB and the ICC's coherence within 0.02 (mixing B: max(ICC, 0.05), its definition).
+    #[test]
+    fn mixing_matches_iid_icc() {
+        let mut ps = Ps::new();
+        let mut rng = Lcg(5);
+        let mut checked = 0;
+        for (quant, steps) in [(false, 7i8), (true, 15)] {
+            for iid in -steps..=steps {
+                for icc in 0..8i8 {
+                    for mode in [0usize, 3] {
+                        set_params(&mut ps, iid, icc, quant, mode);
+                        // frame 1 ramps H from the previous frame's; frame 2 holds it
+                        for frame in 0..2 {
+                            ps.num_env_old = frame;
+                            for k in 0..PS_BANDS {
+                                for n in 0..32 {
+                                    let c = cis(2.0 * core::f64::consts::PI * rng.next() as f64);
+                                    ps.lbuf[k][n] = c;
+                                    ps.rbuf[k][n] = [-c[1], c[0]];
+                                }
+                            }
+                            ps.stereo_mix();
+                        }
+                        let l: Vec<Cx> = ps.lbuf.iter().flat_map(|b| b.iter().copied()).collect();
+                        let r: Vec<Cx> = ps.rbuf.iter().flat_map(|b| b.iter().copied()).collect();
+                        let (ratio, coh) = ratio_coherence(&l, &r);
+                        let want_ratio = 20.0 * math::log10(t::PS_IID_DEQUANT[(iid as i32 + 7 + 23 * quant as i32) as usize] as f64);
+                        let icc_v = t::PS_ICC_INVQ[icc as usize] as f64;
+                        let want_coh = if mode < 3 { icc_v } else { icc_v.max(0.05) };
+                        assert!((ratio - want_ratio).abs() < 0.5, "iid {} (fine {}) icc {} mode {}: ratio {:.3} dB, want {:.3}", iid, quant, icc, mode, ratio, want_ratio);
+                        assert!((coh - want_coh).abs() < 0.02, "iid {} (fine {}) icc {} mode {}: coherence {:.4}, want {:.4}", iid, quant, icc, mode, coh, want_coh);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, (15 + 31) * 8 * 2);
+    }
+
+    /// Run `frames` frames of a continuous complex noise stream in the QMF domain through the whole PS stage (each
+    /// frame's X = 38 stream slots, the last 6 being the next frame's first: x_gen's lookahead); returns per frame
+    /// (input slots, L, R) as flat [band-major] vectors of the 32 output slots.
+    fn run_stage(ps: &mut Ps, frames: usize) -> Vec<(Vec<Cx>, Vec<Cx>, Vec<Cx>)> {
+        let mut rng = Lcg(9);
+        let stream: Vec<[Cx; 64]> = (0..32 * frames + 6).map(|_| { let mut s = [[0.0f32; 2]; 64]; for v in s.iter_mut() { *v = [rng.next(), rng.next()]; } s }).collect();
+        let mut out = Vec::new();
+        for f in 0..frames {
+            let (mut xr, mut xi) = (vec![[0.0f32; 64]; 38], vec![[0.0f32; 64]; 38]);
+            let (mut x2r, mut x2i) = (vec![[0.0f32; 64]; 38], vec![[0.0f32; 64]; 38]);
+            for l in 0..38 { for k in 0..64 { xr[l][k] = stream[32 * f + l][k][0]; xi[l][k] = stream[32 * f + l][k][1]; } }
+            ps.num_env_old = if f == 0 { 0 } else { 1 };
+            ps.apply(&mut xr, &mut xi, &mut x2r, &mut x2i, 64);
+            let flat = |re: &[[f32; 64]], im: &[[f32; 64]]| -> Vec<Cx> { (0..64).flat_map(|k| (0..32).map(move |n| [re[n][k], im[n][k]])).collect() };
+            let st = &stream;
+            let inp: Vec<Cx> = (0..64).flat_map(|k| (0..32).map(move |n| st[32 * f + n][k])).collect();
+            out.push((inp, flat(&xr, &xi), flat(&x2r, &x2i)));
+        }
+        out
+    }
+
+    /// HEAACSBR-PS unit KAT (passthrough): with no IID and no ICC (the bear v2 stream's PS) the whole stage —
+    /// hybrid analysis, decorrelation, mixing, hybrid synthesis — returns the input on both channels, slot-aligned,
+    /// within 1e-5 relative (the hybrid filters sum to a unit impulse at their centre tap).
+    #[test]
+    fn identity_is_passthrough() {
+        let mut ps = Ps::new();
+        set_params(&mut ps, 0, 0, false, 0);
+        ps.enable_iid = false;
+        ps.enable_icc = false;
+        for (f, (inp, l, r)) in run_stage(&mut ps, 5).into_iter().enumerate().skip(1) {
+            let p: f64 = inp.iter().map(|v| (v[0] * v[0] + v[1] * v[1]) as f64).sum();
+            for (name, got) in [("L", &l), ("R", &r)] {
+                let e: f64 = inp.iter().zip(got.iter()).map(|(a, b)| { let (d0, d1) = ((a[0] - b[0]) as f64, (a[1] - b[1]) as f64); d0 * d0 + d1 * d1 }).sum();
+                assert!(math::sqrt(e / p) < 1e-5, "frame {} {}: relative error {:e}", f, name, math::sqrt(e / p));
+            }
+        }
+    }
+
+    /// HEAACSBR-PS unit KAT (whole stage, IID): IID +10 dB, ICC 1 on noise: L/R power within 0.5 dB of 10 dB and
+    /// coherence above 0.98, through the decorrelator and the hybrid bank.
+    #[test]
+    fn stage_iid() {
+        let mut ps = Ps::new();
+        set_params(&mut ps, 4, 0, false, 0);
+        let want = 20.0 * math::log10(t::PS_IID_DEQUANT[11] as f64);
+        for (f, (_, l, r)) in run_stage(&mut ps, 5).into_iter().enumerate().skip(1) {
+            let (ratio, coh) = ratio_coherence(&l, &r);
+            assert!((ratio - want).abs() < 0.5 && (want - 10.0).abs() < 0.01, "frame {}: ratio {:.3} dB, want {:.3}", f, ratio, want);
+            assert!(coh > 0.98, "frame {}: coherence {:.4}", f, coh);
+        }
     }
 }

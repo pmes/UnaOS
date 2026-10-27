@@ -293,9 +293,10 @@ pub struct AacDecoder {
     pub sbr_seen: bool,
     /// HEAACSBR (LEDGER SR198): the SBR tool, when on (`enable_sbr`): `out` is then 2048 samples per channel.
     sbr: Option<alloc::boxed::Box<super::sbr::Sbr>>,
-    /// A parametric stereo extension was seen (`ps=seen`): its synthesis is owed (HEAACSBR-PS).
+    /// A parametric stereo extension was seen (`ps=seen`).
     pub ps_seen: bool,
-    /// PS on a mono core: `out[1]` duplicates `out[0]`.
+    /// PS on a mono core: `out[1]` is the parametric stereo right channel (HEAACSBR-PS, LEDGER SR214; the mono core on
+    /// both channels until the first PS header).
     ps_dup: bool,
     /// The PCE seen in-band (channelConfiguration 0).
     pub pce: Option<Pce>,
@@ -446,10 +447,10 @@ impl AacDecoder {
     }
 
     /// HEAACSBR (LEDGER SR198): switch the SBR tool on — the output doubles to 2048 samples per channel at twice the
-    /// core rate; `ps` (a parametric stereo stream on a mono core) adds a second channel duplicating the first.
+    /// core rate; `ps` (a parametric stereo stream on a mono core) adds the second channel the PS stage synthesises.
     pub fn enable_sbr(&mut self, ps: bool) {
         let n = self.layout.channels;
-        self.sbr = Some(alloc::boxed::Box::new(super::sbr::Sbr::new(super::RATES[self.sf_index], n)));
+        self.sbr = Some(alloc::boxed::Box::new(super::sbr::Sbr::new(super::RATES[self.sf_index], n, ps && n == 1)));
         self.ps_dup = ps && n == 1;
         self.ps_seen |= ps;
         self.out = vec![vec![0.0; 2048]; if self.ps_dup { 2 } else { n }];
@@ -468,10 +469,6 @@ impl AacDecoder {
             for &c in &ochs[..k] { if c < n { covered[c] = true; } }
         }
         for (c, cov) in covered.iter().enumerate() { if !cov { s.apply(None, &[c], &mut self.out); } }
-        if self.ps_dup && self.out.len() == 2 {
-            let (a, b) = self.out.split_at_mut(1);
-            b[0].copy_from_slice(&a[0]);
-        }
     }
 
     fn ics_info(&self, r: &mut BitReader) -> Result<Ics> {

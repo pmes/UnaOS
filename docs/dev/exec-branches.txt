@@ -837,7 +837,7 @@ refs/heads/exec-rmbp-h264enc2   9f778dc37 FOLDED-BY-HAND (this commit) 2026-10-2
 refs/heads/exec-rmbp-httpfail   d78ff23a7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-wpa2join   1705724a4 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-demuxwire   03ecb5366 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-heaacps   1705724a4 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-heaacps   bb1c77e81 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hevcpal   1d99c4ae9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-hevcinter   1d99c4ae9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-hevcheic   1d99c4ae9 IN-FLIGHT cut 2026-10-27
