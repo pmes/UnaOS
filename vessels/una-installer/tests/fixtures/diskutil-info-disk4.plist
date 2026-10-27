@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BusProtocol</key>
+	<string>USB</string>
+	<key>Content</key>
+	<string>GUID_partition_scheme</string>
+	<key>DeviceBlockSize</key>
+	<integer>512</integer>
+	<key>DeviceIdentifier</key>
+	<string>disk4</string>
+	<key>DeviceNode</key>
+	<string>/dev/disk4</string>
+	<key>Ejectable</key>
+	<true/>
+	<key>Internal</key>
+	<false/>
+	<key>MediaName</key>
+	<string>SD Card Reader</string>
+	<key>MountPoint</key>
+	<string></string>
+	<key>OSInternalMedia</key>
+	<false/>
+	<key>Removable</key>
+	<true/>
+	<key>RemovableMedia</key>
+	<true/>
+	<key>RemovableMediaOrExternalDevice</key>
+	<true/>
+	<key>Size</key>
+	<integer>63864569856</integer>
+	<key>TotalSize</key>
+	<integer>63864569856</integer>
+	<key>VirtualOrPhysical</key>
+	<string>Physical</string>
+	<key>WholeDisk</key>
+	<true/>
+	<key>Writable</key>
+	<true/>
+</dict>
+</plist>

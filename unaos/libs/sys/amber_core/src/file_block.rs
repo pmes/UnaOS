@@ -63,3 +63,13 @@ impl Block for FileBlock {
         Ok(())
     }
 }
+
+// INSTALLERCARD (LEDGER SR414, the seat's grant): a device whose length `seek(End)` cannot report (macOS
+// `/dev/diskN` answers 0) is opened at the size the caller read elsewhere (`diskutil info` Size / 512); every
+// access stays bounded by it, exactly as `with` bounds a measured length.
+impl FileBlock {
+    /// Open read-write at a caller-supplied size (the caller has already applied its safety policy).
+    pub fn open_rw_sectors(path: &Path, sectors: u64) -> std::io::Result<Self> {
+        Ok(Self { file: OpenOptions::new().read(true).write(true).open(path)?, sectors, writable: true })
+    }
+}
