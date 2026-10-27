@@ -554,7 +554,7 @@ pub fn memline_selftest() {
         "rebuild"
     };
     let builds = MEM_BUILDS.load(Acquire);
-    let (used, high, furn, delta) = (MEM_USED.load(Relaxed), MEM_HIGH.load(Relaxed), MEM_FURN.load(Relaxed), MEM_DELTA.load(Relaxed)); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let delta = memcensus::report(MEM_FIRST_HIGH.load(Relaxed), high, delta); // MEMLINE2 (B821): the census lines; the delta scored is net of the count-once growth (raw printed beside). LINE-NEUTRAL append, code first
+    let (used, high, furn, delta) = (MEM_USED.load(Relaxed), MEM_HIGH.load(Relaxed), MEM_FURN.load(Relaxed), MEM_DELTA.load(Relaxed)); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let (delta, rl) = memcensus::report(MEM_FIRST_HIGH.load(Relaxed), high, delta, src); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let src = rl.as_str(); // MEMLINE2 (B821): the census lines; the delta scored is net of the count-once growth (raw printed beside). MEMLINEREBUILD (B1009): a rebuild scored net of the session's retained set; `src=` carries `retained_kb= leaked_kb=`. LINE-NEUTRAL append, code first
     let furn_read = furn != u64::MAX;
     let (high_kb, furn_kb) = (high / 1024, if furn_read { furn / 1024 } else { 0 });
     let measured = builds >= 2 && high > 0 && furn_read;
@@ -626,12 +626,23 @@ mod memcensus {
         SNAPS.lock()[BEFORE] = Some(s);
     }
 
-    /// `tests memline`: print the census and return the delta net of the count-once growth (`raw` when unread).
-    pub(super) fn report(first_high: u64, high: u64, raw: i64) -> i64 {
+    // MEMLINEREBUILD (rmbp-ledger B1009, BP-video-18). Flight 38 boot 1: `logout_delta_pct=29 -> FAIL :: src=rebuild`
+    // with the round trip FLAT (census BEFORE == AFTER, three rebuilds at one heap_kb, MEMLEAK leak_rows=0) — the 29 %
+    // was the session's growth between the first build and the teardown, held by non-desktop owners (the boot list's
+    // fixture children, the render task, the U5x launcher), charged to the desktop by scoring against FIRST's high.
+    // retained = BEFORE.used - FIRST.used (any owner, the session's growth before the teardown); leaked = AFTER.used -
+    // BEFORE.used, signed (the round trip's net; negative = teardown freed session state). `src=rebuild` (the
+    // fixture's own teardown just took BEFORE) scores delta_pct(first_high, high - retained - once_rt), once_rt = the
+    // count-once tags' growth BEFORE -> AFTER (their FIRST -> BEFORE growth is inside retained): a round-trip leak or a
+    // fatter build transient still lands in `high`. `src=logout` scores as MEMLINE2 did (owed MEMLINE-LOGOUT). The
+    // second value is `<src> retained_kb=<n> leaked_kb=<n>` (`?` when the census is unread) for the `:: MEMLINE:` line.
+    /// `tests memline`: print the census and return the delta net of the count-once growth (`raw` when unread), with
+    /// the `src=` word carrying `retained_kb= leaked_kb=` (MEMLINEREBUILD B1009).
+    pub(super) fn report(first_high: u64, high: u64, raw: i64, src: &str) -> (i64, alloc::string::String) {
         let snaps = *SNAPS.lock();
         let (Some(f), Some(a)) = (snaps[FIRST], snaps[AFTER]) else {
             serial_println!("[memline] census absent first={} after={} raw_delta_pct={}", snaps[FIRST].is_some() as u8, snaps[AFTER].is_some() as u8, raw);
-            return raw;
+            return (raw, alloc::format!("{} retained_kb=? leaked_kb=?", src));
         };
         let b = snaps[BEFORE].unwrap_or(a);
         // Every owner any of the three saw, with its growth since FIRST; largest |growth| first.
@@ -667,6 +678,14 @@ mod memcensus {
             top.push('-');
         }
         serial_println!("[memline] top {} once_kb={} once=stage,shadow,wallpaper,help raw_delta_pct={}", top, once / 1024, raw);
-        super::delta_pct(first_high, high.saturating_sub(once))
+        let retained = b.used.saturating_sub(f.used); // MEMLINEREBUILD (B1009): the session's growth before the teardown
+        let leaked = a.used as i64 - b.used as i64;
+        let scored = if src == "rebuild" && snaps[BEFORE].is_some() {
+            let once_rt: u64 = ONCE.iter().map(|t| a.bytes_of(t, true).saturating_sub(b.bytes_of(t, true))).sum();
+            high.saturating_sub(retained.saturating_add(once_rt))
+        } else {
+            high.saturating_sub(once)
+        };
+        (super::delta_pct(first_high, scored), alloc::format!("{} retained_kb={} leaked_kb={}", src, retained / 1024, leaked / 1024))
     }
 }
