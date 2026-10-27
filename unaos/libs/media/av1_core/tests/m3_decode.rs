@@ -8,8 +8,8 @@
 //! see docs/dev/evidence/media-1004/AVCODEC.md for the per-vector PSNR table. A change that moves
 //! one of these hashes has changed decoded pixels and must be re-proven against the oracle.
 mod common;
-use av1_core::image::{decode_avif, decode_avif_planes, Filters};
-use common::{fetch, fnv64};
+use av1_core::image::{planes_to_rgba, Filters, Upsampling};
+use common::{avif_planes, fetch, fnv64};
 
 /// name, width, height, bit depth, FNV-1a 64 of Y‖U‖V.
 const PINNED: &[(&str, u32, u32, u32, u64)] = &[
@@ -53,7 +53,7 @@ fn intra_vectors_decode_to_pinned_planes() {
         "sdr_cosmos01000_cicp1-13-6_yuv444_full_qp40",
     ] {
         let Some(file) = fetch(name) else { continue };
-        let p = decode_avif_planes(&file, Filters::default()).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let p = avif_planes(&file, Filters::default()).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert!(p.stats.tiles_exit_ok > 0 && p.stats.tiles_exit_bad == 0, "{name}: exit_symbol padding check failed on {} tile(s)", p.stats.tiles_exit_bad);
         let h = fnv64(&[&p.y, &p.u, &p.v]);
         if print {
@@ -64,7 +64,7 @@ fn intra_vectors_decode_to_pinned_planes() {
         assert_eq!((p.width, p.height, p.bit_depth), (pin.1, pin.2, pin.3), "{name}: geometry");
         assert_eq!(h, pin.4, "{name}: decoded planes changed (FNV-1a 64 0x{h:016x})");
         // The RGBA face is total: one pixel per luma sample.
-        let img = decode_avif(&file).unwrap();
+        let img = planes_to_rgba(&p, Upsampling::Bilinear);
         assert_eq!(img.rgba.len(), (img.w * img.h * 4) as usize);
         checked += 1;
     }
@@ -73,19 +73,11 @@ fn intra_vectors_decode_to_pinned_planes() {
 
 #[test]
 fn stream_decoder_matches_the_still_path() {
-    // The video seam (StreamDecoder): an AV1 key frame fed as one temporal unit, with the av1C
-    // record rebuilt from the container's parsed fields, decodes to the same planes as the AVIF path.
+    // The video seam (StreamDecoder): an AV1 key frame fed as one temporal unit, with the item's own av1C
+    // record (as demux_core's HEIF reader hands it), decodes to the same planes as the AVIF path.
     let Some(file) = fetch("kodim23_yuv420_8bpc") else { return };
-    let item = av1_core::avif_payload(&file).unwrap();
-    let c = item.av1c.clone().unwrap();
-    let mut av1c = vec![
-        0x81,
-        (c.seq_profile << 5) | c.seq_level_idx_0,
-        (c.seq_tier_0 << 7) | ((c.high_bitdepth as u8) << 6) | ((c.twelve_bit as u8) << 5) | ((c.monochrome as u8) << 4) | ((c.chroma_subsampling_x as u8) << 3) | ((c.chroma_subsampling_y as u8) << 2) | c.chroma_sample_position,
-        0,
-    ];
-    av1c.extend_from_slice(&c.config_obus);
-    let mut d = av1_core::image::StreamDecoder::new(&av1c).unwrap();
+    let item = common::avif_item(&file).unwrap();
+    let mut d = av1_core::image::StreamDecoder::new(item.av1c.as_deref().unwrap()).unwrap();
     let p = d.decode_temporal_unit(&item.data).unwrap();
     let pin = PINNED.iter().find(|x| x.0 == "kodim23_yuv420_8bpc").unwrap();
     assert_eq!(fnv64(&[&p.y, &p.u, &p.v]), pin.4);
