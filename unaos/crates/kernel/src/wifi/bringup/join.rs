@@ -39,12 +39,12 @@ pub(super) struct Heard {
     /// STATIONRATE (B855): the rate set S9's ASSOCIATED answer listed (`None` = unread); `keep` picks the station's rate from it.
     pub rates: Option<wifi_core::ieee80211::RateSet>,
     /// STATIONSHORTPRE (B862): S9's ASSOCIATED answer set the capability Short Preamble bit (`assoc::short_preamble`).
-    pub short: bool, pub gw: Option<[u8; 4]>, pub ring: usize, pub scan: super::super::data::BssTable, pub pin: Option<Mac>, pub home: Option<Mac>, pub gw_mac: Option<Mac>, // STATIONROAM (B897): the scan table, the BSSID a join is pinned to, the BSS last linked, the gateway MAC S10a's ARP reply named; STATIONREJOIN (B891): the gateway S10a ARPed (for `associate`'s S10a) and the rungs' ring base (0 on the boot's pass)
+    pub short: bool, pub gw: Option<[u8; 4]>, pub ring: usize, pub scan: super::super::data::BssTable, pub pin: Option<Mac>, pub home: Option<Mac>, pub gw_mac: Option<Mac>, pub resp: u16, // STATIONROAM-ACTIVE (B951): `resp`, the DS channels (bit c; bit 0 = no DS element) of the SSID's probe responses to us noted in this dwell; STATIONROAM (B897): the scan table, the BSSID a join is pinned to, the BSS last linked, the gateway MAC S10a's ARP reply named; STATIONREJOIN (B891): the gateway S10a ARPed (for `associate`'s S10a) and the rungs' ring base (0 on the boot's pass)
 }
 
 impl Heard {
     pub(super) fn new(me: Mac, ssid: Option<String>) -> Heard {
-        Heard { me, target: ssid.map(|s| s.into_bytes()).unwrap_or_default(), bss: None, frames: Vec::new(), watch: None, rates: None, short: false, gw: None, ring: 0, scan: Default::default(), pin: None, home: None, gw_mac: None }
+        Heard { me, target: ssid.map(|s| s.into_bytes()).unwrap_or_default(), bss: None, frames: Vec::new(), watch: None, rates: None, short: false, gw: None, ring: 0, scan: Default::default(), pin: None, home: None, gw_mac: None, resp: 0 }
     }
 }
 
@@ -598,7 +598,7 @@ fn associate(mut st: Station, pin: Option<(Mac, u8)>) -> Result<Mac, (Station, &
     if retune(&mut st, pch).is_err() {
         return Err(narrow(st, "tune"));
     }
-    st.seen.join.pin = Some(pin);
+    st.seen.join.pin = Some(pin); st.seen.join.ring = (st.link.tx_next() + tx::FRAMES - FRAME_AUTH) % tx::FRAMES; // STATIONROAM-ACTIVE (B951): the rung base re-read after the scan, whose sweep's probes took ring frames (S8 would re-post the last probe's frame: same TXINDEX, never sent)
     let mut waited = 0u32;
     while st.seen.join.bss.is_none() && waited < HEAR_MS {
         rx::poll(st.bar0, &mut st.rxr, &mut st.seen, st.ch, SLICE_US, &mut st.w);
@@ -636,7 +636,8 @@ fn restack() {}
 // ── STATIONROAM (rmbp-ledger B897): another BSS of the same SSID, same channel — a scan window, a pick, `associate` pinned ──
 
 /// From `hear`, for every clean management frame: while a scan window is open, a beacon / probe response of the SSID (open BSSes
-/// only: WPA is unbuilt) into the table with the frame's RSSI (`data::ht_power`) and its DS channel (0 = absent).
+/// only: WPA is unbuilt) into the table with the frame's RSSI (`data::ht_power`) and its DS channel (0 = absent). STATIONROAM-ACTIVE (B951):
+/// a probe response addressed to us also sets its DS channel's bit in `Heard.resp` (`dwell`'s early end).
 fn note(frame: &[u8], rssi: i8, h: &mut Heard) {
     let sub = frame[0] >> 4;
     if !h.scan.is_open() || (sub != 0x8 && sub != 0x5) {
@@ -644,7 +645,7 @@ fn note(frame: &[u8], rssi: i8, h: &mut Heard) {
     }
     if let Some(b) = assoc::bss_match(frame, &h.target) {
         if !b.protected {
-            h.scan.see(b.bssid, b.channel.unwrap_or(0), rssi, crate::arch::ticks());
+            h.scan.see(b.bssid, b.channel.unwrap_or(0), rssi, crate::arch::ticks()); if sub == 0x5 && frame[4..10] == h.me { h.resp |= super::super::data::resp_bit(b.channel.unwrap_or(0)); } // STATIONROAM-ACTIVE (B951): an answer to our probe, by its DS channel
         }
     }
 }
@@ -675,7 +676,7 @@ fn narrow(mut st: Station, rung: &'static str) -> (Station, &'static str) {
 /// `tx::prep`): LINKED -> `keep` refilled `STATION`, and the DHCP socket is reset only when S10a's ARP reply named another gateway
 /// MAC; a failure goes through `lose` ("roam": the line, `REJOIN` armed) back into `STATION`, so the re-join ladder's own scan
 /// window picks again (the old BSS when it is still the strongest). Said once per roam. STATIONROAM-XCHAN (B898): every pass samples
-/// the idle gate (`BssTable::quiet` over `Link.rx_data` / `Queue.posted`); a window that ends with the station quiet and nothing in
+/// the idle gate (`BssTable::quiet` over `Link.rx_uni` / `Queue.posted`; STATIONROAM-IDLEUNI B951: group frames do not count); a window that ends with the station quiet and nothing in
 /// flight is NOT closed under the lock: the Station is TAKEN and, no lock held, `sweep` dwells on the other grid channels inside the
 /// same open window and restores the home channel; then the window closes and `roam_pick` may name a BSS on another channel, which
 /// `associate` retunes to. A sweep that cannot restore the home channel is a loss (`lose(st, "tune")`, the re-join ladder retunes).
@@ -691,7 +692,7 @@ fn roam_step() {
         if st.lost.is_some() {
             return;
         }
-        let quiet = st.seen.join.scan.quiet(st.link.rx_data, st.q.posted, now); // STATIONROAM-XCHAN (B898): the idle gate, sampled every pass
+        let quiet = st.seen.join.scan.quiet(st.link.rx_uni, st.q.posted, now); // STATIONROAM-XCHAN (B898): the idle gate, sampled every pass; STATIONROAM-IDLEUNI (B951): unicast frames to us only
         if st.seen.join.scan.due(now) {
             st.seen.join.scan.open(now);
             rx::scan_filter(st.bar0, true, &mut st.w);
@@ -819,18 +820,19 @@ fn retune(st: &mut Station, ch: u8) -> Result<(), &'static str> {
 /// Inside an OPEN scan window (BEACPROMISC on), on a TAKEN Station: one `ROAM_DWELL_MS` dwell on each channel of
 /// `data::dwell_plan(home)` (the grid without the home channel, which the window already heard), `join::note` filling the table with
 /// each beacon's DS channel, then the home channel restored. The data path stalls for its length (`stall=`). `why`: `idle` (the
-/// gate) or `lost` (the re-join). `Err` only when the home channel could not be restored. Said once per sweep.
+/// gate) or `lost` (the re-join). `Err` only when the home channel could not be restored. Said once per sweep. STATIONROAM-ACTIVE
+/// (B951): each dwell is `dwell` — one probe request, then the receiver until `data::dwell_end` (`probes=`, `answered=`).
 fn sweep(st: &mut Station, why: &str) -> Result<u32, &'static str> {
     let home = st.ch as u8;
     let t0 = crate::arch::ticks();
     let (plan, n) = super::super::data::dwell_plan(home);
-    let mut ok = true;
+    let mut ok = true; let (mut probes, mut answered) = (0u32, 0u32); // STATIONROAM-ACTIVE (B951): probes SENT, dwells answered
     for c in plan[..n].iter() {
         if retune(st, *c).is_err() {
             ok = false;
             break;
         }
-        rx::poll(st.bar0, &mut st.rxr, &mut st.seen, st.ch, super::super::data::ROAM_DWELL_MS * 1000, &mut st.w);
+        let (s, a) = dwell(st); probes += s; answered += a; // STATIONROAM-ACTIVE (B951): one probe, then the dwell (early end on an answer)
     }
     let back = retune(st, home);
     let heard = st.seen.join.scan.e.iter().flatten().filter(|s| s.last_ms >= t0 && s.channel != home).count() as u32;
@@ -843,8 +845,36 @@ fn sweep(st: &mut Station, why: &str) -> Result<u32, &'static str> {
         list.push_str(&alloc::format!("{}", c));
     }
     serial_println!(
-        "[wifi10] station sweep why={} home={} plan={} dwell={}ms heard={} stall={}ms -> {} — the data path stalls for the sweep; the window's own channel is not re-dwelled (STATIONROAM-XCHAN B898)",
-        why, home, list, super::super::data::ROAM_DWELL_MS, heard, stall, if ok && back.is_ok() { "done" } else { "failed:tune" }
+        "[wifi10] station sweep why={} home={} plan={} dwell={}ms heard={} stall={}ms probes={} answered={} -> {} — the data path stalls for the sweep; the window's own channel is not re-dwelled (STATIONROAM-XCHAN B898); one probe request per dwell (STATIONROAM-ACTIVE B951)",
+        why, home, list, super::super::data::ROAM_DWELL_MS, heard, stall, probes, answered, if ok && back.is_ok() { "done" } else { "failed:tune" }
     );
     back.map(|_| heard)
+}
+
+// ── STATIONROAM-ACTIVE (rmbp-ledger B951): one probe request per off-channel dwell, the dwell ended early by an answer ──────────
+
+/// One dwell of `sweep` on the channel the PHY was just retuned to (`Station.ch`; `retune` ended with `rx::resume`, so the MAC is
+/// enabled and the TX header's channel matches the cookie), on a TAKEN Station (it owns `prep` by value: always there). ONE broadcast
+/// probe request — the one template, `tx::probe_request` (§9.3.3.9, wildcard SSID, DS = this channel), S7's frame — at 1 Mbit/s CCK
+/// long, on the Link's next ring frame (`Link::reserve`, `pick_rate`'s shape: the ring never carries a gap) through `tx::fire_frame`
+/// (its bounded status spin reads the probe's own status; `tx::Queue` never sees it, so `posted`, the idle gate and the rate
+/// controller do not count it). Then the receiver in `ROAM_SLICE_MS` slices until `data::dwell_end`: `ROAM_DWELL_MS` from the fire
+/// (the spin counts against it), or `ROAM_PROBE_MS` once a probe response of the SSID to us from a BSS on this channel was noted
+/// (`Heard.resp`, cleared before the fire). Returns (1 if the probe was SENT, 1 if the dwell was answered).
+fn dwell(st: &mut Station) -> (u32, u32) {
+    let ch = st.ch as u8;
+    let t0 = crate::arch::ticks();
+    st.seen.join.resp = 0;
+    let n = st.link.reserve();
+    let probe = tx::probe_request(st.link.mac(), st.ch);
+    let r = tx::fire_frame(st.bar0, &st.prep, &probe, st.ch, n, "sweep-probe", tx::RATE_1M, &mut st.w);
+    loop {
+        let el = crate::arch::ticks().saturating_sub(t0);
+        if super::super::data::dwell_end(ch, st.seen.join.resp, el) {
+            break;
+        }
+        let left = super::super::data::ROAM_DWELL_MS.saturating_sub(el).min(super::super::data::ROAM_SLICE_MS);
+        rx::poll(st.bar0, &mut st.rxr, &mut st.seen, st.ch, left * 1000, &mut st.w);
+    }
+    (r.sent() as u32, super::super::data::answered(ch, st.seen.join.resp) as u32)
 }
