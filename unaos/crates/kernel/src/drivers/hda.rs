@@ -1740,22 +1740,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     // verbs and keeps every arc-2 statement below this file's arc-2 banner. See the `PARAM_GPIO_COUNT`
     // block in `mod tone` for why a GPIO set is the only spec-legal move available.
     // ════════════════════════════════════════════════════════════════════════════════════════════
-    let mut afg: Option<u8> = None;
-    if let Some(sub) = rings.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT, a) {
-        a.verbs_get += 1;
-        let start = ((sub >> 16) & 0xFF) as u8;
-        let count = (sub & 0xFF) as u8;
-        for i in 0..count {
-            let fg = start.wrapping_add(i);
-            if let Some(t) = rings.cmd(cad, fg, VERB_GET_PARAMETER, PARAM_FUNCTION_TYPE, a) {
-                a.verbs_get += 1;
-                if t & 0x7F == FG_TYPE_AUDIO {
-                    afg = Some(fg);
-                    break;
-                }
-            }
-        }
-    }
+    let afg: Option<u8> = afg_find(rings, cad, a); // HDASTART (B869): the lookup is `afg_find` (file tail), shared with `walk_keep`
     // (function group, mask, data, direction, enable) as read BEFORE anything was driven.
     let mut gpio_saved: Option<(u8, u8, u8, u8, u8)> = None;
     let mut gpio_final: u8 = 0; // HDATONE6: the GPIO data readback after the drive, for the witness
@@ -3023,11 +3008,22 @@ pub mod ring {
 // (copied out and dropped before `ring::hold`). Never DEV under WALKED; nothing under WALKED but the heap.
 #[cfg(feature = "hda-tone")]
 static TONE_WALK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// HDASTART (rmbp-ledger B869, MEASURE: PASS) — the NETSPLIT rule above, extended. STARTCOLD: condition (3) no longer sends
+// a cold amp to the full probe — a start after the amp's hold-off runs `probe()`'s own sequence in order (`ring::own` ->
+// `reset` (CRST: the amp is cold) -> the kept codec in STATESTS -> `ring::bring_up`) and then REPLAYS the kept walk: the
+// walk's ONE state-changing verb (the audio function group's SET_POWER_STATE D0, `walk_codec`) and `run_tone` on the kept
+// widget table (every pin / power / selector / amp / EAPD / GPIO / converter verb a stream needs is already run_tone's).
+// A warm amp keeps NETSPLIT's path (`ring::hold`, no CRST, no D0). WALKSTALE: condition (5) is `walk_check` — VENDOR_ID,
+// the function group's SUBSYSTEM_ID and the kept path pin's CONFIG_DEFAULT, all three against the kept walk; a codec that
+// answers differently is a swapped or reset codec: the kept walk is DISCARDED (under DEV: DEV -> WALKED, the allowed
+// direction) and the full probe walks (`why=walk-stale`). Readers: `tests sinkall`'s start leg (`start_counts`).
 #[cfg(feature = "hda-tone")]
 struct Walked {
     base: u64,
     iss: u8,
     vendor: u32,
+    afg: u8,
+    ssid: u32,
     walk: CodecWalk,
     ws: alloc::boxed::Box<[Widget; MAX_NODES]>,
 }
@@ -3037,16 +3033,29 @@ static WALKED: crate::sync::Mutex<Option<Walked>> = crate::sync::Mutex::new(None
 static START_REATTACH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[cfg(feature = "hda-tone")]
 static START_WALK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "hda-tone")]
+static START_CRST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "hda-tone")]
+static START_REPLAYED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// GET_SUBSYSTEM_ID (the implementation identification, on the audio function group). [HDA-SPEC §7.3.3.30]
+#[cfg(feature = "hda-tone")]
+const VERB_GET_SUBSYSTEM_ID: u32 = 0xF20;
 
-/// probe's end (the capture line): keep the walk that found an output path, with the codec's VENDOR_ID as its witness;
-/// no path (or no answer) forgets any kept walk. `rings` is held (DEV -> WALKED).
+/// probe's end (the capture line): keep the walk that found an output path, with its witnesses — the codec's VENDOR_ID,
+/// the audio function group ([`afg_find`]) and its SUBSYSTEM_ID (HDASTART B869; the path pin's CONFIG_DEFAULT is the
+/// kept `ws` entry). No path, no function group or a witness unanswered FORGETS any kept walk — so a walk that fails
+/// after `start_reattach`'s stale discard leaves `WALKED` None: never a half-kept walk. `rings` is held (DEV -> WALKED).
 #[cfg(feature = "hda-tone")]
 fn walk_keep(base: u64, iss: u8, walk: Option<&CodecWalk>, ws: &[Widget; MAX_NODES], rings: &mut Rings, a: &mut Audit) {
-    let vendor = match walk.filter(|w| w.path.is_some()) {
-        Some(w) => rings.cmd(w.cad, 0, VERB_GET_PARAMETER, PARAM_VENDOR_ID, a).map(|v| (*w, v)),
-        None => None,
+    let kept = 'k: {
+        let Some(w) = walk.filter(|w| w.path.is_some()) else { break 'k None };
+        let Some(vendor) = rings.cmd(w.cad, 0, VERB_GET_PARAMETER, PARAM_VENDOR_ID, a) else { break 'k None };
+        let Some(afg) = afg_find(rings, w.cad, a) else { break 'k None };
+        let Some(ssid) = rings.cmd(w.cad, afg, VERB_GET_SUBSYSTEM_ID, 0, a) else { break 'k None };
+        a.verbs_get += 2;
+        Some((*w, vendor, afg, ssid))
     };
-    let Some((w, vendor)) = vendor else {
+    let Some((w, vendor, afg, ssid)) = kept else {
         *WALKED.lock() = None;
         return;
     };
@@ -3054,17 +3063,19 @@ fn walk_keep(base: u64, iss: u8, walk: Option<&CodecWalk>, ws: &[Widget; MAX_NOD
     match k.as_mut() {
         Some(kept) => {
             kept.ws.copy_from_slice(&ws[..]);
-            (kept.base, kept.iss, kept.vendor, kept.walk) = (base, iss, vendor, w);
+            (kept.base, kept.iss, kept.vendor, kept.afg, kept.ssid, kept.walk) = (base, iss, vendor, afg, ssid, w);
         }
         None => {
             let mut b: alloc::boxed::Box<[Widget; MAX_NODES]> = alloc::boxed::Box::new([Widget::default(); MAX_NODES]);
             b.copy_from_slice(&ws[..]);
-            *k = Some(Walked { base, iss, vendor, walk: w, ws: b });
+            *k = Some(Walked { base, iss, vendor, afg, ssid, walk: w, ws: b });
         }
     }
 }
 
 /// probe's head. `true` = the stream open was served by a re-attach (probe returns); `false` = run the full probe.
+/// Warm amp: `ring::hold`, no CRST (NETSPLIT B852). Cold amp: `ring::own` -> `reset` (CRST) -> `ring::bring_up`, then
+/// the walk's D0 replayed (HDASTART B869). Both: `walk_check`, then `run_tone` on the kept walk and `stop`.
 #[cfg(feature = "hda-tone")]
 fn start_reattach() -> bool {
     use core::sync::atomic::Ordering::Relaxed;
@@ -3077,36 +3088,99 @@ fn start_reattach() -> bool {
         let k = WALKED.lock();
         k.as_ref().map(|k| {
             ws.copy_from_slice(&k.ws[..]);
-            (k.base, k.iss, k.vendor, k.walk)
+            (k.base, k.iss, k.vendor, k.afg, k.ssid, k.walk)
         })
     }; // WALKED dropped here, before the pair is taken
     let why = 'w: {
-        let Some((base, iss, vendor, walk)) = kept else { break 'w "no-walk" };
-        if amp::warm(base).is_none() {
-            break 'w "amp-cold";
-        }
+        let Some((base, iss, vendor, afg, ssid, walk)) = kept else { break 'w "no-walk" };
+        let Some(pin) = walk.path.map(|p| p.pin) else { break 'w "no-walk" };
+        let pincfg = ws[pin as usize].pincfg;
         let mut a = Audit::default();
-        let Some(mut g) = ring::hold(base, &mut a) else { break 'w "rings" };
-        if g.issue(ring::probe_word(), &mut a) != Some(vendor) {
-            break 'w "codec";
+        let crst = amp::warm(base).is_none(); // the amp dropped after its hold-off (or the link is in reset): a cold start
+        let mut g = if !crst {
+            let Some(g) = ring::hold(base, &mut a) else { break 'w "rings" };
+            g
+        } else {
+            let Some(mut g) = ring::own(base) else { break 'w "rings" };
+            let Some(st) = reset(base, &mut a) else { break 'w "crst" };
+            if st & (1u16 << (walk.cad & 0x0F)) == 0 || !ring::bring_up(&mut g, &mut a) {
+                break 'w "crst";
+            }
+            g
+        };
+        if let Err(why) = walk_check(&mut g, walk.cad, afg, pin, (vendor, ssid, pincfg), &mut a) {
+            if why == "walk-stale" {
+                *WALKED.lock() = None; // DEV -> WALKED (the allowed direction); the full probe re-walks and re-keeps
+            }
+            break 'w why;
+        }
+        let v0 = a.verbs_set;
+        if crst && g.cmd(walk.cad, afg, VERB_SET_POWER_STATE, 0, &mut a).is_some() {
+            a.verbs_set += 1; // the walk's one state-changing verb, replayed after the CRST
         }
         run_tone(base, &mut g, iss, Some(&walk), &ws, &mut a);
         g.stop(&mut a);
+        let replayed = a.verbs_set.wrapping_sub(v0);
         START_REATTACH.fetch_add(1, Relaxed);
+        if crst {
+            START_CRST.fetch_add(1, Relaxed);
+        }
+        START_REPLAYED.fetch_add(replayed, Relaxed);
         serial_println!(
-            "[hda] start reattach=1 walk=0 ms={} vendor={:#010x} (NETSPLIT B852 M3: warm amp, kept walk, no CRST, no re-walk)",
-            crate::arch::ms().saturating_sub(t0), vendor
+            "[hda] start reattach=1 walk=0 crst={} replayed={} ms={} vendor={:#010x} ssid={:#010x} pincfg={:#010x} (HDASTART B869: {} amp, the kept walk replayed, no re-walk)",
+            crst as u8, replayed, crate::arch::ms().saturating_sub(t0), vendor, ssid, pincfg,
+            if crst { "cold" } else { "warm" }
         );
         return true;
     };
     START_WALK.fetch_add(1, Relaxed);
-    serial_println!("[hda] start reattach=0 walk=1 why={} (NETSPLIT B852 M3: the full probe runs)", why);
+    serial_println!("[hda] start reattach=0 walk=1 why={} (NETSPLIT B852 M3, HDASTART B869: the full probe runs)", why);
     false
 }
 
-/// `(re-attached stream opens, fully probed stream opens)` since boot (`tests sinkall`'s start leg reads the deltas).
+/// WALKSTALE (HDASTART B869): the codec on the link is the kept walk's — VENDOR_ID (node 0), SUBSYSTEM_ID (the audio
+/// function group) and the kept path pin's CONFIG_DEFAULT. `Err("codec")` = no answer; `Err("walk-stale")` = answered
+/// differently (a swapped or reset codec), said once with both words.
 #[cfg(feature = "hda-tone")]
-pub fn start_counts() -> (u32, u32) {
+fn walk_check(g: &mut Rings, cad: u8, afg: u8, pin: u8, kept: (u32, u32, u32), a: &mut Audit) -> Result<(), &'static str> {
+    let Some(vendor) = g.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_VENDOR_ID, a) else { return Err("codec") };
+    let ssid = g.cmd(cad, afg, VERB_GET_SUBSYSTEM_ID, 0, a).unwrap_or(0);
+    let pincfg = g.cmd(cad, pin, VERB_GET_CONFIG_DEFAULT, 0, a).unwrap_or(0);
+    a.verbs_get += 3;
+    if (vendor, ssid, pincfg) == kept {
+        return Ok(());
+    }
+    serial_println!(
+        "[hda] start walk-stale vendor={:#010x}->{:#010x} ssid={:#010x}->{:#010x} pincfg={:#010x}->{:#010x} -> kept walk discarded (HDASTART B869)",
+        kept.0, vendor, kept.1, ssid, kept.2, pincfg
+    );
+    Err("walk-stale")
+}
+
+/// The codec's audio function group, from the wire: node 0's subordinate node count, then each function group's type
+/// (HDAAMP's lookup, moved out of `run_tone` by HDASTART B869 so `walk_keep` shares it). [HDA-SPEC §7.3.4.3, §7.3.4.4]
+#[cfg(feature = "hda-tone")]
+fn afg_find(rings: &mut Rings, cad: u8, a: &mut Audit) -> Option<u8> {
+    let sub = rings.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT, a)?;
+    a.verbs_get += 1;
+    let start = ((sub >> 16) & 0xFF) as u8;
+    let count = (sub & 0xFF) as u8;
+    for i in 0..count {
+        let fg = start.wrapping_add(i);
+        if let Some(t) = rings.cmd(cad, fg, VERB_GET_PARAMETER, PARAM_FUNCTION_TYPE, a) {
+            a.verbs_get += 1;
+            if t & 0x7F == FG_TYPE_AUDIO {
+                return Some(fg);
+            }
+        }
+    }
+    None
+}
+
+/// `(re-attached stream opens, fully probed stream opens, cold re-attaches (CRST), verbs replayed)` since boot
+/// (`tests sinkall`'s start leg reads the deltas; HDASTART B869 added the last two).
+#[cfg(feature = "hda-tone")]
+pub fn start_counts() -> (u32, u32, u32, u32) {
     use core::sync::atomic::Ordering::Relaxed;
-    (START_REATTACH.load(Relaxed), START_WALK.load(Relaxed))
+    (START_REATTACH.load(Relaxed), START_WALK.load(Relaxed), START_CRST.load(Relaxed), START_REPLAYED.load(Relaxed))
 }
