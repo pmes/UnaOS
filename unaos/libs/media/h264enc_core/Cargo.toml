@@ -1,0 +1,18 @@
+[package]
+name = "h264enc_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "H264ENC (SR197): an H.264 / AVC encoder — Constrained Baseline, CAVLC, I and P frames (integer-pel motion), constant QP, Annex B and avcC output — over h264_core's inverse transform, intra predictors, CAVLC tables and motion compensation; Stria's video export core."
+
+# H264ENC (LEDGER SR197): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`. Its ONE dependency is h264_core: the
+# inverse side (scaling, inverse transforms, intra predictors, CAVLC / CBP tables, luma / chroma interpolation) is
+# linked by name, never copied; only the forward side (forward transform, quantiser, CAVLC writer, mode decision,
+# motion search, parameter-set and slice writers) is new. The encoder's reconstruction loop is the decoder's
+# arithmetic, so h264_core's decode of the output equals the encoder's reconstruction byte for byte (the KAT).
+[dependencies]
+h264_core = { path = "../h264_core" }
+
+# The mux KAT (tests/mux.rs) writes the encoded samples into an MP4 and reads them back. Test-only.
+[dev-dependencies]
+demux_core = { path = "../demux_core" }

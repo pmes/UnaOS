@@ -2167,6 +2167,14 @@ name = "h264_core"
 version = "0.1.0"
 
 [[package]]
+name = "h264enc_core"
+version = "0.1.0"
+dependencies = [
+ "demux_core",
+ "h264_core",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
