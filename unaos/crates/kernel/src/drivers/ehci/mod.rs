@@ -14385,15 +14385,15 @@ impl Controller {
         // the slot's latest byte. Best-effort by construction: a refusal costs a dark key, never a
         // keystroke (the CASE fold already moved with `kbd_leds`), and latches `kbd_led_ok` off so
         // a halted EP0 never costs a later press a `hw_wait_budget()` — one refused line per endpoint.
-        for ep_i in 0..self.int_eps.len() {
-            let (dirty, ok, dead, t, intf, leds) = { let e = &mut self.int_eps[ep_i]; let d = e.kbd_led_dirty; e.kbd_led_dirty = false; (d, e.kbd_led_ok, e.dead, e.target, e.intf, e.kbd_leds) };
-            if !dirty || !ok || dead { continue; } // nothing owed, a latched-off LED, or a retired endpoint
-            let r = self.set_hid_leds(&t, intf, leds);
-            crate::drivers::hidboot::note_leds_sent(crate::drivers::hidboot::Transport::Ehci, leds, t.addr, intf, r);
-            if r.is_err() {
-                self.int_eps[ep_i].kbd_led_ok = false; // the case fold is untouched
-            }
-        } if let Some((ep_i, t, intf)) = tp_reassert { self.tp_mode_reassert(ep_i, &t, intf); } // POINTERFEEL (B535): the endpoint borrow is released, EP0 is usable — the trackpad's mode re-assert (FILE-TAIL `impl Controller`). LINE-NEUTRAL fold, code first.
+        crate::drivers::hidboot::drain_led_slots(&mut *self, crate::drivers::hidboot::Transport::Ehci); // HIDBOOTLEDSTEST (B995): the loop that stood here is ONE generic fn now,
+        // `hidboot::drain_led_slots` over `hidboot::LedSlots` (this file's tail implements it for `Controller`: `take` reads
+        // and clears `kbd_led_dirty` with `kbd_led_ok`, `dead`, `kbd_leds`, `target.addr`, `intf`; `send` is `set_hid_leds`;
+        // `latch_off` clears `kbd_led_ok`). The rule is unchanged and lives only there: skip a clean slot, a latched-off LED
+        // or a retired endpoint; ONE SET_REPORT per dirty slot with its latest byte; the `[hidboot] leds` line; a refusal
+        // latches the slot off. Split so `tests hidboot` drives the same drain over a fake slot owner (no live controller).
+        // Lines kept 1:1 with the loop that stood here (panic::Location line numbers below are unchanged).
+        //
+        if let Some((ep_i, t, intf)) = tp_reassert { self.tp_mode_reassert(ep_i, &t, intf); } // POINTERFEEL (B535): the endpoint borrow is released, EP0 is usable — the trackpad's mode re-assert (FILE-TAIL `impl Controller`). LINE-NEUTRAL fold, code first.
         // KBDFLAP: the endpoint borrow is released here, so EP0 is usable — clear the device-side
         // stall on every endpoint the walk classified `stall`, then re-arm it. ORDER IS LOAD-
         // BEARING and is the whole point of doing this here rather than in the walk: the clear
@@ -20581,5 +20581,27 @@ pub(crate) mod lend {
         let (s, k) = (super::finemotion::span() as i64, span.max(1) as i64);
         let r = ((r.0 as i64 * s / k) as i32, (r.1 as i64 * s / k) as i32);
         super::finemotion::step2(r, res).0
+    }
+}
+
+// HIDBOOTLEDSTEST (rmbp-ledger B995) — TAIL-APPENDED: the EHCI controller is the slot owner of the ONE LED slot drain
+// (`hidboot::drain_led_slots`, called from `service` where B991's loop stood). Each `IntEp` is one slot; the drain's
+// rule (skip / one send with the latest byte / the line / the latch) is hidboot's, never restated here.
+impl crate::drivers::hidboot::LedSlots for Controller {
+    fn count(&self) -> usize {
+        self.int_eps.len()
+    }
+    fn take(&mut self, i: usize) -> (bool, bool, bool, u8, u8, u8) {
+        let e = &mut self.int_eps[i];
+        let d = e.kbd_led_dirty;
+        e.kbd_led_dirty = false;
+        (d, e.kbd_led_ok, e.dead, e.kbd_leds, e.target.addr, e.intf)
+    }
+    fn send(&mut self, i: usize, leds: u8) -> Result<(), &'static str> {
+        let (t, intf) = (self.int_eps[i].target, self.int_eps[i].intf);
+        unsafe { self.set_hid_leds(&t, intf, leds) }
+    }
+    fn latch_off(&mut self, i: usize) {
+        self.int_eps[i].kbd_led_ok = false; // the case fold is untouched
     }
 }
