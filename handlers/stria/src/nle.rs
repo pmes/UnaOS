@@ -690,14 +690,7 @@ fn vid_frame(
 /// live run (`seek` none) and is not already the mix run, that run becomes the mix run (the step's own source then
 /// opens its run at the cut, as a plain cut does).
 fn vmix_take(s: &timeline_core::schedule::Step, vid: &mut Option<Vid>, vmix_run: &mut Option<Vid>) {
-    let Some(m) = s.vmix else {
-        *vmix_run = None;
-        return;
-    };
-    // NLE3c: a transition from black (`src` none) has no run to take.
-    if m.src.is_some() && m.seek.is_none() && vmix_run.as_ref().map(|v| v.src) != m.src && vid.as_ref().map(|v| v.src) == m.src {
-        *vmix_run = vid.take();
-    }
+    timeline_core::vmix::take_outgoing(s, vid, vmix_run, |v| v.src); // NLE6MIX (B899): the ONE rule, shared with the kernel Player
 }
 
 /// NLE3: the RGBA a video step shows: its own RGBA `b` (`w x h`), or inside a transition `b` mixed with the outgoing
@@ -731,70 +724,9 @@ fn vmix_frame(
 
 /// NLE3: the outgoing frame `a` and the incoming frame `b` (RGBA, `w x h`) mixed at the incoming's weight `t`.
 fn vmix_rgba(kind: timeline_core::TransitionKind, t: timeline_core::schedule::Frac, a: &[u8], b: &[u8], w: u32, h: u32) -> Vec<u8> {
-    use timeline_core::{TransitionKind, WipeDir};
-    let den = t.den.max(1);
-    let round = |n: i64| (2 * n * t.num + den) / (2 * den);
     let mut out = a.to_vec();
-    match kind {
-        TransitionKind::Dissolve => {
-            let alpha = round(255).clamp(0, 255) as u8;
-            for (o, p) in out.chunks_exact_mut(4).zip(b.chunks_exact(4)) {
-                let px = gneiss_pal::dsp::image::blend_nonpremult([p[0], p[1], p[2], alpha], [o[0], o[1], o[2], o[3]]);
-                o.copy_from_slice(&px);
-            }
-        }
-        TransitionKind::Wipe(dir) => {
-            let (w, h) = (w as usize, h as usize);
-            let (wi, hi, num) = (w as i64, h as i64, t.num);
-            for y in 0..h {
-                for x in 0..w {
-                    let (xi, yi) = (x as i64, y as i64);
-                    let incoming = match dir {
-                        WipeDir::LeftToRight => xi < round(wi),
-                        WipeDir::TopToBottom => yi < round(hi),
-                        // NLE3c: exact fractions of t = num / den.
-                        WipeDir::Diagonal => (xi + yi) * den < (wi + hi) * num,
-                        WipeDir::Box => (2 * xi + 1 - wi).abs() * den < wi * num && (2 * yi + 1 - hi).abs() * den < hi * num,
-                        WipeDir::Clock | WipeDir::ClockThree | WipeDir::ClockSix | WipeDir::ClockNine => {
-                            clock_from(dir, x, y, w, h) < std::f64::consts::TAU * num as f64 / den as f64
-                        }
-                        // NLE3cBLACK: the corner boxes (mirrored coordinates), barn doors and the top-right diagonal.
-                        WipeDir::CornerTopLeft => xi * den < wi * num && yi * den < hi * num,
-                        WipeDir::CornerTopRight => (wi - 1 - xi) * den < wi * num && yi * den < hi * num,
-                        WipeDir::CornerBottomRight => (wi - 1 - xi) * den < wi * num && (hi - 1 - yi) * den < hi * num,
-                        WipeDir::CornerBottomLeft => xi * den < wi * num && (hi - 1 - yi) * den < hi * num,
-                        WipeDir::BarnDoorVertical => (2 * xi + 1 - wi).abs() * den < wi * num,
-                        WipeDir::BarnDoorHorizontal => (2 * yi + 1 - hi).abs() * den < hi * num,
-                        WipeDir::DiagonalTopRight => (wi - 1 - xi + yi) * den < (wi + hi) * num,
-                    };
-                    if incoming {
-                        let i = (y * w + x) * 4;
-                        out[i..i + 4].copy_from_slice(&b[i..i + 4]);
-                    }
-                }
-            }
-        }
-    }
+    timeline_core::vmix::mix_step(kind, t, &mut out, b, w, h); // NLE6MIX (B899): the ONE mix fn, shared with the kernel Player
     out
-}
-
-/// NLE3c: the angle of pixel `(x, y)`'s centre about the frame's centre, clockwise from twelve o'clock, in `[0, 2 pi)`.
-fn clock_angle(x: usize, y: usize, w: usize, h: usize) -> f64 {
-    let (dx, dy) = (x as f64 + 0.5 - w as f64 / 2.0, y as f64 + 0.5 - h as f64 / 2.0);
-    dx.atan2(-dy).rem_euclid(std::f64::consts::TAU)
-}
-
-/// NLE3cBLACK (LEDGER SR323): pixel `(x, y)`'s clock angle measured from where `dir`'s hand starts (W201 twelve, W202
-/// three, W203 six, W204 nine o'clock), clockwise, in `[0, 2 pi)`; W201's is [`clock_angle`] itself.
-fn clock_from(dir: timeline_core::WipeDir, x: usize, y: usize, w: usize, h: usize) -> f64 {
-    use timeline_core::WipeDir;
-    let q = match dir {
-        WipeDir::ClockThree => 1.0,
-        WipeDir::ClockSix => 2.0,
-        WipeDir::ClockNine => 3.0,
-        _ => return clock_angle(x, y, w, h),
-    };
-    (clock_angle(x, y, w, h) - q * std::f64::consts::TAU / 4.0).rem_euclid(std::f64::consts::TAU)
 }
 
 /// EDITMAP (LEDGER SR223): a media file as its own timeline.

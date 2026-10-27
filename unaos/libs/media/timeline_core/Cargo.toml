@@ -7,9 +7,12 @@ description = "Stria's timeline core: the non-linear editor's EDL model (tracks,
 
 # NLE1 (LEDGER SR194): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the midden_core shape: a shared core under
 # `unaos/libs/`, a member of the ROOT host workspace (Stria's render links it), linkable by the kernel by path with
-# `default-features = false` (NLE6). Its one dependency is demux_core, for the ONE time-base type (`Timebase`).
+# `default-features = false` (NLE6). demux_core gives the ONE time-base type (`Timebase`); NLE6MIX (rmbp-ledger B899):
+# pixel_core the ONE blend (`blend_nonpremult`) and libm the clock wipe's `atan2` for `vmix::mix_step` (no_std).
 [dependencies]
 demux_core = { path = "../demux_core" }
+pixel_core = { path = "../pixel_core" }
+libm = { version = "0.2", default-features = false }
 
 [features]
 default = ["std"]

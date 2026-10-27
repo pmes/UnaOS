@@ -36,6 +36,8 @@
 //! * Edit lists (EDITMAP, LEDGER SR223): an MP4 `elst` IS a timeline over one source; [`Timeline::lay_edit_list`] lays
 //!   a stream's segments on a track (each media segment a clip, an empty edit a gap, a repeat two clips over one source
 //!   range) and refuses a rate other than 1 by name ([`EditError::Rate`]).
+//! * [`vmix`] (NLE6MIX, rmbp-ledger B899): the ONE video transition mix ([`vmix::mix_step`]) and outgoing-run rule
+//!   ([`vmix::take_outgoing`]) Stria's render and the kernel Player's EDL mode both call.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -48,6 +50,7 @@ use alloc::vec::Vec;
 pub mod edl;
 pub mod editor;
 pub mod schedule;
+pub mod vmix;
 
 /// The ONE time-base type (demux_core's): seconds per tick = `num / den`. A timeline's is `1/fps`.
 pub use demux_core::Timebase;

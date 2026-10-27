@@ -30,7 +30,8 @@
 //!
 //! * THE EDL MODE (NLE6, LEDGER SR207): a `.edl` path plays an edit — timeline_core's editor state and schedule over one
 //!   open per reel, each run's keyframe seek and unseen run-up on this job, the cut's frames through this queue and clock
-//!   (the section at the tail; cut-only, no sound yet).
+//!   (the section at the tail; NLE6MIX rmbp-ledger B899: a transition mixes a second run through timeline_core's one
+//!   `vmix::mix_step`; no sound yet).
 //!
 //! Wire: `[vplay] job spawn|run|exit …`, `[player] video codec=<vp8|av1> size=<w>x<h> fps=<n> …` (player.rs),
 //! `:: VIDEOPLAYER: open=ok frames=<n> dropped=<n> fps=<n> av_sync_ms=<n> clock=<audio|wall> -> PASS ::`
@@ -777,10 +778,14 @@ pub fn fact_lines(f: &Facts) -> [String; 2] {
 // (`timeline_core::schedule::schedule`) is walked: a video step that carries `seek` (or cuts to another reel) opens a
 // run at the keyframe (`Demuxer::samples_from`, demux_core's one `key_at_or_before`) on a fresh [`Pic`]; the run-up
 // (`preroll`) is decoded unseen; each step's picture is queued at its output tick through [`room`], a gap as black.
-// [`present`] shows them on the Player's clock. Cut-only: a transition shows its incoming clip; the audio steps are
-// counted, not played (audio_core::container has no PCM door; NLE6-MIX). Wire: `[nle] reel …`, `[nle] open edl=<path>
-// reels=<n> clips=<n> steps=<n>`, `[nle] job exit frames=<n> seeks=<n> runup=<n> gaps=<n>`; the witness is
-// player.rs `tests nle` (`:: NLE: … ::`).
+// [`present`] shows them on the Player's clock. NLE6MIX (rmbp-ledger B899): a step inside a transition (`Step.vmix`) mixes
+// the outgoing source's frame (a second run, `mix`: the live run it continues via timeline_core's `vmix::take_outgoing`,
+// else opened at its keyframe; dropped at the first step without `vmix`) with its own picture (or the to-black's black)
+// through timeline_core's ONE `vmix::mix_step` (the fn Stria's render calls); a slot the heap or the registry cannot give
+// is refused by name and the incoming shows. The audio steps are counted, not played (audio_core::container has no PCM
+// door; NLE6-MIX). Wire: `[nle] reel …`, `[nle] open edl=<path> reels=<n> clips=<n> steps=<n>`, `[nle] job exit
+// frames=<n> seeks=<n> runup=<n> gaps=<n> mixed=<n> mix_seeks=<n> refused=<n> mix_us_max=<n>`, `[vplay] transition:
+// second decoder slot refused (<why>)`; the witness is player.rs `tests nle` (`:: NLE: … ::`).
 
 /// The `NLE` report's plan cap (output ticks remembered for the witness) and the presented-counter cap.
 const SHOWN_CAP: usize = 4096;
@@ -851,6 +856,13 @@ pub struct EdlReport {
     pub gaps: u64,
     /// Per video step: `(output tick, (source, source tick), carries a seek)`; at most [`SHOWN_CAP`].
     pub plan: Vec<(i64, Option<(u32, i64)>, bool)>,
+    /// NLE6MIX (B899): frames mixed inside a transition, outgoing runs opened at a keyframe, refused second slots, the
+    /// slowest mix (µs), and per mixed frame `(output tick, FNV-1a 64 of the mixed RGBA)` (at most [`SHOWN_CAP`]).
+    pub mixed: u64,
+    pub mix_seeks: u64,
+    pub mix_refused: u64,
+    pub mix_us_max: u64,
+    pub mixes: Vec<(i64, u64)>,
 }
 
 static NLE: crate::sync::Mutex<Option<EdlReport>> = crate::sync::Mutex::new(None);
@@ -876,7 +888,10 @@ fn edl_task(arg: usize) {
     *NLE.lock() = None;
     let mut rep = EdlReport::default();
     let r = edl_run(jid, &path, seek_ms, &mut rep);
-    serial_println!("[nle] job exit frames={} seeks={} runup={} gaps={}", rep.frames, rep.seeks, rep.runup, rep.gaps);
+    serial_println!(
+        "[nle] job exit frames={} seeks={} runup={} gaps={} mixed={} mix_seeks={} refused={} mix_us_max={}",
+        rep.frames, rep.seeks, rep.runup, rep.gaps, rep.mixed, rep.mix_seeks, rep.mix_refused, rep.mix_us_max
+    );
     let frames = rep.frames;
     *NLE.lock() = Some(rep);
     let why = match r {
@@ -942,52 +957,31 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         Some(j) => j.facts = Some(facts),
         None => return Err(("superseded", None)),
     }
-    struct Run {
-        src: timeline_core::SourceId,
-        reads: Vec<demux_core::SampleRead>,
-        pos: usize,
-        pic: Pic,
-    }
-    let mut run: Option<Run> = None;
+    let mut run: Option<EdlRun> = None;
+    let mut mix: Option<EdlRun> = None; // NLE6MIX (B899): a transition's outgoing run, the second decoder slot
     for s in steps.iter().filter(|s| s.kind == Kind::Video) {
         let pts_ms = out_ms(s.out_t);
         if rep.plan.len() < SHOWN_CAP {
             rep.plan.push((s.out_t, s.src.map(|id| (id.0, s.src_t)), s.seek.is_some()));
         }
-        let frame = match s.src {
+        let refused = edl_take(s, &mut run, &mut mix, fw as usize, fh as usize).err();
+        let mut frame = match s.src {
             None => {
-                rep.gaps += 1;
+                if s.vmix.is_none() {
+                    rep.gaps += 1; // a to-black step's black is mixed below (NLE6MIX)
+                }
                 Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize], ord: None }
             }
             Some(id) => {
-                let r = reels.get(id).ok_or_else(|| ("reel-missing", Some(alloc::format!("no reel for source {}", id.0))))?;
-                let (ti, vt, o) = r.v.as_ref().ok_or_else(|| ("no-video", Some(alloc::format!("reel {} has no video stream", id.0))))?;
-                if s.seek.is_some() || run.as_ref().map(|x| x.src) != Some(id) {
-                    let reads: Vec<demux_core::SampleRead> = r.d.samples_from(*ti, o + tl.tb.to_ns(s.src_t)).collect();
-                    let pic = Pic::new(vt).map_err(|e| ("codec-refused", Some(e)))?;
-                    run = Some(Run { src: id, reads, pos: 0, pic });
-                    rep.seeks += 1;
-                }
-                let Some(x) = run.as_mut() else { return Err(("superseded", None)) };
-                loop {
-                    let Some(rd) = x.reads.get(x.pos).copied() else {
-                        return Err(("reel-short", Some(alloc::format!("reel {} ran out at source tick {}", id.0, s.src_t))));
-                    };
-                    x.pos += 1;
-                    if rd.skip {
-                        continue; // LEADSKIP: a leading picture the run's keyframe cannot decode
-                    }
-                    let pk = r.d.packet_at(&rd.sample);
-                    let ord = x.pic.ordinal(&pk.data);
-                    match x.pic.decode(&pk.data) {
-                        Ok(Some(_)) if rd.preroll => rep.runup += 1,
-                        Ok(Some((w, h, px))) => break Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) },
-                        Ok(None) => {}
-                        Err(e) => return Err(("decode-refused", Some(e))),
-                    }
-                }
+                let (w, h, px, ord) = edl_frame(&reels, tl.tb, &mut run, id, s.src_t, s.seek.is_some(), rep, false)?;
+                Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) }
             }
         };
+        match (s.vmix, refused) {
+            (Some(_), Some(why)) => edl_refuse(rep, &why),
+            (Some(m), None) => edl_mix(&reels, tl.tb, s.out_t, m, &mut frame, &mut mix, rep)?,
+            (None, _) => {}
+        }
         if pts_ms < seek_ms {
             continue; // a Player seek: the steps before it decoded unseen (job_task's rule)
         }
@@ -1002,4 +996,154 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         crate::arch::sched::yield_now();
     }
     Ok(())
+}
+
+// ── NLE6MIX (rmbp-ledger B899): the transition mix on the EDL job — the second run, the ONE mix fn, the refusal ─────────
+
+/// One decode run of the EDL job: a reel's video samples from a keyframe on, and the decoder reading them.
+struct EdlRun {
+    src: timeline_core::SourceId,
+    reads: Vec<demux_core::SampleRead>,
+    pos: usize,
+    pic: Pic,
+}
+
+/// The ONE open-or-continue fn (Stria's `vid_frame` shape), for a step's own source and a transition's outgoing alike:
+/// a `seek`, or a run on another source (or none), opens `slot` at the keyframe (`Demuxer::samples_from`; the run-up is
+/// decoded unseen); otherwise the run decodes on. Returns the picture `(w, h, 0RGB, utp1 ordinal)`.
+#[allow(clippy::too_many_arguments)]
+fn edl_frame(
+    reels: &Reels,
+    tb: timeline_core::Timebase,
+    slot: &mut Option<EdlRun>,
+    id: timeline_core::SourceId,
+    src_t: i64,
+    seek: bool,
+    rep: &mut EdlReport,
+    outgoing: bool,
+) -> Result<(usize, usize, Vec<u32>, Option<u32>), (&'static str, Option<String>)> {
+    let r = reels.get(id).ok_or_else(|| ("reel-missing", Some(alloc::format!("no reel for source {}", id.0))))?;
+    let (ti, vt, o) = r.v.as_ref().ok_or_else(|| ("no-video", Some(alloc::format!("reel {} has no video stream", id.0))))?;
+    if seek || slot.as_ref().map(|x| x.src) != Some(id) {
+        let reads: Vec<demux_core::SampleRead> = r.d.samples_from(*ti, o + tb.to_ns(src_t)).collect();
+        let pic = Pic::new(vt).map_err(|e| ("codec-refused", Some(e)))?;
+        *slot = Some(EdlRun { src: id, reads, pos: 0, pic });
+        if outgoing {
+            rep.mix_seeks += 1;
+        } else {
+            rep.seeks += 1;
+        }
+    }
+    let Some(x) = slot.as_mut() else { return Err(("superseded", None)) };
+    loop {
+        let Some(rd) = x.reads.get(x.pos).copied() else {
+            return Err(("reel-short", Some(alloc::format!("reel {} ran out at source tick {}", id.0, src_t))));
+        };
+        x.pos += 1;
+        if rd.skip {
+            continue; // LEADSKIP: a leading picture the run's keyframe cannot decode
+        }
+        let pk = r.d.packet_at(&rd.sample);
+        let ord = x.pic.ordinal(&pk.data);
+        match x.pic.decode(&pk.data) {
+            Ok(Some(_)) if rd.preroll => rep.runup += 1,
+            Ok(Some((w, h, px))) => return Ok((w, h, px, ord)),
+            Ok(None) => {}
+            Err(e) => return Err(("decode-refused", Some(e))),
+        }
+    }
+}
+
+/// timeline_core's ONE outgoing-run rule (`vmix::take_outgoing`, Stria's too) over the job's two runs; when the live run
+/// becomes the outgoing (two decoders now coexist) the heap is asked first, and a refusal drops it (`Err(why)`).
+fn edl_take(s: &timeline_core::schedule::Step, run: &mut Option<EdlRun>, mix: &mut Option<EdlRun>, w: usize, h: usize) -> Result<(), String> {
+    if timeline_core::vmix::take_outgoing(s, run, mix, |x| x.src) {
+        if let Err(why) = slot_room(w, h) {
+            *mix = None;
+            return Err(why);
+        }
+    }
+    Ok(())
+}
+
+/// Mix `frame` (the step's own picture, or the to-black's black) with the outgoing source's frame at `m.src_t` (opaque
+/// black for a transition from black) through timeline_core's ONE `vmix::mix_step`; the mixed RGBA's FNV-1a 64 is kept
+/// for the witness. A slot the heap or the decoder registry cannot give, or a size the mix cannot pair, is refused by
+/// name (the incoming shows); any other error ends the job as the step's own would.
+#[allow(clippy::too_many_arguments)]
+fn edl_mix(
+    reels: &Reels,
+    tb: timeline_core::Timebase,
+    out_t: i64,
+    m: timeline_core::schedule::VideoMix,
+    frame: &mut Frame,
+    mix: &mut Option<EdlRun>,
+    rep: &mut EdlReport,
+) -> Result<(), (&'static str, Option<String>)> {
+    let t0 = crate::hidstall::now_us();
+    let (w, h) = (frame.w, frame.h);
+    let mut a = match m.src {
+        None => [0u8, 0, 0, 255].repeat(w * h), // NLE3c: from black, the outgoing is opaque black
+        Some(o) => {
+            if m.seek.is_some() || mix.as_ref().map(|x| x.src) != Some(o) {
+                if let Err(why) = slot_room(w, h) {
+                    edl_refuse(rep, &why);
+                    return Ok(());
+                }
+            }
+            match edl_frame(reels, tb, mix, o, m.src_t, m.seek.is_some(), rep, true) {
+                Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => unpack(&px),
+                Ok((ow, oh, _, _)) => {
+                    *mix = None;
+                    edl_refuse(rep, &alloc::format!("size {}x{} != {}x{}", ow, oh, w, h));
+                    return Ok(());
+                }
+                Err(("codec-refused", e)) => {
+                    *mix = None;
+                    edl_refuse(rep, &alloc::format!("codec: {}", e.unwrap_or_default()));
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
+    let b = unpack(&frame.px);
+    timeline_core::vmix::mix_step(m.kind, m.t, &mut a, &b, w as u32, h as u32);
+    let sum = a.iter().fold(crate::video::strip::FNV_BASIS, |acc, x| crate::video::strip::fnv1a(acc, *x));
+    if rep.mixes.len() < SHOWN_CAP {
+        rep.mixes.push((out_t, sum));
+    }
+    frame.px = pack(&a);
+    rep.mixed += 1;
+    rep.mix_us_max = rep.mix_us_max.max(crate::hidstall::now_us().saturating_sub(t0));
+    Ok(())
+}
+
+/// Room for a second decoder slot of a `w x h` picture: its frames and the mix's two RGBA buffers (`need` = 16 B a
+/// pixel), granted while the free heap holds twice that.
+fn slot_room(w: usize, h: usize) -> Result<(), String> {
+    let (lo, hi) = crate::allocator::heap_bounds();
+    let free = hi.saturating_sub(lo).saturating_sub(crate::allocator::heap_used());
+    let need = w * h * 16;
+    if free < 2 * need {
+        return Err(alloc::format!("heap free_kb={} need_kb={}", free / 1024, need / 1024));
+    }
+    Ok(())
+}
+
+/// A refused second slot: counted, and named on the wire for the first four.
+fn edl_refuse(rep: &mut EdlReport, why: &str) {
+    rep.mix_refused += 1;
+    if rep.mix_refused <= 4 {
+        serial_println!("[vplay] transition: second decoder slot refused ({})", why);
+    }
+}
+
+/// [`pack`]'s inverse: 0RGB -> straight RGBA, opaque (the mix fn's pixel form).
+fn unpack(px: &[u32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(px.len() * 4);
+    for p in px {
+        v.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]);
+    }
+    v
 }
