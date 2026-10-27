@@ -173,22 +173,10 @@ fn wifidhcp() {
         if !crate::boot::services_gate("net") {
             return absent("services-gate-closed");
         }
-        let t0 = crate::arch::now_cycles();
-        let hz = crate::bootpace::origin_hz().max(1);
-        let ms = || crate::arch::now_cycles().wrapping_sub(t0) / (hz / 1000).max(1);
-        {
-            let _s = crate::net_tick::scope(crate::net_tick::Who::Dhcp);
-            let _ = crate::smolnet::init();
-            while !crate::smolnet::leased() && ms() < WAIT_MS {
-                crate::smolnet::service_poll();
-                crate::arch::sched::sleep_ms(5);
-            }
-        }
+        let waited = stack_dhcp(WAIT_MS); // MT7925S9 (Z46): the smoltcp drive is the ONE `stack_dhcp` (this file's tail), shared with `wifijoin`
         if !super::data::bound() {
             return absent("stack-on-other-link");
         }
-        let ip4 = |o: [u8; 4]| if o == [0; 4] { alloc::string::String::from("-") } else { alloc::format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]) };
-        let waited = ms();
         match crate::smolnet::lease_ip() {
             Some(ip) => {
                 let (gw, dns) = crate::smolnet::route_view();
@@ -371,4 +359,74 @@ pub fn wifijoin() {
         k, plan.ssid, if authed { "ok" } else { "no" }, aid.map_or(alloc::string::String::from("-"), |a| alloc::format!("aid={}", a)),
         if kat && aid.is_some() { "PASS" } else { "FAIL" }
     );
+    if aid.is_some() {
+        s9_dhcp(); // MT7925S9 (zenbook-ledger Z46): smolnet's one DHCP client over the S9 link, then the link's counts
+    }
+}
+
+// ── MT7925S9 (zenbook-ledger Z46): the station's DHCP over the MT7925 link (S9) ─────────────────────────────────────────────
+/// The ONE smoltcp DHCP drive (hoisted out of `wifidhcp`): smolnet's own stack and its ONE client (`smolnet::init` ->
+/// `dhcp_acquire`) under the net-tick DHCP scope, then up to `wait_ms` of `service_poll` until a lease (no lock held while it
+/// sleeps). Returns the ms waited.
+#[cfg(feature = "smolnet")]
+fn stack_dhcp(wait_ms: u64) -> u64 {
+    let t0 = crate::arch::now_cycles();
+    let hz = crate::bootpace::origin_hz().max(1);
+    let ms = || crate::arch::now_cycles().wrapping_sub(t0) / (hz / 1000).max(1);
+    {
+        let _s = crate::net_tick::scope(crate::net_tick::Who::Dhcp);
+        let _ = crate::smolnet::init();
+        while !crate::smolnet::leased() && ms() < wait_ms {
+            crate::smolnet::service_poll();
+            crate::arch::sched::sleep_ms(5);
+        }
+    }
+    ms()
+}
+
+/// A dotted quad for a wire line, `-` for 0.0.0.0 (hoisted out of `wifidhcp`).
+#[cfg(feature = "smolnet")]
+fn ip4(o: [u8; 4]) -> alloc::string::String {
+    if o == [0; 4] { alloc::string::String::from("-") } else { alloc::format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]) }
+}
+
+/// After `tests wifijoin` read ASSOCIATED (MT7925S9, zenbook-ledger Z46): with the S9 link up (`mt7925::linked`) and the Desktop
+/// services gate open (BP-net-4), smolnet's stack is built over it (`drivers/e1000.rs`'s accessor triple reaches the link when no
+/// e1000 and no USB Ethernet answered) and its ONE DHCP client asks for a lease (`stack_dhcp`); then the driver's link line.
+fn s9_dhcp() {
+    use crate::drivers::mt7925 as mt;
+    let absent = |why: &str| serial_println!(":: wifijoin: s9 dhcp=NOT ATTEMPTED reason={} -> ABSENT ::", why);
+    if !mt::linked() {
+        absent("no-link");
+        return mt::say_link();
+    }
+    #[cfg(not(feature = "smolnet"))]
+    {
+        absent("no-stack(smolnet off)");
+        return mt::say_link();
+    }
+    #[cfg(feature = "smolnet")]
+    {
+        const WAIT_MS: u64 = 12_000;
+        if !crate::boot::services_gate("net") {
+            absent("services-gate-closed");
+            return mt::say_link();
+        }
+        let waited = stack_dhcp(WAIT_MS);
+        if !mt::bound() {
+            absent("stack-on-other-link");
+            return mt::say_link();
+        }
+        match crate::smolnet::lease_ip() {
+            Some(ip) => {
+                let (gw, dns) = crate::smolnet::route_view();
+                serial_println!(
+                    ":: wifijoin: s9 dhcp=bound ip={} gw={} dns={} lease={} waited={}ms -> PASS ::",
+                    ip4(ip), ip4(gw), ip4(dns), crate::smolnet::lease_secs().map_or(alloc::string::String::from("unread"), |s| alloc::format!("{}", s)), waited
+                );
+            }
+            None => serial_println!(":: wifijoin: s9 dhcp=none ip=- gw=- dns=- lease=- waited={}ms -> SILENT ::", waited),
+        }
+        mt::say_link();
+    }
 }
