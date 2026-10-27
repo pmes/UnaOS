@@ -852,3 +852,15 @@ refs/heads/exec-rmbp-nle3e   e1e33cbe7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nleprobehdr   b0a799f77 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle2order   153cfbab3 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pngone   113d4379a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pdf1   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle4c   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle3d   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-heifone   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-hevcdepthcore   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nleprobehdrwire   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle2mods   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-vorbistrim   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-gneisspalnostd   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle4bkernel   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aethermacgpu   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-h264enccabac   5da786379 IN-FLIGHT cut 2026-10-27
