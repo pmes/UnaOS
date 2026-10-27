@@ -553,3 +553,110 @@ pub fn pwr_block(freq: u16) -> Option<&'static str> {
         _ => None,
     }
 }
+
+// ── MT7925S10 (zenbook-ledger Z55): the RSN element (IEEE Std 802.11-2020 §9.4.2.24) — the station's WPA2-PSK join ─────────
+// BP-net-15: frames come only from this codec, so the RSN element the association request carries and the judge of the AP's
+// element live here, shared by both radios (the Broadcom's WPA2JOIN is owed). Only WPA2-PSK with CCMP is offered.
+
+/// The RSN element a WPA2-PSK station offers (22 octets): element 48, length 20, version 1, group cipher 00-0F-AC:4 (CCMP),
+/// one pairwise cipher CCMP, one AKM 00-0F-AC:2 (PSK), RSN Capabilities 0 (no MFP). Appended after Extended Supported Rates in
+/// the association request (§9.3.3.6: the RSNE follows the rate elements) and carried as M2's key data.
+pub const RSN_PSK_CCMP: [u8; 22] = [
+    EID_RSN, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0,
+];
+
+/// The suite selector of CCMP-128 and of the PSK AKM (§9.4.2.24.2, Table 9-149; §9.4.2.24.3, Table 9-151).
+const SUITE_CCMP: [u8; 4] = [0x00, 0x0f, 0xac, 4];
+const SUITE_PSK: [u8; 4] = [0x00, 0x0f, 0xac, 2];
+/// RSN Capabilities bit 6 = MFPR (management frame protection required, §9.4.2.24.4).
+const RSN_CAP_MFPR: u16 = 1 << 6;
+
+/// The whole RSN element (id, length and body) of a beacon / probe response, `None` when it carries none or is not one. TOTAL:
+/// an element that runs past the frame ends the walk with `None`.
+pub fn rsn_ie(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() < 24 + 12 {
+        return None;
+    }
+    let (ty, sub) = subtype_of(frame[0]);
+    if ty != FC_TYPE_MGMT || (sub != SUBTYPE_BEACON && sub != SUBTYPE_PROBE_RESP) {
+        return None;
+    }
+    let mut i = 24 + 12;
+    while i + 2 <= frame.len() {
+        let len = frame[i + 1] as usize;
+        if i + 2 + len > frame.len() {
+            return None;
+        }
+        if frame[i] == EID_RSN {
+            return Some(&frame[i..i + 2 + len]);
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// True when the RSN element `elem` (id + length + body) lets a WPA2-PSK CCMP station join: version 1, group cipher CCMP, CCMP
+/// among the pairwise ciphers, PSK among the AKMs, and MFPR clear (absent capabilities read 0). Anything shorter or malformed is
+/// false (a TKIP-only, SAE-only or MFP-required network is refused by its caller by name).
+pub fn rsn_psk_ccmp(elem: &[u8]) -> bool {
+    if elem.len() < 2 || elem[0] != EID_RSN || elem[1] as usize + 2 != elem.len() {
+        return false;
+    }
+    let b = &elem[2..];
+    if b.len() < 8 || u16::from_le_bytes([b[0], b[1]]) != 1 || b[2..6] != SUITE_CCMP {
+        return false;
+    }
+    let np = u16::from_le_bytes([b[6], b[7]]) as usize;
+    let p_end = 8 + 4 * np;
+    if b.len() < p_end + 2 {
+        return false;
+    }
+    let pair_ok = b[8..p_end].chunks(4).any(|s| s == SUITE_CCMP);
+    let na = u16::from_le_bytes([b[p_end], b[p_end + 1]]) as usize;
+    let a_end = p_end + 2 + 4 * na;
+    if b.len() < a_end {
+        return false;
+    }
+    let akm_ok = b[p_end + 2..a_end].chunks(4).any(|s| s == SUITE_PSK);
+    let caps = if b.len() >= a_end + 2 { u16::from_le_bytes([b[a_end], b[a_end + 1]]) } else { 0 };
+    pair_ok && akm_ok && caps & RSN_CAP_MFPR == 0
+}
+
+#[cfg(test)]
+mod rsn_tests {
+    use super::*;
+
+    fn beacon_with(ie: &[u8]) -> Vec<u8> {
+        let mut f = alloc::vec![0u8; 24 + 12];
+        f[0] = SUBTYPE_BEACON << 4;
+        f.extend_from_slice(&[EID_SSID, 3, b'U', b'n', b'a']);
+        f.extend_from_slice(ie);
+        f
+    }
+
+    #[test]
+    fn offer_is_accepted_and_found() {
+        assert!(rsn_psk_ccmp(&RSN_PSK_CCMP));
+        let f = beacon_with(&RSN_PSK_CCMP);
+        assert_eq!(rsn_ie(&f), Some(&RSN_PSK_CCMP[..]));
+        assert_eq!(rsn_ie(&beacon_with(&[])), None);
+    }
+
+    #[test]
+    fn judge_refuses_what_is_not_wpa2_psk_ccmp() {
+        // WPA2/WPA3 transition: AKMs PSK + SAE (00-0F-AC:8), MFPC set (bit 7), MFPR clear: accepted.
+        let mixed = [EID_RSN, 24, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 2, 0, 0, 0x0f, 0xac, 2, 0, 0x0f, 0xac, 8, 0x80, 0];
+        assert!(rsn_psk_ccmp(&mixed));
+        let mut mfpr = mixed;
+        mfpr[24] = 0xc0; // MFPR set
+        assert!(!rsn_psk_ccmp(&mfpr));
+        let mut tkip = RSN_PSK_CCMP;
+        tkip[13] = 2; // pairwise TKIP only
+        assert!(!rsn_psk_ccmp(&tkip));
+        let mut sae = RSN_PSK_CCMP;
+        sae[19] = 8; // SAE only
+        assert!(!rsn_psk_ccmp(&sae));
+        assert!(!rsn_psk_ccmp(&RSN_PSK_CCMP[..10]));
+        assert!(!rsn_psk_ccmp(&[]));
+    }
+}

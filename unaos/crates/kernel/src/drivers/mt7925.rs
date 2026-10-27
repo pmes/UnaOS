@@ -1,9 +1,9 @@
-//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23, and S6 the radio backend registered with the data rings armed, Z29, and S7 the scan, Z34, and S8 DEV_INFO/BSS_INFO, the channel and the open-system auth/assoc frames, Z38, and S9 the peer STA_REC and the data path, Z46; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
+//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23, and S6 the radio backend registered with the data rings armed, Z29, and S7 the scan, Z34, and S8 DEV_INFO/BSS_INFO, the channel and the open-system auth/assoc frames, Z38, and S9 the peer STA_REC and the data path, Z46, and S10 the WPA2-PSK EAPOL path and the radio's keys, Z55; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
 //! MT7925 — S1, the probe (ZENBOOKMT7925, zenbook-ledger Z5). The ladder is
-//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17), S5 (MT7925S5, Z23), S6 (MT7925S6, Z29), S7 (MT7925S7, Z34), S8 (MT7925S8, Z38) and S9 (MT7925S9, Z46) are the eight file-tail blocks; S10 is owed there by name.
+//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17), S5 (MT7925S5, Z23), S6 (MT7925S6, Z29), S7 (MT7925S7, Z34), S8 (MT7925S8, Z38), S9 (MT7925S9, Z46) and S10 (MT7925S10, Z55) are the nine file-tail blocks.
 //!
 //! WHAT THIS RUNG DOES. Once per boot, from the three storage-ready passes in `main.rs` (beside `wifi::service()`,
 //! the same forward-only polled shape), and only after `boot::services_gate("wifi")` answers (R86, BP-net-4):
@@ -2664,7 +2664,7 @@ pub fn link_rx(out: &mut [u8]) -> Option<usize> {
     for _ in 0..RING_DEPTH {
         let v = rx_take(&mut l.rx)?;
         match rx_span(&v) {
-            Some((span, true)) if span.len() <= out.len() => {
+            Some((span, true)) if span.len() <= out.len() && !s10_eapol(&v[span.clone()]) => {
                 let n = span.len();
                 out[..n].copy_from_slice(&v[span]);
                 l.rx_n += 1;
@@ -2780,5 +2780,198 @@ fn link_kat() -> bool {
     ok &= rx_span(&x).is_none();
     x[8..12].copy_from_slice(&(1u32 << 13).to_le_bytes());
     ok &= rx_span(&x) == Some((66..90, false)) && rx_frame(&x) == Some(66..90);
+    ok
+}
+
+// ── MT7925S10 (zenbook-ledger Z55) — S10: the WPA2-PSK handshake's EAPOL path and the radio's keys ─────────────────────────────
+// The handshake itself is `wifi::assoc` (pure) driven by `wifi::verb::s10_wpa2`; this block is its two doors into the radio.
+// EAPOL rides the ONE data path: an inbound 802.1X frame (EtherType 0x888e) is lifted out of `link_rx`'s arm into the one-slot
+// mailbox `S10_EAPOL` (so smolnet never sees it; counted here, not on the link's `rx`), and `eapol_rx` hands it to the station; an
+// outbound one is `link_tx`'s Ethernet frame like any other, its fetch awaited (`eapol_tx`) so the next command cannot overtake it.
+// Lock order: smolnet's STACK, then S9_LINK, then S10_EAPOL; nothing sleeps under any of them. The radio does CCMP: the keys go to
+// it as linux's `mt7925_set_link_key` does (measured, linux v6.11): the first key makes the BSS secure (BSS_INFO re-sent with
+// the SEC TLV: mode WPA2-PSK, status 6, cipher CCMP), then STA_REC_UPDATE with ONE STA_REC_KEY_V3 TLV per key — the pairwise key on
+// the AP peer's wlan index (tx_key 1, key_type 1, muar 0), the group key on the interface's own (wcid 19, tx_key 0, key_type 0,
+// muar 0x0e), peer address = the AP, cipher AES-CCMP (4), key id from the KDE, key length 16, mgmt_prot 1, key RSC 0. No port-secure
+// command: the peer's BASIC TLV carries CONN_STATE_PORT_SECURE since S9 (linux sends none after the handshake). Key bytes live in
+// stack arrays wiped after the command and in the command page, wiped after the last one. Hardware facts only; no code copied.
+
+/// STA_REC's key TLV (STA_REC_KEY_V3), BSS_INFO's security TLV, the CONNAC3 CCMP cipher id, the BSS security mode (MODE_WPA2_PSK) and
+/// status (CCMP), the muar index of the interface's own wlan index, the EAPOL EtherType.
+const STA_TAG_KEY_V3: u16 = 0x27;
+const BSS_TAG_SEC: u16 = 16;
+const CIPHER_CCMP: u8 = 4;
+const MODE_WPA2_PSK: u8 = 7;
+const SEC_STATUS_CCMP: u8 = 6;
+const MUAR_BMC: u8 = 0x0e;
+const ETHERTYPE_EAPOL: u16 = 0x888e;
+/// The secured BSS_INFO body (BASIC 36 + SEC 8 + RLM 16) and the key STA_REC body (8-byte header + the 68-byte key TLV).
+const BSS_SEC_LEN: usize = 60;
+const KEY_REQ_LEN: usize = 76;
+
+/// The newest inbound EAPOL frame (the whole Ethernet frame), written by `link_rx`'s fold, taken by `eapol_rx`.
+static S10_EAPOL: crate::sync::Mutex<Option<Vec<u8>>> = crate::sync::Mutex::new(None);
+/// EAPOL frames lifted out of `link_rx`, and non-EAPOL frames `eapol_rx` dropped (counts since boot; the station reads deltas).
+static S10_N_EAPOL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static S10_N_OTHER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// An Ethernet frame of EtherType 802.1X with at least a 4-octet EAPOL header after the Ethernet header (pure).
+fn s10_is_eapol(f: &[u8]) -> bool {
+    f.len() >= ETH_HDR + 4 && u16::from_be_bytes([f[12], f[13]]) == ETHERTYPE_EAPOL
+}
+
+/// `link_rx`'s fold (called under S9_LINK): an EAPOL frame is kept in the mailbox (the newest replaces an untaken one) and counted;
+/// true = lifted, so the arm does not hand it to the caller. Any other frame is false and untouched.
+fn s10_eapol(f: &[u8]) -> bool {
+    if !s10_is_eapol(f) {
+        return false;
+    }
+    let old = S10_EAPOL.lock().replace(f.to_vec());
+    drop(old);
+    S10_N_EAPOL.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// The next EAPOL frame from the AP (the whole Ethernet frame), or None: one `link_rx` drive into a local buffer (it lifts EAPOL
+/// into the mailbox itself; a frame it returns is not EAPOL and is dropped, counted), then the mailbox taken. No sleep here: the
+/// station polls.
+pub fn eapol_rx() -> Option<Vec<u8>> {
+    let mut buf = alloc::vec![0u8; ETH_MAX];
+    if link_rx(&mut buf).is_some() {
+        S10_N_OTHER.fetch_add(1, Ordering::Relaxed);
+    }
+    S10_EAPOL.lock().take()
+}
+
+/// (EAPOL frames lifted, other frames dropped by `eapol_rx`), since boot.
+pub fn eapol_counts() -> (u32, u32) {
+    (S10_N_EAPOL.load(Ordering::Relaxed), S10_N_OTHER.load(Ordering::Relaxed))
+}
+
+/// One Ethernet frame (802.1X) out through `link_tx`, then its fetch awaited: (ring, next index, posted count) are read under the
+/// lock, the lock released, `tx_done` polled. False = no link, not posted (no room, too long) or the fetch not seen.
+pub fn eapol_tx(frame: &[u8]) -> bool {
+    let before = S9_LINK.lock().as_ref().map(|l| l.tx);
+    let Some(before) = before else { return false };
+    link_tx(frame);
+    let now = S9_LINK.lock().as_ref().map(|l| (l.q0, l.wi, l.tx));
+    match now {
+        Some((q0, wi, tx)) if tx != before => tx_done(q0, wi),
+        _ => false,
+    }
+}
+
+/// The secured BSS_INFO body (pure, 60 bytes): `bss_conn_req`'s BASIC (36), the SEC TLV {tag 16, len 8, mode WPA2-PSK, status 6,
+/// cipher CCMP, 1 pad} and its RLM (16) copied from it.
+fn bss_sec_req(bssid: [u8; 6], band: u8, ch: u8, five: bool) -> [u8; BSS_SEC_LEN] {
+    let c = bss_conn_req(bssid, band, ch, five);
+    let mut v = [0u8; BSS_SEC_LEN];
+    v[..36].copy_from_slice(&c[..36]);
+    let d = put_tlv(&mut v, 36, BSS_TAG_SEC, 8);
+    v[d] = MODE_WPA2_PSK;
+    v[d + 1] = SEC_STATUS_CCMP;
+    v[d + 2] = CIPHER_CCMP;
+    v[44..60].copy_from_slice(&c[36..52]);
+    v
+}
+
+/// The key STA_REC_UPDATE body (pure, 76 bytes) for wlan index `wcid`: header {bss 0, wlan lo, 1 TLV, append, muar (0 for the
+/// pairwise peer, 0x0e for the interface's own index), wlan hi}; TLV {tag 0x27, len 68, add 1, tx_key and key_type 1 for the
+/// pairwise key (0 for the group key), is_authenticator 0, peer `peer`, bss 0, cipher CCMP, `key_id`, key length 16, wlan lo,
+/// mgmt_prot 1, key (16 of 32), key RSC 0}.
+fn key_req(peer: [u8; 6], wcid: u16, pairwise: bool, key_id: u8, key: &[u8; 16]) -> [u8; KEY_REQ_LEN] {
+    let mut v = [0u8; KEY_REQ_LEN];
+    v[1] = (wcid & 0xff) as u8;
+    v[2..4].copy_from_slice(&1u16.to_le_bytes());
+    v[4] = 1;
+    v[5] = if pairwise { 0 } else { MUAR_BMC };
+    v[6] = (wcid >> 8) as u8;
+    let d = put_tlv(&mut v, 8, STA_TAG_KEY_V3, 68);
+    v[d] = 1;
+    v[d + 1] = pairwise as u8;
+    v[d + 2] = pairwise as u8;
+    v[d + 4..d + 10].copy_from_slice(&peer);
+    v[d + 11] = CIPHER_CCMP;
+    v[d + 12] = key_id;
+    v[d + 13] = 16;
+    v[d + 14] = (wcid & 0xff) as u8;
+    v[d + 15] = 1;
+    v[d + 16..d + 32].copy_from_slice(key);
+    v
+}
+
+/// Hand the radio the keys of a finished handshake (after message 4 went out): BSS_INFO with the SEC TLV, the pairwise key on the AP
+/// peer (wlan 1), the group key on the interface (wlan 19), each command acked 0 (a refusal stops the rest and is named `bss`, `ptk`
+/// or `gtk`). `ch` is the BSS's channel (the RLM TLV); the band and the link come from the S9 link. `MCU_LINK` is taken and put back
+/// on every path; the key arrays and the command page are wiped. One `[mt7925] s10 keys` line, no key byte in it.
+pub fn set_keys(bssid: [u8; 6], ch: u8, tk: &[u8; 16], gtk: &[u8; 16], gtk_id: u8) -> Result<(), String> {
+    use crypto_core::ct::Zeroize;
+    let lk = S9_LINK.lock().as_ref().map(|l| (l.five, l.band));
+    let Some((five, band)) = lk else { return Err(String::from("no-link")) };
+    let link = MCU_LINK.lock().take();
+    let Some(mut h) = link else { return Err(String::from("no-mcu")) };
+    let rc = |r: &Result<u8, &'static str>| match r {
+        Ok(a) => alloc::format!("{:#04x}", a),
+        Err(e) => String::from(*e),
+    };
+    let b = uni_cmd(&mut h, UNI_BSS_INFO, &bss_sec_req(bssid, band, ch, five));
+    let (mut p, mut g): (Result<u8, &'static str>, Result<u8, &'static str>) = (Err("skipped"), Err("skipped"));
+    if b == Ok(0) {
+        let mut k = key_req(bssid, WCID_PEER, true, 0, tk);
+        p = uni_cmd(&mut h, UNI_STA_REC, &k);
+        k.zeroize();
+        if p == Ok(0) {
+            let mut k = key_req(bssid, WCID_BMC, false, gtk_id, gtk);
+            g = uni_cmd(&mut h, UNI_STA_REC, &k);
+            k.zeroize();
+        }
+    }
+    for i in 0..(UNI_TXD_BYTES + KEY_REQ_LEN) as u64 {
+        // SAFETY: the 4 KiB command page, owned by this run (MCU_LINK taken), no command in flight: the last command's key bytes are wiped.
+        unsafe { core::ptr::write_volatile((h.page + i) as *mut u8, 0) };
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    *MCU_LINK.lock() = Some(h);
+    if b == Ok(0) && p == Ok(0) && g == Ok(0) {
+        serial_println!(
+            "[mt7925] s10 keys bss={} ptk={} gtk={} wcid={}/{} gtk_id={} -> installed",
+            rc(&b), rc(&p), rc(&g), WCID_PEER, WCID_BMC, gtk_id
+        );
+        return Ok(());
+    }
+    let (which, r) = if b != Ok(0) { ("bss", &b) } else if p != Ok(0) { ("ptk", &p) } else { ("gtk", &g) };
+    serial_println!("[mt7925] s10 keys bss={} ptk={} gtk={} -> REFUSED why={}", rc(&b), rc(&p), rc(&g), which);
+    Err(alloc::format!("{}:{}", which, rc(r)))
+}
+
+/// `tests wpa2`'s `keys` leg (hand-computed from the field tables, no capture): the 60-byte secured BSS_INFO on 2.4 GHz ch 6 (and
+/// the RLM band and channel on 5 GHz ch 36), the pairwise key body (wlan 1, key id 0) and the group key body (wlan 19, muar 0x0e,
+/// key id 2) as byte literals, and the EAPOL judge over a canned EAPOL frame, a canned IPv4 frame and truncations.
+pub fn s10_kat() -> bool {
+    let peer = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let key: [u8; 16] = core::array::from_fn(|i| i as u8);
+    let want_bss: [u8; BSS_SEC_LEN] = [
+        0, 0, 0, 0, 0, 0, 32, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 19, 0, 100, 0, 0, 6, 1, 0, 1, 0, 0, 0,
+        16, 0, 8, 0, 7, 6, 4, 0,
+        2, 0, 16, 0, 6, 6, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0,
+    ];
+    let mut ok = bss_sec_req(peer, 0, 6, false) == want_bss;
+    let five = bss_sec_req(peer, 1, 36, true);
+    ok &= five[11] == 1 && five[29] == PHY_MODE_A && five[36..44] == want_bss[36..44] && five[44..48] == [2, 0, 16, 0] && five[48] == 36 && five[49] == 36 && five[56] == 1
+        && five[52] == 2 && five[53] == 2;
+    let mut want = [0u8; KEY_REQ_LEN];
+    want[..28].copy_from_slice(&[0, 1, 1, 0, 1, 0, 0, 0, 0x27, 0, 68, 0, 1, 1, 1, 0, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 4, 0, 16, 1, 1]);
+    want[28..44].copy_from_slice(&key);
+    ok &= key_req(peer, WCID_PEER, true, 0, &key) == want;
+    let mut want = [0u8; KEY_REQ_LEN];
+    want[..28].copy_from_slice(&[0, 19, 1, 0, 1, 0x0e, 0, 0, 0x27, 0, 68, 0, 1, 0, 0, 0, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0, 4, 2, 16, 19, 1]);
+    want[28..44].copy_from_slice(&key);
+    ok &= key_req(peer, WCID_BMC, false, 2, &key) == want;
+    let mut eapol = alloc::vec![0u8; ETH_HDR + 4];
+    eapol[12] = 0x88;
+    eapol[13] = 0x8e;
+    let mut ip = alloc::vec![0u8; 60];
+    ip[12] = 0x08;
+    ok &= s10_is_eapol(&eapol) && !s10_is_eapol(&ip) && !s10_is_eapol(&eapol[..ETH_HDR + 3]) && !s10_is_eapol(&[]);
     ok
 }

@@ -10657,7 +10657,7 @@ test_splash() {
 # three), every line held on the previous line's verdict. The spec's COMPLETE is the last verdict. The typist connects to QMP before it reads a marker, and the QMP socket exists only after
 # test_x86_64 has removed the old capture, so it never reads a stale log. Transcript: target/zenbook-typist.log (beside it).
 test_zenbook() {
-    local secs="${1:-200}"   # ZENBOOKSPECPINS (Z54): 180 -> 200 s, the three typed verbs added below cost 18.15 s (3 x 4 s settle + 45 keys x 0.12 s + 3 x 0.25 s poll)
+    local secs="${1:-206}"   # MT7925S10 (Z55): 200 -> 206 s, the typed `tests wpa2` costs 5.6 s (4 s settle + 11 keys x 0.12 + 0.25 poll). ZENBOOKSPECPINS (Z54): 180 -> 200 s, the three typed verbs added below cost 18.15 s (3 x 4 s settle + 45 keys x 0.12 s + 3 x 0.25 s poll)
     if [ -z "${UNAOS_ZENBOOKLANE:-}" ]; then
         local _zk="" _zv
         for _zv in $(compgen -e); do case "$_zv" in UNAOS_QEMU_MACHINE|UNAOS_QMP_PORT|UNAOS_NVME_4K|UNAOS_NVME_DISK) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
@@ -10682,14 +10682,14 @@ zenbook_lane_typed() { # $1 = the wall (s)
     TYPIST_PORT="$zport" TYPIST_LOG="$SERIAL_LOG"
     local -a zph=("$FIRSTUSER_PHASE")
     prev=":: BOOTLIST: ran="   # ZENBOOKLANELIST (Z19): held on the lane list's light summary (it runs at [desktop] built), so no typed `tests` meets a list fixture's RUNNING (`:: TESTS: already running — refused ::`)
-    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID suspend:SUSPEND ecqnames:ECQNAMES dwi2cacpi:DWI2CFAST bootlist:BOOTLIST; do   # ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged). ZENBOOKSPECPINS (Z54): suspend, ecqnames, dwi2cacpi (held on DWI2CFAST, its last of three verdicts), each pinned by x86-zenbook.spec §9
+    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID suspend:SUSPEND ecqnames:ECQNAMES dwi2cacpi:DWI2CFAST wpa2:WPA2KAT bootlist:BOOTLIST; do   # ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged). ZENBOOKSPECPINS (Z54): suspend, ecqnames, dwi2cacpi (held on DWI2CFAST, its last of three verdicts), each pinned by x86-zenbook.spec §9
         local done_mark=":: ${v#*:}: "; [ "${v%%:*}" = bootlist ] && done_mark=":: BOOTLIST: probe"
         zph+=("${prev}|tests ${v%%:*}|t:tests spc t:${v%%:*} ret|${done_mark}")
         prev="$done_mark"
     done
     mkdir -p "${WORKSPACE_DIR}/target"; rm -f "$tlog"
     typist_start "$tlog" "$secs" "${zph[@]}"
-    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: typist armed on QMP :${zport} — the first-user form, then tests platform/ec/nvme/i8042/dwi2c/hdacensus/gopshot/eclid/suspend/ecqnames/dwi2cacpi/bootlist (transcript ${tlog#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: typist armed on QMP :${zport} — the first-user form, then tests platform/ec/nvme/i8042/dwi2c/hdacensus/gopshot/eclid/suspend/ecqnames/dwi2cacpi/wpa2/bootlist (transcript ${tlog#${WORKSPACE_DIR}/})${COLOR_RESET}"
     test_x86_64 "$secs" || rc=$?
     wait "$typist" 2>/dev/null || true
     awk '/^\[typist\]/ { print "ZENBOOKLANE:   " $0 }' "$tlog" 2>/dev/null || true
@@ -15288,7 +15288,7 @@ case "${1:-}" in
     test-zenbook|test_zenbook)
         # ZENBOOKLANE (zenbook-ledger Z13): the Zenbook line under QEMU as zenbook_um5606w. Re-execs itself (see
         # test_zenbook), so this arm is entered twice per invocation. Fold-gate command, not a leg of `check`.
-        test_zenbook "${2:-200}"   # ZENBOOKSPECPINS (Z54): 200 s, twelve typed verbs (+18.15 s measured from typist.sh). ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
+        test_zenbook "${2:-206}"   # MT7925S10 (Z55): 206 s, the default beside test_zenbook's (a dispatcher default of 200 would override it). ZENBOOKSPECPINS (Z54): 200 s, twelve typed verbs (+18.15 s measured from typist.sh). ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
         ;;
     kernel8|baremetal)
         _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do
