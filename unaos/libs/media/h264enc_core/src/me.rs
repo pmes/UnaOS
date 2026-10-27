@@ -21,13 +21,19 @@
 //! co-located motion), B_Skip when its prediction leaves no residual, else the cheapest of
 //! B_Direct_16x16 / B_L0_16x16 / B_L1_16x16 / B_Bi_16x16 by SAD + lambda x bits; the bi-prediction is
 //! the decoder's default average `(a + b + 1) >> 1`.
+//!
+//! H264ENCPYRAMID (SR349): [`Encoder::direct`] is spatial or temporal direct by the picture's flag (temporal: h264_core
+//! `inter::dist_scale_factor` / `temporal_mvs` over the POCs, refIdx 0 in both lists), and `bi_pred` applies the
+//! picture's weights through h264_core `inter::weighted_sample` (implicit weights from `inter::implicit_weights`) —
+//! the decoder's own fns, one copy.
 
-use h264_core::inter::{chroma_mc, luma_mc};
+use h264_core::inter::{chroma_mc, dist_scale_factor, implicit_weights, luma_mc, temporal_mvs, weighted_sample};
 use h264_core::picture::{Mv, Plane, BLK_X, BLK_Y};
 
 use crate::nal::{se_bits, ue_bits};
 use crate::transform::{code_chroma, fdct16, quant4, recon4};
-use crate::{lambda, Encoder, Kind, MbCode};
+use crate::sps::WP_LOG2_DENOM;
+use crate::{lambda, BWeights, Encoder, Kind, MbCode};
 
 /// The integer search range in samples, each direction (the refinement adds up to 3/4 sample).
 pub const SEARCH: i32 = 8;
@@ -296,25 +302,37 @@ impl Encoder {
     }
 
     /// The prediction of a B macroblock's motion `m` (SR333): one list's samples, or with both lists the
-    /// decoder's default weighted average `(a + b + 1) >> 1` (h264_core `predict`, weighted_bipred_idc 0).
+    /// decoder's default weighted average `(a + b + 1) >> 1` (h264_core `predict`, weighted_bipred_idc 0); under the
+    /// picture's weights (SR349) h264_core's `weighted_sample`, clipped as the decoder clips it.
     fn bi_pred(&self, mbx: usize, mby: usize, m: [MbMotion; 2]) -> ([i32; 256], [[i32; 64]; 2]) {
-        match (m[0].r >= 0, m[1].r >= 0) {
-            (true, false) => self.inter_pred(&self.refp, mbx, mby, m[0].mv),
-            (false, true) => self.inter_pred(&self.fwd, mbx, mby, m[1].mv),
-            _ => {
-                let (mut l, mut c) = self.inter_pred(&self.refp, mbx, mby, m[0].mv);
-                let (l1, c1) = self.inter_pred(&self.fwd, mbx, mby, m[1].mv);
-                for k in 0..256 {
-                    l[k] = (l[k] + l1[k] + 1) >> 1;
-                }
-                for p in 0..2 {
-                    for k in 0..64 {
-                        c[p][k] = (c[p][k] + c1[p][k] + 1) >> 1;
-                    }
-                }
-                (l, c)
+        let used = [m[0].r >= 0, m[1].r >= 0];
+        let p0 = used[0].then(|| self.inter_pred(&self.refp, mbx, mby, m[0].mv));
+        let p1 = used[1].then(|| self.inter_pred(&self.fwd, mbx, mby, m[1].mv));
+        let wp = self.bw.filter(|b| b.explicit || (used[0] && used[1]));
+        if wp.is_none() {
+            match (p0, p1) {
+                (Some(a), None) => return a,
+                (None, Some(b)) => return b,
+                _ => {}
             }
         }
+        let zero = ([0i32; 256], [[0i32; 64]; 2]);
+        let (a, b) = (p0.unwrap_or(zero), p1.unwrap_or(zero));
+        let mix = |c: usize, x: i32, y: i32| match &wp {
+            None => (x + y + 1) >> 1,
+            Some(w) => weighted_sample(x, y, used, w.log_wd[c], w.w[c], w.o[c]).clamp(0, 255),
+        };
+        let mut l = [0i32; 256];
+        for k in 0..256 {
+            l[k] = mix(0, a.0[k], b.0[k]);
+        }
+        let mut ch = [[0i32; 64]; 2];
+        for p in 0..2 {
+            for k in 0..64 {
+                ch[p][k] = mix(1 + p, a.1[p][k], b.1[p][k]);
+            }
+        }
+        (l, ch)
     }
 
     /// Decide, code and reconstruct the B macroblock (mbx, mby) (SR333): B_Skip when the spatial-direct
@@ -322,9 +340,7 @@ impl Encoder {
     /// B_Bi_16x16 by luma SAD + lambda x (mb_type bits + mvd bits), ties in that order.
     pub(crate) fn b_mb(&mut self, mbx: usize, mby: usize) -> MbCode {
         let i = mby * self.mb_w + mbx;
-        let col = self.col[i];
-        let col_zero = col.r == 0 && (-1..=1).contains(&col.mv.x) && (-1..=1).contains(&col.mv.y);
-        let direct = direct_spatial(&self.motion, &self.motion1, self.mb_w, mbx, mby, col_zero);
+        let direct = self.direct(mbx, mby);
         let (luma, chroma) = self.bi_pred(mbx, mby, direct);
         let code = self.inter_luma(mbx, mby, &luma, Kind::BSkip);
         if code.cbp == 0 && self.chroma_is_empty(mbx, mby, &chroma) {
@@ -371,5 +387,39 @@ impl Encoder {
         self.inter_recon(mbx, mby, &l, &c, &mut code);
         [self.motion[i], self.motion1[i]] = m;
         code
+    }
+}
+
+// H264ENCPYRAMID (SR349): direct mode by the picture's flag, and the picture's bi-prediction weights.
+impl Encoder {
+    /// The direct-mode motion of macroblock (mbx, mby): spatial ([`direct_spatial`], the co-located block zero-motion on
+    /// refIdx 0) or, with direct_spatial_mv_pred_flag 0, temporal (8.4.1.2.3): refIdx 0 in both lists (the co-located
+    /// reference is RefPicList0[0] wherever the encoder writes temporal direct), mvCol scaled by the POC distances of
+    /// the picture, L0[0] and L1[0] (an intra co-located block: zero vectors).
+    pub(crate) fn direct(&self, mbx: usize, mby: usize) -> [MbMotion; 2] {
+        let col = self.col[mby * self.mb_w + mbx];
+        if self.direct_spatial {
+            let col_zero = col.r == 0 && (-1..=1).contains(&col.mv.x) && (-1..=1).contains(&col.mv.y);
+            return direct_spatial(&self.motion, &self.motion1, self.mb_w, mbx, mby, col_zero);
+        }
+        let mv_col = if col.r >= 0 { col.mv } else { Mv::ZERO };
+        let dsf = dist_scale_factor(self.poc_of(self.cur_disp), self.poc_of(self.disp[0]), self.poc_of(self.disp[1]));
+        let (mv0, mv1) = temporal_mvs(dsf, mv_col);
+        [MbMotion { r: 0, mv: mv0 }, MbMotion { r: 0, mv: mv1 }]
+    }
+
+    /// The weights of the B picture about to be coded from the PPS's weighted_bipred_idc: 2 the implicit POC-distance
+    /// weights of L0[0] / L1[0] (one active reference per list: one pair per picture), 1 the explicit table (weight
+    /// 2^[`WP_LOG2_DENOM`] with the luma `offsets`, chroma at its defaults), 0 none.
+    pub(crate) fn b_weights(&self, offsets: Option<[i32; 2]>) -> Option<BWeights> {
+        let lw = WP_LOG2_DENOM as i32;
+        match self.bipred_idc {
+            2 => {
+                let w = implicit_weights(dist_scale_factor(self.poc_of(self.cur_disp), self.poc_of(self.disp[0]), self.poc_of(self.disp[1])));
+                Some(BWeights { explicit: false, log_wd: [5; 3], w: [w; 3], o: [[0; 2]; 3] })
+            }
+            1 => Some(BWeights { explicit: true, log_wd: [lw; 3], w: [[1 << lw; 2]; 3], o: [offsets.unwrap_or([0; 2]), [0; 2], [0; 2]] }),
+            _ => None,
+        }
     }
 }

@@ -19,6 +19,10 @@
 //! (H264ENCBFRAMES SR333) up to 4 B pictures sit between anchors: Main profile, POC type 0, two
 //! reference frames (L0 the past anchor, L1 the future one), B_Skip / B_Direct_16x16 (spatial direct) /
 //! B_L0 / B_L1 / B_Bi_16x16, coded in decoding order through [`Encoder::push`] / [`Encoder::flush`].
+//! H264ENCPYRAMID (SR349): with bframes >= 2 the middle B of each group is coded first as a reference (the B pyramid:
+//! three reference frames, the outer Bs predicting from it by the default POC lists, VUI reorder 2 at bframes >= 3),
+//! [`Config::direct_temporal`] writes temporal direct where it is decodable, and [`Config::bipred`] picks the
+//! bi-prediction weights (implicit by default under the pyramid, or an explicit offset table).
 //!
 //! | [`Config`] field | range         | default | effect                                                  |
 //! |------------------|---------------|---------|---------------------------------------------------------|
@@ -30,7 +34,9 @@
 //! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP |
 //! | `entropy`        | [`Entropy`]   | Cavlc   | Cabac: Main profile, entropy_coding_mode_flag 1, [`cabac`] writes the slice data |
 //! | `transform8x8`   | bool          | false   | High (profile_idc 100), transform_8x8_mode_flag: Intra_8x8 in I macroblocks (SR322) |
-//! | `bframes`        | 0..=4         | 0       | B pictures between anchors (SR333): push / flush, VUI reorder 1 (>4 = 4) |
+//! | `bframes`        | 0..=4         | 0       | B pictures between anchors (SR333): push / flush, VUI reorder 1 (>4 = 4); >= 2 the pyramid (SR349) |
+//! | `direct_temporal`| bool          | false   | temporal direct on the Bs whose L1[0] is an anchor (SR349)          |
+//! | `bipred`         | [`BiPred`]    | Auto    | weighted_bipred_idc: Auto = implicit under the pyramid, else the average (SR349) |
 //!
 //! | module          | Recommendation                                                          |
 //! |-----------------|-------------------------------------------------------------------------|
@@ -58,7 +64,7 @@
 //!
 //! Owed (handlers.md §5): two-pass / scene cuts / activity masking (inside H264ENC-RC), scaling matrices (inside H264ENC-CABAC; High's 8x8 transform is SR322's), the
 //! 16x8 / 8x16 / 8x8 partitions (inside H264ENC-SUBPEL), per-slice filter offsets (inside
-//! H264ENC-DEBLOCK), pyramid / temporal-direct / weighted B (inside H264ENC-BFRAMES), hardware encode (H264ENC-HW).
+//! H264ENC-DEBLOCK), intra / partitioned B macroblocks and adaptive B placement (inside H264ENC-BFRAMES), hardware encode (H264ENC-HW).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -90,7 +96,7 @@ use crate::cavlc::Nnz;
 use crate::me::MbMotion;
 use crate::nal::BitWriter;
 pub use crate::rc::{RateControl, RcMode};
-use crate::sps::SeqParams;
+use crate::sps::{SeqParams, SliceExtra};
 
 /// Every way the encoder refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +162,43 @@ pub struct Config {
     /// B pictures between anchors (H264ENCBFRAMES, SR333): 0 keeps every pinned byte (and [`Encoder::encode`]);
     /// 1..=4 (above 4 read as 4) codes Main profile with POC type 0 through [`Encoder::push`] / [`Encoder::flush`].
     pub bframes: u8,
+    /// Temporal direct (H264ENCPYRAMID, SR349): direct_spatial_mv_pred_flag 0 on the B pictures whose L1[0] is an anchor
+    /// (SR333's Bs and the pyramid's middle); the pyramid's outer Bs keep spatial direct. false keeps every pinned byte.
+    pub direct_temporal: bool,
+    /// The bi-prediction weights of B slices (SR349): see [`BiPred`].
+    pub bipred: BiPred,
+}
+
+/// weighted_bipred_idc of the stream (H264ENCPYRAMID, SR349); without `bframes` always 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BiPred {
+    /// Implicit under the pyramid (bframes >= 2), the default average otherwise.
+    #[default]
+    Auto,
+    /// weighted_bipred_idc 0: `(a + b + 1) >> 1`.
+    Average,
+    /// weighted_bipred_idc 2: POC-distance weights (8.4.2.3.1).
+    Implicit,
+    /// weighted_bipred_idc 1: a pred_weight_table per B slice, the luma offsets from the mean-luma difference to each reference.
+    Explicit,
+}
+
+/// The pyramid role of the picture being coded (SR349): an anchor or SR333's B (Plain), the middle B (Ref), an outer B.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tier {
+    Plain,
+    Ref,
+    Outer,
+}
+
+/// The weights of the B picture being coded (SR349), per component: logWD, w and o per list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BWeights {
+    /// Explicit weights apply to single-list predictions too; implicit ones only to bi-predicted blocks.
+    pub explicit: bool,
+    pub log_wd: [i32; 3],
+    pub w: [[i32; 2]; 3],
+    pub o: [[i32; 2]; 3],
 }
 
 /// The coding type of one picture: an IDR (I slice), a P anchor, or a non-reference B picture (SR333).
@@ -168,6 +211,9 @@ pub enum Pic {
 
 /// SliceQPY of a B picture above its picture QP under constant QP (SR333): slice_qp_delta 2.
 pub const B_QP_OFFSET: i32 = 2;
+
+/// SliceQPY of the pyramid's reference B above its picture QP under constant QP (SR349).
+pub const B_REF_QP_OFFSET: i32 = 1;
 
 /// entropy_coding_mode_flag (7.4.2.2): CAVLC (9.2) or CABAC (9.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -198,7 +244,7 @@ pub struct Access {
     pub keyframe: bool,
     pub nals: Vec<Vec<u8>>,
     /// Presentation time in frames (SR333): the frame index, or under [`Config::bframes`] the display
-    /// index + 1 (the one-picture reorder delay, so `dts <= pts`).
+    /// index + the VUI reorder depth (1, or 2 under a pyramid of bframes >= 3, SR349), so `dts <= pts`.
     pub pts: u64,
     /// Decoding time in frames: the access unit's index in decoding order.
     pub dts: u64,
@@ -384,6 +430,26 @@ pub struct Encoder {
     idr_display: u64,
     /// log2_max_pic_order_cnt_lsb (POC type 0, under `bframes` only).
     log2_max_poc_lsb: u32,
+    /// The pyramid's middle B reconstruction (SR349): L1 of the Bs before it, L0 of those after it.
+    pub(crate) mid: [Plane; 3],
+    /// The middle B's co-located record (SR349): per macroblock its list-0 motion, else its list-1 motion.
+    pub(crate) col_mid: Vec<MbMotion>,
+    /// Display index of `refp`, `fwd` and `mid` (SR349; swapped with them).
+    pub(crate) disp: [u64; 3],
+    /// Display index of the picture being coded.
+    pub(crate) cur_disp: u64,
+    /// The pyramid role of the picture being coded.
+    pub(crate) tier: Tier,
+    /// A middle B was coded since the last anchor: the next P modifies list 0 and forgets it (SR349).
+    mid_live: bool,
+    /// direct_spatial_mv_pred_flag of the B picture being coded.
+    pub(crate) direct_spatial: bool,
+    /// The weights of the B picture being coded (None = the default average).
+    pub(crate) bw: Option<BWeights>,
+    /// weighted_bipred_idc of the PPS.
+    pub(crate) bipred_idc: u32,
+    /// VUI max_num_reorder_frames: the pts delay.
+    depth: u64,
 }
 
 impl Encoder {
@@ -414,9 +480,17 @@ impl Encoder {
         let cabac = cfg.entropy == Entropy::Cabac;
         let high = cfg.transform8x8;
         let reorder = cfg.bframes > 0;
-        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high, reorder, log2_max_poc_lsb };
+        let pyramid = cfg.bframes >= 2;
+        let num_reorder = if cfg.bframes >= 3 { 2 } else { reorder as u32 };
+        let bipred_idc = match (reorder, cfg.bipred) {
+            (false, _) | (_, BiPred::Average) => 0,
+            (_, BiPred::Auto) => 2 * pyramid as u32,
+            (_, BiPred::Implicit) => 2,
+            (_, BiPred::Explicit) => 1,
+        };
+        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high, reorder, log2_max_poc_lsb, pyramid, num_reorder };
         let sps = nal::nal_unit(3, nal::NAL_SPS, &sps::write_sps(&p));
-        let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp, cabac, high));
+        let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp, cabac, high, bipred_idc));
         let planes = || [Plane::new(mb_w * 16, mb_h * 16, 0), Plane::new(mb_w * 8, mb_h * 8, 128), Plane::new(mb_w * 8, mb_h * 8, 128)];
         let (w, h) = (cfg.width as usize, cfg.height as usize);
         Ok(Encoder {
@@ -452,6 +526,16 @@ impl Encoder {
             coded: 0,
             idr_display: 0,
             log2_max_poc_lsb,
+            mid: planes(),
+            col_mid: vec![MbMotion::NONE; mb_w * mb_h],
+            disp: [0; 3],
+            cur_disp: 0,
+            tier: Tier::Plain,
+            mid_live: false,
+            direct_spatial: true,
+            bw: None,
+            bipred_idc,
+            depth: num_reorder as u64,
         })
     }
 
@@ -536,16 +620,40 @@ impl Encoder {
     }
 
     /// Code the anchor in `src`, then each held frame as a B picture between the previous anchor (L0)
-    /// and it (L1); the new anchor then becomes L0.
+    /// and it (L1); the new anchor then becomes L0. SR349: with bframes >= 2 and two or more held frames, the held
+    /// frame (n - 1) / 2 is coded first as the reference B (L0 the past anchor, L1 the new one), then the others in
+    /// display order, each between its nearest past and future reference ([`Encoder::pyramid_swap`]).
     fn group(&mut self, pic: Pic, display: u64) -> Vec<Access> {
+        self.tier = Tier::Plain;
         let mut out = vec![self.code(pic, display)];
         self.recons.push(self.crop.clone());
-        for (planes, d) in core::mem::take(&mut self.ahead) {
-            self.src = planes;
-            out.push(self.code(Pic::B, d));
+        let held = core::mem::take(&mut self.ahead);
+        let mid = (self.cfg.bframes >= 2 && held.len() >= 2).then(|| (held.len() - 1) / 2);
+        if let Some(m) = mid {
+            self.src = held[m].0.clone();
+            self.tier = Tier::Ref;
+            out.push(self.code(Pic::B, held[m].1));
             self.recons.push(self.crop.clone());
         }
+        for (j, (planes, d)) in held.into_iter().enumerate() {
+            if Some(j) == mid {
+                continue;
+            }
+            self.src = planes;
+            let side = mid.map(|m| j < m);
+            self.tier = if side.is_some() { Tier::Outer } else { Tier::Plain };
+            if let Some(before) = side {
+                self.pyramid_swap(before);
+            }
+            out.push(self.code(Pic::B, d));
+            self.recons.push(self.crop.clone());
+            if let Some(before) = side {
+                self.pyramid_swap(before);
+            }
+        }
+        self.tier = Tier::Plain;
         core::mem::swap(&mut self.refp, &mut self.fwd);
+        self.disp.swap(0, 1);
         out
     }
 
@@ -556,12 +664,17 @@ impl Encoder {
         let bpic = pic == Pic::B;
         // frame_num: PrevRefFrameNum + 1; a B picture (nal_ref_idc 0) does not move PrevRefFrameNum.
         let frame_num = if idr { 0 } else { (self.frame_num + 1) % (1 << self.log2_max_frame_num) };
-        if !bpic {
+        let reference = !bpic || self.tier == Tier::Ref;
+        if reference {
             self.frame_num = frame_num;
         }
         if idr {
             self.idr_display = display;
         }
+        self.cur_disp = display;
+        let extra = self.slice_extra(pic);
+        self.direct_spatial = extra.direct_spatial;
+        self.bw = if bpic { self.b_weights(extra.weights) } else { None };
         let slice_qp = self.rc_picture(pic);
         self.set_qp(slice_qp);
         self.qp_pred = slice_qp;
@@ -572,7 +685,7 @@ impl Encoder {
         let mut w = BitWriter::new();
         let is_cabac = self.cfg.entropy == Entropy::Cabac;
         let poc = (self.cfg.bframes > 0).then(|| ((2 * (display - self.idr_display) % (1u64 << self.log2_max_poc_lsb)) as u32, self.log2_max_poc_lsb));
-        sps::write_slice_header(&mut w, pic, frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, poc, self.cfg.deblock, slice_qp - self.cfg.qp as i32, is_cabac);
+        sps::write_slice_header(&mut w, pic, frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, poc, self.cfg.deblock, slice_qp - self.cfg.qp as i32, is_cabac, &extra);
         let hdr = w.bits();
         // CABAC (SR310): the slice data's writer, contexts for I (column 0) or P / B with cabac_init_idc 0.
         let mut cw = is_cabac.then(|| cabac::Writer::new(&mut w, if idr { 0 } else { 1 }, slice_qp, self.mb_w * self.mb_h));
@@ -610,8 +723,8 @@ impl Encoder {
             }
             w.trailing();
         }
-        // A B picture is never a reference: nal_ref_idc 0.
-        let slice = nal::nal_unit(if bpic { 0 } else { 3 }, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
+        // A B picture is not a reference (nal_ref_idc 0) unless it is the pyramid's middle (1, SR349).
+        let slice = nal::nal_unit(if !bpic { 3 } else { reference as u8 }, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
         let nals = if idr { vec![self.sps.clone(), self.pps.clone(), slice] } else { vec![slice] };
         self.rc_update(nals.iter().map(|n| n.len() as u64 * 8).sum());
         self.last_qp = slice_qp;
@@ -619,7 +732,17 @@ impl Encoder {
         self.store_crop();
         if self.cfg.bframes == 0 {
             core::mem::swap(&mut self.rec, &mut self.refp);
+        } else if self.tier == Tier::Ref {
+            // The pyramid's middle B (SR349): its reconstruction is `mid`, its motion the outer Bs' co-located record.
+            core::mem::swap(&mut self.rec, &mut self.mid);
+            self.disp[2] = display;
+            for i in 0..self.col_mid.len() {
+                self.col_mid[i] = if self.motion[i].r >= 0 { self.motion[i] } else { self.motion1[i] };
+            }
+            self.mid_live = true;
         } else if !bpic {
+            self.disp[1] = display;
+            self.mid_live = false;
             // The new anchor is the held B pictures' L1 (`group` makes it L0 after them); its motion is
             // their co-located motion.
             core::mem::swap(&mut self.rec, &mut self.fwd);
@@ -632,7 +755,7 @@ impl Encoder {
         if idr {
             self.idr_count = self.idr_count.wrapping_add(1);
         }
-        let au = Access { keyframe: idr, nals, pts: display + (self.cfg.bframes > 0) as u64, dts: self.coded };
+        let au = Access { keyframe: idr, nals, pts: display + self.depth, dts: self.coded };
         self.coded += 1;
         au
     }
@@ -885,4 +1008,48 @@ pub(crate) fn scan8(c: &[i32; 64]) -> [i32; 64] {
         l[k] = c[ZIGZAG8[k] as usize];
     }
     l
+}
+
+// H264ENCPYRAMID (SR349): the B pyramid's reference arrangement and per-slice syntax.
+impl Encoder {
+    /// Put an outer B's references in `refp` (L0) / `fwd` (L1) — an involution, called before and after its `code`: a B
+    /// before the middle takes the middle as L1 and its co-located record; one after it takes the middle as L0.
+    fn pyramid_swap(&mut self, before: bool) {
+        if before {
+            core::mem::swap(&mut self.fwd, &mut self.mid);
+            core::mem::swap(&mut self.col, &mut self.col_mid);
+            self.disp.swap(1, 2);
+        } else {
+            core::mem::swap(&mut self.refp, &mut self.mid);
+            self.disp.swap(0, 2);
+        }
+    }
+
+    /// The slice syntax beyond SR333's for the picture about to be coded: a P after a middle B puts the past anchor
+    /// first in list 0 (abs_diff_pic_num_minus1 1: the middle B sits between) and forgets that B (MMCO 1, difference 0);
+    /// a B names its reference role, its direct mode and (weighted_bipred_idc 1) its offsets.
+    fn slice_extra(&self, pic: Pic) -> SliceExtra {
+        match pic {
+            Pic::P if self.mid_live => SliceExtra { l0_reorder: Some(1), forget: Some(0), ..SliceExtra::default() },
+            Pic::B => SliceExtra {
+                reference: self.tier == Tier::Ref,
+                direct_spatial: !(self.cfg.direct_temporal && self.tier != Tier::Outer),
+                weights: (self.bipred_idc == 1).then(|| self.wp_offsets()),
+                ..SliceExtra::default()
+            },
+            _ => SliceExtra::default(),
+        }
+    }
+
+    /// PicOrderCnt of display index `d` (POC type 0: twice the distance from the IDR).
+    pub(crate) fn poc_of(&self, d: u64) -> i32 {
+        2 * (d as i64 - self.idr_display as i64) as i32
+    }
+
+    /// The explicit luma offsets of L0[0] / L1[0]: the source's mean luma minus the reference's, rounded, -128..=127.
+    fn wp_offsets(&self) -> [i32; 2] {
+        let sum = |p: &Plane| p.data.iter().map(|&v| v as i64).sum::<i64>();
+        let (s, n) = (sum(&self.src[0]), self.src[0].data.len() as i64);
+        [&self.refp[0], &self.fwd[0]].map(|r| (2 * (s - sum(r)) + n).div_euclid(2 * n).clamp(-128, 127) as i32)
+    }
 }
