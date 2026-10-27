@@ -409,7 +409,7 @@ fn which() {
     SAID.store(true, Ordering::Relaxed);
     let m = crate::drivers::mt7925::mac().unwrap_or([0; 6]);
     serial_println!(
-        "[wifi] radio=mt7925 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} via=drivers::mt7925 data=refused why=s7-not-built -> registered",
+        "[wifi] radio=mt7925 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} via=drivers::mt7925 data=after-join(tests wifijoin) -> registered",
         m[0], m[1], m[2], m[3], m[4], m[5]
     );
 }

@@ -1,9 +1,9 @@
-//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23, and S6 the radio backend registered with the data rings armed, Z29, and S7 the scan, Z34, and S8 DEV_INFO/BSS_INFO, the channel and the open-system auth/assoc frames, Z38; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
+//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23, and S6 the radio backend registered with the data rings armed, Z29, and S7 the scan, Z34, and S8 DEV_INFO/BSS_INFO, the channel and the open-system auth/assoc frames, Z38, and S9 the peer STA_REC and the data path, Z46; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
 //! MT7925 — S1, the probe (ZENBOOKMT7925, zenbook-ledger Z5). The ladder is
-//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17), S5 (MT7925S5, Z23), S6 (MT7925S6, Z29), S7 (MT7925S7, Z34) and S8 (MT7925S8, Z38) are the seven file-tail blocks; S9..S10 are owed there by name.
+//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17), S5 (MT7925S5, Z23), S6 (MT7925S6, Z29), S7 (MT7925S7, Z34), S8 (MT7925S8, Z38) and S9 (MT7925S9, Z46) are the eight file-tail blocks; S10 is owed there by name.
 //!
 //! WHAT THIS RUNG DOES. Once per boot, from the three storage-ready passes in `main.rs` (beside `wifi::service()`,
 //! the same forward-only polled shape), and only after `boot::services_gate("wifi")` answers (R86, BP-net-4):
@@ -1408,7 +1408,7 @@ pub fn mac() -> Option<[u8; 6]> {
 // MAC behind `mac()`). No radio trait exists in the tree: the Broadcom station drives its own internals, and its link joins
 // the stack through `wifi/data.rs`'s accessor triple (BP-net-16). The one NIC trait is `net_phy::RawNic` (BP-net-1), so the
 // backend is `MtRadio` implementing it: the MAC from S5, transmit refused (`tx_ready` false) and receive answering nothing,
-// both by name (`why=s7-not-built`). S6 re-takes own, runs S5's wake reset again through the ONE `wake` with linux's two
+// both by name (`why=s7-not-built`, retired by MT7925S9 Z46: the S9 link carries them). S6 re-takes own, runs S5's wake reset again through the ONE `wake` with linux's two
 // data rings added (TX ring 0, band-0 data; RX ring 2, data: programmed, CPU index 0, every descriptor DMA_DONE, nothing
 // posted, no buffer handed), gives own back and registers the radio; `wifi::service`'s parked arm names it
 // (`[wifi] radio=mt7925`, wifi/mod.rs `which`). The stack's link chain (drivers/e1000.rs's accessor fold) is S9's, so smolnet
@@ -1509,34 +1509,31 @@ pub fn data_rings() -> Option<(u64, u64)> {
     RADIO.lock().as_ref().map(|d| (d.tx0, d.rx2))
 }
 
-/// The MT7925 radio backend (S6): the kernel's one NIC trait (`net_phy::RawNic`) over the parked channel. Nothing binds it
-/// to the stack yet (S9 owed); every operation but `mac` is refused by name, never a silent Ok.
+/// The MT7925 radio backend (S6): the kernel's one NIC trait (`net_phy::RawNic`) over the parked channel. MT7925S9 (Z46): the
+/// S9 link (`S9_LINK`, filled by `join` after the association) carries the frames, 802.3 both ways; `drivers/e1000.rs`'s accessor
+/// triple reaches it after the other links. With no link every operation but `mac` is refused by name, never a silent Ok.
 pub struct MtRadio;
 
 #[cfg(feature = "smolnet")]
 impl crate::net_phy::RawNic for MtRadio {
-    /// Refused: RX ring 2 is armed with no buffer handed; the frame path is S7's.
-    fn rx_frame_raw(_out: &mut [u8]) -> Option<usize> {
-        static SAID: AtomicBool = AtomicBool::new(false);
-        if !SAID.swap(true, Ordering::Relaxed) {
-            serial_println!("[mt7925] s6 rx -> REFUSED why=s7-not-built");
+    /// The next header-translated (Ethernet) frame from RX ring 2 (`link_rx`); None before the stack bound the link.
+    fn rx_frame_raw(out: &mut [u8]) -> Option<usize> {
+        if !bound() {
+            return None;
         }
-        None
+        link_rx(out)
     }
-    /// Refused: TX ring 0 is armed, nothing is posted (the TXWI/connac TXD is S7's); the frame is dropped, said once.
-    fn transmit(_frame: &[u8]) {
-        static SAID: AtomicBool = AtomicBool::new(false);
-        if !SAID.swap(true, Ordering::Relaxed) {
-            serial_println!("[mt7925] s6 tx -> REFUSED why=s7-not-built");
-        }
+    /// One Ethernet frame posted on TX ring 0 behind the 802.3 TXD (`link_tx`); dropped and counted when there is no room.
+    fn transmit(frame: &[u8]) {
+        link_tx(frame)
     }
     /// S5's capability-reply MAC, only once S6 registered the radio.
     fn mac() -> Option<[u8; 6]> {
         if registered() { self::mac() } else { None }
     }
-    /// The explicit refusal: no room ever, so smoltcp's back-pressure never calls `transmit`.
+    /// Room on TX ring 0 for one more frame (`tx_room`); false with no link, so smoltcp keeps the packet.
     fn tx_ready() -> bool {
-        false
+        tx_room()
     }
 }
 
@@ -1688,31 +1685,10 @@ fn scan_req(seq: u8, band: u8, chans: &[u8], active: bool) -> Vec<u8> {
 /// The 802.11 frame's byte range inside one RX ring 2 buffer (pure): past the 8-dword descriptor, its groups and twice the
 /// header pad. None = not a normal frame, header-translated, a length error, or too short for a MAC header.
 fn rx_frame(buf: &[u8]) -> Option<core::ops::Range<usize>> {
-    let (d0, d1, d2) = (le32(buf, 0)?, le32(buf, 4)?, le32(buf, 8)?);
-    if d0 >> 27 != PKT_NORMAL || d2 & (RXD2_HDR_TRANS | RXD2_MAX_LEN_ERR) != 0 {
-        return None;
+    match rx_span(buf) { // MT7925S9 (Z46): the descriptor walk is the ONE `rx_span` (S9's tail); S7 keeps untranslated frames of >= 24 bytes
+        Some((r, false)) if r.len() >= 24 => Some(r),
+        _ => None,
     }
-    let mut off = RXD_BASE;
-    if d1 & RXD1_G4 != 0 {
-        off += 16;
-    }
-    if d1 & RXD1_G1 != 0 {
-        off += 16;
-    }
-    if d1 & RXD1_G2 != 0 {
-        off += 8;
-    }
-    if d1 & RXD1_G3 != 0 {
-        off += 16;
-        if d1 & RXD1_G5 != 0 {
-            off += 96;
-        }
-    }
-    off += 2 * ((d2 >> 13) & 0x7) as usize;
-    if off + 24 > buf.len() {
-        return None;
-    }
-    Some(off..buf.len())
 }
 
 /// Every DMA_DONE descriptor of RX ring 2 in order, at most 32 per call: the bytes (SD_LEN0, capped at the buffer; a frame
@@ -1720,24 +1696,7 @@ fn rx_frame(buf: &[u8]) -> Option<core::ops::Range<usize>> {
 /// (true = it listed a new BSS).
 fn drain(r: &mut Rx2, n: &mut Counts, on_frame: &mut dyn FnMut(&[u8]) -> bool) {
     for _ in 0..RING_DEPTH {
-        let d = r.desc + r.ri as u64 * DESC_BYTES;
-        // SAFETY: descriptor ri (< RING_DEPTH) of RX ring 2's block (`ring()`, armed by `wake`); a status read.
-        let ctrl = unsafe { core::ptr::read_volatile((d + 4) as *const u32) };
-        if ctrl & DMA_DONE == 0 {
-            return;
-        }
-        core::sync::atomic::fence(Ordering::SeqCst);
-        let buf = r.bufs + r.ri as u64 * RX_BUF_BYTES;
-        let mut v = Vec::new();
-        if ctrl & LAST_SEC0 != 0 {
-            let len = (((ctrl & SD_LEN0) >> 16) as u64).min(RX_BUF_BYTES);
-            v.reserve(len as usize);
-            for i in 0..len {
-                // SAFETY: inside descriptor ri's 2048-byte buffer (i < len <= RX_BUF_BYTES), written by the device (DMA_DONE).
-                v.push(unsafe { core::ptr::read_volatile((buf + i) as *const u8) });
-            }
-        }
-        r.ri = rearm(r.q, r.desc, r.bufs, r.ri);
+        let Some(v) = rx_take(r) else { return }; // MT7925S9 (Z46): the per-descriptor read + `rearm` is the ONE `rx_take` (S9's tail), unchanged and in order
         match rx_frame(&v) {
             Some(span) => {
                 n.frames += 1;
@@ -1914,8 +1873,8 @@ pub fn scan_kat() -> bool {
 // carries the band index) and a ROC abort after. The host builds the frame (the station's `wifi_core` builders, handed in as closures: the
 // driver links no codec) and posts it on TX ring 0 as linux does: ONE descriptor, one buffer = a 32-byte connac3 TXD + a 32-byte hw txp whose
 // first pointer names the 802.11 frame (`post` + `tx_done`, S4's); wlan idx 19 = the interface's own wcid (WTBL_RESERVED), fixed rate by table
-// index, queue AC03. The reply is whatever RX ring 2's `drain` hands the station's judge closure (S7's frame filter). No STA_REC (owed S8-STAREC),
-// no key, no interrupt enable, no config write. Hardware facts only; no code copied.
+// index, queue AC03. The reply is whatever RX ring 2's `drain` hands the station's judge closure (S7's frame filter). The AP's STA_REC is S9's
+// (MT7925S9, Z46: S8-STAREC built in `join_run`), no key, no interrupt enable, no config write. Hardware facts only; no code copied.
 
 const UNI_DEV_INFO: u16 = 0x01;
 const UNI_BSS_INFO: u16 = 0x02;
@@ -1998,13 +1957,15 @@ struct Run {
     pre: Result<(), String>,
 }
 
-/// TX ring 0 as one join posts on it: registers, the next CPU index, the TX block, the band index the grant named, 5 GHz.
+/// TX ring 0 as one join posts on it: registers, the next CPU index, the TX block, the band index the grant named, 5 GHz, and
+/// (MT7925S9, Z46) the wlan index the frames ride: the AP peer's 1 once its STA_REC was acked, else the interface's own 19.
 struct Tx {
     q: u64,
     wi: u32,
     blk: u64,
     band: u8,
     five: bool,
+    wcid: u16,
 }
 
 /// What one ROC did: the ack's status byte, the grant (status, band index, ms waited).
@@ -2016,13 +1977,15 @@ struct Roc {
 /// S7's prologue, hoisted unchanged out of `scan_run` (MT7925S8, Z38; the writes and the s7 lines are the same, the tag is `who`):
 /// the pages, own (`take_own`), `kept`, RX ring 2's 64 KiB buffer block, `wake` with the data rings.
 fn rx_open(b: u64, h: &mut Hw, tx0: u64, rx2: u64, who: &'static str) -> Result<Run, &'static str> {
+    let dropped = S9_LINK.lock().take(); // MT7925S9 (Z46): a scan or join re-wakes the rings, so the S9 link ends first (its line)
+    let was = dropped.map_or(false, |l| link_down(l, who));
     let lp = b + CONN_HOST_CSR_TOP + LPCTL;
     if !(map_page(b + WFDMA0) && map_page(b + (DMASHDL_SW_CONTROL & !0xfff))) {
         serial_println!("[mt7925] {} -> NOT ATTEMPTED why=unmapped rel=found", who);
         return Err("unmapped");
     }
     let took = match take_own(lp) {
-        Ok(t) => t,
+        Ok(t) => t || was, // MT7925S9 (Z46): own the ended link kept is given back by this run
         Err((last, rel)) => {
             serial_println!("[mt7925] {} -> NOT ATTEMPTED why=own lpctl={:#010x} rel={}", who, last, rel);
             return Err("own");
@@ -2058,18 +2021,19 @@ fn dev_req(m: [u8; 6]) -> [u8; 16] {
 }
 
 /// BSS_INFO body (pure, 36 bytes): header {bss 0, 3 pad}, the BASIC TLV (tag 0, len 32): active, omac 0, hw bss 0, `band`, STA/INFRA,
-/// conn_state 1 (not connected), wmm 0, `bssid`, the bmc and sta wlan index 19, link 0. `phy` = Some(5 GHz?) is a join's: beacon
+/// conn_state 1 (not connected), wmm 0, `bssid`, the bmc wlan index 19, link 0. `phy` = Some(5 GHz?) is a join's: beacon
 /// interval 100 (`parse_beacon` does not carry it: S8-BCNINT), the legacy phy mode and the non-HT basic phy of the band.
-fn bss_req(bssid: [u8; 6], band: u8, phy: Option<bool>) -> [u8; 36] {
+/// MT7925S9 (Z46): `sta` is the sta wlan index (19 idle, the AP peer's 1 for a join) and `connected` writes conn_state 0.
+fn bss_req(bssid: [u8; 6], band: u8, phy: Option<bool>, sta: u16, connected: bool) -> [u8; 36] {
     let mut v = [0u8; 36];
     v[6] = 32;
     v[8] = 1;
     v[11] = band;
     v[12..16].copy_from_slice(&CONN_INFRA_STA.to_le_bytes());
-    v[16] = 1;
+    v[16] = if connected { 0 } else { 1 };
     v[18..24].copy_from_slice(&bssid);
     v[24..26].copy_from_slice(&WCID_BMC.to_le_bytes());
-    v[30..32].copy_from_slice(&WCID_BMC.to_le_bytes());
+    v[30..32].copy_from_slice(&sta.to_le_bytes());
     if let Some(five) = phy {
         v[26..28].copy_from_slice(&100u16.to_le_bytes());
         v[29] = if five { PHY_MODE_A } else { PHY_MODE_BG };
@@ -2113,12 +2077,13 @@ fn roc_grant(ev: &[u8]) -> Option<(u8, u8)> {
 }
 
 /// The 64-byte TXD + hw txp of one management frame (pure; `frame` >= 24 bytes at bus address `pa`, `tok` the msdu id): d0 length
-/// + 32, CT, queue 3; d1 wlan 19, own MAC 0, band index (TGID, when not 0), 802.11 header format, header info 12, tid 0, fixed
-/// rate; d2 subtype | type; d3 remaining tx count 15, BA disable (+ BCM for a group address); d6 DAS, DIS_MAT, one MSDU, the
-/// fixed-rate table slot; d4, d5, d7 zero. txp: msdu id | valid, then pointer 0 = (`pa`, length | last).
-fn mgmt_txwi(frame: &[u8], pa: u64, tok: u8, five: bool, band: u8) -> [u8; 64] {
+/// + 32, CT, queue 3; d1 wlan `wcid` (MT7925S9: 1 = the AP peer, 19 = the interface), own MAC 0, band index (TGID, when not 0),
+/// 802.11 header format, header info 12, tid 0, fixed rate; d2 subtype | type; d3 remaining tx count 15, BA disable (+ BCM for a
+/// group address); d6 DAS, DIS_MAT, one MSDU, the fixed-rate table slot; d4, d5, d7 zero. txp (`txw_pack`): msdu id | valid, then
+/// pointer 0 = (`pa`, length | last).
+fn mgmt_txwi(frame: &[u8], pa: u64, tok: u8, five: bool, band: u8, wcid: u16) -> [u8; 64] {
     let fc = frame[0] as u32;
-    let mut d1 = WCID_BMC as u32 | (HDR_802_11 << 14) | (12 << 16) | (1 << 31);
+    let mut d1 = wcid as u32 | (HDR_802_11 << 14) | (12 << 16) | (1 << 31);
     if band != 0 {
         d1 |= (band as u32) << 12;
     }
@@ -2136,14 +2101,7 @@ fn mgmt_txwi(frame: &[u8], pa: u64, tok: u8, five: bool, band: u8) -> [u8; 64] {
         (1 << 2) | (1 << 3) | (1 << 4) | ((if five { RATE_TBL_5G } else { RATE_TBL_2G }) << 16),
         0,
     ];
-    let mut v = [0u8; 64];
-    for (i, w) in d.iter().enumerate() {
-        v[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
-    }
-    v[32..34].copy_from_slice(&(tok as u16 | 0x8000).to_le_bytes());
-    v[40..44].copy_from_slice(&(pa as u32).to_le_bytes());
-    v[44..46].copy_from_slice(&(frame.len() as u16 | 0x8000).to_le_bytes());
-    v
+    txw_pack(&d, pa, frame.len(), tok as u16) // MT7925S9 (Z46): the packing is the ONE `txw_pack` (S9's tail), the bytes unchanged
 }
 
 /// An ack's `0x..` text, `-` when the command did not complete.
@@ -2165,7 +2123,7 @@ fn dev_bss_once(h: &mut Hw) {
         return;
     };
     let d = uni_cmd(h, UNI_DEV_INFO, &dev_req(m));
-    let bs = if d.is_ok() { uni_cmd(h, UNI_BSS_INFO, &bss_req([0u8; 6], BAND_UNSET, None)) } else { Err("skipped") };
+    let bs = if d.is_ok() { uni_cmd(h, UNI_BSS_INFO, &bss_req([0u8; 6], BAND_UNSET, None, WCID_BMC, false)) } else { Err("skipped") };
     let ok = d == Ok(0) && bs == Ok(0);
     if ok {
         S8_DEV.store(true, Ordering::Relaxed);
@@ -2187,18 +2145,9 @@ fn tx_mgmt(t: &mut Tx, frame: &[u8], tok: u8) -> Result<(), &'static str> {
     if frame.len() < 24 || frame.len() > MGMT_MAX {
         return Err("frame-len");
     }
-    let slot = t.blk + (t.wi % TX_SLOTS) as u64 * TX_SLOT;
-    let pa = slot + TX_FRAME_OFF;
-    for (i, v) in frame.iter().enumerate() {
-        // SAFETY: inside slot `wi % 4` of the 4 KiB block `join_run` allocated (frame.len() <= MGMT_MAX, offset 128).
-        unsafe { core::ptr::write_volatile((pa + i as u64) as *mut u8, *v) };
-    }
-    let w = mgmt_txwi(frame, pa, tok, t.five, t.band);
-    for (i, v) in w.iter().enumerate() {
-        // SAFETY: the slot's first 64 bytes, same block.
-        unsafe { core::ptr::write_volatile((slot + i as u64) as *mut u8, *v) };
-    }
-    t.wi = post(t.q, t.wi, slot, TXWI_BYTES);
+    let slot = t.blk + (t.wi % TX_SLOTS) as u64 * TX_SLOT; // slot `wi % 4` of the 4 KiB block `join_run` allocated (frame.len() <= MGMT_MAX)
+    let w = mgmt_txwi(frame, slot + TX_FRAME_OFF, tok, t.five, t.band, t.wcid);
+    t.wi = tx_put(t.q, t.wi, slot, frame, &w); // MT7925S9 (Z46): the copy and post are the ONE `tx_put` (S9's tail), writes unchanged and in order
     if tx_done(t.q, t.wi) { Ok(()) } else { Err("tx0") }
 }
 
@@ -2316,28 +2265,36 @@ fn join_run(
     let mut rep = JoinRep { auth: Step::Skipped, assoc: Step::Skipped };
     let mut bss: Result<u8, &'static str> = Err("skipped");
     let mut posted = 0u32;
+    let (mut sta, mut wcid, mut linked): (Result<u8, &'static str>, u16, bool) = (Err("skipped"), WCID_BMC, false); // MT7925S9 (Z46)
     if pre.is_ok() {
         hand_rx(rx2, rxb2);
         w32(q2 + 8, RX_BUFS); // RX ring 2's 31 buffers handed (S7's convention)
         dev_bss_once(h);
-        bss = uni_cmd(h, UNI_BSS_INFO, &bss_req(plan.bssid, BAND_UNSET, Some(five)));
+        bss = uni_cmd(h, UNI_BSS_INFO, &bss_req(plan.bssid, BAND_UNSET, Some(five), WCID_PEER, false)); // MT7925S9: sta idx = the AP peer's
+        sta = uni_cmd(h, UNI_STA_REC, &sta_req(plan.bssid, 0, STA_NONE, five)); // MT7925S9 (Z46, S8-STAREC): the AP's STA_REC before auth
+        if sta == Ok(0) {
+            wcid = WCID_PEER; // the frames ride the peer's wlan index as linux's do once the station exists; else the interface's 19
+        }
         let mut r = Rx2 { q: q2, desc: rx2, bufs: rxb2, ri: 0 };
-        let mut t = Tx { q: b + TX_RING_BASE + TXQ_DATA * RING_REGS, wi: 0, blk: txb, band: 0, five };
+        let mut t = Tx { q: b + TX_RING_BASE + TXQ_DATA * RING_REGS, wi: 0, blk: txb, band: 0, five, wcid };
         rep.auth = exchange(h, &mut r, &mut t, 0, plan.channel, &mut *build, &mut *judge);
         if matches!(rep.auth, Step::Ans(Answer::Ok(_))) {
             rep.assoc = exchange(h, &mut r, &mut t, 1, plan.channel, &mut *build, &mut *judge);
         }
         posted = t.wi;
+        if let Step::Ans(Answer::Ok(aid)) = rep.assoc {
+            linked = link_up(h, plan, aid, &t, r, took); // MT7925S9 (Z46): the connected BSS_INFO, STA_REC ASSOC, the S9 link
+        }
     }
-    let rel = give_back(lp, took);
+    let rel = if linked { "kept-s9" } else { give_back(lp, took) }; // MT7925S9: a linked run keeps driver-own for the data path
     if let Err(w) = pre {
         serial_println!("[mt7925] s8 -> NOT ATTEMPTED why={} rel={}", w, rel);
         return Err("pre");
     }
     let m = plan.bssid;
     serial_println!(
-        "[mt7925] s8 join ssid=\"{}\" bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch={} tx0={} bss={} auth={} assoc={} held={} rel={} -> parked",
-        plan.ssid, m[0], m[1], m[2], m[3], m[4], m[5], plan.channel, posted, ack_text(&bss),
+        "[mt7925] s8 join ssid=\"{}\" bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch={} tx0={} bss={} sta={} wcid={} auth={} assoc={} held={} rel={} -> parked",
+        plan.ssid, m[0], m[1], m[2], m[3], m[4], m[5], plan.channel, posted, ack_text(&bss), ack_text(&sta), wcid,
         step_text(&rep.auth, false), step_text(&rep.assoc, true), kept, rel
     );
     Ok(rep)
@@ -2355,31 +2312,31 @@ pub fn join_kat() -> bool {
     }
     let mut auth = alloc::vec![0u8; 30];
     auth[0] = 0xb0;
-    let a = mgmt_txwi(&auth, 0x1080, 1, false, 0);
+    let a = mgmt_txwi(&auth, 0x1080, 1, false, 0, WCID_BMC);
     let mut ok = a.len() == 64
         && u32_at(&a, 0) == 0x0600_003e && u32_at(&a, 4) == 0x800c_8013 && u32_at(&a, 8) == 0x0b
         && u32_at(&a, 12) == 0x1000_7800 && u32_at(&a, 16) == 0 && u32_at(&a, 20) == 0
         && u32_at(&a, 24) == 0x000b_001c && u32_at(&a, 28) == 0
         && u32_at(&a, 32) == 0x8001 && u32_at(&a, 40) == 0x1080 && u32_at(&a, 44) == 0x801e;
-    let f = mgmt_txwi(&auth, 0x1080, 1, true, 0);
+    let f = mgmt_txwi(&auth, 0x1080, 1, true, 0, WCID_BMC);
     ok &= u32_at(&f, 24) == 0x000f_001c && u32_at(&f, 4) == 0x800c_8013;
     let mut req = alloc::vec![0u8; 52];
     req[0] = 0x00;
-    let c = mgmt_txwi(&req, 0x1480, 2, false, 0);
+    let c = mgmt_txwi(&req, 0x1480, 2, false, 0, WCID_BMC);
     ok &= u32_at(&c, 0) == 0x0600_0054 && u32_at(&c, 8) == 0 && u32_at(&c, 32) == 0x8002
         && u32_at(&c, 40) == 0x1480 && u32_at(&c, 44) == 0x8034;
-    let g = mgmt_txwi(&auth, 0x1080, 1, false, 1);
+    let g = mgmt_txwi(&auth, 0x1080, 1, false, 1, WCID_BMC);
     ok &= u32_at(&g, 4) == 0x800c_9013;
     let mac = [0x02, 0x55, 0x4e, 0x41, 0x4f, 0x53];
     let d = dev_req(mac);
     ok &= d[..10] == [0, 0xff, 0, 0, 0, 0, 12, 0, 1, 0] && d[10..] == mac;
     let bssid = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
-    let i = bss_req(bssid, BAND_UNSET, None);
+    let i = bss_req(bssid, BAND_UNSET, None, WCID_BMC, false);
     ok &= i.len() == 36 && i[6] == 32 && i[8] == 1 && i[11] == 0xff && u32_at(&i, 12) == 0x0001_0001 && i[16] == 1
         && i[18..24] == bssid && u16_at(&i, 24) == 19 && u16_at(&i, 30) == 19 && i[29] == 0 && u16_at(&i, 26) == 0;
-    let j = bss_req(bssid, BAND_UNSET, Some(false));
+    let j = bss_req(bssid, BAND_UNSET, Some(false), WCID_BMC, false);
     ok &= u16_at(&j, 26) == 100 && j[29] == 6 && u16_at(&j, 32) == 1;
-    let k = bss_req(bssid, BAND_UNSET, Some(true));
+    let k = bss_req(bssid, BAND_UNSET, Some(true), WCID_BMC, false);
     ok &= k[29] == 1 && u16_at(&k, 32) == 3;
     let r = roc_req(7, 6, false);
     ok &= r.len() == 28 && u16_at(&r, 4) == 0 && r[6] == 24 && r[9] == 7 && r[10] == 6 && r[12] == 1 && r[14] == 6
@@ -2395,5 +2352,433 @@ pub fn join_kat() -> bool {
     ok &= roc_grant(&ev) == Some((1, 1)) && roc_grant(&ev[..60]).is_none();
     ev[GRANT_TLV] = 4;
     ok &= roc_grant(&ev).is_none();
+    ok && link_kat() // MT7925S9 (Z46): the S9 rows (data TXD, STA_REC, connected BSS_INFO, rx_span)
+}
+
+// ── MT7925S9 (zenbook-ledger Z46) — S9: the AP peer's STA_REC and the data path ─────────────────────────────────────────
+// Linux's station flow after S8's frames: the AP is a station record before authentication (`mt7925_mac_link_sta_add`: BSS_INFO
+// with the peer's wlan index, then STA_REC_UPDATE 0x03 state NONE; the peer's wlan index is 1, wcid 0 being the global entry), so
+// the authentication and association frames ride wcid 1; after the association (`mt7925_mac_link_sta_assoc`) BSS_INFO connected
+// with the RLM TLV (the operating channel once the ROC is aborted) and STA_REC state ASSOC with the AID. The STA_REC carries BASIC,
+// PHY, RA, STATE and HDR_TRANS (to_ds, RX translation on); HT/VHT/HE are S8-HT's. The firmware translates headers both ways
+// (mt792x advertises TX encap and RX decap offload): a data frame goes on TX ring 0 as the Ethernet frame behind an 802.3 TXD
+// (`data_txwi`), and RX ring 2 hands it back header-translated at the offset S7's walk computes (`rx_span`). No 802.11 data frame
+// is built here and `wifi/data.rs` is the Broadcom's. The link lives in `S9_LINK` (filled by `join_run`, ended by `rx_open`);
+// `drivers/e1000.rs`'s accessor triple reaches it through `MtRadio` and `hw_addr` (cfg wifi), smolnet's `tx_ready` / `rx_ready`
+// through `tx_room` / `rx_pending`. Lock order: smolnet's STACK, then S9_LINK; nothing here calls the stack or sleeps under the
+// lock. Driver-own is kept while linked (the data path's MMIO). Fixed rate on data (S9-RATES owed); no TX-free decode: at most
+// TX_INFLIGHT frames un-fetched and a slot rewritten only 32 posts later (S9-TXFREE owed). Hardware facts only; no code copied.
+
+/// The AP peer's wlan index (linux: wcid 0 is the global entry, the first station record takes 1).
+const WCID_PEER: u16 = 1;
+/// STA_REC_UPDATE and its TLV tags (mt76_connac_mcu.h STA_REC_*).
+const UNI_STA_REC: u16 = 0x03;
+const STA_TAG_BASIC: u16 = 0;
+const STA_TAG_RA: u16 = 1;
+const STA_TAG_STATE: u16 = 7;
+const STA_TAG_PHY: u16 = 0x15;
+const STA_TAG_HDR_TRANS: u16 = 0x2b;
+/// CONNECTION_INFRA_AP (STA_TYPE_AP | NETWORK_INFRA): the record of a station's AP; CONN_STATE_PORT_SECURE.
+const CONN_INFRA_AP: u32 = 0x0001_0002;
+const CONN_PORT_SECURE: u8 = 2;
+/// MT76_STA_INFO_STATE_NONE / _ASSOC; BASIC's extra_info VER and NEW (NEW while not associated).
+const STA_NONE: u8 = 0;
+const STA_ASSOC: u8 = 2;
+const EXTRA_VER: u16 = 1;
+const EXTRA_NEW: u16 = 2;
+/// The STA_REC body: 8-byte header + BASIC 20 + PHY 12 + RA 16 + STATE 16 + HDR_TRANS 8.
+const STA_REQ_LEN: usize = 80;
+/// BSS_INFO's RLM TLV tag, the streams (the 2x2 radio) and the connected body (36 + 16).
+const BSS_TAG_RLM: u16 = 2;
+const STREAMS: u8 = 2;
+const BSS_CONN_LEN: usize = 52;
+/// The data TXD: queue = wmm 0 * 4 + (3 - AC_BE 2); HDR_FORMAT 802.3; ETH_802_3 (an EtherType frame); FRAME_TYPE data.
+const Q_IDX_BE: u32 = 1;
+const HDR_802_3: u32 = 0;
+const TXD1_ETH_802_3: u32 = 1 << 20;
+const FRAME_TYPE_DATA: u32 = 2;
+const ETHERTYPE_MIN: u16 = 0x0600;
+/// RXD2 bit 25: the header translation failed (a 2-byte length inserted): dropped.
+const RXD2_TRANS_ERR: u32 = 1 << 25;
+/// The data TX block: 32 slots of 2 KiB (slot i = TX ring 0 descriptor i: TXD + txp at +0, the frame at +128).
+const DATA_BLOCK: usize = 65536;
+const DATA_SLOT: u64 = 2048;
+/// An Ethernet header, the largest frame the link takes (smolnet's FRAME_CAP), the frames left un-fetched at most.
+const ETH_HDR: usize = 14;
+const ETH_MAX: usize = 1536;
+const TX_INFLIGHT: u32 = 8;
+/// The data frames' msdu ids: 0x100 + the slot (the management frames use the ROC tokens 1..127).
+const DATA_TOK: u16 = 0x100;
+
+/// The S9 link: own, the association, TX ring 0 (registers, the next CPU index continuing S8's, the data block), RX ring 2
+/// (continuing the join's drain), the counts.
+struct Link9 {
+    took: bool,
+    aid: u16,
+    five: bool,
+    band: u8,
+    q0: u64,
+    wi: u32,
+    txb: u64,
+    rx: Rx2,
+    tx: u32,
+    rx_n: u32,
+    skip: u32,
+    full: u32,
+}
+
+/// The link, Some from `link_up` until `rx_open` ends it.
+static S9_LINK: crate::sync::Mutex<Option<Link9>> = crate::sync::Mutex::new(None);
+/// The stack was built on the link (`hw_addr` answered).
+static S9_BOUND: AtomicBool = AtomicBool::new(false);
+/// The 64 KiB data TX block (below 4 GiB, `dma::ident` once, never freed: S3's rule).
+static S9_TXB: AtomicU64 = AtomicU64::new(0);
+/// A refusal said once per link loss.
+static S9_RX_SAID: AtomicBool = AtomicBool::new(false);
+static S9_TX_SAID: AtomicBool = AtomicBool::new(false);
+
+/// STA_REC_UPDATE body (pure, 80 bytes) for the AP `peer`: header {bss 0, wlan lo 1, 5 TLVs, append, muar 0, wlan hi 0}; BASIC
+/// {INFRA_AP, PORT_SECURE, qos 0, `aid`, the peer, VER (+ NEW unless ASSOC)}; PHY {basic rates, phy type: 1/2/5.5/11 and HR_DSSS|ERP
+/// on 2.4 GHz, 6/12/24 and OFDM on 5 GHz}; RA {legacy mask: CCK 3:0 + OFDM 13:6 / OFDM}; STATE {`state`}; HDR_TRANS {to_ds 1, RX
+/// translation on}.
+fn sta_req(peer: [u8; 6], aid: u16, state: u8, five: bool) -> [u8; STA_REQ_LEN] {
+    let mut v = [0u8; STA_REQ_LEN];
+    v[1] = (WCID_PEER & 0xff) as u8;
+    v[2..4].copy_from_slice(&5u16.to_le_bytes());
+    v[4] = 1;
+    v[6] = (WCID_PEER >> 8) as u8;
+    let d = put_tlv(&mut v, 8, STA_TAG_BASIC, 20);
+    v[d..d + 4].copy_from_slice(&CONN_INFRA_AP.to_le_bytes());
+    v[d + 4] = CONN_PORT_SECURE;
+    v[d + 6..d + 8].copy_from_slice(&aid.to_le_bytes());
+    v[d + 8..d + 14].copy_from_slice(&peer);
+    let extra = if state == STA_ASSOC { EXTRA_VER } else { EXTRA_VER | EXTRA_NEW };
+    v[d + 14..d + 16].copy_from_slice(&extra.to_le_bytes());
+    let d = put_tlv(&mut v, 28, STA_TAG_PHY, 12);
+    v[d..d + 2].copy_from_slice(&(if five { 0x0015u16 } else { 0x000f }).to_le_bytes());
+    v[d + 2] = if five { 0x08 } else { 0x03 };
+    let d = put_tlv(&mut v, 40, STA_TAG_RA, 16);
+    v[d..d + 2].copy_from_slice(&(if five { 0x3fc0u16 } else { 0x3fcf }).to_le_bytes());
+    let d = put_tlv(&mut v, 56, STA_TAG_STATE, 16);
+    v[d] = state;
+    let d = put_tlv(&mut v, 72, STA_TAG_HDR_TRANS, 8);
+    v[d + 1] = 1; // to_ds; from_ds 0, dis_rx_hdr_tran 0
+    v
+}
+
+/// The connected BSS_INFO body (pure, 52 bytes): `bss_req` with the join's phy, the peer's wlan index and conn_state 0, then RLM
+/// {control `ch`, center `ch`, center2 0, bw 20 (0), 2 TX / 2 RX streams, ht_op 0, sco 0, band 0 (2.4) / 1 (5)}.
+fn bss_conn_req(bssid: [u8; 6], band: u8, ch: u8, five: bool) -> [u8; BSS_CONN_LEN] {
+    let mut v = [0u8; BSS_CONN_LEN];
+    v[..36].copy_from_slice(&bss_req(bssid, band, Some(five), WCID_PEER, true));
+    let d = put_tlv(&mut v, 36, BSS_TAG_RLM, 16);
+    v[d] = ch;
+    v[d + 1] = ch;
+    v[d + 4] = STREAMS;
+    v[d + 5] = STREAMS;
+    v[d + 8] = five as u8;
+    v
+}
+
+/// The ONE TXD + hw txp packer (hoisted out of `mgmt_txwi`): the eight dwords little-endian, then msdu id | valid, then pointer 0
+/// = (`pa`, `len` | last).
+fn txw_pack(d: &[u32; 8], pa: u64, len: usize, tok: u16) -> [u8; 64] {
+    let mut v = [0u8; 64];
+    for (i, w) in d.iter().enumerate() {
+        v[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    v[32..34].copy_from_slice(&(tok | 0x8000).to_le_bytes());
+    v[40..44].copy_from_slice(&(pa as u32).to_le_bytes());
+    v[44..46].copy_from_slice(&(len as u16 | 0x8000).to_le_bytes());
+    v
+}
+
+/// The 64-byte TXD + txp of one Ethernet frame (pure; `len` bytes at bus address `pa`, `ety` its EtherType): d0 length + 32, CT,
+/// queue 1 (BE); d1 wlan 1, band index (TGID, when not 0), 802.3 header format, ETH_802_3 for an EtherType frame, tid 0, fixed
+/// rate; d2 type data, subtype 0; d3 remaining tx count 15, BA disable; d6 DAS, DIS_MAT, one MSDU, the fixed-rate table slot.
+fn data_txwi(len: usize, ety: u16, pa: u64, tok: u16, five: bool, band: u8) -> [u8; 64] {
+    let mut d1 = WCID_PEER as u32 | (HDR_802_3 << 14) | (1 << 31);
+    if ety >= ETHERTYPE_MIN {
+        d1 |= TXD1_ETH_802_3;
+    }
+    if band != 0 {
+        d1 |= (band as u32) << 12;
+    }
+    let d = [
+        (len as u32 + 32) | (Q_IDX_BE << 25),
+        d1,
+        FRAME_TYPE_DATA << 4,
+        (15u32 << 11) | (1 << 28),
+        0,
+        0,
+        (1 << 2) | (1 << 3) | (1 << 4) | ((if five { RATE_TBL_5G } else { RATE_TBL_2G }) << 16),
+        0,
+    ];
+    txw_pack(&d, pa, len, tok)
+}
+
+/// The ONE TX put (hoisted out of `tx_mgmt`): the frame into `slot` + 128, the TXD + txp at `slot`, `post` (CPU index last).
+/// Returns the next CPU index. The slot is the caller's: `tx_mgmt` a 1 KiB slot (<= MGMT_MAX), `link_tx` a 2 KiB one (<= ETH_MAX).
+fn tx_put(q: u64, wi: u32, slot: u64, frame: &[u8], w: &[u8; 64]) -> u32 {
+    let pa = slot + TX_FRAME_OFF;
+    for (i, v) in frame.iter().enumerate() {
+        // SAFETY: inside the caller's slot of its DMA block (offset 128, frame.len() bounded by the caller as above).
+        unsafe { core::ptr::write_volatile((pa + i as u64) as *mut u8, *v) };
+    }
+    for (i, v) in w.iter().enumerate() {
+        // SAFETY: the slot's first 64 bytes, same block.
+        unsafe { core::ptr::write_volatile((slot + i as u64) as *mut u8, *v) };
+    }
+    post(q, wi, slot, TXWI_BYTES)
+}
+
+/// The frame's byte range inside one RX ring 2 buffer and whether the firmware header-translated it (pure; the walk hoisted out of
+/// S7's `rx_frame`): past the 8-dword descriptor, its groups and twice the header pad. None = not a normal frame, a length error, a
+/// failed translation, or shorter than an Ethernet header.
+fn rx_span(buf: &[u8]) -> Option<(core::ops::Range<usize>, bool)> {
+    let (d0, d1, d2) = (le32(buf, 0)?, le32(buf, 4)?, le32(buf, 8)?);
+    let trans = d2 & RXD2_HDR_TRANS != 0;
+    if d0 >> 27 != PKT_NORMAL || d2 & RXD2_MAX_LEN_ERR != 0 || (trans && d2 & RXD2_TRANS_ERR != 0) {
+        return None;
+    }
+    let mut off = RXD_BASE;
+    if d1 & RXD1_G4 != 0 {
+        off += 16;
+    }
+    if d1 & RXD1_G1 != 0 {
+        off += 16;
+    }
+    if d1 & RXD1_G2 != 0 {
+        off += 8;
+    }
+    if d1 & RXD1_G3 != 0 {
+        off += 16;
+        if d1 & RXD1_G5 != 0 {
+            off += 96;
+        }
+    }
+    off += 2 * ((d2 >> 13) & 0x7) as usize;
+    if off + ETH_HDR > buf.len() {
+        return None;
+    }
+    Some((off..buf.len(), trans))
+}
+
+/// The ONE RX ring 2 take (hoisted out of S7's `drain`): descriptor `ri`'s DMA_DONE read; when set, its bytes (SD_LEN0, capped at
+/// the buffer; a frame split over buffers keeps nothing) copied out, then the buffer re-handed (`rearm`). None = not done.
+fn rx_take(r: &mut Rx2) -> Option<Vec<u8>> {
+    let d = r.desc + r.ri as u64 * DESC_BYTES;
+    // SAFETY: descriptor ri (< RING_DEPTH) of RX ring 2's block (`ring()`, armed by `wake`); a status read.
+    let ctrl = unsafe { core::ptr::read_volatile((d + 4) as *const u32) };
+    if ctrl & DMA_DONE == 0 {
+        return None;
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let buf = r.bufs + r.ri as u64 * RX_BUF_BYTES;
+    let mut v = Vec::new();
+    if ctrl & LAST_SEC0 != 0 {
+        let len = (((ctrl & SD_LEN0) >> 16) as u64).min(RX_BUF_BYTES);
+        v.reserve(len as usize);
+        for i in 0..len {
+            // SAFETY: inside descriptor ri's 2048-byte buffer (i < len <= RX_BUF_BYTES), written by the device (DMA_DONE).
+            v.push(unsafe { core::ptr::read_volatile((buf + i) as *const u8) });
+        }
+    }
+    r.ri = rearm(r.q, r.desc, r.bufs, r.ri);
+    Some(v)
+}
+
+/// After an association: the 64 KiB data block, the connected BSS_INFO and STA_REC ASSOC (each acked 0), then the link filled and
+/// said. False = refused (said by name); the caller then gives own back. Only when the AP's STA_REC NONE was acked (`t.wcid`).
+fn link_up(h: &mut Hw, plan: &JoinPlan, aid: u16, t: &Tx, r: Rx2, took: bool) -> bool {
+    if t.wcid != WCID_PEER {
+        serial_println!("[mt7925] s9 link aid={} -> REFUSED why=sta-none", aid);
+        return false;
+    }
+    let mut txb = S9_TXB.load(Ordering::Relaxed);
+    if txb == 0 {
+        let v = crate::arch::memory::dma::ident(DATA_BLOCK, 4096);
+        if v != 0 && v + DATA_BLOCK as u64 <= DMA_LIMIT {
+            txb = v;
+            S9_TXB.store(v, Ordering::Relaxed);
+        }
+    }
+    if txb == 0 {
+        serial_println!("[mt7925] s9 link aid={} -> REFUSED why=no-txmem", aid);
+        return false;
+    }
+    let bs = uni_cmd(h, UNI_BSS_INFO, &bss_conn_req(plan.bssid, t.band, plan.channel, t.five));
+    let st = if bs == Ok(0) { uni_cmd(h, UNI_STA_REC, &sta_req(plan.bssid, aid, STA_ASSOC, t.five)) } else { Err("skipped") };
+    if bs != Ok(0) || st != Ok(0) {
+        serial_println!(
+            "[mt7925] s9 link aid={} bss={} sta={} -> REFUSED why={}",
+            aid, ack_text(&bs), ack_text(&st), if bs != Ok(0) { "bss" } else { "sta" }
+        );
+        return false;
+    }
+    *S9_LINK.lock() = Some(Link9 { took, aid, five: t.five, band: t.band, q0: t.q, wi: t.wi, txb, rx: r, tx: 0, rx_n: 0, skip: 0, full: 0 });
+    S9_RX_SAID.store(false, Ordering::Relaxed);
+    S9_TX_SAID.store(false, Ordering::Relaxed);
+    serial_println!(
+        "[mt7925] s9 link up aid={} wcid={} tx=0 rx=0 skip=0 full=0 bss={} sta={} rel=kept-s9 -> linked",
+        aid, WCID_PEER, ack_text(&bs), ack_text(&st)
+    );
+    true
+}
+
+/// `rx_open` ended the link (a scan or join re-wakes the rings): one line; returns whether the link's run took own.
+fn link_down(l: Link9, who: &'static str) -> bool {
+    serial_println!(
+        "[mt7925] s9 link down why={} aid={} tx={} rx={} skip={} full={}",
+        who, l.aid, l.tx, l.rx_n, l.skip, l.full
+    );
+    l.took
+}
+
+/// The link's state now (`say_link`, for the station's verb after its DHCP wait).
+pub fn say_link() {
+    match S9_LINK.lock().as_ref() {
+        Some(l) => serial_println!(
+            "[mt7925] s9 link up aid={} wcid={} tx={} rx={} skip={} full={}",
+            l.aid, WCID_PEER, l.tx, l.rx_n, l.skip, l.full
+        ),
+        None => serial_println!("[mt7925] s9 link -> down"),
+    }
+}
+
+/// A refusal with no link, said once per loss.
+fn not_linked(said: &AtomicBool, what: &str) {
+    if !said.swap(true, Ordering::Relaxed) {
+        serial_println!("[mt7925] s9 {} -> REFUSED why=not-linked", what);
+    }
+}
+
+/// The next header-translated frame from RX ring 2 into `out` (at most 32 descriptors per call; untranslated frames, other
+/// packets, failed translations and frames longer than `out` are dropped and counted `skip`).
+pub fn link_rx(out: &mut [u8]) -> Option<usize> {
+    let mut g = S9_LINK.lock();
+    let Some(l) = g.as_mut() else {
+        not_linked(&S9_RX_SAID, "rx");
+        return None;
+    };
+    for _ in 0..RING_DEPTH {
+        let v = rx_take(&mut l.rx)?;
+        match rx_span(&v) {
+            Some((span, true)) if span.len() <= out.len() => {
+                let n = span.len();
+                out[..n].copy_from_slice(&v[span]);
+                l.rx_n += 1;
+                return Some(n);
+            }
+            _ => l.skip += 1,
+        }
+    }
+    None
+}
+
+/// Room for one more frame: fewer than TX_INFLIGHT posted frames not yet fetched (TX ring 0's DMA index).
+fn room(l: &Link9) -> bool {
+    let didx = r32(l.q0 + 12) & 0xfff;
+    (l.wi + RING_DEPTH - didx % RING_DEPTH) % RING_DEPTH < TX_INFLIGHT
+}
+
+/// One Ethernet frame out: into slot `wi` of the data block behind `data_txwi`, `tx_put`. No room, shorter than an Ethernet
+/// header or longer than ETH_MAX: dropped and counted `full`.
+pub fn link_tx(frame: &[u8]) {
+    let mut g = S9_LINK.lock();
+    let Some(l) = g.as_mut() else {
+        not_linked(&S9_TX_SAID, "tx");
+        return;
+    };
+    if frame.len() < ETH_HDR || frame.len() > ETH_MAX || !room(l) {
+        l.full += 1;
+        return;
+    }
+    let slot = l.txb + l.wi as u64 * DATA_SLOT;
+    let ety = u16::from_be_bytes([frame[12], frame[13]]);
+    let w = data_txwi(frame.len(), ety, slot + TX_FRAME_OFF, DATA_TOK + l.wi as u16, l.five, l.band);
+    l.wi = tx_put(l.q0, l.wi, slot, frame, &w);
+    l.tx += 1;
+}
+
+/// smolnet's `tx_ready` for the link: room on TX ring 0 now; false with no link.
+pub fn tx_room() -> bool {
+    S9_LINK.lock().as_ref().map_or(false, room)
+}
+
+/// smolnet's poll gate: RX ring 2's next descriptor is done.
+pub fn rx_pending() -> bool {
+    S9_LINK.lock().as_ref().map_or(false, |l| {
+        let d = l.rx.desc + l.rx.ri as u64 * DESC_BYTES;
+        // SAFETY: descriptor ri (< RING_DEPTH) of RX ring 2's block; a status read.
+        unsafe { core::ptr::read_volatile((d + 4) as *const u32) } & DMA_DONE != 0
+    })
+}
+
+/// The S9 link is up (the station's verb asks before its DHCP; no side effect, unlike `hw_addr`).
+pub fn linked() -> bool {
+    S9_LINK.lock().is_some()
+}
+
+/// The stack was built on the link.
+pub fn bound() -> bool {
+    S9_BOUND.load(Ordering::Relaxed)
+}
+
+/// `e1000::hw_addr`'s last fallback: (S5's MAC, 0.0.0.0 before a lease, link up) once linked; link down after `rx_open` ended a
+/// link the stack was bound to; None otherwise.
+pub fn hw_addr() -> Option<([u8; 6], [u8; 4], bool)> {
+    let up = linked();
+    if !up && !bound() {
+        return None;
+    }
+    let m = mac()?;
+    S9_BOUND.store(true, Ordering::Relaxed);
+    Some((m, [0; 4], up))
+}
+
+/// `tests wifijoin`'s S9 rows (hand-computed from the field tables, no capture): the data TXD + txp of a 60-byte Ethernet II frame
+/// on 2.4 GHz and 5 GHz (band 1) and of an 802.2 frame, STA_REC NONE on 2.4 GHz and ASSOC (aid 5) on 5 GHz, the join's and the
+/// connected BSS_INFO with RLM, and `rx_span` over a translated, an untranslated and a translation-failed canned descriptor.
+fn link_kat() -> bool {
+    fn w(v: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes([v[o], v[o + 1], v[o + 2], v[o + 3]])
+    }
+    fn h(v: &[u8], o: usize) -> u16 {
+        u16::from_le_bytes([v[o], v[o + 1]])
+    }
+    let a = data_txwi(60, 0x0800, 0x2080, 0x102, false, 0);
+    let mut ok = w(&a, 0) == 0x0200_005c && w(&a, 4) == 0x8010_0001 && w(&a, 8) == 0x20 && w(&a, 12) == 0x1000_7800
+        && w(&a, 16) == 0 && w(&a, 20) == 0 && w(&a, 24) == 0x000b_001c && w(&a, 28) == 0
+        && w(&a, 32) == 0x8102 && w(&a, 40) == 0x2080 && w(&a, 44) == 0x803c;
+    let f = data_txwi(60, 0x0800, 0x2080, 0x102, true, 1);
+    ok &= w(&f, 4) == 0x8010_1001 && w(&f, 24) == 0x000f_001c;
+    ok &= w(&data_txwi(60, 0x0040, 0x2080, 0x102, false, 0), 4) == 0x8000_0001;
+    let peer = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let s = sta_req(peer, 0, STA_NONE, false);
+    ok &= s[..8] == [0, 1, 5, 0, 1, 0, 0, 0]
+        && h(&s, 8) == 0 && h(&s, 10) == 20 && w(&s, 12) == 0x0001_0002 && s[16] == 2 && s[17] == 0 && h(&s, 18) == 0
+        && s[20..26] == peer && h(&s, 26) == 3
+        && h(&s, 28) == 0x15 && h(&s, 30) == 12 && h(&s, 32) == 0x000f && s[34] == 3
+        && h(&s, 40) == 1 && h(&s, 42) == 16 && h(&s, 44) == 0x3fcf
+        && h(&s, 56) == 7 && h(&s, 58) == 16 && s[60] == 0
+        && h(&s, 72) == 0x2b && h(&s, 74) == 8 && s[76] == 0 && s[77] == 1 && s[78] == 0;
+    let t = sta_req(peer, 5, STA_ASSOC, true);
+    ok &= h(&t, 18) == 5 && h(&t, 26) == 1 && t[60] == 2 && h(&t, 32) == 0x0015 && t[34] == 8 && h(&t, 44) == 0x3fc0;
+    let j = bss_req(peer, BAND_UNSET, Some(false), WCID_PEER, false);
+    ok &= j[16] == 1 && h(&j, 30) == 1 && h(&j, 24) == 19;
+    let c = bss_conn_req(peer, 0, 6, false);
+    ok &= c[16] == 0 && h(&c, 30) == 1 && h(&c, 24) == 19 && c[29] == PHY_MODE_BG && h(&c, 36) == 2 && h(&c, 38) == 16
+        && c[40] == 6 && c[41] == 6 && c[42] == 0 && c[43] == 0 && c[44] == 2 && c[45] == 2 && c[46] == 0 && c[47] == 0 && c[48] == 0
+        && bss_conn_req(peer, 0, 36, true)[48] == 1;
+    let mut x = alloc::vec![0u8; 90];
+    x[0..4].copy_from_slice(&((PKT_NORMAL << 27) | 90).to_le_bytes());
+    x[4..8].copy_from_slice(&(RXD1_G4 | RXD1_G1).to_le_bytes());
+    x[8..12].copy_from_slice(&((1u32 << 13) | RXD2_HDR_TRANS).to_le_bytes());
+    ok &= rx_span(&x) == Some((66..90, true)) && rx_frame(&x).is_none();
+    x[8..12].copy_from_slice(&((1u32 << 13) | RXD2_HDR_TRANS | RXD2_TRANS_ERR).to_le_bytes());
+    ok &= rx_span(&x).is_none();
+    x[8..12].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    ok &= rx_span(&x) == Some((66..90, false)) && rx_frame(&x) == Some(66..90);
     ok
 }

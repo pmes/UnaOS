@@ -1064,7 +1064,7 @@ refs/heads/exec-rmbp-hidbootxhcix86   e0efe15d8 FOLDED-BY-HAND (this commit) 202
 refs/heads/exec-rmbp-pdf4kernellane   80db1f2f1 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookledgerevidence   7040aeeff FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nvmemsix   6e9e18177 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-mt7925s9   1f955b273 cut 2026-10-27 (wave36 batch 20)
+refs/heads/exec-rmbp-mt7925s9   e1c7d391c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookacpplay   0341ffc5f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbooksuspend   a39decfc8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nvmeirqwait   706760a5a FOLDED-BY-HAND (this commit) 2026-10-27
