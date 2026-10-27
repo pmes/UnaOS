@@ -2895,27 +2895,22 @@ pub mod ring {
         g.issue(probe_word(), &mut a)
     }
 
-    /// HDARING M3 — net-hda's HDA half while the pump's step park holds it (sched.rs `singleton_step_parked`): `true`
-    /// = return now (off the pump). Registers net-hda as parkable once. At `until`, ONE probe verb: answered ->
-    /// unparked; silent -> parked again.
+    /// PUMPPARK (B839) M2 — net-hda's unpark probe: ONE probe verb ([`probe_verb`]) answered. The pump loop's gate
+    /// (sched.rs `singleton_step_go`) runs it at the park's `until`.
+    fn probe_answers() -> bool {
+        probe_verb().is_some()
+    }
+
+    /// HDARING M3, PUMPPARK (B839) M2 — registers net-hda's probe ([`probe_answers`]) once; the pump loop parks the
+    /// whole step (sched.rs `singleton_step_go`), so this only honours a park that landed between that gate and here:
+    /// `true` = return now (off the pump).
     pub(super) fn parked() -> bool {
         use crate::video::lag::P_NET;
         static REG: AtomicBool = AtomicBool::new(false);
         if !REG.swap(true, Relaxed) {
-            crate::arch::sched::singleton_step_parkable(P_NET);
+            crate::arch::sched::singleton_step_probe(P_NET, probe_answers);
         }
-        let Some(until) = crate::arch::sched::singleton_step_parked(P_NET) else { return false };
-        let now = crate::arch::ms();
-        if now < until {
-            return true;
-        }
-        if probe_verb().is_some() {
-            crate::arch::sched::singleton_step_unpark(P_NET);
-            false
-        } else {
-            crate::arch::sched::singleton_step_repark(P_NET, now);
-            true
-        }
+        crate::arch::sched::singleton_step_parked(P_NET).is_some()
     }
 
     // ── `tests gatesteal2` LEG 3 (sched.rs): the pump killed with a verb in flight inside net-hda ──────────────────
