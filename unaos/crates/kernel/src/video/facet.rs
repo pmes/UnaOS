@@ -1096,7 +1096,7 @@ pub fn service() {
     if DRAG_ON.load(Ordering::Relaxed) {
         drag_poll();
     }
-    anim::tick(); // QUARRY2 (B336): step an animated image's frames
+    anim::tick(); #[cfg(feature = "facetedit")] super::facetedit::service(); // QUARRY2 (B336): step an animated image's frames. FACETEDIT (B900): the editor's latch, queue and drag (LINE-NEUTRAL append, code before the comment)
 }
 
 /// Is Facet's window live?
@@ -1695,7 +1695,7 @@ fn drag_poll() {
 /// [`service`] applies it. Keys only while this window holds focus; the wheel only when the pointer
 /// is over it. `+`/`=` `-`/`_` zoom, `0` fit, `1` 100 %, Left/`[` Right/`]` browse, Delete trash,
 /// `i` info, `p`/space pause an animation.
-pub fn key_route(ev: crate::pal::Event) -> bool {
+pub fn key_route(ev: crate::pal::Event) -> bool { #[cfg(feature = "facetedit")] if super::facetedit::key_route(ev) { return true; } // FACETEDIT (B900): the editor's keys / Cmd-Z / wheel first (LINE-NEUTRAL append)
     let id = WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE {
         return false;
@@ -1716,7 +1716,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
             if wm::focus_asid() != OWNER {
                 return false;
             }
-            // FACETANIM (B358): `p` / space pause an animation (atomics only — router depth).
+            #[cfg(feature = "facetedit")] if matches!(c, b'e' | b'E') { super::facetedit::request_from_viewer(); return true; } // FACETEDIT (B900): `e` opens the editor on the shown picture (a latch; LINE-NEUTRAL append). FACETANIM (B358): `p` / space pause an animation (atomics only — router depth).
             if matches!(c, b'p' | b'P' | b' ') && anim::toggle_pause() {
                 return true;
             }
@@ -1741,7 +1741,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
 /// Pointer. Returns `true` when the press was CONSUMED: the close disc closes, a press on the
 /// picture raises/focuses and arms a pan drag (applied by [`service`]). Chained from
 /// `quarry::live::press_route`.
-pub fn press_route(x: i32, y: i32) -> bool {
+pub fn press_route(x: i32, y: i32) -> bool { #[cfg(feature = "facetedit")] if super::facetedit::press_route(x, y) { return true; } // FACETEDIT (B900): the editor's presses first (LINE-NEUTRAL append)
     let id = WIN.load(Ordering::Relaxed);
     if id == wm::WIN_NONE {
         return false;
@@ -2153,3 +2153,15 @@ pub fn win() -> wm::WinId {
 // through the binning developer), FAST for Quick Look (the embedded JPEG). A child module, so no `video/mod.rs` line.
 #[path = "facet_raw.rs"]
 pub mod raw;
+
+// FACETEDIT (rmbp-ledger B900): the viewer's `e` hands its picture to the editor (`video/facetedit.rs`): the shown path
+// and the base image (MOVED out of the view, no copy; at most `BASE_W x BASE_H`), then the viewer's row closes — one
+// Facet window at a time. Under the knob, after the file's last line, so no line above moves.
+#[cfg(feature = "facetedit")]
+pub fn edit_handoff() -> Option<(String, Vec<u32>, usize, usize)> {
+    let out = VIEW.lock().take().map(|v| (v.path, v.px, v.bw, v.bh));
+    if out.is_some() {
+        close();
+    }
+    out
+}
