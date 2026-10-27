@@ -56,6 +56,7 @@ version = "0.1.0"
 dependencies = [
  "raw_core",
  "vp8_core",
+ "yuv_core",
 ]
 
 [[package]]
@@ -114,4 +115,8 @@ dependencies = [
 
 [[package]]
 name = "vp8_core"
+version = "0.1.0"
+
+[[package]]
+name = "yuv_core"
 version = "0.1.0"

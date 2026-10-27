@@ -17,7 +17,8 @@
 //!     C and SIMD islow paths.
 //!   * Chroma upsampling: libjpeg's "fancy" triangle filters for h2v1, h2v2 and h1v2; other ratios are
 //!     replicated (box). Edge samples replicate (libjpeg's context rows).
-//!   * Colour (JFIF §7 / T.871): YCbCr → RGB with libjpeg's 16-bit fixed-point tables. 1 component =
+//!   * Colour (JFIF §7 / T.871): YCbCr → RGB (and YCCK's YCC) is yuv_core's ONE `to_rgba` loop over the
+//!     upsampled planes with libjpeg's 16-bit table `JFIF` (JPEGCOLOURONE SR348). 1 component =
 //!     greyscale. 3 components with an Adobe APP14 transform=0, or ids 'R','G','B' = RGB untouched.
 //!     4 components = Adobe CMYK (transform 0) or YCCK (transform 2), stored inverted as Photoshop
 //!     writes it, converted naively `R = C·K/255` (no ICC).
@@ -930,6 +931,16 @@ const fn fix16(x: f64) -> i32 {
     (x * 65536.0 + 0.5) as i32
 }
 
+/// JPEGCOLOURONE (SR348): JFIF's full-range BT.601 YCbCr -> RGB as libjpeg's 16-bit table, handed to yuv_core's one
+/// loop as `Matrix::Table`. T.871's G-from-Cb weight is 0.344136 (yuv_core's `coeffs` derives it exactly); libjpeg (and
+/// so Chromium) uses the rounded 0.34414, and the pinned digests are libjpeg's, so this table keeps it.
+const JFIF: yuv_core::Coeffs = (16, [1 << 16, fix16(1.40200), fix16(0.34414), fix16(0.71414), fix16(1.77200)], 0, 128);
+
+/// The three upsampled full-resolution planes as a yuv_core picture (8-bit, full range, no chroma subsampling left).
+fn jfif_picture(planes: &[Vec<u8>], w: usize, h: usize) -> yuv_core::Picture<'_, u8> {
+    yuv_core::Picture { w, h, y: &planes[0], u: &planes[1], v: &planes[2], y_stride: w, uv_stride: w, ss: (0, 0), mono: false, bit_depth: 8, full: true }
+}
+
 fn reconstruct(f: &Frame, qt: &[[u16; 64]; 4], adobe: Option<u8>, jfif: bool) -> Result<Image, Error> {
     let mut planes = Vec::new();
     for c in &f.comps {
@@ -943,7 +954,15 @@ fn reconstruct(f: &Frame, qt: &[[u16; 64]; 4], adobe: Option<u8>, jfif: bool) ->
     // spell 'R','G','B'.
     let rgb_ids = nc == 3 && f.comps[0].id == b'R' && f.comps[1].id == b'G' && f.comps[2].id == b'B';
     let ycc = nc == 3 && !rgb_ids && (jfif || adobe != Some(0));
-    let half = 1 << 15;
+    let ycck = nc == 4 && adobe == Some(2);
+    if ycc || ycck {
+        // The ONE conversion (yuv_core): chroma is already at luma resolution, so `Chroma` has nothing to do.
+        let pic = jfif_picture(&planes, f.width, f.height);
+        yuv_core::to_rgba(&pic, yuv_core::Matrix::Table(JFIF), yuv_core::Chroma::Nearest, false, &mut rgba);
+        if ycc {
+            return Ok(Image::still(f.width as u32, f.height as u32, rgba));
+        }
+    }
     for i in 0..n {
         let o = &mut rgba[i * 4..i * 4 + 4];
         match nc {
@@ -951,28 +970,15 @@ fn reconstruct(f: &Frame, qt: &[[u16; 64]; 4], adobe: Option<u8>, jfif: bool) ->
                 let g = planes[0][i];
                 o.copy_from_slice(&[g, g, g, 255]);
             }
-            3 if ycc => {
-                let y = planes[0][i] as i32;
-                let cb = planes[1][i] as i32 - 128;
-                let cr = planes[2][i] as i32 - 128;
-                let r = y + ((fix16(1.40200) * cr + half) >> 16);
-                let g = y + ((-fix16(0.34414) * cb - fix16(0.71414) * cr + half) >> 16);
-                let b = y + ((fix16(1.77200) * cb + half) >> 16);
-                o.copy_from_slice(&[r.clamp(0, 255) as u8, g.clamp(0, 255) as u8, b.clamp(0, 255) as u8, 255]);
-            }
             3 => o.copy_from_slice(&[planes[0][i], planes[1][i], planes[2][i], 255]),
             _ => {
                 let (mut c, mut m, mut y) = (planes[0][i] as i32, planes[1][i] as i32, planes[2][i] as i32);
                 let k = planes[3][i] as i32;
-                if adobe == Some(2) {
-                    // YCCK: the first three are YCbCr of the inverted CMY.
-                    let (yy, cb, cr) = (c, m - 128, y - 128);
-                    let r = yy + ((fix16(1.40200) * cr + half) >> 16);
-                    let g = yy + ((-fix16(0.34414) * cb - fix16(0.71414) * cr + half) >> 16);
-                    let b = yy + ((fix16(1.77200) * cb + half) >> 16);
-                    c = 255 - r.clamp(0, 255);
-                    m = 255 - g.clamp(0, 255);
-                    y = 255 - b.clamp(0, 255);
+                if ycck {
+                    // YCCK: the first three are YCbCr of the inverted CMY, converted above by the one call.
+                    c = 255 - o[0] as i32;
+                    m = 255 - o[1] as i32;
+                    y = 255 - o[2] as i32;
                 }
                 if adobe.is_some() {
                     // Adobe stores CMYK inverted: the sample is 255 - ink. R = iC·iK/255, truncated
@@ -1028,4 +1034,94 @@ fn exif_orientation(t: &[u8]) -> Option<u8> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    //! JPEGCOLOURONE (SR348) KATs: the JFIF table through yuv_core is libjpeg's converter on every triple; the measured
+    //! relation to yuv_core's own BT.601 table; libjpeg's h2v2 fancy upsampling vs yuv_core's 9-3-3-1 bilinear.
+    use super::*;
+    use yuv_core::{Chroma, Matrix, Picture};
+
+    /// The retired per-pixel converter (libjpeg's jdcolor.c arithmetic), kept here as the reference.
+    fn libjpeg_ycc(y: i32, cb: i32, cr: i32) -> [u8; 3] {
+        let (cb, cr, half) = (cb - 128, cr - 128, 1 << 15);
+        let r = y + ((fix16(1.40200) * cr + half) >> 16);
+        let g = y + ((-fix16(0.34414) * cb - fix16(0.71414) * cr + half) >> 16);
+        let b = y + ((fix16(1.77200) * cb + half) >> 16);
+        [r.clamp(0, 255) as u8, g.clamp(0, 255) as u8, b.clamp(0, 255) as u8]
+    }
+
+    fn one(y: u8, cb: u8, cr: u8, m: Matrix) -> [u8; 3] {
+        let (yp, up, vp) = ([y], [cb], [cr]);
+        let p = Picture { w: 1, h: 1, y: &yp, u: &up, v: &vp, y_stride: 1, uv_stride: 1, ss: (0, 0), mono: false, bit_depth: 8, full: true };
+        let mut out = [0u8; 4];
+        yuv_core::to_rgba(&p, m, Chroma::Nearest, false, &mut out);
+        [out[0], out[1], out[2]]
+    }
+
+    #[test]
+    fn jfif_table_through_yuv_core_is_libjpeg_exhaustively() {
+        assert_eq!(JFIF, (16, [65536, 91881, 22554, 46802, 116130], 0, 128));
+        // All 2^24 (Y, Cb, Cr): one 256x256 picture per Y, Cb = column, Cr = row.
+        let u: Vec<u8> = (0..65536u32).map(|i| (i & 255) as u8).collect();
+        let v: Vec<u8> = (0..65536u32).map(|i| (i >> 8) as u8).collect();
+        let mut out = vec![0u8; 65536 * 4];
+        for y in 0..=255u8 {
+            let yp = vec![y; 65536];
+            let planes = [yp, u.clone(), v.clone()];
+            yuv_core::to_rgba(&jfif_picture(&planes, 256, 256), Matrix::Table(JFIF), Chroma::Nearest, false, &mut out);
+            for i in 0..65536 {
+                let want = libjpeg_ycc(y as i32, (i & 255) as i32, (i >> 8) as i32);
+                assert_eq!(out[i * 4..i * 4 + 4], [want[0], want[1], want[2], 255], "Y {y} Cb {} Cr {}", i & 255, i >> 8);
+            }
+        }
+    }
+
+    #[test]
+    fn jfif_table_vs_coeffs_601_full_measured_relation() {
+        // yuv_core's own BT.601 full-range 8-bit table is shift 8, not libjpeg's 16: it is NOT the JFIF converter.
+        // Measured over 2^24 triples it moves 1,412,845 by 1; the first is (0, 0, 0): G 136 where libjpeg says 135.
+        let k = yuv_core::coeffs(yuv_core::KR_KB_601, true, 8);
+        assert_eq!(k, (8, [256, 359, 88, 183, 454], 0, 128));
+        assert_ne!(k, JFIF);
+        assert_eq!(one(0, 0, 0, Matrix::Table(JFIF)), [0, 135, 0]);
+        assert_eq!(libjpeg_ycc(0, 0, 0), [0, 135, 0]);
+        assert_eq!(one(0, 0, 0, Matrix::Kr(yuv_core::KR_KB_601)), [0, 136, 0]);
+    }
+
+    #[test]
+    fn h2v2_fancy_is_9_3_3_1_but_rounds_first() {
+        // A 17x13 4:2:0 gradient. jpeg.rs's libjpeg h2v2 fancy upsampling (3:1 weights, chroma rounded to u8 with
+        // biases 8 / 7) then the JFIF table, against yuv_core's Chroma::Bilinear (the same 9-3-3-1 kernel and phase,
+        // carried at 4 fractional bits into one rounding): equal kernels, different rounding points, so pixels move
+        // by 1 and jpeg.rs keeps its own upsampler.
+        let (w, h, cw, ch) = (17usize, 13usize, 9usize, 7usize);
+        let y: Vec<u8> = (0..w * h).map(|i| (((i % w) * 15 + (i / w) * 7) % 256) as u8).collect();
+        let cb: Vec<u8> = (0..cw * ch).map(|i| (((i % cw) * 29 + (i / cw) * 11 + 3) % 256) as u8).collect();
+        let cr: Vec<u8> = (0..cw * ch).map(|i| ((255 + 256 * 4 - (i % cw) * 23 - (i / cw) * 17) % 256) as u8).collect();
+        let comp = |id: u8, hs: usize| Component {
+            id, h: hs, v: hs, tq: 0, bw: 0, bh: 0, pbw: 2, pbh: 1, cw: if hs == 2 { w } else { cw }, ch: if hs == 2 { h } else { ch },
+            coefs: Vec::new(), dc_pred: 0, td: 0, ta: 0,
+        };
+        let f = Frame { width: w, height: h, progressive: false, comps: vec![comp(1, 2), comp(2, 1), comp(3, 1)], hmax: 2, vmax: 2, mcux: 0, mcuy: 0 };
+        // The chroma plane padded to jpeg.rs's block stride (pbw * 8 = 16).
+        let pad = |p: &[u8]| -> Vec<u8> {
+            let mut o = vec![0u8; 16 * ch];
+            for r in 0..ch {
+                o[r * 16..r * 16 + cw].copy_from_slice(&p[r * cw..r * cw + cw]);
+            }
+            o
+        };
+        let planes = [y.clone(), upsample(&pad(&cb), &f.comps[1], &f).unwrap(), upsample(&pad(&cr), &f.comps[2], &f).unwrap()];
+        let mut fancy = vec![0u8; w * h * 4];
+        yuv_core::to_rgba(&jfif_picture(&planes, w, h), Matrix::Table(JFIF), Chroma::Nearest, false, &mut fancy);
+        let p = Picture { w, h, y: &y, u: &cb, v: &cr, y_stride: w, uv_stride: cw, ss: (1, 1), mono: false, bit_depth: 8, full: true };
+        let mut bil = vec![0u8; w * h * 4];
+        yuv_core::to_rgba(&p, Matrix::Table(JFIF), Chroma::Bilinear, false, &mut bil);
+        let max = fancy.iter().zip(&bil).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        let moved = fancy.chunks(4).zip(bil.chunks(4)).filter(|(a, b)| a != b).count();
+        assert_eq!((max, moved), (1, 102), "of {} pixels", w * h);
+        assert_eq!((&fancy[12..15], &bil[12..15]), (&[182u8, 6, 0][..], &[183u8, 5, 0][..]), "row 0 col 3");
+    }
 }
