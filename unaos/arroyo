@@ -113,7 +113,7 @@ esac
 _sha_base="$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
 _sha_suffix=""
 if [ "$_sha_base" != "unknown" ]; then
-    git diff --quiet HEAD 2>/dev/null || _sha_suffix="-d$(git diff HEAD 2>/dev/null | sha256sum | cut -c1-6)"
+    git diff --quiet HEAD 2>/dev/null || _sha_suffix="-d$(git diff HEAD 2>/dev/null | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-6)"
 fi
 export UNAOS_GIT_SHA="${_sha_base}${_sha_suffix}"
 
@@ -9945,9 +9945,9 @@ kfont_tree_pins() {
         case "$f" in ''|'#'*) continue ;; esac
         src="$(find "$root" -maxdepth 2 -name "$f" -print -quit 2>/dev/null)"
         if [ -z "$src" ]; then state="ABSENT ${f}"; continue; fi
-        have="$(sha256sum "$src" | cut -d' ' -f1)"
+        have="$(sha256_of "$src")"
         [ "$have" = "$want" ] || state="MISMATCH ${f}"
-        bytes=$((bytes + $(stat -c %s "$src")))
+        bytes=$((bytes + $(_fsize "$src")))
     done < "$pins"
     echo -e "${COLOR_YELLOW}⚡ FONTS: fonts/ vs firmware/fonts.pins -> ${state} (Inter + JetBrains Mono + Noto Sans, ${bytes} B per volume; FONTSCRAFT B640)${COLOR_RESET}"
 }
@@ -9967,16 +9967,16 @@ ensure_kfont_noto() {
     local dir="${WORKSPACE_DIR}/target/fonts-noto" deb tmp i ok=1
     echo -e "${COLOR_YELLOW}  • FONTS: apt refused or absent — fetching the pinned .deb into ${dir}${COLOR_RESET}"
     mkdir -p "$dir"; deb="$dir/fonts-noto-core.deb"; tmp="$dir/x"
-    if ! { [ -f "$deb" ] && [ "$(sha512sum "$deb" | cut -d' ' -f1)" = "$KFONT_NOTO_DEB_SHA512" ]; }; then
+    if ! { [ -f "$deb" ] && [ "$(sha512_of "$deb")" = "$KFONT_NOTO_DEB_SHA512" ]; }; then
         curl -fsSL -m 300 -o "$deb" "$KFONT_NOTO_DEB_URL" || { echo -e "${COLOR_RED}  • FONTS: fetch failed — media builds without the Noto faces (scripts_missing on the wire)${COLOR_RESET}"; return 0; }
     fi
-    [ "$(sha512sum "$deb" | cut -d' ' -f1)" = "$KFONT_NOTO_DEB_SHA512" ] || { echo -e "${COLOR_RED}  • FONTS: .deb SHA-512 mismatch — refused, not staged${COLOR_RESET}"; rm -f "$deb"; return 0; }
+    [ "$(sha512_of "$deb")" = "$KFONT_NOTO_DEB_SHA512" ] || { echo -e "${COLOR_RED}  • FONTS: .deb SHA-512 mismatch — refused, not staged${COLOR_RESET}"; rm -f "$deb"; return 0; }
     rm -rf "$tmp"; mkdir -p "$tmp"
     # dpkg-deb reads every data.tar compression itself (the 2020 package is zstd); ar + tar where there is no dpkg.
     { if command -v dpkg-deb >/dev/null 2>&1; then dpkg-deb -x "$deb" "$tmp"; else ( cd "$tmp" && ar x "$deb" && tar -xf data.tar.* ); fi; } || { echo -e "${COLOR_RED}  • FONTS: .deb extract failed — not staged${COLOR_RESET}"; return 0; }
     for i in 0 1 2 3; do
         local f="${KFONT_NOTO_FACES[$i]}" src; src="$(find "$tmp" -name "${KFONT_NOTO_FACES[$i]}" -print -quit)"
-        if [ -n "$src" ] && [ "$(sha256sum "$src" | cut -d' ' -f1)" = "${KFONT_NOTO_SHA256[$i]}" ]; then cp -f "$src" "$dir/$f"; else ok=0; echo -e "${COLOR_RED}  • FONTS: ${f} absent or SHA-256 mismatch — not staged${COLOR_RESET}"; fi
+        if [ -n "$src" ] && [ "$(sha256_of "$src")" = "${KFONT_NOTO_SHA256[$i]}" ]; then cp -f "$src" "$dir/$f"; else ok=0; echo -e "${COLOR_RED}  • FONTS: ${f} absent or SHA-256 mismatch — not staged${COLOR_RESET}"; fi
     done
     [ -f "$tmp/usr/share/doc/fonts-noto-core/copyright" ] && cp -f "$tmp/usr/share/doc/fonts-noto-core/copyright" "$dir/LICENSE"
     rm -rf "$tmp"
@@ -10000,7 +10000,7 @@ esp_x86() {
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
-    ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363): the Noto script faces on the builder host first
+    _rustc_floor || exit 1; ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363): the Noto script faces on the builder host first
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     # The media path does NOT go through build_kernel_x86_64 (the builder compiles the kernel
@@ -14990,8 +14990,8 @@ fw_stage_pinned() {
     echo -e "${COLOR_YELLOW}⚡ ${tag}: $# files from ${src} onto the ESP at ${sub}/ (${envn}; bench-only, never in-tree)${COLOR_RESET}"
     for m in "$@"; do
         f="${m%%:*}"; role="${m##*:}"
-        sum=$(sha256sum "${src}/${f}" | cut -d' ' -f1)
-        bytes=$(stat -c %s "${src}/${f}")
+        sum=$(sha256_of "${src}/${f}")
+        bytes=$(_fsize "${src}/${f}")
         echo -e "${COLOR_YELLOW}⚡ ${tag}: ${f} sha256=${sum} bytes=${bytes} pin-row: ${role} ${sum}${COLOR_RESET}"
         pinned=$(awk -v r="$role" '$1==r && NF==2 {print tolower($2)}' "${WORKSPACE_DIR}/firmware/${pins}" 2>/dev/null | head -1)
         if [ -z "$pinned" ]; then [ "$state" = "MATCH" ] && state="UNPINNED"
@@ -15011,6 +15011,33 @@ fw_stage_unafs() {
     cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/unafs/Cargo.toml" -- put "${WORKSPACE_DIR}/target/${tag,,}" "$dir" -i "$img" >/dev/null || {
         echo -e "${COLOR_RED}❌ ${tag}: tools/unafs put target/${tag,,} -> ${dir} failed — no card image${COLOR_RESET}"; return 1; }
     echo -e "${COLOR_YELLOW}⚡ ${tag}: target/${tag,,} onto the UnaFS root at ${dir}/ (bench-only, never in-tree)${COLOR_RESET}"
+}
+
+# ARROYOMAC (rmbp-ledger B1011): the host-portable helpers, so a macOS bench builds the flight image (`esp-x86`) without
+# shims. GNU FIRST, BSD second: GNU `stat -f` is the FILESYSTEM mode, prints `?` for `%z` and exits 0, so the BSD form tried
+# first never falls through on Linux (media-writer.sh's order; make-pi-img.sh switches on `uname -s`). The sha256 mechanism is
+# `sha256_of` (above, Real-hardware boot media); `sha512_of` is its shape. `_ncpu` is for the self-host fixture builds (LNXCROSS).
+_fsize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
+_ncpu() { nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4; }
+sha512_of() {
+    if command -v shasum >/dev/null 2>&1; then shasum -a 512 "$1" | awk '{print $1}'
+    elif command -v sha512sum >/dev/null 2>&1; then sha512sum "$1" | awk '{print $1}'
+    else echo ""; fi
+}
+# The kernel and the builder are built with `cargo +nightly`, which overrides rust-toolchain.toml, so the floor is checked
+# on THAT toolchain: its commit date (YYYY-MM-DD, compared as a string — no `date -d`) must be >= the oldest nightly the
+# flights build on. A stale nightly (flight 38's Mac had a March one) is refused here, not as a compile error deep in a crate.
+_rustc_floor() {
+    local floor="2026-08-31" have
+    have="$(rustc +nightly -V 2>/dev/null | awk '{d=$NF; gsub(/[()]/, "", d); print d}')"
+    case "$have" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) echo -e "${COLOR_RED}❌ TOOLCHAIN: no dated \`rustc +nightly -V\` on this host — run: rustup toolchain install nightly (B1011)${COLOR_RESET}"; return 1 ;;
+    esac
+    if [[ "$have" < "$floor" ]]; then
+        echo -e "${COLOR_RED}❌ TOOLCHAIN: nightly ${have} is older than ${floor} — run: rustup update nightly (B1011)${COLOR_RESET}"; return 1
+    fi
+    return 0
 }
 
 # --- Entry Point ---
