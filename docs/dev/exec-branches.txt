@@ -978,7 +978,7 @@ refs/heads/exec-rmbp-zenbookimageline   bb5f279a7 cut 2026-10-27 (wave36 batch 7
 refs/heads/exec-rmbp-zenbookxhcipick   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
 refs/heads/exec-rmbp-zenbookec   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
 refs/heads/exec-rmbp-nvmeboot   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
-refs/heads/exec-rmbp-boundedwait   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-boundedwait   3c9e61df9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootshared   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
 refs/heads/exec-rmbp-vfsputsweep   26fba6acc FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-gopignite   3bce61780 FOLDED-BY-HAND (this commit) 2026-10-27
