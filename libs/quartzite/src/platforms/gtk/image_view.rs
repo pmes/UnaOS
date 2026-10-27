@@ -124,7 +124,8 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
         while let Ok(msg) = rx.recv().await {
             match msg {
                 SMessage::SurfaceBlit { url, width, height, pixels } if url == target_id => {
-                    *buffer.borrow_mut() = pixels;
+                    // NLE2ORDER (SR227): the Surface takes RGBA (tetra's contract); converted ONCE here to cairo's ARgb32.
+                    *buffer.borrow_mut() = crate::tetra::surface_argb32(&pixels);
                     *dim.borrow_mut() = (width, height);
                     da_clone.queue_draw();
                 }
@@ -133,13 +134,6 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
                 SMessage::BrowserCursorChanged(name) => {
                     let name = if name == "auto" { "default" } else { name.as_str() };
                     da_clone.set_cursor_from_name(Some(name));
-                }
-                SMessage::SurfaceBlit { url, width, height, pixels } => {
-                    if url == target_id {
-                        *buffer.borrow_mut() = pixels;
-                        *dim.borrow_mut() = (width, height);
-                        da_clone.queue_draw();
-                    }
                 }
                 // The engine's answer to BrowserCopy: the display's clipboard.
                 SMessage::BrowserClipboardSet(text) => da_clone.clipboard().set_text(&text),

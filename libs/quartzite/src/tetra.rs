@@ -127,6 +127,9 @@ pub enum TetraNode {
         placeholder: String,
         action: TextAction,
     },
+    /// NLE2ORDER (SR227): the Surface pixel contract. Every `SurfaceBlit { url == id }` carries RGBA8, straight
+    /// (non-premultiplied) alpha, row-major, stride `width * 4`, on every embassy; an embassy whose native buffer
+    /// differs converts ONCE at its hand-off (GTK's cairo ARgb32: [`surface_argb32`]), so no caller swizzles.
     Surface {
         id: String,
     },
@@ -307,5 +310,56 @@ mod tests {
     fn sanitize_line_trims_a_single_trailing_newline() {
         assert_eq!(sanitize_line("done\n"), "done");
         assert_eq!(sanitize_line("done"), "done");
+    }
+}
+
+/// NLE2ORDER (SR227): a Surface's RGBA8 (straight alpha, the [`TetraNode::Surface`] contract) as cairo's `ARgb32`:
+/// one native-endian 32-bit word per pixel, alpha in the high byte, colour premultiplied (`(c * a + 127) / 255`, the
+/// identity at a = 255), so B, G, R, A in memory on a little-endian host. Pure: the GTK embassy's one hand-off
+/// converter (`image_view`, `probe_view`), testable without a GTK handle.
+pub fn surface_argb32(rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len());
+    for px in rgba.chunks_exact(4) {
+        let a = px[3] as u32;
+        let pm = |c: u8| ((c as u32 * a + 127) / 255) as u8;
+        let word = u32::from_be_bytes([px[3], pm(px[0]), pm(px[1]), pm(px[2])]);
+        out.extend_from_slice(&word.to_ne_bytes());
+    }
+    out
+}
+
+#[cfg(test)]
+mod surface_contract_tests {
+    use super::surface_argb32;
+
+    /// RGBA in, RGBA out: an opaque row through the hand-off decodes from cairo's native word back to the caller's
+    /// RGBA, and the word is 0xAARRGGBB (probe_view's swizzle KAT, moved with the fn).
+    #[test]
+    fn surface_rgba_contract_kat() {
+        let row = [0x11, 0x22, 0x33, 0xFF, 0xFE, 0x00, 0x80, 0xFF, 0x00, 0x00, 0x00, 0xFF];
+        let out = surface_argb32(&row);
+        assert_eq!(out.len(), row.len());
+        assert_eq!(u32::from_ne_bytes([out[0], out[1], out[2], out[3]]), 0xFF11_2233);
+        let back: Vec<u8> = out
+            .chunks_exact(4)
+            .flat_map(|w| {
+                let [a, r, g, b] = u32::from_ne_bytes([w[0], w[1], w[2], w[3]]).to_be_bytes();
+                [r, g, b, a]
+            })
+            .collect();
+        assert_eq!(back, row);
+    }
+
+    /// cairo's ARgb32 is premultiplied: hand-computed translucent and clear pixels.
+    #[test]
+    fn surface_argb32_premultiplies_kat() {
+        let out = surface_argb32(&[200, 100, 50, 128, 255, 255, 255, 0, 255, 0, 0, 1]);
+        let word = |i: usize| u32::from_ne_bytes([out[i], out[i + 1], out[i + 2], out[i + 3]]);
+        // 200*128/255 = 100.39 -> 100 (0x64); 100*128/255 = 50.2 -> 50 (0x32); 50*128/255 = 25.1 -> 25 (0x19).
+        assert_eq!(word(0), 0x8064_3219);
+        assert_eq!(word(4), 0x0000_0000);
+        // 255*1/255 = 1.
+        assert_eq!(word(8), 0x0101_0000);
+        assert_eq!(out.len(), 12);
     }
 }

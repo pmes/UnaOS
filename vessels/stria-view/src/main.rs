@@ -121,12 +121,6 @@ fn editor_tree() -> TetraNode {
     ])
 }
 
-/// The pixel order the face's surface reads: GTK's hands its buffer to cairo ARgb32 (BGRA on little-endian), the
-/// AppKit surface and the headless witness take RGBA (NLE2-ORDER owes one Quartzite contract).
-fn surface_order() -> PixelOrder {
-    if cfg!(all(target_os = "linux", feature = "gtk")) { PixelOrder::Bgra } else { PixelOrder::Rgba }
-}
-
 /// A `--do` token as the messages the window would send.
 fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
     let num = |s: &str| s.parse::<i64>().ok();
@@ -223,7 +217,7 @@ fn main() {
     let synapse = Synapse::new();
     {
         let rx = synapse.subscribe();
-        let face = Face::new(EditorState::new(tl), sources, c.size, surface_order(), true);
+        let face = Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true);
         rt.spawn(nle_face::serve(synapse.clone(), rx, face));
     }
     quartzite::Backend::new_tetra_vessel(
