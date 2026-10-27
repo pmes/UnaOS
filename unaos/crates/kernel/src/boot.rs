@@ -416,7 +416,7 @@ pub fn ignite_from() -> &'static str {
 // image-line-pi.env, image-line-orin.env) arms UNAOS_LOGIN, and a build without it (the QEMU lanes) is byte-identical.
 // The Orin's const is held for its line; its desktop is not reached yet (BP-boot-14, `tegra_early_stop`).
 
-/// `(board, year)`: the oldest machine this build's line is for — one const per board (image-line.env's header).
+/// `(board, year)`: the oldest machine this build's line is for — one const per board, the cfg DEFAULT; every reader goes through [`oldest`] (ZENBOOKOLDEST Z12).
 #[cfg(all(feature = "login", target_arch = "x86_64"))]
 pub const OLDEST: (&str, u16) = ("rmbp12", 2012);
 #[cfg(all(feature = "login", target_arch = "aarch64", feature = "tegra"))]
@@ -451,8 +451,8 @@ fn oldest_net() -> &'static str {
 pub fn oldest_say() {
     serial_println!(
         ":: OLDEST: board={} year={} image={} net={} -> BOOTS ::",
-        OLDEST.0,
-        OLDEST.1,
+        oldest().0,
+        oldest().1,
         crate::fs::bootdisk::BUILD_SHA,
         oldest_net()
     ); trust_say(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::tests::bootlist::start(); // BOOTLIST (rmbp-ledger B817, R132): the boot's first [desktop] built starts the ESP list's one worker (tests.rs tail). BOOTLISTARM (B874): widened to the desktop family — the Pi's and the Orin's crystal login reaches this same first build. LINE-NEUTRAL append, code first
@@ -491,4 +491,24 @@ fn trust_say() {
     } else {
         serial_println!("[trust] roots.pem bytes=0 pin=none -> absent");
     }
+}
+
+// ── ZENBOOKOLDEST (zenbook-ledger Z12; BP-boot-15) ───────────────────────────────────────────────────────────────────
+// One image line can boot on more than one x86 machine (the Zenbook line is esp-x86 under image-line-zenbook.env), so the
+// board an x86 boot names is read at run time: the cfg const above is the DEFAULT, and on x86 a positively identified
+// Zenbook UM5606W (`hw::platform()`, Z1: lock-free, resolved at `pci.rs init`, long before the first `[desktop] built`)
+// answers ("zenbook", 2024). The rMBP, QEMU (`platform=qemu`), an unknown or unread SMBIOS, and aarch64 keep the const.
+// Every reader goes through here: the `:: OLDEST:` line (`oldest_say`) and BOOTLIST's `@<board>` key
+// (`tests::bootlist_arm::board`). FILE-TAIL append (nothing above moves); `login` only, the const's own gate.
+
+/// `(board, year)` for THIS boot: the cfg default ([`OLDEST`]), overridden on x86 by the platform the SMBIOS names.
+#[cfg(feature = "login")]
+pub fn oldest() -> (&'static str, u16) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if matches!(crate::hw::platform(), crate::hw::Platform::ZenbookUm5606w) {
+            return ("zenbook", 2024);
+        }
+    }
+    OLDEST
 }
