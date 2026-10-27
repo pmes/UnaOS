@@ -928,7 +928,7 @@ refs/heads/exec-rmbp-nle6export   c29def3f8 FOLDED-BY-HAND (this commit) 2026-10
 refs/heads/exec-rmbp-colourone422   95cdd4473 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle6exportaac   1050b375e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdf4glyphpos   df2a6fe90 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-pdfsignkeyparse   95cdd4473 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pdfsignkeyparse   a673d172b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-mathone   042ebb079 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle6keys   e5c367291 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-userstriacolourone   4a6fb8242 FOLDED-BY-HAND (this commit) 2026-10-27

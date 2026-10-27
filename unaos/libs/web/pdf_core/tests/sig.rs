@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use common::{Body, PdfBuilder, incremental, replace_bytes};
 use crypto_core::Sha256;
 use pdf_core::crypt::Cipher;
-use pdf_core::sig::cms::{self, PrivateKey, SecretKey, SignerKey};
+use pdf_core::sig::cms::{self, Hash, Key, PrivateKey, SecretKey, SignerKey, SigningKey, parse_key};
 use pdf_core::sig::{Chain, Changes, SignRequest, SubFilter, Trust, Verdict, probe_line};
 use pdf_core::write::Edit;
 use pdf_core::{Document, Error};
@@ -52,12 +52,20 @@ fn gen_key(seed: u8) -> PrivateKey {
 }
 
 struct Keys {
+    ca: PrivateKey,
     leaf: PrivateKey,
     other: PrivateKey,
     ec: SecretKey,
     ca_der: Vec<u8>,
     leaf_der: Vec<u8>,
     ec_der: Vec<u8>,
+    /// PDFSIGNKEYPARSE (SR361): an Ed25519 signer under the RSA CA; the RSA leaf certified with RSASSA-PSS / SHA-384; an
+    /// Ed25519 CA (self-signed, same CA name) and the P-256 key certified by it.
+    ed: SigningKey,
+    ed_der: Vec<u8>,
+    leaf_pss_der: Vec<u8>,
+    edca_der: Vec<u8>,
+    ec_under_ed_der: Vec<u8>,
 }
 
 fn keys() -> &'static Keys {
@@ -67,11 +75,18 @@ fn keys() -> &'static Keys {
         let leaf = gen_key(2);
         let other = gen_key(3);
         let ec = SecretKey::from_bytes(&[0x11; 32]).unwrap();
-        let (cak, leafk, eck) = (SignerKey::Rsa(&ca), SignerKey::Rsa(&leaf), SignerKey::P256(&ec));
+        let (cak, leafk, eck) = (SignerKey::Rsa(&ca, Hash::Sha256), SignerKey::Rsa(&leaf, Hash::Sha256), SignerKey::P256(&ec, Hash::Sha256));
         let ca_der = cert(1, "PDFSIG KAT CA", &cak, &cak, true);
         let leaf_der = cert(2, "PDFSIG KAT Signer", &leafk, &cak, false);
         let ec_der = cert(3, "PDFSIGN KAT EC Signer", &eck, &cak, false);
-        Keys { leaf, other, ec, ca_der, leaf_der, ec_der }
+        let ed = SigningKey::from_seed(&[0x22; 32]);
+        let edca = SigningKey::from_seed(&[0x33; 32]);
+        let ed_der = cert(4, "PDFSIGNKEYPARSE KAT Ed25519 Signer", &SignerKey::Ed25519(&ed), &cak, false);
+        let leaf_pss_der = cert(5, "PDFSIGNKEYPARSE KAT PSS Signer", &leafk, &SignerKey::RsaPss(&ca, Hash::Sha384), false);
+        let edcak = SignerKey::Ed25519(&edca);
+        let edca_der = cert(6, "PDFSIG KAT CA", &edcak, &edcak, true);
+        let ec_under_ed_der = cert(7, "PDFSIGNKEYPARSE KAT EC under Ed25519", &eck, &edcak, false);
+        Keys { ca, leaf, other, ec, ca_der, leaf_der, ec_der, ed, ed_der, leaf_pss_der, edca_der, ec_under_ed_der }
     })
 }
 
@@ -133,7 +148,7 @@ fn sign_pdf(mut pdf: Vec<u8>, key: &PrivateKey, certs: &[&[u8]], short: usize) -
     let br = format!("[0 {a:010} {b:010} {c:010}]");
     pdf[at..at + br.len()].copy_from_slice(br.as_bytes());
     let digest = sha256(&[&pdf[..a], &pdf[b..b + c]]);
-    let der = cms::build(&SignerKey::Rsa(key), &digest, certs, AT, false).unwrap();
+    let der = cms::build(&SignerKey::Rsa(key, Hash::Sha256), &digest, certs, AT, false).unwrap();
     let hex: String = der.iter().map(|x| format!("{x:02X}")).collect();
     assert!(hex.len() <= PLACE, "CMS {} hex digits over the placeholder", hex.len());
     pdf[a + 1..a + 1 + hex.len()].copy_from_slice(hex.as_bytes());
@@ -338,7 +353,7 @@ fn trusted_whole(v: &Verdict) -> bool {
 fn sign_unsigned_rsa_trusted() {
     let pdf = blank(false);
     let chain = rsa_chain();
-    let out = sign(&pdf, None, &request("Signature1", SignerKey::Rsa(&keys().leaf), &chain)).unwrap();
+    let out = sign(&pdf, None, &request("Signature1", SignerKey::Rsa(&keys().leaf, Hash::Sha256), &chain)).unwrap();
     assert!(out.starts_with(&pdf), "an incremental update keeps the original as a prefix");
     let v = verdicts(&out, None);
     assert_eq!(v.len(), 1);
@@ -358,11 +373,11 @@ fn sign_unsigned_rsa_trusted() {
 #[test]
 fn second_signature_keeps_first() {
     let chain = rsa_chain();
-    let leaf = SignerKey::Rsa(&keys().leaf);
+    let leaf = SignerKey::Rsa(&keys().leaf, Hash::Sha256);
     let mut first = request("Sig1", leaf, &chain);
     first.certify = Some(2);
     let once = sign(&blank(true), None, &first).unwrap();
-    let twice = sign(&once, None, &request("Sig2", SignerKey::Rsa(&keys().leaf), &chain)).unwrap();
+    let twice = sign(&once, None, &request("Sig2", SignerKey::Rsa(&keys().leaf, Hash::Sha256), &chain)).unwrap();
     assert!(twice.starts_with(&once));
     let v = verdicts(&twice, None);
     assert_eq!(v.len(), 2);
@@ -383,7 +398,7 @@ fn sign_encrypted_file() {
     let chain = rsa_chain();
     for cipher in [Cipher::Aes128, Cipher::Aes256] {
         let enc = Document::parse(&blank(true)).unwrap().save_encrypted(b"user", b"owner", -4, cipher, &[3; 32]);
-        let out = sign(&enc, Some(b"user"), &request("Sig1", SignerKey::Rsa(&keys().leaf), &chain)).unwrap();
+        let out = sign(&enc, Some(b"user"), &request("Sig1", SignerKey::Rsa(&keys().leaf, Hash::Sha256), &chain)).unwrap();
         assert!(out.starts_with(&enc), "{cipher:?}: the signature covers the encrypted file's bytes");
         let v = verdicts(&out, Some(b"user"));
         assert_eq!(v.len(), 1, "{cipher:?}");
@@ -397,7 +412,7 @@ fn sign_encrypted_file() {
 fn certify_then_fill() {
     let chain = rsa_chain();
     for (p, allowed) in [(2u8, true), (1, false)] {
-        let mut r = request("Sig1", SignerKey::Rsa(&keys().leaf), &chain);
+        let mut r = request("Sig1", SignerKey::Rsa(&keys().leaf, Hash::Sha256), &chain);
         r.certify = Some(p);
         let signed = sign(&blank(true), None, &r).unwrap();
         let doc = Document::parse(&signed).unwrap();
@@ -422,7 +437,7 @@ fn certify_then_fill() {
 #[test]
 fn tamper_after_sign() {
     let chain = rsa_chain();
-    let out = sign(&blank(false), None, &request("Signature1", SignerKey::Rsa(&keys().leaf), &chain)).unwrap();
+    let out = sign(&blank(false), None, &request("Signature1", SignerKey::Rsa(&keys().leaf, Hash::Sha256), &chain)).unwrap();
     let bad = replace_bytes(&out, b"/MediaBox [0 0 40 40]", b"/MediaBox [0 0 40 41]");
     assert_ne!(bad, out);
     assert_eq!(verdicts(&bad, None)[0].1, Verdict::DigestMismatch);
@@ -432,7 +447,7 @@ fn tamper_after_sign() {
 fn ecdsa_p256_signer() {
     let k = keys();
     let chain = [k.ec_der.as_slice(), k.ca_der.as_slice()];
-    let out = sign(&blank(false), None, &request("Signature1", SignerKey::P256(&k.ec), &chain)).unwrap();
+    let out = sign(&blank(false), None, &request("Signature1", SignerKey::P256(&k.ec, Hash::Sha256), &chain)).unwrap();
     let v = verdicts(&out, None);
     assert!(trusted_whole(&v[0].1), "{:?}", v[0].1);
 }
@@ -440,7 +455,7 @@ fn ecdsa_p256_signer() {
 #[test]
 fn deterministic_output() {
     let chain = rsa_chain();
-    let r = request("Sig1", SignerKey::Rsa(&keys().leaf), &chain);
+    let r = request("Sig1", SignerKey::Rsa(&keys().leaf, Hash::Sha256), &chain);
     assert_eq!(sign(&blank(true), None, &r).unwrap(), sign(&blank(true), None, &r).unwrap());
     let enc = Document::parse(&blank(true)).unwrap().save_encrypted(b"user", b"owner", -4, Cipher::Aes128, &[3; 32]);
     assert_eq!(sign(&enc, Some(b"user"), &r).unwrap(), sign(&enc, Some(b"user"), &r).unwrap());
@@ -449,7 +464,7 @@ fn deterministic_output() {
 #[test]
 fn sign_refusals() {
     let chain = rsa_chain();
-    let leaf = || SignerKey::Rsa(&keys().leaf);
+    let leaf = || SignerKey::Rsa(&keys().leaf, Hash::Sha256);
     let signed = sign(&blank(true), None, &request("Sig1", leaf(), &chain)).unwrap();
     fn refused(pdf: &[u8], r: &SignRequest<'_>) -> Option<Error> {
         sign(pdf, None, r).err()
@@ -471,10 +486,99 @@ fn sign_refusals() {
 #[test]
 fn cades_subfilter() {
     let chain = rsa_chain();
-    let mut r = request("Signature1", SignerKey::Rsa(&keys().leaf), &chain);
+    let mut r = request("Signature1", SignerKey::Rsa(&keys().leaf, Hash::Sha256), &chain);
     r.subfilter = SubFilter::CadesDetached;
     let out = sign(&blank(false), None, &r).unwrap();
     let doc = Document::parse(&out).unwrap();
     assert_eq!(doc.signatures(&out)[0].subfilter, b"ETSI.CAdES.detached");
     assert!(trusted_whole(&verdicts(&out, None)[0].1));
+}
+
+// ---- PDFSIGNKEYPARSE (LEDGER SR361): RSA-PSS, SHA-384, Ed25519, and a signer read from a key file ----
+
+/// Every signature's verdict with `anchor` as the one trust anchor.
+fn verdicts_under(pdf: &[u8], anchor: &[u8]) -> Vec<Verdict> {
+    let doc = Document::parse(pdf).unwrap();
+    let mut store = TrustStore::new();
+    store.add_der(anchor).unwrap();
+    let trust = Trust { store: &store, at: AT };
+    doc.signatures(pdf).iter().map(|s| s.verify(&doc, pdf, Some(&trust))).collect()
+}
+
+/// Sign the blank page with `key` carrying `chain`; assert Trusted under the RSA CA; return the file.
+fn signed_trusted(key: SignerKey<'_>, chain: &[&[u8]]) -> Vec<u8> {
+    let out = sign(&blank(false), None, &request("Signature1", key, chain)).unwrap();
+    let v = verdicts(&out, None);
+    assert!(trusted_whole(&v[0].1), "{:?}", v[0].1);
+    out
+}
+
+#[test]
+fn rsa_pss_and_sha384_signers() {
+    let k = keys();
+    let chain = rsa_chain();
+    signed_trusted(SignerKey::RsaPss(&k.leaf, Hash::Sha256), &chain);
+    signed_trusted(SignerKey::Rsa(&k.leaf, Hash::Sha384), &chain);
+    signed_trusted(SignerKey::RsaPss(&k.leaf, Hash::Sha384), &chain);
+    // The leaf certified with RSASSA-PSS / SHA-384: the chain builder verifies a PSS certificate signature too.
+    let pss_chain = [k.leaf_pss_der.as_slice(), k.ca_der.as_slice()];
+    signed_trusted(SignerKey::RsaPss(&k.leaf, Hash::Sha256), &pss_chain);
+}
+
+#[test]
+fn p256_sha384_signer() {
+    let k = keys();
+    let chain = [k.ec_der.as_slice(), k.ca_der.as_slice()];
+    signed_trusted(SignerKey::P256(&k.ec, Hash::Sha384), &chain);
+}
+
+#[test]
+fn ed25519_signer() {
+    let k = keys();
+    let chain = [k.ed_der.as_slice(), k.ca_der.as_slice()];
+    let out = signed_trusted(SignerKey::Ed25519(&k.ed), &chain);
+    // RFC 8419: id-sha512 with ABSENT parameters as the digest algorithm, id-Ed25519 as the signature algorithm.
+    let doc = Document::parse(&out).unwrap();
+    let cms = &doc.signatures(&out)[0].contents;
+    let sha512_absent = [0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03];
+    assert!(cms.windows(13).any(|w| w == sha512_absent), "digest algorithm sha512, no parameters");
+    assert!(cms.windows(7).any(|w| w == [0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]), "id-Ed25519");
+}
+
+#[test]
+fn ed25519_certificate_path() {
+    let k = keys();
+    let chain = [k.ec_under_ed_der.as_slice(), k.edca_der.as_slice()];
+    let out = sign(&blank(false), None, &request("Signature1", SignerKey::P256(&k.ec, Hash::Sha256), &chain)).unwrap();
+    let v = verdicts_under(&out, &k.edca_der);
+    assert!(trusted_whole(&v[0]), "{:?}", v[0]);
+    // The same file under the RSA CA (same name, other key) is not trusted.
+    assert!(!trusted_whole(&verdicts(&out, None)[0].1));
+}
+
+#[test]
+fn pss_and_ed25519_are_deterministic() {
+    let k = keys();
+    let chain = rsa_chain();
+    let r = request("Sig1", SignerKey::RsaPss(&k.leaf, Hash::Sha384), &chain);
+    assert_eq!(sign(&blank(true), None, &r).unwrap(), sign(&blank(true), None, &r).unwrap());
+    let ed_chain = [k.ed_der.as_slice(), k.ca_der.as_slice()];
+    let r = request("Sig1", SignerKey::Ed25519(&k.ed), &ed_chain);
+    assert_eq!(sign(&blank(true), None, &r).unwrap(), sign(&blank(true), None, &r).unwrap());
+}
+
+/// `openssl genpkey -algorithm ED25519` (OpenSSL 3.0.13, the bench).
+const ED_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIDqHbOsK21BmcOjUIvtIq93yAHw+dKpr/+Ke63mfCTAM
+-----END PRIVATE KEY-----
+";
+
+#[test]
+fn signer_from_a_key_file() {
+    let k = keys();
+    let Key::Ed25519(ed) = parse_key(ED_PEM.as_bytes()).unwrap() else { panic!("not Ed25519") };
+    let signer = SignerKey::Ed25519(&ed);
+    let der = cert(8, "PDFSIGNKEYPARSE KAT PEM Signer", &signer, &SignerKey::Rsa(&k.ca, Hash::Sha256), false);
+    signed_trusted(signer, &[der.as_slice(), k.ca_der.as_slice()]);
 }
