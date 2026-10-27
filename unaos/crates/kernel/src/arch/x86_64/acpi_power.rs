@@ -846,3 +846,35 @@ pub fn pwrbtn_take() -> Option<bool> {
     }
     Some(hit)
 }
+
+// ── DWI2CACPI (zenbook-ledger Z32) — the DSDT's bytes for the byte scans that read it — FILE TAIL ────────────────────
+// The FADT names the DSDT (`X_DSDT` preferred, else the legacy `DSDT`), exactly as `discover` and `s3_census` resolve it
+// above (DSDT-ONE owed: those two still open-code the locator). One bounded slice of firmware memory, read-only: the
+// signature must be "DSDT" and the header's length between the header and DSDT_MAX. First user: `drivers::dwi2c`'s
+// `aml_scan` (a byte scan, BP-power-4: no AML runs).
+
+/// The largest DSDT this reader hands out (a laptop's is 100-600 KiB).
+const DSDT_MAX: usize = 2 * 1024 * 1024;
+
+/// The DSDT, header included, or `None` (no RSDP, no FADT, no DSDT pointer, a wrong signature, or a length outside
+/// `SDT_HEADER_LEN..=DSDT_MAX`).
+pub(crate) fn dsdt() -> Option<&'static [u8]> {
+    let (sdt, es) = acpi::root_sdt(acpi::rsdp_addr())?;
+    // SAFETY: firmware tables sit on the firmware's identity map (as `scan_s5` reads them); the FADT reads are bounded
+    // by its own length, and the DSDT slice by its header's length after the signature and bounds checks.
+    unsafe {
+        let fadt = acpi::find_table(sdt, es, b"FACP")?;
+        let fl = acpi::table_len(fadt);
+        let mut dsdt: u64 = 0;
+        if fl >= FADT_X_DSDT + 8 { dsdt = ((fadt as usize + FADT_X_DSDT) as *const u64).read_unaligned(); }
+        if dsdt == 0 && fl >= FADT_DSDT + 4 { dsdt = ((fadt as usize + FADT_DSDT) as *const u32).read_unaligned() as u64; }
+        if dsdt == 0 || &*(dsdt as *const [u8; 4]) != b"DSDT" {
+            return None;
+        }
+        let len = acpi::table_len(dsdt);
+        if !(acpi::SDT_HEADER_LEN..=DSDT_MAX).contains(&len) {
+            return None;
+        }
+        Some(core::slice::from_raw_parts(dsdt as *const u8, len))
+    }
+}

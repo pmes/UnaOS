@@ -1034,7 +1034,7 @@ refs/heads/exec-rmbp-mt7925s6   d70543a59 FOLDED-BY-HAND (this commit) 2026-10-2
 refs/heads/exec-rmbp-nlesizepolicyui   43f35c1ba FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookecqevents   b56552d3c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nvme4kn   20eda4229 cut 2026-10-27 (wave36 batch 14)
-refs/heads/exec-rmbp-dwi2cacpi   20eda4229 cut 2026-10-27 (wave36 batch 14)
+refs/heads/exec-rmbp-dwi2cacpi   8c0a22894 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookflightlist   20eda4229 cut 2026-10-27 (wave36 batch 14)
 refs/heads/exec-rmbp-kernelsizekey   7bf419701 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-saverecentopen   97f2c923f cut 2026-10-27 (wave36 batch 15)

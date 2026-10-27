@@ -26,7 +26,7 @@
 //! The touchpad's reports: the `touchpad` module at the tail (ZENBOOKTOUCHPADREPORTS, zenbook-ledger Z18; `ehcihid`
 //! images, pumped by the one HID pass) — the controller that answered is HELD open for it only when armed. `tests dwi2c`
 //! runs the register-sequence machine against a fake controller: `:: DWI2C: proto=ok cases=8/8 -> PASS ::`;
-//! `tests dwi2ctp` the touchpad over the same fake: `:: DWI2C-TP: rdesc=ok reports=2 events=2 scroll2 dy=<n> palm=ok -> PASS ::`.
+//! `tests dwi2ctp` the touchpad over the same fake: `:: DWI2C-TP: rdesc=ok reports=2 events=2 scroll2 dy=<n> palm=ok -> PASS ::`. DWI2CACPI (zenbook-ledger Z32): the DSDT byte scan `aml_scan` (file tail) cross-checks BASES / HID_GUESS (`[dwi2c] acpi ...`), `tests dwi2cacpi`.
 
 use core::cell::RefCell;
 
@@ -383,13 +383,13 @@ fn run<I: Mmio>(i: usize, base: u64, io: &I, say: bool) -> Outcome {
         }
     }
     if s.stuck.is_none() {
-        match HID_GUESS.iter().find(|g| kept.contains(&g.0)) {
+        match acpi_pick(i, kept).or_else(|| HID_GUESS.iter().find(|g| kept.contains(&g.0)).copied()) {
             None => {
                 if say {
                     serial_println!("[dwi2c] ctrl={} hid -> NOT ATTEMPTED why=no-known-address", i);
                 }
             }
-            Some(&(addr, reg)) => match hid_desc(io, addr, reg, win) {
+            Some((addr, reg)) => match hid_desc(io, addr, reg, win) {
                 Ok(Some(d)) => {
                     o.desc = Some(d);
                     o.hid_addr = addr;
@@ -429,7 +429,7 @@ pub fn probe() {
     if !crate::hw::gate(crate::hw::Probe::I2c) {
         return;
     }
-    for (i, &base) in BASES.iter().enumerate() {
+    acpi_census(); for (i, &base) in BASES.iter().enumerate() { // DWI2CACPI (zenbook-ledger Z32): `acpi_census` (file tail) — the DSDT's AMDI0010 `_CRS` base and the touchpad's I2cSerialBus address cross-checked against BASES / HID_GUESS, `ACPI_PICK` set only on agree=yes; LINE-NEUTRAL, the call before this comment.
         crate::arch::memory::map_mmio_window(base, 0x1000);
         if crate::arch::memory::translate(base).is_none() {
             serial_println!("[dwi2c] ctrl={} -> SKIP reason=unmapped", i);
@@ -1544,5 +1544,385 @@ pub mod touchpad {
         let first = a.c.is_some_and(|c| c.n == 1 && c.palms == 1 && c.x == 2000 && c.tip);
         let palm_ok = first && a.wheel.is_none() && b.wheel.is_none() && b.motion.is_some_and(|(dx, _)| dx > 0);
         (scroll_ok, sum, palm_ok)
+    }
+}
+
+// ── DWI2CACPI (zenbook-ledger Z32) — the DSDT's word on the controller base and the touchpad's address — FILE TAIL ────
+// A BYTE SCAN, not an interpreter (BP-power-4: no AML runs): `aml_scan` finds the `_HID "AMDI0010"` Devices and the ONE
+// `Memory32Fixed` (0x86) inside each Device's span (`5B 82` + PkgLength), the ONE PNP0C50 Device (the I2C-HID
+// compatible id, String or EISAID) and the ONE `I2cSerialBus` (0x8E, type 1) inside its span, whose ResourceSource names
+// the controller; the descriptor register only from the literal `_DSM` shape `If (Arg2 == One) Return (<const>)` after
+// the HID GUID (linux i2c-hid-acpi), else `?`. Anything else refuses BY NAME. The result is a CROSS-CHECK of the survey
+// (`BASES`, `HID_GUESS`): on agree=yes `ACPI_PICK` pins which guess pair `run` tries on which controller; on agree=no the
+// survey path runs unchanged and the line records the mismatch (the first boot judges). `AMDI0019` (linux: the
+// PSP-arbitrated bus, ARBITRATION_SEMAPHORE) is deliberately NOT accepted. `tests dwi2cacpi`: the live line, then the KAT
+// over `ACPI_KAT` and three refusal mutants: `:: DWI2CACPI: base=ok tp=ok speed=400000 desc=ok refuse=3/3 -> PASS ::`.
+// Owed: DWI2C-FAST, DWI2C-AOAC, DWI2C-GPIO, DWI2C-ACPI-SSDT (the touchpad declared in an SSDT).
+
+/// `Name (_HID, "AMDI0010")`: the DesignWare I2C master's ACPI id on AMD.
+const ACPI_HID_PAT: &[u8] = b"\x08_HID\x0dAMDI0010\x00";
+/// The I2C-HID compatible id after a `_HID`/`_CID` NameSeg: "PNP0C50", "ACPI0C50", EISAID(PNP0C50).
+const ACPI_TP_IDS: [&[u8]; 3] = [b"\x0dPNP0C50\x00", b"\x0dACPI0C50\x00", b"\x0c\x41\xd0\x0c\x50"];
+/// The HID-over-I2C `_DSM` GUID 3cdff6f7-4267-4555-ad05-b30a3d8938de in ToUUID byte order.
+const HID_DSM_GUID: [u8; 16] = [0xf7, 0xf6, 0xdf, 0x3c, 0x67, 0x42, 0x55, 0x45, 0xad, 0x05, 0xb3, 0x0a, 0x3d, 0x89, 0x38, 0xde];
+/// AMDI0010 Devices kept.
+const ACPI_CTRL_MAX: usize = 8;
+/// How far back from a `_HID` the enclosing `Device` op is looked for.
+const DEV_BACK: usize = 512;
+
+/// What the scan found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AcpiI2c {
+    dev: [u8; 4],
+    base: u32,
+    tp: u16,
+    tpdev: [u8; 4],
+    speed: u32,
+    desc: Option<u16>,
+}
+
+/// A refusal, by name; `what`/`n`/`at` qualify `ambiguous`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct AcpiNo {
+    why: &'static str,
+    what: &'static str,
+    n: usize,
+    at: [[u8; 4]; 2],
+}
+
+/// The pick `run` honours: (controller index into `BASES`, touchpad address, descriptor register). Written once by
+/// `probe` (pci init, BSP) on agree=yes only.
+static ACPI_PICK: spin::Once<(usize, u8, u16)> = spin::Once::new();
+
+/// The first `pat` at or after `lo` that ends at or before `hi`.
+fn find_from(a: &[u8], pat: &[u8], lo: usize, hi: usize) -> Option<usize> {
+    let hi = hi.min(a.len());
+    if pat.is_empty() || hi < pat.len() {
+        return None;
+    }
+    (lo..=hi - pat.len()).find(|&k| &a[k..k + pat.len()] == pat)
+}
+
+/// An AML PkgLength at `i`: (the length it encodes, counting itself; its own width).
+fn pkg_len(a: &[u8], i: usize) -> Option<(usize, usize)> {
+    let lead = *a.get(i)? as usize;
+    let n = lead >> 6;
+    if n == 0 {
+        return Some((lead & 0x3f, 1));
+    }
+    let mut v = lead & 0x0f;
+    for k in 0..n {
+        v |= (*a.get(i + 1 + k)? as usize) << (4 + 8 * k);
+    }
+    Some((v, 1 + n))
+}
+
+/// The last NameSeg of the NameString at `i` (root/parent prefixes, dual and multi names).
+fn last_seg(a: &[u8], mut i: usize) -> Option<[u8; 4]> {
+    while matches!(a.get(i), Some(0x5c) | Some(0x5e)) {
+        i += 1;
+    }
+    let at = match *a.get(i)? {
+        0x2e => i + 5,
+        0x2f => {
+            let n = *a.get(i + 1)? as usize;
+            if n == 0 {
+                return None;
+            }
+            i + 2 + 4 * (n - 1)
+        }
+        _ => i,
+    };
+    let s: [u8; 4] = a.get(at..at + 4)?.try_into().ok()?;
+    if s.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_') { Some(s) } else { None }
+}
+
+/// The nearest `Device` op before `hit` whose PkgLength covers it: (op offset, end, name).
+fn device_of(a: &[u8], hit: usize) -> Option<(usize, usize, [u8; 4])> {
+    let lo = hit.saturating_sub(DEV_BACK);
+    let mut j = hit.checked_sub(2)?;
+    loop {
+        if a[j] == 0x5b && a[j + 1] == 0x82 {
+            if let Some((len, w)) = pkg_len(a, j + 2) {
+                let end = j + 2 + len;
+                if end > hit && end <= a.len() {
+                    if let Some(nm) = last_seg(a, j + 2 + w) {
+                        return Some((j, end, nm));
+                    }
+                }
+            }
+        }
+        if j <= lo {
+            return None;
+        }
+        j -= 1;
+    }
+}
+
+/// The descriptor register from the touchpad Device's `_DSM`, only in the literal shape
+/// `If (Arg2 == One) Return (One | ByteConst | WordConst)` after the HID GUID; `None` otherwise.
+fn dsm_desc(a: &[u8], s: usize, e: usize) -> Option<u16> {
+    let mut k = s;
+    while let Some(m) = find_from(a, &[0x14], k, e) {
+        k = m + 1;
+        let Some((len, w)) = pkg_len(a, m + 1) else { continue };
+        if a.get(m + 1 + w..m + 5 + w) != Some(b"_DSM".as_slice()) {
+            continue;
+        }
+        let me = (m + 1 + len).min(e);
+        let g = find_from(a, &HID_DSM_GUID, m, me)?;
+        let mut i = g + 16;
+        while i + 4 < me {
+            if a[i] == 0xa0 {
+                if let Some((_, w)) = pkg_len(a, i + 1) {
+                    let q = i + 1 + w;
+                    if q + 4 < me && a[q..q + 4] == [0x93, 0x6a, 0x01, 0xa4] {
+                        return match a[q + 4] {
+                            0x01 => Some(1),
+                            0x0a if q + 5 < me => Some(a[q + 5] as u16),
+                            0x0b if q + 6 < me => Some(u16::from_le_bytes([a[q + 5], a[q + 6]])),
+                            _ => None,
+                        };
+                    }
+                }
+            }
+            i += 1;
+        }
+        return None;
+    }
+    None
+}
+
+/// The scan, bounded to `a` (the DSDT). Pure: the KAT runs it over `ACPI_KAT`.
+fn aml_scan(a: &[u8]) -> Result<AcpiI2c, AcpiNo> {
+    let no = |why: &'static str| AcpiNo { why, what: "-", n: 0, at: [*b"----"; 2] };
+    // 1. the AMDI0010 Devices: (name, Memory32Fixed count, the first one's base).
+    let mut ctrls = [([0u8; 4], 0u8, 0u32); ACPI_CTRL_MAX];
+    let mut nc = 0;
+    let mut i = 0;
+    while nc < ACPI_CTRL_MAX {
+        let Some(h) = find_from(a, ACPI_HID_PAT, i, a.len()) else { break };
+        i = h + 1;
+        let Some((s, e, nm)) = device_of(a, h) else { continue };
+        let (mut m, mut base, mut k) = (0u8, 0u32, s);
+        while let Some(at) = find_from(a, &[0x86, 0x09, 0x00], k, e) {
+            k = at + 1;
+            if at + 12 <= e {
+                m = m.saturating_add(1);
+                if m == 1 {
+                    base = u32::from_le_bytes([a[at + 4], a[at + 5], a[at + 6], a[at + 7]]);
+                }
+            }
+        }
+        ctrls[nc] = (nm, m, base);
+        nc += 1;
+    }
+    if nc == 0 {
+        return Err(no("no-hid"));
+    }
+    // 2. the ONE I2C-HID Device (a `_HID` and a `_CID` in one Device count once).
+    let mut tps = [(0usize, 0usize, [0u8; 4]); 2];
+    let mut nt = 0usize;
+    for id in ACPI_TP_IDS {
+        let mut i = 5;
+        while let Some(h) = find_from(a, id, i, a.len()) {
+            i = h + 1;
+            let name = &a[h - 4..h];
+            if a[h - 5] != 0x08 || (name != b"_HID" && name != b"_CID") {
+                continue;
+            }
+            let Some(d) = device_of(a, h - 5) else { continue };
+            if tps[..nt.min(2)].iter().any(|t| t.0 == d.0) {
+                continue;
+            }
+            if nt < 2 {
+                tps[nt] = d;
+            }
+            nt += 1;
+        }
+    }
+    if nt == 0 {
+        return Err(no("no-tp"));
+    }
+    if nt > 1 {
+        return Err(AcpiNo { why: "ambiguous", what: "tp", n: nt, at: [tps[0].2, tps[1].2] });
+    }
+    let (s, e, tpdev) = tps[0];
+    // 3. the ONE I2cSerialBus (type 1) inside it.
+    let mut bus = None;
+    let mut nb = 0usize;
+    let mut k = s;
+    while let Some(at) = find_from(a, &[0x8e], k, e) {
+        k = at + 1;
+        if at + 18 > e || a[at + 5] != 1 {
+            continue;
+        }
+        let ln = u16::from_le_bytes([a[at + 1], a[at + 2]]) as usize;
+        let tdl = u16::from_le_bytes([a[at + 10], a[at + 11]]) as usize;
+        if at + 3 + ln > e || tdl < 6 || 12 + tdl > 3 + ln {
+            continue;
+        }
+        nb += 1;
+        if bus.is_none() {
+            bus = Some((at, ln, tdl));
+        }
+    }
+    let Some((at, ln, tdl)) = bus else { return Err(no("no-bus")) };
+    if nb > 1 {
+        return Err(AcpiNo { why: "ambiguous", what: "bus", n: nb, at: [tpdev, tpdev] });
+    }
+    let speed = u32::from_le_bytes([a[at + 12], a[at + 13], a[at + 14], a[at + 15]]);
+    let tp = u16::from_le_bytes([a[at + 16], a[at + 17]]);
+    // 4. its ResourceSource's last NameSeg is the controller.
+    let src = &a[at + 12 + tdl..at + 3 + ln];
+    let src = &src[..src.iter().position(|&c| c == 0).unwrap_or(src.len())];
+    if src.len() < 4 {
+        return Err(no("no-ctrl"));
+    }
+    let tail = &src[src.len() - 4..];
+    let Some(c) = ctrls[..nc].iter().find(|c| &c.0[..] == tail) else { return Err(no("no-ctrl")) };
+    match c.1 {
+        0 => return Err(no("no-mem")),
+        1 => {}
+        m => return Err(AcpiNo { why: "ambiguous", what: "mem", n: m as usize, at: [c.0, c.0] }),
+    }
+    Ok(AcpiI2c { dev: c.0, base: c.2, tp, tpdev, speed, desc: dsm_desc(a, s, e) })
+}
+
+/// The scan against the survey: (the controller index in `BASES`, the descriptor register to use, the first mismatch).
+fn acpi_agree(f: &AcpiI2c) -> (Option<usize>, u16, Option<&'static str>) {
+    let ctrl = BASES.iter().position(|&b| b == f.base as u64);
+    let guess = HID_GUESS.iter().find(|g| g.0 as u16 == f.tp);
+    let why = if ctrl.is_none() {
+        Some("base")
+    } else if guess.is_none() {
+        Some("tp")
+    } else if f.desc.is_some_and(|d| Some(d) != guess.map(|g| g.1)) {
+        Some("desc")
+    } else {
+        None
+    };
+    (ctrl, f.desc.or(guess.map(|g| g.1)).unwrap_or(0), why)
+}
+
+/// `0x0001` or `?` / a number or `-`, for the wire.
+struct OptHex(Option<u16>);
+impl core::fmt::Display for OptHex {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "{:#06x}", v),
+            None => f.write_str("?"),
+        }
+    }
+}
+struct OptNum(Option<usize>);
+impl core::fmt::Display for OptNum {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self.0 {
+            Some(v) => write!(f, "{}", v),
+            None => f.write_str("-"),
+        }
+    }
+}
+
+fn seg_str(s: &[u8; 4]) -> &str {
+    core::str::from_utf8(s).unwrap_or("????")
+}
+
+/// Print one scan's line; the pick when it agrees with the survey.
+fn acpi_say(r: &Result<AcpiI2c, AcpiNo>) -> Option<(usize, u8, u16)> {
+    match r {
+        Err(n) if n.why == "ambiguous" => {
+            serial_println!("[dwi2c] acpi -> REFUSED why=ambiguous what={} n={} at={},{}", n.what, n.n, seg_str(&n.at[0]), seg_str(&n.at[1]));
+            None
+        }
+        Err(n) => {
+            serial_println!("[dwi2c] acpi -> REFUSED why={}", n.why);
+            None
+        }
+        Ok(f) => {
+            let (ctrl, reg, why) = acpi_agree(f);
+            match why {
+                None => serial_println!(
+                    "[dwi2c] acpi hid=AMDI0010 base={:#x} tp={:#04x} speed={} desc={} agree=yes dev={} tpdev={} ctrl={}",
+                    f.base, f.tp, f.speed, OptHex(f.desc), seg_str(&f.dev), seg_str(&f.tpdev), OptNum(ctrl)
+                ),
+                Some(w) => serial_println!(
+                    "[dwi2c] acpi hid=AMDI0010 base={:#x} tp={:#04x} speed={} desc={} agree=no why={} dev={} tpdev={} ctrl={}",
+                    f.base, f.tp, f.speed, OptHex(f.desc), w, seg_str(&f.dev), seg_str(&f.tpdev), OptNum(ctrl)
+                ),
+            }
+            match (why, ctrl) {
+                (None, Some(k)) => Some((k, f.tp as u8, reg)),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// `probe`'s once-per-boot scan of the live DSDT (read-only); sets `ACPI_PICK` on agree=yes.
+fn acpi_census() {
+    let Some(d) = crate::arch::acpi_power::dsdt() else {
+        serial_println!("[dwi2c] acpi -> REFUSED why=no-dsdt");
+        return;
+    };
+    if let Some(p) = acpi_say(&aml_scan(d)) {
+        ACPI_PICK.call_once(|| p);
+    }
+}
+
+/// `run`'s guess pair from the scan: only on the controller the DSDT named, and only at an address that acked.
+fn acpi_pick(i: usize, kept: &[u8]) -> Option<(u8, u16)> {
+    ACPI_PICK.get().filter(|p| p.0 == i && kept.contains(&p.1)).map(|p| (p.1, p.2))
+}
+
+const ACPI_KAT_LEN: usize = 163;
+/// The touchpad Device's bytes at the fragment's end (the `ambiguous` mutant appends them twice).
+const ACPI_KAT_TP: usize = 112;
+/// A hand-built DSDT body: `Device (I2CA) { _HID "AMDI0010", _UID 0, _CRS { Memory32Fixed (0xFEDC2000, 0x1000) } }` and
+/// `Device (TPD0) { _HID "ELAN1201", _CID EISAID ("PNP0C50"), _CRS { I2cSerialBusV2 (0x15, 400000, "\_SB.I2CA") },
+/// _DSM { If (Arg0 == ToUUID (HID)) { If (Arg2 == One) { Return (One) } } Return (Zero) } }`.
+const ACPI_KAT: [u8; ACPI_KAT_LEN] = [
+    0x5b, 0x82, 0x31, 0x49, 0x32, 0x43, 0x41, 0x08, 0x5f, 0x48, 0x49, 0x44, 0x0d, 0x41, 0x4d, 0x44, 0x49, 0x30,
+    0x30, 0x31, 0x30, 0x00, 0x08, 0x5f, 0x55, 0x49, 0x44, 0x00, 0x08, 0x5f, 0x43, 0x52, 0x53, 0x11, 0x11, 0x0a,
+    0x0e, 0x86, 0x09, 0x00, 0x01, 0x00, 0x20, 0xdc, 0xfe, 0x00, 0x10, 0x00, 0x00, 0x79, 0x00, 0x5b, 0x82, 0x4e,
+    0x06, 0x54, 0x50, 0x44, 0x30, 0x08, 0x5f, 0x48, 0x49, 0x44, 0x0d, 0x45, 0x4c, 0x41, 0x4e, 0x31, 0x32, 0x30,
+    0x31, 0x00, 0x08, 0x5f, 0x43, 0x49, 0x44, 0x0c, 0x41, 0xd0, 0x0c, 0x50, 0x08, 0x5f, 0x43, 0x52, 0x53, 0x11,
+    0x21, 0x0a, 0x1e, 0x8e, 0x19, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x06, 0x00, 0x80, 0x1a, 0x06,
+    0x00, 0x15, 0x00, 0x5c, 0x5f, 0x53, 0x42, 0x2e, 0x49, 0x32, 0x43, 0x41, 0x00, 0x79, 0x00, 0x14, 0x27, 0x5f,
+    0x44, 0x53, 0x4d, 0x04, 0xa0, 0x1e, 0x93, 0x68, 0x11, 0x13, 0x0a, 0x10, 0xf7, 0xf6, 0xdf, 0x3c, 0x67, 0x42,
+    0x55, 0x45, 0xad, 0x05, 0xb3, 0x0a, 0x3d, 0x89, 0x38, 0xde, 0xa0, 0x06, 0x93, 0x6a, 0x01, 0xa4, 0x01, 0xa4,
+    0x00,
+];
+
+/// `tests dwi2cacpi`: the live DSDT's line (read-only), then the scan over `ACPI_KAT` and three refusal mutants.
+pub fn acpi_selftest() {
+    match crate::arch::acpi_power::dsdt() {
+        Some(d) => {
+            let _ = acpi_say(&aml_scan(d));
+        }
+        None => serial_println!("[dwi2c] acpi -> REFUSED why=no-dsdt"),
+    }
+    let good = aml_scan(&ACPI_KAT);
+    let g = good.as_ref().ok();
+    let base_ok = g.is_some_and(|f| f.base == 0xfedc_2000 && f.dev == *b"I2CA");
+    let tp_ok = g.is_some_and(|f| f.tp == 0x15 && f.tpdev == *b"TPD0");
+    let speed = g.map_or(0, |f| f.speed);
+    let desc_ok = g.is_some_and(|f| f.desc == Some(1));
+    let mut m = ACPI_KAT;
+    m[20] = b'9'; // "AMDI0010" -> "AMDI0019"
+    let nohid = ACPI_KAT[20] == b'0' && matches!(aml_scan(&m), Err(AcpiNo { why: "no-hid", .. }));
+    let mut m = ACPI_KAT;
+    m[119] = b'B'; // "\_SB.I2CA" -> "\_SB.I2CB"
+    let noctrl = ACPI_KAT[119] == b'A' && matches!(aml_scan(&m), Err(AcpiNo { why: "no-ctrl", .. }));
+    let mut two = [0u8; ACPI_KAT_LEN + ACPI_KAT_TP];
+    two[..ACPI_KAT_LEN].copy_from_slice(&ACPI_KAT);
+    two[ACPI_KAT_LEN..].copy_from_slice(&ACPI_KAT[ACPI_KAT_LEN - ACPI_KAT_TP..]);
+    let amb = matches!(aml_scan(&two), Err(AcpiNo { why: "ambiguous", what: "tp", n: 2, .. }));
+    let refuse = nohid as u32 + noctrl as u32 + amb as u32;
+    let cases = [("base", base_ok), ("tp", tp_ok), ("speed", speed == 400_000), ("desc", desc_ok), ("no-hid", nohid), ("no-ctrl", noctrl), ("ambiguous", amb)];
+    match cases.iter().find(|c| !c.1) {
+        None => serial_println!(":: DWI2CACPI: base=ok tp=ok speed={} desc=ok refuse={}/3 -> PASS ::", speed, refuse),
+        Some(c) => serial_println!(":: DWI2CACPI: case={} -> FAIL ::", c.0),
     }
 }
