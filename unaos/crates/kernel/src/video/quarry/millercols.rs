@@ -362,7 +362,7 @@ pub(super) fn step(m: &mut Model, c: u8) -> bool {
             if m.cwd != "/" {
                 let (up, child) = (super::parent(&m.cwd), super::leaf(&m.cwd));
                 m.navigate(&up);
-                select_name(m, &child);
+                select_at(m, &up, &child); // RELISTREAD (B853): now, or on a deferred navigate's arrival
             }
         }
         _ => {
@@ -376,11 +376,33 @@ pub(super) fn step(m: &mut Model, c: u8) -> bool {
     true
 }
 
-/// The arrows while the view is Columns and the list has the keyboard. `true` = consumed.
+/// The arrows while the view is Columns and the list has the keyboard. `true` = consumed. RELISTREAD (B853)
+/// KEYTRAVEL: the Columns door is raised after the MODEL take (never in the lockless `q3_key`), so a cold Left / Right
+/// reads off the lock; `step` itself raises nothing (the `columnsview` fixture drives it synchronously).
 pub(super) fn key(c: u8) -> bool {
     let mut g = MODEL.lock();
     let Some(m) = g.as_mut() else { return false };
+    let _door = super::livedir::Door::travel(super::livedir::Travel::Columns);
     step(m, c)
+}
+
+/// RELISTREAD (B853): select `name` in `path` — now when the window shows `path`, else on the deferred navigation's
+/// arrival (`livedir::nav_select`).
+fn select_at(m: &mut Model, path: &str, name: &str) {
+    if m.cwd == path {
+        select_name(m, name);
+    } else {
+        super::livedir::nav_select(path, name);
+    }
+}
+
+/// RELISTREAD (B853): the last `right_select` deferred its navigation (the folder is still being read).
+static RIGHT_DEFER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// RELISTREAD (B853): `ops::right_press` opens no file menu when this is set — the row arrives selected, and the next
+/// right press opens the menu on it (opening it now would act on a row of the OLD folder: RIGHTMENU owed).
+pub(super) fn right_deferred() -> bool {
+    RIGHT_DEFER.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// `tests columnsview` registration (from `quarry3_tests`, no tests.rs line).
@@ -502,13 +524,18 @@ pub(super) fn right_select(m: &mut Model, sx: usize, sy: usize) -> bool {
     let Some((i, row)) = pane_row_at(m, &cols, sx, sy) else { return false };
     let c = &cols[i];
     let kind = match c.kind { Kind::Up => "up", Kind::Focus => "focus", Kind::Next => "next", Kind::Preview => "preview" };
+    RIGHT_DEFER.store(false, core::sync::atomic::Ordering::Release);
     if let Some(j) = row {
         if c.kind == Kind::Focus {
             m.list_sel = j;
         } else {
             let (p, name) = (c.path.clone(), c.rows[j].0.clone());
-            m.navigate(&p);
-            select_name(m, &name);
+            {
+                let _door = super::livedir::Door::travel(super::livedir::Travel::Columns); // RELISTREAD (B853): under ops' MODEL hold
+                m.navigate(&p);
+            }
+            select_at(m, &p, &name);
+            RIGHT_DEFER.store(m.cwd != p, core::sync::atomic::Ordering::Release);
         }
         m.focus = Pane::List;
         m.settle();
