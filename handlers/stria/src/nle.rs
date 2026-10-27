@@ -13,8 +13,10 @@
 //! * A step with `seek` opens a fresh cursor on the source ([`Demuxer::share`], no byte copy), lands it on the keyframe
 //!   ([`Demuxer::seek_track`]) and decodes forward, discarding frames before the step's source time unseen — the run-up,
 //!   the shape vplay and the Player seek with. A continuing step decodes on.
-//! * [`Sources`] is the schedule's [`SourceIndex`]: its keyframe answer is the demuxer's own search
-//!   (`share()` + `seek_track` on a throwaway cursor). NLEPROBE (SR195) owes the pure keyframe-before; the swap is one fn.
+//! * [`Sources`] is the schedule's [`SourceIndex`]: its keyframe answer is NLEPROBE's pure [`Demuxer::keyframe_before`]
+//!   (the search `seek_track` shares; DEMUXWIRE, LEDGER SR213). A source opens by its own index when it has one
+//!   ([`Demuxer::open_indexed`]) and a Matroska video track gets decode times from its codec's reorder depth
+//!   ([`Demuxer::derive_dts`] through `dsp::video::reorder_depth`); [`Sources::open_report`] says how each reel opened.
 //! * Source time 0 is a stream's first presentation time (vplay's rule).
 //! * Transitions (NLE3, LEDGER SR202): a step carrying `vmix` decodes a second run (the outgoing source, which takes
 //!   over the live run it continues) through the same open-or-continue path ([`vid_frame`]) and mixes the two: a
@@ -37,11 +39,12 @@
 //! test-pattern video (frame ordinals from `base`) plus 16-bit PCM whose every sample names its source and index.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use gneiss_pal::dsp::audio::resample;
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
-use gneiss_pal::dsp::demux::{Demuxer, TrackKind, build};
-use gneiss_pal::dsp::video::{Frame, VideoDecoder, decoder_for};
+use gneiss_pal::dsp::demux::{DecodeTime, Demuxer, TrackKind, build};
+use gneiss_pal::dsp::video::{Frame, VideoDecoder, decoder_for, reorder_depth};
 use timeline_core::schedule::{AudioRun, Layer, ScheduleError, audio_runs, schedule};
 use timeline_core::{Kind, SourceId, SourceIndex, Timebase, Timeline};
 
@@ -114,10 +117,25 @@ struct Media {
 }
 
 impl Media {
+    /// DEMUXWIRE (SR213): the editor's open — by the file's own index when it has one (an index open that declares no
+    /// duration opens whole: the schedule bounds clips by it), then decode times from the codec's reorder depth; an
+    /// indexed reel loads its first span so the origin (and the audio `Timing`) read real samples.
     fn open(bytes: Vec<u8>) -> Result<Media, RenderError> {
-        let demux = Demuxer::open(bytes).map_err(|e| RenderError::Demux(e.to_string()))?;
+        let err = |e: gneiss_pal::dsp::demux::Error| RenderError::Demux(e.to_string());
+        let mut demux = Demuxer::open_indexed(bytes).map_err(err)?;
+        if demux.indexed() && demux.duration_ns() == 0 {
+            let data = demux.bytes();
+            drop(demux);
+            demux = Demuxer::open(Arc::try_unwrap(data).unwrap_or_else(|a| (*a).clone())).map_err(err)?;
+        }
+        demux.derive_dts(reorder_depth);
         let find = |k: TrackKind| demux.tracks().iter().position(|t| t.kind == k);
         let (video, audio) = (find(TrackKind::Video), find(TrackKind::Audio));
+        if demux.indexed() {
+            if let Some(i) = video.or(audio) {
+                demux.load_at(i, i64::MIN).map_err(err)?;
+            }
+        }
         let origin = |i: Option<usize>| {
             i.map(|i| {
                 let tb = demux.tracks()[i].timebase;
@@ -162,6 +180,36 @@ impl Sources {
     fn get(&self, id: SourceId) -> Result<&Media, RenderError> {
         self.media.iter().find(|(s, _)| *s == id).map(|(_, m)| m).ok_or(RenderError::NoSource(id))
     }
+    /// DEMUXWIRE (SR213): how source `id` opened — its video stream's (else its audio stream's) survey facts.
+    pub fn open_report(&self, id: SourceId) -> Option<OpenReport> {
+        let m = self.get(id).ok()?;
+        let i = m.video.or(m.audio)?;
+        let s = m.demux.survey().streams.into_iter().nth(i)?;
+        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len() })
+    }
+}
+
+/// DEMUXWIRE (SR213): one reel's open, as `nle schedule` prints it:
+/// `open=<full|indexed> dts=<stored|derived:n|presentation> edits=<n>`. Only the first media edit is applied (as
+/// playback does); `edits` counts every `elst` entry (DEMUXSEEK-EDITMAP owes the rest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenReport {
+    pub indexed: bool,
+    pub decode_time: DecodeTime,
+    pub edits: usize,
+}
+
+impl std::fmt::Display for OpenReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let open = if self.indexed { "indexed" } else { "full" };
+        write!(f, "open={open} dts=")?;
+        match self.decode_time {
+            DecodeTime::Stored => write!(f, "stored")?,
+            DecodeTime::Derived(d) => write!(f, "derived:{d}")?,
+            DecodeTime::Presentation => write!(f, "presentation")?,
+        }
+        write!(f, " edits={}", self.edits)
+    }
 }
 
 impl SourceIndex for Sources {
@@ -174,9 +222,17 @@ impl SourceIndex for Sources {
     fn keyframe_ns(&self, src: SourceId, kind: Kind, t_ns: i64) -> Option<i64> {
         let m = self.get(src).ok()?;
         let (i, origin) = m.stream(kind)?;
-        // NLEPROBE (SR195) owes a pure keyframe-before; until then the demuxer's own search on a throwaway cursor.
-        let mut cursor = m.demux.share();
-        cursor.seek_track(i, origin + t_ns).map(|k| k - origin)
+        // DEMUXWIRE (SR213): NLEPROBE's keyframe-before (the search seek_track shares); an indexed reel's window may not
+        // hold t, so the span holding it is read into a share first.
+        let t = origin + t_ns;
+        let key = if m.demux.indexed() {
+            let mut c = m.demux.share();
+            c.load_at(i, t).ok()?;
+            c.keyframe_before(i, t)
+        } else {
+            m.demux.keyframe_before(i, t)
+        };
+        key.map(|(_, p)| p - origin)
     }
 }
 

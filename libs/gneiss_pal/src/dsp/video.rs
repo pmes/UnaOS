@@ -121,6 +121,21 @@ pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> 
     }
 }
 
+/// DEMUXWIRE (LEDGER SR213): the reorder depth of a video track, read by its codec core from the track's decoder
+/// configuration — what `Demuxer::derive_dts` takes to give a Matroska track decode times (demux_core links no decoder).
+/// H.264 → `h264_core::ps::avcc_reorder_depth` (avcC); AV1 → `av1_core::image::av1c_reorder_depth` (av1C) when the `av1`
+/// feature is on. Anything else → `None`: VP9 (exact: a superframe is presented in decode order) and HEVC (no core reads
+/// hvcC yet, DEMUXSEEK-HEVCDTS) stay `DecodeTime::Presentation`. The one dispatch both of Stria's opens (the editor's and
+/// the Player's) pass by name.
+pub fn reorder_depth(track: &Track) -> Option<u32> {
+    match &track.codec {
+        Codec::Avc => h264_core::ps::avcc_reorder_depth(&track.config),
+        #[cfg(feature = "av1")]
+        Codec::Av1 => av1_core::image::av1c_reorder_depth(&track.config),
+        _ => None,
+    }
+}
+
 #[cfg(feature = "av1")]
 pub mod av1;
 pub mod vp8;

@@ -11,8 +11,10 @@
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! ```
 //!
-//! `schedule` prints one line per step (`timeline_core::schedule`). `render` writes `<stem>.rgba` (every output frame,
-//! `w*h*4` bytes each, in order) and `<stem>.f32` (interleaved little-endian f32 PCM), then one JSON line: frames, size,
+//! `schedule` prints one line per reel (`reel=<r> open=<full|indexed> dts=<stored|derived:n|presentation> edits=<n>`,
+//! `stria::nle::Sources::open_report`; DEMUXWIRE SR213), then one line per step (`timeline_core::schedule`).
+//! `render` writes `<stem>.rgba` (every output frame, `w*h*4` bytes each, in order) and `<stem>.f32`
+//! (interleaved little-endian f32 PCM), then one JSON line: frames, size,
 //! PCM frames, rate, channels, seeks, run-up frames and the FNV-1a 64 of the RGBA stream. `--fps` is the frame rate when
 //! the EDL carries no `* UNA FPS` line (default 25). `--make-src` writes `stria::nle::synth_source` (utp1 + PCM16).
 //! `export` (NLE5, SR204) drives `stria::nle_export::export` into `<dir>` (created): `%06d.png` per frame or
@@ -111,6 +113,11 @@ fn main() {
     match verb.as_str() {
         "schedule" => {
             let steps = schedule(&tl, range, &sources).unwrap_or_else(|e| die(e.to_string()));
+            for s in &tl.sources {
+                if let Some(r) = sources.open_report(s.id) {
+                    println!("reel={} {r}", s.reel);
+                }
+            }
             for s in steps {
                 let kind = if s.kind == Kind::Video { "V" } else { "A" };
                 let track = s.track.and_then(|t| tl.track_number(t)).map(|n| format!("{kind}{n}")).unwrap_or_else(|| "-".into());
