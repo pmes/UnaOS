@@ -170,59 +170,20 @@ impl Dpb {
         self.pics.iter().position(|d| d.is_ref() && d.pic.poc == poc)
     }
 
-    /// 8.3.4: RefPicList0 (and RefPicList1 for a B slice) of slice `sh` from the picture's set `rps`. HEVCREXTSCC
-    /// (SR357): with `rps.curr` the current picture closes every round of RefPicListTemp0 / 1 (8-8, 8-10) as a long-term
-    /// picture ([`CUR_PIC`]), and 8-9 puts it in the last entry of an unmodified RefPicList0 when the list is shorter
-    /// than NumRpsCurrTempList0.
+    /// 8.3.4: RefPicList0 (and RefPicList1 for a B slice) of slice `sh` from the picture's set `rps`: the entries of
+    /// [`list_entries`] mapped to their DPB pictures (the current picture to [`CUR_PIC`]).
     pub fn ref_lists(&self, rps: &Rps, sh: &SliceHeader) -> Result<[RefList; 2]> {
-        let total = rps.st_curr_before.len() + rps.st_curr_after.len() + rps.lt_curr.len() + rps.curr.is_some() as usize;
-        if total == 0 {
-            return Err(Error::Invalid("NumPicTotalCurr is 0 in a P or B slice"));
-        }
-        let build = |first: &[i32], second: &[i32], active: u32, entries: &Option<Vec<u32>>, list0: bool| -> Result<RefList> {
-            let n = (active as usize).max(total);
-            // (PicOrderCntVal, long-term, the current picture)
-            let mut temp: Vec<(i32, bool, bool)> = Vec::with_capacity(n + 1);
-            while temp.len() < n {
-                for &p in first.iter().chain(second.iter()) {
-                    if temp.len() < n {
-                        temp.push((p, false, false));
-                    }
-                }
-                for &p in rps.lt_curr.iter() {
-                    if temp.len() < n {
-                        temp.push((p, true, false));
-                    }
-                }
-                if let Some(c) = rps.curr {
-                    temp.push((c, true, true));
-                }
-            }
+        let map = |entries: Vec<(i32, bool, bool)>| -> Result<RefList> {
             let mut l = RefList::default();
-            for r in 0..active as usize {
-                let e = match entries {
-                    Some(v) => *v.get(r).ok_or(Error::Invalid("list_entry"))? as usize,
-                    None => r,
-                };
-                let &(p, lt, cur) = temp.get(e).ok_or(Error::Invalid("list_entry beyond the reference picture set"))?;
+            for (p, lt, cur) in entries {
                 l.dpb.push(if cur { CUR_PIC } else { self.ref_index(p).ok_or(Error::Invalid("reference picture set names a missing picture (8.3.2)"))? });
                 l.poc.push(p);
                 l.long_term.push(lt);
             }
-            // 8-9 (HEVCREXTSCC): NumRpsCurrTempList0 > num_ref_idx_l0_active_minus1 + 1 without list_entry_l0.
-            if let (true, Some(c), None, true, Some(last)) = (list0, rps.curr, entries, total > active as usize, (active as usize).checked_sub(1)) {
-                l.dpb[last] = CUR_PIC;
-                l.poc[last] = c;
-                l.long_term[last] = true;
-            }
             Ok(l)
         };
-        let l0 = build(&rps.st_curr_before, &rps.st_curr_after, sh.num_ref_idx_l0_active, &sh.list_entry_l0, true)?;
-        let l1 = if sh.slice_type == SliceType::B {
-            build(&rps.st_curr_after, &rps.st_curr_before, sh.num_ref_idx_l1_active, &sh.list_entry_l1, false)?
-        } else {
-            RefList::default()
-        };
+        let l0 = map(list_entries(rps, sh, true)?)?;
+        let l1 = if sh.slice_type == SliceType::B { map(list_entries(rps, sh, false)?)? } else { RefList::default() };
         Ok([l0, l1])
     }
 
@@ -260,6 +221,8 @@ impl Dpb {
 
     /// C.5.2.2 before a picture that is not an IRAP with NoRaslOutputFlag 1 (after its RPS is applied): remove what is
     /// neither waiting nor referenced, then bump while too many pictures wait, one waited too long, or the DPB is full.
+    /// HEVCSCCTAIL (SR365, HEVCREXT-SCC-DPB): a picture with pps_curr_pic_ref_enabled_flag holds a slot of its own while it
+    /// is decoded (A.4.2's maxDpbPicBuf 7), so the decoder passes `max_dec` less that slot.
     pub fn make_room(&mut self, reorder: u32, latency: u32, max_dec: u32, out: &mut VecDeque<Frame>) {
         self.prune();
         while self.over(reorder, latency) || (!self.pics.is_empty() && self.pics.len() as u32 >= max_dec) {
@@ -294,4 +257,53 @@ impl Rps {
         self.curr = on.then_some(poc);
         self
     }
+}
+
+/// 8.3.4: the entries of RefPicList0 (`list0`) or RefPicList1 of slice `sh` from the set `rps`, as (PicOrderCntVal,
+/// long-term, the current picture) per reference index: RefPicListTemp0 / 1 (8-8, 8-10) and list_entry. HEVCREXTSCC
+/// (SR357): with `rps.curr` the current picture closes every round of the temp list as a long-term picture, and 8-9
+/// puts it in the last entry of an unmodified RefPicList0 when the list is shorter than NumRpsCurrTempList0.
+/// HEVCSCCTAIL (SR365): the ONE list builder — [`Dpb::ref_lists`] maps its POCs to pictures, and the slice header's
+/// pred_weight_table reads only its current-picture flags (7.3.6.3 skips their weights).
+pub fn list_entries(rps: &Rps, sh: &SliceHeader, list0: bool) -> Result<Vec<(i32, bool, bool)>> {
+    let total = rps.st_curr_before.len() + rps.st_curr_after.len() + rps.lt_curr.len() + rps.curr.is_some() as usize;
+    if total == 0 {
+        return Err(Error::Invalid("NumPicTotalCurr is 0 in a P or B slice"));
+    }
+    let (first, second, active, entries) = if list0 {
+        (&rps.st_curr_before, &rps.st_curr_after, sh.num_ref_idx_l0_active, &sh.list_entry_l0)
+    } else {
+        (&rps.st_curr_after, &rps.st_curr_before, sh.num_ref_idx_l1_active, &sh.list_entry_l1)
+    };
+    let n = (active as usize).max(total);
+    // (PicOrderCntVal, long-term, the current picture)
+    let mut temp: Vec<(i32, bool, bool)> = Vec::with_capacity(n + 1);
+    while temp.len() < n {
+        for &p in first.iter().chain(second.iter()) {
+            if temp.len() < n {
+                temp.push((p, false, false));
+            }
+        }
+        for &p in rps.lt_curr.iter() {
+            if temp.len() < n {
+                temp.push((p, true, false));
+            }
+        }
+        if let Some(c) = rps.curr {
+            temp.push((c, true, true));
+        }
+    }
+    let mut l = Vec::with_capacity(active as usize);
+    for r in 0..active as usize {
+        let e = match entries {
+            Some(v) => *v.get(r).ok_or(Error::Invalid("list_entry"))? as usize,
+            None => r,
+        };
+        l.push(*temp.get(e).ok_or(Error::Invalid("list_entry beyond the reference picture set"))?);
+    }
+    // 8-9 (HEVCREXTSCC): NumRpsCurrTempList0 > num_ref_idx_l0_active_minus1 + 1 without list_entry_l0.
+    if let (true, Some(c), None, true, Some(last)) = (list0, rps.curr, entries, total > active as usize, (active as usize).checked_sub(1)) {
+        l[last] = (c, true, true);
+    }
+    Ok(l)
 }

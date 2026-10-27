@@ -58,6 +58,8 @@ pub struct Decoder {
     lists_log: Vec<[RefList; 2]>,
     /// HEVCCONF (SR321): (PicOrderCntVal, verdict) of every picture that carried a decoded picture hash.
     hashes: Vec<(i32, HashCheck)>,
+    /// HEVCSCCTAIL (SR365): refuse an SPS / PPS above its level by name ([`Decoder::set_strict_levels`]).
+    strict_levels: bool,
     out: VecDeque<Frame>,
     tag: i64,
     nal_length_size: usize,
@@ -126,6 +128,7 @@ impl Decoder {
             dpb: Dpb::default(),
             lists_log: Vec::new(),
             hashes: Vec::new(),
+            strict_levels: false,
             out: VecDeque::new(),
             tag: 0,
             nal_length_size: 4,
@@ -247,6 +250,14 @@ impl Decoder {
         core::mem::take(&mut self.hashes)
     }
 
+    /// HEVCSCCTAIL (SR365, HEVCREXT-SCC-LEVELS): when on, every picture's SPS / PPS is checked against the level its
+    /// profile_tier_level signals ([`crate::level::check_level`], A.4) and a picture above it is refused by name. Off by
+    /// default (streams in the wild violate their levels); the conformance walker turns it on. Kept across
+    /// [`Decoder::reset`].
+    pub fn set_strict_levels(&mut self, on: bool) {
+        self.strict_levels = on;
+    }
+
     /// Decode one NAL unit (two header bytes first, no start code or length prefix).
     pub fn decode_nal(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
@@ -297,10 +308,13 @@ impl Decoder {
                 Ok(())
             }
             // HEVCCONF (SR321): the decoded picture hash of the picture under decoding; SEI is non-normative, so a
-            // malformed message is dropped, never an error.
+            // malformed message is dropped, never an error. HEVCSCCTAIL (SR365, HEVCREXT-MONOHASH): D.2.19 carries one
+            // component at chroma_format_idc 0, three otherwise.
             SUFFIX_SEI_NUT => {
-                if let (Some(cur), Ok(Some(h))) = (self.cur.as_mut(), sei::picture_hash(rbsp)) {
-                    cur.hash = Some(h);
+                if let Some(cur) = self.cur.as_mut() {
+                    if let Ok(Some(h)) = sei::picture_hash_n(rbsp, if cur.sps.chroma_format_idc == 0 { 1 } else { 3 }) {
+                        cur.hash = Some(h);
+                    }
                 }
                 Ok(())
             }
@@ -326,6 +340,9 @@ impl Decoder {
             let sps = self.sps.get(pps.sps_id as usize).cloned().flatten().ok_or(Error::Invalid("PPS references a missing SPS"))?;
             let sh = parse_slice_header(rbsp, nal, &sps, &pps, None)?;
             let poc = self.picture_order(nal, &sh, &sps);
+            if self.strict_levels {
+                crate::level::check_level(&sps, &pps)?;
+            }
             if sh.slice_type != SliceType::I && pps.constrained_intra_pred_flag {
                 return Err(Error::Unsupported("constrained intra prediction in inter slices (HEVCINTER-CIP)"));
             }
@@ -425,7 +442,9 @@ impl Decoder {
         // 8.3.2 (an IRAP with NoRaslOutputFlag 1 marks every picture unused), then C.5.2.2: make room in the DPB.
         let rps = self.dpb.apply_rps(sh, &sps, poc, nal.is_irap() && self.skip_rasl)?.with_curr(pps.scc.curr_pic_ref_enabled_flag, poc);
         let (reorder, latency, max_dec) = self.bump;
-        self.dpb.make_room(reorder, latency, max_dec, &mut self.out);
+        // HEVCSCCTAIL (SR365, HEVCREXT-SCC-DPB; SPEC-CHECK): C.5.2.2 with the current picture's own slot when it is a
+        // reference of its own slices (pps_curr_pic_ref_enabled_flag).
+        self.dpb.make_room(reorder, latency, max_dec.saturating_sub(pps.scc.curr_pic_ref_enabled_flag as u32), &mut self.out);
         self.lists_log.clear();
         self.cur = Some(CurPic { pic, sps, pps, geo, store: Storage::default(), indep: None, rps, lists: Default::default(), hash: None });
         Ok(())

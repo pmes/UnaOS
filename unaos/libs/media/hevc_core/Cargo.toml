@@ -15,3 +15,9 @@ h264_core = { path = "../h264_core" }
 default = []
 # `std` only adds `std::error::Error` for `Error`.
 std = ["h264_core/std"]
+
+# HEVCSCCTAIL (LEDGER SR365, HEVCCONF-MD5): the conformance walker hashes the decoded YUV through crypto_core's MD5
+# (no_std, zero dependencies) instead of spawning the host's md5sum. A DEV-dependency only: the core's one runtime dep
+# stays h264_core.
+[dev-dependencies]
+crypto_core = { path = "../../sys/crypto_core" }

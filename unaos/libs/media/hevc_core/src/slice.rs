@@ -141,16 +141,19 @@ pub fn peek_pps_id(rbsp: &[u8], nal: &NalHeader) -> Result<u32> {
     Ok(id)
 }
 
-fn pred_weight_list(r: &mut BitReader, n: u32, chroma: bool, luma_denom: u32, chroma_denom: u32) -> Result<WeightList> {
+/// One list of pred_weight_table (7.3.6.3). HEVCSCCTAIL (SR365, HEVCREXT-SCC-WP): the flags of an entry `skip` marks (the
+/// current picture) are not present and infer 0 (7.4.7.3: LumaWeight 2^denom, offset 0).
+fn pred_weight_list(r: &mut BitReader, n: u32, chroma: bool, luma_denom: u32, chroma_denom: u32, skip: &[bool]) -> Result<WeightList> {
     let n = n as usize;
+    let present = |i: usize| !skip.get(i).copied().unwrap_or(false);
     let mut lf = Vec::with_capacity(n);
-    for _ in 0..n {
-        lf.push(r.flag());
+    for i in 0..n {
+        lf.push(present(i) && r.flag());
     }
     let mut cf = alloc::vec![false; n];
     if chroma {
-        for f in cf.iter_mut() {
-            *f = r.flag();
+        for (i, f) in cf.iter_mut().enumerate() {
+            *f = present(i) && r.flag();
         }
     }
     let mut w = WeightList::default();
@@ -311,10 +314,8 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
                 }
             }
             if (pps.weighted_pred_flag && h.slice_type == SliceType::P) || (pps.weighted_bipred_flag && h.slice_type == SliceType::B) {
-                // HEVCREXTSCC (SR357): 7.3.6.3 skips the weight flags of current-picture entries (HEVCREXT-SCC-WP).
-                if pps.scc.curr_pic_ref_enabled_flag {
-                    return Err(Error::Unsupported("weighted prediction with the current picture as a reference (HEVCREXT-SCC)"));
-                }
+                // HEVCSCCTAIL (SR365, HEVCREXT-SCC-WP): 7.3.6.3 skips the weight flags of current-picture entries.
+                let skip = if pps.scc.curr_pic_ref_enabled_flag { curr_entries(&h, sps)? } else { Default::default() };
                 let chroma = sps.chroma_array_type() != 0;
                 let ld = r.ue();
                 if ld > 7 {
@@ -325,9 +326,9 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
                     return Err(Error::Invalid("delta_chroma_log2_weight_denom"));
                 }
                 let mut w = PredWeights { luma_log2_weight_denom: ld, chroma_log2_weight_denom: cd as u32, ..Default::default() };
-                w.l0 = pred_weight_list(&mut r, h.num_ref_idx_l0_active, chroma, ld, cd as u32)?;
+                w.l0 = pred_weight_list(&mut r, h.num_ref_idx_l0_active, chroma, ld, cd as u32, &skip[0])?;
                 if h.slice_type == SliceType::B {
-                    w.l1 = pred_weight_list(&mut r, h.num_ref_idx_l1_active, chroma, ld, cd as u32)?;
+                    w.l1 = pred_weight_list(&mut r, h.num_ref_idx_l1_active, chroma, ld, cd as u32, &skip[1])?;
                 }
                 h.pred_weights = Some(w);
             }
@@ -426,4 +427,19 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
     }
     h.data_offset = r.pos() / 8;
     Ok(h)
+}
+
+/// HEVCSCCTAIL (SR365, HEVCREXT-SCC-WP): which entries of RefPicList0 / RefPicList1 of the slice `h` (header parsed up to
+/// pred_weight_table) are the current picture (PicOrderCnt(RefPicListX[i]) == PicOrderCnt(CurrPic), 7.3.6.3), from the
+/// ONE list builder [`crate::dpb::list_entries`] over the header's own set: only the entries' current-picture flags are
+/// read, so the POCs are relative to 0 and the long-term ones placeholders.
+fn curr_entries(h: &SliceHeader, sps: &Sps) -> Result<[Vec<bool>; 2]> {
+    let mut rps = crate::dpb::Rps { curr: Some(0), ..Default::default() };
+    if let Some(st) = h.rps(sps) {
+        rps.st_curr_before = st.delta_poc_s0.iter().zip(st.used_s0.iter()).filter(|(_, u)| **u).map(|(d, _)| *d).collect();
+        rps.st_curr_after = st.delta_poc_s1.iter().zip(st.used_s1.iter()).filter(|(_, u)| **u).map(|(d, _)| *d).collect();
+    }
+    rps.lt_curr = h.long_term.iter().filter(|l| l.used).map(|_| 0).collect();
+    let mask = |list0: bool| -> Result<Vec<bool>> { Ok(crate::dpb::list_entries(&rps, h, list0)?.iter().map(|e| e.2).collect()) };
+    Ok([mask(true)?, if h.slice_type == SliceType::B { mask(false)? } else { Vec::new() }])
 }
