@@ -421,8 +421,26 @@ fn output_planes(seq: &SequenceHeader, hdr: &FrameHeader, lr: &[crate::decode::P
 pub fn decode_avif_planes(file: &[u8], filters: Filters) -> Result<Planes> {
     let item = avif_payload(file)?;
     let cfg = item.av1c.as_ref().map(|c| c.config_obus.as_slice()).unwrap_or(&[]);
-    let mut p = decode_obus(&item.data, cfg, filters)?;
-    if item.width != 0 && (item.width != p.width || item.height != p.height) {
+    let ispe = (item.width != 0).then_some((item.width, item.height));
+    let nclx = item.nclx.map(|n| (n.colour_primaries, n.transfer_characteristics, n.matrix_coefficients, n.full_range));
+    decode_item_planes(&item.data, cfg, ispe, nclx, filters)
+}
+
+/// HEIFONE (LEDGER SR303): decode one `av01` image item's bytes (a low-overhead OBU stream) to planes, whatever read the
+/// container (this crate's [`crate::avif`] walk, or demux_core's HEIF reader on the host). `config_obus` are the av1C
+/// record's configOBUs; `ispe` the item's spatial extents — when the first shown frame is not that size the item is a
+/// layered image and the last shown frame of the `ispe` size is presented; `nclx` the container's `colr` (primaries,
+/// transfer, matrix, full range), which is authoritative for presentation (AVIF §2.2.1).
+pub fn decode_item_planes(
+    data: &[u8],
+    config_obus: &[u8],
+    ispe: Option<(u32, u32)>,
+    nclx: Option<(u16, u16, u16, bool)>,
+    filters: Filters,
+) -> Result<Planes> {
+    let cfg = config_obus;
+    let mut p = decode_obus(data, cfg, filters)?;
+    if let Some((iw, ih)) = ispe.filter(|&(iw, ih)| iw != p.width || ih != p.height) {
         // A layered image (a1lx / a1op / lsel): the item holds several frames, the upper spatial
         // layers predicted from the lower ones. Decode them all (operating point 0) and present the
         // highest layer — the last shown frame at the image's own size (ispe).
@@ -435,19 +453,19 @@ pub fn decode_avif_planes(file: &[u8], filters: Filters) -> Result<Planes> {
                 }
             }
         }
-        let frames = d.decode(&item.data, false)?;
+        let frames = d.decode(data, false)?;
         p = frames
             .into_iter()
-            .filter(|f| f.width == item.width && f.height == item.height)
+            .filter(|f| f.width == iw && f.height == ih)
             .next_back()
             .ok_or(Error::Unsupported("no layer of the image's size (ispe)"))?;
     }
-    if let Some(n) = item.nclx {
+    if let Some((primaries, transfer, matrix, full_range)) = nclx {
         // The container's nclx box is authoritative for presentation (AVIF §2.2.1).
-        p.color_primaries = n.colour_primaries as u8;
-        p.transfer_characteristics = n.transfer_characteristics as u8;
-        p.matrix_coefficients = n.matrix_coefficients as u8;
-        p.full_range = n.full_range;
+        p.color_primaries = primaries as u8;
+        p.transfer_characteristics = transfer as u8;
+        p.matrix_coefficients = matrix as u8;
+        p.full_range = full_range;
     }
     Ok(p)
 }

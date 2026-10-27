@@ -17,12 +17,14 @@
 //! What pixel_core does not decode is REFUSED, by name, never silently handed to something else: a
 //! container it recognises but cannot read (lossy WebP until VP8CORE, SR40) answers
 //! [`SourceError::Decode`] carrying the format and pixel_core's reason; a container no UnaOS decoder
-//! recognises yet (TIFF, ICO, AVIF, HEIF sequences, JPEG XL, ...) answers [`SourceError::Foreign`] naming it
+//! recognises yet (TIFF, ICO, AVIF and HEIF sequences, JPEG XL, ...) answers [`SourceError::Foreign`] naming it
 //! ([`unrecognised`]).
 //!
 //! HEVCHEIC (SR220): an HEIC still ([`Format::Heic`]: `ftyp` heic / heix, or mif1 without AVIF) is the one container
-//! pixel_core does not own: it decodes through `gneiss_pal::dsp::image::decode_heic` (demux_core's HEIF reader +
+//! pixel_core does not own: it decodes through `gneiss_pal::dsp::image::decode_heif` (demux_core's HEIF reader +
 //! hevc_core, 8-bit intra; 10-bit refuses by name until HEVCMAIN10), and its refusals name `heic` the same way.
+//! HEIFONE (SR303): an AVIF still ([`Format::Avif`]: `ftyp` avif) decodes through the same `decode_heif` (demux_core's
+//! HEIF reader + av1_core), grids included; its refusals name `avif`.
 
 /// The formats [`ImageSource::sniff`] recognises (PIXELCORE's `Format`, same variants, same order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +40,8 @@ pub enum Format {
     Svg,
     /// HEVCHEIC (SR220): an HEIF still holding HEVC images (not a pixel_core format: [`sniff`] adds it).
     Heic,
+    /// HEIFONE (SR303): an AVIF still (an HEIF still holding AV1 images; not a pixel_core format: [`sniff`] adds it).
+    Avif,
 }
 
 impl Format {
@@ -52,6 +56,7 @@ impl Format {
             Format::WebP => "webp",
             Format::Svg => "svg",
             Format::Heic => "heic",
+            Format::Avif => "avif",
         }
     }
 }
@@ -72,9 +77,13 @@ impl From<pixel_core::Format> for Format {
 }
 
 /// Identify a format by its magic bytes — PIXELCORE's own `sniff`, so Facet and its decoder can never
-/// disagree on what a file IS; then demux_core's HEIC brand test (HEVCHEIC, SR220).
+/// disagree on what a file IS; then demux_core's HEIC and AVIF brand tests (HEVCHEIC SR220, HEIFONE SR303).
 pub fn sniff(bytes: &[u8]) -> Option<Format> {
-    pixel_core::sniff(bytes).map(Format::from).or_else(|| gneiss_pal::dsp::image::is_heic(bytes).then_some(Format::Heic))
+    use gneiss_pal::dsp::image::{is_avif, is_heic};
+    pixel_core::sniff(bytes)
+        .map(Format::from)
+        .or_else(|| is_heic(bytes).then_some(Format::Heic))
+        .or_else(|| is_avif(bytes).then_some(Format::Avif))
 }
 
 /// The name of a well-known image container that [`sniff`] does NOT accept, from its magic bytes —
@@ -218,7 +227,7 @@ impl ImageSource for PixelCoreSource {
 
     fn decode(&self, bytes: &[u8]) -> Result<Decoded, SourceError> {
         let format = self.sniff(bytes).ok_or_else(|| unrecognised(bytes))?.name();
-        let decoded = if format == "heic" { gneiss_pal::dsp::image::decode_heic(bytes) } else { pixel_core::decode(bytes) };
+        let decoded = if format == "heic" || format == "avif" { gneiss_pal::dsp::image::decode_heif(bytes) } else { pixel_core::decode(bytes) };
         decoded.map(Decoded::from).map_err(|e| match e {
             pixel_core::Error::UnknownFormat => unrecognised(bytes),
             pixel_core::Error::TooLarge => SourceError::TooLarge { format },
@@ -233,8 +242,10 @@ mod tests {
 
     #[test]
     fn foreign_containers_are_named() {
-        let mut avif = vec![0, 0, 0, 0x1C];
-        avif.extend(b"ftypavif\0\0\0\0avifmif1miaf");
+        // HEIFONE (SR303): an AVIF still is Facet's own now (avif_stills_decode_through_heif); an AVIF image SEQUENCE
+        // (avis without the avif brand) stays foreign.
+        let mut avif = vec![0, 0, 0, 0x18];
+        avif.extend(b"ftypavis\0\0\0\0avismsf1");
         // HEVCHEIC (SR220): a heic still is Facet's own now (heic_is_sniffed_and_refusals_name_heic); an HEIF image
         // SEQUENCE stays foreign.
         let mut heis = vec![0, 0, 0, 0x18];
@@ -340,12 +351,12 @@ mod tests {
 
     #[test]
     fn heic_stills_decode_through_hevc_core() {
-        use gneiss_pal::dsp::image::{decode_heic, heic_kat};
+        use gneiss_pal::dsp::image::{decode_heif, heic_kat};
         let mut f = crate::Facet::new();
         for (bytes, w, h) in [(heic_kat::flat_heic(), 64, 48), (heic_kat::pcm_heic(), 64, 48), (heic_kat::grid_2x2_heic(), 120, 90)] {
             let d = PixelCoreSource.decode(&bytes).unwrap();
             assert_eq!((d.width, d.height, d.frames.is_none(), d.loop_count, d.orientation), (w, h, true, None, 1));
-            assert_eq!(d.rgba, decode_heic(&bytes).unwrap().rgba);
+            assert_eq!(d.rgba, decode_heif(&bytes).unwrap().rgba);
             let (_, info) = f.open_bytes("kat.heic", &bytes).unwrap();
             assert_eq!((info.format.as_str(), info.width, info.height), ("heic", w, h));
         }
@@ -363,5 +374,26 @@ mod tests {
             assert_eq!(at(&grid, 64 + x, 48 + y.min(41)), at(&flat, x, y.min(41)));
         }
         assert_ne!(at(&pcm, 0, 0), at(&pcm, 31, 0), "the PCM block is a gradient, not flat");
+    }
+
+    #[test]
+    fn avif_stills_decode_through_heif() {
+        use gneiss_pal::dsp::image::{avif_kat, decode_heif};
+        let mut f = crate::Facet::new();
+        for (bytes, w, h) in [(avif_kat::white_avif(), 1, 1), (avif_kat::pixi_avif(), 4, 4), (avif_kat::grid_2x2_avif(), 7, 6)] {
+            assert_eq!(sniff(&bytes), Some(Format::Avif));
+            let d = PixelCoreSource.decode(&bytes).unwrap();
+            assert_eq!((d.width, d.height, d.frames.is_none(), d.loop_count, d.orientation), (w, h, true, None, 1));
+            assert_eq!(d.rgba, decode_heif(&bytes).unwrap().rgba);
+            let (_, info) = f.open_bytes("kat.avif", &bytes).unwrap();
+            assert_eq!((info.format.as_str(), info.width, info.height), ("avif", w, h));
+        }
+        // An AVIF ftyp and nothing else: no meta box, refused by name as avif (no longer Foreign).
+        let mut avif = vec![0, 0, 0, 0x1C];
+        avif.extend(b"ftypavif\0\0\0\0avifmif1miaf");
+        assert_eq!(foreign_format(&avif), Some("avif"), "the name table still knows the container");
+        let e = PixelCoreSource.decode(&avif).unwrap_err();
+        assert!(matches!(&e, SourceError::Decode { format: "avif", reason } if reason.contains("no meta")), "{e:?}");
+        assert!(e.to_string().starts_with("avif: "), "{e}");
     }
 }

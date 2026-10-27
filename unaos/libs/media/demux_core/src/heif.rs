@@ -16,6 +16,10 @@
 //! `irot`, `imir`, `clap`, `colr` (`nclx` read; `prof` / `rICC` noted); the `grid` derived item's `ImageGrid` body
 //! ([`parse_grid`]) with its tiles in `dimg` order.
 //!
+//! HEIFONE (LEDGER SR303): the same reader serves AVIF (AV1 Image File Format, the HEIF profile of AOMedia's AVIF
+//! v1.1): an `av01` item ([`ItemKind::Av01`]) with its `av1C` property kept raw and `pixi` (bits per channel); grids of
+//! `av01` tiles read as grids of `hvc1` tiles do. [`is_avif`] tells an AVIF still from HEIC.
+//!
 //! [`build`] is the minimal writer the KATs (here, in gneiss_pal's `dsp::image` and in Facet) make HEIF files with.
 
 use alloc::vec::Vec;
@@ -28,11 +32,13 @@ use crate::mp4::{BoxHeader, body, boxes, child, children, full};
 pub enum ItemKind {
     /// An HEVC-coded image (`hvc1`): its bytes are one length-prefixed access unit, its `hvcC` the parameter sets.
     Hvc1,
+    /// An AV1-coded image (`av01`, HEIFONE SR303): its bytes are a low-overhead AV1 OBU stream, its `av1C` the record.
+    Av01,
     /// A derived image grid (`grid`): its bytes are an `ImageGrid` ([`parse_grid`]), its tiles the `dimg` references.
     Grid,
     /// Exif metadata (`Exif`).
     Exif,
-    /// Any other item type (`av01`, `jpeg`, `iovl`, `mime`, ...), named by its four-character code.
+    /// Any other item type (`jpeg`, `iovl`, `mime`, ...), named by its four-character code.
     Other([u8; 4]),
 }
 
@@ -93,6 +99,10 @@ pub struct Item {
     pub kind: ItemKind,
     /// The `hvcC` property body (an HEVCDecoderConfigurationRecord), raw.
     pub hvcc: Option<Vec<u8>>,
+    /// The `av1C` property body (an AV1CodecConfigurationRecord), raw (HEIFONE SR303).
+    pub av1c: Option<Vec<u8>>,
+    /// `pixi`: bits per channel, one entry per channel.
+    pub pixi: Option<Vec<u8>>,
     /// `ispe` (width, height).
     pub ispe: Option<(u32, u32)>,
     pub nclx: Option<Nclx>,
@@ -171,6 +181,12 @@ pub fn brands(bytes: &[u8]) -> Option<Vec<[u8; 4]>> {
     Some(out)
 }
 
+/// An AVIF still (HEIFONE SR303): brand `avif` among the major / compatible brands. An `avis` image sequence without
+/// the `avif` brand is not a still and answers `false`.
+pub fn is_avif(bytes: &[u8]) -> bool {
+    brands(bytes).is_some_and(|b| b.iter().any(|x| x == b"avif"))
+}
+
 /// An HEIF still that may hold HEVC images: brand `heic` or `heix`, or `mif1` without `avif` / `avis` (an AVIF file
 /// also carries `mif1`). Image sequences (`hevc`, `heis`, `msf1` alone) are not stills and answer `false`.
 pub fn is_heic(bytes: &[u8]) -> bool {
@@ -229,6 +245,7 @@ pub fn parse_heif(bytes: &[u8]) -> Result<Heif, Error> {
         r.skip(2)?; // item_protection_index
         let kind = match &r.fourcc()? {
             b"hvc1" => ItemKind::Hvc1,
+            b"av01" => ItemKind::Av01,
             b"grid" => ItemKind::Grid,
             b"Exif" => ItemKind::Exif,
             k => ItemKind::Other(*k),
@@ -237,6 +254,8 @@ pub fn parse_heif(bytes: &[u8]) -> Result<Heif, Error> {
             id: item_id,
             kind,
             hvcc: None,
+            av1c: None,
+            pixi: None,
             ispe: None,
             nclx: None,
             icc: false,
@@ -373,6 +392,16 @@ fn associate(bytes: &[u8], p: &BoxHeader, it: &mut Item) -> Result<(), Error> {
     let mut r = body(bytes, p);
     match &p.kind {
         b"hvcC" => it.hvcc = Some(bytes[p.body..p.end].to_vec()),
+        b"av1C" => it.av1c = Some(bytes[p.body..p.end].to_vec()),
+        b"pixi" => {
+            full(&mut r)?;
+            let n = r.u8()? as usize;
+            let mut bits = Vec::with_capacity(n);
+            for _ in 0..n {
+                bits.push(r.u8()?);
+            }
+            it.pixi = Some(bits);
+        }
         b"ispe" => {
             full(&mut r)?;
             it.ispe = Some((r.u32()?, r.u32()?));
@@ -423,7 +452,8 @@ pub fn parse_grid(data: &[u8]) -> Result<Grid, Error> {
 
 /// The minimal HEIF writer the KATs build files with: `ftyp` (heic, mif1), `meta` (`hdlr` pict, `pitm`, `iinf` with
 /// `infe` v2, `iref` `dimg`, `iprp` with one `ipco` entry per item property and `ipma` v0, `idat`, `iloc` v1 with
-/// 32-bit offsets and lengths), `mdat`. Items are numbered 1..=n in the order given.
+/// 32-bit offsets and lengths), `mdat`. Items are numbered 1..=n in the order given. [`build::avif`] writes the same
+/// file under the AVIF brands (`avif`, `mif1`, `miaf`).
 pub mod build {
     use alloc::vec::Vec;
 
@@ -472,6 +502,16 @@ pub mod build {
 
     pub fn hvcc(record: &[u8]) -> Vec<u8> {
         bx(b"hvcC", record)
+    }
+    /// `av1C` around an AV1CodecConfigurationRecord body.
+    pub fn av1c(record: &[u8]) -> Vec<u8> {
+        bx(b"av1C", record)
+    }
+    /// `pixi` with one bit depth per channel.
+    pub fn pixi(bits: &[u8]) -> Vec<u8> {
+        let mut b = alloc::vec![bits.len() as u8];
+        b.extend_from_slice(bits);
+        full_bx(b"pixi", 0, 0, &b)
     }
     pub fn ispe(w: u32, h: u32) -> Vec<u8> {
         let mut b = w.to_be_bytes().to_vec();
@@ -535,8 +575,16 @@ pub mod build {
 
     /// [`still`] with another `hdlr` handler type (a reader must refuse anything but `pict`).
     pub fn still_with_handler(primary: u32, items: &[ItemSpec], handler: &[u8; 4]) -> Vec<u8> {
-        let mut ftyp = b"heic\0\0\0\0mif1heic".to_vec();
-        ftyp = bx(b"ftyp", &ftyp);
+        file(b"heic\0\0\0\0mif1heic", primary, items, handler)
+    }
+
+    /// An AVIF still (HEIFONE SR303): [`still`] under the brands `avif` (major), `mif1`, `miaf`.
+    pub fn avif(primary: u32, items: &[ItemSpec]) -> Vec<u8> {
+        file(b"avif\0\0\0\0avifmif1miaf", primary, items, b"pict")
+    }
+
+    fn file(ftyp: &[u8], primary: u32, items: &[ItemSpec], handler: &[u8; 4]) -> Vec<u8> {
+        let ftyp = bx(b"ftyp", ftyp);
         let meta0 = meta(primary, items, handler, 0);
         let mdat_body = ftyp.len() + meta0.len() + 8;
         let meta = meta(primary, items, handler, mdat_body);
@@ -735,5 +783,34 @@ mod tests {
         assert!(!is_heic(&ftyp(b"isommp41")));
         assert!(!is_heic(b""));
         assert!(!is_heic(b"\0\0\0\x20ftypheic"), "ftyp claiming more than the file");
+        // HEIFONE (SR303): AVIF stills are told apart; an avis-only sequence is not a still.
+        assert!(is_avif(&ftyp(b"avifmif1miaf")));
+        assert!(is_avif(&ftyp(b"mif1avif")));
+        assert!(!is_avif(&ftyp(b"avismsf1")));
+        assert!(!is_avif(&ftyp(b"heicmif1heic")));
+        assert!(!is_avif(b""));
+    }
+
+    #[test]
+    fn an_av01_item_reads_back_with_av1c_and_pixi() {
+        let rec = [0x81, 0x20, 0x00, 0x00];
+        let item = ItemSpec {
+            kind: *b"av01",
+            data: b"\x12\x00OBU".to_vec(),
+            props: vec![ispe(1, 1), pixi(&[8, 8, 8]), av1c(&rec), nclx(1, 13, 6, true), irot(3)],
+            ..Default::default()
+        };
+        let f = avif(1, &[item]);
+        assert!(is_avif(&f) && !is_heic(&f));
+        let h = parse_heif(&f).unwrap();
+        assert_eq!(&h.brands[..], &[*b"avif", *b"avif", *b"mif1", *b"miaf"]);
+        let it = h.item(1).unwrap();
+        assert_eq!(it.kind, ItemKind::Av01);
+        assert_eq!(it.av1c.as_deref(), Some(&rec[..]));
+        assert_eq!(it.pixi.as_deref(), Some(&[8u8, 8, 8][..]));
+        assert_eq!((it.hvcc.as_deref(), it.ispe), (None, Some((1, 1))));
+        assert_eq!(it.nclx.map(|n| n.matrix_coefficients), Some(6));
+        assert_eq!(it.transforms, vec![Transform::Irot(3)]);
+        assert_eq!(h.data(&f, it).unwrap(), b"\x12\x00OBU");
     }
 }
