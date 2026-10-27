@@ -1,6 +1,6 @@
 # x86-zenbook.spec — THE ZENBOOK IMAGE LINE, BOOTED UNDER QEMU AS THE ZENBOOK. ZENBOOKLANE (zenbook-ledger Z13), 2026-10-27.
 #
-#   QEMU gate:  ./arroyo test-zenbook 180 -> target/serial.log   (ZENBOOKLANETYPED Z16: 180 s, the default)
+#   QEMU gate:  ./arroyo test-zenbook 200 -> target/serial.log   (ZENBOOKLANETYPED Z16: 180 s; ZENBOOKSPECPINS Z54: 200 s, the default)
 #               (= scripts/image-line-zenbook.env minus its [media] row, every inherited UNAOS_* unset first, plus
 #                UNAOS_PLATFORM=zenbook_um5606w UNAOS_CENSUS=1 UNAOS_USBSERIAL=1, on a fresh card; tests-at-boot OFF)
 #               ./arroyo mbench --replay target/serial.log --spec scripts/specs/x86-zenbook.spec --platform x86
@@ -9,8 +9,8 @@
 #          `test_x86_64` as X86_TEST_SPEC (its COMPLETE ends the wall, its REQUIREs are scored by `x86_test_completion`)
 #          and `x86_pick_capture_spec` replays it (the ZENBOOKLANE arm, asked before the SELFHOST skip).
 #          ZENBOOKLANETYPED (zenbook-ledger Z16): `zenbook_lane_typed` arms ONE typist (scripts/typist.sh, twoboot's) on the
-#          lane's QMP port: the first-user form, then `tests platform|ec|nvme|i8042|dwi2c|hdacensus|gopshot|eclid|bootlist`
-#          (ZENBOOKFLIGHTLIST Z33 added hdacensus, gopshot, eclid), one line each (`tests`
+#          lane's QMP port: the first-user form, then `tests platform|ec|nvme|i8042|dwi2c|hdacensus|gopshot|eclid|suspend|ecqnames|dwi2cacpi|bootlist`
+#          (ZENBOOKFLIGHTLIST Z33 added hdacensus, gopshot, eclid; ZENBOOKSPECPINS Z54 suspend, ecqnames, dwi2cacpi), one line each (`tests`
 #          runs ONE fixture per line), each held on the verdict before it; transcript target/zenbook-typist.log (beside).
 #
 # WHY. The Zenbook-only kernel arms answer `hw::platform()`, and q35's SMBIOS resolves `qemu`, so no QEMU leg reached them
@@ -78,6 +78,15 @@ REQUIRE :: NVME: ctrl=ok ns=1 rw=(ok|in-root) -> PASS :: root=(ok|skip) ::
 REQUIRE :: I8042: init=ready irq=(routed|polled) transport=ps2 table=ok .* -> PASS ::
 REQUIRE :: DWI2C: proto=ok cases=8/8 -> PASS ::
 REQUIRE :: BOOTLIST: probe entries=\d+ heavy=\d+ budget_skips=\d+ summary=ok -> PASS ::
+# ZENBOOKSPECPINS (zenbook-ledger Z54): the three verbs typed after eclid; SUSPEND has no FAIL arm (its SKIP is the no-FADT arm, never on q35); dwi2cacpi prints three verdicts
+REQUIRE :: SUSPEND: .* rung=none .* -> PASS ::
+FORBID :: SUSPEND: -> SKIP reason=no-fadt ::
+REQUIRE :: ECQNAMES: n=3 notify=LID0:0x80 fields=ok scope=ok refuse=3/3 -> PASS ::
+OPTIONAL \[ec\] qnames -> REFUSED why=no-ec
+REQUIRE :: DWI2CACPI: base=ok tp=ok speed=400000 desc=ok refuse=3/3 -> PASS ::
+REQUIRE :: DWI2CGPIO: .* refuse=2/2 -> PASS ::
+REQUIRE :: DWI2CFAST: fmcn=120/256/30 sscn=650/669/30 .* refuse=3/3 -> PASS ::
+FORBID :: (SUSPEND|ECQNAMES|DWI2CACPI|DWI2CGPIO|DWI2CFAST): .*-> FAIL
 FORBID :: (PLATFORM|EC|NVME|I8042|DWI2C|HDACENSUS|GOPSHOT|ECLID|BOOTLIST): .*-> FAIL
 
 # ── 10. ZENBOOKACP (Z25): the HDA census on q35's intel-hda + hda-duplex (UNAOS_HDA), the drive path skipped ───────────
@@ -86,6 +95,9 @@ REQUIRE \[hda\] census codec=0 vid=1af4:0022 subsys=[0-9a-f]{4}:[0-9a-f]{4} afg=
 REQUIRE \[hda\] audit stage=census .*verbs-set=0\b
 REQUIRE :: HDACENSUS: codecs=1 vid=10ec:0294 subsys=1043:1df3 afg=0x01 nodes=\d+ sets=0 cases=4/4 -> PASS ::
 REQUIRE :: HDAPATH: d0=ok path=ok sets=6 cases=3/3 -> PASS ::
+# ZENBOOKSPECPINS (zenbook-ledger Z54): ALCPLAY-SPEC — ZENBOOKACPPLAY's (Z47) decision KAT, printed after HDAPATH by the same `tests hdacensus`
+REQUIRE \[hda\] alcplay kat keep=ok arm=ok tone=ok play=ok held=ok -> ok
+FORBID \[hda\] alcplay kat .*-> FAIL
 FORBID \[hda\] (gpio|tone|path)\b
 
 # ── END OF RUN: the last typed verdict (mbench's completion also needs every REQUIRE above) ───────────────────────────
