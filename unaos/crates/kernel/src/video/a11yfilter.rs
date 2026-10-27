@@ -2,7 +2,7 @@
 //!
 //! A11YFILTERS (rmbp-ledger B705; BP-bar-22, research C §10: colour-vision filters must be system-wide, not per app)
 //! — the colour filter every writer to the scanout applies AT THE COPY. Settings > Accessibility sets it
-//! (`system.accessibility.cvd`, `system.accessibility.invert`; `settings::a11y_load` / `a11y_set` call [`set`]).
+//! (`system.accessibility.cvd`, `system.accessibility.invert`; `settings::a11y_load` / `a11y_set` call `changed`).
 //!
 //! WHY AT THE COPY AND NOT AFTER IT. The x86 compositor keeps no composed frame in RAM: it is damage-driven, and
 //! about six paths write the write-combined BAR1 scanout directly (KCOMP's census,
@@ -241,4 +241,36 @@ pub fn take_stats() -> (u64, u64, u64) {
 /// The counters without draining them.
 pub fn peek_stats() -> (u64, u64, u64) {
     (PRESENTS.load(Relaxed), TPX.load(Relaxed), super::cycles_to_us(TCYC.load(Relaxed)))
+}
+
+// A11YFILTER (rmbp-ledger B857; BP-video-25, video.md §5 A11YSHADOW B816's owed ONE call) — TAIL-APPENDED so no line
+// above moves; desktop-family only (settings' gate), so a knob-off image gains nothing.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+static CHANGES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// THE one filter-changed call (every Settings caller; the body `settings::a11y_filter_moved` was, moved here): latch
+/// `(mode, invert)` and, when that moved the filter, mark the epoch this change's own damage covers
+/// (`desktop::shadows_covered`, stored BEFORE the bump so a pass that reads the bumped epoch reads it too: the shadow
+/// re-lay then only sets STALE), bump the looks epoch (every strip re-seals), damage every window and ask the desktop
+/// layer for its full present — everything on the glass is in the old colours until it is copied again. Holds no
+/// lock across its calls. Returns whether the filter moved.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn changed(mode: usize, invert: bool) -> bool {
+    let m = mode.min(MODES - 1);
+    if m == self::mode() && invert == self::invert() {
+        return false;
+    }
+    set(m, invert);
+    CHANGES.fetch_add(1, Relaxed);
+    crate::video::wm::desktop::shadows_covered(crate::video::theme::epoch().wrapping_add(1));
+    crate::video::theme::bump_epoch();
+    let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+    crate::video::screen::request_full_present();
+    true
+}
+
+/// Filter moves [`changed`] made since boot (`tests a11yfilters`' `changed_calls=`).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn changes() -> u32 {
+    CHANGES.load(Relaxed)
 }

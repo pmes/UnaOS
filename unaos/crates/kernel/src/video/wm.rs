@@ -31871,14 +31871,14 @@ fn overlay_occludes(_r: &Window) -> bool {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod a11yshadow {
     //! CHARTER: Kernel — wm. The shadow pass keys on the ONE looks epoch (`theme::epoch`, which CONTRAST, the
-    //! colour filter's `settings::a11y_filter_moved`, a set/accent change and the lens all bump).
+    //! colour filter's `a11yfilter::changed`, a set/accent change and the lens all bump).
     //!
     //! WHY. The colour filter is applied at the copy (BP-video-25), and a window shadow's pixels reach the panel only
     //! through `desktop::track`'s fills (the erase drain: `stage_fill` -> `bg_row` -> `shade_bytes` -> the filter's
     //! `in_place`). `track` re-queues a cast only when its box or tiles moved or `STALE` is set, and the desktop
     //! layer's own present (`Screen::flush`) skips the occluder boxes, which ARE the shadow extents — so a filter
     //! change re-filtered every pixel but the shadows. Here the pass compares the epoch it last laid at with the live
-    //! one and, on a move, takes the existing re-lay (`shadows_stale`, the wallpaper reload's) before `track`.
+    //! one and, on a move, takes the re-lay (`desktop::shadows_relay`: STALE alone when the filter's own damage covers the epoch, A11YFILTER B857; else `shadows_stale`, the wallpaper reload's) before `track`.
     //! The strips (`strip::seal`) and the VEIL cache (`VeilKey.epoch`) already key on the same epoch.
     use core::sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed};
 
@@ -31895,7 +31895,7 @@ pub mod a11yshadow {
         let e = crate::video::theme::epoch();
         let moved = SHADOW_EPOCH.swap(e, Relaxed) != e;
         if moved {
-            super::shadows_stale();
+            super::desktop::shadows_relay(e);
             RELAYS.fetch_add(1, Relaxed);
         }
         super::desktop::track();
