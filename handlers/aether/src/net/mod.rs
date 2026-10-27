@@ -151,7 +151,7 @@ pub enum Doc {
 pub async fn fetch_document_any(input: &str) -> Result<(Doc, String)> {
     if input.starts_with("file://") {
         if let Some(opened) = crate::chrome::host::open_archive(input) { return opened.map(|(html, url)| (Doc::Text(html), url)); } // PAGESAVECOMPLETE (SR398): a .mhtml / .mht file URL opens as its archive (chrome::host); every other file stays refused
-        if let Some(opened) = crate::chrome::host::open_local(input) { return opened.map(|(html, url)| (Doc::Text(html), url)); } // SAVERECENTOPEN (SR403): a .html / .htm file URL opens under the archive's sandbox CSP (chrome::host); any other file is named on the console and refused below
+        if let Some(opened) = crate::chrome::host::open_local(input) { return opened; } // SAVERECENTOPEN (SR403): a .html / .htm file URL opens under the archive's sandbox CSP (chrome::host); OPENANYTYPE (SR408): a text, image, media or PDF file too; any other file is named on the console and refused below
         anyhow::bail!("file:// fetches are disabled for security reasons.");
     }
     let urls = normalize_url(input);
@@ -395,7 +395,7 @@ pub fn collect_stylesheet_links(base_url: &str, html: &str) -> Vec<SheetLink> {
                 None => Some(href.to_string()),
             };
             if let Some(u) = resolved {
-                if u.starts_with("http://") || u.starts_with("https://") {
+                if u.starts_with("http://") || u.starts_with("https://") || crate::chrome::host::local_part(base_url, &u).is_some() { // OPENANYTYPE (SR408): a local page's own sheet, from its folder
                     out.push(SheetLink {
                         url: u,
                         integrity: attrs.get("integrity").map(str::to_string).filter(|v| !v.trim().is_empty()),
@@ -584,7 +584,7 @@ pub fn collect_image_urls(base_url: &str, html: &str) -> Vec<String> {
                 continue; // decoded synchronously at load, no fetch needed
             }
             let abs = crate::images::resolve(base_url, src);
-            if (abs.starts_with("http://") || abs.starts_with("https://")) && !out.contains(&abs) {
+            if (abs.starts_with("http://") || abs.starts_with("https://") || crate::chrome::host::local_part(base_url, &abs).is_some()) && !out.contains(&abs) { // OPENANYTYPE (SR408): a local page's own image, from its folder
                 out.push(abs);
             }
             if out.len() >= 30 {
@@ -692,7 +692,7 @@ pub fn collect_css_image_refs(
             continue;
         }
         let fetch_url = crate::images::resolve(fetch_base, inner);
-        if !(fetch_url.starts_with("http://") || fetch_url.starts_with("https://")) {
+        if !(fetch_url.starts_with("http://") || fetch_url.starts_with("https://") || crate::chrome::host::local_part(paint_base, &fetch_url).is_some()) { // OPENANYTYPE (SR408): a local page's own image, from its folder
             continue;
         }
         let key = crate::images::resolve(paint_base, inner);
@@ -927,6 +927,7 @@ type LoadFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Loaded> + S
 
 fn start(load: Load, partition: Option<String>, sw: Option<crate::workers::sw::SwHandle>) -> LoadFuture {
     Box::pin(async move {
+        if let Some(done) = local_loaded(&load) { return done; } // OPENANYTYPE (SR408): a local page's admitted file:// sheet or image is read from disk
         let p = partition.as_deref();
         if let Some(h) = sw.as_ref() {
             let (url, pri) = match &load {
@@ -1289,5 +1290,22 @@ mod tests {
         assert_eq!(normalize_url("https://example.com"), vec!["https://example.com"]);
         assert_eq!(normalize_url("http://localhost"), vec!["http://localhost"]);
         assert!(normalize_url("file:///etc/passwd").is_empty());
+    }
+}
+
+// ---- OPENANYTYPE (SR408): a local page's own file:// subresources ------------------------------------------------------
+
+/// OPENANYTYPE (SR408): [`start`]'s local arm: a stylesheet or image whose URL is a file URL (admitted at discovery by
+/// `chrome::host::local_part`: the page's own folder) is read from disk by `chrome::host::read_part` (10 MiB); a script
+/// or font is never read here (scripts stay off on a local page; fonts are not admitted), so `None` leaves it to the
+/// network path, which refuses a file URL as before.
+fn local_loaded(load: &Load) -> Option<Loaded> {
+    match load {
+        Load::Sheet(i, u) if u.starts_with("file://") => {
+            let r = crate::chrome::host::read_part(u).and_then(|b| String::from_utf8(b).context("Invalid UTF-8"));
+            Some(Loaded::Sheet(*i, u.clone(), r))
+        }
+        Load::Image(u, key) if u.starts_with("file://") => Some(Loaded::Image(u.clone(), key.clone(), crate::chrome::host::read_part(u))),
+        _ => None,
     }
 }
