@@ -7,7 +7,9 @@
 //! - Downloads land in the person's Downloads folder (`directories::UserDirs::download_dir`, else
 //!   `~/Downloads`), written to `<name>.part` and renamed when complete — a half-written file never
 //!   carries the real name. A save (PDF4FORMSAVE, SR354: [`save_bytes`], the bytes an engine hands over as
-//!   `BrowserSave`) lands the same way through the same two steps, [`claim`] and [`land`].
+//!   `BrowserSave`) lands the same way through the same two steps, [`claim`] and [`land`]. SAVEDIALOG (SR364): the
+//!   write itself (`.part`, then rename) is gneiss_pal's ONE writer (`gneiss_pal::fs`), Facet's export's too; a Save As
+//!   ([`save_bytes_at`]) writes it at the path the person chose in the face's save panel.
 //! - [`probe`] is the top-level navigation's download decision: a `HEAD` of the URL over gneiss_pal's
 //!   HTTP client (the same cookie jar the page loads use), whose `Content-Disposition` /
 //!   `Content-Type` the model judges ([`super::downloads`]). A failed or refused probe answers
@@ -227,7 +229,7 @@ fn claim(dir: &Path, name: &str) -> std::io::Result<String> {
 /// PDF4FORMSAVE (SR354): the second step: the complete `<name>.part` takes its real name. Answers the file's path.
 fn land(dir: &Path, name: &str) -> std::io::Result<PathBuf> {
     let to = dir.join(name);
-    std::fs::rename(dir.join(format!("{name}.part")), &to)?;
+    gneiss_pal::fs::land(&to)?; // SAVEDIALOG (SR364): the ONE writer's rename
     Ok(to)
 }
 
@@ -241,11 +243,15 @@ pub fn save_bytes(name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
 pub fn save_bytes_in(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     let clean = downloads::sanitize(name);
     let name = claim(dir, if clean.is_empty() { "download" } else { &clean }).map_err(|e| e.to_string())?;
-    let part = dir.join(format!("{name}.part"));
-    std::fs::write(&part, bytes).and_then(|()| land(dir, &name)).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        e.to_string()
-    })
+    let to = dir.join(&name);
+    gneiss_pal::fs::save_bytes(&to, bytes).map(|()| to).map_err(|e| e.to_string())
+}
+
+/// SAVEDIALOG (SR364): write `bytes` at `path`, the path the person chose in the face's save panel (no unique suffix: a
+/// file already there is replaced, as the panel confirmed), through the same ONE writer. The shell's answer to
+/// `SavePanelChose` after a `BrowserSaveAs`.
+pub fn save_bytes_at(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    gneiss_pal::fs::save_bytes(path, bytes).map(|()| path.to_path_buf()).map_err(|e| e.to_string())
 }
 
 /// The page-info popover's answer for `url`: whether the connection was secure, and the sentence that
@@ -301,7 +307,7 @@ pub fn devtools_frame(
 
 #[cfg(test)]
 mod tests {
-    use super::save_bytes_in;
+    use super::{save_bytes_at, save_bytes_in};
 
     /// PDF4FORMSAVE (SR354): the one writer: the path answered, the `(n)` suffix on a collision (a finished file or a
     /// landing `.part`), a hostile name kept inside the folder, no `.part` left behind.
@@ -324,6 +330,22 @@ mod tests {
         assert_eq!(save_bytes_in(&dir, "...", b"d").unwrap(), dir.join("download"));
         let parts = std::fs::read_dir(&dir).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".part")).count();
         assert_eq!(parts, 0, "no .part left behind");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// SAVEDIALOG (SR364): the Save As writer lands at the chosen path exactly: a file there is replaced (the panel
+    /// confirmed it), no `(1)`, no `.part` left behind; a path in no folder answers why.
+    #[test]
+    fn savedialog_writer_at() {
+        let dir = std::env::temp_dir().join(format!("aether-saveas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let to = dir.join("chosen.pdf");
+        std::fs::write(&to, b"old").unwrap();
+        assert_eq!(save_bytes_at(&to, b"new").unwrap(), to);
+        assert_eq!(std::fs::read(&to).unwrap(), b"new", "replaced at the chosen path");
+        assert!(!dir.join("chosen (1).pdf").exists() && !dir.join("chosen.pdf.part").exists());
+        assert!(save_bytes_at(&dir.join("gone").join("x.pdf"), b"x").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

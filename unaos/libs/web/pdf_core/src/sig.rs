@@ -534,9 +534,9 @@ fn classify(o: &Object, n: u32, acroform: Option<u32>, root: Option<u32>) -> Kin
     }
 }
 
-/// The digest algorithms read (SHA-1 is refused by name).
-#[derive(Clone, Copy)]
-enum Hash {
+/// The digest algorithms read (SHA-1 is refused by name) and, PDFSIGNKEYPARSE (SR361), signed with ([`cms::SignerKey`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hash {
     Sha256,
     Sha384,
     Sha512,
@@ -561,6 +561,11 @@ impl Hash {
                 h.finalize().to_vec()
             }
         }
+    }
+
+    /// The digest length in bytes.
+    pub fn len(self) -> usize {
+        self.alg().output_len()
     }
 
     fn alg(self) -> HashAlg {
@@ -895,7 +900,7 @@ impl Document {
         if !write::patch_byte_range(&mut out, br_at, [a, b, c]) {
             return Err(Error::Unsupported("byte range"));
         }
-        let digest: [u8; 32] = Hash::Sha256.digest(&[&out[..a], &out[b..]]).try_into().map_err(|_| PLACE)?;
+        let digest = req.key.hash().digest(&[&out[..a], &out[b..]]);
         let der = cms::build(&req.key, &digest, req.chain, req.time, cades)?;
         if der.len() > bound {
             return Err(PLACE);

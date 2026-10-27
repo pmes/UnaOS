@@ -76,28 +76,6 @@ pub(crate) fn mkdirs(mt: &MountTable, p: &str, who: &str) -> Result<(), VfsError
     Ok(())
 }
 
-/// Create-or-truncate `p` and write `data` from offset 0 (unlink + create: FAT has no shrink).
-pub(crate) fn put_file(mt: &MountTable, p: &str, data: &[u8], who: &str) -> Result<usize, VfsError> {
-    match mt.stat(p) {
-        Ok(st) if st.kind == NodeKind::Dir => return Err(VfsError::IsADirectory),
-        Ok(_) => mt.unlink(p, who)?,
-        Err(_) => {}
-    }
-    mt.create(p, NodeKind::File, who)?;
-    write_at(mt, p, 0, data, who)
-}
-
-fn write_at(mt: &MountTable, p: &str, off: u64, data: &[u8], who: &str) -> Result<usize, VfsError> {
-    let mut done = 0usize;
-    while done < data.len() {
-        match mt.write(p, off + done as u64, &data[done..], who)? {
-            0 => return Err(VfsError::Backend("short-write")),
-            w => done += w,
-        }
-    }
-    Ok(done)
-}
-
 /// `SYS_PATH_READ` / `SYS_PATH_WRITE` over the VFS. `inb` is the whole request; `cap` the read ceiling.
 /// Returns `(bytes to copy out, return value)` or `-errno`.
 pub fn path_fulfil(nr: u64, inb: &[u8], caller: &str, cap: usize) -> Result<(Vec<u8>, i64), i64> {
@@ -169,7 +147,7 @@ pub fn path_fulfil(nr: u64, inb: &[u8], caller: &str, cap: usize) -> Result<(Vec
         if off != 0 {
             return Err(una_abi::EINVAL);
         }
-        let w = put_file(&mt, path, data, who).map_err(|e| errno(&e))?;
+        let w = mt.put_file(path, data, who).map_err(|e| errno(&e))?;
         return Ok((Vec::new(), w as i64));
     }
     let st = mt.stat(path).map_err(|e| errno(&e))?;
@@ -179,7 +157,7 @@ pub fn path_fulfil(nr: u64, inb: &[u8], caller: &str, cap: usize) -> Result<(Vec
     if off > st.size {
         return Err(una_abi::EINVAL);
     }
-    let w = write_at(&mt, path, off, data, who).map_err(|e| errno(&e))?;
+    let w = mt.write_all_at(path, off, data, who).map_err(|e| errno(&e))?;
     Ok((Vec::new(), w as i64))
 }
 
@@ -258,9 +236,9 @@ fn run_fixture(mt: &MountTable, dir: &str) -> Result<Fx, (&'static str, i64)> {
     // 2. Lay the fixture source and its owners table under the scratch tree.
     let src_path = format!("{}/{}", dir, fixture::PATH);
     mkdirs(mt, &src_path, k).map_err(io("mkdirs"))?;
-    put_file(mt, &src_path, fixture::SOURCE.as_bytes(), k).map_err(io("lay"))?;
+    mt.put_file(&src_path, fixture::SOURCE.as_bytes(), k).map_err(io("lay"))?;
     let own_path = format!("{}/witness-owners.txt", dir);
-    put_file(mt, &own_path, fixture::OWNERS.as_bytes(), k).map_err(io("lay-owners"))?;
+    mt.put_file(&own_path, fixture::OWNERS.as_bytes(), k).map_err(io("lay-owners"))?;
     let table = mt.read(&own_path, 0, fixture::OWNERS.len()).map_err(io("read-owners"))?;
     let table = core::str::from_utf8(&table).map_err(|_| ("owners-utf8", 0))?;
     // 3. Prompt: each FAIL with its owner and section, read back off the volume.
@@ -321,9 +299,9 @@ fn run_fixture(mt: &MountTable, dir: &str) -> Result<Fx, (&'static str, i64)> {
             })
             .map_err(|r| ("emit", r_code(r)))?;
         }
-        put_file(mt, &tmp, &out, k).map_err(io("write-dgn"))?;
+        mt.put_file(&tmp, &out, k).map_err(io("write-dgn"))?;
         let back = mt.read(&tmp, 0, out.len()).map_err(io("read-dgn"))?;
-        put_file(mt, &fp, &back, k).map_err(io("copy-back"))?;
+        mt.put_file(&fp, &back, k).map_err(io("copy-back"))?;
         let _ = mt.unlink(&tmp, k);
         patched += 1;
     }
@@ -342,7 +320,7 @@ fn run_fixture(mt: &MountTable, dir: &str) -> Result<Fx, (&'static str, i64)> {
     record::rebuild(&mut r);
     let rn = r.done().ok_or(("record-overflow", 0))?;
     let md_path = format!("{}/diag.0.md", dir);
-    put_file(mt, &md_path, &rbuf[..rn], k).map_err(io("record"))?;
+    mt.put_file(&md_path, &rbuf[..rn], k).map_err(io("record"))?;
     let md = mt.read(&md_path, 0, rn).map_err(io("record-read"))?;
     let mds = core::str::from_utf8(&md).map_err(|_| ("record-utf8", 0))?;
     let mut nb = [0u8; 512];

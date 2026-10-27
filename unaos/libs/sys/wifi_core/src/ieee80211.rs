@@ -454,11 +454,12 @@ pub fn build_null_data_pm(sta: Mac, bssid: Mac, seq: u16, pm: bool) -> Vec<u8> {
 pub const EID_COUNTRY: u8 = 7;
 
 /// STATIONROAM-SWEEP (B958): a beacon's Country element — the country string (2 letters + the environment octet) and the 2.4 GHz
-/// channels 1..14 its subband triplets cover (bit c = channel c).
+/// channels 1..14 its subband triplets cover (bit c = channel c). STATIONROAM-5G (B962): `five`, bit i = `NONDFS_5G[i]` covered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Country {
     pub cc: [u8; 3],
     pub chans: u16,
+    pub five: u16,
 }
 
 /// STATIONROAM-SWEEP (B958): the Country element of a beacon / probe response. TOTAL: `None` unless the frame is one, its IE list fits
@@ -489,7 +490,7 @@ pub fn country_ie(frame: &[u8]) -> Option<Country> {
             if len < 3 || (len - 3) % 3 == 2 {
                 return None;
             }
-            let mut c = Country { cc: [body[0], body[1], body[2]], chans: 0 };
+            let mut c = Country { cc: [body[0], body[1], body[2]], chans: 0, five: 0 };
             let mut k = 3;
             while k + 3 <= len {
                 let (first, n) = (body[k] as u16, body[k + 1] as u16);
@@ -499,6 +500,7 @@ pub fn country_ie(frame: &[u8]) -> Option<Country> {
                             c.chans |= 1 << ch;
                         }
                     }
+                    if first > 14 { for i in 0..n { if let Some(k5) = NONDFS_5G.iter().position(|x| *x as u16 == first + 4 * i) { c.five |= 1 << k5; } } } // STATIONROAM-5G (B962): a 5 GHz triplet counts channels 4 apart (§9.4.2.8)
                 }
                 k += 3;
             }
@@ -507,4 +509,47 @@ pub fn country_ie(frame: &[u8]) -> Option<Country> {
         i += 2 + len;
     }
     found
+}
+
+// ── STATIONROAM-5G (rmbp-ledger B962): the channel -> band map, the DFS rule, the SPROM power block choice — PURE ──────────────
+
+/// STATIONROAM-5G (B962): the 5 GHz channels the station may transmit on without radar detection (UNII-1 and UNII-3), in plan order.
+pub const NONDFS_5G: [u8; 9] = [36, 40, 44, 48, 149, 153, 157, 161, 165];
+
+/// STATIONROAM-5G (B962): the 5 GHz channels b43's 2059 table carries a row for (`radio_2059.c:58-316`): 36..64, 100..140, 149..165.
+fn row_5g(ch: u8) -> bool {
+    ch % 4 == 0 && ((36..=64).contains(&ch) || (100..=140).contains(&ch)) || (149..=165).contains(&ch) && (ch - 149) % 4 == 0
+}
+
+/// STATIONROAM-5G (B962): a channel's centre frequency (MHz): 1..=13 -> 2407 + 5·ch, 14 -> 2484, a 5 GHz channel on b43's 2059 rows
+/// -> 5000 + 5·ch (IEEE 802.11-2020 §E.1); anything else `None`.
+pub fn chan_freq(ch: u8) -> Option<u16> {
+    match ch {
+        1..=13 => Some(2407 + 5 * ch as u16),
+        14 => Some(2484),
+        _ if row_5g(ch) => Some(5000 + 5 * ch as u16),
+        _ => None,
+    }
+}
+
+/// STATIONROAM-5G (B962): `ch` is a 5 GHz channel number (36 and up).
+pub fn is_5g(ch: u8) -> bool {
+    ch >= 36
+}
+
+/// STATIONROAM-5G (B962): `ch` is a DFS channel (52..=144, UNII-2 and UNII-2e): no radar detection is built, so nothing transmits there.
+pub fn dfs(ch: u8) -> bool {
+    (52..=144).contains(&ch)
+}
+
+/// STATIONROAM-5G (B962): the SPROM per-core power block b43 drives TX power control from for `freq` (`phy_ht.c:633-664`): below
+/// 2500 `2g`; 4900..5100 `5gl`; 5100..5500 `5g`; 5500 and up `5gh`; else `None` (b43's fixed defaults, no channel row reaches them).
+pub fn pwr_block(freq: u16) -> Option<&'static str> {
+    match freq {
+        0..=2499 => Some("2g"),
+        4900..=5099 => Some("5gl"),
+        5100..=5499 => Some("5g"),
+        5500..=u16::MAX => Some("5gh"),
+        _ => None,
+    }
 }

@@ -280,7 +280,7 @@ pub fn open(path: &str) -> Result<u32, String> {
     let ox = pw.saturating_sub(ow) / 2;
     let oy = wtop + ph.saturating_sub(wtop).saturating_sub(crate::ui_status::chrome_h(ph)).saturating_sub(oh) / 3;
     let base = st.surf.as_ptr() as usize;
-    let title = alloc::format!("Player - {}", st.name);
+    let title = nle_title(&st.path).unwrap_or_else(|| alloc::format!("Player - {}", st.name)); // NLE6KEYSTAB (rmbp-ledger B975): an EDL opens as the NLE, `NLE - <stem>` (file tail)
     let id = wm::create_at_native(OWNER, base, len * 4, w as u32, h as u32, (w * 4) as u32, title.as_bytes(), ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         hw::stop();
@@ -294,7 +294,7 @@ pub fn open(path: &str) -> Result<u32, String> {
     );
     *STATE.lock() = Some(st); PLAYER_OPEN.store(true, Ordering::Release); // SMALLFIX5 (B480): the posted `player open` flag
     WIN.store(id, Ordering::Relaxed);
-    wm::winid_register_holder(&WIN, "player");
+    wm::winid_register_holder(&WIN, "player"); nle_tab(id, path); // NLE6KEYSTAB (rmbp-ledger B975): an EDL's window is LISTED in the wc window list (file tail)
     wm::focus_changed(OWNER);
     let _ = wm::present(id);
     Ok(id)
@@ -313,7 +313,7 @@ pub fn close(by: &str) {
         return;
     }
     hw::stop();
-    vid::stop(); // VIDEOPLAYER (B434): the picture job ends with the window
+    vid::stop(); edit_close(); // VIDEOPLAYER (B434): the picture job ends with the window. NLE6KEYS (rmbp-ledger B961): the Player's editor state goes with it (file tail)
     if id != wm::WIN_NONE {
         wm::close(id);
     }
@@ -349,7 +349,7 @@ pub fn service() {
         }
         None => {}
     }
-    tick();
+    edit_pass(); tick(); // NLE6KEYS (rmbp-ledger B961): a posted editing key, run on the pass (file tail)
 }
 
 /// F7/F8/F9 on the player (BEZEL shows the play/pause it lands on).
@@ -568,7 +568,7 @@ pub fn press_route(x: i32, y: i32) -> bool {
         Some(s) => (s.w, s.dur_ms, s.oy),
         None => return true,
     };
-    if ly < oy {
+    if ly < oy && edit_press_route(lx, ly) { return true; } if ly < oy { // NLE6FACEDRAG (rmbp-ledger B975): a press on the EDL's view band begins a drag (file tail)
         serial_println!("[player] press video -> {}", if playing() { "pause" } else { "play" }); // VIDEOPLAYER (B434): a click on the picture is play/pause
         post(Act::Toggle);
         return true;
@@ -696,7 +696,7 @@ pub fn key_route(ev: crate::pal::Event) -> bool {
             post(Act::Seek(if back { cur.saturating_sub(STEP_MS) } else { cur + STEP_MS }));
             true
         }
-        _ => false,
+        _ => edit_post(ev), // NLE6KEYS (rmbp-ledger B961): an EDL's editing keys, posted for the pass (file tail)
     }
 }
 
@@ -1114,15 +1114,15 @@ mod vid {
         let audio = if busy && st.playing && pos != u64::MAX && pos > 0 { Some(st.base_ms + pos) } else { None };
         let (w, oy) = (st.w, st.oy);
         let (shown, clock) = if st.err.is_none() { vplay::present(&mut st.surf, w, oy, audio, st.playing) } else { (false, st.shown_ms) };
-        dirty |= shown;
+        dirty |= shown; let band = if shown || st.err.is_some() { None } else { vplay::band_repaint(&mut st.surf, w, oy) }; // NLE6DRAGSNAP (rmbp-ledger B977): no frame this pass: the EDL's view band repainted when a drag marked it (vplay.rs tail)
         let mut controls = false;
         if st.playing && st.vsaid && st.err.is_none() && vplay::finished() && !busy {
             st.playing = false;
             st.ended = true;
-            let (dec, pres, drop, sync, smax, clk) = vplay::stats();
+            let (dec, pres, drop, sync, smax, clk) = vplay::stats(); let pu = vplay::present_us(); // KERNELSCALECOLS (rmbp-ledger B978): the present cost and the queue depth
             serial_println!(
-                "[player] ended path={} at_ms={} frames={} presented={} dropped={} av_sync_ms={} max={} clock={}",
-                st.path, clock, dec, pres, drop, sync, smax, clk
+                "[player] ended path={} at_ms={} frames={} presented={} dropped={} av_sync_ms={} max={} clock={} present_us={} present_max_us={} queue={} filter={}",
+                st.path, clock, dec, pres, drop, sync, smax, clk, pu.0, pu.1, pu.2, pu.3
             );
             controls = true;
         }
@@ -1134,7 +1134,7 @@ mod vid {
         if controls {
             paint(st);
         }
-        if dirty || controls {
+        if let (false, false, Some((y0, y1))) = (dirty, controls, band) { drop(g); let _ = wm::present_rows(id, y0, y1); return; } if dirty || controls { // NLE6DRAGSNAP (rmbp-ledger B977): a band-only repaint presents its rows alone
             drop(g);
             let _ = wm::present(id);
         }
@@ -1368,20 +1368,7 @@ mod nle_fx {
             (alloc::format!("{}.MP4", REELS[3]), standin_reel()), // SWAPBACKVPLAY (rmbp-ledger B956)
             (String::from("NLEFX.EDL"), edl.into_bytes()),
         ];
-        let put = |c: &str, body: &[u8]| -> bool {
-            let _ = mt.unlink(c, p);
-            if mt.create(c, crate::fs::vfs::NodeKind::File, p).is_err() {
-                return false;
-            }
-            let mut off = 0usize;
-            while off < body.len() {
-                match mt.write(c, off as u64, &body[off..(off + 4096).min(body.len())], p) {
-                    Ok(n) if n > 0 => off += n,
-                    _ => break,
-                }
-            }
-            off == body.len()
-        };
+        let put = |c: &str, body: &[u8]| -> bool { mt.put_file(c, body, p).is_ok() }; // NLE6EXPORTONE (rmbp-ledger B963): the ONE VFS whole-file writer (fs/vfs.rs tail)
         let Some(dir) = ["/home", ""].into_iter().find(|d| files.iter().all(|(n, b)| put(&alloc::format!("{}/{}", d, n), b))) else {
             serial_println!(":: NLE: reason=fixture-write (neither /home nor / took the reels) -> SKIP ::");
             return;
@@ -1412,14 +1399,14 @@ mod nle_fx {
         let kat = MIX_KAT.iter().filter(|k| rep.mixes.contains(*k)).count();
         let mix_ok = rep.mixed == 8 && rep.mix_refused == 0 && kat == MIX_KAT.len(); let mix_ok = mix_ok && face_verdict(&rep, face); // NLE6MIXFACE (rmbp-ledger B957): the fresh outgoing run and the seek preview (module tail)
         let colour = rep.coded.iter().filter(|k| **k == COLOUR_KAT).count(); // KERNELCOLOUR (B952): NLEFXC's middle frame by BT.709
-        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1 && standin_ok(&rep); let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; let (exp_ok, exp_word) = export_verdict(dir); let ok = ok && exp_ok; // NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
+        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1 && standin_ok(&rep); let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; let (exp_ok, exp_word) = export_verdict(dir); let ok = ok && exp_ok; let (key_ok, key_word) = keys_leg(dir, &put); let ok = ok && key_ok; let aac_ok = export_aac_leg(dir); let ok = ok && aac_ok; let (drag_ok, drag_word) = drag_leg(dir, &put); let ok = ok && drag_ok; // NLE6FACEDRAG (rmbp-ledger B975): the view band's drags through the pointer door and the NLE tab (module tail). NLE6KEYS (rmbp-ledger B961): the editing keys through the key door (module tail). NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
         serial_println!(
             "[nle] fixture edl={} presented={} dropped={} queued={} gaps={} seek_steps={} ms={}{}",
             path, pres, drop, rep.frames, rep.gaps, seek_steps, crate::arch::ms().saturating_sub(t0), err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default()
         );
         serial_println!(
-            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 env={} xfades={} swaps={} standin={} export={} -> {} ::",
-            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, env_word, rep.xfades, rep.swaps, rep.stand_in_frames, exp_word, if ok { "PASS" } else { "FAIL" }
+            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 env={} xfades={} swaps={} standin={} export={} keys={} drag={} -> {} ::",
+            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, env_word, rep.xfades, rep.swaps, rep.stand_in_frames, exp_word, key_word, drag_word, if ok { "PASS" } else { "FAIL" }
         );
     }
 
@@ -1591,13 +1578,469 @@ mod nle_fx {
         let vi = d.video_track().and_then(|t| d.track_index(t.id));
         let samples = vi.map(|i| d.track_samples(i).count() as u64).unwrap_or(0);
         let ctts = vi.is_some_and(|i| d.track_samples(i).any(|s| s.pts != s.dts));
-        let audio_ok = d.audio_track().is_some_and(|t| t.sample_rate == 48_000 && t.channels == 2) && rep.audio_target > 0 && rep.audio_mixed >= rep.audio_target;
+        let audio_ok = d.audio_track().is_some_and(|t| t.sample_rate == 48_000 && t.channels == 2) && rep.audio_target > 0 && rep.audio_mixed >= rep.audio_target && rep.periods > 0; // NLE6EXPORTSTREAMPCM (rmbp-ledger B976): the sound entered the file before finish
         let need_audio = cfg!(any(feature = "uvc", feature = "hda-tone"));
-        let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio);
+        let (col_ok, col_word) = export_colour(&d, vi); let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir) && col_ok; // H264ENCCOLOURHOST (LEDGER SR377): the re-read file's colour (module tail). NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
         serial_println!(
-            "[nle] fixture export out={} samples={} ticks={} ctts={} audio={} mixed={}/{} bytes={} ms={} -> {}",
-            out, samples, ticks, ctts as u8, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
+            "[nle] fixture export out={} samples={} ticks={} ctts={} colour={} audio={} mixed={}/{} periods={} bytes={} ms={} -> {}",
+            out, samples, ticks, ctts as u8, col_word, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.periods, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
         );
         (ok, if !ok { "FAIL" } else if need_audio { "ok" } else { "skip(no-audio)" })
+    }
+
+    // ── NLE6EXPORTONE (rmbp-ledger B963): `nle export --bitrate 40` over the fixture ─────────────────────────────────────
+    // The same EDL exported again at a CBR target through h264enc_core's `Config.rate` (no B pictures) to `<dir>/NLEFXR.MP4`:
+    // the video samples' bytes must land within 25% of the target over the timeline's ticks (40 kbit/s x 39 / 25 s = 7800
+    // bytes at the fixture's 39 ticks). 40, not 200: 64x48 is 12 macroblocks and the rate controller cannot spend below
+    // QP 16 (`rc::QP_MIN`), so 200 kbit/s (1000 bytes a frame) would read the encoder's QP floor, not its rate control.
+    fn bitrate_verdict(dir: &str) -> bool {
+        use crate::video::export;
+        const KBPS: u32 = 40;
+        let ticks = timeline().map(with_audio).map(|t| t.end()).unwrap_or(0).max(0) as u64;
+        let target = KBPS as u64 * 1000 * ticks / FPS as u64 / 8;
+        let (edl, out) = (alloc::format!("{}/NLEFX.EDL", dir), alloc::format!("{}/NLEFXR.MP4", dir));
+        let t0 = crate::arch::ms();
+        let jid = match export::start(&edl, &out, export::Opts { bitrate: KBPS, ..export::Opts::default() }) {
+            Ok(j) => j,
+            Err(e) => {
+                serial_println!("[nle] fixture export bitrate={} refused ({}) -> FAIL", KBPS, e);
+                return false;
+            }
+        };
+        let rep = loop {
+            if let Some(r) = export::report(jid) {
+                break Some(r);
+            }
+            if crate::arch::ms().saturating_sub(t0) > 30_000 {
+                break None;
+            }
+            crate::arch::sched::sleep_ms(4);
+        };
+        let (bytes, err) = match rep {
+            Some(r) if r.err.is_none() => (r.video_bytes, None),
+            r => (0, Some(r.and_then(|r| r.err).unwrap_or_else(|| String::from("timeout")))),
+        };
+        let dev = (bytes as i64 - target as i64) * 100 / (target.max(1) as i64);
+        let ok = err.is_none() && target > 0 && dev.abs() <= 25;
+        serial_println!(
+            "[nle] fixture export bitrate={} video_bytes={} target={} dev_pct={} out={}{} -> {}",
+            KBPS, bytes, target, dev, out, err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default(), if ok { "ok" } else { "FAIL" }
+        );
+        ok
+    }
+
+    // ── NLE6KEYS (rmbp-ledger B961): the editing keys through the key door ─────────────────────────────────────────
+    // NLEKEY.EDL cuts NLEFXA 0..20 at 0 on one video track (an existing reel, no new file). The Player opens it, seeks to
+    // tick 8 through its own seek door, and the key door (`edit_post` + `edit_pass`: key_route's arm minus its focus gate,
+    // which a headless test does not hold) takes `s` (split at 8), `]` (the right half's in point +1: a one-tick gap at 8)
+    // and `u` (undo). After each key the Player's editor timeline must be the timeline_core op applied by hand; after the
+    // last job plays out its plan is the one-run cut (a seek at tick 0 only), the saved file is `KEY_EDL`, and the view band
+    // of the edited state hashes to `KEY_VIEW_KAT`, both pinned on the host by timeline_core `view::tests::kernel_keys_view_pin`
+    // through the SAME `edl::write` and `view::paint_in`.
+    const KEY_EDL: &str = "TITLE: NLEKEY\nFCM: NON-DROP FRAME\n* UNA FPS 25\n* UNA SOURCE NLEFXA 00:00:01:15\n\n001  NLEFXA   V     C        00:00:00:00 00:00:00:08 00:00:00:00 00:00:00:08\n002  NLEFXA   V     C        00:00:00:08 00:00:00:20 00:00:00:08 00:00:00:20\n";
+    /// FNV-1a 64 of the view band (Role::Tracks, 320x56, RGBA) of NLEFXA split at 8, the right half selected, playhead 8.
+    const KEY_VIEW_KAT: u64 = 0x53f5_5489_46f1_502f;
+
+    /// The keys leg's verdict and its wire word (`ok`, `FAIL`); the detail line always.
+    fn keys_leg(dir: &str, put: &dyn Fn(&str, &[u8]) -> bool) -> (bool, &'static str) {
+        use timeline_core::editor::EditorState;
+        use timeline_core::view;
+        let mut tl = Timeline::new(FPS);
+        let a = tl.add_source(REELS[0], FRAMES as i64);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0)];
+        let path = alloc::format!("{}/NLEKEY.EDL", dir);
+        let wrote = timeline_core::edl::write(&tl, "NLEKEY").map(|t| put(&path, t.as_bytes())).unwrap_or(false);
+        if !wrote || super::open(&path).is_err() {
+            serial_println!("[nle] fixture keys path={} wrote={} -> FAIL", path, wrote as u8);
+            super::close("fixture");
+            return (false, "FAIL");
+        }
+        let t0 = crate::arch::ms();
+        loop {
+            hw::pump_until(4, || false);
+            super::vid::tick();
+            let (said, err) = STATE.lock().as_ref().map(|s| (s.vsaid, s.err.is_some())).unwrap_or((true, true));
+            if said || err || crate::arch::ms().saturating_sub(t0) > 5_000 {
+                break;
+            }
+            crate::arch::sched::sleep_ms(4);
+        }
+        let split = tl.split(0, 8).ok();
+        let trimmed = split.as_ref().and_then(|t| t.trim_in(0, 1, 9).ok());
+        let want = [split.clone(), trimmed, split.clone()];
+        let _ = super::vid::seek(8 * 1000 / FPS as u64);
+        let mut edits = 0usize;
+        for (k, w) in [b's', b']', b'u'].into_iter().zip(want.iter()) {
+            super::edit_post(crate::pal::Event::Key(k));
+            super::edit_pass();
+            if w.is_some() && vplay::edit_timeline() == *w {
+                edits += 1;
+            }
+        }
+        let t1 = crate::arch::ms();
+        loop {
+            hw::pump_until(4, || false);
+            super::vid::tick();
+            let (ended, err) = STATE.lock().as_ref().map(|s| (s.ended, s.err.is_some())).unwrap_or((true, true));
+            if ended || err || crate::arch::ms().saturating_sub(t1) > 10_000 {
+                break;
+            }
+            crate::arch::sched::sleep_ms(4);
+        }
+        let rep = vplay::edl_report().unwrap_or_default();
+        let plan_want: Vec<(i64, Option<(u32, i64)>, bool)> = (0..20).map(|t| (t, Some((a.0, t)), t == 0)).collect();
+        let plan_ok = rep.plan == plan_want;
+        let saved_ok = vplay::read_all(&path).ok().as_deref() == Some(KEY_EDL.as_bytes());
+        let fnv = vplay::edit_timeline()
+            .map(|t| {
+                let mut st = EditorState::new(t);
+                let _ = st.select_at(0, 8);
+                st.seek(8);
+                let l = view::Layout::of_role(view::Role::Tracks, 320, 56, &st);
+                view::fnv1a(&view::paint_in(&st, l, view::Order::Rgba, None, None))
+            })
+            .unwrap_or(0);
+        super::close("fixture");
+        let ok = edits == 3 && plan_ok && saved_ok && fnv == KEY_VIEW_KAT;
+        serial_println!(
+            "[nle] fixture keys path={} edits={}/3 plan={} saved={} view={:x} want={:x} -> {}",
+            path, edits, if plan_ok { "ok" } else { "FAIL" }, if saved_ok { "ok" } else { "FAIL" }, fnv, KEY_VIEW_KAT, if ok { "ok" } else { "FAIL" }
+        );
+        (ok, if ok { "ok" } else { "FAIL" })
+    }
+
+    // ── NLE6EXPORTAAC (rmbp-ledger B960): the same EDL exported with its sound as AAC-LC and the track decoded back ───────
+    // A second export of NLEFX.EDL (`--aac 128`, `<dir>/NLEFXA.MP4`) after the PCM16 one: the file's audio track must be
+    // demux_core's `Codec::Aac` at 48 kHz stereo with ceil(target / 1024) + 1 samples (the encoder's padded last block and
+    // its drain block), and every sample must decode through audio_core's `AacDecoder` (the kernel links the decoder
+    // Stria's host export is checked against) with sound in it. No audio module: nothing was captured, no second export.
+    fn export_aac_leg(dir: &str) -> bool {
+        use crate::video::export;
+        if cfg!(not(any(feature = "uvc", feature = "hda-tone"))) {
+            serial_println!("[nle] fixture export audio=aac skip(no-audio)");
+            return true;
+        }
+        let t0 = crate::arch::ms();
+        let (edl, out) = (alloc::format!("{}/NLEFX.EDL", dir), alloc::format!("{}/NLEFXA.MP4", dir));
+        let jid = match export::start(&edl, &out, export::Opts { aac_kbps: 128, ..export::Opts::default() }) {
+            Ok(j) => j,
+            Err(e) => {
+                serial_println!("[nle] fixture export audio=aac refused ({}) -> FAIL", e);
+                return false;
+            }
+        };
+        let rep = loop {
+            if let Some(r) = export::report(jid) {
+                break Some(r);
+            }
+            if crate::arch::ms().saturating_sub(t0) > 30_000 {
+                break None;
+            }
+            crate::arch::sched::sleep_ms(4);
+        };
+        let rep = match rep {
+            Some(r) if r.err.is_none() => r,
+            r => {
+                serial_println!("[nle] fixture export audio=aac out={} err={} -> FAIL", out, r.and_then(|r| r.err).unwrap_or_else(|| String::from("timeout")));
+                return false;
+            }
+        };
+        let d = match vplay::read_all(&out).and_then(|b| demux_core::Demuxer::open(b).map_err(|e| alloc::format!("demux: {}", e))) {
+            Ok(d) => d,
+            Err(e) => {
+                serial_println!("[nle] fixture export audio=aac out={} reread={} -> FAIL", out, e);
+                return false;
+            }
+        };
+        let Some(t) = d.audio_track().filter(|t| t.codec == demux_core::Codec::Aac && t.sample_rate == 48_000 && t.channels == 2) else {
+            serial_println!("[nle] fixture export audio=aac out={} track=missing -> FAIL", out);
+            return false;
+        };
+        let units: Vec<Vec<u8>> = d.track_index(t.id).map(|i| d.track_samples(i).map(|s| d.packet_at(s).data).collect()).unwrap_or_default();
+        let mut dec = match audio_core::aac::Asc::parse(&t.config).and_then(|a| a.layout().and_then(|l| audio_core::aac::AacDecoder::new(a.sf_index, l))) {
+            Ok(dc) => dc,
+            Err(e) => {
+                serial_println!("[nle] fixture export audio=aac out={} asc={:?} -> FAIL", out, e);
+                return false;
+            }
+        };
+        let (mut decoded, mut loud) = (0usize, false);
+        for u in &units {
+            if dec.decode_block(&mut audio_core::bits::BitReader::new(u), 0).is_err() {
+                break;
+            }
+            decoded += 1;
+            loud |= dec.out.iter().any(|c| c.iter().any(|v| v.abs() > 1.0 / 256.0));
+        }
+        let bytes: usize = units.iter().map(|u| u.len()).sum();
+        let ok = rep.audio_target > 0 && units.len() as u64 == rep.audio_target.div_ceil(1024) + 1 && decoded == units.len() && loud;
+        serial_println!(
+            "[nle] fixture export audio=aac units={} decoded={} bytes={} target={} loud={} -> {}",
+            units.len(), decoded, bytes, rep.audio_target, loud as u8, if ok { "ok" } else { "FAIL" }
+        );
+        ok
+    }
+
+    // ── NLE6FACEDRAG (rmbp-ledger B975): the view band's drags through the pointer door, and the NLE tab ─────────────────
+    // NLEDRG.EDL cuts NLEFXA 0..20 at 0 on one video track (an existing reel, no new file). The Player opens it as the NLE
+    // (`NLE - NLEDRG`, LISTED: `wm::wl_rows` carries the row, appswitch's `apps()` names it `nle`). Once a frame painted the view
+    // band, the pointer door (`edit_press_at` / `edit_motion_at` / `edit_release_at` + `edit_pass`: press_route's arm minus the
+    // window hit and the capture seam, which a headless test does not hold) drags the clip body +3 ticks (`move_clip(0, 0, 0,
+    // 3)`), then its out handle -5 ticks (`trim_out(0, 0, 15)`); after each the Player's editor timeline must be that op applied
+    // by hand, and the saved file is `DRAG_EDL`, pinned on the host by timeline_core `view::drag_tests::kernel_drag_pin` through
+    // the SAME `view::Drag` and `edl::write`. NLE6DRAGSNAP (rmbp-ledger B977): the press snaps, so NLEDRG.EDL carries a second
+    // clip (NLEFXA 20..30 at 30) and a third drag, a body press at `x_of(5) + 1` moved +94 px (a raw 11 ticks), lands the first
+    // clip's out edge 2 px short of the second's `at` 30 and snaps to it: `move_clip(0, 0, 0, 15)`, `snapped=edge`.
+    const DRAG_EDL: &str = "TITLE: NLEDRG\nFCM: NON-DROP FRAME\n* UNA FPS 25\n* UNA SOURCE NLEFXA 00:00:01:15\n\n001  NLEFXA   V     C        00:00:00:00 00:00:00:15 00:00:00:15 00:00:01:05\n002  NLEFXA   V     C        00:00:00:20 00:00:01:05 00:00:01:05 00:00:01:15\n";
+
+    /// The drag leg's verdict and its wire word (`ok`, `FAIL`); the detail line always.
+    fn drag_leg(dir: &str, put: &dyn Fn(&str, &[u8]) -> bool) -> (bool, &'static str) {
+        let mut tl = Timeline::new(FPS);
+        let a = tl.add_source(REELS[0], FRAMES as i64);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(a, 20, 30, 30)];
+        let path = alloc::format!("{}/NLEDRG.EDL", dir);
+        let wrote = timeline_core::edl::write(&tl, "NLEDRG").map(|t| put(&path, t.as_bytes())).unwrap_or(false);
+        let Some(id) = (if wrote { super::open(&path).ok() } else { None }) else {
+            serial_println!("[nle] fixture drag path={} wrote={} -> FAIL", path, wrote as u8);
+            super::close("fixture");
+            return (false, "FAIL");
+        };
+        let mut rows = Vec::new();
+        let n = crate::video::wm::wl_rows(&mut rows);
+        let listed = rows[..n].iter().any(|r| r.id == id && &r.title[..r.len] == b"NLE - NLEDRG");
+        let tab = listed && crate::video::appswitch::apps().iter().any(|a| a.owner == super::OWNER && a.name == "nle");
+        let t0 = crate::arch::ms();
+        let band = loop {
+            hw::pump_until(4, || false);
+            super::vid::tick();
+            let b = vplay::band_layout(&path);
+            let err = STATE.lock().as_ref().map(|s| s.err.is_some()).unwrap_or(true);
+            if b.is_some() || err || crate::arch::ms().saturating_sub(t0) > 5_000 {
+                break b;
+            }
+            crate::arch::sched::sleep_ms(4);
+        };
+        let want_move = tl.move_clip(0, 0, 0, 3).ok();
+        let want_trim = want_move.as_ref().and_then(|t| t.trim_out(0, 0, 15).ok());
+        let want_snap = want_trim.as_ref().and_then(|t| t.move_clip(0, 0, 0, 15).ok());
+        let mut drags = 0usize;
+        if let Some((y0, l)) = band {
+            let z = l.zoom as isize;
+            for (step, w) in [(0usize, &want_move), (1, &want_trim), (2, &want_snap)] {
+                let (y0, l) = vplay::band_layout(&path).unwrap_or((y0, l));
+                let y = y0 + (l.row_y(0) + timeline_core::view::ROW_H as i64 / 2) as usize;
+                let (x, dx) = match step {
+                    0 => ((l.x_of(5) + l.zoom as i64 / 2) as usize, 3 * z),
+                    1 => ((l.x_of(23) - 2) as usize, -5 * z),
+                    _ => ((l.x_of(5) + 1) as usize, 94),
+                };
+                let pressed = super::edit_press_at(x, y);
+                let to = (x as isize + dx).max(0) as usize;
+                super::edit_motion_at(to, y);
+                super::edit_release_at(to, y);
+                super::edit_pass();
+                if pressed && w.is_some() && vplay::edit_timeline() == *w {
+                    drags += 1;
+                }
+            }
+        }
+        let saved_ok = vplay::read_all(&path).ok().as_deref() == Some(DRAG_EDL.as_bytes());
+        super::close("fixture");
+        let ok = tab && drags == 3 && saved_ok;
+        serial_println!(
+            "[nle] fixture drag path={} drags={}/3 saved={} tab={} band={} -> {}",
+            path, drags, if saved_ok { "ok" } else { "FAIL" }, if tab { "ok" } else { "FAIL" }, band.is_some() as u8, if ok { "ok" } else { "FAIL" }
+        );
+        (ok, if ok { "ok" } else { "FAIL" })
+    }
+
+    // ── H264ENCCOLOURHOST (LEDGER SR377): EXPORT-COLOUR-PIN — the exported file's colour read back (handlers.md §5 NLEPROBE-HDR) ──
+    // `export_verdict` re-demuxes NLEFX.MP4; the avc1 track's `Track::colour` (the `colr` `Exp::colour_entry` wrote, the same
+    // colour the SPS VUI states: the kernel reads the container only, it links no h264_core) must state a Kr matrix and an
+    // explicit range. Token `colour=<matrix>/<limited|full>` (the fixture's tick 0 is a utp1 reel: the RGBA path, 6/limited),
+    // `none` when the file states no colour.
+    fn export_colour(d: &demux_core::Demuxer, vi: Option<usize>) -> (bool, String) {
+        let c = vi.and_then(|i| d.tracks().get(i)).and_then(|t| t.colour);
+        match c {
+            Some(c) if yuv_core::kr_kb(c.matrix).is_some() && c.full_range.is_some() => {
+                (true, alloc::format!("{}/{}", c.matrix, if c.full_range == Some(true) { "full" } else { "limited" }))
+            }
+            Some(c) => (false, alloc::format!("{}/{:?}", c.matrix, c.full_range)),
+            None => (false, String::from("none")),
+        }
+    }
+}
+
+// ── NLE6KEYS (rmbp-ledger B961): the Player's editing-key door ─────────────────────────────────────────────────────────
+// `key_route`'s last arm posts a byte that names an editor verb (`vplay::edit_verb`) while the Player shows an EDL with an
+// editor state (`vplay::edit_live`); the next pass runs it (`edit_pass`): the verb on the shared state (`vplay::edit_key`,
+// which saves the EDL), then the scrubber's seek door at the playhead, so the job re-schedules the edited timeline. A
+// paused Player stays paused. Without the video arm the door takes nothing.
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+static EDIT_KEY: AtomicU8 = AtomicU8::new(0);
+
+/// `key_route`'s arm (router depth: a store, no I/O).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_post(ev: crate::pal::Event) -> bool {
+    let crate::pal::Event::Key(b) = ev else { return false };
+    if crate::video::vplay::edit_verb(b).is_none() || !crate::video::vplay::edit_live(&shown()) {
+        return false;
+    }
+    EDIT_KEY.store(b, Ordering::Release);
+    true
+}
+
+/// The pass: the posted key, then the seek door at the playhead it leaves (the facts re-read: the timeline's length moves).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_pass() {
+    let d = EDIT_DRAG.swap(false, Ordering::AcqRel); // NLE6FACEDRAG (rmbp-ledger B975): a released drag first; a key waits a pass
+    let k = if d { 0 } else { EDIT_KEY.swap(0, Ordering::AcqRel) };
+    if k == 0 && !d {
+        return;
+    }
+    let Some((path, ms, playing)) = STATE.lock().as_ref().map(|s| (s.path.clone(), s.shown_ms, s.playing)) else { return };
+    let to = if d { crate::video::vplay::edit_drag_end(&path) } else { crate::video::vplay::edit_key(&path, k, ms) };
+    let Some(to) = to else { return };
+    let _ = vid::seek(to);
+    if let Some(st) = STATE.lock().as_mut() {
+        st.vsaid = false;
+    }
+    if !playing {
+        vid::toggle();
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_close() {
+    if crate::video::vplay::edit_drag_take() {
+        super::capture::cancel(); // NLE6FACEDRAG (rmbp-ledger B975): a drag live at the close lets the pointer go
+    }
+    EDIT_DRAG.store(false, Ordering::Release);
+    let _ = wm::list_furniture(OWNER, false); // NLE6KEYSTAB (rmbp-ledger B975): the NLE leaves the wc window list
+    crate::video::vplay::edit_close();
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+fn edit_post(_: crate::pal::Event) -> bool {
+    false
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+fn edit_pass() {}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+fn edit_close() {}
+
+// ── NLE6KEYSTAB + NLE6FACEDRAG (rmbp-ledger B975): the NLE tab and the view band's pointer door ──────────────────────────────
+// handlers.md §5 NLE6's NLE6KEYS-TAB and NLE6FACE-DRAG. THE TAB: the Player opened on an EDL is titled `NLE - <stem>` (the
+// Player's own `Player - <leaf>` shape, ASCII) and its owner is LISTED in the wc window list while it is open
+// (`wm::list_furniture`: `cycle_order` / `wl_rows` then carry it, so appswitch's Cmd-Tab, the Window menu and WINCYCLE see an
+// app `nle`; appswitch activates it through its existing door); `edit_close` unlists it. Wire: `[nle] tab win=<n> title="NLE -
+// <stem>" listed=<0|1>`. THE DRAG: `press_route`'s picture arm asks `edit_press_route` first: a press on the painted view band
+// begins the host's `view::Drag` (`vplay::edit_press`) and takes the pointer (the capture seam, as the scrubber does); the
+// motion updates it (`vplay::edit_drag_move`, no I/O); the release posts `EDIT_DRAG` and the pass (`edit_pass`) runs
+// `vplay::edit_drag_end` (the commit and the save), then the same seek door the keys use. A press off the band stays play/pause.
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+static EDIT_DRAG: AtomicBool = AtomicBool::new(false);
+
+/// The NLE window's title for an EDL (`None`: a plain Player window).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn nle_title(path: &str) -> Option<String> {
+    crate::video::vplay::is_edl(path).then(|| alloc::format!("NLE - {}", crate::video::vplay::edl_stem(path)))
+}
+
+/// An EDL's window joins the wc window list (the tab).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn nle_tab(id: wm::WinId, path: &str) {
+    if !crate::video::vplay::is_edl(path) {
+        return;
+    }
+    let listed = wm::list_furniture(OWNER, true);
+    serial_println!("[nle] tab win={} title=\"NLE - {}\" listed={}", id, crate::video::vplay::edl_stem(path), listed as u8);
+}
+
+/// A press at surface px `(lx, ly)` on the shown EDL's view band began a drag (no pointer capture: the fixture's door).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_press_at(lx: usize, ly: usize) -> bool {
+    let p = shown();
+    crate::video::vplay::edit_live(&p) && crate::video::vplay::edit_press(&p, lx, ly)
+}
+
+/// `press_route`'s picture arm: a drag begun takes the pointer until the release.
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_press_route(lx: usize, ly: usize) -> bool {
+    if !edit_press_at(lx, ly) {
+        return false;
+    }
+    super::capture::begin(edit_motion, edit_release);
+    true
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_motion_at(lx: usize, ly: usize) {
+    crate::video::vplay::edit_drag_move(lx, ly);
+}
+
+/// The release at surface px: the last motion, then the end posted for the pass (the commit saves: never at router depth).
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_release_at(lx: usize, ly: usize) {
+    edit_motion_at(lx, ly);
+    EDIT_DRAG.store(true, Ordering::Release);
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_motion(x: i32, y: i32) {
+    if let Some((lx, ly)) = local(x, y) {
+        edit_motion_at(lx, ly);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+fn edit_release(x: i32, y: i32) {
+    match local(x, y) {
+        Some((lx, ly)) => edit_release_at(lx, ly),
+        None => EDIT_DRAG.store(true, Ordering::Release),
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+fn nle_title(_: &str) -> Option<String> {
+    None
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+fn nle_tab(_: wm::WinId, _: &str) {}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "videoplayer")))]
+fn edit_press_route(_: usize, _: usize) -> bool {
+    false
+}
+
+// ── KERNELSCALEONEARM (rmbp-ledger B980): the Player's `vid` verb (handlers.md §5 NLEPROBE-HDR's VPLAY-QUEUE-RUNTIME, SCALE-AREA) ──
+// The queue depth and the present's downscale filter at runtime, for measuring the present cost on metal: the Player's own verb,
+// not a Principia key (a debugging aid must not outlive a boot). Each sets the NEXT value; vplay's next job start (an open, a
+// seek) latches it, so `[player] ended ... queue=<n> filter=<nearest|area>` describes the whole play.
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
+    use crate::video::vplay;
+    const USAGE: &str = "usage: vid | vid queue <1..16> | vid filter area|nearest";
+    match (args.first().copied(), args.get(1).copied(), args.len()) {
+        (None, _, _) => {
+            let (qn, an, ql, al) = vplay::knobs();
+            console.println(&alloc::format!("vid: queue={}/{} filter={}/{} (live/next)", ql, qn, vplay::filter_word(al), vplay::filter_word(an)));
+        }
+        (Some("queue"), Some(n), 2) => match n.parse::<u32>() {
+            Ok(n) if vplay::set_queue(n) => console.println(&alloc::format!("vid: queue={} at the next open", n)),
+            _ => console.println(USAGE),
+        },
+        (Some("filter"), Some(f @ ("area" | "nearest")), 2) => {
+            vplay::set_filter(f == "area");
+            console.println(&alloc::format!("vid: filter={} at the next open{}", f, if f == "area" { " (downscales >= 2x)" } else { "" }));
+        }
+        _ => console.println(USAGE),
     }
 }

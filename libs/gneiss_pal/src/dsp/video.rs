@@ -169,11 +169,12 @@ pub fn reorder_depth(track: &Track) -> Option<u32> {
 /// NLEPROBEHDRWIRE (LEDGER SR305): the bitstream's colour of a video track, read by its codec core from the track's decoder
 /// configuration — what `Demuxer::fill_colour` takes as the fallback for what the container did not say (NLEPROBEHDR SR226;
 /// demux_core links no decoder, the [`reorder_depth`] shape). H.264 → `h264_core::ps::avcc_sps`'s VUI (only when
-/// video_signal_type is present); AV1 → `av1_core::image::av1c_codes` mapped by `Colour::from_av1` (KERNELCOLOUR B952; color_config, plus the METADATA OBUs' content light
-/// levels and mastering display) when the `av1` feature is on. Anything else → `None` (HEVC-VUI is owed: hevc_core's SPS
+/// video_signal_type is present); AV1 → `av1_core::image::stream_codes` (the av1C configOBUs, else `first`'s in-band sequence header, AV1INBANDCOLOUR SR366) mapped by `Colour::from_av1` (KERNELCOLOUR B952; color_config, plus the METADATA OBUs' content light
+/// levels and mastering display) when the `av1` feature is on; VP9 → `vp9_core::header::header_codes` (the first key frame's
+/// color_space / color_range, AV1INBANDSIZE SR379's VP9-INBAND-COLOUR). Anything else → `None` (HEVC-VUI is owed: hevc_core's SPS
 /// carries the VUI colour, but its hvcC SPS reader is still the depth's own walk). Both of Stria's opens pass it by name
 /// beside [`reorder_depth`].
-pub fn colour_of(track: &Track) -> Option<super::demux::colour::Colour> {
+pub fn colour_of(track: &Track, first: &[u8]) -> Option<super::demux::colour::Colour> {
     use super::demux::colour::Colour;
     match &track.codec {
         Codec::Avc => {
@@ -191,7 +192,8 @@ pub fn colour_of(track: &Track) -> Option<super::demux::colour::Colour> {
             })
         }
         #[cfg(feature = "av1")]
-        Codec::Av1 => av1_core::image::av1c_codes(&track.config).map(|(c, l, m)| Colour::from_av1(c, l, m)), // KERNELCOLOUR (B952): the one mapping, the kernel Player's too
+        Codec::Av1 => av1_core::image::stream_codes(&track.config, first).map(|(c, l, m)| Colour::from_av1(c, l, m)), // KERNELCOLOUR (B952): the one mapping, the kernel Player's too; AV1INBANDCOLOUR (SR366): `first` the track's first sample
+        Codec::Vp9 => vp9_core::header::header_codes(first).map(|(primaries, transfer, matrix, full)| Colour { primaries, transfer, matrix, full_range: Some(full), mastering: None, light: None }), // AV1INBANDSIZE (SR379): VP9-INBAND-COLOUR, host only (the kernel decodes no VP9)
         _ => None,
     }
 }
@@ -565,5 +567,68 @@ mod tests {
         // RGBA frames pass through untouched.
         let rgba = Frame { width: 1, height: 1, pts_ns: 0, pixels: Pixels::Rgba(vec![1, 2, 3, 4]) };
         assert_eq!(rgba.to_rgba_colour(Some(&colour(9, Some(true))), Chroma::Nearest), [1, 2, 3, 4]);
+    }
+}
+
+/// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): a video track's profile, tier and level as the Player's info line
+/// tokens ([`profile_tokens`]), read by its codec core from the track's decoder configuration — the [`reorder_depth`]
+/// dispatch shape. H.264 -> `h264_core::ps::avcc_sps` (profile_idc named per H.264 A.2, level_idc; H.264 has no tier);
+/// HEVC -> `hevc::hvcc_ptl` (hevc_core's A.3 names) when the `hevc` feature is on. Anything else, or a track with no
+/// configuration record (Annex B: the SPS arrives with the first sample), -> `None`.
+pub fn profile_level(track: &Track) -> Option<String> {
+    match &track.codec {
+        Codec::Avc => {
+            let s = h264_core::ps::avcc_sps(&track.config)?;
+            let profile = match s.profile_idc {
+                66 => "Baseline",
+                77 => "Main",
+                88 => "Extended",
+                100 => "High",
+                110 => "High10",
+                122 => "High422",
+                244 => "High444",
+                44 => "CAVLC444",
+                83 => "ScalableBaseline",
+                86 => "ScalableHigh",
+                118 => "MultiviewHigh",
+                128 => "StereoHigh",
+                _ => "Unknown",
+            };
+            // A.3.1 / A.3.2: level 1b is level_idc 9, or 11 with constraint_set3_flag in Baseline / Main / Extended.
+            let one_b = s.level_idc == 9 || (s.level_idc == 11 && s.constraint_set3 && matches!(s.profile_idc, 66 | 77 | 88));
+            let level = if one_b { (1, 0xB) } else { (s.level_idc / 10, s.level_idc % 10) };
+            Some(profile_tokens(profile, None, level))
+        }
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => hevc::hvcc_ptl(&track.config).map(|p| profile_tokens(p.profile, Some(p.tier), p.level)),
+        _ => None,
+    }
+}
+
+/// HEVCLEVELLINE (SR368): THE one formatter of the profile / tier / level tokens, both codecs':
+/// `profile=<name>[ tier=<main|high>] level=<major>[.<minor>]`; minor 0xB is H.264's level "1b".
+pub fn profile_tokens(profile: &str, tier: Option<&str>, level: (u8, u8)) -> String {
+    let mut s = format!("profile={profile}");
+    if let Some(t) = tier {
+        s += &format!(" tier={t}");
+    }
+    match level {
+        (m, 0xB) => s += &format!(" level={m}b"),
+        (m, 0) => s += &format!(" level={m}"),
+        (m, n) => s += &format!(" level={m}.{n}"),
+    }
+    s
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::profile_tokens;
+
+    #[test]
+    fn profile_tokens_kat() {
+        assert_eq!(profile_tokens("High", None, (4, 1)), "profile=High level=4.1");
+        assert_eq!(profile_tokens("Baseline", None, (1, 0xB)), "profile=Baseline level=1b");
+        assert_eq!(profile_tokens("Main10", Some("main"), (5, 0)), "profile=Main10 tier=main level=5");
+        assert_eq!(profile_tokens("Main422_10", Some("high"), (6, 2)), "profile=Main422_10 tier=high level=6.2");
     }
 }

@@ -482,3 +482,178 @@ fn avif_container_public_vectors() {
         assert_eq!((fh.tile_info.tile_cols, fh.tile_info.tile_rows), (1, 1));
     }
 }
+
+// AV1INBANDCOLOUR (LEDGER SR366): an av1C without configOBUs states no colour; the first temporal unit's in-band sequence
+// header does, read by the same walk (`obus_colour`) and fold as the configOBUs.
+
+/// A profile-0 8-bit 4:2:0 reduced sequence header stating `(primaries, transfer, matrix)` and `full`.
+fn inband_seq(cp: u8, tc: u8, mc: u8, full: bool) -> Vec<u8> {
+    reduced_seq(0, &|w| {
+        w.flag(false); // high_bitdepth
+        w.flag(false); // mono_chrome
+        w.flag(true); // color_description_present_flag
+        w.put(8, cp as u64);
+        w.put(8, tc as u64);
+        w.put(8, mc as u64);
+        w.flag(full); // color_range
+        w.put(2, 0); // chroma_sample_position
+        w.flag(false); // separate_uv_delta_q
+    })
+}
+
+/// HDR_CLL metadata (max_cll 1000, max_fall 400).
+fn inband_cll() -> Vec<u8> {
+    let mut p = vec![1u8];
+    p.extend_from_slice(&1000u16.to_be_bytes());
+    p.extend_from_slice(&400u16.to_be_bytes());
+    p
+}
+
+#[test]
+fn av1inband_sequence_codes_equal_the_av1c_reading() {
+    use av1_core::image::{av1c_codes, sequence_codes, stream_codes};
+    let seq = inband_seq(1, 1, 6, true);
+    // A temporal unit as MP4 / Matroska store it: temporal delimiter, sequence header, metadata, padding.
+    let mut tu = obu(2, &[], true);
+    tu.extend(obu(1, &seq, true));
+    tu.extend(obu(5, &inband_cll(), true));
+    tu.extend(obu(15, &[0xAA, 0x55], true));
+    // The same header and metadata as an av1C's configOBUs.
+    let mut full = vec![0x81, 0x00, 0x0C, 0x00];
+    full.extend(obu(1, &seq, true));
+    full.extend(obu(5, &inband_cll(), true));
+    let bare = vec![0x81, 0x00, 0x0C, 0x00];
+    let want = ((1, 1, 6, true), Some((1000, 400)), None);
+    assert_eq!(av1c_codes(&full), Some(want));
+    assert_eq!(sequence_codes(&tu), Some(want), "the in-band header reads as the configOBUs do");
+    assert_eq!(av1c_codes(&bare), None, "an av1C without configOBUs states no colour");
+    assert_eq!(stream_codes(&bare, &tu), Some(want), "the first temporal unit fills it");
+    assert_eq!(stream_codes(&bare, &[]), None);
+    let mut other = obu(2, &[], true);
+    other.extend(obu(1, &inband_seq(9, 16, 9, false), true));
+    assert_eq!(sequence_codes(&other), Some(((9, 16, 9, false), None, None)));
+    assert_eq!(stream_codes(&full, &other), Some(want), "the configOBUs win over the in-band header");
+    let mut no_seq = obu(2, &[], true);
+    no_seq.extend(obu(15, &[0; 3], true));
+    assert_eq!(sequence_codes(&no_seq), None, "a temporal unit with no sequence header");
+}
+
+// AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream — the decoder's current codes follow it (with the in-band
+// HDR metadata after the first temporal unit), and `StreamDecoder::switch` re-picks under the container-wins rule.
+
+/// A temporal unit: temporal delimiter, sequence header `seq`, then `extra` OBUs (no frame: the header and metadata path alone).
+fn inbandswitch_tu(seq: &[u8], extra: &[Vec<u8>]) -> Vec<u8> {
+    let mut tu = obu(2, &[], true);
+    tu.extend(obu(1, seq, true));
+    for e in extra {
+        tu.extend_from_slice(e);
+    }
+    tu
+}
+
+#[test]
+fn av1inbandswitch_current_codes_follow_the_in_band_header() {
+    use av1_core::image::{switch_codes, StreamDecoder};
+    let mut sd = StreamDecoder::new(&[]).unwrap();
+    assert_eq!(sd.dec.current_codes(), None, "no header yet");
+    let open = Some((1, 1, 1, Some(false)));
+    sd.decode_temporal_unit_all(&inbandswitch_tu(&inband_seq(1, 1, 1, false), &[])).unwrap();
+    assert_eq!(sd.dec.current_codes(), Some(((1, 1, 1, false), None, None)));
+    assert_eq!(sd.switch(open), (None, None), "the first header is the open's: no switch");
+    // the second temporal unit: a new header (BT.601) and HDR_CLL metadata after the first temporal unit
+    sd.decode_temporal_unit_all(&inbandswitch_tu(&inband_seq(6, 6, 6, false), &[obu(5, &inband_cll(), true)])).unwrap();
+    assert_eq!(sd.dec.current_codes(), Some(((6, 6, 6, false), Some((1000, 400)), None)), "current codes follow the new header and carry the CLL");
+    assert_eq!(sd.switch(open), (Some((6, 6, 6, Some(false))), Some((1, 6))), "the switch, reported once");
+    assert_eq!(sd.switch(open), (Some((6, 6, 6, Some(false))), None), "held, not reported again");
+    // a container-stated field (primaries 9, unlike the open's in-band 1) survives the switch
+    assert_eq!(switch_codes(Some((9, 1, 1, Some(false))), (1, 1, 1, false), (6, 6, 6, true)), (9, 6, 6, Some(true)));
+    assert_eq!(switch_codes(None, (1, 1, 1, false), (6, 6, 6, true)), (6, 6, 6, Some(true)), "no open colour: the new header whole");
+    // a seek drops the reference frames, not the switch state; back at the base header = the open's colour again
+    sd.reset();
+    sd.decode_temporal_unit_all(&inbandswitch_tu(&inband_seq(1, 1, 1, false), &[])).unwrap();
+    assert_eq!(sd.switch(open), (None, Some((6, 1))), "the switch back, reported once");
+    assert_eq!(sd.dec.current_codes(), Some(((1, 1, 1, false), Some((1000, 400)), None)), "the last CLL stays in effect");
+    println!("av1inbandswitch: current_codes 1/1/1 -> 6/6/6+cll -> 1/1/1; switch reported twice; container primaries kept");
+}
+
+// AV1INBANDSIZE (LEDGER SR379): a sequence header that really changes mid-stream starts a new coded video sequence (§7.5): the
+// decoder drops every reference (`RefStore::clear`), so a frame of the new sequence decodes at its own size and an inter frame
+// that references across the boundary is refused; `StreamDecoder::size_switch` reports the size change once.
+
+#[test]
+fn av1inbandsize_changed_header_drops_the_refs() {
+    use av1_core::image::{same_sequence, StreamDecoder};
+    let mut sd = StreamDecoder::new(&[]).unwrap();
+    sd.decode_temporal_unit_all(&inbandswitch_tu(&inband_seq(1, 1, 1, false), &[])).unwrap();
+    sd.dec.refs.valid = [true; 8];
+    sd.dec.refs.order_hint = [3; 8];
+    sd.decode_temporal_unit_all(&inbandswitch_tu(&inband_seq(1, 1, 1, false), &[])).unwrap();
+    assert_eq!(sd.dec.refs.valid, [true; 8], "the same header repeated keeps the coded video sequence");
+    sd.decode_temporal_unit_all(&inbandswitch_tu(&inband_seq(6, 6, 6, false), &[])).unwrap();
+    assert_eq!((sd.dec.refs.valid, sd.dec.refs.order_hint), ([false; 8], [0; 8]), "a changed header drops every reference");
+    // operating_parameters_info may change within a sequence; the frame size may not
+    let a = SequenceHeader::parse(&build_full_seq()).unwrap();
+    assert!(!a.operating_points.is_empty());
+    let mut b = a.clone();
+    b.operating_points[0].decoder_buffer_delay += 1;
+    b.operating_points[0].encoder_buffer_delay += 1;
+    b.operating_points[0].low_delay_mode_flag = !b.operating_points[0].low_delay_mode_flag;
+    assert!(same_sequence(&a, &b), "operating_parameters_info aside");
+    b.max_frame_width_minus_1 += 1;
+    assert!(!same_sequence(&a, &b), "another max_frame_width is another sequence");
+    // the size rule: once per change, none for the first picture
+    assert_eq!(sd.size_switch(66, 66), None);
+    assert_eq!(sd.size_switch(66, 66), None);
+    assert_eq!(sd.size_switch(16, 16), Some(((66, 66), (16, 16))));
+    sd.reset();
+    assert_eq!(sd.size_switch(16, 16), None, "a seek keeps the last size");
+    println!("av1inbandsize: same header keeps refs, changed header drops them; op params aside; size switch once");
+}
+
+/// A decoded 8-bit 4:2:0 frame's bytes as libaom's MD5 reads them (Y, U, V rows).
+fn av1inbandsize_bytes(p: &av1_core::image::Planes) -> Vec<u8> {
+    p.y.iter().chain(&p.u).chain(&p.v).map(|&s| s as u8).collect()
+}
+
+#[test]
+fn av1inbandsize_new_sequence_decodes_at_the_new_size() {
+    use av1_core::image::StreamDecoder;
+    use common::{hex, ivf_frames, md5};
+    let (Some(big), Some(big_md5), Some(small), Some(small_md5)) =
+        (fetch("av1-1-b8-01-size-66x66"), fetch("av1-1-b8-01-size-66x66.md5"), fetch("av1-1-b8-01-size-16x16"), fetch("av1-1-b8-01-size-16x16.md5"))
+    else {
+        println!("av1inbandsize: SKIP (vectors offline)");
+        return;
+    };
+    let md5s = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap().lines().filter_map(|l| l.split_whitespace().next().map(String::from)).collect::<Vec<_>>();
+    let (want_big, want_small) = (md5s(&big_md5), md5s(&small_md5));
+    let (tus_big, tus_small) = (ivf_frames(&big), ivf_frames(&small));
+    let mut sd = StreamDecoder::new(&[]).unwrap();
+    let mut n = 0;
+    for tu in &tus_big {
+        let Some(p) = sd.decode_temporal_unit_all(tu).unwrap().pop() else { continue };
+        assert_eq!((p.width, p.height), (66, 66));
+        assert_eq!(hex(&md5(&av1inbandsize_bytes(&p))), want_big[n], "66x66 frame {n}");
+        assert_eq!(sd.size_switch(p.width, p.height), None, "one size: no switch");
+        n += 1;
+    }
+    assert_eq!(n, want_big.len());
+    // the 16x16 stream's sequence header, then its second temporal unit (an inter frame): across the boundary, refused
+    let seq16 = split_obus(tus_small[0]).unwrap().into_iter().find(|o| o.obu_type == 1).expect("TU0 carries the sequence header").payload.to_vec();
+    assert_ne!(SequenceHeader::parse(&seq16).unwrap(), sd.dec.seq.clone().unwrap(), "two sequences");
+    let mut probe = obu(1, &seq16, true);
+    probe.extend_from_slice(tus_small[1]);
+    let err = sd.decode_temporal_unit_all(&probe).err().expect("an inter frame across a new sequence is refused");
+    assert!(format!("{err}").contains("empty slot"), "{err}");
+    // the 16x16 stream from its key frame: every frame at the new size, frame-exact against libaom
+    let mut m = 0;
+    for tu in &tus_small {
+        let Some(p) = sd.decode_temporal_unit_all(tu).unwrap().pop() else { continue };
+        assert_eq!((p.width, p.height), (16, 16));
+        assert_eq!(hex(&md5(&av1inbandsize_bytes(&p))), want_small[m], "16x16 frame {m} after the switch");
+        assert_eq!(sd.size_switch(p.width, p.height), (m == 0).then_some(((66, 66), (16, 16))), "the size switch, reported once");
+        m += 1;
+    }
+    assert_eq!(m, want_small.len());
+    println!("av1inbandsize: 66x66 x{n} -> inter probe refused ({err}) -> 16x16 x{m}, all = libaom");
+}

@@ -20,7 +20,7 @@ use timeline_core::{Clip, Kind, SourceId, Timeline};
 
 const BASE: [u32; 2] = [0, 1000];
 const PER: usize = (SYNTH_RATE / 25) as usize; // samples per tick
-const TICKS: i64 = 35;
+const TICKS: i64 = 35; // H264ENCCOLOURHOST (SR377): HOST_VUI, the export's VUI colour, the fresh encoders' too (test tail)
 
 /// NLE1's timeline: A[13,23)@0, B[0,10)@10 split at 15, a gap 20..25, A[23,33)@25 (video and audio alike).
 fn timeline() -> Timeline {
@@ -176,10 +176,53 @@ fn mp4_audio_round_trip() {
     assert_eq!(got, want_pcm(&tl, &src));
 }
 
+/// NLE6EXPORTAAC (rmbp-ledger B960): `AudioOut::Aac` writes `audio.mp4` with one `mp4a` AAC-LC track: the ASC is LC
+/// mono at 48 kHz, the edit list skips the encoder's 1024-sample priming, every sample decodes through audio_core's
+/// decoder (`gneiss_pal::dsp::audio::aac`), and the decoded sound after the priming tracks the render's samples (the
+/// synthetic sawtooth at 128 kb/s: 34.2 dB measured, 67 units, 7325 bytes; the floor 30 dB).
+#[test]
+fn aac_audio_round_trip() {
+    use gneiss_pal::dsp::audio::aac::{AacDecoder, Asc};
+    use gneiss_pal::dsp::audio::bits::BitReader;
+    const SNR_FLOOR: f64 = 30.0;
+    let tl = timeline();
+    let src = sources(&tl);
+    let dir = fresh("aac");
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(RawSequence), AudioOut::Aac(128)).unwrap();
+    assert_eq!((r.files, r.pcm_frames), (3, 35 * PER as u64));
+    let mp4 = std::fs::read(dir.join("audio.mp4")).unwrap();
+    assert_eq!(r.bytes, std::fs::metadata(dir.join("video.rgba")).unwrap().len() + std::fs::metadata(dir.join("video.json")).unwrap().len() + mp4.len() as u64);
+    let d = Demuxer::open(mp4).unwrap();
+    assert_eq!(d.tracks().len(), 1);
+    let t = &d.tracks()[0];
+    assert_eq!((t.kind, t.codec.clone(), t.sample_rate, t.channels), (TrackKind::Audio, Codec::Aac, SYNTH_RATE, 1));
+    assert_eq!(t.config, vec![0x11, 0x88]);
+    assert_eq!(t.edit.map(|e| e.media_time), Some(1024));
+    let asc = Asc::parse(&t.config).unwrap();
+    let mut dec = AacDecoder::new(asc.sf_index, asc.layout().unwrap()).unwrap();
+    let want = want_pcm(&tl, &src);
+    let units: Vec<Vec<u8>> = d.track_samples(0).map(|s| d.packet_at(s).data).collect();
+    assert_eq!(units.len(), want.len().div_ceil(1024) + 1);
+    let mut got = Vec::new();
+    for u in &units {
+        dec.decode_block(&mut BitReader::new(u), 0).unwrap();
+        got.extend(dec.out[0].iter().map(|&v| v as f64 * 32768.0));
+    }
+    let (mut s, mut n) = (0f64, 0f64);
+    for (i, &w) in want.iter().enumerate() {
+        let e = w as f64 - got[i + 1024];
+        s += w as f64 * w as f64;
+        n += e * e;
+    }
+    let snr = 10.0 * (s / n.max(1e-9)).log10();
+    println!("aac_audio_round_trip: units={} bytes={} snr={snr:.1} dB", units.len(), units.iter().map(|u| u.len()).sum::<usize>());
+    assert!(snr >= SNR_FLOOR, "SNR {snr:.1} dB");
+}
+
 /// NLE5B: a fresh H264ENC encoder over the render's frames (the same converter and config): its samples, its avcC and
 /// its reconstruction per frame.
 fn fresh_h264(frames: &[Vec<u8>], gop: u32) -> (Vec<Vec<u8>>, Vec<u8>, Vec<[Vec<u8>; 3]>, Vec<I420>) {
-    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop, ..Default::default() }).unwrap();
+    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop, colour: HOST_VUI, ..Default::default() }).unwrap();
     let (mut samples, mut recon, mut input) = (Vec::new(), Vec::new(), Vec::new());
     for f in frames {
         let yuv = I420::from_rgba(64, 48, f).unwrap();
@@ -309,7 +352,7 @@ fn h264_bframes_export_writes_composition_offsets() {
     let dir = fresh("h264bframes");
     let r = export(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 10).with_bframes(2)), AudioOut::Mp4).unwrap();
     assert_eq!(r.frames, 35);
-    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop: 10, bframes: 2, ..Default::default() }).unwrap();
+    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop: 10, bframes: 2, colour: HOST_VUI, ..Default::default() }).unwrap();
     let (mut want, mut recon) = (Vec::new(), Vec::new());
     for f in &refr.frames {
         want.extend(enc.push(&I420::from_rgba(64, 48, f).unwrap().as_yuv420()).unwrap());
@@ -365,7 +408,7 @@ fn h264_pyramid_export_reorder_depth_two() {
     let dir = fresh("h264pyramid");
     let r = export(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 10).with_bframes(3)), AudioOut::Mp4).unwrap();
     assert_eq!(r.frames, 35);
-    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop: 10, bframes: 3, ..Default::default() }).unwrap();
+    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop: 10, bframes: 3, colour: HOST_VUI, ..Default::default() }).unwrap();
     let (mut want, mut recon) = (Vec::new(), Vec::new());
     for f in &refr.frames {
         want.extend(enc.push(&I420::from_rgba(64, 48, f).unwrap().as_yuv420()).unwrap());
@@ -405,4 +448,66 @@ fn h264_pyramid_export_reorder_depth_two() {
     }
     let bytes: usize = want.iter().map(|a| a.avcc_sample().len()).sum();
     println!("h264 pyramid bframes 3 export: {bytes} bytes, ctts offsets {offsets:?}");
+}
+
+// ── H264ENCCOLOURHOST (LEDGER SR377): the host export states ONE file colour (handlers.md §5 NLEPROBE-HDR) ──
+/// The VUI codes of `nle_export::RGBA_COLOUR`: the fresh encoders above state them as the export does (their avcC pins).
+const HOST_VUI: Option<(u8, u8, u8, bool)> = Some((2, 2, 6, false));
+
+/// An H.264 export states its file colour as the avc1's `colr` (`Track::colour` on a plain open) and as the avcC's SPS VUI
+/// (the Player's `colour_of`): matrix 6 limited (the RGBA path's BT.601 limited, the kernel export's tag). EXPORTCOLOURPRIM
+/// (rmbp-ledger B979): the primaries / transfer are the reels' one pair (`Timeline::reels_colour`, the kernel's rule too):
+/// untagged reels 2/2/6, one reel tagged BT.709 (`colr` 1/1/1 limited) 1/1/6, two reels that differ (BT.709 and BT.2020)
+/// 2/2/6, since the mix converts no primaries. An audio-only MP4 (no H.264) states none.
+#[test]
+fn h264enccolourhost_export_states_the_file_colour() {
+    use gneiss_pal::dsp::demux::build::Mp4Extras;
+    use gneiss_pal::dsp::demux::colour::Colour;
+    use gneiss_pal::dsp::video::colour_of;
+    use stria::nle::synth_source_with;
+    use stria::nle_export::RGBA_COLOUR;
+    assert_eq!(RGBA_COLOUR, Colour { primaries: 2, transfer: 2, matrix: 6, full_range: Some(false), mastering: None, light: None });
+    let check = |label: &str, mp4: Vec<u8>, want: Colour| {
+        let d = Demuxer::open(mp4).unwrap();
+        let vt = &d.tracks()[0];
+        assert_eq!(vt.codec, Codec::Avc, "{label}");
+        assert_eq!(vt.colour, Some(want), "{label}: the colr");
+        assert_eq!(colour_of(vt, &[]), Some(want), "{label}: the SPS VUI");
+    };
+    let tl = timeline();
+    let src = sources(&tl);
+    let dir = fresh("h264colour");
+    export(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap();
+    check("untagged reels", std::fs::read(dir.join("video.mp4")).unwrap(), RGBA_COLOUR);
+
+    let mut one = Timeline::new(25);
+    let a = one.add_source("A", 50);
+    one.add_track(Kind::Video);
+    one.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+    let bt709 = Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false), mastering: None, light: None };
+    let mut s1 = Sources::new(&one);
+    s1.add(a, synth_source_with(0, 50, 25, &Mp4Extras { colour: vec![(1, bt709)], ..Mp4Extras::default() })).unwrap();
+    assert_eq!(s1.open_report(a).and_then(|r| r.colour), Some(bt709), "the reel states BT.709");
+    let dir = fresh("h264colour709");
+    export(&one, 0..20, &s1, &dir, Box::new(H264Encoder::new(26, 10).with_bframes(2)), AudioOut::None).unwrap();
+    check("one BT.709 reel", std::fs::read(dir.join("video.mp4")).unwrap(), Colour { primaries: 1, transfer: 1, ..RGBA_COLOUR });
+
+    let mut two = Timeline::new(25);
+    let a = two.add_source("A", 50);
+    let b = two.add_source("B", 50);
+    two.add_track(Kind::Video);
+    two.tracks[0].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+    let bt2020 = Colour { primaries: 9, transfer: 14, matrix: 9, full_range: Some(false), mastering: None, light: None };
+    let mut s2 = Sources::new(&two);
+    s2.add(a, synth_source_with(0, 50, 25, &Mp4Extras { colour: vec![(1, bt709)], ..Mp4Extras::default() })).unwrap();
+    s2.add(b, synth_source_with(0, 50, 25, &Mp4Extras { colour: vec![(1, bt2020)], ..Mp4Extras::default() })).unwrap();
+    assert_eq!(s2.open_report(b).and_then(|r| r.colour), Some(bt2020), "the second reel states BT.2020");
+    let dir = fresh("h264colourmixed");
+    export(&two, 0..20, &s2, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap();
+    check("two differing reels", std::fs::read(dir.join("video.mp4")).unwrap(), RGBA_COLOUR);
+
+    let dir = fresh("rawcolour");
+    export(&tl, 0..TICKS, &src, &dir, Box::new(RawSequence), AudioOut::Mp4).unwrap();
+    let d = Demuxer::open(std::fs::read(dir.join("audio.mp4")).unwrap()).unwrap();
+    assert!(d.tracks().iter().all(|t| t.kind == TrackKind::Audio && t.colour.is_none()), "no video, no colour");
 }

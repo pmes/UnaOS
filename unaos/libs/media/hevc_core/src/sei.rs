@@ -6,9 +6,10 @@
 //! HEVCCONF (LEDGER SR321): the decoded picture hash SEI message (7.3.5 sei_message, D.2.19 decoded_picture_hash,
 //! payloadType 132 in a SUFFIX_SEI_NUT) and its check (D.3.19) against the decoded sample arrays after the in-loop
 //! filters, the full pic_width x pic_height picture (not the conformance-window crop). The CRC and checksum variants are
-//! computed here; MD5 needs a digest this zero-dependency crate does not carry and is refused BY NAME
-//! ([`HashCheck::Md5Unchecked`], owed HEVCCONF-MD5 through crypto_core). SEI is non-normative: a malformed message never
-//! fails a decode (the decoder drops it).
+//! computed here; HEVCLEVELLINE (SR368, HEVCSEI-MD5): so is MD5, through crypto_core's digest ([`plane_md5`], the
+//! `Md5Unchecked` verdict deleted). SEI is non-normative: a malformed message never
+//! fails a decode (the decoder drops it). HEVCSCCTAIL (SR365, HEVCREXT-MONOHASH): a 4:0:0 picture's hash carries one
+//! component ([`picture_hash_n`]) and is checked over its one sample array.
 
 use crate::picture::Plane;
 use crate::{Error, Result};
@@ -32,13 +33,17 @@ pub enum HashCheck {
     Match,
     /// The first component (cIdx) whose hash differs.
     Mismatch(usize),
-    /// An MD5 hash: refused by name (HEVCCONF-MD5), not compared.
-    Md5Unchecked,
 }
 
 /// The decoded_picture_hash (payloadType 132) of a SEI RBSP (7.3.2.4 sei_rbsp: sei_message()s until the trailing bits),
-/// `None` when the RBSP carries none or a reserved hash_type. Three components (hevc_core decodes 4:2:0 only).
+/// `None` when the RBSP carries none or a reserved hash_type. Three components ([`picture_hash_n`] with 3).
 pub fn picture_hash(rbsp: &[u8]) -> Result<Option<PictureHash>> {
+    picture_hash_n(rbsp, 3)
+}
+
+/// HEVCSCCTAIL (SR365): [`picture_hash`] of a picture with `components` colour components (D.2.19: 1 at
+/// chroma_format_idc 0, else 3); the components it does not carry are 0.
+pub fn picture_hash_n(rbsp: &[u8], components: usize) -> Result<Option<PictureHash>> {
     let mut i = 0;
     // more_rbsp_data(): stop at the rbsp_stop_one_bit byte followed only by zeros.
     while i < rbsp.len() && !(rbsp[i] == 0x80 && rbsp[i + 1..].iter().all(|&b| b == 0)) {
@@ -58,14 +63,14 @@ pub fn picture_hash(rbsp: &[u8]) -> Result<Option<PictureHash>> {
         let payload = rbsp.get(i..i + payload_size).ok_or(Error::Truncated)?;
         i += payload_size;
         if payload_type == 132 {
-            return decoded_picture_hash(payload);
+            return decoded_picture_hash(payload, components.clamp(1, 3));
         }
     }
     Ok(None)
 }
 
 /// D.2.19 decoded_picture_hash( payloadSize ).
-fn decoded_picture_hash(p: &[u8]) -> Result<Option<PictureHash>> {
+fn decoded_picture_hash(p: &[u8], comps: usize) -> Result<Option<PictureHash>> {
     let (&hash_type, rest) = p.split_first().ok_or(Error::Truncated)?;
     let n = match hash_type {
         0 => 16,
@@ -73,10 +78,11 @@ fn decoded_picture_hash(p: &[u8]) -> Result<Option<PictureHash>> {
         2 => 4,
         _ => return Ok(None),
     };
-    if rest.len() < 3 * n {
+    if rest.len() < comps * n {
         return Err(Error::Truncated);
     }
-    let c = |k: usize| &rest[k * n..(k + 1) * n];
+    let zero = [0u8; 16];
+    let c = |k: usize| if k < comps { &rest[k * n..(k + 1) * n] } else { &zero[..n] };
     Ok(Some(match hash_type {
         0 => Md5([0, 1, 2].map(|k| c(k).try_into().unwrap())),
         1 => Crc([0, 1, 2].map(|k| u16::from_be_bytes(c(k).try_into().unwrap()))),
@@ -128,13 +134,32 @@ pub fn plane_checksum(p: &Plane, bit_depth: u32) -> u32 {
     sum
 }
 
+/// HEVCLEVELLINE (SR368, HEVCSEI-MD5): D.3.19 picture_md5 of one component: the MD5 (crypto_core, RFC 1321) of
+/// pictureData, the same bytes [`plane_crc`] reads.
+pub fn plane_md5(p: &Plane, bit_depth: u32) -> [u8; 16] {
+    let mut md5 = crypto_core::md5::Md5::new();
+    let (mut buf, mut n) = ([0u8; 64], 0);
+    for_each_byte(p, bit_depth, |b| {
+        buf[n] = b;
+        n += 1;
+        if n == buf.len() {
+            md5.update(&buf);
+            n = 0;
+        }
+    });
+    md5.update(&buf[..n]);
+    md5.finalize()
+}
+
 /// Check a picture's decoded sample arrays (after deblocking and SAO) against its decoded_picture_hash. HEVCREXT
 /// (SR334): D.3.19's bitDepth is per component — BitDepthY for plane 0, BitDepthC (`bit_depth_c`) for planes 1 and 2.
+/// HEVCSCCTAIL (SR365): a 4:0:0 picture (0x0 chroma planes) is checked over its one component.
 pub fn check(planes: &[Plane; 3], bit_depth: u32, bit_depth_c: u32, h: &PictureHash) -> HashCheck {
-    for c in 0..3 {
+    let comps = if planes[1].data.is_empty() && planes[2].data.is_empty() { 1 } else { 3 };
+    for c in 0..comps {
         let bd = if c == 0 { bit_depth } else { bit_depth_c };
         let ok = match h {
-            Md5(_) => return HashCheck::Md5Unchecked,
+            Md5(want) => plane_md5(&planes[c], bd) == want[c],
             Crc(want) => plane_crc(&planes[c], bd) == want[c],
             Checksum(want) => plane_checksum(&planes[c], bd) == want[c],
         };

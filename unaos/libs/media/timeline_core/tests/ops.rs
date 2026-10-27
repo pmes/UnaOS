@@ -150,3 +150,23 @@ fn many_ops_are_one_transaction() {
     assert_eq!(tl.ripple_delete_many(&[(7, 0)]), Err(EditError::NoTrack));
     assert_eq!(tl, before);
 }
+
+// ── EXPORTCOLOURPRIM (rmbp-ledger B979): the export's ONE primaries / transfer rule ──
+#[test]
+fn exportcolourprim_reels_colour_is_the_one_pair() {
+    use demux_core::colour::Colour;
+    let col = |p: u8, t: u8, m: u8| Colour { primaries: p, transfer: t, matrix: m, full_range: Some(false), mastering: None, light: None };
+    let (tl, a, b) = base(); // V1: A then B; A1 empty
+    let by = move |ca: Option<Colour>, cb: Option<Colour>| move |id: SourceId| if id == a { ca } else if id == b { cb } else { None };
+    assert_eq!(tl.reels_colour(by(Some(col(1, 1, 1)), Some(col(1, 1, 6)))), (1, 1), "all equal: the pair (the matrix is not part of it)");
+    assert_eq!(tl.reels_colour(by(Some(col(1, 1, 1)), Some(col(9, 14, 9)))), (2, 2), "one differs");
+    assert_eq!(tl.reels_colour(by(Some(col(1, 1, 1)), None)), (2, 2), "one states none");
+    assert_eq!(tl.reels_colour(by(None, None)), (2, 2), "none stated");
+    let mut audio = tl.clone();
+    audio.tracks[1].clips = vec![Clip::new(b, 0, 10, 0)];
+    assert_eq!(audio.reels_colour(by(Some(col(1, 1, 1)), Some(col(1, 1, 1)))), (1, 1), "same reels");
+    audio.tracks[0].clips = vec![Clip::new(a, 0, 10, 0)];
+    assert_eq!(audio.reels_colour(by(Some(col(9, 16, 9)), None)), (9, 16), "an audio-track clip's reel is not a picture");
+    audio.tracks[0].clips.clear();
+    assert_eq!(audio.reels_colour(by(Some(col(1, 1, 1)), Some(col(1, 1, 1)))), (2, 2), "no video clip");
+}

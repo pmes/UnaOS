@@ -925,3 +925,52 @@ refs/heads/exec-rmbp-swapbackvplay   5b23271da FOLDED-BY-HAND (this commit) 2026
 refs/heads/exec-rmbp-nle6mixface   721600d2c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-stationroamsweep   1703321fe FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle6export   c29def3f8 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-colourone422   95cdd4473 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle6exportaac   1050b375e FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pdf4glyphpos   df2a6fe90 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pdfsignkeyparse   a673d172b FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-mathone   042ebb079 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle6keys   e5c367291 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-userstriacolourone   4a6fb8242 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-savedialog   90ac96b5d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-stationroam5g   33cdf45fb FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-hevcscctail   07f7262c1 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-av1inbandcolour   ab42d6cb8 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-metaiccone   8d63439cb FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle6exportone   dbf86cea5 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-vfsputone   6b8600d69 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kernelscaleone   4f9cb5ca7 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-hevclevelline   4553618d5 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle6exportmkv   672c23c04 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-stationroampmu   1cfa919fe FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-yuvfancy   11a0a51d5 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-swapbackspancache   d72af4ea4 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-h264enccbrone   f60e245bb FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kerneldisplayicc   81c1b985e FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-av1inbandswitch   91e6201a7 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pdf4outline   ce7c0db23 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle6keyslabels   10d60446d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-vfsputrest   52674abcf FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-windowaudit   3953fa024 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kernelscaleconvert   58de89b79 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aacencshort   d7486c8e3 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-displayiccfile   635961260 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-h264encplanes   78000a72c FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kernelpngicc   d9df44ad7 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle6keystab   33c9f83bb FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kerneliccint   5c8cd9dab FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle6exportstreampcm   8b0d6859f FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-h264enccolourhost   6217b99d3 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aacencgrouping   16cacfacd FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle6dragsnap   076c8b1f2 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-av1inbandsize   9079e01d6 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kernelscalecols   1e5dd1888 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-exportcolourprim   ef88a6f51 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kerneliccintlut   436d2b3e0 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aacenctns   9eefbece1 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kernelscaleonearm   bae965ecb FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-zenbooksurvey   bc34e5569 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-zenbooknvme   2358f512e FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-zenbooki8042   281b09c3e IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-zenbookgop   281b09c3e IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-zenbookmt7925   281b09c3e IN-FLIGHT cut 2026-10-27

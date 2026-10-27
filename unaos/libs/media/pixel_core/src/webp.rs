@@ -980,7 +980,7 @@ fn predict(px: &mut [u32], w: usize, h: usize, bits: u32, img: &[u32]) {
 
 /// PDFICC (SR358): the profile of the `ICCP` chunk at `p` — RFC 9649 §2.7 places it directly after VP8X when VP8X's
 /// ICC flag (0x20) is set — or None. One chunk header is read, never a second walk.
-fn iccp_after(b: &[u8], p: usize, end: usize) -> Option<Vec<u8>> {
+pub(crate) fn iccp_after(b: &[u8], p: usize, end: usize) -> Option<Vec<u8>> {
     if p + 8 > end || b.get(p..p + 4)? != b"ICCP" {
         return None;
     }

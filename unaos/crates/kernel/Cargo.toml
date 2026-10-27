@@ -3510,7 +3510,7 @@ tcurx = ["tegra", "orinrx", "tcuprobe"]
 # `#[cfg]`-erased, and the image is byte-identical to baseline. Witness tokens are subsystem-named
 # (`[facet]`, `FACETPNG`). Carried by the `deskcascade` implication below so the fifteen-knob jetson
 # build reaches it with no sixteenth knob.
-facet = ["quarry"]
+facet = ["quarry", "dep:icc_core"] # KERNEL-FACET-ICC (LEDGER SR367): + icc_core, the viewer converts tagged stills to sRGB; a `dep:` so a knob-off image carries none of it
 # USBLUN-M3 (F2): the WAY BACK from the USB multi-LUN census. `UNAOS_NOUSBLUN=1` => this feature =>
 # `drivers/xhci/mod.rs` compiles no census at all: Get Max LUN (class request 0xFE) is never asked,
 # `usblun_census`/`usblun_probe`/`bot_get_max_lun`/`ep0_resync` and the three census field types are
@@ -3898,6 +3898,18 @@ svg = ["pixel_core/svg"]
 # dependency only. Kept in sync with `unaos/arroyo` (`_feats` and `K8_FEATS`) and `unaos/builder/src/main.rs`.
 videoplayer = ["dep:av1_core", "dep:vp8_core", "dep:timeline_core", "dep:yuv_core", "dep:h264enc_core"] # NLE6 (LEDGER SR207): the Player's EDL mode links timeline_core
 
+# KERNEL-DISPLAY-ICC (LEDGER SR372): UNAOS_DISPLAY_ICC=1 — the panel's display transform. `video::colour` builds ONE
+# `icc_core::DisplayTransform` (sRGB to the EDID's matrix/TRC panel) at the a11y filter's first latch and the scanout copy
+# filter (`a11yfilter::each` / `in_place` / `color`, BP-video-25) runs it as its LAST stage. Both arches. DEFAULT OFF =>
+# no `video::colour`, no icc_core unless `facet`, no new line. Kept in sync with `unaos/arroyo` and `unaos/builder/src/main.rs`.
+dicc = ["dep:icc_core"]
+
+# NVME (zenbook-ledger Z2, ZENBOOKNVME): UNAOS_NVME=1 arms drivers/nvme.rs — the NVMe host controller, polled (probe by
+# class 01/08/02, reset/enable, identify, one I/O queue pair, the block registry `block::register_nvme`, `tests nvme`).
+# x86_64 only (the enumeration seam is arch::pci). DEFAULT OFF => the module is never lexed and media are byte-identical.
+# Kept in sync with `unaos/arroyo`, `unaos/builder/src/main.rs`, scripts/k8-reach.registry and scripts/banner-cert.sh.
+nvme = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
@@ -3983,6 +3995,9 @@ crypto_core = { path = "../../libs/sys/crypto_core" }
 # inflater + the SHOTZIP PNG encoder, moved here from `selfhost/inflate.rs` and `video/png.rs` (both now
 # re-exports). no_std + alloc, zero deps; arch-neutral; the same crate Aether (via gneiss_pal) links.
 pixel_core = { path = "../../libs/media/pixel_core" }
+# KERNEL-FACET-ICC (LEDGER SR367): Facet's ONE ICC engine (no_std + alloc, its one dep libm, already locked for timeline_core);
+# pulled only by `facet` (the viewer converts a decoded still's `Image::icc` through `apply_icc_to_srgb`).
+icc_core = { path = "../../libs/media/icc_core", optional = true }
 # KERNELFONT (B359): the text core (OpenType, shaping, rasterizer) and its desktop engine `font_core::ui`, behind
 # `video::text`. no_std + alloc, zero deps; only the desktop images reference it, so no other image links it.
 font_core = { path = "../../libs/text/font_core" }

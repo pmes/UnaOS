@@ -7,7 +7,7 @@
 //!
 //! * THE APPS — the live window table grouped by `owner_asid` through WINDOWLIST's readers
 //!   (`wm::cycle_order`, visible rows z-descending = most recent activation first; `wm::wl_rows`, every app
-//!   row with its minimised bit). Apps whose every window is minimised (DOCK2) follow the visible ones.
+//!   row with its minimised bit). Apps whose every window is minimised (DOCK2) follow the visible ones. Kernel furniture is listed only by opt-in (`wm::list_furniture`, NLE6KEYSTAB B975: the Player on an EDL, app `nle`).
 //! * THE STRIP — a chromeless overlay row (`wm::overlay_open`, LAUNCHER's pattern), centred: one APPRES icon
 //!   per app (`appres::blit_key_icon`, generic fallback), the selected one on an accent tile with its name
 //!   under it. Tokens only (`theme::*()`).
@@ -294,7 +294,7 @@ fn close() {
 /// so the app's own stack is kept and its frontmost window ends on top. Returns the windows raised.
 fn activate(a: &App) -> usize {
     #[cfg(target_arch = "x86_64")]
-    crate::arch::x86_64::syscall::user_input_set_active(a.owner);
+    crate::arch::x86_64::syscall::user_input_set_active(if wm::is_kernel_owner(a.owner) { 0 } else { a.owner }); // NLE6KEYSTAB (rmbp-ledger B975): a listed furniture owner (the NLE) takes no ring slot, the dock's rule
     if wm::drag_active() != wm::WIN_NONE {
         wm::drag_cancel("appswitch");
     }

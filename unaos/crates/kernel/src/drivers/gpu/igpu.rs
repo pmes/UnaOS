@@ -388,7 +388,7 @@ const GMUX_DDC_IGD: u8 = 0x01;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
 const GMUX_WAIT_ITERS: u32 = 5000;
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-unsafe fn gmux_outb(port: u16, val: u8) {
+unsafe fn gmux_outb(port: u16, val: u8) { if !crate::hw::gate(crate::hw::Probe::Gmux) { return; } // ZENBOOKSURVEY (zenbook-ledger Z1): no gmux port write on a positively identified non-Apple machine
     unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags)); }
 }
 
@@ -403,7 +403,7 @@ unsafe fn gmux_inb(port: u16) -> u8 {
 /// Returns false on timeout —
 /// and no caller here swallows a timeout silently.
 #[cfg(all(target_arch = "x86_64", feature = "gmux_igd"))]
-unsafe fn gmux_wait_ready() -> bool {
+unsafe fn gmux_wait_ready() -> bool { if !crate::hw::gate(crate::hw::Probe::Gmux) { return false; } // ZENBOOKSURVEY (Z1): every gmux transaction times out at once there = B613's "gmux absent"
     let mut iters = GMUX_WAIT_ITERS;
     loop {
         if (unsafe { gmux_inb(GMUX_PORT_WRITE) } & 0x01) == 0 {

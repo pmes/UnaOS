@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! HEVCCONF (LEDGER SR321): the JCT-VC conformance bitstreams of ITU-T H.265.1 must decode to the reference decoder's
 //! output — every output picture (cropped, output order; yuv420p, or yuv420p10le at Main 10) hashed into one md5 equal
-//! to the listed one — and every decoded picture hash SEI (D.3.19: CRC and checksum; MD5 refused by name) must match its
+//! to the listed one — and every decoded picture hash SEI (D.3.19: CRC, checksum and, since HEVCLEVELLINE SR368, MD5) must match its
 //! picture. The hand KATs (decode.rs, inter.rs, main10.rs, rext.rs) exercise each process once; these exercise their
 //! interactions. The constrained-intra-in-inter vector must be refused by name (HEVCINTER-CIP). Offline => SKIP (the
 //! vectors are fetched by h264_core's fetcher, linked below, never committed; vectors.txt holds the rows and their
-//! provenance). The D.3.19 hash functions and the SEI parser have offline KATs at the foot.
+//! provenance). The D.3.19 hash functions and the SEI parser have offline KATs at the foot. HEVCSCCTAIL (LEDGER SR365):
+//! the output md5 is crypto_core's MD5 (HEVCCONF-MD5; no host md5sum), and every vector decodes under
+//! `Decoder::set_strict_levels` (each must lie within the level it signals, A.4).
 
 #[path = "../../h264_core/tests/common/mod.rs"]
 mod jvt;
 
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 use hevc_core::picture::Plane;
 use hevc_core::sei::{self, HashCheck, PictureHash};
@@ -45,6 +45,7 @@ fn fetch(name: &str) -> Option<Vector> {
 /// Decode a whole Annex B stream: the frames in output order and every picture's hash verdict.
 fn decode_all(stream: &[u8]) -> Result<(Vec<Frame>, Vec<(i32, HashCheck)>), Error> {
     let mut d = Decoder::new();
+    d.set_strict_levels(true);
     let (mut frames, mut checks) = (Vec::new(), Vec::new());
     for u in hevc_core::nal::annexb_units(stream) {
         d.decode_nal(u)?;
@@ -57,12 +58,10 @@ fn decode_all(stream: &[u8]) -> Result<(Vec<Frame>, Vec<(i32, HashCheck)>), Erro
     Ok((frames, checks))
 }
 
-/// The md5 of `data` through the host's md5sum (the harness's tools are host tools, as sha256sum is for the fetcher).
-fn md5(data: &[u8]) -> Option<String> {
-    let mut c = Command::new("md5sum").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().ok()?;
-    c.stdin.take()?.write_all(data).ok()?;
-    let out = c.wait_with_output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).split_whitespace().next()?.to_string())
+/// HEVCSCCTAIL (SR365, HEVCCONF-MD5): lowercase hex of crypto_core's MD5 of `data` (the digest the fluster lists print;
+/// the twin of tools/play-check's `md5_hex`, which hashes the same `yuv_bytes`).
+fn md5(data: &[u8]) -> String {
+    crypto_core::md5::md5(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Decode vector `name` and check it; `None` when it was not available (SKIP).
@@ -80,10 +79,7 @@ fn check_vector(name: &str, v: &Vector, frames: Vec<Frame>, checks: Vec<(i32, Ha
     let ok = checks.iter().filter(|(_, c)| *c == HashCheck::Match).count();
     let md5_unchecked = checks.len() - ok;
     let out: Vec<Vec<u8>> = frames.iter().map(yuv_bytes).collect();
-    let Some(got) = md5(&out.concat()) else {
-        eprintln!("SKIP {name}: md5sum unavailable");
-        return None;
-    };
+    let got = md5(&out.concat());
     if got != v.md5 {
         let at = v.yuv.as_ref().map(|yuv| {
             let mut off = 0;
@@ -210,7 +206,52 @@ fn sei_parse_kat() {
     md5.push(0x80);
     let want: [[u8; 16]; 3] = core::array::from_fn(|c| core::array::from_fn(|i| (c * 16 + i) as u8));
     assert_eq!(sei::picture_hash(&md5), Ok(Some(PictureHash::Md5(want))));
-    assert_eq!(sei::check(&[plane(1, 1, &[0]), plane(1, 1, &[0]), plane(1, 1, &[0])], 8, 8, &PictureHash::Md5(want)), HashCheck::Md5Unchecked);
+    assert_eq!(sei::check(&[plane(1, 1, &[0]), plane(1, 1, &[0]), plane(1, 1, &[0])], 8, 8, &PictureHash::Md5(want)), HashCheck::Mismatch(0));
     assert_eq!(sei::picture_hash(&[5, 1, 0, 0x80]), Ok(None));
     assert_eq!(sei::picture_hash(&[132, 7, 1, 0x12]), Err(Error::Truncated));
+}
+
+/// HEVCSCCTAIL (SR365, HEVCCONF-MD5): the walker's md5 of a known picture through `yuv_bytes` — I420 bytes at 8 bits,
+/// yuv420p10le above — equals the hex pinned from an independent MD5 (Python's hashlib over the same bytes).
+#[test]
+fn md5_kat() {
+    let frame = |planes: [Vec<u8>; 3], bit_depth: u8, planes16: Option<[Vec<u16>; 3]>| Frame {
+        width: 2,
+        height: 2,
+        planes,
+        poc: 0,
+        tag: 0,
+        full_range: false,
+        bit_depth,
+        planes16,
+        chroma: h264_core::ChromaFormat::Yuv420,
+        bit_depth_c: bit_depth,
+    };
+    let f8 = frame([vec![1, 2, 3, 4], vec![5], vec![6]], 8, None);
+    assert_eq!(md5(&yuv_bytes(&f8)), "6ac1e56bc78f031059be7be854522c4c");
+    let f10 = frame([vec![255, 0, 0, 0], vec![128], vec![85]], 10, Some([vec![0x3FF, 0, 1, 2], vec![0x200], vec![0x155]]));
+    assert_eq!(yuv_bytes(&f10), [0xFF, 0x03, 0, 0, 1, 0, 2, 0, 0, 0x02, 0x55, 0x01]);
+    assert_eq!(md5(&yuv_bytes(&f10)), "194ea06078b4dbc31dbc26b29a566407");
+    assert_eq!(md5(b""), "d41d8cd98f00b204e9800998ecf8427e");
+}
+
+/// HEVCLEVELLINE (SR368, HEVCSEI-MD5): D.3.19 picture_md5 per component through crypto_core, against the hex of an
+/// independent MD5 (Python's hashlib over the same pictureData bytes): a 2x2 / 1x1 / 1x1 picture at 8 bits matches, a
+/// changed Cr is Mismatch(2); 10 bits hash low byte first; a 4:0:0 picture (empty chroma) is checked over component 0.
+#[test]
+fn sei_md5_kat() {
+    let hex = |d: [u8; 16]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let digest = |h: &str| -> [u8; 16] { core::array::from_fn(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()) };
+    let pic = [plane(2, 2, &[1, 2, 3, 4]), plane(1, 1, &[5]), plane(1, 1, &[6])];
+    assert_eq!(hex(sei::plane_md5(&pic[0], 8)), "08d6c05a21512a79a1dfeb9d2a8f262f");
+    assert_eq!(hex(sei::plane_md5(&pic[1], 8)), "8bb6c17838643f9691cc6a4de6c51709");
+    assert_eq!(hex(sei::plane_md5(&pic[2], 8)), "06eca1b437c7904cc3ce6546c8110110");
+    let want = PictureHash::Md5(["08d6c05a21512a79a1dfeb9d2a8f262f", "8bb6c17838643f9691cc6a4de6c51709", "06eca1b437c7904cc3ce6546c8110110"].map(digest));
+    assert_eq!(sei::check(&pic, 8, 8, &want), HashCheck::Match);
+    let cr_off = [pic[0].clone(), pic[1].clone(), plane(1, 1, &[7])];
+    assert_eq!(sei::check(&cr_off, 8, 8, &want), HashCheck::Mismatch(2));
+    assert_eq!(hex(sei::plane_md5(&plane(2, 2, &[0x3FF, 0, 1, 2]), 10)), "c0e517ad64daf3a79e06d779d07d8b26");
+    let mono = [pic[0].clone(), plane(0, 0, &[]), plane(0, 0, &[])];
+    let one = PictureHash::Md5([digest("08d6c05a21512a79a1dfeb9d2a8f262f"), [0; 16], [0; 16]]);
+    assert_eq!(sei::check(&mono, 8, 8, &one), HashCheck::Match);
 }

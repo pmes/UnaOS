@@ -373,7 +373,7 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
         checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
             && crate::smolnet::lease_of(&bad).is_none()));
     }
-    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); active_rows(&mut checks); bg_rows(&mut checks); sweep_rows(&mut checks); let mut pass = 0u8; // STATIONROAM-SWEEP (B958): `lostplan`, `country` after `bggate`; STATIONROAM-BGSCAN (B955): `bgplan`, `bggate` after `idleuni`; STATIONROAM-ACTIVE (B951): `probe`, `idleuni` after `idlegate`; STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
+    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); active_rows(&mut checks); bg_rows(&mut checks); sweep_rows(&mut checks); band_rows(&mut checks); rate5g_rows(&mut checks); pmu_rows(&mut checks); window_rows(&mut checks); let mut pass = 0u8; // WINDOW-AUDIT (B970): `window` after `pmu`; STATIONROAM-PMU (B967): `pmu` after `rate5g`; STATIONROAM-5G (B962): `band`, `rate5g` after `country`; STATIONROAM-SWEEP (B958): `lostplan`, `country` after `bggate`; STATIONROAM-BGSCAN (B955): `bgplan`, `bggate` after `idleuni`; STATIONROAM-ACTIVE (B951): `probe`, `idleuni` after `idlegate`; STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
     let mut first = None;
     for (name, ok) in checks.iter() {
         if *ok {
@@ -1044,7 +1044,7 @@ pub fn roam_pick(current: Option<Mac>, ch: u8, t: &BssTable) -> Option<(Mac, u8)
     };
     let mut best: Option<BssSeen> = None;
     for s in t.e.iter().flatten() {
-        if !t.fresh(s) || Some(s.bssid) == current || s.channel > ROAM_CH_MAX || (s.rssi as i16) < floor {
+        if !t.fresh(s) || Some(s.bssid) == current || !roamable(s.channel) || (s.rssi as i16) < floor { // STATIONROAM-5G (B962): 1..=ROAM_CH_MAX or a non-DFS 5 GHz channel (was > ROAM_CH_MAX)
             continue;
         }
         if best.map_or(true, |b| s.rssi > b.rssi) {
@@ -1058,7 +1058,7 @@ pub fn roam_pick(current: Option<Mac>, ch: u8, t: &BssTable) -> Option<(Mac, u8)
 /// reads -55, a short header `i8::MIN`; a closed table ignores `see`; open at 0: BSSID 1 at -60 then -50 holds -55, n 2; seven
 /// more BSSIDs (heard at 20..80) fill the table and a 9th (at 90) evicts BSSID 1, the one heard longest ago (at 5). `roampick`:
 /// current at -60; a candidate at -55 is not picked (+5); once it averages -54 (+6) it is, on 11; a stronger one on channel 13
-/// is not (STATIONROAM-XCHAN B898: ROAM_CH_MAX 12); a stronger one on channel 6 is, on 6; one with no DS element resolves to 11;
+/// is, on 13 (STATIONROAM-PMU B967: ROAM_CH_MAX 13; was not, B898's 12); a stronger one on channel 6 is, on 6; one with no DS element resolves to 11;
 /// an entry from the window before is stale and never picked; a silent current picks nothing; no current picks the strongest. `roamwindow`: arm(0): not due at 59 999, due at 60 000; open at 60 000: ended at 61 000 not
 /// 60 999; closed: due again at 120 000 not 119 999.
 fn roam_rows(checks: &mut Vec<(&'static str, bool)>) {
@@ -1094,7 +1094,7 @@ fn roam_rows(checks: &mut Vec<(&'static str, bool)>) {
     p.see(b(2), 11, -53, 1001);
     let six = roam_pick(Some(b(1)), 11, &p) == Some((b(2), 11));
     p.see(b(4), 13, -25, 1001);
-    let ch13 = roam_pick(Some(b(1)), 11, &p) == Some((b(2), 11));
+    let ch13 = roam_pick(Some(b(1)), 11, &p) == Some((b(4), 13));
     p.see(b(3), 6, -20, 1001);
     let other_ch = roam_pick(Some(b(1)), 11, &p) == Some((b(3), 6));
     p.see(b(6), 0, -10, 1002);
@@ -1122,8 +1122,9 @@ pub const ROAM_DWELL_MS: u64 = 110;
 pub const ROAM_IDLE_MS: u64 = 2000;
 /// The channels swept: the three non-overlapping 2.4 GHz channels (the full 1..13 sweep owed: STATIONROAM-SWEEP).
 pub const ROAM_GRID: [u8; 3] = [1, 6, 11];
-/// The highest channel the switch serves (`htphyinit::switch_channel`: 13/14 take spuravoid=1, `phy_ht.c:740-741`).
-pub const ROAM_CH_MAX: u8 = 12;
+/// The highest channel the switch serves (`htphyinit::switch_channel`: 13 takes spuravoid=1, `phy_ht.c:740-741`, through the PMU
+/// step, STATIONROAM-PMU B967; 14 has no 2059 row).
+pub const ROAM_CH_MAX: u8 = 13;
 
 /// The dwell schedule from `home` (the window already listened on it): `ROAM_GRID` in order without `home` — `(channels, count)`.
 pub fn dwell_plan(home: u8) -> ([u8; 3], usize) {
@@ -1332,8 +1333,8 @@ fn bg_rows(checks: &mut Vec<(&'static str, bool)>) {
 // ── STATIONROAM-SWEEP (rmbp-ledger B958): the lost station's wide sweep and the 802.11d passive rule — PURE, read by `join::sweep` ──
 
 /// The lost plan's order: the grid first (`ROAM_GRID`), then the rest of 1..=13 ascending. Channels above `ROAM_CH_MAX` are not
-/// planned: 13 stays refused by `htphyinit::switch_channel` (the PMU spur-avoid step on ChipCommon, outside the mapped BAR0 extent;
-/// STATIONROAM-PMU owed), so a lost plan holds 11 channels (1..=12 without the home channel).
+/// planned; STATIONROAM-PMU (B967) lifted it to 13 (`htphyinit::switch_channel` runs the PMU spur-avoid step on ChipCommon through
+/// `window::with_core`), so a lost plan holds 12 channels (1..=13 without the home channel), 12 and 13 passive unless COUNTRYCOVER.
 pub const ROAM_LOST_ORDER: [u8; 13] = [1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13];
 /// The channels a sweep never probes unless COUNTRYCOVER allows (passive in FCC domains): 12 and 13, as bits.
 pub const ROAM_PASSIVE: u16 = (1 << 12) | (1 << 13);
@@ -1367,7 +1368,7 @@ pub fn dwell_plan_lost(home: u8, country: Option<&wifi_core::ieee80211::Country>
 
 /// `join::sweep`'s ONE plan: lost = `dwell_plan_lost`; otherwise exactly `dwell_plan(home)` (the idle sweep's grid), every dwell active.
 pub fn sweep_plan(home: u8, lost: bool, country: Option<&wifi_core::ieee80211::Country>) -> ([u8; 13], usize, u16) {
-    if lost {
+    if home > 14 && !lost { return ([0; 13], 0, 0); } if lost { // STATIONROAM-5G (B962): an idle sweep from a 5 GHz home stays in band (`plan_5g`)
         return dwell_plan_lost(home, country);
     }
     let (plan, n) = dwell_plan(home);
@@ -1376,23 +1377,23 @@ pub fn sweep_plan(home: u8, lost: bool, country: Option<&wifi_core::ieee80211::C
     (out, n, 0)
 }
 
-/// `kat`'s rows after B955's (STATIONROAM-SWEEP rmbp-ledger B958). `lostplan`: lost plan(11) = 1,6,2,3,4,5,7,8,9,10,12 (11 channels:
-/// home excluded, 13 absent while ROAM_CH_MAX is 12) with 12 passive; plan(1) starts 6,11,2; a country covering 1-13 clears the
-/// passive mask; the idle plan(11) is the grid's 1,6 with no passive dwell; 11 dwells x ROAM_DWELL_MS = 1210 ms. `country`: a beacon
+/// `kat`'s rows after B955's (STATIONROAM-SWEEP rmbp-ledger B958). `lostplan`: lost plan(11) = 1,6,2,3,4,5,7,8,9,10,12,13 (12 channels:
+/// home excluded, 13 planned since ROAM_CH_MAX is 13, STATIONROAM-PMU B967) with 12 and 13 passive; plan(1) starts 6,11,2; a country
+/// covering 1-13 clears the passive mask; the idle plan(11) is the grid's 1,6 with no passive dwell; 12 dwells x ROAM_DWELL_MS = 1320 ms. `country`: a beacon
 /// announcing "DE " (1, 13, 20) covers 1..13 and allows a probe on 12 and 13; "US " (1, 11, 30) covers 1..11, refuses 12, allows 6; an
 /// operating-extension triplet (201, ..) is skipped; a pad octet is accepted; a truncated element (string + 2 octets) and a probe
 /// request read `None`; no element reads `None` and 12 stays passive.
 fn sweep_rows(checks: &mut Vec<(&'static str, bool)>) {
     use wifi_core::ieee80211::{country_ie, Country};
-    let de = Country { cc: *b"DE ", chans: 0x3FFE };
+    let de = Country { cc: *b"DE ", chans: 0x3FFE, five: 0 };
     let (p, n, m) = dwell_plan_lost(11, None);
-    let mut ok = p == [1, 6, 2, 3, 4, 5, 7, 8, 9, 10, 12, 0, 0] && n == 11 && m == 1 << 12;
+    let mut ok = p == [1, 6, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 0] && n == 12 && m == (1 << 12) | (1 << 13);
     let (p1, n1, _) = dwell_plan_lost(1, None);
-    ok &= p1[..3] == [6, 11, 2] && n1 == 11;
+    ok &= p1[..3] == [6, 11, 2] && n1 == 12;
     ok &= dwell_plan_lost(11, Some(&de)).2 == 0;
     ok &= sweep_plan(11, false, None) == ([1, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 2, 0);
     ok &= sweep_plan(11, true, None) == (p, n, m);
-    ok &= n as u64 * ROAM_DWELL_MS == 1210;
+    ok &= n as u64 * ROAM_DWELL_MS == 1320;
     checks.push(("lostplan", ok));
 
     let frame = |ies: &[u8]| -> Vec<u8> {
@@ -1418,4 +1419,104 @@ fn sweep_rows(checks: &mut Vec<(&'static str, bool)>) {
     let none = country_ie(&frame(&[]));
     c &= none.is_none() && !passive_ok(12, none.as_ref());
     checks.push(("country", c));
+}
+
+// ── STATIONROAM-5G (rmbp-ledger B962): the 5 GHz plan and the roam's channel rule — PURE, read by `join::sweep5` / `roam_pick` ──
+
+/// A BSS the roam may pick by its channel: 0 (no DS element: the channel it was heard on), 1..=`ROAM_CH_MAX`, or a non-DFS 5 GHz
+/// channel (`wifi_core::ieee80211::NONDFS_5G`). A DFS channel is out: nothing transmits there (`tx::dfs_refused`).
+pub fn roamable(c: u8) -> bool {
+    c <= ROAM_CH_MAX || w::NONDFS_5G.contains(&c)
+}
+
+/// The sweep's 5 GHz dwells: `NONDFS_5G` in order without `home`; an idle sweep from a 2.4 GHz home dwells none (the band switch is a
+/// PHY re-init: only a lost station, or a station already on 5 GHz, pays it). `(channels, count, passive)`, passive bit i = plan[i]:
+/// passive unless the home AP's Country element covers that channel (`Country.five`, a 5 GHz triplet's channels 4 apart); no element =
+/// every 5 GHz dwell passive.
+pub fn plan_5g(home: u8, lost: bool, country: Option<&wifi_core::ieee80211::Country>) -> ([u8; 9], usize, u16) {
+    let (mut out, mut n, mut passive) = ([0u8; 9], 0usize, 0u16);
+    if !lost && home <= 14 {
+        return (out, 0, 0);
+    }
+    for (k, c) in w::NONDFS_5G.iter().enumerate() {
+        if *c == home {
+            continue;
+        }
+        if country.map_or(true, |x| x.five & (1u16 << k) == 0) {
+            passive |= 1u16 << n;
+        }
+        out[n] = *c;
+        n += 1;
+    }
+    (out, n, passive)
+}
+
+/// `kat`'s rows after B958's (STATIONROAM-5G rmbp-ledger B962). `band`: chan_freq 1/11/13/14/36/165 = 2412/2462/2472/2484/5180/5825,
+/// 35 and 169 none; 36 is 5 GHz, 11 is not; DFS 52/64/100/144, not 48/149; every NONDFS_5G channel and 52 has a 2059 row
+/// (`radio_2059.c:58-316`), 144 none; roamable 0/1/12/13/36/165 (13: STATIONROAM-PMU B967), not 14/52/100; plan_5g(11, lost, none) = the nine, all passive; (36, idle)
+/// = eight from 40; (11, idle) none; "US " (36,4)(149,5) covers the nine (no passive); "DE " (1,13)(36,4) covers 36..48, 149..165
+/// passive; the idle sweep_plan from 36 is empty; pwr_block 2462/4920/5180/5320/5500/5825 = 2g/5gl/5g/5g/5gh/5gh. `rate5g`:
+/// `tx::band_kat` (station_kat [9]); a 5 GHz rate set (6*,9,12*,18,24*,36,48,54) builds an 8-rung ladder from OFDM 6 with no CCK rung,
+/// four failures at 6 take no step; ack_rate(it, 6) = 6, (it, 24) = 24, (it, 18) = 12 (the highest basic rate not faster, §10.6.6.5.2).
+fn band_rows(checks: &mut Vec<(&'static str, bool)>) {
+    use wifi_core::ieee80211::{chan_freq, country_ie, dfs, is_5g, pwr_block, NONDFS_5G};
+    let mut ok = chan_freq(1) == Some(2412) && chan_freq(11) == Some(2462) && chan_freq(13) == Some(2472) && chan_freq(14) == Some(2484)
+        && chan_freq(36) == Some(5180) && chan_freq(165) == Some(5825) && chan_freq(35).is_none() && chan_freq(169).is_none();
+    ok &= is_5g(36) && !is_5g(11) && dfs(52) && dfs(64) && dfs(100) && dfs(144) && !dfs(48) && !dfs(149);
+    let row = |c: u8| chan_freq(c).and_then(super::radio2059::chan_entry).is_some();
+    ok &= NONDFS_5G.iter().all(|c| row(*c)) && row(52) && !row(144);
+    ok &= roamable(0) && roamable(1) && roamable(12) && roamable(36) && roamable(165) && roamable(13) && !roamable(14) && !roamable(52) && !roamable(100);
+    let (p, n, m) = plan_5g(11, true, None);
+    ok &= p == NONDFS_5G && n == 9 && m == 0x1FF;
+    let (p36, n36, _) = plan_5g(36, false, None);
+    ok &= n36 == 8 && p36[..8] == [40, 44, 48, 149, 153, 157, 161, 165];
+    ok &= plan_5g(11, false, None).1 == 0 && sweep_plan(36, false, None).1 == 0;
+    let frame = |ies: &[u8]| -> Vec<u8> {
+        let mut f = alloc::vec![0x80, 0x00, 0x00, 0x00];
+        f.extend_from_slice(&[0xFF; 6]);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&[0u8; 2 + 12]);
+        f.extend_from_slice(&[0, 4, b'U', b'n', b'a', b'N']);
+        f.extend_from_slice(ies);
+        f
+    };
+    let us = country_ie(&frame(&[7, 9, b'U', b'S', b' ', 36, 4, 23, 149, 5, 30]));
+    ok &= us.map_or(false, |c| c.five == 0x1FF) && plan_5g(11, true, us.as_ref()).2 == 0;
+    let de = country_ie(&frame(&[7, 9, b'D', b'E', b' ', 1, 13, 20, 36, 4, 23]));
+    ok &= de.map_or(false, |c| c.five == 0x00F && c.chans == 0x3FFE) && plan_5g(11, true, de.as_ref()).2 == 0x1F0;
+    ok &= pwr_block(2462) == Some("2g") && pwr_block(4920) == Some("5gl") && pwr_block(5180) == Some("5g") && pwr_block(5320) == Some("5g")
+        && pwr_block(5500) == Some("5gh") && pwr_block(5825) == Some("5gh");
+    checks.push(("band", ok));
+}
+
+fn rate5g_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let s5 = w::RateSet { listed: 0x0FF0, basic: 0x0150 };
+    let mut c = RateCtl::new(Some(s5), false, 12, 0);
+    let mut ok = c.n == 8 && c.ladder[..c.n].iter().all(|r| *r >= 12) && c.rate() == 12;
+    for _ in 0..4 {
+        c.frame(12, false, 11);
+    }
+    ok &= c.decide(1000).is_none() && c.rate() == 12 && c.next_rate() >= 12;
+    ok &= super::assoc::ack_rate(Some(s5), 12) == 12 && super::assoc::ack_rate(Some(s5), w::RATE_24M) == w::RATE_24M && super::assoc::ack_rate(Some(s5), 36) == 24;
+    checks.push(("rate5g", ok && super::bringup::station_kat()[9]));
+}
+
+// ── STATIONROAM-PMU (rmbp-ledger B967): the PMU spur-avoid step's KAT row ──────────────────────────────────────────────────────
+
+/// `kat`'s row after B962's (STATIONROAM-PMU rmbp-ledger B967). `pmu`: `bringup/pmu.rs` `kat` over a mock bus — the capability
+/// decode (no PMU, a separate PMU core, not a 4331, READY with its revision), the BCM4331 PLL rows per spur mode
+/// (`driver_chipcommon_pmu.c:534-551`) and PLL_UPD, the PHY PLL reset's clear/set/clear, a selector that does not take (no MMIO),
+/// and every window move paired [ChipCommon, d11] with nothing read or written off-core.
+fn pmu_rows(checks: &mut Vec<(&'static str, bool)>) {
+    checks.push(("pmu", super::bringup::pmu_kat()));
+}
+
+// ── WINDOW-AUDIT (rmbp-ledger B970): the window helpers' KAT row ─────────────────────────────────────────────────────────────────
+
+/// `kat`'s row after B967's (WINDOW-AUDIT rmbp-ledger B970). `window`: `bringup/window.rs` `kat` over a mock selector — the wifi2
+/// ladder's chain (`move_to` ChipCommon, the EROM page, the d11) closed by ONE `restore` to the d11 pre-image, a refused move that
+/// writes nothing back and reaches no MMIO, `with_core` refused and ok as the pair [ChipCommon, d11], a restore that does not read back.
+fn window_rows(checks: &mut Vec<(&'static str, bool)>) {
+    checks.push(("window", super::bringup::window_kat()));
 }

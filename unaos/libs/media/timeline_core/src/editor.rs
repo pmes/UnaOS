@@ -297,3 +297,111 @@ impl EditorState {
         Ok(())
     }
 }
+
+/// NLE6KEYS (rmbp-ledger B961): THE verb dispatch both faces call — the host face's buttons and keys (`stria::nle_face`
+/// `Face::verb` / `Face::key`) and the kernel Player's editing keys (`video/vplay.rs` `edit_key`). Each face keeps its own
+/// key BINDINGS (the host's `KEYS` names, the kernel's byte table) and maps them onto these words; the arms are the host
+/// face's, moved here unchanged. `None`: not an editor verb (the face's own transport, e.g. `play`, stays the face's).
+/// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
+impl EditorState {
+    pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let ph = self.playhead;
+        Some(match v {
+            "prev" => {
+                self.nudge(-1);
+                Ok(())
+            }
+            "next" => {
+                self.nudge(1);
+                Ok(())
+            }
+            "split" => self.split_at_playhead(),
+            "delete" => self.ripple_delete(),
+            "undo" => {
+                self.undo();
+                Ok(())
+            }
+            "redo" => {
+                self.redo();
+                Ok(())
+            }
+            "zoom-" => {
+                self.zoom_by(-1);
+                Ok(())
+            }
+            "zoom+" => {
+                self.zoom_by(1);
+                Ok(())
+            }
+            "zoom0" => {
+                self.zoom = ZOOM_DEFAULT;
+                Ok(())
+            }
+            "[" => self.trim(Edge::In, -1),
+            "]" => self.trim(Edge::In, 1),
+            "{" => self.trim(Edge::Out, -1),
+            "}" => self.trim(Edge::Out, 1),
+            "lift" => self.lift_selected(),
+            "mark-in" => match self.selected() {
+                Some(c) => self.trim(Edge::In, ph - c.at),
+                None => Err(EditError::NoClip),
+            },
+            "mark-out" => match self.selected() {
+                Some(c) => self.trim(Edge::Out, ph - c.end()),
+                None => Err(EditError::NoClip),
+            },
+            "home" => {
+                self.seek(0);
+                Ok(())
+            }
+            "end" => {
+                let e = self.timeline.end();
+                self.seek(e);
+                Ok(())
+            }
+            "nudge-" => self.move_set(-1),
+            "nudge+" => self.move_set(1),
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod verb_tests {
+    use super::*;
+    use crate::Kind;
+
+    /// stria::nle_face's `synth_fixture` cut list (A 13..23 at 0, B 0..10 at 10, A 23..33 at 25), video only.
+    fn state() -> EditorState {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("A", 50);
+        let b = tl.add_source("B", 50);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        EditorState::new(tl)
+    }
+
+    /// NLE6KEYS: each verb is the op the host face ran by hand; a face word that is not an editor verb is `None`.
+    #[test]
+    fn verb_is_the_host_dispatch() {
+        let mut st = state();
+        let tl0 = st.timeline.clone();
+        st.select(0, 1).unwrap();
+        st.seek(13);
+        assert_eq!(st.verb("mark-in"), Some(Ok(())));
+        let want1 = tl0.trim_in(0, 1, 3).unwrap();
+        assert_eq!(st.timeline, want1);
+        assert_eq!(st.verb("["), Some(Ok(())));
+        assert_eq!(st.timeline, want1.trim_in(0, 1, 2).unwrap());
+        assert_eq!(st.verb("undo"), Some(Ok(())));
+        assert_eq!(st.timeline, want1);
+        st.seek(16);
+        assert_eq!(st.verb("split"), Some(Ok(())));
+        assert_eq!(st.timeline, want1.split(0, 16).unwrap());
+        assert_eq!(st.verb("end"), Some(Ok(())));
+        assert_eq!(st.playhead, st.timeline.end());
+        assert_eq!(st.verb("play"), None);
+        st.deselect();
+        assert_eq!(st.verb("]"), Some(Err(EditError::NoClip)));
+    }
+}

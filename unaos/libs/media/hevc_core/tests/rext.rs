@@ -9,7 +9,9 @@
 //! y = 8, 4:2:2 at luma y = 8 only (luma x = 8 is chroma x = 4); (f) P-slice chroma motion compensation reads mvCLX =
 //! mvLX * 2 / SubWidthC, * 2 / SubHeightC (8.5.3.2.10) at 4:2:2 and 4:4:4; (g) Table 8-3 and the refusals by name
 //! (range extension tools, separate colour planes, the 4:2:0-only consumer gate). HEVCREXTTOOLS (LEDGER SR345): one picture
-//! per range extension tool, h..s below, each failing if its tool is missing; (g) now decodes every flag alone.
+//! per range extension tool, h..s below, each failing if its tool is missing; (g) now decodes every flag alone. HEVCSCCTAIL
+//! (LEDGER SR365): (t) a monochrome picture's one-component hash SEI gives a verdict; (u) the A.4 level limits, refused
+//! by name only under `Decoder::set_strict_levels`.
 
 mod common;
 
@@ -792,4 +794,164 @@ fn s_monochrome_pcm_and_all_dc() {
         assert_eq!(samples(f, 0), y, "bd {bd}");
         assert!(f.planes[1].is_empty() && f.planes[2].is_empty());
     }
+}
+
+/// HEVCSCCTAIL (SR365): an 8x8 monochrome pcm picture (8 bits) whose SPS holds `max_dec_minus1` + 1 pictures, followed
+/// by `sei` (a suffix SEI RBSP) when given, and its luma samples.
+fn mono_pcm(max_dec_minus1: u32, sei: Option<&dyn Fn(&[u16]) -> Vec<u8>>) -> (Vec<u8>, Vec<u16>) {
+    let cfg = SpsCfg { pcm: Some((8, 8, 3, 3, true)), chroma_bit_depth: Some(8), range_ext: None, ..cfg8(0, 8, None) };
+    let mut s = vps(false);
+    s.extend(nal(33, &sps_rbsp_ext(&cfg, &InterSps { max_dec_pic_buffering_minus1: max_dec_minus1, ..Default::default() })));
+    s.extend(nal(34, &pps_rbsp_rext(&pps_qp(26), &PpsInter::default(), &PpsRext::default())));
+    let y: Vec<u16> = (0..64).map(|i| pat(i % 8, i / 8, 5, 8)).collect();
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    e.part_mode_2nx2n();
+    e.pcm_samples_fmt(3, 8, 8, &y, &[], &[], (1, 1));
+    s.extend(nal(19, &e.finish().out));
+    if let Some(f) = sei {
+        s.extend(nal(40, &f(&y)));
+    }
+    (s, y)
+}
+
+#[test]
+fn t_monochrome_picture_hash_sei_gives_a_verdict() {
+    use hevc_core::picture::Plane;
+    use hevc_core::sei::{plane_crc, HashCheck};
+    // D.2.19 at chroma_format_idc 0: hash_type 1 (CRC) and ONE component, payloadSize 3.
+    let crc_sei = |delta: u16| move |y: &[u16]| -> Vec<u8> {
+        let crc = plane_crc(&Plane { w: 8, h: 8, data: y.to_vec() }, 8).wrapping_add(delta);
+        vec![132, 3, 1, (crc >> 8) as u8, crc as u8, 0x80]
+    };
+    for (delta, want) in [(0u16, HashCheck::Match), (1, HashCheck::Mismatch(0))] {
+        let f = crc_sei(delta);
+        let (s, _) = mono_pcm(1, Some(&f as &dyn Fn(&[u16]) -> Vec<u8>));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode");
+        d.flush();
+        assert_eq!(d.take_frames().len(), 1);
+        assert_eq!(d.take_hash_checks(), vec![(0, want)], "delta {delta}");
+    }
+}
+
+#[test]
+fn u_level_limits_refuse_by_name_only_when_strict() {
+    use hevc_core::level::{check_level, level, max_dpb_size};
+    use hevc_core::ps::{Ordering, Pps, ProfileTierLevel, Sps};
+    let sps = |w: u32, h: u32, idc: u8, high: bool, dpb: u32| Sps {
+        width: w,
+        height: h,
+        ptl: ProfileTierLevel { general_profile_idc: 1, general_level_idc: idc, general_tier_flag: high, ..Default::default() },
+        ordering: vec![Ordering { max_dec_pic_buffering_minus1: dpb, ..Default::default() }],
+        ..Default::default()
+    };
+    let pps = |cols: u32, rows: u32| Pps { num_tile_columns: cols, num_tile_rows: rows, ..Default::default() };
+    let refused = |r: Result<(), Error>, what: &str| match r {
+        Err(Error::Unsupported(m)) => assert!(m.contains(what) && m.contains("HEVC-LEVEL"), "{m}"),
+        other => panic!("{what}: {other:?}"),
+    };
+    // Level 1 (MaxLumaPs 36864): 64x48 fits; 256x192 (49152) does not; 552x8 fits the area but not Sqrt(8 x 36864) = 543.
+    assert_eq!(check_level(&sps(64, 48, 30, false, 0), &pps(1, 1)), Ok(()));
+    refused(check_level(&sps(256, 192, 30, false, 0), &pps(1, 1)), "picture above level 1 (MaxLumaPs");
+    refused(check_level(&sps(552, 8, 30, false, 0), &pps(1, 1)), "width or height");
+    refused(check_level(&sps(64, 48, 30, false, 0), &pps(2, 1)), "tiles");
+    refused(check_level(&sps(64, 48, 30, true, 0), &pps(1, 1)), "high tier");
+    refused(check_level(&sps(64, 48, 31, false, 0), &pps(1, 1)), "unknown general_level_idc");
+    // Level 8.5 (255) has no limits; level 4.1 high tier is a level.
+    assert_eq!(check_level(&sps(16384, 16384, 255, false, 15), &pps(30, 30)), Ok(()));
+    assert_eq!(check_level(&sps(1920, 1080, 123, true, 5), &pps(1, 1)), Ok(()));
+    // A.4.2: 1920x1080 at level 4.1 (2073600 > 3/4 of 2228224) keeps maxDpbPicBuf: 6, 7 for an SCC profile.
+    assert_eq!(max_dpb_size(&sps(1920, 1080, 123, false, 0), level(123).unwrap()), 6);
+    let mut scc = sps(1920, 1080, 123, false, 0);
+    scc.ptl.general_profile_idc = 9;
+    assert_eq!(max_dpb_size(&scc, level(123).unwrap()), 7);
+    refused(check_level(&sps(1920, 1080, 123, false, 6), &pps(1, 1)), "MaxDpbSize");
+    assert_eq!(check_level(&scc_dpb(scc, 6), &pps(1, 1)), Ok(()));
+    // By decode: the 8x8 picture at level 2 (MaxDpbSize min(4 x 6, 16) = 16) with a 17-picture DPB is refused only when
+    // strict; 16 pictures pass strict.
+    let (s17, y) = mono_pcm(16, None);
+    let mut d = Decoder::new();
+    d.set_strict_levels(true);
+    refused(d.decode_annexb(&s17), "MaxDpbSize");
+    let f = &decode(&s17)[0];
+    assert_eq!(samples(f, 0), y);
+    let (s16, _) = mono_pcm(15, None);
+    let mut d = Decoder::new();
+    d.set_strict_levels(true);
+    d.decode_annexb(&s16).expect("within level 2");
+    d.flush();
+    assert_eq!(d.take_frames().len(), 1);
+}
+
+fn scc_dpb(mut s: hevc_core::ps::Sps, dpb: u32) -> hevc_core::ps::Sps {
+    s.ordering[0].max_dec_pic_buffering_minus1 = dpb;
+    s
+}
+
+/// HEVCLEVELLINE (SR368, HEVCSEI-MD5): a monochrome picture's one-component MD5 SEI (hash_type 0, payloadSize 17)
+/// gives a verdict (`plane_md5` is pinned against hashlib in tests/conformance.rs `sei_md5_kat`).
+#[test]
+fn v_monochrome_picture_md5_sei_gives_a_verdict() {
+    use hevc_core::picture::Plane;
+    use hevc_core::sei::{plane_md5, HashCheck};
+    let md5_sei = |delta: u8| move |y: &[u16]| -> Vec<u8> {
+        let mut d = plane_md5(&Plane { w: 8, h: 8, data: y.to_vec() }, 8);
+        d[15] = d[15].wrapping_add(delta);
+        let mut rbsp = vec![132, 17, 0];
+        rbsp.extend(d);
+        rbsp.push(0x80);
+        rbsp
+    };
+    for (delta, want) in [(0u8, HashCheck::Match), (1, HashCheck::Mismatch(0))] {
+        let f = md5_sei(delta);
+        let (s, _) = mono_pcm(1, Some(&f as &dyn Fn(&[u16]) -> Vec<u8>));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode");
+        d.flush();
+        assert_eq!(d.take_frames().len(), 1);
+        assert_eq!(d.take_hash_checks(), vec![(0, want)], "delta {delta}");
+    }
+}
+
+/// HEVCLEVELLINE (SR368, HEVC-LEVEL-LINE): the A.3 names of bit-written profile_tier_levels read back by `parse_ptl`
+/// (the 43 constraint bits now kept): `flags` are Table A.2's max_12bit .. lower_bit_rate (then max_14bit) in order.
+#[test]
+fn w_profile_tier_level_names() {
+    use h264_core::bits::BitReader;
+    use hevc_core::ps::{parse_ptl, Ptl};
+    let names = |high: bool, idc: u32, compat: u32, flags: &str, level: u64| -> Ptl {
+        let mut b = BitWriter::default();
+        b.u(0, 2);
+        b.bit(high as u32);
+        b.u(idc as u64, 5);
+        b.u(compat as u64, 32);
+        b.u(0b1001, 4); // progressive, interlaced, non_packed, frame_only
+        for c in flags.bytes() {
+            b.bit((c == b'1') as u32);
+        }
+        b.u(0, 44 - flags.len() as u32);
+        b.u(level, 8);
+        b.u(0, 8); // byte padding for the reader
+        parse_ptl(&mut BitReader::new(&b.out), true, 0).names()
+    };
+    let p = |profile, tier, level| Ptl { profile, tier, level };
+    assert_eq!(names(false, 2, 0, "", 153), p("Main10", "main", (5, 1)));
+    assert_eq!(names(false, 2, 0, "00000001", 120), p("Main10Still", "main", (4, 0)));
+    assert_eq!(names(true, 4, 0, "110100001", 186), p("Main422_10", "high", (6, 2)));
+    assert_eq!(names(false, 4, 0, "000000100", 93), p("Main444_16Intra", "main", (3, 1)));
+    assert_eq!(names(false, 4, 0, "", 63), p("RExt", "main", (2, 1)));
+    assert_eq!(names(false, 9, 0, "1110000011", 150), p("ScreenExtendedMain444", "main", (5, 0)));
+    assert_eq!(names(false, 0, 1 << (31 - 3), "", 255), p("MainStill", "main", (8, 5)));
+    assert_eq!(names(false, 1, 0x6000_0000, "", 60), p("Main", "main", (2, 0)));
+}
+
+/// HEVCLEVELLINE (SR368): `Decoder::profile_tier_level` is the stored SPS's (the common kit writes Main, level 2) and
+/// `None` before any SPS.
+#[test]
+fn x_decoder_profile_tier_level() {
+    use hevc_core::ps::Ptl;
+    let mut d = Decoder::new();
+    assert_eq!(d.profile_tier_level(), None);
+    d.decode_annexb(&nal(33, &sps_rbsp(&SpsCfg::default()))).expect("sps");
+    assert_eq!(d.profile_tier_level(), Some(Ptl { profile: "Main", tier: "main", level: (2, 0) }));
 }

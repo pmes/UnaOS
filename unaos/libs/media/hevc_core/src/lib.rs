@@ -24,6 +24,7 @@
 //! | [`dpb`]         | 8.3.2 reference picture set, 8.3.4 reference picture lists, C.5.2 DPB output    |
 //! | [`inter`]       | 8.5.3 merge / AMVP / TMVP, 8-tap / 4-tap interpolation, weighted prediction      |
 //! | [`decoder`]     | access units, 8.3.1 POC, NoRaslOutputFlag, C.5.2 output order, the API          |
+//! | [`level`]       | A.4 tier and level limits, refused by name under `set_strict_levels` (SR365)    |
 //!
 //! REUSED from h264_core, not copied: [`h264_core::cabac::Cabac`] (the arithmetic decoding engine: H.265 Tables 9-46 /
 //! 9-47 and 9.3.4.3.2-5 equal H.264's 9.3.3.2, and 9.3.2.2's preCtxState gives the same state byte),
@@ -67,8 +68,8 @@
 //! colour planes and bit depths above 16 (HEVCREXT SR334 decodes 4:2:2 / 4:4:4, 12-bit, unequal depths; HEVCREXTTOOLS
 //! SR345 every range extension tool, monochrome and 16 bits; HEVCREXTSCC SR357 palette, intra block copy and the
 //! adaptive colour transform), and of the screen content coding extension (HEVCREXT-SCC) an SCC body behind the
-//! multilayer / 3D bodies, the colour transform at unequal luma / chroma depths, weighted prediction with the current
-//! picture as a reference and intra block copy outside the decoded region. Layers above the base (nuh_layer_id > 0) are
+//! multilayer / 3D bodies, the colour transform at unequal luma / chroma depths and intra block copy outside the decoded
+//! region (HEVCSCCTAIL SR365: weighted prediction with the current picture as a reference decodes). Layers above the base (nuh_layer_id > 0) are
 //! ignored.
 
 #![no_std]
@@ -88,6 +89,7 @@ pub mod decoder;
 pub mod dpb;
 pub mod inter;
 pub mod intra;
+pub mod level;
 pub mod nal;
 pub mod palette;
 pub mod picture;

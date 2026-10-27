@@ -127,8 +127,8 @@ impl Facet {
     /// Open already-read bytes; `path` labels them.
     pub fn open_bytes(&mut self, path: &str, bytes: &[u8]) -> Result<(u64, FacetImageInfo), String> {
         let format = self.source.sniff(bytes).ok_or_else(|| format!("{path}: {}", source::unrecognised(bytes)))?;
-        let meta = meta::read(bytes, format);
-        let decoded = self.source.decode(bytes).map_err(|e| format!("{path}: {e}"))?;
+        let mut meta = meta::read(bytes, format);
+        let decoded = self.source.decode(bytes).map_err(|e| format!("{path}: {e}"))?; meta::icc(&mut meta, format, decoded.icc.as_deref()); // METAICCONE (SR367): the profile label from the one decode's Image::icc
         if decoded.rgba.len() != decoded.width as usize * decoded.height as usize * 4 {
             return Err(format!("{path}: source returned a short pixel buffer"));
         }
@@ -216,16 +216,8 @@ impl Facet {
         let img = self.get(handle)?;
         let baked = img.baked();
         let bytes = png::encode(baked.width, baked.height, &baked.rgba);
-        // Atomic: a sibling temp file, then rename over the target.
-        let tmp = p.with_file_name(format!(
-            ".{}.facet-tmp",
-            p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "export".into())
-        ));
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("{path}: {e}"))?;
-        std::fs::rename(&tmp, p).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("{path}: {e}")
-        })?;
+        // Atomic (SAVEDIALOG, SR364: FACET-SAVEVERB): gneiss_pal's ONE writer — `<path>.part`, then rename over the target.
+        gneiss_pal::fs::save_bytes(p, &bytes).map_err(|e| format!("{path}: {e}"))?;
         Ok(bytes.len() as u64)
     }
 

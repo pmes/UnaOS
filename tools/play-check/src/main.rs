@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use gneiss_pal::dsp::avsync::{ManualTime, TimeSource};
 use gneiss_pal::dsp::image::encode_rgba;
-use gneiss_pal::dsp::video::{Frame, Pixels, TestPattern};
+use gneiss_pal::dsp::video::{Chroma, Frame, Pixels, TestPattern, chroma_of};
 use stria::media::{AudioOut, FrameSink, Player, Tick};
 
 /// A headless audio device: takes stereo frames into a half-second ring and consumes them at
@@ -263,7 +263,7 @@ fn main() {
     if let Some(n) = want {
         match &cap.frame {
             Some(f) => {
-                let rgba = f.to_rgba();
+                let rgba = f.to_rgba_colour(p.colour(), p.video_track().map_or(Chroma::Nearest, chroma_of)); // AV1INBANDCOLOUR (SR366) PLAYCHECK-COLOUR: BusSink's conversion (`Player::colour`, `chroma_of`)
                 let counter = TestPattern::read_counter(&rgba, f.width, f.height);
                 extra += &format!(",\"frame\":{n},\"frame_pts\":{:.6},\"frame_size\":[{},{}],\"frame_fnv\":\"{:x}\",\"counter\":{}", f.pts_ns as f64 / 1e9, f.width, f.height, fnv1a(&rgba), counter.map(|c| c.to_string()).unwrap_or("null".into()));
                 if counter.is_some() && counter != Some(n as u32) {
@@ -375,6 +375,7 @@ fn main() {
             }
         }
     }
+    extra += &profile_json(&info.video_profile); // HEVCLEVELLINE (SR368): "profile" / "tier" / "level"
     println!(
         "{{\"file\":\"{}\",\"video\":\"{}\",\"audio\":\"{}\",\"decoder\":\"{}\",\"audio_decoder\":\"{}\",\"sample_rate\":{},\"channels\":{},\"audio_clock\":{},\"real_video\":{},\"audio_note\":\"{}\",\"size\":[{},{}],\"duration\":{:.6},\"hz\":{hz},\"presented\":{},\"dropped\":{},\"repeated\":{},\"av_max_ms\":{:.3},\"pts\":[{}]{extra},\"ok\":{ok}}}",
         file,
@@ -691,5 +692,45 @@ mod tests {
         (o.compared, o.exact) = (3, 3);
         assert!(o.ok());
         assert_eq!(o.json(), ",\"i420_oracle\":{\"compared\":3,\"exact\":3,\"missing\":0,\"max_abs_diff\":0}");
+    }
+
+    /// AV1INBANDCOLOUR (SR366) PLAYCHECK-COLOUR: `frame_fnv`, the counter read and `--out` take BusSink's conversion
+    /// (`Frame::to_rgba_colour` by `Player::colour` and `chroma_of`), no longer `to_rgba` (BT.601 limited nearest for every
+    /// stream). An untagged SD frame is byte-identical to before; an untagged HD frame takes BT.709; an AV1 frame (bilinear)
+    /// moves: its hash is pinned here.
+    #[test]
+    fn playcheck_colour_converts_as_the_bus_sink() {
+        use gneiss_pal::dsp::demux::colour::Colour;
+        let frame = |w: u32, h: u32| {
+            let (cw, ch) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+            let y: Vec<u8> = (0..w as usize * h as usize).map(|i| (16 + (i * 7) % 220) as u8).collect();
+            let u: Vec<u8> = (0..cw * ch).map(|i| (16 + (i * 13) % 224) as u8).collect();
+            let v: Vec<u8> = (0..cw * ch).map(|i| (240 - (i * 5) % 224) as u8).collect();
+            Frame { width: w, height: h, pts_ns: 0, pixels: Pixels::I420 { y, u, v, y_stride: w as usize, uv_stride: cw } }
+        };
+        let sd = frame(320, 240);
+        assert_eq!(sd.to_rgba_colour(None, Chroma::Nearest), sd.to_rgba(), "untagged SD: the hash is unchanged");
+        let hd = frame(1280, 720);
+        assert_ne!(hd.to_rgba_colour(None, Chroma::Nearest), hd.to_rgba(), "untagged HD converts BT.709 (the size default)");
+        let bt709 = Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false), mastering: None, light: None };
+        let av1 = hd.to_rgba_colour(Some(&bt709), Chroma::Bilinear);
+        assert_eq!(fnv1a(&hd.to_rgba()), 0x0754_30e0, "the retired to_rgba hash of the HD frame");
+        assert_eq!(fnv1a(&av1), 0x72e1_61fd, "an AV1 BT.709 limited bilinear frame_fnv");
+    }
+}
+
+/// HEVCLEVELLINE (LEDGER SR368): the Player's profile tokens (`MediaInfo::video_profile`, `profile=.. tier=.. level=..`)
+/// as JSON fields, one per `key=value` token; "" (no tokens) adds none.
+fn profile_json(tokens: &str) -> String {
+    tokens.split_whitespace().filter_map(|t| t.split_once('=')).map(|(k, v)| format!(",\"{k}\":\"{v}\"")).collect()
+}
+
+#[cfg(test)]
+mod profile_tests {
+    #[test]
+    fn profile_json_kat() {
+        assert_eq!(super::profile_json("profile=Main tier=main level=2"), ",\"profile\":\"Main\",\"tier\":\"main\",\"level\":\"2\"");
+        assert_eq!(super::profile_json("profile=High level=4.1"), ",\"profile\":\"High\",\"level\":\"4.1\"");
+        assert_eq!(super::profile_json(""), "");
     }
 }

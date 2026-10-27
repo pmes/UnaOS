@@ -126,9 +126,10 @@ impl PdfDocument {
         Some(device_box(|x, y| m.apply(x, y), a.get(i)?.rect))
     }
 
-    /// The link or editable widget under viewport CSS (`x`, `y`): the topmost (last painted) visible one.
-    pub fn target_at(&self, x: f64, y: f64, vw: f64, scroll_y: f64) -> Option<Target> {
-        let dy = y + scroll_y;
+    /// The link or editable widget under viewport CSS (`x`, `y`), the viewport scrolled to `scroll` (x, y): the topmost
+    /// (last painted) visible one.
+    pub fn target_at(&self, x: f64, y: f64, vw: f64, scroll: (f64, f64)) -> Option<Target> {
+        let (x, dy) = (x + scroll.0, y + scroll.1);
         let page = self.page_at(dy);
         let (px, py, _, _) = self.page_rect(page, vw);
         let (ux, uy) = ((x - px) / PT, (dy - py) / PT);
@@ -240,9 +241,9 @@ impl crate::AetherEngine {
     /// `pointer_moved` on a PDF: the cursor over a link / check box (pointer) or a text field (text).
     pub(crate) fn pdf_hover(&mut self, x: f64, y: f64) {
         self.pointer = Some((x, y));
-        let (vw, sy) = (self.width as f64, self.scroll_y);
+        let (vw, sy) = (self.width as f64, (self.scroll_x, self.scroll_y));
         let Some(pdf) = self.pdf.as_mut() else { return };
-        let t = pdf.target_at(x, y, vw, sy);
+        let t = if pdf.in_strip(x) { None } else { pdf.target_at(x, y, vw, sy) };
         pdf.hover = t;
         let cursor = match t {
             Some(Target::Link(..)) => "pointer",
@@ -267,7 +268,7 @@ impl crate::AetherEngine {
 
     /// The MouseUp on a PDF: a release on the link or widget the press was on activates it.
     pub(crate) fn pdf_release(&mut self, x: f64, y: f64) {
-        let (vw, sy) = (self.width as f64, self.scroll_y);
+        let (vw, sy) = (self.width as f64, (self.scroll_x, self.scroll_y));
         let Some(pdf) = self.pdf.as_mut() else { return };
         let Some(t) = pdf.pressed.take().filter(|p| pdf.target_at(x, y, vw, sy) == Some(*p)) else { return };
         match t {
@@ -281,7 +282,7 @@ impl crate::AetherEngine {
     }
 
     /// Carry out a link: /URI navigates (the `<a>` path's `pending_nav`); /GoTo and /Named scroll.
-    fn pdf_follow(&mut self, link: LinkAction) {
+    pub(crate) fn pdf_follow(&mut self, link: LinkAction) {
         let vh = self.height as f64;
         let Some(pdf) = self.pdf.as_ref() else { return };
         let y = match link {
@@ -369,11 +370,11 @@ impl crate::AetherEngine {
         self.pdf_refill();
     }
 
-    /// `key_default` on a PDF: the focused text field's editing keys (Return blurs). False when no field holds the
-    /// keys or the key is not an editing one (scrolling and Tab go on).
+    /// `key_default` on a PDF: the focused text field's editing keys (Return blurs), else the view keys
+    /// (`pdf_view_key`: Left / Right, F4). False when neither takes the key (scrolling and Tab go on).
     pub(crate) fn pdf_key(&mut self, key: &str) -> bool {
         use crate::forms::edit::Outcome;
-        let Some(f) = self.pdf.as_mut().and_then(|p| p.focus.as_mut()) else { return false };
+        let Some(f) = self.pdf.as_mut().and_then(|p| p.focus.as_mut()) else { return self.pdf_view_key(key) };
         let before = f.value.clone();
         let multiline = f.multiline;
         match self.edit.key(&mut f.value, key, multiline) {
@@ -391,7 +392,7 @@ impl crate::AetherEngine {
                 self.pdf_dirty();
                 true
             }
-            Outcome::Unhandled => false,
+            Outcome::Unhandled => self.pdf_view_key(key),
         }
     }
 }

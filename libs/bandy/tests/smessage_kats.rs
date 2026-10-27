@@ -1556,6 +1556,9 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserSave { .. } => "BrowserSave", // PDF4FORMSAVE (SR354): the save verb and its two answers
         SMessage::BrowserSaved { .. } => "BrowserSaved",
         SMessage::BrowserSaveFailed { .. } => "BrowserSaveFailed",
+        SMessage::BrowserSaveAs { .. } => "BrowserSaveAs", // SAVEDIALOG (SR364): Save As, and the face's panel ask / answer
+        SMessage::SavePanel { .. } => "SavePanel",
+        SMessage::SavePanelChose { .. } => "SavePanelChose",
     }
 }
 
@@ -1764,4 +1767,26 @@ kat!(
     kat_browser_save_failed,
     SMessage::BrowserSaveFailed { why: "Permission denied".to_string() },
     r#"{"BrowserSaveFailed":{"why":"Permission denied"}}"#
+);
+
+// SAVEDIALOG (SR364): Save As hands the shell the bytes; the shell asks the face for a path; the face answers it, or null (cancelled).
+kat!(
+    kat_browser_save_as,
+    SMessage::BrowserSaveAs { name: "form.pdf".to_string(), mime: "application/pdf".to_string(), bytes: vec![37, 80, 68, 70] },
+    r#"{"BrowserSaveAs":{"name":"form.pdf","mime":"application/pdf","bytes":[37,80,68,70]}}"#
+);
+kat!(
+    kat_save_panel,
+    SMessage::SavePanel { url: "viewport".to_string(), name: "form.pdf".to_string() },
+    r#"{"SavePanel":{"url":"viewport","name":"form.pdf"}}"#
+);
+kat!(
+    kat_save_panel_chose,
+    SMessage::SavePanelChose { url: "viewport".to_string(), path: Some("/home/una/form.pdf".to_string()) },
+    r#"{"SavePanelChose":{"url":"viewport","path":"/home/una/form.pdf"}}"#
+);
+kat!(
+    kat_save_panel_cancelled,
+    SMessage::SavePanelChose { url: "viewport".to_string(), path: None },
+    r#"{"SavePanelChose":{"url":"viewport","path":null}}"#
 );

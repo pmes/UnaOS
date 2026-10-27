@@ -61,7 +61,7 @@ fn base(qp: u8) -> Config {
 }
 
 fn cbr(kbps: u32) -> Option<RateControl> {
-    Some(RateControl { bits_per_second: kbps * 1000, fps_num: FPS, fps_den: 1, mode: RcMode::Cbr })
+    Some(RateControl::cbr(kbps, (FPS, 1)))
 }
 
 /// The bytes of an access unit as the rate controller counts them: every NAL unit.

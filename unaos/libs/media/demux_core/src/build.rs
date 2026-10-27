@@ -240,7 +240,15 @@ impl TrackSpec {
 pub fn pcm16_track(id: u32, sample_rate: u32, channels: u16, pcm: &[i16], frames_per_packet: usize) -> MediaTrack {
     let ch = channels.max(1) as usize;
     let fpp = frames_per_packet.max(1);
-    let spec = TrackSpec {
+    let spec = pcm16_spec(id, sample_rate, channels);
+    let samples = pcm.chunks(fpp * ch).enumerate().map(|(i, c)| pcm16_sample((i * fpp) as u64, c, channels)).collect();
+    MediaTrack { spec, samples }
+}
+
+/// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): [`pcm16_track`]'s sample entry alone (a streamed export declares it before its
+/// packets exist).
+pub fn pcm16_spec(id: u32, sample_rate: u32, channels: u16) -> TrackSpec {
+    TrackSpec {
         id,
         kind: TrackKind::Audio,
         fourcc: *b"sowt",
@@ -254,19 +262,20 @@ pub fn pcm16_track(id: u32, sample_rate: u32, channels: u16, pcm: &[i16], frames
         channels,
         bit_depth: 16,
         default_duration_ns: 0,
-    };
-    let samples = pcm
-        .chunks(fpp * ch)
-        .enumerate()
-        .map(|(i, c)| SampleSpec {
-            data: c.iter().flat_map(|x| x.to_le_bytes()).collect(),
-            dts: (i * fpp) as i64,
-            pts: (i * fpp) as i64,
-            duration: (c.len() / ch) as u32,
-            keyframe: true,
-        })
-        .collect();
-    MediaTrack { spec, samples }
+    }
+}
+
+/// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): one [`pcm16_track`] packet: the interleaved frames `chunk` starting at sample
+/// frame `first_frame` (its dts = pts, in the sample rate's ticks).
+pub fn pcm16_sample(first_frame: u64, chunk: &[i16], channels: u16) -> SampleSpec {
+    let ch = channels.max(1) as usize;
+    SampleSpec {
+        data: chunk.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        dts: first_frame as i64,
+        pts: first_frame as i64,
+        duration: (chunk.len() / ch) as u32,
+        keyframe: true,
+    }
 }
 
 /// `n` test-pattern frames at `fps`, a keyframe every `gop` frames, pts == dts.
@@ -411,7 +420,7 @@ fn rle<T: PartialEq + Copy>(xs: impl Iterator<Item = T>) -> Vec<(u32, T)> {
     out
 }
 
-fn trak(t: &MediaTrack, opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, chunk_offsets: &[u64], progressive: bool) -> Vec<u8> {
+fn trak(t: &MediaTrack, opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, chunk_offsets: &[u64], progressive: bool, sizes: Option<&[u32]>) -> Vec<u8> {
     let s = &t.spec;
     let media_dur = if progressive { track_duration(t) } else { 0 };
     let movie_dur = media_dur * movie_ts as u64 / s.timescale.max(1) as u64;
@@ -512,8 +521,8 @@ fn trak(t: &MediaTrack, opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, chunk_o
     let mut stsz = Vec::new();
     stsz.u32b(0);
     stsz.u32b(samples.len() as u32);
-    for x in samples {
-        stsz.u32b(x.data.len() as u32);
+    for (j, x) in samples.iter().enumerate() {
+        stsz.u32b(sizes.map_or(x.data.len() as u32, |z| z[j]));
     }
     let stsz = fbx(b"stsz", 0, 0, &stsz);
 
@@ -620,7 +629,7 @@ pub fn mp4_with(tracks: &[MediaTrack], opts: &Mp4Options, x: &Mp4Extras) -> Vec<
     let build_moov = |offsets: &[Vec<u64>]| -> Vec<u8> {
         let mut m = mvhd(movie_ts, movie_dur, next_id);
         for (i, t) in tracks.iter().enumerate() {
-            m.extend_from_slice(&trak(t, opts, x, movie_ts, &offsets[i], true));
+            m.extend_from_slice(&trak(t, opts, x, movie_ts, &offsets[i], true, None));
         }
         bx(b"moov", &m)
     };
@@ -654,7 +663,7 @@ fn mp4_fragmented(tracks: &[MediaTrack], opts: &Mp4Options, x: &Mp4Extras, movie
         .unwrap_or(0);
     let mut moov = mvhd(movie_ts, 0, next_id);
     for t in tracks {
-        moov.extend_from_slice(&trak(t, opts, x, movie_ts, &[], false));
+        moov.extend_from_slice(&trak(t, opts, x, movie_ts, &[], false, None));
     }
     let mut mvex = Vec::new();
     let mut mehd = Vec::new();
@@ -1219,6 +1228,69 @@ fn mkv_colour(opts: &MkvOptions, id: u32) -> Vec<u8> {
     el(0x55B0, &b)
 }
 
+/// NLE6EXPORTAAC (rmbp-ledger B960): an AAC track (`mp4a` + `esds`), one raw_data_block per sample of 1024 frames,
+/// timescale = the sample rate. `asc` is the AudioSpecificConfig (audio_core `aac::enc::Encoder::asc`); `config` holds the
+/// whole `esds` body (the full-box word, ES_Descriptor -> DecoderConfigDescriptor (objectTypeIndication 0x40, audio
+/// stream) -> DecoderSpecificInfo = `asc`, SLConfigDescriptor 2), which the reader's `parse_esds` takes back to the ASC.
+/// MP4 only: a Matroska `A_AAC` track wants the bare ASC as CodecPrivate (AACENC-MKV owed), so [`mkv`] of this track is
+/// not supported. The encoder's priming is trimmed by [`mp4a_edit_list`] through [`Mp4Extras::edit_lists`].
+pub fn mp4a_track(id: u32, sample_rate: u32, channels: u16, asc: &[u8], units: Vec<Vec<u8>>, avg_bitrate: u32) -> MediaTrack {
+    let biggest = units.iter().map(|u| u.len()).max().unwrap_or(0) as u32;
+    let spec = mp4a_spec(id, sample_rate, channels, asc, biggest, avg_bitrate);
+    let samples = units.into_iter().enumerate().map(|(i, data)| mp4a_sample(i as u64, data)).collect();
+    MediaTrack { spec, samples }
+}
+
+/// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): [`mp4a_track`]'s sample entry alone, from its biggest unit's size (the esds's
+/// buffer size and max bitrate), so a streamed export states it at the end ([`Mp4Stream::respec`]).
+pub fn mp4a_spec(id: u32, sample_rate: u32, channels: u16, asc: &[u8], biggest: u32, avg_bitrate: u32) -> TrackSpec {
+    let desc = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut d = alloc::vec![tag];
+        let n = body.len();
+        d.extend_from_slice(&[0x80 | ((n >> 21) & 0x7F) as u8, 0x80 | ((n >> 14) & 0x7F) as u8, 0x80 | ((n >> 7) & 0x7F) as u8, (n & 0x7F) as u8]);
+        d.extend_from_slice(body);
+        d
+    };
+    let max_bitrate = (biggest as u64 * 8 * sample_rate as u64 / 1024).max(avg_bitrate as u64) as u32;
+    let mut dcd = alloc::vec![0x40u8, 0x15];
+    dcd.extend_from_slice(&biggest.to_be_bytes()[1..]);
+    dcd.u32b(max_bitrate);
+    dcd.u32b(avg_bitrate);
+    dcd.extend_from_slice(&desc(0x05, asc));
+    let mut es = alloc::vec![0u8, 0, 0]; // ES_ID 0, no dependence / URL / OCR
+    es.extend_from_slice(&desc(0x04, &dcd));
+    es.extend_from_slice(&desc(0x06, &[0x02]));
+    let mut config = alloc::vec![0u8; 4]; // the full-box version and flags
+    config.extend_from_slice(&desc(0x03, &es));
+    TrackSpec {
+        id,
+        kind: TrackKind::Audio,
+        fourcc: *b"mp4a",
+        config_box: Some(*b"esds"),
+        codec_id: "A_AAC",
+        config,
+        timescale: sample_rate,
+        width: 0,
+        height: 0,
+        sample_rate,
+        channels,
+        bit_depth: 16,
+        default_duration_ns: 0,
+    }
+}
+
+/// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): [`mp4a_track`]'s unit `index` (1024 samples each).
+pub fn mp4a_sample(index: u64, data: Vec<u8>) -> SampleSpec {
+    SampleSpec { data, dts: index as i64 * 1024, pts: index as i64 * 1024, duration: 1024, keyframe: true }
+}
+
+/// The [`Mp4Extras::edit_lists`] entry of an [`mp4a_track`]: skip `priming` media samples, present `frames` (in the
+/// default movie timescale, 1000).
+pub fn mp4a_edit_list(id: u32, sample_rate: u32, priming: u32, frames: u64) -> (u32, Vec<(u32, i64, i32)>) {
+    let seg = (frames as u128 * 1000 / sample_rate.max(1) as u128) as u32;
+    (id, alloc::vec![(seg, priming as i64, 0x0001_0000)])
+}
+
 #[cfg(test)]
 mod tests {
     /// SWAPBACKVPLAY (rmbp-ledger B956): the stand-in's pixels, pinned. FNV-1a 64 of `test_pattern_rgba(64, 48, n)`,
@@ -1231,6 +1303,352 @@ mod tests {
         assert_eq!(fnv(&super::test_pattern_rgba(64, 48, 1)), 0xdb29_ef26_80d9_5484);
         for n in [0u32, 1, 42, 999_999] {
             assert_eq!(super::test_pattern_counter(&super::test_pattern_rgba(64, 48, n), 64, 48), Some(n));
+        }
+    }
+
+    /// NLE6EXPORTAAC (rmbp-ledger B960): the `mp4a` / `esds` track and its priming edit read back through the demuxer.
+    #[test]
+    fn mp4a_track_round_trip() {
+        use alloc::vec;
+        let asc = [0x11u8, 0x90];
+        let units: alloc::vec::Vec<alloc::vec::Vec<u8>> = (0..5u8).map(|i| vec![0x21, i, 0x40]).collect();
+        let t = super::mp4a_track(1, 48000, 2, &asc, units.clone(), 128000);
+        let x = super::Mp4Extras { edit_lists: vec![super::mp4a_edit_list(1, 48000, 1024, 3000)], ..Default::default() };
+        let mp4 = super::mp4_with(&[t], &super::Mp4Options::default(), &x);
+        let d = crate::Demuxer::open(mp4).unwrap();
+        let tr = &d.tracks()[0];
+        assert_eq!(tr.codec, crate::Codec::Aac);
+        assert_eq!(tr.config, asc.to_vec());
+        assert_eq!((tr.sample_rate, tr.channels), (48000, 2));
+        assert_eq!(tr.edit.map(|e| e.media_time), Some(1024));
+        let got: alloc::vec::Vec<_> = d.track_samples(0).map(|s| (s.dts, s.duration, d.packet_at(s).data)).collect();
+        assert_eq!(got.len(), 5);
+        for (i, (dts, dur, data)) in got.into_iter().enumerate() {
+            assert_eq!((dts, dur, data), (i as i64 * 1024, 1024, units[i].clone()));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// NLE6EXPORTONE (rmbp-ledger B963; handlers.md §5 NLE6's NLE6EXPORT-TRACK / -STREAM, BP-handlers-14): the ONE coded video
+// track both export faces mux, and the streamed MP4 (the classic non-faststart layout: ftyp, a 64-bit mdat written sample
+// by sample, the moov at the end through the same `mvhd` / `trak` [`mp4_with`] writes; the reader finds a moov anywhere).
+// ---------------------------------------------------------------------------------------------
+
+/// NLE6EXPORT-TRACK (B963): the ONE coded-video sample entry both export faces write (Stria's `nle_export` `video_track`
+/// and the kernel's `nle export`): `fourcc` / `config_box` / `config` (e.g. `avc1` / `avcC` / the encoder's avcC),
+/// `width x height`, timescale = `tb.den` (the project's fps), one sample lasting `tb.num` ticks.
+pub fn coded_video_spec(id: u32, fourcc: [u8; 4], config_box: Option<[u8; 4]>, config: Vec<u8>, width: u16, height: u16, tb: crate::Timebase) -> TrackSpec {
+    let num = tb.num.max(1) as u32;
+    TrackSpec {
+        id,
+        kind: TrackKind::Video,
+        fourcc,
+        config_box,
+        codec_id: "",
+        config,
+        timescale: tb.den as u32,
+        width,
+        height,
+        sample_rate: 0,
+        channels: 0,
+        bit_depth: 0,
+        default_duration_ns: num as u64 * 1_000_000_000 / tb.den.max(1),
+    }
+}
+
+/// One coded unit at its (dts, pts) in `tb` ticks (pts != dts writes `ctts`), lasting one tick.
+pub fn coded_video_sample(tb: crate::Timebase, keyframe: bool, data: Vec<u8>, dts: i64, pts: i64) -> SampleSpec {
+    let num = tb.num.max(1) as u32;
+    SampleSpec { data, dts: dts * num as i64, pts: pts * num as i64, duration: num, keyframe }
+}
+
+/// [`coded_video_spec`]'s track with its units `(keyframe, data, dts, pts)` (ticks of `tb`), each a [`coded_video_sample`].
+pub fn coded_video_track(spec: TrackSpec, tb: crate::Timebase, units: impl IntoIterator<Item = (bool, Vec<u8>, i64, i64)>) -> MediaTrack {
+    let samples = units.into_iter().map(|(k, data, dts, pts)| coded_video_sample(tb, k, data, dts, pts)).collect();
+    MediaTrack { spec, samples }
+}
+
+/// Where [`Mp4Stream`] writes: bytes at an absolute file offset (appends at the end, one patch of the mdat size).
+pub trait Sink {
+    type Error;
+    fn write_at(&mut self, off: u64, bytes: &[u8]) -> Result<(), Self::Error>;
+}
+
+impl Sink for Vec<u8> {
+    type Error = core::convert::Infallible;
+    fn write_at(&mut self, off: u64, bytes: &[u8]) -> Result<(), Self::Error> {
+        let (o, e) = (off as usize, off as usize + bytes.len());
+        if self.len() < e {
+            self.resize(e, 0);
+        }
+        self[o..e].copy_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// One streamed track: its spec, the samples' tables (data emptied once written), sizes and file offsets.
+struct Streamed {
+    spec: TrackSpec,
+    samples: Vec<SampleSpec>,
+    sizes: Vec<u32>,
+    offsets: Vec<u64>,
+}
+
+/// NLE6EXPORT-STREAM (B963): an MP4 written as it is made. [`Mp4Stream::begin`] writes the ftyp and a 64-bit `mdat` header,
+/// [`Mp4Stream::push`] writes each sample's bytes at the end and keeps only its table entry, [`Mp4Stream::finish`] writes
+/// the `moov` (one sample per chunk, `stco` = the recorded offsets, `co64` past 4 GiB) and patches the mdat's size. The
+/// sample tables are the ones [`mp4`] writes for the same tracks (only the chunk offsets differ). Progressive only:
+/// `Mp4Options::fragment` is ignored.
+pub struct Mp4Stream<S: Sink> {
+    sink: S,
+    end: u64,
+    mdat_at: u64,
+    video_bytes: u64,
+    tracks: Vec<Streamed>,
+}
+
+impl<S: Sink> Mp4Stream<S> {
+    /// Start the file at offset 0 of `sink`: [`mp4`]'s ftyp, then `mdat` with a 0 largesize (patched by `finish`).
+    pub fn begin(mut sink: S) -> Result<Self, S::Error> {
+        let one = mp4(&[], &Mp4Options::default());
+        let n = u32::from_be_bytes([one[0], one[1], one[2], one[3]]) as usize;
+        let mut head = Vec::with_capacity(n + 16);
+        head.extend_from_slice(&one[..n]);
+        head.u32b(1);
+        head.extend_from_slice(b"mdat");
+        head.u64b(0);
+        sink.write_at(0, &head)?;
+        Ok(Mp4Stream { sink, end: head.len() as u64, mdat_at: n as u64, video_bytes: 0, tracks: Vec::new() })
+    }
+
+    /// Add a track (any time before `finish`; the moov lists tracks in this order); its index for [`Mp4Stream::push`].
+    pub fn track(&mut self, spec: TrackSpec) -> usize {
+        self.tracks.push(Streamed { spec, samples: Vec::new(), sizes: Vec::new(), offsets: Vec::new() });
+        self.tracks.len() - 1
+    }
+
+    /// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): restate track `track`'s sample entry before `finish` (one known only at the
+    /// end: an `mp4a_spec`'s biggest unit).
+    pub fn respec(&mut self, track: usize, spec: TrackSpec) {
+        self.tracks[track].spec = spec;
+    }
+
+    /// Write sample `s` of track `track` (an index from [`Mp4Stream::track`]) at the end of the file.
+    pub fn push(&mut self, track: usize, mut s: SampleSpec) -> Result<(), S::Error> {
+        self.sink.write_at(self.end, &s.data)?;
+        let n = s.data.len();
+        let t = &mut self.tracks[track];
+        t.offsets.push(self.end);
+        t.sizes.push(n as u32);
+        if t.spec.kind == TrackKind::Video {
+            self.video_bytes += n as u64;
+        }
+        self.end += n as u64;
+        s.data = Vec::new();
+        t.samples.push(s);
+        Ok(())
+    }
+
+    /// The bytes written so far.
+    pub fn len(&self) -> u64 {
+        self.end
+    }
+
+    /// The video tracks' sample bytes written so far.
+    pub fn video_bytes(&self) -> u64 {
+        self.video_bytes
+    }
+
+    /// Write the `moov` at the end and patch the mdat's size; the sink and the file's length. `x` is what [`mp4_with`] takes
+    /// (NLE6EXPORTAAC rmbp-ledger B960: the AAC track's priming edit list), so the one-shot and the stream write one moov.
+    pub fn finish(mut self, opts: &Mp4Options, x: &Mp4Extras) -> Result<(S, u64), S::Error> {
+        let movie_ts = if opts.movie_timescale == 0 { 1000 } else { opts.movie_timescale };
+        let mut o = opts.clone();
+        o.chunk = 1;
+        o.co64 = opts.co64 || self.end > u32::MAX as u64;
+        let built: Vec<(MediaTrack, Vec<u32>, Vec<u64>)> =
+            core::mem::take(&mut self.tracks).into_iter().map(|t| (MediaTrack { spec: t.spec, samples: t.samples }, t.sizes, t.offsets)).collect();
+        let next_id = built.iter().map(|(t, _, _)| t.spec.id).max().unwrap_or(0) + 1;
+        let movie_dur = built.iter().map(|(t, _, _)| track_duration(t) * movie_ts as u64 / t.spec.timescale.max(1) as u64).max().unwrap_or(0);
+        let mut m = mvhd(movie_ts, movie_dur, next_id);
+        for (t, sizes, offsets) in &built {
+            m.extend_from_slice(&trak(t, &o, x, movie_ts, &offsets[..], true, Some(&sizes[..])));
+        }
+        let moov = bx(b"moov", &m);
+        self.sink.write_at(self.end, &moov)?;
+        let mdat_len = self.end - self.mdat_at;
+        self.sink.write_at(self.mdat_at + 8, &mdat_len.to_be_bytes())?;
+        let total = self.end + moov.len() as u64;
+        Ok((self.sink, total))
+    }
+}
+
+#[cfg(test)]
+mod stream_kats {
+    use super::*;
+    use alloc::vec;
+
+    fn units(n: i64) -> Vec<(bool, Vec<u8>, i64, i64)> {
+        // decode order with B pictures: pts = dts + 1 on anchors after the first, dts - 1 on the B between them
+        (0..n).map(|i| (i % 10 == 0, vec![(i * 7) as u8; 40 + (i as usize * 13) % 50], i, if i == 0 { 0 } else if i % 2 == 1 { i + 1 } else { i - 1 })).collect()
+    }
+
+    /// NLE6EXPORT-TRACK (B963): the constructor writes the bytes the retired literal (Stria's `video_track`, the kernel's
+    /// `Exp::write`) wrote, at an integer fps and at 30000/1001.
+    #[test]
+    fn coded_video_track_is_the_retired_literal() {
+        for tb in [crate::Timebase { num: 1, den: 25 }, crate::Timebase { num: 1001, den: 30000 }] {
+            let cfg = vec![1u8, 0x42, 0xc0, 0x1e, 0xff, 0xe1];
+            let u = units(24);
+            let num = tb.num.max(1) as u32;
+            let literal = MediaTrack {
+                spec: TrackSpec {
+                    id: 1,
+                    kind: TrackKind::Video,
+                    fourcc: *b"avc1",
+                    config_box: Some(*b"avcC"),
+                    codec_id: "",
+                    config: cfg.clone(),
+                    timescale: tb.den as u32,
+                    width: 64,
+                    height: 48,
+                    sample_rate: 0,
+                    channels: 0,
+                    bit_depth: 0,
+                    default_duration_ns: num as u64 * 1_000_000_000 / tb.den.max(1),
+                },
+                samples: u.iter().map(|(k, d, dts, pts)| SampleSpec { data: d.clone(), dts: dts * num as i64, pts: pts * num as i64, duration: num, keyframe: *k }).collect(),
+            };
+            let one = coded_video_track(coded_video_spec(1, *b"avc1", Some(*b"avcC"), cfg, 64, 48, tb), tb, u);
+            assert_eq!(mp4(&[one], &Mp4Options::default()), mp4(&[literal], &Mp4Options::default()));
+        }
+    }
+
+    /// The top-level box `kind` of an MP4 (32- or 64-bit sizes).
+    fn top<'a>(b: &'a [u8], kind: &[u8; 4]) -> &'a [u8] {
+        let mut p = 0usize;
+        while p + 8 <= b.len() {
+            let mut n = u32::from_be_bytes([b[p], b[p + 1], b[p + 2], b[p + 3]]) as usize;
+            if n == 1 {
+                n = u64::from_be_bytes(b[p + 8..p + 16].try_into().unwrap()) as usize;
+            }
+            if &b[p + 4..p + 8] == kind {
+                return &b[p..p + n];
+            }
+            p += n.max(8);
+        }
+        panic!("no top-level box");
+    }
+
+    /// NLE6EXPORT-STREAM (B963): the streamed file of {B-ordered video, PCM16} holds the one-shot file's samples, and its
+    /// moov is the one-shot moov byte for byte outside the `stco` entries (the sample tables identical).
+    #[test]
+    fn streamed_moov_is_the_one_shot_moov() {
+        let tb = crate::Timebase { num: 1, den: 25 };
+        let video = coded_video_track(coded_video_spec(1, *b"avc1", Some(*b"avcC"), vec![1, 2, 3], 64, 48, tb), tb, units(30));
+        let pcm: Vec<i16> = (0..48_000 * 2 * 30 / 25).map(|i| (i % 2000) as i16 - 1000).collect();
+        let audio = pcm16_track(2, 48_000, 2, &pcm, 1024);
+        let one = mp4(&[video.clone(), audio.clone()], &Mp4Options::default());
+        let mut st = Mp4Stream::begin(Vec::new()).unwrap();
+        for t in [video, audio] {
+            let i = st.track(t.spec);
+            for s in t.samples {
+                st.push(i, s).unwrap();
+            }
+        }
+        let (file, n) = st.finish(&Mp4Options::default(), &Mp4Extras::default()).unwrap();
+        assert_eq!(n as usize, file.len());
+        let (da, db) = (crate::Demuxer::open(one.clone()).unwrap(), crate::Demuxer::open(file.clone()).unwrap());
+        assert_eq!(da.tracks().len(), 2);
+        assert_eq!(db.tracks().len(), 2);
+        for i in 0..2 {
+            let (a, b): (Vec<_>, Vec<_>) = (da.track_samples(i).collect(), db.track_samples(i).collect());
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!((x.size, x.dts, x.pts, x.duration, x.keyframe), (y.size, y.dts, y.pts, y.duration, y.keyframe));
+                assert_eq!(da.sample_data(x), db.sample_data(y));
+            }
+        }
+        let (ma, mb) = (top(&one, b"moov"), top(&file, b"moov"));
+        assert_eq!(ma.len(), mb.len());
+        let mut skip = vec![false; ma.len()];
+        for p in 4..ma.len().saturating_sub(4) {
+            if &ma[p..p + 4] == b"stco" {
+                let size = u32::from_be_bytes([ma[p - 4], ma[p - 3], ma[p - 2], ma[p - 1]]) as usize;
+                for k in p + 12..p - 4 + size {
+                    skip[k] = true;
+                }
+            }
+        }
+        assert!(skip.iter().any(|&s| s));
+        for k in 0..ma.len() {
+            assert!(skip[k] || ma[k] == mb[k], "moov differs at byte {}", k);
+        }
+    }
+
+    /// NLE6EXPORT-STREAMPCM (rmbp-ledger B976): {B-ordered video, PCM16} pushed by the export's ONE interleave rule (a
+    /// 1024-frame packet once it ends by the end of the last video frame pushed; the rest after) demuxes to the one-shot
+    /// file's samples with the one-shot moov outside `stco`, and its mdat interleaves; the split constructors are the old
+    /// builders' bytes.
+    #[test]
+    fn streamed_interleave_is_the_one_shot() {
+        let tb = crate::Timebase { num: 1, den: 25 };
+        let video = coded_video_track(coded_video_spec(1, *b"avc1", Some(*b"avcC"), vec![1, 2, 3], 64, 48, tb), tb, units(30));
+        let pcm: Vec<i16> = (0..48_000 * 2 * 30 / 25 + 2 * 300).map(|i| (i % 1777) as i16 - 888).collect();
+        let audio = pcm16_track(2, 48_000, 2, &pcm, 1024);
+        let one = mp4(&[video.clone(), audio.clone()], &Mp4Options::default());
+        let split = MediaTrack { spec: pcm16_spec(2, 48_000, 2), samples: pcm.chunks(2048).enumerate().map(|(i, c)| pcm16_sample(i as u64 * 1024, c, 2)).collect() };
+        assert_eq!(mp4(&[split], &Mp4Options::default()), mp4(&[audio.clone()], &Mp4Options::default()));
+        let aus: Vec<Vec<u8>> = (0..9u8).map(|i| vec![i; 10 + i as usize * 7]).collect();
+        let a1 = mp4a_track(2, 48_000, 2, &[0x11, 0x90], aus.clone(), 128_000);
+        let a2 = MediaTrack { spec: mp4a_spec(2, 48_000, 2, &[0x11, 0x90], 66, 128_000), samples: aus.into_iter().enumerate().map(|(i, d)| mp4a_sample(i as u64, d)).collect() };
+        assert_eq!(mp4(&[a1], &Mp4Options::default()), mp4(&[a2], &Mp4Options::default()));
+        let mut st = Mp4Stream::begin(Vec::new()).unwrap();
+        let vi = st.track(video.spec.clone());
+        let mut ai = None;
+        let mut next = 0usize;
+        for (k, s) in video.samples.iter().enumerate() {
+            st.push(vi, s.clone()).unwrap();
+            let due = (k as u64 + 1) * 48_000 / 25;
+            while next < audio.samples.len() && (audio.samples[next].dts as u64) + 1024 <= due {
+                let i = *ai.get_or_insert_with(|| st.track(audio.spec.clone()));
+                st.push(i, audio.samples[next].clone()).unwrap();
+                next += 1;
+            }
+        }
+        let i = *ai.get_or_insert_with(|| st.track(audio.spec.clone()));
+        for s in &audio.samples[next..] {
+            st.push(i, s.clone()).unwrap();
+        }
+        let (file, n) = st.finish(&Mp4Options::default(), &Mp4Extras::default()).unwrap();
+        assert_eq!(n as usize, file.len());
+        let (da, db) = (crate::Demuxer::open(one.clone()).unwrap(), crate::Demuxer::open(file.clone()).unwrap());
+        assert_eq!(db.tracks().len(), 2);
+        for t in 0..2 {
+            let (a, b): (Vec<_>, Vec<_>) = (da.track_samples(t).collect(), db.track_samples(t).collect());
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!((x.size, x.dts, x.pts, x.duration, x.keyframe), (y.size, y.dts, y.pts, y.duration, y.keyframe));
+                assert_eq!(da.sample_data(x), db.sample_data(y));
+            }
+        }
+        let first_audio = db.track_samples(1).map(|s| s.offset).min().unwrap();
+        let last_video = db.track_samples(0).map(|s| s.offset).max().unwrap();
+        assert!(first_audio < last_video, "the streamed mdat interleaves");
+        let (ma, mb) = (top(&one, b"moov"), top(&file, b"moov"));
+        assert_eq!(ma.len(), mb.len());
+        let mut skip = vec![false; ma.len()];
+        for p in 4..ma.len().saturating_sub(4) {
+            if &ma[p..p + 4] == b"stco" {
+                let size = u32::from_be_bytes([ma[p - 4], ma[p - 3], ma[p - 2], ma[p - 1]]) as usize;
+                for k in p + 12..p - 4 + size {
+                    skip[k] = true;
+                }
+            }
+        }
+        for k in 0..ma.len() {
+            assert!(skip[k] || ma[k] == mb[k], "moov differs at byte {}", k);
         }
     }
 }

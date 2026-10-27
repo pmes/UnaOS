@@ -1021,13 +1021,13 @@ pub fn bringup_once() {
     //                                     failure — an ADVISORY, printed as `discriminating=0`, so a
     //                                     reader knows the round-trip below is the weaker claim.
     // Anything else, or a final readback that is not the pre-image, is a hard refusal.
-    let probe = pre_win | 0xFFF;
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, probe) };
+    let probe = pre_win | 0xFFF; let mut pc = window::Pci { bus, dev, func, bar0 };
+    window::Bus::set_cfg80(&mut pc, probe);
     w.cfg80_selftest += 1;
-    let probe_back = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, pre_win) };
+    let probe_back = window::Bus::cfg80(&mut pc);
+    window::Bus::set_cfg80(&mut pc, pre_win);
     w.cfg80_selftest += 1;
-    let selftest = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let selftest = window::Bus::cfg80(&mut pc);
 
     let discriminating = probe_back == probe;
     let probe_sane = discriminating || probe_back == pre_win;
@@ -1060,9 +1060,9 @@ pub fn bringup_once() {
     let (ok, stage, d11_state) = explore(bus, dev, func, bar0, pre_win, pre_win2, &mut w);
 
     // ── R8: RESTORE. Push the value READ at R2, and verify against THAT value. ──────────────────
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, pre_win) };
+    let rs = window::restore(&mut pc, pre_win);
     w.cfg80_restore += 1;
-    let back = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let back = rs.map_or_else(|rb| rb, |()| pre_win);
     let restored = back == pre_win;
     serial_println!(
         ":: wifi2: RESTORE cfg:0x80 <- pre-image {:#010x} readback={:#010x} restored={} — compared against the RECORDED pre-image, never against 0x18000000 ::",
@@ -1094,9 +1094,9 @@ fn explore(
     bus: u8, dev: u8, func: u8, bar0: u64, pre_win: u32, pre_win2: u32, w: &mut Writes,
 ) -> (bool, &'static str, &'static str) {
     // ── R3: ChipCommon. ─────────────────────────────────────────────────────────────────────────
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, BCMA_ADDR_BASE) };
+    let mv = window::move_to(&mut window::Pci { bus, dev, func, bar0 }, BCMA_ADDR_BASE);
     w.cfg80_moves += 1;
-    let win_cc = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let win_cc = mv.map_or_else(|e| e.readback, |_| BCMA_ADDR_BASE);
     let cc_took = win_cc == BCMA_ADDR_BASE;
     serial_println!(
         ":: wifi2: WROTE cfg:0x80 pre={:#010x} new={:#010x} readback={:#010x} took={} — window now on ChipCommon ::",
@@ -1177,9 +1177,9 @@ fn explore(
     let erom_base = erom & 0xFFFF_F000;
     let erom_off = (erom & 0x0000_0FFF) as u64;
     let max_entries = erom_max_entries(erom_off);
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, erom_base) };
+    let mv = window::move_to(&mut window::Pci { bus, dev, func, bar0 }, erom_base);
     w.cfg80_moves += 1;
-    let win_er = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let win_er = mv.map_or_else(|e| e.readback, |_| erom_base);
     let er_took = win_er == erom_base;
     serial_println!(
         ":: wifi2: WROTE cfg:0x80 pre={:#010x} new={:#010x} readback={:#010x} took={} — window now on the EROM (page {:#010x} + offset {:#x}, max-entries={} to the core-window edge); walking READ-ONLY ::",
@@ -1265,9 +1265,9 @@ fn explore(
 /// The caller has already established that the EROM's d11 identity matches four metal boots. This
 /// function opens the core window; every read below is of a status or identity register.
 fn reach_d11(bus: u8, dev: u8, func: u8, bar0: u64, d: &D11, pre_win2: u32, w: &mut Writes) -> bool {
-    unsafe { write_config_32(bus, dev, func, CFG_BAR0_WIN, d.base as u32) };
+    let mv = window::move_to(&mut window::Pci { bus, dev, func, bar0 }, d.base as u32);
     w.cfg80_moves += 1;
-    let win = unsafe { read_config_32(bus, dev, func, CFG_BAR0_WIN) };
+    let win = mv.map_or_else(|e| e.readback, |_| d.base as u32);
     serial_println!(
         ":: wifi2: WROTE cfg:0x80 new={:#010x} readback={:#010x} took={} — window now on the RADIO core; BAR0+0 is d11 register 0 ::",
         d.base as u32, win, (win == d.base as u32) as u8
@@ -2521,7 +2521,7 @@ mod unwind;
 #[cfg(feature = "wifi9")]
 mod htphyinit;
 #[cfg(feature = "wifi9")]
-mod rx;
+mod rx; mod window; #[cfg(feature = "wifi9")] mod pmu; // STATIONROAM-PMU (B967): the scoped cfg:0x80 move and the PMU spur-avoid step (bringup/window.rs, bringup/pmu.rs); WINDOW-AUDIT (B970): `window` under wifi2 (the ladder's move_to/restore)
 
 /// `tests wifi` (verb.rs): WIFI9's three rungs, in b43's order — MAC suspended (`phy_common.c:455`),
 /// the PHY re-init and tune (`htphyinit::run`), the RX ring and the 5 s window (`rx::run`). Once per
@@ -2712,7 +2712,7 @@ mod join;
 mod phy;
 // WIFIDHCP (B831): the kept station's device fns and the TX ring's caps, for `wifi/data.rs` (the accessor triple).
 #[cfg(feature = "wifi10")]
-pub(super) use join::{station_mac, station_pending, station_rx, station_tx, station_tx_room, station_kat};
+pub(super) use join::{station_mac, station_pending, station_rx, station_tx, station_tx_room, station_kat}; #[cfg(feature = "wifi10")] pub(super) use pmu::kat as pmu_kat; #[cfg(feature = "wifi10")] pub(super) use window::kat as window_kat; // STATIONROAM-PMU (B967): the `pmu` KAT row; WINDOW-AUDIT (B970): the `window` row
 #[cfg(feature = "wifi10")]
 pub(super) use tx::{FRAMES, FRAME_MAX};
 

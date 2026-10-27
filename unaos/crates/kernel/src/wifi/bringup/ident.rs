@@ -201,7 +201,7 @@ pub(super) fn sprom_read(bar0: u64, ssid_dev: u16) -> u32 {
         Verdict::Blocked => 3,
         Verdict::Short => 4,
     });
-    *ID.lock() = Some(id); #[cfg(feature = "wifi10")] { *PWR.lock() = Some(pwr_decode(&words)); } // WIFI11 (B653): the per-core power blocks, same read
+    *ID.lock() = Some(id); #[cfg(feature = "wifi10")] { *PWR.lock() = Some(pwr_decode(&words)); *PWR5.lock() = Some(pwr5_decode(&words)); } // STATIONROAM-5G (B962): the 5 GHz half, same read; WIFI11 (B653): the per-core power blocks, same read
     writes
 }
 
@@ -332,3 +332,73 @@ pub(super) fn pwr_line(rev: u8, p: &[CorePwr; 3]) {
         rev, s
     );
 }
+
+// ── STATIONROAM-5G (rmbp-ledger B962): the SPROM's per-core 5 GHz power info, and ONE block selector over b43's ranges ───────────
+/// One core's 5 GHz power fields as `drivers/bcma/sprom.c:296-313` extracts them for the rev-8 layout (`ssb_regs.h:549-565`), from the
+/// same per-core base as `CorePwr`: +0x08 = maxpwr_5g (7:0) | itssi_5g (15:8); +0x0A = maxpwr_5gh (7:0) | maxpwr_5gl (15:8);
+/// +0x0C/+0x0E/+0x10 = pa_5g; +0x12/+0x14/+0x16 = pa_5gl; +0x18/+0x1A/+0x1C = pa_5gh. The last byte read, 0x100 + 0x1D, is inside the
+/// 440-byte shadow.
+#[cfg(feature = "wifi10")]
+#[derive(Clone, Copy)]
+pub(super) struct CorePwr5 {
+    pub itssi_5g: u8,
+    pub maxpwr_5gl: u8,
+    pub maxpwr_5g: u8,
+    pub maxpwr_5gh: u8,
+    pub pa_5gl: [u16; 3],
+    pub pa_5g: [u16; 3],
+    pub pa_5gh: [u16; 3],
+}
+
+#[cfg(feature = "wifi10")]
+static PWR5: Mutex<Option<[CorePwr5; 3]>> = Mutex::new(None);
+
+/// Decode the three cores' 5 GHz fields from the shadow words (word index = byte offset / 2, `sprom.c:183`).
+#[cfg(feature = "wifi10")]
+fn pwr5_decode(words: &[u16]) -> [CorePwr5; 3] {
+    let w = |b: usize| words.get(b / 2).copied().unwrap_or(0xFFFF);
+    let mut out = [CorePwr5 { itssi_5g: 0, maxpwr_5gl: 0, maxpwr_5g: 0, maxpwr_5gh: 0, pa_5gl: [0; 3], pa_5g: [0; 3], pa_5gh: [0; 3] }; 3];
+    for (c, base) in PWR_INFO_CORE.iter().enumerate() {
+        let (m5, mhl) = (w(*base + 0x08), w(*base + 0x0A));
+        let tri = |o: usize| [w(*base + o), w(*base + o + 0x02), w(*base + o + 0x04)];
+        out[c] = CorePwr5 {
+            maxpwr_5g: (m5 & 0x00FF) as u8,
+            itssi_5g: (m5 >> 8) as u8,
+            maxpwr_5gh: (mhl & 0x00FF) as u8,
+            maxpwr_5gl: (mhl >> 8) as u8,
+            pa_5g: tri(0x0C),
+            pa_5gl: tri(0x12),
+            pa_5gh: tri(0x18),
+        };
+    }
+    out
+}
+
+/// The power control inputs for `freq` — b43's block choice (`phy_ht.c:633-664`, `wifi_core::ieee80211::pwr_block`): 2g from the same
+/// fields `phy::once` maps (`pwr_2g`), 5gl / 5g / 5gh from `PWR5`. `Ok((sprom rev, block, per-core inputs))`; `Err` = `pwr_2g`'s
+/// verdict word, `no-block` (a frequency no block covers), or `blank` (`pwr_blank`'s rule on the chosen block: the frame then leaves at
+/// the fixed index, as WIFI11's 2.4 GHz refusal does).
+#[cfg(feature = "wifi10")]
+pub(super) fn pwr_band(freq: u16) -> Result<(u8, &'static str, [super::htphyinit::PwrIn; 3]), &'static str> {
+    let (rev, p2) = pwr_2g()?;
+    let block = wifi_core::ieee80211::pwr_block(freq).ok_or("no-block")?;
+    let p5 = (*PWR5.lock()).ok_or("unread")?;
+    let pick = |c: usize| -> (u8, [u16; 3]) {
+        match block {
+            "2g" => (p2[c].maxpwr_2g, p2[c].pa_2g),
+            "5gl" => (p5[c].maxpwr_5gl, p5[c].pa_5gl),
+            "5g" => (p5[c].maxpwr_5g, p5[c].pa_5g),
+            _ => (p5[c].maxpwr_5gh, p5[c].pa_5gh),
+        }
+    };
+    let mut pin = [super::htphyinit::PwrIn { target: 0, a1: 0, b0: 0, b1: 0 }; 3];
+    for c in 0..3 {
+        let (target, pa) = pick(c);
+        if pwr_blank(&CorePwr { itssi_2g: 0, maxpwr_2g: target, pa_2g: pa }) {
+            return Err("blank");
+        }
+        pin[c] = super::htphyinit::PwrIn { target, a1: pa[0] as i16, b0: pa[1] as i16, b1: pa[2] as i16 };
+    }
+    Ok((rev, block, pin))
+}
+

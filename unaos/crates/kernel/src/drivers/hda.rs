@@ -1082,7 +1082,7 @@ fn reset(base: u64, a: &mut Audit) -> Option<u16> { #[cfg(feature = "hda-tone")]
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The whole driver, in one pass. Every exit path stops the CORB and RIRB DMA engines.
-pub fn probe() { #[cfg(feature = "hda-tone")] if start_reattach() { return; } // NETSPLIT (B852) M3: a WARM stream open re-attaches (no reset, no walk); the rule is `start_reattach` at the file tail
+pub fn probe() { if !crate::hw::gate(crate::hw::Probe::Hda) { serial_println!("[hda] absent"); return; } #[cfg(feature = "hda-tone")] if start_reattach() { return; } // ZENBOOKSURVEY (zenbook-ledger Z1): the codec drive (the CS4206-measured GPIO policy) stays off a positively identified non-Apple machine. NETSPLIT (B852) M3: a WARM stream open re-attaches (no reset, no walk); the rule is `start_reattach` at the file tail
     let mut a = Audit::default();
     let found = crate::drivers::pci::PciScanner::audio_inventory();
     if found.is_empty() {

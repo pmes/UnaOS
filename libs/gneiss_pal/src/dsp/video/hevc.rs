@@ -89,6 +89,15 @@ impl VideoDecoder for HevcDecoder {
     }
 }
 
+/// HEVCLEVELLINE (LEDGER SR368): the profile / tier / level of an hvcC's SPS, read by hevc_core's own decoder
+/// (`configure_hvcc`, `Decoder::profile_tier_level`) — what `dsp::video::profile_level` formats. `None` when the record
+/// carries no SPS that parses.
+pub fn hvcc_ptl(hvcc: &[u8]) -> Option<hevc_core::ps::Ptl> {
+    let mut d = hevc_core::Decoder::new();
+    d.configure_hvcc(hvcc).ok()?;
+    d.profile_tier_level()
+}
+
 /// COLOURONE422 (SR359): hevc_core's hand-assembled-stream kit, by path as tools/play-check takes it.
 #[cfg(test)]
 #[path = "../../../../../unaos/libs/media/hevc_core/tests/common/mod.rs"]

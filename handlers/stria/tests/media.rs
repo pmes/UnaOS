@@ -971,7 +971,9 @@ fn swapbackseek_editor_run_opened_inside_the_span_draws_the_stand_in() {
 // AV1PLAYERCOLOUR (LEDGER SR347): an AV1 reel's frames reach the bus sink as planes and convert by the reel's colour and the
 // size default with bilinear chroma (`chroma_of`), the kernel Player's `colour_rgba_av1`. The AV1 pictures are public AVIF
 // vectors' primary items (av1_core's ONE sha256-pinned fetcher, by path; SKIP offline), muxed as an `av01` MP4 track whose
-// av1C is cut to its 4-byte header, so the bitstream states no colour and only a `colr` can.
+// av1C is cut to its 4-byte header. AV1INBANDCOLOUR (SR366): the item's in-band sequence header then states the bitstream's
+// colour (measured: kids_720p 2/2/2 limited, so the size default still converts it; kodim23 1/13/6 full, so its in-band range
+// wins over the size default's limited), and a `colr` wins over both.
 #[path = "../../../unaos/libs/media/av1_core/tests/common/mod.rs"]
 mod av1_vectors;
 
@@ -1010,7 +1012,7 @@ fn av1playercolour_untagged_720p_converts_bt709_by_the_size_default() {
     assert_eq!((w, h), (1280, 720));
     let (e709, e601) = (av1playercolour_expect(&file, &av1playercolour_c(1)), av1playercolour_expect(&file, &av1playercolour_c(6)));
     assert_ne!(e709, e601, "the vector separates the two matrices");
-    assert_eq!(Player::open(file.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), None);
+    assert_eq!(Player::open(file.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&av1playercolour_c(2)), "the in-band header: 2/2/2 limited");
     let (pw, ph, posted) = posted_rgba(file, "av1-720p");
     assert_eq!((pw, ph), (1280, 720));
     assert!(posted == e709, "untagged 1280x720 AV1 is not BT.709 limited bilinear");
@@ -1023,12 +1025,443 @@ fn av1playercolour_sd_reel_colr_709_wins_and_untagged_is_bt601() {
     assert_eq!((w, h), (768, 512));
     let (e709, e601) = (av1playercolour_expect(&plain, &av1playercolour_c(1)), av1playercolour_expect(&plain, &av1playercolour_c(6)));
     assert_ne!(e709, e601, "the vector separates the two matrices");
+    let inband = gneiss_pal::dsp::demux::colour::Colour { primaries: 1, transfer: 13, full_range: Some(true), ..av1playercolour_c(6) };
+    assert_eq!(Player::open(plain.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&inband), "the in-band header: 1/13/6 full");
+    let e601full = av1playercolour_expect(&plain, &inband);
+    assert_ne!(e601full, e601, "the vector separates the two ranges");
     let (_, _, posted) = posted_rgba(plain, "av1-sd");
-    assert!(posted == e601, "untagged 768x512 AV1 is not BT.601 limited bilinear");
+    assert!(posted == e601full, "an av1C-less 768x512 AV1 reel is not converted by its in-band BT.601 full range (bilinear)");
     let c709 = av1playercolour_c(1);
     let (tagged, _, _) = av1playercolour_reel("kodim23_yuv420_8bpc", Some(c709)).unwrap();
     assert_eq!(Player::open(tagged.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&c709));
     let (_, _, posted) = posted_rgba(tagged, "av1-sd-709");
     assert!(posted == e709, "a colr of BT.709 on an SD AV1 reel does not win over the size default");
-    println!("av1playercolour: kodim23 untagged=bt601 colr709=bt709 bilinear");
+    println!("av1playercolour: kodim23 in-band=bt601-full colr709=bt709 bilinear");
+}
+
+// AV1INBANDCOLOUR (LEDGER SR366): the ONE rule at 720p — container colour > the bitstream (av1C configOBUs, else the first
+// temporal unit's in-band sequence header) > the size default. A 1280x720 av01 reel whose av1C has no configOBUs and whose
+// first sample states BT.601 in-band converts BT.601, not the size default's BT.709 (synthetic, not decodable: Stria's open
+// line drives the colour, `Frame::to_rgba_colour` the pick).
+#[test]
+fn av1inband_720p_in_band_bt601_wins_over_the_size_default() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use gneiss_pal::dsp::video::{Chroma, Pixels, colour_of, reorder_depth};
+    let mut w = av1_vectors::BitWriter::default();
+    w.put(3, 0); // seq_profile
+    w.flag(true); // still_picture
+    w.flag(true); // reduced_still_picture_header
+    w.put(5, 8); // seq_level_idx[0]
+    w.put(4, 10); // frame_width_bits_minus_1
+    w.put(4, 9); // frame_height_bits_minus_1
+    w.put(11, 1279);
+    w.put(10, 719);
+    for _ in 0..6 {
+        w.flag(false); // 128x128, filter_intra, intra_edge, superres, cdef, restoration
+    }
+    w.flag(false); // high_bitdepth
+    w.flag(false); // mono_chrome
+    w.flag(true); // color_description_present_flag
+    w.put(8, 6);
+    w.put(8, 6);
+    w.put(8, 6);
+    w.flag(false); // color_range: limited
+    w.put(2, 0); // chroma_sample_position
+    w.flag(false); // separate_uv_delta_q
+    w.flag(false); // film_grain_params_present
+    w.trailing();
+    let seq = w.bytes;
+    let mut tu = vec![(2 << 3) | 0x02, 0, (1 << 3) | 0x02, seq.len() as u8];
+    tu.extend_from_slice(&seq);
+    let mut spec = build::TrackSpec::test_pattern(1, 1280, 720, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = vec![0x81, 0x00, 0x0C, 0x00];
+    spec.timescale = 1000;
+    let samples = (0..2).map(|i| build::SampleSpec { data: if i == 0 { tu.clone() } else { vec![0x12, 0] }, dts: i * 40, pts: i * 40, duration: 40, keyframe: i == 0 }).collect();
+    let file = build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &build::Mp4Extras::default());
+    let mut d = Demuxer::open(file).unwrap();
+    assert_eq!(d.tracks()[0].colour, None, "no colr");
+    d.derive_dts(reorder_depth); d.fill_colour(colour_of);
+    let c = d.tracks()[0].colour.expect("the in-band header fills the colour");
+    assert_eq!(c, av1playercolour_c(6), "6/6/6 limited from the first temporal unit");
+    let (y, u, v) = (vec![120u8; 1280 * 720], vec![90u8; 640 * 360], vec![200u8; 640 * 360]);
+    let f = Frame { width: 1280, height: 720, pts_ns: 0, pixels: Pixels::I420 { y, u, v, y_stride: 1280, uv_stride: 640 } };
+    let by_track = f.to_rgba_colour(Some(&c), Chroma::Bilinear);
+    assert_eq!(by_track, f.to_rgba(), "the in-band BT.601 limited converts (flat chroma: bilinear == nearest)");
+    assert_ne!(by_track, f.to_rgba_colour(None, Chroma::Bilinear), "not the 720p size default, BT.709");
+    println!("av1inband: 1280x720 in-band={} beats the size default", c);
+}
+
+// AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream changing color_config re-picks the colour. kids_720p's item
+// header (measured: a full sequence header, color_description_present_flag at bit 79 = 0, so 2/2/2; color_range at bit 80;
+// color_config ends at bit 85) is re-packed with 6/6/6 limited for the reel's last two samples: the same frame decodes, the
+// first two convert by the 720p size default (BT.709 limited), the last two by the new header's BT.601 limited, one log line.
+const AV1INBANDSWITCH_CDP_BIT: usize = 79;
+const AV1INBANDSWITCH_CC_END: usize = 85;
+
+/// kids_720p's sequence header payload (`seq`, the item's first OBU) with color_description 6/6/6 and the range bit `full`.
+fn av1inbandswitch_patch(seq: &[u8], full: bool) -> Vec<u8> {
+    let bit = |i: usize| (seq[i / 8] >> (7 - i % 8)) & 1 == 1;
+    let mut w = av1_vectors::BitWriter::default();
+    for i in 0..AV1INBANDSWITCH_CDP_BIT {
+        w.flag(bit(i));
+    }
+    w.flag(true); // color_description_present_flag
+    for _ in 0..3 {
+        w.put(8, 6);
+    }
+    w.flag(full); // color_range
+    for i in AV1INBANDSWITCH_CDP_BIT + 2..AV1INBANDSWITCH_CC_END {
+        w.flag(bit(i)); // chroma_sample_position, separate_uv_delta_q, film_grain_params_present
+    }
+    w.trailing();
+    w.bytes
+}
+
+/// kids_720p's item as 4 key samples of an `av01` track (av1C cut to its header); samples 2-3 carry the 6/6/6 header.
+fn av1inbandswitch_reel() -> Option<(Vec<u8>, Vec<u8>)> {
+    let item = av1_vectors::avif_item(&av1_vectors::fetch("kids_720p")?).unwrap();
+    let data = item.data.clone();
+    assert_eq!(&data[..2], &[0x0A, 0x0B], "the item opens with its 11-byte sequence header OBU");
+    let seq = av1inbandswitch_patch(&data[2..13], false);
+    let mut switched = vec![0x0A, seq.len() as u8];
+    switched.extend_from_slice(&seq);
+    switched.extend_from_slice(&data[13..]);
+    assert_eq!(av1_core::image::sequence_codes(&data), Some(((2, 2, 2, false), None, None)), "the vector's own header");
+    assert_eq!(av1_core::image::sequence_codes(&switched), Some(((6, 6, 6, false), None, None)), "the re-packed header");
+    let mut spec = build::TrackSpec::test_pattern(1, 1280, 720, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = item.av1c.unwrap()[..4].to_vec();
+    spec.timescale = 1000;
+    let samples = (0..4).map(|i| build::SampleSpec { data: if i < 2 { data.clone() } else { switched.clone() }, dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+    let file = build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &build::Mp4Extras::default());
+    Some((file, data))
+}
+
+/// The bus sink's conversion (`media_bus`'s `BusSink`): every presented frame by the open's colour, AV1's bilinear chroma.
+struct Av1InBandSwitchSink {
+    colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
+    shown: Vec<Vec<u8>>,
+}
+impl FrameSink for Av1InBandSwitchSink {
+    fn present(&mut self, f: &Frame, _ordinal: u64) {
+        self.shown.push(f.to_rgba_colour(self.colour.as_ref(), gneiss_pal::dsp::video::Chroma::Bilinear));
+    }
+}
+
+#[test]
+fn av1inbandswitch_player_repicks_bt601_after_the_header_switch() {
+    capture_logs();
+    let Some((file, _)) = av1inbandswitch_reel() else { return };
+    let (e709, e601) = (av1playercolour_expect(&file, &av1playercolour_c(1)), av1playercolour_expect(&file, &av1playercolour_c(6)));
+    assert_ne!(e709, e601, "the vector separates the two matrices");
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    assert_eq!(p.colour(), Some(&av1playercolour_c(2)), "the open's in-band header: 2/2/2 limited");
+    p.play();
+    let mut sink = Av1InBandSwitchSink { colour: p.colour().copied(), shown: Vec::new() };
+    for _ in 0..400 {
+        if sink.shown.len() >= 4 || p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    assert_eq!(sink.shown.len(), 4, "every sample presents");
+    assert!(sink.shown[0] == e709 && sink.shown[1] == e709, "before the switch: the 720p size default, BT.709 limited");
+    assert!(sink.shown[2] == e601 && sink.shown[3] == e601, "after the switch: the new header's BT.601 limited");
+    let lines = my_log_lines("video colour switch");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("matrix=2->6 range=limited"), "{}", lines[0]);
+    println!("av1inbandswitch: {} ; frames 0-1 bt709, 2-3 bt601", lines[0]);
+}
+
+/// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): the Player's info carries the hvcC SPS's profile / tier / level tokens
+/// (`gneiss_pal::dsp::video::profile_level`, hevc_core's A.3 names): the KAT reel's Main SPS reads `profile=Main
+/// tier=main level=2`; the refused SPS (HEVC_SPS_SEPPLANES, COLOURONE422 SR359: was 13/12-bit) with its profile_tier_level patched (byte 3: tier 1, general_profile_idc 4 with
+/// every constraint flag 0; byte 17: general_level_idc 153), carried by the hvcC, reads `profile=RExt tier=high level=5.1`
+/// (the open reads the record, before any picture: the decode's refusal comes later).
+#[test]
+fn hevclevelline_open_reads_profile_tier_level() {
+    let p = Player::open(build::mp4(&[hevc_kat_track(1)], &Mp4Options::default()), Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().video_profile, "profile=Main tier=main level=2");
+    let mut sps = HEVC_SPS_SEPPLANES;
+    assert_eq!((sps[3], sps[17]), (0x01, 0x3c));
+    sps[3] = 0x24;
+    sps[17] = 0x99;
+    let mut t = hevc_kat_track(1);
+    let at = t.spec.config.windows(HEVC_SPS.len()).position(|w| w == HEVC_SPS).unwrap();
+    let mut hvcc = t.spec.config[..at - 2].to_vec();
+    hvcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    hvcc.extend_from_slice(&sps);
+    hvcc.extend_from_slice(&t.spec.config[at + HEVC_SPS.len()..]);
+    t.spec.config = hvcc;
+    let p = Player::open(build::mp4(&[t], &Mp4Options::default()), Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().video_profile, "profile=RExt tier=high level=5.1");
+    println!("hevclevelline: {} / {}", "profile=Main tier=main level=2", p.info().video_profile);
+}
+
+// SWAPBACKSPANCACHE (LEDGER SR370): a reseed (a Player seek, an editor run open) primes the decoder with EVERY in-band set
+// blob in effect at the target (`decode_swap::SetIndex`, an indexed reel's earlier Clusters read through a share), and keeps
+// two parked decoders keyed by their set state: a seek back into a span reuses its decoder (`video reseed: ... cache=hit`).
+
+/// Rule: after straight play, a seek into the refused span is a miss (the 8-bit decoder parked under its state), a seek out
+/// of it to s9 is a hit (that decoder again; the frames equal straight play), and a seek back to s4 is a hit (the parked
+/// refused decoder; the stand-in at the target).
+#[test]
+fn swapbackspancache_player_seek_back_into_a_parked_span_hits_the_cache() {
+    capture_logs();
+    let straight = swapbackseek_straight();
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseek_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, _| false);
+    p.seek(160_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| !s.shown.is_empty());
+    assert_eq!(sink.shown[0], (160_000_000, TestPattern::render(64, 48, 4)), "the first seek target is not the stand-in");
+    p.seek(360_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| s.shown.len() >= 2);
+    assert_eq!(sink.shown, straight[9..11].to_vec(), "s9/s10 after the seek are not the straight-play frames");
+    assert!(p.info().real_video);
+    p.seek(160_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| !s.shown.is_empty());
+    assert_eq!(sink.shown[0], (160_000_000, TestPattern::render(64, 48, 4)), "the seek back is not the stand-in");
+    let lines = my_log_lines("[STRIA] :: video reseed:");
+    assert_eq!(
+        lines,
+        [
+            "[STRIA] :: video reseed: at 160000000 sets=1 cache=miss",
+            "[STRIA] :: video reseed: at 360000000 sets=2 cache=hit",
+            "[STRIA] :: video reseed: at 160000000 sets=1 cache=hit",
+        ],
+    );
+    println!("swapbackspancache: miss hit hit");
+}
+
+/// Rule: `DecodeSwap` alone over the same reel constructs one decoder per set state: reseeds at s9 / s0 / s9 / s4 / s9
+/// build 1, 1, 1, 2, 2 decoders (the open's decoder serves s0, the first fresh one s9), and s9 then decodes flat.
+#[test]
+fn swapbackspancache_decode_swap_builds_one_decoder_per_span() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use stria::decode_swap::{DecodeSwap, open};
+    let d = Demuxer::open(swapbackseek_reel()).unwrap();
+    let t = d.tracks()[0].clone();
+    let mut dec = open(&t);
+    let mut swap = DecodeSwap::default();
+    let mut built = Vec::new();
+    for ns in [360_000_000i64, 0, 360_000_000, 160_000_000, 360_000_000] {
+        swap.reseed(&mut dec, &t, &d, ns);
+        built.push(swap.built());
+    }
+    assert_eq!(built, [1, 1, 1, 2, 2]);
+    let s9 = d.packet_at(&d.samples()[9]);
+    let out = swap.decode(&mut dec, &t, &s9).unwrap();
+    assert!(dec.is_real() && out.swap.is_none());
+    let mut frames = out.frames;
+    frames.extend(dec.flush());
+    assert!(frames[0].to_rgba().chunks(4).all(|p| p == SWAPBACK_FLAT), "s9 is not flat");
+    println!("swapbackspancache: built={}", swap.built());
+}
+
+/// HEVC_SPS with sps_seq_parameter_set_id 1 (its ue(v) `1` -> `010` at RBSP bit 104, after the PTL) and HEVC_PPS naming
+/// SPS 1 (its second ue(v) `1` -> `010`), re-packed bit-exact (stop bit and emulation prevention re-written).
+const HEVC_SPS_ID1: [u8; 27] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x48, 0x08, 0x20, 0xc5, 0x97, 0xe4, 0x93, 0x08, 0x20];
+const HEVC_PPS_TO1: [u8; 7] = [0x44, 0x01, 0xa0, 0x1c, 0x60, 0x44, 0x80];
+
+/// SWAPBACK-SEEK-IDS: s1 carries SPS id 1 and a PPS naming it, s4 re-sends only that PPS (the nearer carrier holds no SPS).
+fn swapbackseekids_reel() -> Vec<u8> {
+    let mut t = hevc_kat_track(8);
+    let carriers: [(usize, &[&[u8]]); 2] = [(1, &[&HEVC_SPS_ID1[..], &HEVC_PPS_TO1[..], &HEVC_IDR[..]]), (4, &[&HEVC_PPS_TO1[..], &HEVC_IDR[..]])];
+    for (i, units) in carriers {
+        let mut s = Vec::new();
+        for unit in units {
+            s.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+            s.extend_from_slice(unit);
+        }
+        t.samples[i].data = s;
+    }
+    build::mp4(&[t], &Mp4Options::default())
+}
+
+/// Rule: a fresh Player's seek to s6 replays BOTH carriers (SPS 1 from s1, the PPS from s4): s6 / s7 decode flat as in
+/// straight play, with no decode warning (today: s4's PPS alone, "PPS references a missing SPS", no picture).
+#[test]
+fn swapbackseekids_player_seek_replays_every_set_id_in_effect() {
+    capture_logs();
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseekids_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut straight = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut straight, |_, _| false);
+    assert_eq!(straight.shown.len(), 8);
+    assert!(straight.shown.iter().all(|(_, rgba)| rgba.chunks(4).all(|p| p == SWAPBACK_FLAT)), "straight play is not flat");
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseekids_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.seek(240_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| s.shown.len() >= 2);
+    assert_eq!(sink.shown, straight.shown[6..8].to_vec(), "s6/s7 after the seek are not the straight-play frames");
+    assert!(my_log_lines("[STRIA] :: video decode:").is_empty(), "{:?}", my_log_lines("[STRIA] :: video decode:"));
+    assert_eq!(my_log_lines("[STRIA] :: video reseed:"), ["[STRIA] :: video reseed: at 240000000 sets=2 cache=miss"]);
+    println!("swapbackseekids: s6 flat sets=2");
+}
+
+/// SWAPBACK-SEEK-INDEXED: the swapbackseek reel's samples as Matroska with Cues, four blocks a Cluster: the 13/12 carrier s1
+/// is in Cluster 0, s4-s7 in Cluster 1, the 8-bit carrier s8 in Cluster 2.
+fn swapbackseekindexed_reel() -> Vec<u8> {
+    let mp4 = gneiss_pal::dsp::demux::Demuxer::open(swapbackseek_reel()).unwrap();
+    let mut t = hevc_kat_track(12);
+    for (spec, s) in t.samples.iter_mut().zip(mp4.samples()) {
+        spec.data = mp4.packet_at(s).data;
+    }
+    build::mkv(&[t], &MkvOptions { webm: false, cues: true, cluster_blocks: 4, duration: true, ..Default::default() })
+}
+
+/// Rule: the editor opens the reel by its Cues (one Cluster loaded per run); a run opened at tick 5 primes from Cluster 0's
+/// carrier and draws the stand-in, the frame the whole render draws there (today: the container's sets, flat). The stand-in's
+/// counter on this Matroska reel reads one ahead from s3 on (its numbering, not the reseed's), so the oracle is the whole render.
+#[test]
+fn swapbackseekindexed_editor_run_primes_from_an_earlier_cluster() {
+    use stria::nle::{RenderSink, Sources, render};
+    struct Frames(Vec<Vec<u8>>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, _out_t: i64, _w: u32, _h: u32, rgba: &[u8]) {
+            self.0.push(rgba.to_vec());
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    let file = swapbackseekindexed_reel();
+    assert!(gneiss_pal::dsp::demux::Demuxer::open_indexed(file.clone()).unwrap().indexed(), "the reel did not open by its Cues");
+    let (tl, src) = Sources::from_media("A", &file, 25).unwrap().unwrap();
+    let mut whole = Frames(Vec::new());
+    render(&tl, 0..8, &src, &mut whole).unwrap();
+    let mut at5 = Frames(Vec::new());
+    render(&tl, 5..6, &src, &mut at5).unwrap();
+    assert!(TestPattern::read_counter(&at5.0[0], 64, 48).is_some(), "a run opened at tick 5 is not the stand-in (a flat decode reads no counter)");
+    assert_eq!(at5.0, whole.0[5..6].to_vec());
+    println!("swapbackseekindexed: tick5 stand-in");
+}
+
+// AV1INBANDSIZE (LEDGER SR379): a size switch mid-stream. kodim23's item (768x512, its own in-band sequence header) for samples
+// 0-1 and kids_720p's (1280x720, another sequence header: a new coded video sequence, av1_core drops the refs) for 2-3, one av01
+// reel. Every presented frame carries its own size (what `BusSink` posts as `MediaFrame { width, height }`, the face building
+// each picture at that size), and the Player says so once.
+fn av1inbandsize_reel() -> Option<Vec<u8>> {
+    let small = av1_vectors::avif_item(&av1_vectors::fetch("kodim23_yuv420_8bpc")?).unwrap();
+    let big = av1_vectors::avif_item(&av1_vectors::fetch("kids_720p")?).unwrap();
+    assert_eq!((small.ispe, big.ispe), (Some((768, 512)), Some((1280, 720))));
+    let mut spec = build::TrackSpec::test_pattern(1, 768, 512, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = small.av1c.clone().unwrap()[..4].to_vec();
+    spec.timescale = 1000;
+    let samples = (0..4).map(|i| build::SampleSpec { data: if i < 2 { small.data.clone() } else { big.data.clone() }, dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+    Some(build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &build::Mp4Extras::default()))
+}
+
+/// Each presented frame's size and its RGBA length through the bus sink's conversion.
+struct Av1InBandSizeSink {
+    colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
+    shown: Vec<(u32, u32, usize)>,
+}
+impl FrameSink for Av1InBandSizeSink {
+    fn present(&mut self, f: &Frame, _ordinal: u64) {
+        let rgba = f.to_rgba_colour(self.colour.as_ref(), gneiss_pal::dsp::video::Chroma::Bilinear);
+        self.shown.push((f.width, f.height, rgba.len()));
+    }
+}
+
+#[test]
+fn av1inbandsize_player_presents_the_new_size_once() {
+    capture_logs();
+    let Some(file) = av1inbandsize_reel() else { return };
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = Av1InBandSizeSink { colour: p.colour().copied(), shown: Vec::new() };
+    for _ in 0..400 {
+        if sink.shown.len() >= 4 || p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    let want = |w: u32, h: u32| (w, h, (w * h * 4) as usize);
+    assert_eq!(sink.shown, vec![want(768, 512), want(768, 512), want(1280, 720), want(1280, 720)], "every frame at its own size");
+    let lines = my_log_lines("video size switch");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("768x512->1280x720"), "{}", lines[0]);
+    println!("av1inbandsize: {} ; frames 768x512 x2, 1280x720 x2", lines[0]);
+}
+
+// VP9INBANDCOLOUR (LEDGER SR379, AV1INBANDSIZE): a VP9 WebM whose key frame states color_space BT.709 (2) and no container Colour:
+// `colour_of`'s VP9 arm (`vp9_core::header::header_codes`) fills `Track::colour` 2/2/1 limited, so the Player converts by BT.709
+// at SD instead of the size default's BT.601. The key frame's uncompressed header (§6.2, profile 0, 8x8) is built here bit by bit.
+fn vp9inbandcolour_key_header(color_space: u64) -> Vec<u8> {
+    let mut w = av1_vectors::BitWriter::default();
+    w.put(2, 2); // frame_marker
+    w.put(2, 0); // profile 0 (low, high)
+    w.flag(false); // show_existing_frame
+    w.flag(false); // frame_type: KEY_FRAME
+    w.flag(true); // show_frame
+    w.flag(false); // error_resilient_mode
+    w.put(24, 0x49_83_42); // frame_sync_code
+    w.put(3, color_space);
+    w.flag(false); // color_range: studio
+    w.put(16, 7); // frame_width_minus_1
+    w.put(16, 7); // frame_height_minus_1
+    w.flag(false); // render_and_frame_size_different
+    w.flag(true); // refresh_frame_context
+    w.flag(false); // frame_parallel_decoding_mode
+    w.put(2, 0); // frame_context_idx
+    w.put(6, 0); // loop_filter_level
+    w.put(3, 0); // loop_filter_sharpness
+    w.flag(false); // loop_filter_delta_enabled
+    w.put(8, 60); // base_q_idx
+    w.put(3, 0); // no delta_q (y dc, uv dc, uv ac)
+    w.flag(false); // segmentation_enabled
+    w.flag(false); // tile_rows_log2 (one 64x64 column: no tile-column bits)
+    w.put(16, 1); // header_size_in_bytes
+    w.trailing();
+    let mut b = w.bytes;
+    b.push(0); // the compressed header's byte (not decoded here)
+    b
+}
+
+#[test]
+fn vp9inbandcolour_webm_bt709_fills_track_colour() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use gneiss_pal::dsp::video::{colour_of, reorder_depth};
+    let reel = |cs: u64| {
+        let mut spec = build::TrackSpec::test_pattern(1, 8, 8, 25);
+        spec.fourcc = *b"vp09";
+        spec.config_box = None;
+        spec.codec_id = "V_VP9";
+        spec.config = Vec::new();
+        spec.timescale = 1000;
+        let samples = (0..2).map(|i| build::SampleSpec { data: vp9inbandcolour_key_header(cs), dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+        build::mkv(&[build::MediaTrack { spec, samples }], &MkvOptions::default())
+    };
+    let mut d = Demuxer::open(reel(2)).unwrap();
+    assert_eq!(d.tracks()[0].colour, None, "no container Colour");
+    d.derive_dts(reorder_depth);
+    d.fill_colour(colour_of);
+    let c709 = gneiss_pal::dsp::demux::colour::Colour { primaries: 2, transfer: 2, matrix: 1, full_range: Some(false), mastering: None, light: None };
+    assert_eq!(d.tracks()[0].colour, Some(c709), "color_space BT.709 -> matrix 1, limited");
+    assert_eq!(Player::open(reel(2), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&c709), "the Player's open fills it too");
+    let mut d0 = Demuxer::open(reel(0)).unwrap();
+    d0.fill_colour(colour_of);
+    assert_eq!(d0.tracks()[0].colour, None, "CS_UNKNOWN states nothing: the size default stays");
+    println!("vp9inbandcolour: WebM color_space 2 -> {c709}");
 }

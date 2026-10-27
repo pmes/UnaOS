@@ -323,7 +323,7 @@ fn kbd(n: usize, alpha: f64) -> Vec<f32> {
     (0..half).map(|i| { acc += w[i]; math::sqrt(acc / total) as f32 }).collect()
 }
 
-fn sine(n: usize) -> Vec<f32> {
+pub(crate) fn sine(n: usize) -> Vec<f32> {
     (0..n / 2).map(|i| math::sin(core::f64::consts::PI / n as f64 * (i as f64 + 0.5)) as f32).collect()
 }
 
@@ -332,7 +332,7 @@ impl AacDecoder {
         if sf_index > 12 { return Err(Error::Invalid("aac: sampling frequency index")); }
         let sf_huff = Huff::new(&t::SF_CODE, &t::SF_BITS);
         let spec_huff = (0..11).map(|i| Huff::new(t::SPEC_CODES[i], t::SPEC_BITS[i])).collect();
-        let pow43 = (0..8192).map(|i| math::pow(i as f64, 4.0 / 3.0) as f32).collect();
+        let pow43 = pow43_table();
         let n = layout.channels;
         Ok(AacDecoder {
             sf_index,
@@ -654,24 +654,13 @@ impl AacDecoder {
                     let compress = r.read(1)?;
                     let res_bits = coef_res + 3;
                     let nbits = res_bits - compress;
-                    // §4.6.9.3 tns_decode_coef
-                    let iqfac = ((1u32 << (res_bits - 1)) as f64 - 0.5) / (core::f64::consts::PI / 2.0);
-                    let iqfac_m = ((1u32 << (res_bits - 1)) as f64 + 0.5) / (core::f64::consts::PI / 2.0);
-                    let mut tmp = [0f64; 20];
-                    for item in tmp.iter_mut().take(order) {
-                        let v = r.read(nbits)? as i32;
-                        let v = (v << (32 - nbits)) >> (32 - nbits);
-                        *item = math::sin(v as f64 / if v >= 0 { iqfac } else { iqfac_m });
+                    // §4.6.9.3 tns_decode_coef: the signed indices, then the ONE conversion (TNS-COEF-ONE, `tns_lpc`)
+                    let mut v = [0i32; 20];
+                    for item in v.iter_mut().take(order) {
+                        let x = r.read(nbits)? as i32;
+                        *item = (x << (32 - nbits)) >> (32 - nbits);
                     }
-                    let mut a = [0f64; 21];
-                    a[0] = 1.0;
-                    for m in 1..=order {
-                        let mut b = a;
-                        for i in 1..m { b[i] = a[i] + tmp[m - 1] * a[m - i]; }
-                        a[1..m].copy_from_slice(&b[1..m]);
-                        a[m] = tmp[m - 1];
-                    }
-                    for i in 0..order { ch.tns.lpc[w][f][i] = a[i + 1] as f32; }
+                    ch.tns.lpc[w][f] = tns_lpc(&v[..order], res_bits);
                 }
             }
         }
@@ -906,4 +895,35 @@ impl AacDecoder {
         }
         Ok(())
     }
+}
+
+/// |q|^(4/3) for q < 8192: the inverse quantiser's table, the decoder's and the encoder's (`super::enc`, NLE6EXPORTAAC
+/// rmbp-ledger B960) one.
+pub(crate) fn pow43_table() -> Vec<f32> {
+    (0..8192).map(|i| math::pow(i as f64, 4.0 / 3.0) as f32).collect()
+}
+
+// ── TNS-COEF-ONE (AACENCTNS, LEDGER SR381): the ONE §4.6.9.3 coefficient conversion, the decoder's parse and the
+// encoder's analysis (`aac::enc`) both call it, so the encoder's FIR is the exact inverse of `spectral_tools`' synthesis ──
+/// `tns_decode_coef`: the signed `res_bits` parcor indices (one per order) to the all-pole filter's LPC coefficients
+/// (`lpc[i]` multiplies y[n - 1 - i]; zeros past the order).
+pub(crate) fn tns_lpc(v: &[i32], res_bits: u32) -> [f32; 20] {
+    let order = v.len().min(20);
+    let iqfac = ((1u32 << (res_bits - 1)) as f64 - 0.5) / (core::f64::consts::PI / 2.0);
+    let iqfac_m = ((1u32 << (res_bits - 1)) as f64 + 0.5) / (core::f64::consts::PI / 2.0);
+    let mut tmp = [0f64; 20];
+    for (item, &x) in tmp.iter_mut().zip(v.iter()).take(order) {
+        *item = math::sin(x as f64 / if x >= 0 { iqfac } else { iqfac_m });
+    }
+    let mut a = [0f64; 21];
+    a[0] = 1.0;
+    for m in 1..=order {
+        let mut b = a;
+        for i in 1..m { b[i] = a[i] + tmp[m - 1] * a[m - i]; }
+        a[1..m].copy_from_slice(&b[1..m]);
+        a[m] = tmp[m - 1];
+    }
+    let mut lpc = [0f32; 20];
+    for i in 0..order { lpc[i] = a[i + 1] as f32; }
+    lpc
 }
