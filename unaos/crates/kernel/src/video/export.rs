@@ -8,7 +8,7 @@
 //! frame-to-encoder glue Stria's host `H264Encoder` drives too) and demux_core's `build::mp4` — never a second encoder,
 //! renderer or mixer.
 //!
-//! * ONE RENDER PATH: `nle export <edl> <out.mp4>` arms an [`Exp`] and starts vplay's EDL job on the EDL ([`start`]). The
+//! * ONE RENDER PATH: `nle export <edl> <out.mp4|out.mkv>` arms an [`Exp`] and starts vplay's EDL job on the EDL ([`start`]). The
 //!   job's schedule loop (`vplay::edl_run`) asks [`sink`] per video step: [`Sink::Encode`] hands the step's frame (RGBA, by
 //!   vplay's `unpack`) to [`frame`] instead of the queue (`room` + `push_back`); nothing is presented. The frame is the one
 //!   the Player would have shown: the same decode, the same transition mix.
@@ -17,7 +17,7 @@
 //!   OFFLINE `audio::mixer::Mix` — the mixer's own engine (per-frame ramps, `align`, the Sinc ingest, `period`) — pumped as
 //!   an infinitely fast sink (after every write / end / state: `period` while `ready`, each period appended to the
 //!   capture). snd's feed, crossfade and drain run unchanged; the capture is 48 kHz stereo PCM16, the mixer's own format.
-//! * THE FILE (NLE6EXPORTONE, rmbp-ledger B963): ONE `build::Mp4Stream` (ftyp, the mdat, the moov at the end). The `avc1`
+//! * THE FILE (NLE6EXPORTONE, rmbp-ledger B963): ONE `build::MuxStream` (NLE6EXPORTMKV B966: the out path's extension picks `build::Mp4Stream` — ftyp, the mdat, the moov at the end — or `build::MkvStream`). The `avc1`
 //!   track is `build::coded_video_spec` (the constructor Stria's `video_track` uses too); each unit is written to the file as
 //!   [`frame`] gets it (`build::coded_video_sample`: its (dts, pts) x the tick, so B pictures write `ctts`), so the export
 //!   holds no more than the encoder's reorder window. The sound streams beside it (NLE6EXPORTSTREAMPCM, rmbp-ledger B976):
@@ -45,7 +45,8 @@
 //! `[nle] export frames=<n> bytes=<n> ms=<n> audio=<mixed>/<target> periods=<n> bframes=<n> out=<p>` · `[nle] export refused why=<w> (<reason>)`
 //! · NLE6EXPORTAAC: `[nle] export audio=aac bytes=<n> units=<n> kbps=<k>` (before the `frames=` line).
 //! The witness is player.rs `tests nle` (`export=` on `:: NLE: … ::`; the AAC leg's `[nle] fixture export audio=aac`).
-//! Owed: the Pi budget, a progress UI on the kernel face, MKV, a knob for the sound's interleave window (NLE6EXPORT-WINDOW).
+//! Owed: the Pi budget, a progress UI on the kernel face, a knob for the sound's interleave window (NLE6EXPORT-WINDOW), the AAC
+//! priming under .mkv (refused by name: CodecDelay owed, NLE6EXPORTMKV-AACDELAY).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -107,7 +108,7 @@ struct Exp {
     out: String,
     opts: Opts,
     rgba: RgbaEncoder,
-    stream: Option<build::Mp4Stream<VfsOut>>,
+    stream: Option<build::MuxStream<VfsOut>>, // NLE6EXPORTMKV (rmbp-ledger B966): the container is the out path's extension
     vtrack: usize,
     /// The file was created by this export (so a refusal unlinks it; a file that was there before is never touched).
     begun: bool,
@@ -126,15 +127,15 @@ struct Exp {
 static ENC: crate::sync::Mutex<Option<Exp>> = crate::sync::Mutex::new(None);
 static LAST: crate::sync::Mutex<Option<(u32, Report)>> = crate::sync::Mutex::new(None);
 
-/// **Export `edl` to `out` (an `.mp4`)**: arm the exporter and start vplay's EDL job on it; the job id. The export runs on
+/// **Export `edl` to `out` (an `.mp4` or an `.mkv`: `build::Container::of`)**: arm the exporter and start vplay's EDL job on it; the job id. The export runs on
 /// the job's worker core; [`report`] answers once it has finished.
 pub fn start(edl: &str, out: &str, opts: Opts) -> Result<u32, String> {
     if !super::vplay::is_edl(edl) {
         return Err(alloc::format!("{} is not an .edl", edl));
     }
-    let n = out.len();
-    if !(n > 4 && out.is_char_boundary(n - 4) && out[n - 4..].eq_ignore_ascii_case(".mp4")) {
-        return Err(alloc::format!("{}: the export writes .mp4 (MKV owed)", out));
+    if build::Container::of(out).is_none() {
+        // NLE6EXPORTMKV (rmbp-ledger B966): THE RULE — the out path's extension names the container (`build::Container::of`)
+        return Err(alloc::format!("{}: the export writes .mp4 or .mkv", out));
     }
     if super::player::is_open() {
         return Err(String::from("the Player is open (close it first: the export takes vplay's one job)"));
@@ -285,8 +286,8 @@ impl Exp {
             if self.stream.is_none() {
                 crate::shell::vfs_mount_table().put_file(&self.out, &[], crate::fs::vfs::KERNEL_PRINCIPAL).map_err(|e| alloc::format!("create {}: {:?}", self.out, e))?;
                 self.begun = true;
-                let mut st = build::Mp4Stream::begin(VfsOut { path: self.out.clone() })?;
-                self.vtrack = st.track(build::coded_video_spec(1, *b"avc1", Some(*b"avcC"), self.rgba.avcc(), self.size.0 as u16, self.size.1 as u16, self.tb));
+                let mut st = build::MuxStream::begin(build::Container::of(&self.out).unwrap_or(build::Container::Mp4), VfsOut { path: self.out.clone() })?; // NLE6EXPORTMKV (rmbp-ledger B966): the stream choice at begin
+                self.vtrack = st.track(build::coded_video_spec(1, *b"avc1", Some(*b"avcC"), self.rgba.avcc(), self.size.0 as u16, self.size.1 as u16, self.tb))?;
                 self.stream = Some(st);
             }
             if let Some(st) = self.stream.as_mut() {
@@ -311,9 +312,9 @@ pub(crate) fn write_file(path: &str, body: &[u8]) -> Result<u64, String> {
     crate::shell::vfs_mount_table().put_file(path, body, crate::fs::vfs::KERNEL_PRINCIPAL).map(|n| n as u64).map_err(|e| alloc::format!("write {}: {:?}", path, e))
 }
 
-/// `nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS] [--aac KBPS]`: arm and start; the job prints the progress and the end.
+/// `nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS] [--aac KBPS]`: arm and start; the job prints the progress and the end.
 pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
-    const USAGE: &str = "usage: nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS] [--aac KBPS]";
+    const USAGE: &str = "usage: nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS] [--aac KBPS]";
     if args.first().copied() != Some("export") || args.len() < 3 {
         console.println(USAGE);
         return;
@@ -680,7 +681,7 @@ impl Exp {
         let Some(st) = self.stream.as_mut() else { return Err(String::from("sound before the file")) };
         let i = match self.snd.track {
             Some(i) => i,
-            None => *self.snd.track.insert(st.track(spec())),
+            None => *self.snd.track.insert(st.track(spec())?), // NLE6EXPORTMKV (rmbp-ledger B966): Matroska refuses a codec by name
         };
         let n = s.data.len();
         st.push(i, s)?;
@@ -708,13 +709,13 @@ impl Exp {
         (rep.audio_mixed, rep.audio_target, rep.audio) = (mixed, target, true);
         self.sound_feed(&pcm, true).map_err(|e| (if e.starts_with("aac-refused") { "aac-refused" } else { "write-refused" }, e))?;
         if let (None, Some(st)) = (self.snd.track, self.stream.as_mut()) {
-            self.snd.track = Some(st.track(build::pcm16_spec(2, rate, 2))); // sound mixed, none of it inside the video: the track stays, empty
+            self.snd.track = Some(st.track(build::pcm16_spec(2, rate, 2)).map_err(|e| ("write-refused", e))?); // sound mixed, none of it inside the video: the track stays, empty
         }
         if let Some(enc) = self.snd.aac.as_ref() {
             let bps = self.opts.aac_kbps.saturating_mul(1000);
             serial_println!("[nle] export audio=aac bytes={} units={} kbps={}", self.snd.bytes, self.snd.samples, self.opts.aac_kbps);
             if let (Some(st), Some(i)) = (self.stream.as_mut(), self.snd.track) {
-                st.respec(i, build::mp4a_spec(2, rate, 2, &enc.asc(), self.snd.biggest, bps));
+                st.respec(i, build::mp4a_spec(2, rate, 2, &enc.asc(), self.snd.biggest, bps)).map_err(|e| ("write-refused", e))?; // NLE6EXPORTMKV (rmbp-ledger B966): MuxStream's respec
             }
             extras.edit_lists.push(build::mp4a_edit_list(2, rate, audio_core::aac::enc::PRIMING, target));
         }

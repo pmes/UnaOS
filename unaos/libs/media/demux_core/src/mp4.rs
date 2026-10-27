@@ -516,7 +516,7 @@ impl FourccString for String {
 }
 
 /// ES_Descriptor (ISO/IEC 14496-1 §7.2.6.5) → (objectTypeIndication, DecoderSpecificInfo bytes).
-fn parse_esds(b: &[u8]) -> Result<(u8, Vec<u8>), Error> {
+pub(crate) fn parse_esds(b: &[u8]) -> Result<(u8, Vec<u8>), Error> {
     let mut r = Reader::new(b);
     full(&mut r)?;
     fn desc(r: &mut Reader) -> Result<(u8, usize), Error> {

@@ -1569,7 +1569,7 @@ mod nle_fx {
         let ctts = vi.is_some_and(|i| d.track_samples(i).any(|s| s.pts != s.dts));
         let audio_ok = d.audio_track().is_some_and(|t| t.sample_rate == 48_000 && t.channels == 2) && rep.audio_target > 0 && rep.audio_mixed >= rep.audio_target && rep.periods > 0; // NLE6EXPORTSTREAMPCM (rmbp-ledger B976): the sound entered the file before finish
         let need_audio = cfg!(any(feature = "uvc", feature = "hda-tone"));
-        let (col_ok, col_word) = export_colour(&d, vi); let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir) && col_ok; // H264ENCCOLOURHOST (LEDGER SR377): the re-read file's colour (module tail). NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
+        let (col_ok, col_word) = export_colour(&d, vi); let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir) && col_ok && mkv_verdict(dir); // NLE6EXPORTMKV (rmbp-ledger B966): the .mkv export (module tail). H264ENCCOLOURHOST (LEDGER SR377): the re-read file's colour (module tail). NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
         serial_println!(
             "[nle] fixture export out={} samples={} ticks={} ctts={} colour={} audio={} mixed={}/{} periods={} bytes={} ms={} -> {}",
             out, samples, ticks, ctts as u8, col_word, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.periods, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
@@ -1858,6 +1858,62 @@ mod nle_fx {
             }
             Some(c) => (false, alloc::format!("{}/{:?}", c.matrix, c.full_range)),
             None => (false, String::from("none")),
+        }
+    }
+
+    // ── NLE6EXPORTMKV (rmbp-ledger B966): the fixture's EDL exported as Matroska and re-demuxed ───────────────────────────
+    // The same EDL with the same knobs as the MP4 export (two B pictures) to `<dir>/NLEFXK.MKV`: the container is the out
+    // path's extension (`build::Container::of`), the stream `build::MkvStream` behind the export's ONE `build::MuxStream`.
+    // Read back through demux_core: the video track holds the timeline's ticks, each sample's (size, keyframe, bytes) is
+    // NLEFX.MP4's and its pts the MP4's within the 1 ms TimestampScale (Matroska stores no dts), and an indexed open finds
+    // the Cues. Its own line; the `export=` token rides `export_verdict`'s `ok`.
+    fn mkv_verdict(dir: &str) -> bool {
+        use crate::video::export;
+        let ticks = timeline().map(with_audio).map(|t| t.end()).unwrap_or(0).max(0) as u64;
+        let (edl, out, mp4) = (alloc::format!("{}/NLEFX.EDL", dir), alloc::format!("{}/NLEFXK.MKV", dir), alloc::format!("{}/NLEFX.MP4", dir));
+        let rep = match export::start(&edl, &out, export::Opts { bframes: 2, ..export::Opts::default() }) {
+            Ok(jid) => await_export(jid),
+            Err(e) => Err(e),
+        };
+        let open = |p: &str| vplay::read_all(p).and_then(|b| demux_core::Demuxer::open(b).map_err(|e| alloc::format!("demux: {}", e)));
+        let rows = |d: &demux_core::Demuxer| -> Vec<(u32, bool, i64, Vec<u8>)> {
+            let Some(i) = d.video_track().and_then(|t| d.track_index(t.id)) else { return Vec::new() };
+            let t = &d.tracks()[i];
+            d.track_samples(i).map(|s| (s.size, s.keyframe, t.to_ns(s.pts), d.sample_data(s).to_vec())).collect()
+        };
+        let (bytes, samples, why) = match rep.and_then(|r| Ok((r.bytes, open(&out)?, open(&mp4)?))) {
+            Ok((bytes, k, m)) => {
+                let (a, b) = (rows(&k), rows(&m));
+                let same = a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.0 == y.0 && x.1 == y.1 && x.3 == y.3 && (x.2 - y.2).abs() <= 1_000_000);
+                let cues = vplay::read_all(&out).ok().and_then(|f| demux_core::Demuxer::open_indexed(f).ok()).map(|d| d.index().len()).unwrap_or(0);
+                let why = if k.format() != demux_core::Format::Matroska { Some(String::from("not-matroska")) } else if !same { Some(String::from("samples-differ")) } else if cues == 0 { Some(String::from("no-cues")) } else { None };
+                (bytes, a.len() as u64, why)
+            }
+            Err(e) => (0, 0, Some(e)),
+        };
+        let ok = why.is_none() && samples == ticks;
+        serial_println!(
+            "[nle] fixture export container=mkv bytes={} samples={}{} -> {}",
+            bytes, samples, why.map(|w| alloc::format!(" why={}", w)).unwrap_or_default(), if ok { "ok" } else { "FAIL" }
+        );
+        ok
+    }
+
+    /// NLE6EXPORTMKV (B966): wait for export `jid`'s report (30 s), its error as Err. (NLEFX-AWAIT owed: export_verdict's and
+    /// bitrate_verdict's own loops onto this one.)
+    fn await_export(jid: u32) -> Result<crate::video::export::Report, String> {
+        let t0 = crate::arch::ms();
+        loop {
+            if let Some(r) = crate::video::export::report(jid) {
+                return match r.err.clone() {
+                    None => Ok(r),
+                    Some(e) => Err(e),
+                };
+            }
+            if crate::arch::ms().saturating_sub(t0) > 30_000 {
+                return Err(String::from("timeout"));
+            }
+            crate::arch::sched::sleep_ms(4);
         }
     }
 }
