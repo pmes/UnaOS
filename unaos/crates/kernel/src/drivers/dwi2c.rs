@@ -13,7 +13,7 @@
 //!   register (IC_COMP_TYPE == 0x44570140, "DW" + 0x0140) before anything is written; 0xffffffff (power-gated by
 //!   the AOAC block, or absent) is `absent`, no write;
 //! * STANDARD mode, 100 kHz: the firmware's SS_SCL counts are kept when both are set, else linux's formula at
-//!   150 MHz (tHIGH 4000 ns, tLOW 4700 ns, tf 300 ns: 642 / 749). Fast mode needs the DSDT's FMCN (owed);
+//!   150 MHz (tHIGH 4000 ns, tLOW 4700 ns, tf 300 ns: 642 / 749). The held touchpad's 400 kHz from the DSDT's FMCN is DWI2CFAST (Z50, file tail);
 //! * the bus probe is a 1-byte READ (DesignWare has no quick write: every DATA_CMD carries a data phase); an
 //!   address NACK is TX_ABRT with TX_ABRT_SOURCE bit 0;
 //! * the I2C-HID descriptor register is the device's `_DSM` (AML again): the 30-byte descriptor is read ONLY at an
@@ -26,7 +26,7 @@
 //! The touchpad's reports: the `touchpad` module at the tail (ZENBOOKTOUCHPADREPORTS, zenbook-ledger Z18; `ehcihid`
 //! images, pumped by the one HID pass) — the controller that answered is HELD open for it only when armed. `tests dwi2c`
 //! runs the register-sequence machine against a fake controller: `:: DWI2C: proto=ok cases=8/8 -> PASS ::`;
-//! `tests dwi2ctp` the touchpad over the same fake: `:: DWI2C-TP: rdesc=ok reports=2 events=2 scroll2 dy=<n> palm=ok -> PASS ::`. DWI2CACPI (zenbook-ledger Z32): the DSDT byte scan `aml_scan` (file tail) cross-checks BASES / HID_GUESS (`[dwi2c] acpi ...`), `tests dwi2cacpi`. DWI2CGPIO (zenbook-ledger Z42): the touchpad's GpioInt and the AMDI0030 line (`[dwi2c] acpi gpio=...`) and the pin's IRQ waking the pump (`tpirq`, file tail).
+//! `tests dwi2ctp` the touchpad over the same fake: `:: DWI2C-TP: rdesc=ok reports=2 events=2 scroll2 dy=<n> palm=ok -> PASS ::`. DWI2CACPI (zenbook-ledger Z32): the DSDT byte scan `aml_scan` (file tail) cross-checks BASES / HID_GUESS (`[dwi2c] acpi ...`), `tests dwi2cacpi`. DWI2CGPIO (zenbook-ledger Z42): the touchpad's GpioInt and the AMDI0030 line (`[dwi2c] acpi gpio=...`) and the pin's IRQ waking the pump (`tpirq`, file tail). DWI2CFAST (zenbook-ledger Z50): the controller's FMCN/SSCN read by the same scan and the held touchpad switched to 400 kHz with a verify read and a 100 kHz fallback (`fast_attach`, file tail), `tests dwi2cacpi`'s third line.
 
 use core::cell::RefCell;
 
@@ -480,6 +480,11 @@ struct FakeState {
     in_n: usize,
     in_i: usize,
     cmds: u32,
+    /// DWI2CFAST (Z50): the fast-mode counts and SDA hold; `nack_fast` NACKs every address while IC_CON's speed field is fast.
+    fs_hcnt: u32,
+    fs_lcnt: u32,
+    hold: u32,
+    nack_fast: bool,
 }
 
 struct Fake {
@@ -529,6 +534,10 @@ impl Fake {
                 in_n: 0,
                 in_i: 0,
                 cmds: 0,
+                fs_hcnt: 0,
+                fs_lcnt: 0,
+                hold: 0,
+                nack_fast: false,
             }),
         }
     }
@@ -550,6 +559,9 @@ impl Mmio for Fake {
             IC_TAR => st.tar,
             IC_SS_SCL_HCNT => st.hcnt,
             IC_SS_SCL_LCNT => st.lcnt,
+            IC_FS_SCL_HCNT => st.fs_hcnt,
+            IC_FS_SCL_LCNT => st.fs_lcnt,
+            IC_SDA_HOLD => st.hold,
             IC_INTR_MASK => st.mask,
             IC_ENABLE => st.en_reg,
             IC_ENABLE_STATUS => st.en_status,
@@ -592,13 +604,16 @@ impl Mmio for Fake {
             IC_TAR => st.tar = v,
             IC_SS_SCL_HCNT => st.hcnt = v,
             IC_SS_SCL_LCNT => st.lcnt = v,
+            IC_FS_SCL_HCNT => st.fs_hcnt = v,
+            IC_FS_SCL_LCNT => st.fs_lcnt = v,
+            IC_SDA_HOLD => st.hold = v,
             IC_INTR_MASK => st.mask = v,
             IC_DATA_CMD => {
                 if st.en_status & 1 == 0 {
                     return;
                 }
                 if !st.in_txn {
-                    if st.tar != st.ack as u32 {
+                    if st.tar != st.ack as u32 || (st.nack_fast && st.con & CON_SPEED_MASK == CON_SPEED_FAST) {
                         st.raw |= INTR_TX_ABRT;
                         st.abrt_src = ABRT_7B_ADDR_NOACK;
                         return;
@@ -1291,6 +1306,7 @@ pub mod touchpad {
         );
         match b.why {
             None => {
+                super::fast_attach(i, io, addr, &d, win, &rbuf[..(d.rdesc as usize).clamp(1, 4)]);
                 *TP.lock() = Some(Tp { base, addr, d, win, p, t: Track::default(), last_ms: 0, first: false, errs: 0, reports: 0 });
                 ARMED.store(true, Ordering::Release);
                 serial_println!("[dwi2c] ctrl={} held for touchpad", i);
@@ -1564,7 +1580,7 @@ pub mod touchpad {
 // survey path runs unchanged and the line records the mismatch (the first boot judges). `AMDI0019` (linux: the
 // PSP-arbitrated bus, ARBITRATION_SEMAPHORE) is deliberately NOT accepted. `tests dwi2cacpi`: the live line, then the KAT
 // over `ACPI_KAT` and three refusal mutants: `:: DWI2CACPI: base=ok tp=ok speed=400000 desc=ok refuse=3/3 -> PASS ::`.
-// Owed: DWI2C-FAST, DWI2C-AOAC, DWI2C-ACPI-SSDT (the touchpad declared in an SSDT); DWI2C-GPIO BUILT by DWI2CGPIO (Z42, below).
+// Owed: DWI2C-AOAC, DWI2C-ACPI-SSDT (the touchpad declared in an SSDT); DWI2C-GPIO BUILT by DWI2CGPIO (Z42, below); DWI2C-FAST BUILT by DWI2CFAST (Z50, file tail).
 
 /// `Name (_HID, "AMDI0010")`: the DesignWare I2C master's ACPI id on AMD.
 const ACPI_HID_PAT: &[u8] = b"\x08_HID\x0dAMDI0010\x00";
@@ -1588,6 +1604,8 @@ struct AcpiI2c {
     desc: Option<u16>,
     /// DWI2CGPIO (Z42): the touchpad Device's ONE GpioInt (0x8C, connection type interrupt), else the refusal's name.
     gpio: Result<GpioInt, &'static str>,
+    /// DWI2CFAST (Z50): the controller Device's FMCN and SSCN (`dw_cn` over its span).
+    cn: Cn,
 }
 
 /// A refusal, by name; `what`/`n`/`at` qualify `ambiguous`.
@@ -1705,8 +1723,8 @@ fn dsm_desc(a: &[u8], s: usize, e: usize) -> Option<u16> {
 /// The scan, bounded to `a` (the DSDT). Pure: the KAT runs it over `ACPI_KAT`.
 fn aml_scan(a: &[u8]) -> Result<AcpiI2c, AcpiNo> {
     let no = |why: &'static str| AcpiNo { why, what: "-", n: 0, at: [*b"----"; 2] };
-    // 1. the AMDI0010 Devices: (name, Memory32Fixed count, the first one's base).
-    let mut ctrls = [([0u8; 4], 0u8, 0u32); ACPI_CTRL_MAX];
+    // 1. the AMDI0010 Devices: (name, Memory32Fixed count, the first one's base, the Device span: DWI2CFAST Z50).
+    let mut ctrls = [([0u8; 4], 0u8, 0u32, 0usize, 0usize); ACPI_CTRL_MAX];
     let mut nc = 0;
     let mut i = 0;
     while nc < ACPI_CTRL_MAX {
@@ -1714,7 +1732,7 @@ fn aml_scan(a: &[u8]) -> Result<AcpiI2c, AcpiNo> {
         i = h + 1;
         let Some((s, e, nm)) = device_of(a, h) else { continue };
         let (m, base, _) = mem32(a, s, e, None);
-        ctrls[nc] = (nm, m, base);
+        ctrls[nc] = (nm, m, base, s, e);
         nc += 1;
     }
     if nc == 0 {
@@ -1786,7 +1804,7 @@ fn aml_scan(a: &[u8]) -> Result<AcpiI2c, AcpiNo> {
         1 => {}
         m => return Err(AcpiNo { why: "ambiguous", what: "mem", n: m as usize, at: [c.0, c.0] }),
     }
-    Ok(AcpiI2c { dev: c.0, base: c.2, tp, tpdev, speed, desc: dsm_desc(a, s, e), gpio: gpioint(a, s, e) })
+    Ok(AcpiI2c { dev: c.0, base: c.2, tp, tpdev, speed, desc: dsm_desc(a, s, e), gpio: gpioint(a, s, e), cn: Cn { fmcn: dw_cn(a, c.3, c.4, b"FMCN"), sscn: dw_cn(a, c.3, c.4, b"SSCN") } })
 }
 
 /// The scan against the survey: (the controller index in `BASES`, the descriptor register to use, the first mismatch).
@@ -1870,7 +1888,7 @@ fn acpi_census() {
     if let Some(p) = acpi_say(&r) {
         ACPI_PICK.call_once(|| p);
     }
-    gpio_census(d, &r);
+    gpio_census(d, &r); timing_census(&r);
 }
 
 /// `run`'s guess pair from the scan: only on the controller the DSDT named, and only at an address that acked.
@@ -1903,7 +1921,7 @@ pub fn acpi_selftest() {
         Some(d) => {
             let r = aml_scan(d);
             let _ = acpi_say(&r);
-            let _ = gpio_say(d, &r);
+            let _ = gpio_say(d, &r); let _ = timing_say(&r);
         }
         None => serial_println!("[dwi2c] acpi -> REFUSED why=no-dsdt"),
     }
@@ -1929,7 +1947,7 @@ pub fn acpi_selftest() {
         None => serial_println!(":: DWI2CACPI: base=ok tp=ok speed={} desc=ok refuse={}/3 -> PASS ::", speed, refuse),
         Some(c) => serial_println!(":: DWI2CACPI: case={} -> FAIL ::", c.0),
     }
-    gpio_selftest();
+    gpio_selftest(); timing_selftest();
 }
 
 // ── DWI2CGPIO (zenbook-ledger Z42) — the touchpad's GpioInt and the FCH GPIO controller's line — FILE TAIL ─────────────
@@ -2407,5 +2425,372 @@ pub mod tpirq {
                 ISR_N.load(Ordering::Relaxed), FOREIGN.load(Ordering::Relaxed)
             );
         }
+    }
+}
+
+// ── DWI2CFAST (zenbook-ledger Z50) — the controller's FMCN/SSCN and the held touchpad at 400 kHz — FILE TAIL ──────────────
+// The same BYTE SCAN discipline (no AML runs, BP-power-4). linux `i2c_dw_acpi_params` evaluates FMCN/SSCN as NAMED OBJECTS
+// under the controller Device (not `_DSD` properties): a Package of 3 Integers (SCL hcnt, SCL lcnt, SDA hold). `dw_cn` reads
+// the two literal shapes `Name (FMCN, Package (3) {..})` and `Method (FMCN) { Return (Package (3) {..}) }` inside the AMDI0010
+// Device span `aml_scan` found, refusing by name (absent, ambiguous, shape). `FAST` is Ok ONLY when Z32 agreed (`ACPI_PICK`),
+// the touchpad's I2cSerialBus ConnectionSpeed is >= 400000 and the counts are sane at AMDI0010's fixed 150 MHz (`fast_ok`);
+// SSCN is printed, not applied (standard mode stays as `open` sets it). `fast_attach` (from `touchpad::attach`'s armed arm,
+// before TP/ARMED, so the pump cannot share the bus) runs `fast_switch`, THE ONE program fn: disable, IC_CON speed = fast,
+// FS_SCL_HCNT/LCNT, SDA_HOLD (IC_COMP_VERSION >= 1.11a only), read back; the FIRST 400 kHz transfer is a verify against
+// `bring_up`'s 100 kHz read of the report descriptor, and any failure restores standard mode with ONE 100 kHz retry. The
+// census and the bring-up never run at 400 kHz. `tests dwi2cacpi`'s third line: `:: DWI2CFAST: fmcn=120/256/30
+// sscn=650/669/30 program=ok verify=ok fallback=ok refuse=3/3 -> PASS ::`. Owed: DWI2C-FAST-CALC (linux's fast-mode formula
+// at 150 MHz when the DSDT carries no FMCN), DWI2C-ACPI-SSDT (FMCN/SSCN declared in an SSDT).
+
+const IC_FS_SCL_HCNT: usize = 0x1c;
+const IC_FS_SCL_LCNT: usize = 0x20;
+const IC_SDA_HOLD: usize = 0x7c;
+/// IC_CON's speed field [2:1]: 1 standard, 2 fast.
+const CON_SPEED_MASK: u32 = 3 << 1;
+const CON_SPEED_FAST: u32 = 2 << 1;
+/// IC_SDA_HOLD exists from IC_COMP_VERSION 1.11a (linux DW_IC_SDA_HOLD_MIN_VERS).
+const SDA_HOLD_MIN_VER: u32 = 0x3131_312a;
+/// IC_SDA_HOLD's RX hold field (linux forces it to 1 when the count leaves it 0).
+const SDA_HOLD_RX_MASK: u32 = 0xff << 16;
+/// The I2cSerialBus ConnectionSpeed that allows fast mode.
+const FAST_MIN: u32 = 400_000;
+
+/// The controller Device's FMCN and SSCN (hcnt, lcnt, sda hold), else the refusal's name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Cn {
+    fmcn: Result<[u32; 3], &'static str>,
+    sscn: Result<[u32; 3], &'static str>,
+}
+
+/// What `fast_attach` programs: the controller index into `BASES`, the touchpad address, the FMCN counts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(feature = "ehcihid"), allow(dead_code))]
+struct Fast {
+    ctrl: usize,
+    addr: u8,
+    hcnt: u32,
+    lcnt: u32,
+    hold: u32,
+}
+
+/// What `fast_switch` came to: the read-back counts and hold (None = SDA_HOLD kept) or why nothing stayed programmed,
+/// the read-back (con, hcnt, lcnt), the verify's word and the 100 kHz retry after a fallback.
+#[cfg_attr(not(feature = "ehcihid"), allow(dead_code))]
+struct FastOut {
+    prog: Result<(u32, u32, Option<u32>), &'static str>,
+    back: (u32, u32, u32),
+    verify: &'static str,
+    retry: Option<bool>,
+}
+
+/// Written once by `acpi_census` (pci init, BSP); read once by `touchpad::attach` before ARMED.
+#[cfg_attr(not(feature = "ehcihid"), allow(dead_code))]
+static FAST: spin::Once<Result<Fast, &'static str>> = spin::Once::new();
+
+/// A Package (0x12) of exactly 3 Integers (Zero, One, ByteConst, WordConst, DWordConst) at `p`, inside its own bound and `e`.
+fn pkg3(a: &[u8], p: usize, e: usize) -> Option<[u32; 3]> {
+    if *a.get(p)? != 0x12 {
+        return None;
+    }
+    let (len, w) = pkg_len(a, p + 1)?;
+    let end = (p + 1 + len).min(e).min(a.len());
+    if *a.get(p + 1 + w)? != 3 {
+        return None;
+    }
+    let mut i = p + 2 + w;
+    let mut v = [0u32; 3];
+    for slot in v.iter_mut() {
+        let (x, n) = match *a.get(i)? {
+            0x00 => (0u32, 1usize),
+            0x01 => (1, 1),
+            0x0a => (*a.get(i + 1)? as u32, 2),
+            0x0b => (u16::from_le_bytes(a.get(i + 1..i + 3)?.try_into().ok()?) as u32, 3),
+            0x0c => (u32::from_le_bytes(a.get(i + 1..i + 5)?.try_into().ok()?), 5),
+            _ => return None,
+        };
+        if i + n > end {
+            return None;
+        }
+        *slot = x;
+        i += n;
+    }
+    Some(v)
+}
+
+/// The ONE definition of `name` in the controller span `[s, e)`: `Name (name, Package)` (NameOp 0x08 before it) or
+/// `Method (name) { Return (Package) }` (MethodOp 0x14 + a PkgLength of the width it encodes before it, ReturnOp first).
+fn dw_cn(a: &[u8], s: usize, e: usize, name: &[u8; 4]) -> Result<[u32; 3], &'static str> {
+    let (mut hit, mut n, mut k) = (None, 0usize, s);
+    while let Some(at) = find_from(a, name, k, e) {
+        k = at + 1;
+        let named = at >= 1 && a[at - 1] == 0x08;
+        let method = !named
+            && (1..=4usize).any(|w| at > w && a[at - 1 - w] == 0x14 && pkg_len(a, at - w).is_some_and(|(_, ww)| ww == w))
+            && a.get(at + 5) == Some(&0xa4);
+        let p = if named {
+            at + 4
+        } else if method {
+            at + 6
+        } else {
+            continue;
+        };
+        n += 1;
+        if hit.is_none() {
+            hit = Some(p);
+        }
+    }
+    let Some(p) = hit else { return Err("absent") };
+    if n > 1 {
+        return Err("ambiguous");
+    }
+    pkg3(a, p, e).ok_or("shape")
+}
+
+/// The FMCN counts' sanity at AMDI0010's fixed 150 MHz (linux acpi_apd): hcnt 6..=0xffff, lcnt 8..=0xffff, hcnt + lcnt >=
+/// 300 (at most ~500 kHz nominal), the SDA hold under the low count. None = sane, else the refusal's name.
+fn fast_ok(hcnt: u32, lcnt: u32, hold: u32) -> Option<&'static str> {
+    if !(6..=0xffff).contains(&hcnt) || !(8..=0xffff).contains(&lcnt) || hcnt + lcnt < 300 {
+        Some("counts")
+    } else if hold & 0xffff >= lcnt {
+        Some("hold")
+    } else {
+        None
+    }
+}
+
+/// `120/256/30` or the refusal's name, for the wire.
+struct CnStr(Result<[u32; 3], &'static str>);
+impl core::fmt::Display for CnStr {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self.0 {
+            Ok(v) => write!(f, "{}/{}/{}", v[0], v[1], v[2]),
+            Err(w) => f.write_str(w),
+        }
+    }
+}
+
+/// Print the timing line for one scan; the verdict `FAST` keeps (Ok only on Z32's agreement, speed and sane counts).
+fn timing_say(r: &Result<AcpiI2c, AcpiNo>) -> Result<Fast, &'static str> {
+    let Ok(f) = r else {
+        serial_println!("[dwi2c] acpi timing -> REFUSED why=no-scan sscn=-");
+        return Err("no-scan");
+    };
+    let [h, l, hold] = match f.cn.fmcn {
+        Ok(v) => v,
+        Err(w) => {
+            let why = match w {
+                "absent" => "no-fmcn",
+                "ambiguous" => "fmcn-ambiguous",
+                _ => "fmcn-shape",
+            };
+            serial_println!("[dwi2c] acpi timing -> REFUSED why={} sscn={}", why, CnStr(f.cn.sscn));
+            return Err(why);
+        }
+    };
+    let pick = ACPI_PICK.get();
+    let why = if pick.is_none() {
+        Some("i2c")
+    } else if f.speed < FAST_MIN {
+        Some("speed")
+    } else {
+        fast_ok(h, l, hold)
+    };
+    serial_println!(
+        "[dwi2c] acpi timing fmcn={}/{}/{} sscn={} speed={} -> {}{}",
+        h, l, hold, CnStr(f.cn.sscn), f.speed, if why.is_none() { "fast" } else { "standard why=" }, why.unwrap_or("")
+    );
+    match (why, pick) {
+        (None, Some(p)) => Ok(Fast { ctrl: p.0, addr: p.1, hcnt: h, lcnt: l, hold }),
+        (Some(w), _) => Err(w),
+        (None, None) => Err("i2c"),
+    }
+}
+
+/// `acpi_census`'s timing half (after the I2C pick): print, and keep the verdict once.
+fn timing_census(r: &Result<AcpiI2c, AcpiNo>) {
+    let v = timing_say(r);
+    FAST.call_once(|| v);
+}
+
+/// Write back what `fast_switch` found (the controller already disabled).
+fn fast_restore<I: Mmio>(io: &I, found: &(u32, u32, u32, u32), hold_ok: bool) {
+    io.wr(IC_CON, found.0);
+    io.wr(IC_FS_SCL_HCNT, found.1);
+    io.wr(IC_FS_SCL_LCNT, found.2);
+    if hold_ok {
+        io.wr(IC_SDA_HOLD, found.3);
+    }
+}
+
+/// THE ONE fast-mode program fn (the KAT drives it over the fake): read the found CON / FS counts / SDA_HOLD, disable,
+/// IC_CON speed field = fast, FS_SCL_HCNT/LCNT, SDA_HOLD (>= 1.11a only, RX hold forced to 1 when 0), read back (a mismatch
+/// restores the found four); then the first 400 kHz transfer reads `want.len()` (<= 4) bytes of `rdreg` and compares them
+/// with `want` (read at 100 kHz); any failure restores the found four (`open`'s standard mode) and retries ONCE at 100 kHz.
+fn fast_switch<I: Mmio>(io: &I, f: &Fast, rdreg: u16, want: &[u8], win: usize) -> FastOut {
+    let found = (io.rd(IC_CON), io.rd(IC_FS_SCL_HCNT), io.rd(IC_FS_SCL_LCNT), io.rd(IC_SDA_HOLD));
+    let mut o = FastOut { prog: Err("disable"), back: (found.0, found.1, found.2), verify: "-", retry: None };
+    if set_enable(io, false, "disable").is_err() {
+        return o;
+    }
+    let hold_ok = io.rd(IC_COMP_VERSION) >= SDA_HOLD_MIN_VER;
+    let hold = if f.hold & SDA_HOLD_RX_MASK == 0 { f.hold | (1 << 16) } else { f.hold };
+    io.wr(IC_CON, (found.0 & !CON_SPEED_MASK) | CON_SPEED_FAST);
+    io.wr(IC_FS_SCL_HCNT, f.hcnt);
+    io.wr(IC_FS_SCL_LCNT, f.lcnt);
+    if hold_ok {
+        io.wr(IC_SDA_HOLD, hold);
+    }
+    let (con, hc, lc, hd) = (io.rd(IC_CON), io.rd(IC_FS_SCL_HCNT), io.rd(IC_FS_SCL_LCNT), io.rd(IC_SDA_HOLD));
+    o.back = (con, hc, lc);
+    if con & CON_SPEED_MASK != CON_SPEED_FAST || hc & 0xffff != f.hcnt || lc & 0xffff != f.lcnt || (hold_ok && hd & 0x00ff_ffff != hold) {
+        fast_restore(io, &found, hold_ok);
+        o.prog = Err("readback");
+        return o;
+    }
+    o.prog = Ok((hc & 0xffff, lc & 0xffff, if hold_ok { Some(hd & 0x00ff_ffff) } else { None }));
+    let n = want.len().min(4);
+    let reg = rdreg.to_le_bytes();
+    let mut chk = [0u8; 4];
+    o.verify = match xfer(io, f.addr, &reg, &mut chk[..n], win) {
+        Ok(()) if chk[..n] == want[..n] => "ok",
+        Ok(()) => "mismatch",
+        Err(e) if e.step == "abort" && e.src & ABRT_7B_ADDR_NOACK != 0 => "nack",
+        Err(e) if e.step == "abort" => "abort",
+        Err(_) => "stuck",
+    };
+    if o.verify != "ok" {
+        let _ = set_enable(io, false, "disable");
+        fast_restore(io, &found, hold_ok);
+        let mut again = [0u8; 4];
+        o.retry = Some(xfer(io, f.addr, &reg, &mut again[..n], win).is_ok() && again[..n] == want[..n]);
+    }
+    o
+}
+
+/// `touchpad::attach`'s armed arm, before TP/ARMED: the switch on the controller and address `FAST` names, else standard
+/// mode kept by name. `want` = the report descriptor's first bytes `bring_up` read at 100 kHz.
+#[cfg_attr(not(feature = "ehcihid"), allow(dead_code))]
+fn fast_attach(i: usize, io: &Real, addr: u8, d: &HidDesc, win: usize, want: &[u8]) {
+    let f = match FAST.get() {
+        Some(Ok(f)) if f.ctrl == i && f.addr == addr => *f,
+        Some(Ok(_)) => {
+            serial_println!("[dwi2c] ctrl={} speed=100k -> KEPT why=other-ctrl", i);
+            return;
+        }
+        Some(Err(w)) => {
+            serial_println!("[dwi2c] ctrl={} speed=100k -> KEPT why={}", i, w);
+            return;
+        }
+        None => {
+            serial_println!("[dwi2c] ctrl={} speed=100k -> KEPT why=no-scan", i);
+            return;
+        }
+    };
+    let o = fast_switch(io, &f, d.rdreg, want, win);
+    match o.prog {
+        Err("readback") => {
+            serial_println!(
+                "[dwi2c] ctrl={} speed=100k -> KEPT why=readback con={:#x} hcnt={} lcnt={}",
+                i, o.back.0, o.back.1, o.back.2
+            );
+            return;
+        }
+        Err(w) => {
+            serial_println!("[dwi2c] ctrl={} speed=100k -> KEPT why={}", i, w);
+            return;
+        }
+        Ok((h, l, Some(hd))) => serial_println!("[dwi2c] ctrl={} speed=400k hcnt={} lcnt={} hold={:#x} -> programmed", i, h, l, hd),
+        Ok((h, l, None)) => serial_println!("[dwi2c] ctrl={} speed=400k hcnt={} lcnt={} hold=kept -> programmed", i, h, l),
+    }
+    if o.verify == "ok" {
+        serial_println!("[dwi2c] ctrl={} speed=400k verify=ok -> fast", i);
+    } else {
+        serial_println!(
+            "[dwi2c] ctrl={} speed=400k verify={} -> FALLBACK speed=100k retry={}",
+            i, o.verify, if o.retry == Some(true) { "ok" } else { "fail" }
+        );
+    }
+}
+
+const TIMING_KAT_LEN: usize = 34;
+/// `Name (FMCN, Package (3) { 0x78, 0x0100, 0x1E })` (ByteConst, WordConst, ByteConst), then
+/// `Method (SSCN) { Return (Package (3) { 0x028A, 0x029D, 0x1E }) }`.
+const TIMING_KAT: [u8; TIMING_KAT_LEN] = [
+    0x08, 0x46, 0x4d, 0x43, 0x4e, 0x12, 0x09, 0x03, 0x0a, 0x78, 0x0b, 0x00, 0x01, 0x0a, 0x1e, //
+    0x14, 0x12, 0x53, 0x53, 0x43, 0x4e, 0x00, 0xa4, 0x12, 0x0a, 0x03, 0x0b, 0x8a, 0x02, 0x0b, 0x9d, 0x02, 0x0a, 0x1e,
+];
+/// The KAT's switch: FMCN's counts on the fake's acking address.
+const FAST_KAT: Fast = Fast { ctrl: 0, addr: 0x15, hcnt: 120, lcnt: 256, hold: 30 };
+
+/// The fake opened as `attach` opens it, the report descriptor's first four bytes served at register 0x0002.
+fn kat_fast_fake(nack_fast: bool) -> Fake {
+    let f = Fake::new();
+    {
+        let mut st = f.s.borrow_mut();
+        st.rdesc[..4].copy_from_slice(&[0x05, 0x0d, 0x09, 0x05]);
+        st.rdesc_n = 4;
+        st.rdreg = 0x0002;
+        st.nack_fast = nack_fast;
+    }
+    f
+}
+
+/// (programmed and read back, verified at 400 kHz).
+fn kat_fast_program() -> (bool, bool) {
+    let f = kat_fast_fake(false);
+    if open(&f).is_err() {
+        return (false, false);
+    }
+    let o = fast_switch(&f, &FAST_KAT, 0x0002, &[0x05, 0x0d, 0x09, 0x05], 16);
+    let st = f.s.borrow();
+    let prog = o.prog == Ok((120, 256, Some(30 | (1 << 16))))
+        && st.con & CON_SPEED_MASK == CON_SPEED_FAST
+        && st.fs_hcnt == 120
+        && st.fs_lcnt == 256;
+    (prog, o.verify == "ok" && o.retry.is_none())
+}
+
+/// A NACK at 400 kHz: standard mode and the found FS counts back, the one 100 kHz retry answers.
+fn kat_fast_fallback() -> bool {
+    let f = kat_fast_fake(true);
+    if open(&f).is_err() {
+        return false;
+    }
+    let o = fast_switch(&f, &FAST_KAT, 0x0002, &[0x05, 0x0d, 0x09, 0x05], 16);
+    let st = f.s.borrow();
+    o.prog.is_ok()
+        && o.verify == "nack"
+        && o.retry == Some(true)
+        && st.con & CON_SPEED_MASK == CON_SPEED_STD
+        && st.fs_hcnt == 0
+        && st.fs_lcnt == 0
+        && st.hold == 0
+}
+
+/// `tests dwi2cacpi`'s third line: `dw_cn` over `TIMING_KAT` and two mutants, the counts' sanity, the switch and its
+/// fallback over the fake controller.
+fn timing_selftest() {
+    let fm = dw_cn(&TIMING_KAT, 0, TIMING_KAT_LEN, b"FMCN");
+    let ss = dw_cn(&TIMING_KAT, 0, TIMING_KAT_LEN, b"SSCN");
+    let mut m = TIMING_KAT;
+    m[4] = b'X'; // "FMCN" -> "FMCX"
+    let absent = TIMING_KAT[4] == b'N' && dw_cn(&m, 0, TIMING_KAT_LEN, b"FMCN") == Err("absent");
+    let mut m = TIMING_KAT;
+    m[7] = 2; // NumElements 3 -> 2
+    let shape = TIMING_KAT[7] == 3 && dw_cn(&m, 0, TIMING_KAT_LEN, b"FMCN") == Err("shape");
+    let counts = fast_ok(120, 5, 30) == Some("counts") && fast_ok(120, 256, 30).is_none();
+    let refuse = absent as u32 + shape as u32 + counts as u32;
+    let (prog, verify) = kat_fast_program();
+    let fallback = kat_fast_fallback();
+    let cases = [
+        ("fmcn", fm == Ok([120, 256, 30])), ("sscn", ss == Ok([650, 669, 30])), ("absent", absent), ("shape", shape),
+        ("counts", counts), ("program", prog), ("verify", verify), ("fallback", fallback),
+    ];
+    match cases.iter().find(|c| !c.1) {
+        None => serial_println!(
+            ":: DWI2CFAST: fmcn={} sscn={} program=ok verify=ok fallback=ok refuse={}/3 -> PASS ::",
+            CnStr(fm), CnStr(ss), refuse
+        ),
+        Some(c) => serial_println!(":: DWI2CFAST: case={} -> FAIL ::", c.0),
     }
 }

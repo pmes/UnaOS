@@ -1068,7 +1068,7 @@ refs/heads/exec-rmbp-mt7925s9   1f955b273 cut 2026-10-27 (wave36 batch 20)
 refs/heads/exec-rmbp-zenbookacpplay   0341ffc5f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbooksuspend   a39decfc8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nvmeirqwait   1f955b273 cut 2026-10-27 (wave36 batch 20)
-refs/heads/exec-rmbp-dwi2cfast   1f955b273 cut 2026-10-27 (wave36 batch 20)
+refs/heads/exec-rmbp-dwi2cfast   ed3e30636 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookecqnames   8341015a2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootledsxhci   e9ae3e423 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-openanytype   1f955b273 cut 2026-10-27 (wave36 batch 20)
