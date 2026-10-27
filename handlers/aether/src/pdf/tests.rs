@@ -1533,3 +1533,90 @@ async fn open_verb_refused_extension_prints_line() {
     assert!(crate::net::fetch_document_any(&url).await.is_err(), "the loader refuses it");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ------------------------------------------------------------------------------------------------- PAGESAVECSSURLS (SR407)
+
+const CSSURLS_TOP: &str = "https://pagesave.example/cssurls/doc";
+const CSSURLS_SITE: &str = "@import \"more.css\"; /* kept */ .a{background:url(img.png)}";
+const CSSURLS_MORE: &str = ".b{background:url(\"../b.png\")}";
+
+/// PAGESAVECSSURLS (SR407): a page whose linked stylesheet `@import`s a second one and names an image by `url()`, the
+/// second naming another, an inline `<style>` with a cached and an uncached `url()`, and a `style=` `url()`: every
+/// resource but `gone.png` cached. Answers the engine with the Save As staged and its markup.
+fn cssurls_page() -> (AetherEngine, Vec<u8>) {
+    let png = pagesave_png();
+    let at = |p: &str| format!("https://pagesave.example/cssurls/{p}");
+    pagesave_cache(CSSURLS_TOP, &at("css/site.css"), "text/css", CSSURLS_SITE.as_bytes());
+    pagesave_cache(CSSURLS_TOP, &at("css/more.css"), "text/css; charset=utf-8", CSSURLS_MORE.as_bytes());
+    for p in ["css/img.png", "b.png", "inline.png", "attr.png"] {
+        pagesave_cache(CSSURLS_TOP, &at(p), "image/png", &png);
+    }
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_html(
+        CSSURLS_TOP,
+        "<html><head><title>CSS Page</title><link rel=\"stylesheet\" href=\"css/site.css\">\
+<style>.c{background:url(inline.png)} .d{background:url(gone.png)}</style></head>\
+<body><div style=\"background:url('attr.png')\">styled</div></body></html>",
+        true,
+    );
+    e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
+    let html = staged_save_as(&mut e).2;
+    (e, html)
+}
+
+/// PAGESAVECSSURLS (SR407): a Complete save writes each stylesheet into `_files/` with its `url()` / `@import` pointing at
+/// the sibling files, the page's `<style>` and `style=` `url()`s pointing into `<stem>_files/`, an unsaved one made
+/// absolute; the url()-only resources (found by the discovery walk) are files; one console line counts 6 and 5.
+#[test]
+fn pagesave_cssurls_complete() {
+    let _g = pagesave_lock();
+    let (e, html) = cssurls_page();
+    let dir = pagesave_dir("pagesavecssurls");
+    let to = dir.join("CSS Page.html");
+    let stub = |_: &str, _: &str, _: std::time::Duration| None::<(String, Vec<u8>)>;
+    let out = crate::chrome::host::page_output(&to, &html, &stub).expect("the Complete save's markup");
+    let files = dir.join("CSS Page_files");
+    let read = |n: &str| String::from_utf8(std::fs::read(files.join(n)).unwrap()).unwrap();
+    assert_eq!(read("site.css"), "@import \"more.css\"; /* kept */ .a{background:url(img.png)}", "the linked sheet's references are siblings");
+    assert_eq!(read("more.css"), ".b{background:url(\"b.png\")}", "the imported sheet's reference too, in its own quote");
+    for n in ["img.png", "b.png", "inline.png", "attr.png"] {
+        assert_eq!(std::fs::read(files.join(n)).unwrap(), pagesave_png(), "{n} saved from the cache");
+    }
+    assert!(!files.join("gone.png").exists(), "the uncached image is not a file");
+    let saved = String::from_utf8(out).unwrap();
+    assert!(saved.contains("href=\"CSS%20Page_files/site.css\""), "the link points at the saved sheet: {saved}");
+    assert!(saved.contains(".c{background:url(CSS%20Page_files/inline.png)}"), "the <style> url() rewritten: {saved}");
+    assert!(saved.contains(".d{background:url(https://pagesave.example/cssurls/gone.png)}"), "an unsaved url() made absolute: {saved}");
+    assert!(saved.contains("style=\"background:url('CSS%20Page_files/attr.png')\""), "the style= url() rewritten: {saved}");
+    let lines = crate::js::console_lines();
+    assert!(lines.iter().any(|(_, l)| l == "[pdf] page save: css urls=6 rewritten=5"), "the one console line: {lines:?}");
+    assert!(e.document.as_ref().unwrap().inner_html().contains("url(inline.png)"), "the live DOM is untouched");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// PAGESAVECSSURLS (SR407): the same page saved as `.mhtml`: the archive carries the url()- and @import-discovered parts,
+/// each stylesheet's bytes exactly as cached (no rewrite: the reader serves each part at its Content-Location), and no
+/// CSS console line.
+#[test]
+fn pagesave_cssurls_mhtml_unchanged() {
+    let _g = pagesave_lock();
+    let (_e, html) = cssurls_page();
+    let dir = pagesave_dir("pagesavecssurlsmhtml");
+    let to = dir.join("CSS Page.mhtml");
+    let stub = |_: &str, _: &str, _: std::time::Duration| None::<(String, Vec<u8>)>;
+    let count = || crate::js::console_lines().iter().filter(|(_, l)| l.starts_with("[pdf] page save: css urls=")).count();
+    let before = count();
+    let archive = crate::chrome::host::page_output(&to, &html, &stub).expect("the staged page's archive");
+    assert_eq!(count(), before, "no CSS line for an archive");
+    let (root, parts) = gneiss_pal::mhtml::read(&archive).expect("an archive");
+    assert_eq!(root.location, CSSURLS_TOP);
+    let body = |p: &str| parts.iter().find(|x| x.location == format!("https://pagesave.example/cssurls/{p}")).map(|x| x.body.clone());
+    assert_eq!(body("css/site.css").as_deref(), Some(CSSURLS_SITE.as_bytes()), "the linked sheet as cached");
+    assert_eq!(body("css/more.css").as_deref(), Some(CSSURLS_MORE.as_bytes()), "the imported sheet, discovered, as cached");
+    for p in ["css/img.png", "b.png", "inline.png", "attr.png"] {
+        assert!(body(p).is_some(), "{p} discovered as a part");
+    }
+    assert!(body("gone.png").is_none(), "the uncached one left out");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

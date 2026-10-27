@@ -252,3 +252,123 @@ pub fn wifiscan() {
     );
     serial_println!(":: wifiscan: kat={} radio=mt7925 bss={} -> {} ::", k, n, if kat && n > 0 { "PASS" } else { "FAIL" });
 }
+
+// ── MT7925S8 (zenbook-ledger Z38): `tests wifijoin <ssid>` — the station's open-system join over the MT7925 (S8) ─────────────
+/// A printable SSID for a wire line: non-printables and quotes as '.', at most 32 (the wifiscan rule; SSID-TEXT-SHARED owed).
+fn ssid_view(b: &[u8]) -> alloc::string::String {
+    b.iter().take(32).map(|&c| if (0x20..0x7f).contains(&c) && c != b'"' { c as char } else { '.' }).collect()
+}
+
+/// `tests wifijoin <ssid>` (MT7925S8, zenbook-ledger Z38): the operator's join, never at boot (BP-net-7), the SSID from the same
+/// `crate::tests::arg()` the Broadcom `tests wifi <ssid>` reads. The KATs first (`mt7925::join_kat`: the TXD/txp, DEV_INFO,
+/// BSS_INFO and ROC bytes; `assoc::kat`: the ONE codec's auth/assoc frames and the judges over canned frames); with no MT7925
+/// registered (QEMU, the rMBP) that is the verdict and nothing touches a device. Else `mt7925::scan` hands each frame here and the
+/// first OPEN BSS naming exactly the SSID with a DS channel is the target (a protected one only sets a flag: WPA2 is S10); then
+/// `mt7925::join` takes the frames from `wifi_core::ieee80211` (`build_auth_open`, `build_assoc_req` with `assoc::assoc_cap`) and
+/// judges the replies with `assoc::auth_reply` / `assoc_reply` / `refusal`. PASS = the KATs held and the association was granted.
+pub fn wifijoin() {
+    use crate::drivers::mt7925 as mt;
+    use wifi_core::ieee80211 as w;
+    let kat = mt::join_kat() && super::assoc::kat().2.is_none();
+    let k = if kat { "ok" } else { "FAIL" };
+    if !mt::registered() {
+        serial_println!(":: wifijoin: kat={} radio=absent -> {} ::", k, if kat { "PASS" } else { "FAIL" });
+        return;
+    }
+    let ssid = crate::tests::arg().unwrap_or_default();
+    let refuse = |why: &str| {
+        serial_println!("[wifi] join radio=mt7925 ssid=\"{}\" -> NOT ATTEMPTED why={}", ssid_view(ssid.as_bytes()), why);
+        serial_println!(":: wifijoin: kat={} radio=mt7925 -> FAIL why={} ::", k, why);
+    };
+    if ssid.is_empty() {
+        return refuse("no-ssid(type tests wifijoin <ssid>)");
+    }
+    if ssid.len() > 32 {
+        return refuse("ssid-too-long");
+    }
+    let Some(me) = mt::mac() else { return refuse("no-mac") };
+    let sb = ssid.as_bytes();
+    let (mut best, mut prot): (Option<super::assoc::Bss>, bool) = (None, false);
+    let _ = mt::scan(&mut |f: &[u8]| -> bool {
+        let Some(b) = super::assoc::bss_match(f, sb) else { return false };
+        if b.protected {
+            prot = true;
+        } else if best.is_none() && b.channel.is_some() {
+            best = Some(b);
+            return true;
+        }
+        false
+    });
+    let Some(bss) = best else { return refuse(if prot { "protected-s10" } else { "not-heard" }) };
+    let (bssid, ch) = (bss.bssid, bss.channel.unwrap_or(0));
+    let cap = super::assoc::assoc_cap(&bss);
+    let mt_ = |m: [u8; 6]| alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
+    let (mut auth, mut assoc): (Option<w::AuthResult>, Option<w::AssocResult>) = (None, None);
+    let mut refused: Option<(u8, &'static str, u16)> = None;
+    let plan = mt::JoinPlan { ssid: &ssid_view(sb), bssid, channel: ch };
+    let rep = mt::join(
+        &plan,
+        &mut |phase: u8| if phase == 0 { w::build_auth_open(me, bssid, 0) } else { w::build_assoc_req(me, bssid, sb, 0, cap) },
+        &mut |phase: u8, f: &[u8]| {
+            if phase == 0 {
+                if let Some(a) = super::assoc::auth_reply(f, me, bssid) {
+                    auth = Some(a);
+                    let good = a.alg == 0 && a.seq == 2 && a.status == 0;
+                    return Some(if good { mt::Answer::Ok(0) } else { mt::Answer::Refused(if a.status != 0 { a.status } else { 0xffff }) });
+                }
+            } else if let Some(a) = super::assoc::assoc_reply(f, me, bssid) {
+                assoc = Some(a);
+                return Some(if a.status == 0 { mt::Answer::Ok(a.aid) } else { mt::Answer::Refused(a.status) });
+            }
+            if let Some((what, reason)) = super::assoc::refusal(f, me, bssid) {
+                refused = Some((phase, what, reason));
+                return Some(mt::Answer::Refused(reason));
+            }
+            None
+        },
+    );
+    let rep = match rep {
+        Ok(r) => r,
+        Err(e) => {
+            serial_println!("[wifi] join radio=mt7925 ssid=\"{}\" -> NOT ATTEMPTED why={}", plan.ssid, e);
+            serial_println!(":: wifijoin: kat={} radio=mt7925 -> FAIL ::", k);
+            return;
+        }
+    };
+    let why = |ph: u8, st: &mt::Step, status: Option<u16>| -> alloc::string::String {
+        match st {
+            mt::Step::Ans(mt::Answer::Refused(c)) => match refused {
+                Some((p, what, reason)) if p == ph => alloc::format!("{}(reason={})", what, reason),
+                _ => alloc::format!("status={}", status.unwrap_or(*c)),
+            },
+            mt::Step::Tx(t) => alloc::format!("tx:{}", t),
+            _ => alloc::string::String::from("no-response"),
+        }
+    };
+    let authed = matches!(rep.auth, mt::Step::Ans(mt::Answer::Ok(_)));
+    let resp = auth.map_or(alloc::string::String::from("alg=- seq=- status=-"), |a| alloc::format!("alg={} seq={} status={}", a.alg, a.seq, a.status));
+    serial_println!(
+        ":: wifiauth: s8 auth ssid={} bssid={} ch={} radio=mt7925 resp={} -> {} ::",
+        plan.ssid, mt_(bssid), ch, resp,
+        if authed { alloc::string::String::from("AUTHENTICATED") } else { alloc::format!("NOT-AUTHENTICATED reason={}", why(0, &rep.auth, auth.map(|a| a.status))) }
+    );
+    let aid = match rep.assoc {
+        mt::Step::Ans(mt::Answer::Ok(a)) => Some(a),
+        _ => None,
+    };
+    if !authed {
+        serial_println!(":: wifiauth: s9 assoc NOT ATTEMPTED reason=s8-NOT-AUTHENTICATED -> ABSENT ::");
+    } else {
+        let resp = assoc.map_or(alloc::string::String::from("status=- aid=-"), |a| alloc::format!("status={} aid={}", a.status, if a.status == 0 { alloc::format!("{}", a.aid) } else { alloc::string::String::from("-") }));
+        serial_println!(
+            ":: wifiauth: s9 assoc ssid={} bssid={} cap={:#06x} radio=mt7925 resp={} -> {} ::",
+            plan.ssid, mt_(bssid), cap, resp,
+            if aid.is_some() { alloc::string::String::from("ASSOCIATED") } else { alloc::format!("NOT-ASSOCIATED reason={}", why(1, &rep.assoc, assoc.map(|a| a.status))) }
+        );
+    }
+    serial_println!(
+        ":: wifijoin: kat={} radio=mt7925 ssid={} auth={} assoc={} -> {} ::",
+        k, plan.ssid, if authed { "ok" } else { "no" }, aid.map_or(alloc::string::String::from("-"), |a| alloc::format!("aid={}", a)),
+        if kat && aid.is_some() { "PASS" } else { "FAIL" }
+    );
+}
