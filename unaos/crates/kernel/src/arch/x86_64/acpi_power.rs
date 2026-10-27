@@ -733,12 +733,12 @@ unsafe fn scan_sx(table_addr: u64, seg: &[u8; 4]) -> Option<(u8, u8)> {
     if len <= acpi::SDT_HEADER_LEN { return None; }
     let body = &core::slice::from_raw_parts(table_addr as *const u8, len)[acpi::SDT_HEADER_LEN..];
     let mut i = 0usize;
-    while i + 4 <= body.len() {
-        if &body[i..i + 4] == seg {
-            let introduced = (i >= 1 && body[i - 1] == 0x08) || (i >= 2 && body[i - 2] == 0x08 && body[i - 1] == 0x5C);
-            if introduced { if let Some(t) = parse_s5_package(&body[i + 4..]) { return Some(t); } }
+    while let Some(h) = find_from(body, seg, i, body.len()) { // AML-HELPERS-ONE (zenbook-ledger Z53): the window loop retired onto `find_from` (same range 0..=len-4), line count kept.
+        i = h + 1;
+        let introduced = (h >= 1 && body[h - 1] == 0x08) || (h >= 2 && body[h - 2] == 0x08 && body[h - 1] == 0x5C);
+        if introduced {
+            if let Some(t) = parse_s5_package(&body[h + 4..]) { return Some(t); }
         }
-        i += 1;
     }
     None
 }
@@ -749,7 +749,7 @@ unsafe fn names(table_addr: u64, seg: &[u8; 4]) -> bool {
     let len = acpi::table_len(table_addr);
     if len <= acpi::SDT_HEADER_LEN { return false; }
     let body = &core::slice::from_raw_parts(table_addr as *const u8, len)[acpi::SDT_HEADER_LEN..];
-    body.windows(4).any(|w| w == seg)
+    find_from(body, seg, 0, body.len()).is_some() // AML-HELPERS-ONE (zenbook-ledger Z53): was `body.windows(4).any(|w| w == seg)`, retired onto `find_from`.
 }
 
 /// Read the firmware's half of S3. `None` = no RSDP or no FADT. Nothing is written.
@@ -1106,5 +1106,113 @@ pub fn suspend_census() -> Option<SuspendCensus> {
             n
         });
         Some(SuspendCensus { s3, s0ix: flags & FADT_FLAG_LOW_POWER_S0 != 0, lpit })
+    }
+}
+
+// ── AML-HELPERS-ONE (zenbook-ledger Z53) — the ONE home of the AML byte-scan helpers — FILE TAIL ─────────────────────────────
+// DWI2CACPI (Z32) wrote `find_from`/`pkg_len`/`last_seg`/`device_of` as private fns in drivers/dwi2c.rs; ZENBOOKECQNAMES (Z51)
+// widened them in place for ec.rs's `qnames_scan`. They are MOVED here verbatim (this file already owns `dsdt()`, `scan_sx` and
+// the ONE DSDT-then-SSDT walk `sx_pkg`): dwi2c.rs re-exports them, ec.rs's `aml` alias names this module. Retired onto them
+// (dup_retired=3): ec.rs's `seg_char` (onto `last_seg`), `names`' and `scan_sx`'s window loops (onto `find_from`). NOT merged
+// (different semantics): ec.rs's `name_end` (the index past a NameString, the NullName accepted), `parse_s5_package`'s
+// one-byte-only PkgLength, and `scan_s5` (the shutdown path's twin of `scan_sx`, owed AML-S5-ONE). Byte scans: no AML runs
+// (BP-power-4). `tests amlone`: the four over the 40-byte `AML_KAT`.
+
+/// How far back from a `_HID` the enclosing `Device` op is looked for.
+const DEV_BACK: usize = 512;
+
+/// The first `pat` at or after `lo` that ends at or before `hi`.
+pub(crate) fn find_from(a: &[u8], pat: &[u8], lo: usize, hi: usize) -> Option<usize> {
+    let hi = hi.min(a.len());
+    if pat.is_empty() || hi < pat.len() {
+        return None;
+    }
+    (lo..=hi - pat.len()).find(|&k| &a[k..k + pat.len()] == pat)
+}
+
+/// An AML PkgLength at `i`: (the length it encodes, counting itself; its own width).
+pub(crate) fn pkg_len(a: &[u8], i: usize) -> Option<(usize, usize)> {
+    let lead = *a.get(i)? as usize;
+    let n = lead >> 6;
+    if n == 0 {
+        return Some((lead & 0x3f, 1));
+    }
+    let mut v = lead & 0x0f;
+    for k in 0..n {
+        v |= (*a.get(i + 1 + k)? as usize) << (4 + 8 * k);
+    }
+    Some((v, 1 + n))
+}
+
+/// The last NameSeg of the NameString at `i` (root/parent prefixes, dual and multi names).
+pub(crate) fn last_seg(a: &[u8], mut i: usize) -> Option<[u8; 4]> {
+    while matches!(a.get(i), Some(0x5c) | Some(0x5e)) {
+        i += 1;
+    }
+    let at = match *a.get(i)? {
+        0x2e => i + 5,
+        0x2f => {
+            let n = *a.get(i + 1)? as usize;
+            if n == 0 {
+                return None;
+            }
+            i + 2 + 4 * (n - 1)
+        }
+        _ => i,
+    };
+    let s: [u8; 4] = a.get(at..at + 4)?.try_into().ok()?;
+    if s.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_') { Some(s) } else { None }
+}
+
+/// The nearest `Device` op before `hit` whose PkgLength covers it: (op offset, end, name).
+pub(crate) fn device_of(a: &[u8], hit: usize) -> Option<(usize, usize, [u8; 4])> {
+    let lo = hit.saturating_sub(DEV_BACK);
+    let mut j = hit.checked_sub(2)?;
+    loop {
+        if a[j] == 0x5b && a[j + 1] == 0x82 {
+            if let Some((len, w)) = pkg_len(a, j + 2) {
+                let end = j + 2 + len;
+                if end > hit && end <= a.len() {
+                    if let Some(nm) = last_seg(a, j + 2 + w) {
+                        return Some((j, end, nm));
+                    }
+                }
+            }
+        }
+        if j <= lo {
+            return None;
+        }
+        j -= 1;
+    }
+}
+
+/// The duplicates AML-HELPERS-ONE retired onto the four (ec.rs `seg_char`, `names`' and `scan_sx`'s window loops): a
+/// count of the arc's hunks, printed on the KAT line, not measured at run time.
+const AML_DUP_RETIRED: usize = 3;
+
+/// `Device (\_SB.DEV0) { Name (_HID, "KAT0") <PkgLength samples: 2-, 3-, 4-byte> Noop } Name (XYZ_, Zero)`: the Device's
+/// one-byte PkgLength (32) ends it at 34; the raw samples at 24, 26 and 29 decode to 0x125, 0x12343 and 0x1234567.
+const AML_KAT: [u8; 40] = [
+    0x5b, 0x82, 0x20, 0x5c, 0x2e, b'S', b'B', b'_', b'_', b'D', b'E', b'V', b'0', 0x08, b'_', b'H', b'I', b'D', 0x0d, b'K',
+    b'A', b'T', b'0', 0x00, 0x45, 0x12, 0x83, 0x34, 0x12, 0xc7, 0x56, 0x34, 0x12, 0xa3, 0x08, b'X', b'Y', b'Z', b'_', 0x00,
+];
+
+/// `tests amlone`: `find_from`'s bounds, `pkg_len`'s four widths (and a truncated 4-byte form), `last_seg` through a root
+/// prefix and a dual name, `device_of` inside and outside the Device's span.
+pub fn amlone_selftest() {
+    let a = &AML_KAT;
+    let find = find_from(a, b"_HID", 0, a.len()) == Some(14)
+        && find_from(a, b"KAT0", 0, 23) == Some(19)
+        && find_from(a, b"KAT0", 0, 22).is_none()
+        && find_from(a, b"_HID", 15, a.len()).is_none();
+    let forms = [pkg_len(a, 2) == Some((32, 1)), pkg_len(a, 24) == Some((0x125, 2)), pkg_len(a, 26) == Some((0x12343, 3)), pkg_len(a, 29) == Some((0x1234567, 4))];
+    let pk = forms.iter().filter(|&&f| f).count();
+    let pkglen = pk == 4 && pkg_len(&a[..31], 29).is_none();
+    let seg = last_seg(a, 3) == Some(*b"DEV0") && last_seg(a, 35) == Some(*b"XYZ_") && last_seg(a, 24).is_none();
+    let device = device_of(a, 14) == Some((0, 34, *b"DEV0")) && device_of(a, 36).is_none();
+    let cases = [("find", find), ("pkglen", pkglen), ("seg", seg), ("device", device)];
+    match cases.iter().find(|c| !c.1) {
+        None => serial_println!(":: AMLONE: find=ok pkglen={}/4 seg=ok device=ok dup_retired={} -> PASS ::", pk, AML_DUP_RETIRED),
+        Some(c) => serial_println!(":: AMLONE: case={} pkglen={}/4 -> FAIL ::", c.0, pk),
     }
 }
