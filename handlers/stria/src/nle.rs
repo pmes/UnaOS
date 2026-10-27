@@ -19,14 +19,19 @@
 //! * Transitions (NLE3, LEDGER SR202): a step carrying `vmix` decodes a second run (the outgoing source, which takes
 //!   over the live run it continues) through the same open-or-continue path ([`vid_frame`]) and mixes the two: a
 //!   dissolve is pixel_core's `blend_nonpremult` of the incoming at alpha `round(255 t)` over the outgoing, a wipe a
-//!   column (`W001`) or row (`W002`) split at `round(w t)` / `round(h t)` with the incoming before the edge.
+//!   column (`W001`) or row (`W002`) split at `round(w t)` / `round(h t)` with the incoming before the edge. NLE3c
+//!   (SR209): `W041` a diagonal from the top-left (`x + y < t (w + h)`), `W101` a centred box growing with `t`, `W201`
+//!   a clock hand from twelve sweeping `2 pi t` (exact fractions, the clock by the pixel centre's angle); a transition
+//!   from black mixes the incoming over opaque black (the gap's black) the same way.
 //! * Video is cut-only and one size: a frame whose size differs from the project's (the first scheduled video source's
 //!   track) is refused (scaling is owed). A gap is black (opaque) or silence.
 //! * Audio is a MIX (NLE4, LEDGER SR203): each audio step renders its `timeline_core::schedule::audio_runs` run: every
 //!   layer decoded on its own track's decoder, resampled to the project rate when its rate differs
 //!   (`audio_core::resample::linear`; the project rate is [`Sources::set_audio_rate`]'s, else the first scheduled audio
 //!   source's), scaled by its gain and its linear fade envelope, summed in integers and clamped to 16 bits once. Only a
-//!   CHANNEL-count mismatch is refused. One layer at 0 dB with no fade passes through bit for bit.
+//!   CHANNEL-count mismatch is refused. One layer at 0 dB with no fade passes through bit for bit. NLE3b (SR209): a
+//!   crossfade's UNDER layer (the outgoing's handle, before the incoming layer of the same track) decodes on its own
+//!   slot (`tracks + track`), so the track's own decoder carries the incoming on; the sum is the same `mix_into`.
 //!
 //! [`synth_source`] writes the codec-free test medium the KATs and `tools/nle --make-src` use: demux_core's `utp1`
 //! test-pattern video (frame ordinals from `base`) plus 16-bit PCM whose every sample names its source and index.
@@ -384,7 +389,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let mut vmix_run: Option<Vid> = None; // NLE3: a transition's outgoing run
     let mut vid: Option<Vid> = None;
     // NLE4: one audio decoder per track; the k-th audio step is the k-th mix run.
-    let mut auds: Vec<Option<Aud>> = (0..tl.tracks.len()).map(|_| None).collect();
+    let mut auds: Vec<Option<Aud>> = (0..2 * tl.tracks.len()).map(|_| None).collect(); // NLE3b: + the under slots
     let mut run_of = runs.iter();
     for s in &steps {
         match (s.kind, s.src) {
@@ -452,8 +457,17 @@ fn mix_run(
 ) -> Result<Vec<f32>, RenderError> {
     let n = n.max(0);
     let mut acc = vec![0i64; n as usize * ch as usize];
-    for l in &run.layers {
-        let slot = &mut auds[l.track];
+    // NLE3b: a layer followed by another of its own track is a crossfade's UNDER layer: its own slot; a track with no
+    // under layer in this run drops its under slot.
+    let tracks = auds.len() / 2;
+    let under = |li: usize| run.layers.get(li + 1).is_some_and(|m| m.track == run.layers[li].track);
+    for t in 0..tracks {
+        if !(0..run.layers.len()).any(|li| under(li) && run.layers[li].track == t) {
+            auds[tracks + t] = None;
+        }
+    }
+    for (li, l) in run.layers.iter().enumerate() {
+        let slot = &mut auds[if under(li) { tracks + l.track } else { l.track }];
         if l.seek.is_some() || slot.as_ref().map(|a| a.src) != Some(l.src) {
             let key = match l.seek {
                 Some(k) => k,
@@ -549,7 +563,8 @@ fn vmix_take(s: &timeline_core::schedule::Step, vid: &mut Option<Vid>, vmix_run:
         *vmix_run = None;
         return;
     };
-    if m.seek.is_none() && vmix_run.as_ref().map(|v| v.src) != Some(m.src) && vid.as_ref().map(|v| v.src) == Some(m.src) {
+    // NLE3c: a transition from black (`src` none) has no run to take.
+    if m.src.is_some() && m.seek.is_none() && vmix_run.as_ref().map(|v| v.src) != m.src && vid.as_ref().map(|v| v.src) == m.src {
         *vmix_run = vid.take();
     }
 }
@@ -567,11 +582,18 @@ fn vmix_frame(
     r: &mut RenderReport,
 ) -> Result<Vec<u8>, RenderError> {
     let Some(m) = s.vmix else { return Ok(f.to_rgba()) };
-    let a = vid_frame(tl, sources, vmix_run, m.src, m.src_t, m.seek, tol, r)?;
-    if a.width != f.width || a.height != f.height {
-        return Err(RenderError::Size { src: m.src, width: a.width, height: a.height });
-    }
-    Ok(vmix_rgba(m.kind, m.t, &a.to_rgba(), &f.to_rgba(), f.width, f.height))
+    let a = match m.src {
+        Some(src) => {
+            let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r)?;
+            if a.width != f.width || a.height != f.height {
+                return Err(RenderError::Size { src, width: a.width, height: a.height });
+            }
+            a.to_rgba()
+        }
+        // NLE3c: from black: the outgoing is opaque black (the gap's black).
+        None => [0u8, 0, 0, 255].repeat(f.width as usize * f.height as usize),
+    };
+    Ok(vmix_rgba(m.kind, m.t, &a, &f.to_rgba(), f.width, f.height))
 }
 
 /// NLE3: the outgoing frame `a` and the incoming frame `b` (RGBA, `w x h`) mixed at the incoming's weight `t`.
@@ -590,11 +612,17 @@ fn vmix_rgba(kind: timeline_core::TransitionKind, t: timeline_core::schedule::Fr
         }
         TransitionKind::Wipe(dir) => {
             let (w, h) = (w as usize, h as usize);
+            let (wi, hi, num) = (w as i64, h as i64, t.num);
             for y in 0..h {
                 for x in 0..w {
+                    let (xi, yi) = (x as i64, y as i64);
                     let incoming = match dir {
-                        WipeDir::LeftToRight => (x as i64) < round(w as i64),
-                        WipeDir::TopToBottom => (y as i64) < round(h as i64),
+                        WipeDir::LeftToRight => xi < round(wi),
+                        WipeDir::TopToBottom => yi < round(hi),
+                        // NLE3c: exact fractions of t = num / den.
+                        WipeDir::Diagonal => (xi + yi) * den < (wi + hi) * num,
+                        WipeDir::Box => (2 * xi + 1 - wi).abs() * den < wi * num && (2 * yi + 1 - hi).abs() * den < hi * num,
+                        WipeDir::Clock => clock_angle(x, y, w, h) < std::f64::consts::TAU * num as f64 / den as f64,
                     };
                     if incoming {
                         let i = (y * w + x) * 4;
@@ -605,4 +633,10 @@ fn vmix_rgba(kind: timeline_core::TransitionKind, t: timeline_core::schedule::Fr
         }
     }
     out
+}
+
+/// NLE3c: the angle of pixel `(x, y)`'s centre about the frame's centre, clockwise from twelve o'clock, in `[0, 2 pi)`.
+fn clock_angle(x: usize, y: usize, w: usize, h: usize) -> f64 {
+    let (dx, dy) = (x as f64 + 0.5 - w as f64 / 2.0, y as f64 + 0.5 - h as f64 / 2.0);
+    dx.atan2(-dy).rem_euclid(std::f64::consts::TAU)
 }

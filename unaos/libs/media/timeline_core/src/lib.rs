@@ -23,6 +23,10 @@
 //!   [`Timeline::remove_transition`]; [`Timeline::validate`] refuses a transition off a cut ([`EditError::Transition`],
 //!   so an op that moves or removes a transition's cut is refused until the transition is removed) or longer than the
 //!   outgoing's handle or the incoming clip ([`EditError::Handle`]).
+//! * NLE3b/NLE3c (LEDGER SR209): a video transition implies the audio crossfade on every audio track whose clips butt
+//!   at the same cut with the same sources ([`Timeline::audio_crossfade`]; `validate` refuses [`EditError::Handle`]
+//!   when the audio clips' handle is short); wipes gain SMPTE W041 / W101 / W201; a transition may come FROM black
+//!   ([`Transition::from_black`], [`Timeline::add_transition_from_black`], CMX's `BL` outgoing line).
 //! * Audio (NLE4, LEDGER SR203): a clip carries a gain in centi-dB ([`Clip::gain_cdb`], 0 = unity) and linear fades in
 //!   ticks ([`Clip::fade_in`], [`Clip::fade_out`], 0 = none; `fade_in + fade_out <= len`); [`Timeline::set_gain`] and
 //!   [`Timeline::set_fades`] edit them; [`schedule::audio_runs`] mixes every audio track.
@@ -123,6 +127,12 @@ pub enum WipeDir {
     LeftToRight,
     /// `W002`: a horizontal edge moving top to bottom (the incoming on top).
     TopToBottom,
+    /// NLE3c `W041` (SMPTE 258M diagonalWipe topLeft): a diagonal edge from the top-left corner (`x + y < t (w + h)`).
+    Diagonal,
+    /// NLE3c `W101` (SMPTE 258M irisWipe rectangle): a centred box growing to the frame (the incoming inside).
+    Box,
+    /// NLE3c `W201` (SMPTE 258M clockWipe clockwiseTwelve): a hand sweeping clockwise from twelve o'clock.
+    Clock,
 }
 
 impl WipeDir {
@@ -131,12 +141,18 @@ impl WipeDir {
         match self {
             WipeDir::LeftToRight => 1,
             WipeDir::TopToBottom => 2,
+            WipeDir::Diagonal => 41,
+            WipeDir::Box => 101,
+            WipeDir::Clock => 201,
         }
     }
     pub fn from_code(code: u16) -> Option<WipeDir> {
         match code {
             1 => Some(WipeDir::LeftToRight),
             2 => Some(WipeDir::TopToBottom),
+            41 => Some(WipeDir::Diagonal),
+            101 => Some(WipeDir::Box),
+            201 => Some(WipeDir::Clock),
             _ => None,
         }
     }
@@ -157,6 +173,8 @@ pub struct Transition {
     pub at: i64,
     pub kind: TransitionKind,
     pub dur: i64,
+    /// NLE3c: the outgoing is BLACK (CMX `BL`): no clip ends at `at`, and the incoming fades / wipes in from black.
+    pub from_black: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +326,18 @@ impl Timeline {
     /// NLE3: every transition sits on a cut between two butted clips of a video track, in `at` order, and fits the
     /// outgoing source's handle (`src_out + dur <= duration`) and the incoming clip (`dur <= len`).
     fn validate_transitions(&self, t: &Track) -> Result<(), EditError> {
+        // NLE3b: an audio cut paired with a video transition crossfades, so its clips need the transition's handle too.
+        if t.kind == Kind::Audio {
+            for ci in 1..t.clips.len() {
+                if let Some(x) = self.crossfade_of(&t.clips, ci) {
+                    let (o, i) = (t.clips[ci - 1], t.clips[ci]);
+                    let handle = self.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
+                    if x.dur > i.len() || x.dur > handle {
+                        return Err(EditError::Handle);
+                    }
+                }
+            }
+        }
         let mut last: Option<i64> = None;
         for x in &t.transitions {
             if t.kind != Kind::Video || x.dur < 1 || last.is_some_and(|l| x.at <= l) {
@@ -316,6 +346,14 @@ impl Timeline {
             last = Some(x.at);
             let out = t.clips.iter().find(|c| c.end() == x.at);
             let inc = t.clips.iter().find(|c| c.at == x.at);
+            if x.from_black {
+                // NLE3c: from black: an incoming clip and NO outgoing one (a cut with an outgoing is a plain transition).
+                let (None, Some(i)) = (out, inc) else { return Err(EditError::Transition) };
+                if x.dur > i.len() {
+                    return Err(EditError::Handle);
+                }
+                continue;
+            }
             let (Some(o), Some(i)) = (out, inc) else { return Err(EditError::Transition) };
             let handle = self.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
             if x.dur > i.len() || x.dur > handle {
@@ -327,13 +365,48 @@ impl Timeline {
 
     /// NLE3: put a transition on the cut at tick `at` of `track` (replacing one already there).
     pub fn add_transition(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
+        self.put_transition(track, Transition { at, kind, dur, from_black: false })
+    }
+
+    /// NLE3c: put a transition FROM BLACK on the clip starting at tick `at` of `track` (no clip may end there).
+    pub fn add_transition_from_black(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
+        self.put_transition(track, Transition { at, kind, dur, from_black: true })
+    }
+
+    /// The one body of the two `add_transition` ops: replace whatever sits at `x.at`, keep `at` order, validate.
+    fn put_transition(&self, track: usize, x: Transition) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         let tr = tl.tracks.get_mut(track).ok_or(EditError::NoTrack)?;
-        tr.transitions.retain(|x| x.at != at);
-        tr.transitions.push(Transition { at, kind, dur });
-        tr.transitions.sort_by_key(|x| x.at);
+        tr.transitions.retain(|y| y.at != x.at);
+        tr.transitions.push(x);
+        tr.transitions.sort_by_key(|y| y.at);
         tl.validate()?;
         Ok(tl)
+    }
+
+    /// NLE3b: the video transition whose audio crossfade sits on the cut before clip `ci` of audio track `track`.
+    /// THE PAIRING RULE: the audio clip `ci` and the one before it butt at a cut `at` where some video track carries a
+    /// (not from-black) transition whose incoming clip has the same source and starts at `at`, and whose outgoing clip
+    /// has the same source as the audio's outgoing and ends at `at`. `None`: a plain audio cut.
+    pub fn audio_crossfade(&self, track: usize, ci: usize) -> Option<Transition> {
+        let t = self.tracks.get(track)?;
+        if t.kind != Kind::Audio {
+            return None;
+        }
+        self.crossfade_of(&t.clips, ci)
+    }
+
+    fn crossfade_of(&self, clips: &[Clip], ci: usize) -> Option<Transition> {
+        let (o, i) = (clips.get(ci.checked_sub(1)?)?, clips.get(ci)?);
+        if o.end() != i.at {
+            return None;
+        }
+        self.tracks.iter().filter(|v| v.kind == Kind::Video).find_map(|v| {
+            let x = v.transitions.iter().find(|x| x.at == i.at && !x.from_black)?;
+            let inc = v.clips.iter().any(|c| c.at == i.at && c.src == i.src);
+            let out = v.clips.iter().any(|c| c.end() == i.at && c.src == o.src);
+            (inc && out).then_some(*x)
+        })
     }
 
     /// NLE3: take the transition off the cut at tick `at` of `track` (the cut is a plain cut again).

@@ -26,7 +26,7 @@
 //! `HH:MM:SS:FF`; absent = none). One with no event above it (or under a `BL` event) is a syntax error.
 //!
 //! Refused, each by name: `FCM: DROP FRAME` or a `;` timecode (drop-frame), any other FCM, a transition other than
-//! `C`, `D` or `W001`/`W002` (or one not shaped as below), an unknown channel, a record span unequal to its source span,
+//! `C`, `D` or `W001`/`W002`/`W041`/`W101`/`W201` (or one not shaped as below), an unknown channel, a record span unequal to its source span,
 //! a malformed timecode, and any line that is none of the above. Tracks come back canonical: V1..Vn, then A1..An.
 //!
 //! Transitions (NLE3, LEDGER SR202) are CMX 3600 two-line events with one event number: the outgoing line (its reel,
@@ -36,6 +36,16 @@
 //! ```text
 //! 002  A        V     C        00:00:00:20 00:00:00:20 00:00:00:20 00:00:00:20
 //! 002  B        V     D    009 00:00:00:00 00:00:00:20 00:00:00:20 00:00:01:15
+//! ```
+//!
+//! NLE3c (LEDGER SR209): wipe codes `W041` (diagonal), `W101` (box) and `W201` (clock) read and write too, and the
+//! outgoing line may be reel `BL` (source in = out = `00:00:00:00`): a transition FROM black
+//! ([`crate::Transition::from_black`]). A zero-length `BL` line with no `D` / `W` line after it is a gap. `BL` as the
+//! incoming line (a transition TO black) is still refused.
+//!
+//! ```text
+//! 001  BL       V     C        00:00:00:00 00:00:00:00 00:00:00:00 00:00:00:00
+//! 001  A        V     D    010 00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20
 //! ```
 //!
 //! [`write`] produces exactly what [`parse`] reads back: `write(parse(write(tl)))` is byte-identical.
@@ -52,7 +62,7 @@ pub enum EdlError {
     DropFrame { line: usize },
     /// An FCM other than `NON-DROP FRAME`.
     Fcm { line: usize },
-    /// A transition other than `C`, `D`, `W001`, `W002`, a `D`/`W` line without its outgoing line, or (write: line 0)
+    /// A transition other than `C`, `D`, `W001`, `W002`, `W041`, `W101`, `W201`, a `D`/`W` line without its outgoing line, or (write: line 0)
     /// a duration past 999 frames.
     Transition { line: usize },
     /// An unknown channel (parse), or a track past V9 / A9 (write: line 0).
@@ -76,7 +86,7 @@ impl core::fmt::Display for EdlError {
         match self {
             EdlError::DropFrame { line } => write!(f, "line {line}: drop-frame timecode is not supported (non-drop frame only)"),
             EdlError::Fcm { line } => write!(f, "line {line}: unknown FCM (only NON-DROP FRAME)"),
-            EdlError::Transition { line } => write!(f, "line {line}: transition is not a cut, a dissolve or a W001/W002 wipe event"),
+            EdlError::Transition { line } => write!(f, "line {line}: transition is not a cut, a dissolve or a W001/W002/W041/W101/W201 wipe event"),
             EdlError::Channel { line } => write!(f, "line {line}: unknown channel"),
             EdlError::Timecode { line } => write!(f, "line {line}: bad timecode"),
             EdlError::Duration { line } => write!(f, "line {line}: record span differs from source span"),
@@ -199,7 +209,8 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             let dur = edl_frames(w[4]).ok_or(EdlError::Transition { line })?;
             match from.take() {
                 Some((n, k, c, reel, o)) if n == w[0] && (k, c) == (kind, num) && o.at == clip.at && w[1] != "BL" => {
-                    trans.push((kind, num, Transition { at: clip.at, kind: tk, dur }, reel, o.src_in, line));
+                    let x = Transition { at: clip.at, kind: tk, dur, from_black: reel == "BL" };
+                    trans.push((kind, num, x, reel, o.src_in, line));
                 }
                 _ => return Err(EdlError::Transition { line }),
             }
@@ -207,10 +218,10 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             cur = Some(events.len() - 1);
             continue;
         }
-        if let Some((_, k, c, reel, o)) = from.take() {
+        if let Some((_, k, c, reel, o)) = from.take().filter(|f| f.3 != "BL") {
             events.push((reel, k, c, o)); // not followed by its D/W line: an empty clip, refused by validate
         }
-        if w[1] == "BL" {
+        if w[1] == "BL" && clip.src_in != clip.src_out {
             cur = None;
             continue;
         }
@@ -222,7 +233,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
         events.push((w[1], kind, num, clip));
         cur = Some(events.len() - 1);
     }
-    if let Some((_, k, c, reel, o)) = from.take() {
+    if let Some((_, k, c, reel, o)) = from.take().filter(|f| f.3 != "BL") {
         events.push((reel, k, c, o));
     }
     // Reels cited without a SOURCE line: their length is the furthest out point that cites them.
@@ -255,6 +266,12 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
     // NLE3: the clip ending at each transition's cut is the one its outgoing line names.
     for (kind, num, x, reel, out_point, line) in trans {
         let ti = if kind == Kind::Video { num - 1 } else { nv + num - 1 };
+        if x.from_black {
+            // NLE3c: no outgoing clip to name; validate checks the incoming clip and that nothing ends at the cut.
+            tl.tracks[ti].transitions.push(x);
+            tl.tracks[ti].transitions.sort_by_key(|x| x.at);
+            continue;
+        }
         let rid = tl.source_by_reel(reel).map(|s| s.id).ok_or(EdlError::Transition { line })?;
         let t = &mut tl.tracks[ti];
         if !t.clips.iter().any(|c| c.end() == x.at && c.src == rid && c.src_out == out_point) {
@@ -294,9 +311,13 @@ fn transition_lines(tl: &Timeline, ti: usize, c: &Clip, num: usize, ch: &str, fp
     if x.dur > 999 {
         return Err(EdlError::Transition { line: 0 });
     }
-    let o = t.clips.iter().find(|o| o.end() == x.at).ok_or(EdlError::Edit(EditError::Transition))?;
-    let reel = &tl.source(o.src).ok_or(EdlError::Edit(EditError::NoSource))?.reel;
-    let (p, r) = (timecode(o.src_out, fps), timecode(x.at, fps));
+    let (reel, p) = if x.from_black {
+        (String::from("BL"), timecode(0, fps))
+    } else {
+        let o = t.clips.iter().find(|o| o.end() == x.at).ok_or(EdlError::Edit(EditError::Transition))?;
+        (tl.source(o.src).ok_or(EdlError::Edit(EditError::NoSource))?.reel.clone(), timecode(o.src_out, fps))
+    };
+    let r = timecode(x.at, fps);
     let out = format!("{:03}  {:<8} {:<5} {:<8} {p} {p} {r} {r}\n", num, reel, ch, "C");
     let code = match x.kind {
         TransitionKind::Dissolve => format!("D    {:03}", x.dur),

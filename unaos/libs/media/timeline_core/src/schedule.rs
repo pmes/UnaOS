@@ -22,7 +22,16 @@
 //! the OUTGOING source at its handle tick (`src_out + k`, `k = t - at`), with its own seek (none when it continues the
 //! previous step's source position: the outgoing run decodes on past its out point), and the incoming's weight
 //! `t = (k + 1) / (dur + 1)` (never 0 or 1). The step's own `src` / `src_t` / `seek` stay the incoming clip's, which
-//! seeks at the cut as a plain cut does.
+//! seeks at the cut as a plain cut does. NLE3c (SR209): a transition from black names no outgoing source
+//! (`VideoMix::src` `None`: opaque black, no seek).
+//!
+//! Audio crossfades (NLE3b, LEDGER SR209): on an audio cut paired with a video transition
+//! ([`crate::Timeline::audio_crossfade`]) a run breaks at `at` and `at + dur`, and inside that span the track gives TWO
+//! layers in this order: the UNDER layer (the outgoing source at its handle `src_out + (t - at)`, its gain, the falling
+//! ramp `ENV_ONE - r`, zero throughout if the outgoing clip faded out) and the incoming clip's own layer (its envelope
+//! `min(fade, r)`), `r = (t - at) * ENV_ONE / dur` at each run edge: LINEAR, the two weights summing to `ENV_ONE`. The
+//! under layer has its own continuity: it seeks at the span's first run and continues after. (Exact except where an
+//! incoming fade-out reaches into the span: interpolated linearly between run edges.)
 
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -59,8 +68,8 @@ pub struct Frac {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoMix {
     pub kind: TransitionKind,
-    /// The OUTGOING clip's source.
-    pub src: SourceId,
+    /// The OUTGOING clip's source (`None`: black, a transition from `BL`).
+    pub src: Option<SourceId>,
     /// Its source tick (in its handle: `src_out + k`).
     pub src_t: i64,
     /// Seek here before decoding it (`None`: its run continues).
@@ -195,21 +204,26 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
     if tracks.is_empty() {
         return Ok(Vec::new());
     }
-    // What each audio track shows at `t`: (clip index, envelope segment 0 fade-in / 1 body / 2 fade-out).
-    let key = |t: i64| -> Vec<Option<(usize, u8)>> {
+    // NLE3b: the crossfade on clip `ci` of track `ti` covering tick `t`, if any.
+    let xfade = |ti: usize, ci: usize, t: i64| tl.audio_crossfade(ti, ci).filter(|x| t < x.at + x.dur);
+    // What each audio track shows at `t`: (clip index, envelope segment 0 fade-in / 1 body / 2 fade-out, in a
+    // crossfade).
+    let key = |t: i64| -> Vec<Option<(usize, u8, bool)>> {
         tracks
             .iter()
             .map(|&ti| {
                 tl.clip_at(ti, t).map(|ci| {
                     let c = &tl.tracks[ti].clips[ci];
                     let seg = if t < c.at + c.fade_in { 0 } else if t >= c.end() - c.fade_out { 2 } else { 1 };
-                    (ci, seg)
+                    (ci, seg, xfade(ti, ci, t).is_some())
                 })
             })
             .collect()
     };
     // Per track: (source, the source tick its previous layer would continue at).
     let mut next: Vec<Option<(SourceId, i64)>> = alloc::vec![None; tl.tracks.len()];
+    // NLE3b: the same for each track's UNDER layer (the outgoing's handle inside a crossfade).
+    let mut xnext: Vec<Option<(SourceId, i64)>> = alloc::vec![None; tl.tracks.len()];
     let mut out = Vec::new();
     let mut t = range.start;
     while t < range.end {
@@ -221,14 +235,24 @@ pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Re
         let mut layers = Vec::new();
         for (k, &ti) in tracks.iter().enumerate() {
             match here[k] {
-                Some((ci, _)) => {
+                Some((ci, _, _)) => {
                     let c = tl.tracks[ti].clips[ci];
+                    let mut env = [env_q16(&c, t), env_q16(&c, end)];
+                    match xfade(ti, ci, t) {
+                        Some(x) => {
+                            let o = tl.tracks[ti].clips[ci - 1];
+                            let under = under_layer(tl, idx, ti, &o, &x, t, end, &mut xnext[ti])?;
+                            layers.push(under);
+                            env = [env[0].min(ramp_q16(&x, t)), env[1].min(ramp_q16(&x, end))];
+                        }
+                        None => xnext[ti] = None,
+                    }
                     let src_t = c.src_in + (t - c.at);
                     let seek = seek_for(tl, idx, Kind::Audio, c.src, src_t, next[ti])?;
                     next[ti] = Some((c.src, src_t + (end - t)));
-                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: c.gain_cdb, env: [env_q16(&c, t), env_q16(&c, end)] });
+                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: c.gain_cdb, env });
                 }
-                None => next[ti] = None,
+                None => (next[ti], xnext[ti]) = (None, None),
             }
         }
         out.push(AudioRun { out_t: t, len: end - t, layers });
@@ -282,19 +306,24 @@ fn vmix_for(
         *m_next = None;
         return Ok(None);
     };
+    let k = t - c.at;
+    let w = Frac { num: k + 1, den: x.dur + 1 };
+    if x.from_black {
+        *m_next = None;
+        return Ok(Some(VideoMix { kind: x.kind, src: None, src_t: 0, seek: None, t: w }));
+    }
     // validate: the outgoing clip ends at the cut, so it is the clip before (clips are ordered and never overlap).
     let o = tr.clips[ci - 1];
-    let k = t - c.at;
     let src_t = o.src_out + k;
     let seek = seek_for(tl, idx, Kind::Video, o.src, src_t, if k == 0 { v_next } else { *m_next })?;
     *m_next = Some((o.src, src_t + 1));
-    Ok(Some(VideoMix { kind: x.kind, src: o.src, src_t, seek, t: Frac { num: k + 1, den: x.dur + 1 } }))
+    Ok(Some(VideoMix { kind: x.kind, src: Some(o.src), src_t, seek, t: w }))
 }
 
 /// NLE3: every transition's outgoing handle lies inside what the index says the source holds.
 fn handles_fit(tl: &Timeline, idx: &dyn SourceIndex) -> Result<(), ScheduleError> {
     for tr in &tl.tracks {
-        for x in &tr.transitions {
+        for x in tr.transitions.iter().filter(|x| !x.from_black) {
             if let Some(o) = tr.clips.iter().find(|c| c.end() == x.at) {
                 if idx.duration(o.src).is_some_and(|d| o.src_out + x.dur > d) {
                     return Err(ScheduleError::OutOfSource(o.src));
@@ -303,4 +332,30 @@ fn handles_fit(tl: &Timeline, idx: &dyn SourceIndex) -> Result<(), ScheduleError
         }
     }
     Ok(())
+}
+
+/// NLE3b: a crossfade's rising weight at timeline edge `t`, Q16: 0 at the cut, [`ENV_ONE`] at `at + dur`.
+fn ramp_q16(x: &crate::Transition, t: i64) -> u32 {
+    ((t - x.at).clamp(0, x.dur) * ENV_ONE as i64 / x.dur.max(1)) as u32
+}
+
+/// NLE3b: the UNDER layer of run `t..end` on track `ti`: the outgoing clip `o`'s source at its handle, its gain, the
+/// falling ramp (scaled by the outgoing's own envelope at its end: 0 when it faded out). Its continuity is `xnext`.
+#[allow(clippy::too_many_arguments)]
+fn under_layer(
+    tl: &Timeline,
+    idx: &dyn SourceIndex,
+    ti: usize,
+    o: &crate::Clip,
+    x: &crate::Transition,
+    t: i64,
+    end: i64,
+    xnext: &mut Option<(SourceId, i64)>,
+) -> Result<Layer, ScheduleError> {
+    let src_t = o.src_out + (t - x.at);
+    let seek = seek_for(tl, idx, Kind::Audio, o.src, src_t, *xnext)?;
+    *xnext = Some((o.src, src_t + (end - t)));
+    let tail = env_q16(o, o.end()) as i64;
+    let fall = |e: i64| ((ENV_ONE as i64 - ramp_q16(x, e) as i64) * tail / ENV_ONE as i64) as u32;
+    Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: o.gain_cdb, env: [fall(t), fall(end)] })
 }
