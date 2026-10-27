@@ -373,7 +373,7 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
         checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
             && crate::smolnet::lease_of(&bad).is_none()));
     }
-    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); active_rows(&mut checks); bg_rows(&mut checks); let mut pass = 0u8; // STATIONROAM-BGSCAN (B955): `bgplan`, `bggate` after `idleuni`; STATIONROAM-ACTIVE (B951): `probe`, `idleuni` after `idlegate`; STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
+    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); active_rows(&mut checks); bg_rows(&mut checks); sweep_rows(&mut checks); let mut pass = 0u8; // STATIONROAM-SWEEP (B958): `lostplan`, `country` after `bggate`; STATIONROAM-BGSCAN (B955): `bgplan`, `bggate` after `idleuni`; STATIONROAM-ACTIVE (B951): `probe`, `idleuni` after `idlegate`; STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
     let mut first = None;
     for (name, ok) in checks.iter() {
         if *ok {
@@ -946,7 +946,7 @@ pub struct BssTable {
     next_ms: u64,
     /// STATIONROAM-XCHAN (B898): the idle gate — the (rx_data, posted) counters last sampled and when they last moved.
     act: Option<(u32, u32)>,
-    act_ms: u64,
+    act_ms: u64, pub country: Option<wifi_core::ieee80211::Country>, // STATIONROAM-SWEEP (B958): the home BSS's Country element (802.11d), `join::note`; COUNTRYCOVER reads it
 }
 
 impl BssTable {
@@ -1327,4 +1327,95 @@ fn bg_rows(checks: &mut Vec<(&'static str, bool)>) {
     let base = wifi_core::ieee80211::build_null_data(STA, BSSID, 0);
     q &= on[1] == 0x11 && on[0] == base[0] && on[2..] == base[2..] && off == base;
     checks.push(("bggate", q));
+}
+
+// ── STATIONROAM-SWEEP (rmbp-ledger B958): the lost station's wide sweep and the 802.11d passive rule — PURE, read by `join::sweep` ──
+
+/// The lost plan's order: the grid first (`ROAM_GRID`), then the rest of 1..=13 ascending. Channels above `ROAM_CH_MAX` are not
+/// planned: 13 stays refused by `htphyinit::switch_channel` (the PMU spur-avoid step on ChipCommon, outside the mapped BAR0 extent;
+/// STATIONROAM-PMU owed), so a lost plan holds 11 channels (1..=12 without the home channel).
+pub const ROAM_LOST_ORDER: [u8; 13] = [1, 6, 11, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13];
+/// The channels a sweep never probes unless COUNTRYCOVER allows (passive in FCC domains): 12 and 13, as bits.
+pub const ROAM_PASSIVE: u16 = (1 << 12) | (1 << 13);
+
+/// COUNTRYCOVER: `true` = the dwell on `ch` may send its probe request. A channel of `ROAM_PASSIVE` is probed only when the home AP's
+/// Country element (802.11d, `wifi_core::ieee80211::country_ie`) lists it in a subband triplet (an ETSI AP lists 1-13, an FCC one 1-11);
+/// no element = passive. Every other channel is always active.
+pub fn passive_ok(ch: u8, country: Option<&wifi_core::ieee80211::Country>) -> bool {
+    if ch >= 16 || ROAM_PASSIVE & (1u16 << ch) == 0 {
+        return true;
+    }
+    country.map_or(false, |c| c.chans & (1u16 << ch) != 0)
+}
+
+/// The lost station's plan: `ROAM_LOST_ORDER` without `home` and without channels above `ROAM_CH_MAX` — `(channels, count, passive)`,
+/// `passive` bit c set where `passive_ok` refuses the probe.
+pub fn dwell_plan_lost(home: u8, country: Option<&wifi_core::ieee80211::Country>) -> ([u8; 13], usize, u16) {
+    let (mut out, mut n, mut passive) = ([0u8; 13], 0usize, 0u16);
+    for c in ROAM_LOST_ORDER.iter() {
+        if *c == home || *c > ROAM_CH_MAX {
+            continue;
+        }
+        out[n] = *c;
+        n += 1;
+        if !passive_ok(*c, country) {
+            passive |= 1u16 << *c;
+        }
+    }
+    (out, n, passive)
+}
+
+/// `join::sweep`'s ONE plan: lost = `dwell_plan_lost`; otherwise exactly `dwell_plan(home)` (the idle sweep's grid), every dwell active.
+pub fn sweep_plan(home: u8, lost: bool, country: Option<&wifi_core::ieee80211::Country>) -> ([u8; 13], usize, u16) {
+    if lost {
+        return dwell_plan_lost(home, country);
+    }
+    let (plan, n) = dwell_plan(home);
+    let mut out = [0u8; 13];
+    out[..3].copy_from_slice(&plan);
+    (out, n, 0)
+}
+
+/// `kat`'s rows after B955's (STATIONROAM-SWEEP rmbp-ledger B958). `lostplan`: lost plan(11) = 1,6,2,3,4,5,7,8,9,10,12 (11 channels:
+/// home excluded, 13 absent while ROAM_CH_MAX is 12) with 12 passive; plan(1) starts 6,11,2; a country covering 1-13 clears the
+/// passive mask; the idle plan(11) is the grid's 1,6 with no passive dwell; 11 dwells x ROAM_DWELL_MS = 1210 ms. `country`: a beacon
+/// announcing "DE " (1, 13, 20) covers 1..13 and allows a probe on 12 and 13; "US " (1, 11, 30) covers 1..11, refuses 12, allows 6; an
+/// operating-extension triplet (201, ..) is skipped; a pad octet is accepted; a truncated element (string + 2 octets) and a probe
+/// request read `None`; no element reads `None` and 12 stays passive.
+fn sweep_rows(checks: &mut Vec<(&'static str, bool)>) {
+    use wifi_core::ieee80211::{country_ie, Country};
+    let de = Country { cc: *b"DE ", chans: 0x3FFE };
+    let (p, n, m) = dwell_plan_lost(11, None);
+    let mut ok = p == [1, 6, 2, 3, 4, 5, 7, 8, 9, 10, 12, 0, 0] && n == 11 && m == 1 << 12;
+    let (p1, n1, _) = dwell_plan_lost(1, None);
+    ok &= p1[..3] == [6, 11, 2] && n1 == 11;
+    ok &= dwell_plan_lost(11, Some(&de)).2 == 0;
+    ok &= sweep_plan(11, false, None) == ([1, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 2, 0);
+    ok &= sweep_plan(11, true, None) == (p, n, m);
+    ok &= n as u64 * ROAM_DWELL_MS == 1210;
+    checks.push(("lostplan", ok));
+
+    let frame = |ies: &[u8]| -> Vec<u8> {
+        let mut f = alloc::vec![0x80, 0x00, 0x00, 0x00];
+        f.extend_from_slice(&[0xFF; 6]);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&[0u8; 2 + 12]);
+        f.extend_from_slice(&[0, 4, b'U', b'n', b'a', b'N']);
+        f.extend_from_slice(ies);
+        f
+    };
+    let d = country_ie(&frame(&[7, 6, b'D', b'E', b' ', 1, 13, 20]));
+    let mut c = d == Some(de) && passive_ok(12, d.as_ref()) && passive_ok(13, d.as_ref());
+    let u = country_ie(&frame(&[7, 6, b'U', b'S', b' ', 1, 11, 30]));
+    c &= u.map_or(false, |x| x.chans == 0x0FFE) && !passive_ok(12, u.as_ref()) && passive_ok(6, u.as_ref());
+    c &= country_ie(&frame(&[7, 9, b'D', b'E', b' ', 201, 1, 0, 1, 13, 20])) == Some(de);
+    c &= country_ie(&frame(&[7, 7, b'D', b'E', b' ', 1, 13, 20, 0])) == Some(de);
+    c &= country_ie(&frame(&[7, 5, b'D', b'E', b' ', 1, 13])).is_none();
+    let mut req = frame(&[7, 6, b'D', b'E', b' ', 1, 13, 20]);
+    req[0] = 0x40;
+    c &= country_ie(&req).is_none();
+    let none = country_ie(&frame(&[]));
+    c &= none.is_none() && !passive_ok(12, none.as_ref());
+    checks.push(("country", c));
 }
