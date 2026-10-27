@@ -198,7 +198,7 @@ pub(super) fn suspend(bar0: u64, w: &mut Writes, tag: &str) -> bool {
 /// channel number alone). Returns the pre-image.
 pub(super) fn chan_cookie(bar0: u64, ch: u16, w: &mut Writes) -> u16 {
     let pre = shm_r16(bar0, SHM_SH_CHAN, w);
-    shm_w16(bar0, SHM_SH_CHAN, ch, w);
+    shm_w16(bar0, SHM_SH_CHAN, ch | if ch > 14 { 0x0100 } else { 0 }, w); // STATIONROAM-5G (B962, the seat's grant): B43_SHM_SH_CHAN_5GHZ, phy_common.c:425-427, b43.h:256; the ucode ORs 0x100 into a 5 GHz frame's chan_radio_code, xmit.c:365-367
     pre
 }
 

@@ -399,7 +399,9 @@ pub(super) struct Tune {
 
 /// `phy_common.c:416-441` (`b43_switch_channel`: the SHM cookie first, then the PHY op, then 8 ms)
 /// + `phy_ht.c:807-835` + `:35-77` (radio) + `:763-805` (PHY). The SHM cookie is the caller's (it owns
-/// the SHM path); this is the hardware half. 2.4 GHz only (`phy_ht.c:1064-1069`).
+/// the SHM path); this is the hardware half. STATIONROAM-5G (B962): a 5 GHz channel (`ch > 14`) takes b43's 5G arm of
+/// `b43_phy_ht_channel_setup` (`phy_ht.c:767-775`: BANDCTL to 2 GHz for the B-PHY write, the B-PHY held IN reset, BANDCTL |= 5GHZ;
+/// HT_TEST untouched, `:795`) — an arm b43 itself never runs (`phy_ht.c:1064-1069`, `main.c:5427-5435`).
 fn tune(h: &mut Ht, ch: u16, e: &ChanR2059) -> Tune {
     let before = h.c.radio_data + h.c.phy_data + h.c.core_regs;
     // ── b43_radio_2059_channel_setup, phy_ht.c:35-77 ──
@@ -422,15 +424,15 @@ fn tune(h: &mut Ht, ch: u16, e: &ChanR2059) -> Tune {
     // b43_phy_ht_bphy_reset(false), phy_ht.c:311-329
     let hdr = h.mmio_r16(PSM_PHY_HDR);
     h.mmio_w16(PSM_PHY_HDR, hdr | PSM_HDR_MAC_PHY_FORCE_CLK);
-    h.phy_mask(HT_B_BBCFG, 0xFFFF & !HT_B_BBCFG_RSTCCA_RSTRX);
-    h.mmio_w16(PSM_PHY_HDR, hdr);
+    if ch > 14 { h.phy_set(HT_B_BBCFG, HT_B_BBCFG_RSTCCA_RSTRX) } else { h.phy_mask(HT_B_BBCFG, 0xFFFF & !HT_B_BBCFG_RSTCCA_RSTRX) } // STATIONROAM-5G (B962): phy_ht.c:771 bphy_reset(true) on 5 GHz
+    h.mmio_w16(PSM_PHY_HDR, hdr); if ch > 14 { h.phy_set(HT_BANDCTL, HT_BANDCTL_5GHZ); } // STATIONROAM-5G (B962): phy_ht.c:774 — switch to 5 GHz
     let bw = [e.phy.bw1, e.phy.bw2, e.phy.bw3, e.phy.bw4, e.phy.bw5, e.phy.bw6];
     for (reg, v) in HT_BW.iter().zip(bw.iter()) {
         h.phy_w(*reg, *v);
     }
     // phy_ht.c:789-797 — not channel 14: OFDM on; 2.4 GHz: HT_TEST bits 0x840 off.
     classifier(h, HT_CLASS_CTL_OFDM_EN, HT_CLASS_CTL_OFDM_EN);
-    h.phy_mask(HT_TEST, !0x840);
+    if ch <= 14 { h.phy_mask(HT_TEST, !0x840); } // STATIONROAM-5G (B962): phy_ht.c:795 — 2.4 GHz only
     tx_power_fix(h); // phy_ht.c:799-800
     // b43_phy_ht_spur_avoid, phy_ht.c:733-761 — channel 11: spuravoid=0 (:740-741). The PLL/PMU steps
     // (:742-748, :752 -> main.c:1204-1218) are ChipCommon/BCMA, outside the d11 window: skipped.
@@ -463,7 +465,7 @@ fn tune(h: &mut Ht, ch: u16, e: &ChanR2059) -> Tune {
 
 /// `phy_ht.c:869-1007` — `b43_phy_ht_op_init`, the receive subset (the TX-only tail named in the
 /// header is not run). Returns the RST2RX verdict.
-fn op_init(h: &mut Ht) -> bool {
+fn op_init(h: &mut Ht, five: bool) -> bool {
     // phy_ht.c:881 -> tables_phy_ht.c:794-823, the 24 regions in b43's order.
     for t in B43_PHY_HT_TABLES_INIT.iter() {
         h.tab_region(t);
@@ -491,7 +493,7 @@ fn op_init(h: &mut Ht) -> bool {
     h.phy_w(extg(0x14f), 0xc8);
     h.phy_w(0x70, 0x50);
     h.phy_w(0x1ff, 0x30);
-    classifier(h, HT_CLASS_CTL_CCK_EN, HT_CLASS_CTL_CCK_EN); // :906-907 (2.4 GHz)
+    classifier(h, HT_CLASS_CTL_CCK_EN, if five { 0 } else { HT_CLASS_CTL_CCK_EN }); // :906-907 (2.4 GHz); STATIONROAM-5G (B962): :903-904, CCK off on 5 GHz
     h.phy_set(0xb1, 0x91); // :909-915
     h.phy_w(0x32f, 0x0003);
     h.phy_w(0x077, 0x0010);
@@ -561,7 +563,7 @@ fn op_init(h: &mut Ht) -> bool {
     }
     classifier(h, 0, 0); // :989
     let clip = [h.phy_r(HT_CLIP1THRES[0]), h.phy_r(HT_CLIP1THRES[1]), h.phy_r(HT_CLIP1THRES[2])]; // :990, :286-291
-    // bphy_init, phy_ht.c:293-309 (2.4 GHz, :992-993)
+    if !five { // bphy_init, phy_ht.c:293-309 (2.4 GHz, :992-993); STATIONROAM-5G (B962): not on 5 GHz
     let mut val: u16 = 0x1E1F;
     for i in 0..16u16 {
         h.phy_w(bmode(0x88 + i), val);
@@ -572,7 +574,7 @@ fn op_init(h: &mut Ht) -> bool {
         h.phy_w(bmode(0x98 + i), val);
         val = val.wrapping_sub(0x202);
     }
-    h.phy_w(bmode(0x38), 0x668);
+    h.phy_w(bmode(0x38), 0x668); }
     h.tab_region(&B43_HTTAB_1A_C0_LATE); // :995-996
     tx_power_fix(h); // :999
     // tx_power_ctl(false), phy_ht.c:533-554 (the saved indices are TX-only state, not kept)
@@ -623,7 +625,7 @@ pub(super) struct Verdict {
 /// wrapper (checked live by `live::handle`).
 pub(super) fn run(bar0: u64, phy_rev: u16, ch: u16, chan_cookie: &mut dyn FnMut(u16)) -> Verdict {
     let mut h = Ht::new(bar0);
-    let freq = 2407 + 5 * ch; // 2.4 GHz channels 1..13
+    let freq = wifi_core::ieee80211::chan_freq(ch as u8).unwrap_or(0); // 2.4 GHz channels 1..13; STATIONROAM-5G (B962): and b43's 5 GHz rows
     let Some(e) = chan_entry(freq) else {
         serial_println!(":: wifi9: htphy-reinit REFUSED reason=no-channel-row ch={} freq={} — radio_2059.c:338-351 finds no row ::", ch, freq);
         return Verdict { ok: false, match_: 0, elems: 0, tune: None, c: h.c };
@@ -634,7 +636,7 @@ pub(super) fn run(bar0: u64, phy_rev: u16, ch: u16, chan_cookie: &mut dyn FnMut(
     chan_cookie(ch);
     let _first = tune(&mut h, ch, e);
     // ops->init (phy_common.c:100).
-    let rst2rx = op_init(&mut h);
+    let rst2rx = op_init(&mut h, ch > 14);
     // b43_switch_channel(phy->channel) (phy_common.c:107).
     chan_cookie(ch);
     let t = tune(&mut h, ch, e);
@@ -1054,11 +1056,87 @@ pub(super) fn tx_pwr_ctl(h: &mut Ht, p: &[PwrIn; 3]) -> TxPctl {
 /// (`tune` sleeps), the d11 owned (the Station taken out of `STATION`).
 #[cfg(feature = "wifi10")]
 pub(super) fn switch_channel(bar0: u64, ch: u16) -> Result<Tune, &'static str> {
-    if !(1..=12).contains(&ch) {
-        return Err("spuravoid");
-    }
-    let Some(e) = chan_entry(2407 + 5 * ch) else { return Err("no-channel-row") };
+    admit(ch)?; // STATIONROAM-5G (B962): 1..=12 or a 5 GHz row; 13/14 spuravoid
+    let Some(e) = chan_entry(wifi_core::ieee80211::chan_freq(ch as u8).unwrap_or(0)) else { return Err("no-channel-row") };
     let mut h = Ht::new(bar0);
     Ok(tune(&mut h, ch, e))
+}
+
+// ── STATIONROAM-5G (rmbp-ledger B962): the 5 GHz rows admitted, and the band switch as b43's PHY re-init ──────────────────────────
+
+/// `switch_channel`'s and `band_switch`'s admit rule, BEFORE any write: channels 1..=12 (13/14 take spuravoid=1, `phy_ht.c:740-741`,
+/// STATIONROAM-PMU owed) and every 5 GHz channel b43's 2059 table carries (`radio_2059.c:58-316`: 36..64, 100..140, 149..165); else
+/// `no-channel-row`. A DFS row is admitted (the PHY may listen there); `tx::dfs_refused` refuses its TX by name.
+#[cfg(feature = "wifi10")]
+fn admit(ch: u16) -> Result<(), &'static str> {
+    if ch == 13 || ch == 14 {
+        return Err("spuravoid");
+    }
+    let ok = (1..=12).contains(&ch) || (ch <= 255 && wifi_core::ieee80211::is_5g(ch as u8) && wifi_core::ieee80211::chan_freq(ch as u8).and_then(chan_entry).is_some());
+    if ok { Ok(()) } else { Err("no-channel-row") }
+}
+
+/// `b43.h:496`, `:506` — the wrapper IOCTL's PHY clock enable and G-mode bits (PHY_RESET and FGC are `super`'s).
+#[cfg(feature = "wifi10")]
+const IOCTL_PHY_CLKEN: u32 = 0x0000_0004;
+#[cfg(feature = "wifi10")]
+const IOCTL_GMODE: u32 = 0x0000_2000;
+
+/// `b43_phy_put_into_reset` (`phy_common.c:336-350`: GMODE cleared, PHY_RESET | FGC, 1 us; FGC off, 1 us), the band's GMODE
+/// (`main.c:3927-3934`: set for 2.4 GHz, clear for 5 GHz), `b43_phy_take_out_of_reset` (`phy_common.c:378-391`: PHY_RESET and PHY_CLKEN
+/// off with FGC, 1 us; FGC off, PHY_CLKEN on, 1 us). Returns the IOCTL word (before, after).
+#[cfg(feature = "wifi10")]
+fn ioctl_band(bar0: u64, five: bool) -> (u32, u32) {
+    let at = BAR0_WRAP_OFF + WRAP_IOCTL;
+    let pre = unsafe { r32(bar0, at) };
+    let mut v = (pre & !IOCTL_GMODE) | super::IOCTL_PHY_RESET | IOCTL_FGC;
+    unsafe { w32(bar0, at, v) };
+    let _ = settle(1);
+    v = unsafe { r32(bar0, at) } & !IOCTL_FGC;
+    unsafe { w32(bar0, at, v) };
+    let _ = settle(1);
+    v = unsafe { r32(bar0, at) };
+    v = if five { v & !IOCTL_GMODE } else { v | IOCTL_GMODE };
+    unsafe { w32(bar0, at, v) };
+    v = (unsafe { r32(bar0, at) } & !super::IOCTL_PHY_RESET & !IOCTL_PHY_CLKEN) | IOCTL_FGC;
+    unsafe { w32(bar0, at, v) };
+    let _ = settle(1);
+    v = (unsafe { r32(bar0, at) } & !IOCTL_FGC) | IOCTL_PHY_CLKEN;
+    unsafe { w32(bar0, at, v) };
+    let _ = settle(1);
+    (pre, unsafe { r32(bar0, at) })
+}
+
+/// What `band_switch` did: the re-init's second tune, its verdict, the IOCTL word (before, after), `tx_prep`'s RX2TX/RST2RX, and
+/// WIFI11's power control when a SPROM block was given.
+#[cfg(feature = "wifi10")]
+pub(super) struct BandSwitch {
+    pub tune: Option<Tune>,
+    pub reinit_ok: bool,
+    pub ioctl: (u32, u32),
+    pub tx_prep_ok: bool,
+    pub pctl: Option<TxPctl>,
+}
+
+/// `b43_switch_band` (`main.c:3885-3953`) on the PHY `run` initialised this boot, to `ch`'s band: the radio off (`phy_ht.c:1024-1026`,
+/// RF_CTL_CMD &= ~CHIP0_PU), `ioctl_band`, then `b43_phy_init` — THE SAME `run` the boot calls (analog on, the 2059 init, tune, op_init,
+/// tune; its band arms keyed on `ch`) — then the TX side `phy::once` ran at boot: `tx_prep` and, when `pin` is a SPROM block,
+/// `tx_pwr_ctl` from it. Refused (`admit`) before any write. Preconditions = `switch_channel`'s (the MAC suspended, no lock held: `run`
+/// sleeps, the d11 owned). Stated divergences: the band initvals (`main.c:3949`) are NOT re-applied — rev 29 has ONE band file for both
+/// bands (`main.c:2486`), applied at boot, and a PHY reset leaves the MAC's registers (STATIONROAM-5GBSIV owed); b43's 5 GHz arm of
+/// `tx_power_ctl` (`phy_ht.c:558-561`, 0x32 over the whole CMD_C1..C3, clearing the EN bits `:556` set) is NOT copied — the INIT field
+/// stays at the setup's 0x19 (STATIONROAM-5GPCTL owed). b43 never runs any of this on 5 GHz (`main.c:5427-5435`).
+#[cfg(feature = "wifi10")]
+pub(super) fn band_switch(bar0: u64, ch: u16, pin: Option<&[PwrIn; 3]>, cookie: &mut dyn FnMut(u16)) -> Result<BandSwitch, &'static str> {
+    admit(ch)?;
+    let mut h = Ht::new(bar0);
+    h.phy_mask(HT_RF_CTL_CMD, !HT_RF_CTL_CMD_CHIP0_PU);
+    let ioctl = ioctl_band(bar0, ch > 14);
+    let phy_rev = unsafe { r16(bar0, D11_PHY_VER) } & 0xF;
+    let v = run(bar0, phy_rev, ch, cookie);
+    let mut h = Ht::new(bar0);
+    let tp = tx_prep(&mut h);
+    let pctl = pin.map(|p| tx_pwr_ctl(&mut h, p));
+    Ok(BandSwitch { tune: v.tune, reinit_ok: v.ok, ioctl, tx_prep_ok: tp.rx2tx && tp.rst2rx, pctl })
 }
 
