@@ -32,8 +32,8 @@
 //!
 //! # The write: the USERS.DAT swap (fs/users.rs), through the mount table
 //!
-//! `preferences.toml.new` is written, READ BACK and PARSED (it must be the tree that was serialized), and
-//! only then does the old file go and the temp get renamed over it. A load that finds no
+//! The render is PARSED (it must be the tree that was serialized), then `<d>.new` is written and READ BACK byte-equal
+//! (`MountTable::put_file_atomic`), and only then does the old file go and the temp get renamed over it. A load that finds no
 //! `preferences.toml` but a parseable `.new` adopts it. The missing directories are created.
 //!
 //! # A refused file
@@ -487,30 +487,15 @@ pub fn save_domain(d: &str) -> Result<usize, String> {
     let text = prefs_core::files::render(d, &want, &now_iso(), &by, &doc_of);
     let n = want.len();
     let p = domain_path(d);
-    let tmp = alloc::format!("{}.new", p);
+    // Parse the render: it must BE the domain's tree. The swap's read-back then proves the file is these bytes (VFSPUTREST B969).
+    match PrefTree::parse(&text) {
+        Ok(t) if t == want || t.to_toml() == want.to_toml() => {} // re-emit equality covers a NaN value
+        _ => return Err(String::from("render does not parse to the tree")),
+    }
     ensure_dirs();
-    write_all(&tmp, text.as_bytes())?;
-    // Read back and parse: the temp must BE the domain's tree before the real file is touched.
-    let back = read_all(&tmp).ok_or_else(|| String::from("read-back failed"))?;
-    if back != text.as_bytes() {
-        return Err(String::from("read-back differs"));
-    }
-    match core::str::from_utf8(&back).ok().map(PrefTree::parse) {
-        Some(Ok(t)) if t == want || t.to_toml() == want.to_toml() => {} // re-emit equality covers a NaN value
-        _ => return Err(String::from("read-back does not parse to the tree")),
-    }
-    let mt = store_mt();
-    let k = crate::fs::vfs::KERNEL_PRINCIPAL;
-    let _ = mt.unlink(&p, k);
-    match mt.rename(&tmp, &p, k) {
-        Ok(()) => {}
-        Err(crate::fs::vfs::VfsError::Unsupported) => {
-            // A backend with no rename: write the real file directly (said), then drop the temp.
-            write_all(&p, text.as_bytes())?;
-            let _ = mt.unlink(&tmp, k);
-            serial_println!("[prefs] swap=direct (the volume has no rename)");
-        }
-        Err(e) => return Err(alloc::format!("rename: {:?}", e)),
+    // `<d>.new` written, read back byte-equal, then renamed over the domain file; a volume with no rename is written direct.
+    if !store_mt().put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).map_err(|e| alloc::format!("swap {}: {:?}", p, e))? {
+        serial_println!("[prefs] swap=direct (the volume has no rename)");
     }
     on_disk_add(d);
     SAVED_N.store(n as u32, Ordering::Relaxed);

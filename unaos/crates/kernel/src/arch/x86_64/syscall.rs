@@ -30887,7 +30887,7 @@ fn spawn_path_checked(path: &str, words: &[alloc::string::String], who: &str, ro
 // FAT/foreign `authorize_write` (the mounting principal or kernel). A refusal is `-EACCES` by the ACL's word. With
 // `selfdiag`, `sys_pathio` keeps both numbers exactly as before and this block is not dispatched.
 // TRUNC truncates an existing file IN PLACE (`MountTable::truncate`, native `truncate_data` keeps the inode) instead
-// of `selfdiag::put_file`'s unlink + create, which would drop the file's owner/grants rows and hand the file to any
+// of `MountTable::put_file`'s unlink + create, which would drop the file's owner/grants rows and hand the file to any
 // holder of a write grant. Wire: `[pathwrite] path=<p> principal=<who> flags=<f> off=<o> bytes=<n> -> ok=<n>` or
 // `… -> errno=<e>`.
 // =================================================================================================

@@ -950,7 +950,7 @@ refs/heads/exec-rmbp-kerneldisplayicc   81c1b985e FOLDED-BY-HAND (this commit) 2
 refs/heads/exec-rmbp-av1inbandswitch   91e6201a7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdf4outline   ce7c0db23 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle6keyslabels   10d60446d FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-vfsputrest   437062021 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-vfsputrest   52674abcf FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-windowaudit   3953fa024 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kernelscaleconvert   58de89b79 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aacencshort   d7486c8e3 FOLDED-BY-HAND (this commit) 2026-10-27

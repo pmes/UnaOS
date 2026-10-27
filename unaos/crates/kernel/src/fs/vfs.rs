@@ -4023,3 +4023,56 @@ impl MountTable {
         Ok(done)
     }
 }
+
+// VFSPUTREST (rmbp-ledger B969; handlers.md §5 NLE6's VFSPUT-ATOMIC): the ONE temp + read-back + swap over `put_file`; prefs
+// `save_domain`'s hand-spelled copy is retired onto it. No backend renames OVER a name (the trait, FAT and UnaFS all refuse an
+// existing target with `Backend("exists")`), so the swap is unlink + rename: the window between the two holds only
+// `<path>.new`, which a reader adopts (prefs `read_domain`). The VFS has no fsync: "on the medium" is each backend's own
+// per-op commit (UnaFS one CoW transaction per op). No lock is held across the steps: a caller serializes the writers of one
+// path (prefs holds `SAVE_LOCK`).
+impl MountTable {
+    /// `data` as the whole of `path` by the swap: `<path>.new` written through [`put_file`](Self::put_file) and read back
+    /// byte-equal, then the old file unlinked and the temp renamed over it. A failure before the old file goes unlinks the
+    /// temp and leaves `path` as it was; a rename failure after it leaves the temp (it is then the only copy). A volume with
+    /// no rename (`Unsupported`) gets `data` written to `path` directly and the temp dropped: `Ok(false)`; the swap is `Ok(true)`.
+    pub fn put_file_atomic(&self, path: &str, data: &[u8], principal: &str) -> Result<bool, VfsError> {
+        let tmp = alloc::format!("{}.new", path);
+        if let Err(e) = self.put_file(&tmp, data, principal).and_then(|_| self.read_back(&tmp, data)) {
+            let _ = self.unlink(&tmp, principal);
+            return Err(e);
+        }
+        if let Err(e) = self.unlink(path, principal) {
+            if self.stat(path).is_ok() {
+                let _ = self.unlink(&tmp, principal);
+                return Err(e);
+            }
+        }
+        match self.rename(&tmp, path, principal) {
+            Ok(()) => Ok(true),
+            Err(VfsError::Unsupported) => {
+                self.put_file(path, data, principal)?;
+                let _ = self.unlink(&tmp, principal);
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Is `path` exactly `data`? The size by `stat`, the bytes by 64 KiB `read`s; a mismatch, an empty or an over-long read
+    /// is `Backend("read-back")`.
+    fn read_back(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
+        if self.stat(path)?.size != data.len() as u64 {
+            return Err(VfsError::Backend("read-back"));
+        }
+        let mut off = 0usize;
+        while off < data.len() {
+            let want = (data.len() - off).min(64 * 1024);
+            let got = self.read(path, off as u64, want)?;
+            if got.is_empty() || got.len() > want || got[..] != data[off..off + got.len()] {
+                return Err(VfsError::Backend("read-back"));
+            }
+            off += got.len();
+        }
+        Ok(())
+    }
+}
