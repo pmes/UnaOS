@@ -9869,7 +9869,7 @@ esp_x86_unafs_card() {
             elif [ "$pinned" != "$sum" ]; then pin_state="MISMATCH"; fi
         done
         echo -e "${COLOR_YELLOW}⚡ WIFI-FW: firmware/b43.pins vs the staged set -> ${pin_state} (the kernel stages only a pinned match; UNPINNED/MISMATCH boots read reason=unpinned/pin-mismatch)${COLOR_RESET}"
-    fi
+    fi; fw_stage_pinned MT7925-FW "${UNAOS_MT7925_FW_PATH:-}" UNAOS_MT7925_FW_PATH "$esp_t" FW/MT7925 mt7925.pins WIFI_MT7925_PATCH_MCU_1_1_hdr.bin:patch WIFI_RAM_CODE_MT7925_1_1.bin:ram || return 1  # MT7925-FW (ZENBOOKMT7925, zenbook-ledger Z5): the MediaTek MT7925 pair (linux-firmware mediatek/mt7925/) from UNAOS_MT7925_FW_PATH onto the ESP at FW/MT7925/, pinned by firmware/mt7925.pins; unset => nothing staged. LINE-NEUTRAL fold; the helper sits above the entry point.
     # KEPLER-FW (KEPLERUCODE rmbp-ledger B637, R119 "the bunker is the standing answer for every proprietary bit"): the
     # GK107's FECS/GPCCS context-switch firmware (fuc409c fuc409d fuc41ac fuc41ad — the names nouveau requests behind
     # NvGrUseFW, gr/gf100.c:2603-2606) is BENCH-ONLY and never in-tree (CLEAN_ROOM_POLICY §4), the WIFI-FW shape exactly:
@@ -14891,6 +14891,39 @@ gates_selftest() {
     rm -rf "$C.bak"
     echo "GATEPATH selftest: plants=${plants} caught=${caught} -> $([ "$caught" -eq "$plants" ] && echo PASS || echo FAIL)"
     [ "$caught" -eq "$plants" ]
+}
+
+# FWSTAGE (ZENBOOKMT7925, zenbook-ledger Z5): ONE pinned firmware-set stager for the ESP (R52, R99, R119) — the WIFI-FW and
+# KEPLER-FW blocks' shape, which move onto it as FWSTAGEONE (owed); MT7925-FW is its first caller (the WIFI-FW block's closing
+# line). Usage: fw_stage_pinned <TAG> <src dir> <env name> <esp tree> <esp subdir> <pins file under firmware/> <file:role>...
+# An empty <src dir> stages nothing (the image byte-identical); a relative path, or a member missing or unreadable, FAILS LOUDLY
+# naming it; otherwise the members land on the ESP at <esp subdir>/ (bench-only, never in-tree), each digest is printed with a
+# ready-to-paste pin row, and the set is compared with the pins file (-> MATCH / UNPINNED / MISMATCH).
+fw_stage_pinned() {
+    local tag="$1" src="$2" envn="$3" esp="$4" sub="$5" pins="$6"; shift 6
+    [ -n "$src" ] || return 0
+    case "$src" in /*) ;; *) echo -e "${COLOR_RED}❌ ${tag}: ${envn} must be absolute: ${src}${COLOR_RESET}"; return 1;; esac
+    local m f role sum bytes pinned state="MATCH"
+    for m in "$@"; do
+        f="${m%%:*}"
+        [ -r "${src}/${f}" ] || { echo -e "${COLOR_RED}❌ ${tag}: ${src}/${f} missing or unreadable — no card image${COLOR_RESET}"; return 1; }
+    done
+    mkdir -p "${esp}/${sub}" || { echo -e "${COLOR_RED}❌ ${tag}: making ${sub}/ on the ESP tree failed — no card image${COLOR_RESET}"; return 1; }
+    for m in "$@"; do
+        f="${m%%:*}"
+        cp "${src}/${f}" "${esp}/${sub}/" || { echo -e "${COLOR_RED}❌ ${tag}: copying ${f} onto the ESP tree at ${sub}/ failed — no card image${COLOR_RESET}"; return 1; }
+    done
+    echo -e "${COLOR_YELLOW}⚡ ${tag}: $# files from ${src} onto the ESP at ${sub}/ (${envn}; bench-only, never in-tree)${COLOR_RESET}"
+    for m in "$@"; do
+        f="${m%%:*}"; role="${m##*:}"
+        sum=$(sha256sum "${src}/${f}" | cut -d' ' -f1)
+        bytes=$(stat -c %s "${src}/${f}")
+        echo -e "${COLOR_YELLOW}⚡ ${tag}: ${f} sha256=${sum} bytes=${bytes} pin-row: ${role} ${sum}${COLOR_RESET}"
+        pinned=$(awk -v r="$role" '$1==r && NF==2 {print tolower($2)}' "${WORKSPACE_DIR}/firmware/${pins}" 2>/dev/null | head -1)
+        if [ -z "$pinned" ]; then [ "$state" = "MATCH" ] && state="UNPINNED"
+        elif [ "$pinned" != "$sum" ]; then state="MISMATCH"; fi
+    done
+    echo -e "${COLOR_YELLOW}⚡ ${tag}: firmware/${pins} vs the staged set -> ${state} (the kernel accepts only a pinned match; UNPINNED/MISMATCH read unpinned/mismatch on its wire)${COLOR_RESET}"
 }
 
 # --- Entry Point ---

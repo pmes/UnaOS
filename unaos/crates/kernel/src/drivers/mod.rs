@@ -78,3 +78,4 @@ pub mod uvc; #[cfg(feature = "sonde")] pub mod realsense_xu; #[cfg(feature = "ua
 #[cfg(all(target_arch = "x86_64", feature = "nvme"))] pub mod nvme; // NVME (zenbook-ledger Z2, ZENBOOKNVME): the NVMe host controller, polled, rung 1 (probe, identify, the block registry `block::register_nvme`, `tests nvme`); x86_64 + `nvme` knob; knob off => never lexed.
 #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))]
 pub mod i8042; // ZENBOOKI8042 (zenbook-ledger Z3): the legacy i8042 PS/2 keyboard controller, a transport into EHCI's `decode_boot_keyboard` (the pump is `ehci::service_ehci_hid`), so it rides the same `ehcihid` gate. Tail append.
+#[cfg(target_arch = "x86_64")] pub mod mt7925; // ZENBOOKMT7925 (zenbook-ledger Z5): the MediaTek MT7925 Wi-Fi 7 S1 probe (drivers/mt7925.rs) — always-on x86 (LAWS §3 boot cold: a driver the board has is default-on); parks silently with no 14c3:7925/0717 in the PCI registry. Tail line, so no module above moves.
