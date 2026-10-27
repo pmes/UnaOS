@@ -118,10 +118,12 @@ fn say(age_ms: u64, fixture: bool) {
     holder(&mut h);
     let mut rh = Line::new();
     rehome_word(&mut rh); // GATESTEAL (B657): `rehome=<ok(pump=<tid>@cpu<n>)|none>` — the loop's other half, on the line that names the wedge
+    let mut hh = Line::new(); crate::allocator::heapgap::holder_word(&mut hh); // PUMPDEATHREHOME (B1016): the heap lock's holder — tracked, `gap:` (a section task not spinning), `untracked` or `none` — and the oldest spin on it, read without the heap
     serial_println!(
-        ":: PUMPWEDGE: age_ms={} last_step={} holder={} rehome={} -> {} :: pump={}@cpu{} passes={} wedges={} bound_ms={}{}",
+        ":: PUMPWEDGE: age_ms={} last_step={} holder={} rehome={} -> {} :: pump={}@cpu{} passes={} wedges={} bound_ms={} heap_holder={} heap_spin_ms={}{}",
         age_ms, step, h.as_str(), rh.as_str(), if fixture { "SEEN" } else { "FAIL" },
         PUMP_TID.load(Relaxed), PUMP_CPU.load(Relaxed) as i64, PASSES.load(Relaxed), WEDGES.load(Relaxed), WEDGE_MS,
+        hh.as_str(), crate::allocator::heapgap::spin_ms(),
         if fixture { " fixture=1" } else { "" }
     );
     let mut ln = Line::new();
@@ -240,6 +242,7 @@ pub fn ensure_tests() {
     if !DONE.swap(true, AcqRel) {
         crate::tests::register("sessionwedge", selftest);
         setter_tests(); // SETTERWEDGE (B553)
+        crate::tests::register("pumpdeath", pumpdeath_selftest); // PUMPDEATHREHOME (B1016): a REAL guard death holding the heap in the tag gap (file tail)
     }
 }
 
@@ -869,5 +872,85 @@ fn gatesteal_selftest() {
         crate::video::wm::comp_svc_masked_declined(),
         match HOLD_STATE.load(Acquire) { 2 => "stolen", 4 => "kept", 3 => "untaken", 1 => "holding", _ => "none" },
         crate::arch::ms().saturating_sub(t0)
+    );
+}
+
+// ══ PUMPDEATHREHOME (rmbp-ledger B1016, BP-cores-14) — `tests pumpdeath` ══════════════════════════════════════════════
+// Flight 38 boot 1: the usb-pump died by its guard holding the heap lock in `sync::Mutex::lock`'s tag gap (the raw lock
+// taken, the registry's tag not yet written), so no release could see it and the glass froze 124 s behind
+// `[lock] spin-wait name=allocator.rs:51 … on=untracked`. The fixture makes that death on purpose: `pumpdeath-die` (a
+// 16 KiB stack) takes the heap untagged inside the allocator's section and recurses into its guard page
+// (`allocator::heapgap::fixture_die`); `release_task`'s heap case must give the heap back. A `pumpdeath-tick` task on a
+// sibling core allocates every 1 ms — the glass's stand-in (the render task allocates every frame): its longest gap is
+// `render_gap_ms`. `heap_spin_ms` runs from the take to a probe allocation's return. A 2 s bound ends the fixture's own
+// hold (`rescued=1`, FAIL) so a broken release cannot wedge the bench. Typed only (R80). At the tail: no line above moves
+// but PUMPWEDGE's two tokens and the registration in `ensure_tests`.
+
+static PD_TICK_ON: AtomicBool = AtomicBool::new(false);
+static PD_TICK_STOP: AtomicBool = AtomicBool::new(false);
+static PD_TICK_GAP: AtomicU64 = AtomicU64::new(0);
+static PD_RETURNED: AtomicBool = AtomicBool::new(false);
+
+fn pumpdeath_tick(_arg: usize) {
+    PD_TICK_ON.store(true, Release);
+    let mut last = crate::arch::ms();
+    while !PD_TICK_STOP.load(Acquire) {
+        let b = alloc::boxed::Box::new(last);
+        drop(core::hint::black_box(b));
+        let now = crate::arch::ms();
+        PD_TICK_GAP.fetch_max(now.saturating_sub(last), Relaxed);
+        last = now;
+        crate::arch::sched::sleep_ms(1);
+    }
+    PD_TICK_ON.store(false, Release);
+}
+
+fn pumpdeath_die(_arg: usize) {
+    let _ = crate::allocator::heapgap::fixture_die();
+    PD_RETURNED.store(true, Release); // the guard never fired (the hold stays for the bound)
+}
+
+/// `:: PUMPDEATH: deaths=1 released=<0|1> heap_spin_ms=<n> render_gap_ms=<n> rescued=<0|1> -> PASS|FAIL|SKIP ::`
+fn pumpdeath_selftest() {
+    use crate::allocator::heapgap as hg;
+    const DIE_STACK: usize = 16 * 1024;
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let Some(tick_cpu) = (0..crate::arch::gdt::MAX_CPUS).map_while(crate::arch::smp::worker_cpu).find(|&c| c != me) else {
+        serial_println!(":: PUMPDEATH: deaths=0 released=0 heap_spin_ms=- render_gap_ms=- rescued=0 -> SKIP :: reason=no-sibling-core");
+        return;
+    };
+    hg::fixture_clear();
+    PD_RETURNED.store(false, Release);
+    PD_TICK_STOP.store(false, Release);
+    PD_TICK_GAP.store(0, Release);
+    crate::arch::sched::spawn("pumpdeath-tick", pumpdeath_tick, 0, tick_cpu, crate::arch::sched::PRIO_NORMAL);
+    if !wait_for(1000, || PD_TICK_ON.load(Acquire)) {
+        PD_TICK_STOP.store(true, Release);
+        serial_println!(":: PUMPDEATH: deaths=0 released=0 heap_spin_ms=- render_gap_ms=- rescued=0 -> FAIL :: reason=no-tick-task cpu={}", tick_cpu);
+        return;
+    }
+    PD_TICK_GAP.store(0, Release); // the window starts here, the tick running
+    let r0 = hg::released();
+    crate::arch::sched::spawn_stack("pumpdeath-die", pumpdeath_die, 0, crate::arch::sched::CPU_AUTO, crate::arch::sched::PRIO_NORMAL, DIE_STACK);
+    // From here until the heap comes back this task allocates nothing (atomics, `ms`, `sleep_ms` only).
+    if !wait_for(1000, hg::fixture_taken) {
+        PD_TICK_STOP.store(true, Release);
+        serial_println!(":: PUMPDEATH: deaths=0 released=0 heap_spin_ms=- render_gap_ms=- rescued=0 -> FAIL :: reason=no-die-task");
+        return;
+    }
+    let t0 = crate::arch::ms();
+    let back = wait_for(2000, || !hg::locked() || hg::released() != r0);
+    let rescued = !back && hg::fixture_rescue();
+    crate::allocator::heappoison::probe(); // the take that runs the poison check (`[heap] poison checked torn=0 -> released`)
+    let spin_ms = crate::arch::ms().saturating_sub(t0);
+    PD_TICK_STOP.store(true, Release);
+    let _ = wait_for(500, || !PD_TICK_ON.load(Acquire));
+    let gap_ms = PD_TICK_GAP.load(Acquire);
+    let released = hg::released() != r0;
+    hg::fixture_clear();
+    let ok = released && !rescued && spin_ms < 100 && gap_ms < 2000;
+    serial_println!(
+        ":: PUMPDEATH: deaths=1 released={} heap_spin_ms={} render_gap_ms={} rescued={} -> {} :: die_returned={} tick=c{} bound_ms=2000 (PUMPDEATHREHOME B1016: a guard death holding the heap in the tag gap)",
+        released as u8, spin_ms, gap_ms, rescued as u8, if ok { "PASS" } else { "FAIL" }, PD_RETURNED.load(Acquire) as u8, tick_cpu
     );
 }

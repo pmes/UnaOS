@@ -61,22 +61,22 @@ unsafe impl GlobalAlloc for Locked<Heap> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut result = null_mut();
         arch::without_interrupts(|| {
-            let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner, &mut heap); // HEAPREGION (B854): a torn verdict re-initialises the heap onto its reserve (the guard passed in). POISON2 (B846): a death-released heap lock is CHECKED at its next allocation (body at the tail). LINE-NEUTRAL append
+            #[cfg(target_arch = "x86_64")] let hg = heapgap::enter(); let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner, &mut heap); // HEAPREGION (B854): a torn verdict re-initialises the heap onto its reserve (the guard passed in). POISON2 (B846): a death-released heap lock is CHECKED at its next allocation (body at the tail). LINE-NEUTRAL append
             match { #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_ALLOC); if heap_dead() { Err(()) } else { heap.allocate_first_fit(layout) } } {
                 Ok(ptr) => { result = ptr.as_ptr(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] high_note(heap.used()); #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_alloc(result as usize, layout.size()); #[cfg(target_arch = "x86_64")] heappoison::op(0); } // MEMLINE (B677): the window's high-water, under the heap lock. LINE-NEUTRAL append, code first; MEMLINE2 (B821): the owner census, same lock
                 Err(_) => { #[cfg(target_arch = "x86_64")] heappoison::op(0); }
             }
-        });
+        #[cfg(target_arch = "x86_64")] heapgap::leave_after(heap, hg); });
         #[cfg(target_arch = "x86_64")] heappoison::say(); result
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         arch::without_interrupts(|| {
-            let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner, &mut heap); // HEAPREGION (B854) HEAPFREEFIRST: a free that is the first take after a death runs the SAME check (and may re-init). LINE-NEUTRAL append
+            #[cfg(target_arch = "x86_64")] let hg = heapgap::enter(); let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner, &mut heap); // HEAPREGION (B854) HEAPFREEFIRST: a free that is the first take after a death runs the SAME check (and may re-init). LINE-NEUTRAL append
             unsafe {
                 #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_FREE); if heap_free_ok(ptr as usize) { heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout); } #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_free(ptr as usize); #[cfg(target_arch = "x86_64")] heappoison::op(0); // MEMLINE2 (B821): a tracked block leaves the owner census under the heap lock, whoever frees it. LINE-NEUTRAL append, code first. HEAPREGION (B854): a free into the abandoned range is DROPPED (`heap_free_ok`); the census still forgets it
             }
-        }); #[cfg(target_arch = "x86_64")] heappoison::say(); // HEAPREGION (B854) HEAPFREEFIRST: the free's check is said after the lock drops, as alloc's tail does. LINE-NEUTRAL append
+        #[cfg(target_arch = "x86_64")] heapgap::leave_after(heap, hg); }); #[cfg(target_arch = "x86_64")] heappoison::say(); // HEAPREGION (B854) HEAPFREEFIRST: the free's check is said after the lock drops, as alloc's tail does. LINE-NEUTRAL append
     }
 }
 
@@ -887,5 +887,165 @@ fn heap_free_ok(p: usize) -> bool {
     #[cfg(not(target_arch = "x86_64"))]
     {
         true
+    }
+}
+
+// PUMPDEATHREHOME (rmbp-ledger B1016, BP-cores-14) — THE HEAP'S IN-SECTION MARKER. Flight 38 boot 1: the usb-pump died by
+// its guard inside prtscr's masked UnaFS save and the heap lock stayed held 124 s by a holder the registry could not name
+// (`[lock] spin-wait name=allocator.rs:51 … on=untracked`): `sync::Mutex::lock` takes the RAW lock before `reg::acquire`
+// writes the tag, so a holder that dies in that window (calls pushing onto a stack already in its absorber) holds the
+// heap with no tag and `release_task`'s walk cannot see it. [`IN`] names the task inside alloc's or dealloc's MASKED
+// section per core (stored before the take, cleared after the guard drops: masked, the task neither migrates nor is
+// preempted there); [`release_dead`] — called by `release_task` before its walk — releases such a hold, mark first,
+// exactly as the walk does, so the next take runs `heappoison::check` (OP is 0 in the gap: `torn=0 -> released`; a
+// holder that died inside a list mutation still reads `torn=1` and takes the HEAPREGION path). At the tail: no line
+// above moves but the two lock lines and the two closing lines (same-line prefixes). x86 only (the registry is x86's).
+#[cfg(target_arch = "x86_64")]
+pub mod heapgap {
+    //! CHARTER: Kernel — kernel-by-ruling (B414 LOCKREG): a heap hold the registry could not tag, released at its holder's death (PUMPDEATHREHOME B1016).
+    use core::sync::atomic::{AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+
+    use crate::arch::gdt::MAX_CPUS;
+
+    use super::ALLOCATOR;
+
+    /// Per core: the task id inside alloc's or dealloc's masked section (0 = none). Written only by that core, masked.
+    static IN: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+    /// Gap holds released at a death since boot.
+    static RELEASED: AtomicU64 = AtomicU64::new(0);
+    /// `tests pumpdeath`'s deliberate gap hold is in place (1) — its own bound may end it (`fixture_rescue`).
+    static FIX: AtomicU64 = AtomicU64::new(0);
+
+    /// The section begins (caller masked, before `self.inner.lock()`): `cpu + 1`, or 0 when the registry cannot name
+    /// the caller (unarmed, a foreign GS, the scheduler's own context) — then nothing is stored.
+    #[inline(always)]
+    pub fn enter() -> usize {
+        match crate::sync::here() {
+            Some((tid, cpu)) if tid != 0 && cpu < MAX_CPUS => {
+                IN[cpu].store(tid, Release);
+                cpu + 1
+            }
+            _ => 0,
+        }
+    }
+
+    /// The section ends: the heap guard `g` drops FIRST, then the marker clears (caller still masked).
+    #[inline(always)]
+    pub fn leave_after<G>(g: G, c: usize) {
+        drop(g);
+        leave(c);
+    }
+
+    #[inline(always)]
+    fn leave(c: usize) {
+        if c != 0 && c <= MAX_CPUS {
+            IN[c - 1].store(0, Release);
+        }
+    }
+
+    /// `release_task`'s heap case (before its walk): `tid` died inside the section on some core, the heap is still
+    /// locked, the registry names NO holder (a tracked hold is the walk's, or a live holder's) and `tid` was not
+    /// spinning for it (`sync::waits_on`) — so `tid` holds it untagged. Mark, force-unlock, one line; 1, else 0.
+    pub fn release_dead(tid: u64, why: &str) -> usize {
+        if tid == 0 {
+            return 0;
+        }
+        let Some(c) = (0..MAX_CPUS).find(|&c| IN[c].load(Acquire) == tid) else { return 0 };
+        IN[c].store(0, Release);
+        let m = &ALLOCATOR.inner;
+        if !m.is_locked() || m.holder().is_some() || crate::sync::waits_on(tid as u32).is_some() {
+            return 0;
+        }
+        let poisoned = m.mark_poison(); // BEFORE the force-unlock, so the next take sees it (`heappoison::check`)
+        // SAFETY: `tid` never runs again (a death site calls `release_task`) and holds the raw heap lock with no guard
+        // that could still be used: it took the lock inside this section and died before its tag (no tracked holder,
+        // no wait record).
+        unsafe { m.force_unlock() };
+        RELEASED.fetch_add(1, AcqRel);
+        let site = m.site();
+        let file = site.file();
+        serial_println!(
+            "[lock] released-on-death name={}:{} at=heap-gap by={}@cpu{} why={} poisoned={}",
+            file.rsplit('/').next().unwrap_or(file), site.line(), tid, c, why, poisoned as u8
+        );
+        1
+    }
+
+    /// PUMPWEDGE's `heap_holder=`: the registry's holder `<tid>@cpu<n>`, else a section task not spinning
+    /// `gap:<tid>@cpu<n>`, else `untracked` while locked, else `none`.
+    pub fn holder_word(out: &mut impl core::fmt::Write) {
+        let m = &ALLOCATOR.inner;
+        if let Some((t, c)) = m.holder() {
+            let _ = write!(out, "{}@cpu{}", t, c);
+            return;
+        }
+        if !m.is_locked() {
+            let _ = out.write_str("none");
+            return;
+        }
+        for (c, w) in IN.iter().enumerate() {
+            let t = w.load(Acquire);
+            if t != 0 && crate::sync::waits_on(t as u32).is_none() {
+                let _ = write!(out, "gap:{}@cpu{}", t, c);
+                return;
+            }
+        }
+        let _ = out.write_str("untracked");
+    }
+
+    /// PUMPWEDGE's `heap_spin_ms=`: the oldest live spin on the heap lock (0 = nobody waits).
+    pub fn spin_ms() -> u64 {
+        ALLOCATOR.inner.wait_ms()
+    }
+
+    /// Gap holds released at a death since boot.
+    pub fn released() -> u64 {
+        RELEASED.load(Acquire)
+    }
+
+    /// The heap lock is held right now (anyone).
+    pub fn locked() -> bool {
+        ALLOCATOR.inner.is_locked()
+    }
+
+    /// `tests pumpdeath`'s deliberate gap hold is in place.
+    pub fn fixture_taken() -> bool {
+        FIX.load(Acquire) == 1
+    }
+
+    /// `pumpdeath-die`: masked, enter the section, take the heap, forget the guard and drop the registry's tag (the gap,
+    /// made on purpose), then recurse into this task's guard page — a REAL guard death (`overflow_exit` ->
+    /// `release_task`). Allocates nothing. Returns only if the guard never fired (the marker cleared; the hold stays
+    /// for the fixture's bound).
+    pub fn fixture_die() -> u64 {
+        crate::arch::without_interrupts(|| {
+            let c = enter();
+            core::mem::forget(ALLOCATOR.inner.lock());
+            ALLOCATOR.inner.untrack();
+            FIX.store(1, Release);
+            let n = crate::arch::stackguard::scratch_deep(0);
+            leave(c);
+            n
+        })
+    }
+
+    /// The fixture's bound: its own hold still in place (no release came) — end it, unpoisoned, as `heappoison::hold_task`'s
+    /// bound does. `true` = it rescued the heap.
+    pub fn fixture_rescue() -> bool {
+        if FIX.swap(0, AcqRel) != 1 {
+            return false;
+        }
+        let m = &ALLOCATOR.inner;
+        if m.is_locked() && m.holder().is_none() {
+            // SAFETY: the fixture task took the lock untagged and is dead or returned without its guard; no release ran.
+            unsafe { m.force_unlock() };
+            return true;
+        }
+        false
+    }
+
+    /// The fixture is over (released or rescued): the next run starts clean.
+    pub fn fixture_clear() {
+        FIX.store(0, Relaxed);
     }
 }

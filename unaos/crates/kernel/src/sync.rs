@@ -745,7 +745,7 @@ mod reg {
     /// M3 — a task that will never run its guards' `Drop`s again (halted by STACKGUARD, a panic) gives back EVERY
     /// lock the registry holds in its name: force-unlocked by address, entry freed, all named on one line. Run AFTER
     /// the special releases (`lockowner`: the sink, the UART, the UnaFS mount — which must be leaked, not dropped).
-    pub fn release_task(tid: u64, why: &str) -> usize { let named = crate::lockowner::release_dead(tid); // STACKGUARD3 (B832): THE one release — lockowner's three first (unpoisoned), then the walk. LINE-NEUTRAL fold
+    pub fn release_task(tid: u64, why: &str) -> usize { let named = crate::lockowner::release_dead(tid); let gap = crate::allocator::heapgap::release_dead(tid, why); // PUMPDEATHREHOME (B1016): a heap hold the registry could not tag (the dead holder was in `Mutex::lock`'s tag gap) released by the heap's in-section marker, BEFORE the walk. STACKGUARD3 (B832): THE one release — lockowner's three first (unpoisoned), then the walk. LINE-NEUTRAL fold
         if tid == 0 || !ON.load(Relaxed) {
             return say_early(tid, why, named); // HEAPREGION (B854) POISONEARLY: the poison table's line too when it named anything (reg tail). STACKGUARD3 (B832): the registry off still releases (and names) lockowner's three
         }
@@ -770,8 +770,8 @@ mod reg {
                 dead.push(t, at, poisoned);
             }
         }
-        let named_n = say_named(tid, why, named); dead.say(why); if named_n + dead.n + dead.more > 0 { say_poison(); } // POISON2 (B846): the table's fill once per death-release that released anything. STACKGUARD3 (B832): one `[lock] released-on-death` line per lock (nothing when nothing was held); the summary line is gone
-        named_n + dead.n + dead.more
+        let named_n = say_named(tid, why, named); dead.say(why); if named_n + dead.n + dead.more + gap > 0 { say_poison(); } // POISON2 (B846): the table's fill once per death-release that released anything. STACKGUARD3 (B832): one `[lock] released-on-death` line per lock (nothing when nothing was held); the summary line is gone
+        named_n + dead.n + dead.more + gap
     }
 
     /// A LIVE task the kernel has given up on (DECJOB's abort): its holds and its wait NAMED, never released —
@@ -1230,6 +1230,40 @@ mod reg {
             "skip(no-unafs)"
         }
     }
+
+    // ── PUMPDEATHREHOME (rmbp-ledger B1016): the heap's gap release reads the registry (allocator.rs `heapgap`) —
+    // who the caller is, who holds a lock, the oldest spin on it — and its fixture drops a tag without the unlock. ──
+
+    /// The caller as the registry names it (`who`): `(task id, cpu)`, `None` unarmed or with a foreign GS.
+    pub fn here() -> Option<(u64, usize)> {
+        who()
+    }
+
+    /// The tracked holder of lock `addr` (`holder_of`), `None` = no partition entry carries it.
+    pub fn holder_at(addr: usize) -> Option<(u64, usize)> {
+        holder_of(addr)
+    }
+
+    /// The oldest live spin on lock `addr`, in ms (0 = nobody waits): the waiter records the 50 ms scan reads.
+    pub fn wait_ms_at(addr: usize) -> u64 {
+        let hz = crate::arch::apic::tsc_hz().max(1000);
+        let t = rdtsc();
+        let mut span = 0u64;
+        for p in PARTS.iter() {
+            if p.w_lock.load(Acquire) == addr {
+                let s = t.saturating_sub(p.w_t0.load(Relaxed));
+                if s <= (u64::MAX >> 1) {
+                    span = span.max(s);
+                }
+            }
+        }
+        span / (hz / 1000)
+    }
+
+    /// Drop lock `addr`'s entries WITHOUT the unlock (`tests pumpdeath`'s deliberate gap hold only).
+    pub fn untrack(addr: usize) {
+        forget(addr)
+    }
 }
 
 // ── STACKGUARD3 (rmbp-ledger B832): the poison check, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
@@ -1266,4 +1300,47 @@ impl<T: ?Sized> Mutex<T> {
             false
         }
     }
+}
+
+// ── PUMPDEATHREHOME (rmbp-ledger B1016): the registry's view of ONE lock, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
+impl<T: ?Sized> Mutex<T> {
+    /// The tracked holder `(task id, cpu)`; `None` = free, or held with no registry entry (the tag gap), or aarch64.
+    #[inline]
+    pub fn holder(&self) -> Option<(u64, usize)> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            reg::holder_at(self.addr())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            None
+        }
+    }
+
+    /// The oldest live spin on this lock in ms (0 = nobody waits, or aarch64).
+    #[inline]
+    pub fn wait_ms(&self) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            reg::wait_ms_at(self.addr())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            0
+        }
+    }
+
+    /// Drop this lock's registry entries without unlocking it: the hold goes untagged (`tests pumpdeath` only).
+    #[inline]
+    pub fn untrack(&self) {
+        #[cfg(target_arch = "x86_64")]
+        reg::untrack(self.addr());
+    }
+}
+
+/// The caller as the registry names it: `(task id, cpu)`, `None` unarmed or with a foreign GS (allocator.rs `heapgap`).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn here() -> Option<(u64, usize)> {
+    reg::here()
 }
