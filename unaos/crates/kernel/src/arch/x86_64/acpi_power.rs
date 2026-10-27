@@ -108,7 +108,7 @@ pub struct S5 {
 /// caller to the legacy 32-bit field rather than to a fabricated port.
 ///
 /// SAFETY: `gas` must point at 12 mapped bytes inside an ACPI table.
-unsafe fn gas_io_port(gas: usize) -> Option<u16> {
+pub(crate) unsafe fn gas_io_port(gas: usize) -> Option<u16> {
     let space = (gas as *const u8).read_unaligned();
     let addr = ((gas + 4) as *const u64).read_unaligned();
     if space == GAS_SPACE_SYSTEM_IO && addr != 0 && addr <= 0xFFFF {

@@ -48,7 +48,7 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
    (+ `via=knob` / `refused=<v>`), and `hw` labels the picked controller. Strix Point: four (1022:151a/151b/151e/151f).
    Owed: ZENBOOK-XHCIALL (every controller up; the ring/port/slot statics per instance, one MSI-X vector each), USB
    tunnelled behind the NHIs (ZENBOOK-USB4), the Fn-key keyboard (ZENBOOK-EC).
-8. **ZENBOOK-EC** — battery, lid and the Fn keys through the ACPI embedded controller (the SMC's job on the rMBP).
+8. **ZENBOOK-EC** — battery, lid and the Fn keys through the ACPI embedded controller (the SMC's job on the rMBP). In flight (ZENBOOKEC, Z8): rung 1 is the ECDT-located transport + a 256-byte RAM census at pci init; the battery decode is ZENBOOK-EC-BATTERY (needs the first boot's DSDT).
 9. **ZENBOOK-TOUCHPAD** — the touchpad over I2C-HID on the AMD DesignWare I2C controller.
 10. **ZENBOOK-ACP** — audio: the ALC294 codec on the Ryzen HD Audio controller (1022:15e3; Linux quirk 1043:1df3
     `ALC294_FIXUP_BASS_SPEAKER_15`) with its CS35L41 amplifiers, and the ACP 7.x coprocessor (1022:15e2). Until this
