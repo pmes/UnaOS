@@ -699,23 +699,23 @@ run (R107): the fold's `wpt_apis` run is the measurement.
 
 ### Gap list (dated 2026-10-13; what this arc did not reach — each change outside its files, named exactly)
 
-1. **No `fit-content`** in layout_core (`unaos/libs/web/layout_core/src/css.rs`'s `width` arm has no keyword for it;
+1. DONE (AETHERFIT SR189, below). **No `fit-content`** in layout_core (`unaos/libs/web/layout_core/src/css.rs`'s `width` arm has no keyword for it;
    grep finds none in layout_core): the spec's UA rules for popovers and modal dialogs (`inset: 0; margin: auto;
    width: fit-content; height: fit-content`) cannot be written, so both sit at the viewport's top-left instead of
    centred. Change: a `fit-content` width / height keyword (shrink-to-fit) in layout_core, then the UA sheet takes the
    spec's rules.
-2. **The hit test does not hoist the top layer** (`handlers/aether/src/lib.rs` `hit_origin` / `hit_context`, lines
+2. DONE (AETHERFIT SR189, below). **The hit test does not hoist the top layer** (`handlers/aether/src/lib.rs` `hit_origin` / `hit_context`, lines
    ~2085-2310, mirror render's paint order without the top layer): a click over a top-layer element can hit the
    document box beneath it. `events.rs` retargets a click on an inert node to the modal dialog, so a modal dialog's
    own controls are reachable only where they do not overlap document content. Change: test the top layer's boxes
    first, in reverse order (`js::toplayer::top_layer`), and skip inert boxes.
-3. **The focusing steps do not refuse inert elements** (`focus()` on an element outside a modal dialog still focuses
+3. OWED (AETHERFIT SR189 measured it a different rule: focus REFUSES, it does not retarget; handlers.md §5). **The focusing steps do not refuse inert elements** (`focus()` on an element outside a modal dialog still focuses
    it; HTML §6.6.3 "focusable area" excludes inert nodes): `handlers/aether/src/js/dom.rs`'s focus path needs
    `toplayer::is_inert`.
 4. **The CloseWatcher interface's own events** (`cancel` / `close` on a page's `CloseWatcher`) are dispatched
    untrusted by `handlers/aether/src/js/closewatcher.rs` (not in this arc's files): route them through
    `events::dispatch_trusted` as toplayer.rs does.
-5. **Pointer, mouse and wheel events** (`events.rs` `pointer_event` / `user_mouse` / `user_button` / `user_wheel`) still
+5. DONE (AETHERFIT SR189, below). **Pointer, mouse and wheel events** (`events.rs` `pointer_event` / `user_mouse` / `user_button` / `user_wheel`) still
    reach inert nodes; only the click and keys are retargeted.
 6. **`::backdrop` under `@media` / `@container`**: `top_layer_backdrops` reads the rule set without evaluating the
    conditions of the rule's ancestors; a backdrop's only painted property is its background colour (no image,
@@ -726,3 +726,53 @@ run (R107): the fold's `wpt_apis` run is the measurement.
 9. **IntersectionObserver**: the flat-tree parent chain stands in for the containing-block chain (an absolutely
    positioned target is clipped by a non-positioned overflow ancestor it escapes); `clip-path` is not a clip; no
    `delay` / `trackVisibility` (AETHERAPIS gap 4's rest).
+
+## AETHERFIT (SR189) — popovers and modal dialogs centred; the top layer hit first; one inert retarget
+
+Closes AETHERTOP's gap list items 1, 2 and 5; item 3 (focus) is a different rule and stays owed
+(`docs/dev/blueprint/handlers.md` §5). Design measured at df909c747, `MEASURE: PASS` from the seat.
+
+### What landed, per spec section
+- **CSS Sizing 3 §2.1 / §5.2 `fit-content`** (layout_core `css.rs` `parse_dimension_str`): the keyword becomes taffy
+  0.15.1's own `Dimension::fit_content()`; taffy's sizing-keyword routine does the shrink-to-fit
+  (min(max-content, max(min-content, available))) and its abspos auto-margin routine the centring. No shrink-to-fit
+  code is written. In the block axis it is the automatic size (CSS Sizing 3 §3.1): `tree.rs passes`' IFC height
+  checks read it as `auto` (`block_auto`). A `fit-content` width is content-sized (`has_width` false).
+- **CSS 2.2 §10.1.3 / Position 3 §2.1, the viewport is a fixed box's containing block** (layout_core `tree.rs`
+  `fixed_viewport`, `record_fixed`): for the run each fixed box's definite insets are rewritten as lengths from its
+  parent's out-of-flow area, so taffy stretches / fit-contents / centres it against the viewport. The original
+  insets are restored with the pass's other rewrites, so every style is byte-identical after the run (the KAT lays
+  the same tree out twice). The viewport origin goes in ONE map, `LayoutTree::fixed_at`, which render
+  (`placed_origin`), the hit test (`hit_origin`) and `scroll::box_origin` all read. It replaces the two copied
+  placement closures (which ignored margins) and the third reading.
+- **HTML §15.3.x / §15.5.x UA rules** (`css/mod.rs` `UA_SHEET`): `[popover]` and `dialog:modal` take the spec's
+  `inset: 0; width: fit-content; height: fit-content; margin: auto`, so both are centred in the viewport.
+- **The top layer is hit first** (`lib.rs hit_test_at`): `js::toplayer::top_layer()` in reverse, inert boxes
+  skipped, each box found through render's factored `top_layer_box` and hit as its own context from its parent's
+  `scroll::box_origin`. The document walk skips those boxes (`hit_collect`), the same rule render uses.
+- **HTML §6.3 / §4.11.4, one retarget rule** (`toplayer::retarget`): an inert node's user interaction event goes
+  to the topmost modal dialog. Key, click, `user_mouse`, `user_button`, `user_wheel` and the hover path
+  (`pointer_moved`) all use it; the two inline copies are gone.
+
+### Counts (host, measured on exec-rmbp-aetherfit; before = df909c747)
+| runner | before | after |
+|---|---|---|
+| `cargo test -p layout_core` | 31 passed / 0 failed | 34 passed / 0 failed (+`tests/fit_content.rs`, 3) |
+| `cargo test --release -p aether --lib` | 210 passed / 1 failed | 211 passed / 1 failed (+`test_hit_test_hoists_the_top_layer`; the failure is the foreign `js::idb::tests::transaction_ordering_kat` both times) |
+| `wpt_apis` the-dialog-element (40 served) | 60/170 | 60/170 |
+| `wpt_apis` popovers (28 served) | 97/136 | 98/136 (`popover-anchor-multicol-display.html` 0/2 -> 1/2) |
+| `wpt_dom` interactive-elements (86 served) | 150/352 | 166/352 (testdriver clicks now reach the centred top layer: `dialog-popover-closedby-complex` 0/40 -> 10/40, `dialog-popover-closedby-simple` 0/6 -> 3/6, `dialog-cancel-preventDefault`, `dialog-light-dismiss-touch`, `simulated-click-inert` 0/1 -> 1/1 each) |
+
+No page went down (per-page diff of both runs). `test_z_index_and_fixed_kat` now paints at the size it was laid
+out at (RULING A: the engine relays out on Resize, so the layout viewport always equals the paint size).
+
+### Why the centring pages did not move (each reads geometry somewhere this arc did not change)
+- `centering.html` 0/23: it sizes nested iframes' viewports and reads their dialogs' rects.
+- `multiple-centered-dialogs.html` 0/1: it reads `getBoundingClientRect()` after `window.scroll`, and
+  `js/cssom.rs element_boxes` gives a fixed box's client rect without taking the scroll off (owed).
+- `abspos-dialog-layout.html` 3/10, `non-modal-dialog-layout.html` 0/1: non-modal dialogs. The spec's
+  `dialog { position: absolute; inset-inline: 0; width: fit-content; margin: auto }` is not written (owed).
+- `modal-dialog-scroll-height.html` 0/1: a fixed box still adds to the document's `scrollHeight`.
+- `top-layer-position.html` 0/1: it reads the computed `position` of a modal dialog whose inline style says
+  `static` / `relative`. That is cascade priority on a UA rule, not layout.
+

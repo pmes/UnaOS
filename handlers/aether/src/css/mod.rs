@@ -527,17 +527,19 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
 /// `dialog:modal` and `::backdrop`.
 /// AETHERTOP (SR146): HTML §15.5.x "the top layer" / §15.3.x rendering rules for the dialog element and popovers,
 /// Fullscreen §7's UA rules, and the `::backdrop` boxes (CSS Position 4 §top-layer): a hidden popover has no box; a
-/// showing one and a modal dialog are fixed boxes of the viewport (laid out from its top-left corner — the engine's
-/// box builder has no `fit-content`, so the spec's `inset: 0; margin: auto` centering, which needs it, is not written:
-/// with both insets an auto width would stretch to the viewport); the fullscreen element fills the viewport; a modal
+/// showing one and a modal dialog are fixed boxes of the viewport — AETHERFIT (SR189): the spec's `inset: 0;
+/// margin: auto; width: fit-content; height: fit-content`, CENTRED (layout_core's `fit-content` keyword and its
+/// fixed-box pass, which gives a fixed box the viewport as its containing block; the spec's `dialog:modal`
+/// `max-width` / `max-height: calc(100% - 6px - 2em)` are not written: a % size of a fixed box still resolves against
+/// its DOM parent); the fullscreen element fills the viewport; a modal
 /// dialog's backdrop is the spec's translucent black, a popover's transparent. `render` paints each top-layer element
 /// after its backdrop (`top_layer_paint`).
 const UA_SHEET: &str = "\
 dialog:not([open]) { display: none; }\
 [popover]:not(:popover-open):not(dialog[open]) { display: none; }\
 dialog:popover-open { display: block; }\
-[popover] { position: fixed; top: 0; left: 0; margin: 0; border: solid; padding: 0.25em; overflow: auto; color: canvastext; background-color: canvas; }\
-dialog:modal { position: fixed; top: 0; left: 0; margin: 0; overflow: auto; }\
+[popover] { position: fixed; inset: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 0.25em; overflow: auto; color: canvastext; background-color: canvas; }\
+dialog:modal { position: fixed; overflow: auto; inset: 0; width: fit-content; height: fit-content; margin: auto; }\
 :not(:root):fullscreen { position: fixed; inset: 0; margin: 0; box-sizing: border-box; min-width: 0; max-width: none; min-height: 0; max-height: none; width: 100%; height: 100%; transform: none; }\
 ::backdrop { position: fixed; inset: 0; }\
 dialog:modal::backdrop { background-color: rgba(0, 0, 0, 0.1); }\

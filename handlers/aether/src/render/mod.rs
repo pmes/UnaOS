@@ -179,6 +179,14 @@ thread_local! {
     static TOP_PASS: std::cell::Cell<Option<NodeId>> = const { std::cell::Cell::new(None) };
 }
 
+/// AETHERTOP (SR146) / AETHERFIT (SR189): the box a top-layer element (DOM node `dom`) is painted — and hit-tested —
+/// as: its first box.
+pub(crate) fn top_layer_box(layout: &LayoutTree, dom: html_core::NodeId) -> Option<NodeId> {
+    let mut ids: Vec<NodeId> = layout.node_map.iter().filter(|(_, n)| n.is_element() && n.id() == dom).map(|(t, _)| *t).collect();
+    ids.sort_by_key(|t| u64::from(*t));
+    ids.first().copied()
+}
+
 /// Is `id` a top-layer box the walk must leave to the top-layer pass (HTML "top layer": an element in it is
 /// painted there, not where its parent would paint it)?
 fn hoisted_to_top_layer(id: NodeId) -> bool {
@@ -1953,24 +1961,14 @@ fn placed_origin(
     let (w, h) = (layout_box.size.width, layout_box.size.height);
     match paint.and_then(|p| p.position_kind) {
         Some(3) => {
-            if let Ok(st) = layout.taffy.style(node_id) {
-                let len = |v: taffy::style::LengthPercentageAuto, basis: f32| -> Option<f32> {
-                    let raw = v.into_raw();
-                    match raw.tag() {
-                        taffy::style::CompactLength::LENGTH_TAG => Some(raw.value()),
-                        taffy::style::CompactLength::PERCENT_TAG => Some(raw.value() * basis),
-                        _ => None,
-                    }
-                };
-                if let Some(l) = len(st.inset.left, vw) {
-                    current_x = sx as f32 + l;
-                } else if let Some(r) = len(st.inset.right, vw) {
-                    current_x = sx as f32 + vw - r - w;
+            // AETHERFIT (SR189): layout_core laid the box out against the viewport (its margins, `fit-content`
+            // and auto-margin centring included) and recorded its viewport origin per axis with an inset.
+            if let Some(&(fx, fy)) = layout.fixed_at.get(&node_id) {
+                if let Some(x) = fx {
+                    current_x = sx as f32 + x;
                 }
-                if let Some(t) = len(st.inset.top, vh) {
-                    current_y = sy as f32 + t;
-                } else if let Some(b) = len(st.inset.bottom, vh) {
-                    current_y = sy as f32 + vh - b - h;
+                if let Some(y) = fy {
+                    current_y = sy as f32 + y;
                 }
             }
         }
@@ -3925,11 +3923,7 @@ fn frame_walk(
     // element's `::backdrop` colour from the cascade (`css::top_layer_paint`).
     let top: Vec<(NodeId, Option<((u8, u8, u8), f32)>)> = crate::css::top_layer_paint()
         .into_iter()
-        .filter_map(|(dom, backdrop)| {
-            let mut ids: Vec<NodeId> = layout.node_map.iter().filter(|(_, n)| n.is_element() && n.id() == dom).map(|(t, _)| *t).collect();
-            ids.sort_by_key(|t| u64::from(*t));
-            ids.first().map(|t| (*t, backdrop))
-        })
+        .filter_map(|(dom, backdrop)| top_layer_box(layout, dom).map(|t| (t, backdrop)))
         .collect();
     TOP_IDS.with(|t| *t.borrow_mut() = top.iter().map(|(t, _)| *t).collect());
 

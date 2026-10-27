@@ -118,6 +118,13 @@ pub fn is_inert(id: usize) -> bool {
     true
 }
 
+/// AETHERFIT (SR189): HTML §6.3 / §4.11.4 — an inert node is not a target of user interaction events: the event goes to
+/// the topmost modal dialog (the `::backdrop`'s originating element) instead. The ONE retarget rule: the click, keys,
+/// pointer, mouse and wheel paths (js/events.rs) and the hover path (lib.rs `pointer_moved`) all take it.
+pub fn retarget(id: usize) -> usize {
+    if is_inert(id) { modal_dialog().unwrap_or(id) } else { id }
+}
+
 fn call(vm: &mut Vm, name: &str, args: &[Value]) -> Option<Value> {
     if super::engine_poisoned() {
         return None;

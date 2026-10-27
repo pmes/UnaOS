@@ -692,9 +692,12 @@ pub fn box_origin<H: Host>(tree: &LayoutTree<H>, id: NodeId, vs: (f32, f32)) -> 
     for w in chain.windows(2) {
         let (p, k) = (w[0], w[1]);
         let kl = tree.taffy.layout(k).ok()?;
+        // AETHERFIT (SR189): a fixed box sits at its viewport origin (`LayoutTree::fixed_at`) per axis with an inset.
         if tree.paint_map.get(&k).and_then(|q| q.position_kind) == Some(3) {
-            o = (vs.0 + kl.location.x, vs.1 + kl.location.y);
-            continue;
+            if let Some(&(fx, fy)) = tree.fixed_at.get(&k) {
+                o = (fx.map_or(o.0 + kl.location.x, |x| vs.0 + x), fy.map_or(o.1 + kl.location.y, |y| vs.1 + y));
+                continue;
+            }
         }
         let sh = content_shift(tree, p);
         let cs = crate::col_shift(tree, k);
