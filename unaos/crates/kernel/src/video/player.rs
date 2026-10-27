@@ -1272,20 +1272,25 @@ pub fn open_flag_agrees() -> Option<bool> {
 // (NLE2's synth_fixture shape), opens the EDL in the Player and runs the pass to the end. `agree` compares each presented
 // frame's ordinal (`vplay::Frame.ord`: the kernel's utp1 picture is a flat field, the counter rides the frame) with the
 // schedule's source tick at that output tick (the job's plan); `seeks` must equal the plan's seek steps and every queued
-// frame must be presented or dropped.
+// frame must be presented or dropped. NLE6MIX (rmbp-ledger B899): the cut list carries a dissolve A->B and a W001 wipe to
+// black; every transition tick is mixed (`mixed=8`, none refused) and the two mid-transition frames' FNV-1a 64 equal
+// `MIX_KAT`, pinned on the host by timeline_core's `vmix` test through the SAME `vmix::mix_step`.
 #[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
 mod nle_fx {
     use super::{hw, STATE};
     use crate::video::vplay;
     use alloc::string::String;
     use alloc::vec::Vec;
-    use timeline_core::{Clip, Kind, Timeline};
+    use timeline_core::{Clip, EditError, Kind, Timeline, TransitionKind, WipeDir};
 
     const FPS: u32 = 25;
     /// The reels' frame ordinals start here (a frame names its reel and its index).
     const BASE: [u32; 2] = [1000, 2000];
     const REELS: [&str; 2] = ["NLEFXA", "NLEFXB"];
     const FRAMES: u32 = 40;
+    /// NLE6MIX (B899): `(output tick, FNV-1a 64 of the mixed 64x48 RGBA)` — tick 11 the dissolve at 2/5 (a flat 42), tick
+    /// 22 the wipe to black at 3/5 (columns 0..37 black); timeline_core `vmix::tests::kernel_fixture_pins` re-derives both.
+    const MIX_KAT: [(i64, u64); 2] = [(11, 0x565d_af03_7163_1325), (22, 0x575d_e51b_bec6_ed25)];
 
     /// A utp1 reel: `FRAMES` 64x48 test-pattern frames at `FPS`, a keyframe every 10, ordinals `base..`.
     fn reel(base: u32) -> Vec<u8> {
@@ -1297,20 +1302,28 @@ mod nle_fx {
         build::mp4(&[video], &build::Mp4Options::default())
     }
 
-    /// The cut list: A 13..23 at 0, B 0..10 at 10, a gap 20..25, A 23..33 at 25.
-    fn timeline() -> Timeline {
+    /// The cut list: A 13..23 at 0, B 0..10 at 10, a gap 20..25, A 23..33 at 25; NLE6MIX: a 4-tick dissolve on the cut at
+    /// 10 and a 4-tick W001 wipe to black at 20 (tick 24 stays a gap).
+    fn timeline() -> Result<Timeline, EditError> {
         let mut tl = Timeline::new(FPS);
         let a = tl.add_source(REELS[0], FRAMES as i64);
         let b = tl.add_source(REELS[1], FRAMES as i64);
         tl.add_track(Kind::Video);
         tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
-        tl
+        tl.add_transition(0, 10, TransitionKind::Dissolve, 4)?.add_transition_to_black(0, 20, TransitionKind::Wipe(WipeDir::LeftToRight), 4)
     }
 
     pub fn fixture() {
         let mt = crate::shell::vfs_mount_table();
         let p = crate::fs::vfs::KERNEL_PRINCIPAL;
-        let edl = match timeline_core::edl::write(&timeline(), "NLEFX") {
+        let tl = match timeline() {
+            Ok(t) => t,
+            Err(e) => {
+                serial_println!(":: NLE: reason=transition ({:?}) -> FAIL ::", e);
+                return;
+            }
+        };
+        let edl = match timeline_core::edl::write(&tl, "NLEFX") {
             Ok(t) => t,
             Err(e) => {
                 serial_println!(":: NLE: reason=edl-write ({}) -> FAIL ::", e);
@@ -1363,14 +1376,16 @@ mod nle_fx {
         let want = |t: i64| rep.plan.iter().find(|s| s.0 == t).and_then(|s| s.1).map(|(src, st)| BASE.get(src as usize).copied().unwrap_or(0) + st as u32);
         let agree = shown.iter().filter(|(t, n)| want(*t) == Some(*n)).count();
         let seek_steps = rep.plan.iter().filter(|s| s.2).count() as u64;
-        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps;
+        let kat = MIX_KAT.iter().filter(|k| rep.mixes.contains(*k)).count();
+        let mix_ok = rep.mixed == 8 && rep.mix_refused == 0 && kat == MIX_KAT.len();
+        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok;
         serial_println!(
             "[nle] fixture edl={} presented={} dropped={} queued={} gaps={} seek_steps={} ms={}{}",
             path, pres, drop, rep.frames, rep.gaps, seek_steps, crate::arch::ms().saturating_sub(t0), err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default()
         );
         serial_println!(
-            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord -> {} ::",
-            pres, rep.seeks, rep.runup, agree, shown.len(), if ok { "PASS" } else { "FAIL" }
+            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} -> {} ::",
+            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), if ok { "PASS" } else { "FAIL" }
         );
     }
 }
