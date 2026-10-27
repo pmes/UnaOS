@@ -3499,6 +3499,7 @@ name = "pdf_core"
 version = "0.1.0"
 dependencies = [
  "pixel_core",
+ "svg_core",
 ]
 
 [[package]]

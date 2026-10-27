@@ -22,6 +22,8 @@
 //! * [`doc`]: [`Document::parse`], `resolve` (object cache, object streams), the page tree with inherited attributes
 //!   ([`Page`]), the /Info strings. /Encrypt is refused by name ([`Error::Encrypted`]; PDF-CRYPT is owed).
 //! * [`content`]: the content-stream TOKENIZER (operands + operator, inline images) — PDF2 interprets it.
+//! * [`render`]: PDF2 (SR313) — the content interpreter (§8: graphics state, paths, clips, colour spaces, functions,
+//!   images, shadings, form XObjects) painting through svg_core's rasterizer; `Page::render`; text goes to a `TextSink`.
 //!
 //! Everything is bounded: nesting and reference chains by [`MAX_DEPTH`], object counts by [`MAX_OBJECTS`], every
 //! decoded stream by [`MAX_DECODED`], the page tree by [`MAX_PAGES`] and a visited set.
@@ -37,6 +39,7 @@ pub mod filters;
 pub mod lexer;
 pub mod object;
 pub mod xref;
+pub mod render;
 
 pub use doc::{Document, Info, Page, XrefKind};
 pub use object::{Dict, Object, Ref, Stream};
