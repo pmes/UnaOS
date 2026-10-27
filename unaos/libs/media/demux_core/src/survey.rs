@@ -53,6 +53,8 @@ pub struct StreamSurvey {
     pub indexed: bool,
     /// DEMUXSEEK (SR200): the stream's edit list, every entry ([`Demuxer::edit_list`]).
     pub edits: Vec<EditSegment>,
+    /// NLEPROBEHDR (SR226): the stream's colour and HDR metadata ([`crate::Track::colour`]); its `Display` is the probe's token.
+    pub colour: Option<crate::colour::Colour>,
 }
 
 /// The editor's probe of one file.
@@ -118,7 +120,7 @@ impl Demuxer {
                     reordered,
                     decode_time: self.decode_time.get(ti).copied().unwrap_or(DecodeTime::Presentation),
                     indexed,
-                    edits: self.edit_list(ti).to_vec(),
+                    edits: self.edit_list(ti).to_vec(), colour: t.colour,
                 }
             })
             .collect();
