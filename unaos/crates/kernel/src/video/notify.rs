@@ -592,7 +592,7 @@ fn show_now(st: &mut St, n: Note, pw: usize, now: u64) {
     if !kept {
         FOCUS_MOVED.fetch_add(1, Ordering::Relaxed);
     }
-    if wire() { serial_println!("[notify] show win={} slot=0 app={} title={} line={} ms={} focus={}", win, s(n.app()), s(n.title()), s(n.line()), CARD_MS, if kept { "kept" } else { "MOVED" }); } if wire() && win != wm::WIN_NONE { serial_println!("[notify] toast present bracket={} passes={}", owns_row(win) as u8, wm::comp_scratch_counts().0.wrapping_sub(p0)); } // TOASTFLICKER (B815) M2: bracket=1 = the card is in the occluder sets the desktop present, the erase drain and the window blit subtract
+    if wire() { serial_println!("[notify] show win={} slot=0 app={} title={} line={} ms={} focus={}", win, s(n.app()), s(n.title()), s(n.line()), CARD_MS, if kept { "kept" } else { "MOVED" }); } if wire() && win != wm::WIN_NONE { serial_println!("[notify] toast present bracket={} passes={}", wm::overlay_live(win) as u8, wm::comp_scratch_counts().0.wrapping_sub(p0)); } // TOASTFLICKER (B815) M2: bracket=1 = the card is in the occluder sets the desktop present, the erase drain and the window blit subtract; TOASTBRACKET (B847): read through wm::overlay_live, the sets' own predicate
 }
 
 fn center_close(st: &mut St, by: &str) {
