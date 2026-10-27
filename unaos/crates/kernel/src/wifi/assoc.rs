@@ -735,3 +735,62 @@ pub fn wpa2_kat() -> [bool; 5] {
     frame &= eapol_payload(&rx, &spa, &aa) == Some(&m1[..]) && eapol_payload(&rx, &spa, &spa).is_none();
     [pbkdf2, prf, micok, unwrap, frame]
 }
+
+// ── S9REJOIN (MT7925S9REJOIN, zenbook-ledger Z59): STATIONREJOIN's backoff (rmbp-ledger B891), MOVED verbatim from wifi/data.rs ──
+// PURE. Compiled under `wifi` (data.rs is wifi10-only), so both stations hold the ONE ladder: the Broadcom's `join::REJOIN`
+// (through data.rs's `pub use`) and the MT7925's `drivers/mt7925.rs` `REJOIN` (its S9REJOIN block).
+
+/// The first re-join waits this long after the loss; each failure doubles the wait.
+pub const REJOIN_FIRST_MS: u64 = 1000;
+/// The longest wait between two re-join attempts.
+pub const REJOIN_CAP_MS: u64 = 30_000;
+
+/// LOST_AT / LOST_WHY and the backoff: armed by `lose`, an attempt is `due` once the wait ran out; `failed` doubles the wait
+/// (capped `REJOIN_CAP_MS`), `linked` disarms it, counts the re-join and resets the ladder for the next loss.
+pub struct Rejoin {
+    pub lost_at: u64,
+    pub why: &'static str,
+    /// Attempts since the last loss.
+    pub n: u32,
+    /// Re-joins that linked this boot.
+    pub rejoins: u32,
+    delay_ms: u64,
+    due_at: u64,
+    armed: bool,
+}
+
+impl Rejoin {
+    pub const fn new() -> Rejoin {
+        Rejoin { lost_at: 0, why: "", n: 0, rejoins: 0, delay_ms: REJOIN_FIRST_MS, due_at: 0, armed: false }
+    }
+
+    pub fn lose(&mut self, now_ms: u64, why: &'static str) {
+        self.lost_at = now_ms;
+        self.why = why;
+        self.n = 0;
+        self.delay_ms = REJOIN_FIRST_MS;
+        self.due_at = now_ms + REJOIN_FIRST_MS;
+        self.armed = true;
+    }
+
+    pub fn due(&self, now_ms: u64) -> bool {
+        self.armed && now_ms >= self.due_at
+    }
+
+    /// One attempt starts: `(its number since the loss, ms since the loss)`.
+    pub fn attempt(&mut self, now_ms: u64) -> (u32, u64) {
+        self.n += 1;
+        (self.n, now_ms.saturating_sub(self.lost_at))
+    }
+
+    pub fn failed(&mut self, now_ms: u64) {
+        self.delay_ms = (self.delay_ms * 2).min(REJOIN_CAP_MS);
+        self.due_at = now_ms + self.delay_ms;
+    }
+
+    pub fn linked(&mut self) {
+        self.armed = false;
+        self.rejoins += 1;
+        self.delay_ms = REJOIN_FIRST_MS;
+    }
+}

@@ -7983,7 +7983,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
     if dead >= MAX_CPUS || live >= MAX_CPUS || dead == live || !cpu_dispatching(live) {
         return r;
     }
-    let now_ms = crate::arch::ms();
+    let now_ms = crate::arch::ms(); let hid = hid_rehome_cpu(dead, live); let mut hid_to: Option<usize> = None; // GATESTEALWORKERCORE (B1029): the `hid-pump` leaves a dead core apart from the worker core (body at the file tail; asked before the masked section: `xhci_worker_cpu` allocates)
     let dead_ticks = percpu::cpu(dead).map_or(0, |p| p.ticks.load(Ordering::Relaxed));
     let live_ticks = percpu::cpu(live).map_or(0, |p| p.ticks.load(Ordering::Relaxed));
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -7997,11 +7997,11 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
                 keep.push(task);
                 continue;
             }
-            rehome_fields(&mut task, live, now_ms);
+            let dst = hid_dst(task.name, hid, live, &mut hid_to); rehome_fields(&mut task, dst, now_ms); // GATESTEALWORKERCORE (B1029): `dst` is `live` for every task but the hid pump
             sgl_moved |= task.id == sgl;
             let prio = task.priority;
-            RUN_QUEUES[live].lock().push(task);
-            poke_for(live, prio);
+            RUN_QUEUES[dst].lock().push(task);
+            poke_for(dst, prio);
             r.ready += 1;
         }
         for task in keep.drain(..) {
@@ -8017,10 +8017,10 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
                 keep_s.push(Sleeper { deadline, task });
                 continue;
             }
-            rehome_fields(&mut task, live, now_ms);
+            let dst = hid_dst(task.name, hid, live, &mut hid_to); rehome_fields(&mut task, dst, now_ms); // GATESTEALWORKERCORE (B1029): as the READY loop
             sgl_moved |= task.id == sgl;
             let left = deadline.saturating_sub(dead_ticks);
-            SLEEPERS[live].lock().push_back(Sleeper { deadline: live_ticks.saturating_add(left), task });
+            let dst_ticks = if dst == live { live_ticks } else { percpu::cpu(dst).map_or(live_ticks, |p| p.ticks.load(Ordering::Relaxed)) }; SLEEPERS[dst].lock().push_back(Sleeper { deadline: dst_ticks.saturating_add(left), task }); // GATESTEALWORKERCORE (B1029): re-based on the destination core's tick domain
             r.sleeping += 1;
         }
         for s in keep_s.drain(..) {
@@ -8028,7 +8028,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
             SLEEPERS[dead].lock().push_back(s);
         }
     });
-    let cur = SCHED[dead].current_tid.load(Ordering::Relaxed); #[cfg(feature = "tickless")] poke_cpu(live); // TICKLESS (B765): the moved sleepers' deadlines may be nearer than the live core's armed one-shot; the IPI makes it re-arm. LINE-NEUTRAL fold, code first
+    let cur = SCHED[dead].current_tid.load(Ordering::Relaxed); #[cfg(feature = "tickless")] { poke_cpu(live); if let Some(h) = hid_to { poke_cpu(h); } } // TICKLESS (B765): the moved sleepers' deadlines may be nearer than the live core's armed one-shot; the IPI makes it re-arm. LINE-NEUTRAL fold, code first
     if cur != 0 {
         r.current = Some(cur);
     }
@@ -8044,7 +8044,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
         }
     }
     serial_println!(
-        ":: [smpbal] rehome dead=c{} live=c{} ready={} sleeping={} left={} current={} moved_current={} was={} new={} (GATESTEAL B657: the pin contract is void on a core the steal declared dead; GATESTEAL2 B667: the singleton in no queue restarts at its loop head) ::",
+        ":: [smpbal] rehome dead=c{} live=c{} ready={} sleeping={} left={} current={} moved_current={} was={} new={} pump={} (GATESTEAL B657: the pin contract is void on a core the steal declared dead; GATESTEAL2 B667: the singleton in no queue restarts at its loop head) ::",
         dead,
         live,
         r.ready,
@@ -8053,7 +8053,8 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
         r.current.map_or(-1i64, |t| t as i64),
         r.moved_current as u8,
         if r.moved_current { was } else { "-" },
-        r.restarted.map_or(-1i64, |t| t as i64)
+        r.restarted.map_or(-1i64, |t| t as i64),
+        HidPumpWord(hid_to, live)
     );
     r
 }
@@ -8597,7 +8598,7 @@ fn gatesteal2_selftest() {
     }
     // The park's switch-back clears the core's published tid: wait for it, so the death finds the pump parked.
     let _ = hold2_wait(50, || current_task_id(dead) != Some(old));
-    let t_death = crate::arch::ms();
+    let t_death = crate::arch::ms(); let hid0 = crate::hidstall::pump_cpu(); HID_REHOME.store(usize::MAX, Ordering::Release); // GATESTEALWORKERCORE (B1029): the hid pump's core before the death, and the drain's record cleared
     crate::video::wm::comp_death_publish_fixture(dead);
     let restarted = hold2_wait(1_500, || {
         crate::sessionwedge::look(crate::arch::ms());
@@ -8610,7 +8611,7 @@ fn gatesteal2_selftest() {
     let live_ok = restarted && live != dead && SGL_LAST_CPU.load(Ordering::Relaxed) == live;
     let s1 = SGL_STAMPS.load(Ordering::Relaxed);
     sleep_ms(1_000);
-    let door = SGL_STAMPS.load(Ordering::Relaxed) > s1 && crate::drivers::xhci::poll_task_armed();
+    let door = SGL_STAMPS.load(Ordering::Relaxed) > s1 && crate::drivers::xhci::poll_task_armed(); let apart = pump_apart(hid0, dead); // GATESTEALWORKERCORE (B1029): after leg 1's second the hid pump has re-stamped its core
     HOLD2_SEM.post();
     let revenant = hold2_wait(1_500, || SGL_REVENANTS.load(Ordering::Acquire) != rev0);
     let by1 = crate::sessionwedge::gatesteal2_rehome().0;
@@ -8649,9 +8650,9 @@ fn gatesteal2_selftest() {
     let hdaring = (None::<bool>, alloc::string::String::from("hdaring=skip(not-built) reattach=skip drained=0 parked=0"));
     crate::sessionwedge::gatesteal2_wedge_leg(false);
     let steps = crate::video::wm::pump_gate_released_steps(); let park = pumppark_leg(rd0); // PUMPPARK (B839) LEG 4: a parked step skipped twice, then unparked on its timer. LINE-NEUTRAL fold, code first
-    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1 && wedge_ok && revenant2 && hdaring.0 != Some(false) && park.0;
+    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1 && wedge_ok && revenant2 && hdaring.0 != Some(false) && park.0 && apart.0;
     serial_println!(
-        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} revenant={} wedge_rehome={} wedge_current={} wedge_from=c{} wedge_live=c{} wedge_restart_ms={} wedge_revenant={} deaths={} {} parked_steps={} released_dead={} {}",
+        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} pump_apart={} revenant={} wedge_rehome={} wedge_current={} wedge_from=c{} wedge_live=c{} wedge_restart_ms={} wedge_revenant={} deaths={} {} parked_steps={} released_dead={} {}",
         dead,
         old,
         moved_current as u8,
@@ -8662,6 +8663,7 @@ fn gatesteal2_selftest() {
         if restarted { new as i64 } else { -1 },
         if restarted { live as i64 } else { -1 },
         if door { "alive" } else { "stale" },
+        apart.1,
         if revenant { "exited" } else { "stuck" },
         if wedge_ok { "wedge" } else if held2 { "none" } else { "unparked" },
         old2,
@@ -9477,6 +9479,23 @@ pub mod preemptoff {
         f()
     }
 
+    /// PREEMPTOFFSDHC (zenbook-ledger Z61): `(this CPU's preempt-off count is held, the current task id or u64::MAX)`,
+    /// read masked so the CPU cannot change between the two words — the sdhc CARD span's witness.
+    pub fn witness() -> (bool, u64) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let cpu = this_cpu();
+            if cpu >= MAX_CPUS {
+                return (false, u64::MAX);
+            }
+            let held = OFF[cpu].load(Ordering::Relaxed) > 0;
+            let tid = match SCHED[cpu].current_tid.load(Ordering::Relaxed) {
+                0 => u64::MAX,
+                id => id,
+            };
+            (held, tid)
+        })
+    }
+
     /// PREEMPTOFFAUDIT M1: the census of the x86 kernel's `without_interrupts` call sites at 611cf90b9 (cores.md §4, the
     /// Z57 row): 178 sites — 13 mask for an ISR or CPU state (I), 138 only for holder non-preemption (II), 27 for both
     /// (III); ONE converted to preempt-off (`drivers::block::hold::with`).
@@ -9522,26 +9541,75 @@ pub mod preemptoff {
                 (on, ticks, switched)
             },
         );
+        // PREEMPTOFFSDHC (zenbook-ledger Z61): the sdhc leg, after the hold — `sdhc_audit_leg` below.
+        #[cfg(feature = "sdhcblk")]
+        let (sdhc_word, sdhc_sw): (&'static str, u64) = sdhc_audit_leg();
+        #[cfg(not(feature = "sdhcblk"))]
+        let (sdhc_word, sdhc_sw): (&'static str, u64) = ("skip(no-sdhcblk)", 0);
+        let converted_sdhc = cfg!(feature = "sdhcblk") as u32;
+        let switched = switched.saturating_add(sdhc_sw);
         let reason = if !on {
             Some("masked")
         } else if ticks == 0 {
             Some("no-tick")
         } else if switched != 0 {
             Some("switched")
+        } else if sdhc_word == "masked" {
+            Some("sdhc-masked")
+        } else if sdhc_word == "not-held" {
+            Some("sdhc-not-held")
+        } else if sdhc_word == "err" {
+            Some("sdhc-read")
         } else {
             None
         };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} hold_irq_on=ok tick_in_hold=ok switched=0 -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} hold_irq_on={} tick_in_hold={} switched={} -> FAIL reason={} ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED,
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} -> FAIL reason={} ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word,
                 if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, r
             ),
         }
+    }
+
+    /// PREEMPTOFFSDHC (zenbook-ledger Z61) — `tests preemptaudit`'s SDHC LEG (named: other arcs add their own legs to
+    /// this block): a 64 KiB card read (`sdhc::read_blocks_512`, 128 sectors from LBA 0) from this unmasked task. Inside
+    /// the CARD span interrupts must be on and the preempt-off count held (the span's own record, `sdhc::audit_take`),
+    /// and nothing may switch this task out across the read. `(sdhc_irq_on word, switches)`: ok | masked | not-held |
+    /// err (the read failed) | skip(no-card) (no card bound, or under 128 sectors: QEMU without an sdhci card).
+    #[cfg(all(feature = "sdhcblk", any(feature = "ahci", feature = "nvme")))]
+    fn sdhc_audit_leg() -> (&'static str, u64) {
+        if crate::drivers::sdhc::card_num_blocks().unwrap_or(0) < 128 {
+            return ("skip(no-card)", 0);
+        }
+        let mut buf = alloc::vec![0u8; 128 * 512];
+        let (_, tid) = witness();
+        let cpu = this_cpu();
+        if cpu >= MAX_CPUS || tid == u64::MAX {
+            return ("err", 0);
+        }
+        let tid0 = SCHED[cpu].current_tid.load(Ordering::Relaxed);
+        let sw0 = ACCT[cpu].ctx_switches.load(Ordering::Relaxed);
+        crate::drivers::sdhc::audit_arm(tid);
+        let r = crate::drivers::sdhc::read_blocks_512(0, 128, &mut buf[..]);
+        let (irq, held) = crate::drivers::sdhc::audit_take();
+        let switched = (this_cpu() != cpu) as u64
+            + ACCT[cpu].ctx_switches.load(Ordering::Relaxed).wrapping_sub(sw0)
+            + (SCHED[cpu].current_tid.load(Ordering::Relaxed) != tid0) as u64;
+        let word = if r.is_err() {
+            "err"
+        } else if irq == 2 {
+            "masked"
+        } else if irq != 1 || !held {
+            "not-held"
+        } else {
+            "ok"
+        };
+        (word, switched)
     }
 }
 
@@ -9744,4 +9812,102 @@ fn restartalloc_selftest() {
         hc,
         if r.is_none() { " reason=no-restart" } else { "" }
     );
+}
+
+// ── GATESTEALWORKERCORE (rmbp-ledger B1029) — the hid pump leaves a dead core APART from the worker core. FILE-TAIL append. ──
+// Flight 38 / `tests gatesteal2`: the watch's `sessionwedge::pick_live` answers `smp::xhci_worker_cpu(0)` (c2) and
+// [`rehome_dead_core`] drained EVERY sleeper of the dead service core onto it — the `hid-pump` (spawned on the service core
+// beside the usb-pump, `drivers::ehci::hid_task_start`) among them — the core where bootlog / geodew / dock / flightrec had
+// placed their workers "apart from the hid pump" while it still sat on c7. The drain runs BEFORE the caller re-publishes the
+// split, so at drain time `xhci_worker_cpu(0)` is the pre-steal worker core (= live) and `xhci_worker_cpu(1)` is the one the
+// pool hands out first once the service role follows to live. ONE placement rule: the hid pump (by its spawn name: it
+// publishes no tid and runs at PRIO_NORMAL like every worker) lands on a dispatching, unparked core that is none of 0, the
+// dead core, live, the render core and those two worker cores, the least loaded by `pick_cpu`'s key pair; with none such it
+// shares live as before. Every other task moves exactly as before. `pick_live` (the service role) is unchanged.
+
+/// GATESTEALWORKERCORE (B1029): the `hid-pump` task's spawn name (`drivers::ehci::hid_task_start`) — its identity in the drain.
+const HID_PUMP_TASK: &str = "hid-pump";
+
+/// GATESTEALWORKERCORE (B1029): where the last [`rehome_dead_core`] drain put the hid pump — `usize::MAX` = no drain saw it,
+/// [`HID_REHOME_SHARED`] = onto `live` (no apart core), else that core. Written by the drain only; read by `tests gatesteal2`.
+static HID_REHOME: AtomicUsize = AtomicUsize::new(usize::MAX);
+const HID_REHOME_SHARED: usize = usize::MAX - 1;
+
+/// GATESTEALWORKERCORE (B1029): the hid pump's destination when it lived on `dead` — `None` when it did not, or when no core
+/// is apart from 0 / dead / live / render / `xhci_worker_cpu(0)` / `xhci_worker_cpu(1)` (asked by name, BP-cores-1). The
+/// scan is `pick_cpu`'s: masked, one run-queue lock at a time across `len()`, keys `max(depth, place_credit)` then
+/// `busy_pct`. Called before the drain's masked section (`xhci_worker_cpu` allocates).
+fn hid_rehome_cpu(dead: usize, live: usize) -> Option<usize> {
+    if crate::hidstall::pump_cpu() != dead {
+        return None;
+    }
+    let render = crate::arch::smp::render_cpu();
+    let w0 = crate::arch::smp::xhci_worker_cpu(0);
+    let w1 = crate::arch::smp::xhci_worker_cpu(1);
+    let now_ms = crate::arch::ms();
+    let mut best: Option<(usize, usize, u32)> = None; // (cpu, load, pct)
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for c in 1..MAX_CPUS {
+            if c == dead || c == live || Some(c) == render || Some(c) == w0 || Some(c) == w1 || !cpu_dispatching(c) || is_dead_core(c) {
+                continue;
+            }
+            let load = RUN_QUEUES[c].lock().len().max(place_credit(c, now_ms) as usize);
+            let pct = ACCT[c].busy_pct(0);
+            let better = match best {
+                None => true,
+                Some((_, bl, bp)) => load < bl || (load == bl && pct < bp),
+            };
+            if better {
+                best = Some((c, load, pct));
+            }
+        }
+    });
+    best.map(|(c, _, _)| c)
+}
+
+/// GATESTEALWORKERCORE (B1029): the drain's destination for one task — `live` for every task but the hid pump, which takes
+/// `hid` (or `live` with none) and is recorded in `hid_to` and [`HID_REHOME`].
+fn hid_dst(name: &'static str, hid: Option<usize>, live: usize, hid_to: &mut Option<usize>) -> usize {
+    if name != HID_PUMP_TASK {
+        return live;
+    }
+    let d = hid.unwrap_or(live);
+    *hid_to = Some(d);
+    HID_REHOME.store(if d == live { HID_REHOME_SHARED } else { d }, Ordering::Release);
+    d
+}
+
+/// GATESTEALWORKERCORE (B1029): the `[smpbal] rehome` line's `pump=` word — `c<n>` (moved apart), `c<live>(shared)` (no apart
+/// core), `-` (the hid pump was not in this drain).
+struct HidPumpWord(Option<usize>, usize);
+
+impl core::fmt::Display for HidPumpWord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            None => f.write_str("-"),
+            Some(c) if c == self.1 => write!(f, "c{}(shared)", c),
+            Some(c) => write!(f, "c{}", c),
+        }
+    }
+}
+
+/// GATESTEALWORKERCORE (B1029): `tests gatesteal2`'s `pump_apart=` — `(not failing, word)`. `skip(elsewhere)` when the hid
+/// pump was not on the dead core, `skip(no-core)` when the drain had no apart core (a small box), `fail(not-drained)` when no
+/// drain saw it, else `ok` iff the hid pump now stamps from the drain's pick and that core is neither the new service core
+/// (`SGL_HOME`), nor the re-published `xhci_worker_cpu(0)`, nor 0; `fail(c<n>)` otherwise.
+#[cfg(feature = "wc")]
+fn pump_apart(hid0: usize, dead: usize) -> (bool, alloc::string::String) {
+    if hid0 != dead {
+        return (true, alloc::string::String::from("skip(elsewhere)"));
+    }
+    let to = HID_REHOME.load(Ordering::Acquire);
+    if to == usize::MAX {
+        return (false, alloc::string::String::from("fail(not-drained)"));
+    }
+    if to == HID_REHOME_SHARED {
+        return (true, alloc::string::String::from("skip(no-core)"));
+    }
+    let p = crate::hidstall::pump_cpu();
+    let ok = p == to && p != SGL_HOME.load(Ordering::Acquire) && Some(p) != crate::arch::smp::xhci_worker_cpu(0) && p != 0;
+    if ok { (true, alloc::string::String::from("ok")) } else { (false, alloc::format!("fail(c{})", p as i64)) }
 }

@@ -101,6 +101,8 @@ REQUIRE :: HDAPATH: d0=ok path=ok sets=6 cases=3/3 -> PASS ::
 # ZENBOOKSPECPINS (zenbook-ledger Z54): ALCPLAY-SPEC — ZENBOOKACPPLAY's (Z47) decision KAT, printed after HDAPATH by the same `tests hdacensus`
 REQUIRE \[hda\] alcplay kat keep=ok arm=ok tone=ok play=ok held=ok -> ok
 FORBID \[hda\] alcplay kat .*-> FAIL
+# ZENBOOKACPDEPOP (zenbook-ledger Z60): the alc294_hp_init depop KAT (verb order, the 0x6f / 0x58 masks, the 20 x 50 ms poll bound, a silent door), printed after the alcplay kat by the same `tests hdacensus`
+REQUIRE \[hda\] depop kat verbs=20 order=ok rmw=ok poll=ok nack=ok -> ok
 FORBID \[hda\] (gpio|tone|path)\b
 
 # ── END OF RUN: the last typed verdict (mbench's completion also needs every REQUIRE above) ───────────────────────────
