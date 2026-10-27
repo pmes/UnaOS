@@ -287,7 +287,7 @@ impl Pic {
             }
             Pic::Av1(d, c) => {
                 let planes = d.decode_temporal_unit(data).map_err(|e| (matches!(e, av1_core::Error::Unsupported(_)), alloc::format!("av1: {:?}", e)))?;
-                Ok(Some((planes.width as usize, planes.height as usize, Px::planes(Src::Av1(Box::new(planes), *c))))) // KERNELSCALECONVERT (B971)
+                Ok(Some((planes.width as usize, planes.height as usize, Px::planes(Src::Av1(Box::new(planes), inband_colour(d, *c, pts)))))) // KERNELSCALECONVERT (B971); AV1INBANDSWITCH (SR373): the frame's colour, decided at the decode
             }
             Pic::Utp1 => {
                 // the stream's own decoder: the packet names its frame; the picture is a flat field whose level steps
@@ -2132,4 +2132,24 @@ fn vp8_picture(y: &vp8_core::Yuv420, c: Option<Colour>) -> (yuv_core::Picture<'_
 fn av1_picture(planes: &av1_core::image::Planes, c: Option<Colour>) -> (yuv_core::Picture<'_, u16>, yuv_core::Matrix) {
     let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), planes.width, planes.height);
     (yuv_core::Picture { full, ..av1_core::image::picture(planes) }, m)
+}
+
+// ── AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream re-picks the colour (handlers.md §5 NLEPROBE-HDR) ──────────
+// `Pic::decode_raw`'s Av1 arm decides each frame's colour right after the decode: the open's (`Track::colour`) until the decoder's
+// current sequence header states other code points than the first decoded one, then av1_core's ONE rule
+// (`StreamDecoder::switch` / `switch_codes`: a field the open took from the bitstream follows the new header, a container-stated
+// one stays), the host `Av1Decoder`'s too. Wire: `[vplay] colour switch at <pts ticks> matrix=<a>-><b> range=<full|limited>`, once
+// per change, printed here (in decode_raw), never at the conversion.
+
+/// AV1INBANDSWITCH (SR373): the colour an AV1 frame converts by, `c` the open's; the switch line on a change.
+fn inband_colour(d: &mut av1_core::image::StreamDecoder, c: Option<Colour>, pts: i64) -> Option<Colour> {
+    let (now, changed) = d.switch(c.map(|c| (c.primaries, c.transfer, c.matrix, c.full_range)));
+    let full = now.map_or(c.and_then(|c| c.full_range), |n| n.3);
+    if let Some((a, b)) = changed {
+        serial_println!("[vplay] colour switch at {} matrix={}->{} range={}", pts, a, b, if full == Some(true) { "full" } else { "limited" });
+    }
+    match now {
+        Some((primaries, transfer, matrix, full_range)) => Some(Colour { primaries, transfer, matrix, full_range, mastering: c.and_then(|c| c.mastering), light: c.and_then(|c| c.light) }),
+        None => c,
+    }
 }

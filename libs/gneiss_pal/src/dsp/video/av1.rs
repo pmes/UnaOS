@@ -24,6 +24,7 @@ use av1_core::image::{Planes, StreamDecoder};
 pub struct Av1Decoder {
     inner: StreamDecoder,
     timebase: crate::dsp::demux::Timebase,
+    open: Option<crate::dsp::demux::colour::Colour>, // AV1INBANDSWITCH (SR373): the open's colour (`Track::colour`), what a header switch merges under
 }
 
 fn map_err(e: av1_core::Error) -> DecodeError {
@@ -37,7 +38,7 @@ impl Av1Decoder {
     /// `track.config` is the av1C record (MP4) or CodecPrivate (Matroska); empty is allowed when
     /// the stream carries its own sequence header.
     pub fn new(track: &Track) -> Result<Av1Decoder, DecodeError> {
-        Ok(Av1Decoder { inner: StreamDecoder::new(&track.config).map_err(map_err)?, timebase: track.timebase })
+        Ok(Av1Decoder { inner: StreamDecoder::new(&track.config).map_err(map_err)?, timebase: track.timebase, open: track.colour })
     }
 }
 
@@ -47,7 +48,7 @@ impl VideoDecoder for Av1Decoder {
     }
     fn decode(&mut self, pkt: &Packet) -> Result<Option<Frame>, DecodeError> {
         let planes = self.inner.decode_temporal_unit(&pkt.data).map_err(map_err)?;
-        Ok(Some(planes_frame(planes, self.timebase.to_ns(pkt.pts))?))
+        Ok(Some(self.inband(planes_frame(planes, self.timebase.to_ns(pkt.pts))?))) // AV1INBANDSWITCH (SR373): a mid-stream header switch re-picks
     }
     fn reset(&mut self) {
         self.inner.reset();
@@ -175,5 +176,27 @@ mod tests {
                 other => panic!("{name}: {other:?}"),
             }
         }
+    }
+}
+
+// ── AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream re-picks the colour (handlers.md §5 NLEPROBE-HDR) ──────────
+// `av1_core::image::StreamDecoder::switch` is the ONE rule (the kernel Player's `inband_colour` calls it too). While the current
+// header's code points equal the open's, the frame leaves as planes, byte-identical; once they differ the frame leaves CONVERTED
+// by the switched colour through the ONE conversion (`Frame::to_rgba_colour`, AV1's bilinear chroma as `chroma_of`), so the bus
+// sink, the editor's `src_rgba` and play-check all pass it through. Wire: `[STRIA] :: video colour switch at <pts_ns>
+// matrix=<a>-><b> range=<full|limited>`, once per change.
+impl Av1Decoder {
+    fn inband(&mut self, f: Frame) -> Frame {
+        use crate::dsp::demux::colour::Colour;
+        let open = self.open.map(|c| (c.primaries, c.transfer, c.matrix, c.full_range));
+        let (now, changed) = self.inner.switch(open);
+        let range = |r: Option<bool>| if r == Some(true) { "full" } else { "limited" };
+        if let Some((a, b)) = changed {
+            log::info!("[STRIA] :: video colour switch at {} matrix={}->{} range={}", f.pts_ns, a, b, range(now.map_or(self.open.and_then(|c| c.full_range), |n| n.3)));
+        }
+        let Some((primaries, transfer, matrix, full_range)) = now else { return f };
+        let c = Colour { primaries, transfer, matrix, full_range, mastering: self.open.and_then(|c| c.mastering), light: self.open.and_then(|c| c.light) };
+        let rgba = f.to_rgba_colour(Some(&c), super::Chroma::Bilinear);
+        Frame { pixels: Pixels::Rgba(rgba), ..f }
     }
 }
