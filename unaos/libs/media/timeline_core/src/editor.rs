@@ -305,7 +305,7 @@ impl EditorState {
 /// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
-        let ph = self.playhead;
+        let ph = self.playhead; if let Some(r) = self.size_verb(v) { return Some(r); } // NLESIZEPOLICYUI (SR402): the `size` words (file tail)
         Some(match v {
             "prev" => {
                 self.nudge(-1);
@@ -403,5 +403,49 @@ mod verb_tests {
         assert_eq!(st.verb("play"), None);
         st.deselect();
         assert_eq!(st.verb("]"), Some(Err(EditError::NoClip)));
+    }
+}
+
+// ── NLESIZEPOLICYUI (LEDGER SR402): the reel's size policy from the editor (handlers.md §5 NLEPROBE-HDR's NLE-SIZE-POLICY-UI) ──
+// The `size` words ride THE verb dispatch ([`EditorState::verb`]) both faces call: `size <reel> <policy>` sets a reel's
+// [`crate::SizePolicy`] through `Timeline::set_size_policy` and the ONE `commit` (undo-able; the EDL's `* UNA SIZE` line is
+// written by `edl::write` wherever a face saves), bare `size` cycles the selected clip's reel through `SizePolicy::next`
+// (the host face's Size button). Refused by name: an unknown reel `EditError::NoSource`, an unknown policy word (or the
+// wrong number of words) `EditError::Policy`, a bare `size` with no clip selected `EditError::NoClip`.
+impl EditorState {
+    /// Reel `reel`'s size policy set to `p` (one commit; the same policy again commits nothing).
+    pub fn set_size_policy(&mut self, reel: &str, p: crate::SizePolicy) -> Result<(), EditError> {
+        let src = self.timeline.source_by_reel(reel).ok_or(EditError::NoSource)?;
+        if src.size_policy == p {
+            return Ok(());
+        }
+        let tl = self.timeline.set_size_policy(src.id, p)?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The selected clip's reel steps to its next size policy (Letterbox -> Fill -> Stretch -> Adopt -> Letterbox).
+    pub fn cycle_size(&mut self) -> Result<(), EditError> {
+        let c = self.selected().ok_or(EditError::NoClip)?;
+        let src = self.timeline.source(c.src).ok_or(EditError::NoSource)?;
+        let tl = self.timeline.set_size_policy(src.id, src.size_policy.next())?;
+        self.commit(tl);
+        Ok(())
+    }
+    /// The `size` words of [`EditorState::verb`]; `None` when `v` is not a `size` verb.
+    fn size_verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
+        let mut w = v.split_ascii_whitespace();
+        if w.next() != Some("size") {
+            return None;
+        }
+        Some(match (w.next(), w.next(), w.next()) {
+            (None, _, _) => self.cycle_size(),
+            (Some(reel), Some(word), None) => match crate::SizePolicy::from_name(word) {
+                Some(p) => self.set_size_policy(reel, p),
+                None if self.timeline.source_by_reel(reel).is_none() => Err(EditError::NoSource),
+                None => Err(EditError::Policy),
+            },
+            (Some(reel), None, _) if self.timeline.source_by_reel(reel).is_none() => Err(EditError::NoSource),
+            _ => Err(EditError::Policy),
+        })
     }
 }

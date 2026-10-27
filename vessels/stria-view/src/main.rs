@@ -477,6 +477,7 @@ fn transport() -> TetraNode {
         button("{", "Out -"),
         button("}", "Out +"),
         button("lift", "Lift"),
+        button("size", "Size"), // NLESIZEPOLICYUI (SR402): cycles the selected clip's reel's size policy
     ])
 }
 
