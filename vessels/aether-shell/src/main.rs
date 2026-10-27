@@ -1619,6 +1619,48 @@ mod tests {
             assert_eq!(rx, engine.present_rgba().2, "zoom {zoom}: still the frame");
         }
     }
+
+    /// AETHERSURFACEHEIGHT (SR411): the page surface's ONE scale, through the shell's own chain on a fake 1000x800-pt
+    /// view at backing scale 2 (no AppKit: the arithmetic is `quartzite::platforms::page_geometry`'s, which the AppKit
+    /// face's `fire_resize` and `sync_metal_layer` read): the viewport the face sends is the points, the engine's device
+    /// and CSS viewport are 1000x800, the frame and the blit are 1000x800, the quad covers the view and only the
+    /// drawable is 2000x1600; a pixel-sized frame (top-left quarter) and a half-height frame are both flagged; zoom 200
+    /// keeps the device and halves the CSS viewport (the engine's one scale is zoom).
+    #[test]
+    fn surfaceheight_one_scale_chain_kat() {
+        let view = (1000.0, 800.0);
+        let probe = quartzite::platforms::page_geometry(view, 2.0, (0, 0));
+        assert_eq!(probe.viewport, (1000, 800), "BrowserResize carries the view in points");
+        let mut engine = AetherEngine::new();
+        engine.set_device_size(probe.viewport.0, probe.viewport.1); // as `Tab::fit_page` does with the pane closed
+        engine.load_html("about:blank", "<html><body><p>surface</p></body></html>", true);
+        let _ = engine.render_frame();
+        assert_eq!(engine.device_size(), (1000, 800));
+        assert_eq!((engine.width, engine.height), (1000, 800), "CSS viewport = points at zoom 100");
+        let (w, h, frame) = engine.present_rgba();
+        assert_eq!((w, h), (1000, 800));
+        let mut sent = quartzite::tetra::SurfaceDamage::default();
+        let Some(SMessage::SurfaceBlit { width, height, damage: None, .. }) = sent.frame("viewport", w, h, frame) else { panic!("first blit is whole") };
+        assert_eq!((width, height), (1000, 800), "texture = the blit");
+        let g = quartzite::platforms::page_geometry(view, 2.0, (width, height));
+        assert!(g.covers(), "{}", g.witness());
+        assert_eq!(g.drawable, (2000, 1600), "the backing scale enters only at the drawable");
+        assert_eq!(g.witness(), "view=1000x800pt scale=2 viewport=1000x800 frame=1000x800 drawable=2000x1600px covers=yes");
+        // The two wrong shapes: a pixel-sized frame shows the top-left quarter; a half-height frame stops mid-view.
+        let px = quartzite::platforms::page_geometry(view, 2.0, (2000, 1600));
+        assert_eq!(px.quad, Some([-1.0, 1.0, 3.0, -3.0]));
+        assert!(!px.covers());
+        let half = quartzite::platforms::page_geometry(view, 2.0, (1000, 400));
+        assert_eq!(half.quad, Some([-1.0, 1.0, 1.0, 0.0]));
+        assert!(half.witness().ends_with("covers=no"));
+        // Zoom 200 on the same view: the device stays the points, the CSS viewport halves, the frame stays the device.
+        engine.set_zoom_pct(200);
+        let _ = engine.render_frame();
+        assert_eq!(engine.device_size(), (1000, 800));
+        assert_eq!((engine.width, engine.height), (500, 400));
+        let (zw, zh, _) = engine.present_rgba();
+        assert!(quartzite::platforms::page_geometry(view, 2.0, (zw, zh)).covers());
+    }
 }
 
 /// AETHERMAC (SR196): every face opens the first argument that is not a flag as the first page
