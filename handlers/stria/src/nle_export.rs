@@ -129,7 +129,7 @@ impl H264Encoder {
 impl VideoEncoder for H264Encoder {
     fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
         if self.enc.is_none() {
-            self.enc = Some(Encoder::new(Config { width, height, qp: self.qp, gop: self.gop }).map_err(ExportError::H264)?);
+            self.enc = Some(Encoder::new(Config { width, height, qp: self.qp, gop: self.gop, ..Default::default() }).map_err(ExportError::H264)?);
         }
         let enc = self.enc.as_mut().expect("built above");
         let yuv = I420::from_rgba(width, height, rgba).map_err(ExportError::H264)?;

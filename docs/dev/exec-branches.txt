@@ -833,7 +833,7 @@ refs/heads/exec-rmbp-nle6   5e65a8816 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle2b   5e65a8816 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle3b   93b1f9431 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-onetext   056a7a524 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-h264enc2   5e65a8816 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-h264enc2   9f778dc37 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-httpfail   d78ff23a7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-wpa2join   1705724a4 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-demuxwire   1705724a4 IN-FLIGHT cut 2026-10-27

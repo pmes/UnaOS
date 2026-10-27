@@ -71,7 +71,7 @@ fn assert_decode_is_recon(f: &Frame, enc: &Encoder, w: usize, h: usize) {
 }
 
 fn encode_intra(img: &Img, qp: u8) -> (Encoder, Access) {
-    let mut enc = Encoder::new(Config { width: img.w as u32, height: img.h as u32, qp, gop: 1 }).unwrap();
+    let mut enc = Encoder::new(Config { width: img.w as u32, height: img.h as u32, qp, gop: 1, ..Default::default() }).unwrap();
     let au = enc.encode(&img.yuv()).unwrap();
     (enc, au)
 }
@@ -228,7 +228,7 @@ fn m1_textured_frame_takes_intra4x4_and_decodes_to_the_reconstruction() {
 
 #[test]
 fn m1_configuration_refusals() {
-    let cfg = Config { width: 64, height: 48, qp: 26, gop: 10 };
+    let cfg = Config { width: 64, height: 48, qp: 26, gop: 10, ..Default::default() };
     assert_eq!(Encoder::new(Config { width: 63, ..cfg }).err(), Some(Error::Geometry));
     assert_eq!(Encoder::new(Config { height: 0, ..cfg }).err(), Some(Error::Geometry));
     assert_eq!(Encoder::new(Config { qp: 15, ..cfg }).err(), Some(Error::Qp));
@@ -237,4 +237,27 @@ fn m1_configuration_refusals() {
     let mut enc = Encoder::new(cfg).unwrap();
     let img = smooth(32, 48);
     assert_eq!(enc.encode(&img.yuv()).err(), Some(Error::FrameSize));
+}
+
+/// H264ENC2 M1 (LEDGER SR211): with the deblocking filter on, the slice header reads back as
+/// disable_deblocking_filter_idc 0 with zero offsets and the filtered I frame decodes to the
+/// reconstruction byte for byte.
+#[test]
+fn m1_deblock_slice_header_reads_back_idc0() {
+    let img = textured(64, 48);
+    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 32, gop: 1, deblock: true, ..Default::default() }).unwrap();
+    let au = enc.encode(&img.yuv()).unwrap();
+    let mut dec = Decoder::new();
+    let f = decode_one(&mut dec, &au);
+    assert_decode_is_recon(&f, &enc, 64, 48);
+    let mut rbsp = Vec::new();
+    nal::unescape(&au.nals[0][1..], &mut rbsp);
+    let sps = ps::parse_sps(&rbsp).unwrap();
+    nal::unescape(&au.nals[1][1..], &mut rbsp);
+    let pps = ps::parse_pps(&rbsp, |_| 1).unwrap();
+    let h = nal::parse_header(au.nals[2][0]).unwrap();
+    nal::unescape(&au.nals[2][1..], &mut rbsp);
+    let mut r = BitReader::new(&rbsp);
+    let sh = ps::parse_slice_header(&mut r, h.nal_type, h.ref_idc, |_| Some(&pps), |_| Some(&sps)).unwrap();
+    assert_eq!((sh.disable_deblocking, sh.alpha_offset, sh.beta_offset), (0, 0, 0));
 }

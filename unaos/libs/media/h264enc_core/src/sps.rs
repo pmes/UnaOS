@@ -116,9 +116,10 @@ pub fn write_pps(qp: i32) -> Vec<u8> {
 /// slice_header (7.3.3) of the one slice of a picture: first_mb_in_slice 0, slice_type 7 (I, all
 /// slices of the picture) or 5 (P), the PPS, frame_num, idr_pic_id on an IDR; a P slice keeps the
 /// default one active reference and no list modification; marking is the IDR's 0 / 0 or sliding
-/// window; slice_qp_delta 0; disable_deblocking_filter_idc 1 (the reconstruction is unfiltered,
-/// the in-loop filter is owed: H264ENC-DEBLOCK).
-pub fn write_slice_header(w: &mut BitWriter, idr: bool, frame_num: u32, log2_max_frame_num: u32, idr_pic_id: u32) {
+/// window; slice_qp_delta 0; disable_deblocking_filter_idc 0 with zero filter offsets when
+/// `deblock` (the encoder filters its reconstruction as the decoder does, SR211), else 1 (the
+/// reconstruction is unfiltered).
+pub fn write_slice_header(w: &mut BitWriter, idr: bool, frame_num: u32, log2_max_frame_num: u32, idr_pic_id: u32, deblock: bool) {
     w.ue(0); // first_mb_in_slice
     w.ue(if idr { 7 } else { 5 }); // slice_type
     w.ue(0); // pic_parameter_set_id
@@ -139,5 +140,11 @@ pub fn write_slice_header(w: &mut BitWriter, idr: bool, frame_num: u32, log2_max
         w.flag(false); // adaptive_ref_pic_marking_mode_flag: sliding window
     }
     w.se(0); // slice_qp_delta
-    w.ue(1); // disable_deblocking_filter_idc
+    if deblock {
+        w.ue(0); // disable_deblocking_filter_idc
+        w.se(0); // slice_alpha_c0_offset_div2
+        w.se(0); // slice_beta_offset_div2
+    } else {
+        w.ue(1); // disable_deblocking_filter_idc
+    }
 }

@@ -35,7 +35,7 @@ fn frame(t: usize) -> [Vec<u8>; 3] {
 
 #[test]
 fn m3_ten_frames_through_mp4_demux_and_decode() {
-    let mut enc = Encoder::new(Config { width: W as u32, height: H as u32, qp: 26, gop: 4 }).unwrap();
+    let mut enc = Encoder::new(Config { width: W as u32, height: H as u32, qp: 26, gop: 4, ..Default::default() }).unwrap();
     let mut samples = Vec::new();
     let mut recon = Vec::new();
     for t in 0..10 {
