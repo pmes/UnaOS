@@ -31,13 +31,14 @@
 //! | `gop`            | >= 1          | (set)   | an IDR every `gop` frames                               |
 //! | `deblock`        | bool          | false   | idc 0 + h264_core's `deblock_picture` over the recon    |
 //! | `subpel`         | 0 / 1 / 2     | 0       | motion refinement: integer / half / quarter (>2 = 2)    |
-//! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP |
+//! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP; CRF: constant quality (SR383) |
 //! | `entropy`        | [`Entropy`]   | Cavlc   | Cabac: Main profile, entropy_coding_mode_flag 1, [`cabac`] writes the slice data |
 //! | `transform8x8`   | bool          | false   | High (profile_idc 100), transform_8x8_mode_flag: Intra_8x8 in I macroblocks (SR322) |
 //! | `bframes`        | 0..=4         | 0       | B pictures between anchors (SR333): push / flush, VUI reorder 1 (>4 = 4); >= 2 the pyramid (SR349) |
 //! | `direct_temporal`| bool          | false   | temporal direct on the Bs whose L1[0] is an anchor (SR349)          |
 //! | `bipred`         | [`BiPred`]    | Auto    | weighted_bipred_idc: Auto = implicit under the pyramid, else the average (SR349) |
 //! | `colour`         | `Option<(u8, u8, u8, bool)>` | None | VUI video_signal_type + colour_description: primaries, transfer, matrix, full range (SR377) |
+//! | `qp_min`         | `Option<u8>`, 16..=51 | None | the floor of every rate-controlled QP; None = `rc::QP_MIN` 16 (SR383) |
 //!
 //! | module          | Recommendation                                                          |
 //! |-----------------|-------------------------------------------------------------------------|
@@ -113,7 +114,8 @@ pub enum Error {
     Gop,
     /// A frame whose size or planes do not match the configuration.
     FrameSize,
-    /// A rate control with a zero bit rate or frame rate, or a VBR max below its mean.
+    /// A rate control with a zero bit rate or frame rate, a VBR max below its mean, a CRF above 51 or a QP floor
+    /// ([`Config::qp_min`]) outside 16..=51.
     Rate,
 }
 
@@ -124,7 +126,7 @@ impl core::fmt::Display for Error {
             Error::Qp => "h264enc: QP outside 16..=40",
             Error::Gop => "h264enc: GOP length 0",
             Error::FrameSize => "h264enc: frame does not match the configured size",
-            Error::Rate => "h264enc: rate control with a zero bit rate / frame rate, or a VBR max below its mean",
+            Error::Rate => "h264enc: rate control with a zero bit rate / frame rate, a VBR max below its mean, a CRF above 51 or a QP floor outside 16..=51",
             Error::Reorder => "h264enc: B pictures are reordered: code through push / flush, not encode",
         })
     }
@@ -172,6 +174,9 @@ pub struct Config {
     /// matrix_coefficients, video_full_range_flag), written as the SPS VUI's video_signal_type with its colour_description; the
     /// exports pass the file's one colour (the same the MP4 `colr` states). None keeps every pinned byte.
     pub colour: Option<(u8, u8, u8, bool)>,
+    /// H264ENCVBRCRF (LEDGER SR383): the floor of every rate-controlled picture and row QP, 16..=51 (else [`Error::Rate`]);
+    /// None = [`rc::QP_MIN`] (16). Read through [`Config::qp_floor`]; unread without [`Config::rate`].
+    pub qp_min: Option<u8>,
 }
 
 /// weighted_bipred_idc of the stream (H264ENCPYRAMID, SR349); without `bframes` always 0.
@@ -469,7 +474,7 @@ impl Encoder {
             return Err(Error::Gop);
         }
         let rc = match cfg.rate {
-            Some(r) => Some(rc::Rc::new(r, cfg.gop, cfg.qp as i32)?.with_bframes(cfg.bframes.min(4))),
+            Some(r) => Some(rc::Rc::new(r, cfg.gop, cfg.qp as i32, cfg.qp_floor())?.with_bframes(cfg.bframes.min(4))),
             None => None,
         };
         let (mb_w, mb_h) = (cfg.width.div_ceil(16) as usize, cfg.height.div_ceil(16) as usize);

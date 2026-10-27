@@ -28,7 +28,7 @@
 //!   length, the AAC entry restated (`build::mp4a_spec` through `Mp4Stream::respec`) with its priming trimmed by
 //!   `build::mp4a_edit_list` in the extras `Mp4Stream::finish` takes ([`Exp::sound_close`]) — then the moov. Written as the shell writes (`write_veto` at start, the kernel principal) through
 //!   the ONE VFS writer, `MountTable::put_file` / `write_all_at`; a refused, failed or superseded export unlinks its
-//!   partial file. `--bitrate KBPS` is h264enc_core's `Config.rate` (CBR), the field Stria's `with_bitrate` sets.
+//!   partial file. `--bitrate KBPS` is h264enc_core's `Config.rate` (CBR), the field Stria's `with_bitrate` sets; `--crf N` (H264ENCVBRCRF SR383) the same field as `RateControl::crf` (Stria's `with_quality`), exclusive with `--bitrate` (refused at start).
 //! * THE PICTURE (H264ENCPLANES, rmbp-ledger B973): the file has ONE colour, fixed at its first frame ([`Exp::push`]): an
 //!   unmixed 8-bit 4:2:0 decoder picture enters h264enc_core's planar entry (`RgbaEncoder::push_planes`) with no RGBA round
 //!   trip when its resolved colour is the file's; any other frame (mixed, black, 10-bit, 4:4:4, another colour) converts its
@@ -64,15 +64,15 @@ pub struct Opts {
     pub gop: u32,
     /// B pictures between anchors (0..=4; h264enc_core's `Config::bframes`).
     pub bframes: u8,
-    /// A constant bit rate in kbit/s (h264enc_core's `Config.rate`, CBR; `qp` its starting QP); 0 = constant QP.
-    pub bitrate: u32,
+    /// A constant bit rate in kbit/s (h264enc_core's `Config.rate`, CBR; `qp` its starting QP); 0 = constant QP. `crf` (SR383): constant quality 0..=51 (`RateControl::crf`), exclusive with `bitrate`.
+    pub bitrate: u32, pub crf: Option<u8>,
     /// NLE6EXPORTAAC (rmbp-ledger B960): the sound as AAC-LC at this many kb/s; 0 = PCM16 `sowt` (the default).
     pub aac_kbps: u32,
 }
 
 impl Default for Opts {
     fn default() -> Opts {
-        Opts { qp: 26, gop: 0, bframes: 0, bitrate: 0, aac_kbps: 0 }
+        Opts { qp: 26, gop: 0, bframes: 0, bitrate: 0, crf: None, aac_kbps: 0 }
     }
 }
 
@@ -137,7 +137,7 @@ pub fn start(edl: &str, out: &str, opts: Opts) -> Result<u32, String> {
         // NLE6EXPORTMKV (rmbp-ledger B966): THE RULE — the out path's extension names the container (`build::Container::of`)
         return Err(alloc::format!("{}: the export writes .mp4 or .mkv", out));
     }
-    if super::player::is_open() {
+    if opts.bitrate > 0 && opts.crf.is_some() { return Err(String::from("--bitrate and --crf are exclusive")); } if super::player::is_open() {
         return Err(String::from("the Player is open (close it first: the export takes vplay's one job)"));
     }
     if let Ok(Some(why)) = crate::shell::vfs_mount_table().write_veto(out) {
@@ -191,7 +191,7 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, planes: Opt
         if e.opts.bitrate > 0 {
             // `RateControl::cbr`, the constructor Stria's `with_bitrate(k, tb.den, tb.num)` calls: the same `Config.rate`, set before the first picture builds the encoder
             e.rgba.cfg.rate = Some(h264enc_core::RateControl::cbr(e.opts.bitrate, (tb.den as u32, tb.num.max(1) as u32)));
-        }
+        } else if let Some(c) = e.opts.crf { e.rgba.cfg.rate = Some(h264enc_core::RateControl::crf(c, (tb.den as u32, tb.num.max(1) as u32))); } // SR383: `--crf N`, Stria's `with_quality`
     }
     let sized = e.sized(w, h); // AV1INBANDSIZE (SR379): the first frame fixes the size; a later frame of another size is refused by name (file tail)
     let r = match sized.and_then(|()| e.push(w, h, planes, rgba).map_err(|err| alloc::format!("{}", err))) {
@@ -312,9 +312,9 @@ pub(crate) fn write_file(path: &str, body: &[u8]) -> Result<u64, String> {
     crate::shell::vfs_mount_table().put_file(path, body, crate::fs::vfs::KERNEL_PRINCIPAL).map(|n| n as u64).map_err(|e| alloc::format!("write {}: {:?}", path, e))
 }
 
-/// `nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS] [--aac KBPS]`: arm and start; the job prints the progress and the end.
+/// `nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS | --crf N] [--aac KBPS]`: arm and start; the job prints the progress and the end.
 pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
-    const USAGE: &str = "usage: nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS] [--aac KBPS]";
+    const USAGE: &str = "usage: nle export <edl> <out.mp4|out.mkv> [--qp N] [--gop N] [--bframes N] [--bitrate KBPS | --crf N] [--aac KBPS]";
     if args.first().copied() != Some("export") || args.len() < 3 {
         console.println(USAGE);
         return;
@@ -327,7 +327,7 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
             ("--qp", Some(n)) => o.qp = n.min(255) as u8,
             ("--gop", Some(n)) => o.gop = n,
             ("--bframes", Some(n)) => o.bframes = n.min(255) as u8,
-            ("--bitrate", Some(n)) => o.bitrate = n,
+            ("--bitrate", Some(n)) => o.bitrate = n, ("--crf", Some(n)) => o.crf = Some(n.min(255) as u8),
             ("--aac", Some(n)) => o.aac_kbps = n,
             _ => {
                 console.println(USAGE);

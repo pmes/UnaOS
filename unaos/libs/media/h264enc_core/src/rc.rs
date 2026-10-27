@@ -35,6 +35,11 @@
 //!
 //! - the one CBR constructor (H264ENC-CBRONE SR371): [`RateControl::cbr`], which Stria's `with_bitrate` and the kernel's export call.
 //!
+//! - H264ENCVBRCRF (SR383): [`RateControl::vbr`] beside it; constant quality [`RcMode::Crf`] through [`RateControl::crf`] (the
+//!   picture QP is the constant-QP rule's at base crf — I and P at crf, a B picture its B offset above — clamped to the floor; no
+//!   bit budget, no row modulation); the floor of every rate-controlled QP is [`crate::Config::qp_min`] (None = [`QP_MIN`]),
+//!   read through [`crate::Config::qp_floor`].
+//!
 //! Owed (handlers.md §5 H264ENC-RC): two-pass, scene-cut IDRs, per-MB activity masking, HRD signalling.
 
 use alloc::vec::Vec;
@@ -43,7 +48,7 @@ use h264_core::tables::QPC;
 
 use crate::{Encoder, Error, Pic, Result, B_QP_OFFSET};
 
-/// The lowest QP the rate controller picks (the encoder's configured floor).
+/// The lowest QP the rate controller picks by default: the default of [`crate::Config::qp_min`] (SR383).
 pub const QP_MIN: i32 = 16;
 /// The highest QP the rate controller picks (the Recommendation's QPY limit).
 pub const QP_MAX: i32 = 51;
@@ -60,6 +65,9 @@ pub enum RcMode {
     /// Variable bit rate: the mean holds at `bits_per_second`, a complex picture may spend more, up
     /// to a one-second bucket drained at `max_bits_per_second`.
     Vbr { max_bits_per_second: u32 },
+    /// Constant quality (H264ENCVBRCRF SR383), crf 0..=51: each picture's QP is the constant-QP rule's at base crf (B pictures
+    /// their offset above), clamped to [`crate::Config::qp_floor`]..=51; `bits_per_second` is not read.
+    Crf(u8),
 }
 
 /// The rate control of a stream ([`crate::Config::rate`]); `fps_num / fps_den` pictures per second.
@@ -118,6 +126,8 @@ pub(crate) struct Rc {
     /// [I, P, B].
     types: [Model; 3],
     last_qp: i32,
+    /// The lowest picture / row QP ([`crate::Config::qp_floor`], SR383).
+    floor: i32,
     // The picture being coded: its type index (0 I, 1 P, 2 B).
     t: usize,
     rows: Vec<u64>,
@@ -130,14 +140,19 @@ pub(crate) struct Rc {
 }
 
 impl Rc {
-    pub(crate) fn new(rate: RateControl, gop: u32, start_qp: i32) -> Result<Rc> {
+    pub(crate) fn new(rate: RateControl, gop: u32, start_qp: i32, floor: i32) -> Result<Rc> {
         let max = match rate.mode {
-            RcMode::Cbr => rate.bits_per_second,
+            RcMode::Cbr | RcMode::Crf(_) => rate.bits_per_second,
             RcMode::Vbr { max_bits_per_second } => max_bits_per_second,
         };
-        if rate.bits_per_second == 0 || rate.fps_num == 0 || rate.fps_den == 0 || max < rate.bits_per_second {
+        let budget_ok = match rate.mode {
+            RcMode::Crf(c) => c as i32 <= QP_MAX,
+            _ => rate.bits_per_second != 0 && max >= rate.bits_per_second,
+        };
+        if !budget_ok || rate.fps_num == 0 || rate.fps_den == 0 || !(QP_MIN..=QP_MAX).contains(&floor) {
             return Err(Error::Rate);
         }
+        let start_qp = start_qp.max(floor);
         let per = |bps: u32| ((bps as u64 * rate.fps_den as u64 / rate.fps_num as u64).max(1)) as i64;
         let buf = rate.bits_per_second as i64;
         Ok(Rc {
@@ -154,6 +169,7 @@ impl Rc {
             err: 0,
             types: [Model::default(); 3],
             last_qp: start_qp,
+            floor,
             t: 0,
             rows: Vec::new(),
             s: 0,
@@ -202,6 +218,8 @@ impl Rc {
                 target -= self.err / 32;
                 target = target.min(self.bmax - self.fmax).max(self.r / 8);
             }
+            // Constant quality never reaches the budget (rc_picture holds its QP, SR383).
+            RcMode::Crf(_) => {}
         }
         let m = self.types[t];
         let refq = if m.coded {
@@ -211,8 +229,8 @@ impl Rc {
         } else {
             self.last_qp
         };
-        let (lo, hi) = ((refq - PIC_STEP).max(QP_MIN), (refq + PIC_STEP).min(QP_MAX));
-        let qp = if m.coded { (lo..=hi).find(|&q| m.predict(s, q) <= target as u128).unwrap_or(hi) } else { refq };
+        let (lo, hi) = ((refq - PIC_STEP).max(self.floor), (refq + PIC_STEP).min(QP_MAX));
+        let qp = if m.coded { (lo..=hi).find(|&q| m.predict(s, q) <= target as u128).unwrap_or(hi) } else { refq.max(self.floor) };
         self.t = t;
         self.rows = rows;
         self.s = s;
@@ -225,17 +243,23 @@ impl Rc {
 
     /// The QP of macroblock row `row` (> 0) after `bits` bits of slice data.
     fn row_qp(&mut self, row: usize, bits: u64) -> i32 {
+        if self.crf().is_some() {
+            return self.pic_qp;
+        }
         let cum: u64 = self.rows[..row].iter().sum();
         let expect = self.target as i128 * cum as i128 / self.s.max(1) as i128;
         let dev = bits as i128 - expect;
         let off = (dev * 8 / self.target.max(1) as i128).clamp(-ROW_STEP as i128, ROW_STEP as i128) as i32;
-        let qp = (self.pic_qp + off).clamp(QP_MIN, QP_MAX);
+        let qp = (self.pic_qp + off).clamp(self.floor, QP_MAX);
         self.span = (self.span.0.min(qp), self.span.1.max(qp));
         qp
     }
 
     /// Fit the model and move the buckets by the coded picture's `bits`.
     fn update(&mut self, bits: u64) {
+        if self.crf().is_some() {
+            return;
+        }
         let m = &mut self.types[self.t];
         m.coded = true;
         m.bits = bits.max(1);
@@ -249,6 +273,20 @@ impl Rc {
         self.plan += self.share - self.r;
         self.fmax = (self.fmax + b - self.rmax).max(0);
         self.err += b - self.r;
+    }
+
+    /// Under [`RcMode::Crf`] (SR383) its base QP.
+    fn crf(&self) -> Option<i32> {
+        match self.rate.mode {
+            RcMode::Crf(c) => Some(c as i32),
+            _ => None,
+        }
+    }
+
+    /// Hold the picture at `qp` (constant quality, SR383): its rows keep it.
+    fn hold(&mut self, qp: i32) {
+        self.pic_qp = qp;
+        self.span = (qp, qp);
     }
 }
 
@@ -295,7 +333,16 @@ impl Encoder {
     /// [`B_QP_OFFSET`] above it, SR333; the pyramid's reference B [`crate::B_REF_QP_OFFSET`], SR349).
     pub(crate) fn rc_picture(&mut self, pic: Pic) -> i32 {
         if self.rc.is_none() {
-            return if pic == Pic::B { (self.cfg.qp as i32 + if self.tier == crate::Tier::Ref { crate::B_REF_QP_OFFSET } else { B_QP_OFFSET }).min(QP_MAX) } else { self.cfg.qp as i32 };
+            return self.fixed_qp(self.cfg.qp as i32, pic);
+        }
+        // Constant quality (SR383): the constant-QP rule at base crf, clamped to the floor; no analysis, no budget.
+        if let Some((crf, floor)) = self.rc.as_ref().and_then(|rc| rc.crf().map(|c| (c, rc.floor))) {
+            let qp = self.fixed_qp(crf, pic).clamp(floor, QP_MAX);
+            if let Some(rc) = self.rc.as_mut() {
+                rc.hold(qp);
+            }
+            self.set_qp(qp);
+            return qp;
         }
         let rows = self.rc_analyse(pic);
         let t = match pic {
@@ -306,6 +353,12 @@ impl Encoder {
         let qp = self.rc.as_mut().map_or(self.cfg.qp as i32, |rc| rc.picture(t, rows));
         self.set_qp(qp);
         qp
+    }
+
+    /// The constant-QP rule (SR333 / SR349) at `base`: I and P pictures at `base`, a B picture [`B_QP_OFFSET`] above it (the
+    /// pyramid's reference B [`crate::B_REF_QP_OFFSET`]), at most [`QP_MAX`]. `rate: None` at `cfg.qp`, [`RcMode::Crf`] at crf.
+    fn fixed_qp(&self, base: i32, pic: Pic) -> i32 {
+        if pic == Pic::B { (base + if self.tier == crate::Tier::Ref { crate::B_REF_QP_OFFSET } else { B_QP_OFFSET }).min(QP_MAX) } else { base }
     }
 
     /// Before macroblock row `row`: its QP from the `bits` of slice data written so far.
@@ -331,6 +384,25 @@ impl RateControl {
     /// `num / den` pictures per second. A time base `tb` (seconds per tick, `1/fps`) passes `(tb.den, tb.num)`.
     pub const fn cbr(kbps: u32, fps: (u32, u32)) -> RateControl {
         RateControl { bits_per_second: kbps.saturating_mul(1000), fps_num: fps.0, fps_den: fps.1, mode: RcMode::Cbr }
+    }
+
+    /// H264ENCVBRCRF (SR383): a variable bit rate of mean `kbps` and max `max_kbps` kbit/s (each x 1000, saturating) at `fps`
+    /// as [`RateControl::cbr`] takes it.
+    pub const fn vbr(kbps: u32, max_kbps: u32, fps: (u32, u32)) -> RateControl {
+        RateControl { bits_per_second: kbps.saturating_mul(1000), fps_num: fps.0, fps_den: fps.1, mode: RcMode::Vbr { max_bits_per_second: max_kbps.saturating_mul(1000) } }
+    }
+
+    /// H264ENCVBRCRF (SR383): constant quality `crf` (0..=51; above 51 refused by `Encoder::new`) at `fps` as
+    /// [`RateControl::cbr`] takes it; no bit budget (`bits_per_second` 0).
+    pub const fn crf(crf: u8, fps: (u32, u32)) -> RateControl {
+        RateControl { bits_per_second: 0, fps_num: fps.0, fps_den: fps.1, mode: RcMode::Crf(crf) }
+    }
+}
+
+impl crate::Config {
+    /// The floor of every rate-controlled QP (SR383): [`crate::Config::qp_min`], else [`QP_MIN`].
+    pub fn qp_floor(&self) -> i32 {
+        self.qp_min.map_or(QP_MIN, i32::from)
     }
 }
 
@@ -363,14 +435,21 @@ mod tests {
     #[test]
     fn refused_rates() {
         let ok = RateControl::cbr(64, (30, 1));
-        assert!(Rc::new(ok, 30, 26).is_ok());
+        assert!(Rc::new(ok, 30, 26, QP_MIN).is_ok());
         for bad in [
             RateControl { bits_per_second: 0, ..ok },
             RateControl { fps_num: 0, ..ok },
             RateControl { fps_den: 0, ..ok },
             RateControl { mode: RcMode::Vbr { max_bits_per_second: 32_000 }, ..ok },
+            RateControl::crf(52, (30, 1)),
+            RateControl::crf(26, (0, 1)),
         ] {
-            assert_eq!(Rc::new(bad, 30, 26).err(), Some(Error::Rate));
+            assert_eq!(Rc::new(bad, 30, 26, QP_MIN).err(), Some(Error::Rate));
+        }
+        // SR383: CRF needs no bit rate; the floor is refused outside 16..=51.
+        assert!(Rc::new(RateControl::crf(51, (30, 1)), 30, 26, QP_MIN).is_ok());
+        for floor in [15, 52] {
+            assert_eq!(Rc::new(ok, 30, 26, floor).err(), Some(Error::Rate));
         }
     }
 
@@ -398,5 +477,29 @@ mod tests {
         assert_eq!(RateControl::cbr(200, (25, 1)), RateControl { bits_per_second: 200_000, fps_num: 25, fps_den: 1, mode: RcMode::Cbr });
         assert_eq!(RateControl::cbr(40, (30_000, 1_001)), RateControl { bits_per_second: 40_000, fps_num: 30_000, fps_den: 1_001, mode: RcMode::Cbr });
         assert_eq!(RateControl::cbr(u32::MAX, (25, 1)).bits_per_second, u32::MAX);
+    }
+
+    /// H264ENCVBRCRF (SR383): the CRF picture QP is the constant-QP rule at base crf (I and P at crf, a B picture 2 above, the
+    /// pyramid's reference B 1 above), clamped to the floor (`Config::qp_min`, default 16) and to 51.
+    #[test]
+    fn crf_picture_qps_pinned() {
+        let enc = |crf: u8, qp_min: Option<u8>| {
+            Encoder::new(Config { width: 32, height: 32, qp: 26, gop: 8, rate: Some(RateControl::crf(crf, (30, 1))), qp_min, ..Default::default() }).unwrap()
+        };
+        let qps = |e: &mut Encoder| {
+            e.tier = crate::Tier::Plain;
+            let (i, p, b) = (e.rc_picture(Pic::Idr), e.rc_picture(Pic::P), e.rc_picture(Pic::B));
+            e.tier = crate::Tier::Ref;
+            let r = e.rc_picture(Pic::B);
+            [i, p, b, r]
+        };
+        assert_eq!(qps(&mut enc(26, None)), [26, 26, 28, 27]);
+        assert_eq!(qps(&mut enc(10, None)), [16, 16, 16, 16]);
+        assert_eq!(qps(&mut enc(50, None)), [50, 50, 51, 51]);
+        assert_eq!(qps(&mut enc(26, Some(30))), [30, 30, 30, 30]);
+        let mut e = enc(26, None);
+        e.rc_picture(Pic::P);
+        e.rc_row(3, 1 << 20);
+        assert_eq!(e.qp, 26, "a CRF picture's rows keep its QP");
     }
 }

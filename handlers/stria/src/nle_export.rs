@@ -135,7 +135,7 @@ impl VideoEncoder for RawSequence {
 }
 
 /// H.264 through H264ENC (Constrained Baseline, constant QP or a CBR target ([`H264Encoder::with_bitrate`], H264ENCRC
-/// SR218), an IDR every `gop` frames): each RGBA frame becomes I420
+/// SR218) or a constant quality ([`H264Encoder::with_quality`], H264ENCVBRCRF SR383), an IDR every `gop` frames): each RGBA frame becomes I420
 /// by `h264enc_core::yuv::I420::from_rgba`, then one access unit, stored as its avcC sample. The encoder is built at
 /// the first frame (its size); a later frame of another size is refused (`h264enc_core::Error::FrameSize`).
 /// NLE6EXPORT (rmbp-ledger B959): the glue is h264enc_core's `rgba::RgbaEncoder` (the kernel's `nle export` drives the same).
@@ -153,6 +153,14 @@ impl H264Encoder {
     /// becomes the rate controller's starting QP.
     pub fn with_bitrate(mut self, kbps: u32, fps_num: u32, fps_den: u32) -> H264Encoder {
         self.rgba.cfg.rate = Some(RateControl::cbr(kbps, (fps_num, fps_den)));
+        self
+    }
+
+    /// H264ENCVBRCRF (SR383): constant quality `crf` (0..=51, h264enc_core's `RcMode::Crf`) at `fps_num / fps_den` frames per
+    /// second (`nle export --crf`): the one `Config.rate` [`H264Encoder::with_bitrate`] sets, so the last of the two wins
+    /// (the faces refuse both by name).
+    pub fn with_quality(mut self, crf: u8, fps_num: u32, fps_den: u32) -> H264Encoder {
+        self.rgba.cfg.rate = Some(RateControl::crf(crf, (fps_num, fps_den)));
         self
     }
 

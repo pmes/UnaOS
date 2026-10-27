@@ -339,6 +339,34 @@ fn h264_bitrate_export_is_the_rate_controlled_encoder() {
     println!("h264 --bitrate 40 export: {bytes} bytes over 35 frames at 25 fps = {:.1} kbit/s", bytes as f64 * 8.0 * 25.0 / 35.0 / 1000.0);
 }
 
+/// H264ENCVBRCRF (SR383): `H264Encoder::with_quality` (`nle export --crf`) hands h264enc_core a constant-quality rate control:
+/// the movie's samples are a fresh encoder's under the hand-written `RcMode::Crf` literal, and every frame decodes.
+#[test]
+fn h264_quality_export_is_the_crf_encoder() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let dir = fresh("h264crf");
+    let enc = H264Encoder::new(26, 10).with_quality(24, tl.tb.den as u32, tl.tb.num as u32);
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(enc), AudioOut::None).unwrap();
+    assert_eq!(r.frames, 35);
+    let rate = RateControl { bits_per_second: 0, fps_num: 25, fps_den: 1, mode: RcMode::Crf(24) };
+    let mut fresh = Encoder::new(Config { width: 64, height: 48, qp: 26, gop: 10, rate: Some(rate), ..Default::default() }).unwrap();
+    let want: Vec<Vec<u8>> = refr.frames.iter().map(|f| fresh.encode(&I420::from_rgba(64, 48, f).unwrap().as_yuv420()).unwrap().avcc_sample()).collect();
+    let d = Demuxer::open(std::fs::read(dir.join("video.mp4")).unwrap()).unwrap();
+    let mut dec = decoder_for(&d.tracks()[0]).unwrap();
+    let mut frames = Vec::new();
+    for (i, s) in d.track_samples(0).copied().collect::<Vec<_>>().iter().enumerate() {
+        let pk = d.packet_at(s);
+        assert_eq!(pk.data, want[i], "sample {i} is the crf encoder's access unit");
+        frames.extend(dec.decode(&pk).unwrap());
+    }
+    frames.extend(dec.flush());
+    assert_eq!(frames.len(), 35);
+    let bytes: usize = want.iter().map(|s| s.len()).sum();
+    println!("h264 --crf 24 export: {bytes} bytes over 35 frames");
+}
+
 /// H264ENCBFRAMES (SR333): `H264Encoder::with_bframes(2)` exports B pictures. The movie's samples are a fresh encoder's
 /// `push` / `flush` units in decoding order; demux_core reads back the stored dts (strictly increasing) and the `ctts`
 /// composition offsets (pts = display + 1, dts <= pts); the avcC's VUI gives the Player's reorder depth 1; the Player's

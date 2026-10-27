@@ -7,7 +7,7 @@
 //! ```text
 //! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
 //! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|aac|none] [--aac] [--mkv]
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! ```
 //!
@@ -23,7 +23,8 @@
 //! `video.rgba` + `video.json`, and `audio.wav` or `audio.mp4`; one JSON line: codec, frames, files, bytes, the RGBA
 //! fnv (`render`'s) and PCM frames. `--video h264` (NLE5B, SR206) writes `movie.mp4` (H.264 + PCM16) under
 //! `--audio mp4`, else `video.mp4`; `--qp` (16..=40, default 26) and `--gop` (default the timeline's fps); `--bitrate`
-//! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP). `--audio aac` (or
+//! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP); `--crf` (0..=51,
+//! H264ENCVBRCRF SR383) a constant quality instead (h264enc_core's `RcMode::Crf`), exclusive with `--bitrate`. `--audio aac` (or
 //! `--aac`; NLE6EXPORTAAC rmbp-ledger B960) writes the MP4's sound as AAC-LC at 128 kb/s instead of PCM16.
 //! `--mkv` (NLE6EXPORTMKV, rmbp-ledger B966) names the muxed file `.mkv` (`movie.mkv` / `video.mkv` / `audio.mkv`): the
 //! extension is the container (an AAC track's priming edit list is refused under `.mkv`: CodecDelay owed).
@@ -38,7 +39,7 @@ use timeline_core::{Kind, Timeline, edl};
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|aac|none] [--aac] [--mkv]");
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv]");
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     std::process::exit(2)
 }
@@ -101,7 +102,7 @@ fn main() {
     let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() };
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
-    let (mut qp, mut gop, mut bitrate) = (26u8, None::<u32>, None::<u32>);
+    let (mut qp, mut gop, mut bitrate, mut crf) = (26u8, None::<u32>, None::<u32>, None::<u8>);
     let mut container = Container::Mp4;
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
@@ -115,6 +116,7 @@ fn main() {
             "--gop" => gop = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
             "--bitrate" => bitrate = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
             "--mkv" => container = Container::Mkv,
+            "--crf" => crf = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
             "--src" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 let Some((r, p)) = v.split_once('=') else { usage() };
@@ -159,8 +161,11 @@ fn main() {
             );
         }
         "export" => {
+            if bitrate.is_some() && crf.is_some() {
+                die("--bitrate and --crf are exclusive".into());
+            }
             let gop = gop.unwrap_or((tl.tb.den / tl.tb.num.max(1)).max(1) as u32);
-            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, container)
+            export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio, qp, gop, bitrate, crf, container)
         }
         _ => usage(),
     }
@@ -168,13 +173,14 @@ fn main() {
 
 /// NLE5 (SR204): the `export` verb — plumbing only; the export is `stria::nle_export`'s.
 #[allow(clippy::too_many_arguments)]
-fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, container: Container) {
+fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str, qp: u8, gop: u32, bitrate: Option<u32>, crf: Option<u8>, container: Container) {
     let enc: Box<dyn VideoEncoder> = match video {
         "png" => Box::new(PngSequence),
         "raw" => Box::new(RawSequence),
-        "h264" => match bitrate {
-            Some(k) => Box::new(H264Encoder::new(qp, gop).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32)),
-            None => Box::new(H264Encoder::new(qp, gop)),
+        "h264" => match (bitrate, crf) {
+            (Some(k), _) => Box::new(H264Encoder::new(qp, gop).with_bitrate(k, tl.tb.den as u32, tl.tb.num as u32)),
+            (None, Some(c)) => Box::new(H264Encoder::new(qp, gop).with_quality(c, tl.tb.den as u32, tl.tb.num as u32)),
+            (None, None) => Box::new(H264Encoder::new(qp, gop)),
         },
         _ => usage(),
     };
