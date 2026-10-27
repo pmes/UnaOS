@@ -328,9 +328,23 @@ pub fn surface_argb32(rgba: &[u8]) -> Vec<u8> {
     out
 }
 
+/// AETHERMACGPU (SR309): where a Surface's pixels land, in clip space, on an embassy that draws them as a GPU quad
+/// (`platforms/macos/gpu_view.rs` `PageGpuView`): the 1:1 top-left pinned placement the CPU page draws
+/// (`image_view` `image_dest`'s browser arm: one surface pixel per view point), as `[left, top, right, bottom]` in
+/// NDC (y up). An image larger than the view overhangs past 1 / -1 (the GPU clips it); `None` for an empty view or
+/// image. Pure, so the placement is testable without a Metal device.
+pub fn surface_ndc(view_w: f64, view_h: f64, img_w: u32, img_h: u32) -> Option<[f32; 4]> {
+    if !(view_w > 0.0 && view_h > 0.0) || img_w == 0 || img_h == 0 {
+        return None;
+    }
+    let right = -1.0 + 2.0 * img_w as f64 / view_w;
+    let bottom = 1.0 - 2.0 * img_h as f64 / view_h;
+    Some([-1.0, 1.0, right as f32, bottom as f32])
+}
+
 #[cfg(test)]
 mod surface_contract_tests {
-    use super::surface_argb32;
+    use super::{surface_argb32, surface_ndc};
 
     /// RGBA in, RGBA out: an opaque row through the hand-off decodes from cairo's native word back to the caller's
     /// RGBA, and the word is 0xAARRGGBB (probe_view's swizzle KAT, moved with the fn).
@@ -361,5 +375,17 @@ mod surface_contract_tests {
         // 255*1/255 = 1.
         assert_eq!(word(8), 0x0101_0000);
         assert_eq!(out.len(), 12);
+    }
+
+    /// AETHERMACGPU (SR309): the GPU page quad is the CPU page's 1:1 top-left placement: an exact fill, a quarter
+    /// (half each way), an overhang past the view's right and bottom edges, and the empty cases.
+    #[test]
+    fn surface_ndc_top_left_kat() {
+        assert_eq!(surface_ndc(800.0, 600.0, 800, 600), Some([-1.0, 1.0, 1.0, -1.0]));
+        assert_eq!(surface_ndc(800.0, 600.0, 400, 300), Some([-1.0, 1.0, 0.0, 0.0]));
+        assert_eq!(surface_ndc(400.0, 300.0, 800, 600), Some([-1.0, 1.0, 3.0, -3.0]));
+        assert_eq!(surface_ndc(0.0, 600.0, 800, 600), None);
+        assert_eq!(surface_ndc(800.0, 600.0, 0, 600), None);
+        assert_eq!(surface_ndc(800.0, 600.0, 800, 0), None);
     }
 }
