@@ -1227,6 +1227,9 @@ fn pdf4fitzoomround_resize_once() {
     let (n, w) = (e.damage_rects.len(), e.width);
     e.pdf_refit();
     assert_eq!((e.damage_rects.len(), e.width, e.zoom_pct()), (n, w, want), "a second refit on the settled state moves and repaints nothing");
+}
+
+// =================================================================================================
 // PAGESAVECOMPLETE (LEDGER SR398): Webpage, Complete (a `_files` folder, the markup rewritten); the MHTML reader opening a
 // `.mhtml` file URL; the save-time fetch of a reference the cache did not hold.
 
