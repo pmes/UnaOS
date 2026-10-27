@@ -26,12 +26,13 @@
 //! | `subpel`         | 0 / 1 / 2     | 0       | motion refinement: integer / half / quarter (>2 = 2)    |
 //! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP |
 //! | `entropy`        | [`Entropy`]   | Cavlc   | Cabac: Main profile, entropy_coding_mode_flag 1, [`cabac`] writes the slice data |
+//! | `transform8x8`   | bool          | false   | High (profile_idc 100), transform_8x8_mode_flag: Intra_8x8 in I macroblocks (SR322) |
 //!
 //! | module          | Recommendation                                                          |
 //! |-----------------|-------------------------------------------------------------------------|
 //! | [`nal`]         | 7.2 RBSP writing, 9.1 ue / se, 7.3.1 NAL units, emulation prevention, avcC |
 //! | [`sps`]         | 7.3.2.1 SPS (+ VUI E.1.1), 7.3.2.2 PPS, 7.3.3 slice header                |
-//! | [`transform`]   | 8.5 forward: 4x4 core transform, DC Hadamards, quantiser                 |
+//! | [`transform`]   | 8.5 forward: 4x4 / 8x8 core transforms, DC Hadamards, quantisers, SATD   |
 //! | [`intra`]       | 8.3 mode decision over h264_core's predictors, 8.3.1.1 mode coding       |
 //! | [`cavlc`]       | 9.2 residual_block_cavlc written, 9.2.1 nC                               |
 //! | [`cabac`]       | 9.3.4 the arithmetic encoder, 9.3.2 binarizations, 9.3.3.1 ctxIdxInc      |
@@ -51,7 +52,7 @@
 //! nC, mvp) are decoder-private methods there, so they are mirrored here for one slice per
 //! picture; making them shared free fns is owed (H264ENC-NBSHARE).
 //!
-//! Owed (handlers.md §5): two-pass / scene cuts / activity masking (inside H264ENC-RC), High / the 8x8 transform (inside H264ENC-CABAC), the
+//! Owed (handlers.md §5): two-pass / scene cuts / activity masking (inside H264ENC-RC), scaling matrices (inside H264ENC-CABAC; High's 8x8 transform is SR322's), the
 //! 16x8 / 8x16 / 8x8 partitions (inside H264ENC-SUBPEL), per-slice filter offsets (inside
 //! H264ENC-DEBLOCK), B-frames (H264ENC-BFRAMES), hardware encode (H264ENC-HW).
 
@@ -78,7 +79,7 @@ use alloc::vec::Vec;
 
 use h264_core::picture::{MbInfo, Motion, Plane, BLK_X, BLK_Y};
 use h264_core::ps::ScalingMatrices;
-use h264_core::tables::{CBP_INTER, CBP_INTRA, QPC, ZIGZAG4};
+use h264_core::tables::{CBP_INTER, CBP_INTRA, QPC, ZIGZAG4, ZIGZAG8};
 use h264_core::transform::LevelScale;
 
 use crate::cavlc::Nnz;
@@ -139,6 +140,11 @@ pub struct Config {
     /// The entropy coder (H264ENCCABAC, SR310): Cavlc (Constrained Baseline, SR197's bytes) or
     /// Cabac (Main profile).
     pub entropy: Entropy,
+    /// The 8x8 transform (H264ENC8X8, SR322): High profile (profile_idc 100) with
+    /// transform_8x8_mode_flag 1 under either entropy coder; I macroblocks may take Intra_8x8 (chosen
+    /// against Intra_4x4 by SATD). P macroblocks keep the 4x4 transform (transform_size_8x8_flag 0;
+    /// their 8x8 choice by real bits is owed). false keeps every pinned byte.
+    pub transform8x8: bool,
 }
 
 /// entropy_coding_mode_flag (7.4.2.2): CAVLC (9.2) or CABAC (9.3).
@@ -198,6 +204,9 @@ impl Access {
 /// Intra_16x16's by more than this many bits' worth ([`lambda`]) — the 16 mode fields it spends.
 pub const I4_BIAS: u32 = 24;
 
+/// The intra 8x8 penalty in bits (SR322): the 4 mode fields Intra_8x8 spends, at [`I4_BIAS`]'s rate.
+pub const I8_BIAS: u32 = 6;
+
 /// The SAD cost of one bit at QP `qp`: about 2^((qp - 12) / 6), the growth of the quantiser step.
 pub fn lambda(qp: i32) -> u32 {
     1 << ((qp - 12).max(0) / 6)
@@ -216,7 +225,7 @@ pub(crate) enum Kind {
 /// h264_core's `mb::Mb` holds them).
 pub(crate) struct MbCode {
     pub kind: Kind,
-    /// Intra4x4PredMode by luma4x4BlkIdx.
+    /// Intra4x4PredMode by luma4x4BlkIdx, or Intra8x8PredMode in [0..4] when `t8x8`.
     pub modes: [u8; 16],
     pub i16_mode: u8,
     pub chroma_mode: u8,
@@ -232,18 +241,24 @@ pub(crate) struct MbCode {
     pub cdc: [[i32; 4]; 2],
     /// ChromaACLevel per iCbCr and chroma4x4BlkIdx (raster, [0] = 0).
     pub cac: [[[i32; 16]; 4]; 2],
+    /// transform_size_8x8_flag (SR322): the luma levels are `luma8` (an I4 kind is then I_NxN coded
+    /// Intra_8x8).
+    pub t8x8: bool,
+    /// The 8x8 luma blocks by luma8x8BlkIdx (raster) when `t8x8`.
+    pub luma8: [[i32; 64]; 4],
 }
 
 impl MbCode {
     pub fn new(kind: Kind) -> MbCode {
-        MbCode { kind, modes: [2; 16], i16_mode: 0, chroma_mode: 0, mvd: [0; 2], cbp: 0, dc: [0; 16], luma: [[0; 16]; 16], cdc: [[0; 4]; 2], cac: [[[0; 16]; 4]; 2] }
+        MbCode { kind, modes: [2; 16], i16_mode: 0, chroma_mode: 0, mvd: [0; 2], cbp: 0, dc: [0; 16], luma: [[0; 16]; 16], cdc: [[0; 4]; 2], cac: [[[0; 16]; 4]; 2], t8x8: false, luma8: [[0; 64]; 4] }
     }
 
-    /// CodedBlockPatternLuma for 4x4-coded luma: bit b8 when a block of that 8x8 has a level.
+    /// CodedBlockPatternLuma: bit b8 when a block of that 8x8 (or the 8x8 itself, `t8x8`) has a level.
     pub fn luma_cbp(&self) -> u8 {
         let mut cbp = 0u8;
         for blk in 0..16 {
-            if self.luma[blk].iter().any(|&v| v != 0) {
+            let coded = if self.t8x8 { self.luma8[blk / 4].iter().any(|&v| v != 0) } else { self.luma[blk].iter().any(|&v| v != 0) };
+            if coded {
                 cbp |= 1 << (blk / 4);
             }
         }
@@ -327,9 +342,10 @@ impl Encoder {
             log2_max_frame_num += 1;
         }
         let cabac = cfg.entropy == Entropy::Cabac;
-        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac };
+        let high = cfg.transform8x8;
+        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high };
         let sps = nal::nal_unit(3, nal::NAL_SPS, &sps::write_sps(&p));
-        let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp, cabac));
+        let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp, cabac, high));
         let planes = || [Plane::new(mb_w * 16, mb_h * 16, 0), Plane::new(mb_w * 8, mb_h * 8, 128), Plane::new(mb_w * 8, mb_h * 8, 128)];
         let (w, h) = (cfg.width as usize, cfg.height as usize);
         Ok(Encoder {
@@ -562,9 +578,13 @@ impl Encoder {
         match code.kind {
             Kind::I4 => {
                 w.ue(off);
+                if self.cfg.transform8x8 {
+                    w.flag(code.t8x8); // transform_size_8x8_flag
+                }
                 let w4 = self.mb_w * 4;
-                for blk in 0..16 {
-                    let (x4, y4) = (mbx * 4 + BLK_X[blk], mby * 4 + BLK_Y[blk]);
+                for blk in 0..mode_fields(code.t8x8) {
+                    let (bx, by) = mode_at(code.t8x8, blk);
+                    let (x4, y4) = (mbx * 4 + bx, mby * 4 + by);
                     let pred = intra::predicted_mode(&self.modes, w4, x4, y4);
                     let m = code.modes[blk];
                     if m == pred {
@@ -587,6 +607,9 @@ impl Encoder {
                 w.se(code.mvd[0]);
                 w.se(code.mvd[1]);
                 w.ue(cbp_code(&CBP_INTER, code.cbp));
+                if self.cfg.transform8x8 && code.cbp & 15 != 0 {
+                    w.flag(code.t8x8); // transform_size_8x8_flag
+                }
             }
             Kind::PSkip => return,
         }
@@ -609,7 +632,13 @@ impl Encoder {
             let mut tc = 0;
             if (code.cbp >> (blk / 4)) & 1 == 1 {
                 let nc = self.nnz.nc_luma(x4, y4);
-                tc = if i16 { cavlc::write_block(w, nc, 15, &scan(&code.luma[blk], 1)) } else { cavlc::write_block(w, nc, 16, &scan(&code.luma[blk], 0)) };
+                tc = if code.t8x8 {
+                    cavlc::write_block(w, nc, 16, &interleave8(&code.luma8[blk / 4], blk % 4)) // 7.3.5.3.2: 4 interleaved 4x4 lists
+                } else if i16 {
+                    cavlc::write_block(w, nc, 15, &scan(&code.luma[blk], 1))
+                } else {
+                    cavlc::write_block(w, nc, 16, &scan(&code.luma[blk], 0))
+                };
             }
             self.nnz.set_luma(x4, y4, tc);
         }
@@ -645,4 +674,35 @@ fn scan(c: &[i32; 16], start: usize) -> [i32; 16] {
 /// codeNum of coded_block_pattern `cbp` in a Table 9-4 column.
 fn cbp_code(table: &[u8; 48], cbp: u8) -> u32 {
     table.iter().position(|&v| v == cbp).expect("coded_block_pattern outside Table 9-4") as u32
+}
+
+/// The number of intra prediction mode fields of an I_NxN macroblock: 16 (Intra_4x4) or 4 (Intra_8x8).
+pub(crate) fn mode_fields(t8x8: bool) -> usize {
+    if t8x8 { 4 } else { 16 }
+}
+
+/// The 4x4 position (x, y) inside the macroblock of mode field `blk`'s top-left 4x4 block: the
+/// luma4x4BlkIdx block, or under the 8x8 transform the luma8x8BlkIdx block (whose mode the
+/// encoder stores on all four of its 4x4s, as h264_core's decoder does).
+pub(crate) fn mode_at(t8x8: bool, blk: usize) -> (usize, usize) {
+    if t8x8 { ((blk % 2) * 2, (blk / 2) * 2) } else { (BLK_X[blk], BLK_Y[blk]) }
+}
+
+/// The CAVLC list of 4x4 block `sub` of a raster 8x8 block (7.3.5.3.2: lumaLevel8x8[4 * k + sub]
+/// over the 8x8 zig-zag of 8.5.7 inverted), as h264_core's `parse_residual` reads it back.
+fn interleave8(c: &[i32; 64], sub: usize) -> [i32; 16] {
+    let mut l = [0i32; 16];
+    for k in 0..16 {
+        l[k] = c[ZIGZAG8[4 * k + sub] as usize];
+    }
+    l
+}
+
+/// The 64 levels of a raster 8x8 block in 8x8 zig-zag scan order (CABAC ctxBlockCat 5).
+pub(crate) fn scan8(c: &[i32; 64]) -> [i32; 64] {
+    let mut l = [0i32; 64];
+    for k in 0..64 {
+        l[k] = c[ZIGZAG8[k] as usize];
+    }
+    l
 }

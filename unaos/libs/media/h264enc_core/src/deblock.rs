@@ -15,6 +15,10 @@
 //! decoder's one `info` grid serves both its contexts and its filter: under
 //! [`crate::Entropy::Cabac`] `note_mb` runs with the filter off too and also records
 //! `chroma_mode` and `cbf` (coded_block_flag per block, h264_core's `CBF_*` bit layout).
+//!
+//! H264ENC8X8 (SR322): `t8x8` (the filter's transform_size_8x8 edge rule: h264_core's
+//! `deblock_picture` skips the odd internal edges of such a macroblock), kind I8x8, and an 8x8's
+//! level marking all four of its 4x4s in `nz` and `cbf`, as h264_core's `parse_residual` records them.
 
 use h264_core::deblock::{deblock_picture, SliceDeblock};
 use h264_core::picture::{MbKind, Mv, BLK_X, BLK_Y, CBF_CHROMA_AC, CBF_CHROMA_DC, CBF_LUMA_DC};
@@ -30,7 +34,9 @@ impl Encoder {
         }
         let i = mby * self.mb_w + mbx;
         let kind = match code.kind {
-            Kind::I4 => MbKind::I4x4,
+            Kind::I4 => {
+                if code.t8x8 { MbKind::I8x8 } else { MbKind::I4x4 }
+            }
             Kind::I16 => MbKind::I16x16,
             Kind::PSkip => MbKind::PSkip,
             Kind::P16 => MbKind::Inter,
@@ -41,7 +47,7 @@ impl Encoder {
         let mut nz = 0u16;
         if code.kind == Kind::P16 {
             for blk in 0..16 {
-                if code.luma[blk].iter().any(|&v| v != 0) {
+                if luma_coded(code, blk) {
                     nz |= 1 << blk;
                 }
             }
@@ -50,7 +56,7 @@ impl Encoder {
         info.slice = 0;
         info.kind = kind;
         info.cbp = code.cbp;
-        info.t8x8 = false;
+        info.t8x8 = code.t8x8;
         info.qp = (if code.cbp != 0 || code.kind == Kind::I16 { self.qp } else { self.qp_pred }) as u8; // QPY: a MB without mb_qp_delta keeps QPY,pred
         info.nz = nz;
         info.chroma_mode = code.chroma_mode;
@@ -90,7 +96,7 @@ impl Encoder {
 pub(crate) fn cbf_bits(code: &MbCode) -> u32 {
     let mut cbf = 0u32;
     for blk in 0..16 {
-        if (code.cbp >> (blk / 4)) & 1 == 1 && code.luma[blk].iter().any(|&v| v != 0) {
+        if (code.cbp >> (blk / 4)) & 1 == 1 && luma_coded(code, blk) {
             cbf |= 1 << blk;
         }
     }
@@ -109,4 +115,9 @@ pub(crate) fn cbf_bits(code: &MbCode) -> u32 {
         }
     }
     cbf
+}
+
+/// Does luma 4x4 block `blk` carry a level: its own, or under the 8x8 transform its 8x8's (SR322)?
+fn luma_coded(code: &MbCode, blk: usize) -> bool {
+    if code.t8x8 { code.luma8[blk / 4].iter().any(|&v| v != 0) } else { code.luma[blk].iter().any(|&v| v != 0) }
 }

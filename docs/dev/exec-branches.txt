@@ -875,6 +875,6 @@ refs/heads/exec-rmbp-heifoneretire   db1ebf8fb IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-meterplayer   bb52f8dfe FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethermacgpudamage   98a53fa76 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hevcconf   12930de7d FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-h264enc8x8   db1ebf8fb IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-h264enc8x8   e5a7667f3 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-stationroam   31ce115db IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle3cblack   31ce115db IN-FLIGHT cut 2026-10-27
