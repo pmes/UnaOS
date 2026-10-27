@@ -1038,7 +1038,7 @@ refs/heads/exec-rmbp-dwi2cacpi   8c0a22894 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-zenbookflightlist   684d7b05a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kernelsizekey   7bf419701 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-saverecentopen   97f2c923f cut 2026-10-27 (wave36 batch 15)
-refs/heads/exec-rmbp-pdf4size   97f2c923f cut 2026-10-27 (wave36 batch 15)
+refs/heads/exec-rmbp-pdf4size   663c8faa7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-adoptpng   97f2c923f cut 2026-10-27 (wave36 batch 15)
 refs/heads/exec-rmbp-mt7925s7   97f2c923f cut 2026-10-27 (wave36 batch 15)
 refs/heads/exec-rmbp-zenbookdocsrefresh   97f2c923f cut 2026-10-27 (wave36 batch 15)

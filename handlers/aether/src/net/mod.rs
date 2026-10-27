@@ -176,14 +176,29 @@ pub async fn fetch_document_any(input: &str) -> Result<(Doc, String)> {
                     response.headers().iter().map(|(k, v)| (k.to_ascii_lowercase(), v.to_string())).collect();
                 crate::security::set_document_headers(&final_url, &doc_headers);
 
-                if response.content_length().unwrap_or(0) > 10 * 1024 * 1024 {
+                // PDF4-SIZE (SR404): the cap is the document type's, chosen by the predicate that picks the PDF arm: a PDF
+                // (its Content-Type, or the `%PDF-` sniff) reads up to `pdf::MAX_BYTES`, every other document 10 MiB. The
+                // Content-Length is held to the most the type can still reach (text/html: 10 MiB, as before), the body is
+                // read once into one buffer sized by it, and refused the moment it passes its cap (a PDF by name).
+                let ctype = header_of(&doc_headers, "content-type").unwrap_or("").to_string();
+                let cap = |head: &[u8]| if crate::pdf::is_pdf(&ctype, head) { crate::pdf::MAX_BYTES } else { 10 * 1024 * 1024 };
+                let declared = response.content_length().unwrap_or(0);
+                if declared > cap(b"%PDF-") as u64 {
+                    if crate::pdf::is_pdf(&ctype, b"") {
+                        anyhow::bail!(crate::pdf::over_cap(declared));
+                    }
                     anyhow::bail!("Response exceeds size limit");
                 }
-                
-                let ctype = header_of(&doc_headers, "content-type").unwrap_or("").to_string();
-                let bytes = response.bytes().await.context("Failed to read body")?;
-                if bytes.len() > 10 * 1024 * 1024 {
-                    anyhow::bail!("Response body exceeds size limit");
+                let mut response = response;
+                let mut bytes: Vec<u8> = Vec::with_capacity(declared.min(cap(b"%PDF-") as u64) as usize);
+                while let Some(chunk) = response.chunk().await.context("Failed to read body")? {
+                    bytes.extend_from_slice(&chunk);
+                    if bytes.len() > cap(&bytes) {
+                        if crate::pdf::is_pdf(&ctype, &bytes) {
+                            anyhow::bail!(crate::pdf::over_cap(bytes.len() as u64));
+                        }
+                        anyhow::bail!("Response body exceeds size limit");
+                    }
                 }
                 if crate::pdf::is_pdf(&ctype, &bytes) {
                     return Ok((Doc::Pdf(bytes), final_url)); // PDF4 (SR324): the engine opens it as a PDF document
