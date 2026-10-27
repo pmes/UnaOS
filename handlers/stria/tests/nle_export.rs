@@ -455,9 +455,10 @@ fn h264_pyramid_export_reorder_depth_two() {
 const HOST_VUI: Option<(u8, u8, u8, bool)> = Some((2, 2, 6, false));
 
 /// An H.264 export states its file colour as the avc1's `colr` (`Track::colour` on a plain open) and as the avcC's SPS VUI
-/// (the Player's `colour_of`): both are `RGBA_COLOUR`, 2/2/6 limited (the RGBA path's BT.601 limited, the kernel export's tag).
-/// The seat's ruling: host == kernel, so a reel tagged BT.709 (`colr` 1/1/1 limited) still exports 2/2/6 limited
-/// (EXPORT-COLOUR-PRIM owes the reels' primaries / transfer for both). An audio-only MP4 (no H.264) states none.
+/// (the Player's `colour_of`): matrix 6 limited (the RGBA path's BT.601 limited, the kernel export's tag). EXPORTCOLOURPRIM
+/// (rmbp-ledger B979): the primaries / transfer are the reels' one pair (`Timeline::reels_colour`, the kernel's rule too):
+/// untagged reels 2/2/6, one reel tagged BT.709 (`colr` 1/1/1 limited) 1/1/6, two reels that differ (BT.709 and BT.2020)
+/// 2/2/6, since the mix converts no primaries. An audio-only MP4 (no H.264) states none.
 #[test]
 fn h264enccolourhost_export_states_the_file_colour() {
     use gneiss_pal::dsp::demux::build::Mp4Extras;
@@ -466,18 +467,18 @@ fn h264enccolourhost_export_states_the_file_colour() {
     use stria::nle::synth_source_with;
     use stria::nle_export::RGBA_COLOUR;
     assert_eq!(RGBA_COLOUR, Colour { primaries: 2, transfer: 2, matrix: 6, full_range: Some(false), mastering: None, light: None });
-    let check = |label: &str, mp4: Vec<u8>| {
+    let check = |label: &str, mp4: Vec<u8>, want: Colour| {
         let d = Demuxer::open(mp4).unwrap();
         let vt = &d.tracks()[0];
         assert_eq!(vt.codec, Codec::Avc, "{label}");
-        assert_eq!(vt.colour, Some(RGBA_COLOUR), "{label}: the colr");
-        assert_eq!(colour_of(vt, &[]), Some(RGBA_COLOUR), "{label}: the SPS VUI");
+        assert_eq!(vt.colour, Some(want), "{label}: the colr");
+        assert_eq!(colour_of(vt, &[]), Some(want), "{label}: the SPS VUI");
     };
     let tl = timeline();
     let src = sources(&tl);
     let dir = fresh("h264colour");
     export(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap();
-    check("untagged reels", std::fs::read(dir.join("video.mp4")).unwrap());
+    check("untagged reels", std::fs::read(dir.join("video.mp4")).unwrap(), RGBA_COLOUR);
 
     let mut one = Timeline::new(25);
     let a = one.add_source("A", 50);
@@ -489,7 +490,21 @@ fn h264enccolourhost_export_states_the_file_colour() {
     assert_eq!(s1.open_report(a).and_then(|r| r.colour), Some(bt709), "the reel states BT.709");
     let dir = fresh("h264colour709");
     export(&one, 0..20, &s1, &dir, Box::new(H264Encoder::new(26, 10).with_bframes(2)), AudioOut::None).unwrap();
-    check("one BT.709 reel", std::fs::read(dir.join("video.mp4")).unwrap());
+    check("one BT.709 reel", std::fs::read(dir.join("video.mp4")).unwrap(), Colour { primaries: 1, transfer: 1, ..RGBA_COLOUR });
+
+    let mut two = Timeline::new(25);
+    let a = two.add_source("A", 50);
+    let b = two.add_source("B", 50);
+    two.add_track(Kind::Video);
+    two.tracks[0].clips = vec![Clip::new(a, 0, 10, 0), Clip::new(b, 0, 10, 10)];
+    let bt2020 = Colour { primaries: 9, transfer: 14, matrix: 9, full_range: Some(false), mastering: None, light: None };
+    let mut s2 = Sources::new(&two);
+    s2.add(a, synth_source_with(0, 50, 25, &Mp4Extras { colour: vec![(1, bt709)], ..Mp4Extras::default() })).unwrap();
+    s2.add(b, synth_source_with(0, 50, 25, &Mp4Extras { colour: vec![(1, bt2020)], ..Mp4Extras::default() })).unwrap();
+    assert_eq!(s2.open_report(b).and_then(|r| r.colour), Some(bt2020), "the second reel states BT.2020");
+    let dir = fresh("h264colourmixed");
+    export(&two, 0..20, &s2, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap();
+    check("two differing reels", std::fs::read(dir.join("video.mp4")).unwrap(), RGBA_COLOUR);
 
     let dir = fresh("rawcolour");
     export(&tl, 0..TICKS, &src, &dir, Box::new(RawSequence), AudioOut::Mp4).unwrap();

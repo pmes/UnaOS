@@ -33,7 +33,8 @@
 //!   unmixed 8-bit 4:2:0 decoder picture enters h264enc_core's planar entry (`RgbaEncoder::push_planes`) with no RGBA round
 //!   trip when its resolved colour is the file's; any other frame (mixed, black, 10-bit, 4:4:4, another colour) converts its
 //!   RGBA through `yuv_core::from_rgba` at the file's matrix. An RGBA-first file is BT.601 limited (the samples it always had);
-//!   every file states its colour as `colr` (`build::Mp4Extras::colour`). Wire `[nle] export colour matrix= range= src= planes=`.
+//!   every file states its colour as `colr` (`build::Mp4Extras::colour`); its primaries / transfer are the EDL's reels' one pair
+//!   (EXPORTCOLOURPRIM rmbp-ledger B979, `timeline_core::Timeline::reels_colour` through [`set_reels`]), else 2 / 2. Wire `[nle] export colour matrix= range= src= planes= prim=`.
 //! * LOCKS: [`ENC`] (the armed export) is a leaf; [`frame`] TAKES the export out of it and encodes with no lock held (a
 //!   1080p picture is far past the lock registry's 50 ms), putting it back unless superseded. `bus::CAP` (the capture) is
 //!   taken under vplay's `snd::SND` and takes nothing (the live forward drops it first): the one new edge is SND -> CAP.
@@ -518,6 +519,8 @@ struct ExpColour {
     /// What fixed it: "planes" or "rgba".
     src: &'static str,
     planes: u64,
+    /// EXPORTCOLOURPRIM (B979): the EDL's reels' one (primaries, transfer), set by vplay's `edl_run` ([`set_reels`]) before any frame.
+    reels: Option<(u8, u8)>,
 }
 
 /// The RGBA path's colour: BT.601 limited, primaries / transfer unspecified (H264ENC-COLOUR: the untagged file read as BT.709 at HD).
@@ -546,10 +549,10 @@ impl Exp {
         if self.col.file.is_none() {
             self.col.src = if src.is_some() { "planes" } else { "rgba" };
         }
-        let file = *self.col.file.get_or_insert(match &src {
+        let file = *self.col.file.get_or_insert(with_pair(self.col.reels, match &src {
             Some((_, fc)) => *fc,
             None => RGBA_COLOUR,
-        }); if !self.rgba.started() { self.rgba.cfg.colour = Some((file.0.primaries, file.0.transfer, file.0.matrix, file.2)); } // H264ENCCOLOURHOST (LEDGER SR377): the SAME file colour as the SPS VUI (h264enc_core `Config::colour`), set before the encoder is built
+        })); if !self.rgba.started() { self.rgba.cfg.colour = Some((file.0.primaries, file.0.transfer, file.0.matrix, file.2)); } // H264ENCCOLOURHOST (LEDGER SR377): the SAME file colour as the SPS VUI (h264enc_core `Config::colour`), set before the encoder is built
         match src {
             Some((p, (_, k, full))) if (k, full) == (file.1, file.2) => {
                 self.col.planes += 1;
@@ -563,10 +566,27 @@ impl Exp {
     fn colour_entry(&self) -> Option<(u32, Colour)> {
         let (c, _, full) = self.col.file?;
         serial_println!(
-            "[nle] export colour matrix={} range={} src={} planes={}/{}",
-            c.matrix, if full { "full" } else { "limited" }, self.col.src, self.col.planes, self.frames
+            "[nle] export colour matrix={} range={} src={} planes={}/{} prim={}/{}",
+            c.matrix, if full { "full" } else { "limited" }, self.col.src, self.col.planes, self.frames, c.primaries, c.transfer
         );
         Some((1, c))
+    }
+}
+
+/// EXPORTCOLOURPRIM (rmbp-ledger B979): the file colour's primaries / transfer are the reels' one pair (both arms of
+/// [`Exp::push`]: the mix converts each reel by its own matrix and no primaries, so a file can state one pair only when every
+/// reel states it), (2, 2) when they differ, one states none, or no EDL open set it. Matrix, Kr / Kb and range unchanged.
+fn with_pair(reels: Option<(u8, u8)>, (c, k, full): (Colour, (i64, i64), bool)) -> (Colour, (i64, i64), bool) {
+    let (primaries, transfer) = reels.unwrap_or((2, 2));
+    (Colour { primaries, transfer, ..c }, k, full)
+}
+
+/// EXPORTCOLOURPRIM (rmbp-ledger B979): EDL job `jid`'s reels' one (primaries, transfer) (`Timeline::reels_colour` over each
+/// reel's opened `Track::colour`), called by vplay's `edl_run` after the reels open, before any frame. A Present job (no
+/// export armed for `jid`) stores nothing. Takes [`ENC`] for the store only.
+pub fn set_reels(jid: u32, pair: (u8, u8)) {
+    if let Some(e) = ENC.lock().as_mut().filter(|e| e.jid == jid) {
+        e.col.reels = Some(pair);
     }
 }
 

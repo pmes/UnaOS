@@ -27,9 +27,10 @@
 //!   video presents from tick 1, or tick 2 under h264enc_core's B pyramid at bframes >= 3 (reorder depth 2, H264ENCPYRAMID SR349).
 //! * H264ENCCOLOURHOST (LEDGER SR377): the file states ONE colour, fixed at its first frame ([`VideoEncoder::colour`]):
 //!   [`H264Encoder`] always encodes the mix's RGBA by `push_rgba` (BT.601 limited), so its file colour is
-//!   [`RGBA_COLOUR`] (primaries / transfer 2, matrix 6, limited: the kernel export's RGBA-path tag, byte for byte), written
+//!   [`RGBA_COLOUR`] (matrix 6, limited: the kernel export's RGBA-path tag, byte for byte), written
 //!   as the SPS VUI (h264enc_core's `Config::colour`) and as the avc1's `colr` through `build::Mp4Extras::colour`. PNG and
-//!   raw state none.
+//!   raw state none. EXPORTCOLOURPRIM (rmbp-ledger B979): its primaries / transfer are the reels' one pair
+//!   (`timeline_core::Timeline::reels_colour` over `Sources::open_report`, the kernel export's rule too), else 2 / 2.
 //! * Single-threaded: the sink owns its encoder, files and counters by `&mut self`; an I/O error is latched and
 //!   returned by [`ExportSink::finish`].
 
@@ -90,8 +91,10 @@ pub trait VideoEncoder {
     fn config(&self) -> VideoConfig;
     fn layout(&self) -> Layout;
     /// H264ENCCOLOURHOST (SR377): called once, before the first frame's `encode`: the file's one colour, which the encoder
-    /// states in its own stream too. None = the stream states no colour.
-    fn colour(&mut self) -> Option<Colour> {
+    /// states in its own stream too. None = the stream states no colour. EXPORTCOLOURPRIM (B979): `reels` is the timeline's
+    /// one (primaries, transfer) pair (`Timeline::reels_colour`), (2, 2) when the reels state none or differ.
+    fn colour(&mut self, reels: (u8, u8)) -> Option<Colour> {
+        let _ = reels;
         None
     }
 }
@@ -177,8 +180,8 @@ impl VideoEncoder for H264Encoder {
     fn layout(&self) -> Layout {
         Layout::Mp4
     }
-    fn colour(&mut self) -> Option<Colour> {
-        let c = RGBA_COLOUR; // H264ENCCOLOURHOST (SR377): the RGBA path's colour, also the SPS VUI
+    fn colour(&mut self, (primaries, transfer): (u8, u8)) -> Option<Colour> {
+        let c = Colour { primaries, transfer, ..RGBA_COLOUR }; // H264ENCCOLOURHOST (SR377): the RGBA path's colour, also the SPS VUI. EXPORTCOLOURPRIM (B979): with the reels' one pair
         self.rgba.cfg.colour = Some((c.primaries, c.transfer, c.matrix, c.full_range == Some(true)));
         Some(c)
     }
@@ -288,6 +291,8 @@ pub struct ExportSink {
     err: Option<ExportError>,
     /// H264ENCCOLOURHOST (SR377): the file's colour, fixed at the first frame by [`VideoEncoder::colour`].
     colour: Option<Colour>,
+    /// EXPORTCOLOURPRIM (B979): the reels' one (primaries, transfer), set by [`export`]; (2, 2) otherwise.
+    reels: (u8, u8),
 }
 
 impl ExportSink {
@@ -307,6 +312,7 @@ impl ExportSink {
             report: ExportReport { fnv: 0xcbf2_9ce4_8422_2325, ..ExportReport::default() },
             err: None,
             colour: None,
+            reels: (2, 2),
         }
     }
 
@@ -338,7 +344,7 @@ impl ExportSink {
             self.report.fnv = (self.report.fnv ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
         }
         self.size = (w, h);
-        if self.report.frames == 0 { self.colour = self.video.colour(); } // H264ENCCOLOURHOST (SR377): the file colour, fixed at the first frame
+        if self.report.frames == 0 { self.colour = self.video.colour(self.reels); } // H264ENCCOLOURHOST (SR377): the file colour, fixed at the first frame
         let units = self.video.encode(w, h, rgba)?;
         self.store(units)?;
         self.report.frames += 1;
@@ -470,7 +476,7 @@ pub fn export(
     video: Box<dyn VideoEncoder>,
     audio: AudioOut,
 ) -> Result<ExportReport, ExportError> {
-    let mut sink = ExportSink::new(dir, video, audio);
+    let mut sink = ExportSink::new(dir, video, audio); sink.reels = tl.reels_colour(|id| sources.open_report(id).and_then(|r| r.colour)); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the file's
     render(tl, range, sources, &mut sink).map_err(ExportError::Render)?;
     sink.finish(tl.tb)
 }
@@ -490,4 +496,5 @@ fn aac_track(id: u32, rate: u32, ch: u16, pcm: &[i16], kbps: u32) -> Result<(bui
 // ── H264ENCCOLOURHOST (LEDGER SR377): the host export's ONE file colour (handlers.md §5 NLEPROBE-HDR's H264ENC-COLOUR-HOST) ──
 /// The RGBA path's colour: `push_rgba` encodes BT.601 limited, primaries / transfer unspecified — the kernel export's
 /// `RGBA_COLOUR` (`unaos/crates/kernel/src/video/export.rs`), so host and kernel state the same file colour for it.
+/// EXPORTCOLOURPRIM (B979): the base; [`H264Encoder`] states the reels' one primaries / transfer pair over it.
 pub const RGBA_COLOUR: Colour = Colour { primaries: 2, transfer: 2, matrix: 6, full_range: Some(false), mastering: None, light: None };
