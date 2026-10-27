@@ -2653,7 +2653,7 @@ pub fn close(id: WinId) -> bool {
     // WMDIRECT — the drag does not survive the window. Ahead of the row free (and of the WEDGE
     // token) so the gesture is cancelled while the id still means something; after this point the
     // slot may be re-issued and a live drag would be steering a stranger's window.
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closing(id); drag_forget(id); winid_close_teardown(id); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] scroll_clear(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path. RING3SCROLL (B778): `scroll_clear(id)` — the window's scroll model goes with the row (a ring-3 window closes here, never through an owner's own clear), folded before this line's first `//`.
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] winmemory::closing(id); drag_forget(id); let close_hooks = winid_close_teardown(id); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] scroll_clear(id); // WINID (SO1(b) / A29) — ⚠ SAME-LINE fold, line-NEUTRAL. Every registered id cache is cleared of `id` HERE, beside `drag_forget` and for its stated reason: this is ahead of the table lock and therefore ahead of the row free, so no cache can still be naming this slot when `create_inner` re-issues it. Id-checked per cell, so a cache pointing at another window is untouched. See the WINID block at this file's tail for the defect (render7: the console's win 1 came back as quarry's win 1), for why this is teardown and not a generation in the id, and for the LOCKFIX argument on the input path. RING3SCROLL (B778): `scroll_clear(id)` — the window's scroll model goes with the row (a ring-3 window closes here, never through an owner's own clear), folded before this line's first `//`.
     // WEDGE-1r2 `<D1>`/`<d1>` — see `move_to`. `close` reaches its barrier through a `TABLE` critical
     // section, so the token has to precede the lock to cover the death that happens ON it.
     crate::wedge2::mark_composite("<D1>", "<d1>");
@@ -2688,7 +2688,7 @@ pub fn close(id: WinId) -> bool {
     // down for nothing, so there is no bracket left to close; a `cursor::repaint()` on this line
     // would be an unbracketed whole-sprite cycle. `drain_deferred`'s masked handback and
     // `composite`'s tail own the sprite through the publish. See [`erase`].
-    composite();
+    composite(); winid_close_hooks_run(id, close_hooks); // WMCLOSEHOOK (rmbp-ledger B1038): an owner whose cell the WINID teardown cleared above (a close behind its back: the furniture disc, `close_all_furniture`, a Log Out) is told HERE — after the row was cleared under TABLE and the drain returned, with no wm lock held — by running its registered close-free (fns at this file's tail). LINE-NEUTRAL append, code first
     true
 }
 
@@ -26321,7 +26321,7 @@ pub fn deadman_damage_sample() -> Option<(u32, u32)> {
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-pub const WINID_HOLDER_MAX: usize = 12;
+pub const WINID_HOLDER_MAX: usize = 24; // WMCLOSEHOOK (B1038): 12 -> 24 in the same commit as the quicklook and closehook-leg cells (A29's rule): 16 x86 holder sites already outran 12, and a refused cell's close hook could never fire
 
 /// WINID — one registered id cache: the cell, and the name that goes on the wire when it is cleared.
 #[cfg(any(
@@ -26331,7 +26331,7 @@ pub const WINID_HOLDER_MAX: usize = 12;
 #[derive(Clone, Copy)]
 struct WinIdHolder {
     cell: Option<&'static core::sync::atomic::AtomicU32>,
-    tag: &'static str,
+    tag: &'static str, hook: Option<WinCloseHook>, // WMCLOSEHOOK (B1038): the owner's close-free, run by `close` when THIS cell is the one the teardown cleared (`winid_register_close_hook`)
 }
 
 /// WINID — the registry. A leaf mutex; see this block's LOCKFIX note.
@@ -26340,7 +26340,7 @@ struct WinIdHolder {
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
 static HOLDERS: Mutex<[WinIdHolder; WINID_HOLDER_MAX]> =
-    Mutex::new([WinIdHolder { cell: None, tag: "" }; WINID_HOLDER_MAX]);
+    Mutex::new([WinIdHolder { cell: None, tag: "", hook: None }; WINID_HOLDER_MAX]);
 
 /// WINID — **register an id cache so [`close`] can clear it.** Idempotent by CELL ADDRESS, so the
 /// natural call site (the module's own `WIN.store(id, ...)` line, which runs once per window) costs a
@@ -26369,7 +26369,7 @@ pub fn winid_register_holder(
             }
         }
         if let Some(i) = free {
-            h[i] = WinIdHolder { cell: Some(cell), tag };
+            h[i] = WinIdHolder { cell: Some(cell), tag, hook: None };
         }
     }
     if free.is_none() {
@@ -26403,7 +26403,7 @@ pub fn winid_register_holder(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-fn winid_holders_clear(id: WinId, names: &mut [&'static str; WINID_HOLDER_MAX]) -> usize {
+fn winid_holders_clear(id: WinId, names: &mut [&'static str; WINID_HOLDER_MAX], hooks: &mut [Option<WinCloseHook>; WINID_HOLDER_MAX]) -> usize { // WMCLOSEHOOK (B1038): each CLEARED cell's hook is copied out beside its tag
     if id == WIN_NONE {
         return 0;
     }
@@ -26419,7 +26419,7 @@ fn winid_holders_clear(id: WinId, names: &mut [&'static str; WINID_HOLDER_MAX]) 
             )
             .is_ok()
             {
-                names[n] = e.tag;
+                names[n] = e.tag; hooks[n] = e.hook;
                 n += 1;
             }
         }
@@ -26529,7 +26529,7 @@ fn winid_close_witness(
     id: WinId,
     cleared: usize,
     names: &[&'static str; WINID_HOLDER_MAX],
-    route: &'static str,
+    route: &'static str, hooked: usize,
 ) {
     if cleared == 0
         && WINID_CLOSE_LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= WINID_LOG_MAX
@@ -26537,7 +26537,7 @@ fn winid_close_witness(
         return;
     }
     crate::bootlog_println!(
-        "[wm] close win={} gen={} route={} holders-cleared={} names={},{},{},{}",
+        "[wm] close win={} gen={} route={} holders-cleared={} names={},{},{},{} hooked={}",
         id,
         winid_gen(id),
         route,
@@ -26545,7 +26545,7 @@ fn winid_close_witness(
         names[0],
         names[1],
         names[2],
-        names[3]
+        names[3], hooked
     );
 }
 
@@ -26554,11 +26554,11 @@ fn winid_close_witness(
     all(target_arch = "x86_64", feature = "wc"),
     all(target_arch = "aarch64", feature = "desktop_firmware")
 ))]
-fn winid_close_teardown(id: WinId) {
+fn winid_close_teardown(id: WinId) -> CloseHooks {
     let route = winid_console_route(id);
     let mut names: [&'static str; WINID_HOLDER_MAX] = [""; WINID_HOLDER_MAX];
-    let cleared = winid_holders_clear(id, &mut names);
-    winid_close_witness(id, cleared, &names, route);
+    let mut hooks = close_hooks_new(); let cleared = winid_holders_clear(id, &mut names, &mut hooks.run); close_hooks_seal(id, &mut hooks, cleared); // WMCLOSEHOOK (B1038): the cleared cells' hooks, and the row's surface when one was collected (file tail)
+    winid_close_witness(id, cleared, &names, route, hooks.hooked); hooks
 }
 
 /// WINID — the erasing twin. No furniture on this image, so a close has nothing to tear down and
@@ -26568,7 +26568,7 @@ fn winid_close_teardown(id: WinId) {
     all(target_arch = "aarch64", feature = "desktop_firmware")
 )))]
 #[inline(always)]
-fn winid_close_teardown(_id: WinId) {}
+fn winid_close_teardown(_id: WinId) -> CloseHooks {}
 
 /// WINID — `route=` for the close witness.
 #[cfg(any(
@@ -32368,3 +32368,141 @@ pub fn list_furniture(owner: u64, on: bool) -> bool {
 pub fn listed_furniture(owner: u64) -> bool {
     owner != 0 && LISTED.iter().any(|s| s.load(core::sync::atomic::Ordering::Acquire) == owner)
 }
+
+// =================================================================================================
+// WMCLOSEHOOK (rmbp-ledger B1038; BP-video-18 kept, the §3 seam sentence) — **an owner whose window is
+// closed behind its back is TOLD, through the WINID registry it already registered with.** TAIL-APPENDED.
+// =================================================================================================
+//
+// Every bypass close ends in [`close`] — `close_all_furniture` (a Log Out, `power::prelude`), the close disc's
+// `wc_close_furniture` on a kernel row — and `close`'s WINID teardown CASes the owner's id cell to `WIN_NONE`
+// ahead of TABLE. That CAS is exactly why the owner's own later `close()` saw `WIN_NONE` and kept its surface
+// (Quarry 7290 KiB, rast_demo's `RW_KEEP` ~300 KiB). The owner identity therefore already lives HERE, in the
+// holder entry, not on the row: the hook is ONE field on [`WinIdHolder`], set by [`winid_register_close_hook`].
+//
+// ORDER (B1033's rule): the hooks are collected by the teardown (ahead of TABLE), and RUN at `close`'s tail —
+// after the row was cleared under TABLE, after the drain returned and the barrier dropped, with no wm lock
+// held. A hook is the owner's existing close-free and NEVER calls `wm::close`. An operator close through the
+// owner's own `close()` swaps the cell to `WIN_NONE` first, so the CAS misses and no hook fires: the owner
+// frees as before, and a bypass close runs the same free — one path.
+//
+// EXACTNESS: a hook is handed the CLOSED ROW's surface address (read under a brief TABLE lock in the teardown,
+// only when a hook was collected) and frees only the buffer that row seated, so a reopened owner's new buffer
+// is never touched. No guard: the kernel is `panic-strategy: abort`, a panicking hook cannot be caught, so no
+// `[wm] close hook` line exists; the count rides `[wm] close … hooked=<n>`. Owed, not built:
+// HOOK-OPEN-INFLIGHT (an owner that reuses its buffer and drops its lock before `create`, Quarry and facet,
+// during an open in flight on another core — B1033's own premise), DRAIN-ABANDON-FREE (a bounded drain that
+// gave up).
+
+/// WMCLOSEHOOK — an owner's close-free: `(the closed id, the closed row's surface address)`.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub type WinCloseHook = fn(WinId, usize);
+
+/// WMCLOSEHOOK — what the teardown hands `close`'s tail: the cleared cells' hooks (index-aligned with the
+/// witness's names), how many of them are set, and the closed row's surface.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+#[derive(Clone, Copy)]
+struct CloseHooks {
+    run: [Option<WinCloseHook>; WINID_HOLDER_MAX],
+    hooked: usize,
+    surf: usize,
+}
+
+/// WMCLOSEHOOK — the erasing twin: no furniture, nothing registered, `close` keeps its bytes.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+type CloseHooks = ();
+
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_hooks_new() -> CloseHooks {
+    CloseHooks { run: [None; WINID_HOLDER_MAX], hooked: 0, surf: 0 }
+}
+
+/// WMCLOSEHOOK — count the collected hooks and, only when there is one, read the row's surface under a brief
+/// TABLE lock. Called from the teardown, ahead of `close`'s own TABLE section, so the row is still live.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn close_hooks_seal(id: WinId, h: &mut CloseHooks, cleared: usize) {
+    h.hooked = h.run[..cleared.min(WINID_HOLDER_MAX)].iter().filter(|f| f.is_some()).count();
+    if h.hooked > 0 {
+        let t = table();
+        h.surf = row(&t, id).map(|r| r.surf).unwrap_or(0);
+    }
+}
+
+/// WMCLOSEHOOK — **register an id cache WITH its owner's close-free.** The cell is registered through
+/// [`winid_register_holder`] (its scan and its loud REFUSED line, not a copy), then the hook is set on that
+/// entry. `false` = the registry is full (said there).
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+pub fn winid_register_close_hook(
+    cell: &'static core::sync::atomic::AtomicU32,
+    tag: &'static str,
+    hook: WinCloseHook,
+) -> bool {
+    if !winid_register_holder(cell, tag) {
+        return false;
+    }
+    let mut h = HOLDERS.lock();
+    for e in h.iter_mut() {
+        if let Some(c) = e.cell {
+            if core::ptr::eq(c, cell) {
+                e.hook = Some(hook);
+                break;
+            }
+        }
+    }
+    true
+}
+
+/// WMCLOSEHOOK — the erasing twin.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+pub fn winid_register_close_hook(
+    _cell: &'static core::sync::atomic::AtomicU32,
+    _tag: &'static str,
+    _hook: fn(WinId, usize),
+) -> bool {
+    false
+}
+
+/// WMCLOSEHOOK — run the hooks `close`'s teardown collected. Called at `close`'s tail only: after the drain,
+/// barrier down, no TABLE held.
+#[cfg(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+))]
+fn winid_close_hooks_run(id: WinId, h: CloseHooks) {
+    if h.hooked == 0 {
+        return;
+    }
+    for f in h.run.iter().flatten() {
+        f(id, h.surf);
+    }
+}
+
+/// WMCLOSEHOOK — the erasing twin.
+#[cfg(not(any(
+    all(target_arch = "x86_64", feature = "wc"),
+    all(target_arch = "aarch64", feature = "desktop_firmware")
+)))]
+#[inline(always)]
+fn winid_close_hooks_run(_id: WinId, _h: CloseHooks) {}

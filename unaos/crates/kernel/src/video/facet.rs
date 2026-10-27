@@ -1164,10 +1164,7 @@ pub fn close() {
     // `wm::close` FIRST — the row must stop naming the buffer before the buffer goes away. It spins
     // on the drain barrier, so it is called with no lock of ours held.
     wm::close(id);
-    *VIEW.lock() = None;
-    *SURF.lock() = Vec::new();
-    SHOWN.lock().clear();
-    anim::stop(); // FACETANIM (B358): the animation ends with its window
+    closed_free(); // WMCLOSEHOOK (rmbp-ledger B1038): the view, the surface, the shown name and the animation, ONE fn (file tail) this close and wm's close hook both run
     serial_println!("[facet] closed win={} paints={}", id, PAINTS.load(Ordering::Relaxed));
 }
 
@@ -1332,7 +1329,7 @@ fn mint(title: &str, vw: usize, vh: usize) -> Result<wm::WinId, FacetError> {
         return Err(FacetError::NoWindow("create-failed"));
     }
     WIN.store(id, Ordering::Relaxed);
-    wm::winid_register_holder(&WIN, "facet");
+    wm::winid_register_close_hook(&WIN, "facet", close_hook); // WMCLOSEHOOK (rmbp-ledger B1038): a close behind facet's back runs `closed_free` (file tail)
     wm::focus_changed(OWNER);
     Ok(id)
 }
@@ -2321,4 +2318,25 @@ fn pix_rgb16(ihdr: &Ihdr, cur: &[u8], x: usize) -> [u16; 3] {
 #[inline]
 fn narrow16(v: u16) -> u8 {
     ((v as u32 * 255 + 32767) / 65535) as u8
+}
+
+// ── WMCLOSEHOOK (rmbp-ledger B1038, BP-video-18 kept) — FILE-TAIL. facet is told when its row is closed behind its back
+// (the furniture disc, `wm::close_all_furniture` at a Log Out): `wm::close` clears `WIN` through the WINID registry and,
+// after the drain with no wm lock held, runs [`close_hook`], which frees what [`close`] frees through [`closed_free`].
+
+/// What a close frees, on either door. FACETANIM (B358): the animation ends with its window.
+fn closed_free() {
+    *VIEW.lock() = None;
+    *SURF.lock() = Vec::new();
+    SHOWN.lock().clear();
+    anim::stop();
+}
+
+/// wm's close hook: free only the buffer the closed row seated, and only while no reopen has published a new `WIN`.
+fn close_hook(_id: wm::WinId, surf: usize) {
+    let seated = WIN.load(Ordering::Acquire) == wm::WIN_NONE && SURF.lock().as_ptr() as usize == surf;
+    if seated {
+        DRAG_ON.store(false, Ordering::Relaxed);
+        closed_free();
+    }
 }

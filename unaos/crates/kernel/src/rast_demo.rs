@@ -591,7 +591,7 @@ impl RwWin {
         // outlives this function and an operator can close it. Register the cell so `wm::close` on
         // ANY route clears it and this module never hands back a re-issued id.
         RW_WIN.store(id, core::sync::atomic::Ordering::Release);
-        wm::winid_register_holder(&RW_WIN, "rastwin");
+        wm::winid_register_close_hook(&RW_WIN, "rastwin", rw_close_hook); // RASTKEEP (WMCLOSEHOOK rmbp-ledger B1038): any close of the parked row frees `RW_KEEP` (file tail)
         serial_println!(
             "[rastwin] {} open win={} owner={:#x} surf={}x{} box={}x{} scale={} at ({},{}) \
              panel={}x{} title={} seat={:?} (3D renders INTO this row; this module writes no panel \
@@ -1228,4 +1228,17 @@ pub fn run_mc(_screen: &mut crate::video::Screen) {
     // that has been feeding them. `run` opens its own row for the paced spin immediately after this
     // function returns, so the glass is never left holding a dead box.
     win.park("mc");
+}
+
+// ── RASTKEEP (WMCLOSEHOOK, rmbp-ledger B1038, BP-video-18 kept) — FILE-TAIL. The parked row's ~300 KiB surface was held by
+// [`RW_KEEP`] after an operator closed the window (the close disc clears `RW_WIN` through the WINID registry and this module
+// was never told; only the next [`rw_take_or_open`] dropped it). `wm::close` now runs this hook after the drain, with no wm
+// lock held: the parked window is dropped iff its `store` is the surface the closed row seated. A close while the demo is
+// still SPINNING (the window not yet parked) is freed at the next `rw_take_or_open`, as before (RASTSPIN-CLOSE, owed).
+fn rw_close_hook(_id: wm::WinId, surf: usize) {
+    let parked = {
+        let mut g = RW_KEEP.lock();
+        if g.as_ref().map(|w| w.store.as_ptr() as usize) == Some(surf) { g.take() } else { None }
+    };
+    drop(parked); // outside the lock; the row stopped naming it and the drain returned
 }
