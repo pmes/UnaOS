@@ -40,8 +40,8 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
    `unaos/crates/kernel/src/arch/x86_64/pci.rs:895`); Strix Point has four (1022:151a/151b/151e/151f) plus two USB4
    NHIs (151c/151d). Measure which physical ports the first one serves; then bring up every xHCI or pick by port.
 7. **ZENBOOK-MT7925** — `drivers/mt7925.rs` (14c3:7925): probe + firmware pin (Z5, fixed-unflown). S2 driver-own and the chip id through
-   the L1 remap, Zenbook only (MT7925S2, Z11). In flight (MT7925S3, Z15): S3 the WFSYS reset and the FWDL TX + event RX rings
-   with WFDMA0 enabled, no firmware; S4..S10 owed in `docs/dev/OS/06_NETWORK_STACK/mt7925.md`.
+   the L1 remap, Zenbook only (MT7925S2, Z11). S3 (MT7925S3, Z15) the WFSYS reset and the FWDL TX + event RX rings
+   with WFDMA0 enabled. In flight (MT7925S4, Z17): S4 the patch and RAM code over the MCU, FW_START, N9_RDY; S5..S10 owed in `docs/dev/OS/06_NETWORK_STACK/mt7925.md`.
 6. **ZENBOOK-XHCIPICK** — BUILT by ZENBOOKXHCIPICK (Z7, fixed-unflown, code-only): the driver is single-instance, so
    the kernel brings up ONE xHCI — the first class 0C/03/30 in walk order (today's tuple, unchanged) unless the build knob
    `UNAOS_XHCI_PICK=<index|b:d.f>` (decimal; arroyo validates) names another (`drivers::xhci::pick`, fed the PCI registry
