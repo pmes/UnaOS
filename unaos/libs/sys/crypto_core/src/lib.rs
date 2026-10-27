@@ -26,6 +26,7 @@
 //! | [`xts`] | XTS-AES-128/256 (ciphertext stealing; whole-block slices of a data unit) | IEEE Std 1619-2007, SP 800-38E |
 //! | [`prf80211`] | the 802.11 PRF-n (HMAC-SHA-1, counter octet) — the RSN key hierarchy's PRF | IEEE Std 802.11-2020 §12.7.1.2 |
 //! | [`ccm`] | AES-CCM (generic M and L; 802.11 CCMP is M=8, L=2) | RFC 3610, SP 800-38C |
+//! | [`ctr`] | CTR mode with an n-bit counter (1..=128 bits) — GCM's GCTR, CCM's A_i, WebCrypto AES-CTR | SP 800-38A §6.5 / B.1 |
 //! | [`keywrap`] | AES Key Wrap (default IV, unwrap integrity check) | RFC 3394 |
 //! | [`cbc`] | CBC mode over AES (whole blocks, PKCS #7 unpad) — PDF's AESV2/AESV3 crypt filters | SP 800-38A §6.2 |
 //! | [`md5`] | MD5 — LEGACY-ONLY (broken): PDF's standard security handler and FLAC's STREAMINFO checksum only | RFC 1321 |
@@ -94,6 +95,7 @@ pub mod argon2;
 pub mod drbg;
 pub mod sha3;
 pub mod mlkem;
+pub mod ctr; // CRYPTOONE-2 (LEDGER SR342): CTR with an n-bit counter, SP 800-38A §6.5 — under gcm, ccm and WebCrypto AES-CTR
 
 pub use sha1::Sha1;
 pub use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};

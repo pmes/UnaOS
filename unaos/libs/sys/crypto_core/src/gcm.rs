@@ -144,26 +144,9 @@ impl AesGcm {
         }
     }
 
-    /// GCTR from counter block `icb` (inc32 on the low 32 bits), four blocks per bitsliced pass.
+    /// GCTR from counter block `icb` (inc32 on the low 32 bits): crate::ctr with a 32-bit counter (CRYPTOONE-2, SR342).
     fn gctr(&self, icb: &[u8; 16], data: &mut [u8]) {
-        let base = u32::from_be_bytes(icb[12..].try_into().unwrap());
-        let mut ctr = 0u32;
-        for chunk in data.chunks_mut(64) {
-            let n = chunk.len().div_ceil(16);
-            let mut ks = [[0u8; 16]; 4];
-            for (k, b) in ks.iter_mut().take(n).enumerate() {
-                b[..12].copy_from_slice(&icb[..12]);
-                b[12..].copy_from_slice(&base.wrapping_add(ctr + k as u32).to_be_bytes());
-            }
-            self.aes.encrypt_blocks(&mut ks[..n]);
-            for (i, x) in chunk.iter_mut().enumerate() {
-                *x ^= ks[i / 16][i % 16];
-            }
-            ctr = ctr.wrapping_add(n as u32);
-            for b in ks.iter_mut() {
-                b.zeroize();
-            }
-        }
+        crate::ctr::ctr(&self.aes, icb, 32, data);
     }
 
     fn tag(&self, j0: &[u8; 16], aad: &[u8], ct: &[u8]) -> [u8; 16] {
