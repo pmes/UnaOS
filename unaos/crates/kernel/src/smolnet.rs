@@ -504,7 +504,7 @@ fn ensure_stack(guard: &mut Option<SmolStack>) -> bool {
     let mut sockets = SocketSet::new(storage);
     // The DHCP socket takes the reserved (NSOCK+1-th) storage slot and is NOT recorded in `reg`, so
     // it never counts against ring-3 socket allocation and no `stack_open*`/`free_row_sockets` touches it.
-    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new()); #[cfg(feature = "wifi10")] { lease_buffer(&mut sockets, dhcp_handle); } // STATIONLEASE (B862): the DHCP socket keeps the last received payload, so the ACK's option 51 is readable (LINE-NEUTRAL)
     let mut stack = SmolStack {
         iface,
         sockets,
@@ -736,7 +736,7 @@ static DHCP_RUNNING: AtomicBool = AtomicBool::new(false);
 fn dhcp_event(stack: &mut SmolStack) -> Option<(Ipv4Cidr, Option<Ipv4Address>, Option<Ipv4Address>)> {
     let h = stack.dhcp?;
     match stack.sockets.get_mut::<dhcpv4::Socket>(h).poll() {
-        Some(dhcpv4::Event::Configured(cfg)) => Some((cfg.address, cfg.router, cfg.dns_servers.first().copied())),
+        Some(dhcpv4::Event::Configured(cfg)) => { #[cfg(feature = "wifi10")] { lease_note(&cfg); } Some((cfg.address, cfg.router, cfg.dns_servers.first().copied())) } // STATIONLEASE (B862): the lease seconds noted from the Config this drain already takes (LINE-NEUTRAL)
         Some(dhcpv4::Event::Deconfigured) | None => None,
     }
 }
@@ -2332,4 +2332,53 @@ fn connect_said(own: Option<crate::net_tick::Who>, ip: [u8; 4], port: u16) {
 #[cfg(feature = "wifi10")]
 pub fn route_view() -> ([u8; 4], [u8; 4]) {
     (CURRENT_GW.load(Ordering::Relaxed).to_be_bytes(), CURRENT_DNS.load(Ordering::Relaxed).to_be_bytes())
+}
+
+// ── STATIONLEASE (rmbp-ledger B862) — TAIL-APPENDED. The lease duration (DHCP option 51, RFC 2132 §9.2) for `tests wifi`'s
+// S10b line. smoltcp 0.14's `dhcpv4::Config` carries no lease field, but its `packet` holds the last received DHCP payload
+// when the socket was given a receive-packet buffer (`set_receive_packet_buffer`, copied before the state match), so at the
+// Requesting -> Ack `Configured` event it is the ACK; smoltcp's own `DhcpRepr::parse` reads option 51. No fork, no second
+// parser. Stored under `STACK` (`dhcp_event`'s caller holds it), read lock-free.
+
+/// The lease seconds of the boot's last ACK the drain saw (0 = unread).
+#[cfg(feature = "wifi10")]
+static LEASE_S: AtomicU32 = AtomicU32::new(0);
+
+/// From `ensure_stack` (once per boot, under `STACK`): the DHCP socket's receive-packet buffer, 1500 octets leaked for the
+/// boot (the socket borrows it `'static`, as `SocketSet<'static>` does its storage).
+#[cfg(feature = "wifi10")]
+fn lease_buffer(sockets: &mut SocketSet<'static>, h: SocketHandle) {
+    let buf: &'static mut [u8] = alloc::vec![0u8; 1500].leak();
+    sockets.get_mut::<dhcpv4::Socket>(h).set_receive_packet_buffer(buf);
+}
+
+/// From `dhcp_event`'s `Configured` arm: the payload the socket kept, read for option 51.
+#[cfg(feature = "wifi10")]
+fn lease_note(cfg: &dhcpv4::Config<'_>) {
+    if let Some(p) = cfg.packet {
+        if let Some(s) = lease_of(p.into_inner()) {
+            LEASE_S.store(s, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The lease seconds of a DHCP payload (the BOOTP message, not the Ethernet frame): `Some` only for a well-formed ACK
+/// (RFC 2132 §9.6 type 5) carrying option 51. Pure (`wifi::data::kat`'s `lease` row).
+#[cfg(feature = "wifi10")]
+pub(crate) fn lease_of(payload: &[u8]) -> Option<u32> {
+    let p = smoltcp::wire::DhcpPacket::new_checked(payload).ok()?;
+    let r = smoltcp::wire::DhcpRepr::parse(&p).ok()?;
+    if !matches!(r.message_type, smoltcp::wire::DhcpMessageType::Ack) {
+        return None;
+    }
+    r.lease_duration
+}
+
+/// `wifi/verb.rs::wifidhcp`'s `lease=`: the seconds, or `None` while unread.
+#[cfg(feature = "wifi10")]
+pub fn lease_secs() -> Option<u32> {
+    match LEASE_S.load(Ordering::Relaxed) {
+        0 => None,
+        s => Some(s),
+    }
 }

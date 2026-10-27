@@ -60,6 +60,38 @@ pub fn assoc_reply_rates(frame: &[u8], me: Mac, bssid: Mac) -> Option<(AssocResu
     assoc_reply(frame, me, bssid).map(|a| (a, w::assoc_resp_rates(frame)))
 }
 
+/// STATIONSHORTPRE (B862): the association response's capability Short Preamble bit (§9.4.1.4 bit 5, 0x0020, the first
+/// fixed field at octet 24): the AP allows short preamble in its BSS. `false` for a frame too short to carry it.
+pub fn short_preamble(frame: &[u8]) -> bool {
+    frame.len() >= 26 && u16::from_le_bytes([frame[24], frame[25]]) & 0x0020 != 0
+}
+
+/// STATIONAIR (B862): S9's pick — `assoc_reply_rates`' judge and answer, with the capability's short-preamble bit.
+pub fn assoc_reply_air(frame: &[u8], me: Mac, bssid: Mac) -> Option<(AssocResult, Option<w::RateSet>, bool)> {
+    assoc_reply_rates(frame, me, bssid).map(|(a, r)| (a, r, short_preamble(frame)))
+}
+
+/// STATIONSHORTPRE (B862): the station's primary rate uses the short preamble — the AP's capability bit allows it (`cap`) and
+/// the rate is CCK 2/5.5/11 (CCK 1 is long only; OFDM has no such preamble). Until STATIONSHORTCAP (our association request
+/// advertises capability 0x0001 only, `wifi_core::ieee80211::build_assoc_req`) the AP's bit alone decides.
+pub fn station_short(cap: bool, rate: u8) -> bool {
+    cap && matches!(rate, 4 | 11 | 22)
+}
+
+/// STATIONDURATION (B862): the rate the AP answers a frame at `rate` with — the control response rate (IEEE Std 802.11-2020
+/// §10.6.6.5.2): the highest BASIC rate not faster than `rate` in its modulation class (CCK / OFDM); none (or the set unread)
+/// -> the highest mandatory rate of that class not faster than it (CCK: every CCK rate, so `rate` itself; OFDM: 24, 12, 6).
+/// A rate outside the legacy set answers CCK 1.
+pub fn ack_rate(rs: Option<w::RateSet>, rate: u8) -> u8 {
+    let Some(k) = w::LEGACY_RATES.iter().position(|r| *r == rate) else { return w::RATE_1M };
+    let (lo, hi) = if k < 4 { (0usize, 4usize) } else { (4usize, 12usize) };
+    let basic = rs.map_or(0u16, |r| r.basic);
+    if let Some(i) = (lo..hi).rev().find(|&i| basic & (1 << i) != 0 && w::LEGACY_RATES[i] <= rate) {
+        return w::LEGACY_RATES[i];
+    }
+    if k < 4 { rate } else { [w::RATE_24M, 24, 12].iter().copied().find(|r| *r <= rate).unwrap_or(12) }
+}
+
 /// STATIONRATE (B855): the kept station's data rate (500 kbit/s units) — OFDM 24 when the AP listed it AND the one Null
 /// probe at OFDM 24 was acked at that rate; else the highest CCK rate the AP listed (11, 5.5, 2); else, or with the
 /// set unread, CCK 1.

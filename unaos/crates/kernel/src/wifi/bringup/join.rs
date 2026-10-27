@@ -38,11 +38,13 @@ pub(super) struct Heard {
     pub watch: Option<super::super::data::Watch>,
     /// STATIONRATE (B855): the rate set S9's ASSOCIATED answer listed (`None` = unread); `keep` picks the station's rate from it.
     pub rates: Option<wifi_core::ieee80211::RateSet>,
+    /// STATIONSHORTPRE (B862): S9's ASSOCIATED answer set the capability Short Preamble bit (`assoc::short_preamble`).
+    pub short: bool,
 }
 
 impl Heard {
     pub(super) fn new(me: Mac, ssid: Option<String>) -> Heard {
-        Heard { me, target: ssid.map(|s| s.into_bytes()).unwrap_or_default(), bss: None, frames: Vec::new(), watch: None, rates: None }
+        Heard { me, target: ssid.map(|s| s.into_bytes()).unwrap_or_default(), bss: None, frames: Vec::new(), watch: None, rates: None, short: false }
     }
 }
 
@@ -154,13 +156,14 @@ fn s9_assoc(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::Seen, bss:
     let target = seen.join.target.clone();
     let frame = wifi_core::ieee80211::build_assoc_req(me, bss.bssid, &target, 0);
     let r = tx::fire_frame(bar0, p, &frame, ch, FRAME_ASSOC, "assoc-req", tx::RATE_1M, w);
-    let (reply, waited) = await_reply(bar0, rxr, seen, ch, bss.bssid, w, assoc::assoc_reply_rates);
+    let (reply, waited) = await_reply(bar0, rxr, seen, ch, bss.bssid, w, assoc::assoc_reply_air);
     let (resp, fields, aid, verdict) = match reply {
-        Reply::Got((a, rates)) if a.status == 0 => {
+        Reply::Got((a, rates, short)) if a.status == 0 => {
             seen.join.rates = rates;
+            seen.join.short = short;
             (1, alloc::format!("status=0 aid={}", a.aid), Some(a.aid), String::from("ASSOCIATED"))
         }
-        Reply::Got((a, _)) => (1, alloc::format!("status={} aid=-", a.status), None, alloc::format!("NOT-ASSOCIATED reason=status={}", a.status)),
+        Reply::Got((a, _, _)) => (1, alloc::format!("status={} aid=-", a.status), None, alloc::format!("NOT-ASSOCIATED reason=status={}", a.status)),
         Reply::Refused(what, reason) => (0, String::from("status=- aid=-"), None, alloc::format!("NOT-ASSOCIATED reason={}(reason={})", what, reason)),
         Reply::None => {
             let why = if r.sent() { alloc::format!("no-response(acked={})", r.acked as u8) } else { alloc::format!("tx:{}", r.reason()) };
@@ -289,8 +292,9 @@ struct Station {
     w: rx::Writes,
     q: tx::Queue,
     lost: Option<&'static str>,
-    /// STATIONRATE (B855): every station data frame's rate (500 kbit/s units), chosen by `keep`.
-    rate: u8,
+    /// STATIONRATE (B855): every station data frame's rate (500 kbit/s units), chosen by `keep`; STATIONAIR (B862): with the
+    /// AP's ACK rate and the short preamble, one `tx::TxRate`.
+    rate: tx::TxRate,
 }
 
 /// THE station. Lock order: smolnet's `STACK` -> `STATION` (smoltcp's poll calls the accessor triple); nothing
@@ -302,14 +306,17 @@ static STATION: crate::sync::Mutex<Option<Station>> = crate::sync::Mutex::new(No
 pub(super) fn keep(bar0: u64, prep: tx::Prep, rxr: rx::Rx, mut seen: rx::Seen, ch: u16, mut w: rx::Writes, mut link: super::super::data::Link) {
     // STATIONRATE (B855): the receive filter and the station's rate, set here on the shell task BEFORE `STATION` is filled
     // (no lock held; the pass still owns the engines).
-    let mut rate = tx::RATE_1M;
+    let mut rate = tx::TxRate::long(tx::RATE_1M);
     if let Some(b) = seen.join.bss {
         let (pre, post) = rx::station_filter(bar0, b.bssid, &mut w);
+        // STATIONTEMPLATE (B862): the MAC and BSSID into template RAM beside the BSSID filter (b43 main.c:679-703).
+        let words = tx::templates(bar0, seen.join.me, b.bssid);
+        let template = if words == 3 { String::from("written") } else { alloc::format!("short({})", words) };
         serial_println!(
-            "[wifi10] station filter promisc=0 beacpromisc=0 keepbad=0 bssid={} macctl={:#010x}->{:#010x} — b43 main.c:690, :3103-3140 (STATIONRATE B855)",
-            mac_text(b.bssid), pre, post
+            "[wifi10] station filter promisc=0 beacpromisc=0 keepbad=0 bssid={} macctl={:#010x}->{:#010x} template={} — b43 main.c:690, :3103-3140 (STATIONRATE B855); main.c:679-703 (STATIONTEMPLATE B862)",
+            mac_text(b.bssid), pre, post, template
         );
-        rate = pick_rate(bar0, &prep, seen.join.rates, ch, &mut link, b.bssid, &mut w);
+        rate = pick_rate(bar0, &prep, seen.join.rates, seen.join.short, ch, &mut link, b.bssid, &mut w);
     }
     seen.data.clear();
     seen.join.frames.clear();
@@ -433,8 +440,10 @@ pub(super) fn rejoin() -> bool {
 
 /// From `keep`, on the shell task before `STATION` is filled: when the AP listed OFDM 24, ONE Null data frame
 /// (`build_null_data`) at OFDM 24 on the Link's next ring frame (`fire_frame`'s bounded status spin) — `probe=ack` iff it was
-/// acked at that rate (`Report::acked_at_rate`); then `assoc::station_rate`. Said once.
-fn pick_rate(bar0: u64, p: &tx::Prep, rs: Option<wifi_core::ieee80211::RateSet>, ch: u16, link: &mut super::super::data::Link, bssid: Mac, w: &mut rx::Writes) -> u8 {
+/// acked at that rate (`Report::acked_at_rate`); then `assoc::station_rate`. STATIONAIR (B862): the rate leaves as ONE
+/// `tx::TxRate` — the AP's answer rate (`assoc::ack_rate`) and the short preamble (`assoc::station_short`, the AP's capability
+/// bit `short_cap` and a CCK 2/5.5/11 rate). Said once.
+fn pick_rate(bar0: u64, p: &tx::Prep, rs: Option<wifi_core::ieee80211::RateSet>, short_cap: bool, ch: u16, link: &mut super::super::data::Link, bssid: Mac, w: &mut rx::Writes) -> tx::TxRate {
     let probe = if assoc::ofdm_listed(rs) {
         let n = link.reserve();
         let null = wifi_core::ieee80211::build_null_data(link.mac(), bssid, 0);
@@ -444,16 +453,19 @@ fn pick_rate(bar0: u64, p: &tx::Prep, rs: Option<wifi_core::ieee80211::RateSet>,
         "none"
     };
     let rate = assoc::station_rate(rs, probe == "ack");
+    let air = tx::TxRate { rate, ack: assoc::ack_rate(rs, rate), short: assoc::station_short(short_cap, rate) };
     serial_println!(
-        "[wifi10] station rate={} probe={} probe_at=keep(shell task, before STATION, no lock) ap={} — b43 xmit.c:136-189, :884 (STATIONRATE B855)",
-        assoc::rate_name(rate), probe, assoc::rates_text(rs)
+        "[wifi10] station rate={} probe={} probe_at=keep(shell task, before STATION, no lock) ap={} preamble={} ack={} nav={}us — b43 xmit.c:136-189, :884 (STATIONRATE B855); xmit.c:374-375, 802.11-2020 §10.6.6.5.2 (STATIONAIR B862)",
+        assoc::rate_name(rate), probe, assoc::rates_text(rs), if air.short { "short" } else { "long" }, assoc::rate_name(air.ack), tx::nav_us(air)
     );
-    rate
+    air
 }
 
-/// `tests wifi` (`data::kat` rows 10-14): `tx::rate_kat`'s four rows, then the station MACCTL word from S6's `arm` word
-/// (ENABLED | INFRA | BEACPROMISC | KEEP_BAD | PROMISC | DISCPMQ -> ENABLED | INFRA | DISCPMQ).
-pub(in crate::wifi) fn station_kat() -> [bool; 5] {
+/// `tests wifi` (`data::kat` rows 10-14, 17-18): `tx::rate_kat`'s four rows, then the station MACCTL word from S6's `arm` word
+/// (ENABLED | INFRA | BEACPROMISC | KEEP_BAD | PROMISC | DISCPMQ -> ENABLED | INFRA | DISCPMQ), then `tx::air_kat`'s two
+/// (duration, shortpre; STATIONAIR B862).
+pub(in crate::wifi) fn station_kat() -> [bool; 7] {
     let t = tx::rate_kat();
-    [t[0], t[1], t[2], t[3], rx::station_macctl(0x4192_0001) == 0x4002_0001]
+    let a = tx::air_kat();
+    [t[0], t[1], t[2], t[3], rx::station_macctl(0x4192_0001) == 0x4002_0001, a[0], a[1]]
 }
