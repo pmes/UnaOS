@@ -40,6 +40,8 @@ OPTIONAL :: ECLID: -> SKIP reason=no-ecdt ::
 
 # ── 3. Z2: the NVMe controller (UNAOS_NVME on the line; the builder attaches the QEMU nvme device) ─────────────────────
 REQUIRE \[nvme\] ctrl mn=".*" ns=1 lba=\d+ blocks=\d+ -> ready
+# NVME4KN-FIXTURE (zenbook-ledger Z40): the 4Kn root lane — `UNAOS_UNAFS=1 UNAOS_NVME_4K=1 ./arroyo esp-x86`, then `UNAOS_NVME_4K=1 UNAOS_NVME_DISK=target/unaos-x86-card.img ./arroyo test-zenbook`: the root flip a one-LBA read-modify-write
+OPTIONAL \[nvme\] test identify=ok sector0=GPT .* rw=ok .* lba=4096 shift=12 rmw=[1-9]\d*
 
 # ── 4. Z10: the compositor ignites on the GOP framebuffer (no Kepler takeover) — the GopBoot arm's first QEMU run ──────
 REQUIRE \[wc-x\] gop-ignite platform=zenbook_um5606w fb=\d+x\d+
