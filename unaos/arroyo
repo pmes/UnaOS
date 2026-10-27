@@ -5325,7 +5325,7 @@ test_aarch64() {
         { cp "$STICK_IMG" "$_apps" && mcopy -o -i "$_apps" "$ESP_DIR_ARM/kernel.elf" ::/kernel.elf; } || { echo -e "${COLOR_RED}test-arm: cannot stage the app stick from ${STICK_IMG} (./arroyo fat-img; mtools)${COLOR_RESET}"; return 2; }
         mmd -i "$_apps" ::/APPS 2>/dev/null; mmd -i "$_apps" ::/system 2>/dev/null; mmd -i "$_apps" ::/system/doc 2>/dev/null
         for _p in midden:MIDDEN una:UNA lumen:LUMEN aether:AETHER stria:STRIA; do case ",${_feats}" in *",${_p%%:*},"*) "build_user_${_p%%:*}_aarch64"; mcopy -o -i "$_apps" "${WORKSPACE_DIR}/target/${_p##*:}.ELF" ::/APPS/ || return 2 ;; esac; done
-        case ",${_feats}" in *",aether,"*) mcopy -o -i "$_apps" "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html ::/system/doc/ || return 2 ;; esac
+        case ",${_feats}" in *",aether,"*) mcopy -o -i "$_apps" "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html "${WORKSPACE_DIR}"/crates/user-aether/doc/*.pdf ::/system/doc/ || return 2 ;; esac  # PDF4KERNEL (B999): + doc/*.pdf (tests aether's fixture.pdf)
         case ",${_feats}" in *",stria,"*) if [ -s "${WORKSPACE_DIR}/target/testf-cache/TEST.WEBM" ]; then mmd -i "$_apps" ::/system/test-f 2>/dev/null; mcopy -o -i "$_apps" "${WORKSPACE_DIR}/target/testf-cache/TEST.WEBM" ::/system/test-f/ || return 2; else echo -e "${COLOR_YELLOW}  ⚠ STRIAMETAL: target/testf-cache/TEST.WEBM absent (the builder fetches it, builder/testf.list) — tests stria SKIPs no-clip on this stick${COLOR_RESET}"; fi ;; esac   # STRIAMETAL (SR139): the clip `tests stria` plays
         STICK_IMG="$_apps"; echo -e "${COLOR_YELLOW}⚡ app stick: ${_apps} (kernel.elf + APPS/ for tests midden/una/lumen/aether):${COLOR_RESET}"; mdir -i "$_apps" ::/APPS
         ;; esac; fi
@@ -10828,7 +10828,7 @@ stage_jetson_el0_images() {
             build_user_aether_aarch64
             cp "${WORKSPACE_DIR}/target/AETHER.ELF" "${APPS_DIR_ARM}/AETHER.ELF"
             staged=$((staged + 1))
-            mkdir -p "${ESP_DIR_ARM}/system/doc" && cp "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html "${ESP_DIR_ARM}/system/doc/"
+            mkdir -p "${ESP_DIR_ARM}/system/doc" && cp "${WORKSPACE_DIR}"/crates/user-aether/doc/*.html "${WORKSPACE_DIR}"/crates/user-aether/doc/*.pdf "${ESP_DIR_ARM}/system/doc/"  # PDF4KERNEL (B999): + doc/*.pdf
             ;;
     esac
     # STRIAMETAL (SR139): STRIA.ELF under `stria`, and the clip `tests stria` plays (builder/testf.list's TEST.WEBM, the

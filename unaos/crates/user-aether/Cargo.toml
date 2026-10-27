@@ -58,6 +58,11 @@ edit_core = { path = "../../libs/text/edit_core" }
 # features; the SAME core the kernel's video/png.rs links and http_core already pulls in for its inflater, so no new
 # code family enters the ELF) decodes the page's `<link rel=icon>` (PNG/JPEG/GIF/BMP/QOI/WebP) for the strip's tile.
 pixel_core = { path = "../../libs/media/pixel_core" }
+# PDF4KERNEL (rmbp-ledger B999): the kernel PDF face — pdf_core (PDF1 SR300: no_std + alloc, forbid(unsafe); its `std`
+# feature is the empty seam, off here) is the SAME core handlers/aether/src/pdf opens and rasters with (`Page::render`
+# + `GlyphSink`, BP-handlers-4). Its deps are already here (pixel_core, font_core, crypto_core / tls_core through
+# vein_ring3) or no_std (svg_core, icc_core); svg_core's Pixmap comes through pdf_core's re-export, so no second line.
+pdf_core = { path = "../../libs/web/pdf_core", default-features = false }
 
 # AETHERNET (SR110): `cryptocore` is the product crypto provider under tls_core (Lumen's line). It is ON BY DEFAULT here
 # because arroyo's build_user_aether_x86 / _aarch64 pass no --features (Lumen's builds pass `--features cryptocore`):

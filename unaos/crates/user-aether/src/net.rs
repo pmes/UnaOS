@@ -87,7 +87,7 @@ pub const MAX_PER_ORIGIN: usize = http_core::MAX_H1_PER_ORIGIN;
 /// Every navigation (all hops, DNS, connect, TLS, body) finishes inside this or ends `timeout`.
 pub const FETCH_MS: u64 = 30_000;
 /// The largest body read (still content-coded) and decoded; Aether's file pages stop at 1 MiB, the network at 4.
-const BODY_MAX: usize = 4 * 1024 * 1024;
+pub(crate) const BODY_MAX: usize = 4 * 1024 * 1024; // PDF4KERNEL (B999): also pdf.rs's MAX_BYTES, ONE cap
 const UA: &str = "Mozilla/5.0 (UnaOS) Aether/1";
 const ACCEPT: &str = "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8";
 
@@ -113,6 +113,9 @@ struct Net {
     /// AETHERLIB (SR193): the answer cache, the parked sockets and the last page's site (the site-for-cookies of the
     /// next navigation) — the model's state.
     seq: fetchseq::Seq<Tcp>,
+    /// PDF4KERNEL (rmbp-ledger B999): the last navigation's final `Content-Type` (None after a failure) — what `load`'s
+    /// PDF branch (`pdf::take`) reads for a network page.
+    ctype: Option<String>,
 }
 
 static mut NET: Option<Net> = None;
@@ -120,7 +123,7 @@ static mut NET: Option<Net> = None;
 fn state() -> &'static mut Net {
     // SAFETY: AETHER.ELF is single-threaded and nothing here re-enters `state` while a borrow is live (the tick hook
     // reads only `DEADLINE`).
-    unsafe { (*core::ptr::addr_of_mut!(NET)).get_or_insert_with(|| Net { tls: None, jar: CookieJar::new(), seq: fetchseq::Seq::new() }) }
+    unsafe { (*core::ptr::addr_of_mut!(NET)).get_or_insert_with(|| Net { tls: None, jar: CookieJar::new(), seq: fetchseq::Seq::new(), ctype: None }) }
 }
 
 static DEADLINE: AtomicU64 = AtomicU64::new(0);
@@ -339,6 +342,7 @@ pub fn fetch(url: &str) -> Result<(Vec<u8>, String), i64> {
     let mut io = Elf { tls: &mut n.tls, jar: &mut n.jar };
     // AETHERLIB (SR193): the model sequences the hops; the values below are the ones this line always read.
     let fetchseq::Nav { cur, out, hops, last } = fetchseq::navigate(&mut io, &mut n.seq, url);
+    n.ctype = out.as_ref().ok().and_then(|r| r.headers.get("content-type")).map(String::from); // PDF4KERNEL (B999)
     // Undo the content codings (gzip/deflate/br; any other is a named refusal).
     let mut coding: &[u8] = b"identity";
     let out = out.and_then(|r| {
@@ -396,4 +400,10 @@ pub fn fetch(url: &str) -> Result<(Vec<u8>, String), i64> {
         Ok((_, body)) => Ok((body, shown)),
         Err(f) => Err(if f.code != 0 { f.code } else { una_abi::EIO }),
     }
+}
+
+/// PDF4KERNEL (rmbp-ledger B999): the last navigation's final `Content-Type`, read by `pdf::take` right after `fetch`
+/// answers (a later fetch — the favicon — overwrites it).
+pub fn last_ctype() -> Option<String> {
+    state().ctype.clone()
 }
