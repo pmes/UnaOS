@@ -894,7 +894,7 @@ refs/heads/exec-rmbp-hevcrext   d08a83b03 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-phyoncefn   5a80ea12d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdfjpx   f3d5ae3c9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-jbig2huff   f3d5ae3c9 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-pdfsig   f3d5ae3c9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pdfsig   dd39de802 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdfwritefonts   707941343 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-stationroamactive   f3d5ae3c9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle2split   2f9283486 IN-FLIGHT cut 2026-10-27

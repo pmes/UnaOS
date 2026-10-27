@@ -161,6 +161,7 @@ fn main() {
     let title = doc.info().title.map(|t| one_line(&t)).filter(|t| !t.is_empty()).unwrap_or_else(|| "-".into());
     let version = if doc.version().is_empty() { "-" } else { doc.version() };
     println!("pages={} version={version} xref={} encrypt={} info={title}", pages.len(), doc.xref_kind().as_str(), doc.encryption());
+    println!("{}", pdf_core::sig::probe_line(&doc, &bytes));
     for (i, p) in pages.iter().enumerate() {
         println!("{}", page_line(&doc, i, p));
     }
