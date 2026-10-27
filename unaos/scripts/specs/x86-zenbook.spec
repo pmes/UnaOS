@@ -80,6 +80,7 @@ REQUIRE \[hw\] skip hda platform=zenbook_um5606w
 REQUIRE \[hda\] census codec=0 vid=1af4:0022 subsys=[0-9a-f]{4}:[0-9a-f]{4} afg=0x[0-9a-f]{2} nodes=\d+ ctrl=[0-9a-f]{4}:[0-9a-f]{4} pcissid=[0-9a-f]{4}:[0-9a-f]{4} -> parked
 REQUIRE \[hda\] audit stage=census .*verbs-set=0\b
 REQUIRE :: HDACENSUS: codecs=1 vid=10ec:0294 subsys=1043:1df3 afg=0x01 nodes=\d+ sets=0 cases=4/4 -> PASS ::
+REQUIRE :: HDAPATH: d0=ok path=ok sets=6 cases=3/3 -> PASS ::
 FORBID \[hda\] (gpio|tone|path)\b
 
 # ── END OF RUN: the last typed verdict (mbench's completion also needs every REQUIRE above) ───────────────────────────

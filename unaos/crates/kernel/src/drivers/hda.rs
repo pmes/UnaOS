@@ -652,7 +652,7 @@ fn pin_colour_name(c: u8) -> &'static str {
 /// response, or two 16-bit entries when the long-form bit (bit 7 of the length parameter) is set;
 /// an entry whose top bit is set is the END of an inclusive RANGE starting at the previous entry.
 /// [HDA-SPEC §7.3.3.3, §7.3.4.11]
-fn read_connections(rings: &mut Rings, cad: u8, nid: u8, w: &mut Widget, a: &mut Audit) {
+fn read_connections<V: Verbs>(rings: &mut V, cad: u8, nid: u8, w: &mut Widget, a: &mut Audit) {
     if w.caps & WCAP_CONN_LIST == 0 {
         return;
     }
@@ -778,7 +778,7 @@ fn find_path(ws: &[Widget; MAX_NODES], pin: u8) -> Option<Path> {
 
 /// Walk one codec: function groups, every widget under each audio function group, and the derived
 /// output path.
-fn walk_codec(rings: &mut Rings, cad: u8, ws: &mut [Widget; MAX_NODES], a: &mut Audit) -> Option<CodecWalk> {
+fn walk_codec<V: Verbs>(rings: &mut V, cad: u8, ws: &mut [Widget; MAX_NODES], a: &mut Audit) -> Option<CodecWalk> {
     let vid = rings.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_VENDOR_ID, a)?;
     a.verbs_get += 1;
     let rev = rings.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_REVISION_ID, a)?;
@@ -1159,7 +1159,7 @@ pub fn probe() { if !crate::hw::gate(crate::hw::Probe::Hda) { census(); return; 
             for w in ws.iter_mut() {
                 *w = Widget::default();
             }
-            let cw = match walk_codec(&mut rings, codecs[ci], &mut ws, &mut a) {
+            let cw = match walk_codec(&mut *rings, codecs[ci], &mut ws, &mut a) {
                 Some(c) => c,
                 None => {
                     serial_println!("[hda] codec={} walk INCOMPLETE — the codec stopped answering", codecs[ci]);
@@ -1743,7 +1743,7 @@ fn run_tone(base: u64, rings: &mut Rings, iss: u8, walk: Option<&CodecWalk>, ws:
     let mut pin_actual = [0xFu8; PAIR_MAX]; // HDATONE6 M2: each member pin's ACTUAL power state after settle (+ fallback)
     match afg.filter(|_| !amp::held()) { // AUDIO8 (B329) M1: the GPIO is driven only by the run that RAISES the amp; held runs skip the block
         None => if amp::held() { gpio_final = amp::gpio_now(); } else { serial_println!("[hda] gpio afg=none caps=0 -> none (no audio function group answered)") },
-        Some(fg) => {
+        Some(fg) => if gpio_none() { gpio_none_say(fg); } else { // ZENBOOKACPCODEC (zenbook-ledger Z43): the ALC294 arm's tone runs with GPIO_NONE set (Linux's 1043:1df3 quirk chains no GPIO fixup), so the drive below is skipped by name; GPIO_NONE is never set on the Cirrus path, whose body is unchanged (this arm's block is the else)
             let caps = rings.cmd(cad, fg, VERB_GET_PARAMETER, PARAM_GPIO_COUNT, a).unwrap_or(0);
             a.verbs_get += 1;
             // [HDA-SPEC §7.3.4.14] bits 7:0 GPIO count, 15:8 GPO count, 23:16 GPI count,
@@ -3236,7 +3236,7 @@ fn census() {
                 continue;
             }
         };
-        let (codecs, n) = codecs_of(statests);
+        let (codecs, n) = codecs_of(statests); let mut armed = false; // ZENBOOKACPCODEC (Z43): set when the ALC294 arm armed this controller's codec (the link then stays up)
         serial_println!(
             "[hda] census ctrl={:04x}:{:04x} bdf={}:{}.{} crst={} raised={} statests={:#06x} codecs={}",
             vend, devid, bus, slot, func, gctl & GCTL_CRST, raised as u8, statests, n
@@ -3250,11 +3250,11 @@ fn census() {
             if ring::bring_up(&mut rings, &mut a) {
                 for &cad in &codecs[..n] {
                     match census_codec(&mut *rings, cad, &mut a) {
-                        Ok(c) => serial_println!(
+                        Ok(c) => { serial_println!(
                             "[hda] census codec={} vid={:04x}:{:04x} subsys={:04x}:{:04x} afg=0x{:02x} nodes={} ctrl={:04x}:{:04x} pcissid={:04x}:{:04x} -> parked",
                             cad, c.vid >> 16, c.vid & 0xFFFF, c.ssid >> 16, c.ssid & 0xFFFF, c.afg, c.nodes,
                             vend, devid, pss & 0xFFFF, pss >> 16
-                        ),
+                        ); census_more(base, &mut *rings, cad, &c, &mut a, &mut armed); } // ZENBOOKACPCODEC (Z43): the pin configs (GET only), then on 10ec:0294 the ALC294 arm (file tail)
                         Err("silent") => serial_println!("[hda] census codec={} -> silent", cad),
                         Err(why) => serial_println!("[hda] census codec={} why={} -> parked", cad, why),
                     }
@@ -3262,9 +3262,9 @@ fn census() {
             }
             rings.stop(&mut a);
         }
-        census_unlink(base, raised, &mut a);
+        alc_unlink(base, raised, armed, &mut a); // ZENBOOKACPCODEC (Z43): census_unlink unless the ALC294 arm armed (a CRST drop is a codec reset)
     }
-    a.line("census");
+    a.line("census"); alc_level(); // ZENBOOKACPCODEC (Z43): the volume knob on the armed path, DEV free
 }
 
 /// Does the census have to raise the link? Only a link found IN reset (GCTL.CRST = 0) [HDA-SPEC §3.3.7].
@@ -3331,7 +3331,7 @@ fn census_codec<V: Verbs>(v: &mut V, cad: u8, a: &mut Audit) -> Result<Census, &
 struct FakeCodec {
     silent: bool,
     verbs: u32,
-    sets: u32,
+    sets: u32, pinctl: u8, eapd: u8, // ZENBOOKACPCODEC (Z43): pin 0x21's stored SET_PIN_CONTROL / SET_EAPD, read back by GET
 }
 
 impl Verbs for FakeCodec {
@@ -3343,12 +3343,29 @@ impl Verbs for FakeCodec {
         if self.silent || cad != 0 {
             return None;
         }
+        if nid == 0x21 && verb == 0x707 { self.pinctl = payload as u8; } if nid == 0x21 && verb == 0x70C { self.eapd = payload as u8; } // ZENBOOKACPCODEC (Z43)
         match (nid, verb, payload) {
             (0x00, VERB_GET_PARAMETER, PARAM_VENDOR_ID) => Some(0x10ec_0294),
             (0x00, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT) => Some(0x0001_0001),
             (0x01, VERB_GET_PARAMETER, PARAM_FUNCTION_TYPE) => Some(0x0000_0101),
             (0x01, VERB_GET_SUBSYSTEM_ID, 0) => Some(0x1043_1df3),
             (0x01, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT) => Some(0x0002_0023),
+            // ZENBOOKACPCODEC (Z43): the walk/arm fixture, shaped on Linux's ALC294 topology (no loopback mixer: the pins
+            // wire straight to DACs 0x02/0x03) — FIXTURE values, not a metal dump. Two DACs, the internal speaker 0x14 and
+            // the headphone jack 0x21 (OUT, HP drive, presence detect, EAPD), both listing [0x02, 0x03].
+            (0x00, VERB_GET_PARAMETER, PARAM_REVISION_ID) => Some(0x0010_0002),
+            (0x02 | 0x03, VERB_GET_PARAMETER, PARAM_WIDGET_CAPS) => Some(0x0000_0405),
+            (0x14 | 0x21, VERB_GET_PARAMETER, PARAM_WIDGET_CAPS) => Some(0x0040_058d),
+            (0x14, VERB_GET_PARAMETER, PARAM_PIN_CAPS) => Some(0x0001_0010),
+            (0x21, VERB_GET_PARAMETER, PARAM_PIN_CAPS) => Some(0x0001_001c),
+            (0x14, VERB_GET_CONFIG_DEFAULT, 0) => Some(0x9017_0110),
+            (0x21, VERB_GET_CONFIG_DEFAULT, 0) => Some(0x0321_1020),
+            (0x14 | 0x21, VERB_GET_PARAMETER, PARAM_CONNECTION_LEN) => Some(0x0000_0002),
+            (0x14 | 0x21, VERB_GET_CONNECTION_ENTRY, 0) => Some(0x0000_0302),
+            (0x21, 0xF07, 0) => Some(self.pinctl as u32),
+            (0x21, 0xF0C, 0) => Some(self.eapd as u32),
+            (_, 0xF05, 0) => Some(0x0000_0000),
+            (_, 0x705 | 0x701 | 0x707 | 0x70C, _) => Some(0),
             _ => None,
         }
     }
@@ -3359,14 +3376,14 @@ impl Verbs for FakeCodec {
 /// (one verb, Err("silent")), statests (the codec list), plan (CRST raised only when found 0).
 pub fn census_selftest() {
     let mut a = Audit::default();
-    let mut f = FakeCodec { silent: false, verbs: 0, sets: 0 };
+    let mut f = FakeCodec { silent: false, verbs: 0, sets: 0, pinctl: 0, eapd: 0 };
     let got = census_codec(&mut f, 0, &mut a);
     let (vid, ssid, afg, nodes) = match &got {
         Ok(c) => (c.vid, c.ssid, c.afg, c.nodes),
         Err(_) => (0, 0, 0, 0),
     };
     let alc = got.is_ok() && vid == 0x10ec_0294 && ssid == 0x1043_1df3 && afg == 0x01 && nodes == 0x23 && f.verbs == 5 && f.sets == 0;
-    let mut s = FakeCodec { silent: true, verbs: 0, sets: 0 };
+    let mut s = FakeCodec { silent: true, verbs: 0, sets: 0, pinctl: 0, eapd: 0 };
     let silent = matches!(census_codec(&mut s, 0, &mut a), Err("silent")) && s.verbs == 1 && s.sets == 0;
     let (_, n1) = codecs_of(0x0001);
     let (c5, n5) = codecs_of(0x0005);
@@ -3390,5 +3407,301 @@ pub fn census_selftest() {
             n1, vid >> 16, vid & 0xFFFF, ssid >> 16, ssid & 0xFFFF, afg, nodes, f.sets + s.sets, ok, cases.len()
         ),
         Some(name) => serial_println!(":: HDACENSUS: codecs={} cases={}/{} -> FAIL :: case={} ::", n1, ok, cases.len(), name),
+    }
+    #[cfg(feature = "hda-tone")] { path_selftest(); } // ZENBOOKACPCODEC (Z43): HDAPATH rides the typed `tests hdacensus` (HDACENSUS above unchanged; HDAPATH-TYPED owed)
+}
+
+// ── ZENBOOKACPCODEC (zenbook-ledger Z43, MEASURE: PASS) — the census's pin configs and the ALC294 headphone ARM — TAIL ──
+// (a) `census_pins` (cfg `hda`, GET verbs only, the census's own audit): every pin of the audio function group with its
+// CONFIG_DEFAULT, `[hda] pin 0x<nid> cfg=0x<..> dev=<…>`, on every codec the census meets (q35's hda-duplex too).
+// (b) THE ARM (cfg `hda-tone`, the drive knob; on 10ec:0294 only, so the q35 lane's codec is never driven): `alc_arm` =
+// the ONE walker (`walk_codec`, generic over `Verbs` like `afg_find`) -> the walk's headphone pin -> the ONE path builder
+// (`find_path`) -> `path_on` (D0 on the path, CONNECTION_SELECT on a non-mixer node with >1 connection — ALC294's pins
+// pick their DAC themselves, Linux: `mixer_nid = 0`, no loopback mixer —, pin ctl OUT|HP, EAPD iff PINCAP_EAPD, each read
+// back). NO GPIO verb (Linux's 1043:1df3 quirk ALC294_FIXUP_BASS_SPEAKER_15 chains no GPIO fixup), no COEF, no stream;
+// the output amps are `vol`'s (`vol::capture` on the headphone path, `vol::apply` after the census drops DEV). The arm
+// has its own audit (`stage=alc294`), so the census's `verbs-set=0` stays the census's. An armed codec keeps the link
+// up (`alc_unlink`: a CRST drop is a codec reset). (c) `tests hda` on the Zenbook (TONE_NOW && TONE_WALK) re-arms and
+// plays `run_tone` through the headphone path with GPIO_NONE set (run_tone's GPIO arm skips by name). A stream open
+// (TONE_NOW alone) plays nothing: ZENBOOK-ACP-PLAY. Owed: -AMPS, -COPROC, -PLAY, -JACK, -DEPOP (Linux's
+// `alc294_hp_init` COEF depop), -BASS (pin 0x15), HDAPATH-TYPED. LOCKS: everything below runs under census's
+// `ring::own` hold (probe's task; run_tone's `play::ST` under DEV as in probe); the statics are atomics.
+
+/// The arm's level when no desktop status exists (video::status's own default, status.rs `VOL_LEVEL`).
+#[cfg(not(feature = "wc"))]
+const ALC_LEVEL_DEFAULT: u8 = 12;
+/// Set by an arm; `alc_level` applies the volume once, after the census's per-controller loop released DEV.
+static ALC_LEVEL_DUE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// ZENBOOKACPCODEC (Z43) (a): every pin's default configuration, GET verbs only. Returns the pins printed.
+fn census_pins<V: Verbs>(v: &mut V, cad: u8, afg: u8, a: &mut Audit) -> u32 {
+    let Some(sub) = v.cmd(cad, afg, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT, a) else { return 0 };
+    a.verbs_get += 1;
+    let start = ((sub >> 16) & 0xFF) as u16;
+    let count = (sub & 0xFF) as u16;
+    let mut pins = 0u32;
+    for i in 0..count {
+        let nid16 = start + i;
+        if nid16 as usize >= MAX_NODES {
+            break;
+        }
+        let nid = nid16 as u8;
+        let Some(caps) = v.cmd(cad, nid, VERB_GET_PARAMETER, PARAM_WIDGET_CAPS, a) else { continue };
+        a.verbs_get += 1;
+        if ((caps >> 20) & 0x0F) as u8 != WT_PIN {
+            continue;
+        }
+        let Some(cfg) = v.cmd(cad, nid, VERB_GET_CONFIG_DEFAULT, 0, a) else { continue };
+        a.verbs_get += 1;
+        serial_println!("[hda] pin 0x{:02x} cfg={:#010x} dev={}", nid, cfg, pin_device_name(((cfg >> 20) & 0x0F) as u8));
+        pins += 1;
+    }
+    pins
+}
+
+/// After one codec's census line: its pins, then (hda-tone, 10ec:0294) the ALC294 arm.
+fn census_more(base: u64, rings: &mut Rings, cad: u8, c: &Census, a: &mut Audit, armed: &mut bool) {
+    let _ = census_pins(rings, cad, c.afg, a);
+    #[cfg(feature = "hda-tone")]
+    {
+        if c.vid == ALC294 {
+            alc_census_arm(base, rings, cad, c.afg, armed);
+        }
+    }
+    #[cfg(not(feature = "hda-tone"))]
+    let _ = (base, armed);
+}
+
+/// The census's unlink, except for an armed codec: its state lives only while CRST=1.
+fn alc_unlink(base: u64, raised: bool, armed: bool, a: &mut Audit) {
+    if armed {
+        if raised {
+            serial_println!("[hda] alc294 link kept crst=1 raised=1 -> the codec keeps its state (a CRST drop is a codec reset)");
+        }
+        return;
+    }
+    census_unlink(base, raised, a);
+}
+
+/// The volume knob on the armed path (`vol::apply`, which takes `ring::hold` itself), once per arm.
+fn alc_level() {
+    if !ALC_LEVEL_DUE.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    #[cfg(feature = "wc")]
+    let (lv, muted) = crate::video::status::volume();
+    #[cfg(not(feature = "wc"))]
+    let (lv, muted) = (ALC_LEVEL_DEFAULT, false);
+    let n = vol::apply(lv, muted);
+    serial_println!("[hda] alc294 vol level={} muted={} answered={}", lv, muted as u8, n);
+}
+
+/// The codec the arm keys on: Realtek ALC294 (VENDOR_ID 10ec:0294), the Zenbook UM5606W's.
+#[cfg(feature = "hda-tone")]
+const ALC294: u32 = 0x10ec_0294;
+/// 0 = no arm yet this boot, 1 = armed, 2 = parked or held.
+#[cfg(feature = "hda-tone")]
+static ALC_ARMED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Set only around the ALC arm's `run_tone`: its GPIO arm then skips the drive (`gpio_none_say`). Never set on Cirrus.
+#[cfg(feature = "hda-tone")]
+static GPIO_NONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "hda-tone")]
+fn gpio_none() -> bool {
+    GPIO_NONE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "hda-tone")]
+fn gpio_none_say(fg: u8) {
+    serial_println!("[hda] alc294 gpio-policy=none afg=0x{:02x} -> not driven (Linux 1043:1df3 chains no GPIO fixup)", fg);
+}
+
+/// One arm's answers. `eapd`: 0 = the pin is not EAPD-capable, 1 = on (read back), 2 = written and read back off.
+#[cfg(feature = "hda-tone")]
+struct AlcArm {
+    walk: CodecWalk,
+    path: Path,
+    d0: bool,
+    hp: bool,
+    eapd: u8,
+}
+
+/// The arm over the verb door: the walk, the headphone pin, its path, the path on.
+#[cfg(feature = "hda-tone")]
+fn alc_arm<V: Verbs>(v: &mut V, cad: u8, afg: u8, ws: &mut [Widget; MAX_NODES], b: &mut Audit) -> Result<AlcArm, &'static str> {
+    let walk = walk_codec(v, cad, ws, b).ok_or("walk")?;
+    let hp = walk.hp_pin.ok_or("no-hp")?;
+    let path = find_path(ws, hp).ok_or("no-path")?;
+    let (d0, hp_on, eapd) = path_on(v, cad, afg, &path, ws, b);
+    Ok(AlcArm { walk, path, d0, hp: hp_on, eapd })
+}
+
+/// The path on: the function group read back at D0 (the walk set it), every power-controlled path node set to D0 and
+/// read back (bounded: 100 x 500 us), a non-mixer node with >1 connection pointed at the input the path took, a mixer's
+/// input amp unmuted at 0 dB, the pin's OUT (+ HP when PINCAP_HP_DRIVE) enable, EAPD iff PINCAP_EAPD. Returns
+/// `(d0, hp, eapd)`. SET_AMP_GAIN_MUTE's 4-bit verb goes through `Verbs::cmd` unchanged (`Rings::cmd` builds
+/// `verb << 8 | payload`, `cmd16`'s word for a 16-bit payload). [HDA-SPEC §7.3.3.2, .7, .10, .13, .16]
+#[cfg(feature = "hda-tone")]
+fn path_on<V: Verbs>(v: &mut V, cad: u8, afg: u8, p: &Path, ws: &[Widget; MAX_NODES], b: &mut Audit) -> (bool, bool, u8) {
+    use tone::*;
+    fn d0<V: Verbs>(v: &mut V, cad: u8, nid: u8, set: bool, b: &mut Audit) -> bool {
+        if set && v.cmd(cad, nid, VERB_SET_POWER_STATE, 0, b).is_some() {
+            b.verbs_set += 1;
+        }
+        for _ in 0..100 {
+            let Some(r) = v.cmd(cad, nid, tone::VERB_GET_POWER_STATE, 0, b) else { return false };
+            b.verbs_get += 1;
+            if (r >> 4) & 0x0F == 0 {
+                return true;
+            }
+            delay_us(500);
+        }
+        false
+    }
+    let mut on = d0(v, cad, afg, false, b);
+    for i in 0..p.len as usize {
+        let nid = p.nodes[i];
+        let w = ws[nid as usize];
+        if w.caps & WCAP_POWER_CTL != 0 && !d0(v, cad, nid, true, b) {
+            on = false;
+        }
+        if w.kind != WT_MIXER && w.nconns > 1 {
+            if v.cmd(cad, nid, VERB_SET_CONNECTION_SELECT, p.sel[i] as u32, b).is_some() {
+                b.verbs_set += 1;
+            }
+        }
+        if w.kind == WT_MIXER && w.in_amp() {
+            let caps = v.cmd(cad, nid, VERB_GET_PARAMETER, PARAM_IN_AMP_CAPS, b).unwrap_or(0);
+            b.verbs_get += 1;
+            if v.cmd(cad, nid, VERB_SET_AMP_GAIN_MUTE, amp_payload(false, p.sel[i], false, (caps & 0x7F) as u8), b).is_some() {
+                b.verbs_set += 1;
+            }
+        }
+    }
+    let pin = p.pin;
+    let pincap = ws[pin as usize].pincap;
+    let mut pinctl = PINCTL_OUT_ENABLE;
+    if pincap & PINCAP_HP_DRIVE != 0 {
+        pinctl |= PINCTL_HP_ENABLE;
+    }
+    if v.cmd(cad, pin, VERB_SET_PIN_CONTROL, pinctl as u32, b).is_some() {
+        b.verbs_set += 1;
+    }
+    let back = v.cmd(cad, pin, VERB_GET_PIN_CONTROL, 0, b).unwrap_or(0);
+    b.verbs_get += 1;
+    let hp = back & PINCTL_OUT_ENABLE as u32 != 0 && back & PINCTL_HP_ENABLE as u32 != 0;
+    let eapd = if pincap & PINCAP_EAPD == 0 {
+        0u8
+    } else {
+        let e0 = v.cmd(cad, pin, VERB_GET_EAPD, 0, b).unwrap_or(0) as u8;
+        b.verbs_get += 1;
+        if v.cmd(cad, pin, VERB_SET_EAPD, (e0 | EAPD_ENABLE) as u32, b).is_some() {
+            b.verbs_set += 1;
+        }
+        let e1 = v.cmd(cad, pin, VERB_GET_EAPD, 0, b).unwrap_or(0) as u8;
+        b.verbs_get += 1;
+        if e1 & EAPD_ENABLE != 0 { 1 } else { 2 }
+    };
+    (on, hp, eapd)
+}
+
+/// The live arm (census, 10ec:0294): first census of the boot and every `tests hda` census arm; any other census keeps.
+#[cfg(feature = "hda-tone")]
+fn alc_census_arm(base: u64, rings: &mut Rings, cad: u8, afg: u8, armed: &mut bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let tone_walk = TONE_NOW.load(Relaxed) && TONE_WALK.load(Relaxed);
+    let state = ALC_ARMED.load(Relaxed);
+    if state != 0 && !tone_walk {
+        *armed = state == 1;
+        let open = TONE_NOW.load(Relaxed);
+        serial_println!(
+            "[hda] alc294 kept armed={} stream-open={} -> {}",
+            (state == 1) as u8, open as u8, if open { "not played (ZENBOOK-ACP-PLAY owed)" } else { "kept" }
+        );
+        return;
+    }
+    let mut b = Audit::default();
+    let mut ws: alloc::boxed::Box<[Widget; MAX_NODES]> = alloc::boxed::Box::new([Widget::default(); MAX_NODES]);
+    match alc_arm(rings, cad, afg, &mut ws, &mut b) {
+        Ok(r) => {
+            let ok = r.d0 && r.hp;
+            serial_println!(
+                "[hda] alc294 d0={} path=0x{:02x}->0x{:02x} hp={} eapd={} -> {}",
+                if r.d0 { "ok" } else { "no" }, r.path.dac, r.path.pin, if r.hp { "on" } else { "off" },
+                match r.eapd { 1 => "on", 2 => "off", _ => "none" },
+                if ok { "armed" } else if !r.d0 { "held why=d0" } else { "held why=hp" }
+            );
+            if ok {
+                let hp_walk = CodecWalk { path: Some(r.path), path_dev: DEV_HP_OUT, ..r.walk };
+                vol::capture(base, Some(&hp_walk), &ws, rings, &mut b);
+                ALC_ARMED.store(1, Relaxed);
+                ALC_LEVEL_DUE.store(true, Relaxed);
+                *armed = true;
+                b.line("alc294");
+                if tone_walk {
+                    alc_tone(base, rings, &hp_walk, &ws, &mut b);
+                }
+                return;
+            }
+            ALC_ARMED.store(2, Relaxed);
+        }
+        Err(why) => {
+            ALC_ARMED.store(2, Relaxed);
+            serial_println!("[hda] alc294 why={} -> parked", why);
+        }
+    }
+    b.line("alc294");
+}
+
+/// `tests hda` on the armed headphone path: output stream 0 after the GCAP.ISS input descriptors, `run_tone` with the
+/// GPIO policy `none`.
+#[cfg(feature = "hda-tone")]
+fn alc_tone(base: u64, rings: &mut Rings, walk: &CodecWalk, ws: &[Widget; MAX_NODES], b: &mut Audit) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let gcap = r16(base, REG_GCAP);
+    let (oss, iss) = ((gcap >> 12) & 0x0F, (gcap >> 8) & 0x0F);
+    if oss == 0 {
+        serial_println!("[hda] alc294 tone=refused why=no-output-streams gcap={:#06x}", gcap);
+        return;
+    }
+    GPIO_NONE.store(true, Relaxed);
+    run_tone(base, rings, iss as u8, Some(walk), ws, b);
+    GPIO_NONE.store(false, Relaxed);
+}
+
+/// ZENBOOKACPCODEC (Z43): `tests hdapath` (and the tail of `tests hdacensus`) — the census's pin configs and the ALC294
+/// arm over the fake codec behind the verb door. Cases: pins (2 pins, 0 sets), arm (d0, path 0x02->0x21, hp, EAPD, 6
+/// sets: the AFG D0, 0x21 D0, 0x21 select, 0x02 D0, pin ctl, EAPD), silent (Err, 0 sets).
+#[cfg(feature = "hda-tone")]
+pub fn path_selftest() {
+    let mut a = Audit::default();
+    let mut f = FakeCodec { silent: false, verbs: 0, sets: 0, pinctl: 0, eapd: 0 };
+    let pins = census_pins(&mut f, 0, 0x01, &mut a) == 2 && f.sets == 0;
+    let mut ws: alloc::boxed::Box<[Widget; MAX_NODES]> = alloc::boxed::Box::new([Widget::default(); MAX_NODES]);
+    let mut g = FakeCodec { silent: false, verbs: 0, sets: 0, pinctl: 0, eapd: 0 };
+    let (d0, path) = match alc_arm(&mut g, 0, 0x01, &mut ws, &mut a) {
+        Ok(r) => (r.d0, r.path.dac == 0x02 && r.path.pin == 0x21 && r.hp && r.eapd == 1),
+        Err(_) => (false, false),
+    };
+    let arm = d0 && path && g.sets == 6;
+    for w in ws.iter_mut() {
+        *w = Widget::default();
+    }
+    let mut s = FakeCodec { silent: true, verbs: 0, sets: 0, pinctl: 0, eapd: 0 };
+    let silent = alc_arm(&mut s, 0, 0x01, &mut ws, &mut a).is_err() && s.sets == 0;
+    let cases = [("pins", pins), ("arm", arm), ("silent", silent)];
+    let mut ok = 0usize;
+    let mut first: Option<&str> = None;
+    for (name, r) in cases {
+        serial_println!("[hda] hdapath kat case={} {}", name, if r { "ok" } else { "FAIL" });
+        if r {
+            ok += 1;
+        } else if first.is_none() {
+            first = Some(name);
+        }
+    }
+    match first {
+        None => serial_println!(":: HDAPATH: d0=ok path=ok sets={} cases={}/{} -> PASS ::", g.sets, ok, cases.len()),
+        Some(name) => serial_println!(":: HDAPATH: cases={}/{} -> FAIL :: case={} ::", ok, cases.len(), name),
     }
 }
