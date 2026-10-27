@@ -7,5 +7,5 @@
 mod decode;
 pub mod encode;
 
-pub use decode::{decode, unfilter_rows};
+pub use decode::{decode, iccp_profile, unfilter_rows};
 pub(crate) use decode::{ApngStepper, Parsed, parse};

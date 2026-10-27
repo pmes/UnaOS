@@ -136,3 +136,95 @@ fn untagged_images_keep_icc_none_and_pins() {
         assert!(icc_core::Profile::parse(&icc).unwrap().is_srgb(), "{name}");
     }
 }
+
+// KERNEL-PNG-ICC / KERNEL-ANIM-ICC (rmbp-ledger B974): the streaming faces carry the profile `decode` reports — the
+// kernel's streaming PNG reads iCCP by `png::iccp_profile` (the decoder's own rule), the kernel's animation player
+// builds its one transform from `Animation::icc`, and `decode_first_frame` keeps the profile (a still WebP's ICCP was
+// dropped there before).
+
+fn facetanim(name: &str) -> Vec<u8> {
+    std::fs::read(format!("{}/tests/fixtures/facetanim/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+}
+
+/// `webp` (VP8X first, at 12) with the ICC flag set and an ICCP chunk inserted directly after VP8X.
+fn webp_tagged(webp: &[u8], profile: &[u8]) -> Vec<u8> {
+    assert_eq!(&webp[12..16], b"VP8X");
+    let vend = 20 + u32::from_le_bytes([webp[16], webp[17], webp[18], webp[19]]) as usize;
+    let mut c = b"ICCP".to_vec();
+    c.extend((profile.len() as u32).to_le_bytes());
+    c.extend(profile);
+    if profile.len() % 2 == 1 {
+        c.push(0);
+    }
+    let mut out = webp[..vend].to_vec();
+    out[20] |= 0x20;
+    out.extend(&c);
+    out.extend(&webp[vend..]);
+    let riff = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&riff.to_le_bytes());
+    out
+}
+
+#[test]
+fn animation_surfaces_icc() {
+    let profile = icc_core::kat::adobe_rgb_v2();
+    // APNG: iCCP right after IHDR.
+    let apng = facetanim("ANIM3.PNG");
+    let mut tagged_png = apng[..33].to_vec();
+    tagged_png.extend(iccp(&profile));
+    tagged_png.extend(&apng[33..]);
+    // Animated WebP: ICCP after VP8X, the flag set.
+    let tagged_webp = webp_tagged(&facetanim("ANIM3.WEBP"), &profile);
+    for (name, plain, tagged) in [("apng", apng.clone(), tagged_png), ("webp", facetanim("ANIM3.WEBP"), tagged_webp)] {
+        let mut a = pixel_core::Animation::new(&tagged[..]).unwrap();
+        assert_eq!(a.icc(), Some(&profile[..]), "{name}: Animation::icc");
+        assert_eq!(pixel_core::decode(&tagged).unwrap().icc.as_deref(), Some(&profile[..]), "{name}: decode agrees");
+        assert_eq!(pixel_core::Animation::new(&plain[..]).unwrap().icc(), None, "{name}: untagged");
+        // Surfaced, not applied: every frame's canvas is the untagged file's.
+        let mut b = pixel_core::Animation::new(&plain[..]).unwrap();
+        while let (Some(fa), Some(fb)) = (a.next_frame(), b.next_frame()) {
+            assert_eq!(fa.unwrap(), fb.unwrap(), "{name}");
+            assert!(a.canvas() == b.canvas(), "{name}: canvas moved");
+        }
+        let f0 = pixel_core::decode_first_frame(&tagged).unwrap();
+        assert_eq!(f0.icc.as_deref(), Some(&profile[..]), "{name}: decode_first_frame keeps the profile");
+        assert!(f0.rgba == pixel_core::decode_first_frame(&plain).unwrap().rgba, "{name}: rgba unchanged");
+    }
+    assert_eq!(pixel_core::Animation::new(&facetanim("ANIM3.GIF")[..]).unwrap().icc(), None, "GIF carries none");
+}
+
+#[test]
+fn decode_first_frame_keeps_the_still_profile() {
+    let profile = icc_core::kat::adobe_rgb_v2();
+    // A still PNG and a still VP8X WebP (the WebP ICCP decode_first_frame used to drop).
+    let png = png_with(&[iccp(&profile)]);
+    let webp = encoded(image::ImageFormat::WebP);
+    assert_eq!(&webp[12..16], b"VP8L");
+    let mut vp8x = b"VP8X".to_vec();
+    vp8x.extend(10u32.to_le_bytes());
+    vp8x.extend([0, 0, 0, 0, 7, 0, 0, 7, 0, 0]);
+    let mut still_webp = webp[..12].to_vec();
+    still_webp.extend(vp8x);
+    still_webp.extend(&webp[12..]);
+    let still_webp = webp_tagged(&still_webp, &profile);
+    for (name, b) in [("png", png), ("webp", still_webp)] {
+        let f0 = pixel_core::decode_first_frame(&b).unwrap();
+        let d = pixel_core::decode(&b).unwrap();
+        assert_eq!(f0.icc.as_deref(), Some(&profile[..]), "{name}");
+        assert_eq!(f0.icc, d.icc, "{name}: decode agrees");
+        assert!(f0.rgba == d.rgba, "{name}");
+    }
+}
+
+#[test]
+fn iccp_profile_is_the_decoders_rule() {
+    let profile = icc_core::kat::adobe_rgb_v2();
+    let chunk = iccp(&profile);
+    let data = &chunk[8..chunk.len() - 4];
+    assert_eq!(pixel_core::png::iccp_profile(data).as_deref(), Some(&profile[..]));
+    assert_eq!(pixel_core::png::iccp_profile(data), pixel_core::decode(&png_with(&[chunk.clone()])).unwrap().icc);
+    let mut bad = b"x\0\x01".to_vec();
+    bad.extend(pixel_core::deflate::compress(&profile).unwrap());
+    assert_eq!(pixel_core::png::iccp_profile(&bad), None, "method 1");
+    assert_eq!(pixel_core::png::iccp_profile(b"no nul at all"), None);
+}

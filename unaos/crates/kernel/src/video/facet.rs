@@ -753,7 +753,7 @@ fn index_chunks(
     mt: &crate::fs::vfs::MountTable,
     path: &str,
     size: u64,
-) -> Result<(Ihdr, Vec<Span>, Vec<u8>), FacetError> {
+) -> Result<(Ihdr, Vec<Span>, Vec<u8>, Option<Span>), FacetError> {
     let head = mt.read(path, 0, 8).map_err(|e| FacetError::Vfs(vfs_why(e)))?;
     if head.len() < 8 || head[..8] != SIGNATURE[..] {
         return Err(FacetError::NotPng);
@@ -761,6 +761,9 @@ fn index_chunks(
     let mut ihdr: Option<Ihdr> = None;
     let mut spans: Vec<Span> = Vec::new();
     let mut palette: Vec<u8> = Vec::new();
+    // KERNEL-PNG-ICC (B974): the first iCCP span (its payload read and inflated after the decode, by `png_icc`), and
+    // whether a cICP was seen (cICP outranks iCCP, pixel_core's rule).
+    let (mut iccp, mut cicp): (Option<Span>, bool) = (None, false);
     let mut at: u64 = 8;
     loop {
         if at + 8 > size {
@@ -799,6 +802,12 @@ fn index_chunks(
                     spans.push(Span { off: data_at, len: len as usize });
                 }
             }
+            b"iCCP" => {
+                if iccp.is_none() && len > 0 && len <= ICCP_CHUNK_MAX {
+                    iccp = Some(Span { off: data_at, len: len as usize });
+                }
+            }
+            b"cICP" => cicp = true,
             b"IEND" => break,
             _ => {}
         }
@@ -817,7 +826,7 @@ fn index_chunks(
             return Err(FacetError::BadPalette("PLTE shorter than the depth's index range"));
         }
     }
-    Ok((ihdr, spans, palette))
+    Ok((ihdr, spans, palette, if cicp { None } else { iccp }))
 }
 
 // ── Adam7 ───────────────────────────────────────────────────────────────────────────────────────
@@ -1386,7 +1395,7 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
         close();
         (ihdr, k, bw, bh, px)
     } else {
-        let (ihdr, spans, palette) = index_chunks(&mt, path, st.size)?;
+        let (ihdr, spans, palette, iccp) = index_chunks(&mt, path, st.size)?;
         let (k, bw, bh) = fit(ihdr.width, ihdr.height, BASE_W, BASE_H).ok_or(FacetError::NoWindow("fit"))?;
         if ihdr.interlaced && k != 1 {
             return Err(FacetError::Interlaced);
@@ -1419,6 +1428,7 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
             }
         }
         d?;
+        png_icc(&mt, path, iccp, &mut px); // KERNEL-PNG-ICC (B974): the held base rows, converted once
         (ihdr, k, bw, bh, px)
     };
 
@@ -2009,7 +2019,7 @@ pub fn decode_file(
         let (ihdr, _k, out_w, out_h, px) = decode_foreign(&mt, path, st.size, bw, bh)?;
         return Ok((px, out_w, out_h, ihdr.width, ihdr.height));
     }
-    let (ihdr, spans, palette) = index_chunks(&mt, path, st.size)?;
+    let (ihdr, spans, palette, iccp) = index_chunks(&mt, path, st.size)?;
     let (k, out_w, out_h) = fit(ihdr.width, ihdr.height, bw, bh).ok_or(FacetError::NoWindow("fit"))?;
     let mut px: Vec<u32> = Vec::new();
     if px.try_reserve_exact(out_w * out_h).is_err() {
@@ -2021,7 +2031,10 @@ pub fn decode_file(
     match (r, src.io_error.take()) {
         (Err(FacetError::Inflate(InflateError::TruncatedInput)), Some(io)) => Err(FacetError::Vfs(io)),
         (Err(e), _) => Err(e),
-        (Ok(d), _) => Ok((px, out_w, out_h, d.ihdr.width, d.ihdr.height)),
+        (Ok(d), _) => {
+            png_icc(&mt, path, iccp, &mut px); // KERNEL-PNG-ICC (B974)
+            Ok((px, out_w, out_h, d.ihdr.width, d.ihdr.height))
+        }
     }
 }
 
@@ -2157,17 +2170,68 @@ pub mod raw;
 /// KERNEL-FACET-ICC (LEDGER SR367): convert a decoded still tagged with an embedded ICC profile (`pixel_core::Image::icc`)
 /// to sRGB through icc_core's ONE entry, `apply_icc_to_srgb` (the host Facet's conversion, the same crate), before the box
 /// reduction; one `[image] icc <converted|srgb|refused:<why>>` line per open (`srgb`: untagged, or an sRGB profile; a
-/// refusal keeps the decoded pixels, sRGB assumed). The kernel's streaming PNG path (no iCCP read: KERNEL-PNG-ICC) and
-/// the animated / RAW paths (KERNEL-ANIM-ICC) are owed.
+/// refusal keeps the decoded pixels, sRGB assumed). Its verdict rule is [`icc_xform`], shared with the streamed PNG
+/// (`png_icc`) and the animated frames (KERNEL-PNG-ICC / KERNEL-ANIM-ICC, B974); RAW previews come through here.
 fn icc_open(path: &str, img: &mut pixel_core::Image) {
     let n = img.icc.as_ref().map_or(0, |p| p.len());
-    let verdict: String = match img.icc.take() {
-        None => String::from("srgb"),
-        Some(icc) => match icc_core::apply_icc_to_srgb(&icc, &mut img.rgba) {
-            Ok(icc_core::Applied::Converted) => String::from("converted"),
-            Ok(icc_core::Applied::Srgb) => String::from("srgb"),
-            Err(e) => alloc::format!("refused:{}", e).chars().map(|c| if c == ' ' { '-' } else { c }).collect(),
-        },
-    };
+    let icc = img.icc.take();
+    let (xf, verdict) = icc_xform(icc.as_deref()); // KERNEL-PNG-ICC (B974): the one verdict rule, `apply_icc_to_srgb`'s two steps
+    if let Some(xf) = &xf {
+        xf.apply_rgba(&mut img.rgba);
+    }
     serial_println!("[image] icc {} bytes={} path={}", verdict, n, path);
+}
+
+// ── KERNEL-PNG-ICC + KERNEL-ANIM-ICC (rmbp-ledger B974): the streamed PNG and the animated frames through icc_core ──
+//
+// One transform per open, built from the file's embedded profile (`icc_core::Transform::for_rgba`, the rule
+// `apply_icc_to_srgb` runs), and run over the BASE image the viewer already holds (`<= BASE_W x BASE_H`, the source never
+// held): the streamed PNG's base after `decode_into` (its iCCP read by pixel_core's own rule, `png::iccp_profile`, through
+// the one inflater), and every animated frame after `anim::reduce_into`. icc_core's source path is f32 (soft-float in
+// this kernel), so the `ms=` token is the cost witness; an untagged file builds nothing and costs nothing.
+
+/// The largest iCCP chunk read (compressed). pixel_core caps the INFLATED profile at 1 MiB; a deflated one is smaller.
+const ICCP_CHUNK_MAX: u64 = 1 << 20;
+
+/// The transform for profile `icc` (None = untagged) and the verdict the `[image] icc` line prints: `srgb` (untagged,
+/// or an sRGB profile: no transform), `converted` (a transform to run), `refused:<why>` (no transform; sRGB assumed).
+pub(super) fn icc_xform(icc: Option<&[u8]>) -> (Option<icc_core::Transform>, String) {
+    match icc {
+        None => (None, String::from("srgb")),
+        Some(p) => match icc_core::Transform::for_rgba(p) {
+            Ok(None) => (None, String::from("srgb")),
+            Ok(Some(xf)) => (Some(xf), String::from("converted")),
+            Err(e) => (None, alloc::format!("refused:{}", e).chars().map(|c| if c == ' ' { '-' } else { c }).collect()),
+        },
+    }
+}
+
+/// Run `xf` over `0x??RRGGBB` words in place (the top byte kept), 64 pixels at a time through a stack RGBA scratch
+/// (`Transform::apply_rgba`, the one per-pixel run; 256 bytes of stack, no heap).
+pub(super) fn icc_xrgb(xf: &icc_core::Transform, px: &mut [u32]) {
+    let mut buf = [0u8; 256];
+    for run in px.chunks_mut(64) {
+        let b = &mut buf[..run.len() * 4];
+        for (q, &w) in b.chunks_exact_mut(4).zip(run.iter()) {
+            q.copy_from_slice(&[(w >> 16) as u8, (w >> 8) as u8, w as u8, (w >> 24) as u8]);
+        }
+        xf.apply_rgba(b);
+        for (w, q) in run.iter_mut().zip(b.chunks_exact(4)) {
+            *w = (*w & 0xFF00_0000) | (q[0] as u32) << 16 | (q[1] as u32) << 8 | q[2] as u32;
+        }
+    }
+}
+
+/// The streamed PNG's profile over its decoded base `px`: read the iCCP span, inflate it by pixel_core's rule, build
+/// the transform once, convert, one `[image] icc <verdict> bytes=<n> src=png-stream ms=<n> path=<p>` line (an unreadable
+/// or broken iCCP is dropped as pixel_core drops it: `srgb bytes=0`).
+fn png_icc(mt: &crate::fs::vfs::MountTable, path: &str, iccp: Option<Span>, px: &mut [u32]) {
+    let t0 = crate::arch::ms();
+    let icc = iccp.and_then(|s| mt.read(path, s.off, s.len).ok()).and_then(|d| pixel_core::png::iccp_profile(&d));
+    let n = icc.as_ref().map_or(0, |p| p.len());
+    let (xf, verdict) = icc_xform(icc.as_deref());
+    if let Some(xf) = &xf {
+        icc_xrgb(xf, px);
+    }
+    serial_println!("[image] icc {} bytes={} src=png-stream ms={} path={}", verdict, n, crate::arch::ms().saturating_sub(t0), path);
 }

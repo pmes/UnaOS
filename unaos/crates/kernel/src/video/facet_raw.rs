@@ -130,7 +130,7 @@ fn preview_src(src: &Src, size: u64, bw: usize, bh: usize) -> Result<(Ihdr, usiz
         return half_with(src, size, bw, bh, &info);
     };
     let jpeg = rd(src, o, l as usize)?;
-    let img = pixel_core::decode_jpeg(&jpeg).map_err(FacetError::Pixel)?;
+    let mut img = pixel_core::decode_jpeg(&jpeg).map_err(FacetError::Pixel)?; super::icc_open(src.name(), &mut img); // KERNEL-ANIM-ICC (B974): the preview's APP2 through Facet's still path
     drop(jpeg);
     reduce_rgba(&img, bw, bh)
 }
