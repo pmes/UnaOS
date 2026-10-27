@@ -7421,7 +7421,7 @@ impl XhciController {
         // transport cannot carry is a caller error, never a silently shortened command.
         if cdb.is_empty() || cdb.len() > 16 {
             return Err(BotError::BadRequest);
-        } #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] { if !self.io_resume(slot_id) { return Err(BotError::NoDevice); } } // SLEEPRESUME (B863): a transfer to a slot on a port the sleep suspended RESUMES that port first (`io_resume`, the file tail), else refused before anything is queued. LINE-NEUTRAL fold, code first
+        } #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] { if !self.io_resume(slot_id) { return Err(BotError::NoDevice); } self.io_stamp(slot_id); } // SLEEPRESUME2 (B887): the last-I/O stamp of a port io_resume brought up (`io_stamp`, the file tail). SLEEPRESUME (B863): a transfer to a slot on a port the sleep suspended RESUMES that port first (`io_resume`, the file tail), else refused before anything is queued. LINE-NEUTRAL fold, code first
         let out = self.bot_transfer_body(slot_id, cdb, data_phys, data_len, dir);
         if let Err(cause) = out {
             // `NoDevice` is raised before anything is built or queued (no rings, no endpoints, or a
@@ -18054,11 +18054,11 @@ pub mod suspend {
     /// USB 2.0 §7.1.7.7 TRSMRCY: recovery before the first transaction.
     const RECOVERY_MS: u64 = 10;
     /// xHCI 1.2 §5.4.8: PLS 8:5, LWS 16; PLS values.
-    const PLS_SHIFT: u32 = 5;
-    const PLS_MASK: u32 = 0xF << PLS_SHIFT;
+    pub(super) const PLS_SHIFT: u32 = 5;
+    pub(super) const PLS_MASK: u32 = 0xF << PLS_SHIFT;
     const LWS: u32 = 1 << 16;
     const PLS_U0: u32 = 0;
-    const PLS_U3: u32 = 3;
+    pub(super) const PLS_U3: u32 = 3;
     const PLS_RESUME: u32 = 15;
 
     /// The sleep state wants the bus suspended (written by `power::sleep` only).
@@ -18177,7 +18177,7 @@ pub mod suspend {
                     PHASE.store(UP, Ordering::Release);
                 }
                 UP => self.ports_reset_service(now), // PORTRESET (B837): a stuck port is reset and re-enumerated through the attach path
-                _ => {}
+                _ => self.io_idle_service(now), // SLEEPRESUME2 (B887): the sleep holding (SUSPENDED, WANT) re-suspends an I/O-resumed port after IO_IDLE_MS idle (file tail)
             }
         }
 
@@ -18208,13 +18208,13 @@ pub mod suspend {
                 let rwe = self.arm_remote_wake(port);
                 let stopped = self.endpoints_stop(port);
                 EP_STOPPED_N.fetch_add(stopped, Ordering::Relaxed);
-                self.set_link_state(port, PLS_U3);
-                let t0 = crate::arch::ms();
-                let mut pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
-                while pls != PLS_U3 && crate::arch::ms().wrapping_sub(t0) < 5 {
-                    core::hint::spin_loop();
-                    pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
-                }
+                let pls = self.port_u3(port); // SLEEPRESUME2 (B887): the U3 write and its bounded PLS read MOVED to the file tail (`port_u3`), the ONE park this pass and the idle re-suspend share
+                // SLEEPRESUME2 (B887): `port_u3` writes PLS=3 with LWS (`set_link_state`, xHCI 1.2 §4.15.2.1: software's U3
+                // request) and reads PLS back until it is 3, bounded 5 ms (a spin with the loan held, the bound this
+                // pass always had); the PLS it read is this port's `suspend -> pls=` word and `pls3`'s count below.
+                // The same park re-suspends a port `io_resume` brought up once it has been idle IO_IDLE_MS
+                // (`io_idle_service`, from `port_suspend_service`'s SUSPENDED-with-WANT arm). Lines kept: the three
+                // unconditional blocks after this module keep their `panic::Location`s.
                 mask |= bit(port);
                 if self.port_major(port) < 3 { usb2 |= bit(port); }
                 done += 1;
@@ -18297,7 +18297,7 @@ pub mod suspend {
         /// root port's number), before U3 (xHCI 1.2 §4.15.1). A DCI that is not Running is left exactly as it is. Each
         /// slot is marked held first; each DCI's bit is set before its command and cleared again if the Stop fails or
         /// the state does not read Stopped(3). Returns the DCIs read Stopped.
-        fn endpoints_stop(&mut self, port: u8) -> u32 {
+        pub(super) fn endpoints_stop(&mut self, port: u8) -> u32 {
             let mut stopped = 0u32;
             for slot in 1..self.slots.len().min(HELD.len()) {
                 if !self.slots[slot].active || self.slots[slot].port_id != port { continue; }
@@ -18353,7 +18353,7 @@ pub mod suspend {
 
         /// Write PLS with LWS on `clear_port_change`'s mask: never a 1 to PED (write-1-to-disable), PR (reset) or a
         /// change bit (RW1C).
-        fn set_link_state(&self, port: u8, pls: u32) {
+        pub(super) fn set_link_state(&self, port: u8, pls: u32) {
             let portsc = self.read_portsc(port);
             let neutral = portsc & !(PORT_CHANGE_BITS | (1 << 1) | (1 << 4) | PLS_MASK);
             self.write_portsc(port, neutral | (pls << PLS_SHIFT) | LWS);
@@ -18890,7 +18890,7 @@ impl XhciController {
         self.endpoints_restart();
         let ran = sp::EP_RUNNING_N.swap(keep, Ordering::Relaxed);
         let _ = sp::EP_STOPPED_N.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(ran)));
-        IO_RESUME_N.fetch_add(1, Ordering::Relaxed);
+        IO_RESUME_N.fetch_add(1, Ordering::Relaxed); IO_UP.fetch_or(b, Ordering::Relaxed); if let Some(t) = IO_LAST_MS.get((port as usize).wrapping_sub(1)) { t.store(crate::arch::ms(), Ordering::Relaxed); } // SLEEPRESUME2 (B887): the port is up by I/O inside this sleep, its idle window starts now (`io_idle_service`)
         serial_println!("[usb] port={} resume why=io slot={} -> ok ms={} ep_running={}", port, slot, crate::arch::ms().wrapping_sub(t0), ran);
         true
     }
@@ -18902,26 +18902,53 @@ impl XhciController {
         false
     }
 
-    /// M3, from `endpoints_stop` once a DCI read Stopped(3): on a hub's status-change DCI with a read armed, the endpoint
-    /// context's TR Dequeue Pointer is compared with the armed TD (`hub_int_expect_phys`). Equal = the TD is KEPT (xHCI 1.2
+    /// M3, from `endpoints_stop` once a DCI read Stopped(3): on every interrupt-IN endpoint with an armed TD (SLEEPRESUME2
+    /// B887: the hub's status-change DCI, the keyboard's and the pointer's, resolved by [`XhciController::stop_td_expect`])
+    /// the endpoint context's TR Dequeue Pointer is compared with the oldest armed TD. Equal = the TD is KEPT (xHCI 1.2
     /// §4.6.9: the xHC re-executes it on the restart doorbell). Past it = the controller consumed it at the Stop (QEMU 8.2
-    /// advances the context dequeue for a NAKing TD), so the hub's single status-change read would be lost: it is
-    /// re-queued through `queue_hub_change_read` (the one arming fn; its doorbell is held and remembered, and
-    /// `endpoints_restart` rings the DCI). Keyed on the pointer, never on a QEMU knob.
+    /// advances the context dequeue for a NAKing TD). The hub's single status-change read is re-queued through
+    /// `queue_hub_change_read` (B863, lines unchanged). A HID endpoint keeps an armed SET (oldest first): the dequeue on
+    /// armed[p] (or on the ring's enqueue, p = n) names the p consumed TDs, which the endpoint's own retire drops (retire at
+    /// armed[p-1] pops exactly them; `prev_phys` := a consumed TD) and its own top-up re-arms (`queue_keyboard_read` /
+    /// `queue_mouse_read`; each doorbell is held and remembered, `endpoints_restart` rings the DCI). A dequeue on none of
+    /// them is `lost` (nothing changed, counted). Keyed on the pointer, never on a QEMU knob.
     fn stop_td_check(&mut self, slot: u8, dci: u8) {
-        let Some(s) = self.slots.get(slot as usize) else { return };
-        if !s.is_hub || s.hub_int_ep == 0 || dci != (s.hub_int_ep & 0x0F) * 2 + 1 || s.hub_int_expect_phys == 0 { return; }
-        let expect = s.hub_int_expect_phys & !0xF;
+        let Some((kind, expect, armed, n, enq)) = self.stop_td_expect(slot, dci) else { return };
         let deq = self.ep_ctx_deq(slot, dci) & !0xF;
-        if deq == expect {
-            HUB_TD_KEPT_N.fetch_add(1, Ordering::Relaxed);
-            serial_println!("[usb] slot={} stop ep={} td=kept", slot, dci);
+        if kind == TD_HUB {
+            if deq == expect {
+                HUB_TD_KEPT_N.fetch_add(1, Ordering::Relaxed); TD_KEPT_N.fetch_add(1, Ordering::Relaxed);
+                serial_println!("[usb] slot={} stop ep={} td=kept", slot, dci);
+                return;
+            }
+            HUB_TD_REQUEUED_N.fetch_add(1, Ordering::Relaxed); TD_REQUEUED_N.fetch_add(1, Ordering::Relaxed);
+            self.slots[slot as usize].hub_int_expect_phys = 0;
+            self.queue_hub_change_read(slot);
+            serial_println!("[usb] slot={} stop ep={} td=consumed deq={:#x} expect={:#x} -> requeued", slot, dci, deq, expect);
             return;
         }
-        HUB_TD_REQUEUED_N.fetch_add(1, Ordering::Relaxed);
-        self.slots[slot as usize].hub_int_expect_phys = 0;
-        self.queue_hub_change_read(slot);
-        serial_println!("[usb] slot={} stop ep={} td=consumed deq={:#x} expect={:#x} -> requeued", slot, dci, deq, expect);
+        let word = if kind == TD_KBD { "kbd" } else { "ptr" };
+        if deq == expect {
+            TD_KEPT_N.fetch_add(1, Ordering::Relaxed);
+            serial_println!("[usb] slot={} stop ep={} td=kept kind={}", slot, dci, word);
+            return;
+        }
+        let p = (1..n).find(|&i| (armed[i] & !0xF) == deq).or(if enq != 0 && deq == enq { Some(n) } else { None });
+        let Some(p) = p else {
+            TD_LOST_N.fetch_add(1, Ordering::Relaxed);
+            serial_println!("[usb] slot={} stop ep={} td=lost deq={:#x} expect={:#x} kind={}", slot, dci, deq, expect, word);
+            return;
+        };
+        let last = armed[p - 1];
+        if kind == TD_KBD {
+            let _ = self.kbd_retire(slot, last);
+            self.kbd_top_up(slot);
+        } else {
+            let _ = self.mouse_retire(slot, last);
+            self.mouse_top_up(slot);
+        }
+        TD_REQUEUED_N.fetch_add(p as u32, Ordering::Relaxed);
+        serial_println!("[usb] slot={} stop ep={} td=consumed deq={:#x} expect={:#x} -> requeued kind={} n={}", slot, dci, deq, expect, word, p);
     }
 
     /// `tests usbsuspend`'s io leg, while SUSPENDED: a TEST UNIT READY (through `scsi_test_unit_ready` -> `bot_transfer`) to
@@ -18970,4 +18997,137 @@ fn root_storage_slot() -> Result<u8, ()> {
     };
     let g = crate::drivers::block::USB_DISKS.try_lock().ok_or(())?;
     Ok(g.get(ix).copied().flatten().map(|d| d.info.slot_id).unwrap_or(0))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// SLEEPRESUME2 (rmbp-ledger B887, docs/dev/blueprint/power.md BP-power-7) — a port resumed by I/O re-suspends when idle;
+// the Stop's TD check covers every interrupt-IN endpoint with an armed TD. FILE-TAIL append under the suspend module's cfg
+// (B863's identity rule: the module's edits are in place). M1: `bot_transfer` stamps ([`XhciController::io_stamp`]) a port
+// `io_resume` brought up; the ONE suspend service, `port_suspend_service`, in its SUSPENDED-with-WANT arm runs
+// [`XhciController::io_idle_service`], which parks such a port again after [`IO_IDLE_MS`] without I/O through
+// `endpoints_stop` (unmodified) and the ONE park [`XhciController::port_u3`] (moved here out of `ports_suspend`). The next
+// I/O resumes it through `io_resume`; the wake resumes it with the rest (`ports_resume_begin` iterates `SUSP_MASK`).
+// M3: `stop_td_check` (above, rewritten in place) with [`XhciController::stop_td_expect`]. Loan holder only.
+
+/// SLEEPRESUME2 (B887): the idle window after which a port `io_resume` brought up is re-suspended (USB autosuspend's
+/// customary 2 s). New: no idle window existed (`suspend::DUE_MS` is the TRSMRCY recovery deadline).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+pub const IO_IDLE_MS: u64 = 2_000;
+/// Root ports `io_resume` brought up inside this sleep (bit `port - 1`). Set by its ok path, cleared by the re-suspend, by
+/// a port already back in `SUSP_MASK`, and whenever the phase is not SUSPENDED (a wake took it). Loan holder only.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static IO_UP: AtomicU64 = AtomicU64::new(0);
+/// Per root port: ms of the last storage transfer on an `IO_UP` port (written at `bot_transfer`'s entry).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static IO_LAST_MS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+/// Idle re-suspends, this boot (`tests usbsuspend` `resuspend=`).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static IO_RESUSPEND_N: AtomicU32 = AtomicU32::new(0);
+/// Every interrupt-IN endpoint's TD check at the Stop (hub, keyboard, pointer), this boot: kept / re-queued (TDs) / lost
+/// (`tests usbsuspend` `tds=`). The hub's own `HUB_TD_*` stay as they are (`hub_td=`).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static TD_KEPT_N: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static TD_REQUEUED_N: AtomicU32 = AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+static TD_LOST_N: AtomicU32 = AtomicU32::new(0);
+/// `stop_td_expect`'s endpoint kinds.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+const TD_HUB: u8 = 1;
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+const TD_KBD: u8 = 2;
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+const TD_PTR: u8 = 3;
+/// The larger armed set (keyboard or pointer): the copy `stop_td_expect` hands back.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+const TD_SET: usize = if KBD_INFLIGHT > MOUSE_INFLIGHT { KBD_INFLIGHT } else { MOUSE_INFLIGHT };
+
+/// SLEEPRESUME2 (B887): idle re-suspends this boot.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+pub fn io_resuspends() -> u32 { IO_RESUSPEND_N.load(Ordering::Relaxed) }
+
+/// SLEEPRESUME2 (B887): (TDs kept, TDs re-queued, endpoints lost) at the Stop, every interrupt-IN endpoint, this boot.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+pub fn td_counts() -> (u32, u32, u32) {
+    (TD_KEPT_N.load(Ordering::Relaxed), TD_REQUEUED_N.load(Ordering::Relaxed), TD_LOST_N.load(Ordering::Relaxed))
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+impl XhciController {
+    /// M1, from `bot_transfer` after `io_resume` let the transfer through: the last-I/O stamp of a port `io_resume` brought
+    /// up inside this sleep (any other port: nothing). One atomic load on every transfer.
+    fn io_stamp(&self, slot: u8) {
+        let port = self.slots.get(slot as usize).map(|s| s.port_id).unwrap_or(0);
+        if IO_UP.load(Ordering::Relaxed) & suspend::bit(port) == 0 { return; }
+        if let Some(t) = IO_LAST_MS.get((port as usize).wrapping_sub(1)) { t.store(crate::arch::ms(), Ordering::Relaxed); }
+    }
+
+    /// M1, from `port_suspend_service`'s SUSPENDED-with-WANT arm (and RECOVERING before its deadline): each port
+    /// `io_resume` brought up that has seen no storage transfer for [`IO_IDLE_MS`] is parked again — its Running DCIs
+    /// stopped (`endpoints_stop`, unmodified: the TD check too), U3 written (`port_u3`), back in `SUSP_MASK`/`USB2_MASK`.
+    /// `EP_STOPPED_N` grows by what was stopped (`io_resume` subtracted what it restarted), so the wake's census pairs.
+    /// Remote wake is not re-armed: a device keeps DEVICE_REMOTE_WAKEUP across suspend/resume (USB 2.0 §9.1.1.6).
+    fn io_idle_service(&mut self, now: u64) {
+        use suspend as sp;
+        let up = IO_UP.load(Ordering::Relaxed);
+        if up == 0 { return; }
+        if sp::PHASE.load(Ordering::Acquire) != sp::SUSPENDED { IO_UP.store(0, Ordering::Relaxed); return; }
+        if self.enum_active { return; }
+        for port in 1..=self.max_ports.min(64) {
+            let b = sp::bit(port);
+            if up & b == 0 { continue; }
+            if sp::SUSP_MASK.load(Ordering::Relaxed) & b != 0 { IO_UP.fetch_and(!b, Ordering::Relaxed); continue; }
+            let idle = now.saturating_sub(IO_LAST_MS[port as usize - 1].load(Ordering::Relaxed));
+            if idle < IO_IDLE_MS { continue; }
+            IO_UP.fetch_and(!b, Ordering::Relaxed);
+            let portsc = self.read_portsc(port);
+            if portsc & 0b11 != 0b11 || (portsc & sp::PLS_MASK) >> sp::PLS_SHIFT > 2 { continue; } // gone or not U0..U2: not ours (the disposal owns a gone port)
+            let stopped = self.endpoints_stop(port);
+            sp::EP_STOPPED_N.fetch_add(stopped, Ordering::Relaxed);
+            let pls = self.port_u3(port);
+            sp::SUSP_MASK.fetch_or(b, Ordering::Relaxed);
+            if self.port_major(port) < 3 { sp::USB2_MASK.fetch_or(b, Ordering::Relaxed); }
+            IO_RESUSPEND_N.fetch_add(1, Ordering::Relaxed);
+            serial_println!("[usb] port={} resuspend why=idle ms={} pls={} ep_stopped={}", port, idle, pls, stopped);
+        }
+    }
+
+    /// The ONE park (MOVED out of `ports_suspend`): PLS=3 with LWS (`set_link_state`, xHCI 1.2 §4.15.2.1), then PLS read
+    /// back until it is 3, bounded 5 ms. Returns the PLS read last.
+    fn port_u3(&self, port: u8) -> u32 {
+        use suspend as sp;
+        self.set_link_state(port, sp::PLS_U3);
+        let t0 = crate::arch::ms();
+        let mut pls = (self.read_portsc(port) & sp::PLS_MASK) >> sp::PLS_SHIFT;
+        while pls != sp::PLS_U3 && crate::arch::ms().wrapping_sub(t0) < 5 {
+            core::hint::spin_loop();
+            pls = (self.read_portsc(port) & sp::PLS_MASK) >> sp::PLS_SHIFT;
+        }
+        pls
+    }
+
+    /// M3: the interrupt-IN endpoint `dci` names on `slot`, with a TD armed: (kind, the oldest armed TD, the armed set
+    /// oldest first, its length, the ring's enqueue). The hub (B863's test: one status-change TD), the keyboard
+    /// (`keyboard_armed_trb`) or the pointer (`mouse_armed_trb`); `None` for any other DCI or an empty set.
+    fn stop_td_expect(&self, slot: u8, dci: u8) -> Option<(u8, u64, [u64; TD_SET], usize, u64)> {
+        let s = self.slots.get(slot as usize)?;
+        let ep_dci = |ep: u8| (ep & 0x0F) * 2 + ((ep & 0x80) != 0) as u8;
+        let mut set = [0u64; TD_SET];
+        if s.is_hub && s.hub_int_ep != 0 && dci == (s.hub_int_ep & 0x0F) * 2 + 1 && s.hub_int_expect_phys != 0 {
+            return Some((TD_HUB, s.hub_int_expect_phys & !0xF, set, 1, 0));
+        }
+        if s.keyboard_ep != 0 && dci == ep_dci(s.keyboard_ep) && s.keyboard_armed_n != 0 {
+            let n = (s.keyboard_armed_n as usize).min(KBD_INFLIGHT).min(TD_SET);
+            set[..n].copy_from_slice(&s.keyboard_armed_trb[..n]);
+            let enq = s.keyboard_ring.as_ref().map_or(0, |r| r.enqueue_ptr_dcs() & !0xF);
+            return Some((TD_KBD, set[0] & !0xF, set, n, enq));
+        }
+        if s.mouse_ep != 0 && dci == ep_dci(s.mouse_ep) && s.mouse_armed_n != 0 {
+            let n = (s.mouse_armed_n as usize).min(MOUSE_INFLIGHT).min(TD_SET);
+            set[..n].copy_from_slice(&s.mouse_armed_trb[..n]);
+            let enq = s.mouse_ring.as_ref().map_or(0, |r| r.enqueue_ptr_dcs() & !0xF);
+            return Some((TD_PTR, set[0] & !0xF, set, n, enq));
+        }
+        None
+    }
 }
