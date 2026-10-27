@@ -1625,7 +1625,7 @@ mod nle_fx {
     // and `u` (undo). After each key the Player's editor timeline must be the timeline_core op applied by hand; after the
     // last job plays out its plan is the one-run cut (a seek at tick 0 only), the saved file is `KEY_EDL`, and the view band
     // of the edited state hashes to `KEY_VIEW_KAT`, both pinned on the host by timeline_core `view::tests::kernel_keys_view_pin`
-    // through the SAME `edl::write` and `view::paint_in`.
+    // through the SAME `edl::write` and `view::paint_in`. KERNELSIZEPIN (rmbp-ledger B1001): then `f` (`size_keys`, module tail).
     const KEY_EDL: &str = "TITLE: NLEKEY\nFCM: NON-DROP FRAME\n* UNA FPS 25\n* UNA SOURCE NLEFXA 00:00:01:15\n\n001  NLEFXA   V     C        00:00:00:00 00:00:00:08 00:00:00:00 00:00:00:08\n002  NLEFXA   V     C        00:00:00:08 00:00:00:20 00:00:00:08 00:00:00:20\n";
     /// FNV-1a 64 of the view band (Role::Tracks, 320x56, RGBA) of NLEFXA split at 8, the right half selected, playhead 8.
     const KEY_VIEW_KAT: u64 = 0x53f5_5489_46f1_502f;
@@ -1667,6 +1667,7 @@ mod nle_fx {
                 edits += 1;
             }
         }
+        let (size_ok, size_word) = size_keys(&path, &split, a);
         let t1 = crate::arch::ms();
         loop {
             hw::pump_until(4, || false);
@@ -1691,10 +1692,10 @@ mod nle_fx {
             })
             .unwrap_or(0);
         super::close("fixture");
-        let ok = edits == 3 && plan_ok && saved_ok && fnv == KEY_VIEW_KAT;
+        let ok = edits == 3 && plan_ok && saved_ok && size_ok && fnv == KEY_VIEW_KAT;
         serial_println!(
-            "[nle] fixture keys path={} edits={}/3 plan={} saved={} view={:x} want={:x} -> {}",
-            path, edits, if plan_ok { "ok" } else { "FAIL" }, if saved_ok { "ok" } else { "FAIL" }, fnv, KEY_VIEW_KAT, if ok { "ok" } else { "FAIL" }
+            "[nle] fixture keys path={} edits={}/3 plan={} saved={} size={} view={:x} want={:x} -> {}",
+            path, edits, if plan_ok { "ok" } else { "FAIL" }, if saved_ok { "ok" } else { "FAIL" }, size_word, fnv, KEY_VIEW_KAT, if ok { "ok" } else { "FAIL" }
         );
         (ok, if ok { "ok" } else { "FAIL" })
     }
@@ -2214,6 +2215,65 @@ mod nle_fx {
         let ok = n == 3;
         serial_println!("[nle] fixture export pixels={} -> {}", n, if ok { "ok" } else { "FAIL" });
         ok
+    }
+
+    // ── KERNELSIZEPIN (rmbp-ledger B1001): the size key and the present it moves (handlers.md §5 NLEPROBE-HDR's KERNEL-SIZE-PIN) ─
+    // After keys_leg's `s ] u` (the timeline is `split`, the playhead at 8 on the right half), `f` through the same key door
+    // (`edit_post` + `edit_pass`): the reel NLEFXA's policy goes Letterbox -> Fill, the editor timeline must be
+    // `Timeline::set_size_policy` applied by hand and the saved file `KEY_EDL` with the one `* UNA SIZE NLEFXA fill` line after
+    // its SOURCE line (`edl::write` omits Letterbox). The pass then runs until the Player presents a frame (`vplay::stats`'s
+    // presented counter) whose picture rows (`STATE.surf` rows 0..oy/2: the view band takes at most the lower half) hold no
+    // black word: Fill covers the box (B997's `present_fit`, wire `[vplay] present fit=fill reel=NLEFXA ...`); the top half's
+    // FNV-1a 64 (`paper::fnv1a`) is printed (its KAT is owed, KERNEL-PRESENT-PIXEL: the flat field's level steps with the
+    // presented ordinal). Back at tick 8, `f` three more times (stretch, adopt, letterbox): the timeline is `split` again and
+    // the file `KEY_EDL` byte for byte, so keys_leg's own checks after it are unchanged.
+
+    /// The size key's verdict and its wire word (`ok`, `FAIL`); the detail line always.
+    fn size_keys(path: &str, split: &Option<Timeline>, a: timeline_core::SourceId) -> (bool, &'static str) {
+        let fill = split.as_ref().and_then(|t| t.set_size_policy(a, timeline_core::SizePolicy::Fill).ok());
+        let src_line = "* UNA SOURCE NLEFXA 00:00:01:15\n";
+        let fill_edl = KEY_EDL.replace(src_line, &alloc::format!("{}* UNA SIZE NLEFXA fill\n", src_line));
+        let p0 = vplay::stats().1;
+        super::edit_post(crate::pal::Event::Key(b'f'));
+        super::edit_pass();
+        let fill_ok = fill.is_some() && vplay::edit_timeline() == fill;
+        let edl_ok = vplay::read_all(path).ok().as_deref() == Some(fill_edl.as_bytes());
+        let (mut bars, mut hash) = (usize::MAX, 0u64);
+        let t0 = crate::arch::ms();
+        loop {
+            hw::pump_until(4, || false);
+            super::vid::tick();
+            let n = vplay::stats().1.saturating_sub(p0);
+            let (err, sample) = STATE
+                .lock()
+                .as_ref()
+                .map(|s| {
+                    let top = (s.oy / 2) * s.w;
+                    let px = &s.surf[..top.min(s.surf.len())];
+                    (s.err.is_some(), Some((px.iter().filter(|&&w| (w & 0x00FF_FFFF) == 0).count(), crate::video::paper::fnv1a(px))))
+                })
+                .unwrap_or((true, None));
+            if let Some((b, h)) = sample.filter(|_| n > 0) {
+                (bars, hash) = (b, h);
+            }
+            if (n > 0 && bars == 0) || err || crate::arch::ms().saturating_sub(t0) > 3_000 {
+                break;
+            }
+            crate::arch::sched::sleep_ms(4);
+        }
+        let presents = vplay::stats().1.saturating_sub(p0);
+        let _ = super::vid::seek(8 * 1000 / FPS as u64);
+        for _ in 0..3 {
+            super::edit_post(crate::pal::Event::Key(b'f'));
+            super::edit_pass();
+        }
+        let back_ok = split.is_some() && vplay::edit_timeline() == *split && vplay::read_all(path).ok().as_deref() == Some(KEY_EDL.as_bytes());
+        let ok = fill_ok && edl_ok && presents > 0 && bars == 0 && back_ok;
+        serial_println!(
+            "[nle] fixture keys size reel=NLEFXA fit=fill edl={} presents={} bars={} hash={:x} back={} -> {}",
+            if fill_ok && edl_ok { "ok" } else { "FAIL" }, presents, bars, hash, if back_ok { "ok" } else { "FAIL" }, if ok { "ok" } else { "FAIL" }
+        );
+        (ok, if ok { "ok" } else { "FAIL" })
     }
 }
 
