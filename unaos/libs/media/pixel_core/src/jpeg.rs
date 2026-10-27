@@ -15,8 +15,8 @@
 //!     bits through pass 1, final descale by 18 bits with rounding, clamp to 0..255). Its precision is
 //!     that of IEEE 1180-1990's accuracy test, which islow passes; it is bit-exact with libjpeg-turbo's
 //!     C and SIMD islow paths.
-//!   * Chroma upsampling: libjpeg's "fancy" triangle filters for h2v1, h2v2 and h1v2; other ratios are
-//!     replicated (box). Edge samples replicate (libjpeg's context rows).
+//!   * Chroma upsampling: libjpeg's "fancy" triangle filters for h2v1, h2v2 and h1v2 are yuv_core's ONE `fancy` kernel
+//!     with libjpeg's bias (YUVFANCY SR369); other ratios are replicated (box). Edge samples replicate (libjpeg's context rows).
 //!   * Colour (JFIF §7 / T.871): YCbCr → RGB (and YCCK's YCC) is yuv_core's ONE `to_rgba` loop over the
 //!     upsampled planes with libjpeg's 16-bit table `JFIF` (JPEGCOLOURONE SR348). 1 component =
 //!     greyscale. 3 components with an Adobe APP14 transform=0, or ids 'R','G','B' = RGB untouched.
@@ -840,37 +840,15 @@ fn upsample(p: &[u8], c: &Component, f: &Frame) -> Result<Vec<u8>, Error> {
                 out[y * w..y * w + w].copy_from_slice(&p[y * stride..y * stride + w]);
             }
         }
-        (2, 1) => {
-            // h2v1_fancy_upsample
-            let mut row = vec![0u8; cw * 2];
+        (2, 1) | (1, 2) | (2, 2) => {
+            // YUVFANCY (SR369): libjpeg's h2v1 / h1v2 / h2v2 fancy filters are yuv_core's one 9-3-3-1 (3-1) kernel with
+            // libjpeg's bias: (8, 7) by column at h2v2, (1, 2) by column at h2v1 and by row at h1v2.
+            let ss = ((fx - 1) as u32, (fy - 1) as u32);
+            let bias = if fx == 2 && fy == 2 { (8, 7) } else { (1, 2) };
             for y in 0..h {
-                h2_row(&mut row, cw, |x| at(x, y), |v, _| v);
-                out[y * w..y * w + w].copy_from_slice(&row[..w]);
-            }
-        }
-        (1, 2) => {
-            // h1v2_fancy_upsample: bias 1 on the upper output row, 2 on the lower.
-            for y in 0..h {
-                let sy = y / 2;
-                let ny = if y % 2 == 0 { sy.saturating_sub(1) } else { (sy + 1).min(ch - 1) };
-                let bias = if y % 2 == 0 { 1 } else { 2 };
                 for x in 0..w {
-                    out[y * w + x] = ((at(x, sy) * 3 + at(x, ny) + bias) >> 2) as u8;
+                    out[y * w + x] = yuv_core::fancy(p, stride, (cw, ch), ss, (y, x), bias) as u8;
                 }
-            }
-        }
-        (2, 2) => {
-            // h2v2_fancy_upsample: vertical 3:1 column sums, then horizontal 3:1 with biases 8/7.
-            let mut sums = vec![0i32; cw];
-            let mut row = vec![0u8; cw * 2];
-            for y in 0..h {
-                let sy = y / 2;
-                let ny = if y % 2 == 0 { sy.saturating_sub(1) } else { (sy + 1).min(ch - 1) };
-                for (x, s) in sums.iter_mut().enumerate() {
-                    *s = at(x, sy) * 3 + at(x, ny);
-                }
-                h2v2_row(&mut row, &sums);
-                out[y * w..y * w + w].copy_from_slice(&row[..w]);
             }
         }
         _ => {
@@ -882,48 +860,6 @@ fn upsample(p: &[u8], c: &Component, f: &Frame) -> Result<Vec<u8>, Error> {
         }
     }
     Ok(out)
-}
-
-/// libjpeg h2v1 fancy row: out[2i] = (3·in[i] + in[i-1] + 1) >> 2, out[2i+1] = (3·in[i] + in[i+1] + 2) >> 2,
-/// with the end samples copied.
-fn h2_row(row: &mut [u8], cw: usize, src: impl Fn(usize) -> i32, _m: impl Fn(i32, usize) -> i32) {
-    if cw == 1 {
-        let v = src(0) as u8;
-        row[0] = v;
-        row[1] = v;
-        return;
-    }
-    let v = src(0);
-    row[0] = v as u8;
-    row[1] = ((v * 3 + src(1) + 2) >> 2) as u8;
-    for i in 1..cw - 1 {
-        let v = src(i) * 3;
-        row[2 * i] = ((v + src(i - 1) + 1) >> 2) as u8;
-        row[2 * i + 1] = ((v + src(i + 1) + 2) >> 2) as u8;
-    }
-    let i = cw - 1;
-    let v = src(i);
-    row[2 * i] = ((v * 3 + src(i - 1) + 1) >> 2) as u8;
-    row[2 * i + 1] = v as u8;
-}
-
-/// libjpeg h2v2 fancy row over precomputed column sums.
-fn h2v2_row(row: &mut [u8], s: &[i32]) {
-    let cw = s.len();
-    if cw == 1 {
-        row[0] = ((s[0] * 4 + 8) >> 4) as u8;
-        row[1] = ((s[0] * 4 + 7) >> 4) as u8;
-        return;
-    }
-    row[0] = ((s[0] * 4 + 8) >> 4) as u8;
-    row[1] = ((s[0] * 3 + s[1] + 7) >> 4) as u8;
-    for i in 1..cw - 1 {
-        row[2 * i] = ((s[i] * 3 + s[i - 1] + 8) >> 4) as u8;
-        row[2 * i + 1] = ((s[i] * 3 + s[i + 1] + 7) >> 4) as u8;
-    }
-    let i = cw - 1;
-    row[2 * i] = ((s[i] * 3 + s[i - 1] + 8) >> 4) as u8;
-    row[2 * i + 1] = ((s[i] * 4 + 7) >> 4) as u8;
 }
 
 /// FIX(x) at libjpeg's 16 SCALEBITS.
@@ -1095,7 +1031,7 @@ mod tests {
         // A 17x13 4:2:0 gradient. jpeg.rs's libjpeg h2v2 fancy upsampling (3:1 weights, chroma rounded to u8 with
         // biases 8 / 7) then the JFIF table, against yuv_core's Chroma::Bilinear (the same 9-3-3-1 kernel and phase,
         // carried at 4 fractional bits into one rounding): equal kernels, different rounding points, so pixels move
-        // by 1 and jpeg.rs keeps its own upsampler.
+        // by 1 and jpeg.rs upsamples by yuv_core's `fancy` with libjpeg's bias (YUVFANCY SR369), not by Bilinear.
         let (w, h, cw, ch) = (17usize, 13usize, 9usize, 7usize);
         let y: Vec<u8> = (0..w * h).map(|i| (((i % w) * 15 + (i / w) * 7) % 256) as u8).collect();
         let cb: Vec<u8> = (0..cw * ch).map(|i| (((i % cw) * 29 + (i / cw) * 11 + 3) % 256) as u8).collect();
@@ -1123,6 +1059,107 @@ mod tests {
         let moved = fancy.chunks(4).zip(bil.chunks(4)).filter(|(a, b)| a != b).count();
         assert_eq!((max, moved), (1, 102), "of {} pixels", w * h);
         assert_eq!((&fancy[12..15], &bil[12..15]), (&[182u8, 6, 0][..], &[183u8, 5, 0][..]), "row 0 col 3");
+    }
+
+    /// The retired libjpeg rows (jdsample.c's h2v1 / h2v2 as jpeg.rs wrote them until YUVFANCY SR369), kept as references.
+    fn ref_h2_row(row: &mut [u8], cw: usize, src: impl Fn(usize) -> i32) {
+        if cw == 1 {
+            let v = src(0) as u8;
+            row[0] = v;
+            row[1] = v;
+            return;
+        }
+        let v = src(0);
+        row[0] = v as u8;
+        row[1] = ((v * 3 + src(1) + 2) >> 2) as u8;
+        for i in 1..cw - 1 {
+            let v = src(i) * 3;
+            row[2 * i] = ((v + src(i - 1) + 1) >> 2) as u8;
+            row[2 * i + 1] = ((v + src(i + 1) + 2) >> 2) as u8;
+        }
+        let i = cw - 1;
+        let v = src(i);
+        row[2 * i] = ((v * 3 + src(i - 1) + 1) >> 2) as u8;
+        row[2 * i + 1] = v as u8;
+    }
+
+    fn ref_h2v2_row(row: &mut [u8], s: &[i32]) {
+        let cw = s.len();
+        if cw == 1 {
+            row[0] = ((s[0] * 4 + 8) >> 4) as u8;
+            row[1] = ((s[0] * 4 + 7) >> 4) as u8;
+            return;
+        }
+        row[0] = ((s[0] * 4 + 8) >> 4) as u8;
+        row[1] = ((s[0] * 3 + s[1] + 7) >> 4) as u8;
+        for i in 1..cw - 1 {
+            row[2 * i] = ((s[i] * 3 + s[i - 1] + 8) >> 4) as u8;
+            row[2 * i + 1] = ((s[i] * 3 + s[i + 1] + 7) >> 4) as u8;
+        }
+        let i = cw - 1;
+        row[2 * i] = ((s[i] * 3 + s[i - 1] + 8) >> 4) as u8;
+        row[2 * i + 1] = ((s[i] * 4 + 7) >> 4) as u8;
+    }
+
+    /// The retired `upsample` arms for (fx, fy) in (2, 1), (1, 2), (2, 2), over the same padded plane.
+    fn ref_upsample(p: &[u8], stride: usize, (cw, ch): (usize, usize), (w, h): (usize, usize), (fx, fy): (usize, usize)) -> Vec<u8> {
+        let at = |x: usize, y: usize| -> i32 { p[y.min(ch - 1) * stride + x.min(cw - 1)] as i32 };
+        let mut out = vec![0u8; w * h];
+        let mut row = vec![0u8; cw * 2];
+        for y in 0..h {
+            let sy = y / 2;
+            let ny = if y % 2 == 0 { sy.saturating_sub(1) } else { (sy + 1).min(ch - 1) };
+            match (fx, fy) {
+                (2, 1) => {
+                    ref_h2_row(&mut row, cw, |x| at(x, y));
+                    out[y * w..y * w + w].copy_from_slice(&row[..w]);
+                }
+                (1, 2) => {
+                    let bias = if y % 2 == 0 { 1 } else { 2 };
+                    for x in 0..w {
+                        out[y * w + x] = ((at(x, sy) * 3 + at(x, ny) + bias) >> 2) as u8;
+                    }
+                }
+                _ => {
+                    let sums: Vec<i32> = (0..cw).map(|x| at(x, sy) * 3 + at(x, ny)).collect();
+                    ref_h2v2_row(&mut row, &sums);
+                    out[y * w..y * w + w].copy_from_slice(&row[..w]);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn yuvfancy_upsample_is_libjpegs_exactly() {
+        // YUVFANCY (SR369): `upsample` through yuv_core's `fancy` is the retired libjpeg rows byte for byte, at every
+        // size 1..=19 x 1..=7 of the three fancy ratios (cw == 1 and odd widths / heights included), pseudo-random planes.
+        let mut seed = 0x2545_f491u32;
+        let mut cases = 0;
+        for (fx, fy) in [(2usize, 1usize), (1, 2), (2, 2)] {
+            for w in 1..=19usize {
+                for h in 1..=7usize {
+                    let (cw, ch) = (w.div_ceil(fx), h.div_ceil(fy));
+                    let pbw = cw.div_ceil(8);
+                    let stride = pbw * 8;
+                    let p: Vec<u8> = (0..stride * ch)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            (seed >> 24) as u8
+                        })
+                        .collect();
+                    let luma = Component { id: 1, h: fx, v: fy, pbw: w.div_ceil(8), cw: w, ch: h, ..Default::default() };
+                    let chroma = Component { id: 2, h: 1, v: 1, pbw, cw, ch, ..Default::default() };
+                    let f = Frame { width: w, height: h, progressive: false, comps: vec![luma, chroma], hmax: fx, vmax: fy, mcux: 0, mcuy: 0 };
+                    let got = upsample(&p, &f.comps[1], &f).unwrap();
+                    assert_eq!(got, ref_upsample(&p, stride, (cw, ch), (w, h), (fx, fy)), "{fx}x{fy} at {w}x{h}");
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 3 * 19 * 7);
     }
 }
 
