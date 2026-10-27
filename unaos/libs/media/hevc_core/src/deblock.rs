@@ -5,12 +5,15 @@
 //! horizontal edges on their output (8.7.2.1). Edges are the transform and coding block edges on the 8x8 luma grid
 //! (16x16 for 4:2:0 chroma); an edge is skipped at the picture boundary, across a slice boundary whose slice (the one
 //! holding q0) disallows it, across a tile boundary when loop_filter_across_tiles_enabled_flag is 0, and in a slice with
-//! slice_deblocking_filter_disabled_flag. Every block of an I picture is intra, so bS is 2 (8.7.2.4). Luma: the
-//! dE / dEp / dEq decisions (8.7.2.5.3) and the strong / normal filters (8.7.2.5.7); chroma: the bS 2 filter
-//! (8.7.2.5.5) with QpC from Table 8-10 and cQpPicOffset. pcm (with pcm_loop_filter_disabled_flag) and transquant
+//! slice_deblocking_filter_disabled_flag. The boundary strength (8.7.2.4, HEVCINTER SR216): 2 when p0 or q0 is intra
+//! (every block of an I picture), 1 on a transform edge with non-zero luma coefficients on either side, 1 when the
+//! two prediction blocks use different reference pictures or numbers of motion vectors or motion vectors 4 quarter
+//! samples apart, else 0 (no filtering). Prediction block edges are edges too. Luma: the dE / dEp / dEq decisions
+//! (8.7.2.5.3) and the strong / normal filters (8.7.2.5.7) with tC from bS; chroma: only bS 2 edges, the filter of
+//! 8.7.2.5.5 with QpC from Table 8-10 and cQpPicOffset. pcm (with pcm_loop_filter_disabled_flag) and transquant
 //! bypass samples are left as they are.
 
-use crate::picture::{Picture, F_BYPASS, F_EDGE_H, F_EDGE_V, F_PCM};
+use crate::picture::{Picture, PuMotion, F_BYPASS, F_CBF, F_EDGE_H, F_EDGE_V, F_PCM, F_PU_EDGE_H, F_PU_EDGE_V};
 use crate::ps::{Geometry, Pps, Sps};
 use crate::tables::{qpc_420, BETA_TABLE, TC_TABLE};
 
@@ -24,12 +27,56 @@ struct EdgeFacts {
     tc_offset_div2: i32,
     no_p: bool,
     no_q: bool,
+    /// bS (8.7.2.4), 1 or 2.
+    bs: i32,
+}
+
+/// Two motion vectors 4 or more quarter luma samples apart in either component.
+fn far(a: [i32; 2], b: [i32; 2]) -> bool {
+    (a[0] - b[0]).abs() >= 4 || (a[1] - b[1]).abs() >= 4
+}
+
+/// 8.7.2.4 bS 1 from motion: different reference pictures (compared as pictures, by PicOrderCntVal) or numbers of
+/// motion vectors, or motion vectors for the same picture 4 quarter samples apart.
+pub fn motion_differs(p: &PuMotion, q: &PuMotion) -> bool {
+    let (np, nq) = (p.pred.count_ones(), q.pred.count_ones());
+    if np != nq {
+        return true;
+    }
+    if np == 1 {
+        let lp = if p.uses(0) { 0 } else { 1 };
+        let lq = if q.uses(0) { 0 } else { 1 };
+        return p.ref_poc[lp] != q.ref_poc[lq] || far(p.mv[lp], q.mv[lq]);
+    }
+    let (p0, p1, q0, q1) = (p.ref_poc[0], p.ref_poc[1], q.ref_poc[0], q.ref_poc[1]);
+    if !((p0 == q0 && p1 == q1) || (p0 == q1 && p1 == q0)) {
+        return true;
+    }
+    if p0 != p1 {
+        if p0 == q0 { far(p.mv[0], q.mv[0]) || far(p.mv[1], q.mv[1]) } else { far(p.mv[0], q.mv[1]) || far(p.mv[1], q.mv[0]) }
+    } else {
+        (far(p.mv[0], q.mv[0]) || far(p.mv[1], q.mv[1])) && (far(p.mv[0], q.mv[1]) || far(p.mv[1], q.mv[0]))
+    }
+}
+
+/// 8.7.2.4: bS of the edge between the 4x4 blocks `ip` (p0) and `iq` (q0); `transform_edge` when the edge is a
+/// transform block edge.
+fn boundary_strength(pic: &Picture, ip: usize, iq: usize, transform_edge: bool) -> i32 {
+    let (mp, mq) = (&pic.motion[ip], &pic.motion[iq]);
+    if mp.pred == 0 || mq.pred == 0 {
+        return BS_INTRA;
+    }
+    if transform_edge && (pic.flags[ip] & F_CBF != 0 || pic.flags[iq] & F_CBF != 0) {
+        return 1;
+    }
+    motion_differs(mp, mq) as i32
 }
 
 fn edge_facts(pic: &Picture, geo: &Geometry, pps: &Pps, pcm_lf_off: bool, p: (usize, usize), q: (usize, usize), flag: u8) -> Option<EdgeFacts> {
     let iq = pic.idx4(q.0, q.1);
     let ip = pic.idx4(p.0, p.1);
-    if pic.flags[iq] & flag == 0 {
+    let pu_flag = if flag == F_EDGE_V { F_PU_EDGE_V } else { F_PU_EDGE_H };
+    if pic.flags[iq] & (flag | pu_flag) == 0 {
         return None;
     }
     let sq = pic.slice_at(geo, q.0, q.1)?;
@@ -44,6 +91,10 @@ fn edge_facts(pic: &Picture, geo: &Geometry, pps: &Pps, pcm_lf_off: bool, p: (us
     if !pps.loop_filter_across_tiles_enabled_flag && geo.tile_of_rs(cp) != geo.tile_of_rs(cq) {
         return None;
     }
+    let bs = boundary_strength(pic, ip, iq, pic.flags[iq] & flag != 0);
+    if bs == 0 {
+        return None;
+    }
     let keep = |i: usize| (pic.flags[i] & F_PCM != 0 && pcm_lf_off) || pic.flags[i] & F_BYPASS != 0;
     Some(EdgeFacts {
         qp_p: pic.qp[ip] as i32,
@@ -52,6 +103,7 @@ fn edge_facts(pic: &Picture, geo: &Geometry, pps: &Pps, pcm_lf_off: bool, p: (us
         tc_offset_div2: sq.tc_offset_div2,
         no_p: keep(ip),
         no_q: keep(iq),
+        bs,
     })
 }
 
@@ -60,7 +112,7 @@ fn edge_facts(pic: &Picture, geo: &Geometry, pps: &Pps, pcm_lf_off: bool, p: (us
 fn filter_luma(d: &mut [u8], q0: usize, across: isize, along: isize, f: &EdgeFacts, bd: u32) {
     let qpl = (f.qp_q + f.qp_p + 1) >> 1;
     let beta = BETA_TABLE[(qpl + (f.beta_offset_div2 << 1)).clamp(0, 51) as usize] as i32 * (1 << (bd - 8));
-    let tc = TC_TABLE[(qpl + 2 * (BS_INTRA - 1) + (f.tc_offset_div2 << 1)).clamp(0, 53) as usize] as i32 * (1 << (bd - 8));
+    let tc = TC_TABLE[(qpl + 2 * (f.bs - 1) + (f.tc_offset_div2 << 1)).clamp(0, 53) as usize] as i32 * (1 << (bd - 8));
     let at = |k: isize, i: isize| (q0 as isize + k * along + i * across) as usize;
     // p_i at offset -(i + 1), q_i at offset i.
     let px = |d: &[u8], i: isize, k: isize| d[at(k, -(i + 1))] as i32;
@@ -170,6 +222,9 @@ pub fn deblock_picture(pic: &mut Picture, geo: &Geometry, sps: &Sps, pps: &Pps) 
                 let q = (qc.0 * 2, qc.1 * 2);
                 let p = (pc.0 * 2 + if vertical { 1 } else { 0 }, pc.1 * 2 + if vertical { 0 } else { 1 });
                 let Some(f) = edge_facts(pic, geo, pps, pcm_lf_off, p, q, flag) else { continue };
+                if f.bs != BS_INTRA {
+                    continue;
+                }
                 let q0 = qc.1 * cstride + qc.0;
                 let across = if vertical { 1isize } else { cstride as isize };
                 let tc_cb = chroma_tc(&f, pps.cb_qp_offset, bdc);

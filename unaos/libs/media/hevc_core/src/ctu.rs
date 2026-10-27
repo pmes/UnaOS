@@ -7,16 +7,20 @@
 //! coding_unit (7.3.8.5: transquant bypass, part_mode, pcm_sample 7.3.8.7, the intra modes), transform_tree and
 //! transform_unit (7.3.8.8 / 7.3.8.10), cu_qp_delta with the QP derivation (8.6.1), and residual_coding (7.3.8.11)
 //! with the context selection of 9.3.4.2 (split_cu_flag, last_sig_coeff prefixes, coded_sub_block_flag,
-//! sig_coeff_flag, the greater1 / greater2 context sets, sign data hiding, the Rice parameter).
+//! sig_coeff_flag, the greater1 / greater2 context sets, sign data hiding, the Rice parameter). HEVCINTER (SR216): the
+//! inter coding unit of P and B slices — cu_skip_flag, pred_mode_flag, the inter part_mode binarization (9.3.3.7 with
+//! the AMP context), prediction_unit (7.3.8.6: merge_flag, merge_idx, inter_pred_idc, ref_idx, mvd_coding 7.3.8.9,
+//! mvp flags) and rqt_root_cbf with the inter transform tree; the motion and the samples come from [`crate::inter`].
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::cabac::{init_type, Contexts, Engine};
+use crate::inter::{amvp, merge_motion, predict_pu, wrap_mv, InterCtx, Part, Pb, PRED_BI, PRED_L0, PRED_L1};
 use crate::intra::{chroma_mode, luma_mode, predict, DC};
-use crate::picture::{Picture, SaoParams, F_BYPASS, F_EDGE_H, F_EDGE_V, F_PCM};
+use crate::picture::{Picture, PuMotion, SaoParams, F_BYPASS, F_CBF, F_EDGE_H, F_EDGE_V, F_PCM, F_PU_EDGE_H, F_PU_EDGE_V, F_SKIP};
 use crate::ps::{Geometry, Pps, ScalingList, Sps, SCAN_ORDER};
-use crate::slice::SliceHeader;
+use crate::slice::{SliceHeader, SliceType};
 use crate::tables::*;
 use crate::transform::{add_residual, inverse_transform, scale, transform_skip};
 use crate::{Error, Result};
@@ -53,6 +57,11 @@ pub struct SliceDecoder<'a> {
     cu_bypass: bool,
     ctb_ts: u32,
     ctb_rs: u32,
+    /// The reference lists of a P / B slice (HEVCINTER); None in an I slice.
+    inter: Option<InterCtx<'a>>,
+    /// The coding unit under decoding is intra (CuPredMode) / its transform tree splits by interSplitFlag.
+    cu_intra: bool,
+    inter_split: bool,
 }
 
 impl<'a> SliceDecoder<'a> {
@@ -66,6 +75,7 @@ impl<'a> SliceDecoder<'a> {
         rbsp: &'a [u8],
         slice_idx: u32,
         slice_addr_rs: u32,
+        inter: Option<InterCtx<'a>>,
     ) -> SliceDecoder<'a> {
         let slice_qp = sh.slice_qp(pps);
         SliceDecoder {
@@ -91,6 +101,9 @@ impl<'a> SliceDecoder<'a> {
             cu_bypass: false,
             ctb_ts: 0,
             ctb_rs: 0,
+            inter,
+            cu_intra: true,
+            inter_split: false,
         }
     }
 
@@ -348,6 +361,11 @@ impl<'a> SliceDecoder<'a> {
         let size = 1usize << log2;
         let (xu, yu) = (x0 as usize, y0 as usize);
         self.cu_bypass = self.pps.transquant_bypass_enabled_flag && self.eng.decision(TRANSQUANT_BYPASS) == 1;
+        if self.inter.is_some() && self.inter_coding_unit(x0, y0, log2, depth)? {
+            return self.finish_cu(xu, yu, size);
+        }
+        self.cu_intra = true;
+        self.inter_split = false;
         let nxn = log2 == self.sps.log2_min_cb && self.eng.decision(PART_MODE) == 0;
         let pcm = !nxn && self.sps.pcm.is_some_and(|p| log2 >= p.log2_min_cb && log2 <= p.log2_max_cb) && self.eng.terminate() == 1;
         let bypass = self.cu_bypass;
@@ -395,6 +413,11 @@ impl<'a> SliceDecoder<'a> {
             let max_depth = self.sps.max_transform_hierarchy_depth_intra + nxn as u32;
             self.transform_tree(xu, yu, xu, yu, log2, 0, 0, true, true, nxn, max_depth, cmode)?;
         }
+        self.finish_cu(xu, yu, size)
+    }
+
+    /// The end of every coding unit: its QpY into the 4x4 facts, qPY_PREV for the next one.
+    fn finish_cu(&mut self, xu: usize, yu: usize, size: usize) -> Result<()> {
         let qp = self.qp_y as i8;
         self.pic.fill4(xu, yu, size, size, |p, i| p.qp[i] = qp);
         self.store.last_qp_y = self.qp_y;
@@ -459,7 +482,7 @@ impl<'a> SliceDecoder<'a> {
         let split = if log2 <= sps.log2_max_tb && log2 > sps.log2_min_tb && depth < max_depth && !(intra_split && depth == 0) {
             self.eng.decision(SPLIT_TRANSFORM + 5 - log2 as usize) == 1
         } else {
-            log2 > sps.log2_max_tb || (intra_split && depth == 0)
+            log2 > sps.log2_max_tb || (intra_split && depth == 0) || (self.inter_split && depth == 0)
         };
         let (mut cb, mut cr) = (false, false);
         if log2 > 2 {
@@ -478,7 +501,8 @@ impl<'a> SliceDecoder<'a> {
             }
             Ok(())
         } else {
-            let cbf_luma = self.eng.decision(CBF_LUMA + if depth == 0 { 1 } else { 0 }) == 1;
+            // cbf_luma is inferred 1 in an inter coding unit's root transform unit without chroma cbfs (7.3.8.8).
+            let cbf_luma = if self.cu_intra || depth != 0 || cb || cr { self.eng.decision(CBF_LUMA + if depth == 0 { 1 } else { 0 }) == 1 } else { true };
             self.transform_unit(x0, y0, xb, yb, log2, blk, cbf_luma, cb, cr, parent_cb, parent_cr, cmode)
         }
     }
@@ -526,21 +550,29 @@ impl<'a> SliceDecoder<'a> {
         self.mark_edges(x0, y0, 1 << log2);
         let bd = self.sps.bit_depth_luma;
         let lmode = self.pic.intra_mode[self.pic.idx4(x0, y0)] as u32;
-        predict(self.pic, self.geo, 0, x0, y0, log2, lmode, self.sps.strong_intra_smoothing_enabled_flag, bd);
+        if self.cu_intra {
+            predict(self.pic, self.geo, 0, x0, y0, log2, lmode, self.sps.strong_intra_smoothing_enabled_flag, bd);
+        }
         if cbf_luma {
+            let n = 1usize << log2;
+            self.pic.fill4(x0, y0, n, n, |p, i| p.flags[i] |= F_CBF);
             self.residual(x0, y0, log2, 0, lmode)?;
         }
         let bdc = self.sps.bit_depth_chroma;
         if chroma_here {
             for (c, cbf) in [(1usize, cb), (2, cr)] {
-                predict(self.pic, self.geo, c, x0 / 2, y0 / 2, log2 - 1, cmode, false, bdc);
+                if self.cu_intra {
+                    predict(self.pic, self.geo, c, x0 / 2, y0 / 2, log2 - 1, cmode, false, bdc);
+                }
                 if cbf {
                     self.residual(x0 / 2, y0 / 2, log2 - 1, c, cmode)?;
                 }
             }
         } else if blk == 3 {
             for (c, cbf) in [(1usize, parent_cb), (2, parent_cr)] {
-                predict(self.pic, self.geo, c, xb / 2, yb / 2, 2, cmode, false, bdc);
+                if self.cu_intra {
+                    predict(self.pic, self.geo, c, xb / 2, yb / 2, 2, cmode, false, bdc);
+                }
                 if cbf {
                     self.residual(xb / 2, yb / 2, 2, c, cmode)?;
                 }
@@ -566,11 +598,11 @@ impl<'a> SliceDecoder<'a> {
             };
             let n = 1usize << log2;
             let factor = match self.scaling {
-                Some(sl) if !(ts && n > 4) => Some(sl.factor[(log2 - 2) as usize][c].as_slice()),
+                Some(sl) if !(ts && n > 4) => Some(sl.factor[(log2 - 2) as usize][c + if self.cu_intra { 0 } else { 3 }].as_slice()),
                 _ => None,
             };
             scale(&mut coeff, log2, qp, bd, factor);
-            if ts { transform_skip(&coeff, log2, bd) } else { inverse_transform(&coeff, log2, c == 0 && log2 == 2, bd) }
+            if ts { transform_skip(&coeff, log2, bd) } else { inverse_transform(&coeff, log2, c == 0 && log2 == 2 && self.cu_intra, bd) }
         };
         add_residual(&mut self.pic.planes[c], x0, y0, log2, &res, bd);
         Ok(())
@@ -744,6 +776,184 @@ impl<'a> SliceDecoder<'a> {
             }
         }
         Ok((coeff, ts))
+    }
+
+    /// HEVCINTER: the inter half of coding_unit() (7.3.8.5) in a P or B slice — cu_skip_flag, pred_mode_flag,
+    /// part_mode, the prediction units and rqt_root_cbf with the inter transform tree. Ok(false): the coding unit is
+    /// intra and the caller's intra path decodes it.
+    fn inter_coding_unit(&mut self, x0: i32, y0: i32, log2: u32, depth: u32) -> Result<bool> {
+        let skip = self.eng.decision(CU_SKIP + self.skip_inc(x0, y0)) == 1;
+        if !skip && self.eng.decision(PRED_MODE) == 1 {
+            return Ok(false);
+        }
+        self.cu_intra = false;
+        self.inter_split = false;
+        let part = if skip { Part::P2Nx2N } else { self.inter_part_mode(log2) };
+        let size = 1usize << log2;
+        let (xu, yu) = (x0 as usize, y0 as usize);
+        let fl = if self.cu_bypass { F_BYPASS } else { 0 } | if skip { F_SKIP } else { 0 };
+        self.pic.fill4(xu, yu, size, size, |p, i| {
+            p.ctdepth[i] = depth as u8;
+            p.flags[i] = (p.flags[i] & !(F_PCM | F_BYPASS | F_SKIP)) | fl;
+            p.intra_mode[i] = DC as u8;
+        });
+        self.mark_edges(xu, yu, size);
+        let mut merge0 = false;
+        for (k, &(xp, yp, w, h)) in part.pus(x0, y0, size as i32).iter().enumerate() {
+            let pb = Pb { xc: x0, yc: y0, ncb: size as i32, x: xp, y: yp, w, h, part, idx: k };
+            let merge = self.prediction_unit(&pb, skip, depth)?;
+            if k == 0 {
+                merge0 = merge;
+            }
+            self.mark_pu_edges(xp as usize, yp as usize, w as usize, h as usize);
+        }
+        if !skip {
+            // rqt_root_cbf is inferred 1 for a merged 2Nx2N prediction unit.
+            let root = (part == Part::P2Nx2N && merge0) || self.eng.decision(RQT_ROOT_CBF) == 1;
+            if root {
+                let max_depth = self.sps.max_transform_hierarchy_depth_inter;
+                self.inter_split = max_depth == 0 && part != Part::P2Nx2N;
+                self.transform_tree(xu, yu, xu, yu, log2, 0, 0, true, true, false, max_depth, DC)?;
+                self.inter_split = false;
+            }
+        }
+        Ok(true)
+    }
+
+    /// cu_skip_flag ctxInc (9.3.4.2.2): the available left and above blocks that were skipped.
+    fn skip_inc(&self, x0: i32, y0: i32) -> usize {
+        let f = |s: &Self, x: i32, y: i32| s.avail(x0, y0, x, y) && s.pic.flags[s.pic.idx4(x as usize, y as usize)] & F_SKIP != 0;
+        f(self, x0 - 1, y0) as usize + f(self, x0, y0 - 1) as usize
+    }
+
+    /// part_mode of an inter coding unit (9.3.3.7, Table 9-43; bins 0 and 1 ctxInc 0 / 1, the third bin ctxInc 2 at
+    /// the minimum size and 3 — the AMP flag — above it, the fourth bypass).
+    fn inter_part_mode(&mut self, log2: u32) -> Part {
+        if self.eng.decision(PART_MODE) == 1 {
+            return Part::P2Nx2N;
+        }
+        let hor = self.eng.decision(PART_MODE + 1) == 1;
+        if log2 == self.sps.log2_min_cb {
+            if hor {
+                return Part::P2NxN;
+            }
+            if log2 == 3 || self.eng.decision(PART_MODE + 2) == 1 {
+                return Part::PNx2N;
+            }
+            return Part::PNxN;
+        }
+        if !self.sps.amp_enabled_flag || self.eng.decision(PART_MODE + 3) == 1 {
+            return if hor { Part::P2NxN } else { Part::PNx2N };
+        }
+        match (hor, self.eng.bypass()) {
+            (true, 0) => Part::P2NxnU,
+            (true, _) => Part::P2NxnD,
+            (false, 0) => Part::PnLx2N,
+            (false, _) => Part::PnRx2N,
+        }
+    }
+
+    /// The left / top edges of a prediction block (8.7.2.3: prediction block edges are filtered too).
+    fn mark_pu_edges(&mut self, x0: usize, y0: usize, w: usize, h: usize) {
+        let (pw, ph) = (self.pic.width, self.pic.height);
+        for y in (y0..(y0 + h).min(ph)).step_by(4) {
+            let i = self.pic.idx4(x0, y);
+            self.pic.flags[i] |= F_PU_EDGE_V;
+        }
+        for x in (x0..(x0 + w).min(pw)).step_by(4) {
+            let i = self.pic.idx4(x, y0);
+            self.pic.flags[i] |= F_PU_EDGE_H;
+        }
+    }
+
+    /// TR with cMax `cmax` whose first `ctx_bins` bins use contexts `slot + i` and the rest bypass (merge_idx, ref_idx).
+    fn tr_ctx(&mut self, slot: usize, ctx_bins: u32, cmax: u32) -> u32 {
+        let mut v = 0;
+        while v < cmax {
+            let b = if v < ctx_bins { self.eng.decision(slot + v as usize) } else { self.eng.bypass() };
+            if b == 0 {
+                break;
+            }
+            v += 1;
+        }
+        v
+    }
+
+    /// inter_pred_idc (9.3.3.8): bin 0 (ctxInc CtDepth) "1" is PRED_BI unless nPbW + nPbH is 12; the last bin (ctxInc
+    /// 4) chooses PRED_L0 / PRED_L1.
+    fn inter_pred_idc(&mut self, wh: i32, depth: u32) -> u32 {
+        if wh != 12 && self.eng.decision(INTER_PRED_IDC + depth.min(3) as usize) == 1 {
+            return PRED_BI;
+        }
+        if self.eng.decision(INTER_PRED_IDC + 4) == 1 { PRED_L1 } else { PRED_L0 }
+    }
+
+    /// mvd_coding() (7.3.8.9): MvdLX[0..2].
+    fn mvd_coding(&mut self) -> [i32; 2] {
+        let g0 = [self.eng.decision(ABS_MVD_GT0), self.eng.decision(ABS_MVD_GT0)];
+        let mut g1 = [0u32; 2];
+        for c in 0..2 {
+            if g0[c] == 1 {
+                g1[c] = self.eng.decision(ABS_MVD_GT1);
+            }
+        }
+        let mut v = [0i32; 2];
+        for c in 0..2 {
+            if g0[c] == 1 {
+                let mut a = 1 + g1[c] as i32;
+                if g1[c] == 1 {
+                    a += self.eng.bypass_egk(1).min(1 << 15) as i32;
+                }
+                if self.eng.bypass() == 1 {
+                    a = -a;
+                }
+                v[c] = a;
+            }
+        }
+        v
+    }
+
+    /// prediction_unit() (7.3.8.6): the syntax, the motion (merge 8.5.3.2.2 or AMVP 8.5.3.2.6 + MvdLX), stored per 4x4,
+    /// and the predicted samples (8.5.3.3). Returns merge_flag.
+    fn prediction_unit(&mut self, pb: &Pb, skip: bool, depth: u32) -> Result<bool> {
+        let Some(ctx) = self.inter else {
+            return Err(Error::Invalid("inter coding unit in an I slice"));
+        };
+        let max_merge = self.sh.max_num_merge_cand;
+        let merge = skip || self.eng.decision(MERGE_FLAG) == 1;
+        let motion = if merge {
+            let idx = if max_merge > 1 { self.tr_ctx(MERGE_IDX, 1, max_merge - 1) } else { 0 };
+            merge_motion(self.pic, self.geo, &ctx, self.sh, self.pps, pb, idx as usize)
+        } else {
+            let idc = if self.sh.slice_type == SliceType::B { self.inter_pred_idc(pb.w + pb.h, depth) } else { PRED_L0 };
+            let mut m = PuMotion::default();
+            let mut mvd = [[0i32; 2]; 2];
+            let mut flag = [0u32; 2];
+            for x in 0..2 {
+                if (x == 0 && idc == PRED_L1) || (x == 1 && idc == PRED_L0) {
+                    continue;
+                }
+                let active = if x == 0 { self.sh.num_ref_idx_l0_active } else { self.sh.num_ref_idx_l1_active };
+                m.ref_idx[x] = if active > 1 { self.tr_ctx(REF_IDX, 2, active - 1) } else { 0 } as i8;
+                if !(x == 1 && self.sh.mvd_l1_zero_flag && idc == PRED_BI) {
+                    mvd[x] = self.mvd_coding();
+                }
+                flag[x] = self.eng.decision(MVP_FLAG);
+                m.pred |= 1 << x;
+            }
+            ctx.complete(&mut m);
+            for x in 0..2 {
+                if m.uses(x) {
+                    let mvp = amvp(self.pic, self.geo, &ctx, self.sh, pb, x, m.ref_idx[x] as usize)[flag[x] as usize];
+                    m.mv[x] = [wrap_mv(mvp[0] + mvd[x][0]), wrap_mv(mvp[1] + mvd[x][1])];
+                }
+            }
+            m
+        };
+        self.pic.fill4(pb.x as usize, pb.y as usize, pb.w as usize, pb.h as usize, |p, i| p.motion[i] = motion);
+        let (bdy, bdc) = (self.sps.bit_depth_luma, self.sps.bit_depth_chroma);
+        predict_pu(self.pic, &ctx, self.sh, self.pps, bdy, bdc, pb.x, pb.y, pb.w, pb.h, &motion);
+        Ok(merge)
     }
 }
 

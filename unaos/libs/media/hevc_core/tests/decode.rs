@@ -250,8 +250,9 @@ fn inter_slices_high_bit_depth_and_422_are_refused_by_name() {
     b.trailing();
     b.u(0xff, 8);
     s.extend(nal(1, &b.out));
+    // HEVCINTER (SR216) decodes P slices: this one's RPS names POC 0, which was never decoded (8.3.2).
     let err = Decoder::new().decode_annexb(&s).unwrap_err();
-    assert_eq!(err, Error::Unsupported("inter slices (HEVCINTER)"));
+    assert_eq!(err, Error::Invalid("reference picture set names a missing picture (8.3.2)"));
 
     for (cfg, want) in [
         (SpsCfg { bit_depth: 10, ..Default::default() }, "bit depth above 8 (HEVCMAIN10)"),

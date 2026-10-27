@@ -262,3 +262,24 @@ pub const DEFAULT_8X8_INTER: [u8; 64] = [
     24, 24, 24, 24, 24, 24, 25, 25, 25, 25, 25, 25, 25, 28, 28, 28, 28, 28, 28, 33, 33, 33, 33, 33, 41, 41, 41, 41, 54, 54,
     54, 71, 71, 91,
 ];
+
+/// 8.5.3.3.3.1 Table 8-11: the luma interpolation filter coefficients fL[xFracL][i], taps at xInt + i - 3 (row 0 is
+/// the full-sample position, never filtered).
+pub const LUMA_FILTER: [[i32; 8]; 4] =
+    [[0, 0, 0, 64, 0, 0, 0, 0], [-1, 4, -10, 58, 17, -5, 1, 0], [-1, 4, -11, 40, 40, -11, 4, -1], [0, 1, -5, 17, 58, -10, 4, -1]];
+
+/// 8.5.3.3.3.2 Table 8-12: the chroma interpolation filter coefficients fC[xFracC][i] (eighth samples), taps at
+/// xInt + i - 1 (row 0 is the full-sample position).
+pub const CHROMA_FILTER: [[i32; 4]; 8] = [
+    [0, 64, 0, 0],
+    [-2, 58, 10, -2],
+    [-4, 54, 16, -2],
+    [-6, 46, 28, -4],
+    [-4, 36, 36, -4],
+    [-4, 28, 46, -6],
+    [-2, 16, 54, -4],
+    [-2, 10, 58, -2],
+];
+
+/// 8.5.3.2.4 Table 8-7: (l0CandIdx, l1CandIdx) for combIdx 0..11 of the combined bi-predictive merging candidates.
+pub const COMB_IDX: [(usize, usize); 12] = [(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1), (0, 3), (3, 0), (1, 3), (3, 1), (2, 3), (3, 2)];
