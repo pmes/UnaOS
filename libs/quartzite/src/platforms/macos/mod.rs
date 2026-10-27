@@ -33,6 +33,9 @@ pub mod find_bar;
 pub mod status_line;
 pub mod downloads;
 pub mod tab_search;
+// AETHERMACDEVTOOLS (SR312): the system-log Console and the developer-tools pane (`widgets::{console_rows, devtools_rows}`).
+pub mod console_view;
+pub mod devtools_view;
 
 // The UI bootstrapping closure
 type BootstrapFn = Box<
@@ -429,7 +432,9 @@ impl Backend {
 /// title bar follows the page (`window_title::bind_browser_title`). The page surface is the one `eval_tetra` builds
 /// (stretched), so it takes the window's slack; every other piece hugs. STRIP2 (SR219): the top strip stands between
 /// the toolbar and the body, the side column in the body; Principia's `aether.tabs.layout` shows one
-/// (`tab_strip::bootstrap_tab_strips`); the keys are the Tab menu's ([`install_tab_keys`]).
+/// (`tab_strip::bootstrap_tab_strips`); the keys are the Tab menu's ([`install_tab_keys`]). AETHERMACDEVTOOLS (SR312): the
+/// page sits under the developer-tools pane's overlay ([`devtools_view::bootstrap_devtools`]); the Develop menu
+/// ([`install_develop_menu`]) carries its keys, F6 and the System Log, and sends Principia's accessibility rows.
 pub fn bootstrap_browser_chrome(window: &NSWindow, toolbar: crate::tetra::TetraNode, synapse: bandy::Synapse) -> Retained<NSView> {
     window_title::bind_browser_title(window, synapse.clone());
     let bar = tetra_eval::eval_tetra(toolbar, synapse.clone());
@@ -439,6 +444,9 @@ pub fn bootstrap_browser_chrome(window: &NSWindow, toolbar: crate::tetra::TetraN
     let page = tetra_eval::eval_tetra(crate::tetra::TetraNode::Surface { id: "viewport".into() }, synapse.clone());
     let downloads = downloads::bootstrap_downloads(synapse.clone());
     install_tab_keys(&bar, &find, &synapse);
+    let surface = page.clone();
+    let page = devtools_view::bootstrap_devtools(synapse.clone(), surface.clone());
+    install_develop_menu(&bar, &surface, &synapse);
     let status = status_line::bootstrap_status_line(synapse);
 
     let page_col = tab_strip::stack(true);
@@ -566,5 +574,123 @@ fn first_text_field(v: &NSView) -> Option<Retained<NSView>> {
         }
         let subs: Retained<objc2_foundation::NSArray<NSView>> = msg_send![v, subviews];
         subs.to_vec().iter().find_map(|s| first_text_field(s))
+    }
+}
+
+/// AETHERMACDEVTOOLS (SR312): a visible "Develop" menu on the main menu, in [`install_tab_keys`]' shape (each item's
+/// target a `bootstrap_button`): Developer Tools (Cmd+Option+I, and F12) fires `devtools_rows::toggle_key`, the toggle
+/// the shell's `DevtoolsChrome::on_key` takes; JavaScript Console (Cmd+Option+J) fires `devtools_rows::console_verbs`
+/// (the Console panel, opening a closed pane); Move Focus (F6) and Move Focus Back (Shift+F6) walk
+/// `a11y_rows::F6_ORDER` ([`f6_focus`]); System Log (Ctrl+`) opens [`console_view::open_console_window`]. Then the
+/// accessibility rows go out ([`send_a11y_rows`]).
+fn install_develop_menu(bar: &NSView, surface: &NSView, synapse: &bandy::Synapse) {
+    use crate::widgets::devtools_rows;
+    use tab_strip::{CMD, CONTROL, SHIFT};
+    /// `NSEventModifierFlagOption`.
+    const OPTION: usize = 1 << 19;
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let menu = tab_strip::new_menu("Develop");
+    let add = |title: &str, key: &str, mask: usize, target: Retained<NSView>| unsafe {
+        let item = tab_strip::menu_item(title, key, mask, &target);
+        let _: () = msg_send![&*menu, addItem: &*item];
+    };
+    let sep = || unsafe {
+        let s: Retained<AnyObject> = msg_send![objc2::class!(NSMenuItem), separatorItem];
+        let _: () = msg_send![&*menu, addItem: &*s];
+    };
+    add("Developer Tools", "i", CMD | OPTION, button::bootstrap_button("Developer Tools", devtools_rows::toggle_key(), synapse.clone()));
+    // NSF12FunctionKey
+    add("Developer Tools (F12)", "\u{F70F}", 0, button::bootstrap_button("Developer Tools (F12)", devtools_rows::toggle_key(), synapse.clone()));
+    let syn = synapse.clone();
+    add(
+        "JavaScript Console",
+        "j",
+        CMD | OPTION,
+        button::bootstrap_button_with(
+            "JavaScript Console",
+            Box::new(move || {
+                for m in devtools_rows::console_verbs(devtools_view::is_open()) {
+                    syn.fire(m);
+                }
+            }),
+        ),
+    );
+    sep();
+    for (title, mask, back) in [("Move Focus", 0usize, false), ("Move Focus Back", SHIFT, true)] {
+        let field_host: Retained<NSView> = objc2::Message::retain(bar);
+        let page: Retained<NSView> = objc2::Message::retain(surface);
+        // NSF6FunctionKey
+        add(title, "\u{F709}", mask, button::bootstrap_button_with(title, Box::new(move || f6_focus(&field_host, &page, back))));
+    }
+    sep();
+    let syn = synapse.clone();
+    add("System Log", "`", CONTROL, button::bootstrap_button_with("System Log", Box::new(move || console_view::open_console_window(syn.clone()))));
+    unsafe {
+        let app = NSApplication::sharedApplication(mtm);
+        let main: *mut AnyObject = msg_send![&app, mainMenu];
+        if !main.is_null() {
+            let item: *mut AnyObject = msg_send![objc2::class!(NSMenuItem), alloc];
+            let t = objc2_foundation::NSString::from_str("Develop");
+            let k = objc2_foundation::NSString::from_str("");
+            let item: *mut AnyObject = msg_send![item, initWithTitle: &*t, action: None::<objc2::runtime::Sel>, keyEquivalent: &*k];
+            if let Some(item) = Retained::<AnyObject>::from_raw(item) {
+                let _: () = msg_send![&*item, setSubmenu: &*menu];
+                let _: () = msg_send![main, addItem: &*item];
+            }
+        }
+    }
+    send_a11y_rows(synapse);
+}
+
+/// AETHERMACDEVTOOLS (SR312): F6 (`back`: Shift+F6) moves the keys to `a11y_rows::f6_step`'s stop: the address field
+/// under `bar` ([`focus_address`]) or the page `surface`. Focus on the surface is the Page stop; anywhere else is neither.
+fn f6_focus(bar: &NSView, surface: &NSView, back: bool) {
+    use crate::widgets::a11y_rows::{f6_step, FocusStop};
+    unsafe {
+        let window: *mut AnyObject = msg_send![surface, window];
+        if window.is_null() {
+            return;
+        }
+        let first: *mut AnyObject = msg_send![window, firstResponder];
+        let on_page = std::ptr::eq(first as *const AnyObject, surface as *const NSView as *const AnyObject);
+        match f6_step(if on_page { Some(FocusStop::Page) } else { None }, back) {
+            FocusStop::Address => focus_address(bar),
+            FocusStop::Page => {
+                let _: objc2::runtime::Bool = msg_send![window, makeFirstResponder: surface];
+            }
+        }
+    }
+}
+
+/// AETHERMACDEVTOOLS (SR312): Principia's accessibility rows (`a11y_rows::read_rows`) go to the shell as
+/// `BrowserA11yPrefs` now and again whenever a `PrefChanged` names one of them and the rows changed (the bus lane; the
+/// GTK face also watches the store's folder, owed here). The dedupe lives in the lane's own thread.
+fn send_a11y_rows(synapse: &bandy::Synapse) {
+    use crate::widgets::a11y_rows;
+    let syn = synapse.clone();
+    let mut rx = synapse.subscribe();
+    let spawned = std::thread::Builder::new().name("a11y-rows".into()).spawn(move || {
+        let mut last = a11y_rows::read_rows();
+        syn.fire(last.message());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a11y rows subscription runtime");
+        rt.block_on(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(m) if a11y_rows::is_a11y_change(&m) => {
+                        let rows = a11y_rows::read_rows();
+                        if rows != last {
+                            syn.fire(rows.message());
+                            last = rows;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    });
+    if let Err(e) = spawned {
+        log::warn!("[aether] accessibility rows: no lane ({e})");
     }
 }

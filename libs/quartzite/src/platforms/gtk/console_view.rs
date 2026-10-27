@@ -43,36 +43,10 @@ use gtk4::{Box, Label, Orientation, ScrolledWindow, TextView, WrapMode};
 
 use bandy::{LogEvent, SMessage, Synapse};
 
-use crate::tetra::{ConsoleLine, ConsoleTetra};
+use crate::tetra::ConsoleTetra;
+// AETHERMACDEVTOOLS (SR312): the rows and text are `widgets::console_rows`' (both faces read them).
+use crate::widgets::console_rows::{render_body, render_header, rows_from_tail};
 use crate::NativeView;
-
-/// One scrollback row as text: `source  text` (or just `text` when the record
-/// carries no source tag). `text` is already sanitized by the bridge.
-fn fmt_line(l: &ConsoleLine) -> String {
-    if l.source.is_empty() {
-        l.text.clone()
-    } else {
-        format!("{}  {}", l.source, l.text)
-    }
-}
-
-/// The whole scrollback rendered as one buffer string, oldest→newest.
-fn render_body(lines: &[ConsoleLine]) -> String {
-    lines.iter().map(fmt_line).collect::<Vec<_>>().join("\n")
-}
-
-/// The header line: what the pane is, plus the honest bounded-ring state.
-fn render_header(dropped: u64, paused: bool) -> String {
-    let mut h = String::from(":: Console — read-only system log");
-    if dropped > 0 {
-        h.push_str(&format!(" · {dropped} evicted"));
-    }
-    if paused {
-        h.push_str(" · PAUSED");
-    }
-    h.push_str(" ::");
-    h
-}
 
 /// Build the read-only, live Console widget from a `ConsoleTetra` snapshot.
 ///
@@ -120,14 +94,7 @@ pub fn bootstrap_console(console: &ConsoleTetra, synapse: Synapse) -> NativeView
     gtk4::glib::spawn_future_local(async move {
         while let Ok(msg) = rx.recv().await {
             if let SMessage::Logs(LogEvent::LogTail { lines, dropped, paused }) = msg {
-                let rendered: Vec<ConsoleLine> = lines
-                    .iter()
-                    .map(|l| ConsoleLine {
-                        level: l.level.clone(),
-                        source: l.source.clone(),
-                        text: crate::tetra::sanitize_line(&l.content),
-                    })
-                    .collect();
+                let rendered = rows_from_tail(&lines);
                 buffer_live.set_text(&render_body(&rendered));
                 header_live.set_label(&render_header(dropped, paused));
             }
