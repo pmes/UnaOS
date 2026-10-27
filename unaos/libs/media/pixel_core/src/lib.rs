@@ -34,6 +34,7 @@ use alloc::vec::Vec;
 pub mod anim;
 pub mod bmp;
 pub mod crc;
+pub mod deflate { pub use crate::png::encode::zlib_compress as compress; } // PDFWRITE (SR325): the one compressor, SHOTZIP's
 pub mod facts;
 pub use facts::{facts_of, ImageFacts};
 pub mod gif;

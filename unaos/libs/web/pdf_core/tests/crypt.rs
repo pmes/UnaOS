@@ -215,6 +215,7 @@ fn reads_back(doc: &Document) {
     assert_eq!(pages.len(), 1);
     assert_eq!(pages[0].contents, CONTENT);
     assert_eq!(doc.info().title.as_deref(), Some(TITLE));
+    saved_reads_back(doc);
 }
 
 fn name_of(kind: Kind) -> &'static str {
@@ -322,4 +323,17 @@ fn other_security_handlers_are_refused_by_name() {
         Document::parse(&build(&e, true)).err(),
         Some(Error::Unsupported("encrypt: security handler other than /Standard"))
     );
+}
+
+/// PDFWRITE (SR325): the document saved (decrypted, /Encrypt dropped) re-parses with NO password to the same plaintext;
+/// an incremental save of an encrypted file is refused (re-encryption owed).
+fn saved_reads_back(doc: &Document) {
+    let out = doc.save();
+    let back = Document::parse(&out).unwrap();
+    assert_eq!(back.encryption(), "none");
+    assert!(!back.trailer().contains(b"Encrypt"));
+    assert_eq!(back.pages().unwrap(), doc.pages().unwrap());
+    assert_eq!(back.pages().unwrap()[0].contents, CONTENT);
+    assert_eq!(back.info(), doc.info());
+    assert!(matches!(pdf_core::write::Edit::new(doc).save_update(&out), Err(Error::Unsupported(_))));
 }

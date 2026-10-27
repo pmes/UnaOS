@@ -42,6 +42,7 @@ fn render_pdf(bytes: &[u8]) -> (Rendered, TextLog) {
     let pages = doc.pages().unwrap();
     let mut log = TextLog::default();
     let r = pages[0].render(&doc, 72.0, &mut log).unwrap();
+    assert_saved_renders_same(bytes, &r);
     (r, log)
 }
 
@@ -301,4 +302,13 @@ fn type4_calculator() {
     assert_eq!(f.eval(&[5.0]), vec![0.0], "real input: bitshift needs an int -> the error result");
     let f = calc(b"{ cvi 4 bitshift 1 or 90 sin add }", vec![0.0, 99.0], vec![0.0, 999.0]);
     assert_eq!(f.eval(&[5.0]), vec![82.0]);
+}
+
+/// PDFWRITE (SR325): every PDF2 fixture saved through `Document::save` and re-parsed renders to the same pixels.
+fn assert_saved_renders_same(bytes: &[u8], r: &Rendered) {
+    let saved = Document::parse(bytes).unwrap().save();
+    let back = Document::parse(&saved).unwrap();
+    let again = back.pages().unwrap()[0].render(&back, 72.0, &mut TextLog::default()).unwrap();
+    assert_eq!((again.pixmap.w, again.pixmap.h), (r.pixmap.w, r.pixmap.h));
+    assert!(again.pixmap.data == r.pixmap.data, "the saved file renders differently");
 }

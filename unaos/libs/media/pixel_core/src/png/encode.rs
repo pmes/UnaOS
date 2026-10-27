@@ -801,3 +801,17 @@ pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, PngE
     }
     Ok(out)
 }
+
+/// PDFWRITE (LEDGER SR325): the encoder's compressor over arbitrary bytes, as one zlib stream (RFC 1950: the 0x78 0x01
+/// header, ONE fixed-Huffman block, Adler-32) — no PNG filter, no chunk framing. It drives [`PngEncoder`]'s own engine
+/// (`feed` / `compress` / `finish`), so there is one LZ77 and one Huffman coder in the tree; the PNG path is unchanged.
+/// Re-exported as `pixel_core::deflate::compress` (pdf_core's FlateDecode writer). Inputs under 4 GiB (u32 stream
+/// positions); `Err(OutOfMemory)` when the window could not be taken.
+pub fn zlib_compress(data: &[u8]) -> Result<Vec<u8>, PngError> {
+    let mut e = PngEncoder::with_bpp(1, 1, 3)?;
+    e.feed(data);
+    // The one "row" is the whole input: `finish` closes the block and the stream.
+    e.rows_pushed = 1;
+    e.finish()?;
+    Ok(core::mem::take(&mut e.pend))
+}
