@@ -1109,18 +1109,22 @@ fn file_url_path(input: &str) -> Option<PathBuf> {
 
 /// SAVERECENTOPEN (SR403): the loader's second file-URL arm (`net::fetch_document_any`, after [`open_archive`]'s): a
 /// `.html` / `.htm` file opens as its markup (at most [`ARCHIVE_MAX`]), the document's URL the file URL, under
-/// [`ARCHIVE_CSP`] as an opened archive is (no script runs, an opaque origin). Any other file is refused by name on the
-/// console (`[pdf] open: <ext> not served`, `none` without an extension) and answered `None`: the loader's own refusal
-/// follows.
-pub fn open_local(input: &str) -> Option<anyhow::Result<(String, String)>> {
+/// [`ARCHIVE_CSP`] as an opened archive is (no script runs, an opaque origin). OPENANYTYPE (SR408): every other file is
+/// asked of [`local_any`] (a text, image or media type by TYPECORE's one table, or a PDF by its head); what it does not
+/// serve is refused by name on the console (`[pdf] open: <ext> not served`, `none` without an extension) and answered
+/// `None`: the loader's own refusal follows.
+pub fn open_local(input: &str) -> Option<anyhow::Result<(crate::net::Doc, String)>> {
     let path = file_url_path(input)?;
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     match ext.as_deref() {
-        Some("html" | "htm") => Some(read_local(input, &path)),
-        other => {
-            crate::js::host::console_out(1, &format!("[pdf] open: {} not served", other.unwrap_or("none")));
-            None
-        }
+        Some("html" | "htm") => Some(read_local(input, &path).map(|(html, url)| (crate::net::Doc::Text(html), url))),
+        other => match local_any(input, &path) {
+            Some(opened) => Some(opened),
+            None => {
+                crate::js::host::console_out(1, &format!("[pdf] open: {} not served", other.unwrap_or("none")));
+                None
+            }
+        },
     }
 }
 
@@ -1132,4 +1136,87 @@ fn read_local(input: &str, path: &Path) -> anyhow::Result<(String, String)> {
     let bytes = std::fs::read(path)?;
     crate::security::set_document_headers(input, &[("content-security-policy".to_string(), ARCHIVE_CSP.to_string())]);
     Ok((String::from_utf8_lossy(&bytes).into_owned(), input.to_string()))
+}
+
+// ---- OPENANYTYPE (SR408): a local file of any served type, and a local page's own file:// subresources -----------------
+// The type is TYPECORE's (`type_core::by_extension`, the one table both rings read); the document a type becomes is the
+// engine's one by-type markup (`js::window::frames::markup_for`, HTML §7.4.6); a PDF is chosen by the PDF arm's own predicate
+// (`pdf::is_pdf`, the `%PDF-` head) under its own cap. Subresources of a local page are read only from the page's folder.
+
+/// OPENANYTYPE (SR408): the largest local subresource [`read_part`] reads (the page loader's http image / body cap).
+const PART_MAX: u64 = 10 << 20;
+
+/// OPENANYTYPE (SR408): [`open_local`]'s non-HTML arm. A `text/*` or JSON file is its text in a `<pre>` (at most
+/// [`ARCHIVE_MAX`]); an `image/*` file an `<img>` of its own file URL (its bytes read as the page's own subresource, so an
+/// SVG is drawn by the image path's renderer, never run); a `video/*` / `audio/*` file a media element of its file URL
+/// (Stria reads the file; nothing is read here); a file the table does not name opens as a PDF when its head says so
+/// (at most `pdf::MAX_BYTES`, refused by `pdf::over_cap`). Every text document runs under [`ARCHIVE_CSP`]. `None`: not
+/// served.
+fn local_any(input: &str, path: &Path) -> Option<anyhow::Result<(crate::net::Doc, String)>> {
+    let mime = type_core::by_extension(&path.to_string_lossy());
+    let Some(mime) = mime else {
+        let mut head = [0u8; 8];
+        let n = std::fs::File::open(path).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).ok()?;
+        return crate::pdf::is_pdf("", &head[..n]).then(|| read_local_pdf(input, path));
+    };
+    let text = mime.starts_with("text/") || mime == type_core::APP_JSON;
+    let media = mime.starts_with("video/") || mime.starts_with("audio/");
+    if !(text || media || mime.starts_with("image/")) {
+        return None;
+    }
+    Some(local_markup(input, path, mime, text))
+}
+
+/// [`local_any`]'s document through `js::window::frames::markup_for`: the text read for a `text` type, the file URL alone else.
+fn local_markup(input: &str, path: &Path, mime: &str, text: bool) -> anyhow::Result<(crate::net::Doc, String)> {
+    let len = std::fs::metadata(path)?.len();
+    let body = if text {
+        if len > ARCHIVE_MAX {
+            anyhow::bail!("the file exceeds {} MiB", ARCHIVE_MAX >> 20);
+        }
+        String::from_utf8_lossy(&std::fs::read(path)?).into_owned()
+    } else {
+        String::new()
+    };
+    let doc = crate::api::fetch::SubDocument { url: input.to_string(), content_type: mime.to_string(), status: 200, body, charset: "UTF-8" };
+    let html = crate::js::window::frames::markup_for(&doc);
+    crate::security::set_document_headers(input, &[("content-security-policy".to_string(), ARCHIVE_CSP.to_string())]);
+    Ok((crate::net::Doc::Text(html), input.to_string()))
+}
+
+/// [`local_any`]'s PDF: the bytes whole, under the PDF arm's cap.
+fn read_local_pdf(input: &str, path: &Path) -> anyhow::Result<(crate::net::Doc, String)> {
+    let len = std::fs::metadata(path)?.len();
+    if len > crate::pdf::MAX_BYTES as u64 {
+        anyhow::bail!(crate::pdf::over_cap(len));
+    }
+    Ok((crate::net::Doc::Pdf(std::fs::read(path)?), input.to_string()))
+}
+
+/// OPENANYTYPE (SR408): the page loader's bound on a local page's subresources (`net`'s discovery filters): `part` is
+/// admitted (answered as is) only when the document `doc` and `part` are both file URLs and `part`'s real path lies under
+/// the real path of `doc`'s folder. A part outside it (a `../` escape, which the URL join has already normalized, or a
+/// symlink out) is named on the console (`[pdf] open: <path> outside the page's folder`) and refused; a part that does
+/// not exist, or a non-file URL, is answered `None` silently.
+pub(crate) fn local_part(doc: &str, part: &str) -> Option<String> {
+    if !part.starts_with("file://") {
+        return None;
+    }
+    let folder = file_url_path(doc)?.parent()?.canonicalize().ok()?;
+    let p = file_url_path(part)?;
+    let real = p.canonicalize().ok()?;
+    if !real.starts_with(&folder) {
+        crate::js::host::console_out(1, &format!("[pdf] open: {} outside the page's folder", p.display()));
+        return None;
+    }
+    Some(part.to_string())
+}
+
+/// OPENANYTYPE (SR408): a local subresource's bytes (at most [`PART_MAX`]), for a URL [`local_part`] admitted.
+pub(crate) fn read_part(url: &str) -> anyhow::Result<Vec<u8>> {
+    let path = file_url_path(url).ok_or_else(|| anyhow::anyhow!("not a file URL"))?;
+    if std::fs::metadata(&path)?.len() > PART_MAX {
+        anyhow::bail!("the file exceeds {} MiB", PART_MAX >> 20);
+    }
+    Ok(std::fs::read(&path)?)
 }

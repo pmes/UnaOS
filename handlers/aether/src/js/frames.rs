@@ -1181,18 +1181,25 @@ fn escape_text(t: &str) -> String {
 }
 
 /// The markup a response becomes (HTML §7.4.6 "loading a document" by type): HTML as is, XML parsed
-/// as HTML (ledgered), plain text in a `<pre>`, an image in an `<img>`.
-fn markup_for(r: &crate::api::fetch::SubDocument) -> String {
+/// as HTML (ledgered), plain text in a `<pre>`, an image in an `<img>`. OPENANYTYPE (SR408): an image is tested before
+/// XML (an `image/svg+xml` document is drawn by the image path, not parsed as markup), and `video/*` / `audio/*` is a
+/// media document (HTML §7.4.6.4: the media element of the response's URL, with controls); the open verb's local files
+/// (`chrome::host` `local_any`) are its second caller.
+pub(crate) fn markup_for(r: &crate::api::fetch::SubDocument) -> String {
     let ct = r.content_type.as_str();
     if ct.is_empty() || ct.contains("html") && !ct.contains("xml") {
         return r.body.clone();
     }
+    if ct.starts_with("image/") {
+        return format!("<html><body style=\"margin:0\"><img src=\"{}\"></body></html>", escape_text(&r.url).replace('"', "&quot;"));
+    }
+    if ct.starts_with("video/") || ct.starts_with("audio/") {
+        let tag = if ct.starts_with("video/") { "video" } else { "audio" };
+        return format!("<html><body style=\"margin:0\"><{tag} src=\"{}\" controls autoplay></{tag}></body></html>", escape_text(&r.url).replace('"', "&quot;"));
+    }
     if ct.contains("xml") {
         crate::ledger::record_dom("frames-xml-parsed-as-html");
         return r.body.clone();
-    }
-    if ct.starts_with("image/") {
-        return format!("<html><body style=\"margin:0\"><img src=\"{}\"></body></html>", escape_text(&r.url).replace('"', "&quot;"));
     }
     format!("<html><head></head><body><pre>{}</pre></body></html>", escape_text(&r.body))
 }
