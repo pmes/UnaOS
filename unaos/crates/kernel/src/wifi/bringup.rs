@@ -2613,7 +2613,8 @@ mod tx;
 /// MAC re-suspended, the HT-PHY's TX-side sequencing (`htphyinit::tx_prep`), the channel cookie, the
 /// TX ring and the SHM/filter words (`tx::prep`), S6's receiver armed (the MAC enabled), the frame
 /// (`tx::fire`), a 2 s response window, both engines stopped. Once per boot; a second `tests wifi`
-/// prints the recorded verdict.
+/// prints the recorded verdict. PHYONCEFN (B950): the per-boot one-shots are `phy::once`; the per-association half on a
+/// kept station's re-join or roam is `join::associate`.
 #[cfg(feature = "wifi10")]
 pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
     static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -2644,72 +2645,12 @@ pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
         }
     };
     let shm_pre = unsafe { r32(bar0, D11_SHM_CONTROL) };
-    let mut w = rx::Writes::default();
-    // 1. The MAC suspended (wifi9's end left it so; re-asserted, main.c:2987-3017), then the PHY's TX side.
-    let suspended = rx::suspend(bar0, &mut w, "wifi10");
-    let mut h = htphyinit::Ht::new(bar0);
-    let tp = htphyinit::tx_prep(&mut h);
-    // WIFI11 (B653): HT-PHY TX power control from the SPROM's per-core PA coefficients — the half WIFI10
-    // designed and did not build (phy_ht.c:1001-1004, after tx_prep's :999-1000). Refused, witnessed, on an
-    // unread / implausible / blank SPROM block: the frame then leaves at WIFI10's fixed index.
-    let pctl = match ident::pwr_2g() {
-        Ok((rev, p)) => {
-            ident::pwr_line(rev, &p);
-            match p.iter().position(ident::pwr_blank) {
-                Some(c) => {
-                    serial_println!(
-                        ":: wifi11: txpctl on=0 target_idx=- sprom=blank(core{} rev={}) -> NOT-SET reason=unprogrammed-pa-block — b43 would drive control from it; the frame leaves at txpctl_cmd=[{:#06x},{:#06x},{:#06x}] ::",
-                        c, rev, tp.txpctl[0], tp.txpctl[1], tp.txpctl[2]
-                    );
-                    None
-                }
-                None => {
-                    let pin = [0usize, 1, 2].map(|c| htphyinit::PwrIn {
-                        target: p[c].maxpwr_2g, a1: p[c].pa_2g[0] as i16, b0: p[c].pa_2g[1] as i16, b1: p[c].pa_2g[2] as i16,
-                    });
-                    let r = htphyinit::tx_pwr_ctl(&mut h, &pin);
-                    serial_println!(
-                        ":: wifi11: txpctl on={} target_idx={:#06x} status=[{:#06x},{:#06x},{:#06x}] targ_pwr=[{},{},{}]dBm/4 idle_tssi=[{},{},{}] tone={} sprom=ok(rev={}) -> {} ::",
-                        r.on as u8, r.status[0], r.status[0], r.status[1], r.status[2], pin[0].target, pin[1].target, pin[2].target,
-                        r.idle[0], r.idle[1], r.idle[2], if r.tone_ok { "ran" } else { "TIMEOUT" }, rev,
-                        if r.on { "SET" } else { "NOT-SET reason=cmd-en-bits-unset" }
-                    );
-                    Some(r)
-                }
-            }
-        }
-        Err(why) => {
-            serial_println!(":: wifi11: txpctl on=0 target_idx=- sprom={} -> NOT-SET reason=sprom-{} — the frame leaves at txpctl_cmd=[{:#06x},{:#06x},{:#06x}] ::", why, why, tp.txpctl[0], tp.txpctl[1], tp.txpctl[2]);
-            None
-        }
-    };
-    let pctl_on = pctl.as_ref().map_or(false, |r| r.on);
-    let cookie_pre = rx::chan_cookie(bar0, CH, &mut w);
-    // 2. The TX ring, the rate memory, the PHY-TX-control words, the station MAC into the filter.
-    let prep = match tx::prep(bar0, mac, &mut w) {
-        Ok(p) => p,
-        Err(why) => {
-            super::status::set_wifi10(3, 0);
-            unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
-            serial_println!(":: wifi10: tx NOT ATTEMPTED reason={} ::", why);
-            return;
-        }
-    };
-    // 3. S6's receiver armed — the MAC enabled, the ucode awake.
+    // 1.-3. The per-boot one-shots, in b43's order (PHYONCEFN B950, bringup/phy.rs): the MAC re-suspended, `tx_prep`, WIFI11's power control, the cookie, `tx::prep`, `rx::arm`.
+    let Ok(phy::PhyState { suspended, h, tp, pctl, pctl_on, cookie_pre, prep, mut rxr, mut w }) = phy::once(bar0, bus, dev, func, mac, CH, shm_pre) else { return };
     let mut seen = rx::Seen::default();
     seen.me = mac;
     // WIFIAUTH (B788): the target armed BEFORE the probe window, so its beacons / probe responses name the BSS.
     seen.join = join::Heard::new(mac, ssid);
-    let mut rxr = match rx::arm(bar0, bus, dev, func, &mut w, "wifi10") {
-        Ok(r) => r,
-        Err(why) => {
-            super::status::set_wifi10(3, 0);
-            let _ = tx::stop(bar0, &mut w);
-            unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
-            serial_println!(":: wifi10: tx NOT ATTEMPTED reason=rx-{} ::", why);
-            return;
-        }
-    };
     // 4. The frame.
     let r = tx::fire(bar0, &prep, mac, CH, &mut w);
     let sent = r.sent();
@@ -2766,6 +2707,9 @@ pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
 // WIFIAUTH (B788, R110): rungs S8 (open-system auth) and S9 (association) inside wifi10's pass. See bringup/join.rs.
 #[cfg(feature = "wifi10")]
 mod join;
+// PHYONCEFN (B950): wifi10's per-boot PHY/MAC/DMA one-shots as one fn, `phy::once`. See bringup/phy.rs.
+#[cfg(feature = "wifi10")]
+mod phy;
 // WIFIDHCP (B831): the kept station's device fns and the TX ring's caps, for `wifi/data.rs` (the accessor triple).
 #[cfg(feature = "wifi10")]
 pub(super) use join::{station_mac, station_pending, station_rx, station_tx, station_tx_room, station_kat};
