@@ -330,7 +330,8 @@ pub fn paint_in(st: &EditorState, l: Layout, order: Order, mut labels: Option<&m
             }
             c.rect(x0 + 1, y0 + 2, x1 - 1, y1 - 2, clip_colour(clip.src.0, track.kind));
             if let (Some(text), Some(src)) = (labels.as_mut(), tl.source(clip.src)) {
-                text.text(&mut c, &src.reel, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
+                let label = if src.size_policy == crate::SizePolicy::Letterbox { src.reel.clone() } else { alloc::format!("{} {}", src.reel, src.size_policy.name()) }; // NLESIZEPOLICYUI (SR402): the reel's policy as a token
+                text.text(&mut c, &label, x0 as f32 + 4.0, y0 as f32 + 15.0, ((x0 + 1) as i32, (x1 - 1) as i32));
             }
         }
     }

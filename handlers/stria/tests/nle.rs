@@ -1060,3 +1060,94 @@ fn nlesizepolicy_two_size_reel_under_each_policy() {
     assert!(matches!(e, ExportError::H264(h264enc_core::Error::FrameSize)), "{e}");
     println!("nlesizepolicy: fill/stretch 768x512 x4 pinned, adopt 1280x720 frames 2-3, export refused: {e}");
 }
+
+// ── NLESIZEPOLICYUI (LEDGER SR402): the reel's size policy chosen from the editor (handlers.md §5 NLEPROBE-HDR) ──────────
+// The `size` words of timeline_core's ONE verb dispatch (`EditorState::verb`, both faces), the EDL's `* UNA SIZE` round
+// trip through the ONE writer, the refusals by name, and the host face's Size button (a 4-way cycle) and label token.
+
+use stria::nle_face::{EditorState, Face, PixelOrder, VERBS, synth_fixture};
+use timeline_core::SizePolicy;
+
+/// The labels the ONE painter draws (`timeline_core::view::Text`), recorded.
+struct NlesizepolicyuiLabels(Vec<String>);
+impl timeline_core::view::Text for NlesizepolicyuiLabels {
+    fn text(&mut self, _: &mut timeline_core::view::Canvas, s: &str, _: f32, _: f32, _: (i32, i32)) {
+        self.0.push(s.to_string());
+    }
+}
+
+fn nlesizepolicyui_labels(st: &EditorState) -> Vec<String> {
+    let mut rec = NlesizepolicyuiLabels(Vec::new());
+    timeline_core::view::paint(st, 320, 160, timeline_core::view::Order::Rgba, Some(&mut rec), None);
+    rec.0
+}
+
+#[test]
+fn nlesizepolicyui_size_verb_sets_the_reels_policy_and_the_edl_round_trips_it() {
+    let (tl0, _) = synth_fixture();
+    let b = tl0.source_by_reel("B").unwrap().id;
+    let mut st = EditorState::new(tl0.clone());
+    assert_eq!(st.verb("size B fill"), Some(Ok(())));
+    assert_eq!(st.timeline, tl0.set_size_policy(b, SizePolicy::Fill).unwrap());
+    assert_eq!(st.undo_depth(), 1);
+    assert_eq!(st.verb("size B fill"), Some(Ok(())), "the same policy again");
+    assert_eq!(st.undo_depth(), 1, "commits nothing");
+    let text = edl::write(&st.timeline, "SIZE").unwrap();
+    assert!(text.contains("* UNA SIZE B fill\n"), "{text}");
+    assert!(!text.contains("* UNA SIZE A"), "a Letterbox reel writes no line: {text}");
+    let back = edl::parse(&text, 25).unwrap();
+    assert_eq!(back.source_by_reel("B").unwrap().size_policy, SizePolicy::Fill);
+    assert_eq!(back.source_by_reel("A").unwrap().size_policy, SizePolicy::Letterbox);
+    assert_eq!(st.verb("size A ADOPT"), Some(Ok(())), "the policy word ignores ASCII case");
+    assert_eq!(st.timeline.source_by_reel("A").unwrap().size_policy, SizePolicy::Adopt);
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.verb("undo"), Some(Ok(())));
+    assert_eq!(st.timeline, tl0, "undo restores Letterbox");
+    assert_eq!(edl::write(&st.timeline, "SIZE").unwrap(), edl::write(&tl0, "SIZE").unwrap());
+}
+
+#[test]
+fn nlesizepolicyui_refuses_an_unknown_reel_and_an_unknown_policy_by_name() {
+    let (tl0, _) = synth_fixture();
+    let mut st = EditorState::new(tl0.clone());
+    assert_eq!(st.verb("size Q fill"), Some(Err(EditError::NoSource)));
+    assert_eq!(st.verb("size Q huge"), Some(Err(EditError::NoSource)));
+    assert_eq!(st.verb("size A huge"), Some(Err(EditError::Policy)));
+    assert_eq!(st.verb("size A"), Some(Err(EditError::Policy)));
+    assert_eq!(st.verb("size A fill extra"), Some(Err(EditError::Policy)));
+    assert_eq!(st.verb("size"), Some(Err(EditError::NoClip)), "a bare size cycles the selected clip's reel");
+    assert_eq!(st.verb("sizes"), None, "not a size verb");
+    assert_eq!(st.timeline, tl0);
+    assert_eq!(st.undo_depth(), 0);
+    assert_eq!(EditError::Policy.to_string(), "no such size policy (letterbox, fill, stretch, adopt)");
+    assert_eq!(EditError::NoSource.to_string(), "no such source");
+    assert_eq!(SizePolicy::ALL.map(|p| p.next()), [SizePolicy::Fill, SizePolicy::Stretch, SizePolicy::Adopt, SizePolicy::Letterbox]);
+}
+
+#[test]
+fn nlesizepolicyui_face_size_button_cycles_through_the_verb() {
+    assert!(VERBS.contains(&"size"));
+    let (tl0, src) = synth_fixture();
+    let b = tl0.source_by_reel("B").unwrap().id;
+    let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+    assert!(face.verb("size"));
+    assert_eq!(face.last_error.take().as_deref(), Some("size: no such clip"));
+    assert_eq!(face.state.timeline, tl0);
+    face.state.select(0, 1).unwrap();
+    let labels = nlesizepolicyui_labels(&face.state);
+    assert!(labels.iter().any(|s| s == "B") && !labels.iter().any(|s| s.starts_with("B ")), "{labels:?}");
+    let mut want = tl0.clone();
+    for p in [SizePolicy::Fill, SizePolicy::Stretch, SizePolicy::Adopt, SizePolicy::Letterbox] {
+        assert!(face.verb("size"));
+        assert_eq!(face.last_error.take(), None);
+        want = want.set_size_policy(b, p).unwrap();
+        assert_eq!(face.state.timeline, want, "{p:?}");
+        let labels = nlesizepolicyui_labels(&face.state);
+        let token = if p == SizePolicy::Letterbox { "B".to_string() } else { format!("B {}", p.name()) };
+        assert!(labels.contains(&token), "{p:?}: {labels:?}");
+        assert!(labels.iter().any(|s| s == "A"), "reel A's label untouched: {labels:?}");
+    }
+    assert_eq!(face.state.undo_depth(), 4);
+    assert!(face.verb("size B huge"));
+    assert_eq!(face.last_error.take().as_deref(), Some("size B huge: no such size policy (letterbox, fill, stretch, adopt)"));
+}

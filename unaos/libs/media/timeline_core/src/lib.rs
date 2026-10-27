@@ -284,6 +284,8 @@ pub enum EditError {
     /// EDITMAP (SR223): an edit-list segment at a rate other than 1 (slow / fast motion, or a rate-0 dwell hold): the
     /// model has no speed op.
     Rate,
+    /// NLESIZEPOLICYUI (SR402): the editor's `size` verb named no [`SizePolicy`] word (or the wrong number of words).
+    Policy,
 }
 
 impl core::fmt::Display for EditError {
@@ -302,6 +304,7 @@ impl core::fmt::Display for EditError {
             EditError::Fade => "fades longer than the clip",
             EditError::Gain => "gain out of range",
             EditError::Rate => "edit list rate is not 1 (no speed op)",
+            EditError::Policy => "no such size policy (letterbox, fill, stretch, adopt)",
         })
     }
 }
@@ -848,6 +851,13 @@ pub struct Place {
 }
 
 impl SizePolicy {
+    /// NLESIZEPOLICYUI (SR402): every policy, in the face's cycle order (the ONE list `from_name` and `next` read).
+    pub const ALL: [SizePolicy; 4] = [SizePolicy::Letterbox, SizePolicy::Fill, SizePolicy::Stretch, SizePolicy::Adopt];
+    /// NLESIZEPOLICYUI (SR402): the policy after this one in [`SizePolicy::ALL`] (Adopt wraps to Letterbox): the face's cycle.
+    pub fn next(self) -> SizePolicy {
+        let i = SizePolicy::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        SizePolicy::ALL[(i + 1) % SizePolicy::ALL.len()]
+    }
     /// The policy's word: the EDL's `* UNA SIZE` token and the wire's `fit=`.
     pub fn name(self) -> &'static str {
         match self {
@@ -859,7 +869,7 @@ impl SizePolicy {
     }
     /// The policy a word names (ASCII case ignored).
     pub fn from_name(s: &str) -> Option<SizePolicy> {
-        [SizePolicy::Letterbox, SizePolicy::Fill, SizePolicy::Stretch, SizePolicy::Adopt].into_iter().find(|p| p.name().eq_ignore_ascii_case(s))
+        SizePolicy::ALL.into_iter().find(|p| p.name().eq_ignore_ascii_case(s))
     }
     /// THE GEOMETRY: a `sw x sh` frame in a `dw x dh` box (all four > 0). Letterbox: the whole frame into
     /// `yuv_core::scale::fit(sw, sh, dw, dh)`; Fill: the box's aspect centred inside the frame (`fit(dw, dh, sw, sh)`) into
@@ -875,8 +885,8 @@ impl SizePolicy {
 }
 
 impl Timeline {
-    /// NLESIZEPOLICY (SR394): the same timeline with source `src`'s size policy `p` (the property's edit; the reel menu is
-    /// owed, NLE-SIZE-POLICY-UI). [`EditError::NoSource`] when the timeline holds no such source.
+    /// NLESIZEPOLICY (SR394): the same timeline with source `src`'s size policy `p` (the property's edit; the editor's `size`
+    /// verb drives it, NLESIZEPOLICYUI SR402: `editor::EditorState::set_size_policy`). [`EditError::NoSource`] when the timeline holds no such source.
     pub fn set_size_policy(&self, src: SourceId, p: SizePolicy) -> Result<Timeline, EditError> {
         let mut tl = self.clone();
         tl.sources.iter_mut().find(|s| s.id == src).ok_or(EditError::NoSource)?.size_policy = p;
