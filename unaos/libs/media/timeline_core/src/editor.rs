@@ -302,6 +302,7 @@ impl EditorState {
 /// `Face::verb` / `Face::key`) and the kernel Player's editing keys (`video/vplay.rs` `edit_key`). Each face keeps its own
 /// key BINDINGS (the host's `KEYS` names, the kernel's byte table) and maps them onto these words; the arms are the host
 /// face's, moved here unchanged. `None`: not an editor verb (the face's own transport, e.g. `play`, stays the face's).
+/// NLE6KEYSLABELS (rmbp-ledger B968): `zoom0` puts the zoom back to [`ZOOM_DEFAULT`] (the kernel's `0` key).
 impl EditorState {
     pub fn verb(&mut self, v: &str) -> Option<Result<(), EditError>> {
         let ph = self.playhead;
@@ -330,6 +331,10 @@ impl EditorState {
             }
             "zoom+" => {
                 self.zoom_by(1);
+                Ok(())
+            }
+            "zoom0" => {
+                self.zoom = ZOOM_DEFAULT;
                 Ok(())
             }
             "[" => self.trim(Edge::In, -1),

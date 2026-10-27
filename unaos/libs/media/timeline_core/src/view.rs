@@ -13,7 +13,8 @@
 //!   [`Layout::hit`], [`Layout::crossing`] and the transition widget's [`Layout::transition_rect`]; [`Layout::of_role`]
 //!   cuts it for a Surface showing only the preview or only the tracks.
 //! * [`paint_in`]: RGBA (or BGRA, [`Order`]) bytes over a plain [`Canvas`]; the optional [`Text`] hook names the clips
-//!   and the ruler's seconds (the host's text_host; the kernel paints none yet). No font, no I/O, no_std + alloc.
+//!   and the ruler's seconds (the host's text_host; the kernel's `video::text`, NLE6KEYSLABELS rmbp-ledger B968). No font,
+//!   no I/O, no_std + alloc.
 //! * The colours are the editor's own table (the host's, moved unchanged); NLE6VIEW-TOKENS (video.md §5) owes them as
 //!   palette_core tokens.
 
@@ -185,6 +186,8 @@ pub const ROW: [[u8; 4]; 2] = [[0x26, 0x26, 0x2e, 255], [0x2c, 0x2c, 0x35, 255]]
 pub const SELECT: [u8; 4] = [0xff, 0xff, 0xff, 255];
 pub const HANDLE: [u8; 4] = [0xff, 0xd0, 0x40, 255];
 pub const PLAYHEAD: [u8; 4] = [0xff, 0x40, 0x40, 255];
+/// The labels' ink (the host's text_host colour, moved unchanged; the kernel's `video::text` labels too: NLE6KEYSLABELS B968).
+pub const LABEL: [u8; 4] = [0xff, 0xff, 0xff, 255];
 pub const REEL: [[u8; 3]; 6] =
     [[0x4a, 0x7d, 0xc9], [0xc9, 0x7d, 0x4a], [0x5a, 0xa8, 0x6a], [0xa8, 0x5a, 0xa0], [0xb8, 0xa8, 0x4a], [0x4a, 0xa8, 0xa8]];
 
@@ -474,5 +477,67 @@ mod tests {
         assert_eq!(at(66, 30), HANDLE, "the right half's in handle");
         assert_eq!(at(10, 30), clip_colour(0, Kind::Video), "the left half");
         assert_eq!(fnv1a(&px), 0x53f5_5489_46f1_502f);
+    }
+
+    /// The label hook as a recorder: every `(text, x, baseline, clip)` call, in order (no pixels).
+    struct Rec(Vec<(alloc::string::String, f32, f32, (i32, i32))>);
+
+    impl Text for Rec {
+        fn text(&mut self, _: &mut Canvas, s: &str, x: f32, baseline: f32, clip: (i32, i32)) {
+            self.0.push((alloc::string::String::from(s), x, baseline, clip));
+        }
+    }
+
+    /// The kernel keys fixture's view band (Role::Tracks, 320x56, playhead 8, the right half selected) through a recorder.
+    fn keys_labels(st: &EditorState) -> (Vec<(alloc::string::String, f32, f32, (i32, i32))>, u64) {
+        let l = Layout::of_role(Role::Tracks, 320, 56, st);
+        let mut rec = Rec(Vec::new());
+        let px = paint_in(st, l, Order::Rgba, Some(&mut rec as &mut dyn Text), None);
+        (rec.0, fnv1a(&px))
+    }
+
+    fn calls(v: &[(&str, f32, f32, (i32, i32))]) -> Vec<(alloc::string::String, f32, f32, (i32, i32))> {
+        v.iter().map(|&(s, x, b, c)| (alloc::string::String::from(s), x, b, c)).collect()
+    }
+
+    /// NLE6KEYSLABELS (rmbp-ledger B968) M3: the label calls the kernel view band's `video::text` hook receives for the
+    /// NLEKEY fixture — the ruler's timecode at each whole second (zoom 8 x 25 fps >= 60) and each clip's reel at its left
+    /// edge, clipped to the clip — at the host's positions; the hook paints no rect, so the band's FNV is `KEY_VIEW_KAT`.
+    #[test]
+    fn kernel_keys_labels_pin() {
+        let mut st = keys_state();
+        st.select_at(0, 8).unwrap();
+        st.seek(8);
+        let (got, fnv) = keys_labels(&st);
+        assert_eq!(
+            got,
+            calls(&[
+                ("00:00:00:00", 2.0, 9.0, (0, 320)),
+                ("00:00:01:00", 202.0, 9.0, (200, 320)),
+                ("NLEFXA", 4.0, 31.0, (1, 63)),
+                ("NLEFXA", 68.0, 31.0, (65, 159)),
+            ])
+        );
+        assert_eq!(fnv, 0x53f5_5489_46f1_502f);
+    }
+
+    /// NLE6KEYSLABELS (rmbp-ledger B968) M3: the kernel's zoom keys (`+` / `=` -> `zoom+`, `-` -> `zoom-`, `0` -> `zoom0`)
+    /// are `EditorState::verb`'s ONE zoom, and the view's `Layout` follows it: below 60 px per second the ruler names none.
+    #[test]
+    fn kernel_zoom_keys_pin() {
+        let mut st = keys_state();
+        st.select_at(0, 8).unwrap();
+        st.seek(8);
+        assert_eq!(st.verb("zoom+"), Some(Ok(())));
+        assert_eq!(st.zoom, 16);
+        assert_eq!(Layout::of_role(Role::Tracks, 320, 56, &st).zoom, 16);
+        for _ in 0..3 {
+            assert_eq!(st.verb("zoom-"), Some(Ok(())));
+        }
+        assert_eq!(st.zoom, 2);
+        let (got, _) = keys_labels(&st);
+        assert_eq!(got, calls(&[("NLEFXA", 4.0, 31.0, (1, 15)), ("NLEFXA", 20.0, 31.0, (17, 39))]));
+        assert_eq!(st.verb("zoom0"), Some(Ok(())));
+        assert_eq!(st.zoom, crate::editor::ZOOM_DEFAULT);
     }
 }
