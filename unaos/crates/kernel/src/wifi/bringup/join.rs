@@ -39,12 +39,12 @@ pub(super) struct Heard {
     /// STATIONRATE (B855): the rate set S9's ASSOCIATED answer listed (`None` = unread); `keep` picks the station's rate from it.
     pub rates: Option<wifi_core::ieee80211::RateSet>,
     /// STATIONSHORTPRE (B862): S9's ASSOCIATED answer set the capability Short Preamble bit (`assoc::short_preamble`).
-    pub short: bool, pub gw: Option<[u8; 4]>, pub ring: usize, pub scan: super::super::data::BssTable, pub pin: Option<Mac>, pub home: Option<Mac>, pub gw_mac: Option<Mac>, pub resp: u16, // STATIONROAM-ACTIVE (B951): `resp`, the DS channels (bit c; bit 0 = no DS element) of the SSID's probe responses to us noted in this dwell; STATIONROAM (B897): the scan table, the BSSID a join is pinned to, the BSS last linked, the gateway MAC S10a's ARP reply named; STATIONREJOIN (B891): the gateway S10a ARPed (for `associate`'s S10a) and the rungs' ring base (0 on the boot's pass)
+    pub short: bool, pub gw: Option<[u8; 4]>, pub ring: usize, pub scan: super::super::data::BssTable, pub pin: Option<Mac>, pub home: Option<Mac>, pub gw_mac: Option<Mac>, pub resp: u16, pub bg: super::super::data::BgScan, // STATIONROAM-BGSCAN (B955): `bg`, the background window's schedule and round-robin cursor; STATIONROAM-ACTIVE (B951): `resp`, the DS channels (bit c; bit 0 = no DS element) of the SSID's probe responses to us noted in this dwell; STATIONROAM (B897): the scan table, the BSSID a join is pinned to, the BSS last linked, the gateway MAC S10a's ARP reply named; STATIONREJOIN (B891): the gateway S10a ARPed (for `associate`'s S10a) and the rungs' ring base (0 on the boot's pass)
 }
 
 impl Heard {
     pub(super) fn new(me: Mac, ssid: Option<String>) -> Heard {
-        Heard { me, target: ssid.map(|s| s.into_bytes()).unwrap_or_default(), bss: None, frames: Vec::new(), watch: None, rates: None, short: false, gw: None, ring: 0, scan: Default::default(), pin: None, home: None, gw_mac: None, resp: 0 }
+        Heard { me, target: ssid.map(|s| s.into_bytes()).unwrap_or_default(), bss: None, frames: Vec::new(), watch: None, rates: None, short: false, gw: None, ring: 0, scan: Default::default(), pin: None, home: None, gw_mac: None, resp: 0, bg: Default::default() }
     }
 }
 
@@ -322,7 +322,7 @@ pub(super) fn keep(bar0: u64, prep: tx::Prep, rxr: rx::Rx, mut seen: rx::Seen, c
     }
     seen.data.clear();
     seen.join.frames.clear();
-    seen.join.watch = seen.join.bss.map(|b| super::super::data::Watch::new(b.bssid, crate::arch::ticks())); seen.join.home = seen.join.bss.map(|b| b.bssid); seen.join.scan.arm(crate::arch::ticks()); // STATIONROAM (B897): the BSS linked, the first scan window ROAM_SCAN_MS out
+    seen.join.watch = seen.join.bss.map(|b| super::super::data::Watch::new(b.bssid, crate::arch::ticks())); seen.join.home = seen.join.bss.map(|b| b.bssid); seen.join.scan.arm(crate::arch::ticks()); seen.join.bg.arm(crate::arch::ticks()); // STATIONROAM-BGSCAN (B955): the first background window ROAM_BG_MS out; STATIONROAM (B897): the BSS linked, the first scan window ROAM_SCAN_MS out
     let next = link.tx_next(); let mut q = tx::Queue::default(); q.ctl = rate_ctl(seen.join.rates, seen.join.short, rate.rate); // STATIONRATECTL (B881): the rate controller starts at `pick_rate`'s rate, owned by STATION with the queue
     *STATION.lock() = Some(Station { bar0, ch, prep, rxr, seen, link, w, q, lost: None, rate }); rejoin_spawn(); // STATIONREJOIN (B891): the station task, started once
     serial_println!("[wifi10] station kept tx_next={} — the TX ring and the receiver stay armed for the stack (WIFIDHCP B831)", next);
@@ -698,24 +698,27 @@ fn roam_step() {
             rx::scan_filter(st.bar0, true, &mut st.w);
             return;
         }
+        if bg_open(st, quiet, now) { return; } // STATIONROAM-BGSCAN (B955): a busy station's background window, every ROAM_BG_MS
         if !st.seen.join.scan.ended(now) {
             return;
         }
-        if st.seen.join.home.is_some() && quiet && st.q.in_flight() == 0 {
-            g.take().map(|st| (st, None)) // STATIONROAM-XCHAN (B898): the window stays open and wide; the dwells extend it, outside the lock
+        if st.seen.join.home.is_some() && quiet && st.q.in_flight() == 0 && !st.seen.join.bg.window { // STATIONROAM-BGSCAN (B955): a quiet background window never becomes the full sweep
+            g.take().map(|st| (st, None, false)) // STATIONROAM-XCHAN (B898): the window stays open and wide; the dwells extend it, outside the lock
+        } else if bg_go(st, now) {
+            g.take().map(|st| (st, None, true)) // STATIONROAM-BGSCAN (B955): ONE PS-announced dwell, outside the lock, inside the open window
         } else {
             st.seen.join.scan.close();
             rx::scan_filter(st.bar0, false, &mut st.w);
             let Some(home) = st.seen.join.home else { return };
             let Some(to) = super::super::data::roam_pick(Some(home), st.ch as u8, &st.seen.join.scan) else { return };
-            g.take().map(|st| (st, Some(to)))
+            g.take().map(|st| (st, Some(to), false))
         }
     };
-    let Some((mut st, pick)) = taken else { return };
+    let Some((mut st, pick, bg)) = taken else { return };
     let to = match pick {
         Some(p) => p,
         None => {
-            let swept = sweep(&mut st, "idle");
+            let swept = if bg { bgscan(&mut st) } else { sweep(&mut st, "idle") }; // STATIONROAM-BGSCAN (B955): one dwell, the window closed and the pick made below as for the sweep
             st.seen.join.scan.close();
             rx::scan_filter(st.bar0, false, &mut st.w);
             if swept.is_err() {
@@ -877,4 +880,108 @@ fn dwell(st: &mut Station) -> (u32, u32) {
         rx::poll(st.bar0, &mut st.rxr, &mut st.seen, st.ch, left * 1000, &mut st.w);
     }
     (r.sent() as u32, super::super::data::answered(ch, st.seen.join.resp) as u32)
+}
+
+// ── STATIONROAM-BGSCAN (rmbp-ledger B955): one PS-announced off-channel dwell per window on a busy station ─────────────────────────
+
+/// `roam_step`, under `STATION`, after the 60 s window's `due`: on a linked station that is NOT quiet, with no window open and the
+/// background window due (`data::BgScan::due`, every `ROAM_BG_MS`): a window opens (`BssTable::open_bg`: the 60 s schedule untouched)
+/// with BEACPROMISC on (`rx::scan_filter`), and the station keeps serving traffic on its home channel for `ROAM_WINDOW_MS`, so the home
+/// BSS's beacon RSSI is fresh for `roam_pick`. `true` = opened (the pass ends).
+fn bg_open(st: &mut Station, quiet: bool, now: u64) -> bool {
+    if quiet || st.seen.join.home.is_none() || st.seen.join.scan.is_open() || !st.seen.join.bg.due(now) {
+        return false;
+    }
+    st.seen.join.scan.open_bg(now);
+    st.seen.join.bg.window = true;
+    rx::scan_filter(st.bar0, true, &mut st.w);
+    true
+}
+
+/// `roam_step`, under `STATION` (the reap done by `service`), at the end of any window that did not take the full sweep: the gate
+/// (`data::BgScan::gate`: at most `ROAM_BG_QMAX` frames in flight). `true` = the Station is taken for `bgscan`; a refusal is counted and
+/// said on the first of a streak, and the window closes as before.
+fn bg_go(st: &mut Station, now: u64) -> bool {
+    if st.seen.join.home.is_none() {
+        return false;
+    }
+    let n = st.q.in_flight();
+    match st.seen.join.bg.gate(n, now) {
+        Ok(()) => true,
+        Err(say) => {
+            if say {
+                serial_println!(
+                    "[wifi10] station bgscan refused=queue in_flight={} max={} -> refused:queue — said once per streak (STATIONROAM-BGSCAN B955)",
+                    n, super::super::data::ROAM_BG_QMAX
+                );
+            }
+            false
+        }
+    }
+}
+
+/// ONE background dwell on a Station TAKEN out of `STATION` (no lock held; `tune` sleeps), inside the open window: the channel from the
+/// round-robin cursor (`BgScan::channel` over `data::dwell_plan(home)`); the queue reaped empty first (`tx::reap` + `rx::poll` slices, at
+/// most `ROAM_BG_DRAIN_MS`: `fire_frame`'s status spin would consume an in-flight frame's status); a Null data frame with the Power
+/// Management bit (`build_null_data_pm`, §9.2.4.1.7) on the Link's next ring frame through `tx::fire_frame` at CCK 1 (`pick_rate`'s
+/// shape, never `tx::Queue`) — the AP's ACK required, so it buffers our frames while we are away (else a PM=0 Null and `failed:ps-ack`,
+/// no dwell); then `retune` + `dwell` (B951's one probe, the early end) and `retune` home; then a PM=0 Null (`ps_end=`; a lost ACK is
+/// healed by our next data frame, PM=0). The AP's buffered frames wait in `seen.data` until the Station is back. `Err` only when the
+/// home channel could not be restored (`roam_step` then loses the station, `why=tune`). Said once per dwell.
+fn bgscan(st: &mut Station) -> Result<u32, &'static str> {
+    use super::super::data;
+    let home = st.ch as u8;
+    let t0 = crate::arch::ticks();
+    let c = st.seen.join.bg.channel(home);
+    let Some(bssid) = st.seen.join.home else { return Ok(0) };
+    let me = st.link.mac();
+    tx::reap(st.bar0, &mut st.q, t0);
+    let drained = st.q.in_flight();
+    while st.q.in_flight() > 0 && crate::arch::ticks().saturating_sub(t0) < data::ROAM_BG_DRAIN_MS {
+        rx::poll(st.bar0, &mut st.rxr, &mut st.seen, st.ch, 1000, &mut st.w);
+        tx::reap(st.bar0, &mut st.q, crate::arch::ticks());
+    }
+    let (mut ps, mut ps_end, mut probes, mut answered, mut dwelt) = ("-", "-", 0u32, 0u32, 0u64);
+    let mut back: Result<(), &'static str> = Ok(());
+    let verdict = if st.q.in_flight() > 0 {
+        "failed:drain"
+    } else {
+        let n = st.link.reserve();
+        let on = wifi_core::ieee80211::build_null_data_pm(me, bssid, 0, true);
+        let r = tx::fire_frame(st.bar0, &st.prep, &on, st.ch, n, "bg-ps-on", tx::RATE_1M, &mut st.w);
+        ps = if r.sent() && r.acked { "ack" } else { "noack" };
+        let mut v = "done";
+        if ps == "ack" {
+            let d0 = crate::arch::ticks();
+            if retune(st, c).is_ok() {
+                let (s, a) = dwell(st);
+                probes = s;
+                answered = a;
+            } else {
+                v = "failed:tune";
+            }
+            dwelt = crate::arch::ticks().saturating_sub(d0);
+            back = retune(st, home);
+            if back.is_err() {
+                v = "failed:tune";
+            }
+        } else {
+            v = "failed:ps-ack";
+        }
+        if back.is_ok() {
+            let n = st.link.reserve();
+            let off = wifi_core::ieee80211::build_null_data_pm(me, bssid, 0, false);
+            let r = tx::fire_frame(st.bar0, &st.prep, &off, st.ch, n, "bg-ps-off", tx::RATE_1M, &mut st.w);
+            ps_end = if r.sent() && r.acked { "ack" } else { "noack" };
+        }
+        v
+    };
+    let heard = st.seen.join.scan.e.iter().flatten().filter(|s| s.last_ms >= t0 && s.channel == c).count() as u32;
+    let stall = crate::arch::ticks().saturating_sub(t0);
+    serial_println!(
+        "[wifi10] station bgscan ch={} home={} dwell={} heard={} stall={}ms ps={} ps_end={} probes={} answered={} drained={} refused={} -> {} — the AP buffers while we are away (PM=1 Null), one dwell per window while busy (STATIONROAM-BGSCAN B955)",
+        c, home, dwelt, heard, stall, ps, ps_end, probes, answered, drained, st.seen.join.bg.refused, verdict
+    );
+    st.seen.join.bg.refused = 0;
+    back.map(|_| heard)
 }
