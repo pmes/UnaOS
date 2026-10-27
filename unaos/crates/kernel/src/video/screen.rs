@@ -1963,7 +1963,7 @@ impl Screen {
         #[cfg(feature = "witness")]
         let sprite_box = super::cursor::live_box_relaxed();
         #[cfg(feature = "witness")]
-        let mut over_sprite = false;
+        let mut over_sprite = false; #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] let mut toast_meter = ToastMeter::take(); // TOASTMETER (SHADOWDAMAGE rmbp-ledger B865): the live overlay boxes by `wm::overlay_row`, read once after `occ` (struct at this file's tail). LINE-NEUTRAL fold, code first.
         // WC-I — the union of the spans this present ACTUALLY copies to glass, accumulated as they
         // are copied. Not the damage set and not the clipped rects: the subtraction is why those
         // three differ, and the only rectangle that can convict the desktop of writing into a window
@@ -2015,7 +2015,7 @@ impl Screen {
                         let seg = (gap_end - xs) * bpp;
                         if off + seg <= self.back_store.len() {
                             super::blitter::a11yfilter::each(self.info.pixel_format, bpp, &self.back_store[off..off + seg], |i, c| self.front.blit(off + i, c)); // A11YFILTERS (B705): the desktop layer's span filtered at the copy (BP-video-25)
-                            flushed += seg as u64;
+                            flushed += seg as u64; #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] { toast_meter.span(y, xs, gap_end); } // TOASTMETER (B865): did this published span land on a live overlay box? Latched per present. LINE-NEUTRAL fold, code first.
                             // WC-I — this span reached glass; fold it into the present's union.
                             // Inside the length guard, so a span the bounds check rejected is not
                             // claimed as a write.
@@ -2055,7 +2055,7 @@ impl Screen {
             let span_end = ((y1 - 1) * stride + x1) * bpp;
             self.front.flush_range(span_start, span_end - span_start); // ZOOMFLUSH (B859): this flush names the rect's rows to the lens (`zoom::flushed`); ZOOMFURN's note here retired.
         }
-        self.last_flush_bytes = flushed;
+        self.last_flush_bytes = flushed; #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] { toast_meter.frame(); } // TOASTMETER (B865): one flicker frame per desktop present that published over a live overlay. LINE-NEUTRAL fold, code first.
         // PTRREPAINT — THE ABSORB, and it is the half that keeps the withheld copy honest.
         //
         // The loop above did not write the sprite's pixels. The arrow therefore never left the glass
@@ -2757,4 +2757,57 @@ fn desk_window_occluders(occ: &mut alloc::vec::Vec<(usize, usize, usize, usize)>
 #[inline(always)]
 fn desk_window_occluders(occ: &mut alloc::vec::Vec<(usize, usize, usize, usize)>) -> usize {
     super::wm::occluders(occ) // WINDOWCAP-2: growable, no staging copy
+}
+
+// TOASTMETER (SHADOWDAMAGE rmbp-ledger B865; BP-video-17, video.md §5 TOASTFLICKER B815's owed meter) — TAIL-APPENDED so
+// no line above moves. `flicker_frames` for the overlays: a desktop present whose serial span loop PUBLISHED a span over
+// a live overlay box (a toast card, the Center, the launcher, ...: `wm::overlay_row`, the one predicate the occluder
+// sets ask) counts one frame. The boxes are read once, after the occluder snapshot and before the loop, so a hit is a
+// span the subtraction let through over a row that was live by then (a subtraction miss, or an overlay that went live
+// between the two reads). Residual (owed TOASTMETERRACE): an overlay that goes live DURING the loop is not seen; the
+// VUG-PAR band path runs only with an empty occluder set and is not metered. Counter and reader on every x86 `wc`
+// build (`tests toastcap` is not witness-gated); the detector is witness-only.
+
+/// Desktop presents that published over a live overlay box since boot.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static OVERLAY_FLICKER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `tests toastcap`'s `flicker_frames=` source (0 on a build without the witness detector).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn overlay_flicker_frames() -> u32 {
+    OVERLAY_FLICKER.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// One present's overlay meter: the boxes (at most 8; notify's 3 cards + the Center fill half) and the latch.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+struct ToastMeter {
+    boxes: [(usize, usize, usize, usize); 8],
+    n: usize,
+    hit: bool,
+}
+
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+impl ToastMeter {
+    fn take() -> Self {
+        let mut boxes = [(0usize, 0usize, 0usize, 0usize); 8];
+        let n = super::wm::overlay_boxes(&mut boxes);
+        ToastMeter { boxes, n, hit: false }
+    }
+
+    /// The span `[x0, x1)` of row `y` reached the glass.
+    #[inline]
+    fn span(&mut self, y: usize, x0: usize, x1: usize) {
+        if self.hit || self.n == 0 {
+            return;
+        }
+        self.hit = self.boxes[..self.n].iter().any(|&(bx, by, bw, bh)| {
+            y >= by && y < by.saturating_add(bh) && x0 < bx.saturating_add(bw) && bx < x1
+        });
+    }
+
+    fn frame(self) {
+        if self.hit {
+            OVERLAY_FLICKER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }

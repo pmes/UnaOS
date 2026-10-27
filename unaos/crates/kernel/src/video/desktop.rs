@@ -3599,22 +3599,22 @@ fn shim_present_label() -> &'static str {
 }
 
 // A11YFILTER (rmbp-ledger B857; BP-video-25, video.md §5 A11YSHADOW B816's owed STALE-only setter) — TAIL-APPENDED so no
-// line above moves. The epoch re-lay (`wm::a11yshadow::track`) takes `shadows_relay`: a colour-filter change's own call
-// (`a11yfilter::changed`) damages every window right after its bump, so the re-lay of THAT epoch only sets STALE; any
-// other epoch move (CONTRAST bumps with no damage of its own and leans on this one) keeps `shadows_stale`'s damage-all.
+// line above moves. The epoch re-lay (`wm::a11yshadow::track`) takes `shadows_relay`. RULE (SHADOWDAMAGE B865): every bumper that
+// damages every window itself stores its epoch here (filter `a11yfilter::changed`, CONTRAST `theme::contrast_bumped`, the lens
+// engage, appearance `install`), and a re-lay of THE LAST COVERED EPOCH only sets STALE; an uncovered bumper still walks.
 
-/// The epoch a colour-filter change's own damage-all covers (`u32::MAX` = none yet).
+/// The last covered epoch: the latest one a bumper's own damage-all covers (`u32::MAX` = none yet).
 static COVERED: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Re-lays that took the damage-all (`shadows_stale`) since boot (`tests a11yfilters`' `extra_pass=`).
 static RELAY_WALKS: AtomicU32 = AtomicU32::new(0);
 
-/// `a11yfilter::changed`: the epoch its bump will make, stored BEFORE the bump (Release), so a pass whose Acquire read
+/// Every covering bumper: the epoch its bump will make, stored BEFORE the bump (Release), so a pass whose Acquire read
 /// of the epoch sees the bump sees this too. A concurrent bump makes it miss: the re-lay then damages (conservative).
 pub fn shadows_covered(e: u32) {
     COVERED.store(e, Ordering::Release);
 }
 
-/// The epoch re-lay at epoch `e`: STALE alone when a filter change's damage covers `e`, else [`shadows_stale`].
+/// The epoch re-lay at epoch `e`: STALE alone when `e` is the last covered epoch, else [`shadows_stale`] (an uncovered bump).
 pub(super) fn shadows_relay(e: u32) {
     if COVERED.load(Ordering::Acquire) == e {
         STALE.store(true, Ordering::Release);

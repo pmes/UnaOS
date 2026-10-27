@@ -513,7 +513,7 @@ fn free_surf(st: &St) -> usize {
 
 /// Re-seat every card at its slot (newest on top) and publish the slots for the press router.
 fn restack(st: &mut St, pw: usize) {
-    let mut packed: [Option<Card>; STACK_MAX] = [None; STACK_MAX];
+    let mut packed: [Option<Card>; STACK_MAX] = [None; STACK_MAX]; let (mut moves, mut nm) = ([(wm::WIN_NONE, 0usize, 0usize); STACK_MAX], 0usize); // RESTACKPASS (SHADOWDAMAGE rmbp-ledger B865): the cards' new rects first, moved together below. LINE-NEUTRAL fold, code first.
     let mut k = 0;
     for c in st.cards.iter().flatten() {
         packed[k] = Some(*c);
@@ -525,7 +525,7 @@ fn restack(st: &mut St, pw: usize) {
             Some(c) => {
                 if c.win != wm::WIN_NONE {
                     let (x, y, _, _) = card_rect(pw, i);
-                    wm::move_to(c.win, x, y);
+                    moves[nm] = (c.win, x, y); nm += 1; // RESTACKPASS (B865): collected, not moved one by one (each `move_to` was a composite)
                 }
                 SLOT_SEQ[i].store(c.n.seq, Ordering::Release);
                 SLOT_BTN[i].store(c.n.has_button(), Ordering::Release);
@@ -535,7 +535,7 @@ fn restack(st: &mut St, pw: usize) {
                 SLOT_BTN[i].store(false, Ordering::Release);
             }
         }
-    }
+    } restack_seat(&moves[..nm]); // RESTACKPASS (B865): ONE `wm::move_set` re-seats the stack under one composite (fn at this file's tail). LINE-NEUTRAL fold, code first.
 }
 
 fn close_card(st: &mut St, i: usize, by: &str) -> Option<Note> {
@@ -1193,14 +1193,14 @@ pub fn toastcap_selftest() {
     MUTE.store(false, Ordering::Relaxed);
     restore(h);
     let (dialogs, primary_max, ret_ok, esc_ok) = super::dialog::toastcap_leg();
-    let (readback, leaks, flicker) = toastflicker_leg(); // TOASTFLICKER (B815) M3: the live read-back leg (file tail)
-    let toast_ok = flicker != "FAIL" && posted == N && shown_max == STACK_MAX && queued == N - STACK_MAX && dropped == 0 && hover_ok && shown == N && drained;
+    let (readback, leaks, flicker) = toastflicker_leg(); let (restack_passes, flicker_frames) = restack_meter(); // TOASTFLICKER (B815) M3: the live read-back leg (file tail). SHADOWDAMAGE (B865): the leg's widest re-seat in passes and its overlay flicker frames
+    let toast_ok = flicker != "FAIL" && posted == N && shown_max == STACK_MAX && queued == N - STACK_MAX && dropped == 0 && hover_ok && shown == N && drained && flicker_frames == 0 && restack_passes <= 1;
     let ok = toast_ok && dialogs > 0 && primary_max == 1 && ret_ok && esc_ok;
     let w = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!(
-        ":: TOASTCAP: posted={} shown_max={} queued={} dropped={} hover_pause={} dialogs={} primary_max={} return={} esc={} -> {} :: shown={} drained={} card_ms={} held={} resumed={} left={} readback={} backdrop_leaks={} flicker={}",
+        ":: TOASTCAP: posted={} shown_max={} queued={} dropped={} hover_pause={} dialogs={} primary_max={} return={} esc={} -> {} :: shown={} drained={} card_ms={} held={} resumed={} left={} readback={} backdrop_leaks={} flicker={} restack_passes={} flicker_frames={}",
         posted, shown_max, queued, dropped, w(hover_ok), dialogs, primary_max, w(ret_ok), w(esc_ok), if ok { "PASS" } else { "FAIL" },
-        shown, w(drained), CARD_MS, w(held), w(resumed), w(left), readback, leaks, flicker
+        shown, w(drained), CARD_MS, w(held), w(resumed), w(left), readback, leaks, flicker, restack_passes, flicker_frames
     );
 }
 
@@ -1536,7 +1536,7 @@ fn toastflicker_leg() -> (usize, usize, &'static str) {
     if super::zoom::want().0 >= 2 {
         return (0, 0, "skip(zoom)");
     }
-    super::notifypane::bypass(true, true);
+    super::notifypane::bypass(true, true); restack_meter_arm(); // RESTACKPASS/TOASTMETER (SHADOWDAMAGE B865): the leg's restack passes and overlay flicker frames start here (file tail). LINE-NEUTRAL fold, code first.
     let dnd0 = DND.swap(false, Ordering::Relaxed);
     for k in 0..STACK_MAX {
         let t = [b'F', b'L', b'0' + k as u8];
@@ -1609,11 +1609,56 @@ fn toastflicker_leg() -> (usize, usize, &'static str) {
     }
     DND.store(dnd0, Ordering::Relaxed);
     super::notifypane::bypass(false, false);
-    let verdict = if leaks > 0 { "FAIL" } else if readback == 0 { "skip(unread)" } else { "ok" };
+    restack_meter_take(); let verdict = if leaks > 0 { "FAIL" } else if readback == 0 { "skip(unread)" } else { "ok" }; // RESTACKPASS/TOASTMETER (B865): taken before the verdict. LINE-NEUTRAL fold, code first.
     (readback, leaks, verdict)
 }
 
 #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
 fn toastflicker_leg() -> (usize, usize, &'static str) {
     (0, 0, "skip(arch)") // aarch64: `open_row` opens no overlay row there (wire-only), so there is no card to read back
+}
+
+// ── RESTACKPASS / TOASTMETER (SHADOWDAMAGE rmbp-ledger B865; BP-video-17, video.md §5 TOASTFLICKER B815's owed) ─────
+// TAIL-APPENDED so no line above moves. A show or close re-seated up to 3 cards with one `wm::move_to` each, and every
+// `move_to` ends in a composite, so the stack's motion took one pass per moved card. `restack` now computes every card's
+// new rect first and hands them to `wm::move_set` (each row through wm's own mover; the tail composites withheld for
+// this task and run once), so the stack moves in ONE pass. `tests toastcap`'s leg reads the widest re-seat in passes
+// (`restack_passes=`) and the desktop presents that published over a live overlay (`flicker_frames=`, screen.rs's
+// TOASTMETER). Seam: OVERLAYARM2 (B866) retires `owns_row` in this file; these edits are restack's three folds, the
+// leg's two folds, the TOASTCAP line and this block.
+
+/// The widest re-seat in composite passes since the leg armed it.
+static RESTACK_MAX: AtomicU32 = AtomicU32::new(0);
+/// The leg's readings: `(restack_passes, flicker_frames)`.
+static LEG_RESTACK: AtomicU32 = AtomicU32::new(0);
+static LEG_FLICKER: AtomicU32 = AtomicU32::new(0);
+/// The overlay flicker count when the leg armed.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static FLICK0: AtomicU32 = AtomicU32::new(0);
+
+/// `restack`'s re-seat: every moved card in ONE `wm::move_set`, its composite passes kept (widest).
+fn restack_seat(moves: &[(wm::WinId, usize, usize)]) {
+    if moves.is_empty() {
+        return;
+    }
+    let p0 = wm::comp_scratch_counts().0;
+    wm::move_set(moves);
+    RESTACK_MAX.fetch_max(wm::comp_scratch_counts().0.wrapping_sub(p0), Ordering::Relaxed);
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn restack_meter_arm() {
+    RESTACK_MAX.store(0, Ordering::Relaxed);
+    FLICK0.store(super::screen::overlay_flicker_frames(), Ordering::Relaxed);
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn restack_meter_take() {
+    LEG_RESTACK.store(RESTACK_MAX.load(Ordering::Relaxed), Ordering::Relaxed);
+    LEG_FLICKER.store(super::screen::overlay_flicker_frames().wrapping_sub(FLICK0.load(Ordering::Relaxed)), Ordering::Relaxed);
+}
+
+/// `(restack_passes, flicker_frames)` from the last live leg (0, 0 where no leg ran: aarch64, headless, a skip).
+fn restack_meter() -> (u32, u32) {
+    (LEG_RESTACK.load(Ordering::Relaxed), LEG_FLICKER.load(Ordering::Relaxed))
 }
