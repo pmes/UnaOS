@@ -768,7 +768,7 @@ refs/heads/exec-rmbp-zoompanel   1d6125a56 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-stationwatch   ac014b3f2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-ticketowner   2814de2ab FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-memline3   079ff61d8 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-poison2   079ff61d8 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-poison2   eade2bf40 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-overlayarm   de8dd3821 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zoomfurn   56f9fa66f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-textscale3   079ff61d8 IN-FLIGHT cut 2026-10-27

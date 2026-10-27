@@ -61,20 +61,20 @@ unsafe impl GlobalAlloc for Locked<Heap> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut result = null_mut();
         arch::without_interrupts(|| {
-            let mut heap = self.inner.lock();
-            match heap.allocate_first_fit(layout) {
-                Ok(ptr) => { result = ptr.as_ptr(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] high_note(heap.used()); #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_alloc(result as usize, layout.size()); } // MEMLINE (B677): the window's high-water, under the heap lock. LINE-NEUTRAL append, code first; MEMLINE2 (B821): the owner census, same lock
-                Err(_) => {}
+            let mut heap = self.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::check(&self.inner); // POISON2 (B846): a death-released heap lock is CHECKED at its next allocation (body at the tail). LINE-NEUTRAL append
+            match { #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_ALLOC); heap.allocate_first_fit(layout) } {
+                Ok(ptr) => { result = ptr.as_ptr(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] high_note(heap.used()); #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_alloc(result as usize, layout.size()); #[cfg(target_arch = "x86_64")] heappoison::op(0); } // MEMLINE (B677): the window's high-water, under the heap lock. LINE-NEUTRAL append, code first; MEMLINE2 (B821): the owner census, same lock
+                Err(_) => { #[cfg(target_arch = "x86_64")] heappoison::op(0); }
             }
         });
-        result
+        #[cfg(target_arch = "x86_64")] heappoison::say(); result
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         arch::without_interrupts(|| {
             let mut heap = self.inner.lock();
             unsafe {
-                heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout); #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_free(ptr as usize); // MEMLINE2 (B821): a tracked block leaves the owner census under the heap lock, whoever frees it. LINE-NEUTRAL append, code first
+                #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_FREE); heap.deallocate(core::ptr::NonNull::new(ptr).unwrap(), layout); #[cfg(all(target_arch = "x86_64", feature = "wc"))] census::on_free(ptr as usize); #[cfg(target_arch = "x86_64")] heappoison::op(0); // MEMLINE2 (B821): a tracked block leaves the owner census under the heap lock, whoever frees it. LINE-NEUTRAL append, code first
             }
         });
     }
@@ -126,7 +126,7 @@ pub struct HeapCensus {
 pub fn heap_census(align: usize) -> HeapCensus {
     let mut c = HeapCensus { used: 0, free: 0, largest_run: 0 };
     arch::without_interrupts(|| {
-        let mut heap = ALLOCATOR.lock();
+        let mut heap = ALLOCATOR.lock(); #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_CENSUS); // POISON2 (B846): the trial loop mutates the hole list
         c.used = heap.used();
         c.free = heap.free();
         let step = align.max(1);
@@ -151,7 +151,7 @@ pub fn heap_census(align: usize) -> HeapCensus {
                 hi = mid - step;
             }
         }
-        c.largest_run = lo;
+        c.largest_run = lo; #[cfg(target_arch = "x86_64")] heappoison::op(0);
     });
     c
 }
@@ -475,5 +475,165 @@ pub mod census {
             drop(heap);
         });
         s
+    }
+}
+
+// POISON2 (rmbp-ledger B846, BP-cores-14) — THE HEAP'S DEATH MARK, CHECKED. STACKGUARD3 (B832) gave the heap lock back on
+// its holder's death through `sync::release_task` and POISONED it, but nothing read the mark: `linked_list_allocator`
+// 0.10.6 keeps its hole list private (`Heap.holes`; `HoleList::first_hole` is `cfg(test)`, `Heap::debug` is
+// `cfg(fuzzing)`), so the list cannot be walked. The rule the crate permits: an in-op marker [`OP`] written ONLY with the
+// heap lock held says whether a holder is inside the crate's list mutation (an alloc's split, a free's insert/merge, the
+// census's trial loop). The next ALLOCATION's take runs [`check`] (`Mutex::take_poison`: one load while nothing is
+// poisoned; a hit clears the slot): OP clear = the dead holder was outside any mutation, the list is whole -> released;
+// OP set = it died inside one, the list may be half-applied -> said `torn=1` and KEPT (re-initialising needs a fresh
+// region from the memory map: owed HEAPREGION). The line is said after the lock drops ([`say`] on alloc's tail), never
+// under it. At the tail: no line above moves. x86 only (the registry and the poison table are x86's).
+#[cfg(target_arch = "x86_64")]
+pub mod heappoison {
+    //! CHARTER: Kernel — kernel-by-ruling (B414 LOCKREG): the heap lock's poison check (POISON2 B846).
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+
+    use super::{Heap, Mutex, ALLOCATOR};
+
+    pub const OP_ALLOC: u8 = 1;
+    pub const OP_FREE: u8 = 2;
+    pub const OP_CENSUS: u8 = 3;
+
+    /// The crate mutation in flight (0 = none). Written only with the heap lock held.
+    static OP: AtomicU8 = AtomicU8::new(0);
+    /// Checks made (a poisoned take found), and how many read the list torn.
+    static CHECKS: AtomicU64 = AtomicU64::new(0);
+    static TORN: AtomicU64 = AtomicU64::new(0);
+    static LAST_TORN: AtomicBool = AtomicBool::new(false);
+    /// The last check's record for its line: 0 = nothing to say, else `0x80 | op`.
+    static PENDING: AtomicU8 = AtomicU8::new(0);
+
+    /// Mark (`kind`) or clear (0) the crate mutation in flight. Caller holds the heap lock.
+    #[inline(always)]
+    pub(super) fn op(kind: u8) {
+        OP.store(kind, Relaxed);
+    }
+
+    /// The take's check (caller holds `heap`): one load while nothing is poisoned.
+    #[inline(always)]
+    pub(super) fn check(heap: &Mutex<Heap>) {
+        if heap.take_poison() {
+            checked();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn checked() {
+        let k = OP.swap(0, Relaxed);
+        CHECKS.fetch_add(1, AcqRel);
+        if k != 0 {
+            TORN.fetch_add(1, Relaxed);
+        }
+        LAST_TORN.store(k != 0, Release);
+        PENDING.store(0x80 | k, Release);
+    }
+
+    /// Say a pending check's line (alloc's tail, the heap lock released). One load while nothing is pending.
+    #[inline(always)]
+    pub(super) fn say() {
+        if PENDING.load(Relaxed) != 0 {
+            said();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn said() {
+        let r = PENDING.swap(0, AcqRel);
+        if r == 0 {
+            return;
+        }
+        let checks = CHECKS.load(Relaxed);
+        match r & 0x0F {
+            0 => serial_println!("[heap] poison checked torn=0 -> released checks={} (POISON2 B846: the dead holder was outside the hole-list mutation)", checks),
+            k => serial_println!(
+                "[heap] poison checked torn=1 op={} -> kept (linked_list_allocator 0.10.6 has no hole walk; owed HEAPREGION) checks={} torn_total={}",
+                match k {
+                    OP_ALLOC => "alloc",
+                    OP_FREE => "free",
+                    OP_CENSUS => "census",
+                    _ => "?",
+                },
+                checks,
+                TORN.load(Relaxed)
+            ),
+        }
+    }
+
+    // ── `tests lockreg`'s heap leg (sync.rs `heap_leg`). STATE: 0 armed, 1 held, 2 claimed by the tester (it releases
+    // through `release_task`), 3 the holder's bound passed first (it unlocked itself, unpoisoned). ──
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    static HOLDER: AtomicU64 = AtomicU64::new(0);
+
+    pub fn arm() {
+        HOLDER.store(0, Relaxed);
+        STATE.store(0, Release);
+    }
+    pub fn checks() -> u64 {
+        CHECKS.load(Acquire)
+    }
+    pub fn last_torn() -> bool {
+        LAST_TORN.load(Acquire)
+    }
+    pub fn held() -> bool {
+        STATE.load(Acquire) == 1
+    }
+    pub fn holder() -> u64 {
+        HOLDER.load(Acquire)
+    }
+    /// The tester takes the hold over (1 -> 2); `false` = the holder's bound passed first.
+    pub fn claim() -> bool {
+        STATE.compare_exchange(1, 2, AcqRel, Acquire).is_ok()
+    }
+
+    /// `lockreg-heap`: take the heap lock masked, end the hold without a release (the guard forgotten: a death the
+    /// guard's Drop never sees), and wait — allocating nothing — until the tester claims it, or 500 ms (TSC) pass.
+    pub fn hold_task(_: usize) {
+        crate::arch::without_interrupts(|| {
+            let g = ALLOCATOR.inner.lock();
+            HOLDER.store(crate::sync::here_tid(), Release);
+            core::mem::forget(g);
+            STATE.store(1, Release);
+            let hz = crate::arch::apic::tsc_hz().max(1_000_000);
+            // SAFETY: `rdtsc` has no preconditions.
+            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+            while STATE.load(Acquire) == 1 {
+                // SAFETY: as above.
+                let now = unsafe { core::arch::x86_64::_rdtsc() };
+                if now.wrapping_sub(t0) > hz / 2 && STATE.compare_exchange(1, 3, AcqRel, Acquire).is_ok() {
+                    // SAFETY: this task took the lock above and forgot its guard; nobody claimed it (1 -> 3), so no other
+                    // release can run.
+                    unsafe { ALLOCATOR.inner.force_unlock() };
+                    return;
+                }
+                core::hint::spin_loop();
+            }
+        });
+    }
+
+    /// The tester claimed the hold (state 2) but `release_task` released nothing: end it, unpoisoned.
+    pub fn unlock_claimed() {
+        if STATE.load(Acquire) == 2 {
+            // SAFETY: state 2 = the holder forgot its guard and handed the hold to the claimer, who calls this once.
+            unsafe { ALLOCATOR.inner.force_unlock() };
+        }
+    }
+
+    /// One allocation (the take that runs [`check`]) and its free.
+    pub fn probe() {
+        let l = core::alloc::Layout::new::<u64>();
+        // SAFETY: a non-zero-size layout; the block is freed with the same layout.
+        unsafe {
+            let p = core::alloc::GlobalAlloc::alloc(&ALLOCATOR, l);
+            if !p.is_null() {
+                core::alloc::GlobalAlloc::dealloc(&ALLOCATOR, p, l);
+            }
+        }
     }
 }
