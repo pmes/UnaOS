@@ -4,14 +4,17 @@
 //! NLE5 (SR204): the editor export. Over NLE1's two synthetic sources (utp1 + PCM16 MP4) the exported PNG sequence
 //! decodes back to the render's frames (counters equal the schedule's), the raw stream is the render's bytes, the WAV
 //! and the PCM16 MP4 carry the render's samples; the WAV header and the f32 -> i16 quantiser are known answers.
+//! NLE5B (SR206): the H.264 export's movie decodes, sample by sample, to the encoder's reconstruction.
 
 use std::path::PathBuf;
 
 use gneiss_pal::dsp::demux::{Codec, Demuxer, TrackKind};
 use gneiss_pal::dsp::image::decode_png;
-use gneiss_pal::dsp::video::TestPattern;
+use gneiss_pal::dsp::video::{Pixels, TestPattern, decoder_for};
+use h264enc_core::yuv::I420;
+use h264enc_core::{Config, Encoder};
 use stria::nle::{RenderSink, SYNTH_RATE, Sources, render, synth_sample, synth_source};
-use stria::nle_export::{AudioOut, PngSequence, RawSequence, export, pcm16, wav_header};
+use stria::nle_export::{AudioOut, H264Encoder, PngSequence, RawSequence, export, pcm16, wav_header};
 use timeline_core::schedule::schedule;
 use timeline_core::{Clip, Kind, SourceId, Timeline};
 
@@ -170,5 +173,97 @@ fn mp4_audio_round_trip() {
     assert_eq!(t.codec, Codec::Pcm { bits: 16, float: false, big_endian: false });
     let data: Vec<u8> = d.track_samples(0).flat_map(|s| d.packet_at(s).data).collect();
     let got: Vec<i16> = data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    assert_eq!(got, want_pcm(&tl, &src));
+}
+
+/// NLE5B: a fresh H264ENC encoder over the render's frames (the same converter and config): its samples, its avcC and
+/// its reconstruction per frame.
+fn fresh_h264(frames: &[Vec<u8>], gop: u32) -> (Vec<Vec<u8>>, Vec<u8>, Vec<[Vec<u8>; 3]>, Vec<I420>) {
+    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop }).unwrap();
+    let (mut samples, mut recon, mut input) = (Vec::new(), Vec::new(), Vec::new());
+    for f in frames {
+        let yuv = I420::from_rgba(64, 48, f).unwrap();
+        samples.push(enc.encode(&yuv.as_yuv420()).unwrap().avcc_sample());
+        let r = enc.reconstruction();
+        recon.push([r[0].to_vec(), r[1].to_vec(), r[2].to_vec()]);
+        input.push(yuv);
+    }
+    (samples, enc.avcc(), recon, input)
+}
+
+fn psnr(a: &[&[u8]], b: &[&[u8]]) -> f64 {
+    let (mut se, mut n) = (0f64, 0f64);
+    for (x, y) in a.iter().zip(b) {
+        assert_eq!(x.len(), y.len());
+        for (&p, &q) in x.iter().zip(y.iter()) {
+            se += (p as f64 - q as f64).powi(2);
+            n += 1.0;
+        }
+    }
+    if se == 0.0 { f64::INFINITY } else { 10.0 * (255.0f64 * 255.0 / (se / n)).log10() }
+}
+
+#[test]
+fn h264_movie_round_trip() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let dir = fresh("h264");
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::Mp4).unwrap();
+    assert_eq!((r.frames, r.files, r.pcm_frames), (35, 1, 35 * PER as u64));
+    assert_eq!(r.fnv, refr.fnv);
+    let mp4 = std::fs::read(dir.join("movie.mp4")).unwrap();
+    assert_eq!(r.bytes, mp4.len() as u64);
+    assert!(!dir.join("audio.mp4").exists() && !dir.join("video.mp4").exists());
+    let (want, avcc, recon, input) = fresh_h264(&refr.frames, 10);
+
+    let d = Demuxer::open(mp4).unwrap();
+    assert_eq!(d.tracks().len(), 2);
+    let vt = &d.tracks()[0];
+    assert_eq!((vt.kind, vt.codec.clone(), vt.width, vt.height), (TrackKind::Video, Codec::Avc, 64, 48));
+    assert_eq!(vt.config, avcc, "the avcC box is the encoder's record");
+    assert_eq!(vt.sample_count, 35);
+    let mut dec = decoder_for(vt).unwrap();
+    let mut frames = Vec::new();
+    for (i, s) in d.track_samples(0).copied().collect::<Vec<_>>().iter().enumerate() {
+        let pk = d.packet_at(s);
+        assert_eq!(pk.keyframe, i % 10 == 0, "sample {i} sync flag");
+        assert_eq!(pk.pts, i as i64, "sample {i} pts at the project fps");
+        assert_eq!(pk.data, want[i], "sample {i} is the encoder's access unit");
+        frames.extend(dec.decode(&pk).unwrap());
+    }
+    frames.extend(dec.flush());
+    assert_eq!(frames.len(), 35);
+    for (i, f) in frames.iter().enumerate() {
+        let Pixels::I420 { y, u, v, .. } = &f.pixels else { panic!("frame {i} not I420") };
+        assert_eq!((f.width, f.height), (64, 48));
+        assert_eq!([y.clone(), u.clone(), v.clone()], recon[i], "frame {i}: decode differs from the reconstruction");
+        let db = psnr(&[y, u, v], &[&input[i].y, &input[i].u, &input[i].v]);
+        assert!(db >= 35.0, "frame {i}: PSNR {db:.2} dB below 35");
+    }
+
+    let at = &d.tracks()[1];
+    assert_eq!((at.kind, at.sample_rate, at.channels), (TrackKind::Audio, SYNTH_RATE, 1));
+    assert_eq!(at.codec, Codec::Pcm { bits: 16, float: false, big_endian: false });
+    let data: Vec<u8> = d.track_samples(1).flat_map(|s| d.packet_at(s).data).collect();
+    let got: Vec<i16> = data.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
+    assert_eq!(got.len(), 35 * PER);
+    assert_eq!(got, want_pcm(&tl, &src));
+}
+
+#[test]
+fn h264_video_plus_wav() {
+    let tl = timeline();
+    let src = sources(&tl);
+    let dir = fresh("h264wav");
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 25)), AudioOut::Wav).unwrap();
+    assert_eq!((r.frames, r.files), (35, 2));
+    let mp4 = std::fs::read(dir.join("video.mp4")).unwrap();
+    let wav = std::fs::read(dir.join("audio.wav")).unwrap();
+    assert_eq!(r.bytes, (mp4.len() + wav.len()) as u64);
+    let d = Demuxer::open(mp4).unwrap();
+    assert_eq!(d.tracks().len(), 1);
+    assert_eq!((d.tracks()[0].codec.clone(), d.tracks()[0].sample_count), (Codec::Avc, 35));
+    let got: Vec<i16> = wav[44..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
     assert_eq!(got, want_pcm(&tl, &src));
 }

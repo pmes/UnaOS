@@ -5,12 +5,15 @@
 //!
 //! CHARTER: Stria — the export half of the non-linear editor: a [`RenderSink`] over [`crate::nle::render`] that hands
 //! each frame to a [`VideoEncoder`] and the PCM to a WAV or a PCM16 MP4; it owns no encoder core (shared-core,
-//! BP-handlers-4: PNG is pixel_core's `encode_rgba`, the MP4 is demux_core's `build::mp4`).
+//! BP-handlers-4: PNG is pixel_core's `encode_rgba`, H.264 is h264enc_core's `Encoder` over its `yuv::I420`, the MP4
+//! is demux_core's `build::mp4`).
 //!
 //! * The ENCODER SEAM is [`VideoEncoder`]: RGBA in, [`Access`] units out, plus the [`VideoConfig`] an MP4 sample entry
 //!   needs and the [`Layout`] the units are stored in. [`PngSequence`] (one `%06d.png` per frame) and
-//!   [`RawSequence`] (one `video.rgba` + a `video.json` sidecar) are the encoders that exist today; the H.264 one is
-//!   NLE5b (one `impl VideoEncoder` over H264ENC's encoder).
+//!   [`RawSequence`] (one `video.rgba` + a `video.json` sidecar) store files; [`H264Encoder`] (NLE5B, LEDGER SR206)
+//!   is H264ENC's encoder fed by its RGBA -> I420 (`h264enc_core::yuv::I420::from_rgba`, the tree's one converter)
+//!   and stores [`Layout::Mp4`]: every access unit an `avc1` sample, muxed at the end in ONE `build::mp4` call with
+//!   the PCM16 track when the audio is [`AudioOut::Mp4`] (`movie.mp4`), alone otherwise (`video.mp4`).
 //! * Audio: [`AudioOut::Wav`] streams RIFF/WAVE PCM16 (`audio.wav`, header patched at the end), [`AudioOut::Mp4`]
 //!   muxes an audio-only `sowt` track (`audio.mp4`) through `build::pcm16_track` + `build::mp4`. The f32 → i16
 //!   quantiser [`pcm16`] inverts the decoders' `s / 32768.0` exactly.
@@ -22,8 +25,11 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use gneiss_pal::dsp::demux::TrackKind;
 use gneiss_pal::dsp::demux::build;
 use gneiss_pal::dsp::image::{PngError, encode_rgba};
+use h264enc_core::yuv::I420;
+use h264enc_core::{Config, Encoder};
 use timeline_core::{Timebase, Timeline};
 
 use crate::nle::{RenderError, RenderSink, Sources, render};
@@ -50,14 +56,17 @@ pub enum Layout {
     FilePerFrame(&'static str),
     /// Every unit appended to `video.<ext>`, with a `video.json` sidecar.
     OneFile(&'static str),
+    /// Every unit one MP4 sample (the [`VideoConfig`] its sample entry), muxed at [`ExportSink::finish`]: `movie.mp4`
+    /// with the PCM16 track under [`AudioOut::Mp4`], else `video.mp4`.
+    Mp4,
 }
 
 /// The encoder seam. RGBA frames in output order go in; zero or more [`Access`] units come out (an encoder with
 /// delay returns them late and the rest from [`flush`](VideoEncoder::flush)).
 ///
-/// NLE5b (H264ENC, LEDGER SR197) implements this once for `h264enc_core::Encoder`: its
+/// [`H264Encoder`] (NLE5B, SR206) implements this once for `h264enc_core::Encoder`: its
 /// `encode -> Access { keyframe, nals }` maps to [`Access`] `{ keyframe, data: Access::avcc_sample() }`, its `avcc()`
-/// to [`VideoConfig`] `{ fourcc: *b"avc1", config_box: Some(*b"avcC"), config: avcc }`, and a `Layout::Mp4` arm
+/// to [`VideoConfig`] `{ fourcc: *b"avc1", config_box: Some(*b"avcC"), config: avcc }`, and the [`Layout::Mp4`] arm
 /// muxes it with the audio in one `build::mp4` call.
 pub trait VideoEncoder {
     fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError>;
@@ -101,6 +110,40 @@ impl VideoEncoder for RawSequence {
     }
 }
 
+/// H.264 through H264ENC (Constrained Baseline, constant QP, an IDR every `gop` frames): each RGBA frame becomes I420
+/// by `h264enc_core::yuv::I420::from_rgba`, then one access unit, stored as its avcC sample. The encoder is built at
+/// the first frame (its size); a later frame of another size is refused (`h264enc_core::Error::FrameSize`).
+pub struct H264Encoder {
+    qp: u8,
+    gop: u32,
+    enc: Option<Encoder>,
+}
+
+impl H264Encoder {
+    /// `qp` 16..=40 and `gop` >= 1 (checked by `Encoder::new` at the first frame).
+    pub fn new(qp: u8, gop: u32) -> H264Encoder {
+        H264Encoder { qp, gop, enc: None }
+    }
+}
+
+impl VideoEncoder for H264Encoder {
+    fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
+        if self.enc.is_none() {
+            self.enc = Some(Encoder::new(Config { width, height, qp: self.qp, gop: self.gop }).map_err(ExportError::H264)?);
+        }
+        let enc = self.enc.as_mut().expect("built above");
+        let yuv = I420::from_rgba(width, height, rgba).map_err(ExportError::H264)?;
+        let au = enc.encode(&yuv.as_yuv420()).map_err(ExportError::H264)?;
+        Ok(vec![Access { keyframe: au.keyframe, data: au.avcc_sample() }])
+    }
+    fn config(&self) -> VideoConfig {
+        VideoConfig { fourcc: *b"avc1", config_box: Some(*b"avcC"), config: self.enc.as_ref().map(Encoder::avcc).unwrap_or_default() }
+    }
+    fn layout(&self) -> Layout {
+        Layout::Mp4
+    }
+}
+
 /// Where the PCM goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioOut {
@@ -127,6 +170,7 @@ pub enum ExportError {
     Io(std::io::Error),
     Png(PngError),
     Render(RenderError),
+    H264(h264enc_core::Error),
 }
 
 impl std::fmt::Display for ExportError {
@@ -135,6 +179,7 @@ impl std::fmt::Display for ExportError {
             ExportError::Io(e) => write!(f, "io: {e}"),
             ExportError::Png(e) => write!(f, "png: {e:?}"),
             ExportError::Render(e) => write!(f, "render: {e}"),
+            ExportError::H264(e) => write!(f, "{e}"),
         }
     }
 }
@@ -188,6 +233,8 @@ pub struct ExportSink {
     one: Option<BufWriter<File>>,
     wav: Option<Wav>,
     pcm: Vec<i16>,
+    /// [`Layout::Mp4`]: (keyframe, sample) per unit, muxed at `finish`.
+    samples: Vec<(bool, Vec<u8>)>,
     afmt: Option<(u32, u16)>,
     size: (u32, u32),
     units: u64,
@@ -205,6 +252,7 @@ impl ExportSink {
             one: None,
             wav: None,
             pcm: Vec::new(),
+            samples: Vec::new(),
             afmt: None,
             size: (0, 0),
             units: 0,
@@ -219,6 +267,7 @@ impl ExportSink {
                 Layout::FilePerFrame(ext) => {
                     std::fs::write(self.dir.join(format!("{:06}.{ext}", self.units)), &u.data)?;
                     self.report.files += 1;
+                    self.report.bytes += u.data.len() as u64;
                 }
                 Layout::OneFile(ext) => {
                     if self.one.is_none() {
@@ -226,9 +275,10 @@ impl ExportSink {
                         self.report.files += 1;
                     }
                     self.one.as_mut().expect("opened above").write_all(&u.data)?;
+                    self.report.bytes += u.data.len() as u64;
                 }
+                Layout::Mp4 => self.samples.push((u.keyframe, u.data)),
             }
-            self.report.bytes += u.data.len() as u64;
             self.units += 1;
         }
         Ok(())
@@ -268,7 +318,7 @@ impl ExportSink {
     }
 
     /// Flush the encoder, close the files (the raw sidecar, the WAV header, the MP4) and report. `tb` is the
-    /// timeline's time base (`1/fps`), written to the raw sidecar.
+    /// timeline's time base (`1/fps`), written to the raw sidecar and the MP4 video track's timescale.
     pub fn finish(mut self, tb: Timebase) -> Result<ExportReport, ExportError> {
         if let Some(e) = self.err.take() {
             return Err(e);
@@ -300,16 +350,56 @@ impl ExportSink {
             self.report.files += 1;
             self.report.bytes += 44 + wav.frames * wav.channels as u64 * 2;
         }
-        if self.audio == AudioOut::Mp4 {
-            if let Some((rate, ch)) = self.afmt {
-                let track = build::pcm16_track(1, rate, ch, &self.pcm, 1024);
-                let mp4 = build::mp4(&[track], &build::Mp4Options::default());
-                std::fs::write(self.dir.join("audio.mp4"), &mp4)?;
-                self.report.files += 1;
-                self.report.bytes += mp4.len() as u64;
-            }
+        let movie = self.video.layout() == Layout::Mp4;
+        let audio = match (self.audio, self.afmt) {
+            (AudioOut::Mp4, Some((rate, ch))) => Some(build::pcm16_track(if movie { 2 } else { 1 }, rate, ch, &self.pcm, 1024)),
+            _ => None,
+        };
+        let mut tracks: Vec<build::MediaTrack> = Vec::new();
+        if movie {
+            tracks.push(self.video_track(tb));
+        }
+        tracks.extend(audio);
+        if !tracks.is_empty() {
+            let name = match (movie, self.audio == AudioOut::Mp4) {
+                (true, true) => "movie.mp4",
+                (true, false) => "video.mp4",
+                (false, _) => "audio.mp4",
+            };
+            let mp4 = build::mp4(&tracks, &build::Mp4Options::default());
+            std::fs::write(self.dir.join(name), &mp4)?;
+            self.report.files += 1;
+            self.report.bytes += mp4.len() as u64;
         }
         Ok(self.report)
+    }
+
+    /// The [`Layout::Mp4`] video track: the encoder's sample entry, timescale = the project's fps (`tb.den`), sample
+    /// `i` at `i * tb.num`.
+    fn video_track(&mut self, tb: Timebase) -> build::MediaTrack {
+        let c = self.video.config();
+        let num = tb.num.max(1) as u32;
+        let spec = build::TrackSpec {
+            id: 1,
+            kind: TrackKind::Video,
+            fourcc: c.fourcc,
+            config_box: c.config_box,
+            codec_id: "",
+            config: c.config,
+            timescale: tb.den as u32,
+            width: self.size.0 as u16,
+            height: self.size.1 as u16,
+            sample_rate: 0,
+            channels: 0,
+            bit_depth: 0,
+            default_duration_ns: num as u64 * 1_000_000_000 / (tb.den as u64).max(1),
+        };
+        let samples = std::mem::take(&mut self.samples)
+            .into_iter()
+            .enumerate()
+            .map(|(i, (keyframe, data))| build::SampleSpec { data, dts: i as i64 * num as i64, pts: i as i64 * num as i64, duration: num, keyframe })
+            .collect();
+        build::MediaTrack { spec, samples }
     }
 }
 

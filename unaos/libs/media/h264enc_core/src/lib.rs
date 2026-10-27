@@ -21,6 +21,7 @@
 //! | [`intra`]       | 8.3 mode decision over h264_core's predictors, 8.3.1.1 mode coding       |
 //! | [`cavlc`]       | 9.2 residual_block_cavlc written, 9.2.1 nC                               |
 //! | [`me`]          | 8.4.1 MV prediction and P_Skip, integer motion search                    |
+//! | [`yuv`]         | RGBA -> I420 input, BT.601 limited range (Rec. ITU-R BT.601), NLE5B      |
 //!
 //! Shared, never copied: h264_core's `transform` (`LevelScale`, `scale4`, `luma_dc`, `chroma_dc`,
 //! `idct4_add`) is the encoder's reconstruction; its `intra` (`pred_nxn`, `pred_16x16`,
@@ -48,6 +49,7 @@ pub mod me;
 pub mod nal;
 pub mod sps;
 pub mod transform;
+pub mod yuv;
 
 use alloc::boxed::Box;
 use alloc::vec;
