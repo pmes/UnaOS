@@ -5412,18 +5412,18 @@ fn sinkall_selftest() {
         if open == 1 && after == 0 && ok { "synthetic" } else { "FAIL" }
     };
     let live = if hda == "ok" { Some(("hda", 0usize)) } else if usb == "ok" { Some(("usb", 1usize)) } else { None };
-    let (mut sources, mut overlap, mut pause_ms) = (0u32, "-", u64::MAX); let mut start_gap: Option<u64> = None; // PLAYSTARTGAP (B805): None = not measured
+    let (mut sources, mut overlap, mut pause_ms) = (0u32, "-", u64::MAX); let mut start_gap: Option<u64> = None; let mut clock = "-"; // PLAYSTARTGAP (B805): None = not measured
     if let Some((s, k)) = live {
         sources = 1; // the alert reached a sink
         let _ = audio::sink(s);
         sources += sinkall_player("player", s, k) as u32;
-        sources += sinkall_player("video", s, k) as u32;
+        sources += sinkall_player("video", s, k) as u32; clock = sinkall_clock(s, k);
         overlap = if sinkall_overlap(s) { "ok" } else { "FAIL" }; pause_ms = sinkall_pause(s); start_gap = sinkall_start(s); // SINKALLDOCS (B781): the Player's pause lands within the sink's queue (file tail). PLAYSTARTGAP (B805): a file play's start gap on the HDA ring (file tail)
     }
     let usb_volume = sinkall_usb_volume(usb); let slider_ms = sinkall_slider(hda, usb); let idle_level = sinkall_idle_level(usb); // MIXERPUMP (B787): a set through `status::set_volume` reaches its carrier within one period + 10 ms (file tail)
     let direct = play::epoch().wrapping_sub(e0) as i64 - mixer::hda_opens().wrapping_sub(o0) as i64;
     let _ = audio::sink(if was == Sink::Usb { "usb" } else if was == Sink::Hda { "hda" } else { "bt" });
-    let failed = [hda, usb, bt_live, bt, overlap, usb_volume, idle_level].iter().any(|v| *v == "FAIL");
+    let failed = [hda, usb, bt_live, bt, overlap, usb_volume, idle_level, clock].iter().any(|v| *v == "FAIL");
     let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 && pause_ms <= SINKALL_PAUSE_MS && slider_ms <= SINKALL_SLIDER_MS && start_gap.map_or(true, |g| g <= play::REFILL_MS) { "PASS" } else { "FAIL" };
     serial_println!(
         ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} pause_ms={} slider_ms={} start_gap_ms={} ::",
@@ -7551,4 +7551,68 @@ fn textscale_win_close(t: &mut TsWin) {
         crate::video::fileview::close();
         t.fv_own = false;
     }
+}
+
+// AUDIOSINK (rmbp-ledger B850; BP-audio-17) — TAIL-APPENDED: `tests sinkall`'s Player clock leg. SINKALL (B767) made the
+// Player a mixer source whose A/V clock is `hda::play::position_ms` -> `mixer::played_now` (the sink's played frames:
+// on HDA `queued` reads the ring's LPIB through `r3_pos`), but no leg sampled it. This one plays 1 s through the Player's
+// own source fns (`fixture_source("player")`), steps the service tick and reads the clock each step: it must never step
+// back, must advance (largest ms between two advances, after the first, <= `hda::play::REFILL_MS`, the ring's refill
+// window — the start leg's bound), must reach >= 800 ms, and the source must close by `play_poll`. The clock is read
+// BEFORE `busy` (a closed play stops the sampling); a 0 after a value is the close's edge (`play_poll` takes the source
+// before it clears `busy`), skipped, never a backstep. A FAIL fails SINKALL. Wire: `[sinkall] leg player src= sink=
+// position_ms= monotone= backsteps= gap_ms= moves= closed= frames= -> ok|FAIL`.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
+fn sinkall_clock(sink: &str, k: usize) -> &'static str {
+    use crate::audio::mixer;
+    use crate::drivers::hda::play;
+    const N: u64 = 48_000;
+    let d0 = mixer::delivered()[k];
+    let src = match play::fixture_source("player") {
+        Ok(id) => id,
+        Err(why) => {
+            serial_println!("[sinkall] leg player sink={} open={} -> FAIL", sink, why);
+            return "FAIL";
+        }
+    };
+    let t0 = crate::arch::ms();
+    let (mut ended, mut closed) = (false, false);
+    let (mut last, mut backsteps, mut moves, mut gap, mut moved_at) = (0u64, 0u32, 0u32, 0u64, t0);
+    while crate::arch::ms().saturating_sub(t0) < 4_000 {
+        if !ended && play::fixture_feed(N) >= N {
+            play::fixture_end();
+            ended = true;
+        }
+        let _ = play::pump_until(2, || false);
+        let p = play::position_ms();
+        if !play::busy() {
+            closed = true;
+            break;
+        }
+        if p == u64::MAX || (p == 0 && last > 0) {
+            continue;
+        }
+        let now = crate::arch::ms();
+        if p < last {
+            backsteps += 1;
+        } else if p > last {
+            if moves > 0 {
+                gap = gap.max(now.saturating_sub(moved_at));
+            }
+            moved_at = now;
+            moves += 1;
+            last = p;
+        }
+    }
+    if !closed {
+        play::stop();
+        let _ = play::pump_until(500, || mixer::sources() == 0);
+    }
+    let frames = mixer::delivered()[k].wrapping_sub(d0);
+    let ok = closed && backsteps == 0 && moves > 0 && last >= 800 && gap <= play::REFILL_MS;
+    serial_println!(
+        "[sinkall] leg player src={} sink={} position_ms={} monotone={} backsteps={} gap_ms={} moves={} closed={} frames={} -> {}",
+        src, sink, last, if backsteps == 0 { "ok" } else { "FAIL" }, backsteps, gap, moves, closed as u8, frames, if ok { "ok" } else { "FAIL" }
+    );
+    if ok { "ok" } else { "FAIL" }
 }
