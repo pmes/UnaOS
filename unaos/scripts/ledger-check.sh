@@ -14,7 +14,7 @@
 #   * id: first cell, `^[A-Z]+[0-9]+` (a cross-ref suffix `(→ S<n>)` is allowed after it). Unique per file.
 #   * status: must BEGIN with one of  open | fixed-unflown | flown | landed | dropped  (bold allowed;
 #     free text allowed after " — " or ", "). Nothing else — "standing", "relayed", "recorded" are not states.
-#   * owner: if the table has an `owner` column, the cell ∈ {orin, pi, rmbp, shared-gate} (first word).
+#   * owner: if the table has an `owner` column, the cell ∈ {orin, pi, rmbp, shared-gate, zenbook} (first word).
 #   * cross-refs: `→ S<n>` / `→ P<n>` anywhere in a row must resolve to an id in docs/dev/LEDGER.md
 #     (checked only when LEDGER.md is present in the tree).
 #   * shas: every 7–8 hex token that `git cat-file -e` recognises as a commit is fine; one that does
@@ -49,7 +49,7 @@ python3 - "$ROOT" <<'PY'
 import re, sys, os, subprocess, glob
 root = sys.argv[1]
 ENUM = ("open", "fixed-unflown", "flown", "landed", "dropped")
-OWNERS = {"orin", "pi", "rmbp", "shared-gate"}
+OWNERS = {"orin", "pi", "rmbp", "shared-gate", "zenbook"}
 
 # GATE-LEDGER FIELD COUNT (rmbp-ledger B63, built rmbp 17 2026-09-08). A markdown row is its PIPES,
 # so a literal `|` inside a cell silently becomes a column boundary — and `\|` does NOT save it in
