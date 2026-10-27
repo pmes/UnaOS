@@ -439,7 +439,7 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
     fb.flush_rect(x, y, w, h);
     let _ = super::beam::settle(hb);
     // TEARSCOPE — record what this present cost against what the beam spends on the same rows.
-    bar_painted(name, r, crate::arch::now_cycles().saturating_sub(tp0), info.height);
+    bar_painted(name, r, crate::arch::now_cycles().saturating_sub(tp0), info.height); overlay_note(name, r, info.width, info.height); // PERFHUD2 (B828): a strip painted over the HUD owes it a full repaint (`overlay_note`, file tail). ⚠ LINE-NEUTRAL fold, code first.
     true
 }
 
@@ -473,7 +473,7 @@ pub fn erase_rect(r: Rect) -> bool {
         return erase_declined(LOCK_SCRATCH); // MENULOCK (B200) — still `false`, now named once per holder
     }; s.tag(TAG_ERASE); // MENULOCK — ⚠ SAME-LINE fold
     super::cursor::undraw();
-    let raw = fb.encode4(super::blitter::a11yfilter::color(wm::DESKTOP_BG)).unwrap_or(0); // A11YFILTERS (B705): the vacated rect in the filtered desktop colour
+    let raw = fb.encode4(super::blitter::a11yfilter::color(wm::DESKTOP_BG)).unwrap_or(0); overlay_note("", (x, y, w, h), info.width, info.height); // PERFHUD2 (B828): an erase over the HUD owes it a full repaint (`overlay_note`, file tail). A11YFILTERS (B705): the vacated rect in the filtered desktop colour
     for i in 0..w {
         s.raw[i] = raw;
     }
@@ -629,7 +629,7 @@ pub fn cycles_to_us(dt: u64) -> u64 {
 /// compile time. Raising it here without widening the clip is a BUILD failure rather than an
 /// occluder silently dropped on a non-witness image — which is the failure mode the WCK4 review named
 /// and the reason the registry exists at all instead of a hand-written arm per strip.
-pub const STRIP_MAX: usize = 2;
+pub const STRIP_MAX: usize = 3; // PERFHUD2 (B828): the third tenant is the performance overlay (`OVERLAY_SLOT`, file tail), so every registry reader withholds its rect. ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
 
 /// A registered furniture strip.
 ///
@@ -670,7 +670,7 @@ pub static TENANTS: [Tenant; STRIP_MAX] = [
         name: "menubar",
         edge: Edge::Top,
         rect: super::menubar::strip_rect,
-    },
+    }, Tenant { name: "perfhud", edge: Edge::Top, rect: super::perfhud::strip_rect }, // PERFHUD2 (B828): the HUD at `OVERLAY_SLOT` (file tail); its rect is what it last painted (lock-free), `None` hidden. ⚠ LINE-NEUTRAL fold, code first.
 ];
 
 /// Every PRESENT strip's rect on this panel, in registry order, written into `out`.
@@ -2047,4 +2047,55 @@ pub fn wall_gen() -> u64 {
 #[cfg(not(feature = "facet"))]
 pub fn wall_gen() -> u64 {
     0
+}
+
+// =================================================================================================
+// PERFHUD2 (rmbp-ledger B828) — the performance overlay as the THIRD tenant, and the latch for the
+// writers the registry does not clip
+// =================================================================================================
+//
+// The HUD (`video/perfhud.rs`) is painted from a cached image and repaints only the field bands whose
+// text changed. That is sound only while nothing else writes its rect: the registry readers
+// (`wm::erase_clip`, the desktop present, `wm::occ_clip`'s push) withhold it as a tenant, and the
+// two writers that do not consult the registry — [`paint`] for ANOTHER tenant or dropdown, and
+// [`erase_rect`] (every vacate) — note here when they cross it, so the HUD's next compose repaints
+// it whole. Appended at the tail so no line above moves.
+
+/// The overlay's slot in [`TENANTS`] and in [`rects`]'s output.
+pub const OVERLAY_SLOT: usize = 2;
+
+const _: () = {
+    // The overlay must sit inside the registry and apart from the two strips, or `overlay_note`
+    // reads another tenant's rect as the HUD's.
+    assert!(OVERLAY_SLOT < STRIP_MAX);
+    assert!(OVERLAY_SLOT != DOCK_SLOT);
+    assert!(OVERLAY_SLOT != MENUBAR_SLOT);
+};
+
+/// A strip paint or erase crossed the overlay's painted rect since its last compose took the latch.
+static OVERLAY_HIT: AtomicBool = AtomicBool::new(false);
+
+/// [`paint`] (`name` = the tenant) and [`erase_rect`] (`name` = `""`) wrote `r` on a `pw` x `ph` panel:
+/// latch a full repaint of the overlay when `r` meets what it last painted. The overlay's own paints
+/// never latch. Two atomic loads when the HUD is hidden.
+fn overlay_note(name: &str, r: Rect, pw: usize, ph: usize) {
+    let t = &TENANTS[OVERLAY_SLOT];
+    if name.as_bytes() == t.name.as_bytes() {
+        return;
+    }
+    let Some((ox, oy, ow, oh)) = (t.rect)(pw, ph) else { return };
+    let (x, y, w, h) = r;
+    if w != 0 && h != 0 && ow != 0 && oh != 0 && x < ox + ow && ox < x + w && y < oy + oh && oy < y + h {
+        OVERLAY_HIT.store(true, Ordering::Release);
+    }
+}
+
+/// The overlay's compose: was its rect written by another strip writer since the last take? Clears it.
+pub fn overlay_take_hit() -> bool {
+    OVERLAY_HIT.swap(false, Ordering::AcqRel)
+}
+
+/// The overlay's sampler: is a hit waiting for a compose (a composite is owed)?
+pub fn overlay_pending() -> bool {
+    OVERLAY_HIT.load(Ordering::Acquire)
 }
