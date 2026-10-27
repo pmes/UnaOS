@@ -700,11 +700,11 @@ fn maskscope_kat() {
     let (line, ms) = (line!(), kat_hold(&KAT_MAX, &KAT_WHO, 30));
     let by = KAT_WHO.read(false);
     let site_ok = by.site().is_some_and(|l| l.file() == file!() && l.line() == line);
-    let (sites, top_ok, sums_ok, roll_ok) = masksites_kat(); // MASKCENSUS (B1028): the site table's leg, on its own instance (tail)
-    let pass = me.is_some() && by.name() == me && site_ok && ms >= 29 && KAT_MAX.load(Relaxed) == ms && sites == 2 && top_ok && sums_ok && roll_ok;
+    let (sites, top_ok, sums_ok, roll_ok) = masksites_kat(); let wrap = wrapsite_kat(); // MASKCENSUS (B1028): the site table's leg, on its own instance (tail); MASKWRITESITE (B1037): the third site, THROUGH the write wrapper (tail)
+    let pass = me.is_some() && by.name() == me && site_ok && ms >= 29 && KAT_MAX.load(Relaxed) == ms && sites == 2 && top_ok && sums_ok && roll_ok && wrap != Some(false);
     serial_println!(
-        ":: MASKSCOPE: who={} ms={} -> {} :: task={} site_ok={} sites={} top_ok={} sums_ok={} roll_ok={} boot_by={}",
-        by, ms, if pass { "PASS" } else { "FAIL" }, me.unwrap_or("?"), site_ok as u8, sites, top_ok as u8, sums_ok as u8, roll_ok as u8, masked_by()
+        ":: MASKSCOPE: who={} ms={} -> {} :: task={} site_ok={} sites={} top_ok={} sums_ok={} roll_ok={} wrapsite_ok={} boot_by={}",
+        by, ms, if pass { "PASS" } else { "FAIL" }, me.unwrap_or("?"), site_ok as u8, sites, top_ok as u8, sums_ok as u8, roll_ok as u8, match wrap { Some(true) => "1", Some(false) => "0", None => "-" }, masked_by()
     );
     crate::tests::tally(pass);
 }
@@ -1026,4 +1026,41 @@ fn masksites_kat() -> (u32, bool, bool, bool) {
     let (s1, s2) = (KAT_SITES.take_sec(), KAT_SITES.take_sec());
     let roll_ok = s1.sites() == 2 && s1.entry(0).0 == pa && s1.find(pb).map(|e| (e.0, e.1)) == Some((2, 9)) && s2.sites() == 0 && KAT_SITES.boot().sites() == 2;
     (boot.sites(), top_ok, sums_ok, roll_ok)
+}
+
+// ── MASKWRITESITE (rmbp-ledger B1037) — a masked span's SITE is the op's caller, not a wrapper's line. FILE-TAIL append. ─────
+// MASKCENSUS (B1028) keys every span on `with_unafs`'s `#[track_caller]` caller, but splitwrite's `with_unafs_write` and
+// `run` (`fs/unafs.rs`) carried no token, so every split write op keyed on `run`'s two `with_unafs` lines (HOLD 1, HOLD 2),
+// and the in-file op wrappers (`native_acl_write/read/clear/list`, `snapshot_read`, `versions`, `read_version`,
+// `restore_version`, `bind_root_on`) on their own call lines. Each now carries `#[track_caller]` (a same-line token): a VFS
+// write op names its own `fs/vfs.rs` line. The split read's chain is NOT tokened: its lines name the hold phase (owed).
+
+/// `tests hidstall`'s MASKSCOPE leg, third site: ONE no-op write op through `with_unafs_write` (x86 `wc`: splitwrite's
+/// wrapper -> `run` -> `with_unafs`; elsewhere the alias, `with_unafs` itself) must key the BOOT table on the call's line.
+/// A REAL ~0 ms masked span (it wins no max: `masked_into` takes only a strictly greater span); it claims one boot slot,
+/// keyed here. `Some(true)` = the key at the call's line rose; `None` = no span was taken (an `Err`: no volume, a Busy
+/// ticket) or the table is full (`other` rose); `Some(false)` = a span ran and keyed elsewhere (e.g. `run`'s line).
+fn wrapsite_kat() -> Option<bool> {
+    let other0 = MASK_SITES.other_n.load(Relaxed);
+    let n0 = site_n(line!() + 1); // the call's line: the NEXT line
+    let (line, r) = (line!(), crate::fs::unafs::with_unafs_write(|_| ()));
+    let rose = site_n(line) > n0;
+    let full = MASK_SITES.other_n.load(Relaxed) != other0;
+    if rose { Some(true) } else if r.is_err() || full { None } else { Some(false) }
+}
+
+/// The boot table's `n` for the site keyed at `hidstall.rs:<line>` (0 = no such key).
+fn site_n(line: u32) -> u32 {
+    for (i, k) in MASK_SITES.site.iter().enumerate() {
+        let p = k.load(Acquire);
+        if p == 0 {
+            continue;
+        }
+        // SAFETY: every key is a `&'static Location` (from `#[track_caller]` / `Location::caller`), stored whole by `MaskSites::note`.
+        let l: &'static core::panic::Location<'static> = unsafe { &*(p as *const core::panic::Location<'static>) };
+        if l.file() == file!() && l.line() == line {
+            return MASK_SITES.n[i].load(Relaxed);
+        }
+    }
+    0
 }
