@@ -14,8 +14,8 @@
 //! pixel_core SURFACES a decoded image's embedded profile (`pixel_core::Image::icc`: PNG iCCP, JPEG APP2, WebP ICCP) and
 //! never links this crate; the callers run [`apply_icc_to_srgb`] (Facet's open, Aether's `<img>`) or a [`Transform`]
 //! (pdf_core's /ICCBased colour space and JPX `colr` profiles). Refused by name ([`Refusal`]): named-colour,
-//! device-link, abstract and multiProcessElements profiles, iccMAX. Owed: output-side mBA / B2A, display profiles,
-//! CMYK printing intents.
+//! device-link, abstract and multiProcessElements profiles, iccMAX. Owed: output-side mBA / B2A, CMYK printing intents;
+//! display profiles: matrix/TRC built ([`display`], KERNEL-DISPLAY-ICC SR372), LUT-based owed.
 //!
 //! `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`; the one dependency is libm (`powf`, `cbrtf`).
 #![no_std]
@@ -23,11 +23,13 @@
 
 extern crate alloc;
 
+pub mod display;
 pub mod profile;
 pub mod transform;
 
 pub use profile::{Clut, Curve, Lut, LutKind, Model, Pcs, Profile, Refusal, SRGB, SRGB_TRC, Space, kat};
 pub use transform::{Transform, bradford, oetf, pcs_to_linear_srgb};
+pub use display::{DisplayTransform, EdidColour, edid_colour};
 
 /// What [`apply_icc_to_srgb`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -26,15 +26,15 @@ const BRADFORD: [[f32; 3]; 3] = [[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.
 
 type M3 = [[f32; 3]; 3];
 
-fn mul(a: &M3, b: &M3) -> M3 {
+pub(crate) fn mul(a: &M3, b: &M3) -> M3 {
     core::array::from_fn(|i| core::array::from_fn(|j| a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j]))
 }
 
-fn apply(m: &M3, v: [f32; 3]) -> [f32; 3] {
+pub(crate) fn apply(m: &M3, v: [f32; 3]) -> [f32; 3] {
     core::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2])
 }
 
-fn inverse(m: &M3) -> M3 {
+pub(crate) fn inverse(m: &M3) -> M3 {
     let c = |r0: usize, c0: usize, r1: usize, c1: usize| m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0];
     let det = m[0][0] * c(1, 1, 2, 2) - m[0][1] * c(1, 0, 2, 2) + m[0][2] * c(1, 0, 2, 1);
     let adj = [

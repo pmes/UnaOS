@@ -910,6 +910,7 @@ fn main() {
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
+    if std::env::var("UNAOS_DISPLAY_ICC").is_ok() { feats.push("dicc"); } // KERNEL-DISPLAY-ICC (LEDGER SR372): the display transform at the scanout copy. Kept in sync with arroyo's mapping.
     // PHASE31ROOT: UNAOS_BAR1EXP=<mode> selects a BAR1-wedge experiment arm
     // (docs/dev/OS/08_VIDEO/phase31-root.md). One mode exists: `uc` -> `bar1exp-uc`, retyping the
     // panel-aperture leaves UC (PAT PA3) instead of WC at `set_framebuffer_wc`. Memory TYPE only.

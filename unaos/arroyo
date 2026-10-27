@@ -942,6 +942,8 @@ _feats="${_feats}sdw,"
 # SCREENLOCK M3: UNAOS_LOCK_ON_IDLE=1 makes DIMIDLE's wake open the lock screen (`login::lock`), read by rustc at BUILD
 # time via `option_env!` in video/dimidle.rs beside UNAOS_IDLE_MIN; not a cargo feature (needs `login`+`wc`). Default off.
 [ -n "${UNAOS_WC:-}" ] && _feats="${_feats}wc,"
+# KERNEL-DISPLAY-ICC (LEDGER SR372): UNAOS_DISPLAY_ICC=1 -> `dicc`: the panel's display transform (sRGB to the EDID's matrix/TRC) as the scanout copy filter's last stage; `[display] icc ...` once at login. Both arches. Default OFF. Kept in sync with builder/src/main.rs and crates/kernel/Cargo.toml.
+[ -n "${UNAOS_DISPLAY_ICC:-}" ] && _feats="${_feats}dicc,"
 # PHASE31ROOT: UNAOS_BAR1EXP=<mode> selects a BAR1-wedge experiment arm (design + evidence:
 # docs/dev/OS/08_VIDEO/phase31-root.md). ONE mode exists today: `uc` -> feature `bar1exp-uc`,
 # which retypes the panel-aperture leaves UC (PAT PA3) instead of WC (PAT PA4) at
