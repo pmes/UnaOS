@@ -9460,4 +9460,87 @@ pub mod preemptoff {
             ),
         }
     }
+
+    // ══════════ PREEMPTOFFAUDIT (zenbook-ledger Z57) — the scoped hold and the census KAT ══════════
+
+    /// PREEMPTOFFAUDIT: the `without_interrupts`-shaped preempt-off span — this CPU's count held around `f`, interrupts
+    /// as the caller had them. The guard's Drop releases the count, so an unwinding `f` still enables.
+    pub fn scoped<R>(f: impl FnOnce() -> R) -> R {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                enable();
+            }
+        }
+        disable();
+        let _off = Off;
+        f()
+    }
+
+    /// PREEMPTOFFAUDIT M1: the census of the x86 kernel's `without_interrupts` call sites at 611cf90b9 (cores.md §4, the
+    /// Z57 row): 178 sites — 13 mask for an ISR or CPU state (I), 138 only for holder non-preemption (II), 27 for both
+    /// (III); ONE converted to preempt-off (`drivers::block::hold::with`).
+    pub const AUDIT_SITES: u32 = 178;
+    pub const AUDIT_ISR: u32 = 13;
+    pub const AUDIT_HOLDER: u32 = 138;
+    pub const AUDIT_BOTH: u32 = 27;
+    pub const AUDIT_CONVERTED: u32 = 1;
+
+    /// `tests preemptaudit`: take the block hold from a task with interrupts ON; inside it interrupts must still be on,
+    /// a timer tick must arrive on this CPU, and nothing may switch this task out (Z52's reading).
+    #[cfg(any(feature = "ahci", feature = "nvme"))]
+    pub fn audit_selftest() {
+        if crate::arch::irqs_masked() {
+            serial_println!(":: PREEMPTAUDIT: -> SKIP(masked) ::");
+            return;
+        }
+        let (on, ticks, switched) = crate::drivers::block::hold::with(
+            50,
+            false,
+            || Some(()),
+            |_| (false, 0u64, u64::MAX),
+            |()| {
+                let on = !crate::arch::irqs_masked();
+                let cpu = this_cpu();
+                if cpu >= MAX_CPUS {
+                    return (on, 0u64, u64::MAX);
+                }
+                let tid0 = SCHED[cpu].current_tid.load(Ordering::Relaxed);
+                let sw0 = ACCT[cpu].ctx_switches.load(Ordering::Relaxed);
+                let t0 = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+                let c0 = crate::arch::now_cycles();
+                let bound = crate::drivers::block::wait::cycles_ms(20);
+                while percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0) < 2
+                    && crate::arch::now_cycles().wrapping_sub(c0) < bound
+                {
+                    core::hint::spin_loop();
+                }
+                let ticks = percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0);
+                let switched = (this_cpu() != cpu) as u64
+                    + ACCT[cpu].ctx_switches.load(Ordering::Relaxed).wrapping_sub(sw0)
+                    + (SCHED[cpu].current_tid.load(Ordering::Relaxed) != tid0) as u64;
+                (on, ticks, switched)
+            },
+        );
+        let reason = if !on {
+            Some("masked")
+        } else if ticks == 0 {
+            Some("no-tick")
+        } else if switched != 0 {
+            Some("switched")
+        } else {
+            None
+        };
+        match reason {
+            None => serial_println!(
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} hold_irq_on=ok tick_in_hold=ok switched=0 -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED
+            ),
+            Some(r) => serial_println!(
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} hold_irq_on={} tick_in_hold={} switched={} -> FAIL reason={} ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED,
+                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, r
+            ),
+        }
+    }
 }
