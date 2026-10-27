@@ -166,18 +166,6 @@ fn sub(fs: &crate::fs::fat::FatFs, ents: &[crate::fs::fat::DirEntry], name: &str
     fs.read_dir(c).ok()
 }
 
-/// The role's pinned digest as written in mt7925.pins (`<role> <64 hex>`, `#` lines and blanks ignored — the
-/// b43.pins grammar). A textual row match; FWPINONE (owed) folds the three pins readers into one.
-fn pin_row(role: &str) -> Option<&'static str> {
-    PINS.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).find_map(|l| {
-        let mut it = l.split_whitespace();
-        match (it.next(), it.next(), it.next()) {
-            (Some(r), Some(h), None) if r == role && h.len() == 64 => Some(h),
-            _ => None,
-        }
-    })
-}
-
 fn hex32(d: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
     for b in d {
@@ -212,10 +200,11 @@ fn fw_check() -> Fw {
         } else if fs.read_file(de, &mut buf, MAX_FILE).is_err() || buf.len() != size {
             ("unreadable", String::from("-"))
         } else {
-            let hex = hex32(&crypto_core::sha2::sha256(&buf));
-            match pin_row(role) {
+            let sha = crypto_core::sha2::sha256(&buf);
+            let hex = hex32(&sha);
+            match crate::hash::pins::pin_for(PINS, role) { // FWSTAGEONE (rmbp-ledger B984): the one pins reader
                 None => ("unpinned", hex),
-                Some(p) if p.eq_ignore_ascii_case(&hex) => ("ok", hex),
+                Some(p) if p == sha => ("ok", hex),
                 Some(_) => ("mismatch", hex),
             }
         };
