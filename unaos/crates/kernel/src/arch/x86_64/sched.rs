@@ -9477,6 +9477,23 @@ pub mod preemptoff {
         f()
     }
 
+    /// PREEMPTOFFSDHC (zenbook-ledger Z61): `(this CPU's preempt-off count is held, the current task id or u64::MAX)`,
+    /// read masked so the CPU cannot change between the two words — the sdhc CARD span's witness.
+    pub fn witness() -> (bool, u64) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let cpu = this_cpu();
+            if cpu >= MAX_CPUS {
+                return (false, u64::MAX);
+            }
+            let held = OFF[cpu].load(Ordering::Relaxed) > 0;
+            let tid = match SCHED[cpu].current_tid.load(Ordering::Relaxed) {
+                0 => u64::MAX,
+                id => id,
+            };
+            (held, tid)
+        })
+    }
+
     /// PREEMPTOFFAUDIT M1: the census of the x86 kernel's `without_interrupts` call sites at 611cf90b9 (cores.md §4, the
     /// Z57 row): 178 sites — 13 mask for an ISR or CPU state (I), 138 only for holder non-preemption (II), 27 for both
     /// (III); ONE converted to preempt-off (`drivers::block::hold::with`).
@@ -9522,26 +9539,75 @@ pub mod preemptoff {
                 (on, ticks, switched)
             },
         );
+        // PREEMPTOFFSDHC (zenbook-ledger Z61): the sdhc leg, after the hold — `sdhc_audit_leg` below.
+        #[cfg(feature = "sdhcblk")]
+        let (sdhc_word, sdhc_sw): (&'static str, u64) = sdhc_audit_leg();
+        #[cfg(not(feature = "sdhcblk"))]
+        let (sdhc_word, sdhc_sw): (&'static str, u64) = ("skip(no-sdhcblk)", 0);
+        let converted_sdhc = cfg!(feature = "sdhcblk") as u32;
+        let switched = switched.saturating_add(sdhc_sw);
         let reason = if !on {
             Some("masked")
         } else if ticks == 0 {
             Some("no-tick")
         } else if switched != 0 {
             Some("switched")
+        } else if sdhc_word == "masked" {
+            Some("sdhc-masked")
+        } else if sdhc_word == "not-held" {
+            Some("sdhc-not-held")
+        } else if sdhc_word == "err" {
+            Some("sdhc-read")
         } else {
             None
         };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} hold_irq_on=ok tick_in_hold=ok switched=0 -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} hold_irq_on={} tick_in_hold={} switched={} -> FAIL reason={} ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED,
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} -> FAIL reason={} ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word,
                 if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, r
             ),
         }
+    }
+
+    /// PREEMPTOFFSDHC (zenbook-ledger Z61) — `tests preemptaudit`'s SDHC LEG (named: other arcs add their own legs to
+    /// this block): a 64 KiB card read (`sdhc::read_blocks_512`, 128 sectors from LBA 0) from this unmasked task. Inside
+    /// the CARD span interrupts must be on and the preempt-off count held (the span's own record, `sdhc::audit_take`),
+    /// and nothing may switch this task out across the read. `(sdhc_irq_on word, switches)`: ok | masked | not-held |
+    /// err (the read failed) | skip(no-card) (no card bound, or under 128 sectors: QEMU without an sdhci card).
+    #[cfg(all(feature = "sdhcblk", any(feature = "ahci", feature = "nvme")))]
+    fn sdhc_audit_leg() -> (&'static str, u64) {
+        if crate::drivers::sdhc::card_num_blocks().unwrap_or(0) < 128 {
+            return ("skip(no-card)", 0);
+        }
+        let mut buf = alloc::vec![0u8; 128 * 512];
+        let (_, tid) = witness();
+        let cpu = this_cpu();
+        if cpu >= MAX_CPUS || tid == u64::MAX {
+            return ("err", 0);
+        }
+        let tid0 = SCHED[cpu].current_tid.load(Ordering::Relaxed);
+        let sw0 = ACCT[cpu].ctx_switches.load(Ordering::Relaxed);
+        crate::drivers::sdhc::audit_arm(tid);
+        let r = crate::drivers::sdhc::read_blocks_512(0, 128, &mut buf[..]);
+        let (irq, held) = crate::drivers::sdhc::audit_take();
+        let switched = (this_cpu() != cpu) as u64
+            + ACCT[cpu].ctx_switches.load(Ordering::Relaxed).wrapping_sub(sw0)
+            + (SCHED[cpu].current_tid.load(Ordering::Relaxed) != tid0) as u64;
+        let word = if r.is_err() {
+            "err"
+        } else if irq == 2 {
+            "masked"
+        } else if irq != 1 || !held {
+            "not-held"
+        } else {
+            "ok"
+        };
+        (word, switched)
     }
 }
 
