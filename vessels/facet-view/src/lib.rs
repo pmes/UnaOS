@@ -269,7 +269,7 @@ impl Viewer {
         match msg {
             SMessage::BrowserText(t) => t.chars().flat_map(|c| self.key(&c.to_string())).collect(),
             SMessage::BrowserKey(k) => self.key(k),
-            SMessage::BrowserScroll(_, dy) => self.scroll(*dy),
+            SMessage::BrowserScroll(_, dy, _) => self.scroll(*dy),
             SMessage::BrowserResize(w, h) => self.resize(*w, *h),
             _ => Vec::new(),
         }

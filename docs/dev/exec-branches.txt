@@ -886,7 +886,7 @@ refs/heads/exec-rmbp-colourone   8b53e278c FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-swapback   1fb7f6f07 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-cryptoone   aec1d01c7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdffax   c549d0678 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-surfaceid   aec1d01c7 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-surfaceid   4a3691214 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-roamxchan   67abf4a00 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264encbframes   aec1d01c7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle6mix   d08a83b03 IN-FLIGHT cut 2026-10-27

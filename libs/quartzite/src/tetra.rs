@@ -541,3 +541,90 @@ mod surface_contract_tests {
         assert_eq!(apply(tx.frame("viewport", 3, 4, g.clone()), &mut rx), Some(None));
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// SURFACEID (LEDGER SR332): a Surface's number on the wire
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// SURFACEID (LEDGER SR332): a tree's [`TetraNode::Surface`] ids in depth-first order. A Surface's number (the `surface`
+/// on bandy's pointer messages) is its index here, so the first or only Surface is 0 and a one-surface tree's wire is
+/// unchanged. Pure: the vessel that declared the tree computes the same numbers the embassy that evaluates it does.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SurfaceMap {
+    ids: Vec<String>,
+}
+
+thread_local! {
+    /// The map of the tree an embassy is evaluating on this thread ([`SurfaceMap::scope`]).
+    static CURRENT_SURFACES: std::cell::RefCell<Option<SurfaceMap>> = const { std::cell::RefCell::new(None) };
+}
+
+impl SurfaceMap {
+    /// Every Surface of `node`, depth-first (only `VStack` / `HStack` hold children).
+    pub fn of(node: &TetraNode) -> SurfaceMap {
+        fn walk(n: &TetraNode, ids: &mut Vec<String>) {
+            match n {
+                TetraNode::Surface { id } => ids.push(id.clone()),
+                TetraNode::VStack(children) | TetraNode::HStack(children) => children.iter().for_each(|c| walk(c, ids)),
+                _ => {}
+            }
+        }
+        let mut ids = Vec::new();
+        walk(node, &mut ids);
+        SurfaceMap { ids }
+    }
+    /// The number of the Surface `id` (its first occurrence), if the tree has one.
+    pub fn number(&self, id: &str) -> Option<u32> {
+        self.ids.iter().position(|s| s == id).map(|i| i as u32)
+    }
+    /// The id of Surface number `n`.
+    pub fn id(&self, n: u32) -> Option<&str> {
+        self.ids.get(n as usize).map(String::as_str)
+    }
+    /// Run `f` (an embassy's synchronous evaluation of the tree) with this map current on this thread, so each Surface
+    /// leaf reads its number through [`surface_number`]; the previous map is restored after.
+    pub fn scope<R>(&self, f: impl FnOnce() -> R) -> R {
+        let prev = CURRENT_SURFACES.with(|c| c.replace(Some(self.clone())));
+        let out = f();
+        CURRENT_SURFACES.with(|c| *c.borrow_mut() = prev);
+        out
+    }
+}
+
+/// The number of Surface `id` in the tree being evaluated on this thread ([`SurfaceMap::scope`]); 0 outside any scope or
+/// for an id the tree does not name (the one-surface default).
+pub fn surface_number(id: &str) -> u32 {
+    CURRENT_SURFACES.with(|c| c.borrow().as_ref().and_then(|m| m.number(id)).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod surface_map_tests {
+    use super::{SurfaceMap, TetraNode, surface_number};
+
+    fn surf(id: &str) -> TetraNode {
+        TetraNode::Surface { id: id.into() }
+    }
+
+    /// SURFACEID M3: depth-first numbering of a nested tree, the one-surface tree's 0, unknown ids, and the scope.
+    #[test]
+    fn surfaceid_map_numbers_depth_first() {
+        let tree = TetraNode::VStack(vec![
+            surf("aux"),
+            TetraNode::HStack(vec![TetraNode::Empty, surf("editor"), TetraNode::VStack(vec![surf("meters")])]),
+            surf("foot"),
+        ]);
+        let m = SurfaceMap::of(&tree);
+        assert_eq!([m.number("aux"), m.number("editor"), m.number("meters"), m.number("foot")], [Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!((m.number("nope"), m.id(1), m.id(4)), (None, Some("editor"), None));
+        assert_eq!(SurfaceMap::of(&TetraNode::VStack(vec![TetraNode::Empty, surf("stria.nle")])).number("stria.nle"), Some(0));
+        assert_eq!(SurfaceMap::of(&TetraNode::Empty), SurfaceMap::default());
+        assert_eq!(surface_number("editor"), 0, "outside a scope: the default surface");
+        let inner = SurfaceMap::of(&TetraNode::VStack(vec![surf("x"), surf("y")]));
+        let got = m.scope(|| {
+            let nested = inner.scope(|| (surface_number("y"), surface_number("editor")));
+            (surface_number("editor"), surface_number("meters"), surface_number("nope"), nested)
+        });
+        assert_eq!(got, (1, 2, 0, (1, 0)));
+        assert_eq!(surface_number("editor"), 0, "the scope is restored");
+    }
+}
