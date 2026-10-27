@@ -504,7 +504,7 @@ fn ensure_stack(guard: &mut Option<SmolStack>) -> bool {
     let mut sockets = SocketSet::new(storage);
     // The DHCP socket takes the reserved (NSOCK+1-th) storage slot and is NOT recorded in `reg`, so
     // it never counts against ring-3 socket allocation and no `stack_open*`/`free_row_sockets` touches it.
-    let dhcp_handle = sockets.add(dhcpv4::Socket::new()); #[cfg(feature = "wifi10")] { lease_buffer(&mut sockets, dhcp_handle); } // STATIONLEASE (B862): the DHCP socket keeps the last received payload, so the ACK's option 51 is readable (LINE-NEUTRAL)
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new()); { lease_buffer(&mut sockets, dhcp_handle); } // STATIONLEASE (B862): the DHCP socket keeps the last received payload, so the ACK's option 51 is readable (LINE-NEUTRAL). LEASERENEW (B888): every smolnet image, un-gated from wifi10 — smoltcp says a same-config renewal only with this buffer
     let mut stack = SmolStack {
         iface,
         sockets,
@@ -721,12 +721,12 @@ pub fn service_poll() {
     let Some(mut g) = STACK.try_lock() else { return };
     let Some(stack) = g.as_mut() else { return };
     poll_now(stack);
-    if LEASED.load(Ordering::Relaxed) || DHCP_RUNNING.load(Ordering::Relaxed) || !DHCP_ATTEMPTED.load(Ordering::Relaxed) {
+    if DHCP_RUNNING.load(Ordering::Relaxed) || !DHCP_ATTEMPTED.load(Ordering::Relaxed) { // LEASERENEW (B888): the drain no longer stops at the first lease (a renewal's Configured, a lost lease's Deconfigured); `dhcp_event`'s `stack.dhcp?` is the check that a socket still answers (LINE-NEUTRAL)
         return;
     }
     if let Some((cidr, router, dns)) = dhcp_event(stack) {
-        dhcp_apply(stack, cidr, router, dns);
-    }
+        dhcp_renew(stack, cidr, router, dns); // LEASERENEW (B888): the first lease applies through dhcp_apply as before; a later Configured is a renewal (LINE-NEUTRAL)
+    } dhcp_lost(stack); // LEASERENEW (B888): a held lease's Deconfigured drops the address (LINE-NEUTRAL)
 }
 
 /// NETCLOCK: a `dhcp_acquire` is pumping (it owns the DHCP socket's events until it returns).
@@ -736,8 +736,8 @@ static DHCP_RUNNING: AtomicBool = AtomicBool::new(false);
 fn dhcp_event(stack: &mut SmolStack) -> Option<(Ipv4Cidr, Option<Ipv4Address>, Option<Ipv4Address>)> {
     let h = stack.dhcp?;
     match stack.sockets.get_mut::<dhcpv4::Socket>(h).poll() {
-        Some(dhcpv4::Event::Configured(cfg)) => { #[cfg(feature = "wifi10")] { lease_note(&cfg); } Some((cfg.address, cfg.router, cfg.dns_servers.first().copied())) } // STATIONLEASE (B862): the lease seconds noted from the Config this drain already takes (LINE-NEUTRAL)
-        Some(dhcpv4::Event::Deconfigured) | None => None,
+        Some(dhcpv4::Event::Configured(cfg)) => { { lease_note(&cfg); } Some((cfg.address, cfg.router, cfg.dns_servers.first().copied())) } // STATIONLEASE (B862): the lease seconds noted from the Config this drain already takes (LINE-NEUTRAL; LEASERENEW B888: every smolnet image)
+        Some(dhcpv4::Event::Deconfigured) => { if LEASED.load(Ordering::Relaxed) { DHCP_LOST.store(true, Ordering::Relaxed); } None } None => None, // LEASERENEW (B888): a Deconfigured while a lease is held is a lost lease (LEASED is false at boot, so the fresh socket's first Deconfigured marks nothing)
     }
 }
 
@@ -2341,44 +2341,185 @@ pub fn route_view() -> ([u8; 4], [u8; 4]) {
 // parser. Stored under `STACK` (`dhcp_event`'s caller holds it), read lock-free.
 
 /// The lease seconds of the boot's last ACK the drain saw (0 = unread).
-#[cfg(feature = "wifi10")]
 static LEASE_S: AtomicU32 = AtomicU32::new(0);
 
 /// From `ensure_stack` (once per boot, under `STACK`): the DHCP socket's receive-packet buffer, 1500 octets leaked for the
 /// boot (the socket borrows it `'static`, as `SocketSet<'static>` does its storage).
-#[cfg(feature = "wifi10")]
 fn lease_buffer(sockets: &mut SocketSet<'static>, h: SocketHandle) {
     let buf: &'static mut [u8] = alloc::vec![0u8; 1500].leak();
     sockets.get_mut::<dhcpv4::Socket>(h).set_receive_packet_buffer(buf);
 }
 
 /// From `dhcp_event`'s `Configured` arm: the payload the socket kept, read for option 51.
-#[cfg(feature = "wifi10")]
 fn lease_note(cfg: &dhcpv4::Config<'_>) {
     if let Some(p) = cfg.packet {
-        if let Some(s) = lease_of(p.into_inner()) {
-            LEASE_S.store(s, Ordering::Relaxed);
+        if let Some((lease, t1, t2)) = ack_of(p.into_inner()) {
+            if let Some(s) = lease {
+                LEASE_S.store(s, Ordering::Relaxed);
+            }
+            ACK_T1.store(t1.unwrap_or(0), Ordering::Relaxed); // LEASERENEW (B888): the ACK's T1/T2 (options 58/59), 0 = absent
+            ACK_T2.store(t2.unwrap_or(0), Ordering::Relaxed);
         }
     }
 }
 
 /// The lease seconds of a DHCP payload (the BOOTP message, not the Ethernet frame): `Some` only for a well-formed ACK
 /// (RFC 2132 §9.6 type 5) carrying option 51. Pure (`wifi::data::kat`'s `lease` row).
-#[cfg(feature = "wifi10")]
 pub(crate) fn lease_of(payload: &[u8]) -> Option<u32> {
+    ack_of(payload).and_then(|a| a.0)
+}
+
+/// LEASERENEW (B888): the ONE parse of a kept DHCP payload — `Some((lease, T1, T2))` (options 51/58/59) only for a
+/// well-formed ACK, through smoltcp's own `DhcpRepr::parse`. `lease_of` is its lease half.
+fn ack_of(payload: &[u8]) -> Option<(Option<u32>, Option<u32>, Option<u32>)> {
     let p = smoltcp::wire::DhcpPacket::new_checked(payload).ok()?;
     let r = smoltcp::wire::DhcpRepr::parse(&p).ok()?;
     if !matches!(r.message_type, smoltcp::wire::DhcpMessageType::Ack) {
         return None;
     }
-    r.lease_duration
+    Some((r.lease_duration, r.renew_duration, r.rebind_duration))
 }
 
 /// `wifi/verb.rs::wifidhcp`'s `lease=`: the seconds, or `None` while unread.
-#[cfg(feature = "wifi10")]
 pub fn lease_secs() -> Option<u32> {
     match LEASE_S.load(Ordering::Relaxed) {
         0 => None,
         s => Some(s),
     }
+}
+
+// ── LEASERENEW (rmbp-ledger B888, BP-net-16) — TAIL-APPENDED. smoltcp 0.14's dhcpv4 socket renews on its own at T1
+// (`socket/dhcpv4.rs:679`, a unicast REQUEST to the server) and, with the receive-packet buffer STATIONLEASE gives it,
+// raises `Configured` on EVERY renewal ACK (`:419-425`). `service_poll` now drains it after the first lease: a renewal
+// is said, a changed one re-applied through the ONE apply fn (`dhcp_apply`), a lost one (`Deconfigured`: expiry, NAK,
+// `reset`) drops the address. No timer of our own: the renewal's timing is smoltcp's. All under `STACK` (the drain's
+// caller holds it); the counters are read lock-free. Wire: `[net] dhcp renewed lease=<s|unread> ip=<same|changed:<ip>>
+// t1_at=<ms>` and `[net] dhcp lease lost`.
+
+/// Renewals said this boot (a smoltcp `Configured` while a lease was held).
+static RENEWS: AtomicU32 = AtomicU32::new(0);
+/// Of those, renewals whose config moved (address, prefix, router or DNS) and was re-applied.
+static RENEW_CHANGED: AtomicU32 = AtomicU32::new(0);
+/// Set by `dhcp_event`'s `Deconfigured` arm while a lease is held; taken by `dhcp_lost`.
+static DHCP_LOST: AtomicBool = AtomicBool::new(false);
+/// The last ACK's T1 / T2 seconds (options 58 / 59; 0 = absent), noted by `lease_note`.
+static ACK_T1: AtomicU32 = AtomicU32::new(0);
+static ACK_T2: AtomicU32 = AtomicU32::new(0);
+
+/// smoltcp's lease when the ACK carried no option 51 (`socket/dhcpv4.rs:20`, `DEFAULT_LEASE_DURATION`).
+const SMOLTCP_DEFAULT_LEASE_S: u64 = 120;
+
+/// From `service_poll`'s drain: a `Configured` event. No lease held -> the first lease, through `dhcp_apply` exactly as
+/// before (a late lease after `dhcp_acquire` gave up, or the next one after a loss). A lease held -> a renewal: compared
+/// with the live config; re-applied through `dhcp_apply` only when it moved; said either way.
+fn dhcp_renew(stack: &mut SmolStack, cidr: Ipv4Cidr, router: Option<Ipv4Address>, dns_srv: Option<Ipv4Address>) {
+    if !LEASED.load(Ordering::Relaxed) {
+        dhcp_apply(stack, cidr, router, dns_srv);
+        return;
+    }
+    let pack = |a: Ipv4Address| { let o = a.octets(); u32::from_be_bytes([o[0], o[1], o[2], o[3]]) };
+    let gw = router.unwrap_or(Ipv4Address::new(GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3]));
+    let same_addr = matches!(stack.iface.ip_addrs().first(), Some(IpCidr::Ipv4(c)) if *c == cidr);
+    let same_gw = CURRENT_GW.load(Ordering::Relaxed) == pack(gw);
+    let same_dns = dns_srv.map_or(true, |d| CURRENT_DNS.load(Ordering::Relaxed) == pack(d));
+    let same = same_addr && same_gw && same_dns;
+    if !same {
+        dhcp_apply(stack, cidr, router, dns_srv);
+        RENEW_CHANGED.fetch_add(1, Ordering::Relaxed);
+    }
+    RENEWS.fetch_add(1, Ordering::Relaxed);
+    let cap_ms = stack.dhcp.and_then(|h| stack.sockets.get::<dhcpv4::Socket>(h).max_lease_duration()).map(|d| d.total_millis());
+    let lease = lease_secs();
+    let t1 = t1_ms(lease, ACK_T1.load(Ordering::Relaxed), ACK_T2.load(Ordering::Relaxed), cap_ms);
+    let lease_word = match lease { Some(s) => alloc::format!("{}", s), None => alloc::string::String::from("unread") };
+    let a = cidr.address().octets();
+    if same {
+        serial_println!("[net] dhcp renewed lease={} ip=same t1_at={}", lease_word, now_ms() + t1 as i64);
+    } else {
+        serial_println!("[net] dhcp renewed lease={} ip=changed:{}.{}.{}.{} t1_at={}", lease_word, a[0], a[1], a[2], a[3], now_ms() + t1 as i64);
+    }
+}
+
+/// From `service_poll`, after the drain: a lost lease (`DHCP_LOST`) drops the address and the default route and clears
+/// the lease atomics, so the next `Configured` is a first lease again (the SOCK-5 line).
+fn dhcp_lost(stack: &mut SmolStack) {
+    if !DHCP_LOST.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    stack.iface.update_ip_addrs(|addrs| addrs.clear());
+    let _ = stack.iface.routes_mut().remove_default_ipv4_route();
+    LEASED.store(false, Ordering::Relaxed);
+    LEASE_IP.store(0, Ordering::Relaxed);
+    CURRENT_GW.store(0, Ordering::Relaxed);
+    CURRENT_DNS.store(0, Ordering::Relaxed);
+    serial_println!("[net] dhcp lease lost");
+}
+
+/// T1 in ms after the ACK, by smoltcp 0.14's own rule (`socket/dhcpv4.rs:470-476` the cap, `:512-544` T1/T2): the lease
+/// (option 51, else 120 s) capped by the socket's `max_lease_duration`; T1 = option 58 when T1 < T2 < lease (or only T1
+/// and T1 < lease), min(lease/2, T2) when only T2 < lease, else lease/2. `t1`/`t2` 0 = absent. Pure.
+fn t1_ms(lease_s: Option<u32>, t1: u32, t2: u32, cap_ms: Option<u64>) -> u64 {
+    let mut lease = lease_s.map_or(SMOLTCP_DEFAULT_LEASE_S, |s| s as u64) * 1000;
+    if let Some(c) = cap_ms {
+        lease = lease.min(c);
+    }
+    let r = if t1 == 0 { None } else { Some(t1 as u64 * 1000) };
+    let b = if t2 == 0 { None } else { Some(t2 as u64 * 1000) };
+    match (r, b) {
+        (Some(r), Some(b)) if r < b && b < lease => r,
+        (Some(r), None) if r < lease => r,
+        (None, Some(b)) if b < lease => (lease / 2).min(b),
+        _ => lease / 2,
+    }
+}
+
+/// `tests dhcprenew` (tests.rs tail): one renewal driven through smoltcp's PUBLIC socket API on the live lease (slirp's
+/// 86400 s lease puts T1 at 12 h): cap the lease at `cap_s` (`set_max_lease_duration`) and `reset()` the socket — the
+/// held lease is lost (`[net] dhcp lease lost`), the next ACK is capped, T1 lands cap/2 later and the renewal is said.
+/// The shell holds the main loop while a fixture runs, so this runs `service_poll` itself (netclock_selftest's shape)
+/// until the lease came back AND a renewal landed, or `budget_ms`; then the cap is lifted, so the next renewal takes the
+/// server's full lease. `Ok((reacquired, first lease seconds or 0, renewals, changed))`; `Err` = the SKIP reason.
+pub fn renew_probe(cap_s: u64, budget_ms: i64) -> Result<(bool, u32, u32, u32), &'static str> {
+    {
+        let mut g = STACK.lock();
+        let Some(stack) = g.as_mut() else { return Err("no-stack") };
+        let Some(h) = stack.dhcp else { return Err("no-dhcp-socket") };
+        if !LEASED.load(Ordering::Relaxed) {
+            return Err("no-lease");
+        }
+        let s = stack.sockets.get_mut::<dhcpv4::Socket>(h);
+        s.set_max_lease_duration(Some(smoltcp::time::Duration::from_secs(cap_s)));
+        s.reset();
+    }
+    kick();
+    let r0 = RENEWS.load(Ordering::Relaxed);
+    let c0 = RENEW_CHANGED.load(Ordering::Relaxed);
+    let start = now_ms();
+    let mut lost = false;
+    let mut reacquired = false;
+    let mut first = 0u32;
+    while now_ms() - start < budget_ms {
+        service_poll();
+        if !LEASED.load(Ordering::Relaxed) {
+            lost = true;
+        } else if lost && !reacquired {
+            reacquired = true;
+            first = lease_secs().unwrap_or(0);
+        }
+        if reacquired && RENEWS.load(Ordering::Relaxed) != r0 {
+            break;
+        }
+        for _ in 0..256 {
+            core::hint::spin_loop();
+        }
+    }
+    {
+        let mut g = STACK.lock();
+        if let Some(stack) = g.as_mut() {
+            if let Some(h) = stack.dhcp {
+                stack.sockets.get_mut::<dhcpv4::Socket>(h).set_max_lease_duration(None);
+            }
+        }
+    }
+    Ok((reacquired, first, RENEWS.load(Ordering::Relaxed).wrapping_sub(r0), RENEW_CHANGED.load(Ordering::Relaxed).wrapping_sub(c0)))
 }
