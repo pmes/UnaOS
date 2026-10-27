@@ -15,7 +15,10 @@
 //! half / quarter samples (H264ENC2, SR211). With [`Config::deblock`] the slices carry
 //! disable_deblocking_filter_idc 0 and the reconstruction passes h264_core's in-loop filter
 //! before it becomes the reference (else idc 1, unfiltered). Output as Annex B byte stream or as
-//! avcC samples with the AVCDecoderConfigurationRecord ([`Encoder::avcc`]).
+//! avcC samples with the AVCDecoderConfigurationRecord ([`Encoder::avcc`]). With [`Config::bframes`]
+//! (H264ENCBFRAMES SR333) up to 4 B pictures sit between anchors: Main profile, POC type 0, two
+//! reference frames (L0 the past anchor, L1 the future one), B_Skip / B_Direct_16x16 (spatial direct) /
+//! B_L0 / B_L1 / B_Bi_16x16, coded in decoding order through [`Encoder::push`] / [`Encoder::flush`].
 //!
 //! | [`Config`] field | range         | default | effect                                                  |
 //! |------------------|---------------|---------|---------------------------------------------------------|
@@ -27,6 +30,7 @@
 //! | `rate`           | `Option<RateControl>` | None | CBR / VBR: `qp` starts, [`rc`] picks each picture's and row's QP |
 //! | `entropy`        | [`Entropy`]   | Cavlc   | Cabac: Main profile, entropy_coding_mode_flag 1, [`cabac`] writes the slice data |
 //! | `transform8x8`   | bool          | false   | High (profile_idc 100), transform_8x8_mode_flag: Intra_8x8 in I macroblocks (SR322) |
+//! | `bframes`        | 0..=4         | 0       | B pictures between anchors (SR333): push / flush, VUI reorder 1 (>4 = 4) |
 //!
 //! | module          | Recommendation                                                          |
 //! |-----------------|-------------------------------------------------------------------------|
@@ -54,7 +58,7 @@
 //!
 //! Owed (handlers.md §5): two-pass / scene cuts / activity masking (inside H264ENC-RC), scaling matrices (inside H264ENC-CABAC; High's 8x8 transform is SR322's), the
 //! 16x8 / 8x16 / 8x8 partitions (inside H264ENC-SUBPEL), per-slice filter offsets (inside
-//! H264ENC-DEBLOCK), B-frames (H264ENC-BFRAMES), hardware encode (H264ENC-HW).
+//! H264ENC-DEBLOCK), pyramid / temporal-direct / weighted B (inside H264ENC-BFRAMES), hardware encode (H264ENC-HW).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -93,6 +97,9 @@ use crate::sps::SeqParams;
 pub enum Error {
     /// Width or height zero, odd (4:2:0 cropping is in units of 2) or above 16384.
     Geometry,
+    /// [`Encoder::encode`] under [`Config::bframes`] above 0: a reordered stream is coded through
+    /// [`Encoder::push`] / [`Encoder::flush`] (SR333).
+    Reorder,
     /// QP outside 16..=40.
     Qp,
     /// A GOP length of 0.
@@ -111,6 +118,7 @@ impl core::fmt::Display for Error {
             Error::Gop => "h264enc: GOP length 0",
             Error::FrameSize => "h264enc: frame does not match the configured size",
             Error::Rate => "h264enc: rate control with a zero bit rate / frame rate, or a VBR max below its mean",
+            Error::Reorder => "h264enc: B pictures are reordered: code through push / flush, not encode",
         })
     }
 }
@@ -145,7 +153,21 @@ pub struct Config {
     /// against Intra_4x4 by SATD). P macroblocks keep the 4x4 transform (transform_size_8x8_flag 0;
     /// their 8x8 choice by real bits is owed). false keeps every pinned byte.
     pub transform8x8: bool,
+    /// B pictures between anchors (H264ENCBFRAMES, SR333): 0 keeps every pinned byte (and [`Encoder::encode`]);
+    /// 1..=4 (above 4 read as 4) codes Main profile with POC type 0 through [`Encoder::push`] / [`Encoder::flush`].
+    pub bframes: u8,
 }
+
+/// The coding type of one picture: an IDR (I slice), a P anchor, or a non-reference B picture (SR333).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pic {
+    Idr,
+    P,
+    B,
+}
+
+/// SliceQPY of a B picture above its picture QP under constant QP (SR333): slice_qp_delta 2.
+pub const B_QP_OFFSET: i32 = 2;
 
 /// entropy_coding_mode_flag (7.4.2.2): CAVLC (9.2) or CABAC (9.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -175,6 +197,11 @@ pub struct Access {
     /// An IDR picture (the container's sync sample).
     pub keyframe: bool,
     pub nals: Vec<Vec<u8>>,
+    /// Presentation time in frames (SR333): the frame index, or under [`Config::bframes`] the display
+    /// index + 1 (the one-picture reorder delay, so `dts <= pts`).
+    pub pts: u64,
+    /// Decoding time in frames: the access unit's index in decoding order.
+    pub dts: u64,
 }
 
 impl Access {
@@ -219,6 +246,27 @@ pub(crate) enum Kind {
     I16,
     PSkip,
     P16,
+    /// B pictures (SR333): B_Skip, B_Direct_16x16 (spatial direct), B_L0_16x16, B_L1_16x16, B_Bi_16x16.
+    BSkip,
+    BDirect,
+    BL0,
+    BL1,
+    BBi,
+}
+
+impl Kind {
+    /// An inter macroblock with mb_type and residual syntax (not skipped, not intra).
+    pub(crate) fn inter_coded(self) -> bool {
+        matches!(self, Kind::P16 | Kind::BDirect | Kind::BL0 | Kind::BL1 | Kind::BBi)
+    }
+    /// Carries mvd_l0.
+    pub(crate) fn l0(self) -> bool {
+        matches!(self, Kind::P16 | Kind::BL0 | Kind::BBi)
+    }
+    /// Carries mvd_l1.
+    pub(crate) fn l1(self) -> bool {
+        matches!(self, Kind::BL1 | Kind::BBi)
+    }
 }
 
 /// The decided syntax of one macroblock: modes, motion and levels (raster within each block, as
@@ -229,8 +277,10 @@ pub(crate) struct MbCode {
     pub modes: [u8; 16],
     pub i16_mode: u8,
     pub chroma_mode: u8,
-    /// mvd_l0 of P_L0_16x16 (quarter samples).
+    /// mvd_l0 of P_L0_16x16 / B_L0 / B_Bi (quarter samples).
     pub mvd: [i32; 2],
+    /// mvd_l1 of B_L1_16x16 / B_Bi_16x16 (SR333).
+    pub mvd1: [i32; 2],
     /// CodedBlockPatternLuma | CodedBlockPatternChroma << 4.
     pub cbp: u8,
     /// Intra16x16DCLevel (raster 4x4).
@@ -250,7 +300,7 @@ pub(crate) struct MbCode {
 
 impl MbCode {
     pub fn new(kind: Kind) -> MbCode {
-        MbCode { kind, modes: [2; 16], i16_mode: 0, chroma_mode: 0, mvd: [0; 2], cbp: 0, dc: [0; 16], luma: [[0; 16]; 16], cdc: [[0; 4]; 2], cac: [[[0; 16]; 4]; 2], t8x8: false, luma8: [[0; 64]; 4] }
+        MbCode { kind, modes: [2; 16], i16_mode: 0, chroma_mode: 0, mvd: [0; 2], mvd1: [0; 2], cbp: 0, dc: [0; 16], luma: [[0; 16]; 16], cdc: [[0; 4]; 2], cac: [[[0; 16]; 4]; 2], t8x8: false, luma8: [[0; 64]; 4] }
     }
 
     /// CodedBlockPatternLuma: bit b8 when a block of that 8x8 (or the 8x8 itself, `t8x8`) has a level.
@@ -303,14 +353,20 @@ pub struct Encoder {
     pub(crate) src: [Plane; 3],
     /// The picture being reconstructed.
     pub(crate) rec: [Plane; 3],
-    /// The previous reconstruction: the reference of a P picture.
+    /// The previous reconstruction: the reference of a P picture (under `bframes` the past anchor, L0).
     pub(crate) refp: [Plane; 3],
+    /// The future anchor, a B picture's L1 reference (SR333; unused without `bframes`).
+    pub(crate) fwd: [Plane; 3],
     crop: [Vec<u8>; 3],
     pub(crate) nnz: Nnz,
     /// Intra4x4PredMode per 4x4 block of the picture (2 for any block not coded Intra_4x4).
     pub(crate) modes: Vec<u8>,
-    /// Motion per macroblock of the current P picture.
+    /// Motion per macroblock of the current P picture (list 0 of a B picture).
     pub(crate) motion: Vec<MbMotion>,
+    /// List-1 motion per macroblock of the current B picture (SR333).
+    pub(crate) motion1: Vec<MbMotion>,
+    /// The last anchor's motion: the co-located macroblocks of spatial direct (NONE after an IDR).
+    pub(crate) col: Vec<MbMotion>,
     /// The deblocking filter's per-macroblock facts of the current picture ([`deblock`]).
     pub(crate) dinfo: Vec<MbInfo>,
     /// The deblocking filter's per-4x4 motion of the current picture ([`deblock`]).
@@ -318,6 +374,16 @@ pub struct Encoder {
     frames: u64,
     idr_count: u32,
     frame_num: u32,
+    /// The padded sources held for B coding, with their display indices (SR333).
+    ahead: Vec<([Plane; 3], u64)>,
+    /// The cropped reconstruction of each access unit the last push / flush returned.
+    recons: Vec<[Vec<u8>; 3]>,
+    /// Access units coded so far (the next one's dts).
+    coded: u64,
+    /// Display index of the last IDR (POC 0).
+    idr_display: u64,
+    /// log2_max_pic_order_cnt_lsb (POC type 0, under `bframes` only).
+    log2_max_poc_lsb: u32,
 }
 
 impl Encoder {
@@ -332,7 +398,7 @@ impl Encoder {
             return Err(Error::Gop);
         }
         let rc = match cfg.rate {
-            Some(r) => Some(rc::Rc::new(r, cfg.gop, cfg.qp as i32)?),
+            Some(r) => Some(rc::Rc::new(r, cfg.gop, cfg.qp as i32)?.with_bframes(cfg.bframes.min(4))),
             None => None,
         };
         let (mb_w, mb_h) = (cfg.width.div_ceil(16) as usize, cfg.height.div_ceil(16) as usize);
@@ -341,9 +407,14 @@ impl Encoder {
         while log2_max_frame_num < 16 && (1u64 << log2_max_frame_num) < cfg.gop as u64 {
             log2_max_frame_num += 1;
         }
+        let mut log2_max_poc_lsb = 4;
+        while log2_max_poc_lsb < 16 && (1u64 << log2_max_poc_lsb) < 4 * cfg.gop as u64 {
+            log2_max_poc_lsb += 1;
+        }
         let cabac = cfg.entropy == Entropy::Cabac;
         let high = cfg.transform8x8;
-        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high };
+        let reorder = cfg.bframes > 0;
+        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high, reorder, log2_max_poc_lsb };
         let sps = nal::nal_unit(3, nal::NAL_SPS, &sps::write_sps(&p));
         let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp, cabac, high));
         let planes = || [Plane::new(mb_w * 16, mb_h * 16, 0), Plane::new(mb_w * 8, mb_h * 8, 128), Plane::new(mb_w * 8, mb_h * 8, 128)];
@@ -364,15 +435,23 @@ impl Encoder {
             src: planes(),
             rec: planes(),
             refp: planes(),
+            fwd: planes(),
             crop: [vec![0; w * h], vec![128; w * h / 4], vec![128; w * h / 4]],
             nnz: Nnz::new(mb_w, mb_h),
             modes: vec![2; mb_w * mb_h * 16],
             motion: vec![MbMotion::NONE; mb_w * mb_h],
+            motion1: vec![MbMotion::NONE; mb_w * mb_h],
+            col: vec![MbMotion::NONE; mb_w * mb_h],
             dinfo: vec![MbInfo::default(); mb_w * mb_h],
             dmo: Motion::new(mb_w, mb_h),
             frames: 0,
             idr_count: 0,
             frame_num: 0,
+            ahead: Vec::new(),
+            recons: Vec::new(),
+            coded: 0,
+            idr_display: 0,
+            log2_max_poc_lsb,
         })
     }
 
@@ -406,21 +485,96 @@ impl Encoder {
         [&self.crop[0], &self.crop[1], &self.crop[2]]
     }
 
+    /// The cropped reconstruction of each access unit the last [`Encoder::push`] / [`Encoder::flush`]
+    /// returned, in the same (decoding) order (SR333).
+    pub fn reconstructions(&self) -> &[[Vec<u8>; 3]] {
+        &self.recons
+    }
+
     /// Encode the next frame: an IDR when the frame index is a multiple of the GOP, else a P frame.
+    /// Under [`Config::bframes`] above 0 it refuses ([`Error::Reorder`]): see [`Encoder::push`].
     pub fn encode(&mut self, f: &Yuv420) -> Result<Access> {
+        if self.cfg.bframes > 0 {
+            return Err(Error::Reorder);
+        }
         self.load(f)?;
         let idr = self.frames.is_multiple_of(self.cfg.gop as u64);
-        self.frame_num = if idr { 0 } else { (self.frame_num + 1) % (1 << self.log2_max_frame_num) };
-        let slice_qp = self.rc_picture(idr);
+        let au = self.code(if idr { Pic::Idr } else { Pic::P }, self.frames);
+        self.frames += 1;
+        Ok(au)
+    }
+
+    /// Take the next frame in output order (SR333) and return the access units it releases, in decoding
+    /// order. Without `bframes` that is [`Encoder::encode`]'s one unit. With `bframes`, display index
+    /// k = frame % gop: k 0 is an IDR; k a multiple of bframes + 1, or the last frame before the next IDR,
+    /// is a P anchor, coded at once and followed by the B pictures held since the previous anchor; any
+    /// other frame is held (no units). [`Encoder::reconstructions`] holds the units' reconstructions.
+    pub fn push(&mut self, f: &Yuv420) -> Result<Vec<Access>> {
+        self.recons.clear();
+        if self.cfg.bframes == 0 {
+            let au = self.encode(f)?;
+            self.recons.push(self.crop.clone());
+            return Ok(vec![au]);
+        }
+        self.load(f)?;
+        let (b, gop) = (self.cfg.bframes.min(4) as u64, self.cfg.gop as u64);
+        let (display, k) = (self.frames, self.frames % gop);
+        self.frames += 1;
+        if k != 0 && k % (b + 1) != 0 && k + 1 != gop {
+            self.ahead.push((self.src.clone(), display));
+            return Ok(Vec::new());
+        }
+        Ok(self.group(if k == 0 { Pic::Idr } else { Pic::P }, display))
+    }
+
+    /// Drain the held frames at the end of the stream (SR333): the last becomes a P anchor, the rest B.
+    pub fn flush(&mut self) -> Result<Vec<Access>> {
+        self.recons.clear();
+        let Some((planes, display)) = self.ahead.pop() else { return Ok(Vec::new()) };
+        self.src = planes;
+        Ok(self.group(Pic::P, display))
+    }
+
+    /// Code the anchor in `src`, then each held frame as a B picture between the previous anchor (L0)
+    /// and it (L1); the new anchor then becomes L0.
+    fn group(&mut self, pic: Pic, display: u64) -> Vec<Access> {
+        let mut out = vec![self.code(pic, display)];
+        self.recons.push(self.crop.clone());
+        for (planes, d) in core::mem::take(&mut self.ahead) {
+            self.src = planes;
+            out.push(self.code(Pic::B, d));
+            self.recons.push(self.crop.clone());
+        }
+        core::mem::swap(&mut self.refp, &mut self.fwd);
+        out
+    }
+
+    /// Code the picture in `src` as `pic` at display index `display`: one slice, its reconstruction
+    /// and (an anchor) the reference update.
+    fn code(&mut self, pic: Pic, display: u64) -> Access {
+        let idr = pic == Pic::Idr;
+        let bpic = pic == Pic::B;
+        // frame_num: PrevRefFrameNum + 1; a B picture (nal_ref_idc 0) does not move PrevRefFrameNum.
+        let frame_num = if idr { 0 } else { (self.frame_num + 1) % (1 << self.log2_max_frame_num) };
+        if !bpic {
+            self.frame_num = frame_num;
+        }
+        if idr {
+            self.idr_display = display;
+        }
+        let slice_qp = self.rc_picture(pic);
+        self.set_qp(slice_qp);
         self.qp_pred = slice_qp;
         self.nnz.reset();
         self.modes.fill(2);
         self.motion.fill(MbMotion::NONE);
+        self.motion1.fill(MbMotion::NONE);
         let mut w = BitWriter::new();
         let is_cabac = self.cfg.entropy == Entropy::Cabac;
-        sps::write_slice_header(&mut w, idr, self.frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, self.cfg.deblock, slice_qp - self.cfg.qp as i32, is_cabac);
+        let poc = (self.cfg.bframes > 0).then(|| ((2 * (display - self.idr_display) % (1u64 << self.log2_max_poc_lsb)) as u32, self.log2_max_poc_lsb));
+        sps::write_slice_header(&mut w, pic, frame_num, self.log2_max_frame_num, self.idr_count & 0xffff, poc, self.cfg.deblock, slice_qp - self.cfg.qp as i32, is_cabac);
         let hdr = w.bits();
-        // CABAC (SR310): the slice data's writer, contexts for I (column 0) or P with cabac_init_idc 0.
+        // CABAC (SR310): the slice data's writer, contexts for I (column 0) or P / B with cabac_init_idc 0.
         let mut cw = is_cabac.then(|| cabac::Writer::new(&mut w, if idr { 0 } else { 1 }, slice_qp, self.mb_w * self.mb_h));
         let mut run = 0u32;
         for mby in 0..self.mb_h {
@@ -430,15 +584,15 @@ impl Encoder {
                     let code = self.intra_mb(mbx, mby);
                     self.note_mb(mbx, mby, &code);
                     match &mut cw {
-                        Some(c) => self.write_mb_cabac(&mut w, c, mbx, mby, &code, false),
+                        Some(c) => self.write_mb_cabac(&mut w, c, mbx, mby, &code, pic),
                         None => self.write_mb(&mut w, mbx, mby, &code, false),
                     }
                 } else {
-                    let code = self.inter_mb(mbx, mby);
+                    let code = if bpic { self.b_mb(mbx, mby) } else { self.inter_mb(mbx, mby) };
                     self.note_mb(mbx, mby, &code);
                     if let Some(c) = &mut cw {
-                        self.write_mb_cabac(&mut w, c, mbx, mby, &code, true);
-                    } else if code.kind == Kind::PSkip {
+                        self.write_mb_cabac(&mut w, c, mbx, mby, &code, pic);
+                    } else if matches!(code.kind, Kind::PSkip | Kind::BSkip) {
                         run += 1;
                     } else {
                         w.ue(run); // mb_skip_run
@@ -456,18 +610,31 @@ impl Encoder {
             }
             w.trailing();
         }
-        let slice = nal::nal_unit(3, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
+        // A B picture is never a reference: nal_ref_idc 0.
+        let slice = nal::nal_unit(if bpic { 0 } else { 3 }, if idr { nal::NAL_IDR } else { nal::NAL_SLICE }, &w.finish());
         let nals = if idr { vec![self.sps.clone(), self.pps.clone(), slice] } else { vec![slice] };
         self.rc_update(nals.iter().map(|n| n.len() as u64 * 8).sum());
         self.last_qp = slice_qp;
         self.deblock();
         self.store_crop();
-        core::mem::swap(&mut self.rec, &mut self.refp);
-        self.frames += 1;
+        if self.cfg.bframes == 0 {
+            core::mem::swap(&mut self.rec, &mut self.refp);
+        } else if !bpic {
+            // The new anchor is the held B pictures' L1 (`group` makes it L0 after them); its motion is
+            // their co-located motion.
+            core::mem::swap(&mut self.rec, &mut self.fwd);
+            if idr {
+                self.col.fill(MbMotion::NONE);
+            } else {
+                self.col.copy_from_slice(&self.motion);
+            }
+        }
         if idr {
             self.idr_count = self.idr_count.wrapping_add(1);
         }
-        Ok(Access { keyframe: idr, nals })
+        let au = Access { keyframe: idr, nals, pts: display + (self.cfg.bframes > 0) as u64, dts: self.coded };
+        self.coded += 1;
+        au
     }
 
     /// Copy the input into the macroblock-padded source planes, replicating the last column / row.
@@ -602,16 +769,29 @@ impl Encoder {
                 w.ue(off + 1 + code.i16_mode as u32 + 4 * (code.cbp >> 4) as u32 + luma);
                 w.ue(code.chroma_mode as u32);
             }
-            Kind::P16 => {
-                w.ue(0); // P_L0_16x16; ref_idx_l0 absent (one active reference)
-                w.se(code.mvd[0]);
-                w.se(code.mvd[1]);
+            Kind::P16 | Kind::BDirect | Kind::BL0 | Kind::BL1 | Kind::BBi => {
+                // P_L0_16x16 0 in a P slice; B_Direct_16x16 0, B_L0_16x16 1, B_L1_16x16 2, B_Bi_16x16 3 in a B
+                // slice (Table 7-14); ref_idx absent (one active reference per list); every mvd_l0 before mvd_l1.
+                w.ue(match code.kind {
+                    Kind::BL0 => 1,
+                    Kind::BL1 => 2,
+                    Kind::BBi => 3,
+                    _ => 0,
+                });
+                if code.kind.l0() {
+                    w.se(code.mvd[0]);
+                    w.se(code.mvd[1]);
+                }
+                if code.kind.l1() {
+                    w.se(code.mvd1[0]);
+                    w.se(code.mvd1[1]);
+                }
                 w.ue(cbp_code(&CBP_INTER, code.cbp));
                 if self.cfg.transform8x8 && code.cbp & 15 != 0 {
                     w.flag(code.t8x8); // transform_size_8x8_flag
                 }
             }
-            Kind::PSkip => return,
+            Kind::PSkip | Kind::BSkip => return,
         }
         if code.cbp != 0 || code.kind == Kind::I16 {
             w.se(self.qp - self.qp_pred); // mb_qp_delta (0 at constant QP); QPY,pred moves as h264_core's mb.rs moves it

@@ -19,6 +19,10 @@
 //! H264ENC8X8 (SR322): `t8x8` (the filter's transform_size_8x8 edge rule: h264_core's
 //! `deblock_picture` skips the odd internal edges of such a macroblock), kind I8x8, and an 8x8's
 //! level marking all four of its 4x4s in `nz` and `cbf`, as h264_core's `parse_residual` records them.
+//!
+//! H264ENCBFRAMES (SR333): the B kinds (BSkip, BDirect, Inter) and both lists' motion per 4x4: refIdx
+//! per list and the reference's id, 0 the past anchor (L0) and 1 the future one (L1); h264_core's
+//! `boundary_strength` applies the bi-predicted / mixed-reference rules over those ids itself.
 
 use h264_core::deblock::{deblock_picture, SliceDeblock};
 use h264_core::picture::{MbKind, Mv, BLK_X, BLK_Y, CBF_CHROMA_AC, CBF_CHROMA_DC, CBF_LUMA_DC};
@@ -27,7 +31,7 @@ use crate::{Encoder, Entropy, Kind, MbCode};
 
 impl Encoder {
     /// Record the deblocking facts of the coded macroblock (mbx, mby) (its motion is already in
-    /// `self.motion`).
+    /// `self.motion` / `self.motion1`).
     pub(crate) fn note_mb(&mut self, mbx: usize, mby: usize, code: &MbCode) {
         if !self.cfg.deblock && self.cfg.entropy == Entropy::Cavlc {
             return;
@@ -39,13 +43,15 @@ impl Encoder {
             }
             Kind::I16 => MbKind::I16x16,
             Kind::PSkip => MbKind::PSkip,
-            Kind::P16 => MbKind::Inter,
+            Kind::P16 | Kind::BL0 | Kind::BL1 | Kind::BBi => MbKind::Inter,
+            Kind::BSkip => MbKind::BSkip,
+            Kind::BDirect => MbKind::BDirect,
         };
         let intra = kind.is_intra();
         // The decoder's nz: TotalCoeff > 0 per luma 4x4 block (by luma4x4BlkIdx). Intra edges are
-        // bS 3 / 4 before nz is read, and a P_Skip has no levels.
+        // bS 3 / 4 before nz is read, and a P_Skip / B_Skip has no levels.
         let mut nz = 0u16;
-        if code.kind == Kind::P16 {
+        if code.kind.inter_coded() {
             for blk in 0..16 {
                 if luma_coded(code, blk) {
                     nz |= 1 << blk;
@@ -61,7 +67,7 @@ impl Encoder {
         info.nz = nz;
         info.chroma_mode = code.chroma_mode;
         info.cbf = cbf_bits(code);
-        let m = self.motion[i];
+        let (m, m1) = (self.motion[i], self.motion1[i]);
         let w4 = self.dmo.w4;
         for blk in 0..16 {
             let g = (mby * 4 + BLK_Y[blk]) * w4 + mbx * 4 + BLK_X[blk];
@@ -70,9 +76,11 @@ impl Encoder {
                 self.dmo.ref_idx[g] = [-1, -1];
                 self.dmo.ref_id[g] = [-1, -1];
             } else {
-                self.dmo.mv[g] = [m.mv, Mv::ZERO];
-                self.dmo.ref_idx[g] = [0, -1];
-                self.dmo.ref_id[g] = [0, -1];
+                // A P macroblock: [mvL0, 0], [0, -1], [0, -1] (motion1 is NONE outside B pictures).
+                let used = |r: i32| r >= 0;
+                self.dmo.mv[g] = [if used(m.r) { m.mv } else { Mv::ZERO }, if used(m1.r) { m1.mv } else { Mv::ZERO }];
+                self.dmo.ref_idx[g] = [m.r.max(-1) as i8, m1.r.max(-1) as i8];
+                self.dmo.ref_id[g] = [if used(m.r) { 0 } else { -1 }, if used(m1.r) { 1 } else { -1 }];
             }
         }
         self.dmo.mb_intra[i] = intra;

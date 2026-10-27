@@ -295,3 +295,60 @@ fn h264_bitrate_export_is_the_rate_controlled_encoder() {
     let bytes: usize = want.iter().map(|s| s.len()).sum();
     println!("h264 --bitrate 40 export: {bytes} bytes over 35 frames at 25 fps = {:.1} kbit/s", bytes as f64 * 8.0 * 25.0 / 35.0 / 1000.0);
 }
+
+/// H264ENCBFRAMES (SR333): `H264Encoder::with_bframes(2)` exports B pictures. The movie's samples are a fresh encoder's
+/// `push` / `flush` units in decoding order; demux_core reads back the stored dts (strictly increasing) and the `ctts`
+/// composition offsets (pts = display + 1, dts <= pts); the avcC's VUI gives the Player's reorder depth 1; the Player's
+/// decoder (`decoder_for`) fed in decoding order outputs every frame in display order equal to the reconstruction.
+#[test]
+fn h264_bframes_export_writes_composition_offsets() {
+    use gneiss_pal::dsp::video::reorder_depth;
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let dir = fresh("h264bframes");
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 10).with_bframes(2)), AudioOut::Mp4).unwrap();
+    assert_eq!(r.frames, 35);
+    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop: 10, bframes: 2, ..Default::default() }).unwrap();
+    let (mut want, mut recon) = (Vec::new(), Vec::new());
+    for f in &refr.frames {
+        want.extend(enc.push(&I420::from_rgba(64, 48, f).unwrap().as_yuv420()).unwrap());
+        recon.extend(enc.reconstructions().iter().cloned());
+    }
+    want.extend(enc.flush().unwrap());
+    recon.extend(enc.reconstructions().iter().cloned());
+    assert_eq!((want.len(), recon.len()), (35, 35));
+
+    let d = Demuxer::open(std::fs::read(dir.join("movie.mp4")).unwrap()).unwrap();
+    let vt = d.tracks()[0].clone();
+    assert_eq!((vt.codec.clone(), vt.sample_count), (Codec::Avc, 35));
+    assert_eq!(vt.config, enc.avcc());
+    assert_eq!(reorder_depth(&vt), Some(1), "the avcC's VUI max_num_reorder_frames");
+    let mut dec = decoder_for(&vt).unwrap();
+    let (mut frames, mut pts, mut offsets) = (Vec::new(), Vec::new(), Vec::new());
+    let mut last_dts = -1;
+    for (i, s) in d.track_samples(0).copied().collect::<Vec<_>>().iter().enumerate() {
+        let pk = d.packet_at(s);
+        assert_eq!(pk.data, want[i].avcc_sample(), "sample {i} is the encoder's access unit");
+        assert_eq!((pk.dts, pk.pts), (want[i].dts as i64, want[i].pts as i64), "sample {i} (dts, pts) at the project fps");
+        assert!(pk.dts > last_dts && pk.dts <= pk.pts, "sample {i}: dts {} pts {}", pk.dts, pk.pts);
+        assert_eq!(pk.keyframe, want[i].keyframe, "sample {i} sync flag");
+        last_dts = pk.dts;
+        pts.push(pk.pts);
+        offsets.push(pk.pts - pk.dts);
+        frames.extend(dec.decode(&pk).unwrap());
+    }
+    frames.extend(dec.flush());
+    assert!(offsets.iter().any(|&o| o != offsets[0]), "the ctts carries the reorder");
+    pts.sort();
+    assert_eq!(pts, (1..=35).collect::<Vec<i64>>(), "every frame presented once, from tick 1");
+    assert_eq!(frames.len(), 35);
+    let mut order: Vec<usize> = (0..35).collect();
+    order.sort_by_key(|&i| want[i].pts);
+    for (k, f) in frames.iter().enumerate() {
+        let Pixels::I420 { y, u, v, .. } = &f.pixels else { panic!("frame {k} not I420") };
+        assert_eq!([y.clone(), u.clone(), v.clone()], recon[order[k]], "frame {k}: decode differs from the reconstruction");
+    }
+    let bytes: usize = want.iter().map(|a| a.avcc_sample().len()).sum();
+    println!("h264 bframes 2 export: {bytes} bytes, ctts offsets {offsets:?}");
+}

@@ -20,6 +20,10 @@
 //! sub_mb_type and ref_idx_l0. Not written either: I_PCM. H264ENC8X8 (SR322) adds transform_size_8x8_flag
 //! (ctxIdx 399..401) and ctxBlockCat 5 (the 8x8 luma block, no coded_block_flag) over h264_core's
 //! `SIG_COEFF_8X8_FRAME` / `LAST_COEFF_8X8`.
+//!
+//! H264ENCBFRAMES (SR333): B slices — mb_skip_flag at ctxIdx 24..26, the B mb_type bins of Table 9-37
+//! (B_Direct_16x16 / B_L0_16x16 / B_L1_16x16 / B_Bi_16x16 at ctxIdx 27..35, h264_core `cabac_mb_type`),
+//! and mvd_l1 beside mvd_l0 with the |mvd| neighbour facts kept per list.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -29,7 +33,7 @@ use h264_core::picture::{blk_at, MbInfo, MbKind, BLK_X, BLK_Y, CBF_CHROMA_AC, CB
 use h264_core::tables::{LAST_COEFF_8X8, RANGE_TAB_LPS, SIG_COEFF_8X8_FRAME, TRANS_IDX_LPS, TRANS_IDX_MPS};
 
 use crate::nal::BitWriter;
-use crate::{intra, mode_at, mode_fields, scan, scan8, Encoder, Kind, MbCode};
+use crate::{intra, mode_at, mode_fields, scan, scan8, Encoder, Kind, MbCode, Pic};
 
 /// ctxIdxOffset (Table 9-34, frame coding) of significant_coeff_flag, last_significant_coeff_flag
 /// and coeff_abs_level_minus1 for ctxBlockCat < 5 (the literals of h264_core's `residual_block`).
@@ -59,8 +63,9 @@ pub struct Writer {
     first: bool,
     /// pStateIdx << 1 | valMPS per ctxIdx (h264_core's layout).
     state: [u8; NUM_CTX],
-    /// Absolute mvd_l0 (x, y) per macroblock, capped at 255 as the decoder's `put_mvd` stores it.
-    mvd: Vec<[u8; 2]>,
+    /// Absolute mvd (x, y) per macroblock and list (SR333: [l0, l1]), capped at 255 as the decoder's
+    /// `put_mvd` stores it.
+    mvd: Vec<[[u8; 2]; 2]>,
     /// mb_qp_delta of the previous macroblock in decoding order was non-zero (9.3.3.1.1.5).
     prev_qp_nz: bool,
 }
@@ -76,7 +81,7 @@ impl Writer {
         }
         let mut init = Cabac::new(&[], 0);
         init.init_contexts(column, slice_qp);
-        Writer { low: 0, range: 510, outstanding: 0, first: true, state: *init.contexts(), mvd: vec![[0; 2]; mbs], prev_qp_nz: false }
+        Writer { low: 0, range: 510, outstanding: 0, first: true, state: *init.contexts(), mvd: vec![[[0; 2]; 2]; mbs], prev_qp_nz: false }
     }
 
     /// Bits the encoder holds and has not yet put (codILow's 10 and the outstanding ones): added to
@@ -383,19 +388,21 @@ impl Encoder {
         }
     }
 
-    /// One macroblock of a CABAC slice (7.3.4 / 7.3.5): mb_skip_flag in a P slice, then
+    /// One macroblock of a CABAC slice (7.3.4 / 7.3.5): mb_skip_flag in a P / B slice, then
     /// macroblock_layer in h264_core `parse_mb`'s element order, then end_of_slice_flag (a 1 after
     /// the picture's last macroblock flushes the encoder). The CABAC twin of `write_mb`; the
     /// macroblock's facts are already in `dinfo` (`note_mb` runs first).
-    pub(crate) fn write_mb_cabac(&mut self, w: &mut BitWriter, c: &mut Writer, mbx: usize, mby: usize, code: &MbCode, p_slice: bool) {
+    pub(crate) fn write_mb_cabac(&mut self, w: &mut BitWriter, c: &mut Writer, mbx: usize, mby: usize, code: &MbCode, slice: Pic) {
         let addr = mby * self.mb_w + mbx;
         let last = addr + 1 == self.mb_w * self.mb_h;
         let (ma, mb) = self.cabac_ab(mbx, mby);
-        c.mvd[addr] = [0; 2];
+        let p_slice = slice != Pic::Idr;
+        c.mvd[addr] = [[0; 2]; 2];
         if p_slice {
             let cond = |m: Option<usize>| m.is_some_and(|m| !self.dinfo[m].kind.is_skip()) as usize;
-            let skip = code.kind == Kind::PSkip;
-            c.decision(w, 11 + cond(ma) + cond(mb), skip as u32); // mb_skip_flag
+            let skip = matches!(code.kind, Kind::PSkip | Kind::BSkip);
+            let base = if slice == Pic::B { 24 } else { 11 };
+            c.decision(w, base + cond(ma) + cond(mb), skip as u32); // mb_skip_flag
             if skip {
                 c.prev_qp_nz = false;
                 c.terminate(w, last);
@@ -453,20 +460,37 @@ impl Encoder {
                 c.decision(w, 14, 0);
                 c.decision(w, 15, 0);
                 c.decision(w, 16, 0);
-                let abs = |m: Option<usize>, comp: usize| m.map_or(0u32, |m| c.mvd[m][comp] as u32);
-                let sums = [abs(ma, 0) + abs(mb, 0), abs(ma, 1) + abs(mb, 1)];
-                for comp in 0..2 {
-                    c.mvd(w, comp, sums[comp], code.mvd[comp]);
-                }
-                c.mvd[addr] = [code.mvd[0].unsigned_abs().min(255) as u8, code.mvd[1].unsigned_abs().min(255) as u8];
+                self.cabac_mvds(w, c, addr, ma, mb, code);
             }
-            Kind::PSkip => unreachable!("P_Skip in an I slice"),
+            Kind::BDirect | Kind::BL0 | Kind::BL1 | Kind::BBi => {
+                // B mb_type (Table 9-37, h264_core `cabac_mb_type`): bin 0 at 27 + (A / B available and not
+                // B_Skip / B_Direct_16x16): B_Direct_16x16 `0`; B_L0_16x16 `1 0 0`, B_L1_16x16 `1 0 1` (bins at 30,
+                // 32); B_Bi_16x16 `1 1 0 0 0 0` (bins at 30, 31, 32, 32, 32). ref_idx absent (one per list).
+                let cond = |m: Option<usize>| m.is_some_and(|m| !matches!(self.dinfo[m].kind, MbKind::BSkip | MbKind::BDirect)) as usize;
+                c.decision(w, 27 + cond(ma) + cond(mb), (code.kind != Kind::BDirect) as u32);
+                match code.kind {
+                    Kind::BL0 | Kind::BL1 => {
+                        c.decision(w, 30, 0);
+                        c.decision(w, 32, (code.kind == Kind::BL1) as u32);
+                    }
+                    Kind::BBi => {
+                        c.decision(w, 30, 1);
+                        c.decision(w, 31, 0);
+                        for _ in 0..3 {
+                            c.decision(w, 32, 0);
+                        }
+                    }
+                    _ => {}
+                }
+                self.cabac_mvds(w, c, addr, ma, mb, code);
+            }
+            Kind::PSkip | Kind::BSkip => unreachable!("a skipped macroblock in an I slice"),
         }
         if code.kind != Kind::I16 {
             self.cabac_cbp(w, c, mbx, mby, code);
         }
-        if self.cfg.transform8x8 && code.kind == Kind::P16 && code.cbp & 15 != 0 {
-            self.cabac_t8x8(w, c, mbx, mby, code.t8x8);
+        if self.cfg.transform8x8 && code.kind.inter_coded() && code.cbp & 15 != 0 {
+            self.cabac_t8x8(w, c, mbx, mby, code.t8x8); // B_Direct_16x16 too: direct_8x8_inference_flag 1
         }
         if code.cbp != 0 || code.kind == Kind::I16 {
             c.qp_delta(w, self.qp - self.qp_pred); // QPY,pred moves as h264_core's mb.rs moves it
@@ -476,6 +500,22 @@ impl Encoder {
             c.prev_qp_nz = false;
         }
         c.terminate(w, last); // end_of_slice_flag
+    }
+
+    /// mvd_l0 (x, y) when the macroblock carries it, then mvd_l1 (h264_core `parse_mb_pred_inter`'s order),
+    /// each with absMvdComp of the left + the upper macroblock in the same list; the |mvd| kept per list.
+    fn cabac_mvds(&self, w: &mut BitWriter, c: &mut Writer, addr: usize, ma: Option<usize>, mb: Option<usize>, code: &MbCode) {
+        for (list, used, mvd) in [(0usize, code.kind.l0(), code.mvd), (1, code.kind.l1(), code.mvd1)] {
+            if !used {
+                continue;
+            }
+            let abs = |m: Option<usize>, comp: usize| m.map_or(0u32, |m| c.mvd[m][list][comp] as u32);
+            let sums = [abs(ma, 0) + abs(mb, 0), abs(ma, 1) + abs(mb, 1)];
+            for comp in 0..2 {
+                c.mvd(w, comp, sums[comp], mvd[comp]);
+            }
+            c.mvd[addr][list] = [mvd[0].unsigned_abs().min(255) as u8, mvd[1].unsigned_abs().min(255) as u8];
+        }
     }
 
     /// transform_size_8x8_flag (ctxIdx 399 + condTermFlagA + condTermFlagB, 9.3.3.1.1.10: the neighbour
