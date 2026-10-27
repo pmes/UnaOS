@@ -24,3 +24,6 @@ pub mod model;
 
 #[cfg(all(target_os = "linux", feature = "gtk"))]
 pub mod telemetry;
+
+// AETHERMACCHROME (SR205): the browser chrome face's rows and text from the Browser* wire (every target; host-tested).
+pub mod chrome_rows;

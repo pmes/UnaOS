@@ -63,3 +63,21 @@ pub fn bootstrap_button(
         Retained::cast_unchecked::<NSView>(btn)
     }
 }
+
+/// AETHERMACCHROME (SR205): [`bootstrap_button`] with the click's closure given instead of a fixed message (the find
+/// bar's arrows read the field's text; a download row's dismiss removes the row).
+pub fn bootstrap_button_with(label: &str, action: Box<dyn Fn()>) -> Retained<NSView> {
+    unsafe {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(40.0, 24.0));
+        let btn: Allocated<UnaButton> = msg_send![UnaButton::class(), alloc];
+        let btn: Retained<UnaButton> = msg_send![btn, initWithFrame: frame];
+        let title = NSString::from_str(label);
+        let _: () = msg_send![&btn, setTitle: &*title];
+        // 1isize = NSRoundedBezelStyle
+        let _: () = msg_send![&btn, setBezelStyle: 1isize];
+        let _: () = msg_send![&btn, setTarget: &*btn];
+        let _: () = msg_send![&btn, setAction: objc2::sel!(onAction:)];
+        *btn.ivars().action.borrow_mut() = Some(action);
+        Retained::cast_unchecked::<NSView>(btn)
+    }
+}

@@ -119,3 +119,19 @@ pub fn bootstrap_text_field(
         Retained::cast_unchecked::<NSView>(field)
     }
 }
+
+/// AETHERMACCHROME (SR205): [`bootstrap_text_field`] with Enter's closure given instead of a `TextAction` (the find
+/// bar's field fires `BrowserFind`); the field is returned typed so its owner can read `stringValue` and focus it.
+pub fn bootstrap_text_field_with(placeholder: &str, action: Box<dyn Fn(String)>) -> Retained<UnaTextField> {
+    unsafe {
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(220.0, 24.0));
+        let field: Allocated<UnaTextField> = msg_send![UnaTextField::class(), alloc];
+        let field: Retained<UnaTextField> = msg_send![field, initWithFrame: frame];
+        let placeholder_str = NSString::from_str(placeholder);
+        let _: () = msg_send![&field, setPlaceholderString: &*placeholder_str];
+        let _: () = msg_send![&field, setTarget: &*field];
+        let _: () = msg_send![&field, setAction: objc2::sel!(onAction:)];
+        *field.ivars().action.borrow_mut() = Some(action);
+        field
+    }
+}

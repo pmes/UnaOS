@@ -62,8 +62,11 @@ Exactly one backend compiles per target (`src/platforms/`):
 | Windows | `platforms/windows` | WinUI 3 / Win32 | Stub |
 | `unaos` | reserved | kernel framebuffer + USB HID | Not yet present |
 
-The selection is driven by `target_os` and Cargo features (`gtk`, `gnome`, `qt`,
-`macos`); a headless fallback `Backend` compiles when no host backend matches.
+The selection is driven by `target_os` and the Cargo features `gtk`, `gnome` and
+`qt`; a headless fallback `Backend` compiles when no host backend matches. AppKit
+is chosen by `target_os = "macos"` alone: the `macos` feature gates nothing and
+only names the run line (`cargo run -p aether-shell --features macos -- <url>`);
+gating the embassy on it is owed (AETHERMAC-SELECT2, `docs/dev/blueprint/handlers.md`).
 
 ## How it fits into UnaOS
 
