@@ -63,6 +63,12 @@ impl Bits {
 /// A Main-profile SPS RBSP (4x3 macroblocks, level 3.0, two reference frames). `reorder`: VUI bitstream_restriction with
 /// max_num_reorder_frames / max_dec_frame_buffering; `poc_type` 0 or 2.
 fn sps_rbsp(reorder: Option<(u32, u32)>, poc_type: u32) -> Vec<u8> {
+    sps_rbsp_vui(reorder, poc_type, None)
+}
+
+/// [`sps_rbsp`] with NLEPROBEHDR's (SR226) VUI colour description: `colour` = (colour_primaries, transfer_characteristics,
+/// matrix_coefficients, video_full_range_flag) written as video_signal_type with colour_description_present_flag.
+fn sps_rbsp_vui(reorder: Option<(u32, u32)>, poc_type: u32, colour: Option<(u8, u8, u8, bool)>) -> Vec<u8> {
     let mut b = Bits::new();
     b.u(77, 8); // profile_idc: Main
     b.u(0, 8); // constraint_set flags
@@ -80,17 +86,33 @@ fn sps_rbsp(reorder: Option<(u32, u32)>, poc_type: u32) -> Vec<u8> {
     b.bit(1); // frame_mbs_only_flag
     b.bit(1); // direct_8x8_inference_flag
     b.bit(0); // frame_cropping_flag
+    if reorder.is_none() && colour.is_none() {
+        b.bit(0);
+        return b.trailing();
+    }
+    b.bit(1); // vui_parameters_present_flag
+    b.bit(0); // aspect_ratio_info_present_flag
+    b.bit(0); // overscan_info_present_flag
+    match colour {
+        None => b.bit(0), // video_signal_type_present_flag
+        Some((p, t, m, full)) => {
+            b.bit(1); // video_signal_type_present_flag
+            b.u(5, 3); // video_format: unspecified
+            b.bit(full as u32); // video_full_range_flag
+            b.bit(1); // colour_description_present_flag
+            b.u(p as u32, 8);
+            b.u(t as u32, 8);
+            b.u(m as u32, 8);
+        }
+    }
+    b.bit(0); // chroma_loc_info_present_flag
+    b.bit(0); // timing_info_present_flag
+    b.bit(0); // nal_hrd
+    b.bit(0); // vcl_hrd
+    b.bit(0); // pic_struct_present_flag
     match reorder {
-        None => b.bit(0),
+        None => b.bit(0), // bitstream_restriction_flag
         Some((reorder, dpb)) => {
-            b.bit(1); // vui_parameters_present_flag
-            for _ in 0..4 {
-                b.bit(0); // aspect_ratio / overscan / video_signal_type / chroma_loc info absent
-            }
-            b.bit(0); // timing_info_present_flag
-            b.bit(0); // nal_hrd
-            b.bit(0); // vcl_hrd
-            b.bit(0); // pic_struct_present_flag
             b.bit(1); // bitstream_restriction_flag
             b.bit(1); // motion_vectors_over_pic_boundaries_flag
             b.ue(0); // max_bytes_per_pic_denom
@@ -504,4 +526,181 @@ fn leadskip_marks_the_leading_pictures_of_an_open_gop() {
     for t in [0i64, 200 * MS, 400 * MS] {
         assert!(d.samples_from(0, t).all(|r| !r.skip));
     }
+}
+
+// ----- NLEPROBEHDR (LEDGER SR226): colour and HDR metadata reach the Track -----
+
+use demux_core::colour::{Colour, Light, Mastering};
+
+/// The test's mirror of the caller's dispatch (as [`avc_depth`] is for the reorder depth): the codec core's colour reading
+/// of a video track's configuration, for `Demuxer::fill_colour`.
+fn colour_of(t: &demux_core::Track) -> Option<Colour> {
+    match t.codec {
+        Codec::Avc => {
+            let s = h264_core::ps::avcc_sps(&t.config)?;
+            if !s.video_signal_type {
+                return None;
+            }
+            Some(Colour {
+                primaries: s.colour_primaries,
+                transfer: s.transfer_characteristics,
+                matrix: s.matrix_coefficients,
+                full_range: Some(s.full_range),
+                mastering: None,
+                light: None,
+            })
+        }
+        Codec::Av1 => {
+            let (cc, meta) = av1_core::image::av1c_colour(&t.config)?;
+            let mut c = Colour {
+                primaries: cc.color_primaries,
+                transfer: cc.transfer_characteristics,
+                matrix: cc.matrix_coefficients,
+                full_range: Some(cc.color_range),
+                mastering: None,
+                light: None,
+            };
+            for m in meta {
+                match m {
+                    av1_core::obu::Metadata::Cll { max_cll, max_fall } => c.light = Some(Light { max_cll, max_fall }),
+                    av1_core::obu::Metadata::Mdcv { primaries, white, luminance_max, luminance_min } => {
+                        c.mastering = Some(Mastering::from_av1(primaries, white, luminance_max, luminance_min))
+                    }
+                    av1_core::obu::Metadata::Other(_) => {}
+                }
+            }
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
+/// BT.2020 / P3-D65-like mastering in ST 2086 units: R (0.708, 0.292), G (0.170, 0.797), B (0.131, 0.046), D65 white,
+/// 1000 cd/m² max, 0.005 cd/m² min.
+const PQ_MASTERING: Mastering = Mastering {
+    primaries: [[35400, 14600], [8500, 39850], [6550, 2300]],
+    white: [15635, 16450],
+    max_lum: 10_000_000,
+    min_lum: 50,
+};
+const PQ_LIGHT: Light = Light { max_cll: 1000, max_fall: 400 };
+
+fn bt709_limited() -> Colour {
+    Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false), mastering: None, light: None }
+}
+
+fn bt2020_pq() -> Colour {
+    Colour { primaries: 9, transfer: 16, matrix: 9, full_range: Some(false), mastering: Some(PQ_MASTERING), light: Some(PQ_LIGHT) }
+}
+
+fn colour_mp4(c: Option<Colour>, config: Vec<u8>) -> Vec<u8> {
+    let x = Mp4Extras { colour: c.map(|c| vec![(1, c)]).unwrap_or_default(), ..Default::default() };
+    build::mp4_with(&[avc_bframes(config)], &Mp4Options::default(), &x)
+}
+
+fn colour_mkv(c: Option<Colour>, config: Vec<u8>) -> Vec<u8> {
+    let o = MkvOptions { colour: c.map(|c| vec![(1, c)]).unwrap_or_default(), ..Default::default() };
+    build::mkv(&[avc_bframes(config)], &o)
+}
+
+#[test]
+fn hdr_bt709_limited_reaches_the_track_and_the_survey() {
+    let cfg = avcc(&sps_rbsp(Some((2, 3)), 0));
+    for file in [colour_mp4(Some(bt709_limited()), cfg.clone()), colour_mkv(Some(bt709_limited()), cfg.clone())] {
+        let d = Demuxer::open(file).unwrap();
+        assert_eq!(d.tracks()[0].colour, Some(bt709_limited()));
+        let s = survey_of(&build::mp4_with(&[avc_bframes(cfg.clone())], &Mp4Options::default(), &Mp4Extras { colour: vec![(1, bt709_limited())], ..Default::default() })).unwrap();
+        assert_eq!(s.streams[0].colour, Some(bt709_limited()));
+        assert_eq!(d.survey().streams[0].colour, Some(bt709_limited()));
+        assert_eq!(d.survey().streams[0].colour.unwrap().to_string(), "colour=1/1/1/limited");
+    }
+}
+
+#[test]
+fn hdr_bt2020_pq_mdcv_clli_round_trip() {
+    let cfg = avcc(&sps_rbsp(Some((2, 3)), 0));
+    let mp4 = colour_mp4(Some(bt2020_pq()), cfg.clone());
+    // MP4 `mdcv` stores G, B, R: the first primary written is green's x.
+    let at = mp4.windows(4).position(|w| w == b"mdcv").unwrap() + 4;
+    assert_eq!(u16::from_be_bytes([mp4[at], mp4[at + 1]]), 8500, "mdcv is written G, B, R");
+    for file in [mp4, colour_mkv(Some(bt2020_pq()), cfg)] {
+        let d = Demuxer::open(file).unwrap();
+        let c = d.tracks()[0].colour.expect("colour");
+        assert_eq!(c, bt2020_pq(), "R, G, B order and ST 2086 units survive the container");
+        assert_eq!(c.to_string(), "colour=9/16/9/limited mdcv clli");
+    }
+}
+
+#[test]
+fn hdr_nclc_says_no_range() {
+    let c = Colour { full_range: None, ..bt709_limited() };
+    let d = Demuxer::open(colour_mp4(Some(c), avcc(&sps_rbsp(Some((2, 3)), 0)))).unwrap();
+    assert_eq!(d.tracks()[0].colour, Some(c));
+    assert_eq!(c.to_string(), "colour=1/1/1");
+    let mkv = Demuxer::open(colour_mkv(Some(c), avcc(&sps_rbsp(Some((2, 3)), 0)))).unwrap();
+    assert_eq!(mkv.tracks()[0].colour, Some(c), "Matroska Range omitted: no range");
+}
+
+#[test]
+fn hdr_no_colr_falls_back_to_the_sps_vui_and_the_container_wins() {
+    let vui = avcc(&sps_rbsp_vui(Some((2, 3)), 0, Some((1, 1, 1, true))));
+    let full709 = Colour { full_range: Some(true), ..bt709_limited() };
+    for file in [colour_mp4(None, vui.clone()), colour_mkv(None, vui.clone())] {
+        let mut d = Demuxer::open(file).unwrap();
+        assert_eq!(d.tracks()[0].colour, None, "the container says nothing");
+        assert_eq!(d.fill_colour(colour_of), 1);
+        assert_eq!(d.tracks()[0].colour, Some(full709), "the SPS VUI fills it");
+        assert_eq!(d.survey().streams[0].colour.unwrap().to_string(), "colour=1/1/1/full");
+        assert_eq!(d.fill_colour(colour_of), 0, "a filled track does not change twice");
+    }
+    // The container's colr wins over the SPS: 9/16/9 limited stays, the SPS fills nothing it already says.
+    let mut d = Demuxer::open(colour_mp4(Some(bt2020_pq()), vui.clone())).unwrap();
+    assert_eq!(d.fill_colour(colour_of), 0);
+    assert_eq!(d.tracks()[0].colour, Some(bt2020_pq()));
+    // A container code that is unspecified (2) takes the bitstream's; its stated range stays.
+    let partial = Colour { primaries: 2, transfer: 2, matrix: 2, full_range: Some(false), mastering: None, light: None };
+    let mut d = Demuxer::open(colour_mp4(Some(partial), vui)).unwrap();
+    assert_eq!(d.fill_colour(colour_of), 1);
+    assert_eq!(d.tracks()[0].colour, Some(bt709_limited()));
+    // An SPS with no video_signal_type gives nothing.
+    let mut d = Demuxer::open(colour_mkv(None, avcc(&sps_rbsp(Some((2, 3)), 0)))).unwrap();
+    assert_eq!(d.fill_colour(colour_of), 0);
+    assert_eq!(d.tracks()[0].colour, None);
+    let sps = h264_core::ps::avcc_sps(&avcc(&sps_rbsp_vui(None, 0, Some((9, 16, 9, false))))).unwrap();
+    assert_eq!((sps.video_signal_type, sps.colour_primaries, sps.transfer_characteristics, sps.matrix_coefficients, sps.full_range), (true, 9, 16, 9, false));
+    assert_eq!(h264_core::ps::avcc_reorder_depth(&avcc(&sps_rbsp_vui(Some((2, 3)), 0, Some((1, 1, 1, true))))), Some(2), "the colour VUI keeps the reorder hint");
+}
+
+/// [`av1c_with_sequence_header`] with an HDR_CLL and an HDR_MDCV METADATA OBU appended to its configOBUs (AV1 §5.8).
+fn av1c_with_hdr_metadata() -> Vec<u8> {
+    let mut c = av1c_with_sequence_header();
+    let mut cll = vec![1u8];
+    cll.extend_from_slice(&1000u16.to_be_bytes());
+    cll.extend_from_slice(&400u16.to_be_bytes());
+    let mut mdcv = vec![2u8];
+    for v in [46399u16, 19137, 11141, 52232, 8585, 3015, 20493, 21561] {
+        mdcv.extend_from_slice(&v.to_be_bytes());
+    }
+    mdcv.extend_from_slice(&(1000u32 << 8).to_be_bytes()); // 24.8: 1000 cd/m²
+    mdcv.extend_from_slice(&82u32.to_be_bytes()); // 18.14: 0.005 cd/m²
+    for p in [cll, mdcv] {
+        c.push((5 << 3) | 0x02); // OBU_METADATA, obu_has_size_field
+        c.push(p.len() as u8);
+        c.extend_from_slice(&p);
+    }
+    c
+}
+
+#[test]
+fn hdr_av1_metadata_obus_fill_mastering_and_light() {
+    let track = bframe_mp4_track(&[0, 1, 2], &[0], *b"av01", *b"av1C", av1c_with_hdr_metadata(), &|i| vec![i as u8; 4]);
+    let mut d = Demuxer::open(build::mkv(&[track], &MkvOptions::default())).unwrap();
+    assert_eq!(d.tracks()[0].colour, None);
+    assert_eq!(d.fill_colour(colour_of), 1);
+    let c = d.tracks()[0].colour.unwrap();
+    assert_eq!(c.mastering, Some(PQ_MASTERING), "AV1 0.16 / 24.8 / 18.14 fixed point in ST 2086 units");
+    assert_eq!(c.light, Some(PQ_LIGHT));
+    assert_eq!((c.primaries, c.transfer, c.matrix, c.full_range), (2, 2, 2, Some(false)), "no color_description: unspecified");
+    assert_eq!(c.to_string(), "colour=2/2/2/limited mdcv clli");
+    assert_eq!(av1_core::image::av1c_reorder_depth(&av1c_with_hdr_metadata()), Some(0), "the metadata OBUs leave the depth read alone");
 }

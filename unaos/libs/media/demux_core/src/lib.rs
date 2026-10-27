@@ -67,6 +67,7 @@ mod read;
 pub mod survey;
 /// AETHERMEDIA2 (SR134): WebVTT for `<track>`.
 pub mod vtt;
+pub mod colour;
 
 /// Why a file could not be demuxed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +194,8 @@ pub struct Track {
     /// MP4ONE (rmbp B464): Apple's `iTunSMPB` (priming, total samples) as the file states it, on every
     /// audio track of an MP4 that carries one; `None` elsewhere.
     pub smpb: Option<(u64, u64)>,
+    /// NLEPROBEHDR (SR226): the colour description and HDR metadata the container states ([`colour`]); `None` when it says nothing.
+    pub colour: Option<colour::Colour>,
 }
 
 /// MP4ONE (rmbp B464): the first media edit of an MP4 `elst` (ISO/IEC 14496-12 §8.6.6) — the edit the

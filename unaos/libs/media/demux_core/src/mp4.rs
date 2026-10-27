@@ -345,7 +345,7 @@ fn parse_trak(data: &[u8], trak: &BoxHeader, movie_ts: u32) -> Result<TrakState,
         trim_start_ns: 0,
         play_ns,
         edit,
-        smpb: None,
+        smpb: None, colour: None,
     };
 
     let minf = child(&mdia_kids, b"minf").ok_or(Error::Invalid("mdia without minf"))?;
@@ -401,7 +401,7 @@ fn parse_stsd(data: &[u8], stsd: &BoxHeader, track: &mut Track) -> Result<(), Er
         _ => child_start = e.end,
     }
     let kids = if child_start < e.end { boxes(data, child_start, e.end)? } else { Vec::new() };
-    let cfg = |k: &[u8; 4]| child(&kids, k).map(|b| data[b.body..b.end].to_vec());
+    let cfg = |k: &[u8; 4]| child(&kids, k).map(|b| data[b.body..b.end].to_vec()); track.colour = colour_boxes(data, &kids);
     track.codec = match &fourcc {
         b"av01" => {
             track.config = cfg(b"av1C").unwrap_or_default();
@@ -1033,4 +1033,44 @@ pub(crate) fn load_span(data: &[u8], sp: &Spans, from: usize, to: usize) -> Resu
         out.push(t.samples);
     }
     Ok(out)
+}
+
+/// NLEPROBEHDR (SR226): the colour a visual sample entry states, from the children [`parse_stsd`] already walked:
+/// `colr` (ISO/IEC 14496-12 §12.1.5: `nclx` = colour_primaries, transfer_characteristics, matrix_coefficients as u16 and
+/// full_range_flag in the top bit of the next byte; QuickTime `nclc` = the three u16 and no range; an ICC `rICC` / `prof`
+/// is not read), `mdcv` (ISO/IEC 23001-8 / ST 2086: display_primaries G, B, R as u16 x, y pairs, the white point, then
+/// max / min luminance u32; reordered here to R, G, B) and `clli` (max_content_light_level, max_pic_average_light_level,
+/// u16). `None` when none of the three is present; a short or unknown box is left out, never an error.
+fn colour_boxes(data: &[u8], kids: &[BoxHeader]) -> Option<crate::colour::Colour> {
+    use crate::colour::{Colour, Light, Mastering};
+    let code = |v: u16| u8::try_from(v).unwrap_or(2);
+    let colr = child(kids, b"colr").and_then(|b| {
+        let mut r = body(data, b);
+        let kind = r.fourcc().ok()?;
+        if &kind != b"nclx" && &kind != b"nclc" {
+            return None;
+        }
+        let (p, t, m) = (r.u16().ok()?, r.u16().ok()?, r.u16().ok()?);
+        let full = if &kind == b"nclx" { Some(r.u8().ok()? & 0x80 != 0) } else { None };
+        Some((code(p), code(t), code(m), full))
+    });
+    let mastering = child(kids, b"mdcv").and_then(|b| {
+        let mut r = body(data, b);
+        let mut gbr = [[0u16; 2]; 3];
+        for p in gbr.iter_mut() {
+            *p = [r.u16().ok()?, r.u16().ok()?];
+        }
+        let white = [r.u16().ok()?, r.u16().ok()?];
+        let (max_lum, min_lum) = (r.u32().ok()?, r.u32().ok()?);
+        Some(Mastering { primaries: [gbr[2], gbr[0], gbr[1]], white, max_lum, min_lum })
+    });
+    let light = child(kids, b"clli").and_then(|b| {
+        let mut r = body(data, b);
+        Some(Light { max_cll: r.u16().ok()?, max_fall: r.u16().ok()? })
+    });
+    if colr.is_none() && mastering.is_none() && light.is_none() {
+        return None;
+    }
+    let (primaries, transfer, matrix, full_range) = colr.unwrap_or((2, 2, 2, None));
+    Some(Colour { primaries, transfer, matrix, full_range, mastering, light })
 }

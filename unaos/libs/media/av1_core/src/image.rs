@@ -614,9 +614,17 @@ pub fn decode_avif(file: &[u8]) -> Result<Image> {
 /// exactly one shown frame (AV1 §7.5; AV1-ISOBMFF §2.4), so decode order is presentation order: `Some(0)` when the record's
 /// configOBUs carry a sequence header that parses, `None` otherwise.
 pub fn av1c_reorder_depth(av1c: &[u8]) -> Option<u32> {
+    av1c_colour(av1c).map(|_| 0)
+}
+
+/// NLEPROBEHDR (LEDGER SR226): the colour an AV1CodecConfigurationRecord states — the color_config of the sequence header in
+/// its configOBUs (§5.5.2) and every METADATA OBU there that parses ([`parse_metadata`]: HDR_CLL, HDR_MDCV). The one walk of
+/// the configOBUs [`av1c_reorder_depth`] also takes. `None` when the record holds no sequence header that parses.
+pub fn av1c_colour(av1c: &[u8]) -> Option<(ColorConfig, Vec<Metadata>)> {
     let cfg = crate::avif::Av1Config::parse(av1c).ok()?;
     let obus = split_obus(&cfg.config_obus).ok()?;
     let o = obus.iter().find(|o| o.obu_type == OBU_SEQUENCE_HEADER_T)?;
-    SequenceHeader::parse(o.payload).ok()?;
-    Some(0)
+    let seq = SequenceHeader::parse(o.payload).ok()?;
+    let meta = obus.iter().filter(|o| o.obu_type == OBU_METADATA_T).filter_map(|o| parse_metadata(o.payload).ok()).collect();
+    Some((seq.color_config, meta))
 }

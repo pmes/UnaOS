@@ -236,13 +236,16 @@ pub struct Mp4Extras {
     /// Per track id, one §8.6.4 `sdtp` byte per sample: an `sdtp` box (progressive) or the sample_flags bits 27..20 of the
     /// `trun` (fragmented).
     pub sdtp: Vec<(u32, Vec<u8>)>,
+    /// NLEPROBEHDR (SR226): per track id, the colour its visual sample entry states: `colr` (`nclx` when `full_range` is
+    /// `Some`, else QuickTime `nclc`), then `mdcv` (G, B, R order) and `clli` when present, after the config box.
+    pub colour: Vec<(u32, crate::colour::Colour)>,
 }
 
 fn track_duration(t: &MediaTrack) -> u64 {
     t.samples.iter().map(|s| (s.pts + s.duration as i64).max(0) as u64).max().unwrap_or(0)
 }
 
-fn sample_entry(t: &TrackSpec) -> Vec<u8> {
+fn sample_entry(t: &TrackSpec, extra: &[u8]) -> Vec<u8> {
     let mut e = alloc::vec![0u8; 6];
     e.u16b(1);
     match t.kind {
@@ -269,6 +272,7 @@ fn sample_entry(t: &TrackSpec) -> Vec<u8> {
     if let Some(k) = t.config_box {
         e.extend_from_slice(&bx(&k, &t.config));
     }
+    e.extend_from_slice(extra);
     bx(&t.fourcc, &e)
 }
 
@@ -337,7 +341,7 @@ fn trak(t: &MediaTrack, opts: &Mp4Options, x: &Mp4Extras, movie_ts: u32, chunk_o
 
     let mut stsd = Vec::new();
     stsd.u32b(1);
-    stsd.extend_from_slice(&sample_entry(s));
+    stsd.extend_from_slice(&sample_entry(s, &entry_colour(x, s.id)));
     let stsd = fbx(b"stsd", 0, 0, &stsd);
 
     let samples: &[SampleSpec] = if progressive { &t.samples } else { &[] };
@@ -690,6 +694,8 @@ pub struct MkvOptions {
     /// DEMUXSEEK (SR200): write a SeekHead first in the Segment pointing at Cues written after the Clusters — one CuePoint
     /// per video keyframe block (CueTime, CueTrack, CueClusterPosition relative to the Segment's body).
     pub cues: bool,
+    /// NLEPROBEHDR (SR226): per track id, a Colour master written inside the track's Video master.
+    pub colour: Vec<(u32, crate::colour::Colour)>,
 }
 
 impl Default for MkvOptions {
@@ -706,6 +712,7 @@ impl Default for MkvOptions {
             duration: true,
             discard_last_ns: 0,
             cues: false,
+            colour: Vec::new(),
         }
     }
 }
@@ -806,7 +813,7 @@ pub fn mkv(tracks: &[MediaTrack], opts: &MkvOptions) -> Vec<u8> {
             e.extend_from_slice(&el_uint(0x23_E383, s.default_duration_ns));
         }
         if s.kind == TrackKind::Video {
-            let v = cat(&[&el_uint(0xB0, s.width as u64), &el_uint(0xBA, s.height as u64)]);
+            let v = cat(&[&el_uint(0xB0, s.width as u64), &el_uint(0xBA, s.height as u64), &mkv_colour(opts, s.id)]);
             e.extend_from_slice(&el(0xE0, &v));
         } else {
             let mut a = cat(&[&el_f64(0xB5, s.sample_rate as f64), &el_uint(0x9F, s.channels as u64)]);
@@ -1028,4 +1035,62 @@ pub fn remux_tracks(d: &crate::Demuxer) -> Option<Vec<MediaTrack>> {
         });
     }
     Some(out)
+}
+
+/// NLEPROBEHDR (SR226): the `colr` / `mdcv` / `clli` boxes [`Mp4Extras::colour`] gives track `id` (empty when none).
+fn entry_colour(x: &Mp4Extras, id: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    let Some((_, c)) = x.colour.iter().find(|(t, _)| *t == id) else { return out };
+    let mut colr = Vec::new();
+    colr.extend_from_slice(if c.full_range.is_some() { b"nclx" } else { b"nclc" });
+    colr.u16b(c.primaries as u16);
+    colr.u16b(c.transfer as u16);
+    colr.u16b(c.matrix as u16);
+    if let Some(full) = c.full_range {
+        colr.push(if full { 0x80 } else { 0 });
+    }
+    out.extend_from_slice(&bx(b"colr", &colr));
+    if let Some(m) = c.mastering {
+        let mut b = Vec::new();
+        for p in [m.primaries[1], m.primaries[2], m.primaries[0]] {
+            b.u16b(p[0]);
+            b.u16b(p[1]);
+        }
+        b.u16b(m.white[0]);
+        b.u16b(m.white[1]);
+        b.u32b(m.max_lum);
+        b.u32b(m.min_lum);
+        out.extend_from_slice(&bx(b"mdcv", &b));
+    }
+    if let Some(l) = c.light {
+        let mut b = Vec::new();
+        b.u16b(l.max_cll);
+        b.u16b(l.max_fall);
+        out.extend_from_slice(&bx(b"clli", &b));
+    }
+    out
+}
+
+/// NLEPROBEHDR (SR226): the Matroska Colour master [`MkvOptions::colour`] gives track `id` (empty when none): the code
+/// points, Range (1 limited, 2 full; omitted when `None`), MaxCLL / MaxFALL and MasteringMetadata as floats.
+fn mkv_colour(opts: &MkvOptions, id: u32) -> Vec<u8> {
+    let Some((_, c)) = opts.colour.iter().find(|(t, _)| *t == id) else { return Vec::new() };
+    let mut b = cat(&[&el_uint(0x55B1, c.matrix as u64), &el_uint(0x55BA, c.transfer as u64), &el_uint(0x55BB, c.primaries as u64)]);
+    if let Some(full) = c.full_range {
+        b.extend_from_slice(&el_uint(0x55B9, if full { 2 } else { 1 }));
+    }
+    if let Some(l) = c.light {
+        b.extend_from_slice(&el_uint(0x55BC, l.max_cll as u64));
+        b.extend_from_slice(&el_uint(0x55BD, l.max_fall as u64));
+    }
+    if let Some(m) = c.mastering {
+        let mut mm = Vec::new();
+        for (i, v) in m.primaries.iter().flatten().chain(m.white.iter()).enumerate() {
+            mm.extend_from_slice(&el_f64(0x55D1 + i as u32, *v as f64 / 50_000.0));
+        }
+        mm.extend_from_slice(&el_f64(0x55D9, m.max_lum as f64 / 10_000.0));
+        mm.extend_from_slice(&el_f64(0x55DA, m.min_lum as f64 / 10_000.0));
+        b.extend_from_slice(&el(0x55D0, &mm));
+    }
+    el(0x55B0, &b)
 }

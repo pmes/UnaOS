@@ -7,7 +7,7 @@
 //! size strips it, all-ones = unknown size §6.2); EBML header §11.2 with DocType; Segment §5.1;
 //! Info §5.1.2 (TimestampScale 0x2AD7B1, Duration 0x4489); Tracks §5.1.4 (TrackEntry 0xAE:
 //! TrackNumber 0xD7, TrackType 0x83, CodecID 0x86, CodecPrivate 0x63A2, DefaultDuration
-//! 0x23E383, CodecDelay 0x56AA, Video 0xE0 → PixelWidth 0xB0 / PixelHeight 0xBA, Audio 0xE1 →
+//! 0x23E383, CodecDelay 0x56AA, Video 0xE0 → PixelWidth 0xB0 / PixelHeight 0xBA / Colour 0x55B0, Audio 0xE1 →
 //! SamplingFrequency 0xB5 / Channels 0x9F, ContentEncodings 0x6D80); Cluster §5.1.3 (Timestamp
 //! 0xE7, SimpleBlock 0xA3, BlockGroup 0xA0 → Block 0xA1, BlockDuration 0x9B, ReferenceBlock
 //! 0xFB); Block structure §10 and lacing §10.3 (Xiph, fixed-size, EBML); unknown-size Cluster
@@ -48,7 +48,7 @@ const ID_DEFAULT_DURATION: u32 = 0x23_E383;
 const ID_CODEC_DELAY: u32 = 0x56AA;
 const ID_VIDEO: u32 = 0xE0;
 const ID_PIXEL_WIDTH: u32 = 0xB0;
-const ID_PIXEL_HEIGHT: u32 = 0xBA;
+const ID_PIXEL_HEIGHT: u32 = 0xBA; const ID_COLOUR: u32 = 0x55B0;
 const ID_AUDIO: u32 = 0xE1;
 const ID_SAMPLING_FREQ: u32 = 0xB5;
 const ID_CHANNELS: u32 = 0x9F;
@@ -306,7 +306,7 @@ fn parse_track(data: &[u8], te: &El) -> Result<TrackState, Error> {
         trim_start_ns: 0,
         play_ns: None,
         edit: None,
-        smpb: None,
+        smpb: None, colour: None,
     };
     let mut default_duration = 0u64;
     let mut sample_rate = 8000.0f64;
@@ -329,7 +329,7 @@ fn parse_track(data: &[u8], te: &El) -> Result<TrackState, Error> {
                 for v in kids(data, c.body, c.end)? {
                     match v.id {
                         ID_PIXEL_WIDTH => t.width = uint(data, &v)? as u32,
-                        ID_PIXEL_HEIGHT => t.height = uint(data, &v)? as u32,
+                        ID_PIXEL_HEIGHT => t.height = uint(data, &v)? as u32, ID_COLOUR => t.colour = colour_master(data, &v),
                         _ => {}
                     }
                 }
@@ -804,4 +804,58 @@ pub(crate) fn load_span(data: &[u8], sp: &Spans, from: usize, to: usize, last: b
         out.push(t.samples);
     }
     Ok(out)
+}
+
+/// NLEPROBEHDR (SR226): a video track's Colour master (RFC 9559 §5.1.4.1.28.18): MatrixCoefficients 0x55B1,
+/// Range 0x55B9 (1 broadcast = limited, 2 full; 0 unspecified and 3 "defined by matrix/transfer" say nothing),
+/// TransferCharacteristics 0x55BA, Primaries 0x55BB (H.273 code points, 2 when absent), MaxCLL 0x55BC, MaxFALL 0x55BD, and
+/// MasteringMetadata 0x55D0 (PrimaryR/G/B ChromaticityX/Y 0x55D1-0x55D6, WhitePointChromaticityX/Y 0x55D7/0x55D8,
+/// LuminanceMax 0x55D9, LuminanceMin 0x55DA: floats, chromaticity 0..1 and cd/m², rounded to ST 2086 units). `None` when the
+/// master does not parse.
+fn colour_master(data: &[u8], e: &El) -> Option<crate::colour::Colour> {
+    use crate::colour::{Colour, Light, Mastering};
+    let code = |v: u64| u8::try_from(v).unwrap_or(2);
+    let mut c = Colour { primaries: 2, transfer: 2, matrix: 2, full_range: None, mastering: None, light: None };
+    let (mut cll, mut fall) = (None, None);
+    for x in kids(data, e.body, e.end).ok()? {
+        match x.id {
+            0x55B1 => c.matrix = code(uint(data, &x).ok()?),
+            0x55B9 => {
+                c.full_range = match uint(data, &x).ok()? {
+                    1 => Some(false),
+                    2 => Some(true),
+                    _ => None,
+                }
+            }
+            0x55BA => c.transfer = code(uint(data, &x).ok()?),
+            0x55BB => c.primaries = code(uint(data, &x).ok()?),
+            0x55BC => cll = Some(uint(data, &x).ok()?.min(u16::MAX as u64) as u16),
+            0x55BD => fall = Some(uint(data, &x).ok()?.min(u16::MAX as u64) as u16),
+            0x55D0 => {
+                let mut m = Mastering { primaries: [[0; 2]; 3], white: [0; 2], max_lum: 0, min_lum: 0 };
+                for y in kids(data, x.body, x.end).ok()? {
+                    let v = float(data, &y).ok()?;
+                    let xy = round_f64(v * 50_000.0).min(u16::MAX as u64) as u16;
+                    let lum = round_f64(v * 10_000.0).min(u32::MAX as u64) as u32;
+                    match y.id {
+                        0x55D1..=0x55D6 => {
+                            let i = (y.id - 0x55D1) as usize;
+                            m.primaries[i / 2][i % 2] = xy;
+                        }
+                        0x55D7 => m.white[0] = xy,
+                        0x55D8 => m.white[1] = xy,
+                        0x55D9 => m.max_lum = lum,
+                        0x55DA => m.min_lum = lum,
+                        _ => {}
+                    }
+                }
+                c.mastering = Some(m);
+            }
+            _ => {}
+        }
+    }
+    if cll.is_some() || fall.is_some() {
+        c.light = Some(Light { max_cll: cll.unwrap_or(0), max_fall: fall.unwrap_or(0) });
+    }
+    Some(c)
 }
