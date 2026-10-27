@@ -5175,34 +5175,34 @@ impl XhciController {
                                                 report[2], report[3], report[4],
                                                 report[5], report[6], report[7],
                                             ];
-                                            let prev_keys = self.slots[slot_id as usize].keyboard_prev_keys; #[cfg(all(target_arch = "x86_64", feature = "wc"))] for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { let _ = crate::video::fnrow::fn_row_usage(crate::video::fnrow::PATH_XHCI, kc, modifiers); } } // XHCIMEDIA (B438): F-row press edges through the one router (the EHCI pump calls it at the same point)
+                                            let prev_keys = self.slots[slot_id as usize].keyboard_prev_keys; // HIDBOOTXHCIX86 (rmbp-ledger B1003): the x86 F-row loop that stood here (XHCIMEDIA B438) is gone — the decoder's own fn-row call (`hidboot::decode_boot_keyboard`, `fnrow::PATH_XHCI` for `Transport::Xhci`) is the ONE router call on both arches
 
-                                            #[cfg(target_arch = "x86_64")] { let mut lev = [crate::pal::Event::None; 12]; let _ = hid_layout_push(&cur_keys, &prev_keys, modifiers, caps, "xHCI", false, &mut lev); } #[cfg(target_arch = "x86_64")] for i in 2..8 { // KEYCHARS (B718): the report's ONE layout call; its chars are pushed there, its claimed usages skipped below. LINE-NEUTRAL, code first.
-                                                let keycode = report[i];
-                                                if keycode == 0 { continue; } // No key
-                                                if keycode == 1 || hid_layout_claim(keycode, modifiers, caps).is_some() { continue; } // ErrorRollOver; KEYCHARS: a usage the live layout claimed typed through `hid_layout_push`
+                                            // HIDBOOTXHCIX86 (rmbp-ledger B1003): the x86 inline PRESS loop that stood on these lines is DELETED. It
+                                            // made the report's layout call (`hid_layout_push(.., "xHCI", stamp=false, ..)`) and then pushed
+                                            // `Event::Key` for EVERY keycode in EVERY report — a LEVEL loop, so a rollover report that
+                                            // re-stated a key still down pushed it a second time: the DBLSTROKE double (Boot AN, fixed on
+                                            // EHCI then) was live on x86 xHCI keyboards. Presses are now the ONE decoder's press EDGES
+                                            // (`hidboot::decode_boot_keyboard` via `decode_noted`, the block below): a key that was not down
+                                            // in the previous report, its `xHCI: KEY: class=` line, `boot::key_stamp()` (the layout call is
+                                            // stamped too), the DBLSTROKE `[keystat] xhci press` witness. Comment lines in place of the
+                                            // statements: this file's `panic::Location` records embed line numbers (B94, LEDGER P7).
 
-                                                // ALLKEYS: one shared fold — table lookup, Ctrl/Alt/GUI
-                                                // policy, and shift^caps — so this decoder and EHCI's
-                                                // cannot disagree about what a key types.
-                                                let ascii = hid_key_ascii(keycode, modifiers, caps);
-                                                if ascii != 0 {
-                                                    if !crate::pwwire::withhold() { serial_println!("xHCI: KEY: class={}", crate::pwwire::key_class(ascii)); } // CONSOLEFIX M3 (R65): never a secret byte on the wire
-                                                    crate::pal::push_event(crate::pal::Event::Key(ascii));
-                                                }
-                                            }
 
-                                            // HIDBOOTARM (rmbp-ledger B1000): on aarch64 this report goes to the ONE boot-keyboard
-                                            // decoder, `drivers::hidboot::decode_boot_keyboard` (via its witness wrapper `decode_noted`),
-                                            // under `Transport::Xhci`: the press EDGES (DBLSTROKE), the layout call, UVUG-6's report-level
-                                            // typematic feed (the decoder's, at pal's own gate; this block's aarch64 feed is gone), the
-                                            // release edges, PRTSCR and the chords, and the lock-key toggle. The x86 statements around
-                                            // this block are `x86_64`-gated in place (HIDBOOT-XHCI-X86 owed). The slot keeps its state:
+
+
+
+
+                                            // HIDBOOTARM (rmbp-ledger B1000) + HIDBOOTXHCIX86 (B1003): on BOTH arches this report goes to the
+                                            // ONE boot-keyboard decoder, `drivers::hidboot::decode_boot_keyboard` (via its witness wrapper
+                                            // `decode_noted`), under `Transport::Xhci`: the press EDGES (DBLSTROKE), the layout call, UVUG-6's
+                                            // report-level typematic feed (the decoder's, at pal's own gate: x86 + `ehcihid`, aarch64 +
+                                            // baremetal|tegra), the release edges, PRTSCR and the chords, and the lock-key toggle. The x86
+                                            // inline statements that stood around this block are deleted (comment lines). The slot keeps its state:
                                             // the decoder works on local copies of prev_keys/prev_mods so the restated line below still
                                             // compares against the previous report (and stores both), `keyboard_leds` is the decoder's
                                             // `leds` byte, and an owed LED change marks HIDLEDDEFER's `keyboard_leds_dirty` for
-                                            // `service_hid_leds`, as the x86 toggle below does. Lines replaced in place (line count kept).
-                                            #[cfg(target_arch = "aarch64")]
+                                            // `service_hid_leds` (HIDBOOT-LEDS-XHCI owed). Lines replaced in place (line count kept).
+                                            // HIDBOOTXHCIX86 (B1003): no cfg on the block below — ONE decoder on every arch.
                                             {
                                                 let s = slot_id as usize;
                                                 let _ = caps; // the decoder reads Caps from `leds` itself
@@ -5215,73 +5215,73 @@ impl XhciController {
                                                 }
                                             }
 
-                                            // HID-KEYS: key-UP edges. A boot report carries the FULL
-                                            // pressed-key set, so any keycode in the previous report
-                                            // that is absent now was released — emit KeyUp(ascii)
-                                            // once per such code. Shift state at release time is used
-                                            // for the ascii (consumers that care about identity match
-                                            // case-insensitively; e.g. GAME-MODE lowercases).
-                                            #[cfg(target_arch = "x86_64")] for &keycode in prev_keys.iter() {
-                                                if keycode == 0 || keycode == 1 { continue; }
-                                                if cur_keys.contains(&keycode) { continue; } // still held
-                                                // ALLKEYS: releases use the LIBERAL fold — a
-                                                // suppressed release strands a held key forever.
-                                                let ascii = hid_key_release_ascii(keycode, modifiers, caps);
-                                                if ascii != 0 {
-                                                    #[cfg(feature = "usbdebug")]
-                                                    if !crate::pwwire::withhold() { serial_println!("[hidkeys] keyup class={} slot={}", crate::pwwire::key_class(ascii), slot_id); } // CONSOLEFIX M3
-                                                    crate::pal::push_event(crate::pal::Event::KeyUp(ascii));
-                                                }
-                                            }
+                                            // HIDBOOTXHCIX86 (rmbp-ledger B1003): the x86 inline RELEASE loop that stood on these lines is
+                                            // DELETED. It pushed `KeyUp` for every keycode in the previous report absent from this one, but
+                                            // its line (`[hidkeys] keyup`) printed only under `usbdebug`. Releases are now the decoder's
+                                            // release edges (the same set diff, the same `hid_key_release_ascii` fold), each with its
+                                            // unconditional `xHCI: KEYUP: class=` line — the release wire EHCI and aarch64 already carry.
+                                            // Comment lines in place of the statements (line count kept).
+
+
+
+
+
+
+
+
+
+
+
+
 
                                             if cur_keys == prev_keys && modifiers == self.slots[slot_id as usize].keyboard_prev_mods { KBD_RESTATED_COUNT.fetch_add(1, Ordering::Relaxed); } self.slots[slot_id as usize].keyboard_prev_mods = modifiers; self.slots[slot_id as usize].keyboard_prev_keys = cur_keys; #[cfg(feature = "xhcikbd")] xhcikbd_note(&cur_keys, &prev_keys); // PRTSCLOST — a report whose six keycodes are byte-identical to the previous report's. SET_IDLE was sent with duration 0 (INDEFINITE, `set_hid_idle` in this file), so the device reports ONLY on a state change and a restated report is IMPOSSIBLE from one — every one of them means at least one intermediate report never reached this decoder. It is also the exact condition under which `hid_print_screen_edge` (and the `HID_LOCK_KEYS` diff below) returns false for a genuine press: `prev_keys` still holds 0x46 because the RELEASE was the report that was lost. Counted BEFORE the store so `prev_keys` is still this report's predecessor. ⚠ FOLDED onto the existing store — no line added.
 
-                                            // PRTSCR: the Print Screen press edge. `prev_keys` is the
-                                            // LOCAL copy taken before the loops above, so the store on
-                                            // the line above has not disturbed it — the same value the
-                                            // lock-key loop below diffs against. Sets a flag and
-                                            // returns; the capture happens on the device-service pass,
-                                            // because a filesystem write from inside this pass would
-                                            // hold the keyboard hostage for its whole duration.
-                                            #[cfg(target_arch = "x86_64")] if let Some(act) = hid_print_screen_action_edge(&cur_keys, &prev_keys, modifiers) {
-                                                // KEYMAP (R60) — the 0x46 EDGE is still detected here (an edge is not a chord), but what
-                                                // it MEANS is the theme table's to say now: a theme with no Print Screen row disarms the
-                                                // key. The witness keeps its shape and gains `action=`.
-                                                serial_println!(
-                                                    ":: PRTSCR: PrintScreen (HID 0x46) down on xHCI -> capture armed action={} ::", act.name()
-                                                );
-                                                if act.is_capture() { crate::video::prtscr::request(); }
-                                            } else if let Some((act, chord)) = hid_screenshot_chord_edge(&cur_keys, &prev_keys, modifiers) {
-                                                // KEYMAP: the chord is JUDGED by `video::keymap::resolve`, never tested here. `else if` so
-                                                // a report carrying both 0x46 and a chord arms once. An action that is NOT a capture
-                                                // (R61's ⌘C/⌘V/⌘X/⌘A, TERMSEL's selection chords, the ⌘⇧Q slot) is delivered on the ring below.
-                                                if act.is_capture() { serial_println!(
-                                                    ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on xHCI -> capture armed action={} ::",
-                                                    chord, act.name()
-                                                ); crate::video::prtscr::request(); } else { serial_println!("[clip] chord={} action={} via={} -> delivered", chord, act.name(), "xhci"); crate::pal::push_event(crate::pal::Event::Action(act)); } // APPCLIP (R61) — **THE NON-CAPTURE ARM, WHICH UNTIL NOW WENT NOWHERE.** KEYMAP resolved ⌘C/⌘V/⌘X/⌘A here and STOPPED (keymap.md §6: "no consumer and no delivery path"), so the chord was judged and then dropped on the floor. It is now pushed onto the SAME ring the keystrokes from this decoder travel, as `pal::Event::Action` — a third kind of event, neither key nor pointer — and the first thing that acts on it is `video::clipboard::terminal_action`. The capture arm above is byte-for-byte what it was: `is_capture()` still owns `prtscr::request()`, so the PRTSCR wire and flight 11’s two proven chords are untouched, and this `else` can only be reached by an action `is_capture()` refused. No modifier, focus or window test is added here and none may be: R61’s point is that the TABLE decides, which is also why `Ctrl-C` cannot reach this line — no shipped row claims it, so `resolve` returns `None` and `hid_key_ascii` still hands the shell 0x03. ⚠ FOLDED onto the existing statement and given no line of its own — this file is 17k/19k lines of `panic::Location` records that embed line numbers (B94, LEDGER P7); CODE FIRST, then the prose (A10FIX).
-                                            }
+                                            // HIDBOOTXHCIX86 (rmbp-ledger B1003): the x86 inline PRTSCR if-chain that stood on these lines
+                                            // is DELETED: the 0x46 Print Screen edge (`hid_print_screen_action_edge`), the screenshot
+                                            // chord (`hid_screenshot_chord_edge`, judged by `video::keymap::resolve`) and APPCLIP's
+                                            // non-capture arm (R61: `pal::Event::Action` on the same ring) are the decoder's, asked against
+                                            // the same previous report; the wire keeps its bytes (`:: PRTSCR: PrintScreen (HID 0x46) down on
+                                            // xHCI -> capture armed action=` / `:: PRTSCR: [prtscr] chord= ... on xHCI` / `[clip] chord=
+                                            // action= via=xhci -> delivered`: the label `xHCI` and the tag `xhci` of `Transport::Xhci`).
+                                            // The capture is still only `prtscr::request()`, run on the device-service pass. Comment lines in
+                                            // place of the statements (line count kept).
 
-                                            // HID-LED: lock-key press edges. A lock key present in this
-                                            // report but absent last report is a fresh press — toggle the
-                                            // matching LED bit and push the new bitmap to the device via
-                                            // SET_REPORT. Caps Lock (0x39, bit1) is the one Peter observed
-                                            // never lighting; Num Lock (0x53, bit0) and Scroll Lock (0x47,
-                                            // bit2) are toggled the same way for LED/state agreement.
-                                            #[cfg(target_arch = "x86_64")] let mut leds_changed = false;
-                                            // ALLKEYS: the (usage, LED bit) pairs now live beside the
-                                            // scancode table so the EHCI toggle loop uses the same three.
-                                            #[cfg(target_arch = "x86_64")] for &(usage, bit) in HID_LOCK_KEYS.iter() {
-                                                let pressed_now = cur_keys.contains(&usage);
-                                                let pressed_before = prev_keys.contains(&usage);
-                                                if pressed_now && !pressed_before {
-                                                    self.slots[slot_id as usize].keyboard_leds ^= bit;
-                                                    leds_changed = true;
-                                                }
-                                            }
-                                            #[cfg(target_arch = "x86_64")] if leds_changed {
-                                                self.slots[slot_id as usize].keyboard_leds_dirty = true; // HIDLEDDEFER (B44) — the bitmap is toggled above; the SET_REPORT that pushes it to the device is a SYNCHRONOUS EP0 control transfer (`set_hid_leds` -> `sync_control` -> `pump_until_ep0_done`, a nested drain of this very event ring, budgeted at `hw_wait_budget()`), and it used to run HERE, inside the completion branch, before the re-arm. It now runs from `service_hid_leds` on the polled service pass, one pass later (<= a few ms), so the completion path holds no wait and no nested dispatch — which also forecloses the re-entrancy orin 17 had to argue was safe (a nested keyboard completion decoding under an outer one). ⚠ FOLDED onto the line that fetched the interface for the call.
-                                                KBD_LED_DEFERRED.fetch_add(1, Ordering::Relaxed); // HIDLEDDEFER — counted so `[kbdpoll]`/XHCIKBD can show the hand-off happened; `[hidled] caps=… set-report ok` still prints, from the service pass. ⚠ FOLDED onto the line that made the call.
-                                            }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                            // HIDBOOTXHCIX86 (rmbp-ledger B1003): the x86 inline lock-key toggle that stood on these lines is
+                                            // DELETED. The decoder toggles the `leds` byte on a lock-key press edge (`HID_LOCK_KEYS`, the
+                                            // same three pairs), the block above writes it back to `keyboard_leds`, and `Transport::Xhci`'s
+                                            // `set_leds` answering true marks HIDLEDDEFER's `keyboard_leds_dirty` + `KBD_LED_DEFERRED` there:
+                                            // `service_hid_leds` still issues the SET_REPORT from the polled service pass (B44), so the
+                                            // completion path holds no EP0 wait. Comment lines in place of the statements (line count kept).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
                                             self.kbd_top_up(slot_id as u8); // XHCINTD — kept as a NO-OP-WHEN-FULL backstop, not as the re-arm: the real one ran at the `rep8` line before the decode. With HIDLEDDEFER nothing between there and here can re-enter this dispatch, so in steady state this is a bounded no-op; it stays because it is the line every reader of the old code looks for. ⚠ FOLDED.
                                         }

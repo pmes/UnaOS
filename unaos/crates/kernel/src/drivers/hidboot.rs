@@ -22,14 +22,14 @@
 // `BT-HID:` for the Bluetooth keyboard (`ehci::bthid`), `PS2-HID:` for the i8042 (`drivers::i8042`).
 // The caller still owns the per-keyboard state (previous keys, modifiers, the lock-key LED byte); the
 // LED change is sent through `Transport::set_leds` (HIDBOOTLEDS B987; EHCI's arm owes its caller's
-// per-endpoint LED slot, HIDBOOTLEDSEHCI B991); every caller runs under `ehci::EHCI_HID`, which serialises the
-// decoder's globals (the DBLSTROKE atomics below) and the typematic feed. `ehci` re-exports
+// per-endpoint LED slot, HIDBOOTLEDSEHCI B991); the EHCI/BT/PS2 callers run under `ehci::EHCI_HID`, the xHCI caller under the
+// xHCI loan (HIDBOOTXHCIX86 B1003): the decoder's globals are atomics (DBLSTROKE, pal's typematic tracker), so two keyboards on two controllers interleave reports on ONE tracker (one pair of hands). `ehci` re-exports
 // `decode_boot_keyboard`, so `ehci::decode_boot_keyboard` paths in prose still resolve.
 //
 // HIDBOOTLEDS (rmbp-ledger B987): the lock LEDs leave the decoder through ONE `Transport::set_leds`
 // call; `[keystat] <tag>` and the PRTSCR `on <transport>` word name the transport (EHCI byte-identical).
 // HIDBOOTLEDSEHCI (B991): EHCI's arm marks the endpoint's LED slot, drained after the walk. Owed (input.md
-// §5 Z3 row): the Fn keys; HIDBOOT-PUMP (the i8042 is pumped only from `ehci::service_ehci_hid`). HIDBOOT-ARM BUILT by HIDBOOTARM (B1000): declared on aarch64, the aarch64 xHCI keyboard calls `decode_noted` (file tail) with `Transport::Xhci`. HIDBOOTLEDSTEST (B995): the slot drain is `drain_led_slots` (file tail), `tests hidboot`.
+// §5 Z3 row): the Fn keys; HIDBOOT-PUMP (the i8042 is pumped only from `ehci::service_ehci_hid`). HIDBOOT-ARM BUILT by HIDBOOTARM (B1000): declared on aarch64, the aarch64 xHCI keyboard calls `decode_noted` (file tail) with `Transport::Xhci`; HIDBOOTXHCIX86 (B1003): the x86 xHCI keyboard calls it too (its inline decode deleted). HIDBOOTLEDSTEST (B995): the slot drain is `drain_led_slots` (file tail), `tests hidboot`.
 
 /// The transport that carried a boot keyboard report. Labels the decoder's wire; changes no decode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -40,7 +40,7 @@ pub enum Transport {
     Bluetooth,
     /// The i8042 PS/2 keyboard (`drivers::i8042`), its set-1 scancodes folded into a boot report.
     Ps2,
-    /// HIDBOOTARM (B1000): a USB boot keyboard on xHCI (aarch64: the Orin's XUSB, the Pi's VL805; x86 xHCI keeps its inline decode, HIDBOOT-XHCI-X86 owed).
+    /// HIDBOOTARM (B1000): a USB boot keyboard on xHCI (aarch64: the Orin's XUSB, the Pi's VL805; x86 since HIDBOOTXHCIX86 B1003: an external USB keyboard on the rMBP/Zenbook).
     Xhci,
 }
 
@@ -271,7 +271,7 @@ impl Transport {
 // stays 0 and not one line is emitted.
 //
 // HIDBOOTARM (B1000): `drivers/mod.rs` declares `pub mod hidboot` on x86_64 AND aarch64 (the aarch64 xHCI
-// keyboard is a caller, under the xHCI loan); HIDBOOTSHARED (B982) had it x86-only. The one dependency
+// keyboard is a caller, under the xHCI loan; x86 xHCI too since HIDBOOTXHCIX86 B1003); HIDBOOTSHARED (B982) had it x86-only. The one dependency
 // that is not on every image, `pal::typematic_note_keys`, carries pal's own gate (`x86_64 + ehcihid`,
 // `aarch64 + baremetal|tegra`) at its call; the i8042 and Bluetooth arms are x86-gated at their helpers.
 
@@ -721,9 +721,9 @@ pub fn selftest() {
 }
 
 // HIDBOOTARM (rmbp-ledger B1000) — TAIL-APPENDED. The i8042 arm of `Transport::set_leds` behind its arch (the
-// `bt_queue_led` shape: the i8042 module is x86_64-only), and the aarch64 xHCI keyboard's entry: `decode_noted` is a
+// `bt_queue_led` shape: the i8042 module is x86_64-only), and the xHCI keyboard's entry (both arches since HIDBOOTXHCIX86 B1003): `decode_noted` is a
 // WITNESS WRAPPER over the ONE decoder, not a second decoder — it calls `decode_boot_keyboard` and, on the first report
-// that pushed a press edge, prints `[hidboot] via=<tag> arch=aarch64 keys=<edges this report>` once per boot.
+// that pushed a press edge, prints `[hidboot] via=<tag> arch=aarch64|x86_64 keys=<edges this report>` once per boot.
 #[cfg(target_arch = "x86_64")]
 fn ps2_set_leds(leds: u8) {
     crate::drivers::i8042::set_leds(leds);
@@ -731,13 +731,13 @@ fn ps2_set_leds(leds: u8) {
 #[cfg(not(target_arch = "x86_64"))]
 fn ps2_set_leds(_leds: u8) {}
 
-/// HIDBOOTARM (B1000): set once the first-key line has printed.
-#[cfg(target_arch = "aarch64")]
+/// HIDBOOTARM (B1000): set once the first-key line has printed (HIDBOOTXHCIX86 B1003: x86 too).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 static ARM_FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// HIDBOOTARM (B1000): the aarch64 xHCI keyboard completion's call (`drivers::xhci` `poll_events`, under the xHCI loan,
+/// HIDBOOTARM (B1000): the xHCI keyboard completion's call on both arches (HIDBOOTXHCIX86 B1003; `drivers::xhci` `poll_events`, under the xHCI loan,
 /// which owns the slot state passed here). Returns `decode_boot_keyboard`'s answer (true = the caller owes its LED slot).
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn decode_noted(t: Transport, report: &[u8], prev_keys: &mut [u8; 6], prev_mods: &mut u8, leds: &mut u8) -> bool {
     use core::sync::atomic::Ordering;
     let before = PRESS_EDGES.load(Ordering::Relaxed);
