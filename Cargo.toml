@@ -51,6 +51,7 @@ members = [
     "unaos/libs/media/hevc_core", # HEVCPARSE (SR199): the from-spec H.265/HEVC bitstream parser and intra decoder (8-bit 4:2:0 I slices) Stria links beside h264_core; no_std, its one dep h264_core (CABAC engine, bit reader, NAL framing, Frame)
     "unaos/libs/media/sbc_core", # A2DP (B739): the SBC encoder (the A2DP mandatory codec) from the specification; no_std, no alloc, zero deps; the kernel includes src/sbc.rs by #[path]
     "unaos/libs/media/timeline_core", # NLE1 (SR194): the no_std timeline core (EDL model, pure edit ops, CMX 3600 text, keyframe-aware render schedule) Stria's render links
+    "unaos/libs/media/raster_core", # RASTERCORE (SR230): the no_std raster document core (Facet's canvas) — layers, masks, selections, commands, the chunked container over PNG layers
     # SVGCORE (SR52): the no_std SVG renderer (XML, paths, painting, text via font_core) behind pixel_core's `svg` format.
     "unaos/libs/media/svg_core",
     "unaos/libs/sys/holocron_core",

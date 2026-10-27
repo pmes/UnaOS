@@ -1,0 +1,18 @@
+[package]
+name = "raster_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Facet's raster document core: layers, masks, selections, the one compositor over pixel_core's blend, commands with undo/redo and the UNARASTR chunked container over PNG layers — shared by Ring 0 and Ring 3."
+
+# RASTERCORE (LEDGER SR230): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the timeline_core shape: a shared core
+# under `unaos/libs/`, a member of the ROOT host workspace, linkable by a later kernel face by path with
+# `default-features = false`. Its one dependency is pixel_core (the PNG reader / writer and `blend_nonpremult`);
+# pixel_core has no `std` feature (`default = []`), so no `default-features` line is needed.
+[dependencies]
+pixel_core = { path = "../pixel_core" }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).
+std = []
