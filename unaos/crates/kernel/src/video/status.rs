@@ -170,7 +170,7 @@ pub enum Source {
     /// Orin.
     None,
     /// The Apple SMC answered the battery keys.
-    Smc,
+    Smc, Ec, // ZENBOOKECBATTERY (zenbook-ledger Z20): `Ec` = the ACPI embedded controller answered (a `drivers::ec` offsets row decoded). LINE-NEUTRAL fold, code before the comment.
     /// ⛔ **A FIXTURE put this reading here, and no hardware produced it.**
     ///
     /// [`inject`] is the only writer of this variant and [`inject`] is `witness`-gated, so a metal
@@ -192,7 +192,7 @@ impl Source {
         match self {
             Source::Unresolved => "unresolved",
             Source::None => "none",
-            Source::Smc => "smc",
+            Source::Smc => "smc", Source::Ec => "ec", // ZENBOOKECBATTERY (zenbook-ledger Z20): the EC arm (`ec_arm`, file tail). LINE-NEUTRAL fold, code before the comment.
             Source::Fixture => "fixture",
         }
     }
@@ -354,7 +354,7 @@ static WIRE_SRC: AtomicU8 = AtomicU8::new(SRC_UNSAID);
 
 const SRC_UNRESOLVED: u8 = 0;
 const SRC_NONE: u8 = 1;
-const SRC_SMC: u8 = 2;
+const SRC_SMC: u8 = 2; const SRC_EC: u8 = 4; // ZENBOOKECBATTERY (zenbook-ledger Z20): see `Source::Ec`. LINE-NEUTRAL fold, code before the comment.
 /// See [`Source::Fixture`]. Only [`inject`] writes it, and [`inject`] is `witness`-gated.
 const SRC_FIXTURE: u8 = 3;
 /// Not a source: the "no `[status] poll` line has been emitted yet" state of [`WIRE_SRC`]. It must
@@ -432,8 +432,8 @@ pub fn poll() {
     // placement argument (WEDGE-8, the render-core rule) falsifiable on metal instead of asserted
     // from a scout's arithmetic.
     let t0 = crate::arch::now_cycles();
-    match board_raw() {
-        Some(b) => {
+    match board_raw().map(|b| (b, SRC_SMC)).or_else(ec_arm) { // ZENBOOKECBATTERY (zenbook-ledger Z20): the EC arm (`ec_arm`, file tail). LINE-NEUTRAL fold, code before the comment.
+        Some((b, src)) => { // ZENBOOKECBATTERY (zenbook-ledger Z20): the EC arm (`ec_arm`, file tail). LINE-NEUTRAL fold, code before the comment.
             // MENUBATT2 — ⛔ [`ANSWERS`] IS COUNTED **HERE** AND NOT IN [`store`], AND THE FIRST
             // MEASURED RUN OF THIS ARC IS WHY. It used to sit in `store`, which [`inject`] also
             // calls, so the gate boot's own capture read `[status] poll n=7 answered=3 src=none`:
@@ -444,7 +444,7 @@ pub fn poll() {
             // by a fixture is the `Source::Fixture` lesson one field over, and it is caught the
             // same way: the term names SWEEPS THAT ANSWERED, so only a sweep may increment it.
             ANSWERS.fetch_add(1, Ordering::Relaxed);
-            store(b, now, SRC_SMC);
+            store(b, now, src); // ZENBOOKECBATTERY (zenbook-ledger Z20): the EC arm (`ec_arm`, file tail). LINE-NEUTRAL fold, code before the comment.
         }
         // A sweep that answered nothing. If the source has NEVER answered, that is the measured
         // absence and it is now resolved. If it HAS, this is a drop-out and the held reading stands
@@ -517,7 +517,7 @@ fn store(b: Battery, now: u64, src: u8) {
 /// risking a line whose `src=` term belongs to a different sweep than its `took_us=`.
 fn src_of(b: u8) -> Source {
     match b {
-        SRC_SMC => Source::Smc,
+        SRC_SMC => Source::Smc, SRC_EC => Source::Ec, // ZENBOOKECBATTERY (zenbook-ledger Z20): the EC arm (`ec_arm`, file tail). LINE-NEUTRAL fold, code before the comment.
         SRC_FIXTURE => Source::Fixture,
         SRC_NONE => Source::None,
         _ => Source::Unresolved,
@@ -533,7 +533,7 @@ pub fn source() -> Source {
 /// has gone past [`STALE_MS`]. For the wire; the painter wants [`bar_item`].
 pub fn reading() -> Option<(Battery, u64)> {
     let src = SRC.load(Ordering::Relaxed);
-    if VALID.load(Ordering::Relaxed) == 0 || (src != SRC_SMC && src != SRC_FIXTURE) {
+    if VALID.load(Ordering::Relaxed) == 0 || (src != SRC_SMC && src != SRC_FIXTURE && src != SRC_EC) { // ZENBOOKECBATTERY (zenbook-ledger Z20): the EC arm (`ec_arm`, file tail). LINE-NEUTRAL fold, code before the comment.
         return None;
     }
     let age = crate::arch::ms().wrapping_sub(AT_MS.load(Ordering::Relaxed));
@@ -982,7 +982,7 @@ pub fn latest() -> Option<(Battery, u64)> {
     if let Some(r) = reading() {
         return Some(r);
     }
-    if VALID.load(Ordering::Relaxed) == 0 || SRC.load(Ordering::Relaxed) != SRC_SMC {
+    if VALID.load(Ordering::Relaxed) == 0 || !matches!(SRC.load(Ordering::Relaxed), SRC_SMC | SRC_EC) { // ZENBOOKECBATTERY (zenbook-ledger Z20): the EC arm (`ec_arm`, file tail). LINE-NEUTRAL fold, code before the comment.
         return None;
     }
     Some((unpack(READING.load(Ordering::Relaxed)), crate::arch::ms().wrapping_sub(AT_MS.load(Ordering::Relaxed))))
@@ -1076,8 +1076,8 @@ fn live_tick(now: u64, real: bool) -> bool {
     if LIVE_LAST_MS.compare_exchange(last, now.max(1), Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return false;
     }
-    if let Some(b) = board_raw() {
-        store(b, now, SRC_SMC);
+    if let Some((b, src)) = board_raw().map(|b| (b, SRC_SMC)).or_else(ec_arm) { // ZENBOOKECBATTERY (zenbook-ledger Z20): the EC arm (`ec_arm`, file tail). LINE-NEUTRAL fold, code before the comment.
+        store(b, now, src); // ZENBOOKECBATTERY (zenbook-ledger Z20): the EC arm (`ec_arm`, file tail). LINE-NEUTRAL fold, code before the comment.
     }
     let raw = dcin_sweep();
     LIVE_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -1085,10 +1085,10 @@ fn live_tick(now: u64, real: bool) -> bool {
     let first = LIVE_WAS_OPEN.swap(1, Ordering::Relaxed) == 0;
     match latest() {
         Some((b, _)) => serial_println!(
-            "[battery] live pct={} state={} watts_in={} src=smc:{}{}",
+            "[battery] live pct={} state={} watts_in={} src={}:{}{}",
             b.percent,
             state_word(&b, mw),
-            Watts(mw),
+            Watts(mw), source().as_str(), // ZENBOOKECBATTERY (zenbook-ledger Z20): the reading's source (`smc` on an SMC reading, as before). LINE-NEUTRAL fold, code before the comment.
             src,
             FirstRaw(first, raw),
         ),
@@ -1178,4 +1178,23 @@ fn battery_fixture() {
     if !live_ok {
         serial_println!(":: BATTERY: live legs ticked={} rows={} states={} decode={} ::", w(ticked), w(rows_ok), w(states_ok), w(decode_ok));
     }
+}
+
+// ── ZENBOOKECBATTERY (zenbook-ledger Z20) — the board source's EC arm. TAIL-APPENDED, so no line above moves ────────────
+// `poll` and `live_tick` ask `board_raw` (the SMC arm, labelled `SRC_SMC`) and, when it gives nothing, this arm: the ACPI
+// embedded controller through `drivers::ec::battery` (a platform's offsets row, read only). It answers `None` silently on
+// every machine `hw::gate(Probe::Ec)` refuses (the rMBP, QEMU) and on every platform with no offsets row (the Zenbook,
+// until ZENBOOK-EC-OFFSETS) — so the item stays the measured absence there. A reading it gives is labelled `SRC_EC`
+// (`src=ec`), never the SMC's name. No minutes-to-full: no EC row carries one.
+
+#[cfg(target_arch = "x86_64")]
+fn ec_arm() -> Option<(Battery, u8)> {
+    let r = crate::drivers::ec::battery()?;
+    Some((Battery { percent: r.pct, charging: r.charging, minutes: None, ma: r.ma, mv: r.mv }, SRC_EC))
+}
+
+/// No EC on this arch: the arm is absent.
+#[cfg(not(target_arch = "x86_64"))]
+fn ec_arm() -> Option<(Battery, u8)> {
+    None
 }
