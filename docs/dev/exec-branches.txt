@@ -1074,7 +1074,7 @@ refs/heads/exec-rmbp-hidbootledsxhci   e9ae3e423 FOLDED-BY-HAND (this commit) 20
 refs/heads/exec-rmbp-openanytype   d00423fee FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-unafsreadunmasked   cd26b9213 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-xhciloanfailhold   cd26b9213 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-lockregforceunlock   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-lockregforceunlock   7ea0109e6 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-maskwritesite   cd26b9213 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-wmclosehook   cd26b9213 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-gen7heldrelease   cd26b9213 IN-FLIGHT cut 2026-10-27
