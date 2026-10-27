@@ -87,7 +87,7 @@ fn install(mut new: Option<Wall>) {
         SNAP.store(snap, Ordering::Release); #[cfg(target_arch = "x86_64")] crate::video::wm::desktop::veil_cache_invalidate();
         core::mem::replace(&mut *g, new)
     };
-    *RETIRED.lock() = old;
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] *RETIRED.lock() = old; #[cfg(all(target_arch = "x86_64", feature = "wc"))] retire(old); // RETIREDFREE (B845): the retire stamped and retagged in one RETIRED hold, freed by `wall-reap` after the grace. LINE-NEUTRAL fold, code first
 }
 
 /// DESKTOPCRAFT (B631): the installed picture and its VEIL for the furniture painters (`None` = the flat colour).
@@ -560,4 +560,90 @@ pub fn startscene_selftest() {
         ":: STARTSCENE: gen_count={} splash_scene={} gop_stars={} hold_ticks={} login_backdrop={} -> {} ::",
         gens, splash_scene as u8, if gop_ok { "ok" } else { "FAIL" }, ticks, if backdrop { "picture" } else { "flat" }, if ok { "PASS" } else { "FAIL" }
     );
+}
+
+// RETIREDFREE (rmbp-ledger B845, BP-video-18, MEMLINE3) — THE RETIRED PICTURE FREED AFTER ITS GRACE. Until this arc the
+// picture an install retired was freed only by the install after next (two panel-sized pictures held). [`retire`]
+// assigns RETIRED (the older one is freed there, as before), retags its two buffers `wallpaper-retired` for the owner
+// census and stamps `RETIRED_AT`, all in ONE `RETIRED` hold; then a one-shot `wall-reap` task on a worker core (the
+// `probe_task`/`regen_task` shape) sleeps to [`RETIRED_GRACE_MS`] and frees the picture — taken under `RETIRED` only
+// while the stamp is the one it slept on, so a newer retire (a regen or a load installing meanwhile) restarts the wait
+// instead. The grace is longer than the 1500 ms W5 gate steal: a masked painter that loaded the old `Snap` has finished
+// its pass, or its core is declared dead. No worker core (or not in a task): today's behaviour. x86 `wc` only.
+// Wire: `[memline] retired freed age_ms=<n>`.
+/// RETIREDFREE (B845): how long a retired picture stays allocated after its retire.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub const RETIRED_GRACE_MS: u64 = 2_000;
+/// RETIREDFREE (B845): when the held RETIRED picture was retired (ms, 0 = none held).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static RETIRED_AT: AtomicU64 = AtomicU64::new(0);
+/// RETIREDFREE (B845): retired pictures the reaper freed this boot.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static RETIRED_FREED: AtomicU32 = AtomicU32::new(0);
+/// RETIREDFREE (B845): a `wall-reap` task is pending.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static REAPING: AtomicBool = AtomicBool::new(false);
+
+/// RETIREDFREE (B845): [`install`]'s retire — assign, retag, stamp under one `RETIRED` hold; then arm the reaper.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn retire(old: Option<Wall>) {
+    use crate::allocator::census;
+    let held = old.is_some();
+    {
+        let mut g = RETIRED.lock();
+        *g = old;
+        if let Some(w) = g.as_ref() {
+            census::retag(w.px.as_ptr() as usize, w.px.capacity() * core::mem::size_of::<u32>(), census::WALLPAPER_RETIRED);
+            census::retag(w.veil.as_ptr() as usize, w.veil.capacity() * core::mem::size_of::<u32>(), census::WALLPAPER_RETIRED);
+        }
+        RETIRED_AT.store(if held { crate::arch::ms().max(1) } else { 0 }, Ordering::Release);
+    }
+    if !held || crate::arch::sched::current_id().is_none() || REAPING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    match crate::arch::smp::worker_cpu(0) {
+        Some(cpu) => crate::arch::sched::spawn("wall-reap", reap_task, cpu, cpu, crate::arch::sched::PRIO_NORMAL),
+        None => REAPING.store(false, Ordering::Release),
+    }
+}
+
+/// RETIREDFREE (B845): the `wall-reap` task — sleep to the grace, free the picture it slept on, then exit.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn reap_task(_cpu: usize) {
+    loop {
+        let at = RETIRED_AT.load(Ordering::Acquire);
+        if at != 0 {
+            let age = (crate::arch::ms() as u64).saturating_sub(at);
+            if age < RETIRED_GRACE_MS {
+                crate::arch::sched::sleep_ms(RETIRED_GRACE_MS - age);
+                continue;
+            }
+            let old = {
+                let mut g = RETIRED.lock();
+                if RETIRED_AT.load(Ordering::Acquire) == at {
+                    RETIRED_AT.store(0, Ordering::Release);
+                    g.take()
+                } else {
+                    None
+                }
+            };
+            if old.is_some() {
+                RETIRED_FREED.fetch_add(1, Ordering::Relaxed);
+                drop(old);
+                serial_println!("[memline] retired freed age_ms={}", age);
+            }
+            continue;
+        }
+        REAPING.store(false, Ordering::Release);
+        if RETIRED_AT.load(Ordering::Acquire) == 0 || REAPING.swap(true, Ordering::AcqRel) {
+            return;
+        }
+    }
+}
+
+/// RETIREDFREE (B845): `(age ms of the held RETIRED picture, None = none held; pictures freed this boot)`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn retired_state() -> (Option<u64>, u32) {
+    let at = RETIRED_AT.load(Ordering::Acquire);
+    (if at == 0 { None } else { Some((crate::arch::ms() as u64).saturating_sub(at)) }, RETIRED_FREED.load(Ordering::Relaxed))
 }

@@ -224,8 +224,13 @@ pub mod census {
     pub const SHADOW: u8 = 2;
     pub const WALLPAPER: u8 = 3;
     pub const HELP: u8 = 4;
+    /// MEMLINE3 (B845): wallpaper's RETIRED picture ([`retag`] at its retire), appres's decoded icons (PIX), the
+    /// faces `video::text` holds resident.
+    pub const WALLPAPER_RETIRED: u8 = 5;
+    pub const APPRES_PIX: u8 = 6;
+    pub const TEXT_RESIDENT: u8 = 7;
     /// Tag -> its census name (0 = no tag).
-    pub const NAMES: [&str; 5] = ["-", "stage", "shadow", "wallpaper", "help"];
+    pub const NAMES: [&str; 8] = ["-", "stage", "shadow", "wallpaper", "help", "wallpaper-retired", "appres-pix", "text-resident"];
     /// An untagged block this large is tracked under its task's name.
     pub const BIG: usize = 64 * 1024;
     /// Owner rows a [`Snapshot`] carries (the last one becomes `other` on overflow).
@@ -237,6 +242,14 @@ pub mod census {
     static ON: AtomicBool = AtomicBool::new(false);
     /// `(tid << 8) | tag`, 0 = free.
     static ARMED: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    /// MEMLINE3 (B845): a slot whose word is unchanged across two census reads this far apart is reclaimed (a task
+    /// killed inside a [`Scope`] never drops it; no Scope lives this long — one grow, one generation).
+    const STALE_MS: u64 = 30_000;
+    /// MEMLINE3 (B845): the word each slot held at the last census read, and when it was first seen.
+    static SEEN: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static SEEN_MS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    /// MEMLINE3 (B845): slots reclaimed this boot.
+    static RECLAIMED: AtomicU64 = AtomicU64::new(0);
 
     /// One tracked block. All-zero is empty (the table is zero-initialised: `.bss`, not image bytes).
     #[derive(Clone, Copy)]
@@ -272,15 +285,18 @@ pub mod census {
     }
 
     /// An armed tag; dropping it restores the task's previous tag (or frees the slot). `slot == SLOTS` = inert.
+    /// MEMLINE3 (B845): `own` is the word this Scope armed; the drop restores only while the slot still holds it, so a
+    /// slot [`reap_stale`] reclaimed (and perhaps re-issued) is never clobbered.
     pub struct Scope {
         slot: usize,
         prev: u64,
+        own: u64,
     }
 
     impl Drop for Scope {
         fn drop(&mut self) {
             if self.slot < SLOTS {
-                ARMED[self.slot].store(self.prev, Release);
+                let _ = ARMED[self.slot].compare_exchange(self.own, self.prev, AcqRel, Relaxed);
             }
         }
     }
@@ -288,7 +304,7 @@ pub mod census {
     /// Tag the calling task's allocations `NAMES[tag]` until the returned [`Scope`] drops. Inert when the census is
     /// not armed, outside a task, or with all slots taken.
     pub fn enter(tag: u8) -> Scope {
-        let inert = Scope { slot: SLOTS, prev: 0 };
+        let inert = Scope { slot: SLOTS, prev: 0, own: 0 };
         if !ON.load(Acquire) || tag == 0 || tag as usize >= NAMES.len() {
             return inert;
         }
@@ -298,12 +314,12 @@ pub mod census {
             let v = s.load(Acquire);
             if v != 0 && v >> 8 == tid {
                 s.store(packed, Release);
-                return Scope { slot: i, prev: v };
+                return Scope { slot: i, prev: v, own: packed };
             }
         }
         for (i, s) in ARMED.iter().enumerate() {
             if s.compare_exchange(0, packed, AcqRel, Relaxed).is_ok() {
-                return Scope { slot: i, prev: 0 };
+                return Scope { slot: i, prev: 0, own: packed };
             }
         }
         inert
@@ -425,6 +441,8 @@ pub mod census {
         pub tracked: u64,
         pub dropped: u64,
         pub rows: [Option<Row>; ROWS],
+        /// MEMLINE3 (B845): census slots reclaimed this boot ([`reap_stale`]).
+        pub reclaimed: u64,
     }
 
     impl Snapshot {
@@ -436,7 +454,8 @@ pub mod census {
 
     /// The census now, by owner. Takes the heap lock itself: never call it from inside an allocation.
     pub fn snapshot() -> Snapshot {
-        let mut s = Snapshot { used: 0, tracked: 0, dropped: 0, rows: [None; ROWS] };
+        reap_stale();
+        let mut s = Snapshot { used: 0, tracked: 0, dropped: 0, rows: [None; ROWS], reclaimed: RECLAIMED.load(Relaxed) };
         crate::arch::without_interrupts(|| {
             let heap = super::ALLOCATOR.lock();
             s.used = heap.used() as u64;
@@ -475,6 +494,38 @@ pub mod census {
             drop(heap);
         });
         s
+    }
+
+    /// MEMLINE3 (B845) — a census read reclaims a slot whose word has not changed for [`STALE_MS`] (its task died
+    /// inside the Scope: x86 sched has no tid-liveness query to ask). Atomics only, before the heap lock. A false
+    /// reclaim of a live Scope only leaves its remaining grows untagged (its drop's CAS misses).
+    fn reap_stale() {
+        let now = crate::arch::ms();
+        for i in 0..SLOTS {
+            let v = ARMED[i].load(Acquire);
+            if v == 0 || SEEN[i].swap(v, AcqRel) != v {
+                SEEN_MS[i].store(now, Relaxed);
+                continue;
+            }
+            if now.saturating_sub(SEEN_MS[i].load(Relaxed)) >= STALE_MS && ARMED[i].compare_exchange(v, 0, AcqRel, Relaxed).is_ok() {
+                RECLAIMED.fetch_add(1, Relaxed);
+                SEEN[i].store(0, Relaxed);
+            }
+        }
+    }
+
+    /// MEMLINE3 (B845) — name the block at `addr` (`size` bytes, the allocation's own length) `NAMES[tag]`: a block
+    /// that changes owner without a new allocation (wallpaper's WALL -> RETIRED). Renames a tracked block or starts
+    /// tracking an untracked one. Inert while unarmed. Takes the heap lock itself: never call it from an allocation.
+    pub fn retag(addr: usize, size: usize, tag: u8) {
+        if !ON.load(Acquire) || addr == 0 || size == 0 || tag == 0 || tag as usize >= NAMES.len() {
+            return;
+        }
+        crate::arch::without_interrupts(|| {
+            let heap = super::ALLOCATOR.lock();
+            insert(addr, size, NAMES[tag as usize], true);
+            drop(heap);
+        });
     }
 }
 

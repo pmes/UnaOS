@@ -474,7 +474,7 @@ fn with_pix<R>(key: &str, size: usize, f: impl FnOnce(&[u32]) -> R) -> Option<R>
     if a.path.starts_with('/') {
         serial_println!("[appres] icon-for name={} from={} path={} size={}", key, if a.source == SOURCE_FOREIGN { "foreign" } else { "root" }, a.path, size); // APPTRUST2 (B478): once per decode
     }
-    let argb = render(&a, size)?;
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _ct = crate::allocator::census::enter(crate::allocator::census::APPRES_PIX); let argb = render(&a, size)?; // FACELEAK (MEMLINE3 B845): the decoded icon (and its PIX entry) tagged for the owner census. LINE-NEUTRAL fold, code first
     DRAWN.fetch_add(1, Ordering::Relaxed);
     let r = f(&argb);
     if let Some(mut p) = PIX.try_lock() {
@@ -669,7 +669,7 @@ pub fn blit_key_icon(px: &mut [u32], stride: usize, h: usize, x: usize, y: usize
         }
     }
     let g = app_from_block("generic", "builtin:generic", "builtin", GENERIC, "builtin");
-    let Some(argb) = render(&g, size) else { return false };
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _ct = crate::allocator::census::enter(crate::allocator::census::APPRES_PIX); let Some(argb) = render(&g, size) else { return false }; // FACELEAK (MEMLINE3 B845): as in `with_pix`. LINE-NEUTRAL fold, code first
     blit(&argb, px);
     if let Some(mut p) = PIX.try_lock() {
         if p.len() >= 64 {
