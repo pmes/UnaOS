@@ -2522,3 +2522,11 @@ FORBID \[textscale\] win=shell css=[0-9]+ grow=[0-9]+ rows_ok=0
 # --- row off its origin. PIDESK-SPEC (an armed kernel8 spec) is the owed row that would let this become a REQUIRE.
 OPTIONAL :: OVERLAYS: launcher=ok appswitch=skip\(x86\) .* -> PASS ::
 FORBID :: OVERLAYS: .* -> FAIL ::
+
+# --- PIDESK-SPEC (rmbp-ledger B878): THE RULE for every `desktop_firmware`-gated row in this file (DRAG-PI :2305-2401,
+# --- SHELLFACE :2507-2515, ARMOVERLAYS :2517-2524, and each one after them). This battery is KNOB-OFF by default, so such
+# --- a row stays OPTIONAL + FORBID HERE; its POSITIVE form is a REQUIRE in `scripts/specs/pi4-desktop.spec` (or an
+# --- OPTIONAL there with its promotion condition beside it), which `kernel8-test` replays AFTER this file when
+# --- UNAOS_PIDESK=1 (`./arroyo kernel8-test --desk 300`; arroyo `k8_pick_capture_spec` / `k8_desk_replay`). This file
+# --- stays the completion source and owns TRUNCATED; the second file carries no FORBID (these do) and no COMPLETE.
+# --- A new desktop line lands in BOTH files in the same commit. Written at the tail: rows cite this file by line.

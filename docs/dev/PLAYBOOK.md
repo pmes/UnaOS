@@ -66,6 +66,8 @@ for every family the flight needs, and a control string that must be 0.
 The rMBP panel on x86 QEMU (ZOOMPANEL B842): `UNAOS_FBW=2880 UNAOS_FBH=1800` arm the default VGA at that size (`xres`/`yres`/`edid`/`vgamem_mb`)
 and the loader picks it when OVMF offers it; `UNAOS_PPI=221` is the ppi the scale is taken from (2.0). The leg: those three plus
 `UNAOS_WC=1 UNAOS_FACET=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`, scored by `scripts/specs/x86-panel.spec`.
+The Pi desktop (PIDESK-SPEC B878): `./arroyo kernel8-test --desk 300` (= `UNAOS_PIDESK=1`) is scored by `scripts/specs/pi4-regression.spec`, then
+`scripts/specs/pi4-desktop.spec` (the armed desktop's REQUIREs); a new `desktop_firmware` line goes OPTIONAL+FORBID in the first and REQUIRE in the second.
 
 ## 4. Stage and card (Orin)
 1. Stage the tree (never a `target/` path to Peter):
