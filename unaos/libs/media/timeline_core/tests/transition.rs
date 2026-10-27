@@ -118,9 +118,9 @@ fn edl_refusals_are_named() {
         Err(EdlError::Edit(EditError::Handle))
     );
     assert!(edl::parse(&ev("002  B        V     D    005 00:00:00:00 00:00:00:10 00:00:00:20 00:00:01:05"), 25).is_ok());
-    // an unknown wipe code
+    // an unknown wipe code (NLE3cBLACK: W003 is a corner box now; W007 is not in the table)
     assert_eq!(
-        edl::parse(&ev("002  B        V     W003 005 00:00:00:00 00:00:00:10 00:00:00:20 00:00:01:05"), 25),
+        edl::parse(&ev("002  B        V     W007 005 00:00:00:00 00:00:00:10 00:00:00:20 00:00:01:05"), 25),
         Err(EdlError::Transition { line: 8 })
     );
     // the incoming line's event number differs from its outgoing line's
@@ -229,9 +229,9 @@ fn nle3c_the_edl_carries_bl_and_the_new_wipes_byte_exact() {
     let gap = "001  BL       V     C        00:00:00:00 00:00:00:00 00:00:00:10 00:00:00:10\n002  B        V     C        00:00:00:00 00:00:00:20 00:00:00:10 00:00:01:05\n";
     let g = edl::parse(gap, 25).unwrap();
     assert_eq!((g.tracks[0].clips.len(), g.tracks[0].transitions.len()), (1, 0));
-    // BL as the incoming line (a transition TO black) is still refused
-    let to_black = "001  B        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20\n002  B        V     C        00:00:00:20 00:00:00:20 00:00:00:20 00:00:00:20\n002  BL       V     D    005 00:00:00:00 00:00:00:05 00:00:00:20 00:00:01:00\n";
-    assert_eq!(edl::parse(to_black, 25), Err(EdlError::Transition { line: 3 }));
+    // NLE3cBLACK: BL as the incoming line is now read (a transition TO black); BL on BOTH lines is refused
+    let both = "001  B        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20\n002  BL       V     C        00:00:00:00 00:00:00:00 00:00:00:20 00:00:00:20\n002  BL       V     D    005 00:00:00:00 00:00:00:05 00:00:00:20 00:00:01:00\n";
+    assert_eq!(edl::parse(both, 25), Err(EdlError::Transition { line: 3 }));
     // W041 / W101 / W201 round trip
     for (d, code) in [(WipeDir::Diagonal, "W041"), (WipeDir::Box, "W101"), (WipeDir::Clock, "W201")] {
         assert_eq!(WipeDir::from_code(d.code()), Some(d));
@@ -240,7 +240,7 @@ fn nle3c_the_edl_carries_bl_and_the_new_wipes_byte_exact() {
         assert!(text.contains(&format!("{code} 007")), "{text}");
         assert_eq!(edl::parse(&text, 25).unwrap(), tl);
     }
-    assert_eq!(WipeDir::from_code(3), None);
+    assert_eq!(WipeDir::from_code(7), None);
 }
 
 #[test]
@@ -322,4 +322,127 @@ fn nle3e_the_audio_crossfade_follows_the_same_op() {
     // the same insert on A1: the crossfade is derived at the new cut
     let va = v.place(1, ins, Mode::Insert).unwrap();
     assert_eq!(va.audio_crossfade(1, 2).map(|x| (x.at, x.dur)), Some((30, 9)));
+}
+
+// ---- NLE3cBLACK (SR323): a transition TO black (CMX `BL` incoming line) and the new SMPTE wipe codes.
+
+/// V1: A[0,20)@0 (source 50 ticks), then a 5-tick dissolve to black in the gap 20..25.
+fn to_black() -> Timeline {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+    tl.add_transition_to_black(0, 20, TransitionKind::Dissolve, 5).unwrap()
+}
+
+const TO_BLACK: &str = "TITLE: TB
+FCM: NON-DROP FRAME
+* UNA FPS 25
+* UNA SOURCE A 00:00:02:00
+
+001  A        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20
+002  A        V     C        00:00:00:20 00:00:00:20 00:00:00:20 00:00:00:20
+002  BL       V     D    005 00:00:00:00 00:00:00:05 00:00:00:20 00:00:01:00
+";
+
+#[test]
+fn nle3cblack_to_black_op_and_refusals() {
+    let tl = to_black();
+    let x = tl.tracks[0].transitions[0];
+    assert_eq!((x.at, x.dur, x.from_black, x.to_black, x.kind), (20, 5, false, true, TransitionKind::Dissolve));
+    // an incoming clip at the cut is a plain cut, not a to-black one; nothing ends at 30
+    assert_eq!(cuts().add_transition_to_black(0, 20, TransitionKind::Dissolve, 5), Err(EditError::Transition));
+    assert_eq!(tl.add_transition_to_black(0, 30, TransitionKind::Dissolve, 5), Err(EditError::Transition));
+    // never both from and to black
+    let mut both = to_black();
+    both.tracks[0].transitions[0].from_black = true;
+    assert_eq!(both.validate(), Err(EditError::Transition));
+    // a clip starting inside the black refuses; one starting where the black ends is fine
+    let mut inside = to_black();
+    inside.tracks[0].clips.push(Clip::new(SourceId(0), 30, 40, 22));
+    assert_eq!(inside.validate(), Err(EditError::Handle));
+    let mut after = to_black();
+    after.tracks[0].clips.push(Clip::new(SourceId(0), 30, 40, 25));
+    assert_eq!(after.validate(), Ok(()));
+    // the outgoing's handle: source 22 ticks holds 2 past src_out 20
+    let mut short = Timeline::new(25);
+    let a = short.add_source("A", 22);
+    short.add_track(Kind::Video);
+    short.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+    assert_eq!(short.add_transition_to_black(0, 20, WIPE, 5), Err(EditError::Handle));
+    assert!(short.add_transition_to_black(0, 20, WIPE, 2).is_ok());
+}
+
+#[test]
+fn nle3cblack_the_edl_carries_bl_incoming_byte_exact() {
+    let tl = to_black();
+    let text = edl::write(&tl, "TB").unwrap();
+    assert_eq!(text, TO_BLACK);
+    let back = edl::parse(&text, 30).unwrap();
+    assert_eq!(back, tl);
+    assert_eq!(edl::write(&back, "TB").unwrap(), text);
+    // a BL incoming line whose record span is shorter than the transition is refused
+    let short = "001  A        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20\n002  A        V     C        00:00:00:20 00:00:00:20 00:00:00:20 00:00:00:20\n002  BL       V     D    005 00:00:00:00 00:00:00:04 00:00:00:20 00:00:00:24\n";
+    assert_eq!(edl::parse(short, 25), Err(EdlError::Transition { line: 3 }));
+    // the new SMPTE codes round trip
+    let codes = [
+        (WipeDir::CornerTopLeft, "W003"),
+        (WipeDir::CornerTopRight, "W004"),
+        (WipeDir::CornerBottomRight, "W005"),
+        (WipeDir::CornerBottomLeft, "W006"),
+        (WipeDir::BarnDoorVertical, "W021"),
+        (WipeDir::BarnDoorHorizontal, "W022"),
+        (WipeDir::DiagonalTopRight, "W042"),
+        (WipeDir::ClockThree, "W202"),
+        (WipeDir::ClockSix, "W203"),
+        (WipeDir::ClockNine, "W204"),
+    ];
+    for (d, code) in codes {
+        assert_eq!(WipeDir::from_code(d.code()), Some(d));
+        let tl = cuts().add_transition(0, 20, TransitionKind::Wipe(d), 7).unwrap();
+        let text = edl::write(&tl, "W").unwrap();
+        assert!(text.contains(&format!("{code} 007")), "{text}");
+        assert_eq!(edl::parse(&text, 25).unwrap(), tl);
+    }
+}
+
+#[test]
+fn nle3cblack_the_schedule_mixes_to_black() {
+    let tl = to_black();
+    let s = schedule(&tl, 0..30, &Gop { dur: 50 }).unwrap();
+    assert!(s[..20].iter().all(|x| x.src == Some(SourceId(0)) && x.vmix.is_none()));
+    for k in 0..5i64 {
+        let x = s[20 + k as usize];
+        assert_eq!((x.track, x.src, x.seek), (Some(0), None, None), "tick {}", 20 + k);
+        let m = x.vmix.unwrap();
+        // the outgoing decodes on past its out point: no seek at the cut or after it
+        assert_eq!((m.src, m.src_t, m.seek, m.t), (Some(SourceId(0)), 20 + k, None, Frac { num: k + 1, den: 6 }));
+    }
+    assert!(s[25..].iter().all(|x| x.track.is_none() && x.src.is_none() && x.vmix.is_none()));
+    // a range that starts inside the black seeks the outgoing there
+    let mid = schedule(&tl, 22..23, &Gop { dur: 50 }).unwrap();
+    assert_eq!(mid[0].vmix.map(|m| (m.src_t, m.seek)), Some((22, Some(20 * NS))));
+    // the black owns its track's gap: a lower track's clip under it loses there, wins after
+    let mut two = Timeline::new(25);
+    let a = two.add_source("A", 50);
+    let b = two.add_source("B", 50);
+    two.add_track(Kind::Video);
+    two.add_track(Kind::Video);
+    two.tracks[0].clips = vec![Clip::new(b, 0, 30, 0)];
+    two.tracks[1].clips = vec![Clip::new(a, 0, 20, 0)];
+    let two = two.add_transition_to_black(1, 20, TransitionKind::Dissolve, 5).unwrap();
+    let s = schedule(&two, 0..30, &Gop { dur: 50 }).unwrap();
+    assert_eq!((s[22].track, s[22].src), (Some(1), None));
+    assert_eq!((s[25].track, s[25].src, s[25].src_t), (Some(0), Some(b), 25));
+}
+
+#[test]
+fn nle3cblack_a_to_black_follows_its_cut() {
+    use timeline_core::Mode;
+    // an Insert before the cut moves it with the outgoing clip's end
+    let tl = to_black().place(0, Clip::new(SourceId(0), 30, 40, 0), Mode::Insert).unwrap();
+    assert_eq!(ats(&tl), vec![(30, 5, TransitionKind::Dissolve)]);
+    assert!(tl.tracks[0].transitions[0].to_black);
+    // lifting the outgoing clip leaves no cut: refused by name
+    assert_eq!(to_black().lift(0, 0), Err(EditError::Transition));
 }

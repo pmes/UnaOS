@@ -409,6 +409,77 @@ fn nle3c_new_wipes_and_a_fade_from_black() {
     println!("nle3c: wipes={wipes} black_dev={black_dev:.2}");
 }
 
+/// NLE3cBLACK (SR323): a 5-tick dissolve TO black after A[0,20)@0: tick 22 (weight 3/6, alpha 128) is black blended
+/// over A@22 by `blend_nonpremult` byte for byte, and the outgoing decodes on past its out point (one open in 0..25).
+#[test]
+fn nle3cblack_a_dissolve_to_black() {
+    use timeline_core::TransitionKind;
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 20, 0)];
+    let tl = tl.add_transition_to_black(0, 20, TransitionKind::Dissolve, 5).unwrap();
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(BASE[0], 50, 25)).unwrap();
+    let mut sink = Collect::default();
+    render(&tl, 22..23, &src, &mut sink).unwrap();
+    let f = sink.frames.remove(0).1;
+    let out = TestPattern::render(64, 48, 22);
+    for (i, (g, o)) in f.chunks_exact(4).zip(out.chunks_exact(4)).enumerate() {
+        let want = gneiss_pal::dsp::image::blend_nonpremult([0, 0, 0, 128], [o[0], o[1], o[2], o[3]]);
+        assert_eq!(g, &want[..], "pixel {i}");
+    }
+    let mut all = Collect::default();
+    let r = render(&tl, 0..25, &src, &mut all).unwrap();
+    assert_eq!((r.frames, r.seeks), (25, 1));
+    println!("nle3cblack: to-black frames={} seeks={}", r.frames, r.seeks);
+}
+
+/// NLE3cBLACK: each new SMPTE wipe at t = 1/2 (tick 23 of a 7-tick wipe from A to B) shows the incoming inside its
+/// shape and the outgoing outside, every pixel one source's or the other's.
+#[test]
+fn nle3cblack_new_wipe_codes() {
+    use timeline_core::{TransitionKind, WipeDir};
+    let mut cut = Timeline::new(25);
+    let (a, b) = (cut.add_source("A", 50), cut.add_source("B", 50));
+    cut.add_track(Kind::Video);
+    cut.tracks[0].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+    let (out, inc) = (TestPattern::render(64, 48, 23), TestPattern::render(64, 48, 1003));
+    let px = |f: &[u8], x: usize, y: usize| f[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].to_vec();
+    let cases: [(WipeDir, Vec<(usize, usize)>, Vec<(usize, usize)>); 10] = [
+        (WipeDir::CornerTopLeft, vec![(0, 0), (31, 23)], vec![(32, 0), (0, 24), (63, 47)]),
+        (WipeDir::CornerTopRight, vec![(63, 0), (32, 23)], vec![(31, 0), (63, 24)]),
+        (WipeDir::CornerBottomRight, vec![(63, 47), (32, 24)], vec![(31, 47), (63, 23)]),
+        (WipeDir::CornerBottomLeft, vec![(0, 47), (31, 24)], vec![(32, 47), (0, 23)]),
+        (WipeDir::BarnDoorVertical, vec![(16, 0), (47, 47), (32, 24)], vec![(15, 24), (48, 24)]),
+        (WipeDir::BarnDoorHorizontal, vec![(0, 12), (63, 35)], vec![(32, 11), (32, 36)]),
+        (WipeDir::DiagonalTopRight, vec![(63, 0), (40, 20)], vec![(0, 47), (20, 40)]),
+        (WipeDir::ClockThree, vec![(10, 40), (50, 40)], vec![(10, 10), (50, 10)]),
+        (WipeDir::ClockSix, vec![(10, 10), (10, 40)], vec![(50, 10), (50, 40)]),
+        (WipeDir::ClockNine, vec![(10, 10), (50, 10)], vec![(10, 40), (50, 40)]),
+    ];
+    let mut src = Sources::new(&cut);
+    for (i, base) in BASE.iter().enumerate() {
+        src.add(SourceId(i as u32), synth_source(*base, 50, 25)).unwrap();
+    }
+    let mut wipes = 0;
+    for (d, ins, outs) in cases {
+        let tl = cut.add_transition(0, 20, TransitionKind::Wipe(d), 7).unwrap();
+        let mut sink = Collect::default();
+        render(&tl, 23..24, &src, &mut sink).unwrap();
+        let f = sink.frames.remove(0).1;
+        for (x, y) in ins {
+            assert_eq!(px(&f, x, y), px(&inc, x, y), "{d:?} ({x},{y}) incoming");
+        }
+        for (x, y) in outs {
+            assert_eq!(px(&f, x, y), px(&out, x, y), "{d:?} ({x},{y}) outgoing");
+        }
+        assert!((0..64 * 48).all(|i| f[i * 4..i * 4 + 4] == inc[i * 4..i * 4 + 4] || f[i * 4..i * 4 + 4] == out[i * 4..i * 4 + 4]));
+        wipes += 1;
+    }
+    println!("nle3cblack: wipes={wipes}");
+}
+
 // ----- DEMUXWIRE (LEDGER SR213): the editor's and the Player's opens call DEMUXSEEK's reads -----
 
 use std::sync::Arc;

@@ -26,7 +26,7 @@
 //! `HH:MM:SS:FF`; absent = none). One with no event above it (or under a `BL` event) is a syntax error.
 //!
 //! Refused, each by name: `FCM: DROP FRAME` or a `;` timecode (drop-frame), any other FCM, a transition other than
-//! `C`, `D` or `W001`/`W002`/`W041`/`W101`/`W201` (or one not shaped as below), an unknown channel, a record span unequal to its source span,
+//! `C`, `D` or a `W<nnn>` that [`WipeDir::from_code`] names (or one not shaped as below), an unknown channel, a record span unequal to its source span,
 //! a malformed timecode, and any line that is none of the above. Tracks come back canonical: V1..Vn, then A1..An.
 //!
 //! Transitions (NLE3, LEDGER SR202) are CMX 3600 two-line events with one event number: the outgoing line (its reel,
@@ -40,8 +40,9 @@
 //!
 //! NLE3c (LEDGER SR209): wipe codes `W041` (diagonal), `W101` (box) and `W201` (clock) read and write too, and the
 //! outgoing line may be reel `BL` (source in = out = `00:00:00:00`): a transition FROM black
-//! ([`crate::Transition::from_black`]). A zero-length `BL` line with no `D` / `W` line after it is a gap. `BL` as the
-//! incoming line (a transition TO black) is still refused.
+//! ([`crate::Transition::from_black`]). A zero-length `BL` line with no `D` / `W` line after it is a gap. NLE3cBLACK
+//! (LEDGER SR323): `BL` as the incoming line is a transition TO black ([`crate::Transition::to_black`]; record span
+//! `at..at + dur`, source from `00:00:00:00`, no clip; `BL` on both lines is refused); NLE3cBLACK's wipe codes too.
 //!
 //! ```text
 //! 001  BL       V     C        00:00:00:00 00:00:00:00 00:00:00:00 00:00:00:00
@@ -62,7 +63,7 @@ pub enum EdlError {
     DropFrame { line: usize },
     /// An FCM other than `NON-DROP FRAME`.
     Fcm { line: usize },
-    /// A transition other than `C`, `D`, `W001`, `W002`, `W041`, `W101`, `W201`, a `D`/`W` line without its outgoing line, or (write: line 0)
+    /// A transition other than `C`, `D`, a `W<nnn>` `WipeDir::from_code` names, a `D`/`W` line without its outgoing line, or (write: line 0)
     /// a duration past 999 frames.
     Transition { line: usize },
     /// An unknown channel (parse), or a track past V9 / A9 (write: line 0).
@@ -86,7 +87,7 @@ impl core::fmt::Display for EdlError {
         match self {
             EdlError::DropFrame { line } => write!(f, "line {line}: drop-frame timecode is not supported (non-drop frame only)"),
             EdlError::Fcm { line } => write!(f, "line {line}: unknown FCM (only NON-DROP FRAME)"),
-            EdlError::Transition { line } => write!(f, "line {line}: transition is not a cut, a dissolve or a W001/W002/W041/W101/W201 wipe event"),
+            EdlError::Transition { line } => write!(f, "line {line}: transition is not a cut, a dissolve or a known SMPTE W<nnn> wipe event"),
             EdlError::Channel { line } => write!(f, "line {line}: unknown channel"),
             EdlError::Timecode { line } => write!(f, "line {line}: bad timecode"),
             EdlError::Duration { line } => write!(f, "line {line}: record span differs from source span"),
@@ -208,11 +209,19 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
             // The incoming line of a transition: it needs its outgoing line (same number, channel and record point).
             let dur = edl_frames(w[4]).ok_or(EdlError::Transition { line })?;
             match from.take() {
-                Some((n, k, c, reel, o)) if n == w[0] && (k, c) == (kind, num) && o.at == clip.at && w[1] != "BL" => {
-                    let x = Transition { at: clip.at, kind: tk, dur, from_black: reel == "BL" };
+                Some((n, k, c, reel, o)) if n == w[0] && (k, c) == (kind, num) && o.at == clip.at && !(reel == "BL" && w[1] == "BL") => {
+                    let x = Transition { at: clip.at, kind: tk, dur, from_black: reel == "BL", to_black: w[1] == "BL" };
                     trans.push((kind, num, x, reel, o.src_in, line));
                 }
                 _ => return Err(EdlError::Transition { line }),
+            }
+            if w[1] == "BL" {
+                // NLE3cBLACK: a transition TO black: the black is the track's gap and makes no clip; it spans `dur` at least.
+                if clip.len() < dur {
+                    return Err(EdlError::Transition { line });
+                }
+                cur = None;
+                continue;
             }
             events.push((w[1], kind, num, clip));
             cur = Some(events.len() - 1);
@@ -319,11 +328,7 @@ fn transition_lines(tl: &Timeline, ti: usize, c: &Clip, num: usize, ch: &str, fp
     };
     let r = timecode(x.at, fps);
     let out = format!("{:03}  {:<8} {:<5} {:<8} {p} {p} {r} {r}\n", num, reel, ch, "C");
-    let code = match x.kind {
-        TransitionKind::Dissolve => format!("D    {:03}", x.dur),
-        TransitionKind::Wipe(d) => format!("W{:03} {:03}", d.code(), x.dur),
-    };
-    Ok((out, code))
+    Ok((out, code_field(x)))
 }
 
 /// Write `tl` as a CMX 3600 EDL: the header, the FPS and SOURCE comments, then one event per clip in record order
@@ -340,20 +345,31 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
         s.push_str(&format!("* UNA SOURCE {} {}\n", src.reel, timecode(src.duration, fps)));
     }
     s.push('\n');
-    let mut ev: Vec<(i64, usize, Clip)> = Vec::new();
+    // NLE3cBLACK: `Err` = a transition TO black, an event at its `at` (no clip).
+    let mut ev: Vec<(i64, usize, Result<Clip, Transition>)> = Vec::new();
     for (ti, t) in tl.tracks.iter().enumerate() {
         for c in &t.clips {
-            ev.push((c.at, ti, *c));
+            ev.push((c.at, ti, Ok(*c)));
+        }
+        for x in t.transitions.iter().filter(|x| x.to_black) {
+            ev.push((x.at, ti, Err(*x)));
         }
     }
     ev.sort_by_key(|e| (e.0, e.1));
-    for (n, (_, ti, c)) in ev.iter().enumerate() {
+    for (n, (_, ti, e)) in ev.iter().enumerate() {
         let num = tl.track_number(*ti).unwrap_or(1);
         let k = if tl.tracks[*ti].kind == Kind::Video { "V" } else { "A" };
         if num > 9 {
             return Err(EdlError::Channel { line: 0 });
         }
         let ch = if num == 1 { String::from(k) } else { format!("{k}{num}") };
+        let c = match e {
+            Ok(c) => c,
+            Err(x) => {
+                s.push_str(&to_black_lines(tl, *ti, x, n + 1, &ch, fps)?);
+                continue;
+            }
+        };
         let reel = &tl.source(c.src).ok_or(EdlError::Edit(EditError::NoSource))?.reel;
         let (out_line, code) = transition_lines(tl, *ti, c, n + 1, &ch, fps)?;
         s.push_str(&out_line);
@@ -391,4 +407,27 @@ fn audio_comment(l: &str, fps: u32, line: usize, clip: Option<&mut Clip>) -> Res
         (c.fade_in, c.fade_out) = (parse_tc(w[0], fps, line)?, parse_tc(w[1], fps, line)?);
     }
     Ok(())
+}
+
+/// NLE3: a transition's CMX transition field: `D    ddd` or `Wnnn ddd`.
+fn code_field(x: &Transition) -> String {
+    match x.kind {
+        TransitionKind::Dissolve => format!("D    {:03}", x.dur),
+        TransitionKind::Wipe(d) => format!("W{:03} {:03}", d.code(), x.dur),
+    }
+}
+
+/// NLE3cBLACK (LEDGER SR323): a transition TO black as its two-line event: the outgoing's zero-length `C` line at its
+/// out point and the cut, then reel `BL` with the transition field over record `at..at + dur` (source from 0).
+fn to_black_lines(tl: &Timeline, ti: usize, x: &Transition, num: usize, ch: &str, fps: u32) -> Result<String, EdlError> {
+    if x.dur > 999 {
+        return Err(EdlError::Transition { line: 0 });
+    }
+    let o = tl.tracks[ti].clips.iter().find(|o| o.end() == x.at).ok_or(EdlError::Edit(EditError::Transition))?;
+    let reel = &tl.source(o.src).ok_or(EdlError::Edit(EditError::NoSource))?.reel;
+    let (p, r) = (timecode(o.src_out, fps), timecode(x.at, fps));
+    let (z, d, e) = (timecode(0, fps), timecode(x.dur, fps), timecode(x.at + x.dur, fps));
+    let mut s = format!("{:03}  {:<8} {:<5} {:<8} {p} {p} {r} {r}\n", num, reel, ch, "C");
+    s.push_str(&format!("{:03}  {:<8} {:<5} {:<8} {z} {d} {r} {e}\n", num, "BL", ch, code_field(x)));
+    Ok(s)
 }

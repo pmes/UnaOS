@@ -877,4 +877,4 @@ refs/heads/exec-rmbp-aethermacgpudamage   98a53fa76 FOLDED-BY-HAND (this commit)
 refs/heads/exec-rmbp-hevcconf   12930de7d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264enc8x8   e5a7667f3 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-stationroam   52c0b238d FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-nle3cblack   31ce115db IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle3cblack   f5dd95c24 FOLDED-BY-HAND (this commit) 2026-10-27
