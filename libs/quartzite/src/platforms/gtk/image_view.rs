@@ -158,7 +158,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
                 // SAVEDIALOG (SR364): the owner asks THIS surface's window for a path: the platform save dialog.
                 Ok(SMessage::SavePanel { url, name, folder }) if url == target_id => super::save_dialog::run(&da_clone, url, &name, folder.as_deref(), resend.clone()),
                 // OPEN-DIALOG-ONE (SR386): the owner asks THIS surface's window for a file: the platform open dialog.
-                Ok(SMessage::OpenPanel { url, filters }) if url == target_id => super::open_dialog::run(&da_clone, url, filters, resend.clone()),
+                Ok(SMessage::OpenPanel { url, filters, folder }) if url == target_id => super::open_dialog::run(&da_clone, url, filters, folder, resend.clone()), // SAVERECENTOPEN (SR403): opening in `folder`
                 Ok(_) => {}
                 // AETHERMACGPU-ENGINEDAMAGE (SR341): a lagged page no longer ENDS this loop (the page froze); its kept frame
                 // is unknown, so it asks the sender for the surface whole.

@@ -205,6 +205,24 @@ impl Plan {
         gpt::Image::build(self.disk_sectors, self.disk_guid, &self.entries())
     }
 
+    /// NVME4KN-FIXTURE (zenbook-ledger Z40): the SAME plan's table at `lba`-byte LBAs (`gpt::lba_ratio`): the
+    /// disk and every extent divided by `lba / 512`; a disk or an extent that is not whole LBAs is `BadGeometry`.
+    pub fn gpt_lba(&self, lba: usize) -> Result<gpt::Image, GptError> {
+        let k = gpt::lba_ratio(lba)?;
+        if self.disk_sectors % k != 0 {
+            return Err(GptError::BadGeometry);
+        }
+        let mut entries = self.entries();
+        for e in entries.iter_mut() {
+            if e.first_lba % k != 0 || (e.last_lba + 1) % k != 0 {
+                return Err(GptError::BadGeometry);
+            }
+            e.first_lba /= k;
+            e.last_lba = (e.last_lba + 1) / k - 1;
+        }
+        gpt::Image::build_lba(self.disk_sectors / k, self.disk_guid, &entries, lba)
+    }
+
     /// The plan's `Display`, one string per line — what the installer window paints.
     pub fn lines(&self) -> Vec<String> {
         let s = alloc::format!("{}", self);

@@ -1151,3 +1151,81 @@ fn nlesizepolicyui_face_size_button_cycles_through_the_verb() {
     assert!(face.verb("size B huge"));
     assert_eq!(face.last_error.take().as_deref(), Some("size B huge: no such size policy (letterbox, fill, stretch, adopt)"));
 }
+
+// ── ADOPTPNG (LEDGER SR405): the PNG sequence honours Adopt (handlers.md §5 NLEPROBE-HDR's ADOPT-PNG) ─────────────────────
+// SR394's two-size reel through `nle_export::export_png`: under Adopt the files are frames of two sizes, read back by
+// pixel_core's header reader and, independently, by the PNG decoder (lossless: the decoder's own picture); under Letterbox,
+// Fill and Stretch one size. A directory that cannot be made is refused naming it.
+
+#[test]
+fn adoptpng_two_size_reel_exports_png_frames_at_their_own_size() {
+    use gneiss_pal::dsp::image::{decode_png, facts_of};
+    use stria::nle_export::{AudioOut, Container, export_png};
+    let _ = nlesizeswitch_lines("");
+    let Some(file) = nlesizeswitch_reel() else { return };
+    let (tl, src) = Sources::from_media("two", &file, 25).unwrap().expect("an MP4");
+    let native = nlesizepolicy_native(&file, &src);
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("adoptpng");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let adopt = tl.set_size_policy(SourceId(0), SizePolicy::Adopt).unwrap();
+    let dir = root.join("adopt");
+    let (r, frames) = export_png(&adopt, 0..4, &src, &dir, AudioOut::None, Container::Mp4).unwrap();
+    assert_eq!((r.frames, r.files), (4, 4));
+    assert_eq!(frames.iter().map(|f| (f.1, f.2)).collect::<Vec<_>>(), vec![(768, 512), (768, 512), (1280, 720), (1280, 720)]);
+    for (i, (path, w, h)) in frames.iter().enumerate() {
+        assert_eq!(*path, dir.join(format!("{i:06}.png")));
+        let bytes = std::fs::read(path).unwrap();
+        let f = facts_of(&bytes).expect("a PNG header");
+        assert_eq!((f.width, f.height), (*w, *h), "frame {i}: the header");
+        let img = decode_png(&bytes).unwrap();
+        assert_eq!((img.width, img.height), (*w, *h), "frame {i}: the decoded picture");
+        assert!(img.rgba == native[i].2, "adopt frame {i}: the decoder's own picture, lossless");
+    }
+    let mut sizes: Vec<(u32, u32)> = frames.iter().map(|f| (f.1, f.2)).collect();
+    sizes.dedup();
+    assert_eq!(sizes.len(), 2, "two sizes under Adopt");
+    let lines = nlesizeswitch_lines("adopted");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+
+    for p in [SizePolicy::Letterbox, SizePolicy::Fill, SizePolicy::Stretch] {
+        let set = tl.set_size_policy(SourceId(0), p).unwrap();
+        let dir = root.join(p.name());
+        let (r, frames) = export_png(&set, 0..4, &src, &dir, AudioOut::None, Container::Mp4).unwrap();
+        assert_eq!(r.frames, 4, "{p:?}");
+        assert!(frames.iter().all(|f| (f.1, f.2) == (768, 512)), "{p:?}: one size");
+        for (path, _, _) in &frames {
+            let img = decode_png(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!((img.width, img.height), (768, 512), "{p:?}: {}", path.display());
+        }
+    }
+
+    // Kept for the tool's run: the reel and its Adopt EDL (`nle export <edl> --src <reel>=two.mp4 --out <dir> --png`).
+    std::fs::write(root.join("two.mp4"), &file).unwrap();
+    std::fs::write(root.join("two.edl"), edl::write(&adopt, "TWO").unwrap()).unwrap();
+    println!("adoptpng: adopt 768x512 x2 + 1280x720 x2 (sizes=2), letterbox/fill/stretch 768x512 x4; reel={} kept in {}", adopt.sources[0].reel, root.display());
+}
+
+#[test]
+fn adoptpng_refused_dir_by_name() {
+    use stria::nle_export::{AudioOut, Container, ExportError, export_png};
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 4);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 4, 0)];
+    let mut src = Sources::new(&tl);
+    src.add(a, synth_source(0, 4, 25)).unwrap();
+    // A path under a regular file: no directory can be made there, root or not (a mode bit would not stop root).
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("adoptpng-refused");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("plain");
+    std::fs::write(&file, b"not a directory").unwrap();
+    let dir = file.join("frames");
+    let e = export_png(&tl, 0..4, &src, &dir, AudioOut::None, Container::Mp4).unwrap_err();
+    assert!(matches!(e, ExportError::Io(_)), "{e}");
+    let text = e.to_string();
+    assert!(text.starts_with(&format!("io: {}: ", dir.display())), "the refusal names the directory: {text}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"not a directory", "nothing written");
+    println!("adoptpng: refused {text}");
+}

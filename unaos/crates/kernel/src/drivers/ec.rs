@@ -15,7 +15,7 @@
 //!   0x00..0xFF is read with RD_EC and printed as eight `[ec] ram` lines: the witness ZENBOOK-EC-BATTERY decodes.
 //!
 //! WRITE SURFACE: RD_EC (0x80) + its address byte, and QR_EC (0x84) from the `_Qxx` event drain alone (ZENBOOKECQEVENTS
-//! Z30, file tail), which dequeues one pending query byte. WR_EC (0x81), BE_EC/BD_EC (0x82/0x83) are never issued.
+//! Z30, file tail), which dequeues one pending query byte; GPE0_STS W1C of the ECDT's one GPE bit after a drain (ZENBOOKECGPE Z36, file tail). WR_EC (0x81), BE_EC/BD_EC (0x82/0x83) are never issued.
 //! BOUNDED: every IBF/OBF wait has a deadline (`hw_wait_budget() / 200`, ~10 ms calibrated); the census stops at the
 //! first stuck handshake and names the step and the status byte. `_Qxx` BYTES drained (Z30); their METHODS need AML: owed.
 //! `tests ec` runs the protocol against a fake port (never a real one): `:: EC: proto=ok cases=5/5 -> PASS ::`.
@@ -199,7 +199,7 @@ fn say_row(base: usize, bytes: &[u8]) {
 }
 
 /// The once-per-boot census (pci.rs init, after `hw::platform_say`). Silent unless `hw::gate(Probe::Ec)`.
-pub fn probe() {
+pub fn probe() { crate::arch::acpi_power::gpe0_say(); // ZENBOOKECGPE (zenbook-ledger Z36): the `[acpi] gpe0=` census, once per x86 boot, BEFORE the EC gate (pci.rs init calls this on every x86 boot). LINE-NEUTRAL fold, code before the comment.
     if !crate::hw::gate(crate::hw::Probe::Ec) {
         return;
     }
@@ -230,7 +230,7 @@ pub fn probe() {
         e.gpe,
         core::str::from_utf8(&e.id[..e.idlen]).unwrap_or("?")
     );
-    let mut io = PortIo { cmd: e.cmd, data: e.data, start: 0, budget: (crate::arch::hw_wait_budget() / 200).max(1) }; PORTS.call_once(|| (e.cmd, e.data)); // ZENBOOKECBATTERY (zenbook-ledger Z20): the ECDT ports kept for `battery()` (file tail). LINE-NEUTRAL fold, code before the comment.
+    let mut io = PortIo { cmd: e.cmd, data: e.data, start: 0, budget: (crate::arch::hw_wait_budget() / 200).max(1) }; PORTS.call_once(|| (e.cmd, e.data)); EC_GPE.call_once(|| e.gpe); // ZENBOOKECGPE (zenbook-ledger Z36): the ECDT's GPE number kept for `gpe_pass` (file tail). ZENBOOKECBATTERY (zenbook-ledger Z20): the ECDT ports kept for `battery()` (file tail). LINE-NEUTRAL fold, code before the comment.
     let mut ram = [0u8; 256];
     let t0 = crate::arch::ms();
     let (n, stale, stuck) = census(&mut io, &mut ram);
@@ -272,7 +272,7 @@ struct Fake {
     ibf_wedge: bool,
     obf_wedge: bool,
     polls: u32,
-    budget: u32, q: [u8; 12], qn: usize, // ZENBOOKECQEVENTS (zenbook-ledger Z30): the fake's pending `_Qxx` queue, front first (`qr_take`, file tail)
+    budget: u32, q: [u8; 12], qn: usize, gsts: u8, gclr: u32, // ZENBOOKECGPE (zenbook-ledger Z36): the fake's GPE0_STS byte and its W1C count (`impl GpeSts for Fake`, file tail). ZENBOOKECQEVENTS (zenbook-ledger Z30): the fake's pending `_Qxx` queue, front first (`qr_take`, file tail)
 }
 
 impl Fake {
@@ -281,7 +281,7 @@ impl Fake {
         for (i, b) in ram.iter_mut().enumerate() {
             *b = (i as u8).wrapping_mul(37) ^ 0x5a;
         }
-        Fake { ram, st: 0, out: 0, lat: 3, pend: 0, held: 0, held_v: 0, want_addr: false, bad_cmd: false, ibf_wedge: false, obf_wedge: false, polls: 0, budget: 64, q: [0; 12], qn: 0 }
+        Fake { ram, st: 0, out: 0, lat: 3, pend: 0, held: 0, held_v: 0, want_addr: false, bad_cmd: false, ibf_wedge: false, obf_wedge: false, polls: 0, budget: 64, q: [0; 12], qn: 0, gsts: 0, gclr: 0 }
     }
     fn take(&mut self) {
         let v = self.held_v;
@@ -589,8 +589,8 @@ pub fn battery_selftest() {
     let mut f = kat_battery(73, 0x02);
     let charge = read_row(&mut f, &KAT_ROW);
     let charge_ok = charge == Ok(Reading { pct: 73, charging: true, ma: 1200, mv: 12300 }) && !f.bad_cmd;
-    let cases: [(&str, bool); 7] =
-        [("charge", charge_ok), ("discharge", bkat_discharge()), ("range", bkat_range()), ("stuck", bkat_stuck()), ("table", bkat_table()), ("lid", bkat_lid()), ("qevents", bkat_qevents())]; // ZENBOOKECLID (zenbook-ledger Z27): the lid leg (file tail); ZENBOOKECQEVENTS (zenbook-ledger Z30): the qevents leg (file tail)
+    let cases: [(&str, bool); 8] =
+        [("charge", charge_ok), ("discharge", bkat_discharge()), ("range", bkat_range()), ("stuck", bkat_stuck()), ("table", bkat_table()), ("lid", bkat_lid()), ("qevents", bkat_qevents()), ("gpe", bkat_gpe())]; // ZENBOOKECGPE (zenbook-ledger Z36): the gpe leg (file tail); ZENBOOKECLID (zenbook-ledger Z27): the lid leg (file tail); ZENBOOKECQEVENTS (zenbook-ledger Z30): the qevents leg (file tail)
     let mut ok = 0;
     let mut first: Option<&str> = None;
     for (name, r) in cases {
@@ -914,7 +914,7 @@ fn say_qstuck(s: Stuck) {
 fn qevent_boot(io: &mut PortIo) -> u32 {
     let mut b = [0u8; Q_PER_PASS];
     let (n, st) = qdrain(io, &mut b);
-    qsay(&b[..n]);
+    qsay(&b[..n]); gpe_pass(n); // ZENBOOKECGPE (zenbook-ledger Z36): the EC's GPE0_STS bit read, and cleared after a drain that consumed events (`gpe_pass`, file tail). LINE-NEUTRAL fold.
     if let Some(s) = st {
         say_qstuck(s);
     }
@@ -937,7 +937,7 @@ pub fn qevent_service() {
     }
     let mut b = [0u8; Q_PER_PASS];
     if let Ok((n, st)) = conversation(|io| qdrain(io, &mut b)) {
-        qsay(&b[..n]);
+        qsay(&b[..n]); gpe_pass(n); // ZENBOOKECGPE (zenbook-ledger Z36): the same GPE step on the service pass (`gpe_pass`, file tail). LINE-NEUTRAL fold.
         if let Some(s) = st {
             say_qstuck(s);
         }
@@ -1006,4 +1006,120 @@ fn bkat_qevents() -> bool {
 
     serial_println!("[ec] qevents kat drained={} distinct={} q={:#04x} q={:#04x} bound={}", n, distinct, b[0], b[1], gn);
     three && after && bound && idle && zero && wedge
+}
+
+// ── ZENBOOKECGPE (zenbook-ledger Z36) — the EC's GPE0_STS bit as a second witness of its events. TAIL-APPENDED ───────────
+// The ECDT names the EC's GPE number (`parse_ecdt`, t[64]); the FADT names the GPE0 block (`acpi_power::gpe0`, its file
+// tail). An EC with an event queued sets SCI_EVT AND its GPE status bit; this tree routes no SCI (ZENBOOK-SCI owed), so
+// the bit is POLLED on the drain passes Z30 already runs (`qevent_boot`, `qevent_service`: no new pass, no new cadence):
+// read on each pass, printed once per change, and cleared (write-1-to-clear of the ONE bit, never another) only after a
+// pass whose drain consumed a query byte, and only in ACPI mode (SCI_EN=1 at the census): in legacy mode the GPE registers
+// belong to the firmware's SMI handler, so there the bit is read and never written (`why=legacy`). No GPE0_EN write, no
+// SCI route, no ACPI_ENABLE. The ONE writer of GPE0_STS: the boot drain (single-threaded) and the service drain
+// (serialized by `LAST_Q_MS`'s compare_exchange). Silent on every machine `hw::gate(Probe::Ec)` refuses (the drains are).
+// `tests ecbattery`'s `gpe` case runs it over the fake EC's GPE0_STS byte.
+
+use core::sync::atomic::AtomicU8;
+
+/// The ECDT's GPE number, kept by `probe` (the fold on its `PortIo` line). Unset = no ECDT was decoded.
+static EC_GPE: spin::Once<u8> = spin::Once::new();
+/// The bit's last printed state (2 = none printed yet).
+static GPE_LAST: AtomicU8 = AtomicU8::new(2);
+/// The `[ec] gpe -> SKIP` line has been printed (once per boot).
+static GPE_SKIP_SAID: AtomicBool = AtomicBool::new(false);
+
+/// One GPE0_STS byte: read, and write-1-to-clear — the seam the KAT fakes.
+trait GpeSts {
+    fn sts(&mut self) -> u8;
+    fn w1c(&mut self, mask: u8);
+}
+
+/// The real GPE0_STS byte at the FADT's port.
+struct GpePort(u16);
+
+impl GpeSts for GpePort {
+    fn sts(&mut self) -> u8 {
+        // SAFETY: the FADT's own GPE0_STS byte (`acpi_power::Gpe0::sts_bit`); a read has no side effect.
+        unsafe { Port::<u8>::new(self.0).read() }
+    }
+    fn w1c(&mut self, mask: u8) {
+        // SAFETY: write-1-to-clear; zero bits are no-ops, so only the EC's one bit is touched.
+        unsafe { Port::<u8>::new(self.0).write(mask) }
+    }
+}
+
+impl GpeSts for Fake {
+    fn sts(&mut self) -> u8 {
+        self.gsts
+    }
+    fn w1c(&mut self, mask: u8) {
+        self.gsts &= !mask;
+        self.gclr += 1;
+    }
+}
+
+/// One pass's GPE step: (the bit was set, it was cleared). Cleared only when set, the drain consumed events and
+/// `may_clear` (ACPI mode).
+fn gpe_step<G: GpeSts>(g: &mut G, mask: u8, drained: usize, may_clear: bool) -> (bool, bool) {
+    let set = g.sts() & mask != 0;
+    if set && drained > 0 && may_clear {
+        g.w1c(mask);
+        return (true, true);
+    }
+    (set, false)
+}
+
+/// `[ec] gpe -> SKIP reason=<why> gpe=<n>` — once per boot.
+fn gpe_skip(why: &str, gpe: u8) {
+    if !GPE_SKIP_SAID.swap(true, Ordering::Relaxed) {
+        serial_println!("[ec] gpe -> SKIP reason={} gpe={}", why, gpe);
+    }
+}
+
+/// The GPE step after a drain pass of `drained` bytes (`qevent_boot`, `qevent_service`):
+/// `[ec] gpe sts=<0|1> gpe=<n> port=0x<p> drained=<k> cleared=<0|1>` once per change of the bit.
+fn gpe_pass(drained: usize) {
+    let Some(&gpe) = EC_GPE.get() else { return };
+    let Some(g) = crate::arch::acpi_power::gpe0() else { return gpe_skip("no-fadt", gpe) };
+    let Some((port, mask)) = g.sts_bit(gpe) else { return gpe_skip(if g.blk == 0 { "no-gpe0" } else { "gpe1" }, gpe) };
+    let may_clear = g.sci_en == Some(true);
+    let (set, cleared) = gpe_step(&mut GpePort(port), mask, drained, may_clear);
+    if GPE_LAST.swap(set as u8, Ordering::Relaxed) != set as u8 {
+        serial_println!(
+            "[ec] gpe sts={} gpe={} port={:#x} drained={} cleared={}{}",
+            set as u8,
+            gpe,
+            port,
+            drained,
+            cleared as u8,
+            if set && !may_clear { " why=legacy" } else { "" }
+        );
+    }
+}
+
+/// `tests ecbattery`'s `gpe` case: the GPE0_STS locate (q35's block, a GPE1 bit, no block), then over the fake EC's
+/// GPE0_STS byte: the bit set and a drain of 0 = read, no write; a drain of 1 = the one bit cleared, the others kept; an
+/// idle pass = no write; legacy mode (`may_clear=false`) = no write. The boot's statics are never touched.
+fn bkat_gpe() -> bool {
+    let q35 = crate::arch::acpi_power::Gpe0 { blk: 0x620, len: 16, sci: 9, sci_en: Some(true) };
+    let locate = q35.sts_bit(0x0b) == Some((0x621, 0x08))
+        && q35.sts_bit(0x40).is_none()
+        && crate::arch::acpi_power::Gpe0 { blk: 0, ..q35 }.sts_bit(0x0b).is_none();
+
+    let mut f = Fake::with_q(&[0x52]);
+    f.gsts = 0x89;
+    let before = gpe_step(&mut f, 0x08, 0, true) == (true, false) && f.gclr == 0 && f.gsts == 0x89;
+    let mut b = [0u8; Q_PER_PASS];
+    let (n, st) = qdrain(&mut f, &mut b);
+    let drained = n == 1 && st.is_none() && b[0] == 0x52;
+    let clear = gpe_step(&mut f, 0x08, n, true) == (true, true) && f.gsts == 0x81 && f.gclr == 1;
+    let (n2, _) = qdrain(&mut f, &mut b);
+    let idle = n2 == 0 && gpe_step(&mut f, 0x08, n2, true) == (false, false) && f.gclr == 1;
+
+    let mut l = Fake::new();
+    l.gsts = 0x08;
+    let legacy = gpe_step(&mut l, 0x08, 1, false) == (true, false) && l.gclr == 0 && l.gsts == 0x08;
+
+    serial_println!("[ec] gpe kat locate={} drained={} gsts={:#04x} clears={} legacy_writes={}", locate as u8, n, f.gsts, f.gclr, l.gclr);
+    locate && before && drained && clear && idle && legacy && !f.bad_cmd
 }
