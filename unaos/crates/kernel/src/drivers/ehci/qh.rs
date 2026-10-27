@@ -190,8 +190,8 @@ pub const MAX_CONTROLLERS: usize = 2;
 /// IN3, trackpad's vendor-multitouch addr 9 IN1) — a budget with ZERO margin, on the arm order
 /// that puts the internal trackpad last. Freeing the BT slot alone restores that exact fit; the
 /// headroom is what keeps one extra plugged-in HID device from starving the internal trackpad
-/// again. Cost is 2 static `IntSlot`s per controller in the kernel image.
-pub const MAX_INT_EPS: usize = 6;
+/// again. INTPOOLGROW (rmbp-ledger B1026): 6 → 8 — flight 38's controller [1] had seven claimants (four HID + three hubs) and hub 1 lost its hot-plug; the slots live in `dma_pool`'s one allocation (0 B more on the bt layout), and the held-mask `int_used` is a u8, so 8 is its ceiling (the assert).
+pub const MAX_INT_EPS: usize = 8; const _: () = assert!(MAX_INT_EPS <= u8::BITS as usize); // INTPOOLGROW (B1026): the `int_used` held-mask width guard (`intpool::slot_take`'s `1 << n` on a u8). LINE-NEUTRAL fold, code first
 
 /// The pools' base (one per EHCI function; the 2012 rMBP has exactly two), 0 until `dma_pool` (file tail) fills it once.
 /// Extra functions beyond MAX_CONTROLLERS are skipped with a trace by the caller.

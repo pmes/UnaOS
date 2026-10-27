@@ -2764,7 +2764,7 @@ fn bt_cfg_has_candidate(cfg: &[u8]) -> bool {
 /// Deliberately NOT pushed into `Controller::int_eps`: that list is drained by `service()`,
 /// which would run HCI event packets through the HID report decoders. This endpoint is read
 /// inline by the L0 sequence and then deactivated. It owns the pool's dedicated `bt_slot` —
-/// NOT one of the `MAX_INT_EPS` (6) HID slots — since MTFIX: on Boot AN it consumed the
+/// NOT one of the `MAX_INT_EPS` (8) HID slots — since MTFIX: on Boot AN it consumed the
 /// fourth of four HID slots and the internal trackpad, enumerated last, fell off the end.
 #[cfg(feature = "bt")]
 struct BtEvtEp {
@@ -14826,7 +14826,7 @@ fn pass_period_selftest() { if crate::tests::defer("passperiod", pass_period_sel
 //   * **No allocation, no `Vec`, no `String`, no formatting.** The registry, the ring and the
 //     counters are `static`. The ISR never prints — every line this block produces is emitted by
 //     the polled pass, which can afford `serial_println!`.
-//   * **Bounded work.** `ISR_MAX_EPS` (12) iterations, each a handful of volatile reads and at most
+//   * **Bounded work.** `ISR_MAX_EPS` (16) iterations, each a handful of volatile reads and at most
 //     an `ISR_SLOT_LEN`-byte copy. No loop here can fail to terminate.
 //   * **Halts are NOT the ISR's business.** A token with `QTD_ERR_MASK` set is left exactly where it
 //     is; the pass retires the endpoint, flushes held key releases and prints the STOP-NOTE, none of
@@ -15611,7 +15611,7 @@ fn halt_class(tok: u32) -> (&'static str, bool) {
 //     keyboard and trackpad sit on `tt=(hub 3 port 2)`. Different ports of a multi-TT hub means
 //     different transaction translators, so these endpoints take no bandwidth from the input path
 //     that matters. This cost does not exist.
-//   * An endpoint slot — real but not scarce: `MAX_INT_EPS` is 6 and this bench arms four.
+//   * An endpoint slot — real but not scarce: `MAX_INT_EPS` is 8 and this bench arms four.
 //   * Two halt lines per boot — real, and it WAS the genuine harm, because the old anonymous
 //     `STOP-NOTE (token ...)` made a third halt naming the real keyboard read as "the usual two".
 //     KBDFLAP already paid that off: every halt now carries `addr=`, `ep=`, `kind=` and `class=`,
@@ -15842,7 +15842,7 @@ fn halt_class(tok: u32) -> (&'static str, bool) {
 // that endpoint's own completions.
 //
 // BOUNDS. `kbdwit_fired` latches on the first dump: at most one dump per endpoint per boot, at
-// most `MAX_INT_EPS` (6) per controller for a whole boot. `kbdwit_broke` latches the same way, so
+// most `MAX_INT_EPS` (8) per controller for a whole boot. `kbdwit_broke` latches the same way, so
 // KBDWIT-2 adds at most one further line per endpoint per boot — eight lines, once, per endpoint,
 // for the entire boot. KBDWIT-LATCH adds `kbdwit_cut`, a THIRD independent one-shot, for a ceiling
 // of nine; it is a separate latch and not a third user of `kbdwit_broke` because with KBDFLAP's
@@ -20674,6 +20674,23 @@ fn lost_note(lost: &mut [u32; 4], n: usize, class: IntClass, addr: u8) -> bool {
     class.is_hid()
 }
 
+/// INTPOOLGROW (rmbp-ledger B1026): the pool's take-or-refuse rule replayed, pure, over `claims` on a pool of `slots`
+/// (the KAT runs it on the historical six and on the live `MAX_INT_EPS`). Returns (held, refused, refused_hid, lost).
+fn pool_replay(claims: &[(IntClass, u8)], slots: usize) -> (usize, usize, usize, [u32; 4]) {
+    let (mut held, mut refused, mut refused_hid, mut lost) = (0usize, 0usize, 0usize, [0u32; 4]);
+    for &(c, a) in claims.iter() {
+        if held < slots {
+            held += 1;
+        } else {
+            if lost_note(&mut lost, refused, c, a) {
+                refused_hid += 1;
+            }
+            refused += 1;
+        }
+    }
+    (held, refused, refused_hid, lost)
+}
+
 /// Count one refused claim (the exhausted STOP-NOTE's site in `arm_interrupt_ep`, under `EHCI_HID`).
 fn int_lost(class: IntClass, addr: u8) {
     let n = INT_REFUSED.fetch_add(1, Ordering::Relaxed) as usize;
@@ -20702,7 +20719,7 @@ impl Controller {
 
 /// `tests intpool` (R80: registered, never at boot): the class rule and the pool-full counting on synthetic claims,
 /// then the live census.
-/// `:: INTPOOL: slots=6 taken=<n> refused=<n> hid_armed=<n> reserve=owed who_lost=<class:addr,...|-> kat=ok|FAIL -> PASS|FAIL ::`
+/// `:: INTPOOL: slots=8 taken=<n> refused=<n> hid_armed=<n> reserve=owed who_lost=<class:addr,...|-> kat=ok|FAIL -> PASS|FAIL ::`
 /// PASS iff the KAT holds and no kbd/mouse claimant was refused. QEMU's EHCI has six ports (UNAOS_USB_EXTRA_INT fills
 /// at most five beside the harness keyboard) and takes no hub, so QEMU never refuses: the refusal leg is the KAT's.
 pub fn intpool_selftest() {
@@ -20711,21 +20728,15 @@ pub fn intpool_selftest() {
         && IntClass::of(false, false, true) == IntClass::Mouse
         && IntClass::of(false, false, false) == IntClass::Hub;
     // Flight 38's controller 1 in arm order: four HID (kbd 6, boot-mouse 7, kbd 9, pointer 9), then hubs 5, 4, 1 —
-    // seven claims on six slots: the seventh (hub 1) is the one refusal, and it is not a HID loss.
+    // seven claims. On the historical six slots the seventh (hub 1) is the one refusal, and it is not a HID loss;
+    // on the live pool (INTPOOLGROW B1026: `MAX_INT_EPS` 8) all seven hold and nothing is lost.
     let claims = [(IntClass::Kbd, 6u8), (IntClass::Mouse, 7), (IntClass::Kbd, 9), (IntClass::Mouse, 9), (IntClass::Hub, 5), (IntClass::Hub, 4), (IntClass::Hub, 1)];
-    let (mut held, mut refused, mut refused_hid, mut lost) = (0usize, 0usize, 0usize, [0u32; 4]);
-    for &(c, a) in claims.iter() {
-        if held < MAX_INT_EPS {
-            held += 1;
-        } else {
-            if lost_note(&mut lost, refused, c, a) {
-                refused_hid += 1;
-            }
-            refused += 1;
-        }
-    }
-    let counting = held == MAX_INT_EPS && refused == 1 && refused_hid == 0
-        && IntClass::unpack(lost[0]) == (IntClass::Hub, 1) && lost[1] == 0
+    let (held, refused, refused_hid, lost) = pool_replay(&claims, 6);
+    let six = held == 6 && refused == 1 && refused_hid == 0
+        && IntClass::unpack(lost[0]) == (IntClass::Hub, 1) && lost[1] == 0;
+    let (held, refused, refused_hid, lost) = pool_replay(&claims, MAX_INT_EPS);
+    let live = held == claims.len() && refused == 0 && refused_hid == 0 && lost == [0u32; 4];
+    let counting = six && live
         && lost_note(&mut [0u32; 4], 4, IntClass::Kbd, 2); // past the record: still counted as a HID loss
     let kat = shapes && counting;
     let (mut taken, mut hid_armed) = (0usize, 0usize);
