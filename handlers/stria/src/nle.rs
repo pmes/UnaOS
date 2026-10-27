@@ -193,7 +193,7 @@ impl Sources {
     }
     /// Open `bytes` (MP4 / Matroska / WebM) as source `id`.
     pub fn add(&mut self, id: SourceId, bytes: Vec<u8>) -> Result<(), RenderError> {
-        let m = Media::open(bytes)?;
+        let m = Media::open(bytes)?; self.note_open(id, &m); // NLE-STANDIN-OPEN (SR353): a reel no decoder fits opens as a stand-in reel
         self.media.retain(|(s, _)| *s != id);
         self.media.push((id, m));
         Ok(())
@@ -226,7 +226,7 @@ pub struct OpenReport {
     pub applied: Option<usize>,
     /// NLEPROBEHDRWIRE (SR305): the reel's colour (container, else the bitstream's through `fill_colour(colour_of)`).
     pub colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
-    /// SWAPBACK (SR329): a render drew stand-in frames for this reel (its decoder refused a span mid-reel).
+    /// SWAPBACK (SR329): a render drew stand-in frames for this reel (its decoder refused a span mid-reel); NLE-STANDIN-OPEN (SR353): or no decoder fits it (set at open).
     pub stand_in: bool,
 }
 
@@ -305,10 +305,10 @@ impl Vid {
     fn open(m: &Media, src: SourceId, key_ns: i64) -> Result<Vid, RenderError> {
         let (i, origin) = m.stream(Kind::Video).ok_or(RenderError::NoStream(src, Kind::Video))?;
         let track = &m.demux.tracks()[i];
-        let dec = decoder_for(track).map_err(|e| RenderError::Decode(e.to_string()))?;
+        let mut dec = crate::decode_swap::open(track); // NLE-STANDIN-OPEN (SR353): the Player's decoder-or-stand-in, never a refused render
         let mut cursor = m.demux.share();
-        cursor.seek_track(i, origin + key_ns);
-        Ok(Vid { src, origin, track_id: track.id, cursor, dec, track: track.clone(), swap: DecodeSwap::default(), stood_in: false, pending: VecDeque::new(), peeked: None, last: None, done: false })
+        cursor.seek_track(i, origin + key_ns); let mut swap = DecodeSwap::default(); swap.reseed(&mut dec, track, &cursor, origin + key_ns); // SWAPBACKSEEK (SR353): the run's keyframe with its in-band parameter sets
+        Ok(Vid { src, origin, track_id: track.id, cursor, track: track.clone(), swap, stood_in: !dec.is_real(), dec, pending: VecDeque::new(), peeked: None, last: None, done: false })
     }
     fn pull(&mut self) -> Result<Option<Frame>, RenderError> {
         loop {
@@ -855,6 +855,17 @@ impl Sources {
             if !v.contains(&id) {
                 v.push(id);
             }
+        }
+    }
+    /// NLE-STANDIN-OPEN (LEDGER SR353): a reel opened as source `id` whose video track no decoder fits is a STAND-IN reel
+    /// from its open (its runs draw the labelled stand-in, [`crate::decode_swap::open`], as the Player plays it); a
+    /// re-added `id` forgets its old mark first.
+    fn note_open(&self, id: SourceId, m: &Media) {
+        if let Ok(mut v) = self.stand_in.lock() {
+            v.retain(|s| *s != id);
+        }
+        if m.video.is_some_and(|i| decoder_for(&m.demux.tracks()[i]).is_err()) {
+            self.note_stand_in(id);
         }
     }
 }

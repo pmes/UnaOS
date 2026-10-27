@@ -360,6 +360,42 @@ impl VideoDecoder for TestPattern {
     }
 }
 
+/// SWAPBACKSEEK (LEDGER SR353): the parameter-set NAL units of one sample of a video track — what Stria's
+/// `decode_swap::reseed` feeds a fresh decoder before a seek target, so the target decodes with the in-band sets in
+/// effect there instead of the pre-seek ones. Re-framed as the track frames its samples (the length size of its
+/// avcC / hvcC, else Annex B start codes), through h264_core's ONE splitter (`nal::length_prefixed_units` /
+/// `annexb_units`, which hevc_core re-exports); H.264 nal_unit_type 7 / 8, HEVC 32 / 33 / 34 (hevc_core's header read).
+/// `None` = the codec carries no parameter-set NALs (VP8, VP9, AV1, `utp1`; HEVC without the `hevc` feature);
+/// `Some(empty)` = this sample carries none (or does not split). The [`reorder_depth`] / [`colour_of`] dispatch shape.
+pub fn param_sets(track: &Track, data: &[u8]) -> Option<Vec<u8>> {
+    let (is_set, len): (fn(&[u8]) -> bool, Option<usize>) = match &track.codec {
+        Codec::Avc => (
+            |u| matches!(u.first().map(|b| b & 0x1F), Some(7 | 8)),
+            if track.config.is_empty() { None } else { h264_core::nal::parse_avcc(&track.config).ok().map(|c| c.nal_length_size) },
+        ),
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => (
+            |u| hevc_core::nal::parse_header(u).is_ok_and(|h| matches!(h.nal_type, 32..=34)),
+            if track.config.is_empty() { None } else { hevc_core::nal::parse_hvcc(&track.config).ok().map(|c| c.nal_length_size) },
+        ),
+        _ => return None,
+    };
+    let units = match len {
+        Some(n) => h264_core::nal::length_prefixed_units(data, n).unwrap_or_default(),
+        None if track.config.is_empty() => h264_core::nal::annexb_units(data),
+        None => Vec::new(),
+    };
+    let mut out = Vec::new();
+    for u in units.into_iter().filter(|u| is_set(u)) {
+        match len {
+            Some(n) => out.extend_from_slice(&(u.len() as u32).to_be_bytes()[4 - n..]),
+            None => out.extend_from_slice(&[0, 0, 0, 1]),
+        }
+        out.extend_from_slice(u);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

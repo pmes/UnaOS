@@ -914,7 +914,7 @@ refs/heads/exec-rmbp-h264encpyramid   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdfsign   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aethermacgpupresentrects   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-playcheckhi   a80198ec9 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-swapbackseek   e9df84207 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-swapbackseek   1c18d7223 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-stationroambgscan   7b77f79c3 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdf4formsave   781558de2 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aethertestroot   781558de2 IN-FLIGHT cut 2026-10-27

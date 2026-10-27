@@ -826,3 +826,136 @@ fn colourone_player_main10_converts_from_ten_bits_and_by_its_colour() {
     assert!(tagged.chunks_exact(4).all(|p| p == [81, 142, 178, 255]), "{:?}", &tagged[..4]);
     println!("colourone: player main10 rgba=87,145,176 bt709=81,142,178");
 }
+
+// SWAPBACKSEEK (LEDGER SR353): a seek (the Player's) and a run open (the editor's) restart the decode at the target keyframe
+// with the in-band parameter sets in effect THERE (`DecodeSwap::reseed`). The Player decodes VIDEO_AHEAD (4) frames ahead of
+// the glass, so its reel's refused span outlasts that: s1 carries the in-band 13-bit sets (`HEVC_SPS_12BIT`), s2-s7 are bare
+// IDRs on them, s8 carries the 8-bit `HEVC_SPS` again, s9-s11 are bare IDRs on it, s0 a bare IDR on the container's.
+fn swapbackseek_reel() -> Vec<u8> {
+    let mut t = hevc_kat_track(12);
+    for (i, sps) in [(1usize, &HEVC_SPS_12BIT[..]), (8, &HEVC_SPS[..])] {
+        let mut s = Vec::new();
+        for unit in [sps, &HEVC_PPS[..], &HEVC_IDR[..]] {
+            s.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+            s.extend_from_slice(unit);
+        }
+        t.samples[i].data = s;
+    }
+    build::mp4(&[t], &Mp4Options::default())
+}
+
+/// Tick `p` into `sink` until `stop` holds or the stream ends.
+fn swapbackseek_run(p: &mut Player, time: &ManualTime, sink: &mut RgbaSink, stop: impl Fn(&Player, &RgbaSink) -> bool) {
+    for _ in 0..400 {
+        if stop(p, sink) || p.tick(sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+}
+
+/// The reel played straight through: the reference frames (s1-s7 the stand-in's counter, the rest flat).
+fn swapbackseek_straight() -> Vec<(i64, Vec<u8>)> {
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseek_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, _| false);
+    assert_eq!(sink.shown.len(), 12);
+    for (i, (_, rgba)) in sink.shown.iter().enumerate() {
+        if (1..=7).contains(&i) {
+            assert_eq!(rgba, &TestPattern::render(64, 48, i as u32), "straight frame {i} is not the stand-in");
+        } else {
+            assert!(rgba.chunks(4).all(|p| p == SWAPBACK_FLAT), "straight frame {i} is not flat");
+        }
+    }
+    sink.shown
+}
+
+/// A Player on the stand-in with the refused decoder parked (it holds s1's 13-bit sets; s8 is past the lookahead).
+fn swapbackseek_parked() -> (Player, ManualTime) {
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseek_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |p, _| !p.info().real_video);
+    assert!(!p.info().real_video, "never swapped to the stand-in");
+    (p, time)
+}
+
+/// Rule: after straight play (the decoder holds s8's 8-bit sets) a seek to s4 decodes it with s1's 13-bit sets: the target
+/// is refused and the stand-in shows AT the target (today: the stale 8-bit sets decode it flat).
+#[test]
+fn swapbackseek_player_seek_into_the_refused_span_starts_on_the_stand_in() {
+    capture_logs();
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseek_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, _| false);
+    assert!(p.info().real_video);
+    p.seek(160_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| !s.shown.is_empty());
+    assert_eq!(sink.shown[0].0, 160_000_000);
+    assert_eq!(sink.shown[0].1, TestPattern::render(64, 48, 4), "the seek target is not the stand-in");
+    assert!(!p.info().real_video);
+    let lines = my_log_lines("[STRIA] :: video decode:");
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(lines[2].starts_with("[STRIA] :: video decode: swapped to stand-in: "), "{lines:?}");
+    println!("swapbackseek: into the span -> {}", p.info().video_decoder);
+}
+
+/// Rule: parked on the stand-in (13-bit sets), a seek to s9 decodes it with s8's 8-bit sets on the real decoder at once —
+/// the frames equal the straight-play frames at those pts, and no `swapped back` line (nothing waited for a keyframe); a
+/// seek to s0 decodes on the container's sets (today: both offered to the parked decoder, refused, the stand-in).
+#[test]
+fn swapbackseek_player_seek_out_of_the_span_decodes_the_8bit_keyframe_at_once() {
+    capture_logs();
+    let straight = swapbackseek_straight();
+    let (mut p, time) = swapbackseek_parked();
+    p.seek(360_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| s.shown.len() >= 2);
+    assert_eq!(sink.shown, straight[9..11].to_vec(), "s9/s10 after the seek are not the straight-play frames");
+    assert!(p.info().real_video);
+    assert_eq!(p.info().video_decoder, "hevc (hevc_core)");
+    let (mut p, time) = swapbackseek_parked();
+    p.seek(0);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| !s.shown.is_empty());
+    assert_eq!(sink.shown[0], straight[0], "s0 after the seek is not the container-set frame"); // (the lookahead has decoded s1 by now: the stand-in again, rightly)
+    let back: Vec<String> = my_log_lines("swapped back").into_iter().filter(|l| !l.ends_with("at 320000000")).collect();
+    assert!(back.is_empty(), "{back:?}");
+    println!("swapbackseek: out of the span -> s9 s10 s0 real, equal to straight play");
+}
+
+/// Rule: the editor's run opened at s2 (a render of tick 2 alone) decodes with s1's 13-bit sets and draws the stand-in; a run
+/// opened at s4 draws the frame the whole render draws there (today: the container's sets decode s2 flat).
+#[test]
+fn swapbackseek_editor_run_opened_inside_the_span_draws_the_stand_in() {
+    use stria::nle::{RenderSink, Sources, render};
+    use timeline_core::SourceId;
+    struct Frames(Vec<Vec<u8>>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, _out_t: i64, _w: u32, _h: u32, rgba: &[u8]) {
+            self.0.push(rgba.to_vec());
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    let (tl, src) = Sources::from_media("A", &swapback_reel(), 25).unwrap().unwrap();
+    let mut whole = Frames(Vec::new());
+    render(&tl, 0..6, &src, &mut whole).unwrap();
+    let mut at2 = Frames(Vec::new());
+    render(&tl, 2..3, &src, &mut at2).unwrap();
+    assert_eq!(at2.0, [TestPattern::render(64, 48, 2)], "a run opened at s2 is not the stand-in");
+    let mut at4 = Frames(Vec::new());
+    render(&tl, 4..5, &src, &mut at4).unwrap();
+    assert_eq!(at4.0, whole.0[4..5].to_vec());
+    let report = src.open_report(SourceId(0)).unwrap().to_string();
+    assert!(report.ends_with(" decode=stand-in"), "{report}");
+    println!("swapbackseek: editor {report}");
+}
