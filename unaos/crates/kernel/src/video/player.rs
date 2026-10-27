@@ -1578,12 +1578,12 @@ mod nle_fx {
         let vi = d.video_track().and_then(|t| d.track_index(t.id));
         let samples = vi.map(|i| d.track_samples(i).count() as u64).unwrap_or(0);
         let ctts = vi.is_some_and(|i| d.track_samples(i).any(|s| s.pts != s.dts));
-        let audio_ok = d.audio_track().is_some_and(|t| t.sample_rate == 48_000 && t.channels == 2) && rep.audio_target > 0 && rep.audio_mixed >= rep.audio_target;
+        let audio_ok = d.audio_track().is_some_and(|t| t.sample_rate == 48_000 && t.channels == 2) && rep.audio_target > 0 && rep.audio_mixed >= rep.audio_target && rep.periods > 0; // NLE6EXPORTSTREAMPCM (rmbp-ledger B976): the sound entered the file before finish
         let need_audio = cfg!(any(feature = "uvc", feature = "hda-tone"));
         let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir); // NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
         serial_println!(
-            "[nle] fixture export out={} samples={} ticks={} ctts={} audio={} mixed={}/{} bytes={} ms={} -> {}",
-            out, samples, ticks, ctts as u8, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
+            "[nle] fixture export out={} samples={} ticks={} ctts={} audio={} mixed={}/{} periods={} bytes={} ms={} -> {}",
+            out, samples, ticks, ctts as u8, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.periods, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
         );
         (ok, if !ok { "FAIL" } else if need_audio { "ok" } else { "skip(no-audio)" })
     }

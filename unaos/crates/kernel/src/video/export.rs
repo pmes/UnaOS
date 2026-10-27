@@ -20,11 +20,13 @@
 //! * THE FILE (NLE6EXPORTONE, rmbp-ledger B963): ONE `build::Mp4Stream` (ftyp, the mdat, the moov at the end). The `avc1`
 //!   track is `build::coded_video_spec` (the constructor Stria's `video_track` uses too); each unit is written to the file as
 //!   [`frame`] gets it (`build::coded_video_sample`: its (dts, pts) x the tick, so B pictures write `ctts`), so the export
-//!   holds no more than the encoder's reorder window. At [`finish`] (after the job's sound closed) the flush's units, then,
-//!   when sound was captured, a `sowt` PCM16 track (`build::pcm16_track`) cut to the video's length — or, under `--aac KBPS`
-//!   ([`Opts::aac_kbps`], NLE6EXPORTAAC rmbp-ledger B960), the same cut PCM through audio_core's `aac::enc::Encoder` (Stria's
-//!   host export's one encoder) as an `mp4a` track (`build::mp4a_track`) pushed through the same stream, its priming
-//!   trimmed by `build::mp4a_edit_list` in the extras `Mp4Stream::finish` takes ([`audio_track`]) — then the moov. Written as the shell writes (`write_veto` at start, the kernel principal) through
+//!   holds no more than the encoder's reorder window. The sound streams beside it (NLE6EXPORTSTREAMPCM, rmbp-ledger B976):
+//!   after each step's units, the capture's audio due by that frame's end goes into track 2 — a `sowt` PCM16 packet of
+//!   1024 frames (`build::pcm16_sample`) or, under `--aac KBPS` ([`Opts::aac_kbps`], NLE6EXPORTAAC rmbp-ledger B960), the
+//!   units of audio_core's `aac::enc::Encoder` (Stria's host export's one encoder, `build::mp4a_sample`) — and nothing past
+//!   the video's length. At [`finish`] (after the job's sound closed) the flush's units, the held rest padded to the video's
+//!   length, the AAC entry restated (`build::mp4a_spec` through `Mp4Stream::respec`) with its priming trimmed by
+//!   `build::mp4a_edit_list` in the extras `Mp4Stream::finish` takes ([`Exp::sound_close`]) — then the moov. Written as the shell writes (`write_veto` at start, the kernel principal) through
 //!   the ONE VFS writer, `MountTable::put_file` / `write_all_at`; a refused, failed or superseded export unlinks its
 //!   partial file. `--bitrate KBPS` is h264enc_core's `Config.rate` (CBR), the field Stria's `with_bitrate` sets.
 //! * THE PICTURE (H264ENCPLANES, rmbp-ledger B973): the file has ONE colour, fixed at its first frame ([`Exp::push`]): an
@@ -39,11 +41,10 @@
 //!   `vplay::finished` cannot say it: a superseded job ends with neither eos nor an error).
 //!
 //! Wire: `[nle] export start edl= out= qp= gop= bframes= bitrate= jid=` · `[nle] export progress pct=<10..100> frames=<n>/<total>` ·
-//! `[nle] export frames=<n> bytes=<n> ms=<n> audio=<mixed>/<target> bframes=<n> out=<p>` · `[nle] export refused why=<w> (<reason>)`
+//! `[nle] export frames=<n> bytes=<n> ms=<n> audio=<mixed>/<target> periods=<n> bframes=<n> out=<p>` · `[nle] export refused why=<w> (<reason>)`
 //! · NLE6EXPORTAAC: `[nle] export audio=aac bytes=<n> units=<n> kbps=<k>` (before the `frames=` line).
 //! The witness is player.rs `tests nle` (`export=` on `:: NLE: … ::`; the AAC leg's `[nle] fixture export audio=aac`).
-//! Owed: the Pi budget, a progress UI on the kernel face, MKV, the sound streamed too (NLE6EXPORT-STREAMPCM: the
-//! capture's PCM is held whole until [`finish`], and the AAC encode runs on it there).
+//! Owed: the Pi budget, a progress UI on the kernel face, MKV, a knob for the sound's interleave window (NLE6EXPORT-WINDOW).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -90,6 +91,8 @@ pub struct Report {
     pub audio_mixed: u64,
     pub audio_target: u64,
     pub audio: bool,
+    /// NLE6EXPORTSTREAMPCM (rmbp-ledger B976): the audio samples written before [`finish`] (the sound streamed, not held).
+    pub periods: u64,
     pub bframes: u8,
     /// The video samples' bytes (the `--bitrate` witness).
     pub video_bytes: u64,
@@ -115,6 +118,8 @@ struct Exp {
     t0: u64,
     /// H264ENCPLANES (B973): the file's one colour and the frames that entered as planes (file tail).
     col: ExpColour,
+    /// NLE6EXPORTSTREAMPCM (B976): the streamed sound's track and its held remainder (file tail).
+    snd: ExpSound,
 }
 
 static ENC: crate::sync::Mutex<Option<Exp>> = crate::sync::Mutex::new(None);
@@ -141,7 +146,7 @@ pub fn start(edl: &str, out: &str, opts: Opts) -> Result<u32, String> {
     let jid = {
         // armed under the lock across the start, so the job's first `sink` sees its own jid
         let mut g = ENC.lock();
-        *g = Some(Exp { jid: 0, out: String::from(out), opts, rgba: RgbaEncoder::new(cfg), stream: None, vtrack: 0, begun: false, size: (0, 0), tb: Timebase { num: 1, den: 25 }, total: 1, frames: 0, next_pct: 10, t0, col: ExpColour::default() });
+        *g = Some(Exp { jid: 0, out: String::from(out), opts, rgba: RgbaEncoder::new(cfg), stream: None, vtrack: 0, begun: false, size: (0, 0), tb: Timebase { num: 1, den: 25 }, total: 1, frames: 0, next_pct: 10, t0, col: ExpColour::default(), snd: ExpSound::default() });
         let jid = super::vplay::start(edl);
         if let Some(e) = g.as_mut() {
             e.jid = jid;
@@ -164,6 +169,12 @@ pub fn arm_audio(jid: u32) {
     }
 }
 
+/// NLE6EXPORTSTREAMPCM (rmbp-ledger B976): after job `jid`'s last picture, before its sound drains: the capture's window is
+/// lifted, so the rest is mixed as it comes and vplay's `snd::drain` ends as it always did. A Present job: nothing armed.
+pub fn sound_tail(jid: u32) {
+    bus::release(jid);
+}
+
 /// The step's frame into the encoder: its decoder planes with the source's colour when unmixed 8-bit 4:2:0 (H264ENCPLANES
 /// B973), and its `w x h` straight RGBA made on demand ([`Exp::push`] decides); `tb` the EDL's time base and `total` its video
 /// steps (the progress). Encodes with no lock held.
@@ -182,7 +193,7 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, planes: Opt
     }
     e.size = (w as u32, h as u32);
     let r = match e.push(w, h, planes, rgba) {
-        Ok(u) => e.stream_units(u).map_err(|m| alloc::format!("write-refused: {}", m)),
+        Ok(u) => e.stream_units(u).and_then(|()| e.stream_sound()).map_err(|m| alloc::format!("write-refused: {}", m)),
         Err(err) => Err(alloc::format!("{}", err)),
     };
     e.frames += 1;
@@ -215,8 +226,8 @@ pub fn finish(jid: u32, r: Result<(), (&'static str, Option<String>)>) -> Result
     match res {
         Ok(rep) => {
             serial_println!(
-                "[nle] export frames={} bytes={} ms={} audio={}/{} bframes={} out={}",
-                rep.frames, rep.bytes, rep.ms, rep.audio_mixed, rep.audio_target, rep.bframes, rep.out
+                "[nle] export frames={} bytes={} ms={} audio={}/{} periods={} bframes={} out={}",
+                rep.frames, rep.bytes, rep.ms, rep.audio_mixed, rep.audio_target, rep.periods, rep.bframes, rep.out
             );
             r
         }
@@ -237,7 +248,7 @@ pub fn report(jid: u32) -> Option<Report> {
 }
 
 impl Exp {
-    /// Flush the encoder's tail into the stream, push the capture's PCM16 track, write the moov; the report is kept in
+    /// Flush the encoder's tail into the stream, close the streamed sound track, write the moov; the report is kept in
     /// [`LAST`]. Any refusal unlinks the partial file.
     fn write(mut self, pcm: Option<(Vec<i16>, u32)>) -> Result<Report, (&'static str, String)> {
         let r = self.write_inner(pcm);
@@ -253,27 +264,11 @@ impl Exp {
         if self.stream.is_none() {
             return Err(("no-frames", String::from("the EDL encoded no frame")));
         }
-        let mut tracks: Vec<build::MediaTrack> = Vec::new();
         let mut rep = Report { frames: self.frames, bframes: self.opts.bframes, out: self.out.clone(), ..Report::default() };
         let mut extras = build::Mp4Extras::default(); // NLE6EXPORTAAC (rmbp-ledger B960): the AAC track's priming edit; empty for PCM16
         extras.colour.extend(self.colour_entry()); // H264ENCPLANES (rmbp-ledger B973): the file's one colour as the avc1's `colr`, and its wire line (file tail)
-        if let Some((mut pcm, rate)) = pcm.filter(|(p, _)| !p.is_empty()) {
-            let target = (self.tb.to_ns(self.total as i64).max(0) as u128 * rate as u128 / 1_000_000_000) as u64;
-            rep.audio_mixed = (pcm.len() / 2) as u64;
-            rep.audio_target = target;
-            rep.audio = true;
-            pcm.resize(target as usize * 2, 0);
-            let (track, edit) = audio_track(&pcm, rate, self.opts.aac_kbps)?;
-            tracks.push(track);
-            extras.edit_lists.extend(edit);
-        }
-        let Some(mut st) = self.stream.take() else { return Err(("no-frames", String::from("the EDL encoded no frame"))) };
-        for t in tracks {
-            let i = st.track(t.spec);
-            for smp in t.samples {
-                st.push(i, smp).map_err(|e| ("write-refused", e))?;
-            }
-        }
+        self.sound_close(pcm, &mut rep, &mut extras)?; // NLE6EXPORTSTREAMPCM (rmbp-ledger B976): the held rest, padded to the video's length, the last packet / the AAC flush, the mp4a entry and its priming edit (file tail)
+        let Some(st) = self.stream.take() else { return Err(("no-frames", String::from("the EDL encoded no frame"))) };
         rep.video_bytes = st.video_bytes();
         let (_, len) = st.finish(&build::Mp4Options::default(), &extras).map_err(|e| ("write-refused", e))?;
         rep.bytes = len;
@@ -368,26 +363,50 @@ pub mod bus {
         jid: u32,
         mix: Mix,
         pcm: Vec<i16>,
+        /// NLE6EXPORTSTREAMPCM (B976): the frames mixed so far, and the window: no period past `allow` (the export's
+        /// `drain` moves it per video step; `release` lifts it after the last picture).
+        mixed: u64,
+        allow: u64,
     }
 
     static CAP: crate::sync::Mutex<Option<Cap>> = crate::sync::Mutex::new(None);
 
     impl Cap {
-        /// The infinitely fast sink: every period the sources can give, appended to the capture.
+        /// The infinitely fast sink, held to its window: every period the sources can give up to `allow` mixed frames,
+        /// appended to the capture (past it the sources' rings fill, `write` takes nothing and snd's feed waits a step).
         fn pump(&mut self) {
             let mut buf = [0i16; mixer::PERIOD_FRAMES * 2];
-            while self.mix.ready() {
+            while self.mix.ready() && self.mixed < self.allow {
                 self.mix.period(&mut buf, mixer::UNITY, false);
                 self.pcm.extend_from_slice(&buf);
+                self.mixed += mixer::PERIOD_FRAMES as u64;
             }
         }
     }
 
     pub(super) fn arm(jid: u32) {
-        *CAP.lock() = Some(Cap { jid, mix: Mix::new(), pcm: Vec::new() });
+        *CAP.lock() = Some(Cap { jid, mix: Mix::new(), pcm: Vec::new(), mixed: 0, allow: 0 });
     }
 
-    /// Disarm job `jid`'s capture: its PCM (interleaved stereo) and rate.
+    /// NLE6EXPORTSTREAMPCM (rmbp-ledger B976): up to `n` frames off the front of job `jid`'s capture (interleaved stereo)
+    /// and its rate, the window moved to `allow` mixed frames; None when no capture is armed. CAP alone (the caller holds
+    /// no lock: `frame` has the export out of ENC).
+    pub(super) fn drain(jid: u32, n: u64, allow: u64) -> Option<(Vec<i16>, u32)> {
+        let mut g = CAP.lock();
+        let c = g.as_mut().filter(|c| c.jid == jid)?;
+        c.allow = c.allow.max(allow);
+        let k = (n as usize).saturating_mul(2).min(c.pcm.len());
+        Some((c.pcm.drain(..k).collect(), RATE))
+    }
+
+    /// NLE6EXPORTSTREAMPCM (rmbp-ledger B976): job `jid`'s window lifted (after its last picture: the rest mixes as it comes).
+    pub(super) fn release(jid: u32) {
+        if let Some(c) = CAP.lock().as_mut().filter(|c| c.jid == jid) {
+            c.allow = u64::MAX;
+        }
+    }
+
+    /// Disarm job `jid`'s capture: the PCM it still holds (interleaved stereo; what the export has not drained) and rate.
     pub(super) fn take(jid: u32) -> Option<(Vec<i16>, u32)> {
         CAP.lock().take_if(|c| c.jid == jid).map(|c| (c.pcm, RATE))
     }
@@ -456,6 +475,12 @@ mod bus {
     pub(super) fn take(_: u32) -> Option<(alloc::vec::Vec<i16>, u32)> {
         None
     }
+    /// No capture, no rate (NLE6EXPORTSTREAMPCM: `drain` answers None before it is used).
+    pub(super) const RATE: u32 = 0;
+    pub(super) fn drain(_: u32, _: u64, _: u64) -> Option<(alloc::vec::Vec<i16>, u32)> {
+        None
+    }
+    pub(super) fn release(_: u32) {}
 }
 
 // ── NLE6EXPORTONE (rmbp-ledger B963): the stream's sink, the export's file through the ONE VFS writer ──────────────────────
@@ -472,25 +497,6 @@ impl build::Sink for VfsOut {
             .map(|_| ())
             .map_err(|e| alloc::format!("write {} at {}: {:?}", self.path, off, e))
     }
-}
-
-/// NLE6EXPORTAAC (rmbp-ledger B960): the captured sound's track (track 2, stereo at `rate`, already cut to the video): PCM16
-/// `sowt` when `aac_kbps` is 0, else AAC-LC through audio_core's `aac::enc::Encoder` (the encoder Stria's host export
-/// takes) as `build::mp4a_track` with its priming edit (`build::mp4a_edit_list`, for `Mp4Stream::finish`'s extras). Runs
-/// in [`Exp::write`], no lock held.
-fn audio_track(pcm: &[i16], rate: u32, aac_kbps: u32) -> Result<(build::MediaTrack, Option<(u32, Vec<(u32, i64, i32)>)>), (&'static str, String)> {
-    if aac_kbps == 0 {
-        return Ok((build::pcm16_track(2, rate, 2, pcm, 1024), None));
-    }
-    use audio_core::aac::enc::{Encoder, PRIMING};
-    let bps = aac_kbps.saturating_mul(1000);
-    let mut enc = Encoder::new(rate, 2, bps).map_err(|e| ("aac-refused", alloc::format!("{:?}", e)))?;
-    let mut units = enc.encode(pcm);
-    units.extend(enc.flush());
-    let (n, bytes) = (units.len(), units.iter().map(|u| u.data.len()).sum::<usize>());
-    serial_println!("[nle] export audio=aac bytes={} units={} kbps={}", bytes, n, aac_kbps);
-    let track = build::mp4a_track(2, rate, 2, &enc.asc(), units.into_iter().map(|u| u.data).collect(), bps);
-    Ok((track, Some(build::mp4a_edit_list(2, rate, PRIMING, (pcm.len() / 2) as u64))))
 }
 
 // ── H264ENCPLANES (rmbp-ledger B973): the export's picture path and its ONE colour (handlers.md §5 NLEPROBE-HDR's H264ENC-PLANES) ──
@@ -561,5 +567,138 @@ impl Exp {
             c.matrix, if full { "full" } else { "limited" }, self.col.src, self.col.planes, self.frames
         );
         Some((1, c))
+    }
+}
+
+// ── NLE6EXPORTSTREAMPCM (rmbp-ledger B976): the sound streamed into the file as it is mixed (handlers.md §5 NLE6's NLE6EXPORT-STREAMPCM) ──
+// ONE interleave rule: after a video step's units are pushed, the sound due is the capture's audio up to the END of the last
+// video frame handed to the encoder, capped at the video's length (`target`). PCM16 pushes it in whole 1024-frame packets
+// (the one-shot `pcm16_track`'s), the remainder held in `carry`; AAC feeds it to the one `Encoder` and pushes every unit it
+// returns. Nothing past `target` enters the track. At finish the capture's rest is taken (cut at `target`), zero-padded to
+// `target`, the last packet / the encoder's flush pushed, and the mp4a entry restated with its biggest unit. The capture
+// pumps only up to `allow` (one more video step + one packet), so it holds a step, not the job; [`sound_tail`] lifts the
+// window after the last picture. The state lives in `Exp`, which `frame` holds outside `ENC`; `bus::drain` takes CAP alone.
+
+/// The PCM16 packet in sample frames (the one-shot track's).
+const PCM_PACKET: u64 = 1024;
+
+/// The streamed sound of one export.
+#[derive(Default)]
+struct ExpSound {
+    /// The 48 kHz frames taken off the capture (every mixed frame by [`Exp::sound_close`]).
+    taken: u64,
+    /// The frames that entered the track (<= the video's length): packets pushed + `carry`, or fed to the encoder.
+    fed: u64,
+    /// PCM16: the frames short of a packet.
+    carry: Vec<i16>,
+    /// The track (id 2), declared at its first sample (always after the avc1, id 1).
+    track: Option<usize>,
+    rate: u32,
+    aac: Option<audio_core::aac::enc::Encoder>,
+    /// Samples pushed (PCM packets or AAC units), their bytes, the biggest (the mp4a entry's buffer size).
+    samples: u64,
+    bytes: u64,
+    biggest: u32,
+    /// Samples pushed before finish (the streaming witness, `periods=`).
+    periods: u64,
+}
+
+impl Exp {
+    /// The sound due by the frame just encoded (the rule above) into the stream, and the capture's window moved one step on.
+    /// Before the file exists nothing is taken (the window still moves).
+    fn stream_sound(&mut self) -> Result<(), String> {
+        let tb = self.tb;
+        let at = |n: u64| (tb.to_ns(n as i64).max(0) as u128 * bus::RATE as u128 / 1_000_000_000) as u64;
+        let due = at(self.frames + 1).min(at(self.total));
+        let allow = at(self.frames + 2) + PCM_PACKET;
+        let n = if self.stream.is_some() { due.saturating_sub(self.snd.fed) } else { 0 };
+        let Some((pcm, rate)) = bus::drain(self.jid, n, allow) else { return Ok(()) };
+        let k = (pcm.len() / 2) as u64;
+        self.snd.rate = rate;
+        self.snd.taken += k;
+        self.snd.fed += k;
+        self.sound_feed(&pcm, false)
+    }
+
+    /// Frames into the track: PCM16 in whole packets (the remainder carried; `end` pushes the last partial one), AAC through
+    /// the one encoder (`end` flushes it); every sample pushed as it comes.
+    fn sound_feed(&mut self, pcm: &[i16], end: bool) -> Result<(), String> {
+        let rate = self.snd.rate;
+        if self.opts.aac_kbps == 0 {
+            self.snd.carry.extend_from_slice(pcm);
+            let whole = PCM_PACKET as usize * 2;
+            let mut at = 0usize;
+            while self.snd.carry.len() - at >= whole || (end && at < self.snd.carry.len()) {
+                let stop = (at + whole).min(self.snd.carry.len());
+                let s = build::pcm16_sample(self.snd.samples * PCM_PACKET, &self.snd.carry[at..stop], 2);
+                at = stop;
+                self.sound_push(|| build::pcm16_spec(2, rate, 2), s, end)?;
+            }
+            self.snd.carry.drain(..at);
+            return Ok(());
+        }
+        let bps = self.opts.aac_kbps.saturating_mul(1000);
+        if self.snd.aac.is_none() {
+            let enc = audio_core::aac::enc::Encoder::new(rate, 2, bps).map_err(|e| alloc::format!("aac-refused: {:?}", e))?;
+            self.snd.aac = Some(enc);
+        }
+        let Some(enc) = self.snd.aac.as_mut() else { return Ok(()) };
+        let mut units = enc.encode(pcm);
+        if end {
+            units.extend(enc.flush());
+        }
+        let asc = enc.asc();
+        for u in units {
+            let i = self.snd.samples;
+            self.sound_push(|| build::mp4a_spec(2, rate, 2, &asc, 0, bps), build::mp4a_sample(i, u.data), end)?;
+        }
+        Ok(())
+    }
+
+    /// One audio sample written at the file's end through the ONE stream; the track declared at the first.
+    fn sound_push(&mut self, spec: impl FnOnce() -> build::TrackSpec, s: build::SampleSpec, end: bool) -> Result<(), String> {
+        let Some(st) = self.stream.as_mut() else { return Err(String::from("sound before the file")) };
+        let i = match self.snd.track {
+            Some(i) => i,
+            None => *self.snd.track.insert(st.track(spec())),
+        };
+        let n = s.data.len();
+        st.push(i, s)?;
+        self.snd.samples += 1;
+        self.snd.bytes += n as u64;
+        self.snd.biggest = self.snd.biggest.max(n as u32);
+        if !end {
+            self.snd.periods += 1;
+        }
+        Ok(())
+    }
+
+    /// At finish (the job's sound closed; `rest` what the capture still holds): the rest cut / padded to the video's length
+    /// and pushed with the last packet or the encoder's flush, the mp4a entry restated and its priming edit; the report's
+    /// sound. No sound mixed: no track (the file as a silent job's always was).
+    fn sound_close(&mut self, rest: Option<(Vec<i16>, u32)>, rep: &mut Report, extras: &mut build::Mp4Extras) -> Result<(), (&'static str, String)> {
+        let Some((mut pcm, rate)) = rest else { return Ok(()) };
+        let mixed = self.snd.taken + (pcm.len() / 2) as u64;
+        if mixed == 0 {
+            return Ok(());
+        }
+        let target = (self.tb.to_ns(self.total as i64).max(0) as u128 * rate as u128 / 1_000_000_000) as u64;
+        pcm.resize(target.saturating_sub(self.snd.fed) as usize * 2, 0); // the cut to the video's length, and its pad
+        (self.snd.rate, self.snd.taken, self.snd.fed) = (rate, mixed, target);
+        (rep.audio_mixed, rep.audio_target, rep.audio) = (mixed, target, true);
+        self.sound_feed(&pcm, true).map_err(|e| (if e.starts_with("aac-refused") { "aac-refused" } else { "write-refused" }, e))?;
+        if let (None, Some(st)) = (self.snd.track, self.stream.as_mut()) {
+            self.snd.track = Some(st.track(build::pcm16_spec(2, rate, 2))); // sound mixed, none of it inside the video: the track stays, empty
+        }
+        if let Some(enc) = self.snd.aac.as_ref() {
+            let bps = self.opts.aac_kbps.saturating_mul(1000);
+            serial_println!("[nle] export audio=aac bytes={} units={} kbps={}", self.snd.bytes, self.snd.samples, self.opts.aac_kbps);
+            if let (Some(st), Some(i)) = (self.stream.as_mut(), self.snd.track) {
+                st.respec(i, build::mp4a_spec(2, rate, 2, &enc.asc(), self.snd.biggest, bps));
+            }
+            extras.edit_lists.push(build::mp4a_edit_list(2, rate, audio_core::aac::enc::PRIMING, target));
+        }
+        rep.periods = self.snd.periods;
+        Ok(())
     }
 }
