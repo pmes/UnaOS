@@ -32,7 +32,7 @@ fn map_err(e: h264_core::Error) -> DecodeError {
     }
 }
 
-fn to_frame(f: h264_core::Frame) -> Frame {
+pub(super) fn to_frame(f: h264_core::Frame) -> Frame {
     let (w, h) = (f.width, f.height);
     let [y, u, v] = f.planes;
     Frame { width: w, height: h, pts_ns: f.tag, pixels: Pixels::I420 { y, u, v, y_stride: w as usize, uv_stride: w as usize / 2 } }

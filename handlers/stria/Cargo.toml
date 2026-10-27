@@ -19,7 +19,9 @@ resonance = { path = "../../libs/resonance" }
 # play real frames instead of the labelled stand-in.
 # VP9CORE (SR116): VP9 (WebM V_VP9, MP4 vp09; profiles 0 and 2) plays real frames through gneiss_pal's
 # unconditional `dsp::video::vp9` arm over unaos/libs/media/vp9_core, beside vp8_core — no feature to name.
-gneiss_pal = { path = "../../libs/gneiss_pal", features = ["av1"] }
+# HEVCPAL (SR215): `hevc` puts HEVCPARSE's decoder (hevc_core) in the same registry: hvc1 / hev1 / V_MPEGH/ISO/HEVC intra streams
+# play real frames, and the editor and Player derive HEVC Matroska decode times from hvcC.
+gneiss_pal = { path = "../../libs/gneiss_pal", features = ["av1", "hevc"] }
 tokio = { version = "1.53", features = ["rt", "sync", "time", "macros"] }
 anyhow = "1.0"
 # NLE1 (SR194): the editor's timeline core (no_std, shared with the on-UnaOS face); `nle` renders its schedule.
