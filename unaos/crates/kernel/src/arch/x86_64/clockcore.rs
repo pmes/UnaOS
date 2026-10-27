@@ -179,7 +179,7 @@ pub fn mask_exit(tok: (u64, u32), site: &'static Location<'static>) {
     }
     let span = tsc_global().saturating_sub(t0);
     if span > THRESH.load(Relaxed) {
-        MASKED_MAX.fetch_max(span, Relaxed);
+        if MASKED_MAX.fetch_max(span, Relaxed) < span { MAX_WHO.note(crate::arch::sched::current_name(), site); } // HIDSTALLMASKSCOPE (B1019): the max names its holder (the masking task is current here)
         name_once(site, span, cpu, false);
     }
 }
@@ -245,7 +245,7 @@ pub fn isr_tick() {
         }
         // SAFETY: every stored site is a `&'static Location` (from `#[track_caller]`).
         let site: &'static Location<'static> = unsafe { &*site };
-        MASKED_MAX.fetch_max(t.saturating_sub(t0), Relaxed);
+        if MASKED_MAX.fetch_max(t.saturating_sub(t0), Relaxed) < t.saturating_sub(t0) { MAX_WHO.note(None, site); } // HIDSTALLMASKSCOPE (B1019): another core's task is not safely readable here (SCHEDUAF): `?@<site>`
         name_once(site, t.saturating_sub(t0), c as u32, true);
     }
 }
@@ -352,12 +352,12 @@ pub fn selftest() {
     let mmax = MASKED_MAX.load(Relaxed) * 1000 / hz.max(1);
     let pass = tsc_clock() && (0..=2).contains(&drift) && masked_ms >= 19 && mmax >= 19 && ticking == cores.len();
     serial_println!(
-        ":: CLOCKCORE: source={} tsc_ms_vs_hpet_ms={} ref=pm window_ms={} masked_clock_ms={}/20 masked_max_ms={} masked_sites={} cores_ticking={}/{} skew_max_cycles={} -> {} ::",
+        ":: CLOCKCORE: source={} tsc_ms_vs_hpet_ms={} ref=pm window_ms={} masked_clock_ms={}/20 masked_max_ms={} masked_by={} masked_sites={} cores_ticking={}/{} skew_max_cycles={} -> {} ::",
         if tsc_clock() { "tsc" } else { "apic" },
         drift,
         WIN_MS,
         masked_ms,
-        mmax,
+        mmax, MAX_WHO.read(false),
         SEEN_N.load(Relaxed),
         ticking,
         cores.len(),
@@ -366,3 +366,9 @@ pub fn selftest() {
     );
     crate::tests::tally(pass);
 }
+
+// ── HIDSTALLMASKSCOPE (rmbp-ledger B1019) — the masked max names its holder. FILE-TAIL append. ─────────────────────────
+// `name_once` names a site the first time it passes 10 ms and never again, so flight 38's `masked_max_ms=2939` named no
+// one. The max's own `fetch_max` winner (`mask_exit`, `isr_tick`'s live scan) now writes this record, `hidstall`'s ONE
+// `MaskWho` type: `masked_by=<task>@<file>:<line>` on the CLOCKCORE line (`?` when another core's tick saw it).
+static MAX_WHO: crate::hidstall::MaskWho = crate::hidstall::MaskWho::new();
