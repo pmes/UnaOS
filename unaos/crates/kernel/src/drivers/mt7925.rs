@@ -3329,6 +3329,11 @@ pub struct RejoinPlan {
     pub watch: Judge,
     pub again: Again,
     pub dhcp: fn(),
+    /// MT7925S10PMKKEEP (zenbook-ledger Z64): a WPA2 plan's derived PMK (zeroized by `pmk_forget`, on every drop of the `Kept`).
+    pub pmk: [u8; 32],
+    /// The AP's beacon RSN element the handshake's message 3 is checked against; `rsn_len` 0 = an OPEN plan (the valid flag).
+    pub rsn: [u8; 128],
+    pub rsn_len: u8,
 }
 
 /// The kept plan and its backoff (STATIONREJOIN's ONE ladder).
@@ -3336,6 +3341,15 @@ pub struct RejoinPlan {
 struct Kept {
     plan: RejoinPlan,
     r: crate::wifi::assoc::Rejoin,
+}
+
+/// MT7925S10PMKKEEP (zenbook-ledger Z64): the kept PMK dies with the plan — replaced by a new keep, forgotten by the operator's
+/// next join, or dropped (the KAT's local one).
+#[cfg(feature = "wifi")]
+impl Drop for Kept {
+    fn drop(&mut self) {
+        pmk_forget(self);
+    }
 }
 
 /// Some from a successful open `tests wifijoin` until the next operator `tests wifijoin`. A LEAF lock (see the block head).
@@ -3426,14 +3440,16 @@ fn rejoin_tick(now: u64) {
         return;
     }
     let go = REJOIN.lock().as_mut().and_then(|k| rejoin_begin(k, now));
-    let Some((plan, n, after, why)) = go else { return };
+    let Some((mut plan, n, after, why)) = go else { return };
     let res = (plan.again)(&plan);
+    let secured = (res.is_ok() && plan.rsn_len > 0) as u8; // MT7925S10PMKKEEP (Z64): the rejoin ran the handshake from the kept PMK
+    crate::wifi::assoc::zeroize_pmk(&mut plan.pmk); // the stack copy of the kept PMK wiped as soon as the attempt returns
     let rejoins = REJOIN.lock().as_mut().map_or(0, |k| rejoin_end(k, res.is_ok(), crate::arch::ms()));
     let verdict = match res {
         Ok(()) => String::from("linked"),
         Err(w) => alloc::format!("failed:{}", w),
     };
-    serial_println!("[mt7925] s9 rejoin n={} after={} why={} -> {} rejoins={}", n, after, why, verdict, rejoins);
+    serial_println!("[mt7925] s9 rejoin n={} after={} why={} -> {} secured={} rejoins={}", n, after, why, verdict, secured, rejoins);
     if res.is_ok() {
         (plan.dhcp)();
     }
@@ -3467,7 +3483,7 @@ pub fn rejoin_kat() -> bool {
     REJOIN_KAT_N.store(0, Ordering::Relaxed);
     let plan = RejoinPlan {
         ssid: [0; 32], ssid_len: 0, bssid: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55], channel: 6, cap: 0x0001,
-        watch: rejoin_kat_judge, again: rejoin_kat_again, dhcp: rejoin_kat_dhcp,
+        watch: rejoin_kat_judge, again: rejoin_kat_again, dhcp: rejoin_kat_dhcp, pmk: [0; 32], rsn: [0; 128], rsn_len: 0,
     };
     let mut k = Kept { plan, r: crate::wifi::assoc::Rejoin::new() };
     k.r.lose(1000, "beacon-loss");
@@ -3482,4 +3498,37 @@ pub fn rejoin_kat() -> bool {
     k.r.lose(200_000, "deauth");
     ok &= step(&mut k, 200_999).is_none() && step(&mut k, 201_000) == Some((1, 1000, true, 2)) && k.r.why == "deauth";
     ok && unlink_rows()
+}
+
+// ── MT7925S10PMKKEEP (zenbook-ledger Z64) — the kept PMK of a WPA2 plan: zeroize and the KAT's read-back ─────────────────────────
+/// Wipe a kept plan's PMK in place (the `Drop` of `Kept`; the beacon RSN element is not a secret). Not in `link_down`: the PMK is
+/// per network and survives a link loss, it dies with the plan.
+#[cfg(feature = "wifi")]
+fn pmk_forget(k: &mut Kept) {
+    crate::wifi::assoc::zeroize_pmk(&mut k.plan.pmk);
+}
+
+/// `tests wifijoin`'s S10PMKKEEP rows (no device): a local WPA2 Kept (the pattern PMK = Annex J.4 test 2's PSK, a 22-octet RSN
+/// element) — `rejoin_begin` copies the plan out with the PMK and the element intact; `pmk_forget` zeroizes it in place; an open
+/// plan carries `rsn_len` 0. Returns the PMK read back from the copy (for `assoc::pmk_kat`), None if any row failed.
+#[cfg(feature = "wifi")]
+pub fn pmk_rows() -> Option<[u8; 32]> {
+    const P: [u8; 32] = [
+        0x0d, 0xc0, 0xd6, 0xeb, 0x90, 0x55, 0x5e, 0xd6, 0x41, 0x97, 0x56, 0xb9, 0xa1, 0x5e, 0xc3, 0xe3,
+        0x20, 0x9b, 0x63, 0xdf, 0x70, 0x7d, 0xd5, 0x08, 0xd1, 0x45, 0x81, 0xf8, 0x98, 0x27, 0x21, 0xaf,
+    ];
+    let mut rsn = [0u8; 128];
+    rsn[..22].copy_from_slice(&[0x30u8; 22]);
+    let wpa = RejoinPlan {
+        ssid: [0; 32], ssid_len: 0, bssid: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55], channel: 6, cap: 0x0001,
+        watch: rejoin_kat_judge, again: rejoin_kat_again, dhcp: rejoin_kat_dhcp, pmk: P, rsn, rsn_len: 22,
+    };
+    let open = RejoinPlan { pmk: [0; 32], rsn: [0; 128], rsn_len: 0, ..wpa };
+    let mut k = Kept { plan: wpa, r: crate::wifi::assoc::Rejoin::new() };
+    k.r.lose(1000, "beacon-loss");
+    let (p, _, _, _) = rejoin_begin(&mut k, 2000)?;
+    let got = p.pmk;
+    let kept = got == P && p.rsn_len == 22 && p.rsn[..22] == [0x30u8; 22] && open.rsn_len == 0;
+    pmk_forget(&mut k);
+    if kept && k.plan.pmk == [0u8; 32] { Some(got) } else { None }
 }
