@@ -5,6 +5,17 @@
 # abimage anywhere) run after the light tier's summary — or on a boot after the first-user boot when /boot/TESTS.HEAVY
 # says `boot2`. Edit this file (or the card's copy) to change the list; no rebuild.
 # Flight 37's list (docs/dev/evidence/rmbp-0915/flight37/FLIGHT37.md §4, §7), in the order the bench typed it.
+# ZENBOOKFLIGHTLIST (zenbook-ledger Z33): the Zenbook's own verbs, `@zenbook` only (boot::oldest().0; rmbp12, pi4 and orin count them other=), FIRST so a generic overrun cannot hide them; esp-zenbook stages this file (it re-enters esp-x86's one bootlist_stage). eclid is NOT here: it is interactive (close/open the lid), typed on the lane only.
+platform @zenbook
+ec @zenbook
+ecbattery @zenbook
+nvme @zenbook
+i8042 @zenbook
+dwi2c @zenbook
+dwi2ctp @zenbook
+dma @zenbook
+hdacensus @zenbook
+gopshot @zenbook
 kgr
 gatesteal2
 unafslock
