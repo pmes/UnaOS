@@ -3929,16 +3929,16 @@ impl XhciController {
         // covers the block layer's synchronous reads as well as the storage bring-up, both of which
         // reach the ladder. See `BOT_PARK_PASS_LADDERS` and `BOT_PARK_PASS_MS`.
         self.bot_pass_begin();
-        let mut any = false;
-        while self.drain_event_ring_once() {
-            any = true;
+        let mut any = false; let mut n = 0usize; // XHCILOANPOLLCAP (zenbook-ledger Z74): the drain is capped at POLL_DRAIN_CAP events a pass (x86: the hold under 50 µs of MMIO); the rest rides the next pass, no second ring walk
+        while n < POLL_DRAIN_CAP && self.drain_event_ring_once() {
+            any = true; n += 1;
         }
         // CCSTRIM: close the late-assert window on a boot-phase boundary rather than a wall clock.
         // Checked AFTER the drain, never before: this pass may be the one carrying the very Port
         // Status Change TRB the detector exists to report, and disarming on entry would swallow it.
         // Every connect edge latched during boot is in the ring by the time the first pass runs, so
         // one completed pass past the floor is sufficient — see CCS_LATE_ARMED.
-        if CCS_LATE_ARMED[self.xi as usize].load(Ordering::Acquire) {
+        if !poll_cap_note(self.xi as usize, n) && CCS_LATE_ARMED[self.xi as usize].load(Ordering::Acquire) { // XHCILOANPOLLCAP (Z74): a capped pass never disarms CCSTRIM (the PSC TRB may still be in the ring); the note runs first, always. LINE-NEUTRAL
             let since = crate::arch::now_cycles()
                 .wrapping_sub(CCS_SETTLE_START[self.xi as usize].load(Ordering::Relaxed))
                 / Self::cycles_per_ms();
@@ -17823,9 +17823,9 @@ pub fn poll_task_start(cpu: usize) {
 fn poll_task(_: usize) {
     loop {
         crate::arch::sched::sleep_ticks(1);
-        service_others(); if let Ok(mut x) = claim_noted() {
+        service_others(); let mut rounds = 0usize; while let Some(mut x) = poll_loan(rounds) { let c0 = poll_cap_count(); // XHCILOANPOLLCAP (zenbook-ledger Z74): controller 0 taken as a BLOCK loan (Z62's ONE take: preempt-off, published); a capped pass puts it back (the gap a masked claimant takes) and re-polls at once. LINE-NEUTRAL
             x.poll_events();
-            crate::video::lag::xhci_polled();
+            crate::video::lag::xhci_polled(); rounds += 1; if poll_cap_count() == c0 || rounds.saturating_mul(POLL_DRAIN_CAP) >= event::EVENT_RING_SIZE { break; } // XHCILOANPOLLCAP (Z74): uncapped -> sleep a tick; at most one ring's worth of capped passes a tick
         }
     }
 }
@@ -19449,5 +19449,81 @@ impl XhciController {
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = ladder;
+    }
+}
+
+// ══════════ XHCILOANPOLLCAP (zenbook-ledger Z74) — the poll drain is capped, and the poller holds controller 0 as a block loan ══════════
+//
+// TAIL-APPENDED (three LINE-NEUTRAL folds in `poll_events`, two in `poll_task`). `poll_events` drained the event ring
+// until empty — up to `EVENT_RING_SIZE` (256) events, each 8 uncached MMIO accesses in steady state (`advance_erdp`: RTSOFF
+// and IMAN reads, IMAN / USBSTS / ERDP hi / ERDP lo writes; the dispatch's re-arm: a DBOFF or MFINDEX read and a doorbell
+// write), ~1-2 ms — so xhci-poll, the most frequent controller-0 holder, stayed preemptible and a masked block claimant
+// met it with `Busy` at once (Z62's F3). A pass now stops after `POLL_DRAIN_CAP` events: ERDP is advanced after every
+// event, so the driver's dequeue pointer always names the next unconsumed TRB and the remainder is the next pass's
+// (xHCI §4.9.4). Capped, the poller's hold fits 50 µs of MMIO, so it takes controller 0 through the block layer's ONE take
+// (`block::xhci_poll_loan` -> Z62's `take_block_loan`: preempt-off, published in `BLOCK_LOAN_CPU`) and a masked claimant on
+// another CPU waits it out. The BOT pump's and `ftdi_done_late`'s own drains stay uncapped (holders' waits, not the poll
+// hold). aarch64: no cap (no publication there). Owed: XHCILOAN-POLLCAP-KAT, XHCILOAN-POLLCAP-METAL, XHCILOAN-POLLCAP-OTHERS.
+
+/// XHCILOANPOLLCAP: events one `poll_events` pass dispatches at most. 8 uncached accesses an event x 1 µs an access (the
+/// top of Z66's 0.5-1 µs: 256 events x >= 4 accesses = 0.5-1 ms) = 8 µs; floor(50 µs / 8 µs) = 6 -> 48 µs of MMIO a pass.
+#[cfg(target_arch = "x86_64")]
+const POLL_DRAIN_CAP: usize = 6;
+/// XHCILOANPOLLCAP: aarch64 drains to empty as before (no preempt-off publication, no xhci-poll task).
+#[cfg(not(target_arch = "x86_64"))]
+const POLL_DRAIN_CAP: usize = usize::MAX;
+
+/// XHCILOANPOLLCAP: capped `poll_events` passes this boot, every controller (`poll_cap=` on the PREEMPTAUDIT line).
+static POLL_CAPPED_N: AtomicU32 = AtomicU32::new(0);
+/// XHCILOANPOLLCAP: the once-line latch — 0 idle, 1 + controller index while counting that controller's remainder, 0xFF said.
+static POLL_CAP_ONCE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// XHCILOANPOLLCAP: events the passes after the first cap drained until one read the ring empty (`left=`).
+static POLL_CAP_LEFT: AtomicU32 = AtomicU32::new(0);
+
+/// XHCILOANPOLLCAP: one `poll_events` pass of controller `xi` dispatched `n` events; `true` = it was capped (events may
+/// remain). Runs under that controller's claim, so a controller's passes never interleave; the latch carries the index.
+fn poll_cap_note(xi: usize, n: usize) -> bool {
+    let capped = n >= POLL_DRAIN_CAP;
+    if capped {
+        POLL_CAPPED_N.fetch_add(1, Ordering::Relaxed);
+    }
+    let me = (xi as u8).saturating_add(1);
+    let st = POLL_CAP_ONCE.load(Ordering::Acquire);
+    if st == 0 {
+        if capped && POLL_CAP_ONCE.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            POLL_CAP_LEFT.store(0, Ordering::Relaxed);
+        }
+    } else if st == me {
+        let left = POLL_CAP_LEFT.fetch_add(n as u32, Ordering::Relaxed).wrapping_add(n as u32);
+        if !capped && POLL_CAP_ONCE.compare_exchange(me, 0xFF, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            serial_println!(
+                "[xhci] poll capped n={} left={} ctrl={} (XHCILOANPOLLCAP Z74, first cap, once)",
+                POLL_DRAIN_CAP,
+                left,
+                xi
+            );
+        }
+    }
+    capped
+}
+
+/// XHCILOANPOLLCAP: capped `poll_events` passes this boot (`poll_cap=`).
+pub fn poll_cap_count() -> u32 {
+    POLL_CAPPED_N.load(Ordering::Relaxed)
+}
+
+/// XHCILOANPOLLCAP: the xhci-poll task's take of controller 0 — the block layer's ONE take (no wait: Busy / NotReady skip
+/// the pass). A Busy on the first round is stamped for the stall line exactly as `claim_noted` did; a Busy on a re-poll
+/// round is a claimant that took the gap, unstamped.
+#[cfg(target_arch = "x86_64")]
+fn poll_loan(round: usize) -> Option<crate::drivers::block::BlockLoan> {
+    match crate::drivers::block::xhci_poll_loan() {
+        Ok(l) => Some(l),
+        Err(e) => {
+            if round == 0 && matches!(e, XhciClaimError::Busy) {
+                crate::video::lag::xhci_busy();
+            }
+            None
+        }
     }
 }

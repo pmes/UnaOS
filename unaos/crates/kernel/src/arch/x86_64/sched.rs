@@ -9565,13 +9565,13 @@ pub mod preemptoff {
         };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} loan_shed={} loan_shed_kat={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word, lw, lw_us, pp, py, ls, lk
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} loan_shed={} loan_shed_kat={} poll_cap={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word, lw, lw_us, pp, py, ls, lk, crate::drivers::xhci::poll_cap_count() // XHCILOANPOLLCAP (zenbook-ledger Z74): `poll_cap=` capped poll passes, a count
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} loan_shed={} loan_shed_kat={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} unafs_leg={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} loan_shed={} loan_shed_kat={} poll_cap={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, ul, sdhc_word,
-                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, py, ls, lk, r
+                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, py, ls, lk, crate::drivers::xhci::poll_cap_count(), r
             ),
         }
     }

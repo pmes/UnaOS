@@ -4965,3 +4965,17 @@ pub fn xhci_loan_shed_kat() -> &'static str {
     }
     "ok"
 }
+
+// ══════════ XHCILOANPOLLCAP (zenbook-ledger Z74) — the xhci-poll task is the block loan's ninth holder ══════════
+//
+// TAIL-APPENDED (no line above moves). `xhci::poll_events` now dispatches at most `POLL_DRAIN_CAP` events a pass (6 on
+// x86: 48 µs of MMIO), so the poller's hold is short and never sleeps; it takes controller 0 through Z62's ONE take
+// (`take_block_loan`: this CPU's preempt-off count, the holder published in `BLOCK_LOAN_CPU`, the shed mark armed) and
+// puts it back through `BlockLoan`'s Drop. A masked claimant on another CPU then waits a running holder out
+// (`masked_loan_wait`) instead of `Busy` why=holder-preemptible. No wait here: the poller skips a Busy pass.
+
+/// XHCILOANPOLLCAP: the xhci-poll task's take of controller 0 as a block loan — `take_block_loan`, nothing else.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_poll_loan() -> Result<BlockLoan, XhciClaimError> {
+    take_block_loan()
+}
