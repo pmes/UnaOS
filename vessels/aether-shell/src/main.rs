@@ -318,9 +318,12 @@ impl Tab {
     /// row diff when they cover most of the frame; whole on the tetra rules).
     fn blit(&mut self, damages: &[(u32, u32, u32, u32)]) {
         if self.is_active() {
-            let rects = aether::render::present_damage(&self.engine, damages, &mut self.painted);
-            let (width, height, pixels) = self.engine.present_rgba();
-            if let Some(m) = self.sent.frame_rects("viewport", width, height, pixels, Some(&rects)) {
+            // AETHERMACGPU-PRESENTRECTS / -SCROLL (SR351): the rects (and a viewport scroll's copy pair) are converted
+            // into the frame `sent` keeps, never the whole device frame; the whole frame only on the tetra rules.
+            let (rects, scroll) = aether::render::present_scroll(&self.engine, damages, &mut self.painted);
+            let (width, height) = self.engine.device_size();
+            let engine = &self.engine;
+            if let Some(m) = self.sent.present("viewport", width, height, &rects, scroll, |f, l| engine.present_rects(f, l), || engine.present_rgba()) {
                 self.bus.fire(m);
             }
         }
@@ -489,7 +492,7 @@ impl Tab {
             }
             SMessage::Facet(FacetCommand::ImageRendered { receipt_id, width, height, rgba, .. }) if receipt_id >> 56 == FACET_RECEIPT_TAG >> 56 => {
                 self.sent.forget(); // AETHERMACGPU-DAMAGE (SR320): the image replaces the face's frame; the next page blit goes whole
-                self.show(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels: rgba, damage: None });
+                self.show(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels: rgba, damage: None, scroll: None });
                 if let Some(u) = self.facet_url.take() {
                     self.show(SMessage::BrowserUrlChanged(u.clone()));
                     self.report(TabReport::Url(self.id, u));
@@ -1492,6 +1495,48 @@ mod tests {
         assert_eq!(pixels, second[y as usize * stride..(y as usize + 1) * stride]);
         assert_eq!(whole / pixels.len(), h as usize, "one row instead of {h}");
         assert!(sent.frame("viewport", w2, h2, second).is_none(), "an identical frame sends nothing");
+    }
+
+    /// AETHERMACGPU-PRESENTRECTS / -SCROLL (SR351): the shell's `Tab::blit` chain on a real engine at zoom 100 and 200: a
+    /// viewport scroll blits as the copy pair plus the band's rows only (under a quarter of the frame), converted into
+    /// the kept frame, and a receiver applying it (`tetra::surface_apply`) to the frame it held ends on `present_rgba`'s
+    /// whole new frame; a following rect blit does too.
+    #[test]
+    fn presentrects_scroll_chain_kat() {
+        let html = r#"<html><body style="margin:0"><div style="height:3000px;background:linear-gradient(red,blue)"></div>
+            <p style="position:absolute;top:30px;left:10px">scroll</p></body></html>"#;
+        for (zoom, device, dy) in [(100u32, (300u32, 200u32), -40), (200, (600, 400), -80)] {
+            let mut engine = AetherEngine::new();
+            engine.set_device_size(device.0, device.1);
+            engine.set_zoom_pct(zoom);
+            engine.load_html("file:///page/index.html", html, true);
+            let damages = engine.render_frame();
+            let mut sent = quartzite::tetra::SurfaceDamage::default();
+            let mut painted = aether::render::PresentMark::default();
+            let mut blit = |engine: &AetherEngine, damages: &[(u32, u32, u32, u32)]| {
+                let (rects, scroll) = aether::render::present_scroll(engine, damages, &mut painted);
+                let (w, h) = engine.device_size();
+                sent.present("viewport", w, h, &rects, scroll, |f, l| engine.present_rects(f, l), || engine.present_rgba())
+            };
+            let Some(SMessage::SurfaceBlit { damage: None, pixels, .. }) = blit(&engine, &damages) else { panic!("first blit whole") };
+            let mut rx = pixels;
+            engine.handle_event(aether::api::events::Event::Scroll(0.0, 40.0));
+            let damages = engine.render_frame();
+            let Some(SMessage::SurfaceBlit { damage: Some(list), pixels, scroll, width, height, .. }) = blit(&engine, &damages) else {
+                panic!("zoom {zoom}: a scroll blit")
+            };
+            assert_eq!(scroll, Some((0, dy)), "zoom {zoom}: the pair");
+            assert!(pixels.len() * 4 < rx.len(), "zoom {zoom}: the band, not the frame ({} of {})", pixels.len(), rx.len());
+            assert!(quartzite::tetra::surface_apply(&mut rx, width, height, &list, &pixels, scroll));
+            assert_eq!(rx, engine.present_rgba().2, "zoom {zoom}: the receiver's frame is the new frame");
+            engine.damage_rects.push((20, 20, 10, 10));
+            let damages = engine.render_frame();
+            let Some(SMessage::SurfaceBlit { damage: Some(list), pixels, scroll: None, width, height, .. }) = blit(&engine, &damages) else {
+                panic!("zoom {zoom}: a rect blit")
+            };
+            assert!(quartzite::tetra::surface_apply(&mut rx, width, height, &list, &pixels, None));
+            assert_eq!(rx, engine.present_rgba().2, "zoom {zoom}: still the frame");
+        }
     }
 }
 

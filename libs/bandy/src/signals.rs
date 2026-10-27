@@ -151,8 +151,8 @@ pub enum SMessage {
     /// (LEDGER SR320) / AETHERMACGPU-ENGINEDAMAGE (SR341): `damage = Some(rects)` says `pixels` carries ONLY those rects'
     /// rows (each rect's `h * w * 4` bytes, stride `w * 4`, concatenated in list order) of a `width x height` frame the
     /// receiver already holds; `None` (omitted from the wire, so a whole frame keeps its frozen shape, smessage_kats) is the
-    /// whole frame. A sender sends a whole frame at least every [`SURFACE_FULL_EVERY`] blits and on [`SMessage::SurfaceResend`].
-    SurfaceBlit { url: String, width: u32, height: u32, pixels: Vec<u8>, #[serde(default, skip_serializing_if = "Option::is_none")] damage: Option<Vec<(u32, u32, u32, u32)>> },
+    /// whole frame. A sender sends a whole frame at least every [`SURFACE_FULL_EVERY`] blits and on [`SMessage::SurfaceResend`]. AETHERMACGPU-SCROLL (SR351): `scroll: Some((dx, dy))` on a damage blit moves the kept frame's pixels by (dx, dy) BEFORE the rects' rows land (None omitted: the wire unchanged).
+    SurfaceBlit { url: String, width: u32, height: u32, pixels: Vec<u8>, #[serde(default, skip_serializing_if = "Option::is_none")] damage: Option<Vec<(u32, u32, u32, u32)>>, #[serde(default, skip_serializing_if = "Option::is_none")] scroll: Option<(i32, i32)> },
     /// AETHERMACGPU-ENGINEDAMAGE (SR341): face -> sender: the face's kept frame of surface `url` is unknown (it lagged on the
     /// bus); the sender's next blit of it goes whole.
     SurfaceResend { url: String },

@@ -420,11 +420,11 @@ impl SurfaceDamage {
             Some(Some(list)) => {
                 let rows = crate::damage::cut(&pixels, width, &list);
                 self.since_full += 1;
-                bandy::SMessage::SurfaceBlit { url: url.to_string(), width, height, pixels: rows, damage: Some(list) }
+                bandy::SMessage::SurfaceBlit { url: url.to_string(), width, height, pixels: rows, damage: Some(list), scroll: None }
             }
             None => {
                 self.since_full = 0;
-                bandy::SMessage::SurfaceBlit { url: url.to_string(), width, height, pixels: pixels.clone(), damage: None }
+                bandy::SMessage::SurfaceBlit { url: url.to_string(), width, height, pixels: pixels.clone(), damage: None, scroll: None }
             }
         };
         self.dims = (width, height);
@@ -684,5 +684,166 @@ mod surface_map_tests {
         });
         assert_eq!(got, (1, 2, 0, (1, 0)));
         assert_eq!(surface_number("editor"), 0, "the scope is restored");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// AETHERMACGPU-PRESENTRECTS / -SCROLL (LEDGER SR351): the kept frame converted in place; the scroll copy-rect
+// ---------------------------------------------------------------------------------------------------------------------
+
+type Rect = crate::damage::Rect;
+
+impl SurfaceDamage {
+    /// [`SurfaceDamage::frame_rects`] for a painter that converts IN PLACE into the frame kept here (the frame last sent,
+    /// identical to the receiver's: the ONE persistent copy). When this blit can carry rects (same size, not due whole,
+    /// `damage::merge(rects)` gives a list), the kept frame is moved by `scroll` (`damage::scroll`), `convert(kept, list)`
+    /// writes ONLY the merged list's pixels into it, and the blit carries the list cut from it plus `scroll`; no whole frame
+    /// is made. Otherwise, or when `convert` refuses (it returns `false` before writing anything), `whole()` makes the frame
+    /// and [`SurfaceDamage::frame_rects`] decides as before (the kept frame forgotten first when it was already moved).
+    #[allow(clippy::too_many_arguments)]
+    pub fn present(
+        &mut self,
+        url: &str,
+        width: u32,
+        height: u32,
+        rects: &[Rect],
+        scroll: Option<(i32, i32)>,
+        convert: impl FnOnce(&mut [u8], &[Rect]) -> bool,
+        whole: impl FnOnce() -> (u32, u32, Vec<u8>),
+    ) -> Option<bandy::SMessage> {
+        let fast = self.dims == (width, height)
+            && self.since_full + 1 < bandy::SURFACE_FULL_EVERY
+            && self.prev.len() == width as usize * height as usize * 4;
+        if let Some(list) = crate::damage::merge(rects, width, height).filter(|_| fast) {
+            if list.is_empty() && scroll.is_none() {
+                return None;
+            }
+            let moved = match scroll {
+                Some(s) => crate::damage::scroll(&mut self.prev, width, height, s),
+                None => true,
+            };
+            if moved && convert(&mut self.prev, &list) {
+                self.since_full += 1;
+                let rows = crate::damage::cut(&self.prev, width, &list);
+                return Some(bandy::SMessage::SurfaceBlit { url: url.to_string(), width, height, pixels: rows, damage: Some(list), scroll });
+            }
+            if scroll.is_some() {
+                self.forget();
+            }
+        }
+        let (w, h, pixels) = whole();
+        self.frame_rects(url, w, h, pixels, Some(rects))
+    }
+}
+
+/// AETHERMACGPU-SCROLL (SR351): a damage blit applied to the `width x height` frame a receiver keeps (4-byte pixels, RGBA
+/// or cairo ARgb32 alike: `rows` in the kept frame's format): the copy-rect first (`damage::scroll` by `scroll`), then each
+/// rect's rows (`damage::spans`, [`surface_splice`]). Everything is checked before anything is written: `false`, and
+/// `kept` untouched, when the rects do not fit, `rows` is not their length, `kept` is not the frame or the scroll leaves
+/// it (the receiver drops the blit; the sender's next whole frame repairs it). The receivers' ONE apply (GTK `image_view`,
+/// AppKit `image_view::set_damage`).
+pub fn surface_apply(kept: &mut [u8], width: u32, height: u32, rects: &[Rect], rows: &[u8], scroll: Option<(i32, i32)>) -> bool {
+    let Some(spans) = crate::damage::spans(rects, width, height, rows.len()) else {
+        return false;
+    };
+    let fits = |s: (i32, i32)| (s.0.unsigned_abs() as u64) < width as u64 && (s.1.unsigned_abs() as u64) < height as u64;
+    if kept.len() != width as usize * height as usize * 4 || !scroll.is_none_or(fits) {
+        return false;
+    }
+    if let Some(s) = scroll {
+        crate::damage::scroll(kept, width, height, s);
+    }
+    spans.into_iter().all(|(r, range)| surface_splice(kept, width, height, r, &rows[range]))
+}
+
+#[cfg(test)]
+mod surface_present_tests {
+    use super::{SurfaceDamage, surface_apply};
+    use bandy::SMessage;
+
+    /// A frame of `w x h` whose pixel (x, y) is `f(x, y)` in every byte.
+    fn frame(w: u32, h: u32, f: impl Fn(u32, u32) -> u8) -> Vec<u8> {
+        (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).flat_map(|(x, y)| [f(x, y); 4]).collect()
+    }
+
+    /// The receivers' apply: scroll then the rects equals the reference; a misfit (rects, length, scroll, frame) refuses
+    /// with the kept frame untouched.
+    #[test]
+    fn surface_apply_kat() {
+        let (w, h) = (4u32, 4u32);
+        let old = frame(w, h, |x, y| (y * 10 + x) as u8);
+        // The page scrolled down one row: rows 1..4 move up, row 3 is the new band (value 99).
+        let want = frame(w, h, |x, y| if y == 3 { 99 } else { ((y + 1) * 10 + x) as u8 });
+        let mut kept = old.clone();
+        assert!(surface_apply(&mut kept, w, h, &[(0, 3, 4, 1)], &[99u8; 16], Some((0, -1))));
+        assert_eq!(kept, want);
+        let mut kept = old.clone();
+        assert!(surface_apply(&mut kept, w, h, &[(1, 1, 1, 1)], &[7u8; 4], None));
+        assert_eq!(kept, frame(w, h, |x, y| if (x, y) == (1, 1) { 7 } else { (y * 10 + x) as u8 }));
+        for (rects, rows, scroll) in [
+            (vec![(0, 3, 4, 2)], vec![0u8; 32], Some((0, -1))),
+            (vec![(0, 3, 4, 1)], vec![0u8; 12], Some((0, -1))),
+            (vec![(0, 3, 4, 1)], vec![0u8; 16], Some((0, -4))),
+            (vec![(0, 3, 4, 1)], vec![0u8; 16], Some((4, 0))),
+        ] {
+            let mut kept = old.clone();
+            assert!(!surface_apply(&mut kept, w, h, &rects, &rows, scroll), "{rects:?} {scroll:?}");
+            assert_eq!(kept, old);
+        }
+        assert!(!surface_apply(&mut vec![0u8; 8], w, h, &[], &[], Some((0, 1))), "not the frame");
+    }
+
+    /// The sender converts only the merged list into its kept frame and the blit carries those rows (and the scroll); the
+    /// receiver ends on the painter's frame; a refusal or a whole-frame rule makes the whole frame.
+    #[test]
+    fn surface_damage_present_kat() {
+        let (w, h) = (8u32, 8u32);
+        let painter = |y0: u32| frame(w, h, move |x, y| ((y + y0) * 8 + x) as u8); // the page scrolled to row y0
+        let mut tx = SurfaceDamage::default();
+        let first = tx.present("viewport", w, h, &[(0, 0, 8, 8)], None, |_, _| panic!("no kept frame yet"), || (w, h, painter(0)));
+        let Some(SMessage::SurfaceBlit { damage: None, pixels, scroll: None, .. }) = first else { panic!("the first send is whole") };
+        let mut rx = pixels;
+        // One rect: only its pixels are converted (the closure sees the merged list and the kept frame).
+        let mut seen = Vec::new();
+        let m = tx.present("viewport", w, h, &[(2, 2, 1, 1)], None, |kept, list| {
+            seen = list.to_vec();
+            kept[(2 * 8 + 2) * 4..(2 * 8 + 2) * 4 + 4].copy_from_slice(&[200; 4]);
+            true
+        }, || panic!("no whole frame"));
+        assert_eq!(seen, vec![(2, 2, 1, 1)]);
+        let Some(SMessage::SurfaceBlit { damage: Some(list), pixels, scroll: None, .. }) = m else { panic!("a rect blit") };
+        assert_eq!((list.clone(), pixels.clone()), (vec![(2, 2, 1, 1)], vec![200; 4]));
+        assert!(surface_apply(&mut rx, w, h, &list, &pixels, None));
+        let mut expect = painter(0);
+        expect[(2 * 8 + 2) * 4..(2 * 8 + 2) * 4 + 4].copy_from_slice(&[200; 4]);
+        assert_eq!(rx, expect);
+        // A scroll of two rows: the kept frame moves, the band (rows 6..8) is converted, the wire carries the pair.
+        let next = painter(2);
+        let m = tx.present("viewport", w, h, &[(0, 6, 8, 2)], Some((0, -2)), |kept, list| {
+            for &(x, y, rw, rh) in list {
+                for yy in y..y + rh {
+                    let a = ((yy * w + x) * 4) as usize;
+                    kept[a..a + (rw * 4) as usize].copy_from_slice(&next[a..a + (rw * 4) as usize]);
+                }
+            }
+            true
+        }, || panic!("no whole frame"));
+        let Some(SMessage::SurfaceBlit { damage: Some(list), pixels, scroll: Some((0, -2)), .. }) = m else { panic!("a scroll blit") };
+        assert_eq!((list.clone(), pixels.len()), (vec![(0, 6, 8, 2)], 2 * 8 * 4));
+        assert!(surface_apply(&mut rx, w, h, &list, &pixels, Some((0, -2))));
+        let mut want = next.clone();
+        let a = ((2 * 8 + 2 - 2 * 8) * 4) as usize; // the rect painted at row 2 moved to row 0
+        want[a..a + 4].copy_from_slice(&[200; 4]);
+        assert_eq!(rx, want);
+        // A refusal without a scroll: the whole frame through frame_rects (rects, cut from the whole frame).
+        let m = tx.present("viewport", w, h, &[(1, 1, 1, 1)], None, |_, _| false, || (w, h, next.clone()));
+        assert!(matches!(m, Some(SMessage::SurfaceBlit { damage: Some(ref l), scroll: None, .. }) if *l == vec![(1, 1, 1, 1)]));
+        // A refusal after the scroll moved the kept frame: forgotten, whole.
+        let m = tx.present("viewport", w, h, &[(0, 7, 8, 1)], Some((0, -1)), |_, _| false, || (w, h, painter(3)));
+        assert!(matches!(m, Some(SMessage::SurfaceBlit { damage: None, scroll: None, .. })), "moved then refused: whole");
+        // Nothing painted, no scroll: nothing sent; most of the frame: the whole-frame path decides.
+        assert!(tx.present("viewport", w, h, &[], None, |_, _| panic!("nothing to convert"), || panic!("no frame")).is_none());
+        let m = tx.present("viewport", w, h, &[(0, 0, 8, 8)], None, |_, _| panic!("merge goes whole"), || (w, h, painter(4)));
+        assert!(matches!(m, Some(SMessage::SurfaceBlit { scroll: None, .. })));
     }
 }

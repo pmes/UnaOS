@@ -125,7 +125,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
     gtk4::glib::spawn_future_local(async move {
         loop {
             match rx.recv().await {
-                Ok(SMessage::SurfaceBlit { url, width, height, pixels, damage }) if url == target_id => {
+                Ok(SMessage::SurfaceBlit { url, width, height, pixels, damage, scroll }) if url == target_id => {
                     // NLE2ORDER (SR227): the Surface takes RGBA (tetra's contract); converted ONCE here to cairo's ARgb32.
                     match damage {
                         None => {
@@ -135,13 +135,12 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
                         // AETHERMACGPU-DAMAGE (SR320) / -ENGINEDAMAGE (SR341): only the rects' rows are converted and
                         // spliced into the kept frame (`damage::spans`, one range per rect); a frame of another size or a
                         // rect list that does not fit drops the blit (the sender's next whole frame repairs it).
+                        // AETHERMACGPU-SCROLL (SR351): the scroll copy first, then the rects, through the ONE
+                        // `tetra::surface_apply` (the rows converted once: `surface_argb32` is per pixel).
                         Some(rects) => {
                             let same = *dim.borrow() == (width, height);
-                            let Some(spans) = crate::damage::spans(&rects, width, height, pixels.len()).filter(|_| same) else {
-                                continue;
-                            };
                             let mut kept = buffer.borrow_mut();
-                            if !spans.into_iter().all(|(r, range)| crate::tetra::surface_splice(&mut kept, width, height, r, &crate::tetra::surface_argb32(&pixels[range]))) {
+                            if !same || !crate::tetra::surface_apply(&mut kept, width, height, &rects, &crate::tetra::surface_argb32(&pixels), scroll) {
                                 continue;
                             }
                         }

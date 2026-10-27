@@ -1656,38 +1656,16 @@ impl AetherEngine {
         let (sw, sh) = (self.width as usize, self.height as usize);
         let (dw, dh) = (self.device.0 as usize, self.device.1 as usize);
         let src = &self.surface;
-        if (sw, sh) == (dw, dh) || sw == 0 || sh == 0 || src.len() < sw * sh * 4 {
+        if sw == 0 || sh == 0 || src.len() < sw * sh * 4 {
             let mut px = src.to_vec();
             for p in px.chunks_exact_mut(4) {
                 p.swap(0, 2);
             }
             return (self.width, self.height, px);
         }
+        // AETHERMACGPU-PRESENTRECTS (SR351): the whole device frame through the ONE per-rect conversion.
         let mut out = vec![0u8; dw * dh * 4];
-        let (rx, ry) = (sw as f64 / dw as f64, sh as f64 / dh as f64);
-        for y in 0..dh {
-            let fy = ((y as f64 + 0.5) * ry - 0.5).clamp(0.0, (sh - 1) as f64);
-            let (y0, ty) = (fy.floor() as usize, fy - fy.floor());
-            let y1 = (y0 + 1).min(sh - 1);
-            for x in 0..dw {
-                let fx = ((x as f64 + 0.5) * rx - 0.5).clamp(0.0, (sw - 1) as f64);
-                let (x0, tx) = (fx.floor() as usize, fx - fx.floor());
-                let x1 = (x0 + 1).min(sw - 1);
-                let o = (y * dw + x) * 4;
-                for c in 0..4 {
-                    let at = |xx: usize, yy: usize| src[(yy * sw + xx) * 4 + c] as f64;
-                    let top = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
-                    let bot = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
-                    // BGRA → RGBA on the way out.
-                    let dc = match c {
-                        0 => 2,
-                        2 => 0,
-                        k => k,
-                    };
-                    out[o + dc] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
-                }
-            }
-        }
+        present_rect(src, (sw, sh), &mut out, (dw, dh), (0, 0, self.device.0, self.device.1));
         (self.device.0, self.device.1, out)
     }
 
@@ -2615,4 +2593,73 @@ impl AetherEngine {
 fn retargeted(n: &crate::dom::NodeRef) -> crate::dom::NodeRef {
     let r = js::toplayer::retarget(n.id().0);
     if r == n.id().0 { n.clone() } else { n.node_at(html_core::NodeId(r)) }
+}
+
+// =================================================================================================
+// AETHERMACGPU-PRESENTRECTS (LEDGER SR351): the presented frame converted per rect.
+// =================================================================================================
+
+impl AetherEngine {
+    /// The frame [`Self::present_rgba`] makes, written ONLY at `rects` (device px) into `frame`, the `device` frame the
+    /// caller keeps (quartzite `tetra::SurfaceDamage`'s kept frame, identical to the face's): the rects' pixels are
+    /// byte-identical to the whole frame's, every other byte of `frame` is untouched. `false`, before any write, for a
+    /// PDF (its frame is `pdf::PdfDocument::present`, not the surface), a degenerate surface or a frame of another size.
+    pub fn present_rects(&self, frame: &mut [u8], rects: &[(u32, u32, u32, u32)]) -> bool {
+        let (sw, sh) = (self.width as usize, self.height as usize);
+        let (dw, dh) = (self.device.0 as usize, self.device.1 as usize);
+        if self.pdf.is_some() || sw == 0 || sh == 0 || self.surface.len() < sw * sh * 4 || frame.len() != dw * dh * 4 {
+            return false;
+        }
+        for &r in rects {
+            present_rect(&self.surface, (sw, sh), frame, (dw, dh), r);
+        }
+        true
+    }
+}
+
+/// The ONE conversion of the presented frame (AETHERMACGPU-PRESENTRECTS, SR351): the device pixels of `rect` (clipped to
+/// the `dw x dh` device) of the BGRA `sw x sh` CSS surface `src`, written as RGBA into `out` (stride `dw * 4`): the
+/// channels swapped when the sizes match, else resampled bilinearly (a device pixel reads its 2x2 CSS footprint), each
+/// pixel's arithmetic independent of the rect, so a rect equals the same pixels of the whole frame.
+fn present_rect(src: &[u8], (sw, sh): (usize, usize), out: &mut [u8], (dw, dh): (usize, usize), rect: (u32, u32, u32, u32)) {
+    let (x0, y0) = (rect.0 as usize, rect.1 as usize);
+    let x1 = (x0 + rect.2 as usize).min(dw);
+    let y1 = (y0 + rect.3 as usize).min(dh);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    if (sw, sh) == (dw, dh) {
+        for y in y0..y1 {
+            let row = (y * dw + x0) * 4..(y * dw + x1) * 4;
+            out[row.clone()].copy_from_slice(&src[row.clone()]);
+            for p in out[row].chunks_exact_mut(4) {
+                p.swap(0, 2);
+            }
+        }
+        return;
+    }
+    let (rx, ry) = (sw as f64 / dw as f64, sh as f64 / dh as f64);
+    for y in y0..y1 {
+        let fy = ((y as f64 + 0.5) * ry - 0.5).clamp(0.0, (sh - 1) as f64);
+        let (sy0, ty) = (fy.floor() as usize, fy - fy.floor());
+        let sy1 = (sy0 + 1).min(sh - 1);
+        for x in x0..x1 {
+            let fx = ((x as f64 + 0.5) * rx - 0.5).clamp(0.0, (sw - 1) as f64);
+            let (sx0, tx) = (fx.floor() as usize, fx - fx.floor());
+            let sx1 = (sx0 + 1).min(sw - 1);
+            let o = (y * dw + x) * 4;
+            for c in 0..4 {
+                let at = |xx: usize, yy: usize| src[(yy * sw + xx) * 4 + c] as f64;
+                let top = at(sx0, sy0) * (1.0 - tx) + at(sx1, sy0) * tx;
+                let bot = at(sx0, sy1) * (1.0 - tx) + at(sx1, sy1) * tx;
+                // BGRA → RGBA on the way out.
+                let dc = match c {
+                    0 => 2,
+                    2 => 0,
+                    k => k,
+                };
+                out[o + dc] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
 }

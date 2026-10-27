@@ -417,7 +417,7 @@ impl FacetImageView {
             );
             return;
         }
-        if super::gpu_view::page_frame(self, rgba, width, height) { *self.ivars().size.borrow_mut() = (width, height); return; } // AETHERMACGPU (SR309): the Metal page takes the blit (size kept for the event mapping)
+        if super::gpu_view::page_frame(self, rgba, width, height) { *self.ivars().size.borrow_mut() = (width, height); *self.ivars().rgba.borrow_mut() = rgba[..expected].to_vec(); return; } // AETHERMACGPU (SR309): the Metal page takes the blit (size kept for the event mapping)
 
         let bytes_per_row = width as usize * 4;
         let rep: Retained<NSBitmapImageRep> = unsafe {
@@ -918,7 +918,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                         bound.get(mtm).set_page_cursor(&name);
                     });
                 }
-                Ok(bandy::SMessage::SurfaceBlit { url, width, height, pixels, damage }) => {
+                Ok(bandy::SMessage::SurfaceBlit { url, width, height, pixels, damage, scroll }) => {
                     if url == target_id {
                         let bound = bound.clone();
                         dispatch2::DispatchQueue::main().exec_async(move || {
@@ -926,7 +926,7 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                             match damage {
                                 None => bound.get(mtm).set_frame(&pixels, &[], width, height),
                                 // AETHERMACGPU-DAMAGE (SR320) / -ENGINEDAMAGE (SR341): the rects' rows only.
-                                Some(rects) => bound.get(mtm).set_damage(&pixels, width, height, &rects),
+                                Some(rects) => bound.get(mtm).set_damage(&pixels, width, height, &rects, scroll),
                             }
                         });
                     }
@@ -959,26 +959,27 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
 // AETHERMACGPU-DAMAGE (LEDGER SR320) / -ENGINEDAMAGE (SR341): a damage blit (`SurfaceBlit { damage: Some(rects) }`,
 // `pixels` = the rects' rows in list order).
 impl FacetImageView {
-    /// The Metal page takes the rects into its texture (`gpu_view::page_damage`); otherwise each rect's rows
-    /// (`damage::spans`) are spliced into the kept frame (`ivars.rgba`, through `tetra::surface_splice`) and that frame is
-    /// shown once through `set_frame`. A kept frame of another size, or rects that do not fit, drop the blit (the sender's
-    /// next whole frame repairs it). Main thread only.
-    pub fn set_damage(&self, rows: &[u8], width: u32, height: u32, rects: &[(u32, u32, u32, u32)]) {
-        if super::gpu_view::page_damage(self, rows, width, height, rects) {
+    /// AETHERMACGPU-SCROLL (SR351): the kept frame (`ivars.rgba`, current on the Metal path too: `set_frame` stores it)
+    /// takes the blit through the ONE `tetra::surface_apply` (the `scroll` copy, then each rect's rows). Without a scroll
+    /// the Metal page takes the rects into its texture (`gpu_view::page_damage`); with one every pixel moved, so the kept
+    /// frame goes up whole through `gpu_view::page_frame` (the one `replace_rect`); the CPU page shows the kept frame
+    /// through `set_frame`. A kept frame of another size, or a blit that does not fit, drops it (the sender's next whole
+    /// frame repairs it). Main thread only.
+    pub fn set_damage(&self, rows: &[u8], width: u32, height: u32, rects: &[(u32, u32, u32, u32)], scroll: Option<(i32, i32)>) {
+        let applied = {
+            let mut kept = self.ivars().rgba.borrow_mut();
+            *self.ivars().size.borrow() == (width, height) && crate::tetra::surface_apply(&mut kept, width, height, rects, rows, scroll)
+        };
+        if scroll.is_none() && super::gpu_view::page_damage(self, rows, width, height, rects) {
             return;
         }
-        let Some(spans) = crate::damage::spans(rects, width, height, rows.len()) else {
+        if !applied {
             return;
-        };
-        let kept = {
-            let mut kept = self.ivars().rgba.borrow_mut();
-            if *self.ivars().size.borrow() != (width, height)
-                || !spans.into_iter().all(|(r, range)| crate::tetra::surface_splice(&mut kept, width, height, r, &rows[range]))
-            {
-                return;
-            }
-            kept.clone()
-        };
+        }
+        let kept = self.ivars().rgba.borrow().clone();
+        if scroll.is_some() && super::gpu_view::page_frame(self, &kept, width, height) {
+            return;
+        }
         self.set_frame(&kept, &[], width, height);
     }
 }
