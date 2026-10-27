@@ -26,7 +26,7 @@
 //!     applied only when the caller asks ([`crate::Image::apply_orientation`]).
 //!
 //! NOT decoded (refused by name): arithmetic coding (SOF9..11, SOF13..15), lossless (SOF3, SOF7, SOF11,
-//! SOF15), hierarchical (SOF5..7, DHP/EXP), 12-bit precision, DNL-defined height. No ICC profile is
+//! SOF15), hierarchical (SOF5..7, DHP/EXP), 12-bit precision, DNL-defined height. An ICC profile (APP2 ICC_PROFILE) is surfaced as `Image::icc`, never
 //! applied. A truncated scan is refused rather than shown partially.
 
 use alloc::vec;
@@ -290,7 +290,7 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
     let mut restart = 0usize;
     let mut adobe: Option<u8> = None;
     let mut jfif = false;
-    let mut orientation = 1u8;
+    let mut orientation = 1u8; let mut icc: Vec<(u8, Vec<u8>)> = Vec::new();
     let mut pos = 2usize;
     let mut eoi = false;
 
@@ -404,13 +404,13 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
                 pos = decode_scan(data, pos, seg, f, &dc_tabs, &ac_tabs, restart)?;
             }
             0xDC => return Err(Error::Unsupported("jpeg DNL")),
-            _ => {} // APPn, COM, JPGn: skipped.
+            0xE2 => icc_part(&mut icc, seg), _ => {} // APPn, COM, JPGn: skipped.
         }
     }
     let _ = eoi; // a missing EOI is tolerated once every scan has been read.
     let f = frame.ok_or(Error::Malformed("no SOF"))?;
     let mut img = reconstruct(&f, &qt, adobe, jfif)?;
-    img.orientation = orientation;
+    img.orientation = orientation; img.icc = icc_join(icc);
     Ok(img)
 }
 
@@ -1124,4 +1124,22 @@ mod tests {
         assert_eq!((max, moved), (1, 102), "of {} pixels", w * h);
         assert_eq!((&fancy[12..15], &bil[12..15]), (&[182u8, 6, 0][..], &[183u8, 5, 0][..]), "row 0 col 3");
     }
+}
+
+/// PDFICC (SR358): one APP2 `ICC_PROFILE\0` segment (ICC.1 Annex B.4: the tag, a 1-based sequence number, the chunk
+/// count, the chunk) kept with its sequence number; any other APP2 is skipped.
+fn icc_part(icc: &mut Vec<(u8, Vec<u8>)>, seg: &[u8]) {
+    if seg.len() > 14 && seg.starts_with(b"ICC_PROFILE\0") && icc.iter().map(|c| c.1.len()).sum::<usize>() + seg.len() <= crate::ICC_MAX {
+        icc.push((seg[12], seg[14..].to_vec()));
+    }
+}
+
+/// PDFICC (SR358): the APP2 chunks joined in sequence-number order (writers emit them in order; a reader must not rely
+/// on it), or None when the file carries none.
+fn icc_join(mut icc: Vec<(u8, Vec<u8>)>) -> Option<Vec<u8>> {
+    if icc.is_empty() {
+        return None;
+    }
+    icc.sort_by_key(|c| c.0);
+    Some(icc.into_iter().flat_map(|c| c.1).collect())
 }

@@ -7,7 +7,7 @@
 //! stencils (painted later in the fill colour); /SMask as alpha. CCITTFax and JBIG2 decode to 1-bit rows through
 //! `filters::bilevel` and take the stencil or bpc-1 sample path (PDFFAX SR331; a feature their decoders refuse is
 //! refused by its name). JPXDecode goes through `filters::jpx` (PDFJPX SR335) to 8-bit samples mapped here by `raw`
-//! (§8.9.5: /ColorSpace wins, else the codestream's; /Decode ignored; /SMaskInData's channel as alpha). Explicit and
+//! (§8.9.5: /ColorSpace wins, else the codestream's ICC profile or space; /Decode ignored; /SMaskInData's channel as alpha). Explicit and
 //! colour-key /Mask and /Matte are owed (PDF-IMGMASK).
 
 use alloc::vec;
@@ -219,11 +219,11 @@ fn jpx_pix(data: &[u8], d: &Dict, res: &Dict, doc: &Document) -> Result<Pixmap, 
     let get = |k: &[u8]| d.get(k).map(|o| doc.get(o));
     let cs = match get(b"ColorSpace") {
         Some(o) => ColourSpace::parse(&o, res, doc).ok_or("JPXDecode")?,
-        None => match (img.space, img.comps) {
+        None => img.icc.as_deref().and_then(|p| super::colour::icc_space(p, None)).unwrap_or(match (img.space, img.comps) {
             (Space::Gray, _) | (Space::Unknown, 1 | 2) => ColourSpace::Gray,
             (Space::Rgb, _) | (Space::Unknown, 3) => ColourSpace::Rgb,
             _ => ColourSpace::Cmyk,
-        },
+        }),
     };
     let n = cs.n();
     if n == 0 || img.comps < n {

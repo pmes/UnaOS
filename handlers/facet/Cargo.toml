@@ -24,6 +24,9 @@ pixel_core = { path = "../../unaos/libs/media/pixel_core" }
 # hevc_core). GNEISSPAL-NOSTD (SR308): gneiss_pal's `api` + `forge` are gated on `std`, so Facet takes
 # `default-features = false` and links dsp only — no http_core / tokio through gneiss_pal (HEVCHEIC's option A undone).
 gneiss_pal = { path = "../../libs/gneiss_pal", default-features = false, features = ["hevc", "av1"] }
+# PDFICC (LEDGER SR358): an image's embedded ICC profile (pixel_core `Image::icc`) converts to sRGB at open through icc_core,
+# Facet's ONE ICC engine (no_std, its one dep libm).
+icc_core = { path = "../../unaos/libs/media/icc_core" }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }

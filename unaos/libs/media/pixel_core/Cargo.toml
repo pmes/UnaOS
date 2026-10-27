@@ -33,3 +33,5 @@ svg-std = ["svg", "svg_core/std"]
 # tests compare pixel-for-pixel. It never reaches the library — a dev-dependency is not linked into it.
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png", "gif", "bmp", "qoi", "webp", "jpeg"] }
+# PDFICC (SR358): icc_core's `kat` profile writers for tests/icc_kat.rs — a dev-dependency only: the library never links icc_core.
+icc_core = { path = "../icc_core" }

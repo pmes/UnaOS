@@ -96,14 +96,14 @@ pub fn decode_heif(bytes: &[u8]) -> Result<Image, Error> {
                 (w, ht, rgba) = (cw, ch, out);
             }
             Transform::Irot(a) => {
-                let mut img = Image { width: w, height: ht, rgba, frames: None, loop_count: None, orientation: [1, 8, 3, 6][a as usize & 3] };
+                let mut img = Image { width: w, height: ht, rgba, frames: None, loop_count: None, orientation: [1, 8, 3, 6][a as usize & 3], icc: None };
                 img.apply_orientation();
                 (w, ht, rgba) = (img.width, img.height, img.rgba);
             }
             Transform::Imir(_) => return Err(Error::Unsupported("heif: imir mirroring (owed)")),
         }
     }
-    Ok(Image { width: w, height: ht, rgba, frames: None, loop_count: None, orientation: 1 })
+    Ok(Image { width: w, height: ht, rgba, frames: None, loop_count: None, orientation: 1, icc: None })
 }
 
 /// HEIFONE (SR303): one coded image item to straight RGBA through its codec's core — the per-codec tile fn

@@ -60,6 +60,7 @@ dependencies = [
  "gneiss_pal",
  "html_core",
  "http_core",
+ "icc_core",
  "image",
  "js_core",
  "kvstore_core",
@@ -1505,6 +1506,7 @@ version = "0.1.0"
 dependencies = [
  "bandy",
  "gneiss_pal",
+ "icc_core",
  "image",
  "log",
  "pixel_core",
@@ -2349,6 +2351,13 @@ dependencies = [
 [[package]]
 name = "ibus"
 version = "0.1.0"
+
+[[package]]
+name = "icc_core"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "ignore"
@@ -3507,6 +3516,7 @@ version = "0.1.0"
 dependencies = [
  "crypto_core",
  "font_core",
+ "icc_core",
  "pixel_core",
  "svg_core",
  "tls_core",
@@ -3555,6 +3565,7 @@ dependencies = [
 name = "pixel_core"
 version = "0.1.0"
 dependencies = [
+ "icc_core",
  "image",
  "raw_core",
  "svg_core",

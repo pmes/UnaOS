@@ -94,7 +94,7 @@ pub fn decode_raster(bytes: &[u8]) -> Option<image::RgbaImage> {
     {
         match gneiss_pal::dsp::image::decode(bytes) {
             Ok(mut img) => {
-                img.apply_orientation();
+                img.apply_orientation(); icc_to_srgb(&mut img);
                 return image::RgbaImage::from_raw(img.width, img.height, img.rgba);
             }
             Err(e) if gneiss_pal::dsp::image::sniff(bytes) == Some(gneiss_pal::dsp::image::Format::WebP) => {
@@ -582,5 +582,17 @@ mod avif_kat_tests {
         }
         let g = super::decode_raster(&grid_2x2_avif()).expect("an AVIF grid decodes");
         assert_eq!((g.width(), g.height()), (7, 6));
+    }
+}
+
+/// PDFICC (SR358): a tagged raster converts to sRGB as browsers convert it (no CSS `color-profile`: owed) — the decoded
+/// first frame through icc_core's ONE entry; an sRGB profile changes nothing, and a refused one is ledgered and the
+/// pixels kept as decoded.
+#[cfg(feature = "pixel-core")]
+fn icc_to_srgb(img: &mut gneiss_pal::dsp::image::Image) {
+    if let Some(p) = img.icc.take() {
+        if let Err(e) = icc_core::apply_icc_to_srgb(&p, &mut img.rgba) {
+            crate::ledger::record_dom(&format!("img-icc-refused:{e}"));
+        }
     }
 }
