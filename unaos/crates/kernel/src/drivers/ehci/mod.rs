@@ -19173,7 +19173,7 @@ pub fn hid_task_start(cpu: usize) {
 fn hid_task(_: usize) {
     loop {
         crate::arch::sched::sleep_ticks(1);
-        service_ehci_hid();
+        crate::hidstall::pump_here(); service_ehci_hid(); // DESKTOPHIDGAP (B1020): the census's pump core (and every "apart from the hid pump" rule) follows this task — GATESTEAL's re-home moves a dead core's sleepers; body at hidstall.rs's tail (LINE-NEUTRAL fold, code first)
     }
 }
 

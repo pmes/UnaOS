@@ -813,7 +813,7 @@ mod worker {
         }
     }
 
-    fn run(_: usize) {
+    fn run(arg: usize) { // DESKTOPHIDGAP (B1020): `arg` 1 = a worker re-homed off the hid pump's core ([`leave_hid_pump`])
         let Some(id) = crate::arch::sched::current_id() else {
             STATE.store(ST_INLINE, Ordering::Release); // PUMPHOLE2: the callers stop deferring and run the body inline
             serial_println!("[flight] service on=inline why=worker-has-no-task-id (POINTERFEEL) ::");
@@ -825,12 +825,41 @@ mod worker {
         OWNER.store(id, Ordering::Release);
         // PUMPHOLE2: both lines print HERE, on the worker's core — the pump's last recorder act was the spawn.
         serial_println!("[flight] service on=worker cpu={} pace_ms={} hid_pump_cpu={} (POINTERFEEL: the flight-recorder step leaves the hid pump's core) ::", c, PACE_MS, crate::hidstall::pump_cpu());
-        print_deferred("worker-up");
+        if arg == 0 { print_deferred("worker-up"); } // DESKTOPHIDGAP (B1020): a re-homed worker does not re-print the boot's deferral (same-line)
         loop {
             let t0 = crate::arch::ms();
             super::service();
             WORST_MS.fetch_max(crate::arch::ms().saturating_sub(t0), Ordering::Relaxed);
-            crate::arch::sched::sleep_ms(PACE_MS);
+            if leave_hid_pump(run) { crate::arch::sched::exit(); } crate::arch::sched::sleep_ms(PACE_MS); // DESKTOPHIDGAP (B1020): the hid pump arrived on this core (GATESTEAL's re-home) -> a fresh worker by `hand()`'s own pick, this one exits (LINE-NEUTRAL fold, code first)
         }
+    }
+
+    // ── DESKTOPHIDGAP (rmbp-ledger B1020) — the worker leaves the hid pump's core when the hid pump ARRIVES on it. ──────
+    // `hand()` places the worker once, "apart from the hid pump" (`xhci_worker_cpu(0).filter(|&c| c != pump_cpu())`).
+    // Flight 38: `tests gatesteal2` re-homed the hid pump onto that very core (c7 -> c2), and the body (worst pass 1331 ms,
+    // its UnaFS spans masked on c2) starved the HID pass for the rest of the boot. `hidstall::pump_here` now publishes the
+    // hid pump's core every pass; this checks the same rule every worker pass and re-homes by `hand()`'s own pick.
+
+    /// Latched once a re-home found no worker core apart from the hid pump's (one line, then silence).
+    static LEAVE_DECLINED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// The worker's per-pass check: `true` = a fresh `flightrec` (arg 1) was spawned off the hid pump's core and this task
+    /// must exit before its next body pass (ownership is by task id: the new task stores [`OWNER`] on its first statement,
+    /// `gate()` skips every other caller meanwhile). `false` = stay (not on the hid pump's core, or no core apart from it).
+    fn leave_hid_pump(run: fn(usize)) -> bool {
+        let here = crate::arch::sched::meter_current_cpu();
+        let pump = crate::hidstall::pump_cpu();
+        if here != pump {
+            return false;
+        }
+        let Some(c) = crate::arch::smp::xhci_worker_cpu(0).filter(|&c| c != pump) else {
+            if !LEAVE_DECLINED.swap(true, Ordering::Relaxed) {
+                serial_println!("[flight] service rehome from=c{} -> declined why=no-worker-core (DESKTOPHIDGAP B1020: the worker stays on the hid pump's core) ::", here);
+            }
+            return false;
+        };
+        serial_println!("[flight] service rehome from=c{} to=c{} why=hid-pump-arrived hid_pump_cpu={} (DESKTOPHIDGAP B1020: the flight-recorder step leaves the hid pump's core) ::", here, c, pump);
+        crate::arch::sched::spawn("flightrec", run, 1, c, crate::arch::sched::PRIO_NORMAL);
+        true
     }
 }

@@ -722,3 +722,27 @@ fn kat_hold(max: &AtomicU64, who: &MaskWho, ms: u64) -> u64 {
     masked_into(max, who, span, site);
     span
 }
+
+// ── DESKTOPHIDGAP (rmbp-ledger B1020) — the census's core FOLLOWS the hid pump. FILE-TAIL append. ─────────────────────────
+// Flight 38: every `[lag] stall … stage=hid` second after 20:45:00 read `hid_gap ≈ masked_ms + 10..15` and `holder=-`, and
+// HIDSTALL said `pump_cpu=7 … fr=worker:c2 fr_worst_ms=1331`. `tests gatesteal2` declared c7 dead and
+// `sched::rehome_dead_core` moved its sleepers — the `hid-pump` among them — to c2, the worker core the `flightrec` worker had
+// been placed on (once, "apart from the hid pump" with pump_cpu=7). [`PUMP_CPU`] was written once at the spawn, so the tick
+// census ([`note_hold`] via `sync::pump_core_hold`), the tickless exclusion and every worker's `!= pump_cpu()` placement kept
+// reading the corpse's number while the flight recorder's masked UnaFS spans starved the pass on c2, charged to no holder.
+// The hid pump now publishes its own core every pass (SESSIONWEDGE's B657 shape for the usb-pump: "the re-home MOVES the
+// pump"), and says a move once.
+
+/// DESKTOPHIDGAP (B1020): the `hid-pump` task's pass, on its own core — re-stamp [`PUMP_CPU`] (one writer: this task) and
+/// print one line when it changed from a set value. Task context only (never the ISR).
+#[cfg(target_arch = "x86_64")]
+pub fn pump_here() {
+    let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let was = PUMP_CPU.swap(cpu, Relaxed);
+    if was != cpu && was != usize::MAX {
+        serial_println!(
+            "[hid] pump core moved from=c{} to=c{} (DESKTOPHIDGAP B1020: the census, the tickless exclusion and every worker's \"apart from the hid pump\" rule follow the hid pump; GATESTEAL's re-home moves a dead core's sleepers)",
+            was, cpu
+        );
+    }
+}
