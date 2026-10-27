@@ -257,13 +257,13 @@ fn ssid_view(b: &[u8]) -> alloc::string::String {
 pub fn wifijoin() {
     use crate::drivers::mt7925 as mt;
     use wifi_core::ieee80211 as w;
-    let s9w = mt::watch_kat(super::assoc::refusal); let kat = mt::join_kat() && super::assoc::kat().2.is_none() && super::assoc::wpa2_kat().iter().all(|&k| k) && s9w; // S9WATCH (zenbook-ledger Z56): the S9 link watch's rows with the station's own judge (LINE-NEUTRAL)
+    let s9w = mt::watch_kat(super::assoc::refusal); let s9r = mt::rejoin_kat(); let kat = mt::join_kat() && super::assoc::kat().2.is_none() && super::assoc::wpa2_kat().iter().all(|&k| k) && s9w && s9r; // S9REJOIN (zenbook-ledger Z59): `s9r`, the rejoin's backoff sequence over a stub attempt and the unlink bodies; S9WATCH (zenbook-ledger Z56): the S9 link watch's rows with the station's own judge (LINE-NEUTRAL)
     let k = if kat { "ok" } else { "FAIL" };
     if !mt::registered() {
-        serial_println!(":: wifijoin: kat={} s9watch={} radio=absent -> {} ::", k, if s9w { "ok" } else { "FAIL" }, if kat { "PASS" } else { "FAIL" }); // S9WATCH (Z56): s9watch=
+        serial_println!(":: wifijoin: kat={} s9watch={} s9rejoin={} radio=absent -> {} ::", k, if s9w { "ok" } else { "FAIL" }, if s9r { "ok" } else { "FAIL" }, if kat { "PASS" } else { "FAIL" }); // S9WATCH (Z56): s9watch=; S9REJOIN (Z59): s9rejoin=
         return;
     }
-    let ssid = crate::tests::arg().unwrap_or_default();
+    mt::rejoin_keep(None); let ssid = crate::tests::arg().unwrap_or_default(); // S9REJOIN (zenbook-ledger Z59): the operator's join forgets the kept plan (a successful open join keeps its own)
     let refuse = |why: &str| {
         serial_println!("[wifi] join radio=mt7925 ssid=\"{}\" -> NOT ATTEMPTED why={}", ssid_view(ssid.as_bytes()), why);
         serial_println!(":: wifijoin: kat={} radio=mt7925 -> FAIL why={} ::", k, why);
@@ -291,30 +291,10 @@ pub fn wifijoin() {
     let (bssid, ch) = (bss.bssid, bss.channel.unwrap_or(0)); let pk = rsn.as_ref().map(|_| super::assoc::wpa_pmk(sb, &pass)); crypto_core::ct::Zeroize::zeroize(&mut pass);
     let cap = super::assoc::assoc_cap(&bss); let pmk = match pk { Some(Err(e)) => return refuse(e), Some(Ok(k)) => Some(crypto_core::ct::SecretBytes(k)), None => None };
     let mt_ = |m: [u8; 6]| alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
-    let (mut auth, mut assoc): (Option<w::AuthResult>, Option<w::AssocResult>) = (None, None);
-    let mut refused: Option<(u8, &'static str, u16)> = None;
+    let mut seen = Seen::default(); // S9REJOIN (zenbook-ledger Z59): the frames and the judge hoisted into the ONE `join_frames` (the rejoin runs it too)
     let plan = mt::JoinPlan { ssid: &ssid_view(sb), bssid, channel: ch, watch: super::assoc::refusal }; // S9WATCH (zenbook-ledger Z56): the station's refusal judge kept by the S9 link
-    let rep = mt::join(
-        &plan,
-        &mut |phase: u8| if phase == 0 { w::build_auth_open(me, bssid, 0) } else { let mut f = w::build_assoc_req(me, bssid, sb, 0, cap); if pmk.is_some() { f.extend_from_slice(&w::RSN_PSK_CCMP); } f },
-        &mut |phase: u8, f: &[u8]| {
-            if phase == 0 {
-                if let Some(a) = super::assoc::auth_reply(f, me, bssid) {
-                    auth = Some(a);
-                    let good = a.alg == 0 && a.seq == 2 && a.status == 0;
-                    return Some(if good { mt::Answer::Ok(0) } else { mt::Answer::Refused(if a.status != 0 { a.status } else { 0xffff }) });
-                }
-            } else if let Some(a) = super::assoc::assoc_reply(f, me, bssid) {
-                assoc = Some(a);
-                return Some(if a.status == 0 { mt::Answer::Ok(a.aid) } else { mt::Answer::Refused(a.status) });
-            }
-            if let Some((what, reason)) = super::assoc::refusal(f, me, bssid) {
-                refused = Some((phase, what, reason));
-                return Some(mt::Answer::Refused(reason));
-            }
-            None
-        },
-    );
+    let rep = join_frames(&plan, me, sb, cap, pmk.is_some(), &mut seen);
+    let Seen { auth, assoc, refused } = seen;
     let rep = match rep {
         Ok(r) => r,
         Err(e) => {
@@ -355,12 +335,12 @@ pub fn wifijoin() {
         );
     }
     serial_println!(
-        ":: wifijoin: kat={} s9watch={} radio=mt7925 ssid={} auth={} assoc={} -> {} ::", // S9WATCH (Z56): s9watch=
-        k, if s9w { "ok" } else { "FAIL" }, plan.ssid, if authed { "ok" } else { "no" }, aid.map_or(alloc::string::String::from("-"), |a| alloc::format!("aid={}", a)),
+        ":: wifijoin: kat={} s9watch={} s9rejoin={} radio=mt7925 ssid={} auth={} assoc={} -> {} ::", // S9WATCH (Z56): s9watch=; S9REJOIN (Z59): s9rejoin=
+        k, if s9w { "ok" } else { "FAIL" }, if s9r { "ok" } else { "FAIL" }, plan.ssid, if authed { "ok" } else { "no" }, aid.map_or(alloc::string::String::from("-"), |a| alloc::format!("aid={}", a)),
         if kat && aid.is_some() { "PASS" } else { "FAIL" }
     );
     if aid.is_some() {
-        if s10_wpa2(me, bssid, ch, &ssid, rsn, pmk) { s9_dhcp(); } // MT7925S9 (zenbook-ledger Z46): smolnet's one DHCP client over the S9 link, then the link's counts
+        let open = rsn.is_none(); if s10_wpa2(me, bssid, ch, &ssid, rsn, pmk) { if open { rejoin_keep(sb, bssid, ch, cap); } s9_dhcp(); } // S9REJOIN (zenbook-ledger Z59): an OPEN join's plan kept for the automatic rejoin (a WPA2 one needs S10-PMK-KEEP).  MT7925S9 (zenbook-ledger Z46): smolnet's one DHCP client over the S9 link, then the link's counts
     }
 }
 
@@ -522,4 +502,79 @@ pub fn wpa2() {
         ":: WPA2KAT: pbkdf2={} prf={} mic={} unwrap={} frame={} keys={} -> {} ::",
         ok(a[0]), ok(a[1]), ok(a[2]), ok(a[3]), ok(a[4]), ok(keys), if a.iter().all(|&b| b) && keys { "PASS" } else { "FAIL" }
     );
+}
+
+// ── S9REJOIN (zenbook-ledger Z59): the station's half of the MT7925 rejoin — ONE join_frames, the kept plan, the attempt ─────────
+/// What the judge heard during one join: the authentication and association answers and a deauth / disassoc (phase, kind, reason).
+#[derive(Default)]
+struct Seen {
+    auth: Option<wifi_core::ieee80211::AuthResult>,
+    assoc: Option<wifi_core::ieee80211::AssocResult>,
+    refused: Option<(u8, &'static str, u16)>,
+}
+
+/// The station's frames and judge for ONE join over the MT7925 (hoisted unchanged out of `wifijoin`; the operator's join and the
+/// automatic rejoin both run it): `build(0)` the open-system authentication request, `build(1)` the association request (with
+/// S10's RSN element when `wpa`); the judge answers with `assoc::auth_reply` / `assoc_reply` / `refusal`, recording into `seen`.
+fn join_frames(
+    plan: &crate::drivers::mt7925::JoinPlan, me: [u8; 6], sb: &[u8], cap: u16, wpa: bool, seen: &mut Seen,
+) -> Result<crate::drivers::mt7925::JoinRep, &'static str> {
+    use crate::drivers::mt7925 as mt;
+    use wifi_core::ieee80211 as w;
+    let bssid = plan.bssid;
+    mt::join(
+        plan,
+        &mut |phase: u8| if phase == 0 { w::build_auth_open(me, bssid, 0) } else { let mut f = w::build_assoc_req(me, bssid, sb, 0, cap); if wpa { f.extend_from_slice(&w::RSN_PSK_CCMP); } f },
+        &mut |phase: u8, f: &[u8]| {
+            if phase == 0 {
+                if let Some(a) = super::assoc::auth_reply(f, me, bssid) {
+                    seen.auth = Some(a);
+                    let good = a.alg == 0 && a.seq == 2 && a.status == 0;
+                    return Some(if good { mt::Answer::Ok(0) } else { mt::Answer::Refused(if a.status != 0 { a.status } else { 0xffff }) });
+                }
+            } else if let Some(a) = super::assoc::assoc_reply(f, me, bssid) {
+                seen.assoc = Some(a);
+                return Some(if a.status == 0 { mt::Answer::Ok(a.aid) } else { mt::Answer::Refused(a.status) });
+            }
+            if let Some((what, reason)) = super::assoc::refusal(f, me, bssid) {
+                seen.refused = Some((phase, what, reason));
+                return Some(mt::Answer::Refused(reason));
+            }
+            None
+        },
+    )
+}
+
+/// After a successful OPEN `tests wifijoin` (the S9 link up): the plan kept in the driver for the automatic rejoin — the SSID bytes,
+/// the BSS, its channel and capability, the station's judge, `rejoin_again` and `s9_dhcp`.
+fn rejoin_keep(sb: &[u8], bssid: [u8; 6], ch: u8, cap: u16) {
+    use crate::drivers::mt7925 as mt;
+    if !mt::linked() {
+        return;
+    }
+    let mut ssid = [0u8; 32];
+    let n = sb.len().min(32);
+    ssid[..n].copy_from_slice(&sb[..n]);
+    mt::rejoin_keep(Some(mt::RejoinPlan {
+        ssid, ssid_len: n as u8, bssid, channel: ch, cap, watch: super::assoc::refusal, again: rejoin_again, dhcp: s9_dhcp,
+    }));
+}
+
+/// ONE rejoin attempt from the driver's `mt7925-rejoin` task: the kept plan through the same `join_frames` -> `mt7925::join` (open:
+/// no RSN element), no scan (the ROC tunes to the kept channel). Err `auth` / `assoc` / `link` (associated, the S9 link refused) or
+/// the join's own refusal word; the driver prints the verdict.
+fn rejoin_again(p: &crate::drivers::mt7925::RejoinPlan) -> Result<(), &'static str> {
+    use crate::drivers::mt7925 as mt;
+    let Some(me) = mt::mac() else { return Err("no-mac") };
+    let sb = &p.ssid[..(p.ssid_len as usize).min(32)];
+    let plan = mt::JoinPlan { ssid: &ssid_view(sb), bssid: p.bssid, channel: p.channel, watch: p.watch };
+    let mut seen = Seen::default();
+    let rep = join_frames(&plan, me, sb, p.cap, false, &mut seen)?;
+    if !matches!(rep.auth, mt::Step::Ans(mt::Answer::Ok(_))) {
+        return Err("auth");
+    }
+    if !matches!(rep.assoc, mt::Step::Ans(mt::Answer::Ok(_))) {
+        return Err("assoc");
+    }
+    if mt::linked() { Ok(()) } else { Err("link") }
 }
