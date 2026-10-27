@@ -2,6 +2,7 @@
 //! validation, RFC 6125 hostname matching, and the PEM trust store.
 
 pub mod aia;
+pub mod build; // PDFSIGN (LEDGER SR350): the DER / X.509 writer, the reader's twin
 pub mod cert;
 pub mod crl;
 pub mod der;

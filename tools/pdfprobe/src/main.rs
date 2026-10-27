@@ -9,6 +9,7 @@
 //! pdfprobe --render <file> <page> <out.png>
 //! pdfprobe --text <file> <page>
 //! pdfprobe --save <in> <out>
+//! pdfprobe --sign <in> <out> <key.p256> <cert.der> [<chain.der>...]
 //! ```
 //!
 //! Prints `pages=<n> version=<v> xref=<table|stream|rebuilt> encrypt=<none|rc4-40|rc4-128|aesv2|aesv3|...>
@@ -27,14 +28,22 @@
 //! `--save` (PDF-WRITE, LEDGER SR325) opens `<in>` with the empty user password, writes `Document::save` (every reachable
 //! object, a classic xref, decrypted: no /Encrypt) to `<out>`, re-parses it and prints
 //! `save=<out> bytes=<n> pages=<n> encrypt=<source kind> -> <saved kind>`; a page count that differs is an error.
+//!
+//! `--sign` (PDFSIGN, LEDGER SR350) opens `<in>` with the empty user password and signs it through `Document::sign`
+//! (one incremental update, a new invisible field `Signature<n+1>` on page 0, adbe.pkcs7.detached, now as /M) with a
+//! RAW 32-byte P-256 private scalar (no key container: the one PEM / PKCS#8 parser is Aether's, PDFSIGN-KEYPARSE owed)
+//! and the DER certificates (the signer's first); prints `sign=<out> bytes=<n> field=<name>` and the signed file's
+//! `sigs=` line (chains unchecked).
 
 use pdf_core::content::ops;
 use pdf_core::font::{Fallback, GlyphSink, spans_to_string};
 use pdf_core::render::{Glyphs, TextLog, TextRun, TextSink, png};
+use pdf_core::sig::cms::{SecretKey, SignerKey};
+use pdf_core::sig::{SignRequest, SubFilter, probe_line};
 use pdf_core::{Document, Object, Page};
 
 fn usage() -> ! {
-    eprintln!("usage: pdfprobe <file> | pdfprobe --render <file> <page> <out.png> | pdfprobe --text <file> <page> | pdfprobe --save <in> <out>");
+    eprintln!("usage: pdfprobe <file> | pdfprobe --render <file> <page> <out.png> | pdfprobe --text <file> <page> | pdfprobe --save <in> <out> | pdfprobe --sign <in> <out> <key.p256> <cert.der> [<chain.der>...]");
     std::process::exit(2)
 }
 
@@ -142,6 +151,9 @@ fn save(input: &str, out: &str) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 6 && args[1] == "--sign" {
+        return sign(&args[2..]);
+    }
     if args.len() == 4 && args[1] == "--save" {
         return save(&args[2], &args[3]);
     }
@@ -165,4 +177,39 @@ fn main() {
     for (i, p) in pages.iter().enumerate() {
         println!("{}", page_line(&doc, i, p));
     }
+}
+
+/// `--sign <in> <out> <key.p256> <cert.der> [<chain.der>...]` (PDFSIGN, LEDGER SR350).
+fn sign(args: &[String]) {
+    use std::io::Read as _;
+    let read = |p: &String| std::fs::read(p).unwrap_or_else(|e| fail(format!("{p}: {e}")));
+    let bytes = read(&args[0]);
+    let doc = Document::parse(&bytes).unwrap_or_else(|e| fail(e));
+    let raw: [u8; 32] = read(&args[2]).as_slice().try_into().unwrap_or_else(|_| fail("the key is not a raw 32-byte P-256 scalar"));
+    let key = SecretKey::from_bytes(&raw).unwrap_or_else(|_| fail("the key is not a P-256 private scalar"));
+    let certs: Vec<Vec<u8>> = args[3..].iter().map(read).collect();
+    let chain: Vec<&[u8]> = certs.iter().map(Vec::as_slice).collect();
+    let field = format!("Signature{}", doc.signatures(&bytes).len() + 1);
+    let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let mut entropy = [0u8; 32];
+    if doc.security().is_some() {
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut entropy)).unwrap_or_else(|e| fail(e));
+    }
+    let req = SignRequest {
+        field: &field,
+        page: 0,
+        key: SignerKey::P256(&key),
+        chain: &chain,
+        subfilter: SubFilter::Pkcs7Detached,
+        name: None,
+        reason: None,
+        location: None,
+        time,
+        certify: None,
+    };
+    let signed = doc.sign(&bytes, &req, &entropy).unwrap_or_else(|e| fail(e));
+    let back = Document::parse(&signed).unwrap_or_else(|e| fail(format!("the signed file does not parse: {e}")));
+    std::fs::write(&args[1], &signed).unwrap_or_else(|e| fail(e));
+    println!("sign={} bytes={} field={field}", args[1], signed.len());
+    println!("{}", probe_line(&back, &signed));
 }
