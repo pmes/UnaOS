@@ -56,7 +56,7 @@ use timeline_core::view::{HANDLE, PLAYHEAD, ROW, SELECT, TRANS_FILL, clip_colour
 #[cfg(test)]
 use timeline_core::{TransitionKind, WipeDir};
 
-const LABEL: [u8; 4] = [0xff, 0xff, 0xff, 255];
+const LABEL: [u8; 4] = view::LABEL; // NLE6KEYSLABELS (rmbp-ledger B968): the view's colour table holds the one literal
 
 /// The view's byte order for a surface's [`PixelOrder`].
 fn vo(o: PixelOrder) -> Order {

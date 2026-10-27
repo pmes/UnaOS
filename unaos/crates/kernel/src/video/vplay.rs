@@ -1816,7 +1816,12 @@ pub fn face_preview_take() -> Option<(i64, bool, u64)> {
 // Player's seek door (`vid::seek`) restarts the job at the playhead over the edited state. [`view_band`]: the picture
 // rect's lower band shows timeline_core's ONE track view (`view::paint_in`, `Role::Tracks`): the host face's pixels.
 // Wire: `[nle] edit <verb> at=<tick> clips=<n> undo=<n> saved=<bytes|refused(..)>`, `[nle] edit <verb> at=<tick> refused
-// (<why>)`, `[nle] view w=<n> h=<n> rows=<n> at=<tick>` (once per seed). Witness: player.rs `tests nle` (`keys=`).
+// (<why>)`, `[nle] view w=<n> h=<n> rows=<n> at=<tick> labels=<n>` (once per seed). Witness: player.rs `tests nle` (`keys=`).
+// NLE6KEYSLABELS (rmbp-ledger B968): the view band's labels (the ruler's timecode, each clip's reel) go through the view's
+// `Text` hook to the kernel's ONE text seam ([`ViewLabels`]: `video::text::draw_with`, `Face::Body`, blended by
+// `video::font::blend`) at the host's positions; `+` / `=` / `-` / `0` are the ONE zoom (`EditorState::verb` `zoom+` /
+// `zoom-` / `zoom0`) on the Player's editor state ([`edit_zoom`]: no save, the seek door re-presents the band),
+// `[nle] edit <zoom+|zoom-|zoom0> at=<tick> zoom=<px>`.
 
 struct Edit {
     path: String,
@@ -1828,8 +1833,9 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 
 /// The kernel face's key bindings (bytes) onto timeline_core's editor verbs: `s` split, `x` / Delete / Backspace delete,
 /// `u` / `z` undo, `Z` redo, `[` / `]` the in point -1 / +1, `{` / `}` the out point -1 / +1, `i` / `o` the in / out point
-/// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport).
-const EDIT_KEYS: [(u8, &str); 13] = [
+/// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
+/// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -).
+const EDIT_KEYS: [(u8, &str); 17] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1843,6 +1849,10 @@ const EDIT_KEYS: [(u8, &str); 13] = [
     (b'}', "}"),
     (b'i', "mark-in"),
     (b'o', "mark-out"),
+    (b'+', "zoom+"),
+    (b'=', "zoom+"),
+    (b'-', "zoom-"),
+    (b'0', "zoom0"),
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1887,7 +1897,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let tb = st.timeline.tb;
         st.seek(tick_of(tb, ms));
         let at = st.playhead;
-        if verb != "undo" && verb != "redo" {
+        if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
             let top = (0..st.timeline.tracks.len())
                 .rev()
                 .filter(|&i| st.timeline.tracks[i].kind == timeline_core::Kind::Video)
@@ -1954,12 +1964,67 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: u64) -> usize {
     let tb = e.st.timeline.tb;
     e.st.seek(tick_of(tb, pts_ms));
     let l = view::Layout::of_role(view::Role::Tracks, w as u32, band as u32, &e.st);
-    let px = pack(&view::paint_in(&e.st, l, view::Order::Rgba, None, None));
+    let mut lab = ViewLabels(0);
+    let px = pack(&view::paint_in(&e.st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None));
     let y0 = vh - band;
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
         e.said = true;
-        serial_println!("[nle] view w={} h={} rows={} at={}", w, band, rows, e.st.playhead);
+        serial_println!("[nle] view w={} h={} rows={} at={} labels={}", w, band, rows, e.st.playhead, lab.0);
     }
     y0
+}
+
+/// NLE6KEYSLABELS (rmbp-ledger B968): a zoom key on the Player's editor state — `EditorState::verb`'s ONE zoom (the host
+/// face's words); the EDL carries no zoom, so nothing is saved. `Some(ms)`: the playhead for the seek door, which
+/// re-presents the frame and with it the band at the new zoom; `None`: at a bound, unchanged.
+fn edit_zoom(st: &mut timeline_core::editor::EditorState, verb: &str, at: i64) -> Option<u64> {
+    let z0 = st.zoom;
+    if !matches!(st.verb(verb), Some(Ok(()))) || st.zoom == z0 {
+        serial_println!("[nle] edit {} at={} unchanged", verb, at);
+        return None;
+    }
+    serial_println!("[nle] edit {} at={} zoom={}", verb, at, st.zoom);
+    Some((st.timeline.tb.to_ns(at).max(0) as u64) / 1_000_000)
+}
+
+/// The cell's top sits this far above the view hook's baseline: the ruler label's baseline is the ruler's top + 9, so the
+/// 16-px `Face::Body` cell fills the 16-px ruler exactly.
+const LABEL_RISE: f32 = 9.0;
+
+/// NLE6KEYSLABELS (rmbp-ledger B968): the view's label hook over the kernel's ONE text seam — `video::text::draw_with` in
+/// `Face::Body` (the fixed 7x16 cell), each covered pixel blended into the band's canvas by `video::font::blend`, inside
+/// the hook's clip columns; the host's positions, the kernel's glyphs. Counts the labels drawn (the `[nle] view` line).
+struct ViewLabels(usize);
+
+impl timeline_core::view::Text for ViewLabels {
+    fn text(&mut self, c: &mut timeline_core::view::Canvas, s: &str, x: f32, baseline: f32, clip: (i32, i32)) {
+        let (w, h) = (c.w as isize, c.h as isize);
+        let (lo, hi) = (clip.0.max(0) as isize, (clip.1 as isize).min(w));
+        if x < 0.0 || x as isize >= hi {
+            return;
+        }
+        let x = x as usize;
+        let l = timeline_core::view::LABEL;
+        let ink = (l[0] as u32) << 16 | (l[1] as u32) << 8 | l[2] as u32;
+        let (ri, bi) = match c.order {
+            timeline_core::view::Order::Rgba => (0, 2),
+            timeline_core::view::Order::Bgra => (2, 0),
+        };
+        let top = (baseline - LABEL_RISE) as isize;
+        let px = &mut c.px;
+        let _ = super::text::draw_with(s.as_bytes(), false, super::text::Face::Body, x, top, (hi - x as isize) as usize, ink, &mut |gx, gy, a| {
+            if gx < lo || gx >= hi || gy < 0 || gy >= h {
+                return;
+            }
+            let i = ((gy * w + gx) * 4) as usize;
+            let Some(p) = px.get_mut(i..i + 4) else { return };
+            let bg = (p[ri] as u32) << 16 | (p[1] as u32) << 8 | p[bi] as u32;
+            let o = super::font::blend(bg, ink, a);
+            p[ri] = (o >> 16) as u8;
+            p[1] = (o >> 8) as u8;
+            p[bi] = o as u8;
+        });
+        self.0 += 1;
+    }
 }
