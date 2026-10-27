@@ -337,3 +337,207 @@ fn saved_reads_back(doc: &Document) {
     assert_eq!(back.info(), doc.info());
     assert!(matches!(pdf_core::write::Edit::new(doc).save_update(&out), Err(Error::Unsupported(_))));
 }
+
+// PDFREENCRYPT (LEDGER SR344): encrypting on save. `Document::save_encrypted` (R3 RC4-128, R4 AESV2, R6 AESV3) and
+// `Edit::save_update_encrypted` read back through the same reader with the user and the owner password; the /O /U
+// values are checked against the forward algorithms run here (no qpdf on the build box: the R6 /U /O /UE /OE /Perms
+// are checked step by step below, not against an outside tool's fixture).
+
+use pdf_core::crypt::Cipher;
+use pdf_core::render::TextLog;
+use pdf_core::write::Edit;
+
+const SEED: [u8; 32] = [0x5c; 32];
+const SEED2: [u8; 32] = [0xa3; 32];
+const ART: &[u8] = b"1 0 0 rg 20 20 120 80 re f BT /F1 12 Tf 72 712 Td (Hello, encrypted world) Tj ET";
+const CIPHERS: [(Cipher, &str); 3] = [(Cipher::Rc4_128, "rc4-128"), (Cipher::Aes128, "aesv2"), (Cipher::Aes256, "aesv3")];
+
+/// A plaintext one-page file with ink on it (a red box) and an /Info /Title.
+fn plain() -> Vec<u8> {
+    let mut b = PdfBuilder::new(1);
+    b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        .obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+        .obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << >> >>");
+    b.stream(4, "", ART);
+    b.obj(5, &format!("<< /Title ({TITLE}) >>"));
+    b.info = Some(5);
+    b.classic()
+}
+
+fn pixels(doc: &Document) -> Vec<u8> {
+    let pages = doc.pages().unwrap();
+    pages[0].render(doc, 36.0, &mut TextLog::default()).unwrap().pixmap.data
+}
+
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+fn same_doc(a: &Document, b: &Document, what: &str) {
+    assert_eq!(a.pages().unwrap(), b.pages().unwrap(), "{what}: pages");
+    assert_eq!(a.info(), b.info(), "{what}: info");
+    assert!(pixels(a) == pixels(b), "{what}: pixels");
+}
+
+/// The saved /Encrypt dictionary (never decrypted) and /ID[0].
+fn encrypt_of(doc: &Document) -> (pdf_core::Dict, Vec<u8>) {
+    let enc = match doc.trailer().get(b"Encrypt").unwrap() {
+        Object::Ref(r) => doc.resolve(*r).unwrap(),
+        o => o.clone(),
+    };
+    let id0 = match doc.trailer().get(b"ID").unwrap() {
+        Object::Array(a) => a[0].as_str().unwrap().to_vec(),
+        _ => panic!("no /ID"),
+    };
+    (enc.as_dict().unwrap().clone(), id0)
+}
+
+fn s(d: &pdf_core::Dict, k: &[u8]) -> Vec<u8> {
+    d.get(k).and_then(Object::as_str).unwrap_or_else(|| panic!("no /{}", String::from_utf8_lossy(k))).to_vec()
+}
+
+#[test]
+fn save_encrypted_round_trips_with_user_and_owner_passwords() {
+    let plain_pdf = plain();
+    let enc_src = build(&security(Kind::AesV2, b"", b"owner", true, false), true);
+    for (src_name, src) in [("plain", &plain_pdf), ("aesv2-source", &enc_src)] {
+        let doc = Document::parse(src).unwrap();
+        if src_name == "plain" {
+            assert!(pixels(&doc).chunks(4).any(|p| p[0] > 200 && p[1] < 60), "the fixture has red ink");
+        }
+        for (cipher, kind) in CIPHERS {
+            let what = format!("{src_name} -> {kind}");
+            let out = doc.save_encrypted(b"u-pw", b"o-pw", P, cipher, &SEED);
+            dump(&format!("reencrypt-{src_name}-{kind}"), &out);
+            assert_eq!(Document::parse(&out).err(), Some(Error::Password), "{what}");
+            assert_eq!(Document::parse_with_password(&out, b"wrong").err(), Some(Error::Password), "{what}");
+            for (pw, owner) in [(&b"u-pw"[..], false), (&b"o-pw"[..], true)] {
+                let back = Document::parse_with_password(&out, pw).unwrap_or_else(|e| panic!("{what}: {e}"));
+                assert_eq!(back.encryption(), kind, "{what}");
+                assert_eq!(back.security().unwrap().owner(), owner, "{what}");
+                assert_eq!(back.security().unwrap().permissions(), P, "{what}");
+                same_doc(&doc, &back, &what);
+            }
+            assert!(!contains(&out, b"Hello, encrypted"), "{what}: content in the clear");
+            assert!(!contains(&out, TITLE.as_bytes()), "{what}: title in the clear");
+            // An empty user password opens without one; the owner password still marks the owner.
+            let open = doc.save_encrypted(b"", b"o-pw", P, cipher, &SEED);
+            let back = Document::parse(&open).unwrap_or_else(|e| panic!("{what} empty: {e}"));
+            assert!(!back.security().unwrap().owner());
+            same_doc(&doc, &back, &what);
+        }
+    }
+}
+
+#[test]
+fn r3_r4_o_and_u_match_the_forward_algorithms() {
+    let doc = Document::parse(&plain()).unwrap();
+    for (cipher, v, r) in [(Cipher::Rc4_128, 2, 3), (Cipher::Aes128, 4, 4)] {
+        let out = doc.save_encrypted(b"u-pw", b"o-pw", P, cipher, &SEED);
+        let back = Document::parse_with_password(&out, b"u-pw").unwrap();
+        let (enc, id0) = encrypt_of(&back);
+        assert_eq!((enc.int(b"V"), enc.int(b"R"), enc.int(b"Length")), (Some(v), Some(r), Some(128)));
+        assert_eq!(enc.int(b"P"), Some(P as i64));
+        let (o, u) = (s(&enc, b"O"), s(&enc, b"U"));
+        // Algorithm 3: MD5 of the padded owner password, 50 more rounds, RC4 x 20 over the padded user password.
+        let mut d = md5(&pad_password(b"o-pw"));
+        for _ in 0..50 {
+            d = md5(&d);
+        }
+        let mut want_o = pad_password(b"u-pw").to_vec();
+        rc4_passes(&d[..16], &mut want_o, false);
+        assert_eq!(o, want_o, "{cipher:?}: /O");
+        // Algorithm 2 over the saved /O, /P and /ID[0], then Algorithm 5: /U's first 16 bytes.
+        let mut h = Md5::new();
+        h.update(&pad_password(b"u-pw"));
+        h.update(&o);
+        h.update(&(P as u32).to_le_bytes());
+        h.update(&id0);
+        let mut k = h.finalize();
+        for _ in 0..50 {
+            k = md5(&k[..16]);
+        }
+        let mut h = Md5::new();
+        h.update(&PAD);
+        h.update(&id0);
+        let mut x = h.finalize().to_vec();
+        rc4_passes(&k, &mut x, false);
+        assert_eq!(u.len(), 32);
+        assert_eq!(&u[..16], &x[..], "{cipher:?}: /U");
+    }
+}
+
+#[test]
+fn r6_u_o_ue_oe_perms_checked_step_by_step() {
+    let doc = Document::parse(&plain()).unwrap();
+    let out = doc.save_encrypted(b"u-pw", b"o-pw", P, Cipher::Aes256, &SEED);
+    assert!(out.starts_with(b"%PDF-2.0"));
+    let back = Document::parse_with_password(&out, b"u-pw").unwrap();
+    let (enc, _) = encrypt_of(&back);
+    assert_eq!((enc.int(b"V"), enc.int(b"R"), enc.int(b"Length")), (Some(5), Some(6), Some(256)));
+    let (u, o, ue, oe, perms) = (s(&enc, b"U"), s(&enc, b"O"), s(&enc, b"UE"), s(&enc, b"OE"), s(&enc, b"Perms"));
+    assert_eq!((u.len(), o.len(), ue.len(), oe.len(), perms.len()), (48, 48, 32, 32, 16));
+    // Algorithm 8 / 9: the hashes over the validation salts (the owner's with the 48-byte /U as extra data).
+    assert_eq!(&u[..32], &hash_r56(6, b"u-pw", &u[32..40], &[])[..]);
+    assert_eq!(&o[..32], &hash_r56(6, b"o-pw", &o[32..40], &u)[..]);
+    // The file key unwrapped from /UE (user key salt) and from /OE (owner key salt) is the same key.
+    let unwrap = |ik: [u8; 32], wrapped: &[u8]| {
+        let mut k = wrapped.to_vec();
+        cbc::decrypt(&Aes::new(&ik).unwrap(), &[0; 16], &mut k).unwrap();
+        k
+    };
+    let ku = unwrap(hash_r56(6, b"u-pw", &u[40..48], &[]), &ue);
+    let ko = unwrap(hash_r56(6, b"o-pw", &o[40..48], &u), &oe);
+    assert_eq!(ku, ko);
+    // Algorithm 10 checked (ISO 32000-2 Algorithm 13): /Perms under the file key reads P, FF FF FF FF, 'T', "adb".
+    let mut pb = perms.clone();
+    cbc::decrypt(&Aes::new(&ku).unwrap(), &[0; 16], &mut pb).unwrap();
+    assert_eq!(&pb[..4], &(P as u32).to_le_bytes());
+    assert_eq!(&pb[4..8], &[0xff; 4]);
+    assert_eq!(pb[8], b'T');
+    assert_eq!(&pb[9..12], b"adb");
+    // The owner password opens the same file as the owner.
+    assert!(Document::parse_with_password(&out, b"o-pw").unwrap().security().unwrap().owner());
+}
+
+#[test]
+fn save_update_of_an_encrypted_file_reads_back_under_the_same_password() {
+    for kind in KINDS {
+        let pdf = build(&security(kind, b"user", b"owner", true, false), true);
+        for pw in [&b"user"[..], &b"owner"[..]] {
+            let doc = Document::parse_with_password(&pdf, pw).unwrap();
+            let mut e = Edit::new(&doc);
+            e.set_info(b"Title", "Updated Title");
+            assert!(matches!(e.save_update(&pdf), Err(Error::Unsupported(_))), "{kind:?}: no entropy, refused");
+            let out = e.save_update_encrypted(&pdf, &SEED).unwrap();
+            dump(&format!("update-{}-{}", name_of(kind), String::from_utf8_lossy(pw)), &out);
+            assert!(out.starts_with(&pdf));
+            assert!(!contains(&out[pdf.len()..], b"Updated Title"), "{kind:?}: appended title in the clear");
+            assert_eq!(Document::parse(&out).err(), Some(Error::Password), "{kind:?}");
+            let back = Document::parse_with_password(&out, pw).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            assert_eq!(back.encryption(), name_of(kind));
+            assert_eq!(back.info().title.as_deref(), Some("Updated Title"), "{kind:?}");
+            assert_eq!(back.pages().unwrap()[0].contents, CONTENT, "{kind:?}");
+        }
+    }
+    // Unencrypted: the same bytes as save_update.
+    let pdf = plain();
+    let doc = Document::parse(&pdf).unwrap();
+    let mut e = Edit::new(&doc);
+    e.set_info(b"Title", "Updated Title");
+    assert!(e.save_update(&pdf).unwrap() == e.save_update_encrypted(&pdf, &SEED).unwrap());
+}
+
+#[test]
+fn save_encrypted_is_deterministic_per_entropy() {
+    let doc = Document::parse(&plain()).unwrap();
+    for (cipher, kind) in CIPHERS {
+        let a = doc.save_encrypted(b"u-pw", b"o-pw", P, cipher, &SEED);
+        let b = doc.save_encrypted(b"u-pw", b"o-pw", P, cipher, &SEED);
+        let c = doc.save_encrypted(b"u-pw", b"o-pw", P, cipher, &SEED2);
+        assert!(a == b, "{kind}: same entropy, same bytes");
+        assert!(a != c, "{kind}: other entropy, other bytes");
+        let id = |x: &[u8]| encrypt_of(&Document::parse_with_password(x, b"u-pw").unwrap()).1;
+        assert_ne!(id(&a), id(&c), "{kind}: /ID[0]");
+    }
+}
