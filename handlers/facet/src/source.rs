@@ -154,6 +154,10 @@ pub struct Decoded {
     /// applies the orientation its own reader ([`crate::meta`]) finds — the authority, which also reads
     /// PNG `eXIf` and WebP `EXIF`; for JPEG the two are asserted to agree.
     pub orientation: u8,
+    /// METAICCONE (SR367): the embedded ICC profile as pixel_core surfaced it (`pixel_core::Image::icc`: PNG iCCP
+    /// inflated, JPEG APP2 joined, WebP ICCP), else `None`. REPORTED: the pixels above are already sRGB
+    /// ([`PixelCoreSource`] converted them); Facet's info label reads it ([`crate::meta::icc`]).
+    pub icc: Option<Vec<u8>>,
 }
 
 impl From<pixel_core::Image> for Decoded {
@@ -165,6 +169,7 @@ impl From<pixel_core::Image> for Decoded {
             frames: i.frames.map(|v| v.into_iter().map(|f| Frame { delay_ms: f.delay_ms, rgba: f.rgba }).collect()),
             loop_count: i.loop_count,
             orientation: i.orientation,
+            icc: i.icc,
         }
     }
 }
@@ -446,6 +451,22 @@ mod tests {
         let (_, named) = pdficc_jpegs(&icc_core::kat::named_colour());
         assert_eq!(PixelCoreSource.decode(&named).unwrap().rgba, raw);
     }
+
+    #[test]
+    fn metaiccone_label_from_the_decoded_profile() {
+        // METAICCONE (SR367): the info label of a tagged JPEG comes from the ONE decode's profile (pixel_core's APP2 join,
+        // carried as Decoded::icc) and icc_core's `desc` reader: a v4 `mluc` description, the profile's byte count.
+        use icc_core::kat;
+        let wtpt = (*b"wtpt", kat::xyz_tag([0.9642, 1.0, 0.8249]));
+        let profile = kat::profile(4, b"mntr", b"GRAY", b"XYZ ", &[wtpt, (*b"kTRC", kat::curv_gamma(1.8)), (*b"desc", kat::mluc("Gray 1.8 v4"))]);
+        let (plain, tagged) = pdficc_jpegs(&profile);
+        assert_eq!(PixelCoreSource.decode(&tagged).unwrap().icc.as_deref(), Some(&profile[..]));
+        assert_eq!(PixelCoreSource.decode(&plain).unwrap().icc, None);
+        let (_, info) = crate::Facet::new().open_bytes("gray.jpg", &tagged).unwrap();
+        assert_eq!(info.colour, format!("ICC profile 'Gray 1.8 v4' ({} bytes)", profile.len()));
+        let (_, info) = crate::Facet::new().open_bytes("plain.jpg", &plain).unwrap();
+        assert_eq!(info.colour, "untagged (assumed sRGB)");
+    }
 }
 
 /// PDFICC (SR358): convert a decoded image tagged with an embedded ICC profile to sRGB — the first frame and every
@@ -463,5 +484,6 @@ fn icc_to_srgb(mut i: pixel_core::Image) -> pixel_core::Image {
         }
         Err(e) => log::warn!("[FACET] :: icc refused: {e} (kept as sRGB)"),
     }
+    i.icc = Some(icc); // METAICCONE (SR367): the profile stays REPORTED on the decoded image (Decoded::icc, meta's label)
     i
 }
