@@ -83,7 +83,7 @@ pub fn read_msld() -> Msld {
         let mut b = [0u8; 1];
         return match smc::read_key(b"MSLD", &mut b) {
             Ok(n) => Msld::Ok(b[0], n),
-            Err(smc::SmcError::Absent) => Msld::NoKey,
+            Err(smc::SmcError::Absent) => ec_lid(), // ZENBOOKECLID (zenbook-ledger Z27): no SMC key here, the ACPI EC's lid answers instead (`ec_lid`, file tail; the rMBP's EC gate is shut, so it answers NoKey as before)
             Err(smc::SmcError::Stuck(s)) => Msld::Stuck(s),
         };
     }
@@ -136,7 +136,7 @@ fn poll(now: u64) {
         Msld::Ok(raw, n) => {
             let prev = LID_RAW.swap(raw as u32, Ordering::AcqRel);
             if prev == u32::MAX {
-                serial_println!("[smc] lid={} raw={} len={} at=boot key=MSLD (rung 0: nonzero=closed is the hypothesis)", lid_word(raw), raw, n);
+                serial_println!("[smc] lid={} raw={} len={} at=boot key={} (rung 0: nonzero=closed is the hypothesis)", lid_word(raw), raw, n, if n == 0 { "ec" } else { "MSLD" });
             } else if prev != raw as u32 {
                 let f = FLIPS.fetch_add(1, Ordering::Relaxed) + 1;
                 serial_println!("[smc] lid={} raw={} was={} flips={} ms={}", lid_word(raw), raw, prev, f, now);
@@ -367,5 +367,24 @@ fn yield_ms(ms: u64) {
     let t0 = crate::arch::ms();
     while crate::arch::ms().saturating_sub(t0) < ms {
         crate::arch::sched::yield_now();
+    }
+}
+
+// ZENBOOKECLID (zenbook-ledger Z27) — TAIL-APPENDED under `lidsleep` (x86). The EC source beside MSLD: `read_msld`'s `Absent`
+// arm (the SMC has no key on this machine, or none at all) asks `drivers::ec::lid()`. Closed/open enter the ONE poll as
+// `Msld::Ok(raw, 0)` (len 0 = the EC: no SMC key has length 0; raw 1 = closed, `lid_closed`'s polarity), so the edge, the
+// flip count and `sleep_request("lid")`/`wake("lid")` are the poll's own, unchanged. A busy or stuck EC read HOLDS the last
+// raw (no edge); with no EC lid (the rMBP: the EC gate is shut; no row; no ECDT) it answers `NoKey`, today's answer.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
+fn ec_lid() -> Msld {
+    use crate::drivers::ec::Lid;
+    match crate::drivers::ec::lid() {
+        Lid::Closed => Msld::Ok(1, 0),
+        Lid::Open => Msld::Ok(0, 0),
+        Lid::Unknown => match LID_RAW.load(Ordering::Relaxed) {
+            u32::MAX => Msld::Stuck(0),
+            r => Msld::Ok(r as u8, 0),
+        },
+        Lid::Absent => Msld::NoKey,
     }
 }

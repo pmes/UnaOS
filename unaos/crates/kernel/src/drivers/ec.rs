@@ -209,7 +209,7 @@ pub fn probe() {
     };
     // SAFETY: `root_sdt` vouched for the XSDT/RSDT and its entry size; firmware tables are identity-mapped.
     let Some(addr) = (unsafe { crate::arch::acpi::find_table(sdt, es, b"ECDT") }) else {
-        serial_println!("[ec] -> SKIP reason=no-ecdt");
+        serial_println!("[ec] -> SKIP reason=no-ecdt lid=?");
         return;
     };
     // SAFETY: `addr` is a table header listed by the root SDT; at most its own length (capped) is read.
@@ -241,15 +241,16 @@ pub fn probe() {
         base += 32;
     }
     match stuck {
-        None => serial_println!("[ec] census bytes={} stale={} ms={} -> ok", n, stale, ms),
+        None => serial_println!("[ec] census bytes={} stale={} ms={} -> ok lid={}", n, stale, ms, lid_census(&ram[..n]).word()),
         Some((at, s)) => serial_println!(
-            "[ec] census bytes={} stale={} ms={} -> stuck at={:#04x} step={} status={:#04x}",
+            "[ec] census bytes={} stale={} ms={} -> stuck at={:#04x} step={} status={:#04x} lid={}",
             n,
             stale,
             ms,
             at,
             s.step.name(),
-            s.status
+            s.status,
+            lid_census(&ram[..n]).word()
         ),
     }
 }
@@ -468,8 +469,8 @@ struct BatteryOffsets {
 const EC_BATTERY_OFFSETS: &[BatteryOffsets] = &[];
 
 /// The row for platform `tok` in `table`.
-fn row_for<'a>(tok: &str, table: &'a [BatteryOffsets]) -> Option<&'a BatteryOffsets> {
-    table.iter().find(|r| r.platform == tok)
+fn row_for<'a, R: EcRow>(tok: &str, table: &'a [R]) -> Option<&'a R> {
+    table.iter().find(|r| r.platform() == tok)
 }
 
 /// Why a row's read gave no reading: a stuck handshake at an address, or a byte out of range at an address.
@@ -520,16 +521,9 @@ pub fn battery() -> Option<Reading> {
         return None;
     }
     let tok = crate::hw::platform().token();
-    let out = match (row_for(tok, EC_BATTERY_OFFSETS), PORTS.get()) {
-        (None, _) => Err(Miss::NoOffsets),
-        (Some(_), None) => Err(Miss::NoEcdt),
-        (Some(row), Some(&(cmd, data))) => match TXN.try_lock() {
-            None => Err(Miss::Busy),
-            Some(_txn) => {
-                let mut io = PortIo { cmd, data, start: 0, budget: (crate::arch::hw_wait_budget() / 200).max(1) };
-                read_row(&mut io, row).map_err(Miss::Read)
-            }
-        },
+    let out = match row_for(tok, EC_BATTERY_OFFSETS) {
+        None => Err(Miss::NoOffsets),
+        Some(row) => conversation(|io| read_row(io, row)).and_then(|r| r.map_err(Miss::Read)), // ZENBOOKECLID (zenbook-ledger Z27): the ONE conversation (file tail)
     };
     if !SOURCE_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
         say_source(tok, &out);
@@ -595,8 +589,8 @@ pub fn battery_selftest() {
     let mut f = kat_battery(73, 0x02);
     let charge = read_row(&mut f, &KAT_ROW);
     let charge_ok = charge == Ok(Reading { pct: 73, charging: true, ma: 1200, mv: 12300 }) && !f.bad_cmd;
-    let cases: [(&str, bool); 5] =
-        [("charge", charge_ok), ("discharge", bkat_discharge()), ("range", bkat_range()), ("stuck", bkat_stuck()), ("table", bkat_table())];
+    let cases: [(&str, bool); 6] =
+        [("charge", charge_ok), ("discharge", bkat_discharge()), ("range", bkat_range()), ("stuck", bkat_stuck()), ("table", bkat_table()), ("lid", bkat_lid())]; // ZENBOOKECLID (zenbook-ledger Z27): the lid leg (file tail)
     let mut ok = 0;
     let mut first: Option<&str> = None;
     for (name, r) in cases {
@@ -611,4 +605,223 @@ pub fn battery_selftest() {
         (None, Ok(r)) => serial_println!(":: ECBATTERY: src=ec pct={} charging={} cases={}/{} -> PASS ::", r.pct, yes_no(r.charging), ok, cases.len()),
         (name, _) => serial_println!(":: ECBATTERY: case={} -> FAIL ::", name.unwrap_or("charge")),
     }
+}
+
+// ── ZENBOOKECLID (zenbook-ledger Z27) — the lid through the EC, by TABLE, and the probe that finds its offset. TAIL-APPENDED ─
+// The lid's EC field is the DSDT's (`_LID` reads an `EmbeddedControl` Field) and this tree runs no AML (BP-power-4); no DSDT
+// dump exists in the tree and nothing has flown, so the lid is a TABLE row keyed by the platform token like the battery's,
+// and the table ships EMPTY (no guessed row): until ZENBOOK-EC-LIDROW lands every platform answers `lid=?`. `lid()` is the
+// EC source beside the SMC's `MSLD` in `video::lidsleep::read_msld` (its `Absent` arm, `ec_lid`); the census line carries
+// `lid=` decoded from the RAM it already read. `tests eclid` (registered, never at boot) is the bench's way to the offset:
+// three 256-byte snapshots, lid open / closed / open, and every address with A == C and A != B printed. READ ONLY: RD_EC
+// through `rd_byte`/`census`, under the ONE `conversation` (the ECDT ports + the `TXN` try_lock + a bounded `PortIo`),
+// which `battery()` shares. `tests ecbattery`'s `lid` case decodes a canned row over the KAT's fake EC.
+
+/// A table row's platform token — the ONE lookup `row_for` serves both tables through.
+trait EcRow {
+    fn platform(&self) -> &'static str;
+}
+
+impl EcRow for BatteryOffsets {
+    fn platform(&self) -> &'static str {
+        self.platform
+    }
+}
+
+/// Where one platform's lid bit sits in EC RAM.
+struct LidOffset {
+    /// `hw::Platform::token()` of the machine this row describes.
+    platform: &'static str,
+    /// The byte, and the bit in it.
+    addr: u8,
+    bit: u8,
+    /// The bit reads 1 while the lid is closed (else 0 while closed).
+    closed_when_set: bool,
+}
+
+impl EcRow for LidOffset {
+    fn platform(&self) -> &'static str {
+        self.platform
+    }
+}
+
+/// The rows. EMPTY: the Zenbook's lid offset comes from the bench's `tests eclid` (or the DSDT's `_LID` Field), never a guess.
+const EC_LID_OFFSETS: &[LidOffset] = &[];
+
+/// The lid as the EC answers it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lid {
+    Open,
+    Closed,
+    /// A row exists but this read gave nothing (the conversation busy, a stuck handshake): hold the last reading.
+    Unknown,
+    /// No EC lid here: the gate refused, no row for this platform, or no ECDT.
+    Absent,
+}
+
+impl Lid {
+    pub fn word(self) -> &'static str {
+        match self {
+            Lid::Open => "open",
+            Lid::Closed => "closed",
+            Lid::Unknown | Lid::Absent => "?",
+        }
+    }
+}
+
+/// The `[ec] lid source=` line has been printed (once per boot, at the first `lid()`).
+static LID_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The ONE runtime EC conversation: the ECDT ports `probe` kept, the `TXN` lock by `try_lock` only (busy = no reading),
+/// and a bounded `PortIo` handed to `f` while the lock is held.
+fn conversation<T>(f: impl FnOnce(&mut PortIo) -> T) -> Result<T, Miss> {
+    let Some(&(cmd, data)) = PORTS.get() else { return Err(Miss::NoEcdt) };
+    let Some(_txn) = TXN.try_lock() else { return Err(Miss::Busy) };
+    let mut io = PortIo { cmd, data, start: 0, budget: (crate::arch::hw_wait_budget() / 200).max(1) };
+    Ok(f(&mut io))
+}
+
+/// `true` = closed, by the row's bit and polarity.
+fn lid_bit(byte: u8, row: &LidOffset) -> bool {
+    ((byte >> (row.bit & 7)) & 1 != 0) == row.closed_when_set
+}
+
+/// One lid read through `rd_byte` (`true` = closed).
+fn read_lid<I: EcIo>(io: &mut I, row: &LidOffset) -> Result<bool, Why> {
+    rd_byte(io, row.addr).map(|b| lid_bit(b, row))
+}
+
+/// The lid decoded from RAM already read (no port I/O): `Absent` with no row, `Unknown` past the bytes read.
+fn lid_census_in(ram: &[u8], row: Option<&LidOffset>) -> Lid {
+    let Some(r) = row else { return Lid::Absent };
+    match ram.get(r.addr as usize) {
+        Some(&b) if lid_bit(b, r) => Lid::Closed,
+        Some(_) => Lid::Open,
+        None => Lid::Unknown,
+    }
+}
+
+/// The census line's `lid=`: this platform's row over the census bytes.
+fn lid_census(ram: &[u8]) -> Lid {
+    lid_census_in(ram, row_for(crate::hw::platform().token(), EC_LID_OFFSETS))
+}
+
+fn miss_word(m: &Miss) -> &'static str {
+    match m {
+        Miss::NoOffsets => "no-offsets",
+        Miss::NoEcdt => "no-ecdt",
+        Miss::Busy => "busy",
+        Miss::Read(Why::Stuck(..)) => "stuck",
+        Miss::Read(Why::Range(..)) => "range",
+    }
+}
+
+/// The lid through the EC. Silent and port-free (`Absent`) unless `hw::gate(Probe::Ec)`; prints ONE
+/// `[ec] lid source=ec|none platform=<token> …` line per boot at the first call. Called from `video::lidsleep`'s `ec_lid`.
+pub fn lid() -> Lid {
+    if !crate::hw::gate(crate::hw::Probe::Ec) {
+        return Lid::Absent;
+    }
+    let tok = crate::hw::platform().token();
+    let out = match row_for(tok, EC_LID_OFFSETS) {
+        None => Err(Miss::NoOffsets),
+        Some(row) => conversation(|io| read_lid(io, row)).and_then(|r| r.map_err(Miss::Read)),
+    };
+    if !LID_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        match &out {
+            Ok(c) => serial_println!("[ec] lid source=ec platform={} lid={}", tok, if *c { "closed" } else { "open" }),
+            Err(m) => serial_println!("[ec] lid source=none platform={} why={}", tok, miss_word(m)),
+        }
+    }
+    match out {
+        Ok(true) => Lid::Closed,
+        Ok(false) => Lid::Open,
+        Err(Miss::NoOffsets) | Err(Miss::NoEcdt) => Lid::Absent,
+        Err(Miss::Busy) | Err(Miss::Read(_)) => Lid::Unknown,
+    }
+}
+
+/// One 256-byte snapshot through `census` inside the conversation; a busy lock is retried once after 50 ms.
+fn lid_snap(ram: &mut [u8; 256]) -> Result<(), Miss> {
+    let mut tries = 0;
+    loop {
+        match conversation(|io| census(io, &mut ram[..])) {
+            Ok((_, _, None)) => return Ok(()),
+            Ok((_, _, Some((at, s)))) => return Err(Miss::Read(Why::Stuck(at, s))),
+            Err(Miss::Busy) if tries == 0 => {
+                tries += 1;
+                crate::arch::sched::sleep_ms(50);
+            }
+            Err(m) => return Err(m),
+        }
+    }
+}
+
+/// `tests eclid` (registered, never at boot): the bench's way to the lid offset. Snapshot A (lid open), 10 s to CLOSE the
+/// lid, snapshot B, 10 s to OPEN it, snapshot C; every address with A == C and A != B is a candidate. READ ONLY (RD_EC).
+pub fn lid_probe() {
+    if !crate::hw::gate(crate::hw::Probe::Ec) {
+        serial_println!(":: ECLID: -> SKIP reason=no-ec ::");
+        return;
+    }
+    if PORTS.get().is_none() {
+        serial_println!(":: ECLID: -> SKIP reason=no-ecdt ::");
+        return;
+    }
+    let mut snaps = [[0u8; 256]; 3];
+    for k in 0..3 {
+        if k == 1 {
+            serial_println!("[ec] lid probe: CLOSE the lid within 10 s");
+            crate::arch::sched::sleep_ms(10_000);
+        } else if k == 2 {
+            serial_println!("[ec] lid probe: OPEN the lid within 10 s");
+            crate::arch::sched::sleep_ms(10_000);
+        }
+        match lid_snap(&mut snaps[k]) {
+            Ok(()) => {}
+            Err(Miss::Read(Why::Stuck(at, s))) => {
+                serial_println!(":: ECLID: snap={} -> FAIL :: reason=stuck at={:#04x} step={} status={:#04x}", k, at, s.step.name(), s.status);
+                return;
+            }
+            Err(m) => {
+                serial_println!(":: ECLID: snap={} -> FAIL :: reason={}", k, miss_word(&m));
+                return;
+            }
+        }
+    }
+    let mut n = 0u32;
+    for a in 0..256usize {
+        let (o, c, o2) = (snaps[0][a], snaps[1][a], snaps[2][a]);
+        if o == o2 && o != c {
+            n += 1;
+            serial_println!("[ec] lid probe addr={:#04x} open={:#04x} closed={:#04x} xor={:#04x}", a, o, c, o ^ c);
+        }
+    }
+    if n >= 1 {
+        serial_println!(":: ECLID: candidates={} -> PASS ::", n);
+    } else {
+        serial_println!(":: ECLID: candidates=0 -> FAIL :: reason=no-flip");
+    }
+}
+
+/// The KAT's canned lid rows (never in `EC_LID_OFFSETS`): bit 2 of byte 9, both polarities.
+const KAT_LID: LidOffset = LidOffset { platform: "kat", addr: 9, bit: 2, closed_when_set: true };
+const KAT_LID_INV: LidOffset = LidOffset { platform: "kat", addr: 9, bit: 2, closed_when_set: false };
+
+/// `tests ecbattery`'s `lid` case: set/clear x polarity through `rd_ec`, the census decode agrees with the read, a stuck
+/// handshake names the address, and no Zenbook row is shipped.
+fn bkat_lid() -> bool {
+    let mut f = Fake::new();
+    f.ram[9] = 0x04 | 0x01;
+    let set = read_lid(&mut f, &KAT_LID) == Ok(true) && read_lid(&mut f, &KAT_LID_INV) == Ok(false);
+    let census_closed = lid_census_in(&f.ram, Some(&KAT_LID)) == Lid::Closed;
+    f.ram[9] = 0x01 | 0x08;
+    let clear = read_lid(&mut f, &KAT_LID) == Ok(false) && read_lid(&mut f, &KAT_LID_INV) == Ok(true);
+    let census_open = lid_census_in(&f.ram, Some(&KAT_LID)) == Lid::Open
+        && lid_census_in(&f.ram, None) == Lid::Absent
+        && lid_census_in(&f.ram[..4], Some(&KAT_LID)) == Lid::Unknown;
+    let mut w = Fake::new();
+    w.obf_wedge = true;
+    let stuck = matches!(read_lid(&mut w, &KAT_LID), Err(Why::Stuck(9, Stuck { step: Step::Obf, .. })));
+    set && census_closed && clear && census_open && stuck && !f.bad_cmd && row_for("zenbook_um5606w", EC_LID_OFFSETS).is_none()
 }
