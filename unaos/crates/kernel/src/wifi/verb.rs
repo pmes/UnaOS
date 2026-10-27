@@ -257,10 +257,10 @@ fn ssid_view(b: &[u8]) -> alloc::string::String {
 pub fn wifijoin() {
     use crate::drivers::mt7925 as mt;
     use wifi_core::ieee80211 as w;
-    let s9w = mt::watch_kat(super::assoc::refusal); let s9r = mt::rejoin_kat(); let kat = mt::join_kat() && super::assoc::kat().2.is_none() && super::assoc::wpa2_kat().iter().all(|&k| k) && s9w && s9r; // S9REJOIN (zenbook-ledger Z59): `s9r`, the rejoin's backoff sequence over a stub attempt and the unlink bodies; S9WATCH (zenbook-ledger Z56): the S9 link watch's rows with the station's own judge (LINE-NEUTRAL)
+    let s10p = mt::pmk_rows().map_or(false, |p| super::assoc::pmk_kat(&p));     let s9w = mt::watch_kat(super::assoc::refusal); let s9r = mt::rejoin_kat(); let kat = mt::join_kat() && super::assoc::kat().2.is_none() && super::assoc::wpa2_kat().iter().all(|&k| k) && s9w && s9r && s10p; // S9REJOIN (zenbook-ledger Z59): `s9r`, the rejoin's backoff sequence over a stub attempt and the unlink bodies; S9WATCH (zenbook-ledger Z56): the S9 link watch's rows with the station's own judge (LINE-NEUTRAL)
     let k = if kat { "ok" } else { "FAIL" };
     if !mt::registered() {
-        serial_println!(":: wifijoin: kat={} s9watch={} s9rejoin={} radio=absent -> {} ::", k, if s9w { "ok" } else { "FAIL" }, if s9r { "ok" } else { "FAIL" }, if kat { "PASS" } else { "FAIL" }); // S9WATCH (Z56): s9watch=; S9REJOIN (Z59): s9rejoin=
+        serial_println!(":: wifijoin: kat={} s9watch={} s9rejoin={} s10pmk={} radio=absent -> {} ::", k, if s9w { "ok" } else { "FAIL" }, if s9r { "ok" } else { "FAIL" }, if s10p { "ok" } else { "FAIL" }, if kat { "PASS" } else { "FAIL" }); // S9WATCH (Z56): s9watch=; S9REJOIN (Z59): s9rejoin=
         return;
     }
     mt::rejoin_keep(None); let ssid = crate::tests::arg().unwrap_or_default(); // S9REJOIN (zenbook-ledger Z59): the operator's join forgets the kept plan (a successful open join keeps its own)
@@ -335,12 +335,12 @@ pub fn wifijoin() {
         );
     }
     serial_println!(
-        ":: wifijoin: kat={} s9watch={} s9rejoin={} radio=mt7925 ssid={} auth={} assoc={} -> {} ::", // S9WATCH (Z56): s9watch=; S9REJOIN (Z59): s9rejoin=
-        k, if s9w { "ok" } else { "FAIL" }, if s9r { "ok" } else { "FAIL" }, plan.ssid, if authed { "ok" } else { "no" }, aid.map_or(alloc::string::String::from("-"), |a| alloc::format!("aid={}", a)),
+        ":: wifijoin: kat={} s9watch={} s9rejoin={} s10pmk={} radio=mt7925 ssid={} auth={} assoc={} -> {} ::", // S10PMKKEEP (Z64): s10pmk=; S9WATCH (Z56): s9watch=; S9REJOIN (Z59): s9rejoin=
+        k, if s9w { "ok" } else { "FAIL" }, if s9r { "ok" } else { "FAIL" }, if s10p { "ok" } else { "FAIL" }, plan.ssid, if authed { "ok" } else { "no" }, aid.map_or(alloc::string::String::from("-"), |a| alloc::format!("aid={}", a)),
         if kat && aid.is_some() { "PASS" } else { "FAIL" }
     );
     if aid.is_some() {
-        let open = rsn.is_none(); if s10_wpa2(me, bssid, ch, &ssid, rsn, pmk) { if open { rejoin_keep(sb, bssid, ch, cap); } s9_dhcp(); } // S9REJOIN (zenbook-ledger Z59): an OPEN join's plan kept for the automatic rejoin (a WPA2 one needs S10-PMK-KEEP).  MT7925S9 (zenbook-ledger Z46): smolnet's one DHCP client over the S9 link, then the link's counts
+        let open = rsn.is_none(); if s10_wpa2(me, bssid, ch, &ssid, rsn, pmk, Some(cap)) { if open { rejoin_keep(sb, bssid, ch, cap, None); } s9_dhcp(); } // S9REJOIN (zenbook-ledger Z59): an OPEN join's plan kept for the automatic rejoin; S10PMKKEEP (Z64): a WPA2 join's kept inside s10_wpa2 (SECURED, `Some(cap)`).  MT7925S9 (zenbook-ledger Z46): smolnet's one DHCP client over the S9 link, then the link's counts
     }
 }
 
@@ -419,7 +419,7 @@ fn s9_dhcp() {
 /// awaited BEFORE the keys are handed to the radio (`mt::set_keys`: linux and wpa_supplicant's order — the AP must see message 4
 /// under the old, unencrypted state); one verdict line. True = SECURED, so the caller runs its DHCP; false = refused, said by name,
 /// no DHCP. The PMK, the PTK and the keys are wiped on every exit (their owners' Drop); no key byte is printed.
-fn s10_wpa2(me: [u8; 6], bssid: [u8; 6], ch: u8, ssid: &str, rsn: Option<alloc::vec::Vec<u8>>, pmk: Option<crypto_core::ct::SecretBytes<32>>) -> bool {
+fn s10_wpa2(me: [u8; 6], bssid: [u8; 6], ch: u8, ssid: &str, rsn: Option<alloc::vec::Vec<u8>>, pmk: Option<crypto_core::ct::SecretBytes<32>>, cap: Option<u16>) -> bool {
     use super::assoc::{eapol_eth, eapol_payload, Handshake, Why};
     use crate::drivers::mt7925 as mt;
     let (Some(rsn), Some(pmk)) = (rsn, pmk) else { return true };
@@ -488,6 +488,7 @@ fn s10_wpa2(me: [u8; 6], bssid: [u8; 6], ch: u8, ssid: &str, rsn: Option<alloc::
         return refuse(&alloc::format!("set-key({})", e));
     }
     serial_println!(":: wifijoin: s10 wpa2 ssid={} -> SECURED ::", ssid_view(ssid.as_bytes()));
+    if let Some(c) = cap { rejoin_keep(ssid.as_bytes(), bssid, ch, c, Some((rsn.as_slice(), &pmk.0))); } // MT7925S10PMKKEEP (zenbook-ledger Z64): the operator's secured join keeps its PMK and the beacon RSN element; the rejoin's own (cap None) must not reset the ladder
     true
 }
 
@@ -547,17 +548,28 @@ fn join_frames(
 
 /// After a successful OPEN `tests wifijoin` (the S9 link up): the plan kept in the driver for the automatic rejoin — the SSID bytes,
 /// the BSS, its channel and capability, the station's judge, `rejoin_again` and `s9_dhcp`.
-fn rejoin_keep(sb: &[u8], bssid: [u8; 6], ch: u8, cap: u16) {
+fn rejoin_keep(sb: &[u8], bssid: [u8; 6], ch: u8, cap: u16, sec: Option<(&[u8], &[u8; 32])>) {
     use crate::drivers::mt7925 as mt;
     if !mt::linked() {
         return;
+    }
+    let (mut pmk, mut rsn, mut rsn_len) = ([0u8; 32], [0u8; 128], 0u8); // MT7925S10PMKKEEP (zenbook-ledger Z64): a WPA2 plan carries the PMK and the beacon RSN element; over 128 octets is not kept (RSN-LONG owed)
+    if let Some((e, k)) = sec {
+        if e.is_empty() || e.len() > 128 {
+            serial_println!("[mt7925] s10 pmkkeep -> NOT KEPT why=rsn-len({})", e.len());
+            return;
+        }
+        pmk = *k;
+        rsn[..e.len()].copy_from_slice(e);
+        rsn_len = e.len() as u8;
     }
     let mut ssid = [0u8; 32];
     let n = sb.len().min(32);
     ssid[..n].copy_from_slice(&sb[..n]);
     mt::rejoin_keep(Some(mt::RejoinPlan {
-        ssid, ssid_len: n as u8, bssid, channel: ch, cap, watch: super::assoc::refusal, again: rejoin_again, dhcp: s9_dhcp,
+        ssid, ssid_len: n as u8, bssid, channel: ch, cap, watch: super::assoc::refusal, again: rejoin_again, dhcp: s9_dhcp, pmk, rsn, rsn_len,
     }));
+    super::assoc::zeroize_pmk(&mut pmk); // the local copy wiped (the plan's own is wiped by the driver's Drop)
 }
 
 /// ONE rejoin attempt from the driver's `mt7925-rejoin` task: the kept plan through the same `join_frames` -> `mt7925::join` (open:
@@ -569,12 +581,22 @@ fn rejoin_again(p: &crate::drivers::mt7925::RejoinPlan) -> Result<(), &'static s
     let sb = &p.ssid[..(p.ssid_len as usize).min(32)];
     let plan = mt::JoinPlan { ssid: &ssid_view(sb), bssid: p.bssid, channel: p.channel, watch: p.watch };
     let mut seen = Seen::default();
-    let rep = join_frames(&plan, me, sb, p.cap, false, &mut seen)?;
+    let rep = join_frames(&plan, me, sb, p.cap, p.rsn_len > 0, &mut seen)?; // MT7925S10PMKKEEP (zenbook-ledger Z64): a WPA2 plan's association carries the RSN element
     if !matches!(rep.auth, mt::Step::Ans(mt::Answer::Ok(_))) {
         return Err("auth");
     }
     if !matches!(rep.assoc, mt::Step::Ans(mt::Answer::Ok(_))) {
         return Err("assoc");
     }
-    if mt::linked() { Ok(()) } else { Err("link") }
+    if !mt::linked() {
+        return Err("link");
+    }
+    if p.rsn_len == 0 {
+        return Ok(());
+    }
+    // MT7925S10PMKKEEP (zenbook-ledger Z64): the SAME `s10_wpa2` from the kept PMK and the kept beacon RSN element (no passphrase, no
+    // scan); `cap` None, so the rejoin's own success does not re-keep. Its REFUSED lines carry the reason; false = `wpa2`.
+    let rsn = p.rsn[..(p.rsn_len as usize).min(128)].to_vec();
+    let ssid = core::str::from_utf8(sb).unwrap_or("");
+    if s10_wpa2(me, p.bssid, p.channel, ssid, Some(rsn), Some(crypto_core::ct::SecretBytes(p.pmk)), None) { Ok(()) } else { Err("wpa2") }
 }

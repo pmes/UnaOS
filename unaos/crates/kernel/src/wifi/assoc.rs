@@ -794,3 +794,33 @@ impl Rejoin {
         self.delay_ms = REJOIN_FIRST_MS;
     }
 }
+
+// ── MT7925S10PMKKEEP (zenbook-ledger Z64): the kept PMK through the handshake ───────────────────────────────────────────────────
+/// Wipe a PMK in place (the kept plan's, in the driver, which links no `crypto_core`).
+pub fn zeroize_pmk(p: &mut [u8; 32]) {
+    p.zeroize();
+}
+
+/// `tests wifijoin`'s `s10pmk=`: the KEPT PMK (`mt7925::pmk_rows`' read-back; Annex J.4 test 2's PSK) through `Handshake::new` and
+/// the canned message 1 / message 3 of `wpa2_kat` (same addresses and nonces): the PTK is the pinned e677aae8..., the keys come
+/// out as canned (TK = PTK[32..48], the GTK and its index), and a PMK with one flipped bit is refused at message 3 by the MIC.
+pub fn pmk_kat(pmk: &[u8; 32]) -> bool {
+    let (aa, spa): (Mac, Mac) = (core::array::from_fn(|i| 0xa0 + i as u8), core::array::from_fn(|i| 0xb0 + i as u8));
+    let (sn, an): ([u8; 32], [u8; 32]) = (core::array::from_fn(|i| 0xc0 + i as u8), core::array::from_fn(|i| 0xe0 + i as u8));
+    let want: [u8; 48] = hx("e677aae82af1fb9a25e93e22ad77022ed90489e672adcc6ae148d0afafb92b6936606222ae74d4d2d1db3ac91f6c2809");
+    let k = ptk(pmk, &aa, &spa, &an, &sn);
+    let gtk: [u8; 16] = core::array::from_fn(|i| 0x70 + i as u8);
+    let (m1, m3) = (kat_m1(&an, 1), kat_m3(&k, &an, 2, &RSN_PSK_CCMP, &gtk, 1));
+    let mut hs = Handshake::new(aa, spa, sn, &RSN_PSK_CCMP, pmk);
+    let good = k == want
+        && hs.on_m1(&m1).is_ok()
+        && match hs.on_m3(&m3) {
+            Ok((_, keys)) => keys.tk[..] == k[32..48] && keys.gtk == gtk && keys.gtk_id == 1,
+            Err(_) => false,
+        };
+    let mut wrong = *pmk;
+    wrong[0] ^= 1;
+    let mut hw = Handshake::new(aa, spa, sn, &RSN_PSK_CCMP, &wrong);
+    let _ = hw.on_m1(&m1);
+    good && hw.on_m3(&m3).err() == Some(Why::Mic)
+}
