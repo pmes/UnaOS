@@ -971,6 +971,6 @@ refs/heads/exec-rmbp-aacenctns   9eefbece1 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-kernelscaleonearm   bae965ecb FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbooksurvey   bc34e5569 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbooknvme   2358f512e FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-zenbooki8042   281b09c3e IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-zenbooki8042   69e242707 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookgop   281b09c3e IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-zenbookmt7925   281b09c3e IN-FLIGHT cut 2026-10-27
