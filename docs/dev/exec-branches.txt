@@ -835,7 +835,7 @@ refs/heads/exec-rmbp-nle3b   93b1f9431 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-onetext   056a7a524 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264enc2   9f778dc37 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-httpfail   d78ff23a7 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-wpa2join   1705724a4 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-wpa2join   1705724a4 SUPERSEDED (WPA2 join built by MT7925S10 Z55 / Z63 / Z64; executor lost at a container reset, no commit)
 refs/heads/exec-rmbp-demuxwire   03ecb5366 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-heaacps   bb1c77e81 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hevcpal   7616caccd FOLDED-BY-HAND (this commit) 2026-10-27
@@ -1072,3 +1072,14 @@ refs/heads/exec-rmbp-dwi2cfast   ed3e30636 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-zenbookecqnames   8341015a2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootledsxhci   e9ae3e423 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-openanytype   d00423fee FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-unafsreadunmasked   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-xhciloanfailhold   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-lockregforceunlock   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-maskwritesite   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-wmclosehook   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-gen7heldrelease   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-gen7sheet   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-preemptoffarm   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-wifileave   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-xhciloanptpcopy   edb51e58d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-loginfurnitureonce   eee01749e FOLDED-BY-HAND (this commit) 2026-10-27

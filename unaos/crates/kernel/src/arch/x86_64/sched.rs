@@ -9548,7 +9548,7 @@ pub mod preemptoff {
         let (sdhc_word, sdhc_sw): (&'static str, u64) = ("skip(no-sdhcblk)", 0);
         let converted_sdhc = cfg!(feature = "sdhcblk") as u32;
         let switched = switched.saturating_add(sdhc_sw);
-        let (lw, lw_us) = crate::drivers::block::xhci_loan_wait_kat(); let reason = if !on { // PREEMPTOFFXHCILOAN (Z62) leg: the masked claimant on a running block-loan holder (`loan_wait=`)
+        let (lw, lw_us) = crate::drivers::block::xhci_loan_wait_kat(); #[cfg(feature = "uvc")] let pp: &'static str = crate::drivers::xhci::ptp::loan_path_kat(); #[cfg(not(feature = "uvc"))] let pp: &'static str = "skip(no-uvc)"; let reason = if !on { // PREEMPTOFFXHCILOAN (Z62) leg: the masked claimant on a running block-loan holder (`loan_wait=`)
             Some("masked")
         } else if ticks == 0 {
             Some("no-tick")
@@ -9560,18 +9560,18 @@ pub mod preemptoff {
             Some("sdhc-not-held")
         } else if sdhc_word == "err" {
             Some("sdhc-read")
-        } else if !(lw == "ok" || lw.starts_with("skip")) { Some("loan-wait") } else {
+        } else if !(lw == "ok" || lw.starts_with("skip")) { Some("loan-wait") } else if !(pp == "ok" || pp.starts_with("skip")) { Some("ptp-path") } else {
             None
         };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word, lw, lw_us
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word, lw, lw_us, pp
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} -> FAIL reason={} ::",
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} -> FAIL reason={} ::",
                 AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word,
-                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, r
+                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, r
             ),
         }
     }
