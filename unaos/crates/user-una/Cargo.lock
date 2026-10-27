@@ -116,6 +116,9 @@ dependencies = [
 [[package]]
 name = "vp8_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "yuv_core"
