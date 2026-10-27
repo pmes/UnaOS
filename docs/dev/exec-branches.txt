@@ -1073,7 +1073,7 @@ refs/heads/exec-rmbp-zenbookecqnames   8341015a2 FOLDED-BY-HAND (this commit) 20
 refs/heads/exec-rmbp-hidbootledsxhci   e9ae3e423 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-openanytype   d00423fee FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-unafsreadunmasked   cd26b9213 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-xhciloanfailhold   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-xhciloanfailhold   04ed2f1d6 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-lockregforceunlock   7ea0109e6 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-maskwritesite   f4afe65ad FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-wmclosehook   cd26b9213 IN-FLIGHT cut 2026-10-27

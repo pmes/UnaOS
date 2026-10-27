@@ -7714,7 +7714,7 @@ impl XhciController {
         // BOT-RESCUE M3 witness 6: the failed stage's own pending record, taken out of
         // `run_bot_stage` instead of dropped, handed to recovery so its evidence line can carry the
         // truth about which pipe the stranded TRB sat on.
-        let failed = self.bot_failed.take();
+        let failed = self.bot_failed.take(); self.loan_shed_hook(true); // XHCILOANFAILHOLD (Z66): the ladder entry — a block loan sheds its preempt-off count and publication before recovery (`loan_shed_hook`, the file tail). LINE-NEUTRAL fold, code first
         if !self.recover_bot_full(slot_id, cause, failed) {
             // Recovery itself did not complete. Pre-arc this was the terminal Err; it now counts as
             // one failed cycle and enters the escalation ladder (which, below `BOT_RESCUE_N_CONSEC`,
@@ -11638,7 +11638,7 @@ impl XhciController {
             // wall-clock deadline below still bounds. KEPT, and not replaced by the spin above: the
             // spin cannot be the only wait, or TCG would never make progress — past its window this
             // path is byte-identical to what it was.
-            crate::hlt();
+            crate::hlt(); self.loan_shed_hook(false); // XHCILOANFAILHOLD (Z66): a block loan held >= LOAN_MASKED_WAIT_MS sheds at this wake (`loan_shed_hook`, the file tail). LINE-NEUTRAL fold, code first
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
                 // BOTCLAIM: the expiry-instant peek — taken FIRST, before a single byte of the
@@ -19419,5 +19419,35 @@ impl crate::drivers::hidboot::LedSlots for XhciController {
     }
     fn latch_off(&mut self, i: usize) {
         self.slots[i].keyboard_led_ok = false; // the case fold is untouched
+    }
+}
+
+// ══════════ XHCILOANFAILHOLD (zenbook-ledger Z66) — the BOT ladder's hook into the block loan's shed ══════════
+//
+// TAIL-APPENDED (two LINE-NEUTRAL call folds: the ladder entry in `bot_transfer_body` and the stage wait's `hlt` in
+// `pump_until_bot_done`). A failing BOT transfer runs its whole ladder inside the block layer's one `storage_*10` call, so
+// only this layer sees a rung; the block layer owns the loan's publication and count (`block::xhci_loan_shed`).
+impl XhciController {
+    /// XHCILOANFAILHOLD: ask the block layer to shed a block loan held by this call chain — at the ladder entry (gate 0)
+    /// or at a stage-wait wake (gate `LOAN_MASKED_WAIT_MS`). Controller 0 only (the only block-loaned controller);
+    /// aarch64 holds no preempt-off count (PREEMPTOFF-ARM), so nothing to shed there.
+    #[inline]
+    fn loan_shed_hook(&self, ladder: bool) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.xi != 0 {
+                return;
+            }
+            let (rung, gate) = if ladder {
+                ("ladder", 0)
+            } else if self.bot_budget_scale == BOT_BUDGET_SCALE_FIRST {
+                ("stage-first", crate::drivers::block::LOAN_MASKED_WAIT_MS)
+            } else {
+                ("stage-escalation", crate::drivers::block::LOAN_MASKED_WAIT_MS)
+            };
+            crate::drivers::block::xhci_loan_shed(rung, gate);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = ladder;
     }
 }
