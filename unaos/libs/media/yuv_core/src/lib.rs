@@ -127,12 +127,19 @@ pub struct Picture<'a, T> {
 /// 2x2 ordered (Bayer) dither thresholds, in quarters of an output LSB.
 const BAYER: [[i32; 2]; 2] = [[0, 2], [3, 1]];
 
-/// THE ONE Y'CbCr -> RGBA loop: packed 8-bit RGBA, row-major, into `out[..w * h * 4]` (alpha 255). A sample deeper than
+/// The whole picture through [`to_rgba_rows`]: packed 8-bit RGBA, row-major, into `out[..w * h * 4]`.
+pub fn to_rgba<T: Copy + Into<i32>>(p: &Picture<'_, T>, m: Matrix, up: Chroma, dither: bool, out: &mut [u8]) {
+    to_rgba_rows(p, 0, p.h, m, up, dither, out)
+}
+
+/// THE ONE Y'CbCr -> RGBA loop over rows `y0..y1` of the picture: packed 8-bit RGBA, row-major, into `out[..(y1 - y0) * w * 4]`
+/// (alpha 255); every neighbour read and the dither keyed on the absolute row, so its rows are the whole picture's rows byte for
+/// byte (KERNELSCALECONVERT rmbp-ledger B971: the kernel Player's shown rows). A sample deeper than
 /// 8 bits is narrowed inside the one rounded shift, after the conversion; with `dither` (and only above 8 bits) the
 /// rounding half is replaced by the 2x2 Bayer bias (1/8, 5/8, 7/8, 3/8 of an LSB, mean 1/2), so a flat field keeps its
 /// mean within half an LSB. YCgCo rounds half up (no dither). At 8-bit 4:2:0, `Matrix::Kr`, `Chroma::Nearest` and no
 /// dither this is COLOURONE's `yuv_to_rgba` byte for byte.
-pub fn to_rgba<T: Copy + Into<i32>>(p: &Picture<'_, T>, m: Matrix, up: Chroma, dither: bool, out: &mut [u8]) {
+pub fn to_rgba_rows<T: Copy + Into<i32>>(p: &Picture<'_, T>, y0: usize, y1: usize, m: Matrix, up: Chroma, dither: bool, out: &mut [u8]) {
     let n = p.bit_depth;
     let k = match m {
         Matrix::Table(k) => k,
@@ -171,7 +178,7 @@ pub fn to_rgba<T: Copy + Into<i32>>(p: &Picture<'_, T>, m: Matrix, up: Chroma, d
         if rf { (sum + ((1 << fs) >> 1)) >> fs } else { sum }
     };
     let (ys, cs) = if p.full { (((1i64 << n) - 1), ((1i64 << n) - 1)) } else { (219i64 << (n - 8), 224i64 << (n - 8)) };
-    for row in 0..p.h {
+    for row in y0..y1.min(p.h) {
         for col in 0..p.w {
             let yraw: i32 = p.y[row * p.y_stride + col].into();
             let yy = yraw - yoff;
@@ -202,7 +209,7 @@ pub fn to_rgba<T: Copy + Into<i32>>(p: &Picture<'_, T>, m: Matrix, up: Chroma, d
                     }
                 }
             };
-            let o = (row * p.w + col) * 4;
+            let o = ((row - y0) * p.w + col) * 4;
             out[o] = r.clamp(0, 255) as u8;
             out[o + 1] = g.clamp(0, 255) as u8;
             out[o + 2] = b.clamp(0, 255) as u8;
@@ -341,5 +348,62 @@ mod tests {
         to_rgba(&p, Matrix::Kr(KR_KB_709), Chroma::Fancy, false, &mut fancy);
         to_rgba(&q, Matrix::Kr(KR_KB_709), Chroma::Nearest, false, &mut full);
         assert_eq!(fancy, full);
+    }
+
+    #[test]
+    fn to_rgba_rows_are_to_rgbas_rows() {
+        // KERNELSCALECONVERT (rmbp-ledger B971): every row window of an LCG 10-bit 7x5 picture, 4:2:0 and 4:2:2, Nearest /
+        // Bilinear / Fancy, dither on and off, equals the whole conversion's slice.
+        const W: usize = 7;
+        const H: usize = 5;
+        let mut s = 0x9e37_79b9u32;
+        let mut next = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            64 + ((s >> 16) % 877) as u16
+        };
+        let mut y = [0u16; W * H];
+        let (mut u, mut v) = ([0u16; 4 * H], [0u16; 4 * H]);
+        y.iter_mut().for_each(|b| *b = next());
+        u.iter_mut().for_each(|b| *b = next());
+        v.iter_mut().for_each(|b| *b = next());
+        for ss in [(1u32, 1u32), (1, 0)] {
+            let p = Picture { w: W, h: H, y: &y, u: &u, v: &v, y_stride: W, uv_stride: 4, ss, mono: false, bit_depth: 10, full: false };
+            for up in [Chroma::Nearest, Chroma::Bilinear, Chroma::Fancy] {
+                for dither in [false, true] {
+                    let mut full = [0u8; W * H * 4];
+                    to_rgba(&p, Matrix::Kr(KR_KB_709), up, dither, &mut full);
+                    for y0 in 0..H {
+                        for y1 in y0 + 1..=H {
+                            let mut rows = [0u8; W * H * 4];
+                            to_rgba_rows(&p, y0, y1, Matrix::Kr(KR_KB_709), up, dither, &mut rows);
+                            assert_eq!(rows[..(y1 - y0) * W * 4], full[y0 * W * 4..y1 * W * 4], "{ss:?} {up:?} {dither} {y0}..{y1}");
+                        }
+                    }
+                }
+            }
+            // The kernel Player's AV1 shown rows: each sampled source row through to_rgba_rows (Bilinear), its columns sampled,
+            // equals the whole Bilinear conversion then nearest-sampled.
+            let mut full = [0u8; W * H * 4];
+            to_rgba(&p, Matrix::Kr(KR_KB_709), Chroma::Bilinear, false, &mut full);
+            for (dw, dh) in [(3usize, 2usize), (11, 9)] {
+                let mut idx = [0u32; H];
+                idx.iter_mut().enumerate().for_each(|(i, r)| *r = i as u32);
+                let col = Picture { w: 1, h: H, y: &idx[..], u: &[], v: &[], y_stride: 1, uv_stride: 0, ss: (0, 0), mono: true, bit_depth: 8, full: true };
+                let mut one = [0u32; 1];
+                let mut seen = 0;
+                crate::scale::nearest_rows(&col, 1, dh, &mut one, &mut [], &mut [], |r, sr| {
+                    let sy = sr.y[0] as usize;
+                    let mut row = [0u8; W * 4];
+                    to_rgba_rows(&p, sy, sy + 1, Matrix::Kr(KR_KB_709), Chroma::Bilinear, false, &mut row);
+                    for c in 0..dw {
+                        let sx = (c * W / dw).min(W - 1);
+                        assert_eq!(row[sx * 4..sx * 4 + 4], full[(sy * W + sx) * 4..(sy * W + sx) * 4 + 4], "{dw}x{dh} row {r} col {c}");
+                    }
+                    assert_eq!(sy, (r * H / dh).min(H - 1));
+                    seen += 1;
+                });
+                assert_eq!(seen, dh);
+            }
+        }
     }
 }

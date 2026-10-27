@@ -11,10 +11,10 @@
 //! * THE JOB (the DECJOB shape, DECJOBHANG B386): `play-vdec`, its own task on a worker core (never cpu 0 — the
 //!   clock core — never the caller's), a [`STACK`]-byte stack whose high-water is on the wire at exit. It reads the
 //!   file, demuxes it, decodes every picture in decode order (VP8 and AV1 keep references: no packet is skipped)
-//!   to 0RGB, and parks the frames in a queue of [`QUEUE`]. It never presents.
+//!   keeping each picture's planes (KERNELSCALECONVERT B971: converted where used, [`Px`]), and parks the frames in a queue of [`QUEUE`]. It never presents.
 //! * THE CONSUMER (the Player's pass — one per vblank): [`present`] reads the clock, takes the NEWEST queued frame
 //!   whose time has come, counts every older one it passed over as a drop, and blits it nearest-scaled and
-//!   letterboxed into the window's video rect. At most one present per pass.
+//!   letterboxed into the window's video rect, converting only the shown rows ([`Frame::rows`]). At most one present per pass.
 //! * THE CLOCK: the audio ring's position while the container's sound plays (a/v sync by the audio clock); a
 //!   pause-aware wall clock without sound (TEST.MP4 is AV1 alone) or after it ends. Until the ring arms (≤ 1.5 s)
 //!   the picture waits at its first frame.
@@ -59,12 +59,12 @@ const AUDIO_WAIT_MS: u64 = 1_500;
 /// A job whose queue nobody drained for this long (and not paused) ends itself.
 const ORPHAN_MS: u64 = 30_000;
 
-/// One decoded picture, 0RGB, at its coded size; `pts_ms` from the track's first packet.
+/// One decoded picture at its coded size (its planes or 0RGB, [`Px`]); `pts_ms` from the track's first packet.
 pub struct Frame {
     pub pts_ms: u64,
     pub w: usize,
     pub h: usize,
-    pub px: Vec<u32>,
+    pub px: Px,
     /// NLE6 (SR207): a utp1 picture's `(output tick, frame ordinal)` in the EDL mode — the presented frame counter the
     /// witness compares with the schedule (the kernel has no utp1 renderer: the pixels are a flat field).
     pub ord: Option<(i64, u32)>,
@@ -228,7 +228,7 @@ impl Pic {
     /// or back by [`StandIn`]'s rule — `DecodeSwap::decode`'s: a parked decoder is offered a keyframe once (a decode = it plays
     /// again, `Swap::Back`; a refusal = reset and parked again); a REAL decoder's core `Unsupported` parks it (reset), the
     /// stand-in paints the refused packet (`Swap::ToStandIn`); any other error is the caller's.
-    fn decode_swap(&mut self, t: &demux_core::Track, data: &[u8], pts: i64, key: bool) -> Result<(Option<(usize, usize, Vec<u32>)>, Option<Swap>), String> {
+    fn decode_swap(&mut self, t: &demux_core::Track, data: &[u8], pts: i64, key: bool) -> Result<(Option<(usize, usize, Px)>, Option<Swap>), String> {
         let parked = match self {
             Pic::StandIn(s) if key => s.parked.take(),
             _ => None,
@@ -265,13 +265,13 @@ impl Pic {
 
     /// One packet → the picture it shows (`None`: an alt-ref / dropped frame that shows nothing); the String error of
     /// [`Pic::decode_raw`] (the poster's door).
-    fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
+    fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Px)>, String> {
         self.decode_raw(data, 0).map_err(|e| e.1)
     }
 
     /// SWAPBACKVPLAY (B956): the decode arms; `Err((unsupported, why))`, `unsupported` = the core's own `Unsupported` (the
     /// swap's one trigger: av1_core's; vp8_core and utp1 have none). `pts` (track ticks) clocks the stand-in's counter.
-    fn decode_raw(&mut self, data: &[u8], pts: i64) -> Result<Option<(usize, usize, Vec<u32>)>, (bool, String)> {
+    fn decode_raw(&mut self, data: &[u8], pts: i64) -> Result<Option<(usize, usize, Px)>, (bool, String)> {
         match self {
             Pic::Vp8(d, c) => {
                 if data.is_empty() {
@@ -283,13 +283,11 @@ impl Pic {
                     Err(e) => return Err((false, alloc::format!("vp8: {:?}", e))),
                 };
                 let y = vp8_core::Yuv420::from_picture(&pic);
-                let rgba = colour_rgba_vp8(&y, *c);
-                Ok(Some((y.width as usize, y.height as usize, pack(&rgba))))
+                Ok(Some((y.width as usize, y.height as usize, Px::planes(Src::Vp8(y, *c))))) // KERNELSCALECONVERT (B971): the planes, converted where used
             }
             Pic::Av1(d, c) => {
                 let planes = d.decode_temporal_unit(data).map_err(|e| (matches!(e, av1_core::Error::Unsupported(_)), alloc::format!("av1: {:?}", e)))?;
-                let rgba = colour_rgba_av1(&planes, *c);
-                Ok(Some((planes.width as usize, planes.height as usize, pack(&rgba))))
+                Ok(Some((planes.width as usize, planes.height as usize, Px::planes(Src::Av1(Box::new(planes), *c))))) // KERNELSCALECONVERT (B971)
             }
             Pic::Utp1 => {
                 // the stream's own decoder: the packet names its frame; the picture is a flat field whose level steps
@@ -297,11 +295,11 @@ impl Pic {
                 let t = demux_core::build::TestPatternPacket::decode(data).ok_or_else(|| (false, String::from("utp1: not a UTP1 packet")))?;
                 let (w, h) = ((t.width as usize).max(1), (t.height as usize).max(1));
                 let l = 28 + t.frame % 200;
-                Ok(Some((w, h, alloc::vec![(l << 16) | (l << 8) | l; w * h])))
+                Ok(Some((w, h, alloc::vec![(l << 16) | (l << 8) | l; w * h].into())))
             }
             Pic::StandIn(s) => {
                 let n = demux_core::build::stand_in_counter(s.tb.to_ns(pts), s.frame_ns);
-                Ok(Some((s.w as usize, s.h as usize, pack(&demux_core::build::test_pattern_rgba(s.w, s.h, n)))))
+                Ok(Some((s.w as usize, s.h as usize, pack(&demux_core::build::test_pattern_rgba(s.w, s.h, n)).into())))
             }
         }
     }
@@ -321,10 +319,10 @@ fn pack(rgba: &[u8]) -> Vec<u32> {
 
 /// Nearest-scale `f` into the `bw x bh` rect at `(x, y)` of a `stride`-wide surface, aspect kept, the bars
 /// `bar`. Returns the picture's drawn size. KERNELSCALEONE (rmbp-ledger B965): the letterbox and the samples are yuv_core's
-/// ONE resampler (`yuv_core::scale::fit` / `nearest_rows`, user-stria's too) over the frame as a mono `Picture<u32>`.
+/// ONE resampler (`yuv_core::scale::fit` / `nearest_rows`, user-stria's too). KERNELSCALECONVERT (rmbp-ledger B971): only the
+/// shown rows convert ([`Frame::rows`]).
 pub fn blit_fit(dst: &mut [u32], stride: usize, x: usize, y: usize, bw: usize, bh: usize, f: &Frame, bar: Option<u32>) -> (usize, usize) {
-    let pic = yuv_core::Picture { w: f.w, h: f.h, y: &f.px[..], u: &[], v: &[], y_stride: f.w, uv_stride: 0, ss: (0, 0), mono: true, bit_depth: 8, full: true };
-    if f.w == 0 || f.h == 0 || bw == 0 || bh == 0 || !yuv_core::scale::fits(&pic) {
+    if f.w == 0 || f.h == 0 || bw == 0 || bh == 0 || !f.fits() {
         return (0, 0);
     }
     let fr = yuv_core::scale::fit(f.w, f.h, bw, bh);
@@ -342,11 +340,10 @@ pub fn blit_fit(dst: &mut [u32], stride: usize, x: usize, y: usize, bw: usize, b
             dst[row + x..row + x + bw].fill(c);
         }
     }
-    let mut buf = alloc::vec![0u32; dw];
-    yuv_core::scale::nearest_rows(&pic, dw, dh, &mut buf, &mut [], &mut [], |i, s| {
+    f.rows(dw, dh, |i, s| {
         let row = (oy + i) * stride;
         if row + x + bw <= dst.len() {
-            dst[row + ox..row + ox + dw].copy_from_slice(&s.y[..dw]);
+            dst[row + ox..row + ox + dw].copy_from_slice(&s[..dw]);
         }
     });
     (dw, dh)
@@ -835,6 +832,7 @@ fn poster_task(arg: usize) {
         for s in d.track_samples(d.track_index(vt.id).unwrap_or(0)).take(8) {
             let pk = d.packet_at(s);
             if let Some((w, h, px)) = pic.decode(&pk.data)? {
+                let _ = px.rgb(); // KERNELSCALECONVERT (B971): the poster converts on its own job; the render task blits the cached 0RGB
                 return Ok((f, Some(Frame { pts_ms: 0, w, h, px, ord: None })));
             }
         }
@@ -1077,7 +1075,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
                 if s.vmix.is_none() {
                     rep.gaps += 1; // a to-black step's black is mixed below (NLE6MIX)
                 }
-                Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize], ord: None }
+                Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize].into(), ord: None }
             }
             Some(id) => {
                 let (w, h, px, ord) = edl_frame(&reels, tl.tb, &mut run, id, s.src_t, s.seek.is_some(), rep, false)?;
@@ -1092,7 +1090,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         if pts_ms < seek_ms {
             continue; // a Player seek: the steps before it decoded unseen (job_task's rule)
         }
-        if let super::export::Sink::Encode = super::export::sink(jid) { super::export::frame(jid, tl.tb, vcount, frame.w, frame.h, &unpack(&frame.px)).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
+        if let super::export::Sink::Encode = super::export::sink(jid) { super::export::frame(jid, tl.tb, vcount, frame.w, frame.h, &unpack(frame.px.rgb())).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
         {
             let mut g = JOB.lock();
             let Some(j) = g.as_mut().filter(|j| j.jid == jid) else { return Err(("superseded", None)) };
@@ -1128,7 +1126,7 @@ fn edl_frame(
     seek: bool,
     rep: &mut EdlReport,
     outgoing: bool,
-) -> Result<(usize, usize, Vec<u32>, Option<u32>), (&'static str, Option<String>)> {
+) -> Result<(usize, usize, Px, Option<u32>), (&'static str, Option<String>)> {
     let r = reels.get(id).ok_or_else(|| ("reel-missing", Some(alloc::format!("no reel for source {}", id.0))))?;
     let (ti, vt, o) = r.v.as_ref().ok_or_else(|| ("no-video", Some(alloc::format!("reel {} has no video stream", id.0))))?;
     if seek || slot.as_ref().map(|x| x.src) != Some(id) {
@@ -1203,7 +1201,7 @@ fn edl_mix(
                 }
             }
             match edl_frame(reels, tb, mix, o, m.src_t, m.seek.is_some(), rep, true) {
-                Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => unpack(&px),
+                Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => unpack(px.rgb()),
                 Ok((ow, oh, _, _)) => {
                     *mix = None;
                     edl_refuse(rep, &alloc::format!("size {}x{} != {}x{}", ow, oh, w, h));
@@ -1218,13 +1216,13 @@ fn edl_mix(
             }
         }
     };
-    let b = unpack(&frame.px);
+    let b = unpack(frame.px.rgb());
     timeline_core::vmix::mix_step(m.kind, m.t, &mut a, &b, w as u32, h as u32);
     let sum = frame_fnv_rgba(&a);
     if rep.mixes.len() < SHOWN_CAP {
         rep.mixes.push((out_t, sum));
     }
-    frame.px = pack(&a);
+    frame.px = pack(&a).into();
     rep.mixed += 1;
     rep.mix_us_max = rep.mix_us_max.max(crate::hidstall::now_us().saturating_sub(t0));
     Ok(())
@@ -1294,10 +1292,8 @@ fn bitstream_colour(t: &demux_core::Track, first: &[u8]) -> Option<Colour> {
 
 /// A VP8 picture -> RGBA by the track's colour: 8-bit 4:2:0, nearest chroma (Stria's `Pixels::I420` path).
 fn colour_rgba_vp8(y: &vp8_core::Yuv420, c: Option<Colour>) -> Vec<u8> {
-    let (w, h) = (y.width as usize, y.height as usize);
-    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), y.width, y.height);
-    let p = yuv_core::Picture { w, h, y: &y.y, u: &y.u, v: &y.v, y_stride: w, uv_stride: y.chroma_width() as usize, ss: (1, 1), mono: false, bit_depth: 8, full };
-    let mut out = alloc::vec![0u8; w * h * 4];
+    let (p, m) = vp8_picture(y, c); // KERNELSCALECONVERT (B971): the one pick + Picture, shared with the shown rows (file tail)
+    let mut out = alloc::vec![0u8; p.w * p.h * 4];
     yuv_core::to_rgba(&p, m, yuv_core::Chroma::Nearest, false, &mut out);
     out
 }
@@ -1305,17 +1301,16 @@ fn colour_rgba_vp8(y: &vp8_core::Yuv420, c: Option<Colour>) -> Vec<u8> {
 /// An AV1 picture -> RGBA by the track's colour: av1_core's own `picture` (any depth, any subsampling) with the pick's
 /// range, bilinear chroma (Stria's `Av1Decoder`).
 fn colour_rgba_av1(planes: &av1_core::image::Planes, c: Option<Colour>) -> Vec<u8> {
-    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), planes.width, planes.height);
-    let p = yuv_core::Picture { full, ..av1_core::image::picture(planes) };
+    let (p, m) = av1_picture(planes, c); // KERNELSCALECONVERT (B971): the one pick + Picture, shared with the shown rows (file tail)
     let mut out = alloc::vec![0u8; p.w * p.h * 4];
     yuv_core::to_rgba(&p, m, yuv_core::Chroma::Bilinear, false, &mut out);
     out
 }
 
 /// The EDL report's coded-picture witness: a picture with no utp1 ordinal, while fewer than [`CODED_CAP`] are kept.
-fn coded(rep: &mut EdlReport, out_t: i64, ord: Option<u32>, px: &[u32]) {
+fn coded(rep: &mut EdlReport, out_t: i64, ord: Option<u32>, px: &Px) {
     if ord.is_none() && rep.coded.len() < CODED_CAP {
-        rep.coded.push((out_t, frame_fnv_rgba(&unpack(px))));
+        rep.coded.push((out_t, frame_fnv_rgba(&unpack(px.rgb())))); // KERNELSCALECONVERT (B971): converted (and cached) only when hashed
     }
 }
 
@@ -1795,7 +1790,7 @@ fn face_preview(seek_ms: u64, rep: &EdlReport, out_t: i64, f: &Frame) {
         return;
     }
     let mix = rep.mixes.last().filter(|m| m.0 == out_t).map(|m| m.1);
-    let sum = mix.unwrap_or_else(|| frame_fnv_rgba(&unpack(&f.px)));
+    let sum = mix.unwrap_or_else(|| frame_fnv_rgba(&unpack(f.px.rgb())));
     serial_println!("[nle] face preview tick={} mixed={}", out_t, mix.is_some() as u8);
     *PREVIEW.lock() = Some((out_t, mix.is_some(), sum));
 }
@@ -2027,4 +2022,114 @@ impl timeline_core::view::Text for ViewLabels {
         });
         self.0 += 1;
     }
+}
+
+// ── KERNELSCALECONVERT (rmbp-ledger B971): the frame's planes, converted where they are used ─────────────────────────────
+// handlers.md §5 NLEPROBE-HDR's KERNEL-SCALE-CONVERT. A decoded VP8 / AV1 picture rides the queue as the decoder's own planes
+// (`vp8_core::Yuv420`, `av1_core::image::Planes`) with the track's colour. A consumer that needs the whole picture (the
+// exporter, `edl_mix`, the `coded` and face-preview hashes) calls [`Px::rgb`]: the existing full conversion (`colour_rgba_vp8`
+// / `colour_rgba_av1` -> `pack`), once, cached, so every pin hashes the bytes it hashed before. The present path
+// ([`Frame::rows`]) converts only the rows the window shows: VP8 (Nearest) sampled by `yuv_core::scale::nearest_rows` and
+// converted per output row by `yuv_core::to_rgba`; AV1 (Bilinear) one sampled source row at a time by `yuv_core::to_rgba_rows`
+// (its neighbour chroma rows read from the whole planes), the columns then sampled; every row and column index is the
+// scaler's own. Bit for bit the full conversion then nearest-sampled. A dropped or run-up frame converts nothing. One holder
+// at a time (the job, the queue under `JOB`, the presenting pass, the poster under `POSTER`): no lock of its own.
+
+/// A frame's pixels: 0RGB, or a decoder's planes converted on first use ([`Px::rgb`]).
+pub struct Px {
+    src: Src,
+    rgb: core::cell::OnceCell<Vec<u32>>,
+}
+
+/// What a [`Px`] was made from.
+enum Src {
+    /// 0RGB (utp1, the stand-in, the EDL black, a mixed frame): the cell holds it.
+    Rgb,
+    Vp8(vp8_core::Yuv420, Option<Colour>),
+    Av1(Box<av1_core::image::Planes>, Option<Colour>),
+}
+
+impl From<Vec<u32>> for Px {
+    fn from(px: Vec<u32>) -> Px {
+        Px { src: Src::Rgb, rgb: core::cell::OnceCell::from(px) }
+    }
+}
+
+impl Px {
+    /// A decoder's planes, not yet converted.
+    fn planes(src: Src) -> Px {
+        Px { src, rgb: core::cell::OnceCell::new() }
+    }
+
+    /// The whole picture as 0RGB: converted on the first call (byte for byte the decode job's former conversion), then cached.
+    pub fn rgb(&self) -> &[u32] {
+        self.rgb.get_or_init(|| match &self.src {
+            Src::Vp8(y, c) => pack(&colour_rgba_vp8(y, *c)),
+            Src::Av1(p, c) => pack(&colour_rgba_av1(p, *c)),
+            Src::Rgb => Vec::new(),
+        })
+    }
+}
+
+/// A `w x h` 0RGB buffer as a mono `Picture<u32>` (how `nearest_rows` samples packed pixels).
+fn mono(w: usize, h: usize, px: &[u32]) -> yuv_core::Picture<'_, u32> {
+    yuv_core::Picture { w, h, y: px, u: &[], v: &[], y_stride: w, uv_stride: 0, ss: (0, 0), mono: true, bit_depth: 8, full: true }
+}
+
+impl Frame {
+    /// Every sample [`Frame::rows`] reads lies inside the frame's pixels (`w`, `h` > 0).
+    pub fn fits(&self) -> bool {
+        match (self.px.rgb.get(), &self.px.src) {
+            (Some(px), _) => yuv_core::scale::fits(&mono(self.w, self.h, px)),
+            (None, Src::Vp8(y, c)) => yuv_core::scale::fits(&vp8_picture(y, *c).0),
+            (None, Src::Av1(p, c)) => yuv_core::scale::fits(&av1_picture(p, *c).0),
+            (None, Src::Rgb) => false,
+        }
+    }
+
+    /// The frame nearest-sampled to `dw x dh`, each output row handed to `row(r, 0RGB)`: a cached or 0RGB frame through
+    /// `nearest_rows` (KERNELSCALEONE's blit); planes convert only the shown rows. `fits()`; `dw`, `dh` > 0.
+    pub fn rows(&self, dw: usize, dh: usize, mut row: impl FnMut(usize, &[u32])) {
+        let mut out = alloc::vec![0u32; dw];
+        match (self.px.rgb.get(), &self.px.src) {
+            (Some(px), _) => yuv_core::scale::nearest_rows(&mono(self.w, self.h, px), dw, dh, &mut out, &mut [], &mut [], |r, s| row(r, s.y)),
+            (None, Src::Vp8(y, c)) => {
+                let (p, m) = vp8_picture(y, *c);
+                let (mut ry, mut ru, mut rv, mut rgba) = (alloc::vec![0u8; dw], alloc::vec![0u8; dw], alloc::vec![0u8; dw], alloc::vec![0u8; dw * 4]);
+                yuv_core::scale::nearest_rows(&p, dw, dh, &mut ry, &mut ru, &mut rv, |r, s| {
+                    yuv_core::to_rgba(s, m, yuv_core::Chroma::Nearest, false, &mut rgba);
+                    row(r, &pack(&rgba));
+                });
+            }
+            (None, Src::Av1(pl, c)) => {
+                let (p, m) = av1_picture(pl, *c);
+                let idx: Vec<u32> = (0..self.h as u32).collect(); // the source row each output row samples: the scaler's own index
+                let (mut one, mut rgba) = ([0u32; 1], alloc::vec![0u8; self.w * 4]);
+                let mut line: (usize, Vec<u32>) = (usize::MAX, Vec::new());
+                yuv_core::scale::nearest_rows(&mono(1, self.h, &idx), 1, dh, &mut one, &mut [], &mut [], |r, s| {
+                    let sy = s.y[0] as usize;
+                    if line.0 != sy {
+                        yuv_core::to_rgba_rows(&p, sy, sy + 1, m, yuv_core::Chroma::Bilinear, false, &mut rgba);
+                        line = (sy, pack(&rgba));
+                    }
+                    yuv_core::scale::nearest_rows(&mono(self.w, 1, &line.1), dw, 1, &mut out, &mut [], &mut [], |_, t| row(r, t.y));
+                });
+            }
+            (None, Src::Rgb) => {}
+        }
+    }
+}
+
+/// A VP8 picture as yuv_core's `Picture` (8-bit 4:2:0) and the track colour's matrix: the ONE pick at the picture's size
+/// (`colour_rgba_vp8`'s and the shown rows').
+fn vp8_picture(y: &vp8_core::Yuv420, c: Option<Colour>) -> (yuv_core::Picture<'_, u8>, yuv_core::Matrix) {
+    let (w, h) = (y.width as usize, y.height as usize);
+    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), y.width, y.height);
+    (yuv_core::Picture { w, h, y: &y.y, u: &y.u, v: &y.v, y_stride: w, uv_stride: y.chroma_width() as usize, ss: (1, 1), mono: false, bit_depth: 8, full }, m)
+}
+
+/// An AV1 picture as av1_core's own `picture` with the pick's range, and the matrix (`colour_rgba_av1`'s and the shown rows').
+fn av1_picture(planes: &av1_core::image::Planes, c: Option<Colour>) -> (yuv_core::Picture<'_, u16>, yuv_core::Matrix) {
+    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), planes.width, planes.height);
+    (yuv_core::Picture { full, ..av1_core::image::picture(planes) }, m)
 }
