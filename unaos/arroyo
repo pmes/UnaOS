@@ -8425,7 +8425,7 @@ KERNEL_CFG_MATRIX=(
   "arm-tegra-image-supstate ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet,login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria,orindesk,orinclick,orinconwin,orinrender,supstate"
   # ── ZENBOOKIMAGELINE (appended 2026-10-27, zenbook-ledger Z6, wave36) — the Zenbook image line ──
   # scripts/image-line-zenbook.env's 27 kernel knobs (ZENBOOKACP Z25: + hda; MT7925S6 Z29: + wifi, the b43 ladder's wifi2..wifi10 still off), verbatim, in arroyo-map order (FOLDBUILD's lesson: an image
-  # line no leg compiles is a line that may not build — wc, installdemo and unafs WITHOUT ahci*, smc, kepler, ivb, hda,
+  # line no leg compiles is a line that may not build — wc, installdemo and unafs WITHOUT ahci*, smc, kepler, ivb, hda-tone, the Broadcom
   # wifi and bt are named by no other leg together). `./arroyo esp-zenbook` builds this set. UNIVERSE SIDE EFFECT:
   # none — an x86-* row subtracts nothing from `x86_cfg_universe`. Board legs +1.
   "x86-zenbook-image ../../x86_64-unaos.json witness,selfhost,wcg-paygo,wcdvalve,logts,tickless,login,installdemo,wifi,wc,deadman,linuxabi,busreg,lumen,stria,netring3,selfdiag,videoplayer,quarry,facet,ftdirx,usbnet,nvme,unafs,hda,uvc,ioapic"
@@ -10708,7 +10708,7 @@ banner_cert_arm() {   # banner_cert_arm <artifact>
 
 # BOOTLISTARM (rmbp-ledger B874, R132): ONE staging fn for the list every media verb carries — `esp-x86`, `esp-arm`,
 # `esp-jetson[-img]`, `kernel8`. It copies unaos/fixtures/TESTS.LIST (and TESTS.HEAVY) VERBATIM into the boot FAT tree:
-# one list for every board; a line's `@<board>` tags (rmbp12 / pi4 / orin = the kernel's `boot::OLDEST`) are filtered by
+# one list for every board; a line's `@<board>` tags (rmbp12 / pi4 / orin / zenbook = the board `boot::oldest()` answers, ZENBOOKOLDEST Z12) are filtered by
 # the kernel's `bootlist::parse`, so a card copy edited by hand reads the same everywhere (grammar: PLAYBOOK §4 item 7).
 # Each verb calls it BEFORE its card image is built from the tree. It stages only when a MEDIA dispatch arm set
 # `_BOOTLIST_MEDIA=1` (a shell variable, not a UNAOS_ knob): the QEMU lanes that reuse these fns (test_fat, test_selfhost,

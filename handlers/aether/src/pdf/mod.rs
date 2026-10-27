@@ -143,7 +143,7 @@ pub struct PdfDocument {
     pub pressed: Option<forms::Target>,
     pub hover: Option<forms::Target>,
     pub focus: Option<forms::FieldFocus>,
-    /// The last fill pdf_core refused, by name (the page shows the file as it was).
+    /// The last fill's refusal by name (`pdf_core::Error`, Debug: set_value, save_update, or `reload`'s re-parse and page-count check); None after an accepted fill (the page shows the file as it was).
     pub form_refused: Option<String>,
     /// PDF4-THUMBS (SR360): the thumbnail strip is open, and its width in CSS px (0 when closed; `thumbs::STRIP_W`
     /// device px at the zoom), which the page lane starts after.
