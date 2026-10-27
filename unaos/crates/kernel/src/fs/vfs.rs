@@ -3994,9 +3994,9 @@ fn el0_session_home() -> Option<String> {
 
 // NLE6EXPORTONE (rmbp-ledger B963; handlers.md §5 NLE6's NLE6EXPORT-WRITE): the ONE whole-file writer over the VFS, the loop
 // seven sites spelled (selfdiag `put_file`, bootwit / panicscreen / prefs `write_all`, trash `write_file`, the export, `tests
-// nle`'s fixture); the export and the fixture are on it, the other five are VFSPUT-ONE (owed), which lifts this cfg. At the
-// file tail, gated as `tests nle` is, so no line above moves and the knob-off image is unchanged.
-#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+// nle`'s fixture). VFSPUTONE (rmbp-ledger B964): every one is on it now (selfdiag / bootwit / panicscreen copies deleted,
+// prefs `write_all` and trash `write_file` one-line bindings), so the cfg is LIFTED: always compiled, x86_64 and aarch64.
+// (The line that held the `x86_64` + `videoplayer` cfg is this comment, so no line of the file moves.)
 impl MountTable {
     /// `data` as the whole of `path`: a directory is refused, an existing file unlinked (FAT has no shrink), the file created
     /// and written from offset 0 (selfdiag's `put_file` semantics). The bytes written.
