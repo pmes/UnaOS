@@ -319,3 +319,26 @@ pub fn lzw_encode(data: &[u8], early: bool) -> Vec<u8> {
     }
     out
 }
+
+/// PDFFORMS (SR326): the builder's annotation + AcroForm helper. Catalog 1 (`catalog_extra` inside it, e.g.
+/// `/AcroForm 30 0 R`), page tree 2, page `i` at 3 + 2i (40 x 40 pt, empty /Resources, `page_extra` inside it, e.g.
+/// `/Annots [20 0 R]`) with its content stream at 4 + 2i; `extra` objects (number, dictionary text or stream
+/// dictionary entries, stream bytes) numbered by the caller from 20.
+pub fn annot_pdf(catalog_extra: &str, pages: &[(&str, &str)], extra: &[(u32, &str, Option<&[u8]>)]) -> Vec<u8> {
+    let mut b = PdfBuilder::new(1);
+    b.obj(1, &format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"));
+    let kids: Vec<String> = (0..pages.len()).map(|i| format!("{} 0 R", 3 + 2 * i)).collect();
+    b.obj(2, &format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), pages.len()));
+    for (i, (page_extra, content)) in pages.iter().enumerate() {
+        let n = 3 + 2 * i as u32;
+        b.obj(n, &format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Resources << >> {page_extra} /Contents {} 0 R >>", n + 1));
+        b.stream(n + 1, "", content.as_bytes());
+    }
+    for (n, d, data) in extra {
+        match data {
+            Some(bytes) => b.stream(*n, d, bytes),
+            None => b.obj(*n, d),
+        };
+    }
+    b.classic()
+}

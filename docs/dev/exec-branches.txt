@@ -880,7 +880,7 @@ refs/heads/exec-rmbp-stationroam   52c0b238d FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-nle3cblack   f5dd95c24 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdf4   aec1d01c7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdfwrite   aec1d01c7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-pdfforms   aec1d01c7 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pdfforms   ac398ea1f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdftransparency   61ad90dd4 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-colourone   aec1d01c7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-swapback   1fb7f6f07 FOLDED-BY-HAND (this commit) 2026-10-27
