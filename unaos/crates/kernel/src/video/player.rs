@@ -1286,7 +1286,7 @@ mod nle_fx {
     const FPS: u32 = 25;
     /// The reels' frame ordinals start here (a frame names its reel and its index).
     const BASE: [u32; 2] = [1000, 2000];
-    const REELS: [&str; 3] = ["NLEFXA", "NLEFXB", "NLEFXC"];
+    const REELS: [&str; 4] = ["NLEFXA", "NLEFXB", "NLEFXC", "NLEFXD"]; // SWAPBACKVPLAY (rmbp-ledger B956): D = an mp4v reel no decoder fits (module tail)
     const FRAMES: u32 = 40;
     /// NLE6MIX (B899): `(output tick, FNV-1a 64 of the mixed 64x48 RGBA)` — tick 11 the dissolve at 2/5 (a flat 42), tick
     /// 22 the wipe to black at 3/5 (columns 0..37 black); timeline_core `vmix::tests::kernel_fixture_pins` re-derives both.
@@ -1338,9 +1338,9 @@ mod nle_fx {
         let mut tl = Timeline::new(FPS);
         let a = tl.add_source(REELS[0], FRAMES as i64);
         let b = tl.add_source(REELS[1], FRAMES as i64);
-        let c = tl.add_source(REELS[2], 4);
+        let c = tl.add_source(REELS[2], 4); let d = tl.add_source(REELS[3], 4); // SWAPBACKVPLAY (rmbp-ledger B956): D 0..4 at 39 (module tail)
         tl.add_track(Kind::Video);
-        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25), Clip::new(c, 0, 4, 35)];
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25), Clip::new(c, 0, 4, 35), Clip::new(d, 0, 4, 39)];
         tl.add_transition(0, 10, TransitionKind::Dissolve, 4)?.add_transition_to_black(0, 20, TransitionKind::Wipe(WipeDir::LeftToRight), 4)
     }
 
@@ -1361,10 +1361,11 @@ mod nle_fx {
                 return;
             }
         };
-        let files: [(String, Vec<u8>); 4] = [
+        let files: [(String, Vec<u8>); 5] = [
             (alloc::format!("{}.MP4", REELS[0]), reel(BASE[0])),
             (alloc::format!("{}.MP4", REELS[1]), reel(BASE[1])),
             (alloc::format!("{}.MP4", REELS[2]), vp8_reel()),
+            (alloc::format!("{}.MP4", REELS[3]), standin_reel()), // SWAPBACKVPLAY (rmbp-ledger B956)
             (String::from("NLEFX.EDL"), edl.into_bytes()),
         ];
         let put = |c: &str, body: &[u8]| -> bool {
@@ -1411,14 +1412,14 @@ mod nle_fx {
         let kat = MIX_KAT.iter().filter(|k| rep.mixes.contains(*k)).count();
         let mix_ok = rep.mixed == 8 && rep.mix_refused == 0 && kat == MIX_KAT.len();
         let colour = rep.coded.iter().filter(|k| **k == COLOUR_KAT).count(); // KERNELCOLOUR (B952): NLEFXC's middle frame by BT.709
-        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1; let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; // NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
+        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1 && standin_ok(&rep); let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; // NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
         serial_println!(
             "[nle] fixture edl={} presented={} dropped={} queued={} gaps={} seek_steps={} ms={}{}",
             path, pres, drop, rep.frames, rep.gaps, seek_steps, crate::arch::ms().saturating_sub(t0), err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default()
         );
         serial_println!(
-            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 env={} xfades={} -> {} ::",
-            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, env_word, rep.xfades, if ok { "PASS" } else { "FAIL" }
+            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 env={} xfades={} swaps={} standin={} -> {} ::",
+            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, env_word, rep.xfades, rep.swaps, rep.stand_in_frames, if ok { "PASS" } else { "FAIL" }
         );
     }
 
@@ -1475,5 +1476,28 @@ mod nle_fx {
             got, ENV_KAT, p0, env.len(), rep.xfades, rep.snd_refused, rep.snd_underruns, rep.snd_frames
         );
         (ok, if ok { "ok" } else { "FAIL" })
+    }
+
+    // ── SWAPBACKVPLAY (rmbp-ledger B956): the reel no decoder fits ───────────────────────────────────────────────
+    // NLEFXD is an `mp4v` reel (MPEG-4 Part 2 Visual: `Codec::Other`, decoded by no core), 64x48, 4 frames, video only, cut at
+    // ticks 39..43 after C: the EDL plays on with the labelled stand-in (`vplay::Pic::open`; `swaps=1 standin=4`) where it ended
+    // `codec-refused` before. Its tick-40 picture (source tick 1: counter 1) hashes to `STANDIN_KAT`, demux_core's ONE painter's
+    // 64x48 frame 1, pinned on the host by `build::tests::stand_in_kat` and by gneiss_pal's `stand_in_paints_the_shared_kat`
+    // (Stria's stand-in paints the same bytes). The mid-stream swap has no fixture: no kernel core refuses a stream mid-stream
+    // yet (SWAPBACK-VPLAY-MID, handlers.md §5).
+    const STANDIN_KAT: (i64, u64) = (40, 0xdb29_ef26_80d9_5484);
+
+    /// NLEFXD: `test_pattern_track` re-labelled `mp4v` with no config box (Stria's `codec_without_decoder_plays_the_labelled_stand_in` shape).
+    fn standin_reel() -> Vec<u8> {
+        use demux_core::build;
+        let mut video = build::test_pattern_track(1, 64, 48, FPS, 4, 1);
+        video.spec.fourcc = *b"mp4v";
+        video.spec.config_box = None;
+        build::mp4(&[video], &build::Mp4Options::default())
+    }
+
+    /// The stand-in's verdict: one run went to it, its four pictures were shown, and tick 40 is the shared painter's frame.
+    fn standin_ok(rep: &vplay::EdlReport) -> bool {
+        rep.swaps == 1 && rep.stand_in_frames == 4 && rep.coded.contains(&STANDIN_KAT)
     }
 }

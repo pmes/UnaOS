@@ -49,6 +49,130 @@ impl TestPatternPacket {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The test pattern's pixels: THE one painter (SWAPBACKVPLAY, rmbp-ledger B956)
+// ---------------------------------------------------------------------------------------------
+// Moved here from gneiss_pal's `TestPattern` (which now delegates) so the kernel Player's stand-in (`video/vplay.rs`
+// `Pic::StandIn`) and Stria's (`TestPattern::stand_in`, used by `handlers/stria/src/decode_swap.rs`) paint the SAME bytes.
+// Layout (any size >= 64x48): seven 75 % bars (white, yellow, cyan, green, magenta, red, blue) over the top 2/3; the
+// bottom 1/3 black with the counter as white 5x7 digits in a [`COUNTER_DIGITS`]-wide field, scale chosen to fit.
+
+/// Digits in the test pattern's counter field.
+pub const COUNTER_DIGITS: usize = 6;
+
+const BARS: [[u8; 3]; 7] = [
+    [191, 191, 191],
+    [191, 191, 0],
+    [0, 191, 191],
+    [0, 191, 0],
+    [191, 0, 191],
+    [191, 0, 0],
+    [0, 0, 191],
+];
+
+/// 5x7 digit glyphs, one row per byte, bit 4 = leftmost column.
+const GLYPHS: [[u8; 7]; 10] = [
+    [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+    [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+    [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
+    [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+    [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+    [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+    [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+    [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+    [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+];
+
+/// Where the counter field sits: (x0, y0, scale) — glyph cells are 6x8 scaled units (5x7 plus a one-unit gap).
+fn counter_geometry(w: u32, h: u32) -> (u32, u32, u32) {
+    let band_top = h * 2 / 3;
+    let band_h = h - band_top;
+    let scale = ((w * 9 / 10) / (COUNTER_DIGITS as u32 * 6)).min(band_h * 8 / 10 / 8).max(1);
+    let field_w = COUNTER_DIGITS as u32 * 6 * scale;
+    let x0 = (w.saturating_sub(field_w)) / 2;
+    let y0 = band_top + (band_h.saturating_sub(8 * scale)) / 2;
+    (x0, y0, scale)
+}
+
+/// Render test-pattern frame `n` at `w x h` as packed straight RGBA (alpha 255).
+pub fn test_pattern_rgba(w: u32, h: u32, n: u32) -> Vec<u8> {
+    let (wu, hu) = (w as usize, h as usize);
+    let mut px = alloc::vec![0u8; wu * hu * 4];
+    let band_top = hu * 2 / 3;
+    for y in 0..hu {
+        for x in 0..wu {
+            let c = if y < band_top { BARS[x * 7 / wu] } else { [0, 0, 0] };
+            let o = (y * wu + x) * 4;
+            px[o..o + 3].copy_from_slice(&c);
+            px[o + 3] = 255;
+        }
+    }
+    let (x0, y0, s) = counter_geometry(w, h);
+    let mut v = n % 10u32.pow(COUNTER_DIGITS as u32);
+    let mut digits = [0u8; COUNTER_DIGITS];
+    for d in digits.iter_mut().rev() {
+        *d = (v % 10) as u8;
+        v /= 10;
+    }
+    for (i, &dg) in digits.iter().enumerate() {
+        let g = &GLYPHS[dg as usize];
+        for (gy, row) in g.iter().enumerate() {
+            for gx in 0..5 {
+                if row & (0x10 >> gx) == 0 {
+                    continue;
+                }
+                for dy in 0..s {
+                    for dx in 0..s {
+                        let x = (x0 + (i as u32 * 6 + gx) * s + dx) as usize;
+                        let y = (y0 + gy as u32 * s + dy) as usize;
+                        if x < wu && y < hu {
+                            let o = (y * wu + x) * 4;
+                            px[o..o + 3].copy_from_slice(&[255, 255, 255]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    px
+}
+
+/// Read the counter back out of a rendered frame (the play-check oracle). Samples the centre of every glyph cell unit
+/// and matches each digit's 5x7 bitmap exactly; `None` if any digit does not match a glyph.
+pub fn test_pattern_counter(rgba: &[u8], w: u32, h: u32) -> Option<u32> {
+    let (x0, y0, s) = counter_geometry(w, h);
+    let mut n = 0u32;
+    for i in 0..COUNTER_DIGITS as u32 {
+        let mut bits = [0u8; 7];
+        for (gy, b) in bits.iter_mut().enumerate() {
+            for gx in 0..5u32 {
+                let x = x0 + (i * 6 + gx) * s + s / 2;
+                let y = y0 + gy as u32 * s + s / 2;
+                let o = ((y * w + x) * 4) as usize;
+                let p = rgba.get(o..o + 3)?;
+                if p.iter().all(|&c| c > 127) {
+                    *b |= 0x10 >> gx;
+                }
+            }
+        }
+        let d = GLYPHS.iter().position(|g| *g == bits)? as u32;
+        n = n * 10 + d;
+    }
+    Some(n)
+}
+
+/// A stand-in's frame duration for `t` (the track's span / its sample count; 33.3 ms when unknown), at least 1 ns.
+pub fn stand_in_frame_ns(t: &crate::Track) -> i64 {
+    let ns = if t.sample_count > 0 && t.duration_ns > 0 { (t.duration_ns / t.sample_count) as i64 } else { 33_333_333 };
+    ns.max(1)
+}
+
+/// A stand-in's counter for a packet at `pts_ns`: `round(pts_ns / frame_ns)`, so frame N of a real file still shows N.
+pub fn stand_in_counter(pts_ns: i64, frame_ns: i64) -> u32 {
+    ((pts_ns + frame_ns / 2) / frame_ns.max(1)).max(0) as u32
+}
+
+// ---------------------------------------------------------------------------------------------
 // Input model
 // ---------------------------------------------------------------------------------------------
 
@@ -1093,4 +1217,20 @@ fn mkv_colour(opts: &MkvOptions, id: u32) -> Vec<u8> {
         b.extend_from_slice(&el(0x55D0, &mm));
     }
     el(0x55B0, &b)
+}
+
+#[cfg(test)]
+mod tests {
+    /// SWAPBACKVPLAY (rmbp-ledger B956): the stand-in's pixels, pinned. FNV-1a 64 of `test_pattern_rgba(64, 48, n)`,
+    /// derived off-tree by a line-for-line port of the painter; the kernel's `tests nle` pins frame 1 (`STANDIN_KAT`,
+    /// `unaos/crates/kernel/src/video/player.rs`) and gneiss_pal's stand-in decode is pinned to it too.
+    #[test]
+    fn stand_in_kat() {
+        let fnv = |b: &[u8]| b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3));
+        assert_eq!(fnv(&super::test_pattern_rgba(64, 48, 0)), 0x9b3e_eb3c_004c_17a5);
+        assert_eq!(fnv(&super::test_pattern_rgba(64, 48, 1)), 0xdb29_ef26_80d9_5484);
+        for n in [0u32, 1, 42, 999_999] {
+            assert_eq!(super::test_pattern_counter(&super::test_pattern_rgba(64, 48, n), 64, 48), Some(n));
+        }
+    }
 }
