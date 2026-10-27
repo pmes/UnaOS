@@ -163,19 +163,10 @@ pub struct PageView {
     pub find_entry: super::glyph::GlyphEntry,
 }
 
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut v = n as f64;
-    let mut u = 0;
-    while v >= 1000.0 && u < UNITS.len() - 1 {
-        v /= 1000.0;
-        u += 1;
-    }
-    if u == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[u]) }
-}
-
 pub fn bootstrap_page_view(id: &str, synapse: Synapse) -> PageView {
     use super::glyph::{GlyphEntry, GlyphLabel};
+    // ONETEXT (SR210): the find verbs, the find count and a download row's text and bar are chrome_rows' (one copy).
+    use crate::widgets::chrome_rows;
     use gtk4::{Align, Box, Button, Orientation, Overlay, ProgressBar};
 
     let surface = bootstrap_image_surface(id, synapse.clone());
@@ -226,11 +217,11 @@ pub fn bootstrap_page_view(id: &str, synapse: Synapse) -> PageView {
     overlay.add_overlay(&find_bar);
     {
         let syn = synapse.clone();
-        find_entry.connect_activate(move |e| syn.fire(SMessage::BrowserFind { query: e.text(), forward: true }));
+        find_entry.connect_activate(move |e| syn.fire(chrome_rows::find_msg(&e.text(), true)));
         let (syn, e) = (synapse.clone(), find_entry.clone());
-        next.connect_clicked(move |_| syn.fire(SMessage::BrowserFind { query: e.text(), forward: true }));
+        next.connect_clicked(move |_| syn.fire(chrome_rows::find_msg(&e.text(), true)));
         let (syn, e) = (synapse.clone(), find_entry.clone());
-        prev.connect_clicked(move |_| syn.fire(SMessage::BrowserFind { query: e.text(), forward: false }));
+        prev.connect_clicked(move |_| syn.fire(chrome_rows::find_msg(&e.text(), false)));
         let hide = {
             let (syn, bar, surf, count) = (synapse.clone(), find_bar.clone(), surface.clone(), find_count.clone());
             std::rc::Rc::new(move || {
@@ -272,7 +263,7 @@ pub fn bootstrap_page_view(id: &str, synapse: Synapse) -> PageView {
                     status_label.set_text(&text);
                 }
                 Ok(SMessage::BrowserFindResult { matches, current, .. }) => {
-                    find_count_c.set_text(&if matches == 0 { "No results".to_string() } else { format!("{current}/{matches}") });
+                    find_count_c.set_text(&chrome_rows::find_count(matches, current));
                 }
                 Ok(SMessage::BrowserDownload { id, name, received, total, done, error }) => {
                     let mut map = rows.borrow_mut();
@@ -299,16 +290,9 @@ pub fn bootstrap_page_view(id: &str, synapse: Synapse) -> PageView {
                             (label, bar)
                         })
                         .clone();
-                    let text = match (&error, done, total) {
-                        (Some(e), _, _) => format!("{name} — failed: {e}"),
-                        (None, true, _) => format!("{name} — saved"),
-                        (None, false, Some(t)) => format!("{name} — {} of {}", human_bytes(received), human_bytes(t)),
-                        (None, false, None) => format!("{name} — {}", human_bytes(received)),
-                    };
-                    label.set_text(&text);
-                    match total.filter(|&t| t > 0) {
-                        _ if done => bar.set_fraction(if error.is_some() { 0.0 } else { 1.0 }),
-                        Some(t) => bar.set_fraction((received as f64 / t as f64).clamp(0.0, 1.0)),
+                    label.set_text(&chrome_rows::download_text(&name, received, total, done, error.as_deref()));
+                    match chrome_rows::download_fraction(received, total, done, done && error.is_some()) {
+                        Some(f) => bar.set_fraction(f),
                         None => bar.pulse(),
                     }
                 }
