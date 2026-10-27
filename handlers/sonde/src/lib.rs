@@ -305,7 +305,7 @@ impl PaneService {
         };
         changed.then(|| {
             let (px, w, h) = self.pane.surface();
-            SMessage::SurfaceBlit { url: PANE_URL.to_string(), width: w, height: h, pixels: px.to_vec() }
+            SMessage::SurfaceBlit { url: PANE_URL.to_string(), width: w, height: h, pixels: px.to_vec(), damage: None }
         })
     }
 }

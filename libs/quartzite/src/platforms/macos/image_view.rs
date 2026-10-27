@@ -914,12 +914,16 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                         bound.get(mtm).set_page_cursor(&name);
                     });
                 }
-                Ok(bandy::SMessage::SurfaceBlit { url, width, height, pixels }) => {
+                Ok(bandy::SMessage::SurfaceBlit { url, width, height, pixels, damage }) => {
                     if url == target_id {
                         let bound = bound.clone();
                         dispatch2::DispatchQueue::main().exec_async(move || {
                             let mtm = MainThreadMarker::new().unwrap();
-                            bound.get(mtm).set_frame(&pixels, &[], width, height);
+                            match damage {
+                                None => bound.get(mtm).set_frame(&pixels, &[], width, height),
+                                // AETHERMACGPU-DAMAGE (SR320): the rect's rows only.
+                                Some(rect) => bound.get(mtm).set_damage(&pixels, width, height, rect),
+                            }
                         });
                     }
                 }
@@ -945,4 +949,24 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
     }).expect("spawn surface-blit thread");
 
     Retained::into_super(view)
+}
+
+// AETHERMACGPU-DAMAGE (LEDGER SR320): a damage blit (`SurfaceBlit { damage: Some(rect) }`, `pixels` = the rect's rows).
+impl FacetImageView {
+    /// The Metal page takes the rect into its texture (`gpu_view::page_damage`); otherwise the rows are spliced into the
+    /// kept frame (`ivars.rgba`, through `tetra::surface_splice`) and that frame is shown through `set_frame`. A kept frame
+    /// of another size drops the blit (the sender's next whole frame repairs it). Main thread only.
+    pub fn set_damage(&self, rows: &[u8], width: u32, height: u32, rect: (u32, u32, u32, u32)) {
+        if super::gpu_view::page_damage(self, rows, width, height, rect) {
+            return;
+        }
+        let kept = {
+            let mut kept = self.ivars().rgba.borrow_mut();
+            if *self.ivars().size.borrow() != (width, height) || !crate::tetra::surface_splice(&mut kept, width, height, rect, rows) {
+                return;
+            }
+            kept.clone()
+        };
+        self.set_frame(&kept, &[], width, height);
+    }
 }
