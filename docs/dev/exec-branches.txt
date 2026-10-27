@@ -1088,3 +1088,11 @@ refs/heads/exec-rmbp-aethersurfaceheight   a9bb0b749 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aetherheaderband   a9bb0b749 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-installervessel   a9bb0b749 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-installercard   a9bb0b749 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-s10keyzero   05beb9fa9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-xhciloanshedkat   05beb9fa9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-preemptoffarmcensus   05beb9fa9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-xhciloanptpyield   05beb9fa9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-hidmaskcore   05beb9fa9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-leakedsurfgrow   05beb9fa9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-gen7lockheld   05beb9fa9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-flushverdictone   05beb9fa9 IN-FLIGHT cut 2026-10-27
