@@ -4123,7 +4123,7 @@ pub fn fb_wc_witness() {
             FBWC_LEAVES.load(Ordering::Relaxed),
             FBWC_LO.load(Ordering::Relaxed),
             FBWC_HI.load(Ordering::Relaxed)
-        );
+        ); aperture_line(); // SCANOUTWC (B860): the UNGATED `[fb] aperture` line from the LIVE leaf (`aperture_line`, file tail) — this arm's own line above is bootlog-only. ⚠ LINE-NEUTRAL fold, code first.
     }
 }
 
@@ -4757,4 +4757,150 @@ pub fn xwin_ceiling_next(bytes: u64) {
 /// APPFAULT: frames slot `s` holds in its ELF window now (the `[task] terminate` line's `freed_kb` / 4).
 pub fn xwin_slot_pages(s: usize) -> u64 {
     XWIN_PAGES.peek(s).map_or(0, |p| p.load(Ordering::Acquire))
+}
+
+// =================================================================================================
+// SCANOUTWC (rmbp-ledger B860; BP-video-27, video §5 PERFHUD2) — the aperture's memory type ON THE WIRE.
+// -------------------------------------------------------------------------------------------------
+// VPERF-WC above already programs PA4 = WC on every core (`ensure_pat_wc`) and retypes the fb leaves to
+// it once (`set_framebuffer_wc`); `map_mmio_window` and the splitter keep them. What never existed on a
+// media build is the READING: `fb_wc_witness`'s `ARM=wc` line is `bootlog_println!` (compiled out
+// without `bootlog`/`tests-at-boot`) and the t~0 print is lost to the FTDI ring, so flight 37's
+// ~16 ns/px HUD paint could not be told apart as "WC lost after boot" or "CPU-side cost". This block
+// reads the LIVE leaf through the one walker (`leaf_entry_ptr`, `pat_bit_for_level`) and says one
+// ungated line, folded onto that witness's default arm (latched by `FBWC_SAID`, the service pass):
+//   `[fb] aperture pat=<t> mtrr=<cover|none> -> <kept|remapped-wc|lost> mtrr_type=<t> idx=<n>
+//    leaf=l<n> fb=<hex> leaves=<n> host=<metal|vm>`
+// `pat` is the IA32_PAT entry the live leaf selects; `lost` = it is not WC. `host` reads CPUID.1:ECX[31]
+// once: `vm` (QEMU's aperture is host RAM, the fixture's control) changes only the reader's expectation,
+// never the verdict words. The MTRR decode is the ONE copy (moved here from `video::vperf`, which now
+// calls it — the seat's grant at MEASURE). Read-only: RDMSR and page-table loads, no lock, no write.
+// Tail block on purpose: nothing above moves.
+// =================================================================================================
+
+const IA32_MTRRCAP: u32 = 0xFE;
+const IA32_MTRR_DEF_TYPE: u32 = 0x2FF;
+const IA32_MTRR_PHYSBASE0: u32 = 0x200;
+
+fn scanoutwc_rdmsr(msr: u32) -> u64 {
+    unsafe { x86_64::registers::model_specific::Msr::new(msr).read() }
+}
+
+/// Decode an architectural memory-type encoding (MTRR type field / PAT entry). Shared with `video::vperf`.
+pub fn mem_type_name(t: u8) -> &'static str {
+    match t {
+        0 => "UC",
+        1 => "WC",
+        4 => "WT",
+        5 => "WP",
+        6 => "WB",
+        7 => "UC-", // valid only as a PAT entry
+        _ => "??",
+    }
+}
+
+/// The MTRR memory type covering physical address `pa`, or a note when MTRRs are disabled.
+/// Returns (type, "how"): `var-range` hit, `default` type, or `disabled` (= all UC). The caller checks
+/// CPUID.01H:EDX[12] first so a part without MTRRs never RDMSRs these. Shared with `video::vperf`.
+pub fn mtrr_type_for(pa: u64) -> (u8, &'static str) {
+    let def = scanoutwc_rdmsr(IA32_MTRR_DEF_TYPE);
+    if def & (1 << 11) == 0 {
+        return (0, "disabled"); // MTRRs disabled => all UC
+    }
+    let vcnt = (scanoutwc_rdmsr(IA32_MTRRCAP) & 0xFF) as u32;
+    // Overlap resolution (SDM: UC wins; WT beats WB). Track the strongest match.
+    let mut hit: Option<u8> = None;
+    for i in 0..vcnt {
+        let base = scanoutwc_rdmsr(IA32_MTRR_PHYSBASE0 + 2 * i);
+        let mask = scanoutwc_rdmsr(IA32_MTRR_PHYSBASE0 + 2 * i + 1);
+        if mask & (1 << 11) == 0 {
+            continue; // range not valid
+        }
+        let m = mask & 0x000F_FFFF_FFFF_F000;
+        if (pa & m) == (base & m) {
+            let t = (base & 0xFF) as u8;
+            hit = Some(match hit {
+                None => t,
+                Some(prev) => {
+                    if prev == 0 || t == 0 {
+                        0 // UC dominates
+                    } else if prev == 4 || t == 4 {
+                        4 // WT beats WB in overlaps
+                    } else {
+                        t
+                    }
+                }
+            });
+        }
+    }
+    match hit {
+        Some(t) => (t, "var-range"),
+        None => ((def & 0xFF) as u8, "default"),
+    }
+}
+
+/// The live leaf mapping `fb`: (the IA32_PAT entry it selects, its PAT index, its level). Without PAT
+/// (CPUID.01H:EDX[16] clear) the legacy PCD/PWT table answers (WB / WT / UC- / UC).
+fn aperture_leaf(fb: u64) -> Option<(u8, u8, u8)> {
+    let (ptr, level) = leaf_entry_ptr(fb)?;
+    let e = unsafe { *ptr };
+    let pat = (e & pat_bit_for_level(level) != 0) as u8;
+    let idx = (pat << 2) | (((e & PTE_PCD != 0) as u8) << 1) | (e & PTE_PWT != 0) as u8;
+    let has_pat = core::arch::x86_64::__cpuid(1).edx & (1 << 16) != 0;
+    let t = if has_pat {
+        ((scanoutwc_rdmsr(IA32_PAT_MSR) >> (8 * idx as u64)) & 0x7) as u8
+    } else {
+        match idx & 3 {
+            0 => 6,
+            1 => 4,
+            2 => 7,
+            _ => 0,
+        }
+    };
+    Some((t, idx, level))
+}
+
+/// The aperture's base as the retype recorded it (0 = the retype has not run).
+fn aperture_base() -> u64 {
+    #[cfg(not(feature = "bar1exp-uc"))]
+    let b = FBWC_LO.load(Ordering::Relaxed);
+    #[cfg(feature = "bar1exp-uc")]
+    let b = BAR1EXP_LO.load(Ordering::Relaxed);
+    b
+}
+
+/// The IA32_PAT entry the LIVE aperture leaf selects now (`None` = no retype ran, or the base is unmapped).
+/// `tests perfhud` puts it on its line (`ap=`), so the HUD's paint time and the aperture's type are read
+/// at the same moment.
+pub fn aperture_pat() -> Option<u8> {
+    let fb = aperture_base();
+    if fb == 0 {
+        return None;
+    }
+    aperture_leaf(fb).map(|l| l.0)
+}
+
+/// SCANOUTWC: the one `[fb] aperture` line (see the block head). Called once, from `fb_wc_witness`'s
+/// default arm after its latch.
+#[cfg(not(feature = "bar1exp-uc"))]
+fn aperture_line() {
+    let fb = FBWC_LO.load(Ordering::Relaxed);
+    let leaves = FBWC_LEAVES.load(Ordering::Relaxed);
+    let c1 = core::arch::x86_64::__cpuid(1);
+    let host = if c1.ecx & (1 << 31) != 0 { "vm" } else { "metal" };
+    let (mt, how) = if c1.edx & (1 << 12) != 0 { mtrr_type_for(fb) } else { (0xFF, "no-mtrr") };
+    let cover = if how == "var-range" { "cover" } else { "none" };
+    match aperture_leaf(fb) {
+        Some((pt, idx, lvl)) => {
+            let verdict = if pt != 1 { "lost" } else if leaves > 0 { "remapped-wc" } else { "kept" };
+            serial_println!(
+                "[fb] aperture pat={} mtrr={} -> {} mtrr_type={} idx={} leaf=l{} fb={:#x} leaves={} host={}",
+                mem_type_name(pt), cover, verdict, mem_type_name(mt), idx, lvl, fb, leaves, host
+            );
+        }
+        None => serial_println!(
+            "[fb] aperture pat=- mtrr={} -> lost mtrr_type={} idx=- leaf=none fb={:#x} leaves={} host={}",
+            cover, mem_type_name(mt), fb, leaves, host
+        ),
+    }
 }
