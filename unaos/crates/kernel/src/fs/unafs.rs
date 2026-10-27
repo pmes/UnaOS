@@ -1076,7 +1076,7 @@ fn is_absent(e: &FileSystemError) -> bool {
 /// drops the revoked edge. `owner`/grant strings are the caller's pre-projected native bytes. Returns
 /// `true` iff every journaled step committed; `false` on any mount or write error (the caller treats a
 /// persist failure as non-fatal for a grow/re-persist, or fail-closed for a create).
-pub fn native_acl_write(
+#[track_caller] pub fn native_acl_write(
     dir_lba: u64,
     dir_off: u32,
     name: &str,
@@ -1229,7 +1229,7 @@ fn native_acl_stage_row(
 /// K6: read back the ACL row for `(dir_lba, dir_off)`, or `None` if there is no row (public) or the
 /// mount fails. The read is pure (no metadata write-back through the coherent mount). Used by the
 /// migration read-back verify and by a native single-row lookup.
-pub fn native_acl_read(dir_lba: u64, dir_off: u32) -> Option<NativeAclRow> {
+#[track_caller] pub fn native_acl_read(dir_lba: u64, dir_off: u32) -> Option<NativeAclRow> {
     with_unafs(|fs| native_acl_read_on(fs, dir_lba, dir_off)).ok().flatten()
 }
 
@@ -1269,7 +1269,7 @@ fn native_acl_row_of(fs: &mut KernelUnaFS, id: u64) -> Option<NativeAclRow> {
 /// K6: clear the ACL row for `(dir_lba, dir_off)` — the `atr_clear_row` native successor. Deletes the
 /// unafs ACL file (journaled), reverting the FAT file to public. Idempotent: an absent row is already
 /// clear (`true`); only a real mount/I-O error is `false`.
-pub fn native_acl_clear(dir_lba: u64, dir_off: u32) -> bool {
+#[track_caller] pub fn native_acl_clear(dir_lba: u64, dir_off: u32) -> bool {
     match with_unafs_write(|fs| {
         let root = fs.superblock.root_inode;
         let fname = acl_file_name(dir_lba, dir_off);
@@ -1290,7 +1290,7 @@ pub fn native_acl_clear(dir_lba: u64, dir_off: u32) -> bool {
 /// K6: every ACL row on the volume — the mount-time rebuild source (the `atr_rebuild_into_owned`
 /// native successor reads this and re-resolves each `name` on the FAT volume). Skips non-`acl-` files
 /// and rows without an owner. On a mount error, an empty list (fail-closed: no owners installed).
-pub fn native_acl_list() -> Vec<NativeAclRow> {
+#[track_caller] pub fn native_acl_list() -> Vec<NativeAclRow> {
     with_unafs(|fs| {
         let root = fs.superblock.root_inode;
         let mut out = Vec::new();
@@ -1453,7 +1453,7 @@ pub enum SnapReadResult {
 /// deleted object). Permitted → the snapshot's bytes; refused → the traced
 /// reason (an impostor or rights-lacking grantee is `DenyAcl`, a live-deleted
 /// object is `DenyNoLiveObject`, fail-closed).
-pub fn snapshot_read(
+#[track_caller] pub fn snapshot_read(
     generation: u64,
     path: &str,
     principal: &str,
@@ -3893,12 +3893,12 @@ pub fn restore_version_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, path: &str
 }
 
 /// FILEVERSIONS (B714): [`versions_on`] on THE mount (`None`: no volume, or no such file).
-pub fn versions(path: &str) -> Option<Vec<VersionInfo>> {
+#[track_caller] pub fn versions(path: &str) -> Option<Vec<VersionInfo>> {
     with_unafs(|fs| versions_on(fs, path).ok()).ok().flatten()
 }
 
 /// FILEVERSIONS (B714): [`read_version_on`] on THE mount.
-pub fn read_version(path: &str, n: usize) -> Option<Vec<u8>> {
+#[track_caller] pub fn read_version(path: &str, n: usize) -> Option<Vec<u8>> {
     with_unafs(|fs| read_version_on(fs, path, n).ok()).ok().flatten()
 }
 
@@ -3906,7 +3906,7 @@ pub fn read_version(path: &str, n: usize) -> Option<Vec<u8>> {
 /// restore path, and it keeps the reason — the crate's refusal comes back whole (`ReadOnly`, `CorruptVolume`, ...)
 /// for the caller's classifier (Quarry's `ops::restore_refusal`); a mount that never ran the restore (no volume, the
 /// device `Busy` past the restart budget) is a `Storage(Io("mount: <MountError>"))`, never an `Ok`.
-pub fn restore_version(path: &str, n: usize) -> Result<(), FileSystemError> {
+#[track_caller] pub fn restore_version(path: &str, n: usize) -> Result<(), FileSystemError> {
     match with_unafs(|fs| restore_version_on(fs, path, n).map_err(|e| { request_mount_discard(); e })) { // crawl B 10: a failed restore's in-RAM references are discarded inside the hold, as `diskfull::write_root` does
         Ok(r) => r,
         Err(MountError::Fs(e)) => Err(e),
@@ -4168,7 +4168,7 @@ pub mod splitwrite {
 
     /// Run the write op `f` against the one coherent mount with its commit split (see the banner). Same contract
     /// as [`with_unafs`]; a commit that fails is `MountError::Fs`, and a `Busy` leaves nothing landed.
-    pub fn with_unafs_write<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+    #[track_caller] pub fn with_unafs_write<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
         let Some(me) = crate::arch::sched::current_id() else {
             return with_unafs(f); // no task identity to hold the ticket by: the whole commit
         };
@@ -4188,7 +4188,7 @@ pub mod splitwrite {
     /// The ticket is held across ALL of the op's commits; a death between them is TICKETOWNER's release (`release_dead`:
     /// the staged RAM goes with the leaked instance; a drop or chunk already flipped stays landed — correct by K8a, and a
     /// landed chunk is a shorter file, never a torn one). Never an `Ok` for an op that owed more: past the bound, Busy.
-    fn run<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+    #[track_caller] fn run<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
         let (mut lost, mut again, mut drops, mut chunks) = (0u32, None::<OpAgain>, 0usize, 0u32); // UNAFSWRITE3 (B872)
         while lost < LOST_RUNS {
             // HOLD 1: the op, then the stage.
@@ -5013,7 +5013,7 @@ pub fn ensure_nvme_root_grant() -> bool {
 /// then bind ([`bind_mount`] tries the root-granted handles first). `true` when the live mount is on `want`.
 /// The ONE rebind: `install::ahciroot::bind_ssd_root` forwards here for `Ahci { port }`.
 #[cfg(all(target_arch = "x86_64", any(feature = "ahciroot", feature = "nvme")))]
-pub fn bind_root_on(want: block::BlockHandle) -> bool {
+#[track_caller] pub fn bind_root_on(want: block::BlockHandle) -> bool {
     if mount_bound_handle().is_some_and(|h| h != want) {
         force_remount();
     }
