@@ -519,3 +519,13 @@ impl Decoder {
         self.dpb.bump_all(&mut self.out);
     }
 }
+
+impl Decoder {
+    /// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): the profile, tier and level ([`crate::ps::Ptl`], A.3) of the SPS of
+    /// the picture under decoding, else of the lowest-id stored SPS (an hvcC's, known from [`Decoder::configure_hvcc`]
+    /// before any picture); `None` before any SPS.
+    pub fn profile_tier_level(&self) -> Option<crate::ps::Ptl> {
+        let sps = self.cur.as_ref().map(|c| &c.sps).or_else(|| self.sps.iter().flatten().next())?;
+        Some(sps.ptl.names())
+    }
+}

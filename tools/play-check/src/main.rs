@@ -374,6 +374,7 @@ fn main() {
             }
         }
     }
+    extra += &profile_json(&info.video_profile); // HEVCLEVELLINE (SR368): "profile" / "tier" / "level"
     println!(
         "{{\"file\":\"{}\",\"video\":\"{}\",\"audio\":\"{}\",\"decoder\":\"{}\",\"audio_decoder\":\"{}\",\"sample_rate\":{},\"channels\":{},\"audio_clock\":{},\"real_video\":{},\"audio_note\":\"{}\",\"size\":[{},{}],\"duration\":{:.6},\"hz\":{hz},\"presented\":{},\"dropped\":{},\"repeated\":{},\"av_max_ms\":{:.3},\"pts\":[{}]{extra},\"ok\":{ok}}}",
         file,
@@ -639,5 +640,21 @@ mod tests {
         (o.compared, o.exact) = (3, 3);
         assert!(o.ok());
         assert_eq!(o.json(), ",\"i420_oracle\":{\"compared\":3,\"exact\":3,\"missing\":0,\"max_abs_diff\":0}");
+    }
+}
+
+/// HEVCLEVELLINE (LEDGER SR368): the Player's profile tokens (`MediaInfo::video_profile`, `profile=.. tier=.. level=..`)
+/// as JSON fields, one per `key=value` token; "" (no tokens) adds none.
+fn profile_json(tokens: &str) -> String {
+    tokens.split_whitespace().filter_map(|t| t.split_once('=')).map(|(k, v)| format!(",\"{k}\":\"{v}\"")).collect()
+}
+
+#[cfg(test)]
+mod profile_tests {
+    #[test]
+    fn profile_json_kat() {
+        assert_eq!(super::profile_json("profile=Main tier=main level=2"), ",\"profile\":\"Main\",\"tier\":\"main\",\"level\":\"2\"");
+        assert_eq!(super::profile_json("profile=High level=4.1"), ",\"profile\":\"High\",\"level\":\"4.1\"");
+        assert_eq!(super::profile_json(""), "");
     }
 }

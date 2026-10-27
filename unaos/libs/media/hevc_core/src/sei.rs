@@ -6,8 +6,8 @@
 //! HEVCCONF (LEDGER SR321): the decoded picture hash SEI message (7.3.5 sei_message, D.2.19 decoded_picture_hash,
 //! payloadType 132 in a SUFFIX_SEI_NUT) and its check (D.3.19) against the decoded sample arrays after the in-loop
 //! filters, the full pic_width x pic_height picture (not the conformance-window crop). The CRC and checksum variants are
-//! computed here; MD5 needs a digest this zero-dependency crate does not carry and is refused BY NAME
-//! ([`HashCheck::Md5Unchecked`], owed HEVCCONF-MD5 through crypto_core). SEI is non-normative: a malformed message never
+//! computed here; HEVCLEVELLINE (SR368, HEVCSEI-MD5): so is MD5, through crypto_core's digest ([`plane_md5`], the
+//! `Md5Unchecked` verdict deleted). SEI is non-normative: a malformed message never
 //! fails a decode (the decoder drops it). HEVCSCCTAIL (SR365, HEVCREXT-MONOHASH): a 4:0:0 picture's hash carries one
 //! component ([`picture_hash_n`]) and is checked over its one sample array.
 
@@ -33,8 +33,6 @@ pub enum HashCheck {
     Match,
     /// The first component (cIdx) whose hash differs.
     Mismatch(usize),
-    /// An MD5 hash: refused by name (HEVCCONF-MD5), not compared.
-    Md5Unchecked,
 }
 
 /// The decoded_picture_hash (payloadType 132) of a SEI RBSP (7.3.2.4 sei_rbsp: sei_message()s until the trailing bits),
@@ -136,6 +134,23 @@ pub fn plane_checksum(p: &Plane, bit_depth: u32) -> u32 {
     sum
 }
 
+/// HEVCLEVELLINE (SR368, HEVCSEI-MD5): D.3.19 picture_md5 of one component: the MD5 (crypto_core, RFC 1321) of
+/// pictureData, the same bytes [`plane_crc`] reads.
+pub fn plane_md5(p: &Plane, bit_depth: u32) -> [u8; 16] {
+    let mut md5 = crypto_core::md5::Md5::new();
+    let (mut buf, mut n) = ([0u8; 64], 0);
+    for_each_byte(p, bit_depth, |b| {
+        buf[n] = b;
+        n += 1;
+        if n == buf.len() {
+            md5.update(&buf);
+            n = 0;
+        }
+    });
+    md5.update(&buf[..n]);
+    md5.finalize()
+}
+
 /// Check a picture's decoded sample arrays (after deblocking and SAO) against its decoded_picture_hash. HEVCREXT
 /// (SR334): D.3.19's bitDepth is per component — BitDepthY for plane 0, BitDepthC (`bit_depth_c`) for planes 1 and 2.
 /// HEVCSCCTAIL (SR365): a 4:0:0 picture (0x0 chroma planes) is checked over its one component.
@@ -144,7 +159,7 @@ pub fn check(planes: &[Plane; 3], bit_depth: u32, bit_depth_c: u32, h: &PictureH
     for c in 0..comps {
         let bd = if c == 0 { bit_depth } else { bit_depth_c };
         let ok = match h {
-            Md5(_) => return HashCheck::Md5Unchecked,
+            Md5(want) => plane_md5(&planes[c], bd) == want[c],
             Crc(want) => plane_crc(&planes[c], bd) == want[c],
             Checksum(want) => plane_checksum(&planes[c], bd) == want[c],
         };

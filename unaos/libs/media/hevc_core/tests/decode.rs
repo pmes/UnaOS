@@ -444,3 +444,30 @@ fn picture_hash_sei_checks_the_decoded_picture() {
     }
     assert_eq!(checks(sum), [(0, HashCheck::Mismatch(0))]);
 }
+
+/// HEVCLEVELLINE (SR368, HEVCSEI-MD5): the flat-128 64x48 picture's MD5 SEI (hash_type 0, payloadSize 49) through
+/// `Decoder::take_hash_checks`, against the hex of an independent MD5 (Python's hashlib: 3072 and 768 bytes of 0x80):
+/// a Match, and a Cb digest one byte off a Mismatch(1).
+#[test]
+fn picture_md5_sei_checks_the_decoded_picture() {
+    use hevc_core::sei::HashCheck;
+    let digest = |h: &str| -> Vec<u8> { (0..16).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let checks = |cb_delta: u8| {
+        let mut rbsp = vec![132, 49, 0];
+        rbsp.extend(digest("76210843ab1bb085f7af7523a281b6f6"));
+        let mut cb = digest("e979abdb2b582b325de6f5bb97b0e643");
+        cb[0] = cb[0].wrapping_add(cb_delta);
+        rbsp.extend(cb);
+        rbsp.extend(digest("e979abdb2b582b325de6f5bb97b0e643"));
+        rbsp.push(0x80);
+        let mut s = all_dc_stream(false, None);
+        s.extend(nal(40, &rbsp));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode");
+        d.flush();
+        assert_eq!(d.take_frames().len(), 1);
+        d.take_hash_checks()
+    };
+    assert_eq!(checks(0), [(0, HashCheck::Match)]);
+    assert_eq!(checks(1), [(0, HashCheck::Mismatch(1))]);
+}

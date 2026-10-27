@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! HEVCCONF (LEDGER SR321): the JCT-VC conformance bitstreams of ITU-T H.265.1 must decode to the reference decoder's
 //! output — every output picture (cropped, output order; yuv420p, or yuv420p10le at Main 10) hashed into one md5 equal
-//! to the listed one — and every decoded picture hash SEI (D.3.19: CRC and checksum; MD5 refused by name) must match its
+//! to the listed one — and every decoded picture hash SEI (D.3.19: CRC, checksum and, since HEVCLEVELLINE SR368, MD5) must match its
 //! picture. The hand KATs (decode.rs, inter.rs, main10.rs, rext.rs) exercise each process once; these exercise their
 //! interactions. The constrained-intra-in-inter vector must be refused by name (HEVCINTER-CIP). Offline => SKIP (the
 //! vectors are fetched by h264_core's fetcher, linked below, never committed; vectors.txt holds the rows and their
@@ -206,7 +206,7 @@ fn sei_parse_kat() {
     md5.push(0x80);
     let want: [[u8; 16]; 3] = core::array::from_fn(|c| core::array::from_fn(|i| (c * 16 + i) as u8));
     assert_eq!(sei::picture_hash(&md5), Ok(Some(PictureHash::Md5(want))));
-    assert_eq!(sei::check(&[plane(1, 1, &[0]), plane(1, 1, &[0]), plane(1, 1, &[0])], 8, 8, &PictureHash::Md5(want)), HashCheck::Md5Unchecked);
+    assert_eq!(sei::check(&[plane(1, 1, &[0]), plane(1, 1, &[0]), plane(1, 1, &[0])], 8, 8, &PictureHash::Md5(want)), HashCheck::Mismatch(0));
     assert_eq!(sei::picture_hash(&[5, 1, 0, 0x80]), Ok(None));
     assert_eq!(sei::picture_hash(&[132, 7, 1, 0x12]), Err(Error::Truncated));
 }
@@ -232,4 +232,25 @@ fn md5_kat() {
     assert_eq!(yuv_bytes(&f10), [0xFF, 0x03, 0, 0, 1, 0, 2, 0, 0, 0x02, 0x55, 0x01]);
     assert_eq!(md5(&yuv_bytes(&f10)), "194ea06078b4dbc31dbc26b29a566407");
     assert_eq!(md5(b""), "d41d8cd98f00b204e9800998ecf8427e");
+}
+
+/// HEVCLEVELLINE (SR368, HEVCSEI-MD5): D.3.19 picture_md5 per component through crypto_core, against the hex of an
+/// independent MD5 (Python's hashlib over the same pictureData bytes): a 2x2 / 1x1 / 1x1 picture at 8 bits matches, a
+/// changed Cr is Mismatch(2); 10 bits hash low byte first; a 4:0:0 picture (empty chroma) is checked over component 0.
+#[test]
+fn sei_md5_kat() {
+    let hex = |d: [u8; 16]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let digest = |h: &str| -> [u8; 16] { core::array::from_fn(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()) };
+    let pic = [plane(2, 2, &[1, 2, 3, 4]), plane(1, 1, &[5]), plane(1, 1, &[6])];
+    assert_eq!(hex(sei::plane_md5(&pic[0], 8)), "08d6c05a21512a79a1dfeb9d2a8f262f");
+    assert_eq!(hex(sei::plane_md5(&pic[1], 8)), "8bb6c17838643f9691cc6a4de6c51709");
+    assert_eq!(hex(sei::plane_md5(&pic[2], 8)), "06eca1b437c7904cc3ce6546c8110110");
+    let want = PictureHash::Md5(["08d6c05a21512a79a1dfeb9d2a8f262f", "8bb6c17838643f9691cc6a4de6c51709", "06eca1b437c7904cc3ce6546c8110110"].map(digest));
+    assert_eq!(sei::check(&pic, 8, 8, &want), HashCheck::Match);
+    let cr_off = [pic[0].clone(), pic[1].clone(), plane(1, 1, &[7])];
+    assert_eq!(sei::check(&cr_off, 8, 8, &want), HashCheck::Mismatch(2));
+    assert_eq!(hex(sei::plane_md5(&plane(2, 2, &[0x3FF, 0, 1, 2]), 10)), "c0e517ad64daf3a79e06d779d07d8b26");
+    let mono = [pic[0].clone(), plane(0, 0, &[]), plane(0, 0, &[])];
+    let one = PictureHash::Md5([digest("08d6c05a21512a79a1dfeb9d2a8f262f"), [0; 16], [0; 16]]);
+    assert_eq!(sei::check(&mono, 8, 8, &one), HashCheck::Match);
 }

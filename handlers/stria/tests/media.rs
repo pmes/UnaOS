@@ -1024,3 +1024,28 @@ fn av1playercolour_sd_reel_colr_709_wins_and_untagged_is_bt601() {
     assert!(posted == e709, "a colr of BT.709 on an SD AV1 reel does not win over the size default");
     println!("av1playercolour: kodim23 untagged=bt601 colr709=bt709 bilinear");
 }
+
+/// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): the Player's info carries the hvcC SPS's profile / tier / level tokens
+/// (`gneiss_pal::dsp::video::profile_level`, hevc_core's A.3 names): the KAT reel's Main SPS reads `profile=Main
+/// tier=main level=2`; the 13/12-bit SPS with its profile_tier_level patched (byte 3: tier 1, general_profile_idc 4 with
+/// every constraint flag 0; byte 17: general_level_idc 153), carried by the hvcC, reads `profile=RExt tier=high level=5.1`
+/// (the open reads the record, before any picture: the decode's refusal of 13 bits comes later).
+#[test]
+fn hevclevelline_open_reads_profile_tier_level() {
+    let p = Player::open(build::mp4(&[hevc_kat_track(1)], &Mp4Options::default()), Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().video_profile, "profile=Main tier=main level=2");
+    let mut sps = HEVC_SPS_12BIT;
+    assert_eq!((sps[3], sps[17]), (0x01, 0x3c));
+    sps[3] = 0x24;
+    sps[17] = 0x99;
+    let mut t = hevc_kat_track(1);
+    let at = t.spec.config.windows(HEVC_SPS.len()).position(|w| w == HEVC_SPS).unwrap();
+    let mut hvcc = t.spec.config[..at - 2].to_vec();
+    hvcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    hvcc.extend_from_slice(&sps);
+    hvcc.extend_from_slice(&t.spec.config[at + HEVC_SPS.len()..]);
+    t.spec.config = hvcc;
+    let p = Player::open(build::mp4(&[t], &Mp4Options::default()), Arc::new(ManualTime::new()), None, 60).unwrap();
+    assert_eq!(p.info().video_profile, "profile=RExt tier=high level=5.1");
+    println!("hevclevelline: {} / {}", "profile=Main tier=main level=2", p.info().video_profile);
+}

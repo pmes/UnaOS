@@ -563,3 +563,66 @@ mod tests {
         assert_eq!(rgba.to_rgba_colour(Some(&colour(9, Some(true))), Chroma::Nearest), [1, 2, 3, 4]);
     }
 }
+
+/// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): a video track's profile, tier and level as the Player's info line
+/// tokens ([`profile_tokens`]), read by its codec core from the track's decoder configuration — the [`reorder_depth`]
+/// dispatch shape. H.264 -> `h264_core::ps::avcc_sps` (profile_idc named per H.264 A.2, level_idc; H.264 has no tier);
+/// HEVC -> `hevc::hvcc_ptl` (hevc_core's A.3 names) when the `hevc` feature is on. Anything else, or a track with no
+/// configuration record (Annex B: the SPS arrives with the first sample), -> `None`.
+pub fn profile_level(track: &Track) -> Option<String> {
+    match &track.codec {
+        Codec::Avc => {
+            let s = h264_core::ps::avcc_sps(&track.config)?;
+            let profile = match s.profile_idc {
+                66 => "Baseline",
+                77 => "Main",
+                88 => "Extended",
+                100 => "High",
+                110 => "High10",
+                122 => "High422",
+                244 => "High444",
+                44 => "CAVLC444",
+                83 => "ScalableBaseline",
+                86 => "ScalableHigh",
+                118 => "MultiviewHigh",
+                128 => "StereoHigh",
+                _ => "Unknown",
+            };
+            // A.3.1 / A.3.2: level 1b is level_idc 9, or 11 with constraint_set3_flag in Baseline / Main / Extended.
+            let one_b = s.level_idc == 9 || (s.level_idc == 11 && s.constraint_set3 && matches!(s.profile_idc, 66 | 77 | 88));
+            let level = if one_b { (1, 0xB) } else { (s.level_idc / 10, s.level_idc % 10) };
+            Some(profile_tokens(profile, None, level))
+        }
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => hevc::hvcc_ptl(&track.config).map(|p| profile_tokens(p.profile, Some(p.tier), p.level)),
+        _ => None,
+    }
+}
+
+/// HEVCLEVELLINE (SR368): THE one formatter of the profile / tier / level tokens, both codecs':
+/// `profile=<name>[ tier=<main|high>] level=<major>[.<minor>]`; minor 0xB is H.264's level "1b".
+pub fn profile_tokens(profile: &str, tier: Option<&str>, level: (u8, u8)) -> String {
+    let mut s = format!("profile={profile}");
+    if let Some(t) = tier {
+        s += &format!(" tier={t}");
+    }
+    match level {
+        (m, 0xB) => s += &format!(" level={m}b"),
+        (m, 0) => s += &format!(" level={m}"),
+        (m, n) => s += &format!(" level={m}.{n}"),
+    }
+    s
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::profile_tokens;
+
+    #[test]
+    fn profile_tokens_kat() {
+        assert_eq!(profile_tokens("High", None, (4, 1)), "profile=High level=4.1");
+        assert_eq!(profile_tokens("Baseline", None, (1, 0xB)), "profile=Baseline level=1b");
+        assert_eq!(profile_tokens("Main10", Some("main"), (5, 0)), "profile=Main10 tier=main level=5");
+        assert_eq!(profile_tokens("Main422_10", Some("high"), (6, 2)), "profile=Main422_10 tier=high level=6.2");
+    }
+}
