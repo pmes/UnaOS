@@ -825,7 +825,7 @@ refs/heads/exec-rmbp-nle5b   3688fb7ca FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kepler3d2   f2f7b61b3 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-stationerp   5e65a8816 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-autolock4   5e65a8816 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-textscalereseat2   5e65a8816 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-textscalereseat2   694417d6a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-sleepresume2   5e65a8816 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-leaserenew   7da6faa75 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pidesklist   7a96c024c FOLDED-BY-HAND (this commit) 2026-10-27

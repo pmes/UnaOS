@@ -407,7 +407,7 @@ pub fn service() {
         let Some(g) = ST.try_lock() else { return };
         (g.cur, g.win, g.deadline, g.shown_s, g.slide, g.at)
     };
-    let Some(d) = cur else { return }; font_follow(&d, win, shown); // TEXTSCALE3 (B849): a restyle repaints the open dialog once (its own pass; it is not in `font_repaint_pass`)
+    let Some(d) = cur else { return }; font_follow(&d, win, shown); drag_follow(&d, shown); // TEXTSCALE3 (B849): a restyle repaints the open dialog once (its own pass; it is not in `font_repaint_pass`)
     if slide != 0 && win != wm::WIN_NONE {
         let s = slide - 1;
         let _ = wm::move_to(win, at.0, at.1.saturating_sub(s as usize * metrics::size(SLIDE_PX)));
@@ -1258,7 +1258,7 @@ fn font_follow(d: &Dlg, win: wm::WinId, shown: u32) {
     if win == wm::WIN_NONE || DLG_SEEN.swap(e, Ordering::Relaxed) == e {
         return;
     }
-    let h = h_at(theme::metrics());
+    if rescaled(d, win, shown) { return; } let h = h_at(theme::metrics());
     let old = DLG_H.load(Ordering::Relaxed);
     if h != old && h <= DLG_CAP.load(Ordering::Relaxed) {
         // TEXTSCALERESEAT (B880): lay out at the new height, then ask wm for it; refused -> back to the kept height.
@@ -1316,7 +1316,7 @@ fn cap_h() -> usize {
 
 /// The open, before the row exists: record the capacity, reserve the surface for it, and fill the band below `H()`.
 fn seat_open() {
-    DLG_CAP.store(cap_h(), Ordering::Relaxed);
+    DLG_CAP.store(cap_h(), Ordering::Relaxed); DLG_S2.store(crate::video::dpi::s2(), Ordering::Relaxed);
     band_clear(H());
 }
 
@@ -1337,4 +1337,95 @@ pub fn reseat_probe() -> Option<(u32, usize, usize)> {
     }
     let i = wm::info(win)?;
     Some((RESEATS.load(Ordering::Relaxed), i.h, metrics::size(h_at(theme::metrics()))))
+}
+
+// ── TEXTSCALERESEAT2 (rmbp-ledger B886; BP-video-40) — TAIL-APPENDED: the dialog follows a user drag and a dpi step ─────
+// M1: a user edge-drag (wm's `resize_begin`/`rs_solve`, capped at the row's `surf_len` = `DLG_CAP`) changes the row's
+// height; `service` -> `drag_follow` reads `wm::info().h` and re-lays the dialog to it, within `[h_at, DLG_CAP]`; after
+// the gesture a height off the logical grid or below the content is asked back through B880's door. M2: a dpi-scale
+// change since `seat_open` cannot re-seat in place (the row's stride is fixed at create), so the reseat re-mints the row
+// while it is NOT live: close it (drained), re-reserve the capacity at the new scale, create it where it stood.
+
+/// The scale (`dpi::s2`) the open dialog's surface was reserved at (`seat_open`).
+static DLG_S2: AtomicU32 = AtomicU32::new(0);
+/// Re-lays a user drag gave the open dialog.
+static DRAGS: AtomicU32 = AtomicU32::new(0);
+/// Not-live re-mints a dpi step gave the open dialog.
+static RESCALES: AtomicU32 = AtomicU32::new(0);
+
+/// The service pass: when the row's height is not the one the dialog laid out at (a user drag), re-lay to it.
+fn drag_follow(d: &Dlg, shown: u32) {
+    let Some(win) = ST.try_lock().map(|g| g.win) else { return };
+    if win == wm::WIN_NONE {
+        return;
+    }
+    let Some(i) = wm::info(win) else { return };
+    let old = DLG_H.load(Ordering::Relaxed);
+    if i.h == metrics::size(old) {
+        return;
+    }
+    let cap = DLG_CAP.load(Ordering::Relaxed);
+    let dragged = metrics::to_logical(i.h);
+    let h = dragged.clamp(h_at(theme::metrics()).min(cap), cap);
+    let live = wm::drag_active() == win;
+    if live && h != dragged {
+        return; // below the content floor mid-gesture: snapped after the release
+    }
+    DLG_H.store(h, Ordering::Relaxed);
+    paint(d, shown);
+    if !live && metrics::size(h) != i.h && wm::resize_kernel_row(win, i.w, metrics::size(h)) != Some(true) {
+        DLG_H.store(old, Ordering::Relaxed);
+        paint(d, shown);
+        let _ = wm::present(win);
+        return;
+    }
+    if h < old {
+        band_clear(h);
+    }
+    DRAGS.fetch_add(1, Ordering::Relaxed);
+    let _ = wm::present(win);
+}
+
+/// The reseat's first question: did the dpi scale move since `seat_open`? `false` = no (re-seat in place). `true` = the
+/// row was re-minted at the new scale (closed, the capacity re-reserved while no row is live, created where it stood).
+fn rescaled(d: &Dlg, win: wm::WinId, shown: u32) -> bool {
+    let (a, b) = (DLG_S2.load(Ordering::Relaxed), crate::video::dpi::s2());
+    if a == b {
+        return false;
+    }
+    let Some(i) = wm::info(win) else { return false };
+    let focused = wm::focus_asid() == OWNER;
+    ST.lock().win = wm::WIN_NONE;
+    wm::clear_modal_top(win);
+    wm::close(win);
+    DLG_H.store(h_at(theme::metrics()), Ordering::Relaxed);
+    seat_open();
+    paint(d, shown);
+    let (sw, sh, cap) = (metrics::size(W), metrics::size(H()), DLG_CAP.load(Ordering::Relaxed));
+    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), i.x, i.y);
+    if new != wm::WIN_NONE {
+        if d.screen {
+            wm::set_modal_top(new);
+            let _ = wm::raise_one(new);
+        }
+        ST.lock().win = new;
+        if focused {
+            wm::focus_changed(OWNER);
+        }
+        let _ = wm::present(new);
+    }
+    RESCALES.fetch_add(1, Ordering::Relaxed);
+    TS_FRAMES.fetch_add(1, Ordering::Relaxed);
+    serial_println!("[textscale] rescale win=dialog s2={}->{} old={} new={} cap={}", a, b, win, new, cap);
+    true
+}
+
+/// `tests textscale`: (the dialog's row, its capacity, the height it laid out at), source px; `None` when no row is up.
+#[cfg(feature = "witness")]
+pub fn drag_probe() -> Option<(wm::WinId, usize, usize)> {
+    let win = ST.lock().win;
+    if win == wm::WIN_NONE {
+        return None;
+    }
+    Some((win, metrics::size(DLG_CAP.load(Ordering::Relaxed)), metrics::size(DLG_H.load(Ordering::Relaxed))))
 }

@@ -712,7 +712,7 @@ fn open_as(state: State) {
     // argument gives the login screen a close box and gives a one-click route to a machine with no
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
-    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::Unlock { b"Unlock" } else if state == State::CreateUser { b"Create account" } else { b"Log in" };
+    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::Unlock { b"Unlock" } else if state == State::CreateUser { b"Create account" } else { b"Log in" }; *CARD_TITLE.lock() = title;
     let id = wm::create_at_native(OWNER, surf, sw * super::super::metrics::size(CARD_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
@@ -3901,7 +3901,7 @@ fn cap_h() -> usize {
 /// `open_as`, before the row exists: record the capacity and reserve the surface for it.
 fn seat_open() {
     let cap = cap_h();
-    CARD_CAP.store(cap, Ordering::Relaxed);
+    CARD_CAP.store(cap, Ordering::Relaxed); CARD_S2.store(crate::video::dpi::s2(), Ordering::Relaxed);
     let _ = super::super::metrics::leaked_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(cap));
 }
 
@@ -3909,7 +3909,7 @@ fn seat_open() {
 /// the new height, then ask wm for it. `true` = re-seated (painted); `false` = nothing to do or refused (the caller
 /// repaints at the kept height).
 fn reseat() -> bool {
-    let id = WIN.load(Ordering::Relaxed);
+    let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE && rescaled(id) { return true; }
     let h = h_at(theme::metrics());
     let old = CARD_H.load(Ordering::Relaxed);
     if id == wm::WIN_NONE || h == old || h > CARD_CAP.load(Ordering::Relaxed) {
@@ -3935,4 +3935,46 @@ pub fn reseat_probe() -> Option<(u32, usize, usize)> {
     }
     let i = wm::info(id)?;
     Some((RESEATS.load(Ordering::Relaxed), i.h, super::super::metrics::size(h_at(theme::metrics()))))
+}
+
+// ── TEXTSCALERESEAT2 (rmbp-ledger B886; BP-video-40) — TAIL-APPENDED: the open card re-mints at a dpi step ────────────
+// A dpi-scale change since `seat_open` cannot re-seat in place (the row's stride is fixed at create), so `reseat` re-mints
+// the row while it is NOT live: close it (drained), re-reserve the capacity at the new scale, create it where it stood
+// under the title it opened with. The form (typed fields, LOCKED) is kept: this is not `take_down` + `open_as`. No code
+// path changes the scale under an open card today (Settings sits under the modal card; `mode_at_login` runs after it).
+
+/// The scale (`dpi::s2`) the open card's surface was reserved at (`seat_open`).
+static CARD_S2: AtomicU32 = AtomicU32::new(0);
+/// The title the open card's row was minted with (`open_as`).
+static CARD_TITLE: crate::sync::Mutex<&'static [u8]> = crate::sync::Mutex::new(b"Log in");
+/// Not-live re-mints a dpi step gave the open card.
+static RESCALES: AtomicU32 = AtomicU32::new(0);
+
+/// `reseat`'s first question: did the dpi scale move since `seat_open`? `false` = no (re-seat in place). `true` = the row
+/// was re-minted at the new scale.
+fn rescaled(id: wm::WinId) -> bool {
+    let (a, b) = (CARD_S2.load(Ordering::Relaxed), crate::video::dpi::s2());
+    if a == b {
+        return false;
+    }
+    let Some(i) = wm::info(id) else { return false };
+    wm::clear_modal_top(id);
+    wm::close(id); // the WINID teardown clears `WIN`
+    WIN.store(wm::WIN_NONE, Ordering::Relaxed);
+    CARD_H.store(h_at(theme::metrics()), Ordering::Relaxed);
+    seat_open();
+    repaint();
+    let (sw, sh, cap) = (super::super::metrics::size(W), super::super::metrics::size(H()), CARD_CAP.load(Ordering::Relaxed));
+    let title = *CARD_TITLE.lock();
+    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * super::super::metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, i.x, i.y);
+    if new != wm::WIN_NONE {
+        WIN.store(new, Ordering::Relaxed);
+        wm::set_modal_top(new);
+        let _ = wm::present(new);
+    } else {
+        FORM.lock().windowed = false;
+    }
+    RESCALES.fetch_add(1, Ordering::Relaxed);
+    serial_println!("[textscale] rescale win=login s2={}->{} old={} new={} cap={}", a, b, id, new, cap);
+    true
 }
