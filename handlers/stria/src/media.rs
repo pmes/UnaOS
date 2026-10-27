@@ -15,6 +15,7 @@
 //!                       stereo f32 ─▶ AudioOut (resonance stereo StreamSource) ◀───┘
 //!                                     └▶ consumed frames ─▶ AudioClock
 //!                       peak L/R per 50 ms ─▶ FrameSink::levels (the meters)
+//!                       RMS L/R per 50 ms (audio_core::meter) ─▶ FrameSink::levels_rms
 //!  master clock = audio (when an audio track decodes and an output exists) else wall
 //! ```
 //!
@@ -47,6 +48,9 @@ pub trait FrameSink {
     /// Audio meters that came due: per [`LEVEL_WINDOW_NS`] window from `pts_ns` on, the peak
     /// absolute sample of the left and right channel as played.
     fn levels(&mut self, _pts_ns: i64, _peaks: &[[f32; 2]]) {}
+    /// METERPLAYER (SR319): the same windows as [`FrameSink::levels`] (same `pts_ns`, same count, called right after it):
+    /// the RMS of the left and right channel in dBFS, read from `audio_core::meter` at the window's close (floor -96).
+    fn levels_rms(&mut self, _pts_ns: i64, _rms_db: &[[f64; 2]]) {}
 }
 
 /// The meter window: 50 ms.
@@ -204,9 +208,11 @@ pub struct Player {
     /// The presentation time of the next queued sample = `audio_base_ns` + `audio_frames`/rate.
     audio_base_ns: i64,
     audio_frames: u64,
-    /// The meter window being accumulated: (index, peak L, peak R), and the finished ones.
+    /// The meter window being accumulated: (index, peak L, peak R), and the finished ones (start, peaks, RMS L/R dBFS).
     level_acc: Option<(i64, f32, f32)>,
-    levels: VecDeque<(i64, [f32; 2])>,
+    levels: VecDeque<(i64, [f32; 2], [f64; 2])>,
+    /// METERPLAYER (SR319): one `audio_core::meter::Meter` per channel (L, R), the windows' RMS; tick thread only, no lock.
+    level_meters: [ac::meter::Meter; 2],
     audio_eof: bool,
     /// Muted: zeros go to the device in place of the samples (the clock keeps running).
     muted: bool,
@@ -438,6 +444,7 @@ impl Player {
             audio_frames: 0,
             level_acc: None,
             levels: VecDeque::new(),
+            level_meters: [ac::meter::Meter::new(audio_rate), ac::meter::Meter::new(audio_rate)],
             audio_eof: false,
             muted: false,
             volume: 1.0,
@@ -611,6 +618,7 @@ impl Player {
         self.audio_frames = 0;
         self.level_acc = None;
         self.levels.clear();
+        self.level_meters.iter_mut().for_each(ac::meter::Meter::reset);
         self.audio_eof = false;
         self.eof = false;
         self.discard_before = ns;
@@ -694,11 +702,14 @@ impl Player {
                 }
                 _ => {
                     if let Some((idx, l, r)) = self.level_acc.take() {
-                        self.levels.push_back((idx * LEVEL_WINDOW_NS, [l, r]));
+                        let rms = self.window_rms();
+                        self.levels.push_back((idx * LEVEL_WINDOW_NS, [l, r], rms));
                     }
                     self.level_acc = Some((w, fr[0].abs(), fr[1].abs()));
                 }
             }
+            self.level_meters[0].push(&[fr[0]], 1);
+            self.level_meters[1].push(&[fr[1]], 1);
         }
         self.audio_frames += (stereo.len() / 2) as u64;
         self.pending.extend(stereo);
@@ -858,23 +869,32 @@ impl Player {
     }
 
     /// The meter windows that are due at `now`.
-    fn due_levels(&mut self, now: i64, eof: bool) -> Option<(i64, Vec<[f32; 2]>)> {
+    fn due_levels(&mut self, now: i64, eof: bool) -> Option<(i64, Vec<[f32; 2]>, Vec<[f64; 2]>)> {
         if eof && self.pending.is_empty() {
             if let Some((idx, l, r)) = self.level_acc.take() {
-                self.levels.push_back((idx * LEVEL_WINDOW_NS, [l, r]));
+                let rms = self.window_rms();
+                self.levels.push_back((idx * LEVEL_WINDOW_NS, [l, r], rms));
             }
         }
         let mut first = None;
         let mut out = Vec::new();
-        while let Some(&(t, p)) = self.levels.front() {
+        let mut rms = Vec::new();
+        while let Some(&(t, p, q)) = self.levels.front() {
             if t > now {
                 break;
             }
             self.levels.pop_front();
             first.get_or_insert(t);
             out.push(p);
+            rms.push(q);
         }
-        first.map(|t| (t, out))
+        first.map(|t| (t, out, rms))
+    }
+
+    /// METERPLAYER (SR319): the closing window's RMS, L and R in dBFS: each channel's meter's 50 ms sliding RMS ending at
+    /// the window's last sample (the window's own RMS when it is full; a partial window counts its missing head as silence).
+    fn window_rms(&self) -> [f64; 2] {
+        [self.level_meters[0].rms_db(), self.level_meters[1].rms_db()]
     }
 
     /// Every queued sample has been played: by the device (all pushed frames consumed), or,
@@ -967,8 +987,9 @@ impl Player {
         let now = self.clock.media_ns();
         self.meter.record(self.time.now_ns() as i64, now);
         let mut presented = false;
-        if let Some((t, peaks)) = self.due_levels(now, self.audio_eof) {
+        if let Some((t, peaks, rms)) = self.due_levels(now, self.audio_eof) {
             sink.levels(t, &peaks);
+            sink.levels_rms(t, &rms);
             if self.vtrack.is_none() {
                 presented = true;
             }

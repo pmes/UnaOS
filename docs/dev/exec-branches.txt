@@ -872,7 +872,7 @@ refs/heads/exec-rmbp-pdfcrypt   db1ebf8fb IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pixelunfilter   db1ebf8fb IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-rsfixed   db1ebf8fb IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-heifoneretire   db1ebf8fb IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-meterplayer   db1ebf8fb IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-meterplayer   bb52f8dfe FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethermacgpudamage   db1ebf8fb IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-hevcconf   db1ebf8fb IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-h264enc8x8   db1ebf8fb IN-FLIGHT cut 2026-10-27
