@@ -906,7 +906,7 @@ refs/heads/exec-rmbp-nle6mixaudio   f9b8e5dc9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdf4annots   48041f8a6 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdfreencrypt   11bc87214 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hevcrexttools   f9b8e5dc9 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-idbkatorder   f9b8e5dc9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-idbkatorder   8f639f6b0 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-phyoncetests   99c1251a2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-av1playercolour   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-jpegcolourone   e9df84207 IN-FLIGHT cut 2026-10-27
