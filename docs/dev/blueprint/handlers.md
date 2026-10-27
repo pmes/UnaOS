@@ -92,7 +92,7 @@
 - NLE2c (SR201 owed): multi-select and snapping (to clip edges and the playhead); `lift` and `move_clip` on the face.
 - NLE2-ORDER (SR201 owed): Quartzite's GTK Surface hands its buffer to cairo `ARgb32` (BGRA bytes on little-endian, `libs/quartzite/src/platforms/gtk/image_view.rs`) while the AppKit one's `set_frame` takes RGBA; `stria-view` blits `PixelOrder::Bgra` under `gtk` meanwhile. One Surface contract owed (aether-shell's GTK chrome blits RGBA into the same surface).
 - NLE2-SURFACEID (SR201 owed): a Surface's pointer events carry no surface id, so a tree with two Surfaces cannot tell its clicks apart; the editor paints preview, ruler and tracks on ONE surface until they do.
-- NLE3 (SR194 owed): transitions: CMX `D` / `W` events (refused by `edl::parse` today), a dissolve step (two sources at one tick) blended with pixel_core's `blend_*`.
+- NLE2-AUDIO (SR201 owed): the face's play steps frames on a clock and plays no sound (the audio is NLE4's mix through Stria's sink); the GTK Surface sends no `BrowserResize`, so its canvas keeps the launch size.
 - NLE3 (SR194 owed): BUILT by SR202 (BP-handlers-14): CMX `D` / `W001` / `W002` two-line events, `Step.vmix`, the dissolve through pixel_core's `blend_nonpremult` and the edge wipes.
 - NLE3b (SR202 owed): the audio crossfade across a transition: NLE4's audio mix list takes the outgoing clip's handle under the transition's span.
 - NLE3c (SR202 owed): more SMPTE wipe codes (W003+: box, diagonal, clock) and a dissolve from / to black (a `BL` outgoing line, refused by `edl::parse` today).
@@ -109,7 +109,7 @@
 - H264ENC-SUBPEL (SR197 owed): the motion search is integer-sample only (+-8 around zero); a half / quarter-sample refinement over `h264_core::inter::luma_mc` and smaller partitions are owed.
 - H264ENC-BFRAMES (SR197 owed): no B pictures; they need reordering (VUI max_num_reorder_frames above 0) and a container composition offset per sample.
 - H264ENC-DEBLOCK (SR197 owed): slices carry disable_deblocking_filter_idc 1 so the reconstruction needs no filter; idc 0 needs the encoder to run h264_core's `deblock` over its reconstruction before it becomes the reference.
-- NLE5b (SR197 owed): the Stria export verb that drives `h264enc_core` from NLE1's (SR194) rendered frames and muxes through demux_core's writer.
+- H264ENC-NBSHARE (SR197 owed): the neighbour rules (sample availability, predicted Intra4x4PredMode, CAVLC nC, mvp / P_Skip) are private methods of h264_core's decoder state (`unaos/libs/media/h264_core/src/mb.rs`, `inter.rs`, `decoder.rs`), so the encoder mirrors them for one slice per picture; making them free fns both sides call is a behaviour-neutral refactor of h264_core.
 - H264ENC-HW (SR197 owed): hardware encode (a GPU or SoC encoder behind the same `Access` output) is unbuilt.
 
 ## 6. Read further
