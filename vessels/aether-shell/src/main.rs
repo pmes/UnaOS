@@ -1365,6 +1365,88 @@ mod tests {
             );
         }
     }
+
+    /// AETHERMACDEVTOOLS (SR312): the faces' developer-tools, console and accessibility rows
+    /// (`quartzite::widgets::{devtools_rows, console_rows, a11y_rows}`, both faces' one copy) against the model: the panel
+    /// labels are `Panel::ALL`'s; the face's toggle and GTK's Ctrl+Shift+I are `is_devtools_toggle`'s; AppKit's
+    /// JavaScript Console key opens a closed pane on the Console panel and never closes an open one (applied as
+    /// `Coordinator::on_devtools` and the tab's `BrowserDevtoolsPanel` arm apply them), and the layout the face receives
+    /// reads open / closed; the console filter over a `LogTail`; the face's accessibility rows reach the engine as the
+    /// prefs Principia's values mean (`A11yPrefs::from_rows` == `from_prefs`); F6 alternates the address and the page.
+    #[test]
+    fn aethermacdevtools_model_kat() {
+        use chrome::devtools::Panel;
+        use quartzite::widgets::{a11y_rows, console_rows, devtools_rows};
+        let labels: Vec<&str> = Panel::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels, devtools_rows::PANELS);
+
+        let is_toggle = |m: &SMessage| match m {
+            SMessage::BrowserDevtoolsKey { key, ctrl, shift, alt } => chrome::is_devtools_toggle(key, *ctrl, *shift, *alt),
+            _ => false,
+        };
+        assert!(is_toggle(&devtools_rows::toggle_key()));
+        assert!(is_toggle(&SMessage::BrowserDevtoolsKey { key: "I".into(), ctrl: true, shift: true, alt: false }));
+
+        fn apply(c: &mut chrome::DevtoolsChrome, panel: &mut Panel, msgs: Vec<SMessage>) {
+            for m in msgs {
+                match m {
+                    SMessage::BrowserDevtoolsKey { key, ctrl, shift, alt } => {
+                        c.on_key(&key, ctrl, shift, alt);
+                    }
+                    SMessage::BrowserDevtoolsPanel(label) => {
+                        if let Some(p) = Panel::ALL.iter().find(|p| p.label().eq_ignore_ascii_case(&label)) {
+                            *panel = *p;
+                        }
+                    }
+                    other => panic!("not a pane verb: {other:?}"),
+                }
+            }
+        }
+        let mut c = chrome::DevtoolsChrome::default();
+        let mut panel = Panel::Elements;
+        let area = Some((1000, 800));
+        assert_eq!(devtools_rows::pane_open(&devtools_layout(&c, area)), Some(false));
+        let v = devtools_rows::console_verbs(c.open);
+        apply(&mut c, &mut panel, v);
+        assert!(c.open);
+        assert_eq!(panel, Panel::Console);
+        assert_eq!(devtools_rows::pane_open(&devtools_layout(&c, area)), Some(true));
+        panel = Panel::Network;
+        let v = devtools_rows::console_verbs(c.open);
+        apply(&mut c, &mut panel, v);
+        assert!(c.open, "an open pane stays open");
+        assert_eq!(panel, Panel::Console);
+        apply(&mut c, &mut panel, vec![devtools_rows::toggle_key()]);
+        assert_eq!(devtools_rows::pane_open(&devtools_layout(&c, area)), Some(false));
+
+        let tail = [
+            bandy::state::LogLine { seq: 1, level: "INFO".into(), source: "net".into(), content: "up".into() },
+            bandy::state::LogLine { seq: 2, level: "ERROR".into(), source: "usb".into(), content: "gone".into() },
+        ];
+        let rows = console_rows::rows_from_tail(&tail);
+        assert_eq!(console_rows::render_body(&console_rows::filtered(&rows, console_rows::LevelFilter::All)), "net  up\nusb  gone");
+        assert_eq!(console_rows::render_body(&console_rows::filtered(&rows, console_rows::LevelFilter::Warn)), "usb  gone");
+
+        let stored = |k: &str| match k {
+            "accessibility.reduce_motion" => Some("on".to_string()),
+            "accessibility.contrast" => Some("more".to_string()),
+            "accessibility.forced_colors" => Some("true".to_string()),
+            _ => None,
+        };
+        let face = a11y_rows::A11yRows::from_values(|k| stored(k).map(bandy::PrefValue::Str));
+        let SMessage::BrowserA11yPrefs { reduce_motion, contrast, forced_colors } = face.message() else { panic!("not the rows") };
+        let applied = aether::dom::a11y::prefs::A11yPrefs::from_rows(reduce_motion, &contrast, forced_colors);
+        assert_eq!(applied, aether::dom::a11y::prefs::A11yPrefs::from_prefs(stored));
+        assert!(matches!(
+            a11y_rows::A11yRows::from_values(|_| None).message(),
+            SMessage::BrowserA11yPrefs { reduce_motion: false, ref contrast, forced_colors: false } if contrast == "no-preference"
+        ));
+
+        use a11y_rows::FocusStop::{Address, Page};
+        assert_eq!(a11y_rows::f6_step(Some(Page), false), Address);
+        assert_eq!(a11y_rows::f6_step(Some(Address), false), Page);
+        assert_eq!(a11y_rows::f6_step(None, true), Page);
+    }
 }
 
 /// AETHERMAC (SR196): every face opens the first argument that is not a flag as the first page
