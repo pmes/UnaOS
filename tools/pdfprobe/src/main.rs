@@ -8,7 +8,8 @@
 //! pdfprobe <file>
 //! ```
 //!
-//! Prints `pages=<n> version=<v> xref=<table|stream|rebuilt> info=<title|->`, then one line per page:
+//! Prints `pages=<n> version=<v> xref=<table|stream|rebuilt> encrypt=<none|rc4-40|rc4-128|aesv2|aesv3|...>
+//! info=<title|->` (encrypt: PDFCRYPT SR315, the file opened with the empty user password), then one line per page:
 //! `page=<i> media=<w>x<h> rotate=<r> ops=<n> fonts=<n> images=<n>` (fonts = the /Resources /Font entries; images =
 //! the /Resources /XObject entries whose /Subtype is /Image, plus the inline images among the page's ops).
 //! A refused file prints `error=<reason>` and exits 1.
@@ -65,7 +66,7 @@ fn main() {
     let pages = doc.pages().unwrap_or_else(|e| fail(e));
     let title = doc.info().title.map(|t| one_line(&t)).filter(|t| !t.is_empty()).unwrap_or_else(|| "-".into());
     let version = if doc.version().is_empty() { "-" } else { doc.version() };
-    println!("pages={} version={version} xref={} info={title}", pages.len(), doc.xref_kind().as_str());
+    println!("pages={} version={version} xref={} encrypt={} info={title}", pages.len(), doc.xref_kind().as_str(), doc.encryption());
     for (i, p) in pages.iter().enumerate() {
         println!("{}", page_line(&doc, i, p));
     }
