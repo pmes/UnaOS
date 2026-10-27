@@ -562,3 +562,25 @@ pub fn demote_bcs() {
 // no line of the root moves; it rides every compositing build, as this blitter does.
 #[path = "a11yfilter.rs"]
 pub mod a11yfilter;
+
+// ---- KEPLER3D2 (rmbp-ledger B883) — the selection re-probed ONCE after the copy engine arms (WALL A) ----------------
+// `ignite` runs inside the takeover (`kepler_display.rs:511` -> `desktop_uefi::activate` -> `desktop_uefi.rs:457`), before
+// `kepler.rs:1474` `kepler_gpublit::arm`, so it latches the CPU on `no-takeover`. `reprobe` (called from the arm line, knob
+// `nvidia-kepler-cecopy`) releases the latch and re-runs `ignite` VERBATIM — the selection body stays exactly once. The CAS
+// keeps a racing lazy `ignite` (`present_band`) safe: whoever re-latches runs the same, now-armed, probe.
+#[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-cecopy"))]
+pub fn reprobe() {
+    let armed = crate::drivers::gpu::kepler_gpublit::armed();
+    let was = selected().name();
+    let why = if !armed {
+        crate::drivers::gpu::kepler_gpublit::reason()
+    } else if SEL_GPU.load(Acquire) {
+        "already-gpu"
+    } else if IGNITED.compare_exchange(true, false, AcqRel, Acquire).is_ok() {
+        ignite();
+        GPU.probe().err().unwrap_or("selftest-ok")
+    } else {
+        "not-ignited" // `ignite` has not run; its first call sees the armed engine
+    };
+    serial_println!("[wc] blitter reprobe armed={} was={} now={} why={}", armed as u8, was, selected().name(), why);
+}
