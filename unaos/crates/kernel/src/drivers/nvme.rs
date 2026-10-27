@@ -45,7 +45,7 @@
 //! ```text
 //! [nvme] bdf <b>:<s>.<f> <vid>:<did> bar0=0x<..> cap=0x<..> ver=<x.y.z> mqes=<n> dstrd=<n> to_ms=<n>   (bootlog)
 //! [nvme] ctrl  (the ready line: mn="<model>" ns=1 lba=<bytes> blocks=<n> -> ready; spelled once, at `probe`)
-//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> runs=<n> run_blocks=<n>
+//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> rbatch=<n> runs=<n> run_blocks=<n> rblocks=<n> rcmds=<n>
 //! :: NVME: ctrl=ok ns=1 rw=ok -> PASS ::
 //! ```
 //!
@@ -303,7 +303,7 @@ fn io_cmd(c: &mut Ctrl, opc: u32, lba: u64, bytes: usize) -> Result<(), ()> {
     cmd[12] = nlb - 1; // 0-based
     if opc == IO_WRITE {
         IO_WRITE_CMDS.fetch_add(1, Ordering::Relaxed); // NVMEBATCH (Z22): what `tests nvme`'s `batch=` counts
-    }
+    } else if opc == IO_READ { IO_READ_CMDS.fetch_add(1, Ordering::Relaxed); IO_READ_BLOCKS.fetch_add(nlb as u64, Ordering::Relaxed); } // NVMEBATCHREAD (Z24): what `tests nvme`'s `rbatch=` / `rblocks=` / `rcmds=` count
     submit(c, false, &mut cmd).map(|_| ())
 }
 
@@ -570,7 +570,7 @@ pub fn probe() {
             return;
         }
     };
-    let (mn, lba, blocks) = (c.mn, c.lba_bytes, c.nsze);
+    let (mn, lba, blocks) = (c.mn, c.lba_bytes, c.nsze); XFER_SECTORS.store(if c.lba_bytes == 512 { (c.max_xfer / 512) as u32 } else { 0 }, Ordering::Relaxed); // NVMEBATCHREAD (Z24): the read-ahead window `fs::unafs::ra_window` gives the NVMe, set before `c` moves
     crate::arch::without_interrupts(|| *CTRL.lock() = Some(c));
     if crate::drivers::block::register_nvme(blocks, lba, &mn) {
         serial_println!("[nvme] ctrl mn=\"{}\" ns=1 lba={} blocks={} -> ready", trimmed(&mn), lba, blocks);
@@ -615,8 +615,8 @@ pub fn selftest() {
     };
     let (runs, run_blocks) = crate::drivers::block::nvme_run_census(); // NVMEBATCH (Z22)
     serial_println!(
-        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} runs={} run_blocks={}",
-        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), runs, run_blocks
+        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} rbatch={} runs={} run_blocks={} rblocks={} rcmds={}",
+        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), LAST_RBATCH.load(Ordering::Relaxed), runs, run_blocks, IO_READ_BLOCKS.load(Ordering::Relaxed), IO_READ_CMDS.load(Ordering::Relaxed)
     );
     let ctrl = if identify { "ok" } else { "bad" };
     let root = root_leg();
@@ -670,7 +670,7 @@ fn scratch_rw(lba: u64, bs: usize) -> &'static str {
     } else if batch != expect {
         "bad:batch"
     } else {
-        "ok"
+        read_legs(lba, &orig, expect) // NVMEBATCHREAD (Z24): the 8-block read is ONE command, on the block layer and through the mount device
     }
 }
 
@@ -719,3 +719,59 @@ static IO_WRITE_CMDS: AtomicU32 = AtomicU32::new(0);
 /// NVMEBATCH: the WRITE commands the scratch leg's 8-block `write_at` issued (0 = the leg did not run); it must
 /// equal `ceil(len / max_xfer)` — 1 on every controller for 8 x 512 B — or the leg answers `bad:batch`.
 static LAST_BATCH: AtomicU32 = AtomicU32::new(0);
+
+// ══════════ NVMEBATCHREAD (zenbook-ledger Z24) — the READ census and the rw leg's read checks ══════════
+
+/// NVMEBATCHREAD: I/O READ commands submitted this boot (bumped in [`io_cmd`], the twin of [`IO_WRITE_CMDS`]).
+static IO_READ_CMDS: AtomicU32 = AtomicU32::new(0);
+/// NVMEBATCHREAD: logical blocks those READ commands moved (`rblocks=`; `rblocks / rcmds` is the batch a read rides).
+static IO_READ_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// NVMEBATCHREAD: the READ commands the scratch leg's 8-block `block::read_blocks_nvme` cost (0 = the leg did not
+/// run); it must equal the write leg's `expect` (`ceil(len / max_xfer)`, 1 for 8 x 512 B) or the leg answers `bad:rbatch`.
+static LAST_RBATCH: AtomicU32 = AtomicU32::new(0);
+/// NVMEBATCHREAD: sectors one command may move (`max_xfer / 512`), set once at [`probe`]; 0 = no window (not
+/// probed, or a non-512-byte namespace, which `fs::unafs::SdSectorDevice` cannot serve: NVME4KN).
+static XFER_SECTORS: AtomicU32 = AtomicU32::new(0);
+
+/// NVMEBATCHREAD: the read-ahead window `fs::unafs::ra_window` gives the NVMe handle (it clamps to the block layer's
+/// per-op cap), so one window fill is one READ command. Lock-free: no controller hold.
+pub(crate) fn xfer_sectors() -> u32 {
+    XFER_SECTORS.load(Ordering::Relaxed)
+}
+
+/// NVMEBATCHREAD: the rw leg's read checks over the restored scratch `orig` at `lba`. (i) `block::read_blocks_nvme` of
+/// the 8 blocks costs `expect` READ commands and returns `orig`, else `bad:rbatch`; (ii) with `unafs`, the same blocks
+/// through the mount device's read path (`fs::unafs::nvme_read_leg`, a fresh device: one window fill) cost exactly ONE
+/// READ and return `orig`, else `bad:rpath`. The commands are counted globally, so each leg keeps the FEWEST of three
+/// attempts: a live root's concurrent READ cannot fail it, a per-sector path (8) always does.
+fn read_legs(lba: u64, orig: &[u8], expect: u32) -> &'static str {
+    let mut back = alloc::vec![0u8; orig.len()];
+    let mut rbatch = u32::MAX;
+    for _ in 0..3 {
+        let r0 = IO_READ_CMDS.load(Ordering::Relaxed);
+        if crate::drivers::block::read_blocks_nvme(lba, &mut back).is_err() || back != orig {
+            return "bad:rbatch";
+        }
+        rbatch = rbatch.min(IO_READ_CMDS.load(Ordering::Relaxed).wrapping_sub(r0));
+    }
+    LAST_RBATCH.store(rbatch, Ordering::Relaxed);
+    if rbatch != expect {
+        return "bad:rbatch";
+    }
+    #[cfg(feature = "unafs")]
+    {
+        let mut fewest = u32::MAX;
+        for _ in 0..3 {
+            back.iter_mut().for_each(|b| *b = 0);
+            let r0 = IO_READ_CMDS.load(Ordering::Relaxed);
+            if !crate::fs::unafs::nvme_read_leg(lba, &mut back) || back != orig {
+                return "bad:rpath";
+            }
+            fewest = fewest.min(IO_READ_CMDS.load(Ordering::Relaxed).wrapping_sub(r0));
+        }
+        if fewest != 1 {
+            return "bad:rpath";
+        }
+    }
+    "ok"
+}
