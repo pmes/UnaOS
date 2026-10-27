@@ -3473,4 +3473,59 @@ mod tests {
         let dark = ((x as u32 + 2)..((x + w) as u32 - 2)).filter(|&cx| px(&engine, cx, mid).0 < 60).count();
         assert_eq!(dark, 0, "the blink's off phase paints no caret");
     }
+    /// AETHERSCALE (SR190): the header's metrics (`chrome::scale`, the bytes AETHER.ELF links by `#[path]`) at each text
+    /// step of the font-size schema — today's heights at and below the default, every band holding the face's line,
+    /// the page keeping lines on the 288 px surface, the menu fitted inside the window with its face held to its row;
+    /// and the first font size whose header would leave no page line, found and asserted past the schema's 32.
+    #[test]
+    fn aetherscale_header_reflows_kat() {
+        use crate::chrome::scale::{self, Metrics};
+        const DEFAULT: i32 = 13;
+        const MENU_ROWS: i32 = 10;
+        const MENU_PAD: i32 = 4;
+        const RING: i32 = 2;
+        let at = |css: i32| (scale::face_for(css, DEFAULT), Metrics::at(scale::face_for(css, DEFAULT)));
+        assert_eq!(scale::line(scale::FACE_BASE), scale::LINE_BASE, "LINE_BASE is the default face's line");
+        let base = |m: &Metrics| (m.tab_h, m.bar_h, m.ctl, m.menu_row, m.status_h);
+        for css in [9, DEFAULT] {
+            let (_, m) = at(css);
+            assert_eq!(base(&m), (26, 30, 22, 22, 14), "css {css}: today's heights");
+            assert_eq!(m.chrome_h(), 56, "css {css}: chrome_h");
+        }
+        // (css, chrome_h, status_h, ctl, page lines at 288)
+        let table = [(9, 56, 14, 22, 10), (13, 56, 14, 22, 10), (16, 62, 17, 25, 10), (20, 70, 21, 29, 9), (26, 84, 28, 36, 8), (32, 96, 34, 42, 7)];
+        let mut prev: Option<Metrics> = None;
+        for &(css, chrome_h, status_h, ctl, lines) in &table {
+            let (face, m) = at(css);
+            assert_eq!((m.chrome_h(), m.status_h, m.ctl), (chrome_h, status_h, ctl), "css {css}: the grown header");
+            if let Some(p) = prev {
+                assert!(m.tab_h >= p.tab_h && m.bar_h >= p.bar_h && m.ctl >= p.ctl && m.menu_row >= p.menu_row && m.status_h >= p.status_h, "css {css}: monotone");
+            }
+            prev = Some(m);
+            assert!(m.ctl - 2 * RING >= m.line, "css {css}: the field holds the face (no FONT_MAX)");
+            assert!(m.tab_h - 4 >= m.line, "css {css}: a tab holds the face");
+            assert!(m.status_h >= m.line, "css {css}: the status line holds the face");
+            assert!(m.bar_h >= m.ctl, "css {css}: the bar holds its controls");
+            let content = m.content_h(scale::SURFACE_H);
+            assert!(content >= scale::PAGE_LINE, "css {css}: a page line left at 288");
+            assert_eq!(content / scale::PAGE_LINE, lines, "css {css}: page lines at 288");
+            // The menu at a full 288 window, under the top layout's header.
+            let mu = m.menu(face, MENU_ROWS, MENU_PAD, m.chrome_h(), scale::SURFACE_H);
+            assert!(mu.y >= 2, "css {css}: menu top inside");
+            assert!(mu.y + MENU_ROWS * mu.row + 2 * MENU_PAD <= scale::SURFACE_H, "css {css}: menu foot inside");
+            assert!(scale::line(mu.face) <= mu.row, "css {css}: a menu row holds its face");
+            if css == DEFAULT {
+                assert_eq!((mu.y, mu.row, mu.face), (58, 22, scale::FACE_BASE), "the default menu is today's");
+            }
+        }
+        // The surface-derived cap: largest (26) holds the menu at 27 px rows and a 21.6 px face.
+        let (face, m) = at(26);
+        let mu = m.menu(face, MENU_ROWS, MENU_PAD, m.chrome_h(), scale::SURFACE_H);
+        assert_eq!(mu.row, 27);
+        assert!((mu.face - 21.6).abs() < 1e-3 && face > mu.face, "largest: the menu face is held ({face} -> {})", mu.face);
+        // The first font size whose header and status line would leave less than one page line on the surface.
+        let first = (9..=200).find(|&css| at(css).1.content_h(scale::SURFACE_H) < scale::PAGE_LINE).unwrap();
+        assert_eq!(first, 77, "the header bound sits at css 77");
+        assert!(first > 32, "no schema step (9..=32) breaks the header bound");
+    }
 }

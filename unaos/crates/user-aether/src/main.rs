@@ -298,7 +298,7 @@ impl App {
     }
     /// Bring the document band [`top`, `bottom`) into the window above the status line.
     fn reveal(&mut self, top: f32, bottom: f32, p: &Page) {
-        let view = (self.h - paint::STATUS_H) as f32;
+        let view = (self.h - paint::status_h()) as f32;
         if top < self.scroll {
             self.scroll_to(top - 4.0, p);
         } else if bottom > self.scroll + view {
@@ -745,7 +745,7 @@ pub extern "C" fn _start() -> ! {
         surf: (base + 0x5000) as *mut u8,
         flags: unsafe { ((base + 0x4000) as *const u32).add(0x20 / 4) },
         w: MAX_W,
-        h: MAX_H - chrome::CHROME_H, // SR109: the page's logical size, below the chrome at 100 %
+        h: MAX_H - chrome::chrome_h(), // SR109: the page's logical size, below the chrome at 100 %
         scroll: 0.0,
         dirty: true,
         relayout: false,
