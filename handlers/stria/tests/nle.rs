@@ -790,3 +790,32 @@ fn colourone_editor_renders_a_bt2020_reel_with_the_2020_matrix() {
     assert_eq!((at(&tagged, 20, 6), at(&plain, 20, 6)), (vec![255, 139, 48, 255], vec![255, 141, 54, 255]));
     println!("colourone: editor bt2020 px=194,73,0 bt601=189,78,0");
 }
+
+// NLE-STANDIN-OPEN (LEDGER SR353): a reel no decoder fits opens in the editor as the Player plays it — the labelled stand-in
+// through `stria::decode_swap::open` — instead of the render failing on `RenderError::Decode`, and the timeline stays editable.
+
+/// Rule: a `V_MPEG4/ISO/ASP` reel (Codec::Other, no core decodes it) opens with ` decode=stand-in` in its open report BEFORE any render,
+/// renders every tick as the stand-in's labelled counter of that source frame, and a trim renders the trimmed frame.
+#[test]
+fn nle_standin_open_a_reel_no_decoder_fits_is_edited_on_stand_in_frames() {
+    // Matroska states the frame size for any video codec (MP4 reads it only for the sample entries it maps), and
+    // `V_MPEG4/ISO/ASP` (MPEG-4 Part 2) is mapped by no demux_core arm (Codec::Other) and decoded by no core.
+    let mut t = build::test_pattern_track(1, 64, 48, 25, 10, 5);
+    t.spec.codec_id = "V_MPEG4/ISO/ASP";
+    let file = build::mkv(&[t], &MkvOptions::default());
+    let (tl, src) = Sources::from_media("S", &file, 25).unwrap().unwrap();
+    let report = src.open_report(SourceId(0)).unwrap().to_string();
+    assert!(report.ends_with(" decode=stand-in"), "{report}");
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..10, &src, &mut sink).unwrap();
+    assert_eq!(r.frames, 10);
+    assert_eq!(sink.frames.iter().map(|f| f.0).collect::<Vec<_>>(), (0..10).collect::<Vec<i64>>());
+    for (i, (_, rgba)) in sink.frames.iter().enumerate() {
+        assert_eq!(rgba, &TestPattern::render(64, 48, i as u32), "tick {i} is not the stand-in's frame {i}");
+    }
+    let trimmed = tl.trim_in(0, 0, 3).unwrap();
+    let mut sink = Collect::default();
+    render(&trimmed, 3..5, &src, &mut sink).unwrap();
+    assert_eq!(sink.frames[0], (3, TestPattern::render(64, 48, 3)));
+    println!("nle-standin-open: {report} frames={}", r.frames);
+}

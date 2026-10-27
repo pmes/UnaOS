@@ -38,7 +38,7 @@ use gneiss_pal::dsp::audio::{self as ac, AudioDecoder};
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
 use gneiss_pal::dsp::avsync::{Decision, DriftMeter, DriftReport, MasterClock, SchedStats, Scheduler, TimeSource};
 use gneiss_pal::dsp::demux::{Demuxer, Packet, Track, TrackKind};
-use gneiss_pal::dsp::video::{Frame, TestPattern, VideoDecoder, decoder_for, reorder_depth, colour_of};
+use gneiss_pal::dsp::video::{Frame, VideoDecoder, reorder_depth, colour_of};
 
 /// Where presented frames (and the audio meters) go.
 pub trait FrameSink {
@@ -325,13 +325,7 @@ impl Player {
         let (demux, vtrack, vdec, audio, duration_ns, start_ns) = match opened {
             Ok(demux) => {
                 let vtrack = demux.tracks().iter().find(|t| t.kind == TrackKind::Video).cloned();
-                let vdec: Option<Box<dyn VideoDecoder>> = vtrack.as_ref().map(|vt| match decoder_for(vt) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        log::info!("[STRIA] :: {e}; test-pattern stand-in");
-                        Box::new(TestPattern::stand_in(vt)) as Box<dyn VideoDecoder>
-                    }
-                });
+                let vdec: Option<Box<dyn VideoDecoder>> = vtrack.as_ref().map(crate::decode_swap::open); // SWAPBACKSEEK (SR353): the ONE decoder-or-stand-in, shared with the editor's run open
                 let atrack = demux.tracks().iter().find(|t| t.kind == TrackKind::Audio).cloned();
                 let mut audio = None;
                 let mut astart: Option<i64> = None;
@@ -594,7 +588,7 @@ impl Player {
         }
         if let Some(v) = self.vdec.as_mut() {
             v.reset();
-        }
+        } self.reseed_video(ns); // SWAPBACKSEEK (SR353): the target's in-band parameter sets, the stand-in re-evaluated there
         match self.audio.as_mut() {
             Some(AudioSrc::Track { dec, .. }) => dec.reset(),
             Some(AudioSrc::File { bytes, dec, frames, .. }) => {
@@ -1078,5 +1072,17 @@ impl Player {
                 self.info.video_decoder = v.name().to_string();
             }
         }
+    }
+}
+
+/// SWAPBACKSEEK (LEDGER SR353): a seek restarts the video decode at the keyframe at or before the target with the in-band
+/// parameter sets in effect there ([`crate::decode_swap::DecodeSwap::reseed`], the one the editor's run open uses), and
+/// `MediaInfo` names the decoder that now plays (a seek out of a refused span plays the real decoder again at once).
+impl Player {
+    fn reseed_video(&mut self, ns: i64) {
+        let (Some(v), Some(vt), Some(d)) = (self.vdec.as_mut(), self.vtrack.as_ref(), self.demux.as_ref()) else { return };
+        self.vswap.reseed(v, vt, d, ns);
+        self.info.real_video = v.is_real();
+        self.info.video_decoder = v.name().to_string();
     }
 }
