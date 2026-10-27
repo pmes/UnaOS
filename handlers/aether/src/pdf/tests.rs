@@ -175,7 +175,7 @@ fn pdf4_html_after_pdf() {
     assert_eq!(e.pdf_status(), None);
 }
 
-// =================================================================================================
+// ==========================================================================================
 // PDF4ANNOTS (SR343): links and form widgets on the page stack.
 // =================================================================================================
 
@@ -421,9 +421,8 @@ fn pdf4formsave_plain_pdf() {
     assert_eq!(name, "PDF4 Test.pdf", "the /Info /Title");
     assert_eq!(mime, "application/pdf");
     assert_eq!(bytes, two_pages(), "an unedited PDF saves its original bytes");
-    e.handle_event(Event::KeyDown("Ctrl+Shift+s".to_string()));
     e.handle_event(Event::KeyDown("s".to_string()));
-    assert!(e.take_pending_save().is_none(), "Shift (Save As) and a bare s stage nothing");
+    assert!(e.take_pending_save().is_none(), "a bare s stages nothing (Shift is Save As: savedialog KATs)");
 }
 
 #[test]
@@ -713,3 +712,36 @@ fn pdf4thumbs_labels() {
     assert!(ink, "page 1's number under its thumbnail");
 }
 
+=======
+/// SAVEDIALOG (SR364): the staged Save As's name, type and bytes.
+fn staged_save_as(e: &mut AetherEngine) -> (String, String, Vec<u8>) {
+    match e.take_pending_save() {
+        Some(bandy::SMessage::BrowserSaveAs { name, mime, bytes }) => (name, mime, bytes),
+        other => panic!("no BrowserSaveAs staged: {other:?}"),
+    }
+}
+
+#[test]
+fn savedialog_ctrl_shift_s_stages_save_as() {
+    let mut e = open(400, 300);
+    e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
+    let (name, mime, bytes) = staged_save_as(&mut e);
+    assert_eq!((name.as_str(), mime.as_str()), ("PDF4 Test.pdf", "application/pdf"), "the Save's own name and type");
+    assert_eq!(bytes, two_pages(), "the Save's own bytes");
+    assert!(e.take_pending_save().is_none(), "taken once");
+    e.handle_event(Event::KeyDown("Meta+Shift+s".to_string()));
+    assert_eq!(staged_save_as(&mut e).2, bytes, "Cmd+Shift+S (the macOS face's key) stages the same");
+    e.handle_event(Event::KeyDown("Ctrl+s".to_string()));
+    assert_eq!(staged_save(&mut e).2, bytes, "plain Ctrl+S is still the Downloads save");
+    e.handle_event(Event::KeyDown("Ctrl+Alt+Shift+S".to_string()));
+    assert!(e.take_pending_save().is_none(), "Alt stages nothing");
+}
+
+#[test]
+fn savedialog_html_tab_stages_nothing() {
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_html("https://example.com/", "<html><body><p>hi</p></body></html>", true);
+    e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
+    assert!(e.take_pending_save().is_none(), "PAGE-SAVE is owed: an HTML tab stages no Save As either");
+}
