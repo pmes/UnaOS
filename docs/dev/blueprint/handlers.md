@@ -5,7 +5,7 @@
 - Each handler is a host crate under `handlers/` (root workspace). `handlers/sonde/` is a 22nd directory; its CODEX row (Amendment IV, R112) awaits Peter's signature.
 - On UnaOS a handler appears as (a) a ring-3 ELF, (b) a kernel fulfiller of its bus verbs, or (c) a kernel app file whose `CHARTER:` names it (seam `shared-core` / `owed B<n>`), listed in `unaos/scripts/charter.registry` (93 lines).
 - Host libraries: `libs/gneiss_pal` (platform layer), `libs/bandy` (bus), `libs/quartzite` (GUI), `libs/elessar` (workspace binder), `libs/euclase` (wgpu), `libs/lux`, `libs/resonance`, `libs/text_host`.
-- Vessels compose handlers into apps: `vessels/lumen`, `vessels/una`, `vessels/pulse`, `vessels/phonolite`, `vessels/facet-view`, `vessels/aether-shell`.
+- Vessels compose handlers into apps: `vessels/lumen`, `vessels/una`, `vessels/pulse`, `vessels/phonolite`, `vessels/facet-view`, `vessels/aether-shell`. aether-shell's faces (AETHERMAC SR196): GTK grows Quartzite's browser chrome; macOS (AppKit, chosen by `target_os`, run line `--features macos -- <url>`) and the headless fallback take the tetra toolbar through Quartzite's `eval_tetra` (`libs/quartzite/src/platforms/macos/tetra_eval.rs`), whose stacks Fill and whose address field and page surface stretch; the tetra face opens its first argument through the omnibox's own `OpenDocument` (`start_url`, `vessels/aether-shell/src/main.rs`).
 
 ## 2. Invariants
 | id | statement | anchor | held by |
@@ -81,6 +81,9 @@
 - NLEPROBE-EDITS (SR195 owed): `mp4.rs` `parse_trak` honours the first media edit only; multi-edit and rate edits, `sdtp`, and open-GOP leading pictures (a `samples_from` on a non-IDR key can hand undecodable leading Bs) are owed.
 - NLEPROBE-HDR (SR195 owed): colour and HDR metadata (MP4 `colr`/`mdcv`/`clli`, Matroska `Colour`, AV1 METADATA OBUs, H.264 VUI primaries/transfer) reach no `Track` field.
 - NLEPROBE-HI (SR195 owed): H.264 High10 and 4:2:2, an HEVC decoder, HE-AAC SBR/PS, and a cross-check of the container's keyframe flag against the decoder's own (`idr`, `frame_type`, `key_frame`).
+- AETHERMAC-CHROME (SR196 owed): the macOS face carries the tetra toolbar only (back, forward, reload, address field); the GTK face's `bootstrap_browser_chrome` (tab strip, find bar, status line, downloads, devtools) has no AppKit counterpart (R104).
+- AETHERMAC-GTKARGV (SR196 owed): the GTK face reads no start URL: `Backend::run` calls `app.run()` (`libs/quartzite/src/platforms/gtk/mod.rs`), which hands argv to GApplication; `run_with_args` with an empty list would let `start_url` serve it too.
+- AETHERMAC-SELECT (SR196 owed): Quartzite's `macos` feature is empty (`libs/quartzite/Cargo.toml`) while its README says the backend selection is driven by target and features; AppKit is chosen by `target_os` alone. Gate the embassy on the feature or correct the README.
 
 ## 6. Read further
 - `docs/CODEX.md`; `docs/dev/USERLAND/ARCHITECTURE.md`; each handler's own `README.md` for implementation (not charter).

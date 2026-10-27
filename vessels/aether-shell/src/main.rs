@@ -1042,7 +1042,7 @@ fn main() {
 
     #[cfg(not(all(target_os = "linux", feature = "gtk")))]
     {
-        let aether_ui = quartzite::tetra::TetraNode::VStack(vec![
+        start_url(&synapse); let aether_ui = quartzite::tetra::TetraNode::VStack(vec![
             quartzite::tetra::TetraNode::HStack(vec![
                 quartzite::tetra::TetraNode::Button {
                     id: "back".into(),
@@ -1129,5 +1129,16 @@ mod tests {
         assert!(c.on_key("I", true, true, false));
         assert_eq!(shape(&c), "BrowserDevtoolsLayout { bottom: true, page: (0, 0, 1000, 800), pane: None }");
         assert_eq!(format!("{:?}", devtools_layout(&c, None)), "BrowserDevtoolsLayout { bottom: true, page: (0, 0, 0, 0), pane: None }");
+    }
+}
+
+/// AETHERMAC (SR196): the tetra faces (macOS AppKit, the headless fallback) open the first argument that is not a
+/// flag as the first page (`cargo run -p aether-shell --features macos -- https://example.com`), through the same
+/// `OpenDocument` the omnibox fires. The coordinator subscribed before this fires, so its first tab receives it.
+/// The GTK face reads none: its `Backend::run` hands argv to GApplication (AETHERMAC-GTKARGV, handlers.md §5).
+#[cfg(not(all(target_os = "linux", feature = "gtk")))]
+fn start_url(bus: &Synapse) {
+    if let Some(url) = std::env::args().skip(1).find(|a| !a.starts_with('-')) {
+        bus.fire(SMessage::OpenDocument { url });
     }
 }
