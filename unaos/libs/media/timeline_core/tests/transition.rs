@@ -162,7 +162,7 @@ fn the_schedule_names_two_sources_inside_a_transition() {
     assert_eq!(m[0], (20, 20, None, f(1, 10)));
     assert_eq!(m[4], (24, 24, None, f(5, 10)));
     assert_eq!(m[8], (28, 28, None, f(9, 10)));
-    assert!(s[20..29].iter().all(|x| x.vmix.is_some_and(|v| v.src == SourceId(0) && v.kind == TransitionKind::Dissolve)));
+    assert!(s[20..29].iter().all(|x| x.vmix.is_some_and(|v| v.src == Some(SourceId(0)) && v.kind == TransitionKind::Dissolve)));
     // the incoming B seeks at the cut like a plain cut, then continues
     assert_eq!((s[20].src, s[20].src_t, s[20].seek), (Some(SourceId(1)), 0, Some(0)));
     assert_eq!((s[24].src_t, s[24].seek), (4, None));
@@ -171,7 +171,7 @@ fn the_schedule_names_two_sources_inside_a_transition() {
     assert_eq!(m[9], (40, 20, None, f(1, 10)));
     assert_eq!(m[13], (44, 24, None, f(5, 10)));
     assert_eq!(m[17], (48, 28, None, f(9, 10)));
-    assert!(s[40..49].iter().all(|x| x.vmix.is_some_and(|v| v.src == SourceId(1) && v.kind == WIPE)));
+    assert!(s[40..49].iter().all(|x| x.vmix.is_some_and(|v| v.src == Some(SourceId(1)) && v.kind == WIPE)));
     assert_eq!((s[40].src, s[40].src_t, s[40].seek), (Some(SourceId(2)), 5, Some(0)));
     assert_eq!(s[49].vmix, None);
     // a range starting mid-transition seeks the outgoing too (keyframe 20 for A's tick 24)
@@ -180,4 +180,77 @@ fn the_schedule_names_two_sources_inside_a_transition() {
     assert_eq!(mixes(&s)[1], (25, 25, None, f(6, 10)));
     // the index says the outgoing's medium ends inside the handle
     assert_eq!(schedule(&tl, 0..60, &Gop { dur: 27 }).unwrap_err(), timeline_core::schedule::ScheduleError::OutOfSource(SourceId(0)));
+}
+
+// ---- NLE3c (SR209): a transition from black and the W041 / W101 / W201 wipe codes.
+
+/// V1: a gap 0..10, then B[0,20)@10 faded in from black over 5 ticks.
+fn from_black() -> Timeline {
+    let mut tl = Timeline::new(25);
+    tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(SourceId(0), 0, 20, 10)];
+    tl.add_transition_from_black(0, 10, TransitionKind::Dissolve, 5).unwrap()
+}
+
+const FROM_BLACK: &str = "TITLE: BL
+FCM: NON-DROP FRAME
+* UNA FPS 25
+* UNA SOURCE B 00:00:02:00
+
+001  BL       V     C        00:00:00:00 00:00:00:00 00:00:00:10 00:00:00:10
+001  B        V     D    005 00:00:00:00 00:00:00:20 00:00:00:10 00:00:01:05
+";
+
+#[test]
+fn nle3c_from_black_op_and_refusals() {
+    let tl = from_black();
+    let x = tl.tracks[0].transitions[0];
+    assert_eq!((x.at, x.dur, x.from_black, x.kind), (10, 5, true, TransitionKind::Dissolve));
+    // a plain dissolve where nothing ends is still off a cut; a from-black one where a clip ends is refused too
+    assert_eq!(tl.remove_transition(0, 10).unwrap().add_transition(0, 10, TransitionKind::Dissolve, 5), Err(EditError::Transition));
+    assert_eq!(cuts().add_transition_from_black(0, 20, TransitionKind::Dissolve, 5), Err(EditError::Transition));
+    // at tick 0 of a timeline (nothing before), and longer than the incoming clip
+    let mut first = cuts();
+    first.tracks[0].clips.truncate(1);
+    assert!(first.add_transition_from_black(0, 0, WIPE, 20).is_ok());
+    assert_eq!(first.add_transition_from_black(0, 0, WIPE, 21), Err(EditError::Handle));
+}
+
+#[test]
+fn nle3c_the_edl_carries_bl_and_the_new_wipes_byte_exact() {
+    let tl = from_black();
+    let text = edl::write(&tl, "BL").unwrap();
+    assert_eq!(text, FROM_BLACK);
+    let back = edl::parse(&text, 30).unwrap();
+    assert_eq!(back, tl);
+    assert_eq!(edl::write(&back, "BL").unwrap(), text);
+    // a zero-length BL line with no D / W line after it is a gap, not an empty clip
+    let gap = "001  BL       V     C        00:00:00:00 00:00:00:00 00:00:00:10 00:00:00:10\n002  B        V     C        00:00:00:00 00:00:00:20 00:00:00:10 00:00:01:05\n";
+    let g = edl::parse(gap, 25).unwrap();
+    assert_eq!((g.tracks[0].clips.len(), g.tracks[0].transitions.len()), (1, 0));
+    // BL as the incoming line (a transition TO black) is still refused
+    let to_black = "001  B        V     C        00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20\n002  B        V     C        00:00:00:20 00:00:00:20 00:00:00:20 00:00:00:20\n002  BL       V     D    005 00:00:00:00 00:00:00:05 00:00:00:20 00:00:01:00\n";
+    assert_eq!(edl::parse(to_black, 25), Err(EdlError::Transition { line: 3 }));
+    // W041 / W101 / W201 round trip
+    for (d, code) in [(WipeDir::Diagonal, "W041"), (WipeDir::Box, "W101"), (WipeDir::Clock, "W201")] {
+        assert_eq!(WipeDir::from_code(d.code()), Some(d));
+        let tl = cuts().add_transition(0, 20, TransitionKind::Wipe(d), 7).unwrap();
+        let text = edl::write(&tl, "W").unwrap();
+        assert!(text.contains(&format!("{code} 007")), "{text}");
+        assert_eq!(edl::parse(&text, 25).unwrap(), tl);
+    }
+    assert_eq!(WipeDir::from_code(3), None);
+}
+
+#[test]
+fn nle3c_the_schedule_mixes_from_black() {
+    let tl = from_black();
+    let s = schedule(&tl, 0..20, &Gop { dur: 50 }).unwrap();
+    assert!(s[..10].iter().all(|x| x.src.is_none() && x.vmix.is_none()));
+    let m = s[12].vmix.unwrap();
+    assert_eq!((m.src, m.src_t, m.seek, m.t), (None, 0, None, Frac { num: 3, den: 6 }));
+    assert_eq!((s[10].src, s[10].seek), (Some(SourceId(0)), Some(0)));
+    assert!(s[10..15].iter().all(|x| x.vmix.is_some_and(|v| v.src.is_none())));
+    assert_eq!(s[15].vmix, None);
 }

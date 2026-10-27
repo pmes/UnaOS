@@ -282,3 +282,116 @@ fn only_a_channel_mismatch_is_refused() {
     let mut sink = Collect::default();
     assert!(matches!(render(&tl, 0..10, &src, &mut sink), Err(stria::nle::RenderError::Format { .. })));
 }
+
+// ---- NLE3b / NLE3c (SR209): the audio crossfade under a dissolve; the W041 / W101 / W201 wipes; a fade from black.
+
+/// NLE3b: V1 and A1 both A[0,20)@0, B[0,20)@20 with a 9-tick dissolve on V1. Inside 20..29 every output sample is the
+/// Q16 model of `mix_into` (the outgoing A at its handle x the falling envelope plus the incoming B x the rising one,
+/// each floored), and against the exact lerp within `(-2 - d, +d]`, `d = |xa - xb| / 65536`: the two floors give
+/// `(-2, 0]` and the envelope's truncation (`eB = floor(ONE j / n)`, `eA = ONE - eB`) adds `(xa - xb) delta / 65536`,
+/// `delta` in `[0, 1)`, whose sign follows `xa - xb`. Outside the span: the plain cut.
+#[test]
+fn nle3b_audio_crossfades_under_a_dissolve() {
+    use timeline_core::TransitionKind;
+    let mut tl = Timeline::new(25);
+    let (a, b) = (tl.add_source("A", 50), tl.add_source("B", 50));
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Audio);
+    for t in 0..2 {
+        tl.tracks[t].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+    }
+    let tl = tl.add_transition(0, 20, TransitionKind::Dissolve, 9).unwrap();
+    let mut src = Sources::new(&tl);
+    for (i, base) in BASE.iter().enumerate() {
+        src.add(SourceId(i as u32), synth_source(*base, 50, 25)).unwrap();
+    }
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..40, &src, &mut sink).unwrap();
+    assert_eq!(sink.pcm.len(), 40 * PER);
+    let one: i64 = 1 << 16;
+    let n = (9 * PER) as i64;
+    let mut maxdev = 0f64;
+    for (i, got) in sink.pcm.iter().enumerate() {
+        let got = (*got * 32768.0).round() as i64;
+        let want = if i < 20 * PER {
+            synth_sample(0, i as u64) as i64
+        } else if i >= 29 * PER {
+            synth_sample(1000, (i - 20 * PER) as u64) as i64
+        } else {
+            let j = (i - 20 * PER) as i64;
+            let (xa, xb) = (synth_sample(0, (i) as u64) as i64, synth_sample(1000, j as u64) as i64);
+            let (ea, eb) = (one + (0 - one) * j / n, one * j / n);
+            let model = ((xa * one * ea) >> 32) + ((xb * one * eb) >> 32);
+            let lerp = xa as f64 + (xb - xa) as f64 * j as f64 / n as f64;
+            let dev = got as f64 - lerp;
+            let d = (xa - xb).abs() as f64 / 65536.0;
+            assert!(dev > -2.0 - d && dev <= d, "sample {i}: {got} vs lerp {lerp} (d {d})");
+            maxdev = maxdev.max(dev.abs());
+            model
+        };
+        assert_eq!(got, want, "sample {i}");
+    }
+    // video: A and B open; audio: A, A's handle (the under layer's own seek), B
+    assert_eq!(r.seeks, 5);
+    println!("nle3b: xfade samples={n} maxdev={maxdev:.3} seeks={}", r.seeks);
+}
+
+/// NLE3c: each new wipe at t = 1/2 (tick 4 of a 7-tick wipe: weight 4/8) shows the incoming inside its shape and
+/// the outgoing outside; a 5-tick fade from black's mid tick (weight 3/6) is the incoming blended over black.
+#[test]
+fn nle3c_new_wipes_and_a_fade_from_black() {
+    use timeline_core::{TransitionKind, WipeDir};
+    let render_one = |tl: &Timeline, t: i64| {
+        let mut src = Sources::new(tl);
+        for (i, base) in BASE.iter().enumerate() {
+            src.add(SourceId(i as u32), synth_source(*base, 50, 25)).unwrap();
+        }
+        let mut sink = Collect::default();
+        render(tl, t..t + 1, &src, &mut sink).unwrap();
+        sink.frames.remove(0).1
+    };
+    let mut cut = Timeline::new(25);
+    let (a, b) = (cut.add_source("A", 50), cut.add_source("B", 50));
+    cut.add_track(Kind::Video);
+    cut.tracks[0].clips = vec![Clip::new(a, 0, 20, 0), Clip::new(b, 0, 20, 20)];
+    // tick 23: outgoing A at 23, incoming B at 3
+    let (out, inc) = (TestPattern::render(64, 48, 23), TestPattern::render(64, 48, 1003));
+    let px = |f: &[u8], x: usize, y: usize| f[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].to_vec();
+    // (wipe, points that are the incoming's, points that are the outgoing's)
+    let cases = [
+        (WipeDir::Diagonal, vec![(0, 0), (30, 20)], vec![(63, 47), (40, 30)]),
+        (WipeDir::Box, vec![(32, 24), (17, 13)], vec![(0, 0), (15, 24), (32, 11)]),
+        (WipeDir::Clock, vec![(40, 10), (40, 40)], vec![(20, 10), (20, 40)]),
+    ];
+    let mut wipes = 0;
+    for (d, ins, outs) in cases {
+        let tl = cut.add_transition(0, 20, TransitionKind::Wipe(d), 7).unwrap();
+        let f = render_one(&tl, 23);
+        for (x, y) in ins {
+            assert_eq!(px(&f, x, y), px(&inc, x, y), "{d:?} ({x},{y}) incoming");
+        }
+        for (x, y) in outs {
+            assert_eq!(px(&f, x, y), px(&out, x, y), "{d:?} ({x},{y}) outgoing");
+        }
+        // and every pixel is one source's or the other's
+        assert!((0..64 * 48).all(|i| f[i * 4..i * 4 + 4] == inc[i * 4..i * 4 + 4] || f[i * 4..i * 4 + 4] == out[i * 4..i * 4 + 4]));
+        wipes += 1;
+    }
+    // from black: a gap 0..10, B[0,20)@10, a 5-tick dissolve from black; tick 12 = weight 3/6 = alpha 128
+    let mut fb = Timeline::new(25);
+    fb.add_source("A", 50);
+    let bb = fb.add_source("B", 50);
+    fb.add_track(Kind::Video);
+    fb.tracks[0].clips = vec![Clip::new(bb, 0, 20, 10)];
+    let fb = fb.add_transition_from_black(0, 10, TransitionKind::Dissolve, 5).unwrap();
+    let f = render_one(&fb, 12);
+    let inc = TestPattern::render(64, 48, 1002);
+    let mut black_dev = 0f64;
+    for i in 0..f.len() {
+        let want = if i % 4 == 3 { 255.0 } else { inc[i] as f64 / 2.0 };
+        let dev = (f[i] as f64 - want).abs();
+        assert!(dev <= 1.5, "byte {i}: got {} want {want}", f[i]);
+        black_dev = black_dev.max(dev);
+    }
+    println!("nle3c: wipes={wipes} black_dev={black_dev:.2}");
+}

@@ -5,7 +5,7 @@
 
 use timeline_core::edl;
 use timeline_core::schedule::{ENV_ONE, audio_runs, schedule};
-use timeline_core::{Clip, EditError, Kind, SourceId, SourceIndex, Timeline};
+use timeline_core::{Clip, EditError, Kind, SourceId, SourceIndex, Timeline, TransitionKind};
 
 const NS: i64 = 40_000_000; // one tick at 25 fps
 
@@ -135,4 +135,56 @@ fn a_gap_is_a_run_with_no_layers() {
     assert_eq!(runs.iter().map(|r| (r.out_t, r.len, r.layers.len())).collect::<Vec<_>>(), vec![(0, 3, 1), (3, 2, 0), (5, 10, 1), (15, 5, 0)]);
     let gap = schedule(&tl, 3..5, &Gop).unwrap();
     assert_eq!((gap[0].src, gap[0].len), (None, 2));
+}
+
+// ---- NLE3b (SR209): a video transition implies the audio crossfade on the paired audio cut.
+
+/// V1 and A1: A[10,30)@0, B[0,40)@20, a 9-tick dissolve on V1's cut at 20.
+fn xfade() -> Timeline {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Audio);
+    for t in 0..2 {
+        tl.tracks[t].clips = vec![Clip::new(a, 10, 30, 0), Clip::new(b, 0, 40, 20)];
+    }
+    tl.add_transition(0, 20, TransitionKind::Dissolve, 9).unwrap()
+}
+
+#[test]
+fn nle3b_a_dissolve_crossfades_the_paired_audio() {
+    let tl = xfade();
+    assert_eq!(tl.audio_crossfade(1, 1).map(|x| (x.at, x.dur)), Some((20, 9)));
+    assert_eq!(tl.audio_crossfade(0, 1), None); // a video track
+    let runs = audio_runs(&tl, 0..60, &Gop).unwrap();
+    assert_eq!(runs.iter().map(|r| (r.out_t, r.len, r.layers.len())).collect::<Vec<_>>(), vec![(0, 20, 1), (20, 9, 2), (29, 31, 1)]);
+    let (under, inc) = (runs[1].layers[0], runs[1].layers[1]);
+    // the outgoing A at its handle (30..), seeking on its own; the incoming B at its start, seeking at the cut
+    assert_eq!((under.track, under.src, under.src_t, under.seek, under.env), (1, SourceId(0), 30, Some(30 * NS), [ENV_ONE, 0]));
+    assert_eq!((inc.track, inc.src, inc.src_t, inc.seek, inc.env), (1, SourceId(1), 0, Some(0), [0, ENV_ONE]));
+    // after the span B continues alone at full
+    assert_eq!((runs[2].layers[0].src_t, runs[2].layers[0].seek, runs[2].layers[0].env), (9, None, [ENV_ONE, ENV_ONE]));
+    // mid-span the two weights still sum to full scale at every edge
+    let mid = audio_runs(&tl, 23..27, &Gop).unwrap();
+    assert_eq!(mid[0].layers[0].env[0] + mid[0].layers[1].env[0], ENV_ONE);
+    assert_eq!(mid[0].layers[0].env[1] + mid[0].layers[1].env[1], ENV_ONE);
+    // the schedule's audio step is the incoming (the top layer)
+    let steps: Vec<_> = schedule(&tl, 0..60, &Gop).unwrap().into_iter().filter(|s| s.kind == Kind::Audio).collect();
+    assert_eq!(steps[1].src, Some(SourceId(1)));
+}
+
+#[test]
+fn nle3b_the_pairing_rule_and_the_audio_handle() {
+    // the audio's outgoing leaves 5 ticks of A past its out point: a 9-tick dissolve is refused by name
+    let tl = xfade();
+    let mut short = tl.remove_transition(0, 20).unwrap();
+    short.tracks[1].clips[0] = Clip::new(SourceId(0), 25, 45, 0);
+    assert_eq!(short.add_transition(0, 20, TransitionKind::Dissolve, 9), Err(EditError::Handle));
+    assert!(short.add_transition(0, 20, TransitionKind::Dissolve, 5).is_ok());
+    // an audio clip of another source at the cut: a plain audio cut
+    let mut other = tl.clone();
+    other.tracks[1].clips[1] = Clip::new(SourceId(0), 0, 40, 20);
+    assert_eq!(other.audio_crossfade(1, 1), None);
+    assert!(audio_runs(&other, 0..60, &Gop).unwrap().iter().all(|r| r.layers.len() == 1));
 }
