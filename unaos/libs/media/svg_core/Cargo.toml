@@ -10,6 +10,7 @@ description = "SVGCORE (SR52): SVG 1.1/2 parsing and rendering written from the 
 # with (one rasterizer, two users). Raster images inside an SVG (`<image>`) are decoded by a caller-supplied
 # hook, so pixel_core can link svg_core (its `svg` format) without a dependency cycle.
 [dependencies]
+libm = { version = "0.2", default-features = false } # MATH-ONE (LEDGER SR362): the one f64 math (timeline_core / icc_core line)
 font_core = { path = "../../text/font_core" }
 
 [features]

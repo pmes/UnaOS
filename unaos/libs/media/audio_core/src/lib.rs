@@ -4,7 +4,7 @@
 //! `audio_core` — the audio decoders UnaOS owns (AUDIOCODEC, ledger SR30).
 //!
 //! Peter (2026-10-04): "we will need to support more than wav files!" — and "true cutting edge, not chicken
-//! wire": every format here is written from its specification, `no_std` + `alloc`, no dependencies. The
+//! wire": every format here is written from its specification, `no_std` + `alloc`, libm its math. The
 //! kernel's `play` and the host (Gneiss `dsp::audio`, Stria, `tools/audio-check`) link the same code.
 //!
 //! | format | specification | module |

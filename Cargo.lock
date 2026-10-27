@@ -314,6 +314,7 @@ version = "0.1.0"
 dependencies = [
  "crypto_core",
  "demux_core",
+ "libm",
 ]
 
 [[package]]
@@ -1915,6 +1916,9 @@ dependencies = [
 [[package]]
 name = "gl_core"
 version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "gl_generator"
@@ -2458,6 +2462,7 @@ name = "infer_core"
 version = "0.1.0"
 dependencies = [
  "crypto_core",
+ "libm",
 ]
 
 [[package]]
@@ -4653,6 +4658,7 @@ name = "svg_core"
 version = "0.1.0"
 dependencies = [
  "font_core",
+ "libm",
  "pixel_core",
 ]
 

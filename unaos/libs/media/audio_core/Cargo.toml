@@ -16,6 +16,7 @@ description = "AUDIOCODEC (SR30): the audio decoders UnaOS owns — WAV, AIFF, F
 # forbid(unsafe_code), itself dependency-free) — MP4/M4A sample tables come from it (src/container.rs); the seat's
 # ruling: a core depending on a core is the seam, not a dependency on the world.
 [dependencies]
+libm = { version = "0.2", default-features = false } # MATH-ONE (LEDGER SR362): the one f64 math (timeline_core / icc_core line)
 demux_core = { path = "../demux_core" }
 # MD5-ONE (CRYPTOONE, LEDGER SR330): the FLAC STREAMINFO checksum is crypto_core's MD5 (src/md5.rs re-exports it) — the
 # MP4ONE seam again, a core on a core (crypto_core: no_std, zero dependencies, already linked by the kernel).
