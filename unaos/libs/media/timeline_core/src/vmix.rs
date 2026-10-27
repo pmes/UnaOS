@@ -135,6 +135,10 @@ mod tests {
         assert_eq!(&k[37 * 4..38 * 4], &[0, 0, 0, 255]);
         assert_eq!(&k[38 * 4..39 * 4], &[40, 40, 40, 255]);
         assert_eq!(fnv(&k), 0x575d_e51b_bec6_ed25);
+        // NLE6MIXFACE (rmbp-ledger B957): tick 10, the dissolve at k=0 (outgoing A ord 1023 under B ord 2000, t = 1/5) -> a flat 46.
+        let mut p = utp1(1023);
+        mix_step(TransitionKind::Dissolve, Frac { num: 1, den: 5 }, &mut p, &utp1(2000), 64, 48);
+        assert!(p.chunks_exact(4).all(|q| q == [46, 46, 46, 255]) && fnv(&p) == 0x575a_f060_ca99_7325);
     }
 
     /// The clock hands: a quarter turn of W201 holds exactly the top-right quadrant (no 1-ulp edge on a 64x48 grid).
