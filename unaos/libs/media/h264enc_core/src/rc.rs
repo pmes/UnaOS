@@ -28,13 +28,18 @@
 //!   of the target (the rows' SAD), written as mb_qp_delta (lib.rs `write_mb`, QPY,pred tracked as
 //!   h264_core's `mb.rs` does).
 //!
+//! - B pictures (H264ENCBFRAMES SR333): a third model; the GOP's budget is shared I : P : B = r : 1 : 1/2
+//!   (a B gets half a P's share: nB = (gop - 1) x b / (b + 1) B pictures per GOP at b B frames); a B
+//!   picture's complexity is the smaller of its zero-motion differences from the two anchors, and its
+//!   first QP is the last picture's + [`crate::B_QP_OFFSET`].
+//!
 //! Owed (handlers.md §5 H264ENC-RC): two-pass, scene-cut IDRs, per-MB activity masking, HRD signalling.
 
 use alloc::vec::Vec;
 
 use h264_core::tables::QPC;
 
-use crate::{Encoder, Error, Result};
+use crate::{Encoder, Error, Pic, Result, B_QP_OFFSET};
 
 /// The lowest QP the rate controller picks (the encoder's configured floor).
 pub const QP_MIN: i32 = 16;
@@ -70,7 +75,7 @@ pub fn step16(qp: i32) -> u64 {
     [10u64, 11, 13, 14, 16, 18][(qp % 6) as usize] << (qp / 6)
 }
 
-/// The last coded picture of one type (I or P): what the R-Q model is fitted to.
+/// The last coded picture of one type (I, P or B): what the R-Q model is fitted to.
 #[derive(Debug, Clone, Copy, Default)]
 struct Model {
     coded: bool,
@@ -94,6 +99,8 @@ impl Model {
 pub(crate) struct Rc {
     rate: RateControl,
     gop: i128,
+    /// B pictures between anchors (SR333).
+    bframes: i128,
     /// Bits per picture at the mean rate, and the one-second buffer.
     r: i64,
     buf: i64,
@@ -106,11 +113,11 @@ pub(crate) struct Rc {
     fmax: i64,
     /// sum(bits) - R * pictures.
     err: i64,
-    /// [I, P].
-    types: [Model; 2],
+    /// [I, P, B].
+    types: [Model; 3],
     last_qp: i32,
-    // The picture being coded.
-    idr: bool,
+    // The picture being coded: its type index (0 I, 1 P, 2 B).
+    t: usize,
     rows: Vec<u64>,
     s: u64,
     share: i64,
@@ -134,6 +141,7 @@ impl Rc {
         Ok(Rc {
             rate,
             gop: gop as i128,
+            bframes: 0,
             r: per(rate.bits_per_second),
             buf,
             full: buf / 2,
@@ -142,9 +150,9 @@ impl Rc {
             bmax: max as i64,
             fmax: 0,
             err: 0,
-            types: [Model::default(); 2],
+            types: [Model::default(); 3],
             last_qp: start_qp,
-            idr: true,
+            t: 0,
             rows: Vec::new(),
             s: 0,
             share: 0,
@@ -154,22 +162,30 @@ impl Rc {
         })
     }
 
-    /// Choose the QP of the next picture from its rows' complexity.
-    fn picture(&mut self, idr: bool, rows: Vec<u64>) -> i32 {
-        let t = if idr { 0 } else { 1 };
+    /// The stream's B pictures between anchors (SR333): the GOP budget's B share.
+    pub(crate) fn with_bframes(mut self, b: u8) -> Rc {
+        self.bframes = b as i128;
+        self
+    }
+
+    /// Choose the QP of the next picture (type index `t`: 0 I, 1 P, 2 B) from its rows' complexity.
+    fn picture(&mut self, t: usize, rows: Vec<u64>) -> i32 {
+        let idr = t == 0;
         let s: u64 = rows.iter().sum();
         if idr {
             self.plan = self.buf / 2;
         }
         // The I / P ratio at equal QP, x16 (k * S' = bits * step of the last picture of each type).
-        let [mi, mp] = self.types;
+        let [mi, mp, _] = self.types;
         let r16: i128 = if mi.coded && mp.coded {
             ((16 * mi.bits as u128 * mi.step as u128) / (mp.bits as u128 * mp.step as u128).max(1)).clamp(16, 256) as i128
         } else {
             64
         };
-        let den = r16 + 16 * (self.gop - 1);
-        let share = (self.r as i128 * self.gop * if idr { r16 } else { 16 } / den) as i64;
+        // Per GOP: one I, nb B pictures at half a P's weight (8 of 16), the rest P (b = 0: nb = 0).
+        let nb = (self.gop - 1) * self.bframes / (self.bframes + 1);
+        let den = r16 + 16 * (self.gop - 1 - nb) + 8 * nb;
+        let share = (self.r as i128 * self.gop * [r16, 16, 8][t] / den) as i64;
         let mut target = share;
         match self.rate.mode {
             RcMode::Cbr => {
@@ -186,10 +202,16 @@ impl Rc {
             }
         }
         let m = self.types[t];
-        let refq = if m.coded { m.qp } else { self.last_qp };
+        let refq = if m.coded {
+            m.qp
+        } else if t == 2 {
+            (self.last_qp + B_QP_OFFSET).min(QP_MAX)
+        } else {
+            self.last_qp
+        };
         let (lo, hi) = ((refq - PIC_STEP).max(QP_MIN), (refq + PIC_STEP).min(QP_MAX));
         let qp = if m.coded { (lo..=hi).find(|&q| m.predict(s, q) <= target as u128).unwrap_or(hi) } else { refq };
-        self.idr = idr;
+        self.t = t;
         self.rows = rows;
         self.s = s;
         self.share = share;
@@ -212,7 +234,7 @@ impl Rc {
 
     /// Fit the model and move the buckets by the coded picture's `bits`.
     fn update(&mut self, bits: u64) {
-        let m = &mut self.types[if self.idr { 0 } else { 1 }];
+        let m = &mut self.types[self.t];
         m.coded = true;
         m.bits = bits.max(1);
         m.step = step16(self.pic_qp);
@@ -236,9 +258,11 @@ impl Encoder {
     }
 
     /// The picture's complexity per macroblock row: the luma gradient of an I picture, the zero-motion
-    /// difference from the reference of a P picture, plus 64 per macroblock.
-    pub(crate) fn rc_analyse(&self, idr: bool) -> Vec<u64> {
-        let (src, refp) = (&self.src[0], &self.refp[0]);
+    /// difference from the reference of a P picture (of a B picture the smaller of its differences from
+    /// the two anchors, SR333), plus 64 per macroblock.
+    pub(crate) fn rc_analyse(&self, pic: Pic) -> Vec<u64> {
+        let idr = pic == Pic::Idr;
+        let (src, refp, fwd) = (&self.src[0], &self.refp[0], &self.fwd[0]);
         let w = src.w;
         let mut rows = Vec::with_capacity(self.mb_h);
         for mby in 0..self.mb_h {
@@ -253,6 +277,8 @@ impl Encoder {
                         if y > 0 {
                             s += (p - src.data[(y - 1) * w + x] as i32).unsigned_abs() as u64;
                         }
+                    } else if pic == Pic::B {
+                        s += (p - refp.data[y * w + x] as i32).unsigned_abs().min((p - fwd.data[y * w + x] as i32).unsigned_abs()) as u64;
                     } else {
                         s += (p - refp.data[y * w + x] as i32).unsigned_abs() as u64;
                     }
@@ -263,13 +289,19 @@ impl Encoder {
         rows
     }
 
-    /// The QP of the next picture (SliceQPY): the rate controller's, else the constant QP.
-    pub(crate) fn rc_picture(&mut self, idr: bool) -> i32 {
+    /// The QP of the next picture (SliceQPY): the rate controller's, else the constant QP (a B picture's
+    /// [`B_QP_OFFSET`] above it, SR333).
+    pub(crate) fn rc_picture(&mut self, pic: Pic) -> i32 {
         if self.rc.is_none() {
-            return self.cfg.qp as i32;
+            return if pic == Pic::B { (self.cfg.qp as i32 + B_QP_OFFSET).min(QP_MAX) } else { self.cfg.qp as i32 };
         }
-        let rows = self.rc_analyse(idr);
-        let qp = self.rc.as_mut().map_or(self.cfg.qp as i32, |rc| rc.picture(idr, rows));
+        let rows = self.rc_analyse(pic);
+        let t = match pic {
+            Pic::Idr => 0,
+            Pic::P => 1,
+            Pic::B => 2,
+        };
+        let qp = self.rc.as_mut().map_or(self.cfg.qp as i32, |rc| rc.picture(t, rows));
         self.set_qp(qp);
         qp
     }

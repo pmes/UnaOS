@@ -10,10 +10,17 @@
 //! (SR310): frames only, CAVLC / CABAC, one slice per picture, one reference frame, POC type
 //! 2 (output order = decoding order) and a VUI bitstream_restriction of max_num_reorder_frames 0 /
 //! max_dec_frame_buffering 1, so a decoder outputs each picture as its access unit ends.
+//!
+//! H264ENCBFRAMES (SR333): with B pictures ([`SeqParams::reorder`]) the stream is Main (B slices are not
+//! Baseline; CAVLC keeps entropy_coding_mode_flag 0), POC type 0 (pic_order_cnt_lsb per slice), two
+//! reference frames and a VUI of max_num_reorder_frames 1 / max_dec_frame_buffering 2; a B slice header
+//! carries direct_spatial_mv_pred_flag 1, both list-modification flags 0 and, as a non-reference
+//! picture, no dec_ref_pic_marking.
 
 use alloc::vec::Vec;
 
 use crate::nal::BitWriter;
+use crate::Pic;
 
 /// profile_idc of Baseline (A.2.1).
 pub const PROFILE_BASELINE: u8 = 66;
@@ -39,6 +46,10 @@ pub struct SeqParams {
     pub cabac: bool,
     /// The 8x8 transform (SR322): High profile, with the SPS's High fields.
     pub high: bool,
+    /// B pictures (SR333): Main profile (unless High), POC type 0, two reference frames, VUI reorder 1.
+    pub reorder: bool,
+    /// log2_max_pic_order_cnt_lsb (written under `reorder` only).
+    pub log2_max_poc_lsb: u32,
 }
 
 /// level_idc for a frame of `mb_w` x `mb_h` macroblocks: the lowest level of Table A-1 whose
@@ -58,7 +69,7 @@ pub fn level_idc(mb_w: u32, mb_h: u32) -> u8 {
 /// seq_parameter_set_rbsp (7.3.2.1.1), the RBSP after the NAL header byte.
 pub fn write_sps(p: &SeqParams) -> Vec<u8> {
     let mut w = BitWriter::new();
-    let (profile, constraint) = if p.high { (PROFILE_HIGH, 0) } else if p.cabac { (PROFILE_MAIN, CONSTRAINT_MAIN) } else { (PROFILE_BASELINE, CONSTRAINT_FLAGS) };
+    let (profile, constraint) = if p.high { (PROFILE_HIGH, 0) } else if p.cabac || p.reorder { (PROFILE_MAIN, CONSTRAINT_MAIN) } else { (PROFILE_BASELINE, CONSTRAINT_FLAGS) };
     w.u(8, profile as u32);
     w.u(8, constraint as u32); // constraint_set0..5 flags + reserved_zero_2bits
     w.u(8, level_idc(p.mb_w, p.mb_h) as u32);
@@ -71,8 +82,14 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
         w.flag(false); // seq_scaling_matrix_present_flag: flat (scaling matrices owed)
     }
     w.ue(p.log2_max_frame_num - 4);
-    w.ue(2); // pic_order_cnt_type: POC follows frame_num, output order = decoding order
-    w.ue(1); // max_num_ref_frames
+    if p.reorder {
+        w.ue(0); // pic_order_cnt_type 0: pic_order_cnt_lsb in every slice header (SR333)
+        w.ue(p.log2_max_poc_lsb - 4); // log2_max_pic_order_cnt_lsb_minus4
+        w.ue(2); // max_num_ref_frames: the past and the future anchor
+    } else {
+        w.ue(2); // pic_order_cnt_type: POC follows frame_num, output order = decoding order
+        w.ue(1); // max_num_ref_frames
+    }
     w.flag(false); // gaps_in_frame_num_value_allowed_flag
     w.ue(p.mb_w - 1);
     w.ue(p.mb_h - 1); // pic_height_in_map_units_minus1
@@ -102,8 +119,8 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
     w.ue(1); // max_bits_per_mb_denom
     w.ue(16); // log2_max_mv_length_horizontal
     w.ue(16); // log2_max_mv_length_vertical
-    w.ue(0); // max_num_reorder_frames
-    w.ue(1); // max_dec_frame_buffering
+    w.ue(p.reorder as u32); // max_num_reorder_frames: 1 with B pictures (the anchor waits for them)
+    w.ue(1 + p.reorder as u32); // max_dec_frame_buffering
     w.trailing();
     w.finish()
 }
@@ -145,28 +162,45 @@ pub fn write_pps(qp: i32, cabac: bool, t8x8: bool) -> Vec<u8> {
 /// otherwise, SR218); disable_deblocking_filter_idc 0 with zero filter offsets when
 /// `deblock` (the encoder filters its reconstruction as the decoder does, SR211), else 1 (the
 /// reconstruction is unfiltered). Under CABAC a P slice carries cabac_init_idc 0 (SR310).
-pub fn write_slice_header(w: &mut BitWriter, idr: bool, frame_num: u32, log2_max_frame_num: u32, idr_pic_id: u32, deblock: bool, slice_qp_delta: i32, cabac: bool) {
+/// SR333: `pic` B writes slice_type 6, direct_spatial_mv_pred_flag 1, ref_pic_list_modification_flag_l1 0
+/// and (nal_ref_idc 0) no marking; `poc` Some((lsb, log2_max_pic_order_cnt_lsb)) writes pic_order_cnt_lsb
+/// (POC type 0), None keeps POC type 2's empty syntax.
+pub fn write_slice_header(w: &mut BitWriter, pic: Pic, frame_num: u32, log2_max_frame_num: u32, idr_pic_id: u32, poc: Option<(u32, u32)>, deblock: bool, slice_qp_delta: i32, cabac: bool) {
+    let idr = pic == Pic::Idr;
     w.ue(0); // first_mb_in_slice
-    w.ue(if idr { 7 } else { 5 }); // slice_type
+    w.ue(match pic {
+        Pic::Idr => 7,
+        Pic::P => 5,
+        Pic::B => 6,
+    }); // slice_type (all slices of the picture)
     w.ue(0); // pic_parameter_set_id
     w.u(log2_max_frame_num, frame_num);
     if idr {
         w.ue(idr_pic_id);
     }
+    if let Some((lsb, log2)) = poc {
+        w.u(log2, lsb); // pic_order_cnt_lsb (POC type 0, SR333)
+    }
     // pic_order_cnt_type 2: no POC syntax.
+    if pic == Pic::B {
+        w.flag(true); // direct_spatial_mv_pred_flag
+    }
     if !idr {
         w.flag(false); // num_ref_idx_active_override_flag
         w.flag(false); // ref_pic_list_modification_flag_l0
     }
-    // nal_ref_idc != 0: dec_ref_pic_marking (7.3.3.3).
+    if pic == Pic::B {
+        w.flag(false); // ref_pic_list_modification_flag_l1
+    }
+    // nal_ref_idc != 0: dec_ref_pic_marking (7.3.3.3); a B picture is not a reference.
     if idr {
         w.flag(false); // no_output_of_prior_pics_flag
         w.flag(false); // long_term_reference_flag
-    } else {
+    } else if pic == Pic::P {
         w.flag(false); // adaptive_ref_pic_marking_mode_flag: sliding window
     }
     if cabac && !idr {
-        w.ue(0); // cabac_init_idc (P slices only; the I slices are the IDRs)
+        w.ue(0); // cabac_init_idc (P / B slices; the I slices are the IDRs)
     }
     w.se(slice_qp_delta); // slice_qp_delta
     if deblock {

@@ -18,6 +18,10 @@
 //!   muxes an audio-only `sowt` track (`audio.mp4`) through `build::pcm16_track` + `build::mp4`. The f32 → i16
 //!   quantiser [`pcm16`] inverts the decoders' `s / 32768.0` exactly.
 //! * [`ExportReport::fnv`] is FNV-1a 64 over the rendered RGBA stream: the same number `nle render` prints.
+//! * H264ENCBFRAMES (SR333): [`H264Encoder::with_bframes`] codes B pictures through h264enc_core's `push` / `flush`;
+//!   each unit carries its (dts, pts) ([`Access::time`]) and the MP4 track writes them per sample, so demux_core's
+//!   `build::mp4` writes the `ctts` composition offsets. No edit list (demux_core shifts pts only), so a reordered
+//!   video presents from tick 1.
 //! * Single-threaded: the sink owns its encoder, files and counters by `&mut self`; an I/O error is latched and
 //!   returned by [`ExportSink::finish`].
 
@@ -39,6 +43,8 @@ use crate::nle::{RenderError, RenderSink, Sources, render};
 pub struct Access {
     pub keyframe: bool,
     pub data: Vec<u8>,
+    /// (dts, pts) in frames when the encoder reorders (SR333); None = output order, unit i at i.
+    pub time: Option<(i64, i64)>,
 }
 
 /// What an MP4 sample entry needs to carry the stream (`build::TrackSpec`'s `fourcc`, `config_box`, `config`).
@@ -84,7 +90,7 @@ pub struct PngSequence;
 impl VideoEncoder for PngSequence {
     fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
         let data = encode_rgba(width, height, rgba).map_err(ExportError::Png)?;
-        Ok(vec![Access { keyframe: true, data }])
+        Ok(vec![Access { keyframe: true, data, time: None }])
     }
     fn config(&self) -> VideoConfig {
         VideoConfig { fourcc: *b"png ", config_box: None, config: Vec::new() }
@@ -100,7 +106,7 @@ pub struct RawSequence;
 
 impl VideoEncoder for RawSequence {
     fn encode(&mut self, _width: u32, _height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
-        Ok(vec![Access { keyframe: true, data: rgba.to_vec() }])
+        Ok(vec![Access { keyframe: true, data: rgba.to_vec(), time: None }])
     }
     fn config(&self) -> VideoConfig {
         VideoConfig { fourcc: *b"raw ", config_box: None, config: Vec::new() }
@@ -118,13 +124,14 @@ pub struct H264Encoder {
     qp: u8,
     gop: u32,
     rate: Option<RateControl>,
+    bframes: u8,
     enc: Option<Encoder>,
 }
 
 impl H264Encoder {
     /// `qp` 16..=40 and `gop` >= 1 (checked by `Encoder::new` at the first frame).
     pub fn new(qp: u8, gop: u32) -> H264Encoder {
-        H264Encoder { qp, gop, rate: None, enc: None }
+        H264Encoder { qp, gop, rate: None, bframes: 0, enc: None }
     }
 
     /// A constant bit rate of `kbps` kbit/s at `fps_num / fps_den` frames per second (`nle export --bitrate`): `qp`
@@ -133,17 +140,34 @@ impl H264Encoder {
         self.rate = Some(RateControl { bits_per_second: kbps.saturating_mul(1000), fps_num, fps_den, mode: RcMode::Cbr });
         self
     }
+
+    /// `n` B pictures between anchors (H264ENCBFRAMES SR333, h264enc_core's `Config::bframes`): units come out in
+    /// decoding order with their (dts, pts), the last ones from `flush`. 0 = the pinned stream.
+    pub fn with_bframes(mut self, n: u8) -> H264Encoder {
+        self.bframes = n;
+        self
+    }
+}
+
+/// h264enc_core's access units as MP4 samples with their (dts, pts).
+fn h264_units(aus: Vec<h264enc_core::Access>) -> Vec<Access> {
+    aus.into_iter().map(|au| Access { keyframe: au.keyframe, data: au.avcc_sample(), time: Some((au.dts as i64, au.pts as i64)) }).collect()
 }
 
 impl VideoEncoder for H264Encoder {
     fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
         if self.enc.is_none() {
-            self.enc = Some(Encoder::new(Config { width, height, qp: self.qp, gop: self.gop, rate: self.rate, ..Default::default() }).map_err(ExportError::H264)?);
+            self.enc = Some(Encoder::new(Config { width, height, qp: self.qp, gop: self.gop, rate: self.rate, bframes: self.bframes, ..Default::default() }).map_err(ExportError::H264)?);
         }
         let enc = self.enc.as_mut().expect("built above");
         let yuv = I420::from_rgba(width, height, rgba).map_err(ExportError::H264)?;
-        let au = enc.encode(&yuv.as_yuv420()).map_err(ExportError::H264)?;
-        Ok(vec![Access { keyframe: au.keyframe, data: au.avcc_sample() }])
+        Ok(h264_units(enc.push(&yuv.as_yuv420()).map_err(ExportError::H264)?))
+    }
+    fn flush(&mut self) -> Result<Vec<Access>, ExportError> {
+        match self.enc.as_mut() {
+            Some(enc) => Ok(h264_units(enc.flush().map_err(ExportError::H264)?)),
+            None => Ok(Vec::new()),
+        }
     }
     fn config(&self) -> VideoConfig {
         VideoConfig { fourcc: *b"avc1", config_box: Some(*b"avcC"), config: self.enc.as_ref().map(Encoder::avcc).unwrap_or_default() }
@@ -242,8 +266,8 @@ pub struct ExportSink {
     one: Option<BufWriter<File>>,
     wav: Option<Wav>,
     pcm: Vec<i16>,
-    /// [`Layout::Mp4`]: (keyframe, sample) per unit, muxed at `finish`.
-    samples: Vec<(bool, Vec<u8>)>,
+    /// [`Layout::Mp4`]: (keyframe, sample, (dts, pts)) per unit, muxed at `finish`.
+    samples: Vec<(bool, Vec<u8>, Option<(i64, i64)>)>,
     afmt: Option<(u32, u16)>,
     size: (u32, u32),
     units: u64,
@@ -286,7 +310,7 @@ impl ExportSink {
                     self.one.as_mut().expect("opened above").write_all(&u.data)?;
                     self.report.bytes += u.data.len() as u64;
                 }
-                Layout::Mp4 => self.samples.push((u.keyframe, u.data)),
+                Layout::Mp4 => self.samples.push((u.keyframe, u.data, u.time)),
             }
             self.units += 1;
         }
@@ -384,7 +408,7 @@ impl ExportSink {
     }
 
     /// The [`Layout::Mp4`] video track: the encoder's sample entry, timescale = the project's fps (`tb.den`), sample
-    /// `i` at `i * tb.num`.
+    /// `i` at `i * tb.num`, or at its unit's (dts, pts) x `tb.num` (SR333: pts != dts writes `ctts`).
     fn video_track(&mut self, tb: Timebase) -> build::MediaTrack {
         let c = self.video.config();
         let num = tb.num.max(1) as u32;
@@ -406,7 +430,10 @@ impl ExportSink {
         let samples = std::mem::take(&mut self.samples)
             .into_iter()
             .enumerate()
-            .map(|(i, (keyframe, data))| build::SampleSpec { data, dts: i as i64 * num as i64, pts: i as i64 * num as i64, duration: num, keyframe })
+            .map(|(i, (keyframe, data, time))| {
+                let (dts, pts) = time.unwrap_or((i as i64, i as i64));
+                build::SampleSpec { data, dts: dts * num as i64, pts: pts * num as i64, duration: num, keyframe }
+            })
             .collect();
         build::MediaTrack { spec, samples }
     }
