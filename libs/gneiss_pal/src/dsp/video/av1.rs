@@ -188,6 +188,9 @@ mod tests {
 impl Av1Decoder {
     fn inband(&mut self, f: Frame) -> Frame {
         use crate::dsp::demux::colour::Colour;
+        if let Some(((w0, h0), (w1, h1))) = self.inner.size_switch(f.width, f.height) {
+            log::info!("[STRIA] :: video size switch at {} {}x{}->{}x{}", f.pts_ns, w0, h0, w1, h1); // AV1INBANDSIZE (SR379): av1_core's ONE size rule, once per change; the frame carries its size
+        }
         let open = self.open.map(|c| (c.primaries, c.transfer, c.matrix, c.full_range));
         let (now, changed) = self.inner.switch(open);
         let range = |r: Option<bool>| if r == Some(true) { "full" } else { "limited" };

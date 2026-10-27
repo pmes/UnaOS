@@ -166,7 +166,8 @@ pub fn reorder_depth(track: &Track) -> Option<u32> {
 /// configuration — what `Demuxer::fill_colour` takes as the fallback for what the container did not say (NLEPROBEHDR SR226;
 /// demux_core links no decoder, the [`reorder_depth`] shape). H.264 → `h264_core::ps::avcc_sps`'s VUI (only when
 /// video_signal_type is present); AV1 → `av1_core::image::stream_codes` (the av1C configOBUs, else `first`'s in-band sequence header, AV1INBANDCOLOUR SR366) mapped by `Colour::from_av1` (KERNELCOLOUR B952; color_config, plus the METADATA OBUs' content light
-/// levels and mastering display) when the `av1` feature is on. Anything else → `None` (HEVC-VUI is owed: hevc_core's SPS
+/// levels and mastering display) when the `av1` feature is on; VP9 → `vp9_core::header::header_codes` (the first key frame's
+/// color_space / color_range, AV1INBANDSIZE SR379's VP9-INBAND-COLOUR). Anything else → `None` (HEVC-VUI is owed: hevc_core's SPS
 /// carries the VUI colour, but its hvcC SPS reader is still the depth's own walk). Both of Stria's opens pass it by name
 /// beside [`reorder_depth`].
 pub fn colour_of(track: &Track, first: &[u8]) -> Option<super::demux::colour::Colour> {
@@ -188,6 +189,7 @@ pub fn colour_of(track: &Track, first: &[u8]) -> Option<super::demux::colour::Co
         }
         #[cfg(feature = "av1")]
         Codec::Av1 => av1_core::image::stream_codes(&track.config, first).map(|(c, l, m)| Colour::from_av1(c, l, m)), // KERNELCOLOUR (B952): the one mapping, the kernel Player's too; AV1INBANDCOLOUR (SR366): `first` the track's first sample
+        Codec::Vp9 => vp9_core::header::header_codes(first).map(|(primaries, transfer, matrix, full)| Colour { primaries, transfer, matrix, full_range: Some(full), mastering: None, light: None }), // AV1INBANDSIZE (SR379): VP9-INBAND-COLOUR, host only (the kernel decodes no VP9)
         _ => None,
     }
 }

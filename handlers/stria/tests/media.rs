@@ -1344,3 +1344,116 @@ fn swapbackseekindexed_editor_run_primes_from_an_earlier_cluster() {
     assert_eq!(at5.0, whole.0[5..6].to_vec());
     println!("swapbackseekindexed: tick5 stand-in");
 }
+
+// AV1INBANDSIZE (LEDGER SR379): a size switch mid-stream. kodim23's item (768x512, its own in-band sequence header) for samples
+// 0-1 and kids_720p's (1280x720, another sequence header: a new coded video sequence, av1_core drops the refs) for 2-3, one av01
+// reel. Every presented frame carries its own size (what `BusSink` posts as `MediaFrame { width, height }`, the face building
+// each picture at that size), and the Player says so once.
+fn av1inbandsize_reel() -> Option<Vec<u8>> {
+    let small = av1_vectors::avif_item(&av1_vectors::fetch("kodim23_yuv420_8bpc")?).unwrap();
+    let big = av1_vectors::avif_item(&av1_vectors::fetch("kids_720p")?).unwrap();
+    assert_eq!((small.ispe, big.ispe), (Some((768, 512)), Some((1280, 720))));
+    let mut spec = build::TrackSpec::test_pattern(1, 768, 512, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = small.av1c.clone().unwrap()[..4].to_vec();
+    spec.timescale = 1000;
+    let samples = (0..4).map(|i| build::SampleSpec { data: if i < 2 { small.data.clone() } else { big.data.clone() }, dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+    Some(build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &build::Mp4Extras::default()))
+}
+
+/// Each presented frame's size and its RGBA length through the bus sink's conversion.
+struct Av1InBandSizeSink {
+    colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
+    shown: Vec<(u32, u32, usize)>,
+}
+impl FrameSink for Av1InBandSizeSink {
+    fn present(&mut self, f: &Frame, _ordinal: u64) {
+        let rgba = f.to_rgba_colour(self.colour.as_ref(), gneiss_pal::dsp::video::Chroma::Bilinear);
+        self.shown.push((f.width, f.height, rgba.len()));
+    }
+}
+
+#[test]
+fn av1inbandsize_player_presents_the_new_size_once() {
+    capture_logs();
+    let Some(file) = av1inbandsize_reel() else { return };
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = Av1InBandSizeSink { colour: p.colour().copied(), shown: Vec::new() };
+    for _ in 0..400 {
+        if sink.shown.len() >= 4 || p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    let want = |w: u32, h: u32| (w, h, (w * h * 4) as usize);
+    assert_eq!(sink.shown, vec![want(768, 512), want(768, 512), want(1280, 720), want(1280, 720)], "every frame at its own size");
+    let lines = my_log_lines("video size switch");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("768x512->1280x720"), "{}", lines[0]);
+    println!("av1inbandsize: {} ; frames 768x512 x2, 1280x720 x2", lines[0]);
+}
+
+// VP9INBANDCOLOUR (LEDGER SR379, AV1INBANDSIZE): a VP9 WebM whose key frame states color_space BT.709 (2) and no container Colour:
+// `colour_of`'s VP9 arm (`vp9_core::header::header_codes`) fills `Track::colour` 2/2/1 limited, so the Player converts by BT.709
+// at SD instead of the size default's BT.601. The key frame's uncompressed header (§6.2, profile 0, 8x8) is built here bit by bit.
+fn vp9inbandcolour_key_header(color_space: u64) -> Vec<u8> {
+    let mut w = av1_vectors::BitWriter::default();
+    w.put(2, 2); // frame_marker
+    w.put(2, 0); // profile 0 (low, high)
+    w.flag(false); // show_existing_frame
+    w.flag(false); // frame_type: KEY_FRAME
+    w.flag(true); // show_frame
+    w.flag(false); // error_resilient_mode
+    w.put(24, 0x49_83_42); // frame_sync_code
+    w.put(3, color_space);
+    w.flag(false); // color_range: studio
+    w.put(16, 7); // frame_width_minus_1
+    w.put(16, 7); // frame_height_minus_1
+    w.flag(false); // render_and_frame_size_different
+    w.flag(true); // refresh_frame_context
+    w.flag(false); // frame_parallel_decoding_mode
+    w.put(2, 0); // frame_context_idx
+    w.put(6, 0); // loop_filter_level
+    w.put(3, 0); // loop_filter_sharpness
+    w.flag(false); // loop_filter_delta_enabled
+    w.put(8, 60); // base_q_idx
+    w.put(3, 0); // no delta_q (y dc, uv dc, uv ac)
+    w.flag(false); // segmentation_enabled
+    w.flag(false); // tile_rows_log2 (one 64x64 column: no tile-column bits)
+    w.put(16, 1); // header_size_in_bytes
+    w.trailing();
+    let mut b = w.bytes;
+    b.push(0); // the compressed header's byte (not decoded here)
+    b
+}
+
+#[test]
+fn vp9inbandcolour_webm_bt709_fills_track_colour() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use gneiss_pal::dsp::video::{colour_of, reorder_depth};
+    let reel = |cs: u64| {
+        let mut spec = build::TrackSpec::test_pattern(1, 8, 8, 25);
+        spec.fourcc = *b"vp09";
+        spec.config_box = None;
+        spec.codec_id = "V_VP9";
+        spec.config = Vec::new();
+        spec.timescale = 1000;
+        let samples = (0..2).map(|i| build::SampleSpec { data: vp9inbandcolour_key_header(cs), dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+        build::mkv(&[build::MediaTrack { spec, samples }], &MkvOptions::default())
+    };
+    let mut d = Demuxer::open(reel(2)).unwrap();
+    assert_eq!(d.tracks()[0].colour, None, "no container Colour");
+    d.derive_dts(reorder_depth);
+    d.fill_colour(colour_of);
+    let c709 = gneiss_pal::dsp::demux::colour::Colour { primaries: 2, transfer: 2, matrix: 1, full_range: Some(false), mastering: None, light: None };
+    assert_eq!(d.tracks()[0].colour, Some(c709), "color_space BT.709 -> matrix 1, limited");
+    assert_eq!(Player::open(reel(2), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&c709), "the Player's open fills it too");
+    let mut d0 = Demuxer::open(reel(0)).unwrap();
+    d0.fill_colour(colour_of);
+    assert_eq!(d0.tracks()[0].colour, None, "CS_UNKNOWN states nothing: the size default stays");
+    println!("vp9inbandcolour: WebM color_space 2 -> {c709}");
+}

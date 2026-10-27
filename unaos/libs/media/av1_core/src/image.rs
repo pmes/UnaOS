@@ -116,7 +116,7 @@ impl Decoder {
             match o.obu_type {
                 OBU_SEQUENCE_HEADER_T => {
                     let s = SequenceHeader::parse(o.payload)?;
-                    self.seq = Some(s);
+                    self.sequence(s); // AV1INBANDSIZE (SR379): a really-changed header starts a new coded video sequence (§7.5): the refs drop
                 }
                 OBU_FRAME_T | OBU_FRAME_HEADER_T => {
                     let s = self.seq.clone().ok_or(Error::Invalid("frame before sequence header"))?;
@@ -651,6 +651,7 @@ pub fn stream_codes(av1c: &[u8], first_tu: &[u8]) -> Option<Av1Codes> {
 pub struct InBand {
     pub base: Option<(u8, u8, u8, bool)>,
     pub last: Option<(u8, u8, u8, Option<bool>)>,
+    pub size: Option<(u32, u32)>, // AV1INBANDSIZE (SR379): the last shown picture's size (`StreamDecoder::size_switch`)
 }
 
 impl Decoder {
@@ -696,4 +697,49 @@ pub fn switch_codes(open: Option<(u8, u8, u8, Option<bool>)>, base: (u8, u8, u8,
     let o = open.unwrap_or((base.0, base.1, base.2, Some(base.3)));
     let f = |o: u8, b: u8, n: u8| if o == b { n } else { o };
     (f(o.0, base.0, now.0), f(o.1, base.1, now.1), f(o.2, base.2, now.2), if o.3 == Some(base.3) { Some(now.3) } else { o.3 })
+}
+
+// ── AV1INBANDSIZE (LEDGER SR379): a new coded video sequence mid-stream (handlers.md §5 NLEPROBE-HDR's AV1-INBAND-SIZE) ──────────
+// §7.5: a sequence header whose contents differ from the one in effect (operating_parameters_info aside, the fields it may change
+// within a sequence; dav1d compares the same way) starts a NEW coded video sequence, whose first frame must be a shown key frame:
+// every reference of the old one is invalid. `Decoder::decode` drops them through the existing `RefStore::clear`, so an inter frame
+// across the boundary is refused by the existing "inter frame references an empty slot" (obu.rs) instead of predicting from the old
+// sequence's pictures. No buffer re-sizes: `FrameState::new` and `output_planes` size every frame from its own header, so the
+// `Planes` of the new sequence carry the new width / height. `meta` (the in-band CLL / MDCV) is kept (AV1-INBAND-HDR-WIRE's).
+// `StreamDecoder::size_switch` is the ONE size-change rule both Players print by (`[STRIA] :: video size switch`, `[vplay] size
+// switch`).
+
+impl Decoder {
+    /// AV1INBANDSIZE (SR379): take a parsed sequence header; one that differs from the current header ([`same_sequence`]) drops
+    /// every reference frame (a new coded video sequence). The first header clears nothing.
+    fn sequence(&mut self, s: SequenceHeader) {
+        if self.seq.as_ref().is_some_and(|cur| !same_sequence(cur, &s)) {
+            self.refs.clear();
+        }
+        self.seq = Some(s);
+    }
+}
+
+/// AV1INBANDSIZE (SR379): whether two sequence headers belong to one coded video sequence (§7.5): equal in every field but each
+/// operating point's operating_parameters_info (`decoder_buffer_delay`, `encoder_buffer_delay`, `low_delay_mode_flag`).
+pub fn same_sequence(a: &SequenceHeader, b: &SequenceHeader) -> bool {
+    let strip = |s: &SequenceHeader| {
+        let mut s = s.clone();
+        for op in &mut s.operating_points {
+            op.decoder_buffer_delay = 0;
+            op.encoder_buffer_delay = 0;
+            op.low_delay_mode_flag = false;
+        }
+        s
+    };
+    strip(a) == strip(b)
+}
+
+impl StreamDecoder {
+    /// AV1INBANDSIZE (SR379): after a decode — the shown picture's `w` x `h` against the last shown one: `Some((before, now))` once
+    /// per change, `None` for the first picture and while the size holds. A seek (`reset`) keeps it.
+    pub fn size_switch(&mut self, w: u32, h: u32) -> Option<((u32, u32), (u32, u32))> {
+        let before = self.inband.size.replace((w, h))?;
+        (before != (w, h)).then_some((before, (w, h)))
+    }
 }
