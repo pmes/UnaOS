@@ -179,7 +179,7 @@ pub fn mask_exit(tok: (u64, u32), site: &'static Location<'static>) {
     }
     let span = tsc_global().saturating_sub(t0);
     if span > THRESH.load(Relaxed) {
-        if MASKED_MAX.fetch_max(span, Relaxed) < span { MAX_WHO.note(crate::arch::sched::current_name(), site); } // HIDSTALLMASKSCOPE (B1019): the max names its holder (the masking task is current here)
+        if MASKED_MAX.fetch_max(span, Relaxed) < span { MAX_WHO.note_at(crate::arch::sched::current_name(), site, cpu as usize); } // HIDSTALLMASKSCOPE (B1019): the max names its holder (the masking task is current here); CLOCKCOREMASKCORE (B1046): the masking core is the token's own (read under this mask)
         name_once(site, span, cpu, false); site_tally(site, span); // MASKCENSUS (B1028): every span over 10 ms counted by its SEEN slot (tail); the live scan below is not counted (one span, many scans)
     }
 }
@@ -245,7 +245,7 @@ pub fn isr_tick() {
         }
         // SAFETY: every stored site is a `&'static Location` (from `#[track_caller]`).
         let site: &'static Location<'static> = unsafe { &*site };
-        if MASKED_MAX.fetch_max(t.saturating_sub(t0), Relaxed) < t.saturating_sub(t0) { MAX_WHO.note(None, site); } // HIDSTALLMASKSCOPE (B1019): another core's task is not safely readable here (SCHEDUAF): `?@<site>`
+        if MASKED_MAX.fetch_max(t.saturating_sub(t0), Relaxed) < t.saturating_sub(t0) { MAX_WHO.note_at(None, site, c); } // HIDSTALLMASKSCOPE (B1019): another core's task is not safely readable here (SCHEDUAF): `?@<site>`; CLOCKCOREMASKCORE (B1046): the masked core is the scan index
         name_once(site, t.saturating_sub(t0), c as u32, true);
     }
 }
@@ -333,11 +333,11 @@ pub fn selftest() {
         drift = ((m1 - m0) as i64 - pm_ms as i64).abs();
     }
     // (2) the masked spin — the property the arc exists for.
-    let mut masked_ms = 0u64;
+    let mut masked_ms = 0u64; let mut spin_core = usize::MAX; // CLOCKCOREMASKCORE (B1046): the spin's core, read inside the mask below
     if hz != 0 {
         masked_ms = crate::arch::without_interrupts(|| {
             let a = ms();
-            let end = rdtsc().wrapping_add(hz / 50); // 20 ms
+            let end = rdtsc().wrapping_add(hz / 50); spin_core = crate::arch::percpu::this_cpu().cpu_index as usize; // 20 ms; CLOCKCOREMASKCORE (B1046): the core under this mask
             while rdtsc() < end {
                 core::hint::spin_loop();
             }
@@ -349,15 +349,15 @@ pub fn selftest() {
         .zip(snap.iter())
         .filter(|&(&c, &s)| crate::arch::percpu::cpu(c).map(|p| p.ticks.load(Relaxed) > s).unwrap_or(false))
         .count();
-    let mmax = MASKED_MAX.load(Relaxed) * 1000 / hz.max(1);
-    let pass = tsc_clock() && (0..=2).contains(&drift) && masked_ms >= 19 && mmax >= 19 && ticking == cores.len();
+    let mmax = MASKED_MAX.load(Relaxed) * 1000 / hz.max(1); let by = MAX_WHO.read(false); let core_ok = max_core_ok(&by, spin_core); // CLOCKCOREMASKCORE (B1046): the holder names its core (tail)
+    let pass = tsc_clock() && (0..=2).contains(&drift) && masked_ms >= 19 && mmax >= 19 && ticking == cores.len() && core_ok;
     serial_println!(
-        ":: CLOCKCORE: source={} tsc_ms_vs_hpet_ms={} ref=pm window_ms={} masked_clock_ms={}/20 masked_max_ms={} masked_by={} masked_sites={} cores_ticking={}/{} skew_max_cycles={} -> {} ::",
+        ":: CLOCKCORE: source={} tsc_ms_vs_hpet_ms={} ref=pm window_ms={} masked_clock_ms={}/20 masked_max_ms={} masked_by={} core_ok={} masked_sites={} cores_ticking={}/{} skew_max_cycles={} -> {} ::",
         if tsc_clock() { "tsc" } else { "apic" },
         drift,
         WIN_MS,
         masked_ms,
-        mmax, MAX_WHO.read(false),
+        mmax, by, core_ok as u8,
         SEEN_N.load(Relaxed),
         ticking,
         cores.len(),
@@ -415,4 +415,20 @@ fn census_say() {
         "[clockcore] masked sites n={} other={}x{} over_ms=10 top={} (MASKCENSUS B1028: every IRQ-masked section over 10 ms by its mask site, <n>x<sum_ms>, top-5 by sum)",
         top.sites(), on, os, top
     );
+}
+
+// ── CLOCKCOREMASKCORE (rmbp-ledger B1046) — clockcore's masked max names its CORE. FILE-TAIL append. ─────────────────────────
+// HIDMASKCORE (B1042) gave `MaskWho` a fourth word but left clockcore's two writers on `MaskWho::note` (no core). Both know
+// it for free: `mask_exit` runs still masked, so its token's `cpu` (mask_enter's `this_cpu` read) is the masking core;
+// `isr_tick`'s live scan reads the per-CPU `MASK_T0`/`MASK_SITE` by index, so the scanned index IS the masked core. They now
+// call `note_at`, and the CLOCKCORE verdict's `masked_by=` prints `MaskedBy`'s ONE Display, `<task|?>@<file>:<line>@c<n>`.
+// `SEEN` is site-indexed (one site masks on many cores), so `[clockcore] masked sites` carries no core (MASK-SITES-CORE owed).
+
+/// `tests clock`'s `core_ok=`: the boot max's holder (`by`) names a valid core whenever it names a site, and when that max
+/// is the selftest's own masked spin (this file's only masked site) its core is `spin_core`, read inside that mask.
+fn max_core_ok(by: &crate::hidstall::MaskedBy, spin_core: usize) -> bool {
+    match by.site() {
+        None => true, // no span over 10 ms recorded: nothing to name
+        Some(l) => by.core().is_some_and(|c| c < MAX_CPUS && (l.file() != file!() || c == spin_core)),
+    }
 }
