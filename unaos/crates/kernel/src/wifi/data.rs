@@ -373,7 +373,7 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
         checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
             && crate::smolnet::lease_of(&bad).is_none()));
     }
-    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); let mut pass = 0u8; // STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
+    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); let mut pass = 0u8; // STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
     let mut first = None;
     for (name, ok) in checks.iter() {
         if *ok {
@@ -901,4 +901,190 @@ fn rejoin_rows(checks: &mut Vec<(&'static str, bool)>) {
     ok &= r.rejoins == 2 && !r.due(300_000);
     ok &= Link::new(STA, BSSID).rebased(30).tx_next() == 1 && Link::new(STA, BSSID).rebased(0).tx_next() == FRAME_DATA0;
     checks.push(("rejoin", ok));
+}
+
+// ── STATIONROAM (rmbp-ledger B897): another BSS of the same SSID — PURE (`Rejoin`'s shape), held in `join::Heard.scan` under `STATION` ──
+
+/// BSSes of the SSID remembered (a 9th evicts the one heard longest ago).
+pub const BSS_MAX: usize = 8;
+/// A candidate must beat the current BSS's beacon RSSI by this many dB.
+pub const ROAM_HYST_DB: i16 = 6;
+/// A linked station opens one scan window this often (the first one this long after `keep`).
+pub const ROAM_SCAN_MS: u64 = 60_000;
+/// How long a scan window listens with BEACPROMISC on (`rx::scan_filter`); a re-join's scan listens as long.
+pub const ROAM_WINDOW_MS: u64 = 1000;
+
+/// One received frame's signal in dBm from the FW598 RX header (b43 xmit.h:239-297): the HT-PHY's three per-chain powers at
+/// octets 9, 10 and 11 (`phy_ht_power0..2`, s8), the strongest taken as b43 does for B43_PHYTYPE_HT (xmit.c:721-725). A short
+/// header reads `i8::MIN`.
+pub fn ht_power(hdr: &[u8]) -> i8 {
+    if hdr.len() < 12 {
+        return i8::MIN;
+    }
+    (hdr[9] as i8).max(hdr[10] as i8).max(hdr[11] as i8)
+}
+
+/// One BSS of the SSID as the scan windows heard it: its channel (the DS element; 0 = absent), its beacon RSSI (dBm), when last
+/// heard and how often.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct BssSeen {
+    pub bssid: Mac,
+    pub channel: u8,
+    pub rssi: i8,
+    pub last_ms: u64,
+    pub n: u16,
+}
+
+/// The scan table and its schedule: `arm` (from `keep`) puts the next window `ROAM_SCAN_MS` out; `due` -> `open` (BEACPROMISC on,
+/// the next window scheduled) -> `see` per beacon -> `ended` after `ROAM_WINDOW_MS` -> `close`. An entry is FRESH when heard in
+/// the last window opened (`last_ms >= opened_ms`); older entries age out by eviction.
+#[derive(Default)]
+pub struct BssTable {
+    pub e: [Option<BssSeen>; BSS_MAX],
+    open: bool,
+    opened_ms: u64,
+    next_ms: u64,
+}
+
+impl BssTable {
+    pub fn arm(&mut self, now_ms: u64) {
+        self.next_ms = now_ms + ROAM_SCAN_MS;
+    }
+
+    pub fn due(&self, now_ms: u64) -> bool {
+        !self.open && now_ms >= self.next_ms
+    }
+
+    pub fn open(&mut self, now_ms: u64) {
+        self.open = true;
+        self.opened_ms = now_ms;
+        self.next_ms = now_ms + ROAM_SCAN_MS;
+    }
+
+    pub fn ended(&self, now_ms: u64) -> bool {
+        self.open && now_ms >= self.opened_ms + ROAM_WINDOW_MS
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    fn fresh(&self, s: &BssSeen) -> bool {
+        s.last_ms >= self.opened_ms
+    }
+
+    /// One beacon of the SSID, while a window is open: the first sight in this window is the sample, later ones the mean of the
+    /// held value and the new; a new BSSID takes a free slot, else the entry heard longest ago.
+    pub fn see(&mut self, bssid: Mac, channel: u8, rssi: i8, now_ms: u64) {
+        if !self.open {
+            return;
+        }
+        let opened = self.opened_ms;
+        if let Some(s) = self.e.iter_mut().flatten().find(|s| s.bssid == bssid) {
+            s.rssi = if s.last_ms >= opened { ((s.rssi as i16 + rssi as i16) / 2) as i8 } else { rssi };
+            s.channel = channel;
+            s.last_ms = now_ms;
+            s.n = s.n.saturating_add(1);
+            return;
+        }
+        let slot = match self.e.iter().position(|s| s.is_none()) {
+            Some(i) => i,
+            None => {
+                let mut old = 0;
+                for i in 1..BSS_MAX {
+                    if self.e[i].map_or(0, |s| s.last_ms) < self.e[old].map_or(0, |s| s.last_ms) {
+                        old = i;
+                    }
+                }
+                old
+            }
+        };
+        self.e[slot] = Some(BssSeen { bssid, channel, rssi, last_ms: now_ms, n: 1 });
+    }
+
+    pub fn get(&self, bssid: Mac) -> Option<BssSeen> {
+        self.e.iter().flatten().find(|s| s.bssid == bssid).copied()
+    }
+}
+
+/// The roam's pick over the last window: candidates FRESH, on `ch` (or with no DS element, 0), not `current`. `Some(cur)` (a
+/// linked station): `cur` itself must be fresh (a silent current is the `Watch`'s loss, not a roam) and a candidate must beat
+/// it by `ROAM_HYST_DB`; the strongest such wins. `None` (the re-join after a loss): the strongest fresh BSS on `ch`.
+pub fn roam_pick(current: Option<Mac>, ch: u8, t: &BssTable) -> Option<Mac> {
+    let floor = match current {
+        Some(cur) => {
+            let c = t.get(cur).filter(|s| t.fresh(s))?;
+            c.rssi as i16 + ROAM_HYST_DB
+        }
+        None => i16::MIN,
+    };
+    let mut best: Option<BssSeen> = None;
+    for s in t.e.iter().flatten() {
+        if !t.fresh(s) || Some(s.bssid) == current || (s.channel != ch && s.channel != 0) || (s.rssi as i16) < floor {
+            continue;
+        }
+        if best.map_or(true, |b| s.rssi > b.rssi) {
+            best = Some(*s);
+        }
+    }
+    best.map(|s| s.bssid)
+}
+
+/// `kat`'s rows after B891's (STATIONROAM rmbp-ledger B897). `bsstable`: `ht_power` of a header with octets 9/10/11 = -70/-55/-80
+/// reads -55, a short header `i8::MIN`; a closed table ignores `see`; open at 0: BSSID 1 at -60 then -50 holds -55, n 2; seven
+/// more BSSIDs (heard at 20..80) fill the table and a 9th (at 90) evicts BSSID 1, the one heard longest ago (at 5). `roampick`:
+/// current at -60; a candidate at -55 is not picked (+5); a stronger one on channel 6 is not; once the candidate averages -54
+/// (+6) it is; an entry from the window before is stale and never picked; a silent current picks nothing; no current picks the
+/// strongest fresh BSS on the channel. `roamwindow`: arm(0): not due at 59 999, due at 60 000; open at 60 000: ended at 61 000 not
+/// 60 999; closed: due again at 120 000 not 119 999.
+fn roam_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let b = |k: u8| -> Mac { [0x00, 0x11, 0x22, 0x33, 0x44, k] };
+    let mut hdr = [0u8; 24];
+    hdr[9] = (-70i8) as u8;
+    hdr[10] = (-55i8) as u8;
+    hdr[11] = (-80i8) as u8;
+    let mut ok = ht_power(&hdr) == -55 && ht_power(&hdr[..11]) == i8::MIN;
+    let mut t = BssTable::default();
+    t.see(b(1), 11, -60, 0);
+    ok &= t.get(b(1)).is_none();
+    t.open(0);
+    t.see(b(1), 11, -60, 0);
+    t.see(b(1), 11, -50, 5);
+    ok &= t.get(b(1)).map_or(false, |s| s.rssi == -55 && s.n == 2 && s.last_ms == 5);
+    for k in 2..=8u8 {
+        t.see(b(k), 11, -70, k as u64 * 10);
+    }
+    ok &= t.e.iter().all(|s| s.is_some());
+    t.see(b(9), 11, -70, 90);
+    ok &= t.get(b(1)).is_none() && t.get(b(9)).is_some() && t.get(b(2)).is_some();
+    checks.push(("bsstable", ok));
+
+    let mut p = BssTable::default();
+    p.see(b(7), 11, -30, 0);
+    p.open(0);
+    p.see(b(7), 11, -30, 0);
+    p.open(1000);
+    p.see(b(1), 11, -60, 1000);
+    p.see(b(2), 11, -55, 1000);
+    let five = roam_pick(Some(b(1)), 11, &p).is_none();
+    p.see(b(3), 6, -20, 1000);
+    let other_ch = roam_pick(Some(b(1)), 11, &p).is_none();
+    p.see(b(2), 11, -53, 1001);
+    let six = roam_pick(Some(b(1)), 11, &p) == Some(b(2));
+    let silent = roam_pick(Some(b(5)), 11, &p).is_none();
+    let none = roam_pick(None, 11, &p) == Some(b(2));
+    checks.push(("roampick", five && other_ch && six && silent && none));
+
+    let mut s = BssTable::default();
+    s.arm(0);
+    let mut win = !s.due(59_999) && s.due(60_000);
+    s.open(60_000);
+    win &= s.is_open() && !s.due(60_000) && !s.ended(60_999) && s.ended(61_000);
+    s.close();
+    win &= !s.is_open() && !s.ended(61_000) && !s.due(119_999) && s.due(120_000);
+    checks.push(("roamwindow", win));
 }
