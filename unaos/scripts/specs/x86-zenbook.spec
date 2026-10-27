@@ -9,7 +9,8 @@
 #          `test_x86_64` as X86_TEST_SPEC (its COMPLETE ends the wall, its REQUIREs are scored by `x86_test_completion`)
 #          and `x86_pick_capture_spec` replays it (the ZENBOOKLANE arm, asked before the SELFHOST skip).
 #          ZENBOOKLANETYPED (zenbook-ledger Z16): `zenbook_lane_typed` arms ONE typist (scripts/typist.sh, twoboot's) on the
-#          lane's QMP port: the first-user form, then `tests platform|ec|nvme|i8042|dwi2c|bootlist`, one line each (`tests`
+#          lane's QMP port: the first-user form, then `tests platform|ec|nvme|i8042|dwi2c|hdacensus|gopshot|eclid|bootlist`
+#          (ZENBOOKFLIGHTLIST Z33 added hdacensus, gopshot, eclid), one line each (`tests`
 #          runs ONE fixture per line), each held on the verdict before it; transcript target/zenbook-typist.log (beside).
 #
 # WHY. The Zenbook-only kernel arms answer `hw::platform()`, and q35's SMBIOS resolves `qemu`, so no QEMU leg reached them
@@ -35,6 +36,7 @@ REQUIRE \[hw\] platform=zenbook_um5606w dmi=".*" vendor=".*" src=knob
 
 # ── 2. Z8: the EC census runs on a non-Apple platform; q35 carries no ECDT, so it stops before any port I/O ───────────
 REQUIRE \[ec\] -> SKIP reason=no-ecdt
+OPTIONAL :: ECLID: -> SKIP reason=no-ecdt ::
 
 # ── 3. Z2: the NVMe controller (UNAOS_NVME on the line; the builder attaches the QEMU nvme device) ─────────────────────
 REQUIRE \[nvme\] ctrl mn=".*" ns=1 lba=\d+ blocks=\d+ -> ready
@@ -42,6 +44,7 @@ REQUIRE \[nvme\] ctrl mn=".*" ns=1 lba=\d+ blocks=\d+ -> ready
 # ── 4. Z10: the compositor ignites on the GOP framebuffer (no Kepler takeover) — the GopBoot arm's first QEMU run ──────
 REQUIRE \[wc-x\] gop-ignite platform=zenbook_um5606w fb=\d+x\d+
 REQUIRE \[gop\] shot centre=ff8000 tl=ff0000 tr=00ff00 bl=0000ff br=ffffff -> PASS
+REQUIRE :: GOPSHOT: ignite=pass centre=ff8000 tl=ff0000 tr=00ff00 bl=0000ff br=ffffff -> PASS ::
 
 # ── 5. Z7: the xHCI census (one controller on q35) ─────────────────────────────────────────────────────────────────────
 REQUIRE \[xhci\] controllers=\d+ picked=\d+ bdf=\d+:\d+\.\d+
@@ -68,12 +71,13 @@ REQUIRE :: NVME: ctrl=ok ns=1 rw=(ok|in-root) -> PASS :: root=(ok|skip) ::
 REQUIRE :: I8042: init=ready irq=(routed|polled) transport=ps2 table=ok .* -> PASS ::
 REQUIRE :: DWI2C: proto=ok cases=8/8 -> PASS ::
 REQUIRE :: BOOTLIST: probe entries=\d+ heavy=\d+ budget_skips=\d+ summary=ok -> PASS ::
-FORBID :: (PLATFORM|EC|NVME|I8042|DWI2C|BOOTLIST): .*-> FAIL
+FORBID :: (PLATFORM|EC|NVME|I8042|DWI2C|HDACENSUS|GOPSHOT|ECLID|BOOTLIST): .*-> FAIL
 
 # ── 10. ZENBOOKACP (Z25): the HDA census on q35's intel-hda + hda-duplex (UNAOS_HDA), the drive path skipped ───────────
 REQUIRE \[hw\] skip hda platform=zenbook_um5606w
 REQUIRE \[hda\] census codec=0 vid=1af4:0022 subsys=[0-9a-f]{4}:[0-9a-f]{4} afg=0x[0-9a-f]{2} nodes=\d+ ctrl=[0-9a-f]{4}:[0-9a-f]{4} pcissid=[0-9a-f]{4}:[0-9a-f]{4} -> parked
 REQUIRE \[hda\] audit stage=census .*verbs-set=0\b
+REQUIRE :: HDACENSUS: codecs=1 vid=10ec:0294 subsys=1043:1df3 afg=0x01 nodes=\d+ sets=0 cases=4/4 -> PASS ::
 FORBID \[hda\] (gpio|tone|path)\b
 
 # ── END OF RUN: the last typed verdict (mbench's completion also needs every REQUIRE above) ───────────────────────────

@@ -10581,8 +10581,8 @@ test_splash() {
 # needs a session, and `tests` runs ONE fixture per line (`tests::shell_verb`: the second word is the fixture's ARG). So
 # ONE typist — scripts/typist.sh, twoboot's `typist_start` lifted (called, never copied) — rides this lane's own QMP port
 # (`-qmp` in UNAOS_QEMU_EXTRA, twoboot's idiom; test_x86_64 arms none for this lane) and types the first-user form, then
-# `tests platform|ec|nvme|i8042|dwi2c|bootlist` one line each, every line held on the previous line's verdict. The spec's
-# COMPLETE is the last verdict. The typist connects to QMP before it reads a marker, and the QMP socket exists only after
+# `tests platform|ec|nvme|i8042|dwi2c|hdacensus|gopshot|eclid|bootlist` one line each (ZENBOOKFLIGHTLIST Z33 added the middle
+# three), every line held on the previous line's verdict. The spec's COMPLETE is the last verdict. The typist connects to QMP before it reads a marker, and the QMP socket exists only after
 # test_x86_64 has removed the old capture, so it never reads a stale log. Transcript: target/zenbook-typist.log (beside it).
 test_zenbook() {
     local secs="${1:-180}"
@@ -10593,7 +10593,7 @@ test_zenbook() {
         set -a; . <(awk '!index($0, "# [media]")' "$WORKSPACE_DIR/scripts/image-line-zenbook.env") || exit 1; set +a
         exec env UNAOS_ZENBOOKLANE=1 UNAOS_PLATFORM=zenbook_um5606w UNAOS_CENSUS=1 UNAOS_USBSERIAL=1 "$0" test-zenbook "$secs"
     fi
-    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: the Zenbook line as zenbook_um5606w on a fresh card, the first-user form typed, then six typed verbs (${secs}s wall, spec ${X86_ZENBOOK_SPEC#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: the Zenbook line as zenbook_um5606w on a fresh card, the first-user form typed, then nine typed verbs (${secs}s wall, spec ${X86_ZENBOOK_SPEC#${WORKSPACE_DIR}/})${COLOR_RESET}"
     rm -f "${WORKSPACE_DIR}/target/sdcard.img"; zenbook_bootlist_carry   # ZENBOOKLANELIST (Z19): the lane's own list, staged by the ONE stager, carried onto the ESP by the builder
     X86_TEST_SPEC="$X86_ZENBOOK_SPEC"
     build_selfbuild_x86() { echo "   ZENBOOKLANE: SELFBUILD staging not entered (build_selfbuild_x86 stubbed, as the twoboot arm does)"; }
@@ -10601,7 +10601,7 @@ test_zenbook() {
 }
 
 # ZENBOOKLANETYPED (zenbook-ledger Z16): `test_zenbook`'s second phase — ONE typist (scripts/typist.sh) on this lane's QMP
-# port, the first-user form then six `tests <verb>` lines, each held on the verdict before it; then `test_x86_64`.
+# port, the first-user form then nine `tests <verb>` lines, each held on the verdict before it; then `test_x86_64`.
 zenbook_lane_typed() { # $1 = the wall (s)
     local secs="$1" rc=0 zport="${UNAOS_QMP_PORT:-4470}" tlog="${WORKSPACE_DIR}/target/zenbook-typist.log" v prev
     while lsof -iTCP:"$zport" -sTCP:LISTEN >/dev/null 2>&1; do zport=$((zport + 1)); done
@@ -10610,14 +10610,14 @@ zenbook_lane_typed() { # $1 = the wall (s)
     TYPIST_PORT="$zport" TYPIST_LOG="$SERIAL_LOG"
     local -a zph=("$FIRSTUSER_PHASE")
     prev=":: BOOTLIST: ran="   # ZENBOOKLANELIST (Z19): held on the lane list's light summary (it runs at [desktop] built), so no typed `tests` meets a list fixture's RUNNING (`:: TESTS: already running — refused ::`)
-    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C bootlist:BOOTLIST; do
+    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID bootlist:BOOTLIST; do   # ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged)
         local done_mark=":: ${v#*:}: "; [ "${v%%:*}" = bootlist ] && done_mark=":: BOOTLIST: probe"
         zph+=("${prev}|tests ${v%%:*}|t:tests spc t:${v%%:*} ret|${done_mark}")
         prev="$done_mark"
     done
     mkdir -p "${WORKSPACE_DIR}/target"; rm -f "$tlog"
     typist_start "$tlog" "$secs" "${zph[@]}"
-    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: typist armed on QMP :${zport} — the first-user form, then tests platform/ec/nvme/i8042/dwi2c/bootlist (transcript ${tlog#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: typist armed on QMP :${zport} — the first-user form, then tests platform/ec/nvme/i8042/dwi2c/hdacensus/gopshot/eclid/bootlist (transcript ${tlog#${WORKSPACE_DIR}/})${COLOR_RESET}"
     test_x86_64 "$secs" || rc=$?
     wait "$typist" 2>/dev/null || true
     awk '/^\[typist\]/ { print "ZENBOOKLANE:   " $0 }' "$tlog" 2>/dev/null || true
