@@ -555,7 +555,7 @@ pub fn present(dst: &mut [u32], w: usize, vh: usize, audio_ms: Option<u64>, play
             p.shown.push(o); // NLE6 (SR207): the presented frame counter
         }
     }
-    let vh = view_band(dst, w, vh, f.pts_ms); let c0 = crate::arch::now_cycles(); blit_fit(dst, w, 0, 0, w, vh, &f, Some(0)); present_cost(c0); // NLE6KEYS (rmbp-ledger B961): the EDL's track view in the picture rect's lower band (file tail)
+    let vh = view_band(dst, w, vh, Some(f.pts_ms)); let c0 = crate::arch::now_cycles(); blit_fit(dst, w, 0, 0, w, vh, &f, Some(0)); present_cost(c0); // NLE6KEYS (rmbp-ledger B961): the EDL's track view in the picture rect's lower band (file tail)
     (true, media)
 }
 
@@ -1935,13 +1935,15 @@ pub fn edit_timeline() -> Option<timeline_core::Timeline> {
 
 /// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
 pub fn edit_close() {
-    *EDIT.lock() = None;
+    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
 }
 
 /// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
 /// playhead at the presented frame's tick) over the picture rect's lower `RULER_H + rows * ROW_H` rows (at most half
-/// of it); returns the rows left for the picture (`vh` unchanged when there is no view).
-fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: u64) -> usize {
+/// of it); returns the rows left for the picture (`vh` unchanged when there is no view). NLE6DRAGSNAP (rmbp-ledger B977):
+/// `pts_ms` `None` repaints at the playhead it holds (a drag's [`band_repaint`]); a live drag paints the host's way, the
+/// preview state (`Drag::shown`) then `view::paint_drag` (the snap guide, the marquee).
+fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize {
     use timeline_core::view;
     let Some(live) = JOB.try_lock().and_then(|g| g.as_ref().map(|j| j.path.clone())) else { return vh };
     let Some(mut g) = EDIT.try_lock() else { return vh };
@@ -1952,10 +1954,15 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: u64) -> usize {
         return vh;
     }
     let tb = e.st.timeline.tb;
-    e.st.seek(tick_of(tb, pts_ms));
+    if let Some(ms) = pts_ms {
+        e.st.seek(tick_of(tb, ms));
+    }
     let l = view::Layout::of_role(view::Role::Tracks, w as u32, band as u32, &e.st);
     let mut lab = ViewLabels(0);
-    let px = pack(&view::paint_in(&e.st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None));
+    let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
+    let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
+    let st = shown.as_ref().unwrap_or(&e.st);
+    let px = pack(&view::paint_drag(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None), l, view::Order::Rgba, drag.as_ref()));
     let y0 = vh - band; band_note(&live, y0, l); // NLE6FACEDRAG (rmbp-ledger B975): the layout painted is the layout a press hits (file tail)
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
@@ -2163,7 +2170,7 @@ fn export_frame(jid: u32, tb: timeline_core::Timebase, total: u64, f: &Frame) ->
 // handlers.md §5 NLE6's NLE6FACE-DRAG. [`view_band`] notes the layout it PAINTED ([`band_note`]: the job's path, the band's top
 // row in the Player's surface, the `Layout`), so a press hits what was drawn (the host face's rule). The Player's pointer door
 // (player.rs `edit_press_route`, the picture arm of `press_route`; the capture seam for the motion and the release) hands
-// surface px to [`edit_press`] (`view::Drag::begin_with`, no snap: NLE6DRAG-SNAP owes the kernel's guide line), the motion
+// surface px to [`edit_press`] (`view::Drag::begin_with`, snapping: NLE6DRAGSNAP B977, the guide painted), the motion
 // to [`edit_drag_move`] (`Drag::update`, router depth, no I/O), and the pass runs [`edit_drag_end`] after the release:
 // `Drag::finish` (the host's ONE commit: `EditorState::trim` / `move_selected` / `move_set`) on the Player's editor state,
 // the EDL saved by [`edit_save`] (the ONE save the keys use too), the playhead handed to the seek door. A ruler press is
@@ -2234,10 +2241,10 @@ pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
     let d = {
         let Some(mut g) = EDIT.try_lock() else { return false };
         let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
-        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, true) else { return false };
+        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false) else { return false };
         d
     };
-    *DRAG.lock() = Some((y0, d));
+    *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
     serial_println!("[nle] drag press {} at={} track={} clip={}", drag_word(d.kind), d.origin_tick, d.track, d.idx);
     true
 }
@@ -2248,7 +2255,7 @@ pub fn edit_drag_move(x: usize, y: usize) {
     let Some((y0, d)) = dg.as_mut() else { return };
     let Some(g) = EDIT.try_lock() else { return };
     let Some(e) = g.as_ref() else { return };
-    d.update(&e.st, x as f64, y as f64 - *y0 as f64);
+    d.update(&e.st, x as f64, y as f64 - *y0 as f64); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the band follows the drag (file tail)
 }
 
 /// **The drag's release, on the pass**: the host's ONE commit (`Drag::finish`) on the Player's editor state, the EDL saved
@@ -2256,10 +2263,10 @@ pub fn edit_drag_move(x: usize, y: usize) {
 /// unchanged, refused, a marquee, or no EDL open at `path`.
 pub fn edit_drag_end(path: &str) -> Option<u64> {
     use timeline_core::view::DragKind;
-    let (_, d) = DRAG.lock().take()?;
+    let (_, d) = DRAG.lock().take()?; BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the guide and preview go (file tail)
     let word = drag_word(d.kind);
     let (from, to) = (d.origin_tick, d.origin_tick + d.delta);
-    let (tl, clips, undo, back) = {
+    let (tl, clips, undo, back, snapped) = {
         let mut g = EDIT.lock();
         let e = g.as_mut().filter(|e| e.path == path)?;
         let st = &mut e.st;
@@ -2281,6 +2288,7 @@ pub fn edit_drag_end(path: &str) -> Option<u64> {
             serial_println!("[nle] drag {} from={} to={} unchanged", word, from, to);
             return None;
         }
+        let snapped = snap_word(&d, st.playhead);
         let before = st.timeline.clone();
         match d.finish(st) {
             Ok(()) if st.timeline != before => {}
@@ -2294,10 +2302,10 @@ pub fn edit_drag_end(path: &str) -> Option<u64> {
             }
         }
         let clips: usize = st.timeline.tracks.iter().map(|t| t.clips.len()).sum();
-        (st.timeline.clone(), clips, st.undo_depth(), ms(st.playhead))
+        (st.timeline.clone(), clips, st.undo_depth(), ms(st.playhead), snapped)
     };
     let saved = edit_save(path, &tl);
-    serial_println!("[nle] drag {} from={} to={} clips={} undo={} saved={}", word, from, to, clips, undo, saved);
+    serial_println!("[nle] drag {} from={} to={} snapped={} clips={} undo={} saved={}", word, from, to, snapped, clips, undo, saved);
     Some(back)
 }
 
@@ -2442,4 +2450,39 @@ pub fn knobs() -> (u32, bool, u32, bool) {
 /// The filter's wire word.
 pub fn filter_word(area: bool) -> &'static str {
     if area { "area" } else { "nearest" }
+}
+
+// ── NLE6DRAGSNAP (rmbp-ledger B977): the band snaps, previews and follows the drag ─────────────────────────────────────────
+// handlers.md §5 NLE6's NLE6DRAG-SNAP / NLE6DRAG-PREVIEW. [`edit_press`] begins the host's `view::Drag` with snapping (clip
+// edges and the playhead, the ONE `snap_targets` / `snap_to`); [`view_band`] paints the drag's preview state
+// (`Drag::shown`) and `view::paint_drag` (the host's guide line and marquee, moved into the view). A paused Player takes no
+// frame, so the band is repainted by the pass: the press, each motion and the release mark [`BAND_DIRTY`]; the Player's
+// pass calls [`band_repaint`] when it presented no frame and presents only the band's rows (`wm::present_rows`). Wire: the
+// drag's commit line carries `snapped=<edge|playhead|none>`.
+
+/// The view band must be repainted (a drag pressed, moved or released since the last paint).
+static BAND_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// **The pass's band repaint** into the Player's surface `dst` (`w` wide, the picture rect `vh` rows): when
+/// [`BAND_DIRTY`], the band repainted at the playhead the editor state holds; `Some((y0, vh))` = the surface rows painted
+/// (re-armed when the band could not be painted this pass).
+pub fn band_repaint(dst: &mut [u32], w: usize, vh: usize) -> Option<(usize, usize)> {
+    if !BAND_DIRTY.swap(false, Ordering::AcqRel) {
+        return None;
+    }
+    let y0 = view_band(dst, w, vh, None);
+    if y0 >= vh {
+        BAND_DIRTY.store(true, Ordering::Release);
+        return None;
+    }
+    Some((y0, vh))
+}
+
+/// What the drag snapped to: `none` (no guide), `playhead` (the guide is the playhead's tick), else `edge` (a clip edge).
+fn snap_word(d: &timeline_core::view::Drag, playhead: i64) -> &'static str {
+    match d.guide {
+        None => "none",
+        Some(t) if t == playhead => "playhead",
+        Some(_) => "edge",
+    }
 }

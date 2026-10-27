@@ -52,7 +52,7 @@ pub use timeline_core::editor::{Edge, EditorState, UNDO_MAX, ZOOM_DEFAULT, ZOOM_
 pub use timeline_core::view::{Drag, DragKind, HANDLE_W, Hit, Layout, MARQUEE_MIN, ROW_H, RULER_H, Role, SNAP_PX, Still, THUMB_H, THUMB_W, TRANS_H, TRANS_MIN_W, fnv1a, snap_targets, snap_to, transition_mid}; // NLE6FACEDRAG (rmbp-ledger B975): the drag model moved to timeline_core::view, both faces call it
 use timeline_core::view::{self, Canvas, FIELD, Order, TRANS};
 #[cfg(test)]
-use timeline_core::view::{HANDLE, PLAYHEAD, ROW, SELECT, TRANS_FILL, clip_colour};
+use timeline_core::view::{GUIDE, HANDLE, PLAYHEAD, ROW, SELECT, TRANS_FILL, clip_colour};
 #[cfg(test)]
 use timeline_core::{TransitionKind, WipeDir};
 
@@ -492,24 +492,7 @@ impl Face {
 // THE SET, SNAPPING AND THE RULER SCRUB (NLE2c, LEDGER SR217)
 // ---------------------------------------------------------------------------------------------------------------------
 
-const GUIDE: [u8; 4] = [0x40, 0xd0, 0xff, 255];
-const MARQUEE: [u8; 4] = [0xa0, 0xa0, 0xff, 255];
-
-/// The live drag over the painted canvas: the snap guide (a vertical line from the ruler down) and the marquee's rect.
-fn paint_drag(px: Vec<u8>, l: Layout, order: PixelOrder, drag: Option<&Drag>) -> Vec<u8> {
-    let Some(d) = drag else { return px };
-    let mut c = Canvas { w: l.w, h: l.h, order: vo(order), px };
-    if let Some(t) = d.guide {
-        let x = l.x_of(t);
-        c.rect(x, l.ruler_y as i64, x + 1, l.h as i64, GUIDE);
-    }
-    if d.kind == DragKind::Marquee && d.moved() {
-        let (x0, x1) = (d.origin.0.min(d.at.0) as i64, d.origin.0.max(d.at.0) as i64 + 1);
-        let (y0, y1) = (d.origin.1.min(d.at.1) as i64, d.origin.1.max(d.at.1) as i64 + 1);
-        c.frame(x0, y0, x1, y1, MARQUEE);
-    }
-    c.px
-}
+// NLE6DRAGSNAP (rmbp-ledger B977): the snap guide and the marquee paint (`paint_drag`, `GUIDE`, `MARQUEE`) moved to timeline_core::view.
 
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1583,7 +1566,7 @@ impl Face {
         if role == Role::Preview {
             return paint_meters(px, l, self.order, &self.meter_levels());
         }
-        paint_meters(paint_drag(self.paint_transition_still(px, l), l, self.order, self.drag.as_ref()), l, self.order, &self.meter_levels())
+        paint_meters(view::paint_drag(self.paint_transition_still(px, l), l, vo(self.order), self.drag.as_ref()), l, self.order, &self.meter_levels())
     }
     /// Every Surface's blit: [`Face::frame`] alone on one Surface; split, the preview's then the tracks'.
     pub fn frames(&mut self) -> Vec<SMessage> {
