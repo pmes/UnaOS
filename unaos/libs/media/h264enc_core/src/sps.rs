@@ -23,6 +23,8 @@ pub const CONSTRAINT_FLAGS: u8 = 0xC0;
 pub const PROFILE_MAIN: u8 = 77;
 /// constraint_set1_flag alone: the CABAC stream conforms to Main (A.2.2), not to Baseline.
 pub const CONSTRAINT_MAIN: u8 = 0x40;
+/// profile_idc of High (A.2.4): the 8x8 transform's stream (H264ENC8X8, SR322), constraint flags 0.
+pub const PROFILE_HIGH: u8 = 100;
 
 /// The sequence-level facts the writers need.
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +37,8 @@ pub struct SeqParams {
     pub qp: i32,
     /// CABAC (entropy_coding_mode_flag 1): Main profile instead of Constrained Baseline.
     pub cabac: bool,
+    /// The 8x8 transform (SR322): High profile, with the SPS's High fields.
+    pub high: bool,
 }
 
 /// level_idc for a frame of `mb_w` x `mb_h` macroblocks: the lowest level of Table A-1 whose
@@ -54,10 +58,18 @@ pub fn level_idc(mb_w: u32, mb_h: u32) -> u8 {
 /// seq_parameter_set_rbsp (7.3.2.1.1), the RBSP after the NAL header byte.
 pub fn write_sps(p: &SeqParams) -> Vec<u8> {
     let mut w = BitWriter::new();
-    w.u(8, (if p.cabac { PROFILE_MAIN } else { PROFILE_BASELINE }) as u32);
-    w.u(8, (if p.cabac { CONSTRAINT_MAIN } else { CONSTRAINT_FLAGS }) as u32); // constraint_set0..5 flags + reserved_zero_2bits
+    let (profile, constraint) = if p.high { (PROFILE_HIGH, 0) } else if p.cabac { (PROFILE_MAIN, CONSTRAINT_MAIN) } else { (PROFILE_BASELINE, CONSTRAINT_FLAGS) };
+    w.u(8, profile as u32);
+    w.u(8, constraint as u32); // constraint_set0..5 flags + reserved_zero_2bits
     w.u(8, level_idc(p.mb_w, p.mb_h) as u32);
     w.ue(0); // seq_parameter_set_id
+    if p.high {
+        w.ue(1); // chroma_format_idc: 4:2:0
+        w.ue(0); // bit_depth_luma_minus8
+        w.ue(0); // bit_depth_chroma_minus8
+        w.flag(false); // qpprime_y_zero_transform_bypass_flag
+        w.flag(false); // seq_scaling_matrix_present_flag: flat (scaling matrices owed)
+    }
     w.ue(p.log2_max_frame_num - 4);
     w.ue(2); // pic_order_cnt_type: POC follows frame_num, output order = decoding order
     w.ue(1); // max_num_ref_frames
@@ -98,8 +110,9 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
 
 /// pic_parameter_set_rbsp (7.3.2.2): CAVLC or CABAC (`cabac`, SR310), one slice group, one active reference by default,
 /// pic_init_qp = the stream's QP (so slice_qp_delta is 0), chroma_qp_index_offset 0,
-/// deblocking_filter_control_present_flag 1 (each slice names its filter idc).
-pub fn write_pps(qp: i32, cabac: bool) -> Vec<u8> {
+/// deblocking_filter_control_present_flag 1 (each slice names its filter idc). With `t8x8` (SR322) the
+/// High tail: transform_8x8_mode_flag 1, pic_scaling_matrix_present_flag 0, second_chroma_qp_index_offset 0.
+pub fn write_pps(qp: i32, cabac: bool, t8x8: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pic_parameter_set_id
     w.ue(0); // seq_parameter_set_id
@@ -116,6 +129,11 @@ pub fn write_pps(qp: i32, cabac: bool) -> Vec<u8> {
     w.flag(true); // deblocking_filter_control_present_flag
     w.flag(false); // constrained_intra_pred_flag
     w.flag(false); // redundant_pic_cnt_present_flag
+    if t8x8 {
+        w.flag(true); // transform_8x8_mode_flag
+        w.flag(false); // pic_scaling_matrix_present_flag
+        w.se(0); // second_chroma_qp_index_offset
+    }
     w.trailing();
     w.finish()
 }

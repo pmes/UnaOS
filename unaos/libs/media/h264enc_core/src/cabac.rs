@@ -17,23 +17,30 @@
 //! decodes to the encoder's reconstruction byte for byte (tests/intra.rs, pframes.rs, rc.rs).
 //!
 //! Not written (the encoder emits neither; owed with the partitions / multiple references):
-//! sub_mb_type and ref_idx_l0. Not written either: transform_size_8x8_flag (High, owed) and I_PCM.
+//! sub_mb_type and ref_idx_l0. Not written either: I_PCM. H264ENC8X8 (SR322) adds transform_size_8x8_flag
+//! (ctxIdx 399..401) and ctxBlockCat 5 (the 8x8 luma block, no coded_block_flag) over h264_core's
+//! `SIG_COEFF_8X8_FRAME` / `LAST_COEFF_8X8`.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
-use h264_core::cabac::{Cabac, ABS_OFFSET, CAT_CHROMA_AC, CAT_CHROMA_DC, CAT_LUMA_4X4, CAT_LUMA_AC, CAT_LUMA_DC, NUM_CTX, SIG_OFFSET};
+use h264_core::cabac::{Cabac, ABS_OFFSET, CAT_CHROMA_AC, CAT_CHROMA_DC, CAT_LUMA_4X4, CAT_LUMA_8X8, CAT_LUMA_AC, CAT_LUMA_DC, NUM_CTX, SIG_OFFSET};
 use h264_core::picture::{blk_at, MbInfo, MbKind, BLK_X, BLK_Y, CBF_CHROMA_AC, CBF_CHROMA_DC, CBF_LUMA_DC};
-use h264_core::tables::{RANGE_TAB_LPS, TRANS_IDX_LPS, TRANS_IDX_MPS};
+use h264_core::tables::{LAST_COEFF_8X8, RANGE_TAB_LPS, SIG_COEFF_8X8_FRAME, TRANS_IDX_LPS, TRANS_IDX_MPS};
 
 use crate::nal::BitWriter;
-use crate::{intra, scan, Encoder, Kind, MbCode};
+use crate::{intra, mode_at, mode_fields, scan, scan8, Encoder, Kind, MbCode};
 
 /// ctxIdxOffset (Table 9-34, frame coding) of significant_coeff_flag, last_significant_coeff_flag
 /// and coeff_abs_level_minus1 for ctxBlockCat < 5 (the literals of h264_core's `residual_block`).
 const SIG_BASE: usize = 105;
 const LAST_BASE: usize = 166;
 const ABS_BASE: usize = 227;
+/// The same three ctxIdxOffsets for ctxBlockCat 5, frame coding (the literals 402 / 417 / 426 of
+/// h264_core's `residual_block`; SR322).
+const SIG_BASE_8X8: usize = 402;
+const LAST_BASE_8X8: usize = 417;
+const ABS_BASE_8X8: usize = 426;
 
 /// mvd ctxIdxInc of prefix bins 1..8 (Table 9-39).
 const MVD_INC: [usize; 8] = [3, 4, 5, 6, 6, 6, 6, 6];
@@ -174,22 +181,28 @@ impl Writer {
         }
     }
 
-    /// residual_block_cabac (7.3.5.3.3) after a coded_block_flag of 1, for ctxBlockCat `cat` < 5:
+    /// residual_block_cabac (7.3.5.3.3) after a coded_block_flag of 1, for ctxBlockCat `cat` < 5,
+    /// or for ctxBlockCat 5 (an 8x8 luma block, 64 levels, no coded_block_flag; SR322):
     /// `list[..max]` in scan order, at least one level non-zero. The significance map
-    /// (9.3.3.1.3: levelListIdx, chroma DC Min(levelListIdx, 2)), then the levels in reverse scan
+    /// (9.3.3.1.3: levelListIdx, chroma DC Min(levelListIdx, 2), cat 5 h264_core's
+    /// `SIG_COEFF_8X8_FRAME` / `LAST_COEFF_8X8`), then the levels in reverse scan
     /// order: coeff_abs_level_minus1 (prefix TU cMax 14, bin 0 ctxIdxInc numDecodAbsLevelGt1 != 0 ?
     /// 0 : Min(4, 1 + numDecodAbsLevelEq1), later bins 5 + Min(4 - (cat == 3), numDecodAbsLevelGt1);
     /// UEG0 bypass suffix) and coeff_sign_flag (bypass). The reader is h264_core's
     /// `Cabac::residual_block`.
     pub fn residual_block(&mut self, w: &mut BitWriter, cat: usize, max: usize, list: &[i32]) {
-        let (sig_base, last_base, abs_base) = (SIG_BASE + SIG_OFFSET[cat], LAST_BASE + SIG_OFFSET[cat], ABS_BASE + ABS_OFFSET[cat]);
+        let (sig_base, last_base, abs_base) = if cat == CAT_LUMA_8X8 { (SIG_BASE_8X8, LAST_BASE_8X8, ABS_BASE_8X8) } else { (SIG_BASE + SIG_OFFSET[cat], LAST_BASE + SIG_OFFSET[cat], ABS_BASE + ABS_OFFSET[cat]) };
         let last = list[..max].iter().rposition(|&v| v != 0).expect("coded_block_flag 1 over a block of zeros");
         for i in 0..max - 1 {
-            let ci = if cat == CAT_CHROMA_DC { i.min(2) } else { i };
+            let (si, li) = match cat {
+                CAT_LUMA_8X8 => (SIG_COEFF_8X8_FRAME[i] as usize, LAST_COEFF_8X8[i] as usize),
+                CAT_CHROMA_DC => (i.min(2), i.min(2)),
+                _ => (i, i),
+            };
             let sig = list[i] != 0;
-            self.decision(w, sig_base + ci, sig as u32);
+            self.decision(w, sig_base + si, sig as u32);
             if sig {
-                self.decision(w, last_base + ci, (i == last) as u32);
+                self.decision(w, last_base + li, (i == last) as u32);
                 if i == last {
                     break;
                 }
@@ -398,9 +411,13 @@ impl Encoder {
                     self.cabac_mb_type_i(w, c, mbx, mby, code, 3, false);
                 }
                 if code.kind == Kind::I4 {
+                    if self.cfg.transform8x8 {
+                        self.cabac_t8x8(w, c, mbx, mby, code.t8x8);
+                    }
                     let w4 = self.mb_w * 4;
-                    for blk in 0..16 {
-                        let (x4, y4) = (mbx * 4 + BLK_X[blk], mby * 4 + BLK_Y[blk]);
+                    for blk in 0..mode_fields(code.t8x8) {
+                        let (bx, by) = mode_at(code.t8x8, blk);
+                        let (x4, y4) = (mbx * 4 + bx, mby * 4 + by);
                         let pred = intra::predicted_mode(&self.modes, w4, x4, y4);
                         let m = code.modes[blk];
                         if m == pred {
@@ -448,6 +465,9 @@ impl Encoder {
         if code.kind != Kind::I16 {
             self.cabac_cbp(w, c, mbx, mby, code);
         }
+        if self.cfg.transform8x8 && code.kind == Kind::P16 && code.cbp & 15 != 0 {
+            self.cabac_t8x8(w, c, mbx, mby, code.t8x8);
+        }
         if code.cbp != 0 || code.kind == Kind::I16 {
             c.qp_delta(w, self.qp - self.qp_pred); // QPY,pred moves as h264_core's mb.rs moves it
             self.qp_pred = self.qp;
@@ -456,6 +476,14 @@ impl Encoder {
             c.prev_qp_nz = false;
         }
         c.terminate(w, last); // end_of_slice_flag
+    }
+
+    /// transform_size_8x8_flag (ctxIdx 399 + condTermFlagA + condTermFlagB, 9.3.3.1.1.10: the neighbour
+    /// macroblock is available and carries the flag), h264_core `cabac_t8x8` (SR322).
+    fn cabac_t8x8(&self, w: &mut BitWriter, c: &mut Writer, mbx: usize, mby: usize, flag: bool) {
+        let (a, b) = self.cabac_ab(mbx, mby);
+        let cond = |m: Option<usize>| m.is_some_and(|m| self.dinfo[m].t8x8) as usize;
+        c.decision(w, 399 + cond(a) + cond(b), flag as u32);
     }
 
     /// coded_block_pattern (9.3.2.6: prefix FL 4 bins, suffix TU cMax 2; ctxIdx 73..84,
@@ -515,6 +543,13 @@ impl Encoder {
         }
         for blk in 0..16 {
             if (code.cbp >> (blk / 4)) & 1 == 0 {
+                continue;
+            }
+            if code.t8x8 {
+                // ctxBlockCat 5: one 64-level block per coded 8x8, no coded_block_flag (SR322).
+                if blk % 4 == 0 {
+                    c.residual_block(w, CAT_LUMA_8X8, 64, &scan8(&code.luma8[blk / 4]));
+                }
                 continue;
             }
             let inc = self.cabac_cbf_luma_inc(mbx, mby, blk, intra);

@@ -14,7 +14,8 @@
 //! frequency) and j the column, as h264_core indexes them.
 
 use h264_core::picture::{BLK_X, BLK_Y};
-use h264_core::transform::{chroma_dc, idct4_add, luma_dc, scale4, LevelScale};
+use h264_core::tables::NORM_ADJUST8;
+use h264_core::transform::{chroma_dc, idct4_add, idct8_add, luma_dc, scale4, scale8, LevelScale};
 
 /// MF(qP % 6, class): class 0 for positions with i and j both even, 1 for both odd, 2 otherwise.
 const MF: [[i32; 3]; 6] = [[13107, 5243, 8066], [11916, 4660, 7490], [10082, 4194, 6554], [9362, 3647, 5825], [8192, 3355, 5243], [7282, 2893, 4559]];
@@ -208,6 +209,133 @@ pub fn recon_chroma(dc: &[i32; 4], ac: &[[i32; 16]; 4], ls: &LevelScale, list: u
     }
 }
 
+// -----------------------------------------------------------------------------------------
+// H264ENC8X8 (LEDGER SR322): the 8x8 transform (High), forward side
+// -----------------------------------------------------------------------------------------
+
+/// The 8x8 integer transform matrix: 8 x the rows of the basis h264_core's `idct8_add` inverts
+/// (8.5.13.2), so [`fdct8`] is exact and its output is 64 x the transform those rows define.
+const C8: [[i32; 8]; 8] = [
+    [8, 8, 8, 8, 8, 8, 8, 8],
+    [12, 10, 6, 3, -3, -6, -10, -12],
+    [8, 4, -4, -8, -8, -4, 4, 8],
+    [10, -3, -12, -6, 6, 12, 3, -10],
+    [8, -8, -8, 8, 8, -8, -8, 8],
+    [6, -12, 3, 10, -10, -3, 12, -6],
+    [4, -8, 8, -4, -4, 8, -8, 4],
+    [3, -6, 10, -12, 12, -10, 6, -3],
+];
+
+/// 64 x the squared norm of each basis row (the dot product of a `C8` row with itself).
+const NN8: [i64; 8] = [512, 578, 320, 578, 512, 578, 320, 578];
+
+const fn mf8_table() -> [[i32; 64]; 6] {
+    let mut t = [[0i32; 64]; 6];
+    let mut q = 0;
+    while q < 6 {
+        let mut p = 0;
+        while p < 64 {
+            let d = NORM_ADJUST8[q][p] as i64 * NN8[p / 8] * NN8[p % 8];
+            t[q][p] = (((1i64 << 36) + d / 2) / d) as i32;
+            p += 1;
+        }
+        q += 1;
+    }
+    t
+}
+
+/// MF8(qP % 6, raster position): the 8x8 quantiser's multiplication factors at 16 + qP / 6 bits,
+/// derived from h264_core's `NORM_ADJUST8` (the decoder's LevelScale8x8 for flat lists) so that
+/// quantising then `scale8` + `idct8_add` is the identity up to the step: MF8 = 2^36 / (normAdjust8 x
+/// NN8[i] x NN8[j]), rounded (JM's quant_coef8: 13107, 12222, 16777, 11428 ... at qP % 6 = 0).
+pub const MF8: [[i32; 64]; 6] = mf8_table();
+
+/// Forward 8x8 transform Y' = C8 X C8^T of a raster 8x8 residual (64 x the transform of 8.5.13).
+pub fn fdct8(x: &[i32; 64]) -> [i32; 64] {
+    let mut t = [0i32; 64];
+    for i in 0..8 {
+        for k in 0..8 {
+            let mut s = 0;
+            for j in 0..8 {
+                s += x[i * 8 + j] * C8[k][j];
+            }
+            t[i * 8 + k] = s;
+        }
+    }
+    let mut y = [0i32; 64];
+    for k in 0..8 {
+        for l in 0..8 {
+            let mut s = 0;
+            for i in 0..8 {
+                s += C8[k][i] * t[i * 8 + l];
+            }
+            y[k * 8 + l] = s;
+        }
+    }
+    y
+}
+
+/// Quantise an [`fdct8`] block in place: Z = sign(Y') * ((|Y'| * MF8 + 64f) >> (22 + qP / 6)), the
+/// 64 of Y' folded into the shift; f is [`quant4`]'s offset at 16 + qP / 6 bits (intra / 3, inter / 6).
+pub fn quant8(c: &mut [i32; 64], qp: i32, intra: bool) {
+    let qbits = 16 + qp / 6;
+    let f = offset(qbits, intra) << 6;
+    let q = (qp % 6) as usize;
+    for p in 0..64 {
+        let v = c[p] as i64;
+        let z = ((v.abs() * MF8[q][p] as i64 + f) >> (qbits + 6)) as i32;
+        c[p] = if v < 0 { -z } else { z };
+    }
+}
+
+/// Add the residual of one 8x8 block of levels `c` (raster) to the prediction in `dst`: h264_core's
+/// `scale8` (8.5.13.1, LevelScale8x8 `ls` for qP % 6) + `idct8_add`, skipped as the decoder skips an
+/// 8x8 with no coefficients.
+pub fn recon8(c: &[i32; 64], ls: &[i32; 64], qp: i32, dst: &mut [u8], off: usize, stride: usize) {
+    if c.iter().all(|&v| v == 0) {
+        return;
+    }
+    let mut d = *c;
+    scale8(&mut d, ls, qp);
+    idct8_add(&d, dst, off, stride);
+}
+
+/// The sum of the absolute values of the n x n (4 or 8) Walsh-Hadamard transform of `r` (row
+/// stride n), unnormalised.
+fn hadamard_abs(r: &[i32], n: usize) -> u32 {
+    let mut t = [0i32; 64];
+    t[..n * n].copy_from_slice(&r[..n * n]);
+    for (stride, step) in [(1usize, n), (n, 1usize)] {
+        // stride 1: along each row (rows step n apart); stride n: along each column.
+        for line in 0..n {
+            let base = line * step;
+            let mut h = 1;
+            while h < n {
+                for j in (0..n).step_by(2 * h) {
+                    for k in j..j + h {
+                        let (a, b) = (t[base + k * stride], t[base + (k + h) * stride]);
+                        t[base + k * stride] = a + b;
+                        t[base + (k + h) * stride] = a - b;
+                    }
+                }
+                h *= 2;
+            }
+        }
+    }
+    t[..n * n].iter().map(|v| v.unsigned_abs()).sum()
+}
+
+/// SATD of a 4x4 residual: the Hadamard sum / 2 (x264's normalisation, about the SAD's scale).
+pub fn satd4(r: &[i32; 16]) -> u32 {
+    hadamard_abs(r, 4) / 2
+}
+
+/// SATD of an 8x8 residual: (the Hadamard sum + 2) >> 2 (x264's sa8d normalisation, comparable
+/// with four [`satd4`]s).
+pub fn satd8(r: &[i32; 64]) -> u32 {
+    (hadamard_abs(r, 8) + 2) >> 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +360,29 @@ mod tests {
                 assert!(e <= step, "qp {qp} k {k}: {e}");
             }
         }
+    }
+
+    /// H264ENC8X8 (SR322): MF8 is JM's quant_coef8 at qP % 6 = 0, and the forward 8x8 transform +
+    /// quantiser + h264_core's `scale8` / `idct8_add` lands within the quantiser's step.
+    #[test]
+    fn forward_8x8_then_shared_inverse_is_near_identity() {
+        assert_eq!((MF8[0][0], MF8[0][1], MF8[0][2], MF8[0][9]), (13107, 12222, 16777, 11428));
+        let ls = LevelScale::new(&ScalingMatrices::FLAT);
+        let mut x = [0i32; 64];
+        for (k, v) in x.iter_mut().enumerate() {
+            *v = ((k * 37) % 23) as i32 - 11;
+        }
+        for (qp, step) in [(16, 4), (26, 13), (40, 52)] {
+            let mut c = fdct8(&x);
+            quant8(&mut c, qp, true);
+            let mut dst = [128u8; 64];
+            recon8(&c, &ls.l8[0][(qp % 6) as usize], qp, &mut dst, 0, 8);
+            for k in 0..64 {
+                let e = (dst[k] as i32 - 128 - x[k]).abs();
+                assert!(e <= step, "8x8 qp {qp} k {k}: {e}");
+            }
+        }
+        // A flat residual is one DC term: |H| sums 16 x 5 and 64 x 5, normalised to 40 and 80.
+        assert_eq!((satd4(&[5; 16]), satd8(&[5; 64])), (40, 80));
     }
 }
