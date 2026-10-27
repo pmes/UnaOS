@@ -2490,7 +2490,7 @@ fn snap_word(d: &timeline_core::view::Drag, playhead: i64) -> &'static str {
 // ── AV1INBANDSIZE (LEDGER SR379): a size switch mid-stream (handlers.md §5 NLEPROBE-HDR's AV1-INBAND-SIZE) ─────────────────────
 // A new coded video sequence (av1_core drops the refs on a really-changed sequence header) may change the picture's size. Every
 // `Frame` carries its own `w` / `h` and `blit_fit` fits each one per call, so the queue and the present need nothing; the export
-// refuses the switch by name (`export.rs` `Exp::sized`). `Pic::decode_raw`'s Av1 arm prints the switch here by av1_core's ONE rule
+// letterboxes it into the first size (`export.rs` `Exp::sized`, EXPORTSIZESCALE B985: [`fit_rgba`] below). `Pic::decode_raw`'s Av1 arm prints the switch here by av1_core's ONE rule
 // (`StreamDecoder::size_switch`, the host `Av1Decoder`'s too). Wire: `[vplay] size switch at <pts ticks> <w>x<h>-><w>x<h>`, once
 // per change.
 
@@ -2501,3 +2501,23 @@ fn inband_size(d: &mut av1_core::image::StreamDecoder, planes: &av1_core::image:
     }
 }
 
+// ── EXPORTSIZESCALE (rmbp-ledger B985): the export's switched frame through the present's ONE scaler (handlers.md §5 NLEPROBE-HDR's EXPORT-SIZE-SCALE) ─
+// `export.rs` `Exp::push_sized` hands a frame of another size than the file's first one here as its straight RGBA (`Px::rgb`,
+// the cached conversion every decoder format reaches): packed into a 0RGB `Frame`, letterboxed into the first size over black by
+// [`blit_fit`] (`yuv_core::scale::fit` + `nearest_rows`; a 0RGB frame is always nearest, so `vid filter area` does not reach it),
+// unpacked for the encoder's RGBA entry. No second scaler, no second letterbox rule.
+
+/// EXPORTSIZESCALE (B985): straight RGBA `w x h` letterboxed into `fw x fh` over black by the present's [`blit_fit`]; None when
+/// the scaler cannot serve it (a zero side, or the RGBA is not `w x h`).
+pub(super) fn fit_rgba(rgba: &[u8], w: usize, h: usize, fw: usize, fh: usize) -> Option<Vec<u8>> {
+    if w == 0 || h == 0 || fw == 0 || fh == 0 || rgba.len() != w * h * 4 {
+        return None;
+    }
+    let f = Frame { pts_ms: 0, w, h, px: Px::from(pack(rgba)), ord: None };
+    let mut dst = alloc::vec![0u32; fw * fh];
+    let (dw, dh) = blit_fit(&mut dst, fw, 0, 0, fw, fh, &f, Some(0));
+    if dw == 0 || dh == 0 {
+        return None;
+    }
+    Some(unpack(&dst))
+}

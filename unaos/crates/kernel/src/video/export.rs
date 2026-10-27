@@ -193,8 +193,8 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, planes: Opt
             e.rgba.cfg.rate = Some(h264enc_core::RateControl::cbr(e.opts.bitrate, (tb.den as u32, tb.num.max(1) as u32)));
         } else if let Some(c) = e.opts.crf { e.rgba.cfg.rate = Some(h264enc_core::RateControl::crf(c, (tb.den as u32, tb.num.max(1) as u32))); } // SR383: `--crf N`, Stria's `with_quality`
     }
-    let sized = e.sized(w, h); // AV1INBANDSIZE (SR379): the first frame fixes the size; a later frame of another size is refused by name (file tail)
-    let r = match sized.and_then(|()| e.push(w, h, planes, rgba).map_err(|err| alloc::format!("{}", err))) {
+    let sized = e.sized(w, h); // AV1INBANDSIZE (SR379): the first frame fixes the size; EXPORTSIZESCALE (rmbp-ledger B985): a later frame of another size is letterboxed into it, refused by name past the scaler (file tail)
+    let r = match sized.and_then(|to| e.push_sized(w, h, to, planes, rgba)) {
         Ok(u) => e.stream_units(u).and_then(|()| e.stream_sound()).map_err(|m| alloc::format!("write-refused: {}", m)),
         Err(err) => Err(alloc::format!("{}", err)),
     };
@@ -724,27 +724,60 @@ impl Exp {
     }
 }
 
-// ── AV1INBANDSIZE (LEDGER SR379): the export refuses a size switch mid-stream by name (handlers.md §5 NLEPROBE-HDR's AV1-INBAND-SIZE) ─
-// The encoder's size is fixed at the first frame (h264enc_core's `RgbaEncoder`, whose `Error::FrameSize` refused a later size
-// unnamed). `frame` asks [`Exp::sized`] before the push: the first frame fixes `size` (no longer rewritten per frame); a later
-// frame of another size is the job's `encode-refused` with the reason below, and the existing `finish` / `abandon` unlinks the
-// partial file. Scaling the switched frames to the first size (yuv_core::scale) is owed: EXPORT-SIZE-SCALE.
+// ── AV1INBANDSIZE (LEDGER SR379) / EXPORTSIZESCALE (rmbp-ledger B985): a size switch mid-stream is scaled to the first size (handlers.md §5 NLEPROBE-HDR's EXPORT-SIZE-SCALE) ─
+// The encoder's size is fixed at the first frame (h264enc_core's `RgbaEncoder`; the avc1 is declared at `size`). `frame` asks
+// [`Exp::sized`] before the push: the first frame fixes `size`; a later frame of another size is LETTERBOXED into it (aspect
+// kept, centred, black bars: SR384's host rule) through the present's ONE scaler, vplay's `blit_fit` (`yuv_core::scale::fit` +
+// `nearest_rows`, reached by vplay's `fit_rgba`), and enters [`Exp::push`]'s existing RGBA arm at the first size (planes None:
+// converted at the file's colour, as a mixed frame is). Refused by name (the job's `encode-refused`; the existing `finish` /
+// `abandon` unlinks the partial file) where the scaler cannot serve it: an area past 4x the first size's, or no `w x h`
+// picture. Wire: `[nle] export size switch <W>x<H>-><w>x<h> scaled`, once per change (at the first frame of each new size; a
+// frame back at the first size prints nothing and re-arms). [`SWITCHED`] holds the size last scaled from: written only by the
+// armed export's `frame` (the Exp out of ENC), an atomic, no lock.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// EXPORTSIZESCALE (B985): the size the export last scaled from, packed `w << 32 | h`; 0 = none (the frame at the first size).
+static SWITCHED: AtomicU64 = AtomicU64::new(0);
 
 impl Exp {
-    /// AV1INBANDSIZE (SR379): the first frame's `w` x `h` fixes the file's size; a later frame of another size is refused by name.
-    fn sized(&mut self, w: usize, h: usize) -> Result<(), String> {
+    /// The first frame's `w` x `h` fixes the file's size (Ok(None)); a later frame of that size is Ok(None); another size is
+    /// Ok(Some(the first size)) to letterbox into, or refused by name past the scaler's 4x area (EXPORTSIZESCALE B985).
+    fn sized(&mut self, w: usize, h: usize) -> Result<Option<(usize, usize)>, String> {
         let now = (w as u32, h as u32);
         if self.frames == 0 {
             self.size = now;
-            return Ok(());
+            SWITCHED.store(0, Ordering::Relaxed);
+            return Ok(None);
         }
         if now == self.size {
-            return Ok(());
+            SWITCHED.store(0, Ordering::Relaxed);
+            return Ok(None);
         }
-        Err(alloc::format!(
-            "size changed mid-stream (AV1-INBAND-SIZE): {}x{} -> {}x{} at frame {}; scaling owed (EXPORT-SIZE-SCALE)",
-            self.size.0, self.size.1, now.0, now.1, self.frames
-        ))
+        let (fw, fh) = (self.size.0 as usize, self.size.1 as usize);
+        if (w as u64) * (h as u64) > 4 * (fw as u64) * (fh as u64) {
+            return Err(alloc::format!(
+                "size changed mid-stream (AV1-INBAND-SIZE): {}x{} -> {}x{} at frame {}: beyond the scaler's 4x area (EXPORT-SIZE-SCALE)",
+                fw, fh, w, h, self.frames
+            ));
+        }
+        let packed = ((now.0 as u64) << 32) | now.1 as u64;
+        if SWITCHED.swap(packed, Ordering::Relaxed) != packed {
+            serial_println!("[nle] export size switch {}x{}->{}x{} scaled", fw, fh, w, h);
+        }
+        Ok(Some((fw, fh)))
+    }
+
+    /// The frame into [`Exp::push`]: as it came (`to` None), or its RGBA letterboxed into `to` by vplay's `fit_rgba` (the
+    /// present's `blit_fit`) and pushed at that size as RGBA (EXPORTSIZESCALE B985).
+    fn push_sized(&mut self, w: usize, h: usize, to: Option<(usize, usize)>, planes: Option<(h264enc_core::Yuv420<'_>, Option<Colour>)>, rgba: impl FnOnce() -> Vec<u8>) -> Result<Vec<h264enc_core::rgba::Unit>, String> {
+        let Some((fw, fh)) = to else { return self.push(w, h, planes, rgba).map_err(|err| alloc::format!("{}", err)) };
+        let Some(scaled) = super::vplay::fit_rgba(&rgba(), w, h, fw, fh) else {
+            return Err(alloc::format!(
+                "size changed mid-stream (AV1-INBAND-SIZE): {}x{} -> {}x{} at frame {}: no {}x{} picture to scale (EXPORT-SIZE-SCALE)",
+                fw, fh, w, h, self.frames, w, h
+            ));
+        };
+        self.push(fw, fh, None, move || scaled).map_err(|err| alloc::format!("{}", err))
     }
 }
-
