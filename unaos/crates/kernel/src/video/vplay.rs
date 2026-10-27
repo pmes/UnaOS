@@ -1832,8 +1832,9 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 /// The kernel face's key bindings (bytes) onto timeline_core's editor verbs: `s` split, `x` / Delete / Backspace delete,
 /// `u` / `z` undo, `Z` redo, `[` / `]` the in point -1 / +1, `{` / `}` the out point -1 / +1, `i` / `o` the in / out point
 /// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
-/// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -).
-const EDIT_KEYS: [(u8, &str); 17] = [
+/// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -); KERNELSIZEKEY (rmbp-ledger B994):
+/// `f` the selected clip's reel's size policy (its fit), cycled (`size`: letterbox -> fill -> stretch -> adopt).
+const EDIT_KEYS: [(u8, &str); 18] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1851,6 +1852,7 @@ const EDIT_KEYS: [(u8, &str); 17] = [
     (b'=', "zoom+"),
     (b'-', "zoom-"),
     (b'0', "zoom0"),
+    (b'f', "size"),
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1909,7 +1911,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         }
         let before = st.timeline.clone();
         match st.verb(verb) {
-            Some(Ok(())) if st.timeline != before => {}
+            Some(Ok(())) if st.timeline != before => edit_size_note(st, verb, at), // KERNELSIZEKEY (rmbp-ledger B994): the reel and its new size policy (file tail)
             Some(Ok(())) => {
                 serial_println!("[nle] edit {} at={} unchanged", verb, at);
                 return None;
@@ -2538,4 +2540,20 @@ fn place_rgba(rgba: Vec<u8>, w: usize, h: usize, fw: usize, fh: usize, fit: time
     c.rect(0, 0, fw as i64, fh as i64, [0, 0, 0, 255]);
     c.blit_policy(&Still { width: w as u32, height: h as u32, rgba }, 0, 0, fw as u32, fh as u32, fit);
     Some(c.px)
+}
+
+// ── KERNELSIZEKEY (rmbp-ledger B994): the kernel face's size key (handlers.md §5 NLEPROBE-HDR's KERNEL-SIZE-KEY) ──────────
+// `f` in [`EDIT_KEYS`] names timeline_core's bare `size` verb (NLESIZEPOLICYUI SR402, `EditorState::verb`'s ONE dispatch):
+// the selected clip's reel cycles its `SizePolicy`. No clip at the playhead is `EditError::NoClip` on [`edit_key`]'s
+// existing refusal line; a change is saved by the ONE writer ([`edit_save`], the EDL's `* UNA SIZE` line). The explicit
+// `size <reel> <policy>` form is owed (KERNEL-SIZE-ARGS: the kernel face has no line editor).
+
+/// KERNELSIZEKEY (rmbp-ledger B994): after `size` changed the timeline, the selected clip's reel and the policy it now
+/// holds: `[nle] edit size <reel> -> <policy> at=<tick>` (before [`edit_key`]'s save line). Any other verb: nothing.
+fn edit_size_note(st: &timeline_core::editor::EditorState, verb: &str, at: i64) {
+    if verb != "size" {
+        return;
+    }
+    let Some(s) = st.selected().and_then(|c| st.timeline.source(c.src)) else { return };
+    serial_println!("[nle] edit size {} -> {} at={}", s.reel, s.size_policy.name(), at);
 }
