@@ -12884,6 +12884,57 @@ run_kernel8() {
         ${UNAOS_QEMU_EXTRA:-}
 }
 
+# PIDESK-SPEC (rmbp-ledger B878): THE ARMED PI DESKTOP'S SPEC, picked in `x86_pick_capture_spec`'s shape. The base
+# battery (pi4-regression.spec) is knob-off, so every `desktop_firmware`-gated line in it is OPTIONAL + FORBID (the
+# DRAG-PI rule) and nothing REQUIREd the Pi desktop's wire. With UNAOS_PIDESK armed (`kernel8-test --desk`), the capture
+# is replayed a SECOND time against pi4-desktop.spec, which carries the positive half (SUITETYPE's second-spec pattern,
+# as pi4-barename.spec). The base spec stays the completion source and owns TRUNCATED; the desktop spec has no COMPLETE.
+PI4_DESKTOP_SPEC="${WORKSPACE_DIR}/scripts/specs/pi4-desktop.spec"
+K8_DESK_SPEC=""   # path of the armed-desktop spec to replay, or "" when none describes this capture
+K8_DESK_WHY=""    # why there is none — printed verbatim in the skip line (empty on the knob-off battery: it stays quiet)
+k8_pick_capture_spec() {
+    K8_DESK_SPEC=""; K8_DESK_WHY=""
+    if [ -z "${UNAOS_PIDESK:-}" ]; then
+        return 0   # the knob-off battery: pi4-regression.spec alone, its output unchanged
+    fi
+    # SHARD-PRESS is `witness`-gated and the drag probes run at registration only under `tests-at-boot`; the lane's
+    # head `case` exports both, so this fires only when a caller cleared one by hand.
+    if [ -z "${UNAOS_WITNESS:-}" ] || [ -z "${UNAOS_TESTS_AT_BOOT:-}" ]; then
+        K8_DESK_WHY="UNAOS_PIDESK is armed but UNAOS_WITNESS='${UNAOS_WITNESS:-}' UNAOS_TESTS_AT_BOOT='${UNAOS_TESTS_AT_BOOT:-}' — pi4-desktop.spec's REQUIREs are the witness-gated SHARD-PRESS and the drag probes that run at registration only under tests-at-boot. Use './arroyo kernel8-test --desk 300' for the gated run."
+        return 0
+    fi
+    K8_DESK_SPEC="$PI4_DESKTOP_SPEC"
+}
+
+# Replay the capture against the armed-desktop spec. $1 = the capture, $2 = the base verdict; returns the COMBINED rc.
+# A base TRUNCATED (3), FLAKE (4) or anything else is returned unchanged and this spec is not asserted (BP-gates-3: a
+# truncated capture is never scored); on a base 0 or 1 the desktop verdict is printed either way and the rc is the base's
+# 1 if it was red, else this spec's.
+k8_desk_replay() {
+    local logf="$1" base="$2" drc=0
+    k8_pick_capture_spec
+    if [ -z "$K8_DESK_SPEC" ]; then
+        if [ -n "$K8_DESK_WHY" ]; then echo -e "${COLOR_YELLOW}⚠ armed-desktop spec replay SKIPPED — ${K8_DESK_WHY}${COLOR_RESET}"; fi
+        return "$base"
+    fi
+    if [ "$base" -ne 0 ] && [ "$base" -ne 1 ]; then
+        echo -e "${COLOR_YELLOW}⚠ armed-desktop spec NOT asserted — the base verdict is rc ${base}, not a complete capture; truncation and flakes are pi4-regression.spec's call.${COLOR_RESET}"
+        return "$base"
+    fi
+    if [ ! -f "$K8_DESK_SPEC" ]; then
+        echo -e "${COLOR_RED}✖ kernel8-test: UNAOS_PIDESK is armed but ${K8_DESK_SPEC} is MISSING — nothing gates the desktop. rc=1${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_CYAN}⚡ mbench: asserting the armed desktop against ${K8_DESK_SPEC#${WORKSPACE_DIR}/}${COLOR_RESET}"
+    python3 "${WORKSPACE_DIR}/scripts/mbench.py" --replay "$logf" --spec "$K8_DESK_SPEC" --platform pi || drc=$?
+    if [ "$drc" -ne 0 ]; then
+        echo -e "${COLOR_RED}✖ kernel8-test: the armed desktop's spec did not pass (rc ${drc}) — a REQUIREd desktop_firmware line is"
+        echo -e "  missing or reads FAIL (its FAIL forbid in pi4-regression.spec says which). Spec: ${K8_DESK_SPEC#${WORKSPACE_DIR}/}${COLOR_RESET}"
+    fi
+    if [ "$base" -ne 0 ]; then return "$base"; fi
+    return "$drc"
+}
+
 # Headless raspi4b test: boot kernel8.img, capture PL011 -> target/serial-pi.log and a QMP
 # screendump of the mailbox framebuffer -> target/pi-screen.png, then self-terminate.
 # MBENCH-HONEST: the DEFAULT WINDOW is 60 s, not the old 8 s. 8 s does not finish a pi4 boot on this
@@ -13128,6 +13179,7 @@ test_kernel8() {
                 echo -e "  in the path that word takes. Script: ${k8_script}${COLOR_RESET}"
             fi
         fi
+        k8_desk_replay "$logf" "$mrc" || mrc=$?   # PIDESK-SPEC (B878): the armed desktop's spec, after the base (and typed) verdicts; rc 3/4 pass through
         return $mrc
     fi
     echo -e "${COLOR_YELLOW}  • UNAOS_K8T_ASSERT=0 — spec assertion SKIPPED; this run carries no verdict${COLOR_RESET}"
@@ -14910,6 +14962,7 @@ case "${1:-}" in
         run_kernel8
         ;;
     kernel8-test|test-pi)
+        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; set -- "$1" "${@:3}"; fi   # PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec
         test_kernel8 "${2:-60}"   # MBENCH-HONEST: 8 s never finished a pi4 boot — see test_kernel8
         ;;
     kernel8-install|install-pi)
@@ -14978,7 +15031,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|gates [--list|--selftest]|jobs-image|twoboot [--card] [--judge <log1> [<log2> [<log3> <log4>]]]|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [--desk] [secs] (the Pi desktop: ./arroyo kernel8-test --desk 300)|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|gates [--list|--selftest]|jobs-image|twoboot [--card] [--judge <log1> [<log2> [<log3> <log4>]]]|clean]"
         exit 1
         ;;
 esac
