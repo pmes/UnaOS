@@ -29,7 +29,7 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
    `./arroyo esp-zenbook` (esp-x86 under that file after every inherited `UNAOS_*` is unset, bar four bench values); the
    check leg `x86-zenbook-image`; um5606w.md §5/§6. Owed: ZENBOOK-OLDEST in flight (ZENBOOKOLDEST, Z12: ONE `boot::oldest()`, the cfg
    default overridden by `hw::platform()`: the Zenbook prints zenbook 2024, `@zenbook` bootlist lines), ZENBOOK-QEMULANE (an arroyo `test` lane with the Zenbook knobs), ZENBOOK-LINEGATE (a
-   `knob-parity-zenbook` gates row running the x86 `--line` mode on the file) — both in flight (ZENBOOKLANE, Z13: `./arroyo test-zenbook`, x86-zenbook.spec, `UNAOS_PLATFORM`; the typed verdicts owed as ZENBOOK-LANETYPED); row 1's recipe should name esp-zenbook.
+   `knob-parity-zenbook` gates row running the x86 `--line` mode on the file) — both in flight (ZENBOOKLANE, Z13: `./arroyo test-zenbook`, x86-zenbook.spec, `UNAOS_PLATFORM`; the typed verdicts: in flight (ZENBOOKLANETYPED, Z16: the first-user form and six `tests <verb>` lines through ONE typist, `unaos/scripts/typist.sh`)); row 1's recipe should name esp-zenbook.
    bdf=<b:d.f>` off the glass, and if the FTDI did not bind rebuild with `UNAOS_XHCI_PICK=<i>` for the next i (Z7). Expected first lines and refusals: um5606w.md §6. Bench only, Peter's go.
 3. **ZENBOOK-NVME** — `drivers/nvme.rs` (class 0108, vendor varies): the root volume. Rung 1 ZENBOOKNVME (Z2); in flight (NVMEBOOT, Z9: the handle, the root grant, the granted write).
 4. **ZENBOOK-I8042** — `drivers/i8042.rs`: the internal keyboard on the EC's 8042 into the input route. In flight
@@ -68,8 +68,8 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
     `cfg(feature = "unaos_ivb")`, which the builder passes only under UNAOS_IVB (`unaos/builder/src/main.rs:1235`); the
     Zenbook line carries no IVB and `esp-zenbook` unsets an inherited one. An rMBP-line image booted on the Zenbook
     still runs them (the SMBIOS-gated loader variant stays unbuilt).
-15. **ZENBOOK-BPROW** — `docs/dev/blueprint/boot.md` has no platform table (measured by Z1): a row per board (loader,
-    image line, oldest const, platform token) is the seat's call; until then the Zenbook's boot path is um5606w.md.
+15. **ZENBOOK-BPROW** — In flight (ZENBOOKLANETYPED, Z16): `docs/dev/blueprint/boot.md` §1 gains the boards table (loader,
+    image line and media verb, oldest, platform token, the QEMU lane of the line, the first-boot doc), one row per board.
 16. **ZENBOOK-LEDGERGATE** — `unaos/scripts/ledger-check.sh` knows the owners {orin, pi, rmbp, shared-gate} and the
     queue files {QUEUE, rmbp, orin, pi}; teach it `zenbook` and this file (Z1's row carries `rmbp` meanwhile).
 17. **ZENBOOK-MODEL** — Peter's to settle: the arc calls the machine the "Zenbook S 14 OLED"; ASUS's numbering makes

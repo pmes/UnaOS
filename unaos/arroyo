@@ -10576,10 +10576,16 @@ test_splash() {
 # SECOND PASS: twoboot's arm, three idioms: a fresh card (target/sdcard.img deleted, so the store is empty and the boot
 # reaches the first-user form), the lane's own spec as X86_TEST_SPEC (its COMPLETE ends FASTTEST's wall; its REQUIREs are
 # scored by `x86_test_completion` and replayed by `x86_spec_replay`), and SELFBUILD's toolchain staging stubbed (the line
-# arms SELFHOST). Then `test_x86_64`, whose verdict is this verb's. The typed `tests platform|ec|nvme|i8042` verdicts need
-# a session (the first-user form typed): ZENBOOK-LANETYPED, owed.
+# arms SELFHOST). Then `test_x86_64`, whose verdict is this verb's.
+# ZENBOOKLANETYPED (zenbook-ledger Z16): THE TYPED SECOND PHASE. The fixtures register only from the `tests` verb, which
+# needs a session, and `tests` runs ONE fixture per line (`tests::shell_verb`: the second word is the fixture's ARG). So
+# ONE typist — scripts/typist.sh, twoboot's `typist_start` lifted (called, never copied) — rides this lane's own QMP port
+# (`-qmp` in UNAOS_QEMU_EXTRA, twoboot's idiom; test_x86_64 arms none for this lane) and types the first-user form, then
+# `tests platform|ec|nvme|i8042|dwi2c|bootlist` one line each, every line held on the previous line's verdict. The spec's
+# COMPLETE is the last verdict. The typist connects to QMP before it reads a marker, and the QMP socket exists only after
+# test_x86_64 has removed the old capture, so it never reads a stale log. Transcript: target/zenbook-typist.log (beside it).
 test_zenbook() {
-    local secs="${1:-90}"
+    local secs="${1:-180}"
     if [ -z "${UNAOS_ZENBOOKLANE:-}" ]; then
         local _zk="" _zv
         for _zv in $(compgen -e); do case "$_zv" in UNAOS_QEMU_MACHINE|UNAOS_QMP_PORT) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
@@ -10587,11 +10593,35 @@ test_zenbook() {
         set -a; . <(awk '!index($0, "# [media]")' "$WORKSPACE_DIR/scripts/image-line-zenbook.env") || exit 1; set +a
         exec env UNAOS_ZENBOOKLANE=1 UNAOS_PLATFORM=zenbook_um5606w UNAOS_CENSUS=1 UNAOS_USBSERIAL=1 "$0" test-zenbook "$secs"
     fi
-    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: the Zenbook line as zenbook_um5606w on a fresh card, to the first-user form (${secs}s wall, spec ${X86_ZENBOOK_SPEC#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: the Zenbook line as zenbook_um5606w on a fresh card, the first-user form typed, then six typed verbs (${secs}s wall, spec ${X86_ZENBOOK_SPEC#${WORKSPACE_DIR}/})${COLOR_RESET}"
     rm -f "${WORKSPACE_DIR}/target/sdcard.img"
     X86_TEST_SPEC="$X86_ZENBOOK_SPEC"
     build_selfbuild_x86() { echo "   ZENBOOKLANE: SELFBUILD staging not entered (build_selfbuild_x86 stubbed, as the twoboot arm does)"; }
-    test_x86_64 "$secs"
+    zenbook_lane_typed "$secs"   # ZENBOOKLANETYPED (Z16): the typist + test_x86_64; its rc is this verb's
+}
+
+# ZENBOOKLANETYPED (zenbook-ledger Z16): `test_zenbook`'s second phase — ONE typist (scripts/typist.sh) on this lane's QMP
+# port, the first-user form then six `tests <verb>` lines, each held on the verdict before it; then `test_x86_64`.
+zenbook_lane_typed() { # $1 = the wall (s)
+    local secs="$1" rc=0 zport="${UNAOS_QMP_PORT:-4470}" tlog="${WORKSPACE_DIR}/target/zenbook-typist.log" v prev
+    while lsof -iTCP:"$zport" -sTCP:LISTEN >/dev/null 2>&1; do zport=$((zport + 1)); done
+    export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -qmp tcp:127.0.0.1:${zport},server,nowait"
+    . "${WORKSPACE_DIR}/scripts/typist.sh"
+    TYPIST_PORT="$zport" TYPIST_LOG="$SERIAL_LOG"
+    local -a zph=("$FIRSTUSER_PHASE")
+    prev="[desktop] built at="
+    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C bootlist:BOOTLIST; do
+        local done_mark=":: ${v#*:}: "; [ "${v%%:*}" = bootlist ] && done_mark=":: BOOTLIST: probe"
+        zph+=("${prev}|tests ${v%%:*}|t:tests spc t:${v%%:*} ret|${done_mark}")
+        prev="$done_mark"
+    done
+    mkdir -p "${WORKSPACE_DIR}/target"; rm -f "$tlog"
+    typist_start "$tlog" "$secs" "${zph[@]}"
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: typist armed on QMP :${zport} — the first-user form, then tests platform/ec/nvme/i8042/dwi2c/bootlist (transcript ${tlog#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    test_x86_64 "$secs" || rc=$?
+    wait "$typist" 2>/dev/null || true
+    awk '/^\[typist\]/ { print "ZENBOOKLANE:   " $0 }' "$tlog" 2>/dev/null || true
+    return "$rc"
 }
 
 # SPLASHGATE — the two splash witnesses are IN THE BOOTED ELF, counted, with both controls.
@@ -15077,7 +15107,7 @@ case "${1:-}" in
     test-zenbook|test_zenbook)
         # ZENBOOKLANE (zenbook-ledger Z13): the Zenbook line under QEMU as zenbook_um5606w. Re-execs itself (see
         # test_zenbook), so this arm is entered twice per invocation. Fold-gate command, not a leg of `check`.
-        test_zenbook "${2:-90}"
+        test_zenbook "${2:-180}"   # ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
         ;;
     kernel8|baremetal)
         _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do
