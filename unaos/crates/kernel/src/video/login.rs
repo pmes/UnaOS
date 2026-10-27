@@ -962,7 +962,7 @@ pub fn consume_key(c: u8) -> bool {
     // mutex take and one relaxed load, and it answers `false`.
     heal_if_row_gone();
     crate::boot::key_taken(); // INSTALLBARE M2 (R86): `[login] key latency ms=` — the EHCI decode's stamp to here
-    submit_drain(); // INPUTSTALL M5: an outcome that landed since the last pass applies before this key is read
+    kb_drain_key(); // INPUTSTALL M5: an outcome that landed since the last pass applies before this key is read. KEYBOOT4 (B864): `submit_drain` labelled `on=key` (tail)
     if submit_busy() {
         return true; // INPUTSTALL M5: a submit is on the worker — the form takes no keys until its outcome lands
     }
@@ -2358,7 +2358,7 @@ fn dispatch_old(job: Job, n: &[u8], p: &[u8], o: &[u8]) {
     w.old[..w.olen].copy_from_slice(&o[..w.olen]);
     let windowed = FORM.lock().windowed || kb_off_render(job); // KEYBOOT2 (B810): the unlock's KDF takes the worker windowed or headless, never the render/input task (LINE-NEUTRAL fold, code first; body at the tail)
     if windowed && kb_worker(job).is_some() && !BUSY.swap(true, Ordering::AcqRel) { // KEYBOOT3 (B856): `kb_worker` — x86 `worker_core()` for every job (unchanged); the Pi's unlock on a worker core (tail). LINE-NEUTRAL
-        let _ = DONE.lock().take(); // a late outcome of a released submit is never applied to this one
+        let _ = DONE.lock().take(); kb_woke_clear(); // a late outcome of a released submit is never applied to this one. KEYBOOT4 (B864): nor labelled by its late wake (LINE-NEUTRAL, body at the tail)
         *WORK.lock() = Some(w);
         // SAFETY: a plain store into our own local; volatile so the scrub of the password copy is not elided.
         unsafe { core::ptr::write_volatile(&mut w.pw, [0; FIELD_MAX]); core::ptr::write_volatile(&mut w.old, [0; FIELD_MAX]) };
@@ -2401,7 +2401,7 @@ fn submit_worker(_: usize) {
     let (out, kdf_ms, adduser_ms) = compute(&w);
     w.pw = [0; FIELD_MAX];
     w.old = [0; FIELD_MAX];
-    *DONE.lock() = Some(Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: true, blocked_ms: 0 });
+    *DONE.lock() = Some(Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: true, blocked_ms: 0 }); kb_wake(); // KEYBOOT4 (B864): posted, THEN the render task woken (the Pi's registered hook; none on x86). LINE-NEUTRAL, body at the tail
 }
 
 /// The render task's drain: apply a landed outcome (called from the render loop's pulse and ahead of every
@@ -2432,7 +2432,7 @@ pub fn submit_drain() { crate::video::lock::service(); civil_tick(); // CLOCKPAI
             f.message = "";
         }
     }
-    say(&d, outcome_word(&d.out));
+    say(&d, outcome_word(&d.out)); kb_drained(&d.out); // KEYBOOT4 (B864): `[login] unlock drained on=<wake|tick|key>` (LINE-NEUTRAL, body at the tail)
     apply(&d);
     BUSY.store(false, Ordering::Release);
     repaint();
@@ -3505,7 +3505,7 @@ pub fn consume_char(ch: char) -> bool {
     }
     heal_if_row_gone();
     crate::boot::key_taken();
-    submit_drain();
+    kb_drain_key(); // KEYBOOT4 (B864): `submit_drain` labelled `on=key` (tail)
     if submit_busy() || PFOCUS.load(Ordering::Relaxed) != 0 {
         return true;
     }
@@ -3763,7 +3763,7 @@ pub fn textscale_rows() -> (usize, bool) {
 fn kb_worker(job: Job) -> Option<usize> {
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     {
-        if !kb_off_render(job) {
+        if !kb_arm_job(job) { // KEYBOOT4 (B864): the unlock AND the create/verify submits (ARMSUBMIT; the audit at `kb_arm_job`)
             return None;
         }
         let o = crate::arch::smp::online_secondaries();
@@ -3809,4 +3809,70 @@ pub fn kb_arm_drain() {
     if submit_busy() {
         submit_drain();
     }
+}
+
+// ── KEYBOOT4 (rmbp-ledger B864) — TAIL-APPENDED: the worker WAKES the render task; the Pi's create/verify on the worker ─
+// KEYBOOT3 put the Pi's unlock on a worker core, but its outcome waited for the render task's next wake: the 250 ms
+// status tick on metal, and on QEMU raspi4b (no live timer, so no `status-tick` task) the next KEY. Now the worker
+// posts DONE and calls ONE registered hook — the Pi binary registers `gui_send(Event::Timer)` under `status_tick`'s
+// own `SCREEN_APP_ACTIVE` gate at the render task's spawn (main.rs, the `register_fb_present_hook` shape) — so the
+// render pass's `kb_arm_drain` applies it at once. The hook is copied out of `KB_WAKE` and called with NO lock held;
+// it must be IRQ-safe and must never wait on the render task (`gui_send` is: one counter bump and a channel post the
+// render task drains). x86 registers none (its pulse drains, X86WAKE owed). The drain says how it ran: `[login] unlock
+// drained on=<wake|tick|key>`. ARMSUBMIT: on the Pi `kb_worker` admits the create/verify submits too (`kb_arm_job`).
+
+/// KEYBOOT4: the render-task wake the worker calls after posting its outcome (`None`: nothing registered — x86).
+static KB_WAKE: crate::sync::Mutex<Option<fn()>> = crate::sync::Mutex::new(None);
+/// KEYBOOT4: the worker's wake was posted for the outcome now in `DONE` (swapped false by the drain's label).
+static KB_WOKE: AtomicBool = AtomicBool::new(false);
+/// KEYBOOT4: a drain is running ahead of a key (`consume_key` / `consume_char`).
+static KB_VIA_KEY: AtomicBool = AtomicBool::new(false);
+
+/// KEYBOOT4: register the render task's wake (the Pi binary, once, at the render task's spawn). IRQ-safe, never
+/// waits on the render task.
+pub fn kb_wake_hook(f: fn()) {
+    *KB_WAKE.lock() = Some(f);
+}
+
+/// KEYBOOT4: the worker's half — the outcome is posted; wake the render task (copied out, called with no lock held).
+fn kb_wake() {
+    let f = *KB_WAKE.lock();
+    if let Some(f) = f {
+        KB_WOKE.store(true, Ordering::Release);
+        f();
+    }
+}
+
+/// KEYBOOT4: a new submit's dispatch — a released submit's late wake never labels the next drain.
+fn kb_woke_clear() {
+    KB_WOKE.store(false, Ordering::Release);
+}
+
+/// KEYBOOT4: the key paths' drain — `submit_drain`, labelled `on=key`.
+fn kb_drain_key() {
+    KB_VIA_KEY.store(true, Ordering::Relaxed);
+    submit_drain();
+    KB_VIA_KEY.store(false, Ordering::Relaxed);
+}
+
+/// KEYBOOT4: `[login] unlock drained on=<wake|tick|key>` — once per applied unlock outcome: `key` ahead of a key,
+/// `wake` on a pass after the worker's wake was posted, else `tick` (a pulse found it).
+fn kb_drained(o: &Outcome) {
+    let woke = KB_WOKE.swap(false, Ordering::AcqRel);
+    if !matches!(o, Outcome::VolUnlock { .. }) {
+        return;
+    }
+    let on = if KB_VIA_KEY.load(Ordering::Relaxed) { "key" } else if woke { "wake" } else { "tick" };
+    serial_println!("[login] unlock drained on={} (KEYBOOT4: the worker's outcome applied on the render task)", on);
+}
+
+/// KEYBOOT4 (ARMSUBMIT): the jobs the Pi gives a worker core — the unlock, and the create / verify submits (create-user,
+/// the login screen's user, the lock screen's unlock). THE AUDIT: they take `TABLE` and `SESSION_LOCAL` (`sync::Mutex`,
+/// BP-cores-20: no raw spin lock outside sync.rs, all in the death walk BP-cores-14), run PBKDF2 / Argon2id with no lock
+/// held, and reach the medium only through the masked `with_unafs` (MOUNT) / `card_lock` (CARD) accessors KEYBOOT3's
+/// unlock worker already takes on that core; the worker is never the input core (BP-cores-3: `online.last()`), and x86
+/// has run this same `compute` on `login-submit` since INPUTSTALL M5 (B375). SetPw and Root stay inline (PISETPW owed).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn kb_arm_job(job: Job) -> bool {
+    matches!(job, Job::VolUnlock { .. } | Job::Create | Job::User | Job::Unlock)
 }
