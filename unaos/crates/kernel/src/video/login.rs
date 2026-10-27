@@ -2245,7 +2245,7 @@ struct Done {
     kdf_ms: u64,
     adduser_ms: u64,
     on_worker: bool,
-    blocked_ms: u64,
+    blocked_ms: u64, masked_ms: u64, on_cpu: usize, pump_cpu: usize, // LOGINSTALL (B1008): the submit's longest masked UnaFS span (any core) and where it ran vs the hid pump (`submit_place`, tail)
 }
 
 static WORK: crate::sync::Mutex<Option<Work>> = crate::sync::Mutex::new(None);
@@ -2329,8 +2329,8 @@ fn apply(d: &Done) {
 fn say(d: &Done, job: &str) {
     SUBMITS.fetch_add(1, Ordering::Relaxed);
     serial_println!(
-        "[login] submit kdf_ms={} adduser_ms={} on={} input_blocked_ms={} kind={}",
-        d.kdf_ms, d.adduser_ms, if d.on_worker { "worker" } else { "render" }, d.blocked_ms, job
+        "[login] submit kdf_ms={} adduser_ms={} on={} input_blocked_ms={} kind={} masked_ms={} on_cpu={} pump_cpu={}",
+        d.kdf_ms, d.adduser_ms, if d.on_worker { "worker" } else { "render" }, d.blocked_ms, job, d.masked_ms, d.on_cpu, PumpCpu(d.pump_cpu)
     );
 }
 
@@ -2371,10 +2371,10 @@ fn dispatch_old(job: Job, n: &[u8], p: &[u8], o: &[u8]) {
         }
         kb_spawn_arm(job); return; // KEYBOOT3 (B856): the Pi's `login-submit` spawn (tail; a no-op on x86, which spawned above). LINE-NEUTRAL
     }
-    let (out, kdf_ms, adduser_ms) = compute(&w);
+    let _ = crate::hidstall::scope_masked_take(); let (out, kdf_ms, adduser_ms) = compute(&w); let (masked_ms, on_cpu, pump_cpu) = submit_place(); // LOGINSTALL (B1008): the scope opened before the slow half, read after it (LINE-NEUTRAL fold, code first; body at the tail)
     w.pw = [0; FIELD_MAX];
     w.old = [0; FIELD_MAX];
-    let d = Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: false, blocked_ms: crate::arch::ms().saturating_sub(t0) };
+    let d = Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: false, blocked_ms: crate::arch::ms().saturating_sub(t0), masked_ms, on_cpu, pump_cpu };
     say(&d, job_word(job));
     apply(&d);
 }
@@ -2398,10 +2398,10 @@ fn submit_worker(_: usize) {
         BUSY.store(false, Ordering::Release);
         return;
     };
-    let (out, kdf_ms, adduser_ms) = compute(&w);
+    let _ = crate::hidstall::scope_masked_take(); let (out, kdf_ms, adduser_ms) = compute(&w); let (masked_ms, on_cpu, pump_cpu) = submit_place(); // LOGINSTALL (B1008): as the inline arm (LINE-NEUTRAL fold, code first; body at the tail)
     w.pw = [0; FIELD_MAX];
     w.old = [0; FIELD_MAX];
-    *DONE.lock() = Some(Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: true, blocked_ms: 0 }); kb_wake(); // KEYBOOT4 (B864): posted, THEN the render task woken (the Pi's registered hook; none on x86). LINE-NEUTRAL, body at the tail
+    *DONE.lock() = Some(Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: true, blocked_ms: 0, masked_ms, on_cpu, pump_cpu }); kb_wake(); // KEYBOOT4 (B864): posted, THEN the render task woken (the Pi's registered hook; none on x86). LINE-NEUTRAL, body at the tail
 }
 
 /// The render task's drain: apply a landed outcome (called from the render loop's pulse and ahead of every
@@ -3977,4 +3977,25 @@ fn rescaled(id: wm::WinId) -> bool {
     RESCALES.fetch_add(1, Ordering::Relaxed);
     serial_println!("[textscale] rescale win=login s2={}->{} old={} new={} cap={}", a, b, id, new, cap);
     true
+}
+
+// ── LOGINSTALL (rmbp-ledger B1008): the submit line says its own masked span and placement ─────────────────────────
+// Flight 38's `masked_max_ms=2940` was read as the login's KDF; the capture put it 31 s later (the `unafslock` fixture's
+// fallback read, task 67 on cpu3). So the submit says what it saw: `masked_ms=` = the longest masked UnaFS attempt on ANY
+// core between the take before `compute` and the take here (`hidstall::scope_masked_take`, REGISTRYCHUNK B508's scope;
+// its other reader, fs/assoc.rs's registry build, runs at the desktop build after the outcome is applied), `on_cpu=` the
+// core that ran the slow half, `pump_cpu=` the hid pump's (`hidstall::pump_cpu`, `none` before it starts).
+// Wire: `[login] submit kdf_ms= adduser_ms= on= input_blocked_ms= kind= masked_ms=<n> on_cpu=<c> pump_cpu=<c|none>`.
+
+/// LOGINSTALL: (masked_ms, on_cpu, pump_cpu) right after a submit's `compute`, on the task that ran it.
+fn submit_place() -> (u64, usize, usize) {
+    (crate::hidstall::scope_masked_take(), crate::arch::percpu::this_cpu().cpu_index as usize, crate::hidstall::pump_cpu())
+}
+
+/// LOGINSTALL: `pump_cpu=` as a core number, `none` while no hid pump has started (`usize::MAX`).
+struct PumpCpu(usize);
+impl core::fmt::Display for PumpCpu {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0 == usize::MAX { f.write_str("none") } else { write!(f, "{}", self.0) }
+    }
 }
