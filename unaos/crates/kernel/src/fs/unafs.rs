@@ -789,8 +789,8 @@ enum Attempt<R> {
 ///
 /// UNAFSTXN: `f` is `FnMut` rather than `FnOnce` because a transaction that dies on a transient
 /// `Busy` is RESTARTED — see [`with_unafs`]'s restart loop and [`TXN_BUSY_ATTEMPTS`].
-fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R> {
-    crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
+fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R, arm: bool) -> Attempt<R> {
+    attempt_span(arm, || { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
         let mut guard = MOUNT.lock(); let _own = crate::lockowner::own(crate::lockowner::UNAFS); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if splitwrite::ticket_foreign() { return Attempt::Restart; } #[cfg(target_arch = "x86_64")] mount_poison_check(&mut *guard); // POISON2 (B846) MOUNTPOISON: a dead holder's mark discards the in-RAM instance before anything reads it (file tail; LINE-NEUTRAL, before this comment). UNAFSWRITE (B825): another task's commit is writing with MOUNT released — leave MOUNT untouched and restart (LINE-NEUTRAL, before this comment). STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
         // UNAFSTXN: open the attempt's contention window, INSIDE the hold. Clearing it before the
         // acquire would be an SMP bug: a core waiting on `MOUNT` would wipe the latch belonging to
@@ -892,12 +892,12 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R
 /// the caller left us unmasked, and spin-hint otherwise. Either way the wait is OUTSIDE the
 /// attempt's own `without_interrupts` span: the F1–F4 rule that no masked span may wait on a driver
 /// lock is not weakened by this loop, it is what the loop is built out of.
-#[track_caller] pub fn with_unafs<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+#[track_caller] pub fn with_unafs<R>(f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> { with_unafs_arm(f, false) } #[track_caller] #[inline(always)] fn with_unafs_arm<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R, read: bool) -> Result<R, MountError> { // UNAFSREADUNMASKED (B1035): with_unafs = the masked arm; with_unafs_read (file tail) = the same loop, read = true (LINE-NEUTRAL, code first)
     let start = crate::arch::now_cycles();
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked_since(t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); let arm = attempt_arm(read); let a = with_unafs_attempt(&mut f, arm); note_attempt(arm, t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
@@ -3054,7 +3054,7 @@ pub mod splitread {
     pub fn note_bound(handle: block::BlockHandle) {
         let span = SPANS.lock().iter().find(|(h, _)| *h == handle).map(|e| e.1);
         let epoch = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
-        *BOUND.lock() = span.map(|span| Bound { epoch, handle, span });
+        *BOUND.lock() = span.map(|span| Bound { epoch, handle, span }); super::readarm::note_bound(handle); // UNAFSREADUNMASKED (B1035): every install records whether its medium takes the read arm
     }
 
     /// Why a split read returned no bytes (the caller maps these to its own error type).
@@ -3103,7 +3103,7 @@ pub mod splitread {
 
     /// One split try (the B670 body): plan under MOUNT, the data blocks off it, the check under MOUNT.
     fn try_split(path: &str, offset: u64, len: u64, st: &mut super::lockhold::Stats, data_us: &mut u64) -> Try {
-        let planned = with_unafs(|fs| {
+        let planned = with_unafs_read(|fs| {
             let h0 = crate::hidstall::now_us();
             let r = (|| -> Result<Option<Plan>, ReadMiss> {
                 let id = fs.resolve_path(path).map_err(|_| ReadMiss::NoSuchPath)?;
@@ -3121,7 +3121,7 @@ pub mod splitread {
         let plan = match plan { Ok(Some(p)) => p, Ok(None) => return Try::Whole, Err(e) => return Try::Done(Err(e)) }; // no bound identity noted, or a ciphered root: the fallback
         let t1 = crate::hidstall::now_us(); let data = read_extents(&plan, offset, len);
         *data_us += crate::hidstall::now_us().saturating_sub(t1); super::lockhold::kat_inject(); // `tests unafslock` KAT only: a commit between the data and the check
-        let checked = with_unafs(|fs| {
+        let checked = with_unafs_read(|fs| {
             let h0 = crate::hidstall::now_us();
             let same = fs.root_generation() == plan.root_gen && BOUND.lock().as_ref().map(|b| b.epoch) == Some(plan.bound.epoch);
             (same, crate::hidstall::now_us().saturating_sub(h0))
@@ -5232,7 +5232,7 @@ pub mod lockhold {
             let (mut id, mut gen0, mut end, mut at) = (0u64, 0u64, 0u64, offset);
             let mut first = true;
             let restart = loop {
-                let held = with_unafs(|fs| {
+                let held = with_unafs_read(|fs| {
                     let h0 = crate::hidstall::now_us();
                     let r = (|| -> Result<Option<Vec<u8>>, ReadMiss> {
                         if first {
@@ -5336,5 +5336,119 @@ pub mod lockhold {
             if chunked { "ok" } else { "FAIL" }
         );
         (retry, chunked, b.hold_max_us)
+    }
+}
+
+// ── UNAFSREADUNMASKED (rmbp-ledger B1035, BP-storage-8 / BP-cores-23) — the MOUNT hold for READS runs preempt-off with interrupts
+// ON. Measured: no ISR touches MOUNT (every take is task context), so its mask was holder non-preemption only (PREEMPTAUDIT class
+// II) — what `preemptoff::scoped` gives. `with_unafs_read` is `with_unafs`'s own loop with `read = true` (`with_unafs_arm`, :895);
+// each attempt picks its span ONCE (`attempt_arm`): preempt-off when the read arm is asked for and the bound medium takes it, else
+// the mask exactly as before. The medium is recorded at every install (`splitread::note_bound`, :3057): the card, an AHCI port or
+// the NVMe namespace take it; an xHCI-backed mount (Global / Usb) keeps the mask, because an UNMASKED `claim_xhci_for_io` waits in
+// an `hlt` loop up to `hw_wait_budget()` and, under preempt-off, a preemptible loan holder on the same CPU could never run. The
+// callers are the split read's plan/check holds and the chunked fallback's per-run holds (`splitread`, `lockhold`); writes and every
+// other caller stay masked (UNAFS-WRITE-UNMASKED owed). A read attempt is not a masked span, so it feeds no masked meter; the first
+// one over 10 ms says ONE `[unafs] hold` line. At the tail: no line above moves.
+
+/// UNAFSREADUNMASKED: the attempt's span — preempt-off (interrupts as the caller had them) on the read arm, else the mask. The
+/// `#[track_caller]` keeps CLOCKCORE's masked-span site at the call (`unafs.rs:793`).
+#[track_caller]
+#[inline(always)]
+fn attempt_span<R>(arm: bool, f: impl FnOnce() -> R) -> R {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        if arm {
+            return crate::arch::sched::preemptoff::scoped(f);
+        }
+    }
+    let _ = arm;
+    crate::arch::without_interrupts(f)
+}
+
+/// UNAFSREADUNMASKED: does this attempt take the read arm? Asked for (`read`) and the bound medium takes it; false off `wc`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[inline(always)]
+fn attempt_arm(read: bool) -> bool {
+    read && readarm::irq_on()
+}
+
+/// UNAFSREADUNMASKED: off `wc` there is no read arm.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[inline(always)]
+fn attempt_arm(_read: bool) -> bool {
+    false
+}
+
+/// UNAFSREADUNMASKED: the attempt's span ended — a masked one feeds HIDSTALL's meters at `with_unafs`'s caller (unchanged); a read
+/// arm one is not masked and only says the once-a-boot hold line.
+#[track_caller]
+#[inline(always)]
+fn note_attempt(arm: bool, t0_us: u64) {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    {
+        if arm {
+            readarm::note_hold(t0_us);
+            return;
+        }
+    }
+    let _ = arm;
+    crate::hidstall::note_masked_since(t0_us)
+}
+
+/// UNAFSREADUNMASKED: run a READ-ONLY `f` against the one coherent mount — [`with_unafs`]'s loop (restart, RENDERWEDGE bound,
+/// ticket, poison, lockowner unchanged) with the attempt preempt-off and interrupts ON when the bound medium takes the read arm.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[track_caller]
+pub fn with_unafs_read<R>(f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+    with_unafs_arm(f, true)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod readarm {
+    use super::*;
+    use core::sync::atomic::AtomicBool;
+
+    /// The bound mount's medium takes the read arm. Written only inside a MOUNT hold (every install's `note_bound`); false until
+    /// the first bind (the mask). Stale after a discard until the next bind.
+    static IRQ_ON: AtomicBool = AtomicBool::new(false);
+    /// The `[unafs] hold` line is said (once a boot).
+    static SAID: AtomicBool = AtomicBool::new(false);
+    /// A read attempt longer than this says the hold line.
+    pub const HOLD_LINE_MS: u64 = 10;
+
+    /// `splitread::note_bound`'s fold: a mount was installed on `handle`.
+    pub fn note_bound(handle: block::BlockHandle) {
+        IRQ_ON.store(medium_irq_on(handle), Ordering::Relaxed);
+    }
+
+    /// The read arm may run with interrupts on (the bound medium is not xHCI-backed).
+    pub fn irq_on() -> bool {
+        IRQ_ON.load(Ordering::Relaxed)
+    }
+
+    /// EXHAUSTIVE on purpose (no wildcard, `bind_probe_admitted`'s discipline): a new handle is an E0004 here, so its read-arm
+    /// verdict is decided in the commit that adds it. Global / Usb are xHCI BOT on x86 (`claim_xhci_for_io`): the mask.
+    fn medium_irq_on(handle: block::BlockHandle) -> bool {
+        match handle {
+            block::BlockHandle::Global => false,
+            block::BlockHandle::Usb => false,
+            #[cfg(feature = "sdhcblk")]
+            block::BlockHandle::Sdhc => true,
+            #[cfg(feature = "ahci")]
+            block::BlockHandle::Ahci { .. } => true,
+            #[cfg(feature = "nvme")]
+            block::BlockHandle::Nvme => true,
+        }
+    }
+
+    /// A read-arm attempt that began at `t0_us` ended; the first one over [`HOLD_LINE_MS`] says the line, at `with_unafs_read`'s caller.
+    #[track_caller]
+    pub fn note_hold(t0_us: u64) {
+        let ms = crate::hidstall::now_us().saturating_sub(t0_us) / 1000;
+        if ms > HOLD_LINE_MS && !SAID.swap(true, Ordering::Relaxed) {
+            let site = core::panic::Location::caller();
+            let file = site.file().rsplit('/').next().unwrap_or(site.file());
+            serial_println!("[unafs] hold why=read masked=0 ms={} site={}:{} (UNAFSREADUNMASKED B1035)", ms, file, site.line());
+        }
     }
 }

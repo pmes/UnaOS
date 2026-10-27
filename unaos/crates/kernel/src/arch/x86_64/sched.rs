@@ -9498,12 +9498,12 @@ pub mod preemptoff {
 
     /// PREEMPTOFFAUDIT M1: the census of the x86 kernel's `without_interrupts` call sites (cores.md §4, the Z57 row): 178
     /// sites at 611cf90b9, corrected by PREEMPTOFFFAT Z65: fat.rs:1027/:1133 are aarch64-only, so 176 — 13 I (ISR or CPU
-    /// state), 136 II (holder non-preemption only), 27 III (both); ONE converted to preempt-off (`block::hold::with`).
+    /// state), 136 II (holder non-preemption only), 27 III (both); ONE converted to preempt-off (`block::hold::with`); B1035: the MOUNT site READS only.
     pub const AUDIT_SITES: u32 = 176;
     pub const AUDIT_ISR: u32 = 13;
     pub const AUDIT_HOLDER: u32 = 136;
     pub const AUDIT_BOTH: u32 = 27;
-    pub const AUDIT_CONVERTED: u32 = 1;
+    pub const AUDIT_CONVERTED: u32 = 1; pub const AUDIT_CONVERTED_UNAFS: u32 = cfg!(feature = "wc") as u32; // UNAFSREADUNMASKED (rmbp-ledger B1035): the MOUNT hold (`fs/unafs.rs` `attempt_span`, was :793) runs preempt-off for READS on a card/AHCI/NVMe medium (`with_unafs_read`); it still masks writes, so the site stays in the census and in II (sites=/holder= unchanged, Z65's rule)
 
     /// `tests preemptaudit`: take the block hold from a task with interrupts ON; inside it interrupts must still be on,
     /// a timer tick must arrive on this CPU, and nothing may switch this task out (Z52's reading).
@@ -9565,12 +9565,12 @@ pub mod preemptoff {
         };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word, lw, lw_us, pp
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, sdhc_word, lw, lw_us, pp
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} -> FAIL reason={} ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word,
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} -> FAIL reason={} ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, sdhc_word,
                 if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, r
             ),
         }
