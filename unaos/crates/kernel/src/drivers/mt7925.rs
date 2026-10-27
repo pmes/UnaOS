@@ -1,9 +1,9 @@
-//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
+//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23, and S6 the radio backend registered with the data rings armed, Z29; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
 //! MT7925 — S1, the probe (ZENBOOKMT7925, zenbook-ledger Z5). The ladder is
-//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17) and S5 (MT7925S5, Z23) are the four file-tail blocks; S6..S10 are owed there by name.
+//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17), S5 (MT7925S5, Z23) and S6 (MT7925S6, Z29) are the five file-tail blocks; S7..S10 are owed there by name.
 //!
 //! WHAT THIS RUNG DOES. Once per boot, from the three storage-ready passes in `main.rs` (beside `wifi::service()`,
 //! the same forward-only polled shape), and only after `boot::services_gate("wifi")` answers (R86, BP-net-4):
@@ -28,7 +28,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 /// MediaTek, and the two device ids linux's mt7925 table binds (mt7925/pci.c:13-19).
 const VENDOR: u16 = 0x14c3;
@@ -90,6 +90,7 @@ pub fn service() {
         S_S3 => s3(),
         S_S4 => s4(), // MT7925S4 (zenbook-ledger Z17): the pass after a clean S3 line (`s3_done`)
         S_S5 => s5(), // MT7925S5 (zenbook-ledger Z23): the pass after a kept S4 line (`s4_done`)
+        S_S6 => s6(), // MT7925S6 (zenbook-ledger Z29): the pass after a clean S5 line (`s5` hands to it with the channel parked)
         _ => {}
     }
 }
@@ -1288,7 +1289,7 @@ fn s5() {
                 "[mt7925] s5 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} caps={} chip_cap={} phy={} held={} rel={} -> parked",
                 m[0], m[1], m[2], m[3], m[4], m[5], c.n, chip, phy, kept, rel
             );
-            *MCU_LINK.lock() = Some(h); // the channel kept for the next rung (S6)
+            *MCU_LINK.lock() = Some(h); STATE.store(S_S6, Ordering::Relaxed); // the channel kept for the next rung (S6; MT7925S6, Z29, hands to S_S6 here)
         }
         Err(S5Why::Pre(w)) => {
             serial_println!("[mt7925] s5 -> NOT ATTEMPTED why={} rel={}", w, rel);
@@ -1304,17 +1305,7 @@ fn s5() {
 /// so S4's firmware chunks cannot be fetched again), then the capability query and its parse.
 fn s5_run(b: u64, h: &mut Hw, held: &mut &'static str) -> Result<Caps, S5Why> {
     *held = if r32(h.q15) as u64 == h.wm && r32(h.q0) as u64 == h.rx0 { "kept" } else { "lost" };
-    dma_off(b).map_err(S5Why::Pre)?;
-    hand_rx(h.rx0, h.rxb);
-    let mut rb = arm(h.q16, S4_TX16.load(Ordering::Relaxed), 0);
-    rb &= arm(h.q15, h.wm, 0);
-    rb &= arm(h.q0, h.rx0, RX_BUFS);
-    let glo = dma_on(b);
-    if !rb || glo & (GLO_TX_EN | GLO_RX_EN) != (GLO_TX_EN | GLO_RX_EN) {
-        return Err(S5Why::Pre(String::from("rb")));
-    }
-    h.wi = 0;
-    h.ri = 0;
+    wake(b, h, &[]).map_err(S5Why::Pre)?; // MT7925S6 (Z29) hoisted the wake reset into `wake`, S5's writes unchanged and in order
     let mut pl = [0u8; 8]; // 4 reserved bytes, then the NIC_CAPA tag and its length (4)
     pl[4..6].copy_from_slice(&NIC_CAPA.to_le_bytes());
     pl[6..8].copy_from_slice(&4u16.to_le_bytes());
@@ -1377,4 +1368,143 @@ fn mac_ok(m: &[u8; 6]) -> bool {
 /// The MT7925's MAC address once S5 read a clean capability reply, else None; RawNic::mac's shape, for S6's backend.
 pub fn mac() -> Option<[u8; 6]> {
     *MAC.lock()
+}
+
+// ── MT7925S6 (zenbook-ledger Z29) — S6: the radio backend registered over the parked channel, the data rings armed ──────
+// Once, on the storage-ready pass after a clean S5 line (`s5` hands to S_S6 with the MCU channel back in `MCU_LINK` and the
+// MAC behind `mac()`). No radio trait exists in the tree: the Broadcom station drives its own internals, and its link joins
+// the stack through `wifi/data.rs`'s accessor triple (BP-net-16). The one NIC trait is `net_phy::RawNic` (BP-net-1), so the
+// backend is `MtRadio` implementing it: the MAC from S5, transmit refused (`tx_ready` false) and receive answering nothing,
+// both by name (`why=s7-not-built`). S6 re-takes own, runs S5's wake reset again through the ONE `wake` with linux's two
+// data rings added (TX ring 0, band-0 data; RX ring 2, data: programmed, CPU index 0, every descriptor DMA_DONE, nothing
+// posted, no buffer handed), gives own back and registers the radio; `wifi::service`'s parked arm names it
+// (`[wifi] radio=mt7925`, wifi/mod.rs `which`). The stack's link chain (drivers/e1000.rs's accessor fold) is S9's, so smolnet
+// never binds a link that cannot send. No config write (bus master as S4 left it), no interrupt enable, no MCU command,
+// nothing transmitted. Hardware facts only; no code copied.
+
+const S_S6: u8 = 8;
+/// Linux's band-0 data TX ring and data RX ring (mt7925.h: TX band0 = ring 0, RX data = ring 2; mt7925.md §1).
+const TXQ_DATA: u64 = 0;
+const RXQ_DATA: u64 = 2;
+
+/// The two data rings S6 armed (descriptor memory; heap address = bus address, below 4 GiB): written once by `s6`.
+struct Data {
+    tx0: u64,
+    rx2: u64,
+}
+static RADIO: crate::sync::Mutex<Option<Data>> = crate::sync::Mutex::new(None);
+/// Set by `s6` on its clean line, after `RADIO`; read by `registered` (wifi's `which`, `MtRadio::mac`).
+static REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Linux's wake reset over the parked channel (hoisted out of `s5_run` by MT7925S6, S5's writes unchanged and in order): DMA
+/// off, ring 0's 31 buffers handed, rings 16 (CPU index 0), 15 and 0 (31) re-armed, then each `(ring registers, descriptor
+/// memory)` in `data` armed with CPU index 0 (S6's data rings; empty for S5), DMA on. Err = `dma_off`'s word, or `rb` when a
+/// read-back or the enable did not hold. The channel's ring indices restart at 0.
+fn wake(b: u64, h: &mut Hw, data: &[(u64, u64)]) -> Result<(), String> {
+    dma_off(b)?;
+    hand_rx(h.rx0, h.rxb);
+    let mut rb = arm(h.q16, S4_TX16.load(Ordering::Relaxed), 0);
+    rb &= arm(h.q15, h.wm, 0);
+    rb &= arm(h.q0, h.rx0, RX_BUFS);
+    for &(q, pa) in data {
+        rb &= arm(q, pa, 0); // CPU index 0: nothing posted, no buffer handed (S3's convention)
+    }
+    let glo = dma_on(b);
+    if !rb || glo & (GLO_TX_EN | GLO_RX_EN) != (GLO_TX_EN | GLO_RX_EN) {
+        return Err(String::from("rb"));
+    }
+    h.wi = 0;
+    h.ri = 0;
+    Ok(())
+}
+
+fn s6() {
+    STATE.store(S_PARKED, Ordering::Relaxed);
+    let held = *PROBE.lock();
+    let Some(p) = held else { return };
+    let link = MCU_LINK.lock().take();
+    let Some(mut h) = link else { return };
+    let Some(m) = mac() else {
+        serial_println!("[mt7925] s6 -> NOT ATTEMPTED why=no-mac held=- rel=found");
+        return;
+    };
+    let b = p.bar0;
+    let lp = b + CONN_HOST_CSR_TOP + LPCTL;
+    if !(map_page(b + WFDMA0) && map_page(b + (DMASHDL_SW_CONTROL & !0xfff))) {
+        serial_println!("[mt7925] s6 -> NOT ATTEMPTED why=unmapped held=- rel=found");
+        return;
+    }
+    let took = r32(lp) & OWN_SYNC != 0;
+    if took {
+        let (ok, last, _) = own(lp, CLR_OWN, false);
+        if !ok {
+            let rel = if own(lp, SET_OWN, true).0 { "fw" } else { "timeout" };
+            serial_println!("[mt7925] s6 -> NOT ATTEMPTED why=own lpctl={:#010x} held=- rel={}", last, rel);
+            return;
+        }
+    }
+    let kept = if r32(h.q15) as u64 == h.wm && r32(h.q0) as u64 == h.rx0 { "kept" } else { "lost" };
+    let (tx0, rx2) = (ring(), ring());
+    let res = if tx0 == 0 || rx2 == 0 {
+        Err(String::from("no-memory")) // nothing written to a ring register; an allocated ring is never freed (S3's rule)
+    } else {
+        let data = [(b + TX_RING_BASE + TXQ_DATA * RING_REGS, tx0), (b + RX_EVENT_RING_BASE + RXQ_DATA * RING_REGS, rx2)];
+        wake(b, &mut h, &data)
+    };
+    let rel = give_back(lp, took);
+    match res {
+        Ok(()) => {
+            *RADIO.lock() = Some(Data { tx0, rx2 });
+            REGISTERED.store(true, Ordering::Release);
+            *MCU_LINK.lock() = Some(h); // the channel kept for the next rung (S7)
+            serial_println!(
+                "[mt7925] s6 radio=registered mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rings=tx0,rx2 tx0={:#x} rx2={:#x} cnt={} held={} rel={} -> parked",
+                m[0], m[1], m[2], m[3], m[4], m[5], tx0, rx2, RING_DEPTH, kept, rel
+            );
+        }
+        Err(w) => {
+            serial_println!("[mt7925] s6 -> NOT ATTEMPTED why={} held={} rel={}", w, kept, rel);
+        }
+    }
+}
+
+/// True once S6 registered the radio (one load); wifi's `which` and `MtRadio::mac` read it.
+pub fn registered() -> bool {
+    REGISTERED.load(Ordering::Acquire)
+}
+
+/// The data rings' descriptor memory (TX ring 0, RX ring 2) once S6 registered the radio, else None; S7 posts on them.
+pub fn data_rings() -> Option<(u64, u64)> {
+    RADIO.lock().as_ref().map(|d| (d.tx0, d.rx2))
+}
+
+/// The MT7925 radio backend (S6): the kernel's one NIC trait (`net_phy::RawNic`) over the parked channel. Nothing binds it
+/// to the stack yet (S9 owed); every operation but `mac` is refused by name, never a silent Ok.
+pub struct MtRadio;
+
+#[cfg(feature = "smolnet")]
+impl crate::net_phy::RawNic for MtRadio {
+    /// Refused: RX ring 2 is armed with no buffer handed; the frame path is S7's.
+    fn rx_frame_raw(_out: &mut [u8]) -> Option<usize> {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            serial_println!("[mt7925] s6 rx -> REFUSED why=s7-not-built");
+        }
+        None
+    }
+    /// Refused: TX ring 0 is armed, nothing is posted (the TXWI/connac TXD is S7's); the frame is dropped, said once.
+    fn transmit(_frame: &[u8]) {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            serial_println!("[mt7925] s6 tx -> REFUSED why=s7-not-built");
+        }
+    }
+    /// S5's capability-reply MAC, only once S6 registered the radio.
+    fn mac() -> Option<[u8; 6]> {
+        if registered() { self::mac() } else { None }
+    }
+    /// The explicit refusal: no room ever, so smoltcp's back-pressure never calls `transmit`.
+    fn tx_ready() -> bool {
+        false
+    }
 }

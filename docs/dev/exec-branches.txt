@@ -1030,7 +1030,7 @@ refs/heads/exec-rmbp-gopignitepixel   a45f65a71 FOLDED-BY-HAND (this commit) 202
 refs/heads/exec-rmbp-hidbootledsehci   4fc5d6480 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-dmaonebody   44c937737 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-exportsizefixturepolicies   64c47f827 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-mt7925s6   48234537d cut 2026-10-27 (wave36 batch 13)
+refs/heads/exec-rmbp-mt7925s6   d70543a59 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nlesizepolicyui   48234537d cut 2026-10-27 (wave36 batch 13)
 refs/heads/exec-rmbp-zenbookecqevents   20eda4229 cut 2026-10-27 (wave36 batch 14)
 refs/heads/exec-rmbp-nvme4kn   20eda4229 cut 2026-10-27 (wave36 batch 14)
