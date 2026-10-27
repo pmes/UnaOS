@@ -1004,4 +1004,9 @@ FORBID :: BOOTLIST: .* -> FAIL ::
 # ── LEASERENEW (rmbp-ledger B888), TAIL-APPENDED — `tests dhcprenew`: the smoltcp lease capped at 8 s through the socket's public API and reset, re-acquired, then ONE renewal at T1 said (`[net] dhcp renewed lease= ip=same t1_at=`). OPTIONAL until flown. ASSUMPTION (code-only, unrun): slirp's bootp answers the renewal's UNICAST REQUEST to 10.0.2.2:67 (ciaddr set, no option 50) with an ACK found by MAC; if it does not, the line reads `-> FAIL reason=no-renewal`.
 OPTIONAL :: DHCPRENEW: first=[0-9]+ renewed=[1-9][0-9]* changed=0 -> PASS ::
 # NLE6 (LEDGER SR207): `tests nle` (typed, R80; needs UNAOS_VIDEO=1, which this leg does not set) — the Player's EDL mode over two synthetic utp1 reels.
-OPTIONAL :: NLE: frames=\d+ seeks=\d+ runup=\d+ agree=\d+/\d+ counter=frame-ord -> PASS ::
+OPTIONAL :: NLE: frames=\d+ seeks=\d+ runup=\d+ agree=\d+/\d+ counter=frame-ord .* export=\S+ .* -> PASS ::
+# EXPORTSIZEFIXTURE (rmbp-ledger B990): `tests nle`'s two-size AV1 reel NLEFXE (libaom size-66x66 then size-16x16) exported: the decoder's size switch, the export's letterbox into the first size, the file read back at 66x66 (OPTIONAL as NLE above: this leg sets no UNAOS_VIDEO).
+OPTIONAL \[vplay\] size switch at \d+ 66x66->16x16
+OPTIONAL \[nle\] export size switch 66x66->16x16 scaled
+OPTIONAL \[nle\] fixture export sizes=2 reel=NLEFXE .* samples=4 first=66x66 .* -> ok
+FORBID \[nle\] fixture export sizes=.* -> FAIL
