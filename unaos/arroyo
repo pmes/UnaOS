@@ -2,7 +2,7 @@
 # ARROYO: The Stream that Feeds the River
 # "Ad Astra Per Aspera"
 #
-# Usage:   (BOOTLIST B817: `esp-x86` also stages unaos/fixtures/TESTS.LIST and TESTS.HEAVY onto the ESP when present — the list the kernel runs at [desktop] built)
+# Usage:   (BOOTLIST B817/B874: `esp-x86`, `esp-arm`, `esp-jetson[-img]` and `kernel8` stage unaos/fixtures/TESTS.LIST and TESTS.HEAVY onto the boot FAT when present — `bootlist_stage`, before each verb's card image; the list the kernel runs at [desktop] built)
 #   ./arroyo              Interactive menu
 #   ./arroyo x86           Build & boot x86_64 (GUI window + serial on stdio)
 #   ./arroyo arm           Build & boot aarch64
@@ -689,6 +689,10 @@ _feats="${_feats}sdw,"
 # KEYBOOT3 (rmbp-ledger B856): UNAOS_KEYBOOT_DEFER=1 defers the first-user keying of the native root (`[keyboot]
 # first-user keying=deferred`); unset keys it. Implies `login` in Cargo.toml. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_KEYBOOT_DEFER:-}" ] && _feats="${_feats}keyboot_defer,"
+# AUTOLOCK3 (rmbp-ledger B875): UNAOS_AUTOLOCK_FIXTURE=1 — `tests autolock` takes its credential from the card's staged
+# /system/fixtures/autolock.cred (esp_x86_unafs_card stages it under the same knob), never a literal. Implies `login` in
+# Cargo.toml. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_AUTOLOCK_FIXTURE:-}" ] && _feats="${_feats}autolock_fixture,"
 # R77 M3: UNAOS_TESTS_AT_BOOT=1 runs the desktop fixture registry (`tests.rs`) at registration, in boot order, exactly as before the `tests` verb existed; unset, the desktop boots quiet and `tests` fires them. The test/test-arm lanes default it ON (top of this file). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_TESTS_AT_BOOT:-}" ] && _feats="${_feats}tests-at-boot,"
 # QUIETBOOT (R80): UNAOS_CENSUS=1 boots with every periodic sampler (`census.rs`) on; unset, the boot prints the boot and `census start <name>` turns one on. The battery verbs export it (head `case`).
@@ -882,6 +886,9 @@ _feats="${_feats}sdw,"
 # KBLIT blit run from `tests ce` / `tests kblit`, never at boot. GPUTESTS (B334): x86_64-only module,
 # stripped by arm_features (k8-reach NA row).
 [ -n "${UNAOS_KEPLER_CE:-}" ] && _feats="${_feats}nvidia-kepler-ce,"
+# KEPLER3D (B877): UNAOS_KEPLERCE=1 arms `tests keplerce` (drivers/gpu/kepler_gpublit.rs tail) — the copy engine's
+# three-job wall fixture. x86_64-only (stripped by arm_features). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_KEPLERCE:-}" ] && _feats="${_feats}nvidia-kepler-cecopy,"
 # SHUTRESTORE (rmbp, 2026-09-15) — the SEVEN refuted Kepler rungs whose CODE had been deleted, each
 # back behind a knob of its own. RULINGS R19 (Peter, 2026-09-05): "you take a path that does not work
 # out so you shut it out but after very many boots its discovered that path needs to be open for
@@ -3324,6 +3331,9 @@ arm_features() {
     # conjunction, so the feature emits not one byte of aarch64 CODE; stripping it keeps the aarch64
     # `-Cmetadata` fingerprint unchanged when an x86 knob line carries `UNAOS_KEPLER_CE=1`.
     f="${f//,nvidia-kepler-ce,/,}"
+    # KEPLER3D (B877): `nvidia-kepler-cecopy` is a cfg'd tail of `kepler_gpublit.rs` (x86_64-only module) and a
+    # `target_arch = "x86_64"` registration: not one byte of aarch64 CODE, same strip, same hash argument.
+    f="${f//,nvidia-kepler-cecopy,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -9784,6 +9794,18 @@ esp_x86_unafs_card() {
     # builds nothing. Before ROOTACL: /system takes its owner row after. Witness: `[unafs-tool] filetypes staged n= created= stamp=`.
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- filetypes -i "$vol" || {
         echo -e "${COLOR_RED}❌ CARDREGISTRY: tools/unafs filetypes failed — no card image${COLOR_RESET}"; return 1; }
+    # AUTOLOCK3 (rmbp-ledger B875, BP-security-2): ONLY on a card built with UNAOS_AUTOLOCK_FIXTURE=1, the autolock fixture's
+    # credential file /system/fixtures/autolock.cred (line 1 the user, line 2 the password: the pair twoboot.sh types at the
+    # first-user form) — a fixture credential on the card is a fixture card's, by the loginst rule; unset, no step and the
+    # card is byte-identical. Before ROOTACL: /system's owner row covers it (reads public, writes system/admin).
+    if [ -n "${UNAOS_AUTOLOCK_FIXTURE:-}" ]; then
+        local alf="${WORKSPACE_DIR}/target/autolock-fixture"
+        mkdir -p "$alf" && printf 'una\ncorrect-horse\n' > "$alf/autolock.cred" || {
+            echo -e "${COLOR_RED}❌ AUTOLOCK3: could not write ${alf#${WORKSPACE_DIR}/}/autolock.cred — no card image${COLOR_RESET}"; return 1; }
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$alf" /system/fixtures -i "$vol" || {
+            echo -e "${COLOR_RED}❌ AUTOLOCK3: tools/unafs put autolock.cred -> /system/fixtures failed — no card image${COLOR_RESET}"; return 1; }
+        echo -e "${COLOR_YELLOW}⚡ AUTOLOCK3: /system/fixtures/autolock.cred staged user=una (fixture card only)${COLOR_RESET}"
+    fi
     # ROOTACL (rmbp-ledger B456, SECREVIEW F2): every tree the loop put takes the `system` owner row, so the card is
     # system-owned from its first boot — the kernel's native ACL lets only `kernel` and the administrator write there
     # (children carry no row and inherit it; fs/rootacl.rs). The kernel stamps /system/types at the registry build.
@@ -10013,7 +10035,7 @@ esp_x86() {
     echo -e "               data tree -> the USB stick, or \`bg /apps/VUG.ELF\` reports -ENOENT."
     echo -e "   Probe after boot: \`cat hello.txt\` must say 'DATA volume' — if it says anything else,"
     echo -e "               the kernel is reading a stick you did not stage."
-    if [ -n "${UNAOS_UNAFS:-}" ]; then esp_x86_unafs_card || exit $?; fi   # UNAFSX86 M3
+    bootlist_stage "${WORKSPACE_DIR}/target/x86_64_esp"; if [ -n "${UNAOS_UNAFS:-}" ]; then esp_x86_unafs_card || exit $?; fi   # UNAFSX86 M3. BOOTLISTARM (B874): the list is staged BEFORE una-card lays p1 from this tree (B817's dispatch-arm copy ran after it)
 }
 
 # VMIMAGE-1: emit ONE self-contained, distributable bootable disk image — a GPT disk with a FAT32
@@ -10621,11 +10643,28 @@ banner_cert_arm() {   # banner_cert_arm <artifact>
     bash "${WORKSPACE_DIR}/scripts/banner-cert.sh" "$1" "$_bc_feats" || exit $?
 }
 
+# BOOTLISTARM (rmbp-ledger B874, R132): ONE staging fn for the list every media verb carries — `esp-x86`, `esp-arm`,
+# `esp-jetson[-img]`, `kernel8`. It copies unaos/fixtures/TESTS.LIST (and TESTS.HEAVY) VERBATIM into the boot FAT tree:
+# one list for every board; a line's `@<board>` tags (rmbp12 / pi4 / orin = the kernel's `boot::OLDEST`) are filtered by
+# the kernel's `bootlist::parse`, so a card copy edited by hand reads the same everywhere (grammar: PLAYBOOK §4 item 7).
+# Each verb calls it BEFORE its card image is built from the tree. It stages only when a MEDIA dispatch arm set
+# `_BOOTLIST_MEDIA=1` (a shell variable, not a UNAOS_ knob): the QEMU lanes that reuse these fns (test_fat, test_selfhost,
+# fat_img, run_kernel8, test_kernel8, install_pi) never carry a list.
+bootlist_stage() {
+    [ "${_BOOTLIST_MEDIA:-}" = "1" ] || return 0
+    local dir="$1" _bl
+    for _bl in TESTS.LIST TESTS.HEAVY; do
+        if [ -f "${WORKSPACE_DIR}/fixtures/${_bl}" ]; then
+            cp "${WORKSPACE_DIR}/fixtures/${_bl}" "${dir}/${_bl}" && echo "   BOOTLIST (B817/B874): staged ${_bl} onto ${dir#${WORKSPACE_DIR}/} (the kernel runs it at [desktop] built; @board lines filtered there)"
+        fi
+    done
+}
+
 esp_arm() {
     prepare_aarch64
     # BANNERCERT2: the ELF the aarch64 firmware loads, certified before the media is announced.
     banner_cert_arm "${ESP_DIR_ARM}/kernel.elf"
-    pack_source_along "$ESP_DIR_ARM"
+    bootlist_stage "$ESP_DIR_ARM"; pack_source_along "$ESP_DIR_ARM"   # BOOTLISTARM (B874): the list, before the tree is packed or carded
     echo -e "${COLOR_GREEN}✅ aarch64 ESP: ${ESP_DIR_ARM}${COLOR_RESET}"
     echo -e "   kernel.elf sha256: $(sha256_of "${ESP_DIR_ARM}/kernel.elf")"
     [ -f "${ESP_DIR_ARM}/SRC.TGZ" ] && echo -e "   SRC.TGZ    sha256: $(sha256_of "${ESP_DIR_ARM}/SRC.TGZ")"
@@ -10853,7 +10892,7 @@ esp_jetson() {
     # `jetson_card_image` below can only ever copy an ELF that has already answered for its banner.
     banner_cert_arm "${ESP_DIR_ARM}/kernel.elf"
     stage_jetson_el0_images
-    pack_source_along "$ESP_DIR_ARM"
+    bootlist_stage "$ESP_DIR_ARM"; pack_source_along "$ESP_DIR_ARM"   # BOOTLISTARM (B874): the list, before the tree is packed or carded
     echo -e "${COLOR_GREEN}✅ Jetson ESP (tegra): ${ESP_DIR_ARM}${COLOR_RESET}"
     [ -f "${ESP_DIR_ARM}/SRC.TGZ" ] && echo -e "   SRC.TGZ sha256: $(sha256_of "${ESP_DIR_ARM}/SRC.TGZ")"
     cat <<EOF
@@ -12553,6 +12592,10 @@ kernel8() {
         K8_FEATS="${K8_FEATS},keyboot_defer"
         echo -e "${COLOR_YELLOW}  • UNAOS_KEYBOOT_DEFER: the first user's password does NOT key the native root (KEYBOOT3 B856; keying deferred)${COLOR_RESET}"
     fi
+    if [ -n "${UNAOS_AUTOLOCK_FIXTURE:-}" ]; then
+        K8_FEATS="${K8_FEATS},autolock_fixture"
+        echo -e "${COLOR_YELLOW}  • UNAOS_AUTOLOCK_FIXTURE: tests autolock reads its credential from the card's /system/fixtures/autolock.cred (AUTOLOCK3 B875; the Pi card step is owed)${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_BUSREG:-}" ]; then
         K8_FEATS="${K8_FEATS},busreg"
         echo -e "${COLOR_YELLOW}  • UNAOS_BUSREG: BANDY3 fulfiller registration on the bus wire (register verb 127, registrable tags 128..=255, kernel relay; tests bandy3)${COLOR_RESET}"
@@ -12828,7 +12871,7 @@ kernel8() {
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/K3HELLO.TXT" / -i "$UNAFS_K3_IMG"
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/K3PAT.BIN" / -i "$UNAFS_K3_IMG"
 
-    bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 128 "$UNAFS_K3_IMG"
+    bootlist_stage "$KERNEL8_DIR"; bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 128 "$UNAFS_K3_IMG"
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
     # BUILD-2: release the coarse build lock now that the image is complete — any QEMU phase that
     # follows (kernel8-test / -run / install) uses per-run ports/logs and may overlap other runs.
@@ -12856,6 +12899,57 @@ run_kernel8() {
         -serial mon:stdio -serial null \
         ${SD_DRIVE} \
         ${UNAOS_QEMU_EXTRA:-}
+}
+
+# PIDESK-SPEC (rmbp-ledger B878): THE ARMED PI DESKTOP'S SPEC, picked in `x86_pick_capture_spec`'s shape. The base
+# battery (pi4-regression.spec) is knob-off, so every `desktop_firmware`-gated line in it is OPTIONAL + FORBID (the
+# DRAG-PI rule) and nothing REQUIREd the Pi desktop's wire. With UNAOS_PIDESK armed (`kernel8-test --desk`), the capture
+# is replayed a SECOND time against pi4-desktop.spec, which carries the positive half (SUITETYPE's second-spec pattern,
+# as pi4-barename.spec). The base spec stays the completion source and owns TRUNCATED; the desktop spec has no COMPLETE.
+PI4_DESKTOP_SPEC="${WORKSPACE_DIR}/scripts/specs/pi4-desktop.spec"
+K8_DESK_SPEC=""   # path of the armed-desktop spec to replay, or "" when none describes this capture
+K8_DESK_WHY=""    # why there is none — printed verbatim in the skip line (empty on the knob-off battery: it stays quiet)
+k8_pick_capture_spec() {
+    K8_DESK_SPEC=""; K8_DESK_WHY=""
+    if [ -z "${UNAOS_PIDESK:-}" ]; then
+        return 0   # the knob-off battery: pi4-regression.spec alone, its output unchanged
+    fi
+    # SHARD-PRESS is `witness`-gated and the drag probes run at registration only under `tests-at-boot`; the lane's
+    # head `case` exports both, so this fires only when a caller cleared one by hand.
+    if [ -z "${UNAOS_WITNESS:-}" ] || [ -z "${UNAOS_TESTS_AT_BOOT:-}" ]; then
+        K8_DESK_WHY="UNAOS_PIDESK is armed but UNAOS_WITNESS='${UNAOS_WITNESS:-}' UNAOS_TESTS_AT_BOOT='${UNAOS_TESTS_AT_BOOT:-}' — pi4-desktop.spec's REQUIREs are the witness-gated SHARD-PRESS and the drag probes that run at registration only under tests-at-boot. Use './arroyo kernel8-test --desk 300' for the gated run."
+        return 0
+    fi
+    K8_DESK_SPEC="$PI4_DESKTOP_SPEC"
+}
+
+# Replay the capture against the armed-desktop spec. $1 = the capture, $2 = the base verdict; returns the COMBINED rc.
+# A base TRUNCATED (3), FLAKE (4) or anything else is returned unchanged and this spec is not asserted (BP-gates-3: a
+# truncated capture is never scored); on a base 0 or 1 the desktop verdict is printed either way and the rc is the base's
+# 1 if it was red, else this spec's.
+k8_desk_replay() {
+    local logf="$1" base="$2" drc=0
+    k8_pick_capture_spec
+    if [ -z "$K8_DESK_SPEC" ]; then
+        if [ -n "$K8_DESK_WHY" ]; then echo -e "${COLOR_YELLOW}⚠ armed-desktop spec replay SKIPPED — ${K8_DESK_WHY}${COLOR_RESET}"; fi
+        return "$base"
+    fi
+    if [ "$base" -ne 0 ] && [ "$base" -ne 1 ]; then
+        echo -e "${COLOR_YELLOW}⚠ armed-desktop spec NOT asserted — the base verdict is rc ${base}, not a complete capture; truncation and flakes are pi4-regression.spec's call.${COLOR_RESET}"
+        return "$base"
+    fi
+    if [ ! -f "$K8_DESK_SPEC" ]; then
+        echo -e "${COLOR_RED}✖ kernel8-test: UNAOS_PIDESK is armed but ${K8_DESK_SPEC} is MISSING — nothing gates the desktop. rc=1${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_CYAN}⚡ mbench: asserting the armed desktop against ${K8_DESK_SPEC#${WORKSPACE_DIR}/}${COLOR_RESET}"
+    python3 "${WORKSPACE_DIR}/scripts/mbench.py" --replay "$logf" --spec "$K8_DESK_SPEC" --platform pi || drc=$?
+    if [ "$drc" -ne 0 ]; then
+        echo -e "${COLOR_RED}✖ kernel8-test: the armed desktop's spec did not pass (rc ${drc}) — a REQUIREd desktop_firmware line is"
+        echo -e "  missing or reads FAIL (its FAIL forbid in pi4-regression.spec says which). Spec: ${K8_DESK_SPEC#${WORKSPACE_DIR}/}${COLOR_RESET}"
+    fi
+    if [ "$base" -ne 0 ]; then return "$base"; fi
+    return "$drc"
 }
 
 # Headless raspi4b test: boot kernel8.img, capture PL011 -> target/serial-pi.log and a QMP
@@ -13102,6 +13196,7 @@ test_kernel8() {
                 echo -e "  in the path that word takes. Script: ${k8_script}${COLOR_RESET}"
             fi
         fi
+        k8_desk_replay "$logf" "$mrc" || mrc=$?   # PIDESK-SPEC (B878): the armed desktop's spec, after the base (and typed) verdicts; rc 3/4 pass through
         return $mrc
     fi
     echo -e "${COLOR_YELLOW}  • UNAOS_K8T_ASSERT=0 — spec assertion SKIPPED; this run carries no verdict${COLOR_RESET}"
@@ -14826,16 +14921,16 @@ case "${1:-}" in
         build_both
         ;;
     esp-x86|esp_x86)
-        esp_x86; for _bl in TESTS.LIST TESTS.HEAVY; do if [ -f "${WORKSPACE_DIR}/fixtures/${_bl}" ]; then cp "${WORKSPACE_DIR}/fixtures/${_bl}" "${WORKSPACE_DIR}/target/x86_64_esp/${_bl}" && echo "   BOOTLIST (B817): staged ${_bl} onto the ESP (the kernel runs it at [desktop] built)"; fi; done   # BOOTLIST (rmbp-ledger B817, R132): the media verb only — the QEMU lanes never stage a list (the builder wipes target/x86_64_esp each run)
+        _BOOTLIST_MEDIA=1 esp_x86   # BOOTLIST (B817, R132) / BOOTLISTARM (B874): the media verb only arms `bootlist_stage` (inside esp_x86, before the card) — the QEMU lanes never stage a list
         ;;
     esp-arm|esp_arm)
-        esp_arm
+        _BOOTLIST_MEDIA=1 esp_arm   # BOOTLISTARM (B874): the media verb arms the list
         ;;
     esp-jetson|esp_jetson|jetson)
-        esp_jetson
+        _BOOTLIST_MEDIA=1 esp_jetson   # BOOTLISTARM (B874)
         ;;
     esp-jetson-img|esp_jetson_img|jetson-img)
-        esp_jetson_img
+        _BOOTLIST_MEDIA=1 esp_jetson_img   # BOOTLISTARM (B874)
         ;;
     selfup-pak|selfup_pak)
         selfup_pak "${2:-}" "${3:-}"
@@ -14878,12 +14973,13 @@ case "${1:-}" in
         test_splash "${2:-120}"
         ;;
     kernel8|baremetal)
-        kernel8
+        _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do
         ;;
     kernel8-run|run-pi)
         run_kernel8
         ;;
     kernel8-test|test-pi)
+        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; set -- "$1" "${@:3}"; fi   # PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec
         test_kernel8 "${2:-60}"   # MBENCH-HONEST: 8 s never finished a pi4 boot — see test_kernel8
         ;;
     kernel8-install|install-pi)
@@ -14952,7 +15048,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|gates [--list|--selftest]|jobs-image|twoboot [--card] [--judge <log1> [<log2> [<log3> <log4>]]]|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [--desk] [secs] (the Pi desktop: ./arroyo kernel8-test --desk 300)|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|gates [--list|--selftest]|jobs-image|twoboot [--card] [--judge <log1> [<log2> [<log3> <log4>]]]|clean]"
         exit 1
         ;;
 esac

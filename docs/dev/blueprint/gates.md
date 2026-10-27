@@ -60,7 +60,7 @@
 
 ## 4. Verbs (`unaos/arroyo` tail `case`)
 `check` · `state` · `gates [--list|--selftest]` · `test` (at `UNAOS_FBW`/`UNAOS_FBH`/`UNAOS_PPI` with `UNAOS_WC`+`UNAOS_FACET` it replays `unaos/scripts/specs/x86-panel.spec`, ZOOMPANEL B842) / `test-arm` / `test-fat` / `test-install` / `test-ptr` / `test-splash` / `test-selfhost` (QEMU) · `x86` / `arm` (QEMU GUI) ·
-`esp-x86` (stages `unaos/fixtures/TESTS.LIST` + `TESTS.HEAVY` onto the ESP when present, the media verb only — BOOTLIST B817, `unaos/arroyo:14559`) / `esp-arm` / `esp-jetson` / `esp-jetson-img` (media) · `kernel8` / `kernel8-run` / `kernel8-test` / `kernel8-install` (Pi) · `foldleg` · `twoboot` · `knoboff` (and `knoboff env NAME=VAL`, B867) · `bootleg` · `battery` · `mbench` · `jobs-image` · `vm-image` · `fat-img` · `selfup-pak` · `clean`.
+`esp-x86` (stages `unaos/fixtures/TESTS.LIST` + `TESTS.HEAVY` onto the ESP when present, the media verb only — BOOTLIST B817, `unaos/arroyo:14559`) / `esp-arm` / `esp-jetson` / `esp-jetson-img` (media) `kernel8` / `kernel8-run` / `kernel8-test` (`--desk` = `UNAOS_PIDESK=1`; with the knob it replays `unaos/scripts/specs/pi4-desktop.spec` after pi4-regression.spec, PIDESK-SPEC B878) / `kernel8-install` (Pi) `foldleg` `twoboot` `knoboff` (and `knoboff env NAME=VAL`, B867) `bootleg` `battery` `mbench` `jobs-image` `vm-image` `fat-img` `selfup-pak` `clean`.
 
 ## 5. Ruled, unbuilt / open
 - GATE-NEUTRAL (BP-shape-4): built as the `neutral` row (SR166); 110 findings at fb8ad2f4 sit on `tools/neutral.allow`, each reason naming its owed rename.

@@ -185,6 +185,12 @@ nvidia-kepler-kfctxbind = ["nvidia-kepler", "nvidia-kepler-fifo"]
 # item, the call site and every `:: KDHEAD:` string are unlinked, media byte-identical. Kept in sync
 # with arroyo AND builder/src/main.rs.
 nvidia-kepler-kdhead = ["nvidia-kepler", "nvidia-kepler-takeover"]
+# KEPLER3D (rmbp-ledger B877): `UNAOS_KEPLERCE=1` arms `tests keplerce` — three 256x256 copies on GPUBLIT's copy-engine
+# channel (VRAM, a fresh heap source, the same source again), each read back through BAR1, naming the wall the first
+# post-self-test job hits. Never at boot (R80), never on the compositor path. Implies the two features `kepler_gpublit` is
+# gated on. DEFAULT OFF => the fixture, its registration and its VRAM region (0 bytes) are unlinked, media byte-identical.
+# Kept in sync with arroyo AND builder/src/main.rs.
+nvidia-kepler-cecopy = ["nvidia-kepler", "nvidia-kepler-takeover"]
 # CTRLBIND (rmbp, shut-out register §2 rung KF9b, 2026-09-17): `UNAOS_KEPLER_CTRLBIND=1` — the half
 # of KF9 the 2026-09-15 SHUTRESTORE could not bring back. The restored `nvidia-kepler-ctrladdr` audit
 # answers "is CTRL_ADDR[1:0] writable" (12/12 yes at s13) and CANNOT answer s13's actual question,
@@ -1000,6 +1006,11 @@ loginst = ["login"]
 # `KB_FIRSTUSER`, `[keyboot] first-user keying=deferred`); unset keys it, as KEYBOOT built it. It replaces KEYBOOT2's
 # `UNAOS_KEYBOOT_FIRSTUSER=0` option_env! (knob-parity parses only `=1`). Implies `login`. Kept in sync with arroyo and builder/src/main.rs.
 keyboot_defer = ["login"]
+# AUTOLOCK3 (rmbp-ledger B875): UNAOS_AUTOLOCK_FIXTURE=1 makes `tests autolock` read its credential from the card's staged
+# fixture file `/system/fixtures/autolock.cred` (arroyo's card builder writes it only when this knob is armed) instead of
+# a compiled literal; the wire prints the user name and the password's length only. A fixture-card knob by the loginst
+# rule: a shipping card never carries the file. Implies `login`. Kept in sync with arroyo and builder/src/main.rs.
+autolock_fixture = ["login"]
 # R77 M3 (THE TEST SUITE IS A COMMAND): run the registered desktop fixtures at registration, as before. Default OFF => they are deferred behind the `tests` shell verb. Kept in sync with arroyo and builder/src/main.rs.
 tests-at-boot = []
 # QUIETBOOT (R80, rmbp-ledger B311): `UNAOS_CENSUS=1` boots with every periodic sampler in `census.rs` ON (the old always-on SERIAL/VBJITTER/SMPLOAD/WCPAR/PTRSTUTTER/deadman/... lines). Default OFF => they stay silent until `census start <name>`. The QEMU battery verbs arm it (arroyo head `case`) so their pinned census lines stay reachable. Kept in sync with arroyo and builder/src/main.rs.

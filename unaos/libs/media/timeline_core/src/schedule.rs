@@ -4,8 +4,8 @@
 //! The render schedule (NLE1 M2, LEDGER SR194): what each output tick shows, in output order, and where a decoder
 //! must seek.
 //!
-//! Video is cut-only: at tick `t` the HIGHEST-numbered video track with a clip at `t` wins (V2 over V1); dissolves are
-//! NLE3. Audio is a MIX (NLE4, LEDGER SR203): [`audio_runs`] lists, per run, EVERY audio track's clip with its gain and
+//! Video is cut-only: at tick `t` the HIGHEST-numbered video track with a clip at `t` wins (V2 over V1); its transitions are
+//! below. Audio is a MIX (NLE4, LEDGER SR203): [`audio_runs`] lists, per run, EVERY audio track's clip with its gain and
 //! fade envelope; a run is the longest span over which every audio track shows the same clip in the same envelope
 //! segment (fade-in, body, fade-out) or nothing. For each output tick the schedule holds one video [`Step`] (`len` 1),
 //! then the audio step whose run starts at that tick, if any: one step per [`AudioRun`], in the same order, whose
@@ -16,11 +16,18 @@
 //! cut to another source, or a jump inside the same one) carries `seek`: the keyframe at or before its source time,
 //! from [`SourceIndex::keyframe_ns`]. The renderer seeks there and decodes up to `src_t` unseen (the run-up). A step
 //! that continues the previous one (a split, or two clips butted end to start in source order) carries none.
+//!
+//! Transitions (NLE3, LEDGER SR202): the rule above still picks the winning track and clip. When the winning clip's
+//! cut carries a [`crate::Transition`] and `t` lies in its first `dur` ticks, the video step also carries [`VideoMix`]:
+//! the OUTGOING source at its handle tick (`src_out + k`, `k = t - at`), with its own seek (none when it continues the
+//! previous step's source position: the outgoing run decodes on past its out point), and the incoming's weight
+//! `t = (k + 1) / (dur + 1)` (never 0 or 1). The step's own `src` / `src_t` / `seek` stay the incoming clip's, which
+//! seeks at the cut as a plain cut does.
 
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use crate::{EditError, Kind, SourceId, SourceIndex, Timeline};
+use crate::{EditError, Kind, SourceId, SourceIndex, Timeline, TransitionKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Step {
@@ -37,6 +44,29 @@ pub struct Step {
     pub len: i64,
     /// Seek here (ns from the source's start, a keyframe) before decoding this step.
     pub seek: Option<i64>,
+    /// NLE3: inside a transition (video only), the outgoing source mixed under this step's.
+    pub vmix: Option<VideoMix>,
+}
+
+/// A fraction `num / den` (`den > 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frac {
+    pub num: i64,
+    pub den: i64,
+}
+
+/// NLE3: the second source of a video step inside a transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoMix {
+    pub kind: TransitionKind,
+    /// The OUTGOING clip's source.
+    pub src: SourceId,
+    /// Its source tick (in its handle: `src_out + k`).
+    pub src_t: i64,
+    /// Seek here before decoding it (`None`: its run continues).
+    pub seek: Option<i64>,
+    /// The incoming's weight, in `(0, 1)`.
+    pub t: Frac,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,9 +100,11 @@ fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> {
 /// The schedule for output ticks `range` (see the module docs).
 pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Result<Vec<Step>, ScheduleError> {
     check(tl, &range, idx)?;
+    handles_fit(tl, idx)?;
     let has = |k: Kind| tl.tracks.iter().any(|t| t.kind == k);
     let (video, audio) = (has(Kind::Video), has(Kind::Audio));
     let mut out = Vec::new();
+    let mut m_next: Option<(SourceId, i64)> = None; // NLE3: the transition's outgoing run
     // The previous video step's (source, the source tick it would continue at).
     let mut v_next: Option<(SourceId, i64)> = None;
     // NLE4: the audio steps are the mix runs' headers, one per run.
@@ -84,13 +116,14 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
                 Some((ti, ci)) => {
                     let c = tl.tracks[ti].clips[ci];
                     let src_t = c.src_in + (t - c.at);
+                    let vmix = vmix_for(tl, idx, ti, ci, t, v_next, &mut m_next)?;
                     let seek = seek_for(tl, idx, Kind::Video, c.src, src_t, v_next)?;
                     v_next = Some((c.src, src_t + 1));
-                    Step { kind: Kind::Video, track: Some(ti), src: Some(c.src), src_t, out_t: t, len: 1, seek }
+                    Step { kind: Kind::Video, track: Some(ti), src: Some(c.src), src_t, out_t: t, len: 1, seek, vmix }
                 }
                 None => {
-                    v_next = None;
-                    Step { kind: Kind::Video, track: None, src: None, src_t: 0, out_t: t, len: 1, seek: None }
+                    (v_next, m_next) = (None, None);
+                    Step { kind: Kind::Video, track: None, src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: None }
                 }
             };
             out.push(step);
@@ -151,7 +184,7 @@ impl AudioRun {
             Some(l) => (Some(l.track), Some(l.src), l.src_t, l.seek),
             None => (None, None, 0, None),
         };
-        Step { kind: Kind::Audio, track, src, src_t, out_t: self.out_t, len: self.len, seek }
+        Step { kind: Kind::Audio, track, src, src_t, out_t: self.out_t, len: self.len, seek, vmix: None }
     }
 }
 
@@ -229,4 +262,45 @@ fn env_q16(c: &crate::Clip, t: i64) -> u32 {
         e = e.min((c.end() - t).max(0) * ENV_ONE as i64 / c.fade_out);
     }
     e as u32
+}
+
+/// NLE3: the outgoing source under video tick `t` of clip `ci` on track `ti`, if `t` lies in the transition on that
+/// clip's cut. Its run continues the previous video step at the transition's first tick (`v_next`), then itself
+/// (`m_next`); `m_next` is reset outside a transition.
+fn vmix_for(
+    tl: &Timeline,
+    idx: &dyn SourceIndex,
+    ti: usize,
+    ci: usize,
+    t: i64,
+    v_next: Option<(SourceId, i64)>,
+    m_next: &mut Option<(SourceId, i64)>,
+) -> Result<Option<VideoMix>, ScheduleError> {
+    let tr = &tl.tracks[ti];
+    let c = tr.clips[ci];
+    let Some(x) = tr.transitions.iter().find(|x| x.at == c.at && t < c.at + x.dur) else {
+        *m_next = None;
+        return Ok(None);
+    };
+    // validate: the outgoing clip ends at the cut, so it is the clip before (clips are ordered and never overlap).
+    let o = tr.clips[ci - 1];
+    let k = t - c.at;
+    let src_t = o.src_out + k;
+    let seek = seek_for(tl, idx, Kind::Video, o.src, src_t, if k == 0 { v_next } else { *m_next })?;
+    *m_next = Some((o.src, src_t + 1));
+    Ok(Some(VideoMix { kind: x.kind, src: o.src, src_t, seek, t: Frac { num: k + 1, den: x.dur + 1 } }))
+}
+
+/// NLE3: every transition's outgoing handle lies inside what the index says the source holds.
+fn handles_fit(tl: &Timeline, idx: &dyn SourceIndex) -> Result<(), ScheduleError> {
+    for tr in &tl.tracks {
+        for x in &tr.transitions {
+            if let Some(o) = tr.clips.iter().find(|c| c.end() == x.at) {
+                if idx.duration(o.src).is_some_and(|d| o.src_out + x.dur > d) {
+                    return Err(ScheduleError::OutOfSource(o.src));
+                }
+            }
+        }
+    }
+    Ok(())
 }

@@ -66,6 +66,8 @@ for every family the flight needs, and a control string that must be 0.
 The rMBP panel on x86 QEMU (ZOOMPANEL B842): `UNAOS_FBW=2880 UNAOS_FBH=1800` arm the default VGA at that size (`xres`/`yres`/`edid`/`vgamem_mb`)
 and the loader picks it when OVMF offers it; `UNAOS_PPI=221` is the ppi the scale is taken from (2.0). The leg: those three plus
 `UNAOS_WC=1 UNAOS_FACET=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`, scored by `scripts/specs/x86-panel.spec`.
+The Pi desktop (PIDESK-SPEC B878): `./arroyo kernel8-test --desk 300` (= `UNAOS_PIDESK=1`) is scored by `scripts/specs/pi4-regression.spec`, then
+`scripts/specs/pi4-desktop.spec` (the armed desktop's REQUIREs); a new `desktop_firmware` line goes OPTIONAL+FORBID in the first and REQUIRE in the second.
 
 ## 4. Stage and card (Orin)
 1. Stage the tree (never a `target/` path to Peter):
@@ -90,9 +92,16 @@ and the loader picks it when OVMF offers it; `UNAOS_PPI=221` is the ppi the scal
    The second writes the FLIGHTID; score every boot by `KELF min=0x0 max=<max_vaddr>` and the boot volume
    serial FIRST. The Orin boots our MBR card from the native microSD slot only when the FAT32 is FAT32 by
    cluster count; from a USB reader it always did.
-7. The list (BOOTLIST B817, R132): the flight's fixtures ride the card as `TESTS.LIST` (`unaos/fixtures/TESTS.LIST`, staged by `esp-x86`;
-   `TESTS.HEAVY` = `boot2` moves the HEAVY tier to boot 2); the kernel runs it at `[desktop] built`. Nobody types fixtures over the door:
-   the seat edits the list before staging and reads `:: BOOTLIST: ran= pass= fail= skip= heavy= ms= ::` and the per-fixture lines off the wire.
+7. The list (BOOTLIST B817, R132; BOOTLISTARM B874): the flight's fixtures ride every board's card as `TESTS.LIST` (ONE file,
+   `unaos/fixtures/TESTS.LIST`, staged verbatim by `esp-x86`, `esp-arm`, `esp-jetson[-img]` and `kernel8` before each card image is
+   built; the QEMU lanes never stage it; `TESTS.HEAVY` = `boot2` moves the HEAVY tier to boot 2); the kernel runs it at `[desktop] built`
+   on the rMBP, the Pi and the Orin. Grammar, one fixture per line: `[tests] <verb> [<one arg>] [@<n>[s]] [@<board> …]` — `@<n>` the
+   budget in seconds (default 60, max 3600; an overrun is ABANDONED: `:: <VERB>: -> SKIP(budget <n>s) ::` + `[bootlist] abandoned …`,
+   a later return `[bootlist] late … late=<n>`); `@<board>` (a letter first: `rmbp12`, `pi4`, `orin` = the kernel's `boot::OLDEST`)
+   limits the line to those boards (several tags = any of them; untagged = every board; a line for another board is counted `other=`);
+   `#` starts a comment; `HEAVY:` puts every later line in the heavy tier. Nobody types fixtures over the door: the seat edits the list
+   before staging and reads `:: BOOTLIST: ran= pass= fail= skip= heavy= ms= ::`, `[bootlist] tally abandoned= late=` and the per-fixture
+   lines off the wire.
 
 ## 5. Read the wire
 `LC_ALL=C tail -c +<mark byte+1> ~/unaos-bench/capture/line-acm0/raw.log | tr -d '\000' > <scratch>/wire.txt`,

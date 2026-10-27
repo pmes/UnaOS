@@ -4545,6 +4545,18 @@ dependencies = [
  "gneiss_pal",
  "log",
  "resonance",
+ "text_host",
+ "timeline_core",
+ "tokio",
+]
+
+[[package]]
+name = "stria-view"
+version = "0.1.0"
+dependencies = [
+ "bandy",
+ "quartzite",
+ "stria",
  "timeline_core",
  "tokio",
 ]

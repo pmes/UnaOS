@@ -832,6 +832,8 @@ fn main() {
     if std::env::var("UNAOS_LOGINST").is_ok() { feats.push("loginst"); }
     // KEYBOOT3 (rmbp-ledger B856): the first-user keying of the native root deferred. Kept in sync with arroyo's map.
     if std::env::var("UNAOS_KEYBOOT_DEFER").is_ok() { feats.push("keyboot_defer"); }
+    // AUTOLOCK3 (rmbp-ledger B875): `tests autolock` reads its credential from the card's staged fixture file. Kept in sync with arroyo's map.
+    if std::env::var("UNAOS_AUTOLOCK_FIXTURE").is_ok() { feats.push("autolock_fixture"); }
     if std::env::var("UNAOS_TESTS_AT_BOOT").is_ok() { feats.push("tests-at-boot"); }
     if std::env::var("UNAOS_CENSUS").is_ok() { feats.push("census"); } // QUIETBOOT (R80): every census sampler on at boot. Kept in sync with arroyo.
     // BT-BOND M1 / HOLOCRON SELFTESTS: UNAOS_HCRONST=1 arms the store's two BOOT-TIME-WRITE selftests
@@ -870,6 +872,8 @@ fn main() {
     // builds — a knob wired into arroyo alone would ship the ladder DISABLED while the
     // banner claims it is on (the s42/INSTGUI and WXN-M3b failure). Kept in sync with arroyo.
     if std::env::var("UNAOS_KEPLER_CE").is_ok() { feats.push("nvidia-kepler-ce"); }
+    // KEPLER3D (B877): UNAOS_KEPLERCE=1 arms `tests keplerce`, the copy engine's three-job wall fixture. Kept in sync with arroyo.
+    if std::env::var("UNAOS_KEPLERCE").is_ok() { feats.push("nvidia-kepler-cecopy"); }
     if std::env::var("UNAOS_KDISP_HOLD").is_ok() { feats.push("nvidia-kepler-kdisp-hold"); }
     // BEAMX86: UNAOS_BEAM=1 arms the x86 beam SOURCE — `kepler_display::beam_probe`, which samples
     // the live head's HEAD_STAT.VERT at the end of the Kepler takeover seam so `arch::scanout_beam()`

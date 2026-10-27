@@ -8,6 +8,8 @@
 //! refuses is `Error::Unsupported` / `Error::UnknownFormat` and the caller decides what to fall back to.
 
 pub use pixel_core::{
-    Error, Format, Frame, Image, MAX_DIM, MAX_PIXELS, decode, decode_bmp, decode_gif, decode_jpeg, decode_png,
+    Error, Format, Frame, Image, MAX_DIM, MAX_PIXELS, blend_nonpremult, decode, decode_bmp, decode_gif, decode_jpeg, decode_png,
     decode_qoi, decode_webp, sniff,
 };
+/// NLE5 (SR204): pixel_core's PNG writer (APPRES B398 / SHOTZIP), the one Stria's editor export encodes with.
+pub use pixel_core::png::encode::{PngError, encode_rgba};

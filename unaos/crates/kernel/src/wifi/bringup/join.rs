@@ -321,8 +321,8 @@ pub(super) fn keep(bar0: u64, prep: tx::Prep, rxr: rx::Rx, mut seen: rx::Seen, c
     seen.data.clear();
     seen.join.frames.clear();
     seen.join.watch = seen.join.bss.map(|b| super::super::data::Watch::new(b.bssid, crate::arch::ticks()));
-    let next = link.tx_next();
-    *STATION.lock() = Some(Station { bar0, ch, prep, rxr, seen, link, w, q: tx::Queue::default(), lost: None, rate });
+    let next = link.tx_next(); let mut q = tx::Queue::default(); q.ctl = rate_ctl(seen.join.rates, seen.join.short, rate.rate); // STATIONRATECTL (B881): the rate controller starts at `pick_rate`'s rate, owned by STATION with the queue
+    *STATION.lock() = Some(Station { bar0, ch, prep, rxr, seen, link, w, q, lost: None, rate });
     serial_println!("[wifi10] station kept tx_next={} — the TX ring and the receiver stay armed for the stack (WIFIDHCP B831)", next);
 }
 
@@ -342,7 +342,7 @@ pub(in crate::wifi) fn station_tx(eth: &[u8]) -> bool {
         return false;
     }
     match st.link.send(eth) {
-        Ok((air, n)) => tx::queue(st.bar0, &st.prep, &mut st.q, &air, st.ch, n, now, st.rate, &mut st.w),
+        Ok((air, n)) => { let r = rate_for(st, &air); tx::queue(st.bar0, &st.prep, &mut st.q, &air, st.ch, n, now, r, &mut st.w) } // STATIONRATECTL (B881): the controller's rate (a probe every 16th unicast frame)
         Err(_) => false,
     }
 }
@@ -398,7 +398,7 @@ pub(in crate::wifi) fn station_mac() -> Option<(Mac, bool)> {
 fn service(st: &mut Station) {
     rx::drain(st.bar0, &mut st.rxr, &mut st.seen, st.ch, &mut st.w);
     let now = crate::arch::ticks();
-    tx::reap(st.bar0, &mut st.q, now);
+    tx::reap(st.bar0, &mut st.q, now); rate_step(st, now); // STATIONRATECTL (B881): at most one step per second, under STATION
     let why = st.seen.join.watch.as_mut().and_then(|wt| wt.tick(now));
     if let Some(why) = why {
         lose(st, why);
@@ -413,9 +413,9 @@ fn lose(st: &mut Station, why: &'static str) {
     let (reason, beacons, tu) = st.seen.join.watch.as_ref().map_or((0, 0, 0), |wt| (wt.reason, wt.beacons, wt.tu));
     let q = &st.q;
     serial_println!(
-        "[wifi10] station lost why={} reason={} beacons={} tu={} tx_posted={} tx_sent={} tx_acked={} tx_failed={} tx_stuck={} tx_full={} tx_q={} rx_data={} — the accessor triple answers link-down; tests wifi <ssid> <gw> re-joins (STATIONWATCH B843)",
+        "[wifi10] station lost why={} reason={} beacons={} tu={} tx_posted={} tx_sent={} tx_acked={} tx_failed={} tx_stuck={} tx_full={} tx_q={} rx_data={} rate={} ok={} retry={}.{} — the accessor triple answers link-down; tests wifi <ssid> <gw> re-joins (STATIONWATCH B843)",
         why, if why == "beacon-loss" { String::from("-") } else { alloc::format!("{}", reason) }, beacons, tu,
-        q.posted, q.sent, q.acked, q.failed, q.stuck, q.full, q.in_flight(), st.link.rx_data
+        q.posted, q.sent, q.acked, q.failed, q.stuck, q.full, q.in_flight(), st.link.rx_data, assoc::rate_name(q.ctl.rate()), q.ctl.stats(q.ctl.rate()).0, q.ctl.stats(q.ctl.rate()).1 / 100, q.ctl.stats(q.ctl.rate()).1 % 100 / 10
     );
 }
 
@@ -453,7 +453,7 @@ fn pick_rate(bar0: u64, p: &tx::Prep, rs: Option<wifi_core::ieee80211::RateSet>,
         "none"
     };
     let rate = assoc::station_rate(rs, probe == "ack");
-    let air = tx::TxRate { rate, ack: assoc::ack_rate(rs, rate), short: assoc::station_short(short_cap, rate) };
+    let air = tx::TxRate { rate, ack: assoc::ack_rate(rs, rate), short: assoc::station_short(short_cap, rate), fb: assoc::fallback_rate(rs, rate) };
     serial_println!(
         "[wifi10] station rate={} probe={} probe_at=keep(shell task, before STATION, no lock) ap={} preamble={} ack={} nav={}us — b43 xmit.c:136-189, :884 (STATIONRATE B855); xmit.c:374-375, 802.11-2020 §10.6.6.5.2 (STATIONAIR B862)",
         assoc::rate_name(rate), probe, assoc::rates_text(rs), if air.short { "short" } else { "long" }, assoc::rate_name(air.ack), tx::nav_us(air)
@@ -464,8 +464,43 @@ fn pick_rate(bar0: u64, p: &tx::Prep, rs: Option<wifi_core::ieee80211::RateSet>,
 /// `tests wifi` (`data::kat` rows 10-14, 17-18): `tx::rate_kat`'s four rows, then the station MACCTL word from S6's `arm` word
 /// (ENABLED | INFRA | BEACPROMISC | KEEP_BAD | PROMISC | DISCPMQ -> ENABLED | INFRA | DISCPMQ), then `tx::air_kat`'s two
 /// (duration, shortpre; STATIONAIR B862).
-pub(in crate::wifi) fn station_kat() -> [bool; 7] {
+pub(in crate::wifi) fn station_kat() -> [bool; 8] {
     let t = tx::rate_kat();
     let a = tx::air_kat();
-    [t[0], t[1], t[2], t[3], rx::station_macctl(0x4192_0001) == 0x4002_0001, a[0], a[1]]
+    [t[0], t[1], t[2], t[3], rx::station_macctl(0x4192_0001) == 0x4002_0001, a[0], a[1], tx::fb_kat()]
+}
+
+// ── STATIONRATECTL (rmbp-ledger B881): the kept station's rate follows the ACKs ───────────────────────────────────────
+
+/// From `keep` (shell task, before `STATION`, no lock): the controller over the AP's rate set, starting at `pick_rate`'s rate.
+fn rate_ctl(rs: Option<wifi_core::ieee80211::RateSet>, short: bool, start: u8) -> super::super::data::RateCtl {
+    super::super::data::RateCtl::new(rs, short, start, crate::arch::ticks())
+}
+
+/// A controller rate as ONE `tx::TxRate`, built as `pick_rate` builds its own: the AP's answer rate (`assoc::ack_rate`), the
+/// short preamble (`assoc::station_short`), the TX header's fallback (`assoc::fallback_rate`).
+fn air_of(c: &super::super::data::RateCtl, rate: u8) -> tx::TxRate {
+    tx::TxRate { rate, ack: assoc::ack_rate(c.rs, rate), short: assoc::station_short(c.short, rate), fb: assoc::fallback_rate(c.rs, rate) }
+}
+
+/// `station_tx`, under `STATION`: the frame's rate. A group addr1 leaves at the current rate (never ACKed, so never a probe and
+/// never counted: `tx::queue` records it as 0); a unicast frame at the controller's next rate.
+fn rate_for(st: &mut Station, air: &[u8]) -> tx::TxRate {
+    if air.len() < 10 || air[4] & 0x01 != 0 {
+        return st.rate;
+    }
+    let r = st.q.ctl.next_rate();
+    if r == st.rate.rate { st.rate } else { air_of(&st.q.ctl, r) }
+}
+
+/// `service`, under `STATION`, after the reap: at most one step per second (`RateCtl::decide`); the new rate becomes the
+/// station's `TxRate`, said with the old rate's EWMA inputs at the moment of the step.
+fn rate_step(st: &mut Station, now: u64) {
+    let Some((old, new, why)) = st.q.ctl.decide(now) else { return };
+    st.rate = air_of(&st.q.ctl, new);
+    let (ok, retry) = st.q.ctl.stats(old);
+    serial_println!(
+        "[wifi10] station rate -> {}->{} why={} ok={} retry={}.{} — rc80211_minstrel.c shape (EWMA per rate, a sample frame every 16), b43 xmit.c:884 (STATIONRATECTL B881)",
+        assoc::rate_name(old), assoc::rate_name(new), why, ok, retry / 100, retry % 100 / 10
+    );
 }

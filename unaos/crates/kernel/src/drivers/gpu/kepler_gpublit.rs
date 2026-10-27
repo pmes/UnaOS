@@ -57,7 +57,7 @@ const W_PTS: usize = 0x80000; // four small-page tables under PDE[1..5] (the sys
 /// `W_UTAB + CHID*0x200`. // nouveau gk104.c:116 (size 0x200), :804 (4096 chids), base.c:305-319, chan.c:463
 const W_UTAB: usize = 0x180000;
 const UTAB_SIZE: usize = 4096 * 0x200;
-const W_SPAN: usize = W_UTAB + UTAB_SIZE;
+const W_SPAN: usize = W_UTAB + UTAB_SIZE + CEFIX_BYTES;
 
 const PUSH_SLOT: usize = 0x800;
 const PUSH_SLOTS: u32 = 16;
@@ -914,3 +914,170 @@ pub fn tests_gpublit() {
     let pass = ARMED.load(Acquire) && matches!(st.verdict, St::Ok);
     serial_println!(":: GPUBLIT-TEST: rerun={} boot={} -> {} ::", verdict_word(st.verdict), boot, if pass { "PASS" } else { "FAIL" });
 }
+
+// ---- KEPLER3D (rmbp-ledger B877) — `tests keplerce`: three 256x256 copies on the CE that name WALL B ----------------
+// The boot self-test passes on every flight (f34..f37 `:: GPUBLIT: selftest=ok ce_us=~20 cpu_us=197`) and the FIRST job after
+// it times out (f34-boot2, f36-boot2, f37-boot1: `demoted reason=timeout job=1 gp_get=2 gp_put=2 sem=00000001 want=00000002`).
+// Three jobs, stopped at the first non-ok one, tell the candidates apart: J1 VRAM -> VRAM (no sysmem PTE: any later job dies),
+// J2 a fresh heap source (new `map_sys` PTEs written after the GMMU walked the table, no TLB invalidate: fresh-pte), J3 the same
+// source again (the cached mapping: reuse). Each destination is read back through the BAR1 aperture word by word. Behind
+// `nvidia-kepler-cecopy` (UNAOS_KEPLERCE), never at boot (R80); it calls `run`, never `copy_wait`, so it neither demotes nor
+// selects the compositor's blitter (WALL A, the selection latched before `arm`, is KEPLER3D2's). The region is the knob-only
+// tail of this module's own VRAM window (`CEFIX_BYTES`, 0 bytes knob-off), inside the PDE[0] identity map, never scanned out.
+
+/// KEPLER3D: the fixture's VRAM region past the USERD table (source half + destination half); 0 bytes without the knob.
+#[cfg(feature = "nvidia-kepler-cecopy")]
+const CEFIX_BYTES: usize = 0x8_0000;
+#[cfg(not(feature = "nvidia-kepler-cecopy"))]
+const CEFIX_BYTES: usize = 0;
+
+#[cfg(feature = "nvidia-kepler-cecopy")]
+mod cefix {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+
+    const W_CEFIX: usize = super::W_UTAB + super::UTAB_SIZE;
+    const F_W: usize = 256;
+    const F_H: usize = 256;
+    const PITCH: usize = F_W * 4;
+    const BYTES: usize = PITCH * F_H;
+    const JOB_BUDGET_US: u64 = 20_000;
+    const _: () = assert!(2 * BYTES <= super::CEFIX_BYTES, "KEPLER3D: the source and destination halves fit the region");
+
+    #[derive(Clone, Copy)]
+    enum Out {
+        Ok,
+        Mismatch(usize),
+        Timeout,
+        Unmappable,
+    }
+
+    fn pat(salt: u32, i: usize) -> u32 {
+        let (x, y) = ((i % F_W) as u32, (i / F_W) as u32);
+        salt ^ (x << 16) ^ (y << 8) ^ (x.wrapping_mul(7).wrapping_add(y.wrapping_mul(13)) & 0xFF)
+    }
+
+    fn out_word(o: Out) -> alloc::string::String {
+        match o {
+            Out::Ok => "ok".into(),
+            Out::Mismatch(n) => alloc::format!("mismatch@{}", n),
+            Out::Timeout => "timeout".into(),
+            Out::Unmappable => "unmappable".into(),
+        }
+    }
+
+    /// One 256x256x4 copy from CPU address `src` into the region's destination half (zeroed first through BAR1), read back
+    /// through the aperture against `pat(salt, ..)`. One `[keplerce] job=` line.
+    fn job(ch: &mut super::Chan, src: usize, salt: u32, k: usize, kind: &str) -> (Out, u64) {
+        let (b1, w) = (super::BAR1.load(Relaxed), super::win());
+        let dst = w + W_CEFIX + BYTES;
+        for i in 0..F_W * F_H {
+            super::vw(dst + i * 4, 0);
+        }
+        let rect = [super::CeRect { src_off: 0, src_pitch: PITCH, dst_off: 0, dst_pitch: PITCH, row_bytes: PITCH, rows: F_H }];
+        let (out, us) = match super::run(ch, src, b1 + dst, &rect, JOB_BUDGET_US) {
+            Ok(c) => {
+                let mut o = Out::Ok;
+                for i in 0..F_W * F_H {
+                    let (got, want) = (super::vr(dst + i * 4), pat(salt, i));
+                    if got != want {
+                        o = Out::Mismatch(i * 4 + (got ^ want).trailing_zeros() as usize / 8);
+                        break;
+                    }
+                }
+                (o, super::cyc_us(c))
+            }
+            Err(super::CeErr::Timeout) => (Out::Timeout, JOB_BUDGET_US),
+            Err(_) => (Out::Unmappable, 0),
+        };
+        serial_println!(
+            "[keplerce] job={} kind={} us={} verify={} seq={} gp_get={} gp_put={} sem={:08X}",
+            k, kind, us, out_word(out), ch.seq, super::vr(w + super::userd_off() + super::USERD_GP_GET), ch.put, super::vr(w + super::W_SEM)
+        );
+        (out, us)
+    }
+
+    /// `tests keplerce`: PASS iff all three jobs copy and verify byte-exact; `wall=` names the first job that did not.
+    pub fn tests_keplerce() {
+        if !super::BUILT.load(Acquire) {
+            if super::VERDICT.load(Acquire) == 0 {
+                serial_println!(":: KEPLERCE: channel=absent copy=- verify=- us=0 jobs=0/3 wall=- -> SKIP reason=no-kepler ::");
+            } else {
+                serial_println!(":: KEPLERCE: channel=refused({}) copy=- verify=- us=0 jobs=0/3 wall=- -> FAIL ::", *super::REFUSED.lock());
+            }
+            return;
+        }
+        // A channel the boot unwound, or one a timeout demoted, answers nothing a job could measure (`tests gpublit` re-lays an
+        // unwound one; the bench runs `tests keplerce` before `tests gen7`, whose candidate race is what demoted f34/f36/f37).
+        let prior = if super::UNWOUND.load(Acquire) { "unwound" } else if super::DEMOTED.load(Acquire) { "demoted" } else { "" };
+        if !prior.is_empty() {
+            serial_println!(":: KEPLERCE: channel={} copy=- verify=- us=0 jobs=0/3 wall=- -> FAIL ::", prior);
+            return;
+        }
+        let mut heap = alloc::vec::Vec::new();
+        if heap.try_reserve_exact(F_W * F_H).is_err() {
+            serial_println!(":: KEPLERCE: channel=ok copy=refused(heap) verify=- us=0 jobs=0/3 wall=- -> FAIL ::");
+            return;
+        }
+        heap.resize(F_W * F_H, 0u32);
+        let t0 = crate::arch::now_cycles();
+        let lim = super::tsc_hz() / 20; // 50 ms for another holder to release the channel
+        let mut g = None;
+        while g.is_none() && crate::arch::now_cycles().saturating_sub(t0) < lim {
+            g = super::CHAN.try_lock();
+            core::hint::spin_loop();
+        }
+        let Some(mut ch) = g else {
+            serial_println!(":: KEPLERCE: channel=busy copy=- verify=- us=0 jobs=0/3 wall=- -> FAIL ::");
+            return;
+        };
+        // J1's source: the CPU writes the pattern through BAR1, timed — the aperture write the copy engine replaces.
+        let (b1, src_v) = (super::BAR1.load(Relaxed), super::win() + W_CEFIX);
+        let jobs: [(&str, u32, &str); 3] = [("vram", 0xC1A5_0000, "later-job"), ("sys", 0xC25A_0000, "fresh-pte"), ("reuse", 0xC3E5_0000, "reuse")];
+        let t1 = crate::arch::now_cycles();
+        for i in 0..F_W * F_H {
+            super::vw(src_v + i * 4, pat(jobs[0].1, i));
+        }
+        let cpu_us = super::cyc_us(crate::arch::now_cycles().saturating_sub(t1));
+        let (mut done, mut wall, mut last, mut sys_us) = (0usize, "none", Out::Ok, 0u64);
+        for (k, &(kind, salt, why)) in jobs.iter().enumerate() {
+            let src = if k == 0 {
+                b1 + src_v
+            } else {
+                for (i, v) in heap.iter_mut().enumerate() {
+                    *v = pat(salt, i);
+                }
+                heap.as_ptr() as usize
+            };
+            let (o, us) = job(&mut ch, src, salt, k + 1, kind);
+            if k == 1 {
+                sys_us = us;
+            }
+            if !matches!(o, Out::Ok) {
+                last = o;
+                wall = why;
+                break;
+            }
+            done += 1;
+        }
+        drop(ch);
+        if done < 3 {
+            super::detail(&super::StOut { verdict: super::St::Timeout, ce_us: 0, cpu_us }); // the existing dump: chid, host, walls, decode
+        }
+        let copy = match last {
+            Out::Ok | Out::Mismatch(_) => "ok",
+            Out::Timeout => "timeout",
+            Out::Unmappable => "unmappable",
+        };
+        let verify = match last {
+            Out::Ok => alloc::string::String::from("ok"),
+            Out::Mismatch(n) => alloc::format!("mismatch@{}", n),
+            _ => alloc::string::String::from("-"),
+        };
+        serial_println!(
+            ":: KEPLERCE: channel=ok copy={} verify={} us={} jobs={}/3 wall={} cpu_us={} px={} -> {} ::",
+            copy, verify, sys_us, done, wall, cpu_us, F_W * F_H, if done == 3 { "PASS" } else { "FAIL" }
+        );
+    }
+}
+#[cfg(feature = "nvidia-kepler-cecopy")]
+pub use cefix::tests_keplerce;

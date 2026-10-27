@@ -7,6 +7,7 @@
 //! ```text
 //! nle schedule <edl> [--fps N] --src REEL=<media> ...
 //! nle render   <edl> [--fps N] --src REEL=<media> ... --out <stem>
+//! nle export   <edl> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw] [--audio wav|mp4|none]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! ```
 //!
@@ -14,16 +15,21 @@
 //! `w*h*4` bytes each, in order) and `<stem>.f32` (interleaved little-endian f32 PCM), then one JSON line: frames, size,
 //! PCM frames, rate, channels, seeks, run-up frames and the FNV-1a 64 of the RGBA stream. `--fps` is the frame rate when
 //! the EDL carries no `* UNA FPS` line (default 25). `--make-src` writes `stria::nle::synth_source` (utp1 + PCM16).
+//! `export` (NLE5, SR204) drives `stria::nle_export::export` into `<dir>` (created): `%06d.png` per frame or
+//! `video.rgba` + `video.json`, and `audio.wav` or `audio.mp4`; one JSON line: frames, files, bytes, the RGBA fnv
+//! (`render`'s) and PCM frames.
 
 use std::io::Write;
 
 use stria::nle::{RenderSink, Sources, render, synth_source};
+use stria::nle_export::{AudioOut, PngSequence, RawSequence, VideoEncoder, export};
 use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl> [--fps N] --src REEL=<media> ... --out <stem>");
+    eprintln!("       nle export <edl> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw] [--audio wav|mp4|none]");
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     std::process::exit(2)
 }
@@ -80,11 +86,14 @@ fn main() {
     }
     let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() };
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
+    let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
     let mut it = args[2..].iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--fps" => fps = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()),
             "--out" => out = Some(it.next().unwrap_or_else(|| usage()).clone()),
+            "--video" => video = it.next().unwrap_or_else(|| usage()).clone(),
+            "--audio" => audio = it.next().unwrap_or_else(|| usage()).clone(),
             "--src" => {
                 let v = it.next().unwrap_or_else(|| usage());
                 let Some((r, p)) = v.split_once('=') else { usage() };
@@ -123,6 +132,28 @@ fn main() {
                 r.frames, r.width, r.height, r.pcm_frames, r.rate, r.channels, r.seeks, r.runup_frames, files.fnv
             );
         }
+        "export" => export_verb(&tl, range, &sources, &out.unwrap_or_else(|| usage()), &video, &audio),
         _ => usage(),
     }
+}
+
+/// NLE5 (SR204): the `export` verb — plumbing only; the export is `stria::nle_export`'s.
+fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, video: &str, audio: &str) {
+    let enc: Box<dyn VideoEncoder> = match video {
+        "png" => Box::new(PngSequence),
+        "raw" => Box::new(RawSequence),
+        _ => usage(),
+    };
+    let aud = match audio {
+        "wav" => AudioOut::Wav,
+        "mp4" => AudioOut::Mp4,
+        "none" => AudioOut::None,
+        _ => usage(),
+    };
+    std::fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{dir}: {e}")));
+    let r = export(tl, range, sources, std::path::Path::new(dir), enc, aud).unwrap_or_else(|e| die(e.to_string()));
+    println!(
+        "{{\"frames\":{},\"files\":{},\"bytes\":{},\"fnv\":\"{:016x}\",\"pcm_frames\":{}}}",
+        r.frames, r.files, r.bytes, r.fnv, r.pcm_frames
+    );
 }

@@ -32310,3 +32310,26 @@ pub fn move_set(moves: &[(WinId, usize, usize)]) {
         composite();
     }
 }
+
+// TEXTSCALERESEAT (rmbp-ledger B880; BP-video-40) — TAIL-APPENDED so no line above moves. The kernel apps' re-seat door: a
+// kernel row (the kernel band, or owner 0 — the login card) asks wm to change its own height when its text size steps.
+// wm never learns text metrics; the window computes its height (`h_at`) and names it. THE RULE: a row that re-seats
+// allocated its surface ONCE, at open, for its LARGEST height (`h_at` at the cap) and named that capacity as `surf_len`
+// at create; it never re-allocates under a live row. The door re-seats within that capacity; past it `resize_to_inner`
+// answers `Some(false)` and the window keeps its height.
+
+/// The kernel apps' re-seat door (TEXTSCALERESEAT B880): `resize_to_inner` — the ONE resize body — with the row's own
+/// position and `Some(owner)`, so a recycled id is refused. `None` = no such row, a compat row, or not a kernel-owned row;
+/// `Some(false)` = unchanged or past the row's surface capacity (the window keeps its height); `Some(true)` = re-seated.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn resize_kernel_row(id: WinId, w: usize, h: usize) -> Option<bool> {
+    let (owner, x, y) = {
+        let t = table();
+        let r = row(&t, id)?;
+        if r.compat || !(r.owner_asid == 0 || is_kernel_owner(r.owner_asid)) {
+            return None;
+        }
+        (r.owner_asid, r.x, r.y)
+    };
+    resize_to_inner(id, Some(owner), x, y, w, h)
+}

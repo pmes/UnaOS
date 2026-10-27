@@ -62,6 +62,10 @@ pub mod media;
 pub mod media_bus;
 /// NLE1 (SR194): the editor render — a timeline_core schedule through the dsp decoder registry.
 pub mod nle;
+/// NLE5 (SR204): the editor export — the encoder seam (PNG / raw), WAV and PCM16 MP4 audio.
+pub mod nle_export;
+/// NLE2 (SR201): the editor face — EditorState over timeline_core's ops, the one painter, the bus service.
+pub mod nle_face;
 /// AETHERMEDIA2 (SR134): the Media Source Extensions feed.
 pub mod media_source;
 
