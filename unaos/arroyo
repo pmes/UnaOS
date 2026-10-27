@@ -2947,6 +2947,23 @@ if [ -n "${UNAOS_UAC:-}" ]; then
         *) export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -audiodev none,id=uac0 -device usb-audio,audiodev=uac0,bus=xhci.0" ;;
     esac
 fi
+# DONGLEBOOT2 (rmbp-ledger B1007): UNAOS_USB_EXTRA_INT=<n> attaches n extra interrupt-endpoint devices (QEMU usb-kbd) on
+# the harness EHCI bus (`usb-ehci,id=ehci`, builder/src/main.rs) at enumeration, through UNAOS_QEMU_EXTRA, so the EHCI
+# int-EP pool (`MAX_INT_EPS` = 6 per controller) carries load. QEMU's usb-ehci has six ports and the harness usb-kbd holds
+# one, so n is clamped to 5 (the pool fills 6/6 exactly; QEMU attaches no hub to EHCI and can never refuse a slot: the
+# refusal leg is `tests intpool`'s KAT). Non-numeric is ignored; skipped under UNAOS_NOEHCIHID (no ehci bus).
+# The leg: `UNAOS_USB_EXTRA_INT=4 ./arroyo test` + `tests intpool`:
+#   `:: INTPOOL: slots=6 taken=5 refused=0 hid_armed=5 reserve=owed who_lost=- kat=ok -> PASS ::`
+USB_EXTRA_INT_DEV="usb-kbd,bus=ehci.0"
+case "${UNAOS_USB_EXTRA_INT:-}" in
+    ''|*[!0-9]*) ;;
+    *) if [ -z "${UNAOS_NOEHCIHID:-}" ]; then
+           _xint=0; _xint_n=$(( UNAOS_USB_EXTRA_INT > 5 ? 5 : UNAOS_USB_EXTRA_INT ))
+           while [ "${_xint}" -lt "${_xint_n}" ]; do
+               export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -device ${USB_EXTRA_INT_DEV},id=xint${_xint}"; _xint=$((_xint + 1))
+           done
+       fi ;;
+esac
 # IOAPIC (rmbp-ledger B147): UNAOS_IOAPIC=1 arms arch/x86_64/ioapic.rs — the Intel 82093AA I/O APIC
 # redirection table, WHICH THIS KERNEL HAS NEVER HAD. `arch/x86_64/apic.rs` drives the LOCAL APIC
 # only (xAPIC MMIO + x2APIC MSRs) and `drivers/pci.rs` can enable MSI and MSI-X, so a PCI function
