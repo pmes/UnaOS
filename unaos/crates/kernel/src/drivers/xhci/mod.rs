@@ -5175,9 +5175,9 @@ impl XhciController {
                                                 report[2], report[3], report[4],
                                                 report[5], report[6], report[7],
                                             ];
-                                            let prev_keys = self.slots[slot_id as usize].keyboard_prev_keys; #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { let _ = crate::video::fnrow::fn_row_usage(crate::video::fnrow::PATH_XHCI, kc, modifiers); } } // XHCIMEDIA (B438): F-row press edges through the one router (the EHCI pump calls it at the same point)
+                                            let prev_keys = self.slots[slot_id as usize].keyboard_prev_keys; #[cfg(all(target_arch = "x86_64", feature = "wc"))] for &kc in cur_keys.iter() { if kc > 1 && !prev_keys.contains(&kc) { let _ = crate::video::fnrow::fn_row_usage(crate::video::fnrow::PATH_XHCI, kc, modifiers); } } // XHCIMEDIA (B438): F-row press edges through the one router (the EHCI pump calls it at the same point)
 
-                                            { let mut lev = [crate::pal::Event::None; 12]; let _ = hid_layout_push(&cur_keys, &prev_keys, modifiers, caps, "xHCI", false, &mut lev); } for i in 2..8 { // KEYCHARS (B718): the report's ONE layout call; its chars are pushed there, its claimed usages skipped below. LINE-NEUTRAL, code first.
+                                            #[cfg(target_arch = "x86_64")] { let mut lev = [crate::pal::Event::None; 12]; let _ = hid_layout_push(&cur_keys, &prev_keys, modifiers, caps, "xHCI", false, &mut lev); } #[cfg(target_arch = "x86_64")] for i in 2..8 { // KEYCHARS (B718): the report's ONE layout call; its chars are pushed there, its claimed usages skipped below. LINE-NEUTRAL, code first.
                                                 let keycode = report[i];
                                                 if keycode == 0 { continue; } // No key
                                                 if keycode == 1 || hid_layout_claim(keycode, modifiers, caps).is_some() { continue; } // ErrorRollOver; KEYCHARS: a usage the live layout claimed typed through `hid_layout_push`
@@ -5192,27 +5192,27 @@ impl XhciController {
                                                 }
                                             }
 
-                                            // UVUG-6: feed the host-side typematic tracker at the HID REPORT
-                                            // level — BEFORE any EVENT_QUEUE push, so a release the queue may
-                                            // later DROP (full 64-slot ring) can never strand a held key. Pass
-                                            // the newest ascii pressed this report and the FULL currently-held
-                                            // ascii set; the tracker disarms the moment its key leaves the set.
-                                            #[cfg(all(target_arch = "aarch64", any(feature = "baremetal", feature = "tegra")))] // ORINREPEAT (SR164): + tegra — the Orin's XUSB keyboards decode in this same `poll_events`, so the Pi's feed is theirs too
+                                            // HIDBOOTARM (rmbp-ledger B1000): on aarch64 this report goes to the ONE boot-keyboard
+                                            // decoder, `drivers::hidboot::decode_boot_keyboard` (via its witness wrapper `decode_noted`),
+                                            // under `Transport::Xhci`: the press EDGES (DBLSTROKE), the layout call, UVUG-6's report-level
+                                            // typematic feed (the decoder's, at pal's own gate; this block's aarch64 feed is gone), the
+                                            // release edges, PRTSCR and the chords, and the lock-key toggle. The x86 statements around
+                                            // this block are `x86_64`-gated in place (HIDBOOT-XHCI-X86 owed). The slot keeps its state:
+                                            // the decoder works on local copies of prev_keys/prev_mods so the restated line below still
+                                            // compares against the previous report (and stores both), `keyboard_leds` is the decoder's
+                                            // `leds` byte, and an owed LED change marks HIDLEDDEFER's `keyboard_leds_dirty` for
+                                            // `service_hid_leds`, as the x86 toggle below does. Lines replaced in place (line count kept).
+                                            #[cfg(target_arch = "aarch64")]
                                             {
-                                                let mut held: [u32; 6] = [0; 6];
-                                                let mut hn = 0usize;
-                                                let mut newest_press: u32 = 0;
-                                                for i in 2..8 {
-                                                    let keycode = report[i];
-                                                    if keycode == 0 || keycode == 1 { continue; }
-                                                    let ascii = hid_repeat_key(keycode, modifiers, caps, hid_key_ascii(keycode, modifiers, caps)); // CHARREPEAT (SR156): the layout's TOKEN — its byte, or a char token for `ü` (was KEYCHARSARM's claim byte, 0 for `ü`), as EHCI's feed does
-                                                    if ascii != 0 {
-                                                        held[hn] = ascii;
-                                                        hn += 1;
-                                                        if !prev_keys.contains(&keycode) { newest_press = ascii; }
-                                                    }
+                                                let s = slot_id as usize;
+                                                let _ = caps; // the decoder reads Caps from `leds` itself
+                                                let (mut pk, mut pm, mut leds) = (prev_keys, self.slots[s].keyboard_prev_mods, self.slots[s].keyboard_leds);
+                                                let owed = crate::drivers::hidboot::decode_noted(crate::drivers::hidboot::Transport::Xhci, report, &mut pk, &mut pm, &mut leds);
+                                                self.slots[s].keyboard_leds = leds;
+                                                if owed {
+                                                    self.slots[s].keyboard_leds_dirty = true;
+                                                    KBD_LED_DEFERRED.fetch_add(1, Ordering::Relaxed);
                                                 }
-                                                crate::pal::typematic_note_keys(newest_press, &held[..hn]); // ARMROUTER (VOLKEYS arm, aarch64): moved to `video::fnrow` (XHCIMEDIA B438), called on every arch below; was: F10/F11/F12 press edges through the same `status::volkey_usage` seam the EHCI decoder calls; the board's backend says `amp_written=false` (no HDA here). Same-line fold, line-neutral.
                                             }
 
                                             // HID-KEYS: key-UP edges. A boot report carries the FULL
@@ -5221,7 +5221,7 @@ impl XhciController {
                                             // once per such code. Shift state at release time is used
                                             // for the ascii (consumers that care about identity match
                                             // case-insensitively; e.g. GAME-MODE lowercases).
-                                            for &keycode in prev_keys.iter() {
+                                            #[cfg(target_arch = "x86_64")] for &keycode in prev_keys.iter() {
                                                 if keycode == 0 || keycode == 1 { continue; }
                                                 if cur_keys.contains(&keycode) { continue; } // still held
                                                 // ALLKEYS: releases use the LIBERAL fold — a
@@ -5243,7 +5243,7 @@ impl XhciController {
                                             // returns; the capture happens on the device-service pass,
                                             // because a filesystem write from inside this pass would
                                             // hold the keyboard hostage for its whole duration.
-                                            if let Some(act) = hid_print_screen_action_edge(&cur_keys, &prev_keys, modifiers) {
+                                            #[cfg(target_arch = "x86_64")] if let Some(act) = hid_print_screen_action_edge(&cur_keys, &prev_keys, modifiers) {
                                                 // KEYMAP (R60) — the 0x46 EDGE is still detected here (an edge is not a chord), but what
                                                 // it MEANS is the theme table's to say now: a theme with no Print Screen row disarms the
                                                 // key. The witness keeps its shape and gains `action=`.
@@ -5267,10 +5267,10 @@ impl XhciController {
                                             // SET_REPORT. Caps Lock (0x39, bit1) is the one Peter observed
                                             // never lighting; Num Lock (0x53, bit0) and Scroll Lock (0x47,
                                             // bit2) are toggled the same way for LED/state agreement.
-                                            let mut leds_changed = false;
+                                            #[cfg(target_arch = "x86_64")] let mut leds_changed = false;
                                             // ALLKEYS: the (usage, LED bit) pairs now live beside the
                                             // scancode table so the EHCI toggle loop uses the same three.
-                                            for &(usage, bit) in HID_LOCK_KEYS.iter() {
+                                            #[cfg(target_arch = "x86_64")] for &(usage, bit) in HID_LOCK_KEYS.iter() {
                                                 let pressed_now = cur_keys.contains(&usage);
                                                 let pressed_before = prev_keys.contains(&usage);
                                                 if pressed_now && !pressed_before {
@@ -5278,7 +5278,7 @@ impl XhciController {
                                                     leds_changed = true;
                                                 }
                                             }
-                                            if leds_changed {
+                                            #[cfg(target_arch = "x86_64")] if leds_changed {
                                                 self.slots[slot_id as usize].keyboard_leds_dirty = true; // HIDLEDDEFER (B44) — the bitmap is toggled above; the SET_REPORT that pushes it to the device is a SYNCHRONOUS EP0 control transfer (`set_hid_leds` -> `sync_control` -> `pump_until_ep0_done`, a nested drain of this very event ring, budgeted at `hw_wait_budget()`), and it used to run HERE, inside the completion branch, before the re-arm. It now runs from `service_hid_leds` on the polled service pass, one pass later (<= a few ms), so the completion path holds no wait and no nested dispatch — which also forecloses the re-entrancy orin 17 had to argue was safe (a nested keyboard completion decoding under an outer one). ⚠ FOLDED onto the line that fetched the interface for the call.
                                                 KBD_LED_DEFERRED.fetch_add(1, Ordering::Relaxed); // HIDLEDDEFER — counted so `[kbdpoll]`/XHCIKBD can show the hand-off happened; `[hidled] caps=… set-report ok` still prints, from the service pass. ⚠ FOLDED onto the line that made the call.
                                             }
