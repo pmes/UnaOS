@@ -2412,13 +2412,13 @@ fn build_initial_frame(stack: &mut [u8], trampoline: extern "C" fn() -> !) -> u6
 /// completion signal for `join`), enqueue it on `target_cpu`'s run queue, and poke that CPU. Returns
 /// the new task's id. `target_cpu` must be an online AP, or [`CPU_AUTO`] to let `pick_cpu` place it
 /// (which also makes it steal-eligible — see `Task::steal_ok`).
-fn spawn_inner(
+fn spawn_inner_with(
     name: &'static str,
     entry: fn(usize),
     arg: usize,
     target_cpu: usize,
     priority: u8,
-    stack_bytes: usize,
+    mut stack: Box<[u8]>, slot: Box<core::mem::MaybeUninit<Task>>, // RESTARTALLOC (B1022): the slab (painted + armed) and the Task's box come in ALLOCATED: `spawn_inner` (file tail) allocates both, the singleton restart hands over its SPARE
     done_sem: Option<Arc<Semaphore>>, kill: Option<Arc<KillSwitch>>, // SHELLTASK2 (B474): a kernel task may carry a TEARDOWN-1 kill switch
 ) -> u64 {
     // SMPBAL-X86: the pin contract is decided from the REQUESTED value, before placement resolves it.
@@ -2430,12 +2430,12 @@ fn spawn_inner(
     // RENDSTACK: the slab is `stack_bytes` USABLE plus the guard span below it. `paint_stack` lays
     // the guard and (under `witness`) the high-water poison; `build_initial_frame` is handed the
     // usable span ONLY, so no frame can be built inside the guard.
-    let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes + STACK_GUARD].into_boxed_slice();
-    paint_stack(&mut stack); super::stackguard::arm(stack.as_ptr() as u64, stack.len(), name); // SMALLFIX M6 (STACKGUARD): the guard page goes NOT-PRESENT after the paint. ⚠ SAME-LINE fold, line-neutral.
+    // RESTARTALLOC (B1022): the slab's allocation, paint and guard arm moved verbatim to `spawn_slab` (file tail): a
+    // caller that must not allocate (the singleton restart) passes a slab it built while the heap was free.
     let ctx_rsp = build_initial_frame(&mut stack[STACK_GUARD..], task_trampoline);
 
     let id = NEXT_TID.fetch_add(1, Ordering::Relaxed); crate::prof::note_task(id, name);
-    let task = Box::new(Task {
+    let task = Box::write(slot, Task { // RESTARTALLOC (B1022): the box was allocated by the caller (the restart's spare, or `spawn_inner`); the literal is unchanged
         id,
         name,
         state: AtomicU8::new(STATE_READY),
@@ -8347,7 +8347,7 @@ pub fn singleton_register(name: &'static str, entry: fn(usize), prio: u8) {
     SGL_ENTRY.store(entry as usize, Ordering::Release);
     SGL_PRIO.store(prio, Ordering::Relaxed);
     SGL_HOME.store(meter_current_cpu(), Ordering::Release);
-    SGL_TID.store(tid, Ordering::Release);
+    SGL_TID.store(tid, Ordering::Release); singleton_spare_arm(name); // RESTARTALLOC (B1022): the restart's SPARE slab + Task box, built here while the heap is free (the fresh instance re-runs this prologue: the re-arm). LINE-NEUTRAL fold, code first
 }
 
 /// GATESTEAL2 — the revenant fence and the singleton's liveness stamp. `true` = the calling task was superseded by a
@@ -8365,7 +8365,7 @@ pub fn singleton_superseded() -> bool {
         );
         return true;
     }
-    let now = crate::arch::ms().max(1);
+    let now = crate::arch::ms().max(1); if SGL_SPARE_WANT.load(Ordering::Relaxed) { singleton_spare_arm(sgl_name()); } // RESTARTALLOC (B1022): the deferred re-arm retries at the loop top while the heap stayed busy (one load when a spare is held). LINE-NEUTRAL fold, code first
     SGL_LAST_MS.store(now, Ordering::Relaxed);
     SGL_LAST_CPU.store(meter_current_cpu(), Ordering::Relaxed);
     SGL_STAMPS.fetch_add(1, Ordering::Relaxed); singleton_dead_check(now); // PUMPPARK (B839) M3: the fresh instance confirms a noted dead instance (one load when none). LINE-NEUTRAL fold, code first
@@ -8391,18 +8391,18 @@ pub fn singleton_restart(from: usize, live: usize) -> Option<(u64, u64)> {
     // SAFETY: `entry` was stored from a `fn(usize)` in `singleton_register`; fn pointers round-trip through usize.
     let f: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(entry) };
     let name = sgl_name();
-    let new = spawn_inner(name, f, live, live, SGL_PRIO.load(Ordering::Relaxed), PUMP_PATH_STACK_SIZE, None, None); // PUMPSTACK (B1006): the one registered singleton is the usb-pump (main.rs `usb_pump` prologue), so its fresh instance takes the pump's MEASURED 32 KiB, never the blanket 16 KiB (flight 38: deaths=3; the RENDSTACK precedent sized `render-rehomed` too). LINE-NEUTRAL, in place
+    let new = singleton_spawn(name, f, live, SGL_PRIO.load(Ordering::Relaxed)); // RESTARTALLOC (B1022): the SPARE when one is held (no allocation on the sick path), else `spawn_inner` as before. PUMPSTACK (B1006): the one registered singleton is the usb-pump (main.rs `usb_pump` prologue), so its fresh instance takes the pump's MEASURED 32 KiB, never the blanket 16 KiB (flight 38: deaths=3; the RENDSTACK precedent sized `render-rehomed` too). LINE-NEUTRAL, in place
     SGL_TID.store(new, Ordering::Release);
     SGL_FRESH_MS.store(0, Ordering::Release);
     SGL_RESTART_OLD.store(old, Ordering::Relaxed);
     SGL_RESTARTS.fetch_add(1, Ordering::AcqRel);
     serial_println!(
-        ":: [sched] RESTART: {} tid={} on c{} in no queue the re-home could drain -> tid={} on c{} at its loop head holds={} (GATESTEAL2 B667: a fresh start, never a frame move; the old instance exits at its next fence) ::",
+        ":: [sched] RESTART: {} tid={} on c{} in no queue the re-home could drain -> tid={} on c{} at its loop head holds={} spare={} (GATESTEAL2 B667: a fresh start, never a frame move; the old instance exits at its next fence) ::",
         name,
         old,
         from,
         new,
-        live, crate::sync::task_holds(old) // POISON2 (B846): the superseded instance's holds NAMED (never released: a restart is not a death)
+        live, crate::sync::task_holds(old), if SGL_SPARE_LAST.load(Ordering::Relaxed) == 1 { "used" } else { "none" } // POISON2 (B846): the superseded instance's holds NAMED (never released: a restart is not a death). RESTARTALLOC (B1022): spare=<used|none>
     );
     Some((old, new))
 }
@@ -8556,7 +8556,7 @@ fn hold2_wait(ms: u64, mut f: impl FnMut() -> bool) -> bool {
 pub fn gatesteal2_ensure_tests() {
     static DONE: AtomicBool = AtomicBool::new(false);
     if !DONE.swap(true, Ordering::AcqRel) {
-        crate::tests::register("gatesteal2", gatesteal2_selftest);
+        crate::tests::register("gatesteal2", gatesteal2_selftest); crate::tests::register("restartalloc", restartalloc_selftest); // RESTARTALLOC (B1022): `tests restartalloc` beside it, same cfg. LINE-NEUTRAL fold, code first
     }
 }
 
@@ -9543,4 +9543,205 @@ pub mod preemptoff {
             ),
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// RESTARTALLOC (rmbp-ledger B1022) — THE SINGLETON RESTART ALLOCATES NOTHING.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+//
+// PUMPDEATHREHOME (B1016, flight 38): after the pump's death `wedge_rehome -> singleton_restart -> spawn_inner` blocked
+// on the heap lock the dead pump still held — the new Task's box and its 32 KiB slab (PUMPSTACK) are heap allocations,
+// and `stackguard::arm` takes two more heap pages (`memory::stack_guard_frame`) — so no RESTART line ever printed and
+// the glass froze. A path that must run when the system is sick cannot allocate.
+//
+// So the shared spawn path is split at its allocations: [`spawn_inner_with`] (in place, the body unchanged but for
+// `Box::write` on the caller's box) takes an ALLOCATED slab (painted and armed) and an uninit Task box; [`spawn_inner`]
+// below allocates both for every ordinary caller. The singleton holds ONE SPARE pair, built by [`singleton_spare_arm`]
+// from `singleton_register` (the pump's prologue, a healthy boot; the fresh instance re-runs it after every restart: the
+// re-arm) and consumed by [`singleton_spawn`] at the restart with no allocation. The spare's guard is armed ONCE when it
+// is built: `stackguard::arm` is not idempotent (two heap pages and a REG row per call) and the slab is never freed while
+// spare, so its guard stays live. A heap that is busy at the re-arm is refused by name and retried at the loop top
+// (`singleton_superseded`). Owed: RESTARTALLOC-ARM, SPARE-RECLAIM, RESTARTALLOC-RUNQ (cores.md §5).
+
+/// RESTARTALLOC — the shared spawn path's allocating half: the slab ([`spawn_slab`]) and the Task's box, then
+/// [`spawn_inner_with`]. Every caller but the singleton restart's spare path comes through here, as before the split.
+fn spawn_inner(
+    name: &'static str,
+    entry: fn(usize),
+    arg: usize,
+    target_cpu: usize,
+    priority: u8,
+    stack_bytes: usize,
+    done_sem: Option<Arc<Semaphore>>, kill: Option<Arc<KillSwitch>>,
+) -> u64 {
+    let stack = spawn_slab(stack_bytes, name);
+    spawn_inner_with(name, entry, arg, target_cpu, priority, stack, Box::<Task>::new_uninit(), done_sem, kill)
+}
+
+/// RESTARTALLOC — a task slab: `stack_bytes` USABLE plus the guard span below it (RENDSTACK), painted, then its guard
+/// page armed NOT-PRESENT. Moved verbatim from `spawn_inner`'s two lines.
+fn spawn_slab(stack_bytes: usize, name: &'static str) -> Box<[u8]> {
+    let mut stack: Box<[u8]> = alloc::vec![0u8; stack_bytes + STACK_GUARD].into_boxed_slice();
+    paint_stack(&mut stack); super::stackguard::arm(stack.as_ptr() as u64, stack.len(), name); // SMALLFIX M6 (STACKGUARD): the guard page goes NOT-PRESENT after the paint.
+    stack
+}
+
+/// The spare's Task box (`*mut MaybeUninit<Task>`), 0 = none. Written LAST on arm (Release): the commit word.
+static SGL_SPARE_TASK: AtomicUsize = AtomicUsize::new(0);
+/// The spare slab's base and length; written only while `SGL_SPARE_TASK` is 0, read only while it is not.
+static SGL_SPARE_STACK: AtomicUsize = AtomicUsize::new(0);
+static SGL_SPARE_LEN: AtomicUsize = AtomicUsize::new(0);
+/// One arm at a time (the pump's prologue and its loop-top retry may overlap across two fresh instances).
+static SGL_SPARE_ARMING: AtomicBool = AtomicBool::new(false);
+/// A spare is owed (taken by a restart, or refused): the loop-top retry's one load.
+static SGL_SPARE_WANT: AtomicBool = AtomicBool::new(false);
+/// The last restart's spawn: 1 = the spare, 0 = `spawn_inner` (none held). The RESTART line's `spare=`.
+static SGL_SPARE_LAST: AtomicU8 = AtomicU8::new(0);
+/// The heap-dead refusal is said once per restart.
+static SGL_SPARE_SAID: AtomicBool = AtomicBool::new(false);
+
+/// RESTARTALLOC — build the singleton's spare (a `PUMP_PATH_STACK_SIZE` slab, painted and armed once, plus an uninit
+/// Task box) when none is held. Refused by name while the heap lock is held (`allocator::heap_busy`): the restart that
+/// follows allocates as before, and the loop top retries. Silent at the boot arm; a re-arm after a restart says so.
+fn singleton_spare_arm(name: &'static str) {
+    if SGL_SPARE_TASK.load(Ordering::Acquire) != 0 {
+        SGL_SPARE_WANT.store(false, Ordering::Relaxed);
+        return;
+    }
+    if SGL_SPARE_ARMING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    if crate::allocator::heap_busy() {
+        SGL_SPARE_WANT.store(true, Ordering::Relaxed);
+        SGL_SPARE_ARMING.store(false, Ordering::Release);
+        if !SGL_SPARE_SAID.swap(true, Ordering::AcqRel) {
+            serial_println!(
+                "[sched] singleton spare -> REFUSED why=heap-dead (RESTARTALLOC B1022: the heap lock is held; the next restart allocates, the loop top retries) restarts={}",
+                SGL_RESTARTS.load(Ordering::Relaxed)
+            );
+        }
+        return;
+    }
+    let stack = spawn_slab(PUMP_PATH_STACK_SIZE, name);
+    let slot = Box::<Task>::new_uninit();
+    let n = stack.len();
+    SGL_SPARE_STACK.store(Box::into_raw(stack) as *mut u8 as usize, Ordering::Relaxed);
+    SGL_SPARE_LEN.store(n, Ordering::Relaxed);
+    SGL_SPARE_TASK.store(Box::into_raw(slot) as usize, Ordering::Release);
+    SGL_SPARE_WANT.store(false, Ordering::Relaxed);
+    SGL_SPARE_ARMING.store(false, Ordering::Release);
+    let restarts = SGL_RESTARTS.load(Ordering::Relaxed);
+    if restarts != 0 {
+        serial_println!(
+            "[sched] singleton spare -> ARMED size={} restarts={} (RESTARTALLOC B1022: the next restart allocates nothing)",
+            PUMP_PATH_STACK_SIZE,
+            restarts
+        );
+    }
+}
+
+/// RESTARTALLOC — take the spare, or `None`. The slab and length are read while the task word still holds the spare
+/// (nothing writes them then), and the CAS claims it.
+fn singleton_spare_take() -> Option<(Box<[u8]>, Box<core::mem::MaybeUninit<Task>>)> {
+    let t = SGL_SPARE_TASK.load(Ordering::Acquire);
+    if t == 0 {
+        return None;
+    }
+    let p = SGL_SPARE_STACK.load(Ordering::Relaxed);
+    let n = SGL_SPARE_LEN.load(Ordering::Relaxed);
+    if SGL_SPARE_TASK.compare_exchange(t, 0, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return None;
+    }
+    // SAFETY: `p`/`n` and `t` came from `Box::into_raw` in `singleton_spare_arm`, published before the task word, and the
+    // CAS above made this the one owner.
+    let stack = unsafe { Box::from_raw(core::ptr::slice_from_raw_parts_mut(p as *mut u8, n)) };
+    let slot = unsafe { Box::from_raw(t as *mut core::mem::MaybeUninit<Task>) };
+    Some((stack, slot))
+}
+
+/// RESTARTALLOC — the restart's spawn: the SPARE when one is held (no allocation: the sick path), else `spawn_inner` at
+/// the pump's measured 32 KiB (PUMPSTACK) as before. Either way a new spare is owed.
+fn singleton_spawn(name: &'static str, f: fn(usize), live: usize, prio: u8) -> u64 {
+    SGL_SPARE_SAID.store(false, Ordering::Relaxed);
+    SGL_SPARE_WANT.store(true, Ordering::Release);
+    match singleton_spare_take() {
+        Some((stack, slot)) => {
+            SGL_SPARE_LAST.store(1, Ordering::Relaxed);
+            spawn_inner_with(name, f, live, live, prio, stack, slot, None, None)
+        }
+        None => {
+            SGL_SPARE_LAST.store(0, Ordering::Relaxed);
+            spawn_inner(name, f, live, live, prio, PUMP_PATH_STACK_SIZE, None, None)
+        }
+    }
+}
+
+/// `tests restartalloc` — `:: RESTARTALLOC: spare=<used|none> restart_ms=<n> heap_held=<0|1> -> PASS|FAIL|SKIP :: old=
+/// new= from=c<n> live=c<n> rearmed=<0|1> holder=c<n>`. A `heappoison::hold_task` holder takes the heap lock (masked, on a
+/// worker core that is neither this one, the restart's live core nor core 0); with it HELD this task restarts the
+/// singleton through [`singleton_restart`] and times it, allocating nothing until it claims and ends the hold. PASS iff
+/// the restart completed on the spare within 100 ms with the heap still held, and the fresh instance re-armed a spare
+/// once the heap was free. Go-red by mutation: `singleton_spawn` always takes `spawn_inner` -> the restart blocks on the
+/// heap until the holder's 500 ms self-release -> `spare=none heap_held=0 -> FAIL` (bounded: no wedge).
+#[cfg(feature = "wc")]
+fn restartalloc_selftest() {
+    use crate::allocator::heappoison as hp;
+    let old = SGL_TID.load(Ordering::Acquire);
+    let home = SGL_HOME.load(Ordering::Acquire);
+    if old == 0 || home >= MAX_CPUS {
+        serial_println!(":: RESTARTALLOC: spare=none restart_ms=- heap_held=0 -> SKIP :: reason=no-singleton");
+        return;
+    }
+    let live = sibling_online_cpu(home);
+    if live == home || live >= MAX_CPUS {
+        serial_println!(":: RESTARTALLOC: spare=none restart_ms=- heap_held=0 -> SKIP :: reason=no-sibling-core from=c{}", home);
+        return;
+    }
+    let me = percpu::this_cpu().cpu_index as usize;
+    let Some(hc) = (0..MAX_CPUS).map_while(crate::arch::smp::worker_cpu).find(|&c| c != me && c != live && c != 0) else {
+        serial_println!(":: RESTARTALLOC: spare=none restart_ms=- heap_held=0 -> SKIP :: reason=no-holder-core from=c{} live=c{}", home, live);
+        return;
+    };
+    if SGL_SPARE_TASK.load(Ordering::Acquire) == 0 {
+        serial_println!(":: RESTARTALLOC: spare=none restart_ms=- heap_held=0 -> FAIL :: reason=no-spare old={} from=c{} live=c{}", old, home, live);
+        return;
+    }
+    hp::arm();
+    spawn("restartalloc-heap", hp::hold_task, 0, hc, PRIO_NORMAL);
+    // Spin (never sleep): from `held()` on, nothing here may touch the heap.
+    let tw = crate::arch::ms();
+    while !hp::held() {
+        if crate::arch::ms().saturating_sub(tw) >= 1_000 {
+            serial_println!(":: RESTARTALLOC: spare=none restart_ms=- heap_held=0 -> SKIP :: reason=no-heap-task holder=c{}", hc);
+            return;
+        }
+        core::hint::spin_loop();
+    }
+    let busy0 = crate::allocator::heap_busy();
+    let t0 = crate::arch::ms();
+    let r = singleton_restart(home, live);
+    let restart_ms = crate::arch::ms().saturating_sub(t0);
+    let used = r.is_some() && SGL_SPARE_LAST.load(Ordering::Relaxed) == 1;
+    let held = busy0 && hp::held() && crate::allocator::heap_busy();
+    if hp::claim() {
+        hp::unlock_claimed();
+    }
+    // The heap is free again: the fresh instance's prologue (`singleton_register`) re-arms the spare.
+    let rearmed = r.is_some() && hold2_wait(1_500, || SGL_SPARE_TASK.load(Ordering::Acquire) != 0);
+    let ok = r.is_some() && used && held && restart_ms <= 100 && rearmed;
+    let (o, n) = r.unwrap_or((old, 0));
+    serial_println!(
+        ":: RESTARTALLOC: spare={} restart_ms={} heap_held={} -> {} :: old={} new={} from=c{} live=c{} rearmed={} holder=c{}{}",
+        if used { "used" } else { "none" },
+        restart_ms,
+        held as u8,
+        if ok { "PASS" } else { "FAIL" },
+        o,
+        n,
+        home,
+        live,
+        rearmed as u8,
+        hc,
+        if r.is_none() { " reason=no-restart" } else { "" }
+    );
 }
