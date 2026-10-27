@@ -2523,3 +2523,18 @@ pub fn renew_probe(cap_s: u64, budget_ms: i64) -> Result<(bool, u32, u32, u32), 
     }
     Ok((reacquired, first, RENEWS.load(Ordering::Relaxed).wrapping_sub(r0), RENEW_CHANGED.load(Ordering::Relaxed).wrapping_sub(c0)))
 }
+
+/// STATIONREJOIN (rmbp-ledger B891): the link under the stack re-joined (`wifi/bringup/join.rs::restack`), so the one DHCP
+/// socket is reset through smoltcp's PUBLIC `reset()` (`renew_probe`'s call, without its cap): a held lease raises
+/// `Deconfigured` on the next poll, `dhcp_lost` drops it, and the next `Configured` is a first lease through `dhcp_apply`.
+/// `false` = no stack or no DHCP socket. The caller holds no lock of its own (order: `STACK` first).
+pub fn dhcp_reset() -> bool {
+    {
+        let mut g = STACK.lock();
+        let Some(stack) = g.as_mut() else { return false };
+        let Some(h) = stack.dhcp else { return false };
+        stack.sockets.get_mut::<dhcpv4::Socket>(h).reset();
+    }
+    kick();
+    true
+}

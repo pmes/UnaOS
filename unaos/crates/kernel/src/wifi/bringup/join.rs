@@ -39,12 +39,12 @@ pub(super) struct Heard {
     /// STATIONRATE (B855): the rate set S9's ASSOCIATED answer listed (`None` = unread); `keep` picks the station's rate from it.
     pub rates: Option<wifi_core::ieee80211::RateSet>,
     /// STATIONSHORTPRE (B862): S9's ASSOCIATED answer set the capability Short Preamble bit (`assoc::short_preamble`).
-    pub short: bool,
+    pub short: bool, pub gw: Option<[u8; 4]>, pub ring: usize, // STATIONREJOIN (B891): the gateway S10a ARPed (for `associate`'s S10a) and the rungs' ring base (0 on the boot's pass)
 }
 
 impl Heard {
     pub(super) fn new(me: Mac, ssid: Option<String>) -> Heard {
-        Heard { me, target: ssid.map(|s| s.into_bytes()).unwrap_or_default(), bss: None, frames: Vec::new(), watch: None, rates: None, short: false }
+        Heard { me, target: ssid.map(|s| s.into_bytes()).unwrap_or_default(), bss: None, frames: Vec::new(), watch: None, rates: None, short: false, gw: None, ring: 0 }
     }
 }
 
@@ -119,7 +119,7 @@ fn s8_auth(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::Seen, bss: 
     let me = seen.join.me;
     let ssid = ssid_text(&seen.join.target);
     let frame = wifi_core::ieee80211::build_auth_open(me, bss.bssid, 0);
-    let r = tx::fire_frame(bar0, p, &frame, ch, FRAME_AUTH, "auth", tx::RATE_1M, w);
+    let r = tx::fire_frame(bar0, p, &frame, ch, (seen.join.ring + FRAME_AUTH) % tx::FRAMES, "auth", tx::RATE_1M, w);
     let (reply, waited) = await_reply(bar0, rxr, seen, ch, bss.bssid, w, assoc::auth_reply);
     let (resp, fields, verdict) = match reply {
         Reply::Got(a) => {
@@ -156,7 +156,7 @@ fn s9_assoc(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::Seen, bss:
     let target = seen.join.target.clone();
     let cap = assoc::assoc_cap(&bss); // STATIONSHORTCAP (B884): ESS, with Short Preamble when the beacon allows it
     let frame = wifi_core::ieee80211::build_assoc_req(me, bss.bssid, &target, 0, cap);
-    let r = tx::fire_frame(bar0, p, &frame, ch, FRAME_ASSOC, "assoc-req", tx::RATE_1M, w);
+    let r = tx::fire_frame(bar0, p, &frame, ch, (seen.join.ring + FRAME_ASSOC) % tx::FRAMES, "assoc-req", tx::RATE_1M, w);
     let (reply, waited) = await_reply(bar0, rxr, seen, ch, bss.bssid, w, assoc::assoc_reply_air);
     let (resp, fields, aid, verdict) = match reply {
         Reply::Got((a, rates, short)) if a.status == 0 => {
@@ -240,8 +240,8 @@ pub(super) fn link(bar0: u64, p: &tx::Prep, rxr: &mut rx::Rx, seen: &mut rx::See
         skip(String::from("no-gateway(type tests wifi <ssid> <gw-ip>)"));
         return (0, None);
     };
-    let gw_text = alloc::format!("{}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]);
-    let mut l = data::Link::new(seen.join.me, bss.bssid);
+    let gw_text = alloc::format!("{}.{}.{}.{}", gw[0], gw[1], gw[2], gw[3]); seen.join.gw = Some(gw); // STATIONREJOIN (B891): kept for a re-join's S10a
+    let mut l = data::Link::new(seen.join.me, bss.bssid).rebased(seen.join.ring);
     let (r, sent) = match l.send(&data::arp_request(l.mac(), [0; 4], gw)) {
         Ok((air, n)) => (tx::fire_frame(bar0, p, &air, ch, n, "data", tx::RATE_1M, w), 1),
         Err(why) => {
@@ -323,7 +323,7 @@ pub(super) fn keep(bar0: u64, prep: tx::Prep, rxr: rx::Rx, mut seen: rx::Seen, c
     seen.join.frames.clear();
     seen.join.watch = seen.join.bss.map(|b| super::super::data::Watch::new(b.bssid, crate::arch::ticks()));
     let next = link.tx_next(); let mut q = tx::Queue::default(); q.ctl = rate_ctl(seen.join.rates, seen.join.short, rate.rate); // STATIONRATECTL (B881): the rate controller starts at `pick_rate`'s rate, owned by STATION with the queue
-    *STATION.lock() = Some(Station { bar0, ch, prep, rxr, seen, link, w, q, lost: None, rate });
+    *STATION.lock() = Some(Station { bar0, ch, prep, rxr, seen, link, w, q, lost: None, rate }); rejoin_spawn(); // STATIONREJOIN (B891): the station task, started once
     serial_println!("[wifi10] station kept tx_next={} — the TX ring and the receiver stay armed for the stack (WIFIDHCP B831)", next);
 }
 
@@ -409,32 +409,23 @@ fn service(st: &mut Station) {
 /// The link is gone: every accessor answers link-down from now on (the engines stay as they are — stopping them sleeps,
 /// so `rejoin` does it from the shell task). Said once.
 fn lose(st: &mut Station, why: &'static str) {
-    st.lost = Some(why);
+    st.lost = Some(why); let rejoins = rejoin_lost(why); // STATIONREJOIN (B891): LOST_AT / LOST_WHY recorded, the re-join armed (STATION -> REJOIN)
     st.seen.data.clear();
     let (reason, beacons, tu) = st.seen.join.watch.as_ref().map_or((0, 0, 0), |wt| (wt.reason, wt.beacons, wt.tu));
     let q = &st.q;
     serial_println!(
-        "[wifi10] station lost why={} reason={} beacons={} tu={} tx_posted={} tx_sent={} tx_acked={} tx_failed={} tx_stuck={} tx_full={} tx_q={} rx_data={} rate={} ok={} retry={}.{} — the accessor triple answers link-down; tests wifi <ssid> <gw> re-joins (STATIONWATCH B843)",
+        "[wifi10] station lost why={} reason={} beacons={} tu={} tx_posted={} tx_sent={} tx_acked={} tx_failed={} tx_stuck={} tx_full={} tx_q={} rx_data={} rate={} ok={} retry={}.{} rejoins={} — the accessor triple answers link-down; the station task re-joins (STATIONWATCH B843, STATIONREJOIN B891)",
         why, if why == "beacon-loss" { String::from("-") } else { alloc::format!("{}", reason) }, beacons, tu,
-        q.posted, q.sent, q.acked, q.failed, q.stuck, q.full, q.in_flight(), st.link.rx_data, assoc::rate_name(q.ctl.rate()), q.ctl.stats(q.ctl.rate()).0, q.ctl.stats(q.ctl.rate()).1 / 100, q.ctl.stats(q.ctl.rate()).1 % 100 / 10
+        q.posted, q.sent, q.acked, q.failed, q.stuck, q.full, q.in_flight(), st.link.rx_data, assoc::rate_name(q.ctl.rate()), q.ctl.stats(q.ctl.rate()).0, q.ctl.stats(q.ctl.rate()).1 / 100, q.ctl.stats(q.ctl.rate()).1 % 100 / 10, rejoins
     );
 }
 
-/// From `wifi10()`'s once-per-boot guard: a LOST station is taken out of `STATION` and its engines stopped here, with
-/// the lock released (`rx::finish` / `tx::stop` sleep), so the pass may run again. `false` = no station, or a live one.
+/// From `wifi10()`'s once-per-boot guard (an operator's second `tests wifi`): STATIONREJOIN (B891) — the pass is NEVER
+/// reopened (its PHY one-shots, `htphyinit::tx_prep`, WIFI11's power control, `tx::prep`, `rx::arm`, ran once this boot);
+/// a LOST station gets ONE re-join attempt now on the same PHY (`rejoin_step`, the backoff skipped). Always `false`.
 pub(super) fn rejoin() -> bool {
-    let taken = {
-        let mut g = STATION.lock();
-        if g.as_ref().map_or(false, |st| st.lost.is_some()) { g.take() } else { None }
-    };
-    let Some(mut st) = taken else { return false };
-    let (mac_off, rx_off) = rx::finish(st.bar0, &st.rxr, &mut st.w);
-    let tx_off = tx::stop(st.bar0, &mut st.w);
-    serial_println!(
-        "[wifi10] station rejoin after={} mac-suspended={} rx-reset={} tx-reset={} — the lost station's engines stopped; the pass runs again (STATIONWATCH B843)",
-        st.lost.unwrap_or("-"), mac_off as u8, rx_off as u8, tx_off as u8
-    );
-    true
+    rejoin_step(true);
+    false
 }
 
 // ── STATIONRATE (rmbp-ledger B855): the station's rate, and the TX header / MACCTL known answers ───────────────────────
@@ -507,3 +498,120 @@ fn rate_step(st: &mut Station, now: u64) {
         assoc::rate_name(old), assoc::rate_name(new), why, ok, retry / 100, retry % 100 / 10
     );
 }
+
+// ── STATIONREJOIN (rmbp-ledger B891): a lost station re-joins on the same PHY ───────────────────────────────────────────
+
+/// The re-join's state (PURE, `data::Rejoin`: LOST_AT, LOST_WHY, the attempt count and the backoff). Lock order: smolnet's
+/// `STACK` -> `STATION` -> `REJOIN` (`lose` takes it under `STATION`); never held while taking `STATION` or `STACK`, never
+/// across a sleep.
+static REJOIN: crate::sync::Mutex<super::super::data::Rejoin> = crate::sync::Mutex::new(super::super::data::Rejoin::new());
+/// The station task has been started (once per boot, by the first `keep`).
+static SPAWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The station task's check cadence.
+const REJOIN_POLL_MS: u64 = 250;
+/// How long a re-join listens for the lost BSS's beacon (passive: `keep`'s BSSID filter passes it) before `failed:hear`.
+const HEAR_MS: u32 = 1000;
+
+/// From `lose`, under `STATION`: the loss recorded and the re-join armed (first attempt 1 s later). Returns the re-joins
+/// that linked this boot (the `station lost` line's `rejoins=`).
+fn rejoin_lost(why: &'static str) -> u32 {
+    let mut r = REJOIN.lock();
+    r.lose(crate::arch::ticks(), why);
+    r.rejoins
+}
+
+/// From `keep`, on the task that kept the station, no lock held: the station task, once per boot (net_tick's shape and CPU
+/// choice: the drive sleeps for seconds, so it sits on neither the render nor the service loop).
+fn rejoin_spawn() {
+    if SPAWNED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let cpu = crate::arch::smp::xhci_worker_cpu(0).or(crate::arch::smp::service_cpu()).unwrap_or(0);
+    crate::arch::sched::spawn("wifi-station", rejoin_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+}
+
+/// The station task: every `REJOIN_POLL_MS`, a due re-join of a lost station (`rejoin_step`); idle otherwise.
+fn rejoin_task(_: usize) {
+    loop {
+        crate::arch::sched::sleep_ms(REJOIN_POLL_MS);
+        rejoin_step(false);
+    }
+}
+
+/// One re-join attempt when a LOST station is kept and its backoff ran out (`force`: the operator's `tests wifi`, now). The
+/// Station is TAKEN out of `STATION` (the lock released at once) and owned by value while the rungs sleep; on LINKED `keep`
+/// refills `STATION`, on a failure the lost Station goes back and the backoff doubles (capped 30 s). Said once per attempt.
+fn rejoin_step(force: bool) {
+    let now = crate::arch::ticks();
+    let taken = {
+        let mut g = STATION.lock();
+        let lost = g.as_ref().map_or(false, |st| st.lost.is_some());
+        if lost && (force || REJOIN.lock().due(now)) { g.take() } else { None }
+    };
+    let Some(st) = taken else { return };
+    let why = st.lost.unwrap_or("-");
+    let (n, after) = REJOIN.lock().attempt(now);
+    let verdict = match associate(st) {
+        Ok(()) => {
+            REJOIN.lock().linked();
+            String::from("linked")
+        }
+        Err((st, rung)) => {
+            *STATION.lock() = Some(st);
+            REJOIN.lock().failed(crate::arch::ticks());
+            alloc::format!("failed:{}", rung)
+        }
+    };
+    serial_println!(
+        "[wifi10] station rejoin n={} after={} why={} -> {} — the same PHY: no tx_prep, power control or tx::prep re-run (STATIONREJOIN B891)",
+        n, after, why, verdict
+    );
+    if verdict == "linked" {
+        restack();
+    }
+}
+
+/// The per-association half of the join on the kept engines: the old queue's TX statuses reaped (so the rungs' `fire_frame`
+/// spins read only their own); the rungs' ring base set so S8 leaves on the old Link's next frame (the ring continues, no
+/// stale descriptor is walked); the watch and the BSS cleared, so `hear` re-fixes the BSS from its beacons within `HEAR_MS`;
+/// then `run` (S8, S9), `link` (S10a, the gateway the operator named) and `keep`. `Err` names the rung that failed.
+fn associate(mut st: Station) -> Result<(), (Station, &'static str)> {
+    tx::reap(st.bar0, &mut st.q, crate::arch::ticks());
+    st.seen.join.ring = (st.link.tx_next() + tx::FRAMES - FRAME_AUTH) % tx::FRAMES;
+    st.seen.join.watch = None;
+    st.seen.join.bss = None;
+    st.seen.join.frames.clear();
+    st.seen.data.clear();
+    let mut waited = 0u32;
+    while st.seen.join.bss.is_none() && waited < HEAR_MS {
+        rx::poll(st.bar0, &mut st.rxr, &mut st.seen, st.ch, SLICE_US, &mut st.w);
+        waited += (SLICE_US / 1000) as u32;
+    }
+    if st.seen.join.bss.is_none() {
+        return Err((st, "hear"));
+    }
+    if run(st.bar0, &st.prep, &mut st.rxr, &mut st.seen, st.ch, &mut st.w) < 2 {
+        return Err((st, "s8"));
+    }
+    if super::super::status::join().1 != 1 {
+        return Err((st, "s9"));
+    }
+    let gw = st.seen.join.gw;
+    let (_, kept) = link(st.bar0, &st.prep, &mut st.rxr, &mut st.seen, st.ch, gw, &mut st.w);
+    let Some(l) = kept else { return Err((st, "s10a")) };
+    let Station { bar0, ch, prep, rxr, seen, w, .. } = st;
+    keep(bar0, prep, rxr, seen, ch, w, l);
+    Ok(())
+}
+
+/// After a LINKED re-join, no wifi lock held: when smoltcp rides the station, its one DHCP socket is reset through smoltcp's
+/// public `reset()` (`smolnet::dhcp_reset`, LEASERENEW's path: the held lease is lost, the next one is a first lease).
+#[cfg(feature = "smolnet")]
+fn restack() {
+    if super::super::data::bound() {
+        let _ = crate::smolnet::dhcp_reset();
+    }
+}
+
+#[cfg(not(feature = "smolnet"))]
+fn restack() {}
