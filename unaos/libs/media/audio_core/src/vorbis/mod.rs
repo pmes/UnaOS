@@ -992,7 +992,7 @@ impl OggVorbis {
         }
         if p.eos {
             if let Some(g) = p.granule {
-                let limit = g as i64 - self.granule_base.unwrap_or(0);
+                let limit = g as i64 - self.granule_base.unwrap_or(0) + self.skip0 as i64; // VORBISTRIM SR307: `decoded` counts the start trim too
                 if (limit as u64) < self.decoded && limit >= 0 {
                     let keep = (limit as u64).saturating_sub(before) as usize;
                     for pl in planes.iter_mut() { pl.truncate(keep.min(pl.len())); }
