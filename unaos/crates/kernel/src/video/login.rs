@@ -689,7 +689,7 @@ fn open_as(state: State) {
         crate::splash::hold_release("first-screen");
         return;
     }
-    CARD_H.store(h_at(theme::metrics()), Ordering::Relaxed); let Some((_s, ow, oh)) = wm::spawn_geometry_native(super::super::metrics::size(W), super::super::metrics::size(H())) else { // TEXTSCALE3 (B849): the height this card lays out at, latched before the row exists
+    CARD_H.store(h_at(theme::metrics()), Ordering::Relaxed); seat_open(); let Some((_s, ow, oh)) = wm::spawn_geometry_native(super::super::metrics::size(W), super::super::metrics::size(H())) else { // TEXTSCALE3 (B849): the height this card lays out at, latched before the row exists
         crate::bootlog_println!("[login] screen open window=no (no surface yet — headless form)");
         crate::splash::hold_release("first-screen");
         return;
@@ -713,7 +713,7 @@ fn open_as(state: State) {
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
     let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::Unlock { b"Unlock" } else if state == State::CreateUser { b"Create account" } else { b"Log in" };
-    let id = wm::create_at_native(OWNER, surf, sw * sh * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
+    let id = wm::create_at_native(OWNER, surf, sw * super::super::metrics::size(CARD_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
         serial_println!("[login] screen open window=no (create refused — headless form)");
@@ -2065,7 +2065,7 @@ pub fn shot_release() -> bool {
 /// glass, painted before the volume was up) repaints once in DejaVu Sans.
 pub fn font_repaint() {
     if is_open() {
-        repaint();
+        if !reseat() { repaint(); }
     }
 }
 
@@ -3682,10 +3682,11 @@ fn kb_wire(ok: bool, why: &'static str) {
 // The card draws the UI face (`FACE`) on bands that sat at constant logical tops on a 16 px rhythm, so the largest
 // text step overwrote its own rows. Every band top is now `gy(top)`: the top at the default size grown once for each
 // text band above it, the count read from ONE table (`BANDS`), and the boxes (`FIELD_H`, `BTN_H`, `PWR_H`) hold the
-// UI line (`theme::metrics().grow`, TEXTSCALE's one reader). The card's height (`h_at`) is latched at open (`CARD_H`):
-// no public wm door resizes a kernel row and the surface is a leaked buffer the row names, so a card open across a
-// step keeps its height (TEXTSCALE-RESEAT, owed). Labels clip at the field; captions stay inside their box. The
-// default size draws the constants.
+// UI line (`theme::metrics().grow`, TEXTSCALE's one reader). The card's height (`h_at`) is set at open (`CARD_H`) and
+// RE-SEATED live (TEXTSCALERESEAT B880): the open reserves the surface for the card's LARGEST height (`h_at` at the
+// cap, `CARD_CAP`) and names that capacity at create, and the restyle hook (`font_repaint` -> `reseat`) repaints at the
+// new `h_at` and asks `wm::resize_kernel_row` for it; past the capacity the door refuses and the card keeps its height.
+// Labels clip at the field; captions stay inside their box. The default size draws the constants.
 
 /// THE BAND TABLE — every literal band top the card's forms use, at the default size, and the number of text bands
 /// above it (each grows the top by what the UI line grew). A new band is added HERE, once; a top missing from the
@@ -3875,4 +3876,63 @@ fn kb_drained(o: &Outcome) {
 #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
 fn kb_arm_job(job: Job) -> bool {
     matches!(job, Job::VolUnlock { .. } | Job::Create | Job::User | Job::Unlock)
+}
+
+// ── TEXTSCALERESEAT (rmbp-ledger B880; BP-video-40) — TAIL-APPENDED: the open card re-seats at a text step ────────────
+// The open reserves the leaked surface ONCE for the card's LARGEST height (`cap_h`: `h_at` at the cap metrics, never
+// below the live one) and names that capacity as the row's `surf_len`; every later `surf()` is a no-alloc slice of it
+// (`leaked_surf` reuses a buffer whose cap holds `n`), so the surface is never re-allocated under the live row. The
+// restyle hook (`font_repaint`) re-seats within that capacity through wm's door; past it the card keeps its height.
+
+/// The height the open card's surface was reserved for (logical px; `cap_h` at open).
+static CARD_CAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(H0);
+/// Re-seats the door accepted (the `tests textscale` leg reads deltas).
+static RESEATS: AtomicU32 = AtomicU32::new(0);
+
+/// The card's largest height: `h_at` at the cap the restyle published (else the live panel's `cap_now`), never below
+/// the live `h_at`.
+fn cap_h() -> usize {
+    let m = theme::metrics();
+    let cap = if m.cap_css > 0 { m.cap_css } else { crate::video::text::textscale::cap_now().max(0) as u32 };
+    let top = theme::TextMetrics { line: crate::video::text::textscale::line_at(cap, crate::video::dpi::s2()), cap_css: cap };
+    h_at(m).max(h_at(top))
+}
+
+/// `open_as`, before the row exists: record the capacity and reserve the surface for it.
+fn seat_open() {
+    let cap = cap_h();
+    CARD_CAP.store(cap, Ordering::Relaxed);
+    let _ = super::super::metrics::leaked_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(cap));
+}
+
+/// The restyle hook's re-seat: when a row is up and the card's `h_at` moved within its capacity, lay out and paint at
+/// the new height, then ask wm for it. `true` = re-seated (painted); `false` = nothing to do or refused (the caller
+/// repaints at the kept height).
+fn reseat() -> bool {
+    let id = WIN.load(Ordering::Relaxed);
+    let h = h_at(theme::metrics());
+    let old = CARD_H.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE || h == old || h > CARD_CAP.load(Ordering::Relaxed) {
+        return false;
+    }
+    CARD_H.store(h, Ordering::Relaxed);
+    repaint();
+    if wm::resize_kernel_row(id, super::super::metrics::size(W), super::super::metrics::size(h)) == Some(true) {
+        RESEATS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    CARD_H.store(old, Ordering::Relaxed);
+    false
+}
+
+/// `tests textscale`: (re-seats so far, the row's height, the height the live text size wants), source px; `None` when
+/// no card row is up.
+#[cfg(feature = "witness")]
+pub fn reseat_probe() -> Option<(u32, usize, usize)> {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE {
+        return None;
+    }
+    let i = wm::info(id)?;
+    Some((RESEATS.load(Ordering::Relaxed), i.h, super::super::metrics::size(h_at(theme::metrics()))))
 }

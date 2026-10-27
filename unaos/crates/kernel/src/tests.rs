@@ -7187,8 +7187,8 @@ fn textscale_selftest() {
         why = "no-face";
     }
     serial_println!(
-        ":: TEXTSCALE: steps={} overlap={} cap={} -> {} :: bumps={} moved={} fits={} clipped={} kit={} restored={} why={} stacked={} windows={}/{} frames={}/{}",
-        done, overlap, cap_seen, v, bumps, moved, fits as u8, clipped, if kit { "ok" } else { "bad" }, restored as u8, why, tsw.stacked, tsw.bad, tsw.legs, tsw.frames, tsw.want
+        ":: TEXTSCALE: steps={} overlap={} cap={} -> {} :: bumps={} moved={} fits={} clipped={} kit={} restored={} why={} stacked={} windows={}/{} frames={}/{} reseat={} clipped_after={} seated={}",
+        done, overlap, cap_seen, v, bumps, moved, fits as u8, clipped, if kit { "ok" } else { "bad" }, restored as u8, why, tsw.stacked, tsw.bad, tsw.legs, tsw.frames, tsw.want, tsw.reseat, tsw.clipped_after, tsw.seated
     );
 }
 
@@ -7482,13 +7482,23 @@ struct TsWin {
     frames: usize,
     want: usize,
     stacked: u32,
+    /// TEXTSCALERESEAT (B880): this test opened the login card / the dialog (closes it); the re-seats the two rows took
+    /// over the run (deltas from `r0`, their counters at open), the per-step rows whose height missed `h_at`, the rows
+    /// seated at the last step, and the steps that moved the text epoch.
+    login_own: bool,
+    dlg_own: bool,
+    reseat: u32,
+    clipped_after: u32,
+    seated: u32,
+    moved_steps: u32,
+    r0: (u32, u32),
 }
 
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 impl TsWin {
     /// No window leg read rows_ok=0, and every moved step reached every opened window as a frame.
     fn ok(&self) -> bool {
-        self.bad == 0 && self.frames >= self.want
+        self.bad == 0 && self.frames >= self.want && self.clipped_after == 0 && (self.seated == 0 || self.reseat > 0 || self.moved_steps == 0)
     }
 }
 
@@ -7500,6 +7510,22 @@ fn textscale_win_open() -> TsWin {
         text.push_str(&alloc::format!("{:02} the quick brown fox jumps over the lazy dog, and the view re-wraps this line at every text size\n", i));
     }
     let fv_own = !crate::video::fileview::is_open() && crate::video::fileview::open_text("textscale", &text).is_ok();
+    // TEXTSCALERESEAT (B880): the login card (the bare shot's form, over the session) and a dialog, seated for the re-seat legs.
+    #[cfg(feature = "login")]
+    let login_own = !crate::video::crystal::login::is_open() && crate::video::crystal::login::shot_bare_open(false);
+    #[cfg(not(feature = "login"))]
+    let login_own = false;
+    let dlg_own = !crate::video::dialog::is_up()
+        && crate::video::dialog::post(crate::video::dialog::Dlg::new(crate::video::dialog::Icon::Caution, b"Text size", b"TEXTSCALERESEAT fixture", b"re-seats at every text step", &[b"OK"]))
+        && {
+            crate::video::dialog::open_now();
+            crate::video::dialog::is_up()
+        };
+    #[cfg(feature = "login")]
+    let r0l = crate::video::crystal::login::reseat_probe().map_or(0, |p| p.0);
+    #[cfg(not(feature = "login"))]
+    let r0l = 0u32;
+    let r0 = (r0l, crate::video::dialog::reseat_probe().map_or(0, |p| p.0));
     TsWin {
         act: crate::video::activity::is_open(),
         fv: crate::video::fileview::is_open(),
@@ -7511,6 +7537,13 @@ fn textscale_win_open() -> TsWin {
         frames: 0,
         want: 0,
         stacked: 0,
+        login_own,
+        dlg_own,
+        reseat: 0,
+        clipped_after: 0,
+        seated: 0,
+        moved_steps: 0,
+        r0,
     }
 }
 
@@ -7554,6 +7587,22 @@ fn textscale_win_leg(t: &mut TsWin, css: i64, e_before: u32) {
         t.frames += (t.act && got.0) as usize + (t.fv && got.1) as usize;
     }
     t.f = now();
+    // TEXTSCALERESEAT (B880): the restyle hooks re-seat the login card (`font_repaint`; the fan-out above is quarry-gated)
+    // and the dialog (`service` -> `font_follow`, idempotent per epoch); each seated row's height must be `h_at` now.
+    #[cfg(all(feature = "login", not(feature = "quarry")))]
+    crate::video::crystal::login::font_repaint();
+    crate::video::dialog::service();
+    #[cfg(feature = "login")]
+    let lp = crate::video::crystal::login::reseat_probe();
+    #[cfg(not(feature = "login"))]
+    let lp: Option<(u32, usize, usize)> = None;
+    let dp = crate::video::dialog::reseat_probe();
+    let show = |p: Option<(u32, usize, usize)>| p.map_or(alloc::string::String::from("skip"), |(_, h, w)| alloc::format!("{}/{}", h, w));
+    serial_println!("[textscale] reseat css={} login={} dialog={}", css, show(lp), show(dp));
+    t.moved_steps += moved as u32;
+    t.seated = lp.is_some() as u32 + dp.is_some() as u32;
+    t.clipped_after += lp.map_or(0, |p| (p.1 != p.2) as u32) + dp.map_or(0, |p| (p.1 != p.2) as u32);
+    t.reseat = lp.map_or(0, |p| p.0.wrapping_sub(t.r0.0)) + dp.map_or(0, |p| p.0.wrapping_sub(t.r0.1));
 }
 
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -7565,6 +7614,17 @@ fn textscale_win_close(t: &mut TsWin) {
     if t.fv_own {
         crate::video::fileview::close();
         t.fv_own = false;
+    }
+    if t.dlg_own {
+        crate::video::dialog::answer(crate::video::dialog::Answer::Cancel);
+        t.dlg_own = false;
+    }
+    #[cfg(feature = "login")]
+    {
+        if t.login_own {
+            let _ = crate::video::crystal::login::shot_bare_close();
+            t.login_own = false;
+        }
     }
 }
 
