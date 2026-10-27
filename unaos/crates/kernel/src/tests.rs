@@ -127,7 +127,7 @@ pub fn run(name: Option<&str>) -> usize {
         if let Some(want) = name { if want != n { continue; } }
         serial_println!(":: TESTS: run {} ::", n);
         *CUR.lock() = n;
-        crate::serial_line::tail_arm(); let vb = verdicts(); f(); skip_note(n, vb); verdict_note(n); #[cfg(all(feature = "witness", target_arch = "x86_64"))] { fixture_stack_note(n); } // QUIETBOOT3 (B352): the fixture's own wire tail, for the glass.
+        crate::serial_line::tail_arm(); let vb = verdicts(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _fx = crate::allocator::census::fx_enter(n); /* FIXTURERETAIN (B1017): the fixture's >= 64 KiB blocks are `fx:<n>` in the census (LINE-NEUTRAL) */ f(); skip_note(n, vb); verdict_note(n); #[cfg(all(feature = "witness", target_arch = "x86_64"))] { fixture_stack_note(n); } // QUIETBOOT3 (B352): the fixture's own wire tail, for the glass.
         if RUN_GEN.load(Ordering::Acquire) == my_gen { *CUR.lock() = ""; } // BOOTLIST (B817): a superseded run leaves CUR to the run that replaced it (LINE-NEUTRAL)
         ran += 1;
     }
@@ -7362,7 +7362,7 @@ fn overlays_say(l: &str, a: &str, rb: usize, lk: usize, v: &str, ext: &OverlaysE
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn memline_selftest() {
     crate::video::desktopbuild::memline_selftest();
-    memleak();
+    memleak(); fixtureretain(); // FIXTURERETAIN (B1017): the per-fixture attribution's KAT, after MEMLEAK (LINE-NEUTRAL append, code first)
 }
 
 /// MEMLINE3 (B845): wait (yielding) until the desktop is built and its first paint read back, at most `ms`.
@@ -8437,4 +8437,72 @@ fn fixture_stack_note(name: &str) {
     if let Some((task, high, size)) = crate::arch::sched::current_stack_high() {
         serial_println!("[tests] fixture={} on={} stack_high={} size={}", name, task, high, size);
     }
+}
+
+// ── FIXTURERETAIN (rmbp-ledger B1017, BP-video-18, BP-cores-22) — TAIL-APPENDED. Flight 38's census held
+// `task:bootlist-fx +18387` KiB: every list child is named `bootlist-fx`, so the row was the sum over sixteen fixtures
+// (~16252 KiB of it GEN7's GEN7TLB holds, now tagged `gen7-held` and counted once). `tests::run` now arms
+// `census::fx_enter(<fixture>)` around each fixture, so a >= 64 KiB block is `fx:<verb>`. The KAT, inside `tests
+// memline` after MEMLEAK: a 192 KiB probe under `fx_enter("fixtureretain-probe")`, TWICE — held, its row holds it
+// (`attributed`); dropped, the row returns to where the run found it (`delta<k>` = 0); then a 128 KiB block must land
+// under the enclosing run's own `fx:memline` (`nest`: the probe's drop restored the word). x86 `wc`.
+// Wire: `[fixtureretain] top fx:<verb>:<kb>,…` · `:: FIXTURERETAIN: fixtures=<n> freed_kb=<n> once_kb=<n>
+// attributed=<y|n> nest=<ok|bad> -> PASS|FAIL :: delta1=<kb> delta2=<kb>` · `-> SKIP :: reason=<census-unarmed|alloc>`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn fixtureretain() {
+    use crate::allocator::census;
+    const PROBE: usize = 192 * 1024;
+    const NEST: usize = 128 * 1024;
+    const ROW: &str = "fx:fixtureretain-probe";
+    if !census::armed() {
+        serial_println!(":: FIXTURERETAIN: -> SKIP :: reason=census-unarmed");
+        return;
+    }
+    let mut attributed = true;
+    let mut deltas = [0i64; 2];
+    for d in deltas.iter_mut() {
+        let b0 = census::snapshot().bytes_of(ROW, true);
+        {
+            let _fx = census::fx_enter("fixtureretain-probe");
+            let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            if v.try_reserve_exact(PROBE).is_err() {
+                serial_println!(":: FIXTURERETAIN: -> SKIP :: reason=alloc");
+                return;
+            }
+            attributed &= census::snapshot().bytes_of(ROW, true) >= b0 + PROBE as u64;
+            drop(v);
+        }
+        *d = census::snapshot().bytes_of(ROW, true) as i64 - b0 as i64;
+    }
+    let n0 = census::snapshot().bytes_of("fx:memline", true);
+    let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let nest = v.try_reserve_exact(NEST).is_ok() && census::snapshot().bytes_of("fx:memline", true) >= n0 + NEST as u64;
+    drop(v);
+    let s = census::snapshot();
+    let mut fx: [(&str, u64); census::ROWS] = [("", 0); census::ROWS];
+    let mut n = 0usize;
+    for r in s.rows.iter().flatten() {
+        if r.tagged && r.name.starts_with("fx:") && n < fx.len() {
+            fx[n] = (r.name, r.bytes);
+            n += 1;
+        }
+    }
+    let fx = &mut fx[..n];
+    fx.sort_unstable_by_key(|r| core::cmp::Reverse(r.1));
+    let mut top = alloc::string::String::new();
+    for &(name, bytes) in fx.iter().take(5) {
+        if !top.is_empty() {
+            top.push(',');
+        }
+        top.push_str(name);
+        top.push_str(&alloc::format!(":{}", bytes / 1024));
+    }
+    serial_println!("[fixtureretain] top {}", if top.is_empty() { "-" } else { top.as_str() });
+    let freed = deltas == [0, 0];
+    let pass = attributed && nest && freed;
+    serial_println!(
+        ":: FIXTURERETAIN: fixtures={} freed_kb={} once_kb={} attributed={} nest={} -> {} :: delta1={} delta2={}",
+        n, if freed { PROBE / 1024 } else { 0 }, s.bytes_of("gen7-held", true) / 1024, if attributed { "y" } else { "n" },
+        if nest { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" }, deltas[0] / 1024, deltas[1] / 1024
+    );
 }

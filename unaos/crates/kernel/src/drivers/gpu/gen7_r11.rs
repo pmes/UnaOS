@@ -417,7 +417,7 @@ unsafe fn exec11(bar0: usize, bar0_size: usize, g: &Geom, src: &[u32]) -> Result
             if p.is_null() {
                 return Err("alloc");
             }
-            *held = (p as usize, n); // a smaller earlier block stays held (GEN7TLB), never freed
+            *held = (p as usize, n); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::allocator::census::retag(p as usize, n * 4096, crate::allocator::census::GEN7_HELD); /* FIXTURERETAIN (B1017): counted once, never fx:gen7 */ // a smaller earlier block stays held (GEN7TLB), never freed
         }
         held.0
     };

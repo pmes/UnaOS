@@ -218,7 +218,7 @@ pub fn heap_high() -> usize {
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub mod census {
     use core::cell::UnsafeCell;
-    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+    use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};
 
     pub const STAGE: u8 = 1;
     pub const SHADOW: u8 = 2;
@@ -229,8 +229,11 @@ pub mod census {
     pub const WALLPAPER_RETIRED: u8 = 5;
     pub const APPRES_PIX: u8 = 6;
     pub const TEXT_RESIDENT: u8 = 7;
+    /// FIXTURERETAIN (B1017): the GEN7 pages held for the boot by design (GEN7TLB, gen7.md §2.6: r11's HELD, r8's
+    /// `reclaim=held` surfaces, gen7blit's sp/dp), named by [`retag`] at each hold site; desktopbuild counts it once.
+    pub const GEN7_HELD: u8 = 8;
     /// Tag -> its census name (0 = no tag).
-    pub const NAMES: [&str; 8] = ["-", "stage", "shadow", "wallpaper", "help", "wallpaper-retired", "appres-pix", "text-resident"];
+    pub const NAMES: [&str; 9] = ["-", "stage", "shadow", "wallpaper", "help", "wallpaper-retired", "appres-pix", "text-resident", "gen7-held"];
     /// An untagged block this large is tracked under its task's name.
     pub const BIG: usize = 64 * 1024;
     /// Owner rows a [`Snapshot`] carries (the last one becomes `other` on overflow).
@@ -309,7 +312,12 @@ pub mod census {
             return inert;
         }
         let Some(tid) = crate::arch::sched::current_id() else { return inert };
-        let packed = (tid << 8) | tag as u64;
+        claim(tid, (tid << 8) | tag as u64)
+    }
+
+    /// Arm `packed` for task `tid`: its own slot when it has one (the drop restores the word it held), else a free
+    /// one. FIXTURERETAIN (B1017): [`enter`]'s loop, shared with [`fx_enter`]. Inert with all slots taken.
+    fn claim(tid: u64, packed: u64) -> Scope {
         for (i, s) in ARMED.iter().enumerate() {
             let v = s.load(Acquire);
             if v != 0 && v >> 8 == tid {
@@ -322,7 +330,7 @@ pub mod census {
                 return Scope { slot: i, prev: 0, own: packed };
             }
         }
-        inert
+        Scope { slot: SLOTS, prev: 0, own: 0 }
     }
 
     #[inline(always)]
@@ -350,7 +358,13 @@ pub mod census {
                 break;
             }
         }
-        let (name, tagged): (&'static str, bool) = if tag != 0 && (tag as usize) < NAMES.len() {
+        let (name, tagged): (&'static str, bool) = if tag & FX != 0 {
+            // FIXTURERETAIN (B1017): a fixture's word names only the blocks a task name would (>= BIG), as `fx:<verb>`.
+            match fx_name(tag & !FX) {
+                Some(n) if size >= BIG => (n, true),
+                _ => return,
+            }
+        } else if tag != 0 && (tag as usize) < NAMES.len() {
             (NAMES[tag as usize], true)
         } else if size >= BIG {
             (crate::arch::sched::current_name().unwrap_or("-"), false)
@@ -507,7 +521,8 @@ pub mod census {
                 SEEN_MS[i].store(now, Relaxed);
                 continue;
             }
-            if now.saturating_sub(SEEN_MS[i].load(Relaxed)) >= STALE_MS && ARMED[i].compare_exchange(v, 0, AcqRel, Relaxed).is_ok() {
+            let stale = if v as u8 & FX != 0 { STALE_FX_MS } else { STALE_MS }; // FIXTURERETAIN (B1017): a fixture outlives 30 s
+            if now.saturating_sub(SEEN_MS[i].load(Relaxed)) >= stale && ARMED[i].compare_exchange(v, 0, AcqRel, Relaxed).is_ok() {
                 RECLAIMED.fetch_add(1, Relaxed);
                 SEEN[i].store(0, Relaxed);
             }
@@ -526,6 +541,89 @@ pub mod census {
             insert(addr, size, NAMES[tag as usize], true);
             drop(heap);
         });
+    }
+
+    // FIXTURERETAIN (rmbp-ledger B1017, BP-cores-22) — PER-FIXTURE ATTRIBUTION. Flight 38's census charged +18387 KiB
+    // to `task:bootlist-fx`: every list child carries that task name, so the row was the SUM over sixteen fixtures.
+    // [`fx_enter`] (folded on `tests::run`'s fixture line, around `f()`, with the fixture's registered name) arms the
+    // task with an FX word, `(tid << 8) | FX | idx`: `idx` names an interned `fx:<verb>` string in [`FXP`]/[`FXL`],
+    // so the Entry's existing name field carries the fixture and nesting is exact (a `stage` enter inside a fixture
+    // restores the FX word on its drop). [`note`] tracks such a task's block only when >= [`BIG`] (as a task name
+    // would), `tagged`, so memcensus prints it bare: `[memline] census tag=fx:gen7`. The strings live in a static
+    // arena under [`FXN`], a leaf lock taken only here, never with the heap lock held, never allocating; a name is
+    // published (Release) before its idx is handed out, and [`note`] reads it lock-free (Acquire). Full = inert.
+
+    /// The FX bit of a word's tag byte; the low 7 bits index the intern table.
+    const FX: u8 = 0x80;
+    const FX_MAX: usize = 128;
+    const FX_ARENA: usize = 4096;
+    /// A fixture runs up to the list's longest budget (`bootlist::BUDGET_MAX_S`) before its word is reaped.
+    const STALE_FX_MS: u64 = 3_600_000;
+    static FXP: [AtomicUsize; FX_MAX] = [const { AtomicUsize::new(0) }; FX_MAX];
+    static FXL: [AtomicUsize; FX_MAX] = [const { AtomicUsize::new(0) }; FX_MAX];
+
+    struct FxArena {
+        buf: [u8; FX_ARENA],
+        used: usize,
+        /// `(source name ptr, source len)` per interned idx, `n` of them.
+        src: [(usize, usize); FX_MAX],
+        n: usize,
+    }
+    static FXN: crate::sync::Mutex<FxArena> = crate::sync::Mutex::new(FxArena { buf: [0; FX_ARENA], used: 0, src: [(0, 0); FX_MAX], n: 0 });
+
+    /// The interned `fx:<verb>` for `idx` (lock-free; `None` = not published).
+    fn fx_name(idx: u8) -> Option<&'static str> {
+        let i = idx as usize;
+        if i >= FX_MAX {
+            return None;
+        }
+        let p = FXP[i].load(Acquire);
+        if p == 0 {
+            return None;
+        }
+        // SAFETY: `p`/`FXL[i]` were published by [`fx_intern`] for bytes of the static arena that are never rewritten
+        // once published (the arena only grows), copied from a `&str` behind the literal ASCII `fx:` prefix.
+        Some(unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(p as *const u8, FXL[i].load(Relaxed))) })
+    }
+
+    /// `name`'s idx, interning `fx:<name>` on its first use (`None` = the table or the arena is full).
+    fn fx_intern(name: &'static str) -> Option<u8> {
+        let mut a = FXN.lock();
+        let key = (name.as_ptr() as usize, name.len());
+        if let Some(i) = a.src[..a.n].iter().position(|&k| k == key) {
+            return Some(i as u8);
+        }
+        let len = 3 + name.len();
+        if a.n >= FX_MAX || a.used + len > FX_ARENA {
+            return None;
+        }
+        let (at, i) = (a.used, a.n);
+        a.buf[at..at + 3].copy_from_slice(b"fx:");
+        a.buf[at + 3..at + len].copy_from_slice(name.as_bytes());
+        a.used += len;
+        a.src[i] = key;
+        a.n += 1;
+        let p = a.buf[at..].as_ptr() as usize;
+        FXL[i].store(len, Relaxed);
+        FXP[i].store(p, Release);
+        Some(i as u8)
+    }
+
+    /// Name the calling task's >= [`BIG`] blocks `fx:<name>` until the returned [`Scope`] drops (`name` = a fixture's
+    /// registered name). Inert when the census is not armed, outside a task, or with the table or the slots full.
+    pub fn fx_enter(name: &'static str) -> Scope {
+        let inert = Scope { slot: SLOTS, prev: 0, own: 0 };
+        if !ON.load(Acquire) {
+            return inert;
+        }
+        let Some(tid) = crate::arch::sched::current_id() else { return inert };
+        let Some(idx) = fx_intern(name) else { return inert };
+        claim(tid, (tid << 8) | (FX | idx) as u64)
+    }
+
+    /// The census is counting (armed at the first desktop build's ask).
+    pub fn armed() -> bool {
+        ON.load(Acquire)
     }
 }
 
