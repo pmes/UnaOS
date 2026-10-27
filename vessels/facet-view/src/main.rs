@@ -191,6 +191,9 @@ fn main() {
                             for r in v.input(&msg) {
                                 synapse.fire(SMessage::Facet(r));
                             }
+                            if let Some(p) = v.take_panel() {
+                                synapse.fire(p); // SAVEDIALOG (SR364): Save As asks the window's save panel
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

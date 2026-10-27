@@ -727,6 +727,8 @@ struct Coordinator {
     devtools: chrome::DevtoolsChrome,
     /// A11YFACE (SR124): the last accessibility rows the face sent (every new tab gets them).
     a11y_prefs: Option<SMessage>,
+    /// SAVEDIALOG (SR364): a `BrowserSaveAs`'s name and bytes, held until the face's save panel answers `SavePanelChose`.
+    save_as: Option<(String, Vec<u8>)>,
 }
 
 /// AETHERDEVTOOLS2 (SR112): the face's layout for the pane — `DevtoolsChrome::split` of the content area
@@ -933,6 +935,9 @@ impl Coordinator {
             | SMessage::BrowserA11y(_) | SMessage::SurfaceResend { .. } => self.to_active(m), // SurfaceResend: AETHERMACGPU-ENGINEDAMAGE (SR341)
             // PDF4FORMSAVE (SR354): a tab's engine handed bytes to save.
             SMessage::BrowserSave { name, bytes, .. } => self.on_save(&name, &bytes),
+            // SAVEDIALOG (SR364): Save As: hold the bytes, ask the page surface's face for a path; its answer writes them.
+            SMessage::BrowserSaveAs { name, bytes, .. } => self.on_save_as(name, bytes),
+            SMessage::SavePanelChose { url, path } if url == "viewport" => self.on_save_chosen(path),
             _ => {}
         }
     }
@@ -941,9 +946,31 @@ impl Coordinator {
     /// download's own unique name, `.part` and rename), list it as a finished download row (the one row path,
     /// `on_report`), and answer `BrowserSaved` / `BrowserSaveFailed`. Written here, synchronously, as the bookmarks are.
     fn on_save(&mut self, name: &str, bytes: &[u8]) {
-        let len = bytes.len() as u64;
+        self.answer_save(name, bytes.len() as u64, chrome::host::save_bytes(name, bytes));
+    }
+
+    /// SAVEDIALOG (SR364): a `BrowserSaveAs`: the bytes wait here (a newer Save As replaces them: the panel is modal) and
+    /// the page surface's face shows the platform save panel seeded with the name.
+    fn on_save_as(&mut self, name: String, bytes: Vec<u8>) {
+        self.bus.fire(SMessage::SavePanel { url: "viewport".into(), name: name.clone() });
+        self.save_as = Some((name, bytes));
+    }
+
+    /// SAVEDIALOG (SR364): the panel's answer: a chosen path lands the held bytes through the ONE writer
+    /// (`chrome::host::save_bytes_at`) and answers as a Save does (`answer_save`); a cancel answers
+    /// `BrowserSaveFailed { why: "cancelled" }` and lists no row. No held bytes: nothing to do.
+    fn on_save_chosen(&mut self, path: Option<String>) {
+        let Some((name, bytes)) = self.save_as.take() else { return };
+        match path {
+            Some(p) => self.answer_save(&name, bytes.len() as u64, chrome::host::save_bytes_at(std::path::Path::new(&p), &bytes)),
+            None => self.bus.fire(SMessage::BrowserSaveFailed { why: "cancelled".into() }),
+        }
+    }
+
+    /// PDF4FORMSAVE (SR354) / SAVEDIALOG (SR364): a written save's finished download row and its answer, for the
+    /// Downloads save and the Save As alike.
+    fn answer_save(&mut self, name: &str, len: u64, result: Result<std::path::PathBuf, String>) {
         self.next_download += 1;
-        let result = chrome::host::save_bytes(name, bytes);
         let shown = match &result {
             Ok(path) => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| name.to_string()),
             Err(_) => name.to_string(),
@@ -1080,6 +1107,7 @@ fn main() {
                     last_resize: None,
                     devtools: chrome::DevtoolsChrome::default(),
                     a11y_prefs: None,
+                    save_as: None,
                 };
                 local.block_on(&rt, coordinator.run(bus_rx, reports_rx, atspi_rx));
             })

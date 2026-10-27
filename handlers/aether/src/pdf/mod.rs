@@ -561,16 +561,19 @@ impl crate::AetherEngine {
     /// PDF4FORMSAVE (SR354): Ctrl/Cmd+S on a PDF stages a `BrowserSave` of the file as it stands (the filled form's
     /// incremental updates, or the fetched bytes untouched) for the shell to write to the Downloads folder. Runs ahead
     /// of `pdf_key`, whose focused field would take the `s` as a consumed character; the field keeps its focus. False
-    /// (the key goes on as before) for any other key and on an HTML page (PAGE-SAVE owed).
+    /// (the key goes on as before) for any other key and on an HTML page (PAGE-SAVE owed). SAVEDIALOG (SR364): with
+    /// Shift (Ctrl/Cmd+Shift+S) the same name / type / bytes stage as `BrowserSaveAs`: the shell asks the face's save
+    /// panel for the path (the staged variant is the Save As flag).
     pub(crate) fn save_key(&mut self, key: &str) -> bool {
         use crate::forms::edit::{parse_key, Key};
         let (m, k) = parse_key(key);
-        if !(m.ctrl || m.meta) || m.alt || m.shift || !matches!(k, Some(Key::Char('s' | 'S'))) {
+        if !(m.ctrl || m.meta) || m.alt || !matches!(k, Some(Key::Char('s' | 'S'))) {
             return false;
         }
         let Some(pdf) = self.pdf.as_ref() else { return false };
         let name = save_name(pdf.title.as_deref(), &self.current_url());
-        self.pending_save = Some(bandy::SMessage::BrowserSave { name, mime: "application/pdf".to_string(), bytes: pdf.bytes.clone() });
+        let (mime, bytes) = ("application/pdf".to_string(), pdf.bytes.clone());
+        self.pending_save = Some(if m.shift { bandy::SMessage::BrowserSaveAs { name, mime, bytes } } else { bandy::SMessage::BrowserSave { name, mime, bytes } });
         true
     }
 

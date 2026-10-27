@@ -155,6 +155,8 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
                 }
                 // The engine's answer to BrowserCopy: the display's clipboard.
                 Ok(SMessage::BrowserClipboardSet(text)) => da_clone.clipboard().set_text(&text),
+                // SAVEDIALOG (SR364): the owner asks THIS surface's window for a path: the platform save dialog.
+                Ok(SMessage::SavePanel { url, name }) if url == target_id => super::save_dialog::run(&da_clone, url, &name, resend.clone()),
                 Ok(_) => {}
                 // AETHERMACGPU-ENGINEDAMAGE (SR341): a lagged page no longer ENDS this loop (the page froze); its kept frame
                 // is unknown, so it asks the sender for the surface whole.

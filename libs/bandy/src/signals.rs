@@ -507,6 +507,17 @@ pub enum SMessage {
     BrowserSaved { path: String },
     /// Shell -> chrome (PDF4FORMSAVE, SR354): the [`SMessage::BrowserSave`] could not be written, and why.
     BrowserSaveFailed { why: String },
+    /// Engine -> shell (SAVEDIALOG, LEDGER SR364): Save As these bytes. Ctrl/Cmd+Shift+S on a PDF tab stages the same
+    /// `name` / `mime` / `bytes` a [`SMessage::BrowserSave`] would; the shell holds them, asks the face for a path
+    /// ([`SMessage::SavePanel`]) and writes them where the person chose. APPENDED so no earlier wire tag moves.
+    BrowserSaveAs { name: String, mime: String, bytes: Vec<u8> },
+    /// Owner -> face (SAVEDIALOG, SR364): show the platform save panel (AppKit NSSavePanel / GTK FileDialog) over the
+    /// surface `url` (the lane that draws that surface answers; every other surface ignores it), seeded with `name`.
+    /// The face writes nothing: it answers [`SMessage::SavePanelChose`].
+    SavePanel { url: String, name: String },
+    /// Face -> owner (SAVEDIALOG, SR364): the path the person chose in the [`SMessage::SavePanel`] over `url`, or `None`
+    /// when the panel was cancelled. A chosen path that exists was confirmed as a replace by the panel.
+    SavePanelChose { url: String, path: Option<String> },
 }
 
 /// A typed preference value — the whole value domain of the Principia

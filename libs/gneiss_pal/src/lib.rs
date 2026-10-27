@@ -31,6 +31,8 @@ pub mod io;
 pub mod paths;
 #[cfg(feature = "std")]
 pub mod persistence;
+// SAVEDIALOG (SR364): the ONE host file writer (`.part` then rename) — ungated, so Facet's no-default-features build links it.
+pub mod fs;
 pub mod utils;
 #[cfg(feature = "std")]
 pub mod app_handler;
