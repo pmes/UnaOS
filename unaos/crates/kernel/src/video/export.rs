@@ -19,9 +19,11 @@
 //!   capture). snd's feed, crossfade and drain run unchanged; the capture is 48 kHz stereo PCM16, the mixer's own format.
 //! * THE FILE ([`finish`], after the job's sound closed): the encoder flushed, ONE `build::mp4` of the `avc1` track (sample
 //!   i at its unit's (dts, pts) x the tick, so B pictures write `ctts`; timescale the EDL's fps, Stria's `video_track`
-//!   shape) and, when sound was captured, a `sowt` PCM16 track (`build::pcm16_track`) cut to the video's length (an AAC
-//!   encoder is owed: NLE6EXPORT-AAC). Written as the shell writes (`write_veto` at start, `SHELL_PRINCIPAL` = the kernel
-//!   principal).
+//!   shape) and, when sound was captured, a `sowt` PCM16 track (`build::pcm16_track`) cut to the video's length — or,
+//!   under `--aac KBPS` ([`Opts::aac_kbps`], NLE6EXPORTAAC rmbp-ledger B960), the same cut PCM through audio_core's
+//!   `aac::enc::Encoder` (Stria's host export's one encoder) as an `mp4a` track (`build::mp4a_track`), its priming trimmed
+//!   by `build::mp4a_edit_list` ([`audio_track`]). Written as the shell writes (`write_veto` at start, `SHELL_PRINCIPAL` =
+//!   the kernel principal).
 //! * LOCKS: [`ENC`] (the armed export) is a leaf; [`frame`] TAKES the export out of it and encodes with no lock held (a
 //!   1080p picture is far past the lock registry's 50 ms), putting it back unless superseded. `bus::CAP` (the capture) is
 //!   taken under vplay's `snd::SND` and takes nothing (the live forward drops it first): the one new edge is SND -> CAP.
@@ -29,9 +31,11 @@
 //!   `vplay::finished` cannot say it: a superseded job ends with neither eos nor an error).
 //!
 //! Wire: `[nle] export start edl= out= qp= gop= bframes= jid=` · `[nle] export progress pct=<10..100> frames=<n>/<total>` ·
-//! `[nle] export frames=<n> bytes=<n> ms=<n> audio=<mixed>/<target> bframes=<n> out=<p>` · `[nle] export refused why=<w> (<reason>)`.
-//! The witness is player.rs `tests nle` (`export=` on `:: NLE: … ::`). Owed: `--bitrate`, the Pi budget, a progress UI on
-//! the kernel face, MKV, AAC, a streaming writer (the units and PCM are held whole until the one `build::mp4`).
+//! `[nle] export frames=<n> bytes=<n> ms=<n> audio=<mixed>/<target> bframes=<n> out=<p>` · `[nle] export refused why=<w> (<reason>)`
+//! · NLE6EXPORTAAC: `[nle] export audio=aac bytes=<n> units=<n> kbps=<k>` (before the `frames=` line).
+//! The witness is player.rs `tests nle` (`export=` on `:: NLE: … ::`; the AAC leg's `[nle] fixture export audio=aac`).
+//! Owed: `--bitrate`, the Pi budget, a progress UI on the kernel face, MKV, a streaming writer (the units and PCM are held
+//! whole until the one `build::mp4`).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -49,11 +53,13 @@ pub struct Opts {
     pub gop: u32,
     /// B pictures between anchors (0..=4; h264enc_core's `Config::bframes`).
     pub bframes: u8,
+    /// NLE6EXPORTAAC (rmbp-ledger B960): the sound as AAC-LC at this many kb/s; 0 = PCM16 `sowt` (the default).
+    pub aac_kbps: u32,
 }
 
 impl Default for Opts {
     fn default() -> Opts {
-        Opts { qp: 26, gop: 0, bframes: 0 }
+        Opts { qp: 26, gop: 0, bframes: 0, aac_kbps: 0 }
     }
 }
 
@@ -236,15 +242,18 @@ impl Exp {
             .collect();
         let mut tracks = alloc::vec![build::MediaTrack { spec, samples }];
         let mut rep = Report { frames: self.frames, bframes: self.opts.bframes, out: self.out.clone(), ..Report::default() };
+        let mut extras = build::Mp4Extras::default(); // NLE6EXPORTAAC (rmbp-ledger B960): the AAC track's priming edit; empty for PCM16
         if let Some((mut pcm, rate)) = pcm.filter(|(p, _)| !p.is_empty()) {
             let target = (self.tb.to_ns(self.total as i64).max(0) as u128 * rate as u128 / 1_000_000_000) as u64;
             rep.audio_mixed = (pcm.len() / 2) as u64;
             rep.audio_target = target;
             rep.audio = true;
             pcm.resize(target as usize * 2, 0);
-            tracks.push(build::pcm16_track(2, rate, 2, &pcm, 1024));
+            let (track, edit) = audio_track(&pcm, rate, self.opts.aac_kbps)?;
+            tracks.push(track);
+            extras.edit_lists.extend(edit);
         }
-        let mp4 = build::mp4(&tracks, &build::Mp4Options::default());
+        let mp4 = build::mp4_with(&tracks, &build::Mp4Options::default(), &extras);
         drop(tracks);
         rep.bytes = write_file(&self.out, &mp4).map_err(|e| ("write-refused", e))?;
         rep.ms = crate::arch::ms().saturating_sub(self.t0);
@@ -270,9 +279,9 @@ fn write_file(path: &str, body: &[u8]) -> Result<u64, String> {
     Ok(off as u64)
 }
 
-/// `nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N]`: arm and start; the job prints the progress and the end.
+/// `nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N] [--aac KBPS]`: arm and start; the job prints the progress and the end.
 pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
-    const USAGE: &str = "usage: nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N]";
+    const USAGE: &str = "usage: nle export <edl> <out.mp4> [--qp N] [--gop N] [--bframes N] [--aac KBPS]";
     if args.first().copied() != Some("export") || args.len() < 3 {
         console.println(USAGE);
         return;
@@ -285,6 +294,7 @@ pub fn shell_verb(args: &[&str], console: &mut crate::console::Console) {
             ("--qp", Some(n)) => o.qp = n.min(255) as u8,
             ("--gop", Some(n)) => o.gop = n,
             ("--bframes", Some(n)) => o.bframes = n.min(255) as u8,
+            ("--aac", Some(n)) => o.aac_kbps = n,
             ("--bitrate", _) => {
                 console.println("nle export: --bitrate is owed (NLE6EXPORT-BITRATE)");
                 return;
@@ -413,4 +423,22 @@ mod bus {
     pub(super) fn take(_: u32) -> Option<(alloc::vec::Vec<i16>, u32)> {
         None
     }
+}
+
+/// NLE6EXPORTAAC (rmbp-ledger B960): the captured sound's track (track 2, stereo at `rate`, already cut to the video): PCM16
+/// `sowt` when `aac_kbps` is 0, else AAC-LC through audio_core's `aac::enc::Encoder` (the encoder Stria's host export
+/// takes) as `build::mp4a_track` with its priming edit (`build::mp4a_edit_list`). Runs in [`Exp::write`], no lock held.
+fn audio_track(pcm: &[i16], rate: u32, aac_kbps: u32) -> Result<(build::MediaTrack, Option<(u32, Vec<(u32, i64, i32)>)>), (&'static str, String)> {
+    if aac_kbps == 0 {
+        return Ok((build::pcm16_track(2, rate, 2, pcm, 1024), None));
+    }
+    use audio_core::aac::enc::{Encoder, PRIMING};
+    let bps = aac_kbps.saturating_mul(1000);
+    let mut enc = Encoder::new(rate, 2, bps).map_err(|e| ("aac-refused", alloc::format!("{:?}", e)))?;
+    let mut units = enc.encode(pcm);
+    units.extend(enc.flush());
+    let (n, bytes) = (units.len(), units.iter().map(|u| u.data.len()).sum::<usize>());
+    serial_println!("[nle] export audio=aac bytes={} units={} kbps={}", bytes, n, aac_kbps);
+    let track = build::mp4a_track(2, rate, 2, &enc.asc(), units.into_iter().map(|u| u.data).collect(), bps);
+    Ok((track, Some(build::mp4a_edit_list(2, rate, PRIMING, (pcm.len() / 2) as u64))))
 }

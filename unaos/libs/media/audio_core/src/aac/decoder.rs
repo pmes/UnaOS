@@ -323,7 +323,7 @@ fn kbd(n: usize, alpha: f64) -> Vec<f32> {
     (0..half).map(|i| { acc += w[i]; math::sqrt(acc / total) as f32 }).collect()
 }
 
-fn sine(n: usize) -> Vec<f32> {
+pub(crate) fn sine(n: usize) -> Vec<f32> {
     (0..n / 2).map(|i| math::sin(core::f64::consts::PI / n as f64 * (i as f64 + 0.5)) as f32).collect()
 }
 
@@ -332,7 +332,7 @@ impl AacDecoder {
         if sf_index > 12 { return Err(Error::Invalid("aac: sampling frequency index")); }
         let sf_huff = Huff::new(&t::SF_CODE, &t::SF_BITS);
         let spec_huff = (0..11).map(|i| Huff::new(t::SPEC_CODES[i], t::SPEC_BITS[i])).collect();
-        let pow43 = (0..8192).map(|i| math::pow(i as f64, 4.0 / 3.0) as f32).collect();
+        let pow43 = pow43_table();
         let n = layout.channels;
         Ok(AacDecoder {
             sf_index,
@@ -906,4 +906,10 @@ impl AacDecoder {
         }
         Ok(())
     }
+}
+
+/// |q|^(4/3) for q < 8192: the inverse quantiser's table, the decoder's and the encoder's (`super::enc`, NLE6EXPORTAAC
+/// rmbp-ledger B960) one.
+pub(crate) fn pow43_table() -> Vec<f32> {
+    (0..8192).map(|i| math::pow(i as f64, 4.0 / 3.0) as f32).collect()
 }

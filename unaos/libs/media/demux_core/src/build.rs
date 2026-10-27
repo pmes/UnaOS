@@ -1219,6 +1219,62 @@ fn mkv_colour(opts: &MkvOptions, id: u32) -> Vec<u8> {
     el(0x55B0, &b)
 }
 
+/// NLE6EXPORTAAC (rmbp-ledger B960): an AAC track (`mp4a` + `esds`), one raw_data_block per sample of 1024 frames,
+/// timescale = the sample rate. `asc` is the AudioSpecificConfig (audio_core `aac::enc::Encoder::asc`); `config` holds the
+/// whole `esds` body (the full-box word, ES_Descriptor -> DecoderConfigDescriptor (objectTypeIndication 0x40, audio
+/// stream) -> DecoderSpecificInfo = `asc`, SLConfigDescriptor 2), which the reader's `parse_esds` takes back to the ASC.
+/// MP4 only: a Matroska `A_AAC` track wants the bare ASC as CodecPrivate (AACENC-MKV owed), so [`mkv`] of this track is
+/// not supported. The encoder's priming is trimmed by [`mp4a_edit_list`] through [`Mp4Extras::edit_lists`].
+pub fn mp4a_track(id: u32, sample_rate: u32, channels: u16, asc: &[u8], units: Vec<Vec<u8>>, avg_bitrate: u32) -> MediaTrack {
+    let desc = |tag: u8, body: &[u8]| -> Vec<u8> {
+        let mut d = alloc::vec![tag];
+        let n = body.len();
+        d.extend_from_slice(&[0x80 | ((n >> 21) & 0x7F) as u8, 0x80 | ((n >> 14) & 0x7F) as u8, 0x80 | ((n >> 7) & 0x7F) as u8, (n & 0x7F) as u8]);
+        d.extend_from_slice(body);
+        d
+    };
+    let biggest = units.iter().map(|u| u.len()).max().unwrap_or(0) as u32;
+    let max_bitrate = (biggest as u64 * 8 * sample_rate as u64 / 1024).max(avg_bitrate as u64) as u32;
+    let mut dcd = alloc::vec![0x40u8, 0x15];
+    dcd.extend_from_slice(&biggest.to_be_bytes()[1..]);
+    dcd.u32b(max_bitrate);
+    dcd.u32b(avg_bitrate);
+    dcd.extend_from_slice(&desc(0x05, asc));
+    let mut es = alloc::vec![0u8, 0, 0]; // ES_ID 0, no dependence / URL / OCR
+    es.extend_from_slice(&desc(0x04, &dcd));
+    es.extend_from_slice(&desc(0x06, &[0x02]));
+    let mut config = alloc::vec![0u8; 4]; // the full-box version and flags
+    config.extend_from_slice(&desc(0x03, &es));
+    let spec = TrackSpec {
+        id,
+        kind: TrackKind::Audio,
+        fourcc: *b"mp4a",
+        config_box: Some(*b"esds"),
+        codec_id: "A_AAC",
+        config,
+        timescale: sample_rate,
+        width: 0,
+        height: 0,
+        sample_rate,
+        channels,
+        bit_depth: 16,
+        default_duration_ns: 0,
+    };
+    let samples = units
+        .into_iter()
+        .enumerate()
+        .map(|(i, data)| SampleSpec { data, dts: i as i64 * 1024, pts: i as i64 * 1024, duration: 1024, keyframe: true })
+        .collect();
+    MediaTrack { spec, samples }
+}
+
+/// The [`Mp4Extras::edit_lists`] entry of an [`mp4a_track`]: skip `priming` media samples, present `frames` (in the
+/// default movie timescale, 1000).
+pub fn mp4a_edit_list(id: u32, sample_rate: u32, priming: u32, frames: u64) -> (u32, Vec<(u32, i64, i32)>) {
+    let seg = (frames as u128 * 1000 / sample_rate.max(1) as u128) as u32;
+    (id, alloc::vec![(seg, priming as i64, 0x0001_0000)])
+}
+
 #[cfg(test)]
 mod tests {
     /// SWAPBACKVPLAY (rmbp-ledger B956): the stand-in's pixels, pinned. FNV-1a 64 of `test_pattern_rgba(64, 48, n)`,
@@ -1231,6 +1287,28 @@ mod tests {
         assert_eq!(fnv(&super::test_pattern_rgba(64, 48, 1)), 0xdb29_ef26_80d9_5484);
         for n in [0u32, 1, 42, 999_999] {
             assert_eq!(super::test_pattern_counter(&super::test_pattern_rgba(64, 48, n), 64, 48), Some(n));
+        }
+    }
+
+    /// NLE6EXPORTAAC (rmbp-ledger B960): the `mp4a` / `esds` track and its priming edit read back through the demuxer.
+    #[test]
+    fn mp4a_track_round_trip() {
+        use alloc::vec;
+        let asc = [0x11u8, 0x90];
+        let units: alloc::vec::Vec<alloc::vec::Vec<u8>> = (0..5u8).map(|i| vec![0x21, i, 0x40]).collect();
+        let t = super::mp4a_track(1, 48000, 2, &asc, units.clone(), 128000);
+        let x = super::Mp4Extras { edit_lists: vec![super::mp4a_edit_list(1, 48000, 1024, 3000)], ..Default::default() };
+        let mp4 = super::mp4_with(&[t], &super::Mp4Options::default(), &x);
+        let d = crate::Demuxer::open(mp4).unwrap();
+        let tr = &d.tracks()[0];
+        assert_eq!(tr.codec, crate::Codec::Aac);
+        assert_eq!(tr.config, asc.to_vec());
+        assert_eq!((tr.sample_rate, tr.channels), (48000, 2));
+        assert_eq!(tr.edit.map(|e| e.media_time), Some(1024));
+        let got: alloc::vec::Vec<_> = d.track_samples(0).map(|s| (s.dts, s.duration, d.packet_at(s).data)).collect();
+        assert_eq!(got.len(), 5);
+        for (i, (dts, dur, data)) in got.into_iter().enumerate() {
+            assert_eq!((dts, dur, data), (i as i64 * 1024, 1024, units[i].clone()));
         }
     }
 }

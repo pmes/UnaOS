@@ -16,7 +16,10 @@
 //!   the PCM16 track when the audio is [`AudioOut::Mp4`] (`movie.mp4`), alone otherwise (`video.mp4`).
 //! * Audio: [`AudioOut::Wav`] streams RIFF/WAVE PCM16 (`audio.wav`, header patched at the end), [`AudioOut::Mp4`]
 //!   muxes an audio-only `sowt` track (`audio.mp4`) through `build::pcm16_track` + `build::mp4`. The f32 → i16
-//!   quantiser [`pcm16`] inverts the decoders' `s / 32768.0` exactly.
+//!   quantiser [`pcm16`] inverts the decoders' `s / 32768.0` exactly. [`AudioOut::Aac`] (NLE6EXPORTAAC, rmbp-ledger
+//!   B960; `nle export --audio aac`) writes the same track as AAC-LC: audio_core's `aac::enc::Encoder` (the kernel's
+//!   export encodes through it too) into `build::mp4a_track`, its 1024-sample priming trimmed by `build::mp4a_edit_list`
+//!   in ONE `build::mp4_with`. PCM16 stays the default.
 //! * [`ExportReport::fnv`] is FNV-1a 64 over the rendered RGBA stream: the same number `nle render` prints.
 //! * H264ENCBFRAMES (SR333): [`H264Encoder::with_bframes`] codes B pictures through h264enc_core's `push` / `flush`;
 //!   each unit carries its (dts, pts) ([`Access::time`]) and the MP4 track writes them per sample, so demux_core's
@@ -174,6 +177,9 @@ pub enum AudioOut {
     Wav,
     /// `audio.mp4`: an audio-only MP4, one `sowt` PCM16 track.
     Mp4,
+    /// NLE6EXPORTAAC (rmbp-ledger B960): as [`AudioOut::Mp4`] (`audio.mp4`, or `movie.mp4` beside H.264), the track one
+    /// `mp4a` AAC-LC track at this many kb/s.
+    Aac(u32),
 }
 
 /// What an export wrote.
@@ -193,6 +199,8 @@ pub enum ExportError {
     Png(PngError),
     Render(RenderError),
     H264(h264enc_core::Error),
+    /// NLE6EXPORTAAC (rmbp-ledger B960): the AAC encoder refused the stream (its rate or channel count).
+    Aac(gneiss_pal::dsp::audio::Error),
 }
 
 impl std::fmt::Display for ExportError {
@@ -202,6 +210,7 @@ impl std::fmt::Display for ExportError {
             ExportError::Png(e) => write!(f, "png: {e:?}"),
             ExportError::Render(e) => write!(f, "render: {e}"),
             ExportError::H264(e) => write!(f, "{e}"),
+            ExportError::Aac(e) => write!(f, "aac: {e:?}"),
         }
     }
 }
@@ -323,7 +332,7 @@ impl ExportSink {
         self.report.pcm_frames += n;
         match self.audio {
             AudioOut::None => {}
-            AudioOut::Mp4 => self.pcm.extend(s.iter().map(|&x| pcm16(x))),
+            AudioOut::Mp4 | AudioOut::Aac(_) => self.pcm.extend(s.iter().map(|&x| pcm16(x))),
             AudioOut::Wav => {
                 if self.wav.is_none() {
                     let mut file = BufWriter::new(File::create(self.dir.join("audio.wav"))?);
@@ -373,8 +382,14 @@ impl ExportSink {
             self.report.bytes += 44 + wav.frames * wav.channels as u64 * 2;
         }
         let movie = self.video.layout() == Layout::Mp4;
+        let mut extras = build::Mp4Extras::default();
         let audio = match (self.audio, self.afmt) {
             (AudioOut::Mp4, Some((rate, ch))) => Some(build::pcm16_track(if movie { 2 } else { 1 }, rate, ch, &self.pcm, 1024)),
+            (AudioOut::Aac(kbps), Some((rate, ch))) => {
+                let (t, edit) = aac_track(if movie { 2 } else { 1 }, rate, ch, &self.pcm, kbps)?;
+                extras.edit_lists.push(edit);
+                Some(t)
+            }
             _ => None,
         };
         let mut tracks: Vec<build::MediaTrack> = Vec::new();
@@ -383,12 +398,12 @@ impl ExportSink {
         }
         tracks.extend(audio);
         if !tracks.is_empty() {
-            let name = match (movie, self.audio == AudioOut::Mp4) {
+            let name = match (movie, matches!(self.audio, AudioOut::Mp4 | AudioOut::Aac(_))) {
                 (true, true) => "movie.mp4",
                 (true, false) => "video.mp4",
                 (false, _) => "audio.mp4",
             };
-            let mp4 = build::mp4(&tracks, &build::Mp4Options::default());
+            let mp4 = build::mp4_with(&tracks, &build::Mp4Options::default(), &extras);
             std::fs::write(self.dir.join(name), &mp4)?;
             self.report.files += 1;
             self.report.bytes += mp4.len() as u64;
@@ -457,4 +472,16 @@ pub fn export(
     let mut sink = ExportSink::new(dir, video, audio);
     render(tl, range, sources, &mut sink).map_err(ExportError::Render)?;
     sink.finish(tl.tb)
+}
+
+/// NLE6EXPORTAAC (rmbp-ledger B960): interleaved PCM16 as an `mp4a` AAC-LC track `id` through audio_core's encoder, and
+/// the edit list that trims its priming to the PCM's own length.
+fn aac_track(id: u32, rate: u32, ch: u16, pcm: &[i16], kbps: u32) -> Result<(build::MediaTrack, (u32, Vec<(u32, i64, i32)>)), ExportError> {
+    use gneiss_pal::dsp::audio::aac::enc::{Encoder, PRIMING};
+    let mut enc = Encoder::new(rate, ch, kbps.saturating_mul(1000)).map_err(ExportError::Aac)?;
+    let mut units = enc.encode(pcm);
+    units.extend(enc.flush());
+    let frames = (pcm.len() / ch.max(1) as usize) as u64;
+    let track = build::mp4a_track(id, rate, ch, &enc.asc(), units.into_iter().map(|u| u.data).collect(), kbps.saturating_mul(1000));
+    Ok((track, build::mp4a_edit_list(id, rate, PRIMING, frames)))
 }

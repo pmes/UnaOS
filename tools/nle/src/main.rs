@@ -7,7 +7,7 @@
 //! ```text
 //! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
 //! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|none]
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|aac|none] [--aac]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! ```
 //!
@@ -23,7 +23,8 @@
 //! `video.rgba` + `video.json`, and `audio.wav` or `audio.mp4`; one JSON line: codec, frames, files, bytes, the RGBA
 //! fnv (`render`'s) and PCM frames. `--video h264` (NLE5B, SR206) writes `movie.mp4` (H.264 + PCM16) under
 //! `--audio mp4`, else `video.mp4`; `--qp` (16..=40, default 26) and `--gop` (default the timeline's fps); `--bitrate`
-//! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP).
+//! a CBR target in kbit/s at the timeline's fps (H264ENCRC SR218: `--qp` becomes the starting QP). `--audio aac` (or
+//! `--aac`; NLE6EXPORTAAC rmbp-ledger B960) writes the MP4's sound as AAC-LC at 128 kb/s instead of PCM16.
 
 use std::io::Write;
 
@@ -35,7 +36,7 @@ use timeline_core::{Kind, Timeline, edl};
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|none]");
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS] [--audio wav|mp4|aac|none] [--aac]");
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     std::process::exit(2)
 }
@@ -106,6 +107,7 @@ fn main() {
             "--out" => out = Some(it.next().unwrap_or_else(|| usage()).clone()),
             "--video" => video = it.next().unwrap_or_else(|| usage()).clone(),
             "--audio" => audio = it.next().unwrap_or_else(|| usage()).clone(),
+            "--aac" => audio = "aac".to_string(),
             "--qp" => qp = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()),
             "--gop" => gop = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
             "--bitrate" => bitrate = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
@@ -175,6 +177,7 @@ fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, di
     let aud = match audio {
         "wav" => AudioOut::Wav,
         "mp4" => AudioOut::Mp4,
+        "aac" => AudioOut::Aac(128),
         "none" => AudioOut::None,
         _ => usage(),
     };
