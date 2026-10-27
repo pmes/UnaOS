@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use gneiss_pal::dsp::demux::build;
 use gneiss_pal::dsp::image::{PngError, encode_rgba};
 use h264enc_core::rgba::{RgbaEncoder, Unit};
-use h264enc_core::{Config, RateControl, RcMode};
+use h264enc_core::{Config, RateControl};
 use timeline_core::{Timebase, Timeline};
 
 use crate::nle::{RenderError, RenderSink, Sources, render};
@@ -133,7 +133,7 @@ impl H264Encoder {
     /// A constant bit rate of `kbps` kbit/s at `fps_num / fps_den` frames per second (`nle export --bitrate`): `qp`
     /// becomes the rate controller's starting QP.
     pub fn with_bitrate(mut self, kbps: u32, fps_num: u32, fps_den: u32) -> H264Encoder {
-        self.rgba.cfg.rate = Some(RateControl { bits_per_second: kbps.saturating_mul(1000), fps_num, fps_den, mode: RcMode::Cbr });
+        self.rgba.cfg.rate = Some(RateControl::cbr(kbps, (fps_num, fps_den)));
         self
     }
 

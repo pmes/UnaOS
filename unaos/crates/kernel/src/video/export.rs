@@ -162,8 +162,8 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, rgba: &[u8]
             e.rgba.cfg.gop = (tb.den / tb.num.max(1)).clamp(1, 600) as u32;
         }
         if e.opts.bitrate > 0 {
-            // tools/nle's `with_bitrate(k, tb.den, tb.num)`: the same `Config.rate`, set before the first picture builds the encoder
-            e.rgba.cfg.rate = Some(h264enc_core::RateControl { bits_per_second: e.opts.bitrate.saturating_mul(1000), fps_num: tb.den as u32, fps_den: tb.num.max(1) as u32, mode: h264enc_core::RcMode::Cbr });
+            // `RateControl::cbr`, the constructor Stria's `with_bitrate(k, tb.den, tb.num)` calls: the same `Config.rate`, set before the first picture builds the encoder
+            e.rgba.cfg.rate = Some(h264enc_core::RateControl::cbr(e.opts.bitrate, (tb.den as u32, tb.num.max(1) as u32)));
         }
     }
     e.size = (w as u32, h as u32);
