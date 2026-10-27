@@ -49,6 +49,8 @@ pub mod flac;
 pub mod io;
 pub mod math;
 pub mod md5;
+/// NLE4C (SR301): the one level meter (peak hold + decay, 50 ms RMS, dBFS).
+pub mod meter;
 pub mod mp3;
 pub mod ogg;
 pub mod opus;

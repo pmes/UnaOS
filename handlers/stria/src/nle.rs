@@ -45,6 +45,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use gneiss_pal::dsp::audio::meter::Meter;
 use gneiss_pal::dsp::audio::resample;
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
 use gneiss_pal::dsp::demux::{DecodeTime, Demuxer, TrackKind, build};
@@ -58,6 +59,12 @@ pub trait RenderSink {
     fn frame(&mut self, out_t: i64, width: u32, height: u32, rgba: &[u8]);
     /// The PCM of output ticks `out_t..` (one audio step): interleaved `f32`.
     fn pcm(&mut self, out_t: i64, rate: u32, channels: u16, interleaved: &[f32]);
+    /// NLE4C (SR301): true when the sink also wants each audio track's own sum ([`RenderSink::track_pcm`]).
+    fn taps_tracks(&self) -> bool {
+        false
+    }
+    /// NLE4C (SR301): audio track `track`'s share of the [`RenderSink::pcm`] just sent (its layers summed, clamped alone).
+    fn track_pcm(&mut self, _out_t: i64, _track: usize, _rate: u32, _channels: u16, _interleaved: &[f32]) {}
 }
 
 /// What a render did.
@@ -487,8 +494,12 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
                 let Some((rate, ch)) = afmt else { continue };
                 let s0 = samples(tl.tb.to_ns(s.out_t), rate);
                 let n = samples(tl.tb.to_ns(s.out_t + s.len), rate) - s0;
-                let pcm = mix_run(tl, run, sources, &mut auds, rate, ch, n, &mut r.seeks)?;
+                let mut taps = sink.taps_tracks().then(Vec::new); // NLE4C: the per-track sums, when the sink meters them
+                let pcm = mix_run(tl, run, sources, &mut auds, rate, ch, n, &mut r.seeks, taps.as_mut())?;
                 sink.pcm(s.out_t, rate, ch, &pcm);
+                if let Some(t) = taps {
+                    tap_tracks(tl, sink, s.out_t, rate, ch, t);
+                }
                 r.pcm_frames += n as u64;
             }
         }
@@ -532,9 +543,13 @@ fn mix_run(
     ch: u16,
     n: i64,
     seeks: &mut u64,
+    mut taps: Option<&mut Vec<Vec<i64>>>,
 ) -> Result<Vec<f32>, RenderError> {
     let n = n.max(0);
     let mut acc = vec![0i64; n as usize * ch as usize];
+    if let Some(t) = taps.as_mut() {
+        **t = vec![vec![0i64; acc.len()]; auds.len() / 2]; // NLE4C: one accumulator per track
+    }
     // NLE3b: a layer followed by another of its own track is a crossfade's UNDER layer: its own slot; a track with no
     // under layer in this run drops its under slot.
     let tracks = auds.len() / 2;
@@ -557,8 +572,11 @@ fn mix_run(
         let start = samples(tl.tb.to_ns(l.src_t), rate);
         let pcm = slot.as_mut().expect("opened above").take_at(start, n, rate)?;
         mix_into(&mut acc, &pcm, l, n, ch.max(1) as usize);
+        if let Some(t) = taps.as_mut() {
+            mix_into(&mut t[l.track], &pcm, l, n, ch.max(1) as usize); // NLE4C: the same terms, the master acc untouched
+        }
     }
-    Ok(acc.into_iter().map(|a| a.clamp(-32768, 32767) as f32 / 32768.0).collect())
+    Ok(out_f32(acc))
 }
 
 /// NLE4: add one layer into the accumulator: each sample as i16, x its gain (Q16) x its envelope (Q16, linear from
@@ -751,5 +769,99 @@ impl Sources {
         }
         sources.applied.push((src, applied.unwrap_or(0)));
         Ok(Some((tl, sources)))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// THE METERS (NLE4C, LEDGER SR301)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// NLE4: the mix accumulator as the PCM sent: each sum clamped to 16 bits once, as `f32` (full scale +-1).
+fn out_f32(acc: Vec<i64>) -> Vec<f32> {
+    acc.into_iter().map(|a| a.clamp(-32768, 32767) as f32 / 32768.0).collect()
+}
+
+/// NLE4C: hand each AUDIO track's own sum of the run just sent to the sink.
+fn tap_tracks(tl: &Timeline, sink: &mut dyn RenderSink, out_t: i64, rate: u32, ch: u16, taps: Vec<Vec<i64>>) {
+    for (t, acc) in taps.into_iter().enumerate() {
+        if tl.tracks.get(t).is_some_and(|tr| tr.kind == Kind::Audio) {
+            sink.track_pcm(out_t, t, rate, ch, &out_f32(acc));
+        }
+    }
+}
+
+/// NLE4C: one meter's reading. `track` is the audio track's index in [`Timeline::tracks`], `None` the master.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeterLevel {
+    pub track: Option<usize>,
+    pub peak_db: f64,
+    pub rms_db: f64,
+}
+
+/// NLE4C (SR301): the editor's meters, per audio track and the master, fed by [`render`] itself: the master reads the
+/// PCM [`RenderSink::pcm`] is handed (what is sent), each track its own sum from `mix_run` ([`RenderSink::track_pcm`]).
+/// One `audio_core::meter::Meter` each; no lock (the owner feeds and reads it on one thread).
+#[derive(Debug, Clone, Default)]
+pub struct MixMeters {
+    tracks: Vec<(usize, Meter)>,
+    master: Option<Meter>,
+    /// The output tick the last feed ended at.
+    next: Option<i64>,
+}
+
+impl MixMeters {
+    /// Render `range` of `tl` into the meters. A range that does not continue the last feed (a seek, a restart) starts
+    /// them from silence: the window follows contiguous playback.
+    pub fn feed(&mut self, tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources) -> Result<RenderReport, RenderError> {
+        if self.next != Some(range.start) {
+            self.reset();
+        }
+        let end = range.end;
+        let r = render(tl, range, sources, self)?;
+        self.next = Some(end);
+        Ok(r)
+    }
+    /// Back to silence (no meters until the next feed).
+    pub fn reset(&mut self) {
+        self.tracks.clear();
+        self.master = None;
+        self.next = None;
+    }
+    /// The readings: the audio tracks in order, then the master. Empty before the first feed.
+    pub fn levels(&self) -> Vec<MeterLevel> {
+        let lv = |track: Option<usize>, m: &Meter| MeterLevel { track, peak_db: m.peak_db(), rms_db: m.rms_db() };
+        self.tracks.iter().map(|(t, m)| lv(Some(*t), m)).chain(self.master.iter().map(|m| lv(None, m))).collect()
+    }
+}
+
+/// A meter at `rate`, rebuilt from silence when the rate changes.
+fn meter_at(m: &mut Option<Meter>, rate: u32) -> &mut Meter {
+    if m.as_ref().map(Meter::rate) != Some(rate.max(1)) {
+        *m = Some(Meter::new(rate));
+    }
+    m.as_mut().expect("set above")
+}
+
+impl RenderSink for MixMeters {
+    fn frame(&mut self, _out_t: i64, _width: u32, _height: u32, _rgba: &[u8]) {}
+    fn pcm(&mut self, _out_t: i64, rate: u32, channels: u16, interleaved: &[f32]) {
+        meter_at(&mut self.master, rate).push(interleaved, channels as usize);
+    }
+    fn taps_tracks(&self) -> bool {
+        true
+    }
+    fn track_pcm(&mut self, _out_t: i64, track: usize, rate: u32, channels: u16, interleaved: &[f32]) {
+        let i = match self.tracks.binary_search_by_key(&track, |(t, _)| *t) {
+            Ok(i) => i,
+            Err(i) => {
+                self.tracks.insert(i, (track, Meter::new(rate)));
+                i
+            }
+        };
+        let m = &mut self.tracks[i].1;
+        if m.rate() != rate.max(1) {
+            *m = Meter::new(rate);
+        }
+        m.push(interleaved, channels as usize);
     }
 }
