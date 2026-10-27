@@ -804,7 +804,7 @@ fn bookmark(app: &mut App, page: &Page) {
 }
 
 /// The MIME type a volume path's extension names, for `downloads::renderable` (no extension: none, rendered).
-fn content_type(path: &str) -> Option<&'static str> {
+pub(crate) fn content_type(path: &str) -> Option<&'static str> {
     let name = path.rsplit('/').next().unwrap_or("");
     let ext = name.rsplit_once('.').map(|(_, e)| e)?.to_ascii_lowercase();
     Some(match ext.as_str() {
@@ -812,6 +812,7 @@ fn content_type(path: &str) -> Option<&'static str> {
         "txt" | "text" | "md" => "text/plain",
         "xml" => "text/xml",
         "svg" => "image/svg+xml",
+        "pdf" => "application/pdf", // PDF4KERNEL (B999): pdf.rs opens it (`pdf::take`)
         _ => "application/octet-stream",
     })
 }
@@ -819,7 +820,7 @@ fn content_type(path: &str) -> Option<&'static str> {
 /// Whether following a link to `path` saves it rather than opens it. A network URL always opens: its type is the
 /// server's, not its last path segment's (`?q=rust+1.80`, `/page.php`), and net::fetch reads the page either way.
 pub fn is_download(path: &str) -> bool {
-    path != NEWTAB && !crate::net::is_net(path) && !downloads::renderable(content_type(path))
+    path != NEWTAB && !crate::net::is_net(path) && !downloads::renderable(content_type(path)) && content_type(path) != Some("application/pdf") // PDF4KERNEL (B999): a PDF opens, as on the host
 }
 
 /// Save the volume file `path` in `<home>/Desktop` under the model's name.
