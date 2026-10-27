@@ -2023,8 +2023,8 @@ pub fn diskfull_selftest() {
 #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn autolock_selftest() {
     use crate::video::{crystal::login, keymap, lock};
-    const NAME: &[u8] = b"una";
-    const PW: &[u8] = b"correct-horse";
+    #[cfg(not(feature = "autolock_fixture"))] const NAME: &[u8] = b"una"; #[cfg(feature = "autolock_fixture")] let Some(cred) = autolock_fixture_cred() else { return }; #[cfg(feature = "autolock_fixture")] #[allow(non_snake_case)] let NAME: &[u8] = &cred.name; // AUTOLOCK3 (B875): knob on, the pair is the card's staged fixture file, never a literal (file tail). LINE-NEUTRAL fold, code first.
+    #[cfg(not(feature = "autolock_fixture"))] const PW: &[u8] = b"correct-horse"; #[cfg(feature = "autolock_fixture")] #[allow(non_snake_case)] let PW: &[u8] = &cred.pw; // AUTOLOCK3 (B875): knob on, no password literal in this leg; `cred` zeroes it on drop.
     const WRONG: &[u8] = b"wrong-horse";
     let mut nb = [0u8; crate::fs::users::NAME_MAX];
     let is_una = |nb: &mut [u8; crate::fs::users::NAME_MAX]| matches!(crate::fs::users::whoami(nb), Some(k) if &nb[..k] == NAME);
@@ -2045,7 +2045,7 @@ fn autolock_selftest() {
             crate::arch::sched::yield_now();
         }
     };
-    let before = lock::fingerprint();
+    let before = lock::fingerprint(); #[cfg(feature = "autolock_fixture")] let root0 = autolock_root_state(); // AUTOLOCK3 (B875): the keyed root's state before the lock (file tail). LINE-NEUTRAL fold, code first.
     let role = keymap::start_role();
     let win = if role != 0 { role } else { crate::drivers::xhci::HID_MOD_GUI };
     let mut cur = [0u8; 6];
@@ -2070,7 +2070,7 @@ fn autolock_selftest() {
     let after = lock::fingerprint();
     let same = before == after;
     let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); let gets = lockchanged_leg(); let deleted = lockdeleted_leg(); // PREFSDELETED (B755): the deleted-domain leg (file tail). // LOCKCHANGED (B758): the lock's GETs per lock-key and per other-key change (file tail). LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
-    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0 && gets.0 && deleted.0; // PREFSDELETED (B755): + deleted. // LOCKCHANGED (B758): + gets. LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
+    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0 && gets.0 && deleted.0; #[cfg(feature = "autolock_fixture")] let pass = pass && autolock_root_kept(root0); // AUTOLOCK3 (B875): + the keyed root kept across the lock (file tail). // PREFSDELETED (B755): + deleted. // LOCKCHANGED (B758): + gets. LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
     serial_println!(
         ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={} gets={} deleted={} verify={} kdf_ms={}",
         entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), resumed, hole_ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), "owed", prefs.1,
@@ -3029,15 +3029,15 @@ fn softydots_selftest() {
     #[cfg(feature = "login")]
     {
         use crate::video::{crystal::login, lock};
-        const NAME: &[u8] = b"una";
-        const PW: &[u8] = b"correct-horse";
+        #[cfg(not(feature = "autolock_fixture"))] const NAME: &[u8] = b"una"; #[cfg(feature = "autolock_fixture")] let cred = autolock_fixture_cred(); #[cfg(feature = "autolock_fixture")] #[allow(non_snake_case)] let NAME: &[u8] = cred.as_ref().map_or(&b""[..], |c| &c.name[..]); // AUTOLOCK4 (B885): knob on, the pair is the card's staged fixture file (AUTOLOCK3's one reader, file tail), never a literal. LINE-NEUTRAL fold, code first.
+        #[cfg(not(feature = "autolock_fixture"))] const PW: &[u8] = b"correct-horse"; #[cfg(feature = "autolock_fixture")] #[allow(non_snake_case)] let PW: &[u8] = cred.as_ref().map_or(&b""[..], |c| &c.pw[..]); // AUTOLOCK4 (B885): knob on, no password literal in this leg; `cred` zeroes it on drop.
         let mut nb = [0u8; crate::fs::users::NAME_MAX];
         let is_una = |nb: &mut [u8; crate::fs::users::NAME_MAX]| matches!(crate::fs::users::whoami(nb), Some(k) if &nb[..k] == NAME);
         if !is_una(&mut nb) {
-            lock_word = alloc::string::String::from("skip(session-not-fixture-user)");
+            lock_word = alloc::string::String::from("skip(session-not-fixture-user)"); #[cfg(feature = "autolock_fixture")] { if cred.is_none() { lock_word = alloc::string::String::from("skip(fixture-credential)"); } } // AUTOLOCK4 (B885): knob on, no staged pair (NAME empty, so this arm) names its own reason after AUTOLOCK3's SKIP line.
         } else if lock::active() || login::is_open() {
             lock_word = alloc::string::String::from("skip(screen-up)");
-        } else {
+        } else if autolock_credential(NAME, PW).is_none() { lock_word = alloc::string::String::from("skip(credential-not-fixture)"); } else { // AUTOLOCK4 (B885): AUTOLOCK2's guard (`users::verify`, the screen's one verdict) BEFORE the lock and any typing, both knob states; a human's `una` SKIPs, never locked (FLIGHT37 §7). LINE-NEUTRAL fold, code first.
             let entered = login::lock() && lock::active();
             wm::composite();
             let gone = entered && taskbar::painted_rect().is_none();
