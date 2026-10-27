@@ -523,3 +523,43 @@ impl Edit<'_> {
         Ok(out)
     }
 }
+
+/// PDFSIGN (LEDGER SR350): where the writer put a signature dictionary's two placeholders in `out[from..]` (the
+/// appended update): the offsets of the /ByteRange array's `[` and of the /Contents string's `<`. The search is for
+/// the exact bytes [`write_dict`] writes for the two ADJACENT entries (built here by `write_name` / [`write_object`],
+/// never a typed copy of the syntax); None unless they occur exactly once.
+pub(crate) fn placeholders(out: &[u8], from: usize, byte_range: &Object, contents: &Object) -> Option<(usize, usize)> {
+    let mut needle = Vec::new();
+    write_name(&mut needle, b"ByteRange");
+    needle.push(b' ');
+    let br_off = needle.len();
+    write_object(&mut needle, byte_range);
+    needle.push(b' ');
+    write_name(&mut needle, b"Contents");
+    needle.push(b' ');
+    let contents_off = needle.len();
+    write_object(&mut needle, contents);
+    let hay = out.get(from..)?;
+    let mut hits = hay.windows(needle.len()).enumerate().filter(|(_, w)| *w == needle.as_slice()).map(|(i, _)| i);
+    let at = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    Some((from + at + br_off, from + at + contents_off))
+}
+
+/// PDFSIGN (SR350): overwrite the /ByteRange placeholder array at `out[at..]` (its `[`, as written: `[0 n n n]`) with
+/// `[0 a b c]` padded with spaces to the same length, so no offset moves; false when it would not fit.
+pub(crate) fn patch_byte_range(out: &mut [u8], at: usize, [a, b, c]: [usize; 3]) -> bool {
+    let Some(len) = out.get(at..).and_then(|t| t.iter().position(|&x| x == b']')).map(|p| p + 1) else { return false };
+    let mut s = String::new();
+    let _ = write!(s, "[0 {a} {b} {c}]");
+    if s.len() > len {
+        return false;
+    }
+    while s.len() < len {
+        s.push(' ');
+    }
+    out[at..at + len].copy_from_slice(s.as_bytes());
+    true
+}

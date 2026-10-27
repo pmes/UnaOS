@@ -24,3 +24,4 @@ mod serialize;
 pub use builder::{Builder, Image, PageBuilder, RgbaPage, from_rgba};
 pub use fonts::FontHandle;
 pub use serialize::{Edit, write_object};
+pub(crate) use serialize::{patch_byte_range, placeholders, text_bytes}; // PDFSIGN (LEDGER SR350): the signature placeholders

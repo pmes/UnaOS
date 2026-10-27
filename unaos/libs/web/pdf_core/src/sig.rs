@@ -25,6 +25,14 @@
 //! 8. incremental updates after the signed revision: the object numbers whose xref entry changed, judged under the
 //!    certification signature's /DocMDP P (1: nothing, 2: form fill and signing, 3: also annotations) and this
 //!    signature's /FieldMDP.
+//!
+//! PDFSIGN (LEDGER SR350) — signing: [`Document::sign`] writes ONE incremental update (PDF-WRITE's `Edit::save_update`,
+//! or `save_update_encrypted` for an encrypted file, whose crypt walk leaves a /ByteRange dictionary's /Contents in the
+//! clear) holding a /Sig dictionary with a fixed-width /ByteRange and a zero /Contents sized by [`cms::bound`], the
+//! field (an unsigned /Sig field filled, or a new invisible widget), and for a certification signature the catalog's
+//! /Perms /DocMDP; then patches the ranges and the CMS ([`cms::build`]) in place: no second serialization.
+
+pub mod cms;
 
 use alloc::format;
 use alloc::string::String;
@@ -46,6 +54,10 @@ use crate::doc::Document;
 use crate::lexer::is_white;
 use crate::object::{Dict, Object, Ref, text_string};
 use crate::xref::{self, XrefEntry};
+use crate::write::{self, Edit};
+use crate::Error;
+use cms::SignerKey;
+use tls_core::x509::build;
 
 const ID_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
 const ID_SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
@@ -737,4 +749,261 @@ fn timestamp(unsigned: &[u8]) -> Option<i64> {
         return parse_time(&gen_time).ok();
     }
     None
+}
+
+// ---- PDFSIGN (LEDGER SR350): signing ----
+
+/// The /SubFilter a new signature carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubFilter {
+    /// `adbe.pkcs7.detached`.
+    Pkcs7Detached,
+    /// `ETSI.CAdES.detached` (the CMS carries ESS signing-certificate-v2).
+    CadesDetached,
+}
+
+/// What [`Document::sign`] signs with and writes.
+pub struct SignRequest<'a> {
+    /// An existing UNSIGNED /Sig field (fully qualified name), else the name of a NEW invisible signature field.
+    pub field: &'a str,
+    /// The page (0-based) a NEW field's widget goes on.
+    pub page: usize,
+    /// The caller's key (borrowed, never stored).
+    pub key: SignerKey<'a>,
+    /// The signer's certificate first, then the rest of the path; all go into the CMS certificate bag.
+    pub chain: &'a [&'a [u8]],
+    pub subfilter: SubFilter,
+    pub name: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub location: Option<&'a str>,
+    /// /M and the signingTime attribute, seconds since the epoch.
+    pub time: i64,
+    /// `Some(P)`: a certification signature with /DocMDP P (1, 2 or 3).
+    pub certify: Option<u8>,
+}
+
+/// Each /ByteRange placeholder integer: ten digits, so any offset in a file under 10^10 bytes fits when patched.
+const BR_PLACEHOLDER: i64 = 9_999_999_999;
+
+impl Document {
+    /// PDFSIGN (SR350): sign `original` (the bytes this document was parsed from) as ONE incremental update and
+    /// return the new file. The update holds the /Sig dictionary (/ByteRange, /Contents, /M, /Name /Reason /Location,
+    /// and the /Reference DocMDP transform when certifying), the field (`req.field` filled when it is an unsigned
+    /// /Sig field, else a new invisible widget `/Rect [0 0 0 0]` on `req.page`, added to the page's /Annots and the
+    /// AcroForm's /Fields), /SigFlags 3, and /Perms /DocMDP when certifying. An encrypted document is updated under
+    /// its own key (`entropy` feeds the AES IVs; unencrypted output does not depend on it). The ranges are then
+    /// patched in place and the CMS written into the zero /Contents (ISO 32000-1 §12.8.1: the rest stays zero).
+    /// Refused by name: a field already signed, a field that is not a signature field, a certification after a
+    /// signature, a /DocMDP P outside 1..=3, a missing or direct page, an empty or unreadable chain.
+    pub fn sign(&self, original: &[u8], req: &SignRequest<'_>, entropy: &[u8; 32]) -> Result<Vec<u8>, Error> {
+        if req.chain.is_empty() {
+            return Err(Error::Unsupported("signer certificate"));
+        }
+        if let Some(p) = req.certify {
+            if !(1..=3).contains(&p) {
+                return Err(Error::Unsupported("DocMDP P"));
+            }
+            if !self.signatures(original).is_empty() {
+                return Err(Error::Unsupported("certification after a signature"));
+            }
+        }
+        let cades = req.subfilter == SubFilter::CadesDetached;
+        let bound = cms::bound(&req.key, req.chain, req.time, cades)?;
+        let br = Object::Array(vec![
+            Object::Int(0),
+            Object::Int(BR_PLACEHOLDER),
+            Object::Int(BR_PLACEHOLDER),
+            Object::Int(BR_PLACEHOLDER),
+        ]);
+        let contents = Object::String(vec![0u8; bound]);
+        let name = |n: &[u8]| Object::Name(n.to_vec());
+        let mut sd = Dict::new();
+        sd.insert(b"Type".to_vec(), name(b"Sig"));
+        sd.insert(b"Filter".to_vec(), name(b"Adobe.PPKLite"));
+        sd.insert(b"SubFilter".to_vec(), name(if cades { &b"ETSI.CAdES.detached"[..] } else { &b"adbe.pkcs7.detached"[..] }));
+        // ADJACENT, in this order: `write::placeholders` finds them as one run of bytes.
+        sd.insert(b"ByteRange".to_vec(), br.clone());
+        sd.insert(b"Contents".to_vec(), contents.clone());
+        sd.insert(b"M".to_vec(), Object::String(pdf_date(req.time)));
+        for (k, v) in [(&b"Name"[..], req.name), (&b"Reason"[..], req.reason), (&b"Location"[..], req.location)] {
+            if let Some(v) = v {
+                sd.insert(k.to_vec(), Object::String(write::text_bytes(v)));
+            }
+        }
+        if let Some(p) = req.certify {
+            let mut params = Dict::new();
+            params.insert(b"Type".to_vec(), name(b"TransformParams"));
+            params.insert(b"P".to_vec(), Object::Int(p as i64));
+            params.insert(b"V".to_vec(), name(b"1.2"));
+            let mut sr = Dict::new();
+            sr.insert(b"Type".to_vec(), name(b"SigRef"));
+            sr.insert(b"TransformMethod".to_vec(), name(b"DocMDP"));
+            sr.insert(b"TransformParams".to_vec(), Object::Dict(params));
+            sd.insert(b"Reference".to_vec(), Object::Array(vec![Object::Dict(sr)]));
+        }
+        let mut edit = Edit::new(self);
+        let sig_ref = edit.add(Object::Dict(sd));
+        let form = self.form();
+        match form.as_ref().and_then(|f| f.fields.iter().find(|x| x.name == req.field)) {
+            Some(f) => {
+                if f.kind != FieldKind::Signature {
+                    return Err(Error::Unsupported("not a signature field"));
+                }
+                if !f.value.is_null() {
+                    return Err(Error::Unsupported("field already signed"));
+                }
+                let fref = f.obj.ok_or(Error::Unsupported("direct field"))?;
+                let Object::Dict(mut fd) = edit.get(fref) else { return Err(Error::Unsupported("direct field")) };
+                fd.insert(b"V".to_vec(), Object::Ref(sig_ref));
+                edit.set(fref, Object::Dict(fd));
+                sign_acroform(self, &mut edit, None)?;
+            }
+            None => {
+                let w = sign_widget(self, &mut edit, req, sig_ref)?;
+                sign_acroform(self, &mut edit, Some(w))?;
+            }
+        }
+        if req.certify.is_some() {
+            let root = self.trailer().get(b"Root").and_then(Object::as_ref).ok_or(Error::Missing)?;
+            let Object::Dict(mut cat) = edit.get(root) else { return Err(Error::Missing) };
+            match cat.get(b"Perms").cloned() {
+                Some(Object::Ref(pr)) => {
+                    let mut perms = match edit.get(pr) {
+                        Object::Dict(d) => d,
+                        _ => Dict::new(),
+                    };
+                    perms.insert(b"DocMDP".to_vec(), Object::Ref(sig_ref));
+                    edit.set(pr, Object::Dict(perms));
+                }
+                other => {
+                    let mut perms = match other {
+                        Some(Object::Dict(d)) => d,
+                        _ => Dict::new(),
+                    };
+                    perms.insert(b"DocMDP".to_vec(), Object::Ref(sig_ref));
+                    cat.insert(b"Perms".to_vec(), Object::Dict(perms));
+                    edit.set(root, Object::Dict(cat));
+                }
+            }
+        }
+        let mut out =
+            if self.security().is_some() { edit.save_update_encrypted(original, entropy)? } else { edit.save_update(original)? };
+        const PLACE: Error = Error::Unsupported("signature placeholder");
+        let (br_at, a) = write::placeholders(&out, original.len(), &br, &contents).ok_or(PLACE)?;
+        let b = a + 2 + 2 * bound;
+        let c = out.len().checked_sub(b).ok_or(PLACE)?;
+        if !write::patch_byte_range(&mut out, br_at, [a, b, c]) {
+            return Err(Error::Unsupported("byte range"));
+        }
+        let digest: [u8; 32] = Hash::Sha256.digest(&[&out[..a], &out[b..]]).try_into().map_err(|_| PLACE)?;
+        let der = cms::build(&req.key, &digest, req.chain, req.time, cades)?;
+        if der.len() > bound {
+            return Err(PLACE);
+        }
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        for (i, &x) in der.iter().enumerate() {
+            out[a + 1 + 2 * i] = HEX[(x >> 4) as usize];
+            out[a + 2 + 2 * i] = HEX[(x & 15) as usize];
+        }
+        Ok(out)
+    }
+}
+
+/// A PDF date (§7.9.4) in UTC: `D:YYYYMMDDHHmmSSZ`.
+fn pdf_date(t: i64) -> Vec<u8> {
+    let (y, mo, d, h, mi, s) = build::civil(t);
+    format!("D:{y:04}{mo:02}{d:02}{h:02}{mi:02}{s:02}Z").into_bytes()
+}
+
+/// A new invisible signature widget (merged field) on `req.page`, appended to that page's /Annots.
+fn sign_widget(doc: &Document, edit: &mut Edit<'_>, req: &SignRequest<'_>, sig_ref: Ref) -> Result<Ref, Error> {
+    let pages = doc.pages()?;
+    let page = pages.get(req.page).and_then(|p| p.obj).ok_or(Error::Unsupported("page"))?;
+    let mut w = Dict::new();
+    w.insert(b"Type".to_vec(), Object::Name(b"Annot".to_vec()));
+    w.insert(b"Subtype".to_vec(), Object::Name(b"Widget".to_vec()));
+    w.insert(b"FT".to_vec(), Object::Name(b"Sig".to_vec()));
+    w.insert(b"T".to_vec(), Object::String(write::text_bytes(req.field)));
+    w.insert(b"Rect".to_vec(), Object::Array(vec![Object::Int(0); 4]));
+    // Print (4) + Locked (128).
+    w.insert(b"F".to_vec(), Object::Int(132));
+    w.insert(b"P".to_vec(), Object::Ref(page));
+    w.insert(b"V".to_vec(), Object::Ref(sig_ref));
+    let wref = edit.add(Object::Dict(w));
+    let Object::Dict(mut pd) = edit.get(page) else { return Err(Error::Unsupported("page")) };
+    match pd.get(b"Annots").cloned() {
+        Some(Object::Ref(ar)) => {
+            let mut a = match edit.get(ar) {
+                Object::Array(a) => a,
+                _ => Vec::new(),
+            };
+            a.push(Object::Ref(wref));
+            edit.set(ar, Object::Array(a));
+        }
+        Some(Object::Array(mut a)) => {
+            a.push(Object::Ref(wref));
+            pd.insert(b"Annots".to_vec(), Object::Array(a));
+            edit.set(page, Object::Dict(pd));
+        }
+        _ => {
+            pd.insert(b"Annots".to_vec(), Object::Array(vec![Object::Ref(wref)]));
+            edit.set(page, Object::Dict(pd));
+        }
+    }
+    Ok(wref)
+}
+
+/// The AcroForm, edited where it lives (indirect, or inline in the catalog, or created inline): `add` appended to
+/// /Fields, /SigFlags given SignaturesExist | AppendOnly (3). Nothing is written when nothing changes.
+fn sign_acroform(doc: &Document, edit: &mut Edit<'_>, add: Option<Ref>) -> Result<(), Error> {
+    let root = doc.trailer().get(b"Root").and_then(Object::as_ref).ok_or(Error::Missing)?;
+    let Object::Dict(mut cat) = edit.get(root) else { return Err(Error::Missing) };
+    let (af_ref, mut af) = match cat.get(b"AcroForm").cloned() {
+        Some(Object::Ref(r)) => (
+            Some(r),
+            match edit.get(r) {
+                Object::Dict(d) => d,
+                _ => Dict::new(),
+            },
+        ),
+        Some(Object::Dict(d)) => (None, d),
+        _ => (None, Dict::new()),
+    };
+    let mut changed = false;
+    if let Some(w) = add {
+        match af.get(b"Fields").cloned() {
+            Some(Object::Ref(fr)) => {
+                let mut a = match edit.get(fr) {
+                    Object::Array(a) => a,
+                    _ => Vec::new(),
+                };
+                a.push(Object::Ref(w));
+                edit.set(fr, Object::Array(a));
+            }
+            Some(Object::Array(mut a)) => {
+                a.push(Object::Ref(w));
+                af.insert(b"Fields".to_vec(), Object::Array(a));
+                changed = true;
+            }
+            _ => {
+                af.insert(b"Fields".to_vec(), Object::Array(vec![Object::Ref(w)]));
+                changed = true;
+            }
+        }
+    }
+    let flags = af.get(b"SigFlags").map(|o| doc.get(o)).and_then(|o| o.as_int()).unwrap_or(0);
+    if flags & 3 != 3 {
+        af.insert(b"SigFlags".to_vec(), Object::Int(flags | 3));
+        changed = true;
+    }
+    if changed {
+        match af_ref {
+            Some(r) => edit.set(r, Object::Dict(af)),
+            None => {
+                cat.insert(b"AcroForm".to_vec(), Object::Dict(af));
+                edit.set(root, Object::Dict(cat));
+            }
+        }
+    }
+    Ok(())
 }

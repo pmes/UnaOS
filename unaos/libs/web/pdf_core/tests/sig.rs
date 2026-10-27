@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! PDFSIG (LEDGER SR337) KATs. A test-side builder makes everything from crypto_core's own signer: a CA and a leaf
-//! certificate (sha256WithRSA, 2048-bit keys generated deterministically from a SHA-256 counter stream by
-//! `rsa_private::PrivateKey::generate`), a detached CMS SignedData (signed attributes contentType / messageDigest /
-//! signingTime, signer by issuerAndSerialNumber, rsaEncryption), and a one-page PDF with a /FT /Sig field whose /Sig
-//! dictionary carries a fixed-width /ByteRange and an 8192-hex-digit /Contents placeholder, patched in place.
+//! PDFSIG (LEDGER SR337) KATs. Everything is made from crypto_core's own signers: a CA and a leaf certificate
+//! (sha256WithRSA, 2048-bit keys generated deterministically from a SHA-256 counter stream by
+//! `rsa_private::PrivateKey::generate`) written by tls_core's `x509::build`, a detached CMS SignedData written by
+//! `pdf_core::sig::cms::build` (PDFSIGN SR350 moved both builders out of this file), and a one-page PDF with a /FT /Sig
+//! field whose /Sig dictionary carries a fixed-width /ByteRange and an 8192-hex-digit /Contents placeholder, patched in
+//! place. PDFSIGN (LEDGER SR350) KATs at the end: `Document::sign` then `Signature::verify` in the same test.
 
 mod common;
 
@@ -13,67 +14,21 @@ use std::sync::OnceLock;
 
 use common::{Body, PdfBuilder, incremental, replace_bytes};
 use crypto_core::Sha256;
-use crypto_core::rsa_private::PrivateKey;
-use pdf_core::Document;
-use pdf_core::sig::{Chain, Changes, Trust, Verdict, probe_line};
+use pdf_core::crypt::Cipher;
+use pdf_core::sig::cms::{self, PrivateKey, SecretKey, SignerKey};
+use pdf_core::sig::{Chain, Changes, SignRequest, SubFilter, Trust, Verdict, probe_line};
+use pdf_core::write::Edit;
+use pdf_core::{Document, Error};
 use tls_core::CertError;
-use tls_core::x509::der::encode_tlv as tlv;
+use tls_core::x509::build::{self, CertSpec};
 use tls_core::x509::verify::TrustStore;
-
-const OID_CN: &[u8] = &[0x55, 0x04, 0x03];
-const OID_BC: &[u8] = &[0x55, 0x1d, 0x13];
-const OID_KU: &[u8] = &[0x55, 0x1d, 0x0f];
-const OID_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
-const OID_SHA256_RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
-const OID_SHA256: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
-const OID_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
-const OID_SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
-const OID_CONTENT_TYPE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x03];
-const OID_MESSAGE_DIGEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
-const OID_SIGNING_TIME: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x05];
 
 /// 2026-10-27T12:00:00Z, inside both certificates' validity (2025-01-01 .. 2035-12-31).
 const AT: i64 = 1_793_102_400;
+const NOT_BEFORE: i64 = 1_735_689_600;
+const NOT_AFTER: i64 = 2_082_672_000;
 const PLACE: usize = 8192;
 const BR_ZERO: &str = "[0 0000000000 0000000000 0000000000]";
-
-fn seq(parts: &[&[u8]]) -> Vec<u8> {
-    tlv(0x30, &parts.concat())
-}
-fn set(parts: &[&[u8]]) -> Vec<u8> {
-    tlv(0x31, &parts.concat())
-}
-fn oid(v: &[u8]) -> Vec<u8> {
-    tlv(0x06, v)
-}
-fn null() -> Vec<u8> {
-    tlv(0x05, &[])
-}
-fn octets(v: &[u8]) -> Vec<u8> {
-    tlv(0x04, v)
-}
-fn utc(s: &str) -> Vec<u8> {
-    tlv(0x17, s.as_bytes())
-}
-/// A non-negative INTEGER from big-endian magnitude bytes.
-fn int(v: &[u8]) -> Vec<u8> {
-    let mut m: Vec<u8> = v.iter().copied().skip_while(|&b| b == 0).collect();
-    if m.is_empty() || m[0] & 0x80 != 0 {
-        m.insert(0, 0);
-    }
-    tlv(0x02, &m)
-}
-fn bits(v: &[u8]) -> Vec<u8> {
-    let mut b = vec![0u8];
-    b.extend_from_slice(v);
-    tlv(0x03, &b)
-}
-fn name(cn: &str) -> Vec<u8> {
-    seq(&[&set(&[&seq(&[&oid(OID_CN), &tlv(0x0c, cn.as_bytes())])])])
-}
-fn alg(o: &[u8]) -> Vec<u8> {
-    seq(&[&oid(o), &null()])
-}
 
 fn sha256(parts: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -99,8 +54,10 @@ fn gen_key(seed: u8) -> PrivateKey {
 struct Keys {
     leaf: PrivateKey,
     other: PrivateKey,
+    ec: SecretKey,
     ca_der: Vec<u8>,
     leaf_der: Vec<u8>,
+    ec_der: Vec<u8>,
 }
 
 fn keys() -> &'static Keys {
@@ -109,77 +66,30 @@ fn keys() -> &'static Keys {
         let ca = gen_key(1);
         let leaf = gen_key(2);
         let other = gen_key(3);
-        let ca_der = cert(1, "PDFSIG KAT CA", "PDFSIG KAT CA", &ca, &ca, true);
-        let leaf_der = cert(2, "PDFSIG KAT CA", "PDFSIG KAT Signer", &leaf, &ca, false);
-        Keys { leaf, other, ca_der, leaf_der }
+        let ec = SecretKey::from_bytes(&[0x11; 32]).unwrap();
+        let (cak, leafk, eck) = (SignerKey::Rsa(&ca), SignerKey::Rsa(&leaf), SignerKey::P256(&ec));
+        let ca_der = cert(1, "PDFSIG KAT CA", &cak, &cak, true);
+        let leaf_der = cert(2, "PDFSIG KAT Signer", &leafk, &cak, false);
+        let ec_der = cert(3, "PDFSIGN KAT EC Signer", &eck, &cak, false);
+        Keys { leaf, other, ec, ca_der, leaf_der, ec_der }
     })
 }
 
-fn sign(key: &PrivateKey, msg: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; 512];
-    let k = key.sign_pkcs1v15(&sha256(&[msg]), &mut out).unwrap();
-    out.truncate(k);
-    out
-}
-
-fn spki(key: &PrivateKey) -> Vec<u8> {
-    let mut n = [0u8; 1024];
-    let mut e = [0u8; 16];
-    let nl = key.public_key().n_be(&mut n);
-    let el = key.public_key().e_be(&mut e);
-    seq(&[&alg(OID_RSA), &bits(&seq(&[&int(&n[..nl]), &int(&e[..el])]))])
-}
-
-fn cert(serial: u8, issuer: &str, subject: &str, key: &PrivateKey, issuer_key: &PrivateKey, ca: bool) -> Vec<u8> {
-    let crit = tlv(0x01, &[0xff]);
-    let exts = if ca {
-        let bc = seq(&[&oid(OID_BC), &crit, &octets(&seq(&[&tlv(0x01, &[0xff])]))]);
-        // keyCertSign (bit 5) + cRLSign (bit 6): 0x06 with one unused bit.
-        let ku = seq(&[&oid(OID_KU), &crit, &octets(&tlv(0x03, &[0x01, 0x06]))]);
-        seq(&[&bc, &ku])
-    } else {
-        // digitalSignature (bit 0): 0x80 with seven unused bits.
-        seq(&[&seq(&[&oid(OID_KU), &crit, &octets(&tlv(0x03, &[0x07, 0x80]))])])
+/// A certificate issued by the CA name through tls_core's writer, signed by `issuer_key`.
+fn cert(serial: u8, subject: &str, key: &SignerKey<'_>, issuer_key: &SignerKey<'_>, ca: bool) -> Vec<u8> {
+    let spki = key.spki();
+    let alg = issuer_key.cert_alg();
+    let spec = CertSpec {
+        serial: &[serial],
+        issuer: "PDFSIG KAT CA",
+        subject,
+        not_before: NOT_BEFORE,
+        not_after: NOT_AFTER,
+        spki: &spki,
+        ca,
     };
-    let a = alg(OID_SHA256_RSA);
-    let tbs = seq(&[
-        &tlv(0xa0, &int(&[2])),
-        &int(&[serial]),
-        &a,
-        &name(issuer),
-        &seq(&[&utc("250101000000Z"), &utc("351231000000Z")]),
-        &name(subject),
-        &spki(key),
-        &tlv(0xa3, &exts),
-    ]);
-    seq(&[&tbs, &a, &bits(&sign(issuer_key, &tbs))])
-}
-
-/// A detached SignedData over `digest`, signed by `key`, naming the leaf (serial 2 under the CA) as signer.
-fn cms(key: &PrivateKey, digest: &[u8], certs: &[&[u8]]) -> Vec<u8> {
-    let attrs = [
-        seq(&[&oid(OID_CONTENT_TYPE), &set(&[&oid(OID_DATA)])]),
-        seq(&[&oid(OID_MESSAGE_DIGEST), &set(&[&octets(digest)])]),
-        seq(&[&oid(OID_SIGNING_TIME), &set(&[&utc("261027120000Z")])]),
-    ]
-    .concat();
-    let sig = sign(key, &tlv(0x31, &attrs));
-    let signer_info = seq(&[
-        &int(&[1]),
-        &seq(&[&name("PDFSIG KAT CA"), &int(&[2])]),
-        &alg(OID_SHA256),
-        &tlv(0xa0, &attrs),
-        &alg(OID_RSA),
-        &octets(&sig),
-    ]);
-    let sd = seq(&[
-        &int(&[1]),
-        &set(&[&alg(OID_SHA256)]),
-        &seq(&[&oid(OID_DATA)]),
-        &tlv(0xa0, &certs.concat()),
-        &set(&[&signer_info]),
-    ]);
-    seq(&[&oid(OID_SIGNED_DATA), &tlv(0xa0, &sd)])
+    let tbs = build::tbs(&spec, &alg);
+    build::certificate(&tbs, &alg, &issuer_key.sign(&tbs))
 }
 
 /// The unsigned file: catalog (AcroForm inline; /Perms /DocMDP when `p` is set), one page, the signature field 4
@@ -223,7 +133,7 @@ fn sign_pdf(mut pdf: Vec<u8>, key: &PrivateKey, certs: &[&[u8]], short: usize) -
     let br = format!("[0 {a:010} {b:010} {c:010}]");
     pdf[at..at + br.len()].copy_from_slice(br.as_bytes());
     let digest = sha256(&[&pdf[..a], &pdf[b..b + c]]);
-    let der = cms(key, &digest, certs);
+    let der = cms::build(&SignerKey::Rsa(key), &digest, certs, AT, false).unwrap();
     let hex: String = der.iter().map(|x| format!("{x:02X}")).collect();
     assert!(hex.len() <= PLACE, "CMS {} hex digits over the placeholder", hex.len());
     pdf[a + 1..a + 1 + hex.len()].copy_from_slice(hex.as_bytes());
@@ -355,4 +265,216 @@ fn unsigned_file_has_no_signatures() {
     let doc = Document::parse(&pdf).unwrap();
     assert!(doc.signatures(&pdf).is_empty());
     assert_eq!(probe_line(&doc, &pdf), "sigs=0");
+}
+
+// ---- PDFSIGN (LEDGER SR350): Document::sign, verified by Signature::verify ----
+
+const ENTROPY: [u8; 32] = [7; 32];
+
+/// One page. `fields`: the AcroForm with two EMPTY signature fields Sig1 (4) and Sig2 (5) and a text field Name (6);
+/// else no form and no /Annots.
+fn blank(fields: bool) -> Vec<u8> {
+    let mut b = PdfBuilder::new(1);
+    if fields {
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R 5 0 R 6 0 R] /SigFlags 3 >> >>")
+            .obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Contents 7 0 R /Annots [4 0 R 5 0 R 6 0 R] >>")
+            .obj(4, "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Sig1) /Rect [0 0 0 0] /F 132 /P 3 0 R >>")
+            .obj(5, "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Sig2) /Rect [0 0 0 0] /F 132 /P 3 0 R >>")
+            .obj(6, "<< /Type /Annot /Subtype /Widget /FT /Tx /T (Name) /Rect [0 0 20 10] /P 3 0 R /V (before) >>");
+    } else {
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+            .obj(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 40 40] /Contents 7 0 R >>");
+    }
+    b.obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>").stream(7, "", b"0 0 m 40 40 l S\n");
+    b.classic()
+}
+
+fn request<'a>(field: &'a str, key: SignerKey<'a>, chain: &'a [&'a [u8]]) -> SignRequest<'a> {
+    SignRequest {
+        field,
+        page: 0,
+        key,
+        chain,
+        subfilter: SubFilter::Pkcs7Detached,
+        name: Some("PDFSIGN KAT Signer"),
+        reason: Some("PDFSIGN KAT"),
+        location: Some("Bench"),
+        time: AT,
+        certify: None,
+    }
+}
+
+fn rsa_chain() -> [&'static [u8]; 2] {
+    let k = keys();
+    [k.leaf_der.as_slice(), k.ca_der.as_slice()]
+}
+
+/// Sign `pdf` (opened with `pw` when given) and return the new file.
+fn sign(pdf: &[u8], pw: Option<&[u8]>, req: &SignRequest<'_>) -> Result<Vec<u8>, Error> {
+    let doc = match pw {
+        Some(p) => Document::parse_with_password(pdf, p).unwrap(),
+        None => Document::parse(pdf).unwrap(),
+    };
+    doc.sign(pdf, req, &ENTROPY)
+}
+
+/// Every signature's (field, verdict) with the CA as the one anchor.
+fn verdicts(pdf: &[u8], pw: Option<&[u8]>) -> Vec<(String, Verdict)> {
+    let doc = match pw {
+        Some(p) => Document::parse_with_password(pdf, p).unwrap(),
+        None => Document::parse(pdf).unwrap(),
+    };
+    let mut store = TrustStore::new();
+    store.add_der(&keys().ca_der).unwrap();
+    let trust = Trust { store: &store, at: AT };
+    doc.signatures(pdf).iter().map(|s| (s.field.clone(), s.verify(&doc, pdf, Some(&trust)))).collect()
+}
+
+fn trusted_whole(v: &Verdict) -> bool {
+    matches!(v, Verdict::Signed { chain: Chain::Trusted, changes: Changes::None, signing_time: Some(AT), .. })
+}
+
+#[test]
+fn sign_unsigned_rsa_trusted() {
+    let pdf = blank(false);
+    let chain = rsa_chain();
+    let out = sign(&pdf, None, &request("Signature1", SignerKey::Rsa(&keys().leaf), &chain)).unwrap();
+    assert!(out.starts_with(&pdf), "an incremental update keeps the original as a prefix");
+    let v = verdicts(&out, None);
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].0, "Signature1");
+    assert!(trusted_whole(&v[0].1), "{:?}", v[0].1);
+    let doc = Document::parse(&out).unwrap();
+    let sig = &doc.signatures(&out)[0];
+    assert_eq!(sig.subfilter, b"adbe.pkcs7.detached");
+    assert_eq!(sig.name.as_deref(), Some("PDFSIGN KAT Signer"));
+    assert_eq!(sig.reason.as_deref(), Some("PDFSIGN KAT"));
+    assert_eq!(sig.location.as_deref(), Some("Bench"));
+    assert_eq!(sig.m.as_deref(), Some("D:20261027120000Z"));
+    assert_eq!(sig.signed_end, out.len());
+    assert_eq!(probe_line(&doc, &out), "sigs=1 Signature1:signed+chain-unchecked");
+}
+
+#[test]
+fn second_signature_keeps_first() {
+    let chain = rsa_chain();
+    let leaf = SignerKey::Rsa(&keys().leaf);
+    let mut first = request("Sig1", leaf, &chain);
+    first.certify = Some(2);
+    let once = sign(&blank(true), None, &first).unwrap();
+    let twice = sign(&once, None, &request("Sig2", SignerKey::Rsa(&keys().leaf), &chain)).unwrap();
+    assert!(twice.starts_with(&once));
+    let v = verdicts(&twice, None);
+    assert_eq!(v.len(), 2);
+    for (field, verdict) in &v {
+        match (field.as_str(), verdict) {
+            ("Sig1", Verdict::Signed { chain: Chain::Trusted, changes: Changes::Allowed { p: 2, touched }, .. }) => {
+                assert_eq!(touched.len(), 2, "the Sig2 field and its /Sig dictionary: {touched:?}");
+                assert!(touched.contains(&5));
+            }
+            ("Sig2", v) => assert!(trusted_whole(v), "{v:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[test]
+fn sign_encrypted_file() {
+    let chain = rsa_chain();
+    for cipher in [Cipher::Aes128, Cipher::Aes256] {
+        let enc = Document::parse(&blank(true)).unwrap().save_encrypted(b"user", b"owner", -4, cipher, &[3; 32]);
+        let out = sign(&enc, Some(b"user"), &request("Sig1", SignerKey::Rsa(&keys().leaf), &chain)).unwrap();
+        assert!(out.starts_with(&enc), "{cipher:?}: the signature covers the encrypted file's bytes");
+        let v = verdicts(&out, Some(b"user"));
+        assert_eq!(v.len(), 1, "{cipher:?}");
+        assert!(trusted_whole(&v[0].1), "{cipher:?}: {:?}", v[0].1);
+        // The update is under the original's key: the /Sig dictionary's /M is not in the clear, its /Contents is.
+        assert!(!out[enc.len()..].windows(17).any(|w| w == b"D:20261027120000Z"), "{cipher:?}");
+    }
+}
+
+#[test]
+fn certify_then_fill() {
+    let chain = rsa_chain();
+    for (p, allowed) in [(2u8, true), (1, false)] {
+        let mut r = request("Sig1", SignerKey::Rsa(&keys().leaf), &chain);
+        r.certify = Some(p);
+        let signed = sign(&blank(true), None, &r).unwrap();
+        let doc = Document::parse(&signed).unwrap();
+        let form = doc.form().unwrap();
+        let name = form.fields.iter().find(|f| f.name == "Name").unwrap();
+        let mut edit = Edit::new(&doc);
+        for (r, o) in form.set_value(&doc, name, "after").unwrap() {
+            edit.set(r, o);
+        }
+        let filled = edit.save_update(&signed).unwrap();
+        let v = verdicts(&filled, None);
+        match (&v[0].1, allowed) {
+            (Verdict::Signed { chain: Chain::Trusted, changes: Changes::Allowed { p: 2, touched }, .. }, true) => {
+                assert!(touched.contains(&6), "{touched:?}");
+            }
+            (Verdict::Signed { changes: Changes::Disallowed { p: 1, .. }, .. }, false) => {}
+            (other, _) => panic!("P={p}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn tamper_after_sign() {
+    let chain = rsa_chain();
+    let out = sign(&blank(false), None, &request("Signature1", SignerKey::Rsa(&keys().leaf), &chain)).unwrap();
+    let bad = replace_bytes(&out, b"/MediaBox [0 0 40 40]", b"/MediaBox [0 0 40 41]");
+    assert_ne!(bad, out);
+    assert_eq!(verdicts(&bad, None)[0].1, Verdict::DigestMismatch);
+}
+
+#[test]
+fn ecdsa_p256_signer() {
+    let k = keys();
+    let chain = [k.ec_der.as_slice(), k.ca_der.as_slice()];
+    let out = sign(&blank(false), None, &request("Signature1", SignerKey::P256(&k.ec), &chain)).unwrap();
+    let v = verdicts(&out, None);
+    assert!(trusted_whole(&v[0].1), "{:?}", v[0].1);
+}
+
+#[test]
+fn deterministic_output() {
+    let chain = rsa_chain();
+    let r = request("Sig1", SignerKey::Rsa(&keys().leaf), &chain);
+    assert_eq!(sign(&blank(true), None, &r).unwrap(), sign(&blank(true), None, &r).unwrap());
+    let enc = Document::parse(&blank(true)).unwrap().save_encrypted(b"user", b"owner", -4, Cipher::Aes128, &[3; 32]);
+    assert_eq!(sign(&enc, Some(b"user"), &r).unwrap(), sign(&enc, Some(b"user"), &r).unwrap());
+}
+
+#[test]
+fn sign_refusals() {
+    let chain = rsa_chain();
+    let leaf = || SignerKey::Rsa(&keys().leaf);
+    let signed = sign(&blank(true), None, &request("Sig1", leaf(), &chain)).unwrap();
+    fn refused(pdf: &[u8], r: &SignRequest<'_>) -> Option<Error> {
+        sign(pdf, None, r).err()
+    }
+    let why = |w: &'static str| Some(Error::Unsupported(w));
+    assert_eq!(refused(&signed, &request("Sig1", leaf(), &chain)), why("field already signed"));
+    let mut r = request("Sig2", leaf(), &chain);
+    r.certify = Some(2);
+    assert_eq!(refused(&signed, &r), why("certification after a signature"));
+    r.certify = Some(4);
+    assert_eq!(refused(&blank(true), &r), why("DocMDP P"));
+    assert_eq!(refused(&blank(true), &request("Name", leaf(), &chain)), why("not a signature field"));
+    let mut r = request("Signature9", leaf(), &chain);
+    r.page = 5;
+    assert_eq!(refused(&blank(false), &r), why("page"));
+    assert_eq!(refused(&blank(false), &request("Signature1", leaf(), &[])), why("signer certificate"));
+}
+
+#[test]
+fn cades_subfilter() {
+    let chain = rsa_chain();
+    let mut r = request("Signature1", SignerKey::Rsa(&keys().leaf), &chain);
+    r.subfilter = SubFilter::CadesDetached;
+    let out = sign(&blank(false), None, &r).unwrap();
+    let doc = Document::parse(&out).unwrap();
+    assert_eq!(doc.signatures(&out)[0].subfilter, b"ETSI.CAdES.detached");
+    assert!(trusted_whole(&verdicts(&out, None)[0].1));
 }
