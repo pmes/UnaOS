@@ -17,6 +17,9 @@
 use bandy::signals::{FacetCommand, FacetEdit, FacetFormat, FacetImageInfo, FacetView, FacetZoom};
 use bandy::{Origin, SMessage};
 
+/// RASTERFACE (SR234): the editor face (`facet-view --edit` / `--synth`).
+pub mod editor;
+
 /// The surface id the vessel blits to (quartzite's `bootstrap_image_surface` filters on it).
 pub const SURFACE: &str = "facet://view";
 

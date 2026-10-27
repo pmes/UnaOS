@@ -17,11 +17,23 @@ bandy = { path = "../../libs/bandy" }
 facet = { path = "../../handlers/facet" }
 tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 log = "0.4"
-
-# The window: quartzite's AppKit image surface (macOS first; other backends follow quartzite).
-[target.'cfg(target_os = "macos")'.dependencies]
+# The window. The viewer: quartzite's AppKit image surface (macOS). RASTERFACE (SR234): the editor's one tetra
+# tree on AppKit (chosen by target_os) and GTK (`--features gtk`), stria-view's two features; no Qt.
 quartzite = { path = "../../libs/quartzite", default-features = false }
+# RASTERFACE (SR234): the editor face drives Facet's shared cores in tools/raster ops.rs's shapes (pixel_core: the
+# PNG writer raster_core's container uses, for export).
+raster_core = { path = "../../unaos/libs/media/raster_core", default-features = false }
+brush_core = { path = "../../unaos/libs/media/brush_core", default-features = false }
+adjust_core = { path = "../../unaos/libs/media/adjust_core", default-features = false }
+pixel_core = { path = "../../unaos/libs/media/pixel_core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
 gneiss_pal = { path = "../../libs/gneiss_pal" }
+
+[features]
+default = []
+gtk = ["quartzite/gtk"]
+macos = ["quartzite/macos"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
