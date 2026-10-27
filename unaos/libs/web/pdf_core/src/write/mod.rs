@@ -13,11 +13,14 @@
 //!   changed objects with a new table and a trailer whose /Prev names the original's (the real-world "save", which keeps
 //!   the original bytes, and so any signature over them, as a prefix). [`crate::Document::save`] is `Edit::new(doc).save()`.
 //! * [`Builder`] / [`PageBuilder`]: new PDF 1.4 files from path operators and images (Flate RGB / Gray, DCT passed
-//!   through); text is drawn as paths (embedded fonts are owed: PDF-WRITE-FONTS). [`from_rgba`]: one image per page,
+//!   through); text drawn as paths, or shown in an embedded face (PDF-WRITE-FONTS SR338: [`Builder::font`] /
+//!   [`PageBuilder::text`], a TrueType subset as Type0 / CIDFontType2, `fonts.rs`). [`from_rgba`]: one image per page,
 //!   the "print what you see" primitive PDF4's face prints through.
 
 mod builder;
+mod fonts;
 mod serialize;
 
 pub use builder::{Builder, Image, PageBuilder, RgbaPage, from_rgba};
+pub use fonts::FontHandle;
 pub use serialize::{Edit, write_object};

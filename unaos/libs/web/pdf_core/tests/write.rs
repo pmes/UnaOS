@@ -6,11 +6,13 @@
 //! `Edit::save_update` (the original bytes a prefix, the new /Info read back), the Builder and `from_rgba` rendered
 //! through PDF2's `Page::render`, and pixel_core's compressor inflating back. The PDFCRYPT, PDF2 and PDF3 suites
 //! round-trip their own fixtures through their helpers (`saved_reads_back`, `assert_saved_renders_same`).
+//! PDF-WRITE-FONTS (SR338): `PageBuilder::text` in the tree's JetBrainsMono-Variable.ttf, subset and read back by PDF3.
 
 mod common;
 
 use common::{Body, PdfBuilder, incremental, replace_bytes, startxref_of, zlib_stored};
 use pdf_core::content::ops;
+use pdf_core::font::{Fallback, GlyphSink, spans_to_string};
 use pdf_core::lexer::Lexer;
 use pdf_core::object::parse_object;
 use pdf_core::render::{Rendered, TextLog};
@@ -320,4 +322,220 @@ fn pixel_core_deflate_inflates_back() {
         assert_eq!(&z[..2], &[0x78, 0x01]);
         assert!(pdf_core::filters::flate(&z).unwrap() == data);
     }
+}
+
+// ------------------------------------------------------------------------------------------- PDF-WRITE-FONTS (SR338)
+
+fn font_file(rel: &str) -> Vec<u8> {
+    std::fs::read(format!("{}/../../../../fonts/{rel}", env!("CARGO_MANIFEST_DIR"))).expect("bundled font")
+}
+
+const JBM: &str = "jetbrains-mono/JetBrainsMono-Variable.ttf";
+
+/// Page 0 through PDF2 with PDF3's GlyphSink at 72 dpi: the ink (255 - red) and the extracted text.
+fn glyph_render(pdf: &[u8]) -> (Vec<u8>, String) {
+    let doc = Document::parse(pdf).unwrap();
+    let page = &doc.pages().unwrap()[0];
+    let fb = Fallback::default();
+    let mut sink = GlyphSink::new(&doc, fb);
+    let r = page.render(&doc, 72.0, &mut sink).unwrap();
+    assert!(r.refused.is_empty(), "{:?}", r.refused);
+    let cov = r.pixmap.data.chunks_exact(4).map(|p| 255 - p[0]).collect();
+    (cov, spans_to_string(&page.text(&doc, &fb)))
+}
+
+fn dict_at(doc: &Document, o: &Object) -> pdf_core::Dict {
+    doc.get(o).as_dict().unwrap().clone()
+}
+
+/// The font program, the Type0 dict and the CIDFont dict behind a page's `/F{id}`.
+fn embedded(doc: &Document, page: usize, key: &[u8]) -> (Vec<u8>, pdf_core::Dict, pdf_core::Dict) {
+    let pg = &doc.pages().unwrap()[page];
+    let fonts = dict_at(doc, pg.resources.get(b"Font").unwrap());
+    let t0 = dict_at(doc, fonts.get(key).unwrap());
+    let kids = doc.get(t0.get(b"DescendantFonts").unwrap());
+    let cid = dict_at(doc, &kids.as_array().unwrap()[0]);
+    let desc = dict_at(doc, cid.get(b"FontDescriptor").unwrap());
+    let ff = doc.get(desc.get(b"FontFile2").unwrap());
+    let prog = doc.decode(ff.as_stream().unwrap()).unwrap().data;
+    (prog, t0, cid)
+}
+
+/// An svg_core path from a font_core glyph path: font units scaled by `k`, moved to (x, y).
+fn glyph_svg(p: &font_core::Path, k: f64, x: f64, y: f64) -> Path {
+    use font_core::PathCmd;
+    let f = |a: f32, b: f32| (x + a as f64 * k, y + b as f64 * k);
+    let mut segs = Vec::new();
+    for c in &p.cmds {
+        segs.push(match *c {
+            PathCmd::MoveTo(a, b) => Seg::Move(f(a, b)),
+            PathCmd::LineTo(a, b) => Seg::Line(f(a, b)),
+            PathCmd::QuadTo(a, b, c2, d) => Seg::Quad(f(a, b), f(c2, d)),
+            PathCmd::CubicTo(a, b, c2, d, e, g) => Seg::Cubic(f(a, b), f(c2, d), f(e, g)),
+            PathCmd::Close => Seg::Close,
+        });
+    }
+    Path { segs }
+}
+
+#[test]
+fn builder_text_round_trips_through_pdf3() {
+    let jbm = font_file(JBM);
+    let src = font_core::Font::parse(&jbm).unwrap();
+    let s = "Hello UnaOS";
+    let mut b = Builder::new();
+    let f = b.font(&jbm).unwrap();
+    let mut p = PageBuilder::new(200.0, 50.0);
+    p.fill_gray(0.0).text(&f, 20.0, 10.0, 15.0, s);
+    b.page(p);
+    let pdf = b.finish();
+    let (cov, text) = glyph_render(&pdf);
+    assert_eq!(text, s);
+
+    // The font objects: Type0 / Identity-H over CIDFontType2, /CIDToGIDMap /Identity, a subset-tagged name.
+    let doc = Document::parse(&pdf).unwrap();
+    let (prog, t0, cid) = embedded(&doc, 0, b"F0");
+    assert_eq!(t0.name(b"Subtype"), Some(&b"Type0"[..]));
+    assert_eq!(t0.name(b"Encoding"), Some(&b"Identity-H"[..]));
+    assert_eq!(cid.name(b"Subtype"), Some(&b"CIDFontType2"[..]));
+    assert_eq!(cid.name(b"CIDToGIDMap"), Some(&b"Identity"[..]));
+    let base = t0.name(b"BaseFont").unwrap();
+    assert!(base.len() > 7 && base[6] == b'+' && base[..6].iter().all(|c| c.is_ascii_uppercase()), "{}", String::from_utf8_lossy(base));
+
+    // The subset parses in font_core, is far smaller than the source, and its sfnt checksum adjustment holds.
+    let sub = font_core::Font::parse(&prog).unwrap();
+    println!("subset: {} bytes of {}, {} glyphs", prog.len(), jbm.len(), sub.num_glyphs);
+    assert!(prog.len() * 10 < jbm.len());
+    let sum = prog.chunks(4).fold(0u32, |a, w| {
+        let mut x = [0u8; 4];
+        x[..w.len()].copy_from_slice(w);
+        a.wrapping_add(u32::from_be_bytes(x))
+    });
+    assert_eq!(sum, 0xB1B0_AFBA);
+    // New ids in first-use order: each subset glyph draws and advances like the source glyph.
+    let (order, closure) = used_glyphs(&src, &[s]);
+    assert_eq!(sub.num_glyphs as usize, 1 + closure.len());
+    for (k, &old) in order.iter().enumerate() {
+        let new = k as u16 + 1;
+        assert_eq!(sub.glyph_path(new), src.glyph_path(old), "glyph {old} -> {new}");
+        assert_eq!(sub.advance(new), src.advance(old));
+    }
+
+    // PIXELS, exact: the same CIDs drawn with the FULL source face embedded (source gids, the same widths).
+    let k = 1000.0 / src.units_per_em as f64;
+    let cids: String = s.chars().map(|c| format!("{:04X}", src.glyph_index(c))).collect();
+    let w: String = order.iter().map(|&g| format!("{g} [{}]", src.advance(g) as f64 * k)).collect::<Vec<_>>().join(" ");
+    let mut full = PdfBuilder::new(1);
+    full.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        .obj(2, "<< /Type /Pages /Kids [5 0 R] /Count 1 /MediaBox [0 0 200 50] >>")
+        .obj(5, "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /Contents 3 0 R >>")
+        .stream(3, "", format!("0 g BT /F1 20 Tf 10 15 Td <{cids}> Tj ET").as_bytes())
+        .obj(4, "<< /Type /Font /Subtype /Type0 /BaseFont /JetBrainsMono /Encoding /Identity-H /DescendantFonts [6 0 R] >>")
+        .obj(6, &format!("<< /Type /Font /Subtype /CIDFontType2 /BaseFont /JetBrainsMono /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R /DW 1000 /W [{w}] /CIDToGIDMap /Identity >>"))
+        .obj(7, "<< /Type /FontDescriptor /FontName /JetBrainsMono /Flags 4 /FontBBox [0 -300 600 1000] /FontFile2 8 0 R >>")
+        .stream(8, "", &jbm);
+    let (full_cov, _) = glyph_render(&full.classic());
+    assert!(full_cov == cov, "the subset draws different ink from the full face");
+
+    // PIXELS, against the builder's own path-text: PageBuilder::path raises the quads to cubics while GlyphSink keeps
+    // them, so svg_core flattens them differently: a measured, pinned tolerance.
+    let mut pp = PageBuilder::new(200.0, 50.0);
+    pp.fill_gray(0.0);
+    let (scale, mut pen) = (20.0 / src.units_per_em as f64, 10.0);
+    for c in s.chars() {
+        let gid = src.glyph_index(c);
+        if let Some(gp) = src.glyph_path(gid) {
+            pp.path(&glyph_svg(&gp, scale, pen, 15.0));
+        }
+        pp.fill();
+        pen += src.advance(gid) as f64 * scale;
+    }
+    let mut pb = Builder::new();
+    pb.page(pp);
+    let r = render(&pb.finish(), 72.0);
+    let path_cov: Vec<u8> = r.pixmap.data.chunks_exact(4).map(|p| 255 - p[0]).collect();
+    let max_diff = cov.iter().zip(&path_cov).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+    let (ink_text, ink_path): (u64, u64) = (cov.iter().map(|&v| v as u64).sum(), path_cov.iter().map(|&v| v as u64).sum());
+    println!("text vs path-text: max pixel diff {max_diff}, ink {ink_text} vs {ink_path}, fnv {:#018x}", fnv(&cov));
+    assert!(max_diff <= TEXT_PATH_MAX_DIFF, "max pixel diff {max_diff}");
+    assert!(ink_text.abs_diff(ink_path) * 1000 <= ink_text, "ink {ink_text} vs {ink_path}");
+    assert_eq!(fnv(&cov), PIN_TEXT, "fnv pin: got {:#018x}", fnv(&cov));
+}
+
+/// The source glyphs `texts` show, in first-use order, and that list plus every composite component they reach.
+fn used_glyphs(src: &font_core::Font<'_>, texts: &[&str]) -> (Vec<u16>, Vec<u16>) {
+    let mut order: Vec<u16> = Vec::new();
+    for c in texts.iter().flat_map(|t| t.chars()) {
+        let g = src.glyph_index(c);
+        if g != 0 && !order.contains(&g) {
+            order.push(g);
+        }
+    }
+    let font_core::Outlines::Glyf(g) = src.outlines else { panic!("glyf face") };
+    let mut closure = order.clone();
+    let mut i = 0;
+    while i < closure.len() {
+        for c in g.components(closure[i]).unwrap_or_default() {
+            if !closure.contains(&c.glyph) {
+                closure.push(c.glyph);
+            }
+        }
+        i += 1;
+    }
+    (order, closure)
+}
+
+/// SR338: the largest per-pixel coverage difference measured between embedded text and the builder's path-text.
+const TEXT_PATH_MAX_DIFF: u8 = 1;
+/// A regression pin of the embedded-text page's ink (the round trip above is the real check).
+const PIN_TEXT: u64 = 0x5852_a6f7_27f1_b3c7;
+
+#[test]
+fn builder_text_font_shared_and_cff_refused() {
+    let jbm = font_file(JBM);
+    let mut b = Builder::new();
+    let f = b.font(&jbm).unwrap();
+    let _unused = b.font(&jbm).unwrap();
+    for word in ["Hi", "Mono"] {
+        let mut p = PageBuilder::new(100.0, 30.0);
+        p.text(&f, 12.0, 5.0, 10.0, word);
+        b.page(p);
+    }
+    let pdf = b.finish();
+    assert_eq!(String::from_utf8_lossy(&pdf).matches("/Subtype /Type0").count(), 1);
+    let doc = Document::parse(&pdf).unwrap();
+    let pages = doc.pages().unwrap();
+    let fonts: Vec<pdf_core::Dict> = pages.iter().map(|p| dict_at(&doc, p.resources.get(b"Font").unwrap())).collect();
+    assert_eq!(fonts[0].get(b"F0"), fonts[1].get(b"F0"));
+    assert!(!fonts[0].contains(b"F1") && !fonts[1].contains(b"F1"));
+    let fb = Fallback::default();
+    assert_eq!(spans_to_string(&pages[0].text(&doc, &fb)), "Hi");
+    assert_eq!(spans_to_string(&pages[1].text(&doc, &fb)), "Mono");
+    // One subset for both pages: .notdef, H, i, M, o, n and the components of the composites among them.
+    let (prog, _, _) = embedded(&doc, 1, b"F0");
+    let src = font_core::Font::parse(&jbm).unwrap();
+    let (order, closure) = used_glyphs(&src, &["Hi", "Mono"]);
+    assert_eq!(order.len(), 5);
+    println!("Hi + Mono: {} glyphs used, {} with components", order.len(), closure.len());
+    assert_eq!(font_core::Font::parse(&prog).unwrap().num_glyphs as usize, 1 + closure.len());
+
+    // CFF / OpenType-CFF refused by name; bytes that are no font refused.
+    let mut otto = jbm.clone();
+    otto[..4].copy_from_slice(b"OTTO");
+    let mut b = Builder::new();
+    match b.font(&otto) {
+        Err(Error::Unsupported(m)) => assert!(m.starts_with("PDF-WRITE-CFF"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(b.font(b"not a font"), Err(Error::Unsupported(_))));
+
+    // A face loaded but never shown changes nothing: the bytes are those of a builder without fonts.
+    let mut plain = Builder::new();
+    plain.title("t").page(PageBuilder::new(10.0, 10.0));
+    let mut loaded = Builder::new();
+    loaded.font(&jbm).unwrap();
+    loaded.title("t").page(PageBuilder::new(10.0, 10.0));
+    let (a, z) = (plain.finish(), loaded.finish());
+    assert!(a == z);
+    assert!(!String::from_utf8_lossy(&a).contains("/Font"));
 }
