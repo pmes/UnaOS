@@ -1,0 +1,16 @@
+# =====================================================================
+# CRATE: tools/pdfprobe/Cargo.toml
+# DESCRIPTION: PDF1 (LEDGER SR300) headless probe of Aether's PDF core:
+#              parses a PDF through pdf_core and prints one summary line
+#              and one line per page. No logic of its own; no third-party
+#              crates.
+# =====================================================================
+
+[package]
+name = "pdfprobe"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[dependencies]
+pdf_core = { path = "../../unaos/libs/web/pdf_core" }

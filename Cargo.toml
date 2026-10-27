@@ -59,6 +59,7 @@ members = [
     "unaos/libs/web/html_core",
     # CSSCORE (SR47): CSS Syntax 3 + Selectors 4 + the cascade helpers, no_std, zero deps.
     "unaos/libs/web/css_core",
+    "unaos/libs/web/pdf_core", # PDF1 (SR300): Aether's no_std PDF reader (lexer, objects, xref tables/streams, object streams, updates, reconstruction, filters, page tree, content tokenizer); its one dep pixel_core's inflater
     "unaos/libs/web/gl_core", # WEBGL1 (SR136): the no_std software WebGL 1.0 / OpenGL ES 2.0 pipeline (state machine, GLSL ES 1.00 bytecode, rasterizer), zero deps
     # LAYOUTCORE (SR76, AETHERMETAL M2): Aether's layout engine (boxes, taffy mapping, inline formatter, tables),
     # no_std + alloc over the Dom/Fonts traits — the ONE engine the host browser and APPS/AETHER.ELF lay out with.
@@ -94,6 +95,7 @@ members = [
     "tools/vertex",
     "tools/play-check",
     "tools/nle", # NLE1 (SR194): the editor's headless face — schedule / render an EDL through stria::nle
+    "tools/pdfprobe", # PDF1 (SR300): pdf_core's headless probe — pages, version, xref kind, title, per-page boxes / ops / fonts / images
     "tools/aethervideo-check",
     "tools/unafs",
     "tools/una-card",
