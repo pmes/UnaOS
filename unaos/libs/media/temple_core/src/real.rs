@@ -3,12 +3,13 @@
 //
 // TEMPLE (SR147): the scalar the renderer is written over. Two backends, one scene:
 //
-//   `Fx`  — Q16.16 in an i32, every op integer (i64 products, saturating). The x86 ring-3 profile is
-//           `+soft-float,-sse` (unaos/x86_64-unknown-none.json) and the kernel clears CR4.OSFXSR for every UnaOS
-//           ring-3 task (crates/kernel/src/arch/x86_64/linuxabi/fpu.rs:20), so an f32 there is a compiler_builtins
-//           call per op. Fx is what the vessel runs on x86; it is bit-exact on every machine, so the host's 64x64
-//           checksum is the ring-3 program's checksum.
-//   `f32` — hardware float where the program owns an FPU (the host; aarch64 ring 3 is hard-float, aarch64-base.json).
+//   `Fx`  — Q16.16 in an i32, every op integer (i64 products, saturating). It is the bit-exact reference: the
+//           same bits on every machine, so the host's 64x64 checksum is any build's checksum, and it is the scalar
+//           of the soft-float profile (the kernel's x86_64-unaos.json, `+soft-float`). Its square root takes the
+//           exact SSE2 path where the target has SSE2 and `u64::isqrt` where it does not: bit-identical (B876).
+//   `f32` — hardware float where the program owns an FPU: the host, x86 ring 3 (B666: unaos/x86_64-unknown-none.json
+//           is `+sse,+sse2`, the FPU context saved eagerly per switch, so f32 is the vessel's scalar on x86), and
+//           aarch64 ring 3 (hard-float, aarch64-base.json).
 //
 // Constants enter through `k(f32)`: on the soft-float target the literal folds at compile time (LLVM folds the
 // IR-level fmul/fptosi before soft-float lowering), so no float op survives into the Fx program's hot paths.
@@ -141,7 +142,7 @@ impl Real for Fx {
         if self.0 <= 0 {
             return Fx(0);
         }
-        Fx(((self.0 as u64) << 16).isqrt() as i32)
+        Fx(isqrt_q32((self.0 as u64) << 16) as i32)
     }
     #[inline(always)]
     fn prod_gt(a: Fx, b: Fx, c: Fx, e: Fx) -> bool {
@@ -204,4 +205,57 @@ fn sqrt_f32(x: f32) -> f32 {
     y = 0.5 * (y + x / y);
     y = 0.5 * (y + x / y);
     0.5 * (y + x / y)
+}
+
+/// `floor(sqrt(n))` for the Q16.16 root's `n = q << 16` (q a positive i32, so n < 2^47). With SSE2 (B876): n is
+/// exact as an f64 (< 2^53), `sqrtsd` is correctly rounded, so the truncated root is the true floor or one above it
+/// (rounding up past an integer); the one downward correction makes it `u64::isqrt` bit for bit, at ~1/5 the cost.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+#[inline(always)]
+#[allow(unused_unsafe)]
+fn isqrt_q32(n: u64) -> u64 {
+    use core::arch::x86_64::{_mm_cvtsd_f64, _mm_set_sd, _mm_setzero_pd, _mm_sqrt_sd};
+    let mut r = unsafe { _mm_cvtsd_f64(_mm_sqrt_sd(_mm_setzero_pd(), _mm_set_sd(n as f64))) } as u64;
+    if r * r > n {
+        r -= 1;
+    }
+    r
+}
+
+/// Without SSE2 (the soft-float kernel profile, aarch64): core's integer square root, unchanged.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse2")))]
+#[inline(always)]
+fn isqrt_q32(n: u64) -> u64 {
+    n.isqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::isqrt_q32;
+
+    /// The fast root is `u64::isqrt` bit for bit over every input `Fx::sqrt` can hand it: a stride sweep of all
+    /// positive i32 (shifted to Q32), both ends of the range, and the edges 0, 1, 2^47 - 1.
+    #[test]
+    fn isqrt_q32_is_isqrt() {
+        let check = |n: u64| assert_eq!(isqrt_q32(n), n.isqrt(), "isqrt_q32({})", n);
+        for n in [0u64, 1, 2, 3, 4, (1u64 << 47) - 1, ((i32::MAX as u64) << 16)] {
+            check(n);
+        }
+        let mut q = 1u64;
+        while q <= i32::MAX as u64 {
+            check(q << 16);
+            q += 997;
+        }
+        for q in (1u64..=200_000).chain((i32::MAX as u64 - 200_000)..=i32::MAX as u64) {
+            check(q << 16);
+        }
+        // Every n just below and at a perfect square near the top of the range, where rounding up bites.
+        for r in ((1u64 << 23) - 4096)..(1u64 << 23) + 64 {
+            let sq = r * r;
+            if sq < (1u64 << 47) {
+                check(sq - 1);
+                check(sq);
+            }
+        }
+    }
 }
