@@ -133,6 +133,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "h264_core"
+version = "0.1.0"
+
+[[package]]
+name = "h264enc_core"
+version = "0.1.0"
+dependencies = [
+ "h264_core",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -531,6 +542,7 @@ dependencies = [
  "font8x8",
  "font_core",
  "geode_core",
+ "h264enc_core",
  "holocron_core",
  "jobs_core",
  "lazy_static",

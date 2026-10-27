@@ -129,7 +129,7 @@ fn facts_of(d: &Demuxer) -> Option<Facts> {
 }
 
 /// The whole file (the demuxer takes the bytes). I/O: a job's, never the router's.
-fn read_all(path: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn read_all(path: &str) -> Result<Vec<u8>, String> {
     let mt = crate::shell::vfs_mount_table();
     let st = mt.stat(path).map_err(|e| alloc::format!("stat: {:?}", e))?;
     if st.size > FILE_CAP {
@@ -889,7 +889,7 @@ fn edl_task(arg: usize) {
     serial_println!("[vplay] job run jid={} cpu={} wait_ms={} mode=edl", jid, crate::arch::percpu::this_cpu().cpu_index, now().saturating_sub(SPAWN_MS.load(Ordering::Acquire)));
     *NLE.lock() = None;
     let mut rep = EdlReport::default();
-    let r = edl_run(jid, &path, seek_ms, &mut rep); snd::close(&mut rep); // NLE6MIXAUDIO (rmbp-ledger B953): every source closed, on every path (file tail)
+    let r = edl_run(jid, &path, seek_ms, &mut rep); snd::close(&mut rep); let r = super::export::finish(jid, r); // NLE6EXPORT (rmbp-ledger B959): an Encode job's MP4 muxed and written once its sound closed (video/export.rs). NLE6MIXAUDIO (rmbp-ledger B953): every source closed, on every path (file tail)
     serial_println!(
         "[nle] job exit frames={} seeks={} runup={} gaps={} mixed={} mix_seeks={} refused={} mix_us_max={}",
         rep.frames, rep.seeks, rep.runup, rep.gaps, rep.mixed, rep.mix_seeks, rep.mix_refused, rep.mix_us_max
@@ -945,7 +945,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
     serial_println!("[nle] open edl={} reels={} clips={} steps={}", path, rep.reels, rep.clips, rep.steps);
     let audio = steps.iter().filter(|s| s.kind == Kind::Audio).count();
     if audio > 0 {
-        snd::open(&reels, tl, seek_ms); // NLE6MIXAUDIO (rmbp-ledger B953): the EDL's sound, one mixer source per audio track, the crossfade's second (file tail)
+        super::export::arm_audio(jid); snd::open(&reels, tl, seek_ms); // NLE6EXPORT (rmbp-ledger B959): an Encode job's sound into the export's offline capture (video/export.rs). NLE6MIXAUDIO (rmbp-ledger B953): the EDL's sound, one mixer source per audio track, the crossfade's second (file tail)
     }
     // the facts: the first scheduled video reel sizes the picture (and the gaps); the EDL's rate is the clock's
     let first = steps.iter().filter(|s| s.kind == Kind::Video).find_map(|s| s.src).and_then(|id| reels.get(id)).and_then(|r| r.v.as_ref());
@@ -987,7 +987,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         if pts_ms < seek_ms {
             continue; // a Player seek: the steps before it decoded unseen (job_task's rule)
         }
-        face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
+        if let super::export::Sink::Encode = super::export::sink(jid) { super::export::frame(jid, tl.tb, vcount, frame.w, frame.h, &unpack(&frame.px)).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
         {
             let mut g = JOB.lock();
             let Some(j) = g.as_mut().filter(|j| j.jid == jid) else { return Err(("superseded", None)) };
@@ -1234,7 +1234,7 @@ fn frame_fnv_rgba(rgba: &[u8]) -> u64 {
 #[cfg(any(feature = "uvc", feature = "hda-tone"))]
 mod snd {
     use super::{EdlReport, Reels, GEN};
-    use crate::audio::mixer;
+    use crate::video::export::bus as mixer; // NLE6EXPORT (rmbp-ledger B959): the live mixer, or the export's offline Mix when an Encode job armed it (video/export.rs `bus`)
     use alloc::vec::Vec;
     use audio_core::AudioDecoder;
     use core::sync::atomic::Ordering;
