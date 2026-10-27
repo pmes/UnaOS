@@ -38,6 +38,8 @@
 //!   range) and refuses a rate other than 1 by name ([`EditError::Rate`]).
 //! * [`vmix`] (NLE6MIX, rmbp-ledger B899): the ONE video transition mix ([`vmix::mix_step`]) and outgoing-run rule
 //!   ([`vmix::take_outgoing`]) Stria's render and the kernel Player's EDL mode both call.
+//! * [`view`] (NLE6KEYS, rmbp-ledger B961): the editor's ONE track view — the geometry ([`view::Layout`]) and the painter
+//!   ([`view::paint_in`]) the host face (`stria::nle_face`) and the kernel Player's EDL view band both draw.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -51,6 +53,7 @@ pub mod edl;
 pub mod editor;
 pub mod schedule;
 pub mod vmix;
+pub mod view;
 
 /// The ONE time-base type (demux_core's): seconds per tick = `num / den`. A timeline's is `1/fps`.
 pub use demux_core::Timebase;

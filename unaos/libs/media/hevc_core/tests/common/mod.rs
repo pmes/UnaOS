@@ -655,6 +655,9 @@ pub struct SliceScc {
     pub act_qp_offset: Option<[i32; 3]>,
     /// (offset_len_minus1, entry_point_offset_minus1) of a wavefront slice.
     pub entry_points: Option<(u32, Vec<u32>)>,
+    /// HEVCSCCTAIL (SR365): the RefPicList0 entries that are the current picture, whose pred_weight_table flags are not
+    /// written (7.3.6.3); empty: every flag written.
+    pub weight_skip: Vec<bool>,
 }
 
 pub fn sps(c: &SpsCfg) -> Vec<u8> {
@@ -931,11 +934,16 @@ pub fn slice_header_scc(c: &SliceCfg, s: &SliceScc) -> BitWriter {
         if let Some((denom, ws)) = &c.weights {
             b.ue(*denom);
             b.se(0); // delta_chroma_log2_weight_denom
-            for w in ws {
-                b.flag(w.is_some());
+            let written = |i: usize| !s.weight_skip.get(i).copied().unwrap_or(false);
+            for (i, w) in ws.iter().enumerate() {
+                if written(i) {
+                    b.flag(w.is_some());
+                }
             }
-            for _ in ws {
-                b.bit(0); // chroma_weight_l0_flag
+            for i in 0..ws.len() {
+                if written(i) {
+                    b.bit(0); // chroma_weight_l0_flag
+                }
             }
             for (dw, off) in ws.iter().flatten() {
                 b.se(*dw);

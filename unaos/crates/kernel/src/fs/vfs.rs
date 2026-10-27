@@ -3991,3 +3991,35 @@ fn el0_session_home() -> Option<String> {
         None
     }
 }
+
+// NLE6EXPORTONE (rmbp-ledger B963; handlers.md §5 NLE6's NLE6EXPORT-WRITE): the ONE whole-file writer over the VFS, the loop
+// seven sites spelled (selfdiag `put_file`, bootwit / panicscreen / prefs `write_all`, trash `write_file`, the export, `tests
+// nle`'s fixture); the export and the fixture are on it, the other five are VFSPUT-ONE (owed), which lifts this cfg. At the
+// file tail, gated as `tests nle` is, so no line above moves and the knob-off image is unchanged.
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+impl MountTable {
+    /// `data` as the whole of `path`: a directory is refused, an existing file unlinked (FAT has no shrink), the file created
+    /// and written from offset 0 (selfdiag's `put_file` semantics). The bytes written.
+    pub fn put_file(&self, path: &str, data: &[u8], principal: &str) -> Result<usize, VfsError> {
+        match self.stat(path) {
+            Ok(st) if st.kind == NodeKind::Dir => return Err(VfsError::IsADirectory),
+            Ok(_) => self.unlink(path, principal)?,
+            Err(_) => {}
+        }
+        self.create(path, NodeKind::File, principal)?;
+        self.write_all_at(path, 0, data, principal)
+    }
+
+    /// All of `data` at `off` of the existing file `path`, in 64 KiB writes (the export's chunk: one backend call stays
+    /// short); a write that makes no progress is `Backend("short-write")`. An append is `off` = the file's end.
+    pub fn write_all_at(&self, path: &str, off: u64, data: &[u8], principal: &str) -> Result<usize, VfsError> {
+        let mut done = 0usize;
+        while done < data.len() {
+            match self.write(path, off + done as u64, &data[done..(done + 64 * 1024).min(data.len())], principal)? {
+                0 => return Err(VfsError::Backend("short-write")),
+                w => done += w,
+            }
+        }
+        Ok(done)
+    }
+}

@@ -719,4 +719,65 @@ pub mod kat {
         t.extend([0, 3, 0, 3, 0, 0, 0, 0]);
         profile(4, b"mntr", b"RGB ", b"XYZ ", &[(*b"A2B0", t)])
     }
+
+    /// METAICCONE (SR367): a v2 `desc` (textDescriptionType, ICC.1:2001 §6.5.17) of the ASCII `s`: the count with its
+    /// NUL, the string, then an empty Unicode and an empty ScriptCode description (67 bytes of ScriptCode field).
+    pub fn desc_v2(s: &str) -> Vec<u8> {
+        let mut t = b"desc\0\0\0\0".to_vec();
+        t.extend((s.len() as u32 + 1).to_be_bytes());
+        t.extend(s.as_bytes());
+        t.push(0);
+        t.extend([0u8; 8]);
+        t.extend([0u8; 3]);
+        t.extend([0u8; 67]);
+        t
+    }
+
+    /// METAICCONE (SR367): a v4 `mluc` (multiLocalizedUnicodeType, ICC.1:2010 §10.15) with one en-US record of `s`,
+    /// UTF-16BE, the record's string at offset 28.
+    pub fn mluc(s: &str) -> Vec<u8> {
+        let u: Vec<u8> = s.encode_utf16().flat_map(|c| c.to_be_bytes()).collect();
+        let mut t = b"mluc\0\0\0\0".to_vec();
+        t.extend(1u32.to_be_bytes());
+        t.extend(12u32.to_be_bytes());
+        t.extend(b"enUS");
+        t.extend((u.len() as u32).to_be_bytes());
+        t.extend(28u32.to_be_bytes());
+        t.extend(u);
+        t
+    }
+}
+
+/// METAICCONE (LEDGER SR367): the profile description (ICC.1:2010 §9.2.41 `desc` tag: the v2 `desc` textDescription
+/// type's ASCII string, or the v4 `mluc` type's first record, UTF-16BE), when it can be read. Read from the tag table
+/// alone, so a profile [`Profile::parse`] refuses (named colour, device link, ...) still names itself; Facet's info
+/// label reads it (moved here from `handlers/facet/src/meta.rs`, its tolerance kept: no header size or version check).
+pub fn description(icc: &[u8]) -> Option<alloc::string::String> {
+    let count = be32(icc, 128).ok()? as usize;
+    for i in 0..count.min(256) {
+        let e = 132 + i * 12;
+        if icc.get(e..e + 4)? == b"desc" {
+            let off = be32(icc, e + 4).ok()? as usize;
+            let len = be32(icc, e + 8).ok()? as usize;
+            let tag = icc.get(off..off.checked_add(len)?)?;
+            return match tag.get(0..4)? {
+                b"desc" => {
+                    let n = be32(tag, 8).ok()? as usize;
+                    let s = tag.get(12..12usize.checked_add(n)?)?;
+                    let s = s.split(|&c| c == 0).next()?;
+                    Some(alloc::string::String::from_utf8_lossy(s).into_owned())
+                }
+                b"mluc" => {
+                    // First record: lang(2) country(2) length(4) offset(4), UTF-16BE.
+                    let rlen = be32(tag, 20).ok()? as usize;
+                    let roff = be32(tag, 24).ok()? as usize;
+                    let raw = tag.get(roff..roff.checked_add(rlen)?)?;
+                    let u: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+                    Some(alloc::string::String::from(alloc::string::String::from_utf16_lossy(&u).trim_end_matches('\0')))
+                }
+                _ => None,
+            };
+        }
+    }
+    None
 }

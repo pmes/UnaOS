@@ -963,7 +963,9 @@ fn swapbackseek_editor_run_opened_inside_the_span_draws_the_stand_in() {
 // AV1PLAYERCOLOUR (LEDGER SR347): an AV1 reel's frames reach the bus sink as planes and convert by the reel's colour and the
 // size default with bilinear chroma (`chroma_of`), the kernel Player's `colour_rgba_av1`. The AV1 pictures are public AVIF
 // vectors' primary items (av1_core's ONE sha256-pinned fetcher, by path; SKIP offline), muxed as an `av01` MP4 track whose
-// av1C is cut to its 4-byte header, so the bitstream states no colour and only a `colr` can.
+// av1C is cut to its 4-byte header. AV1INBANDCOLOUR (SR366): the item's in-band sequence header then states the bitstream's
+// colour (measured: kids_720p 2/2/2 limited, so the size default still converts it; kodim23 1/13/6 full, so its in-band range
+// wins over the size default's limited), and a `colr` wins over both.
 #[path = "../../../unaos/libs/media/av1_core/tests/common/mod.rs"]
 mod av1_vectors;
 
@@ -1002,7 +1004,7 @@ fn av1playercolour_untagged_720p_converts_bt709_by_the_size_default() {
     assert_eq!((w, h), (1280, 720));
     let (e709, e601) = (av1playercolour_expect(&file, &av1playercolour_c(1)), av1playercolour_expect(&file, &av1playercolour_c(6)));
     assert_ne!(e709, e601, "the vector separates the two matrices");
-    assert_eq!(Player::open(file.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), None);
+    assert_eq!(Player::open(file.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&av1playercolour_c(2)), "the in-band header: 2/2/2 limited");
     let (pw, ph, posted) = posted_rgba(file, "av1-720p");
     assert_eq!((pw, ph), (1280, 720));
     assert!(posted == e709, "untagged 1280x720 AV1 is not BT.709 limited bilinear");
@@ -1015,12 +1017,71 @@ fn av1playercolour_sd_reel_colr_709_wins_and_untagged_is_bt601() {
     assert_eq!((w, h), (768, 512));
     let (e709, e601) = (av1playercolour_expect(&plain, &av1playercolour_c(1)), av1playercolour_expect(&plain, &av1playercolour_c(6)));
     assert_ne!(e709, e601, "the vector separates the two matrices");
+    let inband = gneiss_pal::dsp::demux::colour::Colour { primaries: 1, transfer: 13, full_range: Some(true), ..av1playercolour_c(6) };
+    assert_eq!(Player::open(plain.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&inband), "the in-band header: 1/13/6 full");
+    let e601full = av1playercolour_expect(&plain, &inband);
+    assert_ne!(e601full, e601, "the vector separates the two ranges");
     let (_, _, posted) = posted_rgba(plain, "av1-sd");
-    assert!(posted == e601, "untagged 768x512 AV1 is not BT.601 limited bilinear");
+    assert!(posted == e601full, "an av1C-less 768x512 AV1 reel is not converted by its in-band BT.601 full range (bilinear)");
     let c709 = av1playercolour_c(1);
     let (tagged, _, _) = av1playercolour_reel("kodim23_yuv420_8bpc", Some(c709)).unwrap();
     assert_eq!(Player::open(tagged.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&c709));
     let (_, _, posted) = posted_rgba(tagged, "av1-sd-709");
     assert!(posted == e709, "a colr of BT.709 on an SD AV1 reel does not win over the size default");
-    println!("av1playercolour: kodim23 untagged=bt601 colr709=bt709 bilinear");
+    println!("av1playercolour: kodim23 in-band=bt601-full colr709=bt709 bilinear");
+}
+
+// AV1INBANDCOLOUR (LEDGER SR366): the ONE rule at 720p — container colour > the bitstream (av1C configOBUs, else the first
+// temporal unit's in-band sequence header) > the size default. A 1280x720 av01 reel whose av1C has no configOBUs and whose
+// first sample states BT.601 in-band converts BT.601, not the size default's BT.709 (synthetic, not decodable: Stria's open
+// line drives the colour, `Frame::to_rgba_colour` the pick).
+#[test]
+fn av1inband_720p_in_band_bt601_wins_over_the_size_default() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use gneiss_pal::dsp::video::{Chroma, Pixels, colour_of, reorder_depth};
+    let mut w = av1_vectors::BitWriter::default();
+    w.put(3, 0); // seq_profile
+    w.flag(true); // still_picture
+    w.flag(true); // reduced_still_picture_header
+    w.put(5, 8); // seq_level_idx[0]
+    w.put(4, 10); // frame_width_bits_minus_1
+    w.put(4, 9); // frame_height_bits_minus_1
+    w.put(11, 1279);
+    w.put(10, 719);
+    for _ in 0..6 {
+        w.flag(false); // 128x128, filter_intra, intra_edge, superres, cdef, restoration
+    }
+    w.flag(false); // high_bitdepth
+    w.flag(false); // mono_chrome
+    w.flag(true); // color_description_present_flag
+    w.put(8, 6);
+    w.put(8, 6);
+    w.put(8, 6);
+    w.flag(false); // color_range: limited
+    w.put(2, 0); // chroma_sample_position
+    w.flag(false); // separate_uv_delta_q
+    w.flag(false); // film_grain_params_present
+    w.trailing();
+    let seq = w.bytes;
+    let mut tu = vec![(2 << 3) | 0x02, 0, (1 << 3) | 0x02, seq.len() as u8];
+    tu.extend_from_slice(&seq);
+    let mut spec = build::TrackSpec::test_pattern(1, 1280, 720, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = vec![0x81, 0x00, 0x0C, 0x00];
+    spec.timescale = 1000;
+    let samples = (0..2).map(|i| build::SampleSpec { data: if i == 0 { tu.clone() } else { vec![0x12, 0] }, dts: i * 40, pts: i * 40, duration: 40, keyframe: i == 0 }).collect();
+    let file = build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &build::Mp4Extras::default());
+    let mut d = Demuxer::open(file).unwrap();
+    assert_eq!(d.tracks()[0].colour, None, "no colr");
+    d.derive_dts(reorder_depth); d.fill_colour(colour_of);
+    let c = d.tracks()[0].colour.expect("the in-band header fills the colour");
+    assert_eq!(c, av1playercolour_c(6), "6/6/6 limited from the first temporal unit");
+    let (y, u, v) = (vec![120u8; 1280 * 720], vec![90u8; 640 * 360], vec![200u8; 640 * 360]);
+    let f = Frame { width: 1280, height: 720, pts_ns: 0, pixels: Pixels::I420 { y, u, v, y_stride: 1280, uv_stride: 640 } };
+    let by_track = f.to_rgba_colour(Some(&c), Chroma::Bilinear);
+    assert_eq!(by_track, f.to_rgba(), "the in-band BT.601 limited converts (flat chroma: bilinear == nearest)");
+    assert_ne!(by_track, f.to_rgba_colour(None, Chroma::Bilinear), "not the 720p size default, BT.709");
+    println!("av1inband: 1280x720 in-band={} beats the size default", c);
 }

@@ -170,6 +170,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "icc_core"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "jobs_core"
 version = "0.1.0"
 dependencies = [
@@ -547,6 +554,7 @@ dependencies = [
  "geode_core",
  "h264enc_core",
  "holocron_core",
+ "icc_core",
  "jobs_core",
  "lazy_static",
  "ldso_core",

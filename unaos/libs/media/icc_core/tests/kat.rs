@@ -157,3 +157,24 @@ fn refusals_by_name() {
     assert_eq!(Profile::parse(&v5), Err(Refusal::Unsupported("ICC v5 (iccMAX)")));
     assert_eq!(Refusal::NamedColour.to_string(), "named-colour profile");
 }
+
+#[test]
+fn desc_v2_and_v4() {
+    // METAICCONE (SR367): `profile::description` reads the v2 `desc` ASCII string and the v4 `mluc` first record, from
+    // the tag table alone — a profile `Profile::parse` refuses still names itself (Facet's info label).
+    use icc_core::profile::description;
+    let wtpt = (*b"wtpt", kat::xyz_tag([0.9642, 1.0, 0.8249]));
+    let v2 = kat::profile(2, b"mntr", b"GRAY", b"XYZ ", &[wtpt.clone(), (*b"kTRC", kat::curv_gamma(2.2)), (*b"desc", kat::desc_v2("Gray 2.2"))]);
+    assert!(Profile::parse(&v2).is_ok());
+    assert_eq!(description(&v2).as_deref(), Some("Gray 2.2"));
+    let v4 = kat::profile(4, b"mntr", b"GRAY", b"XYZ ", &[(*b"desc", kat::mluc("Display P3 \u{2014} v4")), wtpt]);
+    assert_eq!(description(&v4).as_deref(), Some("Display P3 \u{2014} v4"));
+    // No `desc` tag, a truncated tag table, and the empty input read as None.
+    assert_eq!(description(&kat::adobe_rgb_v2()), None);
+    assert_eq!(description(&v2[..140]), None);
+    assert_eq!(description(&[]), None);
+    // A refused class still yields its description.
+    let named = kat::profile(2, b"nmcl", b"RGB ", b"Lab ", &[(*b"desc", kat::desc_v2("Spot"))]);
+    assert_eq!(Profile::parse(&named), Err(Refusal::NamedColour));
+    assert_eq!(description(&named).as_deref(), Some("Spot"));
+}

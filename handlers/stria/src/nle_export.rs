@@ -32,7 +32,6 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use gneiss_pal::dsp::demux::TrackKind;
 use gneiss_pal::dsp::demux::build;
 use gneiss_pal::dsp::image::{PngError, encode_rgba};
 use h264enc_core::rgba::{RgbaEncoder, Unit};
@@ -415,31 +414,12 @@ impl ExportSink {
     /// `i` at `i * tb.num`, or at its unit's (dts, pts) x `tb.num` (SR333: pts != dts writes `ctts`).
     fn video_track(&mut self, tb: Timebase) -> build::MediaTrack {
         let c = self.video.config();
-        let num = tb.num.max(1) as u32;
-        let spec = build::TrackSpec {
-            id: 1,
-            kind: TrackKind::Video,
-            fourcc: c.fourcc,
-            config_box: c.config_box,
-            codec_id: "",
-            config: c.config,
-            timescale: tb.den as u32,
-            width: self.size.0 as u16,
-            height: self.size.1 as u16,
-            sample_rate: 0,
-            channels: 0,
-            bit_depth: 0,
-            default_duration_ns: num as u64 * 1_000_000_000 / (tb.den as u64).max(1),
-        };
-        let samples = std::mem::take(&mut self.samples)
-            .into_iter()
-            .enumerate()
-            .map(|(i, (keyframe, data, time))| {
-                let (dts, pts) = time.unwrap_or((i as i64, i as i64));
-                build::SampleSpec { data, dts: dts * num as i64, pts: pts * num as i64, duration: num, keyframe }
-            })
-            .collect();
-        build::MediaTrack { spec, samples }
+        let spec = build::coded_video_spec(1, c.fourcc, c.config_box, c.config, self.size.0 as u16, self.size.1 as u16, tb);
+        let units = std::mem::take(&mut self.samples).into_iter().enumerate().map(|(i, (keyframe, data, time))| {
+            let (dts, pts) = time.unwrap_or((i as i64, i as i64));
+            (keyframe, data, dts, pts)
+        });
+        build::coded_video_track(spec, tb, units)
     }
 }
 

@@ -10,6 +10,9 @@
 //! 64: the escape is its value), then a second unit reusing predictor entry 1 (the predictor update); (f) the same map at
 //! 4:2:0 (chroma from the even luma positions, the chroma escape at an even position); (g) the palette predictor
 //! synchronised across a wavefront row; plus every SCC flag present and off decodes as the stream without them.
+//! HEVCSCCTAIL (LEDGER SR365): (h) weighted prediction with the current picture in RefPicList0 decodes (7.3.6.3 skips its
+//! weight flags), (h2) the skip in a list holding a short-term picture and the current one, (i) the C.5.2.2 bumping with
+//! the current picture's own DPB slot.
 
 mod common;
 
@@ -120,14 +123,24 @@ fn b_act_lossy_adds_the_pps_and_slice_qp_offsets_to_the_luma_scale() {
 /// (x * 13 + y * 7) & 255, chroma patterns), then a 2Nx2N AMVP coding unit at x = 16 with MvdL0 `mvd` in integer samples
 /// (motion_vector_resolution_control_idc 1) and no residual.
 fn ibc_stream(mvd: [i32; 2]) -> (Vec<u8>, [Vec<u8>; 3]) {
+    ibc_stream_wp(mvd, false)
+}
+
+/// HEVCSCCTAIL (SR365): [`ibc_stream`], with `wp` the PPS's weighted_pred_flag and a pred_weight_table whose one entry
+/// (the current picture) carries no flags.
+fn ibc_stream_wp(mvd: [i32; 2], wp: bool) -> (Vec<u8>, [Vec<u8>; 3]) {
     let cfg = SpsCfg { width: 32, height: 16, log2_ctb: 4, log2_max_tb: 4, pcm: Some((8, 8, 3, 4, true)), ..Default::default() };
     let scc = SpsScc { curr_pic_ref: true, mv_res_idc: 1, ..Default::default() };
-    let mut s = hdr(&cfg, &InterSps { max_dec_pic_buffering_minus1: 1, ..Default::default() }, &scc, &pps_qp(26), &PpsRext::default(), &PpsScc { curr_pic_ref: true, ..Default::default() });
+    let mut s = vps(false);
+    s.extend(nal(33, &sps_rbsp_scc(&cfg, &InterSps { max_dec_pic_buffering_minus1: 1, ..Default::default() }, Some(&scc))));
+    let pi = PpsInter { weighted_pred: wp, ..Default::default() };
+    s.extend(nal(34, &pps_rbsp_scc(&pps_qp(26), &pi, &PpsRext::default(), Some(&PpsScc { curr_pic_ref: true, ..Default::default() }))));
     let y: Vec<u16> = (0..256).map(|i| (((i % 16) * 13 + (i / 16) * 7) & 255) as u16).collect();
     let cb: Vec<u16> = (0..64).map(|i| (40 + (i % 8) * 9 + (i / 8) * 3) as u16).collect();
     let cr: Vec<u16> = (0..64).map(|i| (200 - (i % 8) * 5 - (i / 8) * 11) as u16).collect();
-    let sl = SliceCfg { nal_type: 19, slice_type: 1, five_minus_max_num_merge_cand: 4, deblocking_disabled: true, ..Default::default() };
-    let mut e = CabacEnc::new(slice_header(&sl), 1, 26);
+    let weights = wp.then(|| (3, vec![None]));
+    let sl = SliceCfg { nal_type: 19, slice_type: 1, five_minus_max_num_merge_cand: 4, deblocking_disabled: true, weights, ..Default::default() };
+    let mut e = CabacEnc::new(slice_header_scc(&sl, &SliceScc { weight_skip: vec![true], ..Default::default() }), 1, 26);
     e.split_cu(0, false);
     e.cu_skip(0, false);
     e.decision(PRED_MODE, 1);
@@ -389,4 +402,80 @@ fn every_scc_flag_present_and_off_decodes_as_the_stream_without_them() {
     let (a, b) = (decode(&plain).expect("plain"), decode(&scc).expect("scc"));
     assert_eq!(a[0].planes, b[0].planes);
     assert!(b[0].planes.iter().all(|p| p.iter().all(|&v| v == 128)));
+}
+
+#[test]
+fn h_weighted_prediction_with_the_current_picture_skips_its_weights() {
+    // RefPicList0 is the current picture alone: pred_weight_table is luma_log2_weight_denom and the chroma delta only;
+    // the inferred weights (2^denom, offset 0) make the copy (c)'s picture. HEVCREXTSCC refused this by name.
+    let (s, want) = ibc_stream_wp([-16, 0], true);
+    let f = &decode(&s).expect("decode")[0];
+    for c in 0..3 {
+        assert_eq!(f.planes[c], want[c], "plane {c}");
+    }
+}
+
+#[test]
+fn h2_the_weight_table_reads_the_short_term_entry_and_skips_the_current_picture() {
+    use hevc_core::nal::parse_header;
+    use hevc_core::ps::{parse_pps, parse_sps};
+    use hevc_core::slice::parse_slice_header;
+    let cfg = SpsCfg { width: 32, height: 16, log2_ctb: 4, log2_max_tb: 4, ..Default::default() };
+    let sps = parse_sps(&sps_rbsp_scc(&cfg, &InterSps { max_dec_pic_buffering_minus1: 2, ..Default::default() }, Some(&SpsScc { curr_pic_ref: true, ..Default::default() }))).unwrap();
+    let pi = PpsInter { weighted_pred: true, ..Default::default() };
+    let pps = parse_pps(&pps_rbsp_scc(&pps_qp(26), &pi, &PpsRext::default(), Some(&PpsScc { curr_pic_ref: true, ..Default::default() }))).unwrap();
+    // A TRAIL_R P slice: RefPicList0 = {POC - 1 (short-term), the current picture}; entry 0 carries delta_luma_weight 5
+    // and luma_offset -3, entry 1 no flags; then five_minus_max_num_merge_cand 2.
+    let sl = SliceCfg {
+        nal_type: 1,
+        slice_type: 1,
+        poc_lsb: 1,
+        neg: vec![(-1, true)],
+        num_ref: Some((2, 1)),
+        weights: Some((2, vec![Some((5, -3)), None])),
+        five_minus_max_num_merge_cand: 2,
+        deblocking_disabled: true,
+        ..Default::default()
+    };
+    let rbsp = slice_header_scc(&sl, &SliceScc { weight_skip: vec![false, true], ..Default::default() }).out;
+    let nal = parse_header(&[1 << 1, 1]).unwrap();
+    let h = parse_slice_header(&rbsp, &nal, &sps, &pps, None).expect("header");
+    let w = h.pred_weights.expect("pred_weight_table");
+    assert_eq!(w.l0.luma, vec![(4 + 5, -3), (4, 0)]);
+    assert_eq!(w.l0.chroma, vec![[(4, 0); 2]; 2]);
+    assert_eq!(h.max_num_merge_cand, 3);
+}
+
+/// HEVCSCCTAIL (SR365): an IDR (POC 0) then a TRAIL_R (POC 1, empty RPS) 16x16 pcm I picture under an SPS of
+/// sps_max_dec_pic_buffering_minus1 1 and sps_max_num_reorder_pics 1, the PPS's curr_pic_ref `curr`.
+fn two_pictures(curr: bool) -> (Vec<u8>, Vec<u8>) {
+    let cfg = SpsCfg { width: 16, height: 16, log2_ctb: 4, log2_max_tb: 4, pcm: Some((8, 8, 3, 4, true)), ..Default::default() };
+    let x = InterSps { max_dec_pic_buffering_minus1: 1, max_num_reorder_pics: 1, ..Default::default() };
+    let mut s = vps(false);
+    s.extend(nal(33, &sps_rbsp_scc(&cfg, &x, Some(&SpsScc { curr_pic_ref: true, ..Default::default() }))));
+    s.extend(nal(34, &pps_rbsp_scc(&pps_qp(26), &PpsInter::default(), &PpsRext::default(), Some(&PpsScc { curr_pic_ref: curr, ..Default::default() }))));
+    let pic = |nal_type: u8, poc_lsb: u32, v: u16| {
+        let sl = SliceCfg { nal_type, slice_type: 2, poc_lsb, deblocking_disabled: true, ..Default::default() };
+        let mut e = CabacEnc::new(slice_header(&sl), 0, 26);
+        e.pcm_cu_fmt(0, 4, 8, 8, &[v; 256], &[v; 64], &[v; 64], (2, 2));
+        nal(nal_type, &e.finish().out)
+    };
+    s.extend(pic(19, 0, 10));
+    (s, pic(1, 1, 20))
+}
+
+#[test]
+fn i_the_current_picture_takes_a_dpb_slot_of_its_own() {
+    for (curr, early) in [(true, 1), (false, 0)] {
+        let (first, second) = two_pictures(curr);
+        let mut d = Decoder::new();
+        d.decode_annexb(&first).expect("first");
+        d.decode_annexb(&second).expect("second");
+        // C.5.2.2 before POC 1: POC 0 waits for output (reorder 1); the DPB of 2 is full only with POC 1's own slot.
+        let mut frames = d.take_frames();
+        assert_eq!(frames.len(), early, "curr_pic_ref {curr}");
+        d.flush();
+        frames.extend(d.take_frames());
+        assert_eq!(frames.iter().map(|f| (f.poc, f.planes[0][0])).collect::<Vec<_>>(), vec![(0, 10), (1, 20)], "curr_pic_ref {curr}");
+    }
 }

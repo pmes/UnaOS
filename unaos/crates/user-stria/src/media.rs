@@ -9,8 +9,11 @@
 // PICTURES. Every packet of the video track is decoded, in decode order (all four codecs keep references, so none is
 // skipped); a shown picture is CONVERTED only when the caller wants it (`want(pts_ms)` — a frame already superseded
 // by the clock is decoded and dropped unconverted), straight from the decoder's planes into the window's video rect:
-// BT.601 limited-range YCbCr -> 0RGB in integer arithmetic, nearest-sampled, letterboxed (never a full-size RGBA copy:
-// the rect is at most 288 x 260). H.264 reorders: its pictures carry their own presentation time (`set_tag`).
+// letterboxed, nearest-sampled, never a full-size RGBA copy (the rect is at most 288 x 260). H.264 reorders: its
+// pictures carry their own presentation time (`set_tag`). USERSTRIACOLOURONE (SR363): the private BT.601 table retired
+// onto yuv_core, the kernel Player's and host Stria's ONE converter — scale THEN convert: `nearest_row` (the scaler)
+// gathers one output row's sampled Y / Cb / Cr as a 4:4:4 row, and ONE `yuv_core::to_rgba` (Chroma::Nearest) converts
+// it with `yuv_core::pick` of the track's colour (`Track::colour`, the container's statement; else the size default).
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -19,7 +22,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use audio_core::AudioDecoder;
-use demux_core::{Codec, Track};
+use demux_core::{colour::Colour, Codec, Track};
 
 /// The container's codec token (vplay.rs `tok`, the kernel Player's words).
 pub fn tok(c: &Codec) -> &'static str {
@@ -52,66 +55,84 @@ pub fn bytes_per_px(c: &Codec) -> usize {
     }
 }
 
-/// One picture's planes, borrowed from whichever decoder made it.
-struct Planes<'a, T> {
-    y: &'a [T],
-    u: &'a [T],
-    v: &'a [T],
-    ys: usize,
-    cs: usize,
-    w: usize,
-    h: usize,
-    sx: u32,
-    sy: u32,
-    shift: u32,
+/// One picture's planes as yuv_core's `Picture` — THE literal of VP8, VP9 and H.264 (AV1's is av1_core's own
+/// `image::picture`). `full` is the pick's, set per conversion in [`scale_then_convert`].
+#[allow(clippy::too_many_arguments)]
+fn planes<'a, T>(y: &'a [T], u: &'a [T], v: &'a [T], y_stride: usize, uv_stride: usize, w: usize, h: usize, ss: (u32, u32), mono: bool, bit_depth: u32) -> yuv_core::Picture<'a, T> {
+    yuv_core::Picture { w, h, y, u, v, y_stride, uv_stride, ss, mono, bit_depth, full: false }
 }
 
 const OPAQUE: u32 = 0xFF00_0000;
 
-fn clamp8(v: i32) -> u32 {
-    v.clamp(0, 255) as u32
+/// The letterbox: the `dw x dh` rect of a `w x h` picture inside `ow x oh`, aspect kept, at `(ox, oy)`.
+fn fit(w: usize, h: usize, ow: usize, oh: usize) -> (usize, usize, usize, usize) {
+    let (dw, dh) = if ow * h <= oh * w { (ow, (h * ow / w).clamp(1, oh)) } else { ((w * oh / h).clamp(1, ow), oh) };
+    (dw, dh, (ow - dw) / 2, (oh - dh) / 2)
 }
 
-/// Convert `p` into the `ow x oh` rect `out`: nearest-sampled, aspect kept, black bars.
-fn convert<T: Copy + Into<u32>>(p: &Planes<'_, T>, out: &mut [u32], ow: usize, oh: usize) {
+/// Every sample [`nearest_row`] can read lies inside the planes.
+fn fits<T>(p: &yuv_core::Picture<'_, T>) -> bool {
+    let (cw, ch) = ((p.w + p.ss.0 as usize) >> p.ss.0, (p.h + p.ss.1 as usize) >> p.ss.1);
+    p.y.len() >= (p.h - 1) * p.y_stride + p.w && (p.mono || p.u.len().min(p.v.len()) >= (ch - 1) * p.uv_stride + cw)
+}
+
+/// THE SCALER (nearest): source row `sy` sampled at `dw` columns (`c * w / dw`) into a 4:4:4 row — each output pixel's
+/// luma and the chroma sample that covers it (what `Chroma::Nearest` reads at that luma position).
+fn nearest_row<T: Copy>(p: &yuv_core::Picture<'_, T>, sy: usize, dw: usize, ry: &mut Vec<T>, ru: &mut Vec<T>, rv: &mut Vec<T>) {
+    ry.clear();
+    ru.clear();
+    rv.clear();
+    let (yrow, crow) = (sy * p.y_stride, (sy >> p.ss.1) * p.uv_stride);
+    for c in 0..dw {
+        let sx = (c * p.w / dw).min(p.w - 1);
+        ry.push(p.y[yrow + sx]);
+        if !p.mono {
+            let ci = crow + (sx >> p.ss.0);
+            ru.push(p.u[ci]);
+            rv.push(p.v[ci]);
+        }
+    }
+}
+
+/// `p` into the `ow x oh` rect `out` (0RGB): letterboxed with black bars, each output row [`nearest_row`]-sampled, then
+/// ONE `yuv_core::to_rgba` over that row with the pick of `colour` at the picture's size (the kernel Player's pick).
+/// Bit for bit a full-size `to_rgba` (Chroma::Nearest) then nearest-sampled, at `dw x dh` conversions.
+fn scale_then_convert<T: Copy + Into<i32>>(p: &yuv_core::Picture<'_, T>, colour: Option<Colour>, out: &mut [u32], ow: usize, oh: usize) {
     out.fill(OPAQUE);
-    if p.w == 0 || p.h == 0 || ow == 0 || oh == 0 {
+    if p.w == 0 || p.h == 0 || ow == 0 || oh == 0 || !fits(p) {
         return;
     }
-    let (dw, dh) = if ow * p.h <= oh * p.w { (ow, (p.h * ow / p.w).clamp(1, oh)) } else { ((p.w * oh / p.h).clamp(1, ow), oh) };
-    let (ox, oy) = ((ow - dw) / 2, (oh - dh) / 2);
-    let mono = p.u.is_empty() || p.v.is_empty();
-    let s = |v: Option<&T>, d: u32| -> i32 { v.map_or(d, |&x| Into::<u32>::into(x) >> p.shift) as i32 };
+    let (m, full) = yuv_core::pick(colour.map(|c| c.matrix), colour.and_then(|c| c.full_range), p.w as u32, p.h as u32);
+    let (dw, dh, ox, oy) = fit(p.w, p.h, ow, oh);
+    let (mut ry, mut ru, mut rv) = (Vec::with_capacity(dw), Vec::with_capacity(dw), Vec::with_capacity(dw));
+    let mut rgba = alloc::vec![0u8; dw * 4];
     for r in 0..dh {
-        let sy = (r * p.h / dh).min(p.h - 1);
-        let (yrow, crow) = (sy * p.ys, (sy >> p.sy) * p.cs);
+        nearest_row(p, (r * p.h / dh).min(p.h - 1), dw, &mut ry, &mut ru, &mut rv);
+        let row = yuv_core::Picture { w: dw, h: 1, y: &ry[..], u: &ru[..], v: &rv[..], y_stride: dw, uv_stride: dw, ss: (0, 0), full, ..*p };
+        yuv_core::to_rgba(&row, m, yuv_core::Chroma::Nearest, false, &mut rgba);
         let orow = (oy + r) * ow + ox;
-        for c in 0..dw {
-            let sx = (c * p.w / dw).min(p.w - 1);
-            let yy = s(p.y.get(yrow + sx), 16) - 16;
-            let (cb, cr) = if mono {
-                (0, 0)
-            } else {
-                let ci = crow + (sx >> p.sx);
-                (s(p.u.get(ci), 128) - 128, s(p.v.get(ci), 128) - 128)
-            };
-            let l = 298 * yy + 128;
-            let px = OPAQUE | clamp8((l + 409 * cr) >> 8) << 16 | clamp8((l - 100 * cb - 208 * cr) >> 8) << 8 | clamp8((l + 516 * cb) >> 8);
-            if let Some(o) = out.get_mut(orow + c) {
-                *o = px;
+        if let Some(o) = out.get_mut(orow..orow + dw) {
+            for (px, c) in o.iter_mut().zip(rgba.chunks_exact(4)) {
+                *px = OPAQUE | (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
             }
         }
     }
 }
 
 /// The picture decoders (the shared cores, one enum — vplay.rs `Pic` with the host registry's VP9 and H.264).
-pub enum VDec {
+enum Pic {
     Vp8(Box<vp8_core::Decoder>),
     Vp9(Box<vp9_core::Decoder>),
     #[cfg(feature = "av1")]
     Av1(Box<av1_core::image::StreamDecoder>),
     #[cfg(feature = "h264")]
     Avc { dec: Box<h264_core::Decoder>, lp: bool, ready: VecDeque<h264_core::Frame> },
+}
+
+/// A video track's decoder and the track's colour (`Track::colour`), which every shown picture converts by.
+pub struct VDec {
+    pic: Pic,
+    colour: Option<Colour>,
 }
 
 /// What one packet gave: nothing shown, a picture shown at `pts_ms` and converted, or shown and passed over.
@@ -122,12 +143,14 @@ pub enum Out {
 }
 
 impl VDec {
+    /// The track's decoder; once per open, the colour line: `[stria] colour matrix=<n> range=<limited|full>
+    /// src=<container|default>` (`<n>` the track's stated code, 2 when none: then the size default converts).
     pub fn new(t: &Track) -> Result<VDec, String> {
-        match t.codec {
-            Codec::Vp8 => Ok(VDec::Vp8(Box::new(vp8_core::Decoder::new()))),
-            Codec::Vp9 => Ok(VDec::Vp9(Box::new(vp9_core::Decoder::new()))),
+        let pic = match t.codec {
+            Codec::Vp8 => Pic::Vp8(Box::new(vp8_core::Decoder::new())),
+            Codec::Vp9 => Pic::Vp9(Box::new(vp9_core::Decoder::new())),
             #[cfg(feature = "av1")]
-            Codec::Av1 => av1_core::image::StreamDecoder::new(&t.config).map(|d| VDec::Av1(Box::new(d))).map_err(|e| format!("av1: {}", e)),
+            Codec::Av1 => av1_core::image::StreamDecoder::new(&t.config).map(|d| Pic::Av1(Box::new(d))).map_err(|e| format!("av1: {}", e))?,
             #[cfg(feature = "h264")]
             Codec::Avc => {
                 let mut dec = Box::new(h264_core::Decoder::new());
@@ -135,21 +158,26 @@ impl VDec {
                 if lp {
                     dec.configure_avcc(&t.config).map_err(|e| format!("h264: {}", e))?;
                 }
-                Ok(VDec::Avc { dec, lp, ready: VecDeque::new() })
+                Pic::Avc { dec, lp, ready: VecDeque::new() }
             }
-            ref c => Err(format!("no-decoder codec={}", tok(c))),
-        }
+            ref c => return Err(format!("no-decoder codec={}", tok(c))),
+        };
+        let stated = t.colour.map(|c| c.matrix).filter(|m| *m != 2);
+        let (_, full) = yuv_core::pick(stated, t.colour.and_then(|c| c.full_range), t.width, t.height);
+        let src = if stated.is_some() { "container" } else { "default" };
+        crate::sys::write(format!("[stria] colour matrix={} range={} src={}\n", stated.unwrap_or(2), if full { "full" } else { "limited" }, src).as_bytes());
+        Ok(VDec { pic, colour: t.colour })
     }
 
     /// After a seek: drop every reference (decoding resumes at the keyframe the demuxer seeked to).
     pub fn reset(&mut self) {
-        match self {
-            VDec::Vp8(d) => **d = vp8_core::Decoder::new(),
-            VDec::Vp9(d) => d.reset(),
+        match &mut self.pic {
+            Pic::Vp8(d) => **d = vp8_core::Decoder::new(),
+            Pic::Vp9(d) => d.reset(),
             #[cfg(feature = "av1")]
-            VDec::Av1(d) => d.reset(),
+            Pic::Av1(d) => d.reset(),
             #[cfg(feature = "h264")]
-            VDec::Avc { dec, ready, .. } => {
+            Pic::Avc { dec, ready, .. } => {
                 dec.reset();
                 ready.clear();
             }
@@ -160,8 +188,9 @@ impl VDec {
     /// the media timeline; `to_ms` maps an H.264 tag (ns, absolute) to it. A shown picture is converted into `out`
     /// (`ow x oh`) only when `want(pts_ms)`.
     pub fn decode(&mut self, data: &[u8], pts_ms: u64, pts_ns: i64, to_ms: &dyn Fn(i64) -> u64, want: &dyn Fn(u64) -> bool, out: &mut [u32], ow: usize, oh: usize) -> Result<Out, String> {
-        match self {
-            VDec::Vp8(d) => {
+        let colour = self.colour;
+        match &mut self.pic {
+            Pic::Vp8(d) => {
                 if data.is_empty() {
                     return Ok(Out::None);
                 }
@@ -173,11 +202,11 @@ impl VDec {
                 if !want(pts_ms) {
                     return Ok(Out::Dropped(pts_ms));
                 }
-                let pl = Planes { y: pic.y, u: pic.u, v: pic.v, ys: pic.y_stride, cs: pic.uv_stride, w: pic.width as usize, h: pic.height as usize, sx: 1, sy: 1, shift: 0 };
-                convert(&pl, out, ow, oh);
+                let pl = planes(pic.y, pic.u, pic.v, pic.y_stride, pic.uv_stride, pic.width as usize, pic.height as usize, (1, 1), false, 8);
+                scale_then_convert(&pl, colour, out, ow, oh);
                 Ok(Out::Shown(pts_ms))
             }
-            VDec::Vp9(d) => {
+            Pic::Vp9(d) => {
                 if data.is_empty() {
                     return Ok(Out::None);
                 }
@@ -190,23 +219,13 @@ impl VDec {
                     return Ok(Out::Dropped(pts_ms));
                 }
                 let (cw, _) = f.plane_size(1);
-                let pl = Planes {
-                    y: &f.planes[0][..],
-                    u: &f.planes[1][..],
-                    v: &f.planes[2][..],
-                    ys: f.width as usize,
-                    cs: cw,
-                    w: f.width as usize,
-                    h: f.height as usize,
-                    sx: f.ss_x as u32,
-                    sy: f.ss_y as u32,
-                    shift: (f.bit_depth as u32).saturating_sub(8),
-                };
-                convert(&pl, out, ow, oh);
+                let (w, h) = (f.width as usize, f.height as usize);
+                let pl = planes(&f.planes[0][..], &f.planes[1][..], &f.planes[2][..], w, cw, w, h, (f.ss_x as u32, f.ss_y as u32), false, f.bit_depth as u32);
+                scale_then_convert(&pl, colour, out, ow, oh);
                 Ok(Out::Shown(pts_ms))
             }
             #[cfg(feature = "av1")]
-            VDec::Av1(d) => {
+            Pic::Av1(d) => {
                 if data.is_empty() {
                     return Ok(Out::None);
                 }
@@ -214,23 +233,11 @@ impl VDec {
                 if !want(pts_ms) {
                     return Ok(Out::Dropped(pts_ms));
                 }
-                let pl = Planes {
-                    y: &p.y[..],
-                    u: if p.mono { &[][..] } else { &p.u[..] },
-                    v: if p.mono { &[][..] } else { &p.v[..] },
-                    ys: p.width as usize,
-                    cs: p.chroma_width() as usize,
-                    w: p.width as usize,
-                    h: p.height as usize,
-                    sx: p.ss_x,
-                    sy: p.ss_y,
-                    shift: p.bit_depth.saturating_sub(8),
-                };
-                convert(&pl, out, ow, oh);
+                scale_then_convert(&av1_core::image::picture(&p), colour, out, ow, oh);
                 Ok(Out::Shown(pts_ms))
             }
             #[cfg(feature = "h264")]
-            VDec::Avc { dec, lp, ready } => {
+            Pic::Avc { dec, lp, ready } => {
                 let r = if data.is_empty() {
                     dec.flush();
                     Ok(())
@@ -253,9 +260,13 @@ impl VDec {
                 if !want(at) {
                     return Ok(Out::Dropped(at));
                 }
-                let w = f.width as usize;
-                let pl = Planes { y: &f.planes[0][..], u: &f.planes[1][..], v: &f.planes[2][..], ys: w, cs: w / 2, w, h: f.height as usize, sx: 1, sy: 1, shift: 0 };
-                convert(&pl, out, ow, oh);
+                let (w, h) = (f.width as usize, f.height as usize);
+                let (sw, sh) = f.chroma.sub();
+                let (ss, mono) = (((sw >> 1) as u32, (sh >> 1) as u32), f.chroma == h264_core::ChromaFormat::Mono);
+                match &f.planes16 {
+                    Some(p16) => scale_then_convert(&planes(&p16[0][..], &p16[1][..], &p16[2][..], w, w / sw, w, h, ss, mono, f.bit_depth as u32), colour, out, ow, oh),
+                    None => scale_then_convert(&planes(&f.planes[0][..], &f.planes[1][..], &f.planes[2][..], w, w / sw, w, h, ss, mono, 8), colour, out, ow, oh),
+                }
                 Ok(Out::Shown(at))
             }
         }
@@ -263,9 +274,9 @@ impl VDec {
 
     /// Pictures still held (H.264's reorder buffer) after the last packet.
     pub fn pending(&self) -> bool {
-        match self {
+        match &self.pic {
             #[cfg(feature = "h264")]
-            VDec::Avc { ready, .. } => !ready.is_empty(),
+            Pic::Avc { ready, .. } => !ready.is_empty(),
             _ => false,
         }
     }

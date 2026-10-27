@@ -8,7 +8,8 @@
 //! (SMPTE ST 2086 mastering display colour volume, CTA-861.3 content light levels). The container's statement is read at
 //! open (MP4 `colr` / `mdcv` / `clli` in the visual sample entry, Matroska `Colour` in the Video master) into
 //! [`crate::Track::colour`]; the bitstream's (H.264 SPS VUI, AV1 sequence header color_config and METADATA OBUs) is the
-//! fallback, handed in by the caller through [`crate::Demuxer::fill_colour`] (demux_core keeps no codec dependency, the
+//! fallback (AV1: the av1C configOBUs, else the first sample's in-band sequence header, AV1INBANDCOLOUR SR366), handed in by
+//! the caller through [`crate::Demuxer::fill_colour`] (demux_core keeps no codec dependency, the
 //! [`crate::Demuxer::derive_dts`] shape). The container wins: [`Colour::or`].
 //!
 //! Units of [`Mastering`] are ST 2086's, as ISO `mdcv` stores them: chromaticity x, y in 0.00002, luminance in
@@ -123,16 +124,18 @@ impl fmt::Display for Colour {
 impl Demuxer {
     /// NLEPROBEHDR (SR226): the bitstream's colour as the fallback for what the container did not say. `colour_of` is the
     /// codec core's reading of a video track's configuration (the H.264 SPS VUI from `avcC`, the AV1 sequence header and
-    /// METADATA OBUs from `av1C`), injected by the caller as [`Demuxer::derive_dts`]'s depth is. A track with no container
-    /// colour takes it whole; one with a container colour keeps it and fills only its gaps ([`Colour::or`]). Returns how
-    /// many tracks changed.
-    pub fn fill_colour(&mut self, colour_of: impl Fn(&Track) -> Option<Colour>) -> usize {
+    /// METADATA OBUs from `av1C`), injected by the caller as [`Demuxer::derive_dts`]'s depth is. AV1INBANDCOLOUR (SR366): it is
+    /// handed the track's first sample in decode order ([`Demuxer::first_sample`]; empty when there is none) beside the track,
+    /// so an av1C without configOBUs is read from the in-band sequence header. A track with no container colour takes it
+    /// whole; one with a container colour keeps it and fills only its gaps ([`Colour::or`]). Returns how many tracks changed.
+    pub fn fill_colour(&mut self, colour_of: impl Fn(&Track, &[u8]) -> Option<Colour>) -> usize {
+        let found: alloc::vec::Vec<(usize, Colour)> = (0..self.tracks.len())
+            .filter(|&i| self.tracks[i].kind == TrackKind::Video)
+            .filter_map(|i| colour_of(&self.tracks[i], self.first_sample(i).unwrap_or(&[])).map(|b| (i, b)))
+            .collect();
         let mut n = 0;
-        for t in self.tracks.iter_mut() {
-            if t.kind != TrackKind::Video {
-                continue;
-            }
-            let Some(b) = colour_of(t) else { continue };
+        for (i, b) in found {
+            let t = &mut self.tracks[i];
             let next = match t.colour {
                 Some(c) => c.or(b),
                 None => b,
