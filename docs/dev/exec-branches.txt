@@ -896,7 +896,7 @@ refs/heads/exec-rmbp-pdfjpx   f3d5ae3c9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-jbig2huff   f3d5ae3c9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdfsig   dd39de802 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdfwritefonts   707941343 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-stationroamactive   f3d5ae3c9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-stationroamactive   be1410fc2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle2split   2f9283486 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-av1colourone   2f9283486 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aethermacgpuenginedamage   2f9283486 IN-FLIGHT cut 2026-10-27

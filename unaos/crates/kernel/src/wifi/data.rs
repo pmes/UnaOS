@@ -134,13 +134,13 @@ pub struct Link {
     bssid: Mac,
     seq: u16,
     tx_next: usize,
-    pub rx_data: u32,
+    pub rx_data: u32, pub rx_uni: u32, // STATIONROAM-IDLEUNI (B951): `rx_uni`, the delivered frames whose addr1 is our MAC (group frames not counted): the idle gate's receive half
     pub tx_toolong: u32,
 }
 
 impl Link {
     pub fn new(sta: Mac, bssid: Mac) -> Link {
-        Link { sta, bssid, seq: 0, tx_next: FRAME_DATA0, rx_data: 0, tx_toolong: 0 }
+        Link { sta, bssid, seq: 0, tx_next: FRAME_DATA0, rx_data: 0, rx_uni: 0, tx_toolong: 0 }
     }
 
     /// `RawNic::transmit`'s half: the air frame for `eth` and the ring frame number it goes out on.
@@ -167,7 +167,7 @@ impl Link {
         while !q.is_empty() {
             let f = q.remove(0);
             if let Some(eth) = from_air(&f, self.sta, self.bssid) {
-                self.rx_data += 1;
+                self.rx_data += 1; if f[4] & 0x01 == 0 { self.rx_uni += 1; } // STATIONROAM-IDLEUNI (B951): unicast to us (`from_air` passed: addr1 = STA)
                 let n = eth.len().min(out.len());
                 out[..n].copy_from_slice(&eth[..n]);
                 return Some(n);
@@ -373,7 +373,7 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
         checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
             && crate::smolnet::lease_of(&bad).is_none()));
     }
-    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); let mut pass = 0u8; // STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
+    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); active_rows(&mut checks); let mut pass = 0u8; // STATIONROAM-ACTIVE (B951): `probe`, `idleuni` after `idlegate`; STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
     let mut first = None;
     for (name, ok) in checks.iter() {
         if *ok {
@@ -956,7 +956,7 @@ impl BssTable {
         self.act_ms = now_ms;
     }
 
-    /// STATIONROAM-XCHAN (B898): one sample of the station's data counters (`Link.rx_data`, `tx::Queue.posted`); a change in either
+    /// STATIONROAM-XCHAN (B898): one sample of the station's data counters (`Link.rx_uni` since STATIONROAM-IDLEUNI B951, `tx::Queue.posted`); a change in either
     /// (or the first sample after `arm`) restarts the clock. `true` = neither moved for `ROAM_IDLE_MS`: an off-channel sweep may stall
     /// the data path.
     pub fn quiet(&mut self, rx: u32, tx: u32, now_ms: u64) -> bool {
@@ -1156,4 +1156,65 @@ fn xchan_rows(checks: &mut Vec<(&'static str, bool)>) {
     t.arm(7000);
     q &= !t.quiet(6, 8, 7000) && !t.quiet(6, 8, 8999) && t.quiet(6, 8, 9000);
     checks.push(("idlegate", q));
+}
+
+// ── STATIONROAM-ACTIVE / STATIONROAM-IDLEUNI (rmbp-ledger B951): the probed dwell's end rule — PURE, read by `join::dwell` ──
+
+/// An answered dwell ends no sooner than this after its probe: mac80211's active-scan channel time (`IEEE80211_CHANNEL_TIME`, HZ/33,
+/// net/mac80211/scan.c), so a second BSS of the SSID on the same channel can answer too.
+pub const ROAM_PROBE_MS: u64 = 30;
+/// The receiver slice inside a probed dwell (`rx::poll` turns are 5 ms).
+pub const ROAM_SLICE_MS: u64 = 10;
+
+/// The `Heard.resp` bit of a probe response's DS channel (0 = no DS element); channels past 15 set none.
+pub fn resp_bit(channel: u8) -> u16 {
+    if channel < 16 { 1u16 << channel } else { 0 }
+}
+
+/// A dwell on `ch` was answered: a probe response to us from a BSS whose DS channel is `ch`, or with no DS element (taken as the channel
+/// it was heard on, `roam_pick`'s rule). An adjacent channel's BSS heard through the 2.4 GHz overlap is not an answer.
+pub fn answered(ch: u8, resp: u16) -> bool {
+    resp & (resp_bit(ch) | 1) != 0
+}
+
+/// The probed dwell ends: `ROAM_DWELL_MS` after the probe either way, or `ROAM_PROBE_MS` after it once answered.
+pub fn dwell_end(ch: u8, resp: u16, elapsed_ms: u64) -> bool {
+    elapsed_ms >= ROAM_DWELL_MS || (answered(ch, resp) && elapsed_ms >= ROAM_PROBE_MS)
+}
+
+/// `kat`'s rows after B898's (STATIONROAM-ACTIVE / -IDLEUNI rmbp-ledger B951). `probe`: resp_bit(6) = 0x40, (0) = 1, (200) = 0;
+/// unanswered on 6: not ended at 109, ended at 110; answered on 6: not ended at 29, ended at 30; no DS element ends at 30; an answer
+/// from channel 5 does not end at 30, ends at 110 (bounded); slice <= floor < dwell. `idleuni`: a FromDS data frame to STA and the
+/// same to broadcast through `Link::recv`: rx_data 2, rx_uni 1; the gate fed rx_uni: arm(0), still quiet at 2000 (not 1999) after the
+/// group frame; after the unicast frame at 2250 not quiet at 4249, quiet at 4250.
+fn active_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let mut ok = resp_bit(6) == 0x40 && resp_bit(0) == 1 && resp_bit(200) == 0;
+    ok &= !dwell_end(6, 0, 109) && dwell_end(6, 0, 110);
+    ok &= !dwell_end(6, resp_bit(6), 29) && dwell_end(6, resp_bit(6), 30);
+    ok &= dwell_end(6, resp_bit(0), 30);
+    ok &= !dwell_end(6, resp_bit(5), 30) && dwell_end(6, resp_bit(5), 110);
+    ok &= ROAM_SLICE_MS <= ROAM_PROBE_MS && ROAM_PROBE_MS < ROAM_DWELL_MS;
+    checks.push(("probe", ok));
+
+    let mut uni = alloc::vec![0x08, 0x02, 0x00, 0x00];
+    uni.extend_from_slice(&STA);
+    uni.extend_from_slice(&BSSID);
+    uni.extend_from_slice(&GW_MAC);
+    uni.extend_from_slice(&[0x10, 0x00, 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x08, 0x06]);
+    uni.extend_from_slice(&[0u8; 28]);
+    let mut grp = uni.clone();
+    grp[4..10].copy_from_slice(&[0xFF; 6]);
+    let mut l = Link::new(STA, BSSID);
+    let mut t = BssTable::default();
+    t.arm(0);
+    let mut out = [0u8; 64];
+    let mut g = !t.quiet(l.rx_uni, 7, 0);
+    let mut q: Vec<Vec<u8>> = alloc::vec![grp];
+    g &= l.recv(&mut q, &mut out).is_some();
+    g &= !t.quiet(l.rx_uni, 7, 1999) && t.quiet(l.rx_uni, 7, 2000);
+    let mut q: Vec<Vec<u8>> = alloc::vec![uni];
+    g &= l.recv(&mut q, &mut out).is_some();
+    g &= !t.quiet(l.rx_uni, 7, 2250) && !t.quiet(l.rx_uni, 7, 4249) && t.quiet(l.rx_uni, 7, 4250);
+    g &= l.rx_data == 2 && l.rx_uni == 1;
+    checks.push(("idleuni", g));
 }
