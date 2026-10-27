@@ -9,7 +9,12 @@
 //! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
 //! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
+//! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
 //! ```
+//!
+//! `size` (NLESIZEPOLICYUI, LEDGER SR402) sets a reel's size policy through the editor's ONE verb dispatch
+//! (`timeline_core::editor::EditorState::verb`, `size <reel> <policy>`) and writes the EDL back through the ONE writer
+//! (`edl::write`, titled by the file's stem): `nle: size <reel> <policy> -> <bytes> bytes`; a refusal is printed, exit 1.
 //!
 //! `schedule` prints one line per reel (`reel=<r> open=<full|indexed> dts=<stored|derived:n|presentation> edits=<n>`,
 //! `stria::nle::Sources::open_report`; DEMUXWIRE SR213; ` applied=<n|first-only>` EDITMAP SR223), then one line per step
@@ -41,6 +46,7 @@ fn usage() -> ! {
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
     eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv]");
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
+    eprintln!("       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     std::process::exit(2)
 }
 
@@ -99,6 +105,7 @@ fn main() {
         std::fs::write(out, synth_source(base, frames, fps)).unwrap_or_else(|e| die(format!("{out}: {e}")));
         return;
     }
+    if args.first().map(String::as_str) == Some("size") { size_verb(&args[1..]); return; } // NLESIZEPOLICYUI (SR402): the reel's size policy into the EDL (file tail)
     let (Some(verb), Some(edl_path)) = (args.first(), args.get(1)) else { usage() };
     let (mut fps, mut out, mut srcs) = (25u32, None::<String>, Vec::new());
     let (mut video, mut audio) = ("png".to_string(), "wav".to_string());
@@ -197,4 +204,27 @@ fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, di
         "{{\"codec\":\"{video}\",\"frames\":{},\"files\":{},\"bytes\":{},\"fnv\":\"{:016x}\",\"pcm_frames\":{}}}",
         r.frames, r.files, r.bytes, r.fnv, r.pcm_frames
     );
+}
+
+/// NLESIZEPOLICYUI (SR402): `nle size <edl> <reel> <policy> [--fps N]` — plumbing only: the EDL opened as the editor's
+/// state, the `size` verb run through timeline_core's ONE dispatch, the timeline written back by the ONE writer.
+fn size_verb(args: &[String]) {
+    let (Some(path), Some(reel), Some(word)) = (args.first(), args.get(1), args.get(2)) else { usage() };
+    let fps = match &args[3..] {
+        [] => 25,
+        [f, n] if f == "--fps" => n.parse().unwrap_or_else(|_| usage()),
+        _ => usage(),
+    };
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("{path}: {e}")));
+    let mut st = timeline_core::editor::EditorState::open(&text, fps).unwrap_or_else(|e| die(format!("{path}: {e}")));
+    let v = format!("size {reel} {word}");
+    match st.verb(&v) {
+        Some(Ok(())) => {}
+        Some(Err(e)) => die(format!("{v}: {e}")),
+        None => usage(),
+    }
+    let stem = std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or("NLE");
+    let out = edl::write(&st.timeline, stem).unwrap_or_else(|e| die(format!("{path}: {e}")));
+    std::fs::write(path, &out).unwrap_or_else(|e| die(format!("{path}: {e}")));
+    println!("nle: {v} -> {} bytes", out.len());
 }

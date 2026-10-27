@@ -150,7 +150,8 @@ pub fn synth_fixture() -> (Timeline, Sources) {
 // ---------------------------------------------------------------------------------------------------------------------
 
 /// The transport verbs a button (or the headless witness) fires as `SMessage::Input { target: SURFACE, text }`.
-pub const VERBS: [&str; 14] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift"];
+/// NLESIZEPOLICYUI (SR402): `size` cycles the selected clip's reel's size policy (timeline_core's `EditorState::verb`).
+pub const VERBS: [&str; 15] = ["play", "prev", "next", "split", "delete", "undo", "redo", "zoom-", "zoom+", "[", "]", "{", "}", "lift", "size"];
 
 /// One editor window's model: the state, the media, the canvas size and pixel order, the transport.
 pub struct Face {
