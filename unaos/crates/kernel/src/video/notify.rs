@@ -278,7 +278,7 @@ static SURF_AT: [AtomicUsize; SURF_N] = [const { AtomicUsize::new(0) }; SURF_N];
 fn surf(i: usize) -> &'static mut [u32] {
     let (w, h) = if i == STACK_MAX { (CW, CH) } else { (W, H) };
     let n = metrics::size(w) * metrics::size(h);
-    metrics::leaked_surf(&SURF_AT[i], n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
+    metrics::login_surf(&SURF_AT[i], n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 }
 
 /// The unread count the bell's badge shows (lock-free: the bar's painter reads it) — the ring's unread items.
@@ -498,7 +498,7 @@ fn open_row(i: usize, x: usize, y: usize) -> wm::WinId {
     {
         let (w, h) = if i == STACK_MAX { (CW, CH) } else { (W, H) };
         let (sw, sh) = (metrics::size(w), metrics::size(h));
-        return wm::overlay_open(surf(i).as_mut_ptr() as usize, sw * sh * 4, sw, sh, x, y);
+        return { let id = wm::overlay_open(surf(i).as_mut_ptr() as usize, sw * sh * 4, sw, sh, x, y); metrics::leaked_surf_retire(&SURF_AT[i], "notify"); id };
     }
     #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
     {
