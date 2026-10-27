@@ -73,14 +73,14 @@ fn pdf4_present_pixels() {
 #[test]
 fn pdf4_scroll_page2() {
     let mut e = open(400, 100);
-    assert_eq!(e.pdf_status().as_deref(), Some("Page 1 / 2"), "the page under the viewport's centre");
+    assert_eq!(e.pdf_status().as_deref(), Some("Page 1 / 2 \u{b7} 100%"), "the page under the viewport's centre (PDF4-FIT-STATUS-PCT SR395: the zoom follows)");
     let top2 = e.pdf.as_ref().unwrap().page_rect(1, 400.0).1;
     assert!((top2 - (GAP + 100.0 * PT + GAP)).abs() < 1e-9);
     e.handle_event(crate::api::events::Event::Scroll(0.0, top2));
     assert!((e.scroll_y - top2).abs() < 1e-9);
     let f = e.present_rgba();
     assert_eq!(px(&f, 200, 2), [255, 0, 0], "page 2's red at the viewport top");
-    assert_eq!(e.pdf_status().as_deref(), Some("Page 2 / 2"));
+    assert_eq!(e.pdf_status().as_deref(), Some("Page 2 / 2 \u{b7} 100%"), "SR395: the zoom on every status");
     e.handle_event(crate::api::events::Event::Scroll(0.0, 10_000.0));
     let max = e.pdf.as_ref().unwrap().max_scroll(100.0);
     assert!((e.scroll_y - max).abs() < 1e-9, "clamped to the stack: {} vs {max}", e.scroll_y);
@@ -265,7 +265,7 @@ fn pdf4annots_link_hover_click() {
     e.handle_event(Event::MouseMove(off.0, off.1));
     assert_eq!(e.take_cursor_change().as_deref(), Some("default"));
     assert_eq!(e.hovered_link(), None);
-    assert_eq!(e.pdf_status().as_deref(), Some("Page 1 / 3"));
+    assert_eq!(e.pdf_status().as_deref(), Some("Page 1 / 3 \u{b7} 100%"), "SR395: the zoom on every status");
 }
 
 #[test]
@@ -277,7 +277,7 @@ fn pdf4annots_goto_xyz() {
     assert_eq!(e.hovered_link().as_deref(), Some("Page 2"));
     click(&mut e, g);
     assert!((e.scroll_y - (top2 + 10.0 * PT)).abs() < 1e-9, "page 2's /XYZ top 30 at the viewport top: {}", e.scroll_y);
-    assert_eq!(e.pdf_status().as_deref(), Some("Page 2 / 3"));
+    assert_eq!(e.pdf_status().as_deref(), Some("Page 2 / 3 \u{b7} 100%"), "SR395: the zoom on every status");
     // /Named /NextPage from page 1: page 2's top.
     e.handle_event(Event::Scroll(0.0, -10_000.0));
     let n = user(&e, 0, 25.0, 35.0);
@@ -939,16 +939,19 @@ fn pdf4outline_named_next_resolves() {
 
 #[test]
 fn pdf4outline_colour_row() {
-    use super::thumbs::row_ink;
+    use super::thumbs::{ink_floor, row_ink, INK_FLOOR};
     let e = action_engine();
-    assert_eq!(row_ink(&e.pdf.as_ref().unwrap().outline[2]), (255, 0, 0), "/C [1 0 0]");
+    // PDF4FITSTATUS (SR395) composes SR389's ink floor onto this row: /C [1 0 0] (luminance 70) is lifted to the floor.
+    let ink = row_ink(&e.pdf.as_ref().unwrap().outline[2]);
+    assert_eq!(ink, ink_floor((255, 0, 0)), "/C [1 0 0] through the ink floor");
+    assert!(ink.0 == 255 && ink.1 == ink.2 && ink.1 > 0 && crate::fonts::raster::luminance(ink) >= INK_FLOOR, "still red, at the floor: {ink:?}");
     assert!(e.pdf.as_ref().unwrap().outline[2].bold, "/F 2: bold");
     if !have_sans() {
         return;
     }
     let f = e.present_rgba();
     // Row 2 at rows 52..74 (the current page's band: "Red" is the last row at or before page 1).
-    assert!(any_px(&f, (18, 110), (52, 74), |p| p[0] > 180 && p[1] < 90 && p[2] < 90), "a red title pixel in row 2");
+    assert!(any_px(&f, (18, 110), (52, 74), |p| p[0] > 200 && p[0] as i32 - p[1] as i32 > 80), "a red title pixel in row 2");
 }
 
 #[test]
@@ -997,4 +1000,173 @@ fn pdf4strip_scale2() {
     click(&mut e, (40.0, 41.0));
     let want = e.pdf.as_ref().unwrap().dest_y(&Dest { page: 1, view: View::Xyz { left: Some(0.0), top: Some(90.0), zoom: None } });
     assert!(near(e.scroll_y, want), "a CSS click lands on row 1 at scale 2: {} vs {want}", e.scroll_y);
+}
+
+// =================================================================================================
+// PDF4-STRIPKEYS / PDF4-FIT / PDF4-OUTLINE-CONTRAST (SR389): the strip's keys, the fit modes, the dark strip's ink floor.
+// =================================================================================================
+
+fn key(e: &mut AetherEngine, k: &str) {
+    e.handle_event(Event::KeyDown(k.to_string()));
+}
+
+/// The strip's pixels in the focus ring's colour.
+fn ring_px(e: &AetherEngine) -> usize {
+    let c = crate::render::focusring::theme().color;
+    let f = e.present_rgba();
+    let sw = super::thumbs::strip_px(super::thumbs::STRIP_W, e.zoom_pct() as f64 / 100.0) as usize;
+    (0..f.1 as usize).flat_map(|y| (0..sw).map(move |x| (x, y))).filter(|&(x, y)| px(&f, x, y) == [c.0, c.1, c.2]).count()
+}
+
+#[test]
+fn pdf4stripkeys_tab_down_enter() {
+    let mut e = engine_with(n_pages(3), 400, 100);
+    key(&mut e, "Tab");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, None, "a closed strip takes no Tab");
+    key(&mut e, "F4");
+    let _ = e.present_rgba();
+    assert_eq!(ring_px(&e), 0, "no ring before the strip is focused");
+    key(&mut e, "Tab");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(0), "Tab: the strip, on the current page's thumbnail");
+    key(&mut e, "Down");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(1));
+    assert_eq!(e.scroll_y, 0.0, "a focus move does not scroll the pages");
+    key(&mut e, "Return");
+    let top2 = e.pdf.as_ref().unwrap().page_rect(1, 400.0).1;
+    assert!(near(e.scroll_y, top2), "Enter lands on page 2: {} vs {top2}", e.scroll_y);
+    assert!(ring_px(&e) > 0, "the focused thumbnail carries the focus ring");
+    key(&mut e, "Up");
+    key(&mut e, "Up");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(0), "Up sticks at the first");
+    key(&mut e, "End");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(2));
+    key(&mut e, "Shift+Tab");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, None, "Shift+Tab: back to the page");
+    assert_eq!(ring_px(&e), 0, "no ring with the page focused");
+}
+
+#[test]
+fn pdf4stripkeys_outline_tree() {
+    use super::thumbs::rows;
+    use pdf_core::annots::{Dest, View};
+    let mut e = outline_engine();
+    let _ = e.present_rgba();
+    key(&mut e, "Tab");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(0), "the current page's item, \"One\"");
+    key(&mut e, "Left");
+    assert_eq!(rows(e.pdf.as_ref().unwrap()).len(), 2, "Left closes the parent");
+    assert_eq!(e.scroll_x, 0.0, "the strip took Left, not the hscroll");
+    key(&mut e, "Right");
+    assert_eq!(rows(e.pdf.as_ref().unwrap()).len(), 3, "Right expands it");
+    assert!(ring_px(&e) > 0, "the focused row carries the focus ring");
+    key(&mut e, "Down");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(1), "the child");
+    key(&mut e, "Return");
+    let want = e.pdf.as_ref().unwrap().dest_y(&Dest { page: 1, view: View::Xyz { left: Some(0.0), top: Some(90.0), zoom: None } });
+    assert!(near(e.scroll_y, want), "Enter follows the child's /XYZ: {} vs {want}", e.scroll_y);
+    key(&mut e, "End");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(2));
+    key(&mut e, "Home");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(0));
+    key(&mut e, "F4");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, None, "the strip closed: its focus goes");
+}
+
+#[test]
+fn pdf4fit_width_page() {
+    use super::thumbs::STRIP_W;
+    let mut e = open(400, 600);
+    let sw = e.pdf.as_ref().unwrap().stack_w();
+    key(&mut e, "w");
+    assert_eq!(e.zoom_pct(), (400.0 / sw * 100.0).floor() as u32, "fit-width: the frame over the stack's width");
+    assert!(e.pdf_status().unwrap().ends_with(&format!(" \u{b7} fit-w {}%", e.zoom_pct())), "{:?}", e.pdf_status());
+    key(&mut e, "F4");
+    // PDF4FITSTATUS (SR395): SR387's strip is STRIP_W CSS px at every zoom (STRIP_W x z device px), so the frame is the
+    // stack and the strip together at z: z = dw / (stack_w + STRIP_W).
+    assert_eq!(e.zoom_pct(), (400.0 / (sw + STRIP_W) * 100.0).floor() as u32, "the strip open: the frame over the stack and the strip");
+    e.set_device_size(600, 600);
+    assert_eq!(e.zoom_pct(), (600.0 / (sw + STRIP_W) * 100.0).floor() as u32, "a resize re-fits");
+    let fit = e.zoom_pct();
+    assert_eq!(e.zoom_step(1), crate::chrome::zoom::step(fit, 1));
+    assert_eq!(e.pdf.as_ref().unwrap().fit, None, "a ladder step drops the mode");
+    assert!(!e.pdf_status().unwrap().contains("fit"), "{:?}", e.pdf_status());
+    e.set_device_size(600, 200);
+    key(&mut e, "p");
+    let ph = 100.0 * PT + 2.0 * GAP;
+    let want = ((600.0 / (sw + STRIP_W)).min(200.0 / ph) * 100.0).floor() as u32;
+    assert_eq!(e.zoom_pct(), want, "fit-page: the tallest page and its gaps fit the height");
+    assert!(want < (600.0 / (sw + STRIP_W) * 100.0).floor() as u32, "the height binds here");
+    assert!(e.pdf_status().unwrap().ends_with(&format!(" \u{b7} fit-p {}%", e.zoom_pct())), "{:?}", e.pdf_status());
+}
+
+#[test]
+fn pdf4outline_contrast_floor() {
+    use super::thumbs::{ink_floor, INK_FLOOR, STRIP_BG};
+    use crate::fonts::raster::luminance;
+    assert!(luminance(STRIP_BG) < INK_FLOOR);
+    let dark = (60, 0, 0);
+    let lifted = ink_floor(dark);
+    let l = luminance(lifted);
+    assert!((INK_FLOOR..=INK_FLOOR + 3).contains(&l), "a dark /C is lifted to the floor: {lifted:?} at {l}");
+    assert!(lifted.0 > lifted.1 && lifted.0 > lifted.2, "its hue holds: {lifted:?}");
+    assert_eq!(ink_floor((200, 220, 255)), (200, 220, 255), "an ink above the floor is unchanged");
+    assert_eq!(luminance(ink_floor((0, 0, 0))), INK_FLOOR, "black lands on the floor grey");
+}
+
+// =================================================================================================
+// PDF4-FIT-STATUS-PCT / PDF4-STRIPKEYS-CLICKFOCUS (SR395): the zoom on the status line, a strip click takes the strip's
+// focus, a re-fit at zoom 2 with SR387's scaled strip.
+// =================================================================================================
+
+#[test]
+fn pdf4fitstatus_pct_text() {
+    let mut e = open(400, 100);
+    assert_eq!(e.pdf_status().as_deref(), Some("Page 1 / 2 \u{b7} 100%"));
+    e.zoom_step(1);
+    assert_eq!(e.pdf_status().as_deref(), Some("Page 1 / 2 \u{b7} 110%"), "a ladder step: the new zoom");
+    key(&mut e, "w");
+    let fit = e.zoom_pct();
+    assert_eq!(fit, (400.0 / e.pdf.as_ref().unwrap().stack_w() * 100.0).floor() as u32);
+    assert!(e.pdf_status().unwrap().ends_with(&format!(" \u{b7} fit-w {fit}%")), "{:?}", e.pdf_status());
+    e.zoom_step(-1);
+    let pct = e.zoom_pct();
+    assert!(e.pdf_status().unwrap().ends_with(&format!(" \u{b7} {pct}%")) && !e.pdf_status().unwrap().contains("fit"), "{:?}", e.pdf_status());
+}
+
+#[test]
+fn pdf4fitstatus_click_focus() {
+    let mut e = engine_with(n_pages(3), 400, 100);
+    key(&mut e, "F4");
+    let _ = e.present_rgba();
+    // Thumbnails 34 x 17 device px stacked 39 apart from row 8: page 2's at rows 47..64.
+    click(&mut e, (60.0, 55.0));
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(1), "the clicked thumbnail holds the strip's focus");
+    key(&mut e, "Down");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(2), "the keys go on from the clicked entry");
+    let mut e = outline_engine();
+    let _ = e.present_rgba();
+    // Rows 22 px from row 8: row 1 ("Child", outline index 1) at 30..52, its toggle column well left of x 40.
+    click(&mut e, (40.0, 41.0));
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(1), "the clicked outline row holds the strip's focus");
+    key(&mut e, "Down");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(2));
+}
+
+#[test]
+fn pdf4fitstatus_refit_scale2() {
+    use super::thumbs::{STRIP_BG, STRIP_W};
+    let mut e = open(400, 300);
+    key(&mut e, "F4");
+    key(&mut e, "w");
+    let sw = e.pdf.as_ref().unwrap().stack_w();
+    e.set_device_size(806, 300);
+    let want = (806.0 / (sw + STRIP_W) * 100.0).floor() as u32;
+    assert_eq!(want, 200, "the frame picked for zoom 2");
+    assert_eq!(e.zoom_pct(), want, "the resize re-fits over the stack and the scaled strip");
+    assert!(e.pdf_status().unwrap().ends_with(" \u{b7} fit-w 200%"), "{:?}", e.pdf_status());
+    let vw = e.width as f64;
+    assert_eq!(e.pdf.as_ref().unwrap().max_scroll_x(vw), 0.0, "the stack fits the lane right of the strip");
+    let f = e.present_rgba();
+    assert_eq!(px(&f, 235, 290), [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2], "the strip is 240 device px at zoom 2");
+    assert_ne!(px(&f, 245, 290), [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2], "and stops there");
 }

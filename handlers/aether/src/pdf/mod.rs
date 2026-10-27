@@ -25,7 +25,7 @@
 //!   spans of one line), the engine's own `FindState`; hits painted as glyph-bounded span sub-boxes;
 //! * the left strip: [`thumbs`] (PDF4-THUMBS SR360, PDF4-OUTLINE / PDF4-THUMBSCROLL SR374) — F4 cycles thumbnails ->
 //!   outline -> off, painted into the same frame; a wheel over it scrolls it (`pdf_wheel`); a click goes to the page;
-//! * the status line: `AetherEngine::pdf_status` ("Page p / n");
+//! * the status line: `AetherEngine::pdf_status` ("Page p / n · 100%", the zoom since PDF4-FIT-STATUS-PCT SR395);
 //! * links and form widgets: [`forms`] (PDF4ANNOTS SR343) — /URI, /GoTo and /Named links (hover: the pointer and the
 //!   status line), check boxes and text fields filled through pdf_core's `Form::set_value` + `Edit::save_update`.
 //!
@@ -144,6 +144,10 @@ pub struct PdfDocument {
     pub outline_open: Vec<bool>,
     pub strip_off: Cell<f64>,
     pub strip_cur: Cell<Option<usize>>,
+    /// PDF4-STRIPKEYS (SR389): the strip's keyboard focus (a page index, or an index into `outline`), None while the
+    /// page holds the keys; PDF4-FIT (SR389): the fit mode and the zoom percentage it last set.
+    pub strip_focus: Option<usize>,
+    pub fit: Option<(Fit, u32)>,
 }
 
 impl PdfDocument {
@@ -199,6 +203,8 @@ impl PdfDocument {
             outline_open,
             strip_off: Cell::new(0.0),
             strip_cur: Cell::new(None),
+            strip_focus: None,
+            fit: None,
         })
     }
 
@@ -335,7 +341,7 @@ impl PdfDocument {
                 }
             }
         }
-        let strip = if self.thumbs { thumbs::paint(self, &mut out, (dw, dh), zoom, scroll_y) } else { None };
+        let strip = if self.thumbs { thumbs::paint(self, &mut out, (dw, dh), zoom, scroll_y) } else { None }; thumbs::focus_paint(self, &mut out, (dw, dh), zoom, scroll_y);
         // Only the pages at this dpi on (or next to) the screen keep a pixmap, and the strip's visible thumbnails.
         let (lo, hi) = (vis.start().saturating_sub(1), vis.end() + 1);
         let (key, tkey) = (dpi_key(dpi), dpi_key(thumbs::THUMB_DPI * zoom));
@@ -515,7 +521,7 @@ impl crate::AetherEngine {
         }
         // PDF4ANNOTS (SR343): a press on a link or form widget starts no selection (its release activates it); a press
         // anywhere else blurs the focused text field.
-        let target = pdf.target_at(x, y, vw, sy);
+        pdf.strip_focus = None; let target = pdf.target_at(x, y, vw, sy);
         pdf.pressed = target;
         if target.is_some() {
             pdf.sel.drag = None;
@@ -622,9 +628,10 @@ impl crate::AetherEngine {
         self.pdf_dirty();
     }
 
-    /// The status line's page indicator ("Page p / n") while a PDF is open.
+    /// The status line's page indicator while a PDF is open: "Page p / n" and the zoom (PDF4-FIT-STATUS-PCT SR395:
+    /// ` · 125%`, ` · fit-w 87%` in a fit mode; `fit_token`).
     pub fn pdf_status(&self) -> Option<String> {
-        self.pdf.as_ref().map(|p| p.status(self.scroll_y, self.height as f64))
+        self.pdf.as_ref().map(|p| p.status(self.scroll_y, self.height as f64) + &p.fit_token(self.zoom_pct))
     }
 
     /// PDF4FORMSAVE (SR354): Ctrl/Cmd+S on a PDF stages a `BrowserSave` of the file as it stands (the filled form's
@@ -688,7 +695,9 @@ impl crate::AetherEngine {
     }
 
     /// The PDF's view keys when no field takes them: unmodified Left / Right scroll a line sideways, F4 cycles the left
-    /// strip (thumbnails, outline, off: `pdf_strip_cycle`). False without a PDF and for any other key.
+    /// strip (thumbnails, outline, off: `pdf_strip_cycle`); PDF4-STRIPKEYS (SR389): the strip's keys first
+    /// (`pdf_strip_key`), PDF4-FIT (SR389): `w` / `p` fit the width / the page (`pdf_fit`). False without a PDF and for
+    /// any other key.
     pub(crate) fn pdf_view_key(&mut self, key: &str) -> bool {
         use crate::forms::edit::{parse_key, Key};
         if self.pdf.is_none() {
@@ -696,6 +705,11 @@ impl crate::AetherEngine {
         }
         if key == "F4" {
             self.pdf_strip_cycle();
+            self.pdf_strip_refocus();
+            self.pdf_refit();
+            return true;
+        }
+        if self.pdf_strip_key(key) {
             return true;
         }
         let (m, k) = parse_key(key);
@@ -705,6 +719,14 @@ impl crate::AetherEngine {
         let dx = match k {
             Some(Key::Left) => -crate::LINE_STEP,
             Some(Key::Right) => crate::LINE_STEP,
+            Some(Key::Char('w')) => {
+                self.pdf_fit(Fit::Width);
+                return true;
+            }
+            Some(Key::Char('p')) => {
+                self.pdf_fit(Fit::Page);
+                return true;
+            }
             _ => return false,
         };
         self.handle_event(crate::api::events::Event::Scroll(dx, 0.0));
@@ -730,5 +752,81 @@ impl crate::AetherEngine {
         pdf.strip_off.set((pdf.strip_off.get() + dy * z).clamp(0.0, max));
         self.pdf_dirty();
         true
+    }
+}
+
+// =================================================================================================
+// PDF4-FIT (SR389): fit-width and fit-page through the one zoom path (`set_zoom_pct`). Both fit the whole stack (the
+// widest page; the tallest for fit-page), so the mode does not depend on the current page and persists across page
+// changes. lib.rs calls `pdf_refit` after every `Event::Resize` arm (a zoom inside the arm would re-enter it).
+// =================================================================================================
+
+/// A fit mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fit {
+    Width,
+    Page,
+}
+
+impl PdfDocument {
+    /// The zoom percentage that fits the stack to a `device` frame: the frame over the stack's width (`stack_w`) and the
+    /// open strip's (SR387: `thumbs::STRIP_W` CSS px at every zoom, so z = dw / (stack_w + STRIP_W)), and for `Fit::Page`
+    /// no more than the frame's height over the tallest page and its gaps; floored (the stack never overflows), clamped
+    /// to the zoom ladder's ends.
+    pub fn fit_pct(&self, fit: Fit, (dw, dh): (u32, u32)) -> u32 {
+        let w = dw as f64 / (self.stack_w() + if self.thumbs { thumbs::STRIP_W } else { 0.0 });
+        let z = match fit {
+            Fit::Width => w,
+            Fit::Page => w.min(dh as f64 / (self.sizes.iter().fold(0.0f64, |m, s| m.max(s.1)) * PT + 2.0 * GAP)),
+        };
+        let lv = crate::chrome::zoom::LEVELS;
+        ((z * 100.0).floor().max(0.0) as u32).clamp(lv[0], lv[lv.len() - 1])
+    }
+
+    /// The status line's zoom token at `pct` (the engine's one `zoom_pct`; PDF4-FIT-STATUS-PCT SR395): ` · 125%`, or
+    /// with the fit mode named ` · fit-w 87%` / ` · fit-p 87%`. The toolbar's `BrowserNavState.zoom_pct` is unchanged.
+    pub fn fit_token(&self, pct: u32) -> String {
+        match self.fit {
+            Some((Fit::Width, _)) => format!(" \u{b7} fit-w {pct}%"),
+            Some((Fit::Page, _)) => format!(" \u{b7} fit-p {pct}%"),
+            None => format!(" \u{b7} {pct}%"),
+        }
+    }
+}
+
+impl crate::AetherEngine {
+    /// `w` / `p` on a PDF: the fit mode is stored with its percentage, then the one zoom path applies it; fit-page also
+    /// brings the current page's top to the frame's top (the one `Event::Scroll` clamp).
+    fn pdf_fit(&mut self, fit: Fit) {
+        let (dev, vh) = (self.device, self.height as f64);
+        let Some(pdf) = self.pdf.as_mut() else { return };
+        let pct = pdf.fit_pct(fit, dev);
+        let cur = pdf.page_at(self.scroll_y + vh / 2.0);
+        pdf.fit = Some((fit, pct));
+        self.set_zoom_pct(pct);
+        if fit == Fit::Page {
+            let vw = self.width as f64;
+            let top = self.pdf.as_ref().map_or(0.0, |p| p.page_rect(cur, vw).1 - GAP);
+            self.handle_event(crate::api::events::Event::Scroll(0.0, top - self.scroll_y));
+        }
+        self.pdf_dirty();
+    }
+
+    /// After a resize (a window resize, a zoom, the strip opening or closing): a zoom that is not the fit's own (a
+    /// ladder step or reset) drops the mode; else the fit is recomputed and applied when it moved.
+    pub(crate) fn pdf_refit(&mut self) {
+        let (dev, now) = (self.device, self.zoom_pct);
+        let Some(pdf) = self.pdf.as_mut() else { return };
+        let Some((fit, pct)) = pdf.fit else { return };
+        if now != pct {
+            pdf.fit = None;
+            return self.pdf_dirty();
+        }
+        let new = pdf.fit_pct(fit, dev);
+        if new != pct {
+            pdf.fit = Some((fit, new));
+            self.set_zoom_pct(new);
+            self.pdf_dirty();
+        }
     }
 }
