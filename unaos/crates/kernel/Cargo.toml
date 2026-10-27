@@ -1000,6 +1000,11 @@ loginst = ["login"]
 # `KB_FIRSTUSER`, `[keyboot] first-user keying=deferred`); unset keys it, as KEYBOOT built it. It replaces KEYBOOT2's
 # `UNAOS_KEYBOOT_FIRSTUSER=0` option_env! (knob-parity parses only `=1`). Implies `login`. Kept in sync with arroyo and builder/src/main.rs.
 keyboot_defer = ["login"]
+# AUTOLOCK3 (rmbp-ledger B875): UNAOS_AUTOLOCK_FIXTURE=1 makes `tests autolock` read its credential from the card's staged
+# fixture file `/system/fixtures/autolock.cred` (arroyo's card builder writes it only when this knob is armed) instead of
+# a compiled literal; the wire prints the user name and the password's length only. A fixture-card knob by the loginst
+# rule: a shipping card never carries the file. Implies `login`. Kept in sync with arroyo and builder/src/main.rs.
+autolock_fixture = ["login"]
 # R77 M3 (THE TEST SUITE IS A COMMAND): run the registered desktop fixtures at registration, as before. Default OFF => they are deferred behind the `tests` shell verb. Kept in sync with arroyo and builder/src/main.rs.
 tests-at-boot = []
 # QUIETBOOT (R80, rmbp-ledger B311): `UNAOS_CENSUS=1` boots with every periodic sampler in `census.rs` ON (the old always-on SERIAL/VBJITTER/SMPLOAD/WCPAR/PTRSTUTTER/deadman/... lines). Default OFF => they stay silent until `census start <name>`. The QEMU battery verbs arm it (arroyo head `case`) so their pinned census lines stay reachable. Kept in sync with arroyo and builder/src/main.rs.

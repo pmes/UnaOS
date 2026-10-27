@@ -282,6 +282,9 @@ fi
 # keyboot_defer (KEYBOOT3, rmbp-ledger B856) is the same shape: `cfg!` picks `KB_FIRSTUSER`'s bool in fs/users.rs, no
 # gated literal, NOWITNESS; its serial line `[keyboot] first-user keying=deferred` is the certificate, read at a first
 # user's create on a build that armed UNAOS_KEYBOOT_DEFER=1.
+# autolock_fixture (AUTOLOCK3, rmbp-ledger B875): token `reason=fixture-file-absent`, the knob-on SKIP literal in tests.rs
+# `autolock_fixture_cred` (once in crates/ + libs/); cond = the leg's caller gate (`ensure_brightfloor`: wc on x86,
+# desktop_firmware on aarch64; `login` is implied by the knob). unmeasured-here: the seat's fold measures it.
 #
 # `a2dp` (A2DPENV, rmbp-ledger B752): token `usage: bt audio <aa:bb:cc:dd:ee:ff`, the refusal of the `bt audio` verb
 # arm (drivers/ehci/bthid.rs `verb`, the arm `#[cfg(feature = "a2dp")] "audio"`); it occurs exactly once in crates/ +
@@ -407,6 +410,7 @@ holocron|[hcron] /system/|-|measured(1)
 svg|more than one root element|facet,wc+desktop_firmware|measured(1)
 prefs_reset|-|no gated string literal: cfg!(feature = "prefs_reset") in video/settings.rs safe_mode_check only selects the 4-byte word knob; certify it from its serial line [prefs] display reset=1 reason=knob|unmeasured-here
 keyboot_defer|-|no gated string literal: cfg!(feature = "keyboot_defer") in fs/users.rs KB_FIRSTUSER only selects a bool; certify it from its serial line [keyboot] first-user keying=deferred (KEYBOOT3 B856)|unmeasured-here
+autolock_fixture|reason=fixture-file-absent|wc+desktop_firmware|unmeasured-here
 TABLE
 }
 

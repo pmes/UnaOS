@@ -7939,3 +7939,107 @@ fn usbsuspend_key_leg(wait: &dyn Fn(u64, &dyn Fn() -> bool) -> bool, all_up: &dy
     serial_println!("[usbsuspend] key leg woke={} swallowed={} src={} backlight_restored={}", woke as u8, swallowed as u8, src, restored as u8);
     if woke && swallowed && src == "login" && restored { "ok" } else { "fail" }
 }
+
+// AUTOLOCK3 (rmbp-ledger B875, BP-security-18, BP-security-2) — TAIL-APPENDED, so no line above moves. CHARTER: on a
+// build that armed the fixture knob (`autolock_fixture`, UNAOS_AUTOLOCK_FIXTURE=1) `tests autolock` takes its credential
+// from the card's staged fixture file (the arroyo card builder's AUTOLOCK3 step, after CARDREGISTRY, ROOTACL owning it)
+// through the mount table's one read path (BOOTLIST's), never from a compiled literal; the pair still goes to AUTOLOCK2's
+// `users::verify` guard and the one typist (`users::screen_key`). The wire carries the user name and the password's
+// LENGTH only; the RAM copy is zeroed on drop. M2: the keyed root's state (the public `unafs::root_unlocked` /
+// `root_locked`) is read before the lock and after the reopen, and PASS needs it kept — a lock never re-asks the root's key.
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+struct FixtureCred {
+    name: alloc::vec::Vec<u8>,
+    pw: alloc::vec::Vec<u8>,
+}
+
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+impl Drop for FixtureCred {
+    fn drop(&mut self) {
+        for b in self.pw.iter_mut() {
+            unsafe { core::ptr::write_volatile(b as *mut u8, 0) };
+        }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+/// The staged fixture credential: line 1 the user name (1..=NAME_MAX bytes), line 2 the password (non-empty); `\r` trimmed.
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+const AUTOLOCK_CRED_PATH: &str = "/system/fixtures/autolock.cred";
+
+/// AUTOLOCK3: read [`AUTOLOCK_CRED_PATH`] (cap 256 B) through `shell::vfs_mount_table().read`. Absent or malformed ->
+/// the AUTOLOCK SKIP line and `None` (the screen is never raised); held -> one `[lock] fixture credential` line naming
+/// the user and the password's byte count only. The read buffer is zeroed before it is freed.
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn autolock_fixture_cred() -> Option<FixtureCred> {
+    let mut raw = match crate::shell::vfs_mount_table().read(AUTOLOCK_CRED_PATH, 0, 256) {
+        Ok(b) => b,
+        Err(_) => {
+            serial_println!(":: AUTOLOCK: entered=0 leaked_keys=0 reopened=- table_same=- ms=- -> SKIP reason=fixture-file-absent path={} ::", AUTOLOCK_CRED_PATH);
+            return None;
+        }
+    };
+    let n = raw.len();
+    let cred = {
+        let mut lines = raw.split(|&b| b == b'\n').map(|l| l.strip_suffix(&b"\r"[..]).unwrap_or(l));
+        let name: &[u8] = lines.next().unwrap_or_default();
+        let pw: &[u8] = lines.next().unwrap_or_default();
+        if !name.is_empty() && name.len() <= crate::fs::users::NAME_MAX && !pw.is_empty() {
+            Some(FixtureCred { name: name.to_vec(), pw: pw.to_vec() })
+        } else {
+            None
+        }
+    };
+    for b in raw.iter_mut() {
+        unsafe { core::ptr::write_volatile(b as *mut u8, 0) };
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    drop(raw);
+    match cred {
+        Some(c) => {
+            serial_println!(
+                "[lock] fixture credential src={} user={} pw_bytes={} (the password is never printed)",
+                AUTOLOCK_CRED_PATH, core::str::from_utf8(&c.name).unwrap_or("?"), c.pw.len()
+            );
+            Some(c)
+        }
+        None => {
+            serial_println!(":: AUTOLOCK: entered=0 leaked_keys=0 reopened=- table_same=- ms=- -> SKIP reason=fixture-file-malformed path={} bytes={} ::", AUTOLOCK_CRED_PATH, n);
+            None
+        }
+    }
+}
+
+/// AUTOLOCK3 M2: 0 = unkeyed (or no native root compiled), 1 = keyed and open this boot, 2 = keyed and not open.
+/// Read-only: the KB_* words are unafs.rs's.
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn autolock_root_state() -> u8 {
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        if crate::fs::unafs::root_locked() {
+            return 2;
+        }
+        if crate::fs::unafs::root_unlocked() {
+            return 1;
+        }
+    }
+    0
+}
+
+/// AUTOLOCK3 M2: after the reopen the root's state equals `root0` and is not keyed-and-closed.
+/// `[lock] fixture root=<keyed|unkeyed|none|locked> before=<…> kept=<1|0> (the lock never re-asks the root's key)`
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn autolock_root_kept(root0: u8) -> bool {
+    fn label(s: u8) -> &'static str {
+        match s {
+            1 => "keyed",
+            2 => "locked",
+            _ if cfg!(any(target_arch = "aarch64", feature = "unafs")) => "unkeyed",
+            _ => "none",
+        }
+    }
+    let now = autolock_root_state();
+    let kept = now == root0 && now != 2;
+    serial_println!("[lock] fixture root={} before={} kept={} (the lock never re-asks the root's key)", label(now), label(root0), kept as u8);
+    kept
+}

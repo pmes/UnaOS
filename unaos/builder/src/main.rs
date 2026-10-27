@@ -832,6 +832,8 @@ fn main() {
     if std::env::var("UNAOS_LOGINST").is_ok() { feats.push("loginst"); }
     // KEYBOOT3 (rmbp-ledger B856): the first-user keying of the native root deferred. Kept in sync with arroyo's map.
     if std::env::var("UNAOS_KEYBOOT_DEFER").is_ok() { feats.push("keyboot_defer"); }
+    // AUTOLOCK3 (rmbp-ledger B875): `tests autolock` reads its credential from the card's staged fixture file. Kept in sync with arroyo's map.
+    if std::env::var("UNAOS_AUTOLOCK_FIXTURE").is_ok() { feats.push("autolock_fixture"); }
     if std::env::var("UNAOS_TESTS_AT_BOOT").is_ok() { feats.push("tests-at-boot"); }
     if std::env::var("UNAOS_CENSUS").is_ok() { feats.push("census"); } // QUIETBOOT (R80): every census sampler on at boot. Kept in sync with arroyo.
     // BT-BOND M1 / HOLOCRON SELFTESTS: UNAOS_HCRONST=1 arms the store's two BOOT-TIME-WRITE selftests
