@@ -261,3 +261,32 @@ fn m1_deblock_slice_header_reads_back_idc0() {
     let sh = ps::parse_slice_header(&mut r, h.nal_type, h.ref_idc, |_| Some(&pps), |_| Some(&sps)).unwrap();
     assert_eq!((sh.disable_deblocking, sh.alpha_offset, sh.beta_offset), (0, 0, 0));
 }
+
+/// H264ENCCABAC (LEDGER SR310): the I-frame scenes above under CABAC (Main profile) decode to the
+/// encoder's reconstruction byte for byte: smooth, flat (bit-exact to the source), textured at QP
+/// 16 / 26 / 40, the cropped 50x34 frame and the deblocked textured frame.
+#[test]
+fn cabac_every_intra_scene_decodes_to_the_reconstruction() {
+    let scenes = [("smooth", smooth(64, 48)), ("flat", flat(64, 48, [144, 144, 112])), ("textured", textured(64, 48)), ("crop", smooth(50, 34))];
+    for (name, img) in &scenes {
+        for qp in [16u8, 26, 40] {
+            for deblock in [false, true] {
+                let base = Config { width: img.w as u32, height: img.h as u32, qp, gop: 1, deblock, ..Default::default() };
+                let mut cv = Encoder::new(base).unwrap();
+                let cv_au = cv.encode(&img.yuv()).unwrap();
+                let mut enc = Encoder::new(Config { entropy: h264enc_core::Entropy::Cabac, ..base }).unwrap();
+                let au = enc.encode(&img.yuv()).unwrap();
+                let mut dec = Decoder::new();
+                let f = decode_one(&mut dec, &au);
+                assert_decode_is_recon(&f, &enc, img.w, img.h);
+                assert_eq!(enc.reconstruction(), cv.reconstruction(), "{name} qp {qp}: the entropy coder moved the reconstruction");
+                if *name == "flat" && qp == 26 && !deblock {
+                    for c in 0..3 {
+                        assert_eq!(f.planes[c], img.p[c], "cabac flat plane {c} not bit-exact");
+                    }
+                }
+                println!("cabac intra {name} qp {qp} deblock {deblock}: cavlc={} cabac={} bytes", cv_au.annexb().len(), au.annexb().len());
+            }
+        }
+    }
+}
