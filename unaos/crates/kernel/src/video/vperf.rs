@@ -135,26 +135,13 @@ fn raw_print(args: core::fmt::Arguments) {
 // (fb = host RAM; MTRRs typically zeroed); the readout that matters is the attended metal bench.
 // -------------------------------------------------------------------------------------------
 
-const IA32_MTRRCAP: u32 = 0xFE;
-const IA32_MTRR_DEF_TYPE: u32 = 0x2FF;
-const IA32_MTRR_PHYSBASE0: u32 = 0x200;
 const IA32_PAT: u32 = 0x277;
+// SCANOUTWC (rmbp-ledger B860, the seat's grant at MEASURE): the MTRR decode and the type names are ONE copy,
+// at `arch::x86_64::memory`'s tail (the ungated `[fb] aperture` line reads them too).
+use crate::arch::memory::{mem_type_name as type_name, mtrr_type_for};
 
 fn rdmsr(msr: u32) -> u64 {
     unsafe { x86_64::registers::model_specific::Msr::new(msr).read() }
-}
-
-/// Decode an architectural memory-type encoding (MTRR type field / PAT entry).
-fn type_name(t: u8) -> &'static str {
-    match t {
-        0 => "UC",
-        1 => "WC",
-        4 => "WT",
-        5 => "WP",
-        6 => "WB",
-        7 => "UC-", // valid only as a PAT entry
-        _ => "??",
-    }
 }
 
 /// Walk the live CR3 tables (identity map, physical_memory_offset == 0) and return the LEAF
@@ -190,45 +177,6 @@ fn walk_leaf(va: u64) -> Option<(u64, u8)> {
             return None;
         }
         Some((pte, 1))
-    }
-}
-
-/// The MTRR memory type covering physical address `pa`, or a note when MTRRs are absent/disabled.
-/// Returns (type, "how"): variable-range hit, default type, or disabled=UC.
-fn mtrr_type_for(pa: u64) -> (u8, &'static str) {
-    let def = rdmsr(IA32_MTRR_DEF_TYPE);
-    if def & (1 << 11) == 0 {
-        return (0, "disabled"); // MTRRs disabled => all UC
-    }
-    let vcnt = (rdmsr(IA32_MTRRCAP) & 0xFF) as u32;
-    // Overlap resolution (SDM: UC wins; WT beats WB). Track the strongest match.
-    let mut hit: Option<u8> = None;
-    for i in 0..vcnt {
-        let base = rdmsr(IA32_MTRR_PHYSBASE0 + 2 * i);
-        let mask = rdmsr(IA32_MTRR_PHYSBASE0 + 2 * i + 1);
-        if mask & (1 << 11) == 0 {
-            continue; // range not valid
-        }
-        let m = mask & 0x000F_FFFF_FFFF_F000;
-        if (pa & m) == (base & m) {
-            let t = (base & 0xFF) as u8;
-            hit = Some(match hit {
-                None => t,
-                Some(prev) => {
-                    if prev == 0 || t == 0 {
-                        0 // UC dominates
-                    } else if prev == 4 || t == 4 {
-                        4 // WT beats WB in overlaps
-                    } else {
-                        t
-                    }
-                }
-            });
-        }
-    }
-    match hit {
-        Some(t) => (t, "var-range"),
-        None => (((def & 0xFF) as u8), "default"),
     }
 }
 

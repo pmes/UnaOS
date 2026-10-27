@@ -784,5 +784,5 @@ refs/heads/exec-rmbp-keyboot3   2879aed46 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-a11yfilter   e38b0b2cd FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-shellface   b52c38a47 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zoomflush   2879aed46 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-scanoutwc   2879aed46 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-scanoutwc   8f7963e9d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-unafswrite2   2879aed46 IN-FLIGHT cut 2026-10-27

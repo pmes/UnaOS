@@ -223,10 +223,10 @@ mod glass {
         if p == 0 { None } else { Some(strip::unpack_rect(p)) }
     }
 
-    /// The grid face's cell and the panel's inner pad: `(cw, ch, pad)` — what [`render`] lays out with and the bands
+    /// The FIXED body cell (HUDSCALE B860: `text::Face::Body`, `font::CELL_W` x `font::CELL_H` device px at every scale) and the panel's inner pad: `(cw, ch, pad)` — what [`render`] lays out with and the bands
     /// are cut by.
     fn geom() -> (usize, usize, usize) {
-        let face = text::Face::Grid;
+        let face = text::Face::Body; // HUDSCALE (B860): the unscaled body cell, not the dpi-scaled Grid — a diagnostic overlay, its text stays small at 2.0 (BP-video-27)
         (face.cell_w(), face.cell_h(), strip::PAD() / 2 + 1)
     }
 
@@ -308,7 +308,7 @@ mod glass {
                 c.fw = fw;
                 (px, nf, full_paint) = (w * h, FIELDS, true);
             }
-        } else {
+        } else { let (sy0, sy1) = band_rows(&c.dirty); let sh = strip::span_hold(r.1 + sy0, r.1 + sy1, ph); // BEAMSPLIT (B860): ONE beam hold over the dirty bands' rows (`band_rows`, module tail; `strip::span_hold`). ⚠ LINE-NEUTRAL fold, code first.
             for k in 0..FIELDS {
                 let Some((bx, by, bw, bh)) = c.dirty[k] else { continue };
                 let img = &c.px;
@@ -321,7 +321,7 @@ mod glass {
                     px += bw * bh;
                     nf += 1;
                 }
-            }
+            } strip::span_settle(sh); // BEAMSPLIT (B860): the span bracket closed after the last band. ⚠ LINE-NEUTRAL fold, code first.
         }
         if nf == 0 {
             return owed;
@@ -458,7 +458,7 @@ mod glass {
     /// Render the panel for `s` into a fresh image: `surface.overlay` (elev.2), a `line.subtle` hairline, the mono
     /// grid face, `text.primary` (`ink.warning` past budget). `None` = no memory for it (the old image stays).
     fn render(s: &Snap) -> Option<(Vec<u32>, usize, usize, usize)> {
-        let face = text::Face::Grid;
+        let face = text::Face::Body; // HUDSCALE (B860): the same fixed cell `geom` lays out on
         let (cw, ch, pad) = geom();
         let (w, h) = (COLS * cw + 2 * pad, FIELDS * ch + 2 * pad);
         let ls = lines(s);
@@ -702,10 +702,20 @@ mod glass {
         let under = paint_us <= PAINT_BUDGET_US;
         let ok = painted && steady && hits == 3 && fields == FIELDS && vis == 1 && under;
         serial_println!(
-            ":: PERFHUD: visible={} paint_us={} fields={} -> {} :: pixels={}/3 budget_us={} under={} fields_dirty={} px={} full_us={} full_px={} scale={} rect={}x{}+{}+{} max_paint_us={}",
+            ":: PERFHUD: visible={} paint_us={} fields={} -> {} :: pixels={}/3 budget_us={} under={} fields_dirty={} px={} full_us={} full_px={} scale={} rect={}x{}+{}+{} max_paint_us={} hud_paint_us={} cell={}x{} src=fixed ap={}",
             vis, paint_us, fields, if ok { "PASS" } else { "FAIL" }, hits, PAINT_BUDGET_US, under as u8, nf, px,
             FULL_US.load(Relaxed), FULL_PX.load(Relaxed), super::super::dpi::scale_str(super::super::dpi::s2()), w, h, x, y,
-            MAX_PAINT_US.load(Relaxed)
+            MAX_PAINT_US.load(Relaxed), FULL_US.load(Relaxed), cw, ch, crate::arch::memory::aperture_pat().map_or("-", crate::arch::memory::mem_type_name)
         );
+    }
+    /// BEAMSPLIT (B860): the image-local rows `[top, bottom)` the dirty field bands span (`(0, 0)` = none dirty) —
+    /// the one `strip::span_hold` bracket the band loop in [`compose`] paints inside.
+    fn band_rows(dirty: &[Option<strip::Rect>; FIELDS]) -> (usize, usize) {
+        let (mut y0, mut y1) = (usize::MAX, 0usize);
+        for &(_, by, _, bh) in dirty.iter().flatten() {
+            y0 = y0.min(by);
+            y1 = y1.max(by + bh);
+        }
+        if y1 == 0 { (0, 0) } else { (y0, y1) }
     }
 }

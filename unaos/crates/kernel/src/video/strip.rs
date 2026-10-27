@@ -412,7 +412,7 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
     // present can outrun the beam where a window's staged blit cannot. See [`bar_painted`].
     // BEAM (orin 26) — hold clear of the beam BEFORE the present clock opens (the wait is the
     // hold's, not the paint's), publish inside the bracket, release after the clean below.
-    let hb = super::beam::hold(y, y + h, info.height, false, true);
+    let hb = band_hold(y, y + h, info.height); // BEAMSPLIT (B860): `beam::hold(.., false, true)` as before, skipped only while a span bracket is open on THIS core (`band_hold`, file tail). ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
     let tp0 = crate::arch::now_cycles();
     let stride_b = info.stride * 4;
     for j in 0..h {
@@ -2121,3 +2121,66 @@ fn zoom_note(name: &str, r: Rect) {
     };
     super::zoom::note_drawn(y, h, src);
 }
+
+// BEAMSPLIT (rmbp-ledger B860; BP-video-27) — ONE beam hold over a pass's dirty bands. TAIL-APPENDED body of one
+// LINE-NEUTRAL fold ([`paint`]'s hold line). A painter that repaints several bands of one tenant in one pass (the HUD's
+// field bands, `perfhud::glass::compose`) opens [`span_hold`] over the rows from the first band's top to the last band's
+// bottom, paints each band through [`paint`] unchanged, and closes it with [`span_settle`]. While the span is open on
+// the presenting core, [`paint`]'s own per-band hold is skipped THERE only (`SPAN_CPU` = core + 1); a paint on any other
+// core takes its own hold as before. The span holds with `record = false` and drops its observation, so no stranger's
+// verdict is parked in `beam`'s per-core slot; the bands' `bar_painted` then reads `blind` (HUDBEAMOBS owed). Knob-off
+// (`beam` off) the three are `#[inline(always)]` twins of what was there — `beam::hold`'s constant `None` — so the call
+// sites fold exactly as `beam`'s own twins do (`./arroyo knoboff beam`).
+
+/// The core (+ 1) whose span bracket is open; 0 = none.
+#[cfg(feature = "beam")]
+static SPAN_CPU: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// [`paint`]'s hold: none while this core's span bracket is open, else the staged present's hold, recorded.
+#[cfg(feature = "beam")]
+fn band_hold(y0: usize, y1: usize, panel_h: usize) -> Option<super::beam::Hold> {
+    if SPAN_CPU.load(Ordering::Acquire) == crate::arch::sched::meter_current_cpu() + 1 {
+        return None;
+    }
+    super::beam::hold(y0, y1, panel_h, false, true)
+}
+
+/// Off-knob [`band_hold`]: exactly the hold [`paint`] took before (a constant `None` off-knob).
+#[cfg(not(feature = "beam"))]
+#[inline(always)]
+fn band_hold(y0: usize, y1: usize, panel_h: usize) -> Option<super::beam::Hold> {
+    super::beam::hold(y0, y1, panel_h, false, true)
+}
+
+/// Open ONE beam bracket over panel rows `[y0, y1)` for the bands painted inside it (unrecorded); [`paint`] on this
+/// core skips its own hold until [`span_settle`]. `None` = no beam source (or no rows): nothing waited, nothing skipped.
+#[cfg(feature = "beam")]
+pub fn span_hold(y0: usize, y1: usize, panel_h: usize) -> Option<super::beam::Hold> {
+    let h = super::beam::hold(y0, y1, panel_h, false, false);
+    if h.is_some() {
+        SPAN_CPU.store(crate::arch::sched::meter_current_cpu() + 1, Ordering::Release);
+    }
+    h
+}
+
+/// Close the bracket [`span_hold`] opened (its observation is dropped: `record = false`).
+#[cfg(feature = "beam")]
+pub fn span_settle(h: Option<super::beam::Hold>) {
+    let open = h.is_some();
+    let _ = super::beam::settle(h);
+    if open {
+        SPAN_CPU.store(0, Ordering::Release);
+    }
+}
+
+/// Off-knob [`span_hold`]: no beam source exists, so no bracket does.
+#[cfg(not(feature = "beam"))]
+#[inline(always)]
+pub fn span_hold(_y0: usize, _y1: usize, _panel_h: usize) -> Option<super::beam::Hold> {
+    None
+}
+
+/// Off-knob [`span_settle`]: nothing to close.
+#[cfg(not(feature = "beam"))]
+#[inline(always)]
+pub fn span_settle(_h: Option<super::beam::Hold>) {}
