@@ -1082,4 +1082,4 @@ refs/heads/exec-rmbp-gen7sheet   cd26b9213 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-preemptoffarm   cd26b9213 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-wifileave   cd26b9213 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpcopy   cd26b9213 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-loginfurnitureonce   cd26b9213 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-loginfurnitureonce   eee01749e FOLDED-BY-HAND (this commit) 2026-10-27

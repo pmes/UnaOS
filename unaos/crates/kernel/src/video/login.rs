@@ -151,7 +151,7 @@ static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// SAFETY: written only from `repaint` on the thread that owns keys (the route that called
 /// `consume_key`, or the ignition that called `open_once`), read by `wm`'s composite — the same benign
 /// present-tear every app surface shares (instgui's contract).
-fn surf() -> &'static mut [u32] { super::super::metrics::leaked_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(H())) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
+fn surf() -> &'static mut [u32] { super::super::metrics::login_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(H())) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -3902,7 +3902,7 @@ fn cap_h() -> usize {
 fn seat_open() {
     let cap = cap_h();
     CARD_CAP.store(cap, Ordering::Relaxed); CARD_S2.store(crate::video::dpi::s2(), Ordering::Relaxed);
-    let _ = super::super::metrics::leaked_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(cap));
+    let _ = super::super::metrics::login_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(cap));
 }
 
 /// The restyle hook's re-seat: when a row is up and the card's `h_at` moved within its capacity, lay out and paint at

@@ -536,7 +536,7 @@ pub fn memline_selftest() {
         serial_println!(":: MEMLINE: -> SKIP :: reason=no-desktop-built");
         return;
     }
-    let src = if builds0 >= 2 {
+    let src = if builds0 >= 2 { if memline_logout_refused(builds0) { return; }
         "logout"
     } else {
         if !settled() {
@@ -605,7 +605,7 @@ mod memcensus {
     const BEFORE: usize = 1;
     const AFTER: usize = 2;
     /// The count-once set (census tag names).
-    const ONCE: [&str; 6] = ["stage", "shadow", "wallpaper", "help", "gen7-held", "slot-record"]; // SLOTRECTAG (B1030): the slot record joins the count-once set
+    const ONCE: [&str; 7] = ["stage", "shadow", "wallpaper", "help", "gen7-held", "slot-record", "login-surface"]; // SLOTRECTAG (B1030): the slot record joins the count-once set. LOGINFURNITUREONCE (B1041): the login furniture's grow-once surface joins it
     /// FIRST, BEFORE, AFTER. Each snapshot is taken (heap lock) before this lock: the two never nest.
     static SNAPS: crate::sync::Mutex<[Option<Snapshot>; 3]> = crate::sync::Mutex::new([None; 3]);
     /// MEMLINE-LOGOUT (B1032): BEFORE was taken at the Log Out's first line ([`logout_first`]); the logout's own
@@ -619,7 +619,7 @@ mod memcensus {
         if g[FIRST].is_none() {
             g[FIRST] = Some(s);
         } else {
-            g[AFTER] = Some(s);
+            g[AFTER] = Some(s); super::MEM_BEFORE_NEWER.store(false, core::sync::atomic::Ordering::Release);
         }
     }
 
@@ -629,7 +629,7 @@ mod memcensus {
             return;
         }
         let s = census::snapshot();
-        SNAPS.lock()[BEFORE] = Some(s);
+        SNAPS.lock()[BEFORE] = Some(s); super::MEM_BEFORE_NEWER.store(true, core::sync::atomic::Ordering::Release);
     }
 
     // MEMLINEREBUILD (rmbp-ledger B1009, BP-video-18). Flight 38 boot 1: `logout_delta_pct=29 -> FAIL :: src=rebuild`
@@ -684,7 +684,7 @@ mod memcensus {
         if top.is_empty() {
             top.push('-');
         }
-        serial_println!("[memline] top {} once_kb={} once=stage,shadow,wallpaper,help,gen7-held,slot-record raw_delta_pct={}", top, once / 1024, raw);
+        serial_println!("[memline] top {} once_kb={} once=stage,shadow,wallpaper,help,gen7-held,slot-record,login-surface raw_delta_pct={}", top, once / 1024, raw);
         let retained = b.used.saturating_sub(f.used); // MEMLINEREBUILD (B1009): the session's growth before the teardown
         let leaked = a.used as i64 - b.used as i64;
         let scored = if snaps[BEFORE].is_some() { net_high(&b, &a, retained, high) } else { high.saturating_sub(once) }; // MEMLINE-LOGOUT (B1032): both arms
@@ -703,7 +703,7 @@ mod memcensus {
     pub(super) fn logout_first() {
         let s = census::snapshot();
         SNAPS.lock()[BEFORE] = Some(s);
-        LOGOUT_BEFORE.store(true, core::sync::atomic::Ordering::Release);
+        LOGOUT_BEFORE.store(true, core::sync::atomic::Ordering::Release); super::MEM_BEFORE_NEWER.store(true, core::sync::atomic::Ordering::Release);
     }
 }
 
@@ -712,4 +712,32 @@ mod memcensus {
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub fn logout_census() {
     memcensus::logout_first();
+}
+
+// LOGINFURNITUREONCE (rmbp-ledger B1041, BP-video-18) — MEMLINE-LOGGEDOUT. `tests memline`'s logout arm (builds >= 2)
+// scored whatever FIRST/BEFORE/AFTER held: run while logged out, BEFORE (the newest Log Out's first line) is NEWER
+// than AFTER (the previous login's build) and the pair is not a round trip. [`MEM_BEFORE_NEWER`] is set where
+// memcensus writes BEFORE (`before`, `logout_first`) and cleared where it writes AFTER (`at_build`); the arm now takes
+// B1009's guard by name ([`settled`]) and refuses as a named SKIP, never a FAIL:
+// `:: MEMLINE: -> SKIP :: src=logout why=<logged-out|build-in-flight> builds=<n>`.
+/// BEFORE was taken after the last AFTER (x86 `wc`: memcensus's three snapshots).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static MEM_BEFORE_NEWER: AtomicBool = AtomicBool::new(false);
+
+/// The logout arm's guard: `true` = refused (the SKIP line said). Logged out = torn down with nothing owed.
+fn memline_logout_refused(builds0: u32) -> bool {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let newer = MEM_BEFORE_NEWER.load(Acquire);
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    let newer = false;
+    let down = !BUILT.load(Acquire) && OWED_AT.load(Acquire) == 0;
+    let why = if down {
+        "logged-out"
+    } else if newer || !settled() {
+        "build-in-flight"
+    } else {
+        return false;
+    };
+    serial_println!(":: MEMLINE: -> SKIP :: src=logout why={} builds={}", why, builds0);
+    true
 }
