@@ -232,8 +232,13 @@ pub mod census {
     /// FIXTURERETAIN (B1017): the GEN7 pages held for the boot by design (GEN7TLB, gen7.md §2.6: r11's HELD, r8's
     /// `reclaim=held` surfaces, gen7blit's sp/dp), named by [`retag`] at each hold site; desktopbuild counts it once.
     pub const GEN7_HELD: u8 = 8;
+    /// WINDOWSURFTAG (B1030): a window's surface, renamed at `wm::create_inner` / `wm::shell_remint` by [`retag_tracked`]
+    /// (the block the owner allocated; one static name, the row's sum and block count carry the windows).
+    pub const WINDOW_SURFACE: u8 = 9;
+    /// SLOTRECTAG (B1030): the WINDOWCAP3 slot record (`memory::slot_rec_ensure`), never freed: desktopbuild counts it once.
+    pub const SLOT_RECORD: u8 = 10;
     /// Tag -> its census name (0 = no tag).
-    pub const NAMES: [&str; 9] = ["-", "stage", "shadow", "wallpaper", "help", "wallpaper-retired", "appres-pix", "text-resident", "gen7-held"];
+    pub const NAMES: [&str; 11] = ["-", "stage", "shadow", "wallpaper", "help", "wallpaper-retired", "appres-pix", "text-resident", "gen7-held", "window-surface", "slot-record"];
     /// An untagged block this large is tracked under its task's name.
     pub const BIG: usize = 64 * 1024;
     /// Owner rows a [`Snapshot`] carries (the last one becomes `other` on overflow).
@@ -541,6 +546,37 @@ pub mod census {
             insert(addr, size, NAMES[tag as usize], true);
             drop(heap);
         });
+    }
+
+    /// WINDOWSURFTAG (B1030) — [`retag`]'s RENAME-ONLY form: name the block STARTING at `addr` `NAMES[tag]` only when the
+    /// census already tracks it (the entry keeps its own size); anything else — a static, an interior pointer (a ring-3
+    /// window's surface inside its slot record), an untracked small block — is left alone, so a seam that sees every
+    /// window's `surf` inserts no phantom entry. `true` = renamed. Inert while unarmed. Takes the heap lock itself: never
+    /// call it from an allocation.
+    pub fn retag_tracked(addr: usize, tag: u8) -> bool {
+        if !ON.load(Acquire) || addr == 0 || tag == 0 || tag as usize >= NAMES.len() {
+            return false;
+        }
+        let name = NAMES[tag as usize];
+        crate::arch::without_interrupts(|| {
+            let heap = super::ALLOCATOR.lock();
+            // SAFETY: the heap lock is held (`heap`), the table's contract.
+            let e = unsafe { &mut *TABLE.e.get() };
+            let mut i = home(addr);
+            let mut hit = false;
+            while e[i].addr != 0 {
+                if e[i].addr == addr {
+                    e[i].nptr = name.as_ptr() as usize;
+                    e[i].nlen = name.len();
+                    e[i].tagged = true;
+                    hit = true;
+                    break;
+                }
+                i = (i + 1) & (CAP - 1);
+            }
+            drop(heap);
+            hit
+        })
     }
 
     // FIXTURERETAIN (rmbp-ledger B1017, BP-cores-22) — PER-FIXTURE ATTRIBUTION. Flight 38's census charged +18387 KiB
