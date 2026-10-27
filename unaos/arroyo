@@ -141,6 +141,29 @@ KERNEL_FP_RUSTFLAGS="-C panic=abort -C force-frame-pointers=yes"
 # path at all. `UNAOS_FBW=1920 UNAOS_FBH=1200 ./arroyo kernel8-test` reproduces bench geometry, and is the
 # configuration the WC-D `[wc-d] verify` verdict was cleared in. NOTE these change compiled-in behaviour:
 # a build made with them is NOT the flashable default image.
+# ZOOMPANEL (rmbp-ledger B842): the same two knobs reach x86. The UEFI loader (crates/bootloader `mod panelknob`) picks
+# the knob's size when the firmware offers it (else today's rule), and here an x86 QEMU run arms the default VGA at
+# that size through UNAOS_QEMU_EXTRA (the builder appends it): `xres`/`yres`, `edid=on` (OVMF offers the EDID's
+# preferred mode) and `vgamem_mb` large enough for one frame. UNAOS_PPI=<n> (option_env! in video/dpi.rs `mod
+# panelknob`) is the effective ppi the scale is taken from (QEMU's EDID claims ~100 ppi). The panel leg:
+# `UNAOS_FBW=2880 UNAOS_FBH=1800 UNAOS_PPI=221 UNAOS_WC=1 UNAOS_FACET=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1
+# ./arroyo test 240`, replayed against scripts/specs/x86-panel.spec (X86_PANEL_SPEC). The aarch64 verbs are skipped.
+if [ -n "${UNAOS_FBW:-}" ] && [ -n "${UNAOS_FBH:-}" ]; then
+    case "${UNAOS_FBW}${UNAOS_FBH}" in
+        *[!0-9]*) echo "✖ UNAOS_FBW='${UNAOS_FBW}' UNAOS_FBH='${UNAOS_FBH}': the panel knobs are decimal pixels"; exit 1 ;;
+    esac
+    case "${1:-}" in
+        arm|test-arm|test-aarch64|test-pi|kernel8*|esp-arm|esp-jetson*) ;;
+        *)
+            _panel_need=$(( (UNAOS_FBW * UNAOS_FBH * 4 + 1048575) / 1048576 )); _panel_mb=16
+            while [ "$_panel_mb" -lt "$_panel_need" ]; do _panel_mb=$((_panel_mb * 2)); done
+            case " ${UNAOS_QEMU_EXTRA:-} " in
+                *" VGA.xres="*) ;;
+                *) export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -global VGA.xres=${UNAOS_FBW} -global VGA.yres=${UNAOS_FBH} -global VGA.edid=on -global VGA.vgamem_mb=${_panel_mb}"
+                   echo "⚡ panel knob: ${UNAOS_FBW}x${UNAOS_FBH} (VGA xres/yres/edid, vgamem ${_panel_mb} MB) ppi=${UNAOS_PPI:-edid}" ;;
+            esac ;;
+    esac
+fi
 #
 # RTCCLOCK (R75) / CLOCKPAINTERS (B719): the display-offset build knob is RETIRED. The CMOS RTC is read and anchored
 # as UTC; the zone is Principia's `system.locale.tz` (Settings > Date & Time), applied when a second is printed
@@ -5502,6 +5525,7 @@ X86_PTR_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-ptr.spec"
 X86_SPLASH_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-splash.spec"
 X86_USBNET_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-usbnet.spec"
 X86_WC_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-wc.spec"         # WCLANE (B156): the compositor leg, UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1   # USBNET (SO56): the dongle-only leg, UNAOS_USBNET=1 UNAOS_NOE1000=1
+X86_PANEL_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-panel.spec"   # ZOOMPANEL (B842): the WC leg at the rMBP panel, UNAOS_FBW=2880 UNAOS_FBH=1800 UNAOS_PPI=221 + UNAOS_WC/FACET
 X86_REPLAY_SPEC=""   # path of the spec to replay, or "" when none describes this capture
 X86_REPLAY_WHY=""    # why there is none — printed verbatim in the skip line
 x86_pick_capture_spec() {
@@ -5581,6 +5605,17 @@ x86_pick_capture_spec() {
     # about the fixture rather than about the kernel. Refused out loud, with the knob named.
     if [ -n "${UNAOS_INSTALLDEMO:-}" ] || [ -n "${UNAOS_PART_DISK:-}" ] || [ -n "${UNAOS_NOSTORAGE:-}" ]; then
         X86_REPLAY_WHY="a medium knob replaced the usb-storage backing (UNAOS_INSTALLDEMO='${UNAOS_INSTALLDEMO:-}' UNAOS_PART_DISK='${UNAOS_PART_DISK:-}' UNAOS_NOSTORAGE='${UNAOS_NOSTORAGE:-}') — the x86 specs' storage pins describe the DEFAULT stick, and asserting them against a disk QEMU did not attach would be a red about the fixture, not about the kernel."
+        return 0
+    fi
+    # ZOOMPANEL (rmbp-ledger B842): the panel knobs put this capture at the rMBP's geometry (VGA xres/yres, the loader's
+    # pick, UNAOS_PPI's scale), so the metal-shaped fixtures (zoom, perfhud, textscale, shimmeridle, veilcost) are scored
+    # by x86-panel.spec there. Asked BEFORE the WC lane: its pins describe the 1280x800 panel.
+    if [ -n "${UNAOS_FBW:-}" ] || [ -n "${UNAOS_FBH:-}" ]; then
+        if [ -n "${UNAOS_FBW:-}" ] && [ -n "${UNAOS_FBH:-}" ] && [ -n "${UNAOS_PPI:-}" ] && [ -n "${UNAOS_WC:-}" ] && [ -n "${UNAOS_FACET:-}" ]; then
+            X86_REPLAY_SPEC="$X86_PANEL_SPEC"
+        else
+            X86_REPLAY_WHY="the panel knobs are armed (UNAOS_FBW='${UNAOS_FBW:-}' UNAOS_FBH='${UNAOS_FBH:-}' UNAOS_PPI='${UNAOS_PPI:-}') but x86-panel.spec was written for UNAOS_FBW+UNAOS_FBH+UNAOS_PPI with UNAOS_WC=1 UNAOS_FACET=1 (zoom/perfhud/shimmeridle/veilcost compile under them); no other spec describes this panel."
+        fi
         return 0
     fi
     # WCLANE (QUEUE.md §5 MENUFIRST finding, rmbp-ledger B156, 2026-09-22: "x86-wc.spec IS NOT IN THE HARNESS'S

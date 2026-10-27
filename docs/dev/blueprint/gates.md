@@ -59,7 +59,7 @@
 | locktype (SR188) | `unaos/scripts/lock-type.py` (imports `tools/neutral-check.py`'s lexer) | BP-cores-20: no raw `spin::Mutex`/`MutexGuard`/`spin::mutex::*`/`spin::RwLock*` in the code of `unaos/crates/kernel/src`, save sync.rs's six allow rows (the registry's inner lock, exact path+line, shrink-only); `spin::Once` and `spin::Spin` pass |
 
 ## 4. Verbs (`unaos/arroyo` tail `case`)
-`check` · `state` · `gates [--list|--selftest]` · `test` / `test-arm` / `test-fat` / `test-install` / `test-ptr` / `test-splash` / `test-selfhost` (QEMU) · `x86` / `arm` (QEMU GUI) ·
+`check` · `state` · `gates [--list|--selftest]` · `test` (at `UNAOS_FBW`/`UNAOS_FBH`/`UNAOS_PPI` with `UNAOS_WC`+`UNAOS_FACET` it replays `unaos/scripts/specs/x86-panel.spec`, ZOOMPANEL B842) / `test-arm` / `test-fat` / `test-install` / `test-ptr` / `test-splash` / `test-selfhost` (QEMU) · `x86` / `arm` (QEMU GUI) ·
 `esp-x86` (stages `unaos/fixtures/TESTS.LIST` + `TESTS.HEAVY` onto the ESP when present, the media verb only — BOOTLIST B817, `unaos/arroyo:14559`) / `esp-arm` / `esp-jetson` / `esp-jetson-img` (media) · `kernel8` / `kernel8-run` / `kernel8-test` / `kernel8-install` (Pi) · `foldleg` · `twoboot` · `knoboff` · `bootleg` · `battery` · `mbench` · `jobs-image` · `vm-image` · `fat-img` · `selfup-pak` · `clean`.
 
 ## 5. Ruled, unbuilt / open
