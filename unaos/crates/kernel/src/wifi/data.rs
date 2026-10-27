@@ -373,7 +373,7 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
         checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
             && crate::smolnet::lease_of(&bad).is_none()));
     }
-    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); active_rows(&mut checks); bg_rows(&mut checks); sweep_rows(&mut checks); band_rows(&mut checks); rate5g_rows(&mut checks); pmu_rows(&mut checks); let mut pass = 0u8; // STATIONROAM-PMU (B967): `pmu` after `rate5g`; STATIONROAM-5G (B962): `band`, `rate5g` after `country`; STATIONROAM-SWEEP (B958): `lostplan`, `country` after `bggate`; STATIONROAM-BGSCAN (B955): `bgplan`, `bggate` after `idleuni`; STATIONROAM-ACTIVE (B951): `probe`, `idleuni` after `idlegate`; STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
+    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); active_rows(&mut checks); bg_rows(&mut checks); sweep_rows(&mut checks); band_rows(&mut checks); rate5g_rows(&mut checks); pmu_rows(&mut checks); window_rows(&mut checks); let mut pass = 0u8; // WINDOW-AUDIT (B970): `window` after `pmu`; STATIONROAM-PMU (B967): `pmu` after `rate5g`; STATIONROAM-5G (B962): `band`, `rate5g` after `country`; STATIONROAM-SWEEP (B958): `lostplan`, `country` after `bggate`; STATIONROAM-BGSCAN (B955): `bgplan`, `bggate` after `idleuni`; STATIONROAM-ACTIVE (B951): `probe`, `idleuni` after `idlegate`; STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
     let mut first = None;
     for (name, ok) in checks.iter() {
         if *ok {
@@ -1510,4 +1510,13 @@ fn rate5g_rows(checks: &mut Vec<(&'static str, bool)>) {
 /// and every window move paired [ChipCommon, d11] with nothing read or written off-core.
 fn pmu_rows(checks: &mut Vec<(&'static str, bool)>) {
     checks.push(("pmu", super::bringup::pmu_kat()));
+}
+
+// ── WINDOW-AUDIT (rmbp-ledger B970): the window helpers' KAT row ─────────────────────────────────────────────────────────────────
+
+/// `kat`'s row after B967's (WINDOW-AUDIT rmbp-ledger B970). `window`: `bringup/window.rs` `kat` over a mock selector — the wifi2
+/// ladder's chain (`move_to` ChipCommon, the EROM page, the d11) closed by ONE `restore` to the d11 pre-image, a refused move that
+/// writes nothing back and reaches no MMIO, `with_core` refused and ok as the pair [ChipCommon, d11], a restore that does not read back.
+fn window_rows(checks: &mut Vec<(&'static str, bool)>) {
+    checks.push(("window", super::bringup::window_kat()));
 }
