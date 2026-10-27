@@ -1075,10 +1075,10 @@ fn site_n(line: u32) -> u32 {
 // `sched::current_name` makes). The note runs right AFTER the attempt's unmask (`with_unafs`'s `note_attempt`), so a re-home in
 // that instant names the new core (benign, said). The ONE `Display` prints `@c<n>` after the site, so the `[lag] stall`,
 // `[filetypes] built` and `[login] submit` lines carry it with no edit of their own. The HIDSTALL verdict (at its 25-field cap)
-// prints [`MaskedBy::three`] (HIDSTALL-25 owed); clockcore's two writers keep [`MaskWho::note`] (no core: CLOCKCORE-MASKCORE owed).
+// prints [`MaskedBy::three`] (HIDSTALL-25 owed); clockcore's two writers pass their core too (CLOCKCOREMASKCORE B1046).
 
 impl MaskWho {
-    /// The max this record names was just won by `name` at `site`, core unknown (clockcore's `mask_exit` / `isr_tick`).
+    /// The max this record names was just won by `name` at `site`, core unknown (no caller since CLOCKCOREMASKCORE B1046).
     pub fn note(&self, name: Option<&'static str>, site: &'static core::panic::Location<'static>) {
         self.note_at(name, site, usize::MAX)
     }
