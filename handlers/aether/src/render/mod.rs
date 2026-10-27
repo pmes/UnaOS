@@ -3033,20 +3033,27 @@ fn frame_walk(
                         let select_label = (tag == "select")
                             .then(|| crate::layout::select_selected_option(dom_node).map(|(_, l)| l))
                             .flatten();
+                        // AETHERSUBMITCAPTION (SR410): a push button paints its label (forms::button_label: the
+                        // value attribute, else "Submit" / "Reset"); it has no dirty value and no placeholder.
+                        let push_label = is_push_button.then(|| crate::forms::button_label(dom_node));
                         let attrs = el.attributes.borrow();
                         // A <select> paints the SELECTED OPTION'S TEXT, not
                         // its submit value: layout publishes the visible label
                         // as data-aether-label, so "English" shows where the
                         // value attribute would only say "en".
-                        let shown = select_label
-                            .as_deref()
-                            .filter(|v| !v.is_empty())
-                            .or_else(|| dirty.as_deref())
-                            .or_else(|| attrs.get("value"))
-                            .filter(|v| !v.is_empty());
+                        let shown = if let Some(l) = push_label.as_deref() {
+                            Some(l).filter(|v| !v.is_empty())
+                        } else {
+                            select_label
+                                .as_deref()
+                                .filter(|v| !v.is_empty())
+                                .or_else(|| dirty.as_deref())
+                                .or_else(|| attrs.get("value"))
+                                .filter(|v| !v.is_empty())
+                        };
                         let is_placeholder = shown.is_none();
                         let password = attrs.get("type").is_some_and(|t| t.trim().eq_ignore_ascii_case("password"));
-                        let mut value = shown.or_else(|| attrs.get("placeholder")).unwrap_or("").to_string();
+                        let mut value = shown.or_else(|| attrs.get("placeholder").filter(|_| !is_push_button)).unwrap_or("").to_string();
                         if password && !is_placeholder {
                             value = "\u{2022}".repeat(value.chars().count());
                         }
@@ -3066,11 +3073,13 @@ fn frame_walk(
                             // edit surface: its text starts at the top.
                             let single_line = tag != "textarea" && content_h > 0.0;
                             let lh = crate::fonts::line_height(font, fs, 0.0);
-                            let (tx, ty, max_w) = if is_push_button && text_w <= content_w {
+                            // AETHERSUBMITCAPTION (SR410): a push button's caption is ALWAYS centred (Chromium centres
+                            // an overflowing label) and clipped to its padding box (html.css `input { overflow: clip }`).
+                            let (tx, ty, max_w) = if is_push_button {
                                 (
                                     content_x + (content_w - text_w) / 2.0,
                                     centered_line_origin_y(font, fs, content_y + content_h / 2.0),
-                                    content_w.max(1.0),
+                                    if text_w <= content_w { content_w.max(1.0) } else { f32::MAX }, // one line, never wrapped
                                 )
                             } else {
                                 // The value's line box is centred in the
@@ -3111,6 +3120,16 @@ fn frame_walk(
                                     fill_rect(cx, ty, cx + 1.0, ty + lh, color, 255, surface, width, height, damage_rects, clip);
                                 }
                             } else {
+                                let caption_clip = if is_push_button {
+                                    (
+                                        clip.0.max(box_sx + bord.left),
+                                        clip.1.max(box_sy + bord.top),
+                                        clip.2.min(box_sx + bw - bord.right),
+                                        clip.3.min(box_sy + bh - bord.bottom),
+                                    )
+                                } else {
+                                    clip
+                                };
                                 draw_text(
                                     &value,
                                     tx,
@@ -3124,7 +3143,7 @@ fn frame_walk(
                                     width,
                                     height,
                                     damage_rects,
-                                    clip,
+                                    caption_clip,
                                 );
                             }
                         }

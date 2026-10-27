@@ -3702,4 +3702,88 @@ mod tests {
         assert_eq!(js(&mut engine, "String(document.scrollingElement.scrollHeight)"), "3000", "the document's extent, without the fixed box");
         assert_eq!(js(&mut engine, "String(document.documentElement.clientHeight)"), "600", "the root's clientHeight is the viewport's");
     }
+
+    /// AETHERSUBMITCAPTION (SR410): (ink pixels, ink x-centre, box x-centre) inside the control `id`'s box, inset
+    /// past a 2px UA border and its padding: a pixel is ink when any channel is darker than 160 (ButtonFace is
+    /// 239, the captions are dark).
+    fn caption_ink(engine: &mut crate::AetherEngine, id: &str) -> (usize, f32, f32) {
+        let r = |e: &mut crate::AetherEngine, k: &str| js_num(e, &format!("document.getElementById('{id}').getBoundingClientRect().{k}"));
+        let (l, t, w, h) = (r(engine, "left"), r(engine, "top"), r(engine, "width"), r(engine, "height"));
+        assert!(w > 14.0 && h > 6.0, "{id}: the control has a box ({w}x{h})");
+        let sw = engine.width as usize;
+        let s = engine.surface();
+        let (x0, x1) = ((l + 7.0).ceil() as usize, (l + w - 7.0).floor() as usize);
+        let (y0, y1) = ((t + 3.0).ceil() as usize, (t + h - 3.0).floor() as usize);
+        let (mut n, mut sx) = (0usize, 0f64);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = (y * sw + x) * 4;
+                if s.get(i..i + 3).is_some_and(|p| p.iter().any(|&c| c < 160)) {
+                    n += 1;
+                    sx += x as f64;
+                }
+            }
+        }
+        let cx = if n > 0 { (sx / n as f64) as f32 } else { 0.0 };
+        (n, cx, (l + w / 2.0) as f32)
+    }
+
+    /// AETHERSUBMITCAPTION (SR410): a submit button paints its caption — the value, the default "Submit" when it
+    /// has none, and Google's home-page buttons (Peter's capture: `.lsb` 15px sans-serif inside `.lsbb`, the
+    /// sprite url left out) centred in their boxes.
+    #[test]
+    fn submit_caption_paints() {
+        let html = r#"<!doctype html><html><head><style>
+            .lsbb{background:#f3f5f6;border:solid 1px;border-color:#d2d2d2 #70757a #70757a #d2d2d2;height:30px}
+            .lsbb{display:block}
+            .lsb{color:#1f1f1f;border:none;cursor:pointer;height:30px;margin:0;outline:0;font:15px sans-serif;vertical-align:top}
+            .ds{display:inline-box;display:inline-block;margin:3px 0 4px;margin-left:4px}
+        </style></head><body><form action="/s">
+            <input type="submit" id="a" value="Go"> <input type="submit" id="b"><br>
+            <span class="ds"><span class="lsbb"><input class="lsb" id="c" value="Google Search" name="btnG" type="submit"></span></span><span class="ds"><span class="lsbb"><input class="lsb" id="d" value="I'm Feeling Lucky" name="btnI" type="submit"></span></span>
+        </form></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        for id in ["a", "b", "c", "d"] {
+            let (n, cx, bx) = caption_ink(&mut engine, id);
+            assert!(n > 0, "{id}: the caption paints glyph ink inside the button");
+            if matches!(id, "c" | "d") {
+                assert!((cx - bx).abs() <= 3.0, "{id}: the caption is centred (ink centre {cx}, box centre {bx})");
+            }
+        }
+    }
+
+    /// AETHERSUBMITCAPTION (SR410): a `<button>`'s text child paints inside its box.
+    #[test]
+    fn button_text_paints() {
+        let html = r#"<html><body><button id="r">Run</button></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(400, 200));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let (n, _, _) = caption_ink(&mut engine, "r");
+        assert!(n > 0, "the button's text paints glyph ink inside it");
+    }
+
+    /// AETHERSUBMITCAPTION (SR410): with no fontconfig configuration a Mac walks its CoreText font domains (a stock
+    /// macOS has no /etc/fonts, so the Linux directories found zero faces); every other OS keeps the four.
+    #[test]
+    fn font_dirs_cover_macos() {
+        let home = Some(PathBuf::from("/Users/p"));
+        let mac = crate::fonts::fontconfig::conventional_dirs(true, home.clone());
+        assert_eq!(mac, vec![PathBuf::from("/System/Library/Fonts"), PathBuf::from("/Library/Fonts"), PathBuf::from("/Users/p/Library/Fonts")]);
+        assert!(!mac.contains(&PathBuf::from("/usr/share/fonts")));
+        let other = crate::fonts::fontconfig::conventional_dirs(false, home);
+        assert_eq!(
+            other,
+            vec![
+                PathBuf::from("/usr/share/fonts"),
+                PathBuf::from("/usr/local/share/fonts"),
+                PathBuf::from("/Users/p/.local/share/fonts"),
+                PathBuf::from("/Users/p/.fonts"),
+            ]
+        );
+    }
 }
