@@ -578,3 +578,23 @@ pub fn av1c_colour(av1c: &[u8]) -> Option<(ColorConfig, Vec<Metadata>)> {
     let meta = obus.iter().filter(|o| o.obu_type == OBU_METADATA_T).filter_map(|o| parse_metadata(o.payload).ok()).collect();
     Some((seq.color_config, meta))
 }
+
+/// KERNELCOLOUR (rmbp-ledger B952): [`av1c_codes`]' answer — `((primaries, transfer, matrix, color_range), the last HDR_CLL
+/// (max_cll, max_fall), the last HDR_MDCV (primaries R G B, white, luminance_max, luminance_min))`, plain values a colour type
+/// that cannot name av1_core's (demux_core links no decoder) maps.
+pub type Av1Codes = ((u8, u8, u8, bool), Option<(u16, u16)>, Option<([[u16; 2]; 3], [u16; 2], u32, u32)>);
+
+/// KERNELCOLOUR (rmbp-ledger B952): [`av1c_colour`] as plain code points — what `demux_core::colour::Colour::from_av1`
+/// maps, for gneiss_pal's `colour_of` and the kernel Player alike (one walk, one mapping).
+pub fn av1c_codes(av1c: &[u8]) -> Option<Av1Codes> {
+    let (cc, meta) = av1c_colour(av1c)?;
+    let (mut cll, mut mdcv) = (None, None);
+    for m in meta {
+        match m {
+            Metadata::Cll { max_cll, max_fall } => cll = Some((max_cll, max_fall)),
+            Metadata::Mdcv { primaries, white, luminance_max, luminance_min } => mdcv = Some((primaries, white, luminance_max, luminance_min)),
+            Metadata::Other(_) => {}
+        }
+    }
+    Some(((cc.color_primaries, cc.transfer_characteristics, cc.matrix_coefficients, cc.color_range), cll, mdcv))
+}

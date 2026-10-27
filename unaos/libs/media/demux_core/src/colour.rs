@@ -54,6 +54,24 @@ pub struct Light {
 }
 
 impl Colour {
+    /// KERNELCOLOUR (rmbp-ledger B952): THE mapping of an AV1 configuration record's colour (`av1_core::image::av1c_codes`:
+    /// color_config's code points and range, the HDR_CLL and HDR_MDCV metadata) — gneiss_pal's `colour_of` and the kernel
+    /// Player's open both call it, so a track's bitstream colour is the same on both rings.
+    pub fn from_av1(
+        (primaries, transfer, matrix, full): (u8, u8, u8, bool),
+        light: Option<(u16, u16)>,
+        mastering: Option<([[u16; 2]; 3], [u16; 2], u32, u32)>,
+    ) -> Colour {
+        Colour {
+            primaries,
+            transfer,
+            matrix,
+            full_range: Some(full),
+            mastering: mastering.map(|(p, w, max, min)| Mastering::from_av1(p, w, max, min)),
+            light: light.map(|(max_cll, max_fall)| Light { max_cll, max_fall }),
+        }
+    }
+
     /// Container wins: each of `self`'s code points stays unless it is 2 (unspecified), and the range, mastering and
     /// light levels are taken from `fallback` only where `self` has none.
     pub fn or(self, fallback: Colour) -> Colour {
