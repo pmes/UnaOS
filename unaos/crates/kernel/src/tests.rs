@@ -8506,3 +8506,17 @@ fn fixtureretain() {
         if nest { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" }, deltas[0] / 1024, deltas[1] / 1024
     );
 }
+
+// ── DESKTOPHIDGAP (rmbp-ledger B1020) — the verb running now, for the `[lag] stall` line's `fixture=` token. FILE-TAIL. ──
+/// DESKTOPHIDGAP (B1020): the fixture [`run`] is executing now (the existing `CUR`), `-` when none or `CUR` is contended —
+/// read with [`running_is`]'s own bounded try (never a sleep: the lag roll calls it). Flight 38's stall lines could not say
+/// which verb they sat beside (gatesteal2, unafslock, idlenet).
+pub fn running_verb() -> &'static str {
+    for _ in 0..64 {
+        if let Some(c) = CUR.try_lock() {
+            return if c.is_empty() { "-" } else { *c };
+        }
+        core::hint::spin_loop();
+    }
+    "-"
+}
