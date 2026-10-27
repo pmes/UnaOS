@@ -2530,3 +2530,11 @@ FORBID :: OVERLAYS: .* -> FAIL ::
 # --- UNAOS_PIDESK=1 (`./arroyo kernel8-test --desk 300`; arroyo `k8_pick_capture_spec` / `k8_desk_replay`). This file
 # --- stays the completion source and owns TRUNCATED; the second file carries no FORBID (these do) and no COMPLETE.
 # --- A new desktop line lands in BOTH files in the same commit. Written at the tail: rows cite this file by line.
+
+# --- BOOTLISTARM (rmbp-ledger B874, R132), TAIL-APPENDED — the Pi runs its TESTS.LIST at the first `[desktop] built` (the
+# --- same `boot::oldest_say` start as x86; `bootlist` widened to the desktop family). OPTIONAL + FORBID and not REQUIRE, on
+# --- the DRAG-PI rule above: the default kernel8-test battery is knob-off (no `desktop_firmware`) and `kernel8-test` never
+# --- stages a list (only the `kernel8` media verb arms `bootlist_stage`), so the summary is absent there by design. The
+# --- OPTIONAL reports an armed card's light summary; the FORBID reds a `tests bootlist` probe FAIL wherever it runs.
+OPTIONAL :: BOOTLIST: ran=[0-9]+ pass=[0-9]+ fail=[0-9]+ skip=[0-9]+ heavy=
+FORBID :: BOOTLIST: .* -> FAIL ::
