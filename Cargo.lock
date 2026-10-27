@@ -3559,6 +3559,7 @@ dependencies = [
  "raw_core",
  "svg_core",
  "vp8_core",
+ "yuv_core",
 ]
 
 [[package]]

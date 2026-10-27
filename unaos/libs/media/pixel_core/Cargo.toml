@@ -18,6 +18,10 @@ svg_core = { path = "../svg_core", optional = true }
 # RAWCORE (B444): camera raw (TIFF/ARW) is a pixel_core route — UnaOS's own no_std raw core (zero deps).
 raw_core = { path = "../raw_core" }
 
+# JPEGCOLOURONE (SR348): JFIF's YCbCr -> RGB is Stria's ONE integer kernel (yuv_core: no_std, no alloc, zero deps),
+# driven with libjpeg's 16-bit table so the Chromium-pinned digests stay byte-identical.
+yuv_core = { path = "../yuv_core" }
+
 [features]
 default = []
 # The `svg` format: sniff `<svg`/`<?xml`, render with svg_core at the intrinsic (or a requested) size.
