@@ -179,7 +179,7 @@ fn mp4_audio_round_trip() {
 /// NLE5B: a fresh H264ENC encoder over the render's frames (the same converter and config): its samples, its avcC and
 /// its reconstruction per frame.
 fn fresh_h264(frames: &[Vec<u8>], gop: u32) -> (Vec<Vec<u8>>, Vec<u8>, Vec<[Vec<u8>; 3]>, Vec<I420>) {
-    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop }).unwrap();
+    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop, ..Default::default() }).unwrap();
     let (mut samples, mut recon, mut input) = (Vec::new(), Vec::new(), Vec::new());
     for f in frames {
         let yuv = I420::from_rgba(64, 48, f).unwrap();
