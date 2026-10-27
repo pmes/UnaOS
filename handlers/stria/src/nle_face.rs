@@ -378,13 +378,15 @@ pub struct Face {
     trans_still: Option<((usize, usize, i64, i64), Option<Still>)>,
     /// NLE4C (SR301): the per-track and master meters, fed by each played tick's render.
     meters: MixMeters,
+    /// SURFACEID (SR332): the Surface number this face's pointer comes from (`None`: every surface, one-surface trees).
+    surface: Option<u32>,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default() }
+        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -392,17 +394,18 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
+        if !self.takes(msg) { return false; } // SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
-            SMessage::BrowserClick(x, y) if !self.buttons => self.click(*x, *y),
+            SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
             SMessage::BrowserResize(w, h) if *w > 0 && *h > 0 && (*w, *h) != self.canvas => {
                 self.canvas = (*w, *h);
                 true
             }
-            SMessage::BrowserButton { down: true, x, y, mods } => self.press(*x, *y, *mods),
+            SMessage::BrowserButton { down: true, x, y, mods, .. } => self.press(*x, *y, *mods),
             SMessage::BrowserButton { down: false, x, y, .. } => self.release(*x, *y),
-            SMessage::BrowserMouseMove(x, y) => self.hover(*x, *y),
-            SMessage::BrowserScroll(_, dy) => self.scroll(*dy),
+            SMessage::BrowserMouseMove(x, y, _) => self.hover(*x, *y),
+            SMessage::BrowserScroll(_, dy, _) => self.scroll(*dy),
             SMessage::BrowserZoom(d) if *d != 0 => {
                 self.state.zoom_by(*d);
                 true
@@ -1332,7 +1335,7 @@ mod tests {
 
         let mut face = Face::new(st, src, (320, 160), PixelOrder::Rgba, false);
         let (x, y) = l.point(0, 12);
-        assert!(face.on(&SMessage::BrowserClick(x, y)));
+        assert!(face.on(&SMessage::BrowserClick(x, y, 0)));
         assert_eq!((face.state.selection, face.state.playhead), (Some((0, 1)), 12));
         assert!(face.on(&SMessage::Input { target: SURFACE.into(), text: "split".into() }));
         assert_eq!(face.state.timeline.tracks[0].clips.len(), 4);
@@ -1409,7 +1412,7 @@ mod tests {
 
     /// NLE2-MODS: a press / release carrying modifier bits (bandy's `MOD_*`).
     fn btn_mods(down: bool, x: f64, y: f64, mods: u8) -> SMessage {
-        SMessage::BrowserButton { down, x, y, mods }
+        SMessage::BrowserButton { down, x, y, mods, surface: 0 }
     }
 
     fn face() -> Face {
@@ -1427,19 +1430,19 @@ mod tests {
         // B[0,10)@10 on V1: x_of(10) = 80, its in handle 80..84; row 0 is y 80..120.
         face.on(&btn(true, 81.0, 100.0));
         assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::TrimIn));
-        assert!(face.on(&SMessage::BrowserMouseMove(105.0, 100.0)));
+        assert!(face.on(&SMessage::BrowserMouseMove(105.0, 100.0, 0)));
         assert_eq!(face.state.timeline, tl0, "nothing commits per move");
         let want = tl0.trim_in(0, 1, 3).unwrap();
         assert_eq!(face.dragging().and_then(|d| d.shown(&face.state)).map(|s| s.timeline), Some(want.clone()));
         assert!(face.on(&btn(false, 105.0, 100.0)));
-        assert!(!face.on(&SMessage::BrowserClick(105.0, 100.0)));
+        assert!(!face.on(&SMessage::BrowserClick(105.0, 100.0, 0)));
         assert_eq!(face.state.timeline, want);
         assert_eq!((face.state.undo_depth(), face.state.playhead, face.state.selection), (1, 0, Some((0, 1))));
         assert!(face.dragging().is_none());
         // Its out handle: B is [3,10)@13..20, x_of(20) = 160, the handle 156..160; drag back 2 ticks.
         face.on(&btn(true, 158.0, 100.0));
         assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::TrimOut));
-        face.on(&SMessage::BrowserMouseMove(142.0, 100.0));
+        face.on(&SMessage::BrowserMouseMove(142.0, 100.0, 0));
         face.on(&btn(false, 142.0, 100.0));
         let mut by_hand = EditorState::new(want);
         by_hand.select(0, 1).unwrap();
@@ -1459,7 +1462,7 @@ mod tests {
         face.on(&btn(true, x, y));
         assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::Move));
         assert_eq!(face.state.selection, Some((0, 2)));
-        face.on(&SMessage::BrowserMouseMove(x + 32.0, y + 40.0));
+        face.on(&SMessage::BrowserMouseMove(x + 32.0, y + 40.0, 0));
         assert_eq!(face.dragging().map(|d| (d.delta, d.to_track)), Some((4, 0)));
         face.on(&btn(false, x + 32.0, y + 40.0));
         assert_eq!(face.state.timeline, tl0.move_clip(0, 2, 0, 29).unwrap());
@@ -1474,7 +1477,7 @@ mod tests {
         let tl0 = face.state.timeline.clone();
         let (x, y) = face.layout().point(0, 12);
         face.on(&btn(true, x, y));
-        face.on(&SMessage::BrowserMouseMove(x + 40.0, y));
+        face.on(&SMessage::BrowserMouseMove(x + 40.0, y, 0));
         assert!(face.on(&SMessage::BrowserKey("Escape".into())));
         assert!(face.dragging().is_none());
         assert_eq!((face.state.timeline.clone(), face.state.undo_depth()), (tl0, 0));
@@ -1484,7 +1487,7 @@ mod tests {
         assert_eq!((face.state.selection, face.state.playhead, face.state.undo_depth()), (Some((0, 0)), 5, 0));
         // Once the surface speaks BrowserButton its BrowserClick is not taken (the release was the click).
         let (x, y) = face.layout().point(1, 12);
-        assert!(!face.on(&SMessage::BrowserClick(x, y)));
+        assert!(!face.on(&SMessage::BrowserClick(x, y, 0)));
         assert_eq!(face.state.selection, Some((0, 0)));
     }
 
@@ -1558,13 +1561,13 @@ mod tests {
     fn nle2b_wheel_zoom_anchors_the_pointer_tick() {
         let mut face = face();
         assert_eq!(face.layout().tick_at(160.0), 20);
-        assert!(!face.on(&SMessage::BrowserMouseMove(160.0, 100.0)));
-        assert!(!face.on(&SMessage::BrowserScroll(0.0, -1.5)), "half a notch is no step");
-        assert!(face.on(&SMessage::BrowserScroll(0.0, -1.5)));
+        assert!(!face.on(&SMessage::BrowserMouseMove(160.0, 100.0, 0)));
+        assert!(!face.on(&SMessage::BrowserScroll(0.0, -1.5, 0)), "half a notch is no step");
+        assert!(face.on(&SMessage::BrowserScroll(0.0, -1.5, 0)));
         assert_eq!(face.state.zoom, 16);
         let l = face.layout();
         assert_eq!((l.t0, l.tick_at(160.0)), (10, 20));
-        assert!(face.on(&SMessage::BrowserScroll(0.0, 3.0)));
+        assert!(face.on(&SMessage::BrowserScroll(0.0, 3.0, 0)));
         assert_eq!(face.state.zoom, 8);
         assert_eq!(face.layout().tick_at(160.0), 20);
     }
@@ -1616,14 +1619,14 @@ mod tests {
         face.state.select_add(0, 1).unwrap();
         let (x, y) = face.layout().point(0, 15); // B's body (B[0,10)@10 butts A@0 and ends 5 before A@25)
         face.on(&btn_mods(true, x, y, bandy::MOD_ALT));
-        face.on(&SMessage::BrowserMouseMove(x + 48.0, y));
+        face.on(&SMessage::BrowserMouseMove(x + 48.0, y, 0));
         assert_eq!(face.dragging().map(|d| (d.kind, d.delta, d.snap)), Some((DragKind::Move, 6, false)));
         face.on(&btn(false, x + 48.0, y));
         assert_eq!(face.last_error.take().as_deref(), Some("drag: clips overlap"));
         assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl0, 0));
         assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 1)), vec![(0, 0), (0, 1)]));
         face.on(&btn_mods(true, x, y, bandy::MOD_ALT));
-        face.on(&SMessage::BrowserMouseMove(x + 40.0, y));
+        face.on(&SMessage::BrowserMouseMove(x + 40.0, y, 0));
         face.on(&btn(false, x + 40.0, y));
         let want = tl0.move_many(&[(0, 0), (0, 1)], 5).unwrap();
         assert_eq!((&face.state.timeline, face.state.undo_depth()), (&want, 1));
@@ -1647,11 +1650,11 @@ mod tests {
         assert_eq!(l.crossing(&face.state.timeline, 300.0, 130.0, 172.0, 90.0), vec![(0, 2), (1, 2)]);
         face.on(&btn(true, 172.0, 90.0)); // V1's gap 20..25
         assert_eq!(face.dragging().map(|d| d.kind), Some(DragKind::Marquee));
-        assert!(face.on(&SMessage::BrowserMouseMove(300.0, 130.0)));
+        assert!(face.on(&SMessage::BrowserMouseMove(300.0, 130.0, 0)));
         face.on(&btn(false, 300.0, 130.0));
         assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 2)), vec![(0, 2), (1, 2)]));
         face.on(&btn_mods(true, 172.0, 125.0, bandy::MOD_SHIFT));
-        face.on(&SMessage::BrowserMouseMove(40.0, 150.0));
+        face.on(&SMessage::BrowserMouseMove(40.0, 150.0, 0));
         face.on(&btn(false, 40.0, 150.0));
         assert_eq!(face.state.set, vec![(0, 2), (1, 0), (1, 1), (1, 2)]);
         assert_eq!(face.state.selection, Some((0, 2)), "an additive marquee keeps the primary");
@@ -1680,7 +1683,7 @@ mod tests {
         // A@25 on V1 (x 200): 35 px left puts its in edge at 165, 5 px from B's out edge at tick 20 (raw delta -4).
         let (x, y) = l.point(0, 28);
         face.on(&btn(true, x, y));
-        face.on(&SMessage::BrowserMouseMove(x - 35.0, y));
+        face.on(&SMessage::BrowserMouseMove(x - 35.0, y, 0));
         assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((-5, Some(20))));
         let px = face.paint();
         assert_eq!(&px[(150 * 320 + 160) * 4..(150 * 320 + 160) * 4 + 4], GUIDE, "the guide line");
@@ -1690,16 +1693,16 @@ mod tests {
         // To the playhead at 30 (x 240): 34 px right puts the in edge 6 px from it (raw +4).
         face.state.seek(30);
         face.on(&btn(true, x, y));
-        face.on(&SMessage::BrowserMouseMove(x + 34.0, y));
+        face.on(&SMessage::BrowserMouseMove(x + 34.0, y, 0));
         assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((5, Some(30))));
         key(&mut face, "Escape");
         key(&mut face, "Alt_L");
         face.on(&btn(true, x, y));
-        face.on(&SMessage::BrowserMouseMove(x - 35.0, y));
+        face.on(&SMessage::BrowserMouseMove(x - 35.0, y, 0));
         assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((-5, Some(20))), "NLE2-MODS: a bare Alt keydown arms nothing");
         key(&mut face, "Escape");
         face.on(&btn_mods(true, x, y, bandy::MOD_ALT | bandy::MOD_CONTROL | bandy::MOD_SUPER));
-        face.on(&SMessage::BrowserMouseMove(x - 35.0, y));
+        face.on(&SMessage::BrowserMouseMove(x - 35.0, y, 0));
         assert_eq!(face.dragging().map(|d| (d.delta, d.guide, d.additive)), Some((-4, None, false)));
     }
 
@@ -1711,9 +1714,9 @@ mod tests {
         let tl0 = face.state.timeline.clone();
         assert!(face.on(&btn(true, 44.0, 70.0)));
         assert_eq!((face.dragging().map(|d| d.kind), face.state.playhead), (Some(DragKind::Scrub), 5));
-        assert!(face.on(&SMessage::BrowserMouseMove(77.0, 70.0)));
+        assert!(face.on(&SMessage::BrowserMouseMove(77.0, 70.0, 0)));
         assert_eq!((face.state.playhead, face.dragging().and_then(|d| d.guide)), (10, Some(10)), "snapped to tick 10");
-        face.on(&SMessage::BrowserMouseMove(124.0, 70.0));
+        face.on(&SMessage::BrowserMouseMove(124.0, 70.0, 0));
         assert_eq!(face.state.playhead, 15);
         assert!(face.on(&btn(false, 124.0, 70.0)));
         assert_eq!((face.state.playhead, face.state.undo_depth(), &face.state.timeline), (15, 0, &tl0));
@@ -2040,5 +2043,84 @@ mod nle4c_tests {
         assert!(face.meter_levels().is_empty(), "stopped: no strip");
         face.feed_meters(face.state.playhead, -1);
         assert!(face.meters().levels().is_empty(), "reverse resets");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// SURFACEID (LEDGER SR332): the face's pointer from its own Surface only
+// ---------------------------------------------------------------------------------------------------------------------
+
+impl Face {
+    /// Route this face to Surface number `n` of its tetra tree (quartzite's `tetra::SurfaceMap::number`): a pointer
+    /// message from any other Surface is not taken.
+    pub fn on_surface(mut self, n: u32) -> Face {
+        self.surface = Some(n);
+        self
+    }
+    /// Whether [`Face::on`] reads `msg`: every message when the face has no surface, else every non-pointer message
+    /// and the pointer messages (bandy's `SMessage::surface`) of its own Surface.
+    pub fn takes(&self, msg: &SMessage) -> bool {
+        match (self.surface, msg.surface()) {
+            (Some(want), Some(got)) => want == got,
+            _ => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod surfaceid_tests {
+    use super::*;
+
+    fn face() -> Face {
+        let (tl, src) = synth_fixture();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    fn on(n: u32, m: SMessage) -> SMessage {
+        let mut m = m;
+        *m.surface_mut().expect("a pointer message") = n;
+        m
+    }
+
+    /// SURFACEID M3: a face on Surface 1 drops press / move / release / wheel / click from Surface 0 (nothing changes),
+    /// and takes them from Surface 1 with the result an unrouted face has; verbs and keys pass either way.
+    #[test]
+    fn surfaceid_face_routes_by_surface() {
+        // Select B, drag its in handle (x 80..84) right 3 ticks, then a wheel notch up (the NLE2B witness's gesture).
+        let gesture = |n: u32| {
+            vec![
+                on(n, SMessage::BrowserButton { down: true, x: 81.0, y: 100.0, mods: 0, surface: 0 }),
+                on(n, SMessage::BrowserMouseMove(105.0, 100.0, 0)),
+                on(n, SMessage::BrowserButton { down: false, x: 105.0, y: 100.0, mods: 0, surface: 0 }),
+                on(n, SMessage::BrowserClick(105.0, 100.0, 0)),
+                on(n, SMessage::BrowserScroll(0.0, -WHEEL_STEP, 0)),
+            ]
+        };
+        let mut plain = face();
+        plain.state.select(0, 1).unwrap();
+        for m in gesture(0) {
+            plain.on(&m);
+        }
+        let mut routed = face().on_surface(1);
+        routed.state.select(0, 1).unwrap();
+        let (tl0, zoom0) = (routed.state.timeline.clone(), routed.state.zoom);
+        for m in gesture(0) {
+            assert!(!routed.takes(&m) && !routed.on(&m), "{m:?}");
+        }
+        assert_eq!((&routed.state.timeline, routed.state.zoom, routed.state.undo_depth()), (&tl0, zoom0, 0));
+        assert!(routed.dragging().is_none() && routed.pointer().is_none());
+        for m in gesture(1) {
+            assert!(routed.takes(&m), "{m:?}");
+            routed.on(&m);
+        }
+        assert_eq!(routed.state.timeline, plain.state.timeline);
+        assert_eq!((routed.state.zoom, routed.state.undo_depth()), (plain.state.zoom, 1));
+        assert_eq!(routed.state.timeline, tl0.trim_in(0, 1, 3).unwrap());
+        // Not pointer messages: taken whatever the surface.
+        assert!(routed.takes(&SMessage::BrowserKey("Home".into())) && routed.takes(&SMessage::BrowserResize(320, 160)));
+        assert!(routed.on(&SMessage::Input { target: SURFACE.into(), text: "undo".into() }));
+        assert_eq!(routed.state.timeline, tl0);
+        // An unrouted face takes every surface's pointer.
+        assert!(face().takes(&on(7, SMessage::BrowserMouseMove(1.0, 1.0, 0))));
     }
 }

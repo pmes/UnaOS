@@ -312,12 +312,12 @@ kat!(kat_browser_nav_forward, SMessage::BrowserNavForward, r#""BrowserNavForward
 kat!(kat_browser_nav_reload, SMessage::BrowserNavReload, r#""BrowserNavReload""#);
 kat!(
     kat_browser_scroll,
-    SMessage::BrowserScroll(0.0, 120.5),
+    SMessage::BrowserScroll(0.0, 120.5, 0),
     r#"{"BrowserScroll":[0.0,120.5]}"#
 );
 kat!(
     kat_browser_click,
-    SMessage::BrowserClick(12.5, 40.0),
+    SMessage::BrowserClick(12.5, 40.0, 0),
     r#"{"BrowserClick":[12.5,40.0]}"#
 );
 kat!(
@@ -512,14 +512,64 @@ kat!(
 );
 kat!(
     kat_browser_button,
-    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0, mods: 0 },
+    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0, mods: 0, surface: 0 },
     r#"{"BrowserButton":{"down":true,"x":12.5,"y":40.0}}"#
 );
 kat!(
     kat_browser_button_mods,
-    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0, mods: bandy::MOD_SHIFT | bandy::MOD_ALT },
+    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0, mods: bandy::MOD_SHIFT | bandy::MOD_ALT, surface: 0 },
     r#"{"BrowserButton":{"down":true,"x":12.5,"y":40.0,"mods":5}}"#
 );
+// SURFACEID (SR332): a pointer message on a Surface other than the tree's first carries its number; 0 is omitted (the
+// goldens above are unchanged: a one-surface tree's wire is byte-identical).
+kat!(
+    kat_browser_button_surface,
+    SMessage::BrowserButton { down: true, x: 12.5, y: 40.0, mods: 0, surface: 2 },
+    r#"{"BrowserButton":{"down":true,"x":12.5,"y":40.0,"surface":2}}"#
+);
+kat!(
+    kat_browser_mouse_move_surface,
+    SMessage::BrowserMouseMove(1.0, 2.0, 3),
+    r#"{"BrowserMouseMove":[1.0,2.0,3]}"#
+);
+kat!(
+    kat_browser_mouse_move,
+    SMessage::BrowserMouseMove(1.0, 2.0, 0),
+    r#"{"BrowserMouseMove":[1.0,2.0]}"#
+);
+kat!(
+    kat_browser_scroll_surface,
+    SMessage::BrowserScroll(0.0, 120.5, 1),
+    r#"{"BrowserScroll":[0.0,120.5,1]}"#
+);
+kat!(
+    kat_browser_click_surface,
+    SMessage::BrowserClick(12.5, 40.0, 1),
+    r#"{"BrowserClick":[12.5,40.0,1]}"#
+);
+
+/// SURFACEID (SR332): the pre-SR332 forms read back as Surface 0, and `surface()` / `surface_mut()` name exactly the four
+/// pointer messages.
+#[test]
+fn surfaceid_old_forms_are_surface_zero() {
+    for old in [
+        r#"{"BrowserButton":{"down":false,"x":1.0,"y":2.0,"mods":1}}"#,
+        r#"{"BrowserMouseMove":[1.0,2.0]}"#,
+        r#"{"BrowserScroll":[0.0,3.0]}"#,
+        r#"{"BrowserClick":[4.0,5.0]}"#,
+    ] {
+        let m: SMessage = serde_json::from_str(old).expect(old);
+        assert_eq!(m.surface(), Some(0), "{old}");
+        assert_eq!(serde_json::to_string(&m).unwrap(), old);
+    }
+    let mut m = SMessage::BrowserMouseMove(1.0, 2.0, 0);
+    *m.surface_mut().unwrap() = 7;
+    assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"BrowserMouseMove":[1.0,2.0,7]}"#);
+    for other in [SMessage::BrowserResize(1, 1), SMessage::BrowserKey("a".into()), SMessage::BrowserText("a".into()), SMessage::Ping] {
+        assert_eq!(other.surface(), None);
+    }
+    assert!(SMessage::Ping.surface_mut().is_none());
+}
 
 /// A11YFACE (SR124): the `a11y` verb table reads every spelling back to its verb, a heading level, and nothing else.
 #[test]
@@ -1399,8 +1449,8 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserNavBack => "BrowserNavBack",
         SMessage::BrowserNavForward => "BrowserNavForward",
         SMessage::BrowserNavReload => "BrowserNavReload",
-        SMessage::BrowserScroll(_, _) => "BrowserScroll",
-        SMessage::BrowserClick(_, _) => "BrowserClick",
+        SMessage::BrowserScroll(..) => "BrowserScroll",
+        SMessage::BrowserClick(..) => "BrowserClick",
         SMessage::BrowserResize(_, _) => "BrowserResize",
         SMessage::BrowserKey(_) => "BrowserKey",
         SMessage::BrowserText(_) => "BrowserText",
@@ -1461,7 +1511,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::ToggleMatrixNode(_) => "ToggleMatrixNode",
         SMessage::UiReady => "UiReady",
         SMessage::Tabula(_) => "Tabula",
-        SMessage::BrowserMouseMove(_, _) => "BrowserMouseMove",
+        SMessage::BrowserMouseMove(..) => "BrowserMouseMove",
         SMessage::BrowserCursorChanged(_) => "BrowserCursorChanged", // AETHERHOVER (SR67) fold: the exhaustive match gains the two motion variants
         SMessage::BrowserGo { .. } => "BrowserGo", // AETHERCHROME (SR84): the chrome's eighteen verbs
         SMessage::BrowserNavStop => "BrowserNavStop",

@@ -27,9 +27,13 @@
 //! it), and the JSON line ends with `transition` (the selected one and its thumbnail's size, or `null`).
 //! NLE4C (SR301): `meters` feeds the face's meters the tick at the playhead (what one played tick feeds); the JSON line
 //! then ends `"meters":[{"track":<n>,"peak":<dBFS>,"rms":<dBFS>},...,{"track":"master",...}]`.
+//! SURFACEID (SR332): `--two-surfaces` puts a second Surface ([`AUX_SURFACE`]) above the editor's in the tree, so the
+//! editor's Surface is number 1 (quartzite's `tetra::SurfaceMap`) and the face is routed to it; every token's pointer
+//! messages carry the editor's number, `aux:<token>` the aux Surface's, and the JSON line ends
+//! `"presses":[[<surface>,<taken>],...]` (each press, the Surface it carried and whether the face took it).
 
 use bandy::{SMessage, Synapse};
-use quartzite::tetra::TetraNode;
+use quartzite::tetra::{SurfaceMap, TetraNode};
 use stria::nle::Sources;
 use stria::nle_face::{self, EditorState, Face, Layout, PixelOrder, SURFACE};
 use timeline_core::{Timeline, edl};
@@ -43,9 +47,13 @@ struct Cli {
     script: Option<String>,
     out: Option<String>,
     labels: bool,
+    two: bool,
 }
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters)";
+/// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
+const AUX_SURFACE: &str = "stria.nle.aux";
+
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, aux:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -53,12 +61,13 @@ fn die(msg: String) -> ! {
 }
 
 fn cli() -> Cli {
-    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false };
+    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false };
     let mut a = std::env::args().skip(1);
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--synth" => c.synth = true,
             "--labels" => c.labels = true,
+            "--two-surfaces" => c.two = true,
             "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(USAGE.into())),
             "--size" => {
                 let v = a.next().unwrap_or_default();
@@ -103,12 +112,18 @@ fn load(c: &Cli) -> (Timeline, Sources) {
 /// THE editor tree, declared once: the editor surface over the transport row. Every button fires
 /// `SMessage::Input { target: SURFACE, text: <verb> }`.
 fn editor_tree() -> TetraNode {
+    editor_tree_for(false)
+}
+
+/// SURFACEID (SR332): the editor tree, with `two` a second Surface ([`AUX_SURFACE`]) first, above the editor's.
+fn editor_tree_for(two: bool) -> TetraNode {
     let button = |verb: &str, label: &str| TetraNode::Button {
         id: verb.into(),
         label: label.into(),
         action: SMessage::Input { target: SURFACE.into(), text: verb.into() },
     };
-    TetraNode::VStack(vec![
+    let aux = two.then(|| TetraNode::Surface { id: AUX_SURFACE.into() });
+    TetraNode::VStack(aux.into_iter().chain([
         TetraNode::Surface { id: SURFACE.into() },
         TetraNode::HStack(vec![
             button("play", "Play"),
@@ -126,7 +141,7 @@ fn editor_tree() -> TetraNode {
             button("}", "Out +"),
             button("lift", "Lift"),
         ]),
-    ])
+    ]).collect())
 }
 
 /// A `--do` token as the messages the window would send.
@@ -161,27 +176,27 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
     let one = match parts.as_slice() {
         ["at", t, row] => {
             let (x, y) = l.point(row.parse().ok()?, num(t)?);
-            SMessage::BrowserClick(x, y)
+            SMessage::BrowserClick(x, y, 0)
         }
         ["transition", t, i] => {
             let (t, i) = (t.parse::<usize>().ok()?, i.parse::<usize>().ok()?);
             let (x0, y0, x1, y1) = l.transition_rect(t, face.state.timeline.tracks.get(t)?.transitions.get(i)?);
-            SMessage::BrowserClick((x0 + x1) as f64 / 2.0, (y0 + y1) as f64 / 2.0)
+            SMessage::BrowserClick((x0 + x1) as f64 / 2.0, (y0 + y1) as f64 / 2.0, 0)
         }
-        ["ruler", t] => SMessage::BrowserClick(l.x_of(num(t)?) as f64 + 0.5, l.ruler_y as f64 + 1.0),
-        ["press", x, y] => SMessage::BrowserButton { down: true, x: px(x)?, y: px(y)?, mods: 0 },
-        ["move", x, y] => SMessage::BrowserMouseMove(px(x)?, px(y)?),
-        ["release"] => return Some(vec![SMessage::BrowserButton { down: false, x: lx, y: ly, mods: 0 }, SMessage::BrowserClick(lx, ly)]),
+        ["ruler", t] => SMessage::BrowserClick(l.x_of(num(t)?) as f64 + 0.5, l.ruler_y as f64 + 1.0, 0),
+        ["press", x, y] => SMessage::BrowserButton { down: true, x: px(x)?, y: px(y)?, mods: 0, surface: 0 },
+        ["move", x, y] => SMessage::BrowserMouseMove(px(x)?, px(y)?, 0),
+        ["release"] => return Some(vec![SMessage::BrowserButton { down: false, x: lx, y: ly, mods: 0, surface: 0 }, SMessage::BrowserClick(lx, ly, 0)]),
         ["marquee", x0, y0, x1, y1] => {
             let (x0, y0, x1, y1) = (px(x0)?, px(y0)?, px(x1)?, px(y1)?);
             return Some(vec![
-                SMessage::BrowserButton { down: true, x: x0, y: y0, mods: 0 },
-                SMessage::BrowserMouseMove(x1, y1),
-                SMessage::BrowserButton { down: false, x: x1, y: y1, mods: 0 },
-                SMessage::BrowserClick(x1, y1),
+                SMessage::BrowserButton { down: true, x: x0, y: y0, mods: 0, surface: 0 },
+                SMessage::BrowserMouseMove(x1, y1, 0),
+                SMessage::BrowserButton { down: false, x: x1, y: y1, mods: 0, surface: 0 },
+                SMessage::BrowserClick(x1, y1, 0),
             ]);
         }
-        ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?),
+        ["wheel", n] => SMessage::BrowserScroll(0.0, -nle_face::WHEEL_STEP * px(n)?, 0),
         [v] if nle_face::VERBS.contains(v) => SMessage::Input { target: SURFACE.into(), text: v.to_string() },
         _ => return None,
     };
@@ -190,11 +205,25 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
 
 /// The script through `Face::on`, token by token; the errors it met.
 fn drive(face: &mut Face, script: &str) -> Vec<String> {
+    drive_on(face, script, None, &mut Vec::new())
+}
+
+/// SURFACEID (SR332): [`drive`] on a two-surface tree: `surfaces` = (the editor's number, the aux Surface's); each
+/// token's pointer messages are stamped with the editor's (`aux:<token>`: the aux one's), and each press is recorded in
+/// `presses` as (its Surface, whether the face took it).
+fn drive_on(face: &mut Face, script: &str, surfaces: Option<(u32, u32)>, presses: &mut Vec<(u32, bool)>) -> Vec<String> {
     let mut errors = Vec::new();
     for tok in script.split(',').filter(|t| !t.is_empty()) {
+        let (tok, aux) = match tok.strip_prefix("aux:") { Some(rest) => (rest, true), None => (tok, false) };
         match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { token(face, tok) } {
             Some(ms) => {
-                for m in ms {
+                for mut m in ms {
+                    if let (Some((editor, other)), Some(s)) = (surfaces, m.surface_mut()) {
+                        *s = if aux { other } else { editor };
+                    }
+                    if let SMessage::BrowserButton { down: true, surface, .. } = m {
+                        presses.push((surface, face.takes(&m)));
+                    }
                     face.on(&m);
                 }
             }
@@ -209,7 +238,10 @@ fn drive(face: &mut Face, script: &str) -> Vec<String> {
 
 /// The headless witness: the script through `Face::on`, then the last frame's facts as one JSON line.
 fn witness(c: &Cli, mut face: Face) -> i32 {
-    let mut errors = drive(&mut face, c.script.as_deref().unwrap_or(""));
+    let map = SurfaceMap::of(&editor_tree_for(c.two));
+    let surfaces = c.two.then(|| (map.number(SURFACE).unwrap_or(0), map.number(AUX_SURFACE).unwrap_or(0)));
+    let mut presses = Vec::new();
+    let mut errors = drive_on(&mut face, c.script.as_deref().unwrap_or(""), surfaces, &mut presses);
     let SMessage::SurfaceBlit { width, height, pixels, .. } = face.frame() else { return 1 };
     if let Some(e) = face.last_error.take() {
         errors.push(e);
@@ -226,8 +258,9 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     let meters = meters_json(c, &face);
+    let presses = presses_json(c, &presses);
     println!(
-        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{}{meters}}}",
+        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{}{meters}{presses}}}",
         st.playhead,
         st.timeline.tracks.len(),
         clips,
@@ -259,8 +292,9 @@ fn main() {
     let c = cli();
     let (tl, sources) = load(&c);
     let windowed = cfg!(any(target_os = "macos", all(target_os = "linux", feature = "gtk")));
-    if c.script.is_some() || c.out.is_some() || !windowed {
-        let face = Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels);
+    let editor = SurfaceMap::of(&editor_tree_for(c.two)).number(SURFACE).unwrap_or(0); // SURFACEID (SR332): the face's Surface
+    if c.script.is_some() || c.out.is_some() || c.two || !windowed {
+        let face = Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels).on_surface(editor);
         std::process::exit(witness(&c, face));
     }
 
@@ -269,7 +303,7 @@ fn main() {
     let synapse = Synapse::new();
     {
         let rx = synapse.subscribe();
-        let face = Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true);
+        let face = Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true).on_surface(editor);
         rt.spawn(nle_face::serve(synapse.clone(), rx, face));
     }
     quartzite::Backend::new_tetra_vessel(
@@ -371,6 +405,30 @@ mod tests {
         assert_eq!(drive(&mut face, "transition:0:0"), vec!["bad token transition:0:0".to_string()]);
     }
 
+    /// SURFACEID M3: with two Surfaces the editor's is number 1; a gesture on the aux Surface is not taken and leaves the
+    /// timeline, the same gesture on the editor's Surface is the NLE2B trim; the default tree is unchanged.
+    #[test]
+    fn surfaceid_witness_two_surfaces() {
+        let one = SurfaceMap::of(&editor_tree());
+        assert_eq!((one.number(SURFACE), one.number(AUX_SURFACE)), (Some(0), None));
+        let two = SurfaceMap::of(&editor_tree_for(true));
+        assert_eq!((two.number(AUX_SURFACE), two.number(SURFACE)), (Some(0), Some(1)));
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false).on_surface(1);
+        let mut presses = Vec::new();
+        let errors = drive_on(&mut face, "at:12:0,aux:press:81:100,aux:move:105:100,aux:release", Some((1, 0)), &mut presses);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl0, 0));
+        let errors = drive_on(&mut face, "press:81:100,move:105:100,release", Some((1, 0)), &mut presses);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.timeline, tl0.trim_in(0, 1, 3).unwrap());
+        assert_eq!(presses, vec![(0, false), (1, true)]);
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true };
+        assert_eq!(presses_json(&c, &presses), r#","presses":[[0,false],[1,true]]"#);
+        assert_eq!(presses_json(&Cli { two: false, ..c }, &presses), "");
+    }
+
     /// NLE4C M3: the `meters` token feeds the tick at the playhead; the face then holds track 1's meter and the master's.
     #[test]
     fn nle4c_witness_meters() {
@@ -395,4 +453,13 @@ fn transition_json(face: &Face) -> String {
         "{{\"track\":{t},\"idx\":{i},\"at\":{},\"dur\":{},\"kind\":\"{kind}\",\"from_black\":{},\"still\":{still}}}",
         x.at, x.dur, x.from_black
     )
+}
+
+/// SURFACEID (SR332): the witness's `"presses"` field, with `--two-surfaces` only (the default line is unchanged).
+fn presses_json(c: &Cli, presses: &[(u32, bool)]) -> String {
+    if !c.two {
+        return String::new();
+    }
+    let all: Vec<String> = presses.iter().map(|(s, t)| format!("[{s},{t}]")).collect();
+    format!(",\"presses\":[{}]", all.join(","))
 }

@@ -157,8 +157,11 @@ pub enum SMessage {
     BrowserNavBack,
     BrowserNavForward,
     BrowserNavReload,
-    BrowserScroll(f64, f64),
-    BrowserClick(f64, f64),
+    /// SURFACEID (LEDGER SR332): the third field on `BrowserScroll` / `BrowserClick` / `BrowserMouseMove` (and
+    /// `BrowserButton`'s `surface`) is the Surface's number in its tetra tree (quartzite `tetra::SurfaceMap`: depth-first,
+    /// the first or only Surface is 0), omitted from the wire when 0 so a one-surface tree keeps its frozen shape.
+    BrowserScroll(f64, f64, #[serde(default, skip_serializing_if = "no_surface")] u32),
+    BrowserClick(f64, f64, #[serde(default, skip_serializing_if = "no_surface")] u32),
     BrowserResize(u32, u32),
     BrowserKey(String),
     BrowserText(String),
@@ -180,7 +183,7 @@ pub enum SMessage {
     /// Chrome → engine: the pointer moved over the page surface, in surface
     /// pixels (top-left origin) — hover, `:hover` style, the cursor shape and
     /// the page's mouseover/mouseout/mouseenter/mouseleave/mousemove (SR67).
-    BrowserMouseMove(f64, f64),
+    BrowserMouseMove(f64, f64, #[serde(default, skip_serializing_if = "no_surface")] u32),
     /// Engine → chrome: the cursor the hovered element asks for changed. A
     /// css-ui-4 `cursor` keyword (`default`, `pointer`, `text`, `wait`, …),
     /// which is also the freedesktop/GTK cursor name; deduped by the engine.
@@ -489,7 +492,8 @@ pub enum SMessage {
     /// and `BrowserMouseMove` are still sent as before. APPENDED so no earlier wire tag moves. NLE2-MODS (LEDGER SR306):
     /// `mods` is the modifier state at the press / release ([`MOD_SHIFT`] | [`MOD_CONTROL`] | [`MOD_ALT`] | [`MOD_SUPER`]),
     /// omitted from the wire when 0 so a press with no modifier keeps its frozen shape (smessage_kats).
-    BrowserButton { down: bool, x: f64, y: f64, #[serde(default, skip_serializing_if = "no_mods")] mods: u8 },
+    /// SURFACEID (LEDGER SR332): `surface` is the Surface's number (see `BrowserScroll`), omitted when 0.
+    BrowserButton { down: bool, x: f64, y: f64, #[serde(default, skip_serializing_if = "no_mods")] mods: u8, #[serde(default, skip_serializing_if = "no_surface")] surface: u32 },
 }
 
 /// A typed preference value — the whole value domain of the Principia
@@ -606,6 +610,11 @@ fn is_false(b: &bool) -> bool {
 /// serde helper: omit an empty modifier set from the wire (`BrowserButton`'s `mods`).
 fn no_mods(m: &u8) -> bool {
     *m == 0
+}
+
+/// serde helper: omit the default Surface (number 0) from the wire (SURFACEID, LEDGER SR332).
+fn no_surface(n: &u32) -> bool {
+    *n == 0
 }
 
 /// `BrowserButton`'s `mods` bits (NLE2-MODS, LEDGER SR306), named once: Shift.
@@ -1060,5 +1069,30 @@ impl TabulaCommand {
                 | TabulaCommand::EditorInsert { .. }
                 | TabulaCommand::EditorClosed { .. }
         )
+    }
+}
+
+/// SURFACEID (LEDGER SR332): the ONE list of the pointer messages that carry a Surface number. Every receiver that routes
+/// by surface (stria's `nle_face::Face::takes`) and every sender that stamps one (stria-view's witness) reads it here.
+impl SMessage {
+    /// The Surface number a pointer message carries; `None` for every other message.
+    pub fn surface(&self) -> Option<u32> {
+        match self {
+            SMessage::BrowserButton { surface, .. }
+            | SMessage::BrowserMouseMove(_, _, surface)
+            | SMessage::BrowserScroll(_, _, surface)
+            | SMessage::BrowserClick(_, _, surface) => Some(*surface),
+            _ => None,
+        }
+    }
+    /// The same field, to stamp.
+    pub fn surface_mut(&mut self) -> Option<&mut u32> {
+        match self {
+            SMessage::BrowserButton { surface, .. }
+            | SMessage::BrowserMouseMove(_, _, surface)
+            | SMessage::BrowserScroll(_, _, surface)
+            | SMessage::BrowserClick(_, _, surface) => Some(surface),
+            _ => None,
+        }
     }
 }

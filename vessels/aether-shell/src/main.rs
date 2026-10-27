@@ -52,19 +52,19 @@ fn coalesce(batch: Vec<SMessage>) -> Vec<SMessage> {
     for (i, msg) in batch.into_iter().enumerate() {
         match msg {
             SMessage::BrowserResize(..) if Some(i) != last_resize => continue,
-            SMessage::BrowserScroll(dx, dy) => {
-                if let Some(SMessage::BrowserScroll(px, py)) = out.last_mut() {
+            SMessage::BrowserScroll(dx, dy, s) => {
+                if let Some(SMessage::BrowserScroll(px, py, _)) = out.last_mut() {
                     *px += dx;
                     *py += dy;
                 } else {
-                    out.push(SMessage::BrowserScroll(dx, dy));
+                    out.push(SMessage::BrowserScroll(dx, dy, s));
                 }
             }
-            SMessage::BrowserMouseMove(x, y) => {
-                if let Some(SMessage::BrowserMouseMove(px, py)) = out.last_mut() {
-                    (*px, *py) = (x, y);
+            SMessage::BrowserMouseMove(x, y, s) => {
+                if let Some(SMessage::BrowserMouseMove(px, py, ps)) = out.last_mut() {
+                    (*px, *py, *ps) = (x, y, s);
                 } else {
-                    out.push(SMessage::BrowserMouseMove(x, y));
+                    out.push(SMessage::BrowserMouseMove(x, y, s));
                 }
             }
             other => out.push(other),
@@ -515,11 +515,11 @@ impl Tab {
             // A stop with no load in flight has nothing to stop.
             SMessage::BrowserNavStop => {}
             // The chrome speaks device pixels; the page lays out in CSS pixels (zoom).
-            SMessage::BrowserScroll(dx, dy) => {
+            SMessage::BrowserScroll(dx, dy, _) => {
                 let (dx, dy) = self.engine.to_css(dx, dy);
                 self.engine.handle_event(aether::api::events::Event::Scroll(dx, dy));
             }
-            SMessage::BrowserClick(x, y) => {
+            SMessage::BrowserClick(x, y, _) => {
                 let (x, y) = self.engine.to_css(x, y);
                 self.engine.handle_event(aether::api::events::Event::MouseDown(x, y));
                 self.engine.handle_event(aether::api::events::Event::MouseUp(x, y));
@@ -549,7 +549,7 @@ impl Tab {
             SMessage::BrowserKey(key) => self.engine.handle_event(aether::api::events::Event::KeyDown(key)),
             SMessage::BrowserText(text) => self.engine.handle_event(aether::api::events::Event::Text(text)),
             // SR67: hover, `:hover` re-style, the page's mouse events.
-            SMessage::BrowserMouseMove(x, y) => {
+            SMessage::BrowserMouseMove(x, y, _) => {
                 let (x, y) = self.engine.to_css(x, y);
                 self.engine.handle_event(aether::api::events::Event::MouseMove(x, y));
             }
@@ -1111,14 +1111,14 @@ mod tests {
     #[test]
     fn coalesce_keeps_the_last_of_adjacent_pointer_moves() {
         let out = coalesce(vec![
-            SMessage::BrowserMouseMove(1.0, 1.0),
-            SMessage::BrowserMouseMove(2.0, 3.0),
-            SMessage::BrowserMouseMove(5.0, 8.0),
-            SMessage::BrowserClick(5.0, 8.0),
-            SMessage::BrowserMouseMove(9.0, 9.0),
+            SMessage::BrowserMouseMove(1.0, 1.0, 0),
+            SMessage::BrowserMouseMove(2.0, 3.0, 0),
+            SMessage::BrowserMouseMove(5.0, 8.0, 0),
+            SMessage::BrowserClick(5.0, 8.0, 0),
+            SMessage::BrowserMouseMove(9.0, 9.0, 0),
         ]);
         let shape: Vec<String> = out.iter().map(|m| format!("{m:?}")).collect();
-        assert_eq!(shape, ["BrowserMouseMove(5.0, 8.0)", "BrowserClick(5.0, 8.0)", "BrowserMouseMove(9.0, 9.0)"]);
+        assert_eq!(shape, ["BrowserMouseMove(5.0, 8.0, 0)", "BrowserClick(5.0, 8.0, 0)", "BrowserMouseMove(9.0, 9.0, 0)"]);
     }
 
     /// Scroll still sums and resize still keeps only the last geometry alongside pointer motion.
@@ -1126,13 +1126,13 @@ mod tests {
     fn coalesce_pointer_motion_leaves_scroll_and_resize_rules_alone() {
         let out = coalesce(vec![
             SMessage::BrowserResize(10, 10),
-            SMessage::BrowserScroll(0.0, 1.0),
-            SMessage::BrowserScroll(0.0, 2.0),
-            SMessage::BrowserMouseMove(4.0, 4.0),
+            SMessage::BrowserScroll(0.0, 1.0, 0),
+            SMessage::BrowserScroll(0.0, 2.0, 0),
+            SMessage::BrowserMouseMove(4.0, 4.0, 0),
             SMessage::BrowserResize(20, 20),
         ]);
         let shape: Vec<String> = out.iter().map(|m| format!("{m:?}")).collect();
-        assert_eq!(shape, ["BrowserScroll(0.0, 3.0)", "BrowserMouseMove(4.0, 4.0)", "BrowserResize(20, 20)"]);
+        assert_eq!(shape, ["BrowserScroll(0.0, 3.0, 0)", "BrowserMouseMove(4.0, 4.0, 0)", "BrowserResize(20, 20)"]);
     }
 
     /// AETHERDEVTOOLS2 (SR112): the face's split/key path through the shell — F12 from the face's hook
