@@ -742,7 +742,7 @@ impl AetherEngine {
     /// is recomputed (a change is staged for [`Self::take_cursor_change`]). A motion that stays on the
     /// same element costs one hit test and one `mousemove`.
     pub fn pointer_moved(&mut self, x: f64, y: f64) {
-        self.selection_pointer_moved(x, y); // AETHERSELECT (SR69): the drag extends while the button is held
+        self.selection_pointer_moved(x, y); if self.pdf.is_some() { return self.pdf_hover(x, y); } // AETHERSELECT (SR69): the drag extends while the button is held
         self.pointer = Some((x, y));
         let hit = self.hit_test_at(x, y);
         // AETHERFIT (SR189): an inert hit is retargeted (HTML §6.3) BEFORE the hover path, so the boundary events
@@ -920,7 +920,7 @@ impl AetherEngine {
                 }
             }
             api::events::Event::MouseUp(x, y) => {
-                self.pointer_released(); // AETHERSELECT (SR69): the drag ends before the click is routed
+                self.pointer_released(); if self.pdf.is_some() { return self.pdf_release(x, y); } // AETHERSELECT (SR69): the drag ends before the click is routed
                 css::note_focus_modality(true); // AETHERGEN (SR71): click focus is pointer-modal
                 let Some(node) = self.hit_test(x, y) else {
                     self.set_focus(None);
@@ -1068,7 +1068,7 @@ impl AetherEngine {
     fn key_default(&mut self, key: String) {
         // AETHERA11Y (SR119): sequential focus navigation (Tab, Enter on links, the arrow keys in
         // composite widgets) before the page's own default; a key it handles is consumed.
-        if crate::dom::a11y::keyboard::handle_key(self, &key) {
+        if self.pdf_key(&key) { return; } if crate::dom::a11y::keyboard::handle_key(self, &key) {
             return;
         }
         // A focused text control takes its editing keys first (forms::edit); the page only
@@ -1213,7 +1213,7 @@ impl AetherEngine {
     /// Inserts `text` at the focused text control's caret (replacing its selection): line breaks are
     /// stripped in a single-line field and normalized to LF in a textarea; `maxlength` is honored.
     fn insert_text(&mut self, text: &str) {
-        let Some(node) = self.editing_node() else { return };
+        if self.pdf.is_some() { return self.pdf_insert(text); } let Some(node) = self.editing_node() else { return };
         let multiline = Self::is_textarea(&node);
         let mut ins = forms::edit::sanitize_insert(text, multiline);
         let mut value = forms::control_value(&node);
@@ -1828,7 +1828,7 @@ impl AetherEngine {
     /// The URL of the link under the pointer (the nearest `<a href>` / `<area href>` on the hover
     /// path), resolved against the document — the chrome's status line.
     pub fn hovered_link(&self) -> Option<String> {
-        let base = self.current_url();
+        if self.pdf.is_some() { return self.pdf_hovered_link(); } let base = self.current_url();
         self.hover_path.iter().find_map(|n| {
             let e = n.as_element()?;
             if !matches!(e.name.local.as_ref(), "a" | "area") {
