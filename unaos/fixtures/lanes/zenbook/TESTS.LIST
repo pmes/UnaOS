@@ -1,0 +1,7 @@
+# The Zenbook lane's boot list (ZENBOOKLANELIST, zenbook-ledger Z19). `./arroyo test-zenbook` stages THIS file through the
+# ONE stager (`bootlist_stage <dir> <this dir>`) and the builder carries it onto the ESP (UNAOS_BOOTLIST_STAGE); it is NOT
+# the flight list (unaos/fixtures/TESTS.LIST), whose ~70 untagged fixtures would not fit the lane's wall and would refuse
+# the typed `tests` verbs. Same grammar (`bootlist::parse`, PLAYBOOK §4 item 7). The spec (x86-zenbook.spec §8) pins
+# light=1 (the @zenbook line runs) and other=1 (the @rmbp12 line is counted, never run).
+platform @zenbook
+gen7 @rmbp12

@@ -1587,7 +1587,7 @@ fn main() {
     let _ = stage_fonts(&kfont_dirs_env(), &esp_dir);
     // QEMUSKIP (B613, B600): the test-f fixtures on the QEMU root too (the ESP directory IS the root under
     // `fat:rw:`), the way metal gets them on the card's UnaFS /system.
-    let _ = stage_testf(&workspace_dir.join("builder/testf.list"), &target_dir.join("testf-cache"), &esp_dir);
+    let _ = stage_testf(&workspace_dir.join("builder/testf.list"), &target_dir.join("testf-cache"), &esp_dir); stage_bootlist_carry(&esp_dir); // ZENBOOKLANELIST (zenbook-ledger Z19): UNAOS_BOOTLIST_STAGE, a QEMU lane's boot list (file tail)
 
     // -----------------------------------------------------------------------------------------
     // WINX-7 PKG — the DATA tree: the EL0 artifacts staged for the volume the RUNNING KERNEL reads.
@@ -3113,4 +3113,33 @@ mod kelfhash_tests {
         assert_eq!(kelfsha::record(Some(&legacy), None), Some(legacy.as_slice()));
         println!("KELFHASH builder: row={} ok=1 torn=mismatch same_kelf=stale other=stale legacy=kelf -> PASS", text.trim_end());
     }
+}
+
+// ZENBOOKLANELIST (zenbook-ledger Z19): UNAOS_BOOTLIST_STAGE=<dir> — a QEMU lane's boot list onto the ESP this run re-created
+// (the wipe above). arroyo's ONE stager (`bootlist_stage`) fills <dir>; this carries every regular file in it onto the ESP
+// root by its own name, so the kernel reads /boot/TESTS.LIST under `fat:rw:`. It knows no file name and filters nothing
+// (the kernel's `bootlist::parse` filters by `@<board>`). Unset: it returns at its first statement — no read, no print.
+fn stage_bootlist_carry(esp_dir: &std::path::Path) {
+    let Ok(dir) = std::env::var("UNAOS_BOOTLIST_STAGE") else { return };
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            println!("   BOOTLIST CARRY (Z19): UNAOS_BOOTLIST_STAGE={} unreadable ({}) — nothing carried", dir, e);
+            return;
+        }
+    };
+    let mut names: Vec<String> = Vec::new();
+    for ent in rd.flatten() {
+        let src = ent.path();
+        if !src.is_file() {
+            continue;
+        }
+        let Some(name) = src.file_name() else { continue };
+        match std::fs::copy(&src, esp_dir.join(name)) {
+            Ok(_) => names.push(name.to_string_lossy().into_owned()),
+            Err(e) => println!("   BOOTLIST CARRY (Z19): {} not carried ({})", src.display(), e),
+        }
+    }
+    names.sort();
+    println!("   BOOTLIST CARRY (Z19): UNAOS_BOOTLIST_STAGE={} -> [{}] onto the ESP root", dir, names.join(" "));
 }

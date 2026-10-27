@@ -1005,7 +1005,7 @@ refs/heads/exec-rmbp-dmaallocone   5dbd44257 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-hidbootleds   8ba82e813 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-saverecent   d7ad4440e cut 2026-10-27 (wave36 batch 9)
 refs/heads/exec-rmbp-pagesave   d7ad4440e cut 2026-10-27 (wave36 batch 9)
-refs/heads/exec-rmbp-zenbooklanelist   4886f5dce cut 2026-10-27 (wave36 batch 10)
+refs/heads/exec-rmbp-zenbooklanelist   232175f52 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookecbattery   438be9774 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookxhciall   4886f5dce cut 2026-10-27 (wave36 batch 10)
 refs/heads/exec-rmbp-nvmebatch   4886f5dce cut 2026-10-27 (wave36 batch 10)
