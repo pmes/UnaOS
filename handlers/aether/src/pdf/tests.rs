@@ -744,3 +744,111 @@ fn savedialog_html_tab_stages_nothing() {
     e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
     assert!(e.take_pending_save().is_none(), "PAGE-SAVE is owed: an HTML tab stages no Save As either");
 }
+
+// =================================================================================================
+// PDF4-STRIPKEYS / PDF4-FIT / PDF4-OUTLINE-CONTRAST (SR389): the strip's keys, the fit modes, the dark strip's ink floor.
+// =================================================================================================
+
+fn key(e: &mut AetherEngine, k: &str) {
+    e.handle_event(Event::KeyDown(k.to_string()));
+}
+
+/// The strip's pixels in the focus ring's colour.
+fn ring_px(e: &AetherEngine) -> usize {
+    let c = crate::render::focusring::theme().color;
+    let f = e.present_rgba();
+    (0..f.1 as usize).flat_map(|y| (0..super::thumbs::STRIP_W as usize).map(move |x| (x, y))).filter(|&(x, y)| px(&f, x, y) == [c.0, c.1, c.2]).count()
+}
+
+#[test]
+fn pdf4stripkeys_tab_down_enter() {
+    let mut e = engine_with(n_pages(3), 400, 100);
+    key(&mut e, "Tab");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, None, "a closed strip takes no Tab");
+    key(&mut e, "F4");
+    let _ = e.present_rgba();
+    assert_eq!(ring_px(&e), 0, "no ring before the strip is focused");
+    key(&mut e, "Tab");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(0), "Tab: the strip, on the current page's thumbnail");
+    key(&mut e, "Down");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(1));
+    assert_eq!(e.scroll_y, 0.0, "a focus move does not scroll the pages");
+    key(&mut e, "Return");
+    let top2 = e.pdf.as_ref().unwrap().page_rect(1, 400.0).1;
+    assert!(near(e.scroll_y, top2), "Enter lands on page 2: {} vs {top2}", e.scroll_y);
+    assert!(ring_px(&e) > 0, "the focused thumbnail carries the focus ring");
+    key(&mut e, "Up");
+    key(&mut e, "Up");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(0), "Up sticks at the first");
+    key(&mut e, "End");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(2));
+    key(&mut e, "Shift+Tab");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, None, "Shift+Tab: back to the page");
+    assert_eq!(ring_px(&e), 0, "no ring with the page focused");
+}
+
+#[test]
+fn pdf4stripkeys_outline_tree() {
+    use super::thumbs::rows;
+    use pdf_core::annots::{Dest, View};
+    let mut e = outline_engine();
+    let _ = e.present_rgba();
+    key(&mut e, "Tab");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(0), "the current page's item, \"One\"");
+    key(&mut e, "Left");
+    assert_eq!(rows(e.pdf.as_ref().unwrap()).len(), 2, "Left closes the parent");
+    assert_eq!(e.scroll_x, 0.0, "the strip took Left, not the hscroll");
+    key(&mut e, "Right");
+    assert_eq!(rows(e.pdf.as_ref().unwrap()).len(), 3, "Right expands it");
+    assert!(ring_px(&e) > 0, "the focused row carries the focus ring");
+    key(&mut e, "Down");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(1), "the child");
+    key(&mut e, "Return");
+    let want = e.pdf.as_ref().unwrap().dest_y(&Dest { page: 1, view: View::Xyz { left: Some(0.0), top: Some(90.0), zoom: None } });
+    assert!(near(e.scroll_y, want), "Enter follows the child's /XYZ: {} vs {want}", e.scroll_y);
+    key(&mut e, "End");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(2));
+    key(&mut e, "Home");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, Some(0));
+    key(&mut e, "F4");
+    assert_eq!(e.pdf.as_ref().unwrap().strip_focus, None, "the strip closed: its focus goes");
+}
+
+#[test]
+fn pdf4fit_width_page() {
+    use super::thumbs::STRIP_W;
+    let mut e = open(400, 600);
+    let sw = e.pdf.as_ref().unwrap().stack_w();
+    key(&mut e, "w");
+    assert_eq!(e.zoom_pct(), (400.0 / sw * 100.0).floor() as u32, "fit-width: the frame over the stack's width");
+    assert!(e.pdf_status().unwrap().ends_with(" \u{b7} fit-w"), "{:?}", e.pdf_status());
+    key(&mut e, "F4");
+    assert_eq!(e.zoom_pct(), ((400.0 - STRIP_W) / sw * 100.0).floor() as u32, "the strip open: the strip-less width over the stack's");
+    e.set_device_size(600, 600);
+    assert_eq!(e.zoom_pct(), ((600.0 - STRIP_W) / sw * 100.0).floor() as u32, "a resize re-fits");
+    let fit = e.zoom_pct();
+    assert_eq!(e.zoom_step(1), crate::chrome::zoom::step(fit, 1));
+    assert_eq!(e.pdf.as_ref().unwrap().fit, None, "a ladder step drops the mode");
+    assert!(!e.pdf_status().unwrap().contains("fit"), "{:?}", e.pdf_status());
+    e.set_device_size(600, 200);
+    key(&mut e, "p");
+    let ph = 100.0 * PT + 2.0 * GAP;
+    let want = (((600.0 - STRIP_W) / sw).min(200.0 / ph) * 100.0).floor() as u32;
+    assert_eq!(e.zoom_pct(), want, "fit-page: the tallest page and its gaps fit the height");
+    assert!(want < ((600.0 - STRIP_W) / sw * 100.0).floor() as u32, "the height binds here");
+    assert!(e.pdf_status().unwrap().ends_with(" \u{b7} fit-p"), "{:?}", e.pdf_status());
+}
+
+#[test]
+fn pdf4outline_contrast_floor() {
+    use super::thumbs::{ink_floor, INK_FLOOR, STRIP_BG};
+    use crate::fonts::raster::luminance;
+    assert!(luminance(STRIP_BG) < INK_FLOOR);
+    let dark = (60, 0, 0);
+    let lifted = ink_floor(dark);
+    let l = luminance(lifted);
+    assert!((INK_FLOOR..=INK_FLOOR + 3).contains(&l), "a dark /C is lifted to the floor: {lifted:?} at {l}");
+    assert!(lifted.0 > lifted.1 && lifted.0 > lifted.2, "its hue holds: {lifted:?}");
+    assert_eq!(ink_floor((200, 220, 255)), (200, 220, 255), "an ink above the floor is unchanged");
+    assert_eq!(luminance(ink_floor((0, 0, 0))), INK_FLOOR, "black lands on the floor grey");
+}
