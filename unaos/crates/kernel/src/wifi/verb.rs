@@ -109,8 +109,8 @@ fn join(ssid: Option<&str>, console: &mut Console) {
          association (S9) are built and run once per boot from `tests wifi <ssid>` on a wifi10 image \
          (wifi_core::ieee80211::build_auth_open / build_assoc_req over the WIFI10 TX ring, the replies \
          judged by wifi::assoc), no capture yet; the data-frame <-> Ethernet path for smoltcp is \
-         host-tested. WPA2 is S10, unbuilt, owed to CRYPTOCORE (PBKDF2-HMAC-SHA1, HMAC-SHA1, \
-         AES-CCMP): an open BSS only. Not attempted here.",
+         host-tested. WPA2-PSK is S10 on the MT7925 path (`tests wifijoin <ssid> <passphrase>`, CCMP keys held by the radio); \
+         on the BCM4331 path WPA2 is unbuilt (WPA2JOIN owed): an open BSS only. Not attempted here.",
         ssid
     ));
 }
@@ -257,7 +257,7 @@ fn ssid_view(b: &[u8]) -> alloc::string::String {
 pub fn wifijoin() {
     use crate::drivers::mt7925 as mt;
     use wifi_core::ieee80211 as w;
-    let s9w = mt::watch_kat(super::assoc::refusal); let kat = mt::join_kat() && super::assoc::kat().2.is_none() && s9w; // S9WATCH (zenbook-ledger Z56): the S9 link watch's rows with the station's own judge (LINE-NEUTRAL)
+    let s9w = mt::watch_kat(super::assoc::refusal); let kat = mt::join_kat() && super::assoc::kat().2.is_none() && super::assoc::wpa2_kat().iter().all(|&k| k) && s9w; // S9WATCH (zenbook-ledger Z56): the S9 link watch's rows with the station's own judge (LINE-NEUTRAL)
     let k = if kat { "ok" } else { "FAIL" };
     if !mt::registered() {
         serial_println!(":: wifijoin: kat={} s9watch={} radio=absent -> {} ::", k, if s9w { "ok" } else { "FAIL" }, if kat { "PASS" } else { "FAIL" }); // S9WATCH (Z56): s9watch=
@@ -276,27 +276,27 @@ pub fn wifijoin() {
     }
     let Some(me) = mt::mac() else { return refuse("no-mac") };
     let sb = ssid.as_bytes();
-    let (mut best, mut prot): (Option<super::assoc::Bss>, bool) = (None, false);
+    let (mut best, mut prot): (Option<super::assoc::Bss>, bool) = (None, false); let mut pass = crate::tests::arg2().unwrap_or_default().into_bytes(); let mut rsn: Option<alloc::vec::Vec<u8>> = None;
     let _ = mt::scan(&mut |f: &[u8]| -> bool {
         let Some(b) = super::assoc::bss_match(f, sb) else { return false };
-        if b.protected {
+        if b.protected && (pass.is_empty() || !w::rsn_ie(f).map_or(false, w::rsn_psk_ccmp)) {
             prot = true;
         } else if best.is_none() && b.channel.is_some() {
-            best = Some(b);
+            best = Some(b); rsn = if b.protected { w::rsn_ie(f).map(|e| e.to_vec()) } else { None };
             return true;
         }
         false
     });
-    let Some(bss) = best else { return refuse(if prot { "protected-s10" } else { "not-heard" }) };
-    let (bssid, ch) = (bss.bssid, bss.channel.unwrap_or(0));
-    let cap = super::assoc::assoc_cap(&bss);
+    let Some(bss) = best else { return refuse(if !prot { "not-heard" } else if pass.is_empty() { "protected-no-psk" } else { "rsn-unsupported" }) };
+    let (bssid, ch) = (bss.bssid, bss.channel.unwrap_or(0)); let pk = rsn.as_ref().map(|_| super::assoc::wpa_pmk(sb, &pass)); crypto_core::ct::Zeroize::zeroize(&mut pass);
+    let cap = super::assoc::assoc_cap(&bss); let pmk = match pk { Some(Err(e)) => return refuse(e), Some(Ok(k)) => Some(crypto_core::ct::SecretBytes(k)), None => None };
     let mt_ = |m: [u8; 6]| alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
     let (mut auth, mut assoc): (Option<w::AuthResult>, Option<w::AssocResult>) = (None, None);
     let mut refused: Option<(u8, &'static str, u16)> = None;
     let plan = mt::JoinPlan { ssid: &ssid_view(sb), bssid, channel: ch, watch: super::assoc::refusal }; // S9WATCH (zenbook-ledger Z56): the station's refusal judge kept by the S9 link
     let rep = mt::join(
         &plan,
-        &mut |phase: u8| if phase == 0 { w::build_auth_open(me, bssid, 0) } else { w::build_assoc_req(me, bssid, sb, 0, cap) },
+        &mut |phase: u8| if phase == 0 { w::build_auth_open(me, bssid, 0) } else { let mut f = w::build_assoc_req(me, bssid, sb, 0, cap); if pmk.is_some() { f.extend_from_slice(&w::RSN_PSK_CCMP); } f },
         &mut |phase: u8, f: &[u8]| {
             if phase == 0 {
                 if let Some(a) = super::assoc::auth_reply(f, me, bssid) {
@@ -360,7 +360,7 @@ pub fn wifijoin() {
         if kat && aid.is_some() { "PASS" } else { "FAIL" }
     );
     if aid.is_some() {
-        s9_dhcp(); // MT7925S9 (zenbook-ledger Z46): smolnet's one DHCP client over the S9 link, then the link's counts
+        if s10_wpa2(me, bssid, ch, &ssid, rsn, pmk) { s9_dhcp(); } // MT7925S9 (zenbook-ledger Z46): smolnet's one DHCP client over the S9 link, then the link's counts
     }
 }
 
@@ -429,4 +429,97 @@ fn s9_dhcp() {
         }
         mt::say_link();
     }
+}
+
+// ── MT7925S10 (zenbook-ledger Z55): the WPA2-PSK handshake over the MT7925 link (S10) ───────────────────────────────────────────
+/// After `tests wifijoin` read ASSOCIATED to a WPA2-PSK BSS: the supplicant's side of the 4-way handshake (IEEE Std 802.11-2020
+/// §12.7.6; the pure half is `assoc::Handshake`). An open BSS (`rsn`/`pmk` None) returns true with no line. Else: a fresh SNonce from
+/// the kernel's DRBG; up to 2 s for message 1 from `mt::eapol_rx` (the link's EAPOL mailbox); message 2 out through `mt::eapol_tx`;
+/// up to 2 s for message 3 (a repeated message 1 is answered with message 2 again, counted `replay=`); message 4 out and its fetch
+/// awaited BEFORE the keys are handed to the radio (`mt::set_keys`: linux and wpa_supplicant's order — the AP must see message 4
+/// under the old, unencrypted state); one verdict line. True = SECURED, so the caller runs its DHCP; false = refused, said by name,
+/// no DHCP. The PMK, the PTK and the keys are wiped on every exit (their owners' Drop); no key byte is printed.
+fn s10_wpa2(me: [u8; 6], bssid: [u8; 6], ch: u8, ssid: &str, rsn: Option<alloc::vec::Vec<u8>>, pmk: Option<crypto_core::ct::SecretBytes<32>>) -> bool {
+    use super::assoc::{eapol_eth, eapol_payload, Handshake, Why};
+    use crate::drivers::mt7925 as mt;
+    let (Some(rsn), Some(pmk)) = (rsn, pmk) else { return true };
+    let refuse = |why: &str| -> bool {
+        serial_println!("[mt7925] s10 wpa2 -> REFUSED why={}", why);
+        serial_println!(":: wifijoin: s10 wpa2 -> FAIL why={} ::", why);
+        false
+    };
+    if !mt::linked() {
+        return refuse("no-link");
+    }
+    let mut sn = [0u8; 32];
+    crate::rand::drbg_fill(&mut sn);
+    let mut hs = Handshake::new(bssid, me, sn, &rsn, &pmk.0);
+    let (c0, t0) = (mt::eapol_counts(), crate::arch::ms());
+    let ms = || crate::arch::ms().saturating_sub(t0);
+    let next = |deadline: u64| -> Option<alloc::vec::Vec<u8>> {
+        loop {
+            if let Some(eth) = mt::eapol_rx() {
+                if let Some(p) = eapol_payload(&eth, &me, &bssid) {
+                    return Some(p.to_vec());
+                }
+            }
+            if ms() >= deadline {
+                return None;
+            }
+            crate::arch::sched::sleep_ms(1);
+        }
+    };
+    let Some(m1) = next(ms() + 2000) else { return refuse("timeout(step=1)") };
+    let t1 = ms();
+    let m2 = match hs.on_m1(&m1) {
+        Ok(m) => m,
+        Err(w) => return refuse(w.name()),
+    };
+    if !mt::eapol_tx(&eapol_eth(&me, &bssid, &m2)) {
+        return refuse("tx(step=2)");
+    }
+    let (mut again, mut dl) = (0u32, ms() + 2000);
+    let (m4, keys) = loop {
+        let Some(f) = next(dl) else { return refuse("timeout(step=3)") };
+        match hs.on_m3(&f) {
+            Ok(r) => break r,
+            Err(Why::Frame) => {
+                if let Ok(m2) = hs.on_m1(&f) {
+                    again += 1;
+                    dl = ms() + 2000;
+                    if !mt::eapol_tx(&eapol_eth(&me, &bssid, &m2)) {
+                        return refuse("tx(step=2)");
+                    }
+                }
+            }
+            Err(w) => return refuse(w.name()),
+        }
+    };
+    let t3 = ms();
+    if !mt::eapol_tx(&eapol_eth(&me, &bssid, &m4)) {
+        return refuse("tx(step=4)");
+    }
+    let c1 = mt::eapol_counts();
+    serial_println!(
+        "[mt7925] s10 wpa2 m1={} m3={} replay={} eapol={} other={} -> keys",
+        t1, t3, again, c1.0.wrapping_sub(c0.0), c1.1.wrapping_sub(c0.1)
+    );
+    if let Err(e) = mt::set_keys(bssid, ch, &keys.tk, &keys.gtk, keys.gtk_id) {
+        return refuse(&alloc::format!("set-key({})", e));
+    }
+    serial_println!(":: wifijoin: s10 wpa2 ssid={} -> SECURED ::", ssid_view(ssid.as_bytes()));
+    true
+}
+
+/// `tests wpa2` (MT7925S10, zenbook-ledger Z55): the WPA2-PSK known-answer legs, no radio needed — `assoc::wpa2_kat`'s five (PBKDF2
+/// Annex J.4, the PRF Annex J.3 and a pinned PTK, the EAPOL-Key MIC, the RFC 3394 unwrap, the message frames) and `mt7925::s10_kat`'s
+/// key-command bodies. One verdict line.
+pub fn wpa2() {
+    let a = super::assoc::wpa2_kat();
+    let keys = crate::drivers::mt7925::s10_kat();
+    let ok = |b: bool| if b { "ok" } else { "FAIL" };
+    serial_println!(
+        ":: WPA2KAT: pbkdf2={} prf={} mic={} unwrap={} frame={} keys={} -> {} ::",
+        ok(a[0]), ok(a[1]), ok(a[2]), ok(a[3]), ok(a[4]), ok(keys), if a.iter().all(|&b| b) && keys { "PASS" } else { "FAIL" }
+    );
 }

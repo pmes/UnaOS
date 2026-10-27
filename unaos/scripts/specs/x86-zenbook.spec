@@ -9,7 +9,7 @@
 #          `test_x86_64` as X86_TEST_SPEC (its COMPLETE ends the wall, its REQUIREs are scored by `x86_test_completion`)
 #          and `x86_pick_capture_spec` replays it (the ZENBOOKLANE arm, asked before the SELFHOST skip).
 #          ZENBOOKLANETYPED (zenbook-ledger Z16): `zenbook_lane_typed` arms ONE typist (scripts/typist.sh, twoboot's) on the
-#          lane's QMP port: the first-user form, then `tests platform|ec|nvme|i8042|dwi2c|hdacensus|gopshot|eclid|suspend|ecqnames|dwi2cacpi|bootlist`
+#          lane's QMP port: the first-user form, then `tests platform|ec|nvme|i8042|dwi2c|hdacensus|gopshot|eclid|suspend|ecqnames|dwi2cacpi|wpa2|bootlist`
 #          (ZENBOOKFLIGHTLIST Z33 added hdacensus, gopshot, eclid; ZENBOOKSPECPINS Z54 suspend, ecqnames, dwi2cacpi), one line each (`tests`
 #          runs ONE fixture per line), each held on the verdict before it; transcript target/zenbook-typist.log (beside).
 #
@@ -88,6 +88,9 @@ REQUIRE :: DWI2CGPIO: .* refuse=2/2 -> PASS ::
 REQUIRE :: DWI2CFAST: fmcn=120/256/30 sscn=650/669/30 .* refuse=3/3 -> PASS ::
 FORBID :: (SUSPEND|ECQNAMES|DWI2CACPI|DWI2CGPIO|DWI2CFAST): .*-> FAIL
 FORBID :: (PLATFORM|EC|NVME|I8042|DWI2C|HDACENSUS|GOPSHOT|ECLID|BOOTLIST): .*-> FAIL
+# MT7925S10 (zenbook-ledger Z55): `tests wpa2`, the WPA2-PSK known-answer legs (PBKDF2 Annex J.4, PRF Annex J.3 + a pinned PTK, the EAPOL-Key MIC, RFC 3394 unwrap, the M1->M2 / M3->M4 frames, the key-command bodies); pure, so QEMU runs it with no radio
+REQUIRE :: WPA2KAT: pbkdf2=ok prf=ok mic=ok unwrap=ok frame=ok keys=ok -> PASS ::
+FORBID :: WPA2KAT: .*-> FAIL
 
 # ── 10. ZENBOOKACP (Z25): the HDA census on q35's intel-hda + hda-duplex (UNAOS_HDA), the drive path skipped ───────────
 REQUIRE \[hw\] skip hda platform=zenbook_um5606w
