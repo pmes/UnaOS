@@ -238,8 +238,8 @@ fn open_inner(path: &str, text: Vec<u8>, spans: Vec<richtext::Span>, n_bytes: us
     let h = WIN_H().min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
     let face = super::text::Face::Grid; // UIMETRICS: the dpi-sized mono grid face
     let (cw, ch) = (face.cell_w(), face.cell_h());
-    let cols = w.saturating_sub(2 * PAD() + crate::ui::px(6)) / cw;
-    let vis = h.saturating_sub(2 * PAD()) / ch;
+    let cols = grid_fit(w, h, cw, ch).0; // TEXTSCALE3 (B849): the one cols/vis formula (file tail), which `reflow` re-asks at a restyle
+    let vis = grid_fit(w, h, cw, ch).1;
     if cols < 8 || vis < 2 {
         return Err(String::from("window below floor"));
     }
@@ -518,7 +518,7 @@ pub fn font_repaint() {
     }
     let mut g = STATE.lock();
     let Some(st) = g.as_mut() else { return };
-    paint(st);
+    reflow(st); paint(st); // TEXTSCALE3 (B849): re-lay cols/vis/wrap at the restyled cell, then paint
     drop(g);
     let _ = wm::present(id);
 }
@@ -553,4 +553,51 @@ pub fn quicklook_body(path: &str, kind: &str, w: usize, h: usize) -> Result<(Vec
     let mut st = State { path: String::from(path), rows: lay.rows, text, top: 0, vis, cols, w, h, surf, spans };
     paint(&mut st);
     Ok((st.surf, rows_n))
+}
+
+// ── TEXTSCALE3 (rmbp-ledger B849) — the File view re-lays at a restyle ──────────────────────────────────────────────
+// The rows pitch on the live Grid cell, but `cols`, `vis` and the wrap were fixed at open, so a text-size step drew
+// rows past the window's bottom on the old wrap. `font_repaint` now re-asks the one formula (`grid_fit`) at the live
+// cell and re-wraps when the columns moved; the window keeps its size (a text view scrolls).
+
+/// Repaints the restyle fan-out asked for (`font_repaint`).
+static TS_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+/// The columns and visible rows a `w x h` (physical px) text view holds at a `cw x ch` cell — the one formula the
+/// viewer and the editor open with and re-lay with.
+pub(crate) fn grid_fit(w: usize, h: usize, cw: usize, ch: usize) -> (usize, usize) {
+    (w.saturating_sub(2 * PAD() + crate::ui::px(6)) / cw.max(1), h.saturating_sub(2 * PAD()) / ch.max(1))
+}
+
+/// Re-lay the open view at the live cell: new `cols` re-wrap the text, new `vis` re-clamp the scroll.
+fn reflow(st: &mut State) {
+    TS_FRAMES.fetch_add(1, Ordering::Relaxed);
+    let face = super::text::Face::Grid;
+    let (cols, vis) = grid_fit(st.w, st.h, face.cell_w(), face.cell_h());
+    if cols < 8 || vis < 2 || (cols, vis) == (st.cols, st.vis) {
+        return;
+    }
+    if cols != st.cols {
+        st.rows = layout(&st.text, cols).rows;
+    }
+    st.cols = cols;
+    st.vis = vis;
+    st.top = clamp_top(st.top, st.rows.len(), vis);
+}
+
+/// `tests textscale`: the rows the view holds at the live cell, and whether they fit (and an open view was re-laid).
+#[cfg(feature = "witness")]
+pub fn textscale_rows() -> (usize, bool) {
+    let face = super::text::Face::Grid;
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    let (cols, vis) = grid_fit(WIN_W(), WIN_H(), cw, ch);
+    let fits = cols >= 8 && vis >= 2 && 2 * PAD() + vis * ch <= WIN_H();
+    let relaid = STATE.lock().as_ref().is_none_or(|st| (st.cols, st.vis) == grid_fit(st.w, st.h, cw, ch));
+    (vis, fits && relaid)
+}
+
+/// `tests textscale`: how many restyle repaints this window has taken.
+#[cfg(feature = "witness")]
+pub fn textscale_frames() -> u32 {
+    TS_FRAMES.load(Ordering::Relaxed)
 }

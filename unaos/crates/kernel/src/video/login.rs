@@ -125,13 +125,13 @@ use super::super::{fbcon, font, theme, wm};
 use crate::fs::users;
 
 const W: usize = 440;
-const H: usize = 300; // DIALOG2 (B404): +60 for the power row (Sleep · Restart · Shut Down) under the form
+const H0: usize = 300; #[allow(non_snake_case)] fn H() -> usize { CARD_H.load(Ordering::Relaxed) } // TEXTSCALE3 (B849): the height the open card was laid out at (`h_at`, latched at open: the surface, the row and every clip agree). DIALOG2 (B404): +60 for the power row (Sleep · Restart · Shut Down) under the form
 /// LOGINFONT (R64: *"the font in the login window was super huge and blocky"*) — the screen's text is the
 /// shared anti-aliased face (`video/font.rs`, the one Quarry took in QUARRYFONT), not font8x8 at 2x. The
 /// vertical rhythm stays 16 px (`Face::Body.cell_h()` is `CELL_H` = 16, what the 2x cell was); the
 /// horizontal arithmetic moves to the face's own advance, as `font::draw_text`'s doc says a conversion must.
 const FACE: crate::video::text::Face = crate::video::text::Face::Ui; // KERNELFONT (B359): the login screen's text is DejaVu Sans (proportional) through `video::text`; the bitmap face is its fallback
-const CELL: usize = font::Face::Body.cell_h();
+#[allow(non_snake_case)] fn CELL() -> usize { theme::metrics().grow(font::Face::Body.cell_h()) } // TEXTSCALE3 (B849): the UI line (`theme::metrics`, TEXTSCALE's one reader); 16 at the default size
 #[allow(dead_code)] const CW: usize = font::Face::Body.cell_w(); // KERNELFONT: layout measures with `text::advance` now; the bitmap advance kept for the fallback's docs
 const FIELD_MAX: usize = 32;
 
@@ -151,7 +151,7 @@ static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// SAFETY: written only from `repaint` on the thread that owns keys (the route that called
 /// `consume_key`, or the ignition that called `open_once`), read by `wm`'s composite — the same benign
 /// present-tear every app surface shares (instgui's contract).
-fn surf() -> &'static mut [u32] { super::super::metrics::leaked_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(H)) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
+fn surf() -> &'static mut [u32] { super::super::metrics::leaked_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(H())) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -280,15 +280,15 @@ const USER_W: usize = 92;
 const USER_GAP: usize = 8;
 const FIELD_X: usize = LX + 100;
 const FIELD_W: usize = W - 2 * LX - 100;
-const FIELD_H: usize = CELL + 8;
+#[allow(non_snake_case)] fn FIELD_H() -> usize { CELL() + 8 }
 const BTN_W: usize = 120;
-const BTN_H: usize = 28;
+#[allow(non_snake_case)] fn BTN_H() -> usize { theme::metrics().grow(28) }
 /// DIALOG2: the power row — three buttons centred along the bottom of the log-in form.
 const PWR_W: usize = 96;
-const PWR_H: usize = 26;
+#[allow(non_snake_case)] fn PWR_H() -> usize { theme::metrics().grow(26) }
 const PWR_GAP: usize = 12;
 const PWR_X: usize = (W - (3 * PWR_W + 2 * PWR_GAP)) / 2;
-const PWR_Y: usize = 238;
+#[allow(non_snake_case)] fn PWR_Y() -> usize { gy(238) } // TEXTSCALE3: the power row's band (`BANDS`)
 const PWR_LABEL: [&[u8]; 3] = [b"Sleep", b"Restart", b"Shut Down"];
 
 /// SECLOGIN M6 — THE ROSTER POLICY. Names on the pre-session glass are a THEME/POLICY choice, not a
@@ -317,13 +317,13 @@ fn user_rows() -> usize {
 /// the current form does not carry has an EMPTY rect, so `ctl_at` cannot hit it and the painter draws nothing.
 fn ctl_rect(c: Ctl, setpw: bool) -> (usize, usize, usize, usize) {
     match (c, setpw) {
-        (Ctl::User(i), false) => (LX + i * (USER_W + USER_GAP), 46, USER_W, FIELD_H),
-        (Ctl::NameField, false) => (FIELD_X, 76, FIELD_W, FIELD_H),
-        (Ctl::PwField, false) => (FIELD_X, 112, FIELD_W, FIELD_H),
-        (Ctl::PwField, true) => (FIELD_X, 76, FIELD_W, FIELD_H),
-        (Ctl::Pw2Field, true) => (FIELD_X, 112, FIELD_W, FIELD_H),
-        (Ctl::Button, _) => (W - LX - BTN_W, 150, BTN_W, BTN_H),
-        (Ctl::Power(i), false) if i < 3 => (PWR_X + i as usize * (PWR_W + PWR_GAP), PWR_Y, PWR_W, PWR_H),
+        (Ctl::User(i), false) => (LX + i * (USER_W + USER_GAP), gy(46), USER_W, FIELD_H()),
+        (Ctl::NameField, false) => (FIELD_X, gy(76), FIELD_W, FIELD_H()),
+        (Ctl::PwField, false) => (FIELD_X, gy(112), FIELD_W, FIELD_H()),
+        (Ctl::PwField, true) => (FIELD_X, gy(76), FIELD_W, FIELD_H()),
+        (Ctl::Pw2Field, true) => (FIELD_X, gy(112), FIELD_W, FIELD_H()),
+        (Ctl::Button, _) => (W - LX - BTN_W, gy(150), BTN_W, BTN_H()),
+        (Ctl::Power(i), false) if i < 3 => (PWR_X + i as usize * (PWR_W + PWR_GAP), PWR_Y(), PWR_W, PWR_H()),
         _ => (0, 0, 0, 0),
     }
 }
@@ -331,10 +331,10 @@ fn ctl_rect(c: Ctl, setpw: bool) -> (usize, usize, usize, usize) {
 /// FIRSTBOOT (R77): the create-user form's rects — name, password, retype stacked, the button where every form has it.
 fn cu_rect(c: Ctl) -> (usize, usize, usize, usize) {
     match c {
-        Ctl::NameField => (FIELD_X, 46, FIELD_W, FIELD_H),
-        Ctl::PwField => (FIELD_X, 82, FIELD_W, FIELD_H),
-        Ctl::Pw2Field => (FIELD_X, 118, FIELD_W, FIELD_H),
-        Ctl::Button => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+        Ctl::NameField => (FIELD_X, gy(46), FIELD_W, FIELD_H()),
+        Ctl::PwField => (FIELD_X, gy(82), FIELD_W, FIELD_H()),
+        Ctl::Pw2Field => (FIELD_X, gy(118), FIELD_W, FIELD_H()),
+        Ctl::Button => (W - LX - BTN_W, gy(150), BTN_W, BTN_H()),
         _ => (0, 0, 0, 0),
     }
 }
@@ -413,7 +413,7 @@ fn local_of(x: i32, y: i32) -> Option<(i32, i32)> {
     }
     let s = info.scale.max(1) as i32;
     let (lx, ly) = (super::super::metrics::to_logical((dx / s) as usize) as i32, super::super::metrics::to_logical((dy / s) as usize) as i32); // UIMETRICS: physical surface px -> the logical layout
-    if lx >= W as i32 || ly >= H as i32 {
+    if lx >= W as i32 || ly >= H() as i32 {
         return None;
     }
     Some((lx, ly))
@@ -425,7 +425,7 @@ fn local_of(x: i32, y: i32) -> Option<(i32, i32)> {
 
 fn fill(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
     // UIMETRICS (B372): the rect is LOGICAL px, clipped to the logical W x H; the surface is the physical one.
-    let (w, h) = (w.min(W.saturating_sub(x)), h.min(H.saturating_sub(y)));
+    let (w, h) = (w.min(W.saturating_sub(x)), h.min(H().saturating_sub(y)));
     super::super::metrics::fill(px, super::super::metrics::size(W), x, y, w, h, c);
 }
 
@@ -438,11 +438,11 @@ fn fill(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
 
 fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
     // LOGINFONT: the shared face, clipped to the surface; all-or-nothing per glyph (its contract).
-    let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, x, y, s, fg, false, FACE); // UIMETRICS: logical origin, dpi-sized face
+    let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H()), W, x, y, s, fg, false, FACE); // UIMETRICS: logical origin, dpi-sized face
 }
 
 fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: bool, secret: bool) {
-    craft_box(px, x, y, w, CELL + 8, Craft::Field, focused); // DESKTOPCRAFT (B631): the kit's text field — rounded, a control-edge hairline, the accent ring outside when focused (was a flat box in a 1 px frame)
+    craft_box(px, x, y, w, FIELD_H(), Craft::Field, focused); // DESKTOPCRAFT (B631): the kit's text field — rounded, a control-edge hairline, the accent ring outside when focused (was a flat box in a 1 px frame)
     let n = content.len().min(FIELD_MAX);
     if secret {
         let dots = [b'*'; FIELD_MAX];
@@ -452,7 +452,7 @@ fn field(px: &mut [u32], x: usize, y: usize, w: usize, content: &[u8], focused: 
     }
     if focused {
         let cx = x + 6 + if secret { super::super::metrics::ladvance(&[b'*'; FIELD_MAX][..n], false, FACE) } else { super::super::metrics::ladvance(&content[..n], false, FACE) }; // KERNELFONT: the caret sits at the shaped advance. LOGINFONT: the caret sits at the face's advance, not the old square cell
-        fill(px, cx, y + 4, 2, CELL, theme::text_primary());
+        fill(px, cx, y + 4, 2, CELL(), theme::text_primary());
     }
 }
 
@@ -465,8 +465,8 @@ fn button(px: &mut [u32], c: Ctl, label: &[u8], primary: bool, setpw: bool) {
     craft_box(px, x, y, w, h, if primary { Craft::Primary } else { Craft::Button }, false); // DESKTOPCRAFT (B631): the kit's push button (rounded, soft shadow, hairline)
     let tw = super::super::metrics::ladvance(label, false, FACE); // KERNELFONT: the shaped width. LOGINFONT
     let tx = x + w.saturating_sub(tw) / 2;
-    let ty = y + h.saturating_sub(CELL) / 2;
-    text(px, tx, ty, label, if primary { theme::surface_raised() } else { theme::text_primary() });
+    let ty = y + h.saturating_sub(CELL()) / 2;
+    text_to(px, tx, ty, label, if primary { theme::surface_raised() } else { theme::text_primary() }, x + w); // TEXTSCALE3 (B849): the caption stays inside its box
 }
 
 /// LOGINFLOW M1 — one user's row. The screen says WHO lives on this machine, which is the Mac model
@@ -492,27 +492,27 @@ fn repaint() {
     // SAFETY: see `SURF`.
     let px: &mut [u32] = surf();
     CIVIL_MIN.store(crate::clock::try_unix_now().map_or(u64::MAX, |u| u / 60), Ordering::Relaxed); // CLOCKPAINTERS (B719): the minute this paint shows (`civil_tick`)
-    fill(px, 0, 0, W, H, theme::surface_window());
+    fill(px, 0, 0, W, H(), theme::surface_window());
     // DESKTOPCRAFT (B631): no inner 1 px frame — the window's own chrome (rounded head, shadowed band) is the card's edge.
     if matches!(f.state, State::Unlock | State::Words) { kb_paint(px, &f); drop(f); let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { let _ = wm::present(id); } return; } if f.state == State::CreateUser { // KEYBOOT (B688): the unlock and words forms (this file's tail)
         // FIRSTBOOT (R77): "Create your account" — name, password, retype, Create.
-        text(px, LX, 14, b"Create your administrator account", theme::text_primary()); // FIRSTUSER (R100): the first user is the administrator
-        craft_rule(px, LX, 36, W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
+        text(px, LX, gy(14), b"Create your administrator account", theme::text_primary()); // FIRSTUSER (R100): the first user is the administrator
+        craft_rule(px, LX, gy(36), W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
         let (nx, ny, nw, _) = cu_rect(Ctl::NameField);
-        text(px, LX, ny + 4, b"Name", theme::text_secondary());
+        text_to(px, LX, ny + 4, b"Name", theme::text_secondary(), FIELD_X - 4);
         field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
         let (pxf, py, pwf, _) = cu_rect(Ctl::PwField);
-        text(px, LX, py + 4, b"Password", theme::text_secondary());
+        text_to(px, LX, py + 4, b"Password", theme::text_secondary(), FIELD_X - 4);
         field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
         let (p2x, p2y, p2w, _) = cu_rect(Ctl::Pw2Field);
-        text(px, LX, p2y + 4, b"Retype", theme::text_secondary());
+        text_to(px, LX, p2y + 4, b"Retype", theme::text_secondary(), FIELD_X - 4);
         field(px, p2x, p2y, p2w, &f.pw2[..f.pw2_len], f.focus == Focus::Retype, true);
         let (bx, by, _, _) = cu_rect(Ctl::Button);
         let _ = (bx, by);
         button(px, Ctl::Button, b"Create", true, false);
-        text(px, LX, 186, b"Enter or Create   Tab switches", theme::text_secondary());
+        text(px, LX, gy(186), b"Enter or Create   Tab switches", theme::text_secondary());
         if !f.message.is_empty() {
-            text(px, LX, 212, f.message.as_bytes(), theme::accent());
+            text(px, LX, gy(212), f.message.as_bytes(), theme::accent());
         }
         drop(f);
         let id = WIN.load(Ordering::Relaxed);
@@ -536,19 +536,19 @@ fn repaint() {
         title[..19].copy_from_slice(b"Set a password for ");
         let n = f.name_len.min(users::NAME_MAX);
         title[19..19 + n].copy_from_slice(&f.name[..n]);
-        text(px, LX, 14, &title[..19 + n], theme::text_primary());
-        craft_rule(px, LX, 36, W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
+        text(px, LX, gy(14), &title[..19 + n], theme::text_primary());
+        craft_rule(px, LX, gy(36), W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
         let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField, true);
-        text(px, LX, py + 4, b"Password", theme::text_secondary());
+        text_to(px, LX, py + 4, b"Password", theme::text_secondary(), FIELD_X - 4);
         field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password, true);
         let (p2x, p2y, p2w, _) = ctl_rect(Ctl::Pw2Field, true);
-        text(px, LX, p2y + 4, b"Retype", theme::text_secondary());
+        text_to(px, LX, p2y + 4, b"Retype", theme::text_secondary(), FIELD_X - 4);
         field(px, p2x, p2y, p2w, &f.pw2[..f.pw2_len], f.focus == Focus::Retype, true);
         button(px, Ctl::Button, b"Set", true, true);
         let hint: &[u8] = b"Enter or Set   Tab switches";
-        text(px, LX, 186, hint, theme::text_secondary());
+        text(px, LX, gy(186), hint, theme::text_secondary());
         if !f.message.is_empty() {
-            text(px, LX, 212, f.message.as_bytes(), theme::accent());
+            text(px, LX, gy(212), f.message.as_bytes(), theme::accent());
         }
         drop(f);
         let id = WIN.load(Ordering::Relaxed);
@@ -561,8 +561,8 @@ fn repaint() {
     // create-first-user title, button label and hint that keyed on `users::count() == 0` are gone.
     let locked = LOCKED.load(Ordering::Relaxed);
     let title: &[u8] = if locked { b"Locked" } else { b"Log in to UnaOS" };
-    text(px, LX, 14, title, theme::text_primary()); if locked { if let Some(secs) = crate::clock::try_unix_now() { let mut c = [b' '; 8]; let n = crate::clock::locale::fmt_time(crate::clock::locale::Painter::Bar, secs, &mut c).min(8); let t = &c[8 - n..]; let t = &t[t.iter().position(|&b| b != b' ').unwrap_or(t.len())..]; text(px, (W - LX).saturating_sub(super::super::metrics::ladvance(t, false, FACE)), 14, t, theme::text_secondary()); } } // LOCK2 (B728): the locked card shows the civil clock (the bar's text through `clock::locale::fmt_time`, the one formatter; `video::lock::clock_tick` repaints it once a minute) beside the title; the session's name is the tile and the read-only field below. LINE-NEUTRAL fold, code first.
-    craft_rule(px, LX, 36, W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
+    text(px, LX, gy(14), title, theme::text_primary()); if locked { if let Some(secs) = crate::clock::try_unix_now() { let mut c = [b' '; 8]; let n = crate::clock::locale::fmt_time(crate::clock::locale::Painter::Bar, secs, &mut c).min(8); let t = &c[8 - n..]; let t = &t[t.iter().position(|&b| b != b' ').unwrap_or(t.len())..]; text(px, (W - LX).saturating_sub(super::super::metrics::ladvance(t, false, FACE)), gy(14), t, theme::text_secondary()); } } // LOCK2 (B728): the locked card shows the civil clock (the bar's text through `clock::locale::fmt_time`, the one formatter; `video::lock::clock_tick` repaints it once a minute) beside the title; the session's name is the tile and the read-only field below. LINE-NEUTRAL fold, code first.
+    craft_rule(px, LX, gy(36), W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
     // The user rows, when there are users. `name_at` is the store's own accessor, so the row a press
     // picks and the row the painter draws are the same row by construction — the `ctl_rect` argument
     // one layer up, applied to the CONTENT as well as to the geometry.
@@ -574,25 +574,25 @@ fn repaint() {
     }
     if locked { if let Some(n) = users::whoami(&mut nb) { user_row(px, 0, &nb[..n], true); } } // FIRSTUSER (R100): the lock screen has the login window's look — the session's own tile and avatar
     let (nx, ny, nw, _) = ctl_rect(Ctl::NameField, false);
-    text(px, LX, ny + 4, b"Name", theme::text_secondary());
+    text_to(px, LX, ny + 4, b"Name", theme::text_secondary(), FIELD_X - 4);
     field(px, nx, ny, nw, &f.name[..f.name_len], f.focus == Focus::Name, false);
     let (pxf, py, pwf, _) = ctl_rect(Ctl::PwField, false);
-    text(px, LX, py + 4, b"Password", theme::text_secondary());
+    text_to(px, LX, py + 4, b"Password", theme::text_secondary(), FIELD_X - 4);
     field(px, pxf, py, pwf, &f.pw[..f.pw_len], f.focus == Focus::Password && PFOCUS.load(Ordering::Relaxed) == 0, true);
     button(px, Ctl::Button, if locked { b"Unlock" } else { b"Log In" }, true, false);
     power_row(px, f.state == State::Open); // RESOLVEHANG2 (B531): the caller holds FORM — pass the state in, never re-lock
     let hint: &[u8] = b"Enter or Log In   Tab switches";
-    text(px, LX, 186, hint, theme::text_secondary());
+    text(px, LX, gy(186), hint, theme::text_secondary());
     let civil_w = civil_line(px); // CLOCKPAINTERS (B719): the civil clock under the card, right of the footer
     if !f.message.is_empty() {
-        text(px, LX, 212, f.message.as_bytes(), theme::accent());
+        text(px, LX, gy(212), f.message.as_bytes(), theme::accent());
     } else if !locked {
         // BRIGHTFLOOR M5 — the safe-mode escape, in small text on the footer (`settings::safe_mode_check`).
-        let fy = H.saturating_sub(super::super::metrics::lcell_h(crate::video::text::Face::Chrome) + 4); // UIMETRICS: the chrome cell in logical px
+        let fy = H().saturating_sub(super::super::metrics::lcell_h(crate::video::text::Face::Chrome) + 4); // UIMETRICS: the chrome cell in logical px
         const LONG: &[u8] = b"hold Shift after login to reset display settings";
         const SHORT: &[u8] = b"Shift after login: reset display";
         let msg = if LX + super::super::metrics::ladvance(LONG, false, crate::video::text::Face::Chrome) + civil_w <= W { LONG } else { SHORT };
-        let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, LX, fy, msg, theme::text_secondary(), false, crate::video::text::Face::Chrome);
+        let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H()), W, LX, fy, msg, theme::text_secondary(), false, crate::video::text::Face::Chrome);
     }
     drop(f);
     let id = WIN.load(Ordering::Relaxed);
@@ -689,7 +689,7 @@ fn open_as(state: State) {
         crate::splash::hold_release("first-screen");
         return;
     }
-    let Some((_s, ow, oh)) = wm::spawn_geometry_native(super::super::metrics::size(W), super::super::metrics::size(H)) else {
+    CARD_H.store(h_at(theme::metrics()), Ordering::Relaxed); let Some((_s, ow, oh)) = wm::spawn_geometry_native(super::super::metrics::size(W), super::super::metrics::size(H())) else { // TEXTSCALE3 (B849): the height this card lays out at, latched before the row exists
         crate::bootlog_println!("[login] screen open window=no (no surface yet — headless form)");
         crate::splash::hold_release("first-screen");
         return;
@@ -705,7 +705,7 @@ fn open_as(state: State) {
     // never shows a blank box.
     FORM.lock().windowed = true;
     repaint();
-    let (sw, sh) = (super::super::metrics::size(W), super::super::metrics::size(H)); let surf = surf().as_mut_ptr() as usize; // UIMETRICS: the native surface
+    let (sw, sh) = (super::super::metrics::size(W), super::super::metrics::size(H())); let surf = surf().as_mut_ptr() as usize; // UIMETRICS: the native surface
     // LOGINCLOSE — the row is minted under [`OWNER`], the shell/desktop band, and THAT is what makes
     // the screen unclosable by the pointer: no control cluster is drawn for it and `wm::hit_test`
     // never names it, so neither router can ask the close question about this row. Changing this
@@ -1424,9 +1424,9 @@ fn close_leg() -> (&'static str, bool) {
     let ctrl = wm::create_at_native(
         1,
         surf().as_mut_ptr() as usize,
-        super::super::metrics::size(W) * super::super::metrics::size(H) * 4,
+        super::super::metrics::size(W) * super::super::metrics::size(H()) * 4,
         super::super::metrics::size(W) as u32,
-        super::super::metrics::size(H) as u32,
+        super::super::metrics::size(H()) as u32,
         (super::super::metrics::size(W) * 4) as u32,
         b"Log in",
         info.x,
@@ -2472,7 +2472,7 @@ fn power_row(px: &mut [u32], on: bool) { // RESOLVEHANG2 (B531): `on` from the c
         let l = PWR_LABEL[i as usize];
         let tw = super::super::metrics::ladvance(l, false, FACE);
         let ink = if i == 0 && !crate::power::sleep_armed() { theme::text_secondary() } else { theme::text_primary() }; // LOGINWINDOW (B430): Sleep greys until LIDSLEEP (B431) arms the lane
-        text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL) / 2, l, ink);
+        text_to(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL()) / 2, l, ink, x + w); // TEXTSCALE3 (B849): inside its box
     }
 }
 
@@ -2532,7 +2532,7 @@ fn power_row_fixture() -> bool {
     FORM.lock().state = State::Open;
     let rects = (0..3u8).all(|i| {
         let (x, y, w, h) = ctl_rect(Ctl::Power(i), false);
-        w > 0 && x + w <= W && y + h <= H && ctl_at((x + w / 2) as i32, (y + h / 2) as i32, false) == Some(Ctl::Power(i))
+        w > 0 && x + w <= W && y + h <= H() && ctl_at((x + w / 2) as i32, (y + h / 2) as i32, false) == Some(Ctl::Power(i))
     }) && ctl_rect(Ctl::Power(0), true).2 == 0;
     FORM.lock().focus = Focus::Password;
     PFOCUS.store(0, Ordering::Relaxed);
@@ -2579,12 +2579,12 @@ fn tile_draw(px: &mut [u32], d: super::loginwindow::Draw) -> bool {
         Draw::Fill(x, y, w, h, c) => { fill(px, x, y, w, h, c); true }
         Draw::TextIn(x, y, w, h, s, c) => {
             let tw = super::super::metrics::ladvance(s, false, FACE);
-            text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL) / 2, s, c);
+            text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL()) / 2, s, c);
             true
         }
         Draw::Icon(x, y, d, key) => {
             use super::super::metrics::size;
-            crate::fs::appres::blit_icon_known(px, size(W), size(H), size(x), size(y), size(d), key)
+            crate::fs::appres::blit_icon_known(px, size(W), size(H()), size(x), size(y), size(d), key)
         }
     }
 }
@@ -2721,10 +2721,10 @@ fn chg_form() -> bool {
 /// The change form's rects — three fields stacked as the create-user form's, the button where every form has it.
 fn chg_rect(c: Ctl) -> (usize, usize, usize, usize) {
     match c {
-        Ctl::OldField => (FIELD_X, 46, FIELD_W, FIELD_H),
-        Ctl::PwField => (FIELD_X, 82, FIELD_W, FIELD_H),
-        Ctl::Pw2Field => (FIELD_X, 118, FIELD_W, FIELD_H),
-        Ctl::Button => (W - LX - BTN_W, 150, BTN_W, BTN_H),
+        Ctl::OldField => (FIELD_X, gy(46), FIELD_W, FIELD_H()),
+        Ctl::PwField => (FIELD_X, gy(82), FIELD_W, FIELD_H()),
+        Ctl::Pw2Field => (FIELD_X, gy(118), FIELD_W, FIELD_H()),
+        Ctl::Button => (W - LX - BTN_W, gy(150), BTN_W, BTN_H()),
         _ => (0, 0, 0, 0),
     }
 }
@@ -2734,21 +2734,21 @@ fn paint_change(px: &mut [u32], f: &Form) {
     title[..23].copy_from_slice(b"Change the password of ");
     let n = f.name_len.min(users::NAME_MAX);
     title[23..23 + n].copy_from_slice(&f.name[..n]);
-    text(px, LX, 14, &title[..23 + n], theme::text_primary());
-    craft_rule(px, LX, 36, W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
+    text(px, LX, gy(14), &title[..23 + n], theme::text_primary());
+    craft_rule(px, LX, gy(36), W - 2 * LX); // DESKTOPCRAFT (B631): a one-device-px hairline (was a 2 px frame line)
     for (c, label, buf, len, focus) in [
         (Ctl::OldField, &b"Old password"[..], &f.old, f.old_len, Focus::Old),
         (Ctl::PwField, &b"New"[..], &f.pw, f.pw_len, Focus::Password),
         (Ctl::Pw2Field, &b"Verify"[..], &f.pw2, f.pw2_len, Focus::Retype),
     ] {
         let (x, y, w, _) = chg_rect(c);
-        text(px, LX, y + 4, label, theme::text_secondary());
+        text_to(px, LX, y + 4, label, theme::text_secondary(), FIELD_X - 4);
         field(px, x, y, w, &buf[..len], f.focus == focus, true);
     }
     button(px, Ctl::Button, b"Change", true, true);
-    text(px, LX, 186, b"Enter or Change   Tab switches", theme::text_secondary());
+    text(px, LX, gy(186), b"Enter or Change   Tab switches", theme::text_secondary());
     if !f.message.is_empty() {
-        text(px, LX, 212, f.message.as_bytes(), theme::accent());
+        text(px, LX, gy(212), f.message.as_bytes(), theme::accent());
     }
 }
 
@@ -2939,7 +2939,7 @@ fn echo_field() -> bool {
         (x, y, w, h, f.focus)
     };
     let id = WIN.load(Ordering::Relaxed);
-    let (y0, y1) = (edge(y), edge(y + h).min(size(H)));
+    let (y0, y1) = (edge(y), edge(y + h).min(size(H())));
     if id != wm::WIN_NONE {
         crate::video::lag::present_req(); // as `wm::present` does: INPUTSTALL's draw/pre split sees the request
         let _ = wm::present_rows(id, y0, y1);
@@ -3048,7 +3048,7 @@ fn craft_rect(x: usize, y: usize, w: usize, h: usize) -> super::super::draw::Rec
 fn craft_box(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, kind: Craft, ring: bool) {
     use super::super::draw::{self, Ink, Surf, DIMS};
     let sw = super::super::metrics::size(W);
-    let n = (sw * super::super::metrics::size(H)).min(px.len());
+    let n = (sw * super::super::metrics::size(H())).min(px.len());
     let mut s = Surf::new(&mut px[..n], sw);
     let r = craft_rect(x, y, w, h);
     let rad = (crate::ui::px(if kind == Craft::Field { DIMS.field_radius } else { DIMS.button_radius }) as i32).min(r.h / 2);
@@ -3078,7 +3078,7 @@ fn craft_box(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, kind: Craft
 fn craft_rule(px: &mut [u32], x: usize, y: usize, w: usize) {
     use super::super::draw::{self, Ink, Surf};
     let sw = super::super::metrics::size(W);
-    let n = (sw * super::super::metrics::size(H)).min(px.len());
+    let n = (sw * super::super::metrics::size(H())).min(px.len());
     let mut s = Surf::new(&mut px[..n], sw);
     let r = craft_rect(x, y, w, 1);
     draw::hairline_h(&mut s, r.x, r.y, r.w, Ink::argb(theme::hairline()));
@@ -3149,10 +3149,10 @@ pub fn open_unlock() {
 /// KEYBOOT: the forms' rects — the unlock form's field, Unlock and the switch; the words screen's Continue.
 fn kb_rect(c: Ctl, st: State) -> (usize, usize, usize, usize) {
     match (st, c) {
-        (State::Unlock, Ctl::PwField) => (FIELD_X, 76, FIELD_W, FIELD_H),
-        (State::Unlock, Ctl::Button) => (W - LX - BTN_W, 150, BTN_W, BTN_H),
-        (State::Unlock, Ctl::Kb(0)) => (LX, 150, 176, BTN_H),
-        (State::Words, Ctl::Kb(1)) => (W - LX - BTN_W, 236, BTN_W, BTN_H),
+        (State::Unlock, Ctl::PwField) => (FIELD_X, gy(76), FIELD_W, FIELD_H()),
+        (State::Unlock, Ctl::Button) => (W - LX - BTN_W, gy(150), BTN_W, BTN_H()),
+        (State::Unlock, Ctl::Kb(0)) => (LX, gy(150), 176, BTN_H()),
+        (State::Words, Ctl::Kb(1)) => (W - LX - BTN_W, gy(236), BTN_W, BTN_H()),
         _ => (0, 0, 0, 0),
     }
 }
@@ -3176,7 +3176,7 @@ fn kb_button(px: &mut [u32], c: Ctl, st: State, label: &[u8], primary: bool) {
     let (x, y, w, h) = kb_rect(c, st);
     craft_box(px, x, y, w, h, if primary { Craft::Primary } else { Craft::Button }, false);
     let tw = super::super::metrics::ladvance(label, false, FACE);
-    text(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL) / 2, label, if primary { theme::surface_raised() } else { theme::text_primary() });
+    text_to(px, x + w.saturating_sub(tw) / 2, y + h.saturating_sub(CELL()) / 2, label, if primary { theme::surface_raised() } else { theme::text_primary() }, x + w); // TEXTSCALE3 (B849): inside its box
 }
 
 /// KEYBOOT: the painter for both forms (`repaint` holds `FORM`; this takes `KB` after it, never before).
@@ -3185,12 +3185,12 @@ fn kb_paint(px: &mut [u32], f: &Form) {
         return kb_paint_words(px);
     }
     let k = KB.lock();
-    text(px, LX, 14, b"This disk is locked", theme::text_primary());
-    craft_rule(px, LX, 36, W - 2 * LX);
+    text(px, LX, gy(14), b"This disk is locked", theme::text_primary());
+    craft_rule(px, LX, gy(36), W - 2 * LX);
     let lead: &[u8] = if k.recovery { b"Type the 24 words of your recovery key" } else { b"Type your password to start UnaOS" };
-    text(px, LX, 46, lead, theme::text_secondary());
+    text(px, LX, gy(46), lead, theme::text_secondary());
     let (x, y, w, _) = kb_rect(Ctl::PwField, State::Unlock);
-    text(px, LX, y + 4, if k.recovery { b"Words" } else { b"Password" }, theme::text_secondary());
+    text_to(px, LX, y + 4, if k.recovery { b"Words" } else { b"Password" }, theme::text_secondary(), FIELD_X - 4);
     if k.recovery {
         // The tail of what was typed that fits the field (the field shows at most FIELD_MAX bytes).
         let typed = &k.words[..k.wlen];
@@ -3203,24 +3203,24 @@ fn kb_paint(px: &mut [u32], f: &Form) {
         let mut line = *b"Words typed: 00 of 24";
         line[13] = b'0' + (n / 10) as u8;
         line[14] = b'0' + (n % 10) as u8;
-        text(px, FIELD_X, 112, &line, theme::text_secondary());
+        text(px, FIELD_X, gy(112), &line, theme::text_secondary());
     } else {
         field(px, x, y, w, &f.pw[..f.pw_len], true, true);
     }
     kb_button(px, Ctl::Button, State::Unlock, b"Unlock", true);
     kb_button(px, Ctl::Kb(0), State::Unlock, if k.recovery { b"Use password" } else { b"Use recovery key" }, false);
     let hint: &[u8] = if k.recovery { b"Enter unlocks   Tab: password" } else { b"Enter unlocks   Tab: recovery key" };
-    text(px, LX, 186, hint, theme::text_secondary());
+    text(px, LX, gy(186), hint, theme::text_secondary());
     if submit_busy() { kb_progress(px); } else if !f.message.is_empty() { // KEYBOOT2 (B810): the unlock's progress while the worker runs
-        text(px, LX, 212, f.message.as_bytes(), theme::accent());
+        text(px, LX, gy(212), f.message.as_bytes(), theme::accent());
     }
 }
 
 /// KEYBOOT: the words screen — 24 numbered words, column by column, and Continue.
 fn kb_paint_words(px: &mut [u32]) {
-    text(px, LX, 14, b"Your recovery key", theme::text_primary());
-    craft_rule(px, LX, 36, W - 2 * LX);
-    text(px, LX, 44, b"Write these 24 words down. They are shown once.", theme::text_secondary());
+    text(px, LX, gy(14), b"Your recovery key", theme::text_primary());
+    craft_rule(px, LX, gy(36), W - 2 * LX);
+    text(px, LX, gy(44), b"Write these 24 words down. They are shown once.", theme::text_secondary());
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {
         let g = KB_SHOWN.lock();
@@ -3241,13 +3241,13 @@ fn kb_paint_words(px: &mut [u32]) {
                 let m = wd.len().min(cell.len() - n);
                 cell[n..n + m].copy_from_slice(&wd.as_bytes()[..m]);
                 n += m;
-                text(px, LX + (i / 6) * colw, 66 + (i % 6) * 20, &cell[..n], theme::text_primary());
+                text(px, LX + (i / 6) * colw, gy(66) + (i % 6) * theme::metrics().grow(20), &cell[..n], theme::text_primary());
                 // SAFETY: our own stack buffer; volatile so the scrub of the word copy is not elided.
                 unsafe { core::ptr::write_volatile(&mut cell, [0; 16]) };
             }
         }
     }
-    text(px, LX, 192, b"Anyone with these words can open this disk.", theme::text_secondary());
+    text(px, LX, gy(192), b"Anyone with these words can open this disk.", theme::text_secondary());
     kb_button(px, Ctl::Kb(1), State::Words, b"Continue", true);
 }
 
@@ -3465,7 +3465,7 @@ pub fn words_up() -> bool {
 /// KEYBOOT: Continue — the drawn words are wiped off the RAM surface (it outlives the row), the words dropped
 /// (wiped), and the session the create-user form opened is closed into.
 fn kb_continue() {
-    fill(surf(), 0, 0, W, H, theme::surface_window());
+    fill(surf(), 0, 0, W, H(), theme::surface_window());
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     drop(KB_SHOWN.lock().take());
     let after = core::mem::replace(&mut KB.lock().after, 0);
@@ -3551,9 +3551,9 @@ fn civil_line(px: &mut [u32]) -> usize {
     let face = crate::video::text::Face::Chrome;
     let s = crate::clock::locale::fmt_stamp(crate::clock::locale::Painter::Login, u);
     let w = super::super::metrics::ladvance(s.as_bytes(), false, face);
-    let fy = H.saturating_sub(super::super::metrics::lcell_h(face) + 4);
+    let fy = H().saturating_sub(super::super::metrics::lcell_h(face) + 4);
     let x = W.saturating_sub(LX + w);
-    let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H), W, x, fy, s.as_bytes(), theme::text_secondary(), false, face);
+    let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H()), W, x, fy, s.as_bytes(), theme::text_secondary(), false, face);
     w + 12
 }
 
@@ -3631,7 +3631,7 @@ fn kb_released() {
 fn kb_progress(px: &mut [u32]) {
     let el = crate::arch::ms().saturating_sub(BUSY_T0_MS.load(Ordering::Relaxed));
     let s = alloc::format!("Unlocking the disk... {}.{} s", el / 1000, (el % 1000) / 100);
-    text(px, LX, 212, s.as_bytes(), theme::text_secondary());
+    text(px, LX, gy(212), s.as_bytes(), theme::text_secondary());
 }
 
 /// KEYBOOT2: the bind half on the render task — `(true, "")` bound, else the refusal's word.
@@ -3676,4 +3676,76 @@ fn kb_wire(ok: bool, why: &'static str) {
     }
     #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]
     let _ = (ok, why);
+}
+
+// ── TEXTSCALE3 (rmbp-ledger B849) — the login card reflows with the text size ───────────────────────────────────────
+// The card draws the UI face (`FACE`) on bands that sat at constant logical tops on a 16 px rhythm, so the largest
+// text step overwrote its own rows. Every band top is now `gy(top)`: the top at the default size grown once for each
+// text band above it, the count read from ONE table (`BANDS`), and the boxes (`FIELD_H`, `BTN_H`, `PWR_H`) hold the
+// UI line (`theme::metrics().grow`, TEXTSCALE's one reader). The card's height (`h_at`) is latched at open (`CARD_H`):
+// no public wm door resizes a kernel row and the surface is a leaked buffer the row names, so a card open across a
+// step keeps its height (TEXTSCALE-RESEAT, owed). Labels clip at the field; captions stay inside their box. The
+// default size draws the constants.
+
+/// THE BAND TABLE — every literal band top the card's forms use, at the default size, and the number of text bands
+/// above it (each grows the top by what the UI line grew). A new band is added HERE, once; a top missing from the
+/// table does not grow. 14 the title; 36 the rule, 44/46 the lead or the user row; 66/76/82 the second band (66 the
+/// words' first row, under the title and the lead); 112/118 the third; 150 the button; 186 the hint; 212 the message;
+/// 238 the power row; 192 and 236 the words screen's warning and Continue (under its six word rows); 300 the card.
+const BANDS: [(usize, usize); 16] = [
+    (14, 0), (36, 1), (44, 1), (46, 1), (66, 2), (76, 2), (82, 2), (112, 3), (118, 3), (150, 4), (186, 5), (212, 6),
+    (238, 7), (192, 8), (236, 9), (H0, 9),
+];
+const _: () = {
+    // every top maps to exactly one count
+    let mut i = 0;
+    while i < BANDS.len() {
+        let mut j = i + 1;
+        while j < BANDS.len() {
+            assert!(BANDS[i].0 != BANDS[j].0);
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
+/// The height the open card was laid out at (`h_at`, stored by `open_as` before the row exists).
+static CARD_H: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(H0);
+
+/// `y` (a default-size band top) at text metrics `m`: grown once per text band above it ([`BANDS`]).
+fn grow_band(m: theme::TextMetrics, y: usize) -> usize {
+    let k = BANDS.iter().find(|b| b.0 == y).map_or(0, |b| b.1);
+    (0..k).fold(y, |a, _| m.grow(a))
+}
+
+/// A band top at the live text size.
+fn gy(y: usize) -> usize {
+    grow_band(theme::metrics(), y)
+}
+
+/// The card's height at text metrics `m`.
+fn h_at(m: theme::TextMetrics) -> usize {
+    grow_band(m, H0)
+}
+
+/// Text clipped at the logical `clip` (a label at the field, a caption at its box).
+fn text_to(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32, clip: usize) {
+    let _ = super::super::metrics::text(px, super::super::metrics::size(W), super::super::metrics::size(H()), clip.min(W), x, y, s, fg, false, FACE);
+}
+
+/// `tests textscale`: the card's height at the live metrics and whether every form's bands stack without overlap —
+/// the log-in form top to bottom over the footer, the words screen's rows over its warning and Continue — with each
+/// box holding the UI line.
+#[cfg(feature = "witness")]
+pub fn textscale_rows() -> (usize, bool) {
+    let m = theme::metrics();
+    let lh = CELL();
+    let h = h_at(m);
+    let foot = h.saturating_sub(super::super::metrics::lcell_h(crate::video::text::Face::Chrome) + 4);
+    let r = |c: Ctl| { let (_, y, _, hh) = ctl_rect(c, false); (y, hh) };
+    let form = [(gy(14), lh), (gy(36), 1), r(Ctl::User(0)), r(Ctl::NameField), r(Ctl::PwField), r(Ctl::Button), (gy(186), lh), (gy(212), lh), r(Ctl::Power(0)), (foot, 0)];
+    let words = [(gy(66) + 5 * m.grow(20), lh), (gy(192), lh), (gy(236), BTN_H()), (h, 0)];
+    let stacked = |v: &[(usize, usize)]| v.windows(2).all(|p| p[0].0 + p[0].1 <= p[1].0);
+    let boxes = FIELD_H() >= lh + 8 && BTN_H() >= lh && PWR_H() >= lh;
+    (h, stacked(&form) && stacked(&words) && boxes)
 }

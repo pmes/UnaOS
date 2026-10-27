@@ -33,7 +33,7 @@ const _: () = assert!(OWNER != wm::KERNEL_OWNER_CONSOLE && OWNER != wm::KERNEL_O
 const _: () = assert!(OWNER != super::fileview::OWNER && OWNER != super::textedit::OWNER && OWNER != super::settings::OWNER);
 
 const WIN_W: usize = 560;
-const WIN_H: usize = 480;
+const WIN_H0: usize = 480; #[allow(non_snake_case)] fn WIN_H() -> usize { WIN_H0 + TS_LINES * theme::metrics().grow(0) } // TEXTSCALE3 (B849): the window keeps the default's line budget at every text step (`theme::metrics`, TEXTSCALE's one reader); the panel still caps it at open
 const PAD: usize = 8;
 const PERIOD_MS: u64 = 1000;
 const MAXC: usize = 8;
@@ -266,7 +266,7 @@ fn paint(st: &mut State) {
         let _ = write!(b, "process table: x86 only (this scheduler exports no PROCS rows)");
     }
     line(&mut st.surf, &mut y, &b, ink);
-    for i in 0..c.n_proc {
+    for i in 0..c.n_proc { if !table_fits(y, ch, h) { break; } // TEXTSCALE3 (B849): a process row is drawn only above the footer
         let p = c.procs[i];
         let mut b = Buf::new();
         let nm = core::str::from_utf8(&p.name[..p.nlen as usize]).unwrap_or("?");
@@ -320,7 +320,7 @@ pub fn open() -> Result<(), &'static str> {
     // UIMETRICS (B372): a NATIVE window — WIN_W x WIN_H logical px (less what the panel lacks), drawn at its
     // physical size at scale 1.
     let w = WIN_W.min(super::metrics::to_logical(pw.saturating_sub(2 * wm::BORDER())).max(1));
-    let h = WIN_H.min(super::metrics::to_logical(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER())).max(1));
+    let h = WIN_H().min(super::metrics::to_logical(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER())).max(1));
     if w < 200 || h < 120 {
         return Err("window below floor");
     }
@@ -490,5 +490,34 @@ pub fn selftest() {
 
 /// KERNELFONT2 (B363) M4: the faces loaded or were restyled — repaint the open window once.
 pub fn font_repaint() {
-    let _ = repaint_now();
+    TS_FRAMES.fetch_add(1, Ordering::Relaxed); let _ = repaint_now(); // TEXTSCALE3 (B849): the restyle frame `tests textscale` counts
+}
+
+// ── TEXTSCALE3 (rmbp-ledger B849) — Activity reflows with the text size ─────────────────────────────────────────────
+// The line pitch (`lcell_h(Body) + 2`, Body is the Grid face here) already follows the step; the window's height keeps
+// the default's line budget (`WIN_H`) and the process table stops above the footer (`table_fits`), so no row is drawn
+// under it at the largest step.
+
+/// The text lines the default window was laid out for (480 logical px less the paddings and the two 4 px gaps).
+const TS_LINES: usize = (WIN_H0 - 2 * PAD - 8) / (crate::video::font::CELL_H + 2);
+/// Repaints the restyle fan-out asked for (`font_repaint`).
+static TS_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+/// A table row at `y` (pitch `ch`) ends above the footer of an `h`-tall window (the footer is at `h - ch - 2`).
+fn table_fits(y: usize, ch: usize, h: usize) -> bool {
+    y + ch <= h.saturating_sub(ch + 2)
+}
+
+/// `tests textscale`: the window's grown height and whether it holds the default's line budget at the live pitch.
+#[cfg(feature = "witness")]
+pub fn textscale_rows() -> (usize, bool) {
+    let ch = super::metrics::lcell_h(super::text::Face::Body) + 2;
+    let h = WIN_H();
+    (h, h.saturating_sub(2 * PAD + 8) / ch.max(1) >= TS_LINES)
+}
+
+/// `tests textscale`: how many restyle repaints this window has taken.
+#[cfg(feature = "witness")]
+pub fn textscale_frames() -> u32 {
+    TS_FRAMES.load(Ordering::Relaxed)
 }

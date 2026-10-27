@@ -804,7 +804,7 @@ fn text_at(st: &mut State, x: usize, y: usize, clip: usize, t: &str, ink: u32, b
 fn txt_ink(st: &mut State, x: usize, r: usize, t: &str, ink: u32) {
     let face = super::text::Face::Ui; // KERNELFONT: labels in the UI face
     let ch = super::metrics::lcell_h(face);
-    text_at(st, x, row_top(r) + (ROW_H() - ch) / 2, CTRL_R.max(x + 1), t, ink, false, face);
+    if let Some(q) = st.runs.as_mut().filter(|q| q.armed) { q.lab = true; } text_at(st, x, row_top(r) + (ROW_H() - ch) / 2, CTRL_R.max(x + 1), t, ink, false, face); // TEXTSCALE3 (B849): a row label's run — `textscale::flush` may split it into two lines (`stack`)
 }
 
 /// A row's label (the primary ink).
@@ -5745,6 +5745,8 @@ pub(crate) mod textscale {
         ink: u32,
         bold: bool,
         face: Face,
+        /// TEXTSCALE3 (B849): a row label (`txt_ink`), which [`stack`] may split into two lines.
+        lab: bool,
     }
 
     /// The paint's text queue: armed while a full paint lays its controls; the drawn runs' rects (logical
@@ -5755,11 +5757,15 @@ pub(crate) mod textscale {
         from: usize,
         pub(super) drawn: Vec<[u16; 4]>,
         pub(super) clipped: u32,
+        /// TEXTSCALE3 (B849): the next queued run is a row label (set by `txt_ink`, taken by [`queue`]).
+        pub(super) lab: bool,
+        /// TEXTSCALE3 (B849): how many row labels [`stack`] split into two lines.
+        pub(super) stacked: u32,
     }
 
     impl Queue {
         pub(super) fn armed() -> Queue {
-            Queue { armed: true, runs: Vec::new(), from: 0, drawn: Vec::new(), clipped: 0 }
+            Queue { armed: true, runs: Vec::new(), from: 0, drawn: Vec::new(), clipped: 0, lab: false, stacked: 0 }
         }
     }
 
@@ -5767,7 +5773,8 @@ pub(crate) mod textscale {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn queue(q: &mut Queue, x: usize, y: usize, clip: usize, t: &str, ink: u32, bold: bool, face: Face) -> usize {
         let pen = metrics::to_logical(metrics::edge(x) + crate::video::text::advance(t.as_bytes(), bold, metrics::native_face(face)));
-        q.runs.push(Run { x, y, clip, pen, t: String::from(t), ink, bold, face });
+        let lab = core::mem::replace(&mut q.lab, false);
+        q.runs.push(Run { x, y, clip, pen, t: String::from(t), ink, bold, face, lab });
         pen
     }
 
@@ -5793,6 +5800,9 @@ pub(crate) mod textscale {
                     clip = clip.min(o.x.saturating_sub(GAP).max(r.x + 1));
                 }
             }
+            if clip < r.clip && r.lab && stack(&mut st.surf, pw, ph, &mut q, r, clip) {
+                continue; // TEXTSCALE3 (B849): the label drew as two lines inside its row
+            }
             if clip < r.clip {
                 q.clipped += 1;
             }
@@ -5803,6 +5813,37 @@ pub(crate) mod textscale {
         q.from = st.hits.len();
         q.armed = keep;
         st.runs = Some(q);
+    }
+
+    /// TEXTSCALE3 (B849) TEXTSCALE-STACK — THE STACK RULE: a row label the flush would clip at `clip` (a control or a
+    /// run on its line) is split at the last space whose prefix fits `clip - x` and drawn as two lines centred in its
+    /// row (line 1 at `y - lh/2`, line 2 under it, both clipped at the same `clip`), when the two lines fit the row:
+    /// `2 * lh <= ROW_H()` (ROW_H = 32 + line, so up to the cap's 32 px line). The control is NOT moved, so the press
+    /// map (`press_dispatch`, `row_of_hit`, `slider_at`) and the hit rects are unchanged. Each drawn line is one `drawn`
+    /// rect; a second line that still passes `clip` counts as clipped. `false` = not split (the run clips as before).
+    fn stack(surf: &mut [u32], pw: usize, ph: usize, q: &mut Queue, r: &Run, clip: usize) -> bool {
+        let lh = metrics::lcell_h(r.face);
+        if 2 * lh > super::ROW_H() {
+            return false;
+        }
+        let b = r.t.as_bytes();
+        let room = clip.saturating_sub(r.x);
+        let Some(cut) = (1..b.len()).rev().find(|&i| b[i] == b' ' && i + 1 < b.len() && metrics::ladvance(&b[..i], r.bold, r.face) <= room) else {
+            return false;
+        };
+        let y1 = r.y.saturating_sub(lh / 2);
+        for (k, s) in [&b[..cut], &b[cut + 1..]].into_iter().enumerate() {
+            let y = y1 + k * lh;
+            metrics::text(surf, pw, ph, clip, r.x, y, s, r.ink, r.bold, r.face);
+            let pen = r.x + metrics::ladvance(s, r.bold, r.face);
+            if pen > clip {
+                q.clipped += 1;
+            }
+            let right = pen.min(clip).max(r.x);
+            q.drawn.push([r.x.min(0xFFFF) as u16, y.min(0xFFFF) as u16, (right - r.x).min(0xFFFF) as u16, lh.min(0xFFFF) as u16]);
+        }
+        q.stacked += 1;
+        true
     }
 
     /// The open window was laid out for another text size (its surface is not [`super::WIN_H`] tall).
@@ -5826,6 +5867,8 @@ pub(crate) mod textscale {
         pub tt: usize,
         pub tc: usize,
         pub clipped: u32,
+        /// TEXTSCALE3 (B849): row labels drawn as two lines ([`stack`]).
+        pub stacked: u32,
         pub kit: bool,
         pub row: usize,
         pub win_h: usize,
@@ -5853,7 +5896,7 @@ pub(crate) mod textscale {
             aw > 0 && ah > 0 && bw > 0 && bh > 0 && ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
         };
         let inside = |a: &[u16; 4], b: &[u16; 4]| a[0] >= b[0] && a[1] >= b[1] && a[0] as usize + a[2] as usize <= b[0] as usize + b[2] as usize && a[1] as usize + a[3] as usize <= b[1] as usize + b[3] as usize;
-        let mut p = Probe { runs: 0, hits: 0, tt: 0, tc: 0, clipped: 0, kit, row: super::ROW_H(), win_h: WIN_H(), line: crate::video::theme::metrics().line };
+        let mut p = Probe { runs: 0, hits: 0, tt: 0, tc: 0, clipped: 0, stacked: 0, kit, row: super::ROW_H(), win_h: WIN_H(), line: crate::video::theme::metrics().line };
         for tab in 0..TABS {
             let mut st = State::new(WIN_W, WIN_H(), core::mem::take(&mut buf), 1, true, col_scrolled(0, tab, TABS));
             let mut v = v0.clone();
@@ -5862,6 +5905,7 @@ pub(crate) mod textscale {
             if let Some(q) = st.runs.as_ref() {
                 p.runs += q.drawn.len();
                 p.clipped += q.clipped;
+                p.stacked += q.stacked;
                 for (i, a) in q.drawn.iter().enumerate() {
                     p.tt += q.drawn[i + 1..].iter().filter(|b| inter(a, *b)).count();
                     p.tc += st.hits.iter().filter(|h| inter(a, *h) && !inside(a, *h)).count();

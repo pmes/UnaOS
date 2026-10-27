@@ -7132,16 +7132,16 @@ fn overlays_read(leg: &str, win: crate::video::wm::WinId) -> (usize, usize) {
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn textscale_selftest() {
     const STEPS: [i64; 5] = [13, 16, 20, 26, 32];
-    let e0 = crate::video::text::epoch();
+    let e0 = crate::video::text::epoch(); let mut tsw = textscale_win_open(); // TEXTSCALE3 (B849): Activity and a long-text File view open for the window legs (`textscale_win_*`, file tail)
     let (mut done, mut overlap, mut moved, mut clipped, mut cap_seen, mut fits, mut kit) = (0usize, 0usize, 0usize, 0u32, 0i64, true, true);
     let mut last_line = crate::video::theme::metrics().line;
     let mut why = "-";
-    for &css in STEPS.iter() {
+    for &css in STEPS.iter() { let e_before = crate::video::text::epoch(); // TEXTSCALE3 (B849): the epoch before this step (the window legs' `moved`)
         let Some((cap, eff)) = crate::video::text::textscale::step(css) else {
             why = "not-applied";
             break;
         };
-        cap_seen = cap;
+        cap_seen = cap; textscale_win_leg(&mut tsw, css, e_before); // TEXTSCALE3 (B849): each Face::Ui window's rows at this step, then the restyle fan-out's frames
         let m = crate::video::theme::metrics();
         if m.line != last_line {
             moved += 1;
@@ -7155,11 +7155,11 @@ fn textscale_selftest() {
         match crate::video::settings::textscale::probe() {
             Some(p) => {
                 serial_println!(
-                    "[textscale] step css={} cap={} eff={} line={} row={} win_h={} runs={} hits={} tt={} tc={} kit={} clipped={}",
-                    css, cap, eff, p.line, p.row, p.win_h, p.runs, p.hits, p.tt, p.tc, if p.kit { "ok" } else { "bad" }, p.clipped
+                    "[textscale] step css={} cap={} eff={} line={} row={} win_h={} runs={} hits={} tt={} tc={} kit={} clipped={} stacked={}",
+                    css, cap, eff, p.line, p.row, p.win_h, p.runs, p.hits, p.tt, p.tc, if p.kit { "ok" } else { "bad" }, p.clipped, p.stacked
                 );
                 overlap += p.tt + p.tc;
-                clipped += p.clipped;
+                clipped += p.clipped; tsw.stacked = p.stacked; // TEXTSCALE3 (B849): the last step is the largest (32 css)
                 kit &= p.kit;
                 done += 1;
             }
@@ -7169,11 +7169,11 @@ fn textscale_selftest() {
             }
         }
     }
-    let restored = crate::video::text::textscale::step(0).is_some();
+    let restored = crate::video::text::textscale::step(0).is_some(); textscale_win_close(&mut tsw); // TEXTSCALE3 (B849): the windows this test opened close
     let bumps = crate::video::text::epoch().wrapping_sub(e0);
     let v = if done == 0 && why == "not-applied" {
         "SKIP"
-    } else if done == STEPS.len() && overlap == 0 && kit && fits && restored {
+    } else if done == STEPS.len() && overlap == 0 && kit && fits && restored && tsw.ok() {
         "PASS"
     } else {
         "FAIL"
@@ -7182,8 +7182,8 @@ fn textscale_selftest() {
         why = "no-face";
     }
     serial_println!(
-        ":: TEXTSCALE: steps={} overlap={} cap={} -> {} :: bumps={} moved={} fits={} clipped={} kit={} restored={} why={}",
-        done, overlap, cap_seen, v, bumps, moved, fits as u8, clipped, if kit { "ok" } else { "bad" }, restored as u8, why
+        ":: TEXTSCALE: steps={} overlap={} cap={} -> {} :: bumps={} moved={} fits={} clipped={} kit={} restored={} why={} stacked={} windows={}/{} frames={}/{}",
+        done, overlap, cap_seen, v, bumps, moved, fits as u8, clipped, if kit { "ok" } else { "bad" }, restored as u8, why, tsw.stacked, tsw.bad, tsw.legs, tsw.frames, tsw.want
     );
 }
 
@@ -7193,3 +7193,108 @@ fn textscale_selftest() {
 fn session_gen_reads_now() -> u32 { crate::fs::users::session_gen_reads() }
 #[cfg(not(feature = "login"))]
 fn session_gen_reads_now() -> u32 { 0 }
+
+// TEXTSCALE3 (rmbp-ledger B849): `tests textscale`'s window legs — every Face::Ui kernel window at each text step
+// (`[textscale] win=<name> css=<c> grow=<h> rows_ok=<0|1|skip(..)>`: each window's own `textscale_rows` witness; Quarry
+// is face-cell-bound, `skip(face-cell)`), then the restyle fan-out (`quarry::live::font_repaint_pass`, idempotent per
+// epoch) and a 50 ms poll of each opened window's restyle frames (`[textscale] frames css=<c> moved=<0|1>
+// activity=<0|1> fileview=<0|1>`). Same gate as the fixture.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+struct TsWin {
+    /// Activity / the File view are open for the legs (frames are polled); `*_own`: this test opened it (closes it).
+    act: bool,
+    fv: bool,
+    act_own: bool,
+    fv_own: bool,
+    /// Each window's restyle-frame count after the last leg.
+    f: (u32, u32),
+    legs: usize,
+    bad: usize,
+    frames: usize,
+    want: usize,
+    stacked: u32,
+}
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+impl TsWin {
+    /// No window leg read rows_ok=0, and every moved step reached every opened window as a frame.
+    fn ok(&self) -> bool {
+        self.bad == 0 && self.frames >= self.want
+    }
+}
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn textscale_win_open() -> TsWin {
+    let act_own = !crate::video::activity::is_open() && crate::video::activity::open().is_ok();
+    let mut text = alloc::string::String::new();
+    for i in 0..48 {
+        text.push_str(&alloc::format!("{:02} the quick brown fox jumps over the lazy dog, and the view re-wraps this line at every text size\n", i));
+    }
+    let fv_own = !crate::video::fileview::is_open() && crate::video::fileview::open_text("textscale", &text).is_ok();
+    TsWin {
+        act: crate::video::activity::is_open(),
+        fv: crate::video::fileview::is_open(),
+        act_own,
+        fv_own,
+        f: (crate::video::activity::textscale_frames(), crate::video::fileview::textscale_frames()),
+        legs: 0,
+        bad: 0,
+        frames: 0,
+        want: 0,
+        stacked: 0,
+    }
+}
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn textscale_win_leg(t: &mut TsWin, css: i64, e_before: u32) {
+    serial_println!("[textscale] win=quarry css={} grow={} rows_ok=skip(face-cell)", css, crate::video::theme::metrics().grow(0));
+    t.legs += 1;
+    let mut v: alloc::vec::Vec<(&str, (usize, bool))> = alloc::vec::Vec::new();
+    v.push(("fileview", crate::video::fileview::textscale_rows()));
+    v.push(("textedit", crate::video::textedit::textscale_rows()));
+    v.push(("activity", crate::video::activity::textscale_rows()));
+    #[cfg(feature = "login")]
+    v.push(("login", crate::video::crystal::login::textscale_rows()));
+    #[cfg(not(feature = "login"))]
+    serial_println!("[textscale] win=login css={} grow=0 rows_ok=skip(knob-off)", css);
+    v.push(("dialog", crate::video::dialog::textscale_rows()));
+    for (name, (g, ok)) in v {
+        serial_println!("[textscale] win={} css={} grow={} rows_ok={}", name, css, g, ok as u8);
+        t.legs += 1;
+        if !ok {
+            t.bad += 1;
+        }
+    }
+    #[cfg(feature = "quarry")]
+    crate::video::quarry::live::font_repaint_pass();
+    let now = || (crate::video::activity::textscale_frames(), crate::video::fileview::textscale_frames());
+    let mut tries = 0;
+    let got = loop {
+        let n = now();
+        let g = (n.0 != t.f.0, n.1 != t.f.1);
+        if ((!t.act || g.0) && (!t.fv || g.1)) || tries == 9 {
+            break g;
+        }
+        tries += 1;
+        crate::arch::sched::sleep_ms(5);
+    };
+    let moved = crate::video::text::epoch() != e_before;
+    serial_println!("[textscale] frames css={} moved={} activity={} fileview={}", css, moved as u8, got.0 as u8, got.1 as u8);
+    if moved {
+        t.want += t.act as usize + t.fv as usize;
+        t.frames += (t.act && got.0) as usize + (t.fv && got.1) as usize;
+    }
+    t.f = now();
+}
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn textscale_win_close(t: &mut TsWin) {
+    if t.act_own {
+        crate::video::activity::close();
+        t.act_own = false;
+    }
+    if t.fv_own {
+        crate::video::fileview::close();
+        t.fv_own = false;
+    }
+}

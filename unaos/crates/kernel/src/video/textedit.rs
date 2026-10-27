@@ -199,8 +199,8 @@ pub fn open(path: &str) -> Result<(usize, usize), String> {
     let h = WIN_H().min(ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()).max(1));
     let face = super::text::Face::Grid; // UIMETRICS: the dpi-sized mono grid face
     let (cw, ch) = (face.cell_w(), face.cell_h());
-    let cols = w.saturating_sub(2 * PAD() + crate::ui::px(6)) / cw;
-    let vis = h.saturating_sub(2 * PAD()) / ch;
+    let cols = super::fileview::grid_fit(w, h, cw, ch).0; // TEXTSCALE3 (B849): the viewer's one cols/vis formula, re-asked by `reflow` at a restyle
+    let vis = super::fileview::grid_fit(w, h, cw, ch).1;
     if cols < 8 || vis < 2 {
         return Err(String::from("window below floor"));
     }
@@ -429,14 +429,7 @@ fn apply(st: &mut State, op: Op) -> bool {
         st.dirty = true;
     }
     if changed {
-        st.rows = layout_rows(&st.text, st.cols);
-        let r = row_of(&st.rows, st.caret);
-        if r < st.top {
-            st.top = r;
-        } else if r >= st.top + st.vis {
-            st.top = r + 1 - st.vis;
-        }
-        st.top = core::cmp::min(st.top, st.rows.len().saturating_sub(st.vis));
+        relayout(st); // TEXTSCALE3 (B849): the rows and the caret kept in view, one fn (file tail) the restyle's `reflow` shares
         paint(st);
     }
     changed
@@ -680,7 +673,7 @@ pub fn font_repaint() {
     }
     let mut g = STATE.lock();
     let Some(st) = g.as_mut() else { return };
-    paint(st);
+    reflow(st); paint(st); // TEXTSCALE3 (B849): re-lay cols/vis/wrap at the restyled cell, then paint
     drop(g);
     let _ = wm::present(id);
 }
@@ -725,4 +718,44 @@ pub fn close_answer(ix: u8) {
         },
         _ => serial_println!("[edit] close cancelled — the window stays"),
     }
+}
+
+// ── TEXTSCALE3 (rmbp-ledger B849) — the editor re-lays at a restyle ─────────────────────────────────────────────────
+// As the File view: the rows pitch on the live Grid cell, but `cols`/`vis` were fixed at open. `font_repaint` re-asks
+// the viewer's one formula (`fileview::grid_fit`) at the live cell and re-lays through `relayout`, the op path's own
+// rows-and-caret block (moved here from `apply` so the two callers share it).
+
+/// Re-wrap the rows at `st.cols` and keep the caret's row in view (the op path after an edit or a move).
+fn relayout(st: &mut State) {
+    st.rows = layout_rows(&st.text, st.cols);
+    let r = row_of(&st.rows, st.caret);
+    if r < st.top {
+        st.top = r;
+    } else if r >= st.top + st.vis {
+        st.top = r + 1 - st.vis;
+    }
+    st.top = core::cmp::min(st.top, st.rows.len().saturating_sub(st.vis));
+}
+
+/// Re-lay the open editor at the live cell (cols/vis moved: re-wrap, caret kept in view).
+fn reflow(st: &mut State) {
+    let face = super::text::Face::Grid;
+    let (cols, vis) = super::fileview::grid_fit(st.w, st.h, face.cell_w(), face.cell_h());
+    if cols < 8 || vis < 2 || (cols, vis) == (st.cols, st.vis) {
+        return;
+    }
+    st.cols = cols;
+    st.vis = vis;
+    relayout(st);
+}
+
+/// `tests textscale`: the rows the editor holds at the live cell, and whether they fit (and an open editor was re-laid).
+#[cfg(feature = "witness")]
+pub fn textscale_rows() -> (usize, bool) {
+    let face = super::text::Face::Grid;
+    let (cw, ch) = (face.cell_w(), face.cell_h());
+    let (cols, vis) = super::fileview::grid_fit(WIN_W(), WIN_H(), cw, ch);
+    let fits = cols >= 8 && vis >= 2 && 2 * PAD() + vis * ch <= WIN_H();
+    let relaid = STATE.lock().as_ref().is_none_or(|st| (st.cols, st.vis) == super::fileview::grid_fit(st.w, st.h, cw, ch));
+    (vis, fits && relaid)
 }
