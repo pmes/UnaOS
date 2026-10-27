@@ -1597,8 +1597,8 @@ fn switch_tab(t: usize) {
         st.found = None;
         st.kf = 0; st.pend = None; // PICKERKEYS (B768): the new pane's first stop
         if let Some(&c) = tab_ctrls(t).first() { st.sel = c; }
-        let (list, n) = col_list(&st.query); // SETTINGSCRAFT: the chosen row is kept in view of the (filtered) column
-        if let Some(p) = list[..n].iter().position(|&k| k as usize == t) { st.col_top = col_scrolled(st.col_top, p, n); }
+        col_follow(st, t); // SETTINGSCRAFT: the chosen row is kept in view of the (filtered) column
+        // A11YFILTER (B857) SETTINGSTABS: the rule is `col_follow` (file tail), which the PrefChanged drain takes too
     }
     serial_println!("[settings] tab={}", TAB_NAMES[t]);
     if t == FT_TAB { crate::fs::assoc::owe_view(); } // FILETYPES (B423): the pane's rows are read on the service pass
@@ -2106,7 +2106,7 @@ fn craft_probe() -> Result<u32, &'static str> {
     let mut surf: Vec<u32> = Vec::new();
     if surf.try_reserve_exact(pw * ph).is_err() { return Err("oom"); }
     surf.resize(pw * ph, 0);
-    let mut st = State::new(WIN_W, WIN_H(), surf, 1, true, 0);
+    let mut st = State::new(WIN_W, WIN_H(), surf, 1, true, col_scrolled(0, 0, TABS));
     let mut v = CUR.lock().clone();
     v.tab = 0;
     paint(&mut st, &v);
@@ -2294,7 +2294,7 @@ fn bus_changes_inner() -> (usize, usize, usize) {
         if m { moved += 1; }
     }
     if moved > 0 {
-        *CUR.lock() = fresh;
+        let tab_moved = (fresh.tab != old.tab).then_some(fresh.tab as usize); *CUR.lock() = fresh; if let Some(t) = tab_moved { col_follow_open(t); } // A11YFILTER (B857): a moved tab scrolls into view; STATE taken after CUR is dropped
         serial_println!("[settings] prefchanged keys={} moved={} via={}", keys.len(), moved, crate::prefs_client::last_via());
         if is_open() { repaint(); }
     }
@@ -3403,7 +3403,7 @@ fn a11y_load(via: &str) {
     let inv = flag(key::A11Y_INVERT).unwrap_or(false); let _ = super::perfhud::latch(flag(key::A11Y_SHOW_PERF).unwrap_or(false), via); // PERFHUD (B710)
     let (rm0, ic0, cq0, ts0) = (A11Y_REDUCE.swap(rm, Ordering::Relaxed), A11Y_CONTRAST.swap(ic, Ordering::Relaxed), A11Y_CURSOR_Q.swap(cq, Ordering::Relaxed), A11Y_TEXT.swap(ts, Ordering::Relaxed));
     let (cvd0, inv0) = (af::mode(), af::invert());
-    af::set(cvd, inv); if cvd0 != cvd || inv0 != inv { a11y_filter_moved(); } // crawl A 6: the whole glass takes the new filter (BP-video-25)
+    let _ = af::changed(cvd, inv); // crawl A 6 · A11YFILTER (B857): the ONE filter-changed call: the whole glass takes the new filter (BP-video-25)
     let moved = (rm0 != rm) as u8 + (ic0 != ic) as u8 + (cq0 != cq) as u8 + (ts0 != ts) as u8 + (cvd0 != cvd) as u8 + (inv0 != inv) as u8;
     if via != "login" && ts0 != ts { A11Y_PERSIST.fetch_or(1 << 3, Ordering::AcqRel); }
     let zm = crate::prefs_client::sys_int(key::A11Y_ZOOM, 0, 4).map_or(0, |v| a11y_zoom_of_seg(a11y_zoom_seg(v as u8))); // ZOOM (B713)
@@ -3441,8 +3441,8 @@ fn a11y_set(row: usize, val: usize, store: bool) {
         1 => { A11Y_CONTRAST.store(val != 0, Ordering::Relaxed); let _ = super::theme::set_contrast(val != 0); /* CONTRAST (B664): the theme takes the set and bumps its epoch, so chrome, menus and the generated wallpaper redraw as an accent change does. ⚠ LINE-NEUTRAL append. */ ("increase_contrast", alloc::format!("{}", (val != 0) as u8), true) }
         2 => { let q = (val.min(255) as u8).clamp(A11Y_CURSOR_MIN_Q, A11Y_CURSOR_MAX_Q); A11Y_CURSOR_Q.store(q, Ordering::Relaxed); ("cursor_size", alloc::format!("x{}", a11y_cursor_str(q)), super::cursor::armed()) }
         3 => { let s = val.min(A11Y_TEXT_NAMES.len() - 1); A11Y_TEXT.store(s as u8, Ordering::Relaxed); ("text_size", alloc::format!("{} ({} px)", A11Y_TEXT_NAMES[s], A11Y_TEXT_PX[s]), true) }
-        4 => { let m = val.min(af::MODES - 1); if m != af::mode() { af::set(m, af::invert()); a11y_filter_moved(); } ("cvd", String::from(af::NAMES[m]), true) }
-        5 => { if (val != 0) != af::invert() { af::set(af::mode(), val != 0); a11y_filter_moved(); } ("invert", alloc::format!("{}", (val != 0) as u8), true) }
+        4 => { let m = val.min(af::MODES - 1); let _ = af::changed(m, af::invert()); ("cvd", String::from(af::NAMES[m]), true) }
+        5 => { let _ = af::changed(af::mode(), val != 0); ("invert", alloc::format!("{}", (val != 0) as u8), true) }
         6 => { let z = a11y_zoom_of_seg(a11y_zoom_seg(val.min(4) as u8)); A11Y_ZOOM.store(z, Ordering::Relaxed); zoom_apply(); ("zoom", alloc::format!("{}", z), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // ZOOM (B713)
         7 => { let f = val.min(A11Y_FOLLOW_NAMES.len() - 1); A11Y_FOLLOW.store(f as u8, Ordering::Relaxed); zoom_apply(); ("zoom_follow", alloc::format!("{}", A11Y_FOLLOW_NAMES[f]), cfg!(all(target_arch = "x86_64", feature = "wc"))) }
         8 => { let _ = super::perfhud::apply(val != 0, "settings", false); /* crawl A 24: the store write is this row's bit 8, not perfhud's OWED too */ ("show_performance", alloc::format!("{}", (val != 0) as u8), cfg!(all(target_arch = "x86_64", feature = "wc"))) } // PERFHUD (B710): applied where the compositor paints it
@@ -3578,7 +3578,7 @@ pub fn selftest_a11y() {
         let mut surf: Vec<u32> = Vec::new();
         if surf.try_reserve_exact(pw * ph).is_err() { false } else {
             surf.resize(pw * ph, 0);
-            let mut st = State::new(WIN_W, WIN_H(), surf, 0, true, 0);
+            let mut st = State::new(WIN_W, WIN_H(), surf, 0, true, col_scrolled(0, A11Y_TAB, TABS));
             let mut v = CUR.lock().clone();
             v.tab = A11Y_TAB as u8;
             paint(&mut st, &v);
@@ -4132,7 +4132,7 @@ pub fn keys_probe() -> (usize, usize) {
     b.resize(pw * ph, 0);
     let v0 = CUR.lock().clone();
     let paint_one = |buf: Vec<u32>, tab: usize, kf: usize| -> (Vec<u32>, Vec<[u16; 4]>, usize) {
-        let mut st = State::new(WIN_W, WIN_H(), buf, 1, false, 0);
+        let mut st = State::new(WIN_W, WIN_H(), buf, 1, false, col_scrolled(0, tab, TABS));
         st.kbd = true;
         st.kf = kf;
         let mut v = v0.clone();
@@ -4990,7 +4990,7 @@ pub fn hwtab_probe() -> (usize, usize, usize, bool, String) {
     let mut page = 0;
     loop {
         HW_TOP.store(page, Ordering::Relaxed);
-        let mut st = State::new(WIN_W, WIN_H(), core::mem::take(&mut buf), 1, true, 0);
+        let mut st = State::new(WIN_W, WIN_H(), core::mem::take(&mut buf), 1, true, col_scrolled(0, HW_TAB, TABS));
         paint(&mut st, &v);
         buf = core::mem::take(&mut st.surf);
         let first = hw_first(n);
@@ -5103,15 +5103,6 @@ pub fn hwtab2_probe() -> (String, String) {
     (clip, report)
 }
 
-/// crawl A 6 (BP-video-25) — TAIL-APPENDED. The colour filter moved: every scanout writer filters at its copy, so
-/// everything already on the glass is in the OLD colours until it is copied again — bump the theme epoch (every strip
-/// re-seals, `strip::seal`), damage every window and ask the desktop layer for its full present, as `set_contrast`'s
-/// epoch bump and the lock's wipe do.
-fn a11y_filter_moved() {
-    super::theme::bump_epoch();
-    let _ = wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
-    super::screen::request_full_present();
-}
 // ── GEODEBACKUP (rmbp-ledger B740, BP-bar-1/14, BP-video-37) — Storage > Back up / Restore — TAIL-APPENDED ─────────────
 // Under the disk cards (two under this knob), three rows: `Back up Home to…` (it lists the writable removable volumes
 // whose free space holds the home's `.geode` archive, measured), `Restore from…` (it lists the `*.geode` files at the
@@ -5916,4 +5907,60 @@ pub(crate) mod textscale {
         }
         Some(p)
     }
+}
+
+// ── A11YFILTER (rmbp-ledger B857; BP-video-20, video.md §5 A11YTREE2 B822's owed SETTINGSTABS) — TAIL-APPENDED ─────
+// The column's one follow rule, moved out of `switch_tab` so the PrefChanged drain takes it too (another client's
+// `system.settings.tab` write moved the tab with the column left where it was: a tab past `COL_VIS` stayed hidden). No
+// new scroll state: `col_top` reaches wm's PANE_COL model through the repaint's `panes_sync`, as a selection's does.
+
+/// Keep tab `t`'s row in view of the (filtered) column: `col_scrolled` from the column's top, over `col_list`.
+fn col_follow(st: &mut State, t: usize) {
+    let (list, n) = col_list(&st.query);
+    if let Some(p) = list[..n].iter().position(|&k| k as usize == t) { st.col_top = col_scrolled(st.col_top, p, n); }
+}
+
+/// [`col_follow`] on the open window's State (none open: nothing). LOCK ORDER: the caller (`bus_changes_inner`) has
+/// DROPPED the CUR lock before this call; this takes STATE alone, never nested inside CUR.
+fn col_follow_open(t: usize) {
+    if let Some(st) = STATE.lock().as_mut() { col_follow(st, t.min(TABS - 1)); }
+}
+
+/// `tests settingsmap`'s tabs leg: `(tab_scroll, probes_rule, detail)`. `probes_rule` = `live` when the tabs outnumber
+/// `COL_VIS` and every tab is shown at the column top the offscreen probes take (`col_scrolled(0, tab, TABS)`), `moot`
+/// when every tab fits. `tab_scroll`: the window (opened if closed), search cleared, column at its top, then the LAST
+/// tab selected (`switch_tab`) must be shown; then from tab 0 at the top again, `write_tab(last)` (the store write
+/// another client makes) and the PrefChanged drain (`bus_changes`) must show it too (`prefchanged=na`: no frame reached
+/// the drain, read on the selection alone). The tab, the store's tab and the window's open state are restored.
+#[cfg(feature = "witness")]
+pub fn tabs_probe(write_tab: &dyn Fn(usize)) -> (&'static str, &'static str, String) {
+    let all = col_list("").0;
+    let shown = |top: usize, k: usize| k >= top && col_tab_at(COL_PAD() + (k - top) * COL_ROW() + COL_ROW() / 2, top, &all, TABS) == Some(k);
+    let rule = if TABS <= COL_VIS() { "moot" } else if (0..TABS).all(|k| shown(col_scrolled(0, k, TABS), k)) { "live" } else { "bad" };
+    let was_open = is_open();
+    if !was_open && open().is_err() {
+        return ("skip(no-window)", rule, alloc::format!("tab={} switch=- prefchanged=-", TAB_NAMES[TABS - 1]));
+    }
+    let last = TABS - 1;
+    let tab0 = cur_tab();
+    let top_of = || STATE.lock().as_ref().map_or(usize::MAX, |s| s.col_top);
+    let reset = || { if let Some(s) = STATE.lock().as_mut() { s.query.clear(); s.col_top = 0; } };
+    // (a) a selection.
+    if cur_tab() == last { switch_tab(0); }
+    reset();
+    switch_tab(last);
+    let a = top_of();
+    // (b) another client's write, through the PrefChanged drain.
+    switch_tab(0);
+    reset();
+    write_tab(last);
+    let _ = bus_changes();
+    let b = (cur_tab() == last).then(|| top_of());
+    if cur_tab() != tab0 { switch_tab(tab0); }
+    write_tab(tab0);
+    let _ = bus_changes();
+    if !was_open { close(); }
+    let ok = shown(a, last) && b.map_or(true, |t| shown(t, last));
+    let detail = alloc::format!("tab={} switch={} prefchanged={}", TAB_NAMES[last], a, b.map_or(String::from("na"), |t| alloc::format!("{}", t)));
+    (if ok { "ok" } else { "bad" }, rule, detail)
 }

@@ -5562,7 +5562,7 @@ fn settingsmap_selftest() {
         NS, k, changed, arrived.map_or(alloc::string::String::from("na"), |a| format!("{}", a)),
         if wrote.is_ok() { "ok" } else { "refused" }, if ok { "PASS" } else { "FAIL" }, if ok { "ok" } else { "bad" }
     );
-    settingsmap_switch_leg(); settingsmap_ring_leg(); // SESSIONGENPOLL (B782): the switch leg (file tail). SUBSCRIBEKEEP (B796): the ring leg (file tail)
+    settingsmap_switch_leg(); settingsmap_ring_leg(); settingsmap_tabs_leg(); // A11YFILTER (B857): the tabs leg (file tail). SESSIONGENPOLL (B782): the switch leg (file tail). SUBSCRIBEKEEP (B796): the ring leg (file tail)
 }
 
 // SESSIONGENPOLL (rmbp-ledger B782) — TAIL-APPENDED: `tests settingsmap`'s switch leg. Settings, the lock, the clock and the
@@ -6422,7 +6422,7 @@ fn a11yfilters_selftest() {
 /// A11YSHADOW (B816) — a window that did NOT present keeps no stale shadow under a colour filter. One 8x8 window
 /// (focussteal's idiom: the user's verb, so it is mapped focused and on top) at the panel's centre casts; with the
 /// filter off a scanout word in its bottom shadow margin (alpha > 0, no window box over it, clear of the sprite) is
-/// read; then the filter changes EXACTLY as `settings::a11y_filter_moved` changes it (the latch, the looks epoch,
+/// read; then the filter changes through the ONE call Settings makes (`a11yfilter::changed`: the latch, the looks epoch,
 /// damage-all, a full present) and the window presents nothing; up to 8 composite passes, and the word must be the
 /// inverted one (`before ^ 0xFFFFFF` — invert is exact on the same unfiltered source). Without the epoch follow the
 /// shadow extent is never re-laid (the occluders keep the desktop layer off it) and the word stays `before`: FAIL.
@@ -6439,12 +6439,9 @@ fn a11yshadow_leg() {
     const _: () = assert!(!wm::is_kernel_owner(OWNER));
     const PASSES: usize = 8;
     let read = |x: usize, y: usize| crate::video::WRITER.lock().read_pixel(x, y);
-    // The filter change as the Settings seam makes it (`a11y_filter_moved`): latch, looks epoch, damage-all, present.
+    // The filter change as the Settings seam makes it: the ONE call (`a11yfilter::changed`, A11YFILTER B857).
     let change = |m: usize, inv: bool| {
-        af::set(m, inv);
-        crate::video::theme::bump_epoch();
-        let _ = wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
-        crate::video::screen::request_full_present();
+        let _ = af::changed(m, inv);
     };
     let pause = || {
         let t = crate::arch::ms() + 5;
@@ -6500,16 +6497,17 @@ fn a11yshadow_leg() {
             }
         }
     }
-    let (verdict, relaid) = match at {
+    let (verdict, relaid, calls, extra) = match at {
         None => {
             serial_println!(":: A11YSHADOW: -> SKIP (no shadow pixel clear of the windows and the sprite) ::");
-            (None, 0)
+            (None, 0, 0, 0)
         }
         Some((x, y, al)) => {
             let (ux, uy) = (x as usize, y as usize);
             let before = read(ux, uy).unwrap_or(0);
             let want = before ^ 0x00FF_FFFF;
             let r0 = wm::a11yshadow::relays();
+            let (c0, w0) = (af::changes(), desktop::relay_walks()); // A11YFILTER (B857): the change's calls and the re-lay's damage-alls
             change(0, true);
             let (mut after, mut passes) = (before, 0usize);
             while passes < PASSES {
@@ -6522,12 +6520,14 @@ fn a11yshadow_leg() {
                 pause();
             }
             let relaid = wm::a11yshadow::relays().wrapping_sub(r0);
+            let (calls, extra) = (af::changes().wrapping_sub(c0), desktop::relay_walks().wrapping_sub(w0));
+            serial_println!("[a11y] shadows stale passes={} covered={}", 1 + extra, crate::video::theme::epoch());
             let ok = after == want && before != want;
             serial_println!(
                 "[a11y] shadow_follows={} win={} at={},{} alpha={} before={:06x} after={:06x} want={:06x} passes={}",
                 if ok { "ok" } else { "FAIL" }, win, x, y, al, before, after, want, passes
             );
-            (Some(ok), relaid)
+            (Some(ok), relaid, calls, extra)
         }
     };
     change(m0, i0);
@@ -6535,9 +6535,10 @@ fn a11yshadow_leg() {
     wm::close(win);
     wm::composite();
     if let Some(ok) = verdict {
+        let pass = ok && calls == 1 && extra == 0;
         serial_println!(
-            ":: A11YSHADOW: shadow_follows={} relaid={} -> {} ::",
-            if ok { "ok" } else { "FAIL" }, relaid, if ok { "PASS" } else { "FAIL" }
+            ":: A11YSHADOW: shadow_follows={} relaid={} changed_calls={} extra_pass={} -> {} ::",
+            if ok { "ok" } else { "FAIL" }, relaid, calls, extra, if pass { "PASS" } else { "FAIL" }
         );
     }
 }
@@ -7642,4 +7643,25 @@ fn textscale_shell_leg(v: &mut alloc::vec::Vec<(&str, (usize, bool))>, css: i64)
         return;
     }
     v.push(("shell", (crate::video::text::grid_cell().1, ok)));
+}
+
+// A11YFILTER (rmbp-ledger B857, BP-video-20) — TAIL-APPENDED: `tests settingsmap`'s tabs leg. A selected tab past the
+// column's visible rows scrolls into view, by a selection AND by another client's `system.settings.tab` write (the
+// PrefChanged drain); the offscreen probes take the same live column rule (`settings::tabs_probe`). The store's tab is
+// written the way the switch leg writes its key, and restored by the probe.
+// `:: SETTINGSMAP: tabs leg tab=<name> switch=<top> prefchanged=<top|na> -> PASS|FAIL :: tab_scroll=<ok|bad|skip(..)> probes_rule=<live|moot|bad> ::`
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn settingsmap_tabs_leg() {
+    use crate::prefs::{key, PrefValue, NS};
+    use crate::video::settings::tabs_probe;
+    crate::prefs_client::subscribe();
+    let write = |t: usize| {
+        let _ = crate::prefs::set(NS, key::SETTINGS_TAB, PrefValue::Int(t as i64));
+    };
+    let (scroll, rule, detail) = tabs_probe(&write);
+    let ok = scroll == "ok" && rule != "bad";
+    serial_println!(
+        ":: SETTINGSMAP: tabs leg {} -> {} :: tab_scroll={} probes_rule={} ::",
+        detail, if ok { "PASS" } else { "FAIL" }, scroll, rule
+    );
 }

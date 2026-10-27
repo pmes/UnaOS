@@ -781,7 +781,7 @@ refs/heads/exec-rmbp-aetherscale   2879aed46 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aetherfit2   2879aed46 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-stationrate   2879aed46 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-keyboot3   2879aed46 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-a11yfilter   2879aed46 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-a11yfilter   e38b0b2cd FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-shellface   b52c38a47 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zoomflush   2879aed46 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-scanoutwc   2879aed46 IN-FLIGHT cut 2026-10-27
