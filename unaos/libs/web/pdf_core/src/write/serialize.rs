@@ -2,12 +2,15 @@
 // Copyright (C) 2026 The Architect & Una
 //
 //! PDF-WRITE (SR325): the object serializer, the one file writer (classic xref) and [`Edit`] (full and incremental save).
+//! PDFREENCRYPT (SR344): `save_encrypted` / `save_update_encrypted` seal each object through
+//! [`crate::crypt::Handler::encrypt_object`] on its way into the same writer.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
+use crate::crypt::{Cipher, Handler, Keystream};
 use crate::doc::Document;
 use crate::object::{Dict, Object, Ref};
 use crate::xref::{self, XrefKind};
@@ -404,12 +407,69 @@ impl<'a> Edit<'a> {
 
     /// An incremental update (§7.5.6): `original` (the bytes this document was parsed from) followed by only the
     /// changed objects, a table for them and a trailer whose /Prev is the original's `startxref`. Refused for an
-    /// encrypted document (the appended objects would have to be encrypted: owed) and for an original whose xref was
-    /// rebuilt or has no `startxref` (save in full). No changes: the original unchanged.
+    /// encrypted document (its appended objects need IVs: [`Edit::save_update_encrypted`] takes the entropy) and for
+    /// an original whose xref was rebuilt or has no `startxref` (save in full). No changes: the original unchanged.
     pub fn save_update(&self, original: &[u8]) -> Result<Vec<u8>, Error> {
-        if self.doc.security().is_some() {
-            return Err(Error::Unsupported("save_update of an encrypted file: re-encryption owed"));
+        self.update(original, None)
+    }
+}
+
+impl Document {
+    /// PDF-WRITE (SR325): the whole document saved as a new file (`Edit::new(self).save()`): decrypted, classic xref.
+    pub fn save(&self) -> Vec<u8> {
+        Edit::new(self).save()
+    }
+
+    /// PDFREENCRYPT (SR344): the whole document saved encrypted (`Edit::new(self).save_encrypted(..)`).
+    pub fn save_encrypted(&self, user_pw: &[u8], owner_pw: &[u8], perms: i32, cipher: Cipher, entropy: &[u8; 32]) -> Vec<u8> {
+        Edit::new(self).save_encrypted(user_pw, owner_pw, perms, cipher, entropy)
+    }
+}
+
+impl Edit<'_> {
+    /// PDFREENCRYPT (LEDGER SR344): the whole file, encrypted. The same objects as [`Edit::save`] (a source that was
+    /// itself encrypted is re-keyed: its objects are already decrypted), each sealed by
+    /// [`Handler::encrypt_object`] under a new standard security handler ([`Handler::create`]: `user_pw`, `owner_pw`,
+    /// /P from `perms`, `cipher`); /Encrypt written as the next free object; a new /ID of two 16-byte strings; every
+    /// random byte drawn from `entropy` ([`Keystream`]); the header at least 1.6 for AES-128 and 2.0 for AES-256.
+    pub fn save_encrypted(&self, user_pw: &[u8], owner_pw: &[u8], perms: i32, cipher: Cipher, entropy: &[u8; 32]) -> Vec<u8> {
+        let mut ks = Keystream::new(entropy);
+        let mut id0 = alloc::vec![0u8; 16];
+        let mut id1 = alloc::vec![0u8; 16];
+        ks.fill(&mut id0);
+        ks.fill(&mut id1);
+        let objs = self.collect();
+        let enc_num = objs.keys().next_back().map_or(1, |&n| n.saturating_add(1));
+        let (h, enc) = Handler::create(user_pw, owner_pw, perms, cipher, &id0, Some(enc_num), &mut ks);
+        let mut sealed: Vec<(Ref, Object)> = objs.into_values().map(|(r, o)| (r, h.encrypt_object(r, o, &mut ks))).collect();
+        sealed.push((Ref { num: enc_num, generation: 0 }, Object::Dict(enc)));
+        let mut t = self.trailer.clone();
+        t.insert(b"Encrypt".to_vec(), Object::Ref(Ref { num: enc_num, generation: 0 }));
+        t.insert(b"ID".to_vec(), Object::Array(alloc::vec![Object::String(id0), Object::String(id1)]));
+        let floor = match cipher {
+            Cipher::Aes256 => "2.0",
+            Cipher::Aes128 => "1.6",
+            Cipher::Rc4_128 => "1.4",
+        };
+        let v = self.version();
+        let version = if v.as_str() >= floor { v } else { String::from(floor) };
+        write_file(&version, &sealed, &t)
+    }
+
+    /// PDFREENCRYPT (SR344): [`Edit::save_update`] for an encrypted original too: the appended objects are sealed
+    /// under the ORIGINAL's file key (the document's opened handler, whether it was opened with the user or the owner
+    /// password; AES IVs drawn from `entropy`) and the trailer carries the original's /Encrypt and /ID. Unencrypted:
+    /// the same bytes as [`Edit::save_update`].
+    pub fn save_update_encrypted(&self, original: &[u8], entropy: &[u8; 32]) -> Result<Vec<u8>, Error> {
+        self.update(original, Some(entropy))
+    }
+
+    /// The one incremental writer behind [`Edit::save_update`] and [`Edit::save_update_encrypted`].
+    fn update(&self, original: &[u8], entropy: Option<&[u8; 32]>) -> Result<Vec<u8>, Error> {
+        if self.doc.security().is_some() && entropy.is_none() {
+            return Err(Error::Unsupported("save_update of an encrypted file: use save_update_encrypted"));
         }
+        let mut ks = entropy.map(Keystream::new);
         if self.doc.xref_kind() == XrefKind::Rebuilt {
             return Err(Error::Unsupported("save_update of a rebuilt xref: save in full"));
         }
@@ -427,7 +487,12 @@ impl<'a> Edit<'a> {
                 continue;
             }
             offs.push((num, *generation, out.len()));
-            write_indirect(&mut out, Ref { num, generation: *generation }, &normalise(o.clone()));
+            let r = Ref { num, generation: *generation };
+            let obj = match (self.doc.security(), ks.as_mut()) {
+                (Some(h), Some(ks)) => h.encrypt_object(r, normalise(o.clone()), ks),
+                _ => normalise(o.clone()),
+            };
+            write_indirect(&mut out, r, &obj);
         }
         let xref_at = out.len();
         out.extend_from_slice(b"xref\n");
@@ -450,14 +515,11 @@ impl<'a> Edit<'a> {
         let mut t = self.trailer.clone();
         t.insert(b"Size".to_vec(), Object::Int(old.max(new)));
         t.insert(b"Prev".to_vec(), Object::Int(prev as i64));
+        if let Some(enc) = self.doc.trailer().get(b"Encrypt").filter(|_| self.doc.security().is_some()) {
+            // The original's /Encrypt (and its /ID, kept by `Edit::new`): the appended objects are under its key.
+            t.insert(b"Encrypt".to_vec(), enc.clone());
+        }
         trailer_tail(&mut out, &t, xref_at);
         Ok(out)
-    }
-}
-
-impl Document {
-    /// PDF-WRITE (SR325): the whole document saved as a new file (`Edit::new(self).save()`): decrypted, classic xref.
-    pub fn save(&self) -> Vec<u8> {
-        Edit::new(self).save()
     }
 }

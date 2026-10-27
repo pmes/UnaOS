@@ -9,9 +9,9 @@
 //! * [`write_object`]: §7.3 syntax out (strings literal or hex, names with `#xx`, reals without exponents).
 //! * [`Edit`]: changes held over a borrowed document (`set`, `add`, `set_info`); `save` writes every object reachable from
 //!   the trailer (numbers and generations kept) with a fresh CLASSIC xref table — chosen for PDF 1.4 compatibility; the
-//!   /Encrypt dictionary is dropped, so saving decrypts (re-encryption is owed) — and `save_update` appends only the
+//!   /Encrypt dictionary is dropped, so saving decrypts (`save_encrypted` re-encrypts, PDFREENCRYPT SR344) — and `save_update` appends only the
 //!   changed objects with a new table and a trailer whose /Prev names the original's (the real-world "save", which keeps
-//!   the original bytes, and so any signature over them, as a prefix). [`crate::Document::save`] is `Edit::new(doc).save()`.
+//!   the original bytes, and so any signature over them, as a prefix; `save_update_encrypted` for an encrypted original). [`crate::Document::save`] is `Edit::new(doc).save()`.
 //! * [`Builder`] / [`PageBuilder`]: new PDF 1.4 files from path operators and images (Flate RGB / Gray, DCT passed
 //!   through); text drawn as paths, or shown in an embedded face (PDF-WRITE-FONTS SR338: [`Builder::font`] /
 //!   [`PageBuilder::text`], a TrueType subset as Type0 / CIDFontType2, `fonts.rs`). [`from_rgba`]: one image per page,

@@ -17,11 +17,15 @@
 //! * Objects: Algorithm 1's per-object key for RC4 and AESV2, the file key for AESV3; AES data is IV + CBC + PKCS #7.
 //!   Exempt: the /Encrypt dictionary, /Type /XRef streams, /Type /Metadata streams when /EncryptMetadata is false, a
 //!   stream whose first filter is /Crypt naming /Identity, and a signature dictionary's /Contents.
+//! * Encrypting on save (PDFREENCRYPT, LEDGER SR344): [`Handler::create`] computes /O /U (R3 / R4) or /U /UE /O /OE
+//!   /Perms (R6) and [`Handler::encrypt_object`] runs the same walk, exemptions and per-object key the other way; the
+//!   randomness is the caller's 32 bytes expanded by crypto_core's ChaCha20 ([`Keystream`]).
 
 use alloc::vec::Vec;
 
 use crypto_core::aes::Aes;
 use crypto_core::cbc;
+use crypto_core::chacha20::ChaCha20;
 use crypto_core::ct::{Zeroize, ct_eq};
 use crypto_core::md5::{Md5, md5};
 use crypto_core::rc4::Rc4;
@@ -229,17 +233,36 @@ impl Handler {
             rc4_apply(key, &mut x);
             return ct_eq(&x, &u[..32]);
         }
+        ct_eq(&self.user_hash(key, id0), &u[..16])
+    }
+
+    /// Algorithm 5 steps a-e (R3+): MD5(PAD, ID[0]) through twenty RC4 passes under `key` — /U's first 16 bytes.
+    fn user_hash(&self, key: &[u8], id0: &[u8]) -> [u8; 16] {
         let mut h = Md5::new();
         h.update(&PAD);
         h.update(id0);
         let mut x = h.finalize();
         rc4_passes(key, &mut x, false);
-        ct_eq(&x, &u[..16])
+        x
     }
 
     /// Algorithm 7: the padded user password recovered from /O with an owner password (Algorithm 3 steps a-d for
     /// the RC4 key, then /O decrypted: once for R2, twenty passes with the key XOR 19..0 for R3+).
     fn owner_to_user(&self, password: &[u8], o: &[u8], n: usize) -> Vec<u8> {
+        let mut d = self.owner_key(password, n);
+        let mut upw = o[..32].to_vec();
+        if self.r == 2 {
+            rc4_apply(&d, &mut upw);
+        } else {
+            rc4_passes(&d, &mut upw, true);
+        }
+        d.zeroize();
+        upw
+    }
+
+    /// Algorithm 3 steps a-d: the RC4 key /O is made with (MD5 of the padded owner password, 50 more rounds for R3+),
+    /// `n` bytes. Algorithm 7 (reading) and Algorithm 3 (writing, [`Handler::create`]) share it.
+    fn owner_key(&self, password: &[u8], n: usize) -> Vec<u8> {
         let mut padded = pad_password(password);
         let mut d = md5(&padded);
         if self.r >= 3 {
@@ -247,15 +270,10 @@ impl Handler {
                 d = md5(&d);
             }
         }
-        let mut upw = o[..32].to_vec();
-        if self.r == 2 {
-            rc4_apply(&d[..n], &mut upw);
-        } else {
-            rc4_passes(&d[..n], &mut upw, true);
-        }
+        let k = d[..n].to_vec();
         d.zeroize();
         padded.zeroize();
-        upw
+        k
     }
 
     /// The method for one stream (the exemptions in the module doc).
@@ -286,36 +304,39 @@ impl Handler {
             return obj;
         }
         match obj {
-            Object::Stream(s) => {
-                let m = self.stream_method(&s.dict);
-                let dict = self.walk_dict(r, s.dict);
-                let data = self.crypt(m, r, s.data);
-                Object::Stream(Stream { dict, data })
-            }
-            o => self.walk(r, o),
+            Object::Stream(s) => self.crypt_stream(r, s, &mut Dir::Open),
+            o => self.walk(r, o, &mut Dir::Open),
         }
     }
 
-    fn walk(&self, r: Ref, o: Object) -> Object {
+    /// One stream in direction `dir`: its dictionary's strings, then its data under [`Handler::stream_method`].
+    fn crypt_stream(&self, r: Ref, s: Stream, dir: &mut Dir) -> Object {
+        let m = self.stream_method(&s.dict);
+        let dict = self.walk_dict(r, s.dict, dir);
+        let data = self.crypt(m, r, s.data, dir);
+        Object::Stream(Stream { dict, data })
+    }
+
+    fn walk(&self, r: Ref, o: Object, dir: &mut Dir) -> Object {
         match o {
-            Object::String(b) => Object::String(self.crypt(self.strs, r, b)),
-            Object::Array(a) => Object::Array(a.into_iter().map(|x| self.walk(r, x)).collect()),
-            Object::Dict(d) => Object::Dict(self.walk_dict(r, d)),
+            Object::String(b) => Object::String(self.crypt(self.strs, r, b, dir)),
+            Object::Array(a) => Object::Array(a.into_iter().map(|x| self.walk(r, x, dir)).collect()),
+            Object::Dict(d) => Object::Dict(self.walk_dict(r, d, dir)),
             o => o,
         }
     }
 
-    fn walk_dict(&self, r: Ref, d: Dict) -> Dict {
+    fn walk_dict(&self, r: Ref, d: Dict, dir: &mut Dir) -> Dict {
         let sig = d.contains(b"ByteRange");
         Dict(
             d.0.into_iter()
-                .map(|(k, v)| if sig && k.as_slice() == b"Contents" { (k, v) } else { (k, self.walk(r, v)) })
+                .map(|(k, v)| if sig && k.as_slice() == b"Contents" { (k, v) } else { (k, self.walk(r, v, dir)) })
                 .collect(),
         )
     }
 
-    /// Undo `m` on `data` for object `r`.
-    fn crypt(&self, m: Method, r: Ref, mut data: Vec<u8>) -> Vec<u8> {
+    /// Undo (`Dir::Open`) or apply (`Dir::Seal`) `m` on `data` for object `r`. RC4 is its own inverse.
+    fn crypt(&self, m: Method, r: Ref, mut data: Vec<u8>, dir: &mut Dir) -> Vec<u8> {
         match m {
             Method::None => data,
             Method::Rc4 => {
@@ -326,11 +347,17 @@ impl Handler {
             }
             Method::AesV2 => {
                 let mut k = self.object_key(r, true);
-                let out = aes_cbc_open(&k, data);
+                let out = match dir {
+                    Dir::Open => aes_cbc_open(&k, data),
+                    Dir::Seal(ks) => aes_cbc_seal(&k, data, ks),
+                };
                 k.zeroize();
                 out
             }
-            Method::AesV3 => aes_cbc_open(&self.key, data),
+            Method::AesV3 => match dir {
+                Dir::Open => aes_cbc_open(&self.key, data),
+                Dir::Seal(ks) => aes_cbc_seal(&self.key, data, ks),
+            },
         }
     }
 
@@ -486,5 +513,185 @@ pub fn hash_r56(r: i64, password: &[u8], salt: &[u8], udata: &[u8]) -> [u8; 32] 
     let mut out = [0u8; 32];
     out.copy_from_slice(&k[..32]);
     k.as_mut_slice().zeroize();
+    out
+}
+
+/// PDFREENCRYPT (LEDGER SR344): the cipher a saved file is encrypted with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cipher {
+    /// /V 5 /R 6: AES-256 (/CFM /AESV3) under a random 32-byte file key (ISO 32000-2 §7.6.4.4).
+    Aes256,
+    /// /V 4 /R 4: AES-128 (/CFM /AESV2) under Algorithm 2's 16-byte file key.
+    Aes128,
+    /// /V 2 /R 3: RC4 under Algorithm 2's 16-byte file key.
+    Rc4_128,
+}
+
+/// Which way [`Handler`]'s one walk runs: decrypting a parsed object, or encrypting one to save.
+enum Dir<'a> {
+    Open,
+    Seal(&'a mut Keystream),
+}
+
+/// The randomness a save draws (file key, R6 salts, the /U tail, /Perms' random bytes, every AES IV, the new /ID):
+/// the caller's 32 bytes of entropy as a crypto_core ChaCha20 key (nonce 0), read as keystream. Deterministic for one
+/// entropy; the caller owns the entropy source (OsEntropy, getrandom, the kernel's rand.rs).
+pub struct Keystream(ChaCha20);
+
+impl Keystream {
+    pub fn new(entropy: &[u8; 32]) -> Self {
+        Keystream(ChaCha20::new(entropy, &[0u8; 12], 0))
+    }
+
+    /// The next `out.len()` bytes.
+    pub fn fill(&mut self, out: &mut [u8]) {
+        out.fill(0);
+        self.0.apply_keystream(out);
+    }
+}
+
+impl Handler {
+    /// PDFREENCRYPT (SR344): a new standard security handler for saving, and its /Encrypt dictionary. `id0` is the
+    /// saved file's /ID[0]; `encrypt_num` the /Encrypt object's number (exempt from encryption). /P is `perms` with
+    /// the reserved bits as §7.6.3.2 Table 22 requires (bits 1-2 clear, 7-8 and 13-32 set). An empty `owner` is the
+    /// user password (Algorithm 3 step a). R3 / R4: /O by Algorithm 3, the file key by Algorithm 2
+    /// ([`Handler::file_key_r4`]), /U by Algorithm 5 plus 16 random bytes. R6: a random file key, /U /UE by
+    /// Algorithm 8, /O /OE by Algorithm 9, /Perms by Algorithm 10; passwords cut to 127 bytes as [`Handler::open`]
+    /// does. Every string and stream is then sealed by [`Handler::encrypt_object`].
+    pub fn create(
+        user: &[u8],
+        owner: &[u8],
+        perms: i32,
+        cipher: Cipher,
+        id0: &[u8],
+        encrypt_num: Option<u32>,
+        ks: &mut Keystream,
+    ) -> (Handler, Dict) {
+        let owner = if owner.is_empty() { user } else { owner };
+        let p = ((perms as u32 | 0xFFFF_F0C0) & !3u32) as i32;
+        let (v, r, m) = match cipher {
+            Cipher::Aes256 => (5, 6, Method::AesV3),
+            Cipher::Aes128 => (4, 4, Method::AesV2),
+            Cipher::Rc4_128 => (2, 3, Method::Rc4),
+        };
+        let mut h = Handler {
+            key: Vec::new(),
+            v,
+            r,
+            stm: m,
+            strs: m,
+            filters: Vec::new(),
+            encrypt_metadata: true,
+            encrypt_num,
+            p,
+            owner: true,
+        };
+        let mut d = Dict::new();
+        d.insert(b"Filter".to_vec(), Object::Name(b"Standard".to_vec()));
+        d.insert(b"V".to_vec(), Object::Int(v));
+        d.insert(b"R".to_vec(), Object::Int(r));
+        d.insert(b"Length".to_vec(), Object::Int(if r == 6 { 256 } else { 128 }));
+        d.insert(b"P".to_vec(), Object::Int(p as i64));
+        if cipher != Cipher::Rc4_128 {
+            let mut std = Dict::new();
+            std.insert(b"CFM".to_vec(), Object::Name(if r == 6 { b"AESV3".to_vec() } else { b"AESV2".to_vec() }));
+            std.insert(b"AuthEvent".to_vec(), Object::Name(b"DocOpen".to_vec()));
+            std.insert(b"Length".to_vec(), Object::Int(if r == 6 { 32 } else { 16 }));
+            let mut cf = Dict::new();
+            cf.insert(b"StdCF".to_vec(), Object::Dict(std));
+            d.insert(b"CF".to_vec(), Object::Dict(cf));
+            d.insert(b"StmF".to_vec(), Object::Name(b"StdCF".to_vec()));
+            d.insert(b"StrF".to_vec(), Object::Name(b"StdCF".to_vec()));
+            h.filters.push((b"StdCF".to_vec(), m));
+        }
+        if r == 6 {
+            let mut key = [0u8; 32];
+            ks.fill(&mut key);
+            // User validation salt, user key salt, owner validation salt, owner key salt.
+            let mut salts = [0u8; 32];
+            ks.fill(&mut salts);
+            let upw = &user[..user.len().min(127)];
+            let opw = &owner[..owner.len().min(127)];
+            let mut u = hash_r56(6, upw, &salts[0..8], &[]).to_vec();
+            u.extend_from_slice(&salts[0..16]);
+            let mut ik = hash_r56(6, upw, &salts[8..16], &[]);
+            let ue = wrap_key(&ik, &key);
+            ik.zeroize();
+            let mut o = hash_r56(6, opw, &salts[16..24], &u).to_vec();
+            o.extend_from_slice(&salts[16..32]);
+            let mut ik = hash_r56(6, opw, &salts[24..32], &u);
+            let oe = wrap_key(&ik, &key);
+            ik.zeroize();
+            let mut pb = [0u8; 16];
+            pb[..4].copy_from_slice(&(p as u32).to_le_bytes());
+            pb[4..8].copy_from_slice(&[0xFF; 4]);
+            pb[8] = b'T';
+            pb[9..12].copy_from_slice(b"adb");
+            ks.fill(&mut pb[12..]);
+            if let Ok(aes) = Aes::new(&key) {
+                aes.encrypt_block(&mut pb);
+            }
+            h.key = key.to_vec();
+            key.zeroize();
+            salts.zeroize();
+            d.insert(b"O".to_vec(), Object::String(o));
+            d.insert(b"U".to_vec(), Object::String(u));
+            d.insert(b"OE".to_vec(), Object::String(oe));
+            d.insert(b"UE".to_vec(), Object::String(ue));
+            d.insert(b"Perms".to_vec(), Object::String(pb.to_vec()));
+        } else {
+            let n = 16;
+            let mut ok = h.owner_key(owner, n);
+            let mut o = pad_password(user).to_vec();
+            rc4_passes(&ok, &mut o, false);
+            ok.zeroize();
+            h.key = h.file_key_r4(user, &o, id0, n);
+            let mut u = h.user_hash(&h.key, id0).to_vec();
+            let mut tail = [0u8; 16];
+            ks.fill(&mut tail);
+            u.extend_from_slice(&tail);
+            d.insert(b"O".to_vec(), Object::String(o));
+            d.insert(b"U".to_vec(), Object::String(u));
+        }
+        (h, d)
+    }
+
+    /// Encrypt one top-level object `r` to save it: [`Handler::decrypt_object`]'s twin over the same walk, exemptions
+    /// and per-object key ([`Handler::object_key`]); AES data gets a fresh IV from `ks` and PKCS #7 padding.
+    pub fn encrypt_object(&self, r: Ref, obj: Object, ks: &mut Keystream) -> Object {
+        if self.encrypt_num == Some(r.num) {
+            return obj;
+        }
+        let mut dir = Dir::Seal(ks);
+        match obj {
+            Object::Stream(s) => self.crypt_stream(r, s, &mut dir),
+            o => self.walk(r, o, &mut dir),
+        }
+    }
+}
+
+/// [`aes_cbc_open`]'s twin: a random IV from `ks`, then AES-CBC over `data` with PKCS #7 padding (§7.6.2).
+fn aes_cbc_seal(key: &[u8], data: Vec<u8>, ks: &mut Keystream) -> Vec<u8> {
+    let Ok(aes) = Aes::new(key) else { return data };
+    let mut iv = [0u8; 16];
+    ks.fill(&mut iv);
+    let len = data.len();
+    let mut out = Vec::with_capacity(len + 32);
+    out.extend_from_slice(&iv);
+    out.extend_from_slice(&data);
+    out.resize(16 + len + 16 - len % 16, 0);
+    if let Some(end) = cbc::pkcs7_pad(&mut out[16..], len) {
+        out.truncate(16 + end);
+    }
+    let _ = cbc::encrypt(&aes, &iv, &mut out[16..]);
+    out
+}
+
+/// [`unwrap_key`]'s twin: the 32-byte file key encrypted with AES-256-CBC, zero IV, no padding, under `ik` (/UE, /OE).
+fn wrap_key(ik: &[u8; 32], key: &[u8]) -> Vec<u8> {
+    let mut out = key[..32].to_vec();
+    if let Ok(aes) = Aes::new(ik) {
+        let _ = cbc::encrypt(&aes, &[0u8; 16], &mut out);
+    }
     out
 }
