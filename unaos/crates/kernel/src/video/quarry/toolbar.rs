@@ -7,6 +7,9 @@
 //!
 //! * **Back / Forward** — a [`History`] of the places the list pane showed (every `show` that changed the
 //!   directory; a travel through the history does not record itself). `<` / `>` keys too.
+//!   RELISTREAD (B853): a Back / Forward steps the history ONLY in the show that lands it — [`after_show`] is the one
+//!   place ([`History::arrive`]); the press only PEEKS. A deferred step that is dropped leaves the history untouched,
+//!   and a second Back while one is pending re-aims at the same place (one step) and never stacks (PENDSTACK owed).
 //! * **The view switcher** — List | Icons | Columns (`v` cycles). The icon view is `iconview.rs`; the columns view
 //!   (Miller columns, COLUMNSVIEW B436) is `millercols.rs`.
 //! * **Search** — a field at the right of the toolbar (a press, or `/`, focuses it); every keystroke re-runs a
@@ -21,7 +24,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use super::{fill, text, theme, Act, DirEnt, Geom, Model, NodeKind, Pane, Rect, MODEL, PAD};
 
@@ -76,6 +79,23 @@ impl History {
         self.back.push(core::mem::replace(&mut self.cur, p.clone()));
         Some(p)
     }
+    /// RELISTREAD (B853): the place Back / Forward would show, without stepping.
+    pub fn peek_back(&self) -> Option<String> {
+        self.back.last().cloned()
+    }
+    pub fn peek_forward(&self) -> Option<String> {
+        self.fwd.last().cloned()
+    }
+    /// RELISTREAD (B853): a Back (`back`) or Forward step LANDED on `path`: step when `path` is still that way's next
+    /// place, else (the history moved under a deferred step) record it as a visit.
+    pub fn arrive(&mut self, back: bool, path: &str) {
+        let next = if back { self.back.last() } else { self.fwd.last() };
+        if next.map_or(false, |p| p == path) {
+            let _ = if back { self.back() } else { self.forward() };
+        } else {
+            self.visit(path);
+        }
+    }
     pub fn can_back(&self) -> bool {
         !self.back.is_empty()
     }
@@ -105,8 +125,13 @@ static TB: crate::sync::Mutex<Tb> = crate::sync::Mutex::new(Tb {
     view: View::List,
     search: Search { focused: false, active: false, q: String::new(), saved: String::new(), hits: 0, src: "-" },
 });
-/// A Back/Forward/segment travel is in flight: its `show` must not record itself.
-static TRAVEL: AtomicBool = AtomicBool::new(false);
+/// What the next `show` records (RELISTREAD B853: a word, not a flag): a visit, the place kept as current (a
+/// search's restore), or a Back / Forward step landing ([`History::arrive`]).
+const VISIT: u8 = 0;
+const KEEP: u8 = 1;
+const BACK: u8 = 2;
+const FWD: u8 = 3;
+static TRAVEL: AtomicU8 = AtomicU8::new(VISIT);
 /// The search's own `show`s (restoring the directory) must not end the search they belong to.
 static SEARCHING: AtomicBool = AtomicBool::new(false);
 
@@ -172,10 +197,12 @@ pub(super) fn after_show(m: &mut Model) {
         t.search.focused = false;
         t.search.q.clear();
     }
-    if TRAVEL.load(Ordering::Relaxed) {
-        t.hist.cur = m.cwd.clone();
-    } else if !t.search.active {
-        t.hist.visit(&m.cwd);
+    match TRAVEL.load(Ordering::Relaxed) {
+        BACK => t.hist.arrive(true, &m.cwd), // RELISTREAD (B853): the step happens in the show that lands it
+        FWD => t.hist.arrive(false, &m.cwd),
+        KEEP => t.hist.cur = m.cwd.clone(),
+        _ if !t.search.active => t.hist.visit(&m.cwd),
+        _ => {}
     }
 }
 
@@ -187,34 +214,43 @@ fn travel(m: &mut Model, to: Option<String>, t: super::livedir::Travel) -> bool 
     m.status = None;
     {
         let _door = super::livedir::Door::reword(t);
-        arrive(m, &p);
+        arrive(m, &p, t);
     }
     serial_println!("[quarry3] travel -> {}", p);
     true
 }
 
 /// NAVTRAVEL (B841): a history step's arrival — the ONE place TRAVEL is raised for a navigate, by the synchronous step
-/// and by the deferred install (`livedir::nav_install`) alike, so it is never left set across a drop.
-pub(super) fn arrive(m: &mut Model, path: &str) {
-    TRAVEL.store(true, Ordering::Relaxed);
+/// and by the deferred install (`livedir::nav_install`) alike, so it is never left set across a drop. RELISTREAD
+/// (B853): it carries the step's way, and the show that lands records the step ([`after_show`]); a deferred navigate
+/// shows nothing here, so the history is untouched until its install lands.
+pub(super) fn arrive(m: &mut Model, path: &str, t: super::livedir::Travel) {
+    let word = match t {
+        super::livedir::Travel::Back => BACK,
+        super::livedir::Travel::Forward => FWD,
+        _ => VISIT,
+    };
+    TRAVEL.store(word, Ordering::Relaxed);
     m.navigate(path);
-    TRAVEL.store(false, Ordering::Relaxed);
+    TRAVEL.store(VISIT, Ordering::Relaxed);
 }
 
+/// RELISTREAD (B853): the press PEEKS; the step is taken by the show that lands (a re-press while pending re-aims).
 pub(super) fn go_back(m: &mut Model) -> bool {
-    let to = TB.lock().hist.back();
+    let to = TB.lock().hist.peek_back();
     travel(m, to, super::livedir::Travel::Back)
 }
 
 pub(super) fn go_forward(m: &mut Model) -> bool {
-    let to = TB.lock().hist.forward();
+    let to = TB.lock().hist.peek_forward();
     travel(m, to, super::livedir::Travel::Forward)
 }
 
-/// NAVTRAVEL (B841): the history's current place and its forward depth (`tests quarryio`'s travel leg).
-pub(super) fn history() -> (String, usize) {
+/// NAVTRAVEL (B841): the history's current place, its forward depth and (RELISTREAD B853) its back depth (`tests
+/// quarryio`'s travel, key and drop probes).
+pub(super) fn history() -> (String, usize, usize) {
     let t = TB.lock();
-    (t.hist.cur.clone(), t.hist.fwd.len())
+    (t.hist.cur.clone(), t.hist.fwd.len(), t.hist.back.len())
 }
 
 fn set_view(v: View) {
@@ -312,9 +348,9 @@ fn end_search(m: &mut Model) {
         core::mem::take(&mut t.search.saved)
     };
     SEARCHING.store(true, Ordering::Relaxed);
-    TRAVEL.store(true, Ordering::Relaxed);
+    TRAVEL.store(KEEP, Ordering::Relaxed);
     m.show(if saved.is_empty() { "/" } else { saved.as_str() });
-    TRAVEL.store(false, Ordering::Relaxed);
+    TRAVEL.store(VISIT, Ordering::Relaxed);
     SEARCHING.store(false, Ordering::Relaxed);
 }
 
@@ -369,6 +405,7 @@ pub(super) fn key(c: u8) -> bool {
         b'<' | b'>' => {
             let mut guard = MODEL.lock();
             let Some(m) = guard.as_mut() else { return false };
+            let _door = super::livedir::Door::travel(if c == b'<' { super::livedir::Travel::Back } else { super::livedir::Travel::Forward }); // RELISTREAD (B853) KEYTRAVEL: raised under MODEL, so a cold step reads off the lock
             let _ = if c == b'<' { go_back(m) } else { go_forward(m) };
             m.settle();
             true

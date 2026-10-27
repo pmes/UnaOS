@@ -480,7 +480,7 @@ fn resort_with(m: &mut Model, st: &mut ColState, kids: &[(String, Vec<DirEnt>)])
 /// the expanded folders' children) happen BEFORE `COLS` is taken; the per-row facts are read by [`facts_pass`] on the
 /// service pass with no Quarry lock held. `COLS` is never held across a read.
 pub(super) fn after_show(m: &mut Model) {
-    let trash = is_trash(&m.cwd);
+    let trash = super::livedir::pre_trash(&m.cwd).unwrap_or_else(|| is_trash(&m.cwd)); // RELISTREAD (B853): an install's pre-read (off every Quarry lock), else the probe here
     super::folderview::enter(&m.cwd); // FOLDERVIEW (B424): a new folder resolves its own view (own, inherited, default) — reads first, COLS only to apply
     let kids = super::livedir::read_open(m); // QUARRYLIVE (B494): the expanded folders' children, read before COLS
     let epoch = EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1335,7 +1335,7 @@ fn relist_leg(dir: &str) -> RelistLeg {
     let p = super::livedir::relist_probe(&bump);
     let (rows, held, locked) = p.done.as_ref().map_or((0, u64::MAX, usize::MAX), |d| (d.rows, d.held_us, d.locked_reads));
     let off_lock = p.done.is_some() && locked == 0;
-    let nl = nav_leg(dir, &sub); // NAVREAD (B834): a navigation into RELIST, read off MODEL (file tail)
+    let nl = nav_leg(dir, &sub, p.done.as_ref().map(|d| d.show_io)); // NAVREAD (B834): a navigation into RELIST, read off MODEL (file tail)
     let ok = off_lock && p.paint_defer && p.stale_dropped && rows > RELIST_ROWS && held <= RELIST_HELD_US && nl.ok;
     let terms = alloc::format!(
         "relist_rows={} relist_held_us={} off_lock={} paint_defer={} stale={} {}",
@@ -1354,7 +1354,9 @@ fn relist_leg(dir: &str) -> RelistLeg {
 /// From `dir` (QIOTMP) into `sub` (RELIST, [`RELIST_ROWS`] files + BUMP) through `livedir::nav_probe`: deferred under the
 /// Door, declined under a PaintMark, a superseded read dropped, the newer one installed off the lock under the bound.
 /// `nav_rows=<n> nav_held_us=<n> nav_off_lock=<ok|FAIL> nav_deferred=<ok|FAIL> nav_paint_defer=<ok|FAIL> nav_stale=<dropped|FAIL>`.
-fn nav_leg(dir: &str, sub: &str) -> RelistLeg {
+/// RELISTREAD (B853): then the keys' doors, a dropped Back's history, a deferred disclosure, a negative entry, and
+/// every install's show free of folder reads under MODEL (`relist_show_io` = the relist leg's install's).
+fn nav_leg(dir: &str, sub: &str, relist_show_io: Option<u64>) -> RelistLeg {
     if !super::open_at(dir) {
         return RelistLeg { ok: false, terms: String::from("nav=FAIL(open)") };
     }
@@ -1368,9 +1370,32 @@ fn nav_leg(dir: &str, sub: &str) -> RelistLeg {
     let xp = super::livedir::expand_probe();
     let (xheld, xlocked) = xp.done.as_ref().map_or((u64::MAX, usize::MAX), |d| (d.held_us, d.locked_reads));
     let expand_ok = xp.deferred && xlocked == 0 && xheld <= RELIST_HELD_US;
-    let ok = off_lock && p.deferred && p.paint_defer && p.stale_dropped && rows > RELIST_ROWS && held <= RELIST_HELD_US && nav_travel && expand_ok;
+    // RELISTREAD (B853): KEYTRAVEL, TRAVELDROP, DISCLOSEREAD, RELISTERR, SHOWFOLDERIO — each install under the bound.
+    let under = |d: &Option<super::livedir::Navigated>| d.as_ref().map_or(false, |d| d.held_us <= RELIST_HELD_US);
+    let kp = super::livedir::key_probe(dir, sub);
+    let key_ok = kp.forward_ok && kp.left_ok && under(&kp.forward) && under(&kp.left);
+    let drop_ok = super::livedir::drop_probe(dir);
+    let _ = super::open_at(dir);
+    let leaf = sub.rsplit('/').next().unwrap_or(sub);
+    let dp = super::livedir::disclose_probe(leaf);
+    let (disc_ok, disc_held, disc_term) = match &dp {
+        None => (true, u64::MAX, alloc::format!("skip(view={})", super::toolbar::mode_name(super::toolbar::view()))),
+        Some((deferred, done)) => {
+            let held = done.as_ref().map_or(u64::MAX, |d| d.held_us);
+            let ok = *deferred && done.as_ref().map_or(false, |d| d.kids > RELIST_ROWS && d.locked_reads == 0) && held <= RELIST_HELD_US;
+            (ok, held, String::from(if ok { "ok" } else { "FAIL" }))
+        }
+    };
+    let (neg_ok, neg) = super::livedir::neg_probe(&join(dir, "GONE"));
+    let neg_ok = neg_ok && under(&neg);
+    let _ = super::open_at(dir);
+    let show_io_ok = relist_show_io == Some(0)
+        && [&p.done, &tp.done, &kp.forward, &kp.left, &neg].iter().all(|d| d.as_ref().map_or(false, |d| d.show_io == 0));
+    let ok = off_lock && p.deferred && p.paint_defer && p.stale_dropped && rows > RELIST_ROWS && held <= RELIST_HELD_US && nav_travel && expand_ok
+        && key_ok && drop_ok && disc_ok && neg_ok && show_io_ok;
+    let okw = |b: bool| if b { "ok" } else { "FAIL" };
     let terms = alloc::format!(
-        "nav_rows={} nav_held_us={} nav_off_lock={} nav_deferred={} nav_paint_defer={} nav_stale={} nav_travel={} history={} expand_deferred={} expand_held_us={}",
+        "nav_rows={} nav_held_us={} nav_off_lock={} nav_deferred={} nav_paint_defer={} nav_stale={} nav_travel={} history={} expand_deferred={} expand_held_us={} key_travel={} drop_history={} disclose_deferred={} disclose_held_us={} neg_cache={} show_io_off_lock={}",
         rows,
         if held == u64::MAX { String::from("-") } else { alloc::format!("{}", held) },
         if off_lock { "ok" } else { "FAIL" },
@@ -1380,7 +1405,13 @@ fn nav_leg(dir: &str, sub: &str) -> RelistLeg {
         if nav_travel { "ok" } else { "FAIL" },
         tp.history,
         if expand_ok { "ok" } else { "FAIL" },
-        if xheld == u64::MAX { String::from("-") } else { alloc::format!("{}", xheld) }
+        if xheld == u64::MAX { String::from("-") } else { alloc::format!("{}", xheld) },
+        okw(key_ok),
+        okw(drop_ok),
+        disc_term,
+        if disc_held == u64::MAX { String::from("-") } else { alloc::format!("{}", disc_held) },
+        okw(neg_ok),
+        okw(show_io_ok)
     );
     RelistLeg { ok, terms }
 }
