@@ -52,6 +52,7 @@ dependencies = [
  "vein_ring3",
  "vp8_core",
  "vp9_core",
+ "yuv_core",
 ]
 
 [[package]]
