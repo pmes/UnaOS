@@ -12,7 +12,7 @@
 
 use h264_core::ps::avcc_reorder_depth;
 use h264_core::Decoder;
-use h264enc_core::{Access, BiPred, Config, Encoder, Entropy, Error, RateControl, RcMode, Yuv420};
+use h264enc_core::{Access, BiPred, Config, Encoder, Entropy, Error, RateControl, Yuv420};
 
 /// The moving square over a gradient (tests/pframes.rs's pattern) at any size.
 fn pattern(w: usize, h: usize, t: usize) -> [Vec<u8>; 3] {
@@ -157,7 +157,7 @@ fn a_transform8x8_and_rate_control_with_b_decode_to_the_reconstruction() {
     let base = Config { width: w as u32, height: h as u32, qp: 26, gop: 30, bframes: 2, deblock: true, subpel: 2, ..Default::default() };
     for entropy in [Entropy::Cavlc, Entropy::Cabac] {
         check(&format!("8x8 {entropy:?}"), Config { transform8x8: true, entropy, ..base }, 40, &src, 30.0);
-        let rate = Some(RateControl { bits_per_second: 60_000, fps_num: 30, fps_den: 1, mode: RcMode::Cbr });
+        let rate = Some(RateControl::cbr(60, (30, 1)));
         let bytes = check(&format!("cbr60 {entropy:?}"), Config { rate, entropy, ..base }, 60, &src, 20.0);
         println!("bframes cbr60 {entropy:?}: {:.2} kbit/s", bytes as f64 * 8.0 * 30.0 / 60.0 / 1000.0);
     }
