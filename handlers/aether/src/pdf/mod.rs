@@ -110,7 +110,7 @@ pub struct PdfDocument {
     pub hits: Vec<Range>,
     pub cur: Option<usize>,
     /// PDF4ANNOTS (SR343): the file as open: the fetched bytes, then those plus the form's incremental update(s) — the
-    /// filled form a save writes (PDF4-FORMSAVE owed: no verb carries it to the downloads folder).
+    /// filled form a save writes (PDF4FORMSAVE SR354: Ctrl/Cmd+S hands it to the shell as `BrowserSave`, `save_key`).
     pub bytes: Vec<u8>,
     /// Each page's object reference (what a destination names).
     page_refs: Vec<Option<Ref>>,
@@ -388,6 +388,19 @@ fn file_name(url: &str) -> String {
     if seg.is_empty() { "PDF".to_string() } else { seg.to_string() }
 }
 
+/// PDF4FORMSAVE (SR354): the file name a save suggests: the /Info /Title, else the URL's last segment (percent-decoded),
+/// sanitized as a download's name is, ending in `.pdf`.
+fn save_name(title: Option<&str>, url: &str) -> String {
+    let base = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::chrome::downloads::percent_decode(&file_name(url)));
+    let base = crate::chrome::downloads::sanitize(&base);
+    let base = if base.is_empty() { "PDF".to_string() } else { base };
+    if base.to_ascii_lowercase().ends_with(".pdf") { base } else { format!("{base}.pdf") }
+}
+
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -543,5 +556,26 @@ impl crate::AetherEngine {
     /// The status line's page indicator ("Page p / n") while a PDF is open.
     pub fn pdf_status(&self) -> Option<String> {
         self.pdf.as_ref().map(|p| p.status(self.scroll_y, self.height as f64))
+    }
+
+    /// PDF4FORMSAVE (SR354): Ctrl/Cmd+S on a PDF stages a `BrowserSave` of the file as it stands (the filled form's
+    /// incremental updates, or the fetched bytes untouched) for the shell to write to the Downloads folder. Runs ahead
+    /// of `pdf_key`, whose focused field would take the `s` as a consumed character; the field keeps its focus. False
+    /// (the key goes on as before) for any other key and on an HTML page (PAGE-SAVE owed).
+    pub(crate) fn save_key(&mut self, key: &str) -> bool {
+        use crate::forms::edit::{parse_key, Key};
+        let (m, k) = parse_key(key);
+        if !(m.ctrl || m.meta) || m.alt || m.shift || !matches!(k, Some(Key::Char('s' | 'S'))) {
+            return false;
+        }
+        let Some(pdf) = self.pdf.as_ref() else { return false };
+        let name = save_name(pdf.title.as_deref(), &self.current_url());
+        self.pending_save = Some(bandy::SMessage::BrowserSave { name, mime: "application/pdf".to_string(), bytes: pdf.bytes.clone() });
+        true
+    }
+
+    /// PDF4FORMSAVE (SR354): the save Ctrl/Cmd+S staged, once (the shell fires it on the bus after the turn).
+    pub fn take_pending_save(&mut self) -> Option<bandy::SMessage> {
+        self.pending_save.take()
     }
 }

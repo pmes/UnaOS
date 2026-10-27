@@ -498,6 +498,15 @@ pub enum SMessage {
     /// omitted from the wire when 0 so a press with no modifier keeps its frozen shape (smessage_kats).
     /// SURFACEID (LEDGER SR332): `surface` is the Surface's number (see `BrowserScroll`), omitted when 0.
     BrowserButton { down: bool, x: f64, y: f64, #[serde(default, skip_serializing_if = "no_mods")] mods: u8, #[serde(default, skip_serializing_if = "no_surface")] surface: u32 },
+    /// Engine -> shell (PDF4FORMSAVE, LEDGER SR354): save these bytes as a file. `name` is the engine's suggested file
+    /// name (the shell sanitizes it and makes it unique in the Downloads folder), `mime` their type. Ctrl/Cmd+S on a PDF
+    /// tab stages the filled `PdfDocument::bytes` (the original file when nothing was filled). APPENDED so no earlier
+    /// wire tag moves.
+    BrowserSave { name: String, mime: String, bytes: Vec<u8> },
+    /// Shell -> chrome (PDF4FORMSAVE, SR354): the [`SMessage::BrowserSave`] landed at `path`.
+    BrowserSaved { path: String },
+    /// Shell -> chrome (PDF4FORMSAVE, SR354): the [`SMessage::BrowserSave`] could not be written, and why.
+    BrowserSaveFailed { why: String },
 }
 
 /// A typed preference value — the whole value domain of the Principia

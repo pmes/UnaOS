@@ -62,7 +62,7 @@ pub struct AetherEngine {
     pub pointer: Option<(f64, f64)>,
     /// The cursor keyword the shell was last told about, and one it has not been told about yet.
     cursor: String,
-    pending_cursor: Option<String>,
+    pending_cursor: Option<String>, pending_save: Option<bandy::SMessage>, // PDF4FORMSAVE (SR354): a staged BrowserSave (Ctrl/Cmd+S on a PDF), `take_pending_save`
     /// AETHERSELECT (SR69): the engine's own "button down" flag — motion extends the selection only
     /// while it is set (`pointer_moved`), and release clears it (`pointer_released`).
     button_down: bool,
@@ -157,7 +157,7 @@ impl AetherEngine {
             hover_path: Vec::new(),
             pointer: None,
             cursor: "default".to_string(),
-            pending_cursor: None,
+            pending_cursor: None, pending_save: None,
             button_down: false,
             sel_drag: None,
             last_press: None,
@@ -1068,7 +1068,7 @@ impl AetherEngine {
     fn key_default(&mut self, key: String) {
         // AETHERA11Y (SR119): sequential focus navigation (Tab, Enter on links, the arrow keys in
         // composite widgets) before the page's own default; a key it handles is consumed.
-        if self.pdf_key(&key) { return; } if crate::dom::a11y::keyboard::handle_key(self, &key) {
+        if self.save_key(&key) { return; } if self.pdf_key(&key) { return; } if crate::dom::a11y::keyboard::handle_key(self, &key) {
             return;
         }
         // A focused text control takes its editing keys first (forms::edit); the page only

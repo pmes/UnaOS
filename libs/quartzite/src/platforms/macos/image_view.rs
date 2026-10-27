@@ -356,7 +356,7 @@ define_class!(
                 if flags & (1 << 20) != 0 {
                     match text.as_str() {
                         "c" | "C" => syn.fire(bandy::SMessage::BrowserCopy),
-                        "a" | "A" => syn.fire(bandy::SMessage::BrowserSelectAll),
+                        "a" | "A" => syn.fire(bandy::SMessage::BrowserSelectAll), "s" | "S" => syn.fire(bandy::SMessage::BrowserKey("Meta+s".into())), // PDF4FORMSAVE (SR354): Cmd+S reaches the engine (a PDF tab saves)
                         _ => {}
                     }
                     return;
