@@ -1009,4 +1009,13 @@ OPTIONAL :: NLE: frames=\d+ seeks=\d+ runup=\d+ agree=\d+/\d+ counter=frame-ord 
 OPTIONAL \[vplay\] size switch at \d+ 66x66->16x16
 OPTIONAL \[nle\] export size switch 66x66->16x16 scaled
 OPTIONAL \[nle\] fixture export sizes=2 reel=NLEFXE .* samples=4 first=66x66 .* -> ok
+# EXPORTSIZEFIXTUREPOLICIES (rmbp-ledger B993): the same reel under Fill (NLESZF) and Stretch (NLESZS), read back at 66x66, and under Adopt (NLESZA) refused by name with its file gone; `policies=` counts the four legs (OPTIONAL as above).
+OPTIONAL \[nle\] export size switch 66x66->16x16 scaled fit=fill
+OPTIONAL \[nle\] export size switch 66x66->16x16 scaled fit=stretch
+OPTIONAL \[nle\] export refused why=encode-refused .*adopt.*\(NLE-SIZE-POLICY\)
+OPTIONAL \[nle\] fixture export sizes=2 reel=NLEFXE .* samples=4 first=66x66 frames=4 .* fit=fill -> ok
+OPTIONAL \[nle\] fixture export sizes=2 reel=NLEFXE .* samples=4 first=66x66 frames=4 .* fit=stretch -> ok
+OPTIONAL \[nle\] fixture export sizes=2 reel=NLEFXE .* fit=adopt refused=1 gone=1 -> ok
+OPTIONAL \[nle\] fixture export policies=4 -> ok
+FORBID \[nle\] fixture export policies=.* -> FAIL
 FORBID \[nle\] fixture export sizes=.* -> FAIL

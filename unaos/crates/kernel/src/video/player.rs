@@ -1569,7 +1569,7 @@ mod nle_fx {
         let ctts = vi.is_some_and(|i| d.track_samples(i).any(|s| s.pts != s.dts));
         let audio_ok = d.audio_track().is_some_and(|t| t.sample_rate == 48_000 && t.channels == 2) && rep.audio_target > 0 && rep.audio_mixed >= rep.audio_target && rep.periods > 0; // NLE6EXPORTSTREAMPCM (rmbp-ledger B976): the sound entered the file before finish
         let need_audio = cfg!(any(feature = "uvc", feature = "hda-tone"));
-        let (col_ok, col_word) = export_colour(&d, vi); let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir) && col_ok && mkv_verdict(dir); let sz_ok = size_verdict(dir); let ok = ok && sz_ok; // EXPORTSIZEFIXTURE (rmbp-ledger B990): the two-size AV1 reel exported (module tail). NLE6EXPORTMKV (rmbp-ledger B966): the .mkv export (module tail). H264ENCCOLOURHOST (LEDGER SR377): the re-read file's colour (module tail). NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
+        let (col_ok, col_word) = export_colour(&d, vi); let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir) && col_ok && mkv_verdict(dir); let sz_ok = size_verdict(dir); let ok = ok && sz_ok; let pol_ok = policies_verdict(dir, sz_ok); let ok = ok && pol_ok; // EXPORTSIZEFIXTUREPOLICIES (rmbp-ledger B993): the same reel under Fill / Stretch / Adopt (module tail). EXPORTSIZEFIXTURE (rmbp-ledger B990): the two-size AV1 reel exported (module tail). NLE6EXPORTMKV (rmbp-ledger B966): the .mkv export (module tail). H264ENCCOLOURHOST (LEDGER SR377): the re-read file's colour (module tail). NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
         serial_println!(
             "[nle] fixture export out={} samples={} ticks={} ctts={} colour={} audio={} mixed={}/{} periods={} bytes={} ms={} -> {}",
             out, samples, ticks, ctts as u8, col_word, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.periods, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
@@ -2015,24 +2015,57 @@ mod nle_fx {
 
     /// The two-size leg: NLEFXE.MP4 and NLESZ.EDL written through the ONE VFS writer, exported to NLESZ.MP4, re-demuxed.
     fn size_verdict(dir: &str) -> bool {
+        size_leg(dir, "NLESZ", timeline_core::SizePolicy::Letterbox)
+    }
+
+    /// EXPORTSIZEFIXTUREPOLICIES (rmbp-ledger B993): B990's leg under the reel policy `fit`: NLEFXE.MP4 and `<stem>.EDL` (the
+    /// policy set by `Timeline::set_size_policy`, so the EDL carries `* UNA SIZE NLEFXE <fit>` unless Letterbox, re-parsed to pin
+    /// the round trip) written through the ONE VFS writer, exported to `<stem>.MP4` and re-demuxed; ` fit=<name>` on the line
+    /// unless Letterbox (B990's line byte-identical). Adopt: the export must be refused by name and its file gone.
+    fn size_leg(dir: &str, stem: &str, fit: timeline_core::SizePolicy) -> bool {
         use crate::video::export;
+        use timeline_core::SizePolicy;
         let mt = crate::shell::vfs_mount_table();
         let put = |c: &str, body: &[u8]| -> bool { mt.put_file(c, body, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok() };
         let mut tl = Timeline::new(FPS);
         let e = tl.add_source("NLEFXE", 4);
         tl.add_track(Kind::Video);
         tl.tracks[0].clips = alloc::vec![Clip::new(e, 0, 4, 0)];
-        let (reel, edl, out) = (alloc::format!("{}/NLEFXE.MP4", dir), alloc::format!("{}/NLESZ.EDL", dir), alloc::format!("{}/NLESZ.MP4", dir));
+        let (reel, edl, out) = (alloc::format!("{}/NLEFXE.MP4", dir), alloc::format!("{}/{}.EDL", dir, stem), alloc::format!("{}/{}.MP4", dir, stem));
         let sizes = size_count();
-        let wrote = put(&reel, &size_reel()) && timeline_core::edl::write(&tl, "NLESZ").map(|t| put(&edl, t.as_bytes())).unwrap_or(false);
-        let rep = if !wrote {
+        let tl = tl.set_size_policy(e, fit).ok();
+        let text = tl.as_ref().and_then(|tl| timeline_core::edl::write(tl, stem).ok());
+        let round = text.as_deref().and_then(|t| timeline_core::edl::parse(t, FPS).ok()).and_then(|t| t.sources.iter().find(|s| s.reel == "NLEFXE").map(|s| s.size_policy)) == Some(fit);
+        if fit == SizePolicy::Adopt {
+            let _ = mt.unlink(&out, crate::fs::vfs::KERNEL_PRINCIPAL); // a stale file from an earlier run must not read as "not gone"
+        }
+        let wrote = put(&reel, &size_reel()) && text.as_deref().map(|t| put(&edl, t.as_bytes())).unwrap_or(false);
+        let rep = if tl.is_none() {
+            Err(String::from("fixture-policy"))
+        } else if !wrote {
             Err(String::from("fixture-write"))
+        } else if !round {
+            Err(String::from("edl-policy"))
         } else {
             match export::start(&edl, &out, export::Opts::default()) {
                 Ok(jid) => await_export(jid),
                 Err(e) => Err(e),
             }
         };
+        if fit == SizePolicy::Adopt {
+            let (refused, why) = match &rep {
+                Ok(_) => (false, Some(String::from("exported"))),
+                Err(m) if m.starts_with("encode-refused") && m.contains("adopt") && m.contains("(NLE-SIZE-POLICY)") => (true, None),
+                Err(m) => (false, Some(m.clone())),
+            };
+            let gone = vplay::read_all(&out).is_err();
+            let ok = sizes == 2 && refused && gone;
+            serial_println!(
+                "[nle] fixture export sizes={} reel=NLEFXE out={} fit=adopt refused={} gone={}{} -> {}",
+                sizes, out, refused as u8, gone as u8, why.map(|w| alloc::format!(" why={}", w)).unwrap_or_default(), if ok { "ok" } else { "FAIL" }
+            );
+            return ok;
+        }
         let open = |p: &str| vplay::read_all(p).and_then(|b| demux_core::Demuxer::open(b).map_err(|e| alloc::format!("demux: {}", e)));
         let (frames, bytes, samples, first, why) = match rep.and_then(|r| Ok((r, open(&out)?))) {
             Ok((r, d)) => {
@@ -2044,10 +2077,29 @@ mod nle_fx {
             Err(e) => (0, 0, 0, (0, 0), Some(e)),
         };
         let ok = why.is_none() && sizes == 2 && samples == 4 && frames == 4 && first == (66, 66);
+        let tok = if fit == SizePolicy::Letterbox { String::new() } else { alloc::format!(" fit={}", fit.name()) };
         serial_println!(
-            "[nle] fixture export sizes={} reel=NLEFXE out={} samples={} first={}x{} frames={} bytes={}{} -> {}",
-            sizes, out, samples, first.0, first.1, frames, bytes, why.map(|w| alloc::format!(" why={}", w)).unwrap_or_default(), if ok { "ok" } else { "FAIL" }
+            "[nle] fixture export sizes={} reel=NLEFXE out={} samples={} first={}x{} frames={} bytes={}{}{} -> {}",
+            sizes, out, samples, first.0, first.1, frames, bytes, tok, why.map(|w| alloc::format!(" why={}", w)).unwrap_or_default(), if ok { "ok" } else { "FAIL" }
         );
+        ok
+    }
+
+    // ── EXPORTSIZEFIXTUREPOLICIES (rmbp-ledger B993): NLEFXE under each size policy (handlers.md §5 NLEPROBE-HDR's EXPORT-SIZE-FIXTURE-POLICIES) ─
+    // B990's leg (`size_leg`) again over the same reel and the same export door, the reel's policy set on the timeline: NLESZF.EDL
+    // Fill and NLESZS.EDL Stretch exported to NLESZF / NLESZS.MP4 (the export's `[nle] export size switch 66x66->16x16 scaled
+    // fit=<name>`, each read back at 4 samples and 66x66), NLESZA.EDL Adopt refused by name (`encode-refused ... adopt ...
+    // (NLE-SIZE-POLICY)`, `Exp::sized`) and its partial file unlinked by the existing `abandon` (only if the encoder had begun the
+    // file: `gone=1` holds either way). NLEFXE's two sizes are both 1:1, so every policy covers the whole 66x66 box: a "no bars"
+    // pixel sample could not tell Fill from Letterbox, and the kernel names no H.264 decoder (h264_core only through h264enc_core):
+    // the geometry pin is owed (EXPORT-SIZE-POLICY-PIXEL: a non-square second size, decoded back). `policies=` counts the four legs
+    // that passed (B990's Letterbox leg passed in as `letterbox`).
+    fn policies_verdict(dir: &str, letterbox: bool) -> bool {
+        use timeline_core::SizePolicy;
+        let legs = [("NLESZF", SizePolicy::Fill), ("NLESZS", SizePolicy::Stretch), ("NLESZA", SizePolicy::Adopt)];
+        let n = letterbox as u32 + legs.iter().map(|&(stem, fit)| size_leg(dir, stem, fit) as u32).sum::<u32>();
+        let ok = n == 4;
+        serial_println!("[nle] fixture export policies={} -> {}", n, if ok { "ok" } else { "FAIL" });
         ok
     }
 }
