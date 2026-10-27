@@ -17,6 +17,9 @@
 //!   `0 <= src_in < src_out <= source.duration`; every clip names a source that exists.
 //! * [`edl`]: the CMX 3600 text EDL (non-drop frame) — reader and writer.
 //! * [`schedule`]: the render schedule — what source tick each output tick shows, and where a decoder must seek.
+//! * Audio (NLE4, LEDGER SR203): a clip carries a gain in centi-dB ([`Clip::gain_cdb`], 0 = unity) and linear fades in
+//!   ticks ([`Clip::fade_in`], [`Clip::fade_out`], 0 = none; `fade_in + fade_out <= len`); [`Timeline::set_gain`] and
+//!   [`Timeline::set_fades`] edit them; [`schedule::audio_runs`] mixes every audio track.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -58,11 +61,29 @@ pub struct Clip {
     pub src_in: i64,
     pub src_out: i64,
     pub at: i64,
+    /// NLE4: the clip's audio gain in centi-dB (0 = unity; [`GAIN_MIN_CDB`]..=[`GAIN_MAX_CDB`]).
+    pub gain_cdb: i32,
+    /// NLE4: a linear fade from silence over the clip's first `fade_in` ticks (0 = none).
+    pub fade_in: i64,
+    /// NLE4: a linear fade to silence over the clip's last `fade_out` ticks (0 = none).
+    pub fade_out: i64,
 }
+
+/// NLE4: the gain range a clip may carry, centi-dB (-144 dB .. +24 dB).
+pub const GAIN_MIN_CDB: i32 = -14_400;
+pub const GAIN_MAX_CDB: i32 = 2_400;
 
 impl Clip {
     pub fn new(src: SourceId, src_in: i64, src_out: i64, at: i64) -> Clip {
-        Clip { src, src_in, src_out, at }
+        Clip { src, src_in, src_out, at, gain_cdb: 0, fade_in: 0, fade_out: 0 }
+    }
+    /// The same clip at gain `cdb` (centi-dB).
+    pub fn gained(self, cdb: i32) -> Clip {
+        Clip { gain_cdb: cdb, ..self }
+    }
+    /// The same clip with fades of `fade_in` / `fade_out` ticks.
+    pub fn faded(self, fade_in: i64, fade_out: i64) -> Clip {
+        Clip { fade_in, fade_out, ..self }
     }
     /// Ticks on the timeline.
     pub fn len(&self) -> i64 {
@@ -122,6 +143,10 @@ pub enum EditError {
     Negative,
     /// A move between a video and an audio track.
     Kind,
+    /// NLE4: a negative fade, or `fade_in + fade_out` longer than the clip.
+    Fade,
+    /// NLE4: a gain outside `GAIN_MIN_CDB..=GAIN_MAX_CDB`.
+    Gain,
 }
 
 impl core::fmt::Display for EditError {
@@ -135,6 +160,8 @@ impl core::fmt::Display for EditError {
             EditError::Empty => "empty clip",
             EditError::Negative => "negative time",
             EditError::Kind => "video and audio tracks do not mix",
+            EditError::Fade => "fades longer than the clip",
+            EditError::Gain => "gain out of range",
         })
     }
 }
@@ -203,6 +230,12 @@ impl Timeline {
                 }
                 if c.src_out > s.duration {
                     return Err(EditError::OutOfSource);
+                }
+                if c.fade_in < 0 || c.fade_out < 0 || c.fade_in + c.fade_out > c.len() {
+                    return Err(EditError::Fade);
+                }
+                if !(GAIN_MIN_CDB..=GAIN_MAX_CDB).contains(&c.gain_cdb) {
+                    return Err(EditError::Gain);
                 }
                 // An out-of-order pair always fails this too (prev.at > c.at implies prev.end > c.at).
                 if prev.is_some_and(|p| p.end() > c.at) {
@@ -314,6 +347,23 @@ impl Timeline {
         tl.validate()?;
         Ok(tl)
     }
+
+    /// NLE4: set a clip's audio gain (centi-dB).
+    pub fn set_gain(&self, track: usize, idx: usize, gain_cdb: i32) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        clip_mut(&mut tl, track, idx)?.gain_cdb = gain_cdb;
+        tl.validate()?;
+        Ok(tl)
+    }
+
+    /// NLE4: set a clip's fades (ticks); refused when they are negative or together longer than the clip.
+    pub fn set_fades(&self, track: usize, idx: usize, fade_in: i64, fade_out: i64) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        let c = clip_mut(&mut tl, track, idx)?;
+        (c.fade_in, c.fade_out) = (fade_in, fade_out);
+        tl.validate()?;
+        Ok(tl)
+    }
 }
 
 fn clip_mut(tl: &mut Timeline, track: usize, idx: usize) -> Result<&mut Clip, EditError> {
@@ -324,13 +374,19 @@ fn sort(t: &mut Track) {
     t.clips.sort_by_key(|c| c.at);
 }
 
-/// Split the clip strictly spanning `t` (if any) into `..t` and `t..`.
+/// Split the clip strictly spanning `t` (if any) into `..t` and `t..`. Both halves keep the gain; the head keeps the
+/// fade-in and the tail the fade-out, each clamped to its half (a split inside a fade shortens it, never invalidly).
 fn split_at(t: &mut Track, at: i64) {
     if let Some(i) = t.clips.iter().position(|c| c.at < at && at < c.end()) {
         let c = t.clips[i];
         let cut = c.src_in + (at - c.at);
-        t.clips[i].src_out = cut;
-        t.clips.insert(i + 1, Clip { src: c.src, src_in: cut, src_out: c.src_out, at });
+        let head = &mut t.clips[i];
+        head.src_out = cut;
+        head.fade_in = c.fade_in.min(head.len());
+        head.fade_out = 0;
+        let tail = Clip { src_in: cut, at, fade_in: 0, ..c };
+        let tail = Clip { fade_out: c.fade_out.min(tail.len()), ..tail };
+        t.clips.insert(i + 1, tail);
     }
 }
 

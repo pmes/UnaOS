@@ -16,19 +16,24 @@
 //! * [`Sources`] is the schedule's [`SourceIndex`]: its keyframe answer is the demuxer's own search
 //!   (`share()` + `seek_track` on a throwaway cursor). NLEPROBE (SR195) owes the pure keyframe-before; the swap is one fn.
 //! * Source time 0 is a stream's first presentation time (vplay's rule).
-//! * Cut-only and one format: a video frame whose size differs from the project's (the first scheduled video source's
-//!   track) is refused (scaling is owed), as is an audio stream whose rate or channel count differs (the mix and the
-//!   resampler are NLE4). A gap is black (opaque) or silence.
+//! * Video is cut-only and one size: a frame whose size differs from the project's (the first scheduled video source's
+//!   track) is refused (scaling is owed). A gap is black (opaque) or silence.
+//! * Audio is a MIX (NLE4, LEDGER SR203): each audio step renders its `timeline_core::schedule::audio_runs` run: every
+//!   layer decoded on its own track's decoder, resampled to the project rate when its rate differs
+//!   (`audio_core::resample::linear`; the project rate is [`Sources::set_audio_rate`]'s, else the first scheduled audio
+//!   source's), scaled by its gain and its linear fade envelope, summed in integers and clamped to 16 bits once. Only a
+//!   CHANNEL-count mismatch is refused. One layer at 0 dB with no fade passes through bit for bit.
 //!
 //! [`synth_source`] writes the codec-free test medium the KATs and `tools/nle --make-src` use: demux_core's `utp1`
 //! test-pattern video (frame ordinals from `base`) plus 16-bit PCM whose every sample names its source and index.
 
 use std::collections::VecDeque;
 
+use gneiss_pal::dsp::audio::resample;
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
 use gneiss_pal::dsp::demux::{Demuxer, TrackKind, build};
 use gneiss_pal::dsp::video::{Frame, VideoDecoder, decoder_for};
-use timeline_core::schedule::{ScheduleError, schedule};
+use timeline_core::schedule::{AudioRun, Layer, ScheduleError, audio_runs, schedule};
 use timeline_core::{Kind, SourceId, SourceIndex, Timebase, Timeline};
 
 /// Where rendered output goes, in output order.
@@ -65,7 +70,7 @@ pub enum RenderError {
     Decode(String),
     /// A frame's size differs from the project's.
     Size { src: SourceId, width: u32, height: u32 },
-    /// An audio stream's rate or channel count differs from the project's.
+    /// An audio stream's channel count differs from the project's (NLE4: a rate is resampled).
     Format { src: SourceId, rate: u32, channels: u16 },
     /// The media ran out before the clip did.
     Short(SourceId),
@@ -126,11 +131,17 @@ impl Media {
 pub struct Sources {
     tb: Timebase,
     media: Vec<(SourceId, Media)>,
+    /// NLE4: the project's audio rate (0 = the first scheduled audio source's).
+    audio_rate: u32,
 }
 
 impl Sources {
     pub fn new(tl: &Timeline) -> Sources {
-        Sources { tb: tl.tb, media: Vec::new() }
+        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0 }
+    }
+    /// NLE4: render audio at `hz` (sources at other rates are resampled); 0 = the first scheduled audio source's rate.
+    pub fn set_audio_rate(&mut self, hz: u32) {
+        self.audio_rate = hz;
     }
     /// Open `bytes` (MP4 / Matroska / WebM) as source `id`.
     pub fn add(&mut self, id: SourceId, bytes: Vec<u8>) -> Result<(), RenderError> {
@@ -249,13 +260,15 @@ struct Aud {
 }
 
 impl Aud {
-    fn open(m: &Media, src: SourceId, key_ns: i64, rate: u32, channels: u16) -> Result<Aud, RenderError> {
+    /// NLE4: refuses only a channel-count mismatch; the run keeps the decoder's own rate (`rate`).
+    fn open(m: &Media, src: SourceId, key_ns: i64, channels: u16) -> Result<Aud, RenderError> {
         let (i, origin) = m.stream(Kind::Audio).ok_or(RenderError::NoStream(src, Kind::Audio))?;
         let track = &m.demux.tracks()[i];
         let dec = audio_decoder_for(track, Timing::of(&m.demux, track)).map_err(|e| RenderError::Decode(e.to_string()))?;
-        if dec.sample_rate() != rate || dec.channels() != channels {
+        if dec.channels() != channels {
             return Err(RenderError::Format { src, rate: dec.sample_rate(), channels: dec.channels() });
         }
+        let rate = dec.sample_rate();
         let mut cursor = m.demux.share();
         cursor.seek_track(i, origin + key_ns);
         let ch = channels.max(1) as usize;
@@ -263,14 +276,19 @@ impl Aud {
     }
     /// Source samples `start..start + n`, interleaved (sample-exact; a hole in the stream is silence).
     fn take(&mut self, start: i64, n: i64) -> Result<Vec<f32>, RenderError> {
+        self.fill(start + n, false)?;
+        Ok(self.drain(start, n))
+    }
+    /// Decode until source sample `want` is buffered; at the stream's end `Short`, or (`soft`) whatever there is.
+    fn fill(&mut self, want: i64, soft: bool) -> Result<(), RenderError> {
         let ch = self.ch;
         loop {
             let have_end = self.buf_at + (self.buf.len() / ch) as i64;
-            if self.started && have_end >= start + n {
+            if self.started && have_end >= want {
                 break;
             }
             if self.done {
-                return Err(RenderError::Short(self.src));
+                return if soft { Ok(()) } else { Err(RenderError::Short(self.src)) };
             }
             match self.cursor.next_packet() {
                 Some(p) if p.track == self.track_id => {
@@ -297,6 +315,11 @@ impl Aud {
                 None => self.done = true,
             }
         }
+        Ok(())
+    }
+    /// Move the buffer's head to source sample `start` (a hole before the buffer is silence).
+    fn seat(&mut self, start: i64) {
+        let ch = self.ch;
         if start >= self.buf_at {
             let drop = ((start - self.buf_at) as usize * ch).min(self.buf.len());
             self.buf.drain(..drop);
@@ -305,16 +328,22 @@ impl Aud {
             self.buf.splice(0..0, std::iter::repeat_n(0.0, pad));
         }
         self.buf_at = start;
+    }
+    /// The buffered source samples `start..start + n`, drained.
+    fn drain(&mut self, start: i64, n: i64) -> Vec<f32> {
+        let ch = self.ch;
+        self.seat(start);
         let take = (n.max(0) as usize * ch).min(self.buf.len());
         let out: Vec<f32> = self.buf.drain(..take).collect();
         self.buf_at += n.max(0);
-        Ok(out)
+        out
     }
 }
 
 /// Render output ticks `range` of `tl` (see the module docs).
 pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sink: &mut dyn RenderSink) -> Result<RenderReport, RenderError> {
-    let steps = schedule(tl, range, sources).map_err(RenderError::Schedule)?;
+    let steps = schedule(tl, range.clone(), sources).map_err(RenderError::Schedule)?;
+    let runs = audio_runs(tl, range, sources).map_err(RenderError::Schedule)?;
     let mut r = RenderReport::default();
     let mut afmt: Option<(u32, u16)> = None;
     for s in &steps {
@@ -339,6 +368,9 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     if r.width == 0 && steps.iter().any(|s| s.kind == Kind::Video) {
         return Err(RenderError::NoSize);
     }
+    if sources.audio_rate > 0 {
+        afmt = afmt.map(|(_, ch)| (sources.audio_rate, ch));
+    }
     if let Some((rate, ch)) = afmt {
         (r.rate, r.channels) = (rate, ch);
     }
@@ -346,7 +378,9 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let black: Vec<u8> = [0u8, 0, 0, 255].repeat(w as usize * h as usize);
     let tol = tl.tb.to_ns(1) / 2;
     let mut vid: Option<Vid> = None;
-    let mut aud: Option<Aud> = None;
+    // NLE4: one audio decoder per track; the k-th audio step is the k-th mix run.
+    let mut auds: Vec<Option<Aud>> = (0..tl.tracks.len()).map(|_| None).collect();
+    let mut run_of = runs.iter();
     for s in &steps {
         match (s.kind, s.src) {
             (Kind::Video, None) => {
@@ -370,33 +404,94 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
                 sink.frame(s.out_t, w, h, &f.to_rgba());
                 r.frames += 1;
             }
-            (Kind::Audio, src) => {
+            (Kind::Audio, _) => {
+                let run = run_of.next().expect("one mix run per audio step");
                 let Some((rate, ch)) = afmt else { continue };
                 let s0 = samples(tl.tb.to_ns(s.out_t), rate);
                 let n = samples(tl.tb.to_ns(s.out_t + s.len), rate) - s0;
-                let pcm = match src {
-                    None => vec![0.0f32; n as usize * ch as usize],
-                    Some(src) => {
-                        let start = samples(tl.tb.to_ns(s.src_t), rate);
-                        if s.seek.is_some() || aud.as_ref().map(|a| a.src) != Some(src) {
-                            let key = match s.seek {
-                                Some(k) => k,
-                                None => sources
-                                    .keyframe_ns(src, Kind::Audio, tl.tb.to_ns(s.src_t))
-                                    .ok_or(RenderError::NoStream(src, Kind::Audio))?,
-                            };
-                            aud = Some(Aud::open(sources.get(src)?, src, key, rate, ch)?);
-                            r.seeks += 1;
-                        }
-                        aud.as_mut().expect("opened above").take(start, n)?
-                    }
-                };
+                let pcm = mix_run(tl, run, sources, &mut auds, rate, ch, n, &mut r.seeks)?;
                 sink.pcm(s.out_t, rate, ch, &pcm);
                 r.pcm_frames += n as u64;
             }
         }
     }
     Ok(r)
+}
+
+impl Aud {
+    /// NLE4: output samples `out_start..out_start + n` at `out_rate` (counted from the source's origin): the source's
+    /// own samples when the rates agree, else linearly resampled (the neighbour past the media's end holds).
+    fn take_at(&mut self, out_start: i64, n: i64, out_rate: u32) -> Result<Vec<f32>, RenderError> {
+        if self.rate == out_rate {
+            return self.take(out_start, n);
+        }
+        if n <= 0 {
+            return Ok(Vec::new());
+        }
+        let (i0, _, _) = resample::linear_pos(out_start, self.rate, out_rate);
+        let (i1, f1, _) = resample::linear_pos(out_start + n - 1, self.rate, out_rate);
+        self.fill(i1 + 1, false)?;
+        if f1 != 0 {
+            self.fill(i1 + 2, true)?;
+        }
+        self.seat(i0);
+        Ok(resample::linear(&self.buf, self.buf_at, self.ch, self.rate, out_rate, out_start, n as usize))
+    }
+}
+
+/// NLE4: one mix run's `n` output samples at the project format: each layer on its track's decoder (opened at its
+/// `seek`, or when the track's source changed), x gain x envelope, summed in i64 and clamped to i16 once.
+#[allow(clippy::too_many_arguments)]
+fn mix_run(
+    tl: &Timeline,
+    run: &AudioRun,
+    sources: &Sources,
+    auds: &mut [Option<Aud>],
+    rate: u32,
+    ch: u16,
+    n: i64,
+    seeks: &mut u64,
+) -> Result<Vec<f32>, RenderError> {
+    let n = n.max(0);
+    let mut acc = vec![0i64; n as usize * ch as usize];
+    for l in &run.layers {
+        let slot = &mut auds[l.track];
+        if l.seek.is_some() || slot.as_ref().map(|a| a.src) != Some(l.src) {
+            let key = match l.seek {
+                Some(k) => k,
+                None => sources.keyframe_ns(l.src, Kind::Audio, tl.tb.to_ns(l.src_t)).ok_or(RenderError::NoStream(l.src, Kind::Audio))?,
+            };
+            *slot = Some(Aud::open(sources.get(l.src)?, l.src, key, ch)?);
+            *seeks += 1;
+        }
+        let start = samples(tl.tb.to_ns(l.src_t), rate);
+        let pcm = slot.as_mut().expect("opened above").take_at(start, n, rate)?;
+        mix_into(&mut acc, &pcm, l, n, ch.max(1) as usize);
+    }
+    Ok(acc.into_iter().map(|a| a.clamp(-32768, 32767) as f32 / 32768.0).collect())
+}
+
+/// NLE4: add one layer into the accumulator: each sample as i16, x its gain (Q16) x its envelope (Q16, linear from
+/// `env[0]` at the run's first sample toward `env[1]` at its end edge).
+fn mix_into(acc: &mut [i64], pcm: &[f32], l: &Layer, n: i64, ch: usize) {
+    let g = gain_q16(l.gain_cdb);
+    let (e0, e1) = (l.env[0] as i64, l.env[1] as i64);
+    for (j, frame) in pcm.chunks(ch).enumerate() {
+        let e = if n > 0 { e0 + (e1 - e0) * j as i64 / n } else { e0 };
+        for (c, &x) in frame.iter().enumerate() {
+            acc[j * ch + c] += (to_i16(x) * g * e) >> 32;
+        }
+    }
+}
+
+/// NLE4: a gain in centi-dB as a Q16 factor (0 cdB = 65536 exactly).
+fn gain_q16(cdb: i32) -> i64 {
+    (10f64.powf(cdb as f64 / 2000.0) * 65536.0).round() as i64
+}
+
+/// NLE4: an `f32` sample (full scale +-1) as a 16-bit value, rounded and clamped.
+fn to_i16(x: f32) -> i64 {
+    (x as f64 * 32768.0).round().clamp(-32768.0, 32767.0) as i64
 }
 
 /// The synthetic sources' audio rate.
