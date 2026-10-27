@@ -15,9 +15,9 @@
 //!
 //! HE-AAC (HEAACSBR, LEDGER SR198): [`sbr`] rebuilds the upper band and the output runs at twice the core rate,
 //! 2048 samples per access unit — switched on by the AudioSpecificConfig (explicit signalling) or by an SBR fill
-//! element in the first access unit (implicit signalling, [`sbr_probe`]). HE-AAC v2's parametric stereo is
-//! recognised (`AacDecoder::ps_seen`, `ps=seen`) and not synthesised: the mono core plays on both channels (owed,
-//! handlers.md HEAACSBR-PS).
+//! element in the first access unit (implicit signalling, [`sbr_probe`]). HE-AAC v2's parametric stereo
+//! (`AacDecoder::ps_seen`, `ps=seen`) is synthesised from the mono core into a stereo pair (HEAACSBR-PS, LEDGER
+//! SR214; a stream whose PS first appears after the probed first access unit stays mono).
 pub mod decoder;
 pub mod sbr;
 pub mod tables;
