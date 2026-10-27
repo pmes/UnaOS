@@ -791,7 +791,7 @@ refs/heads/exec-rmbp-aetherlib   0213ffb62 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-stationair   01f916bb9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-sleepresume   baa7d1da6 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-keyboot4   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-shadowdamage   baa7d1da6 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-shadowdamage   55270af51 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-overlayarm2   149ba4120 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-panelknob2   a3cd0eb5a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zoomflush2   9060133b8 FOLDED-BY-HAND (this commit) 2026-10-27

@@ -6530,15 +6530,15 @@ fn a11yshadow_leg() {
             (Some(ok), relaid, calls, extra)
         }
     };
-    change(m0, i0);
+    let (cpass, lpass, cwalks) = shadowcover_legs(); change(m0, i0); // SHADOWDAMAGE (rmbp-ledger B865): the CONTRAST and lens bumpers' re-lays, counted (fn at this file's tail). LINE-NEUTRAL fold, code first.
     wm::focus_changed(saved);
     wm::close(win);
     wm::composite();
     if let Some(ok) = verdict {
-        let pass = ok && calls == 1 && extra == 0;
+        let pass = ok && calls == 1 && extra == 0 && cpass == 1 && lpass != "0" && cwalks == 0;
         serial_println!(
-            ":: A11YSHADOW: shadow_follows={} relaid={} changed_calls={} extra_pass={} -> {} ::",
-            if ok { "ok" } else { "FAIL" }, relaid, calls, extra, if pass { "PASS" } else { "FAIL" }
+            ":: A11YSHADOW: shadow_follows={} relaid={} changed_calls={} extra_pass={} contrast_pass={} lens_pass={} relay_walks={} -> {} ::",
+            if ok { "ok" } else { "FAIL" }, relaid, calls, extra, cpass, lpass, extra + cwalks, if pass { "PASS" } else { "FAIL" }
         );
     }
 }
@@ -7779,4 +7779,74 @@ fn micring3_two(bytes: &[u8], key: &str, wait: &dyn Fn(u64, &dyn Fn() -> bool) -
         out.readers, out.a, out.b, produced, out.split, n_closed, idle4 as u8, ea as u8, eb as u8
     );
     out
+}
+
+// SHADOWDAMAGE (rmbp-ledger B865, BP-video-25) — TAIL-APPENDED: `a11yshadow_leg`'s two more bumpers, on its existing
+// `change(m0, i0)` line. Each bump is made through its own production door and the shadow pass's re-lay is counted: a
+// covered epoch re-lays STALE-only, so `desktop::relay_walks` does not move. CONTRAST: `theme::set_contrast` (the door
+// Settings' toggle and `contrast_follow` take), on and back. LENS (x86 `wc`): `zoom::set(2, ..)` + `zoom::service` (the
+// Settings pass's engage), then the asked factor restored; `-` when the lens was already on or refused to engage.
+// Returns `(contrast_pass, lens_pass, relay_walks)`; go-red: `theme.rs` `set_contrast`'s `contrast_bumped()` back to a
+// bare `EPOCH.fetch_add` -> contrast_pass=0 relay_walks>=1.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn shadowcover_legs() -> (u8, &'static str, u32) {
+    use crate::video::wm::{self, desktop};
+    let pause = || {
+        let t = crate::arch::ms() + 5;
+        while crate::arch::ms() < t {
+            crate::arch::sched::yield_now();
+        }
+    };
+    // The counters, taken BEFORE a bump, so a re-lay another pass takes in the gap is still seen.
+    let snap = || (wm::a11yshadow::relays(), desktop::relay_walks());
+    // Up to 8 composites until the shadow pass has re-laid since `s`: (re-laid, walks since `s`).
+    let settle = |s: (u32, u32)| -> (bool, u32) {
+        let mut relaid = wm::a11yshadow::relays() != s.0;
+        let mut k = 0;
+        while !relaid && k < 8 {
+            wm::composite();
+            relaid = wm::a11yshadow::relays() != s.0;
+            k += 1;
+            if !relaid {
+                pause();
+            }
+        }
+        (relaid, desktop::relay_walks().wrapping_sub(s.1))
+    };
+    let c0 = crate::video::theme::contrast();
+    let s0 = snap();
+    let _ = crate::video::theme::set_contrast(!c0);
+    let (on_relaid, on_walks) = settle(s0);
+    let s1 = snap();
+    let _ = crate::video::theme::set_contrast(c0);
+    let (off_relaid, off_walks) = settle(s1);
+    let cwalks = on_walks + off_walks;
+    let cpass = (on_relaid && off_relaid && cwalks == 0) as u8;
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let (lpass, lwalks): (&'static str, u32) = {
+        use crate::video::zoom;
+        let (z0, f0) = zoom::want();
+        if z0 >= 2 {
+            ("-", 0)
+        } else {
+            let s = snap();
+            zoom::set(2, f0);
+            zoom::service();
+            if zoom::want().0 != 2 {
+                ("-", 0) // refused: engage named it on the wire and put the ask back to 0
+            } else {
+                let (relaid, w) = settle(s);
+                zoom::set(z0, f0);
+                zoom::service();
+                (if relaid && w == 0 { "1" } else { "0" }, w)
+            }
+        }
+    };
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    let (lpass, lwalks): (&'static str, u32) = ("-", 0);
+    serial_println!(
+        "[a11y] shadowcover contrast_relaid={}/{} lens={} walks=contrast:{},lens:{}",
+        on_relaid as u8, off_relaid as u8, lpass, cwalks, lwalks
+    );
+    (cpass, lpass, cwalks + lwalks)
 }

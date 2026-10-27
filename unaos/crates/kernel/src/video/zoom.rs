@@ -568,7 +568,7 @@ fn engage_at(z: u8) -> Result<u64, &'static str> {
     }
     LIVE.store(z, Release);
     let us = super::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
-    drop(g); super::theme::bump_epoch(); // crawl A 7: every strip re-seals into the RAM frame
+    drop(g); super::wm::desktop::shadows_covered(super::theme::epoch().wrapping_add(1)); super::theme::bump_epoch(); // crawl A 7: every strip re-seals into the RAM frame. LENSCOVER (SHADOWDAMAGE rmbp-ledger B865): the epoch this bump makes is covered by the damage-all + full present below, so the shadow re-lay only sets STALE (`desktop::shadows_relay`); the one cover fold, ZOOMFLUSH2 (B868) holds the note path. LINE-NEUTRAL fold, code first.
     let _ = super::wm::damage_intersecting(0, 0, w, h);
     super::screen::request_full_present();
     ENGAGE_US.store(us, Relaxed);

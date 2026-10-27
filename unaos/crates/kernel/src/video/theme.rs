@@ -988,7 +988,7 @@ pub fn contrast() -> bool {
 pub fn set_contrast(on: bool) -> bool {
     let moved = CONTRAST_ON.swap(on, AOrd::AcqRel) != on;
     if moved {
-        EPOCH.fetch_add(1, AOrd::AcqRel);
+        contrast_bumped(); // CONTRASTDAMAGE (rmbp-ledger B865): the bump with its own cover and repaint — the covered epoch stored first, then damage-all and the full present (fn at this file's tail; both doors, the toggle and `contrast_follow`, come through here). LINE-NEUTRAL: edited in place.
     }
     moved
 }
@@ -1125,4 +1125,30 @@ pub fn metrics() -> TextMetrics {
 pub fn text_restyled(line: usize, cap_css: u32) -> bool {
     TEXT_CAP.store(cap_css, AOrd::Relaxed);
     TEXT_LINE.swap(line as u32, AOrd::AcqRel) != line as u32
+}
+
+// ── CONTRASTDAMAGE (rmbp-ledger B865, SHADOWDAMAGE; BP-video-25) — TAIL-APPENDED so no line above moves ───────────
+// CONTRAST's bump carried no damage of its own and leaned on the shadow re-lay's damage-all (`desktop::shadows_relay`
+// walking). Now its one bumper ([`set_contrast`], which `contrast_follow` also reaches) does what the filter's change
+// does: the epoch the bump makes is stored as covered BEFORE the bump (Release; a pass whose Acquire read sees the bump
+// sees the cover), every window is damaged and the desktop layer asked for its full present, so the re-lay of that epoch
+// only sets STALE. Reads `EPOCH` directly (never [`epoch`], whose `contrast_follow` is a caller of this).
+// LOCKS: `wm::damage_intersecting` takes wm's TABLE. TABLE is private to wm.rs and taken only through its IRQ-masked
+// `table()`, whose rule bars a TABLE section from calling out; wm.rs reads `theme::epoch()` in one place,
+// `a11yshadow::track`, with no TABLE held. So no epoch reader that reaches this through `contrast_follow` re-enters TABLE.
+
+/// [`set_contrast`]'s bump: cover, bump, damage-all, full present (desktop images); the bump alone on the console-only image.
+#[inline]
+fn contrast_bumped() {
+    #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+    {
+        crate::video::wm::desktop::shadows_covered(EPOCH.load(AOrd::Acquire).wrapping_add(1));
+        EPOCH.fetch_add(1, AOrd::AcqRel);
+        let _ = crate::video::wm::damage_intersecting(0, 0, 1 << 16, 1 << 16);
+        crate::video::screen::request_full_present();
+    }
+    #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+    {
+        EPOCH.fetch_add(1, AOrd::AcqRel);
+    }
 }

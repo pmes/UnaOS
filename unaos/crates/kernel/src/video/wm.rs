@@ -2633,7 +2633,7 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // `drain_deferred` and FLICKER-3 removed from `Screen::flush`, and re-paying it on the drag
         // path would be the largest instance of it in the system. The sprite is handled where the
         // paint now happens: the drain's masked handback, and `composite`'s own tail. See [`erase`].
-        composite();
+        if !move_batched() { composite(); } // RESTACKPASS (SHADOWDAMAGE rmbp-ledger B865, seat-granted): a `move_set` batch withholds THIS task's per-move composite and runs one after its last move; every other mover composites as before (fns at this file's tail). LINE-NEUTRAL: edited in place, code first.
     }
     placed
 }
@@ -32234,5 +32234,79 @@ pub fn svc_redrive() {
     use core::sync::atomic::Ordering::{Acquire, Relaxed};
     if COMP_PENDING.load(Acquire) && !COMP_GATE.load(Relaxed) {
         let _ = present_drain();
+    }
+}
+
+// SHADOWDAMAGE (rmbp-ledger B865, BP-video-17; the seat granted wm.rs) — TAIL-APPENDED so no line above moves.
+// TOASTMETER: `overlay_boxes`, the desktop present's meter reading the ONE overlay predicate (`overlay_row`).
+// RESTACKPASS: `move_set`, notify's stack re-seat as ONE composite: each row goes through `move_to_inner` exactly as
+// `move_to` does (the clamp, the erase-minus-new, the re-damage, the present rects, the barrier), and only the tail
+// composite is withheld for the batching task (`move_batched`, the one fold at `move_to_inner`'s end).
+
+/// TOASTMETER (B865): the live overlay rows' boxes (`outer_box` of every row [`overlay_row`] admits) into `out`, by
+/// count, under one table hold (sequential with the present's `occluders`, never nested). Witness meter only.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+pub fn overlay_boxes(out: &mut [(usize, usize, usize, usize)]) -> usize {
+    let t = table();
+    let mut n = 0usize;
+    for r in t.rows.iter() {
+        if n == out.len() {
+            break;
+        }
+        if r.used && overlay_row(r) {
+            out[n] = outer_box(r);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// RESTACKPASS (B865): the task running a [`move_set`] batch (`u64::MAX` = none).
+static BATCH_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Is the calling task inside a [`move_set`] batch? `move_to_inner` then leaves its composite to the batch's one.
+/// One relaxed-cost load when no batch runs.
+#[inline]
+fn move_batched() -> bool {
+    let b = BATCH_TID.load(core::sync::atomic::Ordering::Acquire);
+    b != u64::MAX && crate::arch::sched::current_id() == Some(b)
+}
+
+/// Clears [`BATCH_TID`] on EVERY exit of the batch (the seat's hold: a store at the end alone would, on an early exit,
+/// leave every later move on that task without its composite).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+struct MoveBatch;
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+impl Drop for MoveBatch {
+    fn drop(&mut self) {
+        BATCH_TID.store(u64::MAX, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// RESTACKPASS (B865): move every `(id, x, y)` through [`move_to_inner`] (any owner, as [`move_to`]) with no composite
+/// between them, then ONE composite when any row moved (a no-op move never composited): the rows move together. Outside a scheduled task (no task id to scope the batch)
+/// each move composites as `move_to` does. Not nested (an inner batch's guard would end the outer one early: the outer
+/// moves then composite each, never lose one).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn move_set(moves: &[(WinId, usize, usize)]) {
+    if moves.is_empty() {
+        return;
+    }
+    let Some(me) = crate::arch::sched::current_id() else {
+        for &(id, x, y) in moves {
+            let _ = move_to_inner(id, None, x, y);
+        }
+        return;
+    };
+    let mut moved = false;
+    {
+        BATCH_TID.store(me, core::sync::atomic::Ordering::Release);
+        let _batch = MoveBatch;
+        for &(id, x, y) in moves {
+            moved |= matches!(move_to_inner(id, None, x, y), Moved::Placed { changed: true, .. });
+        }
+    }
+    if moved {
+        composite();
     }
 }
