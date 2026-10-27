@@ -158,17 +158,17 @@ fn mode_table() -> [(Mode, u8); 128] {
     t
 }
 
-struct Bits<'a> {
-    data: &'a [u8],
-    pos: usize,
+pub(super) struct Bits<'a> {
+    pub(super) data: &'a [u8],
+    pub(super) pos: usize,
 }
 
 impl Bits<'_> {
-    fn left(&self) -> usize {
+    pub(super) fn left(&self) -> usize {
         (self.data.len() * 8).saturating_sub(self.pos)
     }
     /// The next `n` (<= 24) bits, zeros past the end.
-    fn peek(&self, n: u32) -> u32 {
+    pub(super) fn peek(&self, n: u32) -> u32 {
         let mut v = 0u32;
         for k in 0..n as usize {
             let p = self.pos + k;
@@ -177,10 +177,10 @@ impl Bits<'_> {
         }
         v
     }
-    fn skip(&mut self, n: usize) {
+    pub(super) fn skip(&mut self, n: usize) {
         self.pos += n;
     }
-    fn align(&mut self) {
+    pub(super) fn align(&mut self) {
         self.pos = self.pos.div_ceil(8) * 8;
     }
 }
