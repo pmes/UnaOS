@@ -13,6 +13,8 @@
 # f29-boot1.log, never invented.
 #
 # The leg's typist types `una` / `correct-horse` twice into the form (the store's first user, the administrator: R100).
+# KEYBOOT3 (rmbp-ledger B856): no `[keyboot] unlock form up` / `unlock kdf_ms= ->` REQUIRE here — this volume is FRESH, so its
+# hold reads `[keyboot] root=none hold=none` and never opens the unlock form; a keyed QEMU boot is owed (KEYBOOTSPEC, security.md §5).
 
 # The Installer stage on the fresh volume, and the form the typist types into.
 REQUIRE :: FIRSTBOOT: stage=installer root=locked users=0 desktop_ignited=false why=store-loaded -> coherent ::

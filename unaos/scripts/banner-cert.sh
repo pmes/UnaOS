@@ -279,6 +279,9 @@ fi
 # error in `svg_core`, linked only by `pixel_core/svg` and called only through facet's decode (facet needs wc on
 # x86, desktop_firmware on aarch64). prefs_reset has no gated literal (`cfg!` picks a 4-byte word) and is
 # NOWITNESS, the `wedge2` shape. The OFF polarity is read from the cfg, not measured on a knob-off ELF.
+# keyboot_defer (KEYBOOT3, rmbp-ledger B856) is the same shape: `cfg!` picks `KB_FIRSTUSER`'s bool in fs/users.rs, no
+# gated literal, NOWITNESS; its serial line `[keyboot] first-user keying=deferred` is the certificate, read at a first
+# user's create on a build that armed UNAOS_KEYBOOT_DEFER=1.
 #
 # `a2dp` (A2DPENV, rmbp-ledger B752): token `usage: bt audio <aa:bb:cc:dd:ee:ff`, the refusal of the `bt audio` verb
 # arm (drivers/ehci/bthid.rs `verb`, the arm `#[cfg(feature = "a2dp")] "audio"`); it occurs exactly once in crates/ +
@@ -403,6 +406,7 @@ ahci-write|:: AHCI: write path ARMED|-|measured(1)
 holocron|[hcron] /system/|-|measured(1)
 svg|more than one root element|facet,wc+desktop_firmware|measured(1)
 prefs_reset|-|no gated string literal: cfg!(feature = "prefs_reset") in video/settings.rs safe_mode_check only selects the 4-byte word knob; certify it from its serial line [prefs] display reset=1 reason=knob|unmeasured-here
+keyboot_defer|-|no gated string literal: cfg!(feature = "keyboot_defer") in fs/users.rs KB_FIRSTUSER only selects a bool; certify it from its serial line [keyboot] first-user keying=deferred (KEYBOOT3 B856)|unmeasured-here
 TABLE
 }
 

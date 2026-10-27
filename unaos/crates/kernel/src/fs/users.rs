@@ -3903,7 +3903,7 @@ pub fn keyboot_hold() -> bool {
                 KB_HOLD_T0.store(crate::arch::ms(), Release);
                 KB_HOLD.store(KB_HELD, Release);
                 serial_println!("[keyboot] hold OPEN root=keyed (the unlock form is up; nothing binds the root until its password or its recovery words open it)");
-                crate::video::crystal::login::open_unlock();
+                crate::video::crystal::login::open_unlock(); keyboot_form_up(); // KEYBOOT3 (B856): the wire before the KDF (tail). LINE-NEUTRAL
                 true
             }
             found => {
@@ -3922,8 +3922,8 @@ pub fn keyboot_hold() -> bool {
 fn keyboot_key_root(name: &[u8], password: &[u8]) {
     #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
-        if !KB_FIRSTUSER { // KEYBOOT2 (B810): the image may defer the first-user keying (UNAOS_KEYBOOT_FIRSTUSER=0; the const at the file tail)
-            return serial_println!("[keyboot] first-user keying=deferred user={} (UNAOS_KEYBOOT_FIRSTUSER=0: the root stays unkeyed; keying from Settings > Security is owed)", wire_name(name));
+        if !KB_FIRSTUSER { // KEYBOOT2 (B810): the image may defer the first-user keying (KEYBOOT3 B856: UNAOS_KEYBOOT_DEFER=1 -> feature keyboot_defer; the const at the file tail)
+            return serial_println!("[keyboot] first-user keying=deferred user={} (UNAOS_KEYBOOT_DEFER=1: the root stays unkeyed; keying from Settings > Security is owed)", wire_name(name));
         }
         let why = |r: &str| serial_println!("[keyboot] root not keyed user={} reason={} (the volume is unchanged)", wire_name(name), r);
         if role_of(name) != Some(Role::Admin) {
@@ -4044,8 +4044,18 @@ pub fn session_gen_reads() -> u32 {
 }
 
 // KEYBOOT2 (rmbp-ledger B810) — TAIL-APPENDED. Until the keyed root's unlock is flown on metal (FLIGHT 37 §6: Enter hung
-// the machine on the first boot of a keyed root), an image can keep the root unkeyed at the first-user form:
-// `UNAOS_KEYBOOT_FIRSTUSER=0` in the build environment defers `keyboot_key_root` (`[keyboot] first-user keying=deferred`).
-// Unset or any other value keys as KEYBOOT built it. The seat decides the image line.
+// the machine on the first boot of a keyed root), an image can keep the root unkeyed at the first-user form. KEYBOOT3
+// (B856): the knob is the positive `UNAOS_KEYBOOT_DEFER=1` -> cargo feature `keyboot_defer` (knob-parity parses only `=1`),
+// which defers `keyboot_key_root` (`[keyboot] first-user keying=deferred`). Unset keys as KEYBOOT built it.
 #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
-const KB_FIRSTUSER: bool = match option_env!("UNAOS_KEYBOOT_FIRSTUSER") { Some(v) => !(v.len() == 1 && v.as_bytes()[0] == b'0'), None => true };
+const KB_FIRSTUSER: bool = !cfg!(feature = "keyboot_defer");
+
+// KEYBOOT3 (rmbp-ledger B856) — TAIL-APPENDED. The wire BEFORE the KDF: the hold has put the unlock form up and the KDF
+// waits for Enter, on the core `login::kb_on` names (FLIGHT 37 §6 row a: the seat could not see the boot holding).
+#[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc", feature = "unafs"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn keyboot_form_up() {
+    serial_println!(
+        "[keyboot] unlock form up kdf_pending=1 on={} (KEYBOOT3: the boot holds here until the root's password or words; the KDF runs after Enter)",
+        crate::video::crystal::login::kb_on()
+    );
+}

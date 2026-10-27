@@ -5562,7 +5562,7 @@ fn render_pass<W: RenderWait>(w: &mut W) {
         }
         cursor_was_visible = cursor_vis;
         // Recompose the strip only when it was overdrawn (Key/Button) — unconditional, cached loads.
-        console_launch_drain("render_service"); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::wm::scroll_service(); if strip_dirty { // PIRENDERSCROLL (LEDGER SR181, BP-video-38): the thumb drag and the bar's hide run HERE, the Pi render pass's drain tail after `console_launch_drain` -- the Pi's ONE caller of `wm::scroll_service` (it ran only from `quarry::service` on a strip press before). Folded, line-neutral, code before the comment; knob-off the cfg erases it (PARITY.md 5.3).
+        console_launch_drain("render_service"); #[cfg(feature = "desktop_firmware")] unaos_kernel::video::wm::scroll_service(); #[cfg(all(feature = "login", feature = "desktop_firmware"))] unaos_kernel::video::crystal::login::kb_arm_drain(); if strip_dirty { // KEYBOOT3 (rmbp-ledger B856, seat grant): `kb_arm_drain` applies the Pi unlock worker's outcome each wake (one load while idle; knob-off erased; LINE-NEUTRAL, code before the comment). PIRENDERSCROLL (LEDGER SR181, BP-video-38): the thumb drag and the bar's hide run HERE, the Pi render pass's drain tail after `console_launch_drain` -- the Pi's ONE caller of `wm::scroll_service` (it ran only from `quarry::service` on a strip press before). Folded, line-neutral, code before the comment; knob-off the cfg erases it (PARITY.md 5.3).
             unaos_kernel::ui_status::draw(&mut pal);
             dirty = true;
         } else if strip_tick {

@@ -2357,7 +2357,7 @@ fn dispatch_old(job: Job, n: &[u8], p: &[u8], o: &[u8]) {
     w.pw[..w.plen].copy_from_slice(&p[..w.plen]);
     w.old[..w.olen].copy_from_slice(&o[..w.olen]);
     let windowed = FORM.lock().windowed || kb_off_render(job); // KEYBOOT2 (B810): the unlock's KDF takes the worker windowed or headless, never the render/input task (LINE-NEUTRAL fold, code first; body at the tail)
-    if windowed && worker_core().is_some() && !BUSY.swap(true, Ordering::AcqRel) {
+    if windowed && kb_worker(job).is_some() && !BUSY.swap(true, Ordering::AcqRel) { // KEYBOOT3 (B856): `kb_worker` — x86 `worker_core()` for every job (unchanged); the Pi's unlock on a worker core (tail). LINE-NEUTRAL
         let _ = DONE.lock().take(); // a late outcome of a released submit is never applied to this one
         *WORK.lock() = Some(w);
         // SAFETY: a plain store into our own local; volatile so the scrub of the password copy is not elided.
@@ -2369,7 +2369,7 @@ fn dispatch_old(job: Job, n: &[u8], p: &[u8], o: &[u8]) {
         if let Some(cpu) = worker_core() {
             crate::arch::sched::spawn_stack("login-submit", submit_worker, 0, cpu, crate::arch::sched::PRIO_NORMAL, crate::arch::sched::RENDER_PATH_STACK_SIZE); // STACKGUARD3 (B832): the bind path's measured 32 KiB (RENDSTACK's rule; the render task ran it before KEYBOOT2 moved it here), never 16 KiB under a masked CARD/MOUNT hold
         }
-        return;
+        kb_spawn_arm(job); return; // KEYBOOT3 (B856): the Pi's `login-submit` spawn (tail; a no-op on x86, which spawned above). LINE-NEUTRAL
     }
     let (out, kdf_ms, adduser_ms) = compute(&w);
     w.pw = [0; FIELD_MAX];
@@ -2392,7 +2392,7 @@ fn worker_core() -> Option<usize> {
 }
 
 /// `login-submit`: compute one submit and post its outcome. Exits when done (the task is freed).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "baremetal")))] // KEYBOOT3 (B856): widened in place — the Pi's unlock runs it too
 fn submit_worker(_: usize) {
     let Some(mut w) = WORK.lock().take() else {
         BUSY.store(false, Ordering::Release);
@@ -3392,7 +3392,7 @@ fn kb_compute(w: &Work, words: bool) -> (Outcome, u64, u64) {
         let _ = (w, words);
         (false, "unbuilt")
     };
-    (Outcome::VolUnlock { ok, why }, crate::arch::ms().saturating_sub(t), 0)
+    let kdf_ms = crate::arch::ms().saturating_sub(t); kb_kdf_said(ok, why, kdf_ms); (Outcome::VolUnlock { ok, why }, kdf_ms, 0) // KEYBOOT3 (B856): the KDF's own line, on the task that ran it, BEFORE the bind (tail). LINE-NEUTRAL
 }
 
 /// KEYBOOT: the render task's half. Unwrapped: KEYBOOT2's bind runs HERE, on the render task (`unafs::keyboot_bind`,
@@ -3585,7 +3585,7 @@ fn kb_off_render(job: Job) -> bool {
 
 /// KEYBOOT2: where an unlock's slow half runs — `worker` (a worker core exists) or `inline`.
 pub fn kb_on() -> &'static str {
-    if worker_core().is_some() { "worker" } else { "inline" }
+    match kb_worker(Job::VolUnlock { words: false }) { Some(0) if cfg!(target_arch = "aarch64") => "boot-core", Some(_) => "worker", None => "inline" } // KEYBOOT3 (B856): the core `kb_worker` picks; `boot-core` = the Pi's core 0 (1-2 APs)
 }
 
 /// KEYBOOT2: the unlock form's submit (and the fixture's): said on the wire, then INPUTSTALL's dispatch.
@@ -3748,4 +3748,65 @@ pub fn textscale_rows() -> (usize, bool) {
     let stacked = |v: &[(usize, usize)]| v.windows(2).all(|p| p[0].0 + p[0].1 <= p[1].0);
     let boxes = FIELD_H() >= lh + 8 && BTN_H() >= lh && PWR_H() >= lh;
     (h, stacked(&form) && stacked(&words) && boxes)
+}
+
+// ── KEYBOOT3 (rmbp-ledger B856) — TAIL-APPENDED: the KDF's own line, and the Pi's unlock on a worker core ──────────────
+// FLIGHT 37 §6: the only line after the KDF was `kb_wire`, said by `kb_apply` on the render task AFTER the bind, so a
+// wedged bind hid whether the KDF had returned. `kb_kdf_said` speaks on the task that ran `keyboot_unwrap`, right after
+// it returns. On the Pi `worker_core()` is `None`, so the unlock's Argon2id ran inline on the render task; `kb_worker`
+// gives the unlock (only) a core through INPUTSTALL M5's own carriage (`dispatch_old`, `submit_worker`, `submit_drain`),
+// and the Pi render pass drains its outcome each wake (`kb_arm_drain`, main.rs `render_pass`).
+
+/// KEYBOOT3: the core a submit's slow half runs on. x86: `worker_core()` for every job (unchanged). The Pi
+/// (`baremetal`), the unlock only: with 3+ APs the AP that is neither render (`online.first()`) nor input
+/// (`online.last()`) — `o[1]`; with 1-2 APs core 0 (the BSP, which `run_bsp(0)` schedules); none: inline.
+fn kb_worker(job: Job) -> Option<usize> {
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    {
+        if !kb_off_render(job) {
+            return None;
+        }
+        let o = crate::arch::smp::online_secondaries();
+        match o.len() {
+            0 => None,
+            1 | 2 => Some(0),
+            _ => Some(o[1]),
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+    {
+        let _ = job;
+        worker_core()
+    }
+}
+
+/// KEYBOOT3: the Pi's unlock bind path's stack (RENDSTACK's measured 32 KiB, as x86's `login-submit`).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+const KB_ARM_STACK: usize = 32 * 1024;
+
+/// KEYBOOT3: spawn the Pi's `login-submit` on `kb_worker`'s core (x86 spawned in `dispatch_old` itself).
+fn kb_spawn_arm(job: Job) {
+    #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+    if let Some(cpu) = kb_worker(job) {
+        crate::arch::sched::spawn_stack("login-submit", submit_worker, 0, cpu, KB_ARM_STACK);
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "baremetal")))]
+    let _ = job;
+}
+
+/// KEYBOOT3: `[keyboot] unlock kdf_ms=<n> -> ok|bad why=` — the KDF has returned (a wrong password reads `mac`).
+fn kb_kdf_said(ok: bool, why: &str, kdf_ms: u64) {
+    if ok {
+        serial_println!("[keyboot] unlock kdf_ms={} -> ok (KEYBOOT3: the key is unwrapped; the bind follows on the render task)", kdf_ms);
+    } else {
+        serial_println!("[keyboot] unlock kdf_ms={} -> bad why={} (KEYBOOT3: the KDF returned; nothing binds)", kdf_ms, if why == "refused" { "mac" } else { why });
+    }
+}
+
+/// KEYBOOT3: the Pi render pass's drain, every wake (main.rs `render_pass`): applies a worker's outcome without
+/// waiting for a key. One acquire load while no submit is in flight.
+pub fn kb_arm_drain() {
+    if submit_busy() {
+        submit_drain();
+    }
 }
