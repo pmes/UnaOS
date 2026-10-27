@@ -236,9 +236,9 @@ pub mod census {
     /// (the block the owner allocated; one static name, the row's sum and block count carry the windows).
     pub const WINDOW_SURFACE: u8 = 9;
     /// SLOTRECTAG (B1030): the WINDOWCAP3 slot record (`memory::slot_rec_ensure`), never freed: desktopbuild counts it once.
-    pub const SLOT_RECORD: u8 = 10;
+    pub const SLOT_RECORD: u8 = 10; pub const LOGIN_SURFACE: u8 = 11; // LOGINFURNITUREONCE (B1041): the login furniture's grow-once surface (login card, dialog, instgui), tagged at its allocation by `video::metrics::login_surf`; desktopbuild counts it once. LINE-NEUTRAL append, code first
     /// Tag -> its census name (0 = no tag).
-    pub const NAMES: [&str; 11] = ["-", "stage", "shadow", "wallpaper", "help", "wallpaper-retired", "appres-pix", "text-resident", "gen7-held", "window-surface", "slot-record"];
+    pub const NAMES: [&str; 12] = ["-", "stage", "shadow", "wallpaper", "help", "wallpaper-retired", "appres-pix", "text-resident", "gen7-held", "window-surface", "slot-record", "login-surface"];
     /// An untagged block this large is tracked under its task's name.
     pub const BIG: usize = 64 * 1024;
     /// Owner rows a [`Snapshot`] carries (the last one becomes `other` on overflow).

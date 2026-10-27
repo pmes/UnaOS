@@ -182,7 +182,7 @@ static PRIMARY: AtomicU32 = AtomicU32::new(0);
 static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn surf() -> &'static mut [u32] {
     let n = metrics::size(W) * metrics::size(H());
-    metrics::leaked_surf(&SURF_AT, n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
+    metrics::login_surf(&SURF_AT, n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 }
 
 /// Queue a dialog (QUEUE ONLY: `try_lock`, no heap, no `wm`). One pending behind the one on the glass; more are dropped, counted.
@@ -1323,7 +1323,7 @@ fn seat_open() {
 /// Fill the capacity surface from logical row `from` to `DLG_CAP` with the window's surface colour.
 fn band_clear(from: usize) {
     let cap = DLG_CAP.load(Ordering::Relaxed);
-    let px = metrics::leaked_surf(&SURF_AT, metrics::size(W) * metrics::size(cap));
+    let px = metrics::login_surf(&SURF_AT, metrics::size(W) * metrics::size(cap));
     metrics::fill(px, metrics::size(W), 0, from, W, cap.saturating_sub(from), theme::surface_window());
 }
 
