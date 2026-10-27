@@ -232,56 +232,16 @@ pub struct TestPattern {
     stand_in: bool,
 }
 
-pub const COUNTER_DIGITS: usize = 6;
-
-const BARS: [[u8; 3]; 7] = [
-    [191, 191, 191],
-    [191, 191, 0],
-    [0, 191, 191],
-    [0, 191, 0],
-    [191, 0, 191],
-    [191, 0, 0],
-    [0, 0, 191],
-];
-
-/// 5×7 digit glyphs, one row per byte, bit 4 = leftmost column.
-const GLYPHS: [[u8; 7]; 10] = [
-    [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
-    [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
-    [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
-    [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
-    [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
-    [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
-    [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
-    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
-    [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
-    [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
-];
-
-/// Where the counter field sits: (x0, y0, scale) — glyph cells are 6×8 scaled units (5×7 plus a
-/// one-unit gap).
-fn counter_geometry(w: u32, h: u32) -> (u32, u32, u32) {
-    let band_top = h * 2 / 3;
-    let band_h = h - band_top;
-    let scale = ((w * 9 / 10) / (COUNTER_DIGITS as u32 * 6)).min(band_h * 8 / 10 / 8).max(1);
-    let field_w = COUNTER_DIGITS as u32 * 6 * scale;
-    let x0 = (w.saturating_sub(field_w)) / 2;
-    let y0 = band_top + (band_h.saturating_sub(8 * scale)) / 2;
-    (x0, y0, scale)
-}
+/// SWAPBACKVPLAY (rmbp-ledger B956): the painter is demux_core's (`build::test_pattern_rgba`), the kernel's stand-in too.
+pub use super::demux::build::COUNTER_DIGITS;
 
 impl TestPattern {
     pub fn new(track: &Track) -> Self {
-        let frame_ns = if track.sample_count > 0 && track.duration_ns > 0 {
-            (track.duration_ns / track.sample_count) as i64
-        } else {
-            33_333_333
-        };
         TestPattern {
             width: track.width.max(64),
             height: track.height.max(48),
             timebase: track.timebase,
-            frame_ns: frame_ns.max(1),
+            frame_ns: super::demux::build::stand_in_frame_ns(track),
             stand_in: false,
         }
     }
@@ -292,65 +252,14 @@ impl TestPattern {
 
     /// Render frame `n` at `w×h` as packed RGBA.
     pub fn render(w: u32, h: u32, n: u32) -> Vec<u8> {
-        let (wu, hu) = (w as usize, h as usize);
-        let mut px = vec![0u8; wu * hu * 4];
-        let band_top = hu * 2 / 3;
-        for y in 0..hu {
-            for x in 0..wu {
-                let c = if y < band_top { BARS[x * 7 / wu] } else { [0, 0, 0] };
-                let o = (y * wu + x) * 4;
-                px[o..o + 3].copy_from_slice(&c);
-                px[o + 3] = 255;
-            }
-        }
-        let (x0, y0, s) = counter_geometry(w, h);
-        let digits = format!("{:0width$}", n % 10u32.pow(COUNTER_DIGITS as u32), width = COUNTER_DIGITS);
-        for (i, ch) in digits.bytes().enumerate() {
-            let g = &GLYPHS[(ch - b'0') as usize];
-            for (gy, row) in g.iter().enumerate() {
-                for gx in 0..5 {
-                    if row & (0x10 >> gx) == 0 {
-                        continue;
-                    }
-                    for dy in 0..s {
-                        for dx in 0..s {
-                            let x = (x0 + (i as u32 * 6 + gx) * s + dx) as usize;
-                            let y = (y0 + gy as u32 * s + dy) as usize;
-                            if x < wu && y < hu {
-                                let o = (y * wu + x) * 4;
-                                px[o..o + 3].copy_from_slice(&[255, 255, 255]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        px
+        super::demux::build::test_pattern_rgba(w, h, n)
     }
 
     /// Read the counter back out of a rendered frame (the play-check oracle). Samples the centre
     /// of every glyph cell unit and matches each digit's 5×7 bitmap exactly; `None` if any digit
     /// does not match a glyph.
     pub fn read_counter(rgba: &[u8], w: u32, h: u32) -> Option<u32> {
-        let (x0, y0, s) = counter_geometry(w, h);
-        let mut n = 0u32;
-        for i in 0..COUNTER_DIGITS as u32 {
-            let mut bits = [0u8; 7];
-            for (gy, b) in bits.iter_mut().enumerate() {
-                for gx in 0..5u32 {
-                    let x = x0 + (i * 6 + gx) * s + s / 2;
-                    let y = y0 + gy as u32 * s + s / 2;
-                    let o = ((y * w + x) * 4) as usize;
-                    let p = rgba.get(o..o + 3)?;
-                    if p.iter().all(|&c| c > 127) {
-                        *b |= 0x10 >> gx;
-                    }
-                }
-            }
-            let d = GLYPHS.iter().position(|g| *g == bits)? as u32;
-            n = n * 10 + d;
-        }
-        Some(n)
+        super::demux::build::test_pattern_counter(rgba, w, h)
     }
 }
 
@@ -363,7 +272,7 @@ impl VideoDecoder for TestPattern {
         let (n, w, h) = match TestPatternPacket::decode(&pkt.data) {
             Some(p) if !self.stand_in => (p.frame, p.width as u32, p.height as u32),
             None if !self.stand_in => return Err(DecodeError::Corrupt("not a UTP1 packet".into())),
-            _ => (((pts_ns + self.frame_ns / 2) / self.frame_ns).max(0) as u32, self.width, self.height),
+            _ => (super::demux::build::stand_in_counter(pts_ns, self.frame_ns), self.width, self.height),
         };
         let (w, h) = (w.max(64), h.max(48));
         Ok(Some(Frame { width: w, height: h, pts_ns, pixels: Pixels::Rgba(Self::render(w, h, n)) }))
@@ -464,6 +373,22 @@ mod tests {
         assert!(matches!(decoder_for(&d.tracks()[0]), Err(DecodeError::Unsupported(_))));
         let s = TestPattern::stand_in(&d.tracks()[0]);
         assert!(!s.is_real());
+    }
+
+    /// SWAPBACKVPLAY (rmbp-ledger B956): Stria's stand-in paints demux_core's ONE painter — an `mp4v` 64x48 reel's sample 1
+    /// hashes to the kernel's `tests nle` `STANDIN_KAT` (FNV-1a 64), pinned again by demux_core's `build::tests::stand_in_kat`.
+    #[test]
+    fn stand_in_paints_the_shared_kat() {
+        let mut t = build::test_pattern_track(1, 64, 48, 25, 4, 1);
+        t.spec.fourcc = *b"mp4v";
+        t.spec.config_box = None;
+        let d = Demuxer::open(build::mp4(&[t], &Mp4Options::default())).unwrap();
+        let tr = d.tracks()[0].clone();
+        let mut s = TestPattern::stand_in(&tr);
+        let pk = d.packet_at(d.track_samples(0).nth(1).unwrap());
+        let f = s.decode(&pk).unwrap().unwrap();
+        let fnv = f.to_rgba().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3));
+        assert_eq!(fnv, 0xdb29_ef26_80d9_5484);
     }
 
     /// VP8CORE (SR40): the WPT VP8 WebM through the registry. Every frame's I420 was byte-identical

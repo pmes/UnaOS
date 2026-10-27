@@ -155,6 +155,32 @@ enum Pic {
     Av1(Box<av1_core::image::StreamDecoder>, Option<Colour>),
     /// NLE6 (SR207): demux_core's `utp1` test stream — its packet carries its ordinal (`build::TestPatternPacket`).
     Utp1,
+    /// SWAPBACKVPLAY (rmbp-ledger B956): the labelled stand-in (see [`StandIn`]).
+    StandIn(Box<StandIn>),
+}
+
+/// SWAPBACKVPLAY (rmbp-ledger B956; handlers.md §5 SWAPBACK-VPLAY): the kernel Player's ONE swap state, the rule of Stria's
+/// `handlers/stria/src/decode_swap.rs` `DecodeSwap::decode` over the no_std cores. The stand-in paints demux_core's ONE painter
+/// (`build::test_pattern_rgba`, the pixels gneiss_pal's `TestPattern::stand_in` paints: bars + `round(pts / frame)`), at the
+/// track's size (at least 64x48). `parked` is the real decoder a core's `Unsupported` refused MID-STREAM, reset: each later
+/// keyframe is offered to it once ([`Pic::decode_swap`]); an open-time stand-in (no decoder fits: [`Pic::open`]) parks nothing and
+/// is never probed. No core frame buffer to drain (the kernel's decoders show each picture as it decodes). Every run open builds
+/// a fresh [`Pic::open`] from the container's track, so no parked decoder crosses a seek (SR353's reseed, the kernel's shape).
+/// Owned by the job task (`job_task`'s local, `EdlRun.pic`): no lock. Wire: `[vplay] swap: stand-in <why> at <ns>`,
+/// `[vplay] swap: back at <ns>` (source ns).
+struct StandIn {
+    w: u32,
+    h: u32,
+    tb: demux_core::Timebase,
+    frame_ns: i64,
+    parked: Option<Pic>,
+}
+
+/// SWAPBACKVPLAY (B956): which way a decode swapped (stria::decode_swap's `Swap`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Swap {
+    ToStandIn,
+    Back,
 }
 
 impl Pic {
@@ -167,8 +193,85 @@ impl Pic {
         }
     }
 
-    /// One packet → the picture it shows (`None`: an alt-ref / dropped frame that shows nothing).
+    /// SWAPBACKVPLAY (B956): the decoder for `t`, else the open-time stand-in (Stria's Player: no decoder fits, the labelled
+    /// stand-in plays) with its `[vplay] swap: stand-in <why> at <at_ns>` line.
+    fn open(t: &demux_core::Track, at_ns: i64) -> Pic {
+        match Pic::new(t) {
+            Ok(p) => p,
+            Err(why) => {
+                serial_println!("[vplay] swap: stand-in {} at {}", why, at_ns);
+                Pic::stand_in(t, None)
+            }
+        }
+    }
+
+    /// SWAPBACKVPLAY (B956): the stand-in for `t` (gneiss_pal `TestPattern::new`'s size and frame through demux_core's rule).
+    fn stand_in(t: &demux_core::Track, parked: Option<Pic>) -> Pic {
+        Pic::StandIn(Box::new(StandIn { w: t.width.max(64), h: t.height.max(48), tb: t.timebase, frame_ns: demux_core::build::stand_in_frame_ns(t), parked }))
+    }
+
+    /// SWAPBACKVPLAY (B956): true while the stand-in draws.
+    fn on_stand_in(&self) -> bool {
+        matches!(self, Pic::StandIn(_))
+    }
+
+    /// SWAPBACKVPLAY (B956): forget the pictures, keep the parameter sets (the parked decoder's reset).
+    fn reset(&mut self) {
+        match self {
+            Pic::Vp8(d, _) => d.reset(),
+            Pic::Av1(d, _) => d.reset(),
+            Pic::Utp1 | Pic::StandIn(_) => {}
+        }
+    }
+
+    /// SWAPBACKVPLAY (B956): decode `data` (a packet of `t` at `pts`, `key` the demuxer's keyframe flag) swapping to the stand-in
+    /// or back by [`StandIn`]'s rule — `DecodeSwap::decode`'s: a parked decoder is offered a keyframe once (a decode = it plays
+    /// again, `Swap::Back`; a refusal = reset and parked again); a REAL decoder's core `Unsupported` parks it (reset), the
+    /// stand-in paints the refused packet (`Swap::ToStandIn`); any other error is the caller's.
+    fn decode_swap(&mut self, t: &demux_core::Track, data: &[u8], pts: i64, key: bool) -> Result<(Option<(usize, usize, Vec<u32>)>, Option<Swap>), String> {
+        let parked = match self {
+            Pic::StandIn(s) if key => s.parked.take(),
+            _ => None,
+        };
+        if let Some(mut real) = parked {
+            match real.decode_raw(data, pts) {
+                Ok(f) => {
+                    *self = real;
+                    serial_println!("[vplay] swap: back at {}", t.to_ns(pts));
+                    return Ok((f, Some(Swap::Back)));
+                }
+                Err(_) => {
+                    real.reset();
+                    if let Pic::StandIn(s) = self {
+                        s.parked = Some(real);
+                    }
+                }
+            }
+        }
+        match self.decode_raw(data, pts) {
+            Ok(f) => Ok((f, None)),
+            Err((true, why)) if !self.on_stand_in() => {
+                let mut real = core::mem::replace(self, Pic::stand_in(t, None));
+                real.reset();
+                if let Pic::StandIn(s) = self {
+                    s.parked = Some(real);
+                }
+                serial_println!("[vplay] swap: stand-in {} at {}", why, t.to_ns(pts));
+                Ok((self.decode_raw(data, pts).ok().flatten(), Some(Swap::ToStandIn)))
+            }
+            Err((_, why)) => Err(why),
+        }
+    }
+
+    /// One packet → the picture it shows (`None`: an alt-ref / dropped frame that shows nothing); the String error of
+    /// [`Pic::decode_raw`] (the poster's door).
     fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
+        self.decode_raw(data, 0).map_err(|e| e.1)
+    }
+
+    /// SWAPBACKVPLAY (B956): the decode arms; `Err((unsupported, why))`, `unsupported` = the core's own `Unsupported` (the
+    /// swap's one trigger: av1_core's; vp8_core and utp1 have none). `pts` (track ticks) clocks the stand-in's counter.
+    fn decode_raw(&mut self, data: &[u8], pts: i64) -> Result<Option<(usize, usize, Vec<u32>)>, (bool, String)> {
         match self {
             Pic::Vp8(d, c) => {
                 if data.is_empty() {
@@ -177,24 +280,28 @@ impl Pic {
                 let pic = match d.decode(data) {
                     Ok(Some(p)) => p,
                     Ok(None) => return Ok(None),
-                    Err(e) => return Err(alloc::format!("vp8: {:?}", e)),
+                    Err(e) => return Err((false, alloc::format!("vp8: {:?}", e))),
                 };
                 let y = vp8_core::Yuv420::from_picture(&pic);
                 let rgba = colour_rgba_vp8(&y, *c);
                 Ok(Some((y.width as usize, y.height as usize, pack(&rgba))))
             }
             Pic::Av1(d, c) => {
-                let planes = d.decode_temporal_unit(data).map_err(|e| alloc::format!("av1: {:?}", e))?;
+                let planes = d.decode_temporal_unit(data).map_err(|e| (matches!(e, av1_core::Error::Unsupported(_)), alloc::format!("av1: {:?}", e)))?;
                 let rgba = colour_rgba_av1(&planes, *c);
                 Ok(Some((planes.width as usize, planes.height as usize, pack(&rgba))))
             }
             Pic::Utp1 => {
                 // the stream's own decoder: the packet names its frame; the picture is a flat field whose level steps
                 // with the ordinal (the host's pattern renderer is gneiss_pal's; NLE6-UTP1 owes its move to a core)
-                let t = demux_core::build::TestPatternPacket::decode(data).ok_or_else(|| String::from("utp1: not a UTP1 packet"))?;
+                let t = demux_core::build::TestPatternPacket::decode(data).ok_or_else(|| (false, String::from("utp1: not a UTP1 packet")))?;
                 let (w, h) = ((t.width as usize).max(1), (t.height as usize).max(1));
                 let l = 28 + t.frame % 200;
                 Ok(Some((w, h, alloc::vec![(l << 16) | (l << 8) | l; w * h])))
+            }
+            Pic::StandIn(s) => {
+                let n = demux_core::build::stand_in_counter(s.tb.to_ns(pts), s.frame_ns);
+                Ok(Some((s.w as usize, s.h as usize, pack(&demux_core::build::test_pattern_rgba(s.w, s.h, n)))))
             }
         }
     }
@@ -504,13 +611,7 @@ fn job_task(arg: usize) {
         let key = d.seek((seek_ms as i64).saturating_mul(1_000_000)).map(|k| k.saturating_sub(vt.to_ns(vpts0.unwrap_or(0))).max(0) as u64 / 1_000_000);
         serial_println!("[vplay] seek jid={} to_ms={} key_ms={} table=container", jid, seek_ms, key.map(|k| k as i64).unwrap_or(-1));
     }
-    let mut pic = match Pic::new(&vt) {
-        Ok(p) => p,
-        Err(e) => {
-            fail(e);
-            return job_exit(jid, paint, "codec-refused", 0, 0);
-        }
-    };
+    let mut pic = Pic::open(&vt, (seek_ms as i64).saturating_mul(1_000_000)); // SWAPBACKVPLAY (rmbp-ledger B956): no decoder fits = the labelled stand-in (Stria's Player), never codec-refused
     let t0 = now();
     let (mut decoded, mut errs) = (0u64, 0u64);
     let mut first_pts: Option<i64> = vpts0;
@@ -531,7 +632,7 @@ fn job_task(arg: usize) {
         if let Err(why) = room(jid) {
             return job_exit(jid, paint, why, decoded, errs);
         }
-        let out = pic.decode(data);
+        let out = pic.decode_swap(&vt, data, p.pts, p.keyframe).map(|r| r.0); // SWAPBACKVPLAY (rmbp-ledger B956): Stria's swap rule
         let fp = *first_pts.get_or_insert(p.pts);
         let pts_ms = (vt.to_ns(p.pts - fp).max(0) as u64) / 1_000_000;
         match out {
@@ -785,7 +886,8 @@ pub fn fact_lines(f: &Facts) -> [String; 2] {
 // is refused by name and the incoming shows. NLE6MIXAUDIO (rmbp-ledger B953): the audio runs play through the mixer,
 // a crossfade on a second source (the section at the file tail, `snd`). Wire: `[nle] reel …`, `[nle] open edl=<path> reels=<n> clips=<n> steps=<n>`, `[nle] job exit
 // frames=<n> seeks=<n> runup=<n> gaps=<n> mixed=<n> mix_seeks=<n> refused=<n> mix_us_max=<n>`, `[vplay] transition:
-// second decoder slot refused (<why>)`; the witness is player.rs `tests nle` (`:: NLE: … ::`).
+// second decoder slot refused (<why>)`; SWAPBACKVPLAY (rmbp-ledger B956): a reel no decoder fits plays the labelled stand-in
+// (`Pic::open`, `[vplay] swap: …`, `swaps=<n> standin=<n>` on the exit line); the witness is player.rs `tests nle` (`:: NLE: … ::`).
 
 /// The `NLE` report's plan cap (output ticks remembered for the witness) and the presented-counter cap.
 const SHOWN_CAP: usize = 4096;
@@ -864,6 +966,10 @@ pub struct EdlReport {
     pub mix_seeks: u64,
     pub mix_refused: u64,
     pub mix_us_max: u64,
+    /// SWAPBACKVPLAY (rmbp-ledger B956): runs that went to the stand-in (an open no decoder fits, or a mid-stream refusal) and
+    /// the stand-in pictures shown.
+    pub swaps: u64,
+    pub stand_in_frames: u64,
     pub mixes: Vec<(i64, u64)>, pub snd_runs: u64, pub xfades: u64, pub snd_refused: u64, pub snd_underruns: u64, pub snd_frames: u64, // NLE6MIXAUDIO (rmbp-ledger B953): the sound's runs, second sources opened and refused, underruns, frames played
 }
 
@@ -891,8 +997,8 @@ fn edl_task(arg: usize) {
     let mut rep = EdlReport::default();
     let r = edl_run(jid, &path, seek_ms, &mut rep); snd::close(&mut rep); // NLE6MIXAUDIO (rmbp-ledger B953): every source closed, on every path (file tail)
     serial_println!(
-        "[nle] job exit frames={} seeks={} runup={} gaps={} mixed={} mix_seeks={} refused={} mix_us_max={}",
-        rep.frames, rep.seeks, rep.runup, rep.gaps, rep.mixed, rep.mix_seeks, rep.mix_refused, rep.mix_us_max
+        "[nle] job exit frames={} seeks={} runup={} gaps={} mixed={} mix_seeks={} refused={} mix_us_max={} swaps={} standin={}",
+        rep.frames, rep.seeks, rep.runup, rep.gaps, rep.mixed, rep.mix_seeks, rep.mix_refused, rep.mix_us_max, rep.swaps, rep.stand_in_frames
     );
     let frames = rep.frames;
     *NLE.lock() = Some(rep);
@@ -1028,7 +1134,7 @@ fn edl_frame(
     let (ti, vt, o) = r.v.as_ref().ok_or_else(|| ("no-video", Some(alloc::format!("reel {} has no video stream", id.0))))?;
     if seek || slot.as_ref().map(|x| x.src) != Some(id) {
         let reads: Vec<demux_core::SampleRead> = r.d.samples_from(*ti, o + tb.to_ns(src_t)).collect();
-        let pic = Pic::new(vt).map_err(|e| ("codec-refused", Some(e)))?;
+        let pic = Pic::open(vt, tb.to_ns(src_t)); rep.swaps += pic.on_stand_in() as u64; // SWAPBACKVPLAY (rmbp-ledger B956): a fresh decoder per run (the kernel's reseed), else the open-time stand-in
         *slot = Some(EdlRun { src: id, reads, pos: 0, pic });
         if outgoing {
             rep.mix_seeks += 1;
@@ -1047,9 +1153,13 @@ fn edl_frame(
         }
         let pk = r.d.packet_at(&rd.sample);
         let ord = x.pic.ordinal(&pk.data);
-        match x.pic.decode(&pk.data) {
+        let out = x.pic.decode_swap(vt, &pk.data, rd.sample.pts, rd.sample.keyframe); rep.swaps += matches!(out, Ok((_, Some(Swap::ToStandIn)))) as u64; // SWAPBACKVPLAY (rmbp-ledger B956): Stria's swap rule
+        match out.map(|r| r.0) {
             Ok(Some(_)) if rd.preroll => rep.runup += 1,
-            Ok(Some((w, h, px))) => return Ok((w, h, px, ord)),
+            Ok(Some((w, h, px))) => {
+                rep.stand_in_frames += x.pic.on_stand_in() as u64;
+                return Ok((w, h, px, ord));
+            }
             Ok(None) => {}
             Err(e) => return Err(("decode-refused", Some(e))),
         }
