@@ -550,14 +550,14 @@ fn rejoin_step(force: bool) {
         if lost && (force || REJOIN.lock().due(now)) { g.take() } else { None }
     };
     let Some(st) = taken else { return };
-    let why = st.lost.unwrap_or("-"); let from = st.seen.join.home; // STATIONROAM (B897): the BSS lost, for the roam line
+    let why = st.lost.unwrap_or("-"); let from = st.seen.join.home; let ch0 = st.ch; // STATIONROAM (B897): the BSS lost, for the roam line; STATIONROAM-XCHAN (B898): its channel
     let (n, after) = REJOIN.lock().attempt(now);
     let verdict = match associate(st, None) {
         Ok(to) => {
             REJOIN.lock().linked();
             if let Some(from) = from.filter(|f| *f != to) {
-                let got = STATION.lock().as_ref().and_then(|s| s.seen.join.scan.get(to)).map(|e| e.rssi);
-                roam_line(from, to, "loss", None, got, "linked");
+                let (got, ch1) = STATION.lock().as_ref().map_or((None, ch0), |s| (s.seen.join.scan.get(to).map(|e| e.rssi), s.ch));
+                roam_line(from, to, "loss", None, got, (ch0, ch1), "linked");
             }
             String::from("linked")
         }
@@ -580,7 +580,8 @@ fn rejoin_step(force: bool) {
 /// spins read only their own); the rungs' ring base set so S8 leaves on the old Link's next frame (the ring continues, no
 /// stale descriptor is walked); the watch and the BSS cleared, so `hear` re-fixes the BSS from its beacons within `HEAR_MS`;
 /// then `run` (S8, S9), `link` (S10a, the gateway the operator named) and `keep`. `Err` names the rung that failed.
-fn associate(mut st: Station, pin: Option<Mac>) -> Result<Mac, (Station, &'static str)> {
+/// STATIONROAM-XCHAN (B898): the pin carries the BSS's channel; the PHY is retuned to it (`retune`) before the hear loop.
+fn associate(mut st: Station, pin: Option<(Mac, u8)>) -> Result<Mac, (Station, &'static str)> {
     tx::reap(st.bar0, &mut st.q, crate::arch::ticks());
     st.seen.join.ring = (st.link.tx_next() + tx::FRAMES - FRAME_AUTH) % tx::FRAMES;
     st.seen.join.watch = None;
@@ -590,10 +591,13 @@ fn associate(mut st: Station, pin: Option<Mac>) -> Result<Mac, (Station, &'stati
     // STATIONROAM (B897): BEACPROMISC on, so the target's beacons pass the old BSSID filter (`keep`'s `station_filter` narrows it
     // again on LINKED; every failure below narrows it first); no pin = the re-join after a loss: one scan window, the strongest.
     rx::scan_filter(st.bar0, true, &mut st.w);
-    let pin = match pin.or_else(|| scan(&mut st)) {
+    let (pin, pch) = match pin.or_else(|| scan(&mut st)) {
         Some(b) => b,
         None => return Err(narrow(st, "hear")),
     };
+    if retune(&mut st, pch).is_err() {
+        return Err(narrow(st, "tune"));
+    }
     st.seen.join.pin = Some(pin);
     let mut waited = 0u32;
     while st.seen.join.bss.is_none() && waited < HEAR_MS {
@@ -646,10 +650,12 @@ fn note(frame: &[u8], rssi: i8, h: &mut Heard) {
 }
 
 /// From `associate` with no pin (the re-join after a loss; the Station owned by value, the filter already widened): one window of
-/// `ROAM_WINDOW_MS` on the receiver, then the strongest fresh BSS of the SSID on the station's channel.
-fn scan(st: &mut Station) -> Option<Mac> {
+/// `ROAM_WINDOW_MS` on the receiver, then (STATIONROAM-XCHAN B898: the link is down, so unconditionally) the dwells on the other
+/// grid channels with the home channel restored (`sweep`), then the strongest fresh BSS of the SSID and its channel.
+fn scan(st: &mut Station) -> Option<(Mac, u8)> {
     st.seen.join.scan.open(crate::arch::ticks());
     rx::poll(st.bar0, &mut st.rxr, &mut st.seen, st.ch, super::super::data::ROAM_WINDOW_MS * 1000, &mut st.w);
+    let _ = sweep(st, "lost");
     st.seen.join.scan.close();
     super::super::data::roam_pick(None, st.ch as u8, &st.seen.join.scan)
 }
@@ -668,7 +674,11 @@ fn narrow(mut st: Station, rung: &'static str) -> (Station, &'static str) {
 /// linked. A pick TAKES the Station out of `STATION` and runs `associate` pinned to it on the kept engines (no PHY one-shot, no
 /// `tx::prep`): LINKED -> `keep` refilled `STATION`, and the DHCP socket is reset only when S10a's ARP reply named another gateway
 /// MAC; a failure goes through `lose` ("roam": the line, `REJOIN` armed) back into `STATION`, so the re-join ladder's own scan
-/// window picks again (the old BSS when it is still the strongest). Said once per roam.
+/// window picks again (the old BSS when it is still the strongest). Said once per roam. STATIONROAM-XCHAN (B898): every pass samples
+/// the idle gate (`BssTable::quiet` over `Link.rx_data` / `Queue.posted`); a window that ends with the station quiet and nothing in
+/// flight is NOT closed under the lock: the Station is TAKEN and, no lock held, `sweep` dwells on the other grid channels inside the
+/// same open window and restores the home channel; then the window closes and `roam_pick` may name a BSS on another channel, which
+/// `associate` retunes to. A sweep that cannot restore the home channel is a loss (`lose(st, "tune")`, the re-join ladder retunes).
 fn roam_step() {
     let now = crate::arch::ticks();
     let taken = {
@@ -681,6 +691,7 @@ fn roam_step() {
         if st.lost.is_some() {
             return;
         }
+        let quiet = st.seen.join.scan.quiet(st.link.rx_data, st.q.posted, now); // STATIONROAM-XCHAN (B898): the idle gate, sampled every pass
         if st.seen.join.scan.due(now) {
             st.seen.join.scan.open(now);
             rx::scan_filter(st.bar0, true, &mut st.w);
@@ -689,15 +700,45 @@ fn roam_step() {
         if !st.seen.join.scan.ended(now) {
             return;
         }
-        st.seen.join.scan.close();
-        rx::scan_filter(st.bar0, false, &mut st.w);
-        let Some(home) = st.seen.join.home else { return };
-        let Some(to) = super::super::data::roam_pick(Some(home), st.ch as u8, &st.seen.join.scan) else { return };
-        let was = st.seen.join.scan.get(home).map(|e| e.rssi);
-        let got = st.seen.join.scan.get(to).map(|e| e.rssi);
-        g.take().map(|st| (st, home, to, was, got))
+        if st.seen.join.home.is_some() && quiet && st.q.in_flight() == 0 {
+            g.take().map(|st| (st, None)) // STATIONROAM-XCHAN (B898): the window stays open and wide; the dwells extend it, outside the lock
+        } else {
+            st.seen.join.scan.close();
+            rx::scan_filter(st.bar0, false, &mut st.w);
+            let Some(home) = st.seen.join.home else { return };
+            let Some(to) = super::super::data::roam_pick(Some(home), st.ch as u8, &st.seen.join.scan) else { return };
+            g.take().map(|st| (st, Some(to)))
+        }
     };
-    let Some((st, from, to, was, got)) = taken else { return };
+    let Some((mut st, pick)) = taken else { return };
+    let to = match pick {
+        Some(p) => p,
+        None => {
+            let swept = sweep(&mut st, "idle");
+            st.seen.join.scan.close();
+            rx::scan_filter(st.bar0, false, &mut st.w);
+            if swept.is_err() {
+                lose(&mut st, "tune");
+                *STATION.lock() = Some(st);
+                return;
+            }
+            let p = st.seen.join.home.and_then(|home| super::super::data::roam_pick(Some(home), st.ch as u8, &st.seen.join.scan));
+            match p {
+                Some(p) => p,
+                None => {
+                    *STATION.lock() = Some(st);
+                    return;
+                }
+            }
+        }
+    };
+    let Some(from) = st.seen.join.home else {
+        *STATION.lock() = Some(st);
+        return;
+    };
+    let was = st.seen.join.scan.get(from).map(|e| e.rssi);
+    let got = st.seen.join.scan.get(to.0).map(|e| e.rssi);
+    let ch0 = st.ch;
     let gw0 = st.seen.join.gw_mac;
     let verdict = match associate(st, Some(to)) {
         Ok(_) => {
@@ -713,14 +754,97 @@ fn roam_step() {
             alloc::format!("failed:{}", rung)
         }
     };
-    roam_line(from, to, "rssi", was, got, &verdict);
+    roam_line(from, to.0, "rssi", was, got, (ch0, to.1 as u16), &verdict);
 }
 
-/// `[wifi10] station roam from= to= why=<rssi|loss> rssi=<dBm|->-><dBm|-> -> <linked|failed:<rung>>`.
-fn roam_line(from: Mac, to: Mac, why: &str, was: Option<i8>, got: Option<i8>, verdict: &str) {
+/// `[wifi10] station roam from= to= why=<rssi|loss> rssi=<dBm|->-><dBm|-> ch=<a>-><b> -> <linked|failed:<rung>>`.
+fn roam_line(from: Mac, to: Mac, why: &str, was: Option<i8>, got: Option<i8>, ch: (u16, u16), verdict: &str) {
     let dbm = |v: Option<i8>| v.map(|x| alloc::format!("{}", x)).unwrap_or_else(|| String::from("-"));
     serial_println!(
-        "[wifi10] station roam from={} to={} why={} rssi={}->{} -> {} — same SSID, same channel, no deauth to the old BSS; no tx::prep re-run (STATIONROAM B897)",
-        mac_text(from), mac_text(to), why, dbm(was), dbm(got), verdict
+        "[wifi10] station roam from={} to={} why={} rssi={}->{} ch={}->{} -> {} — same SSID, no deauth to the old BSS; no tx::prep re-run (STATIONROAM B897, STATIONROAM-XCHAN B898)",
+        mac_text(from), mac_text(to), why, dbm(was), dbm(got), ch.0, ch.1, verdict
     );
+}
+
+// ── STATIONROAM-XCHAN (rmbp-ledger B898): the channel switch on the kept PHY, and the off-channel dwells ──────────────────────
+
+/// `[wifi10] station tune` lines said so far (the first 8 are said, then only a non-DONE).
+static TUNES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The PHY moved to `ch` on a Station TAKEN out of `STATION` (owned by value, so nothing else reaches the d11's indirect PHY/radio
+/// ports; no lock held, `tune` sleeps), on the `wifi-station` task: b43's op_config shape — the MAC suspended (`rx::suspend`), the SHM
+/// cookie (`rx::chan_cookie`, phy_common.c:425-432), `htphyinit::switch_channel` (`tune` alone), the MAC enabled (`rx::resume`).
+/// No one-shot re-run: the TX ring, the receiver, `tx_prep` and WIFI11's power control stay as the pass left them (b43_switch_channel
+/// touches no DMA; 2.4 GHz power control is per band). `Station.ch` follows, so every TX header's chan_radio_code matches the cookie
+/// (a stale header is the ucode's `chan-mismatch`). A refusal writes no PHY register and puts the cookie back. `Err` = refused or
+/// a partial readback (the PHY then says `ch`, and the caller restores or loses).
+fn retune(st: &mut Station, ch: u8) -> Result<(), &'static str> {
+    let from = st.ch;
+    if ch as u16 == from {
+        return Ok(());
+    }
+    let suspended = rx::suspend(st.bar0, &mut st.w, "wifi10-tune");
+    let pre = rx::chan_cookie(st.bar0, ch as u16, &mut st.w);
+    let r = super::htphyinit::switch_channel(st.bar0, ch as u16);
+    if r.is_err() {
+        let _ = rx::chan_cookie(st.bar0, from, &mut st.w);
+    } else {
+        st.ch = ch as u16;
+    }
+    rx::resume(st.bar0, &mut st.w);
+    let (verdict, done, out) = match &r {
+        Ok(t) if t.readback_ok == t.readback_n && t.cca_ok => (String::from("DONE"), true, Ok(())),
+        Ok(t) if t.readback_ok == t.readback_n => (String::from("PARTIAL"), false, Ok(())),
+        Ok(_) => (String::from("PARTIAL"), false, Err("readback")),
+        Err(why) => (alloc::format!("REFUSED reason={}", why), false, Err(*why)),
+    };
+    let n = TUNES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 8 || !done {
+        let (writes, rb, cca) = match &r {
+            Ok(t) => (
+                alloc::format!("{}", t.writes),
+                if t.readback_ok == t.readback_n { String::from("MATCH") } else { alloc::format!("{}/{}", t.readback_ok, t.readback_n) },
+                if t.cca_ok { "rst2rx" } else { "TIMEOUT" },
+            ),
+            Err(_) => (String::from("0"), String::from("-"), "-"),
+        };
+        serial_println!(
+            "[wifi10] station tune ch={}->{} writes={} readback={} cca={} cookie={:#06x} mac-suspended={} -> {} — phy_common.c:416-441, phy_ht.c:35-77 + :763-805; no one-shot re-run (STATIONROAM-XCHAN B898)",
+            from, ch, writes, rb, cca, pre, suspended as u8, verdict
+        );
+    }
+    out
+}
+
+/// Inside an OPEN scan window (BEACPROMISC on), on a TAKEN Station: one `ROAM_DWELL_MS` dwell on each channel of
+/// `data::dwell_plan(home)` (the grid without the home channel, which the window already heard), `join::note` filling the table with
+/// each beacon's DS channel, then the home channel restored. The data path stalls for its length (`stall=`). `why`: `idle` (the
+/// gate) or `lost` (the re-join). `Err` only when the home channel could not be restored. Said once per sweep.
+fn sweep(st: &mut Station, why: &str) -> Result<u32, &'static str> {
+    let home = st.ch as u8;
+    let t0 = crate::arch::ticks();
+    let (plan, n) = super::super::data::dwell_plan(home);
+    let mut ok = true;
+    for c in plan[..n].iter() {
+        if retune(st, *c).is_err() {
+            ok = false;
+            break;
+        }
+        rx::poll(st.bar0, &mut st.rxr, &mut st.seen, st.ch, super::super::data::ROAM_DWELL_MS * 1000, &mut st.w);
+    }
+    let back = retune(st, home);
+    let heard = st.seen.join.scan.e.iter().flatten().filter(|s| s.last_ms >= t0 && s.channel != home).count() as u32;
+    let stall = crate::arch::ticks().saturating_sub(t0);
+    let mut list = String::new();
+    for (i, c) in plan[..n].iter().enumerate() {
+        if i > 0 {
+            list.push(',');
+        }
+        list.push_str(&alloc::format!("{}", c));
+    }
+    serial_println!(
+        "[wifi10] station sweep why={} home={} plan={} dwell={}ms heard={} stall={}ms -> {} — the data path stalls for the sweep; the window's own channel is not re-dwelled (STATIONROAM-XCHAN B898)",
+        why, home, list, super::super::data::ROAM_DWELL_MS, heard, stall, if ok && back.is_ok() { "done" } else { "failed:tune" }
+    );
+    back.map(|_| heard)
 }

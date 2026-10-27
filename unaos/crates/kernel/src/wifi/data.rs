@@ -373,7 +373,7 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
         checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
             && crate::smolnet::lease_of(&bad).is_none()));
     }
-    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); let mut pass = 0u8; // STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
+    ratectl_rows(&mut checks); erp_rows(&mut checks); rejoin_rows(&mut checks); roam_rows(&mut checks); xchan_rows(&mut checks); let mut pass = 0u8; // STATIONROAM-XCHAN (B898): `dwell`, `idlegate` after `roamwindow`; STATIONROAM (B897): `bsstable`, `roampick`, `roamwindow` after `rejoin`; STATIONREJOIN (B891): `rejoin` after them; STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
     let mut first = None;
     for (name, ok) in checks.iter() {
         if *ok {
@@ -944,11 +944,29 @@ pub struct BssTable {
     open: bool,
     opened_ms: u64,
     next_ms: u64,
+    /// STATIONROAM-XCHAN (B898): the idle gate — the (rx_data, posted) counters last sampled and when they last moved.
+    act: Option<(u32, u32)>,
+    act_ms: u64,
 }
 
 impl BssTable {
     pub fn arm(&mut self, now_ms: u64) {
         self.next_ms = now_ms + ROAM_SCAN_MS;
+        self.act = None;
+        self.act_ms = now_ms;
+    }
+
+    /// STATIONROAM-XCHAN (B898): one sample of the station's data counters (`Link.rx_data`, `tx::Queue.posted`); a change in either
+    /// (or the first sample after `arm`) restarts the clock. `true` = neither moved for `ROAM_IDLE_MS`: an off-channel sweep may stall
+    /// the data path.
+    pub fn quiet(&mut self, rx: u32, tx: u32, now_ms: u64) -> bool {
+        if self.act != Some((rx, tx)) {
+            if self.act.is_some() {
+                self.act_ms = now_ms;
+            }
+            self.act = Some((rx, tx));
+        }
+        now_ms >= self.act_ms + ROAM_IDLE_MS
     }
 
     pub fn due(&self, now_ms: u64) -> bool {
@@ -1011,10 +1029,12 @@ impl BssTable {
     }
 }
 
-/// The roam's pick over the last window: candidates FRESH, on `ch` (or with no DS element, 0), not `current`. `Some(cur)` (a
-/// linked station): `cur` itself must be fresh (a silent current is the `Watch`'s loss, not a roam) and a candidate must beat
-/// it by `ROAM_HYST_DB`; the strongest such wins. `None` (the re-join after a loss): the strongest fresh BSS on `ch`.
-pub fn roam_pick(current: Option<Mac>, ch: u8, t: &BssTable) -> Option<Mac> {
+/// The roam's pick over the last window: candidates FRESH, not `current`, on any channel 1..=`ROAM_CH_MAX` (STATIONROAM-XCHAN
+/// B898: the window's dwells heard other channels; no DS element, 0, is taken as `ch`, the channel it was heard on at home).
+/// `Some(cur)` (a linked station): `cur` itself must be fresh (a silent current is the `Watch`'s loss, not a roam) and a candidate
+/// must beat it by `ROAM_HYST_DB`; the strongest such wins. `None` (the re-join after a loss): the strongest fresh BSS.
+/// Returns the BSSID and its channel.
+pub fn roam_pick(current: Option<Mac>, ch: u8, t: &BssTable) -> Option<(Mac, u8)> {
     let floor = match current {
         Some(cur) => {
             let c = t.get(cur).filter(|s| t.fresh(s))?;
@@ -1024,22 +1044,22 @@ pub fn roam_pick(current: Option<Mac>, ch: u8, t: &BssTable) -> Option<Mac> {
     };
     let mut best: Option<BssSeen> = None;
     for s in t.e.iter().flatten() {
-        if !t.fresh(s) || Some(s.bssid) == current || (s.channel != ch && s.channel != 0) || (s.rssi as i16) < floor {
+        if !t.fresh(s) || Some(s.bssid) == current || s.channel > ROAM_CH_MAX || (s.rssi as i16) < floor {
             continue;
         }
         if best.map_or(true, |b| s.rssi > b.rssi) {
             best = Some(*s);
         }
     }
-    best.map(|s| s.bssid)
+    best.map(|s| (s.bssid, if s.channel == 0 { ch } else { s.channel }))
 }
 
 /// `kat`'s rows after B891's (STATIONROAM rmbp-ledger B897). `bsstable`: `ht_power` of a header with octets 9/10/11 = -70/-55/-80
 /// reads -55, a short header `i8::MIN`; a closed table ignores `see`; open at 0: BSSID 1 at -60 then -50 holds -55, n 2; seven
 /// more BSSIDs (heard at 20..80) fill the table and a 9th (at 90) evicts BSSID 1, the one heard longest ago (at 5). `roampick`:
-/// current at -60; a candidate at -55 is not picked (+5); a stronger one on channel 6 is not; once the candidate averages -54
-/// (+6) it is; an entry from the window before is stale and never picked; a silent current picks nothing; no current picks the
-/// strongest fresh BSS on the channel. `roamwindow`: arm(0): not due at 59 999, due at 60 000; open at 60 000: ended at 61 000 not
+/// current at -60; a candidate at -55 is not picked (+5); once it averages -54 (+6) it is, on 11; a stronger one on channel 13
+/// is not (STATIONROAM-XCHAN B898: ROAM_CH_MAX 12); a stronger one on channel 6 is, on 6; one with no DS element resolves to 11;
+/// an entry from the window before is stale and never picked; a silent current picks nothing; no current picks the strongest. `roamwindow`: arm(0): not due at 59 999, due at 60 000; open at 60 000: ended at 61 000 not
 /// 60 999; closed: due again at 120 000 not 119 999.
 fn roam_rows(checks: &mut Vec<(&'static str, bool)>) {
     let b = |k: u8| -> Mac { [0x00, 0x11, 0x22, 0x33, 0x44, k] };
@@ -1071,13 +1091,17 @@ fn roam_rows(checks: &mut Vec<(&'static str, bool)>) {
     p.see(b(1), 11, -60, 1000);
     p.see(b(2), 11, -55, 1000);
     let five = roam_pick(Some(b(1)), 11, &p).is_none();
-    p.see(b(3), 6, -20, 1000);
-    let other_ch = roam_pick(Some(b(1)), 11, &p).is_none();
     p.see(b(2), 11, -53, 1001);
-    let six = roam_pick(Some(b(1)), 11, &p) == Some(b(2));
+    let six = roam_pick(Some(b(1)), 11, &p) == Some((b(2), 11));
+    p.see(b(4), 13, -25, 1001);
+    let ch13 = roam_pick(Some(b(1)), 11, &p) == Some((b(2), 11));
+    p.see(b(3), 6, -20, 1001);
+    let other_ch = roam_pick(Some(b(1)), 11, &p) == Some((b(3), 6));
+    p.see(b(6), 0, -10, 1002);
+    let no_ds = roam_pick(Some(b(1)), 11, &p) == Some((b(6), 11));
     let silent = roam_pick(Some(b(5)), 11, &p).is_none();
-    let none = roam_pick(None, 11, &p) == Some(b(2));
-    checks.push(("roampick", five && other_ch && six && silent && none));
+    let none = roam_pick(None, 11, &p) == Some((b(6), 11)) && p.get(b(7)).map_or(false, |e| !p.fresh(&e));
+    checks.push(("roampick", five && six && ch13 && other_ch && no_ds && silent && none));
 
     let mut s = BssTable::default();
     s.arm(0);
@@ -1087,4 +1111,49 @@ fn roam_rows(checks: &mut Vec<(&'static str, bool)>) {
     s.close();
     win &= !s.is_open() && !s.ended(61_000) && !s.due(119_999) && s.due(120_000);
     checks.push(("roamwindow", win));
+}
+
+// ── STATIONROAM-XCHAN (rmbp-ledger B898): the off-channel dwells and the idle gate — PURE, held in `join::Heard.scan` under `STATION` ──
+
+/// One dwell on another channel inside an open scan window: one beacon interval (100 TU = 102.4 ms) and a little, so a BSS beaconing
+/// at the default interval is heard once per dwell (passive; STATIONROAM-ACTIVE owed).
+pub const ROAM_DWELL_MS: u64 = 110;
+/// A linked station sweeps only after its data counters stood still this long (the sweep stalls the data path).
+pub const ROAM_IDLE_MS: u64 = 2000;
+/// The channels swept: the three non-overlapping 2.4 GHz channels (the full 1..13 sweep owed: STATIONROAM-SWEEP).
+pub const ROAM_GRID: [u8; 3] = [1, 6, 11];
+/// The highest channel the switch serves (`htphyinit::switch_channel`: 13/14 take spuravoid=1, `phy_ht.c:740-741`).
+pub const ROAM_CH_MAX: u8 = 12;
+
+/// The dwell schedule from `home` (the window already listened on it): `ROAM_GRID` in order without `home` — `(channels, count)`.
+pub fn dwell_plan(home: u8) -> ([u8; 3], usize) {
+    let mut out = [0u8; 3];
+    let mut n = 0;
+    for c in ROAM_GRID.iter() {
+        if *c != home {
+            out[n] = *c;
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
+/// `kat`'s rows after B897's (STATIONROAM-XCHAN rmbp-ledger B898). `dwell`: plan(11) = 1, 6; plan(6) = 1, 11; plan(1) = 6, 11;
+/// plan(3) = 1, 6, 11; the stall is at most 3 x `ROAM_DWELL_MS` = 330 ms, 220 on the grid. `idlegate`: arm(0), counters (5, 7):
+/// not quiet at 1999, quiet at 2000; rx moves at 2250: not quiet at 4249, quiet at 4250; tx moves at 4500: not quiet at 6499;
+/// a re-arm at 7000 restarts the clock (not quiet at 8999, quiet at 9000).
+fn xchan_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let mut ok = dwell_plan(11) == ([1, 6, 0], 2) && dwell_plan(6) == ([1, 11, 0], 2) && dwell_plan(1) == ([6, 11, 0], 2);
+    ok &= dwell_plan(3) == ([1, 6, 11], 3);
+    ok &= dwell_plan(3).1 as u64 * ROAM_DWELL_MS == 330 && dwell_plan(11).1 as u64 * ROAM_DWELL_MS == 220;
+    checks.push(("dwell", ok));
+
+    let mut t = BssTable::default();
+    t.arm(0);
+    let mut q = !t.quiet(5, 7, 0) && !t.quiet(5, 7, 1999) && t.quiet(5, 7, 2000);
+    q &= !t.quiet(6, 7, 2250) && !t.quiet(6, 7, 4249) && t.quiet(6, 7, 4250);
+    q &= !t.quiet(6, 8, 4500) && !t.quiet(6, 8, 6499) && t.quiet(6, 8, 6500);
+    t.arm(7000);
+    q &= !t.quiet(6, 8, 7000) && !t.quiet(6, 8, 8999) && t.quiet(6, 8, 9000);
+    checks.push(("idlegate", q));
 }
