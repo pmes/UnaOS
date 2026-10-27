@@ -8387,6 +8387,12 @@ KERNEL_CFG_MATRIX=(
   # UNIVERSE SIDE EFFECT: none — every feature here is already on an arm-* row and on no x86-* row, so
   # `x86_cfg_universe` and the mix-leg count are unchanged. Board legs +1.
   "arm-tegra-image-supstate ../../aarch64-unaos.json witness,logts,wedge2,sched_demo,rast,installdemo,tegra,tegrasmp,smpprobe,xcarve,xcarve_scrub,xcarve_crcrq,xcarve_relink,pcieprobe,pcie2,pcie3,net4,sdmmc,sdmmc_arm,install_target,vnet,tegra_el0,desktop_firmware,livecon,quarry,facet,login,lumen,holocron,selfdiag,midden,una,aether,uvc,sonde,usbnet,stria,orindesk,orinclick,orinconwin,orinrender,supstate"
+  # ── ZENBOOKIMAGELINE (appended 2026-10-27, zenbook-ledger Z6, wave36) — the Zenbook image line ──
+  # scripts/image-line-zenbook.env's 25 kernel knobs, verbatim, in arroyo-map order (FOLDBUILD's lesson: an image
+  # line no leg compiles is a line that may not build — wc, installdemo and unafs WITHOUT ahci*, smc, kepler, ivb, hda,
+  # wifi and bt are named by no other leg together). `./arroyo esp-zenbook` builds this set. UNIVERSE SIDE EFFECT:
+  # none — an x86-* row subtracts nothing from `x86_cfg_universe`. Board legs +1.
+  "x86-zenbook-image ../../x86_64-unaos.json witness,selfhost,wcg-paygo,wcdvalve,logts,tickless,login,installdemo,wc,deadman,linuxabi,busreg,lumen,stria,netring3,selfdiag,videoplayer,quarry,facet,ftdirx,usbnet,nvme,unafs,uvc,ioapic"
 )
 
 # ── GATE-CFG-MIX: the endpoints are not the configurations we ship ────────────────────────────────
@@ -14983,6 +14989,17 @@ case "${1:-}" in
         ;;
     esp-x86|esp_x86)
         _BOOTLIST_MEDIA=1 esp_x86   # BOOTLIST (B817, R132) / BOOTLISTARM (B874): the media verb only arms `bootlist_stage` (inside esp_x86, before the card) — the QEMU lanes never stage a list
+        ;;
+    esp-zenbook|esp_zenbook)
+        # ZENBOOKIMAGELINE (zenbook-ledger Z6): the Zenbook card IS esp-x86 built under scripts/image-line-zenbook.env.
+        # `_feats` was composed from the CALLER's env when this script loaded, and the builder arms any knob that merely
+        # EXISTS (`std::env::var(..).is_ok()`; UNAOS_IVB also builds the loader's entry traces), so every inherited
+        # UNAOS_* is UNSET first — bar the four bench values the line does not set — then the line is loaded and arroyo is
+        # re-entered as esp-x86, whose own banner names the line's features (the one above is the caller's).
+        _zk=""; for _zv in $(compgen -e); do case "$_zv" in UNAOS_MT7925_FW_PATH|UNAOS_GOP|UNAOS_NOSRC|UNAOS_X86_UNAFS_MB) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
+        echo -e "${COLOR_CYAN}⚡ esp-zenbook: line=scripts/image-line-zenbook.env scrubbed=[${_zk# }] gop=${UNAOS_GOP:-auto}${COLOR_RESET}"
+        set -a; . "$WORKSPACE_DIR/scripts/image-line-zenbook.env" || exit 1; set +a
+        exec "$WORKSPACE_DIR/arroyo" esp-x86
         ;;
     esp-arm|esp_arm)
         _BOOTLIST_MEDIA=1 esp_arm   # BOOTLISTARM (B874): the media verb arms the list

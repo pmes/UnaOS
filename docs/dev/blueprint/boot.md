@@ -5,7 +5,7 @@
 - `kernel_main` (`unaos/crates/kernel/src/main.rs:80`) stamps BPACE rungs (`entry heap acpi calib smp sched pci-usb gui`), hands the panel to scheduled services, and the BSP joins the scheduler.
 - ONE phase gate (`unaos/crates/kernel/src/boot.rs:65`) decides what may run: `Setter` (store unread, or no users) → `LoginScreen` (users exist, no session yet) → `Desktop` (latched by the first session).
 - The desktop is an object BUILT when a session opens and torn down at Log Out (`unaos/crates/kernel/src/video/desktopbuild.rs:1-17`).
-- The image's features are one file, `unaos/scripts/image-line.env` (51 exports); Pi and Orin have their own (`image-line-pi.env`, `image-line-orin.env`).
+- The image's features are one file, `unaos/scripts/image-line.env` (51 exports); Pi and Orin have their own (`image-line-pi.env`, `image-line-orin.env`); the Zenbook's is `unaos/scripts/image-line-zenbook.env`, built by `./arroyo esp-zenbook` (esp-x86 under that file, inherited `UNAOS_*` unset; zenbook-ledger Z6).
 
 ## 2. Invariants
 | id | statement | anchor | held by |

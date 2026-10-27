@@ -24,10 +24,12 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
    knobs onto a USB stick, into a USB-A or USB-C port; F2/Esc into the ASUS firmware, Secure Boot OFF, boot the stick.
    The FTDI serial adapter goes on a port of the FIRST xHCI the kernel walks (ZENBOOK-XHCIPICK: try each port; the
    wire names the one that bound). Expected first lines and refusals: um5606w.md §6. Bench only, Peter's go.
-2. **ZENBOOK-IMAGELINE** — `unaos/scripts/image-line-zenbook.env` (the `image-line-pi.env` shape): the rMBP line WITHOUT
-   its Mac-only knobs (SMC, LIDSLEEP, KEPLER*, NOASPM, IVB*, GMUX_IGD, BEAM, HDA, HDATONE, WIFI..WIFI10 and the b43
-   firmware path, BT/BTC/A2DP — the list in um5606w.md §5), its `boot::OLDEST` const (2024) and its arroyo media verb.
-   Without IVB the loader's entry traces are not built (ZENBOOK-LOADERTRACE).
+2. **ZENBOOK-IMAGELINE** — In flight (ZENBOOKIMAGELINE, Z6): `unaos/scripts/image-line-zenbook.env` (25 kernel knobs +
+   the `[media]` UNAOS_MT7925_FW_PATH: the rMBP line without its Mac-only knobs and the SATA set, plus NVME) and
+   `./arroyo esp-zenbook` (esp-x86 under that file after every inherited `UNAOS_*` is unset, bar four bench values); the
+   check leg `x86-zenbook-image`; um5606w.md §5/§6. Owed: ZENBOOK-OLDEST (`boot::OLDEST` is cfg-only, so the image prints
+   rmbp12 2012, not 2024), ZENBOOK-QEMULANE (an arroyo `test` lane with the Zenbook knobs), ZENBOOK-LINEGATE (a
+   `knob-parity-zenbook` gates row running the x86 `--line` mode on the file); row 1's recipe should name esp-zenbook.
 3. **ZENBOOK-NVME** — `drivers/nvme.rs` (class 0108, vendor varies): the root volume. In flight (ZENBOOKNVME).
 4. **ZENBOOK-I8042** — `drivers/i8042.rs`: the internal keyboard on the EC's 8042 into the input route. In flight
    (ZENBOOKI8042; it asks `hw::platform()`).
@@ -46,10 +48,11 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
 12. **ZENBOOK-RADEON** — display beyond GOP: the amdgpu DCN 3.5 scanout on the Radeon 890M (1002:150e, gfx1150) — the
     Kepler-sized job.
 13. **ZENBOOK-SUSPEND** — S0ix / modern standby (the rMBP's `idle` state has no meaning here until the EC row lands).
-14. **ZENBOOK-LOADERTRACE** — the loader's `unaos_ivb` entry traces (`read_igpu_trace`: config 0:2.0 BAR0 MMIO;
-    `read_gmux_trace`: gmux ports 0x7D0/0x7D4; `unaos/crates/bootloader/src/main.rs:448`) run before `uefi::helpers::init`
-    on any image with UNAOS_IVB. Gate them in the loader by the SMBIOS product (Z1's read, moved earlier) — or keep IVB
-    off the Zenbook line (ZENBOOK-IMAGELINE) and say so here.
+14. **ZENBOOK-LOADERTRACE** — closed by ZENBOOK-IMAGELINE (no IVB on the line), Z6: the traces (`read_igpu_trace`,
+    `read_gmux_trace`; the call at `unaos/crates/bootloader/src/main.rs:448`, the fns at :1389/:1438) are all
+    `cfg(feature = "unaos_ivb")`, which the builder passes only under UNAOS_IVB (`unaos/builder/src/main.rs:1235`); the
+    Zenbook line carries no IVB and `esp-zenbook` unsets an inherited one. An rMBP-line image booted on the Zenbook
+    still runs them (the SMBIOS-gated loader variant stays unbuilt).
 15. **ZENBOOK-BPROW** — `docs/dev/blueprint/boot.md` has no platform table (measured by Z1): a row per board (loader,
     image line, oldest const, platform token) is the seat's call; until then the Zenbook's boot path is um5606w.md.
 16. **ZENBOOK-LEDGERGATE** — `unaos/scripts/ledger-check.sh` knows the owners {orin, pi, rmbp, shared-gate} and the
