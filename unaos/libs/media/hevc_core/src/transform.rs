@@ -93,7 +93,7 @@ pub fn add_residual(plane: &mut crate::picture::Plane, x0: usize, y0: usize, log
     for y in 0..n {
         for x in 0..n {
             let v = plane.at(x0 + x, y0 + y) as i32 + res[y * n + x];
-            plane.set(x0 + x, y0 + y, v.clamp(0, max) as u8);
+            plane.set(x0 + x, y0 + y, v.clamp(0, max) as u16);
         }
     }
 }

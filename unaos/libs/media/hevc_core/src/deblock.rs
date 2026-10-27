@@ -109,14 +109,14 @@ fn edge_facts(pic: &Picture, geo: &Geometry, pps: &Pps, pcm_lf_off: bool, p: (us
 
 /// The luma filter of one 4-line edge segment. `q0` is the index of q0,0; `across` steps from p0 to q0, `along` from
 /// line k to line k + 1.
-fn filter_luma(d: &mut [u8], q0: usize, across: isize, along: isize, f: &EdgeFacts, bd: u32) {
+fn filter_luma(d: &mut [u16], q0: usize, across: isize, along: isize, f: &EdgeFacts, bd: u32) {
     let qpl = (f.qp_q + f.qp_p + 1) >> 1;
     let beta = BETA_TABLE[(qpl + (f.beta_offset_div2 << 1)).clamp(0, 51) as usize] as i32 * (1 << (bd - 8));
     let tc = TC_TABLE[(qpl + 2 * (f.bs - 1) + (f.tc_offset_div2 << 1)).clamp(0, 53) as usize] as i32 * (1 << (bd - 8));
     let at = |k: isize, i: isize| (q0 as isize + k * along + i * across) as usize;
     // p_i at offset -(i + 1), q_i at offset i.
-    let px = |d: &[u8], i: isize, k: isize| d[at(k, -(i + 1))] as i32;
-    let qx = |d: &[u8], i: isize, k: isize| d[at(k, i)] as i32;
+    let px = |d: &[u16], i: isize, k: isize| d[at(k, -(i + 1))] as i32;
+    let qx = |d: &[u16], i: isize, k: isize| d[at(k, i)] as i32;
     let dp0 = (px(d, 2, 0) - 2 * px(d, 1, 0) + px(d, 0, 0)).abs();
     let dp3 = (px(d, 2, 3) - 2 * px(d, 1, 3) + px(d, 0, 3)).abs();
     let dq0 = (qx(d, 2, 0) - 2 * qx(d, 1, 0) + qx(d, 0, 0)).abs();
@@ -126,7 +126,7 @@ fn filter_luma(d: &mut [u8], q0: usize, across: isize, along: isize, f: &EdgeFac
     if dpq0 + dpq3 >= beta {
         return;
     }
-    let dsam = |d: &[u8], k: isize, dpq: i32| {
+    let dsam = |d: &[u16], k: isize, dpq: i32| {
         dpq < (beta >> 2)
             && (px(d, 3, k) - px(d, 0, k)).abs() + (qx(d, 0, k) - qx(d, 3, k)).abs() < (beta >> 3)
             && (px(d, 0, k) - qx(d, 0, k)).abs() < ((5 * tc + 1) >> 1)
@@ -141,14 +141,14 @@ fn filter_luma(d: &mut [u8], q0: usize, across: isize, along: isize, f: &EdgeFac
         if strong {
             let c = |v: i32, x: i32| x.clamp(v - 2 * tc, v + 2 * tc);
             if !f.no_p {
-                d[at(k, -1)] = c(p0, (p2 + 2 * p1 + 2 * p0 + 2 * q0v + q1 + 4) >> 3) as u8;
-                d[at(k, -2)] = c(p1, (p2 + p1 + p0 + q0v + 2) >> 2) as u8;
-                d[at(k, -3)] = c(p2, (2 * p3 + 3 * p2 + p1 + p0 + q0v + 4) >> 3) as u8;
+                d[at(k, -1)] = c(p0, (p2 + 2 * p1 + 2 * p0 + 2 * q0v + q1 + 4) >> 3) as u16;
+                d[at(k, -2)] = c(p1, (p2 + p1 + p0 + q0v + 2) >> 2) as u16;
+                d[at(k, -3)] = c(p2, (2 * p3 + 3 * p2 + p1 + p0 + q0v + 4) >> 3) as u16;
             }
             if !f.no_q {
-                d[at(k, 0)] = c(q0v, (p1 + 2 * p0 + 2 * q0v + 2 * q1 + q2 + 4) >> 3) as u8;
-                d[at(k, 1)] = c(q1, (p0 + q0v + q1 + q2 + 2) >> 2) as u8;
-                d[at(k, 2)] = c(q2, (p0 + q0v + q1 + 3 * q2 + 2 * q3 + 4) >> 3) as u8;
+                d[at(k, 0)] = c(q0v, (p1 + 2 * p0 + 2 * q0v + 2 * q1 + q2 + 4) >> 3) as u16;
+                d[at(k, 1)] = c(q1, (p0 + q0v + q1 + q2 + 2) >> 2) as u16;
+                d[at(k, 2)] = c(q2, (p0 + q0v + q1 + 3 * q2 + 2 * q3 + 4) >> 3) as u16;
             }
         } else {
             let mut delta = (9 * (q0v - p0) - 3 * (q1 - p1) + 8) >> 4;
@@ -157,17 +157,17 @@ fn filter_luma(d: &mut [u8], q0: usize, across: isize, along: isize, f: &EdgeFac
             }
             delta = delta.clamp(-tc, tc);
             if !f.no_p {
-                d[at(k, -1)] = (p0 + delta).clamp(0, max) as u8;
+                d[at(k, -1)] = (p0 + delta).clamp(0, max) as u16;
                 if dep {
                     let dp = ((((p2 + p0 + 1) >> 1) - p1 + delta) >> 1).clamp(-(tc >> 1), tc >> 1);
-                    d[at(k, -2)] = (p1 + dp).clamp(0, max) as u8;
+                    d[at(k, -2)] = (p1 + dp).clamp(0, max) as u16;
                 }
             }
             if !f.no_q {
-                d[at(k, 0)] = (q0v - delta).clamp(0, max) as u8;
+                d[at(k, 0)] = (q0v - delta).clamp(0, max) as u16;
                 if deq {
                     let dq = ((((q2 + q0v + 1) >> 1) - q1 - delta) >> 1).clamp(-(tc >> 1), tc >> 1);
-                    d[at(k, 1)] = (q1 + dq).clamp(0, max) as u8;
+                    d[at(k, 1)] = (q1 + dq).clamp(0, max) as u16;
                 }
             }
         }
@@ -175,16 +175,16 @@ fn filter_luma(d: &mut [u8], q0: usize, across: isize, along: isize, f: &EdgeFac
 }
 
 /// The chroma filter (bS 2) of one line across an edge.
-fn filter_chroma_line(d: &mut [u8], q0: usize, across: isize, tc: i32, no_p: bool, no_q: bool, bd: u32) {
+fn filter_chroma_line(d: &mut [u16], q0: usize, across: isize, tc: i32, no_p: bool, no_q: bool, bd: u32) {
     let at = |i: isize| (q0 as isize + i * across) as usize;
     let (p0, p1, q0v, q1) = (d[at(-1)] as i32, d[at(-2)] as i32, d[at(0)] as i32, d[at(1)] as i32);
     let delta = ((((q0v - p0) << 2) + p1 - q1 + 4) >> 3).clamp(-tc, tc);
     let max = (1i32 << bd) - 1;
     if !no_p {
-        d[at(-1)] = (p0 + delta).clamp(0, max) as u8;
+        d[at(-1)] = (p0 + delta).clamp(0, max) as u16;
     }
     if !no_q {
-        d[at(0)] = (q0v - delta).clamp(0, max) as u8;
+        d[at(0)] = (q0v - delta).clamp(0, max) as u16;
     }
 }
 

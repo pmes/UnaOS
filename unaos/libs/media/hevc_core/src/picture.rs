@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! The picture under decoding: three 8-bit planes (4:2:0) and the facts the parser, intra prediction, the deblocking
+//! The picture under decoding: three 16-bit sample planes (4:2:0; HEVCMAIN10 SR311: 8- and 10-bit samples alike) and the facts the parser, intra prediction, the deblocking
 //! filter and SAO read back — per 4x4 luma block (coding quadtree depth, IntraPredModeY, QpY, pcm / transquant bypass,
 //! transform / coding block edges) and per CTB (its slice, its SAO parameters) — with the z-scan availability
 //! process of 6.4.1, and the conformance-window crop into h264_core's [`Frame`]. HEVCINTER (SR216): the per-4x4 motion
@@ -18,19 +18,19 @@ use crate::Frame;
 pub struct Plane {
     pub w: usize,
     pub h: usize,
-    pub data: Vec<u8>,
+    pub data: Vec<u16>,
 }
 
 impl Plane {
-    pub fn new(w: usize, h: usize, fill: u8) -> Plane {
+    pub fn new(w: usize, h: usize, fill: u16) -> Plane {
         Plane { w, h, data: vec![fill; w * h] }
     }
     #[inline]
-    pub fn at(&self, x: usize, y: usize) -> u8 {
+    pub fn at(&self, x: usize, y: usize) -> u16 {
         self.data[y * self.w + x]
     }
     #[inline]
-    pub fn set(&mut self, x: usize, y: usize, v: u8) {
+    pub fn set(&mut self, x: usize, y: usize, v: u16) {
         self.data[y * self.w + x] = v;
     }
 }
@@ -122,6 +122,8 @@ pub struct Picture {
     /// The conformance window in luma samples: (x0, y0, w, h).
     pub crop: (usize, usize, usize, usize),
     pub output: bool,
+    /// BitDepthY (= BitDepthC; unequal depths are refused): to_frame narrows by it (HEVCMAIN10 SR311).
+    pub bit_depth: u32,
 }
 
 impl Picture {
@@ -147,6 +149,7 @@ impl Picture {
             full_range: false,
             crop: (0, 0, width, height),
             output: true,
+            bit_depth: 8,
         }
     }
 
@@ -193,7 +196,9 @@ impl Picture {
         geo.tile_of_rs(cn) == geo.tile_of_rs(cc)
     }
 
-    /// The cropped picture as h264_core's frame type (7.4.3.2.1 conformance window, 4:2:0).
+    /// The cropped picture as h264_core's frame type (7.4.3.2.1 conformance window, 4:2:0). HEVCMAIN10 (SR311): above
+    /// 8 bits `planes16` carries the samples as decoded and `planes` holds them narrowed `>> (bit_depth - 8)`; at 8 bits
+    /// the narrow is a shift of 0 and `planes16` is None.
     pub fn to_frame(&self) -> Frame {
         let (x0, y0, w, h) = self.crop;
         let crop = |pl: &Plane, x0: usize, y0: usize, w: usize, h: usize| {
@@ -204,17 +209,22 @@ impl Picture {
             }
             v
         };
+        let planes16 = [
+            crop(&self.planes[0], x0, y0, w, h),
+            crop(&self.planes[1], x0 / 2, y0 / 2, w / 2, h / 2),
+            crop(&self.planes[2], x0 / 2, y0 / 2, w / 2, h / 2),
+        ];
+        let shift = self.bit_depth - 8;
+        let narrow = |p: &Vec<u16>| p.iter().map(|&v| (v >> shift) as u8).collect::<Vec<u8>>();
         Frame {
             width: w as u32,
             height: h as u32,
-            planes: [
-                crop(&self.planes[0], x0, y0, w, h),
-                crop(&self.planes[1], x0 / 2, y0 / 2, w / 2, h / 2),
-                crop(&self.planes[2], x0 / 2, y0 / 2, w / 2, h / 2),
-            ],
+            planes: [narrow(&planes16[0]), narrow(&planes16[1]), narrow(&planes16[2])],
             poc: self.poc,
             tag: self.tag,
             full_range: self.full_range,
+            bit_depth: self.bit_depth as u8,
+            planes16: if self.bit_depth > 8 { Some(planes16) } else { None },
         }
     }
 }

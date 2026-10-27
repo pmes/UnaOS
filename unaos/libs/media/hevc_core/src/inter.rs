@@ -518,7 +518,7 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
             for i in 0..cw {
                 let (px, py) = ((cx + i) as usize, (cy + j) as usize);
                 if px < plane.w && py < plane.h {
-                    plane.set(px, py, out[(j * cw + i) as usize].clamp(0, max) as u8);
+                    plane.set(px, py, out[(j * cw + i) as usize].clamp(0, max) as u16);
                 }
             }
         }
