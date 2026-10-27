@@ -502,7 +502,7 @@ impl FrameBuffer {
         if end <= byte_offset {
             return;
         }
-        crate::arch::flush_framebuffer_range(self.base + byte_offset, end - byte_offset);
+        crate::arch::flush_framebuffer_range(self.base + byte_offset, end - byte_offset); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::flushed(self.base, byte_offset, end - byte_offset); // ZOOMFLUSH (B859): a flush of the lens's RAM frame names its rows to the lens (`zoom::flushed`, zoom.rs tail). LINE-NEUTRAL fold, code first.
     }
 
     /// COMPOSITE-2 — make CPU writes to the pixel RECT `[x, x+w) x [y, y+h)` visible to a
@@ -539,7 +539,7 @@ impl FrameBuffer {
         // question at this seam is "is this scan-out non-coherent", a CAPABILITY, and `video/mod.rs`
         // calls an arch gate in the experience layer a defect. Kept at nine lines: this file rides
         // the knob-off kernel8.img whose byte-identity is a standing proof (PARITY.md 5.3).
-        crate::arch::flush_framebuffer_rows(self.base + off, row_len, rows, stride_b);
+        crate::arch::flush_framebuffer_rows(self.base + off, row_len, rows, stride_b); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::flushed_rows(self.base, y, rows); // ZOOMFLUSH (B859): the rect's rows named to the lens when this is its RAM frame (`zoom::flushed_rows`, zoom.rs tail). LINE-NEUTRAL fold, code first.
     }
 
     /// Flush the whole framebuffer to RAM. Used by the boot console (`fbcon`), which pokes scattered

@@ -196,7 +196,7 @@ fn band_run(job: &BandJob) {
         }
         let span_start = (y0 * c.stride + d.x0) * c.bpp;
         let span_end = ((y1 - 1) * c.stride + d.x1) * c.bpp;
-        c.front.flush_range(span_start, span_end - span_start); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::note_drawn(y0, y1 - y0, super::zoom::SRC_SCREEN); // ZOOMFURN (B848): this band's rect rows named to the lens after the copy. ⚠ LINE-NEUTRAL fold, code first.
+        c.front.flush_range(span_start, span_end - span_start); // ZOOMFLUSH (B859): this flush names the band's rows to the lens (`zoom::flushed`); ZOOMFURN's note here retired.
     }
 }
 
@@ -2053,7 +2053,7 @@ impl Screen {
             // on cache-coherent targets (x86, and QEMU which models no caches).
             let span_start = (d.y0 * stride + d.x0) * bpp;
             let span_end = ((y1 - 1) * stride + x1) * bpp;
-            self.front.flush_range(span_start, span_end - span_start); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::note_drawn(d.y0, y1 - d.y0, super::zoom::SRC_SCREEN); // ZOOMFURN (B848): the rect's rows named to the lens after its copy (`zoom::screen_front` no longer owes a whole present). ⚠ LINE-NEUTRAL fold, code first.
+            self.front.flush_range(span_start, span_end - span_start); // ZOOMFLUSH (B859): this flush names the rect's rows to the lens (`zoom::flushed`); ZOOMFURN's note here retired.
         }
         self.last_flush_bytes = flushed;
         // PTRREPAINT — THE ABSORB, and it is the half that keeps the withheld copy honest.

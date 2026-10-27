@@ -32036,7 +32036,7 @@ fn present_drain() -> Option<bool> {
 fn drain_present_once() -> bool {
     #[cfg(feature = "witness")]
     let c2_t0 = crate::arch::now_cycles();
-    shadow_track();
+    let dm_t0 = crate::arch::now_cycles(); shadow_track(); // DRAINMETER (B859): the drain present's cost opens here, closes at `perfhud::drain_present`. LINE-NEUTRAL fold, code first.
     let mut disturbed = false;
     match super::panel_snapshot() {
         Some(fb) => {
@@ -32062,7 +32062,7 @@ fn drain_present_once() -> bool {
         c2_t1: crate::arch::now_cycles(),
     });
     super::zoom::on_damage(dirty);
-    pass_owed_redrive();
+    pass_owed_redrive(); super::perfhud::drain_present(dm_t0); // DRAINMETER (B859): the drain present's sample beside the HUD's frame-time ring (perfhud.rs tail). LINE-NEUTRAL fold, code first.
     true
 }
 
@@ -32217,5 +32217,22 @@ fn pool_trim() {
         TRIM_STAGE.fetch_add(stage as u64, Relaxed);
         TRIM_SHADOW.fetch_add(shadow as u64, Relaxed);
         serial_println!("[memline] trim stage={} shadow={} live={} pooled={}", stage, shadow, live, pooled);
+    }
+}
+
+// SVCREDRIVE (rmbp-ledger B859; BP-video-11) — TAIL-APPENDED so no line above moves. A one-pass holder (IRQs masked, or the
+// device-service core) runs no re-run round and no lost-wakeup re-acquire, so the `COMP_PENDING` it leaves (a declined
+// pass, or `pass_owed_redrive`'s owed erase boxes) had only the event-driven `service_damage` as taker and the idle seat's
+// carry as backstop. The device-service lane (`desktop_uefi::desktop_app_service`, ahead of `shimmer_idle`) now re-drives
+// it at its next iteration through its own one-pass shape, `present_drain` (the gate CAS, the PENDING swap, the whole pass
+// when pending, the declines it already makes: a masked service core, a pump step, a held gate). One load per lane pass
+// when nothing is owed.
+
+/// The device-service lane's re-drive of a standing `COMP_PENDING` (SVCREDRIVE B859): `present_drain` when the gate is free.
+#[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))]
+pub fn svc_redrive() {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed};
+    if COMP_PENDING.load(Acquire) && !COMP_GATE.load(Relaxed) {
+        let _ = present_drain();
     }
 }

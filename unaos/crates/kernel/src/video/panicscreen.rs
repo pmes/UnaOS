@@ -164,7 +164,7 @@ pub fn capture(args: fmt::Arguments) {
 }
 
 /// `fbcon::panic_screen` after its fill: the plain screen, from the panel handle fbcon already holds.
-pub fn draw_panic(fb: &FrameBuffer) {
+pub fn draw_panic(fb: &FrameBuffer) { let fb = &super::zoom::panic_glass(*fb); // ZOOMPANIC (B859): under a live lens, the lens's REAL panel (and the lens stopped), lock-free — never the RAM frame nothing presents. LINE-NEUTRAL fold, code first.
     if let Some(mut p) = PANEL.try_lock() {
         *p = Some(*fb);
     }
