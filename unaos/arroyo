@@ -3980,16 +3980,17 @@ _sb_fetch_why() { # dir url rev step tool… — why a fetch-then-build product 
     if [ -d "$d/.git" ] && [ "$(git -C "$d" rev-parse HEAD 2>/dev/null)" = "$r" ]; then echo "build failed $st"; else echo "fetch failed $u"; fi
 }
 _sb_kat_why() { # binary — a freestanding KAT: gcc absent, the gcc build, or the host-kernel run
-    _sb_missing gcc && return 0
-    if [ -x "$1" ]; then echo "host proof failed (the KAT's own fail line: run $1 on the host)"; else echo "build failed gcc -static -nostdlib"; fi
+    _lnx_why && return 0   # LNXCROSS (B1012): the host toolchain pick's refusal (on linux exactly `_sb_missing gcc`)
+    if [ -x "$1" ]; then echo "host proof failed (the KAT's own fail line: run $1 on the host)"; else echo "build failed $_LNX_CC -static -nostdlib"; fi
 }
 build_selfbuild_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c"
     mkdir -p "$sb"
+    _lnx_pick   # LNXCROSS (B1012): the Linux-target cc/ld/strip for this host, probed once, one [selfbuild] line
     cp "$c/hello.c" "${WORKSPACE_DIR}/target/HELLO.C"
     rm -f "$sb/SYSKAT.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -o "$sb/SYSKAT.LNX" "$c/syskat.c" \
-        && "$sb/SYSKAT.LNX" >/dev/null; then
+    if _lnx_kat "$sb/SYSKAT.LNX" "$c/syskat.c" \
+        && { _lnx_deferred 1 SYSKAT.LNX || "$sb/SYSKAT.LNX" >/dev/null; }; then
         cp "$sb/SYSKAT.LNX" "${WORKSPACE_DIR}/target/SYSKAT.LNX"
     else
         _sb_skip 1 SYSKAT.LNX "$(_sb_kat_why "$sb/SYSKAT.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT.LNX"
@@ -3998,8 +3999,8 @@ build_selfbuild_x86() {
     # fallocate/flock, socketpair, sendfile, one signal through rt_sigreturn. Proven on the host kernel (args: a file, its size,
     # a scratch path — UnaOS passes /apps/HELLO.C, the size its loader sees, <home>/kat2.tmp) before it is staged.
     rm -f "$sb/SYSKAT2.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT2.LNX" "$c/syskat2.c" \
-        && "$sb/SYSKAT2.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; then
+    if _lnx_kat "$sb/SYSKAT2.LNX" "$c/syskat2.c" -mno-red-zone \
+        && { _lnx_deferred 2 SYSKAT2.LNX || "$sb/SYSKAT2.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; }; then
         cp "$sb/SYSKAT2.LNX" "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
     else
         _sb_skip 2 SYSKAT2.LNX "$(_sb_kat_why "$sb/SYSKAT2.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
@@ -4009,7 +4010,7 @@ build_selfbuild_x86() {
     local lib="${WORKSPACE_DIR}/target/LIB"
     if [ ! -f "$lib/libc.a" ]; then
         if _selfbuild_fetch "$sb/musl" "$SELFBUILD_MUSL_URL" "$SELFBUILD_MUSL_REV" \
-            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC=gcc CFLAGS="-O2" >/dev/null && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
+            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC="$_LNX_CC" "${_LNX_TOOLS[@]}" CFLAGS="-O2" >/dev/null && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
             rm -rf "$lib" && mkdir -p "$lib/include" "$lib/tcc/include" \
                 && cp "$sb/musl-out/lib/crt1.o" "$sb/musl-out/lib/crti.o" "$sb/musl-out/lib/crtn.o" "$sb/musl-out/lib/libc.a" "$lib/" \
                 && cp -r "$sb/musl-out/include/." "$lib/include/" \
@@ -4021,12 +4022,13 @@ build_selfbuild_x86() {
     # SELFBUILD1 tcc; SELFBUILD3 configures its search paths onto the volume: tccdir /lib/tcc ({B}), crt + libs {B}/.. = /lib,
     # headers {B}/../include (musl) then {B}/include (tcc's own) — so on UnaOS a bare `TCC.LNX -static -o prog prog.c` links musl, and
     # on the host `-B target/LIB/tcc` points the SAME binary at the staged tree (the host proof below). Rebuilt when LIB lacks libtcc1.a.
-    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; } || LC_ALL=C grep -a -q -F /apps/LIB/tcc "${WORKSPACE_DIR}/target/TCC.LNX"; then  # ROOTDISK (B390, R94): a TCC.LNX configured for /apps/LIB is rebuilt for /lib
+    if ! _lnx_hostruns 1; then :   # LNXCROSS (B1012): a darwin host cannot run TCC.LNX (libtcc1.a, the LIB proof): TCC.LNX + LIB refused by name
+    elif [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; } || LC_ALL=C grep -a -q -F /apps/LIB/tcc "${WORKSPACE_DIR}/target/TCC.LNX"; then  # ROOTDISK (B390, R94): a TCC.LNX configured for /apps/LIB is rebuilt for /lib
         if _selfbuild_fetch "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" \
-            && ( cd "$sb/tinycc" && ./configure --cc=gcc --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" \
+            && ( cd "$sb/tinycc" && ./configure --cc="$_LNX_CC" --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" \
                    --tccdir=/lib/tcc --crtprefix='{B}/..' --libpaths='{B}:{B}/..' --sysincludepaths='{B}/../include:{B}/include' --config-musl >/dev/null \
                  && make -s tcc >/dev/null 2>&1 ); then
-            strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
+            _lnx_strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
             if [ -f "$lib/libc.a" ]; then
                 cp "$sb/tinycc/include/"*.h "$lib/tcc/include/" \
                     && ( cd "$sb/tinycc" && rm -f libtcc1.a && make -s libtcc1.a XFLAGS="-B$lib/tcc" >/dev/null 2>&1; [ -f libtcc1.a ] ) \
@@ -4034,7 +4036,7 @@ build_selfbuild_x86() {
                     || { _sb_skip 3 LIB "build failed tinycc libtcc1.a against the staged musl"; rm -rf "$lib"; }
             fi
         else
-            _sb_skip 1 TCC.LNX "$(_sb_fetch_why "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" "tinycc configure/make" make gcc strip)"
+            _sb_skip 1 TCC.LNX "$(_sb_fetch_why "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" "tinycc configure/make" make "${_LNX_CC%% *}" "$_LNX_STRIP")"
         fi
     fi
     # SELFBUILD3 host proof: the staged TCC.LNX compiles PRINTF.C against the staged musl and the output prints, or LIB is not staged.
@@ -4050,13 +4052,14 @@ build_selfbuild_x86() {
     # SELFBUILD3: the lazy-memory KAT (mmap of files private/shared, 256 MiB anon touched sparsely + mincore, PROT_NONE, brk 128 MiB,
     # madvise), proven on the host kernel before it is staged.
     rm -f "$sb/SYSKAT3.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT3.LNX" "$c/syskat3.c" \
-        && "$sb/SYSKAT3.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; then
+    if _lnx_kat "$sb/SYSKAT3.LNX" "$c/syskat3.c" -mno-red-zone \
+        && { _lnx_deferred 3 SYSKAT3.LNX || "$sb/SYSKAT3.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; }; then
         cp "$sb/SYSKAT3.LNX" "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     else
         _sb_skip 3 SYSKAT3.LNX "$(_sb_kat_why "$sb/SYSKAT3.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     fi
-    if [ ! -f "${WORKSPACE_DIR}/target/PROBE.LNX" ]; then
+    if ! _lnx_hostruns probe; then :   # LNXCROSS (B1012): busybox via the gcc driver (libc + libgcc): PROBE.LNX refused by name on darwin
+    elif [ ! -f "${WORKSPACE_DIR}/target/PROBE.LNX" ]; then
         if _selfbuild_fetch "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" \
             && ( cd "$sb/busybox" && make -s defconfig >/dev/null 2>&1 \
                  && sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/; s/^# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/; s/^# CONFIG_FEATURE_PREFER_APPLETS is not set/CONFIG_FEATURE_PREFER_APPLETS=y/' .config \
@@ -4087,8 +4090,8 @@ build_selfbuild4_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
     mkdir -p "$sb"
     rm -f "$sb/SYSKAT4.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT4.LNX" "$c/syskat4.c" \
-        && "$sb/SYSKAT4.LNX" "$sb/kat4.tmp" | grep -q "^syskat4 ok cow=ok cow_kernel=ok cow_prot=ok shared_fork=ok exec_lazy=ok sigbus=ok "; then
+    if _lnx_kat "$sb/SYSKAT4.LNX" "$c/syskat4.c" -mno-red-zone \
+        && { _lnx_deferred 4 SYSKAT4.LNX || "$sb/SYSKAT4.LNX" "$sb/kat4.tmp" | grep -q "^syskat4 ok cow=ok cow_kernel=ok cow_prot=ok shared_fork=ok exec_lazy=ok sigbus=ok "; }; then
         cp "$sb/SYSKAT4.LNX" "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
     else
         _sb_skip 4 SYSKAT4.LNX "$(_sb_kat_why "$sb/SYSKAT4.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
@@ -4097,13 +4100,13 @@ build_selfbuild4_x86() {
         || rustup +nightly target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
     local bin="$sb/rust/x86_64-unknown-linux-musl/release/rust-probe"
     rm -f "$bin"
-    if ( cd "$rs" && CARGO_TARGET_DIR="$sb/rust" cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
+    if ( cd "$rs" && _lnx_cargoenv && CARGO_TARGET_DIR="$sb/rust" cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
         && [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" = "2" ] \
-        && "$bin" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; then
-        strip -o "${WORKSPACE_DIR}/target/RUST.LNX" "$bin"
+        && { _lnx_deferred 4 RUST.LNX || "$bin" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; }; then
+        _lnx_strip -o "${WORKSPACE_DIR}/target/RUST.LNX" "$bin"
     else
         local why4
-        if why4="$(_sb_missing strip)"; then :
+        if why4="$(_sb_missing "$_LNX_STRIP")"; then :
         elif [ ! -f "$(_sb_musl_selfc)/libc.a" ]; then why4="musl target missing (rustup +nightly target add x86_64-unknown-linux-musl refused)"
         elif [ ! -f "$bin" ]; then why4="build failed cargo crates/user-linux-rust --target x86_64-unknown-linux-musl"
         elif [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" != "2" ]; then why4="build failed not ET_EXEC"
@@ -4133,8 +4136,8 @@ build_selfbuild5_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
     mkdir -p "$sb"
     rm -f "$sb/SYSKAT5.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT5.LNX" "$c/syskat5.c" \
-        && "$sb/SYSKAT5.LNX" | grep -q "^syskat5 ok grow=ok move=ok fixed=ok dontunmap=ok errors=ok altstack=ok small=ok "; then
+    if _lnx_kat "$sb/SYSKAT5.LNX" "$c/syskat5.c" -mno-red-zone \
+        && { _lnx_deferred 5 SYSKAT5.LNX || "$sb/SYSKAT5.LNX" | grep -q "^syskat5 ok grow=ok move=ok fixed=ok dontunmap=ok errors=ok altstack=ok small=ok "; }; then
         cp "$sb/SYSKAT5.LNX" "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
     else
         _sb_skip 5 SYSKAT5.LNX "$(_sb_kat_why "$sb/SYSKAT5.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
@@ -15054,6 +15057,62 @@ _rustc_floor() {
     if [[ "$have" < "$floor" ]]; then
         echo -e "${COLOR_RED}❌ TOOLCHAIN: nightly ${have} is older than ${floor} — run: rustup update nightly (B1011)${COLOR_RESET}"; return 1
     fi
+    return 0
+}
+
+
+# LNXCROSS (B1012, flight 38's medium gap): the Linux-target toolchain build_selfbuild_x86 and build_selfbuild4/5_x86 compile, link
+# and strip with. Linux host: gcc / strip — every argv byte-equal to the pre-LNXCROSS lines, so the staged .LNX files and the
+# `SELFBUILD1: sha256` lines are unchanged. Darwin host (a Mac bench): Apple clang cross-targets x86_64-unknown-linux-musl and links
+# through the Rust toolchain's own ld.lld wrapper (lib/rustlib/<host>/bin/gcc-ld/ld.lld; llvm-strip / llvm-ar from llvm-tools) — no
+# Homebrew. A Mac cannot RUN a Linux ELF, so each host proof is DEFERRED to the card's BOOTLIST row (said on its own line), and the
+# products whose build itself runs a Linux ELF on the host are refused by name: TCC.LNX + LIB (tinycc builds libtcc1.a with itself;
+# the LIB proof runs TCC.LNX: TCC-DARWIN-CROSS owed), PROBE.LNX (busybox links libc + libgcc through the gcc driver; no linux
+# builtins archive on a stock Mac: PROBE-DARWIN-CROSS owed). LLD.LNX, LIB/rust, LIB/dyn, LIB/rustc stay Linux-host products.
+_lnx_pick() {
+    [ -n "${_LNX_HOST:-}" ] && return 0
+    local tb why=""
+    if [ "$(uname -s)" = "Darwin" ]; then
+        _LNX_HOST=darwin
+        tb="$(rustc +nightly --print sysroot 2>/dev/null)/lib/rustlib/$(rustc +nightly -vV 2>/dev/null | awk '/host/{print $2}')/bin"
+        if [ -x "$tb/gcc-ld/ld.lld" ]; then _LNX_LD="$tb/gcc-ld/ld.lld"; else _LNX_LD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"; fi
+        if [ -x "$tb/llvm-strip" ]; then _LNX_STRIP="$tb/llvm-strip"; else _LNX_STRIP="$(command -v llvm-strip 2>/dev/null || echo llvm-strip)"; fi
+        _LNX_CC="clang --target=x86_64-unknown-linux-musl -fuse-ld=lld --ld-path=$_LNX_LD"
+        _LNX_TOOLS=("AR=$tb/llvm-ar" "RANLIB=$tb/llvm-ar s")
+        if ! command -v clang >/dev/null 2>&1; then why="missing tool: clang (xcode-select --install)"
+        elif ! command -v "$_LNX_LD" >/dev/null 2>&1; then why="missing tool: ld.lld (the Rust toolchain's gcc-ld/ld.lld)"
+        elif ! command -v "$_LNX_STRIP" >/dev/null 2>&1 || [ ! -x "$tb/llvm-ar" ]; then why="missing tool: llvm-strip/llvm-ar (rustup component add llvm-tools)"; fi
+    else
+        _LNX_HOST=linux _LNX_CC=gcc _LNX_LD=gcc _LNX_STRIP=strip
+        _LNX_TOOLS=()
+        why="$(_sb_missing gcc strip || true)"
+    fi
+    _LNX_WHY="$why"
+    echo "   [selfbuild] host=$_LNX_HOST cc=${_LNX_CC%% *} ld=$_LNX_LD strip=$_LNX_STRIP -> ${why:+REFUSED why=}${why:-ok}"
+}
+_lnx_why() { # prints why the Linux-target toolchain is absent and succeeds; fails silently when it is present (linux: `_sb_missing gcc`)
+    if [ "${_LNX_HOST:-linux}" = "linux" ]; then _sb_missing gcc; return; fi
+    [ -n "${_LNX_WHY:-}" ] && { echo "$_LNX_WHY"; return 0; }; return 1
+}
+_lnx_kat() { # out src [extra flag…] — a freestanding static KAT (no libc, no libgcc): the ONE copy of the flag string
+    $_LNX_CC -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin "${@:3}" -o "$1" "$2"
+}
+_lnx_strip() { "$_LNX_STRIP" "$@"; }
+_lnx_deferred() { # n product — linux: fails silently (the host proof runs as before); darwin: says the proof is the card's and succeeds
+    [ "${_LNX_HOST:-linux}" = "darwin" ] || return 1
+    echo "   SELFBUILD$1: $2 host proof deferred (host=darwin: a Linux ELF does not run here; the card's BOOTLIST row runs it)"
+}
+_lnx_hostruns() { # 1|probe — linux: succeeds; darwin: refuses the products whose BUILD runs a Linux ELF on the host, by name, and fails
+    [ "${_LNX_HOST:-linux}" = "darwin" ] || return 0
+    case "$1" in
+        1) _sb_skip 1 TCC.LNX "host=darwin: tinycc builds libtcc1.a with the fresh TCC.LNX and the LIB proof runs it (TCC-DARWIN-CROSS owed)"
+           [ -d "${WORKSPACE_DIR}/target/LIB" ] && { _sb_skip 3 LIB "needs TCC.LNX (host=darwin, TCC-DARWIN-CROSS owed)"; rm -rf "${WORKSPACE_DIR}/target/LIB"; } ;;
+        probe) _sb_skip 1 PROBE.LNX "host=darwin: busybox links libc + libgcc through the gcc driver (PROBE-DARWIN-CROSS owed)" ;;
+    esac
+    return 1
+}
+_lnx_cargoenv() { # darwin: the musl target's linker is the Rust toolchain's ld.lld (rustc infers the ld.lld flavour from its name); linux: no-op
+    [ "${_LNX_HOST:-linux}" = "darwin" ] && export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$_LNX_LD"
     return 0
 }
 
