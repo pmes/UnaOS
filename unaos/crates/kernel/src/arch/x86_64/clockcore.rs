@@ -180,7 +180,7 @@ pub fn mask_exit(tok: (u64, u32), site: &'static Location<'static>) {
     let span = tsc_global().saturating_sub(t0);
     if span > THRESH.load(Relaxed) {
         if MASKED_MAX.fetch_max(span, Relaxed) < span { MAX_WHO.note(crate::arch::sched::current_name(), site); } // HIDSTALLMASKSCOPE (B1019): the max names its holder (the masking task is current here)
-        name_once(site, span, cpu, false);
+        name_once(site, span, cpu, false); site_tally(site, span); // MASKCENSUS (B1028): every span over 10 ms counted by its SEEN slot (tail); the live scan below is not counted (one span, many scans)
     }
 }
 
@@ -363,7 +363,7 @@ pub fn selftest() {
         cores.len(),
         SKEW_MAX.load(Relaxed),
         if pass { "PASS" } else { "FAIL" }
-    );
+    ); census_say(); // MASKCENSUS (B1028): the SEEN sites' counts and sums, ONE line after the verdict (verdict unchanged; tail)
     crate::tests::tally(pass);
 }
 
@@ -372,3 +372,47 @@ pub fn selftest() {
 // one. The max's own `fetch_max` winner (`mask_exit`, `isr_tick`'s live scan) now writes this record, `hidstall`'s ONE
 // `MaskWho` type: `masked_by=<task>@<file>:<line>` on the CLOCKCORE line (`?` when another core's tick saw it).
 static MAX_WHO: crate::hidstall::MaskWho = crate::hidstall::MaskWho::new();
+
+// ── MASKCENSUS (rmbp-ledger B1028) — SEEN counts every span, not only the first. FILE-TAIL append. ─────────────────────────
+// `name_once` prints a site once; the distribution (how many spans per site, their sum) is what the next flight reads.
+// SEEN's slots are extended in place by two parallel arrays indexed by the same slot: `mask_exit` (the span's own end, its
+// core, still masked: atomics only) adds the span; a site that found SEEN full lands in `other`. `isr_tick`'s live scan
+// is not counted (it re-sees one span every 50 ms). `tests clock` prints the top-5 by sum through `hidstall::SiteTop`,
+// the ONE top-k formatter: `[clockcore] masked sites n=<k> other=<n>x<ms> over_ms=10 top=<file>:<line>:<n>x<sum_ms>,…`.
+static SEEN_CNT: [AtomicU32; SEEN_CAP] = [const { AtomicU32::new(0) }; SEEN_CAP];
+static SEEN_SUM: [AtomicU64; SEEN_CAP] = [const { AtomicU64::new(0) }; SEEN_CAP];
+static OTHER_CNT: AtomicU32 = AtomicU32::new(0);
+static OTHER_SUM: AtomicU64 = AtomicU64::new(0);
+
+/// One masked span over 10 ms (`span` cycles) at `site`, after `name_once` claimed its slot (if SEEN had room).
+#[inline]
+fn site_tally(site: &'static Location<'static>, span: u64) {
+    let p = site as *const _ as *mut Location<'static>;
+    for (i, slot) in SEEN.iter().enumerate() {
+        if slot.load(Acquire) == p {
+            SEEN_CNT[i].fetch_add(1, Relaxed);
+            SEEN_SUM[i].fetch_add(span, Relaxed);
+            return;
+        }
+    }
+    OTHER_CNT.fetch_add(1, Relaxed);
+    OTHER_SUM.fetch_add(span, Relaxed);
+}
+
+/// `tests clock`: the SEEN sites by count and sum (ms), ONE line after the CLOCKCORE verdict.
+fn census_say() {
+    let hz = crate::arch::apic::tsc_hz().max(1);
+    let mut top = crate::hidstall::SiteTop::new(5, false);
+    for (i, slot) in SEEN.iter().enumerate() {
+        let p = slot.load(Acquire);
+        if !p.is_null() {
+            top.offer(p as usize, SEEN_CNT[i].load(Relaxed), SEEN_SUM[i].load(Relaxed).saturating_mul(1000) / hz, 0);
+        }
+    }
+    top.set_other(OTHER_CNT.load(Relaxed), OTHER_SUM.load(Relaxed).saturating_mul(1000) / hz);
+    let (on, os) = top.other();
+    serial_println!(
+        "[clockcore] masked sites n={} other={}x{} over_ms=10 top={} (MASKCENSUS B1028: every IRQ-masked section over 10 ms by its mask site, <n>x<sum_ms>, top-5 by sum)",
+        top.sites(), on, os, top
+    );
+}

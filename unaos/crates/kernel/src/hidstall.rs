@@ -152,7 +152,7 @@ pub fn now_us() -> u64 {
 pub fn note_masked(ms: u64, site: &'static core::panic::Location<'static>) {
     masked_into(&SEC_MASKED_MS, &SEC_MASKED_WHO, ms, site);
     masked_into(&MASKED_MAX_MS, &MASKED_MAX_WHO, ms, site);
-    SCOPE_MASKED_MS.fetch_max(ms, Relaxed); // REGISTRYCHUNK (B508): the scoped max ([`scope_masked_take`])
+    SCOPE_MASKED_MS.fetch_max(ms, Relaxed); masked_into(&SCOPE_BY_MS, &SCOPE_MASKED_WHO, ms, site); MASK_SITES.note(ms, site); // REGISTRYCHUNK (B508): the scoped max ([`scope_masked_take`]); MASKCENSUS (B1028): its holder on the printing line's cadence ([`scope_masked_by`]) and every span's site ([`MaskSites`]), tail
 }
 
 /// The second's longest masked UnaFS span and its holder, taken (reset) at `lag`'s roll (who first: a winner between the two is the next second's).
@@ -200,7 +200,7 @@ fn selftest() {
         if verdict(h, s, k) { "PASS" } else { "FAIL" }, HID_GAP_STALL_MS, KEY_QUEUE_BOUND_MS, DOCK_RELEASE_TIMEOUT_MS,
         holders_seen(), session_worst().1, HolderName(session_worst().0), RELEASES_WAITED.load(Relaxed), LANE_MAX_MS.load(Relaxed), CpuWord(pump_cpu()),
         HID_STALL_HELD_S.load(Relaxed), STALL_GAP_MAX_MS.load(Relaxed), DOCK_HELD.load(Relaxed), TIMEOUT_RELEASE_MS.load(Relaxed), DOCK_UNDECODED.load(Relaxed), FrPlace
-    ); maskscope_kat(); // HIDSTALLMASKSCOPE (B1019): the masked-max holder KAT, `:: MASKSCOPE:` (LINE-NEUTRAL fold, code first; body at the tail)
+    ); mask_sites_say(); maskscope_kat(); // HIDSTALLMASKSCOPE (B1019): the masked-max holder KAT, `:: MASKSCOPE:` (LINE-NEUTRAL fold, code first; body at the tail); MASKCENSUS (B1028): the boot site table's ONE line first
 }
 
 /// REGISTRYCHUNK (rmbp-ledger B508): the longest masked UnaFS span on ANY core since the last take — a step reads
@@ -630,7 +630,7 @@ impl MaskWho {
 }
 
 /// A [`MaskWho`] snapshot: `masked_by=<task>@<file>:<line>` (`?` for no task, `-` for no record).
-pub struct MaskedBy {
+#[derive(Clone, Copy)] pub struct MaskedBy { // MASKCENSUS (B1028): Copy (three plain usizes) so login's `Done` (Copy) carries one; same-line token
     name_p: usize,
     name_l: usize,
     site: usize,
@@ -700,10 +700,11 @@ fn maskscope_kat() {
     let (line, ms) = (line!(), kat_hold(&KAT_MAX, &KAT_WHO, 30));
     let by = KAT_WHO.read(false);
     let site_ok = by.site().is_some_and(|l| l.file() == file!() && l.line() == line);
-    let pass = me.is_some() && by.name() == me && site_ok && ms >= 29 && KAT_MAX.load(Relaxed) == ms;
+    let (sites, top_ok, sums_ok, roll_ok) = masksites_kat(); // MASKCENSUS (B1028): the site table's leg, on its own instance (tail)
+    let pass = me.is_some() && by.name() == me && site_ok && ms >= 29 && KAT_MAX.load(Relaxed) == ms && sites == 2 && top_ok && sums_ok && roll_ok;
     serial_println!(
-        ":: MASKSCOPE: who={} ms={} -> {} :: task={} site_ok={} boot_by={}",
-        by, ms, if pass { "PASS" } else { "FAIL" }, me.unwrap_or("?"), site_ok as u8, masked_by()
+        ":: MASKSCOPE: who={} ms={} -> {} :: task={} site_ok={} sites={} top_ok={} sums_ok={} roll_ok={} boot_by={}",
+        by, ms, if pass { "PASS" } else { "FAIL" }, me.unwrap_or("?"), site_ok as u8, sites, top_ok as u8, sums_ok as u8, roll_ok as u8, masked_by()
     );
     crate::tests::tally(pass);
 }
@@ -745,4 +746,284 @@ pub fn pump_here() {
             was, cpu
         );
     }
+}
+
+// ── MASKCENSUS (rmbp-ledger B1028) — every masked span's SITE, counted; the scoped max's holder. FILE-TAIL append. ──────────
+// HIDSTALLMASKSCOPE (B1019) named only the MAX; flight 38's `hid_stall_s=5` came from many 65-129 ms spans, not one.
+// [`MaskSites`] counts every span [`note_masked`] sees by its site (`with_unafs`'s `#[track_caller]` caller): per second for
+// the `[lag] stall` line's `masked_sites=` (top-3 by the second's sum) and boot-long for `[hidstall] masked sites` after the
+// HIDSTALL verdict (top-5 by sum; the verdict itself is at its 25-field cap). A key is claimed once by CAS (0 -> the
+// `&'static Location`) and never freed; the counters are independent atomics, so there is no lock and nothing is skipped — a
+// reader may see a span's `n` before its `sum` (one span skew, benign). A full table counts `other`. Cost per span: <= 16
+// relaxed loads, one CAS on a site's first span, five RMW atomics; per second, one 16-slot scan in `lag`'s roll.
+// [`SiteTop`] is the ONE top-k formatter (clockcore's `[clockcore] masked sites` line offers its SEEN rows to it).
+// The SCOPE holder: `scope_masked_take`'s max is reset per transaction (assoc's group sizing needs that), so the holder rides
+// a second max on the PRINTING line's cadence, [`scope_masked_by`] — the third [`MaskWho`]. The scope is global (any core):
+// an overlapping login submit and registry build share it, as `SCOPE_MASKED_MS` already does.
+
+const MASK_SITES_N: usize = 16;
+const SITE_TOP_N: usize = 5;
+
+/// A fixed 16-site table of masked spans: key = a `&'static Location` (0 = free), boot-long (n, sum, max) and the
+/// second's (n, sum), plus the overflow row `other`.
+pub(crate) struct MaskSites {
+    site: [AtomicUsize; MASK_SITES_N],
+    n: [AtomicU32; MASK_SITES_N],
+    sum: [AtomicU64; MASK_SITES_N],
+    max: [AtomicU64; MASK_SITES_N],
+    sec_n: [AtomicU32; MASK_SITES_N],
+    sec_sum: [AtomicU64; MASK_SITES_N],
+    other_n: AtomicU32,
+    other_sum: AtomicU64,
+    sec_other_n: AtomicU32,
+    sec_other_sum: AtomicU64,
+}
+
+impl MaskSites {
+    pub(crate) const fn new() -> Self {
+        MaskSites {
+            site: [const { AtomicUsize::new(0) }; MASK_SITES_N],
+            n: [const { AtomicU32::new(0) }; MASK_SITES_N],
+            sum: [const { AtomicU64::new(0) }; MASK_SITES_N],
+            max: [const { AtomicU64::new(0) }; MASK_SITES_N],
+            sec_n: [const { AtomicU32::new(0) }; MASK_SITES_N],
+            sec_sum: [const { AtomicU64::new(0) }; MASK_SITES_N],
+            other_n: AtomicU32::new(0),
+            other_sum: AtomicU64::new(0),
+            sec_other_n: AtomicU32::new(0),
+            sec_other_sum: AtomicU64::new(0),
+        }
+    }
+
+    /// The slot keyed `p`, claimed by CAS when first seen (`None` = the table is full).
+    fn slot(&self, p: usize) -> Option<usize> {
+        for (i, k) in self.site.iter().enumerate() {
+            let cur = k.load(Acquire);
+            if cur == p {
+                return Some(i);
+            }
+            if cur == 0 {
+                match k.compare_exchange(0, p, core::sync::atomic::Ordering::AcqRel, Acquire) {
+                    Ok(_) => return Some(i),
+                    Err(now) if now == p => return Some(i),
+                    Err(_) => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// One masked span of `ms` at `site`. Atomics only (any core, right after the span).
+    pub(crate) fn note(&self, ms: u64, site: &'static core::panic::Location<'static>) {
+        match self.slot(site as *const core::panic::Location<'static> as usize) {
+            Some(i) => {
+                self.n[i].fetch_add(1, Relaxed);
+                self.sum[i].fetch_add(ms, Relaxed);
+                self.max[i].fetch_max(ms, Relaxed);
+                self.sec_n[i].fetch_add(1, Relaxed);
+                self.sec_sum[i].fetch_add(ms, Relaxed);
+            }
+            None => {
+                self.other_n.fetch_add(1, Relaxed);
+                self.other_sum.fetch_add(ms, Relaxed);
+                self.sec_other_n.fetch_add(1, Relaxed);
+                self.sec_other_sum.fetch_add(ms, Relaxed);
+            }
+        }
+    }
+
+    /// The second's top-3 by sum, its counters taken (reset) — `lag`'s roll, every second.
+    pub(crate) fn take_sec(&self) -> SiteTop {
+        let mut t = SiteTop::new(3, false);
+        for (i, k) in self.site.iter().enumerate() {
+            let p = k.load(Acquire);
+            if p == 0 {
+                continue;
+            }
+            let n = self.sec_n[i].swap(0, Relaxed);
+            let sum = self.sec_sum[i].swap(0, Relaxed);
+            t.offer(p, n, sum, 0);
+        }
+        t.set_other(self.sec_other_n.swap(0, Relaxed), self.sec_other_sum.swap(0, Relaxed));
+        t
+    }
+
+    /// The boot-long top-5 by sum, with each site's max.
+    pub(crate) fn boot(&self) -> SiteTop {
+        let mut t = SiteTop::new(SITE_TOP_N, true);
+        for (i, k) in self.site.iter().enumerate() {
+            let p = k.load(Acquire);
+            if p != 0 {
+                t.offer(p, self.n[i].load(Relaxed), self.sum[i].load(Relaxed), self.max[i].load(Relaxed));
+            }
+        }
+        t.set_other(self.other_n.load(Relaxed), self.other_sum.load(Relaxed));
+        t
+    }
+
+    /// Empty the table (the KAT's own instance only: no writer runs beside it).
+    fn clear(&self) {
+        for i in 0..MASK_SITES_N {
+            self.site[i].store(0, Relaxed);
+            self.n[i].store(0, Relaxed);
+            self.sum[i].store(0, Relaxed);
+            self.max[i].store(0, Relaxed);
+            self.sec_n[i].store(0, Relaxed);
+            self.sec_sum[i].store(0, Relaxed);
+        }
+        self.other_n.store(0, Relaxed);
+        self.other_sum.store(0, Relaxed);
+        self.sec_other_n.store(0, Relaxed);
+        self.sec_other_sum.store(0, Relaxed);
+    }
+}
+
+/// The top sites by sum: `<file>:<line>:<n>x<sum_ms>[/<max_ms>],…` (`-` for none). Entries are
+/// `(&'static Location as usize, n, sum_ms, max_ms)`, sorted by sum (the earlier offer first on a tie).
+#[derive(Clone, Copy)]
+pub struct SiteTop {
+    e: [(usize, u32, u64, u64); SITE_TOP_N],
+    cap: usize,
+    with_max: bool,
+    k: u32,
+    other: (u32, u64),
+}
+
+impl SiteTop {
+    /// Keep the top `cap` (at most 5); `with_max` prints `/<max_ms>` per site.
+    pub const fn new(cap: usize, with_max: bool) -> Self {
+        SiteTop { e: [(0, 0, 0, 0); SITE_TOP_N], cap: if cap < SITE_TOP_N { cap } else { SITE_TOP_N }, with_max, k: 0, other: (0, 0) }
+    }
+
+    /// Offer one site (`site` = a `&'static Location` as usize); a site with no span is not counted.
+    pub fn offer(&mut self, site: usize, n: u32, sum_ms: u64, max_ms: u64) {
+        if site == 0 || n == 0 {
+            return;
+        }
+        self.k += 1;
+        let mut i = self.cap;
+        while i > 0 && (self.e[i - 1].0 == 0 || self.e[i - 1].2 < sum_ms) {
+            i -= 1;
+        }
+        if i >= self.cap {
+            return;
+        }
+        let mut j = self.cap - 1;
+        while j > i {
+            self.e[j] = self.e[j - 1];
+            j -= 1;
+        }
+        self.e[i] = (site, n, sum_ms, max_ms);
+    }
+
+    /// The overflow row (spans whose site found the table full).
+    pub fn set_other(&mut self, n: u32, sum_ms: u64) {
+        self.other = (n, sum_ms);
+    }
+
+    /// `(n, sum_ms)` of the overflow row.
+    pub fn other(&self) -> (u32, u64) {
+        self.other
+    }
+
+    /// Sites with a span (all offered, not only the kept top).
+    pub fn sites(&self) -> u32 {
+        self.k
+    }
+
+    /// The kept entry `i` (`(0, 0, 0, 0)` past the end).
+    pub fn entry(&self, i: usize) -> (usize, u32, u64, u64) {
+        if i < self.cap { self.e[i] } else { (0, 0, 0, 0) }
+    }
+
+    /// The kept entry for `site`: `(n, sum_ms, max_ms)`.
+    pub fn find(&self, site: usize) -> Option<(u32, u64, u64)> {
+        self.e[..self.cap].iter().find(|e| e.0 == site && site != 0).map(|e| (e.1, e.2, e.3))
+    }
+
+    /// Printed only when `on` (else `-`): the stall line's `masked_sites=` below `STALL_MS` of masked time.
+    pub fn when(mut self, on: bool) -> Self {
+        if !on {
+            self.e = [(0, 0, 0, 0); SITE_TOP_N];
+            self.k = 0;
+        }
+        self
+    }
+}
+
+impl core::fmt::Display for SiteTop {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut said = false;
+        for &(p, n, sum, max) in self.e[..self.cap].iter() {
+            if p == 0 {
+                continue;
+            }
+            // SAFETY: every key is a `&'static Location` (from `#[track_caller]` / `Location::caller`), stored whole.
+            let l: &'static core::panic::Location<'static> = unsafe { &*(p as *const core::panic::Location<'static>) };
+            let file = l.file();
+            if said {
+                f.write_str(",")?;
+            }
+            write!(f, "{}:{}:{}x{}", file.rsplit('/').next().unwrap_or(file), l.line(), n, sum)?;
+            if self.with_max {
+                write!(f, "/{}", max)?;
+            }
+            said = true;
+        }
+        if !said {
+            f.write_str("-")?;
+        }
+        Ok(())
+    }
+}
+
+/// The boot's masked-span site table ([`note_masked`]).
+static MASK_SITES: MaskSites = MaskSites::new();
+
+/// The second's top-3 masked sites, taken at `lag`'s roll (every second, printed or not).
+pub fn take_sec_sites() -> SiteTop {
+    MASK_SITES.take_sec()
+}
+
+/// The SCOPE holder: the largest scoped span since the last [`scope_masked_by`], and who held it.
+static SCOPE_BY_MS: AtomicU64 = AtomicU64::new(0);
+static SCOPE_MASKED_WHO: MaskWho = MaskWho::new();
+
+/// The holder of the largest masked UnaFS span (any core) since the previous call, reset (who first: a winner between
+/// the two is the next window's). A reader calls it once where its printed max's window opens and once where it closes.
+pub fn scope_masked_by() -> MaskedBy {
+    let by = SCOPE_MASKED_WHO.read(true);
+    SCOPE_BY_MS.swap(0, Relaxed);
+    by
+}
+
+/// `tests hidstall`: the boot site table, ONE line after the HIDSTALL verdict.
+fn mask_sites_say() {
+    let t = MASK_SITES.boot();
+    let (on, os) = t.other();
+    serial_println!(
+        "[hidstall] masked sites n={} other={}x{} top={} (MASKCENSUS B1028: every masked UnaFS span by its with_unafs caller, boot-long, <n>x<sum_ms>/<max_ms>, top-5 by sum)",
+        t.sites(), on, os, t
+    );
+}
+
+/// The MASKSCOPE leg's site check, on the KAT's OWN table (a fixture never feeds the boot table, B1008): two SYNTHETIC
+/// spans' worth of sites (A: one 20 ms span; B: 4 + 5 ms) — no extra IRQ mask, `kat_hold` already drives the masked path.
+/// `(sites, top_ok, sums_ok, roll_ok)`: top = A then B by sum; sums = each site's (n, sum, max); roll = the per-second
+/// take returns both and a second take is empty while the boot counts stay.
+fn masksites_kat() -> (u32, bool, bool, bool) {
+    static KAT_SITES: MaskSites = MaskSites::new();
+    KAT_SITES.clear();
+    let a: &'static core::panic::Location<'static> = core::panic::Location::caller();
+    let b: &'static core::panic::Location<'static> = core::panic::Location::caller();
+    KAT_SITES.note(20, a);
+    KAT_SITES.note(4, b);
+    KAT_SITES.note(5, b);
+    let (pa, pb) = (a as *const core::panic::Location<'static> as usize, b as *const core::panic::Location<'static> as usize);
+    let boot = KAT_SITES.boot();
+    let top_ok = pa != pb && boot.entry(0).0 == pa && boot.entry(1).0 == pb;
+    let sums_ok = boot.find(pa) == Some((1, 20, 20)) && boot.find(pb) == Some((2, 9, 5));
+    let (s1, s2) = (KAT_SITES.take_sec(), KAT_SITES.take_sec());
+    let roll_ok = s1.sites() == 2 && s1.entry(0).0 == pa && s1.find(pb).map(|e| (e.0, e.1)) == Some((2, 9)) && s2.sites() == 0 && KAT_SITES.boot().sites() == 2;
+    (boot.sites(), top_ok, sums_ok, roll_ok)
 }
