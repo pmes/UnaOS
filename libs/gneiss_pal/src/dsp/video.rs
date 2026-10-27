@@ -20,6 +20,10 @@
 
 use super::demux::{Codec, Packet, Track};
 use super::demux::build::TestPatternPacket;
+// AV1COLOURONE (SR340): COLOURONE's kernel lives in yuv_core (no_std, no alloc, zero deps), shared with av1_core.
+use yuv_core::{Chroma, Matrix, Picture, KR_KB_601, KR_KB_709};
+#[cfg(test)]
+use yuv_core::coeffs as yuv_coeffs;
 
 /// Decoded pixels: packed 8-bit RGBA, or planar 8-bit 4:2:0 YCbCr (what an AV1 decoder emits), or planar 4:2:0 YCbCr
 /// above 8 bits (COLOURONE SR328: `I420Hi`, a Main10 picture's samples as decoded, `bit_depth` 9..16).
@@ -44,89 +48,45 @@ impl Frame {
     /// [`Frame::to_rgba_colour`] uses (COLOURONE SR328); at 8 bits its derived table is the historical 298 / 409 / 100 /
     /// 208 / 516 at >> 8, so every caller is byte-identical.
     pub fn to_rgba(&self) -> Vec<u8> {
-        self.yuv_rgba(KR_KB_601, false)
+        self.yuv_rgba(Matrix::Kr(KR_KB_601), false)
     }
 
     /// COLOURONE (LEDGER SR328): packed RGBA converted by the source's colour (`Track::colour`, NLEPROBEHDR SR226) —
-    /// H.273 MatrixCoefficients 1 BT.709, 4 FCC, 5 / 6 BT.601, 7 SMPTE 240M, 9 BT.2020 non-constant-luminance; any other
-    /// matrix (2 unspecified, 0 identity, 8 YCgCo, 10 BT.2020 constant-luminance, reserved) and `None` take the size
+    /// H.273 MatrixCoefficients 1 BT.709, 4 FCC, 5 / 6 BT.601, 7 SMPTE 240M, 9 BT.2020 non-constant-luminance, 0 identity
+    /// (GBR) and 8 YCgCo (MATRIX-MORE, AV1COLOURONE SR340); any other matrix (2 unspecified, 10 BT.2020
+    /// constant-luminance, reserved) and `None` take the size
     /// default, BT.601 below HD and BT.709 when the frame is at least 1280 wide or 720 high (the industry default for
     /// untagged video, as ffmpeg's swscale and the browsers do). `full_range == Some(true)` is full range, anything else
     /// limited. Integer only: a sample above 8 bits (`Pixels::I420Hi`) is narrowed to 8 inside the one rounded multiply,
-    /// after the conversion (no dither). No tone mapping: a PQ / HLG picture keeps its transfer.
+    /// after the conversion (no dither: `yuv_core::to_rgba`'s `dither` is false here). No tone mapping: a PQ / HLG picture
+    /// keeps its transfer. The kernel is `yuv_core`'s (AV1COLOURONE SR340), the one av1_core converts with.
     pub fn to_rgba_colour(&self, colour: Option<&super::demux::colour::Colour>) -> Vec<u8> {
         let hd = self.width >= 1280 || self.height >= 720;
-        let kk = match colour.map(|c| c.matrix) {
-            Some(1) => KR_KB_709,
-            Some(4) => (3000, 1100),
-            Some(5 | 6) => KR_KB_601,
-            Some(7) => (2120, 870),
-            Some(9) => (2627, 593),
-            _ if hd => KR_KB_709,
-            _ => KR_KB_601,
+        let m = match colour.map(|c| c.matrix) {
+            Some(0) => Matrix::Identity,
+            Some(8) => Matrix::YCgCo,
+            mc => Matrix::Kr(mc.and_then(yuv_core::kr_kb).unwrap_or(if hd { KR_KB_709 } else { KR_KB_601 })),
         };
-        self.yuv_rgba(kk, colour.is_some_and(|c| c.full_range == Some(true)))
+        self.yuv_rgba(m, colour.is_some_and(|c| c.full_range == Some(true)))
     }
 
-    fn yuv_rgba(&self, kk: (i64, i64), full: bool) -> Vec<u8> {
+    /// The one kernel at 4:2:0, nearest chroma (the 2x2 block), no dither: COLOURONE's bytes.
+    fn yuv_rgba(&self, m: Matrix, full: bool) -> Vec<u8> {
         let (w, h) = (self.width as usize, self.height as usize);
+        let mut out = vec![0u8; w * h * 4];
         match &self.pixels {
-            Pixels::Rgba(p) => p.clone(),
-            Pixels::I420 { y, u, v, y_stride, uv_stride } => yuv_to_rgba(w, h, [&y[..], &u[..], &v[..]], *y_stride, *uv_stride, yuv_coeffs(kk, full, 8)),
+            Pixels::Rgba(p) => return p.clone(),
+            Pixels::I420 { y, u, v, y_stride, uv_stride } => {
+                let p = Picture { w, h, y: &y[..], u: &u[..], v: &v[..], y_stride: *y_stride, uv_stride: *uv_stride, ss: (1, 1), mono: false, bit_depth: 8, full };
+                yuv_core::to_rgba(&p, m, Chroma::Nearest, false, &mut out);
+            }
             Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth } => {
-                yuv_to_rgba(w, h, [&y[..], &u[..], &v[..]], *y_stride, *uv_stride, yuv_coeffs(kk, full, *bit_depth as u32))
+                let p = Picture { w, h, y: &y[..], u: &u[..], v: &v[..], y_stride: *y_stride, uv_stride: *uv_stride, ss: (1, 1), mono: false, bit_depth: *bit_depth as u32, full };
+                yuv_core::to_rgba(&p, m, Chroma::Nearest, false, &mut out);
             }
         }
+        out
     }
-}
-
-/// COLOURONE (SR328): (Kr, Kb) x 10000 of BT.601 and BT.709 (H.273 Table 4).
-const KR_KB_601: (i64, i64) = (2990, 1140);
-const KR_KB_709: (i64, i64) = (2126, 722);
-
-/// COLOURONE (SR328): the integer YCbCr -> RGB coefficients of one matrix, range and sample depth `n`:
-/// `(shift, [yc, rv, gu, gv, bu], y_offset, c_offset)`. Shift 8 at 8 bits (the historical precision), 16 above; each
-/// coefficient rounded half up from the exact rational: yc = 255 / ys, rv = 2(1-Kr) / cs, bu = 2(1-Kb) / cs,
-/// gu = 2Kb(1-Kb) / (Kg cs), gv = 2Kr(1-Kr) / (Kg cs), with ys = 219 << (n-8), cs = 224 << (n-8) limited and
-/// ys = cs = 2^n - 1 full. The 255 maps every depth straight to 8-bit output.
-fn yuv_coeffs((kr, kb): (i64, i64), full: bool, n: u32) -> (u32, [i32; 5], i32, i32) {
-    let s = if n <= 8 { 8 } else { 16 };
-    let (ys, cs) = if full { (((1i64 << n) - 1), ((1i64 << n) - 1)) } else { (219i64 << (n - 8), 224i64 << (n - 8)) };
-    let rnd = |a: i64, b: i64| ((2 * a + b) / (2 * b)) as i32;
-    let kg = 10000 - kr - kb;
-    let c = [
-        rnd(255 << s, ys),
-        rnd(2 * (10000 - kr) * (255 << s), 10000 * cs),
-        rnd(2 * kb * (10000 - kb) * (255 << s), 10000 * kg * cs),
-        rnd(2 * kr * (10000 - kr) * (255 << s), 10000 * kg * cs),
-        rnd(2 * (10000 - kb) * (255 << s), 10000 * cs),
-    ];
-    let (yoff, coff) = if full { (0, 1i32 << (n - 1)) } else { (16i32 << (n - 8), 128i32 << (n - 8)) };
-    (s, c, yoff, coff)
-}
-
-/// COLOURONE (SR328): the ONE YCbCr 4:2:0 -> RGBA loop, 8-bit or deeper planes, coefficients from [`yuv_coeffs`].
-fn yuv_to_rgba<T: Copy + Into<i32>>(w: usize, h: usize, [y, u, v]: [&[T]; 3], y_stride: usize, uv_stride: usize, k: (u32, [i32; 5], i32, i32)) -> Vec<u8> {
-    let (s, [yc, rv, gu, gv, bu], yoff, coff) = k;
-    let half = 1i32 << (s - 1);
-    let mut out = vec![0u8; w * h * 4];
-    for row in 0..h {
-        for col in 0..w {
-            let yy = y[row * y_stride + col].into() - yoff;
-            let cb = u[(row / 2) * uv_stride + col / 2].into() - coff;
-            let cr = v[(row / 2) * uv_stride + col / 2].into() - coff;
-            let c = yc * yy + half;
-            let r = (c + rv * cr) >> s;
-            let g = (c - gu * cb - gv * cr) >> s;
-            let b = (c + bu * cb) >> s;
-            let o = (row * w + col) * 4;
-            out[o] = r.clamp(0, 255) as u8;
-            out[o + 1] = g.clamp(0, 255) as u8;
-            out[o + 2] = b.clamp(0, 255) as u8;
-            out[o + 3] = 255;
-        }
-    }
-    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

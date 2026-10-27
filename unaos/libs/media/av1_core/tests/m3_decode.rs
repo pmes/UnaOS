@@ -8,7 +8,7 @@
 //! see docs/dev/evidence/media-1004/AVCODEC.md for the per-vector PSNR table. A change that moves
 //! one of these hashes has changed decoded pixels and must be re-proven against the oracle.
 mod common;
-use av1_core::image::{planes_to_rgba, Filters, Upsampling};
+use av1_core::image::{planes_to_rgba, planes_to_rgba_with, Conversion, Filters, Upsampling};
 use common::{avif_planes, fetch, fnv64};
 
 /// name, width, height, bit depth, FNV-1a 64 of Y‖U‖V.
@@ -84,4 +84,62 @@ fn stream_decoder_matches_the_still_path() {
     // A second unit through the same decoder (state carried) decodes identically.
     let p2 = d.decode_temporal_unit(&item.data).unwrap();
     assert_eq!(fnv64(&[&p2.y, &p2.u, &p2.v]), pin.4);
+}
+
+// AV1COLOURONE (LEDGER SR340): planes_to_rgba runs Stria's ONE integer kernel (yuv_core), the one gneiss_pal's
+// `Frame::to_rgba_colour` runs: the same planes give COLOURONE's (SR328) hand-computed answers.
+fn planes(w: u32, h: u32, n: u32, (ss_x, ss_y): (u32, u32), mono: bool, (y, u, v): (Vec<u16>, Vec<u16>, Vec<u16>), mc: u8, full: bool) -> av1_core::image::Planes {
+    av1_core::image::Planes {
+        width: w,
+        height: h,
+        bit_depth: n,
+        mono,
+        ss_x,
+        ss_y,
+        y,
+        u,
+        v,
+        color_primaries: 2,
+        transfer_characteristics: 2,
+        matrix_coefficients: mc,
+        full_range: full,
+        seq: Default::default(),
+        frame: Default::default(),
+        stats: Default::default(),
+    }
+}
+
+#[test]
+fn colourone_av1_planes_convert_as_gneiss_pal_does() {
+    // 8-bit BT.709 limited Y 120 Cb 140 Cr 100 -> (71, 133, 146); 10-bit BT.2020 limited Y 400 Cb 600 Cr 300 -> (9, 128, 145):
+    // gneiss_pal video.rs `colourone_hand_computed_samples`, the same planes through av1_core.
+    let p8 = planes(2, 2, 8, (1, 1), false, (vec![120; 4], vec![140], vec![100]), 1, false);
+    let p10 = planes(2, 2, 10, (1, 1), false, (vec![400; 4], vec![600], vec![300]), 9, false);
+    for up in [Upsampling::Nearest, Upsampling::Bilinear] {
+        assert_eq!(planes_to_rgba(&p8, up).rgba[..4], [71, 133, 146, 255], "{up:?}");
+        assert_eq!(planes_to_rgba(&p10, up).rgba[..4], [9, 128, 145, 255], "{up:?}");
+    }
+    // The stills convention is unchanged: 2 (unspecified) is BT.601 -> (76, 139, 145), 10 is BT.2020's Kr / Kb.
+    let p2 = planes(2, 2, 8, (1, 1), false, (vec![120; 4], vec![140], vec![100]), 2, false);
+    assert_eq!(planes_to_rgba(&p2, Upsampling::Nearest).rgba[..3], [76, 139, 145]);
+    let p10cl = planes(2, 2, 10, (1, 1), false, (vec![400; 4], vec![600], vec![300]), 10, false);
+    assert_eq!(planes_to_rgba(&p10cl, Upsampling::Nearest).rgba[..3], [9, 128, 145]);
+}
+
+#[test]
+fn colourone_av1_bilinear_mono_and_the_libyuv_oracle() {
+    // 4x2 8-bit 4:2:0 BT.709 limited, Y 120, Cb (100, 180), Cr 128: bilinear 9-3-3-1 gives Cb 100 / 120 / 160 / 180 per column.
+    let p = planes(4, 2, 8, (1, 1), false, (vec![120; 8], vec![100, 180], vec![128; 2]), 1, false);
+    let img = planes_to_rgba(&p, Upsampling::Bilinear);
+    let want = [[121, 127, 62], [121, 123, 104], [121, 114, 189], [121, 110, 231]];
+    for (col, w) in want.iter().enumerate() {
+        assert_eq!(img.rgba[col * 4..][..3], w[..], "col {col}");
+    }
+    // Monochrome 10-bit limited Y 502 is grey 127 (no chroma planes).
+    let m = planes(2, 2, 10, (1, 1), true, (vec![502; 4], vec![], vec![]), 1, false);
+    assert_eq!(planes_to_rgba(&m, Upsampling::Bilinear).rgba[..4], [127, 127, 127, 255]);
+    // ORACLE ONLY: libyuv's quantised chroma (BT.2020 Cb -> B capped at 128/64 in 8-bit units) through the same loop.
+    let o = planes(2, 2, 8, (1, 1), false, (vec![120; 4], vec![170], vec![128]), 9, false);
+    assert_eq!(planes_to_rgba_with(&o, Upsampling::Nearest, Conversion::Exact).rgba[..3], [121, 113, 211]);
+    assert_eq!(planes_to_rgba_with(&o, Upsampling::Nearest, Conversion::Libyuv).rgba[..3], [121, 113, 205]);
 }

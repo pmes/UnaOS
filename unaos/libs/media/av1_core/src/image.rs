@@ -477,23 +477,11 @@ pub enum Upsampling {
     Bilinear,
 }
 
-/// Kr, Kb for a matrix_coefficients value (H.273); identity returns None.
-fn kr_kb(mc: u8) -> Option<(f64, f64)> {
-    match mc {
-        0 => None,
-        1 => Some((0.2126, 0.0722)),
-        4 => Some((0.30, 0.11)),
-        5 | 6 | 2 => Some((0.299, 0.114)), // 2 = unspecified: BT.601 like libavif
-        7 => Some((0.212, 0.087)),
-        9 | 10 => Some((0.2627, 0.0593)),
-        _ => Some((0.299, 0.114)),
-    }
-}
-
 /// How the Y'CbCr → R'G'B' matrix is evaluated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Conversion {
-    /// The H.273 equations in floating point (what the AVIF still path, gneiss_pal `decode_heif`, uses).
+    /// The H.273 equations through Stria's ONE integer kernel, `yuv_core::to_rgba` (AV1COLOURONE SR340; what the AVIF
+    /// still path, gneiss_pal `decode_heif`, the host Player and the kernel Player use).
     Exact,
     /// ORACLE ONLY: the same equations with the chroma coefficients quantised the way libyuv
     /// (Chromium's converter) stores them — 6 fractional bits in an int8, so a coefficient above
@@ -503,119 +491,65 @@ pub enum Conversion {
     Libyuv,
 }
 
-/// Convert planes to 8-bit RGBA (H.273 equations, floating point).
+/// Convert planes to 8-bit RGBA (H.273 equations, Stria's one integer kernel).
 pub fn planes_to_rgba(p: &Planes, up: Upsampling) -> Image {
     planes_to_rgba_with(p, up, Conversion::Exact)
 }
 
-/// Convert planes to 8-bit RGBA with an explicit [`Conversion`].
+/// Convert planes to 8-bit RGBA with an explicit [`Conversion`]. AV1COLOURONE (LEDGER SR340): the f64 converter retired
+/// onto `yuv_core::to_rgba`, the kernel gneiss_pal's `Frame::to_rgba_colour` runs. The matrix pick is the stills
+/// convention, unchanged: 0 identity (GBR), 8 YCgCo (MATRIX-MORE; before SR340 it fell to BT.601), 10 (BT.2020
+/// constant-luminance) as BT.2020's Kr / Kb, 2 (unspecified) and every matrix without a stated Kr / Kb BT.601 (as libavif).
 pub fn planes_to_rgba_with(p: &Planes, up: Upsampling, conv: Conversion) -> Image {
+    use yuv_core::{Chroma, Matrix, Picture};
     let (w, h) = (p.width as usize, p.height as usize);
-    let maxv = ((1u32 << p.bit_depth) - 1) as f64;
-    let half = (1u32 << (p.bit_depth - 1)) as f64;
-    let scale = (1u32 << (p.bit_depth - 8)) as f64;
-    let cw = p.chroma_width() as usize;
-    let ch = p.chroma_height() as usize;
-    let mut rgba = vec![0u8; w * h * 4];
-    let chroma = |plane: &[u16], x: usize, y: usize| -> f64 {
-        if p.ss_x == 0 && p.ss_y == 0 {
-            return plane[y * cw + x] as f64;
-        }
-        match up {
-            Upsampling::Nearest => plane[(y >> p.ss_y) * cw + (x >> p.ss_x)] as f64,
-            Upsampling::Bilinear => {
-                // position of luma sample in chroma coordinates (centre siting)
-                let fx = if p.ss_x != 0 { (x as f64 - 0.5) / 2.0 } else { x as f64 };
-                let fy = if p.ss_y != 0 { (y as f64 - 0.5) / 2.0 } else { y as f64 };
-                let x0 = libm_floor(fx);
-                let y0 = libm_floor(fy);
-                let ax = fx - x0;
-                let ay = fy - y0;
-                let g = |xx: f64, yy: f64| -> f64 {
-                    let xi = (xx as isize).clamp(0, cw as isize - 1) as usize;
-                    let yi = (yy as isize).clamp(0, ch as isize - 1) as usize;
-                    plane[yi * cw + xi] as f64
-                };
-                let a = g(x0, y0) * (1.0 - ax) + g(x0 + 1.0, y0) * ax;
-                let b = g(x0, y0 + 1.0) * (1.0 - ax) + g(x0 + 1.0, y0 + 1.0) * ax;
-                a * (1.0 - ay) + b * ay
+    let m = match p.matrix_coefficients {
+        0 => Matrix::Identity,
+        8 => Matrix::YCgCo,
+        mc => {
+            let kk = yuv_core::kr_kb(if mc == 10 { 9 } else { mc }).unwrap_or(yuv_core::KR_KB_601);
+            match conv {
+                Conversion::Exact => Matrix::Kr(kk),
+                Conversion::Libyuv => Matrix::Table(libyuv_coeffs(kk, p.full_range, p.bit_depth)),
             }
         }
     };
-    let kk = kr_kb(p.matrix_coefficients);
-    for y in 0..h {
-        for x in 0..w {
-            let yv = p.y[y * w + x] as f64;
-            let (r, g, b);
-            if p.mono {
-                let l = if p.full_range { yv / maxv } else { (yv - 16.0 * scale) / (219.0 * scale) };
-                r = l;
-                g = l;
-                b = l;
-            } else {
-                let u = chroma(&p.u, x, y);
-                let v = chroma(&p.v, x, y);
-                match kk {
-                    None => {
-                        // identity (GBR)
-                        let n = |c: f64| if p.full_range { c / maxv } else { (c - 16.0 * scale) / (219.0 * scale) };
-                        g = n(yv);
-                        b = n(u);
-                        r = n(v);
-                    }
-                    Some((kr, kb)) => {
-                        let (yy, cb, cr) = if p.full_range {
-                            (yv / maxv, (u - half) / maxv, (v - half) / maxv)
-                        } else {
-                            ((yv - 16.0 * scale) / (219.0 * scale), (u - half) / (224.0 * scale), (v - half) / (224.0 * scale))
-                        };
-                        let kg = 1.0 - kr - kb;
-                        // R = Y + a*Cr, G = Y - b*Cb - c*Cr, B = Y + d*Cb
-                        let mut a = 2.0 - 2.0 * kr;
-                        let mut d = 2.0 - 2.0 * kb;
-                        let mut bb = kb * d / kg;
-                        let mut c = kr * a / kg;
-                        if conv == Conversion::Libyuv {
-                            // coefficients in 8-bit sample units, 6 fractional bits, int8 storage
-                            let unit = if p.full_range { 1.0 } else { 255.0 / 224.0 };
-                            let qz = |x: f64| -> f64 {
-                                let v = libm_floor(x * unit * 64.0 + 0.5).min(128.0);
-                                v / 64.0 / unit
-                            };
-                            a = qz(a);
-                            d = qz(d);
-                            bb = qz(bb);
-                            c = qz(c);
-                        }
-                        r = yy + a * cr;
-                        b = yy + d * cb;
-                        g = yy - bb * cb - c * cr;
-                    }
-                }
-            }
-            let q = |c: f64| -> u8 {
-                let v = c * 255.0 + 0.5;
-                if v <= 0.0 {
-                    0
-                } else if v >= 255.0 {
-                    255
-                } else {
-                    v as u8
-                }
-            };
-            let o = (y * w + x) * 4;
-            rgba[o] = q(r);
-            rgba[o + 1] = q(g);
-            rgba[o + 2] = q(b);
-            rgba[o + 3] = 255;
-        }
-    }
+    let pic = Picture {
+        w,
+        h,
+        y: &p.y,
+        u: &p.u,
+        v: &p.v,
+        y_stride: w,
+        uv_stride: p.chroma_width() as usize,
+        ss: (p.ss_x, p.ss_y),
+        mono: p.mono,
+        bit_depth: p.bit_depth,
+        full: p.full_range,
+    };
+    let chroma = match up {
+        Upsampling::Nearest => Chroma::Nearest,
+        Upsampling::Bilinear => Chroma::Bilinear,
+    };
+    let mut rgba = vec![0u8; w * h * 4];
+    yuv_core::to_rgba(&pic, m, chroma, false, &mut rgba);
     Image { w: p.width, h: p.height, rgba }
 }
 
-fn libm_floor(x: f64) -> f64 {
-    let t = x as i64 as f64;
-    if t > x { t - 1.0 } else { t }
+/// ORACLE ONLY ([`Conversion::Libyuv`]): `yuv_core::coeffs` with the four chroma coefficients quantised as libyuv stores
+/// them — q = round(x · unit · 64) capped at 128, unit 255 / 224 limited and 1 full, in 8-bit sample units — then
+/// rescaled to the kernel's shift: limited q << (s - 6 - (n - 8)), full round(q · 255 · 2^s / (64 (2^n - 1))). Luma stays exact.
+fn libyuv_coeffs((kr, kb): (i64, i64), full: bool, n: u32) -> yuv_core::Coeffs {
+    let (s, [yc, _, _, _, _], yoff, coff) = yuv_core::coeffs((kr, kb), full, n);
+    let rnd = |a: i64, b: i64| (2 * a + b) / (2 * b);
+    let kg = 10000 - kr - kb;
+    // Each coefficient as (numerator, denominator) of x, then q.
+    let (num_den, unit) = ([(2 * (10000 - kr), 10000), (2 * kb * (10000 - kb), 10000 * kg), (2 * kr * (10000 - kr), 10000 * kg), (2 * (10000 - kb), 10000)], if full { (1, 1) } else { (255, 224) });
+    let c = num_den.map(|(a, b)| {
+        let q = rnd(a * unit.0 * 64, b * unit.1).min(128);
+        (if full { rnd(q * (255 << s), 64 * ((1i64 << n) - 1)) } else { q << (s - 6 - (n - 8)) }) as i32
+    });
+    (s, [yc, c[0], c[1], c[2], c[3]], yoff, coff)
 }
 
 /// DEMUXSEEK (LEDGER SR200): the reorder depth of an AV1 track from its AV1CodecConfigurationRecord (`av1C`, Matroska

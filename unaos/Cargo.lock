@@ -17,6 +17,9 @@ dependencies = [
 [[package]]
 name = "av1_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "bit_field"
@@ -616,6 +619,10 @@ checksum = "18245fcbb8b3de8dd198ce7944fdd4096986fd6cd306b0fcfa27df817bd545d6"
 dependencies = [
  "zero",
 ]
+
+[[package]]
+name = "yuv_core"
+version = "0.1.0"
 
 [[package]]
 name = "zero"

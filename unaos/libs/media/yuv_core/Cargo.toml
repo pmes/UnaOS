@@ -1,0 +1,11 @@
+[package]
+name = "yuv_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "AV1COLOURONE (SR340): Stria's ONE integer YCbCr -> RGB kernel — linked by gneiss_pal, av1_core and (through av1_core) the kernel."
+
+# AV1COLOURONE (ledger SR340): `#![no_std]`, no `alloc`, `#![forbid(unsafe_code)]` and NO dependencies — the caller owns
+# the RGBA buffer, so a Ring 0 link pays nothing but the loop. COLOURONE's (SR328) `yuv_coeffs` / `yuv_to_rgba` moved
+# here from gneiss_pal's `dsp/video.rs`; av1_core's f64 converter retired onto it.
+[dependencies]

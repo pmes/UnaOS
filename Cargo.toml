@@ -45,6 +45,7 @@ members = [
     "unaos/libs/media/probe_core", # REALSENSE (SR92, R112): Sonde's probe core — frames (Z16/Y8/Y16/YUY2), depth model, IMU samples; no_std, both rings
     "unaos/libs/media/vp8_core",
     "unaos/libs/media/av1_core",
+    "unaos/libs/media/yuv_core", # AV1COLOURONE (SR340): Stria's ONE integer YCbCr->RGB kernel (gneiss_pal, av1_core, the kernel through av1_core); no_std, no alloc, zero deps
     "unaos/libs/media/vp9_core", # VP9CORE (SR116): the from-spec VP9 decoder (profiles 0 and 2) Stria links beside vp8_core; no_std, zero deps
     "unaos/libs/media/h264_core", # H264CORE (SR133): the from-spec H.264/AVC decoder (Baseline/Main/High 8-bit 4:2:0) Stria links beside vp9_core; no_std, zero deps
     "unaos/libs/media/h264enc_core", # H264ENC (SR197): the Constrained Baseline H.264 encoder (CAVLC, I + integer-pel P) over h264_core's inverse side; no_std, Stria's export core

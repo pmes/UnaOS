@@ -16,24 +16,32 @@ use gneiss_pal::dsp::demux::heif::{self, Transform};
 use gneiss_pal::dsp::image::decode_heif;
 
 /// `av1_core::image::decode_avif` per vector, recorded at db1ebf8fb (HEIFONE-RETIRE SR318) before the walk retired.
+/// AV1COLOURONE (LEDGER SR340) re-pinned 15 of them: av1_core's f64 converter retired onto yuv_core's integer kernel (the
+/// one gneiss_pal's Player runs). Per-vector max |d| per channel, retired f64 vs the integer kernel on the same planes
+/// (bytes changed of total): white_1x1 0 and extended_pixi 0 (pins unchanged); colors_sdr_srgb 1 (3000 / 160000),
+/// colors_text_sdr_srgb 1 (2879 / 160000), kodim23 1 (25970 / 1572864), kodim03 1 (22629 / 1572864), fox 8bpc 4:4:4 1
+/// (32433 / 3844788), fox 10bpc 1 (2021 / 3852800), fox 8bpc mono 1 (27507 / 3852800), fox 12bpc 4:2:2 1 (10522 / 3852800),
+/// Chimera 1 (2813 / 518400), kids_720p 1 (27764 / 3686400), Irvine_CA 1 (21900 / 1228800), cosmos 4:2:0 limited 1
+/// (121869 / 7028736), cosmos 4:4:4 full 1 (95636 / 7028736), Monochrome 1 (54669 / 3686400), fruits_2layer 1
+/// (114625 / 4478976). No vector moves by more than 1.
 const OLD: &[(&str, u32, u32, u64)] = &[
     ("white_1x1", 1, 1, 0x2fa324587145aacb),
     ("extended_pixi", 4, 4, 0x0aca7e310b81f28e),
-    ("colors_sdr_srgb", 200, 200, 0xbdb5ad19b23882d6),
-    ("colors_text_sdr_srgb", 200, 200, 0xe1f173952bb6215a),
-    ("kodim23_yuv420_8bpc", 768, 512, 0x9ddd9442c70b3f2b),
-    ("kodim03_yuv420_8bpc", 768, 512, 0x2dee3d92f1a64edf),
-    ("fox.profile1.8bpc.yuv444.odd-width.odd-height", 1203, 799, 0x8ff85844492eb751),
-    ("fox.profile0.10bpc.yuv420", 1204, 800, 0xf5f3c0e83b9e9436),
-    ("fox.profile0.8bpc.yuv420.monochrome", 1204, 800, 0x4e8b17ff401a8094),
-    ("fox.profile2.12bpc.yuv422", 1204, 800, 0x2c0c11c6e444501d),
-    ("Chimera_8bit_cropped_480x256", 480, 270, 0xfda6d8f3902a16e5),
-    ("kids_720p", 1280, 720, 0xa0ef485ceba07f61),
-    ("Irvine_CA", 480, 640, 0x8a916ec574ea7656),
-    ("sdr_cosmos01000_cicp1-13-6_yuv420_limited_qp40", 2048, 858, 0xe7c743bfc5f06aed),
-    ("sdr_cosmos01000_cicp1-13-6_yuv444_full_qp40", 2048, 858, 0xc44ebd10e5f7aaa9),
-    ("Monochrome", 1280, 720, 0x6fce5b9729507a82),
-    ("fruits_2layer_thumbsize", 1296, 864, 0x55a61fdd8ee01112),
+    ("colors_sdr_srgb", 200, 200, 0xd8ac97c41cf5d126),
+    ("colors_text_sdr_srgb", 200, 200, 0x8aeb27c8f220061b),
+    ("kodim23_yuv420_8bpc", 768, 512, 0x047a07e763897181),
+    ("kodim03_yuv420_8bpc", 768, 512, 0x8b96062ff3f6bac8),
+    ("fox.profile1.8bpc.yuv444.odd-width.odd-height", 1203, 799, 0x4c98e4fdefe27d8a),
+    ("fox.profile0.10bpc.yuv420", 1204, 800, 0x358c0b81cb616093),
+    ("fox.profile0.8bpc.yuv420.monochrome", 1204, 800, 0x04a860a0f2e12ffb),
+    ("fox.profile2.12bpc.yuv422", 1204, 800, 0xc25a132280073723),
+    ("Chimera_8bit_cropped_480x256", 480, 270, 0xfd87c5346f79c9dc),
+    ("kids_720p", 1280, 720, 0xc6df8be178202bd9),
+    ("Irvine_CA", 480, 640, 0x66597fabf0fbf5b4),
+    ("sdr_cosmos01000_cicp1-13-6_yuv420_limited_qp40", 2048, 858, 0xc4c9907cbcb2f994),
+    ("sdr_cosmos01000_cicp1-13-6_yuv444_full_qp40", 2048, 858, 0x8c46d6580908b617),
+    ("Monochrome", 1280, 720, 0x69d2d41a609ad523),
+    ("fruits_2layer_thumbsize", 1296, 864, 0x0a421383ce0d627b),
 ];
 
 fn fnv(b: &[u8]) -> u64 {
