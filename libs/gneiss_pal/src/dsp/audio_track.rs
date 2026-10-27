@@ -558,25 +558,7 @@ impl AudioTrackDecoder for PcmDecoder {
         let samples = pkt
             .data
             .chunks_exact(bps)
-            .map(|c| {
-                let mut b = [0u8; 8];
-                // Normalise to little-endian in b[..bps].
-                for i in 0..bps {
-                    b[i] = if self.big_endian { c[bps - 1 - i] } else { c[i] };
-                }
-                match (self.float, self.bits) {
-                    (true, 32) => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-                    (true, _) => f64::from_le_bytes(b) as f32,
-                    // 8-bit: unsigned in Matroska/WAV convention, signed in QuickTime `twos`;
-                    // we follow the byte order flag: big-endian (twos) = signed.
-                    (false, 8) => {
-                        if self.big_endian { (b[0] as i8) as f32 / 128.0 } else { (b[0] as f32 - 128.0) / 128.0 }
-                    }
-                    (false, 16) => i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0,
-                    (false, 24) => (((b[0] as i32) | (b[1] as i32) << 8 | (b[2] as i32) << 16) << 8 >> 8) as f32 / 8_388_608.0,
-                    (false, _) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2_147_483_648.0,
-                }
-            })
+            .map(|c| ac::container::pcm_sample(c, self.bits, self.float, self.big_endian)) // NLE6MIXAUDIO (rmbp-ledger B953): the ONE byte layout, audio_core's PCM door
             .collect();
         Ok(AudioBlock { pts_ns: self.timebase.to_ns(pkt.pts), sample_rate: self.rate, channels: self.channels, samples })
     }

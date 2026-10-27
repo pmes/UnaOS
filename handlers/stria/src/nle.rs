@@ -578,7 +578,7 @@ fn mix_run(
     // NLE3b: a layer followed by another of its own track is a crossfade's UNDER layer: its own slot; a track with no
     // under layer in this run drops its under slot.
     let tracks = auds.len() / 2;
-    let under = |li: usize| run.layers.get(li + 1).is_some_and(|m| m.track == run.layers[li].track);
+    let under = |li: usize| run.under(li); // NLE6MIXAUDIO (rmbp-ledger B953): timeline_core's one slot rule
     for t in 0..tracks {
         if !(0..run.layers.len()).any(|li| under(li) && run.layers[li].track == t) {
             auds[tracks + t] = None;
@@ -607,19 +607,14 @@ fn mix_run(
 /// NLE4: add one layer into the accumulator: each sample as i16, x its gain (Q16) x its envelope (Q16, linear from
 /// `env[0]` at the run's first sample toward `env[1]` at its end edge).
 fn mix_into(acc: &mut [i64], pcm: &[f32], l: &Layer, n: i64, ch: usize) {
-    let g = gain_q16(l.gain_cdb);
+    let g = gneiss_pal::dsp::audio::ramp::gain_q16(l.gain_cdb); // NLE6MIXAUDIO (rmbp-ledger B953): audio_core's one curve
     let (e0, e1) = (l.env[0] as i64, l.env[1] as i64);
     for (j, frame) in pcm.chunks(ch).enumerate() {
-        let e = if n > 0 { e0 + (e1 - e0) * j as i64 / n } else { e0 };
+        let e = gneiss_pal::dsp::audio::ramp::at(e0, e1, j as i64, n);
         for (c, &x) in frame.iter().enumerate() {
             acc[j * ch + c] += (to_i16(x) * g * e) >> 32;
         }
     }
-}
-
-/// NLE4: a gain in centi-dB as a Q16 factor (0 cdB = 65536 exactly).
-fn gain_q16(cdb: i32) -> i64 {
-    (10f64.powf(cdb as f64 / 2000.0) * 65536.0).round() as i64
 }
 
 /// NLE4: an `f32` sample (full scale +-1) as a 16-bit value, rounded and clamped.

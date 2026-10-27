@@ -396,3 +396,13 @@ fn black_step(
     let vmix = VideoMix { kind: x.kind, src: Some(o.src), src_t, seek, t: Frac { num: k + 1, den: x.dur + 1 } };
     Ok(Step { kind: Kind::Video, track: Some(ti), src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: Some(vmix) })
 }
+
+// ── NLE6MIXAUDIO (rmbp-ledger B953): the ONE audio slot rule (Stria's render and the kernel Player's EDL feed) ──────
+
+impl AudioRun {
+    /// Layer `li` is a crossfade's UNDER layer (the outgoing at its handle): the next layer is of the same track (NLE3b's
+    /// order, under before incoming). It plays from its own decoder slot and, in the kernel, its own mixer source.
+    pub fn under(&self, li: usize) -> bool {
+        self.layers.get(li + 1).is_some_and(|m| self.layers.get(li).is_some_and(|l| m.track == l.track))
+    }
+}
