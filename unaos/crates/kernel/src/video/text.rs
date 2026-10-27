@@ -683,7 +683,7 @@ mod tt {
 
     /// GLYPHSCARD (B1010): advance the late face by ONE short VFS read of at most `chunk` bytes (LATE taken by
     /// `try_lock`: busy -> nothing). On the last chunk: take it, drop LATE, parse, add it under TT through `load`'s own path
-    /// (`add_face`, `font_bytes`, the epoch and the damage, so the windows repaint once), and say so on one line.
+    /// (`insert_face` at its table row, `font_bytes`, the epoch and the damage, so the windows repaint once), and say so on one line.
     pub fn late_pass(chunk: usize) {
         let Some(mut g) = LATE.try_lock() else { return };
         let Some(l) = g.as_mut() else { return };
@@ -721,7 +721,7 @@ mod tt {
         super::resident_note(&l.path, data);
         let added = match TT.lock().as_mut() {
             Some(t) => {
-                t.eng.add_face(l.name, Role::Script, false, f);
+                t.eng.insert_face(super::late_table_slot(&t.eng, l.name), l.name, Role::Script, false, f);
                 t.font_bytes += len;
                 let mut st = t.styles[2].0;
                 st.bold = false;
@@ -1397,11 +1397,11 @@ fn glyphs_fixture() {
         "[glyphs] pseudo labels={} expand=+40% clipped={} worst={}:\"{}\" pseudo_w={} box={} fill={}.{}%",
         boxes.len(), clipped, worst.1, worst.2, worst.3, worst.4, worst.0 / 10, worst.0 % 10
     );
-    let pass = words.iter().all(|&w| w == "ok") && notdef_all == 0 && rtl_ok && clipped == 0 && !boxes.is_empty();
+    let co = chain_order_ok(&chain); let pass = words.iter().all(|&w| w == "ok") && notdef_all == 0 && rtl_ok && clipped == 0 && !boxes.is_empty() && co;
     let tail = if pass { String::new() } else { glyphs_want_tail(&words, &names) }; // GLYPHSCARD (B1010): FAIL only; the PASS line is unchanged
     serial_println!(
-        ":: GLYPHS: arabic={} devanagari={} cjk={} thai={} notdef={} rtl={} pseudo_clipped={} -> {} ::{}",
-        words[0], words[1], words[2], words[3], notdef_all, if rtl_ok { "ok" } else { "fail" }, clipped, if pass { "PASS" } else { "FAIL" }, tail
+        ":: GLYPHS: arabic={} devanagari={} cjk={} thai={} notdef={} rtl={} pseudo_clipped={} chain_order={} -> {} ::{}",
+        words[0], words[1], words[2], words[3], notdef_all, if rtl_ok { "ok" } else { "fail" }, clipped, if co { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" }, tail
     );
 }
 
@@ -1576,4 +1576,32 @@ pub mod textscale {
         }
         None
     }
+}
+
+// ------------------------------------------------------------------------------------------------ GLYPHSCHAINORDER (B1027)
+// The file tail again (no line above moves): the late face's slot at its `tt::FACES` row, and the GLYPHS chain-order leg.
+
+/// GLYPHSCHAINORDER (rmbp-ledger B1027; BP-video-19): the slot a late face `name` takes in the engine — the count of loaded
+/// slots whose `tt::FACES` row comes before `name`'s row — so the chain keeps the table's ORDER (noto-cjk before DejaVu),
+/// never the load's arrival order. A name not in the table goes to the end.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn late_table_slot(eng: &font_core::ui::Engine<'_>, name: &str) -> usize {
+    let row = |n: &str| tt::FACES.iter().position(|r| r.1 == n);
+    let Some(at) = row(name) else { return eng.face_count() };
+    eng.slots().iter().filter(|s| row(s.name).is_some_and(|i| i < at)).count()
+}
+
+/// GLYPHSCHAINORDER (B1027): `tests glyphs`' `chain_order=` — the chain after its role primary (`chain[0]`, which may be the
+/// stand-in `dejavu-sans`) names faces in strictly rising `tt::FACES` row order; a name not in the table is out of order.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+fn chain_order_ok(chain: &[&str]) -> bool {
+    let mut last: Option<usize> = None;
+    for n in chain.iter().skip(1) {
+        let Some(i) = tt::FACES.iter().position(|r| r.1 == *n) else { return false };
+        if last.is_some_and(|l| i <= l) {
+            return false;
+        }
+        last = Some(i);
+    }
+    true
 }

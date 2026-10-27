@@ -840,3 +840,23 @@ pub static PREBLEND_LIGHT: [u8; 256] = [
     229, 230, 231, 232, 233, 234, 235, 235, 236, 237, 238, 239, 240, 240, 241, 242,
     243, 244, 244, 245, 246, 247, 248, 249, 249, 250, 251, 252, 253, 253, 254, 255,
 ];
+
+impl<'a> Engine<'a> {
+    /// GLYPHSCHAINORDER (rmbp-ledger B1027; BP-video-19): [`Engine::add_face`] at slot `at` (clamped to the end), so a face
+    /// read late joins the fallback chain at its loader-table position instead of the tail. The glyph atlases, the hinters
+    /// and the run cache key on the SLOT INDEX, so an insert that shifts slots drops them all (counted as a flush).
+    pub fn insert_face(&mut self, at: usize, name: &'static str, role: Role, bold: bool, font: Font<'a>) {
+        if self.slots.len() >= 255 {
+            return;
+        }
+        let at = at.min(self.slots.len());
+        let shifted = at < self.slots.len();
+        self.slots.insert(at, Slot { name, role, bold, font });
+        if shifted {
+            self.flush_all();
+            self.hinters.clear();
+        }
+        self.runs.clear();
+        self.run_next = 0;
+    }
+}
