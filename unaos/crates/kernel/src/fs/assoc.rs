@@ -858,7 +858,7 @@ pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
     let iow = if scoped { crate::fs::bootstep::scope_word() } else { String::from("global") };
     let sio = || if scoped { crate::fs::bootstep::scope_io() } else { crate::fs::bootstep::io() };
     let io0 = sio();
-    let _ = crate::hidstall::scope_masked_take();
+    let _ = crate::hidstall::scope_masked_take(); let _ = crate::hidstall::scope_masked_by(); // MASKCENSUS (B1028): the build's holder window opens with its masked window
     PER_TYPE_MASKED.store(0, Ordering::Relaxed); // a `set_preferred_in` seed's leftover is not this build's
     let mut masked_max = 0u64;
     let mt = crate::shell::vfs_mount_table();
@@ -867,14 +867,14 @@ pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
     let done = |masked_max: u64| { if scoped { crate::fs::bootstep::scope_disarm(); } masked_max.max(crate::hidstall::scope_masked_take()) };
     if !force && stamp_on_disk(&mt).as_deref() == Some(want.as_str()) {
         let d = sio().since(io0);
-        let mm = done(masked_max);
+        let mm = done(masked_max); let mm_by = crate::hidstall::scope_masked_by(); // MASKCENSUS (B1028): who held the build's largest masked span
         let ms = crate::arch::ms().saturating_sub(t0);
         note_cost(why, ms, d.blocks_read(), mm, false);
         if REG.swap(REG_LIVE, Ordering::AcqRel) == REG_NONE { // FILETYPES2 (B513): the stored registry is current — published
             serial_println!("[filetypes] swap registry=live on={} build_ms=0 skipped=stamp", why);
         }
-        serial_println!("[filetypes] built at={} dir={} created=0 filled=0 types={} skipped=stamp stamp=v{} blocks_read={} cmds={} ms={} io={} masked_max_ms={}",
-            why, TYPES_DIR, builtin_type_count(), BUILDER_VERSION, d.blocks_read(), d.cmds(), ms, iow, mm);
+        serial_println!("[filetypes] built at={} dir={} created=0 filled=0 types={} skipped=stamp stamp=v{} blocks_read={} cmds={} ms={} io={} masked_max_ms={} masked_by={}",
+            why, TYPES_DIR, builtin_type_count(), BUILDER_VERSION, d.blocks_read(), d.cmds(), ms, iow, mm, mm_by);
         return (0, true);
     }
     let r = seed_in(&mt);
@@ -887,7 +887,7 @@ pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
                 Err(_) => "refused",
             };
             let d = sio().since(io0);
-            let mm = done(masked_max.max(PER_TYPE_MASKED.swap(0, Ordering::Relaxed)));
+            let mm = done(masked_max.max(PER_TYPE_MASKED.swap(0, Ordering::Relaxed))); let mm_by = crate::hidstall::scope_masked_by(); // MASKCENSUS (B1028): who held the build's largest masked span
             let ms = crate::arch::ms().saturating_sub(t0);
             note_cost(why, ms, d.blocks_read(), mm, true);
             let commits = SEED_COMMITS.swap(0, Ordering::Relaxed);
@@ -896,8 +896,8 @@ pub fn build_stamped(why: &str, force: bool) -> (usize, bool) {
                 BUILD_COMMITS.store(commits as u64, Ordering::Relaxed);
             }
             crate::fs::bootstep::note_span("filetypes-build", t0, crate::arch::ms()); // SMALLFIX6 (B495): the full build's span, beside the boot steps
-            serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} stamp={} blocks_read={} cmds={} ms={} io={} masked_max_ms={}", why, TYPES_DIR, n, f,
-                known_types_in(&mt).len(), st, d.blocks_read(), d.cmds(), ms, iow, mm);
+            serial_println!("[filetypes] built at={} dir={} created={} filled={} types={} stamp={} blocks_read={} cmds={} ms={} io={} masked_max_ms={} masked_by={}", why, TYPES_DIR, n, f,
+                known_types_in(&mt).len(), st, d.blocks_read(), d.cmds(), ms, iow, mm, mm_by);
             if st == "written" {
                 // FILETYPES2 (B513): THE SWAP — every object and the stamp are on the volume; ONE Release store publishes
                 // the registry. Readers Acquire it in `reg_attr`: before it they answer from the facts, after it from the
