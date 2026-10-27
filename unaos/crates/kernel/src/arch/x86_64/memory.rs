@@ -611,7 +611,7 @@ fn slot_rec_ensure(s: usize) -> bool {
     }
     // Only the claimant of `s` (its `SLOT_USED` CAS) reaches here, so no second writer races this store.
     SLOT_MEM[s].store(p, Ordering::Release);
-    SLOT_RECORDS.fetch_add(1, Ordering::AcqRel);
+    SLOT_RECORDS.fetch_add(1, Ordering::AcqRel); #[cfg(feature = "wc")] { use crate::allocator::census::{retag, SLOT_RECORD}; retag(p as usize, SLOT_RECORD_BYTES, SLOT_RECORD); } // SLOTRECTAG (B1030, BP-cores-22): the slot pool's record, allocated once per index and never freed — `slot-record`, counted once by desktopbuild (was `task:<launcher>`). SAME-LINE fold, line-NEUTRAL
     true
 }
 

@@ -10108,7 +10108,7 @@ pub fn shell_remint(
     {
         return false;
     }
-    r.surf = surf;
+    r.surf = surf; #[cfg(all(target_arch = "x86_64", feature = "wc"))] { let _ = crate::allocator::census::retag_tracked(surf, crate::allocator::census::WINDOW_SURFACE); } // WINDOWSURFTAG (B1030): the shell's re-pointed surface is the window's (rename-only). SAME-LINE fold, line-NEUTRAL
     r.surf_len = surf_len;
     r.damage_all();
     r.presented = true;
@@ -23542,7 +23542,7 @@ fn create_inner(
     row.w = w;
     row.h = h;
     row.stride = stride;
-    row.surf = surf;
+    row.surf = surf; #[cfg(all(target_arch = "x86_64", feature = "wc"))] { let _ = crate::allocator::census::retag_tracked(surf, crate::allocator::census::WINDOW_SURFACE); } // WINDOWSURFTAG (B1030, BP-cores-22): the row's surface is the window's in the census (rename-only: a static or a slot-record interior pointer is not tracked and stays untouched). SAME-LINE fold, line-NEUTRAL
     row.surf_len = surf_len;
     row.z = z;
     row.damage_all();

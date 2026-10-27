@@ -8447,7 +8447,7 @@ fn fixture_stack_note(name: &str) {
 // (`attributed`); dropped, the row returns to where the run found it (`delta<k>` = 0); then a 128 KiB block must land
 // under the enclosing run's own `fx:memline` (`nest`: the probe's drop restored the word). x86 `wc`.
 // Wire: `[fixtureretain] top fx:<verb>:<kb>,…` · `:: FIXTURERETAIN: fixtures=<n> freed_kb=<n> once_kb=<n>
-// attributed=<y|n> nest=<ok|bad> -> PASS|FAIL :: delta1=<kb> delta2=<kb>` · `-> SKIP :: reason=<census-unarmed|alloc>`.
+// attributed=<y|n> nest=<ok|bad> surf_ok=<1|0|skip> -> PASS|FAIL :: delta1=<kb> delta2=<kb>` · `-> SKIP :: reason=<census-unarmed|alloc>`.
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 fn fixtureretain() {
     use crate::allocator::census;
@@ -8478,7 +8478,7 @@ fn fixtureretain() {
     let mut v: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     let nest = v.try_reserve_exact(NEST).is_ok() && census::snapshot().bytes_of("fx:memline", true) >= n0 + NEST as u64;
     drop(v);
-    let s = census::snapshot();
+    let s = census::snapshot(); let surf_ok = windowsurftag_leg(); // WINDOWSURFTAG (B1030): the window-surface leg (LINE-NEUTRAL append, code first; body at the file tail)
     let mut fx: [(&str, u64); census::ROWS] = [("", 0); census::ROWS];
     let mut n = 0usize;
     for r in s.rows.iter().flatten() {
@@ -8499,11 +8499,11 @@ fn fixtureretain() {
     }
     serial_println!("[fixtureretain] top {}", if top.is_empty() { "-" } else { top.as_str() });
     let freed = deltas == [0, 0];
-    let pass = attributed && nest && freed;
+    let pass = attributed && nest && freed && surf_ok != Some(false);
     serial_println!(
-        ":: FIXTURERETAIN: fixtures={} freed_kb={} once_kb={} attributed={} nest={} -> {} :: delta1={} delta2={}",
+        ":: FIXTURERETAIN: fixtures={} freed_kb={} once_kb={} attributed={} nest={} surf_ok={} -> {} :: delta1={} delta2={}",
         n, if freed { PROBE / 1024 } else { 0 }, s.bytes_of("gen7-held", true) / 1024, if attributed { "y" } else { "n" },
-        if nest { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" }, deltas[0] / 1024, deltas[1] / 1024
+        if nest { "ok" } else { "bad" }, match surf_ok { Some(true) => "1", Some(false) => "0", None => "skip" }, if pass { "PASS" } else { "FAIL" }, deltas[0] / 1024, deltas[1] / 1024
     );
 }
 
@@ -8519,4 +8519,31 @@ pub fn running_verb() -> &'static str {
         core::hint::spin_loop();
     }
     "-"
+}
+
+// ── WINDOWSURFTAG (rmbp-ledger B1030, BP-cores-22, BP-video-18) — FILE-TAIL. FIXTURERETAIN's window-surface leg ──
+// A 100 KiB surface (>= BIG, so tracked) handed to `wm::create` is renamed `window-surface` by the create seam
+// (`census::retag_tracked`); closed and dropped, the row returns to where the leg found it. `None` = no window or no
+// memory (`surf_ok=skip`, not a fail). Called from `fixtureretain` (x86 `wc`).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn windowsurftag_leg() -> Option<bool> {
+    use crate::allocator::census;
+    use crate::video::wm;
+    const SURF_OWNER: u64 = 0xF5E;
+    const SURF_WORDS: usize = 160 * 160;
+    let w0 = census::snapshot().bytes_of("window-surface", true);
+    let mut sv: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    if sv.try_reserve_exact(SURF_WORDS).is_err() {
+        return None;
+    }
+    sv.resize(SURF_WORDS, 0);
+    let len = SURF_WORDS * 4;
+    let id = wm::create(SURF_OWNER, sv.as_ptr() as usize, len, 8, 8, 32, b"surftag");
+    if id == wm::WIN_NONE {
+        return None;
+    }
+    let open_ok = census::snapshot().bytes_of("window-surface", true) >= w0 + len as u64;
+    wm::close(id);
+    drop(sv);
+    Some(open_ok && census::snapshot().bytes_of("window-surface", true) == w0)
 }
