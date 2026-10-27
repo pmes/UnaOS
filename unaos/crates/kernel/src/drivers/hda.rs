@@ -3423,7 +3423,7 @@ pub fn census_selftest() {
 // has its own audit (`stage=alc294`), so the census's `verbs-set=0` stays the census's. An armed codec keeps the link
 // up (`alc_unlink`: a CRST drop is a codec reset). (c) `tests hda` on the Zenbook (TONE_NOW && TONE_WALK) re-arms and
 // plays `run_tone` through the headphone path with GPIO_NONE set (run_tone's GPIO arm skips by name). A stream open
-// (TONE_NOW alone) plays nothing: ZENBOOK-ACP-PLAY. Owed: -AMPS, -COPROC, -PLAY, -JACK, -DEPOP (Linux's
+// (TONE_NOW alone) re-arms and plays: ZENBOOKACPPLAY Z47, tail. Owed: -AMPS, -COPROC, -JACK, -DEPOP (Linux's
 // `alc294_hp_init` COEF depop), -BASS (pin 0x15), HDAPATH-TYPED. LOCKS: everything below runs under census's
 // `ring::own` hold (probe's task; run_tone's `play::ST` under DEV as in probe); the statics are atomics.
 
@@ -3609,14 +3609,14 @@ fn path_on<V: Verbs>(v: &mut V, cad: u8, afg: u8, p: &Path, ws: &[Widget; MAX_NO
 #[cfg(feature = "hda-tone")]
 fn alc_census_arm(base: u64, rings: &mut Rings, cad: u8, afg: u8, armed: &mut bool) {
     use core::sync::atomic::Ordering::Relaxed;
-    let tone_walk = TONE_NOW.load(Relaxed) && TONE_WALK.load(Relaxed);
     let state = ALC_ARMED.load(Relaxed);
-    if state != 0 && !tone_walk {
+    let due = alc_due(TONE_NOW.load(Relaxed), TONE_WALK.load(Relaxed), state); // ZENBOOKACPPLAY (Z47): keep / arm / tone / play (file tail)
+    if due == AlcDue::Keep {
         *armed = state == 1;
         let open = TONE_NOW.load(Relaxed);
         serial_println!(
             "[hda] alc294 kept armed={} stream-open={} -> {}",
-            (state == 1) as u8, open as u8, if open { "not played (ZENBOOK-ACP-PLAY owed)" } else { "kept" }
+            (state == 1) as u8, open as u8, if open { "not played (arm held)" } else { "kept" }
         );
         return;
     }
@@ -3634,12 +3634,15 @@ fn alc_census_arm(base: u64, rings: &mut Rings, cad: u8, afg: u8, armed: &mut bo
             if ok {
                 let hp_walk = CodecWalk { path: Some(r.path), path_dev: DEV_HP_OUT, ..r.walk };
                 vol::capture(base, Some(&hp_walk), &ws, rings, &mut b);
+                serial_println!("[audio] sink hda alc294 path=0x{:02x}->0x{:02x} -> ready", r.path.dac, r.path.pin);
                 ALC_ARMED.store(1, Relaxed);
                 ALC_LEVEL_DUE.store(true, Relaxed);
                 *armed = true;
                 b.line("alc294");
-                if tone_walk {
-                    alc_tone(base, rings, &hp_walk, &ws, &mut b);
+                match due {
+                    AlcDue::Tone => alc_tone(base, rings, &hp_walk, &ws, &mut b),
+                    AlcDue::Play => alc_play(base, rings, &hp_walk, &ws, r.path),
+                    _ => {}
                 }
                 return;
             }
@@ -3704,4 +3707,72 @@ pub fn path_selftest() {
         None => serial_println!(":: HDAPATH: d0=ok path=ok sets={} cases={}/{} -> PASS ::", g.sets, ok, cases.len()),
         Some(name) => serial_println!(":: HDAPATH: cases={}/{} -> FAIL :: case={} ::", ok, cases.len(), name),
     }
+    alc_due_selftest(); // ZENBOOKACPPLAY (Z47): its own line, outside HDAPATH's count
+}
+
+// ── ZENBOOKACPPLAY (zenbook-ledger Z47, MEASURE: PASS) — the mixer's HDA stream on the ALC294 arm — TAIL ──
+// Owner: Stria (CODEX §2), the HDA driver's one stream. Measured at 1f955b273: `play::start` (hda_play.rs) sets
+// TONE_NOW + REQ_RATE and calls `probe()`, which on the Zenbook is the census; `alc_census_arm`'s kept branch returned
+// before `run_tone`, so `play::gate` never took the stream (`no speaker path / stream not armed`). The stream setup is
+// already ONE fn (`stream::rearm`, the tone's and `gate`'s) and the path ONE type (`Path`), so nothing is hoisted: a
+// stream open (TONE_NOW alone) re-runs the arm and the same `alc_tone` -> `run_tone` dispatch `tests hda` uses, and
+// `run_tone`'s `play::gate` fold takes the stream (REQ_RATE != 0). A held/parked arm keeps the kept line. Owed:
+// ZENBOOK-ACP-DEPOP (Linux `alc294_hp_init` is COEF read-modify-write + a polled read + sleeps, not a pure write list),
+// ZENBOOK-ACP-WARM (an open re-walks the codec), -AMPS, -COPROC, -JACK, -BASS, -CAPTURE. LOCKS: as the arm's (census's
+// `ring::own` hold; `play::armed_facts` takes `play::ST` under DEV, the direction probe -> run_tone -> gate takes).
+
+/// What a census arm call does on 10ec:0294.
+#[cfg(feature = "hda-tone")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AlcDue {
+    /// Already armed (or held) and nothing asked for a sound: the kept line.
+    Keep,
+    /// The first arm of the boot (no tone, no stream).
+    Arm,
+    /// `tests hda` (TONE_NOW && TONE_WALK): arm, then the tone.
+    Tone,
+    /// A stream open (`play::start`: TONE_NOW alone) on an armed or untried codec: arm, then `play::gate` via run_tone.
+    Play,
+}
+
+/// The decision, pure: `state` is ALC_ARMED (0 untried, 1 armed, 2 parked or held).
+#[cfg(feature = "hda-tone")]
+fn alc_due(tone_now: bool, tone_walk: bool, state: u8) -> AlcDue {
+    if tone_now && tone_walk {
+        return AlcDue::Tone;
+    }
+    if tone_now && state != 2 {
+        return AlcDue::Play;
+    }
+    if state == 0 { AlcDue::Arm } else { AlcDue::Keep }
+}
+
+/// A stream open on the armed headphone path: the tone's dispatch (run_tone hands the stream to `play::gate`), then
+/// the one line saying whether the stream was armed, with its own audit.
+#[cfg(feature = "hda-tone")]
+fn alc_play(base: u64, rings: &mut Rings, walk: &CodecWalk, ws: &[Widget; MAX_NODES], path: Path) {
+    let mut p = Audit::default();
+    alc_tone(base, rings, walk, ws, &mut p);
+    match play::armed_facts() {
+        Some((rate, entries)) => serial_println!(
+            "[hda] play start path=0x{:02x}->0x{:02x} fmt=48k16s2 rate={} bdl={} -> armed", path.dac, path.pin, rate, entries
+        ),
+        None => serial_println!("[hda] play start path=0x{:02x}->0x{:02x} -> refused why=not-armed", path.dac, path.pin),
+    }
+    p.line("play");
+}
+
+/// The decision's KAT (`tests hdacensus`, after HDAPATH, its own line so HDAPATH's `cases=3/3` holds).
+#[cfg(feature = "hda-tone")]
+fn alc_due_selftest() {
+    let keep = alc_due(false, false, 1) == AlcDue::Keep && alc_due(false, false, 2) == AlcDue::Keep;
+    let arm = alc_due(false, false, 0) == AlcDue::Arm;
+    let tone = alc_due(true, true, 1) == AlcDue::Tone && alc_due(true, true, 2) == AlcDue::Tone;
+    let play = alc_due(true, false, 1) == AlcDue::Play && alc_due(true, false, 0) == AlcDue::Play;
+    let held = alc_due(true, false, 2) == AlcDue::Keep;
+    let w = |b: bool| if b { "ok" } else { "FAIL" };
+    serial_println!(
+        "[hda] alcplay kat keep={} arm={} tone={} play={} held={} -> {}",
+        w(keep), w(arm), w(tone), w(play), w(held), w(keep && arm && tone && play && held)
+    );
 }
