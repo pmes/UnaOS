@@ -1726,3 +1726,37 @@ async fn open_verb_any_dotdot_refused() {
     assert!(lines.iter().any(|(_, l)| *l == want), "named on the console line: {lines:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- MIMEONE (SR409): `api::fetch::mime_for_path` reads TYPECORE's one table; a `.pdf` opens by the table, an
+// extension-less PDF still by its head
+
+/// MIMEONE (SR409): the retired fetch table's every row answers its former mime through TYPECORE's one table (no row
+/// conflicted), case-insensitive and past a query / fragment; a name the table does not know keeps the text/html fallback.
+#[test]
+fn mime_one_fetch_rows() {
+    let former = [
+        ("html", "text/html"), ("htm", "text/html"), ("xhtml", "application/xhtml+xml"), ("xht", "application/xhtml+xml"),
+        ("xml", "text/xml"), ("svg", "image/svg+xml"), ("txt", "text/plain"), ("png", "image/png"), ("jpg", "image/jpeg"),
+        ("jpeg", "image/jpeg"), ("gif", "image/gif"), ("js", "text/javascript"), ("css", "text/css"),
+    ];
+    for (e, m) in former {
+        assert_eq!(crate::api::fetch::mime_for_path(&format!("file:///srv/a.{e}?v=1#top")), m, "{e}");
+        assert_eq!(crate::api::fetch::mime_for_path(&format!("file:///srv/A.{}", e.to_ascii_uppercase())), m, "{e} upper");
+    }
+    for u in ["file:///srv/x.unknown", "file:///srv.d/noext", "file:///srv/.profile"] {
+        assert_eq!(crate::api::fetch::mime_for_path(u), "text/html", "{u}");
+    }
+}
+
+/// MIMEONE (SR409): a local PDF without an extension still opens through the PDF arm's head sniff (`pdf::is_pdf`), both pages.
+#[tokio::test]
+async fn mime_one_pdf_noext_sniff() {
+    let (dir, url) = open_any_file("mimeonenoext", "two_pages", &two_pages());
+    let page = crate::net::fetch_page(&url).await.expect("the extension-less PDF opens");
+    assert_eq!(page.pdf.as_ref().map(|b| b.len()), Some(two_pages().len()), "the file's bytes, whole");
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_page(page, true);
+    assert_eq!(e.pdf.as_ref().expect("the PDF opened").page_count(), 2);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

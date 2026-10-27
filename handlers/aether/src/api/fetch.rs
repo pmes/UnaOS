@@ -618,23 +618,8 @@ fn essence(v: &str) -> String {
 }
 
 /// A local file's type from its extension (what a file server would send).
-fn mime_for_path(path: &str) -> String {
-    let p = path.split(['?', '#']).next().unwrap_or(path).to_ascii_lowercase();
-    let ext = p.rsplit('.').next().unwrap_or("");
-    match ext {
-        "html" | "htm" => "text/html",
-        "xhtml" | "xht" => "application/xhtml+xml",
-        "xml" => "text/xml",
-        "svg" => "image/svg+xml",
-        "txt" => "text/plain",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "js" => "text/javascript",
-        "css" => "text/css",
-        _ => "text/html",
-    }
-    .to_string()
+pub(crate) fn mime_for_path(path: &str) -> String {
+    type_core::by_extension(path.split(['?', '#']).next().unwrap_or(path)).unwrap_or(type_core::TEXT_HTML).to_string() // MIMEONE (SR409): TYPECORE's one table, the text/html fallback kept
 }
 
 /// Fetches the resource an `<iframe>` navigates to (HTML §7.4.5 "populating a session history
