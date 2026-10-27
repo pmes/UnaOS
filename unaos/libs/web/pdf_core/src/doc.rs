@@ -59,11 +59,20 @@ pub struct Document {
     cache: RefCell<BTreeMap<(u32, u16), Object>>,
     objstms: RefCell<BTreeMap<u32, ObjStm>>,
     busy: RefCell<BTreeSet<u32>>,
+    crypt: Option<crate::crypt::Handler>,
 }
 
 impl Document {
-    /// Parse a PDF: header, cross-reference (reconstructed when broken), trailer. /Encrypt is refused by name.
+    /// Parse a PDF with the empty user password: an unencrypted file, or an encrypted one that opens without a
+    /// password (the common case). [`Document::parse_with_password`] for any other.
     pub fn parse(bytes: &[u8]) -> Result<Document, Error> {
+        Document::parse_with_password(bytes, b"")
+    }
+
+    /// Parse a PDF: header, cross-reference (reconstructed when broken), trailer. An /Encrypt dictionary is opened
+    /// with `password`, the user or the owner password (`crate::crypt`, PDFCRYPT SR315): [`Error::Password`] when it is
+    /// neither, [`Error::Encrypted`] for a standard dictionary the handler cannot read.
+    pub fn parse_with_password(bytes: &[u8], password: &[u8]) -> Result<Document, Error> {
         let head = &bytes[..bytes.len().min(1024)];
         let version = match find(head, b"%PDF-", 0) {
             Some(p) => {
@@ -76,15 +85,15 @@ impl Document {
             None => String::new(),
         };
         if let Ok(loaded) = xref::load(bytes) {
-            let doc = Document::new(bytes, loaded.entries, loaded.trailer, loaded.kind, version.clone());
+            let mut doc = Document::new(bytes, loaded.entries, loaded.trailer, loaded.kind, version.clone());
             if doc.is_encrypted() {
-                return Err(Error::Encrypted);
+                doc.open_crypt(password)?;
             }
             if doc.catalog().is_some() {
                 return Ok(doc);
             }
         }
-        Document::rebuild(bytes, version)
+        Document::rebuild(bytes, version, password)
     }
 
     fn new(bytes: &[u8], entries: BTreeMap<u32, XrefEntry>, trailer: Dict, kind: XrefKind, version: String) -> Self {
@@ -97,38 +106,15 @@ impl Document {
             cache: RefCell::new(BTreeMap::new()),
             objstms: RefCell::new(BTreeMap::new()),
             busy: RefCell::new(BTreeSet::new()),
+            crypt: None,
         }
     }
 
     /// The reconstruction path: scan for objects, add every object stream's members, find /Root.
-    fn rebuild(bytes: &[u8], version: String) -> Result<Document, Error> {
+    fn rebuild(bytes: &[u8], version: String, password: &[u8]) -> Result<Document, Error> {
         let (entries, trailer) = xref::reconstruct(bytes);
         let mut doc = Document::new(bytes, entries, trailer, XrefKind::Rebuilt, version);
-        let nums: Vec<u32> = doc.entries.keys().copied().collect();
-        let mut extra = Vec::new();
-        let mut catalog = None;
-        let mut xref_dict = None;
-        for num in nums {
-            let Ok(obj) = doc.resolve(Ref { num, generation: 0 }) else { continue };
-            let Some(d) = obj.as_dict() else { continue };
-            match d.name(b"Type") {
-                Some(b"ObjStm") => {
-                    if doc.load_objstm(num, 0).is_ok() {
-                        if let Some(o) = doc.objstms.borrow().get(&num) {
-                            for (idx, (n, _)) in o.pairs.iter().enumerate() {
-                                extra.push((*n, XrefEntry::InStream { stm: num, idx: idx as u32 }));
-                            }
-                        }
-                    }
-                }
-                Some(b"Catalog") => catalog = Some(num),
-                Some(b"XRef") if d.contains(b"Root") => xref_dict = Some(d.clone()),
-                _ => {}
-            }
-        }
-        for (n, e) in extra {
-            doc.entries.entry(n).or_insert(e);
-        }
+        let (mut catalog, xref_dict) = doc.scan_members();
         if !doc.trailer.contains(b"Root") {
             if let Some(d) = xref_dict {
                 for (k, v) in d.iter() {
@@ -140,7 +126,10 @@ impl Document {
         }
         doc.cache.borrow_mut().clear();
         if doc.is_encrypted() {
-            return Err(Error::Encrypted);
+            // The object streams decode only once the key is known: scan again.
+            doc.open_crypt(password)?;
+            catalog = doc.scan_members().0.or(catalog);
+            doc.cache.borrow_mut().clear();
         }
         if doc.catalog().is_none() {
             // An object stream may hold the catalog; look again now that its members are listed.
@@ -225,7 +214,7 @@ impl Document {
                 if got.num != r.num {
                     return Err(Error::Syntax("xref offset names another object", offset));
                 }
-                Ok(obj)
+                Ok(self.decrypt(got, obj))
             }
             Some(XrefEntry::InStream { stm, idx }) => {
                 self.load_objstm(stm, depth + 1)?;
@@ -420,6 +409,73 @@ impl Document {
             creator: s(b"Creator"),
             producer: s(b"Producer"),
         }
+    }
+
+    /// The reconstruction scan (§7.5 fallback): every object stream's members listed in `entries` (an entry the scan
+    /// already has wins), and the catalog and an xref-stream dictionary that names /Root, when found.
+    fn scan_members(&mut self) -> (Option<u32>, Option<Dict>) {
+        let nums: Vec<u32> = self.entries.keys().copied().collect();
+        let mut extra = Vec::new();
+        let mut catalog = None;
+        let mut xref_dict = None;
+        for num in nums {
+            let Ok(obj) = self.resolve(Ref { num, generation: 0 }) else { continue };
+            let Some(d) = obj.as_dict() else { continue };
+            match d.name(b"Type") {
+                Some(b"ObjStm") => {
+                    if self.load_objstm(num, 0).is_ok() {
+                        if let Some(o) = self.objstms.borrow().get(&num) {
+                            for (idx, (n, _)) in o.pairs.iter().enumerate() {
+                                extra.push((*n, XrefEntry::InStream { stm: num, idx: idx as u32 }));
+                            }
+                        }
+                    }
+                }
+                Some(b"Catalog") => catalog = Some(num),
+                Some(b"XRef") if d.contains(b"Root") => xref_dict = Some(d.clone()),
+                _ => {}
+            }
+        }
+        for (n, e) in extra {
+            self.entries.entry(n).or_insert(e);
+        }
+        (catalog, xref_dict)
+    }
+
+    /// Open the trailer's /Encrypt with `password` (`crate::crypt::Handler::open`), then drop every object and object
+    /// stream decoded before the key was known.
+    fn open_crypt(&mut self, password: &[u8]) -> Result<(), Error> {
+        let enc_obj = self.trailer.get(b"Encrypt").cloned().unwrap_or(Object::Null);
+        let encrypt_num = enc_obj.as_ref().map(|r| r.num);
+        let Object::Dict(enc) = self.get(&enc_obj) else { return Err(Error::Encrypted) };
+        let id0 = match self.get(self.trailer.get(b"ID").unwrap_or(&Object::Null)) {
+            Object::Array(a) => a.first().map(|o| self.get(o)).and_then(|o| o.as_str().map(<[u8]>::to_vec)),
+            _ => None,
+        }
+        .unwrap_or_default();
+        let handler = crate::crypt::Handler::open(&enc, &id0, encrypt_num, password, &|o| self.get(o))?;
+        self.crypt = Some(handler);
+        self.cache.borrow_mut().clear();
+        self.objstms.borrow_mut().clear();
+        Ok(())
+    }
+
+    /// The one decryption hook: a top-level object as parsed, through the security handler when the file has one.
+    fn decrypt(&self, r: Ref, obj: Object) -> Object {
+        match &self.crypt {
+            Some(h) => h.decrypt_object(r, obj),
+            None => obj,
+        }
+    }
+
+    /// `none`, or the security handler's kind (`crate::crypt::Handler::kind`: rc4-40, rc4-128, aesv2, aesv3, ...).
+    pub fn encryption(&self) -> &'static str {
+        self.crypt.as_ref().map_or("none", |h| h.kind())
+    }
+
+    /// The opened security handler, when the file is encrypted.
+    pub fn security(&self) -> Option<&crate::crypt::Handler> {
+        self.crypt.as_ref()
     }
 }
 

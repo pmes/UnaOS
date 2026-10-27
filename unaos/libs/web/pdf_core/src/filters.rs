@@ -73,7 +73,7 @@ pub fn decode(stream: &Stream, resolve: &dyn Fn(&Object) -> Object) -> Result<De
                 };
                 return Ok(Decoded { data: cur, image_filter: Some(full.to_vec()), image_parms: parm });
             }
-            b"Crypt" => return Err(Error::Unsupported("Crypt filter (PDF-CRYPT)")),
+            b"Crypt" => cur, // PDFCRYPT (SR315): the security handler decrypted this stream on resolve (crypt.rs)
             _ => return Err(Error::Unsupported("stream filter")),
         };
         if cur.len() > MAX_DECODED {

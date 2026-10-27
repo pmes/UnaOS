@@ -136,7 +136,7 @@ fn filter_chains_and_image_pass_through() {
     assert_eq!(d.image_filter.as_deref(), Some(&b"DCTDecode"[..]));
     assert_eq!(d.image_parms.unwrap().int(b"ColorTransform"), Some(0));
     let s = Stream { dict: dict("<< /Filter /Crypt >>"), data: Vec::new() };
-    assert!(filters::decode(&s, &|o| o.clone()).is_err());
+    assert_eq!(filters::decode(&s, &|o| o.clone()).unwrap().data, b"");
     let s = Stream { dict: dict("<< /Filter /LZWDecode /DecodeParms << /EarlyChange 0 >> >>"), data: lzw_encode(b"abcabcabc", false) };
     assert_eq!(filters::decode(&s, &|o| o.clone()).unwrap().data, b"abcabcabc");
 }
