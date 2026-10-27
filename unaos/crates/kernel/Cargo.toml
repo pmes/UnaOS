@@ -3898,6 +3898,18 @@ svg = ["pixel_core/svg"]
 # dependency only. Kept in sync with `unaos/arroyo` (`_feats` and `K8_FEATS`) and `unaos/builder/src/main.rs`.
 videoplayer = ["dep:av1_core", "dep:vp8_core", "dep:timeline_core", "dep:yuv_core", "dep:h264enc_core"] # NLE6 (LEDGER SR207): the Player's EDL mode links timeline_core
 
+# KERNEL-DISPLAY-ICC (LEDGER SR372): UNAOS_DISPLAY_ICC=1 — the panel's display transform. `video::colour` builds ONE
+# `icc_core::DisplayTransform` (sRGB to the EDID's matrix/TRC panel) at the a11y filter's first latch and the scanout copy
+# filter (`a11yfilter::each` / `in_place` / `color`, BP-video-25) runs it as its LAST stage. Both arches. DEFAULT OFF =>
+# no `video::colour`, no icc_core unless `facet`, no new line. Kept in sync with `unaos/arroyo` and `unaos/builder/src/main.rs`.
+dicc = ["dep:icc_core"]
+
+# NVME (zenbook-ledger Z2, ZENBOOKNVME): UNAOS_NVME=1 arms drivers/nvme.rs — the NVMe host controller, polled (probe by
+# class 01/08/02, reset/enable, identify, one I/O queue pair, the block registry `block::register_nvme`, `tests nvme`).
+# x86_64 only (the enumeration seam is arch::pci). DEFAULT OFF => the module is never lexed and media are byte-identical.
+# Kept in sync with `unaos/arroyo`, `unaos/builder/src/main.rs`, scripts/k8-reach.registry and scripts/banner-cert.sh.
+nvme = []
+
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
 lazy_static = { version = "1.5.0", features = ["spin_no_std"] }

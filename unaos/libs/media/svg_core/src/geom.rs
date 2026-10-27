@@ -588,7 +588,7 @@ pub fn arc_to(path: &mut Path, p0: P, rx: f64, ry: f64, phi_deg: f64, large: boo
     // Step 2: (cx', cy')
     let num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
     let den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
-    let mut coef = if den == 0.0 { 0.0 } else { sqrt((num / den).max(0.0)) };
+    let mut coef = if den == 0.0 || lambda > 1.0 { 0.0 } else { sqrt((num / den).max(0.0)) }; // F.6.6: radii scaled up put the centre on the chord midpoint, the radicand exactly 0 (its computed value is rounding residue; MATH-ONE SR362)
     if large == sweep {
         coef = -coef;
     }
@@ -916,5 +916,18 @@ mod tests {
             area += a.0 * b.1 - b.0 * a.1;
         }
         assert!(((area / 2.0).abs() - PI * 300.0).abs() / (PI * 300.0) < 1e-3, "{area} {}", poly.len());
+    }
+
+    /// MATH-ONE (LEDGER SR362): resvg's tests/shapes/path/M-A.svg arc, radii too small (F.6.6 scales them, the centre is
+    /// the chord midpoint and the sweep exactly 180 degrees). The radicand's rounding residue once split it into three
+    /// cubics under libm's sqrt (on-ArcTo then drew an extra marker-mid); it is two, ending on the endpoint.
+    #[test]
+    fn mathone_arc_half_turn_is_two_cubics() {
+        let mut p = Path::new();
+        p.move_to(30.0, 40.0);
+        arc_to(&mut p, (30.0, 40.0), 40.0, 30.0, 20.0, true, true, (150.0, 100.0));
+        let cubics: Vec<&Seg> = p.segs.iter().filter(|s| matches!(s, Seg::Cubic(..))).collect();
+        assert_eq!(cubics.len(), 2, "{:?}", p.segs);
+        assert!(matches!(p.segs.last(), Some(Seg::Cubic(_, _, (x, y))) if *x == 150.0 && *y == 100.0));
     }
 }

@@ -630,6 +630,9 @@ fn main() {
     // AHCIROOT (rmbp-ledger B332): the SSD UnaFS root + the kernel-held SATA write grant. Implies ahci-write,
     // unafs, installdemo in Cargo.toml. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
     if std::env::var("UNAOS_AHCIROOT").is_ok() { feats.push("ahciroot"); }
+    // NVME (zenbook-ledger Z2): UNAOS_NVME=1 arms drivers/nvme.rs (polled NVMe, `tests nvme`). x86 only. Default OFF => module
+    // unlinked, media byte-identical. Kept in sync with arroyo's mapping and crates/kernel/Cargo.toml.
+    if std::env::var("UNAOS_NVME").is_ok() { feats.push("nvme"); }
     // SELFINSTALL M3 (SH-3): UNAOS_ROOT_PREFER=ahci|sdhc picks the bootdisk root when both the card and the SSD carry
     // UnaOS (cargo features root-prefer-ahci / root-prefer-sdhc). Default OFF => first-found. Kept in sync with arroyo.
     match std::env::var("UNAOS_ROOT_PREFER").as_deref() {
@@ -910,6 +913,7 @@ fn main() {
     // module; DEFAULT OFF => module + call site unlinked => byte-identical media. Needs
     // UNAOS_KEPLER + UNAOS_KEPLER_TAKEOVER to reach its seam. Kept in sync with arroyo's mapping.
     if std::env::var("UNAOS_WC").is_ok() { feats.push("wc"); }
+    if std::env::var("UNAOS_DISPLAY_ICC").is_ok() { feats.push("dicc"); } // KERNEL-DISPLAY-ICC (LEDGER SR372): the display transform at the scanout copy. Kept in sync with arroyo's mapping.
     // PHASE31ROOT: UNAOS_BAR1EXP=<mode> selects a BAR1-wedge experiment arm
     // (docs/dev/OS/08_VIDEO/phase31-root.md). One mode exists: `uc` -> `bar1exp-uc`, retyping the
     // panel-aperture leaves UC (PAT PA3) instead of WC at `set_framebuffer_wc`. Memory TYPE only.
@@ -2214,6 +2218,33 @@ fn main() {
         cmd.arg("-drive").arg(format!("if=none,id=sata0,format=raw,file={}", attach.display()))
            .arg("-device").arg("ide-hd,drive=sata0,bus=ide.1");
         println!("   UNAOS_AHCI_DISK: second SATA disk on ide.1 ({}) — AHCI driver target (ESP keeps ide.0 and bootindex=0)", attach.display());
+    }
+    // NVME (zenbook-ledger Z2) fixture: UNAOS_NVME=1 attaches ONE NVMe controller (`-device nvme`, QEMU's default model
+    // "QEMU NVMe Ctrl" — the only model `tests nvme`'s write leg writes on) backed by a FRESH image, target/nvmefixture.img:
+    // a copy of UNAOS_NVME_DISK=<path> when set, else 64 MiB of zeros. Always a fresh copy, never the operator's file —
+    // the AHCIWRITE rule: the guest writes (and restores) 8 scratch blocks. No bootindex: OVMF keeps booting the ESP.
+    // UNSET => not one argument is added.
+    if std::env::var("UNAOS_NVME").is_ok() {
+        let dst = target_dir.join("nvmefixture.img");
+        match std::env::var("UNAOS_NVME_DISK") {
+            Ok(src) => {
+                let src = {
+                    let p = std::path::PathBuf::from(&src);
+                    if p.is_relative() { workspace_dir.join(p) } else { p }
+                };
+                if !src.exists() {
+                    panic!("UNAOS_NVME_DISK set but {} is missing", src.display());
+                }
+                std::fs::copy(&src, &dst).unwrap();
+            }
+            Err(_) => {
+                let f = std::fs::File::create(&dst).unwrap();
+                f.set_len(64 * 1024 * 1024).unwrap();
+            }
+        }
+        cmd.arg("-drive").arg(format!("if=none,id=nvme0,format=raw,file={}", dst.display()))
+           .arg("-device").arg("nvme,drive=nvme0,serial=una");
+        println!("   UNAOS_NVME: NVMe controller (serial=una) on a fresh {} — NVMe driver target (ESP keeps bootindex=0)", dst.display());
     }
     // EHCI-3 harness: by default (EHCI-4 M1 driver on) the keyboard rides the EHCI bus (QEMU's usb-kbd is
     // HS-capable, so it trains directly on the EHCI root port — Topology B). It REPLACES the

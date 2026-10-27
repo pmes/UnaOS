@@ -1186,11 +1186,10 @@ fn leg_disk() -> Result<Option<(String, String)>, String> {
     let Some(dir) = dir else { return Ok(None) };
     let k = KERNEL_PRINCIPAL;
     let md = join(dir, "Q2NOTE.MD");
-    let _ = mt.unlink(&md, k);
-    mt.create(&md, NodeKind::File, k).map_err(|e| alloc::format!("create {}: {:?}", md, e))?;
-    let mut scratch = Scratch { md: md.clone(), trashed: None }; // from here, every exit releases the file
     let body = b"# QUARRY2\n- a list\n";
-    mt.write(&md, 0, body, k).map_err(|e| alloc::format!("write {}: {:?}", md, e))?;
+    let put = mt.put_file(&md, body, k); // VFSPUTREST (rmbp-ledger B969): the ONE VFS whole-file writer
+    let mut scratch = Scratch { md: md.clone(), trashed: None }; // from here, every exit releases the file
+    put.map_err(|e| alloc::format!("put {}: {:?}", md, e))?;
     let list = alloc::vec![DirEnt { name: String::from("Q2NOTE.MD"), kind: NodeKind::File, size: body.len() as u64, mtime: None }];
     let meta = compute_meta(&mt, dir, &list, &[]);
     let ty = meta.first().map(|m| m.type_name.clone()).unwrap_or_default();

@@ -308,7 +308,7 @@ impl Bus for Mock {
 /// take -> `selector-did-not-take`, no MMIO, the PLL untouched; every move is the pair [ChipCommon, d11] with no MMIO off-core;
 /// pll_table(0/1) are bcma's rows. Never touches `MODE`/`READY` (the station's).
 #[cfg(feature = "wifi10")]
-pub(super) fn kat() -> bool {
+pub(in crate::wifi) fn kat() -> bool {
     let id = 0x1392_4331;
     let mut m = Mock::new(id, 0, 0);
     let mut ok = probe(&mut m).1 == Err("no-pmu") && m.paired() && m.cfg_writes.len() == 2;

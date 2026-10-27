@@ -111,6 +111,9 @@ pub struct MediaInfo {
     pub real_video: bool,
     /// The video decoder's name ("test-pattern", "test-pattern (stand-in)", ...; "" audio-only).
     pub video_decoder: String,
+    /// HEVCLEVELLINE (SR368): the video's `profile=<name> tier=<main|high> level=<n>` tokens (H.264: no tier), from its
+    /// configuration record through `gneiss_pal::dsp::video::profile_level`; "" when the codec / record says none.
+    pub video_profile: String,
     /// The audio decoder's name ("opus", "vorbis", "aac-lc", "mp3", "flac", "pcm"; "" none).
     pub audio_decoder: String,
     /// Why audio is silent, when it is (no track / no decoder / no device).
@@ -418,6 +421,7 @@ impl Player {
             audio: audio_name,
             real_video,
             video_decoder,
+            video_profile: vtrack.as_ref().and_then(gneiss_pal::dsp::video::profile_level).unwrap_or_default(),
             audio_decoder,
             audio_note,
             audio_clock: clock.is_audio(),

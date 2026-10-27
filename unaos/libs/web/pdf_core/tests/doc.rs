@@ -73,3 +73,62 @@ fn info_strings() {
     assert_eq!(i.creator, None);
     assert!(doc.pages().unwrap().is_empty());
 }
+
+// PDF4-OUTLINE (SR374): the outline tree, its destinations through the one resolver, and the refusals.
+
+/// Three pages; the outline: "Chapter 1" (open, /Dest page 1) > "Sec 1.1" (/Dest page 2 /XYZ) and a UTF-16BE "Sec 1.2"
+/// (closed by /Count -1, /A /GoTo named "two"), then "Chapter 2" (/A /URI).
+fn outline_pdf() -> Vec<u8> {
+    let mut b = PdfBuilder::new(1);
+    b.obj(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R /Names << /Dests << /Names [(two) [4 0 R /Fit]] >> >> >>")
+        .obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 /MediaBox [0 0 200 100] >>")
+        .obj(3, "<< /Type /Page /Parent 2 0 R >>")
+        .obj(4, "<< /Type /Page /Parent 2 0 R >>")
+        .obj(5, "<< /Type /Page /Parent 2 0 R >>")
+        .obj(10, "<< /Type /Outlines /First 11 0 R /Last 14 0 R /Count 3 >>")
+        .obj(11, "<< /Title (Chapter 1) /Parent 10 0 R /Next 14 0 R /First 12 0 R /Last 13 0 R /Count 2 /Dest [3 0 R /Fit] >>")
+        .obj(12, "<< /Title (Sec 1.1) /Parent 11 0 R /Next 13 0 R /Dest [4 0 R /XYZ 0 80 0] >>")
+        .obj(13, "<< /Title <FEFF0053006500630020003100AE0032> /Parent 11 0 R /Prev 12 0 R /Count -1 /First 15 0 R /Last 15 0 R /A << /S /GoTo /D (two) >> >>")
+        .obj(14, "<< /Title (Chapter 2) /Parent 10 0 R /Prev 11 0 R /A << /S /URI /URI (https://example.com/) >> >>")
+        .obj(15, "<< /Title (Deep) /Parent 13 0 R /Dest [5 0 R /FitH 50] >>");
+    b.classic()
+}
+
+#[test]
+fn outline_tree_and_dests() {
+    use pdf_core::annots::{Dest, LinkAction, View};
+    let doc = Document::parse(&outline_pdf()).unwrap();
+    let o = doc.outlines().unwrap();
+    let titles: Vec<&str> = o.iter().map(|i| i.title.as_str()).collect();
+    assert_eq!(titles, ["Chapter 1", "Sec 1.1", "Sec 1\u{AE}2", "Deep", "Chapter 2"], "pre-order, UTF-16BE decoded");
+    assert_eq!(o.iter().map(|i| i.level).collect::<Vec<_>>(), [0, 1, 1, 2, 0]);
+    assert_eq!(o.iter().map(|i| i.kids).collect::<Vec<_>>(), [2, 0, 1, 0, 0]);
+    assert_eq!(o.iter().map(|i| i.open).collect::<Vec<_>>(), [true, false, false, false, false], "/Count -1 is closed");
+    assert_eq!(o[0].action, Some(LinkAction::GoTo(Dest { page: 0, view: View::Fit })));
+    assert_eq!(o[1].action, Some(LinkAction::GoTo(Dest { page: 1, view: View::Xyz { left: Some(0.0), top: Some(80.0), zoom: None } })));
+    assert_eq!(o[2].action, Some(LinkAction::GoTo(Dest { page: 1, view: View::Fit })), "/A /GoTo by name through /Names /Dests");
+    assert_eq!(o[3].action, Some(LinkAction::GoTo(Dest { page: 2, view: View::FitH(Some(50.0)) })));
+    assert_eq!(o[4].action, Some(LinkAction::Uri("https://example.com/".into())));
+}
+
+#[test]
+fn outline_next_loop_refused() {
+    let mut b = PdfBuilder::new(1);
+    b.obj(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>")
+        .obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 100] >>")
+        .obj(3, "<< /Type /Page /Parent 2 0 R >>")
+        .obj(10, "<< /Type /Outlines /First 11 0 R >>")
+        .obj(11, "<< /Title (A) /Next 12 0 R >>")
+        .obj(12, "<< /Title (B) /Next 11 0 R >>");
+    let doc = Document::parse(&b.classic()).unwrap();
+    assert_eq!(doc.outlines(), Err(Error::Loop), "a broken /Next chain is refused by name");
+}
+
+#[test]
+fn outline_absent_is_empty() {
+    let mut b = PdfBuilder::new(1);
+    b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        .obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 100] >>")
+        .obj(3, "<< /Type /Page /Parent 2 0 R >>");
+    assert_eq!(Document::parse(&b.classic()).unwrap().outlines(), Ok(Vec::new()));
+}

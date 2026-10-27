@@ -3,9 +3,9 @@
 //
 //! CHARTER: shared-core (media)
 //!
-//! SVGCORE (LEDGER SR52): UnaOS renders SVG from the specifications. `no_std` + `alloc`, no `unsafe`; the one
-//! dependency is UnaOS's own font_core (glyph outlines, shaping, and the exact-area rasterizer paths are
-//! filled with).
+//! SVGCORE (LEDGER SR52): UnaOS renders SVG from the specifications. `no_std` + `alloc`, no `unsafe`; its
+//! dependencies are UnaOS's own font_core (glyph outlines, shaping, and the exact-area rasterizer paths are
+//! filled with) and libm (MATH-ONE SR362).
 //!
 //! | area | spec | module |
 //! |---|---|---|

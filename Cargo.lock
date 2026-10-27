@@ -74,6 +74,7 @@ dependencies = [
  "taffy",
  "text_host",
  "thiserror 2.0.21",
+ "tls_core",
  "tokio",
 ]
 
@@ -314,6 +315,7 @@ version = "0.1.0"
 dependencies = [
  "crypto_core",
  "demux_core",
+ "libm",
 ]
 
 [[package]]
@@ -1915,6 +1917,9 @@ dependencies = [
 [[package]]
 name = "gl_core"
 version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "gl_generator"
@@ -2185,6 +2190,7 @@ version = "0.1.0"
 dependencies = [
  "demux_core",
  "h264_core",
+ "yuv_core",
 ]
 
 [[package]]
@@ -2458,6 +2464,7 @@ name = "infer_core"
 version = "0.1.0"
 dependencies = [
  "crypto_core",
+ "libm",
 ]
 
 [[package]]
@@ -4653,6 +4660,7 @@ name = "svg_core"
 version = "0.1.0"
 dependencies = [
  "font_core",
+ "libm",
  "pixel_core",
 ]
 

@@ -12,6 +12,7 @@ version = "0.1.0"
 dependencies = [
  "crypto_core",
  "demux_core",
+ "libm",
 ]
 
 [[package]]
@@ -141,6 +142,7 @@ name = "h264enc_core"
 version = "0.1.0"
 dependencies = [
  "h264_core",
+ "yuv_core",
 ]
 
 [[package]]
@@ -383,6 +385,7 @@ name = "svg_core"
 version = "0.1.0"
 dependencies = [
  "font_core",
+ "libm",
 ]
 
 [[package]]

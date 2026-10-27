@@ -101,7 +101,7 @@ pub fn latch(fb_w: usize) -> u32 {
     let (ppi, s2) = compute(fb_w);
     PPI.store(ppi, Ordering::Relaxed);
     match S2.compare_exchange(0, s2, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => { panelknob::note(fb_w, s2); s2 }
+        Ok(_) => { panelknob::note(fb_w, s2); display_note(fb_w, s2, ppi); s2 } // ZENBOOKGOP (zenbook-ledger Z4): `[display] gop` once, at the latch; LINE-NEUTRAL fold, body at the file tail
         Err(won) => won,
     }
 }
@@ -273,4 +273,39 @@ mod panelknob {
         let h = crate::video::panel_info_nonblocking().map_or(0, |i| i.height);
         serial_println!("[dpi] panel={}x{}@{} src=knob ppi={}", fb_w, h, super::scale_str(s2), PPI);
     }
+}
+
+/// ZENBOOKGOP (zenbook-ledger Z4) — the panel the kernel draws on, said ONCE at the moment its scale is decided (the
+/// latch's CAS winner, beside `panelknob::note`): `[display] gop <w>x<h> stride=<px> format=<rgb|bgr|u8|unknown>
+/// ppi=<n> src=<knob|edid|none> scale=<s>`. `src` is `compute`'s own order: `UNAOS_PPI` first, else the EDID the loader
+/// carried — on a machine with several GOP outputs that is the PICKED output's (the loader's `gopsel`), so an
+/// external monitor's ppi is its own. Geometry from `panel_info_nonblocking` (a `try_lock`: the latch can run under
+/// FBCON's lock on the Kepler seam); `held` when the writer is busy. x86 only: every x86 panel is a UEFI GOP surface.
+fn display_note(fb_w: usize, s2: u32, ppi: u32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let (h, stride, fmt) = match crate::video::panel_info_nonblocking() {
+            Some(i) => (
+                i.height,
+                i.stride,
+                match i.pixel_format {
+                    unaos_boot_info::PixelFormat::Rgb => "rgb",
+                    unaos_boot_info::PixelFormat::Bgr => "bgr",
+                    unaos_boot_info::PixelFormat::U8 => "u8",
+                    unaos_boot_info::PixelFormat::Unknown => "unknown",
+                },
+            ),
+            None => (0, 0, "held"),
+        };
+        let src = if panelknob::ppi().is_some() {
+            "knob"
+        } else if ppi != 0 {
+            "edid"
+        } else {
+            "none"
+        };
+        serial_println!("[display] gop {}x{} stride={} format={} ppi={} src={} scale={}", fb_w, h, stride, fmt, ppi, src, scale_str(s2));
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (fb_w, s2, ppi);
 }

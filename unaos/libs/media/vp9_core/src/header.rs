@@ -578,3 +578,37 @@ pub fn superframe_frames(data: &[u8]) -> alloc::vec::Vec<&[u8]> {
     out.push(data);
     out
 }
+
+// ── VP9INBANDCOLOUR (LEDGER SR379, AV1INBANDSIZE; handlers.md §5 NLEPROBE-HDR's VP9-INBAND-COLOUR) ─────────────────────────────
+// The bitstream's colour of a VP9 track for `Demuxer::fill_colour` (gneiss_pal's `colour_of`): the first key / intra-only frame's
+// color_config, read by the ONE header reader (`parse_uncompressed`, which also applies §7.2's profile-0 intra-only BT.601), mapped
+// to H.273 code points. VP9 states only the matrix and the range: primaries / transfer are 2 (unspecified).
+
+/// The VP9 color_space enum (§7.2) and color_range as `(primaries, transfer, matrix, full_range)`: CS_UNKNOWN and CS_RESERVED state
+/// nothing (`None`); BT_601 and SMPTE_170 -> 6, BT_709 -> 1, SMPTE_240 -> 7, BT_2020 -> 9 (non-constant luminance), RGB -> 0 full
+/// (ffmpeg's vp9 matrix table).
+pub fn colour_codes(color_space: u8, color_range: u8) -> Option<(u8, u8, u8, bool)> {
+    let matrix = match color_space {
+        1 | 3 => 6,
+        2 => 1,
+        4 => 7,
+        5 => 9,
+        7 => 0,
+        _ => return None,
+    };
+    Some((2, 2, matrix, color_space == 7 || color_range != 0))
+}
+
+/// The colour a VP9 chunk (a frame or a superframe) states: the first key or intra-only frame's [`colour_codes`], parsed on a
+/// scratch [`HeaderState`]; `None` when no frame of it states one (an inter chunk, CS_UNKNOWN, or a header that does not parse).
+pub fn header_codes(chunk: &[u8]) -> Option<(u8, u8, u8, bool)> {
+    for f in superframe_frames(chunk) {
+        let mut st = HeaderState::default();
+        let Ok(h) = parse_uncompressed(f, &mut st) else { continue };
+        if h.key_frame || h.intra_only {
+            return colour_codes(st.color_space, st.color_range);
+        }
+    }
+    None
+}
+

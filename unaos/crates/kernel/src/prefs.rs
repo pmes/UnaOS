@@ -32,8 +32,8 @@
 //!
 //! # The write: the USERS.DAT swap (fs/users.rs), through the mount table
 //!
-//! `preferences.toml.new` is written, READ BACK and PARSED (it must be the tree that was serialized), and
-//! only then does the old file go and the temp get renamed over it. A load that finds no
+//! The render is PARSED (it must be the tree that was serialized), then `<d>.new` is written and READ BACK byte-equal
+//! (`MountTable::put_file_atomic`), and only then does the old file go and the temp get renamed over it. A load that finds no
 //! `preferences.toml` but a parseable `.new` adopts it. The missing directories are created.
 //!
 //! # A refused file
@@ -108,7 +108,7 @@ pub mod key {
     pub const TP_SECONDARY: &str = "trackpad.secondary_click";
     pub const TP_THREE_DRAG: &str = "trackpad.three_finger_drag";
     /// DRAGDROP (B440): the folders the user dropped on Quarry's sidebar Favorites (R79: a preference is Principia's).
-    pub const QUARRY_FAVORITES: &str = "quarry.favorites"; pub const A11Y_REDUCE_MOTION: &str = "accessibility.reduce_motion"; pub const A11Y_INCREASE_CONTRAST: &str = "accessibility.increase_contrast"; pub const A11Y_CURSOR_SIZE: &str = "accessibility.cursor_size"; pub const A11Y_TEXT_SIZE: &str = "accessibility.text_size"; pub const LOOK: &str = "look"; pub const NOTIFY_DND: &str = "notify.dnd"; pub const NOTIFY_DND_FROM: &str = "notify.dnd_from"; pub const NOTIFY_DND_UNTIL: &str = "notify.dnd_until"; pub const PRIVACY_REMEMBER: &str = "privacy.remember"; pub const LOCALE_TZ: &str = "locale.tz"; pub const LOCALE_REGION: &str = "locale.region"; pub const LOCALE_FIRST_DAY: &str = "locale.first_day"; pub const ALL: [&str; 47] = [BRIGHTNESS, IDLE_MIN, WALLPAPER, VOLUME, MUTE, POINTER, LOWBAT_PCT, DOCK_PINS, SETTINGS_TAB, FONT, FONT_SIZE, LOGIN_ITEMS, DISPLAY_MODE, DOCK_POSITION, DOCK_AUTOHIDE, APPEARANCE_MODE, APPEARANCE_ACCENT, APPEARANCE_HIGHLIGHT, TP_SPEED, TP_TAP, TP_NATURAL, TP_SECONDARY, TP_THREE_DRAG, QUARRY_FAVORITES, A11Y_REDUCE_MOTION, A11Y_INCREASE_CONTRAST, A11Y_CURSOR_SIZE, A11Y_TEXT_SIZE, LOOK, NOTIFY_DND, NOTIFY_DND_FROM, NOTIFY_DND_UNTIL, PRIVACY_REMEMBER, LOCALE_TZ, LOCALE_REGION, LOCALE_FIRST_DAY, A11Y_CVD, A11Y_INVERT, A11Y_ZOOM, A11Y_ZOOM_FOLLOW, A11Y_SHOW_PERF, LOCK_AFTER_IDLE_MIN, LOCK_ON_LID, LOCK_ON_SLEEP, KBD_LAYOUT, KBD_COMPOSE, AUDIO_OUTPUT]; pub const AUDIO_OUTPUT: &str = "audio.output"; pub const KBD_LAYOUT: &str = "keyboard.layout"; pub const KBD_COMPOSE: &str = "keyboard.compose"; pub const A11Y_CVD: &str = "accessibility.cvd"; pub const A11Y_INVERT: &str = "accessibility.invert"; pub const A11Y_ZOOM: &str = "accessibility.zoom"; pub const A11Y_ZOOM_FOLLOW: &str = "accessibility.zoom_follow"; pub const A11Y_SHOW_PERF: &str = "accessibility.show_performance"; pub const LOCK_AFTER_IDLE_MIN: &str = "lock.after_idle_min"; pub const LOCK_ON_LID: &str = "lock.on_lid"; pub const LOCK_ON_SLEEP: &str = "lock.on_sleep"; // TZLOCALE (B701): the three system.locale.* keys, Settings > Date & Time's rows. REASK (B681): PRIVACY_REMEMBER, Settings > Privacy's row (does a new answer get kept). SETTINGSMAP (B673): the keys Settings owns a row for (LOOK = prefs_core::appearance::LOOK_KEY, NOTIFY_* = notify/notifypane's, held equal by `tests settingsmap`) and ALL, the iterable table of every key here (LINE-NEUTRAL fold, code first). A11YPANE (B655): the Accessibility pane's four keys (LINE-NEUTRAL fold, code first: this file is lexed into every image)
+    pub const QUARRY_FAVORITES: &str = "quarry.favorites"; pub const A11Y_REDUCE_MOTION: &str = "accessibility.reduce_motion"; pub const A11Y_INCREASE_CONTRAST: &str = "accessibility.increase_contrast"; pub const A11Y_CURSOR_SIZE: &str = "accessibility.cursor_size"; pub const A11Y_TEXT_SIZE: &str = "accessibility.text_size"; pub const LOOK: &str = "look"; pub const NOTIFY_DND: &str = "notify.dnd"; pub const NOTIFY_DND_FROM: &str = "notify.dnd_from"; pub const NOTIFY_DND_UNTIL: &str = "notify.dnd_until"; pub const PRIVACY_REMEMBER: &str = "privacy.remember"; pub const LOCALE_TZ: &str = "locale.tz"; pub const LOCALE_REGION: &str = "locale.region"; pub const LOCALE_FIRST_DAY: &str = "locale.first_day"; pub const ALL: [&str; 47] = [BRIGHTNESS, IDLE_MIN, WALLPAPER, VOLUME, MUTE, POINTER, LOWBAT_PCT, DOCK_PINS, SETTINGS_TAB, FONT, FONT_SIZE, LOGIN_ITEMS, DISPLAY_MODE, DOCK_POSITION, DOCK_AUTOHIDE, APPEARANCE_MODE, APPEARANCE_ACCENT, APPEARANCE_HIGHLIGHT, TP_SPEED, TP_TAP, TP_NATURAL, TP_SECONDARY, TP_THREE_DRAG, QUARRY_FAVORITES, A11Y_REDUCE_MOTION, A11Y_INCREASE_CONTRAST, A11Y_CURSOR_SIZE, A11Y_TEXT_SIZE, LOOK, NOTIFY_DND, NOTIFY_DND_FROM, NOTIFY_DND_UNTIL, PRIVACY_REMEMBER, LOCALE_TZ, LOCALE_REGION, LOCALE_FIRST_DAY, A11Y_CVD, A11Y_INVERT, A11Y_ZOOM, A11Y_ZOOM_FOLLOW, A11Y_SHOW_PERF, LOCK_AFTER_IDLE_MIN, LOCK_ON_LID, LOCK_ON_SLEEP, KBD_LAYOUT, KBD_COMPOSE, AUDIO_OUTPUT]; pub const AUDIO_OUTPUT: &str = "audio.output"; pub const KBD_LAYOUT: &str = "keyboard.layout"; pub const KBD_COMPOSE: &str = "keyboard.compose"; pub const A11Y_CVD: &str = "accessibility.cvd"; pub const A11Y_INVERT: &str = "accessibility.invert"; pub const A11Y_ZOOM: &str = "accessibility.zoom"; pub const A11Y_ZOOM_FOLLOW: &str = "accessibility.zoom_follow"; pub const A11Y_SHOW_PERF: &str = "accessibility.show_performance"; pub const LOCK_AFTER_IDLE_MIN: &str = "lock.after_idle_min"; pub const LOCK_ON_LID: &str = "lock.on_lid"; pub const LOCK_ON_SLEEP: &str = "lock.on_sleep"; pub const DISPLAY_ICC: &str = "display.icc"; // DISPLAYICCFILE (rmbp-ledger B972): DISPLAY_ICC, the absolute path of an installed display profile `video::colour::latch` takes over the EDID, OUT of ALL until DISPLAY-ICC-FACE gives it a Settings row (ALL is the keys Settings rows; `settings::selftest_map` reds an unrowed one). TZLOCALE (B701): the three system.locale.* keys, Settings > Date & Time's rows. REASK (B681): PRIVACY_REMEMBER, Settings > Privacy's row (does a new answer get kept). SETTINGSMAP (B673): the keys Settings owns a row for (LOOK = prefs_core::appearance::LOOK_KEY, NOTIFY_* = notify/notifypane's, held equal by `tests settingsmap`) and ALL, the iterable table of every key here (LINE-NEUTRAL fold, code first). A11YPANE (B655): the Accessibility pane's four keys (LINE-NEUTRAL fold, code first: this file is lexed into every image)
 }
 
 static TREE: crate::sync::Mutex<PrefTree> = crate::sync::Mutex::new(PrefTree::new());
@@ -487,30 +487,15 @@ pub fn save_domain(d: &str) -> Result<usize, String> {
     let text = prefs_core::files::render(d, &want, &now_iso(), &by, &doc_of);
     let n = want.len();
     let p = domain_path(d);
-    let tmp = alloc::format!("{}.new", p);
+    // Parse the render: it must BE the domain's tree. The swap's read-back then proves the file is these bytes (VFSPUTREST B969).
+    match PrefTree::parse(&text) {
+        Ok(t) if t == want || t.to_toml() == want.to_toml() => {} // re-emit equality covers a NaN value
+        _ => return Err(String::from("render does not parse to the tree")),
+    }
     ensure_dirs();
-    write_all(&tmp, text.as_bytes())?;
-    // Read back and parse: the temp must BE the domain's tree before the real file is touched.
-    let back = read_all(&tmp).ok_or_else(|| String::from("read-back failed"))?;
-    if back != text.as_bytes() {
-        return Err(String::from("read-back differs"));
-    }
-    match core::str::from_utf8(&back).ok().map(PrefTree::parse) {
-        Some(Ok(t)) if t == want || t.to_toml() == want.to_toml() => {} // re-emit equality covers a NaN value
-        _ => return Err(String::from("read-back does not parse to the tree")),
-    }
-    let mt = store_mt();
-    let k = crate::fs::vfs::KERNEL_PRINCIPAL;
-    let _ = mt.unlink(&p, k);
-    match mt.rename(&tmp, &p, k) {
-        Ok(()) => {}
-        Err(crate::fs::vfs::VfsError::Unsupported) => {
-            // A backend with no rename: write the real file directly (said), then drop the temp.
-            write_all(&p, text.as_bytes())?;
-            let _ = mt.unlink(&tmp, k);
-            serial_println!("[prefs] swap=direct (the volume has no rename)");
-        }
-        Err(e) => return Err(alloc::format!("rename: {:?}", e)),
+    // `<d>.new` written, read back byte-equal, then renamed over the domain file; a volume with no rename is written direct.
+    if !store_mt().put_file_atomic(&p, text.as_bytes(), crate::fs::vfs::KERNEL_PRINCIPAL).map_err(|e| alloc::format!("swap {}: {:?}", p, e))? {
+        serial_println!("[prefs] swap=direct (the volume has no rename)");
     }
     on_disk_add(d);
     SAVED_N.store(n as u32, Ordering::Relaxed);

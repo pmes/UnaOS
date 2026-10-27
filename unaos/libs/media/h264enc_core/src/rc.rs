@@ -33,6 +33,8 @@
 //!   picture's complexity is the smaller of its zero-motion differences from the two anchors, and its
 //!   first QP is the last picture's + [`crate::B_QP_OFFSET`].
 //!
+//! - the one CBR constructor (H264ENC-CBRONE SR371): [`RateControl::cbr`], which Stria's `with_bitrate` and the kernel's export call.
+//!
 //! Owed (handlers.md §5 H264ENC-RC): two-pass, scene-cut IDRs, per-MB activity masking, HRD signalling.
 
 use alloc::vec::Vec;
@@ -324,6 +326,14 @@ impl Encoder {
     }
 }
 
+impl RateControl {
+    /// A constant bit rate of `kbps` kbit/s (`bits_per_second = kbps * 1000`, saturating) at `fps = (num, den)`:
+    /// `num / den` pictures per second. A time base `tb` (seconds per tick, `1/fps`) passes `(tb.den, tb.num)`.
+    pub const fn cbr(kbps: u32, fps: (u32, u32)) -> RateControl {
+        RateControl { bits_per_second: kbps.saturating_mul(1000), fps_num: fps.0, fps_den: fps.1, mode: RcMode::Cbr }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,7 +362,7 @@ mod tests {
 
     #[test]
     fn refused_rates() {
-        let ok = RateControl { bits_per_second: 64_000, fps_num: 30, fps_den: 1, mode: RcMode::Cbr };
+        let ok = RateControl::cbr(64, (30, 1));
         assert!(Rc::new(ok, 30, 26).is_ok());
         for bad in [
             RateControl { bits_per_second: 0, ..ok },
@@ -369,7 +379,7 @@ mod tests {
     #[test]
     fn rows_take_different_qps() {
         let (w, h) = (64usize, 64usize);
-        let rate = RateControl { bits_per_second: 20_000, fps_num: 30, fps_den: 1, mode: RcMode::Cbr };
+        let rate = RateControl::cbr(20, (30, 1));
         let mut enc = Encoder::new(Config { width: w as u32, height: h as u32, qp: 20, gop: 8, rate: Some(rate), ..Default::default() }).unwrap();
         let mut spread = 0;
         for t in 0..16usize {
@@ -380,5 +390,13 @@ mod tests {
             spread = spread.max(span.1 - span.0);
         }
         assert!(spread > 0, "no picture moved its rows' QP");
+    }
+
+    /// H264ENC-CBRONE (SR371): the constructor builds the struct both callers wrote by hand.
+    #[test]
+    fn cbr_constructor_equals_the_literal() {
+        assert_eq!(RateControl::cbr(200, (25, 1)), RateControl { bits_per_second: 200_000, fps_num: 25, fps_den: 1, mode: RcMode::Cbr });
+        assert_eq!(RateControl::cbr(40, (30_000, 1_001)), RateControl { bits_per_second: 40_000, fps_num: 30_000, fps_den: 1_001, mode: RcMode::Cbr });
+        assert_eq!(RateControl::cbr(u32::MAX, (25, 1)).bits_per_second, u32::MAX);
     }
 }

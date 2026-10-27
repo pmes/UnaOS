@@ -887,3 +887,71 @@ fn scc_dpb(mut s: hevc_core::ps::Sps, dpb: u32) -> hevc_core::ps::Sps {
     s.ordering[0].max_dec_pic_buffering_minus1 = dpb;
     s
 }
+
+/// HEVCLEVELLINE (SR368, HEVCSEI-MD5): a monochrome picture's one-component MD5 SEI (hash_type 0, payloadSize 17)
+/// gives a verdict (`plane_md5` is pinned against hashlib in tests/conformance.rs `sei_md5_kat`).
+#[test]
+fn v_monochrome_picture_md5_sei_gives_a_verdict() {
+    use hevc_core::picture::Plane;
+    use hevc_core::sei::{plane_md5, HashCheck};
+    let md5_sei = |delta: u8| move |y: &[u16]| -> Vec<u8> {
+        let mut d = plane_md5(&Plane { w: 8, h: 8, data: y.to_vec() }, 8);
+        d[15] = d[15].wrapping_add(delta);
+        let mut rbsp = vec![132, 17, 0];
+        rbsp.extend(d);
+        rbsp.push(0x80);
+        rbsp
+    };
+    for (delta, want) in [(0u8, HashCheck::Match), (1, HashCheck::Mismatch(0))] {
+        let f = md5_sei(delta);
+        let (s, _) = mono_pcm(1, Some(&f as &dyn Fn(&[u16]) -> Vec<u8>));
+        let mut d = Decoder::new();
+        d.decode_annexb(&s).expect("decode");
+        d.flush();
+        assert_eq!(d.take_frames().len(), 1);
+        assert_eq!(d.take_hash_checks(), vec![(0, want)], "delta {delta}");
+    }
+}
+
+/// HEVCLEVELLINE (SR368, HEVC-LEVEL-LINE): the A.3 names of bit-written profile_tier_levels read back by `parse_ptl`
+/// (the 43 constraint bits now kept): `flags` are Table A.2's max_12bit .. lower_bit_rate (then max_14bit) in order.
+#[test]
+fn w_profile_tier_level_names() {
+    use h264_core::bits::BitReader;
+    use hevc_core::ps::{parse_ptl, Ptl};
+    let names = |high: bool, idc: u32, compat: u32, flags: &str, level: u64| -> Ptl {
+        let mut b = BitWriter::default();
+        b.u(0, 2);
+        b.bit(high as u32);
+        b.u(idc as u64, 5);
+        b.u(compat as u64, 32);
+        b.u(0b1001, 4); // progressive, interlaced, non_packed, frame_only
+        for c in flags.bytes() {
+            b.bit((c == b'1') as u32);
+        }
+        b.u(0, 44 - flags.len() as u32);
+        b.u(level, 8);
+        b.u(0, 8); // byte padding for the reader
+        parse_ptl(&mut BitReader::new(&b.out), true, 0).names()
+    };
+    let p = |profile, tier, level| Ptl { profile, tier, level };
+    assert_eq!(names(false, 2, 0, "", 153), p("Main10", "main", (5, 1)));
+    assert_eq!(names(false, 2, 0, "00000001", 120), p("Main10Still", "main", (4, 0)));
+    assert_eq!(names(true, 4, 0, "110100001", 186), p("Main422_10", "high", (6, 2)));
+    assert_eq!(names(false, 4, 0, "000000100", 93), p("Main444_16Intra", "main", (3, 1)));
+    assert_eq!(names(false, 4, 0, "", 63), p("RExt", "main", (2, 1)));
+    assert_eq!(names(false, 9, 0, "1110000011", 150), p("ScreenExtendedMain444", "main", (5, 0)));
+    assert_eq!(names(false, 0, 1 << (31 - 3), "", 255), p("MainStill", "main", (8, 5)));
+    assert_eq!(names(false, 1, 0x6000_0000, "", 60), p("Main", "main", (2, 0)));
+}
+
+/// HEVCLEVELLINE (SR368): `Decoder::profile_tier_level` is the stored SPS's (the common kit writes Main, level 2) and
+/// `None` before any SPS.
+#[test]
+fn x_decoder_profile_tier_level() {
+    use hevc_core::ps::Ptl;
+    let mut d = Decoder::new();
+    assert_eq!(d.profile_tier_level(), None);
+    d.decode_annexb(&nal(33, &sps_rbsp(&SpsCfg::default()))).expect("sps");
+    assert_eq!(d.profile_tier_level(), Some(Ptl { profile: "Main", tier: "main", level: (2, 0) }));
+}

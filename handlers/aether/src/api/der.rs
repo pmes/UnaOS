@@ -2,111 +2,21 @@
 //! SubjectPublicKeyInfo (RFC 5280 §4.1.2.7), PrivateKeyInfo (RFC 5208 §5 / RFC 5958), RSAPublicKey and
 //! RSAPrivateKey (RFC 8017 A.1), ECPrivateKey (RFC 5915 §3) and the CurvePrivateKey OCTET STRING (RFC 8410 §7).
 //!
-//! The reader is strict DER, because key material is attacker-supplied: definite lengths in their minimal form,
-//! INTEGERs minimal and (where a key needs it) non-negative, nothing trailing. The writer emits only DER.
+//! PDFSIGNKEYPARSE (LEDGER SR361): the reader and the writer are tls_core's ONE key-container layer
+//! (`tls_core::key`, over its strict `Der` and `x509::build`); what stays here is the JS face's vocabulary — dotted
+//! OID strings and [`Params`] — mapped at the edge, every accept / refuse rule and every byte unchanged.
 
-/// Universal tags used here.
-pub const INTEGER: u8 = 0x02;
-pub const BIT_STRING: u8 = 0x03;
-pub const OCTET_STRING: u8 = 0x04;
-pub const NULL: u8 = 0x05;
-pub const OID: u8 = 0x06;
-pub const SEQUENCE: u8 = 0x30;
+use tls_core::key::{self, AlgParams};
+use tls_core::x509::build;
 
-/// A cursor over DER bytes.
-pub struct Reader<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    pub fn new(b: &'a [u8]) -> Self {
-        Reader { b, pos: 0 }
-    }
-
-    pub fn at_end(&self) -> bool {
-        self.pos == self.b.len()
-    }
-
-    /// The next tag, if any, without consuming it.
-    pub fn peek(&self) -> Option<u8> {
-        self.b.get(self.pos).copied()
-    }
-
-    /// One TLV: (tag, contents). Low-tag-number form only; lengths definite and minimal (X.690 §10.1).
-    pub fn tlv(&mut self) -> Option<(u8, &'a [u8])> {
-        let tag = *self.b.get(self.pos)?;
-        if tag & 0x1f == 0x1f {
-            return None;
-        }
-        let l0 = *self.b.get(self.pos + 1)? as usize;
-        let mut p = self.pos + 2;
-        let len = if l0 < 0x80 {
-            l0
-        } else {
-            let n = l0 & 0x7f;
-            if n == 0 || n > 4 {
-                return None;
-            }
-            let mut len = 0usize;
-            for i in 0..n {
-                len = (len << 8) | *self.b.get(p + i)? as usize;
-            }
-            // minimal: no leading zero octet, and the long form only for lengths >= 128
-            if self.b[p] == 0 || len < 0x80 {
-                return None;
-            }
-            p += n;
-            len
-        };
-        let end = p.checked_add(len)?;
-        let body = self.b.get(p..end)?;
-        self.pos = end;
-        Some((tag, body))
-    }
-
-    /// The next TLV, which must carry `tag`.
-    pub fn expect(&mut self, tag: u8) -> Option<&'a [u8]> {
-        match self.tlv()? {
-            (t, body) if t == tag => Some(body),
-            _ => None,
-        }
-    }
-
-    /// A non-negative INTEGER's magnitude, big-endian, minimal (X.690 §8.3.2), at least one byte.
-    pub fn uint(&mut self) -> Option<&'a [u8]> {
-        let b = self.expect(INTEGER)?;
-        if b.is_empty() || b[0] & 0x80 != 0 {
-            return None;
-        }
-        if b.len() > 1 && b[0] == 0 && b[1] & 0x80 == 0 {
-            return None;
-        }
-        if b.len() > 1 && b[0] == 0 { Some(&b[1..]) } else { Some(b) }
-    }
-
-    /// A small INTEGER (a version field).
-    pub fn small_uint(&mut self) -> Option<u64> {
-        let b = self.uint()?;
-        if b.len() > 8 {
-            return None;
-        }
-        Some(b.iter().fold(0u64, |a, &x| (a << 8) | x as u64))
-    }
-
-    /// An OBJECT IDENTIFIER in dotted form (X.690 §8.19).
-    pub fn oid(&mut self) -> Option<String> {
-        oid_to_string(self.expect(OID)?)
-    }
-
-    /// A BIT STRING with no unused bits (every key carried in one is whole octets).
-    pub fn bits(&mut self) -> Option<&'a [u8]> {
-        let b = self.expect(BIT_STRING)?;
-        if b.first() != Some(&0) {
-            return None;
-        }
-        Some(&b[1..])
-    }
+/// AlgorithmIdentifier's parameters as `crypto.subtle` carries them: none, NULL, or a named-curve OID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Params {
+    Absent,
+    Null,
+    Oid(String),
+    /// Anything else (explicit curve parameters, RSASSA-PSS-params, …): refused by every caller.
+    Other,
 }
 
 pub fn oid_to_string(b: &[u8]) -> Option<String> {
@@ -161,242 +71,97 @@ pub fn oid_from_string(s: &str) -> Vec<u8> {
     out
 }
 
-// ---- writer ------------------------------------------------------------------------------------------------------
+fn params_from(p: AlgParams<'_>) -> Option<Params> {
+    Some(match p {
+        AlgParams::Absent => Params::Absent,
+        AlgParams::Null => Params::Null,
+        AlgParams::Oid(b) => Params::Oid(oid_to_string(b)?),
+        AlgParams::Other => Params::Other,
+    })
+}
 
-pub fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    let n = body.len();
-    if n < 0x80 {
-        out.push(n as u8);
-    } else {
-        let bytes = n.to_be_bytes();
-        let skip = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
-        out.push(0x80 | (bytes.len() - skip) as u8);
-        out.extend_from_slice(&bytes[skip..]);
+/// The parameters' OID bytes (empty unless `Params::Oid`), which [`alg_params`] borrows.
+fn param_oid(p: &Params) -> Vec<u8> {
+    match p {
+        Params::Oid(o) => oid_from_string(o),
+        _ => Vec::new(),
     }
-    out.extend_from_slice(body);
-    out
 }
 
-pub fn seq(parts: &[Vec<u8>]) -> Vec<u8> {
-    tlv(SEQUENCE, &parts.concat())
-}
-
-/// A non-negative INTEGER from big-endian magnitude bytes (leading zeros dropped, a 0x00 added before a set
-/// high bit).
-pub fn uint(be: &[u8]) -> Vec<u8> {
-    let nz = be.iter().position(|&b| b != 0).unwrap_or(be.len());
-    let mut body = Vec::new();
-    let mag = &be[nz..];
-    if mag.is_empty() {
-        body.push(0);
-    } else {
-        if mag[0] & 0x80 != 0 {
-            body.push(0);
-        }
-        body.extend_from_slice(mag);
+fn alg_params<'a>(p: &Params, oid: &'a [u8]) -> AlgParams<'a> {
+    match p {
+        Params::Absent => AlgParams::Absent,
+        Params::Null => AlgParams::Null,
+        Params::Oid(_) => AlgParams::Oid(oid),
+        Params::Other => AlgParams::Other,
     }
-    tlv(INTEGER, &body)
-}
-
-pub fn oid(s: &str) -> Vec<u8> {
-    tlv(OID, &oid_from_string(s))
-}
-
-pub fn bits(b: &[u8]) -> Vec<u8> {
-    let mut body = vec![0u8];
-    body.extend_from_slice(b);
-    tlv(BIT_STRING, &body)
 }
 
 pub fn octets(b: &[u8]) -> Vec<u8> {
-    tlv(OCTET_STRING, b)
-}
-
-/// AlgorithmIdentifier's parameters as `crypto.subtle` carries them: none, NULL, or a named-curve OID.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Params {
-    Absent,
-    Null,
-    Oid(String),
-    /// Anything else (explicit curve parameters, RSASSA-PSS-params, …): refused by every caller.
-    Other,
-}
-
-fn alg_id(oid_s: &str, params: &Params) -> Vec<u8> {
-    let mut parts = vec![oid(oid_s)];
-    match params {
-        Params::Null => parts.push(tlv(NULL, &[])),
-        Params::Oid(o) => parts.push(oid(o)),
-        _ => {}
-    }
-    seq(&parts)
-}
-
-fn read_alg_id(r: &mut Reader) -> Option<(String, Params)> {
-    let body = r.expect(SEQUENCE)?;
-    let mut a = Reader::new(body);
-    let o = a.oid()?;
-    let params = if a.at_end() {
-        Params::Absent
-    } else {
-        match a.tlv()? {
-            (NULL, b) if b.is_empty() => Params::Null,
-            (OID, b) => Params::Oid(oid_to_string(b)?),
-            _ => Params::Other,
-        }
-    };
-    if !a.at_end() {
-        return None;
-    }
-    Some((o, params))
+    build::octets(b)
 }
 
 /// SubjectPublicKeyInfo → (algorithm OID, parameters, subjectPublicKey octets).
 pub fn spki_parse(b: &[u8]) -> Option<(String, Params, Vec<u8>)> {
-    let mut r = Reader::new(b);
-    let body = r.expect(SEQUENCE)?;
-    if !r.at_end() {
-        return None;
-    }
-    let mut s = Reader::new(body);
-    let (o, p) = read_alg_id(&mut s)?;
-    let key = s.bits()?;
-    if !s.at_end() {
-        return None;
-    }
-    Some((o, p, key.to_vec()))
+    let (o, p, k) = key::spki(b).ok()?;
+    Some((oid_to_string(o)?, params_from(p)?, k.to_vec()))
 }
 
 pub fn spki_build(oid_s: &str, params: &Params, key: &[u8]) -> Vec<u8> {
-    seq(&[alg_id(oid_s, params), bits(key)])
+    let po = param_oid(params);
+    key::spki_build(&oid_from_string(oid_s), &alg_params(params, &po), key)
 }
 
 /// PrivateKeyInfo / OneAsymmetricKey (version 0 or 1; attributes and the v2 public key are skipped) →
 /// (algorithm OID, parameters, privateKey octets).
 pub fn pkcs8_parse(b: &[u8]) -> Option<(String, Params, Vec<u8>)> {
-    let mut r = Reader::new(b);
-    let body = r.expect(SEQUENCE)?;
-    if !r.at_end() {
-        return None;
-    }
-    let mut s = Reader::new(body);
-    let version = s.small_uint()?;
-    if version > 1 {
-        return None;
-    }
-    let (o, p) = read_alg_id(&mut s)?;
-    let key = s.expect(OCTET_STRING)?;
-    while !s.at_end() {
-        let (tag, _) = s.tlv()?;
-        if tag != 0xa0 && tag != 0x81 && tag != 0xa1 {
-            return None;
-        }
-    }
-    Some((o, p, key.to_vec()))
+    let p = key::pkcs8(b).ok()?;
+    Some((oid_to_string(p.alg)?, params_from(p.params)?, p.key.to_vec()))
 }
 
 pub fn pkcs8_build(oid_s: &str, params: &Params, key: &[u8]) -> Vec<u8> {
-    seq(&[uint(&[0]), alg_id(oid_s, params), octets(key)])
+    let po = param_oid(params);
+    key::pkcs8_build(&oid_from_string(oid_s), &alg_params(params, &po), key)
 }
 
 /// RSAPublicKey → (n, e).
 pub fn rsa_public_parse(b: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    let mut r = Reader::new(b);
-    let body = r.expect(SEQUENCE)?;
-    if !r.at_end() {
-        return None;
-    }
-    let mut s = Reader::new(body);
-    let n = s.uint()?.to_vec();
-    let e = s.uint()?.to_vec();
-    if !s.at_end() {
-        return None;
-    }
-    Some((n, e))
+    let [n, e] = key::rsa_public(b).ok()?;
+    Some((n.to_vec(), e.to_vec()))
 }
 
 pub fn rsa_public_build(n: &[u8], e: &[u8]) -> Vec<u8> {
-    seq(&[uint(n), uint(e)])
+    key::rsa_public_build(n, e)
 }
 
 /// RSAPrivateKey (two-prime, version 0) → [n, e, d, p, q, dP, dQ, qInv].
 pub fn rsa_private_parse(b: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let mut r = Reader::new(b);
-    let body = r.expect(SEQUENCE)?;
-    if !r.at_end() {
-        return None;
-    }
-    let mut s = Reader::new(body);
-    if s.small_uint()? != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(8);
-    for _ in 0..8 {
-        out.push(s.uint()?.to_vec());
-    }
-    if !s.at_end() {
-        return None;
-    }
-    Some(out)
+    Some(key::rsa_private(b).ok()?.iter().map(|c| c.to_vec()).collect())
 }
 
 pub fn rsa_private_build(parts: &[Vec<u8>]) -> Vec<u8> {
-    let mut items = vec![uint(&[0])];
-    items.extend(parts.iter().map(|p| uint(p)));
-    seq(&items)
+    key::rsa_private_build(&parts.iter().map(Vec::as_slice).collect::<Vec<_>>())
 }
 
 /// ECPrivateKey (version 1) → (the private key octets, the named curve if `[0]` carries one, the public key
 /// if `[1]` carries one).
 pub fn ec_private_parse(b: &[u8]) -> Option<(Vec<u8>, Option<String>, Option<Vec<u8>>)> {
-    let mut r = Reader::new(b);
-    let body = r.expect(SEQUENCE)?;
-    if !r.at_end() {
-        return None;
-    }
-    let mut s = Reader::new(body);
-    if s.small_uint()? != 1 {
-        return None;
-    }
-    let d = s.expect(OCTET_STRING)?.to_vec();
-    let mut curve = None;
-    let mut public = None;
-    if s.peek() == Some(0xa0) {
-        let inner = s.expect(0xa0)?;
-        let mut i = Reader::new(inner);
-        curve = Some(i.oid()?);
-        if !i.at_end() {
-            return None;
-        }
-    }
-    if s.peek() == Some(0xa1) {
-        let inner = s.expect(0xa1)?;
-        let mut i = Reader::new(inner);
-        public = Some(i.bits()?.to_vec());
-        if !i.at_end() {
-            return None;
-        }
-    }
-    if !s.at_end() {
-        return None;
-    }
-    Some((d, curve, public))
+    let e = key::ec_private(b).ok()?;
+    let curve = match e.curve {
+        Some(c) => Some(oid_to_string(c)?),
+        None => None,
+    };
+    Some((e.d.to_vec(), curve, e.public.map(<[u8]>::to_vec)))
 }
 
 /// ECPrivateKey with the public key in `[1]` and no `[0]` (the curve is in the PrivateKeyInfo).
 pub fn ec_private_build(d: &[u8], public: &[u8]) -> Vec<u8> {
-    seq(&[uint(&[1]), octets(d), tlv(0xa1, &bits(public))])
+    key::ec_private_build(d, public)
 }
 
 /// CurvePrivateKey (RFC 8410 §7): an OCTET STRING.
 pub fn octets_parse(b: &[u8]) -> Option<Vec<u8>> {
-    let mut r = Reader::new(b);
-    let v = r.expect(OCTET_STRING)?.to_vec();
-    if !r.at_end() {
-        return None;
-    }
-    Some(v)
+    key::curve_private(b).ok().map(<[u8]>::to_vec)
 }
 
 #[cfg(test)]
@@ -412,7 +177,7 @@ mod tests {
         assert_eq!(spki_parse(&spki), Some(("1.3.101.112".to_string(), Params::Absent, vec![7u8; 32])));
         let big = rsa_public_build(&[0x80; 200], &[1, 0, 1]);
         assert_eq!(rsa_public_parse(&big), Some((vec![0x80; 200], vec![1, 0, 1])));
-        assert!(Reader::new(&[0x02, 0x81, 0x01, 0x00]).uint().is_none(), "non-minimal length");
-        assert!(Reader::new(&[0x02, 0x02, 0x00, 0x01]).uint().is_none(), "non-minimal integer");
+        assert!(tls_core::x509::der::Der::new(&[0x02, 0x81, 0x01, 0x00]).uint().is_err(), "non-minimal length");
+        assert!(tls_core::x509::der::Der::new(&[0x02, 0x02, 0x00, 0x01]).uint().is_err(), "non-minimal integer");
     }
 }

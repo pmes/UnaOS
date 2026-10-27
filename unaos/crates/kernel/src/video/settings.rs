@@ -2265,7 +2265,7 @@ fn bus_changes_inner() -> (usize, usize, usize) {
     let mut keys: Vec<&'static str> = Vec::new();
     let mut idle = 0usize;
     let frames = crate::prefs_client::changes_drain(|ns, k| {
-        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } if k.starts_with("keyboard.") { KB_DIRTY.store(true, Ordering::Release); } // KEYMAPS (B704): another client chose a layout. A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
+        if ns != crate::prefs::NS { return; } if k.starts_with("appearance.") { super::appearance::mark_dirty(); } if k.starts_with("accessibility.") { A11Y_DIRTY.store(true, Ordering::Release); } if k.starts_with("keyboard.") { KB_DIRTY.store(true, Ordering::Release); } #[cfg(feature = "dicc")] { if k == crate::prefs::key::DISPLAY_ICC { A11Y_DIRTY.store(true, Ordering::Release); } } // DISPLAYICCFILE (rmbp-ledger B972): the installed display profile key re-latches through the a11y filter's own door (a11y_load -> af::changed -> colour::latch). LINE-NEUTRAL append, code first. KEYMAPS (B704): another client chose a layout. A11YPANE (B655): the service pass re-reads and re-latches. APPEARANCE (B408): another client chose
         if let Some(s) = SHOWN.iter().find(|s| **s == k) {
             if *s == crate::prefs::key::IDLE_MIN { idle += 1; }
             if !keys.contains(s) { keys.push(s); }

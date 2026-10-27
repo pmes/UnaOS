@@ -25,13 +25,16 @@ pub use yuv_core::Chroma; use yuv_core::{Matrix, Picture, KR_KB_601}; // AV1PLAY
 #[cfg(test)]
 use yuv_core::{coeffs as yuv_coeffs, KR_KB_709};
 
-/// Decoded pixels: packed 8-bit RGBA, or planar 8-bit 4:2:0 YCbCr (what an AV1 decoder emits), or planar 4:2:0 YCbCr
-/// above 8 bits (COLOURONE SR328: `I420Hi`, a Main10 picture's samples as decoded, `bit_depth` 9..16).
+/// Decoded pixels: packed 8-bit RGBA, or planar 8-bit 4:2:0 YCbCr (what an AV1 decoder emits), or planar YCbCr above 8 bits
+/// (COLOURONE SR328: `I420Hi`, a Main10 picture's samples as decoded). COLOURONE422 (SR359): `I420Hi` is THE plane shape for
+/// everything else — `ss` the chroma subsampling as yuv_core's `Picture` takes it ((1, 1) 4:2:0, (1, 0) 4:2:2, (0, 0) 4:4:4;
+/// `uv_stride` samples per chroma row), `bit_depth` the luma's and `bit_depth_c` the Cb / Cr planes' (8..=16 each; 8-bit
+/// 4:2:2 / 4:4:4 too). `I420` stays the 8-bit 4:2:0 shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pixels {
     Rgba(Vec<u8>),
     I420 { y: Vec<u8>, u: Vec<u8>, v: Vec<u8>, y_stride: usize, uv_stride: usize },
-    I420Hi { y: Vec<u16>, u: Vec<u16>, v: Vec<u16>, y_stride: usize, uv_stride: usize, bit_depth: u8 },
+    I420Hi { y: Vec<u16>, u: Vec<u16>, v: Vec<u16>, y_stride: usize, uv_stride: usize, bit_depth: u8, ss: (u32, u32), bit_depth_c: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +70,8 @@ impl Frame {
         self.yuv_rgba(m, full, chroma)
     }
 
-    /// The one kernel at 4:2:0, the caller's chroma upsampling (nearest: the 2x2 block, COLOURONE's bytes), no dither.
+    /// The one kernel, the caller's chroma upsampling (nearest: the 2x2 block at 4:2:0, COLOURONE's bytes), no dither;
+    /// COLOURONE422 (SR359): an `I420Hi` frame at its own subsampling and per-plane depths (`yuv_core::to_rgba_depths`).
     fn yuv_rgba(&self, m: Matrix, full: bool, up: Chroma) -> Vec<u8> {
         let (w, h) = (self.width as usize, self.height as usize);
         let mut out = vec![0u8; w * h * 4];
@@ -77,9 +81,9 @@ impl Frame {
                 let p = Picture { w, h, y: &y[..], u: &u[..], v: &v[..], y_stride: *y_stride, uv_stride: *uv_stride, ss: (1, 1), mono: false, bit_depth: 8, full };
                 yuv_core::to_rgba(&p, m, up, false, &mut out);
             }
-            Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth } => {
-                let p = Picture { w, h, y: &y[..], u: &u[..], v: &v[..], y_stride: *y_stride, uv_stride: *uv_stride, ss: (1, 1), mono: false, bit_depth: *bit_depth as u32, full };
-                yuv_core::to_rgba(&p, m, up, false, &mut out);
+            Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth, ss, bit_depth_c } => {
+                let p = Picture { w, h, y: &y[..], u: &u[..], v: &v[..], y_stride: *y_stride, uv_stride: *uv_stride, ss: *ss, mono: false, bit_depth: *bit_depth as u32, full };
+                yuv_core::to_rgba_depths(&p, *bit_depth_c as u32, m, up, false, &mut out);
             }
         }
         out
@@ -166,7 +170,8 @@ pub fn reorder_depth(track: &Track) -> Option<u32> {
 /// configuration — what `Demuxer::fill_colour` takes as the fallback for what the container did not say (NLEPROBEHDR SR226;
 /// demux_core links no decoder, the [`reorder_depth`] shape). H.264 → `h264_core::ps::avcc_sps`'s VUI (only when
 /// video_signal_type is present); AV1 → `av1_core::image::stream_codes` (the av1C configOBUs, else `first`'s in-band sequence header, AV1INBANDCOLOUR SR366) mapped by `Colour::from_av1` (KERNELCOLOUR B952; color_config, plus the METADATA OBUs' content light
-/// levels and mastering display) when the `av1` feature is on. Anything else → `None` (HEVC-VUI is owed: hevc_core's SPS
+/// levels and mastering display) when the `av1` feature is on; VP9 → `vp9_core::header::header_codes` (the first key frame's
+/// color_space / color_range, AV1INBANDSIZE SR379's VP9-INBAND-COLOUR). Anything else → `None` (HEVC-VUI is owed: hevc_core's SPS
 /// carries the VUI colour, but its hvcC SPS reader is still the depth's own walk). Both of Stria's opens pass it by name
 /// beside [`reorder_depth`].
 pub fn colour_of(track: &Track, first: &[u8]) -> Option<super::demux::colour::Colour> {
@@ -188,6 +193,7 @@ pub fn colour_of(track: &Track, first: &[u8]) -> Option<super::demux::colour::Co
         }
         #[cfg(feature = "av1")]
         Codec::Av1 => av1_core::image::stream_codes(&track.config, first).map(|(c, l, m)| Colour::from_av1(c, l, m)), // KERNELCOLOUR (B952): the one mapping, the kernel Player's too; AV1INBANDCOLOUR (SR366): `first` the track's first sample
+        Codec::Vp9 => vp9_core::header::header_codes(first).map(|(primaries, transfer, matrix, full)| Colour { primaries, transfer, matrix, full_range: Some(full), mastering: None, light: None }), // AV1INBANDSIZE (SR379): VP9-INBAND-COLOUR, host only (the kernel decodes no VP9)
         _ => None,
     }
 }
@@ -540,11 +546,11 @@ mod tests {
         // offsets 64 / 512; yy 336, cb 88, cr -212, c = 19077 * 336 + 32768 = 6442640:
         // R (6442640 - 5830636) >> 16 = 9, G (6442640 - 270072 + 2259284) >> 16 = 128, B (6442640 + 3088008) >> 16 = 145.
         assert_eq!(yuv_coeffs((2627, 593), false, 10), (16, [19077, 27503, 3069, 10657, 35091], 64, 512));
-        let hi = Frame { width: 2, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![400; 4], u: vec![600], v: vec![300], y_stride: 2, uv_stride: 1, bit_depth: 10 } };
+        let hi = Frame { width: 2, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![400; 4], u: vec![600], v: vec![300], y_stride: 2, uv_stride: 1, bit_depth: 10, ss: (1, 1), bit_depth_c: 10 } };
         assert_eq!(hi.to_rgba_colour(Some(&colour(9, Some(false))), Chroma::Nearest)[..4], [9, 128, 145, 255]);
         // A Main10 sample narrowed after the conversion, not before: 601 limited Y 515 Cb 600 Cr 400 is (87, 145, 176);
         // the >> 2 planes (128, 150, 100) through the 8-bit table give (86, 145, 175).
-        let m10 = Frame { width: 2, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![515; 4], u: vec![600], v: vec![400], y_stride: 2, uv_stride: 1, bit_depth: 10 } };
+        let m10 = Frame { width: 2, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![515; 4], u: vec![600], v: vec![400], y_stride: 2, uv_stride: 1, bit_depth: 10, ss: (1, 1), bit_depth_c: 10 } };
         assert_eq!(m10.to_rgba()[..3], [87, 145, 176]);
         assert_eq!(px8(2, 2, 128, 150, 100, None), [86, 145, 175]);
     }
@@ -561,5 +567,68 @@ mod tests {
         // RGBA frames pass through untouched.
         let rgba = Frame { width: 1, height: 1, pts_ns: 0, pixels: Pixels::Rgba(vec![1, 2, 3, 4]) };
         assert_eq!(rgba.to_rgba_colour(Some(&colour(9, Some(true))), Chroma::Nearest), [1, 2, 3, 4]);
+    }
+}
+
+/// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): a video track's profile, tier and level as the Player's info line
+/// tokens ([`profile_tokens`]), read by its codec core from the track's decoder configuration — the [`reorder_depth`]
+/// dispatch shape. H.264 -> `h264_core::ps::avcc_sps` (profile_idc named per H.264 A.2, level_idc; H.264 has no tier);
+/// HEVC -> `hevc::hvcc_ptl` (hevc_core's A.3 names) when the `hevc` feature is on. Anything else, or a track with no
+/// configuration record (Annex B: the SPS arrives with the first sample), -> `None`.
+pub fn profile_level(track: &Track) -> Option<String> {
+    match &track.codec {
+        Codec::Avc => {
+            let s = h264_core::ps::avcc_sps(&track.config)?;
+            let profile = match s.profile_idc {
+                66 => "Baseline",
+                77 => "Main",
+                88 => "Extended",
+                100 => "High",
+                110 => "High10",
+                122 => "High422",
+                244 => "High444",
+                44 => "CAVLC444",
+                83 => "ScalableBaseline",
+                86 => "ScalableHigh",
+                118 => "MultiviewHigh",
+                128 => "StereoHigh",
+                _ => "Unknown",
+            };
+            // A.3.1 / A.3.2: level 1b is level_idc 9, or 11 with constraint_set3_flag in Baseline / Main / Extended.
+            let one_b = s.level_idc == 9 || (s.level_idc == 11 && s.constraint_set3 && matches!(s.profile_idc, 66 | 77 | 88));
+            let level = if one_b { (1, 0xB) } else { (s.level_idc / 10, s.level_idc % 10) };
+            Some(profile_tokens(profile, None, level))
+        }
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => hevc::hvcc_ptl(&track.config).map(|p| profile_tokens(p.profile, Some(p.tier), p.level)),
+        _ => None,
+    }
+}
+
+/// HEVCLEVELLINE (SR368): THE one formatter of the profile / tier / level tokens, both codecs':
+/// `profile=<name>[ tier=<main|high>] level=<major>[.<minor>]`; minor 0xB is H.264's level "1b".
+pub fn profile_tokens(profile: &str, tier: Option<&str>, level: (u8, u8)) -> String {
+    let mut s = format!("profile={profile}");
+    if let Some(t) = tier {
+        s += &format!(" tier={t}");
+    }
+    match level {
+        (m, 0xB) => s += &format!(" level={m}b"),
+        (m, 0) => s += &format!(" level={m}"),
+        (m, n) => s += &format!(" level={m}.{n}"),
+    }
+    s
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::profile_tokens;
+
+    #[test]
+    fn profile_tokens_kat() {
+        assert_eq!(profile_tokens("High", None, (4, 1)), "profile=High level=4.1");
+        assert_eq!(profile_tokens("Baseline", None, (1, 0xB)), "profile=Baseline level=1b");
+        assert_eq!(profile_tokens("Main10", Some("main"), (5, 0)), "profile=Main10 tier=main level=5");
+        assert_eq!(profile_tokens("Main422_10", Some("high"), (6, 2)), "profile=Main422_10 tier=high level=6.2");
     }
 }

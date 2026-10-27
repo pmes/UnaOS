@@ -11,10 +11,10 @@
 //! * THE JOB (the DECJOB shape, DECJOBHANG B386): `play-vdec`, its own task on a worker core (never cpu 0 — the
 //!   clock core — never the caller's), a [`STACK`]-byte stack whose high-water is on the wire at exit. It reads the
 //!   file, demuxes it, decodes every picture in decode order (VP8 and AV1 keep references: no packet is skipped)
-//!   to 0RGB, and parks the frames in a queue of [`QUEUE`]. It never presents.
+//!   keeping each picture's planes (KERNELSCALECONVERT B971: converted where used, [`Px`]), and parks the frames in a queue of [`QUEUE`]. It never presents.
 //! * THE CONSUMER (the Player's pass — one per vblank): [`present`] reads the clock, takes the NEWEST queued frame
 //!   whose time has come, counts every older one it passed over as a drop, and blits it nearest-scaled and
-//!   letterboxed into the window's video rect. At most one present per pass.
+//!   letterboxed into the window's video rect, converting only the shown rows ([`Frame::rows`]). At most one present per pass.
 //! * THE CLOCK: the audio ring's position while the container's sound plays (a/v sync by the audio clock); a
 //!   pause-aware wall clock without sound (TEST.MP4 is AV1 alone) or after it ends. Until the ring arms (≤ 1.5 s)
 //!   the picture waits at its first frame.
@@ -51,7 +51,7 @@ use demux_core::{colour::Colour, Codec, Demuxer};
 /// VFS read chain with margin; `[vplay] job exit … stack high=` re-derives it on metal.
 pub const STACK: usize = 256 * 1024;
 /// Frames decoded ahead of the clock.
-const QUEUE: usize = 3;
+const QUEUE: usize = vplay_queue(option_env!("UNAOS_VPLAY_QUEUE")); // KERNELSCALECOLS (rmbp-ledger B978): the build knob, default 3 (file tail)
 /// The largest file the job reads whole (the demuxer takes the bytes).
 const FILE_CAP: u64 = 96 << 20;
 /// The ring has this long to arm before the picture runs on the wall clock.
@@ -59,12 +59,12 @@ const AUDIO_WAIT_MS: u64 = 1_500;
 /// A job whose queue nobody drained for this long (and not paused) ends itself.
 const ORPHAN_MS: u64 = 30_000;
 
-/// One decoded picture, 0RGB, at its coded size; `pts_ms` from the track's first packet.
+/// One decoded picture at its coded size (its planes or 0RGB, [`Px`]); `pts_ms` from the track's first packet.
 pub struct Frame {
     pub pts_ms: u64,
     pub w: usize,
     pub h: usize,
-    pub px: Vec<u32>,
+    pub px: Px,
     /// NLE6 (SR207): a utp1 picture's `(output tick, frame ordinal)` in the EDL mode — the presented frame counter the
     /// witness compares with the schedule (the kernel has no utp1 renderer: the pixels are a flat field).
     pub ord: Option<(i64, u32)>,
@@ -228,7 +228,7 @@ impl Pic {
     /// or back by [`StandIn`]'s rule — `DecodeSwap::decode`'s: a parked decoder is offered a keyframe once (a decode = it plays
     /// again, `Swap::Back`; a refusal = reset and parked again); a REAL decoder's core `Unsupported` parks it (reset), the
     /// stand-in paints the refused packet (`Swap::ToStandIn`); any other error is the caller's.
-    fn decode_swap(&mut self, t: &demux_core::Track, data: &[u8], pts: i64, key: bool) -> Result<(Option<(usize, usize, Vec<u32>)>, Option<Swap>), String> {
+    fn decode_swap(&mut self, t: &demux_core::Track, data: &[u8], pts: i64, key: bool) -> Result<(Option<(usize, usize, Px)>, Option<Swap>), String> {
         let parked = match self {
             Pic::StandIn(s) if key => s.parked.take(),
             _ => None,
@@ -265,13 +265,13 @@ impl Pic {
 
     /// One packet → the picture it shows (`None`: an alt-ref / dropped frame that shows nothing); the String error of
     /// [`Pic::decode_raw`] (the poster's door).
-    fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
+    fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Px)>, String> {
         self.decode_raw(data, 0).map_err(|e| e.1)
     }
 
     /// SWAPBACKVPLAY (B956): the decode arms; `Err((unsupported, why))`, `unsupported` = the core's own `Unsupported` (the
     /// swap's one trigger: av1_core's; vp8_core and utp1 have none). `pts` (track ticks) clocks the stand-in's counter.
-    fn decode_raw(&mut self, data: &[u8], pts: i64) -> Result<Option<(usize, usize, Vec<u32>)>, (bool, String)> {
+    fn decode_raw(&mut self, data: &[u8], pts: i64) -> Result<Option<(usize, usize, Px)>, (bool, String)> {
         match self {
             Pic::Vp8(d, c) => {
                 if data.is_empty() {
@@ -283,13 +283,11 @@ impl Pic {
                     Err(e) => return Err((false, alloc::format!("vp8: {:?}", e))),
                 };
                 let y = vp8_core::Yuv420::from_picture(&pic);
-                let rgba = colour_rgba_vp8(&y, *c);
-                Ok(Some((y.width as usize, y.height as usize, pack(&rgba))))
+                Ok(Some((y.width as usize, y.height as usize, Px::planes(Src::Vp8(y, *c))))) // KERNELSCALECONVERT (B971): the planes, converted where used
             }
             Pic::Av1(d, c) => {
-                let planes = d.decode_temporal_unit(data).map_err(|e| (matches!(e, av1_core::Error::Unsupported(_)), alloc::format!("av1: {:?}", e)))?;
-                let rgba = colour_rgba_av1(&planes, *c);
-                Ok(Some((planes.width as usize, planes.height as usize, pack(&rgba))))
+                let planes = d.decode_temporal_unit(data).map_err(|e| (matches!(e, av1_core::Error::Unsupported(_)), alloc::format!("av1: {:?}", e)))?; inband_size(d, &planes, pts); // AV1INBANDSIZE (SR379): the size line, av1_core's ONE rule (file tail)
+                Ok(Some((planes.width as usize, planes.height as usize, Px::planes(Src::Av1(Box::new(planes), inband_colour(d, *c, pts)))))) // KERNELSCALECONVERT (B971); AV1INBANDSWITCH (SR373): the frame's colour, decided at the decode
             }
             Pic::Utp1 => {
                 // the stream's own decoder: the packet names its frame; the picture is a flat field whose level steps
@@ -297,11 +295,11 @@ impl Pic {
                 let t = demux_core::build::TestPatternPacket::decode(data).ok_or_else(|| (false, String::from("utp1: not a UTP1 packet")))?;
                 let (w, h) = ((t.width as usize).max(1), (t.height as usize).max(1));
                 let l = 28 + t.frame % 200;
-                Ok(Some((w, h, alloc::vec![(l << 16) | (l << 8) | l; w * h])))
+                Ok(Some((w, h, alloc::vec![(l << 16) | (l << 8) | l; w * h].into())))
             }
             Pic::StandIn(s) => {
                 let n = demux_core::build::stand_in_counter(s.tb.to_ns(pts), s.frame_ns);
-                Ok(Some((s.w as usize, s.h as usize, pack(&demux_core::build::test_pattern_rgba(s.w, s.h, n)))))
+                Ok(Some((s.w as usize, s.h as usize, pack(&demux_core::build::test_pattern_rgba(s.w, s.h, n)).into())))
             }
         }
     }
@@ -321,10 +319,10 @@ fn pack(rgba: &[u8]) -> Vec<u32> {
 
 /// Nearest-scale `f` into the `bw x bh` rect at `(x, y)` of a `stride`-wide surface, aspect kept, the bars
 /// `bar`. Returns the picture's drawn size. KERNELSCALEONE (rmbp-ledger B965): the letterbox and the samples are yuv_core's
-/// ONE resampler (`yuv_core::scale::fit` / `nearest_rows`, user-stria's too) over the frame as a mono `Picture<u32>`.
+/// ONE resampler (`yuv_core::scale::fit` / `nearest_rows`, user-stria's too). KERNELSCALECONVERT (rmbp-ledger B971): only the
+/// shown rows convert ([`Frame::rows`]).
 pub fn blit_fit(dst: &mut [u32], stride: usize, x: usize, y: usize, bw: usize, bh: usize, f: &Frame, bar: Option<u32>) -> (usize, usize) {
-    let pic = yuv_core::Picture { w: f.w, h: f.h, y: &f.px[..], u: &[], v: &[], y_stride: f.w, uv_stride: 0, ss: (0, 0), mono: true, bit_depth: 8, full: true };
-    if f.w == 0 || f.h == 0 || bw == 0 || bh == 0 || !yuv_core::scale::fits(&pic) {
+    if f.w == 0 || f.h == 0 || bw == 0 || bh == 0 || !f.fits() {
         return (0, 0);
     }
     let fr = yuv_core::scale::fit(f.w, f.h, bw, bh);
@@ -342,11 +340,10 @@ pub fn blit_fit(dst: &mut [u32], stride: usize, x: usize, y: usize, bw: usize, b
             dst[row + x..row + x + bw].fill(c);
         }
     }
-    let mut buf = alloc::vec![0u32; dw];
-    yuv_core::scale::nearest_rows(&pic, dw, dh, &mut buf, &mut [], &mut [], |i, s| {
+    f.rows(dw, dh, |i, s| {
         let row = (oy + i) * stride;
         if row + x + bw <= dst.len() {
-            dst[row + ox..row + ox + dw].copy_from_slice(&s.y[..dw]);
+            dst[row + ox..row + ox + dw].copy_from_slice(&s[..dw]);
         }
     });
     (dw, dh)
@@ -391,13 +388,16 @@ struct Play {
     audio_seen: bool,
     /// NLE6 (SR207): `(output tick, ordinal)` of each presented frame that carries one (at most [`SHOWN_CAP`]).
     shown: Vec<(i64, u32)>,
+    /// KERNELSCALECOLS (B978): the presents' blit cycles, summed, and the largest one (`present_us`, file tail).
+    present_cyc: u64,
+    present_max: u64,
 }
 
 static PLAY: crate::sync::Mutex<Play> = crate::sync::Mutex::new(Play::new());
 
 impl Play {
     const fn new() -> Play {
-        Play { presented: 0, dropped: 0, sync_sum: 0, sync_n: 0, sync_max: 0, by_audio: 0, by_wall: 0, media_ms: 0, wall_ms: 0, open_ms: 0, audio_expected: false, audio_seen: false, shown: Vec::new() }
+        Play { presented: 0, dropped: 0, sync_sum: 0, sync_n: 0, sync_max: 0, by_audio: 0, by_wall: 0, media_ms: 0, wall_ms: 0, open_ms: 0, audio_expected: false, audio_seen: false, shown: Vec::new(), present_cyc: 0, present_max: 0 }
     }
 }
 
@@ -445,7 +445,7 @@ pub fn start_at(path: &str, ms: u64) -> u32 {
     let jid = GEN.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     *JOB.lock() = Some(Job { jid, path: String::from(path), facts: None, queue: VecDeque::new(), decoded: 0, err: None, eos: false, sound: None, seek_ms: ms });
     let t = now();
-    *PLAY.lock() = Play { open_ms: t, wall_ms: t, media_ms: ms, ..Play::new() };
+    *PLAY.lock() = Play { open_ms: t, wall_ms: t, media_ms: ms, ..Play::new() }; knobs_latch(); // KERNELSCALEONEARM (rmbp-ledger B980): the `vid` queue depth and filter apply from this job start (file tail)
     PAUSED.store(false, Ordering::Release);
     SPAWN_MS.store(t, Ordering::Release);
     DRAIN_MS.store(t, Ordering::Release);
@@ -555,7 +555,7 @@ pub fn present(dst: &mut [u32], w: usize, vh: usize, audio_ms: Option<u64>, play
             p.shown.push(o); // NLE6 (SR207): the presented frame counter
         }
     }
-    let vh = view_band(dst, w, vh, f.pts_ms); blit_fit(dst, w, 0, 0, w, vh, &f, Some(0)); // NLE6KEYS (rmbp-ledger B961): the EDL's track view in the picture rect's lower band (file tail)
+    let vh = view_band(dst, w, vh, Some(f.pts_ms)); let c0 = crate::arch::now_cycles(); blit_fit(dst, w, 0, 0, w, vh, &f, Some(0)); present_cost(c0); // NLE6KEYS (rmbp-ledger B961): the EDL's track view in the picture rect's lower band (file tail)
     (true, media)
 }
 
@@ -672,7 +672,7 @@ fn room(jid: u32) -> Result<(), &'static str> {
             return Err("aborted");
         }
         let q = JOB.lock().as_ref().map(|j| j.queue.len()).unwrap_or(0);
-        if q < QUEUE {
+        if q < QUEUE_LIVE.load(Ordering::Acquire) as usize {
             return Ok(());
         }
         if now().saturating_sub(DRAIN_MS.load(Ordering::Acquire)) > ORPHAN_MS && !PAUSED.load(Ordering::Acquire) {
@@ -835,6 +835,7 @@ fn poster_task(arg: usize) {
         for s in d.track_samples(d.track_index(vt.id).unwrap_or(0)).take(8) {
             let pk = d.packet_at(s);
             if let Some((w, h, px)) = pic.decode(&pk.data)? {
+                let _ = px.rgb(); // KERNELSCALECONVERT (B971): the poster converts on its own job; the render task blits the cached 0RGB
                 return Ok((f, Some(Frame { pts_ms: 0, w, h, px, ord: None })));
             }
         }
@@ -1044,7 +1045,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         reels.reels.push(Reel { id: s.id, d, v, a });
     }
     let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?;
-    rep.reels = reels.reels.len();
+    rep.reels = reels.reels.len(); super::export::set_reels(jid, tl.reels_colour(|id| reels.get(id).and_then(|r| r.v.as_ref()).and_then(|v| v.1.colour))); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the export file's (video/export.rs)
     rep.clips = tl.tracks.iter().map(|t| t.clips.len()).sum();
     rep.steps = steps.len();
     serial_println!("[nle] open edl={} reels={} clips={} steps={}", path, rep.reels, rep.clips, rep.steps);
@@ -1077,7 +1078,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
                 if s.vmix.is_none() {
                     rep.gaps += 1; // a to-black step's black is mixed below (NLE6MIX)
                 }
-                Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize], ord: None }
+                Frame { pts_ms, w: fw as usize, h: fh as usize, px: alloc::vec![0; fw as usize * fh as usize].into(), ord: None }
             }
             Some(id) => {
                 let (w, h, px, ord) = edl_frame(&reels, tl.tb, &mut run, id, s.src_t, s.seek.is_some(), rep, false)?;
@@ -1092,7 +1093,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         if pts_ms < seek_ms {
             continue; // a Player seek: the steps before it decoded unseen (job_task's rule)
         }
-        if let super::export::Sink::Encode = super::export::sink(jid) { super::export::frame(jid, tl.tb, vcount, frame.w, frame.h, &unpack(&frame.px)).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
+        if let super::export::Sink::Encode = super::export::sink(jid) { export_frame(jid, tl.tb, vcount, &frame).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
         {
             let mut g = JOB.lock();
             let Some(j) = g.as_mut().filter(|j| j.jid == jid) else { return Err(("superseded", None)) };
@@ -1102,7 +1103,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         }
         snd::tick(jid); crate::arch::sched::yield_now(); // NLE6MIXAUDIO (rmbp-ledger B953): the sound, once per step (file tail)
     }
-    snd::drain(jid); Ok(()) // NLE6MIXAUDIO (rmbp-ledger B953): the sound plays out after the last picture, bounded (file tail)
+    super::export::sound_tail(jid); snd::drain(jid); Ok(()) // NLE6EXPORTSTREAMPCM (rmbp-ledger B976): an Encode job's capture window lifted after its last picture (video/export.rs). NLE6MIXAUDIO (rmbp-ledger B953): the sound plays out after the last picture, bounded (file tail)
 }
 
 // ── NLE6MIX (rmbp-ledger B899): the transition mix on the EDL job — the second run, the ONE mix fn, the refusal ─────────
@@ -1128,7 +1129,7 @@ fn edl_frame(
     seek: bool,
     rep: &mut EdlReport,
     outgoing: bool,
-) -> Result<(usize, usize, Vec<u32>, Option<u32>), (&'static str, Option<String>)> {
+) -> Result<(usize, usize, Px, Option<u32>), (&'static str, Option<String>)> {
     let r = reels.get(id).ok_or_else(|| ("reel-missing", Some(alloc::format!("no reel for source {}", id.0))))?;
     let (ti, vt, o) = r.v.as_ref().ok_or_else(|| ("no-video", Some(alloc::format!("reel {} has no video stream", id.0))))?;
     if seek || slot.as_ref().map(|x| x.src) != Some(id) {
@@ -1203,7 +1204,7 @@ fn edl_mix(
                 }
             }
             match edl_frame(reels, tb, mix, o, m.src_t, m.seek.is_some(), rep, true) {
-                Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => unpack(&px),
+                Ok((ow, oh, px, _)) if (ow, oh) == (w, h) => unpack(px.rgb()),
                 Ok((ow, oh, _, _)) => {
                     *mix = None;
                     edl_refuse(rep, &alloc::format!("size {}x{} != {}x{}", ow, oh, w, h));
@@ -1218,13 +1219,13 @@ fn edl_mix(
             }
         }
     };
-    let b = unpack(&frame.px);
+    let b = unpack(frame.px.rgb());
     timeline_core::vmix::mix_step(m.kind, m.t, &mut a, &b, w as u32, h as u32);
     let sum = frame_fnv_rgba(&a);
     if rep.mixes.len() < SHOWN_CAP {
         rep.mixes.push((out_t, sum));
     }
-    frame.px = pack(&a);
+    frame.px = pack(&a).into();
     rep.mixed += 1;
     rep.mix_us_max = rep.mix_us_max.max(crate::hidstall::now_us().saturating_sub(t0));
     Ok(())
@@ -1294,10 +1295,8 @@ fn bitstream_colour(t: &demux_core::Track, first: &[u8]) -> Option<Colour> {
 
 /// A VP8 picture -> RGBA by the track's colour: 8-bit 4:2:0, nearest chroma (Stria's `Pixels::I420` path).
 fn colour_rgba_vp8(y: &vp8_core::Yuv420, c: Option<Colour>) -> Vec<u8> {
-    let (w, h) = (y.width as usize, y.height as usize);
-    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), y.width, y.height);
-    let p = yuv_core::Picture { w, h, y: &y.y, u: &y.u, v: &y.v, y_stride: w, uv_stride: y.chroma_width() as usize, ss: (1, 1), mono: false, bit_depth: 8, full };
-    let mut out = alloc::vec![0u8; w * h * 4];
+    let (p, m) = vp8_picture(y, c); // KERNELSCALECONVERT (B971): the one pick + Picture, shared with the shown rows (file tail)
+    let mut out = alloc::vec![0u8; p.w * p.h * 4];
     yuv_core::to_rgba(&p, m, yuv_core::Chroma::Nearest, false, &mut out);
     out
 }
@@ -1305,17 +1304,16 @@ fn colour_rgba_vp8(y: &vp8_core::Yuv420, c: Option<Colour>) -> Vec<u8> {
 /// An AV1 picture -> RGBA by the track's colour: av1_core's own `picture` (any depth, any subsampling) with the pick's
 /// range, bilinear chroma (Stria's `Av1Decoder`).
 fn colour_rgba_av1(planes: &av1_core::image::Planes, c: Option<Colour>) -> Vec<u8> {
-    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), planes.width, planes.height);
-    let p = yuv_core::Picture { full, ..av1_core::image::picture(planes) };
+    let (p, m) = av1_picture(planes, c); // KERNELSCALECONVERT (B971): the one pick + Picture, shared with the shown rows (file tail)
     let mut out = alloc::vec![0u8; p.w * p.h * 4];
     yuv_core::to_rgba(&p, m, yuv_core::Chroma::Bilinear, false, &mut out);
     out
 }
 
 /// The EDL report's coded-picture witness: a picture with no utp1 ordinal, while fewer than [`CODED_CAP`] are kept.
-fn coded(rep: &mut EdlReport, out_t: i64, ord: Option<u32>, px: &[u32]) {
+fn coded(rep: &mut EdlReport, out_t: i64, ord: Option<u32>, px: &Px) {
     if ord.is_none() && rep.coded.len() < CODED_CAP {
-        rep.coded.push((out_t, frame_fnv_rgba(&unpack(px))));
+        rep.coded.push((out_t, frame_fnv_rgba(&unpack(px.rgb())))); // KERNELSCALECONVERT (B971): converted (and cached) only when hashed
     }
 }
 
@@ -1795,7 +1793,7 @@ fn face_preview(seek_ms: u64, rep: &EdlReport, out_t: i64, f: &Frame) {
         return;
     }
     let mix = rep.mixes.last().filter(|m| m.0 == out_t).map(|m| m.1);
-    let sum = mix.unwrap_or_else(|| frame_fnv_rgba(&unpack(&f.px)));
+    let sum = mix.unwrap_or_else(|| frame_fnv_rgba(&unpack(f.px.rgb())));
     serial_println!("[nle] face preview tick={} mixed={}", out_t, mix.is_some() as u8);
     *PREVIEW.lock() = Some((out_t, mix.is_some(), sum));
 }
@@ -1816,7 +1814,12 @@ pub fn face_preview_take() -> Option<(i64, bool, u64)> {
 // Player's seek door (`vid::seek`) restarts the job at the playhead over the edited state. [`view_band`]: the picture
 // rect's lower band shows timeline_core's ONE track view (`view::paint_in`, `Role::Tracks`): the host face's pixels.
 // Wire: `[nle] edit <verb> at=<tick> clips=<n> undo=<n> saved=<bytes|refused(..)>`, `[nle] edit <verb> at=<tick> refused
-// (<why>)`, `[nle] view w=<n> h=<n> rows=<n> at=<tick>` (once per seed). Witness: player.rs `tests nle` (`keys=`).
+// (<why>)`, `[nle] view w=<n> h=<n> rows=<n> at=<tick> labels=<n>` (once per seed). Witness: player.rs `tests nle` (`keys=`).
+// NLE6KEYSLABELS (rmbp-ledger B968): the view band's labels (the ruler's timecode, each clip's reel) go through the view's
+// `Text` hook to the kernel's ONE text seam ([`ViewLabels`]: `video::text::draw_with`, `Face::Body`, blended by
+// `video::font::blend`) at the host's positions; `+` / `=` / `-` / `0` are the ONE zoom (`EditorState::verb` `zoom+` /
+// `zoom-` / `zoom0`) on the Player's editor state ([`edit_zoom`]: no save, the seek door re-presents the band),
+// `[nle] edit <zoom+|zoom-|zoom0> at=<tick> zoom=<px>`.
 
 struct Edit {
     path: String,
@@ -1828,8 +1831,9 @@ static EDIT: crate::sync::Mutex<Option<Edit>> = crate::sync::Mutex::new(None);
 
 /// The kernel face's key bindings (bytes) onto timeline_core's editor verbs: `s` split, `x` / Delete / Backspace delete,
 /// `u` / `z` undo, `Z` redo, `[` / `]` the in point -1 / +1, `{` / `}` the out point -1 / +1, `i` / `o` the in / out point
-/// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport).
-const EDIT_KEYS: [(u8, &str); 13] = [
+/// to the playhead (the host face's meanings; Space and the arrows stay the Player's transport); NLE6KEYSLABELS (B968):
+/// `+` / `=` zoom in, `-` zoom out, `0` the default zoom (the host's `KEYS` + / = / -).
+const EDIT_KEYS: [(u8, &str); 17] = [
     (b's', "split"),
     (b'x', "delete"),
     (0x7F, "delete"),
@@ -1843,6 +1847,10 @@ const EDIT_KEYS: [(u8, &str); 13] = [
     (b'}', "}"),
     (b'i', "mark-in"),
     (b'o', "mark-out"),
+    (b'+', "zoom+"),
+    (b'=', "zoom+"),
+    (b'-', "zoom-"),
+    (b'0', "zoom0"),
 ];
 
 /// The EDL job's open: a fresh EDL (or another path) seeds the Player's editor state; the same path keeps it (a restart
@@ -1887,7 +1895,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let tb = st.timeline.tb;
         st.seek(tick_of(tb, ms));
         let at = st.playhead;
-        if verb != "undo" && verb != "redo" {
+        if verb.starts_with("zoom") { return edit_zoom(st, verb, at); } if verb != "undo" && verb != "redo" { // NLE6KEYSLABELS (rmbp-ledger B968): a zoom key neither reselects nor saves (section tail)
             let top = (0..st.timeline.tracks.len())
                 .rev()
                 .filter(|&i| st.timeline.tracks[i].kind == timeline_core::Kind::Video)
@@ -1915,15 +1923,7 @@ pub fn edit_key(path: &str, b: u8, ms: u64) -> Option<u64> {
         let clips: usize = st.timeline.tracks.iter().map(|t| t.clips.len()).sum();
         (at, st.timeline.clone(), clips, st.undo_depth(), (tb.to_ns(at).max(0) as u64) / 1_000_000)
     };
-    let leaf = path.rsplit('/').next().unwrap_or(path);
-    let stem = if is_edl(leaf) { &leaf[..leaf.len() - 4] } else { leaf };
-    let saved = match timeline_core::edl::write(&tl, stem) {
-        Ok(text) => match super::export::write_file(path, text.as_bytes()) {
-            Ok(n) => alloc::format!("{}", n),
-            Err(e) => alloc::format!("refused({})", e),
-        },
-        Err(e) => alloc::format!("refused({})", e),
-    };
+    let saved = edit_save(path, &tl); // NLE6FACEDRAG (rmbp-ledger B975): the ONE save, shared with the drag door (file tail)
     serial_println!("[nle] edit {} at={} clips={} undo={} saved={}", verb, at, clips, undo, saved);
     Some(back)
 }
@@ -1935,13 +1935,15 @@ pub fn edit_timeline() -> Option<timeline_core::Timeline> {
 
 /// The Player closed: its editor state goes (a later open of the same EDL reads the saved file afresh).
 pub fn edit_close() {
-    *EDIT.lock() = None;
+    *EDIT.lock() = None; BAND_DIRTY.store(false, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): no band to repaint (file tail)
 }
 
 /// The present's view band: with an editor state for the live job's EDL, timeline_core's track view (`Role::Tracks`, the
 /// playhead at the presented frame's tick) over the picture rect's lower `RULER_H + rows * ROW_H` rows (at most half
-/// of it); returns the rows left for the picture (`vh` unchanged when there is no view).
-fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: u64) -> usize {
+/// of it); returns the rows left for the picture (`vh` unchanged when there is no view). NLE6DRAGSNAP (rmbp-ledger B977):
+/// `pts_ms` `None` repaints at the playhead it holds (a drag's [`band_repaint`]); a live drag paints the host's way, the
+/// preview state (`Drag::shown`) then `view::paint_drag` (the snap guide, the marquee).
+fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: Option<u64>) -> usize {
     use timeline_core::view;
     let Some(live) = JOB.try_lock().and_then(|g| g.as_ref().map(|j| j.path.clone())) else { return vh };
     let Some(mut g) = EDIT.try_lock() else { return vh };
@@ -1952,14 +1954,550 @@ fn view_band(dst: &mut [u32], w: usize, vh: usize, pts_ms: u64) -> usize {
         return vh;
     }
     let tb = e.st.timeline.tb;
-    e.st.seek(tick_of(tb, pts_ms));
+    if let Some(ms) = pts_ms {
+        e.st.seek(tick_of(tb, ms));
+    }
     let l = view::Layout::of_role(view::Role::Tracks, w as u32, band as u32, &e.st);
-    let px = pack(&view::paint_in(&e.st, l, view::Order::Rgba, None, None));
-    let y0 = vh - band;
+    let mut lab = ViewLabels(0);
+    let drag = DRAG.try_lock().and_then(|g| g.as_ref().map(|d| d.1));
+    let shown = drag.as_ref().and_then(|d| d.shown(&e.st));
+    let st = shown.as_ref().unwrap_or(&e.st);
+    let px = pack(&view::paint_drag(view::paint_in(st, l, view::Order::Rgba, Some(&mut lab as &mut dyn view::Text), None), l, view::Order::Rgba, drag.as_ref()));
+    let y0 = vh - band; band_note(&live, y0, l); // NLE6FACEDRAG (rmbp-ledger B975): the layout painted is the layout a press hits (file tail)
     dst[y0 * w..vh * w].copy_from_slice(&px);
     if !e.said {
         e.said = true;
-        serial_println!("[nle] view w={} h={} rows={} at={}", w, band, rows, e.st.playhead);
+        serial_println!("[nle] view w={} h={} rows={} at={} labels={}", w, band, rows, e.st.playhead, lab.0);
     }
     y0
 }
+
+/// NLE6KEYSLABELS (rmbp-ledger B968): a zoom key on the Player's editor state — `EditorState::verb`'s ONE zoom (the host
+/// face's words); the EDL carries no zoom, so nothing is saved. `Some(ms)`: the playhead for the seek door, which
+/// re-presents the frame and with it the band at the new zoom; `None`: at a bound, unchanged.
+fn edit_zoom(st: &mut timeline_core::editor::EditorState, verb: &str, at: i64) -> Option<u64> {
+    let z0 = st.zoom;
+    if !matches!(st.verb(verb), Some(Ok(()))) || st.zoom == z0 {
+        serial_println!("[nle] edit {} at={} unchanged", verb, at);
+        return None;
+    }
+    serial_println!("[nle] edit {} at={} zoom={}", verb, at, st.zoom);
+    Some((st.timeline.tb.to_ns(at).max(0) as u64) / 1_000_000)
+}
+
+/// The cell's top sits this far above the view hook's baseline: the ruler label's baseline is the ruler's top + 9, so the
+/// 16-px `Face::Body` cell fills the 16-px ruler exactly.
+const LABEL_RISE: f32 = 9.0;
+
+/// NLE6KEYSLABELS (rmbp-ledger B968): the view's label hook over the kernel's ONE text seam — `video::text::draw_with` in
+/// `Face::Body` (the fixed 7x16 cell), each covered pixel blended into the band's canvas by `video::font::blend`, inside
+/// the hook's clip columns; the host's positions, the kernel's glyphs. Counts the labels drawn (the `[nle] view` line).
+struct ViewLabels(usize);
+
+impl timeline_core::view::Text for ViewLabels {
+    fn text(&mut self, c: &mut timeline_core::view::Canvas, s: &str, x: f32, baseline: f32, clip: (i32, i32)) {
+        let (w, h) = (c.w as isize, c.h as isize);
+        let (lo, hi) = (clip.0.max(0) as isize, (clip.1 as isize).min(w));
+        if x < 0.0 || x as isize >= hi {
+            return;
+        }
+        let x = x as usize;
+        let l = timeline_core::view::LABEL;
+        let ink = (l[0] as u32) << 16 | (l[1] as u32) << 8 | l[2] as u32;
+        let (ri, bi) = match c.order {
+            timeline_core::view::Order::Rgba => (0, 2),
+            timeline_core::view::Order::Bgra => (2, 0),
+        };
+        let top = (baseline - LABEL_RISE) as isize;
+        let px = &mut c.px;
+        let _ = super::text::draw_with(s.as_bytes(), false, super::text::Face::Body, x, top, (hi - x as isize) as usize, ink, &mut |gx, gy, a| {
+            if gx < lo || gx >= hi || gy < 0 || gy >= h {
+                return;
+            }
+            let i = ((gy * w + gx) * 4) as usize;
+            let Some(p) = px.get_mut(i..i + 4) else { return };
+            let bg = (p[ri] as u32) << 16 | (p[1] as u32) << 8 | p[bi] as u32;
+            let o = super::font::blend(bg, ink, a);
+            p[ri] = (o >> 16) as u8;
+            p[1] = (o >> 8) as u8;
+            p[bi] = o as u8;
+        });
+        self.0 += 1;
+    }
+}
+
+// ── KERNELSCALECONVERT (rmbp-ledger B971): the frame's planes, converted where they are used ─────────────────────────────
+// handlers.md §5 NLEPROBE-HDR's KERNEL-SCALE-CONVERT. A decoded VP8 / AV1 picture rides the queue as the decoder's own planes
+// (`vp8_core::Yuv420`, `av1_core::image::Planes`) with the track's colour. A consumer that needs the whole picture (the
+// exporter, `edl_mix`, the `coded` and face-preview hashes) calls [`Px::rgb`]: the existing full conversion (`colour_rgba_vp8`
+// / `colour_rgba_av1` -> `pack`), once, cached, so every pin hashes the bytes it hashed before. The present path
+// ([`Frame::rows`]) converts only the rows the window shows: VP8 (Nearest, KERNELSCALEONEARM B980: no gathered scratch rows) and
+// AV1 (Bilinear) through ONE `sampled`, one sampled source row at a time by `yuv_core::to_rgba_cols`
+// over the distinct sampled columns only (KERNELSCALECOLS B978; its neighbour chroma read from the whole planes), the output
+// gathered from them; every row and column index is the
+// scaler's own. Bit for bit the full conversion then nearest-sampled. A dropped or run-up frame converts nothing. One holder
+// at a time (the job, the queue under `JOB`, the presenting pass, the poster under `POSTER`): no lock of its own.
+
+/// A frame's pixels: 0RGB, or a decoder's planes converted on first use ([`Px::rgb`]).
+pub struct Px {
+    src: Src,
+    rgb: core::cell::OnceCell<Vec<u32>>,
+}
+
+/// What a [`Px`] was made from.
+enum Src {
+    /// 0RGB (utp1, the stand-in, the EDL black, a mixed frame): the cell holds it.
+    Rgb,
+    Vp8(vp8_core::Yuv420, Option<Colour>),
+    Av1(Box<av1_core::image::Planes>, Option<Colour>),
+}
+
+impl From<Vec<u32>> for Px {
+    fn from(px: Vec<u32>) -> Px {
+        Px { src: Src::Rgb, rgb: core::cell::OnceCell::from(px) }
+    }
+}
+
+impl Px {
+    /// A decoder's planes, not yet converted.
+    fn planes(src: Src) -> Px {
+        Px { src, rgb: core::cell::OnceCell::new() }
+    }
+
+    /// The whole picture as 0RGB: converted on the first call (byte for byte the decode job's former conversion), then cached.
+    pub fn rgb(&self) -> &[u32] {
+        self.rgb.get_or_init(|| match &self.src {
+            Src::Vp8(y, c) => pack(&colour_rgba_vp8(y, *c)),
+            Src::Av1(p, c) => pack(&colour_rgba_av1(p, *c)),
+            Src::Rgb => Vec::new(),
+        })
+    }
+}
+
+/// A `w x h` 0RGB buffer as a mono `Picture<u32>` (how `nearest_rows` samples packed pixels).
+fn mono(w: usize, h: usize, px: &[u32]) -> yuv_core::Picture<'_, u32> {
+    yuv_core::Picture { w, h, y: px, u: &[], v: &[], y_stride: w, uv_stride: 0, ss: (0, 0), mono: true, bit_depth: 8, full: true }
+}
+
+impl Frame {
+    /// Every sample [`Frame::rows`] reads lies inside the frame's pixels (`w`, `h` > 0).
+    pub fn fits(&self) -> bool {
+        match (self.px.rgb.get(), &self.px.src) {
+            (Some(px), _) => yuv_core::scale::fits(&mono(self.w, self.h, px)),
+            (None, Src::Vp8(y, c)) => yuv_core::scale::fits(&vp8_picture(y, *c).0),
+            (None, Src::Av1(p, c)) => yuv_core::scale::fits(&av1_picture(p, *c).0),
+            (None, Src::Rgb) => false,
+        }
+    }
+
+    /// The frame nearest-sampled to `dw x dh`, each output row handed to `row(r, 0RGB)`: a cached or 0RGB frame through
+    /// `nearest_rows` (KERNELSCALEONE's blit); planes convert only the shown rows. `fits()`; `dw`, `dh` > 0.
+    pub fn rows(&self, dw: usize, dh: usize, mut row: impl FnMut(usize, &[u32])) {
+        let mut out = alloc::vec![0u32; dw];
+        match (self.px.rgb.get(), &self.px.src) {
+            (Some(px), _) => yuv_core::scale::nearest_rows(&mono(self.w, self.h, px), dw, dh, &mut out, &mut [], &mut [], |r, s| row(r, s.y)),
+            (None, Src::Vp8(y, c)) => {
+                let (p, m) = vp8_picture(y, *c);
+                sampled(&p, m, yuv_core::Chroma::Nearest, dw, dh, &mut out, &mut row); // KERNELSCALEONEARM (rmbp-ledger B980): the AV1 arm's column list, Nearest (file tail)
+            }
+            (None, Src::Av1(pl, c)) => {
+                let (p, m) = av1_picture(pl, *c);
+                sampled(&p, m, yuv_core::Chroma::Bilinear, dw, dh, &mut out, &mut row); // KERNELSCALECOLS (B978): the distinct sampled source columns only
+            }
+            (None, Src::Rgb) => {}
+        }
+    }
+}
+
+/// A VP8 picture as yuv_core's `Picture` (8-bit 4:2:0) and the track colour's matrix: the ONE pick at the picture's size
+/// (`colour_rgba_vp8`'s and the shown rows').
+fn vp8_picture(y: &vp8_core::Yuv420, c: Option<Colour>) -> (yuv_core::Picture<'_, u8>, yuv_core::Matrix) {
+    let (w, h) = (y.width as usize, y.height as usize);
+    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), y.width, y.height);
+    (yuv_core::Picture { w, h, y: &y.y, u: &y.u, v: &y.v, y_stride: w, uv_stride: y.chroma_width() as usize, ss: (1, 1), mono: false, bit_depth: 8, full }, m)
+}
+
+/// An AV1 picture as av1_core's own `picture` with the pick's range, and the matrix (`colour_rgba_av1`'s and the shown rows').
+fn av1_picture(planes: &av1_core::image::Planes, c: Option<Colour>) -> (yuv_core::Picture<'_, u16>, yuv_core::Matrix) {
+    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), planes.width, planes.height);
+    (yuv_core::Picture { full, ..av1_core::image::picture(planes) }, m)
+}
+
+// ── AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream re-picks the colour (handlers.md §5 NLEPROBE-HDR) ──────────
+// `Pic::decode_raw`'s Av1 arm decides each frame's colour right after the decode: the open's (`Track::colour`) until the decoder's
+// current sequence header states other code points than the first decoded one, then av1_core's ONE rule
+// (`StreamDecoder::switch` / `switch_codes`: a field the open took from the bitstream follows the new header, a container-stated
+// one stays), the host `Av1Decoder`'s too. Wire: `[vplay] colour switch at <pts ticks> matrix=<a>-><b> range=<full|limited>`, once
+// per change, printed here (in decode_raw), never at the conversion.
+
+/// AV1INBANDSWITCH (SR373): the colour an AV1 frame converts by, `c` the open's; the switch line on a change.
+fn inband_colour(d: &mut av1_core::image::StreamDecoder, c: Option<Colour>, pts: i64) -> Option<Colour> {
+    let (now, changed) = d.switch(c.map(|c| (c.primaries, c.transfer, c.matrix, c.full_range)));
+    let full = now.map_or(c.and_then(|c| c.full_range), |n| n.3);
+    if let Some((a, b)) = changed {
+        serial_println!("[vplay] colour switch at {} matrix={}->{} range={}", pts, a, b, if full == Some(true) { "full" } else { "limited" });
+    }
+    match now {
+        Some((primaries, transfer, matrix, full_range)) => Some(Colour { primaries, transfer, matrix, full_range, mastering: c.and_then(|c| c.mastering), light: c.and_then(|c| c.light) }),
+        None => c,
+    }
+}
+
+// ── H264ENCPLANES (rmbp-ledger B973): the exporter takes an unmixed picture's planes (handlers.md §5 NLEPROBE-HDR's H264ENC-PLANES) ──
+// At the export call a frame still holding the decoder's planes (`Src::Vp8` / `Src::Av1`) is UNMIXED: `edl_mix` leaves a mixed
+// frame as `Src::Rgb`, and a gap's black, the stand-in and utp1 are `Src::Rgb` too. An 8-bit 4:2:0 picture (every VP8; AV1 at 8
+// bits, not mono, 4:2:0, its u16 samples narrowed by a plain copy) goes to the exporter as h264enc_core planes with the frame's
+// colour; the exporter decides whether they match its file's colour (`export.rs` `Exp::push`). Any other frame gives None and
+// its RGBA on demand (`Px::rgb`, the cached conversion), so an unmixed 8-bit frame converts nothing. 10-bit / 4:4:4 / mono
+// pictures take the RGBA path (H264ENC-PLANES-HI owed).
+
+/// The EDL job's frame into the exporter: its planes when unmixed 8-bit 4:2:0, else None; its RGBA only if the exporter asks.
+fn export_frame(jid: u32, tb: timeline_core::Timebase, total: u64, f: &Frame) -> Result<(), String> {
+    let narrow = |s: &[u16]| s.iter().map(|&x| x as u8).collect::<Vec<u8>>();
+    let av1 = match &f.px.src {
+        Src::Av1(p, _) if p.bit_depth == 8 && !p.mono && (p.ss_x, p.ss_y) == (1, 1) => Some((narrow(&p.y), narrow(&p.u), narrow(&p.v))),
+        _ => None,
+    };
+    let planes = match (&f.px.src, &av1) {
+        (Src::Vp8(y, c), _) => Some((h264enc_core::Yuv420 { width: y.width, height: y.height, y: &y.y, u: &y.u, v: &y.v, y_stride: y.width as usize, uv_stride: y.chroma_width() as usize }, *c)),
+        (Src::Av1(p, c), Some((py, pu, pv))) => Some((h264enc_core::Yuv420 { width: p.width, height: p.height, y: py, u: pu, v: pv, y_stride: p.width as usize, uv_stride: p.chroma_width() as usize }, *c)),
+        _ => None,
+    };
+    super::export::frame(jid, tb, total, f.w, f.h, planes, || unpack(f.px.rgb()))
+}
+
+// ── NLE6FACEDRAG (rmbp-ledger B975): pointer drags on the view band — the host's ONE `view::Drag` over the painted layout ─────
+// handlers.md §5 NLE6's NLE6FACE-DRAG. [`view_band`] notes the layout it PAINTED ([`band_note`]: the job's path, the band's top
+// row in the Player's surface, the `Layout`), so a press hits what was drawn (the host face's rule). The Player's pointer door
+// (player.rs `edit_press_route`, the picture arm of `press_route`; the capture seam for the motion and the release) hands
+// surface px to [`edit_press`] (`view::Drag::begin_with`, snapping: NLE6DRAGSNAP B977, the guide painted), the motion
+// to [`edit_drag_move`] (`Drag::update`, router depth, no I/O), and the pass runs [`edit_drag_end`] after the release:
+// `Drag::finish` (the host's ONE commit: `EditorState::trim` / `move_selected` / `move_set`) on the Player's editor state,
+// the EDL saved by [`edit_save`] (the ONE save the keys use too), the playhead handed to the seek door. A ruler press is
+// the scrub (the seek door at the tick released on), a press on an empty track spot the marquee (a selection, no save).
+// Wire: `[nle] drag press <kind> at=<tick> track=<n> clip=<n>`, `[nle] drag <move|trim-in|trim-out> from=<tick> to=<tick>
+// clips=<n> undo=<n> saved=<bytes|refused(..)>`, `[nle] drag <kind> from= to= unchanged|refused (<why>)`, `[nle] drag scrub
+// from= to=`, `[nle] drag marquee from= to= selected=<n>`. Witness: player.rs `tests nle` (`drag=`).
+
+/// The layout [`view_band`] last painted: `(job path, band top row, layout)`.
+static BAND: crate::sync::Mutex<Option<(String, usize, timeline_core::view::Layout)>> = crate::sync::Mutex::new(None);
+/// The live drag: `(band top row at the press, the drag)`.
+static DRAG: crate::sync::Mutex<Option<(usize, timeline_core::view::Drag)>> = crate::sync::Mutex::new(None);
+
+/// [`view_band`]'s note of what it painted (a try: a press reading it skips one frame's note).
+fn band_note(live: &str, y0: usize, l: timeline_core::view::Layout) {
+    let Some(mut b) = BAND.try_lock() else { return };
+    match b.as_mut() {
+        Some(n) if n.0 == live => {
+            n.1 = y0;
+            n.2 = l;
+        }
+        _ => *b = Some((String::from(live), y0, l)),
+    }
+}
+
+/// The view band painted for the EDL at `path`: `(band top row in the Player's surface, layout)` (the witness reads it).
+pub fn band_layout(path: &str) -> Option<(usize, timeline_core::view::Layout)> {
+    let g = BAND.try_lock()?;
+    g.as_ref().filter(|b| b.0 == path).map(|b| (b.1, b.2))
+}
+
+/// The EDL's stem (`/home/NLEKEY.EDL` -> `NLEKEY`): its `TITLE:` and the NLE window's title.
+pub fn edl_stem(path: &str) -> &str {
+    let leaf = path.rsplit('/').next().unwrap_or(path);
+    if is_edl(leaf) { &leaf[..leaf.len() - 4] } else { leaf }
+}
+
+/// THE save of an edited timeline (keys and drags): timeline_core's ONE writer (`edl::write`, titled by the stem) through
+/// export.rs `write_file`; the bytes written, or `refused(<why>)`.
+fn edit_save(path: &str, tl: &timeline_core::Timeline) -> String {
+    match timeline_core::edl::write(tl, edl_stem(path)) {
+        Ok(text) => match super::export::write_file(path, text.as_bytes()) {
+            Ok(n) => alloc::format!("{}", n),
+            Err(e) => alloc::format!("refused({})", e),
+        },
+        Err(e) => alloc::format!("refused({})", e),
+    }
+}
+
+fn drag_word(k: timeline_core::view::DragKind) -> &'static str {
+    use timeline_core::view::DragKind;
+    match k {
+        DragKind::TrimIn => "trim-in",
+        DragKind::TrimOut => "trim-out",
+        DragKind::Move => "move",
+        DragKind::Marquee => "marquee",
+        DragKind::Scrub => "scrub",
+    }
+}
+
+/// **A press at surface px `(x, y)`** on the Player's EDL at `path`: on the painted band a drag begins (`Drag::begin_with`,
+/// which selects a pressed clip as the host's does); `false` off the band, off anything, or with no editor state.
+pub fn edit_press(path: &str, x: usize, y: usize) -> bool {
+    let Some((y0, l)) = band_layout(path) else { return false };
+    if y < y0 || y >= y0 + l.h as usize || x >= l.w as usize {
+        return false;
+    }
+    let d = {
+        let Some(mut g) = EDIT.try_lock() else { return false };
+        let Some(e) = g.as_mut().filter(|e| e.path == path) else { return false };
+        let Some(d) = timeline_core::view::Drag::begin_with(&mut e.st, l, x as f64, (y - y0) as f64, false, false) else { return false };
+        d
+    };
+    *DRAG.lock() = Some((y0, d)); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the selection shows (file tail)
+    serial_println!("[nle] drag press {} at={} track={} clip={}", drag_word(d.kind), d.origin_tick, d.track, d.idx);
+    true
+}
+
+/// The pointer moved to surface px `(x, y)` during a drag (router depth: locks tried, no I/O).
+pub fn edit_drag_move(x: usize, y: usize) {
+    let Some(mut dg) = DRAG.try_lock() else { return };
+    let Some((y0, d)) = dg.as_mut() else { return };
+    let Some(g) = EDIT.try_lock() else { return };
+    let Some(e) = g.as_ref() else { return };
+    d.update(&e.st, x as f64, y as f64 - *y0 as f64); BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the band follows the drag (file tail)
+}
+
+/// **The drag's release, on the pass**: the host's ONE commit (`Drag::finish`) on the Player's editor state, the EDL saved
+/// when the timeline changed. `Some(ms)`: the playhead (a scrub: the tick released on) for the seek door; `None`: no drag,
+/// unchanged, refused, a marquee, or no EDL open at `path`.
+pub fn edit_drag_end(path: &str) -> Option<u64> {
+    use timeline_core::view::DragKind;
+    let (_, d) = DRAG.lock().take()?; BAND_DIRTY.store(true, Ordering::Release); // NLE6DRAGSNAP (rmbp-ledger B977): the guide and preview go (file tail)
+    let word = drag_word(d.kind);
+    let (from, to) = (d.origin_tick, d.origin_tick + d.delta);
+    let (tl, clips, undo, back, snapped) = {
+        let mut g = EDIT.lock();
+        let e = g.as_mut().filter(|e| e.path == path)?;
+        let st = &mut e.st;
+        let tb = st.timeline.tb;
+        let ms = move |t: i64| (tb.to_ns(t).max(0) as u64) / 1_000_000;
+        match d.kind {
+            DragKind::Scrub => {
+                serial_println!("[nle] drag scrub from={} to={}", from, to);
+                return Some(ms(to));
+            }
+            DragKind::Marquee => {
+                let _ = d.finish(st);
+                serial_println!("[nle] drag marquee from={} to={} selected={}", from, to, st.set.len());
+                return None;
+            }
+            _ => {}
+        }
+        if !d.moved() {
+            serial_println!("[nle] drag {} from={} to={} unchanged", word, from, to);
+            return None;
+        }
+        let snapped = snap_word(&d, st.playhead);
+        let before = st.timeline.clone();
+        match d.finish(st) {
+            Ok(()) if st.timeline != before => {}
+            Ok(()) => {
+                serial_println!("[nle] drag {} from={} to={} unchanged", word, from, to);
+                return None;
+            }
+            Err(why) => {
+                serial_println!("[nle] drag {} from={} to={} refused ({})", word, from, to, why);
+                return None;
+            }
+        }
+        let clips: usize = st.timeline.tracks.iter().map(|t| t.clips.len()).sum();
+        (st.timeline.clone(), clips, st.undo_depth(), ms(st.playhead), snapped)
+    };
+    let saved = edit_save(path, &tl);
+    serial_println!("[nle] drag {} from={} to={} snapped={} clips={} undo={} saved={}", word, from, to, snapped, clips, undo, saved);
+    Some(back)
+}
+
+/// Drop a live drag (the Player closed); `true` when one was live (the caller cancels its pointer capture).
+pub fn edit_drag_take() -> bool {
+    DRAG.lock().take().is_some()
+}
+
+// ── KERNELSCALECOLS (rmbp-ledger B978): the AV1 present's column list, its cost, the queue knob (handlers.md §5 NLEPROBE-HDR) ──
+// KERNEL-SCALE-BILINEAR-COLS: [`Frame::rows`]' AV1 arm converts each sampled source row over only the DISTINCT sampled source
+// columns (`yuv_core::to_rgba_cols`, the ONE loop; Bilinear's far chroma read from the whole planes as before) and gathers the
+// output row from them: a 1080p picture in a 640x360 fit converts 360 x 640 = 230,400 pixels per present where it converted
+// 691,200; an upscale converts w per row as before; bit for bit the former present. KERNEL-SCALE-PRESENT-COST: [`present`]
+// times its `blit_fit` (the conversion and the scale) into `Play` under `PLAY`, reset by every open; `[player] ended ...
+// present_us=<mean> present_max_us=<max> queue=<n>` prints it. VPLAY-QUEUE-KNOB: `UNAOS_VPLAY_QUEUE=<1..=16>` at BUILD time
+// (`option_env!`, the `UNAOS_PPI` shape: unset or empty = 3, anything else refused by name), [`QUEUE`].
+
+/// The scaler's column map `sxs` (monotone) as its distinct source columns, ascending, and each output column's index into them.
+fn distinct(sxs: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let (mut cols, mut at): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::with_capacity(sxs.len()));
+    for &x in sxs {
+        if cols.last() != Some(&x) {
+            cols.push(x);
+        }
+        at.push(cols.len() as u32 - 1);
+    }
+    (cols, at)
+}
+
+/// One present's blit, started at cycle `c0`, into the play's cost.
+fn present_cost(c0: u64) {
+    let dt = crate::arch::now_cycles().saturating_sub(c0);
+    let mut p = PLAY.lock();
+    p.present_cyc = p.present_cyc.saturating_add(dt);
+    p.present_max = p.present_max.max(dt);
+}
+
+/// `(mean present us, largest present us, queue depth, filter)` of the play: the `[player] ended` line's cost tokens (the depth and
+/// the filter the job started with, KERNELSCALEONEARM B980).
+pub fn present_us() -> (u64, u64, usize, &'static str) {
+    let p = PLAY.lock();
+    let us = crate::video::blitter::cycles_to_us;
+    (us(p.present_cyc) / p.presented.max(1), us(p.present_max), QUEUE_LIVE.load(Ordering::Acquire) as usize, filter_word(AREA_LIVE.load(Ordering::Acquire)))
+}
+
+/// `UNAOS_VPLAY_QUEUE`: unset or empty = 3 frames; a decimal 1..=16 (0 would never let `room` pass, 16 AV1 1080p frames hold
+/// about 100 MB of planes); anything else fails the build by name.
+const fn vplay_queue(s: Option<&str>) -> usize {
+    let b = match s {
+        None => return 3,
+        Some(s) => s.as_bytes(),
+    };
+    if b.is_empty() {
+        return 3;
+    }
+    let (mut v, mut i) = (0usize, 0usize);
+    while i < b.len() {
+        if b[i] < b'0' || b[i] > b'9' || v > 16 {
+            panic!("UNAOS_VPLAY_QUEUE must be 1..=16 frames");
+        }
+        v = v * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    if v == 0 || v > 16 {
+        panic!("UNAOS_VPLAY_QUEUE must be 1..=16 frames");
+    }
+    v
+}
+
+// ── KERNELSCALEONEARM (rmbp-ledger B980): one present shape for both codecs, the runtime queue depth, the area filter ──────────
+// handlers.md §5 NLEPROBE-HDR's KERNEL-SCALE-ONE-ARM, VPLAY-QUEUE-RUNTIME and SCALE-AREA. [`sampled`] is B978's AV1 present
+// (the scaler's own index, the distinct sampled source columns, one `yuv_core::to_rgba_cols` per distinct sampled source row,
+// the output gathered) generalised over the sample type and the chroma mode; the VP8 arm calls it with `Chroma::Nearest` where
+// it gathered three 4:4:4 scratch rows per output row: with no dither the bias is position-free and Nearest reads the same
+// luma and chroma sample at (row, column), so the bytes are the gathered row's and the conversions drop to distinct rows x
+// distinct columns. The queue depth and the filter are the Player's own `vid` verb (`player::shell_verb`), debugging aids that
+// must not outlive a boot (no Principia key): `vid queue <1..=16>` / `vid filter area|nearest` set the NEXT values, every job
+// start ([`start_at`]: an open, a seek, the export) latches them into the live ones `room`, `sampled` and `present_us` read.
+// [`QUEUE`] (B978's build knob) stays the default depth; the filter defaults to nearest (the pins hash nearest presents). Area
+// (`yuv_core::scale::area_rows`, then the ONE converter) applies to a planes frame downscaled 2x or more; a 0RGB frame stays
+// nearest. Atomics only: no lock.
+
+static QUEUE_NEXT: AtomicU32 = AtomicU32::new(QUEUE as u32);
+static QUEUE_LIVE: AtomicU32 = AtomicU32::new(QUEUE as u32);
+static AREA_NEXT: AtomicBool = AtomicBool::new(false);
+static AREA_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// A picture's planes sampled to `dw x dh` with `up` chroma, each output row handed to `row(r, 0RGB)` through `out` (`dw` long):
+/// the area filter on a downscale of 2x or more when the job started with it, else the distinct-columns nearest present.
+fn sampled<T: Copy + Into<i32> + Into<u64> + TryFrom<u64>>(p: &yuv_core::Picture<'_, T>, m: yuv_core::Matrix, up: yuv_core::Chroma, dw: usize, dh: usize, out: &mut [u32], row: &mut impl FnMut(usize, &[u32])) {
+    if AREA_LIVE.load(Ordering::Acquire) && (p.w >= 2 * dw || p.h >= 2 * dh) {
+        let s0 = p.y[0];
+        let (mut ry, mut ru, mut rv, mut rgba) = (alloc::vec![s0; dw], alloc::vec![s0; dw], alloc::vec![s0; dw], alloc::vec![0u8; dw * 4]);
+        yuv_core::scale::area_rows(p, dw, dh, &mut ry, &mut ru, &mut rv, |r, s| {
+            yuv_core::to_rgba(s, m, up, false, &mut rgba);
+            row(r, &pack(&rgba));
+        });
+        return;
+    }
+    let idx: Vec<u32> = (0..p.h.max(p.w) as u32).collect(); // the source row / column each output row / column samples: the scaler's own index
+    let mut sxs = alloc::vec![0u32; dw];
+    yuv_core::scale::nearest_rows(&mono(p.w, 1, &idx), dw, 1, &mut sxs, &mut [], &mut [], |_, _| {});
+    let (cols, at) = distinct(&sxs); // KERNELSCALECOLS (B978): convert only the distinct sampled source columns
+    let (mut one, mut rgba) = ([0u32; 1], alloc::vec![0u8; cols.len() * 4]);
+    let mut line: (usize, Vec<u32>) = (usize::MAX, Vec::new());
+    yuv_core::scale::nearest_rows(&mono(1, p.h, &idx), 1, dh, &mut one, &mut [], &mut [], |r, s| {
+        let sy = s.y[0] as usize;
+        if line.0 != sy {
+            yuv_core::to_rgba_cols(p, sy, sy + 1, cols.iter().map(|&x| x as usize), m, up, false, &mut rgba);
+            line = (sy, pack(&rgba));
+        }
+        out.iter_mut().zip(&at).for_each(|(o, &i)| *o = line.1[i as usize]);
+        row(r, &*out);
+    });
+}
+
+/// A job start takes the `vid` verb's queue depth and filter.
+fn knobs_latch() {
+    QUEUE_LIVE.store(QUEUE_NEXT.load(Ordering::Acquire), Ordering::Release);
+    AREA_LIVE.store(AREA_NEXT.load(Ordering::Acquire), Ordering::Release);
+}
+
+/// `vid queue <n>`: the queue depth from the next job start; `false` (nothing set) outside 1..=16.
+pub fn set_queue(n: u32) -> bool {
+    if !(1..=16).contains(&n) {
+        return false;
+    }
+    QUEUE_NEXT.store(n, Ordering::Release);
+    true
+}
+
+/// `vid filter area|nearest`: the present's downscale filter from the next job start.
+pub fn set_filter(area: bool) {
+    AREA_NEXT.store(area, Ordering::Release);
+}
+
+/// `(next queue depth, next filter is area, live queue depth, live filter is area)`.
+pub fn knobs() -> (u32, bool, u32, bool) {
+    (QUEUE_NEXT.load(Ordering::Acquire), AREA_NEXT.load(Ordering::Acquire), QUEUE_LIVE.load(Ordering::Acquire), AREA_LIVE.load(Ordering::Acquire))
+}
+
+/// The filter's wire word.
+pub fn filter_word(area: bool) -> &'static str {
+    if area { "area" } else { "nearest" }
+}
+
+// ── NLE6DRAGSNAP (rmbp-ledger B977): the band snaps, previews and follows the drag ─────────────────────────────────────────
+// handlers.md §5 NLE6's NLE6DRAG-SNAP / NLE6DRAG-PREVIEW. [`edit_press`] begins the host's `view::Drag` with snapping (clip
+// edges and the playhead, the ONE `snap_targets` / `snap_to`); [`view_band`] paints the drag's preview state
+// (`Drag::shown`) and `view::paint_drag` (the host's guide line and marquee, moved into the view). A paused Player takes no
+// frame, so the band is repainted by the pass: the press, each motion and the release mark [`BAND_DIRTY`]; the Player's
+// pass calls [`band_repaint`] when it presented no frame and presents only the band's rows (`wm::present_rows`). Wire: the
+// drag's commit line carries `snapped=<edge|playhead|none>`.
+
+/// The view band must be repainted (a drag pressed, moved or released since the last paint).
+static BAND_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// **The pass's band repaint** into the Player's surface `dst` (`w` wide, the picture rect `vh` rows): when
+/// [`BAND_DIRTY`], the band repainted at the playhead the editor state holds; `Some((y0, vh))` = the surface rows painted
+/// (re-armed when the band could not be painted this pass).
+pub fn band_repaint(dst: &mut [u32], w: usize, vh: usize) -> Option<(usize, usize)> {
+    if !BAND_DIRTY.swap(false, Ordering::AcqRel) {
+        return None;
+    }
+    let y0 = view_band(dst, w, vh, None);
+    if y0 >= vh {
+        BAND_DIRTY.store(true, Ordering::Release);
+        return None;
+    }
+    Some((y0, vh))
+}
+
+/// What the drag snapped to: `none` (no guide), `playhead` (the guide is the playhead's tick), else `edge` (a clip edge).
+fn snap_word(d: &timeline_core::view::Drag, playhead: i64) -> &'static str {
+    match d.guide {
+        None => "none",
+        Some(t) if t == playhead => "playhead",
+        Some(_) => "edge",
+    }
+}
+
+// ── AV1INBANDSIZE (LEDGER SR379): a size switch mid-stream (handlers.md §5 NLEPROBE-HDR's AV1-INBAND-SIZE) ─────────────────────
+// A new coded video sequence (av1_core drops the refs on a really-changed sequence header) may change the picture's size. Every
+// `Frame` carries its own `w` / `h` and `blit_fit` fits each one per call, so the queue and the present need nothing; the export
+// refuses the switch by name (`export.rs` `Exp::sized`). `Pic::decode_raw`'s Av1 arm prints the switch here by av1_core's ONE rule
+// (`StreamDecoder::size_switch`, the host `Av1Decoder`'s too). Wire: `[vplay] size switch at <pts ticks> <w>x<h>-><w>x<h>`, once
+// per change.
+
+/// AV1INBANDSIZE (SR379): the size line when `planes` (decoded at `pts`) is not the last shown picture's size.
+fn inband_size(d: &mut av1_core::image::StreamDecoder, planes: &av1_core::image::Planes, pts: i64) {
+    if let Some(((w0, h0), (w1, h1))) = d.size_switch(planes.width, planes.height) {
+        serial_println!("[vplay] size switch at {} {}x{}->{}x{}", pts, w0, h0, w1, h1);
+    }
+}
+

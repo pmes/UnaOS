@@ -14,7 +14,7 @@
 //! libaom's per-frame MD5s (docs/dev/evidence/media-1004/AVCODEC2.md); superres returns
 //! `DecodeError::Unsupported`, and film grain synthesis is reported in that doc. The decoder keeps
 //! the reference frames across packets; `reset()` (a seek) drops them. AV1PLAYERCOLOUR (SR347): frames leave as the decoded
-//! planes (`Pixels::I420` at 8 bits, `I420Hi` deeper; mono with neutral chroma; 4:4:4 / 4:2:2 refused, COLOURONE-422), so
+//! planes (`Pixels::I420` at 8-bit 4:2:0, `I420Hi` deeper or 4:4:4 / 4:2:2 (COLOURONE422 SR359); mono with neutral chroma), so
 //! `Frame::to_rgba_colour` converts them by `Track::colour` and the size default, bilinear (`chroma_of`), as the kernel does.
 
 use super::{DecodeError, Frame, Pixels, VideoDecoder};
@@ -24,6 +24,7 @@ use av1_core::image::{Planes, StreamDecoder};
 pub struct Av1Decoder {
     inner: StreamDecoder,
     timebase: crate::dsp::demux::Timebase,
+    open: Option<crate::dsp::demux::colour::Colour>, // AV1INBANDSWITCH (SR373): the open's colour (`Track::colour`), what a header switch merges under
 }
 
 fn map_err(e: av1_core::Error) -> DecodeError {
@@ -37,7 +38,7 @@ impl Av1Decoder {
     /// `track.config` is the av1C record (MP4) or CodecPrivate (Matroska); empty is allowed when
     /// the stream carries its own sequence header.
     pub fn new(track: &Track) -> Result<Av1Decoder, DecodeError> {
-        Ok(Av1Decoder { inner: StreamDecoder::new(&track.config).map_err(map_err)?, timebase: track.timebase })
+        Ok(Av1Decoder { inner: StreamDecoder::new(&track.config).map_err(map_err)?, timebase: track.timebase, open: track.colour })
     }
 }
 
@@ -47,7 +48,7 @@ impl VideoDecoder for Av1Decoder {
     }
     fn decode(&mut self, pkt: &Packet) -> Result<Option<Frame>, DecodeError> {
         let planes = self.inner.decode_temporal_unit(&pkt.data).map_err(map_err)?;
-        Ok(Some(planes_frame(planes, self.timebase.to_ns(pkt.pts))?))
+        Ok(Some(self.inband(planes_frame(planes, self.timebase.to_ns(pkt.pts))?))) // AV1INBANDSWITCH (SR373): a mid-stream header switch re-picks
     }
     fn reset(&mut self) {
         self.inner.reset();
@@ -58,13 +59,12 @@ impl VideoDecoder for Av1Decoder {
 /// (the u16 samples narrowed, lossless at 8 bits), deeper is `Pixels::I420Hi` with the sequence header's depth; luma
 /// `width` per row, chroma `chroma_width()` (odd sizes as `av1_core::image::picture`). Monochrome (Main profile) fills both
 /// chroma planes at 1 << (depth - 1), yuv_core's chroma offset at either range, so every Kr matrix gives the kernel's mono
-/// grey. 4:4:4 / 4:2:2 (profiles 1 / 2) are refused by name: the frame contract carries 4:2:0 only (COLOURONE-422).
+/// grey. COLOURONE422 (SR359): 4:4:4 / 4:2:2 (profiles 1 / 2) leave as `Pixels::I420Hi` at their own subsampling and
+/// `chroma_width()` (as `av1_core::image::picture`, the kernel's), so the conversion equals `colour_rgba_av1` there too.
 fn planes_frame(p: Planes, pts_ns: i64) -> Result<Frame, DecodeError> {
-    if !p.mono && (p.ss_x, p.ss_y) != (1, 1) {
-        let s = if p.ss_x == 0 && p.ss_y == 0 { "4:4:4" } else { "4:2:2" };
-        return Err(DecodeError::Unsupported(format!("AV1 {s} chroma (COLOURONE-422: the frame contract carries 4:2:0 only)")));
-    }
-    let (y_stride, uv_stride) = (p.width as usize, ((p.width + 1) >> 1) as usize);
+    let ss = if p.mono { (1, 1) } else { (p.ss_x, p.ss_y) };
+    let y_stride = p.width as usize;
+    let uv_stride = if p.mono { ((p.width + 1) >> 1) as usize } else { p.chroma_width() as usize };
     let (u, v) = if p.mono {
         let n = uv_stride * ((p.height + 1) >> 1) as usize;
         let mid = 1u16 << (p.bit_depth - 1);
@@ -72,11 +72,12 @@ fn planes_frame(p: Planes, pts_ns: i64) -> Result<Frame, DecodeError> {
     } else {
         (p.u, p.v)
     };
-    let pixels = if p.bit_depth <= 8 {
+    let pixels = if p.bit_depth <= 8 && ss == (1, 1) {
         let n8 = |s: Vec<u16>| s.into_iter().map(|x| x as u8).collect::<Vec<u8>>();
         Pixels::I420 { y: n8(p.y), u: n8(u), v: n8(v), y_stride, uv_stride }
     } else {
-        Pixels::I420Hi { y: p.y, u, v, y_stride, uv_stride, bit_depth: p.bit_depth as u8 }
+        let d = p.bit_depth as u8;
+        Pixels::I420Hi { y: p.y, u, v, y_stride, uv_stride, bit_depth: d, ss, bit_depth_c: d }
     };
     Ok(Frame { width: p.width, height: p.height, pts_ns, pixels })
 }
@@ -167,13 +168,59 @@ mod tests {
         }
     }
 
+    /// COLOURONE422 (SR359): 4:4:4 and 4:2:2 planes (was: refused by name) convert as the kernel Player's `colour_rgba_av1`
+    /// does, every pixel, at 8 and 10 bits, SD and HD, odd sizes, the four colours.
     #[test]
-    fn av1playercolour_444_and_422_refused_by_name() {
-        for (ss, name) in [((0, 0), "4:4:4"), ((1, 0), "4:2:2")] {
-            match planes_frame(planes(4, 2, 8, ss, false), 0) {
-                Err(DecodeError::Unsupported(s)) => assert!(s.contains(name) && s.contains("COLOURONE-422"), "{s}"),
-                other => panic!("{name}: {other:?}"),
+    fn colourone422_av1_444_and_422_convert_as_the_kernel_does() {
+        let cs = [None, Some(colour(2, None)), Some(colour(1, Some(false))), Some(colour(6, Some(true)))];
+        let mut n = 0;
+        for ss in [(0, 0), (1, 0)] {
+            for depth in [8, 10] {
+                for (w, h) in [(5, 3), (1281, 2)] {
+                    let p = planes(w, h, depth, ss, false);
+                    let f = planes_frame(p.clone(), 0).unwrap();
+                    assert!(matches!(&f.pixels, Pixels::I420Hi { ss: s, bit_depth: d, bit_depth_c: dc, .. } if *s == ss && *d as u32 == depth && *dc as u32 == depth));
+                    for c in &cs {
+                        assert_eq!(f.to_rgba_colour(c.as_ref(), Chroma::Bilinear), kernel(&p, c.as_ref()), "{ss:?} {w}x{h} {depth}-bit {c:?}");
+                        assert_eq!(f.to_rgba_colour(c.as_ref(), Chroma::Nearest), kernel_nearest(&p, c.as_ref()), "{ss:?} {w}x{h} {depth}-bit {c:?} nearest");
+                        n += 1;
+                    }
+                }
             }
         }
+        println!("colourone422: av1 4:4:4 / 4:2:2 planes == kernel colour_rgba_av1 ({n} cases)");
+    }
+
+    fn kernel_nearest(p: &Planes, c: Option<&Colour>) -> Vec<u8> {
+        let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), p.width, p.height);
+        let pic = yuv_core::Picture { full, ..av1_core::image::picture(p) };
+        let mut out = vec![0u8; pic.w * pic.h * 4];
+        yuv_core::to_rgba(&pic, m, Chroma::Nearest, false, &mut out);
+        out
+    }
+}
+
+// ── AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream re-picks the colour (handlers.md §5 NLEPROBE-HDR) ──────────
+// `av1_core::image::StreamDecoder::switch` is the ONE rule (the kernel Player's `inband_colour` calls it too). While the current
+// header's code points equal the open's, the frame leaves as planes, byte-identical; once they differ the frame leaves CONVERTED
+// by the switched colour through the ONE conversion (`Frame::to_rgba_colour`, AV1's bilinear chroma as `chroma_of`), so the bus
+// sink, the editor's `src_rgba` and play-check all pass it through. Wire: `[STRIA] :: video colour switch at <pts_ns>
+// matrix=<a>-><b> range=<full|limited>`, once per change.
+impl Av1Decoder {
+    fn inband(&mut self, f: Frame) -> Frame {
+        use crate::dsp::demux::colour::Colour;
+        if let Some(((w0, h0), (w1, h1))) = self.inner.size_switch(f.width, f.height) {
+            log::info!("[STRIA] :: video size switch at {} {}x{}->{}x{}", f.pts_ns, w0, h0, w1, h1); // AV1INBANDSIZE (SR379): av1_core's ONE size rule, once per change; the frame carries its size
+        }
+        let open = self.open.map(|c| (c.primaries, c.transfer, c.matrix, c.full_range));
+        let (now, changed) = self.inner.switch(open);
+        let range = |r: Option<bool>| if r == Some(true) { "full" } else { "limited" };
+        if let Some((a, b)) = changed {
+            log::info!("[STRIA] :: video colour switch at {} matrix={}->{} range={}", f.pts_ns, a, b, range(now.map_or(self.open.and_then(|c| c.full_range), |n| n.3)));
+        }
+        let Some((primaries, transfer, matrix, full_range)) = now else { return f };
+        let c = Colour { primaries, transfer, matrix, full_range, mastering: self.open.and_then(|c| c.mastering), light: self.open.and_then(|c| c.light) };
+        let rgba = f.to_rgba_colour(Some(&c), super::Chroma::Bilinear);
+        Frame { pixels: Pixels::Rgba(rgba), ..f }
     }
 }

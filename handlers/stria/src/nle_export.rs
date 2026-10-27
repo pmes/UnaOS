@@ -25,6 +25,12 @@
 //!   each unit carries its (dts, pts) ([`Access::time`]) and the MP4 track writes them per sample, so demux_core's
 //!   `build::mp4` writes the `ctts` composition offsets. No edit list (demux_core shifts pts only), so a reordered
 //!   video presents from tick 1, or tick 2 under h264enc_core's B pyramid at bframes >= 3 (reorder depth 2, H264ENCPYRAMID SR349).
+//! * H264ENCCOLOURHOST (LEDGER SR377): the file states ONE colour, fixed at its first frame ([`VideoEncoder::colour`]):
+//!   [`H264Encoder`] always encodes the mix's RGBA by `push_rgba` (BT.601 limited), so its file colour is
+//!   [`RGBA_COLOUR`] (matrix 6, limited: the kernel export's RGBA-path tag, byte for byte), written
+//!   as the SPS VUI (h264enc_core's `Config::colour`) and as the avc1's `colr` through `build::Mp4Extras::colour`. PNG and
+//!   raw state none. EXPORTCOLOURPRIM (rmbp-ledger B979): its primaries / transfer are the reels' one pair
+//!   (`timeline_core::Timeline::reels_colour` over `Sources::open_report`, the kernel export's rule too), else 2 / 2.
 //! * Single-threaded: the sink owns its encoder, files and counters by `&mut self`; an I/O error is latched and
 //!   returned by [`ExportSink::finish`].
 
@@ -37,10 +43,11 @@ use gneiss_pal::dsp::demux::build;
 pub use gneiss_pal::dsp::demux::build::Container;
 use gneiss_pal::dsp::image::{PngError, encode_rgba};
 use h264enc_core::rgba::{RgbaEncoder, Unit};
-use h264enc_core::{Config, RateControl, RcMode};
+use h264enc_core::{Config, RateControl};
 use timeline_core::{Timebase, Timeline};
 
 use crate::nle::{RenderError, RenderSink, Sources, render};
+use gneiss_pal::dsp::demux::colour::Colour;
 
 /// One encoded unit: a whole PNG, a raw frame, or (NLE5b) one H.264 access unit as an MP4 sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +92,13 @@ pub trait VideoEncoder {
     }
     fn config(&self) -> VideoConfig;
     fn layout(&self) -> Layout;
+    /// H264ENCCOLOURHOST (SR377): called once, before the first frame's `encode`: the file's one colour, which the encoder
+    /// states in its own stream too. None = the stream states no colour. EXPORTCOLOURPRIM (B979): `reels` is the timeline's
+    /// one (primaries, transfer) pair (`Timeline::reels_colour`), (2, 2) when the reels state none or differ.
+    fn colour(&mut self, reels: (u8, u8)) -> Option<Colour> {
+        let _ = reels;
+        None
+    }
 }
 
 /// A PNG per frame through pixel_core's writer (lossless RGBA, colour type 6).
@@ -138,7 +152,7 @@ impl H264Encoder {
     /// A constant bit rate of `kbps` kbit/s at `fps_num / fps_den` frames per second (`nle export --bitrate`): `qp`
     /// becomes the rate controller's starting QP.
     pub fn with_bitrate(mut self, kbps: u32, fps_num: u32, fps_den: u32) -> H264Encoder {
-        self.rgba.cfg.rate = Some(RateControl { bits_per_second: kbps.saturating_mul(1000), fps_num, fps_den, mode: RcMode::Cbr });
+        self.rgba.cfg.rate = Some(RateControl::cbr(kbps, (fps_num, fps_den)));
         self
     }
 
@@ -167,6 +181,11 @@ impl VideoEncoder for H264Encoder {
     }
     fn layout(&self) -> Layout {
         Layout::Mp4
+    }
+    fn colour(&mut self, (primaries, transfer): (u8, u8)) -> Option<Colour> {
+        let c = Colour { primaries, transfer, ..RGBA_COLOUR }; // H264ENCCOLOURHOST (SR377): the RGBA path's colour, also the SPS VUI. EXPORTCOLOURPRIM (B979): with the reels' one pair
+        self.rgba.cfg.colour = Some((c.primaries, c.transfer, c.matrix, c.full_range == Some(true)));
+        Some(c)
     }
 }
 
@@ -272,6 +291,10 @@ pub struct ExportSink {
     units: u64,
     report: ExportReport,
     err: Option<ExportError>,
+    /// H264ENCCOLOURHOST (SR377): the file's colour, fixed at the first frame by [`VideoEncoder::colour`].
+    colour: Option<Colour>,
+    /// EXPORTCOLOURPRIM (B979): the reels' one (primaries, transfer), set by [`export`]; (2, 2) otherwise.
+    reels: (u8, u8),
     /// NLE6EXPORTMKV (rmbp-ledger B966): the muxed file's container (its name's extension, `build::Container`).
     container: build::Container,
 }
@@ -292,6 +315,8 @@ impl ExportSink {
             units: 0,
             report: ExportReport { fnv: 0xcbf2_9ce4_8422_2325, ..ExportReport::default() },
             err: None,
+            colour: None,
+            reels: (2, 2),
             container: build::Container::Mp4,
         }
     }
@@ -324,6 +349,7 @@ impl ExportSink {
             self.report.fnv = (self.report.fnv ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
         }
         self.size = (w, h);
+        if self.report.frames == 0 { self.colour = self.video.colour(self.reels); } // H264ENCCOLOURHOST (SR377): the file colour, fixed at the first frame
         let units = self.video.encode(w, h, rgba)?;
         self.store(units)?;
         self.report.frames += 1;
@@ -387,6 +413,7 @@ impl ExportSink {
         }
         let movie = self.video.layout() == Layout::Mp4;
         let mut extras = build::Mp4Extras::default();
+        if movie { extras.colour.extend(self.colour.map(|c| (1, c))); } // H264ENCCOLOURHOST (SR377): the file colour as the avc1's (track 1) `colr`
         let audio = match (self.audio, self.afmt) {
             (AudioOut::Mp4, Some((rate, ch))) => Some(build::pcm16_track(if movie { 2 } else { 1 }, rate, ch, &self.pcm, 1024)),
             (AudioOut::Aac(kbps), Some((rate, ch))) => {
@@ -471,7 +498,7 @@ pub fn export_as(
     audio: AudioOut,
     container: build::Container,
 ) -> Result<ExportReport, ExportError> {
-    let mut sink = ExportSink::new(dir, video, audio);
+    let mut sink = ExportSink::new(dir, video, audio); sink.reels = tl.reels_colour(|id| sources.open_report(id).and_then(|r| r.colour)); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the file's
     sink.container = container;
     render(tl, range, sources, &mut sink).map_err(ExportError::Render)?;
     sink.finish(tl.tb)
@@ -488,3 +515,9 @@ fn aac_track(id: u32, rate: u32, ch: u16, pcm: &[i16], kbps: u32) -> Result<(bui
     let track = build::mp4a_track(id, rate, ch, &enc.asc(), units.into_iter().map(|u| u.data).collect(), kbps.saturating_mul(1000));
     Ok((track, build::mp4a_edit_list(id, rate, PRIMING, frames)))
 }
+
+// ── H264ENCCOLOURHOST (LEDGER SR377): the host export's ONE file colour (handlers.md §5 NLEPROBE-HDR's H264ENC-COLOUR-HOST) ──
+/// The RGBA path's colour: `push_rgba` encodes BT.601 limited, primaries / transfer unspecified — the kernel export's
+/// `RGBA_COLOUR` (`unaos/crates/kernel/src/video/export.rs`), so host and kernel state the same file colour for it.
+/// EXPORTCOLOURPRIM (B979): the base; [`H264Encoder`] states the reels' one primaries / transfer pair over it.
+pub const RGBA_COLOUR: Colour = Colour { primaries: 2, transfer: 2, matrix: 6, full_range: Some(false), mastering: None, light: None };

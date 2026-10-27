@@ -320,6 +320,12 @@ pub struct BootInfo {
     /// x86_64 only, for the BOOTCLOCK reason above; appended after `loader_stages`, so every older offset holds.
     #[cfg(target_arch = "x86_64")]
     pub kelf: KelfVerdict,
+    /// ZENBOOKSURVEY (zenbook-ledger Z1): the SMBIOS entry point the loader found in the UEFI configuration table
+    /// (SMBIOS 3.0 preferred, 2.x fallback) as `SMBIOS_TAG | phys`, or 0. The tag is there because a kernel can boot
+    /// under an older loader whose struct ends at `kelf`; the kernel trusts it only with the tag, the anchor and its
+    /// checksum (`hw::platform`). x86_64 only, appended after `kelf`, so every older offset holds.
+    #[cfg(target_arch = "x86_64")]
+    pub smbios_ptr: u64,
 
     #[cfg(feature = "unaos_ivb")]
     pub igpu_trace_0: [u32; 11],
@@ -402,6 +408,7 @@ const _: () = {
     assert!(offset_of!(BootInfo, tsc_loader_jump) == 272, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
     assert!(offset_of!(BootInfo, loader_stages) == 280, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
     assert!(offset_of!(BootInfo, kelf) == 424, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder.");
+    assert!(offset_of!(BootInfo, smbios_ptr) == 464, "ABI-LOCK: BootInfo field offset moved — see the ABI-LOCK note at the top of this file. Append new fields at the END; never reorder."); // ZENBOOKSURVEY (Z1)
 };
 
 /// The size of the common prefix — everything above the `unaos_ivb` fields, and also
@@ -413,7 +420,7 @@ const _: () = {
 /// `unaos_ivb` tail's first assertion is written against, so keeping it honest per arch is what
 /// keeps THAT check meaningful rather than merely true.
 #[cfg(target_arch = "x86_64")]
-pub const BOOT_INFO_COMMON_LEN: usize = 464; // LOADERSTALL (B490): 280 + the 144-byte LoaderStages record. KELFHASH (B709): + the 40-byte KelfVerdict
+pub const BOOT_INFO_COMMON_LEN: usize = 472; // LOADERSTALL (B490): 280 + the 144-byte LoaderStages record. KELFHASH (B709): + the 40-byte KelfVerdict. ZENBOOKSURVEY (Z1): + the 8-byte smbios_ptr
 #[cfg(not(target_arch = "x86_64"))]
 pub const BOOT_INFO_COMMON_LEN: usize = 256;
 
@@ -444,14 +451,14 @@ const _: () = {
     // one-sided `unaos_ivb` arm non-catastrophic. If it ever fails, the two feature legs have
     // diverged in their shared region and the loader and kernel no longer see the same fields.
     assert!(offset_of!(BootInfo, igpu_trace_0) == BOOT_INFO_COMMON_LEN, "ABI-LOCK: the unaos_ivb tail no longer starts at the end of the common prefix — the two feature legs have diverged. See the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_0) == 464, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_1) == 508, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_2) == 552, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, gmux_trace_0) == 596, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, igpu_trace_valid) == 624, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, kdisp_trace_0) == 628, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(offset_of!(BootInfo, kdisp_trace_valid) == 656, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
-    assert!(core::mem::size_of::<BootInfo>() == 664, "ABI-LOCK: BootInfo size changed on an unaos_ivb build — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_0) == 472, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_1) == 516, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_2) == 560, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, gmux_trace_0) == 604, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, igpu_trace_valid) == 632, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, kdisp_trace_0) == 636, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(offset_of!(BootInfo, kdisp_trace_valid) == 664, "ABI-LOCK: BootInfo unaos_ivb field offset moved — see the ABI-LOCK note at the top of this file.");
+    assert!(core::mem::size_of::<BootInfo>() == 672, "ABI-LOCK: BootInfo size changed on an unaos_ivb build — see the ABI-LOCK note at the top of this file.");
 };
 
 #[cfg(all(feature = "unaos_ivb", not(target_arch = "x86_64")))]
@@ -501,3 +508,7 @@ const _: () = {
     assert!(core::mem::size_of::<MemoryRegionKind>() == 1, "ABI-LOCK: MemoryRegionKind is no longer one byte — it is embedded in MemoryRegion, whose size is the array stride the kernel walks. See the ABI-LOCK note at the top of this file.");
     assert!(core::mem::align_of::<MemoryRegionKind>() == 1, "ABI-LOCK: MemoryRegionKind alignment changed — see the ABI-LOCK note at the top of this file.");
 };
+
+/// ZENBOOKSURVEY (zenbook-ledger Z1): the tag in bits 63:48 of [`BootInfo::smbios_ptr`] (`SM`); a physical address never
+/// reaches bit 48 on x86_64, so `ptr >> 48 == 0x534D` says a loader that knows the field wrote it.
+pub const SMBIOS_TAG: u64 = 0x534D_0000_0000_0000;

@@ -13,7 +13,8 @@
 //!   [`Layout::hit`], [`Layout::crossing`] and the transition widget's [`Layout::transition_rect`]; [`Layout::of_role`]
 //!   cuts it for a Surface showing only the preview or only the tracks.
 //! * [`paint_in`]: RGBA (or BGRA, [`Order`]) bytes over a plain [`Canvas`]; the optional [`Text`] hook names the clips
-//!   and the ruler's seconds (the host's text_host; the kernel paints none yet). No font, no I/O, no_std + alloc.
+//!   and the ruler's seconds (the host's text_host; the kernel's `video::text`, NLE6KEYSLABELS rmbp-ledger B968). No font,
+//!   no I/O, no_std + alloc.
 //! * The colours are the editor's own table (the host's, moved unchanged); NLE6VIEW-TOKENS (video.md §5) owes them as
 //!   palette_core tokens.
 
@@ -185,6 +186,8 @@ pub const ROW: [[u8; 4]; 2] = [[0x26, 0x26, 0x2e, 255], [0x2c, 0x2c, 0x35, 255]]
 pub const SELECT: [u8; 4] = [0xff, 0xff, 0xff, 255];
 pub const HANDLE: [u8; 4] = [0xff, 0xd0, 0x40, 255];
 pub const PLAYHEAD: [u8; 4] = [0xff, 0x40, 0x40, 255];
+/// The labels' ink (the host's text_host colour, moved unchanged; the kernel's `video::text` labels too: NLE6KEYSLABELS B968).
+pub const LABEL: [u8; 4] = [0xff, 0xff, 0xff, 255];
 pub const REEL: [[u8; 3]; 6] =
     [[0x4a, 0x7d, 0xc9], [0xc9, 0x7d, 0x4a], [0x5a, 0xa8, 0x6a], [0xa8, 0x5a, 0xa0], [0xb8, 0xa8, 0x4a], [0x4a, 0xa8, 0xa8]];
 
@@ -474,5 +477,447 @@ mod tests {
         assert_eq!(at(66, 30), HANDLE, "the right half's in handle");
         assert_eq!(at(10, 30), clip_colour(0, Kind::Video), "the left half");
         assert_eq!(fnv1a(&px), 0x53f5_5489_46f1_502f);
+    }
+
+    /// The label hook as a recorder: every `(text, x, baseline, clip)` call, in order (no pixels).
+    struct Rec(Vec<(alloc::string::String, f32, f32, (i32, i32))>);
+
+    impl Text for Rec {
+        fn text(&mut self, _: &mut Canvas, s: &str, x: f32, baseline: f32, clip: (i32, i32)) {
+            self.0.push((alloc::string::String::from(s), x, baseline, clip));
+        }
+    }
+
+    /// The kernel keys fixture's view band (Role::Tracks, 320x56, playhead 8, the right half selected) through a recorder.
+    fn keys_labels(st: &EditorState) -> (Vec<(alloc::string::String, f32, f32, (i32, i32))>, u64) {
+        let l = Layout::of_role(Role::Tracks, 320, 56, st);
+        let mut rec = Rec(Vec::new());
+        let px = paint_in(st, l, Order::Rgba, Some(&mut rec as &mut dyn Text), None);
+        (rec.0, fnv1a(&px))
+    }
+
+    fn calls(v: &[(&str, f32, f32, (i32, i32))]) -> Vec<(alloc::string::String, f32, f32, (i32, i32))> {
+        v.iter().map(|&(s, x, b, c)| (alloc::string::String::from(s), x, b, c)).collect()
+    }
+
+    /// NLE6KEYSLABELS (rmbp-ledger B968) M3: the label calls the kernel view band's `video::text` hook receives for the
+    /// NLEKEY fixture — the ruler's timecode at each whole second (zoom 8 x 25 fps >= 60) and each clip's reel at its left
+    /// edge, clipped to the clip — at the host's positions; the hook paints no rect, so the band's FNV is `KEY_VIEW_KAT`.
+    #[test]
+    fn kernel_keys_labels_pin() {
+        let mut st = keys_state();
+        st.select_at(0, 8).unwrap();
+        st.seek(8);
+        let (got, fnv) = keys_labels(&st);
+        assert_eq!(
+            got,
+            calls(&[
+                ("00:00:00:00", 2.0, 9.0, (0, 320)),
+                ("00:00:01:00", 202.0, 9.0, (200, 320)),
+                ("NLEFXA", 4.0, 31.0, (1, 63)),
+                ("NLEFXA", 68.0, 31.0, (65, 159)),
+            ])
+        );
+        assert_eq!(fnv, 0x53f5_5489_46f1_502f);
+    }
+
+    /// NLE6KEYSLABELS (rmbp-ledger B968) M3: the kernel's zoom keys (`+` / `=` -> `zoom+`, `-` -> `zoom-`, `0` -> `zoom0`)
+    /// are `EditorState::verb`'s ONE zoom, and the view's `Layout` follows it: below 60 px per second the ruler names none.
+    #[test]
+    fn kernel_zoom_keys_pin() {
+        let mut st = keys_state();
+        st.select_at(0, 8).unwrap();
+        st.seek(8);
+        assert_eq!(st.verb("zoom+"), Some(Ok(())));
+        assert_eq!(st.zoom, 16);
+        assert_eq!(Layout::of_role(Role::Tracks, 320, 56, &st).zoom, 16);
+        for _ in 0..3 {
+            assert_eq!(st.verb("zoom-"), Some(Ok(())));
+        }
+        assert_eq!(st.zoom, 2);
+        let (got, _) = keys_labels(&st);
+        assert_eq!(got, calls(&[("NLEFXA", 4.0, 31.0, (1, 15)), ("NLEFXA", 20.0, 31.0, (17, 39))]));
+        assert_eq!(st.verb("zoom0"), Some(Ok(())));
+        assert_eq!(st.zoom, crate::editor::ZOOM_DEFAULT);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// NLE6FACEDRAG (rmbp-ledger B975): THE DRAG — one pointer gesture model for both faces
+// ---------------------------------------------------------------------------------------------------------------------
+// Moved unchanged from `stria::nle_face` (NLE2B LEDGER SR208, NLE2c SR217), as NLE6KEYS (B961) moved `Layout`: a press
+// classified by the drawn trim handles (`HANDLE_W`) then `Layout::hit`, updated by moves (snapped within `SNAP_PX` unless
+// the no-snap modifier), committed ONCE on release through `EditorState`'s ops (`trim`, `move_selected`, `move_set`,
+// `select_many`). `stria::nle_face` re-exports every name here; the kernel Player's view band (vplay.rs `edit_press` /
+// `edit_drag_move` / `edit_drag_end`) calls the same fns over the layout it painted.
+
+use crate::EditError;
+use crate::editor::Edge;
+
+/// What a drag does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragKind {
+    /// The selected clip's in handle (`EditorState::trim(Edge::In, ..)`).
+    TrimIn,
+    /// The selected clip's out handle (`EditorState::trim(Edge::Out, ..)`).
+    TrimOut,
+    /// A clip body (`EditorState::move_selected`; NLE2c: `EditorState::move_set` for a set of more than one).
+    Move,
+    /// NLE2c: a rubber band from an empty track spot (`EditorState::select_many` of the clips it crosses).
+    Marquee,
+    /// NLE2c: a press on the ruler; the playhead follows the pointer (a seek, not an edit).
+    Scrub,
+}
+
+/// One pointer drag: begun by a press, updated by moves, committed ONCE on release ([`Drag::finish`]). It reads the
+/// layout frozen at the press, so the pixel -> tick mapping cannot shift under it, and it edits only through
+/// [`EditorState`]'s public ops.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Drag {
+    pub kind: DragKind,
+    pub track: usize,
+    pub idx: usize,
+    /// The tick under the press.
+    pub origin_tick: i64,
+    pub layout: Layout,
+    /// Ticks moved since the press (snapped when `snap`).
+    pub delta: i64,
+    /// Where a move lands (a track of the clip's kind).
+    pub to_track: usize,
+    /// NLE2c: the press and the pointer now (surface pixels).
+    pub origin: (f64, f64),
+    pub at: (f64, f64),
+    /// NLE2c: snap the moving edge to clip edges / the playhead (off under the no-snap modifier).
+    pub snap: bool,
+    /// NLE2c: begun with shift (adds to the set instead of replacing it).
+    pub additive: bool,
+    /// NLE2c: the tick the delta snapped to (painted as the guide line).
+    pub guide: Option<i64>,
+}
+
+impl Drag {
+    /// A press at `(x, y)` with no modifier ([`Drag::begin_with`]).
+    pub fn begin(st: &mut EditorState, l: Layout, x: f64, y: f64) -> Option<Drag> {
+        Drag::begin_with(st, l, x, y, false, false)
+    }
+    /// A press at `(x, y)`: on the primary's drawn trim handle (the rects [`paint`] draws) a trim; on a clip body a move
+    /// (a clip of the set keeps the set and becomes its primary, `shift` adds the clip, else it alone is selected); on
+    /// an empty track spot a marquee; on the ruler a scrub; anywhere else no drag.
+    pub fn begin_with(st: &mut EditorState, l: Layout, x: f64, y: f64, shift: bool, nosnap: bool) -> Option<Drag> {
+        let origin_tick = l.tick_at(x);
+        let mk = |kind, track, idx| Drag {
+            kind,
+            track,
+            idx,
+            origin_tick,
+            layout: l,
+            delta: 0,
+            to_track: track,
+            origin: (x, y),
+            at: (x, y),
+            snap: !nosnap,
+            additive: shift,
+            guide: None,
+        };
+        if let (Some((track, idx)), Some(c), false) = (st.selection, st.selected(), shift) {
+            let y0 = l.row_y(track) as f64;
+            if y >= y0 && y < y0 + ROW_H as f64 {
+                let (x0, x1) = (l.x_of(c.at) as f64, l.x_of(c.end()) as f64);
+                let hw = HANDLE_W as f64;
+                let kind = if x >= x0 && x < x0 + hw {
+                    Some(DragKind::TrimIn)
+                } else if x >= x1 - hw && x < x1 {
+                    Some(DragKind::TrimOut)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    return Some(mk(kind, track, idx));
+                }
+            }
+        }
+        match l.hit(&st.timeline, x, y) {
+            Hit::Clip(track, idx, _) => {
+                if shift || st.set.contains(&(track, idx)) {
+                    st.select_add(track, idx).ok()?;
+                } else {
+                    st.select(track, idx).ok()?;
+                }
+                Some(mk(DragKind::Move, track, idx))
+            }
+            Hit::Track(track, _) => Some(mk(DragKind::Marquee, track, 0)),
+            Hit::Ruler(_) => Some(mk(DragKind::Scrub, 0, 0)),
+            Hit::None => None,
+        }
+    }
+    /// The pointer is at `(x, y)`: the tick delta (snapped), and for a move of one clip the row under it when that
+    /// track's kind matches.
+    pub fn update(&mut self, st: &EditorState, x: f64, y: f64) {
+        self.at = (x, y);
+        self.delta = self.layout.tick_at(x) - self.origin_tick;
+        self.guide = None;
+        if self.snap {
+            self.snap_delta(st, x);
+        }
+        if self.kind != DragKind::Move || st.set.len() > 1 {
+            return;
+        }
+        if let Hit::Clip(row, ..) | Hit::Track(row, _) = self.layout.hit(&st.timeline, x, y) {
+            let from = st.timeline.tracks.get(self.track).map(|t| t.kind);
+            if from.is_some() && from == st.timeline.tracks.get(row).map(|t| t.kind) {
+                self.to_track = row;
+            }
+        }
+    }
+    /// The drag would change something.
+    pub fn moved(&self) -> bool {
+        match self.kind {
+            DragKind::Marquee => {
+                (self.at.0 - self.origin.0).abs() >= MARQUEE_MIN || (self.at.1 - self.origin.1).abs() >= MARQUEE_MIN
+            }
+            _ => self.delta != 0 || self.to_track != self.track,
+        }
+    }
+    /// THE commit of the gesture: one `trim`, `move_selected` / `move_set` or marquee selection (a scrub commits nothing).
+    pub fn finish(&self, st: &mut EditorState) -> Result<(), EditError> {
+        match self.kind {
+            DragKind::Marquee => {
+                let (x0, y0, x1, y1) = (self.origin.0, self.origin.1, self.at.0, self.at.1);
+                st.select_many(&self.layout.crossing(&st.timeline, x0, y0, x1, y1), self.additive);
+                return Ok(());
+            }
+            DragKind::Scrub => return Ok(()),
+            _ => {}
+        }
+        if st.selection != Some((self.track, self.idx)) {
+            st.select(self.track, self.idx)?;
+        }
+        match self.kind {
+            DragKind::TrimIn => st.trim(Edge::In, self.delta),
+            DragKind::TrimOut => st.trim(Edge::Out, self.delta),
+            DragKind::Move if st.set.len() > 1 => st.move_set(self.delta),
+            _ => {
+                let at = st.selected().ok_or(EditError::NoClip)?.at;
+                st.move_selected(self.to_track, at + self.delta)
+            }
+        }
+    }
+    /// The preview: [`Drag::finish`] on a scratch state (no undo stacks); `None` when nothing moved or the op refuses.
+    pub fn shown(&self, st: &EditorState) -> Option<EditorState> {
+        if !self.moved() {
+            return None;
+        }
+        let mut s = EditorState::new(st.timeline.clone());
+        s.selection = st.selection;
+        s.set = st.set.clone();
+        s.playhead = st.playhead;
+        s.zoom = st.zoom;
+        self.finish(&mut s).ok()?;
+        Some(s)
+    }
+}
+
+/// How near (px, at the current zoom) a moving edge must come to a clip edge or the playhead to snap to it.
+pub const SNAP_PX: f64 = 6.0;
+/// How far (px) the pointer must travel before a press on an empty track is a marquee rather than a click.
+pub const MARQUEE_MIN: f64 = 3.0;
+
+/// Where a moving edge may snap: every clip's `at` and `end` on any track except the `exclude`d clips', plus the
+/// playhead when `playhead`; sorted, deduped.
+pub fn snap_targets(st: &EditorState, exclude: &[(usize, usize)], playhead: bool) -> Vec<i64> {
+    let mut v = Vec::new();
+    for (t, tr) in st.timeline.tracks.iter().enumerate() {
+        for (i, c) in tr.clips.iter().enumerate() {
+            if !exclude.contains(&(t, i)) {
+                v.push(c.at);
+                v.push(c.end());
+            }
+        }
+    }
+    if playhead {
+        v.push(st.playhead);
+    }
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// The target nearest pixel `x` whose `x_of` lies within [`SNAP_PX`] of it (a tie: the earlier tick); `None` when none
+/// is in range.
+pub fn snap_to(l: &Layout, targets: &[i64], x: f64) -> Option<i64> {
+    let mut best: Option<(f64, i64)> = None;
+    for &t in targets {
+        let d = (l.x_of(t) as f64 - x).abs();
+        if d <= SNAP_PX && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, t));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+impl Drag {
+    /// Snap the delta: each moving edge sits at pixel `x_of(edge) + (x - origin.x)` (a scrub's is the pointer); the
+    /// nearest (edge, target) pair within [`SNAP_PX`] sets `delta = target - edge` and the guide. A marquee never snaps.
+    fn snap_delta(&mut self, st: &EditorState, x: f64) {
+        let l = self.layout;
+        let dx = x - self.origin.0;
+        let one = [(self.track, self.idx)];
+        let (edges, exclude, playhead): (Vec<i64>, &[(usize, usize)], bool) = match self.kind {
+            DragKind::Marquee => return,
+            DragKind::Scrub => {
+                if let Some(t) = snap_to(&l, &snap_targets(st, &[], false), x) {
+                    self.delta = t - self.origin_tick;
+                    self.guide = Some(t);
+                }
+                return;
+            }
+            DragKind::TrimIn | DragKind::TrimOut => {
+                let Some(c) = st.timeline.tracks.get(self.track).and_then(|tr| tr.clips.get(self.idx)) else { return };
+                (vec![if self.kind == DragKind::TrimIn { c.at } else { c.end() }], &one, true)
+            }
+            DragKind::Move => {
+                let set: &[(usize, usize)] = if st.set.len() > 1 { &st.set } else { &one };
+                let edges = set
+                    .iter()
+                    .filter_map(|&(t, i)| st.timeline.tracks.get(t)?.clips.get(i))
+                    .flat_map(|c| [c.at, c.end()])
+                    .collect();
+                (edges, set, true)
+            }
+        };
+        let targets = snap_targets(st, exclude, playhead);
+        let mut best: Option<(f64, i64, i64)> = None;
+        for &e in &edges {
+            let ex = l.x_of(e) as f64 + dx;
+            if let Some(t) = snap_to(&l, &targets, ex) {
+                let d = (l.x_of(t) as f64 - ex).abs();
+                if best.is_none_or(|(bd, _, _)| d < bd) {
+                    best = Some((d, e, t));
+                }
+            }
+        }
+        if let Some((_, e, t)) = best {
+            self.delta = t - e;
+            self.guide = Some(t);
+        }
+    }
+}
+
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// NLE6FACEDRAG (rmbp-ledger B975) M3, NLE6DRAGSNAP (rmbp-ledger B977): the kernel fixture's drag leg (player.rs
+    /// `nle_fx::drag_leg`) on the host: NLEFXA 0..20 at 0 and NLEFXA 20..30 at 30, the view band `Role::Tracks` 320x56,
+    /// snap ON (the kernel's press). A press on the first clip's body at tick 5 dragged +3 ticks is `move_clip(0, 0, 0,
+    /// 3)`; a press on its out handle (`x_of(end) - 2`) dragged -5 ticks is `trim_out(0, 0, 15)` (whole ticks at 8 px: no
+    /// snap moves either); a body press at `x_of(5) + 1` dragged +94 px is a raw 11 ticks whose out edge lands 2 px short
+    /// of the second clip's `at` 30 and snaps: `move_clip(0, 0, 0, 15)`; the saved text is `DRAG_EDL` in player.rs, this
+    /// literal.
+    #[test]
+    fn kernel_drag_pin() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 20, 0), Clip::new(a, 20, 30, 30)];
+        let want_move = tl.move_clip(0, 0, 0, 3).unwrap();
+        let want_trim = want_move.trim_out(0, 0, 15).unwrap();
+        let want_snap = want_trim.move_clip(0, 0, 0, 15).unwrap();
+        let mut st = EditorState::new(tl);
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        let (z, y) = (l.zoom as f64, l.row_y(0) as f64 + ROW_H as f64 / 2.0);
+        let x = l.x_of(5) as f64 + z / 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false).unwrap();
+        assert_eq!((d.kind, d.origin_tick), (DragKind::Move, 5));
+        d.update(&st, x + 3.0 * z, y);
+        assert_eq!(d.guide, None);
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, want_move);
+        let x = l.x_of(23) as f64 - 2.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false).unwrap();
+        assert_eq!((d.kind, d.origin_tick), (DragKind::TrimOut, 22));
+        d.update(&st, x - 5.0 * z, y);
+        assert_eq!((d.origin_tick + d.delta, d.guide), (17, None));
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, want_trim);
+        let x = l.x_of(5) as f64 + 1.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false).unwrap();
+        assert_eq!((d.kind, d.origin_tick), (DragKind::Move, 5));
+        d.update(&st, x + 94.0, y);
+        assert_eq!(l.tick_at(x + 94.0) - d.origin_tick, 11, "the raw delta");
+        assert_eq!((d.delta, d.guide), (12, Some(30)), "snapped to the second clip's in edge");
+        assert_eq!(d.finish(&mut st), Ok(()));
+        assert_eq!(st.timeline, want_snap);
+        assert_eq!(st.undo_depth(), 3);
+        assert_eq!(
+            edl::write(&st.timeline, "NLEDRG").unwrap(),
+            "TITLE: NLEDRG\nFCM: NON-DROP FRAME\n* UNA FPS 25\n* UNA SOURCE NLEFXA 00:00:01:15\n\n001  NLEFXA   V     C        00:00:00:00 00:00:00:15 00:00:00:15 00:00:01:05\n002  NLEFXA   V     C        00:00:00:20 00:00:01:05 00:00:01:05 00:00:01:15\n"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// NLE6DRAGSNAP (rmbp-ledger B977): THE DRAG'S PAINT — the snap guide and the marquee, one fn for both faces
+// ---------------------------------------------------------------------------------------------------------------------
+// Moved byte for byte from `stria::nle_face` (`paint_drag`, `GUIDE`, `MARQUEE`; NLE2c LEDGER SR217). The host face paints it
+// over `paint_in` of the drag's preview state (`Drag::shown`); the kernel Player's view band (vplay.rs `view_band`) does
+// the same, repainted on each drag motion (vplay.rs `band_repaint`).
+
+/// The snap guide's colour (a vertical line from the ruler down at [`Drag::guide`]).
+pub const GUIDE: [u8; 4] = [0x40, 0xd0, 0xff, 255];
+/// The marquee's outline.
+pub const MARQUEE: [u8; 4] = [0xa0, 0xa0, 0xff, 255];
+
+/// The live drag over the painted canvas: the snap guide (a vertical line from the ruler down) and the marquee's rect.
+pub fn paint_drag(px: Vec<u8>, l: Layout, order: Order, drag: Option<&Drag>) -> Vec<u8> {
+    let Some(d) = drag else { return px };
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    if let Some(t) = d.guide {
+        let x = l.x_of(t);
+        c.rect(x, l.ruler_y as i64, x + 1, l.h as i64, GUIDE);
+    }
+    if d.kind == DragKind::Marquee && d.moved() {
+        let (x0, x1) = (d.origin.0.min(d.at.0) as i64, d.origin.0.max(d.at.0) as i64 + 1);
+        let (y0, y1) = (d.origin.1.min(d.at.1) as i64, d.origin.1.max(d.at.1) as i64 + 1);
+        c.frame(x0, y0, x1, y1, MARQUEE);
+    }
+    c.px
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::*;
+    use crate::{Clip, Timeline};
+
+    /// NLE6DRAGSNAP (rmbp-ledger B977) M3: the kernel band's paint of the fixture's snap drag (`drag_tests::kernel_drag_pin`'s
+    /// third drag) — the guide in [`GUIDE`] down the band at `x_of(30)`, the preview (`Drag::shown`) painting the moved clip
+    /// over 15..30 while the committed state still ends it at 18.
+    #[test]
+    fn kernel_drag_snap_paint_pin() {
+        let mut tl = Timeline::new(25);
+        let a = tl.add_source("NLEFXA", 40);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 0, 15, 3), Clip::new(a, 20, 30, 30)];
+        let mut st = EditorState::new(tl);
+        let l = Layout::of_role(Role::Tracks, 320, 56, &st);
+        let y = l.row_y(0) as f64 + ROW_H as f64 / 2.0;
+        let x = l.x_of(5) as f64 + 1.0;
+        let mut d = Drag::begin_with(&mut st, l, x, y, false, false).unwrap();
+        d.update(&st, x + 94.0, y);
+        assert_eq!(d.guide, Some(30));
+        let at = |px: &[u8], x: i64, y: i64| {
+            let i = (y as usize * l.w as usize + x as usize) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        let yi = y as i64;
+        let before = paint_in(&st, l, Order::Rgba, None, None);
+        assert_eq!(at(&before, l.x_of(25), yi), ROW[0], "committed: nothing at tick 25");
+        let shown = d.shown(&st).unwrap();
+        let px = paint_drag(paint_in(&shown, l, Order::Rgba, None, None), l, Order::Rgba, Some(&d));
+        assert_eq!(at(&px, l.x_of(25), yi), clip_colour(a.0, Kind::Video), "the preview's moved clip");
+        assert_eq!(at(&px, l.x_of(30), yi), GUIDE, "the guide line");
+        assert_eq!(at(&px, l.x_of(30), l.ruler_y as i64), GUIDE, "the guide from the ruler down");
+        assert_eq!(paint_drag(before.clone(), l, Order::Rgba, None), before, "no drag: unchanged");
     }
 }

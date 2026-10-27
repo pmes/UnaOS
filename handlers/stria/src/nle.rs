@@ -130,6 +130,8 @@ struct Media {
     audio: Option<usize>,
     v0: i64,
     a0: i64,
+    /// SWAPBACKSPANCACHE (SR370): the reel's in-band parameter sets, walked once at the first run open and shared by every run.
+    sets: std::sync::OnceLock<Arc<crate::decode_swap::SetIndex>>,
 }
 
 impl Media {
@@ -160,7 +162,7 @@ impl Media {
             .unwrap_or(0)
         };
         let (v0, a0) = (origin(video), origin(audio));
-        Ok(Media { demux, video, audio, v0, a0 })
+        Ok(Media { demux, video, audio, v0, a0, sets: Default::default() })
     }
     fn stream(&self, kind: Kind) -> Option<(usize, i64)> {
         match kind {
@@ -307,7 +309,7 @@ impl Vid {
         let track = &m.demux.tracks()[i];
         let mut dec = crate::decode_swap::open(track); // NLE-STANDIN-OPEN (SR353): the Player's decoder-or-stand-in, never a refused render
         let mut cursor = m.demux.share();
-        cursor.seek_track(i, origin + key_ns); let mut swap = DecodeSwap::default(); swap.reseed(&mut dec, track, &cursor, origin + key_ns); // SWAPBACKSEEK (SR353): the run's keyframe with its in-band parameter sets
+        cursor.seek_track(i, origin + key_ns); let mut swap = DecodeSwap::with_index(m.sets.get_or_init(|| Arc::new(crate::decode_swap::SetIndex::of(track, &m.demux))).clone()); swap.reseed(&mut dec, track, &cursor, origin + key_ns); // SWAPBACKSEEK (SR353): the run's keyframe with its in-band parameter sets; SWAPBACKSPANCACHE (SR370): every set in effect, the reel's index walked once
         Ok(Vid { src, origin, track_id: track.id, cursor, track: track.clone(), swap, stood_in: !dec.is_real(), dec, pending: VecDeque::new(), peeked: None, last: None, done: false })
     }
     fn pull(&mut self) -> Result<Option<Frame>, RenderError> {

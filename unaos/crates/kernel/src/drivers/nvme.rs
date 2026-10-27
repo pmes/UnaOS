@@ -1,0 +1,678 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 The Architect & Una
+//
+//! CHARTER: Amber Bytes (Disks) — seam: driver. The NVMe host controller (`UNAOS_NVME=1`, default OFF).
+//!
+//! # SCOPE — ZENBOOKNVME (zenbook-ledger Z2), rung 1
+//!
+//! **Does:** find the first NVMe controller by PCI class (0x01 mass storage / 0x08 NVM / progif 0x02),
+//! claim it (memory decode + bus master), map BAR0 uncacheable, read `CAP`/`VS`, reset it (`CC.EN=0`,
+//! wait `CSTS.RDY=0`), program ONE admin queue pair, enable it (wait `CSTS.RDY=1`, both waits bounded by
+//! `CAP.TO`), IDENTIFY the controller (model, MDTS) and namespace 1 (size, LBA format), create ONE I/O
+//! queue pair (qid 1, depth 32), and publish the namespace into `drivers::block`'s NVMe registry
+//! (`block::register_nvme`) — the free-function registry shape AHCI's first rung (rmbp-ledger B89)
+//! established. NVMe 1.4 base specification, cleanroom: no driver code from any other OS was consulted.
+//!
+//! **Polled, never interrupted:** every completion queue is created with `IEN=0` and no MSI/MSI-X
+//! vector is touched; a command's completion is polled on the CQ phase bit against a TSC deadline
+//! ([`T_CMD_MS`]). A miss prints `[nvme] cmd timeout opcode=0x<op> ...` and MARKS the controller
+//! (DONGLEBOOT's rule, rmbp-ledger B658): every later command is refused at once.
+//!
+//! **Does NOT (owed rows, docs/dev/blueprint/storage.md §5):** become a `BlockHandle` / `BlockSource`,
+//! so `fs/bootdisk.rs`'s root walk cannot see the namespace yet (NVMEBOOT); write through the block
+//! layer (`block::write_blocks_nvme` refuses — NVMEWRITE); MSI-X; namespaces other than 1; TRIM; the
+//! SMART/Health log page.
+//!
+//! **The one write:** WRITE (0x01) is compiled, and [`write_at`] is PRIVATE with exactly ONE caller —
+//! the `tests nvme` scratch leg ([`selftest`]), which runs it only on QEMU's emulated controller (model
+//! string `QEMU NVMe Ctrl`) and restores the scratch blocks it wrote. `grep -n 'write_at' drivers/nvme.rs`
+//! is the audit.
+//!
+//! # Lock
+//!
+//! [`CTRL`] holds the whole controller (rings, heads/tails, phases, the PRP list page, the bounce). It is
+//! held ONLY through [`with_ctrl`]: interrupts masked (no preemption inside the hold) and acquired with a
+//! bounded `try_lock` — DONGLEBOOT's discipline, minimal half (no render path reaches this driver in
+//! rung 1; lifting `ahci::dongle::with_port` into one shared hold is owed row DISKHOLD). One command is
+//! outstanding at a time, so one lock is a correctness requirement.
+//!
+//! # Wire
+//!
+//! ```text
+//! [nvme] bdf <b>:<s>.<f> <vid>:<did> bar0=0x<..> cap=0x<..> ver=<x.y.z> mqes=<n> dstrd=<n> to_ms=<n>   (bootlog)
+//! [nvme] ctrl  (the ready line: mn="<model>" ns=1 lba=<bytes> blocks=<n> -> ready; spelled once, at `probe`)
+//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>>
+//! :: NVME: ctrl=ok ns=1 rw=ok -> PASS ::
+//! ```
+//!
+//! # Byte identity
+//!
+//! Declared `#[cfg(all(target_arch = "x86_64", feature = "nvme"))]` in `drivers/mod.rs`: knob off, this
+//! file is never lexed, the block-layer hunk is cfg-erased at `block.rs`'s tail, and the `pci.rs` probe
+//! call and the `tests.rs` registration are LINE-NEUTRAL folds that vanish.
+
+use crate::sync::Mutex;
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, Ordering};
+
+// ── NVMe 1.4 §3.1: controller registers ─────────────────────────────────────────────────────────
+const REG_CAP: u64 = 0x00;
+const REG_VS: u64 = 0x08;
+const REG_CC: u64 = 0x14;
+const REG_CSTS: u64 = 0x1C;
+const REG_AQA: u64 = 0x24;
+const REG_ASQ: u64 = 0x28;
+const REG_ACQ: u64 = 0x30;
+/// Doorbells start at 0x1000; queue y's SQ tail is at index 2y, its CQ head at 2y+1, each `4 << DSTRD` apart.
+const DB_BASE: u64 = 0x1000;
+
+const CC_EN: u32 = 1 << 0;
+/// I/O submission queue entry size 2^6 = 64 bytes; completion entry 2^4 = 16 bytes. CSS=0 (NVM), MPS=0
+/// (4 KiB pages), AMS=0 (round robin), SHN=0.
+const CC_IOSQES: u32 = 6 << 16;
+const CC_IOCQES: u32 = 4 << 20;
+const CSTS_RDY: u32 = 1 << 0;
+const CSTS_CFS: u32 = 1 << 1;
+
+// ── Opcodes ────────────────────────────────────────────────────────────────────────────────────
+const ADM_CREATE_IO_SQ: u32 = 0x01;
+const ADM_CREATE_IO_CQ: u32 = 0x05;
+const ADM_IDENTIFY: u32 = 0x06;
+const IO_WRITE: u32 = 0x01;
+const IO_READ: u32 = 0x02;
+
+const ADMIN_DEPTH: u16 = 8;
+const IO_DEPTH: u16 = 32;
+const IO_QID: u16 = 1;
+const PAGE: usize = 4096;
+/// The data bounce: 8 pages = 32 KiB, `block::MAX_BLOCKS_PER_OP` (64) x 512-byte sectors.
+const BOUNCE_PAGES: usize = 8;
+const BOUNCE_BYTES: usize = BOUNCE_PAGES * PAGE;
+const SQE_BYTES: u64 = 64;
+const CQE_BYTES: u64 = 16;
+
+/// A command's completion budget. IDENTIFY and a 32 KiB read are microsecond-scale on a healthy
+/// device; a second is a deadline, not an expectation (AHCI's `T_CMD_MS`).
+const T_CMD_MS: u64 = 1000;
+/// How long a caller may wait for [`CTRL`] before refusing.
+const T_HOLD_MS: u64 = T_CMD_MS + 500;
+/// QEMU's emulated controller's default model number (`-device nvme`, `mn` unset).
+const QEMU_MN: &[u8] = b"QEMU NVMe Ctrl";
+/// The scratch leg: 8 blocks ending 64 blocks before the namespace's end (below a GPT backup array).
+const SCRATCH_BLOCKS: u64 = 8;
+const SCRATCH_FROM_END: u64 = 72;
+
+// ── Bounded waits, in TSC units. The construction of `drivers/ahci.rs` / `drivers/sdhc.rs` (a third
+// copy; the lift to one shared helper is owed row BOUNDEDWAIT). `arch::ms()` is not usable: the probe
+// runs inside `pci::init` with interrupts masked, where the APIC tick does not advance.
+#[inline]
+fn cycles_ms(ms: u64) -> u64 {
+    let hz = crate::arch::apic::tsc_hz();
+    if hz != 0 {
+        hz.saturating_mul(ms) / 1000
+    } else {
+        crate::arch::HW_WAIT_BUDGET.saturating_mul(ms) / 2000
+    }
+}
+
+/// Spin until `pred()` holds or `ms` milliseconds elapse.
+fn wait_ms<F: Fn() -> bool>(ms: u64, pred: F) -> bool {
+    let start = crate::arch::now_cycles();
+    let budget = cycles_ms(ms);
+    loop {
+        if pred() {
+            return true;
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+#[inline]
+fn elapsed_ms(start: u64) -> u64 {
+    crate::arch::now_cycles().wrapping_sub(start) / cycles_ms(1).max(1)
+}
+
+// ── MMIO: BAR0 is identity-mapped Uncacheable, so accesses are strongly ordered on x86.
+#[inline]
+fn r32(bar: u64, off: u64) -> u32 {
+    unsafe { core::ptr::read_volatile((bar + off) as *const u32) }
+}
+#[inline]
+fn w32(bar: u64, off: u64, val: u32) {
+    unsafe { core::ptr::write_volatile((bar + off) as *mut u32, val) }
+}
+#[inline]
+fn r64(bar: u64, off: u64) -> u64 {
+    (r32(bar, off) as u64) | ((r32(bar, off + 4) as u64) << 32)
+}
+#[inline]
+fn w64(bar: u64, off: u64, val: u64) {
+    w32(bar, off, val as u32);
+    w32(bar, off + 4, (val >> 32) as u32);
+}
+#[inline]
+fn db_off(index: u16, dstrd: u32) -> u64 {
+    DB_BASE + (index as u64) * (4u64 << dstrd)
+}
+
+/// Zeroed, aligned, DMA-visible memory; 0 on failure. Heap addresses ARE bus addresses (the identity
+/// map, the same standing property `drivers/ahci.rs`'s `bus_addr` names). Never freed: the controller
+/// owns these rings for as long as `CC.EN` is set, and this arc has no teardown.
+fn dma_alloc(size: usize) -> u64 {
+    match core::alloc::Layout::from_size_align(size, PAGE) {
+        Ok(l) => unsafe { alloc::alloc::alloc_zeroed(l) as u64 },
+        Err(_) => 0,
+    }
+}
+
+/// One queue pair: the SQ and CQ rings (one page each), the SQ tail we own, the CQ head we own, and
+/// the phase tag the next valid completion will carry.
+struct Queue {
+    qid: u16,
+    sq: u64,
+    cq: u64,
+    depth: u16,
+    tail: u16,
+    head: u16,
+    phase: bool,
+}
+
+impl Queue {
+    const fn new(qid: u16, sq: u64, cq: u64, depth: u16) -> Self {
+        Queue { qid, sq, cq, depth, tail: 0, head: 0, phase: true }
+    }
+}
+
+/// The brought-up controller.
+struct Ctrl {
+    bar0: u64,
+    dstrd: u32,
+    admin: Queue,
+    io: Queue,
+    cid: u16,
+    prp_list: u64,
+    bounce: u64,
+    /// Bytes one command may move: min(the bounce, MDTS).
+    max_xfer: usize,
+    lba_bytes: u32,
+    nsze: u64,
+    mn: [u8; 40],
+}
+
+/// THE controller. Held only through [`with_ctrl`].
+static CTRL: Mutex<Option<Ctrl>> = Mutex::new(None);
+/// A command missed its bound this boot: every later command is refused at once.
+static DEAD: AtomicBool = AtomicBool::new(false);
+static DEAD_SAID: AtomicBool = AtomicBool::new(false);
+/// Acquires of [`CTRL`] that gave up at the bound (the first few print).
+static BUSY_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+/// Submit one command on the admin (`admin`) or the I/O queue and poll its completion. Returns DW0.
+fn submit(c: &mut Ctrl, admin: bool, cmd: &mut [u32; 16]) -> Result<u32, ()> {
+    let opc = cmd[0] & 0xFF;
+    if DEAD.load(Ordering::Acquire) {
+        if !DEAD_SAID.swap(true, Ordering::AcqRel) {
+            serial_println!("[nvme] ctrl marked — opcode={:#04x} refused at once (it missed its bound earlier this boot)", opc);
+        }
+        return Err(());
+    }
+    let cid = c.cid;
+    c.cid = c.cid.wrapping_add(1);
+    cmd[0] = (cmd[0] & 0xFF) | ((cid as u32) << 16);
+    let bar0 = c.bar0;
+    let dstrd = c.dstrd;
+    let q = if admin { &mut c.admin } else { &mut c.io };
+
+    let slot = q.sq + (q.tail as u64) * SQE_BYTES;
+    for (i, dw) in cmd.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((slot + (i as u64) * 4) as *mut u32, *dw) };
+    }
+    q.tail = (q.tail + 1) % q.depth;
+    fence(Ordering::SeqCst);
+    w32(bar0, db_off(q.qid * 2, dstrd), q.tail as u32);
+
+    let ent = q.cq + (q.head as u64) * CQE_BYTES;
+    let start = crate::arch::now_cycles();
+    let budget = cycles_ms(T_CMD_MS);
+    loop {
+        let dw3 = unsafe { core::ptr::read_volatile((ent + 12) as *const u32) };
+        if ((dw3 >> 16) & 1 == 1) == q.phase {
+            break;
+        }
+        if crate::arch::now_cycles().wrapping_sub(start) >= budget {
+            DEAD.store(true, Ordering::Release);
+            serial_println!(
+                "[nvme] cmd timeout opcode={:#04x} qid={} cid={} ms={} bound_ms={} csts={:#010x} -> ctrl marked",
+                opc, q.qid, cid, elapsed_ms(start), T_CMD_MS, r32(bar0, REG_CSTS)
+            );
+            return Err(());
+        }
+        core::hint::spin_loop();
+    }
+    fence(Ordering::SeqCst);
+    let dw0 = unsafe { core::ptr::read_volatile(ent as *const u32) };
+    let dw3 = unsafe { core::ptr::read_volatile((ent + 12) as *const u32) };
+    q.head = (q.head + 1) % q.depth;
+    if q.head == 0 {
+        q.phase = !q.phase;
+    }
+    w32(bar0, db_off(q.qid * 2 + 1, dstrd), q.head as u32);
+
+    let sc = (dw3 >> 17) & 0xFF;
+    let sct = (dw3 >> 25) & 0x7;
+    if sc != 0 || sct != 0 {
+        serial_println!("[nvme] cmd error opcode={:#04x} qid={} sct={} sc={:#04x}", opc, q.qid, sct, sc);
+        return Err(());
+    }
+    if (dw3 & 0xFFFF) as u16 != cid {
+        serial_println!("[nvme] cmd cid mismatch opcode={:#04x} qid={} want={} got={}", opc, q.qid, cid, dw3 & 0xFFFF);
+        return Err(());
+    }
+    Ok(dw0)
+}
+
+/// The ONE way [`CTRL`] is held: interrupts masked, a bounded try, never an unbounded spin.
+fn with_ctrl<R>(lba: u64, f: impl FnOnce(&mut Ctrl) -> Result<R, ()>) -> Result<R, ()> {
+    crate::arch::without_interrupts(move || {
+        let t0 = crate::arch::now_cycles();
+        let bound = cycles_ms(T_HOLD_MS);
+        let mut guard = loop {
+            if let Some(g) = CTRL.try_lock() {
+                break g;
+            }
+            if crate::arch::now_cycles().wrapping_sub(t0) >= bound {
+                let n = BUSY_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 4 {
+                    serial_println!("[nvme] busy refused lba={} waited_ms={} bound_ms={} n={}", lba, elapsed_ms(t0), T_HOLD_MS, n);
+                }
+                return Err(());
+            }
+            core::hint::spin_loop();
+        };
+        match &mut *guard {
+            Some(c) => f(c),
+            None => Err(()),
+        }
+    })
+}
+
+/// One READ/WRITE of `bytes` (whole blocks, <= `max_xfer`) between the namespace and the bounce.
+fn io_cmd(c: &mut Ctrl, opc: u32, lba: u64, bytes: usize) -> Result<(), ()> {
+    let pages = (bytes + PAGE - 1) / PAGE;
+    let prp1 = c.bounce;
+    let prp2 = if pages <= 1 {
+        0
+    } else if pages == 2 {
+        c.bounce + PAGE as u64
+    } else {
+        for i in 1..pages {
+            unsafe {
+                core::ptr::write_volatile((c.prp_list + ((i - 1) as u64) * 8) as *mut u64, c.bounce + (i * PAGE) as u64)
+            };
+        }
+        c.prp_list
+    };
+    let nlb = (bytes / c.lba_bytes as usize) as u32;
+    if nlb == 0 {
+        return Err(());
+    }
+    let mut cmd = [0u32; 16];
+    cmd[0] = opc;
+    cmd[1] = 1; // NSID 1
+    cmd[6] = prp1 as u32;
+    cmd[7] = (prp1 >> 32) as u32;
+    cmd[8] = prp2 as u32;
+    cmd[9] = (prp2 >> 32) as u32;
+    cmd[10] = lba as u32;
+    cmd[11] = (lba >> 32) as u32;
+    cmd[12] = nlb - 1; // 0-based
+    submit(c, false, &mut cmd).map(|_| ())
+}
+
+/// Move `len` bytes (whole blocks) at `lba`, chunked by `max_xfer`, through the bounce.
+fn transfer(lba: u64, ptr: *mut u8, len: usize, write: bool) -> Result<(), ()> {
+    with_ctrl(lba, |c| {
+        let bs = c.lba_bytes as usize;
+        if len == 0 || len % bs != 0 {
+            return Err(());
+        }
+        let blocks = (len / bs) as u64;
+        match lba.checked_add(blocks) {
+            Some(end) if end <= c.nsze => {}
+            _ => return Err(()),
+        }
+        let per = (c.max_xfer / bs).max(1) * bs;
+        let mut done = 0usize;
+        while done < len {
+            let n = core::cmp::min(per, len - done);
+            let at = lba + (done / bs) as u64;
+            if write {
+                unsafe { core::ptr::copy_nonoverlapping(ptr.add(done) as *const u8, c.bounce as *mut u8, n) };
+                io_cmd(c, IO_WRITE, at, n)?;
+            } else {
+                io_cmd(c, IO_READ, at, n)?;
+                unsafe { core::ptr::copy_nonoverlapping(c.bounce as *const u8, ptr.add(done), n) };
+            }
+            done += n;
+        }
+        Ok(())
+    })
+}
+
+/// Read whole blocks at `lba` into `buf`. What `block::read_blocks_nvme` calls.
+pub(crate) fn read_at(lba: u64, buf: &mut [u8]) -> Result<(), ()> {
+    transfer(lba, buf.as_mut_ptr(), buf.len(), false)
+}
+
+/// Write whole blocks at `lba` from `buf`. PRIVATE: its ONE caller is [`selftest`]'s scratch leg.
+fn write_at(lba: u64, buf: &[u8]) -> Result<(), ()> {
+    transfer(lba, buf.as_ptr() as *mut u8, buf.len(), true)
+}
+
+fn trimmed(s: &[u8]) -> &str {
+    let end = s.iter().rposition(|&b| b != b' ' && b != 0).map_or(0, |i| i + 1);
+    core::str::from_utf8(&s[..end]).unwrap_or("?")
+}
+
+/// Walk PCI for the first function reporting class 0x01 / subclass 0x08 / progif 0x02 (NVM Express).
+/// Class-based, never bdf-based (LAWS §3); the same 256x32 multi-function-gated sweep as `ahci`'s.
+fn find_controller() -> Option<(u8, u8, u8, u16, u16)> {
+    for bus in 0u16..256 {
+        for slot in 0u8..32 {
+            let v0 = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, 0, 0x00) };
+            if v0 == 0xFFFF {
+                continue;
+            }
+            let hdr0 = unsafe { crate::arch::pci::read_config_32(bus as u8, slot, 0, 0x0C) };
+            let max_func: u8 = if ((hdr0 >> 16) & 0x80) != 0 { 7 } else { 0 };
+            for func in 0..=max_func {
+                let vend = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, func, 0x00) };
+                if vend == 0xFFFF {
+                    continue;
+                }
+                let class_reg = unsafe { crate::arch::pci::read_config_32(bus as u8, slot, func, 0x08) };
+                let class = ((class_reg >> 24) & 0xFF) as u8;
+                let sub = ((class_reg >> 16) & 0xFF) as u8;
+                let progif = ((class_reg >> 8) & 0xFF) as u8;
+                if class == 0x01 && sub == 0x08 && progif == 0x02 {
+                    let devid = unsafe { crate::arch::pci::read_config_16(bus as u8, slot, func, 0x02) };
+                    return Some((bus as u8, slot, func, vend, devid));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Claim the function (memory decode + bus master: NVMe has no PIO data path) and decode BAR0, which
+/// is a 64-bit memory BAR on every controller (NVMe 1.4 §2.1.10/§2.1.11: MLBAR + MUBAR).
+fn take(bus: u8, slot: u8, func: u8, vend: u16, devid: u16) -> Option<u64> {
+    let lo = unsafe { crate::arch::pci::read_config_32(bus, slot, func, 0x10) };
+    let command = unsafe { crate::arch::pci::read_config_16(bus, slot, func, 0x04) };
+    if lo & 0x1 != 0 {
+        serial_println!("[nvme] bdf {}:{}.{} {:04x}:{:04x} BAR0 is an I/O BAR — not an NVMe register block, refused", bus, slot, func, vend, devid);
+        return None;
+    }
+    let bar0 = if lo & 0x06 == 0x04 {
+        let hi = unsafe { crate::arch::pci::read_config_32(bus, slot, func, 0x14) };
+        ((lo & 0xFFFF_F000) as u64) | ((hi as u64) << 32)
+    } else {
+        (lo & 0xFFFF_F000) as u64
+    };
+    if bar0 == 0 {
+        serial_println!("[nvme] bdf {}:{}.{} {:04x}:{:04x} BAR0 unassigned by firmware — refused", bus, slot, func, vend, devid);
+        return None;
+    }
+    if command & 0x0006 != 0x0006 {
+        unsafe { crate::arch::pci::write_config_16(bus, slot, func, 0x04, command | 0x0006) };
+        let after = unsafe { crate::arch::pci::read_config_16(bus, slot, func, 0x04) };
+        if after & 0x0006 != 0x0006 {
+            serial_println!("[nvme] bdf {}:{}.{} decode/bus-master did not stick (cmd={:#06x}) — refused", bus, slot, func, after);
+            return None;
+        }
+    }
+    // Registers + the admin doorbells at DSTRD 0; `bring_up` widens the window once CAP names the stride.
+    crate::arch::memory::map_mmio_window(bar0, 0x2000);
+    Some(bar0)
+}
+
+/// Reset, program the admin queue, enable, identify, create the I/O pair. Every refusal names itself.
+fn bring_up(bus: u8, slot: u8, func: u8, vend: u16, devid: u16, bar0: u64) -> Option<Ctrl> {
+    let cap = r64(bar0, REG_CAP);
+    let vs = r32(bar0, REG_VS);
+    let mqes = (cap & 0xFFFF) as u32 + 1;
+    let to_ms = (((cap >> 24) & 0xFF) * 500).max(500);
+    let dstrd = ((cap >> 32) & 0xF) as u32;
+    let css_nvm = (cap >> 37) & 1;
+    let mpsmin = (cap >> 48) & 0xF;
+    crate::bootlog_println!(
+        "[nvme] bdf {}:{}.{} {:04x}:{:04x} bar0={:#x} cap={:#018x} ver={}.{}.{} mqes={} dstrd={} to_ms={}",
+        bus, slot, func, vend, devid, bar0, cap, vs >> 16, (vs >> 8) & 0xFF, vs & 0xFF, mqes, dstrd, to_ms
+    );
+    if dstrd != 0 {
+        crate::arch::memory::map_mmio_window(bar0, (DB_BASE + 4 * (4u64 << dstrd)) as usize);
+    }
+    if mpsmin != 0 {
+        serial_println!("[nvme] refused mpsmin={} (4 KiB pages only)", mpsmin);
+        return None;
+    }
+    if css_nvm == 0 {
+        serial_println!("[nvme] refused cap.css={:#04x} (no NVM command set)", (cap >> 37) & 0xFF);
+        return None;
+    }
+    if mqes < 2 {
+        serial_println!("[nvme] refused mqes={}", mqes);
+        return None;
+    }
+    let io_depth = core::cmp::min(IO_DEPTH as u32, mqes) as u16;
+
+    // Reset: the firmware's NVMe driver usually leaves the controller enabled.
+    let cc = r32(bar0, REG_CC);
+    if cc & CC_EN != 0 {
+        w32(bar0, REG_CC, cc & !CC_EN);
+    }
+    if !wait_ms(to_ms, || r32(bar0, REG_CSTS) & CSTS_RDY == 0) {
+        serial_println!("[nvme] disable timeout csts={:#010x} to_ms={}", r32(bar0, REG_CSTS), to_ms);
+        return None;
+    }
+
+    let asq = dma_alloc(PAGE);
+    let acq = dma_alloc(PAGE);
+    let iosq = dma_alloc(PAGE);
+    let iocq = dma_alloc(PAGE);
+    let prp_list = dma_alloc(PAGE);
+    let bounce = dma_alloc(BOUNCE_BYTES);
+    if asq == 0 || acq == 0 || iosq == 0 || iocq == 0 || prp_list == 0 || bounce == 0 {
+        serial_println!("[nvme] DMA allocation failed — controller not brought up");
+        return None;
+    }
+
+    let aq = (ADMIN_DEPTH - 1) as u32;
+    w32(bar0, REG_AQA, (aq << 16) | aq);
+    w64(bar0, REG_ASQ, asq);
+    w64(bar0, REG_ACQ, acq);
+    w32(bar0, REG_CC, CC_IOCQES | CC_IOSQES);
+    w32(bar0, REG_CC, CC_IOCQES | CC_IOSQES | CC_EN);
+    let ready = wait_ms(to_ms, || r32(bar0, REG_CSTS) & (CSTS_RDY | CSTS_CFS) != 0);
+    let csts = r32(bar0, REG_CSTS);
+    if !ready || csts & CSTS_CFS != 0 || csts & CSTS_RDY == 0 {
+        serial_println!("[nvme] enable timeout csts={:#010x} to_ms={}", csts, to_ms);
+        return None;
+    }
+
+    let mut c = Ctrl {
+        bar0,
+        dstrd,
+        admin: Queue::new(0, asq, acq, ADMIN_DEPTH),
+        io: Queue::new(IO_QID, iosq, iocq, io_depth),
+        cid: 0,
+        prp_list,
+        bounce,
+        max_xfer: BOUNCE_BYTES,
+        lba_bytes: 512,
+        nsze: 0,
+        mn: [b' '; 40],
+    };
+
+    // IDENTIFY controller (CNS 1).
+    let mut cmd = [0u32; 16];
+    cmd[0] = ADM_IDENTIFY;
+    cmd[6] = bounce as u32;
+    cmd[7] = (bounce >> 32) as u32;
+    cmd[10] = 1;
+    submit(&mut c, true, &mut cmd).ok()?;
+    let id = unsafe { core::slice::from_raw_parts(bounce as *const u8, PAGE) };
+    c.mn.copy_from_slice(&id[24..64]);
+    let mdts = id[77] as usize;
+    c.max_xfer = if mdts == 0 || mdts >= 4 { BOUNCE_BYTES } else { PAGE << mdts };
+
+    // IDENTIFY namespace 1 (CNS 0).
+    let mut cmd = [0u32; 16];
+    cmd[0] = ADM_IDENTIFY;
+    cmd[1] = 1;
+    cmd[6] = bounce as u32;
+    cmd[7] = (bounce >> 32) as u32;
+    submit(&mut c, true, &mut cmd).ok()?;
+    let ns = unsafe { core::slice::from_raw_parts(bounce as *const u8, PAGE) };
+    let mut nsze_b = [0u8; 8];
+    nsze_b.copy_from_slice(&ns[0..8]);
+    let nsze = u64::from_le_bytes(nsze_b);
+    let flbas = (ns[26] & 0x0F) as usize;
+    let lbaf_at = 128 + 4 * flbas;
+    let lbaf = u32::from_le_bytes([ns[lbaf_at], ns[lbaf_at + 1], ns[lbaf_at + 2], ns[lbaf_at + 3]]);
+    let lbads = (lbaf >> 16) & 0xFF;
+    if nsze == 0 {
+        serial_println!("[nvme] refused ns=1 nsze=0 (namespace 1 inactive)");
+        return None;
+    }
+    if !(9..=12).contains(&lbads) {
+        serial_println!("[nvme] refused ns=1 lbads={} (512..4096-byte blocks only)", lbads);
+        return None;
+    }
+    c.nsze = nsze;
+    c.lba_bytes = 1u32 << lbads;
+
+    // CREATE I/O CQ (qid 1, physically contiguous, interrupts off), then CREATE I/O SQ on it.
+    let qsz = ((io_depth - 1) as u32) << 16;
+    let mut cmd = [0u32; 16];
+    cmd[0] = ADM_CREATE_IO_CQ;
+    cmd[6] = iocq as u32;
+    cmd[7] = (iocq >> 32) as u32;
+    cmd[10] = qsz | IO_QID as u32;
+    cmd[11] = 1; // PC=1, IEN=0
+    submit(&mut c, true, &mut cmd).ok()?;
+    let mut cmd = [0u32; 16];
+    cmd[0] = ADM_CREATE_IO_SQ;
+    cmd[6] = iosq as u32;
+    cmd[7] = (iosq >> 32) as u32;
+    cmd[10] = qsz | IO_QID as u32;
+    cmd[11] = ((IO_QID as u32) << 16) | 1; // CQID 1, PC=1
+    submit(&mut c, true, &mut cmd).ok()?;
+    Some(c)
+}
+
+/// The one entry point. Called once from `arch::x86_64::pci::init`, behind the `nvme` feature.
+pub fn probe() {
+    let (bus, slot, func, vend, devid) = match find_controller() {
+        Some(t) => t,
+        None => {
+            crate::bootlog_println!("[nvme] no NVMe controller (class 0x01/0x08 progif 0x02)");
+            return;
+        }
+    };
+    let bar0 = match take(bus, slot, func, vend, devid) {
+        Some(b) => b,
+        None => return,
+    };
+    let c = match bring_up(bus, slot, func, vend, devid, bar0) {
+        Some(c) => c,
+        None => {
+            serial_println!("[nvme] bdf {}:{}.{} not brought up — no namespace published", bus, slot, func);
+            return;
+        }
+    };
+    let (mn, lba, blocks) = (c.mn, c.lba_bytes, c.nsze);
+    crate::arch::without_interrupts(|| *CTRL.lock() = Some(c));
+    if crate::drivers::block::register_nvme(blocks, lba, &mn) {
+        serial_println!("[nvme] ctrl mn=\"{}\" ns=1 lba={} blocks={} -> ready", trimmed(&mn), lba, blocks);
+    }
+}
+
+/// `tests nvme` (ZENBOOKNVME M3): identify (the registered namespace), read sector 0 through the block
+/// registry, and — on QEMU's controller only — a write + read-back of 8 scratch blocks that are restored.
+pub fn selftest() {
+    let dev = match crate::drivers::block::nvme_info() {
+        Some(d) => d,
+        None => {
+            serial_println!(":: NVME: ctrl=none ns=0 rw=- -> SKIP reason=no-nvme ::");
+            return;
+        }
+    };
+    let bs = dev.block_size as usize;
+    let held = with_ctrl(0, |c| Ok(c.mn));
+    let mn = held.unwrap_or([b' '; 40]);
+    let identify = held.is_ok() && dev.num_blocks > 0 && !trimmed(&mn).is_empty();
+
+    let mut sec = alloc::vec![0u8; bs];
+    let sector0 = match crate::drivers::block::read_blocks_nvme(0, &mut sec) {
+        Ok(_) => match amber_core::gpt::classify_sector0(&sec[..512]) {
+            amber_core::gpt::Sector0::Protective => "GPT",
+            amber_core::gpt::Sector0::Mbr => "MBR",
+            amber_core::gpt::Sector0::None => "none",
+        },
+        Err(_) => "unreadable",
+    };
+
+    let scratch = dev.num_blocks.saturating_sub(SCRATCH_FROM_END);
+    let rw: &str = if !mn.starts_with(QEMU_MN) {
+        "skip"
+    } else if dev.num_blocks < SCRATCH_FROM_END * 2 {
+        "bad:small"
+    } else {
+        scratch_rw(scratch, bs)
+    };
+    serial_println!(
+        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={}",
+        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw
+    );
+    let ctrl = if identify { "ok" } else { "bad" };
+    if !identify || sector0 == "unreadable" {
+        serial_println!(":: NVME: ctrl={} ns=1 rw={} -> FAIL reason={} ::", ctrl, rw, if identify { "read" } else { "identify" });
+    } else if rw == "ok" {
+        serial_println!(":: NVME: ctrl=ok ns=1 rw=ok -> PASS ::");
+    } else if rw == "skip" {
+        serial_println!(":: NVME: ctrl=ok ns=1 rw=skip -> SKIP reason=rw-not-qemu ::");
+    } else {
+        serial_println!(":: NVME: ctrl=ok ns=1 rw={} -> FAIL reason=rw ::", rw);
+    }
+}
+
+/// The scratch leg: read the original, write an lba-salted pattern, read it back, restore, verify.
+fn scratch_rw(lba: u64, bs: usize) -> &'static str {
+    let len = SCRATCH_BLOCKS as usize * bs;
+    let mut orig = alloc::vec![0u8; len];
+    if crate::drivers::block::read_blocks_nvme(lba, &mut orig).is_err() {
+        return "bad:read-orig";
+    }
+    let mut pat = alloc::vec![0u8; len];
+    for (i, b) in pat.iter_mut().enumerate() {
+        *b = (i as u64 ^ lba.wrapping_mul(0x9E37_79B9) ^ (i as u64 >> 9)) as u8;
+    }
+    if write_at(lba, &pat).is_err() {
+        return "bad:write";
+    }
+    let mut back = alloc::vec![0u8; len];
+    if crate::drivers::block::read_blocks_nvme(lba, &mut back).is_err() {
+        return "bad:read-back";
+    }
+    let same = back == pat;
+    if write_at(lba, &orig).is_err() {
+        return "bad:restore";
+    }
+    if crate::drivers::block::read_blocks_nvme(lba, &mut back).is_err() || back != orig {
+        return "bad:restore-verify";
+    }
+    if same { "ok" } else { "bad:mismatch" }
+}

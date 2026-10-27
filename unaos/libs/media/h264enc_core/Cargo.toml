@@ -12,6 +12,9 @@ description = "H264ENC (SR197): an H.264 / AVC encoder — Constrained Baseline,
 # arithmetic, so h264_core's decode of the output equals the encoder's reconstruction byte for byte (the KAT).
 [dependencies]
 h264_core = { path = "../h264_core" }
+# H264ENCPLANES (rmbp-ledger B973): the RGBA -> I420 is yuv_core's `from_rgba` (the ONE converter, beside its `to_rgba`; no_std,
+# no alloc, zero deps), `yuv.rs` its thin owner of the planes.
+yuv_core = { path = "../yuv_core" }
 
 # The mux KAT (tests/mux.rs) writes the encoded samples into an MP4 and reads them back. Test-only.
 [dev-dependencies]

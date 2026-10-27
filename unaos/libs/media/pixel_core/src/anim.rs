@@ -51,6 +51,9 @@ pub struct Animation<B: AsRef<[u8]>> {
     primed: Option<u32>,
     next: usize,
     ended: bool,
+    /// KERNEL-ANIM-ICC (rmbp-ledger B974): the file's embedded ICC profile, as [`Image::icc`] reports it for the same
+    /// file (APNG iCCP, animated WebP ICCP after a VP8X with the ICC flag, a still's own; GIF none).
+    icc: Option<Vec<u8>>,
 }
 
 impl<B: AsRef<[u8]>> Animation<B> {
@@ -58,7 +61,7 @@ impl<B: AsRef<[u8]>> Animation<B> {
     /// [`crate::decode`] refuses it, and an APNG whose animation is unusable becomes its still).
     pub fn new(owner: B) -> Result<Self, Error> {
         let bytes = owner.as_ref();
-        let (kind, w, h, lp, n, d, still) = match crate::sniff(bytes).ok_or(Error::UnknownFormat)? {
+        let (kind, w, h, lp, n, d, still, icc) = match crate::sniff(bytes).ok_or(Error::UnknownFormat)? {
             Format::Gif => {
                 let (n, lp) = crate::gif::scan(bytes);
                 let mut s = crate::gif::Stepper::new(bytes)?;
@@ -67,14 +70,16 @@ impl<B: AsRef<[u8]>> Animation<B> {
                     None => return Err(Error::Malformed("gif without an image")),
                 };
                 let (w, h) = (s.cw, s.ch);
-                (Kind::Gif(s), w, h, lp, n, d, None)
+                (Kind::Gif(s), w, h, lp, n, d, None, None)
             }
             Format::WebP => match crate::webp::animation_start(bytes) {
                 Some((p, end, w, h)) => {
                     let mut s = crate::webp::Stepper::new(bytes, p, end, w, h)?;
                     let d = s.step(bytes).ok_or(Error::Malformed("webp animation without an ANMF frame"))??;
                     let (n, lp) = (s.listed(), s.loop_count());
-                    (Kind::WebP(s), w, h, lp, n, d, None)
+                    // KERNEL-ANIM-ICC (B974): `decode`'s rule — ICCP directly after a first-chunk VP8X carrying the ICC flag.
+                    let icc = if bytes.get(12..16) == Some(&b"VP8X"[..]) && bytes.get(20).is_some_and(|f| f & 0x20 != 0) { crate::webp::iccp_after(bytes, p, end) } else { None };
+                    (Kind::WebP(s), w, h, lp, n, d, None, icc)
                 }
                 None => still(crate::decode_webp(bytes)?),
             },
@@ -85,7 +90,8 @@ impl<B: AsRef<[u8]>> Animation<B> {
                         Some(r) => {
                             let d = r?;
                             let (w, h, n, lp) = (p.width(), p.height(), crate::png::ApngStepper::listed(&p), s.loop_count());
-                            (Kind::Apng(p, s), w, h, lp, n, d, None)
+                            let icc = p.icc().map(|x| x.to_vec()); // KERNEL-ANIM-ICC (B974)
+                            (Kind::Apng(p, s), w, h, lp, n, d, None, icc)
                         }
                         None => still(p.still()?),
                     },
@@ -105,6 +111,7 @@ impl<B: AsRef<[u8]>> Animation<B> {
             primed: Some(d),
             next: 0,
             ended: false,
+            icc,
         };
         if a.count <= 1 {
             // One frame is a still: `decode` reports no frames and no loop count for it.
@@ -132,6 +139,11 @@ impl<B: AsRef<[u8]>> Animation<B> {
     /// More than one frame.
     pub fn is_animated(&self) -> bool {
         self.count > 1
+    }
+    /// KERNEL-ANIM-ICC (B974): the embedded ICC profile (reported, never applied: the player builds one
+    /// `icc_core::Transform` from it and runs every frame through it), or None.
+    pub fn icc(&self) -> Option<&[u8]> {
+        self.icc.as_deref()
     }
 
     /// The canvas: `width * height * 4` straight RGBA, the frame [`Animation::next_frame`] last put up.
@@ -207,10 +219,10 @@ impl<B: AsRef<[u8]>> Animation<B> {
     }
 }
 
-/// The arms of [`Animation::new`] for a still: `(kind, w, h, loop, count, delay, pixels)`.
+/// The arms of [`Animation::new`] for a still: `(kind, w, h, loop, count, delay, pixels, icc)`.
 #[allow(clippy::type_complexity)]
-fn still(img: Image) -> (Kind, u32, u32, Option<u16>, usize, u32, Option<Vec<u8>>) {
-    (Kind::Still, img.width, img.height, None, 1, 0, Some(img.rgba))
+fn still(img: Image) -> (Kind, u32, u32, Option<u16>, usize, u32, Option<Vec<u8>>, Option<Vec<u8>>) {
+    (Kind::Still, img.width, img.height, None, 1, 0, Some(img.rgba), img.icc)
 }
 
 /// The file's bytes.
@@ -227,14 +239,14 @@ pub fn decode_first_frame(bytes: &[u8]) -> Result<Image, Error> {
     match crate::sniff(bytes) {
         Some(Format::Gif | Format::WebP | Format::Png) => {
             let a = Animation::new(bytes)?;
-            let (w, h) = (a.width, a.height);
+            let (w, h, icc) = (a.width, a.height, a.icc); // KERNEL-ANIM-ICC (B974): the profile kept (a still WebP's ICCP was dropped here)
             let rgba = match a.kind {
                 Kind::Still => a.still,
                 Kind::Gif(s) => s.canvas,
                 Kind::WebP(s) => s.canvas,
                 Kind::Apng(_, s) => s.canvas,
             };
-            Ok(Image::still(w, h, rgba))
+            Ok(Image::still(w, h, rgba).with_icc(icc))
         }
         _ => {
             let mut img = crate::decode(bytes)?;

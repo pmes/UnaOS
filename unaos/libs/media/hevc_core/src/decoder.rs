@@ -72,8 +72,8 @@ pub struct Decoder {
     prev_tid0_poc: i32,
     /// (sps_max_num_reorder_pics, SpsMaxLatencyPictures or 0, sps_max_dec_pic_buffering) of the active SPS.
     bump: (u32, u32, u32),
-    /// HEVCREXT (SR334): the consumer shows 4:2:0 at one bit depth only, so 4:2:2 / 4:4:4 and unequal luma / chroma depths
-    /// are refused by name ([`Decoder::set_chroma_420_only`]).
+    /// HEVCREXT (SR334): a consumer that shows 4:2:0 at one bit depth only refuses 4:2:2 / 4:4:4 and unequal luma / chroma
+    /// depths by name ([`Decoder::set_chroma_420_only`]); no in-tree consumer sets it since COLOURONE422 (SR359).
     chroma_420_only: bool,
 }
 
@@ -141,9 +141,9 @@ impl Decoder {
         }
     }
 
-    /// HEVCREXT (SR334): a consumer that can only display 4:2:0 at one bit depth (gneiss_pal's `to_frame` / `Pixels::I420Hi`
-    /// carry one `bit_depth`, until COLOURONE-422) asks for 4:2:2 / 4:4:4 streams and unequal luma / chroma depths to be
-    /// refused by name at SPS activation, so its player keeps the labelled stand-in instead of showing wrong colours.
+    /// HEVCREXT (SR334): a consumer that can only display 4:2:0 at one bit depth asks for 4:2:2 / 4:4:4 streams and unequal
+    /// luma / chroma depths to be refused by name at SPS activation, so its player keeps the labelled stand-in. COLOURONE422
+    /// (SR359): gneiss_pal's `to_frame` carries every format and both depths, so no in-tree consumer sets it (tests/rext.rs pins it).
     /// Kept across [`Decoder::reset`].
     pub fn set_chroma_420_only(&mut self, on: bool) {
         self.chroma_420_only = on;
@@ -517,5 +517,15 @@ impl Decoder {
     /// C.5.2.4 "bumping" until nothing waits for output.
     fn bump_all(&mut self) {
         self.dpb.bump_all(&mut self.out);
+    }
+}
+
+impl Decoder {
+    /// HEVCLEVELLINE (LEDGER SR368, HEVC-LEVEL-LINE): the profile, tier and level ([`crate::ps::Ptl`], A.3) of the SPS of
+    /// the picture under decoding, else of the lowest-id stored SPS (an hvcC's, known from [`Decoder::configure_hvcc`]
+    /// before any picture); `None` before any SPS.
+    pub fn profile_tier_level(&self) -> Option<crate::ps::Ptl> {
+        let sps = self.cur.as_ref().map(|c| &c.sps).or_else(|| self.sps.iter().flatten().next())?;
+        Some(sps.ptl.names())
     }
 }

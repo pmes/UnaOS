@@ -3,7 +3,7 @@ name = "infer_core"
 version = "0.1.0"
 edition = "2024"
 license = "LGPL-3.0-or-later"
-description = "INFERCORE (SR57): UnaOS's own CPU inference core — safetensors / ONNX-initializer readers, the BERT WordPiece tokenizer and the BERT encoder (sentence embeddings) — no_std + alloc, zero dependencies."
+description = "INFERCORE (SR57): UnaOS's own CPU inference core — safetensors / ONNX-initializer readers, the BERT WordPiece tokenizer and the BERT encoder (sentence embeddings) — no_std + alloc, one dependency, libm (MATH-ONE SR362)."
 
 # INFERCORE (LEDGER SR57, R83): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, NO dependencies.
 # Written from the specifications: the safetensors format (huggingface/safetensors README), onnx.proto3
@@ -12,6 +12,7 @@ description = "INFERCORE (SR57): UnaOS's own CPU inference core — safetensors 
 # hand-edited) from the UnicodeData.txt files pinned in vectors.txt. gneiss_pal's `local-embed`
 # feature (Vein's local embedder, EMBED B317) links it; the metal can link it by path.
 [dependencies]
+libm = { version = "0.2", default-features = false } # MATH-ONE (LEDGER SR362): the one f64 math (timeline_core / icc_core line)
 
 [features]
 default = []

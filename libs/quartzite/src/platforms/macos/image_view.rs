@@ -356,7 +356,7 @@ define_class!(
                 if flags & (1 << 20) != 0 {
                     match text.as_str() {
                         "c" | "C" => syn.fire(bandy::SMessage::BrowserCopy),
-                        "a" | "A" => syn.fire(bandy::SMessage::BrowserSelectAll), "s" | "S" => syn.fire(bandy::SMessage::BrowserKey("Meta+s".into())), // PDF4FORMSAVE (SR354): Cmd+S reaches the engine (a PDF tab saves)
+                        "a" | "A" => syn.fire(bandy::SMessage::BrowserSelectAll), "s" | "S" => syn.fire(bandy::SMessage::BrowserKey((if flags & (1 << 17) != 0 { "Meta+Shift+s" } else { "Meta+s" }).into())), // PDF4FORMSAVE (SR354): Cmd+S reaches the engine (a PDF tab saves); SAVEDIALOG (SR364): with Shift (NSEventModifierFlagShift = 1 << 17) it is Save As
                         _ => {}
                     }
                     return;
@@ -930,6 +930,11 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                             }
                         });
                     }
+                }
+                // SAVEDIALOG (SR364): the owner asks THIS surface's window for a path: the platform save panel, on the main thread.
+                Ok(bandy::SMessage::SavePanel { url, name }) if url == target_id => {
+                    let syn = resend.clone();
+                    dispatch2::DispatchQueue::main().exec_async(move || super::save_panel::run(url, &name, &syn));
                 }
                 // AETHERSELECT (SR69): the engine's copy lands on the general pasteboard as plain text.
                 Ok(bandy::SMessage::BrowserClipboardSet(text)) => {
