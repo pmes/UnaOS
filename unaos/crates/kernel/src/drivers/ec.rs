@@ -15,7 +15,7 @@
 //!   0x00..0xFF is read with RD_EC and printed as eight `[ec] ram` lines: the witness ZENBOOK-EC-BATTERY decodes.
 //!
 //! WRITE SURFACE: RD_EC (0x80) + its address byte, and QR_EC (0x84) from the `_Qxx` event drain alone (ZENBOOKECQEVENTS
-//! Z30, file tail), which dequeues one pending query byte; GPE0_STS W1C of the ECDT's one GPE bit after a drain (ZENBOOKECGPE Z36, file tail). WR_EC (0x81), BE_EC/BD_EC (0x82/0x83) are never issued.
+//! Z30, file tail), which dequeues one pending query byte; GPE0_STS W1C of the ECDT's one GPE bit after a drain (ZENBOOKECGPE Z36, file tail); on the Zenbook the SCI arm: GPE0_EN (the EC's bit alone), every GPE0_STS bit W1C'd by the SCI handler, ACPI_ENABLE at boot (ZENBOOKSCI Z41, file tail). WR_EC (0x81), BE_EC/BD_EC (0x82/0x83) are never issued.
 //! BOUNDED: every IBF/OBF wait has a deadline (`hw_wait_budget() / 200`, ~10 ms calibrated); the census stops at the
 //! first stuck handshake and names the step and the status byte. `_Qxx` BYTES drained (Z30); their METHODS need AML: owed.
 //! `tests ec` runs the protocol against a fake port (never a real one): `:: EC: proto=ok cases=5/5 -> PASS ::`.
@@ -234,14 +234,14 @@ pub fn probe() { crate::arch::acpi_power::gpe0_say(); // ZENBOOKECGPE (zenbook-l
     let mut ram = [0u8; 256];
     let t0 = crate::arch::ms();
     let (n, stale, stuck) = census(&mut io, &mut ram);
-    let ms = crate::arch::ms().saturating_sub(t0); let q = if stuck.is_none() { qevent_boot(&mut io) } else { 0 }; // ZENBOOKECQEVENTS (zenbook-ledger Z30): the boot drain of the `_Qxx` bytes queued before this census, with the census's own io (`qevent_boot`, file tail). LINE-NEUTRAL fold, code before the comment.
+    let ms = crate::arch::ms().saturating_sub(t0); let q = if stuck.is_none() { qevent_boot(&mut io) } else { 0 }; let sci = if stuck.is_none() { sci_arm() } else { "census-stuck" }; // ZENBOOKSCI (zenbook-ledger Z41): the SCI arm after a census that did not stick and after the boot drain (`sci_arm`, file tail; the Zenbook alone). ZENBOOKECQEVENTS (zenbook-ledger Z30): the boot drain of the `_Qxx` bytes queued before this census, with the census's own io (`qevent_boot`, file tail). LINE-NEUTRAL fold, code before the comment.
     let mut base = 0;
     while base < n {
         say_row(base, &ram[base..n.min(base + 32)]);
         base += 32;
     }
     match stuck {
-        None => serial_println!("[ec] census bytes={} stale={} ms={} -> ok lid={} qevents={}", n, stale, ms, lid_census(&ram[..n]).word(), q),
+        None => serial_println!("[ec] census bytes={} stale={} ms={} -> ok lid={} qevents={} sci={}", n, stale, ms, lid_census(&ram[..n]).word(), q, sci),
         Some((at, s)) => serial_println!(
             "[ec] census bytes={} stale={} ms={} -> stuck at={:#04x} step={} status={:#04x} lid={}",
             n,
@@ -589,8 +589,8 @@ pub fn battery_selftest() {
     let mut f = kat_battery(73, 0x02);
     let charge = read_row(&mut f, &KAT_ROW);
     let charge_ok = charge == Ok(Reading { pct: 73, charging: true, ma: 1200, mv: 12300 }) && !f.bad_cmd;
-    let cases: [(&str, bool); 8] =
-        [("charge", charge_ok), ("discharge", bkat_discharge()), ("range", bkat_range()), ("stuck", bkat_stuck()), ("table", bkat_table()), ("lid", bkat_lid()), ("qevents", bkat_qevents()), ("gpe", bkat_gpe())]; // ZENBOOKECGPE (zenbook-ledger Z36): the gpe leg (file tail); ZENBOOKECLID (zenbook-ledger Z27): the lid leg (file tail); ZENBOOKECQEVENTS (zenbook-ledger Z30): the qevents leg (file tail)
+    let cases: [(&str, bool); 9] =
+        [("charge", charge_ok), ("discharge", bkat_discharge()), ("range", bkat_range()), ("stuck", bkat_stuck()), ("table", bkat_table()), ("lid", bkat_lid()), ("qevents", bkat_qevents()), ("gpe", bkat_gpe()), ("sci", bkat_sci())]; // ZENBOOKSCI (zenbook-ledger Z41): the sci leg (file tail); ZENBOOKECGPE (zenbook-ledger Z36): the gpe leg (file tail); ZENBOOKECLID (zenbook-ledger Z27): the lid leg (file tail); ZENBOOKECQEVENTS (zenbook-ledger Z30): the qevents leg (file tail)
     let mut ok = 0;
     let mut first: Option<&str> = None;
     for (name, r) in cases {
@@ -927,17 +927,17 @@ pub fn qevent_service() {
     if !crate::hw::gate(crate::hw::Probe::Ec) {
         return;
     }
-    let now = crate::arch::ms();
+    let now = crate::arch::ms(); sci_service(now); // ZENBOOKSCI (zenbook-ledger Z41): the SCI's storm mask and its `[acpi] sci n=` line, task context (`sci_service`, file tail). LINE-NEUTRAL fold.
     let last = LAST_Q_MS.load(Ordering::Relaxed);
-    if last != 0 && now.wrapping_sub(last) < Q_POLL_MS {
+    if last != 0 && now.wrapping_sub(last) < Q_POLL_MS && !sci_due() { // ZENBOOKSCI (Z41): an EC SCI makes the drain due now, not at the 10 s poll.
         return;
     }
     if LAST_Q_MS.compare_exchange(last, now.max(1), Ordering::AcqRel, Ordering::Relaxed).is_err() {
         return;
     }
-    let mut b = [0u8; Q_PER_PASS];
-    if let Ok((n, st)) = conversation(|io| qdrain(io, &mut b)) {
-        qsay(&b[..n]); gpe_pass(n); // ZENBOOKECGPE (zenbook-ledger Z36): the same GPE step on the service pass (`gpe_pass`, file tail). LINE-NEUTRAL fold.
+    let mut b = [0u8; Q_PER_PASS]; sci_take(); // ZENBOOKSCI (Z41): the pending flag cleared BEFORE the drain, so an SCI during it re-sets it. LINE-NEUTRAL fold.
+    let r = conversation(|io| qdrain(io, &mut b)); sci_busy(r.is_err()); if let Ok((n, st)) = r { // ZENBOOKSCI (Z41): no conversation = the SCI stays pending, the EC's enable stays off.
+        qsay(&b[..n]); gpe_pass(n); sci_rearm(); // ZENBOOKSCI (zenbook-ledger Z41): the EC's GPE0_EN bit back on after the drain (`sci_rearm`, file tail). ZENBOOKECGPE (zenbook-ledger Z36): the same GPE step on the service pass (`gpe_pass`, file tail). LINE-NEUTRAL fold.
         if let Some(s) = st {
             say_qstuck(s);
         }
@@ -1082,7 +1082,7 @@ fn gpe_pass(drained: usize) {
     let Some(&gpe) = EC_GPE.get() else { return };
     let Some(g) = crate::arch::acpi_power::gpe0() else { return gpe_skip("no-fadt", gpe) };
     let Some((port, mask)) = g.sts_bit(gpe) else { return gpe_skip(if g.blk == 0 { "no-gpe0" } else { "gpe1" }, gpe) };
-    let may_clear = g.sci_en == Some(true);
+    let may_clear = g.sci_en == Some(true) || sci_armed(); // ZENBOOKSCI (Z41): `gpe0()`'s Once froze the pre-arm SCI_EN.
     let (set, cleared) = gpe_step(&mut GpePort(port), mask, drained, may_clear);
     if GPE_LAST.swap(set as u8, Ordering::Relaxed) != set as u8 {
         serial_println!(
@@ -1122,4 +1122,409 @@ fn bkat_gpe() -> bool {
 
     serial_println!("[ec] gpe kat locate={} drained={} gsts={:#04x} clears={} legacy_writes={}", locate as u8, n, f.gsts, f.gclr, l.gclr);
     locate && before && drained && clear && idle && legacy && !f.bad_cmd
+}
+
+// ── ZENBOOKSCI (zenbook-ledger Z41) — the EC's SCI: ACPI mode, GPE0_EN for the EC bit alone, the SCI GSI routed. TAIL ──────
+// Before Z41 the drain was polled only (`qevent_service` every `Q_POLL_MS`): no GPE0_EN writer, the SCI GSI never routed,
+// ACPI mode only at S5. `sci_arm` (from `probe`, after a census that did not stick and after `qevent_boot`; the Zenbook
+// ALONE — `hw::platform()`, narrower than `hw::gate(Probe::Ec)`, so no other non-Apple machine enters ACPI mode at boot)
+// enters ACPI mode through `acpi_power::acpi_mode_enter` (the existing `enter_acpi_mode`), writes GPE0_EN whole through
+// `acpi_power::gpe0_en_only` (every enable 0, every status cleared, then the ECDT's GPE bit), allocates a vector
+// (`interrupts::vectors::alloc`), resolves the SCI through the ONE ISO walk (`ioapic::iso_gsi`, level / active-low by
+// default) and routes it in i8042's shape (`route_gsi` masked, then `set_mask`). The handler is LOCK-FREE (port I/O and
+// atomics): the EC's status bit set = its enable byte 0 (held off until drained) and `SCI_PENDING`; EVERY set GPE0_STS bit
+// is write-1-cleared (the firmware-armed GPEs this tree cannot service never hold the level line); more than
+// `SCI_STORM_N` SCIs inside one `SCI_WIN_MS` with no EC bit = every GPE0_EN byte 0 and `SCI_STORM`. The service pass
+// (task context) drains (the ONE `qdrain` through the ONE `conversation`), re-enables the EC bit, masks the IOAPIC entry
+// after a storm, and prints. PM1_EN is never touched (the fixed power button stays polled, BP-power-11).
+// `tests ecbattery`'s `sci` case runs the step, the drain on its flag, the re-arm and the storm guard over fakes.
+
+use core::sync::atomic::AtomicU16;
+
+/// Non-EC SCIs inside one window that mean a storm.
+const SCI_STORM_N: u32 = 50;
+/// The storm window.
+const SCI_WIN_MS: u64 = 1000;
+
+/// The GPE0 block port the handler reads (0 = not armed; stored LAST before the vector exists).
+static SCI_BLK: AtomicU16 = AtomicU16::new(0);
+/// GPE0_BLK_LEN / 2: the status half's length (the enable half follows it).
+static SCI_HALF: AtomicU8 = AtomicU8::new(0);
+/// The EC's bit: status-byte index << 8 | mask.
+static SCI_ECBIT: AtomicU16 = AtomicU16::new(0);
+/// The routed GSI (the storm's IOAPIC mask).
+static SCI_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
+/// The SCI is armed (routed and unmasked).
+static SCI_ON: AtomicBool = AtomicBool::new(false);
+/// An EC SCI arrived and its drain has not run.
+static SCI_PENDING: AtomicBool = AtomicBool::new(false);
+/// The pending flag this service pass took (`sci_take`), so a busy conversation can give it back.
+static SCI_TAKEN: AtomicBool = AtomicBool::new(false);
+/// The storm guard fired: every GPE0_EN byte is 0 and stays 0.
+static SCI_STORM: AtomicBool = AtomicBool::new(false);
+/// The storm line has been printed (and the IOAPIC entry masked).
+static SCI_STORM_SAID: AtomicBool = AtomicBool::new(false);
+/// SCIs taken / with the EC bit / with another GPE bit / with no GPE0 status bit at all.
+static SCI_N: AtomicU32 = AtomicU32::new(0);
+static SCI_EC: AtomicU32 = AtomicU32::new(0);
+static SCI_OTHER: AtomicU32 = AtomicU32::new(0);
+static SCI_NONGPE: AtomicU32 = AtomicU32::new(0);
+/// The storm window's start (`arch::ms()`, 0 = none) and its non-EC count.
+#[cfg(feature = "ioapic")]
+static SCI_WIN: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ioapic")]
+static SCI_WN: AtomicU32 = AtomicU32::new(0);
+/// `SCI_N` at the last `[acpi] sci n=` line, and when it printed.
+static SCI_SAID_N: AtomicU32 = AtomicU32::new(0);
+static SCI_SAID_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The GPE0 block byte by byte (offsets from the block: status half first, enable half at `half`) — the seam the KAT fakes.
+trait GpeBlock {
+    fn rd(&mut self, off: u16) -> u8;
+    fn wr(&mut self, off: u16, v: u8);
+}
+
+/// The real GPE0 block at the FADT's port.
+struct GpePorts(u16);
+
+impl GpeBlock for GpePorts {
+    fn rd(&mut self, off: u16) -> u8 {
+        // SAFETY: an offset inside the FADT's GPE0 block (`sci_arm` stored its port and half); a read has no side effect.
+        unsafe { Port::<u8>::new(self.0 + off).read() }
+    }
+    fn wr(&mut self, off: u16, v: u8) {
+        // SAFETY: a status byte (write-1-to-clear of bits read set) or an enable byte this kernel owns since `sci_arm`.
+        unsafe { Port::<u8>::new(self.0 + off).write(v) }
+    }
+}
+
+/// The KAT's GPE0 block: status bytes write-1-to-clear below `half`, enable bytes plain from `half`.
+struct FakeGpe {
+    r: [u8; 16],
+    half: u16,
+    writes: u32,
+}
+
+impl GpeBlock for FakeGpe {
+    fn rd(&mut self, off: u16) -> u8 {
+        self.r[off as usize]
+    }
+    fn wr(&mut self, off: u16, v: u8) {
+        self.writes += 1;
+        if off < self.half {
+            self.r[off as usize] &= !v;
+        } else {
+            self.r[off as usize] = v;
+        }
+    }
+}
+
+/// What one SCI found in GPE0_STS.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SciHit {
+    /// The EC's bit was set (its enable byte is now 0).
+    ec: bool,
+    /// Another bit was set.
+    other: bool,
+    /// Any bit was set.
+    any: bool,
+}
+
+/// The handler's GPE step: every status byte read; the EC's bit set = its enable byte 0; every set bit written back
+/// (write-1-to-clear). No lock, no EC conversation.
+fn sci_step<G: GpeBlock>(g: &mut G, half: u16, ecbit: u16) -> SciHit {
+    let (eb, em) = (ecbit >> 8, (ecbit & 0xff) as u8);
+    let mut hit = SciHit { ec: false, other: false, any: false };
+    for i in 0..half {
+        let s = g.rd(i);
+        if s == 0 {
+            continue;
+        }
+        hit.any = true;
+        let ec_mask = if i == eb { em } else { 0 };
+        if s & ec_mask != 0 {
+            hit.ec = true;
+            g.wr(half + eb, 0);
+        }
+        if s & !ec_mask != 0 {
+            hit.other = true;
+        }
+        g.wr(i, s);
+    }
+    hit
+}
+
+/// One non-EC SCI at `now`: `true` = more than `SCI_STORM_N` inside the current `SCI_WIN_MS` window.
+fn storm_hit(win: &AtomicU64, cnt: &AtomicU32, now: u64) -> bool {
+    let w = win.load(Ordering::Relaxed);
+    if w == 0 || now.wrapping_sub(w) >= SCI_WIN_MS {
+        win.store(now.max(1), Ordering::Relaxed);
+        cnt.store(1, Ordering::Relaxed);
+        return false;
+    }
+    cnt.fetch_add(1, Ordering::Relaxed) + 1 > SCI_STORM_N
+}
+
+/// Every GPE0_EN byte 0 (the storm guard).
+fn mask_all<G: GpeBlock>(g: &mut G, half: u16) {
+    for i in 0..half {
+        g.wr(half + i, 0);
+    }
+}
+
+/// The EC's enable bit back on (we own every enable bit and only the EC's is ever 1, so the byte is written whole).
+fn sci_rearm_on<G: GpeBlock>(g: &mut G, half: u16, ecbit: u16) {
+    g.wr(half + (ecbit >> 8), (ecbit & 0xff) as u8);
+}
+
+/// `[acpi] sci -> SKIP reason=<reason>[-<detail>]`; returns the census line's `sci=` word.
+fn sci_skip(reason: &'static str, detail: &str) -> &'static str {
+    if detail.is_empty() {
+        serial_println!("[acpi] sci -> SKIP reason={}", reason);
+    } else {
+        serial_println!("[acpi] sci -> SKIP reason={}-{}", reason, detail);
+    }
+    reason
+}
+
+/// The Zenbook alone reaches the SCI arm.
+fn sci_platform() -> bool {
+    matches!(crate::hw::platform(), crate::hw::Platform::ZenbookUm5606w)
+}
+
+/// The route's mode word.
+#[cfg(feature = "ioapic")]
+fn mode_word(trig: crate::arch::ioapic::Trigger, pol: crate::arch::ioapic::Polarity) -> &'static str {
+    use crate::arch::ioapic::{Polarity, Trigger};
+    match (trig, pol) {
+        (Trigger::Level, Polarity::ActiveLow) => "level-low",
+        (Trigger::Level, _) => "level-high",
+        (Trigger::Edge, Polarity::ActiveLow) => "edge-low",
+        _ => "edge-high",
+    }
+}
+
+/// The arm's undo before the SCI is live: every GPE0_EN byte 0 and the handler disarmed.
+#[cfg(feature = "ioapic")]
+fn sci_off(g: &crate::arch::acpi_power::Gpe0) {
+    SCI_ON.store(false, Ordering::Release);
+    SCI_BLK.store(0, Ordering::Release);
+    let _ = crate::arch::acpi_power::gpe0_en_only(g, None);
+}
+
+/// The SCI arm (`probe`, once): `on`, or the SKIP reason (the census line's `sci=` word). The Zenbook alone.
+#[cfg(feature = "ioapic")]
+fn sci_arm() -> &'static str {
+    use crate::arch::ioapic::{self, Polarity, Trigger};
+    if !sci_platform() {
+        return "platform";
+    }
+    let Some(&gpe) = EC_GPE.get() else { return sci_skip("no-ecdt-gpe", "") };
+    let Some(g) = crate::arch::acpi_power::gpe0() else { return sci_skip("no-fadt", "") };
+    let (Some((sts, mask)), Some(_)) = (g.sts_bit(gpe), g.en_bit(gpe)) else {
+        return sci_skip(if g.blk == 0 { "no-gpe0" } else { "gpe1" }, "");
+    };
+    let already = match crate::arch::acpi_power::acpi_mode_enter() {
+        Ok(a) => a,
+        Err(why) => return sci_skip("acpi-mode", why),
+    };
+    let (was, en) = crate::arch::acpi_power::gpe0_en_only(&g, Some(gpe));
+    SCI_HALF.store(g.len / 2, Ordering::Relaxed);
+    SCI_ECBIT.store(((sts - g.blk) << 8) | mask as u16, Ordering::Relaxed);
+    SCI_BLK.store(g.blk, Ordering::Release);
+    let Some(vector) = crate::arch::interrupts::vectors::alloc("acpi-sci", sci_isr) else {
+        sci_off(&g);
+        return sci_skip("no-vector", "");
+    };
+    let (gsi, pol, trig, via) = if g.sci <= 0xFF {
+        ioapic::iso_gsi(g.sci as u8, Polarity::ActiveLow, Trigger::Level)
+    } else {
+        (g.sci as u32, Polarity::ActiveLow, Trigger::Level, "identity")
+    };
+    if let Err(e) = ioapic::route_gsi(gsi, vector, pol, trig, crate::arch::apic::apic_id()) {
+        sci_off(&g);
+        return sci_skip("route", e.as_str());
+    }
+    SCI_GSI.store(gsi, Ordering::Relaxed);
+    SCI_ON.store(true, Ordering::Release);
+    if let Err(e) = ioapic::set_mask(gsi, false) {
+        sci_off(&g);
+        let _ = ioapic::unroute(gsi);
+        return sci_skip("unmask", e.as_str());
+    }
+    serial_println!(
+        "[acpi] sci on gsi={} via={} mode={} vector={:#04x} gpe={} gpe0_en={:#x} was={:#x} acpi_mode={}",
+        gsi,
+        via,
+        mode_word(trig, pol),
+        vector,
+        gpe,
+        en,
+        was,
+        if already { "already" } else { "entered" }
+    );
+    "on"
+}
+
+/// No IOAPIC in this kernel: nothing is touched (no ACPI mode, no GPE0_EN write).
+#[cfg(not(feature = "ioapic"))]
+fn sci_arm() -> &'static str {
+    if !sci_platform() {
+        return "platform";
+    }
+    sci_skip("no-ioapic-in-kernel", "")
+}
+
+/// The SCI's vector: the lock-free step, then the local APIC's EOI.
+#[cfg(feature = "ioapic")]
+extern "x86-interrupt" fn sci_isr(_f: x86_64::structures::idt::InterruptStackFrame) {
+    sci_irq();
+    crate::arch::apic::eoi();
+}
+
+/// The handler body: count, `sci_step` on the real block, the EC's flag, the storm guard. Port I/O and atomics only.
+#[cfg(feature = "ioapic")]
+fn sci_irq() {
+    SCI_N.fetch_add(1, Ordering::Relaxed);
+    let blk = SCI_BLK.load(Ordering::Acquire);
+    if blk == 0 {
+        return;
+    }
+    let half = SCI_HALF.load(Ordering::Relaxed) as u16;
+    let mut g = GpePorts(blk);
+    let hit = sci_step(&mut g, half, SCI_ECBIT.load(Ordering::Relaxed));
+    if hit.ec {
+        SCI_EC.fetch_add(1, Ordering::Relaxed);
+        SCI_PENDING.store(true, Ordering::Release);
+    }
+    if hit.other {
+        SCI_OTHER.fetch_add(1, Ordering::Relaxed);
+    }
+    if !hit.any {
+        SCI_NONGPE.fetch_add(1, Ordering::Relaxed);
+    }
+    if !hit.ec && !SCI_STORM.load(Ordering::Relaxed) && storm_hit(&SCI_WIN, &SCI_WN, crate::arch::ms()) {
+        mask_all(&mut g, half);
+        SCI_STORM.store(true, Ordering::Release);
+    }
+}
+
+/// The storm's IOAPIC mask, task context (the `CENSUS` lock is never taken in the handler).
+fn sci_mask_route(gsi: u32) {
+    #[cfg(feature = "ioapic")]
+    {
+        let _ = crate::arch::ioapic::set_mask(gsi, true);
+    }
+    #[cfg(not(feature = "ioapic"))]
+    {
+        let _ = gsi;
+    }
+}
+
+/// The service pass's SCI step (`qevent_service`, before its throttle): after a storm, the IOAPIC entry masked and
+/// `[acpi] sci storm masked n=<n> other=<k> src=<gpe|non-gpe>` once; otherwise `[acpi] sci n=<n> ec=<e> other=<k>` at
+/// the first SCI and then at most once per `Q_POLL_MS` when the count moved.
+fn sci_service(now: u64) {
+    if !SCI_ON.load(Ordering::Acquire) {
+        return;
+    }
+    let n = SCI_N.load(Ordering::Relaxed);
+    let other = SCI_OTHER.load(Ordering::Relaxed);
+    if SCI_STORM.load(Ordering::Acquire) {
+        if !SCI_STORM_SAID.swap(true, Ordering::Relaxed) {
+            sci_mask_route(SCI_GSI.load(Ordering::Relaxed));
+            let src = if SCI_NONGPE.load(Ordering::Relaxed) > 0 { "non-gpe" } else { "gpe" };
+            serial_println!("[acpi] sci storm masked n={} other={} src={}", n, other, src);
+        }
+        return;
+    }
+    let said = SCI_SAID_N.load(Ordering::Relaxed);
+    if n == said {
+        return;
+    }
+    let last = SCI_SAID_MS.load(Ordering::Relaxed);
+    if said != 0 && now.wrapping_sub(last) < Q_POLL_MS {
+        return;
+    }
+    SCI_SAID_N.store(n, Ordering::Relaxed);
+    SCI_SAID_MS.store(now, Ordering::Relaxed);
+    serial_println!("[acpi] sci n={} ec={} other={}", n, SCI_EC.load(Ordering::Relaxed), other);
+}
+
+/// An EC SCI is waiting for its drain.
+fn sci_due() -> bool {
+    SCI_PENDING.load(Ordering::Acquire)
+}
+
+/// The service pass takes the pending flag before its drain (an SCI during the drain sets it again).
+fn sci_take() {
+    SCI_TAKEN.store(SCI_PENDING.swap(false, Ordering::AcqRel), Ordering::Relaxed);
+}
+
+/// No conversation this pass: a taken flag goes back, so the next pass drains (the EC's enable stays off meanwhile).
+fn sci_busy(busy: bool) {
+    if busy && SCI_TAKEN.load(Ordering::Relaxed) {
+        SCI_PENDING.store(true, Ordering::Release);
+    }
+}
+
+/// After a drain: the EC's GPE0_EN bit back on, unless the SCI is unarmed or the storm guard fired.
+fn sci_rearm() {
+    if !SCI_ON.load(Ordering::Acquire) || SCI_STORM.load(Ordering::Acquire) {
+        return;
+    }
+    let blk = SCI_BLK.load(Ordering::Acquire);
+    if blk == 0 {
+        return;
+    }
+    sci_rearm_on(&mut GpePorts(blk), SCI_HALF.load(Ordering::Relaxed) as u16, SCI_ECBIT.load(Ordering::Relaxed));
+}
+
+/// The SCI is armed (ACPI mode is then known on, whatever `gpe0()`'s Once read before the arm).
+fn sci_armed() -> bool {
+    SCI_ON.load(Ordering::Acquire)
+}
+
+/// `tests ecbattery`'s `sci` case over a fake GPE0 block (half 4, the EC at GPE 0x0b = byte 1 mask 0x08) and the fake
+/// EC: the EC bit and another set = both cleared, the EC's enable off, the flag set; the flag drains the fake's queued byte
+/// through `qdrain`; the re-arm puts the enable back; an idle step writes nothing; the storm guard fires at the 51st hit
+/// in one window and resets in the next; `mask_all` zeroes every enable. The boot's statics are never touched.
+fn bkat_sci() -> bool {
+    let mut g = FakeGpe { r: [0; 16], half: 4, writes: 0 };
+    let ecbit: u16 = (1 << 8) | 0x08;
+    g.r[1] = 0x09;
+    g.r[2] = 0x40;
+    g.r[5] = 0x08;
+    let pending = AtomicBool::new(false);
+    let hit = sci_step(&mut g, 4, ecbit);
+    if hit.ec {
+        pending.store(true, Ordering::Relaxed);
+    }
+    let step = hit == SciHit { ec: true, other: true, any: true } && g.r[..4] == [0u8; 4] && g.r[5] == 0;
+
+    let mut f = Fake::with_q(&[0x52]);
+    let mut b = [0u8; Q_PER_PASS];
+    let (n, st) = if pending.swap(false, Ordering::Relaxed) { qdrain(&mut f, &mut b) } else { (0, None) };
+    let drained = n == 1 && st.is_none() && b[0] == 0x52 && !f.bad_cmd;
+
+    sci_rearm_on(&mut g, 4, ecbit);
+    let en = g.r[5];
+    let rearm = en == 0x08;
+    let w = g.writes;
+    let idle = sci_step(&mut g, 4, ecbit) == SciHit { ec: false, other: false, any: false } && g.writes == w && g.r[5] == 0x08;
+
+    let (win, cnt) = (AtomicU64::new(0), AtomicU32::new(0));
+    let mut storm_at = 0u32;
+    for k in 1..=SCI_STORM_N + 1 {
+        if storm_hit(&win, &cnt, 5_000) {
+            storm_at = k;
+            break;
+        }
+    }
+    let reset = !storm_hit(&win, &cnt, 5_000 + SCI_WIN_MS);
+    mask_all(&mut g, 4);
+    let masked = g.r[4..8] == [0u8; 4];
+
+    serial_println!("[ec] sci kat ec={} drained={} en={:#04x} storm_at={}", hit.ec as u8, n, en, storm_at);
+    step && drained && rearm && idle && storm_at == SCI_STORM_N + 1 && reset && masked
 }

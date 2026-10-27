@@ -885,8 +885,8 @@ pub(crate) fn dsdt() -> Option<&'static [u8]> {
 // the same `acpi::root_sdt` + `acpi::find_table` and decoded by `gas_io_port` (X_ preferred when the FADT carries it, else
 // the legacy u32), and SCI_EN through `discover`'s own PM1a port (no second PM1a locator). NOTHING here writes: the one
 // GPE0_STS write in the tree is `drivers::ec`'s W1C of the ECDT's GPE bit after a drain (ec.rs file tail). GPE0_EN, the
-// SCI GSI's route and ACPI_ENABLE at boot are ZENBOOK-SCI (owed: on the rMBP every firmware-armed GPE would fire with no
-// AML to service it). `gpe0_say` puts the facts on the wire once per x86 boot (`ec::probe`'s signature line).
+// SCI GSI's route and ACPI_ENABLE at boot: ZENBOOKSCI (Z41, this file's tail + ec.rs's), on the Zenbook alone (on the rMBP
+// every firmware-armed GPE would fire with no AML to service it). `gpe0_say` puts the facts on the wire once per x86 boot.
 
 /// FADT u16 SCI_INT: the SCI's interrupt (a GSI on an APIC machine).
 const FADT_SCI_INT: usize = 46;
@@ -969,4 +969,74 @@ pub fn gpe0_say() {
     } else {
         serial_println!("[acpi] gpe0={:#x} len={} sci={} sci_en={}", g.blk, g.len, g.sci, en);
     }
+}
+
+// ── ZENBOOKSCI (zenbook-ledger Z41) — ACPI mode at boot and the GPE0 enable half, for the EC's SCI — FILE TAIL ──────────
+// `drivers::ec::sci_arm` (the Zenbook alone, after a clean EC census) is the ONE caller of both writers below. ACPI mode is
+// entered through the existing `enter_acpi_mode` (the FADT's SMI_CMD / ACPI_ENABLE, its bounded SCI_EN poll; body
+// untouched), reached through `discover`'s PM1a. GPE0_EN is written whole: every enable byte 0 (the firmware-armed lid,
+// power and thermal GPEs whose `_Lxx`/`_Exx` AML this tree cannot run, BP-power-4), every GPE0_STS bit write-1-cleared,
+// then the ONE named GPE's enable bit set. GPE registers are byte-accessed (ACPI §4.8.4.1). PM1_EN is not touched.
+
+impl Gpe0 {
+    /// The GPE0_EN port and mask of GPE number `gpe` (the enable half starts `len/2` after the block), or `None` as
+    /// `sts_bit`.
+    pub fn en_bit(&self, gpe: u8) -> Option<(u16, u8)> {
+        let (sts, mask) = self.sts_bit(gpe)?;
+        Some((sts + (self.len / 2) as u16, mask))
+    }
+}
+
+/// Put the platform in ACPI mode for the SCI: `Ok(true)` = SCI_EN was already set, `Ok(false)` = entered now through
+/// `enter_acpi_mode`, `Err(why)` = no PM1a (`discover`'s reason) or `acpi-enable-refused` (no SMI handshake declared,
+/// or SCI_EN never read back set within the poll).
+pub fn acpi_mode_enter() -> Result<bool, &'static str> {
+    let s5 = discover()?;
+    // SAFETY: PM1a_CNT is the FADT's own port (read only here); `enter_acpi_mode` writes only the FADT's ACPI_ENABLE value
+    // to the FADT's SMI_CMD port, as in `poweroff`.
+    unsafe {
+        if Port::<u16>::new(s5.pm1a).read() & PM1_CNT_SCI_EN != 0 {
+            return Ok(true);
+        }
+        if enter_acpi_mode(&s5) { Ok(false) } else { Err("acpi-enable-refused") }
+    }
+}
+
+/// GPE0_EN := `gpe`'s bit alone (`None` = every enable 0): every enable byte zeroed, every GPE0_STS byte write-1-cleared
+/// with the value read, then the one bit set. Returns (enable half before, after) as little-endian u64s of its first 8
+/// bytes — the dump the storm question reads. No block = (0, 0), nothing written.
+pub fn gpe0_en_only(g: &Gpe0, gpe: Option<u8>) -> (u64, u64) {
+    if g.blk == 0 {
+        return (0, 0);
+    }
+    let half = (g.len / 2) as u16;
+    let en0 = g.blk + half;
+    let mut was = 0u64;
+    let mut now = 0u64;
+    // SAFETY: every port lies inside the FADT's GPE0 block (`blk .. blk + len`); STS writes are write-1-to-clear of bits
+    // read set, EN writes are the enables this kernel owns from here on.
+    unsafe {
+        for i in 0..half {
+            let mut en: Port<u8> = Port::new(en0 + i);
+            let v = en.read();
+            if i < 8 {
+                was |= (v as u64) << (8 * i);
+            }
+            en.write(0);
+        }
+        for i in 0..half {
+            let mut sts: Port<u8> = Port::new(g.blk + i);
+            let v = sts.read();
+            if v != 0 {
+                sts.write(v);
+            }
+        }
+        if let Some((port, mask)) = gpe.and_then(|n| g.en_bit(n)) {
+            Port::<u8>::new(port).write(mask);
+        }
+        for i in 0..half.min(8) {
+            now |= (Port::<u8>::new(en0 + i).read() as u64) << (8 * i);
+        }
+    }
+    (was, now)
 }

@@ -934,20 +934,29 @@ const IOAPIC3_APIC_INPUT: bool = true;
 /// opposite of PCI's INTx default `route_pci_intx` applies. The last field is `iso` or `identity`.
 /// Writes nothing; the caller programs the entry with `route_gsi` and unmasks with `set_mask`.
 pub fn isa_gsi(irq: u8) -> (u32, Polarity, Trigger, &'static str) {
+    iso_gsi(irq, Polarity::ActiveHigh, Trigger::Edge)
+}
+
+// ── ZENBOOKSCI (zenbook-ledger Z41): THE ONE ISO WALK, WITH THE CALLER'S BUS DEFAULT ───────────────
+/// `isa_gsi`'s walk with the default named by the caller: an override's `bus-default` flags and the
+/// identity fallback resolve to `pol_default` / `trig_default`. ISA asks edge / active-high (`isa_gsi`);
+/// the ACPI SCI asks level / active-low (ACPI §5.2.12.5: the SCI is a sharable, level, active-low
+/// interrupt unless an override says otherwise; `drivers::ec`'s SCI arm). Writes nothing.
+pub fn iso_gsi(irq: u8, pol_default: Polarity, trig_default: Trigger) -> (u32, Polarity, Trigger, &'static str) {
     let c = CENSUS.lock();
     for i in 0..c.n_isos {
         let iso = c.isos[i];
         if iso.bus == 0 && iso.irq == irq {
             let pol = match Polarity::from_flags(iso.flags) {
-                Polarity::BusDefault => Polarity::ActiveHigh,
+                Polarity::BusDefault => pol_default,
                 p => p,
             };
             let trig = match Trigger::from_flags(iso.flags) {
-                Trigger::BusDefault => Trigger::Edge,
+                Trigger::BusDefault => trig_default,
                 t => t,
             };
             return (iso.gsi, pol, trig, "iso");
         }
     }
-    (irq as u32, Polarity::ActiveHigh, Trigger::Edge, "identity")
+    (irq as u32, pol_default, trig_default, "identity")
 }
