@@ -512,7 +512,7 @@ impl FacetImageView {
     fn fire_resize(&self, size: NSSize) {
         let syn = self.ivars().synapse.borrow().clone();
         let Some(syn) = syn else { return };
-        let (w, h) = (size.width.max(1.0) as u32, size.height.max(1.0) as u32);
+        let (w, h) = crate::platforms::page_geometry((size.width, size.height), 1.0, (0, 0)).viewport; // AETHERSURFACEHEIGHT (SR411): the view in points, the one rule
         if self.ivars().last_resize_sent.get() == Some((w, h)) {
             return;
         }
