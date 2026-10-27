@@ -1089,7 +1089,7 @@ refs/heads/exec-rmbp-aetherheaderband   a9bb0b749 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-installervessel   a9bb0b749 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-installercard   a9bb0b749 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-s10keyzero   870337caa FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-xhciloanshedkat   05beb9fa9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-xhciloanshedkat   a2d33fdae FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmcensus   05beb9fa9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-xhciloanptpyield   05beb9fa9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-hidmaskcore   2ab1b5c93 FOLDED-BY-HAND (this commit) 2026-10-27
