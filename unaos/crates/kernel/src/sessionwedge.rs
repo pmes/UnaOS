@@ -871,3 +871,13 @@ fn gatesteal_selftest() {
         crate::arch::ms().saturating_sub(t0)
     );
 }
+
+// ── CONSOLEPICK (rmbp-ledger B1014; GRANT 7, the seat's MEASURE line) — the pump stamp, read only ──────────────────
+/// The usb-pump's age: ms since its last loop-top `stamp`, `None` when it never stamped. Read by
+/// `drivers::xhci::ftdi::console_watch` for `pump=<alive|dead|never>` (dead at [`WEDGE_MS`]); PUMPWEDGE's stamp, never a second one.
+pub fn pump_age_ms() -> Option<u64> {
+    match LAST_MS.load(Relaxed) {
+        0 => None,
+        t => Some(crate::arch::ms().saturating_sub(t)),
+    }
+}
