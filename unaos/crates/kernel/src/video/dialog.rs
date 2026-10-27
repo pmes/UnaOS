@@ -313,7 +313,7 @@ fn open_pending() {
             paint(&d, d.countdown_s);
             let (sw, sh) = (metrics::size(W), metrics::size(H()));
             let start_y = y.saturating_sub(slide as usize * metrics::size(SLIDE_PX));
-            win = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * metrics::size(DLG_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), x, start_y);
+            win = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * metrics::size(DLG_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), x, start_y); metrics::leaked_surf_retire(&SURF_AT, "dialog");
             if win != wm::WIN_NONE {
                 if d.screen {
                     wm::set_modal_top(win); // DIALOG2: over the login screen — the ceiling is the dialog's while it is up
@@ -1402,7 +1402,7 @@ fn rescaled(d: &Dlg, win: wm::WinId, shown: u32) -> bool {
     seat_open();
     paint(d, shown);
     let (sw, sh, cap) = (metrics::size(W), metrics::size(H()), DLG_CAP.load(Ordering::Relaxed));
-    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), i.x, i.y);
+    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), i.x, i.y); metrics::leaked_surf_retire(&SURF_AT, "dialog");
     if new != wm::WIN_NONE {
         if d.screen {
             wm::set_modal_top(new);

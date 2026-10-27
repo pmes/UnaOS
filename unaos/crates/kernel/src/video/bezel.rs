@@ -166,7 +166,7 @@ fn close(now: u64) {
 static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn surf() -> &'static mut [u32] {
     let n = metrics::size(W) * metrics::size(H);
-    metrics::leaked_surf(&SURF_AT, n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
+    metrics::login_surf(&SURF_AT, n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 }
 
 /// Physical-pixel painter over the surface (`pw` x `ph`). Shapes test each pixel's centre in LOGICAL px x16
@@ -289,7 +289,7 @@ fn draw(kind: u8, lv: u8) -> u32 {
         let (sw, sh) = (metrics::size(W), metrics::size(H));
         let x = pw.saturating_sub(sw) / 2;
         let y = ph.saturating_sub(sh + metrics::size(96));
-        let id = wm::overlay_open(surf().as_mut_ptr() as usize, sw * sh * 4, sw, sh, x, y);
+        let id = wm::overlay_open(surf().as_mut_ptr() as usize, sw * sh * 4, sw, sh, x, y); metrics::leaked_surf_retire(&SURF_AT, "bezel");
         WIN.store(if id == wm::WIN_NONE { 0 } else { id }, Ordering::Release);
         return if id == wm::WIN_NONE { 0 } else { id };
     }
