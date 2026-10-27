@@ -684,7 +684,7 @@ mod tt {
             if name.starts_with("dejavu-mono") && have_jb {
                 continue; // JetBrains Mono holds the grid: the DejaVu mono faces are not read
             }
-            let p = alloc::format!("{}/{}", dir, file);
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))] let _ct = crate::allocator::census::enter(crate::allocator::census::TEXT_RESIDENT); let p = alloc::format!("{}/{}", dir, file); // FACELEAK (MEMLINE3 B845): one face (read, leaked, noted resident, added) tagged for the owner census. LINE-NEUTRAL fold, code first
             let why = match read_face(mt, &p) {
                 Ok(v) => {
                     let len = v.len();
