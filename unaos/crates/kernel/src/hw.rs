@@ -235,7 +235,7 @@ fn pci_rows(c: &mut Census, wait: bool) {
             c, "pci",
             alloc::format!("{:04x}:{:04x}", f.vendor, f.device),
             alloc::format!("{}:{}.{}", f.bus, f.dev, f.func),
-            String::from(pci_class_name(f.class, f.sub, f.progif)),
+            String::from(pci_id_name(f.vendor, f.device).unwrap_or_else(|| pci_class_name(f.class, f.sub, f.progif))),
             driver, state,
         );
     }
@@ -490,5 +490,398 @@ fn arm_pcie_rows(c: &mut Census, wait: bool) {
             String::from(pci_class_name(f.class, f.sub, f.progif)),
             driver, state,
         );
+    }
+}
+
+// ── ZENBOOKSURVEY (zenbook-ledger Z1) — THE PLATFORM — TAIL-APPENDED, so no line above moves ───────────────────────
+// Which machine is this? The loader hands the SMBIOS entry point from the UEFI configuration table
+// (`BootInfo::smbios_ptr`, tagged with `unaos_boot_info::SMBIOS_TAG`); main.rs lifts it into [`set_smbios`];
+// `pci.rs init` resolves it ONCE, first thing ([`platform_say`]), before any probe that touches an Apple-only register
+// window, and prints `[hw] platform=<token> dmi="<product>" vendor="<manufacturer>" src=<how>`. The SMC, the gmux and
+// the HDA codec drive ask [`gate`]: today's code runs on the MacBookPro10,1, under QEMU, on any Apple machine, on a
+// machine whose SMBIOS could not be read (an older loader, a bad anchor or checksum, an unmapped page — so a rMBP under
+// an old loader keeps every probe) and before the resolution; a POSITIVELY identified non-Apple machine (the Zenbook
+// UM5606W, or any other vendor) gets `[hw] skip <probe> platform=<token>` once and the probe's own "absent" answer.
+// `tests platform` re-prints the line and runs the parser over five canned tables (`:: PLATFORM: … -> PASS ::`).
+// Readers take no lock: the resolution lives in a `spin::Once` (the acpi.rs TOPOLOGY idiom), the skip lines in one
+// atomic bitmask. `pci_id_name` is the PCI id table the census's name column asks first (the class name stays the
+// fallback); the sibling ZENBOOK arcs add their own rows above its last arm.
+
+/// The machine this kernel booted on, from the SMBIOS Type 1 (System Information) record.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Platform {
+    /// Type 1 product `MacBookPro10,1` — the 2012 Retina MacBook Pro the x86 line was built on.
+    MacBookPro10_1,
+    /// A product containing `UM5606` — the ASUS Zenbook UM5606W (Strix Point).
+    ZenbookUm5606w,
+    /// Manufacturer `QEMU`, or a product starting `Standard PC (` (OVMF's q35 / i440fx tables).
+    Qemu,
+    /// Anything else: the Type 1 product (empty when no SMBIOS was read).
+    Unknown(&'static str),
+}
+
+impl Platform {
+    /// The wire token.
+    pub fn token(self) -> &'static str {
+        match self {
+            Platform::MacBookPro10_1 => "macbookpro10_1",
+            Platform::ZenbookUm5606w => "zenbook_um5606w",
+            Platform::Qemu => "qemu",
+            Platform::Unknown(_) => "unknown",
+        }
+    }
+}
+
+/// The Apple-only probes [`gate`] answers for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Probe {
+    /// The Apple SMC at ports 0x300/0x304 (`drivers/smc.rs`).
+    Smc,
+    /// The Apple gmux at ports 0x7C2-0x7D4 and its IGD switch ladder (`drivers/gpu/igpu.rs`).
+    Gmux,
+    /// The HDA codec drive, whose GPIO policy was measured on the CS4206 only (`drivers/hda.rs`).
+    Hda,
+}
+
+impl Probe {
+    /// The wire name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Probe::Smc => "smc",
+            Probe::Gmux => "gmux",
+            Probe::Hda => "hda",
+        }
+    }
+    fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+}
+
+const K_MAC: u8 = 0;
+const K_ZENBOOK: u8 = 1;
+const K_QEMU: u8 = 2;
+/// A Type 1 from a non-Apple vendor: Apple-only probes are skipped.
+const K_OTHER: u8 = 3;
+/// A Type 1 from Apple that is not the 10,1: today's probes run.
+const K_APPLE: u8 = 4;
+/// No usable SMBIOS: today's probes run.
+const K_NODMI: u8 = 5;
+const DMI_LEN: usize = 64;
+
+/// One resolution: the kind, how it was read, and the two Type 1 strings (printable ASCII, `"` -> `?`).
+struct Dmi {
+    kind: u8,
+    src: &'static str,
+    vendor: [u8; DMI_LEN],
+    vlen: usize,
+    product: [u8; DMI_LEN],
+    plen: usize,
+}
+
+impl Dmi {
+    fn empty(src: &'static str) -> Dmi {
+        Dmi { kind: K_NODMI, src, vendor: [0; DMI_LEN], vlen: 0, product: [0; DMI_LEN], plen: 0 }
+    }
+    fn vendor_str(&self) -> &str {
+        core::str::from_utf8(&self.vendor[..self.vlen]).unwrap_or("")
+    }
+    fn product_str(&self) -> &str {
+        core::str::from_utf8(&self.product[..self.plen]).unwrap_or("")
+    }
+}
+
+/// Copy a Type 1 string into a fixed buffer: printable ASCII only, trailing spaces dropped.
+fn dmi_copy(dst: &mut [u8; DMI_LEN], src: &[u8]) -> usize {
+    let mut n = 0;
+    for &b in src.iter().take(DMI_LEN) {
+        dst[n] = if (0x20..0x7F).contains(&b) && b != b'"' { b } else { b'?' };
+        n += 1;
+    }
+    while n > 0 && dst[n - 1] == b' ' {
+        n -= 1;
+    }
+    n
+}
+
+/// The loader's tagged pointer, as main.rs lifted it (0 = none).
+static SMBIOS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The one resolution, written once by [`platform_say`].
+static PLAT: spin::Once<Dmi> = spin::Once::new();
+/// One bit per [`Probe`] whose skip line has printed this boot.
+static SKIPPED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// main.rs:219 — store `BootInfo::smbios_ptr` (read later, never here: the heap and the live map are not up yet).
+pub fn set_smbios(ptr: u64) {
+    SMBIOS.store(ptr, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Classify one Type 1 (manufacturer, product).
+fn classify(vendor: &[u8], product: &[u8]) -> u8 {
+    let trim = |s: &[u8]| -> usize { s.iter().rposition(|&b| b != b' ' && b != 0).map_or(0, |i| i + 1) };
+    let (v, p) = (&vendor[..trim(vendor)], &product[..trim(product)]);
+    if v.is_empty() && p.is_empty() {
+        K_NODMI
+    } else if p == b"MacBookPro10,1" {
+        K_MAC
+    } else if p.windows(6).any(|w| w == b"UM5606") {
+        K_ZENBOOK
+    } else if v == b"QEMU" || p.starts_with(b"Standard PC (") {
+        K_QEMU
+    } else if v.starts_with(b"Apple") {
+        K_APPLE
+    } else {
+        K_OTHER
+    }
+}
+
+/// Does a machine of this kind run the Apple-only probes as today? Only a positively identified non-Apple one does not.
+fn kind_runs(kind: u8) -> bool {
+    !matches!(kind, K_ZENBOOK | K_OTHER)
+}
+
+fn sum8(b: &[u8]) -> u8 {
+    b.iter().fold(0u8, |a, &x| a.wrapping_add(x))
+}
+
+fn le16(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+
+fn le32(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+/// The `idx`-th (1-based) string of a structure's string set (`strs` = the bytes after the formatted area, up to and
+/// including the first NUL of the double-NUL terminator). Index 0 is "no string".
+fn dmi_string(strs: &[u8], idx: u8) -> &[u8] {
+    if idx == 0 {
+        return &[];
+    }
+    strs.split(|&b| b == 0).nth(idx as usize - 1).unwrap_or(&[])
+}
+
+/// Read the Type 1 (manufacturer, product) through the entry point at `ep`. Pure: every byte comes from `read(addr,
+/// len)`, which answers `None` for a range it cannot show. SMBIOS 3.0 `_SM3_` (24-byte entry, 64-bit table address,
+/// DSP0134 §5.2.2) or 2.x `_SM_` + `_DMI_` (31-byte entry, §5.2.1); both checksums are checked; the walk is bounded
+/// by the table length (capped at 64 KiB) and stops at type 127.
+fn smbios_type1<'a>(ep: u64, read: &dyn Fn(u64, usize) -> Option<&'a [u8]>) -> Result<(&'static str, &'a [u8], &'a [u8]), &'static str> {
+    let head = read(ep, 5).ok_or("unmapped")?;
+    let (src, taddr, tlen) = if head == b"_SM3_" {
+        let e = read(ep, 0x18).ok_or("unmapped")?;
+        let n = (e[6] as usize).max(0x18);
+        let e = read(ep, n).ok_or("unmapped")?;
+        if sum8(e) != 0 {
+            return Err("bad-checksum");
+        }
+        ("smbios3", u64::from_le_bytes([e[0x10], e[0x11], e[0x12], e[0x13], e[0x14], e[0x15], e[0x16], e[0x17]]), le32(e, 0x0C) as usize)
+    } else if &head[..4] == b"_SM_" {
+        let e = read(ep, 0x1F).ok_or("unmapped")?;
+        let n = (e[5] as usize).clamp(0x1E, 0x1F);
+        if sum8(&e[..n]) != 0 || &e[0x10..0x15] != b"_DMI_" || sum8(&e[0x10..0x1F]) != 0 {
+            return Err("bad-checksum");
+        }
+        ("smbios2", le32(e, 0x18) as u64, le16(e, 0x16) as usize)
+    } else {
+        return Err("bad-anchor");
+    };
+    let t = read(taddr, tlen.min(0x1_0000)).ok_or("unmapped")?;
+    let mut i = 0usize;
+    while i + 4 <= t.len() {
+        let (ty, l) = (t[i], t[i + 1] as usize);
+        if l < 4 || i + l > t.len() {
+            return Err("bad-table");
+        }
+        let s = i + l;
+        let mut j = s;
+        loop {
+            if j + 1 >= t.len() {
+                return Err("bad-table");
+            }
+            if t[j] == 0 && t[j + 1] == 0 {
+                break;
+            }
+            j += 1;
+        }
+        if ty == 1 && l >= 6 {
+            let strs = &t[s..j + 1];
+            return Ok((src, dmi_string(strs, t[i + 4]), dmi_string(strs, t[i + 5])));
+        }
+        if ty == 127 {
+            break;
+        }
+        i = j + 2;
+    }
+    Err("no-type1")
+}
+
+/// `len` bytes of firmware memory at physical `addr`, when every 4 KiB page of it is present in the live tables and
+/// maps to itself (the kernel runs on the firmware's identity map, arch/x86_64/memory.rs; `memory::translate` is the
+/// read-only walk). `None` instead of a fault for a pointer an older loader's bytes made up.
+#[cfg(target_arch = "x86_64")]
+fn read_phys(addr: u64, len: usize) -> Option<&'static [u8]> {
+    if addr == 0 || len == 0 || addr >> 48 != 0 {
+        return None;
+    }
+    let end = addr.checked_add(len as u64)?;
+    let mut page = addr & !0xFFF;
+    while page < end {
+        if crate::arch::x86_64::memory::translate(page)? != page {
+            return None;
+        }
+        page += 0x1000;
+    }
+    // SAFETY: every page of [addr, addr + len) is present and identity-mapped (checked above); the SMBIOS entry point
+    // and table are firmware data nothing in the kernel writes.
+    Some(unsafe { core::slice::from_raw_parts(addr as *const u8, len) })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn read_phys(_addr: u64, _len: usize) -> Option<&'static [u8]> {
+    None
+}
+
+/// The one resolution from the stored pointer.
+fn resolve() -> Dmi {
+    let raw = SMBIOS.load(core::sync::atomic::Ordering::Relaxed);
+    if raw == 0 {
+        return Dmi::empty("absent");
+    }
+    if raw >> 48 != unaos_boot_info::SMBIOS_TAG >> 48 {
+        return Dmi::empty("bad-tag");
+    }
+    let mut d = Dmi::empty("absent");
+    match smbios_type1(raw & 0x0000_FFFF_FFFF_FFFF, &read_phys) {
+        Ok((src, v, p)) => {
+            d.src = src;
+            d.vlen = dmi_copy(&mut d.vendor, v);
+            d.plen = dmi_copy(&mut d.product, p);
+            d.kind = classify(&d.vendor[..d.vlen], &d.product[..d.plen]);
+        }
+        Err(why) => d.src = why,
+    }
+    d
+}
+
+/// The machine, as resolved at `pci.rs init` (`Unknown("")` before that).
+pub fn platform() -> Platform {
+    match PLAT.get() {
+        None => Platform::Unknown(""),
+        Some(d) => match d.kind {
+            K_MAC => Platform::MacBookPro10_1,
+            K_ZENBOOK => Platform::ZenbookUm5606w,
+            K_QEMU => Platform::Qemu,
+            _ => Platform::Unknown(d.product_str()),
+        },
+    }
+}
+
+/// Resolve (once) and print `[hw] platform=… dmi="…" vendor="…" src=…`. Called first thing in `pci.rs init` and by
+/// `tests platform`.
+pub fn platform_say() {
+    let d = PLAT.call_once(resolve);
+    serial_println!("[hw] platform={} dmi=\"{}\" vendor=\"{}\" src={}", platform().token(), d.product_str(), d.vendor_str(), d.src);
+}
+
+/// May the Apple-only probe `p` touch its registers? `true` = run today's code. `false` only on a positively identified
+/// non-Apple machine, and then `[hw] skip <probe> platform=<token>` prints once per probe per boot. Lock-free.
+pub fn gate(p: Probe) -> bool {
+    let Some(d) = PLAT.get() else { return true };
+    if kind_runs(d.kind) {
+        return true;
+    }
+    if SKIPPED.fetch_or(p.bit(), core::sync::atomic::Ordering::Relaxed) & p.bit() == 0 {
+        serial_println!("[hw] skip {} platform={}", p.name(), platform().token());
+    }
+    false
+}
+
+/// `tests platform`: the live line again, then the parser over five canned tables (an SMBIOS 3.0 entry point and a
+/// two-structure table each): the rMBP, the Zenbook, QEMU, a Dell, and the QEMU table with its entry checksum broken.
+/// PASS = all five classify as expected AND the live platform resolved.
+pub fn platform_selftest() {
+    platform_say();
+    const BASE: u64 = 0x1000;
+    let image = |vendor: &[u8], product: &[u8], corrupt: bool| -> Vec<u8> {
+        let mut t: Vec<u8> = alloc::vec![1, 8, 0, 0, 1, 2, 0, 0];
+        t.extend_from_slice(vendor);
+        t.push(0);
+        t.extend_from_slice(product);
+        t.extend_from_slice(&[0, 0]);
+        t.extend_from_slice(&[127, 4, 1, 0, 0, 0]);
+        let mut img = alloc::vec![0u8; 0x40];
+        img[..5].copy_from_slice(b"_SM3_");
+        img[6] = 0x18;
+        img[7] = 3;
+        img[0x0C..0x10].copy_from_slice(&(t.len() as u32).to_le_bytes());
+        img[0x10..0x18].copy_from_slice(&(BASE + 0x40).to_le_bytes());
+        img[5] = 0u8.wrapping_sub(sum8(&img[..0x18]));
+        if corrupt {
+            img[5] ^= 0x5A;
+        }
+        img.extend_from_slice(&t);
+        img
+    };
+    let cases: [(&[u8], &[u8], bool, u8); 5] = [
+        (b"Apple Inc.", b"MacBookPro10,1", false, K_MAC),
+        (b"ASUSTeK COMPUTER INC.", b"ASUS Zenbook S 16 UM5606WA_UM5606WA", false, K_ZENBOOK),
+        (b"QEMU", b"Standard PC (Q35 + ICH9, 2009)", false, K_QEMU),
+        (b"Dell Inc.", b"XPS 13 9340", false, K_OTHER),
+        (b"QEMU", b"Standard PC (Q35 + ICH9, 2009)", true, K_NODMI),
+    ];
+    let mut ok = 0usize;
+    for (v, p, bad, want) in cases {
+        let img = image(v, p, bad);
+        let read = |a: u64, n: usize| kat_read(&img, BASE, a, n);
+        let kind = match smbios_type1(BASE, &read) {
+            Ok((_, v, p)) => classify(v, p),
+            Err(_) => K_NODMI,
+        };
+        if kind == want && kind_runs(kind) == !matches!(want, K_ZENBOOK | K_OTHER) {
+            ok += 1;
+        } else {
+            serial_println!("[hw] platform kat miss want={} got={}", want, kind);
+        }
+    }
+    let live = PLAT.get();
+    let run = if live.map_or(true, |d| kind_runs(d.kind)) { "run" } else { "skip" };
+    let pass = ok == cases.len() && live.is_some();
+    serial_println!(
+        ":: PLATFORM: platform={} src={} kat={}/{} gate=smc:{},gmux:{},hda:{} -> {} ::",
+        platform().token(), live.map_or("unresolved", |d| d.src), ok, cases.len(), run, run, run, if pass { "PASS" } else { "FAIL" }
+    );
+}
+
+/// `tests platform`'s reader over one canned image based at `base`.
+fn kat_read(img: &[u8], base: u64, a: u64, n: usize) -> Option<&[u8]> {
+    let o = a.checked_sub(base)? as usize;
+    img.get(o..o.checked_add(n)?)
+}
+
+/// The census's name for a PCI function this kernel knows by id (pci.ids 2026.10.27), asked before the class name.
+/// QEMU's and the rMBP's functions match no row, so their census text is unchanged. ZENBOOK sibling arcs: add ONE row
+/// above the last arm and name the hunk.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn pci_id_name(vendor: u16, device: u16) -> Option<&'static str> {
+    match (vendor, device) {
+        (0x1002, 0x150E) => Some("Radeon 890M graphics (Strix, gfx1150)"),
+        (0x1002, 0x1640) => Some("Radeon HD Audio (HDMI/DP)"),
+        (0x1022, 0x1507) => Some("Strix root complex"),
+        (0x1022, 0x1508) => Some("Strix IOMMU"),
+        (0x1022, 0x1509) => Some("Strix dummy host bridge"),
+        (0x1022, 0x150A) => Some("Strix PCIe USB4 bridge"),
+        (0x1022, 0x150B) => Some("Strix GPP bridge"),
+        (0x1022, 0x150C) => Some("Strix internal GPP bridge"),
+        (0x1022, 0x150D) => Some("Strix PCIe dummy function"),
+        (0x1022, 0x151A | 0x151B | 0x151E | 0x151F) => Some("Strix USB 3.1 controller (xHCI)"),
+        (0x1022, 0x151C | 0x151D) => Some("Strix USB4 host interface (NHI)"),
+        (0x1022, 0x15E2) => Some("AMD audio coprocessor (ACP)"),
+        (0x1022, 0x15E3) => Some("Ryzen HD Audio controller"),
+        (0x1022, 0x16F8..=0x16FF) => Some("Strix data fabric"),
+        (0x1022, 0x17E0) => Some("AMD platform security processor (CCP/ASP)"),
+        (0x1022, 0x17F0) => Some("AMD neural processing unit (NPU)"),
+        (0x1022, 0x790B) => Some("AMD FCH SMBus controller"),
+        (0x1022, 0x790E) => Some("AMD FCH LPC bridge"),
+        _ => None,
     }
 }
