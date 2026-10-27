@@ -33,6 +33,9 @@
 //!   (`timeline_core::Timeline::reels_colour` over `Sources::open_report`, the kernel export's rule too), else 2 / 2.
 //! * Single-threaded: the sink owns its encoder, files and counters by `&mut self`; an I/O error is latched and
 //!   returned by [`ExportSink::finish`].
+//! * ADOPTPNG (LEDGER SR405): [`export_png`] is the PNG sequence ([`PngSequence`] through [`export_as`]) read back per frame
+//!   by pixel_core's header reader (`facts_of`): each frame's path and size (Adopt's frames keep their own), every I/O
+//!   refusal naming the directory.
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
@@ -529,3 +532,35 @@ fn aac_track(id: u32, rate: u32, ch: u16, pcm: &[i16], kbps: u32) -> Result<(bui
 /// `RGBA_COLOUR` (`unaos/crates/kernel/src/video/export.rs`), so host and kernel state the same file colour for it.
 /// EXPORTCOLOURPRIM (B979): the base; [`H264Encoder`] states the reels' one primaries / transfer pair over it.
 pub const RGBA_COLOUR: Colour = Colour { primaries: 2, transfer: 2, matrix: 6, full_range: Some(false), mastering: None, light: None };
+
+// ── ADOPTPNG (LEDGER SR405): the PNG sequence read back per frame (handlers.md §5 NLEPROBE-HDR's ADOPT-PNG) ──────────────
+/// [`export_as`] through [`PngSequence`] into `dir` (created), then every written `%06d.png` read back by pixel_core's ONE
+/// header reader (`gneiss_pal::dsp::image::facts_of`): `(path, width, height)` per frame in output order. A reel under
+/// `SizePolicy::Adopt` hands its frames on at their own size, so the sizes may differ; every other policy gives the
+/// project's size. Every I/O error is re-made naming `dir` (`io: <dir>: <error>`); a file that does not read back as a PNG
+/// is `InvalidData` naming its path.
+pub fn export_png(
+    tl: &Timeline,
+    range: std::ops::Range<i64>,
+    sources: &Sources,
+    dir: &Path,
+    audio: AudioOut,
+    container: build::Container,
+) -> Result<(ExportReport, Vec<(PathBuf, u32, u32)>), ExportError> {
+    let named = |e: std::io::Error| ExportError::Io(std::io::Error::new(e.kind(), format!("{}: {e}", dir.display())));
+    std::fs::create_dir_all(dir).map_err(named)?;
+    let r = export_as(tl, range, sources, dir, Box::new(PngSequence), audio, container).map_err(|e| match e {
+        ExportError::Io(e) => named(e),
+        e => e,
+    })?;
+    let mut frames = Vec::with_capacity(r.frames as usize);
+    for n in 0..r.frames {
+        let path = dir.join(format!("{n:06}.png"));
+        let bytes = std::fs::read(&path).map_err(named)?;
+        let Some(f) = gneiss_pal::dsp::image::facts_of(&bytes) else {
+            return Err(ExportError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: not a PNG", path.display()))));
+        };
+        frames.push((path, f.width, f.height));
+    }
+    Ok((r, frames))
+}

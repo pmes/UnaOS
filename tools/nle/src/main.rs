@@ -7,7 +7,7 @@
 //! ```text
 //! nle schedule <edl|media> [--fps N] --src REEL=<media> ...
 //! nle render   <edl|media> [--fps N] --src REEL=<media> ... --out <stem>
-//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv]
+//! nle export   <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]
 //! nle --make-src <out.mp4> <base> [frames] [fps]
 //! nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]
 //! ```
@@ -33,18 +33,21 @@
 //! `--aac`; NLE6EXPORTAAC rmbp-ledger B960) writes the MP4's sound as AAC-LC at 128 kb/s instead of PCM16.
 //! `--mkv` (NLE6EXPORTMKV, rmbp-ledger B966) names the muxed file `.mkv` (`movie.mkv` / `video.mkv` / `audio.mkv`): the
 //! extension is the container (an AAC track's priming edit list is refused under `.mkv`: CodecDelay owed).
+//! `--png` (ADOPTPNG, LEDGER SR405) is `--video png`: the PNG sequence (`stria::nle_export::export_png`) read back per
+//! frame, `nle: frame <n> <w>x<h> <path>` on stderr per frame and `nle: export png frames=<n> sizes=<k>` last (a reel under
+//! Adopt keeps each frame's own size); the stdout JSON line is unchanged.
 
 use std::io::Write;
 
 use stria::nle::{RenderSink, Sources, render, synth_source};
-use stria::nle_export::{AudioOut, Container, H264Encoder, PngSequence, RawSequence, VideoEncoder, export_as};
+use stria::nle_export::{AudioOut, Container, ExportReport, H264Encoder, PngSequence, RawSequence, VideoEncoder, export_as, export_png};
 use timeline_core::schedule::schedule;
 use timeline_core::{Kind, Timeline, edl};
 
 fn usage() -> ! {
     eprintln!("usage: nle schedule <edl|media> [--fps N] --src REEL=<media> ...");
     eprintln!("       nle render <edl|media> [--fps N] --src REEL=<media> ... --out <stem>");
-    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv]");
+    eprintln!("       nle export <edl|media> [--fps N] --src REEL=<media> ... --out <dir> [--video png|raw|h264] [--qp N] [--gop N] [--bitrate KBPS | --crf N] [--audio wav|mp4|aac|none] [--aac] [--mkv] [--png]");
     eprintln!("       nle --make-src <out.mp4> <base> [frames] [fps]");
     eprintln!("       nle size <edl> <reel> <letterbox|fill|stretch|adopt> [--fps N]");
     std::process::exit(2)
@@ -119,6 +122,7 @@ fn main() {
             "--video" => video = it.next().unwrap_or_else(|| usage()).clone(),
             "--audio" => audio = it.next().unwrap_or_else(|| usage()).clone(),
             "--aac" => audio = "aac".to_string(),
+            "--png" => video = "png".to_string(), // ADOPTPNG (SR405): the PNG sequence with its per-frame manifest (png_export, file tail)
             "--qp" => qp = it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage()),
             "--gop" => gop = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
             "--bitrate" => bitrate = Some(it.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage())),
@@ -199,7 +203,7 @@ fn export_verb(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, di
         _ => usage(),
     };
     std::fs::create_dir_all(dir).unwrap_or_else(|e| die(format!("{dir}: {e}")));
-    let r = export_as(tl, range, sources, std::path::Path::new(dir), enc, aud, container).unwrap_or_else(|e| die(e.to_string()));
+    let r = if video == "png" { png_export(tl, range, sources, dir, aud, container) } else { export_as(tl, range, sources, std::path::Path::new(dir), enc, aud, container).unwrap_or_else(|e| die(e.to_string())) }; // ADOPTPNG (SR405): the PNG arm's manifest (file tail)
     println!(
         "{{\"codec\":\"{video}\",\"frames\":{},\"files\":{},\"bytes\":{},\"fnv\":\"{:016x}\",\"pcm_frames\":{}}}",
         r.frames, r.files, r.bytes, r.fnv, r.pcm_frames
@@ -227,4 +231,20 @@ fn size_verb(args: &[String]) {
     let out = edl::write(&st.timeline, stem).unwrap_or_else(|e| die(format!("{path}: {e}")));
     std::fs::write(path, &out).unwrap_or_else(|e| die(format!("{path}: {e}")));
     println!("nle: {v} -> {} bytes", out.len());
+}
+
+/// ADOPTPNG (SR405): the `png` arm of `export` — plumbing only: `stria::nle_export::export_png` writes and reads back the
+/// sequence; one stderr line per frame (`nle: frame <n> <w>x<h> <path>`), then `nle: export png frames=<n> sizes=<k>` (k the
+/// distinct sizes); the report goes back to `export_verb`, which prints the one JSON line. A refusal is printed, exit 1.
+fn png_export(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, dir: &str, aud: AudioOut, container: Container) -> ExportReport {
+    let (r, frames) = export_png(tl, range, sources, std::path::Path::new(dir), aud, container).unwrap_or_else(|e| die(e.to_string()));
+    let mut sizes: Vec<(u32, u32)> = Vec::new();
+    for (n, (path, w, h)) in frames.iter().enumerate() {
+        eprintln!("nle: frame {n} {w}x{h} {}", path.display());
+        if !sizes.contains(&(*w, *h)) {
+            sizes.push((*w, *h));
+        }
+    }
+    eprintln!("nle: export png frames={} sizes={}", frames.len(), sizes.len());
+    r
 }
