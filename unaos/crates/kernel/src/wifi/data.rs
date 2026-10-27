@@ -20,8 +20,9 @@
 //! the gateway the operator named is S10a; smoltcp's DHCP over the kept station is S10b (`verb.rs::wifidhcp`).
 //!
 //! The KATs are hand-assembled from the clause layouts (no captured data frame exists in `docs/dev/evidence`),
-//! so `n=9/9` certifies the judge, the codec, the 1514-octet frame cap, the addr1 filter and the link watch (STATIONWATCH
-//! B843) against the standard's field order, not a replay of a capture.
+//! so `n=16/16` certifies the judge, the codec, the 1514-octet frame cap, the addr1 filter and the link watch (STATIONWATCH
+//! B843), the TX header's rate fields, the station's MACCTL word, the AP's rate set and the probe's Null frame (STATIONRATE
+//! B855) against the standard's and b43's field order, not a replay of a capture.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -147,10 +148,16 @@ impl Link {
             self.tx_toolong += 1;
             return Err("too-long");
         };
+        Ok((f, self.reserve()))
+    }
+
+    /// The next ring frame number, taken (and the sequence number advanced): `send`'s numbering, and the kept station's one
+    /// OFDM probe frame (STATIONRATE B855), so the ring never carries a gap.
+    pub fn reserve(&mut self) -> usize {
         let n = self.tx_next;
         self.tx_next = (self.tx_next + 1) % FRAMES;
         self.seq = (self.seq + 1) & 0x0FFF;
-        Ok((f, n))
+        n
     }
 
     /// `RawNic::rx_frame_raw`'s half: the next kept frame that `from_air` accepts, as Ethernet, into `out`
@@ -290,6 +297,45 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
     checks.push(("watch", wd.tick(20) == Some("deauth") && wd.reason == 7 && wa.tick(20) == Some("disassoc") && wa.reason == 8
         && wb.beacons == 1 && wb.tu == 100 && at500.is_none() && lost_at == 1100 && wb.tick(1300) == Some("beacon-loss")
         && gap == (None, None, None)));
+    // 10-14 (STATIONRATE B855): the TX header's rate fields and the station's MACCTL word (`bringup/join.rs::station_kat`).
+    let k = super::bringup::station_kat();
+    checks.push(("plcp-cck1", k[0]));
+    checks.push(("plcp-cck11", k[1]));
+    checks.push(("plcp-ofdm24", k[2]));
+    checks.push(("txhdr-rate", k[3]));
+    checks.push(("macctl", k[4]));
+    // 15. rates: an 11g association response (Supported 1*,2*,5.5*,11*,6,9,12,18; Extended 24,36,48,54) -> CCK 11 without
+    //     the probe's ack, OFDM 24 with it; an 11b-only one -> CCK 11 even "acked"; a malformed IE list (the Extended
+    //     element declares 4 octets, carries 2) and one with no rate element -> unread -> CCK 1, never a panic.
+    let mut ar = alloc::vec![0x10, 0x00, 0x3a, 0x01];
+    ar.extend_from_slice(&STA);
+    ar.extend_from_slice(&BSSID);
+    ar.extend_from_slice(&BSSID);
+    ar.extend_from_slice(&[0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xc0]);
+    let mut b_only = ar.clone();
+    b_only.extend_from_slice(&[0x01, 0x04, 0x82, 0x84, 0x8b, 0x96]);
+    let mut g = b_only.clone();
+    g[31] = 0x08;
+    g.extend_from_slice(&[0x0c, 0x12, 0x18, 0x24, 0x32, 0x04, 0x30, 0x48, 0x60, 0x6c]);
+    let mut bad = g.clone();
+    bad.truncate(bad.len() - 2);
+    let rg = super::assoc::assoc_reply_rates(&g, STA, BSSID).and_then(|(_, r)| r);
+    let rb = super::assoc::assoc_reply_rates(&b_only, STA, BSSID).and_then(|(_, r)| r);
+    let rbad = super::assoc::assoc_reply_rates(&bad, STA, BSSID);
+    let rnone = super::assoc::assoc_reply_rates(&ar, STA, BSSID);
+    checks.push(("rates", matches!(rg, Some(r) if r.listed == 0x0FFF && r.basic == 0x000F)
+        && super::assoc::station_rate(rg, false) == w::RATE_11M && super::assoc::station_rate(rg, true) == w::RATE_24M
+        && super::assoc::ofdm_listed(rg) && !super::assoc::ofdm_listed(rb)
+        && super::assoc::station_rate(rb, true) == w::RATE_11M
+        && matches!(rbad, Some((a, None)) if a.status == 0) && super::assoc::station_rate(None, true) == w::RATE_1M
+        && matches!(rnone, Some((_, None))) && super::assoc::rates_text(rg) == "1*,2*,5.5*,11*,6,9,12,18,24,36,48,54"));
+    // 16. null: the probe's Null data frame (§9.3.2.1 subtype 4) — FC 48 01, duration 0, BSSID, STA, BSSID, seq 0; 24 octets.
+    let mut nul = alloc::vec![0x48, 0x01, 0x00, 0x00];
+    nul.extend_from_slice(&BSSID);
+    nul.extend_from_slice(&STA);
+    nul.extend_from_slice(&BSSID);
+    nul.extend_from_slice(&[0x00, 0x00]);
+    checks.push(("null", w::build_null_data(STA, BSSID, 0) == nul && nul.len() == 24));
     let mut pass = 0u8;
     let mut first = None;
     for (name, ok) in checks.iter() {

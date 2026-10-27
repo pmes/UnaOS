@@ -85,10 +85,10 @@ impl RawNic for E1000Nic {
         e1000::hw_addr().map(|(mac, _, _)| mac)
     }
     /// NETCLOCK M3: the USB dongle's TX ring is bounded and drained asynchronously; full = back-pressure.
-    fn tx_ready() -> bool {
+    fn tx_ready() -> bool { #[cfg(feature = "wifi10")] if crate::wifi::data::bound() { return crate::wifi::data::tx_ready(); } // STATIONTXGATE (B855): the kept station's asynchronous TX ring answers its own room in EVERY wifi10 image, usbnet or not (STATIONTX B843's fold, moved out of the usbnet cfg; LINE-NEUTRAL)
         #[cfg(feature = "usbnet")]
         if !e1000::nic_present() {
-            #[cfg(feature = "wifi10")] if crate::wifi::data::bound() { return crate::wifi::data::tx_ready(); } return crate::drivers::xhci::usbnet::tx_room(); // STATIONTX (B843): the kept station's asynchronous TX ring answers its own room (WIFIDHCP B831's fold; LINE-NEUTRAL)
+            return crate::drivers::xhci::usbnet::tx_room(); // NETCLOCK M3: the dongle's room (the Wi-Fi station's fold moved to this fn's first line, STATIONTXGATE B855; LINE-NEUTRAL)
         }
         true
     }

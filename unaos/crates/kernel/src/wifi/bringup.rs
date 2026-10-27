@@ -2768,6 +2768,6 @@ pub fn wifi10(ssid: Option<alloc::string::String>, gw: Option<[u8; 4]>) {
 mod join;
 // WIFIDHCP (B831): the kept station's device fns and the TX ring's caps, for `wifi/data.rs` (the accessor triple).
 #[cfg(feature = "wifi10")]
-pub(super) use join::{station_mac, station_pending, station_rx, station_tx, station_tx_room};
+pub(super) use join::{station_mac, station_pending, station_rx, station_tx, station_tx_room, station_kat};
 #[cfg(feature = "wifi10")]
 pub(super) use tx::{FRAMES, FRAME_MAX};

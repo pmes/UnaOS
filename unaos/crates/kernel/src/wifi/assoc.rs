@@ -54,6 +54,46 @@ pub fn assoc_reply(frame: &[u8], me: Mac, bssid: Mac) -> Option<AssocResult> {
     parse_assoc_resp(frame)
 }
 
+/// STATIONRATE (B855): `assoc_reply`'s judge and answer, with the rate set the response listed (`w::assoc_resp_rates`,
+/// the codec's total parser: `None` = unread — a response with no rate element, or a malformed IE list).
+pub fn assoc_reply_rates(frame: &[u8], me: Mac, bssid: Mac) -> Option<(AssocResult, Option<w::RateSet>)> {
+    assoc_reply(frame, me, bssid).map(|a| (a, w::assoc_resp_rates(frame)))
+}
+
+/// STATIONRATE (B855): the kept station's data rate (500 kbit/s units) — OFDM 24 when the AP listed it AND the one Null
+/// probe at OFDM 24 was acked at that rate; else the highest CCK rate the AP listed (11, 5.5, 2); else, or with the
+/// set unread, CCK 1.
+pub fn station_rate(rs: Option<w::RateSet>, ofdm_acked: bool) -> u8 {
+    let Some(rs) = rs else { return w::RATE_1M };
+    if ofdm_acked && rs.has(w::RATE_24M) {
+        return w::RATE_24M;
+    }
+    [w::RATE_11M, 11, 4].iter().copied().find(|r| rs.has(*r)).unwrap_or(w::RATE_1M)
+}
+
+/// The OFDM probe runs: the AP listed OFDM 24.
+pub fn ofdm_listed(rs: Option<w::RateSet>) -> bool {
+    rs.map_or(false, |r| r.has(w::RATE_24M))
+}
+
+/// The wire's name for a rate `station_rate` chooses.
+pub fn rate_name(rate: u8) -> &'static str {
+    match rate { 4 => "cck2", 11 => "cck5.5", 22 => "cck11", 48 => "ofdm24", _ => "cck1" }
+}
+
+/// The AP's rate set as `1*,2*,5.5*,11*,6,9,…` (Mbit/s, `*` = basic), or `unread`.
+pub fn rates_text(rs: Option<w::RateSet>) -> alloc::string::String {
+    let Some(rs) = rs else { return alloc::string::String::from("unread") };
+    let mut t = alloc::string::String::new();
+    for (i, r) in w::LEGACY_RATES.iter().enumerate() {
+        if rs.listed & (1 << i) == 0 { continue; }
+        if !t.is_empty() { t.push(','); }
+        if *r == 11 { t.push_str("5.5") } else { t.push_str(&alloc::format!("{}", r / 2)) }
+        if rs.basic & (1 << i) != 0 { t.push('*'); }
+    }
+    t
+}
+
 /// A Deauthentication / Disassociation from the AP to us: its name and reason code (§9.4.1.7).
 pub fn refusal(frame: &[u8], me: Mac, bssid: Mac) -> Option<(&'static str, u16)> {
     if !from_bss_to_us(frame, me, bssid) { return None; }

@@ -508,3 +508,25 @@ pub(super) fn drain(bar0: u64, rx: &mut Rx, s: &mut Seen, ch: u16, w: &mut Write
     unsafe { w32(bar0, RXINDEX, (((cur + SLOTS - 1) % SLOTS) * DESC_BYTES) as u32) };
     w.dma += 1;
 }
+
+// ── STATIONPROMISC (rmbp-ledger B855): the kept station leaves promiscuous receive ─────────────────────────────────
+
+/// `main.c:3103-3135` (`b43_adjust_opmode` for an associated station: no FIF_* promiscuity) — the station's MACCTL word
+/// from S6's `arm` word: PROMISC, BEACPROMISC and KEEP_BAD off (a bad-FCS frame bypasses the address filter); every
+/// other bit kept. Pure (`join::station_kat`'s `macctl` row).
+#[cfg(feature = "wifi10")]
+pub(super) fn station_macctl(ctl: u32) -> u32 {
+    ctl & !(MACCTL_PROMISC | MACCTL_BEACPROMISC | MACCTL_KEEP_BAD)
+}
+
+/// From `join::keep`, before the station is kept: the BSSID into the MAC filter's BSSID entry (`main.c:690`, b43.h:400;
+/// the one filter writer `tx::macfilter`), then MACCTL read-modify-written to `station_macctl` live, as b43 does
+/// (`main.c:3109`, `:3140`; no suspend). The software half stays `data::keep`'s addr1 filter. Returns (pre, post).
+#[cfg(feature = "wifi10")]
+pub(super) fn station_filter(bar0: u64, bssid: [u8; 6], w: &mut Writes) -> (u32, u32) {
+    super::tx::macfilter(bar0, super::tx::MACFILTER_BSSID, bssid, w);
+    let pre = unsafe { r32(bar0, D11_MACCTL) };
+    macctl_w(bar0, station_macctl(pre), w);
+    let post = unsafe { r32(bar0, D11_MACCTL) };
+    (pre, post)
+}

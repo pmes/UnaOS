@@ -332,3 +332,81 @@ mod tests {
         assert_eq!(&back[14..], b"hello");
     }
 }
+
+// ── STATIONRATE (rmbp-ledger B855): the AP's rate set from its association response, and the Null data frame the
+// station's OFDM probe sends ─────────────────────────────────────────────────────────────────────────────────────
+
+/// The twelve legacy rates in 500 kbit/s units (§9.4.2.3): CCK 1/2/5.5/11, OFDM 6/9/12/18/24/36/48/54. Bit `i` of a
+/// `RateSet` word is `LEGACY_RATES[i]`.
+pub const LEGACY_RATES: [u8; 12] = [2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108];
+/// CCK 1 Mbit/s, CCK 11 Mbit/s and OFDM 24 Mbit/s in the same units.
+pub const RATE_1M: u8 = 2;
+pub const RATE_11M: u8 = 22;
+pub const RATE_24M: u8 = 48;
+
+/// The rates an association response listed (Supported Rates §9.4.2.3 + Extended Supported Rates §9.4.2.13) and the
+/// subset marked basic (the octet's top bit), as `LEGACY_RATES` bit masks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RateSet {
+    pub listed: u16,
+    pub basic: u16,
+}
+
+impl RateSet {
+    /// `rate` (500 kbit/s units) is one the AP listed.
+    pub fn has(&self, rate: u8) -> bool {
+        LEGACY_RATES.iter().position(|r| *r == rate).map_or(false, |i| self.listed & (1 << i) != 0)
+    }
+}
+
+/// The rate elements of an association response (§9.3.3.6: the IEs follow capability, status and AID, 6 octets).
+/// TOTAL: `None` unless it is an association response whose IE list fits exactly (a declared IE running past the
+/// frame is malformed) and that carries at least one known rate; octets that name no legacy rate (a BSS membership
+/// selector, §9.4.2.3) are ignored.
+pub fn assoc_resp_rates(frame: &[u8]) -> Option<RateSet> {
+    if frame.len() < 24 + 6 {
+        return None;
+    }
+    let (ty, sub) = subtype_of(frame[0]);
+    if ty != FC_TYPE_MGMT || sub != SUBTYPE_ASSOC_RESP {
+        return None;
+    }
+    let mut rs = RateSet::default();
+    let mut i = 24 + 6;
+    while i < frame.len() {
+        if i + 2 > frame.len() {
+            return None;
+        }
+        let eid = frame[i];
+        let len = frame[i + 1] as usize;
+        if i + 2 + len > frame.len() {
+            return None;
+        }
+        if eid == EID_SUPP_RATES || eid == EID_EXT_RATES {
+            for &o in &frame[i + 2..i + 2 + len] {
+                if let Some(k) = LEGACY_RATES.iter().position(|r| *r == o & 0x7F) {
+                    rs.listed |= 1 << k;
+                    if o & 0x80 != 0 {
+                        rs.basic |= 1 << k;
+                    }
+                }
+            }
+        }
+        i += 2 + len;
+    }
+    if rs.listed == 0 { None } else { Some(rs) }
+}
+
+/// A Null data frame to the AP (§9.3.2.1, Data type subtype 4, no body): FC 48 01 (ToDS), duration 0, addr1 = addr3 =
+/// the BSSID, addr2 = the station, the sequence number — 24 octets.
+pub fn build_null_data(sta: Mac, bssid: Mac, seq: u16) -> Vec<u8> {
+    let mut f = Vec::with_capacity(24);
+    f.push((0b0100 << 4) | (FC_TYPE_DATA << 2));
+    f.push(0x01);
+    f.extend_from_slice(&[0, 0]);
+    f.extend_from_slice(&bssid);
+    f.extend_from_slice(&sta);
+    f.extend_from_slice(&bssid);
+    f.extend_from_slice(&(seq << 4).to_le_bytes());
+    f
+}
