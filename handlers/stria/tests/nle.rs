@@ -116,3 +116,59 @@ fn a_clip_past_the_media_is_refused() {
     let mut sink = Collect::default();
     assert!(matches!(render(&tl, 0..20, &src, &mut sink), Err(stria::nle::RenderError::Schedule(_))));
 }
+
+/// NLE3 (SR202): V1 A[0,20)@0, B[0,20)@20 (9-tick dissolve), C[5,25)@40 (9-tick W001 wipe), over utp1 sources whose
+/// counters start at 0 / 1000 / 2000. The mid-dissolve frame is pixel_core's model (`blend_nonpremult`) of the two
+/// counters' frames, byte for byte, and within its floor bound of their lerp; the mid-wipe frame's left half is the
+/// incoming's, its right half the outgoing's.
+#[test]
+fn transitions_blend() {
+    use timeline_core::{TransitionKind, WipeDir};
+    let mut tl = Timeline::new(25);
+    let ids: Vec<SourceId> = ["A", "B", "C"].iter().map(|r| tl.add_source(r, 50)).collect();
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(ids[0], 0, 20, 0), Clip::new(ids[1], 0, 20, 20), Clip::new(ids[2], 5, 25, 40)];
+    let tl = tl
+        .add_transition(0, 20, TransitionKind::Dissolve, 9)
+        .unwrap()
+        .add_transition(0, 40, TransitionKind::Wipe(WipeDir::LeftToRight), 9)
+        .unwrap();
+    let mut src = Sources::new(&tl);
+    for (i, id) in ids.iter().enumerate() {
+        src.add(*id, synth_source(i as u32 * 1000, 50, 25)).unwrap();
+    }
+    let mut sink = Collect::default();
+    let r = render(&tl, 0..60, &src, &mut sink).unwrap();
+    assert_eq!(sink.frames.len(), 60);
+    let at = |t: usize| TestPattern::read_counter(&sink.frames[t].1, 64, 48);
+    assert_eq!((at(0), at(19), at(29), at(39), at(49), at(59)), (Some(0), Some(19), Some(1009), Some(1019), Some(2014), Some(2024)));
+    // mid-dissolve (tick 24, t = 5/10 -> alpha round(255 t) = 128): outgoing A at 24, incoming B at 4.
+    // The model: the incoming at alpha 128 over the opaque outgoing, byte for byte.
+    let (a, b) = (TestPattern::render(64, 48, 24), TestPattern::render(64, 48, 1004));
+    let got = &sink.frames[24].1;
+    let model: Vec<u8> = a
+        .chunks_exact(4)
+        .zip(b.chunks_exact(4))
+        .flat_map(|(o, p)| gneiss_pal::dsp::image::blend_nonpremult([p[0], p[1], p[2], 128], [o[0], o[1], o[2], o[3]]))
+        .collect();
+    assert_eq!(got, &model);
+    // Its bound against the lerp: for an opaque dst, dfa = 255 * (256 - 128) >> 8 = 127 (not 127.5) and each channel
+    // is floor((s * 128 + d * 127) * floor(2^24 / 255) >> 24), so the weights are 128/255 and 127/255 and both floors
+    // round down: the worst case s = 0, d = 255 gives 126 against 127.5. Every byte is within 1.5 of (s + d) / 2.
+    for i in 0..got.len() {
+        let want = (a[i] as f64 + b[i] as f64) / 2.0;
+        assert!((got[i] as f64 - want).abs() <= 1.5, "byte {i}: got {} want {want}", got[i]);
+    }
+    assert_ne!(got, &a);
+    // mid-wipe (tick 44, t = 5/10): incoming C at 9 on the left 32 columns, outgoing B at 24 on the right
+    let (inc, out) = (TestPattern::render(64, 48, 2009), TestPattern::render(64, 48, 1024));
+    let got = &sink.frames[44].1;
+    for y in 0..48 {
+        let row = y * 64 * 4;
+        assert_eq!(&got[row..row + 32 * 4], &inc[row..row + 32 * 4], "row {y} left");
+        assert_eq!(&got[row + 32 * 4..row + 64 * 4], &out[row + 32 * 4..row + 64 * 4], "row {y} right");
+    }
+    // three opens (A, B, C at their keyframe 0); the outgoing runs continue; C's run-up is 5 frames
+    assert_eq!((r.frames, r.seeks, r.runup_frames), (60, 3, 5));
+    println!("nle3: frames={} seeks={} runup={}", r.frames, r.seeks, r.runup_frames);
+}

@@ -16,6 +16,10 @@
 //! * [`Sources`] is the schedule's [`SourceIndex`]: its keyframe answer is the demuxer's own search
 //!   (`share()` + `seek_track` on a throwaway cursor). NLEPROBE (SR195) owes the pure keyframe-before; the swap is one fn.
 //! * Source time 0 is a stream's first presentation time (vplay's rule).
+//! * Transitions (NLE3, LEDGER SR202): a step carrying `vmix` decodes a second run (the outgoing source, which takes
+//!   over the live run it continues) through the same open-or-continue path ([`vid_frame`]) and mixes the two: a
+//!   dissolve is pixel_core's `blend_nonpremult` of the incoming at alpha `round(255 t)` over the outgoing, a wipe a
+//!   column (`W001`) or row (`W002`) split at `round(w t)` / `round(h t)` with the incoming before the edge.
 //! * Cut-only and one format: a video frame whose size differs from the project's (the first scheduled video source's
 //!   track) is refused (scaling is owed), as is an audio stream whose rate or channel count differs (the mix and the
 //!   resampler are NLE4). A gap is black (opaque) or silence.
@@ -345,29 +349,23 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let (w, h) = (r.width, r.height);
     let black: Vec<u8> = [0u8, 0, 0, 255].repeat(w as usize * h as usize);
     let tol = tl.tb.to_ns(1) / 2;
+    let mut vmix_run: Option<Vid> = None; // NLE3: a transition's outgoing run
     let mut vid: Option<Vid> = None;
     let mut aud: Option<Aud> = None;
     for s in &steps {
         match (s.kind, s.src) {
             (Kind::Video, None) => {
+                vmix_run = None;
                 sink.frame(s.out_t, w, h, &black);
                 r.frames += 1;
             }
             (Kind::Video, Some(src)) => {
-                let target = tl.tb.to_ns(s.src_t);
-                if s.seek.is_some() || vid.as_ref().map(|v| v.src) != Some(src) {
-                    let key = match s.seek {
-                        Some(k) => k,
-                        None => sources.keyframe_ns(src, Kind::Video, target).ok_or(RenderError::NoStream(src, Kind::Video))?,
-                    };
-                    vid = Some(Vid::open(sources.get(src)?, src, key)?);
-                    r.seeks += 1;
-                }
-                let f = vid.as_mut().expect("opened above").show(target, tol, &mut r.runup_frames)?;
+                vmix_take(s, &mut vid, &mut vmix_run);
+                let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r)?;
                 if f.width != w || f.height != h {
                     return Err(RenderError::Size { src, width: f.width, height: f.height });
                 }
-                sink.frame(s.out_t, w, h, &f.to_rgba());
+                sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &f, tol, &mut r)?);
                 r.frames += 1;
             }
             (Kind::Audio, src) => {
@@ -420,4 +418,96 @@ pub fn synth_source(base: u32, frames: u32, fps: u32) -> Vec<u8> {
     let pcm: Vec<i16> = (0..n).map(|i| synth_sample(base, i)).collect();
     let audio = build::pcm16_track(2, SYNTH_RATE, 1, &pcm, (SYNTH_RATE / fps / 2).max(1) as usize);
     build::mp4(&[video, audio], &build::Mp4Options::default())
+}
+
+/// The frame at source tick `src_t` of `src` from the decode run `run`: a step with `seek`, or a run on another
+/// source (or none), opens a fresh run at the keyframe (the run-up is decoded unseen); otherwise the run decodes on.
+/// Shared by a step's own source and a transition's outgoing source (NLE3).
+#[allow(clippy::too_many_arguments)]
+fn vid_frame(
+    tl: &Timeline,
+    sources: &Sources,
+    run: &mut Option<Vid>,
+    src: SourceId,
+    src_t: i64,
+    seek: Option<i64>,
+    tol: i64,
+    r: &mut RenderReport,
+) -> Result<Frame, RenderError> {
+    let target = tl.tb.to_ns(src_t);
+    if seek.is_some() || run.as_ref().map(|v| v.src) != Some(src) {
+        let key = match seek {
+            Some(k) => k,
+            None => sources.keyframe_ns(src, Kind::Video, target).ok_or(RenderError::NoStream(src, Kind::Video))?,
+        };
+        *run = Some(Vid::open(sources.get(src)?, src, key)?);
+        r.seeks += 1;
+    }
+    run.as_mut().expect("opened above").show(target, tol, &mut r.runup_frames)
+}
+
+/// NLE3: outside a transition the outgoing run is dropped; at a transition tick whose outgoing source continues the
+/// live run (`seek` none) and is not already the mix run, that run becomes the mix run (the step's own source then
+/// opens its run at the cut, as a plain cut does).
+fn vmix_take(s: &timeline_core::schedule::Step, vid: &mut Option<Vid>, vmix_run: &mut Option<Vid>) {
+    let Some(m) = s.vmix else {
+        *vmix_run = None;
+        return;
+    };
+    if m.seek.is_none() && vmix_run.as_ref().map(|v| v.src) != Some(m.src) && vid.as_ref().map(|v| v.src) == Some(m.src) {
+        *vmix_run = vid.take();
+    }
+}
+
+/// NLE3: the RGBA a video step shows: its own frame `f`, or inside a transition `f` mixed with the outgoing source's
+/// frame from `vmix_run`.
+#[allow(clippy::too_many_arguments)]
+fn vmix_frame(
+    tl: &Timeline,
+    sources: &Sources,
+    s: &timeline_core::schedule::Step,
+    vmix_run: &mut Option<Vid>,
+    f: &Frame,
+    tol: i64,
+    r: &mut RenderReport,
+) -> Result<Vec<u8>, RenderError> {
+    let Some(m) = s.vmix else { return Ok(f.to_rgba()) };
+    let a = vid_frame(tl, sources, vmix_run, m.src, m.src_t, m.seek, tol, r)?;
+    if a.width != f.width || a.height != f.height {
+        return Err(RenderError::Size { src: m.src, width: a.width, height: a.height });
+    }
+    Ok(vmix_rgba(m.kind, m.t, &a.to_rgba(), &f.to_rgba(), f.width, f.height))
+}
+
+/// NLE3: the outgoing frame `a` and the incoming frame `b` (RGBA, `w x h`) mixed at the incoming's weight `t`.
+fn vmix_rgba(kind: timeline_core::TransitionKind, t: timeline_core::schedule::Frac, a: &[u8], b: &[u8], w: u32, h: u32) -> Vec<u8> {
+    use timeline_core::{TransitionKind, WipeDir};
+    let den = t.den.max(1);
+    let round = |n: i64| (2 * n * t.num + den) / (2 * den);
+    let mut out = a.to_vec();
+    match kind {
+        TransitionKind::Dissolve => {
+            let alpha = round(255).clamp(0, 255) as u8;
+            for (o, p) in out.chunks_exact_mut(4).zip(b.chunks_exact(4)) {
+                let px = gneiss_pal::dsp::image::blend_nonpremult([p[0], p[1], p[2], alpha], [o[0], o[1], o[2], o[3]]);
+                o.copy_from_slice(&px);
+            }
+        }
+        TransitionKind::Wipe(dir) => {
+            let (w, h) = (w as usize, h as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    let incoming = match dir {
+                        WipeDir::LeftToRight => (x as i64) < round(w as i64),
+                        WipeDir::TopToBottom => (y as i64) < round(h as i64),
+                    };
+                    if incoming {
+                        let i = (y * w + x) * 4;
+                        out[i..i + 4].copy_from_slice(&b[i..i + 4]);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
