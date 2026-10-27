@@ -302,3 +302,121 @@ fn type4_calculator() {
     let f = calc(b"{ cvi 4 bitshift 1 or 90 sin add }", vec![0.0, 99.0], vec![0.0, 999.0]);
     assert_eq!(f.eval(&[5.0]), vec![82.0]);
 }
+
+// --- PDFTRANSPARENCY (LEDGER SR327): blend modes, soft masks, transparency groups.
+
+#[test]
+fn multiply_blend() {
+    // 0.5 grey paper (0.5 x 255 + 0.5 -> 128), then a Multiply red square: B = Cb x Cs per channel -> (128, 0, 0).
+    let r = render(
+        "/ExtGState << /M 5 0 R >>",
+        "0.5 g 0 0 40 40 re f /M gs 1 0 0 rg 10 10 20 20 re f",
+        &[(5, "<< /Type /ExtGState /BM /Multiply >>", None)],
+    );
+    assert_eq!(px(&r, 20, 20), [128, 0, 0, 255]);
+    assert_eq!(px(&r, 10, 29), [128, 0, 0, 255]);
+    assert_eq!(px(&r, 5, 5), [128, 128, 128, 255]);
+    assert!(r.refused.is_empty(), "{:?}", r.refused);
+    pin(&r, 0x41bfe80438ad5d25);
+}
+
+#[test]
+fn luminosity_soft_mask() {
+    // The mask group (BBox x 0..30): a 0.25 grey band x 0..15 (lum 64), an axial black -> white ramp x 15..30; outside the
+    // BBox the backdrop /BC (default black, lum 0). A red page fill through it over white paper: G = B = 255 - mask.
+    let form = b"0.25 g 0 0 15 40 re f q 15 0 15 40 re W n /Sh sh Q";
+    let r = render(
+        "/ExtGState << /S 5 0 R >>",
+        "/S gs 1 0 0 rg 0 0 40 40 re f",
+        &[
+            (5, "<< /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >>", None),
+            (
+                6,
+                "/Type /XObject /Subtype /Form /BBox [0 0 30 40] /Group << /S /Transparency /CS /DeviceGray >> \
+                 /Resources << /Shading << /Sh 7 0 R >> >>",
+                Some(form.to_vec()),
+            ),
+            (
+                7,
+                "<< /ShadingType 2 /ColorSpace /DeviceGray /Coords [15 0 30 0] \
+                 /Function << /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1 >> >>",
+                None,
+            ),
+        ],
+    );
+    // mask 64: coverage div255(255 x 64) = 64, G = 255 x (1 - 64/255) = 191.
+    assert_eq!(px(&r, 5, 20), [255, 191, 191, 255]);
+    assert_eq!(px(&r, 14, 3), [255, 191, 191, 255]);
+    // Outside the group's BBox: BC black, mask 0, the paper stays white.
+    assert_eq!(px(&r, 35, 20), WHITE);
+    // The ramp: G falls monotonically with x, from near white to near red.
+    let g: Vec<u8> = (15..30).map(|x| px(&r, x, 20)[1]).collect();
+    assert!(g.windows(2).all(|w| w[0] >= w[1]), "{g:?}");
+    assert!(g[0] > 230 && g[14] < 25, "{g:?}");
+    assert!(px(&r, 22, 20)[0] == 255);
+    assert!(r.refused.is_empty(), "{:?}", r.refused);
+    pin(&r, 0x3ac1a410ef0bf2a5);
+}
+
+#[test]
+fn isolated_group_ca_half() {
+    // Red 5..25 then blue 15..35 (user space), opaque, inside an isolated group painted with ca 0.5: the group composites
+    // ONCE, so the overlap is blue at half (not blue-at-half over red-at-half). draw_pixmap: k = 128, sa = 128, inv = 127.
+    let r = render(
+        "/ExtGState << /H 5 0 R >> /XObject << /F 6 0 R >>",
+        "/H gs /F Do",
+        &[
+            (5, "<< /Type /ExtGState /ca 0.5 >>", None),
+            (
+                6,
+                "/Type /XObject /Subtype /Form /BBox [0 0 40 40] /Group << /S /Transparency /I true >>",
+                Some(b"1 0 0 rg 5 5 20 20 re f 0 0 1 rg 15 15 20 20 re f".to_vec()),
+            ),
+        ],
+    );
+    assert_eq!(px(&r, 20, 20), [127, 127, 255, 255]);
+    assert_eq!(px(&r, 10, 30), [255, 127, 127, 255]);
+    assert_eq!(px(&r, 30, 10), [127, 127, 255, 255]);
+    assert_eq!(px(&r, 2, 2), WHITE);
+    assert!(r.refused.is_empty(), "{:?}", r.refused);
+    pin(&r, 0x3735d487e3e2fa25);
+}
+
+#[test]
+fn hue_blend() {
+    // Backdrop (0.2, 0.4, 0.8) = (51, 102, 204); a Hue red: SetLum(SetSat(Cs, Sat(Cb)), Lum(Cb)) (§11.3.5.3).
+    // Sat(Cb) = 0.6, Lum(Cb) = 0.384; SetSat(red, 0.6) = (0.6, 0, 0), Lum 0.18; + 0.204 -> (0.804, 0.204, 0.204).
+    let r = render(
+        "/ExtGState << /U 5 0 R >>",
+        "0.2 0.4 0.8 rg 0 0 40 40 re f /U gs 1 0 0 rg 10 10 20 20 re f",
+        &[(5, "<< /Type /ExtGState /BM /Hue >>", None)],
+    );
+    assert_eq!(px(&r, 5, 5), [51, 102, 204, 255]);
+    assert_eq!(px(&r, 20, 20), [205, 52, 52, 255]);
+    assert!(r.refused.is_empty(), "{:?}", r.refused);
+    pin(&r, 0x93eade6929ca2b25);
+}
+
+#[test]
+fn transparency_refusals() {
+    // A soft mask and a BM array (first recognised name wins) are no longer refused; an unknown blend mode still is (drawn
+    // Normal), and a knockout group is drawn non-knockout and named.
+    let r = render(
+        "/ExtGState << /A 5 0 R /B 6 0 R >> /XObject << /K 7 0 R >>",
+        "/A gs /B gs 0 1 0 rg 0 0 10 10 re f /K Do",
+        &[
+            (5, "<< /Type /ExtGState /BM [/Multiply /Normal] /SMask << /S /Alpha /G 7 0 R >> >>", None),
+            (6, "<< /Type /ExtGState /BM /Bogus /SMask /None >>", None),
+            (
+                7,
+                "/Type /XObject /Subtype /Form /BBox [0 0 40 40] /Group << /S /Transparency /K true >>",
+                Some(b"0 0 1 rg 20 20 10 10 re f".to_vec()),
+            ),
+        ],
+    );
+    assert_eq!(r.refused, vec!["blend mode", "knockout group"]);
+    // /Bogus drew Normal with the mask cleared: plain green, then plain blue.
+    assert_eq!(px(&r, 5, 35), [0, 255, 0, 255]);
+    assert_eq!(px(&r, 25, 15), [0, 0, 255, 255]);
+    pin(&r, 0xd3733284beac14fd);
+}

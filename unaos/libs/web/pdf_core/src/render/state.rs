@@ -7,6 +7,7 @@
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
+use svg_core::fe::BlendMode;
 use svg_core::geom::Transform;
 use svg_core::raster::Mask;
 use svg_core::stroke::{Cap, Join, StrokeStyle, normalize_dashes};
@@ -66,6 +67,10 @@ pub struct GState {
     /// ca and CA (§11.6.4.4 constant alpha).
     pub fill_alpha: f32,
     pub stroke_alpha: f32,
+    /// The blend mode (§11.3.5; PDFTRANSPARENCY SR327), applied by `Interp::paint` through svg_core's `fe::blend`.
+    pub blend: BlendMode,
+    /// The soft mask (§11.6.5.2) as a device-space mask multiplied into every paint; `None` = no mask.
+    pub soft_mask: Option<Rc<Mask>>,
     pub text: TextState,
 }
 
@@ -85,6 +90,8 @@ impl GState {
             stroke: Colour::black(),
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
+            blend: BlendMode::Normal,
+            soft_mask: None,
             text: TextState::default(),
         }
     }
@@ -112,9 +119,10 @@ impl GState {
         StrokeStyle { width, cap: self.cap, join: self.join, miter_limit: self.miter_limit.max(1.0), dash }
     }
 
-    /// Apply an ExtGState dictionary. Soft masks and blend modes other than Normal are refused by name and drawn as
-    /// Normal without a mask (PDF-TRANSPARENCY is owed).
-    pub fn apply_ext(&mut self, d: &Dict, doc: &Document, refused: &mut Vec<&'static str>) {
+    /// Apply an ExtGState dictionary. /BM sets the blend mode (an unrecognised one is refused by name and drawn
+    /// Normal); /SMask /None clears the soft mask, and an /SMask dictionary is RETURNED for the interpreter to render
+    /// (`Interp::soft_mask`, PDFTRANSPARENCY SR327).
+    pub fn apply_ext(&mut self, d: &Dict, doc: &Document, refused: &mut Vec<&'static str>) -> Option<Dict> {
         let num = |k: &[u8]| d.get(k).map(|o| doc.get(o)).and_then(|o| o.as_f64());
         if let Some(v) = num(b"LW") {
             self.line_width = v.abs();
@@ -149,17 +157,31 @@ impl GState {
                 self.text.size = sz;
             }
         }
-        match d.get(b"SMask").map(|o| doc.get(o)) {
-            None | Some(Object::Null) => {}
-            Some(Object::Name(n)) if n == b"None" => {}
-            Some(_) => refuse(refused, "soft mask"),
+        if let Some(o) = d.get(b"BM").map(|o| doc.get(o)) {
+            match super::blend::parse(&o, doc) {
+                Some(m) => self.blend = m,
+                None => {
+                    self.blend = BlendMode::Normal;
+                    refuse(refused, "blend mode");
+                }
+            }
         }
-        let normal = |o: &Object| matches!(o.as_name(), Some(b"Normal") | Some(b"Compatible"));
-        match d.get(b"BM").map(|o| doc.get(o)) {
-            None => {}
-            Some(Object::Array(a)) if a.first().is_some_and(|o| normal(&doc.get(o))) => {}
-            Some(o) if normal(&o) => {}
-            Some(_) => refuse(refused, "blend mode"),
+        match d.get(b"SMask").map(|o| doc.get(o)) {
+            None => None,
+            Some(Object::Dict(m)) => Some(m),
+            Some(Object::Null) => {
+                self.soft_mask = None;
+                None
+            }
+            Some(Object::Name(n)) if n == b"None" => {
+                self.soft_mask = None;
+                None
+            }
+            Some(_) => {
+                self.soft_mask = None;
+                refuse(refused, "soft mask");
+                None
+            }
         }
     }
 }
