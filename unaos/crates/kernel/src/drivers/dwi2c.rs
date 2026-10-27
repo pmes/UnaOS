@@ -26,7 +26,7 @@
 //! The touchpad's reports: the `touchpad` module at the tail (ZENBOOKTOUCHPADREPORTS, zenbook-ledger Z18; `ehcihid`
 //! images, pumped by the one HID pass) — the controller that answered is HELD open for it only when armed. `tests dwi2c`
 //! runs the register-sequence machine against a fake controller: `:: DWI2C: proto=ok cases=8/8 -> PASS ::`;
-//! `tests dwi2ctp` the touchpad over the same fake: `:: DWI2C-TP: rdesc=ok reports=2 events=2 scroll2 dy=<n> palm=ok -> PASS ::`. DWI2CACPI (zenbook-ledger Z32): the DSDT byte scan `aml_scan` (file tail) cross-checks BASES / HID_GUESS (`[dwi2c] acpi ...`), `tests dwi2cacpi`.
+//! `tests dwi2ctp` the touchpad over the same fake: `:: DWI2C-TP: rdesc=ok reports=2 events=2 scroll2 dy=<n> palm=ok -> PASS ::`. DWI2CACPI (zenbook-ledger Z32): the DSDT byte scan `aml_scan` (file tail) cross-checks BASES / HID_GUESS (`[dwi2c] acpi ...`), `tests dwi2cacpi`. DWI2CGPIO (zenbook-ledger Z42): the touchpad's GpioInt and the AMDI0030 line (`[dwi2c] acpi gpio=...`) and the pin's IRQ waking the pump (`tpirq`, file tail).
 
 use core::cell::RefCell;
 
@@ -754,8 +754,8 @@ pub mod touchpad {
     //! RESET over wCommandRegister, the report descriptor read once from wReportDescRegister, then — when the
     //! descriptor declares the Digitizer Input Mode feature (0x0D:0x52) — ONE SET_REPORT(Feature, Input Mode = 3)
     //! through wDataRegister, without which a Precision Touchpad stays in mouse mode and never sends its touch report.
-    //! The GPIO interrupt (AMDI0030) is AML-only, so the input register is POLLED: one bounded plain read of
-    //! wMaxInputLength bytes per [`POLL_MS`], from the one HID pass (`ehci::service_ehci_hid`), under `EHCI_HID` then
+    //! The input register is POLLED: one bounded plain read of
+    //! wMaxInputLength bytes per [`POLL_MS`] (sooner when the GPIO interrupt fired: DWI2CGPIO Z42, `super::tpirq`), from the one HID pass (`ehci::service_ehci_hid`), under `EHCI_HID` then
     //! [`TP`] (`try_lock`, never blocking the pass). The parse is a MINIMAL PTP map ([`parse`]): the shared
     //! `ehci::parse_report_descriptor` keeps one report id and the last X it sees, so it cannot hold a Finger
     //! collection; the bit reads and the curve are EHCI's (`ehci::lend`), not copies. The first finger's absolute
@@ -1294,6 +1294,7 @@ pub mod touchpad {
                 *TP.lock() = Some(Tp { base, addr, d, win, p, t: Track::default(), last_ms: 0, first: false, errs: 0, reports: 0 });
                 ARMED.store(true, Ordering::Release);
                 serial_println!("[dwi2c] ctrl={} held for touchpad", i);
+                super::tpirq::arm();
             }
             Some(_) => {
                 let back = super::close(io, &saved);
@@ -1315,20 +1316,26 @@ pub mod touchpad {
         let Some(mut g) = TP.try_lock() else { return };
         let Some(tp) = g.as_mut() else { return };
         let now = crate::arch::ms();
-        if now.wrapping_sub(tp.last_ms) < POLL_MS {
+        let irq = super::tpirq::take();
+        if !irq && now.wrapping_sub(tp.last_ms) < POLL_MS {
             return;
         }
         tp.last_ms = now;
         let io = super::Real { base: tp.base };
         let n = (tp.d.maxin as usize).clamp(2, MAXIN_CAP);
         let mut buf = [0u8; MAXIN_CAP];
-        if super::xfer(&io, tp.addr, &[], &mut buf[..n], tp.win).is_err() {
+        let r = super::xfer(&io, tp.addr, &[], &mut buf[..n], tp.win);
+        if irq {
+            super::tpirq::rearm();
+        }
+        if r.is_err() {
             tp.errs = tp.errs.saturating_add(1);
             return;
         }
         let o = step(&tp.p, &mut tp.t, &buf[..n], now);
         let Some(c) = o.c else { return };
         tp.reports = tp.reports.saturating_add(1);
+        super::tpirq::note(irq, tp.reports);
         if !tp.first {
             tp.first = true;
             serial_println!(
@@ -1557,7 +1564,7 @@ pub mod touchpad {
 // survey path runs unchanged and the line records the mismatch (the first boot judges). `AMDI0019` (linux: the
 // PSP-arbitrated bus, ARBITRATION_SEMAPHORE) is deliberately NOT accepted. `tests dwi2cacpi`: the live line, then the KAT
 // over `ACPI_KAT` and three refusal mutants: `:: DWI2CACPI: base=ok tp=ok speed=400000 desc=ok refuse=3/3 -> PASS ::`.
-// Owed: DWI2C-FAST, DWI2C-AOAC, DWI2C-GPIO, DWI2C-ACPI-SSDT (the touchpad declared in an SSDT).
+// Owed: DWI2C-FAST, DWI2C-AOAC, DWI2C-ACPI-SSDT (the touchpad declared in an SSDT); DWI2C-GPIO BUILT by DWI2CGPIO (Z42, below).
 
 /// `Name (_HID, "AMDI0010")`: the DesignWare I2C master's ACPI id on AMD.
 const ACPI_HID_PAT: &[u8] = b"\x08_HID\x0dAMDI0010\x00";
@@ -1579,6 +1586,8 @@ struct AcpiI2c {
     tpdev: [u8; 4],
     speed: u32,
     desc: Option<u16>,
+    /// DWI2CGPIO (Z42): the touchpad Device's ONE GpioInt (0x8C, connection type interrupt), else the refusal's name.
+    gpio: Result<GpioInt, &'static str>,
 }
 
 /// A refusal, by name; `what`/`n`/`at` qualify `ambiguous`.
@@ -1704,16 +1713,7 @@ fn aml_scan(a: &[u8]) -> Result<AcpiI2c, AcpiNo> {
         let Some(h) = find_from(a, ACPI_HID_PAT, i, a.len()) else { break };
         i = h + 1;
         let Some((s, e, nm)) = device_of(a, h) else { continue };
-        let (mut m, mut base, mut k) = (0u8, 0u32, s);
-        while let Some(at) = find_from(a, &[0x86, 0x09, 0x00], k, e) {
-            k = at + 1;
-            if at + 12 <= e {
-                m = m.saturating_add(1);
-                if m == 1 {
-                    base = u32::from_le_bytes([a[at + 4], a[at + 5], a[at + 6], a[at + 7]]);
-                }
-            }
-        }
+        let (m, base, _) = mem32(a, s, e, None);
         ctrls[nc] = (nm, m, base);
         nc += 1;
     }
@@ -1786,7 +1786,7 @@ fn aml_scan(a: &[u8]) -> Result<AcpiI2c, AcpiNo> {
         1 => {}
         m => return Err(AcpiNo { why: "ambiguous", what: "mem", n: m as usize, at: [c.0, c.0] }),
     }
-    Ok(AcpiI2c { dev: c.0, base: c.2, tp, tpdev, speed, desc: dsm_desc(a, s, e) })
+    Ok(AcpiI2c { dev: c.0, base: c.2, tp, tpdev, speed, desc: dsm_desc(a, s, e), gpio: gpioint(a, s, e) })
 }
 
 /// The scan against the survey: (the controller index in `BASES`, the descriptor register to use, the first mismatch).
@@ -1866,9 +1866,11 @@ fn acpi_census() {
         serial_println!("[dwi2c] acpi -> REFUSED why=no-dsdt");
         return;
     };
-    if let Some(p) = acpi_say(&aml_scan(d)) {
+    let r = aml_scan(d);
+    if let Some(p) = acpi_say(&r) {
         ACPI_PICK.call_once(|| p);
     }
+    gpio_census(d, &r);
 }
 
 /// `run`'s guess pair from the scan: only on the controller the DSDT named, and only at an address that acked.
@@ -1899,7 +1901,9 @@ const ACPI_KAT: [u8; ACPI_KAT_LEN] = [
 pub fn acpi_selftest() {
     match crate::arch::acpi_power::dsdt() {
         Some(d) => {
-            let _ = acpi_say(&aml_scan(d));
+            let r = aml_scan(d);
+            let _ = acpi_say(&r);
+            let _ = gpio_say(d, &r);
         }
         None => serial_println!("[dwi2c] acpi -> REFUSED why=no-dsdt"),
     }
@@ -1924,5 +1928,484 @@ pub fn acpi_selftest() {
     match cases.iter().find(|c| !c.1) {
         None => serial_println!(":: DWI2CACPI: base=ok tp=ok speed={} desc=ok refuse={}/3 -> PASS ::", speed, refuse),
         Some(c) => serial_println!(":: DWI2CACPI: case={} -> FAIL ::", c.0),
+    }
+    gpio_selftest();
+}
+
+// ── DWI2CGPIO (zenbook-ledger Z42) — the touchpad's GpioInt and the FCH GPIO controller's line — FILE TAIL ─────────────
+// The same BYTE SCAN discipline as DWI2CACPI above (no AML runs, BP-power-4): `gpioint` reads the ONE GpioInt (0x8C,
+// connection type 0 = interrupt; ACPI 6.x §6.4.3.8.1) inside the touchpad Device's span `aml_scan` already found (the
+// `dsm_desc` shape): its first pin, Level/Edge, the polarity, Wake and the ResourceSource's last NameSeg. `gpio_ctrl`
+// finds the ONE `_HID "AMDI0030"` Device (the AMD FCH GPIO controller, linux pinctrl-amd), its ONE Extended Interrupt
+// (0x89, one GSI — an ACPI Interrupt number IS a GSI, §6.4.3.6, so `ioapic::route_gsi` takes it as is) and the
+// Memory32Fixed at the FCH's fixed GPIO bank `GPIO_BASE` (coreboot ACPIMMIO_GPIO0_BASE; `mem32`, factored out of
+// `aml_scan`). `GPIO_SCAN` is Ok ONLY when Z32 agreed (`ACPI_PICK` set) AND the base, the ResourceSource and the pin's
+// bound agree; `tpirq::arm` (the module after this one) is the only reader. `tests dwi2cacpi` gains a second line over
+// `ACPI_GPIO_KAT`: `:: DWI2CGPIO: pin=8 mode=level-low wake=1 ctrl=GPIO irq=7 line=level-low base=ok src=ok refuse=2/2
+// -> PASS ::`. Owed: DWI2C-ACPI-SSDT (the touchpad and its GpioInt declared in an SSDT).
+
+/// `Name (_HID, "AMDI0030")`: the AMD FCH GPIO controller's ACPI id.
+const GPIO_HID_PAT: &[u8] = b"\x08_HID\x0dAMDI0030\x00";
+/// The FCH GPIO bank 0 (coreboot ACPIMMIO_GPIO0_BASE): pin n's register at + 4n.
+const GPIO_BASE: u32 = 0xfed8_1500;
+/// Pin registers end here (0xfc is the master register, pin slot 63; 0x2f0.. the summary registers).
+const GPIO_PIN_END: u32 = 0x2f0;
+const GPIO_MASTER_PIN: u16 = 63;
+
+/// The touchpad's GpioInt: (first pin, edge, polarity 0 high / 1 low / 2 both, wake, ResourceSource last NameSeg).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct GpioInt {
+    pin: u16,
+    edge: bool,
+    pol: u8,
+    wake: bool,
+    src: [u8; 4],
+}
+
+/// The AMDI0030 Device: its name, its line (GSI, edge, active-low), its Memory32Fixed count and the GPIO bank's window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct GpioCtl {
+    dev: [u8; 4],
+    gsi: u32,
+    edge: bool,
+    low: bool,
+    mems: u8,
+    base: u32,
+    len: u32,
+}
+
+/// What `tpirq::arm` routes: the pin and its mode, the controller's line and window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(all(feature = "ehcihid", feature = "ioapic")), allow(dead_code))]
+struct TpGpio {
+    pin: u16,
+    edge: bool,
+    pol: u8,
+    gsi: u32,
+    gsi_edge: bool,
+    gsi_low: bool,
+    base: u32,
+    len: u32,
+}
+
+/// Written once by `acpi_census` (pci init, BSP); read by `tpirq::arm`.
+#[cfg_attr(not(all(feature = "ehcihid", feature = "ioapic")), allow(dead_code))]
+static GPIO_SCAN: spin::Once<Result<TpGpio, &'static str>> = spin::Once::new();
+
+/// The Memory32Fixed descriptors (0x86) in `[s, e)`: (count, base, length) of the one whose base is `want`, else of
+/// the first (0, 0 when none). `aml_scan`'s step 1 with `None`.
+fn mem32(a: &[u8], s: usize, e: usize, want: Option<u32>) -> (u8, u32, u32) {
+    let (mut m, mut first, mut hit, mut k) = (0u8, None, None, s);
+    while let Some(at) = find_from(a, &[0x86, 0x09, 0x00], k, e) {
+        k = at + 1;
+        if at + 12 <= e {
+            m = m.saturating_add(1);
+            let b = u32::from_le_bytes([a[at + 4], a[at + 5], a[at + 6], a[at + 7]]);
+            let l = u32::from_le_bytes([a[at + 8], a[at + 9], a[at + 10], a[at + 11]]);
+            if first.is_none() {
+                first = Some((b, l));
+            }
+            if hit.is_none() && want == Some(b) {
+                hit = Some((b, l));
+            }
+        }
+    }
+    let (b, l) = hit.or(first).unwrap_or((0, 0));
+    (m, b, l)
+}
+
+/// The ONE GpioInt in `[s, e)` (the touchpad Device's span). Pure: the KAT runs it.
+fn gpioint(a: &[u8], s: usize, e: usize) -> Result<GpioInt, &'static str> {
+    let (mut got, mut n, mut k) = (None, 0usize, s);
+    while let Some(at) = find_from(a, &[0x8c], k, e) {
+        k = at + 1;
+        if at + 23 > e || a[at + 4] != 0 {
+            continue;
+        }
+        let ln = u16::from_le_bytes([a[at + 1], a[at + 2]]) as usize;
+        let end = at + 3 + ln;
+        let pt = u16::from_le_bytes([a[at + 14], a[at + 15]]) as usize;
+        let no = u16::from_le_bytes([a[at + 17], a[at + 18]]) as usize;
+        if ln < 20 || end > e || pt < 23 || at + pt + 2 > end || no < 23 || at + no >= end {
+            continue;
+        }
+        let name = &a[at + no..end];
+        let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())];
+        if name.len() < 4 {
+            continue;
+        }
+        let src = [name[name.len() - 4], name[name.len() - 3], name[name.len() - 2], name[name.len() - 1]];
+        let fl = u16::from_le_bytes([a[at + 7], a[at + 8]]);
+        n += 1;
+        if got.is_none() {
+            got = Some(GpioInt {
+                pin: u16::from_le_bytes([a[at + pt], a[at + pt + 1]]),
+                edge: fl & 1 != 0,
+                pol: ((fl >> 1) & 3) as u8,
+                wake: fl & 0x10 != 0,
+                src,
+            });
+        }
+    }
+    match (got, n) {
+        (None, _) => Err("no-gpioint"),
+        (Some(g), 1) => Ok(g),
+        _ => Err("ambiguous what=gpioint"),
+    }
+}
+
+/// The ONE AMDI0030 Device, its ONE one-GSI Extended Interrupt, the Memory32Fixed at `GPIO_BASE`. Pure.
+fn gpio_ctrl(a: &[u8]) -> Result<GpioCtl, &'static str> {
+    let (mut hit, mut nh, mut i) = (None, 0usize, 0usize);
+    while let Some(h) = find_from(a, GPIO_HID_PAT, i, a.len()) {
+        i = h + 1;
+        if let Some(d) = device_of(a, h) {
+            nh += 1;
+            if hit.is_none() {
+                hit = Some(d);
+            }
+        }
+    }
+    let Some((s, e, dev)) = hit else { return Err("no-gpio") };
+    if nh > 1 {
+        return Err("ambiguous what=gpio");
+    }
+    let (mut irq, mut ni, mut k) = (None, 0usize, s);
+    while let Some(at) = find_from(a, &[0x89, 0x06, 0x00], k, e) {
+        k = at + 1;
+        if at + 9 > e || a[at + 4] != 1 {
+            continue;
+        }
+        ni += 1;
+        if irq.is_none() {
+            irq = Some((u32::from_le_bytes([a[at + 5], a[at + 6], a[at + 7], a[at + 8]]), a[at + 3]));
+        }
+    }
+    let Some((gsi, fl)) = irq else { return Err("no-irq") };
+    if ni > 1 {
+        return Err("ambiguous what=irq");
+    }
+    let (mems, base, len) = mem32(a, s, e, Some(GPIO_BASE));
+    if mems == 0 {
+        return Err("no-mem");
+    }
+    Ok(GpioCtl { dev, gsi, edge: fl & 2 != 0, low: fl & 4 != 0, mems, base, len })
+}
+
+/// `level-low` and kin, for the wire.
+fn mode_str(edge: bool, pol: u8) -> &'static str {
+    match (edge, pol) {
+        (false, 0) => "level-high",
+        (false, 1) => "level-low",
+        (false, _) => "level-both",
+        (true, 0) => "edge-high",
+        (true, 1) => "edge-low",
+        (true, _) => "edge-both",
+    }
+}
+
+/// Print the gpio line for one DSDT and the I2C scan's result; the verdict `GPIO_SCAN` keeps.
+fn gpio_say(d: &[u8], r: &Result<AcpiI2c, AcpiNo>) -> Result<TpGpio, &'static str> {
+    let c = match gpio_ctrl(d) {
+        Ok(c) => c,
+        Err(w) => {
+            serial_println!("[dwi2c] acpi gpio -> REFUSED why={}", w);
+            return Err(w);
+        }
+    };
+    let Ok(f) = r else {
+        serial_println!("[dwi2c] acpi gpio -> REFUSED why=no-tp");
+        return Err("no-tp");
+    };
+    let g = match f.gpio {
+        Ok(g) => g,
+        Err(w) => {
+            serial_println!("[dwi2c] acpi gpio -> REFUSED why={}", w);
+            return Err(w);
+        }
+    };
+    let why = if ACPI_PICK.get().is_none() {
+        Some("i2c")
+    } else if c.base != GPIO_BASE {
+        Some("base")
+    } else if g.src != c.dev {
+        Some("src")
+    } else if g.pin == GPIO_MASTER_PIN || (g.pin as u32) * 4 + 4 > c.len.min(GPIO_PIN_END) {
+        Some("pin")
+    } else {
+        None
+    };
+    serial_println!(
+        "[dwi2c] acpi gpio={} {} irq={} line={} base={:#x} src={} wake={} agree={}{}",
+        g.pin, mode_str(g.edge, g.pol), c.gsi, mode_str(c.edge, c.low as u8), c.base, seg_str(&g.src), g.wake as u8,
+        if why.is_none() { "yes" } else { "no why=" }, why.unwrap_or("")
+    );
+    match why {
+        Some(w) => Err(w),
+        None => Ok(TpGpio {
+            pin: g.pin,
+            edge: g.edge,
+            pol: g.pol,
+            gsi: c.gsi,
+            gsi_edge: c.edge,
+            gsi_low: c.low,
+            base: c.base,
+            len: c.len,
+        }),
+    }
+}
+
+/// `acpi_census`'s gpio half (after the I2C pick): print, and keep the verdict once.
+fn gpio_census(d: &[u8], r: &Result<AcpiI2c, AcpiNo>) {
+    let v = gpio_say(d, r);
+    GPIO_SCAN.call_once(|| v);
+}
+
+const ACPI_GPIO_KAT_LEN: usize = 89;
+/// Where the raw GpioInt starts (after the GPIO Device).
+const ACPI_GPIO_KAT_DEV: usize = 54;
+/// `Device (GPIO) { _HID "AMDI0030", _CRS { Interrupt (ResourceConsumer, Level, ActiveLow, Shared) {7},
+/// Memory32Fixed (ReadWrite, 0xFED81500, 0x400) } }`, then one raw `GpioInt (Level, ActiveLow, ExclusiveAndWake, PullUp,
+/// 0, "\_SB.GPIO") {8}` (35 bytes: the 23-byte header, pin table at 0x17, the name at 0x19).
+const ACPI_GPIO_KAT: [u8; ACPI_GPIO_KAT_LEN] = [
+    0x5b, 0x82, 0x34, 0x47, 0x50, 0x49, 0x4f, 0x08, 0x5f, 0x48, 0x49, 0x44, 0x0d, 0x41, 0x4d, 0x44, 0x49, 0x30,
+    0x30, 0x33, 0x30, 0x00, 0x08, 0x5f, 0x43, 0x52, 0x53, 0x11, 0x1a, 0x0a, 0x17, 0x89, 0x06, 0x00, 0x0d, 0x01,
+    0x07, 0x00, 0x00, 0x00, 0x86, 0x09, 0x00, 0x01, 0x00, 0x15, 0xd8, 0xfe, 0x00, 0x04, 0x00, 0x00, 0x79, 0x00,
+    0x8c, 0x20, 0x00, 0x01, 0x00, 0x01, 0x00, 0x12, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x17, 0x00, 0x00, 0x19,
+    0x00, 0x23, 0x00, 0x00, 0x00, 0x08, 0x00, 0x5c, 0x5f, 0x53, 0x42, 0x2e, 0x47, 0x50, 0x49, 0x4f, 0x00,
+];
+
+/// `tests dwi2cacpi`'s second line: the two scans over `ACPI_GPIO_KAT` and two refusal mutants.
+fn gpio_selftest() {
+    let (ck, gk) = (gpio_ctrl(&ACPI_GPIO_KAT).ok(), gpioint(&ACPI_GPIO_KAT, ACPI_GPIO_KAT_DEV, ACPI_GPIO_KAT_LEN).ok());
+    let pin = gk.map_or(0xffff, |g| g.pin);
+    let mode = gk.map_or("-", |g| mode_str(g.edge, g.pol));
+    let wake = gk.is_some_and(|g| g.wake);
+    let ctrl_ok = ck.is_some_and(|c| c.dev == *b"GPIO");
+    let irq = ck.map_or(u32::MAX, |c| c.gsi);
+    let line = ck.map_or("-", |c| mode_str(c.edge, c.low as u8));
+    let base_ok = ck.is_some_and(|c| c.base == GPIO_BASE && c.len == 0x400 && c.mems == 1);
+    let src_ok = matches!((gk, ck), (Some(g), Some(c)) if g.src == c.dev);
+    let mut m = ACPI_GPIO_KAT;
+    m[ACPI_GPIO_KAT_DEV + 4] = 1; // connection type interrupt -> IO
+    let noint = ACPI_GPIO_KAT[ACPI_GPIO_KAT_DEV + 4] == 0
+        && matches!(gpioint(&m, ACPI_GPIO_KAT_DEV, ACPI_GPIO_KAT_LEN), Err("no-gpioint"));
+    let mut m = ACPI_GPIO_KAT;
+    m[20] = b'9'; // "AMDI0030" -> "AMDI0039"
+    let nogpio = ACPI_GPIO_KAT[20] == b'0' && matches!(gpio_ctrl(&m), Err("no-gpio"));
+    let refuse = noint as u32 + nogpio as u32;
+    let cases = [
+        ("pin", pin == 8), ("mode", mode == "level-low"), ("wake", wake), ("ctrl", ctrl_ok), ("irq", irq == 7),
+        ("line", line == "level-low"), ("base", base_ok), ("src", src_ok), ("no-gpioint", noint), ("no-gpio", nogpio),
+    ];
+    match cases.iter().find(|c| !c.1) {
+        None => serial_println!(
+            ":: DWI2CGPIO: pin={} mode={} wake=1 ctrl=GPIO irq={} line={} base=ok src=ok refuse={}/2 -> PASS ::",
+            pin, mode, irq, line, refuse
+        ),
+        Some(c) => serial_println!(":: DWI2CGPIO: case={} -> FAIL ::", c.0),
+    }
+}
+
+/// DWI2CGPIO (zenbook-ledger Z42) — the touchpad's GPIO pin as an interrupt that wakes the HID pass's read. File tail.
+#[cfg(feature = "ehcihid")]
+pub mod tpirq {
+    //! CHARTER: Kernel — driver (the touchpad's FCH GPIO pin routed through the IOAPIC to the HID pass's one read, DWI2CGPIO zenbook-ledger Z42; no CODEX §2 handler owns the FCH GPIO block).
+    //!
+    //! `arm` (once, from `touchpad::attach`'s armed branch; BSP, pci init, interrupts masked) takes `GPIO_SCAN`'s Ok
+    //! only, reads the pin register and every other pin register of the bank (read-only census, `others=` = pins
+    //! firmware left enabled AND delivered on the same shared line, which nothing here services: any -> refused
+    //! `why=shared-pins` before a write), then i8042's order (`route_irq1` / `unmask_irq1`): `vectors::alloc`,
+    //! `ioapic::route_gsi` MASKED with the AMDI0030 line's mode, ONE pin write (trigger and active level from the
+    //! GpioInt as linux `amd_gpio_irq_set_type` does, INTERRUPT_ENABLE bit 11, INTERRUPT_MASK bit 12 = delivered,
+    //! INTERRUPT_STS bit 28 W1C; debounce and wake kept as found, WAKE_STS bit 29 never written 1), read back, then
+    //! `ioapic::set_mask(gsi, false)`. The ISR takes NO lock (`sync::Mutex` does not mask interrupts): on its pin's
+    //! status it MASKS the pin (bit 12 clear: an I2C-HID line stays asserted until the report is read) and W1Cs the
+    //! status, sets `PENDING`, EOIs the GPIO unit (master 0xfc bit 29) and the local APIC. `touchpad::pump` reads at
+    //! once on `PENDING` (else the 8 ms poll, kept as the safety net, DWI2C-PUMP owed) and `rearm` unmasks the pin
+    //! after the read. The pin register's two writers never overlap: the ISR writes it only while delivered, the
+    //! pump only after a PENDING read.
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+    /// linux pinctrl-amd.h: the pin register's fields.
+    #[cfg(feature = "ioapic")]
+    const LEVEL_TRIG: u32 = 1 << 8;
+    #[cfg(feature = "ioapic")]
+    const ACTIVE_SHIFT: u32 = 9;
+    #[cfg(feature = "ioapic")]
+    const ACTIVE_MASK: u32 = 3 << 9;
+    #[cfg(feature = "ioapic")]
+    const INT_EN: u32 = 1 << 11;
+    const INT_UNMASK: u32 = 1 << 12;
+    const INT_STS: u32 = 1 << 28;
+    const WAKE_STS: u32 = 1 << 29;
+    /// WAKE_INT_MASTER_REG and its EOI bit.
+    #[cfg(feature = "ioapic")]
+    const MASTER: u64 = 0xfc;
+    #[cfg(feature = "ioapic")]
+    const MASTER_EOI: u32 = 1 << 29;
+    /// The census line prints at these report counts (bounded: four lines).
+    const WIT: [u32; 4] = [1, 100, 1000, 10000];
+
+    /// The pin register's address (0 = no IRQ: the poll alone).
+    static PIN_VA: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "ioapic")]
+    static MASTER_VA: AtomicU64 = AtomicU64::new(0);
+    static PENDING: AtomicBool = AtomicBool::new(false);
+    static ISR_N: AtomicU32 = AtomicU32::new(0);
+    static FOREIGN: AtomicU32 = AtomicU32::new(0);
+    static IRQ_REPORTS: AtomicU32 = AtomicU32::new(0);
+    static POLL_REPORTS: AtomicU32 = AtomicU32::new(0);
+
+    fn rd(va: u64) -> u32 {
+        // SAFETY: `va` is inside the GPIO bank window `arm` mapped and translated.
+        unsafe { core::ptr::read_volatile(va as *const u32) }
+    }
+
+    fn wr(va: u64, v: u32) {
+        // SAFETY: as `rd`.
+        unsafe { core::ptr::write_volatile(va as *mut u32, v) }
+    }
+
+    #[cfg(feature = "ioapic")]
+    pub(super) fn arm() {
+        use crate::arch::ioapic::{self, Polarity, Trigger};
+        let g = match super::GPIO_SCAN.get() {
+            Some(Ok(g)) => *g,
+            Some(Err(w)) => {
+                serial_println!("[dwi2c] touchpad irq -> REFUSED why={}", w);
+                return;
+            }
+            None => {
+                serial_println!("[dwi2c] touchpad irq -> REFUSED why=no-scan");
+                return;
+            }
+        };
+        let base = g.base as u64;
+        let page = base & !0xfff;
+        let size = ((base - page + g.len as u64 + 0xfff) & !0xfff) as usize;
+        crate::arch::memory::map_mmio_window(page, size);
+        if crate::arch::memory::translate(base).is_none() || crate::arch::memory::translate(base + MASTER).is_none() {
+            serial_println!("[dwi2c] touchpad irq -> REFUSED why=unmapped base={:#x}", base);
+            return;
+        }
+        let pin_va = base + 4 * g.pin as u64;
+        let v = rd(pin_va);
+        let mut others = 0u32;
+        let pins = (g.len.min(super::GPIO_PIN_END) / 4) as u64;
+        for k in 0..pins {
+            if k == g.pin as u64 || k == super::GPIO_MASTER_PIN as u64 {
+                continue;
+            }
+            let o = rd(base + 4 * k);
+            if o != 0xffff_ffff && o & (INT_EN | INT_UNMASK) == INT_EN | INT_UNMASK {
+                others += 1;
+            }
+        }
+        serial_println!(
+            "[dwi2c] gpio pin={} reg={:#010x} sts={} en={} unmask={} level={} act={} wake={} others={}",
+            g.pin, v, (v >> 28) & 1, (v >> 11) & 1, (v >> 12) & 1, (v >> 8) & 1, (v >> 9) & 3, (v >> 13) & 7, others
+        );
+        if v == 0xffff_ffff {
+            serial_println!("[dwi2c] touchpad irq -> REFUSED why=pin-absent");
+            return;
+        }
+        if others > 0 {
+            serial_println!("[dwi2c] touchpad irq -> REFUSED why=shared-pins n={}", others);
+            return;
+        }
+        let Some(vector) = crate::arch::interrupts::vectors::alloc("dwi2c-tp", isr) else {
+            serial_println!("[dwi2c] touchpad irq -> REFUSED why=no-vector");
+            return;
+        };
+        let pol = if g.gsi_low { Polarity::ActiveLow } else { Polarity::ActiveHigh };
+        let trig = if g.gsi_edge { Trigger::Edge } else { Trigger::Level };
+        let entry = match ioapic::route_gsi(g.gsi, vector, pol, trig, crate::arch::apic::apic_id()) {
+            Ok(e) => e,
+            Err(e) => {
+                serial_println!("[dwi2c] touchpad irq -> REFUSED why=route-{} gsi={}", e.as_str(), g.gsi);
+                return;
+            }
+        };
+        let level = if g.edge { 0 } else { LEVEL_TRIG };
+        let act = ((g.pol as u32) & 3) << ACTIVE_SHIFT;
+        let want = (v & !(LEVEL_TRIG | ACTIVE_MASK | WAKE_STS)) | level | act | INT_EN | INT_UNMASK | INT_STS;
+        wr(pin_va, want);
+        let back = rd(pin_va);
+        let fields = LEVEL_TRIG | ACTIVE_MASK | INT_EN | INT_UNMASK;
+        if back & fields != want & fields {
+            wr(pin_va, v & !(INT_STS | WAKE_STS));
+            serial_println!("[dwi2c] touchpad irq -> REFUSED why=pin-readback want={:#010x} back={:#010x}", want, back);
+            return;
+        }
+        MASTER_VA.store(base + MASTER, Ordering::Release);
+        PIN_VA.store(pin_va, Ordering::Release);
+        if let Err(e) = ioapic::set_mask(g.gsi, false) {
+            PIN_VA.store(0, Ordering::Release);
+            wr(pin_va, v & !(INT_STS | WAKE_STS));
+            serial_println!("[dwi2c] touchpad irq -> REFUSED why=unmask-{} gsi={}", e.as_str(), g.gsi);
+            return;
+        }
+        serial_println!(
+            "[dwi2c] touchpad irq=armed gsi={} vector={:#04x} pin={} mode={} line={} entry={:#x} -> routed",
+            g.gsi, vector, g.pin, super::mode_str(g.edge, g.pol), super::mode_str(g.gsi_edge, g.gsi_low as u8), entry
+        );
+    }
+
+    #[cfg(not(feature = "ioapic"))]
+    pub(super) fn arm() {
+        serial_println!("[dwi2c] touchpad irq -> REFUSED why=no-ioapic-in-kernel");
+    }
+
+    /// The pin's ISR: MMIO and atomics only, no lock.
+    #[cfg(feature = "ioapic")]
+    extern "x86-interrupt" fn isr(_f: x86_64::structures::idt::InterruptStackFrame) {
+        let pin_va = PIN_VA.load(Ordering::Acquire);
+        if pin_va != 0 {
+            let v = rd(pin_va);
+            if v & INT_STS != 0 {
+                wr(pin_va, (v & !(INT_UNMASK | WAKE_STS)) | INT_STS);
+                PENDING.store(true, Ordering::Release);
+                ISR_N.fetch_add(1, Ordering::Relaxed);
+            } else {
+                FOREIGN.fetch_add(1, Ordering::Relaxed);
+            }
+            let m = MASTER_VA.load(Ordering::Acquire);
+            if m != 0 {
+                wr(m, rd(m) | MASTER_EOI);
+            }
+        }
+        crate::arch::apic::eoi();
+    }
+
+    /// The pump's question: did the pin fire since the last read? (Clears the flag.)
+    pub(super) fn take() -> bool {
+        PENDING.swap(false, Ordering::AcqRel)
+    }
+
+    /// After a PENDING read: deliver the pin again (bit 12), writing no W1C bit.
+    pub(super) fn rearm() {
+        let va = PIN_VA.load(Ordering::Acquire);
+        if va == 0 {
+            return;
+        }
+        let v = rd(va);
+        wr(va, (v & !(INT_STS | WAKE_STS)) | INT_UNMASK);
+    }
+
+    /// One decoded report: counted by what woke its read; the census line at `WIT`'s counts.
+    pub(super) fn note(irq: bool, reports: u32) {
+        if irq {
+            IRQ_REPORTS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            POLL_REPORTS.fetch_add(1, Ordering::Relaxed);
+        }
+        if WIT.contains(&reports) {
+            serial_println!(
+                "[dwi2c] touchpad irq={} polled={} isr={} foreign={}",
+                IRQ_REPORTS.load(Ordering::Relaxed), POLL_REPORTS.load(Ordering::Relaxed),
+                ISR_N.load(Ordering::Relaxed), FOREIGN.load(Ordering::Relaxed)
+            );
+        }
     }
 }

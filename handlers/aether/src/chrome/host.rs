@@ -11,7 +11,8 @@
 //!   write itself (`.part`, then rename) is gneiss_pal's ONE writer (`gneiss_pal::fs`), Facet's export's too; a Save As
 //!   ([`save_bytes_at`]) writes it at the path the person chose in the face's save panel. PAGESAVECOMPLETE (SR398): an HTML
 //!   tab's Save As chosen as `.html` lands "Webpage, Complete" (a `<name>_files/` folder beside it), as `.mhtml` the archive;
-//!   [`open_archive`] opens a `.mhtml` file URL.
+//!   [`open_archive`] opens a `.mhtml` file URL. PAGESAVECSSURLS (SR407): the `url()` / `@import` references inside CSS
+//!   are found and, in a Complete save, rewritten through one walk over css_core's tokenizer ([`css_urls_walk`]).
 //! - [`probe`] is the top-level navigation's download decision: a `HEAD` of the URL over gneiss_pal's
 //!   HTTP client (the same cookie jar the page loads use), whose `Content-Disposition` /
 //!   `Content-Type` the model judges ([`super::downloads`]). A failed or refused probe answers
@@ -360,19 +361,45 @@ fn page_name(doc: &crate::dom::NodeRef, url: &str) -> String {
 /// document itself left out: it is the root part) found through the one lookup (`devtools::network::cached`), as
 /// MHTML parts at their absolute URLs. PAGESAVECOMPLETE (SR398): a reference the cache does not hold is answered in the
 /// second list (an http(s) one; [`fill_missing`] fetches it at save time), and each nested document of the frame tree is
-/// its own `text/html` part ([`frame_parts`]), in place of what the cache holds for its URL.
+/// its own `text/html` part ([`frame_parts`]), in place of what the cache holds for its URL. PAGESAVECSSURLS (SR407): the
+/// references are a FIFO worklist: the DOM's in tree order, then each `url()` / `@import` of the live DOM's `<style>`
+/// texts and `style=` values ([`css_refs`], against the page URL), and each cached stylesheet's own ([`css_refs`] against
+/// its URL), each URL once.
 fn page_parts(engine: &crate::AetherEngine) -> (Vec<gneiss_pal::mhtml::Part>, Vec<String>) {
     use crate::devtools::network::{cached, references, Initiator};
     let top = engine.current_url();
     let frames = frame_parts(engine);
     let (mut parts, mut missing) = (Vec::new(), Vec::new());
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     for (kind, url) in references(engine) {
         if kind == Initiator::Document || frames.iter().any(|f| f.location == url) {
             continue;
         }
+        queue.push_back(url);
+    }
+    let mut seen: Vec<String> = queue.iter().cloned().collect();
+    seen.push(top.clone());
+    seen.extend(frames.iter().map(|f| f.location.clone()));
+    if let Some(doc) = engine.document.as_ref() {
+        for u in dom_css_refs(&doc.document_node(), &top) {
+            if !seen.contains(&u) {
+                seen.push(u.clone());
+                queue.push_back(u);
+            }
+        }
+    }
+    while let Some(url) = queue.pop_front() {
         match cached(&top, &url) {
             Some(e) => {
                 let content_type = e.headers.get("content-type").unwrap_or("application/octet-stream").to_string();
+                if is_css(&content_type) {
+                    for u in css_refs(&String::from_utf8_lossy(&e.body), &url) {
+                        if !seen.contains(&u) {
+                            seen.push(u.clone());
+                            queue.push_back(u);
+                        }
+                    }
+                }
                 parts.push(gneiss_pal::mhtml::Part { location: url, content_type, body: e.body });
             }
             None if is_web(&url) => missing.push(url),
@@ -444,14 +471,27 @@ pub(crate) fn page_output(path: &Path, bytes: &[u8], fetch: Fetch) -> Option<Vec
 }
 
 /// PAGESAVECOMPLETE (SR398): each missing reference fetched once under [`FETCH_BUDGET`]; one not fetched is left out,
-/// named on the console.
+/// named on the console. PAGESAVECSSURLS (SR407): a worklist: a fetched stylesheet's own `url()` / `@import` references
+/// ([`css_refs`]) not yet a part or asked are fetched in the same pass, under the same budget.
 fn fill_missing(page: &mut StagedPage, fetch: Fetch) {
     let site = gneiss_pal::api::http::site_of(&page.root_url).unwrap_or_default();
     let started = std::time::Instant::now();
-    for url in std::mem::take(&mut page.missing) {
+    let mut queue: std::collections::VecDeque<String> = std::mem::take(&mut page.missing).into();
+    let mut asked: Vec<String> = queue.iter().cloned().collect();
+    while let Some(url) = queue.pop_front() {
         let left = FETCH_BUDGET.saturating_sub(started.elapsed());
         match if left.is_zero() { None } else { fetch(&url, &site, left) } {
-            Some((content_type, body)) => page.parts.push(gneiss_pal::mhtml::Part { location: url, content_type, body }),
+            Some((content_type, body)) => {
+                if is_css(&content_type) {
+                    for u in css_refs(&String::from_utf8_lossy(&body), &url) {
+                        if is_web(&u) && u != page.root_url && !asked.contains(&u) && !page.parts.iter().any(|p| p.location == u) {
+                            asked.push(u.clone());
+                            queue.push_back(u);
+                        }
+                    }
+                }
+                page.parts.push(gneiss_pal::mhtml::Part { location: url, content_type, body });
+            }
             None => crate::js::host::console_out(1, &format!("[pdf] page save: {url} not cached")),
         }
     }
@@ -546,6 +586,8 @@ fn seg_encode(s: &str) -> String {
 /// downloads rule, `downloads::file_name`, with an extension from its media type when it has none, `.html` for a
 /// document, unique in the folder; an HTML part rewritten as the page is), then the page's markup through
 /// [`rewrite_saved`] with the folder as the prefix. A part that could not be written stays at its absolute URL.
+/// PAGESAVECSSURLS (SR407): a stylesheet part's `url()` / `@import` references through [`rewrite_css_urls`] (siblings in
+/// the folder), and one console line per save counting the CSS references and those rewritten to a saved file.
 fn write_complete(path: &Path, page: &StagedPage) -> String {
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "page".to_string());
     let folder_name = format!("{stem}_files");
@@ -569,11 +611,15 @@ fn write_complete(path: &Path, page: &StagedPage) -> String {
         names.insert(p.location.clone(), name);
     }
     let mut saved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tally = CssTally::default();
     if !page.parts.is_empty() && std::fs::create_dir_all(&folder).is_ok() {
         for p in &page.parts {
             let Some(name) = names.get(&p.location) else { continue };
             let body = if is_html(&p.content_type) {
-                rewrite_saved(&String::from_utf8_lossy(&p.body), &p.location, &names, "").into_bytes()
+                rewrite_saved(&String::from_utf8_lossy(&p.body), &p.location, &names, "", &mut tally).into_bytes()
+            } else if is_css(&p.content_type) {
+                let css = std::str::from_utf8(&p.body).ok().and_then(|c| rewrite_css_urls(c, &p.location, &names, "", &mut tally));
+                css.map(String::into_bytes).unwrap_or_else(|| p.body.clone())
             } else {
                 p.body.clone()
             };
@@ -585,7 +631,9 @@ fn write_complete(path: &Path, page: &StagedPage) -> String {
             }
         }
     }
-    rewrite_saved(&page.html, &page.root_url, &saved, &format!("{}/", seg_encode(&folder_name)))
+    let out = rewrite_saved(&page.html, &page.root_url, &saved, &format!("{}/", seg_encode(&folder_name)), &mut tally);
+    crate::js::host::console_out(0, &format!("[pdf] page save: css urls={} rewritten={}", tally.urls, tally.rewritten));
+    out
 }
 
 /// The attributes the rewrite reads (the URL-valued ones `devtools::network::references` follows, and `href` / `action`
@@ -595,15 +643,20 @@ const URL_ATTRS: [&str; 6] = ["src", "href", "poster", "data", "action", "srcset
 /// PAGESAVECOMPLETE (SR398): the ONE rewrite pass over the serializer's output: a detached parse (`dom::parse_html`; the
 /// live DOM is untouched), each URL attribute resolved against `base` as a reference is: one in `saved` (URL -> file name)
 /// becomes `prefix` + the name (its fragment kept), any other RELATIVE value (no scheme, not `#…`) its absolute URL;
-/// `<base>` dropped; serialized again by the one serializer.
-fn rewrite_saved(html: &str, base: &str, saved: &std::collections::HashMap<String, String>, prefix: &str) -> String {
+/// `<base>` dropped; serialized again by the one serializer. PAGESAVECSSURLS (SR407): each `style=` value and each
+/// `<style>` element's text through [`rewrite_css_urls`] (the same map and prefix), counted in `tally`.
+fn rewrite_saved(html: &str, base: &str, saved: &std::collections::HashMap<String, String>, prefix: &str, tally: &mut CssTally) -> String {
     let doc = crate::dom::parse_html(html);
     let mut bases = Vec::new();
+    let mut styles = Vec::new();
     for n in doc.descendants() {
         let Some(e) = n.as_element() else { continue };
         if e.name.local.0 == "base" {
             bases.push(n.clone());
             continue;
+        }
+        if e.name.local.0 == "style" {
+            styles.push(n.clone());
         }
         let mut attrs = e.attributes.borrow_mut();
         for name in URL_ATTRS {
@@ -611,6 +664,19 @@ fn rewrite_saved(html: &str, base: &str, saved: &std::collections::HashMap<Strin
             let new = if name == "srcset" { rewrite_srcset(&raw, base, saved, prefix) } else { rewrite_url(&raw, base, saved, prefix) };
             if let Some(v) = new {
                 attrs.insert(name, v);
+            }
+        }
+        let style = attrs.get("style").map(str::to_string);
+        if let Some(v) = style.and_then(|raw| rewrite_css_urls(&raw, base, saved, prefix, tally)) {
+            attrs.insert("style", v);
+        }
+    }
+    for st in styles {
+        for c in st.children() {
+            let Some(t) = c.as_text() else { continue };
+            let raw = t.borrow().clone();
+            if let Some(v) = rewrite_css_urls(&raw, base, saved, prefix, tally) {
+                *t.borrow_mut() = v;
             }
         }
     }
@@ -655,6 +721,152 @@ fn rewrite_srcset(raw: &str, base: &str, saved: &std::collections::HashMap<Strin
         })
         .collect();
     changed.then(|| out.join(", "))
+}
+
+// ---- PAGESAVECSSURLS (SR407): the URL references inside CSS (saved stylesheets, `<style>`, `style=`) -------------------
+// ONE walk over css_core's own tokenizer (`css_core::tokenizer::Tokenizer`, the engine's CSS tokenizer; no regex, no
+// second parser; `layout_core::css::extract_css_url` is a first-`url(` slice and is not this). Two users: the Complete
+// save's rewrite ([`rewrite_css_urls`], SR398's one [`rewrite_url`] rule) and the save's discovery ([`css_refs`], SR398's
+// [`resolve`]). The MHTML archive's parts are never rewritten: each keeps its Content-Location and the reader serves it.
+
+/// PAGESAVECSSURLS (SR407): one Complete save's CSS references (`urls`) and those rewritten to a saved file (`rewritten`).
+#[derive(Default)]
+struct CssTally {
+    urls: usize,
+    rewritten: usize,
+}
+
+/// A stylesheet part?
+fn is_css(content_type: &str) -> bool {
+    essence(content_type) == "text/css"
+}
+
+/// PAGESAVECSSURLS (SR407): every URL reference of `css` — a `url(...)` token, `url(` + a string, `@import` + a string —
+/// handed to `each`; a Some replaces that token (a url token as `url(v)`, quoted and escaped when `v` needs it; a string
+/// in its own quote, escaped). Everything between tokens (comments included) is copied from the tokenizer's source.
+/// None when nothing changed (the input stays as it was, byte for byte).
+fn css_urls_walk(css: &str, mut each: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    use css_core::tokenizer::{Token, Tokenizer};
+    let mut tk = Tokenizer::new(css);
+    let mut toks: Vec<(Token, usize, usize)> = Vec::new();
+    while let Some(t) = tk.next_token() {
+        toks.push(t);
+    }
+    let src = tk.source();
+    let mut out = String::with_capacity(css.len());
+    let (mut copied, mut changed) = (0usize, false);
+    let mut i = 0;
+    while i < toks.len() {
+        let string_after = matches!(&toks[i].0, Token::Function(f) if f.eq_ignore_ascii_case("url"))
+            || matches!(&toks[i].0, Token::AtKeyword(k) if k.eq_ignore_ascii_case("import"));
+        let at = if string_after {
+            let mut j = i + 1;
+            while matches!(toks.get(j), Some((Token::Whitespace, _, _))) {
+                j += 1;
+            }
+            matches!(toks.get(j), Some((Token::String(_), _, _))).then_some(j)
+        } else {
+            matches!(&toks[i].0, Token::Url(_)).then_some(i)
+        };
+        let Some(j) = at else {
+            i += 1;
+            continue;
+        };
+        let (tok, start, end) = &toks[j];
+        let (raw, quoted) = match tok {
+            Token::Url(v) => (v.as_str(), false),
+            Token::String(v) => (v.as_str(), true),
+            _ => unreachable!(),
+        };
+        if let Some(v) = each(raw) {
+            out.extend(&src[copied..*start]);
+            if quoted {
+                let q = src[*start];
+                out.push_str(&css_quote(&v, q));
+            } else if v.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '(' | ')' | '\\') || c.is_control()) {
+                out.push_str(&format!("url({})", css_quote(&v, '"')));
+            } else {
+                out.push_str(&format!("url({v})"));
+            }
+            copied = *end;
+            changed = true;
+        }
+        i = j + 1;
+    }
+    changed.then(|| {
+        out.extend(&src[copied..]);
+        out
+    })
+}
+
+/// A CSS string of `v` in the quote `q`: the quote and `\` escaped, a newline as `\a `.
+fn css_quote(v: &str, q: char) -> String {
+    let mut s = String::with_capacity(v.len() + 2);
+    s.push(q);
+    for c in v.chars() {
+        match c {
+            '\n' => s.push_str("\\a "),
+            c if c == q || c == '\\' => {
+                s.push('\\');
+                s.push(c);
+            }
+            c => s.push(c),
+        }
+    }
+    s.push(q);
+    s
+}
+
+/// PAGESAVECSSURLS (SR407): `css`'s URL references through [`rewrite_url`] against `base` (a saved one becomes `prefix` +
+/// its file name, any other relative one its absolute URL, an absolute or `data:` or `#…` one stays), each counted in
+/// `tally` (`rewritten` when it resolves to a key of `saved`). None: nothing changed.
+fn rewrite_css_urls(css: &str, base: &str, saved: &std::collections::HashMap<String, String>, prefix: &str, tally: &mut CssTally) -> Option<String> {
+    css_urls_walk(css, |raw| {
+        tally.urls += 1;
+        if resolve(base, raw).is_some_and(|u| saved.contains_key(&u)) {
+            tally.rewritten += 1;
+        }
+        rewrite_url(raw, base, saved, prefix)
+    })
+}
+
+/// PAGESAVECSSURLS (SR407): `css`'s URL references resolved against `base` (as [`resolve`]: fragment-less), in order, each
+/// once; a `#…` one is not a resource.
+fn css_refs(css: &str, base: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    css_urls_walk(css, |raw| {
+        if !raw.trim_start().starts_with('#') {
+            if let Some(u) = resolve(base, raw) {
+                if !out.contains(&u) {
+                    out.push(u);
+                }
+            }
+        }
+        None
+    });
+    out
+}
+
+/// PAGESAVECSSURLS (SR407): the CSS references of a live DOM: each `<style>` element's text and each `style=` value, in
+/// tree order, through [`css_refs`] against the page URL `base`.
+fn dom_css_refs(root: &crate::dom::NodeRef, base: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for n in root.descendants() {
+        let Some(e) = n.as_element() else { continue };
+        let mut css = String::new();
+        if e.name.local.0 == "style" {
+            css = n.text_contents();
+        }
+        let style = e.attributes.borrow().get("style").map(str::to_string);
+        for text in [css, style.unwrap_or_default()] {
+            for u in css_refs(&text, base) {
+                if !out.contains(&u) {
+                    out.push(u);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// PAGESAVECOMPLETE (SR398): the loader's file-URL arm (`net::fetch_document_any`): a `file://` URL whose path ends

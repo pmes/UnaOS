@@ -1048,13 +1048,19 @@ refs/heads/exec-rmbp-zenbookecgpe   dc1814ec9 FOLDED-BY-HAND (this commit) 2026-
 refs/heads/exec-rmbp-dsdtone   353c891c8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-flightlistboardtags   3a52111bd FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kernelpresentpolicy   1e744ddc9 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-mt7925s8   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
+refs/heads/exec-rmbp-mt7925s8   87dfce30b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookledgerhead   d661547f0 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nvme4knfixture   b1f383796 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-exportsizepolicypixel   7d4c60aee FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdf4kernel   11c1f9d2c FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-zenbooksci   847b2bd32 cut 2026-10-27 (wave36 batch 18)
-refs/heads/exec-rmbp-dwi2cgpio   847b2bd32 cut 2026-10-27 (wave36 batch 18)
-refs/heads/exec-rmbp-zenbookacpcodec   847b2bd32 cut 2026-10-27 (wave36 batch 18)
-refs/heads/exec-rmbp-pagesavecssurls   847b2bd32 cut 2026-10-27 (wave36 batch 18)
+refs/heads/exec-rmbp-zenbooksci   bdf2388d0 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-dwi2cgpio   92a0b0c20 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-zenbookacpcodec   3585b7f12 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pagesavecssurls   f3327e17e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootarm   376bea1cb FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kernelsizepin   ff4fa8a0b cut 2026-10-27 (wave36 batch 19)
+refs/heads/exec-rmbp-kernelpresentrows   ff4fa8a0b cut 2026-10-27 (wave36 batch 19)
+refs/heads/exec-rmbp-hidbootxhcix86   ff4fa8a0b cut 2026-10-27 (wave36 batch 19)
+refs/heads/exec-rmbp-pdf4kernellane   ff4fa8a0b cut 2026-10-27 (wave36 batch 19)
+refs/heads/exec-rmbp-zenbookledgerevidence   ff4fa8a0b cut 2026-10-27 (wave36 batch 19)
+refs/heads/exec-rmbp-nvmemsix   ff4fa8a0b cut 2026-10-27 (wave36 batch 19)
