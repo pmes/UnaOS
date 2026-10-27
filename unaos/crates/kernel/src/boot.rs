@@ -398,7 +398,7 @@ pub fn shot_bare_held() -> bool {
 
 /// SETTERWEDGE (rmbp-ledger B553): the phase the ignition ended, as `[boot] phase=desktop from=` spells it (`tests setterwedge`).
 /// FILE-TAIL append (nothing above moves); x86 `wc` only, the watch's own gate.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn ignite_from() -> &'static str {
     match FROM.load(Ordering::Relaxed) {
         1 => "setter",
@@ -455,7 +455,7 @@ pub fn oldest_say() {
         OLDEST.1,
         crate::fs::bootdisk::BUILD_SHA,
         oldest_net()
-    ); trust_say(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::tests::bootlist::start(); // BOOTLIST (rmbp-ledger B817, R132): the boot's first [desktop] built starts the ESP list's one worker (tests.rs tail). LINE-NEUTRAL append, code first
+    ); trust_say(); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] crate::tests::bootlist::start(); // BOOTLIST (rmbp-ledger B817, R132): the boot's first [desktop] built starts the ESP list's one worker (tests.rs tail). BOOTLISTARM (B874): widened to the desktop family — the Pi's and the Orin's crystal login reaches this same first build. LINE-NEUTRAL append, code first
 }
 
 // ── TRUSTSTAGE (rmbp-ledger B836; net.md §5, BP-boot-15) ─────────────────────────────────────────────────────────────

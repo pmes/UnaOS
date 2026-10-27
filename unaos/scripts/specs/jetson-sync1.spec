@@ -2363,6 +2363,12 @@ FORBID X200 FLAG
 # `ADDR` value. See arch_arm64.md §ORIN-RAS-ADDR for why an ADDR must never be the key.
 FORBID Exception reason=1 syndrome=0x82000010
 FORBID \[wm\] winid-register REFUSED
+# BOOTLISTARM (rmbp-ledger B874, R132): the Orin runs its TESTS.LIST at the first `[desktop] built` (the same
+# `boot::oldest_say` start; `esp-jetson` stages the list before `jetson_card_image`). OPTIONAL + FORBID and not REQUIRE
+# (the DRAG-PI rule, pi4-regression.spec): a capture whose boot never reached the desktop, or a card staged without a
+# list, carries no summary; a `tests bootlist` probe FAIL is red wherever it lands.
+OPTIONAL :: BOOTLIST: ran=[0-9]+ pass=[0-9]+ fail=[0-9]+ skip=[0-9]+ heavy=
+FORBID :: BOOTLIST: .* -> FAIL ::
 
 # ── CONTRACT (SPECRUN, 2026-09-15) ──────────────────────────────────────────────────────────────
 # A PINNED LINE IN THIS FILE IS CHANGED TOGETHER WITH THE KERNEL LINE IT PINS, IN THE SAME COMMIT —

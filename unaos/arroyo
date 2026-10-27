@@ -2,7 +2,7 @@
 # ARROYO: The Stream that Feeds the River
 # "Ad Astra Per Aspera"
 #
-# Usage:   (BOOTLIST B817: `esp-x86` also stages unaos/fixtures/TESTS.LIST and TESTS.HEAVY onto the ESP when present — the list the kernel runs at [desktop] built)
+# Usage:   (BOOTLIST B817/B874: `esp-x86`, `esp-arm`, `esp-jetson[-img]` and `kernel8` stage unaos/fixtures/TESTS.LIST and TESTS.HEAVY onto the boot FAT when present — `bootlist_stage`, before each verb's card image; the list the kernel runs at [desktop] built)
 #   ./arroyo              Interactive menu
 #   ./arroyo x86           Build & boot x86_64 (GUI window + serial on stdio)
 #   ./arroyo arm           Build & boot aarch64
@@ -10010,7 +10010,7 @@ esp_x86() {
     echo -e "               data tree -> the USB stick, or \`bg /apps/VUG.ELF\` reports -ENOENT."
     echo -e "   Probe after boot: \`cat hello.txt\` must say 'DATA volume' — if it says anything else,"
     echo -e "               the kernel is reading a stick you did not stage."
-    if [ -n "${UNAOS_UNAFS:-}" ]; then esp_x86_unafs_card || exit $?; fi   # UNAFSX86 M3
+    bootlist_stage "${WORKSPACE_DIR}/target/x86_64_esp"; if [ -n "${UNAOS_UNAFS:-}" ]; then esp_x86_unafs_card || exit $?; fi   # UNAFSX86 M3. BOOTLISTARM (B874): the list is staged BEFORE una-card lays p1 from this tree (B817's dispatch-arm copy ran after it)
 }
 
 # VMIMAGE-1: emit ONE self-contained, distributable bootable disk image — a GPT disk with a FAT32
@@ -10618,11 +10618,28 @@ banner_cert_arm() {   # banner_cert_arm <artifact>
     bash "${WORKSPACE_DIR}/scripts/banner-cert.sh" "$1" "$_bc_feats" || exit $?
 }
 
+# BOOTLISTARM (rmbp-ledger B874, R132): ONE staging fn for the list every media verb carries — `esp-x86`, `esp-arm`,
+# `esp-jetson[-img]`, `kernel8`. It copies unaos/fixtures/TESTS.LIST (and TESTS.HEAVY) VERBATIM into the boot FAT tree:
+# one list for every board; a line's `@<board>` tags (rmbp12 / pi4 / orin = the kernel's `boot::OLDEST`) are filtered by
+# the kernel's `bootlist::parse`, so a card copy edited by hand reads the same everywhere (grammar: PLAYBOOK §4 item 7).
+# Each verb calls it BEFORE its card image is built from the tree. It stages only when a MEDIA dispatch arm set
+# `_BOOTLIST_MEDIA=1` (a shell variable, not a UNAOS_ knob): the QEMU lanes that reuse these fns (test_fat, test_selfhost,
+# fat_img, run_kernel8, test_kernel8, install_pi) never carry a list.
+bootlist_stage() {
+    [ "${_BOOTLIST_MEDIA:-}" = "1" ] || return 0
+    local dir="$1" _bl
+    for _bl in TESTS.LIST TESTS.HEAVY; do
+        if [ -f "${WORKSPACE_DIR}/fixtures/${_bl}" ]; then
+            cp "${WORKSPACE_DIR}/fixtures/${_bl}" "${dir}/${_bl}" && echo "   BOOTLIST (B817/B874): staged ${_bl} onto ${dir#${WORKSPACE_DIR}/} (the kernel runs it at [desktop] built; @board lines filtered there)"
+        fi
+    done
+}
+
 esp_arm() {
     prepare_aarch64
     # BANNERCERT2: the ELF the aarch64 firmware loads, certified before the media is announced.
     banner_cert_arm "${ESP_DIR_ARM}/kernel.elf"
-    pack_source_along "$ESP_DIR_ARM"
+    bootlist_stage "$ESP_DIR_ARM"; pack_source_along "$ESP_DIR_ARM"   # BOOTLISTARM (B874): the list, before the tree is packed or carded
     echo -e "${COLOR_GREEN}✅ aarch64 ESP: ${ESP_DIR_ARM}${COLOR_RESET}"
     echo -e "   kernel.elf sha256: $(sha256_of "${ESP_DIR_ARM}/kernel.elf")"
     [ -f "${ESP_DIR_ARM}/SRC.TGZ" ] && echo -e "   SRC.TGZ    sha256: $(sha256_of "${ESP_DIR_ARM}/SRC.TGZ")"
@@ -10850,7 +10867,7 @@ esp_jetson() {
     # `jetson_card_image` below can only ever copy an ELF that has already answered for its banner.
     banner_cert_arm "${ESP_DIR_ARM}/kernel.elf"
     stage_jetson_el0_images
-    pack_source_along "$ESP_DIR_ARM"
+    bootlist_stage "$ESP_DIR_ARM"; pack_source_along "$ESP_DIR_ARM"   # BOOTLISTARM (B874): the list, before the tree is packed or carded
     echo -e "${COLOR_GREEN}✅ Jetson ESP (tegra): ${ESP_DIR_ARM}${COLOR_RESET}"
     [ -f "${ESP_DIR_ARM}/SRC.TGZ" ] && echo -e "   SRC.TGZ sha256: $(sha256_of "${ESP_DIR_ARM}/SRC.TGZ")"
     cat <<EOF
@@ -12825,7 +12842,7 @@ kernel8() {
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/K3HELLO.TXT" / -i "$UNAFS_K3_IMG"
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/K3PAT.BIN" / -i "$UNAFS_K3_IMG"
 
-    bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 128 "$UNAFS_K3_IMG"
+    bootlist_stage "$KERNEL8_DIR"; bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 128 "$UNAFS_K3_IMG"
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
     # BUILD-2: release the coarse build lock now that the image is complete — any QEMU phase that
     # follows (kernel8-test / -run / install) uses per-run ports/logs and may overlap other runs.
@@ -14631,16 +14648,16 @@ case "${1:-}" in
         build_both
         ;;
     esp-x86|esp_x86)
-        esp_x86; for _bl in TESTS.LIST TESTS.HEAVY; do if [ -f "${WORKSPACE_DIR}/fixtures/${_bl}" ]; then cp "${WORKSPACE_DIR}/fixtures/${_bl}" "${WORKSPACE_DIR}/target/x86_64_esp/${_bl}" && echo "   BOOTLIST (B817): staged ${_bl} onto the ESP (the kernel runs it at [desktop] built)"; fi; done   # BOOTLIST (rmbp-ledger B817, R132): the media verb only — the QEMU lanes never stage a list (the builder wipes target/x86_64_esp each run)
+        _BOOTLIST_MEDIA=1 esp_x86   # BOOTLIST (B817, R132) / BOOTLISTARM (B874): the media verb only arms `bootlist_stage` (inside esp_x86, before the card) — the QEMU lanes never stage a list
         ;;
     esp-arm|esp_arm)
-        esp_arm
+        _BOOTLIST_MEDIA=1 esp_arm   # BOOTLISTARM (B874): the media verb arms the list
         ;;
     esp-jetson|esp_jetson|jetson)
-        esp_jetson
+        _BOOTLIST_MEDIA=1 esp_jetson   # BOOTLISTARM (B874)
         ;;
     esp-jetson-img|esp_jetson_img|jetson-img)
-        esp_jetson_img
+        _BOOTLIST_MEDIA=1 esp_jetson_img   # BOOTLISTARM (B874)
         ;;
     selfup-pak|selfup_pak)
         selfup_pak "${2:-}" "${3:-}"
@@ -14683,7 +14700,7 @@ case "${1:-}" in
         test_splash "${2:-120}"
         ;;
     kernel8|baremetal)
-        kernel8
+        _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do
         ;;
     kernel8-run|run-pi)
         run_kernel8
