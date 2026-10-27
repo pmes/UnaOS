@@ -1255,16 +1255,7 @@ pub fn op_open_version(path: &str, seq: u64) -> Result<String, String> {
         _ => alloc::format!("{} (version {})", name, seq),
     };
     let dst = join(&dir, &copy);
-    if exists(&t, &dst) {
-        t.unlink(&dst, P).map_err(err_s)?;
-    }
-    t.create(&dst, NodeKind::File, P).map_err(err_s)?;
-    let mut off = 0usize;
-    while off < bytes.len() {
-        let end = (off + COPY_CHUNK).min(bytes.len());
-        t.write(&dst, off as u64, &bytes[off..end], P).map_err(err_s)?;
-        off = end;
-    }
+    t.put_file(&dst, &bytes, P).map_err(err_s)?; // VFSPUTSWEEP (B983)
     Ok(dst)
 }
 

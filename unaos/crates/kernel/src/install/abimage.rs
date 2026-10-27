@@ -91,10 +91,7 @@ fn put(mt: &MountTable, name: &str, bytes: &[u8]) -> Result<(), &'static str> {
     } else {
         mt.create(&p, NodeKind::File, KERNEL_PRINCIPAL).map_err(|_| "create")?;
     }
-    match mt.write(&p, 0, bytes, KERNEL_PRINCIPAL) {
-        Ok(n) if n == bytes.len() => Ok(()),
-        _ => Err("write"),
-    }
+    mt.write_all_at(&p, 0, bytes, KERNEL_PRINCIPAL).map(|_| ()).map_err(|_| "write") // VFSPUTSWEEP (B983)
 }
 
 fn drop_file(mt: &MountTable, name: &str) -> Result<(), &'static str> {
