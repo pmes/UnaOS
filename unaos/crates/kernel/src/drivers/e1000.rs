@@ -304,13 +304,13 @@ impl E1000 {
     }
 
     /// Allocate the RX descriptor ring + contiguous packet buffers and point each
-    /// descriptor at its buffer. The `alloc_zeroed` pointer doubles as the physical
-    /// address (identity map), matching the xHCI ring allocation.
+    /// descriptor at its buffer. The `arch::memory::dma::ident` address doubles as the bus
+    /// address (identity map), the one DMA allocator the xHCI rings use (DMAALLOCXHCI B988).
     fn alloc_rx(&mut self) {
         let ring_layout = Layout::from_size_align(NUM_RX * core::mem::size_of::<RxDesc>(), 4096).unwrap();
         let buf_layout = Layout::from_size_align(NUM_RX * RX_BUF_SIZE, 4096).unwrap();
-        self.rx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut RxDesc };
-        self.rx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
+        self.rx_ring = crate::arch::memory::dma::ident(ring_layout.size(), ring_layout.align()) as *mut RxDesc;
+        self.rx_buffers = crate::arch::memory::dma::ident(buf_layout.size(), buf_layout.align()) as *mut u8;
 
         for i in 0..NUM_RX {
             let buf_phys = (self.rx_buffers as u64) + (i * RX_BUF_SIZE) as u64;
@@ -331,8 +331,8 @@ impl E1000 {
     fn alloc_tx(&mut self) {
         let ring_layout = Layout::from_size_align(NUM_TX * core::mem::size_of::<TxDesc>(), 4096).unwrap();
         let buf_layout = Layout::from_size_align(NUM_TX * TX_BUF_SIZE, 4096).unwrap();
-        self.tx_ring = unsafe { alloc::alloc::alloc_zeroed(ring_layout) as *mut TxDesc };
-        self.tx_buffers = unsafe { alloc::alloc::alloc_zeroed(buf_layout) };
+        self.tx_ring = crate::arch::memory::dma::ident(ring_layout.size(), ring_layout.align()) as *mut TxDesc;
+        self.tx_buffers = crate::arch::memory::dma::ident(buf_layout.size(), buf_layout.align()) as *mut u8;
 
         for i in 0..NUM_TX {
             let desc = TxDesc {

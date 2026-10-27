@@ -1,9 +1,9 @@
-//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
+//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
 //! MT7925 — S1, the probe (ZENBOOKMT7925, zenbook-ledger Z5). The ladder is
-//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11) and S3 (MT7925S3, Z15) are the two file-tail blocks; S4..S10 are owed there by name.
+//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15) and S4 (MT7925S4, Z17) are the three file-tail blocks; S5..S10 are owed there by name.
 //!
 //! WHAT THIS RUNG DOES. Once per boot, from the three storage-ready passes in `main.rs` (beside `wifi::service()`,
 //! the same forward-only polled shape), and only after `boot::services_gate("wifi")` answers (R86, BP-net-4):
@@ -88,6 +88,7 @@ pub fn service() {
         S_WAIT_VOL => wait_vol(),
         S_S2 => s2(),
         S_S3 => s3(),
+        S_S4 => s4(), // MT7925S4 (zenbook-ledger Z17): the pass after a clean S3 line (`s3_done`)
         _ => {}
     }
 }
@@ -184,35 +185,17 @@ fn hex32(d: &[u8; 32]) -> String {
 /// as a digest to pin, not a silence.
 fn fw_check() -> Fw {
     let mut out = Fw { word: String::from("absent"), sha: ["-", "-"] };
-    let Ok(fs) = crate::fs::fat::mount_program_source() else {
-        out.word = String::from("no-esp");
-        return out;
+    let (fs, ents) = match fw_dir() {
+        Ok(d) => d,
+        Err(w) => {
+            out.word = String::from(w);
+            return out;
+        }
     };
-    let Ok(root) = fs.read_root() else {
-        out.word = String::from("no-esp");
-        return out;
-    };
-    let Some(d0) = sub(&fs, &root, DIR0) else { return out };
-    let Some(ents) = sub(&fs, &d0, DIR1) else { return out };
     let mut present = 0usize;
     for (i, (role, file)) in SET.iter().enumerate() {
-        let Some(de) = ents.iter().find(|e| !e.is_dir && name_is(e, file)) else { continue };
+        let Some((verdict, hex, size, _)) = fw_read(&fs, &ents, i) else { continue };
         present += 1;
-        let size = de.size as usize;
-        let mut buf = Vec::new();
-        let (verdict, hex): (&'static str, String) = if size > MAX_FILE {
-            ("too-large", String::from("-"))
-        } else if fs.read_file(de, &mut buf, MAX_FILE).is_err() || buf.len() != size {
-            ("unreadable", String::from("-"))
-        } else {
-            let sha = crypto_core::sha2::sha256(&buf);
-            let hex = hex32(&sha);
-            match crate::hash::pins::pin_for(PINS, role) { // FWSTAGEONE (rmbp-ledger B984): the one pins reader
-                None => ("unpinned", hex),
-                Some(p) if p == sha => ("ok", hex),
-                Some(_) => ("mismatch", hex),
-            }
-        };
         out.sha[i] = match verdict {
             "ok" | "mismatch" | "unpinned" => verdict,
             _ => "-",
@@ -226,6 +209,40 @@ fn fw_check() -> Fw {
         out.word = alloc::format!("present:{}", present);
     }
     out
+}
+
+/// The program-source FAT mounted and `FW/MT7925/` listed (MT7925S4, Z17, hoisted out of `fw_check` so S1 and S4 share
+/// ONE reader). Err = the `fw=` word: `no-esp` (no mount or no root) or `absent` (no FW/MT7925 directory).
+fn fw_dir() -> Result<(crate::fs::fat::FatFs, Vec<crate::fs::fat::DirEntry>), &'static str> {
+    let fs = crate::fs::fat::mount_program_source().map_err(|_| "no-esp")?;
+    let root = fs.read_root().map_err(|_| "no-esp")?;
+    let d0 = sub(&fs, &root, DIR0).ok_or("absent")?;
+    let ents = sub(&fs, &d0, DIR1).ok_or("absent")?;
+    Ok((fs, ents))
+}
+
+/// Member `i` of SET read whole and digested against its pin (MT7925S4 hoisted it out of `fw_check`; S1 reads the
+/// verdict, S4 uploads the bytes only when it is `ok`). None = not on the volume; else (verdict, sha256 hex or `-`,
+/// directory size, the bytes read).
+fn fw_read(fs: &crate::fs::fat::FatFs, ents: &[crate::fs::fat::DirEntry], i: usize) -> Option<(&'static str, String, usize, Vec<u8>)> {
+    let (role, file) = SET[i];
+    let de = ents.iter().find(|e| !e.is_dir && name_is(e, file))?;
+    let size = de.size as usize;
+    let mut buf = Vec::new();
+    let (verdict, hex): (&'static str, String) = if size > MAX_FILE {
+        ("too-large", String::from("-"))
+    } else if fs.read_file(de, &mut buf, MAX_FILE).is_err() || buf.len() != size {
+        ("unreadable", String::from("-"))
+    } else {
+        let sha = crypto_core::sha2::sha256(&buf);
+        let hex = hex32(&sha);
+        match crate::hash::pins::pin_for(PINS, role) { // FWSTAGEONE (rmbp-ledger B984): the one pins reader
+            None => ("unpinned", hex),
+            Some(p) if p == sha => ("ok", hex),
+            Some(_) => ("mismatch", hex),
+        }
+    };
+    Some((verdict, hex, size, buf))
 }
 
 fn say(p: &Probe, fw: &Fw) {
@@ -524,10 +541,7 @@ fn s3() {
     }
     let mut rb = true;
     for (q, pa) in [(b + TX_RING_BASE + TXQ_FWDL * RING_REGS, tx), (b + RX_EVENT_RING_BASE + RXQ_MCU * RING_REGS, rx)] {
-        w32(q, pa as u32); // base
-        w32(q + 4, RING_DEPTH); // count
-        w32(q + 8, 0); // CPU index: no TX posted, no RX buffer handed
-        rb &= r32(q) == pa as u32 && r32(q + 4) == RING_DEPTH;
+        rb &= arm(q, pa, 0); // CPU index 0: no TX posted, no RX buffer handed (MT7925S4 hoisted the body into `arm`)
     }
     let glo = dma_on(b);
     let rel = give_back(lp, took);
@@ -535,6 +549,16 @@ fn s3() {
         "[mt7925] s3 wfdma tx={:#x} rx={:#x} cnt={} rb={} glo={:#010x} rel={} -> parked",
         tx, rx, RING_DEPTH, if rb { "ok" } else { "bad" }, glo, rel
     );
+    s3_done(tx, rx, rb, glo, rel); // MT7925S4 (Z17): the rings recorded, S4 on the next pass only after a clean S3 line
+}
+
+/// One ring's four-register arm (MT7925S4 hoisted it out of `s3`'s loop; S3 calls it with CPU index 0, S4 for rings 16, 15
+/// and 0): base, count, CPU index, then base and count read back. True when both read back as written.
+fn arm(q: u64, pa: u64, cidx: u32) -> bool {
+    w32(q, pa as u32); // base
+    w32(q + 4, RING_DEPTH); // count
+    w32(q + 8, cidx); // CPU index
+    r32(q) == pa as u32 && r32(q + 4) == RING_DEPTH
 }
 
 /// A BAR0 register read; only on pages `map_page` proved present this boot (S2's, S3's).
@@ -597,11 +621,11 @@ fn dma_off(b: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// One ring's descriptors: zeroed, page-aligned, heap address = bus address (the identity map, nvme.rs `dma_alloc`'s
-/// standing property), every ctrl word DMA_DONE (linux's queue reset, dma.c:209-211). 0 on failure. Never freed: the
-/// device holds the base while GLO_CFG's EN bits are set (the one shared allocator, DMAALLOCONE B986).
+/// One ring's descriptors: zeroed, page-aligned, below 4 GiB, heap address = bus address, every ctrl word DMA_DONE
+/// (linux's queue reset, dma.c:209-211). 0 on failure, a ring past 4 GiB included (DMAALLOCXHCI B988: the allocator
+/// refuses it, so S3 says `no-memory` and its `dma-high` arm is unreachable). Never freed (DMAALLOCONE B986).
 fn ring() -> u64 {
-    let p = crate::arch::memory::dma::ident(RING_BYTES, 4096);
+    let p = crate::arch::memory::dma::alloc(RING_BYTES, 4096, true).filter(|b| b.pa == b.va).map_or(0, |b| b.va);
     if p != 0 {
         for i in 0..RING_DEPTH as u64 {
             // SAFETY: inside the RING_BYTES block just allocated; descriptor i's ctrl word at +4.
@@ -637,4 +661,445 @@ fn give_back(lp: u64, took: bool) -> &'static str {
     } else {
         "timeout"
     }
+}
+
+// ── MT7925S4 (zenbook-ledger Z17) — S4: the patch and the RAM code uploaded over the MCU, the N9 started ──────────────
+// Once, on the storage-ready pass after a clean S3 line (`s3_done` hands to S_S4 only when S3's ring read-backs held, the
+// ownership went back and WFDMA0 read back enabled). Linux's `mt7925e_mcu_init` / `mt792x_load_firmware`: take driver-own
+// again, re-arm the rings (FWDL 16, the MCU command ring WM 15, the event ring 0 with buffers), enable the DMA, then
+// patch (semaphore, per-section init_download + raw scatter, finish, release) and RAM code (per-region init_download +
+// scatter, FW_START) and poll N9 ready. Commands ride ring 15 with the legacy 64-byte MCU TXD; the scatter chunks ride
+// ring 16 raw and unacked (each is waited on by its TX completion); events are read from ring 0. PCI bus master goes ON
+// (the ONE config write) and is put back unless FW_START was acked AND N9 reads ready. Hardware facts only; no code copied.
+
+const S_S4: u8 = 6;
+/// The ring-16 and ring-0 descriptor memory S3 allocated: written once by `s3_done`, read once by `s4`.
+static S4_TX16: AtomicU64 = AtomicU64::new(0);
+static S4_RX0: AtomicU64 = AtomicU64::new(0);
+
+/// MT7925_TXQ_MCU_WM = 15 (mt7925.h:92).
+const TXQ_WM: u64 = 15;
+/// MT_PCIE_MAC_PM (BAR0+0x10194) and its L0S_DIS bit (pci_mcu.c:45).
+const PCIE_MAC_PM: u64 = 0x1_0194;
+const PM_L0S_DIS: u32 = 1 << 8;
+/// MCU command ids (mt76_connac_mcu.h).
+const CID_TARGET_ADDR: u8 = 0x01;
+const CID_FW_START: u8 = 0x02;
+const CID_PATCH_START: u8 = 0x05;
+const CID_PATCH_FINISH: u8 = 0x07;
+const CID_SEM: u8 = 0x10;
+/// PATCH_SEM_CONTROL operations and answers.
+const SEM_GET: u32 = 1;
+const SEM_RELEASE: u32 = 0;
+const SEM_IS_DL: u8 = 1;
+const SEM_GOT: u8 = 2;
+const SEM_RELEASED: u8 = 3;
+/// Download mode bits (DL_MODE_*, DL_CONFIG_ENCRY_MODE_SEL).
+const DL_ENCRYPT: u32 = 1 << 0;
+const DL_KEY_IDX: u32 = 0x6;
+const DL_RESET_SEC_IV: u32 = 1 << 3;
+const DL_ENCRY_MODE_SEL: u32 = 1 << 6;
+const DL_NEED_RSP: u32 = 1 << 31;
+/// RAM region feature bits (FW_FEATURE_*).
+const FEAT_ENCRYPT: u32 = 1 << 0;
+const FEAT_ENCRY_MODE: u32 = 1 << 4;
+const FEAT_OVERRIDE_ADDR: u32 = 1 << 5;
+const FEAT_NON_DL: u32 = 1 << 6;
+/// Patch image: 96-byte header (n_region BE at +0x2c), 64-byte sections; RAM image: 36-byte trailer, 40-byte regions.
+const PATCH_HDR: usize = 96;
+const PATCH_SEC: usize = 64;
+const RAM_TRAILER: usize = 36;
+const RAM_REGION: usize = 40;
+const MAX_REGIONS: usize = 16;
+/// The command TXD (connac2 mcu_txd): 64 bytes, payload after it.
+const TXD_BYTES: usize = 64;
+/// TX descriptor ctrl: LAST_SEC0 (bit 30); SD_LEN0 sits in bits 29:16.
+const LAST_SEC0: u32 = 1 << 30;
+/// Event ring: 31 buffers of 2048 bytes in one 64 KiB block (the 32nd descriptor stays DMA_DONE: a full ring).
+const RX_BUFS: u32 = 31;
+const RX_BUF_BYTES: u64 = 2048;
+const RX_BLOCK: usize = 65536;
+/// FW_SCATTER chunk size; waits: an acked command's event, one chunk's TX completion, N9 ready after FW_START.
+const CHUNK: usize = 4096;
+const EVENT_MS: u64 = 3000;
+const TXDONE_MS: u64 = 100;
+const N9_MS: u64 = 2000;
+
+/// The device-facing state of one S4 run; owned by `s4`'s stack frame, no lock.
+struct Hw {
+    q16: u64,
+    q15: u64,
+    /// Ring 0's descriptor memory, the command page, the event-buffer block.
+    rx0: u64,
+    page: u64,
+    rxb: u64,
+    /// CPU indices of rings 16 and 15, the next event descriptor, the last command sequence (1..15).
+    fi: u32,
+    wi: u32,
+    ri: u32,
+    seq: u8,
+}
+
+/// What `s4` says at the end.
+struct Rep {
+    held: &'static str,
+    patch: String,
+    ram: usize,
+    sent: bool,
+    fw_start: &'static str,
+    n9: &'static str,
+    saved: Option<u16>,
+}
+
+/// S3 calls this at its end: record the two ring addresses and hand to S4 only on a clean S3 line.
+fn s3_done(tx: u64, rx: u64, rb: bool, glo: u32, rel: &str) {
+    if rb && rel != "timeout" && glo & (GLO_TX_EN | GLO_RX_EN) == (GLO_TX_EN | GLO_RX_EN) {
+        S4_TX16.store(tx, Ordering::Relaxed);
+        S4_RX0.store(rx, Ordering::Relaxed);
+        STATE.store(S_S4, Ordering::Relaxed);
+    }
+}
+
+fn be32(d: &[u8], o: usize) -> Option<u32> {
+    let s = d.get(o..o.checked_add(4)?)?;
+    Some(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+fn le32(d: &[u8], o: usize) -> Option<u32> {
+    let s = d.get(o..o.checked_add(4)?)?;
+    Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+/// True when every byte of `v` lies below 4 GiB (the identity-mapped heap address is the bus address).
+fn low(v: &[u8]) -> bool {
+    (v.as_ptr() as u64).checked_add(v.len() as u64).map_or(false, |e| e <= DMA_LIMIT)
+}
+
+/// `why` for a failed acked command: a full event ring keeps its own word, anything else the step's word.
+fn why_of(e: &'static str, w: String) -> String {
+    if e == "rx-full" { String::from(e) } else { w }
+}
+
+fn s4() {
+    STATE.store(S_PARKED, Ordering::Relaxed);
+    let held = *PROBE.lock();
+    let Some(p) = held else { return };
+    let b = p.bar0;
+    let lp = b + CONN_HOST_CSR_TOP + LPCTL;
+    let mapped = map_page(b + WFDMA0) && map_page(b + (DMASHDL_SW_CONTROL & !0xfff)) && map_page(b + (PCIE_MAC_PM & !0xfff));
+    if !mapped {
+        serial_println!("[mt7925] s4 -> NOT ATTEMPTED why=unmapped bm=off rel=found");
+        return;
+    }
+    let took = r32(lp) & OWN_SYNC != 0;
+    if took {
+        let (ok, last, _) = own(lp, CLR_OWN, false);
+        if !ok {
+            let rel = if own(lp, SET_OWN, true).0 { "fw" } else { "timeout" };
+            serial_println!("[mt7925] s4 -> NOT ATTEMPTED why=own lpctl={:#010x} bm=off rel={}", last, rel);
+            return;
+        }
+    }
+    // The firmware bytes live in this frame: dropped only after every descriptor completed or bus master is back off.
+    let mut hold: Vec<u8> = Vec::new();
+    let mut rep = Rep { held: "lost", patch: String::from("-"), ram: 0, sent: false, fw_start: "-", n9: "-", saved: None };
+    let res = s4_run(&p, &mut hold, &mut rep);
+    let keep = res.is_ok() && rep.sent && rep.fw_start == "ok" && rep.n9 == "ready";
+    let bm = match rep.saved {
+        None => "off",
+        Some(_) if keep => "on",
+        Some(saved) => {
+            // SAFETY: the one restore write, the COMMAND word read before bus master went on, to the function the walk recorded.
+            unsafe { crate::arch::pci::write_config_16(p.bus, p.dev, p.func, PCI_COMMAND, saved) };
+            "restored"
+        }
+    };
+    let rel = give_back(lp, took);
+    if rep.sent {
+        serial_println!(
+            "[mt7925] s4 held={} patch={} ram={} fw_start={} n9={} bm={} rel={} -> parked",
+            rep.held, rep.patch, rep.ram, rep.fw_start, rep.n9, bm, rel
+        );
+    } else {
+        let why = match res {
+            Err(w) => w,
+            Ok(()) => String::from("?"),
+        };
+        serial_println!("[mt7925] s4 -> NOT ATTEMPTED why={} bm={} rel={}", why, bm, rel);
+    }
+    drop(hold);
+}
+
+/// Everything between driver-own and give-back. Err = the `why=` word; `rep` carries what was learned either way.
+fn s4_run(p: &Probe, hold: &mut Vec<u8>, rep: &mut Rep) -> Result<(), String> {
+    let b = p.bar0;
+    let (tx16, rx0) = (S4_TX16.load(Ordering::Relaxed), S4_RX0.load(Ordering::Relaxed));
+    let q16 = b + TX_RING_BASE + TXQ_FWDL * RING_REGS;
+    let q15 = b + TX_RING_BASE + TXQ_WM * RING_REGS;
+    let q0 = b + RX_EVENT_RING_BASE + RXQ_MCU * RING_REGS;
+    rep.held = if r32(q16) as u64 == tx16 && r32(q0) as u64 == rx0 { "kept" } else { "lost" };
+    let pm = b + PCIE_MAC_PM;
+    w32(pm, r32(pm) | PM_L0S_DIS);
+    let (fs, ents) = fw_dir().map_err(|_| String::from("no-fw"))?;
+    let patch_bytes = match fw_read(&fs, &ents, 0) {
+        Some(("ok", _, _, v)) => v,
+        _ => return Err(String::from("no-fw")),
+    };
+    let wm = ring();
+    let page = crate::arch::memory::dma::ident(4096, 4096);
+    let rxb = crate::arch::memory::dma::ident(RX_BLOCK, 4096);
+    if wm == 0 || page == 0 || rxb == 0 || tx16 == 0 || rx0 == 0 {
+        return Err(String::from("no-memory"));
+    }
+    if wm + RING_BYTES as u64 > DMA_LIMIT || page + 4096 > DMA_LIMIT || rxb + RX_BLOCK as u64 > DMA_LIMIT || !low(&patch_bytes) {
+        return Err(String::from("dma-high"));
+    }
+    *hold = patch_bytes;
+    dma_off(b)?;
+    for i in 0..RX_BUFS as u64 {
+        let d = rx0 + i * DESC_BYTES;
+        // SAFETY: descriptor i of ring 0's block (RING_BYTES, 32 descriptors, i < 31); the buffer is inside the 64 KiB block.
+        unsafe {
+            core::ptr::write_volatile(d as *mut u32, (rxb + i * RX_BUF_BYTES) as u32);
+            core::ptr::write_volatile((d + 4) as *mut u32, (RX_BUF_BYTES as u32) << 16); // DMA_DONE clear: handed to the device
+        }
+    }
+    let mut rb = arm(q16, tx16, 0);
+    rb &= arm(q15, wm, 0);
+    rb &= arm(q0, rx0, RX_BUFS);
+    let glo = dma_on(b);
+    if !rb || glo & (GLO_TX_EN | GLO_RX_EN) != (GLO_TX_EN | GLO_RX_EN) {
+        return Err(String::from("rb"));
+    }
+    // SAFETY: a config-space read of the function the boot's walk recorded.
+    let saved = unsafe { crate::arch::pci::read_config_16(p.bus, p.dev, p.func, PCI_COMMAND) };
+    crate::drivers::pci::PciScanner::enable_bus_master(p.bus, p.dev, p.func); // the ONE config write
+    rep.saved = Some(saved);
+    let mut h = Hw { q16, q15, rx0, page, rxb, fi: 0, wi: 0, ri: 0, seq: 0 };
+    let sem = cmd(&mut h, CID_SEM, &SEM_GET.to_le_bytes()).map_err(|e| why_of(e, String::from("sem")))?;
+    match sem {
+        SEM_IS_DL => rep.patch = String::from("resident"),
+        SEM_GOT => {
+            patch(&mut h, hold)?;
+            rep.patch = alloc::format!("{}", hold.len());
+        }
+        _ => return Err(String::from("sem")),
+    }
+    let ram_bytes = match fw_read(&fs, &ents, 1) {
+        Some(("ok", _, _, v)) => v,
+        _ => return Err(String::from("no-fw")),
+    };
+    if !low(&ram_bytes) {
+        return Err(String::from("dma-high"));
+    }
+    *hold = ram_bytes; // the patch's transfers are complete: its bytes go
+    rep.ram = hold.len();
+    let (option, addr) = ram(&mut h, hold)?;
+    rep.sent = true;
+    let mut pl = [0u8; 8];
+    pl[0..4].copy_from_slice(&option.to_le_bytes());
+    pl[4..8].copy_from_slice(&addr.to_le_bytes());
+    rep.fw_start = if cmd(&mut h, CID_FW_START, &pl).is_ok() { "ok" } else { "timeout" };
+    let misc = b + CONN_HOST_CSR_TOP + CONN_ON_MISC;
+    let (ready, _) = spin_until(N9_MS, || r32(misc) & FW_N9_RDY == FW_N9_RDY);
+    rep.n9 = if ready { "ready" } else { "timeout" };
+    Ok(())
+}
+
+/// One TX descriptor posted on a ring: buffer, length, LAST_SEC0, DMA_DONE clear, a fence, then the CPU index. Returns
+/// the new CPU index. The ring's base is read back from its own base register.
+fn post(q: u64, idx: u32, pa: u64, len: u32) -> u32 {
+    let d = r32(q) as u64 + idx as u64 * DESC_BYTES;
+    // SAFETY: descriptor `idx` (< RING_DEPTH) of a ring `arm` programmed and read back; the buffer is the caller's.
+    unsafe {
+        core::ptr::write_volatile(d as *mut u32, pa as u32);
+        core::ptr::write_volatile((d + 8) as *mut u32, 0);
+        core::ptr::write_volatile((d + 12) as *mut u32, 0);
+        core::ptr::write_volatile((d + 4) as *mut u32, (len << 16) | LAST_SEC0);
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let next = (idx + 1) % RING_DEPTH;
+    w32(q + 8, next);
+    next
+}
+
+/// The ring's DMA index caught up with the CPU index: everything posted was fetched. Bounded TXDONE_MS.
+fn tx_done(q: u64, next: u32) -> bool {
+    spin_until(TXDONE_MS, || r32(q + 12) & 0xfff == next).0
+}
+
+/// One acked MCU command: the connac2 TXD built in the command page, posted on ring 15, its TX completion awaited, then
+/// the event with this sequence. Ok = the event's status byte (@40).
+fn cmd(h: &mut Hw, cid: u8, payload: &[u8]) -> Result<u8, &'static str> {
+    let total = TXD_BYTES + payload.len();
+    h.seq = if h.seq >= 15 { 1 } else { h.seq + 1 };
+    let seq = h.seq;
+    let pg = h.page;
+    // SAFETY: the 4 KiB command page (total <= 4096: payloads are at most 12 bytes), owned by this run, one command at a time.
+    unsafe {
+        core::ptr::write_bytes(pg as *mut u8, 0, TXD_BYTES + 16);
+        core::ptr::write_volatile(pg as *mut u32, total as u32 | (2 << 23) | (0x20 << 25)); // TX_BYTES | PKT_FMT=CMD | Q_IDX
+        core::ptr::write_volatile((pg + 4) as *mut u32, 1 << 14); // HDR_FORMAT=CMD
+        core::ptr::write_volatile((pg + 32) as *mut u16, (total - 32) as u16);
+        core::ptr::write_volatile((pg + 34) as *mut u16, 0x8000); // pq_id
+        core::ptr::write_volatile((pg + 36) as *mut u8, cid);
+        core::ptr::write_volatile((pg + 37) as *mut u8, 0xa0); // pkt_type
+        core::ptr::write_volatile((pg + 38) as *mut u8, 3); // set_query: MCU_Q_NA
+        core::ptr::write_volatile((pg + 39) as *mut u8, seq);
+        for (i, v) in payload.iter().enumerate() {
+            core::ptr::write_volatile((pg + TXD_BYTES as u64 + i as u64) as *mut u8, *v);
+        }
+    }
+    let next = post(h.q15, h.wi, pg, total as u32);
+    h.wi = next;
+    if !tx_done(h.q15, next) {
+        return Err("tx");
+    }
+    event(h, seq)
+}
+
+/// The event ring: descriptor `ri` polled for DMA_DONE (the whole wait bounded EVENT_MS), its buffer's seq (@37) matched,
+/// status @40 returned; other events are skipped. No recycling: the 32nd event is the `rx-full` refusal.
+fn event(h: &mut Hw, seq: u8) -> Result<u8, &'static str> {
+    let t0 = crate::arch::ms();
+    loop {
+        if h.ri >= RX_BUFS {
+            return Err("rx-full");
+        }
+        let left = EVENT_MS.saturating_sub(crate::arch::ms().saturating_sub(t0));
+        if left == 0 {
+            return Err("event");
+        }
+        let d = h.rx0 + h.ri as u64 * DESC_BYTES;
+        // SAFETY: descriptor ri (< 31) of ring 0's block; a status read.
+        let (done, _) = spin_until(left, || unsafe { core::ptr::read_volatile((d + 4) as *const u32) } & DMA_DONE != 0);
+        if !done {
+            return Err("event");
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let buf = h.rxb + h.ri as u64 * RX_BUF_BYTES;
+        h.ri += 1;
+        // SAFETY: inside this descriptor's 2048-byte buffer, which the device has finished writing (DMA_DONE).
+        let (got, status) = unsafe { (core::ptr::read_volatile((buf + 37) as *const u8), core::ptr::read_volatile((buf + 40) as *const u8)) };
+        if got == seq {
+            return Ok(status);
+        }
+    }
+}
+
+/// FW_SCATTER: `bytes` in chunks of at most CHUNK raw on ring 16, each chunk's TX completion awaited (linux gets no
+/// event per chunk). Ok = chunks sent; Err = the index of the chunk that did not complete.
+fn scatter(h: &mut Hw, bytes: &[u8]) -> Result<usize, usize> {
+    let mut n = 0usize;
+    for c in bytes.chunks(CHUNK) {
+        let next = post(h.q16, h.fi, c.as_ptr() as u64, c.len() as u32);
+        h.fi = next;
+        if !tx_done(h.q16, next) {
+            return Err(n);
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// `mt76_connac_mcu_init_download`: {addr, len, mode} little-endian; the patch-start command for the three patch
+/// addresses the 7925 uses, target-address-len otherwise. Acked.
+fn init_download(h: &mut Hw, addr: u32, len: u32, mode: u32) -> Result<(), &'static str> {
+    let c = if addr == 0x20_0000 || addr == 0x90_0000 || addr == 0xe000_2800 { CID_PATCH_START } else { CID_TARGET_ADDR };
+    let mut pl = [0u8; 12];
+    pl[0..4].copy_from_slice(&addr.to_le_bytes());
+    pl[4..8].copy_from_slice(&len.to_le_bytes());
+    pl[8..12].copy_from_slice(&mode.to_le_bytes());
+    cmd(h, c, &pl).map(|_| ())
+}
+
+/// A patch section's download mode from its security word (`get_data_mode`).
+fn patch_mode(info: u32) -> u32 {
+    let mut m = DL_NEED_RSP;
+    if info == 0xffff_ffff {
+        return m;
+    }
+    match info >> 24 {
+        1 => m |= DL_ENCRYPT | ((info & 0xff) << 1 & DL_KEY_IDX) | DL_RESET_SEC_IV,
+        2 => m |= DL_ENCRYPT | DL_ENCRY_MODE_SEL | DL_RESET_SEC_IV,
+        _ => {}
+    }
+    m
+}
+
+/// A RAM region's download mode from its feature word (`gen_dl_mode`).
+fn ram_mode(f: u32) -> u32 {
+    let mut m = DL_NEED_RSP | (f & DL_KEY_IDX);
+    if f & FEAT_ENCRYPT != 0 {
+        m |= DL_ENCRYPT | DL_RESET_SEC_IV;
+    }
+    if f & FEAT_ENCRY_MODE != 0 {
+        m |= DL_ENCRY_MODE_SEL;
+    }
+    m
+}
+
+/// The patch: every section init_download + scatter, PATCH_FINISH (status 0), semaphore release (status 3).
+fn patch(h: &mut Hw, fw: &[u8]) -> Result<(), String> {
+    let hdr = || String::from("hdr");
+    let n = be32(fw, 0x2c).ok_or_else(hdr)? as usize;
+    if n == 0 || n > MAX_REGIONS {
+        return Err(hdr());
+    }
+    for i in 0..n {
+        let s = PATCH_HDR + PATCH_SEC * i;
+        let (Some(ty), Some(offs), Some(addr), Some(len), Some(info)) =
+            (be32(fw, s), be32(fw, s + 4), be32(fw, s + 12), be32(fw, s + 16), be32(fw, s + 20))
+        else {
+            return Err(hdr());
+        };
+        let (offs, len) = (offs as usize, len as usize);
+        let end = offs.checked_add(len).filter(|e| *e <= fw.len()).ok_or_else(hdr)?;
+        if ty & 0xffff != 2 {
+            return Err(hdr());
+        }
+        init_download(h, addr, len as u32, patch_mode(info)).map_err(|e| why_of(e, alloc::format!("dl at={}", i)))?;
+        scatter(h, &fw[offs..end]).map_err(|c| alloc::format!("scatter at={}", c))?;
+    }
+    match cmd(h, CID_PATCH_FINISH, &[0u8; 4]) {
+        Ok(0) => {}
+        Err(e) => return Err(why_of(e, String::from("finish"))),
+        Ok(_) => return Err(String::from("finish")),
+    }
+    match cmd(h, CID_SEM, &SEM_RELEASE.to_le_bytes()) {
+        Ok(SEM_RELEASED) => Ok(()),
+        Err(e) => Err(why_of(e, String::from("sem"))),
+        Ok(_) => Err(String::from("sem")),
+    }
+}
+
+/// The RAM code: every downloadable region init_download + scatter (the data offset accumulates every region's length,
+/// NON_DL ones included). Ok = FW_START's (option, override address).
+fn ram(h: &mut Hw, fw: &[u8]) -> Result<(u32, u32), String> {
+    let hdr = || String::from("hdr");
+    let t = fw.len().checked_sub(RAM_TRAILER).ok_or_else(hdr)?;
+    let n = *fw.get(t + 2).ok_or_else(hdr)? as usize;
+    if n == 0 || n > MAX_REGIONS || n * RAM_REGION > t {
+        return Err(hdr());
+    }
+    let data_end = t - n * RAM_REGION;
+    let mut off = 0usize;
+    let mut ov: Option<u32> = None;
+    for i in 0..n {
+        let r = t - RAM_REGION * (n - i);
+        let (Some(addr), Some(len), Some(feat)) = (le32(fw, r + 16), le32(fw, r + 20), le32(fw, r + 24)) else {
+            return Err(hdr());
+        };
+        let len = len as usize;
+        let end = off.checked_add(len).filter(|e| *e <= data_end).ok_or_else(hdr)?;
+        if feat & FEAT_NON_DL == 0 {
+            if feat & FEAT_OVERRIDE_ADDR != 0 {
+                ov = Some(addr);
+            }
+            init_download(h, addr, len as u32, ram_mode(feat)).map_err(|e| why_of(e, alloc::format!("dl at={}", i)))?;
+            scatter(h, &fw[off..end]).map_err(|c| alloc::format!("scatter at={}", c))?;
+        }
+        off = end;
+    }
+    Ok((ov.is_some() as u32, ov.unwrap_or(0)))
 }

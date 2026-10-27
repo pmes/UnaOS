@@ -1355,7 +1355,7 @@ impl XhciController {
         *EV_RING.lock() = Some(ring);
         if EV_BUF.load(Ordering::Relaxed) == 0 {
             let l = core::alloc::Layout::from_size_align(64, 64).unwrap();
-            let p = unsafe { alloc::alloc::alloc_zeroed(l) };
+            let p = crate::arch::memory::dma::ident(l.size(), l.align()) as *mut u8;
             if p.is_null() {
                 return false;
             }

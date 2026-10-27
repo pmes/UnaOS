@@ -10594,7 +10594,7 @@ test_zenbook() {
         exec env UNAOS_ZENBOOKLANE=1 UNAOS_PLATFORM=zenbook_um5606w UNAOS_CENSUS=1 UNAOS_USBSERIAL=1 "$0" test-zenbook "$secs"
     fi
     echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: the Zenbook line as zenbook_um5606w on a fresh card, the first-user form typed, then six typed verbs (${secs}s wall, spec ${X86_ZENBOOK_SPEC#${WORKSPACE_DIR}/})${COLOR_RESET}"
-    rm -f "${WORKSPACE_DIR}/target/sdcard.img"
+    rm -f "${WORKSPACE_DIR}/target/sdcard.img"; zenbook_bootlist_carry   # ZENBOOKLANELIST (Z19): the lane's own list, staged by the ONE stager, carried onto the ESP by the builder
     X86_TEST_SPEC="$X86_ZENBOOK_SPEC"
     build_selfbuild_x86() { echo "   ZENBOOKLANE: SELFBUILD staging not entered (build_selfbuild_x86 stubbed, as the twoboot arm does)"; }
     zenbook_lane_typed "$secs"   # ZENBOOKLANETYPED (Z16): the typist + test_x86_64; its rc is this verb's
@@ -10609,7 +10609,7 @@ zenbook_lane_typed() { # $1 = the wall (s)
     . "${WORKSPACE_DIR}/scripts/typist.sh"
     TYPIST_PORT="$zport" TYPIST_LOG="$SERIAL_LOG"
     local -a zph=("$FIRSTUSER_PHASE")
-    prev="[desktop] built at="
+    prev=":: BOOTLIST: ran="   # ZENBOOKLANELIST (Z19): held on the lane list's light summary (it runs at [desktop] built), so no typed `tests` meets a list fixture's RUNNING (`:: TESTS: already running — refused ::`)
     for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C bootlist:BOOTLIST; do
         local done_mark=":: ${v#*:}: "; [ "${v%%:*}" = bootlist ] && done_mark=":: BOOTLIST: probe"
         zph+=("${prev}|tests ${v%%:*}|t:tests spc t:${v%%:*} ret|${done_mark}")
@@ -10622,6 +10622,19 @@ zenbook_lane_typed() { # $1 = the wall (s)
     wait "$typist" 2>/dev/null || true
     awk '/^\[typist\]/ { print "ZENBOOKLANE:   " $0 }' "$tlog" 2>/dev/null || true
     return "$rc"
+}
+
+# ZENBOOKLANELIST (zenbook-ledger Z19): the lane's boot list. The builder re-creates target/x86_64_esp on every run
+# (builder/src/main.rs, the ESP wipe) and `bootlist_stage` arms only on the media verbs, so the lane read `list=absent`.
+# The ONE stager fills target/bootlist-carry from the LANE list (unaos/fixtures/lanes/zenbook/, not the flight list: its
+# ~70 untagged fixtures would not fit the wall and would refuse the typed verbs), and UNAOS_BOOTLIST_STAGE hands that dir
+# to the builder, whose `stage_bootlist_carry` copies it onto the ESP root (it knows no file name, filters nothing).
+zenbook_bootlist_carry() {
+    local dir="${WORKSPACE_DIR}/target/bootlist-carry"
+    rm -rf "$dir"; mkdir -p "$dir" || exit 1
+    _BOOTLIST_MEDIA=1 bootlist_stage "$dir" "${WORKSPACE_DIR}/fixtures/lanes/zenbook"
+    [ -f "${dir}/TESTS.LIST" ] || { echo -e "${COLOR_RED}✖ ZENBOOKLANELIST: no lane list at fixtures/lanes/zenbook/TESTS.LIST — the lane would read list=absent. rc=1${COLOR_RESET}"; exit 1; }
+    export UNAOS_BOOTLIST_STAGE="$dir"
 }
 
 # SPLASHGATE — the two splash witnesses are IN THE BOOTED ELF, counted, with both controls.
@@ -10699,13 +10712,15 @@ banner_cert_arm() {   # banner_cert_arm <artifact>
 # the kernel's `bootlist::parse`, so a card copy edited by hand reads the same everywhere (grammar: PLAYBOOK §4 item 7).
 # Each verb calls it BEFORE its card image is built from the tree. It stages only when a MEDIA dispatch arm set
 # `_BOOTLIST_MEDIA=1` (a shell variable, not a UNAOS_ knob): the QEMU lanes that reuse these fns (test_fat, test_selfhost,
-# fat_img, run_kernel8, test_kernel8, install_pi) never carry a list.
+# fat_img, run_kernel8, test_kernel8, install_pi) never carry a list. ZENBOOKLANELIST (zenbook-ledger Z19): an optional $2 names the
+# source dir (default unaos/fixtures, what every media verb passes by passing nothing); `test-zenbook` stages its own lane list
+# through it (`zenbook_bootlist_carry`) and the builder carries that onto the ESP it re-creates (UNAOS_BOOTLIST_STAGE).
 bootlist_stage() {
     [ "${_BOOTLIST_MEDIA:-}" = "1" ] || return 0
-    local dir="$1" _bl
+    local dir="$1" src="${2:-${WORKSPACE_DIR}/fixtures}" _bl
     for _bl in TESTS.LIST TESTS.HEAVY; do
-        if [ -f "${WORKSPACE_DIR}/fixtures/${_bl}" ]; then
-            cp "${WORKSPACE_DIR}/fixtures/${_bl}" "${dir}/${_bl}" && echo "   BOOTLIST (B817/B874): staged ${_bl} onto ${dir#${WORKSPACE_DIR}/} (the kernel runs it at [desktop] built; @board lines filtered there)"
+        if [ -f "${src}/${_bl}" ]; then
+            cp "${src}/${_bl}" "${dir}/${_bl}" && echo "   BOOTLIST (B817/B874): staged ${_bl} onto ${dir#${WORKSPACE_DIR}/} (the kernel runs it at [desktop] built; @board lines filtered there)"
         fi
     done
 }

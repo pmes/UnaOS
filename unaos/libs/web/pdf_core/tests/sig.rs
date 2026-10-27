@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use common::{Body, PdfBuilder, incremental, replace_bytes};
 use crypto_core::Sha256;
 use pdf_core::crypt::Cipher;
-use pdf_core::sig::cms::{self, Hash, Key, PrivateKey, SecretKey, SignerKey, SigningKey, parse_key};
+use pdf_core::sig::cms::{self, Hash, Key, PrivateKey, Remote, Scheme, SecretKey, SignerKey, SigningKey, parse_key};
 use pdf_core::sig::{Chain, Changes, SignRequest, SubFilter, Trust, Verdict, probe_line};
 use pdf_core::write::Edit;
 use pdf_core::{Document, Error};
@@ -581,4 +581,75 @@ fn signer_from_a_key_file() {
     let signer = SignerKey::Ed25519(&ed);
     let der = cert(8, "PDFSIGNKEYPARSE KAT PEM Signer", &signer, &SignerKey::Rsa(&k.ca, Hash::Sha256), false);
     signed_trusted(signer, &[der.as_slice(), k.ca_der.as_slice()]);
+}
+
+// ---- PDF-KEYSTORE (LEDGER SR382): a Remote signer (the key held elsewhere; here the same keys behind a callback) ----
+
+/// The callback a Holocron-held key answers through, over the local keys: the digest (the message for Ed25519) in, the
+/// signature out.
+fn by_key(k: &Keys) -> impl Fn(Scheme, &[u8]) -> Result<Vec<u8>, String> + '_ {
+    move |s, tbs| match s {
+        Scheme::Pkcs1(_) => {
+            let mut out = vec![0u8; 256];
+            k.leaf.sign_pkcs1v15(tbs, &mut out).map_err(|_| "rsa".to_string())?;
+            Ok(out)
+        }
+        Scheme::P256(_) => {
+            let raw = k.ec.sign_prehashed(tbs);
+            let mut der = [0u8; 72];
+            let n = crypto_core::p256::signature_to_der(&raw, &mut der);
+            Ok(der[..n].to_vec())
+        }
+        Scheme::Ed25519 => Ok(k.ed.sign(tbs).to_vec()),
+        Scheme::Pss(_) => Err("no PSS here".to_string()),
+    }
+}
+
+#[test]
+fn remote_rsa_matches_local() {
+    let k = keys();
+    let chain = rsa_chain();
+    let cb = by_key(k);
+    let remote = Remote::for_certificate(&k.leaf_der, Hash::Sha256, false, &cb).unwrap();
+    assert_eq!((remote.scheme, remote.max_sig), (Scheme::Pkcs1(Hash::Sha256), 256));
+    assert_eq!(remote.spki, SignerKey::Rsa(&k.leaf, Hash::Sha256).spki());
+    let out = sign(&blank(true), None, &request("Sig1", SignerKey::Remote(remote), &chain)).unwrap();
+    let local = sign(&blank(true), None, &request("Sig1", SignerKey::Rsa(&k.leaf, Hash::Sha256), &chain)).unwrap();
+    assert_eq!(out, local, "a remote PKCS#1 v1.5 signer writes the local file byte for byte");
+    assert!(trusted_whole(&verdicts(&out, None)[0].1));
+}
+
+#[test]
+fn remote_p256_and_ed25519() {
+    let k = keys();
+    let cb = by_key(k);
+    let ec_chain = [k.ec_der.as_slice(), k.ca_der.as_slice()];
+    let remote = Remote::for_certificate(&k.ec_der, Hash::Sha256, false, &cb).unwrap();
+    assert_eq!((remote.scheme, remote.max_sig), (Scheme::P256(Hash::Sha256), 72));
+    let out = signed_trusted(SignerKey::Remote(remote), &ec_chain);
+    let local = sign(&blank(false), None, &request("Signature1", SignerKey::P256(&k.ec, Hash::Sha256), &ec_chain)).unwrap();
+    assert_eq!(out, local, "RFC 6979: the remote P-256 file is the local one");
+    let ed_chain = [k.ed_der.as_slice(), k.ca_der.as_slice()];
+    let remote = Remote::for_certificate(&k.ed_der, Hash::Sha256, false, &cb).unwrap();
+    assert_eq!((remote.scheme, remote.max_sig), (Scheme::Ed25519, 64));
+    signed_trusted(SignerKey::Remote(remote), &ed_chain);
+    // PSS on a P-256 certificate is refused by name.
+    assert!(matches!(Remote::for_certificate(&k.ec_der, Hash::Sha256, true, &cb), Err(Error::Unsupported("remote key"))));
+}
+
+#[test]
+fn remote_refusals() {
+    let k = keys();
+    let chain = rsa_chain();
+    let cb = by_key(k);
+    // The callback refuses (PSS is not answered here).
+    let remote = Remote::for_certificate(&k.leaf_der, Hash::Sha256, true, &cb).unwrap();
+    assert_eq!(sign(&blank(false), None, &request("Signature1", SignerKey::Remote(remote), &chain)), Err(Error::Unsupported("remote signer")));
+    // An answer longer than the certificate's key allows.
+    let long = |_: Scheme, _: &[u8]| -> Result<Vec<u8>, String> { Ok(vec![1u8; 257]) };
+    let remote = Remote::for_certificate(&k.leaf_der, Hash::Sha256, false, &long).unwrap();
+    assert_eq!(
+        sign(&blank(false), None, &request("Signature1", SignerKey::Remote(remote), &chain)),
+        Err(Error::Unsupported("remote signature length"))
+    );
 }

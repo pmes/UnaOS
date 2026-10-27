@@ -32,17 +32,25 @@
 //!   off arm), its parcor coefficients are quantised (4 / 3 bits), turned into the filter by
 //!   the decoder's own `tns_lpc` and the spectrum replaced by the residual before the two loops (`tns_window`); the
 //!   decoder's `spectral_tools` synthesis inverts it exactly. The thresholds are taken from the unfiltered spectrum and
-//!   divided by the synthesis filter's noise gain.
+//!   divided by the synthesis filter's noise gain. TWO FILTERS AND coef_compress (AACENCTNSMULTI, LEDGER SR390): a long
+//!   window whose filter fired may split at the band b* minimising the two ranges' residual energies after their
+//!   quantised filters (`tns_window` on scratch copies), filter 0 the top range, filter 1 the one below (`tns_multi`);
+//!   that candidate is coded beside the one-filter one and kept when the frame's quantised noise over the mask is
+//!   lower (`nmr`, from `band`). A filter whose indices fit one bit fewer is sent coef_compress. Filters stay upward
+//!   (AACENC-TNS-DOWN owed: the NMR trial picked downward filters that raised the short-block pre-echo).
 //! * THE PSY MODEL (AACENCTNS, LEDGER SR381; `allowed`): the band energies spread by a two-slope Bark function (3GPP TS
 //!   26.403: `SPREAD_LO_DB` 30 / `SPREAD_HI_DB` 15 dB per Bark, one `Spread` table per block type built in `new`), under a
 //!   spectral-flatness tonality offset (`TONAL_DB` 18 for a tonal band, `NOISE_DB` 6 for a flat one; AACENCTNSNORM SR385:
 //!   the opt-in `Psy::Pred` takes a long block's tonality from the unpredictability of its MDCT magnitudes over the two
 //!   previous long blocks instead, `chaos_tonality`; not the default: on the correlated CPE fixture it overran the
-//!   bitrate by 6 bytes, AACENC-PSY-PRED-DEFAULT owed). A band under the
+//!   bitrate by 6 bytes, AACENC-PSY-PRED-DEFAULT owed; with AACENCTNSMULTI's PE lend it is inside the bitrate). A band under the
 //!   floor below is not coded; a band the model masks keeps a base scalefactor (never coarser than the last that codes
 //!   anything) the inner loop's spare bits reach (the seat's ruling: with the masked bands dropped, the 1 kHz tone fell to
-//!   36.7 dB). THE BIT RESERVOIR: a frame borrows the bits earlier frames left (capped at `AU_MAX_BITS` a channel) and
+//!   36.7 dB). THE BIT RESERVOIR: a frame borrows from the bits earlier frames left (capped at `AU_MAX_BITS` a channel) and
 //!   banks the mean frame less its real bits, so a silent frame funds the next transient and the mean bitrate holds.
+//!   AACENCTNSMULTI (LEDGER SR390): the lend follows the frame's perceptual entropy (3GPP TS 26.403 §5.4's Σ n·log2(E/T),
+//!   `frame_pe`) against its running mean, on §5.6's save / spend shape over the bank's fill (`res_lend`): a high-PE
+//!   frame takes more than the mean (the whole bank at twice the mean PE or after silence), a low-PE frame less.
 //! * THE QUANTISER (the two loops): a per-band threshold from the psy model (floored at an
 //!   absolute level and at the frame's mask floor, `MASK_DB` under its loudest band per coefficient, so a tone's window
 //!   leakage is not coded at the tone's SNR; measured on `aac_enc_sine_snr`'s 1 kHz tone at 128 kb/s stereo, 1356 bits a
@@ -264,6 +272,15 @@ pub struct Encoder {
     tns_gate: bool,
     psy: Psy,
     pred: Vec<(Option<Vec<f32>>, Option<Vec<f32>>)>,
+    /// AACENCTNSMULTI (LEDGER SR390): two filters / coef_compress on (off: one uncompressed filter a window) and the PE
+    /// lend on (off: SR381's lend-all), the frame PE's running mean, the last unit's active filters and bits
+    /// coef_compress saved, and the reservoir's signed lend
+    tns_multi: bool,
+    res_pe: bool,
+    pe_mean: f64,
+    tns_filters: u8,
+    tns_saved: usize,
+    lend: isize,
 }
 
 impl Encoder {
@@ -326,6 +343,12 @@ impl Encoder {
             tns_gate: false,
             psy: Psy::Flatness,
             pred: vec![(None, None); ch],
+            tns_multi: true,
+            res_pe: true,
+            pe_mean: 0.0,
+            tns_filters: 0,
+            tns_saved: 0,
+            lend: 0,
         })
     }
 
@@ -514,10 +537,14 @@ impl Encoder {
         self.short_next = attack;
         self.prev_seq = seq;
         let g = self.grid(seq, &env);
-        let mut x: Vec<Vec<f32>> = Vec::with_capacity(ch);
-        let mut allowed: Vec<Vec<f64>> = Vec::with_capacity(ch);
-        let mut floors: Vec<Vec<f64>> = Vec::with_capacity(ch);
-        let mut tns: Vec<TnsSide> = Vec::with_capacity(ch);
+        // per channel: the unfiltered spectrum in grid order, its thresholds and floors, the SR381 base candidate's
+        // filtered window-major spectrum and side, and (AACENCTNSMULTI) the multi candidate where it differs
+        let mut orig: Vec<Vec<f32>> = Vec::with_capacity(ch);
+        let mut a0: Vec<Vec<f64>> = Vec::with_capacity(ch);
+        let mut fl0: Vec<Vec<f64>> = Vec::with_capacity(ch);
+        let mut filt: Vec<Vec<f32>> = Vec::with_capacity(ch);
+        let mut base: Vec<TnsSide> = Vec::with_capacity(ch);
+        let mut multi: Vec<Option<(Vec<f32>, TnsSide)>> = Vec::with_capacity(ch);
         for c in 0..ch {
             let mut raw = vec![0f32; 2048];
             for i in 0..FRAME {
@@ -528,28 +555,61 @@ impl Encoder {
             }
             let mut s = self.analyse(seq, &raw);
             // AACENCTNS: the thresholds from the unfiltered spectrum, then TNS on the window-major spectrum, the thresholds
-            // of the filtered bands lowered by the synthesis filter's noise gain
-            let orig = if g.short { interleave(&s, &g) } else { s.clone() };
+            // of the filtered bands lowered by the synthesis filter's noise gain (`candidate`)
+            let o = if g.short { interleave(&s, &g) } else { s.clone() };
             // AACENCTNSNORM: `Psy::Pred` reads the two previous long spectra (a short block clears them)
             let pred = if self.psy == Psy::Pred { core::mem::replace(&mut self.pred[c], (None, None)) } else { (None, None) };
             let prev = match (&pred, g.short) { ((Some(p1), Some(p2)), false) => Some((&p1[..], &p2[..])), _ => None };
-            let (mut a, mut fl) = self.allowed(&orig, &g, prev);
-            if self.psy == Psy::Pred { self.pred[c] = if g.short { (None, None) } else { (Some(orig.clone()), pred.0) }; }
+            let (a, fl) = self.allowed(&o, &g, prev);
+            if self.psy == Psy::Pred { self.pred[c] = if g.short { (None, None) } else { (Some(o.clone()), pred.0) }; }
             // AACENCTNSNORM: every block whose band-normalised prediction gain passes; SR381's attack gate (LONG_START /
             // EIGHT_SHORT / LONG_STOP only) is the `tns_gate` KAT switch
-            let t = if self.tns && (!self.tns_gate || seq != ONLY_LONG) { self.tns_block(&mut s, &g) } else { TnsSide::none(g.short) };
-            t.lift(&mut a, &g);
-            t.lift(&mut fl, &g);
-            x.push(if !t.any() { orig } else if g.short { interleave(&s, &g) } else { s });
-            allowed.push(a);
-            floors.push(fl);
-            tns.push(t);
+            let gate = self.tns && (!self.tns_gate || seq != ONLY_LONG);
+            let unf = if gate && self.tns_multi { Some(s.clone()) } else { None };
+            let mut t = if gate { self.tns_block(&mut s, &g) } else { TnsSide::none(g.short) };
+            if self.tns_multi { t.compress(); }
+            let m = match unf {
+                Some(mut u) if t.any() => {
+                    let mut tm = self.tns_multi(&mut u, &g, &t);
+                    tm.compress();
+                    if tm.plain() { None } else { Some((u, tm)) }
+                }
+                _ => None,
+            };
+            orig.push(o);
+            a0.push(a);
+            fl0.push(fl);
+            filt.push(s);
+            base.push(t);
+            multi.push(m);
         }
-        self.tns_windows = tns.iter().map(|t| t.order.iter().filter(|&&o| o > 0).count() as u8).sum();
-        let ms = if ch == 2 && self.ms { ms_decide(&mut x, &mut allowed, &g) } else { vec![false; g.bands()] };
-        let side: Vec<usize> = tns.iter().map(|t| t.bits()).collect();
-        let borrow = if self.reservoir { self.res } else { 0 };
-        let mut coded: Vec<Coded> = self.code(&x, &g, &allowed, &floors, &side, borrow);
+        let (x, allowed, floors, ms0) = self.candidate(&g, &orig, &a0, &fl0, &filt, &base);
+        let mut ms = ms0;
+        // AACENCTNSMULTI (RES-PE): the reservoir lends by the frame's perceptual entropy (off: SR381's whole bank)
+        let lend: isize = if !self.reservoir { 0 } else if self.res_pe { self.res_lend(frame_pe(&x, &allowed, &g)) } else { self.res as isize };
+        self.lend = lend;
+        let side: Vec<usize> = base.iter().map(|t| t.bits()).collect();
+        let mut coded: Vec<Coded> = self.code(&x, &g, &allowed, &floors, &side, lend);
+        let mut tns = base;
+        // AACENCTNSMULTI: THE FRAME TRIAL — the multi candidate through the same lift → ms_decide → code at the same lend,
+        // kept when its frame NMR is lower
+        if multi.iter().any(|m| m.is_some()) {
+            let (mut filt_m, mut sides_m) = (filt.clone(), tns.clone());
+            for (c, m) in multi.into_iter().enumerate() {
+                if let Some((u, tm)) = m { filt_m[c] = u; sides_m[c] = tm; }
+            }
+            let (xm, am, flm, msm) = self.candidate(&g, &orig, &a0, &fl0, &filt_m, &sides_m);
+            let side_m: Vec<usize> = sides_m.iter().map(|t| t.bits()).collect();
+            let cm = self.code(&xm, &g, &am, &flm, &side_m, lend);
+            if self.nmr(&xm, &cm, &am, &g) < self.nmr(&x, &coded, &allowed, &g) {
+                coded = cm;
+                tns = sides_m;
+                ms = msm;
+            }
+        }
+        self.tns_windows = tns.iter().map(|t| t.filtered()).sum();
+        self.tns_filters = tns.iter().map(|t| t.filters()).sum();
+        self.tns_saved = tns.iter().map(|t| t.saved()).sum();
         let mut w = Bits::new();
         if ch == 1 {
             w.put(3, super::decoder::ID_SCE);
@@ -625,17 +685,15 @@ impl Encoder {
         let start = (0..num_swb).find(|&b| g.swb[b] as f64 * hz >= TNS_START_HZ).unwrap_or(num_swb);
         let end = max_bands.min(g.nb);
         if end <= start { return side; }
-        side.length = (num_swb - start) as u8;
-        side.bands = (start, end);
+        let length = (num_swb - start) as u8;
         let (lo, hi) = (g.swb[start] as usize, g.swb[end] as usize);
         for w in 0..if g.short { 8 } else { 1 } {
             let win = &mut s[w * bins..(w + 1) * bins];
             // AACENCTNSNORM (SR385): the band-normalised detector's weights
             let wts = if self.tns_norm { Some(tns_weights(win, g.swb, start, end)) } else { None };
             if let Some((p, idx, gain)) = tns_window(win, lo, hi, order, res_bits, wts.as_deref()) {
-                side.order[w] = p as u8;
-                side.idx[w] = idx;
-                side.gain[w] = gain;
+                side.nf[w] = 1;
+                side.f[w][0] = TnsFilter { length, bands: (start, end), order: p as u8, compress: false, idx, gain };
             }
         }
         side
@@ -644,9 +702,9 @@ impl Encoder {
     /// The two loops on the channels' spectra over the grid, each band held under its `allowed` noise: the OUTER loop per
     /// channel, the INNER loop per budget set — every channel in ONE set against `budget · channels` (AACENCGROUPING: a
     /// CPE's common global offset, so an M/S frame spends S's leftover on M), or with `cpe` off one set per channel.
-    /// AACENCTNS: a set's budget also borrows its share of the reservoir's `borrow` bits (capped at the AU max) and pays
-    /// its channels' TNS `side` bits.
-    fn code(&self, xs: &[Vec<f32>], g: &Grid, allowed: &[Vec<f64>], floors: &[Vec<f64>], side: &[usize], borrow: usize) -> Vec<Coded> {
+    /// AACENCTNS: a set's budget also takes its share of the reservoir's `lend` bits (AACENCTNSMULTI: signed — a low-PE
+    /// frame lends back, floored at 64 bits a channel; capped at the AU max) and pays its channels' TNS `side` bits.
+    fn code(&self, xs: &[Vec<f32>], g: &Grid, allowed: &[Vec<f64>], floors: &[Vec<f64>], side: &[usize], lend: isize) -> Vec<Coded> {
         let nb = g.bands();
         let mut aa: Vec<Vec<f32>> = Vec::with_capacity(xs.len());
         let mut bases: Vec<Vec<Option<(i32, i32)>>> = Vec::with_capacity(xs.len());
@@ -680,7 +738,8 @@ impl Encoder {
         let sets: Vec<Vec<usize>> = if self.cpe { vec![(0..xs.len()).collect()] } else { (0..xs.len()).map(|c| vec![c]).collect() };
         let mut out: Vec<Coded> = Vec::with_capacity(xs.len());
         for set in &sets {
-            let budget = (self.budget * set.len() + borrow / sets.len()).min(self.au_max * set.len() / xs.len()).saturating_sub(set.iter().map(|&c| side[c]).sum::<usize>());
+            let budget = ((self.budget * set.len()) as isize + lend / sets.len() as isize).max(64 * set.len() as isize) as usize;
+            let budget = budget.min(self.au_max * set.len() / xs.len()).saturating_sub(set.iter().map(|&c| side[c]).sum::<usize>());
             let run = |gofs: i32, top: usize| -> Vec<Coded> { set.iter().map(|&c| self.plan(&xs[c], &aa[c], &bases[c], gofs, g, top)).collect() };
             let bits = |cs: &[Coded]| cs.iter().map(|c| c.bits).sum::<usize>();
             // the INNER loop: the smallest global offset whose frame fits the budget
@@ -987,52 +1046,102 @@ fn write_band(w: &mut Bits, cb: u8, q: &[i32]) {
 /// dB to a power ratio.
 fn db(x: f64) -> f64 { math::exp2(x / 10.0 * core::f64::consts::LOG2_10) }
 
-/// One channel's TNS side data for a block (§4.4.2.7 tns_data): one upward filter per window that has one (order 0:
-/// n_filt 0), over the bands `bands` (length = num_swb − start: the decoder's top is num_swb); the quantised parcor
-/// indices and the synthesis filter's noise gain per window.
+/// One channel's TNS side data for a block (§4.4.2.7 tns_data): per window `nf` filters (AACENCTNSMULTI, LEDGER SR390:
+/// up to 2 a long window, 1 a short one), filter 0 the top one (its range ends at the decoder's num_swb), filter 1 the
+/// `length` bands below it.
+#[derive(Clone)]
 struct TnsSide {
     short: bool,
+    nf: [u8; 8],
+    f: [[TnsFilter; 2]; 8],
+}
+
+/// One TNS filter: its `length` on the wire, the grid bands it filtered (`bands.0..bands.1`), the order (0: a length
+/// only; upward: AACENC-TNS-DOWN owed), coef_compress, the quantised
+/// parcor indices and the synthesis filter's noise gain Σh².
+#[derive(Clone, Copy)]
+struct TnsFilter {
     length: u8,
     bands: (usize, usize),
-    order: [u8; 8],
-    idx: [[i32; 12]; 8],
-    gain: [f64; 8],
+    order: u8,
+    compress: bool,
+    idx: [i32; 12],
+    gain: f64,
+}
+
+impl TnsFilter {
+    const OFF: TnsFilter = TnsFilter { length: 0, bands: (0, 0), order: 0, compress: false, idx: [0; 12], gain: 1.0 };
 }
 
 impl TnsSide {
-    fn none(short: bool) -> TnsSide { TnsSide { short, length: 0, bands: (0, 0), order: [0; 8], idx: [[0; 12]; 8], gain: [1.0; 8] } }
-    fn any(&self) -> bool { self.order.iter().any(|&o| o > 0) }
+    fn none(short: bool) -> TnsSide { TnsSide { short, nf: [0; 8], f: [[TnsFilter::OFF; 2]; 8] } }
     fn windows(&self) -> usize { if self.short { 8 } else { 1 } }
-    /// Bits of tns_data (the present flag is `plan`'s): per window n_filt, then coef_res, length, order, direction,
-    /// coef_compress and the indices of its one filter.
+    /// Window `w`'s filters with an order (the ones that filter).
+    fn active(&self, w: usize) -> impl Iterator<Item = &TnsFilter> + '_ { self.f[w][..self.nf[w] as usize].iter().filter(|f| f.order > 0) }
+    fn any(&self) -> bool { (0..self.windows()).any(|w| self.active(w).next().is_some()) }
+    /// The windows that filter (the `tns_windows` stat), the filters, the bits coef_compress saved.
+    fn filtered(&self) -> u8 { (0..self.windows()).filter(|&w| self.active(w).next().is_some()).count() as u8 }
+    fn filters(&self) -> u8 { (0..self.windows()).map(|w| self.active(w).count() as u8).sum() }
+    fn saved(&self) -> usize { (0..self.windows()).map(|w| self.active(w).filter(|f| f.compress).map(|f| f.order as usize).sum::<usize>()).sum() }
+    /// One filter a window (a multi candidate like this one equals its base).
+    fn plain(&self) -> bool { (0..self.windows()).all(|w| self.nf[w] <= 1) }
+    /// coef_compress (AACENCTNSMULTI) on every filter whose indices all fit one bit fewer (the decoder's sign extension
+    /// then yields the same indices).
+    fn compress(&mut self) {
+        let half = 1i32 << (if self.short { 3 } else { 4 } - 1);
+        for w in 0..self.windows() {
+            for f in self.f[w].iter_mut() {
+                let o = f.order as usize;
+                f.compress = o > 0 && f.idx[..o].iter().all(|&v| v >= -(half / 2) && v < half / 2);
+            }
+        }
+    }
+    /// Bits of tns_data (the present flag is `plan`'s): per window n_filt, then coef_res, and per filter length, order
+    /// and, when it filters, direction, coef_compress and the indices.
     fn bits(&self) -> usize {
         if !self.any() { return 0; }
         let (nf, len, ord, res) = if self.short { (1, 4, 3, 3) } else { (2, 6, 5, 4) };
-        (0..self.windows()).map(|w| { let o = self.order[w] as usize; nf + if o > 0 { 1 + len + ord + 2 + res * o } else { 0 } }).sum()
+        (0..self.windows())
+            .map(|w| {
+                let n = self.nf[w] as usize;
+                nf + if n > 0 {
+                    1 + self.f[w][..n].iter().map(|f| { let o = f.order as usize; len + ord + if o > 0 { 2 + (res - f.compress as usize) * o } else { 0 } }).sum::<usize>()
+                } else {
+                    0
+                }
+            })
+            .sum()
     }
     fn write(&self, w: &mut Bits) {
         let (nf, len, ord, res) = if self.short { (1, 4, 3, 3u32) } else { (2, 6, 5, 4u32) };
         for win in 0..self.windows() {
-            let o = self.order[win] as usize;
-            w.put(nf, (o > 0) as u32);
-            if o == 0 { continue; }
+            let n = self.nf[win] as usize;
+            w.put(nf, n as u32);
+            if n == 0 { continue; }
             w.put(1, if self.short { 0 } else { 1 }); // coef_res: 3 bits short, 4 long
-            w.put(len, self.length as u32);
-            w.put(ord, o as u32);
-            w.put(1, 0); // direction: upward
-            w.put(1, 0); // coef_compress
-            for &v in &self.idx[win][..o] { w.put(res, (v as u32) & ((1 << res) - 1)); }
+            for f in &self.f[win][..n] {
+                let o = f.order as usize;
+                w.put(len, f.length as u32);
+                w.put(ord, o as u32);
+                if o == 0 { continue; }
+                w.put(1, 0); // direction: upward (AACENC-TNS-DOWN owed: a downward filter needs a pre-echo-aware cost)
+                w.put(1, f.compress as u32); // coef_compress (AACENCTNSMULTI)
+                let nb = res - f.compress as u32;
+                for &v in &f.idx[..o] { w.put(nb, (v as u32) & ((1 << nb) - 1)); }
+            }
         }
     }
-    /// The thresholds of the grid's bands inside the filtered range divided by the synthesis filter's noise gain (a
-    /// short group: the largest of its filtered windows').
+    /// The thresholds of the grid's bands inside a filter's range divided by that filter's noise gain (a band two
+    /// filters' windows cover in a short group: the largest).
     fn lift(&self, a: &mut [f64], g: &Grid) {
         if !self.any() { return; }
         let mut w0 = 0;
         for gi in 0..g.ng {
             let gl = g.glen[gi];
-            let gain = (w0..w0 + gl).filter(|&w| self.order[w] > 0).map(|w| self.gain[w]).fold(1f64, f64::max);
-            for b in self.bands.0..self.bands.1.min(g.nb) { a[gi * g.nb + b] /= gain; }
+            for b in 0..g.nb {
+                let gain = (w0..w0 + gl).flat_map(|w| self.active(w)).filter(|f| b >= f.bands.0 && b < f.bands.1).map(|f| f.gain).fold(1f64, f64::max);
+                a[gi * g.nb + b] /= gain;
+            }
             w0 += gl;
         }
     }
@@ -1153,6 +1262,151 @@ fn spread_table(swb: &[u16], hz: f64) -> Spread {
 /// Hz to Bark (Zwicker): 13·atan(0.00076 f) + 3.5·atan((f / 7500)²).
 fn bark(f: f64) -> f64 { 13.0 * math::atan(0.00076 * f) + 3.5 * math::atan((f / 7500.0) * (f / 7500.0)) }
 
+
+// ── tns_multi (AACENCTNSMULTI, LEDGER SR390): two filters a long window, coef_compress, the frame trial ──
+impl Encoder {
+    /// The multi candidate over a block's UNFILTERED window-major spectrum `s` (filtered in place), refining only the
+    /// long windows where the base filter fired (so the filtered windows are the base's). The measured rule is the
+    /// residual energy of the QUANTISED filter over its range (`tns_window` on a scratch copy, with the range's own
+    /// AACENCTNSNORM weights; the range's own energy where it does not fire): the window splits at the band b*
+    /// minimising the top range's [b*, end) plus the bottom's [start, b*) — the top filter stops where extending it down
+    /// raises the error — when that sum is below the single filter's. Upward only (AACENC-TNS-DOWN owed: measured, the
+    /// NMR trial picked downward filters that raised the short-block pre-echo 5.721e4 -> 1.190e5).
+    fn tns_multi(&self, s: &mut [f32], g: &Grid, base: &TnsSide) -> TnsSide {
+        let mut side = base.clone();
+        if g.short { return side; } // n_filt is 1 bit a short window
+        let num_swb = t::NUM_SWB_1024[self.sf_index] as usize;
+        let edge = |b: usize| g.swb[b] as usize;
+        // filter range b0..b1 of `x` (AACENCTNSNORM: the range's own band weights, as `tns_block` takes them)
+        let run = |x: &mut [f32], b0: usize, b1: usize| -> Option<(usize, [i32; 12], f64)> {
+            let wts = if self.tns_norm { Some(tns_weights(x, g.swb, b0, b1)) } else { None };
+            tns_window(x, edge(b0), edge(b1), TNS_ORDER_LONG, 4, wts.as_deref())
+        };
+        // a range's residual energy after its quantised filter (its own energy where it does not fire), and whether it fired
+        let seg = |x: &[f32], b0: usize, b1: usize| -> (f64, bool) {
+            let (lo, hi) = (edge(b0), edge(b1));
+            let mut y = x.to_vec();
+            let fired = run(&mut y, b0, b1).is_some();
+            (y[lo..hi].iter().map(|&v| v as f64 * v as f64).sum::<f64>(), fired)
+        };
+        let f0 = side.f[0][0];
+        let (start, end) = f0.bands;
+        let x = &mut s[..1024];
+        if side.nf[0] == 0 { return side; }
+        let single = seg(x, start, end);
+        // (summed residual, b, the top range fired, the bottom fired)
+        let mut split: Option<(f64, usize, bool, bool)> = None;
+        for b in start + 1..end {
+            let (top, bot) = (seg(x, b, end), seg(x, start, b));
+            if !top.1 && !bot.1 { continue; }
+            let e = top.0 + bot.0;
+            if split.map_or(true, |sp| e < sp.0) { split = Some((e, b, top.1, bot.1)); }
+        }
+        // the same `tns_window` calls the rule measured, now on the candidate's spectrum
+        let apply = |x: &mut [f32], b0: usize, b1: usize, length: u8| -> TnsFilter {
+            let mut f = TnsFilter { length, bands: (b0, b1), ..TnsFilter::OFF };
+            if let Some((p, idx, gain)) = run(x, b0, b1) {
+                f.order = p as u8;
+                f.idx = idx;
+                f.gain = gain;
+            }
+            f
+        };
+        match split {
+            Some((e, b, top, bot)) if e < single.0 => {
+                let ft = if top { apply(x, b, end, (num_swb - b) as u8) } else { TnsFilter { length: (num_swb - b) as u8, bands: (b, end), ..TnsFilter::OFF } };
+                if bot {
+                    let fb = apply(x, start, b, (b - start) as u8);
+                    side.nf[0] = 2;
+                    side.f[0] = [ft, fb];
+                } else {
+                    side.nf[0] = 1;
+                    side.f[0] = [ft, TnsFilter::OFF];
+                }
+            }
+            // the single filter: the base's own (the same call on the same spectrum)
+            _ => side.f[0][0] = apply(x, start, end, f0.length),
+        }
+        side
+    }
+
+    /// One candidate's coding inputs: per channel the thresholds and floors lifted by its TNS side, the spectrum (the
+    /// filtered one where the side filters, in grid order), then M/S over the pair.
+    fn candidate(&self, g: &Grid, orig: &[Vec<f32>], a0: &[Vec<f64>], fl0: &[Vec<f64>], filt: &[Vec<f32>], sides: &[TnsSide]) -> (Vec<Vec<f32>>, Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<bool>) {
+        let ch = orig.len();
+        let mut x: Vec<Vec<f32>> = Vec::with_capacity(ch);
+        let mut allowed: Vec<Vec<f64>> = Vec::with_capacity(ch);
+        let mut floors: Vec<Vec<f64>> = Vec::with_capacity(ch);
+        for c in 0..ch {
+            let (mut a, mut fl) = (a0[c].clone(), fl0[c].clone());
+            let t = &sides[c];
+            t.lift(&mut a, g);
+            t.lift(&mut fl, g);
+            x.push(if !t.any() { orig[c].clone() } else if g.short { interleave(&filt[c], g) } else { filt[c].clone() });
+            allowed.push(a);
+            floors.push(fl);
+        }
+        let ms = if ch == 2 && self.ms { ms_decide(&mut x, &mut allowed, g) } else { vec![false; g.bands()] };
+        (x, allowed, floors, ms)
+    }
+
+    /// The frame trial's cost: the quantised error at the budget over the mask, Σ over the channels' grid bands of the
+    /// noise (`band`, the outer loop's own measure, at a coded band's final scalefactor; the band's energy where it is
+    /// not coded) over its `allowed` threshold.
+    fn nmr(&self, xs: &[Vec<f32>], cs: &[Coded], allowed: &[Vec<f64>], g: &Grid) -> f64 {
+        let mut total = 0f64;
+        for ((x, c), al) in xs.iter().zip(cs).zip(allowed) {
+            let a: Vec<f32> = x.iter().map(|&v| math::pow(v.abs() as f64, 0.75) as f32).collect();
+            for i in 0..g.bands() {
+                let (gi, b) = (i / g.nb, i % g.nb);
+                let (lo, hi) = g.rng(i);
+                let j = gi * c.max_sfb + b;
+                let noise = if b < c.max_sfb && c.cb[j] != 0 { self.band(x, &a, lo, hi, c.sf[j]).0 } else { x[lo..hi].iter().map(|&v| v as f64 * v as f64).sum() };
+                total += noise / al[i];
+            }
+        }
+        total
+    }
+}
+
+// ── res_pe (AACENCTNSMULTI, LEDGER SR390): the bit reservoir lends by perceptual entropy (3GPP TS 26.403 §5.4 / §5.6) ──
+/// The frame PE's running mean (frames), the PE ratio at which a frame takes the whole bank, and the largest share of
+/// the mean frame a low-PE frame saves (26.403's maxBitSave for long blocks).
+const PE_AVG: f64 = 16.0;
+const R_SPEND: f64 = 2.0;
+const SAVE_MAX: f64 = 0.3;
+
+impl Encoder {
+    /// The reservoir's signed lend for a frame of perceptual entropy `pe` (the bit-demand curve over the fill f =
+    /// res / res_max, r = pe over the running mean): spend = res · clamp(f + (r − 1)/(R_SPEND − 1), 0, 1), save = the
+    /// mean frame · SAVE_MAX · max(0, 1 − r) · (1 − f); lend = spend − save. Then the mean moves (the first frame with
+    /// a PE seeds it).
+    fn res_lend(&mut self, pe: f64) -> isize {
+        let mean = (self.budget * self.channels + FRAME_OVERHEAD) as f64;
+        let r = if pe <= 0.0 { 0.0 } else if self.pe_mean <= 0.0 { R_SPEND } else { pe / self.pe_mean };
+        if self.pe_mean <= 0.0 { if pe > 0.0 { self.pe_mean = pe; } } else { self.pe_mean += (pe - self.pe_mean) / PE_AVG; }
+        let f = if self.res_max == 0 { 1.0 } else { self.res as f64 / self.res_max as f64 };
+        let spend = self.res as f64 * (f + (r - 1.0) / (R_SPEND - 1.0)).clamp(0.0, 1.0);
+        let save = mean * SAVE_MAX * (1.0 - r).max(0.0) * (1.0 - f);
+        (spend - save) as isize
+    }
+}
+
+/// The frame's perceptual entropy (26.403 §5.4's form): Σ over the channels' grid bands of `pe_band`.
+fn frame_pe(xs: &[Vec<f32>], allowed: &[Vec<f64>], g: &Grid) -> f64 {
+    let mut pe = 0f64;
+    for (x, a) in xs.iter().zip(allowed) {
+        for i in 0..g.bands() {
+            let (lo, hi) = g.rng(i);
+            let e: f64 = x[lo..hi].iter().map(|&v| v as f64 * v as f64).sum();
+            pe += pe_band(e, a[i], (hi - lo) as f64);
+        }
+    }
+    pe
+}
+
+/// One band's PE: n · log2(E / T) where the energy E is over the threshold T, else 0.
+fn pe_band(e: f64, t: f64, n: f64) -> f64 { if t > 0.0 && e > t { n * math::log2(e / t) } else { 0.0 } }
 
 #[cfg(test)]
 mod tests {
@@ -1556,6 +1810,8 @@ mod tests {
     const PRE_ECHO_VS_SR378_DB: f64 = 20.0;
     /// SR381 (586, 160); AACENCTNSNORM (SR385): (566, 168), the burst's neighbours now filtered by the normalised gate.
     const RESERVOIR_BYTES: (usize, usize) = (566, 168);
+    /// AACENCTNSMULTI (LEDGER SR390): the tone + noise-burst units whose long window carries two filters.
+    const TWO_FILTER_UNITS: [usize; 5] = [0, 9, 11, 19, 28];
 
     /// A tone (440 Hz + 2 harmonics) with 512-sample white-noise bursts (abrupt onset) at `BURSTS`, mono.
     fn tone_bursts(frames: usize) -> Vec<i16> {
@@ -1732,7 +1988,8 @@ mod tests {
     /// previous long blocks holds the sine within 0.3 dB of SR381 and the correlated CPE at SR378's one-budget floor, and
     /// both streams decode. Not the default: measured (SR385) the CPE stream at 8539 bytes, over the bitrate's 8533
     /// (`aac_enc_cpe_budget`'s bound); the 1 kHz tone's MDCT magnitudes cycle every 3 blocks, which a magnitude-only
-    /// two-block prediction reads as partly chaotic (AACENC-PSY-PRED-DEFAULT owed).
+    /// two-block prediction reads as partly chaotic (AACENC-PSY-PRED-DEFAULT owed). AACENCTNSMULTI (SR390): under the
+    /// PE lend the CPE stream is 8423 bytes, inside the bitrate (the overrun closed), at 4.9/4.9 dB (SR385 5.0/5.0).
     #[test]
     fn aac_enc_psy_pred() {
         let (sine, sine_b) = sine_with(|e| e.psy = Psy::Pred);
@@ -1741,5 +1998,82 @@ mod tests {
         std::println!("aac_enc_psy_pred: sine {:.1}/{:.1} dB {sine_b} B; correlated one budget {:.1}/{:.1} dB {bytes} bytes, the bitrate's {cap}", sine[0], sine[1], cpe[0], cpe[1]);
         for c in 0..2 { assert!(sine[c] >= SINE_SR381[c] - 0.3, "channel {c}: Pred {:.1} dB, SR381 {:.1}", sine[c], SINE_SR381[c]); }
         for c in 0..2 { assert!(cpe[c] >= CPE_SR378, "channel {c}: Pred {:.1} dB, SR378 {CPE_SR378}", cpe[c]); }
+    }
+
+    // ---- AACENCTNSMULTI (LEDGER SR390): two filters, coef_compress; the PE lend
+
+    /// Mono 48 kHz at `kbps`, the multi candidate on or off, fed a frame at a time: (units, per unit of the encode phase
+    /// (filtered windows, active filters, bits coef_compress saved), the whole signal's SNR).
+    fn multi_run(pcm: &[i16], kbps: u32, multi: bool) -> (Vec<AccessUnit>, Vec<(u8, u8, usize)>, f64) {
+        let mut e = Encoder::new(48000, 1, kbps * 1000).unwrap();
+        e.tns_multi = multi;
+        let mut units = Vec::new();
+        let mut st = Vec::new();
+        for f in pcm.chunks(1024) {
+            for u in e.encode(f) { units.push(u); st.push((e.tns_windows, e.tns_filters, e.tns_saved)); }
+        }
+        units.extend(e.flush());
+        let d = decode(&e, &units);
+        let (mut s, mut n) = (0f64, 0f64);
+        for (i, &x) in pcm.iter().enumerate() {
+            let r = x as f64 - d[0][i + PRIMING as usize];
+            s += x as f64 * x as f64;
+            n += r * r;
+        }
+        (units, st, 10.0 * math::log10(s / n.max(1e-9)))
+    }
+
+    /// TNS-MULTI: on the tone + noise bursts (64 kb/s mono) long windows carry two filters (TWO_FILTER_UNITS, pinned),
+    /// coef_compress saves bits, the filtered windows stay the base's (TNS_UNITS), and the stream's SNR holds; every
+    /// stream decodes through our decoder's TNS synthesis (n_filt 2, coef_compress 1). Off: one uncompressed filter a
+    /// window (SR385's stream).
+    #[test]
+    fn aac_enc_tns_multi() {
+        let tb = tone_bursts(40960);
+        let (u_on, st_on, snr_on) = multi_run(&tb, 64, true);
+        let (u_off, st_off, snr_off) = multi_run(&tb, 64, false);
+        assert_eq!(u_on.len(), u_off.len());
+        assert_eq!(st_on.iter().map(|s| s.0).collect::<Vec<u8>>(), st_off.iter().map(|s| s.0).collect::<Vec<u8>>());
+        assert!(st_off.iter().all(|s| s.1 == s.0 && s.2 == 0));
+        let two: Vec<usize> = st_on.iter().enumerate().filter(|(_, s)| s.1 > s.0).map(|(u, _)| u).collect();
+        let saved: usize = st_on.iter().map(|s| s.2).sum();
+        std::println!("aac_enc_tns_multi: tone+bursts two-filter units {two:?}, coef_compress saved {saved} bits, SNR multi {snr_on:.2} off {snr_off:.2} dB");
+        for &u in &two { assert_ne!(wire_seq(&u_on[u]), 2, "unit {u}: two filters on a short window"); }
+        assert_eq!(two, TWO_FILTER_UNITS.to_vec());
+        assert!(saved > 0, "coef_compress saved nothing");
+        assert!(snr_on >= snr_off - 0.5, "tone+bursts: multi {snr_on:.2} dB, off {snr_off:.2} dB");
+    }
+
+    /// RES-PE: on the tone + noise bursts (64 kb/s mono) the reservoir lends by perceptual entropy — each burst's attack
+    /// blocks get more than the mean frame (measured 384 / 383 / 377 bytes, the mean 170; SR381's flat lend 219 / 231 /
+    /// 227), the stationary ONLY_LONG units less (median 143; flat 159), the stream within the bitrate (6832 of 6997).
+    #[test]
+    fn aac_enc_res_pe() {
+        let pcm = tone_bursts(40960);
+        let run = |pe: bool| -> (Vec<AccessUnit>, usize) {
+            let mut e = Encoder::new(48000, 1, 64000).unwrap();
+            e.res_pe = pe;
+            let mut units = e.encode(&pcm);
+            units.extend(e.flush());
+            (units, (e.budget + FRAME_OVERHEAD) / 8)
+        };
+        let (on, mean) = run(true);
+        let (off, _) = run(false);
+        let peaks = |u: &[AccessUnit]| -> Vec<usize> {
+            BURSTS.iter().map(|&p| { let u0 = p / 1024; (u0 - 1..=u0 + 1).filter(|&i| matches!(wire_seq(&u[i]), 1 | 2)).map(|i| u[i].data.len()).max().unwrap_or(0) }).collect()
+        };
+        let still = |u: &[AccessUnit]| -> usize {
+            let mut v: Vec<usize> = (12..u.len() - 2).filter(|&i| wire_seq(&u[i]) == 0).map(|i| u[i].data.len()).collect();
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        let (p_on, p_off, s_on, s_off) = (peaks(&on), peaks(&off), still(&on), still(&off));
+        let total: usize = on.iter().map(|u| u.data.len()).sum();
+        let total_off: usize = off.iter().map(|u| u.data.len()).sum();
+        let cap = 64000 * on.len() * 1024 / 48000 / 8;
+        std::println!("aac_enc_res_pe: mean frame {mean} bytes; burst peaks PE {p_on:?} flat {p_off:?}; stationary median PE {s_on} flat {s_off}; stream PE {total} flat {total_off}, the bitrate's {cap}");
+        for &b in &p_on { assert!(b > mean, "burst unit {b} bytes, the mean {mean}"); }
+        assert!(s_on < mean, "stationary median {s_on} bytes, the mean {mean}");
+        assert!(total <= cap, "{total} bytes, the bitrate's {cap}");
     }
 }

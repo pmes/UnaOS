@@ -10,7 +10,8 @@ description = "Holocron (CODEX §2, The Key): the host keyring daemon, its Unix-
 # attributes), SO_PEERCRED principal stamping, the daemon and the client. No third-party dependencies of its own.
 
 [dependencies]
-holocron_core = { path = "../../unaos/libs/sys/holocron_core" }
+# PDF-KEYSTORE (SR382): `pkcs8` — the daemon is the fulfiller that holds signing key files and signs with them.
+holocron_core = { path = "../../unaos/libs/sys/holocron_core", features = ["pkcs8"] }
 # The no_std core of UnaFS only (the `std` feature would pull gneiss_pal's network stack into a keyring).
 unafs = { path = "../../unaos/libs/fs/unafs", default-features = false }
 # CRYPTOCORE's `std` source (/dev/urandom) under the DRBG the daemon draws from.

@@ -3106,7 +3106,7 @@ unsafe impl Sync for DeviceSlot {}
 impl DeviceSlot {
     pub fn new() -> Self {
         let desc_layout = core::alloc::Layout::from_size_align(256, 64).unwrap();
-        let desc_buffer = unsafe { alloc::alloc::alloc_zeroed(desc_layout) };
+        let desc_buffer = crate::arch::memory::dma::ident(desc_layout.size(), desc_layout.align()) as *mut u8;
         Self {
             active: false,
             port_id: 0,
@@ -5395,7 +5395,7 @@ impl XhciController {
             // 1. Allocate and set DCBAAP
             let dcbaap_size = (self.max_slots as usize + 1) * 8;
             let layout = core::alloc::Layout::from_size_align(dcbaap_size, 64).unwrap();
-            let dcbaap_ptr = alloc::alloc::alloc_zeroed(layout) as *mut u64;
+            let dcbaap_ptr = crate::arch::memory::dma::ident(layout.size(), layout.align()) as *mut u64;
             self.dcbaap = dcbaap_ptr;
 
             let dcbaap_reg = (self.op_base + 0x30) as *mut u64;
@@ -5432,7 +5432,7 @@ impl XhciController {
                 // The Scratchpad Buffer Array: one u64 physical pointer per buffer, page-aligned.
                 let arr_layout =
                     core::alloc::Layout::from_size_align(max_scratchpad * 8, page_bytes).unwrap();
-                let arr = alloc::alloc::alloc_zeroed(arr_layout) as *mut u64;
+                let arr = crate::arch::memory::dma::ident(arr_layout.size(), arr_layout.align()) as *mut u64;
                 let (heap_lo, heap_hi) = crate::allocator::heap_bounds();
                 if arr.is_null()
                     || (arr as usize) < heap_lo
@@ -5447,7 +5447,7 @@ impl XhciController {
                     for i in 0..max_scratchpad {
                         let buf_layout =
                             core::alloc::Layout::from_size_align(page_bytes, page_bytes).unwrap();
-                        let buf = alloc::alloc::alloc_zeroed(buf_layout);
+                        let buf = crate::arch::memory::dma::ident(buf_layout.size(), buf_layout.align()) as *mut u8;
                         if buf.is_null() {
                             break;
                         }
@@ -5550,7 +5550,7 @@ impl XhciController {
             //    old `static mut ERST_TABLE` in kernel-image .bss (JETSON-XCARVE: see the EventRing doc).
             //    64-byte alignment (xHCI 6.5) comes from ErstTable's `#[repr(align(64))]`.
             let erst_layout = core::alloc::Layout::new::<ErstTable>();
-            let erst = alloc::alloc::alloc_zeroed(erst_layout) as *mut ErstTable;
+            let erst = crate::arch::memory::dma::ident(erst_layout.size(), erst_layout.align()) as *mut ErstTable;
             (*erst).entries[0] = ErstEntry {
                 ring_address: event_ring_phys,
                 size: event::EVENT_RING_SIZE as u16, // Must match EVENT_RING_SIZE in event.rs
@@ -7108,8 +7108,8 @@ impl XhciController {
             let input_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<InputContext>(), 64).unwrap();
             let output_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<DeviceContext>(), 64).unwrap();
             
-            let input_ctx_virt = alloc::alloc::alloc_zeroed(input_layout) as *mut InputContext;
-            let output_ctx_virt = alloc::alloc::alloc_zeroed(output_layout) as *mut DeviceContext;
+            let input_ctx_virt = crate::arch::memory::dma::ident(input_layout.size(), input_layout.align()) as *mut InputContext;
+            let output_ctx_virt = crate::arch::memory::dma::ident(output_layout.size(), output_layout.align()) as *mut DeviceContext;
             let ep0_ring = ring::TransferRing::new(16);
             let ep0_ring_phys = ep0_ring.get_ptr();
 
@@ -7245,16 +7245,16 @@ impl XhciController {
 
             // Dedicated DMA buffers for Bulk-Only Transport (CBW / data / CSW).
             let cbw_layout = core::alloc::Layout::from_size_align(64, 64).unwrap();
-            slot.cbw_buffer = Some(alloc::alloc::alloc_zeroed(cbw_layout));
+            slot.cbw_buffer = Some(crate::arch::memory::dma::ident(cbw_layout.size(), cbw_layout.align()) as *mut u8);
             let csw_layout = core::alloc::Layout::from_size_align(64, 64).unwrap();
-            slot.csw_buffer = Some(alloc::alloc::alloc_zeroed(csw_layout));
+            slot.csw_buffer = Some(crate::arch::memory::dma::ident(csw_layout.size(), csw_layout.align()) as *mut u8);
             // MULTIBLK: the data-stage staging buffer is STORAGE_DATA_BYTES (32 KiB), 64 KiB-ALIGNED.
             // The alignment is not a cache-line choice — it is what keeps a single Normal TRB from
             // ever crossing a 64 KiB boundary (xHCI 1.2 §4.11.7.1), so the audited one-TRB data stage
             // stays valid at every size up to the buffer. See STORAGE_DATA_BYTES for the full note.
             let data_layout =
                 core::alloc::Layout::from_size_align(STORAGE_DATA_BYTES, STORAGE_DATA_ALIGN).unwrap();
-            slot.scsi_data_buffer = Some(alloc::alloc::alloc_zeroed(data_layout));
+            slot.scsi_data_buffer = Some(crate::arch::memory::dma::ident(data_layout.size(), data_layout.align()) as *mut u8);
             slot.bulk_in_ep = in_addr;
             slot.bulk_out_ep = out_addr;
 
@@ -9181,13 +9181,13 @@ impl XhciController {
             Err(e) => serial_println!(":: USB: [usb36] step1 baseline ERR {:?} ::", e),
         }
 
-        // --- Step 2: FRESH alloc_zeroed buffer PRE-FILLED with 0xA5, then READ(10) LBA0 into it.
+        // --- Step 2: FRESH dma::ident buffer PRE-FILLED with 0xA5, then READ(10) LBA0 into it.
         //     PATTERN-SURVIVED => the device never wrote (DMA never landed); ZEROS => something wrote
         //     zeros OVER the pattern (DMA landed zeros, or a stale write-back clobbered it); DATA =>
         //     the block landed. This is the critical 'never-lands vs lands-zeros' discriminator. ---
         {
             let layout = core::alloc::Layout::from_size_align(512, 64).unwrap();
-            let fresh = unsafe { alloc::alloc::alloc_zeroed(layout) };
+            let fresh = crate::arch::memory::dma::ident(layout.size(), layout.align()) as *mut u8;
             if fresh.is_null() {
                 serial_println!(":: USB: [usb36] step2 alloc failed ::");
             } else {
@@ -14611,7 +14611,7 @@ impl XhciController {
             self.slots[hub_slot as usize].hub_int_ring = Some(ring);
             if self.slots[hub_slot as usize].hub_change_buffer.is_none() {
                 let l = core::alloc::Layout::from_size_align(64, 64).unwrap();
-                self.slots[hub_slot as usize].hub_change_buffer = Some(alloc::alloc::alloc_zeroed(l));
+                self.slots[hub_slot as usize].hub_change_buffer = Some(crate::arch::memory::dma::ident(l.size(), l.align()) as *mut u8);
             }
             input_ctx_virt = self.slots[hub_slot as usize].input_context;
             let base_ptr = input_ctx_virt as *mut u32;
@@ -14951,8 +14951,8 @@ impl XhciController {
         unsafe {
             let input_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<InputContext>(), 64).unwrap();
             let output_layout = core::alloc::Layout::from_size_align(core::mem::size_of::<DeviceContext>(), 64).unwrap();
-            let input_ctx_virt = alloc::alloc::alloc_zeroed(input_layout) as *mut InputContext;
-            let output_ctx_virt = alloc::alloc::alloc_zeroed(output_layout) as *mut DeviceContext;
+            let input_ctx_virt = crate::arch::memory::dma::ident(input_layout.size(), input_layout.align()) as *mut InputContext;
+            let output_ctx_virt = crate::arch::memory::dma::ident(output_layout.size(), output_layout.align()) as *mut DeviceContext;
             let ep0_ring = ring::TransferRing::new(16);
             let ep0_ring_phys = ep0_ring.get_ptr();
 
@@ -15826,7 +15826,7 @@ impl XhciController {
                 slot.keyboard_ring = Some(ring);
                 if slot.data_buffer.is_none() {
                     let l = core::alloc::Layout::from_size_align(512, 64).unwrap();
-                    slot.data_buffer = Some(alloc::alloc::alloc_zeroed(l));
+                    slot.data_buffer = Some(crate::arch::memory::dma::ident(l.size(), l.align()) as *mut u8);
                 }
                 let ep = base_ptr.add((1 + dci as usize) * CTX_WORDS);
                 ep.add(0).write_volatile(encode_interval(interval) << 16); // HIDESIT (rmbp 2026-09-15; the sibling HUBFIX/d9c5987b convicted and reported) — DW0 IS INTERVAL (bits 23:16) AND NOTHING ELSE. It used to carry `| (mps << 24)`, and bits 31:24 of an Endpoint Context DW0 are **Max ESIT Payload Hi** (xHCI 1.2 Table 6-9, §6.2.3.8) — the HIGH half of a 32-bit byte count, not a second copy of the packet size. An mps-8 boot keyboard therefore asked the xHC for `8 << 16` = 524288 bytes PER SERVICE INTERVAL, 65536x what one 8-byte boot report needs (measured at d186e15c: `dw0=0x08060000 … esit=524288 esithi=8`). HUBFIX excused this arm as "LS/FS behind a TT, whose periodic budget the xHC does not police" — ⚠ THAT PREMISE IS WRONG, and this arc's baseline is what disproved it: QEMU's `usb-kbd`/`usb-tablet` on `xhci.0` train at **speed=3, HIGH SPEED, on a ROOT PORT**, no TT anywhere, and the request was honoured only because QEMU's xHCI model validates no periodic budget at all. A real xHC budgets an HS root-port interrupt endpoint directly and returns completion code 8 (Bandwidth Error) for 524288 B/ESIT against an HS budget of ~3 KB/microframe — the same code the Orin's HS hub returns in RENDER2-AUDIT N2. Writing 0 here is also the only always-legal value: §6.2.3.8 makes Max ESIT Payload Hi RsvdZ whenever HCCPARAMS2.LEC = 0, and this driver never reads LEC. `encode_interval` is UNCHANGED and verified for the HID case by the witness's independent recomputation (`ival=6/6` HS kbd, `3/3` HS pointer). ⚠ FOLDED onto this line, never a line of its own: this file is compiled into the Pi's kernel8.img and a line added anywhere in it moves every panic `Location` below.
@@ -15850,7 +15850,7 @@ impl XhciController {
                 slot.mouse_ring = Some(ring);
                 if slot.mouse_data_buffer.is_none() {
                     let l = core::alloc::Layout::from_size_align(512, 64).unwrap();
-                    slot.mouse_data_buffer = Some(alloc::alloc::alloc_zeroed(l));
+                    slot.mouse_data_buffer = Some(crate::arch::memory::dma::ident(l.size(), l.align()) as *mut u8);
                 }
                 let ep = base_ptr.add((1 + dci as usize) * CTX_WORDS);
                 ep.add(0).write_volatile(encode_interval(interval) << 16); // HIDESIT — the POINTER endpoint carried the identical misplaced `(mps << 24)`, and it is a SEPARATE defect on a separate device: the keyboard and the pointer enumerate into different slots and each builds its own input context, so a fix proved on one proves nothing about the other. Measured at d186e15c on the same leg: `slot=3 ptr … dw0=0x08030000 … esit=524288 esithi=8`. Same correction, same citations as the keyboard arm above. ⚠ FOLDED.

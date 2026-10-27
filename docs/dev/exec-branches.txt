@@ -984,7 +984,7 @@ refs/heads/exec-rmbp-vfsputsweep   26fba6acc FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-gopignite   3bce61780 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-mt7925s2   d337bcc0c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-fwstageone   2acd96300 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-pdfkeystore   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-pdfkeystore   f6c6f5481 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264encvbrcrf   2a6995f1c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nlesizeswitch   69d9c007b FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aacenctnsnorm   27e22f07a FOLDED-BY-HAND (this commit) 2026-10-27
@@ -997,11 +997,19 @@ refs/heads/exec-rmbp-mt7925s3   e56878fb2 FOLDED-BY-HAND (this commit) 2026-10-2
 refs/heads/exec-rmbp-exportsizescale   2773a3aa8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-swapbacknlecache   06d07c0d7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdf4stripkeys   ae8272e02 cut 2026-10-27 (wave36 batch 8)
-refs/heads/exec-rmbp-aacenctnsmulti   ae8272e02 cut 2026-10-27 (wave36 batch 8)
+refs/heads/exec-rmbp-aacenctnsmulti   0b55d5962 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbooklanetyped   33e9b4fe3 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-mt7925s4   d7ad4440e cut 2026-10-27 (wave36 batch 9)
+refs/heads/exec-rmbp-mt7925s4   3465258aa FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbooktouchpadreports   6434f6cd4 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-dmaallocone   5dbd44257 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootleds   8ba82e813 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-saverecent   d7ad4440e cut 2026-10-27 (wave36 batch 9)
 refs/heads/exec-rmbp-pagesave   d7ad4440e cut 2026-10-27 (wave36 batch 9)
+refs/heads/exec-rmbp-zenbooklanelist   232175f52 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-zenbookecbattery   438be9774 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-zenbookxhciall   4886f5dce cut 2026-10-27 (wave36 batch 10)
+refs/heads/exec-rmbp-nvmebatch   2a5671570 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-dmaallocxhci   407a30991 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-keysignone   4886f5dce cut 2026-10-27 (wave36 batch 10)
+refs/heads/exec-rmbp-nlesizepolicy   4886f5dce cut 2026-10-27 (wave36 batch 10)
+refs/heads/exec-rmbp-pdf4fitstatus   4886f5dce cut 2026-10-27 (wave36 batch 10)
