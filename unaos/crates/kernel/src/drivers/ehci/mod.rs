@@ -708,8 +708,8 @@ fn m8_threshold_cy() -> u64 {
     }
 }
 
-/// One woken, schedule-bearing EHCI function. All DMA structures live in the static
-/// `qh::DMA_POOLS` (kernel image, low physical); every `*_phys` field is the page-table-
+/// One woken, schedule-bearing EHCI function. All DMA structures live in its pool from
+/// `qh::dma_pool` (the one DMA allocator, B989); every `*_phys` field is the page-table-
 /// resolved physical address the controller is actually programmed with (probe-5 discipline —
 /// never the heap virt==phys shortcut).
 pub struct Controller {
@@ -13618,9 +13618,9 @@ impl Controller {
         true
     }
 
-    /// The controller's static DMA pool (index-bound checked at construction).
+    /// The controller's DMA pool (Some by construction: the controller exists only after `qh::dma_pool(idx)` answered).
     fn pool(&self) -> *mut qh::DmaPool {
-        unsafe { &mut DMA_POOLS[self.idx] as *mut qh::DmaPool }
+        qh::dma_pool(self.idx).unwrap_or(core::ptr::null_mut()) // DMAALLOCEHCI (B989): was `&mut DMA_POOLS[self.idx]`
     }
 
     /// KBDFLAP — re-arm an interrupt endpoint whose device-side stall has JUST been cleared.
@@ -15301,7 +15301,7 @@ unsafe fn isr_arm_controller(idx: usize, bus: u8, dev: u8, func: u8, op: u64) {
 /// for real — a hand-built completion token, the actual ISR entry point, the actual consumer — so a
 /// regression in the interrupt path fails a QEMU boot instead of waiting for a bench sitting.
 ///
-/// **Why it is safe to run here.** It borrows `DMA_POOLS[0].int_slots[0]` and `ISR_EPS[0]` at a
+/// **Why it is safe to run here.** It borrows `qh::dma_pool(0)`'s `int_slots[0]` and `ISR_EPS[0]` at a
 /// moment when both are provably unowned: no controller has been constructed, no endpoint has been
 /// armed, `USBINTR` is masked on every function and no MSI is routed, so nothing else in the machine
 /// can be looking at either. `arm_interrupt_ep` rewrites both from scratch when the slot is really
@@ -15312,7 +15312,7 @@ unsafe fn isr_arm_controller(idx: usize, bus: u8, dev: u8, func: u8, op: u64) {
 /// the qTD-chain one, so a fixture that tested only the mode it happens to be booting on would be
 /// blind to exactly the half this arc's own risk lives in.
 unsafe fn isr_selftest() {
-    let pool = &mut DMA_POOLS[0] as *mut qh::DmaPool;
+    let Some(pool) = qh::dma_pool(0) else { serial_println!(":: EHCI-HID: ISRARM self-test SKIPPED — the DMA allocator refused the pool (DMAALLOCEHCI B989). Nothing was exercised; treat the ISR path as UNTESTED on this boot == witness ::"); return; };
     let slot0 = &mut (*pool).int_slots[0];
     let (qh, qtd, buf) = (
         &mut slot0.qh as *mut Qh,
@@ -18060,7 +18060,7 @@ pub fn init() {
                         );
                         continue;
                     }
-                    let pool = &mut DMA_POOLS[idx];
+                    let Some(pool) = qh::dma_pool(idx) else { crate::bootlog_println!(":: EHCI-HID: [{}] STOP-NOTE the DMA allocator refused the pool (DMAALLOCEHCI B989) — controller skipped ::", idx); continue; }; let pool = &mut *pool;
                     let (
                         Some(fl_phys),
                         Some(head_phys),

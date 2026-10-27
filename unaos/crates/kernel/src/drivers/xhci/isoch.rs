@@ -938,8 +938,8 @@ impl IsoHost for XhciUvc<'_> {
             // The ring was never handed to a running endpoint: it is ours to drop.
             // SAFETY: the allocations above, with their own layouts, referenced by no context that took effect.
             unsafe {
-                alloc::alloc::dealloc(ring as *mut u8, rl);
-                alloc::alloc::dealloc(bufs, bl);
+                crate::arch::memory::dma::free_ident(ring as u64, rl.size(), rl.align());
+                crate::arch::memory::dma::free_ident(bufs as u64, bl.size(), bl.align());
             }
             return Err(e);
         }

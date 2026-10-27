@@ -67,7 +67,7 @@ pub use super::xwin::current_slot;
 /// window) and the buffer is refused otherwise. (2) coherency. The BCM2711 PCIe and Tegra XUSB paths do not
 /// snoop the data cache, so the zeroed buffer is cleaned and invalidated to the PoC here, the ONE place
 /// (`super::cache::clean_invalidate_range`), before any device can see it. One arch-neutral body with per-arch
-/// bus/settle hooks is owed (DMA-ONEBODY); nothing is ever freed (DMA-FREE owed), as on x86.
+/// bus/settle hooks is owed (DMA-ONEBODY); `free` / `free_ident` give memory back, as on x86 (DMA-FREE, B989).
 pub mod dma {
     use alloc::alloc::{alloc_zeroed, dealloc, Layout};
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -77,12 +77,16 @@ pub mod dma {
         pub va: u64,
         pub pa: u64,
         pub len: usize,
+        /// The alignment it was allocated with, so `free` can rebuild its layout (DMAALLOCEHCI B989).
+        pub align: usize,
     }
 
     /// Successful `alloc` calls since boot (the KAT's uncounted `take`s excluded).
     static ALLOCS: AtomicU64 = AtomicU64::new(0);
     /// Bytes those calls handed out.
     static BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Buffers given back through `free` / `free_ident` (DMAALLOCEHCI B989).
+    static FREES: AtomicU64 = AtomicU64::new(0);
 
     /// The 32-bit bus window a `below_4g` device can address (the Pi's RC inbound window is RAM @ 0, 4 GiB).
     const LIMIT_4G: u64 = 0x1_0000_0000;
@@ -130,7 +134,7 @@ pub mod dma {
         }
         // The zeros reach DRAM and no stale line survives to shadow the device's later writes.
         super::super::cache::clean_invalidate_range(va as usize, bytes);
-        Some(DmaBuf { va, pa: pa.unwrap_or(0), len: bytes })
+        Some(DmaBuf { va, pa: pa.unwrap_or(0), len: bytes, align })
     }
 
     /// The drivers' shim: one u64 that is both the CPU pointer and the bus address (0 = no memory), as on x86.
@@ -141,8 +145,37 @@ pub mod dma {
         }
     }
 
-    /// Give a buffer back. A no-op today, as on x86 (DMA-FREE owed).
-    pub fn free(_b: DmaBuf) {}
+    /// Give a buffer back (DMA-FREE, DMAALLOCEHCI B989): deallocated with the layout it was allocated with
+    /// (`len`, `align`) and counted in the census. A zero length or an invalid layout is a no-op.
+    ///
+    /// # Safety
+    /// `b` came from `alloc` (or is `free_ident`'s rebuild of an `ident` buffer) and is given back once, and no
+    /// device can still reach it: never handed to one, or its engine is stopped / the command that would have used
+    /// it never took effect. `DmaBuf`'s fields are public, so this is the caller's promise, not the type's.
+    pub unsafe fn free(b: DmaBuf) {
+        if b.len == 0 {
+            return;
+        }
+        let Ok(layout) = Layout::from_size_align(b.len, b.align) else {
+            return;
+        };
+        // SAFETY: the caller's contract above; the layout is the one `take` allocated with.
+        unsafe { dealloc(b.va as *mut u8, layout) };
+        FREES.fetch_add(1, Relaxed);
+    }
+
+    /// `ident`'s inverse: give back a buffer `ident(bytes, align)` returned as `va` (0 is a no-op, as `ident`'s
+    /// "no memory"). The identity assumption (`pa == va`) stays in this module.
+    ///
+    /// # Safety
+    /// As `free`: `va` came from `ident(bytes, align)` with these exact arguments and no device can still reach it.
+    pub unsafe fn free_ident(va: u64, bytes: usize, align: usize) {
+        if va == 0 {
+            return;
+        }
+        // SAFETY: the caller's contract above.
+        unsafe { free(DmaBuf { va, pa: va, len: bytes, align }) };
+    }
 
     /// The boot's DMA census, printed once on a `census` / tests-at-boot build (the caller is owed: DMA-CENSUS-ARM).
     pub fn census() {
@@ -150,7 +183,7 @@ pub mod dma {
         if DONE.swap(true, Relaxed) {
             return;
         }
-        crate::census_println!("[dma] census allocs={} bytes={}", ALLOCS.load(Relaxed), BYTES.load(Relaxed));
+        crate::census_println!("[dma] census allocs={} bytes={} frees={}", ALLOCS.load(Relaxed), BYTES.load(Relaxed), FREES.load(Relaxed));
     }
 
     /// `tests dma`: alignment, zeroing, the below-4G refusal against a fake bound, and the identity window.
@@ -184,15 +217,27 @@ pub mod dma {
             None => true,
         };
         let zero_len = take(0, 64, None).is_none();
-        let pass = align_ok && zero_ok && ident_ok && refused && zero_len;
+        // DMAALLOCEHCI (B989): the free leg — one counted alloc given back through `free`; both counters move by one.
+        let (a0, f0) = (ALLOCS.load(Relaxed), FREES.load(Relaxed));
+        let free_ok = match alloc(4096, 4096, false) {
+            Some(b) => {
+                // SAFETY: allocated just above by `alloc`; no device saw it.
+                unsafe { free(b) };
+                ALLOCS.load(Relaxed) == a0 + 1 && FREES.load(Relaxed) == f0 + 1
+            }
+            None => false,
+        };
+        let pass = align_ok && zero_ok && ident_ok && refused && zero_len && free_ok;
         serial_println!(
-            ":: DMA: align={} zero={} below4g={} ident={} census={}/{} -> {} ::",
+            ":: DMA: align={} zero={} below4g={} ident={} free={} census={}/{}/{} -> {} ::",
             if align_ok { "ok" } else { "bad" },
             if zero_ok { "ok" } else { "bad" },
             if refused { "refused" } else { "bad" },
             if ident_ok { "ok" } else { "bad" },
+            if free_ok { "ok" } else { "bad" },
             ALLOCS.load(Relaxed),
             BYTES.load(Relaxed),
+            FREES.load(Relaxed),
             if pass { "PASS" } else { "FAIL" }
         );
     }

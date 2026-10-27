@@ -9196,7 +9196,7 @@ impl XhciController {
                     Ok(r) => Self::piusb36_report("step2-fresh-A5-heap", fresh as u64, r.status, r.residue, Some(0xA5)),
                     Err(e) => serial_println!(":: USB: [usb36] step2 fresh-A5 ERR {:?} ::", e),
                 }
-                unsafe { alloc::alloc::dealloc(fresh, layout); }
+                unsafe { crate::arch::memory::dma::free_ident(fresh as u64, layout.size(), layout.align()); }
             }
         }
 

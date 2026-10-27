@@ -5005,8 +5005,8 @@ fn reserve2_cut(v: &mut alloc::vec::Vec<(u64, u64)>, s: u64, e: u64) {
 /// as asked, and comes from the kernel heap, which this kernel identity-maps (`init` picks a Usable region
 /// and maps it VA == PA), so today a heap address IS its bus address. The bus address is still computed
 /// through `translate` (this file's one page walk), so a future IOMMU or non-identity map (ZENBOOK-IOMMU)
-/// changes ONE place: `DmaBuf::pa`. Nothing is ever freed: every device holds its rings for the whole boot
-/// (`free` is a no-op that says so; freeing on device close is owed, DMA-FREE).
+/// changes ONE place: `DmaBuf::pa`. Most devices hold their rings for the whole boot; an error path that never
+/// handed a buffer to a running engine gives it back through `free` / `free_ident` (DMA-FREE, DMAALLOCEHCI B989).
 pub mod dma {
     use alloc::alloc::{alloc_zeroed, dealloc, Layout};
     use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -5016,12 +5016,16 @@ pub mod dma {
         pub va: u64,
         pub pa: u64,
         pub len: usize,
+        /// The alignment it was allocated with, so `free` can rebuild its layout (DMAALLOCEHCI B989).
+        pub align: usize,
     }
 
     /// Successful `alloc` calls since boot (the KAT's uncounted `take`s excluded).
     static ALLOCS: AtomicU64 = AtomicU64::new(0);
     /// Bytes those calls handed out.
     static BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Buffers given back through `free` / `free_ident` (DMAALLOCEHCI B989).
+    static FREES: AtomicU64 = AtomicU64::new(0);
 
     /// The 32-bit bus window a `below_4g` device can address.
     const LIMIT_4G: u64 = 0x1_0000_0000;
@@ -5060,7 +5064,7 @@ pub mod dma {
             unsafe { dealloc(p, layout) };
             return None;
         }
-        Some(DmaBuf { va, pa: pa.unwrap_or(0), len: bytes })
+        Some(DmaBuf { va, pa: pa.unwrap_or(0), len: bytes, align })
     }
 
     /// The drivers' shim: one u64 that is both the CPU pointer and the bus address, which is how every converted
@@ -5073,9 +5077,37 @@ pub mod dma {
         }
     }
 
-    /// Give a buffer back. A no-op today: no driver frees its DMA memory (each device owns it for the whole boot),
-    /// and handing memory back while a device may still DMA into it is the bug a real teardown must get right.
-    pub fn free(_b: DmaBuf) {}
+    /// Give a buffer back (DMA-FREE, DMAALLOCEHCI B989): deallocated with the layout it was allocated with
+    /// (`len`, `align`) and counted in the census. A zero length or an invalid layout is a no-op.
+    ///
+    /// # Safety
+    /// `b` came from `alloc` (or is `free_ident`'s rebuild of an `ident` buffer) and is given back once, and no
+    /// device can still reach it: never handed to one, or its engine is stopped / the command that would have used
+    /// it never took effect. `DmaBuf`'s fields are public, so this is the caller's promise, not the type's.
+    pub unsafe fn free(b: DmaBuf) {
+        if b.len == 0 {
+            return;
+        }
+        let Ok(layout) = Layout::from_size_align(b.len, b.align) else {
+            return;
+        };
+        // SAFETY: the caller's contract above; the layout is the one `take` allocated with.
+        unsafe { dealloc(b.va as *mut u8, layout) };
+        FREES.fetch_add(1, Relaxed);
+    }
+
+    /// `ident`'s inverse: give back a buffer `ident(bytes, align)` returned as `va` (0 is a no-op, as `ident`'s
+    /// "no memory"). The identity assumption (`pa == va`) stays in this module.
+    ///
+    /// # Safety
+    /// As `free`: `va` came from `ident(bytes, align)` with these exact arguments and no device can still reach it.
+    pub unsafe fn free_ident(va: u64, bytes: usize, align: usize) {
+        if va == 0 {
+            return;
+        }
+        // SAFETY: the caller's contract above.
+        unsafe { free(DmaBuf { va, pa: va, len: bytes, align }) };
+    }
 
     /// The boot's DMA census, printed once (at desktop-ready, `bootpace`) on a `census` / tests-at-boot build.
     pub fn census() {
@@ -5083,7 +5115,7 @@ pub mod dma {
         if DONE.swap(true, Relaxed) {
             return;
         }
-        crate::census_println!("[dma] census allocs={} bytes={}", ALLOCS.load(Relaxed), BYTES.load(Relaxed));
+        crate::census_println!("[dma] census allocs={} bytes={} frees={}", ALLOCS.load(Relaxed), BYTES.load(Relaxed), FREES.load(Relaxed));
     }
 
     /// `tests dma`: alignment, zeroing, the below-4G refusal against a fake bound, and the identity shim's pa.
@@ -5117,15 +5149,27 @@ pub mod dma {
             None => true,
         };
         let zero_len = take(0, 64, None).is_none();
-        let pass = align_ok && zero_ok && ident_ok && refused && zero_len;
+        // DMAALLOCEHCI (B989): the free leg — one counted alloc given back through `free`; both counters move by one.
+        let (a0, f0) = (ALLOCS.load(Relaxed), FREES.load(Relaxed));
+        let free_ok = match alloc(4096, 4096, false) {
+            Some(b) => {
+                // SAFETY: allocated just above by `alloc`; no device saw it.
+                unsafe { free(b) };
+                ALLOCS.load(Relaxed) == a0 + 1 && FREES.load(Relaxed) == f0 + 1
+            }
+            None => false,
+        };
+        let pass = align_ok && zero_ok && ident_ok && refused && zero_len && free_ok;
         serial_println!(
-            ":: DMA: align={} zero={} below4g={} ident={} census={}/{} -> {} ::",
+            ":: DMA: align={} zero={} below4g={} ident={} free={} census={}/{}/{} -> {} ::",
             if align_ok { "ok" } else { "bad" },
             if zero_ok { "ok" } else { "bad" },
             if refused { "refused" } else { "bad" },
             if ident_ok { "ok" } else { "bad" },
+            if free_ok { "ok" } else { "bad" },
             ALLOCS.load(Relaxed),
             BYTES.load(Relaxed),
+            FREES.load(Relaxed),
             if pass { "PASS" } else { "FAIL" }
         );
     }
