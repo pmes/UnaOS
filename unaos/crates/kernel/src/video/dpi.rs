@@ -68,7 +68,7 @@ pub fn edid_native() -> Option<(u32, u32)> {
 }
 
 /// `(effective ppi, scale x2)` for a framebuffer `fb_w` px wide (0 = take the native width). Pure.
-pub fn compute(fb_w: usize) -> (u32, u32) {
+pub fn compute(fb_w: usize) -> (u32, u32) { if let Some(k) = panelknob::ppi() { return (k, s2_for(k)); }
     let Some((hact, native)) = edid_native() else {
         return (0, S2_MIN);
     };
@@ -101,7 +101,7 @@ pub fn latch(fb_w: usize) -> u32 {
     let (ppi, s2) = compute(fb_w);
     PPI.store(ppi, Ordering::Relaxed);
     match S2.compare_exchange(0, s2, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => s2,
+        Ok(_) => { panelknob::note(fb_w, s2); s2 }
         Err(won) => won,
     }
 }
@@ -233,4 +233,44 @@ const _: () = {
 /// (FONTSCRAFT) switches `text.rs` to this seam. Pure read of the live scale.
 pub fn face_ppi() -> u32 {
     s2() * BASE_PPI / 2
+}
+
+/// ZOOMPANEL (rmbp-ledger B842) — the compile-time PANEL DENSITY OVERRIDE `UNAOS_PPI`, WC-D's shape (`UNAOS_FBW` /
+/// `UNAOS_FBH`, `arch/aarch64/mailbox.rs` `FORCE_W`), read once here. Set, it is the EFFECTIVE ppi `compute` answers
+/// (the EDID is not asked) and the scale is `s2_for` of it, so every reader — the latch, the furniture's metrics,
+/// the faces, Settings — agrees; `relatch_edid` never moves a latch that has a ppi, so a later EDID cannot undo it.
+/// It exists so an x86 QEMU run at the rMBP's 2880x1800 (arroyo's VGA `xres`/`yres`) lays out at 2.0 as the metal
+/// does: QEMU's generated EDID claims about 100 ppi. Unset (the default) both calls fold to nothing. `option_env!`
+/// lands in rustc's dep-info as `env-dep`, so cargo rebuilds when the value changes. A build made with it is NOT the
+/// flashable default image.
+mod panelknob {
+    const PPI: u32 = match option_env!("UNAOS_PPI") {
+        None => 0,
+        Some(s) if s.is_empty() => 0,
+        Some(s) => match u32::from_str_radix(s, 10) {
+            Ok(v) => v,
+            Err(_) => panic!("UNAOS_PPI must be a decimal ppi"),
+        },
+    };
+
+    /// The knob's ppi, `None` unset.
+    #[inline(always)]
+    pub fn ppi() -> Option<u32> {
+        if PPI == 0 {
+            None
+        } else {
+            Some(PPI)
+        }
+    }
+
+    /// `[dpi] panel=<w>x<h>@<scale> src=knob ppi=<n>` once (the latch's CAS winner), on a knob build only. The height
+    /// is read without blocking (0 if the panel is held).
+    #[inline(always)]
+    pub fn note(fb_w: usize, s2: u32) {
+        if PPI == 0 {
+            return;
+        }
+        let h = crate::video::panel_info_nonblocking().map_or(0, |i| i.height);
+        crate::serial_println!("[dpi] panel={}x{}@{} src=knob ppi={}", fb_w, h, super::scale_str(s2), PPI);
+    }
 }

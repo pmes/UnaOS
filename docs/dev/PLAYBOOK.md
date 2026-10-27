@@ -63,6 +63,9 @@ UNAOS_WC=1 ./arroyo test                                                     # x
 ```
 Then certify the artifact, never the diff: `LC_ALL=C grep -a -o -F '<witness>' target/aarch64_esp/kernel.elf | wc -l`
 for every family the flight needs, and a control string that must be 0.
+The rMBP panel on x86 QEMU (ZOOMPANEL B842): `UNAOS_FBW=2880 UNAOS_FBH=1800` arm the default VGA at that size (`xres`/`yres`/`edid`/`vgamem_mb`)
+and the loader picks it when OVMF offers it; `UNAOS_PPI=221` is the ppi the scale is taken from (2.0). The leg: those three plus
+`UNAOS_WC=1 UNAOS_FACET=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1 UNAOS_QEMU_FULL=1 ./arroyo test 240`, scored by `scripts/specs/x86-panel.spec`.
 
 ## 4. Stage and card (Orin)
 1. Stage the tree (never a `target/` path to Peter):

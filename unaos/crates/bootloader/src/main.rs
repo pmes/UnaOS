@@ -622,8 +622,8 @@ fn main() -> Status { #[cfg(target_arch = "x86_64")] let tsc_loader_entry: u64 =
         //      linear mode at the firmware's chosen resolution, else the largest linear within budget.
         let by_native = native
             .and_then(|res| gop.modes().find(|m| m.info().resolution() == res && usable(m.info())));
-        let target_is_native = by_native.is_some();
-        let target: Option<uefi::proto::console::gop::Mode> = if by_native.is_some() {
+        let by_knob = panelknob::pick(&gop, &usable); let target_is_native = by_knob.is_none() && by_native.is_some();
+        let target: Option<uefi::proto::console::gop::Mode> = if by_knob.is_some() { by_knob } else if by_native.is_some() {
             by_native
         } else if cur_linear {
             None
@@ -1776,5 +1776,42 @@ mod kelfcheck {
         loop {
             boot::stall(core::time::Duration::from_secs(1));
         }
+    }
+}
+
+/// ZOOMPANEL (rmbp-ledger B842) — the loader's half of WC-D's compile-time PANEL OVERRIDE (`UNAOS_FBW` /
+/// `UNAOS_FBH`, the same two knobs `arch/aarch64/mailbox.rs` reads as `FORCE_W`/`FORCE_H`, the same meaning: the
+/// panel's size). The pick rule: the knob's size when the firmware offers it as a usable mode (linear, inside the
+/// back-buffer budget), else today's rule (EDID-native, else the firmware's current mode) unchanged — a mode the
+/// firmware does not offer is said once and changes nothing else. Unset (the default), `pick` is `None` before any
+/// work, so the call on the selection line compiles to nothing. arroyo arms QEMU's VGA at the same size
+/// (`-global VGA.xres/yres/edid`), so an x86 QEMU run can be the rMBP's 2880x1800. `option_env!` lands in rustc's
+/// dep-info as `env-dep`, so cargo rebuilds this crate when either value changes. A build made with them is NOT
+/// the flashable default image.
+mod panelknob {
+    use uefi::proto::console::gop::{GraphicsOutput, Mode, ModeInfo};
+
+    const fn knob(v: Option<&str>) -> usize {
+        match v {
+            None => 0,
+            Some(s) if s.is_empty() => 0,
+            Some(s) => match u32::from_str_radix(s, 10) {
+                Ok(n) => n as usize,
+                Err(_) => panic!("UNAOS_FBW / UNAOS_FBH must be decimal pixels"),
+            },
+        }
+    }
+
+    const W: usize = knob(option_env!("UNAOS_FBW"));
+    const H: usize = knob(option_env!("UNAOS_FBH"));
+
+    /// The first usable mode at exactly the knob's size, or `None` (unset, or not offered).
+    pub fn pick(gop: &GraphicsOutput, usable: impl Fn(&ModeInfo) -> bool) -> Option<Mode> {
+        if W == 0 || H == 0 {
+            return None;
+        }
+        let m = gop.modes().find(|m| m.info().resolution() == (W, H) && usable(m.info()));
+        log::info!("GOP: panel knob {}x{} -> {}", W, H, if m.is_some() { "offered" } else { "not offered (today's pick)" });
+        m
     }
 }
