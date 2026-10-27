@@ -645,7 +645,7 @@ fn note(frame: &[u8], rssi: i8, h: &mut Heard) {
     }
     if let Some(b) = assoc::bss_match(frame, &h.target) {
         if !b.protected {
-            h.scan.see(b.bssid, b.channel.unwrap_or(0), rssi, crate::arch::ticks()); if sub == 0x5 && frame[4..10] == h.me { h.resp |= super::super::data::resp_bit(b.channel.unwrap_or(0)); } // STATIONROAM-ACTIVE (B951): an answer to our probe, by its DS channel
+            h.scan.see(b.bssid, b.channel.unwrap_or(0), rssi, crate::arch::ticks()); if sub == 0x5 && frame[4..10] == h.me { h.resp |= super::super::data::resp_bit(b.channel.unwrap_or(0)); } if Some(b.bssid) == h.home { if let Some(c) = wifi_core::ieee80211::country_ie(frame) { h.scan.country = Some(c); } } // STATIONROAM-SWEEP (B958): the home BSS's Country element (802.11d) for COUNTRYCOVER; STATIONROAM-ACTIVE (B951): an answer to our probe, by its DS channel
         }
     }
 }
@@ -828,14 +828,14 @@ fn retune(st: &mut Station, ch: u8) -> Result<(), &'static str> {
 fn sweep(st: &mut Station, why: &str) -> Result<u32, &'static str> {
     let home = st.ch as u8;
     let t0 = crate::arch::ticks();
-    let (plan, n) = super::super::data::dwell_plan(home);
+    let (plan, n, passive) = super::super::data::sweep_plan(home, why == "lost", st.seen.join.scan.country.as_ref()); // STATIONROAM-SWEEP (B958): lost = 1..=12 without home, grid first, 12 passive unless COUNTRYCOVER
     let mut ok = true; let (mut probes, mut answered) = (0u32, 0u32); // STATIONROAM-ACTIVE (B951): probes SENT, dwells answered
     for c in plan[..n].iter() {
         if retune(st, *c).is_err() {
             ok = false;
             break;
         }
-        let (s, a) = dwell(st); probes += s; answered += a; // STATIONROAM-ACTIVE (B951): one probe, then the dwell (early end on an answer)
+        let (s, a) = dwell(st, passive & (1u16 << *c) != 0); probes += s; answered += a; // STATIONROAM-SWEEP (B958): a passive dwell sends no probe; STATIONROAM-ACTIVE (B951): one probe, then the dwell (early end on an answer)
     }
     let back = retune(st, home);
     let heard = st.seen.join.scan.e.iter().flatten().filter(|s| s.last_ms >= t0 && s.channel != home).count() as u32;
@@ -847,9 +847,10 @@ fn sweep(st: &mut Station, why: &str) -> Result<u32, &'static str> {
         }
         list.push_str(&alloc::format!("{}", c));
     }
+    let mut plist = String::new(); for c in plan[..n].iter().filter(|c| passive & (1u16 << **c) != 0) { if !plist.is_empty() { plist.push(','); } plist.push_str(&alloc::format!("{}", c)); } if plist.is_empty() { plist.push('-'); } // STATIONROAM-SWEEP (B958): the passive dwells, `-` for none
     serial_println!(
-        "[wifi10] station sweep why={} home={} plan={} dwell={}ms heard={} stall={}ms probes={} answered={} -> {} — the data path stalls for the sweep; the window's own channel is not re-dwelled (STATIONROAM-XCHAN B898); one probe request per dwell (STATIONROAM-ACTIVE B951)",
-        why, home, list, super::super::data::ROAM_DWELL_MS, heard, stall, probes, answered, if ok && back.is_ok() { "done" } else { "failed:tune" }
+        "[wifi10] station sweep why={} home={} plan={} passive={} dwell={}ms heard={} stall={}ms probes={} answered={} -> {} — the data path stalls for the sweep; the window's own channel is not re-dwelled (STATIONROAM-XCHAN B898); one probe request per dwell (STATIONROAM-ACTIVE B951)",
+        why, home, list, plist, super::super::data::ROAM_DWELL_MS, heard, stall, probes, answered, if ok && back.is_ok() { "done" } else { "failed:tune" }
     );
     back.map(|_| heard)
 }
@@ -864,13 +865,11 @@ fn sweep(st: &mut Station, why: &str) -> Result<u32, &'static str> {
 /// controller do not count it). Then the receiver in `ROAM_SLICE_MS` slices until `data::dwell_end`: `ROAM_DWELL_MS` from the fire
 /// (the spin counts against it), or `ROAM_PROBE_MS` once a probe response of the SSID to us from a BSS on this channel was noted
 /// (`Heard.resp`, cleared before the fire). Returns (1 if the probe was SENT, 1 if the dwell was answered).
-fn dwell(st: &mut Station) -> (u32, u32) {
+fn dwell(st: &mut Station, passive: bool) -> (u32, u32) {
     let ch = st.ch as u8;
     let t0 = crate::arch::ticks();
     st.seen.join.resp = 0;
-    let n = st.link.reserve();
-    let probe = tx::probe_request(st.link.mac(), st.ch);
-    let r = tx::fire_frame(st.bar0, &st.prep, &probe, st.ch, n, "sweep-probe", tx::RATE_1M, &mut st.w);
+    let r = if passive { None } else { let n = st.link.reserve(); let probe = tx::probe_request(st.link.mac(), st.ch); Some(tx::fire_frame(st.bar0, &st.prep, &probe, st.ch, n, "sweep-probe", tx::RATE_1M, &mut st.w)) }; // STATIONROAM-SWEEP (B958): a passive dwell (12/13 without COUNTRYCOVER) sends nothing and listens the full ROAM_DWELL_MS
     loop {
         let el = crate::arch::ticks().saturating_sub(t0);
         if super::super::data::dwell_end(ch, st.seen.join.resp, el) {
@@ -879,7 +878,7 @@ fn dwell(st: &mut Station) -> (u32, u32) {
         let left = super::super::data::ROAM_DWELL_MS.saturating_sub(el).min(super::super::data::ROAM_SLICE_MS);
         rx::poll(st.bar0, &mut st.rxr, &mut st.seen, st.ch, left * 1000, &mut st.w);
     }
-    (r.sent() as u32, super::super::data::answered(ch, st.seen.join.resp) as u32)
+    (r.map_or(false, |r| r.sent()) as u32, super::super::data::answered(ch, st.seen.join.resp) as u32)
 }
 
 // ── STATIONROAM-BGSCAN (rmbp-ledger B955): one PS-announced off-channel dwell per window on a busy station ─────────────────────────
@@ -954,7 +953,7 @@ fn bgscan(st: &mut Station) -> Result<u32, &'static str> {
         if ps == "ack" {
             let d0 = crate::arch::ticks();
             if retune(st, c).is_ok() {
-                let (s, a) = dwell(st);
+                let (s, a) = dwell(st, false); // STATIONROAM-SWEEP (B958): the background plan is the grid, always active
                 probes = s;
                 answered = a;
             } else {

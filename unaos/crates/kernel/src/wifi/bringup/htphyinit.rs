@@ -1049,7 +1049,7 @@ pub(super) fn tx_pwr_ctl(h: &mut Ht, p: &[PwrIn; 3]) -> TxPctl {
 /// channel switch on the PHY `run` initialised this boot — ONLY `tune` (the 2059 PLL, the PHY channel setup, tx_power_fix, the
 /// 8 ms settle), the same fn `run` calls twice. No one-shot: b43's switch re-runs no init, no tx_prep, no power-control setup
 /// (2.4 GHz power control reads the band's SPROM block, `phy_ht.c` tx_power_ctl_setup) and touches no DMA. Channels 1..12 only:
-/// 13/14 take spuravoid=1 (`phy_ht.c:740-741`), whose PMU PLL step is outside the d11 window (STATIONROAM-SWEEP owed). Refused
+/// 13/14 take spuravoid=1 (`phy_ht.c:740-741`), whose PMU PLL step is outside the d11 window (STATIONROAM-SWEEP B958: refused by name — ChipCommon is outside the mapped 0x2000 BAR0 extent and the PMU's core on cc rev 37 is unmeasured; STATIONROAM-PMU owed). Refused
 /// BEFORE any write. Preconditions (the caller, `join::retune`): the MAC suspended, the SHM cookie written, no spinlock held
 /// (`tune` sleeps), the d11 owned (the Station taken out of `STATION`).
 #[cfg(feature = "wifi10")]

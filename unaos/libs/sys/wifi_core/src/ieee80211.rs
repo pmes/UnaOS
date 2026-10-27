@@ -449,3 +449,62 @@ pub fn build_null_data_pm(sta: Mac, bssid: Mac, seq: u16, pm: bool) -> Vec<u8> {
     }
     f
 }
+
+/// STATIONROAM-SWEEP (rmbp-ledger B958): the Country element (IEEE 802.11-2020 §9.4.2.8, the 802.11d regulatory domain).
+pub const EID_COUNTRY: u8 = 7;
+
+/// STATIONROAM-SWEEP (B958): a beacon's Country element — the country string (2 letters + the environment octet) and the 2.4 GHz
+/// channels 1..14 its subband triplets cover (bit c = channel c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Country {
+    pub cc: [u8; 3],
+    pub chans: u16,
+}
+
+/// STATIONROAM-SWEEP (B958): the Country element of a beacon / probe response. TOTAL: `None` unless the frame is one, its IE list fits
+/// (a declared IE running past the frame is malformed) and it carries a Country element of at least the 3-octet string whose rest is
+/// whole (first channel, number of channels, max power) triplets plus at most one pad octet. A triplet whose first octet is 201 or more
+/// (an operating extension, §9.4.2.8) is skipped; channels past 14 set no bit.
+pub fn country_ie(frame: &[u8]) -> Option<Country> {
+    if frame.len() < 24 + 12 {
+        return None;
+    }
+    let (ty, sub) = subtype_of(frame[0]);
+    if ty != FC_TYPE_MGMT || (sub != SUBTYPE_BEACON && sub != SUBTYPE_PROBE_RESP) {
+        return None;
+    }
+    let mut found = None;
+    let mut i = 24 + 12;
+    while i < frame.len() {
+        if i + 2 > frame.len() {
+            return None;
+        }
+        let eid = frame[i];
+        let len = frame[i + 1] as usize;
+        if i + 2 + len > frame.len() {
+            return None;
+        }
+        if eid == EID_COUNTRY && found.is_none() {
+            let body = &frame[i + 2..i + 2 + len];
+            if len < 3 || (len - 3) % 3 == 2 {
+                return None;
+            }
+            let mut c = Country { cc: [body[0], body[1], body[2]], chans: 0 };
+            let mut k = 3;
+            while k + 3 <= len {
+                let (first, n) = (body[k] as u16, body[k + 1] as u16);
+                if first < 201 {
+                    for ch in first..first + n {
+                        if (1..=14).contains(&ch) {
+                            c.chans |= 1 << ch;
+                        }
+                    }
+                }
+                k += 3;
+            }
+            found = Some(c);
+        }
+        i += 2 + len;
+    }
+    found
+}
