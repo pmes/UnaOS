@@ -17,7 +17,8 @@
 //! device-link, abstract and multiProcessElements profiles, iccMAX. Owed: output-side mBA / B2A, CMYK printing intents;
 //! display profiles: matrix/TRC built ([`display`], KERNEL-DISPLAY-ICC SR372), LUT-based owed.
 //!
-//! A matrix/TRC source runs over RGBA in integers (KERNEL-ICC-INT, SR376: DisplayTransform's Q14 shape); a caller opening
+//! A matrix/TRC source runs over RGBA in integers (KERNEL-ICC-INT, SR376: DisplayTransform's Q14 shape), an RGB LUT
+//! source too, and RGBA16 through [`Transform::apply_rgba16`] (KERNEL-ICC-INT-LUT / KERNEL-PNG16-ICC, SR380); a caller opening
 //! many files keeps one built transform per profile in a [`TransformCache`] (KERNEL-ICC-CACHE, SR376).
 //!
 //! `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`; the one dependency is libm (`powf`, `cbrtf`).
