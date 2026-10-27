@@ -727,7 +727,7 @@ pub struct S3Census {
 }
 
 /// Scan one AML table for `NameOp [RootChar] <seg>` followed by a sleep-type package (the `_S5_` grammar).
-#[cfg(feature = "lidsleep")]
+/// ZENBOOKSUSPEND (Z48): ungated (was `lidsleep`) — `sx_pkg` (file tail) walks every x86 image's tables through it.
 unsafe fn scan_sx(table_addr: u64, seg: &[u8; 4]) -> Option<(u8, u8)> {
     let len = acpi::table_len(table_addr);
     if len <= acpi::SDT_HEADER_LEN { return None; }
@@ -776,10 +776,10 @@ pub fn s3_census() -> Option<S3Census> {
         let dsdt: u64 = dsdt().map_or(0, |t| t.as_ptr() as u64);
         // DSDT-ONE (B996): `dsdt()`'s locator, the stricter one (signature + DSDT_MAX); a refused DSDT reads as 0, so
         // `_S3_` still comes from the SSDTs and `pts`/`wak` read 0. LINE-NEUTRAL: three lines for the old three.
-        let mut s3 = if dsdt != 0 { scan_sx(dsdt, b"_S3_") } else { None };
-        if s3.is_none() {
-            acpi::each_table(sdt, es, |addr, sig| { if sig == b"SSDT" { s3 = scan_sx(addr, b"_S3_"); } s3.is_some() });
-        }
+        let s3 = sx_pkg(sdt, es, dsdt, b"_S3_");
+        // ZENBOOKSUSPEND (Z48): the DSDT-then-SSDT `_S3_` walk that stood here is `sx_pkg` (file tail), the ONE walk, shared
+        // with `power::suspend`'s census (`suspend_census`). LINE-NEUTRAL: one call and these three comment lines for the
+        // old four, so no `panic::Location` below moves.
         let (pts, wak) = if dsdt != 0 { (names(dsdt, b"_PTS"), names(dsdt, b"_WAK")) } else { (false, false) };
         Some(S3Census { facs, waking_vec, s3, pts, wak })
     }
@@ -1039,4 +1039,72 @@ pub fn gpe0_en_only(g: &Gpe0, gpe: Option<u8>) -> (u64, u64) {
         }
     }
     (was, now)
+}
+
+// ── ZENBOOKSUSPEND (zenbook-ledger Z48) — the suspend census: `_S3_`, the FADT's low-power S0 idle flag, the LPIT — FILE TAIL
+// `power::suspend` (`tests suspend`) asks what the firmware offers toward a sleep deeper than `idle`, on every x86 image (the
+// Zenbook line carries no `lidsleep`, so `s3_census` is not linked there). READ ONLY, no AML runs (BP-power-4): the `_S3_`
+// package through `scan_sx` (ungated by this arc) in the ONE DSDT-then-SSDT walk `sx_pkg` (`s3_census` calls it too); FADT
+// flags bit 21 LOW_POWER_S0_IDLE_CAPABLE (ACPI 6.x §5.2.9); the LPIT (Intel's Low Power Idle Table: a 36-byte header, then
+// LPI structures each carrying its u32 Length at +4), counted, never interpreted. Entering S0ix is the uPEP `_DSM`'s (AML):
+// owed as ZENBOOK-SUSPEND-S0IX.
+
+/// FADT flag bit 21: LOW_POWER_S0_IDLE_CAPABLE — the platform's low-power idle in S0 is at least as good as S3.
+const FADT_FLAG_LOW_POWER_S0: u32 = 1 << 21;
+
+/// The first recognisable `seg` sleep-type package (`_S3_`, ...): the DSDT first (`dsdt` = its address, 0 = none), then
+/// each SSDT. The ONE walk; `scan_sx` is the recogniser.
+///
+/// SAFETY: `sdt`/`es` from `acpi::root_sdt`; `dsdt` 0 or `dsdt()`'s table (both on the firmware's identity map).
+pub(crate) unsafe fn sx_pkg(sdt: u64, es: usize, dsdt: u64, seg: &[u8; 4]) -> Option<(u8, u8)> {
+    let mut t = if dsdt != 0 { scan_sx(dsdt, seg) } else { None };
+    if t.is_none() {
+        acpi::each_table(sdt, es, |addr, sig| {
+            if sig == b"SSDT" {
+                t = scan_sx(addr, seg);
+            }
+            t.is_some()
+        });
+    }
+    t
+}
+
+/// What the firmware offers toward suspend (read only).
+#[derive(Clone, Copy, Debug)]
+pub struct SuspendCensus {
+    /// `\_S3_` SLP_TYPa/b, when a recognisable package is in the DSDT or an SSDT.
+    pub s3: Option<(u8, u8)>,
+    /// FADT flags bit 21 (LOW_POWER_S0_IDLE_CAPABLE).
+    pub s0ix: bool,
+    /// LPI structures in the LPIT; `None` = no LPIT.
+    pub lpit: Option<u32>,
+}
+
+/// Read the suspend census. `None` = no RSDP or no FADT. Nothing is written.
+pub fn suspend_census() -> Option<SuspendCensus> {
+    let (sdt, es) = acpi::root_sdt(acpi::rsdp_addr())?;
+    // SAFETY: firmware tables sit on the firmware's identity map; the FADT read is bounded by its length, the LPIT walk by
+    // the LPIT's own length (each structure's Length checked against what is left).
+    unsafe {
+        let fadt = acpi::find_table(sdt, es, b"FACP")?;
+        let fl = acpi::table_len(fadt);
+        let flags = if fl >= FADT_FLAGS + 4 { ((fadt as usize + FADT_FLAGS) as *const u32).read_unaligned() } else { 0 };
+        let dsdt: u64 = dsdt().map_or(0, |t| t.as_ptr() as u64);
+        let s3 = sx_pkg(sdt, es, dsdt, b"_S3_");
+        let lpit = acpi::find_table(sdt, es, b"LPIT").map(|t| {
+            let len = acpi::table_len(t);
+            let mut off = acpi::SDT_HEADER_LEN;
+            let mut n = 0u32;
+            while off + 8 <= len {
+                let l = ((t as usize + off + 4) as *const u32).read_unaligned() as usize;
+                if l < 8 || off + l > len {
+                    break;
+                }
+                n += 1;
+                off += l;
+            }
+            n
+        });
+        Some(SuspendCensus { s3, s0ix: flags & FADT_FLAG_LOW_POWER_S0 != 0, lpit })
+    }
 }

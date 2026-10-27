@@ -60,7 +60,7 @@ fixed-unflown: the image line `esp-zenbook` (Z6, 27 kernel knobs) and its QEMU l
     `map_mmio_window` from re-typing it UC, and the WXN-M2 splitter's named assert fires if that leaf holds kernel text; the
     first boot's `:: x86 fb-wc: retyped N leaf(s) … over lo..hi ::` names the level (a 1 GiB hull = live; the fix splits the
     fb's leaf to 2 MiB / 4 KiB before the retype).
-13. **ZENBOOK-SUSPEND** — S0ix / modern standby (the rMBP's `idle` state has no meaning here until the EC row lands).
+13. **ZENBOOK-SUSPEND** — S0ix / modern standby (the rMBP's `idle` state has no meaning here until the EC row lands). In flight (ZENBOOKSUSPEND, Z48, code-only): `tests suspend`, the read-only census + plan (`[power] suspend plan … s3= s0ix= lpit= lid= panel=none cpu=hlt -> rung=none`); it enters nothing. Owed: ZENBOOK-SUSPEND-S0IX, ZENBOOK-PANEL-DPMS, ZENBOOK-EC-LIDROW, S3-RESUME, ZENBOOK-IDLE-CSTATE.
 14. **ZENBOOK-LOADERTRACE** — closed by ZENBOOK-IMAGELINE (no IVB on the line), Z6: the traces (`read_igpu_trace`,
     `read_gmux_trace`; the call at `unaos/crates/bootloader/src/main.rs:448`, the fns at :1389/:1438) are all
     `cfg(feature = "unaos_ivb")`, which the builder passes only under UNAOS_IVB (`unaos/builder/src/main.rs:1235`); the
