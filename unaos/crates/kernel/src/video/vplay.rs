@@ -322,10 +322,18 @@ fn pack(rgba: &[u8]) -> Vec<u32> {
 /// ONE resampler (`yuv_core::scale::fit` / `nearest_rows`, user-stria's too). KERNELSCALECONVERT (rmbp-ledger B971): only the
 /// shown rows convert ([`Frame::rows`]).
 pub fn blit_fit(dst: &mut [u32], stride: usize, x: usize, y: usize, bw: usize, bh: usize, f: &Frame, bar: Option<u32>) -> (usize, usize) {
+    blit_place(dst, stride, x, y, bw, bh, f, bar, timeline_core::SizePolicy::Letterbox)
+}
+
+/// KERNELPRESENTROWS (rmbp-ledger B1002): [`blit_fit`] by any `fit`: the drawn rect and the source rows are
+/// `SizePolicy::place`'s (Letterbox's is `yuv_core::scale::fit`, byte for byte), only `place(..).src`'s rows converted
+/// ([`Frame::rows_in`]); the box outside the drawn rect is `bar`.
+fn blit_place(dst: &mut [u32], stride: usize, x: usize, y: usize, bw: usize, bh: usize, f: &Frame, bar: Option<u32>, fit: timeline_core::SizePolicy) -> (usize, usize) {
     if f.w == 0 || f.h == 0 || bw == 0 || bh == 0 || !f.fits() {
         return (0, 0);
     }
-    let fr = yuv_core::scale::fit(f.w, f.h, bw, bh);
+    let p = fit.place(f.w, f.h, bw, bh);
+    let (fr, src) = (p.dst, if fit == timeline_core::SizePolicy::Letterbox { None } else { Some(p.src) });
     let (dw, dh, ox, oy) = (fr.w, fr.h, x + fr.x, y + fr.y);
     for r in 0..bh {
         let row = (y + r) * stride;
@@ -340,7 +348,7 @@ pub fn blit_fit(dst: &mut [u32], stride: usize, x: usize, y: usize, bw: usize, b
             dst[row + x..row + x + bw].fill(c);
         }
     }
-    f.rows(dw, dh, |i, s| {
+    f.rows_in(src, dw, dh, |i, s| {
         let row = (oy + i) * stride;
         if row + x + bw <= dst.len() {
             dst[row + ox..row + ox + dw].copy_from_slice(&s[..dw]);
@@ -2091,17 +2099,28 @@ impl Frame {
 
     /// The frame nearest-sampled to `dw x dh`, each output row handed to `row(r, 0RGB)`: a cached or 0RGB frame through
     /// `nearest_rows` (KERNELSCALEONE's blit); planes convert only the shown rows. `fits()`; `dw`, `dh` > 0.
-    pub fn rows(&self, dw: usize, dh: usize, mut row: impl FnMut(usize, &[u32])) {
+    pub fn rows(&self, dw: usize, dh: usize, row: impl FnMut(usize, &[u32])) {
+        self.rows_in(None, dw, dh, row)
+    }
+
+    /// KERNELPRESENTROWS (rmbp-ledger B1002): [`Frame::rows`] over the source rect `src` (inside the frame; None = the whole
+    /// frame): output row `r` from source row `src.y + r * src.h / dh`, column `c` from `src.x + c * src.w / dw`
+    /// (`Canvas::blit_policy`'s positions); planes convert only those rows' sampled columns.
+    pub fn rows_in(&self, src: Option<yuv_core::scale::Rect>, dw: usize, dh: usize, mut row: impl FnMut(usize, &[u32])) {
         let mut out = alloc::vec![0u32; dw];
         match (self.px.rgb.get(), &self.px.src) {
-            (Some(px), _) => yuv_core::scale::nearest_rows(&mono(self.w, self.h, px), dw, dh, &mut out, &mut [], &mut [], |r, s| row(r, s.y)),
+            (Some(px), _) => {
+                let s = src.unwrap_or(yuv_core::scale::Rect { w: self.w, h: self.h, x: 0, y: 0 });
+                let pic = yuv_core::Picture { w: s.w, h: s.h, y: &px[s.y * self.w + s.x..], y_stride: self.w, ..mono(self.w, self.h, px) };
+                yuv_core::scale::nearest_rows(&pic, dw, dh, &mut out, &mut [], &mut [], |r, s| row(r, s.y))
+            }
             (None, Src::Vp8(y, c)) => {
                 let (p, m) = vp8_picture(y, *c);
-                sampled(&p, m, yuv_core::Chroma::Nearest, dw, dh, &mut out, &mut row); // KERNELSCALEONEARM (rmbp-ledger B980): the AV1 arm's column list, Nearest (file tail)
+                sampled(&p, m, yuv_core::Chroma::Nearest, src, dw, dh, &mut out, &mut row); // KERNELSCALEONEARM (rmbp-ledger B980): the AV1 arm's column list, Nearest (file tail)
             }
             (None, Src::Av1(pl, c)) => {
                 let (p, m) = av1_picture(pl, *c);
-                sampled(&p, m, yuv_core::Chroma::Bilinear, dw, dh, &mut out, &mut row); // KERNELSCALECOLS (B978): the distinct sampled source columns only
+                sampled(&p, m, yuv_core::Chroma::Bilinear, src, dw, dh, &mut out, &mut row); // KERNELSCALECOLS (B978): the distinct sampled source columns only
             }
             (None, Src::Rgb) => {}
         }
@@ -2395,8 +2414,9 @@ static AREA_LIVE: AtomicBool = AtomicBool::new(false);
 
 /// A picture's planes sampled to `dw x dh` with `up` chroma, each output row handed to `row(r, 0RGB)` through `out` (`dw` long):
 /// the area filter on a downscale of 2x or more when the job started with it, else the distinct-columns nearest present.
-fn sampled<T: Copy + Into<i32> + Into<u64> + TryFrom<u64>>(p: &yuv_core::Picture<'_, T>, m: yuv_core::Matrix, up: yuv_core::Chroma, dw: usize, dh: usize, out: &mut [u32], row: &mut impl FnMut(usize, &[u32])) {
-    if AREA_LIVE.load(Ordering::Acquire) && (p.w >= 2 * dw || p.h >= 2 * dh) {
+/// KERNELPRESENTROWS (B1002): `src` (None = the whole picture) is the source rect sampled; the area filter takes the whole picture only.
+fn sampled<T: Copy + Into<i32> + Into<u64> + TryFrom<u64>>(p: &yuv_core::Picture<'_, T>, m: yuv_core::Matrix, up: yuv_core::Chroma, src: Option<yuv_core::scale::Rect>, dw: usize, dh: usize, out: &mut [u32], row: &mut impl FnMut(usize, &[u32])) {
+    if src.is_none() && AREA_LIVE.load(Ordering::Acquire) && (p.w >= 2 * dw || p.h >= 2 * dh) {
         let s0 = p.y[0];
         let (mut ry, mut ru, mut rv, mut rgba) = (alloc::vec![s0; dw], alloc::vec![s0; dw], alloc::vec![s0; dw], alloc::vec![0u8; dw * 4]);
         yuv_core::scale::area_rows(p, dw, dh, &mut ry, &mut ru, &mut rv, |r, s| {
@@ -2406,12 +2426,13 @@ fn sampled<T: Copy + Into<i32> + Into<u64> + TryFrom<u64>>(p: &yuv_core::Picture
         return;
     }
     let idx: Vec<u32> = (0..p.h.max(p.w) as u32).collect(); // the source row / column each output row / column samples: the scaler's own index
+    let s = src.unwrap_or(yuv_core::scale::Rect { w: p.w, h: p.h, x: 0, y: 0 }); // KERNELPRESENTROWS (B1002): the index starts at the crop
     let mut sxs = alloc::vec![0u32; dw];
-    yuv_core::scale::nearest_rows(&mono(p.w, 1, &idx), dw, 1, &mut sxs, &mut [], &mut [], |_, _| {});
+    yuv_core::scale::nearest_rows(&mono(s.w, 1, &idx[s.x..]), dw, 1, &mut sxs, &mut [], &mut [], |_, _| {});
     let (cols, at) = distinct(&sxs); // KERNELSCALECOLS (B978): convert only the distinct sampled source columns
     let (mut one, mut rgba) = ([0u32; 1], alloc::vec![0u8; cols.len() * 4]);
     let mut line: (usize, Vec<u32>) = (usize::MAX, Vec::new());
-    yuv_core::scale::nearest_rows(&mono(1, p.h, &idx), 1, dh, &mut one, &mut [], &mut [], |r, s| {
+    yuv_core::scale::nearest_rows(&mono(1, s.h, &idx[s.y..]), 1, dh, &mut one, &mut [], &mut [], |r, s| {
         let sy = s.y[0] as usize;
         if line.0 != sy {
             yuv_core::to_rgba_cols(p, sy, sy + 1, cols.iter().map(|&x| x as usize), m, up, false, &mut rgba);
@@ -2566,6 +2587,15 @@ fn edit_size_note(st: &timeline_core::editor::EditorState, verb: &str, at: i64) 
 // `edit_key`'s playhead to the seek door, whose restarted job presents by the edited state. Wire: `[vplay] present
 // fit=<fill|stretch|adopt> reel=<reel> frame=<W>x<H> box=<w>x<vh> drawn=<dw>x<dh>`, once per change of a non-Letterbox fit
 // (a Letterbox play prints nothing).
+// KERNELPRESENTROWS (rmbp-ledger B1002, handlers.md §5 NLEPROBE-HDR's KERNEL-PRESENT-ROWS): Fill / Stretch no longer convert the
+// whole picture per present (`Px::rgb` -> `fit_rgba` -> `Canvas::blit_policy`): [`place_frame`] is [`blit_place`] (the ONE blit,
+// [`blit_fit`] its Letterbox), `SizePolicy::place` the ONE geometry, [`Frame::rows_in`] over `place(..).src` the ONE converter
+// (`sampled`'s index starts at the crop, the conversion stays on the whole planes at the absolute positions), so a Fill crop's
+// rows outside `src` are never converted. Pixel identity by construction: output (r, c) = source (src.y + min(r * src.h / dh,
+// src.h - 1), src.x + min(c * src.w / dw, src.w - 1)) both before and after, converted by the same conversion (B978 / B980's
+// rows == `colour_rgba_*`), the 0RGB -> RGBA -> 0RGB round trip lossless, the drawn rect the whole box. Fill / Stretch stay
+// nearest under `vid filter area` (the area filter takes the whole picture only). The export's [`fit_rgba`] is unchanged. Wire:
+// the present line gains ` rows=<converted source rows>/<H>` (Adopt: its drawn rows).
 
 /// The last non-Letterbox fit the present's line named (`SizePolicy as u8`; 0 = Letterbox, never printed).
 static PRESENT_FIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -2602,21 +2632,20 @@ fn present_fit(dst: &mut [u32], w: usize, vh: usize, f: &Frame) {
         return;
     };
     if PRESENT_FIT.swap(fit as u8, Ordering::AcqRel) != fit as u8 {
-        serial_println!("[vplay] present fit={} reel={} frame={}x{} box={}x{} drawn={}x{}", fit.name(), reel, f.w, f.h, w, vh, dw, dh);
+        let rows = if fit == SizePolicy::Adopt { dh } else { fit.place(f.w, f.h, w, vh).src.h }; // KERNELPRESENTROWS (B1002): the source rows converted
+        serial_println!("[vplay] present fit={} reel={} frame={}x{} box={}x{} drawn={}x{} rows={}/{}", fit.name(), reel, f.w, f.h, w, vh, dw, dh, rows, f.h);
     }
 }
 
-/// Fill / Stretch: the frame's whole picture through [`fit_rgba`] (the export's door) into `w x vh`, packed into `dst`;
-/// the drawn size is `SizePolicy::place`'s. None when the frame's pixels are not `w x h` or `dst` is short.
+/// Fill / Stretch: KERNELPRESENTROWS (rmbp-ledger B1002): [`blit_place`] into `w x vh` over black, only
+/// `SizePolicy::place`'s source rows converted ([`Frame::rows_in`]); the drawn size is `place`'s. None when the frame
+/// cannot be sampled (`Frame::fits`) or `dst` is short.
 fn place_frame(dst: &mut [u32], w: usize, vh: usize, f: &Frame, fit: timeline_core::SizePolicy) -> Option<(usize, usize)> {
-    let px = f.px.rgb();
-    if f.w == 0 || f.h == 0 || w == 0 || vh == 0 || px.len() != f.w * f.h || dst.len() < w * vh {
+    if dst.len() < w * vh {
         return None;
     }
-    let out = fit_rgba(unpack(px), f.w, f.h, w, vh, fit)?;
-    dst[..w * vh].copy_from_slice(&pack(&out));
-    let p = fit.place(f.w, f.h, w, vh);
-    Some((p.dst.w, p.dst.h))
+    let (dw, dh) = blit_place(dst, w, 0, 0, w, vh, f, Some(0), fit);
+    (dw > 0).then_some((dw, dh))
 }
 
 /// Adopt: the frame at its own size (no scale) centred in `w x vh` over black bars, a side larger than the rect cropped
