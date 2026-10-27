@@ -356,7 +356,7 @@ define_class!(
                 if flags & (1 << 20) != 0 {
                     match text.as_str() {
                         "c" | "C" => syn.fire(bandy::SMessage::BrowserCopy),
-                        "a" | "A" => syn.fire(bandy::SMessage::BrowserSelectAll), "s" | "S" => syn.fire(bandy::SMessage::BrowserKey((if flags & (1 << 17) != 0 { "Meta+Shift+s" } else { "Meta+s" }).into())), // PDF4FORMSAVE (SR354): Cmd+S reaches the engine (a PDF tab saves); SAVEDIALOG (SR364): with Shift (NSEventModifierFlagShift = 1 << 17) it is Save As
+                        "a" | "A" => syn.fire(bandy::SMessage::BrowserSelectAll), "s" | "S" => syn.fire(bandy::SMessage::BrowserKey((if flags & (1 << 17) != 0 { "Meta+Shift+s" } else { "Meta+s" }).into())), "o" | "O" => syn.fire(bandy::SMessage::BrowserKey("Meta+o".into())), // SAVERECENTOPEN (SR403): Cmd+O reaches the chrome's open verb; PDF4FORMSAVE (SR354): Cmd+S reaches the engine (a PDF tab saves); SAVEDIALOG (SR364): with Shift (NSEventModifierFlagShift = 1 << 17) it is Save As
                         _ => {}
                     }
                     return;
@@ -937,9 +937,9 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                     dispatch2::DispatchQueue::main().exec_async(move || super::save_panel::run(url, &name, folder.as_deref(), &syn));
                 }
                 // OPEN-DIALOG-ONE (SR386): the owner asks THIS surface's window for a file: the platform open panel, on the main thread.
-                Ok(bandy::SMessage::OpenPanel { url, filters }) if url == target_id => {
-                    let syn = resend.clone();
-                    dispatch2::DispatchQueue::main().exec_async(move || super::open_panel::run(url, &filters, &syn));
+                Ok(bandy::SMessage::OpenPanel { url, filters, folder }) if url == target_id => {
+                    let syn = resend.clone(); // SAVERECENTOPEN (SR403): the panel opens in `folder`
+                    dispatch2::DispatchQueue::main().exec_async(move || super::open_panel::run(url, &filters, folder.as_deref(), &syn));
                 }
                 // AETHERSELECT (SR69): the engine's copy lands on the general pasteboard as plain text.
                 Ok(bandy::SMessage::BrowserClipboardSet(text)) => {
