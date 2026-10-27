@@ -15,3 +15,9 @@ description = "AVCODEC (SR24): a from-spec AV1 decoder (intra / AVIF first) and 
 default = []
 # `std` only adds `std::error::Error` for `Error`; the decoder itself never needs it.
 std = []
+
+# HEIFONE-RETIRE (LEDGER SR318): the AVIF KATs read their files' `av01` items through demux_core's HEIF reader (THE item
+# walk; av1_core's own retired). Test-only; the crate itself keeps NO dependencies (demux_core dev-depends on av1_core
+# the same way).
+[dev-dependencies]
+demux_core = { path = "../demux_core" }

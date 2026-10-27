@@ -85,8 +85,8 @@ fn decode_data_uri(rest: &str) -> Option<image::RgbaImage> {
 /// `pixel_core`, the code the kernel's Facet runs too — with the EXIF orientation applied, as a browser
 /// applies it (`image-orientation: from-image`). WebP NEVER falls back (SR40 removed that chicken
 /// wire): a WebP pixel_core refuses (malformed) is a ledgered miss. The `image` crate stays behind
-/// it ONLY for the other formats pixel_core refuses (ICO, TIFF, AVIF, …, or a file it calls
-/// malformed), and only with the `image-fallback` feature (without it the `image` crate can still read
+/// it ONLY for the other formats pixel_core refuses (ICO, TIFF, …, or a file it calls malformed; AVIF is
+/// gneiss_pal's `decode_heif`, never the `image` crate), and only with the `image-fallback` feature (without it the `image` crate can still read
 /// PNG — the codec its PNG writer brings along). Build without the `pixel-core` feature to put the
 /// `image` crate back in front for everything (the swap is reversible).
 pub fn decode_raster(bytes: &[u8]) -> Option<image::RgbaImage> {
@@ -104,10 +104,11 @@ pub fn decode_raster(bytes: &[u8]) -> Option<image::RgbaImage> {
             Err(_) => {}
         }
     }
-    // AETHERMEDIA (SR107): AVIF through av1_core (AVCODEC, SR24) — never the image crate.
+    // AETHERMEDIA (SR107): AVIF through UnaOS's own decoders — never the image crate. HEIFONE-RETIRE (SR318): gneiss_pal's
+    // `decode_heif` (demux_core's HEIF reader + av1_core), so grids and `clap` / `irot` now decode in the browser too.
     if is_avif(bytes) {
-        return match av1_core::image::decode_avif(bytes) {
-            Ok(img) => image::RgbaImage::from_raw(img.w, img.h, img.rgba),
+        return match gneiss_pal::dsp::image::decode_heif(bytes) {
+            Ok(img) => image::RgbaImage::from_raw(img.width, img.height, img.rgba),
             Err(e) => {
                 crate::ledger::record_dom(&format!("img-avif-refused:{e:?}"));
                 None
@@ -410,7 +411,7 @@ pub fn effective_img_src(attrs: &crate::dom::Attributes) -> Option<String> {
 
 /// Image MIME types `decode_raster` / `decode_svg` take, for a `<picture>`'s `<source type>`:
 /// pixel_core's formats (PNG, JPEG, GIF, BMP, QOI, WebP), the `image` crate fallback's
-/// (ICO, TIFF), SVG when the `svg` feature rasterises it, and AVIF through av1_core.
+/// (ICO, TIFF), SVG when the `svg` feature rasterises it, and AVIF through gneiss_pal's `decode_heif`.
 pub fn can_decode_type(mime: &str) -> bool {
     let base = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
     match base.as_str() {
@@ -559,4 +560,27 @@ pub fn resolve(base: &str, src: &str) -> String {
         .and_then(|b| b.join(src))
         .map(|u| u.to_string())
         .unwrap_or_else(|_| src.to_string())
+}
+
+/// HEIFONE-RETIRE (SR318): `<img>` AVIF decodes through gneiss_pal's `decode_heif`, byte-identical to the retired
+/// `av1_core::image::decode_avif` on gneiss_pal's AVIF KAT files (FNV-1a 64 of that path's RGBA, pinned before HEIFONE),
+/// and a grid primary — refused by the old path — now composites.
+#[cfg(test)]
+mod avif_kat_tests {
+    use gneiss_pal::dsp::image::avif_kat::{grid_2x2_avif, pixi_avif, white_avif};
+
+    fn fnv(b: &[u8]) -> u64 {
+        b.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3))
+    }
+
+    #[test]
+    fn avif_img_decodes_as_before_and_grids_now_decode() {
+        for (f, w, h, pin) in [(white_avif(), 1, 1, 0x2fa3_2458_7145_aacbu64), (pixi_avif(), 4, 4, 0x0aca_7e31_0b81_f28e)] {
+            assert!(super::is_avif(&f));
+            let img = super::decode_raster(&f).expect("AVIF decodes");
+            assert_eq!((img.width(), img.height(), fnv(img.as_raw())), (w, h, pin));
+        }
+        let g = super::decode_raster(&grid_2x2_avif()).expect("an AVIF grid decodes");
+        assert_eq!((g.width(), g.height()), (7, 6));
+    }
 }

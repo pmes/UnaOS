@@ -1,10 +1,11 @@
 //! M1 KATs — OBU framing, sequence header (every field), frame header (KEY / INTRA_ONLY),
-//! tile info, and the AVIF container, from hand-built bitstreams and public files.
+//! tile info, and the AVIF container (read by demux_core's HEIF reader, HEIFONE-RETIRE SR318), from hand-built
+//! bitstreams and public files.
 
 mod common;
-use av1_core::avif::avif_payload;
+use av1_core::avif::Av1Config;
 use av1_core::obu::*;
-use common::{fetch, BitWriter};
+use common::{avif_item, fetch, BitWriter};
 
 fn obu(t: u8, payload: &[u8], with_size: bool) -> Vec<u8> {
     let mut v = vec![(t << 3) | ((with_size as u8) << 1)];
@@ -452,14 +453,13 @@ fn avif_container_public_vectors() {
     ];
     for (name, w, h, prof, sb128, bd, ss) in cases {
         let Some(file) = fetch(name) else { continue };
-        let item = avif_payload(&file).unwrap();
-        assert_eq!((item.width, item.height), (w, h), "{name} ispe");
-        assert_eq!(item.bits_per_channel, vec![8, 8, 8], "{name} pixi");
-        let c = item.av1c.as_ref().unwrap();
+        let item = avif_item(&file).unwrap();
+        assert_eq!(item.ispe, Some((w, h)), "{name} ispe");
+        assert_eq!(item.pixi, Some(vec![8, 8, 8]), "{name} pixi");
+        let c = Av1Config::parse(item.av1c.as_deref().unwrap()).unwrap();
         assert_eq!(c.seq_profile, prof, "{name} av1C");
-        let n = item.nclx.unwrap();
-        assert_eq!((n.colour_primaries, n.transfer_characteristics, n.matrix_coefficients, n.full_range), (1, 13, 6, true));
-        let obus = item.obus().unwrap();
+        assert_eq!(item.nclx, Some((1, 13, 6, true)));
+        let obus = split_obus(&item.data).unwrap();
         let types: Vec<u8> = obus.iter().map(|o| o.obu_type).collect();
         assert!(types.contains(&OBU_SEQUENCE_HEADER_T) && types.contains(&OBU_FRAME_T), "{name}: {types:?}");
         let sh = obus.iter().find(|o| o.obu_type == OBU_SEQUENCE_HEADER_T).unwrap();
@@ -481,10 +481,4 @@ fn avif_container_public_vectors() {
         assert_eq!((fh.frame_width, fh.frame_height), (w, h));
         assert_eq!((fh.tile_info.tile_cols, fh.tile_info.tile_rows), (1, 1));
     }
-}
-
-#[test]
-fn avif_rejects_garbage() {
-    assert!(avif_payload(&[]).is_err());
-    assert!(avif_payload(&[0, 0, 0, 8, b'f', b't', b'y', b'p']).is_err());
 }

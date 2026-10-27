@@ -8,7 +8,7 @@
 //! |---------------|-------------------------------------------------------------|
 //! | [`bits`]      | §4.10 descriptors f(n) su(n) ns(n) le(n) leb128() uvlc()     |
 //! | [`obu`]       | §5.3–5.9 OBU, sequence header, frame header, tile info       |
-//! | [`avif`]      | AVIF / HEIF (ISO/IEC 23008-12) / ISOBMFF item extraction     |
+//! | [`avif`]      | the `av1C` record (AV1-ISOBMFF); items are demux_core::heif's |
 //! | [`symbol`]    | §8.2 symbol decoder with CDF adaptation                      |
 //! | [`cdf`]       | §6.8.2 every CDF array, load/save/frame-end update           |
 //! | [`decode`]    | §5.9–5.11 tile, partition, block, mode info, residual        |
@@ -21,7 +21,7 @@
 //! | [`loopfilter`]| §7.14 deblocking                                             |
 //! | [`cdef`]      | §7.15 CDEF                                                   |
 //! | [`restoration`]| §7.17 loop restoration (Wiener, self-guided)               |
-//! | [`image`]     | Y'CbCr → RGBA and the `decode_avif` entry point              |
+//! | [`image`]     | Y'CbCr → RGBA and the `decode_item_planes` item decode       |
 //!
 //! What is NOT decoded yet (owed, see docs/dev/evidence/media-1004/AVCODEC2.md): superres
 //! upscaling, film grain synthesis, large-scale tile, AVIF grid/alpha/layers/transform properties.
@@ -52,8 +52,7 @@ pub mod symbol;
 pub mod tables;
 pub mod transform;
 
-pub use avif::{avif_payload, Obus};
-pub use image::{decode_avif, Image};
+pub use image::Image;
 
 /// Every way a decode can fail.
 #[derive(Debug, Clone, PartialEq, Eq)]

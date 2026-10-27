@@ -7,8 +7,8 @@
 //! sha256 checks (tests/vectors.txt) and skipped when offline; nothing is committed.
 mod common;
 use av1_core::decode::ToolStats;
-use av1_core::image::{decode_avif_planes, Filters, Planes, StreamDecoder};
-use common::{fetch, fnv64, ivf_frames, md5, mkv_frames, vectors};
+use av1_core::image::{Filters, Planes, StreamDecoder};
+use common::{avif_planes, fetch, fnv64, ivf_frames, md5, mkv_frames, vectors};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -92,7 +92,7 @@ fn intra_block_copy_monochrome_avif() {
     // M1: Microsoft's screen-content key frame with allow_intrabc. The Chromium oracle matched
     // this decode at 60.62 dB, max abs diff 1 (docs/dev/evidence/media-1004/AVCODEC2.md).
     let Some(f) = fetch("Monochrome") else { return };
-    let p = decode_avif_planes(&f, Filters::default()).unwrap();
+    let p = avif_planes(&f, Filters::default()).unwrap();
     assert_eq!((p.width, p.height, p.bit_depth, p.mono), (1280, 720, 8, true));
     assert!(p.frame.allow_intrabc);
     assert!(p.stats.intrabc_blocks > 0 && p.stats.tiles_exit_bad == 0);
@@ -222,7 +222,7 @@ fn layered_avif_decodes_its_top_layer() {
     // from the base layer, and the stream uses segmentation. Chromium oracle: 43.75 dB RGB
     // (luma 56.3 dB in 2x2-averaged Y'CbCr; the blue channel carries clipped saturated chroma).
     let Some(f) = fetch("fruits_2layer_thumbsize") else { return };
-    let p = decode_avif_planes(&f, Filters::default()).unwrap();
+    let p = avif_planes(&f, Filters::default()).unwrap();
     assert_eq!((p.width, p.height), (1296, 864));
     assert!(p.stats.inter_blocks > 0 && p.stats.scaled_ref_blocks > 0 && p.stats.segmentation && p.stats.tiles_exit_bad == 0);
     let h = fnv64(&[&p.y, &p.u, &p.v]);
