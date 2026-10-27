@@ -180,8 +180,8 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, planes: Opt
             e.rgba.cfg.rate = Some(h264enc_core::RateControl { bits_per_second: e.opts.bitrate.saturating_mul(1000), fps_num: tb.den as u32, fps_den: tb.num.max(1) as u32, mode: h264enc_core::RcMode::Cbr });
         }
     }
-    e.size = (w as u32, h as u32);
-    let r = match e.push(w, h, planes, rgba) {
+    let sized = e.sized(w, h); // AV1INBANDSIZE (SR379): the first frame fixes the size; a later frame of another size is refused by name (file tail)
+    let r = match sized.and_then(|()| e.push(w, h, planes, rgba).map_err(|err| alloc::format!("{}", err))) {
         Ok(u) => e.stream_units(u).map_err(|m| alloc::format!("write-refused: {}", m)),
         Err(err) => Err(alloc::format!("{}", err)),
     };
@@ -563,3 +563,28 @@ impl Exp {
         Some((1, c))
     }
 }
+
+// ── AV1INBANDSIZE (LEDGER SR379): the export refuses a size switch mid-stream by name (handlers.md §5 NLEPROBE-HDR's AV1-INBAND-SIZE) ─
+// The encoder's size is fixed at the first frame (h264enc_core's `RgbaEncoder`, whose `Error::FrameSize` refused a later size
+// unnamed). `frame` asks [`Exp::sized`] before the push: the first frame fixes `size` (no longer rewritten per frame); a later
+// frame of another size is the job's `encode-refused` with the reason below, and the existing `finish` / `abandon` unlinks the
+// partial file. Scaling the switched frames to the first size (yuv_core::scale) is owed: EXPORT-SIZE-SCALE.
+
+impl Exp {
+    /// AV1INBANDSIZE (SR379): the first frame's `w` x `h` fixes the file's size; a later frame of another size is refused by name.
+    fn sized(&mut self, w: usize, h: usize) -> Result<(), String> {
+        let now = (w as u32, h as u32);
+        if self.frames == 0 {
+            self.size = now;
+            return Ok(());
+        }
+        if now == self.size {
+            return Ok(());
+        }
+        Err(alloc::format!(
+            "size changed mid-stream (AV1-INBAND-SIZE): {}x{} -> {}x{} at frame {}; scaling owed (EXPORT-SIZE-SCALE)",
+            self.size.0, self.size.1, now.0, now.1, self.frames
+        ))
+    }
+}
+

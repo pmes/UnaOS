@@ -253,3 +253,41 @@ fn inter_frame_first_is_refused() {
     let r = Decoder::new().decode(&[0b1000_0110, 0, 0, 0, 0, 0, 0, 0]);
     assert!(r.is_err());
 }
+
+// VP9INBANDCOLOUR (LEDGER SR379, AV1INBANDSIZE): the first key frame's color_space / color_range as H.273 code points
+// (`vp9_core::header::header_codes`, what gneiss_pal's `colour_of` hands `Demuxer::fill_colour`). In `key_frame_8x8` the 3-bit
+// color_space sits at bits 32-34 and color_range at bit 35 (profile 0); profile 2's ten_or_twelve_bit moves them one bit on.
+fn vp9inbandcolour_patch(mut f: Vec<u8>, cs: u8, full: bool) -> Vec<u8> {
+    f[4] = (f[4] & 0x0f) | (cs << 5) | ((full as u8) << 4);
+    f
+}
+
+#[test]
+fn vp9inbandcolour_header_codes_map_color_space() {
+    use vp9_core::header::{colour_codes, header_codes};
+    let base = key_frame_8x8(false);
+    assert_eq!(header_codes(&base), Some((2, 2, 6, false)), "the builder's BT.601 studio");
+    let bt709 = vp9inbandcolour_patch(base.clone(), 2, false);
+    assert_eq!(header_codes(&bt709), Some((2, 2, 1, false)), "BT.709 -> matrix 1");
+    assert_eq!(header_codes(&vp9inbandcolour_patch(base.clone(), 2, true)), Some((2, 2, 1, true)), "full range");
+    assert_eq!(header_codes(&vp9inbandcolour_patch(base.clone(), 5, false)), Some((2, 2, 9, false)), "BT.2020 -> 9");
+    assert_eq!(header_codes(&vp9inbandcolour_patch(base.clone(), 4, false)), Some((2, 2, 7, false)), "SMPTE 240 -> 7");
+    assert_eq!(header_codes(&vp9inbandcolour_patch(base.clone(), 0, false)), None, "CS_UNKNOWN states nothing");
+    assert_eq!((colour_codes(3, 0), colour_codes(6, 0), colour_codes(7, 1)), (Some((2, 2, 6, false)), None, Some((2, 2, 0, true))));
+    // profile 2: color_space at bits 33-35 (the builder's 1 = BT.601)
+    assert_eq!(header_codes(&key_frame_8x8(true)), Some((2, 2, 6, false)));
+    // the patched frame still decodes, and the decoder's frame carries the same color_space
+    let f = Decoder::new().decode(&bt709).unwrap().expect("shown");
+    assert_eq!((f.color_space, f.color_range), (2, 0));
+    assert!(f.planes[0].iter().all(|&v| v == 128));
+    // a superframe: the first key frame of it states the colour
+    let mut sf = bt709.clone();
+    let n = bt709.len();
+    assert!(n < 256);
+    sf.extend_from_slice(&bt709);
+    sf.extend_from_slice(&[0xc1, n as u8, n as u8, 0xc1]);
+    assert_eq!(superframe_frames(&sf).len(), 2);
+    assert_eq!(header_codes(&sf), Some((2, 2, 1, false)));
+    assert_eq!(header_codes(&[0x00, 0x01]), None, "not a frame");
+    println!("vp9inbandcolour: header_codes BT.709 -> 2/2/1, 2020 -> 9, unknown -> None; frame decodes");
+}

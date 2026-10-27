@@ -286,7 +286,7 @@ impl Pic {
                 Ok(Some((y.width as usize, y.height as usize, Px::planes(Src::Vp8(y, *c))))) // KERNELSCALECONVERT (B971): the planes, converted where used
             }
             Pic::Av1(d, c) => {
-                let planes = d.decode_temporal_unit(data).map_err(|e| (matches!(e, av1_core::Error::Unsupported(_)), alloc::format!("av1: {:?}", e)))?;
+                let planes = d.decode_temporal_unit(data).map_err(|e| (matches!(e, av1_core::Error::Unsupported(_)), alloc::format!("av1: {:?}", e)))?; inband_size(d, &planes, pts); // AV1INBANDSIZE (SR379): the size line, av1_core's ONE rule (file tail)
                 Ok(Some((planes.width as usize, planes.height as usize, Px::planes(Src::Av1(Box::new(planes), inband_colour(d, *c, pts)))))) // KERNELSCALECONVERT (B971); AV1INBANDSWITCH (SR373): the frame's colour, decided at the decode
             }
             Pic::Utp1 => {
@@ -2315,3 +2315,18 @@ pub fn edit_drag_end(path: &str) -> Option<u64> {
 pub fn edit_drag_take() -> bool {
     DRAG.lock().take().is_some()
 }
+
+// ── AV1INBANDSIZE (LEDGER SR379): a size switch mid-stream (handlers.md §5 NLEPROBE-HDR's AV1-INBAND-SIZE) ─────────────────────
+// A new coded video sequence (av1_core drops the refs on a really-changed sequence header) may change the picture's size. Every
+// `Frame` carries its own `w` / `h` and `blit_fit` fits each one per call, so the queue and the present need nothing; the export
+// refuses the switch by name (`export.rs` `Exp::sized`). `Pic::decode_raw`'s Av1 arm prints the switch here by av1_core's ONE rule
+// (`StreamDecoder::size_switch`, the host `Av1Decoder`'s too). Wire: `[vplay] size switch at <pts ticks> <w>x<h>-><w>x<h>`, once
+// per change.
+
+/// AV1INBANDSIZE (SR379): the size line when `planes` (decoded at `pts`) is not the last shown picture's size.
+fn inband_size(d: &mut av1_core::image::StreamDecoder, planes: &av1_core::image::Planes, pts: i64) {
+    if let Some(((w0, h0), (w1, h1))) = d.size_switch(planes.width, planes.height) {
+        serial_println!("[vplay] size switch at {} {}x{}->{}x{}", pts, w0, h0, w1, h1);
+    }
+}
+
