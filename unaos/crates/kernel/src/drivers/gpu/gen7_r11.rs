@@ -170,7 +170,7 @@ const DIM_MAX: usize = 8192;
 
 /// The pages, allocated once per size and held for the boot (GEN7TLB, gen7.md §2.6): (base VA, page count). A run
 /// needing more pages allocates afresh and the smaller block stays held, never freed. The rule: gen7.rs `held_take` (GEN7HOLDONCE, B1025).
-static HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0, 0));
+pub(in crate::drivers::gpu::gen7) static HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0, 0));
 
 /// The draw's geometry: the source window and the render target.
 #[derive(Clone, Copy)]
@@ -548,7 +548,7 @@ unsafe fn exec11(bar0: usize, bar0_size: usize, g: &Geom, src: &[u32]) -> Result
         wr(bar0, slot(k), ptes[k]);
     }
     out.landed = (0..n).all(|k| rd(bar0, slot(k)) == ptes[k]) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
-    wr(bar0, flsh, 1);
+    wr(bar0, flsh, 1); crate::drivers::gpu::gen7::assert_no_slot_held("r11-ptes"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
 
     out.disabled = true;
     if out.landed {
@@ -560,7 +560,7 @@ unsafe fn exec11(bar0: usize, bar0_size: usize, g: &Geom, src: &[u32]) -> Result
         wr(bar0, g7regs::RCS_RING_CTL, RCS_RING_CTL_1PAGE_EN);
         out.armed = rd(bar0, g7regs::RCS_RING_CTL) & 1 == 1;
         if out.armed {
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); crate::drivers::gpu::gen7::assert_no_slot_held("r11-kick"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
             let t0 = crate::arch::now_cycles();
             wr(bar0, g7regs::RCS_RING_TAIL, tail);
             let _ = poll_cycles(EXEC_BUDGET_CYC, || {
@@ -618,7 +618,7 @@ unsafe fn exec11(bar0: usize, bar0_size: usize, g: &Geom, src: &[u32]) -> Result
             wr(bar0, slot(k), base_img);
         }
         out.ptes_restored = (0..n).all(|k| rd(bar0, slot(k)) == base_img) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
-        wr(bar0, flsh, 1);
+        wr(bar0, flsh, 1); crate::drivers::gpu::gen7::assert_no_slot_held("r11-unmap"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
     }
     crate::drivers::gpu::gen7::held_release(&HELD, "r11", out.disabled, out.ptes_restored); Ok(out) // GEN7HELDRELEASE (B1039): the ONE release, behind the disabled confirm + the PTE read-back + R6c's witness (gen7.rs tail). LINE-NEUTRAL append
 }

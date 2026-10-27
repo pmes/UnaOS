@@ -7751,10 +7751,107 @@ fn order_leg() {
             "ok"
         };
         let v = if w == "ok" { "PASS" } else if w.starts_with("skip") { "SKIP" } else { "FAIL" };
-        serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} ::", fwd as u8, rev as u8, i0, i1, v, w);
+        let (v, n, kat) = nohold_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat);
     }
     #[cfg(not(feature = "gen7blit"))]
     {
-        serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> SKIP gen7_order=skip(no-gen7blit) ::");
+        let (v, n, kat) = nohold_leg("SKIP"); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} ::", v, n, kat);
     }
+}
+
+// =================================================================================
+// GEN7SLOTNOHOLD (rmbp-ledger B1047) — FILE-TAIL append: nothing above it moves. BP-gpu-9's second half (a slot's Mutex
+// is never held across a GPU op) witnessed: the four engines (r9, r10, r11, gen7blit) call `assert_no_slot_held` on the
+// existing line of each GPU-op phase (the PTE install flush, the ring kick's fence line before t0, the PTE restore
+// flush: twelve same-line tokens). It READS the lock registry through its existing API (`Mutex::holder` + `sync::here`,
+// B1016; no new registry fn): a slot THIS task holds at the op counts in `SLOT_HELD_N` and says one `[gen7] slot held
+// across op=<what> slot=<name>` per boot; it never panics and takes no lock. The engine lock (gen7blit's `PAGES`) is
+// held across ops by design and is not a slot. `tests gen7`'s GEN7ORDER line carries `slot_nohold=<n>` (0 = pass) and
+// `slot_kat=` (one slot taken by `try_lock`, checked under SLOT_KAT, its own count given back: B1034's shape).
+// GEN7-SLOT-NOHOLD-RUNGS owed: R5-R8's `witnessed_write` sites in this file carry no token.
+// =================================================================================
+
+/// Slot holds seen live across a GPU op this boot (the KAT's own count given back).
+static SLOT_HELD_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// The boot's one `[gen7] slot held across` line was said.
+static SLOT_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `nohold_leg`'s KAT is checking: count, never say.
+static SLOT_KAT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// BP-gpu-9's witness at a GPU-op site: how many gen7 slots THIS task holds now (each counted in `SLOT_HELD_N`, the
+/// boot's first said by name). 0 while the registry is unarmed or names no caller (nothing attributable). Reads only:
+/// one `is_locked` load per built slot, the registry walk (`holder`) only for a locked one.
+pub(crate) fn assert_no_slot_held(what: &'static str) -> usize {
+    let Some((me, _)) = crate::sync::here() else { return 0 };
+    let mut n = 0usize;
+    #[allow(unused_mut, unused_variables)]
+    let mut chk = |name: &'static str, s: &crate::sync::Mutex<(usize, usize)>| {
+        if s.is_locked() && s.holder().map(|h| h.0) == Some(me) {
+            n += 1;
+            SLOT_HELD_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if !SLOT_KAT.load(core::sync::atomic::Ordering::Relaxed) && !SLOT_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                serial_println!("[gen7] slot held across op={} slot={}", what, name);
+            }
+        }
+    };
+    #[cfg(feature = "gen7r8")]
+    {
+        chk("r8-ring", &R8_HELD[0]);
+        chk("r8-src", &R8_HELD[1]);
+        chk("r8-dst", &R8_HELD[2]);
+    }
+    #[cfg(feature = "gen7blit")]
+    {
+        chk("blit-sp", &BLIT_HELD[0]);
+        chk("blit-dp", &BLIT_HELD[1]);
+        chk("blit-ring", &BLIT_RING_HELD);
+    }
+    #[cfg(feature = "gen7r9")]
+    {
+        chk("r9", &R9_HELD);
+        chk("r10", &R10_HELD);
+        chk("r11", &r9::draw::quad::HELD);
+    }
+    n
+}
+
+/// The KAT's slot: the first one this build has.
+#[allow(unreachable_code)]
+fn kat_slot() -> Option<&'static crate::sync::Mutex<(usize, usize)>> {
+    #[cfg(feature = "gen7blit")]
+    {
+        return Some(&BLIT_RING_HELD);
+    }
+    #[cfg(feature = "gen7r9")]
+    {
+        return Some(&R9_HELD);
+    }
+    #[cfg(feature = "gen7r8")]
+    {
+        return Some(&R8_HELD[0]);
+    }
+    None
+}
+
+/// GEN7ORDER's nohold terms `(verdict, slot_nohold, slot_kat)`: the KAT holds one slot (`try_lock`: no order edge, it
+/// cannot wait) and asks the helper, which must count exactly it; the count is given back. `slot_nohold` is the boot's
+/// real count after both ladder runs; a non-zero count or a KAT miss FAILs, else `v` stands.
+fn nohold_leg(v: &'static str) -> (&'static str, usize, &'static str) {
+    let kat = crate::arch::without_interrupts(|| {
+        let Some(slot) = kat_slot() else { return "skip(no-slot)" };
+        if crate::sync::here().is_none() {
+            return "skip(unarmed)";
+        }
+        let Some(_g) = slot.try_lock() else { return "skip(busy)" };
+        if slot.holder().is_none() {
+            return "skip(untracked)";
+        }
+        SLOT_KAT.store(true, core::sync::atomic::Ordering::Relaxed);
+        let c = assert_no_slot_held("kat");
+        SLOT_KAT.store(false, core::sync::atomic::Ordering::Relaxed);
+        SLOT_HELD_N.fetch_sub(c, core::sync::atomic::Ordering::Relaxed);
+        if c == 1 { "ok" } else { "miss" }
+    });
+    let n = SLOT_HELD_N.load(core::sync::atomic::Ordering::Relaxed);
+    (if n != 0 || kat == "miss" { "FAIL" } else { v }, n, kat)
 }
