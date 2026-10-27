@@ -872,6 +872,8 @@ fn main() {
     // builds — a knob wired into arroyo alone would ship the ladder DISABLED while the
     // banner claims it is on (the s42/INSTGUI and WXN-M3b failure). Kept in sync with arroyo.
     if std::env::var("UNAOS_KEPLER_CE").is_ok() { feats.push("nvidia-kepler-ce"); }
+    // KEPLER3D (B877): UNAOS_KEPLERCE=1 arms `tests keplerce`, the copy engine's three-job wall fixture. Kept in sync with arroyo.
+    if std::env::var("UNAOS_KEPLERCE").is_ok() { feats.push("nvidia-kepler-cecopy"); }
     if std::env::var("UNAOS_KDISP_HOLD").is_ok() { feats.push("nvidia-kepler-kdisp-hold"); }
     // BEAMX86: UNAOS_BEAM=1 arms the x86 beam SOURCE — `kepler_display::beam_probe`, which samples
     // the live head's HEAD_STAT.VERT at the end of the Kepler takeover seam so `arch::scanout_beam()`

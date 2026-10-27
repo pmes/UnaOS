@@ -810,7 +810,7 @@ refs/heads/exec-rmbp-demuxseek   3ead33dc7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-bootlistarm   3ead33dc7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-autolock3   30cf7bdad FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-templeperf   18c4aa607 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-kepler3d   3ead33dc7 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-kepler3d   318b4fbb6 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pideskspec   3ead33dc7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-wpa2   3ead33dc7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-textscalereseat   5e60ea4ff FOLDED-BY-HAND (this commit) 2026-10-27

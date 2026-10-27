@@ -886,6 +886,9 @@ _feats="${_feats}sdw,"
 # KBLIT blit run from `tests ce` / `tests kblit`, never at boot. GPUTESTS (B334): x86_64-only module,
 # stripped by arm_features (k8-reach NA row).
 [ -n "${UNAOS_KEPLER_CE:-}" ] && _feats="${_feats}nvidia-kepler-ce,"
+# KEPLER3D (B877): UNAOS_KEPLERCE=1 arms `tests keplerce` (drivers/gpu/kepler_gpublit.rs tail) — the copy engine's
+# three-job wall fixture. x86_64-only (stripped by arm_features). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_KEPLERCE:-}" ] && _feats="${_feats}nvidia-kepler-cecopy,"
 # SHUTRESTORE (rmbp, 2026-09-15) — the SEVEN refuted Kepler rungs whose CODE had been deleted, each
 # back behind a knob of its own. RULINGS R19 (Peter, 2026-09-05): "you take a path that does not work
 # out so you shut it out but after very many boots its discovered that path needs to be open for
@@ -3328,6 +3331,9 @@ arm_features() {
     # conjunction, so the feature emits not one byte of aarch64 CODE; stripping it keeps the aarch64
     # `-Cmetadata` fingerprint unchanged when an x86 knob line carries `UNAOS_KEPLER_CE=1`.
     f="${f//,nvidia-kepler-ce,/,}"
+    # KEPLER3D (B877): `nvidia-kepler-cecopy` is a cfg'd tail of `kepler_gpublit.rs` (x86_64-only module) and a
+    # `target_arch = "x86_64"` registration: not one byte of aarch64 CODE, same strip, same hash argument.
+    f="${f//,nvidia-kepler-cecopy,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
