@@ -46,7 +46,7 @@ pub const SPAN_CACHE: usize = 2;
 
 /// A set state ([`SetIndex::key`]). SWAPBACK-SETIDS (SR388): `Ids` = the (nal_unit_type, id) -> last unit map of the replay,
 /// sorted by (kind, id), when every replayed blob reads its ids (gneiss_pal's `param_set_ids`; vacuously the empty replay), so
-/// equal states in different blobs are one key; `Blobs` = the [`SetIndex`] blob ids in replay order otherwise (H.264, a unit
+/// equal states in different blobs are one key; `Blobs` = the [`SetIndex`] blob ids in replay order otherwise (a unit
 /// whose id does not read): two such states key apart, a miss, never a wrong decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetKey {
@@ -288,7 +288,7 @@ impl SetIndex {
             let id = match self.blobs.iter().position(|b| *b == blob) {
                 Some(i) => i,
                 None => {
-                    self.ids.push(gneiss_pal::dsp::video::hevc::param_set_ids(track, &blob)); // SWAPBACK-SETIDS (SR388)
+                    self.ids.push(gneiss_pal::dsp::video::h264::param_set_ids(track, &blob).or_else(|| gneiss_pal::dsp::video::hevc::param_set_ids(track, &blob))); // SWAPBACK-SETIDS (SR388), -AVC (SR397): each reader is None off its own codec
                     self.blobs.push(blob);
                     self.blobs.len() - 1
                 }

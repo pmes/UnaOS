@@ -1555,3 +1555,93 @@ fn swapbacknlecache_depth_one_cache_evicts() {
     assert_eq!(builds(1), [1, 2, 3, 4]);
     println!("swapbacknlecache: depth2 {:?} depth1 {:?}", builds(0), builds(1));
 }
+
+// SWAPBACKSETIDSAVC (LEDGER SR397): an H.264 reel's set state is keyed by ids too (gneiss_pal's `h264::param_set_ids` beside
+// the HEVC one in `SetIndex::scan`), and a same-reel seek step inside one render reopens on the reel's held decoder (`vid_frame`
+// drops the outgoing run, which parks it, before the new run open takes the slot).
+
+/// SPS (Main, 64x48) and PPS of tests/nle.rs's AVCC_REORDER2; a stand-in IDR slice unit (the reseed decodes only set blobs).
+const AVC_SPS: [u8; 12] = [0x67, 0x4D, 0x00, 0x1E, 0xED, 0x88, 0xF4, 0x03, 0xC2, 0x21, 0x16, 0x48];
+const AVC_PPS: [u8; 4] = [0x68, 0xCE, 0x38, 0x80];
+const AVC_IDR: [u8; 3] = [0x65, 0x88, 0x84];
+
+/// An avc1 reel of 8 keyframes (avcC with the SPS and PPS): s1 carries [SPS, PPS], s4 [PPS, SPS] — the same ids and bytes in
+/// another blob.
+fn swapbacksetidsavc_reel() -> Vec<u8> {
+    let mut spec = build::TrackSpec::test_pattern(1, 64, 48, 25);
+    spec.fourcc = *b"avc1";
+    spec.config_box = Some(*b"avcC");
+    spec.codec_id = "V_MPEG4/ISO/AVC";
+    let mut avcc = vec![1, 0x4D, 0x00, 0x1E, 0xFF, 0xE1, 0, AVC_SPS.len() as u8];
+    avcc.extend_from_slice(&AVC_SPS);
+    avcc.extend_from_slice(&[1, 0, AVC_PPS.len() as u8]);
+    avcc.extend_from_slice(&AVC_PPS);
+    spec.config = avcc;
+    spec.timescale = 1000;
+    let lp = |us: &[&[u8]]| us.iter().flat_map(|u| [&(u.len() as u32).to_be_bytes()[..], *u].concat()).collect::<Vec<u8>>();
+    let samples = (0..8)
+        .map(|i| {
+            let data = match i {
+                1 => lp(&[&AVC_SPS[..], &AVC_PPS[..], &AVC_IDR[..]]),
+                4 => lp(&[&AVC_PPS[..], &AVC_SPS[..], &AVC_IDR[..]]),
+                _ => lp(&[&AVC_IDR[..]]),
+            };
+            build::SampleSpec { data, dts: i as i64 * 40, pts: i as i64 * 40, duration: 40, keyframe: true }
+        })
+        .collect();
+    build::mp4(&[build::MediaTrack { spec, samples }], &Mp4Options::default())
+}
+
+/// Rule: reseeds at s2 (state [s1's blob]) then s6 ([s1's, s4's]) of an H.264 reel build ONE decoder — the two states key alike
+/// by id, the second reseed a hit (before SR397 an H.264 blob keyed by blob list: a second construction, a miss).
+#[test]
+fn swapbacksetidsavc_equal_avc_states_in_different_blobs_hit() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use stria::decode_swap::{DecodeSwap, open};
+    let d = Demuxer::open(swapbacksetidsavc_reel()).unwrap();
+    let t = d.tracks()[0].clone();
+    let mut dec = open(&t);
+    assert!(dec.is_real(), "an avc1 track opens h264_core");
+    let mut swap = DecodeSwap::default();
+    let mut built = Vec::new();
+    let mut hits = Vec::new();
+    for ns in [80_000_000i64, 240_000_000] {
+        hits.push(swap.reseed(&mut dec, &t, &d, ns));
+        built.push(swap.built());
+    }
+    assert_eq!(built, [1, 1]);
+    assert_eq!(hits, [Some(false), Some(true)]);
+    println!("swapbacksetidsavc: avc built={} hits={hits:?}", swap.built());
+}
+
+/// Rule: one render of V1 = A[5,6)@0, A[4,5)@1 over the swapback reel (a same-reel seek step; both ticks in the 8-bit set state)
+/// reseeds miss then HIT on reel 0 (before SR397 the step's open ran before the outgoing run parked: miss, miss), with two
+/// seeks and both frames flat.
+#[test]
+fn swapbacksetidsavc_same_reel_seek_step_in_one_render_hits() {
+    use stria::nle::{RenderSink, Sources, render};
+    use timeline_core::{Clip, Kind, Timeline};
+    struct Frames(Vec<Vec<u8>>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, _out_t: i64, _w: u32, _h: u32, rgba: &[u8]) {
+            self.0.push(rgba.to_vec());
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    capture_logs();
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 6);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 5, 6, 0), Clip::new(a, 4, 5, 1)];
+    let mut src = Sources::new(&tl);
+    src.add(a, swapback_reel()).unwrap();
+    let mut sink = Frames(Vec::new());
+    let r = render(&tl, 0..2, &src, &mut sink).unwrap();
+    assert_eq!((r.frames, r.seeks), (2, 2));
+    assert_eq!(sink.0.len(), 2);
+    for rgba in &sink.0 {
+        assert!(rgba.chunks(4).all(|p| p == SWAPBACK_FLAT), "not flat {:?}", &rgba[..4]);
+    }
+    assert_eq!(my_log_lines("[STRIA] :: nle reseed"), ["[STRIA] :: nle reseed reel=0 cache=miss", "[STRIA] :: nle reseed reel=0 cache=hit"]);
+    println!("swapbacksetidsavc: same-render seek step reel=0 miss hit");
+}

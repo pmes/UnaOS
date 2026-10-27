@@ -687,7 +687,7 @@ fn vid_frame(
             Some(k) => k,
             None => sources.keyframe_ns(src, Kind::Video, target).ok_or(RenderError::NoStream(src, Kind::Video))?,
         };
-        *run = Some(Vid::open(sources.get(src)?, src, key)?);
+        *run = None; *run = Some(Vid::open(sources.get(src)?, src, key)?); // SWAPBACK-NLECACHE-SHARED (SR397): the outgoing run parks before the new open takes the reel's slot
         r.seeks += 1;
     }
     let f = run.as_mut().expect("opened above").show(target, tol, &mut r.runup_frames);
