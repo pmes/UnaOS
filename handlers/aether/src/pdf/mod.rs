@@ -337,7 +337,7 @@ impl PdfDocument {
         let strip = if self.thumbs { thumbs::paint(self, &mut out, (dw, dh), zoom, scroll_y) } else { None };
         // Only the pages at this dpi on (or next to) the screen keep a pixmap, and the strip's visible thumbnails.
         let (lo, hi) = (vis.start().saturating_sub(1), vis.end() + 1);
-        let (key, tkey) = (dpi_key(dpi), dpi_key(thumbs::THUMB_DPI));
+        let (key, tkey) = (dpi_key(dpi), dpi_key(thumbs::THUMB_DPI * zoom));
         self.cache
             .borrow_mut()
             .retain(|k, _| (k.1 == key && k.0 >= lo && k.0 <= hi) || strip.is_some_and(|(a, b)| k.1 == tkey && k.0 >= a && k.0 <= b));
@@ -674,7 +674,7 @@ impl crate::AetherEngine {
     pub(crate) fn pdf_resized(&mut self) {
         let z = self.zoom();
         if let Some(p) = self.pdf.as_mut().filter(|p| p.thumbs) {
-            p.left = thumbs::STRIP_W / z;
+            p.left = thumbs::strip_css(z);
         }
         self.pdf_scroll_x(0.0);
     }
@@ -718,7 +718,7 @@ impl crate::AetherEngine {
         let (z, dh) = (self.zoom(), self.device.1 as f64);
         let Some((px, _)) = self.pointer else { return false };
         let Some(pdf) = self.pdf.as_ref().filter(|p| p.in_strip(px)) else { return false };
-        let max = (thumbs::extent(pdf) - dh).max(0.0);
+        let max = (thumbs::extent(pdf, z) - dh).max(0.0);
         pdf.strip_off.set((pdf.strip_off.get() + dy * z).clamp(0.0, max));
         self.pdf_dirty();
         true

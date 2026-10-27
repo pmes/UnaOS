@@ -515,6 +515,13 @@ pub struct OutlineItem {
     pub open: bool,
     /// The item's direct children.
     pub kids: usize,
+    /// PDF4-OUTLINE-STYLE (SR387): /C, the title's DeviceRGB colour (each component clamped to 0..1); None when absent
+    /// or not three numbers.
+    pub color: Option<[f64; 3]>,
+    /// /F bit 1 (ISO 32000-1 Table 153): the title is italic.
+    pub italic: bool,
+    /// /F bit 2: the title is bold.
+    pub bold: bool,
 }
 
 impl Document {
@@ -565,8 +572,10 @@ fn outline_walk(
         let title = d.get(b"Title").map(|t| doc.get(t)).and_then(|t| t.as_str().map(text_string)).unwrap_or_default();
         let open = d.get(b"Count").map(|c| doc.get(c)).and_then(|c| c.as_int()).is_some_and(|c| c > 0);
         let action = crate::annots::link(doc, &d, page_refs);
+        let color = outline_color(doc, d.get(b"C"));
+        let f = d.get(b"F").map(|f| doc.get(f)).and_then(|f| f.as_int()).unwrap_or(0);
         let at = out.len();
-        out.push(OutlineItem { title, level, action, open, kids: 0 });
+        out.push(OutlineItem { title, level, action, open, kids: 0, color, italic: f & 1 != 0, bold: f & 2 != 0 });
         if let Some(kid) = d.get(b"First") {
             out[at].kids = outline_walk(doc, kid, level + 1, page_refs, seen, out)?;
         }
@@ -574,4 +583,18 @@ fn outline_walk(
         cur = d.get(b"Next").cloned();
     }
     Ok(n)
+}
+
+/// PDF4-OUTLINE-STYLE (SR387): an item's /C as three components clamped to 0..1 (None unless three numbers).
+fn outline_color(doc: &Document, c: Option<&Object>) -> Option<[f64; 3]> {
+    let c = doc.get(c?);
+    let a = c.as_array()?;
+    if a.len() != 3 {
+        return None;
+    }
+    let mut v = [0.0; 3];
+    for (o, x) in a.iter().zip(v.iter_mut()) {
+        *x = doc.get(o).as_f64()?.clamp(0.0, 1.0);
+    }
+    Some(v)
 }

@@ -132,3 +132,37 @@ fn outline_absent_is_empty() {
         .obj(3, "<< /Type /Page /Parent 2 0 R >>");
     assert_eq!(Document::parse(&b.classic()).unwrap().outlines(), Ok(Vec::new()));
 }
+
+// =================================================================================================
+// PDF4-OUTLINE-ACTIONS / PDF4-OUTLINE-STYLE (LEDGER SR387): refused kinds named, /Named carried, /C and /F read.
+// =================================================================================================
+
+#[test]
+fn outline_actions_refused_and_style() {
+    use pdf_core::annots::LinkAction;
+    let mut b = PdfBuilder::new(1);
+    b.obj(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>")
+        .obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 100] >>")
+        .obj(3, "<< /Type /Page /Parent 2 0 R >>")
+        .obj(4, "<< /Type /Page /Parent 2 0 R >>")
+        .obj(10, "<< /Type /Outlines /First 11 0 R /Last 16 0 R /Count 6 >>")
+        .obj(11, "<< /Title (Remote) /Next 12 0 R /A << /S /GoToR /F (other.pdf) /D [0 /Fit] >> /C [1 0 0] /F 3 >>")
+        .obj(12, "<< /Title (Launch) /Next 13 0 R /A << /S /Launch /F (calc.exe) >> >>")
+        .obj(13, "<< /Title (Script) /Next 14 0 R /A << /S /JavaScript /JS (app.alert(1)) >> >>")
+        .obj(14, "<< /Title (Next) /Next 15 0 R /A << /S /Named /N /NextPage >> /F 2 >>")
+        .obj(15, "<< /Title (Print) /Next 16 0 R /A << /S /Named /N /Print >> /C [0 2 -1] >>")
+        .obj(16, "<< /Title (Plain) /Dest [4 0 R /Fit] /C [1 0] >>");
+    let o = Document::parse(&b.classic()).unwrap().outlines().unwrap();
+    assert_eq!(o.len(), 6);
+    assert_eq!(o[0].action, Some(LinkAction::Refused("GoToR")), "/GoToR refused by name");
+    assert_eq!(o[1].action, Some(LinkAction::Refused("Launch")), "/Launch refused by name");
+    assert_eq!(o[2].action, Some(LinkAction::Refused("JavaScript")), "/JavaScript refused by name");
+    assert_eq!(o[3].action, Some(LinkAction::Named(b"NextPage".to_vec())), "a standard /Named is carried for the face");
+    assert_eq!(o[4].action, Some(LinkAction::Named(b"Print".to_vec())), "a viewer's own /Named is carried too");
+    assert_eq!(o[0].color, Some([1.0, 0.0, 0.0]), "/C read");
+    assert!(o[0].italic && o[0].bold, "/F 3: italic and bold");
+    assert!(!o[3].italic && o[3].bold, "/F 2: bold only");
+    assert_eq!(o[4].color, Some([0.0, 1.0, 0.0]), "/C components clamped to 0..1");
+    assert_eq!(o[5].color, None, "a /C of two numbers is none");
+    assert!(!o[5].italic && !o[5].bold && o[1].color.is_none(), "no /F, no /C: plain");
+}

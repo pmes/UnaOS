@@ -744,3 +744,139 @@ fn savedialog_html_tab_stages_nothing() {
     e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
     assert!(e.take_pending_save().is_none(), "PAGE-SAVE is owed: an HTML tab stages no Save As either");
 }
+
+// =================================================================================================
+// PDF4-OUTLINE-ACTIONS / -STYLE / -ELLIPSIS / PDF4-STRIP-HIDPI (LEDGER SR387): refused rows muted and named, /Named
+// resolved, /C ink, the ellipsis, the strip at scale 2.
+// =================================================================================================
+
+const LONG_TITLE: &str = "A very long outline title that runs well past the strip edge";
+
+/// Two 200 x 100 pt pages (page 2 red), four flat outline items: "Remote" (/GoToR, refused), "Next" (/Named
+/// NextPage), "Red" (/C [1 0 0], page 1) and a long title (page 2).
+fn action_outline() -> Vec<u8> {
+    let mut b = PdfBuilder::new(1);
+    b.obj(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>")
+        .obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 100] >>")
+        .obj(3, "<< /Type /Page /Parent 2 0 R >>")
+        .obj(4, "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>")
+        .stream(6, "", b"1 0 0 rg 0 0 200 100 re f")
+        .obj(10, "<< /Type /Outlines /First 11 0 R /Last 14 0 R /Count 4 >>")
+        .obj(11, "<< /Title (Remote) /Next 12 0 R /A << /S /GoToR /F (other.pdf) /D [0 /Fit] >> >>")
+        .obj(12, "<< /Title (Next) /Next 13 0 R /A << /S /Named /N /NextPage >> >>")
+        .obj(13, "<< /Title (Red) /Next 14 0 R /C [1 0 0] /F 2 /Dest [3 0 R /Fit] >>")
+        .obj(14, &format!("<< /Title ({LONG_TITLE}) /Dest [4 0 R /Fit] >>"));
+    b.classic()
+}
+
+fn action_engine() -> AetherEngine {
+    let mut e = engine_with(action_outline(), 400, 100);
+    e.handle_event(Event::KeyDown("F4".to_string()));
+    e.handle_event(Event::KeyDown("F4".to_string()));
+    e
+}
+
+fn have_sans() -> bool {
+    crate::fonts::face(&crate::fonts::FontSel::new(crate::fonts::SANS, 400, false)).is_some()
+}
+
+/// Whether any pixel of the device box [x0, x1) x [y0, y1) satisfies `f`.
+fn any_px(f: &(u32, u32, Vec<u8>), (x0, x1): (usize, usize), (y0, y1): (usize, usize), p: impl Fn([u8; 3]) -> bool) -> bool {
+    (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).any(|(x, y)| p(px(f, x, y)))
+}
+
+#[test]
+fn pdf4outline_refused_muted_no_nav() {
+    use super::thumbs::{refused, row_ink, MUTED, LABEL_INK};
+    let mut e = action_engine();
+    {
+        let pdf = e.pdf.as_ref().unwrap();
+        assert_eq!(pdf.outline[0].action.as_ref().and_then(refused), Some("GoToR"), "the core's refusal by name");
+        assert_eq!(pdf.outline[1].action.as_ref().and_then(refused), None, "NextPage is one of the standard four");
+        assert_eq!(row_ink(&pdf.outline[0]), MUTED);
+        assert_eq!(row_ink(&pdf.outline[1]), LABEL_INK);
+    }
+    let f = e.present_rgba();
+    if have_sans() {
+        assert!(any_px(&f, (18, 110), (8, 30), |p| p == [MUTED.0, MUTED.1, MUTED.2]), "row 0's title in the muted ink");
+        assert!(!any_px(&f, (18, 110), (8, 30), |p| p == [LABEL_INK.0, LABEL_INK.1, LABEL_INK.2]), "and not the plain ink");
+    }
+    click(&mut e, (40.0, 19.0));
+    assert_eq!(e.scroll_y, 0.0, "a refused action does not navigate");
+    assert!(e.pending_nav.is_none(), "nor load anything");
+    let lines = crate::js::console_lines();
+    assert!(lines.iter().any(|(_, l)| l == "[pdf] outline action refused: GoToR"), "named on the console line: {lines:?}");
+}
+
+#[test]
+fn pdf4outline_named_next_resolves() {
+    let mut e = action_engine();
+    let _ = e.present_rgba();
+    click(&mut e, (40.0, 41.0));
+    let top2 = e.pdf.as_ref().unwrap().page_rect(1, 400.0).1;
+    assert!(near(e.scroll_y, top2), "/Named NextPage goes to page 2: {} vs {top2}", e.scroll_y);
+    let lines = crate::js::console_lines();
+    assert!(!lines.iter().any(|(_, l)| l.starts_with("[pdf] outline action refused")), "nothing refused: {lines:?}");
+}
+
+#[test]
+fn pdf4outline_colour_row() {
+    use super::thumbs::row_ink;
+    let e = action_engine();
+    assert_eq!(row_ink(&e.pdf.as_ref().unwrap().outline[2]), (255, 0, 0), "/C [1 0 0]");
+    assert!(e.pdf.as_ref().unwrap().outline[2].bold, "/F 2: bold");
+    if !have_sans() {
+        return;
+    }
+    let f = e.present_rgba();
+    // Row 2 at rows 52..74 (the current page's band: "Red" is the last row at or before page 1).
+    assert!(any_px(&f, (18, 110), (52, 74), |p| p[0] > 180 && p[1] < 90 && p[2] < 90), "a red title pixel in row 2");
+}
+
+#[test]
+fn pdf4outline_ellipsis() {
+    use super::thumbs::{advancer, ellipsize, row_x, PAD, STRIP_BG, STRIP_W, TOGGLE};
+    let adv = advancer(1.0, 400, false);
+    let avail = STRIP_W - row_x(0) - TOGGLE - PAD;
+    let short = ellipsize(&adv, "Red", avail);
+    assert_eq!(short, "Red", "a title that fits is whole");
+    if !have_sans() {
+        return;
+    }
+    let t = ellipsize(&adv, LONG_TITLE, avail);
+    assert!(t.ends_with('\u{2026}') && t.chars().count() > 1, "cut with an ellipsis: {t:?}");
+    assert!(LONG_TITLE.starts_with(t.trim_end_matches('\u{2026}')), "a prefix of the title: {t:?}");
+    assert!(adv.str(&t) as f64 <= avail, "it fits: {} > {avail}", adv.str(&t));
+    let e = action_engine();
+    let f = e.present_rgba();
+    // Row 3 at rows 74..96: ink up to the ellipsis, none in the PAD columns before the strip's edge.
+    let edge = (STRIP_W - PAD) as usize;
+    let bg = |p: [u8; 3]| p == [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2];
+    assert!(any_px(&f, (edge - 12, edge), (74, 96), |p| !bg(p)), "the ellipsis is the row's last glyph, near the edge");
+    assert!(!any_px(&f, (edge, STRIP_W as usize), (74, 96), |p| !bg(p)), "nothing drawn past the text edge");
+}
+
+#[test]
+fn pdf4strip_scale2() {
+    use super::thumbs::{LABEL_INK, ROW_ACTIVE, STRIP_BG, STRIP_W};
+    use pdf_core::annots::{Dest, View};
+    let mut e = AetherEngine::new();
+    e.set_device_size(800, 200);
+    e.set_zoom_pct(200);
+    e.load_pdf(URL, outline_pages(), true);
+    e.handle_event(Event::KeyDown("F4".to_string()));
+    assert!(near(e.pdf.as_ref().unwrap().left, STRIP_W), "the strip is STRIP_W CSS px at every scale");
+    let _ = e.present_rgba();
+    assert!(e.pdf.as_ref().unwrap().cached_keys().contains(&(0, 24_000)), "thumbnails at the scale's dpi");
+    e.handle_event(Event::KeyDown("F4".to_string()));
+    let f = e.present_rgba();
+    // 240 device px wide; rows 44 px: row 0 at 16..60 (the current page's band), row 1 at 60..104.
+    assert_eq!(px(&f, 235, 150), [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2], "the strip reaches 240 device px");
+    assert_ne!(px(&f, 245, 150), [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2], "and stops there");
+    assert_eq!(px(&f, 4, 58), [ROW_ACTIVE.0, ROW_ACTIVE.1, ROW_ACTIVE.2], "row 0's band is 44 px tall");
+    assert_eq!(px(&f, 4, 62), [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2], "row 1 starts at 60");
+    assert_eq!(px(&f, 20, 34), [LABEL_INK.0, LABEL_INK.1, LABEL_INK.2], "row 0's open toggle, 16 px at row_x(0) * 2");
+    click(&mut e, (40.0, 41.0));
+    let want = e.pdf.as_ref().unwrap().dest_y(&Dest { page: 1, view: View::Xyz { left: Some(0.0), top: Some(90.0), zoom: None } });
+    assert!(near(e.scroll_y, want), "a CSS click lands on row 1 at scale 2: {} vs {want}", e.scroll_y);
+}
