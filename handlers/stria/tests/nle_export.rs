@@ -352,3 +352,57 @@ fn h264_bframes_export_writes_composition_offsets() {
     let bytes: usize = want.iter().map(|a| a.avcc_sample().len()).sum();
     println!("h264 bframes 2 export: {bytes} bytes, ctts offsets {offsets:?}");
 }
+
+/// H264ENCPYRAMID (SR349): `H264Encoder::with_bframes(3)` exports h264enc_core's B pyramid. The avcC's VUI gives reorder
+/// depth 2, the `ctts` offsets carry the reorder (pts = display + 2, dts <= pts), and the Player's decoder (`decoder_for`)
+/// fed in decoding order outputs every frame in display order equal to the reconstruction.
+#[test]
+fn h264_pyramid_export_reorder_depth_two() {
+    use gneiss_pal::dsp::video::reorder_depth;
+    let tl = timeline();
+    let src = sources(&tl);
+    let refr = reference(&tl, &src);
+    let dir = fresh("h264pyramid");
+    let r = export(&tl, 0..TICKS, &src, &dir, Box::new(H264Encoder::new(26, 10).with_bframes(3)), AudioOut::Mp4).unwrap();
+    assert_eq!(r.frames, 35);
+    let mut enc = Encoder::new(Config { width: 64, height: 48, qp: 26, gop: 10, bframes: 3, ..Default::default() }).unwrap();
+    let (mut want, mut recon) = (Vec::new(), Vec::new());
+    for f in &refr.frames {
+        want.extend(enc.push(&I420::from_rgba(64, 48, f).unwrap().as_yuv420()).unwrap());
+        recon.extend(enc.reconstructions().iter().cloned());
+    }
+    want.extend(enc.flush().unwrap());
+    recon.extend(enc.reconstructions().iter().cloned());
+    assert_eq!((want.len(), recon.len()), (35, 35));
+
+    let d = Demuxer::open(std::fs::read(dir.join("movie.mp4")).unwrap()).unwrap();
+    let vt = d.tracks()[0].clone();
+    assert_eq!(vt.config, enc.avcc());
+    assert_eq!(reorder_depth(&vt), Some(2), "the avcC's VUI max_num_reorder_frames under the pyramid");
+    let mut dec = decoder_for(&vt).unwrap();
+    let (mut frames, mut pts, mut offsets) = (Vec::new(), Vec::new(), Vec::new());
+    let mut last_dts = -1;
+    for (i, s) in d.track_samples(0).copied().collect::<Vec<_>>().iter().enumerate() {
+        let pk = d.packet_at(s);
+        assert_eq!(pk.data, want[i].avcc_sample(), "sample {i} is the encoder's access unit");
+        assert_eq!((pk.dts, pk.pts), (want[i].dts as i64, want[i].pts as i64), "sample {i} (dts, pts)");
+        assert!(pk.dts > last_dts && pk.dts <= pk.pts, "sample {i}: dts {} pts {}", pk.dts, pk.pts);
+        last_dts = pk.dts;
+        pts.push(pk.pts);
+        offsets.push(pk.pts - pk.dts);
+        frames.extend(dec.decode(&pk).unwrap());
+    }
+    frames.extend(dec.flush());
+    assert!(offsets.iter().any(|&o| o != offsets[0]), "the ctts carries the reorder");
+    pts.sort();
+    assert_eq!(pts, (2..=36).collect::<Vec<i64>>(), "every frame presented once, from tick 2");
+    assert_eq!(frames.len(), 35);
+    let mut order: Vec<usize> = (0..35).collect();
+    order.sort_by_key(|&i| want[i].pts);
+    for (k, f) in frames.iter().enumerate() {
+        let Pixels::I420 { y, u, v, .. } = &f.pixels else { panic!("frame {k} not I420") };
+        assert_eq!([y.clone(), u.clone(), v.clone()], recon[order[k]], "frame {k}: decode differs from the reconstruction");
+    }
+    let bytes: usize = want.iter().map(|a| a.avcc_sample().len()).sum();
+    println!("h264 pyramid bframes 3 export: {bytes} bytes, ctts offsets {offsets:?}");
+}

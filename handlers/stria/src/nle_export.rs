@@ -21,7 +21,7 @@
 //! * H264ENCBFRAMES (SR333): [`H264Encoder::with_bframes`] codes B pictures through h264enc_core's `push` / `flush`;
 //!   each unit carries its (dts, pts) ([`Access::time`]) and the MP4 track writes them per sample, so demux_core's
 //!   `build::mp4` writes the `ctts` composition offsets. No edit list (demux_core shifts pts only), so a reordered
-//!   video presents from tick 1.
+//!   video presents from tick 1, or tick 2 under h264enc_core's B pyramid at bframes >= 3 (reorder depth 2, H264ENCPYRAMID SR349).
 //! * Single-threaded: the sink owns its encoder, files and counters by `&mut self`; an I/O error is latched and
 //!   returned by [`ExportSink::finish`].
 

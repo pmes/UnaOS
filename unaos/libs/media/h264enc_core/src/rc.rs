@@ -290,10 +290,10 @@ impl Encoder {
     }
 
     /// The QP of the next picture (SliceQPY): the rate controller's, else the constant QP (a B picture's
-    /// [`B_QP_OFFSET`] above it, SR333).
+    /// [`B_QP_OFFSET`] above it, SR333; the pyramid's reference B [`crate::B_REF_QP_OFFSET`], SR349).
     pub(crate) fn rc_picture(&mut self, pic: Pic) -> i32 {
         if self.rc.is_none() {
-            return if pic == Pic::B { (self.cfg.qp as i32 + B_QP_OFFSET).min(QP_MAX) } else { self.cfg.qp as i32 };
+            return if pic == Pic::B { (self.cfg.qp as i32 + if self.tier == crate::Tier::Ref { crate::B_REF_QP_OFFSET } else { B_QP_OFFSET }).min(QP_MAX) } else { self.cfg.qp as i32 };
         }
         let rows = self.rc_analyse(pic);
         let t = match pic {

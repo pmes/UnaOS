@@ -7,10 +7,12 @@
 //! order and outputs every picture IN OUTPUT ORDER equal to the encoder's reconstruction of it; dts
 //! counts the decoding order, pts the display order + 1, dts <= pts; the SPS's VUI reorder depth is 1
 //! (0 without B); `bframes` 0 through `push` keeps the pinned bytes; the GOP-30 scene is smaller with B.
+//! H264ENCPYRAMID (SR349): bframes 3 / 4 (the pyramid: a reference B, VUI reorder 2, pts = display + 2), temporal
+//! direct, implicit and explicit weighted bi-prediction each decode to the reconstruction in output order.
 
 use h264_core::ps::avcc_reorder_depth;
 use h264_core::Decoder;
-use h264enc_core::{Access, Config, Encoder, Entropy, Error, RateControl, RcMode, Yuv420};
+use h264enc_core::{Access, BiPred, Config, Encoder, Entropy, Error, RateControl, RcMode, Yuv420};
 
 /// The moving square over a gradient (tests/pframes.rs's pattern) at any size.
 fn pattern(w: usize, h: usize, t: usize) -> [Vec<u8>; 3] {
@@ -86,22 +88,28 @@ fn encode_all(cfg: Config, n: usize, src: &dyn Fn(usize) -> [Vec<u8>; 3]) -> (Ve
     (aus, recons, enc)
 }
 
+/// The VUI reorder depth (and pts delay) of a `bframes` stream: 2 under a pyramid of 3 or 4 Bs, else 1 (SR349).
+fn depth(cfg: &Config) -> u64 {
+    if cfg.bframes >= 3 { 2 } else { 1 }
+}
+
 /// Encode under `cfg` (bframes > 0) and decode with h264_core: the timing rules hold, and the decoder's
 /// output-order pictures equal the reconstructions sorted by pts, each within `floor` dB of its source.
 /// Returns the stream's bytes (every NAL unit).
 fn check(name: &str, cfg: Config, n: usize, src: &dyn Fn(usize) -> [Vec<u8>; 3], floor: f64) -> usize {
     let (aus, recons, enc) = encode_all(cfg, n, src);
     assert_eq!(aus.len(), n, "{name}: one access unit per frame");
-    assert_eq!(avcc_reorder_depth(&enc.avcc()), Some(1), "{name}: VUI max_num_reorder_frames");
+    let dp = depth(&cfg);
+    assert_eq!(avcc_reorder_depth(&enc.avcc()), Some(dp as u32), "{name}: VUI max_num_reorder_frames");
     for (i, a) in aus.iter().enumerate() {
         assert_eq!(a.dts, i as u64, "{name}: dts is the decoding index");
         assert!(a.dts <= a.pts, "{name}: AU {i} dts {} > pts {}", a.dts, a.pts);
-        assert_eq!(a.keyframe, (a.pts - 1) % cfg.gop as u64 == 0, "{name}: AU {i} (pts {}) sync flag", a.pts);
+        assert_eq!(a.keyframe, (a.pts - dp) % cfg.gop as u64 == 0, "{name}: AU {i} (pts {}) sync flag", a.pts);
     }
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by_key(|&i| aus[i].pts);
-    assert_eq!(order.iter().map(|&i| aus[i].pts).collect::<Vec<_>>(), (1..=n as u64).collect::<Vec<_>>(), "{name}: pts = display + 1");
-    assert!(aus.iter().any(|a| a.pts != a.dts + 1), "{name}: nothing was reordered");
+    assert_eq!(order.iter().map(|&i| aus[i].pts).collect::<Vec<_>>(), (dp..n as u64 + dp).collect::<Vec<_>>(), "{name}: pts = display + depth");
+    assert!(aus.iter().any(|a| a.pts != a.dts + dp), "{name}: nothing was reordered");
 
     let mut dec = Decoder::new();
     let mut frames = Vec::new();
@@ -129,7 +137,7 @@ fn a_every_scene_with_b_decodes_to_the_reconstruction_in_output_order() {
     let scenes: [(&str, usize, usize, fn(usize, usize, usize) -> [Vec<u8>; 3]); 3] =
         [("pattern 64x48", 64, 48, pattern), ("scene 128x96", 128, 96, scene), ("crop 50x34", 50, 34, scene)];
     for (name, w, h, f) in scenes {
-        for bframes in [1u8, 2] {
+        for bframes in [1u8, 2, 3, 4] {
             for entropy in [Entropy::Cavlc, Entropy::Cabac] {
                 for deblock in [false, true] {
                     let cfg = Config { width: w as u32, height: h as u32, qp: 26, gop: 10, subpel: 2, deblock, entropy, bframes, ..Default::default() };
@@ -199,7 +207,81 @@ fn d_gop30_scene_is_smaller_with_b() {
         let b0: usize = aus.iter().map(|a| a.nals.iter().map(|x| x.len()).sum::<usize>()).sum();
         let b1 = check(&format!("gop30 b1 {entropy:?}"), cfg(1), 60, &|t| scene(w, h, t), 30.0);
         let b2 = check(&format!("gop30 b2 {entropy:?}"), cfg(2), 60, &|t| scene(w, h, t), 30.0);
-        println!("bframes gop30 {entropy:?}: b0={b0} b1={b1} ({:.1}%) b2={b2} ({:.1}%) bytes", 100.0 * b1 as f64 / b0 as f64, 100.0 * b2 as f64 / b0 as f64);
-        assert!(b1 < b0 && b2 < b0, "{entropy:?}: B pictures did not shrink the stream (b0 {b0} b1 {b1} b2 {b2})");
+        let b3 = check(&format!("gop30 b3 {entropy:?}"), cfg(3), 60, &|t| scene(w, h, t), 30.0);
+        let b4 = check(&format!("gop30 b4 {entropy:?}"), cfg(4), 60, &|t| scene(w, h, t), 30.0);
+        let pc = |b: usize| 100.0 * b as f64 / b0 as f64;
+        println!("bframes gop30 {entropy:?}: b0={b0} b1={b1} ({:.1}%) b2={b2} ({:.1}%) b3={b3} ({:.1}%) b4={b4} ({:.1}%) bytes (b2+ = the pyramid)", pc(b1), pc(b2), pc(b3), pc(b4));
+        assert!(b1 < b0 && b2 < b0 && b3 < b0 && b4 < b0, "{entropy:?}: B pictures did not shrink the stream (b0 {b0} b1 {b1} b2 {b2} b3 {b3} b4 {b4})");
     }
+}
+
+/// The textured scene fading up: +3 luma per frame (the explicit weights' case, SR349).
+fn fade(w: usize, h: usize, t: usize) -> [Vec<u8>; 3] {
+    let mut p = scene(w, h, t);
+    for v in p[0].iter_mut() {
+        *v = (*v as usize + 3 * t).min(255) as u8;
+    }
+    p
+}
+
+/// The pyramid (SR349): bframes 3 writes VUI reorder 2 and codes a reference B (a non-IDR slice with nal_ref_idc 1)
+/// per full group; bframes 2 keeps reorder 1 (its middle is the first B).
+#[test]
+fn e_pyramid_codes_a_reference_b_and_reorder_two() {
+    let base = Config { width: 64, height: 48, qp: 26, gop: 10, ..Default::default() };
+    assert_eq!(avcc_reorder_depth(&Encoder::new(Config { bframes: 2, ..base }).unwrap().avcc()), Some(1));
+    for b in [3u8, 4] {
+        let cfg = Config { bframes: b, ..base };
+        assert_eq!(avcc_reorder_depth(&Encoder::new(cfg).unwrap().avcc()), Some(2), "b{b}: VUI reorder");
+        let (aus, _, _) = encode_all(cfg, 20, &|t| pattern(64, 48, t));
+        let refb = aus.iter().filter(|a| a.nals.iter().any(|n| n[0] & 0x1f == 1 && n[0] >> 5 == 1)).count();
+        assert!(refb >= 2, "b{b}: {refb} reference B pictures");
+    }
+}
+
+/// Temporal direct (SR349) on SR333's Bs (bframes 1) and the pyramid's middle (bframes 3): decodes bit-exact to the
+/// reconstruction, and the stream differs from spatial direct's.
+#[test]
+fn f_temporal_direct_decodes_to_the_reconstruction() {
+    let (w, h) = (128usize, 96usize);
+    for bframes in [1u8, 3] {
+        for entropy in [Entropy::Cavlc, Entropy::Cabac] {
+            for deblock in [false, true] {
+                let cfg = Config { width: w as u32, height: h as u32, qp: 26, gop: 15, subpel: 2, deblock, entropy, bframes, ..Default::default() };
+                let label = format!("temporal b{bframes} {entropy:?} deblock {deblock}");
+                let t = check(&label, Config { direct_temporal: true, ..cfg }, 30, &|t| scene(w, h, t), 30.0);
+                let s = check(&format!("spatial b{bframes} {entropy:?} deblock {deblock}"), cfg, 30, &|t| scene(w, h, t), 30.0);
+                println!("bframes {label}: {t} bytes (spatial {s})");
+                assert_ne!(t, 0);
+            }
+        }
+    }
+    let cfg = Config { width: w as u32, height: h as u32, qp: 26, gop: 15, bframes: 1, ..Default::default() };
+    let (a, _, _) = encode_all(Config { direct_temporal: true, ..cfg }, 30, &|t| scene(w, h, t));
+    let (b, _, _) = encode_all(cfg, 30, &|t| scene(w, h, t));
+    assert_ne!(a, b, "temporal direct wrote the spatial stream");
+}
+
+/// Weighted bi-prediction (SR349): implicit (Auto under the pyramid at bframes 4, where the middle sits at 2/5 and the
+/// weights are not 32 / 32; Implicit at bframes 1) and explicit (the fading scene) decode bit-exact; the explicit stream
+/// differs from the average's.
+#[test]
+fn g_weighted_bipred_decodes_to_the_reconstruction() {
+    let (w, h) = (128usize, 96usize);
+    for entropy in [Entropy::Cavlc, Entropy::Cabac] {
+        let base = Config { width: w as u32, height: h as u32, qp: 26, gop: 15, subpel: 2, deblock: true, entropy, ..Default::default() };
+        let auto = check(&format!("auto b4 {entropy:?}"), Config { bframes: 4, ..base }, 30, &|t| scene(w, h, t), 30.0);
+        let avg = check(&format!("average b4 {entropy:?}"), Config { bframes: 4, bipred: BiPred::Average, ..base }, 30, &|t| scene(w, h, t), 30.0);
+        let imp = check(&format!("implicit b1 {entropy:?}"), Config { bframes: 1, bipred: BiPred::Implicit, ..base }, 30, &|t| scene(w, h, t), 30.0);
+        for b in [2u8, 3] {
+            let exp = check(&format!("explicit fade b{b} {entropy:?}"), Config { bframes: b, bipred: BiPred::Explicit, ..base }, 30, &|t| fade(w, h, t), 28.0);
+            let fav = check(&format!("average fade b{b} {entropy:?}"), Config { bframes: b, bipred: BiPred::Average, ..base }, 30, &|t| fade(w, h, t), 28.0);
+            println!("bframes weighted {entropy:?} fade b{b}: explicit={exp} average={fav} bytes");
+        }
+        println!("bframes weighted {entropy:?}: b4 auto(implicit)={auto} average={avg}; b1 implicit={imp} bytes");
+    }
+    let cfg = Config { width: w as u32, height: h as u32, qp: 26, gop: 15, bframes: 2, ..Default::default() };
+    let (a, _, _) = encode_all(Config { bipred: BiPred::Explicit, ..cfg }, 30, &|t| fade(w, h, t));
+    let (b, _, _) = encode_all(Config { bipred: BiPred::Average, ..cfg }, 30, &|t| fade(w, h, t));
+    assert_ne!(a, b, "explicit weights wrote the average's stream");
 }

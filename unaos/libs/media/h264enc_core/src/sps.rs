@@ -16,6 +16,11 @@
 //! reference frames and a VUI of max_num_reorder_frames 1 / max_dec_frame_buffering 2; a B slice header
 //! carries direct_spatial_mv_pred_flag 1, both list-modification flags 0 and, as a non-reference
 //! picture, no dec_ref_pic_marking.
+//!
+//! H264ENCPYRAMID (SR349): under the pyramid ([`SeqParams::pyramid`], bframes >= 2) three reference frames, VUI
+//! max_num_reorder_frames [`SeqParams::num_reorder`] (2 at bframes >= 3) and max_dec_frame_buffering 4; per slice a
+//! [`SliceExtra`] carries the reference B's marking, the anchor's list-0 modification and MMCO 1, temporal direct and the
+//! explicit pred_weight_table; the PPS names weighted_bipred_idc.
 
 use alloc::vec::Vec;
 
@@ -50,6 +55,10 @@ pub struct SeqParams {
     pub reorder: bool,
     /// log2_max_pic_order_cnt_lsb (written under `reorder` only).
     pub log2_max_poc_lsb: u32,
+    /// The B pyramid (SR349): max_num_ref_frames 3 and max_dec_frame_buffering 4.
+    pub pyramid: bool,
+    /// VUI max_num_reorder_frames: 0 without B, 1, or 2 under a pyramid of bframes >= 3 (SR349).
+    pub num_reorder: u32,
 }
 
 /// level_idc for a frame of `mb_w` x `mb_h` macroblocks: the lowest level of Table A-1 whose
@@ -85,7 +94,7 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
     if p.reorder {
         w.ue(0); // pic_order_cnt_type 0: pic_order_cnt_lsb in every slice header (SR333)
         w.ue(p.log2_max_poc_lsb - 4); // log2_max_pic_order_cnt_lsb_minus4
-        w.ue(2); // max_num_ref_frames: the past and the future anchor
+        w.ue(if p.pyramid { 3 } else { 2 }); // max_num_ref_frames: the past and the future anchor (+ the pyramid's middle B, SR349)
     } else {
         w.ue(2); // pic_order_cnt_type: POC follows frame_num, output order = decoding order
         w.ue(1); // max_num_ref_frames
@@ -119,8 +128,8 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
     w.ue(1); // max_bits_per_mb_denom
     w.ue(16); // log2_max_mv_length_horizontal
     w.ue(16); // log2_max_mv_length_vertical
-    w.ue(p.reorder as u32); // max_num_reorder_frames: 1 with B pictures (the anchor waits for them)
-    w.ue(1 + p.reorder as u32); // max_dec_frame_buffering
+    w.ue(p.num_reorder); // max_num_reorder_frames: 1 with B pictures (the anchor waits for them), 2 under a deep pyramid
+    w.ue(if p.pyramid { 4 } else { 1 + p.reorder as u32 }); // max_dec_frame_buffering: 3 references + 1 waiting B under the pyramid
     w.trailing();
     w.finish()
 }
@@ -129,7 +138,7 @@ pub fn write_sps(p: &SeqParams) -> Vec<u8> {
 /// pic_init_qp = the stream's QP (so slice_qp_delta is 0), chroma_qp_index_offset 0,
 /// deblocking_filter_control_present_flag 1 (each slice names its filter idc). With `t8x8` (SR322) the
 /// High tail: transform_8x8_mode_flag 1, pic_scaling_matrix_present_flag 0, second_chroma_qp_index_offset 0.
-pub fn write_pps(qp: i32, cabac: bool, t8x8: bool) -> Vec<u8> {
+pub fn write_pps(qp: i32, cabac: bool, t8x8: bool, bipred_idc: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.ue(0); // pic_parameter_set_id
     w.ue(0); // seq_parameter_set_id
@@ -139,7 +148,7 @@ pub fn write_pps(qp: i32, cabac: bool, t8x8: bool) -> Vec<u8> {
     w.ue(0); // num_ref_idx_l0_default_active_minus1
     w.ue(0); // num_ref_idx_l1_default_active_minus1
     w.flag(false); // weighted_pred_flag
-    w.u(2, 0); // weighted_bipred_idc
+    w.u(2, bipred_idc); // weighted_bipred_idc: 0 default, 1 explicit, 2 implicit (SR349)
     w.se(qp - 26); // pic_init_qp_minus26
     w.se(0); // pic_init_qs_minus26
     w.se(0); // chroma_qp_index_offset
@@ -165,7 +174,7 @@ pub fn write_pps(qp: i32, cabac: bool, t8x8: bool) -> Vec<u8> {
 /// SR333: `pic` B writes slice_type 6, direct_spatial_mv_pred_flag 1, ref_pic_list_modification_flag_l1 0
 /// and (nal_ref_idc 0) no marking; `poc` Some((lsb, log2_max_pic_order_cnt_lsb)) writes pic_order_cnt_lsb
 /// (POC type 0), None keeps POC type 2's empty syntax.
-pub fn write_slice_header(w: &mut BitWriter, pic: Pic, frame_num: u32, log2_max_frame_num: u32, idr_pic_id: u32, poc: Option<(u32, u32)>, deblock: bool, slice_qp_delta: i32, cabac: bool) {
+pub fn write_slice_header(w: &mut BitWriter, pic: Pic, frame_num: u32, log2_max_frame_num: u32, idr_pic_id: u32, poc: Option<(u32, u32)>, deblock: bool, slice_qp_delta: i32, cabac: bool, x: &SliceExtra) {
     let idr = pic == Pic::Idr;
     w.ue(0); // first_mb_in_slice
     w.ue(match pic {
@@ -183,21 +192,34 @@ pub fn write_slice_header(w: &mut BitWriter, pic: Pic, frame_num: u32, log2_max_
     }
     // pic_order_cnt_type 2: no POC syntax.
     if pic == Pic::B {
-        w.flag(true); // direct_spatial_mv_pred_flag
+        w.flag(x.direct_spatial); // direct_spatial_mv_pred_flag (0 = temporal, SR349)
     }
     if !idr {
         w.flag(false); // num_ref_idx_active_override_flag
-        w.flag(false); // ref_pic_list_modification_flag_l0
+        w.flag(x.l0_reorder.is_some()); // ref_pic_list_modification_flag_l0
+        if let Some(d) = x.l0_reorder {
+            w.ue(0); // modification_of_pic_nums_idc 0: subtract
+            w.ue(d); // abs_diff_pic_num_minus1
+            w.ue(3); // end of the list's modifications
+        }
     }
     if pic == Pic::B {
         w.flag(false); // ref_pic_list_modification_flag_l1
     }
-    // nal_ref_idc != 0: dec_ref_pic_marking (7.3.3.3); a B picture is not a reference.
+    if let Some(o) = x.weights {
+        pred_weight_table(w, o);
+    }
+    // nal_ref_idc != 0: dec_ref_pic_marking (7.3.3.3); a B picture is a reference only as the pyramid's middle (SR349).
     if idr {
         w.flag(false); // no_output_of_prior_pics_flag
         w.flag(false); // long_term_reference_flag
-    } else if pic == Pic::P {
-        w.flag(false); // adaptive_ref_pic_marking_mode_flag: sliding window
+    } else if pic == Pic::P || x.reference {
+        w.flag(x.forget.is_some()); // adaptive_ref_pic_marking_mode_flag: sliding window, or MMCO 1 (SR349)
+        if let Some(d) = x.forget {
+            w.ue(1); // memory_management_control_operation 1: a short-term picture unused
+            w.ue(d); // difference_of_pic_nums_minus1
+            w.ue(0); // end of the operations
+        }
     }
     if cabac && !idr {
         w.ue(0); // cabac_init_idc (P / B slices; the I slices are the IDRs)
@@ -209,5 +231,44 @@ pub fn write_slice_header(w: &mut BitWriter, pic: Pic, frame_num: u32, log2_max_
         w.se(0); // slice_beta_offset_div2
     } else {
         w.ue(1); // disable_deblocking_filter_idc
+    }
+}
+
+/// The per-slice syntax beyond SR333's (H264ENCPYRAMID, SR349); [`Default`] writes SR333's bytes for an anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SliceExtra {
+    /// A B picture with nal_ref_idc != 0 (the pyramid's middle): it carries dec_ref_pic_marking.
+    pub reference: bool,
+    /// direct_spatial_mv_pred_flag of a B slice (false = temporal direct).
+    pub direct_spatial: bool,
+    /// The list-0 modification of a P slice: abs_diff_pic_num_minus1 (idc 0) so RefPicList0[0] is the past anchor.
+    pub l0_reorder: Option<u32>,
+    /// MMCO 1 difference_of_pic_nums_minus1: the previous middle B marked unused.
+    pub forget: Option<u32>,
+    /// The explicit pred_weight_table of a B slice (weighted_bipred_idc 1): the luma offsets of L0[0] and L1[0].
+    pub weights: Option<[i32; 2]>,
+}
+
+impl Default for SliceExtra {
+    fn default() -> SliceExtra {
+        SliceExtra { reference: false, direct_spatial: true, l0_reorder: None, forget: None, weights: None }
+    }
+}
+
+/// The luma_log2_weight_denom (and chroma's) of the explicit table: weight 32 is 1.0.
+pub const WP_LOG2_DENOM: u32 = 5;
+
+/// pred_weight_table (7.3.3.2) of a B slice with one active reference per list: denominators [`WP_LOG2_DENOM`], per list
+/// a luma weight of 32 with the offset when it is not 0 (luma_weight_lX_flag), chroma at its defaults.
+fn pred_weight_table(w: &mut BitWriter, offsets: [i32; 2]) {
+    w.ue(WP_LOG2_DENOM); // luma_log2_weight_denom
+    w.ue(WP_LOG2_DENOM); // chroma_log2_weight_denom
+    for o in offsets {
+        w.flag(o != 0); // luma_weight_lX_flag
+        if o != 0 {
+            w.se(1 << WP_LOG2_DENOM); // luma_weight_lX
+            w.se(o); // luma_offset_lX
+        }
+        w.flag(false); // chroma_weight_lX_flag
     }
 }

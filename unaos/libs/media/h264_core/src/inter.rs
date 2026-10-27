@@ -210,16 +210,8 @@ impl<'a> SliceCtx<'a> {
             };
             let p0 = self.ref_pic(0, r0)?;
             let p1 = self.ref_pic(1, 0)?;
-            let td = (p1.poc - p0.poc).clamp(-128, 127);
-            let (mv0, mv1) = if p0.is_long() || td == 0 {
-                (mv_col, Mv::ZERO)
-            } else {
-                let tb = (self.pic.poc - p0.poc).clamp(-128, 127);
-                let tx = (16384 + (td / 2).abs()) / td;
-                let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
-                let m0 = Mv::new((dsf * mv_col.x as i32 + 128) >> 8, (dsf * mv_col.y as i32 + 128) >> 8);
-                (m0, Mv::new(m0.x as i32 - mv_col.x as i32, m0.y as i32 - mv_col.y as i32))
-            };
+            let dsf = if p0.is_long() { None } else { dist_scale_factor(self.pic.poc, p0.poc, p1.poc) };
+            let (mv0, mv1) = temporal_mvs(dsf, mv_col);
             Ok(BlockMotion { r: [r0, 0], mv: [mv0, mv1] })
         }
     }
@@ -322,18 +314,8 @@ impl<'a> SliceCtx<'a> {
             // Implicit (8.4.2.3.1).
             let p0 = self.ref_pic(0, m.r[0])?;
             let p1 = self.ref_pic(1, m.r[1])?;
-            let td = (p1.poc - p0.poc).clamp(-128, 127);
-            let (mut w0, mut w1) = (32, 32);
-            if td != 0 && !p0.is_long() && !p1.is_long() {
-                let tb = (self.pic.poc - p0.poc).clamp(-128, 127);
-                let tx = (16384 + (td / 2).abs()) / td;
-                let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
-                if (-64..=128).contains(&(dsf >> 2)) {
-                    w0 = 64 - (dsf >> 2);
-                    w1 = dsf >> 2;
-                }
-            }
-            let wp = Wp { log_wd: 5, w: [w0, w1], o: [0, 0] };
+            let dsf = if p0.is_long() || p1.is_long() { None } else { dist_scale_factor(self.pic.poc, p0.poc, p1.poc) };
+            let wp = Wp { log_wd: 5, w: implicit_weights(dsf), o: [0, 0] };
             return Ok(Some([wp; 3]));
         }
         let Some(pw) = self.sh.weights.as_ref() else { return Ok(None) };
@@ -383,16 +365,7 @@ impl<'a> SliceCtx<'a> {
                         (None, [true, true]) => (a + b + 1) >> 1,
                         (None, [true, false]) => a,
                         (None, _) => b,
-                        (Some(wp), u) => {
-                            let wp = &wp[c];
-                            let lw = wp.log_wd;
-                            if u[0] && u[1] {
-                                ((a * wp.w[0] + b * wp.w[1] + (1 << lw)) >> (lw + 1)) + ((wp.o[0] + wp.o[1] + 1) >> 1)
-                            } else {
-                                let (s, l) = if u[0] { (a, 0) } else { (b, 1) };
-                                if lw >= 1 { ((s * wp.w[l] + (1 << (lw - 1))) >> lw) + wp.o[l] } else { s * wp.w[l] + wp.o[l] }
-                            }
-                        }
+                        (Some(wp), u) => weighted_sample(a, b, u, wp[c].log_wd, wp[c].w, wp[c].o),
                     };
                     plane.data[(cy + yy) * plane.w + cx + xx] = v.clamp(0, 255) as u8;
                 }
@@ -470,5 +443,49 @@ pub fn chroma_mc(p: &Plane, x0: i32, y0: i32, mv: Mv, bw: usize, bh: usize, out:
             let v = ((8 - xf) * (8 - yf) * a + xf * (8 - yf) * b + (8 - xf) * yf * c + xf * yf * d + 32) >> 6;
             out[(y * 16 + x) as usize] = v as u8;
         }
+    }
+}
+
+// H264ENCPYRAMID (SR349): the POC-distance and weighted-sample formulas as free fns, the ONE copy the decoder's temporal
+// direct / implicit weights / `predict` and h264enc_core's encoder both call.
+
+/// DistScaleFactor (8.4.1.2.3) of the picture at POC `cur` between references at `poc0` (list 0) and `poc1` (list 1): tb and
+/// td clipped to -128..=127, None when td is 0 (the caller passes None itself for a long-term reference).
+pub fn dist_scale_factor(cur: i32, poc0: i32, poc1: i32) -> Option<i32> {
+    let td = (poc1 - poc0).clamp(-128, 127);
+    if td == 0 {
+        return None;
+    }
+    let tb = (cur - poc0).clamp(-128, 127);
+    let tx = (16384 + (td / 2).abs()) / td;
+    Some(((tb * tx + 32) >> 6).clamp(-1024, 1023))
+}
+
+/// Temporal direct (8.4.1.2.3): (mvL0, mvL1) from the co-located vector `mv_col` scaled by `dsf`; None = (mvCol, 0).
+pub fn temporal_mvs(dsf: Option<i32>, mv_col: Mv) -> (Mv, Mv) {
+    match dsf {
+        None => (mv_col, Mv::ZERO),
+        Some(dsf) => {
+            let m0 = Mv::new((dsf * mv_col.x as i32 + 128) >> 8, (dsf * mv_col.y as i32 + 128) >> 8);
+            (m0, Mv::new(m0.x as i32 - mv_col.x as i32, m0.y as i32 - mv_col.y as i32))
+        }
+    }
+}
+
+/// Implicit bi-prediction weights (8.4.2.3.1, logWD 5): (64 - DSF >> 2, DSF >> 2), or (32, 32) without a DSF or out of range.
+pub fn implicit_weights(dsf: Option<i32>) -> [i32; 2] {
+    match dsf {
+        Some(d) if (-64..=128).contains(&(d >> 2)) => [64 - (d >> 2), d >> 2],
+        _ => [32, 32],
+    }
+}
+
+/// One weighted prediction sample (8.4.2.3.2) from the list-0 / list-1 samples `a` / `b` (`used` per list), unclipped.
+pub fn weighted_sample(a: i32, b: i32, used: [bool; 2], log_wd: i32, w: [i32; 2], o: [i32; 2]) -> i32 {
+    if used[0] && used[1] {
+        ((a * w[0] + b * w[1] + (1 << log_wd)) >> (log_wd + 1)) + ((o[0] + o[1] + 1) >> 1)
+    } else {
+        let (s, l) = if used[0] { (a, 0) } else { (b, 1) };
+        if log_wd >= 1 { ((s * w[l] + (1 << (log_wd - 1))) >> log_wd) + o[l] } else { s * w[l] + o[l] }
     }
 }
