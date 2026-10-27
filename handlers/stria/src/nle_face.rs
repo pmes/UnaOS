@@ -36,7 +36,7 @@ pub use text_host::line::PixelOrder;
 use text_host::line::TextStyle;
 use timeline_core::{Clip, EditError, Kind, Timeline, Transition, TransitionKind, WipeDir, edl};
 
-use crate::nle::{RenderError, RenderSink, Sources, render, synth_source};
+use crate::nle::{MeterLevel, MixMeters, RenderError, RenderSink, Sources, render, synth_source};
 
 /// The editor surface's id (the tetra `Surface` and every `SurfaceBlit` / `Input` target).
 pub const SURFACE: &str = "stria.nle";
@@ -376,13 +376,15 @@ pub struct Face {
     view: Option<(i64, i64)>,
     /// NLE3d (SR302): the selected transition's thumbnail, keyed `(track, idx, dur, at)` (rendered once per change).
     trans_still: Option<((usize, usize, i64, i64), Option<Still>)>,
+    /// NLE4C (SR301): the per-track and master meters, fed by each played tick's render.
+    meters: MixMeters,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None }
+        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default() }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -492,7 +494,7 @@ impl Face {
             self.playing = false;
             return true;
         }
-        self.state.nudge(self.rate);
+        self.feed_meters(ph, self.rate); self.state.nudge(self.rate);
         true
     }
     /// The canvas as painted now (the preview at the playhead rendered first). While a drag is live the drag's
@@ -509,7 +511,7 @@ impl Face {
             }
         };
         let px = paint_in(st, l, self.order, self.labels.as_ref(), self.still.as_ref());
-        paint_drag(self.paint_transition_still(px, l), l, self.order, self.drag.as_ref())
+        paint_meters(paint_drag(self.paint_transition_still(px, l), l, self.order, self.drag.as_ref()), l, self.order, &self.meter_levels())
     }
     /// The canvas as the surface's blit.
     pub fn frame(&mut self) -> SMessage {
@@ -1879,4 +1881,140 @@ mod tests {
 
     /// `nle3d_widget_paint_golden`'s hash, measured by the test's first run (FNV-1a 64 of the 320x160 RGBA paint).
     const GOLDEN_TRANSITIONS: &str = "9b5278f1281cd494";
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// THE METERS (NLE4C, LEDGER SR301)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// The meter strip's width (px), at the canvas's right edge.
+pub const METER_W: u32 = 6;
+/// The strip's bottom: readings at or below this are an empty bar (linear in dB up to 0 dBFS).
+pub const METER_VIEW_DB: f64 = -60.0;
+const METER_BG: [u8; 4] = [0x10, 0x10, 0x14, 255];
+const METER_RMS: [u8; 4] = [0x40, 0xd0, 0x60, 255];
+const METER_PEAK: [u8; 4] = [0xff, 0xe0, 0x40, 255];
+
+impl Face {
+    /// Feed the meters the `n` played ticks from `from` (`stria::nle::MixMeters::feed`: the render of the whole timeline
+    /// there, so a track's meter reads its share of what is sent and the master the sum). A reverse shuttle (`n <= 0`)
+    /// renders no audio: the meters fall to nothing. An error is the face's `last_error` and resets them.
+    pub fn feed_meters(&mut self, from: i64, n: i64) {
+        let end = (from + n).min(self.state.timeline.end());
+        if n <= 0 || end <= from {
+            self.meters.reset();
+            return;
+        }
+        if let Err(e) = self.meters.feed(&self.state.timeline, from..end, &self.sources) {
+            self.last_error = Some(format!("meters: {e}"));
+            self.meters.reset();
+        }
+    }
+    /// The meters as last fed.
+    pub fn meters(&self) -> &MixMeters {
+        &self.meters
+    }
+    /// What the strip paints: the meters while playing, nothing when stopped (never a frozen reading).
+    fn meter_levels(&self) -> Vec<MeterLevel> {
+        if self.playing { self.meters.levels() } else { Vec::new() }
+    }
+}
+
+/// The meter strip over a painted canvas: each audio track's bar inside its row, the master's down the preview band, at
+/// x `w - METER_W - 1 .. w - 1`; the RMS filled from the bottom, the peak a 1 px line, both linear in dB over
+/// [`METER_VIEW_DB`]..0. No levels paint nothing.
+fn paint_meters(px: Vec<u8>, l: Layout, order: PixelOrder, levels: &[MeterLevel]) -> Vec<u8> {
+    if levels.is_empty() {
+        return px;
+    }
+    let mut c = Canvas { w: l.w, h: l.h, order, px };
+    let (x1, x0) = (l.w as i64 - 1, l.w as i64 - 1 - METER_W as i64);
+    let frac = |db: f64| ((db - METER_VIEW_DB) / -METER_VIEW_DB).clamp(0.0, 1.0);
+    for lv in levels {
+        let (y0, y1) = match lv.track {
+            Some(t) if t < l.rows => (l.row_y(t) + 2, l.row_y(t) + ROW_H as i64 - 2),
+            Some(_) => continue,
+            None => (1, l.preview_h as i64 - 1),
+        };
+        if y1 - y0 < 2 {
+            continue;
+        }
+        let span = (y1 - y0) as f64;
+        c.rect(x0, y0, x1, y1, METER_BG);
+        let fill = (frac(lv.rms_db) * span).round() as i64;
+        c.rect(x0, y1 - fill, x1, y1, METER_RMS);
+        let pk = (frac(lv.peak_db) * span).round() as i64;
+        if pk > 0 {
+            let y = (y1 - pk).max(y0);
+            c.rect(x0, y, x1, y + 1, METER_PEAK);
+        }
+    }
+    c.px
+}
+
+#[cfg(test)]
+mod nle4c_tests {
+    use super::*;
+    use crate::nle::synth_sample;
+    use gneiss_pal::dsp::audio::meter::dbfs;
+
+    /// NLE4C M3: the strip over the fixture's paint: the master's RMS fill and peak line down the preview band, track 1's
+    /// inside its row, the rest of the canvas the plain paint; golden.
+    #[test]
+    fn nle4c_meter_strip_golden() {
+        let mut st = EditorState::new(synth_fixture().0);
+        st.seek(15);
+        let l = Layout::of(320, 160, &st);
+        let base = paint(&st, 320, 160, PixelOrder::Rgba, None, None);
+        let levels = [
+            MeterLevel { track: Some(1), peak_db: -6.0, rms_db: -30.0 },
+            MeterLevel { track: None, peak_db: 0.0, rms_db: -15.0 },
+        ];
+        assert_eq!(paint_meters(base.clone(), l, PixelOrder::Rgba, &[]), base, "no levels paint nothing");
+        let rgba = paint_meters(base.clone(), l, PixelOrder::Rgba, &levels);
+        let at = |x: usize, y: usize| &rgba[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
+        let x = 316;
+        // track 1's row: y 122..158 (36 px); RMS -30 dB fills 18 px from 158 up, the -6 dB peak sits 32 px up
+        assert_eq!((l.row_y(1), l.preview_h), (120, 64));
+        assert_eq!(at(x, 157), METER_RMS);
+        assert_eq!(at(x, 140), METER_RMS);
+        assert_eq!(at(x, 139), METER_BG);
+        assert_eq!(at(x, 126), METER_PEAK);
+        // the master: y 1..63 (62 px); RMS -15 dB fills 47 px (from 16 down), the 0 dB peak is the top row
+        assert_eq!(at(x, 16), METER_RMS);
+        assert_eq!(at(x, 15), METER_BG);
+        assert_eq!(at(x, 1), METER_PEAK);
+        assert_eq!(at(319, 140), &base[(140 * 320 + 319) * 4..(140 * 320 + 319) * 4 + 4], "the strip ends at w - 1");
+        assert_eq!(at(x, 100), &base[(100 * 320 + x) * 4..(100 * 320 + x) * 4 + 4], "no strip on a video row");
+        assert_eq!(format!("{:016x}", fnv1a(&rgba)), GOLDEN_METERS);
+    }
+
+    /// `nle4c_meter_strip_golden`'s hash, measured by the test's first run (FNV-1a 64 of the 320x160 RGBA paint).
+    const GOLDEN_METERS: &str = "e813db12ef577e17";
+
+    /// NLE4C M2: a played tick feeds the meters from the render: one audio track at 0 dB passes bit for bit, so its
+    /// meter IS the master's, and the peak is the loudest sample sent (reel A from source tick 13: samples 24960..26880,
+    /// the loudest 6879 / 32768); a stopped face paints no strip; a reverse shuttle resets them.
+    #[test]
+    fn nle4c_played_tick_feeds_the_meters() {
+        let (tl, src) = synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(face.meters().levels().is_empty());
+        face.verb("play");
+        assert!(face.tick());
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        let lv = face.meters().levels();
+        assert_eq!(lv.len(), 2);
+        assert_eq!((lv[0].track, lv[1].track), (Some(1), None));
+        assert_eq!((lv[0].peak_db, lv[0].rms_db), (lv[1].peak_db, lv[1].rms_db));
+        let loud = (24_960u64..26_880).map(|i| synth_sample(0, i)).max().unwrap();
+        assert_eq!(loud, 6879);
+        assert!((lv[1].peak_db - dbfs(loud as f64 / 32768.0)).abs() < 1e-9, "{}", lv[1].peak_db);
+        assert!(lv[1].rms_db < lv[1].peak_db && lv[1].rms_db > -96.0);
+        assert_eq!(face.meter_levels().len(), 2, "playing: the strip shows");
+        face.verb("play");
+        assert!(face.meter_levels().is_empty(), "stopped: no strip");
+        face.feed_meters(face.state.playhead, -1);
+        assert!(face.meters().levels().is_empty(), "reverse resets");
+    }
 }

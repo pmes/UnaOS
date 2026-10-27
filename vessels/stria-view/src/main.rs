@@ -25,6 +25,8 @@
 //! `key:Meta+a` is the `BrowserSelectAll` both faces send for it, and the JSON line ends with the set's size `set`.
 //! NLE3d (SR302): `transition:<track>:<idx>` clicks that transition's widget (selecting it; `delete`, `[` / `]` then edit
 //! it), and the JSON line ends with `transition` (the selected one and its thumbnail's size, or `null`).
+//! NLE4C (SR301): `meters` feeds the face's meters the tick at the playhead (what one played tick feeds); the JSON line
+//! then ends `"meters":[{"track":<n>,"peak":<dBFS>,"rms":<dBFS>},...,{"track":"master",...}]`.
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::TetraNode;
@@ -43,7 +45,7 @@ struct Cli {
     labels: bool,
 }
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -190,7 +192,7 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
 fn drive(face: &mut Face, script: &str) -> Vec<String> {
     let mut errors = Vec::new();
     for tok in script.split(',').filter(|t| !t.is_empty()) {
-        match token(face, tok) {
+        match if tok == "meters" { face.feed_meters(face.state.playhead, 1); Some(Vec::new()) } else { token(face, tok) } {
             Some(ms) => {
                 for m in ms {
                     face.on(&m);
@@ -223,8 +225,9 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let sel = st.selection.map(|(t, i)| format!("\"{t}:{i}\"")).unwrap_or_else(|| "null".into());
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
+    let meters = meters_json(c, &face);
     println!(
-        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{}}}",
+        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{}{meters}}}",
         st.playhead,
         st.timeline.tracks.len(),
         clips,
@@ -237,6 +240,19 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
         transition_json(&face)
     );
     0
+}
+
+/// NLE4C: the witness's `"meters"` field, when the script fed them.
+fn meters_json(c: &Cli, face: &Face) -> String {
+    if !c.script.as_deref().unwrap_or("").split(',').any(|t| t == "meters") {
+        return String::new();
+    }
+    let one = |m: &stria::nle::MeterLevel| {
+        let track = m.track.map(|t| t.to_string()).unwrap_or_else(|| "\"master\"".into());
+        format!("{{\"track\":{track},\"peak\":{:.2},\"rms\":{:.2}}}", m.peak_db, m.rms_db)
+    };
+    let all: Vec<String> = face.meters().levels().iter().map(one).collect();
+    format!(",\"meters\":[{}]", all.join(","))
 }
 
 fn main() {
@@ -353,6 +369,17 @@ mod tests {
         assert_eq!(face.state.timeline, tl0.remove_transition(0, 10).unwrap());
         assert_eq!((transition_json(&face), face.state.undo_depth()), ("null".to_string(), 4));
         assert_eq!(drive(&mut face, "transition:0:0"), vec!["bad token transition:0:0".to_string()]);
+    }
+
+    /// NLE4C M3: the `meters` token feeds the tick at the playhead; the face then holds track 1's meter and the master's.
+    #[test]
+    fn nle4c_witness_meters() {
+        let (tl, src) = nle_face::synth_fixture();
+        let mut face = Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false);
+        assert!(drive(&mut face, "meters").is_empty());
+        let lv = face.meters().levels();
+        assert_eq!(lv.iter().map(|m| m.track).collect::<Vec<_>>(), vec![Some(1), None]);
+        assert!((lv[1].peak_db + 13.56).abs() < 0.01, "{}", lv[1].peak_db);
     }
 }
 
