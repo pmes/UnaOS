@@ -20,9 +20,10 @@
 //! the gateway the operator named is S10a; smoltcp's DHCP over the kept station is S10b (`verb.rs::wifidhcp`).
 //!
 //! The KATs are hand-assembled from the clause layouts (no captured data frame exists in `docs/dev/evidence`),
-//! so `n=16/16` certifies the judge, the codec, the 1514-octet frame cap, the addr1 filter and the link watch (STATIONWATCH
+//! so `n=19/19` certifies the judge, the codec, the 1514-octet frame cap, the addr1 filter and the link watch (STATIONWATCH
 //! B843), the TX header's rate fields, the station's MACCTL word, the AP's rate set and the probe's Null frame (STATIONRATE
-//! B855) against the standard's and b43's field order, not a replay of a capture.
+//! B855), the NAV, the short preamble and the DHCP lease seconds (STATIONAIR B862; the `lease` row exists only where smolnet
+//! does) against the standard's and b43's field order, not a replay of a capture.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -336,6 +337,42 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
     nul.extend_from_slice(&BSSID);
     nul.extend_from_slice(&[0x00, 0x00]);
     checks.push(("null", w::build_null_data(STA, BSSID, 0) == nul && nul.len() == 24));
+    // 17. duration (STATIONAIR B862): `tx::air_kat`'s NAV row, then the AP's answer rate (§10.6.6.5.2): the 11g set above
+    //     (basic 1,2,5.5,11) answers CCK 11 at 11 and OFDM 24 at 24 (no basic OFDM: the mandatory 24); basic 1,2 answers CCK 11
+    //     at 2; basic 6,12 answers OFDM 24 at 12; unread answers CCK 5.5 at 5.5; an unknown rate answers CCK 1.
+    let b12 = w::RateSet { listed: 0x000F, basic: 0x0003 };
+    let b6_12 = w::RateSet { listed: 0x0FFF, basic: 0x000F | (1 << 4) | (1 << 6) };
+    checks.push(("duration", k[5] && super::assoc::ack_rate(rg, w::RATE_11M) == w::RATE_11M
+        && super::assoc::ack_rate(rg, w::RATE_24M) == w::RATE_24M && super::assoc::ack_rate(Some(b12), w::RATE_11M) == 4
+        && super::assoc::ack_rate(Some(b6_12), w::RATE_24M) == 24 && super::assoc::ack_rate(None, 11) == 11
+        && super::assoc::ack_rate(None, 7) == w::RATE_1M));
+    // 18. shortpre (STATIONAIR B862): `tx::air_kat`'s phy_ctl row, then the capability bit of the 11g response with
+    //     capability 0x0021 (ESS + Short Preamble) read set and with 0x0001 read clear; the station uses it for CCK 2/5.5/11 only.
+    let mut gs = g.clone();
+    gs[24] = 0x21;
+    checks.push(("shortpre", k[6] && matches!(super::assoc::assoc_reply_air(&gs, STA, BSSID), Some((a, Some(_), true)) if a.status == 0)
+        && !super::assoc::short_preamble(&g) && super::assoc::station_short(true, w::RATE_11M) && super::assoc::station_short(true, 4)
+        && !super::assoc::station_short(true, w::RATE_1M) && !super::assoc::station_short(true, w::RATE_24M)
+        && !super::assoc::station_short(false, w::RATE_11M)));
+    // 19. lease (STATIONLEASE B862): a BOOTP reply (op 2, Ethernet, hlen 6, magic 63 82 53 63 at 236) carrying DHCP message
+    //     type 5 (ACK), mask 255.255.255.0 and option 51 = 3600 s, read through smoltcp's own parser (`smolnet::lease_of`) ->
+    //     3600; the same as an OFFER (type 2) -> unread; a broken magic cookie -> unread.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    {
+        let mut ack = alloc::vec![0u8; 236];
+        ack[0] = 2;
+        ack[1] = 1;
+        ack[2] = 6;
+        ack[16..20].copy_from_slice(&[192, 168, 1, 50]);
+        ack[28..34].copy_from_slice(&STA);
+        ack.extend_from_slice(&[0x63, 0x82, 0x53, 0x63, 53, 1, 5, 1, 4, 255, 255, 255, 0, 51, 4, 0x00, 0x00, 0x0E, 0x10, 255]);
+        let mut offer = ack.clone();
+        offer[242] = 2;
+        let mut bad = ack.clone();
+        bad[236] = 0x00;
+        checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
+            && crate::smolnet::lease_of(&bad).is_none()));
+    }
     let mut pass = 0u8;
     let mut first = None;
     for (name, ok) in checks.iter() {
