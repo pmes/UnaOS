@@ -216,7 +216,7 @@ pub fn deblock_picture(pic: &mut Picture, geo: &Geometry, sps: &Sps, pps: &Pps) 
         // Chroma: edges every 8 chroma samples (16 luma at 4:2:0), one line at a time; HEVCREXT (SR334): the luma
         // location of q0 is the chroma one scaled by (SubWidthC, SubHeightC), p0's is one luma sample before it.
         let (sw, sh) = pic.chroma.sub();
-        let cat = sps.chroma_array_type();
+        let cat = sps.chroma_array_type(); if cat == 0 { continue; } // HEVCREXTTOOLS (SR345): monochrome has no chroma edges
         let (cw, ch) = (w / sw, h / sh);
         let cstride = pic.planes[1].w;
         let (outer, inner) = if vertical { (cw, ch) } else { (ch, cw) };

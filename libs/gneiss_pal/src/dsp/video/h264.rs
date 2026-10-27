@@ -32,11 +32,28 @@ fn map_err(e: h264_core::Error) -> DecodeError {
     }
 }
 
+/// HEVCREXTTOOLS (SR345): hevc_core's monochrome (`ChromaFormat::Mono`, empty Cb / Cr) as a grey 4:2:0 frame — flat
+/// 128 chroma, and 1 << (bit_depth - 1) in `planes16` — THE one copy of that fill, for the Player and the HEIC tile.
+fn mono_grey(f: &mut h264_core::Frame) {
+    if f.chroma != h264_core::ChromaFormat::Mono {
+        return;
+    }
+    let n = (f.width as usize / 2) * (f.height as usize / 2);
+    f.planes[1] = vec![128; n];
+    f.planes[2] = vec![128; n];
+    if let Some(p) = f.planes16.as_mut() {
+        let mid = 1u16 << (f.bit_depth.clamp(1, 16) - 1);
+        p[1] = vec![mid; n];
+        p[2] = vec![mid; n];
+    }
+    f.chroma = h264_core::ChromaFormat::Yuv420;
+}
+
 /// The one h264_core / hevc_core `Frame` -> [`Frame`] bridge. COLOURONE (SR328): above 8 bits (HEVC Main10) the samples
 /// as decoded (`planes16`) become `Pixels::I420Hi`, so the conversion narrows after it converts; 8-bit is `I420` as before.
-pub(crate) fn to_frame(f: h264_core::Frame) -> Frame {
+pub(crate) fn to_frame(mut f: h264_core::Frame) -> Frame {
     let (w, h) = (f.width, f.height);
-    let (y_stride, uv_stride) = (w as usize, w as usize / 2);
+    let (y_stride, uv_stride) = (w as usize, w as usize / 2); mono_grey(&mut f); // HEVCREXTTOOLS (SR345): 4:0:0 -> grey 4:2:0
     let pixels = match f.planes16 {
         Some([y, u, v]) => Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth: f.bit_depth },
         None => {

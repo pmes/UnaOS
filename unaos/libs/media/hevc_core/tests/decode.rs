@@ -254,16 +254,16 @@ fn inter_slices_high_bit_depth_and_422_are_refused_by_name() {
     let err = Decoder::new().decode_annexb(&s).unwrap_err();
     assert_eq!(err, Error::Invalid("reference picture set names a missing picture (8.3.2)"));
 
-    for (cfg, want) in [
-        (SpsCfg { bit_depth: 13, ..Default::default() }, "bit depth above 12 (HEVCREXT-TOOLS)"),
-        (SpsCfg { chroma_format_idc: 0, ..Default::default() }, "monochrome 4:0:0 (HEVCREXT-MONO)"),
+    for (cfg, what) in [
+        (SpsCfg { bit_depth: 13, ..Default::default() }, "13 bits (HEVCREXTTOOLS SR345: up to 16 decode)"),
+        (SpsCfg { chroma_format_idc: 0, ..Default::default() }, "monochrome (HEVCREXTTOOLS SR345: HEVCREXT-MONO built, its picture KAT is rext.rs s)"),
     ] {
         let mut s = headers(&cfg, &PpsCfg { init_qp: 26, ..Default::default() });
         let hdr = idr_slice_header(false, false, false, false);
         let mut e = CabacEnc::new(hdr, 0, 26);
         all_dc_ctu(&mut e, false);
         s.extend(nal(19, &e.finish().out));
-        assert_eq!(Decoder::new().decode_annexb(&s).unwrap_err(), Error::Unsupported(want));
+        assert!(!matches!(Decoder::new().decode_annexb(&s), Err(Error::Unsupported(_))), "{what} is no longer refused by name");
     }
 }
 

@@ -82,43 +82,17 @@ impl Default for Decoder {
 }
 
 /// The refusals by name (the crate doc): what an activated SPS / PPS may not use. HEVCREXT (SR334): 4:2:2, 4:4:4, 12
-/// bits and unequal luma / chroma depths decode; monochrome, separate colour planes, depths above 12 and each range
-/// extension tool are refused by name.
+/// bits and unequal luma / chroma depths decode. HEVCREXTTOOLS (SR345): every range extension tool, monochrome and the
+/// 16-bit profiles decode; separate colour planes and the screen content coding extension are refused by name.
 fn check_supported(sps: &Sps, pps: &Pps) -> Result<()> {
     if sps.separate_colour_plane_flag {
         return Err(Error::Unsupported("separate colour planes (HEVCREXT)"));
     }
-    if sps.chroma_format_idc == 0 {
-        return Err(Error::Unsupported("monochrome 4:0:0 (HEVCREXT-MONO)"));
-    }
-    if sps.bit_depth_luma > 12 || sps.bit_depth_chroma > 12 {
-        return Err(Error::Unsupported("bit depth above 12 (HEVCREXT-TOOLS)"));
-    }
-    let (s, p) = (&sps.range_ext, &pps.range_ext);
-    let tools = [
-        (s.transform_skip_rotation_enabled_flag, "range extension tool transform_skip_rotation_enabled_flag (HEVCREXT-TOOLS)"),
-        (s.transform_skip_context_enabled_flag, "range extension tool transform_skip_context_enabled_flag (HEVCREXT-TOOLS)"),
-        (s.implicit_rdpcm_enabled_flag, "range extension tool implicit_rdpcm_enabled_flag (HEVCREXT-TOOLS)"),
-        (s.explicit_rdpcm_enabled_flag, "range extension tool explicit_rdpcm_enabled_flag (HEVCREXT-TOOLS)"),
-        (s.extended_precision_processing_flag, "range extension tool extended_precision_processing_flag (HEVCREXT-TOOLS)"),
-        (s.intra_smoothing_disabled_flag, "range extension tool intra_smoothing_disabled_flag (HEVCREXT-TOOLS)"),
-        (s.high_precision_offsets_enabled_flag, "range extension tool high_precision_offsets_enabled_flag (HEVCREXT-TOOLS)"),
-        (s.persistent_rice_adaptation_enabled_flag, "range extension tool persistent_rice_adaptation_enabled_flag (HEVCREXT-TOOLS)"),
-        (s.cabac_bypass_alignment_enabled_flag, "range extension tool cabac_bypass_alignment_enabled_flag (HEVCREXT-TOOLS)"),
-        (p.log2_max_transform_skip_block_size_minus2 != 0, "range extension tool log2_max_transform_skip_block_size_minus2 (HEVCREXT-TOOLS)"),
-        (p.cross_component_prediction_enabled_flag, "range extension tool cross_component_prediction_enabled_flag (HEVCREXT-TOOLS)"),
-        (p.chroma_qp_offset_list_enabled_flag, "range extension tool chroma_qp_offset_list_enabled_flag (HEVCREXT-TOOLS)"),
-        (p.log2_sao_offset_scale_luma != 0, "range extension tool log2_sao_offset_scale_luma (HEVCREXT-TOOLS)"),
-        (p.log2_sao_offset_scale_chroma != 0, "range extension tool log2_sao_offset_scale_chroma (HEVCREXT-TOOLS)"),
-    ];
-    if let Some(&(_, name)) = tools.iter().find(|t| t.0) {
-        return Err(Error::Unsupported(name));
-    }
-    if sps.range_ext.any() || pps.range_ext.any() {
-        return Err(Error::Unsupported("range extension tools"));
+    if sps.bit_depth_luma > 16 || sps.bit_depth_chroma > 16 {
+        return Err(Error::Unsupported("bit depth above 16 (HEVCREXT-TOOLS)"));
     }
     if sps.scc_extension_flag || pps.scc_extension_flag {
-        return Err(Error::Unsupported("screen content coding extension"));
+        return Err(Error::Unsupported("screen content coding extension (HEVCREXT-SCC)"));
     }
     Ok(())
 }
@@ -337,10 +311,11 @@ impl Decoder {
                 return Err(Error::Unsupported("constrained intra prediction in inter slices (HEVCINTER-CIP)"));
             }
             check_supported(&sps, &pps)?;
-            if self.chroma_420_only && sps.chroma_format_idc != 1 {
+            if self.chroma_420_only && sps.chroma_format_idc > 1 {
                 return Err(Error::Unsupported("chroma 4:2:2 / 4:4:4 not displayable yet (COLOURONE-422)"));
             }
-            if self.chroma_420_only && sps.bit_depth_luma != sps.bit_depth_chroma {
+            // HEVCREXTTOOLS (SR345): monochrome passes (gneiss_pal's to_frame fills its grey chroma); BitDepthC is unused.
+            if self.chroma_420_only && sps.chroma_format_idc == 1 && sps.bit_depth_luma != sps.bit_depth_chroma {
                 return Err(Error::Unsupported("luma and chroma bit depths differ (COLOURONE-422)"));
             }
             self.start_picture(nal, &sh, sps, pps, poc)?;
@@ -407,7 +382,7 @@ impl Decoder {
 
     fn start_picture(&mut self, nal: &NalHeader, sh: &SliceHeader, sps: Sps, pps: Pps, poc: i32) -> Result<()> {
         let geo = Geometry::new(&sps, &pps)?;
-        let chroma = sps.chroma_format().ok_or(Error::Unsupported("monochrome 4:0:0 (HEVCREXT-MONO)"))?;
+        let chroma = sps.chroma_format().ok_or(Error::Unsupported("separate colour planes (HEVCREXT)"))?;
         let mut pic = Picture::with_chroma(sps.width as usize, sps.height as usize, &geo, chroma);
         pic.poc = poc;
         pic.tag = self.tag;

@@ -62,9 +62,23 @@ pub fn chroma_mode_422(mode: u32) -> u32 {
     CHROMA_422_MODE[mode as usize] as u32
 }
 
+/// HEVCREXTTOOLS (SR345): the range extension's switches of 8.4.4.2 (the default is the version 1 prediction):
+/// intra_smoothing_disabled_flag (filterFlag 0 in 8.4.4.2.3) and disableIntraBoundaryFilter (implicit_rdpcm_enabled_flag
+/// with cu_transquant_bypass_flag: no DC edge filter and no mode 10 / 26 boundary filter).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IntraRext {
+    pub smoothing_disabled: bool,
+    pub boundary_filter_disabled: bool,
+}
+
 /// Predict the nTbS x nTbS block (nTbS = 1 << log2) of component `c` whose top-left sample is (x0, y0) in that
 /// component's plane, writing the prediction into the plane (8.4.4.2).
 pub fn predict(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: usize, log2: u32, mode: u32, strong_smoothing: bool, bit_depth: u32) {
+    predict_rext(pic, geo, c, x0, y0, log2, mode, strong_smoothing, bit_depth, IntraRext::default())
+}
+
+/// HEVCREXTTOOLS (SR345): [`predict`] with the range extension's switches.
+pub fn predict_rext(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: usize, log2: u32, mode: u32, strong_smoothing: bool, bit_depth: u32, rext: IntraRext) {
     let n = 1usize << log2;
     // HEVCREXT (SR334): the component's (SubWidthC, SubHeightC) maps its samples to luma locations (6.4.1).
     let (sw, sh) = if c == 0 { (1, 1) } else { pic.chroma.sub() };
@@ -111,7 +125,7 @@ pub fn predict(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: usize
     }
     let ni = n as i32;
     // 8.4.4.2.3 filtering: cIdx 0, or every component at ChromaArrayType 3 (HEVCREXT SR334).
-    if (c == 0 || pic.chroma == ChromaFormat::Yuv444) && mode != DC && n != 4 {
+    if (c == 0 || pic.chroma == ChromaFormat::Yuv444) && mode != DC && n != 4 && !rext.smoothing_disabled {
         let min_dist = (mode as i32 - 26).abs().min((mode as i32 - 10).abs());
         if min_dist > INTRA_HOR_VER_DIST_THRES[(log2 - 3) as usize] {
             let left = |y: i32| refs[(2 * ni - 1 - y) as usize];
@@ -162,7 +176,7 @@ pub fn predict(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: usize
             for v in pred.iter_mut() {
                 *v = dc;
             }
-            if c == 0 && n < 32 {
+            if c == 0 && n < 32 && !rext.boundary_filter_disabled {
                 pred[0] = (left(0) + 2 * dc + top(0) + 2) >> 2;
                 for x in 1..ni {
                     pred[x as usize] = (top(x) + 3 * dc + 2) >> 2;
@@ -206,7 +220,7 @@ pub fn predict(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: usize
                     pred[(y * ni + x) as usize] = v;
                 }
             }
-            if c == 0 && n < 32 {
+            if c == 0 && n < 32 && !rext.boundary_filter_disabled {
                 if mode == 26 {
                     for y in 0..ni {
                         pred[(y * ni) as usize] = (top(0) + ((left(y) - left(-1)) >> 1)).clamp(0, max);

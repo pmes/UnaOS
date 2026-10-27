@@ -255,4 +255,10 @@ impl<'a> Cabac<'a> {
     pub fn cbf_ctx(cat: usize, inc: u32) -> usize {
         85 + CBF_OFFSET[cat] + inc as usize
     }
+
+    /// H.265 9.3.4.3.6 (HEVCREXTTOOLS SR345): cabac_bypass_alignment_enabled_flag sets ivlCurrRange to 256 before the
+    /// aligned bypass bins (coeff_sign_flag, coeff_abs_level_remaining); `bypass` then reads them as raw bits.
+    pub fn align_bypass(&mut self) {
+        self.range = 256;
+    }
 }

@@ -684,9 +684,11 @@ impl Sps {
     pub fn chroma_array_type(&self) -> u32 {
         if self.separate_colour_plane_flag { 0 } else { self.chroma_format_idc }
     }
-    /// HEVCREXT (SR334): the Picture / Frame chroma format of ChromaArrayType 1..3 (None: monochrome or separate planes).
+    /// HEVCREXT (SR334): the Picture / Frame chroma format of ChromaArrayType 0..3 (HEVCREXTTOOLS SR345: 0 is
+    /// monochrome; None: separate colour planes).
     pub fn chroma_format(&self) -> Option<h264_core::ChromaFormat> {
         match self.chroma_array_type() {
+            0 if !self.separate_colour_plane_flag => Some(h264_core::ChromaFormat::Mono),
             1 => Some(h264_core::ChromaFormat::Yuv420),
             2 => Some(h264_core::ChromaFormat::Yuv422),
             3 => Some(h264_core::ChromaFormat::Yuv444),
@@ -696,6 +698,12 @@ impl Sps {
     /// The ordering of the highest sub-layer (HighestTid = sps_max_sub_layers_minus1).
     pub fn highest_ordering(&self) -> Ordering {
         self.ordering.last().copied().unwrap_or_default()
+    }
+    /// HEVCREXTTOOLS (SR345): log2TransformRange of component `c` (7.4.3.2.2): Max(15, BitDepth + 6) with
+    /// extended_precision_processing_flag, else 15; CoeffMin / CoeffMax are -(1 << it) / (1 << it) - 1.
+    pub fn log2_transform_range(&self, c: usize) -> u32 {
+        let bd = if c == 0 { self.bit_depth_luma } else { self.bit_depth_chroma };
+        if self.range_ext.extended_precision_processing_flag { (bd + 6).max(15) } else { 15 }
     }
 }
 

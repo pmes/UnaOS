@@ -37,12 +37,22 @@
 - hevc/INITQP_B_Main10_Sony_1.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/HEVC_v1/INITQP_B_Main10_Sony_1.zip f63c71e5f6b9c6ddf2b080524f9f14b1 INITQP_B_Main10_Sony_1/INITQP_B_Main10_Sony_1.bit
 # HEVCREXT (LEDGER SR334): the JCT-VC Range Extensions suite of ITU-T H.265.1 (draft_conformance/RExt), walked by
 # conformance.rs `rext_vectors_decode_or_are_refused_by_name`: each row decodes to its md5 (yuv422p / yuv444p, two bytes
-# per sample above 8 bits) or is refused by a name carrying HEVCREXT (the RExt tools, monochrome and depths above 12 stay
-# owed: HEVCREXT-TOOLS, HEVCREXT-MONO); the first run is the bench's (HEVCCONF-REXT, HEVCCONF-RUN: itu.int is refused at
+# per sample above 8 bits) or is refused by a name carrying HEVCREXT (since HEVCREXTTOOLS SR345 only separate colour planes
+# and SCC, which no row uses, stay refused); the first run is the bench's (HEVCCONF-REXT, HEVCCONF-RUN: itu.int is refused at
 # the cloud egress, so every row SKIPs there).
 # PROVENANCE: the URL, the bitstream name and the decoded-YUV md5 of each row are those of fluster's
 # test_suites/h.265/JCT-VC-RExt.json (github.com/fluendo/fluster @5d9d2bc676d97a17900e98fc69216d6d2c8f1ad0, the commit
 # HEVCCONF pinned; fetched 2026-10-27: 49 vectors, "test_method": "md5"). sha256 `-`: HEVCCONF-PIN.
+# HEVCREXTTOOLS (LEDGER SR345): the rows each tool unlocks, as the bitstream names say (a GENERAL / Bitdepth / WPP row also
+# exercises whatever range extension flags its SPS / PPS set): explicit RDPCM: ExplicitRdpcm_A_BBC_1, ExplicitRdpcm_B_BBC_2;
+# cross_component_prediction: CCP_8bit_RExt_QCOM_1, CCP_10bit_RExt_QCOM_1, CCP_12bit_RExt_QCOM_1; persistent_rice_adaptation:
+# PERSIST_RPARAM_A_RExt_Sony_3; transform_skip_context (with implicit RDPCM / rotation / transform skip sizes in the 4:4:4
+# profiles): the six TSCTX_*_RExt_SHARP_1; cabac_bypass_alignment: WPP_AND_TILE_AND_CABAC_BYPASS_ALIGN_1 (and _0, the flag
+# off); extended_precision_processing and the 16-bit profiles: the eight EXTPREC_*_RExt_Sony_1,
+# WPP_AND_TILE_AND_CABAC_EXT_PREC_1, GENERAL_16b_444_RExt_Sony_2, GENERAL_16b_444_highThroughput_RExt_Sony_2; log2_sao_offset
+# _scale: SAO_A_RExt_MediaTek_1; monochrome (HEVCREXT-MONO): GENERAL_8b_400, GENERAL_12b_400, GENERAL_16b_400; the formats
+# alone (HEVCREXT SR334): ADJUST_IPRED_ANGLE, IPCM_A / IPCM_B, QMATRIX_A, Main_422_10_A / B and the GENERAL 4:2:0 / 4:2:2 /
+# 4:4:4 rows. chroma_qp_offset_list and high_precision_offsets have no row of their own name (the GENERAL rows' SPS / PPS).
 - hevc/rext/ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/RExt/ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2.zip b045776950c2e06d35348bd03268c07f ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2/ADJUST_IPRED_ANGLE_A_RExt_Mitsubishi_2.bit
 - hevc/rext/Bitdepth_A_RExt_Sony_1.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/RExt/Bitdepth_A_RExt_Sony_1.zip 2b65fa2f384085926deb4f9d20fcd798 Bitdepth_A_RExt_Sony_1/Bitdepth_A_RExt_Sony_1.bin
 - hevc/rext/Bitdepth_B_RExt_Sony_1.zip https://www.itu.int/wftp3/av-arch/jctvc-site/bitstream_exchange/draft_conformance/RExt/Bitdepth_B_RExt_Sony_1.zip cf489cf45491fab54cdba936885836cb Bitdepth_B_RExt_Sony_1/Bitdepth_B_RExt_Sony_1.bin

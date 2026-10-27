@@ -136,15 +136,17 @@ impl Picture {
         Picture::with_chroma(width, height, geo, ChromaFormat::Yuv420)
     }
 
-    /// HEVCREXT (SR334): a picture whose chroma planes follow `chroma` (Table 6-1).
+    /// HEVCREXT (SR334): a picture whose chroma planes follow `chroma` (Table 6-1); HEVCREXTTOOLS (SR345): monochrome's
+    /// Cb / Cr planes are 0 x 0.
     pub fn with_chroma(width: usize, height: usize, geo: &Geometry, chroma: ChromaFormat) -> Picture {
         let (sw, sh) = chroma.sub();
+        let (cw, ch) = if chroma == ChromaFormat::Mono { (0, 0) } else { (width / sw, height / sh) };
         let n4 = geo.w4 * geo.h4;
         let nctb = (geo.width_ctbs * geo.height_ctbs) as usize;
         Picture {
             width,
             height,
-            planes: [Plane::new(width, height, 0), Plane::new(width / sw, height / sh, 0), Plane::new(width / sw, height / sh, 0)],
+            planes: [Plane::new(width, height, 0), Plane::new(cw, ch, 0), Plane::new(cw, ch, 0)],
             w4: geo.w4,
             h4: geo.h4,
             ctdepth: vec![0; n4],
@@ -217,6 +219,8 @@ impl Picture {
     pub fn to_frame(&self) -> Frame {
         let (x0, y0, w, h) = self.crop;
         let (sw, sh) = self.chroma.sub();
+        // HEVCREXTTOOLS (SR345): a monochrome frame carries empty Cb / Cr planes (the consumer's grey fill is gneiss_pal's).
+        let (cw, ch) = if self.chroma == ChromaFormat::Mono { (0, 0) } else { (w / sw, h / sh) };
         let crop = |pl: &Plane, x0: usize, y0: usize, w: usize, h: usize| {
             let mut v = Vec::with_capacity(w * h);
             for r in 0..h {
@@ -227,8 +231,8 @@ impl Picture {
         };
         let planes16 = [
             crop(&self.planes[0], x0, y0, w, h),
-            crop(&self.planes[1], x0 / sw, y0 / sh, w / sw, h / sh),
-            crop(&self.planes[2], x0 / sw, y0 / sh, w / sw, h / sh),
+            crop(&self.planes[1], x0 / sw, y0 / sh, cw, ch),
+            crop(&self.planes[2], x0 / sw, y0 / sh, cw, ch),
         ];
         let (shift, shift_c) = (self.bit_depth - 8, self.bit_depth_c - 8);
         let narrow = |p: &Vec<u16>, shift: u32| p.iter().map(|&v| (v >> shift) as u8).collect::<Vec<u8>>();

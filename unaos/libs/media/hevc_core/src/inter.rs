@@ -444,26 +444,30 @@ pub fn chroma_mc(r: &Plane, xc: i32, yc: i32, mv: [i32; 2], w: i32, h: i32, bd: 
 }
 
 /// The explicit weight, offset and log2WD of list `l`, reference index `ref_idx`, component `c` (7-56, 8.5.3.3.4.3).
-fn explicit_weight(sh: &SliceHeader, c: usize, l: usize, ref_idx: i8, bd: u32) -> (i32, i32, u32) {
-    let shift1 = 14 - bd;
+/// HEVCREXTTOOLS (SR345): `high` is high_precision_offsets_enabled_flag — WpOffsetBdShift 0 instead of BitDepth - 8 and
+/// WpOffsetHalfRangeC 1 << (BitDepthC - 1) instead of 128; shift1 is Max(2, 14 - bitDepth) (the 16-bit profiles).
+fn explicit_weight(sh: &SliceHeader, c: usize, l: usize, ref_idx: i8, bd: u32, high: bool) -> (i32, i32, u32) {
+    let shift1 = (14 - bd as i32).max(2) as u32;
+    let off_shift = if high { 0 } else { bd - 8 };
     let Some(pw) = sh.pred_weights.as_ref() else { return (1, 0, shift1) };
     let wl = if l == 0 { &pw.l0 } else { &pw.l1 };
     let r = usize::try_from(ref_idx).unwrap_or(0);
     if c == 0 {
         let d = pw.luma_log2_weight_denom;
         let (w, o) = wl.luma.get(r).copied().unwrap_or((1 << d, 0));
-        (w, o << (bd - 8), d + shift1)
+        (w, o << off_shift, d + shift1)
     } else {
         let d = pw.chroma_log2_weight_denom;
         let (w, delta) = wl.chroma.get(r).map(|e| e[c - 1]).unwrap_or((1 << d, 0));
-        let o = (128 + delta - ((128 * w) >> d)).clamp(-128, 127);
-        (w, o << (bd - 8), d + shift1)
+        let half = if high { 1i32 << (bd - 1) } else { 128 };
+        let o = (half + delta - ((half * w) >> d)).clamp(-half, half - 1);
+        (w, o << off_shift, d + shift1)
     }
 }
 
 /// 8.5.3.3: predict the samples of prediction block (x, y, w, h) with motion `m` into the current picture's planes
 /// (default or explicit weighted sample prediction).
-pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps, bd_y: u32, bd_c: u32, x: i32, y: i32, w: i32, h: i32, m: &PuMotion) {
+pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps, bd_y: u32, bd_c: u32, high: bool, x: i32, y: i32, w: i32, h: i32, m: &PuMotion) {
     let weighted = match sh.slice_type {
         SliceType::P => pps.weighted_pred_flag,
         SliceType::B => pps.weighted_bipred_flag,
@@ -492,22 +496,23 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
             }
         }
         let max = (1i32 << bd) - 1;
-        let shift1 = 14 - bd as i32;
+        // HEVCREXTTOOLS (SR345): shift1 Max(2, 14 - bitDepth), shift2 Max(3, 15 - bitDepth) (equal up to 12 bits).
+        let shift1 = (14 - bd as i32).max(2);
         let out: Vec<i32> = match (&pred[0], &pred[1]) {
             (Some(a), Some(b)) => {
                 if weighted {
-                    let (w0, o0, lwd) = explicit_weight(sh, c, 0, m.ref_idx[0], bd);
-                    let (w1, o1, _) = explicit_weight(sh, c, 1, m.ref_idx[1], bd);
+                    let (w0, o0, lwd) = explicit_weight(sh, c, 0, m.ref_idx[0], bd, high);
+                    let (w1, o1, _) = explicit_weight(sh, c, 1, m.ref_idx[1], bd, high);
                     a.iter().zip(b.iter()).map(|(&p0, &p1)| (p0 * w0 + p1 * w1 + ((o0 + o1 + 1) << lwd)) >> (lwd + 1)).collect()
                 } else {
-                    let shift2 = 15 - bd as i32;
+                    let shift2 = (15 - bd as i32).max(3);
                     a.iter().zip(b.iter()).map(|(&p0, &p1)| (p0 + p1 + (1 << (shift2 - 1))) >> shift2).collect()
                 }
             }
             (Some(a), None) | (None, Some(a)) => {
                 let l = if pred[0].is_some() { 0 } else { 1 };
                 if weighted {
-                    let (w0, o0, lwd) = explicit_weight(sh, c, l, m.ref_idx[l], bd);
+                    let (w0, o0, lwd) = explicit_weight(sh, c, l, m.ref_idx[l], bd, high);
                     a.iter()
                         .map(|&p| if lwd >= 1 { ((p * w0 + (1 << (lwd - 1))) >> lwd) + o0 } else { p * w0 + o0 })
                         .collect()
