@@ -102,50 +102,9 @@ const WATCHDOG_TIMEOUT: u32 = 0x7fff_ffff; // gf100.c:1799
 const MTHD_IMAGE_SIZE: u32 = 0x10; // gf100.c:963
 const READY_BUDGET_US: u64 = 2_000_000; // nvkm_msec(device, 2000, …) gf100.c:1793, :964
 
-fn nib(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// The pinned SHA-256 for `role`, or `None` (no row or a malformed one — both refuse as `unpinned`). The b43.pins
-/// grammar (wifi/firmware.rs `pin_for`): `<role> <64 hex>`, `#` lines and blanks ignored.
-fn pin_for(role: &str) -> Option<[u8; 32]> {
-    for line in PINS.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut it = line.split_whitespace();
-        let (Some(r), Some(h), None) = (it.next(), it.next(), it.next()) else { continue };
-        if r != role || h.len() != 64 {
-            continue;
-        }
-        let b = h.as_bytes();
-        let mut out = [0u8; 32];
-        let mut ok = true;
-        for i in 0..32 {
-            match (nib(b[2 * i]), nib(b[2 * i + 1])) {
-                (Some(hi), Some(lo)) => out[i] = (hi << 4) | lo,
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
-            return Some(out);
-        }
-    }
-    None
-}
-
 /// How many roles carry a row — printed so a `-> absent` with `pins=0/4` reads as "nothing pinned yet".
 pub fn pinned_rows() -> usize {
-    SET.iter().filter(|(r, _)| pin_for(r).is_some()).count()
+    SET.iter().filter(|(r, _)| crate::hash::pins::pin_for(PINS, r).is_some()).count()
 }
 
 fn hex32(d: &[u8; 32]) -> String {
@@ -216,7 +175,7 @@ pub fn stage() -> Result<Set, String> {
             continue;
         }
         let sha = crypto_core::sha2::sha256(&buf);
-        let v = match pin_for(role) {
+        let v = match crate::hash::pins::pin_for(PINS, role) {
             None => {
                 if worst.0 < 2 {
                     worst = (2, "unpinned");

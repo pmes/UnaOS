@@ -27,7 +27,7 @@ import contextlib, glob, hashlib, io, os, re, subprocess, sys, tempfile
 
 FW = os.path.join('unaos', 'firmware')
 PIN_ROW = re.compile(r'^(\S+)\s+([0-9a-f]{64})\s*$')
-LEDGER_ID = re.compile(r'\b(SR|SO|SP|S|B)(\d+)\b')
+LEDGER_ID = re.compile(r'\b(SR|SO|SP|PI|S|B|Z)(\d+)\b')
 
 
 def census(root):
