@@ -7530,7 +7530,7 @@ fn textscale_win_leg(t: &mut TsWin, css: i64, e_before: u32) {
             break g;
         }
         tries += 1;
-        crate::arch::sched::sleep_ms(5);
+        { let t0 = crate::arch::ms(); while crate::arch::ms().saturating_sub(t0) < 5 { crate::arch::sched::yield_now(); } } // TEXTSCALE3 (B849): arch-neutral 5 ms wait (sched::sleep_ms is x86-only; this leg is desktop-family)
     };
     let moved = crate::video::text::epoch() != e_before;
     serial_println!("[textscale] frames css={} moved={} activity={} fileview={}", css, moved as u8, got.0 as u8, got.1 as u8);
