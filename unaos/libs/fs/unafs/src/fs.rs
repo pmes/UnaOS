@@ -362,6 +362,74 @@ pub struct UnaFS<D: BlockDevice> {
     /// writes into the root record beside `root_flags` — read off the mounted root, OR-ed by the first
     /// version kept ([`ROOT_FLAG_VERSIONS`](crate::root::ROOT_FLAG_VERSIONS)), never cleared.
     rocompat: u64,
+    /// UNAFSWRITE (B825): a [`stage`](Self::stage)d commit waits for its [`flip`](Self::flip); cleared by any
+    /// landed commit and by [`txn_unwind`](Self::txn_unwind).
+    in_flight: bool,
+    /// UNAFSWRITE (B825): this mount's identity ([`NEXT_INSTANCE`]) — a staged commit flips only on the
+    /// instance that staged it.
+    instance: u64,
+    /// UNAFSWRITE (B825): failed-transaction reloads so far — a staged commit whose RAM was reloaded is lost.
+    unwinds: u64,
+}
+
+/// UNAFSWRITE (B825): the next mount instance id (format and mount take one each).
+static NEXT_INSTANCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
+fn next_instance() -> u64 {
+    NEXT_INSTANCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// UNAFSWRITE (B825): a commit cut at its barrier — the bytes of every block steps 0-3 produced, and the root
+/// record the flip will write. Made by [`UnaFS::stage`] under the caller's lock; written by
+/// [`write_staged`](Self::write_staged) through ANY device on the same medium (no `&UnaFS`, so the caller may
+/// release its lock); landed by [`UnaFS::flip`].
+///
+/// THE TWO-WRITER RULE: between `stage` and `flip` nothing else may write the volume — no other transaction,
+/// commit or unwind on this instance, and no other mount. The staged blocks are free in the committed tree and
+/// allocated only in this instance's RAM; a commit that ran meanwhile could rewrite them from newer RAM, and a
+/// late `write_staged` would then put older bytes under a root that names them. `flip` detects every change
+/// to RAM and refuses to write the root over it (`Restage`, `Lost`), but it cannot see a write that raced it on
+/// the medium: excluding that is the caller's (the kernel's commit ticket).
+pub struct StagedCommit {
+    blocks: Vec<(u64, Vec<u8>)>,
+    root: RootRecord,
+    slot: RootSlot,
+    base_gen: u64,
+    epoch: u64,
+    next_inode: u64,
+    instance: u64,
+    unwinds: u64,
+}
+
+impl StagedCommit {
+    /// Blocks staged (map leaves and index nodes).
+    pub fn blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Write every staged block to `device`, then flush — the commit's pre-flip barrier. `device` must address
+    /// the same volume as the mount that staged (same partition offset; a ciphered volume's device must carry its
+    /// cipher). The root sector is not touched: a cut anywhere in here leaves the committed tree whole, the
+    /// written blocks free in it.
+    pub fn write_staged<B: BlockDevice>(&self, device: &mut B) -> Result<(), FileSystemError> {
+        for (b, bytes) in &self.blocks {
+            device.write_block(*b, bytes)?;
+        }
+        device.flush()?;
+        Ok(())
+    }
+}
+
+/// UNAFSWRITE (B825): what [`UnaFS::flip`] did with a staged commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlipOutcome {
+    /// The root flipped to the staged tree — or a commit since already carried the staged changes.
+    Landed,
+    /// The RAM moved after the stage (a mutation, a grown inode map, a generation): nothing was written; the
+    /// staged changes are still in RAM and a [`UnaFS::commit`] lands them with the rest.
+    Restage,
+    /// This mount is not the one that staged, or its RAM was reloaded since: the staged changes are gone.
+    Lost,
 }
 
 impl<D: BlockDevice> UnaFS<D> {
@@ -455,6 +523,9 @@ impl<D: BlockDevice> UnaFS<D> {
             key_slot: None,
             versioning: false,
             rocompat: 0,
+            in_flight: false,
+            instance: next_instance(),
+            unwinds: 0,
         };
 
         // The reserved system objects, in id order (1..=4).
@@ -577,6 +648,9 @@ impl<D: BlockDevice> UnaFS<D> {
             key_slot,
             versioning: false,
             rocompat: loaded.root.rocompat(),
+            in_flight: false,
+            instance: next_instance(),
+            unwinds: 0,
         };
 
         // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
@@ -1047,7 +1121,37 @@ impl<D: BlockDevice> UnaFS<D> {
         r
     }
 
+    /// UNAFSWRITE (B825): the commit is three phases — [`commit_stage`](Self::commit_stage) (steps 0-3),
+    /// the pre-flip barrier, [`commit_flip`](Self::commit_flip) (steps 5-6). Here they run back to back
+    /// with every block written straight to the device: the I/O order of the one-piece commit.
     fn commit_body(&mut self) -> Result<(), FileSystemError> {
+        let (new_root, slot) = self.commit_stage(None)?;
+
+        // 4. Barrier: every fresh block must be on the medium before the
+        //    root flip makes them reachable.
+        //
+        //    LOAD-BEARING CONTRACT (lens B, 2026-07-16): on the kernel path
+        //    `flush()` is a NO-OP — the ordering rests entirely on every
+        //    `write_block`/`write_sector` being SYNCHRONOUS-TO-MEDIUM (the
+        //    eMMC2 CMD24 busy-wait + CMD13 status check). This flush is
+        //    decorative there (and a real fsync on host FileDevice). Any
+        //    future write-cache, write-back, or DMA-queued storage path MUST
+        //    implement a real flush at its device seam, or commit ordering
+        //    (fresh blocks before the root flip) silently breaks.
+        self.device.flush()?;
+
+        self.commit_flip(new_root, slot)
+    }
+
+    /// Steps 0-3 of a commit: relocate both maps' dirty nodes to fresh blocks and serialize them. With
+    /// `capture == None` each block goes to the device; with `Some(v)` its bytes are pushed onto `v` instead
+    /// (UNAFSWRITE: [`stage`](Self::stage)) — the device is not written. Every block either way was allocated
+    /// in the refcount map's current view and is free in the committed (frozen) one: unreachable until the
+    /// flip. Returns the root record the flip writes and the slot it goes to.
+    fn commit_stage(
+        &mut self,
+        mut capture: Option<&mut Vec<(u64, Vec<u8>)>>,
+    ) -> Result<(RootRecord, RootSlot), FileSystemError> {
         // 0. A leaf the transaction could not read means the in-RAM counts
         //    are incomplete: refuse before writing anything.
         self.refmap.take_fault()?;
@@ -1102,7 +1206,18 @@ impl<D: BlockDevice> UnaFS<D> {
             let txn_blocks = &mut self.txn_blocks;
             let stats = &mut self.stats;
             let mut write = |b: u64, buf: &[u8]| -> Result<(), FileSystemError> {
-                device.write_block(b, buf)?;
+                match capture.as_deref_mut() {
+                    None => device.write_block(b, buf)?,
+                    Some(v) => {
+                        let mut bytes = Vec::new();
+                        bytes
+                            .try_reserve_exact(buf.len())
+                            .and_then(|_| v.try_reserve(1))
+                            .map_err(|_| StorageError::AllocRefused(buf.len() as u64))?;
+                        bytes.extend_from_slice(buf);
+                        v.push((b, bytes));
+                    }
+                }
                 *txn_blocks += 1;
                 stats.blocks_written += 1;
                 Ok(())
@@ -1125,20 +1240,6 @@ impl<D: BlockDevice> UnaFS<D> {
 
         let free_blocks = self.refmap.free_blocks();
 
-        // 4. Barrier: every fresh block must be on the medium before the
-        //    root flip makes them reachable.
-        //
-        //    LOAD-BEARING CONTRACT (lens B, 2026-07-16): on the kernel path
-        //    `flush()` is a NO-OP — the ordering rests entirely on every
-        //    `write_block`/`write_sector` being SYNCHRONOUS-TO-MEDIUM (the
-        //    eMMC2 CMD24 busy-wait + CMD13 status check). This flush is
-        //    decorative there (and a real fsync on host FileDevice). Any
-        //    future write-cache, write-back, or DMA-queued storage path MUST
-        //    implement a real flush at its device seam, or commit ordering
-        //    (fresh blocks before the root flip) silently breaks.
-        self.device.flush()?;
-
-        // 5. The atomic point: ONE 512 B write to the INACTIVE slot.
         let new_root = RootRecord {
             generation: self.root.generation + 1,
             imap_block: self.imap_tree.top(),
@@ -1149,7 +1250,13 @@ impl<D: BlockDevice> UnaFS<D> {
             free_blocks,
             flags: (self.root_flags & !crate::root::ROOT_ROCOMPAT_MASK) | self.rocompat,
         };
-        let slot = self.active_slot.other();
+        Ok((new_root, self.active_slot.other()))
+    }
+
+    /// Steps 5-6 of a commit, after the barrier: the flip and the bookkeeping that makes the new tree the
+    /// committed one. Clears a staged commit's in-flight mark (UNAFSWRITE): whatever was staged has landed.
+    fn commit_flip(&mut self, new_root: RootRecord, slot: RootSlot) -> Result<(), FileSystemError> {
+        // 5. The atomic point: ONE 512 B write to the INACTIVE slot.
         crate::root::write_slot(&mut self.device, slot, &new_root)?;
         // Same contract as the pre-flip barrier above: decorative where every
         // write is already synchronous-to-medium; MANDATORY-real on any
@@ -1165,7 +1272,79 @@ impl<D: BlockDevice> UnaFS<D> {
         self.stats.commits += 1;
         self.stats.last_commit_blocks = self.txn_blocks;
         self.txn_blocks = 0;
+        self.in_flight = false;
         Ok(())
+    }
+
+    /// UNAFSWRITE (B825): STAGE a commit — steps 0-3 run in RAM exactly as [`commit`](Self::commit) runs them,
+    /// but the blocks are captured, not written. The caller writes them ([`StagedCommit::write_staged`]) and then
+    /// [`flip`](Self::flip)s. A pending v6 -> v7 migration commits whole here (`None`: nothing to write or flip).
+    /// A failure unwinds to the committed root, as a failed commit does.
+    pub fn stage(&mut self) -> Result<Option<StagedCommit>, FileSystemError> {
+        if let Err(e) = self.write_gate() {
+            self.txn_unwind();
+            return Err(e);
+        }
+        if self.migrate_pending {
+            self.commit()?;
+            return Ok(None);
+        }
+        let mut blocks = Vec::new();
+        let (root, slot) = match self.commit_stage(Some(&mut blocks)) {
+            Ok(r) => r,
+            Err(e) => {
+                self.txn_unwind();
+                return Err(e);
+            }
+        };
+        self.in_flight = true;
+        Ok(Some(StagedCommit {
+            blocks,
+            root,
+            slot,
+            base_gen: self.root.generation,
+            epoch: self.refmap.epoch(),
+            next_inode: self.imap.len() as u64,
+            instance: self.instance,
+            unwinds: self.unwinds,
+        }))
+    }
+
+    /// UNAFSWRITE (B825): FLIP a staged commit whose blocks are on the medium. `Lost` when another instance or a
+    /// reload holds the RAM; `Landed` without a write when a commit since carried it; `Restage` (nothing written)
+    /// when the RAM moved after the stage; else ONE root-sector write and the bookkeeping of a landed commit.
+    /// A failed flip unwinds to the committed root.
+    pub fn flip(&mut self, s: &StagedCommit) -> Result<FlipOutcome, FileSystemError> {
+        if s.instance != self.instance || s.unwinds != self.unwinds {
+            return Ok(FlipOutcome::Lost);
+        }
+        if !self.in_flight {
+            return Ok(if self.root.generation > s.base_gen { FlipOutcome::Landed } else { FlipOutcome::Lost });
+        }
+        if self.refmap.epoch() != s.epoch
+            || self.imap.len() as u64 != s.next_inode
+            || self.root.generation != s.base_gen
+            || self.active_slot.other() != s.slot
+        {
+            return Ok(FlipOutcome::Restage);
+        }
+        match self.commit_flip(s.root, s.slot) {
+            Ok(()) => Ok(FlipOutcome::Landed),
+            Err(e) => {
+                self.txn_unwind();
+                Err(e)
+            }
+        }
+    }
+
+    /// UNAFSWRITE (B825): changes are staged in RAM that no commit has landed yet.
+    pub fn has_staged(&self) -> bool {
+        self.refmap.staged() || !self.imap_tree.dirty.is_empty() || self.imap.len() as u64 != self.root.next_inode
+    }
+
+    /// UNAFSWRITE (B825): this mount still holds `s`'s changes unlanded — a [`commit`](Self::commit) lands them.
+    pub fn holds_staged(&self, s: &StagedCommit) -> bool {
+        self.in_flight && s.instance == self.instance && s.unwinds == self.unwinds
     }
 
     /// Historical name for "make everything durable" — under CoW that is a
@@ -2990,6 +3169,9 @@ impl<D: BlockDevice> UnaFS<D> {
             }
         }
         self.txn_blocks = 0;
+        // UNAFSWRITE (B825): a staged commit's RAM is gone — its flip answers `Lost`.
+        self.in_flight = false;
+        self.unwinds = self.unwinds.wrapping_add(1);
     }
 
     /// Drop a retained snapshot by its `generation` stamp (design V2): remove

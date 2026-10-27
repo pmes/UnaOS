@@ -393,8 +393,27 @@ the bytes read are the bytes the extents named. Any change, unaligned extent or 
 the read again in one hold (`fallbacks=`). `tests unafslock` holds it: `:: UNAFSLOCK: ops=<n>
 held_max_ms=<n> io_under_lock=0 -> PASS ::` (every MOUNT hold of the read and of a concurrent metadata
 loop ≤ 5 ms, bytes equal to a reference read). Built under `wc` on x86; the call site in
-`NativeBackend::read` (`fs/vfs.rs`) is the seat's fold. Writes and directory listings still hold
-MOUNT across their I/O.
+`NativeBackend::read` (`fs/vfs.rs`) is the seat's fold. Directory listings, and a write op's own blocks, still
+hold MOUNT across their I/O.
+
+**The commit's card writes leave MOUNT (UNAFSWRITE, rmbp B825).** The same K8a rule lets a COMMIT write
+without the lock: the blocks a commit writes (the moved inode-map and refcount-map leaves and index nodes) are
+allocated in the refcount map's current view and free in the committed one, so nothing on disk names them until
+the root flips (§R12), and the blocks the transaction released stay unallocatable until the flip's `freeze`. The
+crate cuts its commit at the pre-flip barrier: `UnaFS::stage` (steps 0-3 in RAM, the blocks' bytes captured),
+`StagedCommit::write_staged` (the blocks and the barrier, through any device on the volume), `UnaFS::flip` (ONE
+root sector, only if the mount instance, the unwind count, the generation, the refcount epoch and the inode-map
+length are what the stage saw; else `Restage` — nothing written, a whole commit lands everything — or `Lost`);
+`commit` is the three back to back with the identical I/O order. A cut during the write leaves the old tree,
+the written blocks free in it. The kernel's `fs::unafs::with_unafs_write` (x86 `wc`; an alias of `with_unafs`
+elsewhere) runs a write op and its stage in one MOUNT hold, the write with MOUNT released, the flip in a second
+hold. **Two writers never overlap:** a commit TICKET (the holder's task id) is held from before the op to after
+the flip; every `with_unafs` waits for it before an attempt, and one that took MOUNT after it was taken releases
+MOUNT untouched and restarts — otherwise a commit from newer RAM could rewrite a staged block and the late staged
+write put older bytes under the root that names it. The mount device's read-ahead windows are dropped after a
+write phase (they never saw it). A ciphered root, a mount with no bound span and the v6 migration commit whole.
+Host proof: `tests/commit_split.rs` (three phases = one commit; restage; carried; a cut after the write; another
+instance).
 
 ## §R17 The `una:versions` trailer (FILEVERSIONS, rmbp-ledger B714)
 

@@ -791,7 +791,7 @@ enum Attempt<R> {
 /// `Busy` is RESTARTED — see [`with_unafs`]'s restart loop and [`TXN_BUSY_ATTEMPTS`].
 fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R> {
     crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
-        let mut guard = MOUNT.lock(); let _own = crate::lockowner::own(crate::lockowner::UNAFS); // STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
+        let mut guard = MOUNT.lock(); let _own = crate::lockowner::own(crate::lockowner::UNAFS); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if splitwrite::ticket_foreign() { return Attempt::Restart; } // UNAFSWRITE (B825): another task's commit is writing with MOUNT released — leave MOUNT untouched and restart (LINE-NEUTRAL, before this comment). STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
         // UNAFSTXN: open the attempt's contention window, INSIDE the hold. Clearing it before the
         // acquire would be an SMP bug: a core waiting on `MOUNT` would wipe the latch belonging to
         // the transaction currently running under it. Under the lock the flag is serialized with
@@ -897,7 +897,7 @@ pub fn with_unafs<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, Moun
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        match { let t_mask = crate::hidstall::now_us(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked_since(t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } match { let t_mask = crate::hidstall::now_us(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked_since(t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
@@ -2935,12 +2935,12 @@ pub fn tx_io() -> (u64, u64) {
 /// `ReadAheadCache`'s, so `SdSectorDevice`'s BOOT80 call sites are unchanged.
 pub struct RaSet {
     window: u64,
-    slots: alloc::vec::Vec<unafs::readahead::ReadAheadCache>,
+    slots: alloc::vec::Vec<unafs::readahead::ReadAheadCache>, #[cfg(all(target_arch = "x86_64", feature = "wc"))] seen: u64, // UNAFSWRITE (B825): the `splitwrite::RA_GEN` these windows were filled under
 }
 
 impl RaSet {
     fn new(window: u64) -> Self {
-        Self { window, slots: alloc::vec::Vec::new() }
+        Self { window, slots: alloc::vec::Vec::new(), #[cfg(all(target_arch = "x86_64", feature = "wc"))] seen: 0 }
     }
 
     fn window_sectors(&self) -> u64 {
@@ -2959,7 +2959,7 @@ impl RaSet {
     where
         F: FnMut(u64, &mut [u8]) -> Result<(), SectorError>,
     {
-        if let Some(i) = self.slots.iter().position(|s| s.lookup(lba, out)) {
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitwrite::ra_sync(self); if let Some(i) = self.slots.iter().position(|s| s.lookup(lba, out)) { // UNAFSWRITE (B825): a split commit wrote blocks past this device — its windows drop first
             TX_HITS.fetch_add(1, Ordering::Relaxed);
             let s = self.slots.remove(i);
             self.slots.insert(0, s);
@@ -3025,7 +3025,7 @@ pub mod splitread {
     static SPANS: Mutex<Vec<(block::BlockHandle, PartitionSpan)>> = Mutex::new(Vec::new());
     /// The live bound mount's identity; written only inside the MOUNT hold (the :807 fold).
     static BOUND: Mutex<Option<Bound>> = Mutex::new(None);
-    static EPOCH: AtomicU64 = AtomicU64::new(0);
+    static EPOCH: AtomicU64 = AtomicU64::new(0); pub(super) fn bound_now() -> Option<(block::BlockHandle, PartitionSpan)> { BOUND.lock().as_ref().map(|b| (b.handle, b.span)) } // UNAFSWRITE (B825): the bound mount's medium, for the split commit's write phase (LINE-NEUTRAL)
 
     /// Split reads this boot, the longest MOUNT hold one of them took (us), the medium fetches made
     /// under MOUNT by a fallback, and the fallbacks.
@@ -3263,7 +3263,7 @@ pub mod splitread {
     /// worker core while this task runs metadata ops (`resolve_path` + `read_inode`) on the same mount.
     /// PASS = every MOUNT hold of both ≤ 5 ms, no fetch under MOUNT by the read, at least one
     /// metadata op completed while the read ran, and the bytes equal a reference read taken first.
-    pub fn selftest() {
+    pub fn selftest() { super::splitwrite::write_leg(); // UNAFSWRITE (B825): the write leg runs first and prints its own line
         const CAP: u64 = 4 << 20;
         let pick = with_unafs(|fs| -> Option<(String, u64)> {
             let dir = fs.resolve_path("/apps").ok()?;
@@ -3947,4 +3947,323 @@ pub fn record_attrs_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, id: u64, ino:
         }
     }
     Ok(a)
+}
+
+// =================================================================================================
+// UNAFSWRITE (rmbp-ledger B825; storage.md BP-storage-8, unafs-records.md §R16) — a commit's card WRITES leave the
+// IRQ-masked MOUNT hold. TAIL-APPENDED (this file's panic Locations are line-pinned); the hooks are same-line folds
+// under this module's cfg — :794 (`ticket_foreign`, inside the hold), :900 (`ticket_wait`, before each attempt),
+// :2938/:2943/:2962 (`RaSet`'s generation), :3028 (`splitread::bound_now`), :3266 (the `tests unafslock` write leg)
+// — so an image without `wc` is byte-identical and its write ops reach `with_unafs` through the alias below.
+//
+// THE WIRE THAT OWED IT (FILETYPES3 B820, flight 37 boot 3): every UnaFS commit's card writes ran inside the masked
+// MOUNT hold (~40 ms per commit on the rMBP card, `[filetypes] … masked_ms=44` for one key), the floor under the
+// registry build's `masked_max_ms`.
+//
+// THE SPLIT (the crate's `stage` / `StagedCommit::write_staged` / `flip`):
+//   1. HOLD 1 (MOUNT): the op runs with autocommit off, then `stage` relocates the maps and captures their blocks.
+//   2. WRITE (MOUNT released, IRQs as the caller left them): the captured blocks through a device of their own on
+//      the bound mount's medium and partition, then the barrier. They are free in the committed tree (K8a), so a
+//      cut here leaves the old tree whole. `RA_GEN` moves after it: the mount device's read-ahead never saw them.
+//   3. HOLD 2 (MOUNT): `flip` writes the one root sector if nothing moved since the stage; else `Restage` (a whole
+//      commit lands everything) or `Lost` (another mount: the op runs again on it, at most twice).
+// THE TWO-WRITER RULE: from the ticket's take to its give the holder is the volume's only writer — every
+// `with_unafs` waits for the ticket before an attempt (:900), and one that took MOUNT after the ticket was taken
+// leaves it untouched and restarts (:794). The holder's own holds pass by task id. Lock order TICKET ⊃ MOUNT.
+// =================================================================================================
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub use splitwrite::with_unafs_write;
+/// UNAFSWRITE (B825): without `wc` (and on aarch64) a write op's commit stays whole under MOUNT — the same call.
+#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+pub use with_unafs as with_unafs_write;
+
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod splitwrite {
+    use super::*;
+    use ::unafs::fs::{FlipOutcome, StagedCommit};
+    use core::sync::atomic::AtomicU64;
+
+    /// The commit ticket: the holder's task id, 0 = free.
+    static TICKET: AtomicU64 = AtomicU64::new(0);
+    /// Moves after every write phase; a `RaSet` filled under an older value drops its windows (`ra_sync`).
+    static RA_GEN: AtomicU64 = AtomicU64::new(0);
+
+    /// Census: commits flipped after an off-MOUNT write; commits whose card writes ran under MOUNT (ciphered root,
+    /// no bound span, a failed write phase, a restage); restages; lost stages; the longest hold (us); the longest
+    /// write phase (ms).
+    static SPLIT: AtomicU64 = AtomicU64::new(0);
+    static WHOLE: AtomicU64 = AtomicU64::new(0);
+    static RESTAGED: AtomicU64 = AtomicU64::new(0);
+    static LOST: AtomicU64 = AtomicU64::new(0);
+    static HELD_MAX_US: AtomicU64 = AtomicU64::new(0);
+    static WRITE_MS_MAX: AtomicU64 = AtomicU64::new(0);
+
+    /// The bound on any wait for the ticket: RENDERWEDGE's `MOUNT_BOUND_MS` (`video/renderwedge.rs`, 1500 ms — not
+    /// re-exported by that module, so its value is restated here), past which the caller answers `Busy`.
+    const TICKET_BOUND_MS: u64 = 1_500;
+    /// Runs of the op when its stage is `Lost` (another mount bound during the write phase).
+    const LOST_RUNS: u32 = 2;
+    /// A split commit whose write phase took this long prints its `[unafs] commit` line.
+    const LINE_MS: u64 = 20;
+
+    fn now_us() -> u64 {
+        crate::hidstall::now_us()
+    }
+
+    fn pause() {
+        if crate::arch::irqs_masked() {
+            core::hint::spin_loop();
+        } else {
+            crate::hlt(); // unmasked: let the holder run
+        }
+    }
+
+    /// :794 fold — the ticket is held by another task (read inside the MOUNT hold).
+    pub(super) fn ticket_foreign() -> bool {
+        let t = TICKET.load(Ordering::Acquire);
+        t != 0 && crate::arch::sched::current_id() != Some(t)
+    }
+
+    /// :900 fold — wait (bounded) until no other task holds the ticket; `false` = the bound passed.
+    pub(super) fn ticket_wait() -> bool {
+        if !ticket_foreign() {
+            return true;
+        }
+        let t0 = now_us();
+        while ticket_foreign() {
+            if now_us().saturating_sub(t0) >= TICKET_BOUND_MS * 1000 {
+                return false;
+            }
+            pause();
+        }
+        true
+    }
+
+    fn ticket_take(me: u64) -> bool {
+        let t0 = now_us();
+        loop {
+            if TICKET.compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return true;
+            }
+            if now_us().saturating_sub(t0) >= TICKET_BOUND_MS * 1000 {
+                return false;
+            }
+            pause();
+        }
+    }
+
+    /// :2962 fold — drop the windows of a `RaSet` filled before the last write phase.
+    pub(super) fn ra_sync(ra: &mut RaSet) {
+        let g = RA_GEN.load(Ordering::Acquire);
+        if ra.seen != g {
+            ra.invalidate();
+            ra.seen = g;
+        }
+    }
+
+    enum Stage {
+        Done,
+        Whole(Result<(), FileSystemError>),
+        Split(StagedCommit, block::BlockHandle, PartitionSpan),
+    }
+
+    enum Flip {
+        Ok,
+        Restaged(Result<(), FileSystemError>),
+        Whole(Result<(), FileSystemError>),
+        Lost,
+        Err(FileSystemError),
+    }
+
+    /// Run the write op `f` against the one coherent mount with its commit split (see the banner). Same contract
+    /// as [`with_unafs`]; a commit that fails is `MountError::Fs`, and a `Busy` leaves nothing landed.
+    pub fn with_unafs_write<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+        let Some(me) = crate::arch::sched::current_id() else {
+            return with_unafs(f); // no task identity to hold the ticket by: the whole commit
+        };
+        if TICKET.load(Ordering::Acquire) == me {
+            return with_unafs(f); // already this task's (never nested in practice: `f` runs under MOUNT)
+        }
+        if !ticket_take(me) {
+            return Err(MountError::Busy);
+        }
+        let out = run(&mut f);
+        TICKET.store(0, Ordering::Release);
+        out
+    }
+
+    fn run<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+        for _ in 0..LOST_RUNS {
+            // HOLD 1: the op, then the stage.
+            let (r, stage, held1) = with_unafs(|fs| {
+                let h0 = now_us();
+                fs.set_autocommit(false);
+                let r = f(fs);
+                fs.set_autocommit(true);
+                let stage = if MOUNT_DISCARD.load(Ordering::Relaxed) || !fs.has_staged() {
+                    Stage::Done // a K9 discard drops the mount after this closure; or nothing to commit
+                } else if fs.key_slot().is_some_and(|k| k.cipher == ::unafs::keyslot::CIPHER_AES256_XTS) {
+                    Stage::Whole(fs.commit()) // the write device would need the mount's cipher
+                } else {
+                    match super::splitread::bound_now() {
+                        None => Stage::Whole(fs.commit()),
+                        Some((handle, span)) => match fs.stage() {
+                            Ok(Some(s)) => Stage::Split(s, handle, span),
+                            Ok(None) => Stage::Whole(Ok(())), // the v6 -> v7 migration committed whole
+                            Err(e) => Stage::Whole(Err(e)),
+                        },
+                    }
+                };
+                (r, stage, now_us().saturating_sub(h0))
+            })?;
+            let (s, handle, span) = match stage {
+                Stage::Done => return Ok(r),
+                Stage::Whole(Ok(())) => {
+                    WHOLE.fetch_add(1, Ordering::Relaxed);
+                    return Ok(r);
+                }
+                Stage::Whole(Err(e)) => return Err(MountError::Fs(e)),
+                Stage::Split(s, handle, span) => (s, handle, span),
+            };
+
+            // WRITE: MOUNT released; the ticket keeps every other writer out.
+            let t1 = now_us();
+            let wrote = write_phase(&s, handle, &span);
+            RA_GEN.fetch_add(1, Ordering::Release);
+            let write_ms = now_us().saturating_sub(t1) / 1000;
+
+            // HOLD 2: the flip.
+            let (flip, held2) = match with_unafs(|fs| {
+                let h0 = now_us();
+                let o = if !wrote {
+                    if fs.holds_staged(&s) { Flip::Whole(fs.commit()) } else { Flip::Lost }
+                } else {
+                    match fs.flip(&s) {
+                        Ok(FlipOutcome::Landed) => Flip::Ok,
+                        Ok(FlipOutcome::Restage) => Flip::Restaged(fs.commit()),
+                        Ok(FlipOutcome::Lost) => Flip::Lost,
+                        Err(e) => Flip::Err(e),
+                    }
+                };
+                (o, now_us().saturating_sub(h0))
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    force_remount(); // the staged RAM goes with the mount: a Busy never lands later
+                    return Err(e);
+                }
+            };
+            let held = held1.max(held2);
+            HELD_MAX_US.fetch_max(held, Ordering::Relaxed);
+            WRITE_MS_MAX.fetch_max(write_ms, Ordering::Relaxed);
+            let (name, out) = match flip {
+                Flip::Ok => {
+                    SPLIT.fetch_add(1, Ordering::Relaxed);
+                    ("ok", Some(Ok(())))
+                }
+                Flip::Restaged(res) => {
+                    RESTAGED.fetch_add(1, Ordering::Relaxed);
+                    WHOLE.fetch_add(1, Ordering::Relaxed);
+                    ("restaged", Some(res))
+                }
+                Flip::Whole(res) => {
+                    WHOLE.fetch_add(1, Ordering::Relaxed);
+                    ("whole", Some(res))
+                }
+                Flip::Lost => {
+                    LOST.fetch_add(1, Ordering::Relaxed);
+                    ("lost", None)
+                }
+                Flip::Err(e) => return Err(MountError::Fs(e)), // the flip failed and unwound: nothing landed
+            };
+            if write_ms >= LINE_MS || name != "ok" {
+                serial_println!("[unafs] commit staged_blocks={} write_ms={} held_us={} flip={}", s.blocks(), write_ms, held, name);
+            }
+            match out {
+                Some(Ok(())) => return Ok(r),
+                Some(Err(e)) => return Err(MountError::Fs(e)),
+                None => {} // Lost: run the op again on the mount that is bound now
+            }
+        }
+        Err(MountError::Busy)
+    }
+
+    /// The staged blocks through a device of their own on the bound mount's medium — the constructors `mount_on`
+    /// uses (`SdSectorDevice::open_on`, `BlockAdapter::for_partition`). `false` on any refusal.
+    fn write_phase(s: &StagedCommit, handle: block::BlockHandle, span: &PartitionSpan) -> bool {
+        match SdSectorDevice::open_on(handle) {
+            Ok(dev) => s.write_staged(&mut BlockAdapter::for_partition(dev, span)).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// `(split, whole, restaged, lost, held_max_us, write_ms_max)` this boot.
+    pub fn census() -> (u64, u64, u64, u64, u64, u64) {
+        (
+            SPLIT.load(Ordering::Relaxed),
+            WHOLE.load(Ordering::Relaxed),
+            RESTAGED.load(Ordering::Relaxed),
+            LOST.load(Ordering::Relaxed),
+            HELD_MAX_US.load(Ordering::Relaxed),
+            WRITE_MS_MAX.load(Ordering::Relaxed),
+        )
+    }
+
+    /// `tests unafslock` write leg (:3266 fold): 8 attribute commits on a scratch file under `/var`, each through
+    /// `with_unafs_write`. ok = 8 commits, all split, none under MOUNT, none lost, every hold <= 20 ms.
+    pub fn write_leg() {
+        const LEAF: &str = "unafslock.tmp";
+        const PATH: &str = "/var/unafslock.tmp";
+        const N: u64 = 8;
+        let made = with_unafs_write(|fs| -> Result<u64, (bool, &'static str)> {
+            if fs.key_slot().is_some_and(|k| k.cipher == ::unafs::keyslot::CIPHER_AES256_XTS) {
+                return Err((true, "ciphered root"));
+            }
+            let var = fs.resolve_path("/var").map_err(|_| (true, "no /var"))?;
+            match fs.resolve_path(PATH) {
+                Ok(id) => Ok(id),
+                Err(_) => fs.create_file(var, String::from(LEAF)).map_err(|_| (false, "create")),
+            }
+        });
+        let id = match made {
+            Ok(Ok(id)) => id,
+            Ok(Err((true, why))) => {
+                serial_println!("[unafslock] write -> SKIP ({})", why);
+                return;
+            }
+            Ok(Err((false, why))) => {
+                serial_println!("[unafslock] write commits=0 -> FAIL why={}", why);
+                return;
+            }
+            Err(_) => {
+                serial_println!("[unafslock] write -> SKIP (no native unafs volume)");
+                return;
+            }
+        };
+        let (s0, w0, r0, l0, _, _) = census();
+        HELD_MAX_US.store(0, Ordering::Relaxed);
+        WRITE_MS_MAX.store(0, Ordering::Relaxed);
+        let mut commits = 0u64;
+        for i in 0..N {
+            let r = with_unafs_write(|fs| fs.set_attribute(id, String::from("unafslock"), AttributeValue::Int(i as i64)));
+            if matches!(r, Ok(Ok(()))) {
+                commits += 1;
+            }
+        }
+        let (s1, w1, r1, l1, held, wms) = census();
+        let _ = with_unafs_write(|fs| fs.resolve_path("/var").and_then(|var| fs.unlink(var, LEAF)));
+        let (split, whole, restaged, lost) = (s1.wrapping_sub(s0), w1.wrapping_sub(w0), r1.wrapping_sub(r0), l1.wrapping_sub(l0));
+        let ok = commits == N && split >= N && whole == 0 && lost == 0 && held <= 20_000;
+        serial_println!(
+            "[unafslock] write commits={} split={} write_held_us={} write_ms_max={} io_under_lock={} restaged={} lost={} -> {}",
+            commits,
+            split,
+            held,
+            wms,
+            whole,
+            restaged,
+            lost,
+            if ok { "ok" } else { "FAIL" }
+        );
+    }
 }

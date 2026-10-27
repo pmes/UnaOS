@@ -50,6 +50,7 @@ HDARING (B811): `[pump] step=<name> parked deaths=<n> until=<ms> (HDARING B811: 
 - HDARING (B811) owed: the step park is honoured by net-hda's HDA half only; a generic park in the pump loop (main.rs skipping any parked step) is owed. The flight-37 loop's cause on the HDA side (four owners of one CORB/RIRB pair) is closed by BP-audio-19; the instruction at rip 0x788a205c is still unnamed.
 
 - QUARRYRELIST (B824) residual and owed: `columns::after_show`'s `is_trash` (an in-memory mount-table build) stays inside the install's MODEL hold (measured in `held_us`); a FAILED read is not cacheable, so a vanished cwd or expanded tree row is re-read once under MODEL (`locked_reads=`). NAVREAD — a NAVIGATION's `Model::show` (tree press, `activate_row`, back/forward) still reads under MODEL in the router; the same plan/read/install split applies to `navigate`. SHOWFOLDERIO — `is_trash` and `folderview::enter`'s resolve read in the read phase and hand their answers to the install. RELISTERR — a generation-stamped negative cache entry lets a failed read install too.
+- UNAFSWRITE (B825) owed (BP-cores-14 kept): TICKETOWNER — the UnaFS commit ticket (`fs::unafs::splitwrite`) is an atomic word, not a tracked lock: a stack-overflow kill of its holder during the write phase leaves it held, and every `with_unafs` answers Busy after its 1500 ms bound until reboot. TICKETPREEMPT — a MASKED `with_unafs` caller on the core where the holder was preempted mid-write spins its bound.
 
 ## 6. Read further
 - `docs/dev/OS/02_KERNEL_CORE/scheduler.md` — the scheduler design.
