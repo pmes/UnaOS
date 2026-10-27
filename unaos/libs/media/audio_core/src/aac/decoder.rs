@@ -783,25 +783,9 @@ impl AacDecoder {
                 let start = ics.swb[bottom.min(mmm)] as usize;
                 let end = ics.swb[top.min(mmm)] as usize;
                 if end <= start { continue; }
-                let size = end - start;
-                let lpc = &ch.tns.lpc[w][f];
                 let base = w * 128;
-                // all-pole filter in the frequency direction: y[n] = x[n] - Σ lpc[i]·y[n-i]
-                if ch.tns.direction[w][f] {
-                    for m in 0..size {
-                        let n = base + end - 1 - m;
-                        let mut y = ch.coef[n];
-                        for i in 1..=order.min(m) { y -= lpc[i - 1] * ch.coef[n + i]; }
-                        ch.coef[n] = y;
-                    }
-                } else {
-                    for m in 0..size {
-                        let n = base + start + m;
-                        let mut y = ch.coef[n];
-                        for i in 1..=order.min(m) { y -= lpc[i - 1] * ch.coef[n - i]; }
-                        ch.coef[n] = y;
-                    }
-                }
+                // AACENCTNSDOWN (LEDGER SR406, the seat's grant): the all-pole loops are `tns_synth` at the file tail
+                tns_synth(&mut ch.coef, base + start, base + end, &ch.tns.lpc[w][f], order, ch.tns.direction[w][f]);
             }
         }
     }
@@ -926,4 +910,27 @@ pub(crate) fn tns_lpc(v: &[i32], res_bits: u32) -> [f32; 20] {
     let mut lpc = [0f32; 20];
     for i in 0..order { lpc[i] = a[i + 1] as f32; }
     lpc
+}
+
+/// AACENCTNSDOWN (LEDGER SR406; the seat's grant, beside TNS-COEF-ONE's `tns_lpc`): §4.6.9's all-pole synthesis over
+/// `coef[start..end]` in the frequency direction, y[n] = x[n] - Σ lpc[i]·y[n∓i] — upward from `start`, or with `down`
+/// (direction 1) from `end - 1` down. The decoder's `spectral_tools` and the encoder's pre-echo cost (`aac::enc`
+/// `echo_cost`) both call it: one synthesis.
+pub(crate) fn tns_synth(coef: &mut [f32], start: usize, end: usize, lpc: &[f32; 20], order: usize, down: bool) {
+    let size = end.saturating_sub(start);
+    if down {
+        for m in 0..size {
+            let n = end - 1 - m;
+            let mut y = coef[n];
+            for i in 1..=order.min(m) { y -= lpc[i - 1] * coef[n + i]; }
+            coef[n] = y;
+        }
+    } else {
+        for m in 0..size {
+            let n = start + m;
+            let mut y = coef[n];
+            for i in 1..=order.min(m) { y -= lpc[i - 1] * coef[n - i]; }
+            coef[n] = y;
+        }
+    }
 }

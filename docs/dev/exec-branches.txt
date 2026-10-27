@@ -1043,7 +1043,7 @@ refs/heads/exec-rmbp-adoptpng   9ee178a2b FOLDED-BY-HAND (this commit) 2026-10-2
 refs/heads/exec-rmbp-mt7925s7   ca04e8026 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookdocsrefresh   50334f7bb FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootledstest   9a4ea2fd7 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aacenctnsdown   b3def5e82 cut 2026-10-27 (wave36 batch 16)
+refs/heads/exec-rmbp-aacenctnsdown   640d5ae1c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookecgpe   dc1814ec9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-dsdtone   353c891c8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-flightlistboardtags   3a52111bd FOLDED-BY-HAND (this commit) 2026-10-27
