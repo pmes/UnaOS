@@ -958,3 +958,10 @@ refs/heads/exec-rmbp-displayiccfile   635961260 FOLDED-BY-HAND (this commit) 202
 refs/heads/exec-rmbp-h264encplanes   78000a72c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kernelpngicc   d9df44ad7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle6keystab   33c9f83bb FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kerneliccint   2e1698471 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle6exportstreampcm   2e1698471 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-h264enccolourhost   2e1698471 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aacencgrouping   2e1698471 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle6dragsnap   2e1698471 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-av1inbandsize   2e1698471 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-kernelscalecols   2e1698471 IN-FLIGHT cut 2026-10-27
