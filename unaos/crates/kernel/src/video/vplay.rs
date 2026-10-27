@@ -1100,7 +1100,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         }
         snd::tick(jid); crate::arch::sched::yield_now(); // NLE6MIXAUDIO (rmbp-ledger B953): the sound, once per step (file tail)
     }
-    snd::drain(jid); Ok(()) // NLE6MIXAUDIO (rmbp-ledger B953): the sound plays out after the last picture, bounded (file tail)
+    super::export::sound_tail(jid); snd::drain(jid); Ok(()) // NLE6EXPORTSTREAMPCM (rmbp-ledger B976): an Encode job's capture window lifted after its last picture (video/export.rs). NLE6MIXAUDIO (rmbp-ledger B953): the sound plays out after the last picture, bounded (file tail)
 }
 
 // ── NLE6MIX (rmbp-ledger B899): the transition mix on the EDL job — the second run, the ONE mix fn, the refusal ─────────
