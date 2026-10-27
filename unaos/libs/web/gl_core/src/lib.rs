@@ -13,7 +13,7 @@
 //!   bytecode and its interpreter; [`link`] — program link; [`program`] — shader and program objects.
 //! * [`raster`] — draws, clipping, rasterization, per-fragment operations, clear, readPixels, presentation.
 //!
-//! `no_std` + `alloc`, no dependencies, no `unsafe`.
+//! `no_std` + `alloc`, one dependency (libm, MATH-ONE SR362), no `unsafe`.
 #![no_std]
 #![forbid(unsafe_code)]
 

@@ -12,6 +12,7 @@ version = "0.1.0"
 dependencies = [
  "crypto_core",
  "demux_core",
+ "libm",
 ]
 
 [[package]]
@@ -383,6 +384,7 @@ name = "svg_core"
 version = "0.1.0"
 dependencies = [
  "font_core",
+ "libm",
 ]
 
 [[package]]

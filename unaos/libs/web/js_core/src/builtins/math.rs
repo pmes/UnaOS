@@ -1114,3 +1114,24 @@ fn min(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 fn random(vm: &mut Vm, _ctx: &CallCtx) -> JsResult<Value> {
     Ok(Value::Number(vm.random()))
 }
+
+/// MATH-ONE-JS (LEDGER SR362): js_core keeps its double-double engine instead of retiring onto libm. Measured at the
+/// retirement: on 900 inputs where js_core and libm 0.2.16 disagree (300 each of exp / pow / sin), js_core is the
+/// correctly rounded double every time (60-digit decimal reference) and libm the neighbour every time; libm differs on
+/// 3-20% of inputs, each a visible digit in Number::toString. Six of those points, pinned (libm's answer in the comment).
+#[cfg(test)]
+mod mathone_js {
+    use super::{exp, pow, sin};
+    fn f(b: u64) -> f64 {
+        f64::from_bits(b)
+    }
+    #[test]
+    fn mathone_js_correctly_rounded_where_libm_is_not() {
+        assert_eq!(exp(f(0x4033_4618_a50f_c8f4)).to_bits(), 0x41ab_fa70_60b1_f81d); // libm ...81c
+        assert_eq!(exp(f(0x400e_3139_a384_a450)).to_bits(), 0x4045_c71a_3da2_e293); // libm ...292
+        assert_eq!(pow(f(0x4050_204b_4f71_f650), f(0x4021_5673_41be_5626)).to_bits(), 0x4331_4886_9fbc_58ad); // libm ...8ac
+        assert_eq!(pow(f(0x408c_a76e_3a31_050f), f(0x4018_8f05_f39b_84cc)).to_bits(), 0x43b5_6246_d9a1_263b); // libm ...63a
+        assert_eq!(sin(f(0x4015_80c7_2405_f5b8)).to_bits(), 0xbfe9_36a6_5da2_0743); // libm ...744
+        assert_eq!(sin(f(0xbfec_1269_4ae9_8448)).to_bits(), 0xbfe8_9b80_875a_e66f); // libm ...670
+    }
+}
