@@ -1555,3 +1555,73 @@ fn swapbacknlecache_depth_one_cache_evicts() {
     assert_eq!(builds(1), [1, 2, 3, 4]);
     println!("swapbacknlecache: depth2 {:?} depth1 {:?}", builds(0), builds(1));
 }
+
+// ── VP9INBANDSWITCH (LEDGER SR400; handlers.md §5 NLEPROBE-HDR's VP9-INBAND-SWITCH) ─────────────────────────────────────────────
+// A VP9 WebM of four decodable key frames: BT.709 8x8, BT.601 6x4 twice, BT.709 6x4. The open fills `Track::colour` 2/2/1 limited
+// from the first (SR379); the VP9 arm hands each picture's own color_space / range and size to gneiss_pal's ONE in-band step
+// (`dsp::video::inband_frame`, AV1's), so the BT.601 frames leave converted (`Pixels::Rgba`), the last is back at the open's
+// colour (planes again), and the colour line fires twice, the size line once. The header is SR379's builder with the size and
+// header_size_in_bytes patched; the bool-coded tail (compressed header + the one 8x8 tile, decodable at any size 1..=8) is the
+// bytes `vp9_core/tests/structure.rs` pins as `VP9INBANDSWITCH_TAIL`.
+const VP9INBANDSWITCH_TAIL: &[u8] = &[0, 0, 59, 0];
+
+fn vp9inbandswitch_key(color_space: u64, w: u32, h: u32) -> Vec<u8> {
+    let mut f = vp9inbandcolour_key_header(color_space);
+    f.truncate(14); // the 112-bit uncompressed header; drop SR379's stand-in compressed byte
+    let mut put = |at: usize, v: u32, n: usize| {
+        for i in 0..n {
+            let (byte, bit) = ((at + i) / 8, 7 - (at + i) % 8);
+            f[byte] = (f[byte] & !(1 << bit)) | ((((v >> (n - 1 - i)) & 1) as u8) << bit);
+        }
+    };
+    put(36, w - 1, 16); // frame_width_minus_1
+    put(52, h - 1, 16); // frame_height_minus_1
+    put(96, 2, 16); // header_size_in_bytes: the tail's compressed header
+    f.extend_from_slice(VP9INBANDSWITCH_TAIL);
+    f
+}
+
+/// Each presented frame's size and whether it left converted (a switched colour) or as planes.
+struct Vp9InBandSwitchSink {
+    shown: Vec<(u32, u32, bool)>,
+}
+impl FrameSink for Vp9InBandSwitchSink {
+    fn present(&mut self, f: &Frame, _ordinal: u64) {
+        self.shown.push((f.width, f.height, matches!(f.pixels, gneiss_pal::dsp::video::Pixels::Rgba(_))));
+    }
+}
+
+#[test]
+fn vp9inbandswitch_player_repicks_and_reports_size() {
+    capture_logs();
+    let keys = [vp9inbandswitch_key(2, 8, 8), vp9inbandswitch_key(1, 6, 4), vp9inbandswitch_key(1, 6, 4), vp9inbandswitch_key(2, 6, 4)];
+    let mut spec = build::TrackSpec::test_pattern(1, 8, 8, 25);
+    spec.fourcc = *b"vp09";
+    spec.config_box = None;
+    spec.codec_id = "V_VP9";
+    spec.config = Vec::new();
+    spec.timescale = 1000;
+    let samples = keys.iter().enumerate().map(|(i, k)| build::SampleSpec { data: k.clone(), dts: i as i64 * 40, pts: i as i64 * 40, duration: 40, keyframe: true }).collect();
+    let file = build::mkv(&[build::MediaTrack { spec, samples }], &MkvOptions::default());
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    let c709 = gneiss_pal::dsp::demux::colour::Colour { primaries: 2, transfer: 2, matrix: 1, full_range: Some(false), mastering: None, light: None };
+    assert_eq!(p.colour(), Some(&c709), "the open's first key frame: BT.709 limited");
+    p.play();
+    let mut sink = Vp9InBandSwitchSink { shown: Vec::new() };
+    for _ in 0..400 {
+        if sink.shown.len() >= 4 || p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    assert_eq!(sink.shown, vec![(8, 8, false), (6, 4, true), (6, 4, true), (6, 4, false)], "every frame at its own size; the BT.601 ones re-picked");
+    let colour = my_log_lines("video colour switch");
+    assert_eq!(colour.len(), 2, "{colour:?}");
+    assert!(colour[0].contains("matrix=1->6 range=limited"), "{}", colour[0]);
+    assert!(colour[1].contains("matrix=6->1 range=limited"), "{}", colour[1]);
+    let size = my_log_lines("video size switch");
+    assert_eq!(size.len(), 1, "{size:?}");
+    assert!(size[0].contains("8x8->6x4"), "{}", size[0]);
+    println!("vp9inbandswitch: {} ; {} ; {}", colour[0], colour[1], size[0]);
+}

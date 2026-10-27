@@ -645,14 +645,9 @@ pub fn stream_codes(av1c: &[u8], first_tu: &[u8]) -> Option<Av1Codes> {
 // bitstream reading); then every field the open took FROM the bitstream (open == base) follows the current header and a field the
 // container stated differently keeps the container's. Back at the base codes = the open's colour again, byte-identical.
 
-/// AV1INBANDSWITCH (SR373): a [`StreamDecoder`]'s switch state — the first decoded header's code points (`base`) and the colour
-/// the last frame switched to (`last`, `None` = the open's).
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct InBand {
-    pub base: Option<(u8, u8, u8, bool)>,
-    pub last: Option<(u8, u8, u8, Option<bool>)>,
-    pub size: Option<(u32, u32)>, // AV1INBANDSIZE (SR379): the last shown picture's size (`StreamDecoder::size_switch`)
-}
+/// AV1INBANDSWITCH (SR373): a [`StreamDecoder`]'s switch state (`InBand`) and the container-wins merge (`switch_codes`) live in
+/// yuv_core since VP9INBANDSWITCH (LEDGER SR400) lifted them byte for byte, so VP9 reports by the same rule; these paths stay.
+pub use yuv_core::inband::{switch_codes, InBand};
 
 impl Decoder {
     /// AV1INBANDSWITCH (SR373): the codes of the sequence header in effect (its color_config) and the last HDR_CLL / HDR_MDCV
@@ -680,23 +675,8 @@ impl StreamDecoder {
     /// `None` while the current header's code points equal the first decoded header's (the open's colour applies), else the
     /// colour to convert by ([`switch_codes`]); `.1` is `Some((matrix before, matrix now))` once per change of `.0`.
     pub fn switch(&mut self, open: Option<(u8, u8, u8, Option<bool>)>) -> (Option<(u8, u8, u8, Option<bool>)>, Option<(u8, u8)>) {
-        let Some((now, _, _)) = self.dec.current_codes() else { return (self.inband.last, None) };
-        let base = *self.inband.base.get_or_insert(now);
-        let next = if now == base { None } else { Some(switch_codes(open, base, now)) };
-        let open_m = open.map_or(base.2, |o| o.2);
-        let changed = (next != self.inband.last).then(|| (self.inband.last.map_or(open_m, |l| l.2), next.map_or(open_m, |n| n.2)));
-        self.inband.last = next;
-        (next, changed)
+        self.inband.switch(self.dec.current_codes().map(|c| c.0), open) // VP9INBANDSWITCH (SR400): the ONE rule, `yuv_core::inband`
     }
-}
-
-/// AV1INBANDSWITCH (SR373): the container-wins merge of a header switch — each field the open took from the bitstream (equal to
-/// `base`, the open's in-band reading) takes `now`'s value; a field the container stated differently keeps the open's. `open`
-/// `None` (no colour at open) reads as `base`.
-pub fn switch_codes(open: Option<(u8, u8, u8, Option<bool>)>, base: (u8, u8, u8, bool), now: (u8, u8, u8, bool)) -> (u8, u8, u8, Option<bool>) {
-    let o = open.unwrap_or((base.0, base.1, base.2, Some(base.3)));
-    let f = |o: u8, b: u8, n: u8| if o == b { n } else { o };
-    (f(o.0, base.0, now.0), f(o.1, base.1, now.1), f(o.2, base.2, now.2), if o.3 == Some(base.3) { Some(now.3) } else { o.3 })
 }
 
 // ── AV1INBANDSIZE (LEDGER SR379): a new coded video sequence mid-stream (handlers.md §5 NLEPROBE-HDR's AV1-INBAND-SIZE) ──────────
@@ -739,7 +719,6 @@ impl StreamDecoder {
     /// AV1INBANDSIZE (SR379): after a decode — the shown picture's `w` x `h` against the last shown one: `Some((before, now))` once
     /// per change, `None` for the first picture and while the size holds. A seek (`reset`) keeps it.
     pub fn size_switch(&mut self, w: u32, h: u32) -> Option<((u32, u32), (u32, u32))> {
-        let before = self.inband.size.replace((w, h))?;
-        (before != (w, h)).then_some((before, (w, h)))
+        self.inband.size_switch(w, h) // VP9INBANDSWITCH (SR400): the ONE size rule, `yuv_core::inband`
     }
 }
