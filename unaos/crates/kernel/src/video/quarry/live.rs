@@ -4475,9 +4475,9 @@ pub fn font_repaint_pass() {
     crate::video::instgui::font_repaint();
     let rows = crate::video::fbcon::font_repaint();
     serial_println!(
-        "[kfont] repaint epoch={} console_rows={} windows=quarry,settings,activity,fileview,textedit{}{} face={}",
+        "[kfont] repaint epoch={} console_rows={} win=boot-log routed={} windows=quarry,settings,activity,fileview,textedit{}{} face={}",
         e,
-        rows,
+        rows, crate::video::fbcon::console_is_routed() as u8,
         if cfg!(feature = "login") { ",login" } else { "" },
         if cfg!(all(target_arch = "x86_64", feature = "wc", feature = "instgui")) { ",instgui" } else { "" },
         crate::video::text::face_name(crate::video::text::Face::Ui)

@@ -7515,7 +7515,7 @@ fn textscale_win_leg(t: &mut TsWin, css: i64, e_before: u32) {
     v.push(("login", crate::video::crystal::login::textscale_rows()));
     #[cfg(not(feature = "login"))]
     serial_println!("[textscale] win=login css={} grow=0 rows_ok=skip(knob-off)", css);
-    v.push(("dialog", crate::video::dialog::textscale_rows()));
+    v.push(("dialog", crate::video::dialog::textscale_rows())); textscale_shell_leg(&mut v, css);
     for (name, (g, ok)) in v {
         serial_println!("[textscale] win={} css={} grow={} rows_ok={}", name, css, g, ok as u8);
         t.legs += 1;
@@ -7619,4 +7619,27 @@ fn sinkall_clock(sink: &str, k: usize) -> &'static str {
         src, sink, last, if backsteps == 0 { "ok" } else { "FAIL" }, backsteps, gap, moves, closed as u8, frames, if ok { "ok" } else { "FAIL" }
     );
     if ok { "ok" } else { "FAIL" }
+}
+
+// SHELLFACE (rmbp-ledger B858): `tests textscale`'s shell row — the windowed shell (x86 `wc`, the Pi `render_pass` and
+// Orin `jd2_console_pump` shells on aarch64 `desktop_firmware`) at each text step, read off `console::shell_face` (its
+// render pass's `font_follow` writes it) with TEXTSCALE2's predicate: painted at the current face epoch, at the console
+// cell, with rows. Up to 2 s for the owning pass to run. A shell that never painted (no windowed shell on this boot)
+// prints `[textscale] win=shell css=<c> grow=0 rows_ok=skip(no-shell-window)` and adds no row. Same gate as the leg.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn textscale_shell_leg(v: &mut alloc::vec::Vec<(&str, (usize, bool))>, css: i64) {
+    let t0 = crate::arch::ms();
+    let ok = loop {
+        let (e, rows, _, ch) = crate::console::shell_face();
+        let hit = e != 0 && e == crate::video::text::epoch() && ch == crate::video::text::grid_cell().1 && rows > 0;
+        if hit || crate::arch::ms().saturating_sub(t0) >= 2_000 {
+            break hit;
+        }
+        crate::arch::sched::yield_now();
+    };
+    if !ok && crate::console::shell_face().0 == 0 {
+        serial_println!("[textscale] win=shell css={} grow=0 rows_ok=skip(no-shell-window)", css);
+        return;
+    }
+    v.push(("shell", (crate::video::text::grid_cell().1, ok)));
 }

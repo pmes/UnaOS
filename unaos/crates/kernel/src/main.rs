@@ -3029,7 +3029,7 @@ fn jd2_console_pump(_arg: usize) {
             cursor::restore(&mut pal);
             needs_render = true;
         }
-        if needs_render {
+        #[cfg(feature = "desktop_firmware")] if spal.as_mut().is_some_and(|p| console.font_follow(p)) { needs_render = true; key_repainted = true; } if needs_render {
             shellwin_present(&mut spal, shell_id, &mut pal, key_repainted); if let Ok(mut x) = unaos_kernel::drivers::xhci::claim() { x.poll_events(); } // PRTSCLOST (orin 17) — RE-ARM THE HID READS THE INSTANT THE PRESENT RELEASES THE CORE, instead of waiting for the top of the next iteration. Exactly ONE Normal TRB is outstanding on the keyboard interrupt-IN and it is re-armed only from the completion dispatch (drivers/xhci/mod.rs), and `set_hid_idle` sent SET_IDLE duration 0 = INDEFINITE, so the device reports ONLY on a state change and never resends: every key edge that happens while the endpoint has no TD queued is lost with no line anywhere. That is render8's PRTSCLOST — three fast Print Screen presses, one `armed` line. The present is the longest thing this loop does between two drains (render8's `[wc-h] maxpresent_us=92344`), and a 92 ms hole is wider than a human's whole press-and-release. This is a `poll_events()` on a ring that is usually empty — the same cheap MMIO the loop head already does, and `claim()` failing is a no-op, so a contended pass behaves exactly as it did. It does NOT close the window on its own (the slice below is the other half, and only multiple outstanding TDs would close it for good); it removes the largest term, and `[kbdpoll] armgap_us=` measures what is left. ⚠ LINE-NEUTRAL fold onto the existing present.
         }
         // VUGRAS: the shell-idle writeback sweep on the ~250 ms cadence (boot-14's crash path — the
@@ -5692,7 +5692,7 @@ fn render_pass<W: RenderWait>(w: &mut W) {
         // Deliberately NOT counted into `s6_composites`: that witness measures PANEL composites, and
         // folding a window present into it would report the backdrop presenting when it did not.
         #[cfg(feature = "desktop_firmware")]
-        if shell_dirty {
+        if shell_dirty | (shell_id != unaos_kernel::video::wm::WIN_NONE && shell_console.font_follow(&mut shell_pal)) {
             shell_pal.render();
             let _ = unaos_kernel::video::wm::present_outcome_owned(
                 shell_id,
