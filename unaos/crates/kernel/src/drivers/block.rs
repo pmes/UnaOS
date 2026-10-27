@@ -71,7 +71,7 @@ fn claim_xhci_for_io() -> Result<BlockLoan, BlockError> {
         Err(XhciClaimError::NotReady) => return Err(BlockError::NotReady),
         Err(XhciClaimError::Busy) => {}
     }
-    if crate::arch::irqs_masked() {
+    if crate::arch::irqs_masked() || (cfg!(target_arch = "aarch64") && crate::arch::sched::preemptoff::witness().0) { // PREEMPTOFFARM (zenbook-ledger Z67): an aarch64 preempt-off holder (the FAT/DIR spans) must not hlt-wait on a preemptible holder either (WEDGE-8 F3); x86 unchanged. LINE-NEUTRAL fold
         return masked_loan_wait(); // PREEMPTOFFXHCILOAN (Z62): a bounded spin on a RUNNING holder only (was: Busy at once)
     }
     let start = crate::arch::now_cycles();
