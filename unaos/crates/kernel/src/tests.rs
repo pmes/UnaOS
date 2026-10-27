@@ -7174,11 +7174,11 @@ fn textscale_selftest() {
             }
         }
     }
-    let restored = crate::video::text::textscale::step(0).is_some(); textscale_win_close(&mut tsw); // TEXTSCALE3 (B849): the windows this test opened close
+    let restored = crate::video::text::textscale::step(0).is_some(); let rs2 = textscale_reseat2_leg(); textscale_win_close(&mut tsw); // TEXTSCALE3 (B849): the windows this test opened close
     let bumps = crate::video::text::epoch().wrapping_sub(e0);
     let v = if done == 0 && why == "not-applied" {
         "SKIP"
-    } else if done == STEPS.len() && overlap == 0 && kit && fits && restored && tsw.ok() {
+    } else if done == STEPS.len() && overlap == 0 && kit && fits && restored && tsw.ok() && rs2.2 {
         "PASS"
     } else {
         "FAIL"
@@ -7187,8 +7187,8 @@ fn textscale_selftest() {
         why = "no-face";
     }
     serial_println!(
-        ":: TEXTSCALE: steps={} overlap={} cap={} -> {} :: bumps={} moved={} fits={} clipped={} kit={} restored={} why={} stacked={} windows={}/{} frames={}/{} reseat={} clipped_after={} seated={}",
-        done, overlap, cap_seen, v, bumps, moved, fits as u8, clipped, if kit { "ok" } else { "bad" }, restored as u8, why, tsw.stacked, tsw.bad, tsw.legs, tsw.frames, tsw.want, tsw.reseat, tsw.clipped_after, tsw.seated
+        ":: TEXTSCALE: steps={} overlap={} cap={} -> {} :: bumps={} moved={} fits={} clipped={} kit={} restored={} why={} stacked={} windows={}/{} frames={}/{} reseat={} clipped_after={} seated={} instgui={} drag={}",
+        done, overlap, cap_seen, v, bumps, moved, fits as u8, clipped, if kit { "ok" } else { "bad" }, restored as u8, why, tsw.stacked, tsw.bad, tsw.legs, tsw.frames, tsw.want, tsw.reseat, tsw.clipped_after, tsw.seated, rs2.0, rs2.1
     );
 }
 
@@ -8240,4 +8240,80 @@ mod bootlist_arm {
         let (a, l) = counts();
         (a.wrapping_sub(a0), l.wrapping_sub(l0))
     }
+}
+
+// TEXTSCALERESEAT2 (rmbp-ledger B886; BP-video-40) — TAIL-APPENDED: `tests textscale`'s drag and installer legs, run after
+// the restore and before the fixture windows close. DRAG: a real bottom-edge resize gesture on the fixture dialog through
+// wm's own seam (`resize_begin`, `drag_motion`, `drag_end`), half-way to its capacity and then past it; after each,
+// `dialog::service` (`drag_follow`) must have laid the dialog out at the row's height, and the row never passes capacity.
+// INSTGUI (x86 `wc` + `instgui` only): the installer re-seats at the largest step (`instgui=<h>/<want>`, h == want).
+// Wire: `[textscale] reseat2 drag=<ok|bad|skip> grew=<h0>-><h1> cap=<c> instgui=<h>/<want>|skip`; the summary's tail
+// tokens `instgui=` and `drag=`; a `bad` or a mismatch fails TEXTSCALE.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn textscale_reseat2_leg() -> (alloc::string::String, &'static str, bool) {
+    use crate::video::dialog;
+    fn drag_leg() -> (&'static str, (usize, usize, usize)) {
+        use crate::video::{dialog, wm};
+        dialog::service(); // the restore's text step re-seats the dialog first (`font_follow`, once per epoch)
+        let Some((win, cap, _)) = dialog::drag_probe() else { return ("skip", (0, 0, 0)) };
+        let Some(i) = wm::info(win) else { return ("skip", (0, 0, 0)) };
+        if cap <= i.h {
+            return ("skip", (i.h, i.h, i.h));
+        }
+        let (gx, gy) = (i.x as i32 + 8, (i.y + i.h) as i32);
+        let gesture = |dy: usize| -> bool {
+            if !wm::resize_begin(win, wm::RS_B, gx, gy) {
+                return false;
+            }
+            let _ = wm::drag_motion(gx, gy + dy as i32);
+            let _ = wm::drag_end();
+            dialog::service();
+            true
+        };
+        if !gesture(((cap - i.h) / 2).max(1)) {
+            return ("bad", (i.h, 0, 0));
+        }
+        let (Some(a), Some((_, _, laid_a))) = (wm::info(win), dialog::drag_probe()) else { return ("bad", (i.h, 0, 0)) };
+        if !gesture(cap * 2) {
+            return ("bad", (i.h, a.h, 0));
+        }
+        let (Some(b), Some((_, _, laid_b))) = (wm::info(win), dialog::drag_probe()) else { return ("bad", (i.h, a.h, 0)) };
+        let ok = a.h > i.h && a.h == laid_a && b.h <= cap && b.h == laid_b;
+        (if ok { "ok" } else { "bad" }, (i.h, a.h, b.h))
+    }
+    let (drag, grew) = drag_leg();
+    let (ig, ig_ok) = textscale_instgui_leg();
+    let cap = dialog::drag_probe().map_or(0, |p| p.1);
+    serial_println!("[textscale] reseat2 drag={} grew={}->{} cap={} instgui={}", drag, grew.0, grew.1, cap, ig); let _ = grew.2;
+    (ig, drag, drag != "bad" && ig_ok)
+}
+
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+fn textscale_instgui_leg() -> (alloc::string::String, bool) {
+    use crate::video::instgui;
+    let own = !instgui::is_open();
+    if own {
+        instgui::open();
+    }
+    if !instgui::is_open() {
+        return (alloc::string::String::from("skip"), true);
+    }
+    let r = crate::video::text::textscale::step(32).map(|_| {
+        instgui::font_repaint();
+        instgui::reseat_probe()
+    });
+    let _ = crate::video::text::textscale::step(0);
+    instgui::font_repaint();
+    if own {
+        instgui::close();
+    }
+    match r {
+        Some(Some((_, h, want))) => (alloc::format!("{}/{}", h, want), h == want),
+        _ => (alloc::string::String::from("skip"), true),
+    }
+}
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), not(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))))]
+fn textscale_instgui_leg() -> (alloc::string::String, bool) {
+    (alloc::string::String::from("skip"), true)
 }
