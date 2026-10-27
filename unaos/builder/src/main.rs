@@ -2242,9 +2242,12 @@ fn main() {
                 f.set_len(64 * 1024 * 1024).unwrap();
             }
         }
+        // NVME4KN (zenbook-ledger Z31): UNAOS_NVME_4K=1 gives the namespace 4096-byte logical blocks (a 4Kn drive), the
+        // `[nvme] test ... lba=4096 shift=12` leg; unset => the 512-byte namespace, not one argument changes.
+        let nvme4k = std::env::var("UNAOS_NVME_4K").is_ok();
         cmd.arg("-drive").arg(format!("if=none,id=nvme0,format=raw,file={}", dst.display()))
-           .arg("-device").arg("nvme,drive=nvme0,serial=una");
-        println!("   UNAOS_NVME: NVMe controller (serial=una) on a fresh {} — NVMe driver target (ESP keeps bootindex=0)", dst.display());
+           .arg("-device").arg(if nvme4k { "nvme,drive=nvme0,serial=una,logical_block_size=4096,physical_block_size=4096" } else { "nvme,drive=nvme0,serial=una" });
+        println!("   UNAOS_NVME: NVMe controller (serial=una, lba={}) on a fresh {} — NVMe driver target (ESP keeps bootindex=0)", if nvme4k { 4096 } else { 512 }, dst.display());
     }
     // EHCI-3 harness: by default (EHCI-4 M1 driver on) the keyboard rides the EHCI bus (QEMU's usb-kbd is
     // HS-capable, so it trains directly on the EHCI root port — Topology B). It REPLACES the
