@@ -750,7 +750,7 @@ refs/heads/exec-rmbp-navread   8aef7df2 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-zoomcost   8aef7df2 IN-FLIGHT cut 2026-10-21
 refs/heads/exec-rmbp-textscale   3d786e5bb FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-memline2   85e3ee470 FOLDED-BY-HAND (this commit) 2026-10-26
-refs/heads/exec-rmbp-unafswrite   159f16f6 IN-FLIGHT cut 2026-10-26 (re-cut after the reset)
+refs/heads/exec-rmbp-unafswrite   2ce95dc00 FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-overlayocc   e34822272 FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-perfhud2   f4f699fb6 FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-stackguard3   6516102c8 FOLDED-BY-HAND (this commit) 2026-10-26
