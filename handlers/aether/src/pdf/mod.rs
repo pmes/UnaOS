@@ -25,7 +25,7 @@
 //!   spans of one line), the engine's own `FindState`; hits painted as glyph-bounded span sub-boxes;
 //! * the left strip: [`thumbs`] (PDF4-THUMBS SR360, PDF4-OUTLINE / PDF4-THUMBSCROLL SR374) — F4 cycles thumbnails ->
 //!   outline -> off, painted into the same frame; a wheel over it scrolls it (`pdf_wheel`); a click goes to the page;
-//! * the status line: `AetherEngine::pdf_status` ("Page p / n");
+//! * the status line: `AetherEngine::pdf_status` ("Page p / n · 100%", the zoom since PDF4-FIT-STATUS-PCT SR395);
 //! * links and form widgets: [`forms`] (PDF4ANNOTS SR343) — /URI, /GoTo and /Named links (hover: the pointer and the
 //!   status line), check boxes and text fields filled through pdf_core's `Form::set_value` + `Edit::save_update`.
 //!
@@ -627,9 +627,10 @@ impl crate::AetherEngine {
         self.pdf_dirty();
     }
 
-    /// The status line's page indicator ("Page p / n") while a PDF is open.
+    /// The status line's page indicator while a PDF is open: "Page p / n" and the zoom (PDF4-FIT-STATUS-PCT SR395:
+    /// ` · 125%`, ` · fit-w 87%` in a fit mode; `fit_token`).
     pub fn pdf_status(&self) -> Option<String> {
-        self.pdf.as_ref().map(|p| p.status(self.scroll_y, self.height as f64) + p.fit_token())
+        self.pdf.as_ref().map(|p| p.status(self.scroll_y, self.height as f64) + &p.fit_token(self.zoom_pct))
     }
 
     /// PDF4FORMSAVE (SR354): Ctrl/Cmd+S on a PDF stages a `BrowserSave` of the file as it stands (the filled form's
@@ -774,12 +775,13 @@ impl PdfDocument {
         ((z * 100.0).floor().max(0.0) as u32).clamp(lv[0], lv[lv.len() - 1])
     }
 
-    /// The status line's fit token (empty without a fit mode: the toolbar shows the percentage).
-    pub fn fit_token(&self) -> &'static str {
+    /// The status line's zoom token at `pct` (the engine's one `zoom_pct`; PDF4-FIT-STATUS-PCT SR395): ` · 125%`, or
+    /// with the fit mode named ` · fit-w 87%` / ` · fit-p 87%`. The toolbar's `BrowserNavState.zoom_pct` is unchanged.
+    pub fn fit_token(&self, pct: u32) -> String {
         match self.fit {
-            Some((Fit::Width, _)) => " \u{b7} fit-w",
-            Some((Fit::Page, _)) => " \u{b7} fit-p",
-            None => "",
+            Some((Fit::Width, _)) => format!(" \u{b7} fit-w {pct}%"),
+            Some((Fit::Page, _)) => format!(" \u{b7} fit-p {pct}%"),
+            None => format!(" \u{b7} {pct}%"),
         }
     }
 }

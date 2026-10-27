@@ -216,7 +216,12 @@ impl crate::AetherEngine {
             return self.pdf_outline_click(x * z, y * z);
         }
         let Some(i) = at(pdf, y * z, dh, z, sy) else { return };
-        let top = pdf.page_rect(i, vw).1;
+        // PDF4-STRIPKEYS-CLICKFOCUS (SR395): the clicked thumbnail takes the strip's keyboard focus (the field's goes).
+        if let Some(pdf) = self.pdf.as_mut() {
+            pdf.strip_focus = Some(i);
+            pdf.blur();
+        }
+        let top = self.pdf.as_ref().map_or(0.0, |p| p.page_rect(i, vw).1);
         self.handle_event(crate::api::events::Event::Scroll(0.0, top - self.scroll_y));
         self.pdf_dirty();
     }
@@ -391,6 +396,9 @@ impl crate::AetherEngine {
         let (z, dh, sy) = (self.zoom(), self.device.1 as f64, self.scroll_y);
         let Some(pdf) = self.pdf.as_mut() else { return };
         let Some((i, on_toggle)) = outline_at(pdf, (x, y), dh, z, sy) else { return };
+        // PDF4-STRIPKEYS-CLICKFOCUS (SR395): the clicked row (its toggle, a refused row too) takes the strip's focus.
+        pdf.strip_focus = Some(i);
+        pdf.blur();
         if on_toggle {
             if let Some(o) = pdf.outline_open.get_mut(i) {
                 *o = !*o;
