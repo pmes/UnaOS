@@ -257,10 +257,10 @@ fn ssid_view(b: &[u8]) -> alloc::string::String {
 pub fn wifijoin() {
     use crate::drivers::mt7925 as mt;
     use wifi_core::ieee80211 as w;
-    let kat = mt::join_kat() && super::assoc::kat().2.is_none();
+    let s9w = mt::watch_kat(super::assoc::refusal); let kat = mt::join_kat() && super::assoc::kat().2.is_none() && s9w; // S9WATCH (zenbook-ledger Z56): the S9 link watch's rows with the station's own judge (LINE-NEUTRAL)
     let k = if kat { "ok" } else { "FAIL" };
     if !mt::registered() {
-        serial_println!(":: wifijoin: kat={} radio=absent -> {} ::", k, if kat { "PASS" } else { "FAIL" });
+        serial_println!(":: wifijoin: kat={} s9watch={} radio=absent -> {} ::", k, if s9w { "ok" } else { "FAIL" }, if kat { "PASS" } else { "FAIL" }); // S9WATCH (Z56): s9watch=
         return;
     }
     let ssid = crate::tests::arg().unwrap_or_default();
@@ -293,7 +293,7 @@ pub fn wifijoin() {
     let mt_ = |m: [u8; 6]| alloc::format!("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
     let (mut auth, mut assoc): (Option<w::AuthResult>, Option<w::AssocResult>) = (None, None);
     let mut refused: Option<(u8, &'static str, u16)> = None;
-    let plan = mt::JoinPlan { ssid: &ssid_view(sb), bssid, channel: ch };
+    let plan = mt::JoinPlan { ssid: &ssid_view(sb), bssid, channel: ch, watch: super::assoc::refusal }; // S9WATCH (zenbook-ledger Z56): the station's refusal judge kept by the S9 link
     let rep = mt::join(
         &plan,
         &mut |phase: u8| if phase == 0 { w::build_auth_open(me, bssid, 0) } else { w::build_assoc_req(me, bssid, sb, 0, cap) },
@@ -355,8 +355,8 @@ pub fn wifijoin() {
         );
     }
     serial_println!(
-        ":: wifijoin: kat={} radio=mt7925 ssid={} auth={} assoc={} -> {} ::",
-        k, plan.ssid, if authed { "ok" } else { "no" }, aid.map_or(alloc::string::String::from("-"), |a| alloc::format!("aid={}", a)),
+        ":: wifijoin: kat={} s9watch={} radio=mt7925 ssid={} auth={} assoc={} -> {} ::", // S9WATCH (Z56): s9watch=
+        k, if s9w { "ok" } else { "FAIL" }, plan.ssid, if authed { "ok" } else { "no" }, aid.map_or(alloc::string::String::from("-"), |a| alloc::format!("aid={}", a)),
         if kat && aid.is_some() { "PASS" } else { "FAIL" }
     );
     if aid.is_some() {
