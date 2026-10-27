@@ -139,6 +139,10 @@ impl Parsed {
     pub fn height(&self) -> u32 {
         self.h.height as u32
     }
+    /// KERNEL-ANIM-ICC (B974): the embedded profile (iCCP inflated; None under a cICP), for `crate::Animation::icc`.
+    pub(crate) fn icc(&self) -> Option<&[u8]> {
+        self.icc.as_deref()
+    }
 }
 
 /// Walk the chunks: everything [`decode`] needs, nothing inflated.
@@ -691,11 +695,18 @@ fn icc_chunk(icc: &mut Option<Vec<u8>>, cicp: &mut bool, kind: &[u8], data: &[u8
     if icc.is_some() {
         return;
     }
-    let Some(nul) = data.iter().take(80).position(|&b| b == 0) else { return };
+    *icc = iccp_profile(data);
+}
+
+/// KERNEL-PNG-ICC (rmbp-ledger B974): the profile an `iCCP` chunk's DATA carries — profile name (at most 79 bytes),
+/// NUL, compression method 0, a zlib stream inflated through the one inflater under `ICCP_MAX` — or None (a broken
+/// chunk is dropped). `icc_chunk`'s rule, public so the kernel's streaming PNG path reads iCCP by the same rule.
+pub fn iccp_profile(data: &[u8]) -> Option<Vec<u8>> {
+    let nul = data.iter().take(80).position(|&b| b == 0)?;
     if data.get(nul + 1) != Some(&0) {
-        return;
+        return None;
     }
-    *icc = crate::zlib_decompress(&data[nul + 2..], ICCP_MAX).ok();
+    crate::zlib_decompress(&data[nul + 2..], ICCP_MAX).ok()
 }
 
 /// The inflated iCCP cap: 1 MiB, not [`crate::ICC_MAX`], since `zlib_decompress` reserves its whole cap up front (an
