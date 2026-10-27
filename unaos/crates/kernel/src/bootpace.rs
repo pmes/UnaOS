@@ -154,7 +154,7 @@ const ENUM_DONE_TAGS: [&str; 17] = [
 /// the serial/FTDI wire and the post-boot log, and a per-phase panel line during enumeration would
 /// perturb the very boot it is measuring.
 pub fn record(tag: &'static str) {
-    let c = crate::arch::now_cycles();
+    let c = crate::arch::now_cycles(); #[cfg(target_arch = "x86_64")] { crate::drivers::xhci::ftdi::console_watch::stamped(tag); }
     let mut r = RING.lock();
     let n = r.len;
     if n == CAP {

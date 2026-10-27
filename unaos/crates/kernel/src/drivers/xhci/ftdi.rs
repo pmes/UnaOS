@@ -850,3 +850,253 @@ pub mod ftdirx {
 pub fn lockowner_release() {
     unsafe { RING.force_unlock() };
 }
+
+// ── CONSOLEPICK (rmbp-ledger B1014) — the console's own absence, said on every OTHER channel ─────────────────
+//
+// Flight 38 boot 2 (the Ethernet dongle plugged at power-on) put NOTHING on the wire and took no input at the unlock
+// form. On the rMBP this cable is the only wire: every line before `ftdi-up` lives only in `RING` above and reaches a
+// second host only through `drain_into`'s replay — so a boot that never brings the console up says nothing at all,
+// not even that it is silent. This watch is armed at the `pci-usb` stamp (`bootpace::record`'s line-neutral fold),
+// looks every 250 ms, and when the console is not live `BUDGET_MS` after it says ONE line naming why: on the wire's
+// own path (`serial_println!` -> `mirror` -> `RING`, so a late `ftdi-up` REPLAYS it — the ring is never dropped), in
+// the GUI-WITNESS ring (`bootlog::record`), in the BPACE ledger (`ftdi-late`, beside a later `ftdi-up`), and — only
+// when it is a FAULT (the FT232 holds a slot, the pump is not alive, the enumeration is not idle, or the controller
+// could not be read) — on the glass through the splash's lock-free OVER line (`splash::over_label`, SPLASHSTALL B510).
+// A machine with no cable on a live, idle bus (every user's machine) gets nothing on the glass.
+//
+// ⚠ TAIL MODULE ON PURPOSE (LINE-NEUTRAL): nothing below it shifts, so no panic `Location` above moves.
+/// CHARTER: driver seam (CODEX §2 Comscan) — the x86 FTDI console's absence witness: one watch armed at `pci-usb`, one line at the budget.
+#[cfg(target_arch = "x86_64")]
+pub mod console_watch {
+    use core::fmt::{self, Write};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::{AcqRel, Acquire, Release}};
+
+    /// The budget from `pci-usb` (xHCI init returned): flight 38 boot 1's `ftdi-up` at 6535 ms, plus margin.
+    pub const BUDGET_MS: u64 = 15_000;
+    /// The watch's cadence (bootwatch's shape).
+    const LOOK_MS: u64 = 250;
+    /// The fixture's bound on waiting for the watch to finish.
+    const FIXTURE_WAIT_MS: u64 = 20_000;
+
+    static SPAWNED: AtomicBool = AtomicBool::new(false);
+    static T0_MS: AtomicU64 = AtomicU64::new(0);
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    static GLASS: AtomicBool = AtomicBool::new(false);
+
+    /// One read of the controller, copied out under its loan and printed after the loan is back.
+    #[derive(Clone, Copy)]
+    struct Snap {
+        read: bool,
+        slots: u32,
+        seen: bool,
+        at_slot: u8,
+        ftdi_slot: u8,
+        enum_port: u8,
+        enum_stage: &'static str,
+        queued: u32,
+    }
+
+    /// `claim_at` is O(1) and never waits: a `Busy`/`NotReady` controller is `read=false`, printed `?`.
+    fn snap() -> Snap {
+        let mut s = Snap { read: false, slots: 0, seen: false, at_slot: 0, ftdi_slot: 0, enum_port: 0, enum_stage: "", queued: 0 };
+        if let Ok(loan) = crate::drivers::xhci::claim_at(crate::drivers::xhci::ftdi_ctrl()) {
+            let x = &*loan;
+            s.read = true;
+            for (i, d) in x.slots.iter().enumerate() {
+                if i == 0 || !d.active {
+                    continue;
+                }
+                s.slots += 1;
+                if !s.seen && d.vid == super::FTDI_VID && d.pid == super::FTDI_PID {
+                    s.seen = true;
+                    s.at_slot = i as u8;
+                }
+            }
+            s.ftdi_slot = x.ftdi_slot;
+            s.enum_port = if x.enum_active { x.enumerating_port } else { 0 };
+            s.enum_stage = x.enum_stage;
+            s.queued = x.ports_to_enumerate.len() as u32;
+        }
+        s
+    }
+
+    fn enum_idle(s: &Snap) -> bool {
+        s.read && s.enum_port == 0 && s.queued == 0
+    }
+
+    /// `pump=`: PUMPWEDGE's own stamp (`sessionwedge::pump_age_ms`), dead at its own bound (`WEDGE_MS`); `?` without `wc`.
+    fn pump() -> (&'static str, Option<u64>) {
+        #[cfg(feature = "wc")]
+        {
+            match crate::sessionwedge::pump_age_ms() {
+                None => ("never", None),
+                Some(a) if a >= crate::sessionwedge::WEDGE_MS => ("dead", Some(a)),
+                Some(a) => ("alive", Some(a)),
+            }
+        }
+        #[cfg(not(feature = "wc"))]
+        {
+            ("?", None)
+        }
+    }
+
+    /// `ftdi-up` in ms from the BPACE origin, through the ledger's own accessors (never a second clock).
+    fn up_ms() -> Option<u64> {
+        let c = crate::bootpace::cycles_of("ftdi-up")?;
+        let hz = crate::bootpace::origin_hz();
+        if hz < 1000 {
+            return None;
+        }
+        Some(c.wrapping_sub(crate::bootpace::origin_cycles()) / (hz / 1000))
+    }
+
+    /// A number, or the word that stands for its absence.
+    struct Num(Option<u64>, &'static str);
+    impl fmt::Display for Num {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self.0 {
+                Some(v) => write!(f, "{}", v),
+                None => f.write_str(self.1),
+            }
+        }
+    }
+
+    /// `enum=`: `idle`, `p<port>:<stage>[+<queued>]`, `queued<n>`, or `?` (the controller unreadable).
+    struct EnumWord(Snap);
+    impl fmt::Display for EnumWord {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let s = &self.0;
+            if !s.read {
+                f.write_str("?")
+            } else if s.enum_port != 0 {
+                write!(f, "p{}:{}", s.enum_port, s.enum_stage)?;
+                if s.queued > 0 { write!(f, "+{}", s.queued) } else { Ok(()) }
+            } else if s.queued > 0 {
+                write!(f, "queued{}", s.queued)
+            } else {
+                f.write_str("idle")
+            }
+        }
+    }
+
+    fn seen_word(s: &Snap) -> &'static str {
+        if !s.read { "?" } else if s.seen { "y" } else { "n" }
+    }
+
+    /// A bounded, allocation-free line (bootstep's `PanelLine` shape): what does not fit is dropped.
+    struct Line {
+        b: [u8; 224],
+        n: usize,
+    }
+    impl Line {
+        const fn new() -> Self {
+            Line { b: [0; 224], n: 0 }
+        }
+        fn as_str(&self) -> &str {
+            core::str::from_utf8(&self.b[..self.n]).unwrap_or("[console] ftdi not up")
+        }
+    }
+    impl Write for Line {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            let take = core::cmp::min(self.b.len() - self.n, s.len());
+            self.b[self.n..self.n + take].copy_from_slice(&s.as_bytes()[..take]);
+            self.n += take;
+            Ok(())
+        }
+    }
+
+    /// `bootpace::record`'s fold, every stamp: the `pci-usb` stamp (kernel_main, BSP, after `sched`) spawns the watch ONCE.
+    pub fn stamped(tag: &str) {
+        if tag != "pci-usb" || SPAWNED.swap(true, AcqRel) {
+            return;
+        }
+        T0_MS.store(crate::arch::ms().max(1), Release);
+        let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+        let cpu = crate::arch::sched::sibling_online_cpu(me);
+        crate::arch::sched::spawn("console-watch", watch_task, 0, cpu, crate::arch::sched::PRIO_HIGH);
+    }
+
+    fn watch_task(_arg: usize) {
+        loop {
+            crate::arch::sched::sleep_ms(LOOK_MS);
+            if super::is_live() {
+                break;
+            }
+            let el = crate::arch::ms().saturating_sub(T0_MS.load(Acquire));
+            if el >= BUDGET_MS {
+                fire(el);
+                break;
+            }
+        }
+        DONE.store(true, Release);
+    }
+
+    /// The ONE line, on every channel; the glass only on a fault.
+    fn fire(el: u64) {
+        let s = snap();
+        let (pw, age) = pump();
+        let mut ln = Line::new();
+        let _ = write!(
+            ln,
+            "[console] ftdi not up after {} ms: slots={} ftdi_seen={} at_slot={} enum={} pump={} pump_age_ms={}",
+            el,
+            Num(if s.read { Some(s.slots as u64) } else { None }, "?"),
+            seen_word(&s),
+            s.at_slot,
+            EnumWord(s),
+            pw,
+            Num(age, "-")
+        );
+        let fault = !s.read || s.seen || pw != "alive" || !enum_idle(&s);
+        GLASS.store(fault, Release);
+        FIRED.store(true, Release);
+        serial_println!("{}", ln.as_str());
+        crate::bootlog::record("console:ftdi-not-up");
+        crate::bootpace::record("ftdi-late");
+        if fault {
+            crate::splash::over_label(ln.as_str());
+        }
+    }
+
+    /// `tests consolepick`: `:: CONSOLEPICK: ftdi_slot=<k> of <n> up_ms=<n|none> fallback=<0|1> -> PASS|FAIL :: reason= seen= enum= pump=`.
+    /// PASS `ok` (live, no fallback) / `no-cable` (not live, the fallback said so, no FT232 on the bus, nothing on the
+    /// glass); FAIL `late` (live after the fallback) / `seen-not-up` (the FT232 holds a slot, never up) / `no-cable`
+    /// (no FT232 seen, but the fallback was a fault: its enum= / pump= name it) / `silent` (neither up nor announced).
+    pub fn fixture() {
+        let t = crate::arch::ms();
+        while !DONE.load(Acquire) && crate::arch::ms().saturating_sub(t) < FIXTURE_WAIT_MS {
+            crate::arch::sched::sleep_ms(100);
+        }
+        let mut s = snap();
+        let mut tries = 0u32;
+        while !s.read && tries < 50 {
+            crate::arch::sched::sleep_ms(10);
+            s = snap();
+            tries += 1;
+        }
+        let live = super::is_live();
+        let fired = FIRED.load(Acquire);
+        let glass = GLASS.load(Acquire);
+        let (pass, reason) = match (live, fired) {
+            (true, false) => (true, "ok"),
+            (true, true) => (false, "late"),
+            (false, true) if s.seen => (false, "seen-not-up"),
+            (false, true) => (s.read && !glass, "no-cable"),
+            (false, false) => (false, "silent"),
+        };
+        let (pw, _) = pump();
+        serial_println!(
+            ":: CONSOLEPICK: ftdi_slot={} of {} up_ms={} fallback={} -> {} :: reason={} seen={} enum={} pump={}",
+            s.ftdi_slot,
+            Num(if s.read { Some(s.slots as u64) } else { None }, "?"),
+            Num(up_ms(), "none"),
+            fired as u8,
+            if pass { "PASS" } else { "FAIL" },
+            reason,
+            seen_word(&s),
+            EnumWord(s),
+            pw
+        );
+    }
+}
