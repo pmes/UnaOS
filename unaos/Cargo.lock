@@ -556,6 +556,7 @@ dependencies = [
  "font8x8",
  "font_core",
  "geode_core",
+ "h264_core",
  "h264enc_core",
  "holocron_core",
  "icc_core",
