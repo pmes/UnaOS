@@ -4,7 +4,7 @@
 use async_channel::Sender;
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box, Button, CheckButton, Entry, EventControllerKey, Expander, FileDialog,
+    Align, Box, Button, CheckButton, Entry, EventControllerKey, Expander,
     Label, Orientation,
     PolicyType, Popover, PropagationPhase, ScrolledWindow, Stack,
     StackSwitcher, StackTransitionType, ToggleButton, Overlay,
@@ -237,18 +237,15 @@ fn setup_input_area(tx_event: &Sender<Event>, window: &NativeWindow, active_targ
         let parent_window = window_clone.clone();
         let target = target_file.clone();
         glib::MainContext::default().spawn_local(async move {
-            let dialog = FileDialog::new();
-            let result = dialog.open_future(Some(&parent_window)).await;
-            if let Ok(file) = result {
-                if let Some(path) = file.path() {
-                    let path_str = path.to_string_lossy().to_string();
-                    let _ = tx
-                        .send(Event::Input {
-                            target: target.borrow().clone(),
-                            text: format!("/upload {}", path_str),
-                        })
-                        .await;
-                }
+            // OPEN-DIALOG-ONE (SR386): the faces' one open dialog, not a private FileDialog.
+            if let Some(path) = crate::platforms::gtk::open_dialog::choose(Some(parent_window.upcast_ref()), &[]).await {
+                let path_str = path.to_string_lossy().to_string();
+                let _ = tx
+                    .send(Event::Input {
+                        target: target.borrow().clone(),
+                        text: format!("/upload {}", path_str),
+                    })
+                    .await;
             }
         });
     });

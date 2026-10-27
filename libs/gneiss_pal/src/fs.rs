@@ -5,7 +5,11 @@
 //! over `to`, so a half-written file never carries the real name. Every save lands through it: Aether's downloads and
 //! its Save / Save As (`chrome::host`), and Facet's `export`. Ungated (std::fs only), so Facet's
 //! `default-features = false` links it without the network face. Naming policy (a unique `(n)` name in a folder) is
-//! the caller's: this module writes where it is told.
+//! the caller's: this module writes where it is told. WRITEONE (SR386): Aether's bookmarks (`save_bytes`), its media cache
+//! (streamed and resumed: `part` + `land`) and the HTTP cache's disk tier (`api::http`) write through it too. Two writers
+//! stay their own by design: Principia's prefs (`<domain>.new` is the kernel's swap name, read back and parsed before the
+//! rename) and Holocron's store (a hidden `.<name>.tmp` no secret's name can be, `0600` `create_new`, file and folder
+//! fsync); neither crate links gneiss_pal.
 
 use std::io;
 use std::path::{Path, PathBuf};

@@ -1559,6 +1559,8 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserSaveAs { .. } => "BrowserSaveAs", // SAVEDIALOG (SR364): Save As, and the face's panel ask / answer
         SMessage::SavePanel { .. } => "SavePanel",
         SMessage::SavePanelChose { .. } => "SavePanelChose",
+        SMessage::OpenPanel { .. } => "OpenPanel", // OPEN-DIALOG-ONE (SR386): the face's open panel ask / answer
+        SMessage::OpenPanelChose { .. } => "OpenPanelChose",
     }
 }
 
@@ -1789,4 +1791,21 @@ kat!(
     kat_save_panel_cancelled,
     SMessage::SavePanelChose { url: "viewport".to_string(), path: None },
     r#"{"SavePanelChose":{"url":"viewport","path":null}}"#
+);
+
+// OPEN-DIALOG-ONE (SR386): the owner asks the face for a file to open; the face answers it, or null (cancelled).
+kat!(
+    kat_open_panel,
+    SMessage::OpenPanel { url: "viewport".to_string(), filters: vec!["pdf".to_string()] },
+    r#"{"OpenPanel":{"url":"viewport","filters":["pdf"]}}"#
+);
+kat!(
+    kat_open_panel_chose,
+    SMessage::OpenPanelChose { url: "viewport".to_string(), path: Some("/home/una/doc.pdf".to_string()) },
+    r#"{"OpenPanelChose":{"url":"viewport","path":"/home/una/doc.pdf"}}"#
+);
+kat!(
+    kat_open_panel_cancelled,
+    SMessage::OpenPanelChose { url: "viewport".to_string(), path: None },
+    r#"{"OpenPanelChose":{"url":"viewport","path":null}}"#
 );

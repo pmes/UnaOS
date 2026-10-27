@@ -255,7 +255,7 @@ impl HttpCache {
 }
 
 /// The disk tier: `<dir>/<fnv64(key)>.uhc`, each file an [`Entry::encode`] (whose key is checked on load),
-/// written to a temp name and renamed; the index (size, last use) is rebuilt from the directory at open, and
+/// written to `<name>.part` and renamed through [`crate::fs::save_bytes`] (WRITEONE, SR386); the index (size, last use) is rebuilt from the directory at open, and
 /// the least recently used files go when the total passes the bound (down to 90% of it).
 struct DiskCache {
     dir: PathBuf,
@@ -291,7 +291,8 @@ impl DiskCache {
             for ent in rd.flatten() {
                 let name = ent.file_name().to_string_lossy().into_owned();
                 let Ok(meta) = ent.metadata() else { continue };
-                if name.ends_with(".tmp") {
+                // WRITEONE (SR386): a crash's `.part` (crate::fs), and an older build's `.tmp`, are swept.
+                if name.ends_with(".part") || name.ends_with(".tmp") {
                     let _ = std::fs::remove_file(ent.path());
                     continue;
                 }
@@ -343,10 +344,8 @@ impl DiskCache {
             return;
         }
         let path = self.dir.join(&name);
-        let tmp = self.dir.join(format!("{name}.tmp"));
-        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return;
+        if crate::fs::save_bytes(&path, &bytes).is_err() {
+            return; // WRITEONE (SR386): the ONE writer removed its `.part`
         }
         let Ok(mut i) = self.index.lock() else { return };
         let t = i.tick();
@@ -2563,6 +2562,29 @@ mod cache_tests {
         }
         let total = small.index.lock().unwrap().total;
         assert!(total <= 4096, "disk tier over its bound: {total}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WRITEONE (SR386): the disk tier writes through `crate::fs` (`<name>.part`, then rename) and its open sweeps a
+    /// crash's `.part` and an older build's `.tmp`; a put leaves no `.part` behind.
+    #[test]
+    fn writeone_disk_tier_sweeps_part() {
+        let dir = std::env::temp_dir().join(format!("gneiss-http-writeone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("00000000000000aa.uhc.part"), b"half").unwrap();
+        std::fs::write(dir.join("00000000000000bb.uhc.tmp"), b"legacy").unwrap();
+        let disk = DiskCache::open(dir.clone(), 1 << 20);
+        assert!(!dir.join("00000000000000aa.uhc.part").exists(), "a crash's .part is swept");
+        assert!(!dir.join("00000000000000bb.uhc.tmp").exists(), "an older build's .tmp is swept");
+        assert_eq!(disk.index.lock().unwrap().total, 0);
+        let url = Url::parse("https://a.example/one").unwrap();
+        let mut e = Entry::new(hcache::cache_key("p", &url), &url, &Headers::new(), 200, "OK", &Headers::new(), 0, 0);
+        e.body = vec![9u8; 100];
+        disk.put(&e);
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|d| d.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, [file_name(&e.key)], "one entry, no .part left behind");
+        assert!(disk.get(&e.key).is_some(), "the landed entry reads back");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
