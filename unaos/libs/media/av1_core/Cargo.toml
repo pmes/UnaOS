@@ -9,7 +9,10 @@ description = "AVCODEC (SR24): a from-spec AV1 decoder (intra / AVIF first) and 
 # written from the AV1 Bitstream & Decoding Process Specification v1.0.0 with Errata 1. The default
 # CDFs, scans, quantizer tables and filter taps are generated from the spec's own Markdown sources by
 # tools/gen_tables.py into src/tables.rs (one file, never hand-edited).
+# AV1COLOURONE (ledger SR340): the ONE exception is yuv_core, Stria's shared integer YCbCr->RGB kernel (no_std, no alloc,
+# zero deps), which `image::planes_to_rgba_with` converts with — the kernel gneiss_pal's Player uses, never a second copy.
 [dependencies]
+yuv_core = { path = "../yuv_core" }
 
 [features]
 default = []

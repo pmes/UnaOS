@@ -13,6 +13,9 @@ dependencies = [
 [[package]]
 name = "av1_core"
 version = "0.1.0"
+dependencies = [
+ "yuv_core",
+]
 
 [[package]]
 name = "crypto_core"
@@ -64,4 +67,8 @@ version = "0.1.0"
 
 [[package]]
 name = "vp9_core"
+version = "0.1.0"
+
+[[package]]
+name = "yuv_core"
 version = "0.1.0"
