@@ -8040,7 +8040,7 @@ pub fn rehome_dead_core(dead: usize, live: usize) -> Rehomed {
         if let Some((old, new)) = singleton_restart(dead, live) {
             r.current = Some(old);
             r.moved_current = true;
-            r.restarted = Some(new);
+            r.restarted = Some(new); if cur == old { singleton_dead_note(dead, old); } // PUMPPARK (B839) M3: only an instance CURRENT on the core the steal declared dead is noted; a parked one (a wait queue may post it) is a revenant. LINE-NEUTRAL fold, code first
         }
     }
     serial_println!(
@@ -8368,7 +8368,7 @@ pub fn singleton_superseded() -> bool {
     let now = crate::arch::ms().max(1);
     SGL_LAST_MS.store(now, Ordering::Relaxed);
     SGL_LAST_CPU.store(meter_current_cpu(), Ordering::Relaxed);
-    SGL_STAMPS.fetch_add(1, Ordering::Relaxed);
+    SGL_STAMPS.fetch_add(1, Ordering::Relaxed); singleton_dead_check(now); // PUMPPARK (B839) M3: the fresh instance confirms a noted dead instance (one load when none). LINE-NEUTRAL fold, code first
     if SGL_FRESH_MS.load(Ordering::Relaxed) == 0 && SGL_RESTARTS.load(Ordering::Relaxed) != 0 {
         let _ = SGL_FRESH_MS.compare_exchange(0, now, Ordering::AcqRel, Ordering::Relaxed);
     }
@@ -8417,15 +8417,17 @@ pub fn singleton_restart(from: usize, live: usize) -> Option<(u64, u64)> {
 const STEP_PARK_DEATHS: u32 = 3;
 const STEP_PARK_WINDOW_MS: u64 = 30_000;
 const STEP_PARK_MS: u64 = 10_000;
-/// Bit `step` set = an owner honours a park of that pump step.
-static SGL_PARKABLE: AtomicU32 = AtomicU32::new(0);
+/// PUMPPARK (B839): the steps that never park — xhci (the xHCI input poll and the storage loan), ehci-hid (the internal
+/// keyboard and trackpad), typematic-smc (key repeat, and `render_rehome_service`: the dead-core re-home itself).
+const STEP_NEVER_PARK: u32 = (1u32 << crate::video::lag::P_XHCI) | (1u32 << crate::video::lag::P_HID) | (1u32 << crate::video::lag::P_TYPEMATIC);
+/// Bit `step` set = the pump loop honours a park of that step (PUMPPARK B839: every step but the never-park set).
+static SGL_PARKABLE: AtomicU32 = AtomicU32::new(!STEP_NEVER_PARK & !1);
 static SGL_DEATH_STEP: AtomicU8 = AtomicU8::new(0);
 static SGL_DEATH_RUN: AtomicU32 = AtomicU32::new(0);
 static SGL_DEATH_T0: AtomicU64 = AtomicU64::new(0);
-/// The parked step (0 = none) and the ms its owner may probe it again.
-static SGL_PARK_STEP: AtomicU8 = AtomicU8::new(0);
-static SGL_PARK_UNTIL: AtomicU64 = AtomicU64::new(0);
-static SGL_PARK_AT: AtomicU64 = AtomicU64::new(0);
+/// PUMPPARK (B839): per step, the ms its probe may run again (0 = not parked) and the ms the park began.
+static SGL_PARK_UNTIL: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+static SGL_PARK_AT: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
 
 /// HDARING — count a death in `step` (0 = no step known); park it at the bound.
 fn singleton_death_step(step: u8, now: u64) {
@@ -8438,10 +8440,8 @@ fn singleton_death_step(step: u8, now: u64) {
         SGL_DEATH_RUN.store(1, Ordering::Release);
         1
     };
-    if run >= STEP_PARK_DEATHS && step < 32 && SGL_PARKABLE.load(Ordering::Acquire) & (1 << step) != 0 && SGL_PARK_STEP.load(Ordering::Acquire) != step {
-        SGL_PARK_UNTIL.store(now + STEP_PARK_MS, Ordering::Release);
-        SGL_PARK_AT.store(now.max(1), Ordering::Relaxed);
-        SGL_PARK_STEP.store(step, Ordering::Release);
+    if run >= STEP_PARK_DEATHS && step < 32 && SGL_PARKABLE.load(Ordering::Acquire) & (1 << step) != 0 && SGL_PARK_UNTIL[step as usize].load(Ordering::Acquire) == 0 {
+        step_park(step, now, STEP_PARK_MS);
         serial_println!(
             "[pump] step={} parked deaths={} until={} (HDARING B811: {} deaths in {} within {} ms — the step is off the pump until its owner's probe answers)",
             crate::video::lag::qs_step_name(step), run, now + STEP_PARK_MS, run, crate::video::lag::qs_step_name(step), STEP_PARK_WINDOW_MS
@@ -8452,38 +8452,52 @@ fn singleton_death_step(step: u8, now: u64) {
 /// HDARING — the owner of pump step `step` honours a park of it (call once).
 pub fn singleton_step_parkable(step: u8) {
     if step < 32 {
-        SGL_PARKABLE.fetch_or(1 << step, Ordering::AcqRel);
+        SGL_PARKABLE.fetch_or((1u32 << step) & !STEP_NEVER_PARK, Ordering::AcqRel);
     }
 }
 
 /// HDARING — `Some(until_ms)` while `step` is parked.
 pub fn singleton_step_parked(step: u8) -> Option<u64> {
-    if step == 0 || SGL_PARK_STEP.load(Ordering::Acquire) != step {
+    if step == 0 || step >= 32 {
         return None;
     }
-    Some(SGL_PARK_UNTIL.load(Ordering::Acquire))
+    match SGL_PARK_UNTIL[step as usize].load(Ordering::Acquire) {
+        0 => None,
+        until => Some(until),
+    }
 }
 
-/// HDARING — the owner's probe answered: the step runs again, its death count starts over.
+/// HDARING — the step's probe answered: the step runs again, its death count starts over.
 pub fn singleton_step_unpark(step: u8) {
-    if SGL_PARK_STEP.compare_exchange(step, 0, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    step_unpark(step, "answered");
+}
+
+/// PUMPPARK (B839) — unpark `step` (`why` = answered | timer | fixture); one line, the death count starts over.
+fn step_unpark(step: u8, why: &str) {
+    if step == 0 || step >= 32 {
+        return;
+    }
+    let until = SGL_PARK_UNTIL[step as usize].load(Ordering::Acquire);
+    if until == 0 || SGL_PARK_UNTIL[step as usize].compare_exchange(until, 0, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return;
     }
     SGL_DEATH_RUN.store(0, Ordering::Release);
     SGL_DEATH_STEP.store(0, Ordering::Relaxed);
     serial_println!(
-        "[pump] step={} unparked probe=answered parked_ms={} (HDARING B811)",
+        "[pump] step={} unparked probe={} parked_ms={} skipped={} (HDARING B811, PUMPPARK B839)",
         crate::video::lag::qs_step_name(step),
-        crate::arch::ms().saturating_sub(SGL_PARK_AT.load(Ordering::Relaxed))
+        why,
+        crate::arch::ms().saturating_sub(SGL_PARK_AT[step as usize].load(Ordering::Relaxed)),
+        SGL_SKIPS[step as usize].load(Ordering::Relaxed)
     );
 }
 
 /// HDARING — the owner's probe was silent: parked another STEP_PARK_MS.
 pub fn singleton_step_repark(step: u8, now: u64) {
-    if SGL_PARK_STEP.load(Ordering::Acquire) != step {
+    if singleton_step_parked(step).is_none() {
         return;
     }
-    SGL_PARK_UNTIL.store(now + STEP_PARK_MS, Ordering::Release);
+    SGL_PARK_UNTIL[step as usize].store(now + STEP_PARK_MS, Ordering::Release); SGL_SKIP_SAID.fetch_and(!(1u32 << step), Ordering::AcqRel); // PUMPPARK (B839): the re-park's first skip is said again
     serial_println!(
         "[pump] step={} parked deaths={} until={} probe=silent (HDARING B811)",
         crate::video::lag::qs_step_name(step),
@@ -8571,7 +8585,7 @@ fn gatesteal2_selftest() {
         return;
     }
     HOLD2_SEM.init();
-    let restarts0 = SGL_RESTARTS.load(Ordering::Acquire);
+    let restarts0 = SGL_RESTARTS.load(Ordering::Acquire); let rd0 = SGL_DEAD_RELEASED.load(Ordering::Acquire); // PUMPPARK (B839): no dead release may fire across the revenant legs. LINE-NEUTRAL fold, code first
     let rev0 = SGL_REVENANTS.load(Ordering::Acquire);
     HOLD2_STATE.store(0, Ordering::Release);
     HOLD2_ARMED.store(true, Ordering::Release);
@@ -8634,10 +8648,10 @@ fn gatesteal2_selftest() {
     #[cfg(not(feature = "hda"))]
     let hdaring = (None::<bool>, alloc::string::String::from("hdaring=skip(not-built) reattach=skip drained=0 parked=0"));
     crate::sessionwedge::gatesteal2_wedge_leg(false);
-    let steps = crate::video::wm::pump_gate_released_steps();
-    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1 && wedge_ok && revenant2 && hdaring.0 != Some(false);
+    let steps = crate::video::wm::pump_gate_released_steps(); let park = pumppark_leg(rd0); // PUMPPARK (B839) LEG 4: a parked step skipped twice, then unparked on its timer. LINE-NEUTRAL fold, code first
+    let ok = moved_current && live_ok && alive_ms <= 500 && door && revenant && steps >= 1 && wedge_ok && revenant2 && hdaring.0 != Some(false) && park.0;
     serial_println!(
-        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} revenant={} wedge_rehome={} wedge_current={} wedge_from=c{} wedge_live=c{} wedge_restart_ms={} wedge_revenant={} deaths={} {}",
+        ":: GATESTEAL2: death=c{} current={} moved_current={} rehome={} pump_alive_ms={} gate_released_steps={} -> {} :: new_tid={} live=c{} was=parked door={} revenant={} wedge_rehome={} wedge_current={} wedge_from=c{} wedge_live=c{} wedge_restart_ms={} wedge_revenant={} deaths={} {} parked_steps={} released_dead={} {}",
         dead,
         old,
         moved_current as u8,
@@ -8656,7 +8670,7 @@ fn gatesteal2_selftest() {
         wedge_ms,
         if revenant2 { "exited" } else { "stuck" },
         deaths,
-        hdaring.1
+        hdaring.1, SGL_PARKS.load(Ordering::Relaxed), SGL_DEAD_RELEASED.load(Ordering::Relaxed), park.1
     );
 }
 
@@ -9067,4 +9081,170 @@ pub mod tickless {
     pub fn arm_err_us() -> (u64, u64) {
         (ERR_LATE_US.load(Relaxed), ERR_EARLY_US.load(Relaxed))
     }
+}
+
+// ── PUMPPARK (rmbp-ledger B839) — the pump loop parks ANY broken step; a truly dead instance's locks go back ─────────
+// HDARING (B811) parked a step that kept killing the singleton, but only net-hda's HDA half honoured it. Now the pump
+// loop (main.rs `usb_pump`) asks [`singleton_step_go`] before every parkable step (each step's statements sit inside
+// `if singleton_step_go(P_X) { … }`, closed before the step's `pump_seg` mark, so the lag order still advances); the
+// park table is per step (`SGL_PARK_UNTIL`), so two parked steps never un-park each other; every step is parkable but
+// `STEP_NEVER_PARK` (the input pumps and the re-home carrier). At a park's `until` the step's OWN probe
+// ([`singleton_step_probe`]; HDA's VENDOR_ID verb first) decides: answered -> unparked, silent -> parked again; a step
+// with no probe unparks on the timer. M3: a superseded instance that was CURRENT on the core the steal declared dead
+// ([`rehome_dead_core`]) is noted; the fresh instance, >= DEAD_CONFIRM_MS later, releases its locks POISONED through
+// `sync::release_task(tid, "pump-dead")` ONLY IF that core still publishes the tid as current and its tick count has
+// not moved (no timer IRQ: halted, or masked for good). A parked instance and the wedge path never release (BP-cores-11:
+// a superseded instance is a revenant that may run). Blueprint: cores.md BP-cores-21, BP-cores-14.
+
+/// PUMPPARK — per step, the skips the pump loop made while it was parked (`tests gatesteal2` LEG 4 reads them).
+static SGL_SKIPS: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
+/// PUMPPARK — bit `step` set = this park's first skip has been said.
+static SGL_SKIP_SAID: AtomicU32 = AtomicU32::new(0);
+/// PUMPPARK — parks this boot (deaths and the fixture): `parked_steps=`.
+static SGL_PARKS: AtomicU32 = AtomicU32::new(0);
+/// PUMPPARK — per step, its unpark probe (a `fn() -> bool` as usize; 0 = none: the timer unparks).
+static SGL_PROBE: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
+/// PUMPPARK — the noted dead instance (0 = none), its core, that core's tick count and the ms at the note.
+static SGL_DEAD_TID: AtomicU64 = AtomicU64::new(0);
+static SGL_DEAD_CPU: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SGL_DEAD_TICKS: AtomicU64 = AtomicU64::new(0);
+static SGL_DEAD_AT: AtomicU64 = AtomicU64::new(0);
+/// PUMPPARK — dead instances whose locks were released: `released_dead=`.
+static SGL_DEAD_RELEASED: AtomicU32 = AtomicU32::new(0);
+/// PUMPPARK — a noted instance is confirmed dead no sooner than this after its note (on top of the 1.5 s steal bound).
+const DEAD_CONFIRM_MS: u64 = 1_000;
+
+/// PUMPPARK — park `step` for `ms` from `now` (the death path and the fixture share it).
+fn step_park(step: u8, now: u64, ms: u64) {
+    if step == 0 || step >= 32 {
+        return;
+    }
+    SGL_PARK_AT[step as usize].store(now.max(1), Ordering::Relaxed);
+    SGL_SKIP_SAID.fetch_and(!(1u32 << step), Ordering::AcqRel);
+    SGL_PARK_UNTIL[step as usize].store((now + ms).max(1), Ordering::Release);
+    SGL_PARKS.fetch_add(1, Ordering::AcqRel);
+}
+
+/// PUMPPARK — register `probe` as `step`'s unpark probe (`true` = the step's owner answers; runs on the pump at the
+/// park's `until`, so it must be bounded).
+pub fn singleton_step_probe(step: u8, probe: fn() -> bool) {
+    if step != 0 && step < 32 {
+        SGL_PROBE[step as usize].store(probe as usize, Ordering::Release);
+    }
+}
+
+/// PUMPPARK — the pump loop's question before step `step`: `true` = run it. Parked and before `until`: the skip is
+/// counted (said once per park) and `false`. At `until`: the step's probe answers -> unparked, `true`; silent -> parked
+/// again, `false`; no probe -> unparked on the timer, `true`.
+pub fn singleton_step_go(step: u8) -> bool {
+    let Some(until) = singleton_step_parked(step) else { return true };
+    let now = crate::arch::ms();
+    if now >= until {
+        let p = SGL_PROBE[step as usize].load(Ordering::Acquire);
+        if p == 0 {
+            step_unpark(step, "timer");
+            return true;
+        }
+        // SAFETY: `p` was stored from a `fn() -> bool` in `singleton_step_probe`; fn pointers round-trip through usize.
+        let probe: fn() -> bool = unsafe { core::mem::transmute::<usize, fn() -> bool>(p) };
+        if probe() {
+            step_unpark(step, "answered");
+            return true;
+        }
+        singleton_step_repark(step, now);
+    }
+    let n = SGL_SKIPS[step as usize].fetch_add(1, Ordering::AcqRel) + 1;
+    if SGL_SKIP_SAID.fetch_or(1u32 << step, Ordering::AcqRel) & (1u32 << step) == 0 {
+        serial_println!(
+            "[pump] step={} skipped parked_ms={} until={} skips={} (PUMPPARK B839: the step is off the pump until its probe answers or its timer runs out)",
+            crate::video::lag::qs_step_name(step),
+            now.saturating_sub(SGL_PARK_AT[step as usize].load(Ordering::Relaxed)),
+            SGL_PARK_UNTIL[step as usize].load(Ordering::Relaxed),
+            n
+        );
+    }
+    false
+}
+
+/// PUMPPARK M3 — note the superseded instance `tid` that was CURRENT on `dead` when the steal's re-home restarted it
+/// (one pending; a second note while one is pending is dropped — the fresh pump is confirming the first).
+fn singleton_dead_note(dead: usize, tid: u64) {
+    if tid == 0 || dead >= MAX_CPUS || SGL_DEAD_TID.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    SGL_DEAD_CPU.store(dead, Ordering::Relaxed);
+    SGL_DEAD_TICKS.store(percpu::cpu(dead).map_or(0, |p| p.ticks.load(Ordering::Relaxed)), Ordering::Relaxed);
+    SGL_DEAD_AT.store(crate::arch::ms().max(1), Ordering::Relaxed);
+    SGL_DEAD_TID.store(tid, Ordering::Release);
+}
+
+/// PUMPPARK M3 — on the fresh instance's stamp: confirm a noted dead instance after DEAD_CONFIRM_MS. Still current on
+/// its core with that core's ticks frozen -> its locks back POISONED through the ONE release; else a revenant, nothing.
+fn singleton_dead_check(now: u64) {
+    let tid = SGL_DEAD_TID.load(Ordering::Acquire);
+    if tid == 0 || now.saturating_sub(SGL_DEAD_AT.load(Ordering::Relaxed)) < DEAD_CONFIRM_MS {
+        return;
+    }
+    if SGL_DEAD_TID.compare_exchange(tid, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let cpu = SGL_DEAD_CPU.load(Ordering::Relaxed);
+    let t0 = SGL_DEAD_TICKS.load(Ordering::Relaxed);
+    let t1 = percpu::cpu(cpu).map_or(t0.wrapping_add(1), |p| p.ticks.load(Ordering::Relaxed));
+    let still = current_task_id(cpu) == Some(tid);
+    let after = now.saturating_sub(SGL_DEAD_AT.load(Ordering::Relaxed));
+    if still && t1 == t0 {
+        let n = crate::sync::release_task(tid, "pump-dead");
+        SGL_DEAD_RELEASED.fetch_add(1, Ordering::AcqRel);
+        serial_println!(
+            "[pump] dead tid={} c{} halted ticks={} after_ms={} -> released={} (PUMPPARK B839: current on the core the steal declared dead, no timer tick since the note)",
+            tid, cpu, t1, after, n
+        );
+    } else {
+        serial_println!(
+            "[pump] dead tid={} c{} revenant current={} ticks_moved={} after_ms={} -> nothing released (PUMPPARK B839)",
+            tid, cpu, still as u8, t1.wrapping_sub(t0), after
+        );
+    }
+}
+
+/// PUMPPARK — `tests gatesteal2` LEG 4's park length (the step is unparked by its timer).
+#[cfg(feature = "wc")]
+const PUMPPARK_LEG_MS: u64 = 500;
+
+/// PUMPPARK — `tests gatesteal2` LEG 4: `(pass, "pumppark=<ok|fail/<why>> skipped=<n> unparked=<timer|none>")`. Parks
+/// usb-summary (its two calls are one-shot latched, a skip costs nothing) through [`step_park`] for PUMPPARK_LEG_MS;
+/// PASS iff the pump loop skipped it at least twice, it unparked on its timer, and no dead release fired across the
+/// test (`rd0`: legs 1-3 supersede revenants). Go-red by mutation: `singleton_step_go` returning `true` while parked ->
+/// `skipped=0 -> pumppark=fail/no-skip`.
+#[cfg(feature = "wc")]
+fn pumppark_leg(rd0: u32) -> (bool, alloc::string::String) {
+    let s = crate::video::lag::P_SUMMARY;
+    let k0 = SGL_SKIPS[s as usize].load(Ordering::Acquire);
+    let now = crate::arch::ms();
+    step_park(s, now, PUMPPARK_LEG_MS);
+    serial_println!(
+        "[pump] step={} parked deaths=0 until={} (PUMPPARK B839: fixture)",
+        crate::video::lag::qs_step_name(s),
+        now + PUMPPARK_LEG_MS
+    );
+    let skipped = hold2_wait(PUMPPARK_LEG_MS, || SGL_SKIPS[s as usize].load(Ordering::Acquire) >= k0 + 2);
+    let unparked = hold2_wait(PUMPPARK_LEG_MS + 2_000, || singleton_step_parked(s).is_none());
+    if !unparked {
+        step_unpark(s, "fixture");
+    }
+    let skips = SGL_SKIPS[s as usize].load(Ordering::Acquire).saturating_sub(k0);
+    let released = SGL_DEAD_RELEASED.load(Ordering::Acquire).saturating_sub(rd0);
+    let ok = skipped && unparked && released == 0;
+    let why = if !skipped { "/no-skip" } else if !unparked { "/still-parked" } else if released != 0 { "/released-a-revenant" } else { "" };
+    (
+        ok,
+        alloc::format!(
+            "pumppark={}{} skipped={} unparked={}",
+            if ok { "ok" } else { "fail" },
+            why,
+            skips,
+            if unparked { "timer" } else { "none" }
+        ),
+    )
 }
