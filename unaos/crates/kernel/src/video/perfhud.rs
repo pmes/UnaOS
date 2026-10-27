@@ -700,12 +700,41 @@ mod glass {
             drive();
         }
         let under = paint_us <= PAINT_BUDGET_US;
-        let ok = painted && steady && hits == 3 && fields == FIELDS && vis == 1 && under;
+        let ok = painted && steady && hits == 3 && fields == FIELDS && vis == 1 && under; let ds = super::drain_sample(); // DRAINMETER (B859): the drain present's sample, reported, not gated
         serial_println!(
-            ":: PERFHUD: visible={} paint_us={} fields={} -> {} :: pixels={}/3 budget_us={} under={} fields_dirty={} px={} full_us={} full_px={} scale={} rect={}x{}+{}+{} max_paint_us={}",
+            ":: PERFHUD: visible={} paint_us={} fields={} -> {} :: pixels={}/3 budget_us={} under={} fields_dirty={} px={} full_us={} full_px={} scale={} rect={}x{}+{}+{} max_paint_us={} present={} drain_n={} drain_us={} drain_max_us={}",
             vis, paint_us, fields, if ok { "PASS" } else { "FAIL" }, hits, PAINT_BUDGET_US, under as u8, nf, px,
             FULL_US.load(Relaxed), FULL_PX.load(Relaxed), super::super::dpi::scale_str(super::super::dpi::s2()), w, h, x, y,
-            MAX_PAINT_US.load(Relaxed)
+            MAX_PAINT_US.load(Relaxed), if ds.0 == 0 { "-" } else { "drain" }, ds.0, ds.1, ds.2
         );
     }
+}
+
+// DRAINMETER (rmbp-ledger B859; BP-video-11, BP-video-27) — TAIL-APPENDED so no line above moves. The drain-only present
+// (`wm::drain_present_once`, SHIMMERPRESENT B840) takes no `lag::pass`, k2p or frame-time stamp; its cost is a
+// present-kind term BESIDE the frame-time ring, never in it (the ring is the whole pass, the HUD's `ft` field; a drain
+// mixed in would lie about frame time, and the HUD's painter is not this arc's). Recorded whether or not the HUD is shown
+// (three relaxed atomics per drain present); `tests perfhud` reads it: `present=<drain|-> drain_n= drain_us= drain_max_us=`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static DRAIN_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static DRAIN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+static DRAIN_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `wm::drain_present_once`'s tail (under COMP_GATE): one drain present ran, opened at cycle `t0`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn drain_present(t0: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let us = super::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
+    DRAIN_N.fetch_add(1, Relaxed);
+    DRAIN_US.store(us, Relaxed);
+    DRAIN_MAX_US.fetch_max(us, Relaxed);
+}
+
+/// `(drain presents since boot, the last one's us, the worst us)`.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub fn drain_sample() -> (u64, u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (DRAIN_N.load(Relaxed), DRAIN_US.load(Relaxed), DRAIN_MAX_US.load(Relaxed))
 }

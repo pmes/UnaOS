@@ -102,7 +102,7 @@ pub fn asleep() -> bool { SLEPT.load(Ordering::Relaxed) }
 pub fn service() {
     let now = crate::arch::ms();
     if FILL_OWED.swap(false, Ordering::AcqRel) && SLEPT.load(Ordering::Acquire) {
-        if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) { fb.fill_screen(0); fb.flush_all(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::note_unnoted(); } // ZOOMFURN (B848): an unnamed RAM-frame write owes the lens one whole present, counted. ⚠ LINE-NEUTRAL fold.
+        if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) { fb.fill_screen(0); fb.flush_all(); } // ZOOMFLUSH (B859): the flush names these rows to the lens (`zoom::flushed`); ZOOMFURN's whole owe here retired.
         #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] crate::power::sleep::measure_enter();
     }
     if SLEPT.load(Ordering::Acquire) {
@@ -122,7 +122,7 @@ pub fn service() {
     if REPAINT_OWED.swap(false, Ordering::AcqRel) {
         if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) {
             fb.fill_screen(super::wm::DESKTOP_BG);
-            fb.flush_all(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::note_unnoted(); // ZOOMFURN (B848): an unnamed RAM-frame write owes the lens one whole present, counted. ⚠ LINE-NEUTRAL fold.
+            fb.flush_all(); // ZOOMFLUSH (B859): the flush names these rows to the lens (`zoom::flushed`); ZOOMFURN's whole owe here retired.
             let (w, h) = (fb.width(), fb.height());
             let _ = super::wm::damage_intersecting(0, 0, w, h);
         }

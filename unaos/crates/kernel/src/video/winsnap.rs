@@ -364,7 +364,7 @@ fn paint(r: (usize, usize, usize, usize)) {
         }
         y += 1;
     }
-    fb.flush_rect(r.0, r.1, r.2, r.3); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::zoom::note_unnoted(); // ZOOMFURN (B848): an unnamed RAM-frame write owes the lens one whole present, counted. ⚠ LINE-NEUTRAL fold.
+    fb.flush_rect(r.0, r.1, r.2, r.3); // ZOOMFLUSH (B859): the flush names these rows to the lens (`zoom::flushed`); ZOOMFURN's whole owe here retired.
     PAINTED.fetch_add(1, Relaxed);
 }
 

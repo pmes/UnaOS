@@ -82,14 +82,14 @@
 //! whole present is owed only by a moved glass key, an engage or factor change, or an UNNOTED write (a dirty pass with
 //! no note, or a writer outside the noted set calling [`note_unnoted`]: dimidle, lidsleep, lock, winsnap), each counted
 //! ([`SWEEP_WHOLE`], `sweep_whole=`) and paid ONCE by the next present. No timer: with every writer noted a boot never
-//! sweeps. A writer neither noted nor announcing is shown at the next whole present (ZOOMFLUSH, video.md §5).
+//! sweeps. ZOOMFLUSH (B859): the post-write clean IS the note — `FrameBuffer::flush_*` of the RAM frame names its rows ([`flushed`]).
 //!
 //! WIRE: `[zoom] z=<n> follow=<p|f> origin=<x>,<y> present_us=<n> rows=<w>/<h> skipped=<0|1>` on each change
 //! (rate-limited to 1/s, from the service pass); `[zoom] engage refused z=<n> why=<why>` (printed by [`engage`]
 //! itself, ZOOM2 B829); `tests zoom`: `:: ZOOM: z=2 px_ok=3 present_us=<n> -> PASS ::` (+ `panel= smooth_us=
 //! engage_us= budget_us= under= lost= why= present_full_us= present_band_us= rows=<w>/<h> skipped= furn_rows=<ok|bad>
-//! furn=<cursor rows>/<dest rows> sweep_whole=<fixture delta> sweep_boot=<n>`); ZOOMFURN (B848): `[zoom] rows=<n>/<h>
-//! src=<strip|hud|dropdown|cursor|screen> noted=strip:<a>,hud:<b>,dropdown:<c>,cursor:<d>,screen:<e> sweep_whole=<n>`
+//! furn=<flush rows>/<dest rows> sweep_whole=<fixture delta> sweep_boot=<n> flush_noted=<n> double_notes=0`); ZOOMFURN (B848): `[zoom] rows=<n>/<h>
+//! src=<strip|hud|dropdown|cursor|screen|flush> noted=strip:<a>,hud:<b>,dropdown:<c>,cursor:<d>,screen:<e>,flush:<f> sweep_whole=<n>`
 //! (the service pass, at most every 5 s, only when a tally moved).
 
 use alloc::vec::Vec;
@@ -160,9 +160,9 @@ pub const SRC_STRIP: u8 = 0;
 pub const SRC_HUD: u8 = 1;
 pub const SRC_DROPDOWN: u8 = 2;
 pub const SRC_CURSOR: u8 = 3;
-pub const SRC_SCREEN: u8 = 4;
-const SRC_N: usize = 5;
-const SRC_NAMES: [&str; SRC_N] = ["strip", "hud", "dropdown", "cursor", "screen"];
+pub const SRC_SCREEN: u8 = 4; pub const SRC_FLUSH: u8 = 5; // ZOOMFLUSH (B859): `FrameBuffer::flush_*` of the RAM frame (`flushed`, file tail)
+const SRC_N: usize = 6;
+const SRC_NAMES: [&str; SRC_N] = ["strip", "hud", "dropdown", "cursor", "screen", "flush"];
 /// A noted write since the last [`on_damage`] took it (the pass's `Owed.dirty` is then rows, not a whole owe).
 static DRAWN: AtomicBool = AtomicBool::new(false);
 /// Source rows noted per source since boot, and the last noter.
@@ -568,7 +568,7 @@ fn engage_at(z: u8) -> Result<u64, &'static str> {
         if wg.base_addr() != real.base_addr() {
             return Err("panel-moved");
         }
-        *wg = l.sfb;
+        *wg = l.sfb; publish_frame(l); // ZOOMFLUSH (B859): the frame's base and the real panel published for `flushed` and `panic_glass` (file tail)
     }
     LIVE.store(z, Release);
     let us = super::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
@@ -650,8 +650,8 @@ fn furn_line() {
     FURN_AT.store(now, Relaxed);
     let ph = LENS.try_lock().and_then(|g| g.as_ref().map(|l| l.h)).unwrap_or(0);
     serial_println!(
-        "[zoom] rows={}/{} src={} noted=strip:{},hud:{},dropdown:{},cursor:{},screen:{} sweep_whole={}",
-        PRESENT_ROWS.load(Relaxed), ph, SRC_NAMES[(LAST_SRC.load(Relaxed) as usize).min(SRC_N - 1)], n[0], n[1], n[2], n[3], n[4], sw
+        "[zoom] rows={}/{} src={} noted=strip:{},hud:{},dropdown:{},cursor:{},screen:{},flush:{} sweep_whole={}",
+        PRESENT_ROWS.load(Relaxed), ph, SRC_NAMES[(LAST_SRC.load(Relaxed) as usize).min(SRC_N - 1)], n[0], n[1], n[2], n[3], n[4], n[5], sw
     );
 }
 
@@ -719,7 +719,7 @@ pub fn selftest() {
     }
     let smooth_us = LENS.lock().as_mut().and_then(|l| present_locked(l, true, true)).unwrap_or(0);
     let (full_us, band_us, band_rows, skipped) = band_probe();
-    let (furn_cur, furn_rows, furn_why) = furn_probe();
+    let (furn_cur, furn_rows, double_notes, furn_why) = furn_probe();
     let o = ORIGIN.load(Relaxed);
     serial_println!("[zoom] z=2 follow=p origin={},{} present_us={}", o >> 32, o & 0xFFFF_FFFF, worst);
     crate::pal::cursor::set_abs(abs(px0.max(0) as usize, w), abs(py0.max(0) as usize, h), w as i32, h as i32);
@@ -747,9 +747,9 @@ pub fn selftest() {
     }
     let pass = px_ok == 3 && band_ok && furn_ok && sweep_whole == 0;
     serial_println!(
-        ":: ZOOM: z=2 px_ok={} present_us={} -> {} :: panel={}x{} smooth_us={} engage_us={} budget_us={} under={} lost={} why={} present_full_us={} present_band_us={} rows={}/{} skipped={} furn_rows={} furn={}/{} sweep_whole={} sweep_boot={}",
+        ":: ZOOM: z=2 px_ok={} present_us={} -> {} :: panel={}x{} smooth_us={} engage_us={} budget_us={} under={} lost={} why={} present_full_us={} present_band_us={} rows={}/{} skipped={} furn_rows={} furn={}/{} sweep_whole={} sweep_boot={} flush_noted={} double_notes={}",
         px_ok, worst, if pass { "PASS" } else { "FAIL" }, w, h, smooth_us, ENGAGE_US.load(Relaxed), BUDGET_US, (worst <= BUDGET_US) as u8, PANEL_LOST.load(Relaxed), why,
-        full_us, band_us, band_rows, h, skipped as u8, if furn_ok { "ok" } else { "bad" }, furn_cur, furn_rows, sweep_whole, sweep_boot
+        full_us, band_us, band_rows, h, skipped as u8, if furn_ok { "ok" } else { "bad" }, furn_cur, furn_rows, sweep_whole, sweep_boot, furn_cur, double_notes
     );
 }
 
@@ -770,19 +770,20 @@ fn band_probe() -> (u64, u64, u64, bool) {
 }
 
 /// ZOOMFURN (B848): `tests zoom` M3 under ONE waiting `LENS` hold — a whole nearest present (the glass known), a REAL
-/// cursor write (`cursor::repaint`: its `flush_box`/`flush_rect` note [`SRC_CURSOR`]; its `on_pointer` kick loses the
+/// cursor write (`cursor::repaint`: its `flush_box`/`flush_rect` flushes note [`SRC_FLUSH`]; its `on_pointer` kick loses the
 /// try-lock to this hold), then [`on_damage`]`(true)` (the dirty rule under test: a noted write came, so no whole
 /// owe), then a present that must write rows, not the panel: `0 < rows < h`. Returns `(cursor rows noted, destination
 /// rows written, why)`; why `-` = ok, `furn` = the cursor noted nothing, `furn-whole` = the noted dirty owed whole,
-/// `furn-rows` = the present wrote none or every row.
-fn furn_probe() -> (u64, u64, &'static str) {
+/// `furn-rows` = the present wrote none or every row. ZOOMFLUSH (B859): the cursor's rows are its flush's (`SRC_FLUSH`), and
+/// a cursor/screen note during the write is a double (`double`, returned third).
+fn furn_probe() -> (u64, u64, u64, &'static str) {
     let mut g = LENS.lock();
-    let Some(l) = g.as_mut() else { return (0, 0, "furn") };
+    let Some(l) = g.as_mut() else { return (0, 0, 0, "furn") };
     let _ = present_locked(l, false, true);
-    let c0 = NOTED[SRC_CURSOR as usize].load(Relaxed);
+    let c0 = NOTED[SRC_FLUSH as usize].load(Relaxed); let d0 = NOTED[SRC_CURSOR as usize].load(Relaxed) + NOTED[SRC_SCREEN as usize].load(Relaxed); // ZOOMFLUSH (B859): the cursor write is noted by its flush; a cursor/screen note is a double
     DRAWN.store(false, Release);
     super::cursor::repaint();
-    let cur = NOTED[SRC_CURSOR as usize].load(Relaxed).saturating_sub(c0);
+    let cur = NOTED[SRC_FLUSH as usize].load(Relaxed).saturating_sub(c0); let double = (NOTED[SRC_CURSOR as usize].load(Relaxed) + NOTED[SRC_SCREEN as usize].load(Relaxed)).saturating_sub(d0);
     let whole0 = OWED.swap(false, AcqRel);
     on_damage(true);
     let whole = OWED.load(Acquire);
@@ -799,10 +800,12 @@ fn furn_probe() -> (u64, u64, &'static str) {
         "furn-whole"
     } else if rows == 0 || rows as usize >= l.h {
         "furn-rows"
+    } else if double != 0 {
+        "double"
     } else {
         "-"
     };
-    (cur, rows, why)
+    (cur, rows, double, why)
 }
 
 /// ZOOM2 (B829): one fixture present + its read-back under ONE waiting `LENS` hold. The pointer is moved to the corner
@@ -851,4 +854,67 @@ pub fn screen_front(front: FrameBuffer) -> FrameBuffer {
         return front;
     }
     if LIVE.load(Acquire) != 0 { l.sfb } else { l.real }
+}
+
+// ZOOMFLUSH + ZOOMPANIC (rmbp-ledger B859; BP-video-26) — TAIL-APPENDED. Every writer's post-write clean is
+// `FrameBuffer::flush_range` / `flush_rect` / `flush_all`; when its base is the lens's RAM frame (published here by the
+// engage, under the LENS and WRITER holds) the flush names the rows it cleaned through [`note_drawn`] (`SRC_FLUSH`): one
+// predicate, one call, so a writer outside the furniture's noted set is noted, and `on_damage`'s dirty rule owes whole
+// only for a pass that flushed nothing. ZOOMPANIC: the panic screen paints the lens's REAL panel and stops the lens
+// ([`panic_glass`]), lock-free — never `disengage`, whose LENS / WRITER waits the dying core may hold, and whose copy-back
+// the panic fill overpaints at once.
+
+/// The RAM frame's base and pitch (bytes); the real panel's base, length (bytes) and stride (pixels). 0 = never engaged.
+static FRAME_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static FRAME_PITCH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static REAL_BASE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static REAL_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static REAL_STRIDE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `engage_at`, as `WRITER` is retargeted (LENS and WRITER held): publish the frame and the real panel. The frame's base
+/// is stored last (Release), and `LIVE` after it, so a flush that sees `LIVE` and the base sees the pitch too.
+fn publish_frame(l: &Lens) {
+    REAL_BASE.store(l.real.base_addr(), Relaxed);
+    REAL_LEN.store(l.real.len(), Relaxed);
+    REAL_STRIDE.store(l.rstride, Relaxed);
+    FRAME_PITCH.store(l.w * 4, Relaxed);
+    FRAME_BASE.store(l.sfb.base_addr(), Release);
+}
+
+/// `FrameBuffer::flush_range` (and `flush_all`): bytes `off..off+len` of the surface at `base` were cleaned after a write.
+/// The RAM frame's: their rows noted (`SRC_FLUSH`). One relaxed load when the lens is off.
+#[inline]
+pub fn flushed(base: usize, off: usize, len: usize) {
+    if LIVE.load(Relaxed) == 0 || len == 0 || base != FRAME_BASE.load(Acquire) {
+        return;
+    }
+    let p = FRAME_PITCH.load(Relaxed).max(1);
+    let y = off / p;
+    note_drawn(y, (off + len).div_ceil(p) - y, SRC_FLUSH);
+}
+
+/// `FrameBuffer::flush_rect`: rows `y..y+h` of the surface at `base` were cleaned after a write. The RAM frame's: noted
+/// (`SRC_FLUSH`). One relaxed load when the lens is off.
+#[inline]
+pub fn flushed_rows(base: usize, y: usize, h: usize) {
+    if LIVE.load(Relaxed) == 0 || base != FRAME_BASE.load(Acquire) {
+        return;
+    }
+    note_drawn(y, h, SRC_FLUSH);
+}
+
+/// ZOOMPANIC (B859): `panicscreen::draw_panic`'s surface. While the lens is live and `fb` is its RAM frame or its real
+/// panel: the lens is stopped (`LIVE = 0`: no core presents the frame over the panic screen, every note is inert) and the
+/// REAL panel is returned, rebuilt from the published atomics (no lock). Otherwise `fb` unchanged. `WRITER` stays on the
+/// RAM frame, so a writer after the panic paints memory nobody shows.
+pub fn panic_glass(fb: FrameBuffer) -> FrameBuffer {
+    let (frame, real) = (FRAME_BASE.load(Acquire), REAL_BASE.load(Relaxed));
+    if LIVE.load(Acquire) == 0 || frame == 0 || real == 0 || (fb.base_addr() != frame && fb.base_addr() != real) {
+        return fb;
+    }
+    LIVE.store(0, Release);
+    let fi = fb.info();
+    let mut out = FrameBuffer::new();
+    out.init(real, REAL_LEN.load(Relaxed), FrameBufferInfo { width: fi.width, height: fi.height, stride: REAL_STRIDE.load(Relaxed), bytes_per_pixel: 4, pixel_format: fi.pixel_format });
+    out
 }

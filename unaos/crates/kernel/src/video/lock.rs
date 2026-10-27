@@ -351,7 +351,7 @@ fn wipe() {
     }
     if let Some(fb) = super::panel_snapshot().filter(|f| f.is_ready()) {
         fb.fill_screen(super::blitter::a11yfilter::color(super::wm::DESKTOP_BG)); // crawl A 17: the scanout writer filters at the copy (BP-video-25)
-        fb.flush_all(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::note_unnoted(); // ZOOMFURN (B848): an unnamed RAM-frame write owes the lens one whole present, counted. ⚠ LINE-NEUTRAL fold.
+        fb.flush_all(); // ZOOMFLUSH (B859): the flush names these rows to the lens (`zoom::flushed`); ZOOMFURN's whole owe here retired.
         let (w, h) = (fb.width(), fb.height());
         let _ = super::wm::damage_intersecting(0, 0, w, h);
     }
