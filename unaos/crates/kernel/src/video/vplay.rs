@@ -1093,7 +1093,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         if pts_ms < seek_ms {
             continue; // a Player seek: the steps before it decoded unseen (job_task's rule)
         }
-        if let super::export::Sink::Encode = super::export::sink(jid) { export_frame(jid, tl.tb, vcount, &frame).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
+        if let super::export::Sink::Encode = super::export::sink(jid) { export_frame(jid, tl.tb, vcount, &frame, s.src.and_then(|id| tl.source(id)).map_or(timeline_core::SizePolicy::Letterbox, |r| r.size_policy)).map_err(|e| ("encode-refused", Some(e)))?; rep.frames += 1; snd::tick(jid); crate::arch::sched::yield_now(); continue; } face_preview(seek_ms, rep, s.out_t, &frame); room(jid).map_err(|why| (why, None))?; // NLE6EXPORT (rmbp-ledger B959): the Encode sink — the step's frame to the exporter, not the queue (video/export.rs). NLE6MIXFACE (rmbp-ledger B957): the first frame a Player seek shows (file tail)
         {
             let mut g = JOB.lock();
             let Some(j) = g.as_mut().filter(|j| j.jid == jid) else { return Err(("superseded", None)) };
@@ -2152,7 +2152,8 @@ fn inband_colour(d: &mut av1_core::image::StreamDecoder, c: Option<Colour>, pts:
 // pictures take the RGBA path (H264ENC-PLANES-HI owed).
 
 /// The EDL job's frame into the exporter: its planes when unmixed 8-bit 4:2:0, else None; its RGBA only if the exporter asks.
-fn export_frame(jid: u32, tb: timeline_core::Timebase, total: u64, f: &Frame) -> Result<(), String> {
+/// NLESIZEPOLICY (LEDGER SR394): `fit` is the step's reel's size policy (`timeline_core::Source::size_policy`), for the export's size switch.
+fn export_frame(jid: u32, tb: timeline_core::Timebase, total: u64, f: &Frame, fit: timeline_core::SizePolicy) -> Result<(), String> {
     let narrow = |s: &[u16]| s.iter().map(|&x| x as u8).collect::<Vec<u8>>();
     let av1 = match &f.px.src {
         Src::Av1(p, _) if p.bit_depth == 8 && !p.mono && (p.ss_x, p.ss_y) == (1, 1) => Some((narrow(&p.y), narrow(&p.u), narrow(&p.v))),
@@ -2163,7 +2164,7 @@ fn export_frame(jid: u32, tb: timeline_core::Timebase, total: u64, f: &Frame) ->
         (Src::Av1(p, c), Some((py, pu, pv))) => Some((h264enc_core::Yuv420 { width: p.width, height: p.height, y: py, u: pu, v: pv, y_stride: p.width as usize, uv_stride: p.chroma_width() as usize }, *c)),
         _ => None,
     };
-    super::export::frame(jid, tb, total, f.w, f.h, planes, || unpack(f.px.rgb()))
+    super::export::frame(jid, tb, total, f.w, f.h, fit, planes, || unpack(f.px.rgb()))
 }
 
 // ── NLE6FACEDRAG (rmbp-ledger B975): pointer drags on the view band — the host's ONE `view::Drag` over the painted layout ─────
@@ -2508,16 +2509,33 @@ fn inband_size(d: &mut av1_core::image::StreamDecoder, planes: &av1_core::image:
 // unpacked for the encoder's RGBA entry. No second scaler, no second letterbox rule.
 
 /// EXPORTSIZESCALE (B985): straight RGBA `w x h` letterboxed into `fw x fh` over black by the present's [`blit_fit`]; None when
-/// the scaler cannot serve it (a zero side, or the RGBA is not `w x h`).
-pub(super) fn fit_rgba(rgba: &[u8], w: usize, h: usize, fw: usize, fh: usize) -> Option<Vec<u8>> {
+/// the scaler cannot serve it (a zero side, or the RGBA is not `w x h`). NLESIZEPOLICY (SR394): another `fit` than Letterbox
+/// goes through [`place_rgba`] (file tail).
+pub(super) fn fit_rgba(rgba: Vec<u8>, w: usize, h: usize, fw: usize, fh: usize, fit: timeline_core::SizePolicy) -> Option<Vec<u8>> {
     if w == 0 || h == 0 || fw == 0 || fh == 0 || rgba.len() != w * h * 4 {
         return None;
     }
-    let f = Frame { pts_ms: 0, w, h, px: Px::from(pack(rgba)), ord: None };
+    if fit != timeline_core::SizePolicy::Letterbox { return place_rgba(rgba, w, h, fw, fh, fit); } // NLESIZEPOLICY (SR394): Fill / Stretch by the editor's ONE painter (file tail)
+    let f = Frame { pts_ms: 0, w, h, px: Px::from(pack(&rgba)), ord: None };
     let mut dst = alloc::vec![0u32; fw * fh];
     let (dw, dh) = blit_fit(&mut dst, fw, 0, 0, fw, fh, &f, Some(0));
     if dw == 0 || dh == 0 {
         return None;
     }
     Some(unpack(&dst))
+}
+
+// ── NLESIZEPOLICY (LEDGER SR394): the export's switched frame by its reel's size policy (handlers.md §5 NLEPROBE-HDR's NLE-SIZE-POLICY) ─
+// [`fit_rgba`]'s Letterbox stays the present's [`blit_fit`] (EXPORTSIZESCALE's bytes); Fill and Stretch go through the editor's
+// ONE painter both rings link, `timeline_core::view::Canvas::blit_policy` (`SizePolicy::place` over yuv_core::scale's `fit`,
+// sampled by its `nearest_rows`), over opaque black: Stria's `reel_rgba` paints the same way, so host == kernel. Adopt never
+// reaches here (`export.rs` `Exp::sized` refuses it by name).
+
+/// NLESIZEPOLICY (SR394): straight RGBA `w x h` (checked by [`fit_rgba`]) into `fw x fh` by `fit` (Fill / Stretch) over black.
+fn place_rgba(rgba: Vec<u8>, w: usize, h: usize, fw: usize, fh: usize, fit: timeline_core::SizePolicy) -> Option<Vec<u8>> {
+    use timeline_core::view::{Canvas, Order, Still};
+    let mut c = Canvas::new(fw as u32, fh as u32, Order::Rgba);
+    c.rect(0, 0, fw as i64, fh as i64, [0, 0, 0, 255]);
+    c.blit_policy(&Still { width: w as u32, height: h as u32, rgba }, 0, 0, fw as u32, fh as u32, fit);
+    Some(c.px)
 }

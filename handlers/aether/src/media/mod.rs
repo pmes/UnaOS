@@ -998,7 +998,7 @@ pub fn on_message(msg: &SMessage) -> Effect {
                         fx.relayout = true;
                     }
                     let duration_changed = e.ready_state >= HAVE_METADATA && e.duration_ns != *duration_ns;
-                    e.natural = nat;
+                    if !(e.ready_state >= HAVE_METADATA && nat.is_some_and(|(w, h)| video_resize(e, w, h))) { e.natural = nat; } // NLESIZEPOLICY (SR394) AETHER-RESIZE-REOPEN: a later MediaOpened at another size fires `resize` through the one video_resize
                     e.duration_ns = *duration_ns;
                     e.real_video = *real_video;
                     if e.state == State::Loading {

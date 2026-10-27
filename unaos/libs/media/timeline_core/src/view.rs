@@ -238,29 +238,44 @@ impl Canvas {
         self.rect(x1 - 1, y0, x1, y1, c);
     }
     /// `s` nearest-scaled to fit (aspect kept) and centred in `x0..x0+bw` x `y0..y0+bh`.
+    /// VIEW-SCALE-ONE (NLESIZEPOLICY, LEDGER SR394): [`Canvas::blit_policy`]'s letterbox, yuv_core::scale's integer `fit`.
     pub fn blit_fit(&mut self, s: &Still, x0: u32, y0: u32, bw: u32, bh: u32) {
-        if s.width == 0 || s.height == 0 || bw == 0 || bh == 0 || s.rgba.len() < s.width as usize * s.height as usize * 4 {
+        self.blit_policy(s, x0, y0, bw, bh, crate::SizePolicy::Letterbox);
+    }
+    /// NLESIZEPOLICY (LEDGER SR394): `s` into the box `x0..x0+bw` x `y0..y0+bh` by `fit` ([`crate::SizePolicy::place`],
+    /// the ONE geometry), sampled by yuv_core::scale's ONE `nearest_rows` (the frame as a mono picture of RGBA samples;
+    /// output row `r` from source row `r * h / dh`, column `c` from `c * w / dw`, inside the placed source rect), each
+    /// sample through [`Canvas::put`], clipped to the canvas. The box outside the placed rect is left as it was.
+    pub fn blit_policy(&mut self, s: &Still, x0: u32, y0: u32, bw: u32, bh: u32, fit: crate::SizePolicy) {
+        let (sw, sh) = (s.width as usize, s.height as usize);
+        if sw == 0 || sh == 0 || bw == 0 || bh == 0 || s.rgba.len() < sw * sh * 4 {
             return;
         }
-        let k = (bw as f64 / s.width as f64).min(bh as f64 / s.height as f64);
-        let (dw, dh) = (((s.width as f64 * k) as u32).max(1), ((s.height as f64 * k) as u32).max(1));
-        let (ox, oy) = (x0 + (bw - dw.min(bw)) / 2, y0 + (bh - dh.min(bh)) / 2);
-        for dy in 0..dh {
-            let (y, sy) = (oy + dy, dy as u64 * s.height as u64 / dh as u64);
-            if y >= self.h {
-                break;
+        let p = fit.place(sw, sh, bw as usize, bh as usize);
+        let (px, _) = s.rgba.as_chunks::<4>();
+        let pic = yuv_core::Picture { w: p.src.w, h: p.src.h, y: &px[p.src.y * sw + p.src.x..], u: &[], v: &[], y_stride: sw, uv_stride: 0, ss: (0, 0), mono: true, bit_depth: 8, full: true };
+        if !yuv_core::scale::fits(&pic) {
+            return;
+        }
+        let (cw, ch) = (self.w as usize, self.h as usize);
+        let (ox, oy) = (x0 as usize + p.dst.x, y0 as usize + p.dst.y);
+        let mut ry = vec![[0u8; 4]; p.dst.w];
+        let pen = Canvas { w: 0, h: 0, order: self.order, px: Vec::new() }; // `put`'s byte order, while the closure holds `px`
+        let dst = &mut self.px;
+        yuv_core::scale::nearest_rows(&pic, p.dst.w, p.dst.h, &mut ry, &mut [], &mut [], |r, row| {
+            let y = oy + r;
+            if y >= ch {
+                return;
             }
-            for dx in 0..dw {
-                let (x, sx) = (ox + dx, dx as u64 * s.width as u64 / dw as u64);
-                if x >= self.w {
+            for (c, &sample) in row.y.iter().enumerate() {
+                let x = ox + c;
+                if x >= cw {
                     break;
                 }
-                let si = (sy as usize * s.width as usize + sx as usize) * 4;
-                let p = self.put([s.rgba[si], s.rgba[si + 1], s.rgba[si + 2], s.rgba[si + 3]]);
-                let di = (y as usize * self.w as usize + x as usize) * 4;
-                self.px[di..di + 4].copy_from_slice(&p);
+                let di = (y * cw + x) * 4;
+                dst[di..di + 4].copy_from_slice(&pen.put(sample));
             }
-        }
+        });
     }
 }
 

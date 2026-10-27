@@ -13,6 +13,9 @@ description = "Stria's timeline core: the non-linear editor's EDL model (tracks,
 demux_core = { path = "../demux_core" }
 pixel_core = { path = "../pixel_core" }
 libm = { version = "0.2", default-features = false }
+# NLESIZEPOLICY (LEDGER SR394): yuv_core::scale, the ONE letterbox `fit` + `nearest_rows` (no deps, no alloc; already in both locks
+# through av1_core / the kernel): `SizePolicy::place` and `view::Canvas::blit_policy` (VIEW-SCALE-ONE: the f64 fit retired).
+yuv_core = { path = "../yuv_core" }
 
 [features]
 default = ["std"]

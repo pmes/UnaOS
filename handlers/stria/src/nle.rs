@@ -51,7 +51,7 @@ use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for}
 use gneiss_pal::dsp::demux::{DecodeTime, Demuxer, TrackKind, build};
 use gneiss_pal::dsp::video::{Frame, VideoDecoder, decoder_for, reorder_depth, colour_of};
 use timeline_core::schedule::{AudioRun, Layer, ScheduleError, audio_runs, schedule};
-use timeline_core::{Kind, SourceId, SourceIndex, Timebase, Timeline};
+use timeline_core::{Kind, SizePolicy, SourceId, SourceIndex, Timebase, Timeline};
 use crate::decode_swap::{DecodeSwap, Swap};
 use gneiss_pal::dsp::demux::Track;
 
@@ -526,8 +526,8 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
             (Kind::Video, Some(src)) => {
                 vmix_take(s, &mut vid, &mut vmix_run);
                 let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r)?;
-                let rgba = reel_rgba(sources, src, &f, &mut vid, w, h)?; // NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size
-                sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r)?);
+                let (rgba, fw, fh) = reel_rgba(sources, src, &f, &mut vid, w, h, reel_fit(tl, src, s.vmix.is_none()))?; // NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size; NLESIZEPOLICY (SR394): by the reel's size policy
+                sink.frame(s.out_t, fw, fh, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r)?);
                 r.frames += 1;
             }
             (Kind::Audio, _) => {
@@ -722,7 +722,7 @@ fn vmix_frame(
     let a = match m.src {
         Some(src) => {
             let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r)?;
-            reel_rgba(sources, src, &a, vmix_run, w, h)? // NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
+            reel_rgba(sources, src, &a, vmix_run, w, h, reel_fit(tl, src, false))?.0 // NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
         None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
@@ -898,25 +898,44 @@ fn src_rgba(sources: &Sources, src: SourceId, f: &Frame) -> Vec<u8> {
 /// `timeline_core::view::Canvas::blit_fit` (aspect kept, centred, over the preview band's black `FIELD`), with one
 /// `[STRIA] :: nle size switch reel=<id> <W>x<H>-><w>x<h> scaled` line each time the run `run` sees its frame size change to
 /// a size other than the reel's. A reel whose own size is not the project's stays [`RenderError::Size`].
-fn reel_rgba(sources: &Sources, src: SourceId, f: &Frame, run: &mut Option<Vid>, w: u32, h: u32) -> Result<Vec<u8>, RenderError> {
+/// NLESIZEPOLICY (LEDGER SR394): `fit` is the reel's [`SizePolicy`] ([`reel_fit`]): Letterbox as above, Fill / Stretch
+/// through the same painter's `Canvas::blit_policy` (` fit=<name>` appended to the line), Adopt hands the frame on at its own
+/// size (`[STRIA] :: nle size switch reel=<id> <W>x<H> adopted`); returns the RGBA and its size.
+fn reel_rgba(sources: &Sources, src: SourceId, f: &Frame, run: &mut Option<Vid>, w: u32, h: u32, fit: SizePolicy) -> Result<(Vec<u8>, u32, u32), RenderError> {
     let now = (f.width, f.height);
     let reel = sources.get(src).ok().and_then(|m| m.video.map(|i| (m.demux.tracks()[i].width, m.demux.tracks()[i].height))).filter(|&(rw, rh)| rw > 0 && rh > 0).unwrap_or(now);
     let last = run.as_mut().and_then(|v| v.size.replace(now));
     if now == (w, h) {
-        return Ok(src_rgba(sources, src, f));
+        return Ok((src_rgba(sources, src, f), w, h));
     }
     if reel != (w, h) {
         return Err(RenderError::Size { src, width: now.0, height: now.1 });
     }
     let rgba = src_rgba(sources, src, f);
+    if fit == SizePolicy::Adopt {
+        if last != Some(now) {
+            log::info!("[STRIA] :: nle size switch reel={} {}x{} adopted", src.0, now.0, now.1);
+        }
+        return Ok((rgba, now.0, now.1));
+    }
     if last != Some(now) {
-        log::info!("[STRIA] :: nle size switch reel={} {}x{}->{}x{} scaled", src.0, now.0, now.1, reel.0, reel.1);
+        let tok = if fit == SizePolicy::Letterbox { String::new() } else { format!(" fit={}", fit.name()) };
+        log::info!("[STRIA] :: nle size switch reel={} {}x{}->{}x{} scaled{}", src.0, now.0, now.1, reel.0, reel.1, tok);
     }
     use timeline_core::view::{Canvas, FIELD, Order, Still};
     let mut c = Canvas::new(reel.0, reel.1, Order::Rgba);
     c.rect(0, 0, reel.0 as i64, reel.1 as i64, FIELD);
-    c.blit_fit(&Still { width: now.0, height: now.1, rgba }, 0, 0, reel.0, reel.1);
-    Ok(c.px)
+    c.blit_policy(&Still { width: now.0, height: now.1, rgba }, 0, 0, reel.0, reel.1, fit);
+    Ok((c.px, reel.0, reel.1))
+}
+
+/// NLESIZEPOLICY (LEDGER SR394): source `src`'s size policy on `tl` (absent: Letterbox). `alone` is false inside a
+/// transition: the mix is one size, so Adopt mixes as Letterbox there.
+fn reel_fit(tl: &Timeline, src: SourceId, alone: bool) -> SizePolicy {
+    match tl.source(src).map_or(SizePolicy::Letterbox, |s| s.size_policy) {
+        SizePolicy::Adopt if !alone => SizePolicy::Letterbox,
+        p => p,
+    }
 }
 
 /// SWAPBACK-NLECACHE (LEDGER SR388): the editor's runs park their decoder across runs. A run's close (a cut, a seek step, the
