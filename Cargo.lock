@@ -64,6 +64,7 @@ dependencies = [
  "js_core",
  "kvstore_core",
  "layout_core",
+ "pdf_core",
  "pixel_core",
  "psl_core",
  "resvg",

@@ -630,7 +630,7 @@ impl Tab {
             self.last_nav = Some(nav);
             self.bus.fire(SMessage::BrowserNavState { can_back: nav.0, can_forward: nav.1, loading: nav.2, zoom_pct: nav.3 });
         }
-        let link = self.engine.hovered_link().unwrap_or_default();
+        let link = self.engine.hovered_link().or_else(|| self.engine.pdf_status()).unwrap_or_default(); // PDF4 (SR324): "Page p / n"
         if link != self.last_status && self.is_active() {
             self.last_status = link.clone();
             self.bus.fire(SMessage::BrowserStatus(link));
