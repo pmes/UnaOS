@@ -5538,7 +5538,7 @@ fn render_pass<W: RenderWait>(w: &mut W) {
         let mut serial_budget = unaos_kernel::arch::serial::shell_inbox::CAP;
         while serial_budget > 0 {
             let Some(b) = unaos_kernel::arch::serial::shell_inbox::take() else { break };
-            serial_budget -= 1;
+            serial_budget -= 1; #[cfg(feature = "login")] if unaos_kernel::fs::users::screen_key(b) { continue; } // PIDESKQEMULIST (rmbp-ledger B894): the serial inbox asks the login screen first, as every other key route does (:1905, :2965, :5436) — R63/BP-boot-7: a UART byte never reaches the shell while the screen is up. LINE-NEUTRAL append, code first
             if windowed {
                 #[cfg(feature = "desktop_firmware")]
                 {
