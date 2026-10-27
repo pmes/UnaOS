@@ -82,3 +82,41 @@ fn m3_ten_frames_through_mp4_demux_and_decode() {
         }
     }
 }
+
+/// H264ENCCOLOURHOST (LEDGER SR377): `Config::colour` is written as the SPS VUI's video_signal_type + colour_description and
+/// h264_core's reader (`ps::avcc_sps`, the one the Player's `colour_of` calls) reads the same codes back; the access units
+/// are byte for byte the uncoloured stream's (the VUI lives in the avcC only); without a colour the SPS is the one measured
+/// at 2e1698471 before the writer changed (Baseline and the B pyramid's Main).
+#[test]
+fn h264enccolourhost_vui_colour_reads_back() {
+    let code = |c: Option<(u8, u8, u8, bool)>, bframes: u8| {
+        let mut enc = Encoder::new(Config { width: W as u32, height: H as u32, qp: 26, gop: 4, bframes, colour: c, ..Default::default() }).unwrap();
+        let mut units = Vec::new();
+        for t in 0..6 {
+            let p = frame(t);
+            let yuv = Yuv420 { width: W as u32, height: H as u32, y: &p[0], u: &p[1], v: &p[2], y_stride: W, uv_stride: W / 2 };
+            units.extend(enc.push(&yuv).unwrap().iter().map(|a| a.avcc_sample()));
+        }
+        units.extend(enc.flush().unwrap().iter().map(|a| a.avcc_sample()));
+        (enc.sps_nal().to_vec(), enc.avcc(), units)
+    };
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let (sps0, avcc0, units0) = code(None, 0);
+    assert_eq!(hex(&sps0), "6742c00ada11e806d0442350", "the uncoloured Baseline SPS is unchanged");
+    assert_eq!(hex(&code(None, 2).0), "674d400af208f4036822114580", "the uncoloured Main (B pyramid) SPS is unchanged");
+    let s = h264_core::ps::avcc_sps(&avcc0).unwrap();
+    assert!(!s.video_signal_type);
+    for c in [(1u8, 1u8, 1u8, false), (2, 2, 6, false), (9, 16, 9, true)] {
+        for bframes in [0u8, 2] {
+            let (sps, avcc, units) = code(Some(c), bframes);
+            let s = h264_core::ps::avcc_sps(&avcc).expect("the coloured SPS parses");
+            assert!(s.video_signal_type, "{c:?} b{bframes}: video_signal_type_present_flag");
+            assert_eq!((s.colour_primaries, s.transfer_characteristics, s.matrix_coefficients, s.full_range), c, "b{bframes}");
+            assert_eq!((s.width_mbs, s.height_map_units), (W as u32 / 16, H as u32 / 16), "the VUI follows the picture size fields intact");
+            if bframes == 0 {
+                assert_ne!(sps, sps0);
+                assert_eq!(units, units0, "{c:?}: the access units are the uncoloured stream's");
+            }
+        }
+    }
+}

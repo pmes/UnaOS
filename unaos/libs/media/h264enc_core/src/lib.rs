@@ -37,6 +37,7 @@
 //! | `bframes`        | 0..=4         | 0       | B pictures between anchors (SR333): push / flush, VUI reorder 1 (>4 = 4); >= 2 the pyramid (SR349) |
 //! | `direct_temporal`| bool          | false   | temporal direct on the Bs whose L1[0] is an anchor (SR349)          |
 //! | `bipred`         | [`BiPred`]    | Auto    | weighted_bipred_idc: Auto = implicit under the pyramid, else the average (SR349) |
+//! | `colour`         | `Option<(u8, u8, u8, bool)>` | None | VUI video_signal_type + colour_description: primaries, transfer, matrix, full range (SR377) |
 //!
 //! | module          | Recommendation                                                          |
 //! |-----------------|-------------------------------------------------------------------------|
@@ -167,6 +168,10 @@ pub struct Config {
     pub direct_temporal: bool,
     /// The bi-prediction weights of B slices (SR349): see [`BiPred`].
     pub bipred: BiPred,
+    /// H264ENCCOLOURHOST (LEDGER SR377): the stream's colour as H.273 code points (colour_primaries, transfer_characteristics,
+    /// matrix_coefficients, video_full_range_flag), written as the SPS VUI's video_signal_type with its colour_description; the
+    /// exports pass the file's one colour (the same the MP4 `colr` states). None keeps every pinned byte.
+    pub colour: Option<(u8, u8, u8, bool)>,
 }
 
 /// weighted_bipred_idc of the stream (H264ENCPYRAMID, SR349); without `bframes` always 0.
@@ -488,7 +493,7 @@ impl Encoder {
             (_, BiPred::Implicit) => 2,
             (_, BiPred::Explicit) => 1,
         };
-        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high, reorder, log2_max_poc_lsb, pyramid, num_reorder };
+        let p = SeqParams { width: cfg.width, height: cfg.height, mb_w: mb_w as u32, mb_h: mb_h as u32, log2_max_frame_num, qp, cabac, high, reorder, log2_max_poc_lsb, pyramid, num_reorder, colour: cfg.colour };
         let sps = nal::nal_unit(3, nal::NAL_SPS, &sps::write_sps(&p));
         let pps = nal::nal_unit(3, nal::NAL_PPS, &sps::write_pps(qp, cabac, high, bipred_idc));
         let planes = || [Plane::new(mb_w * 16, mb_h * 16, 0), Plane::new(mb_w * 8, mb_h * 8, 128), Plane::new(mb_w * 8, mb_h * 8, 128)];

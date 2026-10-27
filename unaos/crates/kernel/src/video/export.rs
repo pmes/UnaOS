@@ -549,7 +549,7 @@ impl Exp {
         let file = *self.col.file.get_or_insert(match &src {
             Some((_, fc)) => *fc,
             None => RGBA_COLOUR,
-        });
+        }); if !self.rgba.started() { self.rgba.cfg.colour = Some((file.0.primaries, file.0.transfer, file.0.matrix, file.2)); } // H264ENCCOLOURHOST (LEDGER SR377): the SAME file colour as the SPS VUI (h264enc_core `Config::colour`), set before the encoder is built
         match src {
             Some((p, (_, k, full))) if (k, full) == (file.1, file.2) => {
                 self.col.planes += 1;
