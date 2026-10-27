@@ -344,7 +344,7 @@ fn ensure_wifi() {
     #[cfg(all(target_arch = "x86_64", feature = "wifi"))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("wifi", crate::wifi::verb::selftest); }
+        if !DONE.swap(true, Ordering::AcqRel) { register("wifi", crate::wifi::verb::selftest); #[cfg(feature = "wifi10")] register("phy", crate::wifi::bringup::phy_tests); } // PHYONCE-TESTS (B954): `tests phy`, wifi10's per-boot one-shots alone (the bringup.rs tail)
     }
 }
 

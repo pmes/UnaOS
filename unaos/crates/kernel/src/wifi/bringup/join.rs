@@ -421,9 +421,9 @@ fn lose(st: &mut Station, why: &'static str) {
     );
 }
 
-/// From `wifi10()`'s once-per-boot guard (an operator's second `tests wifi`): STATIONREJOIN (B891) — the pass is NEVER
-/// reopened (its PHY one-shots, `htphyinit::tx_prep`, WIFI11's power control, `tx::prep`, `rx::arm`, ran once this boot);
-/// a LOST station gets ONE re-join attempt now on the same PHY (`rejoin_step`, the backoff skipped). Always `false`.
+/// From `wifi10()`'s once-per-boot guard (an operator's second `tests wifi`): STATIONREJOIN (B891) — the pass is NEVER reopened
+/// (its per-boot one-shots, `phy::once` — `htphyinit::tx_prep`, WIFI11's power control, `tx::prep`, `rx::arm` — ran once this boot,
+/// from `tests wifi` or `tests phy`, PHYONCE-CITE B954); a LOST station gets ONE re-join attempt now on the same PHY (`rejoin_step`, the backoff skipped). Always `false`.
 pub(super) fn rejoin() -> bool {
     rejoin_step(true);
     false
@@ -568,7 +568,7 @@ fn rejoin_step(force: bool) {
         }
     };
     serial_println!(
-        "[wifi10] station rejoin n={} after={} why={} -> {} — the same PHY: no tx_prep, power control or tx::prep re-run (STATIONREJOIN B891)",
+        "[wifi10] station rejoin n={} after={} why={} -> {} — the same PHY: phy::once not re-run (STATIONREJOIN B891)",
         n, after, why, verdict
     );
     if verdict == "linked" {
