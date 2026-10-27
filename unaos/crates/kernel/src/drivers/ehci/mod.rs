@@ -19069,7 +19069,7 @@ pub fn service_ehci_hid() {
     // passes per second and this measures the gap BETWEEN them, which is the quantity `dark_gap_ms`
     // is made of; stamped here, beside its twin and above the lock, for the identical reason.
     pass_period_note();
-    let mut g = EHCI_HID.lock(); crate::pointerfeel::note_pass(crate::arch::ms()); // PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
+    let mut g = EHCI_HID.lock(); crate::pointerfeel::note_pass(crate::arch::ms()); crate::drivers::i8042::pump(decode_boot_keyboard); // ZENBOOKI8042 (Z3): the i8042 transport drains here, under this lock, handed the one boot-keyboard decoder (LINE-NEUTRAL fold, code first). PUMPHOLE (B541): the pass cadence `tests pointerfeel` classes each report gap by — stamped AFTER the lock, so a pass that waited on it is charged the wait (LINE-NEUTRAL fold, code first)
     let Some(ctrls) = g.as_mut() else { return };
     for c in ctrls.iter_mut() {
         unsafe { c.service() }; #[cfg(all(feature = "lidsleep", feature = "wc"))] c.port_suspend_service(); // USBSUSPEND (B766): the sleep state's SUSPEND/resume of this controller's root ports, under this lock; the body is `suspend` at the file tail. LINE-NEUTRAL fold, code first
@@ -19620,7 +19620,7 @@ pub fn hid_task_start(cpu: usize) {
     if HID_TASK.swap(true, core::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    crate::arch::sched::spawn("hid-pump", hid_task, 0, cpu, crate::arch::sched::PRIO_NORMAL); crate::hidstall::note_pump_cpu(cpu); // HIDSTALL2 (B509): the core whose masked holds the census names
+    crate::drivers::i8042::init(); crate::arch::sched::spawn("hid-pump", hid_task, 0, cpu, crate::arch::sched::PRIO_NORMAL); crate::hidstall::note_pump_cpu(cpu); // ZENBOOKI8042 (Z3): the i8042 controller comes up once, post-ACPI/PCI, before the pass that drains it exists (LINE-NEUTRAL fold, code first). HIDSTALL2 (B509): the core whose masked holds the census names
     serial_println!(
         "[hid] pump task=hid-pump cpu={} cadence=1tick (INPUTSTALL2: the HID pass never waits on the device-service loop)",
         cpu

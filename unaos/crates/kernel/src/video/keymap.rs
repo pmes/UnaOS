@@ -852,3 +852,56 @@ fn win_l(modifiers: u8, usage_edge: u8) -> Option<(Action, &'static str)> {
         None
     }
 }
+
+// ZENBOOKI8042 (zenbook-ledger Z3) — TAIL-APPENDED, so no line above moves. SET 1 (TRANSLATED) TO HID USAGE: the i8042
+// keyboard's make codes in this file's own vocabulary (the HID usage every `Binding`, every layout row and
+// `hid_key_ascii` is keyed by), so the PS/2 transport (`drivers/i8042.rs`) builds a boot report the one decoder reads
+// exactly as a USB one. A break code is the make code | 0x80 (the caller strips it). 0 = no usage.
+
+/// Set-1 base make codes 0x00..=0x58 -> HID usage (HID Usage Tables §10, Keyboard/Keypad page 0x07).
+pub const SET1_TO_HID: [u8; 0x59] = [
+    // 0x00: -, Esc, 1..0, -, =, Backspace, Tab
+    0x00, 0x29, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2D, 0x2E, 0x2A, 0x2B,
+    // 0x10: q w e r t y u i o p [ ] Enter LCtrl a s
+    0x14, 0x1A, 0x08, 0x15, 0x17, 0x1C, 0x18, 0x0C, 0x12, 0x13, 0x2F, 0x30, 0x28, 0xE0, 0x04, 0x16,
+    // 0x20: d f g h j k l ; ' ` LShift \ z x c v
+    0x07, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F, 0x33, 0x34, 0x35, 0xE1, 0x31, 0x1D, 0x1B, 0x06, 0x19,
+    // 0x30: b n m , . / RShift KP* LAlt Space Caps F1 F2 F3 F4 F5
+    0x05, 0x11, 0x10, 0x36, 0x37, 0x38, 0xE5, 0x55, 0xE2, 0x2C, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
+    // 0x40: F6 F7 F8 F9 F10 NumLock ScrollLock KP7 KP8 KP9 KP- KP4 KP5 KP6 KP+ KP1
+    0x3F, 0x40, 0x41, 0x42, 0x43, 0x53, 0x47, 0x5F, 0x60, 0x61, 0x56, 0x5C, 0x5D, 0x5E, 0x57, 0x59,
+    // 0x50: KP2 KP3 KP0 KP. SysRq(Alt+PrtSc) - ISO\ F11 F12
+    0x5A, 0x5B, 0x62, 0x63, 0x46, 0x00, 0x64, 0x44, 0x45,
+];
+
+/// Set-1 codes after an 0xE0 prefix -> HID usage. The E0 2A / E0 AA / E0 36 / E0 B6 fake shifts the Print Screen and
+/// navigation-cluster sequences wrap themselves in are absent on purpose: they map to 0 and are dropped.
+pub const SET1_E0_TO_HID: [(u8, u8); 18] = [
+    (0x1C, 0x58), // KP Enter
+    (0x1D, 0xE4), // Right Ctrl
+    (0x35, 0x54), // KP /
+    (0x37, 0x46), // Print Screen
+    (0x38, 0xE6), // Right Alt
+    (0x47, 0x4A), // Home
+    (0x48, 0x52), // Up
+    (0x49, 0x4B), // Page Up
+    (0x4B, 0x50), // Left
+    (0x4D, 0x4F), // Right
+    (0x4F, 0x4D), // End
+    (0x50, 0x51), // Down
+    (0x51, 0x4E), // Page Down
+    (0x52, 0x49), // Insert
+    (0x53, 0x4C), // Delete
+    (0x5B, 0xE3), // Left GUI
+    (0x5C, 0xE7), // Right GUI
+    (0x5D, 0x65), // Menu (Application)
+];
+
+/// The HID usage of set-1 make `code` (break bit already stripped), `e0` = an 0xE0 prefix preceded it. Pure; 0 = none.
+pub fn set1_usage(e0: bool, code: u8) -> u8 {
+    if e0 {
+        SET1_E0_TO_HID.iter().find(|&&(c, _)| c == code).map(|&(_, u)| u).unwrap_or(0)
+    } else {
+        SET1_TO_HID.get(code as usize).copied().unwrap_or(0)
+    }
+}

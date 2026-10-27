@@ -926,3 +926,28 @@ pub fn pirq_gsi(bus: u8, dev: u8, func: u8, pin: u8, fw_line: u8) -> Result<u32,
 // interrupt counts moving where flight 13 read `ISRARM REFUSED reason=pirq-disabled`.
 const IOAPIC3_APIC_INPUT: bool = true;
 
+
+// ── ZENBOOKI8042 (zenbook-ledger Z3): THE ISA ROUTE QUESTION ────────────────────────────────────────
+/// Which GSI does ISA IRQ `irq` land on, with what polarity and trigger, and how was that decided?
+/// The MADT Interrupt Source Override for bus 0 / `irq` when firmware declared one (its flags win over
+/// the bus default), else identity. ISA's bus default is EDGE and ACTIVE HIGH (ACPI §5.2.12.5), the
+/// opposite of PCI's INTx default `route_pci_intx` applies. The last field is `iso` or `identity`.
+/// Writes nothing; the caller programs the entry with `route_gsi` and unmasks with `set_mask`.
+pub fn isa_gsi(irq: u8) -> (u32, Polarity, Trigger, &'static str) {
+    let c = CENSUS.lock();
+    for i in 0..c.n_isos {
+        let iso = c.isos[i];
+        if iso.bus == 0 && iso.irq == irq {
+            let pol = match Polarity::from_flags(iso.flags) {
+                Polarity::BusDefault => Polarity::ActiveHigh,
+                p => p,
+            };
+            let trig = match Trigger::from_flags(iso.flags) {
+                Trigger::BusDefault => Trigger::Edge,
+                t => t,
+            };
+            return (iso.gsi, pol, trig, "iso");
+        }
+    }
+    (irq as u32, Polarity::ActiveHigh, Trigger::Edge, "identity")
+}
