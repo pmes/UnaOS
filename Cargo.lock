@@ -74,6 +74,7 @@ dependencies = [
  "taffy",
  "text_host",
  "thiserror 2.0.21",
+ "tls_core",
  "tokio",
 ]
 

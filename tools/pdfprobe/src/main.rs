@@ -9,7 +9,7 @@
 //! pdfprobe --render <file> <page> <out.png>
 //! pdfprobe --text <file> <page>
 //! pdfprobe --save <in> <out>
-//! pdfprobe --sign <in> <out> <key.p256> <cert.der> [<chain.der>...]
+//! pdfprobe --sign [--pss] [--sha384] <in> <out> <key.pem|der> <cert.der> [<chain.der>...]
 //! ```
 //!
 //! Prints `pages=<n> version=<v> xref=<table|stream|rebuilt> encrypt=<none|rc4-40|rc4-128|aesv2|aesv3|...>
@@ -31,19 +31,21 @@
 //!
 //! `--sign` (PDFSIGN, LEDGER SR350) opens `<in>` with the empty user password and signs it through `Document::sign`
 //! (one incremental update, a new invisible field `Signature<n+1>` on page 0, adbe.pkcs7.detached, now as /M) with a
-//! RAW 32-byte P-256 private scalar (no key container: the one PEM / PKCS#8 parser is Aether's, PDFSIGN-KEYPARSE owed)
-//! and the DER certificates (the signer's first); prints `sign=<out> bytes=<n> field=<name>` and the signed file's
-//! `sigs=` line (chains unchecked).
+//! key file read by tls_core's ONE key parser (PDFSIGNKEYPARSE, LEDGER SR361: PEM or DER — PKCS#8, PKCS#1 RSA, SEC 1
+//! P-256, Ed25519; a raw 32-byte P-256 scalar that is no key file is still read as one) and the DER certificates (the
+//! signer's first); RSA signs PKCS#1 v1.5, or RSASSA-PSS with `--pss`; `--sha384` picks SHA-384 over SHA-256 (Ed25519
+//! always signs with SHA-512, RFC 8419); prints `sign=<out> bytes=<n> field=<name> key=<rsa|rsa-pss|p256|ed25519>
+//! hash=<sha256|sha384|sha512>` and the signed file's `sigs=` line (chains unchecked).
 
 use pdf_core::content::ops;
 use pdf_core::font::{Fallback, GlyphSink, spans_to_string};
 use pdf_core::render::{Glyphs, TextLog, TextRun, TextSink, png};
-use pdf_core::sig::cms::{SecretKey, SignerKey};
-use pdf_core::sig::{SignRequest, SubFilter, probe_line};
+use pdf_core::sig::cms::{Key, SecretKey, SignerKey, parse_key};
+use pdf_core::sig::{Hash, SignRequest, SubFilter, probe_line};
 use pdf_core::{Document, Object, Page};
 
 fn usage() -> ! {
-    eprintln!("usage: pdfprobe <file> | pdfprobe --render <file> <page> <out.png> | pdfprobe --text <file> <page> | pdfprobe --save <in> <out> | pdfprobe --sign <in> <out> <key.p256> <cert.der> [<chain.der>...]");
+    eprintln!("usage: pdfprobe <file> | pdfprobe --render <file> <page> <out.png> | pdfprobe --text <file> <page> | pdfprobe --save <in> <out> | pdfprobe --sign [--pss] [--sha384] <in> <out> <key.pem|der> <cert.der> [<chain.der>...]");
     std::process::exit(2)
 }
 
@@ -179,14 +181,39 @@ fn main() {
     }
 }
 
-/// `--sign <in> <out> <key.p256> <cert.der> [<chain.der>...]` (PDFSIGN, LEDGER SR350).
+/// `--sign [--pss] [--sha384] <in> <out> <key.pem|der> <cert.der> [<chain.der>...]` (PDFSIGN, LEDGER SR350;
+/// PDFSIGNKEYPARSE, LEDGER SR361).
 fn sign(args: &[String]) {
     use std::io::Read as _;
+    let flags = args.iter().take_while(|a| a.starts_with("--")).count();
+    let (pss, sha384) = (args[..flags].iter().any(|a| a == "--pss"), args[..flags].iter().any(|a| a == "--sha384"));
+    if flags != pss as usize + sha384 as usize || args.len() < flags + 4 {
+        usage();
+    }
+    let args = &args[flags..];
     let read = |p: &String| std::fs::read(p).unwrap_or_else(|e| fail(format!("{p}: {e}")));
     let bytes = read(&args[0]);
     let doc = Document::parse(&bytes).unwrap_or_else(|e| fail(e));
-    let raw: [u8; 32] = read(&args[2]).as_slice().try_into().unwrap_or_else(|_| fail("the key is not a raw 32-byte P-256 scalar"));
-    let key = SecretKey::from_bytes(&raw).unwrap_or_else(|_| fail("the key is not a P-256 private scalar"));
+    let key_file = read(&args[2]);
+    let key = match parse_key(&key_file) {
+        Ok(k) => k,
+        Err(e) => match <[u8; 32]>::try_from(key_file.as_slice()) {
+            Ok(raw) => Key::P256(SecretKey::from_bytes(&raw).unwrap_or_else(|_| fail("the key is not a P-256 private scalar"))),
+            Err(_) => fail(format!("the key is refused: {}", e.why())),
+        },
+    };
+    let hash = if sha384 { Hash::Sha384 } else { Hash::Sha256 };
+    let (signer, kind) = match &key {
+        Key::Rsa(k) if pss => (SignerKey::RsaPss(k, hash), "rsa-pss"),
+        Key::Rsa(k) => (SignerKey::Rsa(k, hash), "rsa"),
+        Key::P256(k) => (SignerKey::P256(k, hash), "p256"),
+        Key::Ed25519(k) => (SignerKey::Ed25519(k), "ed25519"),
+    };
+    let hash_name = match signer.hash() {
+        Hash::Sha256 => "sha256",
+        Hash::Sha384 => "sha384",
+        Hash::Sha512 => "sha512",
+    };
     let certs: Vec<Vec<u8>> = args[3..].iter().map(read).collect();
     let chain: Vec<&[u8]> = certs.iter().map(Vec::as_slice).collect();
     let field = format!("Signature{}", doc.signatures(&bytes).len() + 1);
@@ -198,7 +225,7 @@ fn sign(args: &[String]) {
     let req = SignRequest {
         field: &field,
         page: 0,
-        key: SignerKey::P256(&key),
+        key: signer,
         chain: &chain,
         subfilter: SubFilter::Pkcs7Detached,
         name: None,
@@ -210,6 +237,6 @@ fn sign(args: &[String]) {
     let signed = doc.sign(&bytes, &req, &entropy).unwrap_or_else(|e| fail(e));
     let back = Document::parse(&signed).unwrap_or_else(|e| fail(format!("the signed file does not parse: {e}")));
     std::fs::write(&args[1], &signed).unwrap_or_else(|e| fail(e));
-    println!("sign={} bytes={} field={field}", args[1], signed.len());
+    println!("sign={} bytes={} field={field} key={kind} hash={hash_name}", args[1], signed.len());
     println!("{}", probe_line(&back, &signed));
 }
