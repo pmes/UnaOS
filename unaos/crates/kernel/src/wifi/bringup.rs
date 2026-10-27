@@ -2521,7 +2521,7 @@ mod unwind;
 #[cfg(feature = "wifi9")]
 mod htphyinit;
 #[cfg(feature = "wifi9")]
-mod rx;
+mod rx; #[cfg(feature = "wifi9")] mod window; #[cfg(feature = "wifi9")] mod pmu; // STATIONROAM-PMU (B967): the scoped cfg:0x80 move and the PMU spur-avoid step (bringup/window.rs, bringup/pmu.rs)
 
 /// `tests wifi` (verb.rs): WIFI9's three rungs, in b43's order — MAC suspended (`phy_common.c:455`),
 /// the PHY re-init and tune (`htphyinit::run`), the RX ring and the 5 s window (`rx::run`). Once per
@@ -2712,7 +2712,7 @@ mod join;
 mod phy;
 // WIFIDHCP (B831): the kept station's device fns and the TX ring's caps, for `wifi/data.rs` (the accessor triple).
 #[cfg(feature = "wifi10")]
-pub(super) use join::{station_mac, station_pending, station_rx, station_tx, station_tx_room, station_kat};
+pub(super) use join::{station_mac, station_pending, station_rx, station_tx, station_tx_room, station_kat}; #[cfg(feature = "wifi10")] pub(super) use pmu::kat as pmu_kat; // STATIONROAM-PMU (B967): the `pmu` KAT row
 #[cfg(feature = "wifi10")]
 pub(super) use tx::{FRAMES, FRAME_MAX};
 

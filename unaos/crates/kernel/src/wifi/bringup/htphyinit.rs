@@ -434,11 +434,15 @@ fn tune(h: &mut Ht, ch: u16, e: &ChanR2059) -> Tune {
     classifier(h, HT_CLASS_CTL_OFDM_EN, HT_CLASS_CTL_OFDM_EN);
     if ch <= 14 { h.phy_mask(HT_TEST, !0x840); } // STATIONROAM-5G (B962): phy_ht.c:795 — 2.4 GHz only
     tx_power_fix(h); // phy_ht.c:799-800
-    // b43_phy_ht_spur_avoid, phy_ht.c:733-761 — channel 11: spuravoid=0 (:740-741). The PLL/PMU steps
-    // (:742-748, :752 -> main.c:1204-1218) are ChipCommon/BCMA, outside the d11 window: skipped.
-    h.mmio_w16(TSF_CLK_FRAC_LOW, 0x6666); // main.c:3063-3066 (BCM4331, 160 MHz)
+    // b43_phy_ht_spur_avoid, phy_ht.c:733-761 — spuravoid=1 on channel 13 (:740-741; 14 has no 2059 row, `admit`), else 0.
+    // STATIONROAM-PMU (B967): the PLL/PMU steps (:742-748, :752 -> main.c:1202-1216) are ChipCommon's, reached through aperture 0
+    // (`window::with_core`, cfg:0x80 moved and restored) and run ONLY when the mode changes (`pmu::mode`); else today's writes.
+    let want = (ch == 13) as u8;
+    let mut step = if want != super::pmu::mode() { Some(spur_pll(h, want)) } else { None };
+    h.mmio_w16(TSF_CLK_FRAC_LOW, if want == 1 { 0x3E70 } else { 0x6666 }); // main.c:3040-3058 (BCM4331: 164 MHz spur 1, 160 MHz spur 0)
     h.mmio_w16(TSF_CLK_FRAC_HIGH, 0x6);
-    h.phy_mask(HT_BBCFG, !HT_BBCFG_RSTRX & 0xFFFF); // phy_ht.c:757-758
+    if let Some(s) = step.as_mut() { spur_reset(s); } // main.c:1202-1216, phy_ht.c:752
+    if want == 1 { h.phy_set(HT_BBCFG, HT_BBCFG_RSTRX) } else { h.phy_mask(HT_BBCFG, !HT_BBCFG_RSTRX & 0xFFFF) } // phy_ht.c:754-758
     let cca_ok = reset_cca(h); // phy_ht.c:760
     h.phy_w(0x017e, 0x3830); // phy_ht.c:804
     crate::arch::sched::sleep_ms(8); // phy_common.c:440 — the radio tunes and stabilises
@@ -459,6 +463,12 @@ fn tune(h: &mut Ht, ch: u16, e: &ChanR2059) -> Tune {
     for (reg, v) in HT_BW.iter().zip(bw.iter()) {
         n += 1;
         if h.phy_r(*reg) == *v { ok += 1; }
+    }
+    if let Some(s) = step { // STATIONROAM-PMU (B967): the spur step is ONE more readback item, only when it ran
+        n += 1;
+        if s.ok() { ok += 1; }
+        if s.pll.as_ref().map_or(false, |p| p.ok) { super::pmu::set_mode(want); }
+        spur_line(&s, want);
     }
     Tune { ch, writes, readback_ok: ok, readback_n: n, cca_ok }
 }
@@ -1050,13 +1060,15 @@ pub(super) fn tx_pwr_ctl(h: &mut Ht, p: &[PwrIn; 3]) -> TxPctl {
 /// `phy_common.c:416-441` (`b43_switch_channel`) -> `phy_ht.c:807-835` (`b43_phy_ht_op_switch_channel`): the hardware half of a
 /// channel switch on the PHY `run` initialised this boot — ONLY `tune` (the 2059 PLL, the PHY channel setup, tx_power_fix, the
 /// 8 ms settle), the same fn `run` calls twice. No one-shot: b43's switch re-runs no init, no tx_prep, no power-control setup
-/// (2.4 GHz power control reads the band's SPROM block, `phy_ht.c` tx_power_ctl_setup) and touches no DMA. Channels 1..12 only:
-/// 13/14 take spuravoid=1 (`phy_ht.c:740-741`), whose PMU PLL step is outside the d11 window (STATIONROAM-SWEEP B958: refused by name — ChipCommon is outside the mapped 0x2000 BAR0 extent and the PMU's core on cc rev 37 is unmeasured; STATIONROAM-PMU owed). Refused
+/// (2.4 GHz power control reads the band's SPROM block, `phy_ht.c` tx_power_ctl_setup) and touches no DMA. Channels 1..13:
+/// 13 takes spuravoid=1 (`phy_ht.c:740-741`), whose PMU PLL step is ChipCommon's — reached through BAR0's aperture 0 by a scoped
+/// cfg:0x80 move (`window::with_core`; STATIONROAM-PMU B967; the SWEEP-era "outside the mapped extent" was wrong), gated by
+/// `admit`'s PMU probe; 14 has no 2059 row. Refused
 /// BEFORE any write. Preconditions (the caller, `join::retune`): the MAC suspended, the SHM cookie written, no spinlock held
 /// (`tune` sleeps), the d11 owned (the Station taken out of `STATION`).
 #[cfg(feature = "wifi10")]
 pub(super) fn switch_channel(bar0: u64, ch: u16) -> Result<Tune, &'static str> {
-    admit(ch)?; // STATIONROAM-5G (B962): 1..=12 or a 5 GHz row; 13/14 spuravoid
+    admit(ch)?; // STATIONROAM-5G (B962): 1..=12 or a 5 GHz row; STATIONROAM-PMU (B967): 13 once the PMU probe reads READY
     let Some(e) = chan_entry(wifi_core::ieee80211::chan_freq(ch as u8).unwrap_or(0)) else { return Err("no-channel-row") };
     let mut h = Ht::new(bar0);
     Ok(tune(&mut h, ch, e))
@@ -1064,16 +1076,21 @@ pub(super) fn switch_channel(bar0: u64, ch: u16) -> Result<Tune, &'static str> {
 
 // ── STATIONROAM-5G (rmbp-ledger B962): the 5 GHz rows admitted, and the band switch as b43's PHY re-init ──────────────────────────
 
-/// `switch_channel`'s and `band_switch`'s admit rule, BEFORE any write: channels 1..=12 (13/14 take spuravoid=1, `phy_ht.c:740-741`,
-/// STATIONROAM-PMU owed) and every 5 GHz channel b43's 2059 table carries (`radio_2059.c:58-316`: 36..64, 100..140, 149..165); else
-/// `no-channel-row`. A DFS row is admitted (the PHY may listen there); `tx::dfs_refused` refuses its TX by name.
+/// `switch_channel`'s and `band_switch`'s admit rule, BEFORE any write: channels 1..=13 and every 5 GHz channel b43's 2059 table
+/// carries (`radio_2059.c:58-316`: 36..64, 100..140, 149..165); else `no-channel-row` (14: b43 has no 2484 row). STATIONROAM-PMU
+/// (B967): 13 takes spuravoid=1 (`phy_ht.c:740-741`), so while the PLL is not already in mode 1 it is admitted only when the PMU probe
+/// (`spur_ready`: `live::handle`, `pmu::ready`) read READY, else `pmu:<reason>`. A DFS row is admitted (the PHY may listen there);
+/// `tx::dfs_refused` refuses its TX by name.
 #[cfg(feature = "wifi10")]
 fn admit(ch: u16) -> Result<(), &'static str> {
-    if ch == 13 || ch == 14 {
-        return Err("spuravoid");
+    let ok = (1..=13).contains(&ch) || (ch <= 255 && wifi_core::ieee80211::is_5g(ch as u8) && wifi_core::ieee80211::chan_freq(ch as u8).and_then(chan_entry).is_some());
+    if !ok {
+        return Err("no-channel-row");
     }
-    let ok = (1..=12).contains(&ch) || (ch <= 255 && wifi_core::ieee80211::is_5g(ch as u8) && wifi_core::ieee80211::chan_freq(ch as u8).and_then(chan_entry).is_some());
-    if ok { Ok(()) } else { Err("no-channel-row") }
+    if ch == 13 && super::pmu::mode() != 1 {
+        spur_ready()?;
+    }
+    Ok(())
 }
 
 /// `b43.h:496`, `:506` — the wrapper IOCTL's PHY clock enable and G-mode bits (PHY_RESET and FGC are `super`'s).
@@ -1140,3 +1157,100 @@ pub(super) fn band_switch(bar0: u64, ch: u16, pin: Option<&[PwrIn; 3]>, cookie: 
     Ok(BandSwitch { tune: v.tune, reinit_ok: v.ok, ioctl, tx_prep_ok: tp.rx2tx && tp.rst2rx, pctl })
 }
 
+// ── STATIONROAM-PMU (rmbp-ledger B967): b43's spur-avoid PLL step through ChipCommon's PMU ─────────────────────────────────────
+
+/// `BCMA_CLKCTLST` (`bcma_regs.h:7`) — the d11 core's clock control/status, d11+0x1E0.
+const D11_CLKCTLST: u64 = 0x01E0;
+/// `b43.h:490-491` — `B43_BCMA_CLKCTLST_80211_PLL_REQ`, `_PHY_PLL_REQ`.
+const CLKCTLST_80211_PLL_REQ: u32 = 0x0000_0100;
+const CLKCTLST_PHY_PLL_REQ: u32 = 0x0000_0200;
+
+/// One spur step: the d11 CLKCTLST (before, after both masks), the PLL update, the PHY PLL reset, the PMU's revision.
+struct Spur {
+    clk: (u32, u32),
+    pll: Result<super::pmu::Pll, &'static str>,
+    reset: Result<u32, &'static str>,
+    pmu_rev: u8,
+}
+
+impl Spur {
+    fn ok(&self) -> bool {
+        self.pll.as_ref().map_or(false, |p| p.ok) && self.reset.map_or(false, |v| v & 0x4 == 0)
+    }
+}
+
+/// The radio's window, from `live::handle` (the live proof cfg:0x80 is on the d11, and the bdf).
+fn spur_bus() -> Result<super::window::Pci, &'static str> {
+    let (bar0, bus, dev, func) = super::live::handle().map_err(|_| "no-handle")?;
+    Ok(super::window::Pci { bus, dev, func, bar0 })
+}
+
+/// `admit`'s gate for channel 13: the PMU probe (once per boot) read READY.
+#[cfg(feature = "wifi10")]
+fn spur_ready() -> Result<u8, &'static str> {
+    let mut b = spur_bus().map_err(super::pmu::refusal)?;
+    super::pmu::ready(&mut b).map_err(super::pmu::refusal)
+}
+
+/// `phy_ht.c:742-748`: `bcma_core_pll_ctl(d11, PHY_PLL_REQ, 0, false)` (the request masked, read back),
+/// `bcma_pmu_spuravoid_pllupdate(cc, want)` (`pmu::spur_avoid`, one window move), `bcma_core_pll_ctl(d11, 80211|PHY_PLL_REQ,
+/// 80211|PHY_PLL_ST, false)` — on=false: masked and read back, NO wait (`drivers/bcma/core.c` bcma_core_pll_ctl), as b43 has it.
+fn spur_pll(h: &mut Ht, want: u8) -> Spur {
+    let c0 = unsafe { r32(h.bar0, D11_CLKCTLST) };
+    unsafe { w32(h.bar0, D11_CLKCTLST, c0 & !CLKCTLST_PHY_PLL_REQ) };
+    h.c.core_regs += 1;
+    let _ = unsafe { r32(h.bar0, D11_CLKCTLST) };
+    let (pll, pmu_rev) = match spur_bus() {
+        Ok(mut b) => match super::pmu::ready(&mut b) {
+            Ok(rev) => (super::pmu::spur_avoid(&mut b, want), rev),
+            Err(e) => (Err(e), 0),
+        },
+        Err(e) => (Err(e), 0),
+    };
+    let c1 = unsafe { r32(h.bar0, D11_CLKCTLST) };
+    unsafe { w32(h.bar0, D11_CLKCTLST, c1 & !(CLKCTLST_80211_PLL_REQ | CLKCTLST_PHY_PLL_REQ)) };
+    h.c.core_regs += 1;
+    let c2 = unsafe { r32(h.bar0, D11_CLKCTLST) };
+    Spur { clk: (c0, c2), pll, reset: Err("not-run"), pmu_rev }
+}
+
+/// `b43_wireless_core_phy_pll_reset` (`main.c:1202-1216`, `phy_ht.c:752`) — `pmu::pll_reset`, one window move; not run when the
+/// PLL update did not (its refusal stands).
+fn spur_reset(s: &mut Spur) {
+    if s.pll.is_err() {
+        return;
+    }
+    s.reset = match spur_bus() {
+        Ok(mut b) => super::pmu::pll_reset(&mut b),
+        Err(e) => Err(e),
+    };
+}
+
+/// The step's one line (said on every step: a step runs only on a mode change, into or out of channel 13).
+fn spur_line(s: &Spur, want: u8) {
+    let pll = match &s.pll {
+        Ok(p) => alloc::format!("ctl0:{:#010x}->{:#010x},ctl2:{:#010x}->{:#010x}", p.pre[0], p.post[0], p.pre[1], p.post[1]),
+        Err(_) => alloc::string::String::from("-"),
+    };
+    let ctl = match &s.pll {
+        Ok(p) => alloc::format!("{:#010x}", p.pmu_ctl),
+        Err(_) => alloc::string::String::from("-"),
+    };
+    let reset = match s.reset {
+        Ok(v) if v & 0x4 == 0 => "ok",
+        Ok(_) => "bit2-stuck",
+        Err(e) => e,
+    };
+    let win = if matches!(s.pll, Err("restore-mismatch")) || matches!(s.reset, Err("restore-mismatch")) { "NOT-RESTORED" } else { "restored" };
+    let why = match (&s.pll, s.reset) {
+        (Err(e), _) => *e,
+        (Ok(p), _) if !p.ok => "pll-readback",
+        (Ok(_), Err(e)) => e,
+        _ => "pll-reset",
+    };
+    serial_println!(
+        "[wifi10] pmu spuravoid={} cc_rev={}(erom) pmu_rev={} pll={} pmu_ctl={} pll_reset={} clkctlst={:#010x}->{:#010x} tsf_frac=0x6{:04x} win={} -> {}{} — phy_ht.c:742-761, driver_chipcommon_pmu.c:534-551, main.c:1202-1216, :3040-3058 (STATIONROAM-PMU B967)",
+        want, super::pmu::CC_REV_METAL, s.pmu_rev, pll, ctl, reset, s.clk.0, s.clk.1, if want == 1 { 0x3E70 } else { 0x6666 }, win,
+        if s.ok() { "DONE" } else { "REFUSED reason=" }, if s.ok() { "" } else { why }
+    );
+}
