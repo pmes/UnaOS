@@ -1558,12 +1558,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             // The Pi's order: device service, then input, then render. `arg` carries the core index
             // so each task's own dispatch witness names the core it actually woke up on rather than
             // the one we intended.
-            unaos_kernel::arch::sched::spawn(
+            unaos_kernel::arch::sched::spawn_stack(
                 "usb-pump",
                 usb_pump,
                 svc_cpu,
                 svc_cpu,
-                unaos_kernel::arch::sched::PRIO_NORMAL,
+                unaos_kernel::arch::sched::PRIO_NORMAL, unaos_kernel::arch::sched::PUMP_PATH_STACK_SIZE, // PUMPSTACK (rmbp-ledger B1006) — the x86 usb-pump comes off the BLANKET 16 KiB onto a MEASURED 32 KiB through the existing `spawn_stack` (RENDSTACK's shape, the render spawn below): flight 38 boot 1 halted it at `[stack] guard hit task=usb-pump size=16384 high=17712 holding=2` inside its prtscr step (the PNG encode, then the UnaFS write under the ticket). The Pi's `PUMP_PATH_STACK_SIZE` (this file's tail) is aarch64-only; the x86 twin and the numbers are the PUMPSTACK block at the tail of `arch/x86_64/sched.rs`, which also sizes the singleton RESTART the same. `input` stays 16 KiB: its x86 body only drains the event ring. ⚠ FOLDED, call RENAMED in place, line count unchanged; x86-only by the enclosing cfg.
             );
             unaos_kernel::arch::sched::spawn(
                 "input",
