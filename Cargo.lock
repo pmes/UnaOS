@@ -4552,6 +4552,7 @@ dependencies = [
  "anyhow",
  "bandy",
  "gneiss_pal",
+ "h264enc_core",
  "log",
  "resonance",
  "text_host",
