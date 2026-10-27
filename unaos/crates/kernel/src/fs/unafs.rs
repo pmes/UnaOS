@@ -751,10 +751,10 @@ fn note_sector_busy(e: &BlockError) {
 ///   that ends in `Busy` here has ALREADY absorbed a full bounded wait, and multiplying that by an
 ///   attempt count is the thing to prevent — the deadline stops us after roughly one such wait
 ///   rather than eight.
-/// * **The attempt cap binds every instant-refusal backend.** WEDGE-8's xHCI keeps the original
-///   policy (a masked claimant is told `Busy` immediately, `drivers/block.rs::claim_xhci_for_io`),
-///   so on a USB-backed volume the attempts cost nothing but the inter-attempt yield and the
-///   deadline would never fire. The count is what terminates the loop there.
+/// * **The attempt cap binds every near-instant-refusal backend.** xHCI (x86, Z62) spins a masked
+///   claimant <= 10 ms only on a published holder RUNNING on another CPU, `Busy` at once otherwise
+///   (`drivers/block.rs::claim_xhci_for_io`; aarch64 at once), so a USB attempt costs at most ~10 ms
+///   plus the yield and the deadline would never fire. The count is what terminates the loop there.
 ///
 /// EIGHT, not `fat.rs`'s sixty-four, and the difference is deliberate: a restarted FAT RMW re-runs
 /// ONE sector read-modify-write, whereas a restarted unafs transaction re-runs a whole CoW

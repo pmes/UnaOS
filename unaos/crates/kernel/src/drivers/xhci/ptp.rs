@@ -1841,31 +1841,34 @@ pub fn list(storage: Option<u32>, handle: Option<u32>) -> Vec<Row> {
 
 // ── Callers outside the controller: the loan ───────────────────────────────────────────────────────
 
-/// Run `f` with the controller loaned, waiting (bounded, unmasked only) the way the block layer does.
+/// Run `f` with the controller loaned through the block layer's ONE claim path, claim-only (XHCILOANPTPCOPY, zenbook-ledger
+/// Z69: `BlockLoan::claim_only` — the bounded unmasked wait is `claim_xhci_for_io`'s; a PTP hold is never preempt-off).
 fn with_controller<T>(f: impl FnOnce(&mut XhciController) -> Result<T, &'static str>) -> Result<T, &'static str> {
-    let mut loan = match super::claim() {
-        Ok(l) => l,
-        Err(super::XhciClaimError::NotReady) => return Err("no USB controller"),
-        Err(super::XhciClaimError::Busy) => {
-            if crate::arch::irqs_masked() {
-                return Err("USB busy");
-            }
-            let start = crate::arch::now_cycles();
-            let budget = crate::arch::hw_wait_budget();
-            loop {
-                crate::hlt();
-                match super::claim() {
-                    Ok(l) => break l,
-                    Err(super::XhciClaimError::NotReady) => return Err("no USB controller"),
-                    Err(super::XhciClaimError::Busy) => {}
-                }
-                if crate::arch::now_cycles().wrapping_sub(start) >= budget {
-                    return Err("USB busy");
-                }
-            }
-        }
-    };
+    let mut loan = crate::drivers::block::BlockLoan::claim_only().map_err(|e| match e {
+        crate::drivers::block::BlockError::NotReady => "no USB controller",
+        crate::drivers::block::BlockError::Busy => "USB busy",
+        _ => "USB error",
+    })?;
     f(&mut *loan)
+}
+
+/// XHCILOANPTPCOPY: `tests preemptaudit`'s `ptp_path=` word — a PTP claim must go through the ONE path (the block
+/// layer's PTP-claim counter moves by one) and must hold no publication: `ok` / `no-bump` / `published` / `busy` /
+/// `err`, or `skip(masked|no-xhci)`.
+pub fn loan_path_kat() -> &'static str {
+    if crate::arch::irqs_masked() {
+        return "skip(masked)";
+    }
+    let before = crate::drivers::block::xhci_loan_ptp_claims();
+    let r = with_controller(|_| if crate::drivers::block::xhci_loan_published() { Err("published") } else { Ok(()) });
+    match r {
+        Ok(()) if crate::drivers::block::xhci_loan_ptp_claims() != before => "ok",
+        Ok(()) => "no-bump",
+        Err("published") => "published",
+        Err("USB busy") => "busy",
+        Err("no USB controller") => "skip(no-xhci)",
+        Err(_) => "err",
+    }
 }
 
 /// Object bytes for the volume's `read`.
