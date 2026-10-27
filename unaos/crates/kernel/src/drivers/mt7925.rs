@@ -2649,9 +2649,10 @@ fn link_down(why: &str, h: Option<&mut Hw>) -> bool {
         S9_DOWN.store(true, Ordering::Relaxed);
     }
     let fw = match h { Some(h) => unlink(h, &l), None => String::from("busy") }; // S9-UNLINK (zenbook-ledger Z59): STA_REC remove, BSS_INFO not connected, BCNFT off
+    let rekeys = rekey_clear(); // S10REKEY (zenbook-ledger Z63): the group-rekey record (the KCK/KEK) dropped and zeroized, the EAPOL mailbox emptied; its count on the line
     serial_println!(
-        "[mt7925] s9 link down why={} aid={} tx={} rx={} skip={} full={} fw={}",
-        why, l.aid, l.tx, l.rx_n, l.skip, l.full, fw
+        "[mt7925] s9 link down why={} aid={} tx={} rx={} skip={} full={} fw={} rekeys={}",
+        why, l.aid, l.tx, l.rx_n, l.skip, l.full, fw, rekeys
     );
     l.took
 }
@@ -3080,8 +3081,10 @@ fn key_req(peer: [u8; 6], wcid: u16, pairwise: bool, key_id: u8, key: &[u8; 16])
 /// Hand the radio the keys of a finished handshake (after message 4 went out): BSS_INFO with the SEC TLV, the pairwise key on the AP
 /// peer (wlan 1), the group key on the interface (wlan 19), each command acked 0 (a refusal stops the rest and is named `bss`, `ptk`
 /// or `gtk`). `ch` is the BSS's channel (the RLM TLV); the band and the link come from the S9 link. `MCU_LINK` is taken and put back
-/// on every path; the key arrays and the command page are wiped. One `[mt7925] s10 keys` line, no key byte in it.
-pub fn set_keys(bssid: [u8; 6], ch: u8, tk: &[u8; 16], gtk: &[u8; 16], gtk_id: u8) -> Result<(), String> {
+/// on every path; the key arrays and the command page are wiped. One `[mt7925] s10 keys` line, no key byte in it. S10REKEY
+/// (zenbook-ledger Z63): `tk` None = the GROUP ARM (a rekey): no BSS_INFO, no pairwise key, the one group KEY_V3 on wlan 19 (linux
+/// sends the BSS SEC TLV only with the first key), same channel take/put and wipe, no `s10 keys` line (`rekey_tick`'s line speaks).
+pub fn set_keys(bssid: [u8; 6], ch: u8, tk: Option<&[u8; 16]>, gtk: &[u8; 16], gtk_id: u8) -> Result<(), String> {
     use crypto_core::ct::Zeroize;
     let lk = S9_LINK.lock().as_ref().map(|l| (l.five, l.band));
     let Some((five, band)) = lk else { return Err(String::from("no-link")) };
@@ -3091,12 +3094,19 @@ pub fn set_keys(bssid: [u8; 6], ch: u8, tk: &[u8; 16], gtk: &[u8; 16], gtk_id: u
         Ok(a) => alloc::format!("{:#04x}", a),
         Err(e) => String::from(*e),
     };
-    let b = uni_cmd(&mut h, UNI_BSS_INFO, &bss_sec_req(bssid, band, ch, five));
+    let full = tk.is_some();
+    let b = if full { uni_cmd(&mut h, UNI_BSS_INFO, &bss_sec_req(bssid, band, ch, five)) } else { Ok(0) };
     let (mut p, mut g): (Result<u8, &'static str>, Result<u8, &'static str>) = (Err("skipped"), Err("skipped"));
     if b == Ok(0) {
-        let mut k = key_req(bssid, WCID_PEER, true, 0, tk);
-        p = uni_cmd(&mut h, UNI_STA_REC, &k);
-        k.zeroize();
+        p = match tk {
+            Some(tk) => {
+                let mut k = key_req(bssid, WCID_PEER, true, 0, tk);
+                let r = uni_cmd(&mut h, UNI_STA_REC, &k);
+                k.zeroize();
+                r
+            }
+            None => Ok(0),
+        };
         if p == Ok(0) {
             let mut k = key_req(bssid, WCID_BMC, false, gtk_id, gtk);
             g = uni_cmd(&mut h, UNI_STA_REC, &k);
@@ -3110,6 +3120,9 @@ pub fn set_keys(bssid: [u8; 6], ch: u8, tk: &[u8; 16], gtk: &[u8; 16], gtk_id: u
     core::sync::atomic::fence(Ordering::SeqCst);
     *MCU_LINK.lock() = Some(h);
     if b == Ok(0) && p == Ok(0) && g == Ok(0) {
+        if !full {
+            return Ok(());
+        }
         serial_println!(
             "[mt7925] s10 keys bss={} ptk={} gtk={} wcid={}/{} gtk_id={} -> installed",
             rc(&b), rc(&p), rc(&g), WCID_PEER, WCID_BMC, gtk_id
@@ -3117,7 +3130,9 @@ pub fn set_keys(bssid: [u8; 6], ch: u8, tk: &[u8; 16], gtk: &[u8; 16], gtk_id: u
         return Ok(());
     }
     let (which, r) = if b != Ok(0) { ("bss", &b) } else if p != Ok(0) { ("ptk", &p) } else { ("gtk", &g) };
-    serial_println!("[mt7925] s10 keys bss={} ptk={} gtk={} -> REFUSED why={}", rc(&b), rc(&p), rc(&g), which);
+    if full {
+        serial_println!("[mt7925] s10 keys bss={} ptk={} gtk={} -> REFUSED why={}", rc(&b), rc(&p), rc(&g), which);
+    }
     Err(alloc::format!("{}:{}", which, rc(r)))
 }
 
@@ -3151,6 +3166,88 @@ pub fn s10_kat() -> bool {
     ip[12] = 0x08;
     ok &= s10_is_eapol(&eapol) && !s10_is_eapol(&ip) && !s10_is_eapol(&eapol[..ETH_HDR + 3]) && !s10_is_eapol(&[]);
     ok
+}
+
+// ── S10REKEY (zenbook-ledger Z63) — the WPA2 group-key rekey on the secured link (IEEE Std 802.11-2020 §12.7.7) ───────────────────
+// After the 4-way handshake the AP replaces the group key (typically hourly) with group message 1 (the new GTK wrapped under the
+// KEK); a station that does not answer loses broadcast and multicast and is deauthenticated by many APs. `link_rx`'s divert keeps
+// lifting EAPOL into `S10_EAPOL` for the link's whole life; the station hands its pure judge here once SECURED (`rekey_arm`: a
+// closure owning `wifi::assoc::Rekey`, the KCK/KEK, so the driver names no wifi type), and `rekey_tick` — on the `mt7925-rejoin`
+// task's poll, never the render loop (`set_keys` waits on the MCU up to EVENT_MS per command) — takes the mailbox, judges, installs
+// the GTK through `set_keys`' group arm, then answers group message 2 through `eapol_tx` (wpa_supplicant's and mt76's order: install,
+// then message 2, which is unicast under the PTK). `rekey_clear` (from `link_down`) drops the record (its Drop zeroizes the keys).
+// S10_REKEY is a LEAF lock: the judge (pure, no sleep) runs under it; `set_keys` and `eapol_tx` run with it released; never held
+// with S9_LINK, MCU_LINK or S10_EAPOL. Owed: S10-MFP (the IGTK KDE), S10-REKEY-EVENTRACE. Facts from the standard; no code copied.
+
+/// The station's group-message-1 judge: the whole Ethernet frame in -> (group message 2 as an Ethernet frame, the GTK's key id, the
+/// GTK, the replay counter), or the refusal's word. It owns the KCK/KEK; dropping it zeroizes them.
+pub type GroupJudge = alloc::boxed::Box<dyn FnMut(&[u8]) -> Result<(Vec<u8>, u8, [u8; 16], u64), &'static str> + Send>;
+
+/// One secured link's rekey record: the judge, the BSS and its channel (for `set_keys`), the rekeys installed.
+struct Rekey10 {
+    judge: GroupJudge,
+    bssid: [u8; 6],
+    ch: u8,
+    n: u32,
+}
+
+/// Some from a SECURED `tests wifijoin` until `link_down`. A LEAF lock (see the block head).
+static S10_REKEY: crate::sync::Mutex<Option<Rekey10>> = crate::sync::Mutex::new(None);
+
+/// The station's arm after SECURED: the record replaced (an old one dropped, its keys zeroized), the mailbox emptied, and the
+/// `mt7925-rejoin` task started if it is not yet (its poll runs `rekey_tick`).
+pub fn rekey_arm(bssid: [u8; 6], ch: u8, judge: GroupJudge) {
+    let old = S10_REKEY.lock().replace(Rekey10 { judge, bssid, ch, n: 0 });
+    drop(old);
+    let stale = S10_EAPOL.lock().take();
+    drop(stale);
+    #[cfg(feature = "wifi")]
+    {
+        rejoin_spawn();
+    }
+}
+
+/// From `link_down`: the record dropped (the KCK/KEK zeroized by its Drop), the mailbox emptied; the rekeys it installed (0 with none).
+fn rekey_clear() -> u32 {
+    let old = S10_REKEY.lock().take();
+    let n = old.as_ref().map_or(0, |r| r.n);
+    drop(old);
+    let stale = S10_EAPOL.lock().take();
+    drop(stale);
+    n
+}
+
+/// One check from the `mt7925-rejoin` poll: nothing with no record; else the newest EAPOL frame (the mailbox when smolnet drains
+/// the link, else one `eapol_rx` drive), judged under S10_REKEY, then with the lock released the GTK into the radio (`set_keys`'
+/// group arm, the GTK wiped after) and group message 2 out (`eapol_tx`). One line per frame: installed or REFUSED by name.
+pub fn rekey_tick() {
+    if S10_REKEY.lock().is_none() {
+        return;
+    }
+    let f = if bound() { S10_EAPOL.lock().take() } else { eapol_rx() };
+    let Some(f) = f else { return };
+    let r = S10_REKEY.lock().as_mut().map(|k| ((k.judge)(&f), k.bssid, k.ch));
+    let Some((res, bssid, ch)) = r else { return };
+    let refuse = |why: &str| {
+        serial_println!("[mt7925] s10 rekey -> REFUSED why={}", why);
+    };
+    let (m2, gtk_id, mut gtk, replay) = match res {
+        Ok(v) => v,
+        Err(w) => return refuse(w),
+    };
+    let set = set_keys(bssid, ch, None, &gtk, gtk_id);
+    crypto_core::ct::Zeroize::zeroize(&mut gtk[..]);
+    if let Err(e) = set {
+        return refuse(&alloc::format!("set-key({})", e));
+    }
+    if !eapol_tx(&m2) {
+        return refuse("tx");
+    }
+    let n = S10_REKEY.lock().as_mut().map_or(0, |k| {
+        k.n += 1;
+        k.n
+    });
+    serial_println!("[mt7925] s10 rekey n={} gtk_id={} replay={} -> installed", n, gtk_id, replay);
 }
 
 // ── S9REJOIN (zenbook-ledger Z59) — S9-UNLINK (the firmware's records unwound on link_down) and S9-REJOIN (the kept plan, re-joined) ──
@@ -3257,7 +3354,16 @@ const REJOIN_POLL_MS: u64 = 250;
 pub fn rejoin_keep(p: Option<RejoinPlan>) {
     let on = p.is_some();
     *REJOIN.lock() = p.map(|plan| Kept { plan, r: crate::wifi::assoc::Rejoin::new() });
-    if on && !REJOIN_SPAWNED.swap(true, Ordering::AcqRel) {
+    if on {
+        rejoin_spawn();
+    }
+}
+
+/// The `mt7925-rejoin` task, spawned once per boot (hoisted verbatim out of `rejoin_keep` by S10REKEY, zenbook-ledger Z63, so a
+/// secured join's `rekey_arm` starts the same ONE task: its poll also runs `rekey_tick`).
+#[cfg(feature = "wifi")]
+fn rejoin_spawn() {
+    if !REJOIN_SPAWNED.swap(true, Ordering::AcqRel) {
         let cpu = crate::arch::smp::xhci_worker_cpu(0).or(crate::arch::smp::service_cpu()).unwrap_or(0);
         crate::arch::sched::spawn("mt7925-rejoin", rejoin_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
     }
@@ -3286,7 +3392,7 @@ fn rejoin_lose(_: &'static str) -> bool {
 fn rejoin_task(_: usize) {
     loop {
         crate::arch::sched::sleep_ms(REJOIN_POLL_MS);
-        rejoin_tick(crate::arch::ms());
+        rejoin_tick(crate::arch::ms()); rekey_tick(); // S10REKEY (zenbook-ledger Z63): the group-key rekey rides the same poll (never the render loop: its key command waits on the MCU)
     }
 }
 

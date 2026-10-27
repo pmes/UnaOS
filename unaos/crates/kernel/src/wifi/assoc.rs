@@ -295,6 +295,8 @@ const KI_M1: u16 = 0x008a; // ver 2 | pairwise | ack
 const KI_M2: u16 = 0x010a; // ver 2 | pairwise | MIC
 const KI_M3: u16 = 0x13ca; // ver 2 | pairwise | install | ack | MIC | secure | encrypted
 const KI_M4: u16 = 0x030a; // ver 2 | pairwise | MIC | secure
+const KI_G1: u16 = 0x1382; // S10REKEY (Z63): ver 2 | group | ack | MIC | secure | encrypted (§12.7.7.2)
+const KI_G2: u16 = 0x0302; // S10REKEY (Z63): ver 2 | group | MIC | secure (§12.7.7.3)
 /// The most key data a message 3 may carry (the data is the RSN element and the KDEs, a few dozen octets).
 const KD_MAX: usize = 1024;
 /// The EtherType of 802.1X (EAPOL), and the Ethernet header it follows.
@@ -309,6 +311,8 @@ pub enum Why {
     RsnMismatch,
     Replay,
     Frame,
+    /// S10REKEY (Z63): a group message 1 whose key data carries no GTK KDE.
+    Kde,
 }
 
 impl Why {
@@ -319,6 +323,7 @@ impl Why {
             Why::RsnMismatch => "rsn-mismatch",
             Why::Replay => "replay",
             Why::Frame => "frame",
+            Why::Kde => "kde",
         }
     }
 }
@@ -469,8 +474,9 @@ fn unwrap_kd(kek: &[u8], kd: &[u8]) -> Result<Vec<u8>, Why> {
 
 /// Walk message 3's unwrapped key data (§12.7.6.4, §12.7.2 h): the first RSN element must equal `rsn_ap` (the AP's beacon element)
 /// byte for byte, and the GTK KDE (element dd, OUI 00-0F-AC, data type 1, key id in bits 0-1 of its first octet) carries a
-/// 16-octet group key. Padding (a dd of length 0 then zeros) is walked as empty elements.
-fn scan_kd(p: &[u8], rsn_ap: &[u8]) -> Result<(u8, [u8; 16]), Why> {
+/// 16-octet group key. Padding (a dd of length 0 then zeros) is walked as empty elements. S10REKEY (Z63): `rsn_ap` None = a group
+/// message 1 (§12.7.7.2: the GTK KDE alone; an RSN element is not required and not judged; no GTK KDE = `Kde`).
+fn scan_kd(p: &[u8], rsn_ap: Option<&[u8]>) -> Result<(u8, [u8; 16]), Why> {
     let (mut i, mut rsn, mut gtk): (usize, bool, Option<(u8, [u8; 16])>) = (0, false, None);
     while i + 2 <= p.len() {
         let (id, len) = (p[i], p[i + 1] as usize);
@@ -479,7 +485,7 @@ fn scan_kd(p: &[u8], rsn_ap: &[u8]) -> Result<(u8, [u8; 16]), Why> {
         }
         let b = &p[i + 2..i + 2 + len];
         if id == 0x30 && !rsn {
-            if &p[i..i + 2 + len] != rsn_ap {
+            if rsn_ap.map_or(false, |ap| &p[i..i + 2 + len] != ap) {
                 return Err(Why::RsnMismatch);
             }
             rsn = true;
@@ -490,10 +496,11 @@ fn scan_kd(p: &[u8], rsn_ap: &[u8]) -> Result<(u8, [u8; 16]), Why> {
         }
         i += 2 + len;
     }
-    match (rsn, gtk) {
-        (true, Some(g)) => Ok(g),
-        (false, _) => Err(Why::RsnMismatch),
-        (true, None) => Err(Why::Frame),
+    match (rsn_ap, rsn, gtk) {
+        (None, _, Some(g)) | (Some(_), true, Some(g)) => Ok(g),
+        (None, _, None) => Err(Why::Kde),
+        (Some(_), false, _) => Err(Why::RsnMismatch),
+        (Some(_), true, None) => Err(Why::Frame),
     }
 }
 
@@ -562,7 +569,7 @@ impl Handshake {
             return Err(Why::Replay);
         }
         let mut plain = unwrap_kd(&self.ptk[16..32], e.data)?;
-        let r = scan_kd(&plain, &self.rsn_ap);
+        let r = scan_kd(&plain, Some(&self.rsn_ap[..]));
         plain.zeroize();
         let (gtk_id, mut gtk) = r?;
         let mut keys = Keys { tk: [0u8; 16], gtk, gtk_id };
@@ -616,13 +623,21 @@ fn kat_m1(an: &[u8; 32], replay: u64) -> Vec<u8> {
     f
 }
 
-/// The authenticator's message 3 for the KAT: key data = `rsn` || the GTK KDE (dd 16, 00-0F-AC 1, id | tx, 0, GTK) || the dd-0
-/// padding to a multiple of 8, wrapped under the KEK, framed (0x13ca), the MIC under the KCK.
+/// The authenticator's message 3 for the KAT: key data = `rsn` || the GTK KDE (dd 16, 00-0F-AC 1, id | tx, 0, GTK), framed by
+/// `kat_wrapped` (0x13ca).
 fn kat_m3(ptk: &[u8; 48], an: &[u8; 32], replay: u64, rsn: &[u8], gtk: &[u8; 16], gtk_id: u8) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(rsn);
     p.extend_from_slice(&[0xdd, 22, 0x00, 0x0f, 0xac, 1, gtk_id | 4, 0]);
     p.extend_from_slice(gtk);
+    kat_wrapped(ptk, 0x13ca, an, replay, &p)
+}
+
+/// An authenticator's EAPOL-Key frame for the KAT (kat_m3's frame half, hoisted by S10REKEY Z63 so message 3 and the group message 1
+/// share it): `plain` with the dd-0 padding to a multiple of 8, wrapped under the KEK, framed with `info`, key length 16, `replay`,
+/// `nonce`, the MIC under the KCK.
+fn kat_wrapped(ptk: &[u8; 48], info: u16, nonce: &[u8; 32], replay: u64, plain: &[u8]) -> Vec<u8> {
+    let mut p = plain.to_vec();
     if p.len() % 8 != 0 {
         p.push(0xdd);
         while p.len() % 8 != 0 {
@@ -631,10 +646,11 @@ fn kat_m3(ptk: &[u8; 48], an: &[u8; 32], replay: u64, rsn: &[u8], gtk: &[u8; 16]
     }
     let mut w = alloc::vec![0u8; p.len() + 8];
     let _ = keywrap::wrap(&ptk[16..32], &p, &mut w);
-    let mut f = alloc::vec![1u8, 3, 0, 0, 2, 0x13, 0xca, 0, 16];
+    let mut f = alloc::vec![1u8, 3, 0, 0, 2, 0, 0, 0, 16];
     f[2..4].copy_from_slice(&((95 + w.len()) as u16).to_be_bytes());
+    f[5..7].copy_from_slice(&info.to_be_bytes());
     f.extend_from_slice(&replay.to_be_bytes());
-    f.extend_from_slice(an);
+    f.extend_from_slice(nonce);
     f.extend_from_slice(&[0u8; 16 + 8 + 8 + 16]);
     f.extend_from_slice(&(w.len() as u16).to_be_bytes());
     f.extend_from_slice(&w);
@@ -643,12 +659,12 @@ fn kat_m3(ptk: &[u8; 48], an: &[u8; 32], replay: u64, rsn: &[u8], gtk: &[u8; 16]
     f
 }
 
-/// `tests wpa2`'s pure legs `[pbkdf2, prf, mic, unwrap, frame]` (the key-command bodies, `keys`, are `mt7925::s10_kat`). Published
+/// `tests wpa2`'s pure legs `[pbkdf2, prf, mic, unwrap, frame, rekey]` (the key-command bodies, `keys`, are `mt7925::s10_kat`). Published
 /// vectors: Annex J.4 (PSK), Annex J.3 (PRF-384), RFC 2202 case 2 (HMAC-SHA-1), RFC 3394 §4.1 (key wrap). No published PTK or
 /// EAPOL-Key MIC vector was readable at the cut, so those two are pinned from an independent implementation (Python hashlib/hmac,
 /// `scratch/.../tools/wpa2vec.py`): PMK = J.4 test 2's PSK, AA a0..a5, SPA b0..b5, SNonce c0..df, ANonce e0..ff -> PTK
 /// e677aae8...1f6c2809 and, for the message 2 of a replay-1 message 1 carrying our RSN element, MIC 4b68b6ef2ab7b3e4be16d2a7dc2eb086.
-pub fn wpa2_kat() -> [bool; 5] {
+pub fn wpa2_kat() -> [bool; 6] {
     let psk2: [u8; 32] = hx("0dc0d6eb90555ed6419756b9a15ec3e3209b63df707dd508d14581f8982721af");
     // 0. pbkdf2: Annex J.4 tests 1 and 2 through `wpa_pmk`; the 64-hex PSK form; the refusals.
     let pbkdf2 = wpa_pmk(b"IEEE", b"password") == Ok(hx("f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e"))
@@ -733,7 +749,103 @@ pub fn wpa2_kat() -> [bool; 5] {
     frame &= eapol_payload(&tx, &spa, &aa).is_none() && tx[0..6] == aa && tx[6..12] == spa && tx[12..14] == [0x88, 0x8e] && tx[14..] == m1[..];
     let rx = eapol_eth(&aa, &spa, &m1);
     frame &= eapol_payload(&rx, &spa, &aa) == Some(&m1[..]) && eapol_payload(&rx, &spa, &spa).is_none();
-    [pbkdf2, prf, micok, unwrap, frame]
+    // 5. rekey (S10REKEY, zenbook-ledger Z63): the group-key handshake over the KCK/KEK this handshake kept (`rekey_rows`).
+    let rekey = rekey_rows(&hs, &Handshake::new(aa, spa, sn, &RSN_PSK_CCMP, &psk2), &k, &m3);
+    [pbkdf2, prf, micok, unwrap, frame, rekey]
+}
+
+// ── S10REKEY (MT7925S10REKEY, zenbook-ledger Z63): the group-key handshake (IEEE Std 802.11-2020 §12.7.7), PURE — no device, no print ──
+// After the 4-way handshake the AP replaces the group key with a 2-message exchange: group message 1 (group, ack, MIC, secure,
+// encrypted key data: the new GTK KDE wrapped under the KEK, a replay counter above every one accepted) and our group message 2
+// (group, MIC, secure, the counter echoed, zero nonce, no key data). `Handshake::rekey` keeps the KCK and KEK of a finished handshake
+// as a `Rekey` (zeroized on drop; the station hands it to the driver inside its judge closure, `mt7925::rekey_arm`, dropped by
+// `rekey_clear` on link_down); `Rekey::on_group_m1` judges through the ONE `ek_parse`, `mic`, `unwrap_kd`, `scan_kd` and `ek_build`.
+// The IGTK KDE (S10-MFP) is walked past, not parsed. Facts from the standard; no code copied.
+
+/// The KCK and KEK of a finished 4-way handshake and the highest replay counter accepted from the AP. Zeroized on drop.
+pub struct Rekey {
+    kck: [u8; 16],
+    kek: [u8; 16],
+    replay: u64,
+}
+
+impl Drop for Rekey {
+    fn drop(&mut self) {
+        self.kck.zeroize();
+        self.kek.zeroize();
+    }
+}
+
+impl Handshake {
+    /// The rekey state of a finished handshake (message 3 accepted, message 4 built): KCK = PTK[0..16], KEK = PTK[16..32], the
+    /// replay counter of message 3. None before that.
+    pub fn rekey(&self) -> Option<Rekey> {
+        if self.step != 2 {
+            return None;
+        }
+        let mut r = Rekey { kck: [0u8; 16], kek: [0u8; 16], replay: self.replay };
+        r.kck.copy_from_slice(&self.ptk[..16]);
+        r.kek.copy_from_slice(&self.ptk[16..32]);
+        Some(r)
+    }
+}
+
+impl Rekey {
+    /// Group message 1 (§12.7.7.2) -> (group message 2 (§12.7.7.3), the GTK's key id, the GTK, the replay counter). Checked in
+    /// that order, the MIC before anything it protects: Key Information, the MIC under the KCK, the replay counter above the last
+    /// accepted, the key data unwrapped under the KEK, the GTK KDE. A refused frame changes nothing; the caller zeroizes the GTK.
+    pub fn on_group_m1(&mut self, f: &[u8]) -> Result<(Vec<u8>, u8, [u8; 16], u64), Why> {
+        let e = ek_parse(f).ok_or(Why::Frame)?;
+        if e.info & KI_JUDGED != KI_G1 {
+            return Err(Why::Frame);
+        }
+        let want = mic(&self.kck, e.frame);
+        if !ct_eq(&e.frame[EK_MIC], &want) {
+            return Err(Why::Mic);
+        }
+        if e.replay <= self.replay {
+            return Err(Why::Replay);
+        }
+        let mut plain = unwrap_kd(&self.kek, e.data)?;
+        let r = scan_kd(&plain, None);
+        plain.zeroize();
+        let (gtk_id, gtk) = r?;
+        let mut m2 = ek_build(e.ver, KI_G2, e.replay, &[0u8; 32], &[]);
+        let m = mic(&self.kck, &m2);
+        m2[EK_MIC].copy_from_slice(&m);
+        self.replay = e.replay;
+        Ok((m2, gtk_id, gtk, e.replay))
+    }
+}
+
+/// `wpa2_kat`'s `rekey` leg: `hs` finished (the pinned PTK `k`), `fresh` not; a canned group message 1 (replay 3, GTK 80..8f, key
+/// id 2) -> the GTK, its id, the counter and group message 2 field by field; the same message again (replay), a flipped MIC, key data
+/// without the GTK KDE, the pairwise message 3 `m3` refused; then replay 4 accepted (the refusals changed nothing).
+fn rekey_rows(hs: &Handshake, fresh: &Handshake, k: &[u8; 48], m3: &[u8]) -> bool {
+    let Some(mut rk) = hs.rekey() else { return false };
+    let mut ok = fresh.rekey().is_none();
+    let gtk: [u8; 16] = core::array::from_fn(|i| 0x80 + i as u8);
+    let mut kde = alloc::vec![0xdd, 22, 0x00, 0x0f, 0xac, 1, 2, 0];
+    kde.extend_from_slice(&gtk);
+    let g1 = kat_wrapped(k, KI_G1, &[0u8; 32], 3, &kde);
+    ok &= match rk.on_group_m1(&g1) {
+        Ok((m2, id, g, replay)) => {
+            m2.len() == 99 && m2[0] == 1 && m2[1] == 3 && m2[2..4] == [0, 95] && m2[4] == 2 && m2[5..7] == [0x03, 0x02]
+                && m2[7..9] == [0, 0] && m2[9..17] == 3u64.to_be_bytes() && m2[17..49].iter().all(|&b| b == 0)
+                && m2[97..99] == [0, 0] && m2[EK_MIC] == mic(&k[..16], &m2) && id == 2 && g == gtk && replay == 3
+        }
+        Err(_) => false,
+    };
+    ok &= rk.on_group_m1(&g1).err() == Some(Why::Replay);
+    let mut bad = kat_wrapped(k, KI_G1, &[0u8; 32], 4, &kde);
+    bad[EK_MIC.start] ^= 1;
+    ok &= rk.on_group_m1(&bad).err() == Some(Why::Mic);
+    let mut pad = [0u8; 16];
+    pad[0] = 0xdd;
+    ok &= rk.on_group_m1(&kat_wrapped(k, KI_G1, &[0u8; 32], 4, &pad)).err() == Some(Why::Kde);
+    ok &= rk.on_group_m1(m3).err() == Some(Why::Frame);
+    ok &= rk.on_group_m1(&kat_wrapped(k, KI_G1, &[0u8; 32], 4, &kde)).map_or(false, |r| r.3 == 4);
+    ok
 }
 
 // ── S9REJOIN (MT7925S9REJOIN, zenbook-ledger Z59): STATIONREJOIN's backoff (rmbp-ledger B891), MOVED verbatim from wifi/data.rs ──
