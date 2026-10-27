@@ -3505,6 +3505,7 @@ dependencies = [
  "font_core",
  "pixel_core",
  "svg_core",
+ "tls_core",
 ]
 
 [[package]]
