@@ -146,25 +146,15 @@ pub fn aes_gcm(encrypt: bool, key: &[u8], iv: &[u8], aad: &[u8], tag_len: usize,
 /// increment modulo 2^length, the rest stays fixed; None when the data needs more blocks than the counter has
 /// values (the counter would repeat), or a length is out of range.
 pub fn aes_ctr(key: &[u8], counter: &[u8], length: u32, data: &[u8]) -> Option<Vec<u8>> {
+    // CRYPTOONE-2 (SR342): crypto_core's one CTR, its n-bit counter WebCrypto's `length`; `fits` is the repeat refusal.
     let a = Aes::new(key).ok()?;
-    if counter.len() != 16 || length == 0 || length > 128 {
+    let counter: &[u8; 16] = counter.try_into().ok()?;
+    let bits = u8::try_from(length).ok()?;
+    if !crypto_core::ctr::fits(bits, data.len()) {
         return None;
     }
-    let blocks = data.len().div_ceil(16) as u128;
-    if length < 128 && blocks > (1u128 << length) {
-        return None;
-    }
-    let mask: u128 = if length == 128 { u128::MAX } else { (1u128 << length) - 1 };
-    let mut ctr = u128::from_be_bytes(counter.try_into().ok()?);
     let mut out = data.to_vec();
-    for chunk in out.chunks_mut(16) {
-        let mut ks = ctr.to_be_bytes();
-        a.encrypt_block(&mut ks);
-        for (b, k) in chunk.iter_mut().zip(ks.iter()) {
-            *b ^= k;
-        }
-        ctr = (ctr & !mask) | (ctr.wrapping_add(1) & mask);
-    }
+    crypto_core::ctr::ctr(&a, counter, bits, &mut out);
     Some(out)
 }
 
@@ -250,62 +240,15 @@ pub fn aes_cbc(encrypt: bool, key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<
 /// AES Key Wrap (RFC 3394 §2.2.1 / §2.2.2, the default IV A6A6A6A6A6A6A6A6); None for data that is not a
 /// multiple of 8 bytes (at least 16 to wrap, 24 to unwrap) or an unwrap whose integrity check fails.
 pub fn aes_kw(wrap: bool, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
-    let a = Aes::new(key).ok()?;
-    const IV: [u8; 8] = [0xA6; 8];
-    if data.len() % 8 != 0 {
-        return None;
-    }
+    // CRYPTOONE-2 (SR342): crypto_core's one RFC 3394 (`keywrap`); its Length / Auth / key errors are this fn's None.
     if wrap {
-        if data.len() < 16 {
-            return None;
-        }
-        let n = data.len() / 8;
-        let mut aa = IV;
-        let mut r: Vec<[u8; 8]> = data.chunks(8).map(|c| c.try_into().unwrap()).collect();
-        for j in 0..6 {
-            for i in 0..n {
-                let mut b = [0u8; 16];
-                b[..8].copy_from_slice(&aa);
-                b[8..].copy_from_slice(&r[i]);
-                a.encrypt_block(&mut b);
-                let t = (n * j + i + 1) as u64;
-                aa.copy_from_slice(&b[..8]);
-                for (x, y) in aa.iter_mut().zip(t.to_be_bytes()) {
-                    *x ^= y;
-                }
-                r[i].copy_from_slice(&b[8..]);
-            }
-        }
-        let mut out = aa.to_vec();
-        for x in r {
-            out.extend_from_slice(&x);
-        }
+        let mut out = vec![0u8; data.len() + 8];
+        crypto_core::keywrap::wrap(key, data, &mut out).ok()?;
         Some(out)
     } else {
-        if data.len() < 24 {
-            return None;
-        }
-        let n = data.len() / 8 - 1;
-        let mut aa: [u8; 8] = data[..8].try_into().ok()?;
-        let mut r: Vec<[u8; 8]> = data[8..].chunks(8).map(|c| c.try_into().unwrap()).collect();
-        for j in (0..6).rev() {
-            for i in (0..n).rev() {
-                let t = (n * j + i + 1) as u64;
-                let mut b = [0u8; 16];
-                b[..8].copy_from_slice(&aa);
-                for (x, y) in b[..8].iter_mut().zip(t.to_be_bytes()) {
-                    *x ^= y;
-                }
-                b[8..].copy_from_slice(&r[i]);
-                a.decrypt_block(&mut b);
-                aa.copy_from_slice(&b[..8]);
-                r[i].copy_from_slice(&b[8..]);
-            }
-        }
-        if !crypto_core::ct::ct_eq(&aa, &IV) {
-            return None;
-        }
-        Some(r.concat())
+        let mut out = vec![0u8; data.len().checked_sub(8)?];
+        crypto_core::keywrap::unwrap(key, data, &mut out).ok()?;
+        Some(out)
     }
 }
 
@@ -1661,6 +1604,39 @@ mod tests {
         let pt = [0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a];
         assert_eq!(hex(&aes_ctr(&key, &ctr, 64, &pt).unwrap()), "874d6191b620e3261bef6864990db6ce");
         assert!(aes_ctr(&key, &ctr, 1, &[0u8; 33]).is_none(), "three blocks under a 1-bit counter repeat it");
+        // CRYPTOONE-2 (SR342): byte pins from an independent oracle (`openssl enc -aes-{128,256}-ecb -nopad` over the
+        // counter blocks WebCrypto's `length` defines, the 128-bit rows also `openssl enc -aes-{128,256}-ctr`): the counter
+        // block f0f1..feff with its low `length` bits all ones, so every case wraps at block 2; plaintext byte i = 7i+3.
+        let unhex = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        let k256 = unhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+        for (k, length, block, want) in [
+            (&key[..], 1, "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff", "ef86ce6b87465184c9905f25bdc0c4881bfe93efd0f95cba"),
+            (&key[..], 8, "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff", "ef86ce6b87465184c9905f25bdc0c4883e726eee54fae5a0d162da5ada1ef02bf61eb4f52e6b0155"),
+            (&key[..], 32, "f0f1f2f3f4f5f6f7f8f9fafbffffffff", "3feb719b7ffe16c743e82650583fe7ae3a5e10dbd60e6780b54972c3dd70d3bba0ab67ddc4df572a"),
+            (&key[..], 64, "f0f1f2f3f4f5f6f7ffffffffffffffff", "7224800b1528ebec973ffbc757bf43f57f553a3ed54ffa8eb24c44f55c3d9ede4c456d0a15df6027"),
+            (&key[..], 128, "ffffffffffffffffffffffffffffffff", "89f897195dd1abc03272354a6820cfc00e8dea84952e041795f049877ed581b3b4f88cb8cbb7b3ab"),
+            (&k256[..], 1, "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff", "08d56ce946313b0765d8c2459f3ea06eb81d0705aa6d1fe3"),
+            (&k256[..], 8, "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff", "08d56ce946313b0765d8c2459f3ea06e23146e7e787b97653e2b8ba728f66388f271e1504e343c0d"),
+            (&k256[..], 32, "f0f1f2f3f4f5f6f7f8f9fafbffffffff", "07c23e3d1749736ec61ace2883adbf47d1824d293f297b5204e7ee9d8a5f8338f351329954be1371"),
+            (&k256[..], 64, "f0f1f2f3f4f5f6f7ffffffffffffffff", "17c6774aadb0188f5b086e3bd36580edc7cab6c730a0096cda536b500274c67bf1b5d944922219c9"),
+            (&k256[..], 128, "ffffffffffffffffffffffffffffffff", "38363839d77c09eaa1844f9e3a4305a0961277091b59eb72bcfff50084de7d8872ffefa5f47c120f"),
+        ] {
+            let n = if length == 1 { 24 } else { 40 };
+            let p: Vec<u8> = (0..n).map(|i| (i * 7 + 3) as u8).collect();
+            let c = aes_ctr(k, &unhex(block), length, &p).unwrap();
+            assert_eq!(hex(&c), want, "{}-bit key, length {length}", k.len() * 8);
+            assert_eq!(aes_ctr(k, &unhex(block), length, &c).unwrap(), p, "inverse, {}-bit key, length {length}", k.len() * 8);
+        }
+        let f51 = unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710");
+        assert_eq!(
+            hex(&aes_ctr(&key, &ctr, 128, &f51).unwrap()),
+            "874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff5ae4df3edbd5d35e5b4f09020db03eab1e031dda2fbe03d1792170a0f3009cee"
+        );
+        assert!(aes_ctr(&key, &ctr, 8, &[0u8; 256 * 16]).is_some(), "256 blocks under an 8-bit counter use each value once");
+        assert!(aes_ctr(&key, &ctr, 8, &[0u8; 256 * 16 + 1]).is_none(), "257 blocks under an 8-bit counter repeat it");
+        assert!(aes_ctr(&key, &ctr, 0, &pt).is_none(), "length 0");
+        assert!(aes_ctr(&key, &ctr, 129, &pt).is_none(), "length 129");
+        assert!(aes_ctr(&key, &ctr[..15], 64, &pt).is_none(), "a 15-byte counter");
         let sealed = aes_gcm(true, &key, &[7u8; 12], b"aad", 16, b"hello").unwrap();
         assert_eq!(aes_gcm(false, &key, &[7u8; 12], b"aad", 16, &sealed).unwrap(), b"hello");
         let mut bad = sealed.clone();
@@ -1720,5 +1696,38 @@ mod tests {
         let mut bad = wrapped.clone();
         bad[3] ^= 1;
         assert!(aes_kw(false, &kek, &bad).is_none());
+        // CRYPTOONE-2 (SR342): RFC 3394 §4.2-4.6 (KEK 00..17 / 00..1f over 128 / 192 / 256 bits of key data), each wrap
+        // and unwrap; 40-byte pins from an independent oracle (`openssl enc -id-aes{128,256}-wrap -iv A6A6A6A6A6A6A6A6`,
+        // plaintext byte i = 7i+3); then the refusals.
+        let unhex = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        let kd = unhex("00112233445566778899aabbccddeeff000102030405060708090a0b0c0d0e0f");
+        for (kek_len, data_len, want) in [
+            (24, 16, "96778b25ae6ca435f92b5b97c050aed2468ab8a17ad84e5d"),
+            (32, 16, "64e8c3f9ce0f5ba263e9777905818a2a93c8191e7d6e8ae7"),
+            (24, 24, "031d33264e15d33268f24ec260743edce1c6c7ddee725a936ba814915c6762d2"),
+            (32, 24, "a8f9bc1612c68b3ff6e6f4fbe30e71e4769c8b80a32cb8958cd5d17d6b254da1"),
+            (32, 32, "28c9f404c4b810f4cbccb35cfb87f8263f5786e2d80ed326cbc7f0e71a99f43bfb988b9b7a02dd21"),
+        ] {
+            let k: Vec<u8> = (0..kek_len as u8).collect();
+            let w = aes_kw(true, &k, &kd[..data_len]).unwrap();
+            assert_eq!(hex(&w), want, "RFC 3394 wrap, {}-bit KEK, {} bits", kek_len * 8, data_len * 8);
+            assert_eq!(aes_kw(false, &k, &w).unwrap(), &kd[..data_len], "RFC 3394 unwrap, {}-bit KEK", kek_len * 8);
+        }
+        let p40: Vec<u8> = (0..40).map(|i| (i * 7 + 3) as u8).collect();
+        for (kek_len, want) in [
+            (16u8, "6b5c9ba022f2f4c77de16207a6606037e04f413d1c88ec7ef9c93b30c8eb7f27d5ec19b2ba163b82ab096a5c08c805c9"),
+            (32u8, "34e0b2e10b655a780b93e49350160151aff844b5fc9fa663d7780cebd7e5896f9f35defa42d981c4dbf63fec5adbcae0"),
+        ] {
+            let k: Vec<u8> = (0..kek_len).collect();
+            let w = aes_kw(true, &k, &p40).unwrap();
+            assert_eq!(hex(&w), want, "openssl wrap, {}-bit KEK", kek_len as usize * 8);
+            assert_eq!(aes_kw(false, &k, &w).unwrap(), p40, "openssl unwrap, {}-bit KEK", kek_len as usize * 8);
+        }
+        assert!(aes_kw(true, &kek, &data[..8]).is_none(), "one 64-bit block to wrap");
+        assert!(aes_kw(true, &kek, &data[..15]).is_none(), "15 bytes to wrap");
+        assert!(aes_kw(false, &kek, &wrapped[..16]).is_none(), "16 bytes to unwrap");
+        assert!(aes_kw(false, &kek, &p40[..31]).is_none(), "31 bytes to unwrap");
+        assert!(aes_kw(true, &[0u8; 17], &data).is_none(), "a 17-byte KEK");
+        assert!(aes_kw(false, &[0u8; 17], &wrapped).is_none(), "a 17-byte KEK");
     }
 }
