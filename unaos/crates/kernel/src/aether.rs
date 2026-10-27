@@ -173,6 +173,8 @@ pub fn selftest() {
         why(if !drive.tab { "no-tab" } else if !drive.url { "no-omnibox-nav" } else if drive.find == 0 { "no-find" } else { "no-back" });
     }
     net_drive(drive.tails[11].as_deref());
+    let reached = drive.tails[0].as_deref().is_some_and(|f| f.starts_with("PASS") && ints(f, "at=").len() == 3); // `drive`'s guard before `chrome`
+    pdf_verdict(drive.tails[12].as_deref(), reached); // PDF4KERNEL (B999)
     verdict_m3(window, painted, lines, &drive, if ok && m3 && chrome { "PASS" } else { "FAIL" });
 }
 
@@ -206,8 +208,9 @@ fn net_drive(omni: Option<&str>) {
 /// and the three facts the witness carries.
 #[derive(Default)]
 struct Drive {
-    /// M3: focus, hover, select, clip, nav; SR109: tab, url, find, back, zoom, close; AETHERMETAL5: the https omnibox.
-    tails: [Option<alloc::string::String>; 12],
+    /// M3: focus, hover, select, clip, nav; SR109: tab, url, find, back, zoom, close; AETHERMETAL5: the https omnibox;
+    /// PDF4KERNEL (rmbp-ledger B999): the fixture PDF typed into the omnibox (index 12).
+    tails: [Option<alloc::string::String>; 13],
     hover: bool,
     nav: bool,
     select: u64,
@@ -323,6 +326,13 @@ fn chrome(slot: u64, d: &mut Drive) {
     d.back = pass(&d.tails[8], "how=back");
     d.tails[9] = step(slot, ":: AETHER: zoom", &[key(b'=')]);
     d.tails[10] = step(slot, ":: AETHER: tab", &[key(0x17)]);
+    // PDF4KERNEL (rmbp-ledger B999): the omnibox to the staged fixture PDF (crates/user-aether/doc/fixture.pdf, the
+    // builder's stage_welcome) — `:: AETHER: pdf -> PASS pages=2 page=1/2 … painted=<n>`; judged by `pdf_verdict`
+    // beside the SR109 verdict, never in it. Before the https step, which must stay last.
+    let mut evs: alloc::vec::Vec<u64> = alloc::vec![key(0x0C)];
+    evs.extend(b"/system/doc/fixture.pdf".iter().map(|&c| key(c)));
+    evs.push(key(b'\n'));
+    d.tails[12] = step(slot, ":: AETHER: pdf", &evs);
     // AETHERMETAL5: LAST, because the fetch it starts holds the program until its deadline; the omnibox line is
     // written before the fetch, so the step reads it at once. Reported by `net_drive`, never in the verdict.
     let mut evs: alloc::vec::Vec<u64> = alloc::vec![key(0x0C)];
@@ -375,4 +385,18 @@ fn check(why: &dyn Fn(&str)) -> Result<(alloc::vec::Vec<u8>, &'static str), &'st
         return Ok((img, "bad"));
     }
     Ok((img, window))
+}
+
+/// PDF4KERNEL (rmbp-ledger B999): the kernel PDF face's line, reported BESIDE the SR109 verdict (a volume without the
+/// fixture never reds AETHERAPP): `:: AETHERPDF: tail=<the program's `:: AETHER: pdf` tail> -> PASS|FAIL|SKIP ::` —
+/// PASS when the program opened the fixture and page 1 drew (`painted=` > 0), SKIP when the drive never reached the
+/// step (no page report, or no focus box for M3, so `chrome` never ran), FAIL otherwise (no line, or a refusal).
+fn pdf_verdict(tail: Option<&str>, driven: bool) {
+    let painted = tail.map(|t| ints(t, "painted=")).and_then(|v| v.first().copied()).unwrap_or(0);
+    let v = match tail {
+        _ if !driven => "SKIP",
+        Some(t) if t.starts_with("PASS") && painted > 0 => "PASS",
+        _ => "FAIL",
+    };
+    serial_println!(":: AETHERPDF: tail={:?} -> {} ::", tail, v);
 }

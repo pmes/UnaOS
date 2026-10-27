@@ -68,7 +68,7 @@ fixed-unflown: the image line `esp-zenbook` (Z6, 27 kernel knobs) and its QEMU l
     still runs them (the SMBIOS-gated loader variant stays unbuilt).
 15. **ZENBOOK-BPROW** — BUILT (ZENBOOKLANETYPED, Z16, fixed-unflown): `docs/dev/blueprint/boot.md` §1 gains the boards table (loader,
     image line and media verb, oldest, platform token, the QEMU lane of the line, the first-boot doc), one row per board.
-16. **ZENBOOK-LEDGERGATE** — `unaos/scripts/ledger-check.sh` knows the owners {orin, pi, rmbp, shared-gate} and the
+16. **ZENBOOK-LEDGERGATE** — in flight (ZENBOOKLEDGERHEAD, Z39) — `unaos/scripts/ledger-check.sh` knows the owners {orin, pi, rmbp, shared-gate} and the
     queue files {QUEUE, rmbp, orin, pi}; teach it `zenbook` and this file (Z1's row carries `rmbp` meanwhile).
 17. **ZENBOOK-MODEL** — Peter's to settle: the arc calls the machine the "Zenbook S 14 OLED"; ASUS's numbering makes
     UM5606WA the Zenbook S **16** (Linux `alc269.c`: "ASUS UM5606WA"; the S 14 is the Intel UX5406). The platform

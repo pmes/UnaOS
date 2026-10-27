@@ -41,6 +41,10 @@ pub struct Txt {
     mono: bool,
     pub bytes: usize,
     pub faces: usize,
+    /// PDF4KERNEL (rmbp-ledger B999): the regular Sans and Mono faces' bytes (leaked with the engine's), the `Fallback`
+    /// pdf.rs draws a PDF's unembedded fonts with; None when the face is not on the volume.
+    pub sans_face: Option<&'static [u8]>,
+    pub mono_face: Option<&'static [u8]>,
 }
 
 /// Why no face is drawing (the start line's `font_why=`).
@@ -71,6 +75,7 @@ pub fn load() -> (Txt, Option<Why>) {
     let mut faces = 0usize;
     let mut dir: Option<&[u8]> = None;
     let mut first_err = Why::Absent(0);
+    let (mut sans, mut mono_bytes): (Option<&'static [u8]>, Option<&'static [u8]>) = (None, None); // PDF4KERNEL (B999)
     for (k, &(file, role, bold)) in FACES.iter().enumerate() {
         let mut got: Option<Vec<u8>> = None;
         for d in DIRS.iter().filter(|d| dir.map_or(true, |x| x == **d)) {
@@ -98,7 +103,7 @@ pub fn load() -> (Txt, Option<Why>) {
         }
         let Some(v) = got else {
             if k == 0 {
-                return (Txt { eng: None, mono: false, bytes: 0, faces: 0 }, Some(first_err));
+                return (Txt { eng: None, mono: false, bytes: 0, faces: 0, sans_face: None, mono_face: None }, Some(first_err));
             }
             continue; // bold / mono absent: the engine's fallback stack draws them with what is there
         };
@@ -106,16 +111,21 @@ pub fn load() -> (Txt, Option<Why>) {
         let data: &'static [u8] = alloc::boxed::Box::leak(v.into_boxed_slice());
         match Font::parse(data) {
             Ok(f) => {
+                match k {
+                    0 => sans = Some(data), // PDF4KERNEL (B999): the regular faces, pdf.rs's Fallback
+                    2 => mono_bytes = Some(data),
+                    _ => {}
+                }
                 eng.add_face(NAMES[k], role, bold, f);
                 bytes += len;
                 faces += 1;
             }
-            Err(_) if k == 0 => return (Txt { eng: None, mono: false, bytes: 0, faces: 0 }, Some(Why::Parse)),
+            Err(_) if k == 0 => return (Txt { eng: None, mono: false, bytes: 0, faces: 0, sans_face: None, mono_face: None }, Some(Why::Parse)),
             Err(_) => {}
         }
     }
     let mono = eng.has(Role::Mono);
-    (Txt { eng: Some(eng), mono, bytes, faces }, None)
+    (Txt { eng: Some(eng), mono, bytes, faces, sans_face: sans, mono_face: mono_bytes }, None)
 }
 
 impl Txt {

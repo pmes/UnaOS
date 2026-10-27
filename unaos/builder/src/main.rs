@@ -159,10 +159,11 @@ fn stage_welcome(workspace_dir: &std::path::Path, volume: &std::path::Path) -> b
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(&src, dir.join("welcome.html")).unwrap();
     // AETHERMETAL M3 (SR96): every page under doc/ rides too — the click's target (keys.html) must be on the volume.
+    // PDF4KERNEL (rmbp-ledger B999): and its PDFs — `tests aether` types /system/doc/fixture.pdf into the omnibox.
     if let Ok(rd) = std::fs::read_dir(src.parent().unwrap()) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().is_some_and(|x| x == "html") && p.file_name().is_some_and(|n| n != "welcome.html") {
+            if p.extension().is_some_and(|x| x == "html" || x == "pdf") && p.file_name().is_some_and(|n| n != "welcome.html") {
                 let _ = std::fs::copy(&p, dir.join(p.file_name().unwrap()));
             }
         }

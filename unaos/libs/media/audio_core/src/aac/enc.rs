@@ -36,8 +36,13 @@
 //!   window whose filter fired may split at the band b* minimising the two ranges' residual energies after their
 //!   quantised filters (`tns_window` on scratch copies), filter 0 the top range, filter 1 the one below (`tns_multi`);
 //!   that candidate is coded beside the one-filter one and kept when the frame's quantised noise over the mask is
-//!   lower (`nmr`, from `band`). A filter whose indices fit one bit fewer is sent coef_compress. Filters stay upward
-//!   (AACENC-TNS-DOWN owed: the NMR trial picked downward filters that raised the short-block pre-echo).
+//!   lower (`nmr`, from `band`). A filter whose indices fit one bit fewer is sent coef_compress. DOWNWARD FILTERS
+//!   (AACENCTNSDOWN, LEDGER SR406): the kept candidate's filters re-applied downward (`tns_fir`, the same indices: the
+//!   detection is direction-symmetric) are coded beside it and kept when `echo_cost` is lower — the decoder's rebuild
+//!   (dequantised, M/S undone, the decoder's own `tns_synth`) against the unfiltered spectrum, put through the inverse
+//!   transform under the block's window, its noise per 128-sample sub-block over the input's energy there: noise
+//!   before an attack, where the input is quiet, dominates. SR390's NMR trial had picked downward filters that raised
+//!   the short-block pre-echo (NMR is blind to where in time the noise sits).
 //! * THE PSY MODEL (AACENCTNS, LEDGER SR381; `allowed`): the band energies spread by a two-slope Bark function (3GPP TS
 //!   26.403: `SPREAD_LO_DB` 30 / `SPREAD_HI_DB` 15 dB per Bark, one `Spread` table per block type built in `new`), under a
 //!   tonality offset (`TONAL_DB` 18 for a tonal band, `NOISE_DB` 6 for a flat one). THE TONALITY (AACENCPSYPREDDEFAULT,
@@ -289,6 +294,13 @@ pub struct Encoder {
     tns_filters: u8,
     tns_saved: usize,
     lend: isize,
+    /// AACENCTNSDOWN (LEDGER SR406): the downward candidate on (off: SR396's stream), the KAT-only arm that picks it by
+    /// the frame NMR instead of `echo_cost` (SR390's dropped rule), A2's extra condition (NMR not higher), and the last
+    /// unit's filters sent downward
+    tns_down: bool,
+    down_nmr: bool,
+    down_both: bool,
+    tns_down_n: u8,
 }
 
 impl Encoder {
@@ -357,6 +369,10 @@ impl Encoder {
             tns_filters: 0,
             tns_saved: 0,
             lend: 0,
+            tns_down: true,
+            down_nmr: false,
+            down_both: false,
+            tns_down_n: 0,
         })
     }
 
@@ -499,34 +515,48 @@ impl Encoder {
     /// spectrum: 1024 long coefficients, or eight short windows of 128 (window-major). With `mdst` (AACENCPSYPREDDEFAULT
     /// SR396) a long block's MDST of the same windowed block too (`Psy::Pred`); a short block has none.
     fn analyse(&self, seq: u8, raw: &[f32], mdst: bool) -> (Vec<f32>, Option<Vec<f32>>) {
-        let (wl, ws) = (&self.win, &self.win_s);
         if seq == EIGHT_SHORT {
+            let ws = self.short_window();
             let mut x = vec![0f32; 1024];
             let mut z = vec![0f32; 256];
             for w in 0..8 {
                 let o = 448 + w * 128;
-                for n in 0..128 {
-                    z[n] = raw[o + n] * ws[n];
-                    z[128 + n] = raw[o + 128 + n] * ws[127 - n];
-                }
+                for n in 0..256 { z[n] = raw[o + n] * ws[n]; }
                 x[w * 128..w * 128 + 128].copy_from_slice(&self.mdct(&z));
             }
             return (x, None);
         }
-        let mut z = vec![0f32; 2048];
+        let wl = self.long_window(seq);
+        let z: Vec<f32> = (0..2048).map(|n| if wl[n] == 0.0 { 0.0 } else { raw[n] * wl[n] }).collect();
+        (self.mdct(&z), if mdst { Some(self.mdst(&z)) } else { None })
+    }
+
+    /// AACENCTNSDOWN (LEDGER SR406): the one window table — a long sequence's 2048 weights (sine shapes: ONLY_LONG
+    /// rising and falling, LONG_START's flat 1024..1472 and short fall, LONG_STOP's short rise at 448 and flat 576..1024,
+    /// zero elsewhere), which `analyse` applies before the transform and `echo_cost` after the inverse one.
+    fn long_window(&self, seq: u8) -> Vec<f32> {
+        let (wl, ws) = (&self.win, &self.win_s);
+        let mut v = vec![0f32; 2048];
         if seq == LONG_STOP {
-            for n in 0..128 { z[448 + n] = raw[448 + n] * ws[n]; }
-            for n in 576..1024 { z[n] = raw[n]; }
+            for n in 0..128 { v[448 + n] = ws[n]; }
+            for n in 576..1024 { v[n] = 1.0; }
         } else {
-            for n in 0..1024 { z[n] = raw[n] * wl[n]; }
+            for n in 0..1024 { v[n] = wl[n]; }
         }
         if seq == LONG_START {
-            for n in 1024..1472 { z[n] = raw[n]; }
-            for n in 0..128 { z[1472 + n] = raw[1472 + n] * ws[127 - n]; }
+            for n in 1024..1472 { v[n] = 1.0; }
+            for n in 0..128 { v[1472 + n] = ws[127 - n]; }
         } else {
-            for n in 0..1024 { z[1024 + n] = raw[1024 + n] * wl[1023 - n]; }
+            for n in 0..1024 { v[1024 + n] = wl[1023 - n]; }
         }
-        (self.mdct(&z), if mdst { Some(self.mdst(&z)) } else { None })
+        v
+    }
+
+    /// AACENCTNSDOWN (LEDGER SR406): a short window's 256 weights (the sine rise, then its fall); window w sits at
+    /// 448 + 128·w of the block.
+    fn short_window(&self) -> Vec<f32> {
+        let ws = &self.win_s;
+        (0..256).map(|n| if n < 128 { ws[n] } else { ws[255 - n] }).collect()
     }
 
     fn frame(&mut self, cur: &[i16], next: &[i16]) -> AccessUnit {
@@ -561,6 +591,9 @@ impl Encoder {
         let mut filt: Vec<Vec<f32>> = Vec::with_capacity(ch);
         let mut base: Vec<TnsSide> = Vec::with_capacity(ch);
         let mut multi: Vec<Option<(Vec<f32>, TnsSide)>> = Vec::with_capacity(ch);
+        // AACENCTNSDOWN (SR406): per channel the raw block and the unfiltered window-major spectrum (`echo_cost`'s inputs)
+        let mut raws: Vec<Vec<f32>> = Vec::with_capacity(ch);
+        let mut unfs: Vec<Vec<f32>> = Vec::with_capacity(ch);
         for c in 0..ch {
             let mut raw = vec![0f32; 2048];
             for i in 0..FRAME {
@@ -585,6 +618,7 @@ impl Encoder {
             // EIGHT_SHORT / LONG_STOP only) is the `tns_gate` KAT switch
             let gate = self.tns && (!self.tns_gate || seq != ONLY_LONG);
             let unf = if gate && self.tns_multi { Some(s.clone()) } else { None };
+            unfs.push(if gate && self.tns_down { s.clone() } else { Vec::new() });
             let mut t = if gate { self.tns_block(&mut s, &g) } else { TnsSide::none(g.short) };
             if self.tns_multi { t.compress(); }
             let m = match unf {
@@ -601,8 +635,9 @@ impl Encoder {
             filt.push(s);
             base.push(t);
             multi.push(m);
+            raws.push(raw);
         }
-        let (x, allowed, floors, ms0) = self.candidate(&g, &orig, &a0, &fl0, &filt, &base);
+        let (mut x, mut allowed, floors, ms0) = self.candidate(&g, &orig, &a0, &fl0, &filt, &base);
         let mut ms = ms0;
         // AACENCTNSMULTI (RES-PE): the reservoir lends by the frame's perceptual entropy (off: SR381's whole bank)
         let lend: isize = if !self.reservoir { 0 } else if self.res_pe { self.res_lend(frame_pe(&x, &allowed, &g)) } else { self.res as isize };
@@ -624,8 +659,34 @@ impl Encoder {
                 coded = cm;
                 tns = sides_m;
                 ms = msm;
+                x = xm;
+                allowed = am;
             }
         }
+        // AACENCTNSDOWN (LEDGER SR406): THE DIRECTION TRIAL — the kept candidate's filters sent downward (the same
+        // indices re-applied to the unfiltered spectrum), through the same lift → ms_decide → code at the same lend, kept
+        // when the synthesis-side `echo_cost` is lower (`down_both`: and the frame NMR not higher; the KAT-only
+        // `down_nmr`: by the NMR alone, SR390's dropped rule)
+        if self.tns_down && tns.iter().any(|t| t.any()) {
+            let sides_d: Vec<TnsSide> = tns.iter().map(|t| t.flip()).collect();
+            let mut filt_d = unfs.clone();
+            for c in 0..ch { if sides_d[c].any() { sides_d[c].refilter(&mut filt_d[c], g.swb); } }
+            let (xd, ad, fld, msd) = self.candidate(&g, &orig, &a0, &fl0, &filt_d, &sides_d);
+            let side_d: Vec<usize> = sides_d.iter().map(|t| t.bits()).collect();
+            let cd = self.code(&xd, &g, &ad, &fld, &side_d, lend);
+            let keep = if self.down_nmr {
+                self.nmr(&xd, &cd, &ad, &g) < self.nmr(&x, &coded, &allowed, &g)
+            } else {
+                self.echo_cost(&g, seq, &cd, &msd, &sides_d, &unfs, &raws) < self.echo_cost(&g, seq, &coded, &ms, &tns, &unfs, &raws)
+                    && (!self.down_both || self.nmr(&xd, &cd, &ad, &g) <= self.nmr(&x, &coded, &allowed, &g))
+            };
+            if keep {
+                coded = cd;
+                tns = sides_d;
+                ms = msd;
+            }
+        }
+        self.tns_down_n = tns.iter().map(|t| t.downs()).sum();
         self.tns_windows = tns.iter().map(|t| t.filtered()).sum();
         self.tns_filters = tns.iter().map(|t| t.filters()).sum();
         self.tns_saved = tns.iter().map(|t| t.saved()).sum();
@@ -715,7 +776,7 @@ impl Encoder {
             let wts = if self.tns_norm { Some(tns_weights(win, g.swb, start, end)) } else { None };
             if let Some((p, idx, gain)) = tns_window(win, lo, hi, order, res_bits, wts.as_deref()) {
                 side.nf[w] = 1;
-                side.f[w][0] = TnsFilter { length, bands: (start, end), order: p as u8, compress: false, idx, gain };
+                side.f[w][0] = TnsFilter { length, bands: (start, end), order: p as u8, compress: false, idx, gain, down: false };
             }
         }
         side
@@ -791,12 +852,16 @@ impl Encoder {
         for k in lo..hi {
             let q = (a[k] * qs + 0.4054) as i32;
             mq = mq.max(q);
-            let d = if q < 8192 { self.pow43[q as usize] * ds } else { 0.0 };
+            let d = self.dequant(q, ds);
             let r = (x[k].abs() - d) as f64;
             noise += r * r;
         }
         (noise, mq)
     }
+
+    /// AACENCTNSDOWN (LEDGER SR406): |q|^(4/3) at the step `ds` = 2^(0.25·(sf - 100)) (`band`'s rule; 0 past the
+    /// table), the magnitude the decoder reconstructs.
+    fn dequant(&self, q: i32, ds: f32) -> f32 { if q < 8192 { self.pow43[q as usize] * ds } else { 0.0 } }
 
     /// Quantise every band at its base sf + `gofs` (never finer than its overflow limit), hold the scalefactor chain
     /// within ±60, pick the codebooks, count the bits. Bands `top..` of every window are not coded.
@@ -1079,8 +1144,8 @@ struct TnsSide {
 }
 
 /// One TNS filter: its `length` on the wire, the grid bands it filtered (`bands.0..bands.1`), the order (0: a length
-/// only; upward: AACENC-TNS-DOWN owed), coef_compress, the quantised
-/// parcor indices and the synthesis filter's noise gain Σh².
+/// only), coef_compress, the quantised parcor indices, the synthesis filter's noise gain Σh² and the direction
+/// (AACENCTNSDOWN, LEDGER SR406: `down` is direction 1; the gain is the same either way).
 #[derive(Clone, Copy)]
 struct TnsFilter {
     length: u8,
@@ -1089,10 +1154,11 @@ struct TnsFilter {
     compress: bool,
     idx: [i32; 12],
     gain: f64,
+    down: bool,
 }
 
 impl TnsFilter {
-    const OFF: TnsFilter = TnsFilter { length: 0, bands: (0, 0), order: 0, compress: false, idx: [0; 12], gain: 1.0 };
+    const OFF: TnsFilter = TnsFilter { length: 0, bands: (0, 0), order: 0, compress: false, idx: [0; 12], gain: 1.0, down: false };
 }
 
 impl TnsSide {
@@ -1107,6 +1173,26 @@ impl TnsSide {
     fn saved(&self) -> usize { (0..self.windows()).map(|w| self.active(w).filter(|f| f.compress).map(|f| f.order as usize).sum::<usize>()).sum() }
     /// One filter a window (a multi candidate like this one equals its base).
     fn plain(&self) -> bool { (0..self.windows()).all(|w| self.nf[w] <= 1) }
+    /// AACENCTNSDOWN (LEDGER SR406): the same filters (indices, orders, ranges, gains) sent downward; the active
+    /// filters that are (the `tns_down_n` stat).
+    fn flip(&self) -> TnsSide {
+        let mut t = self.clone();
+        for w in 0..t.windows() { for f in t.f[w].iter_mut() { f.down = f.order > 0; } }
+        t
+    }
+    fn downs(&self) -> u8 { (0..self.windows()).map(|w| self.active(w).filter(|f| f.down).count() as u8).sum() }
+    /// AACENCTNSDOWN: this side's filters applied to an UNFILTERED window-major spectrum `u` (grid bands `swb`): each
+    /// active filter's LPC from the decoder's own `tns_lpc` of its stored indices, then `tns_fir` in its direction.
+    fn refilter(&self, u: &mut [f32], swb: &[u16]) {
+        let (bins, res) = if self.short { (128usize, 3u32) } else { (1024usize, 4u32) };
+        for w in 0..self.windows() {
+            for f in self.active(w) {
+                let o = f.order as usize;
+                let lpc = super::decoder::tns_lpc(&f.idx[..o], res);
+                tns_fir(u, w * bins + swb[f.bands.0] as usize, w * bins + swb[f.bands.1] as usize, &lpc, o, f.down);
+            }
+        }
+    }
     /// coef_compress (AACENCTNSMULTI) on every filter whose indices all fit one bit fewer (the decoder's sign extension
     /// then yields the same indices).
     fn compress(&mut self) {
@@ -1146,7 +1232,7 @@ impl TnsSide {
                 w.put(len, f.length as u32);
                 w.put(ord, o as u32);
                 if o == 0 { continue; }
-                w.put(1, 0); // direction: upward (AACENC-TNS-DOWN owed: a downward filter needs a pre-echo-aware cost)
+                w.put(1, f.down as u32); // direction (AACENCTNSDOWN SR406: 1 where `echo_cost` kept the downward candidate)
                 w.put(1, f.compress as u32); // coef_compress (AACENCTNSMULTI)
                 let nb = res - f.compress as u32;
                 for &v in &f.idx[..o] { w.put(nb, (v as u32) & ((1 << nb) - 1)); }
@@ -1212,11 +1298,7 @@ fn tns_window(x: &mut [f32], lo: usize, hi: usize, order: usize, res_bits: u32, 
     }
     let p = (0..order).rev().find(|&m| idx[m] != 0).map(|m| m + 1)?;
     let lpc = super::decoder::tns_lpc(&idx[..p], res_bits);
-    for i in (lo..hi).rev() {
-        let mut e = x[i];
-        for j in 1..=p.min(i - lo) { e += lpc[j - 1] * x[i - j]; }
-        x[i] = e;
-    }
+    tns_fir(x, lo, hi, &lpc, p, false);
     let mut h = vec![0f64; n];
     h[0] = 1.0;
     let mut gain = 1.0;
@@ -1227,6 +1309,25 @@ fn tns_window(x: &mut [f32], lo: usize, hi: usize, order: usize, res_bits: u32, 
         gain += y * y;
     }
     Some((p, idx, gain))
+}
+
+/// AACENCTNSDOWN (LEDGER SR406): the TNS analysis FIR over `x[lo..hi]`, the exact inverse of the decoder's
+/// `tns_synth`: upward (direction 0) e[i] = x[i] + Σ lpc[j]·x[i-j], run from the top down; downward (direction 1)
+/// e[i] = x[i] + Σ lpc[j]·x[i+j], run from the bottom up (each line reads only lines not yet replaced).
+fn tns_fir(x: &mut [f32], lo: usize, hi: usize, lpc: &[f32; 20], p: usize, down: bool) {
+    if down {
+        for i in lo..hi {
+            let mut e = x[i];
+            for j in 1..=p.min(hi - 1 - i) { e += lpc[j - 1] * x[i + j]; }
+            x[i] = e;
+        }
+    } else {
+        for i in (lo..hi).rev() {
+            let mut e = x[i];
+            for j in 1..=p.min(i - lo) { e += lpc[j - 1] * x[i - j]; }
+            x[i] = e;
+        }
+    }
 }
 
 /// AACENCTNSNORM (LEDGER SR385): the band normalisation of TNS detection (3GPP TS 26.403; the FDK encoder's weighted
@@ -1314,8 +1415,9 @@ impl Encoder {
     /// residual energy of the QUANTISED filter over its range (`tns_window` on a scratch copy, with the range's own
     /// AACENCTNSNORM weights; the range's own energy where it does not fire): the window splits at the band b*
     /// minimising the top range's [b*, end) plus the bottom's [start, b*) — the top filter stops where extending it down
-    /// raises the error — when that sum is below the single filter's. Upward only (AACENC-TNS-DOWN owed: measured, the
-    /// NMR trial picked downward filters that raised the short-block pre-echo 5.721e4 -> 1.190e5).
+    /// raises the error — when that sum is below the single filter's. Upward here; AACENCTNSDOWN (SR406) flips the
+    /// kept candidate's filters in `frame`'s direction trial (by `echo_cost`, not the NMR that raised the short-block
+    /// pre-echo 5.721e4 -> 1.190e5 in SR390's trial).
     fn tns_multi(&self, s: &mut [f32], g: &Grid, base: &TnsSide) -> TnsSide {
         let mut side = base.clone();
         if g.short { return side; } // n_filt is 1 bit a short window
@@ -1410,6 +1512,95 @@ impl Encoder {
             }
         }
         total
+    }
+
+    /// AACENCTNSDOWN (LEDGER SR406): the pre-echo-aware cost of a coded candidate, measured on the SYNTHESIS side. Per
+    /// channel, what the decoder rebuilds: the dequantised spectrum (`dequant`, coded bands only), M/S bands back to L/R
+    /// (the decoder's order: M/S, then TNS), de-interleaved to window-major, the decoder's own `tns_synth` per filter in
+    /// its direction over the range the decoder clips it to (`TNS_MAX_BANDS` and the frame's max_sfb); the noise is the
+    /// unfiltered spectrum `unf` less that, put through the encoder's `Imdct` (the decoder's transform, scale 2/N) under
+    /// the block's synthesis window (`long_window` / `short_window`): this block's share of the time-domain noise over
+    /// its 2048 samples. The cost is Σ over the 16 sub-blocks of 128 of noise / (the input `raw`'s energy + `ATTACK_MIN`,
+    /// the detector's floor): noise where the input is quiet (before an attack) dominates.
+    #[allow(clippy::too_many_arguments)]
+    fn echo_cost(&self, g: &Grid, seq: u8, coded: &[Coded], ms: &[bool], sides: &[TnsSide], unf: &[Vec<f32>], raw: &[Vec<f32>]) -> f64 {
+        let ch = coded.len();
+        let m = coded.iter().map(|c| c.max_sfb).max().unwrap_or(0);
+        let (bins, res, tmax) = if g.short { (128usize, 3u32, t::TNS_MAX_BANDS_128[self.sf_index] as usize) } else { (1024usize, 4u32, t::TNS_MAX_BANDS_1024[self.sf_index] as usize) };
+        let mmm = tmax.min(m);
+        let mut xh: Vec<Vec<f32>> = coded
+            .iter()
+            .map(|c| {
+                let mut v = vec![0f32; 1024];
+                for i in 0..g.bands() {
+                    let (gi, b) = (i / g.nb, i % g.nb);
+                    if b >= c.max_sfb || c.cb[gi * c.max_sfb + b] == 0 { continue; }
+                    let ds = math::exp2(0.25 * (c.sf[gi * c.max_sfb + b] - 100) as f64) as f32;
+                    let (lo, hi) = g.rng(i);
+                    for k in lo..hi { let d = self.dequant(c.q[k].abs(), ds); v[k] = if c.q[k] < 0 { -d } else { d }; }
+                }
+                v
+            })
+            .collect();
+        if ch == 2 {
+            let (l, r) = xh.split_at_mut(1);
+            for i in 0..g.bands() {
+                if !ms[i] { continue; }
+                let (lo, hi) = g.rng(i);
+                for k in lo..hi { let (mm, ss) = (l[0][k], r[0][k]); l[0][k] = mm + ss; r[0][k] = mm - ss; }
+            }
+        }
+        let mut cost = 0f64;
+        for c in 0..ch {
+            // de-interleave (the inverse of `interleave`)
+            let mut wm = if g.short { vec![0f32; 1024] } else { xh[c].clone() };
+            if g.short {
+                let (mut pos, mut w0) = (0usize, 0usize);
+                for gi in 0..g.ng {
+                    let gl = g.glen[gi];
+                    for b in 0..g.swb.len() - 1 {
+                        let (lo, hi) = (g.swb[b] as usize, g.swb[b + 1] as usize);
+                        for w in w0..w0 + gl {
+                            wm[w * 128 + lo..w * 128 + hi].copy_from_slice(&xh[c][pos..pos + hi - lo]);
+                            pos += hi - lo;
+                        }
+                    }
+                    w0 += gl;
+                }
+            }
+            let t = &sides[c];
+            for w in 0..t.windows() {
+                for f in t.active(w) {
+                    let o = f.order as usize;
+                    let (lo, hi) = (g.swb[f.bands.0.min(mmm)] as usize, g.swb[f.bands.1.min(mmm)] as usize);
+                    if hi <= lo { continue; }
+                    let lpc = super::decoder::tns_lpc(&f.idx[..o], res);
+                    super::decoder::tns_synth(&mut wm, w * bins + lo, w * bins + hi, &lpc, o, f.down);
+                }
+            }
+            let e: Vec<f32> = unf[c].iter().zip(&wm).map(|(&u, &d)| u - d).collect();
+            let mut nt = vec![0f32; 2048];
+            if g.short {
+                let ws = self.short_window();
+                let mut y = vec![0f32; 256];
+                for w in 0..8 {
+                    self.mdct_s.inverse(&e[w * 128..w * 128 + 128], &mut y);
+                    for n in 0..256 { nt[448 + w * 128 + n] += y[n] * ws[n] * (2.0 / 256.0); }
+                }
+            } else {
+                let wl = self.long_window(seq);
+                let mut y = vec![0f32; 2048];
+                self.mdct.inverse(&e, &mut y);
+                for n in 0..2048 { nt[n] = y[n] * wl[n] * (2.0 / 2048.0); }
+            }
+            for sb in 0..16 {
+                let r = sb * 128..sb * 128 + 128;
+                let noise: f64 = nt[r.clone()].iter().map(|&v| v as f64 * v as f64).sum();
+                let sig: f64 = raw[c][r].iter().map(|&v| v as f64 * v as f64).sum();
+                cost += noise / (sig + ATTACK_MIN);
+            }
+        }
+        cost
     }
 }
 
@@ -1854,7 +2045,9 @@ mod tests {
     const PRE_ECHO_SR378: f64 = 4.257e7;
     const PRE_ECHO_VS_SR378_DB: f64 = 20.0;
     /// SR381 (586, 160); AACENCTNSNORM (SR385): (566, 168), the burst's neighbours now filtered by the normalised gate.
-    const RESERVOIR_BYTES: (usize, usize) = (566, 168);
+    /// AACENCTNSDOWN (SR406): (555, 170) — the burst's EIGHT_SHORT unit codes its filters downward (`echo_cost`), whose
+    /// residual codes in fewer bytes with the reservoir and in a few more at the fixed budget.
+    const RESERVOIR_BYTES: (usize, usize) = (555, 170);
     /// AACENCTNSMULTI (LEDGER SR390): the tone + noise-burst units whose long window carries two filters.
     /// AACENCPSYPREDDEFAULT (SR396; SR390's [0, 9, 11, 19, 28] under the flatness tonality): unit 9's NMR trial now keeps
     /// the one-filter candidate.
@@ -2187,4 +2380,102 @@ mod tests {
         assert!(s_on < mean, "stationary median {s_on} bytes, the mean {mean}");
         assert!(total <= cap, "{total} bytes, the bitrate's {cap}");
     }
+
+    // ---- AACENCTNSDOWN (LEDGER SR406): downward filters kept by the synthesis-side pre-echo cost
+
+    /// `pcm` (`ch` channels) at `kbps` through `set`, fed a frame at a time: (units, per unit of the encode phase
+    /// (windows filtered, filters sent downward), the decoded channels).
+    fn down_run(pcm: &[i16], ch: u16, kbps: u32, set: impl Fn(&mut Encoder)) -> (Vec<AccessUnit>, Vec<(u8, u8)>, Vec<Vec<f64>>) {
+        let mut e = Encoder::new(48000, ch, kbps * 1000).unwrap();
+        set(&mut e);
+        let mut units = Vec::new();
+        let mut st = Vec::new();
+        for f in pcm.chunks(1024 * ch as usize) {
+            for u in e.encode(f) { units.push(u); st.push((e.tns_windows, e.tns_down_n)); }
+        }
+        units.extend(e.flush());
+        let d = decode(&e, &units);
+        (units, st, d)
+    }
+
+    /// The arms the arc measures: SR396's stream (down off), A1 (`echo_cost` alone: the default), A2 (and the NMR not
+    /// higher), SR390's NMR rule, B (SR381's attack gate over the normalised gain, direction by A1). (The seat's ruling
+    /// (b)'s partner-tail arm — the last unit's noise tail added to the block's first half — was measured identical to
+    /// A1 on every fixture, the same down units and numbers, and reverted.)
+    fn down_arms() -> [(&'static str, fn(&mut Encoder)); 5] {
+        [
+            ("off", |e| e.tns_down = false),
+            ("A1", |_| {}),
+            ("A2", |e| e.down_both = true),
+            ("nmr", |e| e.down_nmr = true),
+            ("B", |e| e.tns_gate = true),
+        ]
+    }
+
+    /// TNS-DOWN: (i) `tns_fir` downward (and upward) is inverted exactly by the decoder's `tns_synth`; (ii) per arm on
+    /// the pre-echo fixture (`pre_echo`'s bursts, mono 64 kb/s), the fixed-budget clicks (`tns_clicks`'s), the tone +
+    /// noise bursts and the 1 kHz sine: the units sent downward, the pre-echo, the SNR; the sine carries TNS on no
+    /// stationary unit (the Pred tonality, SR396) and the default keeps every floor against SR396's stream.
+    #[test]
+    fn aac_enc_tns_down() {
+        // (i) the FIR and the decoder's synthesis, both directions
+        let lpc = super::super::decoder::tns_lpc(&[5, -3, 2, 1, -1], 4);
+        let x: Vec<f32> = (0..300).map(|n| (math::sin(n as f64 * 0.21) * 900.0 + math::cos(n as f64 * 1.7) * 200.0) as f32).collect();
+        for down in [false, true] {
+            let mut y = x.clone();
+            tns_fir(&mut y, 20, 280, &lpc, 5, down);
+            assert!(y[20..280].iter().zip(&x[20..280]).any(|(a, b)| (a - b).abs() > 1.0), "down {down}: the FIR changed nothing");
+            super::super::decoder::tns_synth(&mut y, 20, 280, &lpc, 5, down);
+            let worst = y.iter().zip(&x).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(worst < 0.05, "down {down}: round trip worst {worst}");
+        }
+        // (ii) the arms
+        let clicks = bursts(40960, &BURSTS, 1);
+        let tb = tone_bursts(40960);
+        let sine = sine_pcm(48000, 48000, 1000.0, 16000.0);
+        let quiet = |d: &[Vec<f64>], pcm: &[i16]| -> f64 {
+            BURSTS.iter().map(|&p| (p - 768..p - 64).map(|i| { let r = pcm[i] as f64 - d[0][i + PRIMING as usize]; r * r }).sum::<f64>()).sum()
+        };
+        let snr = |d: &[Vec<f64>], pcm: &[i16], ch: usize, c: usize, skip: usize| -> f64 {
+            let n = pcm.len() / ch;
+            let (mut s, mut e) = (0f64, 0f64);
+            for i in skip..n - skip { let x = pcm[i * ch + c] as f64; let r = x - d[c][i + PRIMING as usize]; s += x * x; e += r * r; }
+            10.0 * math::log10(s / e.max(1e-9))
+        };
+        let downs = |st: &[(u8, u8)]| -> Vec<usize> { st.iter().enumerate().filter(|(_, s)| s.1 > 0).map(|(u, _)| u).collect() };
+        let mut table: Vec<(&str, f64, f64, f64, f64, [f64; 2], Vec<usize>, Vec<usize>)> = Vec::new();
+        for (name, set) in down_arms() {
+            let (_, st_p, d_p) = down_run(&clicks, 1, 64, set);
+            let (_, st_c, d_c) = down_run(&clicks, 1, 64, |e| { set(e); e.reservoir = false; });
+            let (_, st_t, d_t) = down_run(&tb, 1, 64, set);
+            let (u_s, st_s, d_s) = down_run(&sine, 2, 128, set);
+            let pre = quiet(&d_p, &clicks);
+            let row = (name, pre, 10.0 * math::log10(PRE_ECHO_SR378 / pre), quiet(&d_c, &clicks), quiet(&d_t, &tb), snr(&d_t, &tb, 1, 0, 0), [snr(&d_s, &sine, 2, 0, 2048), snr(&d_s, &sine, 2, 1, 2048)], u_s.iter().map(|u| u.data.len()).sum::<usize>());
+            std::println!("aac_enc_tns_down: {name}: pre-echo {:.3e} ({:.1} dB under SR378) down units {:?}; fixed-budget clicks {:.3e} down {:?}; tone+bursts before {:.3e} SNR {:.2} dB down {:?}; sine {:.2}/{:.2} dB {} B tns units {:?} down {:?}",
+                row.1, row.2, downs(&st_p), row.3, downs(&st_c), row.4, row.5, downs(&st_t), row.6[0], row.6[1], row.7,
+                st_s.iter().enumerate().filter(|(_, s)| s.0 > 0).map(|(u, _)| u).collect::<Vec<usize>>(), downs(&st_s));
+            let tns_s: Vec<usize> = st_s.iter().enumerate().filter(|(_, s)| s.0 > 0).map(|(u, _)| u).collect();
+            table.push((name, row.1, row.3, row.4, row.5, row.6, downs(&st_p), if name == "A1" { downs(&st_s) } else { tns_s }));
+        }
+        let arm = |n: &str| table.iter().find(|r| r.0 == n).unwrap().clone();
+        let (off, a1, nmr, b) = (arm("off"), arm("A1"), arm("nmr"), arm("B"));
+        // the default (A1) against SR396's stream: the pre-echo no higher (the seat's hard floor), the down units pinned
+        assert!(a1.1 <= off.1 && a1.1 <= PRE_ECHO_SR396, "A1 pre-echo {:.3e}, SR396 {:.3e}", a1.1, off.1);
+        assert_eq!(a1.6, DOWN_UNITS.to_vec());
+        // the fixed-budget clicks: a measured fall (4.731e6 -> 5.236e6), held above `TNS_PRE_ECHO_DB` by `aac_enc_tns_burst`
+        // the tone + bursts no worse before the bursts and in SNR
+        assert!(a1.3 <= off.3 && a1.4 >= off.4 - 0.1, "tone+bursts A1 {:.3e} {:.2} dB, off {:.3e} {:.2} dB", a1.3, a1.4, off.3, off.4);
+        // SR390's NMR rule reproduces its over-application (go-red: the cost, not the direction, decides)
+        assert!(nmr.1 > off.1, "the NMR arm's pre-echo {:.3e}, off {:.3e}", nmr.1, off.1);
+        // the sine: TNS on the units SR385 measured worth +0.6 dB (pinned), none of them downward
+        // under A1, the SNR kept; B (no TNS on stationary blocks) loses that 0.6 dB (AACENC-TNS-TONAL owed)
+        assert_eq!(off.7, (0..45).filter(|&u| u != 29).collect::<Vec<usize>>(), "the sine's TNS units");
+        assert!(a1.7.is_empty(), "A1 sent sine units {:?} downward", a1.7);
+        for c in 0..2 { assert!(a1.5[c] >= off.5[c] && b.5[c] < off.5[c], "sine channel {c}: A1 {:.2} B {:.2} off {:.2}", a1.5[c], b.5[c], off.5[c]); }
+    }
+
+    /// AACENCTNSDOWN (LEDGER SR406): SR396's measured short-block pre-echo (`aac_enc_short_pre_echo`), the hard floor;
+    /// the pre-echo fixture's units A1 sends downward.
+    const PRE_ECHO_SR396: f64 = 5.881e4;
+    const DOWN_UNITS: [usize; 4] = [10, 19, 20, 29];
 }

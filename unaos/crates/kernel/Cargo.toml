@@ -3896,7 +3896,7 @@ svg = ["pixel_core/svg"]
 # audio_core::vorbis), no second decoder (R79): video/webm, video/mp4, video/x-matroska open in the Player.
 # Links av1_core. x86 `wc` + `hda-tone` carry the window and the sound; the aarch64 K8_FEATS arm compiles the
 # dependency only. Kept in sync with `unaos/arroyo` (`_feats` and `K8_FEATS`) and `unaos/builder/src/main.rs`.
-videoplayer = ["dep:av1_core", "dep:vp8_core", "dep:timeline_core", "dep:yuv_core", "dep:h264enc_core"] # NLE6 (LEDGER SR207): the Player's EDL mode links timeline_core
+videoplayer = ["dep:av1_core", "dep:vp8_core", "dep:timeline_core", "dep:yuv_core", "dep:h264enc_core", "dep:h264_core"] # NLE6 (LEDGER SR207): the Player's EDL mode links timeline_core
 
 # KERNEL-DISPLAY-ICC (LEDGER SR372): UNAOS_DISPLAY_ICC=1 — the panel's display transform. `video::colour` builds ONE
 # `icc_core::DisplayTransform` (sRGB to the EDID's matrix/TRC panel) at the a11y filter's first latch and the scanout copy
@@ -4021,6 +4021,7 @@ yuv_core = { path = "../../libs/media/yuv_core", optional = true } # KERNELCOLOU
 # NLE6 (LEDGER SR207): Stria's editor core (no_std + alloc; its one dep demux_core is linked above) — the Player's EDL mode (video/vplay.rs) parses, edits and schedules through it. Pulled only by `videoplayer`.
 timeline_core = { path = "../../libs/media/timeline_core", default-features = false, optional = true }
 h264enc_core = { path = "../../libs/media/h264enc_core", optional = true } # NLE6EXPORT (rmbp-ledger B959): the editor's export on UnaOS (video/export.rs) encodes through h264enc_core's RGBA face (no_std + alloc; its one dep h264_core). Pulled only by `videoplayer`.
+h264_core = { path = "../../libs/media/h264_core", optional = true } # EXPORTSIZEPOLICYPIXEL (rmbp-ledger B998): `tests nle` decodes the export back through h264_core (video/player.rs `row_bars`; no_std + alloc, zero deps, h264enc_core's own dep). Pulled only by `videoplayer`.
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 unafs = { path = "../../libs/fs/unafs", default-features = false }
