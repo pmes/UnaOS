@@ -67,6 +67,17 @@ impl<'a> Cabac<'a> {
         }
     }
 
+    /// The context states (pStateIdx << 1 | valMPS per ctxIdx). HEVCPARSE (LEDGER SR199): hevc_core runs
+    /// this engine (H.265 9.3.4.3 is this decoding engine bit for bit) over its own ctxIdx layout.
+    pub fn contexts(&self) -> &[u8; NUM_CTX] {
+        &self.state
+    }
+
+    /// The context states, writable: H.265's own initialisation (9.3.2.2) and WPP storage / sync (9.3.2.4).
+    pub fn contexts_mut(&mut self) -> &mut [u8; NUM_CTX] {
+        &mut self.state
+    }
+
     /// The slice data the engine reads (for the I_PCM samples).
     pub fn data(&self) -> &'a [u8] {
         self.data

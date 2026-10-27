@@ -1,0 +1,17 @@
+[package]
+name = "hevc_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "HEVCPARSE (SR199): a from-specification H.265 / HEVC bitstream parser and intra decoder (ITU-T Rec. H.265) — NAL units (Annex B and hvcC), VPS / SPS / PPS, slice segment headers, CABAC with every context table, and 8-bit 4:2:0 intra pictures (coding quadtree, 35 intra modes, DCT / DST, dequantisation, deblocking, SAO) — shared by Ring 0 and Ring 3; Stria's hvc1 / hev1 / V_MPEGH/ISO/HEVC video codec."
+
+# HEVCPARSE (LEDGER SR199, CHARTER Stria shared-core): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`. The ONE
+# dependency is h264_core: its CABAC arithmetic decoding engine (H.265 9.3.4.3 is that engine bit for bit), its RBSP bit
+# reader, its NAL framing (emulation prevention, Annex B, length prefixes) and its output `Frame` are reused, not copied.
+[dependencies]
+h264_core = { path = "../h264_core" }
+
+[features]
+default = []
+# `std` only adds `std::error::Error` for `Error`.
+std = ["h264_core/std"]
