@@ -15,10 +15,16 @@
 //!   point = 96/72 CSS px), each rendered by PDF2's `Page::render` at 96 dpi x zoom through PDF3's `GlyphSink` (the
 //!   unembedded faces from text_host's font database: [`fallback`]) and cached per (page, dpi): a zoom re-renders crisp
 //!   instead of resampling, and only the pages near the viewport keep a pixmap;
-//! * the scroll extent: [`PdfDocument::max_scroll`] re-binds the one `Event::Scroll` clamp;
+//! * the scroll extent: [`PdfDocument::max_scroll`] re-binds the one `Event::Scroll` clamp; PDF4-HSCROLL (SR360): the
+//!   pages centre in a lane as wide as the widest page ([`PdfDocument::stack_w`]), and the same clamp moves the
+//!   engine's `scroll_x` over [`PdfDocument::max_scroll_x`] (`pdf_scroll_x`; Left / Right keys, `pdf_view_key`);
 //! * selection: [`select`] — a span-based selection parallel to the DOM one (selection.rs holds DOM boundary points),
-//!   over PDF3's `Page::text` spans; copy joins them through PDF3's `spans_to_string`;
-//! * find: `chrome::find::find_all` per span, the engine's own `FindState`; hits painted as span sub-boxes;
+//!   over PDF3's `Page::text` spans, snapped to their glyph boxes (PDF4GLYPHPOS SR360); copy joins them through PDF3's
+//!   `spans_to_string`;
+//! * find: `chrome::find::find_all` over each page's text joined by PDF3's `spans_to_string_mapped` (a match may cross
+//!   spans of one line), the engine's own `FindState`; hits painted as glyph-bounded span sub-boxes;
+//! * thumbnails: [`thumbs`] (PDF4-THUMBS SR360) — F4 toggles a left strip painted into the same frame, its pages
+//!   through the same (page, dpi) cache; a click scrolls to the page;
 //! * the status line: `AetherEngine::pdf_status` ("Page p / n");
 //! * links and form widgets: [`forms`] (PDF4ANNOTS SR343) — /URI, /GoTo and /Named links (hover: the pointer and the
 //!   status line), check boxes and text fields filled through pdf_core's `Form::set_value` + `Edit::save_update`.
@@ -28,6 +34,7 @@
 
 pub mod forms;
 pub mod select;
+pub mod thumbs;
 #[cfg(test)]
 mod tests;
 
@@ -36,7 +43,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use pdf_core::font::{Fallback, GlyphSink, TextSpan};
+use pdf_core::font::{Fallback, GlyphSink, TextSpan, spans_to_string_mapped};
 use pdf_core::render::Pixmap;
 use pdf_core::{Annot, Document, Form, Page, Ref};
 
@@ -124,6 +131,10 @@ pub struct PdfDocument {
     pub focus: Option<forms::FieldFocus>,
     /// The last fill pdf_core refused, by name (the page shows the file as it was).
     pub form_refused: Option<String>,
+    /// PDF4-THUMBS (SR360): the thumbnail strip is open, and its width in CSS px (0 when closed; `thumbs::STRIP_W`
+    /// device px at the zoom), which the page lane starts after.
+    pub thumbs: bool,
+    pub left: f64,
 }
 
 impl PdfDocument {
@@ -170,6 +181,8 @@ impl PdfDocument {
             hover: None,
             focus: None,
             form_refused: None,
+            thumbs: false,
+            left: 0.0,
         })
     }
 
@@ -177,10 +190,22 @@ impl PdfDocument {
         self.pages.len()
     }
 
-    /// Page `i`'s rect in document CSS px `(x, y, w, h)` for a viewport `vw` CSS px wide.
+    /// Page `i`'s rect in document CSS px `(x, y, w, h)` for a viewport `vw` CSS px wide: centred in the lane right of
+    /// the thumbnail strip, the lane as wide as the widest page when that is wider than the viewport (PDF4-HSCROLL).
     pub fn page_rect(&self, i: usize, vw: f64) -> (f64, f64, f64, f64) {
         let (w, h) = (self.sizes[i].0 * PT, self.sizes[i].1 * PT);
-        (((vw - w) / 2.0).max(GAP), self.tops[i], w, h)
+        let lane = (vw - self.left).max(self.stack_w());
+        (self.left + ((lane - w) / 2.0).max(GAP), self.tops[i], w, h)
+    }
+
+    /// PDF4-HSCROLL (SR360): the stack's width in CSS px (the widest page and a GAP each side).
+    pub fn stack_w(&self) -> f64 {
+        self.sizes.iter().fold(0.0f64, |m, s| m.max(s.0)) * PT + 2.0 * GAP
+    }
+
+    /// PDF4-HSCROLL (SR360): the viewport's horizontal scroll range for a viewport `vw` CSS px wide.
+    pub fn max_scroll_x(&self, vw: f64) -> f64 {
+        (self.stack_w() - (vw - self.left)).max(0.0)
     }
 
     /// The stack's height in CSS px.
@@ -215,7 +240,7 @@ impl PdfDocument {
     }
 
     /// Page `i` rendered at `dpi` (cached).
-    fn pixmap(&self, i: usize, dpi: f64) -> Rc<Pixmap> {
+    pub(crate) fn pixmap(&self, i: usize, dpi: f64) -> Rc<Pixmap> {
         let key = (i, dpi_key(dpi));
         if let Some(p) = self.cache.borrow().get(&key) {
             return p.clone();
@@ -242,9 +267,9 @@ impl PdfDocument {
         self.page_at(scroll_y)..=self.page_at(scroll_y + vh)
     }
 
-    /// The frame for the shell: `device` pixels at `zoom`, for a CSS viewport `vw` wide scrolled to `scroll_y`
-    /// (`AetherEngine::present_rgba`'s contract: width, height, straight RGBA).
-    pub fn present(&self, device: (u32, u32), zoom: f64, vw: f64, scroll_y: f64) -> (u32, u32, Vec<u8>) {
+    /// The frame for the shell: `device` pixels at `zoom`, for a CSS viewport `vw` wide scrolled to (`scroll_x`,
+    /// `scroll_y`) (`AetherEngine::present_rgba`'s contract: width, height, straight RGBA); the open thumbnail strip last.
+    pub fn present(&self, device: (u32, u32), zoom: f64, vw: f64, scroll_x: f64, scroll_y: f64) -> (u32, u32, Vec<u8>) {
         let (dw, dh) = (device.0 as usize, device.1 as usize);
         let mut out = vec![255u8; dw * dh * 4];
         for p in out.chunks_exact_mut(4) {
@@ -257,7 +282,7 @@ impl PdfDocument {
         let vis = self.visible(scroll_y, vh);
         for i in vis.clone() {
             let (x, y, w, h) = self.page_rect(i, vw);
-            let (ox, oy) = ((x * zoom).round() as i64, ((y - scroll_y) * zoom).round() as i64);
+            let (ox, oy) = (((x - scroll_x) * zoom).round() as i64, ((y - scroll_y) * zoom).round() as i64);
             let pm = self.pixmap(i, dpi);
             let (pw, ph) = if pm.w > 0 { (pm.w, pm.h) } else { ((w * zoom).ceil() as usize, (h * zoom).ceil() as usize) };
             // The page's columns that land on the frame.
@@ -294,10 +319,13 @@ impl PdfDocument {
                 }
             }
         }
-        // Only the pages at this dpi on (or next to) the screen keep a pixmap.
+        let strip = if self.thumbs { thumbs::paint(self, &mut out, (dw, dh), zoom, scroll_y) } else { None };
+        // Only the pages at this dpi on (or next to) the screen keep a pixmap, and the strip's visible thumbnails.
         let (lo, hi) = (vis.start().saturating_sub(1), vis.end() + 1);
-        let key = dpi_key(dpi);
-        self.cache.borrow_mut().retain(|k, _| k.1 == key && k.0 >= lo && k.0 <= hi);
+        let (key, tkey) = (dpi_key(dpi), dpi_key(thumbs::THUMB_DPI));
+        self.cache
+            .borrow_mut()
+            .retain(|k, _| (k.1 == key && k.0 >= lo && k.0 <= hi) || strip.is_some_and(|(a, b)| k.1 == tkey && k.0 >= a && k.0 <= b));
         (device.0, device.1, out)
     }
 
@@ -317,36 +345,44 @@ impl PdfDocument {
             }
         }
         for (k, h) in self.hits.iter().enumerate().filter(|(_, h)| h.page == i) {
-            if let Some(sp) = spans.get(h.span) {
-                let col = if Some(k) == self.cur { ACTIVE_MARK } else { crate::selection::FIND_MARK };
-                out.push((select::sub_box(sp, h.lo, h.hi), col));
-            }
+            let col = if Some(k) == self.cur { ACTIVE_MARK } else { crate::selection::FIND_MARK };
+            out.extend(select::rects(&range_sel(h), i, &spans).into_iter().map(|r| (r, col)));
         }
         out
     }
 
-    /// The text position under viewport CSS (`x`, `y`), for a viewport `vw` wide scrolled to `scroll_y`.
-    pub fn hit_at(&self, x: f64, y: f64, vw: f64, scroll_y: f64) -> Option<Pos> {
-        let dy = y + scroll_y;
+    /// The text position under viewport CSS (`x`, `y`), for a viewport `vw` wide scrolled to `scroll` (x, y).
+    pub fn hit_at(&self, x: f64, y: f64, vw: f64, scroll: (f64, f64)) -> Option<Pos> {
+        let (x, dy) = (x + scroll.0, y + scroll.1);
         let page = self.page_at(dy);
         let (px, py, _, _) = self.page_rect(page, vw);
         let spans = self.spans(page);
         select::hit(&spans, (x - px) / PT, (dy - py) / PT).map(|(span, ch)| Pos { page, span, ch })
     }
 
-    /// A find hit's box on its page (72-dpi page space).
+    /// A find hit's box on its page (72-dpi page space): the union of its glyph-bounded span boxes.
     pub fn range_rect(&self, r: &Range) -> Option<[f64; 4]> {
-        self.spans(r.page).get(r.span).map(|s| select::sub_box(s, r.lo, r.hi))
+        let spans = self.spans(r.page);
+        select::rects(&range_sel(r), r.page, &spans)
+            .into_iter()
+            .reduce(|u, q| [u[0].min(q[0]), u[1].min(q[1]), u[2].max(q[2]), u[3].max(q[3])])
     }
 
-    /// Every case-insensitive match of `query` (the find bar's matcher), span by span.
+    /// Every case-insensitive match of `query` (the find bar's matcher) in each page's text as PDF3's one line
+    /// assembler joins it (`spans_to_string_mapped`): a match may cross spans of one line, never a line break.
     pub fn find_all(&self, query: &str) -> Vec<Range> {
         let mut out = Vec::new();
         for page in 0..self.pages.len() {
-            for (span, s) in self.spans(page).iter().enumerate() {
-                for (a, b) in crate::chrome::find::find_all(&s.text, query) {
-                    let (lo, hi) = (s.text[..a].chars().count(), s.text[..b].chars().count());
-                    out.push(Range { page, span, lo, hi });
+            let spans = self.spans(page);
+            let (text, map) = spans_to_string_mapped(&spans);
+            for (a, b) in crate::chrome::find::find_all(&text, query) {
+                if text[a..b].contains('\n') {
+                    continue;
+                }
+                let (ca, cb) = (text[..a].chars().count(), text[..b].chars().count());
+                let cut = &map[ca..cb.min(map.len())];
+                if let (Some(&(span, lo)), Some(&(end, last))) = (cut.iter().flatten().next(), cut.iter().flatten().last()) {
+                    out.push(Range { page, span, lo, end, hi: last + 1 });
                 }
             }
         }
@@ -379,6 +415,12 @@ impl PdfDocument {
             _ => (p, p),
         }
     }
+}
+
+/// A find hit as a selection (its rects come from the selection's per-span path).
+fn range_sel(r: &Range) -> PdfSelection {
+    let (a, b) = r.bounds();
+    PdfSelection { anchor: Some(a), focus: Some(b), drag: None }
 }
 
 /// The last path segment of `url` (the title of a PDF without /Info /Title).
@@ -447,8 +489,14 @@ impl crate::AetherEngine {
 
     /// `press_at` on a PDF: a caret, the word or the span under the pointer; Shift extends.
     pub(crate) fn pdf_press(&mut self, x: f64, y: f64, clicks: u8, shift: bool) {
-        let (vw, sy) = (self.width as f64, self.scroll_y);
+        let (vw, sy) = (self.width as f64, (self.scroll_x, self.scroll_y));
         let Some(pdf) = self.pdf.as_mut() else { return };
+        // PDF4-THUMBS (SR360): a press in the open strip jumps to the thumbnail's page.
+        if pdf.in_strip(x) {
+            pdf.pressed = None;
+            pdf.sel.drag = None;
+            return self.pdf_thumb_click(y);
+        }
         // PDF4ANNOTS (SR343): a press on a link or form widget starts no selection (its release activates it); a press
         // anywhere else blurs the focused text field.
         let target = pdf.target_at(x, y, vw, sy);
@@ -477,7 +525,7 @@ impl crate::AetherEngine {
 
     /// `selection_pointer_moved` on a PDF (button held): the focus follows the pointer at the press's granularity.
     pub(crate) fn pdf_drag(&mut self, x: f64, y: f64) {
-        let (vw, sy) = (self.width as f64, self.scroll_y);
+        let (vw, sy) = (self.width as f64, (self.scroll_x, self.scroll_y));
         let Some(pdf) = self.pdf.as_mut() else { return };
         let Some((g, lo, hi)) = pdf.sel.drag else { return };
         let Some(p) = pdf.hit_at(x, y, vw, sy) else { return };
@@ -533,11 +581,16 @@ impl crate::AetherEngine {
         let (a, b) = h.bounds();
         pdf.sel = PdfSelection { anchor: Some(a), focus: Some(b), drag: None };
         let Some(r) = pdf.range_rect(&h) else { return };
-        let (_, py, _, _) = pdf.page_rect(h.page, vw);
+        let (px, py, _, _) = pdf.page_rect(h.page, vw);
+        let strip = pdf.left;
         let (top, bottom) = (py + r[1] * PT, py + r[3] * PT);
-        if top < self.scroll_y || bottom > self.scroll_y + vh {
-            let target = (top - vh / 3.0).max(0.0);
-            self.handle_event(crate::api::events::Event::Scroll(0.0, target - self.scroll_y));
+        let dy = if top < self.scroll_y || bottom > self.scroll_y + vh { (top - vh / 3.0).max(0.0) - self.scroll_y } else { 0.0 };
+        // PDF4-HSCROLL (SR360): and sideways, when the hit lies outside the lane's visible columns.
+        let (left, right) = (px + r[0] * PT, px + r[2] * PT);
+        let (lo, hi) = (self.scroll_x + strip, self.scroll_x + vw);
+        let dx = if left < lo { left - GAP - lo } else if right > hi { right + GAP - hi } else { 0.0 };
+        if dx != 0.0 || dy != 0.0 {
+            self.handle_event(crate::api::events::Event::Scroll(dx, dy));
         }
     }
 
@@ -577,5 +630,58 @@ impl crate::AetherEngine {
     /// PDF4FORMSAVE (SR354): the save Ctrl/Cmd+S staged, once (the shell fires it on the bus after the turn).
     pub fn take_pending_save(&mut self) -> Option<bandy::SMessage> {
         self.pending_save.take()
+    }
+}
+
+// =================================================================================================
+// PDF4-HSCROLL / PDF4-THUMBS (SR360): the engine's horizontal scroll and view keys (lib.rs calls the first two from one
+// line each: the `Event::Scroll` clamp and the `Event::Resize` arm; `pdf_key` calls the third).
+// =================================================================================================
+
+impl crate::AetherEngine {
+    /// The x half of the one `Event::Scroll` clamp: `scroll_x` over [0, `max_scroll_x`] (a no-op without a PDF; the
+    /// frame is repainted when it moves).
+    pub(crate) fn pdf_scroll_x(&mut self, dx: f64) {
+        let vw = self.width as f64;
+        let Some(p) = self.pdf.as_ref() else { return };
+        let x = (self.scroll_x + dx).clamp(0.0, p.max_scroll_x(vw));
+        if x != self.scroll_x {
+            self.scroll_x = x;
+            self.pdf_dirty();
+        }
+    }
+
+    /// The viewport was resized (a window resize or a zoom): the strip's CSS width follows the zoom, `scroll_x`
+    /// re-clamps.
+    pub(crate) fn pdf_resized(&mut self) {
+        let z = self.zoom();
+        if let Some(p) = self.pdf.as_mut().filter(|p| p.thumbs) {
+            p.left = thumbs::STRIP_W / z;
+        }
+        self.pdf_scroll_x(0.0);
+    }
+
+    /// The PDF's view keys when no field takes them: unmodified Left / Right scroll a line sideways, F4 toggles the
+    /// thumbnail strip. False without a PDF and for any other key.
+    pub(crate) fn pdf_view_key(&mut self, key: &str) -> bool {
+        use crate::forms::edit::{parse_key, Key};
+        if self.pdf.is_none() {
+            return false;
+        }
+        if key == "F4" {
+            self.pdf_thumbs_toggle();
+            return true;
+        }
+        let (m, k) = parse_key(key);
+        if m.ctrl || m.alt || m.meta || m.shift {
+            return false;
+        }
+        let dx = match k {
+            Some(Key::Left) => -crate::LINE_STEP,
+            Some(Key::Right) => crate::LINE_STEP,
+            _ => return false,
+        };
+        self.handle_event(crate::api::events::Event::Scroll(dx, 0.0));
+        true
     }
 }

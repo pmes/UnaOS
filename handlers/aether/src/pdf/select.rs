@@ -3,8 +3,9 @@
 //
 //! PDF4 (LEDGER SR324): the selection in a PDF document, parallel to the DOM selection (selection.rs keeps DOM
 //! boundary points; a PDF page has no DOM). A position is (page, span, char) over PDF3's `TextSpan`s in content
-//! order; a span carries ONE box (the renderer's 72-dpi device space), so a character's x is proportional across its
-//! span (per-glyph boxes are owed: PDF4-GLYPHPOS). The copied text is the selected spans' slices joined by PDF3's
+//! order; a span carries one box per char (`TextSpan::glyphs`, the renderer's 72-dpi device space: PDF4GLYPHPOS
+//! SR360), so a caret and a selection edge snap to glyph boundaries (proportional across the span box only for a span
+//! without them). A find hit may run across spans of one line ([`Range::end`]). The copied text is the selected spans' slices joined by PDF3's
 //! `spans_to_string` (one line assembler), the pages by a newline.
 //!
 //! CHARTER: Aether owns the browser and the PDF line (CODEX §2 Web); this is inside the live handler.
@@ -38,18 +39,20 @@ impl PdfSelection {
     }
 }
 
-/// A find hit: chars `lo..hi` of one span.
+/// A find hit: from char `lo` of span `span` to char boundary `hi` of span `end` (`end == span` inside one span;
+/// PDF4GLYPHPOS SR360: a match may cross spans of one line).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Range {
     pub page: usize,
     pub span: usize,
     pub lo: usize,
+    pub end: usize,
     pub hi: usize,
 }
 
 impl Range {
     pub fn bounds(&self) -> (Pos, Pos) {
-        (Pos { page: self.page, span: self.span, ch: self.lo }, Pos { page: self.page, span: self.span, ch: self.hi })
+        (Pos { page: self.page, span: self.span, ch: self.lo }, Pos { page: self.page, span: self.end, ch: self.hi })
     }
 }
 
@@ -57,8 +60,17 @@ fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
-/// The x of the boundary before char `ch` of `span` (proportional across its box).
+/// The span's glyph boxes when they cover its text (one per char), else None.
+fn glyphs(span: &TextSpan) -> Option<&[[f64; 4]]> {
+    (!span.glyphs.is_empty() && span.glyphs.len() == char_len(&span.text)).then_some(span.glyphs.as_slice())
+}
+
+/// The x of the boundary before char `ch` of `span`: the glyph's left edge (the last glyph's right edge at the end);
+/// proportional across the span box only when the span has no glyph boxes.
 pub fn char_x(span: &TextSpan, ch: usize) -> f64 {
+    if let Some(g) = glyphs(span) {
+        return if ch >= g.len() { g[g.len() - 1][2] } else { g[ch][0] };
+    }
     let n = char_len(&span.text).max(1);
     span.bbox[0] + (span.bbox[2] - span.bbox[0]) * ch.min(n) as f64 / n as f64
 }
@@ -87,6 +99,10 @@ pub fn hit(spans: &[TextSpan], x: f64, y: f64) -> Option<(usize, usize)> {
     }
     let (i, _) = best?;
     let s = &spans[i];
+    // The glyph boundary nearest the point: the glyphs whose centre lies left of it.
+    if let Some(g) = glyphs(s) {
+        return Some((i, g.iter().filter(|b| (b[0] + b[2]) / 2.0 < x).count()));
+    }
     let n = char_len(&s.text);
     let w = s.bbox[2] - s.bbox[0];
     let ch = if w > 0.0 { ((x - s.bbox[0]) / w * n as f64).round().clamp(0.0, n as f64) as usize } else { 0 };
@@ -151,7 +167,8 @@ pub fn text(sel: &PdfSelection, spans_of: impl Fn(usize) -> Rc<Vec<TextSpan>>) -
             .into_iter()
             .map(|(k, lo, hi)| {
                 let s = &spans[k];
-                TextSpan { text: s.text.chars().skip(lo).take(hi - lo).collect(), bbox: sub_box(s, lo, hi), ..s.clone() }
+                let glyphs = s.glyphs.get(lo..hi).map(<[_]>::to_vec).unwrap_or_default();
+                TextSpan { text: s.text.chars().skip(lo).take(hi - lo).collect(), bbox: sub_box(s, lo, hi), glyphs, ..s.clone() }
             })
             .collect();
         if !cut.is_empty() {

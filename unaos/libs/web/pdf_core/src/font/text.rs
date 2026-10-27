@@ -5,7 +5,9 @@
 //! shown string with its text matrix and CTM. It maps each code to Unicode (/ToUnicode, else the encoding's glyph name
 //! through the AGL, else U+FFFD) and assembles [`TextSpan`]s by position: a space where the gap between two glyphs on
 //! one line exceeds 0.25 em, a new span when the font or size changes or the baseline moves by more than 0.5 em.
-//! [`spans_to_string`] joins spans into lines. Positions are the renderer's device space at 72 dpi (y down, the
+//! [`spans_to_string`] joins spans into lines ([`spans_to_string_mapped`] also maps each joined char back to its span
+//! and char: find across spans, PDF4GLYPHPOS SR360). Each span keeps one box per char of its text (`glyphs`: the
+//! glyph's advance box, split evenly when one glyph maps to several chars; an inserted space spans the gap). Positions are the renderer's device space at 72 dpi (y down, the
 //! CropBox's corner at the origin, /Rotate applied). Assembly assumes horizontal lines (rotated / vertical text order
 //! is owed); `Page::text` runs the whole interpreter and discards the pixels (a text-only pass is owed).
 
@@ -21,13 +23,20 @@ use crate::Document;
 
 /// A run of extracted text: its string, its box `[x0 y0 x1 y1]` (min / max corners in the renderer's 72 dpi device
 /// space; each glyph's em box from 0.2 em below the baseline to 0.8 em above), the font's /BaseFont and the size in
-/// device units.
+/// device units. `glyphs` holds one box per char of `text` (PDF4GLYPHPOS SR360), same space and vertical extent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextSpan {
     pub text: String,
     pub bbox: [f64; 4],
     pub font: String,
     pub size: f64,
+    pub glyphs: Vec<[f64; 4]>,
+}
+
+/// One glyph's box split evenly along the line among the `n` chars its Unicode text holds.
+fn split_box(b: [f64; 4], n: usize) -> impl Iterator<Item = [f64; 4]> {
+    let w = (b[2] - b[0]) / n.max(1) as f64;
+    (0..n).map(move |k| [b[0] + w * k as f64, b[1], b[0] + w * (k + 1) as f64, b[3]])
 }
 
 /// Collects the spans of a page.
@@ -74,14 +83,17 @@ impl<'d, 'f> TextCollector<'d, 'f> {
             if same_line && span.font == font && (span.size - size).abs() <= 0.01 * em {
                 if x0 - end.1 > 0.25 * em && !span.text.ends_with(' ') && ch != " " {
                     span.text.push(' ');
+                    span.glyphs.push([end.1.min(x0), glyph_box[1], end.1.max(x0), glyph_box[3]]);
                 }
                 span.text.push_str(ch);
+                span.glyphs.extend(split_box(glyph_box, ch.chars().count()));
                 span.bbox = [span.bbox[0].min(glyph_box[0]), span.bbox[1].min(glyph_box[1]), span.bbox[2].max(glyph_box[2]), span.bbox[3].max(glyph_box[3])];
                 end.1 = x1;
                 return;
             }
         }
-        self.spans.push(TextSpan { text: String::from(ch), bbox: glyph_box, font: String::from(font), size });
+        let glyphs = split_box(glyph_box, ch.chars().count()).collect();
+        self.spans.push(TextSpan { text: String::from(ch), bbox: glyph_box, font: String::from(font), size, glyphs });
         self.ends.push((y, x1));
     }
 
@@ -102,22 +114,32 @@ impl TextSink for TextCollector<'_, '_> {
 /// Spans as plain text: a newline where the line moves by more than 0.5 em (box centres across the line), a space
 /// between two spans of one line whose gap exceeds 0.25 em.
 pub fn spans_to_string(spans: &[TextSpan]) -> String {
+    spans_to_string_mapped(spans).0
+}
+
+/// [`spans_to_string`] and, per char of the joined text, the (span, char) it came from (None for an inserted space or
+/// newline): the one line assembler, so a match in the joined text maps back to glyph boxes (PDF4GLYPHPOS SR360).
+pub fn spans_to_string_mapped(spans: &[TextSpan]) -> (String, Vec<Option<(usize, usize)>>) {
     let mut out = String::new();
+    let mut map = Vec::new();
     let mut prev: Option<&TextSpan> = None;
-    for s in spans {
+    for (i, s) in spans.iter().enumerate() {
         if let Some(p) = prev {
             let em = p.size.max(s.size).max(1e-9);
             let (pc, sc) = ((p.bbox[1] + p.bbox[3]) / 2.0, (s.bbox[1] + s.bbox[3]) / 2.0);
             if (pc - sc).abs() > 0.5 * em {
                 out.push('\n');
+                map.push(None);
             } else if s.bbox[0] - p.bbox[2] > 0.25 * em && !out.ends_with(' ') && !s.text.starts_with(' ') {
                 out.push(' ');
+                map.push(None);
             }
         }
         out.push_str(&s.text);
+        map.extend((0..s.text.chars().count()).map(|k| Some((i, k))));
         prev = Some(s);
     }
-    out
+    (out, map)
 }
 
 impl Page {

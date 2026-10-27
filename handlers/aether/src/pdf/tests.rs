@@ -435,3 +435,138 @@ fn pdf4formsave_html_tab_stages_nothing() {
     assert!(e.take_pending_save().is_none(), "PAGE-SAVE is owed: an HTML tab stages nothing");
 }
 
+
+// ------------------------------------------------------------------------------------------------- PDF4GLYPHPOS / PDF4-HSCROLL / PDF4-THUMBS (SR360)
+
+/// A 200 x 100 pt page over `content`: /F1 Helvetica and /F2 Courier, /Widths 500 except W (1000) and i (250).
+fn glyph_page(content: &str) -> Vec<u8> {
+    let w: Vec<&str> = (32..127).map(|c| if c == b'W' as i32 { "1000" } else if c == b'i' as i32 { "250" } else { "500" }).collect();
+    let w = w.join(" ");
+    let mut b = PdfBuilder::new(1);
+    b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        .obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 100] >>")
+        .obj(3, "<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 7 0 R /F2 8 0 R >> >> /Contents 5 0 R >>")
+        .stream(5, "", content.as_bytes())
+        .obj(7, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 32 /LastChar 126 /Widths [{w}] >>"))
+        .obj(8, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Courier /FirstChar 32 /LastChar 126 /Widths [{w}] >>"));
+    b.classic()
+}
+
+fn near(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
+}
+
+#[test]
+fn pdf4glyphpos_selection_snaps_to_glyph() {
+    use super::select::{char_x, hit, sub_box};
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 600);
+    e.load_pdf(URL, glyph_page("BT /F1 24 Tf 100 40 Td (WiW) Tj ET"), true);
+    let (x0, y0) = {
+        let pdf = e.pdf.as_ref().unwrap();
+        let spans = pdf.spans(0);
+        let s = &spans[0];
+        assert_eq!(s.text, "WiW");
+        // W 100..124, i 124..130, W 130..154 (a proportional caret would put boundary 1 at 118).
+        assert!(near(char_x(s, 1), 124.0), "{}", char_x(s, 1));
+        assert!(near(char_x(s, 3), 154.0));
+        let b = sub_box(s, 1, 2);
+        assert!(near(b[0], 124.0) && near(b[2], 130.0), "{b:?}");
+        assert_eq!(hit(&spans, 110.0, 50.0), Some((0, 0)), "nearest glyph boundary (proportional: 1)");
+        let (x0, y0, _, _) = pdf.page_rect(0, 400.0);
+        (x0, y0)
+    };
+    // A drag from pt 110 to pt 129 copies "Wi" (proportional: "i").
+    e.press_at(x0 + 110.0 * PT, y0 + 50.0 * PT, 1, false);
+    e.selection_pointer_moved(x0 + 129.0 * PT, y0 + 50.0 * PT);
+    e.pointer_released();
+    assert_eq!(e.selected_text(), "Wi");
+}
+
+#[test]
+fn pdf4glyphpos_find_across_spans() {
+    use super::select::Range;
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 600);
+    e.load_pdf(URL, glyph_page("BT /F1 24 Tf 100 40 Td (Hel) Tj /F2 24 Tf (lo) Tj /F1 24 Tf 0 -30 Td (abc) Tj ET"), true);
+    assert_eq!(e.pdf.as_ref().unwrap().spans(0).len(), 3, "a font change starts a span");
+    assert_eq!(e.find("Hello", true), (1, 1));
+    let pdf = e.pdf.as_ref().unwrap();
+    assert_eq!(pdf.hits[0], Range { page: 0, span: 0, lo: 0, end: 1, hi: 2 });
+    let r = pdf.range_rect(&pdf.hits[0]).unwrap();
+    assert!(near(r[0], 100.0) && near(r[2], 160.0), "{r:?}");
+    assert!(pdf.find_all("lo\nab").is_empty(), "never across a line break");
+    assert_eq!(pdf.find_all("abc").len(), 1);
+    // Inside the "lo" span (pt 150), below the baseline: paper under the active orange.
+    let (x0, y0, _, _) = pdf.page_rect(0, 400.0);
+    let (x, y) = ((x0 + 150.0 * PT) as usize, (y0 + (r[3] * PT).floor() - 2.0) as usize);
+    let f = e.present_rgba();
+    assert_eq!(px(&f, x, y), [ACTIVE_MARK.0, ACTIVE_MARK.1, ACTIVE_MARK.2]);
+}
+
+#[test]
+fn pdf4hscroll_wide_page_zoom300() {
+    let mut e = open(400, 600);
+    e.set_zoom_pct(300);
+    let vw = e.width as f64;
+    let max = e.pdf.as_ref().unwrap().max_scroll_x(vw);
+    assert!(near(max, 200.0 * PT + 2.0 * GAP - vw), "max_scroll_x {max} at vw {vw}");
+    // The blue rect (pt x 20..80) on device row (8 + 80) x 3: at x 104..344 unscrolled.
+    let row = 264;
+    let f = e.present_rgba();
+    assert_eq!(px(&f, 250, row), [0, 0, 255]);
+    assert_ne!(px(&f, 10, row), [0, 0, 255]);
+    e.handle_event(Event::Scroll(50.0, 0.0));
+    assert!(near(e.scroll_x, 50.0));
+    let f = e.present_rgba();
+    assert_eq!(px(&f, 10, row), [0, 0, 255], "moved 150 device px left");
+    assert_ne!(px(&f, 250, row), [0, 0, 255]);
+    // The hit test follows: a drag over "Hello" (pt 101 -> 125) copies "He".
+    let (x0, y0, _, _) = e.pdf.as_ref().unwrap().page_rect(0, vw);
+    let at = |pt: f64| x0 + pt * PT - 50.0;
+    let y = y0 + 52.0 * PT;
+    e.press_at(at(101.0), y, 1, false);
+    e.selection_pointer_moved(at(125.0), y);
+    e.pointer_released();
+    assert_eq!(e.selected_text(), "He");
+    e.handle_event(Event::KeyDown("Right".to_string()));
+    assert!(near(e.scroll_x, 50.0 + 40.0), "Right: a 40 px line ({})", e.scroll_x);
+    e.handle_event(Event::Scroll(10_000.0, 0.0));
+    assert!(near(e.scroll_x, max), "clamped: {}", e.scroll_x);
+    e.handle_event(Event::KeyDown("Left".to_string()));
+    assert!(near(e.scroll_x, max - 40.0));
+    e.set_zoom_pct(100);
+    assert_eq!(e.pdf.as_ref().unwrap().max_scroll_x(e.width as f64), 0.0);
+    assert_eq!(e.scroll_x, 0.0, "re-clamped on the zoom");
+    e.handle_event(Event::Scroll(50.0, 0.0));
+    assert_eq!(e.scroll_x, 0.0, "a page that fits does not scroll sideways");
+}
+
+#[test]
+fn pdf4thumbs_strip_and_click() {
+    use super::thumbs::{STRIP_BG, STRIP_W, THUMB_ACTIVE};
+    let mut e = open(400, 100);
+    e.handle_event(Event::KeyDown("F4".to_string()));
+    {
+        let pdf = e.pdf.as_ref().unwrap();
+        assert!(pdf.thumbs && near(pdf.left, STRIP_W));
+        assert!(near(pdf.page_rect(0, 400.0).0, STRIP_W + GAP), "the lane starts after the strip");
+    }
+    let f = e.present_rgba();
+    let keys = e.pdf.as_ref().unwrap().cached_keys();
+    assert!(keys.contains(&(0, 12_000)) && keys.contains(&(1, 12_000)), "both thumbnails through the one cache: {keys:?}");
+    // Thumbnails 34 x 17 device px: page 1 at rows 8..25 (framed: current), page 2 at rows 33..50 (all red).
+    assert_eq!(px(&f, 60, 41), [255, 0, 0], "page 2's thumbnail");
+    assert_eq!(px(&f, 60, 6), [THUMB_ACTIVE.0, THUMB_ACTIVE.1, THUMB_ACTIVE.2], "the current page's frame");
+    assert_eq!(px(&f, 2, 95), [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2]);
+    click(&mut e, (60.0, 41.0));
+    let top2 = e.pdf.as_ref().unwrap().page_rect(1, 400.0).1;
+    assert!(near(e.scroll_y, top2), "the click scrolls to page 2: {} vs {top2}", e.scroll_y);
+    assert_eq!(e.selected_text(), "", "a strip press selects nothing");
+    e.handle_event(Event::KeyDown("F4".to_string()));
+    let pdf = e.pdf.as_ref().unwrap();
+    assert!(!pdf.thumbs && pdf.left == 0.0);
+    assert!(near(pdf.page_rect(0, 400.0).0, 200.0 / 3.0), "today's centring back");
+    let _ = e.present_rgba();
+    assert!(e.pdf.as_ref().unwrap().cached_keys().iter().all(|k| k.1 != 12_000), "closed: no thumbnail kept");
+}

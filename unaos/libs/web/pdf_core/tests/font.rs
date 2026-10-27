@@ -9,7 +9,7 @@ mod common;
 
 use common::PdfBuilder;
 use pdf_core::font::cmap::CMap;
-use pdf_core::font::{Fallback, GlyphSink, spans_to_string};
+use pdf_core::font::{Fallback, GlyphSink, spans_to_string, spans_to_string_mapped};
 use pdf_core::Document;
 
 const W: usize = 200;
@@ -425,4 +425,37 @@ fn assert_saved_renders_same(pdf: &[u8], fb: Fallback<'_>, cov: &Vec<u8>, text: 
     let again: Vec<u8> = r.pixmap.data.chunks_exact(4).map(|p| 255 - p[0]).collect();
     assert!(&again == cov, "the saved file draws different ink");
     assert_eq!(spans_to_string(&page.text(&doc, &fb)), text);
+}
+
+/// PDF4GLYPHPOS (SR360): `Page::text` keeps one box per char. Helvetica with /Widths 500 at 24 pt: each glyph 12 pt
+/// wide, contiguous from the pen; the space inserted for a gap spans the gap; `spans_to_string_mapped` joins exactly
+/// as `spans_to_string` and maps the inserted separator to None.
+#[test]
+fn text_glyph_boxes() {
+    let mut b = page("BT /F1 24 Tf 10 15 Td (Hello) Tj 80 0 Td (ab) Tj /F1 12 Tf 40 0 Td (c) Tj ET");
+    b.obj(4, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 32 /LastChar 126 /Widths [{}] >>", widths(95, 500)));
+    let pdf = b.classic();
+    let doc = Document::parse(&pdf).unwrap();
+    let spans = doc.pages().unwrap()[0].text(&doc, &Fallback::default());
+    assert_eq!(spans.len(), 2, "the size change starts a span: {spans:?}");
+    let s = &spans[0];
+    assert_eq!(s.text, "Hello ab");
+    assert_eq!(s.glyphs.len(), s.text.chars().count(), "one box per char");
+    let near = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    for (k, g) in s.glyphs[..5].iter().enumerate() {
+        assert!(near(g[0], 10.0 + 12.0 * k as f64) && near(g[2], 22.0 + 12.0 * k as f64), "glyph {k}: {g:?}");
+    }
+    assert!(near(s.glyphs[5][0], 70.0) && near(s.glyphs[5][2], 90.0), "the gap space spans the gap: {:?}", s.glyphs[5]);
+    assert!(near(s.glyphs[6][0], 90.0) && near(s.glyphs[7][2], 114.0));
+    assert!(near(s.bbox[0], s.glyphs[0][0]) && near(s.bbox[2], s.glyphs[7][2]), "the span box is the glyphs' union");
+    assert!(s.glyphs.iter().all(|g| near(g[1], s.bbox[1]) && near(g[3], s.bbox[3])));
+    assert_eq!(spans[1].glyphs.len(), 1);
+    assert!(near(spans[1].glyphs[0][0], 130.0) && near(spans[1].glyphs[0][2], 136.0));
+    let (text, map) = spans_to_string_mapped(&spans);
+    assert_eq!(text, spans_to_string(&spans));
+    assert_eq!(text, "Hello ab c");
+    assert_eq!(map.len(), text.chars().count());
+    assert_eq!(map[5], Some((0, 5)), "the span's own space maps to it");
+    assert_eq!(map[8], None, "the separator between spans is inserted");
+    assert_eq!(map[9], Some((1, 0)));
 }
