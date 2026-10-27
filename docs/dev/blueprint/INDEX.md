@@ -49,11 +49,12 @@ BLUEPRINT: sheets=<a>,<b>  keeps=BP-<A>-1,BP-<A>-4,…  changes=BP-<B>-3 (R<n> |
 | [handlers.md](handlers.md) | CODEX manifest, host userspace (libs, handlers, vessels, tools), which handlers run as ring-3 ELFs on UnaOS | `handlers/`, `libs/`, `vessels/`, `tools/`, `docs/CODEX.md` §2-§3 |
 | [gates.md](gates.md) | arroyo verbs, `./arroyo gates` (19 rows), foldleg/twoboot/knoboff, ledgers, queues, STATUS, evidence | `unaos/arroyo`, `unaos/scripts/`, `tools/status-check.py`, `docs/dev/LEDGER.md`, `docs/dev/QUEUE.md`, `docs/dev/STATUS.tsv`, the track ledgers and queues in `docs/dev/OS/` |
 | [power.md](power.md) | the power verbs (reboot, shutdown, sleep), the SMC (read only), the lid, the sleep state `idle` and why S3 is unreachable, the power key, the SLEEP line (BP-bar-20) | `unaos/crates/kernel/src/power.rs`, `unaos/crates/kernel/src/drivers/smc.rs`, `unaos/crates/kernel/src/arch/x86_64/acpi_power.rs`, `unaos/crates/kernel/src/video/lidsleep.rs` |
+| [gpu.md](gpu.md) | the GPU drivers under `drivers/gpu`: the gen7 (Ivy Bridge) ladder's knobs, bank-only boot, RCS/BCS rungs, GGTT windows, the ring-before-pages rule, the posted TLB flush, the ONE held-page rule and its lock order, the BCS as the compositor's second blitter; the Kepler rungs are named, owed rows | `unaos/crates/kernel/src/drivers/gpu/` (`gen7.rs`, `gen7_blit.rs`, `gen7_r9.rs`, `gen7_r10.rs`, `gen7_r11.rs`; Kepler and `igpu.rs` named) |
 
 ## Not covered by any sheet yet (seat to decide)
 
-GPU driver ladders (`drivers/gpu/**`, the Kepler and gen7
-rungs: R101, R127), the compatibility box (`unaos/crates/kernel/src/arch/x86_64/linuxabi/`, `docs/dev/OS/03_COMPATIBILITY_BOX/`), selfhost
+The Kepler rungs' invariants (gpu.md names their files;
+GPU-SHEET-KEPLER owed there: R101, R127), the compatibility box (`unaos/crates/kernel/src/arch/x86_64/linuxabi/`, `docs/dev/OS/03_COMPATIBILITY_BOX/`), selfhost
 (`unaos/crates/kernel/src/selfhost/`). Each is a candidate sheet. (Power/SMC: power.md, SLEEP B691.)
 
 ## Seat decisions on the drafter's open points (LAWS §8: engineering is the seat's; Peter is asked what to build and how it looks)
