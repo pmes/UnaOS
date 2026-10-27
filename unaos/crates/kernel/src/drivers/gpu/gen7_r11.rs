@@ -217,6 +217,7 @@ struct Out11 {
     mismatch: u32,
     first: Option<(u32, u32, u32, u32)>,
     passed: &'static str,
+    reused: bool, // GEN7HELDRELEASE (B1039, GEN7-HELD-WIRE): `held_take` handed back HELD's block from an earlier run
 }
 
 /// R11 under `tests gen7`, after R10's line: gated on R10's verified triangle this run, then the table, the window,
@@ -311,7 +312,7 @@ pub(super) fn run(r10: &str) {
     let sampled = if o.pixels > 0 && o.mismatch == 0 { "ok" } else { "no" };
     let (fx, fy, got, want) = o.first.unwrap_or((0, 0, 0, 0));
     serial_println!(
-        "[gen7] r11 draw=quad src={}:{}x{}@s{} rt={}x{}:b8g8r8a8 sampled={} mismatch={} landed={} r10={} rows_cited={}/{} ring=rcs cand={} prim=trilist verts=6 pitch={} slots={} pixels={}/{} first={} at=({},{}) got=0x{:08X} want=0x{:08X} fence=0x{:08X} read=0x{:08X} head={:#x} tail={:#x} passed={} idle={} restored=regs:{},fw:{},ptes:{} gpu_us={} us={} -> {}",
+        "[gen7] r11 draw=quad src={}:{}x{}@s{} rt={}x{}:b8g8r8a8 sampled={} mismatch={} landed={} r10={} rows_cited={}/{} ring=rcs cand={} prim=trilist verts=6 pitch={} slots={} pixels={}/{} first={} at=({},{}) got=0x{:08X} want=0x{:08X} fence=0x{:08X} read=0x{:08X} head={:#x} tail={:#x} passed={} idle={} restored=regs:{},fw:{},ptes:{} gpu_us={} us={} reuse={} held_kb={} -> {}",
         g.id,
         g.w,
         g.h,
@@ -345,6 +346,8 @@ pub(super) fn run(r10: &str) {
         o.ptes_restored as u32,
         cycles_to_us(o.cyc),
         us,
+        if o.reused { "y" } else { "n" },
+        crate::drivers::gpu::gen7::held_kb(),
         verdict
     );
     serial_println!(
@@ -410,7 +413,7 @@ unsafe fn exec11(bar0: usize, bar0_size: usize, g: &Geom, src: &[u32]) -> Result
     }
 
     // ---- the pages, held for the boot ---------------------------------------------------------------------------------
-    let base_va = {
+    let (base_va, reused) = {
         let (p, reused) = crate::drivers::gpu::gen7::held_take(&HELD, n); // GEN7HOLDONCE (B1025): r11's rule, hoisted verbatim to gen7.rs's tail (r8 and gen7blit take through it too)
         if !reused {
             Layout::from_size_align(n * 4096, 4096).map_err(|_| "layout")?; // the refusal by name r11 always made (held_take returned 0)
@@ -419,7 +422,7 @@ unsafe fn exec11(bar0: usize, bar0_size: usize, g: &Geom, src: &[u32]) -> Result
             }
             #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::allocator::census::retag(p as usize, n * 4096, crate::allocator::census::GEN7_HELD); /* FIXTURERETAIN (B1017): counted once, never fx:gen7 */ // a smaller earlier block stays held (GEN7TLB), never freed
         }
-        p
+        (p, reused) // GEN7HELDRELEASE (B1039, GEN7-HELD-WIRE): r10's shape, `reuse=` reaches the line
     };
     let va = |k: usize| base_va + k * 4096;
     let mut ptes: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
@@ -538,7 +541,7 @@ unsafe fn exec11(bar0: usize, bar0_size: usize, g: &Geom, src: &[u32]) -> Result
     clflush_range(base_va, n * 4096);
     let fence = (va(PG_STATE) + OFF_FENCE as usize) as *mut u32;
 
-    let mut out = Out11 { cand, tail, ..Out11::default() };
+    let mut out = Out11 { cand, tail, reused, ..Out11::default() };
 
     // ---- claim: PTEs, landed check, the pinned GTT flush (R10's) -----------------------------------------------------
     for k in 0..n {
@@ -617,5 +620,5 @@ unsafe fn exec11(bar0: usize, bar0_size: usize, g: &Geom, src: &[u32]) -> Result
         out.ptes_restored = (0..n).all(|k| rd(bar0, slot(k)) == base_img) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
         wr(bar0, flsh, 1);
     }
-    Ok(out)
+    crate::drivers::gpu::gen7::held_release(&HELD, "r11", out.disabled, out.ptes_restored); Ok(out) // GEN7HELDRELEASE (B1039): the ONE release, behind the disabled confirm + the PTE read-back + R6c's witness (gen7.rs tail). LINE-NEUTRAL append
 }
