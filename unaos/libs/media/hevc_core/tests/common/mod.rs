@@ -180,6 +180,33 @@ impl CabacEnc {
             self.bypass_bits(v - (((1 << (p - 3)) + 2) << rice), p - 3 + rice);
         }
     }
+    /// HEVCREXTTOOLS (SR345): coeff_abs_level_remaining with extended_precision_processing_flag (the limited EGk of
+    /// 9.3.3.12 at log2TransformRange `log2_range`): below the maximum prefix the unlimited code, at it no separator and
+    /// log2TransformRange suffix bits.
+    pub fn remaining_limited(&mut self, v: u32, rice: u32, log2_range: u32) {
+        if (v >> rice) < 4 {
+            return self.remaining(v, rice);
+        }
+        let max_ext = 28 - log2_range;
+        let mut pre = 0;
+        while pre < max_ext && v >= (((1u32 << (pre + 2)) + 2) << rice) {
+            pre += 1;
+        }
+        for _ in 0..4 + pre {
+            self.bypass(1);
+        }
+        let base = ((1u32 << (pre + 1)) + 2) << rice;
+        if pre < max_ext {
+            self.bypass(0);
+            self.bypass_bits(v - base, pre + 1 + rice);
+        } else {
+            self.bypass_bits(v - base, log2_range);
+        }
+    }
+    /// HEVCREXTTOOLS (SR345): cabac_bypass_alignment (9.3.4.3.6): ivlCurrRange = 256 before the aligned bypass bins.
+    pub fn align(&mut self) {
+        self.range = 256;
+    }
     /// DecodeTerminate's encoder; a 1 flushes (the code word ends with the stop / alignment 1).
     pub fn terminate(&mut self, bin: u32) {
         self.range -= 2;
@@ -237,8 +264,10 @@ impl CabacEnc {
     pub fn dc_cu_fmt(&mut self, mpm: u32, chroma_format_idc: u32) {
         self.prev_intra(true);
         self.mpm_idx(mpm);
-        self.chroma_dm();
-        for _ in 0..if chroma_format_idc == 2 { 4 } else { 2 } {
+        if chroma_format_idc != 0 {
+            self.chroma_dm(); // HEVCREXTTOOLS (SR345): monochrome codes no chroma syntax
+        }
+        for _ in 0..[0, 2, 4, 2][chroma_format_idc as usize] {
             self.cbf_chroma(0, false);
         }
         self.cbf_luma(0, false);
@@ -328,7 +357,7 @@ impl CabacEnc {
         for &v in &y[..n * n] {
             self.bw.u(v as u64, luma_bits);
         }
-        for p in [cb, cr] {
+        for p in [cb, cr].into_iter().filter(|p| !p.is_empty()) {
             for &v in &p[..(n / sub.0) * (n / sub.1)] {
                 self.bw.u(v as u64, chroma_bits);
             }
@@ -592,6 +621,29 @@ pub struct PpsInter {
 }
 
 pub fn pps_rbsp_ext(c: &PpsCfg, x: &PpsInter) -> Vec<u8> {
+    pps_rbsp_rext(c, x, &PpsRext::default())
+}
+
+/// HEVCREXTTOOLS (SR345): pps_range_extension() (7.3.2.3.2).
+#[derive(Clone, Default)]
+pub struct PpsRange {
+    pub log2_max_transform_skip_block_size_minus2: u32,
+    pub cross_component_prediction: bool,
+    /// chroma_qp_offset_list_enabled_flag: (diff_cu_chroma_qp_offset_depth, [(cb_qp_offset_list, cr_qp_offset_list)]).
+    pub chroma_qp_offset_list: Option<(u32, Vec<(i32, i32)>)>,
+    /// (log2_sao_offset_scale_luma, log2_sao_offset_scale_chroma).
+    pub log2_sao_offset_scale: (u32, u32),
+}
+
+/// HEVCREXTTOOLS (SR345): the PPS fields the range extension KATs set; the default writes [`pps_rbsp_ext`]'s bits.
+#[derive(Clone, Default)]
+pub struct PpsRext {
+    pub transform_skip: bool,
+    pub transquant_bypass: bool,
+    pub range: Option<PpsRange>,
+}
+
+pub fn pps_rbsp_rext(c: &PpsCfg, x: &PpsInter, r: &PpsRext) -> Vec<u8> {
     let mut b = BitWriter::default();
     b.ue(0);
     b.ue(0);
@@ -604,14 +656,14 @@ pub fn pps_rbsp_ext(c: &PpsCfg, x: &PpsInter) -> Vec<u8> {
     b.ue(0);
     b.se(c.init_qp - 26);
     b.bit(0); // constrained_intra_pred_flag
-    b.bit(0); // transform_skip_enabled_flag
+    b.flag(r.transform_skip); // transform_skip_enabled_flag
     b.bit(0); // cu_qp_delta_enabled_flag
     b.se(c.cb_qp_offset);
     b.se(0);
     b.bit(0);
     b.flag(x.weighted_pred);
     b.flag(x.weighted_bipred);
-    b.bit(0); // transquant_bypass_enabled_flag
+    b.flag(r.transquant_bypass); // transquant_bypass_enabled_flag
     b.bit(0); // tiles
     b.bit(0); // entropy_coding_sync
     b.bit(1); // pps_loop_filter_across_slices_enabled_flag
@@ -626,7 +678,30 @@ pub fn pps_rbsp_ext(c: &PpsCfg, x: &PpsInter) -> Vec<u8> {
     b.flag(x.lists_modification); // lists_modification_present_flag
     b.ue(0);
     b.bit(0);
-    b.bit(0);
+    match &r.range {
+        Some(e) => {
+            b.bit(1); // pps_extension_present_flag
+            b.bit(1); // pps_range_extension_flag
+            b.u(0, 3); // multilayer, 3d, scc
+            b.u(0, 4); // pps_extension_4bits
+            if r.transform_skip {
+                b.ue(e.log2_max_transform_skip_block_size_minus2);
+            }
+            b.flag(e.cross_component_prediction);
+            b.flag(e.chroma_qp_offset_list.is_some());
+            if let Some((depth, list)) = &e.chroma_qp_offset_list {
+                b.ue(*depth);
+                b.ue(list.len() as u32 - 1);
+                for &(cb, cr) in list {
+                    b.se(cb);
+                    b.se(cr);
+                }
+            }
+            b.ue(e.log2_sao_offset_scale.0);
+            b.ue(e.log2_sao_offset_scale.1);
+        }
+        None => b.bit(0), // pps_extension_present_flag
+    }
     b.trailing();
     b.out
 }

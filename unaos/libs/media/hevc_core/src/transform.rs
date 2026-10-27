@@ -13,7 +13,14 @@ use crate::tables::{DST_MATRIX, LEVEL_SCALE, TRANS_MATRIX};
 
 /// 8.6.2 / 8.6.3: TransCoeffLevel -> d (in place), for qP (Qp'Y or Qp'C), `factor` the ScalingFactor (None: m = 16).
 pub fn scale(coeff: &mut [i32], log2: u32, qp: i32, bit_depth: u32, factor: Option<&[u8]>) {
-    let bd_shift = bit_depth as i32 + log2 as i32 - 5;
+    scale_range(coeff, log2, qp, bit_depth, factor, 15)
+}
+
+/// HEVCREXTTOOLS (SR345): [`scale`] at log2TransformRange `range` (15, or Max(15, BitDepth + 6) with
+/// extended_precision_processing_flag): bdShift = BitDepth + Log2(nTbS) + 10 - range, d clipped to CoeffMin..CoeffMax.
+pub fn scale_range(coeff: &mut [i32], log2: u32, qp: i32, bit_depth: u32, factor: Option<&[u8]>, range: u32) {
+    let bd_shift = bit_depth as i32 + log2 as i32 + 10 - range as i32;
+    let (lo, hi) = (-(1i64 << range), (1i64 << range) - 1);
     let ls = (LEVEL_SCALE[(qp % 6) as usize] as i64) << (qp / 6);
     let add = 1i64 << (bd_shift - 1);
     for (i, c) in coeff.iter_mut().enumerate() {
@@ -22,7 +29,7 @@ pub fn scale(coeff: &mut [i32], log2: u32, qp: i32, bit_depth: u32, factor: Opti
         }
         let m = factor.map_or(16, |f| f[i] as i64);
         let v = ((*c as i64) * m * ls + add) >> bd_shift;
-        *c = v.clamp(-32768, 32767) as i32;
+        *c = v.clamp(lo, hi) as i32;
     }
 }
 
@@ -34,7 +41,19 @@ fn basis(dst: bool, log2: u32, k: usize, n: usize) -> i32 {
 
 /// 8.6.4.2: the residual of the scaled coefficients `d` (DST when `dst`: intra luma 4x4).
 pub fn inverse_transform(d: &[i32], log2: u32, dst: bool, bit_depth: u32) -> Vec<i32> {
+    inverse_transform_range(d, log2, dst, bit_depth, 15)
+}
+
+/// HEVCREXTTOOLS (SR345): bdShift of 8.6.2 — Max(20 - bitDepth, extended_precision_processing_flag ? 11 : 0); a
+/// log2TransformRange above 15 only arises with the flag, and below bit depth 10 the two forms agree.
+fn bd_shift(bit_depth: u32, range: u32) -> i64 {
+    (20 - bit_depth as i64).max(if range > 15 { 11 } else { 0 })
+}
+
+/// HEVCREXTTOOLS (SR345): [`inverse_transform`] at log2TransformRange `range` (the intermediate clip is CoeffMin..CoeffMax).
+pub fn inverse_transform_range(d: &[i32], log2: u32, dst: bool, bit_depth: u32, range: u32) -> Vec<i32> {
     let n = 1usize << log2;
+    let (lo, hi) = (-(1i64 << range), (1i64 << range) - 1);
     // Stage 1: each column (vertical 1-D transform), then (e + 64) >> 7 clipped to 16 bits.
     let mut g = vec![0i32; n * n];
     for x in 0..n {
@@ -56,11 +75,11 @@ pub fn inverse_transform(d: &[i32], log2: u32, dst: bool, bit_depth: u32) -> Vec
                     e += basis(dst, log2, k, y) as i64 * c as i64;
                 }
             }
-            g[y * n + x] = ((e + 64) >> 7).clamp(-32768, 32767) as i32;
+            g[y * n + x] = ((e + 64) >> 7).clamp(lo, hi) as i32;
         }
     }
     // Stage 2: each row (horizontal 1-D transform), then the bdShift rounding.
-    let bd_shift = 20 - bit_depth as i64;
+    let bd_shift = bd_shift(bit_depth, range);
     let add = 1i64 << (bd_shift - 1);
     let mut r = vec![0i32; n * n];
     for y in 0..n {
@@ -80,8 +99,14 @@ pub fn inverse_transform(d: &[i32], log2: u32, dst: bool, bit_depth: u32) -> Vec
 
 /// 8.6.4.2 with transform_skip_flag: r = d << tsShift (tsShift = 5 + Log2(nTbS)), then the bdShift rounding.
 pub fn transform_skip(d: &[i32], log2: u32, bit_depth: u32) -> Vec<i32> {
-    let ts_shift = 5 + log2;
-    let bd_shift = 20 - bit_depth as i64;
+    transform_skip_range(d, log2, bit_depth, 15)
+}
+
+/// HEVCREXTTOOLS (SR345): [`transform_skip`] at log2TransformRange `range`: tsShift = (extended_precision_processing_flag ?
+/// Min(5, bdShift - 2) : 5) + Log2(nTbS).
+pub fn transform_skip_range(d: &[i32], log2: u32, bit_depth: u32, range: u32) -> Vec<i32> {
+    let bd_shift = bd_shift(bit_depth, range);
+    let ts_shift = if range > 15 { 5.min(bd_shift as u32 - 2) } else { 5 } + log2;
     let add = 1i64 << (bd_shift - 1);
     d.iter().map(|&c| ((((c as i64) << ts_shift) + add) >> bd_shift) as i32).collect()
 }

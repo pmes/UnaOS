@@ -287,3 +287,27 @@ pub const COMB_IDX: [(usize, usize); 12] = [(0, 1), (1, 0), (0, 2), (2, 0), (1, 
 /// HEVCREXT (SR334) 8.4.3 Table 8-3: the 4:2:2 IntraPredModeC from the mode X of Table 8-2 (ChromaArrayType 2).
 pub const CHROMA_422_MODE: [u8; 35] =
     [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 11, 13, 15, 16, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
+
+// HEVCREXTTOOLS (LEDGER SR345): the range extension's own syntax elements, in a SECOND table above `CTX_END` so the base
+// layout (and its contiguity KAT) stands; `cabac::initial_contexts` initialises both. sig_coeff_flag's transform_skip
+// contexts (ctxInc 42 / 43) are already the last two of the base sig_coeff_flag table.
+pub const EXPLICIT_RDPCM: usize = CTX_END;
+pub const EXPLICIT_RDPCM_DIR: usize = CTX_END + 2;
+pub const LOG2_RES_SCALE: usize = CTX_END + 4;
+pub const RES_SCALE_SIGN: usize = CTX_END + 12;
+pub const CU_CHROMA_QP_OFFSET_FLAG: usize = CTX_END + 14;
+pub const CU_CHROMA_QP_OFFSET_IDX: usize = CTX_END + 15;
+/// One past the last range extension slot.
+pub const REXT_CTX_END: usize = CTX_END + 16;
+
+pub const REXT_CTX_TABLES: &[CtxTable] = &[
+    // Table 9-x explicit_rdpcm_flag / explicit_rdpcm_dir_flag (ctxInc cIdx == 0 ? 0 : 1; P and B only).
+    CtxTable { name: "explicit_rdpcm_flag", slot: EXPLICIT_RDPCM, init: [&[], &[139, 139], &[139, 139]] },
+    CtxTable { name: "explicit_rdpcm_dir_flag", slot: EXPLICIT_RDPCM_DIR, init: [&[], &[139, 139], &[139, 139]] },
+    // log2_res_scale_abs_plus1 (ctxInc 4 * c + binIdx) and res_scale_sign_flag (ctxInc c).
+    CtxTable { name: "log2_res_scale_abs_plus1", slot: LOG2_RES_SCALE, init: [&[154; 8], &[154; 8], &[154; 8]] },
+    CtxTable { name: "res_scale_sign_flag", slot: RES_SCALE_SIGN, init: [&[154, 154], &[154, 154], &[154, 154]] },
+    // cu_chroma_qp_offset_flag and cu_chroma_qp_offset_idx (every bin one context).
+    CtxTable { name: "cu_chroma_qp_offset_flag", slot: CU_CHROMA_QP_OFFSET_FLAG, init: [&[154], &[154], &[154]] },
+    CtxTable { name: "cu_chroma_qp_offset_idx", slot: CU_CHROMA_QP_OFFSET_IDX, init: [&[154], &[154], &[154]] },
+];

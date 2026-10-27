@@ -564,9 +564,9 @@ fn my_log_lines(containing: &str) -> Vec<String> {
     CAPTURED.lock().unwrap().iter().filter(|(t, l)| *t == me && l.contains(containing)).map(|(_, l)| l.clone()).collect()
 }
 
-/// HEVC_SPS with bit_depth_luma_minus8 = bit_depth_chroma_minus8 = 5 (the two ue(v) after the conformance flag, 7.3.2.2:
-/// `1` -> `00110` each), re-packed in place: a 13-bit SPS hevc_core refuses by name at activation (above 12: HEVCREXT-TOOLS).
-const HEVC_SPS_12BIT: [u8; 28] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x11, 0x8c, 0x5f, 0x92, 0x4c, 0x20, 0x80];
+/// HEVC_SPS with bit_depth_luma_minus8 5 / bit_depth_chroma_minus8 4 (the two ue(v) after the conformance flag, 7.3.2.2: `1` ->
+/// `00110` / `00101`), re-packed in place: luma 13 / chroma 12 bits, which the Player's 4:2:0-only hevc_core refuses by name (HEVCREXTTOOLS SR345: 13 bits alone now decode).
+const HEVC_SPS_12BIT: [u8; 28] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x11, 0x8a, 0x5f, 0x92, 0x4c, 0x20, 0x80];
 
 #[derive(Default)]
 struct CountSink {
@@ -606,7 +606,7 @@ fn hevcdepthcore_12bit_mid_stream_swaps_to_the_stand_in_once() {
     }
     let lines = my_log_lines("[STRIA] :: video decode:");
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(lines[0], "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (bit depth above 12 (HEVCREXT-TOOLS))");
+    assert_eq!(lines[0], "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (luma and chroma bit depths differ (COLOURONE-422))");
     assert!(!p.info().real_video);
     assert_eq!(p.info().video_decoder, "test-pattern (stand-in)");
     assert_eq!(sink.shown.iter().map(|s| s.1).collect::<Vec<_>>(), [0, 40_000_000, 80_000_000, 120_000_000], "{:?}", sink.shown);
@@ -738,7 +738,7 @@ fn swapback_player_returns_to_the_real_decoder_at_the_8bit_keyframe() {
     assert_eq!(
         lines,
         [
-            "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (bit depth above 12 (HEVCREXT-TOOLS))",
+            "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (luma and chroma bit depths differ (COLOURONE-422))",
             "[STRIA] :: video decode: swapped back at 120000000",
         ],
     );

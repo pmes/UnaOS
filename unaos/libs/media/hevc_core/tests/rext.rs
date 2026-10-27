@@ -8,7 +8,8 @@
 //! cMax 31) over the whole 32x32 chroma CTB; (e) chroma deblocking every 8 CHROMA samples: 4:4:4 at luma x = 8 and
 //! y = 8, 4:2:2 at luma y = 8 only (luma x = 8 is chroma x = 4); (f) P-slice chroma motion compensation reads mvCLX =
 //! mvLX * 2 / SubWidthC, * 2 / SubHeightC (8.5.3.2.10) at 4:2:2 and 4:4:4; (g) Table 8-3 and the refusals by name
-//! (range extension tools, separate colour planes, the 4:2:0-only consumer gate).
+//! (range extension tools, separate colour planes, the 4:2:0-only consumer gate). HEVCREXTTOOLS (LEDGER SR345): one picture
+//! per range extension tool, h..s below, each failing if its tool is missing; (g) now decodes every flag alone.
 
 mod common;
 
@@ -342,23 +343,12 @@ fn g_table_8_3_and_the_refusals_by_name() {
         assert_eq!(chroma_mode_422(x), m, "mode {x}");
     }
     assert_eq!(chroma_mode_422(chroma_mode(4, 7)), 5);
-    let names = [
-        "transform_skip_rotation_enabled_flag",
-        "transform_skip_context_enabled_flag",
-        "implicit_rdpcm_enabled_flag",
-        "explicit_rdpcm_enabled_flag",
-        "extended_precision_processing_flag",
-        "intra_smoothing_disabled_flag",
-        "high_precision_offsets_enabled_flag",
-        "persistent_rice_adaptation_enabled_flag",
-        "cabac_bypass_alignment_enabled_flag",
-    ];
-    for (i, name) in names.iter().enumerate() {
+    // HEVCREXTTOOLS (SR345): each range extension flag alone now decodes the all-DC picture (no tool changes it).
+    for i in 0..9 {
         let mut f = [false; 9];
         f[i] = true;
-        let err = Decoder::new().decode_annexb(&dc32(&SpsCfg { range_ext: Some(f), ..cfg32(3, 8) })).unwrap_err();
-        let Error::Unsupported(msg) = err else { panic!("{name}: {err:?}") };
-        assert!(msg.contains(name) && msg.contains("HEVCREXT-TOOLS"), "{name}: {msg}");
+        let fr = decode(&dc32(&SpsCfg { range_ext: Some(f), ..cfg32(3, 8) }));
+        assert!(fr[0].planes.iter().all(|p| p.iter().all(|&v| v == 128)), "flag {i}");
     }
     // A range extension present with every flag 0 decodes.
     assert_eq!(decode(&dc32(&SpsCfg { range_ext: Some([false; 9]), ..cfg32(2, 8) })).len(), 1);
@@ -395,4 +385,411 @@ fn g_table_8_3_and_the_refusals_by_name() {
     d.decode_annexb(&dc32(&cfg32(1, 8))).expect("4:2:0 through the gate");
     d.flush();
     assert_eq!(d.take_frames()[0].chroma, ChromaFormat::Yuv420);
+    // HEVCREXTTOOLS (SR345): monochrome passes the gate (gneiss_pal's to_frame fills its grey chroma).
+    let mut d = Decoder::new();
+    d.set_chroma_420_only(true);
+    d.decode_annexb(&dc32(&SpsCfg { chroma_bit_depth: Some(8), ..cfg32(0, 10) })).expect("4:0:0 through the gate");
+    d.flush();
+    assert_eq!(d.take_frames()[0].chroma, ChromaFormat::Mono);
+}
+
+// ---------------------------------------------------------------- HEVCREXTTOOLS (LEDGER SR345)
+
+/// An 8x8 picture in one 16x16 CTB (the split to the 8x8 CU inferred), max transform 8x8.
+fn cfg8(idc: u32, bit_depth: u32, flag: Option<usize>) -> SpsCfg {
+    let mut f = [false; 9];
+    if let Some(i) = flag {
+        f[i] = true;
+    }
+    SpsCfg { width: 8, height: 8, log2_ctb: 4, log2_max_tb: 3, chroma_format_idc: idc, bit_depth, range_ext: Some(f), ..Default::default() }
+}
+
+/// VPS, an SPS with a two-picture DPB, and the PPS with the range extension fields `r`.
+fn hdr(cfg: &SpsCfg, p: &PpsCfg, pi: &PpsInter, r: &PpsRext) -> Vec<u8> {
+    let mut s = vps(false);
+    s.extend(nal(33, &sps_rbsp_ext(cfg, &InterSps { max_dec_pic_buffering_minus1: 2, ..Default::default() })));
+    s.extend(nal(34, &pps_rbsp_rext(p, pi, r)));
+    s
+}
+
+fn pps_qp(init_qp: i32) -> PpsCfg {
+    PpsCfg { init_qp, deblocking_disabled: true, ..Default::default() }
+}
+
+/// One DC level of a residual_coding() whose last position is (0, 0): last prefixes 0 at ctxOffset `off`, greater1 1
+/// (ctxSet 0, greater1Ctx 1), greater2 1, then (after `align` when cabac_bypass_alignment) sign 0 and the remaining
+/// level - 3 by `rem`.
+fn dc_level(e: &mut CabacEnc, off: usize, chroma: bool, align: bool, rem: impl FnOnce(&mut CabacEnc)) {
+    e.decision(LAST_X + off, 0);
+    e.decision(LAST_Y + off, 0);
+    e.decision(GT1 + if chroma { 16 } else { 0 } + 1, 1);
+    e.decision(GT2 + if chroma { 4 } else { 0 }, 1);
+    if align {
+        e.align();
+    }
+    e.bypass(0);
+    rem(e);
+}
+
+/// The 8x8 intra CU's head: (transquant bypass), part_mode 2Nx2N, the luma mode by mpm_idx, chroma DM.
+fn cu_head(e: &mut CabacEnc, bypass: Option<bool>, mpm: u32) {
+    if let Some(b) = bypass {
+        e.decision(TRANSQUANT_BYPASS, b as u32);
+    }
+    e.part_mode_2nx2n();
+    e.prev_intra(true);
+    e.mpm_idx(mpm);
+    e.chroma_dm();
+}
+
+fn luma_of(f: &Frame) -> Vec<i32> {
+    samples(f, 0).iter().map(|&v| v as i32).collect()
+}
+
+/// 8.6.2 + 8.6.4.2 (transform skip) for one level at qP `qp`, flat scaling, log2TransformRange 15.
+fn ts_residual(level: i64, qp: i64, log2: i64, bd: i64) -> i32 {
+    let s1 = bd + log2 - 5;
+    let d = ((level * 16 * ((LEVEL_SCALE[(qp % 6) as usize] as i64) << (qp / 6)) + (1 << (s1 - 1))) >> s1).clamp(-32768, 32767);
+    let s2 = 20 - bd;
+    (((d << (5 + log2)) + (1 << (s2 - 1))) >> s2) as i32
+}
+
+#[test]
+fn h_implicit_rdpcm_on_an_8x8_transform_skip_block() {
+    // INTRA_ANGULAR26 (mpm_idx 2) with implicit_rdpcm_enabled_flag; transform skip at 8x8 (log2_max_transform_skip_block_size
+    // _minus2 1): one level 4 at (0, 0) accumulates down column 0 (8.6.8 vertical: r[x][y] += r[x][y - 1]).
+    let cfg = cfg8(1, 8, Some(2));
+    let r = PpsRext { transform_skip: true, range: Some(PpsRange { log2_max_transform_skip_block_size_minus2: 1, ..Default::default() }), ..Default::default() };
+    let mut s = hdr(&cfg, &pps_qp(26), &PpsInter::default(), &r);
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    cu_head(&mut e, None, 2);
+    e.cbf_chroma(0, false);
+    e.cbf_chroma(0, false);
+    e.cbf_luma(0, true);
+    e.decision(TRANSFORM_SKIP, 1);
+    dc_level(&mut e, 3, false, false, |e| e.remaining(1, 0));
+    s.extend(nal(19, &e.finish().out));
+    let y = luma_of(&decode(&s)[0]);
+    // d = (4 * 16 * (51 << 4) + 32) >> 6 = 816; r = ((816 << 8) + 2048) >> 12 = 51.
+    let res = ts_residual(4, 26, 3, 8);
+    assert_eq!(res, 51);
+    for i in 0..64 {
+        assert_eq!(y[i], if i % 8 == 0 { 128 + res } else { 128 }, "luma ({}, {})", i % 8, i / 8);
+    }
+}
+
+#[test]
+fn i_rotation_and_the_transform_skip_context_on_a_4x4_bypass_block() {
+    // transform_skip_rotation + transform_skip_context, a transquant-bypass intra DC CU split into four 4x4 TUs; TU 0
+    // carries one level 5 at (1, 1): last (1, 1) (diagonal scan position 4), the four sig_coeff_flags before it on the
+    // transform-skip context (ctxInc 42), and the 180-degree rotation puts the residual at (2, 2).
+    let cfg = SpsCfg { depth_intra: 1, range_ext: Some([true, true, false, false, false, false, false, false, false]), ..cfg8(1, 8, None) };
+    let mut s = hdr(&cfg, &pps_qp(26), &PpsInter::default(), &PpsRext { transquant_bypass: true, ..Default::default() });
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    cu_head(&mut e, Some(true), 1);
+    e.decision(SPLIT_TRANSFORM + 2, 1);
+    e.cbf_chroma(0, false);
+    e.cbf_chroma(0, false);
+    e.cbf_luma(1, true);
+    for (ctx, bin) in [(LAST_X, 1), (LAST_X + 1, 0), (LAST_Y, 1), (LAST_Y + 1, 0)] {
+        e.decision(ctx, bin);
+    }
+    for _ in 0..4 {
+        e.decision(SIG + 42, 0);
+    }
+    e.decision(GT1 + 1, 1);
+    e.decision(GT2, 1);
+    e.bypass(0);
+    e.remaining(2, 0);
+    for _ in 0..3 {
+        e.cbf_luma(1, false);
+    }
+    s.extend(nal(19, &e.finish().out));
+    let y = luma_of(&decode(&s)[0]);
+    for i in 0..64 {
+        assert_eq!(y[i], if i == 2 * 8 + 2 { 133 } else { 128 }, "luma ({}, {})", i % 8, i / 8);
+    }
+}
+
+#[test]
+fn j_explicit_rdpcm_in_an_inter_bypass_cu() {
+    // A P picture over a flat IDR: a merged 2Nx2N transquant-bypass CU (mv 0), explicit_rdpcm_flag 1 with
+    // explicit_rdpcm_dir_flag 1 (vertical): one level 5 at (0, 0) fills column 0.
+    let cfg = cfg8(1, 8, Some(3));
+    let mut s = hdr(&cfg, &pps_qp(26), &PpsInter::default(), &PpsRext { transquant_bypass: true, ..Default::default() });
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    e.decision(TRANSQUANT_BYPASS, 0);
+    e.part_mode_2nx2n();
+    e.dc_cu_fmt(1, 1);
+    s.extend(nal(19, &e.finish().out));
+    let pc = SliceCfg { nal_type: 1, slice_type: 1, poc_lsb: 1, neg: vec![(-1, true)], five_minus_max_num_merge_cand: 4, deblocking_disabled: true, ..Default::default() };
+    let mut e = CabacEnc::new(slice_header(&pc), 1, 26);
+    e.decision(TRANSQUANT_BYPASS, 1);
+    e.cu_skip(0, false);
+    e.pred_inter();
+    e.part_mode_2nx2n();
+    e.merge_flag(true);
+    // rqt_root_cbf inferred 1 (2Nx2N merge); one 8x8 TU: cbf_cb 0, cbf_cr 0, cbf_luma inferred 1.
+    e.cbf_chroma(0, false);
+    e.cbf_chroma(0, false);
+    e.decision(EXPLICIT_RDPCM, 1);
+    e.decision(EXPLICIT_RDPCM_DIR, 1);
+    dc_level(&mut e, 3, false, false, |e| e.remaining(2, 0));
+    s.extend(nal(1, &e.finish().out));
+    let f = decode(&s);
+    let p = f.iter().find(|f| f.poc == 1).expect("POC 1");
+    let y = luma_of(p);
+    for i in 0..64 {
+        assert_eq!(y[i], if i % 8 == 0 { 133 } else { 128 }, "luma ({}, {})", i % 8, i / 8);
+    }
+}
+
+#[test]
+fn k_cu_chroma_qp_offset_picks_list_entry_one() {
+    // chroma_qp_offset_list [(0, 0), (6, -3)], cu_chroma_qp_offset_flag 1, cu_chroma_qp_offset_idx 1: Cb's qPi is
+    // 37 + 6 = 43 (8.6.1), QpC 37 by Table 8-10 instead of 34; one Cb DC level 16 at slice QP 37.
+    let cfg = SpsCfg { width: 16, height: 16, log2_ctb: 4, log2_max_tb: 4, ..Default::default() };
+    let r = PpsRext { range: Some(PpsRange { chroma_qp_offset_list: Some((0, vec![(0, 0), (6, -3)])), ..Default::default() }), ..Default::default() };
+    let mut s = hdr(&cfg, &pps_qp(37), &PpsInter::default(), &r);
+    let mut b = BitWriter::default();
+    b.bit(1); // first_slice_segment_in_pic_flag
+    b.bit(0); // no_output_of_prior_pics_flag
+    b.ue(0);
+    b.ue(2); // slice_type I
+    b.se(0); // slice_qp_delta
+    b.bit(1); // cu_chroma_qp_offset_enabled_flag
+    b.trailing();
+    let mut e = CabacEnc::new(b, 0, 37);
+    e.split_cu(0, false);
+    e.prev_intra(true);
+    e.mpm_idx(1);
+    e.chroma_dm();
+    e.cbf_chroma(0, true);
+    e.cbf_chroma(0, false);
+    e.cbf_luma(0, false);
+    e.decision(CU_CHROMA_QP_OFFSET_FLAG, 1);
+    e.decision(CU_CHROMA_QP_OFFSET_IDX, 1); // TR cMax 1: idx 1
+    dc_level(&mut e, 15, true, false, |e| e.remaining(13, 0));
+    s.extend(nal(19, &e.finish().out));
+    let f = decode(&s);
+    let want = dc_residual_8x8(16, qpc_420(43) as i64);
+    assert_ne!(want, dc_residual_8x8(16, qpc_420(37) as i64), "the offset must be visible");
+    assert!(f[0].planes[1].iter().all(|&v| v as i32 == 128 + want), "Cb {:?}", &f[0].planes[1][..8]);
+    assert!(f[0].planes[0].iter().chain(f[0].planes[2].iter()).all(|&v| v == 128));
+}
+
+#[test]
+fn l_cross_component_prediction_scales_the_luma_residual_into_cb() {
+    // 4:4:4 lossless DC CU, chroma DM: luma level 8 at (0, 0), cbf_cb 0; log2_res_scale_abs_plus1[0] 3, sign 0 ->
+    // ResScaleVal 4: rCb = (4 * ((8 << 8) >> 8)) >> 3 = 4 (8.6.6); Cr's log2_res_scale_abs_plus1 0.
+    let cfg = cfg8(3, 8, None);
+    let r = PpsRext { transquant_bypass: true, range: Some(PpsRange { cross_component_prediction: true, ..Default::default() }), ..Default::default() };
+    let mut s = hdr(&cfg, &pps_qp(26), &PpsInter::default(), &r);
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    cu_head(&mut e, Some(true), 1);
+    e.cbf_chroma(0, false);
+    e.cbf_chroma(0, false);
+    e.cbf_luma(0, true);
+    dc_level(&mut e, 3, false, false, |e| e.remaining(5, 0));
+    for (k, bin) in [1, 1, 1, 0].into_iter().enumerate() {
+        e.decision(LOG2_RES_SCALE + k, bin);
+    }
+    e.decision(RES_SCALE_SIGN, 0);
+    e.decision(LOG2_RES_SCALE + 4, 0);
+    s.extend(nal(19, &e.finish().out));
+    let f = &decode(&s)[0];
+    for i in 0..64 {
+        assert_eq!(f.planes[0][i], if i == 0 { 136 } else { 128 }, "Y {i}");
+        assert_eq!(f.planes[1][i], if i == 0 { 132 } else { 128 }, "Cb {i}");
+        assert_eq!(f.planes[2][i], 128, "Cr {i}");
+    }
+}
+
+#[test]
+fn m_persistent_rice_carries_stat_coeff_across_transform_units() {
+    // Two lossless 8x8 DC CUs (16x8 picture) each split into four 4x4 TUs, each TU one DC level 23 (remaining 20):
+    // StatCoeff[3] (luma, bypass) counts up once per TU (20 >= 3 << (StatCoeff / 4)), so TUs 4..7 start at cRiceParam 1;
+    // a decoder that does not carry StatCoeff reads them at 0 and fails.
+    let cfg = SpsCfg { width: 16, depth_intra: 1, ..cfg8(1, 8, Some(7)) };
+    let mut s = hdr(&cfg, &pps_qp(26), &PpsInter::default(), &PpsRext { transquant_bypass: true, ..Default::default() });
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    let mut stat = 0u32;
+    let mut rices = Vec::new();
+    for _cu in 0..2 {
+        cu_head(&mut e, Some(true), 1);
+        e.decision(SPLIT_TRANSFORM + 2, 1);
+        e.cbf_chroma(0, false);
+        e.cbf_chroma(0, false);
+        for _tu in 0..4 {
+            e.cbf_luma(1, true);
+            let rice = stat / 4;
+            rices.push(rice);
+            dc_level(&mut e, 0, false, false, |e| e.remaining(20, rice));
+            if 20 >= 3 << rice {
+                stat += 1;
+            } else if 40 < (1 << rice) && stat > 0 {
+                stat -= 1;
+            }
+        }
+    }
+    assert_eq!(rices, [0, 0, 0, 0, 1, 1, 1, 1]);
+    s.extend(nal(19, &e.finish().out));
+    let y = luma_of(&decode(&s)[0]);
+    for i in 0..128 {
+        let (x, yy) = (i % 16, i / 16);
+        assert_eq!(y[i], if x % 4 == 0 && yy % 4 == 0 { 151 } else { 128 }, "luma ({x}, {yy})");
+    }
+}
+
+#[test]
+fn n_cabac_bypass_alignment_before_the_sign_and_escape_bins() {
+    // One lossless DC level 100: greater2 1 sets escapeDataPresent, so the encoder aligns (ivlCurrRange 256) before
+    // the sign and coeff_abs_level_remaining 97; a decoder that does not align reads other bins.
+    let cfg = cfg8(1, 8, Some(8));
+    let mut s = hdr(&cfg, &pps_qp(26), &PpsInter::default(), &PpsRext { transquant_bypass: true, ..Default::default() });
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    cu_head(&mut e, Some(true), 1);
+    e.cbf_chroma(0, false);
+    e.cbf_chroma(0, false);
+    e.cbf_luma(0, true);
+    dc_level(&mut e, 3, false, true, |e| e.remaining(97, 0));
+    s.extend(nal(19, &e.finish().out));
+    let y = luma_of(&decode(&s)[0]);
+    for i in 0..64 {
+        assert_eq!(y[i], if i == 0 { 228 } else { 128 }, "luma {i}");
+    }
+}
+
+#[test]
+fn o_intra_smoothing_disabled_predicts_from_unfiltered_references() {
+    // A pcm CU whose column 7 is L[y] = 4 y^2 (convex, so the [1 2 1] filter would move it), then an 8x8 INTRA_ANGULAR18
+    // CU (rem_intra_luma_pred_mode 16 past MPMs {0, 1, 26}): min distance 8 > 7 would filter; intra_smoothing_disabled
+    // leaves the references, so pred(x, y) = L[0] for x >= y (top and corner substituted from L[0]), else L[y - x - 1].
+    let cfg = SpsCfg { width: 16, pcm: Some((8, 8, 3, 3, true)), ..cfg8(1, 8, Some(5)) };
+    let mut s = hdr(&cfg, &pps_qp(26), &PpsInter::default(), &PpsRext::default());
+    let l = |y: usize| (4 * y * y) as u16;
+    let ypcm: Vec<u16> = (0..64).map(|i| if i % 8 == 7 { l(i / 8) } else { 128 }).collect();
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    e.part_mode_2nx2n();
+    e.pcm_samples_fmt(3, 8, 8, &ypcm, &[128; 16], &[128; 16], (2, 2));
+    e.part_mode_2nx2n();
+    e.terminate(0); // pcm_flag 0
+    e.prev_intra(false);
+    e.bypass_bits(16, 5);
+    e.chroma_dm();
+    e.cbf_chroma(0, false);
+    e.cbf_chroma(0, false);
+    e.cbf_luma(0, false);
+    s.extend(nal(19, &e.finish().out));
+    let y = luma_of(&decode(&s)[0]);
+    for yy in 0..8 {
+        for x in 0..8 {
+            let want = if x >= yy { l(0) } else { l(yy - x - 1) } as i32;
+            assert_eq!(y[yy * 16 + 8 + x], want, "pred ({x}, {yy})");
+        }
+    }
+}
+
+#[test]
+fn p_high_precision_offsets_add_the_offset_at_full_bit_depth() {
+    // 10-bit P skip CU over a flat 512 IDR, explicit weights: LumaWeight 1 (denom 0), luma_offset 100: with
+    // high_precision_offsets_enabled_flag the offset is not scaled by 1 << (BitDepth - 8): 612, not 912.
+    let cfg = cfg8(1, 10, Some(6));
+    let mut s = hdr(&cfg, &pps_qp(26), &PpsInter { weighted_pred: true, ..Default::default() }, &PpsRext::default());
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+    e.part_mode_2nx2n();
+    e.dc_cu_fmt(1, 1);
+    s.extend(nal(19, &e.finish().out));
+    let pc = SliceCfg {
+        nal_type: 1,
+        slice_type: 1,
+        poc_lsb: 1,
+        neg: vec![(-1, true)],
+        weights: Some((0, vec![Some((0, 100))])),
+        five_minus_max_num_merge_cand: 4,
+        deblocking_disabled: true,
+        ..Default::default()
+    };
+    let mut e = CabacEnc::new(slice_header(&pc), 1, 26);
+    e.cu_skip(0, true);
+    s.extend(nal(1, &e.finish().out));
+    let f = decode(&s);
+    let p = f.iter().find(|f| f.poc == 1).expect("POC 1");
+    assert!(samples(p, 0).iter().all(|&v| v == 612), "{:?}", &samples(p, 0)[..4]);
+    assert!(samples(p, 1).iter().chain(samples(p, 2).iter()).all(|&v| v == 512));
+}
+
+#[test]
+fn q_log2_sao_offset_scale_shifts_the_band_offset() {
+    // 10-bit luma band offset 3 at band 16 (512 >> 5) with log2_sao_offset_scale_luma 2: SaoOffsetVal 3 << 2 = 12.
+    let cfg = SpsCfg { sao: true, ..cfg32(1, 10) };
+    let r = PpsRext { range: Some(PpsRange { log2_sao_offset_scale: (2, 0), ..Default::default() }), ..Default::default() };
+    let mut s = hdr(&cfg, &pps_qp(26), &PpsInter::default(), &r);
+    let mut e = CabacEnc::new(idr_slice_header(true, false, true, true), 0, 26);
+    e.decision(SAO_TYPE, 1);
+    e.bypass(0);
+    for a in [3, 0, 0, 0] {
+        e.bypass_tu(a, 31);
+    }
+    e.bypass(0);
+    e.bypass_bits(16, 5);
+    e.split_cu(0, false);
+    e.dc_cu_fmt(1, 1);
+    s.extend(nal(19, &e.finish().out));
+    let f = &decode(&s)[0];
+    assert!(samples(f, 0).iter().all(|&v| v == 524), "{:?}", &samples(f, 0)[..4]);
+    assert!(samples(f, 1).iter().all(|&v| v == 512));
+}
+
+#[test]
+fn r_extended_precision_at_sixteen_bits() {
+    // (a) 16-bit 4:4:4 all-DC pictures are 1 << 15 (the 16-bit profiles decode).
+    let f = &decode(&dc32(&SpsCfg { range_ext: Some([false, false, false, false, true, false, false, false, false]), ..cfg32(3, 16) }))[0];
+    assert_eq!(f.bit_depth, 16);
+    assert!(f.planes16.as_ref().unwrap().iter().all(|p| p.iter().all(|&v| v == 32768)));
+    // (b) extended_precision_processing_flag at 16 bits (log2TransformRange 22): one transform-skip level 40000 (above the
+    // 16-bit CoeffMax) through the limited EGk at slice QP -48 (qP 0): d = (40000 * 16 * 40 + 32) >> 6 = 400000 (bdShift
+    // 16 + 2 + 10 - 22), r = ((400000 << 7) + 1024) >> 11 = 25000 (bdShift Max(4, 11), tsShift Min(5, 9) + 2).
+    let cfg = SpsCfg { depth_intra: 1, ..cfg8(1, 16, Some(4)) };
+    let mut s = hdr(&cfg, &pps_qp(-48), &PpsInter::default(), &PpsRext { transform_skip: true, ..Default::default() });
+    let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, -48);
+    cu_head(&mut e, None, 1);
+    e.decision(SPLIT_TRANSFORM + 2, 1);
+    e.cbf_chroma(0, false);
+    e.cbf_chroma(0, false);
+    e.cbf_luma(1, true);
+    e.decision(TRANSFORM_SKIP, 1);
+    dc_level(&mut e, 0, false, false, |e| e.remaining_limited(39997, 0, 22));
+    for _ in 0..3 {
+        e.cbf_luma(1, false);
+    }
+    s.extend(nal(19, &e.finish().out));
+    let y = luma_of(&decode(&s)[0]);
+    for i in 0..64 {
+        assert_eq!(y[i], if i == 0 { 32768 + 25000 } else { 32768 }, "luma {i}");
+    }
+}
+
+#[test]
+fn s_monochrome_pcm_and_all_dc() {
+    // chroma_format_idc 0: no chroma syntax, a Frame with ChromaFormat::Mono and empty Cb / Cr planes.
+    for bd in [8, 12] {
+        let f = &decode(&dc32(&SpsCfg { chroma_bit_depth: Some(8), ..cfg32(0, bd) }))[0];
+        assert_eq!(f.chroma, ChromaFormat::Mono);
+        assert!(f.planes[1].is_empty() && f.planes[2].is_empty());
+        assert!(samples(f, 0).iter().all(|&v| v == 1 << (bd - 1)), "bd {bd}");
+    }
+    for bd in [8u32, 12] {
+        let cfg = SpsCfg { pcm: Some((bd, 8, 3, 3, true)), chroma_bit_depth: Some(8), range_ext: None, ..cfg8(0, bd, None) };
+        let mut s = hdr(&cfg, &pps_qp(26), &PpsInter::default(), &PpsRext::default());
+        let y: Vec<u16> = (0..64).map(|i| pat(i % 8, i / 8, 3, bd)).collect();
+        let mut e = CabacEnc::new(idr_slice_header(false, false, false, true), 0, 26);
+        e.part_mode_2nx2n();
+        e.pcm_samples_fmt(3, bd, 8, &y, &[], &[], (1, 1));
+        s.extend(nal(19, &e.finish().out));
+        let f = &decode(&s)[0];
+        assert_eq!(f.chroma, ChromaFormat::Mono);
+        assert_eq!(samples(f, 0), y, "bd {bd}");
+        assert!(f.planes[1].is_empty() && f.planes[2].is_empty());
+    }
 }

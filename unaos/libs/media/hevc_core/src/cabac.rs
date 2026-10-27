@@ -16,7 +16,7 @@
 use h264_core::cabac::{Cabac, NUM_CTX};
 
 use crate::slice::SliceType;
-use crate::tables::{init_state, CNU, CTX_TABLES};
+use crate::tables::{init_state, CNU, CTX_TABLES, REXT_CTX_TABLES};
 
 /// A saved set of context states (9.3.2.4 TableStateIdxWpp / TableStateIdxDs).
 pub type Contexts = [u8; NUM_CTX];
@@ -45,7 +45,7 @@ pub fn init_type(slice_type: SliceType, cabac_init_flag: bool) -> usize {
 /// The initial context states of every slot for (initType, SliceQpY), 9.3.2.2.
 pub fn initial_contexts(init_type: usize, qp: i32) -> Contexts {
     let mut s = [0u8; NUM_CTX];
-    for t in CTX_TABLES {
+    for t in CTX_TABLES.iter().chain(REXT_CTX_TABLES) {
         let row = t.init[init_type];
         for i in 0..t.len() {
             s[t.slot + i] = init_state(row.get(i).copied().unwrap_or(CNU), qp);
@@ -116,6 +116,11 @@ impl<'a> Engine<'a> {
         self.c.terminate()
     }
 
+    /// HEVCREXTTOOLS (SR345) 9.3.4.3.6: ivlCurrRange = 256 before the aligned bypass bins.
+    pub fn align_bypass(&mut self) {
+        self.c.align_bypass();
+    }
+
     /// FL binarization in bypass bins (9.3.3.5): `n` bins, most significant first.
     pub fn bypass_bits(&mut self, n: u32) -> u32 {
         let mut v = 0;
@@ -156,5 +161,29 @@ impl<'a> Engine<'a> {
             }
             ((((1u64 << (p - 3)) + 2) << rice) as u32).wrapping_add(self.bypass_bits(n))
         }
+    }
+
+    /// HEVCREXTTOOLS (SR345): coeff_abs_level_remaining with extended_precision_processing_flag (9.3.3.11 with the
+    /// limited k-th order Exp-Golomb of 9.3.3.12): the same TR prefix (cMax 4 << cRiceParam); past it at most
+    /// maxPrefixExtLen = 28 - log2TransformRange further ones. Below that maximum the code is the unlimited one (a 0
+    /// separator, then preExtLen + 1 + cRiceParam bits); at it there is no separator and log2TransformRange bits follow.
+    pub fn coeff_abs_level_remaining_limited(&mut self, rice: u32, log2_range: u32) -> u32 {
+        let max_ext = 28u32.saturating_sub(log2_range);
+        let mut p = 0u32;
+        while p < 4 && self.bypass() == 1 {
+            p += 1;
+        }
+        if p < 4 {
+            return (p << rice) + self.bypass_bits(rice);
+        }
+        let mut pre = 0u32;
+        while pre < max_ext && self.bypass() == 1 {
+            pre += 1;
+        }
+        let n = if pre == max_ext { log2_range } else { pre + 1 + rice };
+        if n > 31 || pre + 1 + rice > 31 {
+            return u32::MAX >> 1;
+        }
+        ((((1u64 << (pre + 1)) + 2) << rice) as u32).wrapping_add(self.bypass_bits(n))
     }
 }

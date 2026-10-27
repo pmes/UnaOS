@@ -10,7 +10,7 @@ mod common;
 
 use common::*;
 use hevc_core::tables::*;
-use hevc_core::{Decoder, Error, Frame};
+use hevc_core::{Decoder, Frame};
 
 fn decode(stream: &[u8]) -> Vec<Frame> {
     let mut d = Decoder::new();
@@ -142,11 +142,11 @@ fn eight_bit_frames_carry_no_planes16() {
 }
 
 #[test]
-fn depths_above_twelve_are_refused_by_name() {
+fn depths_up_to_sixteen_decode() {
     for (cfg, want) in [
-        (cfg32(13), "bit depth above 12 (HEVCREXT-TOOLS)"),
-        (SpsCfg { chroma_bit_depth: Some(13), ..cfg32(10) }, "bit depth above 12 (HEVCREXT-TOOLS)"),
+        (cfg32(13), [1u16 << 12, 1 << 12]), // HEVCREXTTOOLS (SR345): above 12 bits decodes (the 16-bit profiles)
+        (SpsCfg { chroma_bit_depth: Some(13), ..cfg32(10) }, [1 << 9, 1 << 12]),
     ] {
-        assert_eq!(Decoder::new().decode_annexb(&dc32(&cfg)).unwrap_err(), Error::Unsupported(want));
+        let p16 = decode(&dc32(&cfg))[0].planes16.clone().unwrap(); assert!(p16[0].iter().all(|&v| v == want[0]) && p16[1].iter().all(|&v| v == want[1]));
     }
 }

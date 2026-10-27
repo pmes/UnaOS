@@ -6,6 +6,7 @@
 //! lies outside the picture, across a slice boundary the loop filters may not cross, or across a tile boundary when
 //! loop_filter_across_tiles_enabled_flag is 0, is left as it is). Applied where the CTB's slice has slice_sao_luma_flag /
 //! slice_sao_chroma_flag; pcm (with pcm_loop_filter_disabled_flag) and transquant bypass samples are left as they are.
+//! HEVCREXTTOOLS (SR345): SaoOffsetVal arrives already shifted by log2_sao_offset_scale_luma / _chroma (ctu.rs `sao`).
 
 use crate::picture::{Picture, F_BYPASS, F_PCM, NO_SLICE};
 use crate::ps::{Geometry, Pps, Sps};

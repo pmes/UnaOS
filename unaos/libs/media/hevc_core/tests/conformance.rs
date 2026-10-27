@@ -141,7 +141,7 @@ vectors!(
 );
 
 /// HEVCREXT (SR334): every `hevc/rext/` row of vectors.txt (the JCT-VC RExt suite) decodes to its md5, or is refused by
-/// a name carrying HEVCREXT (the RExt tools, monochrome, depths above 12 stay owed); offline each row SKIPs.
+/// a name carrying HEVCREXT (HEVCREXTTOOLS SR345: only separate colour planes and SCC remain); offline each row SKIPs.
 #[test]
 fn rext_vectors_decode_or_are_refused_by_name() {
     let names = LIST.lines().filter_map(|l| l.split_whitespace().nth(1)?.strip_prefix("hevc/rext/")?.strip_suffix(".zip"));

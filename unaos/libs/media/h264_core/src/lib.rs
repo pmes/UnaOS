@@ -162,14 +162,15 @@ impl Frame {
     }
 }
 
-/// HEVCREXT (SR334): the sampling of a [`Frame`]'s Cb / Cr planes against its luma plane (H.265 Table 6-1). Monochrome
-/// is not a variant yet (HEVCREXT-MONO).
+/// HEVCREXT (SR334): the sampling of a [`Frame`]'s Cb / Cr planes against its luma plane (H.265 Table 6-1). HEVCREXTTOOLS
+/// (SR345): `Mono` (chroma_format_idc 0) has no Cb / Cr samples; its Frame carries empty chroma planes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ChromaFormat {
     #[default]
     Yuv420,
     Yuv422,
     Yuv444,
+    Mono,
 }
 
 impl ChromaFormat {
@@ -178,7 +179,7 @@ impl ChromaFormat {
         match self {
             ChromaFormat::Yuv420 => (2, 2),
             ChromaFormat::Yuv422 => (2, 1),
-            ChromaFormat::Yuv444 => (1, 1),
+            ChromaFormat::Yuv444 | ChromaFormat::Mono => (1, 1),
         }
     }
 }
