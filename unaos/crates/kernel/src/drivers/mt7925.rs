@@ -1,9 +1,9 @@
-//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
+//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, and S2 driver-own and the chip id, Z11; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
 //! MT7925 — S1, the probe (ZENBOOKMT7925, zenbook-ledger Z5). The ladder is
-//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2..S10 are owed there by name.
+//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11) is the file tail; S3..S10 are owed there by name.
 //!
 //! WHAT THIS RUNG DOES. Once per boot, from the three storage-ready passes in `main.rs` (beside `wifi::service()`,
 //! the same forward-only polled shape), and only after `boot::services_gate("wifi")` answers (R86, BP-net-4):
@@ -16,10 +16,13 @@
 //! * hashes the linux-firmware pair on the ESP at `FW/MT7925/` against `unaos/firmware/mt7925.pins` (arroyo's
 //!   MT7925-FW line stages it from `UNAOS_MT7925_FW_PATH`), and says one line, then parks.
 //!
-//! WHAT IT DOES NOT DO. ZERO device writes: no config write, no MMIO write, nothing uploaded, nothing transmitted
-//! (BP-net-7, BP-net-8). The silicon CHIPID/REV registers (0x70010200/0x70010204) sit behind the L1 remap selector
-//! (a write to BAR0+0x155024) that linux issues only after the driver-own handshake — both are S2's, as is the
-//! WFDMA reset. A machine without the radio (QEMU, the rMBP) parks on the first pass: no gate call, no line.
+//! S1 WRITES NOTHING: no config write, no MMIO write, nothing uploaded, nothing transmitted (BP-net-7, BP-net-8).
+//! S2 (MT7925S2, zenbook-ledger Z11; the file tail) runs once on the next pass, only on a positively identified
+//! Zenbook (`hw::platform()`), and its device writes are exactly: LPCTL CLR_OWN (driver-own, at most OWN_TRIES, none
+//! when the driver already owns), HIF_REMAP_L1 twice (select the 0x7001 window for CHIPID 0x70010200 / REV
+//! 0x70010204, then restore), and LPCTL SET_OWN (at most OWN_TRIES) only when S2 took own — the device left as found.
+//! The WFSYS reset and the WFDMA are S3's. A machine without the radio (QEMU, the rMBP) parks on the first pass: no
+//! gate call, no line.
 //!
 //! Hardware facts are from linux v6.11 drivers/net/wireless/mediatek/mt76 (ISC); no code was copied.
 
@@ -83,6 +86,7 @@ pub fn service() {
         S_START => start(),
         S_GATE => gate(),
         S_WAIT_VOL => wait_vol(),
+        S_S2 => s2(),
         _ => {}
     }
 }
@@ -141,7 +145,7 @@ fn wait_vol() {
     if !have && waited < WAIT_BOUND_MS {
         return;
     }
-    STATE.store(S_PARKED, Ordering::Relaxed);
+    STATE.store(S_S2, Ordering::Relaxed); // MT7925S2 (Z11): S2 runs on the next pass, after this S1 line
     let held = *PROBE.lock();
     let Some(p) = held else { return };
     let fw = if have { fw_check() } else { Fw { word: String::from("no-volume"), sha: ["-", "-"] } };
@@ -249,4 +253,129 @@ fn say(p: &Probe, fw: &Fw) {
         "[mt7925] probe at={}:{}.{} id={:04x}:{:04x} rev={:#04x} bar0={} mem={} lpctl={} own={} fwstate={} fw={} patch_sha={} ram_sha={} -> parked",
         p.bus, p.dev, p.func, VENDOR, p.device, p.rev, bar0, if p.mem { "on" } else { "off" }, lpctl, own, fwstate, fw.word, fw.sha[0], fw.sha[1]
     );
+}
+
+// ── MT7925S2 (zenbook-ledger Z11) — S2: driver-own and the chip id through the L1 remap ─────────────────────────────
+// Once, on the storage-ready pass after the S1 line (`wait_vol` hands to S_S2), only on a positively identified Zenbook
+// (`hw::platform()`). Writes, all bounded: LPCTL CLR_OWN (<= OWN_TRIES; none when the driver already owns), HIF_REMAP_L1
+// twice (select the 0x7001 window, restore), and LPCTL SET_OWN (<= OWN_TRIES) only when this rung took own. Linux
+// reads CHIPID/REV right after driver-own and before the WFSYS reset (mt7925/pci.c probe), so the reset stays S3's.
+
+/// MT_CONN_ON_LPCTL's SET_OWN (firmware takes own) and CLR_OWN (driver takes own) bits (mt792x_regs.h:470-471).
+const SET_OWN: u32 = 1 << 0;
+const CLR_OWN: u32 = 1 << 1;
+/// MT_HIF_REMAP_L1 (bits 31:16 select a 64 KiB window of the chip's map) and the BAR0 offset that window answers at
+/// (mt7925/regs.h:70-74).
+const HIF_REMAP_L1: u64 = 0x0015_5024;
+const REMAP_BASE_L1: u64 = 0x0013_0000;
+/// MT_HW_CHIPID / MT_HW_REV (mt792x_regs.h:394-395); both in the 0x7001 window, so one selector write serves both.
+const HW_CHIPID: u32 = 0x7001_0200;
+const HW_REV: u32 = 0x7001_0204;
+/// Per try: one LPCTL write, then OWN_SYNC polled up to OWN_TRY_MS; OWN_TRIES tries = the 200 ms bound. The read cap
+/// ends a try should the tick stall.
+const OWN_TRY_MS: u64 = 50;
+const OWN_TRIES: u32 = 4;
+const OWN_READ_CAP: u32 = 1_000_000;
+const S_S2: u8 = 4;
+
+fn s2() {
+    STATE.store(S_PARKED, Ordering::Relaxed);
+    let held = *PROBE.lock();
+    let Some(p) = held else { return };
+    let plat = crate::hw::platform();
+    if plat != crate::hw::Platform::ZenbookUm5606w {
+        serial_println!("[mt7925] s2 -> NOT ATTEMPTED why=platform={}", plat.token());
+        return;
+    }
+    let why = if !p.mem {
+        Some("mem-off")
+    } else if p.bar0 == 0 {
+        Some("unassigned")
+    } else {
+        match p.regs {
+            None => Some("unmapped"),
+            Some((l, _)) if l == u32::MAX => Some("dead"),
+            Some(_) => None,
+        }
+    };
+    if let Some(w) = why {
+        serial_println!("[mt7925] s2 -> NOT ATTEMPTED why={}", w);
+        return;
+    }
+    if !map_page(p.bar0 + (HIF_REMAP_L1 & !0xfff)) || !map_page(p.bar0 + REMAP_BASE_L1) {
+        serial_println!("[mt7925] s2 -> NOT ATTEMPTED why=unmapped");
+        return;
+    }
+    let lp = p.bar0 + CONN_HOST_CSR_TOP + LPCTL;
+    // SAFETY: LPCTL sits in the conn_host_csr_top page S1's `read_csr_top` mapped and proved present (regs is Some).
+    let now = unsafe { core::ptr::read_volatile(lp as *const u32) };
+    let took = now & OWN_SYNC != 0;
+    if took {
+        let (ok, last, waited) = own(lp, CLR_OWN, false);
+        if !ok {
+            let rel = if own(lp, SET_OWN, true).0 { "fw" } else { "timeout" };
+            serial_println!("[mt7925] own -> REFUSED lpctl={:#010x} waited={} rel={}", last, waited, rel);
+            return;
+        }
+    }
+    let (chip, rev, restored) = read_chip(p.bar0);
+    let rel = if !took {
+        "found"
+    } else if own(lp, SET_OWN, true).0 {
+        "fw"
+    } else {
+        "timeout"
+    };
+    serial_println!(
+        "[mt7925] s2 own={} chip={:#x} rev={:#x} remap={} rel={} -> parked",
+        if took { "ok" } else { "found" }, chip, rev, if restored { "restored" } else { "stuck" }, rel
+    );
+}
+
+/// One LPCTL handshake (linux's drv/fw pmctrl shape): per try write `bit`, then poll OWN_SYNC until it reads
+/// `want_fw` (set = firmware owns) for up to OWN_TRY_MS; at most OWN_TRIES writes. (reached, last LPCTL, ms waited).
+fn own(lp: u64, bit: u32, want_fw: bool) -> (bool, u32, u64) {
+    let t0 = crate::arch::ms();
+    let mut last = 0u32;
+    for _ in 0..OWN_TRIES {
+        // SAFETY: LPCTL in the mapped, present conn_host_csr_top page; the ownership handshake write linux issues.
+        unsafe { core::ptr::write_volatile(lp as *mut u32, bit) };
+        let t = crate::arch::ms();
+        let mut reads = 0u32;
+        while crate::arch::ms().saturating_sub(t) < OWN_TRY_MS && reads < OWN_READ_CAP {
+            // SAFETY: as above; a status read.
+            last = unsafe { core::ptr::read_volatile(lp as *const u32) };
+            if (last & OWN_SYNC != 0) == want_fw {
+                return (true, last, crate::arch::ms().saturating_sub(t0));
+            }
+            reads += 1;
+            core::hint::spin_loop();
+        }
+    }
+    (false, last, crate::arch::ms().saturating_sub(t0))
+}
+
+/// `read_csr_top`'s map shape for one more BAR0 page: a page-table edit, then present proved before any access.
+fn map_page(page: u64) -> bool {
+    crate::arch::memory::map_mmio_window(page, 0x1000);
+    crate::arch::memory::translate(page).is_some()
+}
+
+/// CHIPID and REV through the L1 remap: the selector saved, the 0x7001 window selected (read back to push it), the two
+/// reads, the selector restored and read back. (chip, rev, selector restored).
+fn read_chip(bar0: u64) -> (u32, u32, bool) {
+    let sel = bar0 + HIF_REMAP_L1;
+    let win = bar0 + REMAP_BASE_L1;
+    // SAFETY: both pages are mapped uncacheable and proved present (`map_page`); the driver owns the chip (the
+    // handshake above, or found so); the selector is put back before this block ends.
+    unsafe {
+        let backup = core::ptr::read_volatile(sel as *const u32);
+        core::ptr::write_volatile(sel as *mut u32, (backup & 0xffff) | (HW_CHIPID & 0xffff_0000));
+        let _ = core::ptr::read_volatile(sel as *const u32); // push the selector write (linux reads it back)
+        let chip = core::ptr::read_volatile((win + (HW_CHIPID & 0xffff) as u64) as *const u32);
+        let rev = core::ptr::read_volatile((win + (HW_REV & 0xffff) as u64) as *const u32);
+        core::ptr::write_volatile(sel as *mut u32, backup);
+        let restored = core::ptr::read_volatile(sel as *const u32) == backup;
+        (chip, rev, restored)
+    }
 }

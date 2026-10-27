@@ -36,7 +36,8 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
 6. **ZENBOOK-XHCIPICK** — the kernel brings up ONE xHCI, the first class 0C/03/30 in walk order (`PciScanner::scan`,
    `unaos/crates/kernel/src/arch/x86_64/pci.rs:895`); Strix Point has four (1022:151a/151b/151e/151f) plus two USB4
    NHIs (151c/151d). Measure which physical ports the first one serves; then bring up every xHCI or pick by port.
-7. **ZENBOOK-MT7925** — `drivers/mt7925.rs` (14c3:7925): probe + firmware pin only. In flight (ZENBOOKMT7925).
+7. **ZENBOOK-MT7925** — `drivers/mt7925.rs` (14c3:7925): probe + firmware pin (Z5, fixed-unflown). In flight (MT7925S2, Z11): S2 driver-own and the chip id through
+   the L1 remap, Zenbook only; S3..S10 owed in `docs/dev/OS/06_NETWORK_STACK/mt7925.md`.
 8. **ZENBOOK-EC** — battery, lid and the Fn keys through the ACPI embedded controller (the SMC's job on the rMBP).
 9. **ZENBOOK-TOUCHPAD** — the touchpad over I2C-HID on the AMD DesignWare I2C controller.
 10. **ZENBOOK-ACP** — audio: the ALC294 codec on the Ryzen HD Audio controller (1022:15e3; Linux quirk 1043:1df3
