@@ -834,9 +834,9 @@ impl Console {
 // background: it is read back), so every layout fn above re-lays out its rows at the new cell; `font_follow` is the
 // render task's per-pass question — `video::text::epoch` (KERNELFONT2 M4, the one restyle signal) moved since this
 // shell last painted -> one full repaint, `[kfont] repaint shell epoch= console_rows= cols= cell= face=`. At the
-// default size the shell is on the JetBrains Mono grid too (FONTSCRAFT's direction: one console face). x86 `wc` only;
-// every other console (the knob-off image, aarch64's shells, the backdrop shell, the pager) draws as before.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+// default size the shell is on the JetBrains Mono grid too (FONTSCRAFT's direction: one console face). The desktop family;
+// SHELLFACE (B858): x86 `wc` and the aarch64 `desktop_firmware` shells (Pi `render_pass`, Orin `jd2_console_pump`); every other console draws as before.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 mod textscale2 {
     use core::sync::atomic::{AtomicU32, AtomicUsize};
     /// The face epoch the windowed shell last repainted at (0 = never).
@@ -847,7 +847,7 @@ mod textscale2 {
 }
 
 /// The windowed shell's last restyle repaint: `(face epoch, rows, cell w, cell h)` (`tests textscale2`).
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn shell_face() -> (u32, usize, usize, usize) {
     use core::sync::atomic::Ordering::Acquire;
     let e = textscale2::SHELL_EPOCH.load(Acquire);
@@ -855,7 +855,7 @@ pub fn shell_face() -> (u32, usize, usize, usize) {
     (e, textscale2::SHELL_ROWS.load(Acquire), (c >> 16) as usize, (c & 0xFFFF) as usize)
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 impl Console {
     /// The metrics this console lays out and paints with: the surface's, with the console's grid cell
     /// (`video::text::grid_cell`) as the text cell and the line pitch when it renders into a window.
@@ -924,7 +924,7 @@ impl Console {
 }
 
 // The knob-off twins: every other build draws exactly what it drew.
-#[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 impl Console {
     #[inline(always)]
     fn face_m(&self, pal: &TargetPal) -> crate::ui::Metrics {

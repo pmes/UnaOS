@@ -2503,3 +2503,13 @@ FORBID :: STOR2-MV: aarch64 SYS_RENAME FAIL
 REQUIRE :: LFNMV: sys_rename_long=-EINVAL shell_mv_long=ok alias_leak=false readback=ok \(aarch64: .* -> PASS ::
 FORBID :: LFNMV: SKIPPED
 FORBID :: LFNMV: .* -> FAIL ::
+
+# --- SHELLFACE (rmbp-ledger B858): the aarch64 `desktop_firmware` shell window (the Pi `render_pass` shell) takes the
+# --- console's Grid face and repaints whole when `video::text::epoch` moves (`Console::font_follow`, TEXTSCALE2's
+# --- fold widened to the desktop family). OPTIONAL + FORBID and not REQUIRE, on the DRAG-PI rule above and the seat's
+# --- ruling: the default kernel8-test battery is knob-off (`desktop_firmware` arms only under UNAOS_PIDESK), and mbench
+# --- has no knob-conditional REQUIRE. The OPTIONAL reports the repaint line on an armed battery; the FORBID reds a shell
+# --- row that laid out off the Grid cell in `tests textscale` (`textscale_shell_leg`). PIDESK-SPEC (an armed kernel8
+# --- spec) is the owed row that would let this become a REQUIRE.
+OPTIONAL \[kfont\] repaint shell epoch=[1-9][0-9]* console_rows=[1-9]
+FORBID \[textscale\] win=shell css=[0-9]+ grow=[0-9]+ rows_ok=0
