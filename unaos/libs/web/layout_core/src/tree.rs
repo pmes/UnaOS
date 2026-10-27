@@ -629,6 +629,13 @@ fn control_line_height<F: Fonts + ?Sized>(fonts: &F, family: u16) -> f32 {
     if fonts.has_face(sel) { fonts.line_height(sel, CONTROL_FONT_PX, 0.0) } else { 15.0 }
 }
 
+/// AETHERSUBMITCAPTION (SR410): one line of a button label in `family` at `size` (= `control_line_height`
+/// at family 0 and the control font size).
+fn button_line_height<F: Fonts + ?Sized>(fonts: &F, family: u16, size: f32) -> f32 {
+    let sel = FontSel::new(family, 400, false);
+    if fonts.has_face(sel) { fonts.line_height(sel, size, 0.0) } else { 15.0 * size / CONTROL_FONT_PX }
+}
+
 /// UA (html.css + Chromium's control theme) box metrics of form controls:
 /// text fields `padding: 1px 2px; border: 2px inset` with one line of the
 /// 13.333px control font and the `size=20` default width; checkbox and
@@ -678,7 +685,10 @@ fn ua_control<N: DomNode>(node: &N, _tag: &str, style: &mut Style) {
 /// line by the `size=20` average-character width for a field, the label
 /// for a button-like input, the selected label plus the arrow for a
 /// select, rows x cols of the monospace control font for a textarea.
-fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F) -> Option<(f32, f32)> {
+/// AETHERSUBMITCAPTION (SR410): a button-like input's label is measured in the element's own font, `font`
+/// = (family, size) — the author's family when one is set, else family 0 as before — so the caption the
+/// painter centres fits the box (byte-identical at the UA defaults).
+fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F, font: (u16, f32)) -> Option<(f32, f32)> {
     let kind = control_kind(node)?;
     let attr = |name: &str| node.attr(name);
     let lh = control_line_height(fonts, 0);
@@ -690,7 +700,7 @@ fn control_intrinsic<H: Host, F: Fonts + ?Sized>(node: &H::Node, fonts: &F) -> O
         Control::Button if node.tag().as_deref() == Some("input") => {
             let t = attr("type").unwrap_or_default().to_ascii_lowercase();
             let label = attr("value").unwrap_or_else(|| if t == "reset" { "Reset".into() } else { "Submit".into() });
-            Some((text_advance(fonts, &label, 0, CONTROL_FONT_PX), lh))
+            Some((text_advance(fonts, &label, font.0, font.1), button_line_height(fonts, font.0, font.1)))
         }
         Control::Select => {
             let label = select_selected_option::<H>(node).map(|(_, l)| l).unwrap_or_default();
@@ -1551,7 +1561,7 @@ fn prepass<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, fonts: &F) -> P
                     };
                     out.media.insert(node_id, (w, h, ratio));
                 }
-                if let Some(wh) = control_intrinsic::<H, F>(dom_node, fonts) {
+                if let Some(wh) = control_intrinsic::<H, F>(dom_node, fonts, (if paint.and_then(|p| p.family).is_some() { size.family } else { 0 }, size.font_size)) {
                     out.imgs.insert(node_id, wh);
                 }
                 if tag == "img" {
