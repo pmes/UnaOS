@@ -859,7 +859,7 @@ refs/heads/exec-rmbp-heifone   5da786379 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-hevcdepthcore   94fa106ce FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nleprobehdrwire   3f450a486 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle2mods   44d0e2b7a FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-vorbistrim   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-vorbistrim   ef3144396 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-gneisspalnostd   9bbbfa121 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle4bkernel   5da786379 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aethermacgpu   5da786379 IN-FLIGHT cut 2026-10-27

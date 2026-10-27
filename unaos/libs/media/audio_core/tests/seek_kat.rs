@@ -326,3 +326,56 @@ fn check_opus(name: &str, b: &[u8], targets: &[u64]) {
         assert!(tail < 2e-3, "{name} @ {ms} ms: not converged 250 ms after the landing (err {tail})");
     }
 }
+
+/// VORBISTRIM (LEDGER SR307): the Ogg Vorbis granule trims (Vorbis I §A.2) over the in-repo v05.ogg's packets re-paged
+/// by `paginate`, against the untrimmed decode of the same packets: the first audio packet yields no samples; a short
+/// last granule cuts the END (two pages, and one page that is both first and last — chromium-sfx.ogg's shape, where
+/// the spec cuts the end, not the beginning); a first-page granule below the decoded count cuts the START.
+#[test]
+fn vorbis_granule_trims() {
+    let b = std::fs::read(common::root().join("data").join("vorbis").join("v05.ogg")).unwrap();
+    let pk = ogg_packets(&b);
+    let setup = audio_core::vorbis::Setup::parse(&pk[0], &pk[2]).unwrap();
+    assert_eq!(setup.channels, 1, "v05.ogg is mono");
+    let mut dec = audio_core::vorbis::VorbisDecoder::new(setup);
+    let (mut out, mut raw, mut g, mut outs) = (Vec::new(), Vec::new(), 0u64, Vec::new());
+    let audio: Vec<(Vec<u8>, u64)> = pk[3..].iter().map(|p| {
+        let n = dec.decode(p, &mut out).unwrap();
+        raw.extend_from_slice(&out[0][..n]);
+        outs.push(n as u64);
+        g += n as u64;
+        (p.clone(), g)
+    }).collect();
+    assert_eq!(outs[0], 0, "the first audio packet yields no samples (§4.3.8: no previous block to overlap)");
+    let pages = |f: &[u8]| f.windows(4).filter(|w| *w == b"OggS").count() - 3;
+    let decode = |f: &[u8]| { let (info, pcm) = audio_core::decode_all(f).unwrap(); assert_eq!(info.channels, 1); pcm };
+    // (a) TWO audio pages, the last granule short of the decoded count by half the last packet's output
+    let k = 24;
+    let total = audio[k - 1].1;
+    let trim = outs[k - 1] / 2;
+    assert!(trim > 0);
+    let mut two = audio[..k].to_vec();
+    two[k - 1].1 = total - trim;
+    let data: usize = two.iter().map(|p| p.0.len()).sum();
+    assert!(data > 600);
+    let f = paginate(&pk[..3], &two, (data + 255) / 2 + 1);
+    assert_eq!(pages(&f), 2, "two audio pages");
+    let got = decode(&f);
+    assert_eq!(got.len() as u64, total - trim, "end trim to the last granule (two pages)");
+    assert!(got[..] == raw[..(total - trim) as usize], "end trim keeps the untrimmed decode's prefix (two pages)");
+    // (b) ONE audio page, first AND last (EOS), granule short: the end is cut, not the beginning
+    let f = paginate(&pk[..3], &two, 1 << 16);
+    assert_eq!(pages(&f), 1, "one audio page");
+    let got = decode(&f);
+    assert_eq!(got.len() as u64, total - trim, "end trim to the granule (first page is the last)");
+    assert!(got[..] == raw[..(total - trim) as usize], "a first-and-last page cuts the end, not the beginning");
+    // (c) every granule lowered by S: the first page (not EOS) says S fewer samples than it decodes -> start trim
+    let s = 100u64;
+    let all = audio.last().unwrap().1;
+    let low: Vec<(Vec<u8>, u64)> = audio.iter().map(|(p, g)| (p.clone(), g.saturating_sub(s))).collect();
+    let f = paginate(&pk[..3], &low, 300);
+    assert!(pages(&f) > 2, "multi-page");
+    let got = decode(&f);
+    assert_eq!(got.len() as u64, all - s, "start trim of S samples, no end trim");
+    assert!(got[..] == raw[s as usize..], "start trim drops the untrimmed decode's first S samples");
+}
