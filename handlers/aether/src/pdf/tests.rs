@@ -426,12 +426,14 @@ fn pdf4formsave_plain_pdf() {
 }
 
 #[test]
-fn pdf4formsave_html_tab_stages_nothing() {
+fn pdf4formsave_html_tab_stages_the_page() {
     let mut e = AetherEngine::new();
     e.set_device_size(400, 300);
     e.load_html("https://example.com/", "<html><body><p>hi</p></body></html>", true);
     e.handle_event(Event::KeyDown("Ctrl+s".to_string()));
-    assert!(e.take_pending_save().is_none(), "PAGE-SAVE is owed: an HTML tab stages nothing");
+    let (name, mime, bytes) = staged_save(&mut e);
+    assert_eq!((name.as_str(), mime.as_str()), ("example.com.html", "text/html"), "PAGESAVE (SR392): no <title>: the host");
+    assert!(String::from_utf8(bytes).unwrap().contains("<p>hi</p>"), "the page's markup");
 }
 
 
@@ -737,10 +739,126 @@ fn savedialog_ctrl_shift_s_stages_save_as() {
 }
 
 #[test]
-fn savedialog_html_tab_stages_nothing() {
+fn savedialog_html_tab_stages_the_page() {
+    let _g = pagesave_lock();
     let mut e = AetherEngine::new();
     e.set_device_size(400, 300);
     e.load_html("https://example.com/", "<html><body><p>hi</p></body></html>", true);
     e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
-    assert!(e.take_pending_save().is_none(), "PAGE-SAVE is owed: an HTML tab stages no Save As either");
+    let (name, mime, bytes) = staged_save_as(&mut e);
+    assert_eq!((name.as_str(), mime.as_str()), ("example.com.html", "text/html"), "PAGESAVE (SR392): the Save's name and type");
+    e.handle_event(Event::KeyDown("Ctrl+s".to_string()));
+    assert_eq!(staged_save(&mut e).2, bytes, "the Save's own bytes");
+}
+
+// ------------------------------------------------------------------------------------------------- PAGESAVE (SR392)
+
+/// PAGESAVE (SR392): the KATs that stage an HTML Save As share `chrome::host`'s one staged-page slot: one at a time.
+fn pagesave_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The first `<title>`'s text and the `<body>`'s text of a document.
+fn title_and_body(doc: &crate::dom::NodeRef) -> (String, String) {
+    let text = |sel: &str| doc.select(sel).ok().and_then(|mut t| t.next()).map(|t| t.as_node().text_contents()).unwrap_or_default();
+    (text("title"), text("body"))
+}
+
+const PAGESAVE_HTML: &str = "<!DOCTYPE html><html><head><title>Page Save</title></head><body><h1>Saved</h1><p>first = one</p>\
+<script>var p = document.createElement('p'); p.textContent = 'added by script'; document.body.appendChild(p);</script></body></html>";
+
+#[test]
+fn pagesave_ctrl_s_reparses() {
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_html("https://pagesave.example/doc", PAGESAVE_HTML, true);
+    e.handle_event(Event::KeyDown("Ctrl+s".to_string()));
+    let (name, mime, bytes) = staged_save(&mut e);
+    assert_eq!((name.as_str(), mime.as_str()), ("Page Save.html", "text/html"), "the <title>, as .html");
+    let html = String::from_utf8(bytes).unwrap();
+    assert!(html.starts_with("<!DOCTYPE html>"), "the Document node: its DOCTYPE first: {}", &html[..html.len().min(40)]);
+    let saved = crate::dom::parse_html(&html);
+    let live = title_and_body(e.document.as_ref().unwrap());
+    assert_eq!(title_and_body(&saved), live, "the saved bytes re-parse to the same title and body text");
+    assert!(live.1.contains("added by script"), "the CURRENT DOM, the script's edit included: {:?}", live.1);
+    assert!(e.take_pending_save().is_none(), "taken once");
+    e.handle_event(Event::KeyDown("Meta+s".to_string()));
+    assert_eq!(staged_save(&mut e).2, html.into_bytes(), "Cmd+S stages the same");
+}
+
+/// A minimal multipart/related reader (the test's own): per part its fields (lower-cased names) and its decoded body.
+fn mhtml_parts(bytes: &[u8]) -> (String, Vec<(Vec<(String, String)>, Vec<u8>)>) {
+    let s = std::str::from_utf8(bytes).unwrap();
+    let (head, body) = s.split_once("\r\n\r\n").unwrap();
+    let delim = format!("--{}", gneiss_pal::mhtml::BOUNDARY);
+    let body = body.split(&format!("{delim}--")).next().unwrap();
+    let mut out = Vec::new();
+    for chunk in body.split(&delim).skip(1) {
+        let (fh, fb) = chunk.strip_prefix("\r\n").unwrap().split_once("\r\n\r\n").unwrap();
+        let fields: Vec<(String, String)> = fh.split("\r\n").map(|l| {
+            let (k, v) = l.split_once(':').unwrap();
+            (k.trim().to_ascii_lowercase(), v.trim().to_string())
+        }).collect();
+        let fb = fb.strip_suffix("\r\n").unwrap();
+        let qp = fields.iter().any(|(k, v)| k == "content-transfer-encoding" && v == "quoted-printable");
+        let data = if qp {
+            let (b, mut d, mut i) = (fb.as_bytes(), Vec::new(), 0);
+            while i < b.len() {
+                if b[i] == b'=' && b[i + 1] == b'\r' { i += 3; continue; }
+                if b[i] == b'=' { d.push(u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap(), 16).unwrap()); i += 3; continue; }
+                d.push(b[i]);
+                i += 1;
+            }
+            d
+        } else {
+            gneiss_pal::forge::base64_decode(fb).unwrap()
+        };
+        out.push((fields, data));
+    }
+    (head.to_string(), out)
+}
+
+#[test]
+fn pagesave_mhtml_save_as() {
+    let _g = pagesave_lock();
+    const TOP: &str = "https://pagesave.example/mhtml/doc";
+    const IMG: &str = "https://pagesave.example/mhtml/a.png";
+    let png: Vec<u8> = b"\x89PNG\r\n\x1a\n".iter().copied().chain(0..=255u8).collect();
+    let u = gneiss_pal::api::http::Url::parse(IMG).unwrap();
+    let key = http_core::cache::cache_key(&gneiss_pal::api::http::site_of(TOP).unwrap(), &u);
+    let mut hdrs = gneiss_pal::api::http::Headers::new();
+    hdrs.append("content-type", "image/png").unwrap();
+    let mut entry = http_core::cache::Entry::new(key, &u, &gneiss_pal::api::http::Headers::new(), 200, "OK", &hdrs, 0, 0);
+    entry.body = png.clone();
+    crate::net::http_cache().put(entry);
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_html(TOP, "<html><head><title>Archive</title></head><body><p>with a picture</p><img src=\"a.png\"></body></html>", true);
+    e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
+    let (name, mime, html) = staged_save_as(&mut e);
+    assert_eq!((name.as_str(), mime.as_str()), ("Archive.html", "text/html"));
+    let dir = std::env::temp_dir().join(format!("aether-pagesave-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let to = dir.join("Archive.mhtml");
+    assert_eq!(crate::chrome::host::save_bytes_at(&to, &html).unwrap(), to);
+    let (head, parts) = mhtml_parts(&std::fs::read(&to).unwrap());
+    assert!(head.contains("multipart/related; type=\"text/html\""), "{head}");
+    assert_eq!(parts.len(), 2, "the root and the one image the cache holds");
+    let field = |f: &[(String, String)], k: &str| f.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default();
+    assert_eq!((field(&parts[0].0, "content-type"), field(&parts[0].0, "content-location")), ("text/html; charset=utf-8".to_string(), TOP.to_string()));
+    assert_eq!(String::from_utf8(parts[0].1.clone()).unwrap().replace("\r\n", "\n"), String::from_utf8(html.clone()).unwrap().replace("\r\n", "\n"), "the root is the staged markup");
+    assert_eq!((field(&parts[1].0, "content-type"), field(&parts[1].0, "content-location")), ("image/png".to_string(), IMG.to_string()));
+    assert_eq!(parts[1].1, png, "the image part is the cached bytes");
+    // The same Save As chosen as .html lands the markup itself; a PDF-like save named .mhtml lands its bytes unchanged.
+    e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
+    let html2 = staged_save_as(&mut e).2;
+    let plain = dir.join("Archive.html");
+    crate::chrome::host::save_bytes_at(&plain, &html2).unwrap();
+    assert_eq!(std::fs::read(&plain).unwrap(), html2, "a .html path: the HTML");
+    let other = dir.join("x.mhtml");
+    crate::chrome::host::save_bytes_at(&other, b"%PDF-1.7").unwrap();
+    assert_eq!(std::fs::read(&other).unwrap(), b"%PDF-1.7", "bytes that are not the staged page land unchanged");
+    std::fs::remove_dir_all(&dir).unwrap();
 }

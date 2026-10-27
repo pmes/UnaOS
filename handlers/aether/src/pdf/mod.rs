@@ -629,7 +629,8 @@ impl crate::AetherEngine {
     /// PDF4FORMSAVE (SR354): Ctrl/Cmd+S on a PDF stages a `BrowserSave` of the file as it stands (the filled form's
     /// incremental updates, or the fetched bytes untouched) for the shell to write to the Downloads folder. Runs ahead
     /// of `pdf_key`, whose focused field would take the `s` as a consumed character; the field keeps its focus. False
-    /// (the key goes on as before) for any other key and on an HTML page (PAGE-SAVE owed). SAVEDIALOG (SR364): with
+    /// (the key goes on as before) for any other key. PAGESAVE (SR392): on an HTML page the same keys stage the current
+    /// DOM's markup as `<title>.html` (`chrome::host::page_save`; a Save As chosen as `.mhtml` lands the archive). SAVEDIALOG (SR364): with
     /// Shift (Ctrl/Cmd+Shift+S) the same name / type / bytes stage as `BrowserSaveAs`: the shell asks the face's save
     /// panel for the path (the staged variant is the Save As flag).
     pub(crate) fn save_key(&mut self, key: &str) -> bool {
@@ -638,7 +639,13 @@ impl crate::AetherEngine {
         if !(m.ctrl || m.meta) || m.alt || !matches!(k, Some(Key::Char('s' | 'S'))) {
             return false;
         }
-        let Some(pdf) = self.pdf.as_ref() else { return false };
+        let Some(pdf) = self.pdf.as_ref() else {
+            // PAGESAVE (SR392): an HTML tab: the current DOM, staged as the PDF arm stages its bytes.
+            let Some((name, bytes)) = crate::chrome::host::page_save(self, m.shift) else { return false };
+            let mime = "text/html".to_string();
+            self.pending_save = Some(if m.shift { bandy::SMessage::BrowserSaveAs { name, mime, bytes } } else { bandy::SMessage::BrowserSave { name, mime, bytes } });
+            return true;
+        };
         let name = save_name(pdf.title.as_deref(), &self.current_url());
         let (mime, bytes) = ("application/pdf".to_string(), pdf.bytes.clone());
         self.pending_save = Some(if m.shift { bandy::SMessage::BrowserSaveAs { name, mime, bytes } } else { bandy::SMessage::BrowserSave { name, mime, bytes } });

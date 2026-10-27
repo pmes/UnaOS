@@ -251,6 +251,7 @@ pub fn save_bytes_in(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, St
 /// file already there is replaced, as the panel confirmed), through the same ONE writer. The shell's answer to
 /// `SavePanelChose` after a `BrowserSaveAs`.
 pub fn save_bytes_at(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let archive = page_archive_for(path, bytes); let bytes = archive.as_deref().unwrap_or(bytes); // PAGESAVE (SR392): a staged page chosen as .mhtml lands as its archive
     gneiss_pal::fs::save_bytes(path, bytes).map(|()| path.to_path_buf()).map_err(|e| e.to_string())
 }
 
@@ -303,6 +304,86 @@ pub fn devtools_frame(
     let damage = tools.timeline.frame(engine);
     let lines = tools.render(engine);
     (damage, Some(lines))
+}
+
+// ================================================================================================= PAGESAVE (SR392)
+// Save / Save As on an HTML tab (`pdf::save_key` calls `page_save`): the CURRENT DOM through the one serializer (html_core,
+// `NodeRef::inner_html` on the Document node: the DOCTYPE then the tree) — the engine keeps no copy of the fetched
+// markup, and the DOM is the page as the person sees it, script edits included (a form control's live value that never
+// reached an attribute is not markup, as a browser's "HTML only" save). A Save As also stages the page in `STAGED_PAGE`
+// so that the path the panel answers decides the format: `.mhtml` / `.mht` lands the archive (`gneiss_pal::mhtml`),
+// anything else the HTML itself.
+
+/// A page a Save As staged: its URL, its serialized markup and the resources the cache held for it.
+struct StagedPage {
+    root_url: String,
+    html: String,
+    parts: Vec<gneiss_pal::mhtml::Part>,
+}
+
+/// PAGESAVE (SR392): the one staged page, owned here: written on the tab engine's turn (`page_save`), taken by the
+/// Coordinator's `SavePanelChose` answer (`save_bytes_at`). One slot: a newer Save As replaces it, the panel being
+/// modal (the Coordinator's `save_as` holds one set of bytes for the same reason).
+static STAGED_PAGE: std::sync::Mutex<Option<StagedPage>> = std::sync::Mutex::new(None);
+
+/// PAGESAVE (SR392): what Ctrl/Cmd+S (or, `save_as`, Ctrl/Cmd+Shift+S) on an HTML tab saves: the file name
+/// (`<title>.html`) and the current DOM's markup. A Save As stages the page with its resources (gathered now: the
+/// page's partition and the cache's memory tier are this page's only until the next load). None without a document.
+pub fn page_save(engine: &crate::AetherEngine, save_as: bool) -> Option<(String, Vec<u8>)> {
+    let doc = engine.document.as_ref()?;
+    let html = doc.inner_html();
+    let root_url = engine.current_url();
+    let name = page_name(doc, &root_url);
+    if save_as {
+        let page = StagedPage { root_url, html: html.clone(), parts: page_parts(engine) };
+        *STAGED_PAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(page);
+    }
+    Some((name, html.into_bytes()))
+}
+
+/// The name a page save suggests: the current DOM's first `<title>`, else the URL's host, else `page`; sanitized as a
+/// download's name is; `.html` unless it already ends `.html` / `.htm`.
+fn page_name(doc: &crate::dom::NodeRef, url: &str) -> String {
+    let title = doc.select("title").ok().and_then(|mut t| t.next()).map(|t| t.as_node().text_contents());
+    let title = title.map(|t| t.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|t| !t.is_empty());
+    let base = title.unwrap_or_else(|| html_core::url::Url::parse(url).map(|u| u.hostname()).unwrap_or_default());
+    let base = downloads::sanitize(&base);
+    let base = if base.is_empty() { "page".to_string() } else { base };
+    let lower = base.to_ascii_lowercase();
+    if lower.ends_with(".html") || lower.ends_with(".htm") { base } else { format!("{base}.html") }
+}
+
+/// The page's resources the HTTP cache holds: every reference of the live DOM (`devtools::network::references`, the
+/// document itself left out: it is the root part) found through the one lookup (`devtools::network::cached`), as
+/// MHTML parts at their absolute URLs. A reference the cache does not hold is left out (PAGE-SAVE-FETCH owed).
+fn page_parts(engine: &crate::AetherEngine) -> Vec<gneiss_pal::mhtml::Part> {
+    use crate::devtools::network::{cached, references, Initiator};
+    let top = engine.current_url();
+    references(engine)
+        .into_iter()
+        .filter(|(kind, _)| *kind != Initiator::Document)
+        .filter_map(|(_, url)| {
+            let e = cached(&top, &url)?;
+            let content_type = e.headers.get("content-type").unwrap_or("application/octet-stream").to_string();
+            Some(gneiss_pal::mhtml::Part { location: url, content_type, body: e.body })
+        })
+        .collect()
+}
+
+/// `save_bytes_at`'s format choice: a `.mhtml` / `.mht` path whose bytes are the staged page's markup takes the staged
+/// page and answers its archive; anything else (a `.html` path, a PDF's Save As named `x.mhtml`) answers None and the
+/// bytes land as they are.
+fn page_archive_for(path: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if ext != "mhtml" && ext != "mht" {
+        return None;
+    }
+    let mut slot = STAGED_PAGE.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref()?.html.as_bytes() != bytes {
+        return None;
+    }
+    let page = slot.take()?;
+    Some(gneiss_pal::mhtml::write(&page.root_url, &page.html, &page.parts))
 }
 
 #[cfg(test)]
