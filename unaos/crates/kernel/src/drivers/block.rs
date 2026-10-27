@@ -3915,8 +3915,8 @@ pub fn read_blocks_nvme(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
 // The audit is `grep -rn hold_nvme_root_grant unaos/crates/kernel/src` -> this declaration + that call.
 //
 // [`write_blocks_nvme`] is the ONLY block-layer path to `drivers::nvme::write_at`: -EPERM unless the
-// live grant covers every block of the run, else written and READ BACK block by block (AHCIROOT's
-// `ahci_port_write` rule). [`flush_nvme`] is the K8a commit barrier `fs::unafs::SdSectorDevice::flush`
+// live grant covers every block of the run, else written and READ BACK as one run (AHCIROOT's
+// `ahci_port_write` rule; NVMEBATCH zenbook-ledger Z22: one WRITE and one read-back per run, not per block). [`flush_nvme`] is the K8a commit barrier `fs::unafs::SdSectorDevice::flush`
 // calls on an NVMe handle. The slot's lock is taken IRQ-masked, copied out, never held across I/O.
 
 /// NVMEBOOT: THE slot — `(first_lba, last_lba)`, inclusive. `None` = every NVMe write is -EPERM.
@@ -4053,9 +4053,10 @@ pub fn write_block_nvme(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 }
 
 /// NVMEBOOT (NVMEWRITE): THE NVMe block-layer write. -EPERM unless the live root grant covers every block
-/// of the run; otherwise written through `drivers::nvme::write_at` and read back block by block. A grant
-/// exists only over a 512-byte-LBA namespace (`fs::unafs::SdSectorDevice` is 512-only), so the read-back
-/// buffer is one sector and any other block size is refused.
+/// of the run; otherwise written through `drivers::nvme::write_at` and read back with ONE `read_at` over the
+/// run, compared block by block in memory (NVMEBATCH, zenbook-ledger Z22: `fs::unafs::handle_write_multi` hands a
+/// whole 4 KiB UnaFS block here as one run; the driver chunks by its own MDTS). A grant exists only over a
+/// 512-byte-LBA namespace (`fs::unafs::SdSectorDevice` is 512-only), so any other block size is refused.
 #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
 pub fn write_blocks_nvme(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     let dev = nvme_info().ok_or(BlockError::NotReady)?;
@@ -4079,15 +4080,28 @@ pub fn write_blocks_nvme(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         return Err(BlockError::BadLba);
     }
     crate::drivers::nvme::write_at(lba, buf).map_err(|_| BlockError::Io)?;
-    let mut rb = [0u8; SECTOR_BYTES];
-    for i in 0..count {
-        crate::drivers::nvme::read_at(lba + i as u64, &mut rb).map_err(|_| BlockError::Io)?;
-        if rb[..] != buf[i * bs..(i + 1) * bs] {
-            serial_println!(":: [nvme] write readback MISMATCH lba={} — the medium does not hold what was written ::", lba + i as u64);
-            return Err(BlockError::Io);
-        }
+    let mut rb = alloc::vec![0u8; count * bs];
+    crate::drivers::nvme::read_at(lba, &mut rb).map_err(|_| BlockError::Io)?;
+    if let Some(i) = (0..count).find(|&i| rb[i * bs..(i + 1) * bs] != buf[i * bs..(i + 1) * bs]) {
+        serial_println!(":: [nvme] write readback MISMATCH lba={} — the medium does not hold what was written ::", lba + i as u64);
+        return Err(BlockError::Io);
     }
+    NVME_RUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    NVME_RUN_BLOCKS.fetch_add(count as u32, core::sync::atomic::Ordering::Relaxed);
     Ok(())
+}
+
+/// NVMEBATCH (zenbook-ledger Z22): granted runs written and verified this boot, and the blocks they carried — the
+/// `tests nvme` line's `runs=` / `run_blocks=` (a UnaFS root's run is 8 blocks; before Z22 every run was 1).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_RUNS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_RUN_BLOCKS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// NVMEBATCH: `(runs, blocks)` written through [`write_blocks_nvme`] this boot.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_run_census() -> (u32, u32) {
+    (NVME_RUNS.load(core::sync::atomic::Ordering::Relaxed), NVME_RUN_BLOCKS.load(core::sync::atomic::Ordering::Relaxed))
 }
 
 /// NVMEBOOT: NVM Flush on namespace 1 — the commit barrier (a controller with no volatile write cache
