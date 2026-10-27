@@ -21,15 +21,15 @@
 // report, and the decoder's own key lines name it — `EHCI-HID:` for EHCI (byte-identical to before),
 // `BT-HID:` for the Bluetooth keyboard (`ehci::bthid`), `PS2-HID:` for the i8042 (`drivers::i8042`).
 // The caller still owns the per-keyboard state (previous keys, modifiers, the lock-key LED byte); the
-// LED change is sent through `Transport::set_leds` (HIDBOOTLEDS B987; EHCI's SET_REPORT stays at its
-// caller, see that fn); every caller runs under `ehci::EHCI_HID`, which serialises the
+// LED change is sent through `Transport::set_leds` (HIDBOOTLEDS B987; EHCI's arm owes its caller's
+// per-endpoint LED slot, HIDBOOTLEDSEHCI B991); every caller runs under `ehci::EHCI_HID`, which serialises the
 // decoder's globals (the DBLSTROKE atomics below) and the typematic feed. `ehci` re-exports
 // `decode_boot_keyboard`, so `ehci::decode_boot_keyboard` paths in prose still resolve.
 //
 // HIDBOOTLEDS (rmbp-ledger B987): the lock LEDs leave the decoder through ONE `Transport::set_leds`
 // call; `[keystat] <tag>` and the PRTSCR `on <transport>` word name the transport (EHCI byte-identical).
-// Owed (input.md §5 Z3 row): HIDBOOT-LEDS-EHCI; the Fn keys; HIDBOOT-ARM; HIDBOOT-PUMP (the i8042 is
-// pumped only from `ehci::service_ehci_hid`).
+// HIDBOOTLEDSEHCI (B991): EHCI's arm marks the endpoint's LED slot, drained after the walk. Owed (input.md
+// §5 Z3 row): HIDBOOT-LEDS-TEST; the Fn keys; HIDBOOT-ARM; HIDBOOT-PUMP (the i8042 is pumped only from `ehci::service_ehci_hid`).
 
 /// The transport that carried a boot keyboard report. Labels the decoder's wire; changes no decode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -64,15 +64,15 @@ impl Transport {
     /// HIDBOOTLEDS (B987) — the ONE route for a lock-LED change, called once from
     /// `decode_boot_keyboard`'s lock-key site. PS/2: the i8042's 0xED sequence (async, acked through
     /// the scancode ring, bounded). Bluetooth: bthid's existing `PENDING_LED` slot, drained as the
-    /// DATA|Output report on the next pass. EHCI: nothing here — SET_REPORT is an EP0 control transfer
-    /// that needs `&mut Controller`, which the endpoint walk holds while it calls the decoder, so the
-    /// caller's `led_pushes` deferral (`set_hid_leds` after the walk) sends it, reading this decoder's
-    /// `bool` (owed: HIDBOOT-LEDS-EHCI).
-    pub fn set_leds(self, leds: u8) {
+    /// DATA|Output report on the next pass. EHCI (HIDBOOTLEDSEHCI B991): SET_REPORT is an EP0 control
+    /// transfer that needs `&mut Controller`, which the endpoint walk holds while it calls the decoder,
+    /// and this unit label cannot address the endpoint — so the arm answers `true`: the caller's
+    /// per-endpoint LED slot (`kbd_leds` + `kbd_led_dirty`) is owed, drained after the walk. Bluetooth and PS/2 queue themselves and answer `false`.
+    pub fn set_leds(self, leds: u8) -> bool {
         match self {
-            Transport::Ehci => {}
-            Transport::Bluetooth => bt_queue_led(leds),
-            Transport::Ps2 => crate::drivers::i8042::set_leds(leds),
+            Transport::Ehci => true,
+            Transport::Bluetooth => { bt_queue_led(leds); false }
+            Transport::Ps2 => { crate::drivers::i8042::set_leds(leds); false }
         }
     }
 }
@@ -240,9 +240,9 @@ impl Transport {
 ///
 /// The decoder does not itself send SET_REPORT — it cannot. It is called from inside
 /// `Controller::service`'s `for e in self.int_eps.iter_mut()`, which holds an exclusive borrow of
-/// `int_eps`, while a control transfer needs `&mut self`. So it RETURNS whether the bitmap changed
-/// and the caller issues the request after the loop drops that borrow — the same deferral shape the
-/// `mtraw` capture-window restore already uses at that site.
+/// `int_eps`, while a control transfer needs `&mut self`. So it RETURNS whether the transport owes
+/// the caller's LED slot (HIDBOOTLEDSEHCI B991: EHCI marks `kbd_led_dirty`) and the caller drains it
+/// after the loop drops that borrow — the shape the `mtraw` capture-window restore uses there.
 ///
 /// MODIFIER POLICY is `xhci::hid_key_ascii`'s, not this function's, and deliberately so: Ctrl/Alt/
 /// GUI folding was absent from BOTH decoders (Cmd-Q typed a bare `q` into the shell line), and
@@ -257,7 +257,7 @@ impl Transport {
 /// through `xhci::hid_key_release_ascii`, which depends only on Shift and Caps: Shift+`1` that
 /// pressed `!` releases `!`, not `1`.
 ///
-/// Returns `true` if this report toggled a lock key — i.e. the caller owes the device a SET_REPORT.
+/// Returns `true` if this report toggled a lock key AND `Transport::set_leds` says the caller owes its LED slot (EHCI).
 // ── DBLSTROKE witness state ──────────────────────────────────────────────────────────────────────
 //
 // Boot totals only; no per-endpoint state, because the operator has one pair of hands and the question
@@ -496,7 +496,7 @@ pub unsafe fn decode_boot_keyboard(
     // Note these usages produce NO `Key`/`KeyUp` event and never did — `HID_SCANCODE_TO_ASCII` maps
     // all three to (0,0), so the loops above skip them. A lock key changes the MEANING of later
     // keys; it is not itself a character. Mirrors the xHCI toggle loop, sharing its (usage, bit) table.
-    let mut changed = false;
+    let mut changed = false; let mut owed = false; // HIDBOOTLEDSEHCI (B991): `owed` = the transport's answer, returned below
     for &(usage, bit) in crate::drivers::xhci::HID_LOCK_KEYS.iter() {
         if cur_keys.contains(&usage) && !prev_keys.contains(&usage) {
             *leds ^= bit;
@@ -504,7 +504,7 @@ pub unsafe fn decode_boot_keyboard(
         }
     }
     if changed {
-        t.set_leds(*leds); // HIDBOOTLEDS (B987): the ONE LED route; EHCI's arm is empty (its caller's SET_REPORT reads `changed`)
+        owed = t.set_leds(*leds); // HIDBOOTLEDS (B987): the ONE LED route; HIDBOOTLEDSEHCI (B991): EHCI's arm owes the caller's LED slot
     }
 
     // PRTSCR: the Print Screen press edge — the SAME shared predicate the xHCI decoder asks, for the
@@ -539,7 +539,7 @@ pub unsafe fn decode_boot_keyboard(
     // resolve each stranded key to the same shifted ascii its press produced. Updated ONLY here —
     // past the `< 8` guard — so a refused short report never overwrites the last true modifier state.
     *prev_mods = modifiers;
-    changed
+    owed
 }
 
 // HIDBOOTLEDS (B987): `Transport::set_leds`'s Bluetooth arm — bthid's `PENDING_LED` slot where the
@@ -550,3 +550,22 @@ fn bt_queue_led(leds: u8) {
 }
 #[cfg(not(feature = "btc"))]
 fn bt_queue_led(_leds: u8) {}
+
+// HIDBOOTLEDSEHCI (rmbp-ledger B991): the `[hidboot] leds` line for a transport whose LED change its
+// caller sent (EHCI's slot drain, after the endpoint walk: `ehci::Controller::service`). `r` is the
+// control fn's own answer; "timeout" names itself and every other refusal (stall, hse, ...) reads
+// `ctrl-fail` (the EHCI-HID ALLKEYS witness beside it keeps the exact cause). Human-rate: one line per
+// lock press, and a refusing keyboard's latch makes its refused line once per endpoint.
+#[cfg(feature = "ehcihid")]
+pub fn note_leds_sent(t: Transport, leds: u8, addr: u8, intf: u8, r: Result<(), &'static str>) {
+    let caps = (leds >> 1) & 1;
+    match r {
+        Ok(()) => {
+            serial_println!("[hidboot] leds via={} leds={:#04x} caps={} addr={} intf={} -> sent", t.tag(), leds, caps, addr, intf);
+        }
+        Err(e) => {
+            let why = if e == "timeout" { "timeout" } else { "ctrl-fail" };
+            serial_println!("[hidboot] leds via={} leds={:#04x} caps={} addr={} intf={} -> refused why={}", t.tag(), leds, caps, addr, intf, why);
+        }
+    }
+}
