@@ -167,3 +167,78 @@ mod tests {
         assert!(matches!(pcm32(1, (10, 10), &[480; 1024], &[360; 256], &[640; 256]).pixels, Pixels::I420Hi { ss: (1, 1), bit_depth: 10, bit_depth_c: 10, .. }));
     }
 }
+
+/// SWAPBACK-SETIDS (LEDGER SR388): the (nal_unit_type, id, unit) of every parameter-set NAL in `blob` — one
+/// [`super::param_sets`] blob, framed as `track` frames its samples (the hvcC's NAL length size, else Annex B start codes) —
+/// split by h264_core's ONE splitter and each id read by hevc_core's own parsers (`parse_vps` / `parse_sps` / `parse_pps`
+/// over the unescaped payload, the decoder's own dispatch). What Stria's `decode_swap::SetIndex::key` keys a set state by,
+/// so equal states in different blobs are one key. `None` when the track is not HEVC, or any unit is not a VPS / SPS / PPS
+/// whose header and id parse (the caller then keys by the blob itself).
+pub fn param_set_ids(track: &Track, blob: &[u8]) -> Option<Vec<(u8, u32, Vec<u8>)>> {
+    if track.codec != crate::dsp::demux::Codec::Hevc {
+        return None;
+    }
+    let units = if track.config.is_empty() {
+        hevc_core::nal::annexb_units(blob)
+    } else {
+        let n = hevc_core::nal::parse_hvcc(&track.config).ok()?.nal_length_size;
+        hevc_core::nal::length_prefixed_units(blob, n).ok()?
+    };
+    let mut out = Vec::with_capacity(units.len());
+    let mut rbsp = Vec::new();
+    for u in units {
+        let h = hevc_core::nal::parse_header(u).ok()?;
+        hevc_core::nal::unescape(u.get(2..)?, &mut rbsp);
+        let id = match h.nal_type {
+            32 => hevc_core::ps::parse_vps(&rbsp).ok()?.id as u32,
+            33 => hevc_core::ps::parse_sps(&rbsp).ok()?.id as u32,
+            34 => hevc_core::ps::parse_pps(&rbsp).ok()?.id as u32,
+            _ => return None,
+        };
+        out.push((h.nal_type, id, u.to_vec()));
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod setids_tests {
+    use super::param_set_ids;
+    use crate::dsp::demux::Demuxer;
+    use crate::dsp::demux::build::{self, Mp4Options};
+
+    /// The HEVC KAT units (Main, 64x48, 8-bit: Stria's `tests/media.rs` HEVC_VPS / HEVC_SPS / HEVC_PPS).
+    const VPS: [u8; 23] = [0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xac, 0x09];
+    const SPS: [u8; 27] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x16, 0x5f, 0x92, 0x4c, 0x20, 0x80];
+    const PPS: [u8; 6] = [0x44, 0x01, 0xc0, 0x71, 0x81, 0x12];
+
+    /// Rule: an hvcC track's 4-byte-length blob VPS + SPS + PPS reads (32, 0) (33, 0) (34, 0) with each unit; the same blob
+    /// on an H.264 track reads `None` (no HEVC ids there), and a blob holding a non-set unit reads `None`.
+    #[test]
+    fn swapbacksetids_reads_vps_sps_pps_ids() {
+        let mut hvcc = vec![1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 60, 0xf0, 0x00, 0xfc, 0xfd, 0xf8, 0xf8, 0, 0, 0x0f, 3];
+        for (ty, unit) in [(32u8, &VPS[..]), (33, &SPS[..]), (34, &PPS[..])] {
+            hvcc.extend_from_slice(&[0x80 | ty, 0, 1]);
+            hvcc.extend_from_slice(&(unit.len() as u16).to_be_bytes());
+            hvcc.extend_from_slice(unit);
+        }
+        let mut spec = build::TrackSpec::test_pattern(1, 64, 48, 25);
+        spec.fourcc = *b"hvc1";
+        spec.config_box = Some(*b"hvcC");
+        spec.codec_id = "V_MPEGH/ISO/HEVC";
+        spec.config = hvcc;
+        spec.timescale = 1000;
+        let samples = vec![build::SampleSpec { data: vec![0, 0, 0, 1, 0x26], dts: 0, pts: 0, duration: 40, keyframe: true }];
+        let d = Demuxer::open(build::mp4(&[build::MediaTrack { spec, samples }], &Mp4Options::default())).unwrap();
+        let t = d.tracks()[0].clone();
+        let blob: Vec<u8> = [&VPS[..], &SPS[..], &PPS[..]].iter().flat_map(|u| [&(u.len() as u32).to_be_bytes()[..], *u].concat()).collect();
+        let ids = param_set_ids(&t, &blob).expect("HEVC set ids");
+        assert_eq!(ids.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), [(32, 0), (33, 0), (34, 0)]);
+        assert_eq!(ids[1].2, SPS.to_vec());
+        let mut avc = t.clone();
+        avc.codec = crate::dsp::demux::Codec::Avc;
+        assert_eq!(param_set_ids(&avc, &blob), None);
+        let mut idr = blob.clone();
+        idr.extend_from_slice(&[0, 0, 0, 3, 0x26, 0x01, 0xaf]);
+        assert_eq!(param_set_ids(&t, &idr), None);
+    }
+}

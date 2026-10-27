@@ -14,7 +14,7 @@
 //! KEYFRAME packet (the demuxer's own flag) is offered to the parked decoder once — one decode, never per packet, the
 //! bound on the cost and on a swap storm; when it decodes, it is the stream's decoder again (one `video decode: swapped
 //! back at <pts ns>` line); when it refuses, it is reset and parked again and the stand-in draws the packet. An open-time
-//! stand-in (no decoder fits the track: `is_real` false, nothing parked) is never probed. Any other error is the caller's. SWAPBACKSEEK (SR353): a seek (the Player's) or a run open (the editor's) first calls [`DecodeSwap::reseed`] — a fresh decoder primed with the in-band sets in effect at the target — and [`open`] is both opens' decoder-or-stand-in. SWAPBACKSPANCACHE (SR370): `reseed` replays EVERY in-band set blob in effect at the target ([`SetIndex`], built once per open, an indexed reel's earlier spans read through a share) and keeps two parked decoders keyed by their set state, so a seek back into a span reuses its decoder (`video reseed: ... cache=hit|miss`).
+//! stand-in (no decoder fits the track: `is_real` false, nothing parked) is never probed. Any other error is the caller's. SWAPBACKSEEK (SR353): a seek (the Player's) or a run open (the editor's) first calls [`DecodeSwap::reseed`] — a fresh decoder primed with the in-band sets in effect at the target — and [`open`] is both opens' decoder-or-stand-in. SWAPBACKSPANCACHE (SR370): `reseed` replays EVERY in-band set blob in effect at the target ([`SetIndex`], built once per open, an indexed reel's earlier spans read through a share) and keeps two parked decoders keyed by their set state, so a seek back into a span reuses its decoder (`video reseed: ... cache=hit|miss`). SWAPBACKNLECACHE (SR388): the set state is keyed by its (kind, id) -> unit map read through gneiss_pal's `param_set_ids` ([`SetKey`]: equal states in different blobs hit), the cache depth is [`DecodeSwap::set_cache_depth`] over [`SPAN_CACHE`], and `reseed` says whether it hit so the editor, which now holds one swap and decoder per reel across its runs, names the reel.
 
 use std::sync::Arc;
 
@@ -36,13 +36,23 @@ pub struct DecodeSwap {
     built: u32,
     /// The open's in-band set index (built at the first reseed, or handed in by [`DecodeSwap::with_index`]).
     index: Option<Arc<SetIndex>>,
+    /// SWAPBACK-CACHESIZE (SR388): the parked-decoder depth, 0 = [`SPAN_CACHE`] ([`DecodeSwap::set_cache_depth`]).
+    depth: usize,
 }
 
-/// SWAPBACKSPANCACHE (SR370): how many reseed-parked decoders a stream keeps (SWAPBACK-CACHESIZE owes the knob).
+/// SWAPBACKSPANCACHE (SR370): how many reseed-parked decoders a stream keeps by default; SWAPBACK-CACHESIZE (SR388): a swap's
+/// own depth is [`DecodeSwap::set_cache_depth`] (the Principia setting that calls it is owed: Stria has no settings path).
 pub const SPAN_CACHE: usize = 2;
 
-/// A set state: the [`SetIndex`] blob ids [`SetIndex::replay`] gives, in replay order.
-type SetKey = Vec<usize>;
+/// A set state ([`SetIndex::key`]). SWAPBACK-SETIDS (SR388): `Ids` = the (nal_unit_type, id) -> last unit map of the replay,
+/// sorted by (kind, id), when every replayed blob reads its ids (gneiss_pal's `param_set_ids`; vacuously the empty replay), so
+/// equal states in different blobs are one key; `Blobs` = the [`SetIndex`] blob ids in replay order otherwise (H.264, a unit
+/// whose id does not read): two such states key apart, a miss, never a wrong decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetKey {
+    Ids(Vec<(u8, u32, Vec<u8>)>),
+    Blobs(Vec<usize>),
+}
 
 /// Which way a decode swapped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,17 +127,19 @@ impl DecodeSwap {
     /// ([`SetIndex::replay`]), and it is the outgoing real decoder when that already holds this set state, else a parked one
     /// keyed by it, else a fresh `decoder_for` (a miss); the outgoing real decoder is parked under its own key. A hit is
     /// re-primed too (a parked decoder was offered keyframes it refused), so its tables equal a fresh decoder's.
-    pub fn reseed(&mut self, dec: &mut Box<dyn VideoDecoder>, track: &Track, demux: &Demuxer, t_ns: i64) {
+    /// SWAPBACKNLECACHE (SR388): `Some(hit)` when it reseeded (keys compare as [`SetKey`]s), `None` when it left `dec` alone.
+    pub fn reseed(&mut self, dec: &mut Box<dyn VideoDecoder>, track: &Track, demux: &Demuxer, t_ns: i64) -> Option<bool> {
         if (!dec.is_real() && self.parked.is_none()) || param_sets(track, &[]).is_none() {
-            return;
+            return None;
         }
-        let Some(ti) = demux.track_index(track.id) else { return };
-        let Some((key, key_ns)) = demux.keyframe_before(ti, t_ns) else { return };
-        let Some(&s) = demux.samples().get(key) else { return };
+        let ti = demux.track_index(track.id)?;
+        let (key, key_ns) = demux.keyframe_before(ti, t_ns)?;
+        let &s = demux.samples().get(key)?;
         let index = self.index_for(track, demux);
         let want = index.replay(track.to_ns(s.dts));
-        let out_key = self.last_at.map(|a| index.replay(a)).or_else(|| self.seeded.clone()).unwrap_or_default();
-        let hit = if out_key == want {
+        let want_key = index.key(&want);
+        let out_key = self.last_at.map(|a| index.key(&index.replay(a))).or_else(|| self.seeded.clone()).unwrap_or_else(|| index.key(&[]));
+        let hit = if out_key == want_key {
             if !dec.is_real() {
                 if let Some(real) = self.parked.take() {
                     *dec = real;
@@ -135,12 +147,12 @@ impl DecodeSwap {
             }
             true
         } else {
-            let found = self.spans.iter().position(|(k, _)| *k == want).map(|i| self.spans.remove(i).1);
+            let found = self.spans.iter().position(|(k, _)| *k == want_key).map(|i| self.spans.remove(i).1);
             let hit = found.is_some();
             let next = match found {
                 Some(d) => d,
                 None => {
-                    let Ok(d) = decoder_for(track) else { return };
+                    let Ok(d) = decoder_for(track) else { return None };
                     self.built += 1;
                     d
                 }
@@ -149,7 +161,7 @@ impl DecodeSwap {
             let out = if old.is_real() { Some(old) } else { self.parked.take() };
             if let Some(o) = out {
                 self.spans.push((out_key, o));
-                if self.spans.len() > SPAN_CACHE {
+                if self.spans.len() > self.cap() {
                     self.spans.remove(0);
                 }
             }
@@ -163,8 +175,9 @@ impl DecodeSwap {
         dec.reset();
         log::info!("[STRIA] :: video reseed: at {key_ns} sets={} cache={}", want.len(), if hit { "hit" } else { "miss" });
         self.parked = None;
-        self.seeded = Some(want);
+        self.seeded = Some(want_key);
         self.last_at = None;
+        Some(hit)
     }
 
     /// SWAPBACKSPANCACHE (SR370): a run's swap state over an open's [`SetIndex`] already built (the editor's `Media` keeps one
@@ -176,6 +189,16 @@ impl DecodeSwap {
     /// Fresh decoders [`DecodeSwap::reseed`] constructed (each a cache miss).
     pub fn built(&self) -> u32 {
         self.built
+    }
+
+    /// SWAPBACK-CACHESIZE (SR388): keep `n` reseed-parked decoders (0 = [`SPAN_CACHE`]); a deeper span list is trimmed,
+    /// least recently parked first, at the next park.
+    pub fn set_cache_depth(&mut self, n: usize) {
+        self.depth = n;
+    }
+
+    fn cap(&self) -> usize {
+        if self.depth == 0 { SPAN_CACHE } else { self.depth }
     }
 
     /// The open's set index, rebuilt (and the parked spans, keyed by its blob ids, dropped) when `demux` is not the one it
@@ -215,6 +238,8 @@ pub fn open(track: &Track) -> Box<dyn VideoDecoder> {
 pub struct SetIndex {
     stamp: (usize, usize),
     blobs: Vec<Vec<u8>>,
+    /// SWAPBACK-SETIDS (SR388): each blob's (nal_unit_type, id, unit) list, read once at intern (`None`: an id did not read).
+    ids: Vec<Option<Vec<(u8, u32, Vec<u8>)>>>,
     /// (decode time ns, blob id) per carrier, in decode order.
     carriers: Vec<(i64, usize)>,
 }
@@ -227,7 +252,7 @@ fn stamp(demux: &Demuxer) -> (usize, usize) {
 impl SetIndex {
     /// Walk `demux` (track `track`) once: a full open's sample table, or every span of an indexed open.
     pub fn of(track: &Track, demux: &Demuxer) -> SetIndex {
-        let mut ix = SetIndex { stamp: stamp(demux), blobs: Vec::new(), carriers: Vec::new() };
+        let mut ix = SetIndex { stamp: stamp(demux), blobs: Vec::new(), ids: Vec::new(), carriers: Vec::new() };
         let Some(ti) = demux.track_index(track.id) else { return ix };
         if param_sets(track, &[]).is_none() {
             return ix;
@@ -263,6 +288,7 @@ impl SetIndex {
             let id = match self.blobs.iter().position(|b| *b == blob) {
                 Some(i) => i,
                 None => {
+                    self.ids.push(gneiss_pal::dsp::video::hevc::param_set_ids(track, &blob)); // SWAPBACK-SETIDS (SR388)
                     self.blobs.push(blob);
                     self.blobs.len() - 1
                 }
@@ -283,5 +309,18 @@ impl SetIndex {
         }
         last.sort_by_key(|e| e.0);
         last.into_iter().map(|e| e.1).collect()
+    }
+
+    /// SWAPBACK-SETIDS (SR388): the [`SetKey`] of a replay (blob ids in replay order, as [`SetIndex::replay`] gives): every
+    /// blob's units applied in order, the last unit of each (kind, id) kept — `Ids` when every blob read its ids, else `Blobs`.
+    pub fn key(&self, replay: &[usize]) -> SetKey {
+        let mut m = std::collections::BTreeMap::new();
+        for &b in replay {
+            let Some(Some(units)) = self.ids.get(b) else { return SetKey::Blobs(replay.to_vec()) };
+            for (kind, id, unit) in units {
+                m.insert((*kind, *id), unit.clone());
+            }
+        }
+        SetKey::Ids(m.into_iter().map(|((kind, id), unit)| (kind, id, unit)).collect())
     }
 }
