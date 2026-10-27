@@ -8,6 +8,7 @@ pub mod layout;
 pub mod render;
 pub mod js;
 pub mod images;
+pub mod pdf; // PDF4 (SR324): a PDF response as a document (the page stack, scroll / zoom / find / select)
 pub mod canvas;
 pub mod forms;
 pub mod css;
@@ -114,6 +115,9 @@ pub struct AetherEngine {
     /// Each hit as (start node, UTF-16 offset, end node, UTF-16 offset): a hit may span text nodes.
     find_hits: Vec<(usize, u32, usize, u32)>,
     find_epoch: u64,
+    /// PDF4 (SR324): the open PDF, beside the empty document carrying its title; while Some it paints, scrolls,
+    /// selects and finds (`pdf::PdfDocument`, the hooks in `pdf/mod.rs`).
+    pub pdf: Option<pdf::PdfDocument>,
 }
 
 /// A selection drag (AETHERSELECT).
@@ -175,6 +179,7 @@ impl AetherEngine {
             find: chrome::find::FindState::default(),
             find_hits: Vec::new(),
             find_epoch: 0,
+            pdf: None,
         }
     }
 
@@ -343,6 +348,7 @@ impl AetherEngine {
     /// the same granularity while the button is held.
     pub fn press_at(&mut self, x: f64, y: f64, clicks: u8, shift: bool) {
         self.button_down = true;
+        if self.pdf.is_some() { return self.pdf_press(x, y, clicks, shift); } // PDF4 (SR324)
         // AETHERSTYLE3 (SR103): a press on a scroll container's scrollbar drags its thumb, or pages the
         // track toward the press; it starts no selection.
         if self.scrollbar_press(x, y) {
@@ -392,6 +398,7 @@ impl AetherEngine {
         if !self.button_down {
             return;
         }
+        if self.pdf.is_some() { return self.pdf_drag(x, y); } // PDF4 (SR324)
         if self.scrollbar_drag(x, y) {
             return;
         }
@@ -471,6 +478,7 @@ impl AetherEngine {
 
     /// Ctrl/Cmd+A: select the document's contents (the body's children).
     pub fn select_all(&mut self) {
+        if self.pdf.is_some() { return self.pdf_select_all(); } // PDF4 (SR324)
         let Some(doc) = self.document.clone() else { return };
         let root = doc.select_first("body").map(|b| b.as_node().clone()).ok().or_else(|| doc.first_child());
         let Some(root) = root else { return };
@@ -486,6 +494,7 @@ impl AetherEngine {
 
     /// The selected text, serialized per the HTML `innerText` algorithm (`Selection.toString()`).
     pub fn selected_text(&self) -> String {
+        if let Some(p) = &self.pdf { return p.selected_text(); } // PDF4 (SR324)
         match (&self.layout_tree, &self.document) {
             (Some(l), Some(d)) => selection::selection_text(l, d),
             _ => String::new(),
@@ -849,6 +858,7 @@ impl AetherEngine {
                     .and_then(|t| t.taffy.layout(t.root_node).ok().map(|l| l.size.height))
                     .map(|h| (h as f64 - self.height as f64).max(0.0))
                     .unwrap_or(f64::MAX);
+                let max_scroll = self.pdf.as_ref().map_or(max_scroll, |p| p.max_scroll(self.height as f64)); // PDF4 (SR324)
                 self.scroll_y = (self.scroll_y + dy).clamp(0.0, max_scroll);
                 self.lazy_images_pass(); // AETHERMEDIA (SR107): loading=lazy images nearing the viewport
                 // Integer shift must equal the difference of the TRUNCATED
@@ -1642,6 +1652,7 @@ impl AetherEngine {
     /// its channels swapped (quartzite's set_frame contract is RGBA) and, under zoom, resampled
     /// bilinearly from the CSS-size frame.
     pub fn present_rgba(&self) -> (u32, u32, Vec<u8>) {
+        if let Some(p) = &self.pdf { return p.present(self.device, self.zoom(), self.width as f64, self.scroll_y); } // PDF4 (SR324)
         let (sw, sh) = (self.width as usize, self.height as usize);
         let (dw, dh) = (self.device.0 as usize, self.device.1 as usize);
         let src = &self.surface;
@@ -1687,6 +1698,7 @@ impl AetherEngine {
     /// current)` (1-based; 0 = none). AETHERDEBT SR93: a hit may span element boundaries inside one
     /// block (`<b>un</b>a` finds "una"), over the text with its white space collapsed.
     pub fn find(&mut self, query: &str, forward: bool) -> (u32, u32) {
+        if self.pdf.is_some() { return self.pdf_find(query, forward); } // PDF4 (SR324)
         let cur = if self.find.is_repeat(query) && self.find_epoch == self.layout_epoch {
             self.find.step(forward)
         } else {
@@ -1709,6 +1721,7 @@ impl AetherEngine {
 
     /// The find bar closed: the active hit's highlight goes.
     pub fn find_close(&mut self) {
+        if self.pdf.is_some() { self.pdf_find_close(); } // PDF4 (SR324)
         if self.find.current.is_some() {
             selection::set(None);
         }
@@ -1889,6 +1902,7 @@ impl AetherEngine {
     /// for scripted sites: the page's own JS drives its state; no per-site
     /// code anywhere.
     pub fn load_page(&mut self, page: net::Page, add_history: bool) {
+        if let Some(bytes) = page.pdf { return self.load_pdf(&page.base_url, bytes, add_history); } // PDF4 (SR324)
         images::set_page(&page.base_url, page.images);
         self.load_impl(
             &page.base_url,
@@ -1907,6 +1921,7 @@ impl AetherEngine {
         scripts_override: Option<(&[String], &[String])>,
         add_history: bool,
     ) {
+        self.pdf = None; // PDF4 (SR324): every document load drops the PDF (load_pdf sets it after this runs)
         // AETHERCHROME (SR84): the session history is the truth; `history`/`history_idx` mirror it. A
         // new navigation drops the forward entries and appends one of a new document; a traversal or
         // reload (`add_history = false`) re-commits the current entry with the document it now holds.

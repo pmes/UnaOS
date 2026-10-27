@@ -131,8 +131,24 @@ pub async fn fetch_document(input: &str) -> Result<String> {
 
 /// [`fetch_document`] that also returns the FINAL response URL — after redirects (and after the
 /// https-then-http guess for a scheme-less input): the document's URL, which its relative URLs resolve
-/// against and the address bar shows (HTML §7.4.1, the response's URL).
+/// against and the address bar shows (HTML §7.4.1, the response's URL). A PDF response is not text: it is refused
+/// here (the page loader takes it through [`fetch_document_any`]).
 pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
+    match fetch_document_any(input).await? {
+        (Doc::Text(text), url) => Ok((text, url)),
+        (Doc::Pdf(_), _) => anyhow::bail!("not a text document: application/pdf"),
+    }
+}
+
+/// A top-level response's body (PDF4 SR324): text (HTML and everything else the engine parses as a page), or a PDF
+/// ([`crate::pdf::is_pdf`]: its Content-Type, or the `%PDF-` sniff), kept as bytes.
+pub enum Doc {
+    Text(String),
+    Pdf(Vec<u8>),
+}
+
+/// [`fetch_document_final`]'s fetch, with a PDF body kept as bytes instead of refused as non-UTF-8.
+pub async fn fetch_document_any(input: &str) -> Result<(Doc, String)> {
     if input.starts_with("file://") {
         anyhow::bail!("file:// fetches are disabled for security reasons.");
     }
@@ -145,7 +161,7 @@ pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
     for url in urls {
         // AETHERSW (SR104): a navigation under a registered scope is the controlling worker's `fetch` event first.
         if let Some(answer) = sw_navigate(&url).await {
-            return answer;
+            return answer.map(|(text, u)| (Doc::Text(text), u));
         }
         match get(&url, Priority::Document, None).await {
             Ok(response) => {
@@ -163,13 +179,17 @@ pub async fn fetch_document_final(input: &str) -> Result<(String, String)> {
                     anyhow::bail!("Response exceeds size limit");
                 }
                 
+                let ctype = header_of(&doc_headers, "content-type").unwrap_or("").to_string();
                 let bytes = response.bytes().await.context("Failed to read body")?;
                 if bytes.len() > 10 * 1024 * 1024 {
                     anyhow::bail!("Response body exceeds size limit");
                 }
+                if crate::pdf::is_pdf(&ctype, &bytes) {
+                    return Ok((Doc::Pdf(bytes), final_url)); // PDF4 (SR324): the engine opens it as a PDF document
+                }
                 
                 let text = String::from_utf8(bytes).context("Invalid UTF-8")?;
-                return Ok((text, final_url));
+                return Ok((Doc::Text(text), final_url));
             }
             Err(e) => {
                 last_err = Some(anyhow::anyhow!(e).context("Connection failure"));
@@ -396,6 +416,9 @@ pub struct Page {
     /// time but NOT fetched here — the shell fetches it after the page is
     /// delivered so chrome decoration never delays a load.
     pub favicon: Option<String>,
+    /// PDF4 (SR324): the response was a PDF ([`Doc::Pdf`]): its bytes, and nothing else of the page is filled
+    /// (`AetherEngine::load_page` opens it through `load_pdf`).
+    pub pdf: Option<Vec<u8>>,
 }
 
 /// One collected script slot: the ordinal of its `<script>` element among
@@ -517,6 +540,7 @@ pub fn favicon_url(base_url: &str, html: &str) -> Option<String> {
 /// the `image` crate behind it (it picks the largest contained image), and an SVG
 /// icon falls back to the rasterizer the page images use.
 pub async fn fetch_favicon(url: &str) -> Option<(u32, u32, Vec<u8>)> {
+    if url.starts_with("data:") { return crate::images::get(url).map(|i| (i.width(), i.height(), i.as_raw().clone())); } // PDF4 (SR324): the PDF glyph
     let bytes = fetch_image_bytes(url).await.ok()?;
     let decoded = crate::images::decode_raster(&bytes).or_else(|| crate::images::decode_svg(&bytes))?;
     let (w, h) = decoded.dimensions();
@@ -935,7 +959,12 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
     http_cache().clear_memory();
     // The page's base is the FINAL response URL (after redirects): relative stylesheet, script,
     // image and link URLs resolve against it, and it is the history entry the address bar shows.
-    let (html, base) = fetch_document_final(input).await?;
+    let (html, base) = match fetch_document_any(input).await? {
+        (Doc::Text(html), base) => (html, base),
+        (Doc::Pdf(bytes), base) => {
+            return Ok(Page { base_url: base, pdf: Some(bytes), favicon: Some(crate::pdf::GLYPH_URI.to_string()), ..Default::default() });
+        }
+    };
     let partition = http::site_of(&base);
     // AETHERSW (SR104): the document's controller (decided at navigation, as `workers::sw` decides a client's).
     let sw = {
@@ -1077,7 +1106,7 @@ pub async fn fetch_page(input: &str) -> Result<Page> {
         }
     }
     let favicon = favicon_url(&base, &html);
-    Ok(Page { base_url: base, html, sheets, images, scripts, script_nodes, script_urls, favicon })
+    Ok(Page { base_url: base, html, sheets, images, scripts, script_nodes, script_urls, favicon, pdf: None })
 }
 
 #[cfg(test)]

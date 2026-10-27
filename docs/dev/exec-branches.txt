@@ -878,7 +878,7 @@ refs/heads/exec-rmbp-hevcconf   12930de7d FOLDED-BY-HAND (this commit) 2026-10-2
 refs/heads/exec-rmbp-h264enc8x8   e5a7667f3 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-stationroam   52c0b238d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle3cblack   f5dd95c24 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-pdf4   aec1d01c7 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pdf4   5673a4dbd FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdfwrite   9aff5f176 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdfforms   ac398ea1f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdftransparency   61ad90dd4 FOLDED-BY-HAND (this commit) 2026-10-27

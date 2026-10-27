@@ -56,6 +56,9 @@ font_core = { path = "../../unaos/libs/text/font_core" }
 text_host = { path = "../../libs/text_host" }
 # AETHERFONT: WOFF 1.0 tables inflate through PIXELCORE's zlib (in-tree).
 pixel_core = { path = "../../unaos/libs/media/pixel_core" }
+# PDF4 (SR324): a PDF response opens as a document — the ONE PDF reader (pdf_core: PDF1 objects, PDF2 rendering, PDF3
+# fonts and text) both rings link (BP-handlers-4); the engine adds the face only (`src/pdf/`).
+pdf_core = { path = "../../unaos/libs/web/pdf_core" }
 base64 = "0.23"
 resvg = { version = "0.48.1", optional = true }  # EYES bumped to latest stable (R83); PIXELCORE keeps it behind `svg`
 # HTTPCORE (SR51): tokio-tungstenite deleted — no live caller (api/websockets.rs is a stub); an RFC 6455 client is owed.
