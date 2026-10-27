@@ -164,7 +164,7 @@ fn handle_info(handle: block::BlockHandle) -> Option<block::BlockDeviceInfo> {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::sdhc_info(),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::ahci_info_port(port), // UNAFSX86: the SATA disk's own row
+        block::BlockHandle::SdMmc => block::tegra_sd_info(), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::ahci_info_port(port), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => block::nvme_info(), // UNAFSX86: the SATA disk's own row
     }
 }
 
@@ -185,7 +185,7 @@ fn handle_read(
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::read_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::read_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::read_block_ahci_port(port, lba, buf), // UNAFSX86
+        block::BlockHandle::SdMmc => block::read_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::read_block_ahci_port(port, lba, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => block::read_block_nvme(lba, buf), // UNAFSX86
     }
 }
 
@@ -199,7 +199,7 @@ fn handle_write(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), 
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::write_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::write_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::write_block_ahci_port(port, lba, buf), // UNAFSX86: refuses unless ahci-write's grant path — the twin of the read arm
+        block::BlockHandle::SdMmc => block::write_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::write_block_ahci_port(port, lba, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => block::write_block_nvme(lba, buf), // UNAFSX86: refuses unless ahci-write's grant path — the twin of the read arm
     }
 }
 
@@ -256,7 +256,7 @@ impl SdSectorDevice {
             #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
             block::BlockHandle::Sdhc => dev.num_blocks,
             #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-            block::BlockHandle::SdMmc => dev.num_blocks, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => dev.num_blocks, // UNAFSX86: a dedicated per-port row
+            block::BlockHandle::SdMmc => dev.num_blocks, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => dev.num_blocks, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => dev.num_blocks, // UNAFSX86: a dedicated per-port row
         };
         Ok(Self { handle, sectors, ra: RaSet::new(ra_window(handle)) })
     }
@@ -370,7 +370,7 @@ impl SectorDevice for SdSectorDevice {
     /// otherwise the root flip can reach the medium before the tree it points
     /// at, and commit ordering silently breaks.
     fn flush(&mut self) -> Result<(), SectorError> {
-        #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let block::BlockHandle::Ahci { port } = self.handle { return block::flush_ahci_port(port).map_err(|_| SectorError::Io(alloc::string::String::from("ahci: FLUSH CACHE EXT failed"))); } // AHCIROOT (B332): a SATA SSD HAS a write cache — this is the real drain the note above demands
+        #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let block::BlockHandle::Ahci { port } = self.handle { return block::flush_ahci_port(port).map_err(|_| SectorError::Io(alloc::string::String::from("ahci: FLUSH CACHE EXT failed"))); } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if self.handle == block::BlockHandle::Nvme { return block::flush_nvme().map_err(|_| SectorError::Io(alloc::string::String::from("nvme: FLUSH failed"))); } // AHCIROOT (B332): a SATA SSD HAS a write cache — this is the real drain the note above demands
         Ok(())
     }
 }
@@ -599,7 +599,7 @@ fn bind_probe_admitted(handle: block::BlockHandle) -> bool {
         // TEGRASD merge arm — prescribed by the MERGE NOTE above: the orin's unafs volume rides
         // the card's dedicated handle while `Global` is the USB stick; admit the probe.
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => true, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => false, // UNAFSX86: NOT probed — the shared mount is read-write and this transport refuses ordinary writes; a SATA volume is reached by `mount_on` read-only, never by the lazy bind
+        block::BlockHandle::SdMmc => true, #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => false, #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => false, // UNAFSX86: NOT probed — the shared mount is read-write and this transport refuses ordinary writes; a SATA volume is reached by `mount_on` read-only, never by the lazy bind
     }
 }
 
@@ -629,7 +629,7 @@ fn handle_kind_name(handle: block::BlockHandle) -> &'static str {
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => "sdhc",
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => "ahci", // UNAFSX86
+        block::BlockHandle::SdMmc => "tegra-sd", #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { .. } => "ahci", #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => "nvme", // UNAFSX86
     }
 }
 
@@ -662,7 +662,7 @@ pub fn mount_bound_handle() -> Option<block::BlockHandle> { #[cfg(all(target_arc
 /// The successful bind prints the `[unafsbind]` witness: `mount=native` (the native volume's VFS
 /// name of record — vfs.rs mounts `NativeBackend::new("native")`), `handle=` the disk it rode.
 fn bind_mount() -> Result<BoundMount, MountError> { #[cfg(all(target_arch = "x86_64", feature = "wc"))] debug_assert!(crate::arch::sched::current_id().map_or(true, |t| !crate::lockowner::held_by(crate::lockowner::UNAFS, t)), "MOUNTSTACK (B846): bind_mount under the MOUNT hold"); // POISON2 (B846) MOUNTSTACK: with the ticket the bind runs BEFORE the masked hold (`prebind`, file tail); a bind under it is a bug. LINE-NEUTRAL append
-    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let Some(port) = crate::install::ahciroot::root_port() { if let Ok(fs) = mount_on(block::BlockHandle::Ahci { port }) { return Ok(BoundMount { handle: block::BlockHandle::Ahci { port }, fs }); } } // AHCIROOT (B332) M4: the root-granted SSD binds FIRST — SSD root over card root; silent (the UNAFSX86 line names it)
+    #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let Some(port) = crate::install::ahciroot::root_port() { if let Ok(fs) = mount_on(block::BlockHandle::Ahci { port }) { return Ok(BoundMount { handle: block::BlockHandle::Ahci { port }, fs }); } } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if block::nvme_root_grant().is_some() { if let Ok(fs) = mount_on(block::BlockHandle::Nvme) { return Ok(BoundMount { handle: block::BlockHandle::Nvme, fs }); } } // AHCIROOT (B332) M4: the root-granted SSD binds FIRST — SSD root over card root; silent (the UNAFSX86 line names it)
     let global_err = match mount_on(block::BlockHandle::Global) {
         Ok(fs) => {
             serial_println!(
@@ -3405,7 +3405,7 @@ fn keyboot_candidates() -> Vec<block::BlockHandle> {
     #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))]
     if let Some(port) = crate::install::ahciroot::ensure_root_grant() {
         v.push(block::BlockHandle::Ahci { port });
-    }
+    } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if ensure_nvme_root_grant() { v.push(block::BlockHandle::Nvme); } // NVMEBOOT (Z9): the root-granted NVMe after the SSD, before the probe walk (LINE-NEUTRAL append)
     for h in bind_probe_candidates() {
         if h == block::BlockHandle::Global || bind_probe_admitted(h) {
             v.push(h);
@@ -4957,4 +4957,66 @@ fn bind_dead_task(_: usize) {
     serial_println!("[unafs] lockreg-bind returned depth={} (the guard did not fire)", n);
     BIND_TID.store(0, Ordering::Release);
     BIND_LIVE.store(false, Ordering::Release);
+}
+
+// =================================================================================================
+// NVMEBOOT (zenbook-ledger Z9) — the NVMe namespace's UnaFS volume as `/`, in AHCIROOT's shape.
+//
+// TAIL-APPENDED; every change above is a LINE-NEUTRAL fold. The block layer owns the grant SLOT
+// (`drivers/block.rs` tail: one inclusive range, -EPERM outside it, never cleared); this section owns the
+// JUDGMENT that fills it, and the one rebind both roots use:
+//
+// * [`ensure_nvme_root_grant`] — the one UnaFS volume `locate_on(BlockHandle::Nvme)` finds (the FIRST
+//   partition carrying UnaFS magic: the very extent `mount_on` will ride) gets the boot's NVMe root grant,
+//   exactly that extent and nothing else; a foreign partition beside it (the Zenbook's Windows) stays
+//   outside it. Silent (R80): the `:: UNAFSX86: root=unafs src=nvme … ::` line is the boot's one line.
+//   Called from `bootdisk::unafs_state` and [`keyboot_candidates`] BEFORE the bind, with no lock of ours
+//   held; [`bind_mount`] only reads the slot.
+// * [`bind_root_on`] — make the shared mount ride `want` (AHCIROOT's rebind; `install::ahciroot::bind_ssd_root`
+//   is this function for `Ahci { port }`).
+
+/// NVMEBOOT: the negative answer, cached (DONGLEBOOT B658's idea): the namespace was read and carries no UnaFS
+/// volume, or its LBA size is not 512. Never set on an I/O error, nor while no namespace is published.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_ROOT_NONE: AtomicBool = AtomicBool::new(false);
+
+/// NVMEBOOT: mint and hold the boot's NVMe root grant over the namespace's UnaFS volume. Idempotent; silent.
+/// `true` when the grant is live.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn ensure_nvme_root_grant() -> bool {
+    if block::nvme_root_grant().is_some() {
+        return true;
+    }
+    // `UNAOS_ROOT_PREFER=sdhc` is the operator's way to boot the card's root over an installed disk (AHCIROOT).
+    if NVME_ROOT_NONE.load(Ordering::Acquire) || cfg!(feature = "root-prefer-sdhc") {
+        return false;
+    }
+    if block::nvme_info().is_none() {
+        return false; // no namespace published (yet): never remembered as absent
+    }
+    let span = match locate_on(block::BlockHandle::Nvme) {
+        Ok(span) => span,
+        Err(MountError::NoVolume) | Err(MountError::BadSectorSize(_)) => {
+            NVME_ROOT_NONE.store(true, Ordering::Release);
+            return false;
+        }
+        Err(_) => return false,
+    };
+    // A UnaFS block is 8 sectors (4 KiB over 512 B LBAs — `open_on` refused any other size above).
+    let Some(last) = span.block_count.checked_mul(8).and_then(|n| span.base_lba.checked_add(n)).and_then(|e| e.checked_sub(1)) else {
+        return false;
+    };
+    block::hold_nvme_root_grant(span.base_lba, last)
+}
+
+/// NVMEBOOT: make the shared UnaFS mount ride `want` — drop a mount bound elsewhere (an earlier lazy bind),
+/// then bind ([`bind_mount`] tries the root-granted handles first). `true` when the live mount is on `want`.
+/// The ONE rebind: `install::ahciroot::bind_ssd_root` forwards here for `Ahci { port }`.
+#[cfg(all(target_arch = "x86_64", any(feature = "ahciroot", feature = "nvme")))]
+pub fn bind_root_on(want: block::BlockHandle) -> bool {
+    if mount_bound_handle().is_some_and(|h| h != want) {
+        force_remount();
+    }
+    let _ = with_unafs(|_| ());
+    mount_bound_handle() == Some(want)
 }

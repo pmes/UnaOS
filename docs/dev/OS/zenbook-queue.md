@@ -31,7 +31,7 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
    rmbp12 2012, not 2024), ZENBOOK-QEMULANE (an arroyo `test` lane with the Zenbook knobs), ZENBOOK-LINEGATE (a
    `knob-parity-zenbook` gates row running the x86 `--line` mode on the file); row 1's recipe should name esp-zenbook.
    bdf=<b:d.f>` off the glass, and if the FTDI did not bind rebuild with `UNAOS_XHCI_PICK=<i>` for the next i (Z7). Expected first lines and refusals: um5606w.md §6. Bench only, Peter's go.
-3. **ZENBOOK-NVME** — `drivers/nvme.rs` (class 0108, vendor varies): the root volume. In flight (ZENBOOKNVME).
+3. **ZENBOOK-NVME** — `drivers/nvme.rs` (class 0108, vendor varies): the root volume. Rung 1 ZENBOOKNVME (Z2); in flight (NVMEBOOT, Z9: the handle, the root grant, the granted write).
 4. **ZENBOOK-I8042** — `drivers/i8042.rs`: the internal keyboard on the EC's 8042 into the input route. In flight
    (ZENBOOKI8042; it asks `hw::platform()`).
 5. **ZENBOOK-GOP** — the loader picks the CONNECTED output's native mode (the dead internal panel enumerated or not:
