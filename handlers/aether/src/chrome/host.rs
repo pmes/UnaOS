@@ -1108,7 +1108,7 @@ fn file_url_path(input: &str) -> Option<PathBuf> {
 }
 
 /// SAVERECENTOPEN (SR403): the loader's second file-URL arm (`net::fetch_document_any`, after [`open_archive`]'s): a
-/// `.html` / `.htm` file opens as its markup (at most [`ARCHIVE_MAX`]), the document's URL the file URL, under
+/// `.html` / `.htm` file (TYPECORE's `text/html` rows, MIMEONE SR409) opens as its markup (at most [`ARCHIVE_MAX`]), the document's URL the file URL, under
 /// [`ARCHIVE_CSP`] as an opened archive is (no script runs, an opaque origin). OPENANYTYPE (SR408): every other file is
 /// asked of [`local_any`] (a text, image or media type by TYPECORE's one table, or a PDF by its head); what it does not
 /// serve is refused by name on the console (`[pdf] open: <ext> not served`, `none` without an extension) and answered
@@ -1117,7 +1117,7 @@ pub fn open_local(input: &str) -> Option<anyhow::Result<(crate::net::Doc, String
     let path = file_url_path(input)?;
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     match ext.as_deref() {
-        Some("html" | "htm") => Some(read_local(input, &path).map(|(html, url)| (crate::net::Doc::Text(html), url))),
+        _ if type_core::by_extension(&path.to_string_lossy()) == Some(type_core::TEXT_HTML) => Some(read_local(input, &path).map(|(html, url)| (crate::net::Doc::Text(html), url))), // MIMEONE (SR409): TYPECORE's html row, not a literal
         other => match local_any(input, &path) {
             Some(opened) => Some(opened),
             None => {
@@ -1149,7 +1149,8 @@ const PART_MAX: u64 = 10 << 20;
 /// OPENANYTYPE (SR408): [`open_local`]'s non-HTML arm. A `text/*` or JSON file is its text in a `<pre>` (at most
 /// [`ARCHIVE_MAX`]); an `image/*` file an `<img>` of its own file URL (its bytes read as the page's own subresource, so an
 /// SVG is drawn by the image path's renderer, never run); a `video/*` / `audio/*` file a media element of its file URL
-/// (Stria reads the file; nothing is read here); a file the table does not name opens as a PDF when its head says so
+/// (Stria reads the file; nothing is read here); a `.pdf` (the table's `application/pdf`, MIMEONE SR409) opens as a PDF,
+/// and so does a file the table does not name when its head says so
 /// (at most `pdf::MAX_BYTES`, refused by `pdf::over_cap`). Every text document runs under [`ARCHIVE_CSP`]. `None`: not
 /// served.
 fn local_any(input: &str, path: &Path) -> Option<anyhow::Result<(crate::net::Doc, String)>> {
@@ -1159,6 +1160,7 @@ fn local_any(input: &str, path: &Path) -> Option<anyhow::Result<(crate::net::Doc
         let n = std::fs::File::open(path).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).ok()?;
         return crate::pdf::is_pdf("", &head[..n]).then(|| read_local_pdf(input, path));
     };
+    if mime == type_core::APP_PDF { return Some(read_local_pdf(input, path)); } // MIMEONE (SR409): a `.pdf` answers through the table (TYPECORE-PDF); the head sniff above stays for a file without one
     let text = mime.starts_with("text/") || mime == type_core::APP_JSON;
     let media = mime.starts_with("video/") || mime.starts_with("audio/");
     if !(text || media || mime.starts_with("image/")) {

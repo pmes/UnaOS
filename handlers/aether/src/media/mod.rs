@@ -559,24 +559,10 @@ pub fn source_for(node: &NodeRef, base: &str) -> Option<(String, String)> {
     None
 }
 
-/// MIME type from a url's extension (the `type`-less fallback).
+/// MIME type from a url's extension (the `type`-less fallback). MIMEONE (SR409): TYPECORE's one table
+/// (`type_core::by_extension`), a video or audio type only; any other name answers octet, as before.
 pub fn mime_for(url: &str) -> &'static str {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    match path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref() {
-        Some("mp4") | Some("m4v") => "video/mp4",
-        Some("webm") => "video/webm",
-        Some("mkv") => "video/x-matroska",
-        Some("mov") => "video/quicktime",
-        Some("m4a") => "audio/mp4",
-        Some("mp3") => "audio/mpeg",
-        Some("ogg") => "audio/ogg",
-        Some("wav") => "audio/wav",
-        Some("flac") => "audio/flac",
-        Some("opus") => "audio/ogg",
-        Some("aac") => "audio/aac",
-        Some("aif") | Some("aiff") => "audio/aiff",
-        _ => "application/octet-stream",
-    }
+    type_core::by_extension(url.split(['?', '#']).next().unwrap_or(url)).filter(|m| m.starts_with("video/") || m.starts_with("audio/")).unwrap_or(type_core::OCTET)
 }
 
 fn find(r: &Registry, node: &NodeRef) -> Option<usize> {
