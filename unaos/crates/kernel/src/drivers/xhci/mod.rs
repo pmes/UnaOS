@@ -5593,7 +5593,7 @@ impl XhciController {
             // handler can never load an un-initialized (0) base if an interrupt fires. (Both
             // IMAN.IE here and USBCMD.INTE in start() gate delivery, but publish-before-enable
             // is the correct-by-design ordering regardless of those gates.)
-            ir0_base(self.xi as usize).store(ir0_base, Ordering::Release);
+            self::ir0_base(self.xi as usize).store(ir0_base, Ordering::Release);
             op_base_of(self.xi as usize).store(self.op_base, Ordering::Release);
 
             // 6. ENABLE the Interrupter (IMAN - Interrupter Management) - Offset 0x00.
