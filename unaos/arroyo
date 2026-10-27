@@ -686,6 +686,10 @@ _feats="${_feats}sdw,"
 # KEYBOOT3 (rmbp-ledger B856): UNAOS_KEYBOOT_DEFER=1 defers the first-user keying of the native root (`[keyboot]
 # first-user keying=deferred`); unset keys it. Implies `login` in Cargo.toml. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_KEYBOOT_DEFER:-}" ] && _feats="${_feats}keyboot_defer,"
+# AUTOLOCK3 (rmbp-ledger B875): UNAOS_AUTOLOCK_FIXTURE=1 — `tests autolock` takes its credential from the card's staged
+# /system/fixtures/autolock.cred (esp_x86_unafs_card stages it under the same knob), never a literal. Implies `login` in
+# Cargo.toml. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_AUTOLOCK_FIXTURE:-}" ] && _feats="${_feats}autolock_fixture,"
 # R77 M3: UNAOS_TESTS_AT_BOOT=1 runs the desktop fixture registry (`tests.rs`) at registration, in boot order, exactly as before the `tests` verb existed; unset, the desktop boots quiet and `tests` fires them. The test/test-arm lanes default it ON (top of this file). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_TESTS_AT_BOOT:-}" ] && _feats="${_feats}tests-at-boot,"
 # QUIETBOOT (R80): UNAOS_CENSUS=1 boots with every periodic sampler (`census.rs`) on; unset, the boot prints the boot and `census start <name>` turns one on. The battery verbs export it (head `case`).
@@ -9781,6 +9785,18 @@ esp_x86_unafs_card() {
     # builds nothing. Before ROOTACL: /system takes its owner row after. Witness: `[unafs-tool] filetypes staged n= created= stamp=`.
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- filetypes -i "$vol" || {
         echo -e "${COLOR_RED}❌ CARDREGISTRY: tools/unafs filetypes failed — no card image${COLOR_RESET}"; return 1; }
+    # AUTOLOCK3 (rmbp-ledger B875, BP-security-2): ONLY on a card built with UNAOS_AUTOLOCK_FIXTURE=1, the autolock fixture's
+    # credential file /system/fixtures/autolock.cred (line 1 the user, line 2 the password: the pair twoboot.sh types at the
+    # first-user form) — a fixture credential on the card is a fixture card's, by the loginst rule; unset, no step and the
+    # card is byte-identical. Before ROOTACL: /system's owner row covers it (reads public, writes system/admin).
+    if [ -n "${UNAOS_AUTOLOCK_FIXTURE:-}" ]; then
+        local alf="${WORKSPACE_DIR}/target/autolock-fixture"
+        mkdir -p "$alf" && printf 'una\ncorrect-horse\n' > "$alf/autolock.cred" || {
+            echo -e "${COLOR_RED}❌ AUTOLOCK3: could not write ${alf#${WORKSPACE_DIR}/}/autolock.cred — no card image${COLOR_RESET}"; return 1; }
+        cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "$alf" /system/fixtures -i "$vol" || {
+            echo -e "${COLOR_RED}❌ AUTOLOCK3: tools/unafs put autolock.cred -> /system/fixtures failed — no card image${COLOR_RESET}"; return 1; }
+        echo -e "${COLOR_YELLOW}⚡ AUTOLOCK3: /system/fixtures/autolock.cred staged user=una (fixture card only)${COLOR_RESET}"
+    fi
     # ROOTACL (rmbp-ledger B456, SECREVIEW F2): every tree the loop put takes the `system` owner row, so the card is
     # system-owned from its first boot — the kernel's native ACL lets only `kernel` and the administrator write there
     # (children carry no row and inherit it; fs/rootacl.rs). The kernel stamps /system/types at the registry build.
@@ -12549,6 +12565,10 @@ kernel8() {
     if [ -n "${UNAOS_KEYBOOT_DEFER:-}" ]; then
         K8_FEATS="${K8_FEATS},keyboot_defer"
         echo -e "${COLOR_YELLOW}  • UNAOS_KEYBOOT_DEFER: the first user's password does NOT key the native root (KEYBOOT3 B856; keying deferred)${COLOR_RESET}"
+    fi
+    if [ -n "${UNAOS_AUTOLOCK_FIXTURE:-}" ]; then
+        K8_FEATS="${K8_FEATS},autolock_fixture"
+        echo -e "${COLOR_YELLOW}  • UNAOS_AUTOLOCK_FIXTURE: tests autolock reads its credential from the card's /system/fixtures/autolock.cred (AUTOLOCK3 B875; the Pi card step is owed)${COLOR_RESET}"
     fi
     if [ -n "${UNAOS_BUSREG:-}" ]; then
         K8_FEATS="${K8_FEATS},busreg"
