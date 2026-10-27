@@ -866,7 +866,7 @@ refs/heads/exec-rmbp-aethermacgpu   667c333dd FOLDED-BY-HAND (this commit) 2026-
 refs/heads/exec-rmbp-h264enccabac   706bf9b6e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hevcmain10   dbcff7094 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aethermacdevtools   f3c5334d5 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-pdf2   db1ebf8fb IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pdf2   5a65c0d63 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdf3   db1ebf8fb IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdfcrypt   3817105a7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pixelunfilter   119610687 FOLDED-BY-HAND (this commit) 2026-10-27

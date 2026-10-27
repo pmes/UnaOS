@@ -6,19 +6,24 @@
 //!
 //! ```text
 //! pdfprobe <file>
+//! pdfprobe --render <file> <page> <out.png>
 //! ```
 //!
 //! Prints `pages=<n> version=<v> xref=<table|stream|rebuilt> encrypt=<none|rc4-40|rc4-128|aesv2|aesv3|...>
 //! info=<title|->` (encrypt: PDFCRYPT SR315, the file opened with the empty user password), then one line per page:
 //! `page=<i> media=<w>x<h> rotate=<r> ops=<n> fonts=<n> images=<n>` (fonts = the /Resources /Font entries; images =
 //! the /Resources /XObject entries whose /Subtype is /Image, plus the inline images among the page's ops).
+//! `--render` (PDF2, LEDGER SR313) draws page `<page>` (0-based) at 72 dpi through `Page::render`, writes it as a PNG, and
+//! prints `page=<i> render=<w>x<h> runs=<text runs> refused=<names|->` (text runs: the strings the page shows, recorded,
+//! not drawn — PDF3 draws glyphs).
 //! A refused file prints `error=<reason>` and exits 1.
 
 use pdf_core::content::ops;
+use pdf_core::render::{TextLog, png};
 use pdf_core::{Document, Object, Page};
 
 fn usage() -> ! {
-    eprintln!("usage: pdfprobe <file>");
+    eprintln!("usage: pdfprobe <file> | pdfprobe --render <file> <page> <out.png>");
     std::process::exit(2)
 }
 
@@ -56,8 +61,27 @@ fn page_line(doc: &Document, i: usize, p: &Page) -> String {
     )
 }
 
+/// `--render <file> <page> <out.png>`.
+fn render(file: &str, page: &str, out: &str) {
+    let index: usize = page.parse().unwrap_or_else(|_| usage());
+    let bytes = std::fs::read(file).unwrap_or_else(|e| fail(e));
+    let doc = Document::parse(&bytes).unwrap_or_else(|e| fail(e));
+    let pages = doc.pages().unwrap_or_else(|e| fail(e));
+    let p = pages.get(index).unwrap_or_else(|| fail(format!("no page {index} (pages={})", pages.len())));
+    let mut log = TextLog::default();
+    let r = p.render(&doc, 72.0, &mut log).unwrap_or_else(|e| fail(e));
+    let encoded = png(&r.pixmap).unwrap_or_else(|e| fail(e));
+    std::fs::write(out, encoded).unwrap_or_else(|e| fail(e));
+    let refused = if r.refused.is_empty() { "-".to_string() } else { r.refused.join(",") };
+    println!("page={index} render={}x{} runs={} refused={refused}", r.pixmap.w, r.pixmap.h, log.runs.len());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 5 && args[1] == "--render" {
+        render(&args[2], &args[3], &args[4]);
+        return;
+    }
     if args.len() != 2 {
         usage();
     }
