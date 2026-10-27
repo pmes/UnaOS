@@ -1569,7 +1569,7 @@ mod nle_fx {
         let ctts = vi.is_some_and(|i| d.track_samples(i).any(|s| s.pts != s.dts));
         let audio_ok = d.audio_track().is_some_and(|t| t.sample_rate == 48_000 && t.channels == 2) && rep.audio_target > 0 && rep.audio_mixed >= rep.audio_target && rep.periods > 0; // NLE6EXPORTSTREAMPCM (rmbp-ledger B976): the sound entered the file before finish
         let need_audio = cfg!(any(feature = "uvc", feature = "hda-tone"));
-        let (col_ok, col_word) = export_colour(&d, vi); let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir) && col_ok && mkv_verdict(dir); let sz_ok = size_verdict(dir); let ok = ok && sz_ok; let pol_ok = policies_verdict(dir, sz_ok); let ok = ok && pol_ok; // EXPORTSIZEFIXTUREPOLICIES (rmbp-ledger B993): the same reel under Fill / Stretch / Adopt (module tail). EXPORTSIZEFIXTURE (rmbp-ledger B990): the two-size AV1 reel exported (module tail). NLE6EXPORTMKV (rmbp-ledger B966): the .mkv export (module tail). H264ENCCOLOURHOST (LEDGER SR377): the re-read file's colour (module tail). NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
+        let (col_ok, col_word) = export_colour(&d, vi); let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio) && bitrate_verdict(dir) && col_ok && mkv_verdict(dir); let sz_ok = size_verdict(dir); let ok = ok && sz_ok; let pol_ok = policies_verdict(dir, sz_ok); let ok = ok && pol_ok; let px_ok = pixels_verdict(dir); let ok = ok && px_ok; // EXPORTSIZEPOLICYPIXEL (rmbp-ledger B998): NLEFXG's exports decoded back (module tail). EXPORTSIZEFIXTUREPOLICIES (rmbp-ledger B993): the same reel under Fill / Stretch / Adopt (module tail). EXPORTSIZEFIXTURE (rmbp-ledger B990): the two-size AV1 reel exported (module tail). NLE6EXPORTMKV (rmbp-ledger B966): the .mkv export (module tail). H264ENCCOLOURHOST (LEDGER SR377): the re-read file's colour (module tail). NLE6EXPORTONE (rmbp-ledger B963): the `--bitrate` export (module tail), behind the first
         serial_println!(
             "[nle] fixture export out={} samples={} ticks={} ctts={} colour={} audio={} mixed={}/{} periods={} bytes={} ms={} -> {}",
             out, samples, ticks, ctts as u8, col_word, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.periods, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
@@ -1983,24 +1983,24 @@ mod nle_fx {
 
     /// NLEFXE: `test_pattern_track` re-labelled `av01` (av1C: profile 0, level 0, 8-bit 4:2:0, no configOBUs: the in-band headers rule),
     /// its four samples `SIZE_TUS`, keyframes at 0 and 2.
-    fn size_reel() -> Vec<u8> {
+    fn size_reel(tus: [&[u8]; 4]) -> Vec<u8> {
         use demux_core::build;
         let mut video = build::test_pattern_track(1, 66, 66, FPS, 4, 2);
         video.spec.fourcc = *b"av01";
         video.spec.config_box = Some(*b"av1C");
         video.spec.codec_id = "V_AV1";
         video.spec.config = alloc::vec![0x81, 0x00, 0x0c, 0x00];
-        for (s, tu) in video.samples.iter_mut().zip(SIZE_TUS) {
+        for (s, tu) in video.samples.iter_mut().zip(tus) {
             s.data = tu.to_vec();
         }
         build::mp4(&[video], &build::Mp4Options::default())
     }
 
     /// The distinct `max_frame_width x max_frame_height` the canned temporal units' sequence headers state.
-    fn size_count() -> usize {
+    fn size_count(tus: [&[u8]; 4]) -> usize {
         use av1_core::obu::{split_obus, SequenceHeader};
         let mut seen: Vec<(u32, u32)> = Vec::new();
-        for tu in SIZE_TUS {
+        for tu in tus {
             for o in split_obus(tu).unwrap_or_default().iter().filter(|o| o.obu_type == 1) {
                 if let Ok(s) = SequenceHeader::parse(o.payload) {
                     let wh = (s.max_frame_width_minus_1 + 1, s.max_frame_height_minus_1 + 1);
@@ -2015,31 +2015,31 @@ mod nle_fx {
 
     /// The two-size leg: NLEFXE.MP4 and NLESZ.EDL written through the ONE VFS writer, exported to NLESZ.MP4, re-demuxed.
     fn size_verdict(dir: &str) -> bool {
-        size_leg(dir, "NLESZ", timeline_core::SizePolicy::Letterbox)
+        size_leg(dir, "NLESZ", timeline_core::SizePolicy::Letterbox, "NLEFXE", SIZE_TUS)
     }
 
     /// EXPORTSIZEFIXTUREPOLICIES (rmbp-ledger B993): B990's leg under the reel policy `fit`: NLEFXE.MP4 and `<stem>.EDL` (the
     /// policy set by `Timeline::set_size_policy`, so the EDL carries `* UNA SIZE NLEFXE <fit>` unless Letterbox, re-parsed to pin
     /// the round trip) written through the ONE VFS writer, exported to `<stem>.MP4` and re-demuxed; ` fit=<name>` on the line
     /// unless Letterbox (B990's line byte-identical). Adopt: the export must be refused by name and its file gone.
-    fn size_leg(dir: &str, stem: &str, fit: timeline_core::SizePolicy) -> bool {
+    fn size_leg(dir: &str, stem: &str, fit: timeline_core::SizePolicy, reel_id: &str, tus: [&[u8]; 4]) -> bool {
         use crate::video::export;
         use timeline_core::SizePolicy;
         let mt = crate::shell::vfs_mount_table();
         let put = |c: &str, body: &[u8]| -> bool { mt.put_file(c, body, crate::fs::vfs::KERNEL_PRINCIPAL).is_ok() };
         let mut tl = Timeline::new(FPS);
-        let e = tl.add_source("NLEFXE", 4);
+        let e = tl.add_source(reel_id, 4);
         tl.add_track(Kind::Video);
         tl.tracks[0].clips = alloc::vec![Clip::new(e, 0, 4, 0)];
-        let (reel, edl, out) = (alloc::format!("{}/NLEFXE.MP4", dir), alloc::format!("{}/{}.EDL", dir, stem), alloc::format!("{}/{}.MP4", dir, stem));
-        let sizes = size_count();
+        let (reel, edl, out) = (alloc::format!("{}/{}.MP4", dir, reel_id), alloc::format!("{}/{}.EDL", dir, stem), alloc::format!("{}/{}.MP4", dir, stem));
+        let sizes = size_count(tus);
         let tl = tl.set_size_policy(e, fit).ok();
         let text = tl.as_ref().and_then(|tl| timeline_core::edl::write(tl, stem).ok());
-        let round = text.as_deref().and_then(|t| timeline_core::edl::parse(t, FPS).ok()).and_then(|t| t.sources.iter().find(|s| s.reel == "NLEFXE").map(|s| s.size_policy)) == Some(fit);
+        let round = text.as_deref().and_then(|t| timeline_core::edl::parse(t, FPS).ok()).and_then(|t| t.sources.iter().find(|s| s.reel == reel_id).map(|s| s.size_policy)) == Some(fit);
         if fit == SizePolicy::Adopt {
             let _ = mt.unlink(&out, crate::fs::vfs::KERNEL_PRINCIPAL); // a stale file from an earlier run must not read as "not gone"
         }
-        let wrote = put(&reel, &size_reel()) && text.as_deref().map(|t| put(&edl, t.as_bytes())).unwrap_or(false);
+        let wrote = put(&reel, &size_reel(tus)) && text.as_deref().map(|t| put(&edl, t.as_bytes())).unwrap_or(false);
         let rep = if tl.is_none() {
             Err(String::from("fixture-policy"))
         } else if !wrote {
@@ -2061,8 +2061,8 @@ mod nle_fx {
             let gone = vplay::read_all(&out).is_err();
             let ok = sizes == 2 && refused && gone;
             serial_println!(
-                "[nle] fixture export sizes={} reel=NLEFXE out={} fit=adopt refused={} gone={}{} -> {}",
-                sizes, out, refused as u8, gone as u8, why.map(|w| alloc::format!(" why={}", w)).unwrap_or_default(), if ok { "ok" } else { "FAIL" }
+                "[nle] fixture export sizes={} reel={} out={} fit=adopt refused={} gone={}{} -> {}",
+                sizes, reel_id, out, refused as u8, gone as u8, why.map(|w| alloc::format!(" why={}", w)).unwrap_or_default(), if ok { "ok" } else { "FAIL" }
             );
             return ok;
         }
@@ -2079,8 +2079,8 @@ mod nle_fx {
         let ok = why.is_none() && sizes == 2 && samples == 4 && frames == 4 && first == (66, 66);
         let tok = if fit == SizePolicy::Letterbox { String::new() } else { alloc::format!(" fit={}", fit.name()) };
         serial_println!(
-            "[nle] fixture export sizes={} reel=NLEFXE out={} samples={} first={}x{} frames={} bytes={}{}{} -> {}",
-            sizes, out, samples, first.0, first.1, frames, bytes, tok, why.map(|w| alloc::format!(" why={}", w)).unwrap_or_default(), if ok { "ok" } else { "FAIL" }
+            "[nle] fixture export sizes={} reel={} out={} samples={} first={}x{} frames={} bytes={}{}{} -> {}",
+            sizes, reel_id, out, samples, first.0, first.1, frames, bytes, tok, why.map(|w| alloc::format!(" why={}", w)).unwrap_or_default(), if ok { "ok" } else { "FAIL" }
         );
         ok
     }
@@ -2097,9 +2097,122 @@ mod nle_fx {
     fn policies_verdict(dir: &str, letterbox: bool) -> bool {
         use timeline_core::SizePolicy;
         let legs = [("NLESZF", SizePolicy::Fill), ("NLESZS", SizePolicy::Stretch), ("NLESZA", SizePolicy::Adopt)];
-        let n = letterbox as u32 + legs.iter().map(|&(stem, fit)| size_leg(dir, stem, fit) as u32).sum::<u32>();
+        let n = letterbox as u32 + legs.iter().map(|&(stem, fit)| size_leg(dir, stem, fit, "NLEFXE", SIZE_TUS) as u32).sum::<u32>();
         let ok = n == 4;
         serial_println!("[nle] fixture export policies={} -> {}", n, if ok { "ok" } else { "FAIL" });
+        ok
+    }
+
+    // ── EXPORTSIZEPOLICYPIXEL (rmbp-ledger B998): NLEFXG's exports decoded back (handlers.md §5 NLEPROBE-HDR's EXPORT-SIZE-POLICY-PIXEL) ─
+    // NLEFXE's two sizes are both 1:1, so B993's policies all cover the box. NLEFXG keeps NLEFXE's 66x66 pair and switches to libaom's
+    // `av1-1-b8-01-size-16x64` (not in av1_core's vectors.txt: fetched from aom-test-data, sha1 dd44aad500c7ca0fc97e3d8f0abed3c83b24c79c
+    // = libaom's test/test-data.sha1, sha256 a6764971146e487f369159400efe937ad049c4e06e7e98edb2f35724b378c39c), its two temporal units
+    // verbatim (TU0 = temporal delimiter + sequence header + key frame, TU1 = an inter frame), canned as `NLEFXE_66K` is. 16x64 into
+    // 66x66: Letterbox paints the picture at columns 25..40 (`yuv_core::scale::fit`) over black bars, Fill takes its centre 16x16
+    // over the whole box, Stretch the whole picture. Each policy's export (B993's `size_leg`, the reel as its parameter) is decoded
+    // back through h264_core: the export's gop is one second, so the first sample after the switch (2) is a P picture and samples
+    // 0..=2 are decoded in order; frame 2's centre luma row is read in three spans (the 16x64 picture's luma is 133..255, a bar ~16).
+    // Adopt stays B993's refusal pin. `pixels=` counts the three legs that passed.
+    const NLEFXG_16K: [u8; 507] = [
+        0x12, 0x00, 0x0a, 0x0a, 0x00, 0x00, 0x00, 0x01, 0xaf, 0xfe, 0xff, 0xfc, 0xc0, 0x20, 0x32, 0xea,
+        0x03, 0x10, 0x00, 0x8d, 0x80, 0x00, 0x40, 0x00, 0x30, 0x00, 0x00, 0x00, 0x08, 0xee, 0x30, 0xd7,
+        0x67, 0xdc, 0x81, 0x29, 0xcd, 0x2b, 0x03, 0x9a, 0x16, 0x6a, 0xe7, 0x29, 0xc9, 0x80, 0x6d, 0xdc,
+        0x19, 0x0e, 0x6e, 0x89, 0xde, 0x12, 0x82, 0x1c, 0xfa, 0x57, 0x75, 0x88, 0x2a, 0xa9, 0x01, 0xa3,
+        0x6b, 0x1d, 0x97, 0xc2, 0xd5, 0x05, 0x72, 0x83, 0xfe, 0x45, 0x08, 0x0a, 0x10, 0x35, 0xe2, 0x36,
+        0xf7, 0xf2, 0xc9, 0x5a, 0x6d, 0x4d, 0x7b, 0x6c, 0x97, 0x4c, 0x01, 0x39, 0xbb, 0x74, 0x73, 0x7b,
+        0x5d, 0xef, 0x69, 0x8f, 0x83, 0x66, 0xde, 0xd0, 0x63, 0x88, 0xce, 0x58, 0xf1, 0x09, 0x47, 0x2e,
+        0x4d, 0xea, 0x95, 0xe6, 0xa6, 0x04, 0x02, 0xdf, 0xd0, 0x05, 0x2e, 0x41, 0x00, 0x3c, 0x5a, 0x30,
+        0xc7, 0x1d, 0x81, 0x96, 0xdd, 0x53, 0x5f, 0x53, 0xb5, 0x96, 0x8f, 0x6d, 0xa7, 0xd5, 0xda, 0x7c,
+        0xbe, 0x12, 0x0e, 0xe2, 0xed, 0x0d, 0xde, 0xc8, 0x7f, 0x4b, 0xb1, 0x72, 0xbf, 0x96, 0xbd, 0x2b,
+        0x27, 0x39, 0x7a, 0x1a, 0x63, 0x7f, 0xa3, 0x71, 0x8c, 0xda, 0x60, 0x8d, 0xb8, 0xf6, 0x19, 0xfa,
+        0x1e, 0xb8, 0x06, 0xe6, 0x5e, 0x95, 0xb0, 0x8b, 0x24, 0xfa, 0x90, 0x11, 0x39, 0x00, 0xdb, 0x82,
+        0x1c, 0x4c, 0x50, 0xc4, 0xda, 0x4d, 0x37, 0x57, 0x3a, 0xf1, 0xfa, 0xb3, 0xf2, 0x14, 0xbb, 0x88,
+        0xab, 0x66, 0x03, 0x38, 0x23, 0xff, 0x80, 0x9a, 0x02, 0x59, 0xfc, 0xee, 0x1c, 0xef, 0x48, 0x25,
+        0x03, 0x85, 0xce, 0xaa, 0x14, 0xcf, 0x79, 0x19, 0xbb, 0x52, 0x17, 0x16, 0x2e, 0x5f, 0x12, 0xd0,
+        0xac, 0xca, 0x86, 0xd5, 0xf4, 0xd6, 0x26, 0x67, 0x2a, 0xae, 0xd1, 0xf3, 0x91, 0x83, 0xb6, 0xe2,
+        0x1b, 0x06, 0xbb, 0x3a, 0x8a, 0x04, 0x6b, 0xea, 0xfb, 0x5e, 0xb7, 0x15, 0xda, 0x2f, 0xe3, 0xf9,
+        0x7d, 0x1f, 0x8c, 0x30, 0x70, 0xc6, 0x17, 0xbc, 0xa3, 0xdf, 0xe2, 0xfa, 0xa7, 0xa1, 0x16, 0x35,
+        0xf6, 0x87, 0x51, 0x9d, 0x01, 0x9e, 0x8b, 0xb6, 0x58, 0x44, 0xcd, 0xee, 0x05, 0x3e, 0x4d, 0x23,
+        0xa0, 0xea, 0x4e, 0x90, 0xd6, 0x2f, 0x5f, 0x64, 0xa0, 0xe9, 0x22, 0x34, 0x56, 0x3a, 0xe3, 0xa0,
+        0x7a, 0xf3, 0x11, 0x15, 0x6d, 0xce, 0x3c, 0x24, 0xcd, 0x8d, 0x2c, 0x33, 0xf2, 0xab, 0x41, 0x2a,
+        0x86, 0x64, 0x4f, 0xcd, 0xba, 0x9b, 0x0f, 0x4c, 0x4b, 0xe9, 0xe0, 0x74, 0x73, 0x4c, 0xd4, 0x64,
+        0x86, 0x3b, 0x9f, 0x11, 0x60, 0xf0, 0x3a, 0xc1, 0x3a, 0xf8, 0x6c, 0x29, 0x03, 0x46, 0xfa, 0x0a,
+        0x81, 0x60, 0x4a, 0x3a, 0x49, 0xab, 0xd2, 0xf6, 0x9f, 0x2c, 0xeb, 0xee, 0x2d, 0x17, 0x29, 0x83,
+        0x7c, 0xab, 0xc0, 0xc5, 0x75, 0x5b, 0xf0, 0x83, 0xb9, 0x36, 0xf5, 0x74, 0xd2, 0x2c, 0x3a, 0x98,
+        0x1e, 0x48, 0x81, 0xcb, 0x46, 0xec, 0xc0, 0x20, 0x6e, 0xc9, 0xa8, 0xf5, 0xf3, 0xae, 0x8e, 0xd6,
+        0x1c, 0x06, 0x43, 0xee, 0x8f, 0x29, 0x2b, 0x64, 0xe3, 0x1e, 0x7d, 0xf7, 0x22, 0x4d, 0x81, 0x0d,
+        0xa9, 0x79, 0x99, 0x61, 0x31, 0xc4, 0x94, 0x16, 0xa4, 0x01, 0xa3, 0x63, 0x98, 0x38, 0x37, 0x49,
+        0x42, 0xf6, 0x46, 0xa9, 0x3c, 0x33, 0xb3, 0x4e, 0x5b, 0xeb, 0x6f, 0x53, 0x27, 0x16, 0x79, 0xc8,
+        0x2e, 0xae, 0xce, 0xa9, 0x7d, 0x7e, 0x91, 0x05, 0xea, 0xd9, 0x4b, 0xdc, 0xa4, 0x85, 0x8b, 0x55,
+        0xf4, 0x53, 0xf5, 0xbb, 0x4e, 0x24, 0x67, 0xc5, 0x08, 0xa3, 0xe4, 0x6b, 0x23, 0xb1, 0x4e, 0x42,
+        0xa6, 0xeb, 0x16, 0x8c, 0x5d, 0xec, 0x9b, 0x4c, 0xa1, 0x41, 0x60,
+    ];
+    const NLEFXG_16I: [u8; 182] = [
+        0x12, 0x00, 0x32, 0xb1, 0x01, 0x30, 0x03, 0xc3, 0x00, 0xa7, 0x2e, 0x7a, 0x3a, 0x00, 0x81, 0x00,
+        0x00, 0xc0, 0x00, 0x00, 0x40, 0x28, 0x00, 0xea, 0x5f, 0xa3, 0x43, 0xd7, 0x69, 0x98, 0x9f, 0x56,
+        0xc8, 0x1f, 0xa2, 0x20, 0x5c, 0xac, 0x42, 0x7e, 0x70, 0xe5, 0x13, 0x2a, 0xbe, 0x1c, 0x97, 0x52,
+        0x0f, 0x6f, 0x63, 0x63, 0xed, 0x20, 0x41, 0xb2, 0xbd, 0xcd, 0x86, 0xf1, 0x54, 0xbc, 0xb7, 0xc8,
+        0x28, 0x1b, 0x63, 0x2d, 0x9e, 0xc9, 0xa8, 0x03, 0xe9, 0x89, 0xb0, 0x3d, 0x4e, 0xb7, 0x64, 0x38,
+        0xb9, 0x9b, 0x81, 0xbd, 0x10, 0x82, 0xcb, 0x5c, 0xdb, 0x51, 0x4b, 0xac, 0xfa, 0xe5, 0x80, 0x6e,
+        0x80, 0x6d, 0x7b, 0x11, 0x3c, 0x15, 0x61, 0x8b, 0xa5, 0xee, 0xb3, 0x21, 0x51, 0x47, 0xce, 0xb3,
+        0x7c, 0x0c, 0x35, 0xa0, 0x23, 0xa1, 0xbd, 0xd8, 0x33, 0x38, 0x66, 0xd2, 0x20, 0x0c, 0x38, 0xba,
+        0xc4, 0xaf, 0xa0, 0xcc, 0xd0, 0x56, 0xb2, 0x73, 0x53, 0x08, 0x45, 0x06, 0x88, 0x92, 0x0c, 0x3c,
+        0x7e, 0x37, 0x99, 0x82, 0x0f, 0x07, 0xfc, 0x75, 0x95, 0xff, 0x73, 0xc0, 0x75, 0x58, 0xbb, 0x3a,
+        0x6c, 0x3c, 0xe6, 0x4f, 0x46, 0x46, 0xe6, 0xec, 0xa6, 0x66, 0xab, 0x9e, 0xf2, 0x07, 0x73, 0xb8,
+        0xbe, 0xb1, 0xc2, 0x47, 0x73, 0xf8,
+    ];
+    const PIXEL_TUS: [&[u8]; 4] = [&NLEFXE_66K, &NLEFXE_66I, &NLEFXG_16K, &NLEFXG_16I];
+
+    /// `path`'s frame 2 (h264_core over samples 0..=2), its centre luma row's mean in three spans: left x 0..12, middle
+    /// x w/2-4..w/2+4, right x w-14..w-2. Ok(true) = bars (left and right < 48, middle > 96); Ok(false) = no bars (all three > 96).
+    fn row_bars(path: &str) -> Result<(bool, [u32; 3]), String> {
+        let d = vplay::read_all(path).and_then(|b| demux_core::Demuxer::open(b).map_err(|e| alloc::format!("demux: {}", e)))?;
+        let t = d.video_track().ok_or_else(|| String::from("no-video"))?;
+        let i = d.track_index(t.id).ok_or_else(|| String::from("no-video"))?;
+        let mut dec = h264_core::Decoder::new();
+        dec.configure_avcc(&t.config).map_err(|e| alloc::format!("{}", e))?;
+        for (n, s) in d.track_samples(i).take(3).enumerate() {
+            dec.set_tag(n as i64);
+            dec.decode_sample(d.sample_data(s)).map_err(|e| alloc::format!("{}", e))?;
+        }
+        dec.flush();
+        let f = dec.take_frames().into_iter().find(|f| f.tag == 2).ok_or_else(|| String::from("no-frame-2"))?;
+        let (w, h) = (f.width as usize, f.height as usize);
+        if w < 32 || h < 2 || f.planes[0].len() < w * h {
+            return Err(alloc::format!("frame {}x{}", w, h));
+        }
+        let row = &f.planes[0][(h / 2) * w..(h / 2 + 1) * w];
+        let mean = |a: usize, b: usize| row[a..b].iter().map(|&v| v as u32).sum::<u32>() / (b - a) as u32;
+        let luma = [mean(0, 12), mean(w / 2 - 4, w / 2 + 4), mean(w - 14, w - 2)];
+        let [l, m, r] = luma;
+        if l < 48 && r < 48 && m > 96 {
+            Ok((true, luma))
+        } else if l > 96 && r > 96 && m > 96 {
+            Ok((false, luma))
+        } else {
+            Err(alloc::format!("row l={} m={} r={}", l, m, r))
+        }
+    }
+
+    /// One policy: B993's `size_leg` over NLEFXG as `<stem>`, then `row_bars` on `<stem>.MP4`; ok iff both and bars == `want`.
+    fn pixel_leg(dir: &str, stem: &str, fit: timeline_core::SizePolicy, want: bool) -> bool {
+        let got = if size_leg(dir, stem, fit, "NLEFXG", PIXEL_TUS) { row_bars(&alloc::format!("{}/{}.MP4", dir, stem)) } else { Err(String::from("export")) };
+        let ok = matches!(got, Ok((b, _)) if b == want);
+        let (bars, luma, why) = match &got {
+            Ok((b, [l, m, r])) => (if *b { "yes" } else { "no" }, alloc::format!(" luma={}/{}/{}", l, m, r), String::new()),
+            Err(e) => ("?", String::new(), alloc::format!(" why={}", e)),
+        };
+        serial_println!("[nle] fixture export pixel fit={} bars={} reel=NLEFXG{}{} -> {}", fit.name(), bars, luma, why, if ok { "ok" } else { "FAIL" });
+        ok
+    }
+
+    /// NLEPXL Letterbox (bars), NLEPXF Fill and NLEPXS Stretch (no bars).
+    fn pixels_verdict(dir: &str) -> bool {
+        use timeline_core::SizePolicy;
+        let legs = [("NLEPXL", SizePolicy::Letterbox, true), ("NLEPXF", SizePolicy::Fill, false), ("NLEPXS", SizePolicy::Stretch, false)];
+        let n = legs.iter().map(|&(stem, fit, want)| pixel_leg(dir, stem, fit, want) as u32).sum::<u32>();
+        let ok = n == 3;
+        serial_println!("[nle] fixture export pixels={} -> {}", n, if ok { "ok" } else { "FAIL" });
         ok
     }
 }

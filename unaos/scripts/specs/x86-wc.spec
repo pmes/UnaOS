@@ -1019,6 +1019,11 @@ OPTIONAL \[nle\] fixture export sizes=2 reel=NLEFXE .* fit=adopt refused=1 gone=
 OPTIONAL \[nle\] fixture export policies=4 -> ok
 FORBID \[nle\] fixture export policies=.* -> FAIL
 FORBID \[nle\] fixture export sizes=.* -> FAIL
+# EXPORTSIZEPOLICYPIXEL (rmbp-ledger B998): a second two-size reel NLEFXG (libaom size-66x66 then the non-square size-16x64) exported under Letterbox (NLEPXL), Fill (NLEPXF) and Stretch (NLEPXS), each export's frame after the switch decoded back through h264_core and its centre row read: Letterbox shows black bars left and right, Fill and Stretch none (OPTIONAL as above).
+OPTIONAL \[nle\] fixture export pixel fit=letterbox bars=yes .* -> ok
+OPTIONAL \[nle\] fixture export pixel fit=fill bars=no .* -> ok
+OPTIONAL \[nle\] fixture export pixel fit=stretch bars=no .* -> ok
+FORBID \[nle\] fixture export pixel.* -> FAIL
 # HIDBOOTLEDSTEST (rmbp-ledger B995), TAIL-APPENDED — `tests hidboot`: the boot decoder under Transport::Ehci owes the LED slot on a lock-key press edge only, the ONE slot drain (`hidboot::drain_led_slots`) coalesces four toggles into one send with the latest byte and skips a dead endpoint, a refusing endpoint is latched off after one send. OPTIONAL until a typist types it (nothing types it on this lane today).
 OPTIONAL :: HIDBOOT: owed=ok coalesce=ok latch=ok -> PASS ::
 FORBID :: HIDBOOT: .*-> FAIL
