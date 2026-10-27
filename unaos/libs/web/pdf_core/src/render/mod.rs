@@ -156,7 +156,7 @@ impl Page {
             sink,
             depth: 0,
         };
-        it.run(&ops(&self.contents));
+        it.run(&ops(&self.contents)); it.annots(self, rot.then_pre(&flip));
         Ok(Rendered { pixmap: it.canvas, refused: it.refused })
     }
 }
@@ -642,5 +642,20 @@ impl Interp<'_, '_> {
             }
         }
         self.text.advance(g.advance);
+    }
+}
+
+/// PDFFORMS (SR326): the page's annotations AFTER its content (§12.5.5), each from the page's default graphics state
+/// with the CTM = the page's initial CTM x A (`crate::annots::appearance::placement`), through the ONE form-XObject
+/// path (`form`: its /Matrix, its /BBox clip, its resources).
+impl Interp<'_, '_> {
+    fn annots(&mut self, page: &Page, base: Transform) {
+        self.stack.clear();
+        for (a, s) in crate::annots::appearance::painted(page, self.doc) {
+            self.gs = GState::new(base.then_pre(&a));
+            self.gs.base = base;
+            self.res = page.resources.clone();
+            self.form(&s);
+        }
     }
 }
