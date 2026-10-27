@@ -178,3 +178,124 @@ fn desc_v2_and_v4() {
     assert_eq!(Profile::parse(&named), Err(Refusal::NamedColour));
     assert_eq!(description(&named).as_deref(), Some("Spot"));
 }
+
+// KERNEL-DISPLAY-ICC (LEDGER SR372) known answers for `icc_core::display`: sRGB to a matrix/TRC panel. The references are
+// hand-derived offline (python, f64): each side's matrix from its EDID-quantised xy primaries + white, Bradford-adapted
+// to the ICC D50, `inv(M_panel) . M_sRGB`, the sRGB EOTF in, the panel's pure gamma out. A DCI-P3 (D65) panel at gamma
+// 2.20 takes sRGB red (255, 0, 0) to (233.519, 53.904, 40.126), green to (116.278, 251.014, 77.362), blue to
+// (0, 12.511, 244.347), (200, 100, 50) to (185.832, 105.024, 64.232) and grey 128 to 127.026; an sRGB-primaries panel
+// declaring a pure gamma 2.20 without the sRGB bit takes grey 10 to 18.285.
+use icc_core::display::{self, colorants};
+use icc_core::{DisplayTransform, edid_colour};
+
+const P3_Q10: [[u16; 2]; 4] = [[696, 328], [271, 707], [154, 61], [320, 337]];
+const SRGB_Q10: [[u16; 2]; 4] = [[655, 338], [307, 614], [154, 61], [320, 337]];
+
+fn q10(c: [[u16; 2]; 4]) -> [[f32; 2]; 4] {
+    c.map(|p| p.map(|v| v as f32 / 1024.0))
+}
+
+fn near3(a: [u8; 3], b: [u8; 3]) -> bool {
+    (0..3).all(|k| near(a[k], b[k], 1))
+}
+
+#[test]
+fn display_edid_colour_bytes() {
+    let b = display::kat::edid(P3_Q10, 120, false);
+    assert_eq!(b.iter().fold(0u8, |a, x| a.wrapping_add(*x)), 0, "checksum");
+    // 0x17 gamma 2.20, 0x18 features, 0x19 / 0x1A the low bits (Rx Ry Gx Gy / Bx By Wx Wy), 0x1B.. the high eight.
+    assert_eq!(&b[0x17..0x23], &[120, 0x0A, 0x0F, 0x91, 0xAE, 0x52, 0x43, 0xB0, 0x26, 0x0F, 0x50, 0x54]);
+    let e = edid_colour(&b).unwrap();
+    assert_eq!(e.chroma, q10(P3_Q10));
+    assert_eq!(e.gamma, 2.2);
+    assert!(!e.srgb);
+    assert!(edid_colour(&display::kat::edid(SRGB_Q10, 120, true)).unwrap().srgb);
+    let mut x = b;
+    x[0x17] = 0xFF;
+    assert_eq!(edid_colour(&x), Err(Refusal::Unsupported("EDID gamma in an extension block")));
+    assert_eq!(edid_colour(&b[..127]), Err(Refusal::Malformed("EDID base block")));
+    let mut flat = P3_Q10;
+    flat[3] = [320, 0];
+    let e = edid_colour(&display::kat::edid(flat, 120, false)).unwrap();
+    assert_eq!(DisplayTransform::from_edid_colour(&e).err(), Some(Refusal::Unsupported("EDID chromaticity degenerate")));
+}
+
+#[test]
+fn display_srgb_edid_is_identity() {
+    let e = edid_colour(&display::kat::edid(SRGB_Q10, 120, true)).unwrap();
+    let x = DisplayTransform::from_edid_colour(&e).unwrap();
+    assert!(x.is_identity());
+    let mut px = [200, 100, 50, 7, 10, 10, 10, 255];
+    let before = px;
+    x.apply(&mut px);
+    assert_eq!(px, before);
+    assert!(DisplayTransform::from_profile(&SRGB).unwrap().is_identity());
+    // The same primaries declaring a pure gamma 2.20 without the sRGB bit: the EDID gamma is taken literally.
+    let e = edid_colour(&display::kat::edid(SRGB_Q10, 120, false)).unwrap();
+    let x = DisplayTransform::from_edid_colour(&e).unwrap();
+    assert!(!x.is_identity());
+    assert!(near3(x.rgb([10, 10, 10]), [18, 18, 18]), "{:?}", x.rgb([10, 10, 10]));
+    assert!(near3(x.rgb([128, 128, 128]), [127, 127, 127]));
+    assert!(near3(x.rgb([255, 0, 0]), [255, 0, 0]));
+}
+
+#[test]
+fn display_p3_known_values() {
+    let e = edid_colour(&display::kat::edid(P3_Q10, 120, false)).unwrap();
+    let x = DisplayTransform::from_edid_colour(&e).unwrap();
+    assert!(!x.is_identity());
+    for (i, o) in [
+        ([255, 0, 0], [234, 54, 40]),
+        ([0, 255, 0], [116, 251, 77]),
+        ([0, 0, 255], [0, 13, 244]),
+        ([255, 255, 255], [255, 255, 255]),
+        ([128, 128, 128], [127, 127, 127]),
+        ([200, 100, 50], [186, 105, 64]),
+        ([0, 0, 0], [0, 0, 0]),
+    ] {
+        assert!(near3(x.rgb(i), o), "{i:?} -> {:?}, want {o:?}", x.rgb(i));
+    }
+    let mut px = [200, 100, 50, 33];
+    x.apply(&mut px);
+    assert_eq!((px[..3] == x.rgb([200, 100, 50])[..], px[3]), (true, 33), "apply = rgb, alpha untouched");
+}
+
+#[test]
+fn display_from_profile_equals_from_edid() {
+    let ch = q10(P3_Q10);
+    let g = 563.0 / 256.0;
+    let m = colorants(&ch).unwrap();
+    let rows = core::array::from_fn(|c| [m[0][c], m[1][c], m[2][c]]);
+    let p = Profile::parse(&kat::matrix_trc_v2(rows, kat::curv_gamma(g))).unwrap();
+    let a = DisplayTransform::from_profile(&p).unwrap();
+    let b = DisplayTransform::from_edid(ch, g).unwrap();
+    let steps: [u8; 17] = core::array::from_fn(|i| (i * 16).min(255) as u8);
+    for r in steps {
+        for gg in steps {
+            for bb in steps {
+                assert!(near3(a.rgb([r, gg, bb]), b.rgb([r, gg, bb])), "({r}, {gg}, {bb})");
+            }
+        }
+    }
+}
+
+#[test]
+fn display_refusals() {
+    let gray = Profile::parse(&kat::gray_v2(2.2)).unwrap();
+    assert_eq!(DisplayTransform::from_profile(&gray).err(), Some(Refusal::Unsupported("GRAY display profile")));
+    let lut = Profile::parse(&kat::lut16_cmyk_v2()).unwrap();
+    assert_eq!(DisplayTransform::from_profile(&lut).err(), Some(Refusal::Unsupported("LUT-based display profile")));
+    assert_eq!(DisplayTransform::from_edid(q10(P3_Q10), 0.0).err(), Some(Refusal::Malformed("display gamma")));
+}
+
+#[test]
+fn display_bgra_is_rgba_swapped() {
+    let x = DisplayTransform::from_edid(q10(P3_Q10), 2.2).unwrap();
+    let mut rgba = [200, 100, 50, 9, 0, 255, 0, 1, 17, 34, 51, 0];
+    let mut bgra = [50, 100, 200, 9, 0, 255, 0, 1, 51, 34, 17, 0];
+    x.apply(&mut rgba);
+    x.apply_bgra(&mut bgra);
+    for p in 0..3 {
+        assert_eq!([bgra[4 * p + 2], bgra[4 * p + 1], bgra[4 * p], bgra[4 * p + 3]], rgba[4 * p..4 * p + 4]);
+    }
+}

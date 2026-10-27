@@ -79,7 +79,7 @@ pub fn set(mode: usize, invert: bool) {
     let m = mode.min(MODES - 1);
     MODE.store(m as u8, Relaxed);
     INVERT.store(invert, Relaxed);
-    ACTIVE.store(m != 0 || invert, Relaxed);
+    ACTIVE.store(m != 0 || invert, Relaxed); #[cfg(feature = "dicc")] { if crate::video::colour::on() { ACTIVE.store(true, Relaxed); } } // KERNEL-DISPLAY-ICC (SR372): a live display transform keeps every writer on the filtered path. LINE-NEUTRAL append, code first
 }
 
 #[inline]
@@ -128,9 +128,9 @@ pub fn apply(c: u32, mode: usize, inv: bool) -> u32 {
 }
 
 /// A solid colour on its way to the scanout, under the applied filter (the identity while off).
-#[inline]
+#[inline] #[cfg_attr(feature = "dicc", allow(unreachable_code))]
 pub fn color(c: u32) -> u32 {
-    if !active() {
+    #[cfg(feature = "dicc")] { return dicc_color(c); } if !active() { // KERNEL-DISPLAY-ICC (SR372): the solid colour through the display stage too (file tail). LINE-NEUTRAL append, code first
         return c;
     }
     apply(c, mode(), invert())
@@ -197,7 +197,7 @@ pub fn in_place(fmt: PixelFormat, bpp: usize, buf: &mut [u8]) {
         return;
     }
     let t0 = crate::arch::now_cycles();
-    transform(fmt, mode(), invert(), buf);
+    transform(fmt, mode(), invert(), buf); #[cfg(feature = "dicc")] { crate::video::colour::rows(fmt, buf); } // KERNEL-DISPLAY-ICC (SR372): the display stage after the filter, inside the timed bracket. LINE-NEUTRAL append, code first
     TCYC.fetch_add(crate::arch::now_cycles().saturating_sub(t0), Relaxed);
     TPX.fetch_add((buf.len() / 4) as u64, Relaxed);
 }
@@ -218,7 +218,7 @@ pub fn each(fmt: PixelFormat, bpp: usize, src: &[u8], mut sink: impl FnMut(usize
         let n = (src.len() - i).min(CHUNK * 4);
         buf[..n].copy_from_slice(&src[i..i + n]);
         let t0 = crate::arch::now_cycles();
-        transform(fmt, m, inv, &mut buf[..n]);
+        transform(fmt, m, inv, &mut buf[..n]); #[cfg(feature = "dicc")] { crate::video::colour::rows(fmt, &mut buf[..n]); } // KERNEL-DISPLAY-ICC (SR372): the display stage after the filter, inside the timed bracket. LINE-NEUTRAL append, code first
         TCYC.fetch_add(crate::arch::now_cycles().saturating_sub(t0), Relaxed);
         TPX.fetch_add((n / 4) as u64, Relaxed);
         sink(i, &buf[..n]);
@@ -257,7 +257,7 @@ static CHANGES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::n
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn changed(mode: usize, invert: bool) -> bool {
     let m = mode.min(MODES - 1);
-    if m == self::mode() && invert == self::invert() {
+    #[cfg(feature = "dicc")] let fresh = crate::video::colour::latch(); #[cfg(not(feature = "dicc"))] let fresh = false; if !fresh && m == self::mode() && invert == self::invert() { // KERNEL-DISPLAY-ICC (SR372): the display transform's first latch takes this call's own full-repaint path. LINE-NEUTRAL, code first
         return false;
     }
     set(m, invert);
@@ -273,4 +273,15 @@ pub fn changed(mode: usize, invert: bool) -> bool {
 #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn changes() -> u32 {
     CHANGES.load(Relaxed)
+}
+
+// KERNEL-DISPLAY-ICC (LEDGER SR372; BP-video-25) — TAIL-APPENDED so no line above moves: `color`'s body under `dicc`,
+// the filter then the panel's display transform (`video::colour::word`, the identity while no transform is live).
+#[cfg(feature = "dicc")]
+#[inline]
+fn dicc_color(c: u32) -> u32 {
+    if !active() {
+        return c;
+    }
+    crate::video::colour::word(apply(c, mode(), invert()))
 }
