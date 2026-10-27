@@ -1000,7 +1000,7 @@ refs/heads/exec-rmbp-pdf4stripkeys   ae8272e02 cut 2026-10-27 (wave36 batch 8)
 refs/heads/exec-rmbp-aacenctnsmulti   ae8272e02 cut 2026-10-27 (wave36 batch 8)
 refs/heads/exec-rmbp-zenbooklanetyped   d7ad4440e cut 2026-10-27 (wave36 batch 9)
 refs/heads/exec-rmbp-mt7925s4   d7ad4440e cut 2026-10-27 (wave36 batch 9)
-refs/heads/exec-rmbp-zenbooktouchpadreports   d7ad4440e cut 2026-10-27 (wave36 batch 9)
+refs/heads/exec-rmbp-zenbooktouchpadreports   6434f6cd4 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-dmaallocone   d7ad4440e cut 2026-10-27 (wave36 batch 9)
 refs/heads/exec-rmbp-hidbootleds   8ba82e813 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-saverecent   d7ad4440e cut 2026-10-27 (wave36 batch 9)

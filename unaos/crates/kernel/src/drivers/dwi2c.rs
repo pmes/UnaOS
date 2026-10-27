@@ -23,8 +23,10 @@
 //! Runs once at `pci.rs init` behind `hw::gate(Probe::I2c)` (the Zenbook only: the fixed map is AMD's); every
 //! controller is left AS FOUND (CON, TAR, SS counts, INTR_MASK, ENABLE saved and restored) and a busy one is refused
 //! untouched. Every wait is `drivers::block::wait::bounded` (TSC, right with interrupts masked inside pci::init).
-//! The touchpad's reports are owed (ZENBOOK-TOUCHPAD-REPORTS). `tests dwi2c` runs the register-sequence machine
-//! against a fake controller: `:: DWI2C: proto=ok cases=8/8 -> PASS ::`.
+//! The touchpad's reports: the `touchpad` module at the tail (ZENBOOKTOUCHPADREPORTS, zenbook-ledger Z18; `ehcihid`
+//! images, pumped by the one HID pass) — the controller that answered is HELD open for it only when armed. `tests dwi2c`
+//! runs the register-sequence machine against a fake controller: `:: DWI2C: proto=ok cases=8/8 -> PASS ::`;
+//! `tests dwi2ctp` the touchpad over the same fake: `:: DWI2C-TP: rdesc=ok reports=2 events=2 -> PASS ::`.
 
 use core::cell::RefCell;
 
@@ -132,6 +134,10 @@ struct HidDesc {
     rdesc: u16,
     input: u16,
     maxin: u16,
+    /// ZENBOOKTOUCHPADREPORTS (Z18): wReportDescRegister, wCommandRegister, wDataRegister.
+    rdreg: u16,
+    cmd: u16,
+    data: u16,
 }
 
 /// One bus scan.
@@ -153,6 +159,8 @@ struct Outcome {
     nacks: u32,
     desc: Option<HidDesc>,
     restored: bool,
+    /// ZENBOOKTOUCHPADREPORTS (Z18): the address the descriptor answered at.
+    hid_addr: u8,
 }
 
 fn identify<I: Mmio>(io: &I) -> Ident {
@@ -221,7 +229,7 @@ fn xfer<I: Mmio>(io: &I, addr: u8, wr: &[u8], rd: &mut [u8], win: usize) -> Resu
     let mut sent = 0usize;
     let mut got = 0usize;
     let start = crate::arch::now_cycles();
-    let budget = crate::drivers::block::wait::cycles_ms(XFER_MS);
+    let budget = crate::drivers::block::wait::cycles_ms(XFER_MS + total as u64 / 8); // ZENBOOKTOUCHPADREPORTS (Z18): a report descriptor of ~700 B at 100 kHz is ~65 ms; a 1-byte scan read keeps 20 ms
     loop {
         let raw = io.rd(IC_RAW_INTR_STAT);
         if raw & INTR_TX_ABRT != 0 {
@@ -288,7 +296,7 @@ fn parse_desc(d: &[u8; 30]) -> Option<HidDesc> {
     if w(0) != 30 || w(2) != 0x0100 {
         return None;
     }
-    Some(HidDesc { rdesc: w(4), input: w(8), maxin: w(10), vid: w(20), pid: w(22), ver: w(24) })
+    Some(HidDesc { rdesc: w(4), input: w(8), maxin: w(10), vid: w(20), pid: w(22), ver: w(24), rdreg: w(6), cmd: w(16), data: w(18) })
 }
 
 /// The descriptor register written (little-endian), then 30 bytes read after a RESTART.
@@ -384,6 +392,7 @@ fn run<I: Mmio>(i: usize, base: u64, io: &I, say: bool) -> Outcome {
             Some(&(addr, reg)) => match hid_desc(io, addr, reg, win) {
                 Ok(Some(d)) => {
                     o.desc = Some(d);
+                    o.hid_addr = addr;
                     if say {
                         serial_println!(
                             "[dwi2c] ctrl={} hid addr={:#04x} reg={:#06x} vid={:#06x} pid={:#06x} ver={:#06x} rdesc={} input={:#06x} maxin={} -> desc",
@@ -427,7 +436,14 @@ pub fn probe() {
             continue;
         }
         let io = Real { base };
-        let _ = run(i, base, &io, true);
+        let o = run(i, base, &io, true);
+        #[cfg(feature = "ehcihid")]
+        {
+            if let (true, Some(d)) = (o.found, o.desc) {
+                touchpad::attach(i, base, &io, o.hid_addr, d);
+            }
+        }
+        let _ = &o;
     }
 }
 
@@ -455,6 +471,15 @@ struct FakeState {
     wn: usize,
     rpos: usize,
     writes: u32,
+    /// ZENBOOKTOUCHPADREPORTS (Z18): the report descriptor served at `rdreg`, the input reports a PLAIN read serves in
+    /// turn, and the command writes (a STOP after more than 2 written bytes) counted.
+    rdesc: [u8; 160],
+    rdesc_n: usize,
+    rdreg: u16,
+    input: [[u8; 32]; 2],
+    in_n: usize,
+    in_i: usize,
+    cmds: u32,
 }
 
 struct Fake {
@@ -497,6 +522,13 @@ impl Fake {
                 wn: 0,
                 rpos: 0,
                 writes: 0,
+                rdesc: [0; 160],
+                rdesc_n: 0,
+                rdreg: 0,
+                input: [[0; 32]; 2],
+                in_n: 0,
+                in_i: 0,
+                cmds: 0,
             }),
         }
     }
@@ -577,17 +609,34 @@ impl Mmio for Fake {
                 }
                 if v & CMD_READ != 0 {
                     let reg = u16::from_le_bytes(st.wbuf);
-                    let b = if st.wn == 2 && reg == 0x0001 { st.desc.get(st.rpos).copied().unwrap_or(0xff) } else { 0xff };
+                    let b = if st.wn == 2 && reg == 0x0001 {
+                        st.desc.get(st.rpos).copied().unwrap_or(0xff)
+                    } else if st.wn == 2 && st.rdesc_n > 0 && reg == st.rdreg {
+                        if st.rpos < st.rdesc_n { st.rdesc[st.rpos] } else { 0xff }
+                    } else if st.wn == 0 && st.in_i < st.in_n {
+                        st.input[st.in_i].get(st.rpos).copied().unwrap_or(0)
+                    } else if st.wn == 0 && st.in_n > 0 {
+                        0
+                    } else {
+                        0xff
+                    };
                     st.rpos += 1;
                     Fake::push_rx(&mut st, b);
-                } else if st.wn < 2 {
-                    let at = st.wn;
-                    st.wbuf[at] = v as u8;
+                } else {
+                    if st.wn < 2 {
+                        let at = st.wn;
+                        st.wbuf[at] = v as u8;
+                    }
                     st.wn += 1;
                 }
                 if v & CMD_STOP != 0 {
                     st.raw |= INTR_STOP_DET;
                     st.in_txn = false;
+                    if st.wn > 2 {
+                        st.cmds += 1;
+                    } else if st.wn == 0 && v & CMD_READ != 0 && st.in_i < st.in_n {
+                        st.in_i += 1;
+                    }
                 }
             }
             _ => {}
@@ -692,5 +741,630 @@ pub fn selftest() {
     match first {
         None => serial_println!(":: DWI2C: proto=ok cases={}/{} -> PASS ::", ok, cases.len()),
         Some(name) => serial_println!(":: DWI2C: proto=fail case={} -> FAIL ::", name),
+    }
+}
+
+/// ZENBOOKTOUCHPADREPORTS (zenbook-ledger Z18) — the touchpad's I2C-HID reports into the pointer route. File tail.
+#[cfg(feature = "ehcihid")]
+pub mod touchpad {
+    //! CHARTER: Kernel — driver (the I2C-HID touchpad's bring-up and its Precision Touchpad reports into
+    //! `pal::push_pointer_report`, ZENBOOKTOUCHPADREPORTS zenbook-ledger Z18; no CODEX §2 handler owns a platform I2C bus).
+    //!
+    //! HID over I2C 1.0 at the address Z14's census found answering a guess-table descriptor register: SET_POWER(ON) and
+    //! RESET over wCommandRegister, the report descriptor read once from wReportDescRegister, then — when the
+    //! descriptor declares the Digitizer Input Mode feature (0x0D:0x52) — ONE SET_REPORT(Feature, Input Mode = 3)
+    //! through wDataRegister, without which a Precision Touchpad stays in mouse mode and never sends its touch report.
+    //! The GPIO interrupt (AMDI0030) is AML-only, so the input register is POLLED: one bounded plain read of
+    //! wMaxInputLength bytes per [`POLL_MS`], from the one HID pass (`ehci::service_ehci_hid`), under `EHCI_HID` then
+    //! [`TP`] (`try_lock`, never blocking the pass). The parse is a MINIMAL PTP map ([`parse`]): the shared
+    //! `ehci::parse_report_descriptor` keeps one report id and the last X it sees, so it cannot hold a Finger
+    //! collection; the bit reads and the curve are EHCI's (`ehci::lend`), not copies. The first finger's absolute
+    //! position becomes a relative delta by the Wellspring lane's rules (a lift, a contact id or contact count change,
+    //! or a 250 ms silence re-baselines; the curve is `finemotion::step2`, the raw step pre-scaled to that lane's span);
+    //! the Button-page bit is the click (the pad's physical press, as bcm5974's `ibt`); a touch is never a press.
+
+    use super::{HidDesc, Mmio};
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// The longest report descriptor read.
+    const RDESC_MAX: usize = 1024;
+    /// The longest input report read.
+    const MAXIN_CAP: usize = 64;
+    /// One input-register poll per this many milliseconds (~3 ms of bus at 100 kHz for a 32-byte report).
+    const POLL_MS: u64 = 8;
+    /// After RESET, before the descriptor read (no interrupt to wait on).
+    const SETTLE_MS: u64 = 100;
+    const OP_RESET: u8 = 0x01;
+    const OP_SET_REPORT: u8 = 0x03;
+    const OP_SET_POWER: u8 = 0x08;
+    const POWER_ON: u8 = 0x00;
+    const TYPE_FEATURE: u8 = 0x03;
+    /// Full usages (page << 16 | id).
+    const U_TOUCH_PAD: u32 = 0x000d_0005;
+    const U_FINGER: u32 = 0x000d_0022;
+    const U_TIP: u32 = 0x000d_0042;
+    const U_CONTACT_ID: u32 = 0x000d_0051;
+    const U_INPUT_MODE: u32 = 0x000d_0052;
+    const U_CONTACT_COUNT: u32 = 0x000d_0054;
+    const U_X: u32 = 0x0001_0030;
+    const U_Y: u32 = 0x0001_0031;
+    const U_BUTTON1: u32 = 0x0009_0001;
+
+    /// One report field: bit offset in the report body (after the id byte), size in bits (0 = absent), logical max.
+    #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+    struct Field {
+        off: u16,
+        size: u8,
+        max: u32,
+    }
+
+    /// The minimal Precision Touchpad map.
+    #[derive(Clone, Copy, Default, Debug)]
+    struct Ptp {
+        /// The touch report's id (0 = the descriptor declares none).
+        rid: u8,
+        tip: Field,
+        cid: Field,
+        x: Field,
+        y: Field,
+        count: Field,
+        button: Field,
+        /// Finger collections inside the Touch Pad application collection.
+        contacts: u8,
+        has_mode: bool,
+        mode_rid: u8,
+        mode: Field,
+        /// The Input Mode feature report's body length in bytes.
+        mode_len: u16,
+        /// A Touch Pad collection with the first finger's X, Y and Tip found.
+        ptp: bool,
+    }
+
+    /// The running bit offset of one report id (input or feature).
+    fn slot(t: &mut [(u8, u32); 8], n: &mut usize, rid: u8) -> usize {
+        if let Some(k) = t[..*n].iter().position(|e| e.0 == rid) {
+            return k;
+        }
+        if *n < t.len() {
+            t[*n] = (rid, 0);
+            *n += 1;
+            return *n - 1;
+        }
+        t.len() - 1
+    }
+
+    /// One walk of the report descriptor's short items (HID 1.11 §6.2.2) with a collection stack.
+    fn parse(d: &[u8]) -> Ptp {
+        let mut p = Ptp::default();
+        let (mut page, mut rsize, mut rcount, mut lmax, mut rid) = (0u32, 0u32, 0u32, 0u32, 0u8);
+        let mut usages = [0u32; 16];
+        let mut nu = 0usize;
+        let (mut umin, mut umax) = (0u32, 0u32);
+        let mut depth = 0usize;
+        let mut tp_depth = 0usize;
+        let mut finger = 0u8;
+        let mut finger_depth = 0usize;
+        let mut seen_tp = false;
+        let mut ins = [(0u8, 0u32); 8];
+        let mut nin = 0usize;
+        let mut fts = [(0u8, 0u32); 8];
+        let mut nft = 0usize;
+        let mut i = 0usize;
+        while i < d.len() {
+            let b = d[i];
+            if b == 0xfe {
+                break;
+            }
+            let size = match b & 3 {
+                3 => 4,
+                s => s as usize,
+            };
+            if i + 1 + size > d.len() {
+                break;
+            }
+            let mut data = 0u32;
+            for k in 0..size {
+                data |= (d[i + 1 + k] as u32) << (8 * k);
+            }
+            let full = if size == 4 { data } else { (page << 16) | (data & 0xffff) };
+            match b & 0xfc {
+                0x04 => page = data & 0xffff,
+                0x24 => lmax = data,
+                0x74 => rsize = data,
+                0x94 => rcount = data,
+                0x84 => rid = data as u8,
+                0x08 => {
+                    if nu < usages.len() {
+                        usages[nu] = full;
+                        nu += 1;
+                    }
+                }
+                0x18 => umin = full,
+                0x28 => umax = full,
+                0xa0 => {
+                    let u = if nu > 0 { usages[0] } else { 0 };
+                    depth += 1;
+                    if u == U_TOUCH_PAD && tp_depth == 0 {
+                        tp_depth = depth;
+                        seen_tp = true;
+                    }
+                    if u == U_FINGER && tp_depth != 0 {
+                        p.contacts = p.contacts.saturating_add(1);
+                        finger = p.contacts;
+                        finger_depth = depth;
+                    }
+                    nu = 0;
+                    umin = 0;
+                    umax = 0;
+                }
+                0xc0 => {
+                    if depth > 0 {
+                        if depth == finger_depth {
+                            finger = 0;
+                            finger_depth = 0;
+                        }
+                        if depth == tp_depth {
+                            tp_depth = 0;
+                        }
+                        depth -= 1;
+                    }
+                }
+                0x80 | 0xb0 => {
+                    let input = b & 0xfc == 0x80;
+                    let cnt = rcount.min(64);
+                    let at = if input { slot(&mut ins, &mut nin, rid) } else { slot(&mut fts, &mut nft, rid) };
+                    let base = if input { ins[at].1 } else { fts[at].1 };
+                    if data & 1 == 0 {
+                        for j in 0..cnt {
+                            let u = if (j as usize) < nu {
+                                usages[j as usize]
+                            } else if nu > 0 {
+                                usages[nu - 1]
+                            } else if umax >= umin && umin != 0 {
+                                umin.wrapping_add(j)
+                            } else {
+                                0
+                            };
+                            let f = Field { off: base.saturating_add(j.saturating_mul(rsize)).min(u16::MAX as u32) as u16, size: rsize.min(32) as u8, max: lmax };
+                            if input && tp_depth != 0 {
+                                match u {
+                                    U_TIP if finger == 1 => {
+                                        p.tip = f;
+                                        p.rid = rid;
+                                    }
+                                    U_CONTACT_ID if finger == 1 => p.cid = f,
+                                    U_X if finger == 1 => p.x = f,
+                                    U_Y if finger == 1 => p.y = f,
+                                    U_CONTACT_COUNT if p.count.size == 0 => p.count = f,
+                                    U_BUTTON1 if p.button.size == 0 => p.button = f,
+                                    _ => {}
+                                }
+                            } else if !input && u == U_INPUT_MODE && !p.has_mode {
+                                p.has_mode = true;
+                                p.mode_rid = rid;
+                                p.mode = f;
+                            }
+                        }
+                    }
+                    let next = base.saturating_add(rsize.min(256) * cnt);
+                    if input {
+                        ins[at].1 = next;
+                    } else {
+                        fts[at].1 = next;
+                    }
+                    nu = 0;
+                    umin = 0;
+                    umax = 0;
+                }
+                0x90 => {
+                    nu = 0;
+                    umin = 0;
+                    umax = 0;
+                }
+                _ => {}
+            }
+            i += 1 + size;
+        }
+        if p.has_mode {
+            if let Some(e) = fts[..nft].iter().find(|e| e.0 == p.mode_rid) {
+                p.mode_len = e.1.div_ceil(8).min(u16::MAX as u32) as u16;
+            }
+        }
+        p.ptp = seen_tp && p.x.size > 0 && p.y.size > 0 && p.tip.size > 0;
+        p
+    }
+
+    /// The first finger of one input packet (`[len lo, len hi, id, body]`); `None` = nothing pending or another report.
+    #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+    struct Contact {
+        x: i32,
+        y: i32,
+        tip: bool,
+        cid: u32,
+        count: u32,
+        buttons: u8,
+    }
+
+    fn contact(p: &Ptp, pkt: &[u8]) -> Option<Contact> {
+        if pkt.len() < 3 {
+            return None;
+        }
+        let len = u16::from_le_bytes([pkt[0], pkt[1]]) as usize;
+        if len <= 2 {
+            return None;
+        }
+        let rep = &pkt[2..len.min(pkt.len())];
+        let body = if p.rid != 0 {
+            if rep.first().copied() != Some(p.rid) {
+                return None;
+            }
+            &rep[1..]
+        } else {
+            rep
+        };
+        let rd = |f: Field| if f.size == 0 { 0 } else { crate::drivers::ehci::lend::bits(body, f.off, f.size) };
+        Some(Contact {
+            x: rd(p.x) as i32,
+            y: rd(p.y) as i32,
+            tip: rd(p.tip) != 0,
+            cid: rd(p.cid),
+            count: rd(p.count),
+            buttons: (rd(p.button) & 1) as u8,
+        })
+    }
+
+    /// The absolute-to-relative state (the Wellspring lane's `mt_step` rules).
+    #[derive(Default)]
+    struct Track {
+        prev: Option<(i32, i32)>,
+        cid: u32,
+        count: u32,
+        ms: u64,
+        res: (i32, i32),
+        buttons: u8,
+    }
+
+    /// What one packet comes to: the contact, the whole-pixel motion, a button edge.
+    struct Out {
+        c: Option<Contact>,
+        motion: Option<(i32, i32)>,
+        edge: bool,
+        buttons: u8,
+    }
+
+    impl Out {
+        /// The pal events this packet pushes.
+        fn events(&self) -> u32 {
+            self.motion.is_some() as u32 + self.edge as u32
+        }
+    }
+
+    /// One packet, PURE but for `t`: a lift, a contact id or count change, or a silence of `lend::JUMP_GAP_MS`
+    /// re-baselines; else the first finger's step through the lent curve. HID y is already screen-down.
+    fn step(p: &Ptp, t: &mut Track, pkt: &[u8], now_ms: u64) -> Out {
+        let mut o = Out { c: None, motion: None, edge: false, buttons: t.buttons };
+        let Some(c) = contact(p, pkt) else { return o };
+        o.c = Some(c);
+        if !c.tip {
+            t.prev = None;
+            t.res = (0, 0);
+        } else {
+            let gap = now_ms.wrapping_sub(t.ms);
+            let rebase = c.cid != t.cid || c.count != t.count || gap >= crate::drivers::ehci::lend::JUMP_GAP_MS;
+            match t.prev {
+                Some((px, py)) if !rebase => {
+                    let span = (p.x.max.min(i32::MAX as u32) as i32).max(1);
+                    let (dx, dy) = crate::drivers::ehci::lend::curve((c.x - px, c.y - py), span, &mut t.res);
+                    if dx != 0 || dy != 0 {
+                        o.motion = Some((dx, dy));
+                    }
+                }
+                _ => t.res = (0, 0),
+            }
+            t.prev = Some((c.x, c.y));
+            t.cid = c.cid;
+            t.count = c.count;
+            t.ms = now_ms;
+        }
+        if c.buttons != t.buttons {
+            o.edge = true;
+            t.buttons = c.buttons;
+        }
+        o.buttons = t.buttons;
+        o
+    }
+
+    /// One command over wCommandRegister: `[reg lo, reg hi, b0, opcode]`.
+    fn command<I: Mmio>(io: &I, addr: u8, d: &HidDesc, b0: u8, op: u8, win: usize) -> Result<(), super::Fail> {
+        let r = d.cmd.to_le_bytes();
+        super::xfer(io, addr, &[r[0], r[1], b0, op], &mut [0u8; 0], win)
+    }
+
+    /// SET_REPORT(Feature, Input Mode = 3): the command, then wDataRegister, the length (counting itself), the id,
+    /// the feature body with the mode field set and every other byte 0.
+    fn set_mode<I: Mmio>(io: &I, addr: u8, d: &HidDesc, p: &Ptp, win: usize) -> Result<(), super::Fail> {
+        let n = (p.mode_len as usize).clamp(1, 8);
+        let mut body = [0u8; 8];
+        let at = p.mode.off as usize;
+        if at / 8 < n {
+            body[at / 8] |= 3u8 << (at % 8);
+        }
+        let (c, dr) = (d.cmd.to_le_bytes(), d.data.to_le_bytes());
+        let mut w = [0u8; 24];
+        let mut k = 0usize;
+        let mut put = |b: u8| {
+            w[k] = b;
+            k += 1;
+        };
+        put(c[0]);
+        put(c[1]);
+        if p.mode_rid < 15 {
+            put((TYPE_FEATURE << 4) | p.mode_rid);
+            put(OP_SET_REPORT);
+        } else {
+            put((TYPE_FEATURE << 4) | 0x0f);
+            put(OP_SET_REPORT);
+            put(p.mode_rid);
+        }
+        put(dr[0]);
+        put(dr[1]);
+        let len = (2 + (p.mode_rid != 0) as usize + n) as u16;
+        put(len as u8);
+        put((len >> 8) as u8);
+        if p.mode_rid != 0 {
+            put(p.mode_rid);
+        }
+        for &b in &body[..n] {
+            put(b);
+        }
+        super::xfer(io, addr, &w[..k], &mut [0u8; 0], win)
+    }
+
+    /// What the bring-up came to (the wire line's fields); `why` = None means armed.
+    #[derive(Default)]
+    struct Bring {
+        power: bool,
+        reset_len: u16,
+        rdesc: u16,
+        mode: &'static str,
+        p: Ptp,
+        why: Option<&'static str>,
+    }
+
+    /// SET_POWER(ON), RESET, a settle, one drain read, the report descriptor, the PTP map, the Input Mode feature.
+    /// Generic over the register seam: the KAT drives this same fn.
+    fn bring_up<I: Mmio>(io: &I, addr: u8, d: &HidDesc, win: usize, settle_ms: u64, rbuf: &mut [u8; RDESC_MAX]) -> Bring {
+        let mut b = Bring { mode: "none", reset_len: 0xffff, rdesc: d.rdesc, ..Bring::default() };
+        if d.cmd == 0 || d.rdreg == 0 {
+            b.why = Some("no-registers");
+            return b;
+        }
+        if (d.maxin as usize) > MAXIN_CAP {
+            b.why = Some("maxin");
+            return b;
+        }
+        b.power = command(io, addr, d, POWER_ON, OP_SET_POWER, win).is_ok();
+        if !b.power {
+            b.why = Some("power");
+            return b;
+        }
+        if command(io, addr, d, 0x00, OP_RESET, win).is_err() {
+            b.why = Some("reset");
+            return b;
+        }
+        if settle_ms > 0 {
+            let _ = crate::drivers::block::wait::bounded(settle_ms, || false);
+        }
+        let n = (d.maxin as usize).clamp(2, MAXIN_CAP);
+        let mut drain = [0u8; MAXIN_CAP];
+        if super::xfer(io, addr, &[], &mut drain[..n], win).is_ok() {
+            b.reset_len = u16::from_le_bytes([drain[0], drain[1]]);
+        }
+        let len = d.rdesc as usize;
+        if len == 0 || len > RDESC_MAX {
+            b.why = Some("rdesc-len");
+            return b;
+        }
+        if super::xfer(io, addr, &d.rdreg.to_le_bytes(), &mut rbuf[..len], win).is_err() {
+            b.why = Some("rdesc-read");
+            return b;
+        }
+        b.p = parse(&rbuf[..len]);
+        if !b.p.ptp {
+            b.why = Some("not-ptp");
+            return b;
+        }
+        if b.p.has_mode {
+            if set_mode(io, addr, d, &b.p, win).is_ok() {
+                b.mode = "set";
+            } else {
+                b.mode = "fail";
+                b.why = Some("mode");
+            }
+        }
+        b
+    }
+
+    /// The held touchpad.
+    struct Tp {
+        base: u64,
+        addr: u8,
+        d: HidDesc,
+        win: usize,
+        p: Ptp,
+        t: Track,
+        last_ms: u64,
+        first: bool,
+        errs: u32,
+        reports: u32,
+    }
+
+    /// Written once by [`attach`] at pci init; read by [`pump`] with `try_lock` under `EHCI_HID` (order EHCI_HID -> TP).
+    static TP: crate::sync::Mutex<Option<Tp>> = crate::sync::Mutex::new(None);
+    static ARMED: AtomicBool = AtomicBool::new(false);
+
+    /// `probe`'s follow-on for a controller whose census found a descriptor: re-open it (Z14's save + configure),
+    /// bring the touchpad up; armed = the controller is HELD open for [`pump`], else restored as Z14 left it.
+    pub(super) fn attach(i: usize, base: u64, io: &super::Real, addr: u8, d: HidDesc) {
+        if ARMED.load(Ordering::Acquire) {
+            return;
+        }
+        let win = super::window(super::identify(io).param1);
+        let (saved, _) = match super::open(io) {
+            Ok(v) => v,
+            Err(f) => {
+                serial_println!("[dwi2c] ctrl={} hid addr={:#04x} -> NOT ARMED why=open step={} src={:#x}", i, addr, f.step, f.src);
+                return;
+            }
+        };
+        let mut rbuf = [0u8; RDESC_MAX];
+        let b = bring_up(io, addr, &d, win, SETTLE_MS, &mut rbuf);
+        let p = b.p;
+        serial_println!(
+            "[dwi2c] hid rdesc={} ptp={} contacts={} ctrl={} addr={:#04x} rid={} xmax={} ymax={} power={} reset={} mode={} -> {}{}",
+            b.rdesc, if p.ptp { "yes" } else { "no" }, p.contacts, i, addr, p.rid, p.x.max, p.y.max,
+            if b.power { "ok" } else { "fail" }, b.reset_len, b.mode,
+            if b.why.is_none() { "armed" } else { "NOT ARMED why=" }, b.why.unwrap_or("")
+        );
+        match b.why {
+            None => {
+                *TP.lock() = Some(Tp { base, addr, d, win, p, t: Track::default(), last_ms: 0, first: false, errs: 0, reports: 0 });
+                ARMED.store(true, Ordering::Release);
+                serial_println!("[dwi2c] ctrl={} held for touchpad", i);
+            }
+            Some(_) => {
+                let back = super::close(io, &saved);
+                if back {
+                    serial_println!("[dwi2c] ctrl={} restored en={}", i, saved.en & 1);
+                } else {
+                    serial_println!("[dwi2c] ctrl={} restore -> stuck step=disable", i);
+                }
+            }
+        }
+    }
+
+    /// The HID pass's touchpad step (`ehci::service_ehci_hid`, under `EHCI_HID`): at most one bounded input-register
+    /// read per [`POLL_MS`], each decoded packet into ONE `pal::push_pointer_report`.
+    pub fn pump() {
+        if !ARMED.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(mut g) = TP.try_lock() else { return };
+        let Some(tp) = g.as_mut() else { return };
+        let now = crate::arch::ms();
+        if now.wrapping_sub(tp.last_ms) < POLL_MS {
+            return;
+        }
+        tp.last_ms = now;
+        let io = super::Real { base: tp.base };
+        let n = (tp.d.maxin as usize).clamp(2, MAXIN_CAP);
+        let mut buf = [0u8; MAXIN_CAP];
+        if super::xfer(&io, tp.addr, &[], &mut buf[..n], tp.win).is_err() {
+            tp.errs = tp.errs.saturating_add(1);
+            return;
+        }
+        let o = step(&tp.p, &mut tp.t, &buf[..n], now);
+        let Some(c) = o.c else { return };
+        tp.reports = tp.reports.saturating_add(1);
+        if !tp.first {
+            tp.first = true;
+            serial_println!(
+                "[dwi2c] touchpad first-report x={} y={} contacts={} tip={} buttons={:#04x}",
+                c.x, c.y, c.count, c.tip as u8, c.buttons
+            );
+        }
+        crate::pal::push_pointer_report(
+            o.motion.map(|(x, y)| crate::pal::Event::Mouse { x, y }),
+            if o.edge { Some(crate::pal::Event::Button(o.buttons)) } else { None },
+        );
+    }
+
+    /// The KAT's Precision Touchpad descriptor: Touch Pad (rid 4) with two Finger collections (Confidence, Tip,
+    /// 6 pad bits, Contact ID 8, X 16 max 4095, Y 16 max 2047), Contact Count 8, Button 1, 7 pad bits, the Contact
+    /// Count Maximum feature (rid 5); Device Configuration with the Input Mode feature (rid 3).
+    const KAT_RDESC: &[u8] = &[
+        0x05, 0x0d, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x04, //
+        0x09, 0x22, 0xa1, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x09, 0x47, 0x81, 0x02, 0x09, 0x42,
+        0x81, 0x02, 0x95, 0x06, 0x81, 0x03, 0x75, 0x08, 0x95, 0x01, 0x25, 0x0f, 0x09, 0x51, 0x81, 0x02, 0x05, 0x01,
+        0x26, 0xff, 0x0f, 0x75, 0x10, 0x95, 0x01, 0x09, 0x30, 0x81, 0x02, 0x26, 0xff, 0x07, 0x09, 0x31, 0x81, 0x02,
+        0xc0, //
+        0x05, 0x0d, 0x09, 0x22, 0xa1, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x09, 0x47, 0x81, 0x02,
+        0x09, 0x42, 0x81, 0x02, 0x95, 0x06, 0x81, 0x03, 0x75, 0x08, 0x95, 0x01, 0x25, 0x0f, 0x09, 0x51, 0x81, 0x02,
+        0x05, 0x01, 0x26, 0xff, 0x0f, 0x75, 0x10, 0x95, 0x01, 0x09, 0x30, 0x81, 0x02, 0x26, 0xff, 0x07, 0x09, 0x31,
+        0x81, 0x02, 0xc0, //
+        0x05, 0x0d, 0x15, 0x00, 0x25, 0x05, 0x75, 0x08, 0x95, 0x01, 0x09, 0x54, 0x81, 0x02, //
+        0x05, 0x09, 0x09, 0x01, 0x25, 0x01, 0x75, 0x01, 0x95, 0x01, 0x81, 0x02, 0x95, 0x07, 0x81, 0x03, //
+        0x05, 0x0d, 0x85, 0x05, 0x09, 0x55, 0x25, 0x05, 0x75, 0x08, 0x95, 0x01, 0xb1, 0x02, 0xc0, //
+        0x05, 0x0d, 0x09, 0x0e, 0xa1, 0x01, 0x85, 0x03, 0x09, 0x22, 0xa1, 0x02, 0x09, 0x52, 0x15, 0x00, 0x25, 0x0a,
+        0x75, 0x08, 0x95, 0x01, 0xb1, 0x02, 0xc0, 0xc0,
+    ];
+
+    /// One canned touch report for [`KAT_RDESC`]: `[17, 0, 0x04, body x14]`.
+    fn kat_report(x: u16, y: u16, tip: bool, button: bool) -> [u8; 32] {
+        let mut r = [0u8; 32];
+        r[0] = 17;
+        r[2] = 0x04;
+        r[3] = 0x01 | if tip { 0x02 } else { 0x00 };
+        r[4] = 1;
+        r[5..7].copy_from_slice(&x.to_le_bytes());
+        r[7..9].copy_from_slice(&y.to_le_bytes());
+        r[15] = 1;
+        r[16] = button as u8;
+        r
+    }
+
+    /// `tests dwi2ctp`: the bring-up and two canned reports over the fake controller; the pal events are COUNTED from
+    /// `step`, never pushed into the live queue.
+    pub fn selftest() {
+        let f = super::Fake::new();
+        {
+            let mut st = f.s.borrow_mut();
+            let n = KAT_RDESC.len();
+            st.desc[4..6].copy_from_slice(&(n as u16).to_le_bytes());
+            st.desc[6..8].copy_from_slice(&0x0002u16.to_le_bytes());
+            st.desc[16..18].copy_from_slice(&0x0005u16.to_le_bytes());
+            st.desc[18..20].copy_from_slice(&0x0006u16.to_le_bytes());
+            st.rdesc[..n].copy_from_slice(KAT_RDESC);
+            st.rdesc_n = n;
+            st.rdreg = 0x0002;
+        }
+        let raw = f.s.borrow().desc;
+        let (mut rdesc_ok, mut reports, mut events, mut first_ok) = (false, 0u32, 0u32, false);
+        if let (Some(d), Ok((saved, _))) = (super::parse_desc(&raw), super::open(&f)) {
+            let win = super::window(super::identify(&f).param1);
+            let mut rbuf = [0u8; RDESC_MAX];
+            let b = bring_up(&f, 0x15, &d, win, 0, &mut rbuf);
+            let p = b.p;
+            let cmds = f.s.borrow().cmds;
+            rdesc_ok = b.why.is_none() && p.ptp && p.rid == 4 && p.contacts == 2 && p.x.max == 4095 && p.y.max == 2047 && p.has_mode && p.mode_rid == 3 && b.mode == "set" && cmds == 3;
+            {
+                let mut st = f.s.borrow_mut();
+                st.input[0] = kat_report(1000, 800, true, false);
+                st.input[1] = kat_report(1100, 850, true, true);
+                st.in_n = 2;
+                st.in_i = 0;
+            }
+            let mut t = Track::default();
+            for k in 0..2u64 {
+                let mut buf = [0u8; 32];
+                if super::xfer(&f, 0x15, &[], &mut buf, win).is_err() {
+                    break;
+                }
+                let o = step(&p, &mut t, &buf, k * POLL_MS);
+                if let Some(c) = o.c {
+                    reports += 1;
+                    if k == 0 {
+                        first_ok = c.x == 1000 && c.y == 800 && c.tip && c.count == 1 && c.buttons == 0 && o.events() == 0;
+                    }
+                }
+                events += o.events();
+            }
+            let _ = super::close(&f, &saved);
+        }
+        let pass = rdesc_ok && first_ok && reports == 2 && events == 2;
+        serial_println!(
+            ":: DWI2C-TP: rdesc={} reports={} events={} -> {} ::",
+            if rdesc_ok { "ok" } else { "fail" }, reports, events, if pass { "PASS" } else { "FAIL" }
+        );
     }
 }
