@@ -6992,7 +6992,7 @@ fn keyboot_unlock_leg() {
 
 // OVERLAYOCC (rmbp-ledger B827, BP-video-17) M3 — `tests overlays` (witness, x86 `wc`): every kernel overlay row is in the
 // compositor's occluder sets, read back live. Two legs through the overlays' pub doors only — the Launcher (`launcher::open`
-// / `close`) and the switcher (`appswitch::hid_edge` + `key_door(CycleWindow)` + `service`, Esc edge to close) — each finds
+// / `close`) and the switcher (`appswitch::fixture_hold` + `key_door(CycleWindow)` + `service`, Esc door to close) — each finds
 // its row by diffing `wm::overlay_rows` before/after the open, then reads it back with `toastflicker_leg`'s shape
 // (notify.rs): 48 samples 25 ms apart, every 8th re-queues the desktop rect over the box, each runs `wm::composite`.
 // Wire: `[overlays] leg=<n> win= box=<x>,<y>,<w>x<h> readback= leaks=` · `:: OVERLAYS: launcher=<ok|LEAK|skip(..)>
@@ -7015,7 +7015,7 @@ fn overlays_selftest() {
     let mut after = alloc::vec::Vec::new();
     let fresh = |b: &alloc::vec::Vec<wm::WinId>, a: &alloc::vec::Vec<wm::WinId>| a.iter().copied().find(|id| !b.contains(id));
     // Leg 1: the Launcher.
-    let (mut rb_all, mut lk_all) = (0usize, 0usize);
+    let (mut rb_all, mut lk_all) = (0usize, 0usize); let mut ext = OverlaysExt::default(); // OVERLAYARM (B847): the extras, bodies at the file tail
     let launcher_word: alloc::string::String = if launcher::is_open() {
         "skip(busy)".into()
     } else {
@@ -7026,7 +7026,7 @@ fn overlays_selftest() {
         let w = if launcher::is_open() { fresh(&before, &after) } else { None };
         let word = match w {
             Some(win) => {
-                let (rb, lk) = overlays_read("launcher", win);
+                let (rb, lk) = overlays_read("launcher", win); overlays_ext_leg(&mut ext, win);
                 rb_all += rb;
                 lk_all += lk;
                 overlays_word(rb, lk)
@@ -7043,32 +7043,32 @@ fn overlays_selftest() {
     } else if appswitch::is_active() {
         "skip(busy)".into()
     } else {
-        const ESC: [u8; 6] = [0x29, 0, 0, 0, 0, 0];
-        let none = [0u8; 6];
-        let cmd = crate::video::keymap::active().cmd_role;
+        // SWITCHFIXTURE (B847): Cmd is held through appswitch's own fixture door, never the HID byte — the live decoder
+        // writes that byte per report (`hid_edge`), and its Cmd-up edge would commit the strip mid-read. While held, the
+        // decoder's write defers to the fixture; the strip is cancelled by the Esc key door and Cmd released after it.
         wm::overlay_rows(&mut before);
-        appswitch::hid_edge(&none, &none, cmd);
+        appswitch::fixture_hold(true);
         appswitch::key_door(crate::pal::Event::Action(crate::video::keymap::Action::CycleWindow));
         appswitch::service();
         wm::overlay_rows(&mut after);
         let w = if appswitch::is_active() { fresh(&before, &after) } else { None };
         let word = match w {
             Some(win) => {
-                let (rb, lk) = overlays_read("appswitch", win);
+                let (rb, lk) = overlays_read("appswitch", win); overlays_ext_leg(&mut ext, win);
                 rb_all += rb;
-                lk_all += lk;
+                lk_all += lk; ext.cmd_held = Some(appswitch::is_active()); // still up after 48 samples: no live report committed it
                 overlays_word(rb, lk)
             }
             None => "skip(oneapp)".into(),
         };
-        appswitch::hid_edge(&ESC, &none, cmd); // the Esc edge: cancel (nothing activated)
+        appswitch::key_door(crate::pal::Event::Key(0x1B)); // the Esc key door: cancel (nothing activated)
         appswitch::service();
-        appswitch::hid_edge(&none, &ESC, 0); // Cmd up while inactive: no commit
+        appswitch::fixture_hold(false); // Cmd up through the same door, the strip closed: no commit
         word
     };
-    let leak = launcher_word == "LEAK" || switch_word == "LEAK";
-    let v = if leak { "FAIL" } else if rb_all == 0 { "SKIP" } else { "PASS" };
-    say(launcher_word.as_str(), switch_word.as_str(), rb_all, lk_all, v);
+    let leak = launcher_word == "LEAK" || switch_word == "LEAK"; overlays_arm_door(&mut ext);
+    let v = if leak || ext.bad() { "FAIL" } else if rb_all == 0 { "SKIP" } else { "PASS" };
+    overlays_say(launcher_word.as_str(), switch_word.as_str(), rb_all, lk_all, v, &ext);
 }
 
 /// `tests overlays`' leg word: `LEAK` (a point differed), `skip(unread)` (no point read), else `ok`.
@@ -7193,3 +7193,95 @@ fn textscale_selftest() {
 fn session_gen_reads_now() -> u32 { crate::fs::users::session_gen_reads() }
 #[cfg(not(feature = "login"))]
 fn session_gen_reads_now() -> u32 { 0 }
+
+// OVERLAYARM (rmbp-ledger B847, BP-video-17) — TAIL-APPENDED bodies of `overlays_selftest`'s line-neutral folds: the occluder
+// predicate's last readers and the doors OVERLAYOCC left owed. Per read leg: `bracket_src=` (notify's bracket reader,
+// `wm::overlay_live`, names the row) and `verify_rows=` (the read-back excuse set, `occluders_above`, admits it, through
+// `wm::verify_admits`); the switcher's `cmd_held=` (the strip survived the read under the fixture-held Cmd); `arm_door=` (the
+// Start flyout, whose open is the one `overlay_open` door on both desktop families, sits at its own origin).
+// Wire: `:: OVERLAYS: ... -> <V> :: arm_door=<ok|n/a|FAIL> bracket_src=<wm|MISS|n/a> verify_rows=<n> cmd_held=<ok|LOST|n/a>`.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+#[derive(Default)]
+struct OverlaysExt {
+    /// Legs read (a row found and sampled).
+    legs: usize,
+    /// Legs whose row `wm::overlay_live` named.
+    bracket: usize,
+    /// Legs whose row `occluders_above` admitted.
+    verify: usize,
+    /// The switcher still up after its read (`None`: the leg did not read).
+    cmd_held: Option<bool>,
+    /// `ok` / `n/a` / `FAIL` (empty until the Start leg ran).
+    arm_door: &'static str,
+}
+
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+impl OverlaysExt {
+    fn bracket_word(&self) -> &'static str {
+        if self.legs == 0 { "n/a" } else if self.bracket == self.legs { "wm" } else { "MISS" }
+    }
+    fn cmd_word(&self) -> &'static str {
+        match self.cmd_held { Some(true) => "ok", Some(false) => "LOST", None => "n/a" }
+    }
+    fn arm_word(&self) -> &'static str {
+        if self.arm_door.is_empty() { "n/a" } else { self.arm_door }
+    }
+    /// A FAIL extra: the bracket reader missed a row, the excuse set left one out, the strip was committed under the
+    /// fixture's Cmd, or the Start row was not at its origin.
+    fn bad(&self) -> bool {
+        self.bracket_word() == "MISS" || self.verify < self.legs || self.cmd_word() == "LOST" || self.arm_word() == "FAIL"
+    }
+}
+
+/// One read leg's extras, while its row `win` is still open.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+fn overlays_ext_leg(ext: &mut OverlaysExt, win: crate::video::wm::WinId) {
+    use crate::video::wm;
+    ext.legs += 1;
+    if wm::overlay_live(win) {
+        ext.bracket += 1;
+    }
+    if wm::verify_admits(win) {
+        ext.verify += 1;
+    }
+}
+
+/// The Start leg (OVERLAYENTRY-ARM): Start opened through `startmenu::open`, its fresh overlay row found by diffing
+/// `wm::overlay_rows`, which must sit at the flyout's `rect()` less the shadow band, `w + 2m` x `h + 2m`; then closed.
+/// `n/a` when a flyout is already open or the open is refused.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+fn overlays_arm_door(ext: &mut OverlaysExt) {
+    use crate::video::{softy::startmenu, wm};
+    if startmenu::open_kind() != 0 {
+        ext.arm_door = "n/a";
+        return;
+    }
+    let mut before = alloc::vec::Vec::new();
+    let mut after = alloc::vec::Vec::new();
+    wm::overlay_rows(&mut before);
+    if !startmenu::open(1, "overlays") {
+        ext.arm_door = "n/a";
+        return;
+    }
+    wm::overlay_rows(&mut after);
+    let m = startmenu::shadow_band();
+    let win = after.iter().copied().find(|id| !before.contains(id));
+    let placed = match (win, startmenu::rect()) {
+        (Some(id), Some((x, y, w, h))) => wm::info(id)
+            .map(|i| i.x + m == x && i.y + m == y && i.w == w + 2 * m && i.h == h + 2 * m)
+            .unwrap_or(false),
+        _ => false,
+    };
+    serial_println!("[overlays] leg=start win={} placed={} band={}", win.unwrap_or(wm::WIN_NONE), placed as u8, m);
+    let _ = startmenu::close("overlays");
+    ext.arm_door = if placed { "ok" } else { "FAIL" };
+}
+
+/// The summary line with the extras after its `::` (the early SKIP lines keep the bare shape).
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+fn overlays_say(l: &str, a: &str, rb: usize, lk: usize, v: &str, ext: &OverlaysExt) {
+    serial_println!(
+        ":: OVERLAYS: launcher={} appswitch={} readback={} leaks={} -> {} :: arm_door={} bracket_src={} verify_rows={} cmd_held={}",
+        l, a, rb, lk, v, ext.arm_word(), ext.bracket_word(), ext.verify, ext.cmd_word()
+    );
+}

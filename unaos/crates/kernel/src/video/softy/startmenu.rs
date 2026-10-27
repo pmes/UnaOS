@@ -727,17 +727,8 @@ pub fn open(kind: u8, by: &str) -> bool {
     let (addr, len) = (st.buf.as_ptr() as usize, st.buf.len() * 4);
     *ST.lock() = Some(st);
     let (wx, wy) = (x - m, y - m);
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    // OVERLAYENTRY-ARM (B847): the one overlay door on both desktop families — minted, placed at (wx, wy) and presented, one composite.
     let id = wm::overlay_open(addr, len, sw, sh, wx, wy);
-    // The Pi's desktop has no `overlay_open` (x86's Launcher door): the same chromeless row, placed by `move_to`.
-    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
-    let id = {
-        let id = wm::splash_open(addr, len, sw, sh);
-        if id != wm::WIN_NONE {
-            let _ = wm::move_to(id, wx, wy);
-        }
-        id
-    };
     if id == wm::WIN_NONE {
         *ST.lock() = None;
         serial_println!("[softy] {} open REFUSED reason=overlay by={}", word(kind), by);

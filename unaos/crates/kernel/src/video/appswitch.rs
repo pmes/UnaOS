@@ -361,7 +361,7 @@ pub fn key_door(ev: crate::pal::Event) -> bool {
 
 /// **The HID edge** — every keyboard report, from `xhci::hid_screenshot_chord_edge` (both decoders). Atomics only.
 pub fn hid_edge(cur_keys: &[u8; 6], prev_keys: &[u8; 6], modifiers: u8) {
-    let held = modifiers & super::keymap::active().cmd_role != 0;
+    let held = modifiers & super::keymap::active().cmd_role != 0 || FIXTURE_HELD.load(Ordering::Acquire); // SWITCHFIXTURE (B847): the decoder's per-report write defers to a fixture-held Cmd
     let was = CMD_PREV.swap(held, Ordering::AcqRel);
     if !is_active() {
         return;
@@ -458,4 +458,13 @@ pub fn ensure_tests() {
     if !DONE.swap(true, Ordering::AcqRel) {
         crate::tests::register("appswitch", selftest);
     }
+}
+
+/// SWITCHFIXTURE (rmbp-ledger B847) — TAIL-APPENDED: the fixture's Cmd door. `on` holds Cmd through [`FIXTURE_HELD`] (read by
+/// `cmd_held` and by [`hid_edge`], so a live HID report with Cmd up does not latch the commit while the fixture holds it);
+/// `false` lets the operator's byte rule again. Release only after the switcher is closed (an active strip would commit on
+/// the next report's Cmd-up edge).
+#[cfg(feature = "witness")]
+pub fn fixture_hold(on: bool) {
+    FIXTURE_HELD.store(on, Ordering::Release);
 }

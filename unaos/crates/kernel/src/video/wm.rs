@@ -3900,7 +3900,7 @@ fn occluders_above(z: u32, id: u32) -> OccSnap {
     };
     let mut snap = pre;
     for r in t.rows.iter() {
-        if !r.used || r.compat {
+        if !r.used || (r.compat && !verify_overlay(r)) {
             continue;
         }
         if (r.z, r.id) <= (z, id) {
@@ -29582,7 +29582,7 @@ pub fn retitle(id: WinId, name: &[u8]) {
 /// SHORTCUTS / OVERLAYENTRY (B827): the overlays' row — [`chromeless_open`]'s chromeless compat row at `(x, y)`, minted,
 /// placed and presented under one table hold and composited ONCE there (never first at the panel origin). Same contract:
 /// `surf` is a `w * h * 4` xRGB buffer that must outlive the row; pin with [`set_modal_top`], close with [`close`].
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub fn overlay_open(surf: usize, surf_len: usize, w: usize, h: usize, x: usize, y: usize) -> WinId {
     // OVERLAYENTRY (rmbp-ledger B827, BP-video-17): this door used to call `splash_open` (a composite with the row
     // presented at (0,0)) and then move it and composite again, so every overlay painted once at the panel origin
@@ -31989,4 +31989,56 @@ pub fn surface_pixel(id: WinId, sx: usize, sy: usize) -> Option<u32> {
     // row is held live by the table hold, and `off + 4 <= surf_len` was checked above (`verify_reference`'s source shape).
     let p = (r.surf as *const u8).wrapping_add(off) as *const u32;
     Some(unsafe { core::ptr::read_unaligned(p) })
+}
+
+// OVERLAYARM (rmbp-ledger B847, BP-video-17) — TAIL-APPENDED so no line above moves: the occluder predicate's last readers.
+// `occluders_above` (the WC-D/WC-G read-back excuse set) asks `verify_overlay` on its existing line; notify's
+// `[notify] toast present bracket=` asks `overlay_live`; `tests overlays` asks `verify_admits`. One predicate: `overlay_row`.
+
+/// VERIFYOCC: `occluders_above`'s question — is compat row `r` a live overlay (so it is excused above a window under
+/// read-back)? `overlay_row` on the desktop family; `occluders_above` is plain-`witness` and compiles where `overlay_row`
+/// does not, so the twin below answers `false` there (the set is then exactly the old non-compat one). Takes no lock.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+#[cfg(feature = "witness")]
+#[inline(always)]
+fn verify_overlay(r: &Window) -> bool {
+    overlay_row(r)
+}
+#[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+#[cfg(feature = "witness")]
+#[inline(always)]
+fn verify_overlay(_r: &Window) -> bool {
+    false
+}
+
+/// TOASTBRACKET: is window `id` a live overlay row by the occluder sets' own predicate ([`overlay_row`])? One table
+/// hold. notify's bracket calls it under notify's `ST` (the ST -> TABLE order `show_now`'s `open_row`/`restack` already take).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn overlay_live(id: WinId) -> bool {
+    let t = table();
+    row(&t, id).map(|r| r.used && overlay_row(r)).unwrap_or(false)
+}
+
+/// `tests overlays` (fixture only): does `occluders_above` (the read-back excuse set) admit overlay row `id`? Asks the
+/// production snapshot with no table held (`occluders_above(0, 0)`: every row above the bottom), then reads the row's
+/// `outer_box` under one table hold. Retries (at most 4) only when the snapshot was the contention pardon box.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+pub fn verify_admits(id: WinId) -> bool {
+    for _ in 0..4 {
+        let snap = occluders_above(0, 0);
+        let b = {
+            let t = table();
+            match row(&t, id) {
+                Some(r) if r.used => outer_box(r),
+                _ => return false,
+            }
+        };
+        if snap.boxes.iter().any(|&x| x == b) {
+            return true;
+        }
+        if !(snap.n == 1 && snap.boxes.first() == Some(&(0, 0, usize::MAX, usize::MAX))) {
+            return false;
+        }
+    }
+    false
 }
