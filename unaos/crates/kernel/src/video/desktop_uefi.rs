@@ -734,7 +734,7 @@ pub fn desktop_app_service() {
     // It self-throttles to `status::POLL_MS` (10 s) and costs one clock read and one relaxed load on
     // the ~999 passes in between. The FIRST pass finds `LAST_POLL_MS == 0` and sweeps immediately,
     // so the item is resolved before the bar reaches the glass rather than ten seconds after.
-    super::status::poll(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::brightkeys::service(); // BRIGHTKEYS — applies a pending backlight step (gmux port I/O belongs on this pass, not in the decoder). ⚠ SAME-LINE fold.
+    super::status::poll(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::brightkeys::service(); crate::drivers::ec::qevent_service(); // ZENBOOKECQEVENTS (zenbook-ledger Z30): the EC `_Qxx` drain, self-throttled to the battery sweep's 10 s, silent off `hw::gate(Probe::Ec)` (drivers/ec.rs tail); LINE-NEUTRAL, code before the first `//`. BRIGHTKEYS — applies a pending backlight step (gmux port I/O belongs on this pass, not in the decoder). ⚠ SAME-LINE fold.
     super::status::poll(); super::status::tray_publish(); super::powerui::lowbat_service(); #[cfg(feature = "wc")] super::dock::lp_service(crate::arch::ms()); // DOCKRUN — 600 ms hold on a running dock tile opens its menu.
 
     // Not armed = the activation never completed. Cheapest test first, and it is the one that is
