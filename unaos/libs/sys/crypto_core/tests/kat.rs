@@ -61,3 +61,8 @@ fn m6_rsa_verify() {
 fn m7_sha3_mlkem() {
     run(&["sha3/", "mlkem/"]);
 }
+
+#[test]
+fn m8_rsn_primitives() {
+    run(&["prf80211/", "ccm/", "keywrap/"]);
+}

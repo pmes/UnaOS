@@ -24,6 +24,9 @@
 //! | [`chacha20`], [`poly1305`], [`chacha20poly1305`] | ChaCha20, Poly1305, the AEAD | RFC 8439 |
 //! | [`aes`], [`gcm`] | AES-128/192/256 (bitsliced; forward and inverse cipher), GCM/GMAC | FIPS 197, SP 800-38D |
 //! | [`xts`] | XTS-AES-128/256 (ciphertext stealing; whole-block slices of a data unit) | IEEE Std 1619-2007, SP 800-38E |
+//! | [`prf80211`] | the 802.11 PRF-n (HMAC-SHA-1, counter octet) — the RSN key hierarchy's PRF | IEEE Std 802.11-2020 §12.7.1.2 |
+//! | [`ccm`] | AES-CCM (generic M and L; 802.11 CCMP is M=8, L=2) | RFC 3610, SP 800-38C |
+//! | [`keywrap`] | AES Key Wrap (default IV, unwrap integrity check) | RFC 3394 |
 //! | [`x25519`] | X25519 | RFC 7748 |
 //! | [`ed25519`] | Ed25519 | RFC 8032 |
 //! | [`p256`] | P-256 ECDH + ECDSA | SP 800-186, FIPS 186-5, RFC 6979, SEC 1 |
@@ -68,6 +71,9 @@ pub mod chacha20poly1305;
 pub mod aes;
 pub mod gcm;
 pub mod xts; // XTS (rmbp-ledger B689): IEEE 1619 XTS-AES over `aes::Aes` — the UnaFS volume cipher
+pub mod prf80211; // WPA2CRYPTO (rmbp-ledger B882): the IEEE 802.11 PRF-n over HMAC-SHA-1
+pub mod ccm; // WPA2CRYPTO (rmbp-ledger B882): AES-CCM, RFC 3610 / SP 800-38C (802.11 CCMP: M=8, L=2)
+pub mod keywrap; // WPA2CRYPTO (rmbp-ledger B882): AES Key Wrap, RFC 3394
 mod field25519;
 pub mod x25519;
 pub mod ed25519;
