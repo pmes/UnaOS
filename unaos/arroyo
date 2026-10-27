@@ -25,6 +25,9 @@
 #                          Knob-off byte-identity: build the knob-OFF loadable image at the baseline
 #                          and at this tree IN ONE DIRECTORY and compare them, with an armed control
 #                          probe. Exit 0 identical / 1 moved / 2 no verdict. EXECUTOR-BRIEF §5.
+#   ./arroyo knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]
+#                          The same check for an option_env! knob (UNAOS_PPI, UNAOS_FBW/FBH): both kernels
+#                          AND both UEFI loaders built with the knob UNSET, SET and EMPTY. See THE ENV FORM.
 #   ./arroyo clean         Purge all build artifacts
 
 set -e
@@ -13895,6 +13898,24 @@ battery() {
 #      named, build failure, a control that did not fire, a scored build that compiled something
 #      other than the kernel crate (or nothing), or a user_blob that moved between the two scored
 #      builds. A 2 is never a pass.
+#
+# THE ENV FORM (`./arroyo knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]`, PANELKNOB2 rmbp-ledger B867). A
+# cargo feature is not the only knob: `UNAOS_PPI` (video/dpi.rs `mod panelknob`) and `UNAOS_FBW`/`UNAOS_FBH`
+# (crates/bootloader `mod panelknob`, arch/aarch64/mailbox.rs) are `option_env!` reads, so no feature set names
+# them and the form above has nothing to remove. THE RULE for such a knob: the images built with it UNSET equal
+# the baseline's (the classic claim), an EMPTY value (`NAME=`) builds the same bytes as UNSET (every parser here
+# folds `Some("")` to off, and arroyo's own `[ -n "${UNAOS_X:-}" ]` reads empty as unset), and SET moves at least
+# one image (the control — a knob that moves nothing is misspelled or dead, and gets no verdict). Each NAME must
+# be read by an `option_env!("NAME")` under crates/kernel/src or crates/bootloader/src, the two crates this verb
+# builds (the env form's "declared" check), and is unset in this process before the first build. FOUR phases —
+# [1/4] baseline UNSET and [2/4] tree UNSET (scored, warm-first exactly as above), [3/4] tree SET (control),
+# [4/4] tree EMPTY — and each builds FOUR artifacts: the two kernel loadable images and the x86_64-unknown-uefi
+# and aarch64-unknown-uefi `bootloader.efi` (the loader reads the panel knobs; GATE-BOOTLOADER's command, with
+# $BOOTLOADER_FEATURES, in the same throwaway tree and target dir). A PE carries a link TimeDateStamp and a
+# CheckSum that say nothing about the code, so `_knoboff_pe_norm` zeroes those 8 bytes in the COMPARED COPY
+# (COFF header +4 = e_lfanew+8; optional header +64 = e_lfanew+88) — the PE analogue of objcopy-ing the ELF.
+# COST: 16 compiles a run (4 per phase; a cold key adds the warm-up pass), so every phase prints its wall time.
+# Exit status as above; an EMPTY that differs from UNSET is a 1 naming the artifact.
 _knoboff_arm_csv() {
     local _save="$KERNEL_FEATURES" _out
     KERNEL_FEATURES="${1:+--features $1}"
@@ -13915,26 +13936,48 @@ _knoboff_arm_csv() {
 # run log, which keeps the existing `tail -20 "$LOG"` diagnostics working unchanged.
 _knoboff_flat() {
     local _tree="$1" _tgt="$2" _arch="$3" _feats="$4" _out="$5" _log="$6" _census="${7:-}"
-    local _tspec _elf _TOOLBIN _rc=0
+    local _tspec _elf _TOOLBIN _rc=0 _crate=kernel _uefi=0
     _TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     case "$_arch" in
         x86) _tspec="../../x86_64-unaos.json"; _elf="$_tgt/x86_64-unaos/release/unaos-kernel" ;;
         arm) _tspec="../../aarch64-unaos.json"; _elf="$_tgt/aarch64-unaos/release/unaos-kernel" ;;
+        # THE ENV FORM's loaders (B867): GATE-BOOTLOADER's / prepare_aarch64's command, in the same tree and target dir.
+        uefi-x86) _tspec="x86_64-unknown-uefi";  _elf="$_tgt/x86_64-unknown-uefi/release/bootloader.efi";  _crate=bootloader; _uefi=1 ;;
+        uefi-arm) _tspec="aarch64-unknown-uefi"; _elf="$_tgt/aarch64-unknown-uefi/release/bootloader.efi"; _crate=bootloader; _uefi=1 ;;
         *)   echo "knoboff: bad arch $_arch" >&2; return 2 ;;
     esac
     local _fargs=""; [ -n "$_feats" ] && _fargs="--features $_feats"
+    local _zflags="$NIGHTLY_FLAGS"
+    if [ "$_uefi" -eq 1 ]; then _zflags="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem"; fi
     local _step="${_log}.step"
     : > "$_step"
-    ( cd "$_tree/unaos/crates/kernel" \
+    ( cd "$_tree/unaos/crates/$_crate" \
       && CARGO_TARGET_DIR="$_tgt" cargo +nightly build --release \
-         --target "$_tspec" $NIGHTLY_FLAGS $_fargs ) >"$_step" 2>&1 || _rc=1
+         --target "$_tspec" $_zflags $_fargs ) >"$_step" 2>&1 || _rc=1
     if [ -n "$_census" ]; then
         awk '$1 == "Compiling" { print $2 }' "$_step" | sort -u | paste -sd, - > "$_census"
     fi
     cat "$_step" >> "$_log"; rm -f "$_step"
     [ $_rc -eq 0 ] || return 1
     [ -f "$_elf" ] || return 1
+    if [ "$_uefi" -eq 1 ]; then
+        cp -f "$_elf" "$_out" >>"$_log" 2>&1 || return 1
+        _knoboff_pe_norm "$_out" || { echo "knoboff: $_out is not a PE image" >>"$_log"; return 1; }
+        return 0
+    fi
     "$_TOOLBIN/llvm-objcopy" -O binary "$_elf" "$_out" >>"$_log" 2>&1 || return 1
+    return 0
+}
+
+# THE ENV FORM (B867): zero a PE image's COFF TimeDateStamp (e_lfanew+8) and optional-header CheckSum
+# (e_lfanew+88) in place — the copy knoboff compares, never the build's own .efi. 1 = not a PE.
+_knoboff_pe_norm() {
+    local _f="$1" _pe
+    _pe="$(od -An -tu4 -j60 -N4 "$_f" 2>/dev/null | tr -d ' \n')"
+    case "$_pe" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(dd if="$_f" bs=1 skip="$_pe" count=2 2>/dev/null)" = "PE" ] || return 1
+    printf '\0\0\0\0' | dd of="$_f" bs=1 seek=$((_pe + 8)) conv=notrunc 2>/dev/null || return 1
+    printf '\0\0\0\0' | dd of="$_f" bs=1 seek=$((_pe + 88)) conv=notrunc 2>/dev/null || return 1
     return 0
 }
 
@@ -13960,7 +14003,7 @@ _knoboff_census_empty() { [ -z "$(tr -d '[:space:]' < "$1" 2>/dev/null)" ]; }
 _knoboff_census_foreign() {
     local _f
     for _f in "$@"; do cat "$_f" 2>/dev/null || true; echo; done \
-        | tr ',' '\n' | sed '/^$/d' | { grep -vx 'unaos-kernel' || true; } | sort -u | paste -sd, -
+        | tr ',' '\n' | sed '/^$/d' | { grep -vxE 'unaos-kernel|bootloader' || true; } | sort -u | paste -sd, -
 }
 
 # FORCE THE SCORED KERNEL COMPILE, so that "this run measured it" is true.
@@ -13976,6 +14019,7 @@ _knoboff_census_foreign() {
 # than a claim about the cache.
 _knoboff_touch_kernel() {
     touch "$1/unaos/crates/kernel/src/main.rs" "$1/unaos/crates/kernel/src/lib.rs" 2>/dev/null || true
+    touch "$1/unaos/crates/bootloader/src/main.rs" 2>/dev/null || true   # THE ENV FORM's scored loader compile (B867)
 }
 
 # sha256 of the `include_bytes!`d EL0 payload, or "absent". See the USER_BLOB paragraph in the header.
@@ -14002,27 +14046,53 @@ _knoboff_blob_id() {
 # $9 census-arm.  Sets _kb_rc_x / _kb_rc_a (0 = built).
 _knoboff_scored_pair() {
     local _lbl="$1" _tree="$2" _tgt="$3" _fx="$4" _fa="$5" _ox="$6" _oa="$7" _cx="$8" _ca="$9"
+    # THE ENV FORM (B867): $10-$13 = loader out-x86, out-arm, census-x86, census-arm; built in the same pass, their
+    # censuses join the warm test. Absent (the feature form), nothing below differs from the two-arch path.
+    local _olx="${10:-}" _ola="${11:-}" _clx="${12:-}" _cla="${13:-}"
     _kb_rc_x=0; _knoboff_flat "$_tree" "$_tgt" x86 "$_fx" "$_ox" "$LOG" "$_cx" || _kb_rc_x=$?
     _kb_rc_a=0; _knoboff_flat "$_tree" "$_tgt" arm "$_fa" "$_oa" "$LOG" "$_ca" || _kb_rc_a=$?
-    [ $_kb_rc_x -eq 0 ] && [ $_kb_rc_a -eq 0 ] || return 0
-    if [ -z "$(_knoboff_census_foreign "$_cx" "$_ca")" ] \
+    _kb_rc_lx=0; _kb_rc_la=0
+    if [ -n "$_olx" ]; then
+        _knoboff_flat "$_tree" "$_tgt" uefi-x86 "${kb_lf:-}" "$_olx" "$LOG" "$_clx" || _kb_rc_lx=$?
+        _knoboff_flat "$_tree" "$_tgt" uefi-arm "${kb_lf:-}" "$_ola" "$LOG" "$_cla" || _kb_rc_la=$?
+    fi
+    [ $_kb_rc_x -eq 0 ] && [ $_kb_rc_a -eq 0 ] && [ $_kb_rc_lx -eq 0 ] && [ $_kb_rc_la -eq 0 ] || return 0
+    local _lwarm=1
+    if [ -n "$_olx" ]; then
+        if [ -n "$(_knoboff_census_foreign "$_clx" "$_cla")" ] || _knoboff_census_empty "$_clx" || _knoboff_census_empty "$_cla"; then _lwarm=0; fi
+    fi
+    if [ "$_lwarm" -eq 1 ] && [ -z "$(_knoboff_census_foreign "$_cx" "$_ca")" ] \
        && ! _knoboff_census_empty "$_cx" && ! _knoboff_census_empty "$_ca"; then
         return 0        # exactly one kernel compile per arch with the deps warm: this IS the scored build
     fi
+    if [ -n "$_olx" ]; then
+    echo -e "   ${COLOR_YELLOW}↻ $_lbl: first pass compiled [$(_knoboff_census_show "$_cx")|$(_knoboff_census_show "$_ca")|$(_knoboff_census_show "$_clx")|$(_knoboff_census_show "$_cla")] —${COLOR_RESET}"
+    else
     echo -e "   ${COLOR_YELLOW}↻ $_lbl: first pass compiled [$(_knoboff_census_show "$_cx")|$(_knoboff_census_show "$_ca")] —${COLOR_RESET}"
+    fi
     echo -e "   ${COLOR_YELLOW}  it paid for the deps, or it compiled nothing at all. Either way it is a WARM-UP and its${COLOR_RESET}"
     echo -e "   ${COLOR_YELLOW}  images are discarded: rebuilding the kernel alone against the now-warm cache and scoring${COLOR_RESET}"
     echo -e "   ${COLOR_YELLOW}  THAT — one extra kernel-only compile per arch, which is what the claim costs.${COLOR_RESET}"
     _knoboff_touch_kernel "$_tree"
     _kb_rc_x=0; _knoboff_flat "$_tree" "$_tgt" x86 "$_fx" "$_ox" "$LOG" "$_cx" || _kb_rc_x=$?
     _kb_rc_a=0; _knoboff_flat "$_tree" "$_tgt" arm "$_fa" "$_oa" "$LOG" "$_ca" || _kb_rc_a=$?
+    if [ -n "$_olx" ]; then
+        _kb_rc_lx=0; _knoboff_flat "$_tree" "$_tgt" uefi-x86 "${kb_lf:-}" "$_olx" "$LOG" "$_clx" || _kb_rc_lx=$?
+        _kb_rc_la=0; _knoboff_flat "$_tree" "$_tgt" uefi-arm "${kb_lf:-}" "$_ola" "$LOG" "$_cla" || _kb_rc_la=$?
+    fi
     return 0
 }
 
 knoboff() {
     local feat="${1:-}" baseline="${2:-}"
-    if [ -z "$feat" ]; then
+    # THE ENV FORM (B867): `knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]` — see its paragraph in the header.
+    local kb_env=0 envspec="" kb_lbl="${1:-}"
+    if [ "$feat" = env ]; then kb_env=1; envspec="${2:-}"; baseline="${3:-}"; kb_lbl="env ${envspec}"; fi
+    if [ -z "$feat" ] || { [ "$kb_env" -eq 1 ] && [ -z "$envspec" ]; }; then
         echo -e "${COLOR_RED}usage: ./arroyo knoboff <feature> [baseline-ref]${COLOR_RESET}"
+        echo -e "${COLOR_RED}       ./arroyo knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]${COLOR_RESET}"
+        echo "       env NAME=VAL   an option_env! knob (UNAOS_PPI, UNAOS_FBW/FBH): both kernels and both"
+        echo "                      UEFI loaders built UNSET, SET and EMPTY (THE ENV FORM)"
         echo "       <feature>      a cargo feature declared in crates/kernel/Cargo.toml [features]"
         echo "       [baseline-ref] default: HEAD when the tree is dirty, HEAD~1 when it is clean."
         echo "                      A MERGE HEAD has no default — HEAD~1 is the first parent, which is"
@@ -14039,12 +14109,37 @@ knoboff() {
     # byte-identity for a name cargo has never heard of is measuring nothing.
     local declared
     declared="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+[ \t]*=/{sub(/[ \t]*=.*/,"");print}' "$CARGO_TOML" | sort -u)"
-    if ! printf '%s\n' "$declared" | grep -qx -- "$feat"; then
+    if [ "$kb_env" -eq 0 ] && ! printf '%s\n' "$declared" | grep -qx -- "$feat"; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — '$feat' is not declared in crates/kernel/Cargo.toml [features].${COLOR_RESET}"
         echo -e "         A cfg on an undeclared feature is always false, so nothing here could be measured."
         echo -e "         Declared: $(printf '%s' "$declared" | tr '\n' ' ')"
         return 2
     fi
+    # (1, ENV FORM) READ. The env form's "declared": every NAME is a UNAOS_ knob with a non-empty value, read by an
+    # `option_env!("NAME")` in one of the two crates built here. A name nothing reads cannot move an image, and a
+    # misspelling would otherwise reach the control and read as "dead knob" instead of "no such knob".
+    local kb_pairs="" kb_names="" kb_pair kb_n kb_v
+    if [ "$kb_env" -eq 1 ]; then
+        for kb_pair in ${envspec//,/ }; do
+            kb_n="${kb_pair%%=*}"; kb_v="${kb_pair#*=}"
+            if [ "$kb_n" = "$kb_pair" ] || [ -z "$kb_v" ] || ! printf '%s' "$kb_n" | grep -qx 'UNAOS_[A-Z0-9_]\{1,\}'; then
+                echo -e "${COLOR_RED}knoboff: NO VERDICT — '$kb_pair' is not NAME=VAL with NAME a UNAOS_ knob and VAL non-empty.${COLOR_RESET}"
+                return 2
+            fi
+            if ! grep -rqF "option_env!(\"$kb_n\")" "$WORKSPACE_DIR/crates/kernel/src" "$WORKSPACE_DIR/crates/bootloader/src" 2>/dev/null; then
+                echo -e "${COLOR_RED}knoboff: NO VERDICT — no option_env!(\"$kb_n\") under crates/kernel/src or crates/bootloader/src.${COLOR_RESET}"
+                echo -e "         Nothing this verb builds reads '$kb_n', so no image could move; a feature knob takes the"
+                echo -e "         first form: ${COLOR_YELLOW}./arroyo knoboff <feature>${COLOR_RESET}"
+                return 2
+            fi
+            kb_pairs="$kb_pairs $kb_pair"; kb_names="$kb_names $kb_n"
+        done
+        if [ -z "$kb_names" ]; then
+            echo -e "${COLOR_RED}knoboff: NO VERDICT — the env spec '$envspec' names no knob.${COLOR_RESET}"; return 2
+        fi
+        for kb_n in $kb_names; do unset "$kb_n"; done   # UNSET is the scored state; the caller may have exported it
+    fi
+    local kb_lf="${BOOTLOADER_FEATURES#--features }"   # the loaders' feature csv (env form; GATE-BOOTLOADER's set)
 
     # (2) ENV — asked as a FEATURE-SET question, not as an env-var-name question. The first cut of this
     # check scanned for `UNAOS_*` in the environment and refused; it fired on every single run, because
@@ -14136,6 +14231,7 @@ knoboff() {
     for f in ${base_feats//,/ }; do [ "$f" = "$feat" ] && continue; acc="$acc$f,"; done
     local off_csv="${acc%,}"
     local on_csv="${off_csv:+$off_csv,}$feat"
+    if [ "$kb_env" -eq 1 ]; then off_csv="$base_feats"; on_csv="$base_feats"; fi   # ENV FORM: the knob is the env, not a feature
     local off_arm on_arm
     off_arm="$(_knoboff_arm_csv "$off_csv")"
     on_arm="$(_knoboff_arm_csv "$on_csv")"
@@ -14163,9 +14259,11 @@ knoboff() {
     # A feature that is ON by default inverts the question — knob-off then means REMOVING shipped code,
     # and the baseline it is compared against still contains it. Say so rather than printing a verdict
     # whose words ("knob-off byte-identical") mean something else here.
+    if [ "$kb_env" -eq 0 ]; then
     case ",${default_csv}," in
         *",${feat},"*) echo -e "${COLOR_YELLOW}⚠ '${feat}' is ON by default: this run measures REMOVING it, not adding it.${COLOR_RESET}" ;;
     esac
+    fi
 
     # (5b) SCRATCH — PER CALLER, never one directory per bench (SO34; see this verb's header). The
     # key is a digest of the CALLER'S worktree path, so two executors on one box are two keys and
@@ -14210,11 +14308,15 @@ knoboff() {
         return 0
     }
 
-    echo -e "${COLOR_PURPLE}══ knoboff: $feat ══${COLOR_RESET}"
+    echo -e "${COLOR_PURPLE}══ knoboff: $kb_lbl ══${COLOR_RESET}"
     echo -e "   baseline   ${base_sha}  $(cd "$REPO" && git log --format=%s -1 "$base_sha" | cut -c1-64)"
     echo -e "   current    ${head_sha}$([ "$dirty" -eq 1 ] && echo ' + uncommitted diff')"
     echo -e "   knob-off   x86: [${off_csv:-<none>}]   arm: [${off_arm:-<none>}]"
     echo -e "   knob-on    x86: [${on_csv}]   arm: [${on_arm:-<none>}]"
+    if [ "$kb_env" -eq 1 ]; then
+        echo -e "   env knob  ${kb_pairs}   phases: UNSET (baseline, tree) · SET (control) · EMPTY (tree)"
+        echo -e "   loaders    uefi-x86 + uefi-arm bootloader.efi, features [${kb_lf:-<none>}], PE stamp+checksum zeroed"
+    fi
     echo -e "   tree       $TREE   (all three builds of THIS run go HERE — one directory, no path delta)"
     echo -e "   caller     $REPO   (the key above: no other executor's run shares this directory)"
     echo -e "   run        $RUN"
@@ -14261,31 +14363,74 @@ knoboff() {
     # for identity — only for inequality).
     local C_BX="$RUN/census-base-x86.txt" C_BA="$RUN/census-base-arm.txt"
     local C_CX="$RUN/census-cur-x86.txt"  C_CA="$RUN/census-cur-arm.txt"
-    local _kb_rc_x=0 _kb_rc_a=0
+    local _kb_rc_x=0 _kb_rc_a=0 _kb_rc_lx=0 _kb_rc_la=0
+    # THE ENV FORM's artifacts (B867): the two loaders of each phase, the EMPTY phase's four, the loader censuses.
+    local F_BLX="$RUN/flat-base-uefi-x86.efi"  F_BLA="$RUN/flat-base-uefi-arm.efi"
+    local F_CLX="$RUN/flat-cur-uefi-x86.efi"   F_CLA="$RUN/flat-cur-uefi-arm.efi"
+    local F_OLX="$RUN/flat-armed-uefi-x86.efi" F_OLA="$RUN/flat-armed-uefi-arm.efi"
+    local F_EX="$RUN/flat-empty-x86.bin" F_EA="$RUN/flat-empty-arm.bin" F_ELX="$RUN/flat-empty-uefi-x86.efi" F_ELA="$RUN/flat-empty-uefi-arm.efi"
+    local C_BLX="$RUN/census-base-uefi-x86.txt" C_BLA="$RUN/census-base-uefi-arm.txt"
+    local C_CLX="$RUN/census-cur-uefi-x86.txt"  C_CLA="$RUN/census-cur-uefi-arm.txt"
+    local kb_lb=() kb_lc=() kb_np=3 kb_off="knob OFF" kb_t0=$SECONDS kb_t=$SECONDS
+    local rc_base_lx=0 rc_base_la=0 rc_cur_lx=0 rc_cur_la=0 rc_on_lx=0 rc_on_la=0
+    local rc_e_x=0 rc_e_a=0 rc_e_lx=0 rc_e_la=0
+    if [ "$kb_env" -eq 1 ]; then
+        kb_lb=( "$F_BLX" "$F_BLA" "$C_BLX" "$C_BLA" ); kb_lc=( "$F_CLX" "$F_CLA" "$C_CLX" "$C_CLA" )
+        kb_np=4; kb_off="knob UNSET (${kb_names# })"
+    fi
+    # The env form's per-phase wall time (16 compiles a run: the bench reads the cost before it pays it).
+    _knoboff_took() { if [ "$kb_env" -eq 1 ]; then echo -e "   ⏱ $1 took $((SECONDS - kb_t)) s (run so far $((SECONDS - kb_t0)) s)"; fi; kb_t=$SECONDS; return 0; }
 
     # [1/3] THE SCORED BASELINE. `_knoboff_scored_pair` warms first and scores second whenever the
     # first pass was not already a warm kernel-only compile; see its header for why the warm-up is
     # conditional rather than unconditional.
-    echo -e "${COLOR_YELLOW}⚡ [1/3] baseline ${base_sha:0:8}, knob OFF (scored)...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}⚡ [1/${kb_np}] baseline ${base_sha:0:8}, ${kb_off} (scored)...${COLOR_RESET}"
     if ! _knoboff_checkout "$base_sha" ""; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — could not check out $base_sha in $TREE; see $LOG${COLOR_RESET}"; _knoboff_bye 2; return 2; fi
     local BLOB_B; BLOB_B="$(_knoboff_blob_id "$TREE")"
-    _knoboff_scored_pair "baseline" "$TREE" "$TGT" "$off_csv" "$off_arm" "$F_BX" "$F_BA" "$C_BX" "$C_BA"
-    rc_base_x=$_kb_rc_x; rc_base_a=$_kb_rc_a
+    _knoboff_scored_pair "baseline" "$TREE" "$TGT" "$off_csv" "$off_arm" "$F_BX" "$F_BA" "$C_BX" "$C_BA" "${kb_lb[@]}"
+    rc_base_x=$_kb_rc_x; rc_base_a=$_kb_rc_a; rc_base_lx=$_kb_rc_lx; rc_base_la=$_kb_rc_la
+    _knoboff_took "[1/${kb_np}]"
 
-    echo -e "${COLOR_YELLOW}⚡ [2/3] current tree, knob OFF (scored)...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}⚡ [2/${kb_np}] current tree, ${kb_off} (scored)...${COLOR_RESET}"
     if ! _knoboff_checkout "$head_sha" "$PATCHF"; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — the working diff did not apply onto $head_sha in $TREE; see $LOG${COLOR_RESET}"; _knoboff_bye 2; return 2; fi
     local BLOB_C; BLOB_C="$(_knoboff_blob_id "$TREE")"
-    _knoboff_scored_pair "tree" "$TREE" "$TGT" "$off_csv" "$off_arm" "$F_CX" "$F_CA" "$C_CX" "$C_CA"
-    rc_cur_x=$_kb_rc_x; rc_cur_a=$_kb_rc_a
+    _knoboff_scored_pair "tree" "$TREE" "$TGT" "$off_csv" "$off_arm" "$F_CX" "$F_CA" "$C_CX" "$C_CA" "${kb_lc[@]}"
+    rc_cur_x=$_kb_rc_x; rc_cur_a=$_kb_rc_a; rc_cur_lx=$_kb_rc_lx; rc_cur_la=$_kb_rc_la
+    _knoboff_took "[2/${kb_np}]"
 
+    if [ "$kb_env" -eq 1 ]; then
+        echo -e "${COLOR_YELLOW}⚡ [3/4] current tree, knob SET${kb_pairs} (control — the comparison must be able to come out unequal)...${COLOR_RESET}"
+        for kb_pair in $kb_pairs; do export "$kb_pair"; done
+    else
     echo -e "${COLOR_YELLOW}⚡ [3/3] current tree, knob ON (control — the comparison must be able to come out unequal)...${COLOR_RESET}"
+    fi
     rc_on_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$on_csv" "$F_OX" "$LOG" || rc_on_x=$?
     rc_on_a=0; _knoboff_flat "$TREE" "$TGT" arm "$on_arm" "$F_OA" "$LOG" || rc_on_a=$?
+    if [ "$kb_env" -eq 1 ]; then
+        _knoboff_flat "$TREE" "$TGT" uefi-x86 "$kb_lf" "$F_OLX" "$LOG" || rc_on_lx=$?
+        _knoboff_flat "$TREE" "$TGT" uefi-arm "$kb_lf" "$F_OLA" "$LOG" || rc_on_la=$?
+        for kb_n in $kb_names; do unset "$kb_n"; done
+        _knoboff_took "[3/4]"
+        # [4/4] EMPTY: the knob present with no value must build the UNSET bytes (the parsers' `Some("")` = off).
+        echo -e "${COLOR_YELLOW}⚡ [4/4] current tree, knob EMPTY (${kb_names# } set to '') — must equal UNSET...${COLOR_RESET}"
+        for kb_n in $kb_names; do export "$kb_n="; done
+        _knoboff_flat "$TREE" "$TGT" x86 "$off_csv" "$F_EX" "$LOG" || rc_e_x=$?
+        _knoboff_flat "$TREE" "$TGT" arm "$off_arm" "$F_EA" "$LOG" || rc_e_a=$?
+        _knoboff_flat "$TREE" "$TGT" uefi-x86 "$kb_lf" "$F_ELX" "$LOG" || rc_e_lx=$?
+        _knoboff_flat "$TREE" "$TGT" uefi-arm "$kb_lf" "$F_ELA" "$LOG" || rc_e_la=$?
+        for kb_n in $kb_names; do unset "$kb_n"; done
+        _knoboff_took "[4/4]"
+    fi
 
-    if [ $rc_base_x -ne 0 ] || [ $rc_base_a -ne 0 ] || [ $rc_cur_x -ne 0 ] || [ $rc_cur_a -ne 0 ]; then
+    if [ $rc_base_x -ne 0 ] || [ $rc_base_a -ne 0 ] || [ $rc_cur_x -ne 0 ] || [ $rc_cur_a -ne 0 ] \
+       || [ $rc_base_lx -ne 0 ] || [ $rc_base_la -ne 0 ] || [ $rc_cur_lx -ne 0 ] || [ $rc_cur_la -ne 0 ] \
+       || [ $rc_e_x -ne 0 ] || [ $rc_e_a -ne 0 ] || [ $rc_e_lx -ne 0 ] || [ $rc_e_la -ne 0 ]; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — a knob-OFF build failed (x86 base:$rc_base_x arm base:$rc_base_a x86 cur:$rc_cur_x arm cur:$rc_cur_a).${COLOR_RESET}"
+        if [ "$kb_env" -eq 1 ]; then
+            echo -e "${COLOR_RED}         loaders base:$rc_base_lx|$rc_base_la cur:$rc_cur_lx|$rc_cur_la · EMPTY x86:$rc_e_x arm:$rc_e_a loaders:$rc_e_lx|$rc_e_la${COLOR_RESET}"
+        fi
         echo -e "         tail of $LOG:"; tail -20 "$LOG" | sed 's/^/         /'
         _knoboff_bye 2; return 2
     fi
@@ -14295,14 +14440,21 @@ knoboff() {
     # images came out of the same cache state, and the census is the only evidence of that. Printed
     # unconditionally, because a verdict quoted without it cannot be checked.
     local foreign warm=yes why=""
-    foreign="$(_knoboff_census_foreign "$C_BX" "$C_BA" "$C_CX" "$C_CA")"
+    local kb_cen=( "$C_BX" "$C_BA" "$C_CX" "$C_CA" )
+    if [ "$kb_env" -eq 1 ]; then kb_cen+=( "$C_BLX" "$C_BLA" "$C_CLX" "$C_CLA" ); fi
+    foreign="$(_knoboff_census_foreign "${kb_cen[@]}")"
+    local kb_c kb_cempty=0
+    for kb_c in "${kb_cen[@]}"; do if _knoboff_census_empty "$kb_c"; then kb_cempty=1; fi; done
     if [ -n "$foreign" ]; then
         warm=no; why="a scored build compiled a crate that is not the kernel (rebuilt: $foreign)"
-    elif _knoboff_census_empty "$C_BX" || _knoboff_census_empty "$C_BA" \
-      || _knoboff_census_empty "$C_CX" || _knoboff_census_empty "$C_CA"; then
+    elif [ "$kb_cempty" -eq 1 ]; then
         warm=no; why="a scored build compiled NOTHING, so its image is an artifact some earlier run left behind"
     fi
+    if [ "$kb_env" -eq 1 ]; then
+    echo -e "   knoboff: warm=${warm} compiled_baseline=[$(_knoboff_census_show "$C_BX")|$(_knoboff_census_show "$C_BA")|$(_knoboff_census_show "$C_BLX")|$(_knoboff_census_show "$C_BLA")] compiled_tree=[$(_knoboff_census_show "$C_CX")|$(_knoboff_census_show "$C_CA")|$(_knoboff_census_show "$C_CLX")|$(_knoboff_census_show "$C_CLA")]   (x86|arm|uefi-x86|uefi-arm)"
+    else
     echo -e "   knoboff: warm=${warm} compiled_baseline=[$(_knoboff_census_show "$C_BX")|$(_knoboff_census_show "$C_BA")] compiled_tree=[$(_knoboff_census_show "$C_CX")|$(_knoboff_census_show "$C_CA")]   (x86|arm)"
+    fi
     echo -e "   user_blob  baseline ${BLOB_B:0:16}   tree ${BLOB_C:0:16}   (include_bytes! payload, arch/aarch64/syscall.rs)"
     if [ "$warm" != yes ]; then
         echo -e "${COLOR_RED}knoboff: 2 — NO VERDICT: cache not warm (rebuilt: ${foreign:-<nothing — see below>})${COLOR_RESET}"
@@ -14343,8 +14495,22 @@ knoboff() {
     local ctl_x=0 ctl_a=0
     if [ $rc_on_x -eq 0 ] && ! cmp -s "$F_OX" "$F_CX"; then ctl_x=1; fi
     if [ $rc_on_a -eq 0 ] && ! cmp -s "$F_OA" "$F_CA"; then ctl_a=1; fi
+    local ctl_lx=0 ctl_la=0
+    if [ "$kb_env" -eq 1 ]; then
+        if [ $rc_on_lx -eq 0 ] && ! cmp -s "$F_OLX" "$F_CLX"; then ctl_lx=1; fi
+        if [ $rc_on_la -eq 0 ] && ! cmp -s "$F_OLA" "$F_CLA"; then ctl_la=1; fi
+        echo -e "   control    SET≠UNSET  x86: $([ $ctl_x -eq 1 ] && echo YES || echo no)   arm: $([ $ctl_a -eq 1 ] && echo YES || echo no)   uefi-x86: $([ $ctl_lx -eq 1 ] && echo YES || echo no)   uefi-arm: $([ $ctl_la -eq 1 ] && echo YES || echo no)"
+        if [ $ctl_x -eq 0 ] && [ $ctl_a -eq 0 ] && [ $ctl_lx -eq 0 ] && [ $ctl_la -eq 0 ]; then
+            echo -e "${COLOR_RED}knoboff: NO VERDICT — setting${kb_pairs} changed NONE of the four images.${COLOR_RESET}"
+            echo -e "         (SET builds: x86:$rc_on_x arm:$rc_on_a uefi-x86:$rc_on_lx uefi-arm:$rc_on_la.) A knob read only under a cfg"
+            echo -e "         nobody armed (re-run with its partner: ${COLOR_YELLOW}UNAOS_<PARTNER>=1 UNAOS_KNOBOFF_WITH_ENV=1 ./arroyo knoboff env …${COLOR_RESET}),"
+            echo -e "         a knob that needs a pair (UNAOS_FBW needs UNAOS_FBH: name both), or a dead read. Not a pass."
+            _knoboff_bye 2; return 2
+        fi
+    else
     echo -e "   control    x86 armed≠off: $([ $ctl_x -eq 1 ] && echo YES || echo no)   arm armed≠off: $([ $ctl_a -eq 1 ] && echo YES || echo no)"
-    if [ $ctl_x -eq 0 ] && [ $ctl_a -eq 0 ]; then
+    fi
+    if [ $ctl_x -eq 0 ] && [ $ctl_a -eq 0 ] && [ "$kb_env" -eq 0 ]; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — arming '$feat' changed NEITHER image.${COLOR_RESET}"
         if [ $rc_on_x -ne 0 ] || [ $rc_on_a -ne 0 ]; then
             echo -e "         (the armed build itself failed: x86:$rc_on_x arm:$rc_on_a.) TWO causes, and the"
@@ -14373,10 +14539,16 @@ knoboff() {
 
     # (8) VERDICT.
     local rc=0
-    local a
-    for a in x86 arm; do
+    local a kb_arts="x86 arm"
+    if [ "$kb_env" -eq 1 ]; then kb_arts="x86 arm uefi-x86 uefi-arm"; fi
+    for a in $kb_arts; do
         local base cur bfile cfile
-        if [ "$a" = x86 ]; then bfile="$F_BX"; cfile="$F_CX"; else bfile="$F_BA"; cfile="$F_CA"; fi
+        case "$a" in
+            x86) bfile="$F_BX"; cfile="$F_CX" ;;
+            arm) bfile="$F_BA"; cfile="$F_CA" ;;
+            uefi-x86) bfile="$F_BLX"; cfile="$F_CLX" ;;
+            uefi-arm) bfile="$F_BLA"; cfile="$F_CLA" ;;
+        esac
         base="$(_knoboff_id "$bfile")"; cur="$(_knoboff_id "$cfile")"
         if cmp -s "$bfile" "$cfile"; then
             echo -e "${COLOR_GREEN}   ✅ $a knob-off image BYTE-IDENTICAL to baseline — ${base}${COLOR_RESET}"
@@ -14389,8 +14561,31 @@ knoboff() {
             rc=1
         fi
     done
+    # THE ENV FORM's second claim: EMPTY builds the UNSET bytes, on every artifact.
+    if [ "$kb_env" -eq 1 ]; then
+        local efile kb_eok=1
+        for a in $kb_arts; do
+            case "$a" in
+                x86) efile="$F_EX"; cfile="$F_CX" ;;
+                arm) efile="$F_EA"; cfile="$F_CA" ;;
+                uefi-x86) efile="$F_ELX"; cfile="$F_CLX" ;;
+                uefi-arm) efile="$F_ELA"; cfile="$F_CLA" ;;
+            esac
+            if ! cmp -s "$efile" "$cfile"; then
+                echo -e "${COLOR_RED}   ❌ $a EMPTY ≠ UNSET — an empty value is not unset: the knob's parser reads Some(\"\") as set${COLOR_RESET}"
+                echo -e "${COLOR_RED}      unset $(_knoboff_id "$cfile")   empty $(_knoboff_id "$efile")${COLOR_RESET}"
+                kb_eok=0; rc=1
+            fi
+        done
+        if [ "$kb_eok" -eq 1 ]; then echo -e "${COLOR_GREEN}   ✅ EMPTY == UNSET on all four images${COLOR_RESET}"; fi
+        echo -e "   ⏱ knoboff env: whole run $((SECONDS - kb_t0)) s"
+    fi
 
-    if [ $rc -eq 0 ]; then
+    if [ $rc -eq 0 ] && [ "$kb_env" -eq 1 ]; then
+        echo -e "${COLOR_GREEN}knoboff: PASS — env${kb_pairs} UNSET is byte-identical to ${base_sha:0:8} on both kernels and both loaders; EMPTY == UNSET; control fired, cache warm.${COLOR_RESET}"
+        echo -e "   Scope of that PASS: the x86_64 and aarch64-virt KERNEL images and the two UEFI loaders. NOT kernel8.img"
+        echo -e "   and NOT any staged media. It GUARDS A BASELINE; it is not evidence the knob WORKS (score the armed run)."
+    elif [ $rc -eq 0 ]; then
         echo -e "${COLOR_GREEN}knoboff: PASS — '$feat' OFF is byte-identical to ${base_sha:0:8} on both arches; control fired, cache warm.${COLOR_RESET}"
         echo -e "   Scope of that PASS: the x86_64 and aarch64-virt KERNEL images. NOT kernel8.img (built"
         echo -e "   from K8_FEATS, a separate curated list) and NOT any staged media. A pi ack is still a pi ack."
@@ -14707,7 +14902,7 @@ case "${1:-}" in
     knoboff)
         # KNOBOFF: byte-identity of the knob-OFF image against a baseline, measured in ONE directory.
         # Exit status IS the result (0 identical / 1 moved / 2 no verdict) — see knoboff() above.
-        knoboff "${2:-}" "${3:-}" || exit $?
+        knoboff "${2:-}" "${3:-}" "${4:-}" || exit $?
         ;;
     jobs-image)
         jobs_image

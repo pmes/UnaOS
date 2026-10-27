@@ -4,7 +4,7 @@
 - `unaos/arroyo` is the one build/test entry point (a bash script; verbs at its `case` near the file tail).
 - `./arroyo check` type-checks both arches (every kernel cfg leg) and runs GATE-LEDGER (`unaos/arroyo:8854`, `unaos/arroyo:9480-9517`).
 - `./arroyo gates` runs every host gate in `GATES_SET` (no cargo, ~30 s), one `gate=<name> rc=<n>` line each, then `GATES: <n> run <n> green -> PASS|FAIL`; exit = the worst rc (`unaos/arroyo:14426-14443`).
-- Fold legs beside the compile legs: `foldleg` (the x86 kernel + loader built under `image-line.env`), `twoboot` (the image booted twice under QEMU), `knoboff <feature>` (knob-off byte identity, `unaos/arroyo:13888`).
+- Fold legs beside the compile legs: `foldleg` (the x86 kernel + loader built under `image-line.env`), `twoboot` (the image booted twice under QEMU), `knoboff <feature>` / `knoboff env NAME=VAL[,…]` (knob-off byte identity of a cargo feature / of an `option_env!` knob, `unaos/arroyo:14086`).
 - The image legs of `./arroyo check` (KERNEL_CFG_MATRIX tail): each is the knob line a card flies, so the fold type-checks it.
 
   | leg | the line it compiles | anchor |
@@ -23,7 +23,7 @@
 | BP-gates-2 | Every host gate carries a control: a broken pattern is exit 2 (no verdict), never a green. | `docs/dev/LAWS.md` §5 "A check that cannot fire is an absent one"; `unaos/scripts/appearance-check.py:28-31` | each gate's control probe |
 | BP-gates-3 | A capture judged by a verb must reach the ladder's LAST line; a truncated run is exit 5, never a pass. | `docs/dev/LAWS.md` §5 "A TRUNCATED RUN IS NEVER A PASS" | `ladder_tail_check` in `unaos/arroyo` |
 | BP-gates-4 | An instrument's presence is certified on the ARTIFACT (`LC_ALL=C grep -a -o -F <witness>`) with a control string, never by the diff, the check or the banner; a video gate carries `UNAOS_WC=1`. | `docs/dev/PLAYBOOK.md:64-65`; `docs/dev/LAWS.md` §5 | `gates` row `banner` (`unaos/scripts/banner-cert.sh`) |
-| BP-gates-5 | Knob-off byte identity: a new statement goes inside an existing cfg region or LINE-NEUTRAL before the line's first `//`; `./arroyo knoboff <f>` exit 0 = identical, 1 = moved, 2 = no verdict (never a pass). | `docs/dev/EXECUTOR-BRIEF.md:18-24` | `./arroyo knoboff`; `unaos/scripts/line-neutral.sh` |
+| BP-gates-5 | Knob-off byte identity: a new statement goes inside an existing cfg region or LINE-NEUTRAL before the line's first `//`; `./arroyo knoboff <f>` exit 0 = identical, 1 = moved, 2 = no verdict (never a pass). PANELKNOB2 (B867): an `option_env!` knob (`UNAOS_PPI`, `UNAOS_FBW`/`UNAOS_FBH`) is measured by `./arroyo knoboff env NAME=VAL[,…]` on both kernels and both UEFI loaders — UNSET equals the baseline, EMPTY equals UNSET, SET moves an image (else no verdict); 16 compiles a run, each phase prints its wall time. | `docs/dev/EXECUTOR-BRIEF.md:18-24`; `unaos/arroyo:14086` | `./arroyo knoboff`; `unaos/scripts/line-neutral.sh` |
 | BP-gates-6 | A status word (flew, unflown, refuted, landed on metal, and the three claim words) in a ledger or a queue STATE cites an `ST<n>` row whose quoted line exists byte-for-byte in that flight's capture. | `docs/dev/STATUS.md:1-25` | `gates` row `status` (`tools/status-check.py`) |
 | BP-gates-7 | Every finding is one ledger row (7 cells, no literal pipe, no scratch path, no unpushed sha); ids unique per file; the arc that fixes, flies or drops it ticks it in the same commit. | `docs/dev/PLAYBOOK.md:98-101`; `unaos/scripts/ledger-check.sh:1-20` | GATE-LEDGER in `./arroyo check` |
 | BP-gates-8 | A fold is UNION BY ROW ID; a `.rs` union is followed by brace/line arithmetic against both parents; the fold's own falsifiers re-run on the folded tree. | `docs/dev/LAWS.md` §3 "Folds", "A clean merge is where composition defects hide" | GATE-BRACES, GATE-SELFSYNTAX in `./arroyo check` (names from LAWS; implementation `unverified`) |
@@ -60,7 +60,7 @@
 
 ## 4. Verbs (`unaos/arroyo` tail `case`)
 `check` · `state` · `gates [--list|--selftest]` · `test` (at `UNAOS_FBW`/`UNAOS_FBH`/`UNAOS_PPI` with `UNAOS_WC`+`UNAOS_FACET` it replays `unaos/scripts/specs/x86-panel.spec`, ZOOMPANEL B842) / `test-arm` / `test-fat` / `test-install` / `test-ptr` / `test-splash` / `test-selfhost` (QEMU) · `x86` / `arm` (QEMU GUI) ·
-`esp-x86` (stages `unaos/fixtures/TESTS.LIST` + `TESTS.HEAVY` onto the ESP when present, the media verb only — BOOTLIST B817, `unaos/arroyo:14559`) / `esp-arm` / `esp-jetson` / `esp-jetson-img` (media) · `kernel8` / `kernel8-run` / `kernel8-test` / `kernel8-install` (Pi) · `foldleg` · `twoboot` · `knoboff` · `bootleg` · `battery` · `mbench` · `jobs-image` · `vm-image` · `fat-img` · `selfup-pak` · `clean`.
+`esp-x86` (stages `unaos/fixtures/TESTS.LIST` + `TESTS.HEAVY` onto the ESP when present, the media verb only — BOOTLIST B817, `unaos/arroyo:14559`) / `esp-arm` / `esp-jetson` / `esp-jetson-img` (media) · `kernel8` / `kernel8-run` / `kernel8-test` / `kernel8-install` (Pi) · `foldleg` · `twoboot` · `knoboff` (and `knoboff env NAME=VAL`, B867) · `bootleg` · `battery` · `mbench` · `jobs-image` · `vm-image` · `fat-img` · `selfup-pak` · `clean`.
 
 ## 5. Ruled, unbuilt / open
 - GATE-NEUTRAL (BP-shape-4): built as the `neutral` row (SR166); 110 findings at fb8ad2f4 sit on `tools/neutral.allow`, each reason naming its owed rename.
