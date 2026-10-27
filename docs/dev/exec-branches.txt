@@ -1061,6 +1061,6 @@ refs/heads/exec-rmbp-hidbootarm   376bea1cb FOLDED-BY-HAND (this commit) 2026-10
 refs/heads/exec-rmbp-kernelsizepin   ff4fa8a0b cut 2026-10-27 (wave36 batch 19)
 refs/heads/exec-rmbp-kernelpresentrows   cf5f1b2fa FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootxhcix86   e0efe15d8 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-pdf4kernellane   ff4fa8a0b cut 2026-10-27 (wave36 batch 19)
+refs/heads/exec-rmbp-pdf4kernellane   80db1f2f1 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookledgerevidence   ff4fa8a0b cut 2026-10-27 (wave36 batch 19)
 refs/heads/exec-rmbp-nvmemsix   6e9e18177 FOLDED-BY-HAND (this commit) 2026-10-27

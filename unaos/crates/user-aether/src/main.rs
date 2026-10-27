@@ -522,7 +522,8 @@ fn load(app: &mut App, page: &mut Page, fonts: &mut txt::Fonts, path: &str, how:
 /// engine's `net::favicon_url` rule) — fetched ONCE through `fetch` (the volume or AETHERNET), decoded by pixel_core
 /// (the still-image core http_core already links: PNG, JPEG, GIF, BMP, QOI, WebP; an ICO is refused, no icon), and
 /// handed to the chrome as `sidetabs::favicon_tile`'s 16 px tile for the active tab — or `None`, the letter tile.
-/// Wire: `:: AETHER: favicon -> PASS w=<w> h=<h> src=<url> ::` / `FAIL reason=<none|fetch|decode> ::`.
+/// Wire: `:: AETHER: favicon -> PASS w=<w> h=<h> src=<url> ::` / `SKIP reason=none ::` (no icon declared: not a failure,
+/// AETHERLANE B1004) / `FAIL reason=<fetch|decode> src=<url> ::`.
 fn favicon(app: &mut App, page: &Page) {
     const RELS: [&str; 4] = ["icon", "shortcut", "apple-touch-icon", "apple-touch-icon-precomposed"];
     let doc = page.doc;
@@ -540,7 +541,7 @@ fn favicon(app: &mut App, page: &Page) {
     let mut l = Line::new(b":: AETHER: favicon -> ");
     let Some(src) = href.and_then(|h| resolve(&page.path, &h).ok()).map(|(p, _)| p) else {
         app.ch.set_icon(id, None);
-        l.put(b"FAIL reason=none ::").wire();
+        l.put(b"SKIP reason=none ::").wire(); // AETHERLANE (rmbp-ledger B1004): a page with no icon is not a failure
         return;
     };
     let tile = match fetch(&src) {
