@@ -17,8 +17,9 @@
 # resolution before `platform_say` prints it; the DMI strings stay QEMU's own. NOTHING here is the metal (ZENBOOK-FIRSTBOOT).
 #
 # MEASURED AT THE CUT (ae8272e02), and why some expected lines are NOT pinned:
-#   * `[hw] skip smc|gmux|hda` — ZERO lines: the SMC (feature smc), the gmux (gmux_igd + intel-ivb) and the HDA codec
-#     drive (hda) are not on the Zenbook line, so no gate call is linked. A future line that adds one prints its skip here.
+#   * `[hw] skip smc|gmux` — ZERO lines: the SMC (feature smc) and the gmux (gmux_igd + intel-ivb) are not on the Zenbook
+#     line, so no gate call is linked. ZENBOOKACP (zenbook-ledger Z25) put `hda` on the line: `[hw] skip hda` now prints
+#     and the gate's non-Apple arm runs the read-only codec census (section 10).
 #   * `[mt7925] s2` — SILENT: with no 14c3 device on the bus `mt7925::s2` returns before its platform test.
 #   * the typed fixtures register only from the `tests` verb, which needs a session on this `login` line: section 7 below
 #     (ZENBOOKLANETYPED, Z16, measured at d7ad4440e).
@@ -66,6 +67,12 @@ REQUIRE :: I8042: init=ready irq=(routed|polled) transport=ps2 table=ok .* -> PA
 REQUIRE :: DWI2C: proto=ok cases=8/8 -> PASS ::
 REQUIRE :: BOOTLIST: probe entries=\d+ heavy=\d+ budget_skips=\d+ summary=ok -> PASS ::
 FORBID :: (PLATFORM|EC|NVME|I8042|DWI2C|BOOTLIST): .*-> FAIL
+
+# ── 10. ZENBOOKACP (Z25): the HDA census on q35's intel-hda + hda-duplex (UNAOS_HDA), the drive path skipped ───────────
+REQUIRE \[hw\] skip hda platform=zenbook_um5606w
+REQUIRE \[hda\] census codec=0 vid=1af4:0022 subsys=[0-9a-f]{4}:[0-9a-f]{4} afg=0x[0-9a-f]{2} nodes=\d+ ctrl=[0-9a-f]{4}:[0-9a-f]{4} pcissid=[0-9a-f]{4}:[0-9a-f]{4} -> parked
+REQUIRE \[hda\] audit stage=census .*verbs-set=0\b
+FORBID \[hda\] (gpio|tone|path)\b
 
 # ── END OF RUN: the last typed verdict (mbench's completion also needs every REQUIRE above) ───────────────────────────
 COMPLETE :: BOOTLIST: probe .* -> PASS ::

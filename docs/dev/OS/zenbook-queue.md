@@ -53,7 +53,9 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
 9. **ZENBOOK-TOUCHPAD** — the touchpad over I2C-HID on the AMD DesignWare I2C controller. In flight (ZENBOOKTOUCHPAD, Z14): rung 1 is `drivers/dwi2c.rs`, the FCH's fixed I2C pages identified read-only, a 1-byte-read bus census and the I2C-HID descriptor at a guess-table address, Zenbook only, each controller restored as found. Owed: ZENBOOK-TOUCHPAD-REPORTS in flight (ZENBOOKTOUCHPADREPORTS, Z18: SET_POWER + RESET, the report descriptor, the Input Mode feature, the Precision Touchpad's first finger polled from the HID pass into `pal::push_pointer_report`; owed DWI2C-GPIO, DWI2C-TPGEST, DWI2C-PALM, DWI2C-TPGAIN, DWI2C-MOUSEMODE), DWI2C-ACPI (the `_CRS` base and the touchpad's address and `_DSM` register: AML or the first boot's dump), DWI2C-FAST, DWI2C-AOAC, the Fn keys.
 10. **ZENBOOK-ACP** — audio: the ALC294 codec on the Ryzen HD Audio controller (1022:15e3; Linux quirk 1043:1df3
     `ALC294_FIXUP_BASS_SPEAKER_15`) with its CS35L41 amplifiers, and the ACP 7.x coprocessor (1022:15e2). Until this
-    lands `hda::probe` answers `[hda] absent` on the Zenbook (Z1's gate).
+    lands `hda::probe` answers `[hda] absent` on the Zenbook (Z1's gate). In flight (ZENBOOKACP, Z25): rung 1 is the
+    read-only codec census on the gate's non-Apple arm (UNAOS_HDA on the line; CRST raised only if found low and restored,
+    GET verbs only, `verbs-set=0`), `tests hdacensus`; owed ZENBOOK-ACP-CODEC, -AMPS, -COPROC, -PLAY (audio.md §5).
 11. **ZENBOOK-USB4** — the USB4 host routers (NHI 151c/151d) and the tunnelled DP / PCIe / USB behind them.
 12. **ZENBOOK-RADEON** — display beyond GOP: the amdgpu DCN 3.5 scanout on the Radeon 890M (1002:150e, gfx1150) — the
     Kepler-sized job. FBWCLEAF (measured by GOPIGNITE Z10, not built): `set_framebuffer_wc` (`unaos/crates/kernel/src/arch/x86_64/memory.rs:3735`)
