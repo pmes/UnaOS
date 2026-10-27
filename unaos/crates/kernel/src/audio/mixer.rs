@@ -8,8 +8,8 @@
 //!
 //! * **Sources** — up to [`MAX_SOURCES`], each a ring of PCM16 / 2 ch / 48 kHz frames ([`SRC_CAP`] = 200 ms) with its
 //!   own gain (Q8, [`UNITY`] = 256). A source written in another format (8..48 kHz, 1|2 ch, 8|16 bit — the
-//!   `SYS_AUDIO_OPEN` range) is widened, duplicated and nearest-sample resampled on the way in (`hda_play::feed`'s
-//!   arithmetic). A ring-3 program's stream is a source keyed by its (row, slot generation) — the key and liveness
+//!   `SYS_AUDIO_OPEN` range) is widened and duplicated on the way in, its rate converted by ONE held windowed sinc
+//!   (`audio_core::resample::Sinc`, NLE4BKERNEL B896; was nearest-sample). A ring-3 program's stream is a source keyed by its (row, slot generation) — the key and liveness
 //!   compare STRIAMETAL's doors used — and a source whose owner exited is reaped on the next pump.
 //! * **The period** — 10 ms ([`PERIOD_FRAMES`] = 480 frames). [`Mix::period`] takes up to one period from every
 //!   source, scales each by its gain, SATURATING-adds them (each add clamps to i16), then applies the master gain
@@ -41,7 +41,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering}; use audio_core::resample::Sinc; // NLE4BKERNEL (rmbp-ledger B896): the mixer's rate converters (file tail). LINE-NEUTRAL append, before this comment.
 
 /// The mixer's one format: 48 kHz, 2 x 16-bit.
 pub const RATE: u32 = 48_000;
@@ -82,7 +82,7 @@ pub struct Source {
     /// SINKALL: held out of the mix (the Player's pause): no frame taken, no underrun counted.
     paused: bool,
     underruns: u32,
-    owner: Option<Owner>,
+    owner: Option<Owner>, rs: Option<Sinc>, // NLE4BKERNEL (rmbp-ledger B896): a non-48 kHz source's ONE converter, built before MIX by `ingest_sinc` (file tail)
 }
 
 /// SINKALL: a source's account: source frames written and played (capped), its underruns, and drained = ended with
@@ -157,7 +157,7 @@ impl Mix {
         let id = self.next_id;
         self.srcs.push(Source {
             id, name, gain, ring: VecDeque::new(), rate, ch, bits, in_n: 0, out_n: 0, taken: 0, last_e: self.emitted,
-            primed: false, ended: false, paused: false, underruns: 0, owner,
+            primed: false, ended: false, paused: false, underruns: 0, owner, rs: None,
         });
         Ok(id)
     }
@@ -172,8 +172,8 @@ impl Mix {
         let fin = s.ch as usize * s.bits as usize / 8;
         let (src, eff) = (s.rate as u64, RATE as u64);
         let mut i = 0;
-        while i + fin <= data.len() {
-            // the 48 kHz frames this source frame yields (nearest-sample: out k plays source frame k * src / eff)
+        while i + fin <= data.len() && (s.rate == RATE || i < INGEST_MAX * fin) { // NLE4BKERNEL (B896): a converting source takes at most INGEST_MAX frames per call (the soft-float work under MIX)
+            // the ring room this source frame needs: the 48 kHz frames at or before it (out k sits at source frame k * src / eff)
             let gi = s.in_n;
             let mut k = 0usize;
             while (s.out_n + k as u64) * src / eff <= gi {
@@ -189,10 +189,10 @@ impl Mix {
                 (_, 1) => { let v = i16::from_le_bytes([f[0], f[1]]); (v, v) }
                 _ => (i16::from_le_bytes([f[0], f[1]]), i16::from_le_bytes([f[2], f[3]])),
             };
-            for _ in 0..k {
-                s.ring.push_back([l, r]);
+            match s.rate {
+                RATE => { for _ in 0..k { s.ring.push_back([l, r]); } s.out_n += k as u64; } // 48 kHz: k == 1, the integer copy
+                _ => s.out_n += sinc_push(&mut s.rs, &mut s.ring, s.rate, s.ch, l, r), // NLE4BKERNEL (rmbp-ledger B896): the source's ONE Sinc (file tail)
             }
-            s.out_n += k as u64;
             s.in_n += 1;
             i += fin;
         }
@@ -204,7 +204,7 @@ impl Mix {
 
     /// Source `id` has no more frames: what it holds still plays.
     pub fn end(&mut self, id: u32) -> bool {
-        self.at(id).map(|s| s.ended = true).is_some()
+        self.at(id).map(|s| { if !s.ended { ingest_flush(s); } s.ended = true }).is_some() // NLE4BKERNEL (B896): the converter's lookahead into the ring (file tail)
     }
 
     pub fn set_gain(&mut self, id: u32, gain: u16) -> bool {
@@ -296,11 +296,11 @@ struct Out {
     pend: Vec<u8>,
     pend_off: usize,
     said: &'static str,
-    /// SINKALL: the BT rate converter's two clocks (48 kHz frames in, 44.1 kHz frames out).
-    rs: (u64, u64),
+    /// NLE4BKERNEL (rmbp-ledger B896): the BT output's ONE rate converter (48 -> 44.1 kHz), built once per boot before OUT.
+    rs: Option<Sinc>,
 }
 static OUT: crate::sync::Mutex<Out> =
-    crate::sync::Mutex::new(Out { kind: OUT_NONE, hda: 0, draining: false, delivered: 0, pend: Vec::new(), pend_off: 0, said: "", rs: (0, 0) });
+    crate::sync::Mutex::new(Out { kind: OUT_NONE, hda: 0, draining: false, delivered: 0, pend: Vec::new(), pend_off: 0, said: "", rs: None });
 /// The sink's play position in emitted frames (the A/V clock's base), refreshed by every pump.
 static SINK_PLAYED: AtomicU64 = AtomicU64::new(0);
 
@@ -371,7 +371,7 @@ fn release(o: &mut Out) {
             let _ = crate::drivers::hda::play::r3_close(o.hda as u64, MIX_ROW, MIX_GEN);
         }
         #[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
-        OUT_BT => a2dp::finish(),
+        OUT_BT => { bt_drain(o); a2dp::finish(); } // NLE4BKERNEL (B896): the converter's lookahead plays before the end (file tail)
         _ => {}
     }
     o.kind = OUT_NONE;
@@ -400,7 +400,7 @@ fn acquire(o: &mut Out, kind: u8) -> bool {
             o.hda = h;
             o.draining = false;
             o.delivered = 0;
-            o.rs = (0, 0);
+            if let Some(r) = o.rs.as_mut() { r.reset(); } // NLE4BKERNEL (B896): a new stream starts the converter from silence
             o.said = "";
             serial_println!("[audio] mix sink={} -> ok", name);
             true
@@ -505,8 +505,8 @@ fn status(m: &Mix, kind: u8) {
 
 /// THE PUMP: bring the output the current sink names up or down, and move mixed periods into it while it has room.
 pub fn pump() {
-    let Some(mut o) = OUT.try_lock() else { return };
-    let o = &mut *o;
+    let bt = bt_sinc_due(); let Some(mut o) = OUT.try_lock() else { return }; // NLE4BKERNEL (rmbp-ledger B896): the BT converter's table is built BEFORE OUT (file tail). LINE-NEUTRAL append, before this comment.
+    let o = &mut *o; bt_sinc_keep(o, bt);
     let mut buf = [0i16; PERIOD_FRAMES * 2];
     for _ in 0..64 {
         let q = queued(o);
@@ -569,7 +569,7 @@ fn fill_pend(o: &mut Out, buf: &[i16]) {
     o.pend.clear();
     o.pend_off = 0;
     if o.kind == OUT_BT {
-        to_bt_rate(&mut o.rs, buf, &mut o.pend);
+        if let Some(r) = o.rs.as_mut() { to_bt_rate(r, buf, &mut o.pend); } // NLE4BKERNEL (B896): None only when BT became the sink after this pump's prologue: that period is dropped
     } else {
         for v in buf.iter() {
             o.pend.extend_from_slice(&v.to_le_bytes());
@@ -577,17 +577,17 @@ fn fill_pend(o: &mut Out, buf: &[i16]) {
     }
 }
 
-/// SINKALL: interleaved 48 kHz stereo frames to the A2DP stream's 44.1 kHz, nearest-sample (out frame k plays in frame
-/// k x 48000 / 44100 — `Mix::write`'s arithmetic the other way), `rs` = (frames in, frames out) across periods.
-pub fn to_bt_rate(rs: &mut (u64, u64), period: &[i16], out: &mut Vec<u8>) {
-    for f in period.chunks_exact(2) {
-        let gi = rs.0;
-        rs.0 += 1;
-        while rs.1 * RATE as u64 / BT_RATE as u64 <= gi {
-            out.extend_from_slice(&f[0].to_le_bytes());
-            out.extend_from_slice(&f[1].to_le_bytes());
-            rs.1 += 1;
+/// SINKALL: interleaved 48 kHz stereo frames to the A2DP stream's 44.1 kHz through the output's ONE held `Sinc` (NLE4BKERNEL
+/// B896; was nearest-sample), streaming across periods; its lookahead is flushed at `release` ([`bt_drain`]).
+pub fn to_bt_rate(rs: &mut Sinc, period: &[i16], out: &mut Vec<u8>) {
+    let (mut input, mut buf) = (period, [0i16; 2 * 512]);
+    loop {
+        let (_, made) = rs.process_i16(input, &mut buf);
+        input = &[];
+        for v in &buf[..made * 2] {
+            out.extend_from_slice(&v.to_le_bytes());
         }
+        if made < 512 { break; }
     }
 }
 
@@ -600,8 +600,8 @@ pub fn open(name: &'static str, gain: u16) -> Result<u32, &'static str> {
 /// way in): the Player (`player` / `video`) and the alert open here. Its opener [`close`]s it.
 pub fn open_fmt(name: &'static str, rate: u32, ch: u8, bits: u8, gain: u16) -> Result<u32, &'static str> {
     let r = {
-        let mut m = MIX.lock();
-        let r = m.open(name, rate, ch, bits, gain, None);
+        let rs = ingest_sinc(rate, ch); let mut m = MIX.lock(); // NLE4BKERNEL (B896): a non-48 kHz source's table is built BEFORE MIX (file tail)
+        let r = m.open(name, rate, ch, bits, gain, None); m.keep_sinc(&r, rs);
         if r.is_ok() {
             status(&m, wanted());
         }
@@ -703,8 +703,8 @@ pub fn r3_open(row: usize, tgen: u64, alive: fn(usize, u64) -> bool, pid: u64, r
     }
     pump(); // reap a stale stream of an exited owner before the duplicate check
     let r = {
-        let mut m = MIX.lock();
-        let r = m.open("ring3", rate as u32, ch as u8, bits as u8, UNITY, Some(Owner { row, tgen, alive, pid }));
+        let rs = ingest_sinc(rate as u32, ch as u8); let mut m = MIX.lock(); // NLE4BKERNEL (B896): the table is built BEFORE MIX (file tail)
+        let r = m.open("ring3", rate as u32, ch as u8, bits as u8, UNITY, Some(Owner { row, tgen, alive, pid })); m.keep_sinc(&r, rs);
         if r.is_ok() {
             status(&m, wanted());
         }
@@ -883,19 +883,19 @@ pub fn bt_synthetic(pcm: &[u8]) -> (usize, usize, u64, u64, bool) {
     let open = m.srcs.len();
     let took = m.write(id, pcm).unwrap_or(0);
     m.end(id);
-    let (mut rs, mut out, mut buf) = ((0u64, 0u64), Vec::new(), [0i16; PERIOD_FRAMES * 2]);
+    let (mut rs, mut out, mut buf) = (Sinc::new(RATE, BT_RATE, 2), Vec::new(), [0i16; PERIOD_FRAMES * 2]);
     while m.has_data() {
         m.period(&mut buf, 8 * 16, false);
         to_bt_rate(&mut rs, &buf, &mut out);
     }
-    m.remove(id);
+    bt_flush(&mut rs, &mut out); m.remove(id); // NLE4BKERNEL (B896): the end of the stream, as `release` flushes the live one
     let after = m.srcs.len();
     let fin = m.emitted;
     let fout = (out.len() / 4) as u64;
     let want = fin * BT_RATE as u64 / RATE as u64;
     let pin = pcm.chunks_exact(2).map(|b| (i16::from_le_bytes([b[0], b[1]]) as i32).abs()).max().unwrap_or(0);
     let pout = out.chunks_exact(2).map(|b| (i16::from_le_bytes([b[0], b[1]]) as i32).abs()).max().unwrap_or(0);
-    let ok = took == pcm.len() && fout.abs_diff(want) <= 1 && pout <= pin / 2 + 2 && pout * 5 >= pin * 2; // nearest-sample may skip the peak sample: half, within 20 % below
+    let ok = took == pcm.len() && fout.abs_diff(want) <= 1 && pout <= pin / 2 + pin / 50 + 2 && pout * 5 >= pin * 2; // the sinc's inter-sample peak (NLE4BKERNEL B896): half, within +2 % / -20 %
     serial_println!("[sinkall] bt synthetic frames_in={} frames_out={} want={} peak_in={} peak_out={} -> {}", fin, fout, want, pin, pout, if ok { "ok" } else { "FAIL" });
     (open, after, fin, fout, ok)
 }
@@ -959,4 +959,123 @@ fn bt_delay() -> u64 {
         return 0;
     }
     a2dp::delay_tenth_ms().map_or(0, |t| t as u64 * RATE as u64 / 10_000)
+}
+
+// ── NLE4BKERNEL (rmbp-ledger B896) — TAIL-APPENDED: the mixer's two rate converters are `audio_core::resample::Sinc` ─────
+// Owner: Stria (CODEX §2), the mixer's ingest and its A2DP output (handlers.md §5 NLE4b's NLE4B-KERNEL); both were
+// nearest-sample. A source at another rate holds ONE Sinc (`Source.rs`): its table is built by [`ingest_sinc`] in the
+// opener's task BEFORE MIX is taken (`open_fmt`, `r3_open`) and moved in under MIX ([`Mix::keep_sinc`]); `Mix::write` hands
+// it one frame at a time ([`sinc_push`], at most [`INGEST_MAX`] frames per call, so the soft-float work under MIX stays a
+// few ms) and `Mix::end` flushes its lookahead ([`ingest_flush`]). The A2DP output holds ONE (`Out.rs`), built once per boot
+// by [`bt_sinc_due`] in `pump` BEFORE OUT's try_lock and kept by [`bt_sinc_keep`], reset at `acquire`, its lookahead written
+// into the stream at `release` ([`bt_drain`]). No table is built under a spin lock and no lock edge is new (audio.md §3);
+// 48 kHz sources keep the integer copy. The i16 <-> f32 crossing is audio_core's ONE (`Sinc::process_i16` / `flush_i16`).
+
+/// Source frames one `Mix::write` call converts at most (~46 ms at 44.1 kHz; every writer takes a partial count).
+const INGEST_MAX: usize = 2_048;
+/// The A2DP output's converter is kept in `Out` (built once per boot).
+static BT_RS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The converter a new source at `rate` / `ch` needs, built here in the opener's task with no lock held (None at 48 kHz
+/// or for a format `Mix::open` refuses), with the build's ms for the wire.
+fn ingest_sinc(rate: u32, ch: u8) -> Option<(Sinc, u64)> {
+    if rate == RATE || !(una_abi::AUDIO_RATE_MIN..=una_abi::AUDIO_RATE_MAX).contains(&rate) || !(ch == 1 || ch == 2) {
+        return None;
+    }
+    let t0 = crate::arch::ms();
+    let s = Sinc::new(rate, RATE, ch as usize);
+    Some((s, crate::arch::ms().saturating_sub(t0)))
+}
+
+impl Mix {
+    /// Move the converter [`ingest_sinc`] built into the source `open` just made (under MIX: a move, never a build).
+    fn keep_sinc(&mut self, r: &Result<u32, (i64, &'static str)>, rs: Option<(Sinc, u64)>) {
+        let (Ok(id), Some((rs, ms))) = (r, rs) else { return };
+        let Some(s) = self.at(*id) else { return };
+        serial_println!("[audio] mix resample id={} rate={}->{} ch={} taps={} table_ms={} -> sinc", s.id, s.rate, RATE, s.ch, rs.taps(), ms);
+        s.rs = Some(rs);
+    }
+}
+
+/// Interleaved converter output (`ch` = 1 or 2) into a source ring of stereo frames (mono to both channels).
+fn push_frames(ring: &mut VecDeque<[i16; 2]>, ch: usize, out: &[i16]) {
+    for f in out.chunks_exact(ch) {
+        ring.push_back([f[0], f[ch - 1]]);
+    }
+}
+
+/// One source frame (`l`, `r`; mono reads `l`) through the source's converter into its ring: the 48 kHz frames it yielded
+/// (0..6; more than 8 ready wait for the next call). An offline [`Mix`] (a test) builds the converter here on first use;
+/// the live mixer's are built by [`ingest_sinc`] before MIX.
+fn sinc_push(rs: &mut Option<Sinc>, ring: &mut VecDeque<[i16; 2]>, rate: u32, ch: u8, l: i16, r: i16) -> u64 {
+    let ch = ch as usize;
+    let rs = rs.get_or_insert_with(|| Sinc::new(rate, RATE, ch));
+    let mut out = [0i16; 2 * 8];
+    let (_, made) = rs.process_i16(&[l, r][..ch], &mut out[..8 * ch]);
+    push_frames(ring, ch, &out[..made * ch]);
+    made as u64
+}
+
+/// End of a converting source's stream: its converter's lookahead (read as silence) into the ring.
+fn ingest_flush(s: &mut Source) {
+    let ch = s.ch as usize;
+    let Some(rs) = s.rs.as_mut() else { return };
+    let mut out = [0i16; 2 * 32];
+    loop {
+        let n = rs.flush_i16(&mut out[..32 * ch]);
+        push_frames(&mut s.ring, ch, &out[..n * ch]);
+        s.out_n += n as u64;
+        if n < 32 {
+            break;
+        }
+    }
+}
+
+/// The A2DP output's converter, built here in `pump` BEFORE OUT is taken, while BT is the sink wanted and none is kept.
+fn bt_sinc_due() -> Option<(Sinc, u64)> {
+    if BT_RS.load(Ordering::Acquire) || wanted() != OUT_BT {
+        return None;
+    }
+    let t0 = crate::arch::ms();
+    let s = Sinc::new(RATE, BT_RATE, 2);
+    Some((s, crate::arch::ms().saturating_sub(t0)))
+}
+
+/// Keep the converter [`bt_sinc_due`] built (under OUT: a move); one built by a racing pump is dropped.
+fn bt_sinc_keep(o: &mut Out, bt: Option<(Sinc, u64)>) {
+    let Some((rs, ms)) = bt else { return };
+    if o.rs.is_none() {
+        serial_println!("[audio] mix resample bt rate={}->{} ch=2 taps={} table_ms={} -> sinc", RATE, BT_RATE, rs.taps(), ms);
+        o.rs = Some(rs);
+    }
+    BT_RS.store(true, Ordering::Release);
+}
+
+/// The converter's lookahead as 44.1 kHz stereo bytes: the end of a BT stream (`release`, [`bt_drain`]; `bt_synthetic`).
+fn bt_flush(rs: &mut Sinc, out: &mut Vec<u8>) {
+    let mut buf = [0i16; 2 * 32];
+    loop {
+        let n = rs.flush_i16(&mut buf);
+        for v in &buf[..n * 2] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        if n < 32 {
+            break;
+        }
+    }
+}
+
+/// `release` of the A2DP output: the converter's lookahead into the stream before its end, counted as delivered (the
+/// live leg's `frames + 2 >= want`).
+#[cfg(all(target_arch = "x86_64", feature = "a2dp"))]
+fn bt_drain(o: &mut Out) {
+    let mut tail = Vec::new();
+    if let Some(rs) = o.rs.as_mut() {
+        bt_flush(rs, &mut tail);
+    }
+    if !tail.is_empty() {
+        let took = a2dp::write(&tail) as u64;
+        DELIVERED[OUT_BT as usize].fetch_add(took / 4, Ordering::Relaxed);
+        o.delivered += took / 4;
+    }
 }

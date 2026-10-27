@@ -404,3 +404,170 @@ mod tests {
         }
     }
 }
+
+// ---- NLE4BKERNEL (rmbp-ledger B896): the streaming form over interleaved i16, for the kernel's mixer ----
+// The ONE i16 <-> f32 conversion of the kernel's converters: the mixer's source ingest (any rate -> 48 kHz) and its A2DP
+// output (48 -> 44.1 kHz) call these, never `process` with their own conversion. Alloc-free: the samples cross in
+// stack chunks of `I16_CHUNK` samples (so at most `I16_CHUNK` channels); an output rounds half away from zero and
+// saturates to i16 (never wraps).
+
+/// Samples per stack chunk of [`Sinc::process_i16`] / [`Sinc::flush_i16`] (also their channel limit).
+pub const I16_CHUNK: usize = 64;
+
+impl Sinc {
+    /// [`Sinc::process`] over interleaved i16: all of `input`'s whole frames are taken, and as many ready output frames
+    /// as fit are written into `output` (`(source frames consumed, output frames produced)`); outputs that did not fit
+    /// come on the next call (`input` may then be empty). Bit-for-bit the f32 form's frames, rounded.
+    pub fn process_i16(&mut self, input: &[i16], output: &mut [i16]) -> (usize, usize) {
+        let ch = self.ch;
+        let step = (I16_CHUNK / ch).max(1);
+        let (frames, room_all) = (input.len() / ch, output.len() / ch);
+        let (mut fi, mut fo) = ([0.0f32; I16_CHUNK], [0.0f32; I16_CHUNK]);
+        let (mut took, mut made) = (0usize, 0usize);
+        loop {
+            let n = (frames - took).min(step);
+            for (d, s) in fi.iter_mut().zip(&input[took * ch..(took + n) * ch]) {
+                *d = *s as f32;
+            }
+            let room = (room_all - made).min(step);
+            let (t, m) = self.process(&fi[..n * ch], &mut fo[..room * ch]);
+            for (d, s) in output[made * ch..(made + m) * ch].iter_mut().zip(&fo[..m * ch]) {
+                *d = round_i16(*s);
+            }
+            took += t;
+            made += m;
+            if took == frames && m < room.max(1) {
+                break;
+            }
+        }
+        (took, made)
+    }
+
+    /// [`Sinc::flush`] over interleaved i16: the stream's tail (the lookahead read as silence) into `output`; call again
+    /// while it returns a full `output`.
+    pub fn flush_i16(&mut self, output: &mut [i16]) -> usize {
+        let ch = self.ch;
+        let step = (I16_CHUNK / ch).max(1);
+        let room_all = output.len() / ch;
+        let mut fo = [0.0f32; I16_CHUNK];
+        let mut made = 0usize;
+        while made < room_all {
+            let room = (room_all - made).min(step);
+            let m = self.flush(&mut fo[..room * ch]);
+            for (d, s) in output[made * ch..(made + m) * ch].iter_mut().zip(&fo[..m * ch]) {
+                *d = round_i16(*s);
+            }
+            made += m;
+            if m < room {
+                break;
+            }
+        }
+        made
+    }
+}
+
+/// An f32 sample (i16 scale) to i16: rounded half away from zero, saturated (`as` saturates; NaN is 0).
+fn round_i16(v: f32) -> i16 {
+    (if v >= 0.0 { v + 0.5 } else { v - 0.5 }) as i16
+}
+
+#[cfg(test)]
+mod kernel_i16 {
+    use super::*;
+
+    /// A deterministic i16 signal (a scrambled ramp at about half scale).
+    fn noise(n: usize, ch: usize) -> Vec<i16> {
+        (0..n * ch).map(|i| (((i as i64 * 7_919) % 32_749) - 16_374) as i16).collect()
+    }
+
+    /// The whole-stream f32 form, rounded: the reference the i16 form must equal.
+    fn whole_f32(from: u32, to: u32, ch: usize, src: &[i16]) -> Vec<i16> {
+        let mut s = Sinc::new(from, to, ch);
+        let fin: Vec<f32> = src.iter().map(|&v| v as f32).collect();
+        let mut out = alloc::vec![0.0f32; (src.len() / ch * to as usize / from as usize + 64) * ch];
+        let (_, a) = s.process(&fin, &mut out);
+        let b = s.flush(&mut out[a * ch..]);
+        out[..(a + b) * ch].iter().map(|&v| round_i16(v)).collect()
+    }
+
+    #[test]
+    fn i16_equal_rates_are_bit_exact() {
+        let src = noise(1_000, 2);
+        let mut s = Sinc::new(48_000, 48_000, 2);
+        let mut out = alloc::vec![0i16; 2_000];
+        assert_eq!(s.process_i16(&src, &mut out), (1_000, 1_000));
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn i16_frame_calls_equal_the_whole_f32_stream() {
+        // the mixer's ingest shape: ONE source frame per call (mono and stereo), then the flush at end of stream
+        for (from, to, ch) in [(44_100u32, 48_000u32, 1usize), (44_100, 48_000, 2), (22_050, 48_000, 1), (48_000, 44_100, 2)] {
+            let src = noise(3_001, ch);
+            let mut s = Sinc::new(from, to, ch);
+            let (mut got, mut buf) = (Vec::new(), [0i16; 16]);
+            for f in src.chunks_exact(ch) {
+                let (took, made) = s.process_i16(f, &mut buf[..8 * ch]);
+                assert_eq!(took, 1);
+                got.extend_from_slice(&buf[..made * ch]);
+            }
+            loop {
+                let n = s.flush_i16(&mut buf[..8 * ch]);
+                got.extend_from_slice(&buf[..n * ch]);
+                if n < 8 {
+                    break;
+                }
+            }
+            assert_eq!(got, whole_f32(from, to, ch, &src), "{from}->{to} ch={ch}");
+        }
+    }
+
+    #[test]
+    fn i16_saturates_never_wraps() {
+        // a full-scale square overshoots (Gibbs) through the sinc: the i16 form clamps where the f32 form exceeds i16
+        let src: Vec<i16> = (0..4_410).map(|i| if (i / 50) % 2 == 0 { i16::MAX } else { i16::MIN }).collect();
+        let reference = {
+            let mut s = Sinc::new(44_100, 48_000, 1);
+            let fin: Vec<f32> = src.iter().map(|&v| v as f32).collect();
+            let mut out = alloc::vec![0.0f32; 5_000];
+            let (_, a) = s.process(&fin, &mut out);
+            out.truncate(a);
+            out
+        };
+        assert!(reference.iter().any(|&v| v > 32_767.0) && reference.iter().any(|&v| v < -32_768.0), "the control: no overshoot");
+        let mut s = Sinc::new(44_100, 48_000, 1);
+        let mut out = alloc::vec![0i16; 5_000];
+        let (_, made) = s.process_i16(&src, &mut out);
+        assert_eq!(made, reference.len());
+        for (o, r) in out[..made].iter().zip(&reference) {
+            if *r > 32_767.0 {
+                assert_eq!(*o, i16::MAX);
+            } else if *r < -32_768.0 {
+                assert_eq!(*o, i16::MIN);
+            } else {
+                assert!((*o as f32 - r).abs() <= 0.5, "{o} vs {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn i16_bt_periods_count() {
+        // the mixer's A2DP output: 18 periods of 480 stereo frames at 48 kHz, then the flush at release = 7938 at 44.1 kHz
+        let src = noise(8_640, 2);
+        let mut s = Sinc::new(48_000, 44_100, 2);
+        let (mut made, mut buf) = (0usize, [0i16; 2 * 512]);
+        for p in src.chunks(480 * 2) {
+            let (took, m) = s.process_i16(p, &mut buf);
+            assert_eq!((took, m < 512), (480, true));
+            made += m;
+        }
+        loop {
+            let n = s.flush_i16(&mut buf);
+            made += n;
+            if n < 512 {
+                break;
+            }
+        }
+        assert_eq!(made, 7_938);
+    }
+}
