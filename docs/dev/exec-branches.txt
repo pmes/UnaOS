@@ -1091,7 +1091,7 @@ refs/heads/exec-rmbp-installercard   6bc2f17f9 FOLDED-BY-HAND (this commit) 2026
 refs/heads/exec-rmbp-s10keyzero   870337caa FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-xhciloanshedkat   a2d33fdae FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-preemptoffarmcensus   05beb9fa9 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-xhciloanptpyield   05beb9fa9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-xhciloanptpyield   5264e715a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidmaskcore   2ab1b5c93 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-leakedsurfgrow   039ba6743 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-gen7lockheld   3948ba9a5 FOLDED-BY-HAND (this commit) 2026-10-27
