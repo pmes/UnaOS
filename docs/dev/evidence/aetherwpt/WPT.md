@@ -834,3 +834,5 @@ No page went down (per-page diff of both runners after the `toplayer.rs` fix).
   its max-content capped at the viewport, whatever the definite available width, so `fit-content(<lp>)` (and the
   bare `fit-content`) do not clamp a text wider than the limit, and `max-content` stops at the viewport.
 
+
+MEASURE: PASS — the top-layer fit is built on the ONE existing top-layer list (toplayer.rs track() right after each removal, before the focus restore, per the seat's ruling); the dialog's absolute positioning and the IFC-root measure clamp capped at the viewport are the measurement's corrections; the two dropped pages returned to baseline with no page below it; both grants (js/html.rs, js/toplayer.rs) named.
