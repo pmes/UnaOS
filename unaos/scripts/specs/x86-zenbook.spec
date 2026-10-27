@@ -44,6 +44,9 @@ REQUIRE \[nvme\] ctrl mn=".*" ns=1 lba=\d+ blocks=\d+ -> ready
 OPTIONAL \[nvme\] test identify=ok sector0=GPT .* rw=ok .* lba=4096 shift=12 rmw=[1-9]\d*
 # NVMEMSIX (zenbook-ledger Z45): q35's nvme has MSI-X in BAR0 — the I/O CQ's completion vector fired during the rw leg
 OPTIONAL \[nvme\] test identify=ok .* irqs=[1-9]\d*
+# NVMEIRQWAIT (zenbook-ledger Z49): the rw leg's I/O waits slept on the vector and it woke them (the shell on the vector's CPU, unmasked); a vector that never wakes is the off-latch, never on QEMU
+OPTIONAL \[nvme\] test identify=ok .* waits=[1-9]\d* wakes=[1-9]\d*
+FORBID \[nvme\] irq wait off
 
 # ── 4. Z10: the compositor ignites on the GOP framebuffer (no Kepler takeover) — the GopBoot arm's first QEMU run ──────
 REQUIRE \[wc-x\] gop-ignite platform=zenbook_um5606w fb=\d+x\d+
