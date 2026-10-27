@@ -201,7 +201,7 @@ fn ensure_shellux() {
     #[cfg(all(feature = "witness", feature = "facet", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
     {
         static DONE3: AtomicBool = AtomicBool::new(false);
-        if !DONE3.swap(true, Ordering::AcqRel) { register("imgview", crate::video::facet::imgview_selftest); }
+        if !DONE3.swap(true, Ordering::AcqRel) { register("imgview", crate::video::facet::imgview_selftest); #[cfg(feature = "facetedit")] register("facetedit", crate::video::facetedit::selftest); } // FACETEDIT (B900): `tests facetedit`, the editor's eight gestures (LINE-NEUTRAL append, code before the comment)
     }
 }
 

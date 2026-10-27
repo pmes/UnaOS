@@ -1308,6 +1308,8 @@ fi
 [ -n "${UNAOS_SVG:-}" ] && _feats="${_feats}svg,"
 # VIDEOPLAYER (B434): UNAOS_VIDEO=1 — the Player plays video (video::vplay over demux_core + vp8_core + av1_core; links av1_core). x86 metal; the K8_FEATS arm in kernel8() compiles the dependency only. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_VIDEO:-}" ] && _feats="${_feats}videoplayer,"
+# FACETEDIT (rmbp-ledger B900): UNAOS_FACETEDIT=1 — Facet's kernel face, the image viewer's EDIT mode (video/facetedit*.rs over raster_core + brush_core + adjust_core; implies facet). x86-first: no K8_FEATS arm. The builder's map does not read it yet (FACETEDIT.md grant).
+[ -n "${UNAOS_FACETEDIT:-}" ] && _feats="${_feats}facetedit,"
 # unaos_ivb rides the same knob: BootInfo ABI fields — kernel and bootloader must agree (builder
 # arms the bootloader side; this feature list only reaches the kernel).
 [ -n "${UNAOS_IVB:-}" ] && _feats="${_feats}intel-ivb,unaos_ivb,"

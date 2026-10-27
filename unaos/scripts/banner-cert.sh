@@ -297,6 +297,13 @@ fi
 # Its caller is the registration folded onto `ensure_fpu`'s line under `#[cfg(feature = "tickless")]` inside that fn's
 # `#[cfg(target_arch = "x86_64")]` block, and `ensure_fpu` is called unconditionally by `tests::shell_verb` — so no
 # second knob (rule 7(a)); cond `@arch:x86_64` names the arch gate. unmeasured-here: the seat's fold measures it.
+#
+# `facetedit` (FACETEDIT, rmbp-ledger B900): token `[facetedit] closed win=`, the editor's close line (video/facetedit.rs
+# `close`); it occurs exactly once in crates/ + libs/. The module is compiled under `facetedit` AND the desktop family
+# (video/mod.rs: x86 `wc` | aarch64 `desktop_firmware`, facet's gate), which `facetedit` does not imply, so cond
+# `wc+desktop_firmware` (the `svg` row's shape; rule 7(a)). Its caller chain is live: `facet::service` / `key_route` /
+# `press_route` fold the editor's entries, and quarry drives those. unmeasured-here: no ELF built with the knob armed
+# for this row (the builder does not map UNAOS_FACETEDIT yet); the seat's fold measures it.
 # ---------------------------------------------------------------------------------------------
 bc_table() {
 cat <<'TABLE'
@@ -321,6 +328,7 @@ bt|vendor-classed: RF/Bluetooth subclass+protocol|-|measured
 btc|REACHED — a BR/EDR link was established|-|measured
 a2dp|usage: bt audio <aa:bb:cc:dd:ee:ff|-|unmeasured-here
 tickless|[tick] core=|@arch:x86_64|unmeasured-here
+facetedit|[facetedit] closed win=|wc+desktop_firmware|unmeasured-here
 smolnet|:: SOCK-1: smoltcp icmp echo|-|measured(1)
 wifi|:: wifi: firmware NOT staged — no program-source block device; searched|-|measured
 wifi2|:: wifi2: upload NOT ATTEMPTED uploaded-bytes=|-|measured
