@@ -97,6 +97,7 @@ members = [
     "tools/vertex",
     "tools/play-check",
     "tools/nle", # NLE1 (SR194): the editor's headless face — schedule / render an EDL through stria::nle
+    "tools/raster", # RASTERCLI (SR233): the host CLI over raster_core/brush_core/adjust_core — Facet's host witness
     "tools/aethervideo-check",
     "tools/unafs",
     "tools/una-card",
