@@ -33,17 +33,9 @@ fn map_err(e: hevc_core::Error) -> DecodeError {
     }
 }
 
-/// HEVCPAL (SR215): the reorder depth of an hvcC — its first SPS's `sps_max_num_reorder_pics` at the highest
-/// sub-layer, read by hevc_core's own parser (what `Demuxer::derive_dts` takes through `dsp::video::reorder_depth`).
-/// `None` when the record or its SPS does not parse. (HEVCDEPTH-CORE owes this fn in hevc_core::ps.)
-pub fn hvcc_reorder_depth(hvcc: &[u8]) -> Option<u32> {
-    let cfg = hevc_core::nal::parse_hvcc(hvcc).ok()?;
-    let nal = cfg.units().find(|u| u.first().is_some_and(|b| (b >> 1) & 0x3f == hevc_core::nal::SPS_NUT))?;
-    let mut rbsp = Vec::new();
-    hevc_core::nal::unescape(nal.get(2..)?, &mut rbsp);
-    let sps = hevc_core::ps::parse_sps(&rbsp).ok()?;
-    Some(sps.highest_ordering().max_num_reorder_pics)
-}
+/// HEVCPAL (SR215): the reorder depth of an hvcC (what `Demuxer::derive_dts` takes through `dsp::video::reorder_depth`).
+/// HEVCDEPTH-CORE (SR304): the one body is hevc_core's, beside its SPS parser; this adapter keeps no copy.
+pub use hevc_core::ps::hvcc_reorder_depth;
 
 impl HevcDecoder {
     pub fn new(track: &Track) -> Result<HevcDecoder, DecodeError> {
