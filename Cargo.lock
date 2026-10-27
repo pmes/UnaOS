@@ -5064,6 +5064,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "una-installer"
+version = "0.1.0"
+dependencies = [
+ "amber_bytes",
+ "amber_core",
+ "aule",
+ "bandy",
+ "elessar",
+ "gneiss_pal",
+ "log",
+ "quartzite",
+ "tokio",
+]
+
+[[package]]
 name = "una-res"
 version = "0.1.0"
 dependencies = [

@@ -117,6 +117,7 @@ members = [
     "vessels/facet-view",
     "vessels/stria-view", # NLE2 (SR201): Stria's editor face — one tetra tree on AppKit / GTK, the headless witness
     "vessels/una",
+    "vessels/una-installer", # INSTALLERVESSEL (SR413): the UnaOS_Installer vessel — host probe, the vessel catalog, build (Aulë) + install + run
     "libs/lux",
     "vessels/aether-shell"
 ]
