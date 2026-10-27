@@ -823,7 +823,7 @@ refs/heads/exec-rmbp-stationratectl   2e09a4ed6 FOLDED-BY-HAND (this commit) 202
 refs/heads/exec-rmbp-wpa2crypto   27569f892 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle5b   3688fb7ca FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kepler3d2   f2f7b61b3 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-stationerp   5e65a8816 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-stationerp   cbd72f19e FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-autolock4   600ac953d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-textscalereseat2   694417d6a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-sleepresume2   e37ca958d FOLDED-BY-HAND (this commit) 2026-10-27

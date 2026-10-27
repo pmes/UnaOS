@@ -20,7 +20,7 @@
 //! the gateway the operator named is S10a; smoltcp's DHCP over the kept station is S10b (`verb.rs::wifidhcp`).
 //!
 //! The KATs are hand-assembled from the clause layouts (no captured data frame exists in `docs/dev/evidence`),
-//! so `n=21/21` (STATIONRATECTL B881: `ratectl`, `fallback`) certifies the judge, the codec, the 1514-octet frame cap, the addr1 filter and the link watch (STATIONWATCH
+//! so `n=23/23` (STATIONRATECTL B881: `ratectl`, `fallback`; STATIONERP B884: `erp`, `cts`) certifies the judge, the codec, the 1514-octet frame cap, the addr1 filter and the link watch (STATIONWATCH
 //! B843), the TX header's rate fields, the station's MACCTL word, the AP's rate set and the probe's Null frame (STATIONRATE
 //! B855), the NAV, the short preamble and the DHCP lease seconds (STATIONAIR B862; the `lease` row exists only where smolnet
 //! does) against the standard's and b43's field order, not a replay of a capture.
@@ -351,9 +351,9 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
     let mut gs = g.clone();
     gs[24] = 0x21;
     checks.push(("shortpre", k[6] && matches!(super::assoc::assoc_reply_air(&gs, STA, BSSID), Some((a, Some(_), true)) if a.status == 0)
-        && !super::assoc::short_preamble(&g) && super::assoc::station_short(true, w::RATE_11M) && super::assoc::station_short(true, 4)
-        && !super::assoc::station_short(true, w::RATE_1M) && !super::assoc::station_short(true, w::RATE_24M)
-        && !super::assoc::station_short(false, w::RATE_11M)));
+        && !super::assoc::short_preamble(&g) && super::assoc::station_short(true, false, w::RATE_11M) && super::assoc::station_short(true, false, 4)
+        && !super::assoc::station_short(true, false, w::RATE_1M) && !super::assoc::station_short(true, false, w::RATE_24M)
+        && !super::assoc::station_short(false, false, w::RATE_11M) && !super::assoc::station_short(true, true, w::RATE_11M)));
     // 19. lease (STATIONLEASE B862): a BOOTP reply (op 2, Ethernet, hlen 6, magic 63 82 53 63 at 236) carrying DHCP message
     //     type 5 (ACK), mask 255.255.255.0 and option 51 = 3600 s, read through smoltcp's own parser (`smolnet::lease_of`) ->
     //     3600; the same as an OFFER (type 2) -> unread; a broken magic cookie -> unread.
@@ -373,7 +373,7 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
         checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
             && crate::smolnet::lease_of(&bad).is_none()));
     }
-    ratectl_rows(&mut checks); let mut pass = 0u8; // STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL)
+    ratectl_rows(&mut checks); erp_rows(&mut checks); let mut pass = 0u8; // STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
     let mut first = None;
     for (name, ok) in checks.iter() {
         if *ok {
@@ -771,4 +771,42 @@ fn ratectl_rows(checks: &mut Vec<(&'static str, bool)>) {
     checks.push(("fallback", fb(Some(g), w::RATE_24M) == w::RATE_11M && fb(Some(g), w::RATE_11M) == 11 && fb(Some(g), 11) == 4
         && fb(Some(g), 4) == w::RATE_1M && fb(Some(g), w::RATE_1M) == w::RATE_1M && fb(Some(b12), w::RATE_11M) == 4
         && fb(None, w::RATE_24M) == w::RATE_1M && super::bringup::station_kat()[7]));
+}
+
+/// `kat`'s rows after B881's (STATIONERP rmbp-ledger B884). `erp`: a beacon (§9.3.3.2) naming UnaNet with capability 0x0021 (ESS +
+/// Short Preamble) and an ERP element (§9.4.2.12, element 42) of 0x06 (Use_Protection | Barker_Preamble_Mode) -> `Bss { short: true,
+/// erp: Some(6) }`, protection asked, Barker asked, `erp=prot,barker`, S9's capability 0x0021, and CCK 11 then leaves LONG
+/// (`station_short(cap, barker, rate)`); the same beacon with capability 0x0001 and ERP 0x00 -> short false, `open,short`, S9
+/// capability 0x0001; with no ERP element (or an empty one) -> `None`, `absent`, neither asked. `cts`: `tx::cts_kat`'s header words.
+fn erp_rows(checks: &mut Vec<(&'static str, bool)>) {
+    use super::assoc;
+    let beacon = |cap: u16, erp: &[u8]| {
+        let mut f = alloc::vec![0x80, 0x00, 0x00, 0x00];
+        f.extend_from_slice(&[0xFF; 6]);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&[0x00, 0x00]);
+        f.extend_from_slice(&[0; 8]);
+        f.extend_from_slice(&[0x64, 0x00]);
+        f.extend_from_slice(&cap.to_le_bytes());
+        f.extend_from_slice(&[0x00, 0x06]);
+        f.extend_from_slice(b"UnaNet");
+        f.extend_from_slice(&[0x03, 0x01, 0x0b]);
+        f.extend_from_slice(erp);
+        f
+    };
+    let pb = assoc::bss_match(&beacon(0x0021, &[w::EID_ERP, 1, 0x06]), b"UnaNet");
+    let ob = assoc::bss_match(&beacon(0x0001, &[w::EID_ERP, 1, 0x00]), b"UnaNet");
+    let nb = assoc::bss_match(&beacon(0x0021, &[]), b"UnaNet");
+    let eb = assoc::bss_match(&beacon(0x0021, &[w::EID_ERP, 0]), b"UnaNet");
+    let prot = matches!(pb, Some(b) if b.short && b.erp == Some(0x06) && !b.protected && assoc::assoc_cap(&b) == 0x0021
+        && assoc::erp_protect(b.erp) && assoc::erp_barker(b.erp) && assoc::erp_text(b.erp) == "prot,barker"
+        && !assoc::station_short(b.short, assoc::erp_barker(b.erp), w::RATE_11M));
+    let open = matches!(ob, Some(b) if !b.short && b.erp == Some(0x00) && assoc::assoc_cap(&b) == 0x0001
+        && !assoc::erp_protect(b.erp) && !assoc::erp_barker(b.erp) && assoc::erp_text(b.erp) == "open,short");
+    let none = matches!(nb, Some(b) if b.erp.is_none() && assoc::erp_text(b.erp) == "absent" && !assoc::erp_protect(b.erp)
+        && assoc::station_short(b.short, assoc::erp_barker(b.erp), w::RATE_11M))
+        && matches!(eb, Some(b) if b.erp.is_none());
+    checks.push(("erp", prot && open && none));
+    checks.push(("cts", super::bringup::station_kat()[8]));
 }
