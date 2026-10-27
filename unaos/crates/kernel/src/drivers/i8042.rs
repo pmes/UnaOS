@@ -221,10 +221,11 @@ fn refuse(step: &'static str) {
     verdict(3, step);
 }
 
-/// The platform gate. ZENBOOKSURVEY's `crate::hw::platform()` is absent at this cut; the seat
-/// composes `if matches!(crate::hw::platform(), crate::hw::Platform::MacBookPro10_1) { return Some("platform=mac"); }`
-/// here at the fold. Until then the controller probe below (0xFF = no 8042) is the hardware's own answer.
+/// The platform gate: ZENBOOKSURVEY's `crate::hw::platform()` (Z1), composed at the fold. The rMBP has no 8042 behind
+/// its LPC (its keyboard is USB), so the probe is skipped by name there; elsewhere the controller probe below
+/// (0xFF = no 8042) is the hardware's own answer.
 fn platform_skip() -> Option<&'static str> {
+    if matches!(crate::hw::platform(), crate::hw::Platform::MacBookPro10_1) { return Some("platform=mac"); }
     None
 }
 
