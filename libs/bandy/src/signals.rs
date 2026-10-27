@@ -528,8 +528,15 @@ pub enum SMessage {
     /// Owner -> face (OPEN-DIALOG-ONE, LEDGER SR386): show the platform open panel (AppKit NSOpenPanel / GTK FileDialog)
     /// over the surface `url` (the lane that draws that surface answers; every other surface ignores it), offering the
     /// files whose names end in one of `filters` (extensions without the dot; empty = any file). The face reads nothing:
-    /// it answers [`SMessage::OpenPanelChose`]. APPENDED so no earlier wire tag moves.
-    OpenPanel { url: String, filters: Vec<String> },
+    /// it answers [`SMessage::OpenPanelChose`]. APPENDED so no earlier wire tag moves. SAVERECENTOPEN (SR403): `folder` is
+    /// the panel's initial directory (the Aether chrome's Ctrl/Cmd+O sends Principia's `aether.save.folder`, else the
+    /// Downloads folder); omitted from the wire when `None`, so a folderless panel keeps its frozen shape (smessage_kats).
+    OpenPanel {
+        url: String,
+        filters: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+    },
     /// Face -> owner (OPEN-DIALOG-ONE, SR386): the file the person chose in the [`SMessage::OpenPanel`] over `url`, or
     /// `None` when the panel was cancelled.
     OpenPanelChose { url: String, path: Option<String> },

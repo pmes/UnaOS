@@ -912,6 +912,15 @@ impl Coordinator {
                     let _ = tx.send(TabCmd::Msg(m.clone()));
                 }
             }
+            // SAVERECENTOPEN (SR403): Ctrl/Cmd+O is the chrome's open verb, not the page's key: the page surface's face shows
+            // the open panel in the recent folder; the chosen file is recorded (SAVERECENT's one writer) and the active tab
+            // opens it (an image through Facet, a page under the archive's sandbox). A cancel answers nothing.
+            SMessage::BrowserKey(k) if chrome::host::open_key(&k) => self.bus.fire(chrome::host::open_panel(quartzite::widgets::chrome_rows::stored_str)),
+            SMessage::OpenPanelChose { url, path: Some(p) } if url == chrome::host::OPEN_SURFACE => {
+                use quartzite::widgets::chrome_rows::{store_str, stored_str};
+                let url = chrome::host::open_chosen(std::path::Path::new(&p), stored_str, store_str);
+                self.to_active(SMessage::OpenDocument { url });
+            }
             SMessage::OpenDocument { .. }
             | SMessage::BrowserNavBack
             | SMessage::BrowserNavForward

@@ -1802,8 +1802,14 @@ kat!(
 // OPEN-DIALOG-ONE (SR386): the owner asks the face for a file to open; the face answers it, or null (cancelled).
 kat!(
     kat_open_panel,
-    SMessage::OpenPanel { url: "viewport".to_string(), filters: vec!["pdf".to_string()] },
+    SMessage::OpenPanel { url: "viewport".to_string(), filters: vec!["pdf".to_string()], folder: None },
     r#"{"OpenPanel":{"url":"viewport","filters":["pdf"]}}"#
+);
+// SAVERECENTOPEN (SR403): the chrome's Ctrl/Cmd+O opens the panel in the recent folder (any file: no filters).
+kat!(
+    kat_open_panel_folder,
+    SMessage::OpenPanel { url: "viewport".to_string(), filters: vec![], folder: Some("/home/p/Documents".to_string()) },
+    r#"{"OpenPanel":{"url":"viewport","filters":[],"folder":"/home/p/Documents"}}"#
 );
 kat!(
     kat_open_panel_chose,

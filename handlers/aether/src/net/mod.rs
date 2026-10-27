@@ -151,6 +151,7 @@ pub enum Doc {
 pub async fn fetch_document_any(input: &str) -> Result<(Doc, String)> {
     if input.starts_with("file://") {
         if let Some(opened) = crate::chrome::host::open_archive(input) { return opened.map(|(html, url)| (Doc::Text(html), url)); } // PAGESAVECOMPLETE (SR398): a .mhtml / .mht file URL opens as its archive (chrome::host); every other file stays refused
+        if let Some(opened) = crate::chrome::host::open_local(input) { return opened.map(|(html, url)| (Doc::Text(html), url)); } // SAVERECENTOPEN (SR403): a .html / .htm file URL opens under the archive's sandbox CSP (chrome::host); any other file is named on the console and refused below
         anyhow::bail!("file:// fetches are disabled for security reasons.");
     }
     let urls = normalize_url(input);

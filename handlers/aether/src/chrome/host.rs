@@ -664,9 +664,7 @@ fn rewrite_srcset(raw: &str, base: &str, saved: &std::collections::HashMap<Strin
 /// seeded into the HTTP cache's MEMORY tier under the page's partition ([`seed_parts`]) and the document runs under
 /// [`ARCHIVE_CSP`].
 pub fn open_archive(input: &str) -> Option<anyhow::Result<(String, String)>> {
-    let rest = input.strip_prefix("file://")?;
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
-    let path = PathBuf::from(downloads::percent_decode(rest.split(['?', '#']).next().unwrap_or("")));
+    let path = file_url_path(input)?; // SAVERECENTOPEN (SR403): the one file-URL parse, shared with `open_local`
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     if ext != "mhtml" && ext != "mht" {
         return None;
@@ -848,4 +846,78 @@ mod tests {
         assert_eq!(super::save_folder(|_, _| None), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+}
+
+// ---- SAVERECENTOPEN (SR403): the chrome's open verb (Ctrl/Cmd+O), its recent folder, and local pages -----------------
+// The shell's Coordinator catches the key (`open_key`; the engine cannot read Principia) and fires [`open_panel`] on the
+// one bus; the face's open panel (OPEN-DIALOG-ONE, SR386) answers `OpenPanelChose`, which [`open_chosen`] records through
+// SAVERECENT's ONE writer (`remember_saved`) and turns into the file URL the active tab opens: an image through the tab's
+// Facet arm, a `.mhtml` through [`open_archive`], a `.html` / `.htm` through [`open_local`] (net's file-URL arm).
+
+/// SAVERECENTOPEN (SR403): the surface whose face answers the open panel (the page surface, as a Save As's panel).
+pub const OPEN_SURFACE: &str = "viewport";
+
+/// SAVERECENTOPEN (SR403): is `key` the chrome's open verb, Ctrl+O (GTK) or Cmd+O (`Meta+o`, the macOS page view)? Not
+/// with Alt or Shift. Read by the engine's one key parser (`forms::edit::parse_key`).
+pub fn open_key(key: &str) -> bool {
+    use crate::forms::edit::{parse_key, Key};
+    let (m, k) = parse_key(key);
+    (m.ctrl || m.meta) && !m.alt && !m.shift && matches!(k, Some(Key::Char('o' | 'O')))
+}
+
+/// SAVERECENTOPEN (SR403): the folder the open panel starts in: SAVERECENT's [`save_folder`] (the folder the last Save
+/// As or Open chose, while it is a directory), else the Downloads folder ([`downloads_dir`]).
+pub fn open_folder(get: impl Fn(&str, &str) -> Option<String>) -> String {
+    save_folder(get).unwrap_or_else(|| downloads_dir().to_string_lossy().into_owned())
+}
+
+/// SAVERECENTOPEN (SR403): the open panel Ctrl/Cmd+O asks the page surface's face for: any file (no filters: a type
+/// Aether does not serve is refused by name when it loads, so the panel keeps no second extension table), opening in
+/// [`open_folder`].
+pub fn open_panel(get: impl Fn(&str, &str) -> Option<String>) -> bandy::SMessage {
+    bandy::SMessage::OpenPanel { url: OPEN_SURFACE.to_string(), filters: Vec::new(), folder: Some(open_folder(get)) }
+}
+
+/// SAVERECENTOPEN (SR403): the file the person chose in the open panel: recorded through SAVERECENT's ONE writer
+/// ([`remember_saved`]: its folder becomes `aether.save.folder`, the path heads `aether.recent`), answered as the
+/// `file://` URL the active tab opens (each path segment percent-encoded by [`seg_encode`]).
+pub fn open_chosen(path: &Path, get: impl Fn(&str, &str) -> Option<String>, set: impl FnMut(&str, &str, String)) -> String {
+    remember_saved(path, get, set);
+    let p = path.to_string_lossy();
+    format!("file://{}", p.split('/').map(seg_encode).collect::<Vec<_>>().join("/"))
+}
+
+/// SAVERECENTOPEN (SR403): the local path a `file://` URL names (`localhost` host allowed, the query and fragment
+/// dropped, `%XX` decoded); `None` for any other URL. [`open_archive`] and [`open_local`] read it.
+fn file_url_path(input: &str) -> Option<PathBuf> {
+    let rest = input.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    Some(PathBuf::from(downloads::percent_decode(rest.split(['?', '#']).next().unwrap_or(""))))
+}
+
+/// SAVERECENTOPEN (SR403): the loader's second file-URL arm (`net::fetch_document_any`, after [`open_archive`]'s): a
+/// `.html` / `.htm` file opens as its markup (at most [`ARCHIVE_MAX`]), the document's URL the file URL, under
+/// [`ARCHIVE_CSP`] as an opened archive is (no script runs, an opaque origin). Any other file is refused by name on the
+/// console (`[pdf] open: <ext> not served`, `none` without an extension) and answered `None`: the loader's own refusal
+/// follows.
+pub fn open_local(input: &str) -> Option<anyhow::Result<(String, String)>> {
+    let path = file_url_path(input)?;
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("html" | "htm") => Some(read_local(input, &path)),
+        other => {
+            crate::js::host::console_out(1, &format!("[pdf] open: {} not served", other.unwrap_or("none")));
+            None
+        }
+    }
+}
+
+/// [`open_local`]'s read.
+fn read_local(input: &str, path: &Path) -> anyhow::Result<(String, String)> {
+    if std::fs::metadata(path)?.len() > ARCHIVE_MAX {
+        anyhow::bail!("the page exceeds {} MiB", ARCHIVE_MAX >> 20);
+    }
+    let bytes = std::fs::read(path)?;
+    crate::security::set_document_headers(input, &[("content-security-policy".to_string(), ARCHIVE_CSP.to_string())]);
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), input.to_string()))
 }

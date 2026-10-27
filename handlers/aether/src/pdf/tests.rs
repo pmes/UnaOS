@@ -1351,3 +1351,93 @@ fn pagesave_fetch_stub() {
     assert_eq!(*asked.borrow(), vec![(IMG.to_string(), site.clone()), (IMG.to_string(), site)], "once per save, in the partition");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- SAVERECENTOPEN (SR403): the chrome's open verb (Ctrl/Cmd+O), the recent folder, a local page opened sandboxed --
+
+/// SAVERECENTOPEN (SR403): a fake Principia store (the shell's is quartzite's `chrome_rows::stored_str` / `store_str`).
+type OpenVerbStore = std::cell::RefCell<std::collections::HashMap<(String, String), String>>;
+
+fn open_verb_get(store: &OpenVerbStore) -> impl Fn(&str, &str) -> Option<String> + '_ {
+    move |ns: &str, k: &str| store.borrow().get(&(ns.to_string(), k.to_string())).cloned()
+}
+
+fn open_verb_set(store: &OpenVerbStore) -> impl FnMut(&str, &str, String) + '_ {
+    move |ns: &str, k: &str, v: String| {
+        store.borrow_mut().insert((ns.to_string(), k.to_string()), v);
+    }
+}
+
+/// SAVERECENTOPEN (SR403): Ctrl+O (GTK) / Cmd+O (`Meta+o`) is the open verb, nothing else is; its panel is the page
+/// surface's, any file, opening in the recent folder while it is a directory, else in Downloads.
+#[test]
+fn open_verb_ctrl_o_fires_panel_with_recent_folder() {
+    use crate::chrome::host::{downloads_dir, open_key, open_panel, OPEN_SURFACE, SAVE_FOLDER_KEY};
+    assert!(open_key("Ctrl+o") && open_key("Meta+o"), "Ctrl+O and Cmd+O open");
+    for k in ["o", "Ctrl+Shift+O", "Ctrl+Alt+o", "Ctrl+s", "Meta+Shift+s"] {
+        assert!(!open_key(k), "{k} is not the open verb");
+    }
+    let dir = pagesave_dir("openverbpanel");
+    let d = dir.to_string_lossy().into_owned();
+    let store = OpenVerbStore::default();
+    open_verb_set(&store)("aether", SAVE_FOLDER_KEY, d.clone());
+    match open_panel(open_verb_get(&store)) {
+        bandy::SMessage::OpenPanel { url, filters, folder } => {
+            assert_eq!(url, OPEN_SURFACE);
+            assert!(filters.is_empty(), "any file: an unserved type is refused by name when it loads");
+            assert_eq!(folder.as_deref(), Some(d.as_str()), "the recent folder");
+        }
+        other => panic!("not an OpenPanel: {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    let downloads = downloads_dir().to_string_lossy().into_owned();
+    match open_panel(open_verb_get(&store)) {
+        bandy::SMessage::OpenPanel { folder, .. } => assert_eq!(folder.as_deref(), Some(downloads.as_str()), "a stale folder falls back to Downloads"),
+        other => panic!("not an OpenPanel: {other:?}"),
+    }
+}
+
+/// SAVERECENTOPEN (SR403): the chosen `.html` is recorded through SAVERECENT's one writer (its folder, the recent list's
+/// head) and opens through the loader as the file URL under the archive's sandbox: its script does not run.
+#[tokio::test]
+async fn open_verb_html_sandboxed_and_recorded() {
+    use crate::chrome::host::{open_chosen, recent_paths, RECENT_KEY, SAVE_FOLDER_KEY};
+    let dir = pagesave_dir("openverbhtml");
+    let path = dir.join("a page.html");
+    std::fs::write(&path, "<html><head><title>Local</title></head><body><p>from the disk</p><script>document.title = 'scripted';</script></body></html>").unwrap();
+    let store = OpenVerbStore::default();
+    open_verb_set(&store)("aether", RECENT_KEY, "/older/x.pdf".to_string());
+    let url = open_chosen(&path, open_verb_get(&store), open_verb_set(&store));
+    assert_eq!(url, format!("file://{}", path.display()).replace(' ', "%20"), "the file URL, percent-encoded");
+    let get = open_verb_get(&store);
+    assert_eq!(get("aether", SAVE_FOLDER_KEY), Some(dir.to_string_lossy().into_owned()), "the folder is recorded");
+    let recent = recent_paths(get("aether", RECENT_KEY).as_deref());
+    assert_eq!(recent, [path.to_string_lossy().into_owned(), "/older/x.pdf".to_string()], "the path heads the recent list");
+    let page = crate::net::fetch_page(&url).await.expect("the local page opens");
+    assert_eq!(page.base_url, url, "the document's URL is the file URL");
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_page(page, true);
+    let (title, body) = title_and_body(e.document.as_ref().unwrap());
+    assert_eq!(title, "Local", "the page's script did not run");
+    assert!(body.contains("from the disk"), "{body}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// SAVERECENTOPEN (SR403): a file Aether does not serve is named on the console line and refused by the loader.
+#[tokio::test]
+async fn open_verb_refused_extension_prints_line() {
+    let dir = pagesave_dir("openverbrefused");
+    let path = dir.join("notes.txt");
+    std::fs::write(&path, "plain").unwrap();
+    let url = format!("file://{}", path.display());
+    let mut e = AetherEngine::new();
+    e.set_device_size(200, 100);
+    e.load_html("https://openverb.example/", "<p>console</p>", true);
+    assert!(crate::chrome::host::open_local(&url).is_none(), "a .txt is not served");
+    assert!(crate::chrome::host::open_local("file:///etc/hostname").is_none());
+    let lines = crate::js::console_lines();
+    assert!(lines.iter().any(|(_, l)| l == "[pdf] open: txt not served"), "named on the console line: {lines:?}");
+    assert!(lines.iter().any(|(_, l)| l == "[pdf] open: none not served"), "no extension: {lines:?}");
+    assert!(crate::net::fetch_document_any(&url).await.is_err(), "the loader refuses it");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
