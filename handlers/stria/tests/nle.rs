@@ -819,3 +819,127 @@ fn nle_standin_open_a_reel_no_decoder_fits_is_edited_on_stand_in_frames() {
     assert_eq!(sink.frames[0], (3, TestPattern::render(64, 48, 3)));
     println!("nle-standin-open: {report} frames={}", r.frames);
 }
+
+// NLESIZESWITCH (LEDGER SR384): the editor's run across a mid-stream size switch. SR379's two-size AV1 reel (kodim23's item,
+// 768x512, for samples 0-1, kids_720p's, 1280x720, a new coded video sequence, for 2-3; the track declares 768x512) was
+// refused `source 0 frame 1280x720 is not the project size`; now the run letterboxes each switched frame into the reel's
+// first size through the editor's ONE fit (`timeline_core::view::Canvas::blit_fit`), says so once, and the host export
+// encodes every frame at that size. The pictures are av1_core's sha256-pinned public vectors (SKIP offline).
+#[path = "../../../unaos/libs/media/av1_core/tests/common/mod.rs"]
+mod av1_vectors;
+
+/// The run's log lines, captured per thread (tests/media.rs's HEVCPAL-SWAP shape; this binary had no logger).
+struct NleSizeSwitchLog;
+static NLESIZESWITCH_LINES: std::sync::Mutex<Vec<(std::thread::ThreadId, String)>> = std::sync::Mutex::new(Vec::new());
+impl log::Log for NleSizeSwitchLog {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, r: &log::Record) {
+        NLESIZESWITCH_LINES.lock().unwrap().push((std::thread::current().id(), r.args().to_string()));
+    }
+    fn flush(&self) {}
+}
+fn nlesizeswitch_lines(containing: &str) -> Vec<String> {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log::set_logger(&NleSizeSwitchLog).expect("no other logger in this test binary");
+        log::set_max_level(log::LevelFilter::Info);
+    });
+    let me = std::thread::current().id();
+    NLESIZESWITCH_LINES.lock().unwrap().iter().filter(|(t, l)| *t == me && l.contains(containing)).map(|(_, l)| l.clone()).collect()
+}
+
+/// SR379's fixture (tests/media.rs `av1inbandsize_reel`): one av01 track declared 768x512, 4 key samples of 40 ms.
+fn nlesizeswitch_reel() -> Option<Vec<u8>> {
+    use gneiss_pal::dsp::demux::build::{self, Mp4Options};
+    let small = av1_vectors::avif_item(&av1_vectors::fetch("kodim23_yuv420_8bpc")?).unwrap();
+    let big = av1_vectors::avif_item(&av1_vectors::fetch("kids_720p")?).unwrap();
+    assert_eq!((small.ispe, big.ispe), (Some((768, 512)), Some((1280, 720))));
+    let mut spec = build::TrackSpec::test_pattern(1, 768, 512, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = small.av1c.clone().unwrap()[..4].to_vec();
+    spec.timescale = 1000;
+    let samples = (0..4).map(|i| build::SampleSpec { data: if i < 2 { small.data.clone() } else { big.data.clone() }, dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+    Some(build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &build::Mp4Extras::default()))
+}
+
+#[derive(Default)]
+struct NleSizeSwitchSink {
+    frames: Vec<(u32, u32, Vec<u8>)>,
+}
+impl RenderSink for NleSizeSwitchSink {
+    fn frame(&mut self, _out_t: i64, w: u32, h: u32, rgba: &[u8]) {
+        self.frames.push((w, h, rgba.to_vec()));
+    }
+    fn pcm(&mut self, _out_t: i64, _rate: u32, _ch: u16, _s: &[f32]) {}
+}
+
+#[test]
+fn nlesizeswitch_two_size_reel_runs_and_exports_at_the_first_size() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use gneiss_pal::dsp::video::{chroma_of, decoder_for};
+    use timeline_core::view::{Canvas, FIELD, Order, Still};
+    let _ = nlesizeswitch_lines("");
+    let Some(file) = nlesizeswitch_reel() else { return };
+    let (tl, src) = Sources::from_media("two", &file, 25).unwrap().expect("an MP4");
+
+    // The run: every frame at the reel's first size.
+    let mut sink = NleSizeSwitchSink::default();
+    let r = render(&tl, 0..4, &src, &mut sink).unwrap();
+    assert_eq!((r.width, r.height, r.frames), (768, 512, 4));
+    assert!(sink.frames.iter().all(|(w, h, px)| (*w, *h, px.len()) == (768, 512, 768 * 512 * 4)), "one size reaches the sink");
+
+    // The expected pictures: the decoder's own frames converted by the reel's colour, the switched ones fitted by Canvas::blit_fit.
+    let colour = src.open_report(SourceId(0)).and_then(|o| o.colour);
+    let mut d = Demuxer::open(file.clone()).unwrap();
+    let track = d.tracks()[0].clone();
+    let mut dec = decoder_for(&track).unwrap();
+    let mut decoded = Vec::new();
+    while let Some(p) = d.next_packet() {
+        decoded.extend(dec.decode(&p).unwrap());
+    }
+    decoded.extend(dec.flush());
+    assert_eq!(decoded.iter().map(|f| (f.width, f.height)).collect::<Vec<_>>(), vec![(768, 512), (768, 512), (1280, 720), (1280, 720)]);
+    for (i, f) in decoded.iter().enumerate() {
+        let native = f.to_rgba_colour(colour.as_ref(), chroma_of(&track));
+        let want = if i < 2 {
+            native
+        } else {
+            let mut c = Canvas::new(768, 512, Order::Rgba);
+            c.rect(0, 0, 768, 512, FIELD);
+            c.blit_fit(&Still { width: 1280, height: 720, rgba: native }, 0, 0, 768, 512);
+            c.px
+        };
+        assert!(sink.frames[i].2 == want, "frame {i}: the run's picture is the reel's conversion (fitted when switched)");
+    }
+    // 1280x720 into 768x512 keeps its aspect: 768x432 at y 40, black bars above and below.
+    let px = |i: usize, x: usize, y: usize| sink.frames[i].2[(y * 768 + x) * 4..(y * 768 + x) * 4 + 4].to_vec();
+    assert_eq!((px(2, 384, 0), px(2, 384, 39), px(2, 384, 472), px(2, 384, 511)), (FIELD.to_vec(), FIELD.to_vec(), FIELD.to_vec(), FIELD.to_vec()));
+    let lines = nlesizeswitch_lines("nle size switch");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("reel=0 1280x720->768x512 scaled"), "{}", lines[0]);
+
+    // The host export: the encoder sees the first size only.
+    use stria::nle_export::{AudioOut, H264Encoder, export};
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlesizeswitch");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let rep = export(&tl, 0..4, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap();
+    assert_eq!(rep.frames, 4);
+    let out = Demuxer::open(std::fs::read(dir.join("video.mp4")).unwrap()).unwrap();
+    let vt = out.tracks()[0].clone();
+    assert_eq!((vt.width, vt.height, vt.sample_count), (768, 512, 4));
+    let mut dec = decoder_for(&vt).unwrap();
+    let mut got = Vec::new();
+    for s in out.track_samples(0).copied().collect::<Vec<_>>() {
+        got.extend(dec.decode(&out.packet_at(&s)).unwrap());
+    }
+    got.extend(dec.flush());
+    assert_eq!(got.iter().map(|f| (f.width, f.height)).collect::<Vec<_>>(), vec![(768, 512); 4]);
+    let lines = nlesizeswitch_lines("nle size switch");
+    assert_eq!(lines.len(), 2, "the export's own run says it once more: {lines:?}");
+    println!("nlesizeswitch: {} ; run 768x512 x4, export avc1 768x512 x4", lines[0]);
+}

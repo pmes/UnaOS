@@ -636,3 +636,47 @@ fn http_media_is_cached_then_handed_to_stria_as_a_file_and_a_failure_paints() {
     assert!(!e2.media_elements()[0].fetching);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ------------------------------------------------------------------------------------------
+// NLESIZESWITCH (LEDGER SR384) AETHER-VIDEO-RESIZE: a mid-stream size switch (Stria's MediaFrames each carry their own size)
+// moves `natural`, so videoWidth / videoHeight follow, `resize` fires once for the change, and the box relays out.
+
+fn nlesizeswitch_settle(e: &mut AetherEngine) {
+    for _ in 0..6 {
+        if let Some(js) = e.js_engine.as_mut() {
+            crate::event_loop::settle(js, 50);
+        }
+        e.tick();
+    }
+}
+
+#[test]
+fn nlesizeswitch_new_frame_size_moves_natural_and_fires_resize_once() {
+    let mut e = AetherEngine::new();
+    e.load_html(
+        "file:///page/r.html",
+        r#"<html><body style="margin:0"><video src="clip.webm"></video><script>window.log = []; var v = document.querySelector('video'); v.addEventListener('resize', function () { log.push(v.videoWidth + 'x' + v.videoHeight); });</script></body></html>"#,
+        true,
+    );
+    nlesizeswitch_settle(&mut e);
+    let url = e.media_elements()[0].url.clone();
+    let node = e.media_elements()[0].node.clone();
+    let _ = e.take_media_requests();
+    let frame = |w: u32, h: u32, n: i64| SMessage::MediaFrame { url: url.clone(), pts_ns: n * FRAME_NS, width: w, height: h, rgba: TestPattern::render(w, h, n as u32), levels: vec![] };
+    e.on_media_message(&SMessage::MediaOpened { url: url.clone(), duration_ns: (FRAMES * FRAME_NS) as u64, width: W, height: H, video: "V_AV1".into(), audio: String::new(), real_video: true, audio_clock: false });
+    e.on_media_message(&frame(W, H, 0));
+    e.on_media_message(&frame(W, H, 1));
+    nlesizeswitch_settle(&mut e);
+    let eval = |e: &mut AetherEngine, src: &str| e.js_engine.as_mut().expect("page has a script engine").eval_string(src).unwrap_or_else(|err| format!("THROW {err}"));
+    assert_eq!(eval(&mut e, "log.join(' ')"), format!("{W}x{H}"), "metadata's resize only");
+    e.on_media_message(&frame(2 * W, 2 * H, 2));
+    e.on_media_message(&frame(2 * W, 2 * H, 3));
+    nlesizeswitch_settle(&mut e);
+    assert_eq!(e.media_elements()[0].natural, Some((2 * W, 2 * H)));
+    assert_eq!(eval(&mut e, "v.videoWidth + 'x' + v.videoHeight"), format!("{}x{}", 2 * W, 2 * H));
+    assert_eq!(eval(&mut e, "log.join(' ')"), format!("{W}x{H} {}x{}", 2 * W, 2 * H), "ONE resize for the switch");
+    assert_eq!(media::events(&node).iter().filter(|t| **t == "resize").count(), 2);
+    e.render_frame();
+    let (_, _, w, h) = video_box(&e, 0);
+    assert_eq!((w, h), (2 * W, 2 * H), "the box follows the new intrinsic size");
+}

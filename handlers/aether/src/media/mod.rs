@@ -1044,6 +1044,7 @@ pub fn on_message(msg: &SMessage) -> Effect {
                         e.natural = Some((f.width(), f.height()));
                         fx.relayout = true;
                     }
+                    fx.relayout |= video_resize(e, f.width(), f.height()); // NLESIZESWITCH (SR384) AETHER-VIDEO-RESIZE: natural follows the frame, `resize` once per change
                     e.frame = Some(f);
                     e.pts_ns = *pts_ns;
                     e.presented += 1;
@@ -1623,3 +1624,19 @@ pub mod tracks;
 
 #[cfg(test)]
 mod tests;
+
+// ── NLESIZESWITCH (LEDGER SR384): AETHER-VIDEO-RESIZE (handlers.md §5 NLEPROBE-HDR) ──
+/// HTML §4.8.12: whenever the video's intrinsic width or height changes and `readyState` is not HAVE_NOTHING, fire `resize`.
+/// A presented MediaFrame of another size than `natural` (a mid-stream size switch: each frame carries its own size) is the
+/// new intrinsic size: `natural`, so videoWidth / videoHeight, `requestVideoFrameCallback`'s width / height and the box's
+/// intrinsic size, follows it, through the ONE event path [`fire`]. True when layout must be rebuilt.
+fn video_resize(e: &mut Element, w: u32, h: u32) -> bool {
+    if e.kind != Kind::Video || e.natural.is_none() || e.natural == Some((w, h)) {
+        return false;
+    }
+    e.natural = Some((w, h));
+    if e.ready_state != HAVE_NOTHING {
+        fire(e, "resize");
+    }
+    true
+}
