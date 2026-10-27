@@ -4,7 +4,8 @@
 //! The picture under decoding: three 8-bit planes (4:2:0) and the facts the parser, intra prediction, the deblocking
 //! filter and SAO read back — per 4x4 luma block (coding quadtree depth, IntraPredModeY, QpY, pcm / transquant bypass,
 //! transform / coding block edges) and per CTB (its slice, its SAO parameters) — with the z-scan availability
-//! process of 6.4.1, and the conformance-window crop into h264_core's [`Frame`].
+//! process of 6.4.1, and the conformance-window crop into h264_core's [`Frame`]. HEVCINTER (SR216): the per-4x4 motion
+//! field ([`PuMotion`]) that merge / AMVP, the temporal predictor of later pictures and the deblocking filter read.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -62,8 +63,42 @@ pub const F_BYPASS: u8 = 2;
 /// A transform or coding block edge lies on the left / top of this 4x4 block.
 pub const F_EDGE_V: u8 = 4;
 pub const F_EDGE_H: u8 = 8;
+/// The block lies in a luma transform block with non-zero coefficients (cbf_luma; 8.7.2.4 bS 1).
+pub const F_CBF: u8 = 16;
+/// A prediction block edge (not a transform edge) lies on the left / top of this 4x4 block.
+pub const F_PU_EDGE_V: u8 = 32;
+pub const F_PU_EDGE_H: u8 = 64;
+/// cu_skip_flag of the block's coding unit (9.3.4.2.2 ctxInc of the next cu_skip_flag).
+pub const F_SKIP: u8 = 128;
 /// The block has been parsed (its CU's facts are filled).
 pub const NO_SLICE: u32 = u32::MAX;
+
+/// The motion of one 4x4 luma block (8.5.3.2): predFlagL0 (bit 0) / predFlagL1 (bit 1), refIdxLX, mvLX in quarter
+/// luma samples, and the PicOrderCntVal / long-term marking of each list's reference picture as the block's slice saw
+/// them (the temporal predictor of a later picture and the deblocking filter compare pictures by them). `pred` 0 is an
+/// intra block (or one not yet decoded); an unused list keeps ref_idx -1, mv 0, ref_poc 0, ref_lt false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PuMotion {
+    pub pred: u8,
+    pub ref_idx: [i8; 2],
+    pub mv: [[i32; 2]; 2],
+    pub ref_poc: [i32; 2],
+    pub ref_lt: [bool; 2],
+}
+
+impl Default for PuMotion {
+    fn default() -> Self {
+        PuMotion { pred: 0, ref_idx: [-1, -1], mv: [[0; 2]; 2], ref_poc: [0; 2], ref_lt: [false; 2] }
+    }
+}
+
+impl PuMotion {
+    /// predFlagLX.
+    #[inline]
+    pub fn uses(&self, x: usize) -> bool {
+        self.pred & (1 << x) != 0
+    }
+}
 
 pub struct Picture {
     pub width: usize,
@@ -79,6 +114,8 @@ pub struct Picture {
     pub ctb_slice: Vec<u32>,
     pub sao: Vec<SaoParams>,
     pub slices: Vec<SliceInfo>,
+    /// The motion of every 4x4 block (HEVCINTER).
+    pub motion: Vec<PuMotion>,
     pub poc: i32,
     pub tag: i64,
     pub full_range: bool,
@@ -104,6 +141,7 @@ impl Picture {
             ctb_slice: vec![NO_SLICE; nctb],
             sao: vec![SaoParams::default(); nctb],
             slices: Vec::new(),
+            motion: vec![PuMotion::default(); n4],
             poc: 0,
             tag: 0,
             full_range: false,

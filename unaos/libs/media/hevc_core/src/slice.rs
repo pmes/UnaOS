@@ -63,6 +63,8 @@ pub struct SliceHeader {
     /// The slice's own set when !short_term_ref_pic_set_sps_flag.
     pub st_rps: Option<StRps>,
     pub long_term: Vec<LongTerm>,
+    /// num_long_term_sps: the first entries of `long_term` that index the SPS candidates (7-52 restarts there).
+    pub num_long_term_sps: u32,
     pub temporal_mvp_enabled_flag: bool,
     pub sao_luma_flag: bool,
     pub sao_chroma_flag: bool,
@@ -230,6 +232,7 @@ pub fn parse_slice_header(rbsp: &[u8], nal: &NalHeader, sps: &Sps, pps: &Pps, pr
                 if num_lt_sps > nsps {
                     return Err(Error::Invalid("num_long_term_sps"));
                 }
+                h.num_long_term_sps = num_lt_sps;
                 let num_lt_pics = r.ue();
                 if num_lt_sps + num_lt_pics > 32 {
                     return Err(Error::Invalid("num_long_term_pics"));

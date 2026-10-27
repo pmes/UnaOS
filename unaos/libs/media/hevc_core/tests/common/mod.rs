@@ -237,6 +237,84 @@ impl CabacEnc {
         self.cbf_chroma(0, false);
         self.cbf_luma(0, false);
     }
+    // HEVCINTER (SR216) syntax elements.
+    pub fn cu_skip(&mut self, inc: usize, v: bool) {
+        self.decision(CU_SKIP + inc, v as u32);
+    }
+    /// pred_mode_flag 0 (MODE_INTER).
+    pub fn pred_inter(&mut self) {
+        self.decision(PRED_MODE, 0);
+    }
+    pub fn merge_flag(&mut self, v: bool) {
+        self.decision(MERGE_FLAG, v as u32);
+    }
+    /// merge_idx `i` with MaxNumMergeCand `max` (TR, first bin context-coded).
+    pub fn merge_idx(&mut self, i: u32, max: u32) {
+        for k in 0..max - 1 {
+            let bin = (k < i) as u32;
+            if k == 0 { self.decision(MERGE_IDX, bin) } else { self.bypass(bin) }
+            if bin == 0 {
+                break;
+            }
+        }
+    }
+    /// ref_idx_lX `i` with num_ref_idx_lX_active `n` (TR, two context-coded bins).
+    pub fn ref_idx(&mut self, i: u32, n: u32) {
+        for k in 0..n - 1 {
+            let bin = (k < i) as u32;
+            if k < 2 { self.decision(REF_IDX + k as usize, bin) } else { self.bypass(bin) }
+            if bin == 0 {
+                break;
+            }
+        }
+    }
+    /// inter_pred_idc PRED_BI of a prediction block with nPbW + nPbH != 12 at coding quadtree depth `depth`.
+    pub fn pred_bi(&mut self, depth: usize) {
+        self.decision(INTER_PRED_IDC + depth, 1);
+    }
+    /// mvd_coding() (7.3.8.9).
+    pub fn mvd(&mut self, v: [i32; 2]) {
+        for c in v {
+            self.decision(ABS_MVD_GT0, (c != 0) as u32);
+        }
+        for c in v {
+            if c != 0 {
+                self.decision(ABS_MVD_GT1, (c.abs() > 1) as u32);
+            }
+        }
+        for c in v {
+            if c != 0 {
+                if c.abs() > 1 {
+                    self.egk(c.unsigned_abs() - 2, 1);
+                }
+                self.bypass((c < 0) as u32);
+            }
+        }
+    }
+    pub fn mvp_flag(&mut self, v: u32) {
+        self.decision(MVP_FLAG, v);
+    }
+    pub fn rqt_root_cbf(&mut self, v: bool) {
+        self.decision(RQT_ROOT_CBF, v as u32);
+    }
+    /// A 2^log2 coding unit with pcm_flag 1 (its quadtree split flag `split_inc` 0 coded first) holding `y` / `cb` /
+    /// `cr` samples (row-major), the engine restarted after them.
+    pub fn pcm_cu(&mut self, split_inc: usize, log2: u32, y: &[u8], cb: &[u8], cr: &[u8]) {
+        self.split_cu(split_inc, false);
+        self.terminate(1);
+        self.zero_align();
+        let n = 1usize << log2;
+        for &v in &y[..n * n] {
+            self.bw.u(v as u64, 8);
+        }
+        for p in [cb, cr] {
+            for &v in &p[..n * n / 4] {
+                self.bw.u(v as u64, 8);
+            }
+        }
+        self.restart();
+    }
+
     pub fn finish(mut self) -> BitWriter {
         self.terminate(1);
         self.zero_align();
@@ -376,6 +454,20 @@ impl Default for SpsCfg {
 }
 
 pub fn sps_rbsp(c: &SpsCfg) -> Vec<u8> {
+    sps_rbsp_ext(c, &InterSps::default())
+}
+
+/// HEVCINTER (SR216): the SPS fields an inter stream sets; the default writes [`sps_rbsp`]'s bits.
+#[derive(Clone, Default)]
+pub struct InterSps {
+    pub max_dec_pic_buffering_minus1: u32,
+    pub max_num_reorder_pics: u32,
+    pub depth_inter: u32,
+    pub amp: bool,
+    pub temporal_mvp: bool,
+}
+
+pub fn sps_rbsp_ext(c: &SpsCfg, x: &InterSps) -> Vec<u8> {
     let mut b = BitWriter::default();
     b.u(0, 4);
     b.u(0, 3);
@@ -401,17 +493,17 @@ pub fn sps_rbsp(c: &SpsCfg) -> Vec<u8> {
     b.ue(c.bit_depth - 8);
     b.ue(4); // log2_max_pic_order_cnt_lsb_minus4
     b.bit(1);
-    b.ue(0);
-    b.ue(0);
+    b.ue(x.max_dec_pic_buffering_minus1);
+    b.ue(x.max_num_reorder_pics);
     b.ue(0);
     b.ue(c.log2_min_cb - 3);
     b.ue(c.log2_ctb - c.log2_min_cb);
     b.ue(c.log2_min_tb - 2);
     b.ue(c.log2_max_tb - c.log2_min_tb);
-    b.ue(0);
+    b.ue(x.depth_inter);
     b.ue(c.depth_intra);
     b.bit(0); // scaling_list_enabled_flag
-    b.bit(0); // amp
+    b.flag(x.amp);
     b.flag(c.sao);
     match c.pcm {
         Some((bl, bc, lmin, lmax, lf)) => {
@@ -426,7 +518,7 @@ pub fn sps_rbsp(c: &SpsCfg) -> Vec<u8> {
     }
     b.ue(0); // num_short_term_ref_pic_sets
     b.bit(0); // long_term_ref_pics_present_flag
-    b.bit(0); // sps_temporal_mvp_enabled_flag
+    b.flag(x.temporal_mvp); // sps_temporal_mvp_enabled_flag
     b.flag(c.strong);
     b.bit(0); // vui
     b.bit(0); // extension
@@ -447,6 +539,18 @@ pub struct PpsCfg {
 }
 
 pub fn pps_rbsp(c: &PpsCfg) -> Vec<u8> {
+    pps_rbsp_ext(c, &PpsInter::default())
+}
+
+/// HEVCINTER (SR216): the PPS fields an inter stream sets; the default writes [`pps_rbsp`]'s bits.
+#[derive(Clone, Default)]
+pub struct PpsInter {
+    pub weighted_pred: bool,
+    pub weighted_bipred: bool,
+    pub lists_modification: bool,
+}
+
+pub fn pps_rbsp_ext(c: &PpsCfg, x: &PpsInter) -> Vec<u8> {
     let mut b = BitWriter::default();
     b.ue(0);
     b.ue(0);
@@ -464,8 +568,8 @@ pub fn pps_rbsp(c: &PpsCfg) -> Vec<u8> {
     b.se(c.cb_qp_offset);
     b.se(0);
     b.bit(0);
-    b.bit(0);
-    b.bit(0);
+    b.flag(x.weighted_pred);
+    b.flag(x.weighted_bipred);
     b.bit(0); // transquant_bypass_enabled_flag
     b.bit(0); // tiles
     b.bit(0); // entropy_coding_sync
@@ -478,7 +582,7 @@ pub fn pps_rbsp(c: &PpsCfg) -> Vec<u8> {
         b.bit(0);
     }
     b.bit(0); // pps_scaling_list_data_present_flag
-    b.bit(0); // lists_modification_present_flag
+    b.flag(x.lists_modification); // lists_modification_present_flag
     b.ue(0);
     b.bit(0);
     b.bit(0);
@@ -503,6 +607,129 @@ pub fn idr_slice_header(sao_luma: bool, sao_chroma: bool, sao_enabled: bool, deb
     }
     b.se(0); // slice_qp_delta
     if sao_luma || sao_chroma || !deblocking_disabled {
+        b.bit(1); // slice_loop_filter_across_slices_enabled_flag
+    }
+    b.trailing();
+    b
+}
+
+/// HEVCINTER (SR216): a first slice segment header (PPS 0, slice_qp_delta 0, SAO off) of any type.
+#[derive(Clone, Default)]
+pub struct SliceCfg {
+    pub nal_type: u8,
+    /// slice_type: 0 B, 1 P, 2 I.
+    pub slice_type: u32,
+    pub poc_lsb: u32,
+    /// The slice's own st_ref_pic_set: (DeltaPocS0, used) nearest first, (DeltaPocS1, used) nearest first.
+    pub neg: Vec<(i32, bool)>,
+    pub pos: Vec<(i32, bool)>,
+    /// The SPS enables TMVP (slice_temporal_mvp_enabled_flag is coded) / its value.
+    pub sps_tmvp: bool,
+    pub tmvp: bool,
+    pub collocated_from_l0: bool,
+    pub collocated_ref_idx: u32,
+    /// num_ref_idx_active_override: (l0, l1) active counts.
+    pub num_ref: Option<(u32, u32)>,
+    /// The PPS has lists_modification_present_flag; the entries.
+    pub lists_mod: bool,
+    pub list_entry_l0: Option<Vec<u32>>,
+    pub list_entry_l1: Option<Vec<u32>>,
+    pub mvd_l1_zero: bool,
+    /// pred_weight_table (P with weighted_pred_flag): luma_log2_weight_denom, chroma denom delta 0, and per l0 entry
+    /// Some((delta_luma_weight, luma_offset)) or None; chroma flags all 0.
+    pub weights: Option<(u32, Vec<Option<(i32, i32)>>)>,
+    pub five_minus_max_num_merge_cand: u32,
+    pub deblocking_disabled: bool,
+}
+
+pub fn slice_header(c: &SliceCfg) -> BitWriter {
+    let mut b = BitWriter::default();
+    let irap = (16..=23).contains(&c.nal_type);
+    let idr = c.nal_type == 19 || c.nal_type == 20;
+    b.bit(1); // first_slice_segment_in_pic_flag
+    if irap {
+        b.bit(0); // no_output_of_prior_pics_flag
+    }
+    b.ue(0);
+    b.ue(c.slice_type);
+    if !idr {
+        b.u(c.poc_lsb as u64, 8);
+        b.bit(0); // short_term_ref_pic_set_sps_flag
+        b.ue(c.neg.len() as u32);
+        b.ue(c.pos.len() as u32);
+        let mut prev = 0;
+        for &(d, used) in &c.neg {
+            b.ue((prev - d - 1) as u32);
+            b.flag(used);
+            prev = d;
+        }
+        prev = 0;
+        for &(d, used) in &c.pos {
+            b.ue((d - prev - 1) as u32);
+            b.flag(used);
+            prev = d;
+        }
+        if c.sps_tmvp {
+            b.flag(c.tmvp);
+        }
+    }
+    if c.slice_type != 2 {
+        let total = c.neg.iter().chain(c.pos.iter()).filter(|e| e.1).count() as u32;
+        let (l0, l1) = c.num_ref.unwrap_or((1, 1));
+        match c.num_ref {
+            Some((a, bb)) => {
+                b.bit(1);
+                b.ue(a - 1);
+                if c.slice_type == 0 {
+                    b.ue(bb - 1);
+                }
+            }
+            None => b.bit(0),
+        }
+        if c.lists_mod && total > 1 {
+            let bits = 32 - (total - 1).leading_zeros();
+            for (k, e) in [&c.list_entry_l0, &c.list_entry_l1].into_iter().enumerate() {
+                if k == 1 && c.slice_type != 0 {
+                    break;
+                }
+                b.flag(e.is_some());
+                if let Some(v) = e {
+                    for &x in v {
+                        b.u(x as u64, bits);
+                    }
+                }
+            }
+        }
+        if c.slice_type == 0 {
+            b.flag(c.mvd_l1_zero);
+        }
+        if c.tmvp {
+            if c.slice_type == 0 {
+                b.flag(c.collocated_from_l0);
+            }
+            let from_l0 = c.slice_type == 1 || c.collocated_from_l0;
+            if (from_l0 && l0 > 1) || (!from_l0 && l1 > 1) {
+                b.ue(c.collocated_ref_idx);
+            }
+        }
+        if let Some((denom, ws)) = &c.weights {
+            b.ue(*denom);
+            b.se(0); // delta_chroma_log2_weight_denom
+            for w in ws {
+                b.flag(w.is_some());
+            }
+            for _ in ws {
+                b.bit(0); // chroma_weight_l0_flag
+            }
+            for (dw, off) in ws.iter().flatten() {
+                b.se(*dw);
+                b.se(*off);
+            }
+        }
+        b.ue(c.five_minus_max_num_merge_cand);
+    }
+    b.se(0); // slice_qp_delta
+    if !c.deblocking_disabled {
         b.bit(1); // slice_loop_filter_across_slices_enabled_flag
     }
     b.trailing();
