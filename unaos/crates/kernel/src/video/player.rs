@@ -975,7 +975,7 @@ mod vid {
 
     /// A video type (`video/*` by the one type check, `fs::filetype`). I/O: the file's head, on the service pass.
     pub fn wants(path: &str) -> bool {
-        crate::fs::filetype::type_of(path).0.starts_with("video/")
+        vplay::is_edl(path) || crate::fs::filetype::type_of(path).0.starts_with("video/") // NLE6 (SR207): an EDL plays in the picture rect
     }
     pub fn start(path: &str) {
         vplay::start(path);
@@ -985,6 +985,7 @@ mod vid {
     }
     pub fn register() {
         crate::tests::register("videoplayer", fixture);
+        crate::tests::register("nle", super::nle_fx::fixture); // NLE6 (SR207): `tests nle`, the EDL mode
     }
 
     fn restart(st: &mut State) {
@@ -1262,4 +1263,114 @@ static PLAYER_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicB
 pub fn open_flag_agrees() -> Option<bool> {
     let flag = PLAYER_OPEN.load(Ordering::Acquire);
     STATE.try_lock().map(|g| g.is_some() == flag)
+}
+
+// ── NLE6 (LEDGER SR207) — `tests nle`: the Player's EDL mode over two synthetic reels ─────────────────────────────
+// R80: typed, never at boot; registered beside `tests videoplayer` (`vid::register`, the same gate). The fixture writes
+// two utp1 reels through demux_core's own writer (`build::test_pattern_track` + `TestPatternPacket`, video only: the
+// kernel has no PCM door yet, NLE6-MIX) and an EDL through timeline_core's writer (`edl::write`) of a cut list with a gap
+// (NLE2's synth_fixture shape), opens the EDL in the Player and runs the pass to the end. `agree` compares each presented
+// frame's ordinal (`vplay::Frame.ord`: the kernel's utp1 picture is a flat field, the counter rides the frame) with the
+// schedule's source tick at that output tick (the job's plan); `seeks` must equal the plan's seek steps and every queued
+// frame must be presented or dropped.
+#[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
+mod nle_fx {
+    use super::{hw, STATE};
+    use crate::video::vplay;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use timeline_core::{Clip, Kind, Timeline};
+
+    const FPS: u32 = 25;
+    /// The reels' frame ordinals start here (a frame names its reel and its index).
+    const BASE: [u32; 2] = [1000, 2000];
+    const REELS: [&str; 2] = ["NLEFXA", "NLEFXB"];
+    const FRAMES: u32 = 40;
+
+    /// A utp1 reel: `FRAMES` 64x48 test-pattern frames at `FPS`, a keyframe every 10, ordinals `base..`.
+    fn reel(base: u32) -> Vec<u8> {
+        use demux_core::build;
+        let mut video = build::test_pattern_track(1, 64, 48, FPS, FRAMES, 10);
+        for (i, s) in video.samples.iter_mut().enumerate() {
+            s.data = build::TestPatternPacket { frame: base + i as u32, width: 64, height: 48 }.encode();
+        }
+        build::mp4(&[video], &build::Mp4Options::default())
+    }
+
+    /// The cut list: A 13..23 at 0, B 0..10 at 10, a gap 20..25, A 23..33 at 25.
+    fn timeline() -> Timeline {
+        let mut tl = Timeline::new(FPS);
+        let a = tl.add_source(REELS[0], FRAMES as i64);
+        let b = tl.add_source(REELS[1], FRAMES as i64);
+        tl.add_track(Kind::Video);
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        tl
+    }
+
+    pub fn fixture() {
+        let mt = crate::shell::vfs_mount_table();
+        let p = crate::fs::vfs::KERNEL_PRINCIPAL;
+        let edl = match timeline_core::edl::write(&timeline(), "NLEFX") {
+            Ok(t) => t,
+            Err(e) => {
+                serial_println!(":: NLE: reason=edl-write ({}) -> FAIL ::", e);
+                return;
+            }
+        };
+        let files: [(String, Vec<u8>); 3] = [
+            (alloc::format!("{}.MP4", REELS[0]), reel(BASE[0])),
+            (alloc::format!("{}.MP4", REELS[1]), reel(BASE[1])),
+            (String::from("NLEFX.EDL"), edl.into_bytes()),
+        ];
+        let put = |c: &str, body: &[u8]| -> bool {
+            let _ = mt.unlink(c, p);
+            if mt.create(c, crate::fs::vfs::NodeKind::File, p).is_err() {
+                return false;
+            }
+            let mut off = 0usize;
+            while off < body.len() {
+                match mt.write(c, off as u64, &body[off..(off + 4096).min(body.len())], p) {
+                    Ok(n) if n > 0 => off += n,
+                    _ => break,
+                }
+            }
+            off == body.len()
+        };
+        let Some(dir) = ["/home", ""].into_iter().find(|d| files.iter().all(|(n, b)| put(&alloc::format!("{}/{}", d, n), b))) else {
+            serial_println!(":: NLE: reason=fixture-write (neither /home nor / took the reels) -> SKIP ::");
+            return;
+        };
+        let path = alloc::format!("{}/NLEFX.EDL", dir);
+        let t0 = crate::arch::ms();
+        let opened = super::open(&path);
+        let open_ok = opened.is_ok() && super::is_open() && super::shown() == path;
+        loop {
+            hw::pump_until(4, || false); // the HDA service, as `tests videoplayer` (the desktop pass is not running)
+            super::vid::tick();
+            let (ended, err) = STATE.lock().as_ref().map(|s| (s.ended, s.err.is_some())).unwrap_or((true, true));
+            if ended || err || crate::arch::ms().saturating_sub(t0) > 20_000 {
+                break;
+            }
+            crate::arch::sched::sleep_ms(4);
+        }
+        let (_dec, pres, drop, _sync, _smax, _clk) = vplay::stats();
+        let shown = vplay::shown();
+        let rep = vplay::edl_report().unwrap_or_default();
+        let err = STATE.lock().as_ref().and_then(|s| s.err.clone());
+        let ended = STATE.lock().as_ref().map(|s| s.ended).unwrap_or(false);
+        super::close("fixture");
+        // the schedule's ordinal at an output tick: the reel's base + the step's source tick
+        let want = |t: i64| rep.plan.iter().find(|s| s.0 == t).and_then(|s| s.1).map(|(src, st)| BASE.get(src as usize).copied().unwrap_or(0) + st as u32);
+        let agree = shown.iter().filter(|(t, n)| want(*t) == Some(*n)).count();
+        let seek_steps = rep.plan.iter().filter(|s| s.2).count() as u64;
+        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps;
+        serial_println!(
+            "[nle] fixture edl={} presented={} dropped={} queued={} gaps={} seek_steps={} ms={}{}",
+            path, pres, drop, rep.frames, rep.gaps, seek_steps, crate::arch::ms().saturating_sub(t0), err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default()
+        );
+        serial_println!(
+            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord -> {} ::",
+            pres, rep.seeks, rep.runup, agree, shown.len(), if ok { "PASS" } else { "FAIL" }
+        );
+    }
 }

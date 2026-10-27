@@ -3896,7 +3896,7 @@ svg = ["pixel_core/svg"]
 # audio_core::vorbis), no second decoder (R79): video/webm, video/mp4, video/x-matroska open in the Player.
 # Links av1_core. x86 `wc` + `hda-tone` carry the window and the sound; the aarch64 K8_FEATS arm compiles the
 # dependency only. Kept in sync with `unaos/arroyo` (`_feats` and `K8_FEATS`) and `unaos/builder/src/main.rs`.
-videoplayer = ["dep:av1_core", "dep:vp8_core"]
+videoplayer = ["dep:av1_core", "dep:vp8_core", "dep:timeline_core"] # NLE6 (LEDGER SR207): the Player's EDL mode links timeline_core
 
 [dependencies]
 # FIX: Use 'spin_no_std' to explicitly disable Standard Library usage
@@ -4002,6 +4002,8 @@ noto-sans-mono-bitmap = { version = "0.3.2", default-features = false, features 
 # VIDEOPLAYER (B434): the picture cores the Player's video job decodes with — optional, pulled only by `videoplayer`.
 vp8_core = { path = "../../libs/media/vp8_core", optional = true }
 av1_core = { path = "../../libs/media/av1_core", optional = true }
+# NLE6 (LEDGER SR207): Stria's editor core (no_std + alloc; its one dep demux_core is linked above) — the Player's EDL mode (video/vplay.rs) parses, edits and schedules through it. Pulled only by `videoplayer`.
+timeline_core = { path = "../../libs/media/timeline_core", default-features = false, optional = true }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 unafs = { path = "../../libs/fs/unafs", default-features = false }
