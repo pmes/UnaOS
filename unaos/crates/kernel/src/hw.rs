@@ -541,7 +541,7 @@ pub enum Probe {
     /// The Apple gmux at ports 0x7C2-0x7D4 and its IGD switch ladder (`drivers/gpu/igpu.rs`).
     Gmux,
     /// The HDA codec drive, whose GPIO policy was measured on the CS4206 only (`drivers/hda.rs`).
-    Hda, Ec, // ZENBOOKEC (zenbook-ledger Z8): `Ec` = the ACPI embedded controller census (`drivers/ec.rs`), gated the INVERSE way (`ec_runs`, file tail). LINE-NEUTRAL fold, code before the comment.
+    Hda, Ec, I2c, // ZENBOOKTOUCHPAD (zenbook-ledger Z14): `I2c` = the AMD FCH DesignWare I2C census (`drivers/dwi2c.rs`), gated to the Zenbook (`i2c_runs`, file tail). ZENBOOKEC (zenbook-ledger Z8): `Ec` = the ACPI embedded controller census (`drivers/ec.rs`), gated the INVERSE way (`ec_runs`, file tail). LINE-NEUTRAL fold, code before the comment.
 }
 
 impl Probe {
@@ -550,7 +550,7 @@ impl Probe {
         match self {
             Probe::Smc => "smc",
             Probe::Gmux => "gmux",
-            Probe::Hda => "hda", Probe::Ec => "ec", // ZENBOOKEC (Z8). LINE-NEUTRAL fold.
+            Probe::Hda => "hda", Probe::Ec => "ec", Probe::I2c => "i2c", // ZENBOOKTOUCHPAD (Z14). ZENBOOKEC (Z8). LINE-NEUTRAL fold.
         }
     }
     fn bit(self) -> u8 {
@@ -785,7 +785,7 @@ pub fn platform_say() {
 
 /// May the Apple-only probe `p` touch its registers? `true` = run today's code. `false` only on a positively identified
 /// non-Apple machine, and then `[hw] skip <probe> platform=<token>` prints once per probe per boot. Lock-free.
-pub fn gate(p: Probe) -> bool { if p == Probe::Ec { return ec_runs(); } // ZENBOOKEC (zenbook-ledger Z8): the EC probe runs ONLY on a positively identified non-Apple machine and prints no skip line elsewhere (body `ec_runs` at the file tail). LINE-NEUTRAL fold, code before the comment.
+pub fn gate(p: Probe) -> bool { if p == Probe::Ec { return ec_runs(); } if p == Probe::I2c { return i2c_runs(); } // ZENBOOKTOUCHPAD (zenbook-ledger Z14): the DesignWare I2C census runs ONLY on the Zenbook, silent elsewhere (body `i2c_runs` at the file tail). ZENBOOKEC (zenbook-ledger Z8): the EC probe runs ONLY on a positively identified non-Apple machine and prints no skip line elsewhere (body `ec_runs` at the file tail). LINE-NEUTRAL fold, code before the comment.
     let Some(d) = PLAT.get() else { return true };
     if kind_runs(d.kind) {
         return true;
@@ -891,4 +891,11 @@ fn pci_id_name(vendor: u16, device: u16) -> Option<&'static str> {
 /// QEMU, any Apple machine and a boot with no readable SMBIOS answer `false`, silently.
 fn ec_runs() -> bool {
     PLAT.get().is_some_and(|d| !kind_runs(d.kind))
+}
+
+/// ZENBOOKTOUCHPAD (zenbook-ledger Z14): may the DesignWare I2C census (`drivers/dwi2c.rs`) touch the AMD FCH's fixed
+/// I2C pages (0xfedc2000..0xfedc5fff)? Only on a positively identified Zenbook: the fixed map is AMD's, so another
+/// non-Apple vendor is NOT probed; every other machine answers `false`, silently.
+fn i2c_runs() -> bool {
+    PLAT.get().is_some_and(|d| d.kind == K_ZENBOOK)
 }
