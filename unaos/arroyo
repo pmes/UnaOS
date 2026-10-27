@@ -9653,6 +9653,27 @@ pack_source_along() {
     echo -e "   sha256: ${sha}   (SRC.SHA beside it: sha + commit/branch/describe)"
 }
 
+# TRUSTSTAGE (rmbp-ledger B836, net.md §5): every https page and LUMEN's provider open /system/trust/roots.pem ON THE
+# CARD (vein_ring3::trust). A line that arms a network client (UNAOS_NETRING3 or UNAOS_LUMEN — the builder's own two knobs,
+# builder/src/main.rs) gets no card without the pinned bundle: the builder's `stage_trust` staged it into the data tree
+# only when its sha256 matched the committed pin, and the tree is rebuilt every run, so its presence there is THIS build's
+# answer; the pin is re-read here with `sha256_of`. Called by esp_x86_unafs_card right after it removes the old image.
+trust_card_gate() {
+    local pem="${WORKSPACE_DIR}/target/x86_64_data/system/trust/roots.pem" pinf="${WORKSPACE_DIR}/../system/trust/roots.pem.sha256" pin="" have
+    if [ -z "${UNAOS_NETRING3:-}" ] && [ -z "${UNAOS_LUMEN:-}" ]; then
+        echo -e "${COLOR_YELLOW}⚡ TRUST: not needed (no NETRING3)${COLOR_RESET}"; return 0
+    fi
+    [ -f "$pinf" ] && pin="$(cut -d' ' -f1 "$pinf")"
+    if [ ! -f "$pem" ]; then
+        echo -e "${COLOR_RED}❌ TRUST: system/trust/roots.pem absent and the line arms NETRING3/LUMEN — run tools/trust-bundle — no card image${COLOR_RESET}"; return 1
+    fi
+    have="$(sha256_of "$pem")"
+    if [ -z "$pin" ] || [ "$have" != "$pin" ]; then
+        echo -e "${COLOR_RED}❌ TRUST: system/trust/roots.pem sha256 ${have} != pin ${pin:-none} — run tools/trust-bundle — no card image${COLOR_RESET}"; return 1
+    fi
+    echo -e "${COLOR_YELLOW}⚡ TRUST: card carries /system/trust/roots.pem ($(wc -c < "$pem" | tr -d ' ') B, pin ${have:0:8}) for NETRING3/LUMEN${COLOR_RESET}"
+}
+
 # x86_64 boot media for the MacBook (UEFI). Emits TWO trees, because on x86 there are two volumes:
 #
 #   target/x86_64_esp/   the volume UEFI BOOTS  — EFI/BOOT/BOOTX64.EFI + kernel.elf (+ companions).
@@ -9702,6 +9723,7 @@ esp_x86_unafs_card() {
     local UNAFS_CLI_MANIFEST="${WORKSPACE_DIR}/../tools/unafs/Cargo.toml"
     echo -e "${COLOR_YELLOW}⚡ UNAFSX86: formatting the x86 UnaFS system volume (${unafs_mb} MiB)...${COLOR_RESET}"
     rm -f "$vol" "$card"
+    trust_card_gate || return 1   # TRUSTSTAGE (rmbp-ledger B836): a NETRING3/LUMEN line gets no card without the pinned trust bundle
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$vol" -s "$unafs_mb" || {
         echo -e "${COLOR_RED}❌ UNAFSX86: tools/unafs init failed — no card image${COLOR_RESET}"; return 1; }
     # ROOTDISK2 (B401): the programs and the libraries onto the volume `/` is — real directories, not ESP links.
