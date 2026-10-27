@@ -974,3 +974,19 @@ refs/heads/exec-rmbp-zenbooknvme   2358f512e FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-zenbooki8042   69e242707 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookgop   6ef6b3edb FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookmt7925   189cb7bf9 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-zenbookimageline   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-zenbookxhcipick   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-zenbookec   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-nvmeboot   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-boundedwait   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-hidbootshared   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-vfsputsweep   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-gopignite   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-mt7925s2   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-fwstageone   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-pdfkeystore   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-h264encvbrcrf   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-nlesizeswitch   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-aacenctnsnorm   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-writeone   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
+refs/heads/exec-rmbp-pdf4outlineactions   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
