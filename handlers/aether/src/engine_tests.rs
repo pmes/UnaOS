@@ -734,6 +734,33 @@ mod tests {
         assert_eq!(id_at(&engine, 50.0, 500.0), "floor", "a visibility:hidden box is not a target");
     }
 
+    /// AETHERFIT (SR189): a modal dialog is centred in the viewport (the UA sheet's `inset: 0; margin: auto; width /
+    /// height: fit-content` over layout_core's fixed-box pass) and the top layer is hit before the document: the
+    /// viewport's centre hits the dialog's control even though a document box lies under it, and a point outside the
+    /// dialog hits the (inert) document box beneath, which the input path then retargets.
+    #[test]
+    fn test_hit_test_hoists_the_top_layer() {
+        let html = r#"<html><head><style>
+            body { margin: 0; }
+            #under { height: 600px; }
+            dialog { padding: 0; border: 0; }
+            #inner { display: block; width: 100px; height: 40px; }
+        </style></head><body><div id="under"></div><dialog><div id="inner"></div></dialog>
+        <script>document.querySelector('dialog').showModal();</script></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("fixture://toplayer", html, true);
+        let id_at = |e: &crate::AetherEngine, x: f64, y: f64| {
+            e.hit_test_at(x, y)
+                .and_then(|(n, _)| n.as_element().map(|el| el.attributes.borrow().get("id").unwrap_or("").to_string()))
+                .unwrap_or_default()
+        };
+        let (vw, vh) = (engine.width as f64, engine.height as f64);
+        assert_eq!(id_at(&engine, vw / 2.0, vh / 2.0), "inner", "the centred modal dialog is hit above the document");
+        assert_eq!(id_at(&engine, vw / 2.0 - 45.0, vh / 2.0 - 15.0), "inner", "its box spans 100 x 40 around the centre");
+        assert_eq!(id_at(&engine, vw / 2.0 + 60.0, vh / 2.0), "under", "outside the dialog: the document box beneath");
+        assert_eq!(id_at(&engine, 5.0, 5.0), "under", "the dialog no longer sits at the top-left");
+    }
+
     /// AETHERHOVER (SR67): `cursor` is computed on the hovered element (inherited; a link carries the
     /// UA's `pointer`; `auto` is the I-beam over text, the arrow elsewhere; a url list falls back to
     /// its keyword) and a change is raised once.
@@ -2824,7 +2851,7 @@ mod tests {
             r#"<html><body><div style="position:relative;height:100px"><div style="position:absolute;left:0;top:0;width:50px;height:50px;background:#ff0000;z-index:2"></div><div style="position:absolute;left:25px;top:25px;width:50px;height:50px;background:#0000ff;z-index:1"></div></div><div style="position:fixed;left:0;right:0;bottom:0;height:10px;background:#00ff00"></div></body></html>"#,
             "body{margin:0}",
         );
-        let (w, h) = (200u32, 300u32);
+        let (w, h) = (t.viewport.0 as u32, t.viewport.1 as u32); // AETHERFIT (SR189): paint at the layout's viewport
         let mut surface = vec![0u8; (w * h * 4) as usize];
         crate::render::render_frame(&t, &mut surface, w, h, 0.0, 0.0, &[(0, 0, w, h)]);
         let px = |x: u32, y: u32| { let i = ((y * w + x) * 4) as usize; (surface[i + 2], surface[i + 1], surface[i]) }; // BGRA

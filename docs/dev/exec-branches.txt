@@ -757,7 +757,7 @@ refs/heads/exec-rmbp-stackguard3   6516102c8 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-cardregistry   c9d155994 FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-navread   ad3b4fe55 FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-zoomcost   731d173b0 FOLDED-BY-HAND (this commit) 2026-10-26
-refs/heads/exec-rmbp-aetherfit   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aetherfit   089125743 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-truststage   82650e085 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-portreset   a972b61f1 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-heldmap   d0c1af344 FOLDED-BY-HAND (this commit) 2026-10-27

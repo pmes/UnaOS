@@ -590,7 +590,8 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.pct_math = Some(m);
             }
             if i == 0 {
-                style.paint.has_width = Some(!matches!(value, "auto"));
+                // AETHERFIT (SR189): a `fit-content` width is content-sized, like `auto` (css-sizing-3 §5.2).
+                style.paint.has_width = Some(!matches!(value.trim(), "auto" | "fit-content"));
             }
             match i {
                 0 => style.width = d,
@@ -3332,6 +3333,11 @@ pub fn parse_dimension_str(value: &str, cx: &ParseCx) -> Option<Dimension> {
     let v = value.trim();
     if v == "auto" {
         return Some(Dimension::auto());
+    }
+    // AETHERFIT (SR189): css-sizing-3 §2.1 `fit-content` — taffy's own sizing keyword (shrink-to-fit:
+    // min(max-content, max(min-content, the stretch-fit size)), and abspos auto margins centre against it).
+    if v == "fit-content" {
+        return Some(Dimension::fit_content());
     }
     if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
         return Some(Dimension::percent(pct / 100.0));

@@ -691,11 +691,22 @@ impl AetherEngine {
             py: (y + self.scroll_y) as f32,
             sx: self.scroll_x as i32 as f32,
             sy: self.scroll_y as i32 as f32,
-            vw: self.width as f32,
-            vh: self.height as f32,
+            top: Vec::new(),
         };
         let all = (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::INFINITY);
-        let (mut tid, over_text) = hit_context(&cx, layout.root_node, (0.0, 0.0), all).unwrap_or((layout.root_node, false));
+        // AETHERFIT (SR189): HTML §15.5.x "the top layer" is painted above the document, so it is hit first — its
+        // boxes in reverse top-layer order, an inert one (below the topmost modal dialog) skipped — each as its own
+        // stacking context from its parent's origin; the document walk then skips them (render's rule).
+        let top: Vec<(taffy::prelude::NodeId, bool)> = js::toplayer::top_layer()
+            .into_iter()
+            .filter_map(|(dom, _)| render::top_layer_box(layout, html_core::NodeId(dom)).map(|t| (t, js::toplayer::is_inert(dom))))
+            .collect();
+        let cx = HitCtx { top: top.iter().map(|(t, _)| *t).collect(), ..cx };
+        let top_hit = top.iter().rev().filter(|(_, inert)| !inert).find_map(|(t, _)| {
+            let parent = layout.taffy.parent(*t).and_then(|p| layout_core::scroll::box_origin(layout, p, (cx.sx, cx.sy))).unwrap_or((0.0, 0.0));
+            hit_context(&cx, *t, parent, all)
+        });
+        let (mut tid, over_text) = top_hit.or_else(|| hit_context(&cx, layout.root_node, (0.0, 0.0), all)).unwrap_or((layout.root_node, false));
         loop {
             if let Some(n) = layout.node_map.get(&tid) {
                 if n.is_element() {
@@ -725,7 +736,12 @@ impl AetherEngine {
         self.selection_pointer_moved(x, y); // AETHERSELECT (SR69): the drag extends while the button is held
         self.pointer = Some((x, y));
         let hit = self.hit_test_at(x, y);
-        let target = hit.as_ref().map(|(n, _)| n.clone());
+        // AETHERFIT (SR189): an inert hit is retargeted (HTML §6.3) BEFORE the hover path, so the boundary events
+        // fire once at the modal dialog rather than once per inert element.
+        let target = hit.as_ref().map(|(n, _)| {
+            let r = js::toplayer::retarget(n.id().0);
+            if r == n.id().0 { n.clone() } else { n.node_at(html_core::NodeId(r)) }
+        });
         let new_path: Vec<crate::dom::NodeRef> = match &target {
             Some(t) => std::iter::once(t.clone()).chain(t.ancestors().filter(|a| a.is_element())).collect(),
             None => Vec::new(),
@@ -2093,11 +2109,11 @@ struct HitCtx<'a> {
     /// The pointer in document coordinates.
     px: f32,
     py: f32,
-    /// The scroll offset render paints at (truncated), and the viewport (fixed boxes resolve against it).
+    /// The scroll offset render paints at (truncated; a fixed box's viewport origin is offset by it).
     sx: f32,
     sy: f32,
-    vw: f32,
-    vh: f32,
+    /// AETHERFIT (SR189): the top layer's boxes (hit before the document; the document walk skips them).
+    top: Vec<taffy::prelude::NodeId>,
 }
 
 impl HitCtx<'_> {
@@ -2135,31 +2151,18 @@ fn hit_layered(layout: &layout::LayoutTree, id: taffy::prelude::NodeId) -> bool 
 }
 
 /// `id`'s border-box origin given its parent's: `location` from the parent, or for `position: fixed`
-/// the viewport (render's rule: insets against the viewport, scroll ignored).
+/// its viewport origin (render's rule — AETHERFIT SR189: layout_core's `fixed_at`, scroll ignored).
 fn hit_origin(cx: &HitCtx, id: taffy::prelude::NodeId, parent: (f32, f32)) -> (f32, f32) {
     let layout = cx.layout;
     let Ok(l) = layout.taffy.layout(id) else { return parent };
     let (mut x, mut y) = (parent.0 + l.location.x, parent.1 + l.location.y);
     if layout.paint_map.get(&id).and_then(|p| p.position_kind) == Some(3) {
-        if let Ok(st) = layout.taffy.style(id) {
-            let len = |v: taffy::style::LengthPercentageAuto, basis: f32| -> Option<f32> {
-                let raw = v.into_raw();
-                match raw.tag() {
-                    taffy::style::CompactLength::LENGTH_TAG => Some(raw.value()),
-                    taffy::style::CompactLength::PERCENT_TAG => Some(raw.value() * basis),
-                    _ => None,
-                }
-            };
-            let (w, h) = (l.size.width, l.size.height);
-            if let Some(v) = len(st.inset.left, cx.vw) {
+        if let Some(&(fx, fy)) = layout.fixed_at.get(&id) {
+            if let Some(v) = fx {
                 x = cx.sx + v;
-            } else if let Some(v) = len(st.inset.right, cx.vw) {
-                x = cx.sx + cx.vw - v - w;
             }
-            if let Some(v) = len(st.inset.top, cx.vh) {
+            if let Some(v) = fy {
                 y = cx.sy + v;
-            } else if let Some(v) = len(st.inset.bottom, cx.vh) {
-                y = cx.sy + cx.vh - v - h;
             }
         }
     }
@@ -2218,7 +2221,8 @@ fn hit_box_entries(cx: &HitCtx, id: taffy::prelude::NodeId, o: (f32, f32), clip:
 /// The normal-flow entries under `node` (paint order) and the layers it hoists.
 fn hit_collect(cx: &HitCtx, node: taffy::prelude::NodeId, o: (f32, f32), clip: HitRect, out: &mut Vec<HitEntry>, layers: &mut Vec<HitLayer>) {
     for (c, po) in hit_kids(cx.layout, node, o) {
-        if hit_skipped(cx.layout, c) {
+        // AETHERFIT (SR189): a top-layer box is hit in the top layer, not where its parent would place it.
+        if hit_skipped(cx.layout, c) || cx.top.contains(&c) {
             continue;
         }
         if hit_layered(cx.layout, c) {

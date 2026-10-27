@@ -1413,6 +1413,8 @@ pub fn user_mouse(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64), related: 
     if super::engine_poisoned() {
         return false;
     }
+    // AETHERFIT (SR189): AETHERTOP gap 5 — an inert target goes to the modal dialog (`toplayer::retarget`).
+    let n = super::toplayer::retarget(n);
     // AETHERWPT3 (SR138): Pointer Events §11 — the pointer event first, at the pointer capture target when
     // there is one (boundary events are not fired while captured); a canceled pointerdown suppresses the
     // compatibility mousemove until the release.
@@ -1467,6 +1469,7 @@ pub fn user_button(vm: &mut Vm, n: usize, ty: &str, client: (f64, f64)) -> bool 
         return true;
     }
     let n = if dom::kind(n) == dom::NK::Element { n } else { parent_of(n).unwrap_or(n) };
+    let n = super::toplayer::retarget(n); // AETHERFIT (SR189): AETHERTOP gap 5
     // AETHERWPT3 (SR138): Pointer Events §11.1 — pointerdown / pointerup first, at the capture target when
     // captured (the compatibility mouse event follows it there); a canceled pointerdown suppresses the
     // compatibility mousedown / mouseup; after pointerup the capture is implicitly released (§10.3).
@@ -1504,6 +1507,7 @@ pub fn user_wheel(vm: &mut Vm, n: usize, client: (f64, f64), delta: (f64, f64)) 
         return true;
     }
     let n = if dom::kind(n) == dom::NK::Element { n } else { parent_of(n).unwrap_or(n) };
+    let n = super::toplayer::retarget(n); // AETHERFIT (SR189): AETHERTOP gap 5
     let init = vm.new_plain_object();
     let ri = root(vm, Value::Object(init));
     let g = Value::Object(vm.realm().global);
@@ -1562,7 +1566,7 @@ pub fn user_key(vm: &mut Vm, focused: Option<usize>, ty: &str, k: &crate::api::u
     let t = focused.or_else(|| dom::body_of(d)).or_else(|| dom::document_element_of(d)).unwrap_or(d);
     // AETHERTOP (SR146): HTML §6.3 / §4.11.4 — while a modal dialog is shown the rest of the document is inert, and an
     // inert node is not a target of user interaction events: the key goes to the topmost modal dialog instead.
-    let t = if super::toplayer::is_inert(t) { super::toplayer::modal_dialog().unwrap_or(t) } else { t };
+    let t = super::toplayer::retarget(t);
     let init = vm.new_plain_object();
     let ri = root(vm, Value::Object(init));
     let g = Value::Object(vm.realm().global);
@@ -1608,7 +1612,7 @@ fn click_with_activation(vm: &mut Vm, n: usize, trusted: bool) -> (bool, bool) {
     // activation behavior: it targets the modal dialog, the backdrop's originating element. Light dismiss still
     // sees where it landed (`hit`), so a `closedby=any` dialog closes on a backdrop click (§6.12.2).
     let hit = n;
-    let n = if trusted && super::toplayer::is_inert(n) { super::toplayer::modal_dialog().unwrap_or(n) } else { n };
+    let n = if trusted { super::toplayer::retarget(n) } else { n };
     // HTMLElement.click(): the "click in progress" flag stops re-entrant clicks.
     if CLICKING.with(|c| c.borrow().contains(&n)) {
         return (true, false);
