@@ -34,7 +34,7 @@ unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
 pub struct MutexGuard<'a, T: ?Sized + 'a, R = spin::relax::Spin> {
     /// The registry entry this hold occupies (`u16::MAX` = untracked). Released in `Drop`, BEFORE `_raw`.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // aarch64: the wrapper only (no registry)
-    slot: u16,
+    slot: u16, #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] era: u16, // LOCKREGFORCEUNLOCK (B1036): the slot's generation when this guard was built (`release` compares it). LINE-NEUTRAL fold
     _raw: spin::MutexGuard<'a, ()>,
     data: *mut T,
     _p: PhantomData<(&'a mut T, R)>,
@@ -58,7 +58,7 @@ impl<T> Mutex<T> {
 impl<T: ?Sized> Mutex<T> {
     #[inline]
     fn guard<'a>(&'a self, raw: spin::MutexGuard<'a, ()>, slot: u16) -> MutexGuard<'a, T> {
-        MutexGuard { slot, _raw: raw, data: self.data.get(), _p: PhantomData }
+        MutexGuard { slot, era: slot_era(slot), _raw: raw, data: self.data.get(), _p: PhantomData }
     }
 
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // aarch64: the wrapper only (no registry)
@@ -155,7 +155,7 @@ impl<T: ?Sized, R> Drop for MutexGuard<'_, T, R> {
     #[inline]
     fn drop(&mut self) {
         #[cfg(target_arch = "x86_64")]
-        reg::release(self.slot);
+        reg::release(self.slot, self.era);
     }
 }
 
@@ -221,7 +221,7 @@ mod reg {
     struct Part {
         mask: AtomicU32,
         /// `tid << 24 | class << 8 | (cpu + 1)` (0 = free).
-        tag: [AtomicU64; PER], intent: [AtomicU64; PER], // REGGAP (B1021): the claimed slot's tag before its raw CAS, + WIN across the CAS window (0 = none) — LINE-NEUTRAL fold
+        tag: [AtomicU64; PER], intent: [AtomicU64; PER], era: [AtomicU16; PER], // REGGAP (B1021): the claimed slot's tag before its raw CAS, + WIN across the CAS window (0 = none); LOCKREGFORCEUNLOCK (B1036): `era` (the slot's generation) bumped by every out-of-band free (`bump`) — LINE-NEUTRAL fold
         lock: [AtomicUsize; PER],
         at: [AtomicPtr<Loc>; PER],
         t0: [AtomicU64; PER],
@@ -242,7 +242,7 @@ mod reg {
         const fn new() -> Self {
             Part {
                 mask: AtomicU32::new(0),
-                tag: [const { AtomicU64::new(0) }; PER], intent: [const { AtomicU64::new(0) }; PER], // REGGAP (B1021) — LINE-NEUTRAL fold
+                tag: [const { AtomicU64::new(0) }; PER], intent: [const { AtomicU64::new(0) }; PER], era: [const { AtomicU16::new(0) }; PER], // REGGAP (B1021); LOCKREGFORCEUNLOCK (B1036) — LINE-NEUTRAL fold
                 lock: [const { AtomicUsize::new(0) }; PER],
                 at: [const { AtomicPtr::new(core::ptr::null_mut()) }; PER],
                 t0: [const { AtomicU64::new(0) }; PER],
@@ -463,8 +463,8 @@ mod reg {
 
     /// A hold ends (the guard's `Drop`, before the raw unlock): the held span into this core's max, the entry freed.
     #[inline]
-    pub fn release(slot: u16) {
-        if slot == NONE {
+    pub fn release(slot: u16, era: u16) {
+        if slot == NONE || stale(slot, era) { // LOCKREGFORCEUNLOCK (B1036): a slot freed out of band since this guard was built is counted (`release_stale=`), never cleared. LINE-NEUTRAL fold
             return;
         }
         let (cpu, i) = (slot as usize / PER, slot as usize % PER);
@@ -489,7 +489,7 @@ mod reg {
                 let i = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 if p.tag[i].load(Acquire) != 0 && p.lock[i].load(Relaxed) == addr {
-                    p.tag[i].store(0, Release);
+                    bump(p, i); p.tag[i].store(0, Release); // LOCKREGFORCEUNLOCK (B1036): the generation moves BEFORE the mask clear, so a live guard's later release is a no-op. LINE-NEUTRAL fold
                     p.mask.fetch_and(!(1u32 << i), Release);
                 }
             }
@@ -760,7 +760,7 @@ mod reg {
                     continue;
                 }
                 let addr = p.lock[i].load(Relaxed); let at = p.at[i].load(Relaxed); let poisoned = addr != 0 && mark_poison(addr); // STACKGUARD3 (B832): the acquire site before the slot frees; the POISON mark BEFORE the force-unlock, so the next taker sees it
-                p.tag[i].store(0, Release);
+                bump(p, i); p.tag[i].store(0, Release); // LOCKREGFORCEUNLOCK (B1036): a revenant's later guard release is a no-op. LINE-NEUTRAL fold
                 p.mask.fetch_and(!(1u32 << i), Release);
                 if addr != 0 {
                     // SAFETY: `addr` is the raw `spin::Mutex<()>` of a `sync::Mutex` held by `tid`, which never runs
@@ -875,7 +875,7 @@ mod reg {
         let freed = if died && tid != 0 { release_task(tid, "tests lockreg") } else { 0 };
         let back = DIE.try_lock().is_some();
         let _ = DIE.take_poison(); let (gword, poisoned, retake_ms) = guard_leg(); let released = died && freed == 1 && back && gword == "ok"; let ((hword, fword), mword) = (heap_leg(), mount_leg()); let rword = crate::allocator::heappoison::reinit_leg(); let cword = if on { crate::drivers::sdhc::card_leg() } else { "skip(unarmed)" }; let bword = bind_leg(); let kword = if on { crate::allocator::heappoison::census_leg() } else { "skip(unarmed)" }; // BINDLIVE (B873): the bind task's real guard death (`bind_dead=`) and the census take's check (`census_check=`). HEAPREGION (B854): the free-first check (`free_first=`) and the scratch re-init (`heap_reinit=`). POISON2 (B846): the heap's and the mount's synthetic deaths, read released and checked (reg tail). STACKGUARD3 (B832): the death leg's mark cleared; the REAL guard leg (file tail) must pass too. LINE-NEUTRAL fold
-        let fullw = full_kat(); let sh = slot_high_max(); let (mut acq, mut tracked, mut held_max) = (EARLY.load(Relaxed) + UNGS.load(Relaxed), 0u64, 0u64); // LOCKREGFULL (B1034): the FULL KAT (its counts taken back out before `overflow` is read), the high-water, every untracked acquire in `wrapped=`. LINE-NEUTRAL fold
+        let fuw = forceunlock_kat(); let fullw = full_kat(); let sh = slot_high_max(); let (mut acq, mut tracked, mut held_max) = (EARLY.load(Relaxed) + UNGS.load(Relaxed), 0u64, 0u64); // LOCKREGFORCEUNLOCK (B1036): the force_unlock KAT (`forceunlock_kat=`). LOCKREGFULL (B1034): the FULL KAT (its counts taken back out before `overflow` is read), the high-water, every untracked acquire in `wrapped=`. LINE-NEUTRAL fold
         for p in PARTS.iter() {
             acq += p.acq.load(Relaxed);
             tracked += p.tracked.load(Relaxed);
@@ -888,9 +888,9 @@ mod reg {
         let max_at = HELD_MAX_AT.load(Relaxed);
         // SAFETY: `max_at` is a `&'static Location` or null.
         let max_at = if max_at.is_null() { None } else { Some(unsafe { &*max_at }) };
-        let pass = on && held_done && named && released && inv == 0 && overflow == 0 && leg_ok(hword) && leg_ok(mword) && leg_ok(rword) && leg_ok(fword) && (cword == "registered" || cword.starts_with("skip")) && leg_ok(bword) && leg_ok(kword) && leg_ok(fullw);
+        let pass = on && held_done && named && released && inv == 0 && overflow == 0 && leg_ok(hword) && leg_ok(mword) && leg_ok(rword) && leg_ok(fword) && (cword == "registered" || cword.starts_with("skip")) && leg_ok(bword) && leg_ok(kword) && leg_ok(fullw) && leg_ok(fuw);
         serial_println!(
-            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} heap_check={} mount_poison={} heap_reinit={} free_first={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{} poison_slots={}/16 poison_lost={} card={} bind_dead={} census_check={} untracked_early={} untracked_gs={} untracked_full={} slot_high={}@cpu{} full_kat={}",
+            ":: LOCKREG: locks={} wrapped={}/{} held_max_ms={} inversions={} released_on_death={} poisoned={} retake_ms={} heap_check={} mount_poison={} heap_reinit={} free_first={} named={} overflow={} -> {} :: held_max_at={} held_max_via={} held_max_by={}@cpu{} poison_slots={}/16 poison_lost={} card={} bind_dead={} census_check={} untracked_early={} untracked_gs={} untracked_full={} slot_high={}@cpu{} full_kat={} release_stale={} forceunlock_kat={}",
             CLASS_N.load(Relaxed),
             tracked,
             acq,
@@ -902,7 +902,7 @@ mod reg {
             if pass { "PASS" } else { "FAIL" }, Site(class_site(HELD_MAX_CLASS.load(Relaxed))), // KVMLAT (B578): the longest hold's lock, by name (`?` = none recorded)
             Site(max_at),
             tag_tid(max_tag),
-            tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed), cword, bword, kword, EARLY.load(Relaxed), UNGS.load(Relaxed), FULL.load(Relaxed), sh.0, sh.1, fullw
+            tag_cpu(max_tag), POISON_N.load(Acquire), POISON_LOST.load(Relaxed), cword, bword, kword, EARLY.load(Relaxed), UNGS.load(Relaxed), FULL.load(Relaxed), sh.0, sh.1, fullw, STALE.load(Relaxed), fuw
         );
         reggap_leg(); // REGGAP (B1021): the intent arm's KAT, its own `:: REGGAP:` line after LOCKREG's
     }
@@ -1629,6 +1629,99 @@ mod reg {
             "ok"
         }
     }
+
+    // ── LOCKREGFORCEUNLOCK (rmbp-ledger B1036, BP-cores-20): a slot freed OUT OF BAND — `forget` (`Mutex::force_unlock`,
+    // `untrack`) and `release_task`'s walk — moves its generation (`era`) BEFORE the mask clear; the guard snapshotted the
+    // era when it was built (`era_of`), so its own later release finds a mismatch and is a no-op, counted in
+    // `release_stale=` (a revenant after a pump-dead release, or a force_unlock under a live guard), never freeing a slot a
+    // later acquire re-claimed. A normal release never bumps: `acquire` is untouched. ──
+
+    /// Guard releases that found their slot freed out of band since the guard was built (nothing cleared).
+    static STALE: AtomicU64 = AtomicU64::new(0);
+
+    /// The era slot `slot` carries now (0 for NONE): the guard's snapshot (`Mutex::guard`).
+    #[inline(always)]
+    pub fn era_of(slot: u16) -> u16 {
+        if slot == NONE {
+            return 0;
+        }
+        PARTS[slot as usize / PER].era[slot as usize % PER].load(Acquire)
+    }
+
+    /// `release`'s check: `true` = the slot was freed out of band since the guard's snapshot — counted; the caller
+    /// clears nothing (never printed here: this runs inside a guard's `Drop`).
+    #[inline(always)]
+    fn stale(slot: u16, era: u16) -> bool {
+        if PARTS[slot as usize / PER].era[slot as usize % PER].load(Acquire) == era {
+            return false;
+        }
+        STALE.fetch_add(1, Relaxed);
+        true
+    }
+
+    /// An out-of-band free of slot `i` of `p`: its era moves (the caller clears the mask bit after this).
+    #[inline(always)]
+    fn bump(p: &Part, i: usize) {
+        p.era[i].fetch_add(1, Release);
+    }
+
+    // `tests lockreg`'s force_unlock leg: a live guard on FUKAT force-unlocked, its slot re-claimed by FUKAT2.
+    static FUKAT: super::Mutex<u32> = super::Mutex::new(0);
+    static FUKAT2: super::Mutex<u32> = super::Mutex::new(0);
+
+    /// The force_unlock KAT (`forceunlock_kat=`), masked on this core: take FUKAT (slot s), force-unlock it under its live
+    /// guard (s freed), take FUKAT2 (it lands on s, the lowest free bit), drop the stale FUKAT guard (s must stay
+    /// FUKAT2's, `release_stale` +1), drop FUKAT2's guard (s freed). The KAT's own stale count is given back.
+    fn forceunlock_kat() -> &'static str {
+        if !ON.load(Acquire) {
+            return "skip(unarmed)";
+        }
+        let stale0 = STALE.load(Relaxed);
+        let w = crate::arch::without_interrupts(|| {
+            if who().is_none() {
+                return "skip(no-cpu)";
+            }
+            let g = FUKAT.lock();
+            let s = g.slot;
+            if s == NONE {
+                drop(g);
+                return "untracked";
+            }
+            // SAFETY: this leg holds FUKAT through `g` and never touches its data again; `g` is only dropped below (the
+            // stale release under test, whose raw unlock finds the word already free). Nothing else takes FUKAT.
+            unsafe { FUKAT.force_unlock() };
+            if !slot_free(s) {
+                drop(g);
+                return "not-freed";
+            }
+            let g2 = FUKAT2.lock();
+            if g2.slot != s {
+                drop(g);
+                drop(g2);
+                return "skip(no-reuse)";
+            }
+            let (p, i) = (&PARTS[s as usize / PER], s as usize % PER);
+            drop(g);
+            let live = !slot_free(s) && p.tag[i].load(Acquire) != 0 && p.lock[i].load(Relaxed) == FUKAT2.addr();
+            let counted = STALE.load(Relaxed).wrapping_sub(stale0) == 1;
+            drop(g2);
+            let freed = slot_free(s);
+            if !live {
+                "freed-live"
+            } else if !counted {
+                "not-counted"
+            } else if !freed {
+                "kept"
+            } else {
+                "ok"
+            }
+        });
+        let mine = STALE.load(Relaxed).wrapping_sub(stale0).min(1);
+        if mine > 0 {
+            STALE.fetch_sub(mine, Relaxed);
+        }
+        w
+    }
 }
 
 // ── STACKGUARD3 (rmbp-ledger B832): the poison check, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
@@ -1708,4 +1801,19 @@ impl<T: ?Sized> Mutex<T> {
 #[inline]
 pub fn here() -> Option<(u64, usize)> {
     reg::here()
+}
+
+// ── LOCKREGFORCEUNLOCK (rmbp-ledger B1036): the guard's era snapshot, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
+/// The era slot `slot` carries now (`reg::era_of`); 0 for an untracked hold and on aarch64 (no registry).
+#[inline(always)]
+fn slot_era(slot: u16) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        reg::era_of(slot)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = slot;
+        0
+    }
 }

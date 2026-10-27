@@ -320,3 +320,18 @@ pub fn sanity_fixture() {
         if ck.bad == 0 { "PASS" } else { "FAIL" }
     );
 }
+
+// ── LOGINFURNITUREONCE (rmbp-ledger B1041, BP-video-18; BP-cores-22 kept) — the login furniture's surface, named ──────
+// The login card, the dialog and instgui hand wm a [`leaked_surf`] slice (header + 4, an INTERIOR pointer), so wm's
+// create seam (`census::retag_tracked`, rename-only by address) cannot name the block and the census read it as
+// `task:<n>`; on an auto-login boot the card's first allocation lands inside the Log Out round trip (BEFORE ->
+// AFTER) and was charged as `leaked_kb`. [`login_surf`] holds a `census::enter(LOGIN_SURFACE)` scope around the one
+// [`leaked_surf`] call (atomics only, no lock on the painter's path; inert while the census is unarmed), so the
+// buffer — and any grow (LEAKEDSURF-GROW, owed) — is the `login-surface` row, counted once by desktopbuild's memline.
+
+/// [`leaked_surf`] for the login furniture (login card, dialog, instgui): the same buffer, census-tagged `login-surface`.
+pub fn login_surf(at: &core::sync::atomic::AtomicUsize, n: usize) -> &'static mut [u32] {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let _tag = crate::allocator::census::enter(crate::allocator::census::LOGIN_SURFACE);
+    leaked_surf(at, n)
+}

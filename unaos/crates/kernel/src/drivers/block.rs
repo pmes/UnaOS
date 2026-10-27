@@ -4273,7 +4273,7 @@ impl Drop for BlockLoan {
         // withdrawn (only if it is still ours) and the count released.
         #[cfg(target_arch = "x86_64")] let shed = loan_shed_take(); drop(self.loan.take()); // XHCILOANFAILHOLD (Z66): the shed mark is read BEFORE the put (still held: no other block loan can exist to clear it)
         #[cfg(target_arch = "x86_64")]
-        { if shed { return; } // XHCILOANFAILHOLD (Z66): a shed loan already withdrew its publication and released its count (`xhci_loan_shed`)
+        { if self.tag == 0 { return; } if shed { return; } // XHCILOANPTPCOPY (Z69): a demoted (claim-only) loan holds no count and no publication. XHCILOANFAILHOLD (Z66): a shed loan already withdrew its publication and released its count (`xhci_loan_shed`)
             let _ = BLOCK_LOAN_CPU.compare_exchange(
                 self.tag,
                 0,
@@ -4312,6 +4312,7 @@ fn loan_why_word(code: u8) -> &'static str {
         1 => "holder-preemptible",
         2 => "same-cpu",
         3 => "masked-timeout(10ms)",
+        4 => "claimant-long-hold", // XHCILOANPTPCOPY (Z69): a masked PTP/MTP claimant (its transaction hlt-waits) is refused at once
         _ => "none",
     }
 }
@@ -4381,14 +4382,7 @@ fn masked_loan_wait() -> Result<BlockLoan, BlockError> {
     let code = if why.get() == 0 { 3 } else { why.get() };
     LOAN_LAST_WHY.store(code, core::sync::atomic::Ordering::Relaxed);
     LOAN_MASKED_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if !LOAN_REFUSAL_SAID.swap(true, core::sync::atomic::Ordering::AcqRel) {
-        let us = crate::arch::now_cycles().wrapping_sub(t0).saturating_mul(1000) / wait::cycles_ms(1).max(1);
-        serial_println!(
-            "[xhci] loan masked claim -> Busy why={} waited_us={} (PREEMPTOFFXHCILOAN Z62, first refusal, once)",
-            loan_why_word(code),
-            us
-        );
-    }
+    say_loan_refusal("block", code, t0); // XHCILOANPTPCOPY (Z69): the ONE refusal line and latch, `who=` named
     Err(BlockError::Busy)
 }
 
@@ -4472,6 +4466,97 @@ pub fn xhci_loan_wait_kat() -> (&'static str, u64) {
     });
     let _ = wait::bounded(200, || LOAN_KAT_STATE.load(Ordering::Acquire) >= 3);
     (word, cycles.saturating_mul(1000) / wait::cycles_ms(1).max(1))
+}
+
+// ══════════ XHCILOANPTPCOPY (zenbook-ledger Z69) — the PTP/MTP controller claim takes the ONE block-loan path, demoted to claim-only ══════════
+//
+// TAIL-APPENDED. `drivers/xhci/ptp.rs` `with_controller` copied `claim_xhci_for_io`'s hlt loop on the same controller-0
+// claim word. A PTP/MTP hold is measured at seconds to minutes (`mtp::READ_CHUNK` 64 MiB, GetObject to `WHOLE_CAP`
+// 128 MiB, the shutter's >= 1 s ObjectAdded watch, a whole-file SendObject), far past the loan's one-BOT-transaction
+// expectation, so it must hold neither the preempt-off count (BP-cores-23) nor the publication: `claim_only` takes the
+// ONE path (`claim_xhci_for_io`) and demotes the loan at once. A masked PTP claimant is refused at once (its transaction
+// `hlt`-waits, which at IF=0 never wakes), counted and said by the one refusal line (`who=ptp`). Owed: XHCILOAN-PTPYIELD.
+
+/// XHCILOANPTPCOPY: PTP/MTP claims that took the loan through [`BlockLoan::claim_only`] this boot.
+static LOAN_PTP_CLAIMS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+impl BlockLoan {
+    /// XHCILOANPTPCOPY: the controller loan for a LONG holder (the PTP/MTP transport): the ONE claim path
+    /// (`claim_xhci_for_io`: its unmasked bounded hlt wait), then demoted — no preempt-off count, no publication — so a
+    /// masked block claimant meets an unpublished holder and is told `Busy` at once (`why=holder-preemptible`). A masked
+    /// caller is refused at once (`why=claimant-long-hold`).
+    pub fn claim_only() -> Result<BlockLoan, BlockError> {
+        if crate::arch::irqs_masked() {
+            ptp_masked_refusal();
+            return Err(BlockError::Busy);
+        }
+        let mut l = claim_xhci_for_io()?;
+        l.demote();
+        LOAN_PTP_CLAIMS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        Ok(l)
+    }
+
+    /// XHCILOANPTPCOPY: withdraw this loan's publication (only if still ours) and release the count its take holds;
+    /// `tag` 0 then tells the Drop there is nothing left to release.
+    fn demote(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.tag != 0 {
+                let _ = BLOCK_LOAN_CPU.compare_exchange(
+                    self.tag,
+                    0,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                self.tag = 0;
+                crate::arch::sched::preemptoff::enable();
+            }
+        }
+    }
+}
+
+/// XHCILOANPTPCOPY: PTP/MTP claims through the one path this boot (read by `ptp::loan_path_kat`).
+pub fn xhci_loan_ptp_claims() -> u32 {
+    LOAN_PTP_CLAIMS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// XHCILOANPTPCOPY: whether a preempt-off block holder of controller 0's loan is published right now.
+pub fn xhci_loan_published() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        BLOCK_LOAN_CPU.load(core::sync::atomic::Ordering::Acquire) != 0
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// XHCILOANPTPCOPY: a MASKED PTP/MTP claimant, refused at once: counted with the masked refusals, said once.
+#[cfg(target_arch = "x86_64")]
+fn ptp_masked_refusal() {
+    LOAN_LAST_WHY.store(4, core::sync::atomic::Ordering::Relaxed);
+    LOAN_MASKED_BUSY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    say_loan_refusal("ptp", 4, crate::arch::now_cycles());
+}
+
+/// XHCILOANPTPCOPY: aarch64 keeps the silent at-once refusal (PREEMPTOFF-ARM owed).
+#[cfg(not(target_arch = "x86_64"))]
+fn ptp_masked_refusal() {}
+
+/// XHCILOANPTPCOPY: the ONE `[xhci] loan` first-refusal line (the boot's first masked refusal, once), naming the
+/// refused claimant (`block` | `ptp`).
+#[cfg(target_arch = "x86_64")]
+fn say_loan_refusal(who: &str, code: u8, t0: u64) {
+    if !LOAN_REFUSAL_SAID.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        let us = crate::arch::now_cycles().wrapping_sub(t0).saturating_mul(1000) / wait::cycles_ms(1).max(1);
+        serial_println!(
+            "[xhci] loan masked claim -> Busy who={} why={} waited_us={} (PREEMPTOFFXHCILOAN Z62, first refusal, once)",
+            who,
+            loan_why_word(code),
+            us
+        );
+    }
 }
 
 // ══════════ XHCILOANFAILHOLD (zenbook-ledger Z66) — a block loan in a BOT wait sheds its non-preemption ══════════
