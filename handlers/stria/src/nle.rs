@@ -305,6 +305,8 @@ struct Vid {
     peeked: Option<Frame>,
     last: Option<Frame>,
     done: bool,
+    /// NLESIZESWITCH (SR384): the size of the last frame this run showed (`reel_rgba`'s one line per change).
+    size: Option<(u32, u32)>,
 }
 
 impl Vid {
@@ -324,7 +326,7 @@ impl Vid {
         if let Some(hit) = swap.reseed(&mut dec, track, &cursor, origin + key_ns) { // SWAPBACKSEEK (SR353): the run's keyframe with every set in effect there
             log::info!("[STRIA] :: nle reseed reel={} cache={}", src.0, if hit { "hit" } else { "miss" });
         }
-        Ok(Vid { src, origin, track_id: track.id, cursor, track: track.clone(), swap, stood_in: !dec.is_real(), park: m.park.clone(), dec, pending: VecDeque::new(), peeked: None, last: None, done: false })
+        Ok(Vid { src, origin, track_id: track.id, cursor, track: track.clone(), swap, stood_in: !dec.is_real(), park: m.park.clone(), dec, pending: VecDeque::new(), peeked: None, last: None, done: false, size: None })
     }
     fn pull(&mut self) -> Result<Option<Frame>, RenderError> {
         loop {
@@ -524,10 +526,8 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
             (Kind::Video, Some(src)) => {
                 vmix_take(s, &mut vid, &mut vmix_run);
                 let f = vid_frame(tl, sources, &mut vid, src, s.src_t, s.seek, tol, &mut r)?;
-                if f.width != w || f.height != h {
-                    return Err(RenderError::Size { src, width: f.width, height: f.height });
-                }
-                sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &src_rgba(sources, src, &f), f.width, f.height, tol, &mut r)?);
+                let rgba = reel_rgba(sources, src, &f, &mut vid, w, h)?; // NLESIZESWITCH (SR384): a switched frame letterboxed into its reel's first size
+                sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &rgba, w, h, tol, &mut r)?);
                 r.frames += 1;
             }
             (Kind::Audio, _) => {
@@ -722,10 +722,7 @@ fn vmix_frame(
     let a = match m.src {
         Some(src) => {
             let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r)?;
-            if a.width != w || a.height != h {
-                return Err(RenderError::Size { src, width: a.width, height: a.height });
-            }
-            src_rgba(sources, src, &a)
+            reel_rgba(sources, src, &a, vmix_run, w, h)? // NLESIZESWITCH (SR384): the outgoing source's frame, as the step's own
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
         None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
@@ -892,6 +889,34 @@ impl Sources {
 fn src_rgba(sources: &Sources, src: SourceId, f: &Frame) -> Vec<u8> {
     let track = sources.get(src).ok().and_then(|m| m.video.map(|i| &m.demux.tracks()[i]));
     f.to_rgba_colour(track.and_then(|t| t.colour.as_ref()), track.map_or(gneiss_pal::dsp::video::Chroma::Nearest, gneiss_pal::dsp::video::chroma_of))
+}
+
+// ── NLESIZESWITCH (LEDGER SR384): the editor's run across a mid-stream size switch (handlers.md §5 NLEPROBE-HDR's NLE-SIZE-SWITCH) ──
+/// A frame of source `src` as RGBA at the project size `w x h`, for both of the render's frame -> RGBA sites. The frame is
+/// converted at its own size by [`src_rgba`]; a frame whose size differs from its reel's (the reel track's `width x height`,
+/// the reel's first size, the size the project takes) is LETTERBOXED into the reel's size by the editor's ONE fit,
+/// `timeline_core::view::Canvas::blit_fit` (aspect kept, centred, over the preview band's black `FIELD`), with one
+/// `[STRIA] :: nle size switch reel=<id> <W>x<H>-><w>x<h> scaled` line each time the run `run` sees its frame size change to
+/// a size other than the reel's. A reel whose own size is not the project's stays [`RenderError::Size`].
+fn reel_rgba(sources: &Sources, src: SourceId, f: &Frame, run: &mut Option<Vid>, w: u32, h: u32) -> Result<Vec<u8>, RenderError> {
+    let now = (f.width, f.height);
+    let reel = sources.get(src).ok().and_then(|m| m.video.map(|i| (m.demux.tracks()[i].width, m.demux.tracks()[i].height))).filter(|&(rw, rh)| rw > 0 && rh > 0).unwrap_or(now);
+    let last = run.as_mut().and_then(|v| v.size.replace(now));
+    if now == (w, h) {
+        return Ok(src_rgba(sources, src, f));
+    }
+    if reel != (w, h) {
+        return Err(RenderError::Size { src, width: now.0, height: now.1 });
+    }
+    let rgba = src_rgba(sources, src, f);
+    if last != Some(now) {
+        log::info!("[STRIA] :: nle size switch reel={} {}x{}->{}x{} scaled", src.0, now.0, now.1, reel.0, reel.1);
+    }
+    use timeline_core::view::{Canvas, FIELD, Order, Still};
+    let mut c = Canvas::new(reel.0, reel.1, Order::Rgba);
+    c.rect(0, 0, reel.0 as i64, reel.1 as i64, FIELD);
+    c.blit_fit(&Still { width: now.0, height: now.1, rgba }, 0, 0, reel.0, reel.1);
+    Ok(c.px)
 }
 
 /// SWAPBACK-NLECACHE (LEDGER SR388): the editor's runs park their decoder across runs. A run's close (a cut, a seek step, the
