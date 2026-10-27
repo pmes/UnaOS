@@ -180,7 +180,8 @@ pub fn sound_tail(jid: u32) {
 /// The step's frame into the encoder: its decoder planes with the source's colour when unmixed 8-bit 4:2:0 (H264ENCPLANES
 /// B973), and its `w x h` straight RGBA made on demand ([`Exp::push`] decides); `tb` the EDL's time base and `total` its video
 /// steps (the progress). Encodes with no lock held.
-pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, planes: Option<(h264enc_core::Yuv420<'_>, Option<Colour>)>, rgba: impl FnOnce() -> Vec<u8>) -> Result<(), String> {
+/// NLESIZEPOLICY (LEDGER SR394): `fit` is the step's reel's size policy, read when the frame's size is not the file's.
+pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, fit: timeline_core::SizePolicy, planes: Option<(h264enc_core::Yuv420<'_>, Option<Colour>)>, rgba: impl FnOnce() -> Vec<u8>) -> Result<(), String> {
     let Some(mut e) = ENC.lock().take_if(|e| e.jid == jid) else { return Err(String::from("superseded")) };
     if e.frames == 0 {
         e.tb = tb;
@@ -193,8 +194,8 @@ pub fn frame(jid: u32, tb: Timebase, total: u64, w: usize, h: usize, planes: Opt
             e.rgba.cfg.rate = Some(h264enc_core::RateControl::cbr(e.opts.bitrate, (tb.den as u32, tb.num.max(1) as u32)));
         } else if let Some(c) = e.opts.crf { e.rgba.cfg.rate = Some(h264enc_core::RateControl::crf(c, (tb.den as u32, tb.num.max(1) as u32))); } // SR383: `--crf N`, Stria's `with_quality`
     }
-    let sized = e.sized(w, h); // AV1INBANDSIZE (SR379): the first frame fixes the size; EXPORTSIZESCALE (rmbp-ledger B985): a later frame of another size is letterboxed into it, refused by name past the scaler (file tail)
-    let r = match sized.and_then(|to| e.push_sized(w, h, to, planes, rgba)) {
+    let sized = e.sized(w, h, fit); // AV1INBANDSIZE (SR379): the first frame fixes the size; EXPORTSIZESCALE (rmbp-ledger B985): a later frame of another size is letterboxed into it, refused by name past the scaler (file tail)
+    let r = match sized.and_then(|to| e.push_sized(w, h, to, fit, planes, rgba)) {
         Ok(u) => e.stream_units(u).and_then(|()| e.stream_sound()).map_err(|m| alloc::format!("write-refused: {}", m)),
         Err(err) => Err(alloc::format!("{}", err)),
     };
@@ -743,7 +744,9 @@ static SWITCHED: AtomicU64 = AtomicU64::new(0);
 impl Exp {
     /// The first frame's `w` x `h` fixes the file's size (Ok(None)); a later frame of that size is Ok(None); another size is
     /// Ok(Some(the first size)) to letterbox into, or refused by name past the scaler's 4x area (EXPORTSIZESCALE B985).
-    fn sized(&mut self, w: usize, h: usize) -> Result<Option<(usize, usize)>, String> {
+    /// NLESIZEPOLICY (SR394): by the reel's `fit` — Fill / Stretch say ` fit=<name>` on the line, Adopt is refused by name
+    /// (an mp4 track holds one size).
+    fn sized(&mut self, w: usize, h: usize, fit: timeline_core::SizePolicy) -> Result<Option<(usize, usize)>, String> {
         let now = (w as u32, h as u32);
         if self.frames == 0 {
             self.size = now;
@@ -755,6 +758,12 @@ impl Exp {
             return Ok(None);
         }
         let (fw, fh) = (self.size.0 as usize, self.size.1 as usize);
+        if fit == timeline_core::SizePolicy::Adopt {
+            return Err(alloc::format!(
+                "size changed mid-stream (AV1-INBAND-SIZE): {}x{} -> {}x{} at frame {}: the reel's size policy is adopt and an mp4 holds one size (NLE-SIZE-POLICY)",
+                fw, fh, w, h, self.frames
+            ));
+        }
         if (w as u64) * (h as u64) > 4 * (fw as u64) * (fh as u64) {
             return Err(alloc::format!(
                 "size changed mid-stream (AV1-INBAND-SIZE): {}x{} -> {}x{} at frame {}: beyond the scaler's 4x area (EXPORT-SIZE-SCALE)",
@@ -763,16 +772,17 @@ impl Exp {
         }
         let packed = ((now.0 as u64) << 32) | now.1 as u64;
         if SWITCHED.swap(packed, Ordering::Relaxed) != packed {
-            serial_println!("[nle] export size switch {}x{}->{}x{} scaled", fw, fh, w, h);
+            let tok = if fit == timeline_core::SizePolicy::Letterbox { "" } else { fit.name() };
+            serial_println!("[nle] export size switch {}x{}->{}x{} scaled{}{}", fw, fh, w, h, if tok.is_empty() { "" } else { " fit=" }, tok);
         }
         Ok(Some((fw, fh)))
     }
 
     /// The frame into [`Exp::push`]: as it came (`to` None), or its RGBA letterboxed into `to` by vplay's `fit_rgba` (the
     /// present's `blit_fit`) and pushed at that size as RGBA (EXPORTSIZESCALE B985).
-    fn push_sized(&mut self, w: usize, h: usize, to: Option<(usize, usize)>, planes: Option<(h264enc_core::Yuv420<'_>, Option<Colour>)>, rgba: impl FnOnce() -> Vec<u8>) -> Result<Vec<h264enc_core::rgba::Unit>, String> {
+    fn push_sized(&mut self, w: usize, h: usize, to: Option<(usize, usize)>, fit: timeline_core::SizePolicy, planes: Option<(h264enc_core::Yuv420<'_>, Option<Colour>)>, rgba: impl FnOnce() -> Vec<u8>) -> Result<Vec<h264enc_core::rgba::Unit>, String> {
         let Some((fw, fh)) = to else { return self.push(w, h, planes, rgba).map_err(|err| alloc::format!("{}", err)) };
-        let Some(scaled) = super::vplay::fit_rgba(&rgba(), w, h, fw, fh) else {
+        let Some(scaled) = super::vplay::fit_rgba(rgba(), w, h, fw, fh, fit) else {
             return Err(alloc::format!(
                 "size changed mid-stream (AV1-INBAND-SIZE): {}x{} -> {}x{} at frame {}: no {}x{} picture to scale (EXPORT-SIZE-SCALE)",
                 fw, fh, w, h, self.frames, w, h

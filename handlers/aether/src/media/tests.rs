@@ -680,3 +680,41 @@ fn nlesizeswitch_new_frame_size_moves_natural_and_fires_resize_once() {
     let (_, _, w, h) = video_box(&e, 0);
     assert_eq!((w, h), (2 * W, 2 * H), "the box follows the new intrinsic size");
 }
+
+// ── NLESIZEPOLICY (LEDGER SR394): AETHER-RESIZE-REOPEN (handlers.md §5 NLEPROBE-HDR) ──
+// A later MediaOpened at another size moves `natural` through the ONE `video_resize`, so `resize` fires once; the same size
+// again fires none.
+#[test]
+fn nlesizepolicy_reopen_at_another_size_fires_resize_once() {
+    let mut e = AetherEngine::new();
+    e.load_html(
+        "file:///page/r.html",
+        r#"<html><body style="margin:0"><video src="clip.webm"></video><script>window.log = []; var v = document.querySelector('video'); v.addEventListener('resize', function () { log.push(v.videoWidth + 'x' + v.videoHeight); });</script></body></html>"#,
+        true,
+    );
+    nlesizeswitch_settle(&mut e);
+    let url = e.media_elements()[0].url.clone();
+    let node = e.media_elements()[0].node.clone();
+    let _ = e.take_media_requests();
+    let opened = |w: u32, h: u32| SMessage::MediaOpened { url: url.clone(), duration_ns: (FRAMES * FRAME_NS) as u64, width: w, height: h, video: "V_AV1".into(), audio: String::new(), real_video: true, audio_clock: false };
+    let frame = |w: u32, h: u32, n: i64| SMessage::MediaFrame { url: url.clone(), pts_ns: n * FRAME_NS, width: w, height: h, rgba: TestPattern::render(w, h, n as u32), levels: vec![] };
+    e.on_media_message(&opened(W, H));
+    e.on_media_message(&frame(W, H, 0));
+    nlesizeswitch_settle(&mut e);
+    let eval = |e: &mut AetherEngine, src: &str| e.js_engine.as_mut().expect("page has a script engine").eval_string(src).unwrap_or_else(|err| format!("THROW {err}"));
+    assert_eq!(eval(&mut e, "log.join(' ')"), format!("{W}x{H}"), "metadata's resize only");
+    // The reopen at another size (a re-sent MediaOpened, e.g. a loop restart or a reload of the stream).
+    e.on_media_message(&opened(2 * W, 2 * H));
+    nlesizeswitch_settle(&mut e);
+    assert_eq!(e.media_elements()[0].natural, Some((2 * W, 2 * H)));
+    assert_eq!(eval(&mut e, "v.videoWidth + 'x' + v.videoHeight"), format!("{}x{}", 2 * W, 2 * H));
+    assert_eq!(eval(&mut e, "log.join(' ')"), format!("{W}x{H} {}x{}", 2 * W, 2 * H), "ONE resize for the reopen");
+    // The same size again, and its frame: nothing more.
+    e.on_media_message(&opened(2 * W, 2 * H));
+    e.on_media_message(&frame(2 * W, 2 * H, 1));
+    nlesizeswitch_settle(&mut e);
+    assert_eq!(media::events(&node).iter().filter(|t| **t == "resize").count(), 2);
+    e.render_frame();
+    let (_, _, w, h) = video_box(&e, 0);
+    assert_eq!((w, h), (2 * W, 2 * H), "the box follows the reopened size");
+}

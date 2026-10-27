@@ -41,6 +41,8 @@
 //! * [`view`] (NLE6KEYS, rmbp-ledger B961): the editor's ONE track view — the geometry ([`view::Layout`]) and the painter
 //!   ([`view::paint_in`]) the host face (`stria::nle_face`) and the kernel Player's EDL view band both draw.
 //! * EXPORTCOLOURPRIM (rmbp-ledger B979): [`Timeline::reels_colour`] — the ONE file-colour rule both exports call (Stria's `nle_export::export`, the kernel's EDL export).
+//! * NLESIZEPOLICY (LEDGER SR394): each [`Source`] carries a [`SizePolicy`] (`* UNA SIZE` in the [`edl`]) — how a frame of
+//!   another size than its reel's first fills the reel's box; [`SizePolicy::place`] is the ONE geometry both faces read.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -76,6 +78,8 @@ pub struct Source {
     pub id: SourceId,
     pub reel: String,
     pub duration: i64,
+    /// NLESIZEPOLICY (SR394): how a frame of another size than the reel's first fills it ([`SizePolicy::Letterbox`] by default).
+    pub size_policy: SizePolicy,
 }
 
 /// One event: source ticks `src_in..src_out` (exclusive end) shown from timeline tick `at`.
@@ -324,7 +328,7 @@ impl Timeline {
     /// Add a source (builder); its id is its index.
     pub fn add_source(&mut self, reel: &str, duration: i64) -> SourceId {
         let id = SourceId(self.sources.len() as u32);
-        self.sources.push(Source { id, reel: String::from(reel), duration });
+        self.sources.push(Source { id, reel: String::from(reel), duration, size_policy: SizePolicy::Letterbox });
         id
     }
     /// Add an empty track (builder); returns its index.
@@ -811,5 +815,71 @@ impl Timeline {
             }
         }
         pair.unwrap_or((2, 2))
+    }
+}
+
+// ── NLESIZEPOLICY (LEDGER SR394): a reel's size policy (handlers.md §5 NLEPROBE-HDR's NLE-SIZE-POLICY) ──────────────────────
+// A reel whose frames change size mid-stream (AV1INBANDSIZE SR379) shows each frame in the reel's FIRST size; how is the
+// reel's property, ONE per source, stored by the one EDL codec as `* UNA SIZE <reel> <policy>` (absent = Letterbox, so every
+// EDL written before it is byte-identical). [`SizePolicy::place`] is the ONE geometry over yuv_core::scale's ONE `fit`; the
+// editor's `view::Canvas::blit_policy` samples through yuv_core::scale's `nearest_rows`, Stria's render (`stria::nle`
+// `reel_rgba`) and the kernel's EDL export (`video/export.rs` `Exp::sized`) both read the reel's policy from here.
+
+/// How a frame of another size than its reel's first size is shown in the reel's box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SizePolicy {
+    /// Aspect kept, centred, bars (SR384's rule): the default.
+    #[default]
+    Letterbox,
+    /// Aspect kept, the box covered, the source's overflow cropped centred.
+    Fill,
+    /// The whole frame scaled to the whole box (aspect not kept).
+    Stretch,
+    /// The frame keeps its own size: honoured by a run whose sink takes any size, refused by name by an export (an mp4
+    /// track holds one size). Placed into a box (a transition's mix), it places as [`SizePolicy::Letterbox`].
+    Adopt,
+}
+
+/// Where a `sw x sh` frame goes in a `dw x dh` box: the source rect sampled and the box rect it fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Place {
+    pub src: yuv_core::scale::Rect,
+    pub dst: yuv_core::scale::Rect,
+}
+
+impl SizePolicy {
+    /// The policy's word: the EDL's `* UNA SIZE` token and the wire's `fit=`.
+    pub fn name(self) -> &'static str {
+        match self {
+            SizePolicy::Letterbox => "letterbox",
+            SizePolicy::Fill => "fill",
+            SizePolicy::Stretch => "stretch",
+            SizePolicy::Adopt => "adopt",
+        }
+    }
+    /// The policy a word names (ASCII case ignored).
+    pub fn from_name(s: &str) -> Option<SizePolicy> {
+        [SizePolicy::Letterbox, SizePolicy::Fill, SizePolicy::Stretch, SizePolicy::Adopt].into_iter().find(|p| p.name().eq_ignore_ascii_case(s))
+    }
+    /// THE GEOMETRY: a `sw x sh` frame in a `dw x dh` box (all four > 0). Letterbox: the whole frame into
+    /// `yuv_core::scale::fit(sw, sh, dw, dh)`; Fill: the box's aspect centred inside the frame (`fit(dw, dh, sw, sh)`) into
+    /// the whole box; Stretch: the whole frame into the whole box; Adopt: as Letterbox (see [`SizePolicy::Adopt`]).
+    pub fn place(self, sw: usize, sh: usize, dw: usize, dh: usize) -> Place {
+        let whole = |w, h| yuv_core::scale::Rect { w, h, x: 0, y: 0 };
+        match self {
+            SizePolicy::Letterbox | SizePolicy::Adopt => Place { src: whole(sw, sh), dst: yuv_core::scale::fit(sw, sh, dw, dh) },
+            SizePolicy::Fill => Place { src: yuv_core::scale::fit(dw, dh, sw, sh), dst: whole(dw, dh) },
+            SizePolicy::Stretch => Place { src: whole(sw, sh), dst: whole(dw, dh) },
+        }
+    }
+}
+
+impl Timeline {
+    /// NLESIZEPOLICY (SR394): the same timeline with source `src`'s size policy `p` (the property's edit; the reel menu is
+    /// owed, NLE-SIZE-POLICY-UI). [`EditError::NoSource`] when the timeline holds no such source.
+    pub fn set_size_policy(&self, src: SourceId, p: SizePolicy) -> Result<Timeline, EditError> {
+        let mut tl = self.clone();
+        tl.sources.iter_mut().find(|s| s.id == src).ok_or(EditError::NoSource)?.size_policy = p;
+        Ok(tl)
     }
 }

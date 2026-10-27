@@ -963,3 +963,100 @@ fn nlesizeswitch_two_size_reel_runs_and_exports_at_the_first_size() {
     assert_eq!(lines.len(), 2, "the export's own run says it once more: {lines:?}");
     println!("nlesizeswitch: {} ; run 768x512 x4, export avc1 768x512 x4", lines[0]);
 }
+
+// ── NLESIZEPOLICY (LEDGER SR394): SR384's two-size reel under each size policy (handlers.md §5 NLEPROBE-HDR's NLE-SIZE-POLICY) ──
+// The reel's policy is an EDL property (`* UNA SIZE`); Letterbox is SR384's run above, unchanged. Fill and Stretch fit the
+// 1280x720 frames into the reel's 768x512 through `Canvas::blit_policy`, pinned here against a hand nearest loop over the
+// decoder's own conversion; Adopt hands them on at 1280x720 and the H.264 export refuses by the encoder's own name.
+
+/// The decoder's own frames of the SR379 reel, converted by its colour (as `src_rgba` does).
+fn nlesizepolicy_native(file: &[u8], src: &Sources) -> Vec<(u32, u32, Vec<u8>)> {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use gneiss_pal::dsp::video::{chroma_of, decoder_for};
+    let colour = src.open_report(SourceId(0)).and_then(|o| o.colour);
+    let mut d = Demuxer::open(file.to_vec()).unwrap();
+    let track = d.tracks()[0].clone();
+    let mut dec = decoder_for(&track).unwrap();
+    let mut out = Vec::new();
+    while let Some(p) = d.next_packet() {
+        out.extend(dec.decode(&p).unwrap());
+    }
+    out.extend(dec.flush());
+    out.iter().map(|f| (f.width, f.height, f.to_rgba_colour(colour.as_ref(), chroma_of(&track)))).collect()
+}
+
+/// A hand nearest sample: the 768x512 picture whose pixel (x, y) is the 1280x720 `native`'s
+/// (`sx0 + x * sw / 768`, `y * 720 / 512`) — the source rect `sw` wide from column `sx0`.
+fn nlesizepolicy_hand(native: &[u8], sx0: usize, sw: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(768 * 512 * 4);
+    for y in 0..512 {
+        for x in 0..768 {
+            let si = ((y * 720 / 512) * 1280 + sx0 + x * sw / 768) * 4;
+            out.extend_from_slice(&native[si..si + 4]);
+        }
+    }
+    out
+}
+
+#[test]
+fn nlesizepolicy_two_size_reel_under_each_policy() {
+    use timeline_core::SizePolicy;
+    let _ = nlesizeswitch_lines("");
+    let Some(file) = nlesizeswitch_reel() else { return };
+    let (tl, src) = Sources::from_media("two", &file, 25).unwrap().expect("an MP4");
+    let native = nlesizepolicy_native(&file, &src);
+    assert_eq!(native.iter().map(|f| (f.0, f.1)).collect::<Vec<_>>(), vec![(768, 512), (768, 512), (1280, 720), (1280, 720)]);
+    let px = |p: &[u8], w: usize, x: usize, y: usize| p[(y * w + x) * 4..(y * w + x) * 4 + 4].to_vec();
+
+    for (fit, sx0, sw) in [(SizePolicy::Fill, 100, 1080), (SizePolicy::Stretch, 0, 1280)] {
+        // The policy rides the EDL: written, read back, and the run takes the read-back timeline.
+        let set = tl.set_size_policy(SourceId(0), fit).unwrap();
+        let text = edl::write(&set, "TWO").unwrap();
+        assert!(text.contains(&format!("* UNA SIZE {} {}\n", set.sources[0].reel, fit.name())), "{text}");
+        let back = edl::parse(&text, 25).unwrap();
+        assert_eq!(back.sources[0].size_policy, fit);
+        let mut sink = NleSizeSwitchSink::default();
+        let r = render(&back, 0..4, &src, &mut sink).unwrap();
+        assert_eq!((r.width, r.height, r.frames), (768, 512, 4));
+        assert!(sink.frames.iter().all(|(w, h, p)| (*w, *h, p.len()) == (768, 512, 768 * 512 * 4)), "{fit:?}: one size reaches the sink");
+        assert!(sink.frames[0].2 == native[0].2 && sink.frames[1].2 == native[1].2, "{fit:?}: first-size frames pass as decoded");
+        for i in 2..4 {
+            assert!(sink.frames[i].2 == nlesizepolicy_hand(&native[i].2, sx0, sw), "{fit:?} frame {i}: the hand nearest sample of the placed rect");
+        }
+        // Named pins: the corners map to the placed source rect's corners (no bars: every pixel is the picture's).
+        let (f, n) = (&sink.frames[2].2, &native[2].2);
+        assert_eq!(px(f, 768, 0, 0), px(n, 1280, sx0, 0));
+        assert_eq!(px(f, 768, 767, 511), px(n, 1280, sx0 + 767 * sw / 768, 718));
+        assert_eq!(px(f, 768, 384, 256), px(n, 1280, sx0 + 384 * sw / 768, 360));
+        let lines = nlesizeswitch_lines(&format!("fit={}", fit.name()));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(&format!("nle size switch reel=0 1280x720->768x512 scaled fit={}", fit.name())), "{}", lines[0]);
+    }
+    let fill = tl.set_size_policy(SourceId(0), SizePolicy::Fill).unwrap();
+    let mut a = NleSizeSwitchSink::default();
+    render(&fill, 0..4, &src, &mut a).unwrap();
+    let st = tl.set_size_policy(SourceId(0), SizePolicy::Stretch).unwrap();
+    let mut b = NleSizeSwitchSink::default();
+    render(&st, 0..4, &src, &mut b).unwrap();
+    assert!(a.frames[2].2 != b.frames[2].2, "Fill crops, Stretch squeezes: two pictures");
+
+    // Adopt: the run hands the switched frames on at their own size, said once; the H.264 export refuses by the encoder's name.
+    let adopt = tl.set_size_policy(SourceId(0), SizePolicy::Adopt).unwrap();
+    let mut sink = NleSizeSwitchSink::default();
+    let r = render(&adopt, 0..4, &src, &mut sink).unwrap();
+    assert_eq!((r.width, r.height, r.frames), (768, 512, 4), "the report keeps the project's size");
+    assert_eq!(sink.frames.iter().map(|f| (f.0, f.1)).collect::<Vec<_>>(), vec![(768, 512), (768, 512), (1280, 720), (1280, 720)]);
+    for (i, f) in sink.frames.iter().enumerate() {
+        assert!(f.2 == native[i].2, "adopt frame {i}: the decoder's own picture");
+    }
+    let lines = nlesizeswitch_lines("adopted");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("nle size switch reel=0 1280x720 adopted"), "{}", lines[0]);
+    use stria::nle_export::{AudioOut, ExportError, H264Encoder, export};
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("nlesizepolicy");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let e = export(&adopt, 0..4, &src, &dir, Box::new(H264Encoder::new(26, 10)), AudioOut::None).unwrap_err();
+    assert!(matches!(e, ExportError::H264(h264enc_core::Error::FrameSize)), "{e}");
+    println!("nlesizepolicy: fill/stretch 768x512 x4 pinned, adopt 1280x720 frames 2-3, export refused: {e}");
+}

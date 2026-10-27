@@ -49,13 +49,18 @@
 //! 001  A        V     D    010 00:00:00:00 00:00:00:20 00:00:00:00 00:00:00:20
 //! ```
 //!
+//! NLESIZEPOLICY (LEDGER SR394): `* UNA SIZE <reel> <policy>` is the reel's [`crate::SizePolicy`] (`letterbox`, `fill`,
+//! `stretch`, `adopt`; absent = letterbox), written right after that reel's `* UNA SOURCE` line and only when not letterbox,
+//! so an EDL with no policy writes as before. A SIZE line may sit anywhere (it applies once every reel exists); one naming a
+//! reel nothing cites, an unknown policy, or a second SIZE line for one reel is a syntax error.
+//!
 //! [`write`] produces exactly what [`parse`] reads back: `write(parse(write(tl)))` is byte-identical.
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{Clip, EditError, Kind, Timeline, Transition, TransitionKind, WipeDir};
+use crate::{Clip, EditError, Kind, SizePolicy, Timeline, Transition, TransitionKind, WipeDir};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdlError {
@@ -161,6 +166,8 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
     let mut from: Option<(&str, Kind, usize, &str, Clip)> = None;
     // NLE3: each transition read: (kind, track number, transition, outgoing reel, outgoing out point, line).
     let mut trans: Vec<(Kind, usize, Transition, &str, i64, usize)> = Vec::new();
+    // NLESIZEPOLICY (SR394): each `* UNA SIZE` read: (reel, policy, line), applied once every source exists.
+    let mut sizes: Vec<(&str, SizePolicy, usize)> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let l = raw.trim();
@@ -184,6 +191,9 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
                 if tl.source_by_reel(w[0]).is_none() {
                     tl.add_source(w[0], d);
                 }
+            }
+            if let Some(r) = l.strip_prefix("* UNA SIZE ") {
+                sizes.push(size_comment(r, line)?);
             }
             if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
                 audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
@@ -289,6 +299,13 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
         t.transitions.push(x);
         t.transitions.sort_by_key(|x| x.at);
     }
+    for (n, &(reel, p, line)) in sizes.iter().enumerate() {
+        if sizes[..n].iter().any(|s| s.0 == reel) {
+            return Err(EdlError::Syntax { line });
+        }
+        let id = tl.source_by_reel(reel).map(|s| s.id).ok_or(EdlError::Syntax { line })?;
+        tl = tl.set_size_policy(id, p).map_err(EdlError::Edit)?;
+    }
     tl.validate().map_err(EdlError::Edit)?;
     Ok(tl)
 }
@@ -343,6 +360,9 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             return Err(EdlError::Reel);
         }
         s.push_str(&format!("* UNA SOURCE {} {}\n", src.reel, timecode(src.duration, fps)));
+        if src.size_policy != SizePolicy::Letterbox {
+            s.push_str(&format!("* UNA SIZE {} {}\n", src.reel, src.size_policy.name())); // NLESIZEPOLICY (SR394)
+        }
     }
     s.push('\n');
     // NLE3cBLACK: `Err` = a transition TO black, an event at its `at` (no clip).
@@ -430,4 +450,14 @@ fn to_black_lines(tl: &Timeline, ti: usize, x: &Transition, num: usize, ch: &str
     let mut s = format!("{:03}  {:<8} {:<5} {:<8} {p} {p} {r} {r}\n", num, reel, ch, "C");
     s.push_str(&format!("{:03}  {:<8} {:<5} {:<8} {z} {d} {r} {e}\n", num, "BL", ch, code_field(x)));
     Ok(s)
+}
+
+/// NLESIZEPOLICY (LEDGER SR394): the words after `* UNA SIZE `: a reel name and a policy word.
+fn size_comment(r: &str, line: usize) -> Result<(&str, SizePolicy, usize), EdlError> {
+    let w: Vec<&str> = r.split_whitespace().collect();
+    if w.len() != 2 || !reel_ok(w[0]) {
+        return Err(EdlError::Syntax { line });
+    }
+    let p = SizePolicy::from_name(w[1]).ok_or(EdlError::Syntax { line })?;
+    Ok((w[0], p, line))
 }
