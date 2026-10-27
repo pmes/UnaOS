@@ -3985,7 +3985,7 @@ fn rescaled(id: wm::WinId) -> bool {
 // core between the take before `compute` and the take here (`hidstall::scope_masked_take`, REGISTRYCHUNK B508's scope;
 // its other reader, fs/assoc.rs's registry build, runs at the desktop build after the outcome is applied), `on_cpu=` the
 // core that ran the slow half, `pump_cpu=` the hid pump's (`hidstall::pump_cpu`, `none` before it starts).
-// Wire: `[login] submit kdf_ms= adduser_ms= on= input_blocked_ms= kind= masked_ms=<n> masked_by=<task>@<file>:<line>|- on_cpu=<c> pump_cpu=<c|none>`.
+// Wire: `[login] submit kdf_ms= adduser_ms= on= input_blocked_ms= kind= masked_ms=<n> masked_by=<task>@<file>:<line>@c<n>|- on_cpu=<c> pump_cpu=<c|none>`.
 
 /// LOGINSTALL: (masked_ms, masked_by, on_cpu, pump_cpu) right after a submit's `compute`, on the task that ran it
 /// (MASKCENSUS B1028: `masked_by` = the holder of the largest scoped span in the same window, `hidstall::scope_masked_by`).
