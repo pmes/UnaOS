@@ -6092,7 +6092,7 @@ fn ehci_hub_selftest() {
 // only when the stream's epoch moved (the stream is this play's). None (-1) = not measured: the live sink is not HDA, no
 // home takes the fixture, or the stream was not this play's. PASS in `sinkall_selftest` needs <= `REFILL_MS` (203). QEMU's
 // VFS is fast: this leg cannot tell the old service-pass read from the new; the rmbp TEST.WAV flight is the measure.
-// Wire: `[sinkall] leg start sink= done= epoch_moved= start_gap_ms= refill_ms=`.
+// Wire: `[sinkall] leg start sink= done= epoch_moved= start_gap_ms= refill_ms= reattach= walk=` (NETSPLIT B852: the opens' re-attach / full-probe deltas).
 #[cfg(all(target_arch = "x86_64", feature = "hda-tone"))]
 fn sinkall_start(sink: &str) -> Option<u64> {
     use crate::drivers::hda::play;
@@ -6104,7 +6104,7 @@ fn sinkall_start(sink: &str) -> Option<u64> {
         serial_println!("[sinkall] leg start sink={} -> not-measured (no writable home for the fixture)", sink);
         return None;
     };
-    let e0 = play::epoch();
+    let e0 = play::epoch(); let sc0 = crate::drivers::hda::start_counts(); // NETSPLIT (B852) M3: how the open was served (re-attach vs full probe)
     let opened = play::open_player(&path).is_ok();
     let done = opened && play::pump_until(6_000, || !play::busy());
     let moved = play::epoch() != e0;
@@ -6114,8 +6114,8 @@ fn sinkall_start(sink: &str) -> Option<u64> {
     }
     play::fixture_drop(&path);
     serial_println!(
-        "[sinkall] leg start sink={} done={} epoch_moved={} start_gap_ms={} refill_ms={}",
-        sink, done as u8, moved as u8, gap.map_or(-1, |g| g as i64), play::REFILL_MS
+        "[sinkall] leg start sink={} done={} epoch_moved={} start_gap_ms={} refill_ms={} reattach={} walk={}",
+        sink, done as u8, moved as u8, gap.map_or(-1, |g| g as i64), play::REFILL_MS, { let sc = crate::drivers::hda::start_counts(); sc.0.wrapping_sub(sc0.0) }, { let sc = crate::drivers::hda::start_counts(); sc.1.wrapping_sub(sc0.1) }
     );
     gap
 }

@@ -989,9 +989,9 @@ pub const S_ROLLUPS: u8 = 12;
 pub const S_TERMSEL: u8 = 13;
 
 /// `usb-pump` step names ([`pump_seg`] ids index this).
-pub const PUMP_NAMES: [&str; 17] = [
+pub const PUMP_NAMES: [&str; 18] = [
     "-", "xhci", "ehci-hid", "store-services", "prtscr", "selfhost", "desktop-app", "root-pass", "fatverb",
-    "wifi", "bootlog", "console", "flight-recorder", "u-probes", "usb-summary", "net-hda", "typematic-smc",
+    "wifi", "bootlog", "console", "flight-recorder", "u-probes", "usb-summary", "net", "typematic-smc", "hda",
 ];
 pub const P_XHCI: u8 = 1;
 pub const P_HID: u8 = 2;
@@ -1008,7 +1008,7 @@ pub const P_FLIGHT: u8 = 12;
 pub const P_UPROBES: u8 = 13;
 pub const P_SUMMARY: u8 = 14;
 pub const P_NET: u8 = 15;
-pub const P_TYPEMATIC: u8 = 16;
+pub const P_TYPEMATIC: u8 = 16; pub const P_HDA: u8 = 17; // NETSPLIT (B852): HDA's probe is its own step after `net` (was one `net-hda` step: a parked HDA no longer parks e1000)
 
 /// The render task's last mark (0 = none open: parked, or not yet routed).
 static SEG_LAST_US: AtomicU64 = AtomicU64::new(0);
@@ -1062,7 +1062,7 @@ pub fn pump_next(id: u8) -> u8 {
         P_CONSOLE => P_FLIGHT,
         P_FLIGHT => P_UPROBES,
         P_UPROBES => P_SUMMARY,
-        P_SUMMARY => P_NET,
+        P_SUMMARY => P_NET, P_NET => P_HDA,
         _ => 0,
     }
 }
