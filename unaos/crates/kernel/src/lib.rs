@@ -65,7 +65,7 @@ pub mod net_dns;
 #[cfg(all(feature = "wifi", target_arch = "x86_64"))]
 pub mod wifi;
 
-pub mod allocator;
+pub mod allocator; pub mod dma; // DMAONEBODY (rmbp-ledger B992): the one DMA allocator's arch-neutral body (dma.rs); each arch memory.rs keeps its `dma_bus` / `dma_settle` hooks and re-exports it as `arch::memory::dma`. LINE-NEUTRAL fold, code first
 pub mod shell;
 pub mod shellux; pub mod help; // SHELLUX (R75) — line editor: history, Tab completion, control keys (new file, tail-neutral)
 pub mod selftest;
