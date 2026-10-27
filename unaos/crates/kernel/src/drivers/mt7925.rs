@@ -2641,7 +2641,7 @@ fn link_up(h: &mut Hw, plan: &JoinPlan, aid: u16, t: &Tx, r: Rx2, took: bool) ->
 /// no lock held (it takes `S9_LINK`). S9REJOIN (zenbook-ledger Z59, S9-UNLINK): `h` is the MCU channel owned by value by the
 /// caller (`rx_open`'s run, or `watch` having taken it out of `MCU_LINK`; never under a lock); with it the firmware's records of
 /// the link are unwound in linux's disconnect order (`unlink`), their acks on the line (`fw=busy` with no channel). Not `pub`:
-/// `Hw` is private and every caller is in this file. S10-KEYZERO (owed): the key teardown folds AFTER the S9-UNLINK hunk, same `h`.
+/// `Hw` is private and every caller is in this file. S10-KEYZERO (the refusal by name, S10-KEYZERO-ENC owed): the key teardown would fold AFTER the S9-UNLINK hunk, same `h`.
 fn link_down(why: &str, h: Option<&mut Hw>) -> bool {
     let Some(l) = S9_LINK.lock().take() else { return false };
     S9_WATCH.store(false, Ordering::Relaxed);
@@ -2651,8 +2651,8 @@ fn link_down(why: &str, h: Option<&mut Hw>) -> bool {
     let fw = match h { Some(h) => unlink(h, &l), None => String::from("busy") }; // S9-UNLINK (zenbook-ledger Z59): STA_REC remove, BSS_INFO not connected, BCNFT off
     let rekeys = rekey_clear(); // S10REKEY (zenbook-ledger Z63): the group-rekey record (the KCK/KEK) dropped and zeroized, the EAPOL mailbox emptied; its count on the line
     serial_println!(
-        "[mt7925] s9 link down why={} aid={} tx={} rx={} skip={} full={} fw={} rekeys={}",
-        why, l.aid, l.tx, l.rx_n, l.skip, l.full, fw, rekeys
+        "[mt7925] s9 link down why={} aid={} tx={} rx={} skip={} full={} fw={} rekeys={} radiokeys=ptk-sta-remove,{}",
+        why, l.aid, l.tx, l.rx_n, l.skip, l.full, fw, rekeys, keyzero_word()
     );
     l.took
 }
@@ -3530,8 +3530,8 @@ pub fn pmk_rows() -> Option<[u8; 32]> {
 // link's TX ring BEFORE `link_down` (whose STA_REC remove frees the peer's WTBL entry), the ONE teardown `link_end`. The MCU has no
 // disconnect command of its own (S7/S8 built none; `unlink` only informs the firmware), so the notice is a raw management frame; a
 // silent station is aged out by the AP's inactivity timer. Radio keys: the PTK goes with the STA_REC remove; the GTK slot on wlan 19
-// stays until a rejoin overwrites it (`set_keys` only installs; S10-KEYZERO owed). Owed: S9-ROAM, S10-PMKSA, S10-KEYSTORE,
-// S10-KEYZERO, WIFILEAVE-BUILD, WIFILEAVE-DEAUTH-PMF. Hardware facts only; no code copied.
+// stays until a rejoin overwrites it (`set_keys` only installs; S10-KEYZERO-ENC owed). Owed: S9-ROAM, S10-PMKSA, S10-KEYSTORE,
+// S10-KEYZERO-ENC, WIFILEAVE-BUILD, WIFILEAVE-DEAUTH-PMF. Hardware facts only; no code copied.
 
 /// The ONE link end, hoisted verbatim out of `watch` (and now also `leave`'s): the MCU channel taken out of `MCU_LINK` (None while a scan
 /// or join holds it), `link_down`, the channel put back, driver-own handed back when the link's run took it. The `rel=` word.
@@ -3593,8 +3593,8 @@ pub fn leave(deauth: &dyn Fn([u8; 6], [u8; 6]) -> Vec<u8>) {
     }
     let rel = link_end("leave");
     serial_println!(
-        "[mt7925] s9 left reason=operator keys=cleared pmk={} deauth={} rejoins=0 rekeys={} radiokeys=ptk-sta-remove,gtk-owed(S10-KEYZERO) rel={}",
-        pmk, notice, keys, rel
+        "[mt7925] s9 left reason=operator keys=cleared pmk={} deauth={} rejoins=0 rekeys={} radiokeys=ptk-sta-remove,{} rel={}",
+        pmk, notice, keys, keyzero_word(), rel
     );
 }
 
@@ -3617,4 +3617,24 @@ pub fn leave_kat() -> bool {
     let z = plan_drop_of(&mut k);
     let gone = k.is_none() && k.as_mut().and_then(|x| rejoin_begin(x, 1_000_000)).is_none();
     due && gone && z == Some([0u8; 32]) && plan_drop_of(&mut k).is_none()
+}
+
+// ── S10-KEYZERO (zenbook-ledger Z70): the radio's own key copy on a link end — the refusal, by name ─────────────────────────────
+// The PTK leaves with the peer's STA_REC remove (`unlink`). The group key on wlan 19 stays until a rejoin overwrites it: the driver
+// writes the KEY_V3 add word as the literal 1 (the one value measured, Z55) and no removal encoding is named anywhere in the tree,
+// so no clearing command is built (never a guessed wire field). Owed: S10-KEYZERO-ENC (the removal word, then `clear_keys` through
+// `key_req`'s builder called from `link_end`), S10-KEYZERO-OVERWRITE (a zero-key reinstall, refused: it leaves a key installed).
+/// The ONE spelling of the group-key refusal on the `s9 left` and `s9 link down` lines.
+fn keyzero_word() -> &'static str {
+    "gtk-owed(S10-KEYZERO-ENC)"
+}
+
+/// The key-zero verdict for the WPA2KAT line (pure): `skip(enc-unmeasured)` while `key_req`'s add byte is 1 on both arms (what the
+/// install path pins, so a later remove encoding is a deliberate change); `FAIL(add-byte)` if either arm moved.
+pub fn keyzero_kat() -> &'static str {
+    let d = 12; // `put_tlv(&mut v, 8, ..)` returns 8 + 4
+    let k = [0u8; 16];
+    let p = key_req([0u8; 6], 1, true, 0, &k);
+    let g = key_req([0u8; 6], 19, false, 1, &k);
+    if p[d] == 1 && g[d] == 1 { "skip(enc-unmeasured)" } else { "FAIL(add-byte)" }
 }
