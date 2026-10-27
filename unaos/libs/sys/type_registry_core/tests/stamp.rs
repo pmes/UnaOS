@@ -1,11 +1,11 @@
 //! CARDREGISTRY (rmbp-ledger B833): the stamp KAT — the value the kernel prints (`[filetypes] … stamp=`) and the card
-//! builder writes, pinned at 159f16f6. A change to the facts, the extension table or a built-in's resource block moves
+//! builder writes, pinned at 159f16f6, re-pinned by MIMEONE (SR409: nine EXT_TABLE rows). A change to the facts, the extension table or a built-in's resource block moves
 //! it; re-pin with the new value AND bump nothing else.
 use type_registry_core::*;
 
 #[test]
 fn stamp_kat() {
-    assert_eq!(stamp(), "v1 h=87bb828989426a43 n=32");
+    assert_eq!(stamp(), "v1 h=4d980e7133475f4f n=32");
     assert_eq!(builtin_type_count(), 32);
     assert_eq!(TYPE_FACTS.len(), 31);
     assert_eq!(BUILTIN.len(), 13);

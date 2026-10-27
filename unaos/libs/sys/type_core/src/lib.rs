@@ -43,6 +43,15 @@ pub const GZIP: &str = "application/gzip";
 pub const TAR: &str = "application/x-tar";
 pub const DIRECTORY: &str = "inode/directory";
 pub const OCTET: &str = "application/octet-stream";
+/// MIMEONE (SR409): the web types Aether's two retired tables (`api::fetch::mime_for_path`, `media::mime_for`) named and
+/// this table did not, and TYPECORE-PDF's PDF; each the IANA registration (no row conflicted with a table row).
+pub const TEXT_HTML: &str = "text/html"; // MIMEONE (SR409): WHATWG HTML
+pub const TEXT_CSS: &str = "text/css"; // MIMEONE (SR409): RFC 2318
+pub const TEXT_JAVASCRIPT: &str = "text/javascript"; // MIMEONE (SR409): RFC 9239 (application/javascript obsolete)
+pub const TEXT_XML: &str = "text/xml"; // MIMEONE (SR409): RFC 7303 registers text/ and application/; fetch's answer kept
+pub const APP_XHTML: &str = "application/xhtml+xml"; // MIMEONE (SR409): RFC 3236
+pub const APP_PDF: &str = "application/pdf"; // MIMEONE (SR409): RFC 8118 (TYPECORE-PDF)
+pub const VIDEO_QUICKTIME: &str = "video/quicktime"; // MIMEONE (SR409): IANA (Apple)
 
 /// The lowest `PT_LOAD` vaddr a static Linux image may carry (`linuxabi::elf::IMAGE_FLOOR`). A UnaOS image is
 /// linked at vaddr 0 and biased into a slot window, so its lowest `PT_LOAD` sits below it.
@@ -99,6 +108,16 @@ pub const EXT_TABLE: &[(&str, &str)] = &[
     ("m4v", VIDEO_MP4),
     ("webm", VIDEO_WEBM),
     ("mkv", VIDEO_MATROSKA),
+    // MIMEONE (SR409): Aether's two retired tables' rows, and TYPECORE-PDF's.
+    ("html", TEXT_HTML),
+    ("htm", TEXT_HTML),
+    ("xhtml", APP_XHTML),
+    ("xht", APP_XHTML),
+    ("xml", TEXT_XML),
+    ("css", TEXT_CSS),
+    ("js", TEXT_JAVASCRIPT),
+    ("pdf", APP_PDF),
+    ("mov", VIDEO_QUICKTIME),
 ];
 
 /// The extension of `name` (without the dot), or `None`. Both separators, so a host path works too.
@@ -371,5 +390,19 @@ mod tests {
             [demux_core::mime::AUDIO_MP4, demux_core::mime::VIDEO_MP4, demux_core::mime::VIDEO_WEBM, demux_core::mime::VIDEO_MATROSKA],
             [AUDIO_MP4, VIDEO_MP4, VIDEO_WEBM, VIDEO_MATROSKA]
         );
+    }
+
+    /// MIMEONE (SR409): the rows Aether's retired tables carried and TYPECORE-PDF's, each its ruled mime.
+    #[test]
+    fn mime_one_rows() {
+        let want = [
+            ("index.html", TEXT_HTML), ("A.HTM", TEXT_HTML), ("p.xhtml", APP_XHTML), ("p.xht", APP_XHTML), ("d.xml", TEXT_XML),
+            ("s.css", TEXT_CSS), ("app.js", TEXT_JAVASCRIPT), ("Doc.PDF", APP_PDF), ("clip.mov", VIDEO_QUICKTIME),
+        ];
+        for (n, m) in want {
+            assert_eq!(by_extension(n), Some(m), "{n}");
+        }
+        assert_eq!(extensions_of(TEXT_HTML).count(), 2);
+        assert_eq!(by_extension("/srv/.html"), None, "a leading dot is a name");
     }
 }

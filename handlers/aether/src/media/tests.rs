@@ -718,3 +718,22 @@ fn nlesizepolicy_reopen_at_another_size_fires_resize_once() {
     let (_, _, w, h) = video_box(&e, 0);
     assert_eq!((w, h), (2 * W, 2 * H), "the box follows the reopened size");
 }
+
+/// MIMEONE (SR409): the retired media table's every row answers its former mime through TYPECORE's one table (no row
+/// conflicted), case-insensitive and past a query / fragment; a name that is not video or audio answers octet, as before.
+#[test]
+fn mime_one_media_rows() {
+    let former = [
+        ("mp4", "video/mp4"), ("m4v", "video/mp4"), ("webm", "video/webm"), ("mkv", "video/x-matroska"),
+        ("mov", "video/quicktime"), ("m4a", "audio/mp4"), ("mp3", "audio/mpeg"), ("ogg", "audio/ogg"),
+        ("wav", "audio/wav"), ("flac", "audio/flac"), ("opus", "audio/ogg"), ("aac", "audio/aac"),
+        ("aif", "audio/aiff"), ("aiff", "audio/aiff"),
+    ];
+    for (e, m) in former {
+        assert_eq!(media::mime_for(&format!("https://x.test/a/clip.{e}?q=1#t=2")), m, "{e}");
+        assert_eq!(media::mime_for(&format!("file:///v/CLIP.{}", e.to_ascii_uppercase())), m, "{e} upper");
+    }
+    for u in ["https://x.test/a.png", "https://x.test/noext", "https://x.test/", "file:///v/page.html"] {
+        assert_eq!(media::mime_for(u), "application/octet-stream", "{u}");
+    }
+}
