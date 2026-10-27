@@ -8501,8 +8501,8 @@ fn fixtureretain() {
     let freed = deltas == [0, 0];
     let pass = attributed && nest && freed && surf_ok != Some(false);
     serial_println!(
-        ":: FIXTURERETAIN: fixtures={} freed_kb={} once_kb={} attributed={} nest={} surf_ok={} -> {} :: delta1={} delta2={}",
-        n, if freed { PROBE / 1024 } else { 0 }, s.bytes_of("gen7-held", true) / 1024, if attributed { "y" } else { "n" },
+        ":: FIXTURERETAIN: fixtures={} freed_kb={} once_kb={} gen7_released_kb={} attributed={} nest={} surf_ok={} -> {} :: delta1={} delta2={}",
+        n, if freed { PROBE / 1024 } else { 0 }, s.bytes_of("gen7-held", true) / 1024, { #[cfg(any(feature = "gen7r9", feature = "gen7blit"))] { crate::drivers::gpu::gen7::held_released_kb() } #[cfg(not(any(feature = "gen7r9", feature = "gen7blit")))] { 0usize } }, if attributed { "y" } else { "n" },
         if nest { "ok" } else { "bad" }, match surf_ok { Some(true) => "1", Some(false) => "0", None => "skip" }, if pass { "PASS" } else { "FAIL" }, deltas[0] / 1024, deltas[1] / 1024
     );
 }

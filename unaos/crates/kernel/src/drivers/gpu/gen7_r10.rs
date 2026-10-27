@@ -693,7 +693,7 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
         out.ptes_restored = (0..R10_WIN).all(|k| rd(bar0, slot(k)) == base_img) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
         wr(bar0, flsh, 1);
     }
-    Ok(out)
+    crate::drivers::gpu::gen7::held_release(&crate::drivers::gpu::gen7::R10_HELD, "r10", out.disabled, out.ptes_restored); Ok(out) // GEN7HELDRELEASE (B1039): the ONE release, behind the disabled confirm + the PTE read-back + R6c's witness (gen7.rs tail). LINE-NEUTRAL append
 }
 
 // R11 — the first composited surface (GEN7R11, B654): two textured triangles sampling the front window, read back and

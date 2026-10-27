@@ -318,7 +318,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
         out.ptes_restored = (0..win).all(|k| rd(bar0, slot(k)) == base_img) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
         wr(bar0, GFX_FLSH, 1);
     }
-    clflush_range(dst.va, dst.len); // the CPU reads what the engine wrote, not a stale line
+    clflush_range(dst.va, dst.len); crate::drivers::gpu::gen7::held_release(&crate::drivers::gpu::gen7::BLIT_RING_HELD, "blit", all_disabled, out.ptes_restored); // the CPU reads what the engine wrote, not a stale line. GEN7HELDRELEASE (B1039): the ONE release, under PAGES, behind the disabled+idle confirm + the PTE read-back + R6c's witness (gen7.rs tail). LINE-NEUTRAL append, code first
     Ok(out)
 }
 

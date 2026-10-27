@@ -4426,7 +4426,7 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     } else {
         "tlb-flush-write-silent"
     };
-    let flush_positive = tlb_verdict == "tlb-flush-decodes";
+    let flush_positive = tlb_verdict == "tlb-flush-decodes"; #[cfg(any(feature = "gen7r9", feature = "gen7blit"))] { flush_bank(tlb_verdict); } // GEN7HELDRELEASE (B1039): R6c's read-back is the held pages' ONE witness (body at the file tail). LINE-NEUTRAL append, code first
 
     // The independent structural leg. If no candidate's enable ever latched, the head never
     // moved and no sentinel ever landed, then no engine access was ever issued through either
@@ -7593,3 +7593,80 @@ static R10_HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0
 /// gen7blit's ring slot: the ring + sentinel pages (2 pages, `blit::bcs_job`; `blit::PAGES` stays the engine's lock).
 #[cfg(feature = "gen7blit")]
 static BLIT_RING_HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0, 0));
+
+// =================================================================================
+// GEN7HELDRELEASE (rmbp-ledger B1039) — FILE-TAIL append beside GEN7HELDONE's block: nothing above it moves. The ONE
+// release path for the ring slots (r9, r10, r11, gen7blit): each engine calls `held_release` at its run's unwind tail,
+// after its own ring-disabled confirm (§1.1.11.2 p.76), its PTE read-back and its post-restore `0x101008` write. The
+// rule is R7's `r7_reclaim` (never_fetched = false: a held block may carry an earlier run's fetch); the witness is R6c's
+// read-back of `0x101008` banked this boot (`flush_bank`), never "the engine is idle" (GEN7TLB, gen7.rs R6c). On a part
+// whose R6c reads `tlb-flush-write-silent` (the RMBP) every engine is refused by name once per boot and its slot stays
+// intact, so reuse is unchanged. GEN7-HELD-PARK / GEN7-TLB-WITNESS / FLUSH-VERDICT-ONE owed.
+// =================================================================================
+
+/// R6c's `0x101008` read-back this boot: 0 unmeasured, 1 decodes, 2 write-silent, 3 all-ones.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+static FLUSH_SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// Bytes `held_release` returned to the heap this boot.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+static RELEASED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// One bit per engine: its `held_kept=` line was said this boot.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+static KEPT_SAID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// R6c banks its three-way `tlb_verdict` (the only read-back of `0x101008` the driver makes).
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+fn flush_bank(verdict: &str) {
+    let v = match verdict {
+        "tlb-flush-decodes" => 1,
+        "tlb-flush-allones" => 3,
+        _ => 2,
+    };
+    FLUSH_SEEN.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Release `slot`'s held block after a WITNESSED GGTT TLB flush, else keep it (refused by name, once per engine per
+/// boot; the slot stays intact). `disabled` is the engine's ring-disabled confirm, `ptes_restored` its PTE read-back
+/// after the unwind. Called with the engine serialized (the `tests gen7` path; gen7blit under `PAGES`), never across a
+/// GPU op.
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+pub(crate) fn held_release(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'static str, disabled: bool, ptes_restored: bool) {
+    let n = slot.lock().1;
+    if n == 0 {
+        return;
+    }
+    let seen = FLUSH_SEEN.load(core::sync::atomic::Ordering::Relaxed);
+    if r7_reclaim(disabled && ptes_restored, false, seen == 1) {
+        held_end(slot, true);
+        RELEASED_BYTES.fetch_add(n * 4096, core::sync::atomic::Ordering::Relaxed);
+        serial_println!("[gen7] held release engine={} kb={} witness=r6-flush-decodes held_kb={}", engine, n * 4, held_kb());
+        return;
+    }
+    let why = if !disabled {
+        "ring-not-disabled"
+    } else if !ptes_restored {
+        "ptes-not-restored"
+    } else {
+        match seen {
+            0 => "flush-unmeasured",
+            3 => "flush-allones",
+            _ => "flush-write-silent",
+        }
+    };
+    let bit: u8 = match engine {
+        "r9" => 1,
+        "r10" => 2,
+        "r11" => 4,
+        _ => 8,
+    };
+    if KEPT_SAID.fetch_or(bit, core::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        serial_println!("[gen7] held release engine={} kb={} -> KEPT held_kept={}:{}", engine, n * 4, engine, why);
+    }
+}
+
+/// KiB `held_release` returned to the heap this boot (FIXTURERETAIN's `gen7_released_kb=`).
+#[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+#[allow(dead_code)]
+pub(crate) fn held_released_kb() -> usize {
+    RELEASED_BYTES.load(core::sync::atomic::Ordering::Relaxed) / 1024
+}
