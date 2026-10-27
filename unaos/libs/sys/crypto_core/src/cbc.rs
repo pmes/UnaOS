@@ -5,7 +5,8 @@
 //! PDFCRYPT (LEDGER SR315): PDF's AESV2 / AESV3 crypt filters are AES-CBC with the IV as the first 16 bytes and
 //! PKCS #7 padding (ISO 32000-1 §7.6.2), the /UE and /OE key unwrap is AES-256-CBC with a zero IV and no padding, and
 //! the R6 password hash (ISO 32000-2 Algorithm 2.B) runs AES-128-CBC without padding — all three are these two calls.
-//! CBC-ONE (owed): Aether's WebCrypto AES-CBC (`handlers/aether/src/api/subtle.rs` `aes_cbc`) retires onto this.
+//! CBC-ONE (CRYPTOONE, LEDGER SR330): Aether's WebCrypto AES-CBC (`handlers/aether/src/api/subtle.rs` `aes_cbc`) is
+//! these calls with [`pkcs7_pad`] / [`pkcs7_unpad`], no second CBC.
 //!
 //! CONSTANT-TIME in the key and the data (the bitsliced [`Aes`] and XORs). [`pkcs7_unpad`] reads the last byte to
 //! find the pad length, so it is NOT constant-time in the plaintext's padding; CBC with unauthenticated padding is a
@@ -67,6 +68,21 @@ pub fn pkcs7_unpad(data: &[u8]) -> Option<usize> {
         return None;
     }
     if data[data.len() - n..].iter().all(|&b| b == last) { Some(data.len() - n) } else { None }
+}
+
+/// PKCS #7 (RFC 5652 §6.3), the pad side: write `n` bytes of value `n` (1..=16, a whole block when `len` is already
+/// aligned) after the first `len` bytes of `buf`, and answer the padded length; `None` when `buf` is shorter than it.
+/// CRYPTOONE (LEDGER SR330): WebCrypto's AES-CBC encrypt (Aether `subtle.rs`), beside [`pkcs7_unpad`].
+pub fn pkcs7_pad(buf: &mut [u8], len: usize) -> Option<usize> {
+    let n = BLOCK - len % BLOCK;
+    let end = len.checked_add(n)?;
+    if buf.len() < end {
+        return None;
+    }
+    for b in &mut buf[len..end] {
+        *b = n as u8;
+    }
+    Some(end)
 }
 
 #[cfg(test)]
@@ -143,5 +159,23 @@ mod tests {
         assert_eq!(pkcs7_unpad(b"abc\x02\x03"), None);
         assert_eq!(pkcs7_unpad(&[17u8; 17]), None);
         assert_eq!(pkcs7_unpad(b""), None);
+        // CRYPTOONE (SR330): the pad side, and pad -> unpad round trips across the block edges.
+        let mut b = [0u8; 32];
+        assert_eq!(pkcs7_pad(&mut b, 0), Some(16));
+        assert_eq!(b[..16], [16u8; 16]);
+        let mut b = *b"abc\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        assert_eq!(pkcs7_pad(&mut b, 3), Some(16));
+        assert_eq!(&b[3..], &[13u8; 13]);
+        let mut b = [0u8; 32];
+        assert_eq!(pkcs7_pad(&mut b, 16), Some(32));
+        assert_eq!(b[16..], [16u8; 16]);
+        assert_eq!(pkcs7_pad(&mut [0u8; 15], 3), None);
+        assert_eq!(pkcs7_pad(&mut [0u8; 16], 16), None);
+        for len in 0..=33 {
+            let mut b = [0xa5u8; 48];
+            let end = pkcs7_pad(&mut b, len).unwrap();
+            assert_eq!(end % BLOCK, 0);
+            assert_eq!(pkcs7_unpad(&b[..end]), Some(len));
+        }
     }
 }

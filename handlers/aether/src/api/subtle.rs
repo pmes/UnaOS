@@ -18,6 +18,7 @@
 use crate::api::der;
 use crate::js::idl::arg;
 use crypto_core::aes::Aes;
+use crypto_core::cbc;
 use crypto_core::gcm::AesGcm;
 use crypto_core::hmac::Hmac;
 use crypto_core::{Digest, Sha1, Sha256, Sha384, Sha512};
@@ -230,43 +231,20 @@ fn n_aes_ctr(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 /// AES-CBC (SP 800-38A §6.2) with the PKCS #7 padding WebCrypto §26.6 prescribes; None for an IV that is not 16
 /// bytes, a ciphertext that is not whole blocks, or padding that does not verify.
 pub fn aes_cbc(encrypt: bool, key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    // CRYPTOONE (SR330): crypto_core's one CBC and its PKCS #7 pad / unpad (an empty ciphertext unpads to None).
     let a = Aes::new(key).ok()?;
-    let mut prev: [u8; 16] = iv.try_into().ok()?;
+    let iv: [u8; 16] = iv.try_into().ok()?;
+    let mut buf = data.to_vec();
     if encrypt {
-        let pad = 16 - data.len() % 16;
-        let mut buf = data.to_vec();
-        buf.extend(std::iter::repeat_n(pad as u8, pad));
-        for chunk in buf.chunks_mut(16) {
-            let mut b = [0u8; 16];
-            for i in 0..16 {
-                b[i] = chunk[i] ^ prev[i];
-            }
-            a.encrypt_block(&mut b);
-            chunk.copy_from_slice(&b);
-            prev = b;
-        }
-        Some(buf)
+        buf.resize(data.len() + 16 - data.len() % 16, 0);
+        cbc::pkcs7_pad(&mut buf, data.len())?;
+        cbc::encrypt(&a, &iv, &mut buf).ok()?;
     } else {
-        if data.is_empty() || data.len() % 16 != 0 {
-            return None;
-        }
-        let mut out = data.to_vec();
-        for chunk in out.chunks_mut(16) {
-            let c: [u8; 16] = (&*chunk).try_into().ok()?;
-            let mut b = c;
-            a.decrypt_block(&mut b);
-            for i in 0..16 {
-                chunk[i] = b[i] ^ prev[i];
-            }
-            prev = c;
-        }
-        let pad = *out.last()? as usize;
-        if pad == 0 || pad > 16 || out[out.len() - pad..].iter().any(|&x| x as usize != pad) {
-            return None;
-        }
-        out.truncate(out.len() - pad);
-        Some(out)
+        cbc::decrypt(&a, &iv, &mut buf).ok()?;
+        let n = cbc::pkcs7_unpad(&buf)?;
+        buf.truncate(n);
     }
+    Some(buf)
 }
 
 /// AES Key Wrap (RFC 3394 §2.2.1 / §2.2.2, the default IV A6A6A6A6A6A6A6A6); None for data that is not a
@@ -1703,6 +1681,37 @@ mod tests {
         assert_eq!(hex(&ct[..16]), "7649abac8119b246cee98e9b12e9197d");
         assert_eq!(aes_cbc(false, &key, &iv, &ct).unwrap(), pt);
         assert!(aes_cbc(false, &key, &iv, &ct[..16]).is_none(), "a block of ciphertext without its padding block");
+        // CRYPTOONE (SR330): byte pins from an independent oracle (`openssl enc -aes-{128,256}-cbc`, PKCS #7), plaintext
+        // byte i = 7i+3, lengths across the pad edges; then the refusals (`openssl enc -nopad` blocks whose last bytes are
+        // 0x00, 0x11 and a mismatched 03 02), an IV of 15 bytes and a ciphertext of 17 bytes.
+        let unhex = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        let k256 = unhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+        for (k, n, want) in [
+            (&key[..], 0, "c84af0b613435d5d9182801a9bd9320b"),
+            (&key[..], 1, "120670e9d142292550e51267f1fca68c"),
+            (&key[..], 15, "5423281508b6c0a4654ab8d0d005cd87"),
+            (&key[..], 16, "0fa02a8340a0687ca4413328a063ed24a876931ec46e29d83efd7a03d34c73a5"),
+            (&key[..], 17, "0fa02a8340a0687ca4413328a063ed24e93a2a7a7773fae5f8460332905722d0"),
+            (&key[..], 33, "0fa02a8340a0687ca4413328a063ed248ae61fb0dfdb689e3ef022124fd852c88ad65a30376aea476002b0c535051c52"),
+            (&k256[..], 0, "7e9248e5d829ca7593f0c549db2f5b8c"),
+            (&k256[..], 1, "93606db43c3c82de8827b5d48df8507d"),
+            (&k256[..], 15, "efad87737244744a330a65ee2b54ab4c"),
+            (&k256[..], 16, "6b0cc2fa3f07c100597c412b40bebb35aaff3c06224594b97c07c93a608948b9"),
+            (&k256[..], 17, "6b0cc2fa3f07c100597c412b40bebb35a55f0e5be5d776302735611fccf5a43c"),
+            (&k256[..], 33, "6b0cc2fa3f07c100597c412b40bebb353f19f3cbbe9a00468597d4db1eb7229b05e3731af89121e3fda0e33ba996bc03"),
+        ] {
+            let p: Vec<u8> = (0..n).map(|i| (i * 7 + 3) as u8).collect();
+            let c = aes_cbc(true, k, &iv, &p).unwrap();
+            assert_eq!(hex(&c), want, "encrypt, {}-bit key, {n} bytes", k.len() * 8);
+            assert_eq!(aes_cbc(false, k, &iv, &c).unwrap(), p, "decrypt, {}-bit key, {n} bytes", k.len() * 8);
+        }
+        for bad in ["eb593b41c96ffe158076a92d64c0c365", "cf7827403708b0b521a0a8b5b1dc2ba7", "1d32e73ed751219edca9e4ec134fdaca"] {
+            assert!(aes_cbc(false, &key, &iv, &unhex(bad)).is_none(), "bad padding {bad}");
+        }
+        assert!(aes_cbc(true, &key, &iv[..15], &pt).is_none(), "a 15-byte IV");
+        assert!(aes_cbc(false, &key, &iv[..15], &ct).is_none(), "a 15-byte IV");
+        assert!(aes_cbc(false, &key, &iv, &ct[..17]).is_none(), "a ciphertext that is not whole blocks");
+        assert!(aes_cbc(false, &key, &iv, &[]).is_none(), "an empty ciphertext");
         let kek: Vec<u8> = (0u8..16).collect();
         let data = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
         let wrapped = aes_kw(true, &kek, &data).unwrap();
