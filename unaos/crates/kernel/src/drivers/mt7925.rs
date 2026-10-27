@@ -2711,7 +2711,7 @@ pub fn rx_pending() -> bool {
     S9_LINK.lock().as_ref().map_or(false, |l| {
         let d = l.rx.desc + l.rx.ri as u64 * DESC_BYTES;
         // SAFETY: descriptor ri (< RING_DEPTH) of RX ring 2's block; a status read.
-        unsafe { core::ptr::read_volatile((d + 4) as *const u32) } & DMA_DONE != 0
+        (unsafe { core::ptr::read_volatile((d + 4) as *const u32) } & DMA_DONE) != 0
     })
 }
 
