@@ -503,6 +503,11 @@ struct RowSink<'a> {
     /// The first thing that went wrong, if anything. Set once; every later byte is refused, which is
     /// what turns a bad row into `InflateError::SinkRejected` and stops the decode immediately.
     err: Option<FacetError>,
+
+    /// KERNEL-PNG16-ICC (LEDGER SR380): a tagged 16-bit PNG's transform, run on each row's 16-bit samples BEFORE the cut
+    /// to 8 bits and the box filter (`consume_row`), and its RGBA16 scratch (`out_w * k * 4`, reserved only when used).
+    xf16: Option<&'a icc_core::Transform>,
+    row16: Vec<u16>,
 }
 
 impl<'a> RowSink<'a> {
@@ -514,6 +519,7 @@ impl<'a> RowSink<'a> {
         out_w: usize,
         out_h: usize,
         px: &'a mut [u32],
+        xf16: Option<&'a icc_core::Transform>,
     ) -> Result<Self, FacetError> {
         let bpp = ihdr.filter_unit().ok_or(FacetError::BadIhdr("colour type"))?;
         let row_bytes = ihdr.row_bytes().ok_or(FacetError::BadIhdr("scanline overflow"))?;
@@ -529,6 +535,15 @@ impl<'a> RowSink<'a> {
         cur.resize(row_bytes, 0);
         prev.resize(row_bytes, 0);
         acc.resize(out_w * 3, 0);
+        // KERNEL-PNG16-ICC (LEDGER SR380): the 16-bit row scratch, only for a tagged depth-16 image.
+        let xf16 = xf16.filter(|_| ihdr.depth == 16);
+        let mut row16: Vec<u16> = Vec::new();
+        if xf16.is_some() {
+            if row16.try_reserve_exact(out_w * k * 4).is_err() {
+                return Err(FacetError::OutOfMemory(out_w * k * 8));
+            }
+            row16.resize(out_w * k * 4, 0);
+        }
         Ok(Self {
             ihdr,
             palette,
@@ -547,6 +562,8 @@ impl<'a> RowSink<'a> {
             out_y: 0,
             px,
             err: None,
+            xf16,
+            row16,
         })
     }
 
@@ -562,8 +579,9 @@ impl<'a> RowSink<'a> {
             return;
         }
         let k = self.k;
+        let rows16 = self.icc16_row(); // KERNEL-PNG16-ICC (LEDGER SR380): a tagged 16-bit row, converted before its cut to 8
         for x in 0..self.out_w * k {
-            let (r, g, b) = self.rgb(x);
+            let (r, g, b) = if rows16 { (narrow16(self.row16[x * 4]), narrow16(self.row16[x * 4 + 1]), narrow16(self.row16[x * 4 + 2])) } else { self.rgb(x) };
             let o = (x / k) * 3;
             self.acc[o] += r as u32;
             self.acc[o + 1] += g as u32;
@@ -587,6 +605,19 @@ impl<'a> RowSink<'a> {
         }
         self.acc_rows = 0;
         self.out_y += 1;
+    }
+
+    /// KERNEL-PNG16-ICC (LEDGER SR380): with a transform held (a tagged depth-16 image), unpack the used part of the
+    /// current scanline at 16 bits into `row16` and run `Transform::apply_rgba16` over it; false (nothing done) otherwise.
+    fn icc16_row(&mut self) -> bool {
+        let Some(xf) = self.xf16 else { return false };
+        let n = self.out_w * self.k;
+        for x in 0..n {
+            let [r, g, b] = pix_rgb16(&self.ihdr, &self.cur, x);
+            self.row16[x * 4..x * 4 + 4].copy_from_slice(&[r, g, b, 0xFFFF]);
+        }
+        xf.apply_rgba16(&mut self.row16[..n * 4]);
+        true
     }
 }
 
@@ -963,6 +994,10 @@ pub struct Decoded {
 /// filters, the colour conversion and the box filter — over synthetic bytes with no volume, no panel
 /// and no window. That is the difference between a fixture that tests the plumbing and one that
 /// tests the decode.
+///
+/// `xf16` (KERNEL-PNG16-ICC, LEDGER SR380): a tagged depth-16 non-interlaced image's transform, run by [`RowSink`] on
+/// the 16-bit samples before the cut to 8 bits; `None` keeps every row byte-identical (the Adam7 path ignores it).
+#[allow(clippy::too_many_arguments)]
 pub fn decode_into<S: ByteSource>(
     ihdr: Ihdr,
     palette: &[u8],
@@ -971,6 +1006,7 @@ pub fn decode_into<S: ByteSource>(
     out_w: usize,
     out_h: usize,
     px: &mut [u32],
+    xf16: Option<&icc_core::Transform>,
 ) -> Result<Decoded, FacetError> {
     if ihdr.interlaced {
         if k != 1 || out_w != ihdr.width as usize || out_h != ihdr.height as usize {
@@ -987,7 +1023,7 @@ pub fn decode_into<S: ByteSource>(
         }
         return Ok(Decoded { ihdr, k, out_w, out_h, rows: ihdr.height });
     }
-    let mut sink = RowSink::new(ihdr, palette, k, out_w, out_h, px)?;
+    let mut sink = RowSink::new(ihdr, palette, k, out_w, out_h, px, xf16)?;
     let r = inflate::zlib_inflate(src, &mut sink);
     // The sink's own error outranks the decoder's: `SinkRejected` is what the decoder says when THIS
     // module refused a byte, and the reason it refused is the finding.
@@ -1413,7 +1449,9 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
         }
         px.resize(bw * bh, crate::video::theme::OPAQUE_BLACK);
         let mut src = IdatSource::new(&mt, path, &spans);
-        let r = decode_into(ihdr, &palette, &mut src, k, bw, bh, &mut px);
+        let ic = png_icc_xf(&mt, path, iccp); // KERNEL-PNG16-ICC (LEDGER SR380): the transform BEFORE the decode, so a 16-bit row converts before its cut
+        let x16 = ic.xf.as_ref().filter(|_| ihdr.depth == 16 && !ihdr.interlaced);
+        let r = decode_into(ihdr, &palette, &mut src, k, bw, bh, &mut px, x16);
         let d = match (r, src.io_error.take()) {
             (Err(FacetError::Inflate(InflateError::TruncatedInput)), Some(io)) => {
                 serial_println!("[facet] decoded rows=0 inflate=vfs-{} ms={}", io, crate::arch::ms().saturating_sub(t0));
@@ -1428,7 +1466,7 @@ fn open_inner(path: &str) -> Result<Opened, FacetError> {
             }
         }
         d?;
-        png_icc(&mt, path, iccp, &mut px); // KERNEL-PNG-ICC (B974): the held base rows, converted once
+        png_icc(path, &ic, x16.is_some(), &mut px); // KERNEL-PNG-ICC (B974): the held base rows, converted once (SR380: unless the 16-bit rows were)
         (ihdr, k, bw, bh, px)
     };
 
@@ -1864,7 +1902,7 @@ fn selftest_result() -> Result<(u32, u32, String), &'static str> {
 
     // Leg A — decode at 1:1 and checksum the pixels.
     let mut px = [0u32; W * H];
-    let d = decode_into(ihdr, &[], &mut SliceSource::new(&idat), 1, W, H, &mut px)
+    let d = decode_into(ihdr, &[], &mut SliceSource::new(&idat), 1, W, H, &mut px, None)
         .map_err(|_| "decode of the five-filter fixture failed")?;
     if d.rows != H as u32 {
         return Err("the five-filter fixture decoded the wrong number of rows");
@@ -1902,7 +1940,7 @@ fn selftest_result() -> Result<(u32, u32, String), &'static str> {
     // The witness carries `reason()`'s OWN string — the exact token `[facet] refuse path=… reason=`
     // would print — rather than a category invented here, so this leg covers the wire format too and
     // a reader can match the fixture's text against a real refusal's.
-    let reason = match decode_into(ihdr, &[], &mut SliceSource::new(&bad), 1, W, H, &mut px2) {
+    let reason = match decode_into(ihdr, &[], &mut SliceSource::new(&bad), 1, W, H, &mut px2, None) {
         Err(e) => e.reason(),
         Ok(_) => return Err("a corrupted IDAT decoded successfully — the trailer is not checked"),
     };
@@ -1950,7 +1988,7 @@ fn selftest_result() -> Result<(u32, u32, String), &'static str> {
         let z = zlib_stored(&inter);
         let ih = Ihdr { width: W as u32, height: H as u32, depth: 8, colour: 2, interlaced: true };
         let mut pa = [0u32; W * H];
-        decode_into(ih, &[], &mut SliceSource::new(&z), 1, W, H, &mut pa)
+        decode_into(ih, &[], &mut SliceSource::new(&z), 1, W, H, &mut pa, None)
             .map_err(|_| "decode of the Adam7 fixture failed")?;
         let s7 = pa.iter().fold(0u32, |a, p| a.wrapping_mul(31).wrapping_add(*p));
         if s7 != want {
@@ -2027,12 +2065,14 @@ pub fn decode_file(
     }
     px.resize(out_w * out_h, 0);
     let mut src = IdatSource::new(&mt, path, &spans);
-    let r = decode_into(ihdr, &palette, &mut src, k, out_w, out_h, &mut px);
+    let ic = png_icc_xf(&mt, path, iccp); // KERNEL-PNG16-ICC (LEDGER SR380)
+    let x16 = ic.xf.as_ref().filter(|_| ihdr.depth == 16 && !ihdr.interlaced);
+    let r = decode_into(ihdr, &palette, &mut src, k, out_w, out_h, &mut px, x16);
     match (r, src.io_error.take()) {
         (Err(FacetError::Inflate(InflateError::TruncatedInput)), Some(io)) => Err(FacetError::Vfs(io)),
         (Err(e), _) => Err(e),
         (Ok(d), _) => {
-            png_icc(&mt, path, iccp, &mut px); // KERNEL-PNG-ICC (B974)
+            png_icc(path, &ic, x16.is_some(), &mut px); // KERNEL-PNG-ICC (B974)
             Ok((px, out_w, out_h, d.ihdr.width, d.ihdr.height))
         }
     }
@@ -2222,20 +2262,63 @@ pub(super) fn icc_xrgb(xf: &icc_core::Transform, px: &mut [u32]) {
     }
 }
 
-/// The streamed PNG's profile over its decoded base `px`: read the iCCP span, inflate it by pixel_core's rule, build
-/// the transform once, convert, one `[image] icc <verdict> bytes=<n> src=png-stream ms=<n> path=<p>` line (an unreadable
-/// or broken iCCP is dropped as pixel_core drops it: `srgb bytes=0`).
-fn png_icc(mt: &crate::fs::vfs::MountTable, path: &str, iccp: Option<Span>, px: &mut [u32]) {
+/// The streamed PNG's profile, read and built BEFORE the decode (KERNEL-PNG16-ICC, LEDGER SR380: a 16-bit row needs
+/// it): the transform, the verdict, the profile's bytes and the build's ms.
+struct PngIcc {
+    xf: Option<icc_core::Transform>,
+    verdict: String,
+    n: usize,
+    ms: u64,
+}
+
+/// Read the iCCP span, inflate it by pixel_core's rule, build the transform once (an unreadable or broken iCCP is
+/// dropped as pixel_core drops it: `srgb bytes=0`).
+fn png_icc_xf(mt: &crate::fs::vfs::MountTable, path: &str, iccp: Option<Span>) -> PngIcc {
     let t0 = crate::arch::ms();
     let icc = iccp.and_then(|s| mt.read(path, s.off, s.len).ok()).and_then(|d| pixel_core::png::iccp_profile(&d));
     let n = icc.as_ref().map_or(0, |p| p.len());
     let (xf, verdict) = icc_xform(icc.as_deref());
-    if let Some(xf) = &xf {
+    PngIcc { xf, verdict, n, ms: crate::arch::ms().saturating_sub(t0) }
+}
+
+/// The streamed PNG's profile over its decoded base `px`: convert (unless `rows16`: the 16-bit rows already ran it
+/// inside the decode), one `[image] icc <verdict> bytes=<n> src=png-stream[ depth=16] ms=<n> path=<p>` line (`ms=` the
+/// build plus the base conversion; a 16-bit image's row conversion is inside the decode's own `ms=`).
+fn png_icc(path: &str, ic: &PngIcc, rows16: bool, px: &mut [u32]) {
+    let t0 = crate::arch::ms();
+    if let Some(xf) = ic.xf.as_ref().filter(|_| !rows16) {
         icc_xrgb(xf, px);
     }
-    serial_println!("[image] icc {} bytes={} src=png-stream ms={} path={}", verdict, n, crate::arch::ms().saturating_sub(t0), path);
+    let depth = if rows16 { " depth=16" } else { "" };
+    serial_println!("[image] icc {} bytes={} src=png-stream{} ms={} path={}", ic.verdict, ic.n, depth, ic.ms + crate::arch::ms().saturating_sub(t0), path);
 }
 
 // KERNEL-ICC-CACHE (LEDGER SR376): the built transforms of the last four profiles (`icc_core::TransformCache`, fnv-keyed),
 // taken only by `icc_xform`, so every open (still, streamed PNG, wallpaper, animation, RAW preview) shares it.
 static ICC_CACHE: crate::sync::Mutex<icc_core::TransformCache> = crate::sync::Mutex::new(icc_core::TransformCache::new());
+
+// ── KERNEL-PNG16-ICC (LEDGER SR380): a tagged 16-bit PNG converted on its 16-bit samples ──
+
+/// The `x`-th pixel of a depth-16 scanline as a 16-bit RGB triple (big-endian samples, grey replicated, alpha dropped):
+/// the samples `pix_sample` cuts to their high byte, read whole for `RowSink::icc16_row`.
+fn pix_rgb16(ihdr: &Ihdr, cur: &[u8], x: usize) -> [u16; 3] {
+    let s = |i: usize| u16::from_be_bytes([*cur.get(2 * i).unwrap_or(&0), *cur.get(2 * i + 1).unwrap_or(&0)]);
+    match ihdr.colour {
+        0 => {
+            let g = s(x);
+            [g, g, g]
+        }
+        4 => {
+            let g = s(x * 2);
+            [g, g, g]
+        }
+        2 => [s(x * 3), s(x * 3 + 1), s(x * 3 + 2)],
+        _ => [s(x * 4), s(x * 4 + 1), s(x * 4 + 2)],
+    }
+}
+
+/// A 16-bit sample to 8 bits, rounded.
+#[inline]
+fn narrow16(v: u16) -> u8 {
+    ((v as u32 * 255 + 32767) / 65535) as u8
+}
