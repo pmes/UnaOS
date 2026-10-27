@@ -813,60 +813,7 @@ fn erp_rows(checks: &mut Vec<(&'static str, bool)>) {
 
 // ── STATIONREJOIN (rmbp-ledger B891): the lost station's re-join — PURE (`Watch`'s shape), owned by `join::REJOIN` ─────────
 
-/// The first re-join waits this long after the loss; each failure doubles the wait.
-pub const REJOIN_FIRST_MS: u64 = 1000;
-/// The longest wait between two re-join attempts.
-pub const REJOIN_CAP_MS: u64 = 30_000;
-
-/// LOST_AT / LOST_WHY and the backoff: armed by `lose`, an attempt is `due` once the wait ran out; `failed` doubles the wait
-/// (capped `REJOIN_CAP_MS`), `linked` disarms it, counts the re-join and resets the ladder for the next loss.
-pub struct Rejoin {
-    pub lost_at: u64,
-    pub why: &'static str,
-    /// Attempts since the last loss.
-    pub n: u32,
-    /// Re-joins that linked this boot.
-    pub rejoins: u32,
-    delay_ms: u64,
-    due_at: u64,
-    armed: bool,
-}
-
-impl Rejoin {
-    pub const fn new() -> Rejoin {
-        Rejoin { lost_at: 0, why: "", n: 0, rejoins: 0, delay_ms: REJOIN_FIRST_MS, due_at: 0, armed: false }
-    }
-
-    pub fn lose(&mut self, now_ms: u64, why: &'static str) {
-        self.lost_at = now_ms;
-        self.why = why;
-        self.n = 0;
-        self.delay_ms = REJOIN_FIRST_MS;
-        self.due_at = now_ms + REJOIN_FIRST_MS;
-        self.armed = true;
-    }
-
-    pub fn due(&self, now_ms: u64) -> bool {
-        self.armed && now_ms >= self.due_at
-    }
-
-    /// One attempt starts: `(its number since the loss, ms since the loss)`.
-    pub fn attempt(&mut self, now_ms: u64) -> (u32, u64) {
-        self.n += 1;
-        (self.n, now_ms.saturating_sub(self.lost_at))
-    }
-
-    pub fn failed(&mut self, now_ms: u64) {
-        self.delay_ms = (self.delay_ms * 2).min(REJOIN_CAP_MS);
-        self.due_at = now_ms + self.delay_ms;
-    }
-
-    pub fn linked(&mut self) {
-        self.armed = false;
-        self.rejoins += 1;
-        self.delay_ms = REJOIN_FIRST_MS;
-    }
-}
+pub use super::assoc::{Rejoin, REJOIN_CAP_MS, REJOIN_FIRST_MS}; // S9REJOIN (MT7925S9REJOIN, zenbook-ledger Z59): the backoff MOVED verbatim to wifi/assoc.rs (compiled under `wifi`, so the MT7925 station shares it); every `data::Rejoin` path unchanged
 
 impl Link {
     /// STATIONREJOIN (B891): the Link's numbering moved `base` frames on (mod `FRAMES`), so a re-join's S10a and data continue

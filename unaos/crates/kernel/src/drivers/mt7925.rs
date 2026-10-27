@@ -1980,7 +1980,7 @@ struct Roc {
 /// S7's prologue, hoisted unchanged out of `scan_run` (MT7925S8, Z38; the writes and the s7 lines are the same, the tag is `who`):
 /// the pages, own (`take_own`), `kept`, RX ring 2's 64 KiB buffer block, `wake` with the data rings.
 fn rx_open(b: u64, h: &mut Hw, tx0: u64, rx2: u64, who: &'static str) -> Result<Run, &'static str> {
-    let was = link_down(who); // MT7925S9 (Z46): a scan or join re-wakes the rings, so the S9 link ends first (its line); S9WATCH (Z56): through the ONE link end
+    let was = link_down(who, Some(&mut *h)); // S9REJOIN (zenbook-ledger Z59, S9-UNLINK): the channel in hand, so the firmware's records of the old link are unwound too. MT7925S9 (Z46): a scan or join re-wakes the rings, so the S9 link ends first (its line); S9WATCH (Z56): through the ONE link end
     let lp = b + CONN_HOST_CSR_TOP + LPCTL;
     if !(map_page(b + WFDMA0) && map_page(b + (DMASHDL_SW_CONTROL & !0xfff))) {
         serial_println!("[mt7925] {} -> NOT ATTEMPTED why=unmapped rel=found", who);
@@ -2638,16 +2638,20 @@ fn link_up(h: &mut Hw, plan: &JoinPlan, aid: u16, t: &Tx, r: Rx2, took: bool) ->
 /// rings; `watch` calls it on a deauth, a disassoc or the firmware's beacon loss): the link taken out of `S9_LINK`, one line, the
 /// watch disarmed, smolnet's flag raised when the stack was bound (`down_take`; the driver never calls the stack). Returns whether
 /// the link's run took own (the caller hands it back: `rx_open` with its run, `watch` at once). False with no link. Call it with
-/// no lock held (it takes `S9_LINK`). S10-KEYZERO (owed, MT7925S10's): the key teardown folds onto this body.
-pub fn link_down(why: &str) -> bool {
+/// no lock held (it takes `S9_LINK`). S9REJOIN (zenbook-ledger Z59, S9-UNLINK): `h` is the MCU channel owned by value by the
+/// caller (`rx_open`'s run, or `watch` having taken it out of `MCU_LINK`; never under a lock); with it the firmware's records of
+/// the link are unwound in linux's disconnect order (`unlink`), their acks on the line (`fw=busy` with no channel). Not `pub`:
+/// `Hw` is private and every caller is in this file. S10-KEYZERO (owed): the key teardown folds AFTER the S9-UNLINK hunk, same `h`.
+fn link_down(why: &str, h: Option<&mut Hw>) -> bool {
     let Some(l) = S9_LINK.lock().take() else { return false };
     S9_WATCH.store(false, Ordering::Relaxed);
     if bound() {
         S9_DOWN.store(true, Ordering::Relaxed);
     }
+    let fw = match h { Some(h) => unlink(h, &l), None => String::from("busy") }; // S9-UNLINK (zenbook-ledger Z59): STA_REC remove, BSS_INFO not connected, BCNFT off
     serial_println!(
-        "[mt7925] s9 link down why={} aid={} tx={} rx={} skip={} full={}",
-        why, l.aid, l.tx, l.rx_n, l.skip, l.full
+        "[mt7925] s9 link down why={} aid={} tx={} rx={} skip={} full={} fw={}",
+        why, l.aid, l.tx, l.rx_n, l.skip, l.full, fw
     );
     l.took
 }
@@ -2798,7 +2802,7 @@ fn link_kat() -> bool {
     ok &= rx_span(&x).is_none();
     x[8..12].copy_from_slice(&(1u32 << 13).to_le_bytes());
     ok &= rx_span(&x) == Some((66..90, false)) && rx_frame(&x) == Some(66..90);
-    ok && watch_rows() // S9WATCH (zenbook-ledger Z56): the BCNFT body and the beacon-loss event decode
+    ok && watch_rows() && unlink_rows() // S9WATCH (zenbook-ledger Z56): the BCNFT body and the beacon-loss event decode; S9REJOIN (Z59): the three unlink bodies
 }
 
 // ── S9WATCH (zenbook-ledger Z56) — the S9 link's watch: deauth / disassoc from the AP, the firmware's beacon loss ──────────
@@ -2889,13 +2893,18 @@ pub fn watch() {
     let Some((what, code)) = lost else { return };
     let why = if what == "beacon-loss" { String::from(what) } else { alloc::format!("{}(reason={})", what, code) };
     let stack = if bound() { "reset" } else { "unbound" };
-    let took = link_down(&why);
+    let mut hw = MCU_LINK.try_lock().and_then(|mut g| g.take()); // S9REJOIN (Z59, S9-UNLINK): the channel taken out (lock released) for link_down's commands, put back after; None while a scan/join holds it
+    let took = link_down(&why, hw.as_mut());
+    if let Some(hw) = hw {
+        *MCU_LINK.lock() = Some(hw);
+    }
     let held = *PROBE.lock();
     let rel = match held {
         Some(p) => give_back(p.bar0 + CONN_HOST_CSR_TOP + LPCTL, took),
         None => "found",
     };
-    serial_println!("[mt7925] s9 watch -> lost why={} code={} rel={} stack={}", what, code, rel, stack);
+    let rejoin = if rejoin_lose(what) { "armed" } else { "off" }; // S9REJOIN (Z59): the kept plan's backoff armed (REJOIN, a leaf lock); the attempts run on the mt7925-rejoin task
+    serial_println!("[mt7925] s9 watch -> lost why={} code={} rel={} stack={} rejoin={}", what, code, rel, stack, rejoin);
 }
 
 /// smolnet's `service_poll`: a link the stack was bound to ended since the last call (taken once).
@@ -3142,4 +3151,229 @@ pub fn s10_kat() -> bool {
     ip[12] = 0x08;
     ok &= s10_is_eapol(&eapol) && !s10_is_eapol(&ip) && !s10_is_eapol(&eapol[..ETH_HDR + 3]) && !s10_is_eapol(&[]);
     ok
+}
+
+// ── S9REJOIN (zenbook-ledger Z59) — S9-UNLINK (the firmware's records unwound on link_down) and S9-REJOIN (the kept plan, re-joined) ──
+// `link_down` left the firmware holding the dead link: the AP peer's STA_REC (wcid 1, ASSOC), the BSS_INFO connected, the BCNFT
+// beacon monitor armed; and after a loss the station stayed down until the operator typed `tests wifijoin` again. Linux (v6.17
+// mt76 + mac80211, facts only): `ieee80211_set_disassoc` flushes the AP station first — mt7925's link-station removal sends
+// STA_REC_UPDATE with enable off (the header, a REMOVE TLV 0x25 {action 0} and a bare MLD_OFF TLV 0x23), clears the WTBL's ADM
+// count (an MMIO write, not built: S9-WTBLCLR), then BSS_INFO_UPDATE with enable off (BASIC conn_state 1, which is our join's own
+// `bss_req(.., WCID_PEER, false)` byte for byte) — and only then the ASSOC change turns the beacon filter off: ONE BSS_INFO_UPDATE
+// with the PM_DISABLE TLV (27; not a BCNFT TLV) plus an rx-filter clear of DROP_OTHER_BEACON we never set (S9-BCNDROP). Here:
+// `unlink` sends those three in that order from `link_down`, each acked (`fw=` on its line). The rejoin: the station keeps its
+// successful OPEN join's plan (`rejoin_keep`, wifi/verb.rs; cleared by every operator `tests wifijoin`); `watch` arms STATIONREJOIN's
+// ONE backoff (`wifi::assoc::Rejoin`, B891's: 1 s after the loss, doubling, capped 30 s, no attempt cap, moved out of the wifi10-only
+// data.rs for this) on a loss; ONE `mt7925-rejoin` task (B891's `rejoin_spawn` shape, spawned once by the first kept plan; never
+// the render loop's parked arm: a join takes seconds and the DHCP drive up to 12 s) runs each due attempt through the station's
+// handed-in `again` (the operator's ONE join path, `join_frames` -> `join`), then the station's `s9_dhcp`. REJOIN is a LEAF lock:
+// never held while taking MCU_LINK, S9_LINK or STACK, never across an attempt. Owed: S9-ROAM, S10-PMK-KEEP (a WPA2 rejoin needs the
+// PMK kept; only open plans are kept), WIFILEAVE, S9-BCNINT, S9-BCNDROP, S9-WTBLCLR, REJOIN-TASK-ONE, S10-KEYZERO (after S9-UNLINK).
+// Hardware facts only; no code copied.
+
+/// STA_REC_REMOVE and STA_REC_MLD_OFF (mt76_connac_mcu.h); UNI_BSS_INFO_PM_DISABLE; the remove body's length.
+const STA_TAG_REMOVE: u16 = 0x25;
+const STA_TAG_MLD_OFF: u16 = 0x23;
+const BSS_TAG_PM_DISABLE: u16 = 27;
+const STA_REMOVE_LEN: usize = 20;
+
+/// STA_REC_UPDATE remove body (pure, 20 bytes) for the AP peer: header {bss 0, wlan lo 1, 2 TLVs, append, muar 0, wlan hi 0, rsv},
+/// REMOVE {tag 0x25, len 8, action 0, 3 pad}, MLD_OFF {tag 0x23, len 4}.
+fn sta_remove_req() -> [u8; STA_REMOVE_LEN] {
+    let mut v = [0u8; STA_REMOVE_LEN];
+    v[1] = WCID_PEER as u8;
+    v[2..4].copy_from_slice(&2u16.to_le_bytes());
+    v[4] = 1;
+    let _ = put_tlv(&mut v, 8, STA_TAG_REMOVE, 8);
+    let _ = put_tlv(&mut v, 16, STA_TAG_MLD_OFF, 4);
+    v
+}
+
+/// BSS_INFO_UPDATE beacon-monitor off (pure, 8 bytes): header {bss 0, 3 pad}, PM_DISABLE {tag 27, len 4}.
+fn pm_disable_req() -> [u8; 8] {
+    let mut v = [0u8; 8];
+    let _ = put_tlv(&mut v, 4, BSS_TAG_PM_DISABLE, 4);
+    v
+}
+
+/// S9-UNLINK, from `link_down` with the channel owned by value: STA_REC remove, BSS_INFO not connected (the link's BSSID, band and
+/// PHY band), beacon monitor off — each sent whatever the one before answered (linux ignores the errors too). The `fw=` text.
+fn unlink(h: &mut Hw, l: &Link9) -> String {
+    let s = uni_cmd(h, UNI_STA_REC, &sta_remove_req());
+    let b = uni_cmd(h, UNI_BSS_INFO, &bss_req(l.bssid, l.band, Some(l.five), WCID_PEER, false));
+    let c = uni_cmd(h, UNI_BSS_INFO, &pm_disable_req());
+    alloc::format!("sta:{},bss:{},bcnft:{}", ack_text(&s), ack_text(&b), ack_text(&c))
+}
+
+/// The unlink rows (hand-computed from the field tables, no capture; folded into `link_kat`): the remove body, the PM_DISABLE body,
+/// and the not-connected BSS_INFO on band 0 (active 1, band 0, conn_state 1, sta index 1).
+fn unlink_rows() -> bool {
+    let b = bss_req([0x00, 0x11, 0x22, 0x33, 0x44, 0x55], 0, Some(false), WCID_PEER, false);
+    sta_remove_req() == [0, 1, 2, 0, 1, 0, 0, 0, 0x25, 0, 8, 0, 0, 0, 0, 0, 0x23, 0, 4, 0]
+        && pm_disable_req() == [0, 0, 0, 0, 27, 0, 4, 0]
+        && b[8] == 1 && b[11] == 0 && b[16] == 1 && u16::from_le_bytes([b[30], b[31]]) == WCID_PEER
+}
+
+/// The station's ONE rejoin attempt (`wifi/verb.rs::rejoin_again`, the operator's join path): Ok = the S9 link is up again; Err =
+/// the word on the rejoin line (`auth`, `assoc`, `link`, or the join's own refusal).
+#[cfg(feature = "wifi")]
+pub type Again = fn(&RejoinPlan) -> Result<(), &'static str>;
+
+/// What a successful open join leaves for a rejoin: the SSID bytes, the BSS, its channel and capability, the station's judge, the
+/// attempt and the post-link DHCP drive (both the station's: the driver links no wifi_core).
+#[cfg(feature = "wifi")]
+#[derive(Clone, Copy)]
+pub struct RejoinPlan {
+    pub ssid: [u8; 32],
+    pub ssid_len: u8,
+    pub bssid: [u8; 6],
+    pub channel: u8,
+    pub cap: u16,
+    pub watch: Judge,
+    pub again: Again,
+    pub dhcp: fn(),
+}
+
+/// The kept plan and its backoff (STATIONREJOIN's ONE ladder).
+#[cfg(feature = "wifi")]
+struct Kept {
+    plan: RejoinPlan,
+    r: crate::wifi::assoc::Rejoin,
+}
+
+/// Some from a successful open `tests wifijoin` until the next operator `tests wifijoin`. A LEAF lock (see the block head).
+#[cfg(feature = "wifi")]
+static REJOIN: crate::sync::Mutex<Option<Kept>> = crate::sync::Mutex::new(None);
+/// The `mt7925-rejoin` task was spawned (once per boot).
+#[cfg(feature = "wifi")]
+static REJOIN_SPAWNED: AtomicBool = AtomicBool::new(false);
+/// The task's check cadence (B891's).
+#[cfg(feature = "wifi")]
+const REJOIN_POLL_MS: u64 = 250;
+
+/// The station's keep (Some, after a successful open join, the link up) or forget (None, at every operator `tests wifijoin`); the
+/// first Some spawns the task (B891's CPU choice: an xHCI worker, else the service CPU).
+#[cfg(feature = "wifi")]
+pub fn rejoin_keep(p: Option<RejoinPlan>) {
+    let on = p.is_some();
+    *REJOIN.lock() = p.map(|plan| Kept { plan, r: crate::wifi::assoc::Rejoin::new() });
+    if on && !REJOIN_SPAWNED.swap(true, Ordering::AcqRel) {
+        let cpu = crate::arch::smp::xhci_worker_cpu(0).or(crate::arch::smp::service_cpu()).unwrap_or(0);
+        crate::arch::sched::spawn("mt7925-rejoin", rejoin_task, 0, cpu, crate::arch::sched::PRIO_NORMAL);
+    }
+}
+
+/// From `watch` after a loss (no other lock held): the kept plan's backoff armed (first attempt 1 s later). False with no plan.
+#[cfg(feature = "wifi")]
+fn rejoin_lose(why: &'static str) -> bool {
+    match REJOIN.lock().as_mut() {
+        Some(k) => {
+            k.r.lose(crate::arch::ms(), why);
+            true
+        }
+        None => false,
+    }
+}
+
+/// No station without `wifi`: nothing is ever kept.
+#[cfg(not(feature = "wifi"))]
+fn rejoin_lose(_: &'static str) -> bool {
+    false
+}
+
+/// The rejoin task: every `REJOIN_POLL_MS`, a due attempt (`rejoin_tick`); idle otherwise.
+#[cfg(feature = "wifi")]
+fn rejoin_task(_: usize) {
+    loop {
+        crate::arch::sched::sleep_ms(REJOIN_POLL_MS);
+        rejoin_tick(crate::arch::ms());
+    }
+}
+
+/// Under REJOIN (pure over the Kept): a due attempt starts — (the plan, its number since the loss, ms since the loss, why).
+#[cfg(feature = "wifi")]
+fn rejoin_begin(k: &mut Kept, now: u64) -> Option<(RejoinPlan, u32, u64, &'static str)> {
+    if !k.r.due(now) {
+        return None;
+    }
+    let (n, after) = k.r.attempt(now);
+    Some((k.plan, n, after, k.r.why))
+}
+
+/// Under REJOIN (pure over the Kept): the attempt's verdict recorded — linked resets the ladder, a failure doubles the wait. The
+/// re-joins that linked.
+#[cfg(feature = "wifi")]
+fn rejoin_end(k: &mut Kept, ok: bool, now: u64) -> u32 {
+    if ok {
+        k.r.linked();
+    } else {
+        k.r.failed(now);
+    }
+    k.r.rejoins
+}
+
+/// One check: nothing while a scan or join holds the channel (no attempt counted); else a due attempt — the plan copied out under
+/// REJOIN, the lock released, the station's `again`, the verdict recorded under REJOIN, one line, and on linked the station's DHCP.
+#[cfg(feature = "wifi")]
+fn rejoin_tick(now: u64) {
+    if MCU_LINK.try_lock().map_or(true, |g| g.is_none()) {
+        return;
+    }
+    let go = REJOIN.lock().as_mut().and_then(|k| rejoin_begin(k, now));
+    let Some((plan, n, after, why)) = go else { return };
+    let res = (plan.again)(&plan);
+    let rejoins = REJOIN.lock().as_mut().map_or(0, |k| rejoin_end(k, res.is_ok(), crate::arch::ms()));
+    let verdict = match res {
+        Ok(()) => String::from("linked"),
+        Err(w) => alloc::format!("failed:{}", w),
+    };
+    serial_println!("[mt7925] s9 rejoin n={} after={} why={} -> {} rejoins={}", n, after, why, verdict, rejoins);
+    if res.is_ok() {
+        (plan.dhcp)();
+    }
+}
+
+/// The KAT's stub attempt: refused twice, then linked (counted by `REJOIN_KAT_N`, reset by `rejoin_kat`).
+#[cfg(feature = "wifi")]
+static REJOIN_KAT_N: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "wifi")]
+fn rejoin_kat_again(_: &RejoinPlan) -> Result<(), &'static str> {
+    if REJOIN_KAT_N.fetch_add(1, Ordering::Relaxed) < 2 { Err("auth") } else { Ok(()) }
+}
+#[cfg(feature = "wifi")]
+fn rejoin_kat_judge(_: &[u8], _: [u8; 6], _: [u8; 6]) -> Option<(&'static str, u16)> {
+    None
+}
+#[cfg(feature = "wifi")]
+fn rejoin_kat_dhcp() {}
+
+/// `tests wifijoin`'s S9-REJOIN rows (no device; the stub seam is the plan's `again`, as the judge is `watch_kat`'s): on a local
+/// Kept, a beacon loss at 1000 ms — nothing due at 1999; attempt 1 at 2000 (1000 ms after) refused; nothing at 3999; attempt 2 at
+/// 4000 refused; nothing at 7999; attempt 3 at 8000 linked (rejoins 1); never due again; a deauth at 200000 resets the ladder
+/// (nothing at 200999, attempt 1 at 201000, linked, rejoins 2) — then `unlink_rows`.
+#[cfg(feature = "wifi")]
+pub fn rejoin_kat() -> bool {
+    fn step(k: &mut Kept, now: u64) -> Option<(u32, u64, bool, u32)> {
+        let (p, n, after, _) = rejoin_begin(k, now)?;
+        let ok = (p.again)(&p).is_ok();
+        Some((n, after, ok, rejoin_end(k, ok, now)))
+    }
+    REJOIN_KAT_N.store(0, Ordering::Relaxed);
+    let plan = RejoinPlan {
+        ssid: [0; 32], ssid_len: 0, bssid: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55], channel: 6, cap: 0x0001,
+        watch: rejoin_kat_judge, again: rejoin_kat_again, dhcp: rejoin_kat_dhcp,
+    };
+    let mut k = Kept { plan, r: crate::wifi::assoc::Rejoin::new() };
+    k.r.lose(1000, "beacon-loss");
+    let mut ok = step(&mut k, 1999).is_none()
+        && step(&mut k, 2000) == Some((1, 1000, false, 0))
+        && step(&mut k, 3999).is_none()
+        && step(&mut k, 4000) == Some((2, 3000, false, 0))
+        && step(&mut k, 7999).is_none()
+        && step(&mut k, 8000) == Some((3, 7000, true, 1))
+        && step(&mut k, 1_000_000).is_none()
+        && k.r.why == "beacon-loss";
+    k.r.lose(200_000, "deauth");
+    ok &= step(&mut k, 200_999).is_none() && step(&mut k, 201_000) == Some((1, 1000, true, 2)) && k.r.why == "deauth";
+    ok && unlink_rows()
 }
