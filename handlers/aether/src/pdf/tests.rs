@@ -1170,3 +1170,58 @@ fn pdf4fitstatus_refit_scale2() {
     assert_eq!(px(&f, 235, 290), [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2], "the strip is 240 device px at zoom 2");
     assert_ne!(px(&f, 245, 290), [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2], "and stops there");
 }
+
+// =================================================================================================
+// PDF4-FIT-ZOOMROUND (SR401): a zoom or a device resize whose CSS viewport rounds to the same size fires no
+// `Event::Resize`; `apply_device_size` re-fits in that case itself, once (the Resize arm refits otherwise).
+// =================================================================================================
+
+#[test]
+fn pdf4fitzoomround_device_round() {
+    use super::thumbs::STRIP_W;
+    let mut e = open(400, 300);
+    key(&mut e, "F4");
+    key(&mut e, "w");
+    e.set_device_size(806, 300);
+    assert_eq!((e.zoom_pct(), e.width, e.height), (200, 403, 150), "refit_scale2's state");
+    let sw = e.pdf.as_ref().unwrap().stack_w();
+    assert_eq!(((805.0f64 / 2.0).round() as u32, (300.0f64 / 2.0).round() as u32), (403, 150), "805 px rounds to the same CSS size at zoom 2");
+    e.set_device_size(805, 300);
+    let want = (805.0 / (sw + STRIP_W) * 100.0).floor() as u32;
+    assert_eq!(want, 199);
+    assert_eq!(e.zoom_pct(), want, "the fit tracks the device px with no Resize fired");
+    assert!(e.pdf_status().unwrap().ends_with(" \u{b7} fit-w 199%"), "{:?}", e.pdf_status());
+    let vw = e.width as f64;
+    assert_eq!(e.pdf.as_ref().unwrap().max_scroll_x(vw), 0.0, "the stack still fits the lane right of the strip");
+}
+
+#[test]
+fn pdf4fitzoomround_ladder_round() {
+    let mut e = open(1130, 400);
+    key(&mut e, "w");
+    assert_eq!((e.zoom_pct(), e.width, e.height), (399, 283, 100), "fit-w at 1130 device px");
+    assert!(e.pdf_status().unwrap().ends_with(" \u{b7} fit-w 399%"), "{:?}", e.pdf_status());
+    assert_eq!(e.zoom_step(1), 400);
+    assert_eq!((e.width, e.height), (283, 100), "282.5 rounds to 283: the CSS size held, no Resize fired");
+    assert_eq!(e.pdf.as_ref().unwrap().fit, None, "the ladder step still drops the mode");
+    let s = e.pdf_status().unwrap();
+    assert!(s.ends_with(" \u{b7} 400%") && !s.contains("fit"), "{s:?}");
+}
+
+#[test]
+fn pdf4fitzoomround_resize_once() {
+    use super::thumbs::STRIP_W;
+    let mut e = open(400, 300);
+    key(&mut e, "F4");
+    key(&mut e, "w");
+    e.set_device_size(806, 300);
+    let sw = e.pdf.as_ref().unwrap().stack_w();
+    e.set_device_size(1000, 300);
+    let want = (1000.0 / (sw + STRIP_W) * 100.0).floor() as u32;
+    assert_eq!(e.zoom_pct(), want, "a resize that changes the CSS size re-fits through the Resize arm");
+    assert_eq!(e.width, (1000.0 / (want as f64 / 100.0)).round() as u32);
+    assert_eq!(e.pdf.as_ref().unwrap().fit, Some((super::Fit::Width, want)));
+    let (n, w) = (e.damage_rects.len(), e.width);
+    e.pdf_refit();
+    assert_eq!((e.damage_rects.len(), e.width, e.zoom_pct()), (n, w, want), "a second refit on the settled state moves and repaints nothing");
+}

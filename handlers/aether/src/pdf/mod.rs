@@ -758,7 +758,8 @@ impl crate::AetherEngine {
 // =================================================================================================
 // PDF4-FIT (SR389): fit-width and fit-page through the one zoom path (`set_zoom_pct`). Both fit the whole stack (the
 // widest page; the tallest for fit-page), so the mode does not depend on the current page and persists across page
-// changes. lib.rs calls `pdf_refit` after every `Event::Resize` arm (a zoom inside the arm would re-enter it).
+// changes. lib.rs calls `pdf_refit` after every `Event::Resize` arm (a zoom inside the arm would re-enter it), and
+// PDF4-FIT-ZOOMROUND (SR401): `apply_device_size` calls it when no Resize fired (the CSS size rounded the same).
 // =================================================================================================
 
 /// A fit mode.
@@ -813,7 +814,8 @@ impl crate::AetherEngine {
     }
 
     /// After a resize (a window resize, a zoom, the strip opening or closing): a zoom that is not the fit's own (a
-    /// ladder step or reset) drops the mode; else the fit is recomputed and applied when it moved.
+    /// ladder step or reset) drops the mode; else the fit is recomputed and applied when it moved (a second call on the
+    /// settled state is a no-op, so the nested call through `set_zoom_pct` returns).
     pub(crate) fn pdf_refit(&mut self) {
         let (dev, now) = (self.device, self.zoom_pct);
         let Some(pdf) = self.pdf.as_mut() else { return };

@@ -1637,7 +1637,7 @@ impl AetherEngine {
         let ch = ((self.device.1 as f64 / z).round() as u32).max(1);
         if (cw, ch) != (self.width, self.height) {
             self.handle_event(api::events::Event::Resize(cw, ch));
-        }
+        } else { self.pdf_refit(); } // PDF4-FIT-ZOOMROUND (SR401): no Resize fired (the CSS size rounded the same), so re-fit here; the arm refits otherwise
         self.needs_repaint = true;
         self.damage_rects.push((0, 0, self.width, self.height));
     }
