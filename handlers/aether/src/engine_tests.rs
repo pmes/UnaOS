@@ -3473,4 +3473,82 @@ mod tests {
         let dark = ((x as u32 + 2)..((x + w) as u32 - 2)).filter(|&cx| px(&engine, cx, mid).0 < 60).count();
         assert_eq!(dark, 0, "the blink's off phase paints no caret");
     }
+
+    /// AETHERFIT2 (SR191): HTML §6.6.3 — an inert node is not a focusable area: under a modal dialog `focus()` on the
+    /// blocked document REFUSES (activeElement stays), while a control inside the dialog still takes focus.
+    #[test]
+    fn test_focus_refuses_an_inert_element() {
+        let html = r#"<html><body><input id="outside"><dialog><input id="inside"></dialog>
+            <script>document.querySelector('dialog').showModal();</script></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.load_html("https://example.com/", html, true);
+        let js = |e: &mut crate::AetherEngine, src: &str| e.js_engine.as_mut().unwrap().eval_string(src).unwrap();
+        let before = js(&mut engine, "String(document.activeElement && document.activeElement.id)");
+        js(&mut engine, "document.getElementById('outside').focus()");
+        assert_eq!(js(&mut engine, "String(document.activeElement && document.activeElement.id)"), before, "focus() on an inert element is refused");
+        assert_ne!(before, "outside");
+        js(&mut engine, "document.getElementById('inside').focus()");
+        assert_eq!(js(&mut engine, "document.activeElement.id"), "inside", "a control inside the modal dialog still focuses");
+        js(&mut engine, "document.querySelector('dialog').close(); document.getElementById('outside').focus()");
+        assert_eq!(js(&mut engine, "document.activeElement.id"), "outside", "with the dialog closed the document focuses again");
+    }
+
+    /// AETHERFIT2 (SR191): MouseUp's defaults take the RETARGETED hit (HTML §6.3) — a click on an inert link under a
+    /// modal dialog follows no link; without the dialog the same click navigates.
+    #[test]
+    fn test_mouseup_defaults_take_the_retargeted_hit() {
+        let page = |modal: bool| {
+            format!(
+                r#"<html><head><style>body {{ margin: 0; }} #l {{ display: block; height: 600px; }}</style></head><body>
+                <a id="l" href="/next">link</a><dialog><p>modal</p></dialog>
+                <script>{}</script></body></html>"#,
+                if modal { "document.querySelector('dialog').showModal();" } else { "" }
+            )
+        };
+        for modal in [true, false] {
+            let mut engine = crate::AetherEngine::new();
+            engine.load_html("https://example.com/", &page(modal), true);
+            engine.render_frame();
+            engine.handle_event(crate::api::events::Event::MouseDown(5.0, 5.0));
+            engine.handle_event(crate::api::events::Event::MouseUp(5.0, 5.0));
+            let nav = engine.take_pending_nav();
+            if modal {
+                assert!(nav.is_none(), "a click on the inert link under a modal dialog stages no navigation");
+            } else {
+                assert!(nav.is_some(), "without the dialog the click follows the link");
+            }
+        }
+    }
+
+    /// AETHERFIT2 (SR191): CSSOM reads the fixed box's viewport origin and the top layer — a modal dialog's
+    /// getBoundingClientRect() does not move with window.scroll, elementFromPoint at its centre is inside it over a
+    /// document box, and the root's scrollHeight leaves the fixed box out (its clientHeight is the viewport's).
+    #[test]
+    fn test_cssom_fixed_rects_hit_the_top_layer() {
+        let html = r#"<html><head><style>
+            body { margin: 0; }
+            #under { height: 3000px; }
+            dialog { padding: 0; border: 0; }
+            #inner { display: block; width: 100px; height: 40px; }
+        </style></head><body><div id="under"></div><dialog><div id="inner"></div></dialog>
+        <script>document.querySelector('dialog').showModal();</script></body></html>"#;
+        let mut engine = crate::AetherEngine::new();
+        engine.handle_event(crate::api::events::Event::Resize(800, 600));
+        engine.load_html("https://example.com/", html, true);
+        engine.render_frame();
+        let js = |e: &mut crate::AetherEngine, src: &str| e.js_engine.as_mut().unwrap().eval_string(src).unwrap();
+        let top0 = js(&mut engine, "String(document.getElementById('inner').getBoundingClientRect().top)");
+        let left0 = js(&mut engine, "String(document.getElementById('inner').getBoundingClientRect().left)");
+        assert_eq!(top0, "280", "centred in the 600px viewport: (600 - 40) / 2");
+        assert_eq!(left0, "350", "centred in the 800px viewport: (800 - 100) / 2");
+        assert_eq!(js(&mut engine, "String(document.elementFromPoint(400, 300).id)"), "inner", "the top layer is hit above the document box");
+        assert_eq!(js(&mut engine, "String(document.elementFromPoint(5, 5).id)"), "under", "outside the dialog: the document box");
+        js(&mut engine, "window.scrollTo(0, 500)");
+        assert_eq!(js(&mut engine, "String(window.scrollY)"), "500");
+        assert_eq!(js(&mut engine, "String(document.getElementById('inner').getBoundingClientRect().top)"), top0, "a fixed box does not move with the scroll");
+        assert_eq!(js(&mut engine, "String(document.getElementById('under').getBoundingClientRect().top)"), "-500", "a document box does");
+        assert_eq!(js(&mut engine, "String(document.elementFromPoint(400, 300).id)"), "inner", "still hit at the same viewport point after the scroll");
+        assert_eq!(js(&mut engine, "String(document.scrollingElement.scrollHeight)"), "3000", "the document's extent, without the fixed box");
+        assert_eq!(js(&mut engine, "String(document.documentElement.clientHeight)"), "600", "the root's clientHeight is the viewport's");
+    }
 }

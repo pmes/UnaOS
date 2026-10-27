@@ -709,7 +709,7 @@ run (R107): the fold's `wpt_apis` run is the measurement.
    document box beneath it. `events.rs` retargets a click on an inert node to the modal dialog, so a modal dialog's
    own controls are reachable only where they do not overlap document content. Change: test the top layer's boxes
    first, in reverse order (`js::toplayer::top_layer`), and skip inert boxes.
-3. OWED (AETHERFIT SR189 measured it a different rule: focus REFUSES, it does not retarget; handlers.md §5). **The focusing steps do not refuse inert elements** (`focus()` on an element outside a modal dialog still focuses
+3. DONE (AETHERFIT2 SR191, below: `js/html.rs focus_op` refuses an inert element; AETHERFIT SR189 measured it a different rule: focus REFUSES, it does not retarget). **The focusing steps do not refuse inert elements** (`focus()` on an element outside a modal dialog still focuses
    it; HTML §6.6.3 "focusable area" excludes inert nodes): `handlers/aether/src/js/dom.rs`'s focus path needs
    `toplayer::is_inert`.
 4. **The CloseWatcher interface's own events** (`cancel` / `close` on a page's `CloseWatcher`) are dispatched
@@ -775,4 +775,62 @@ out at (RULING A: the engine relays out on Resize, so the layout viewport always
 - `modal-dialog-scroll-height.html` 0/1: a fixed box still adds to the document's `scrollHeight`.
 - `top-layer-position.html` 0/1: it reads the computed `position` of a modal dialog whose inline style says
   `static` / `relative`. That is cascade priority on a UA rule, not layout.
+
+## AETHERFIT2 (SR191) — focus refuses inert; MouseUp defaults retargeted; CSSOM fixed rects and the top layer; fixed % sizes; the sizing keywords
+
+Closes AETHERFIT's owed list (a)-(e) (`docs/dev/blueprint/handlers.md` §5) and AETHERTOP gap 3. Design measured at
+2879aed46, `MEASURE: PASS` from the seat; grants `js/html.rs` (the focus path is there at the cut, not in
+`js/dom.rs`) and, after the first after-run, `js/toplayer.rs` (below).
+
+### What landed, per spec section
+- **HTML §6.6.3, an inert node is not a focusable area** (`js/html.rs focus_op`): `focus()` on an element
+  `toplayer::is_inert` names REFUSES; it is never retargeted. The dialog focusing steps reach it through `el.focus()`.
+  The first after-run took two pages DOWN (`dialog-focus-previous-outside.html` 4/6 -> 2/6, `dialog-closedby-start-
+  open.html` 1/2 -> 0/2): `toplayer.rs closeDialog` restored focus BEFORE syncing the Rust top-layer mirror
+  (`track()`), so the restore target was still inert to `is_inert` and was refused. HTML's close steps take the
+  dialog out of the top layer before the restore; `closeDialog` and `hidePopover` now call `track()` at that
+  point (the trailing one stays). Both pages are back at baseline.
+- **HTML §6.3, the shell's MouseUp defaults** (`lib.rs`): the focus starting point, media toggle and the link /
+  control / label walk act on the RETARGETED hit through ONE tail fn `retargeted`, which `pointer_moved` also uses.
+  The JS dispatch keeps the raw hit (`user_button` / `click_with_activation` retarget themselves; light dismiss needs
+  to know the click fell outside the dialog).
+- **CSS 2.2 §9.6.1 / CSSOM View §6.1, §7** (`js/cssom.rs`): `element_boxes` takes a fixed box's origin from
+  `LayoutTree::fixed_at` per pinned axis and marks its subtree (`Flushed.pinned`). ONE `client_rect` subtracts the
+  scroll only on unpinned axes, and both `client_rects` and `hit_test` read it. `hit_test` ranks a hit in a
+  top-layer element above every document layer (later entries above earlier), through the same `top_layer()` +
+  `render::top_layer_box` path. `document_extent` leaves pinned boxes out (css-overflow-3 §2.2). The root element's
+  clientWidth/Height are the viewport's, and its scrollWidth/Height = max(extent, viewport).
+- **CSS 2.2 §10.1.3, a fixed box's % sizes** (layout_core `tree.rs fixed_viewport`): its % `width` / `height` /
+  `min-*` / `max-*` (and `fit-content(%)`) resolve against the viewport in the same rewrite-then-restore step as its
+  insets (one `FixedSaved` record per box). That restore now runs first among the pass restores, so another pass's
+  own restore keeps the last word on its field. KAT: a second layout leaves every style identical.
+- **CSS Sizing 3 §2.1 / §3.1 / §3.2** (layout_core `css.rs parse_dimension_str`): `min-content`, `max-content` and
+  `fit-content(<length-percentage>)` map onto taffy 0.15.1's own keywords (no sizing code); `has_width` is false for
+  any sizing keyword, and `block_auto` reads every sizing keyword but `stretch` as auto. On `min-*` / `max-*` they fold
+  to auto (taffy's min/max sizes cannot hold a keyword).
+- **HTML §15.3.x UA rules** (`css/mod.rs UA_SHEET`): the spec's non-modal `dialog { position: absolute; inset-inline:
+  0; width / height: fit-content; margin: auto }` (written as `left: 0; right: 0`: layout_core has no logical insets).
+  `dialog:modal`'s `max-width` / `max-height` are `calc(100vw - 6px - 2em)` / `calc(100vh - 6px - 2em)`, the spec's
+  `100%`, which is right ONLY because a top-layer box's containing block is the viewport.
+
+### Counts (host, measured in the same worktree; before = 2879aed46)
+| runner | before | after |
+|---|---|---|
+| `cargo test -p layout_core` | 34 passed / 0 failed | 36 passed / 0 failed (+`fixed_percent_size_resolves_against_the_viewport`, +`sizing_keywords_parse_onto_taffy`) |
+| `cargo test --release -p aether --lib` | 211 passed / 1 failed | 214 passed / 1 failed (+`test_focus_refuses_an_inert_element`, +`test_mouseup_defaults_take_the_retargeted_hit`, +`test_cssom_fixed_rects_hit_the_top_layer`; the failure is the foreign `js::idb::tests::transaction_ordering_kat` both times) |
+| `wpt_apis` the-dialog-element (40 served) | 60/170 | 69/170 (`abspos-dialog-layout` 3/10 -> 10/10, `modal-dialog-scroll-height` 0/1 -> 1/1, `multiple-centered-dialogs` 0/1 -> 1/1) |
+| `wpt_apis` popovers (28 served) | 98/136 | 98/136 (no page changed) |
+| `wpt_dom` interactive-elements (86 served) | 166/352 | 168/352 (`modal-dialog-scroll-height` 0/1 -> 1/1, `remove-dialog-should-unblock-document` 0/1 -> 1/1) |
+
+No page went down (per-page diff of both runners after the `toplayer.rs` fix).
+
+### Why the remaining named pages did not move
+- `centering.html` 0/23: nested iframes' viewports (owed).
+- `top-layer-position.html` 0/1: a top-layer element's computed `position` (static / relative becoming absolute) is
+  cascade priority on a UA rule, not layout (owed).
+- `non-modal-dialog-layout.html` 0/1: one subtest that switches an open dialog between `absolute`, `static` and
+  `relative` against a relative container by script; its first failing assert was not chased in this arc.
+- Measured while building and owed (handlers.md §5 (c)): layout_core's IFC-root measure lays a content-sized box at
+  its max-content capped at the viewport, whatever the definite available width, so `fit-content(<lp>)` (and the
+  bare `fit-content`) do not clamp a text wider than the limit, and `max-content` stops at the viewport.
 

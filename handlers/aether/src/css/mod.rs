@@ -529,17 +529,26 @@ pub fn apply_stylesheets(layout_tree: &mut LayoutTree, sheets: &[String]) {
 /// Fullscreen §7's UA rules, and the `::backdrop` boxes (CSS Position 4 §top-layer): a hidden popover has no box; a
 /// showing one and a modal dialog are fixed boxes of the viewport — AETHERFIT (SR189): the spec's `inset: 0;
 /// margin: auto; width: fit-content; height: fit-content`, CENTRED (layout_core's `fit-content` keyword and its
-/// fixed-box pass, which gives a fixed box the viewport as its containing block; the spec's `dialog:modal`
-/// `max-width` / `max-height: calc(100% - 6px - 2em)` are not written: a % size of a fixed box still resolves against
-/// its DOM parent); the fullscreen element fills the viewport; a modal
-/// dialog's backdrop is the spec's translucent black, a popover's transparent. `render` paints each top-layer element
-/// after its backdrop (`top_layer_paint`).
+/// fixed-box pass, which gives a fixed box the viewport as its containing block); the fullscreen element fills the
+/// viewport; a modal dialog's backdrop is the spec's translucent black, a popover's transparent. `render` paints each
+/// top-layer element after its backdrop (`top_layer_paint`).
+/// AETHERFIT2 (SR191): HTML §15.3.x's `dialog` rule, its layout half — `position: absolute; inset-inline-start: 0;
+/// inset-inline-end: 0; width: fit-content; height: fit-content; margin: auto` (an open non-modal dialog is out of
+/// flow, centred in the inline axis; `inset-inline` is written as `left` / `right`, horizontal-tb, since layout_core
+/// has no logical insets; the paint half — `border: solid; padding: 1em; background-color: Canvas; color:
+/// CanvasText` — is owed). `dialog:modal`'s `max-width` / `max-height` are the spec's `calc(100% - 6px - 2em)`
+/// written as `calc(100vw - 6px - 2em)` / `calc(100vh - 6px - 2em)`: that is right ONLY because a top-layer box's
+/// containing block is the viewport (its `position: fixed`), so its 100% IS 100vw / 100vh — layout_core keeps no
+/// block-axis %-calc expression (`pct_math` is the width family, resolved against the DOM parent), so the % text
+/// would not resolve against the viewport. A later logical-inset or containing-block arc that changes either
+/// premise rewrites these two values.
 const UA_SHEET: &str = "\
 dialog:not([open]) { display: none; }\
+dialog { position: absolute; left: 0; right: 0; width: fit-content; height: fit-content; margin: auto; }\
 [popover]:not(:popover-open):not(dialog[open]) { display: none; }\
 dialog:popover-open { display: block; }\
 [popover] { position: fixed; inset: 0; width: fit-content; height: fit-content; margin: auto; border: solid; padding: 0.25em; overflow: auto; color: canvastext; background-color: canvas; }\
-dialog:modal { position: fixed; overflow: auto; inset: 0; width: fit-content; height: fit-content; margin: auto; }\
+dialog:modal { position: fixed; overflow: auto; inset: 0; width: fit-content; height: fit-content; margin: auto; max-width: calc(100vw - 6px - 2em); max-height: calc(100vh - 6px - 2em); }\
 :not(:root):fullscreen { position: fixed; inset: 0; margin: 0; box-sizing: border-box; min-width: 0; max-width: none; min-height: 0; max-height: none; width: 100%; height: 100%; transform: none; }\
 ::backdrop { position: fixed; inset: 0; }\
 dialog:modal::backdrop { background-color: rgba(0, 0, 0, 0.1); }\
