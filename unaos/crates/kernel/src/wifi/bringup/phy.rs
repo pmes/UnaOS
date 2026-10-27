@@ -93,3 +93,38 @@ pub(super) fn once(bar0: u64, bus: u8, dev: u8, func: u8, mac: [u8; 6], ch: u16,
     };
     Ok(PhyState { suspended, h, tp, pctl, pctl_on, cookie_pre, prep, rxr, w })
 }
+
+// ── PHYONCE-TESTS (rmbp-ledger B954): `tests phy` parks `once`'s PhyState here; `wifi10()` takes it ──────────────────────
+
+/// The PhyState `tests phy` left, with the SHM_CONTROL pre-image `wifi10()` restores at its end. Filled at most once per
+/// boot (`bringup::PHY_RAN` keeps `once` to one call), emptied by `take`. The lock is held for the put, the take and the
+/// check only; the suspend, the drain and the resume (they poll and settle) run outside it.
+static PARK: crate::sync::Mutex<Option<(PhyState, u32)>> = crate::sync::Mutex::new(None);
+
+/// From `bringup::phy_tests` after `once` returned Ok: the MAC suspended again (`rx::suspend` — an enabled ucode ACKs unicast
+/// to the station MAC that `tx::prep` put in MACFILTER_SELF, and the 64-slot ring fills with no reader), the frames the armed
+/// ring took meanwhile drained into a scratch `Seen` (wifi10's probe window counts only its own), SHM_CONTROL restored and
+/// read back, the state parked. `(mac_suspended, drained_frames, shm_restored)`.
+pub(super) fn park(bar0: u64, mut p: PhyState, ch: u16, shm_pre: u32) -> (bool, u32, bool) {
+    let mac_off = rx::suspend(bar0, &mut p.w, "wifi10-phy");
+    let mut scratch = rx::Seen::default();
+    rx::drain(bar0, &mut p.rxr, &mut scratch, ch, &mut p.w);
+    unsafe { w32(bar0, D11_SHM_CONTROL, shm_pre) };
+    let shm_ok = unsafe { super::r32(bar0, D11_SHM_CONTROL) } == shm_pre;
+    *PARK.lock() = Some((p, shm_pre));
+    (mac_off, scratch.frames, shm_ok)
+}
+
+/// `wifi10()`'s latch check: a parked PhyState lets its pass run once more, from the probe.
+pub(super) fn parked() -> bool {
+    PARK.lock().is_some()
+}
+
+/// From `wifi10()` in place of `once`: the parked state and its pre-image, the MAC enabled again (`rx::resume`, arm's
+/// enable as one fn) right before the probe, as `once` left it. `None` when `tests phy` parked nothing.
+pub(super) fn take(bar0: u64) -> Option<(PhyState, u32)> {
+    let mut got = PARK.lock().take()?;
+    rx::resume(bar0, &mut got.0.w);
+    serial_println!("[wifi10] phy taken from tests phy (PHYONCE-TESTS B954) -> mac resumed; the pass goes on from the probe");
+    Some(got)
+}
