@@ -194,8 +194,8 @@ fn wifidhcp() {
                 let (gw, dns) = crate::smolnet::route_view();
                 super::data::set_dhcp(1);
                 serial_println!(
-                    ":: WIFIDHCP: dhcp=bound ip={} gw={} dns={} lease=unread waited={}ms -> PASS ::",
-                    ip4(ip), ip4(gw), ip4(dns), waited
+                    ":: WIFIDHCP: dhcp=bound ip={} gw={} dns={} lease={} waited={}ms -> PASS ::",
+                    ip4(ip), ip4(gw), ip4(dns), crate::smolnet::lease_secs().map_or(alloc::string::String::from("unread"), |s| alloc::format!("{}", s)), waited
                 );
             }
             None => {

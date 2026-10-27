@@ -22,6 +22,12 @@ resonance = { path = "../../libs/resonance" }
 gneiss_pal = { path = "../../libs/gneiss_pal", features = ["av1"] }
 tokio = { version = "1.53", features = ["rt", "sync", "time", "macros"] }
 anyhow = "1.0"
+# NLE1 (SR194): the editor's timeline core (no_std, shared with the on-UnaOS face); `nle` renders its schedule.
+timeline_core = { path = "../../unaos/libs/media/timeline_core" }
+# NLE5B (SR206): the H.264 export encodes through H264ENC's encoder and its RGBA -> I420 (`yuv`), the tree's one converter.
+h264enc_core = { path = "../../unaos/libs/media/h264enc_core" }
+# NLE2 (SR201): the editor face names its clips through the host font stack quartzite's chrome uses (seat grant).
+text_host = { path = "../../libs/text_host" }
 log = "0.4"
 
 [dev-dependencies]

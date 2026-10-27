@@ -20,9 +20,10 @@
 //! the gateway the operator named is S10a; smoltcp's DHCP over the kept station is S10b (`verb.rs::wifidhcp`).
 //!
 //! The KATs are hand-assembled from the clause layouts (no captured data frame exists in `docs/dev/evidence`),
-//! so `n=16/16` certifies the judge, the codec, the 1514-octet frame cap, the addr1 filter and the link watch (STATIONWATCH
+//! so `n=23/23` (STATIONRATECTL B881: `ratectl`, `fallback`; STATIONERP B884: `erp`, `cts`) certifies the judge, the codec, the 1514-octet frame cap, the addr1 filter and the link watch (STATIONWATCH
 //! B843), the TX header's rate fields, the station's MACCTL word, the AP's rate set and the probe's Null frame (STATIONRATE
-//! B855) against the standard's and b43's field order, not a replay of a capture.
+//! B855), the NAV, the short preamble and the DHCP lease seconds (STATIONAIR B862; the `lease` row exists only where smolnet
+//! does) against the standard's and b43's field order, not a replay of a capture.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -336,7 +337,43 @@ pub fn kat() -> (u8, u8, Option<&'static str>) {
     nul.extend_from_slice(&BSSID);
     nul.extend_from_slice(&[0x00, 0x00]);
     checks.push(("null", w::build_null_data(STA, BSSID, 0) == nul && nul.len() == 24));
-    let mut pass = 0u8;
+    // 17. duration (STATIONAIR B862): `tx::air_kat`'s NAV row, then the AP's answer rate (§10.6.6.5.2): the 11g set above
+    //     (basic 1,2,5.5,11) answers CCK 11 at 11 and OFDM 24 at 24 (no basic OFDM: the mandatory 24); basic 1,2 answers CCK 11
+    //     at 2; basic 6,12 answers OFDM 24 at 12; unread answers CCK 5.5 at 5.5; an unknown rate answers CCK 1.
+    let b12 = w::RateSet { listed: 0x000F, basic: 0x0003 };
+    let b6_12 = w::RateSet { listed: 0x0FFF, basic: 0x000F | (1 << 4) | (1 << 6) };
+    checks.push(("duration", k[5] && super::assoc::ack_rate(rg, w::RATE_11M) == w::RATE_11M
+        && super::assoc::ack_rate(rg, w::RATE_24M) == w::RATE_24M && super::assoc::ack_rate(Some(b12), w::RATE_11M) == 4
+        && super::assoc::ack_rate(Some(b6_12), w::RATE_24M) == 24 && super::assoc::ack_rate(None, 11) == 11
+        && super::assoc::ack_rate(None, 7) == w::RATE_1M));
+    // 18. shortpre (STATIONAIR B862): `tx::air_kat`'s phy_ctl row, then the capability bit of the 11g response with
+    //     capability 0x0021 (ESS + Short Preamble) read set and with 0x0001 read clear; the station uses it for CCK 2/5.5/11 only.
+    let mut gs = g.clone();
+    gs[24] = 0x21;
+    checks.push(("shortpre", k[6] && matches!(super::assoc::assoc_reply_air(&gs, STA, BSSID), Some((a, Some(_), true)) if a.status == 0)
+        && !super::assoc::short_preamble(&g) && super::assoc::station_short(true, false, w::RATE_11M) && super::assoc::station_short(true, false, 4)
+        && !super::assoc::station_short(true, false, w::RATE_1M) && !super::assoc::station_short(true, false, w::RATE_24M)
+        && !super::assoc::station_short(false, false, w::RATE_11M) && !super::assoc::station_short(true, true, w::RATE_11M)));
+    // 19. lease (STATIONLEASE B862): a BOOTP reply (op 2, Ethernet, hlen 6, magic 63 82 53 63 at 236) carrying DHCP message
+    //     type 5 (ACK), mask 255.255.255.0 and option 51 = 3600 s, read through smoltcp's own parser (`smolnet::lease_of`) ->
+    //     3600; the same as an OFFER (type 2) -> unread; a broken magic cookie -> unread.
+    #[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+    {
+        let mut ack = alloc::vec![0u8; 236];
+        ack[0] = 2;
+        ack[1] = 1;
+        ack[2] = 6;
+        ack[16..20].copy_from_slice(&[192, 168, 1, 50]);
+        ack[28..34].copy_from_slice(&STA);
+        ack.extend_from_slice(&[0x63, 0x82, 0x53, 0x63, 53, 1, 5, 1, 4, 255, 255, 255, 0, 51, 4, 0x00, 0x00, 0x0E, 0x10, 255]);
+        let mut offer = ack.clone();
+        offer[242] = 2;
+        let mut bad = ack.clone();
+        bad[236] = 0x00;
+        checks.push(("lease", crate::smolnet::lease_of(&ack) == Some(3600) && crate::smolnet::lease_of(&offer).is_none()
+            && crate::smolnet::lease_of(&bad).is_none()));
+    }
+    ratectl_rows(&mut checks); erp_rows(&mut checks); let mut pass = 0u8; // STATIONRATECTL (B881): `ratectl`, `fallback` at the END of the table (LINE-NEUTRAL); STATIONERP (B884): `erp`, `cts` after them
     let mut first = None;
     for (name, ok) in checks.iter() {
         if *ok {
@@ -539,4 +576,237 @@ impl Watch {
         }
         self.lost
     }
+}
+
+// ── STATIONRATECTL (rmbp-ledger B881): the kept station's rate follows the ACKs ─────────────────────────────────────
+
+/// Unicast frames between two probes at the next rate up (minstrel's sample frame, `rc80211_minstrel.c`, the reference only).
+const PROBE_EVERY: u32 = 16;
+/// Consecutive frames at the current rate not acked within the long-retry tries before a step down (`fail`).
+const FAIL_K: u32 = 4;
+/// Frames at the current rate before its EWMA (success < 50%) may step it down (`window`).
+const WINDOW: u32 = 16;
+/// Consecutive successes at the current rate an acked probe needs before a step up (`probe-ok`).
+const UP_N: u32 = 8;
+/// The least time between two steps, so at most one `[wifi10] station rate ->` line per second.
+const HOLD_MS: u64 = 1000;
+
+/// The kept station's rate controller — PURE (`Watch`'s shape): `tx::reap`, the one TX-status reader, feeds it per statused
+/// unicast frame (`frame`); `join::rate_for` asks it the next frame's rate (`next_rate`, every `PROBE_EVERY`th unicast frame
+/// one rate up); `join::rate_step` asks it for a step (`decide`). It lives in `tx::Queue` inside the station, so the one
+/// `STATION` lock owns it (no atomics, no lock of its own). The ladder is the AP's listed legacy rates (and the start rate)
+/// by speed; per rate an EWMA of success per mille (`(7e + s) / 8`, s = 1000 iff acked within the long-retry tries,
+/// `tx::Report::acked_at_rate`'s rule; 1000 before any frame) and an EWMA of retries x100.
+#[derive(Default, Clone, Copy)]
+pub struct RateCtl {
+    pub rs: Option<w::RateSet>,
+    pub short: bool,
+    ladder: [u8; 12],
+    n: usize,
+    cur: usize,
+    ewma: [u16; 12],
+    tries: [u16; 12],
+    run: u32,
+    fails: u32,
+    since: u32,
+    probe_at: u32,
+    probe: Option<bool>,
+    last_ms: u64,
+}
+
+impl RateCtl {
+    /// The AP's rate set `rs` (unread = the start rate alone, no steps), its short-preamble bit, the start rate (`pick_rate`'s).
+    pub fn new(rs: Option<w::RateSet>, short: bool, start: u8, now_ms: u64) -> RateCtl {
+        let mut bits = rs.map_or(0u16, |r| r.listed);
+        if let Some(i) = w::LEGACY_RATES.iter().position(|r| *r == start) {
+            bits |= 1 << i;
+        }
+        let mut c = RateCtl { rs, short, ewma: [1000; 12], last_ms: now_ms, ..RateCtl::default() };
+        for (i, r) in w::LEGACY_RATES.iter().enumerate() {
+            if bits & (1 << i) != 0 {
+                c.ladder[c.n] = *r;
+                c.n += 1;
+            }
+        }
+        c.ladder[..c.n].sort_unstable();
+        if c.n == 0 {
+            c.ladder[0] = w::RATE_1M;
+            c.n = 1;
+        }
+        c.cur = c.ladder[..c.n].iter().position(|r| *r == start).unwrap_or(0);
+        c
+    }
+
+    /// The current rate (500 kbit/s units).
+    pub fn rate(&self) -> u8 {
+        if self.n == 0 { w::RATE_1M } else { self.ladder[self.cur] }
+    }
+
+    fn index(&self, rate: u8) -> Option<usize> {
+        if rate == 0 { None } else { self.ladder[..self.n].iter().position(|r| *r == rate) }
+    }
+
+    /// The next unicast frame's rate: the current one, or every `PROBE_EVERY`th frame the next rate up (none at the top).
+    pub fn next_rate(&mut self) -> u8 {
+        if self.n == 0 {
+            return w::RATE_1M;
+        }
+        self.probe_at += 1;
+        if self.cur + 1 < self.n && self.probe_at >= PROBE_EVERY {
+            self.probe_at = 0;
+            return self.ladder[self.cur + 1];
+        }
+        self.ladder[self.cur]
+    }
+
+    /// One statused frame posted at `rate` (0 = a group frame, ignored; a rate off the ladder, ignored): acked within the
+    /// long-retry tries (`at_rate`) or not, after `frame_count` transmissions.
+    pub fn frame(&mut self, rate: u8, at_rate: bool, frame_count: u8) {
+        let Some(i) = self.index(rate) else { return };
+        let s: u32 = if at_rate { 1000 } else { 0 };
+        self.ewma[i] = ((self.ewma[i] as u32 * 7 + s) / 8) as u16;
+        self.tries[i] = ((self.tries[i] as u32 * 7 + frame_count.saturating_sub(1) as u32 * 100) / 8) as u16;
+        if i == self.cur {
+            self.since += 1;
+            if at_rate {
+                self.run += 1;
+                self.fails = 0;
+            } else {
+                self.fails += 1;
+                self.run = 0;
+            }
+        } else if i == self.cur + 1 {
+            self.probe = Some(at_rate);
+        }
+    }
+
+    /// A step, at most one per `HOLD_MS`, in order: down `fail` (`FAIL_K` consecutive failures), down `window` (`WINDOW`
+    /// frames and EWMA < 500), up `probe-ok` (the last probe acked within the tries and `UP_N` consecutive successes). A
+    /// failed probe is dropped (the frames after it stay at the current rate). `(old, new, why)`.
+    pub fn decide(&mut self, now_ms: u64) -> Option<(u8, u8, &'static str)> {
+        if self.n == 0 || now_ms.saturating_sub(self.last_ms) < HOLD_MS {
+            return None;
+        }
+        let c = self.cur;
+        let (to, why) = if self.fails >= FAIL_K && c > 0 {
+            (c - 1, "fail")
+        } else if self.since >= WINDOW && self.ewma[c] < 500 && c > 0 {
+            (c - 1, "window")
+        } else if self.probe == Some(true) && self.run >= UP_N && c + 1 < self.n {
+            (c + 1, "probe-ok")
+        } else {
+            if self.probe == Some(false) {
+                self.probe = None;
+            }
+            return None;
+        };
+        let old = self.ladder[c];
+        self.cur = to;
+        self.run = 0;
+        self.fails = 0;
+        self.since = 0;
+        self.probe_at = 0;
+        self.probe = None;
+        self.last_ms = now_ms;
+        Some((old, self.ladder[to], why))
+    }
+
+    /// `rate`'s EWMA inputs for the wire: (success percent, retries per frame x100); (0, 0) off the ladder.
+    pub fn stats(&self, rate: u8) -> (u16, u16) {
+        self.index(rate).map_or((0, 0), |i| (self.ewma[i] / 10, self.tries[i]))
+    }
+}
+
+/// `kat`'s last two rows (STATIONRATECTL B881; WPA2's rows follow). `ratectl`: an 11g set (listed 0x0FFF, basic 1,2,5.5,11),
+/// start CCK 11 — the 16 next rates are 15 x CCK 11 then OFDM 12 (the probe cadence); all acked: no step at 500 ms (the
+/// hold), CCK 11 -> OFDM 12 `probe-ok` at 1000 ms; 4 unacked (frame_count 11) at OFDM 12: none at 1500, OFDM 12 -> CCK 11
+/// `fail` at 2000, its EWMA 58% and 4.12 retries; 8 x (acked, unacked, unacked) at CCK 11 (never 4 in a row; EWMA 31.5%):
+/// CCK 11 -> OFDM 9 `window` at 3000; an 11b set at its top never probes and holds; an unread set is CCK 1 alone and holds;
+/// one unacked frame from a fresh EWMA reads 87% and 1.25; a group frame (rate 0) and an unknown rate are not counted.
+/// `fallback`: `assoc::fallback_rate` (the highest basic CCK below) and the TX header's fallback fields (`tx::fb_kat`).
+fn ratectl_rows(checks: &mut Vec<(&'static str, bool)>) {
+    let g = w::RateSet { listed: 0x0FFF, basic: 0x000F };
+    let mut c = RateCtl::new(Some(g), false, w::RATE_11M, 0);
+    let mut seq = [0u8; 16];
+    for s in seq.iter_mut() {
+        *s = c.next_rate();
+    }
+    let cadence = seq[..15].iter().all(|r| *r == w::RATE_11M) && seq[15] == 24;
+    for r in seq.iter() {
+        c.frame(*r, true, 1);
+    }
+    let climb = c.decide(500).is_none() && c.decide(1000) == Some((w::RATE_11M, 24, "probe-ok")) && c.rate() == 24;
+    for _ in 0..4 {
+        c.frame(24, false, 11);
+    }
+    let down = c.decide(1500).is_none() && c.decide(2000) == Some((24, w::RATE_11M, "fail")) && c.stats(24) == (58, 412);
+    for _ in 0..8 {
+        c.frame(w::RATE_11M, true, 1);
+        c.frame(w::RATE_11M, false, 11);
+        c.frame(w::RATE_11M, false, 11);
+    }
+    let window = c.decide(3000) == Some((w::RATE_11M, 18, "window"));
+    let mut t = RateCtl::new(Some(w::RateSet { listed: 0x000F, basic: 0x000F }), false, w::RATE_11M, 0);
+    let mut top = true;
+    for _ in 0..32 {
+        top &= t.next_rate() == w::RATE_11M;
+    }
+    for _ in 0..16 {
+        t.frame(w::RATE_11M, true, 1);
+    }
+    top &= t.decide(1000).is_none();
+    let mut b = RateCtl::new(None, false, w::RATE_1M, 0);
+    for _ in 0..4 {
+        b.frame(w::RATE_1M, false, 11);
+    }
+    let bottom = b.decide(1000).is_none() && b.next_rate() == w::RATE_1M && b.rate() == w::RATE_1M;
+    let mut d = RateCtl::new(Some(g), false, w::RATE_11M, 0);
+    d.frame(w::RATE_11M, false, 11);
+    d.frame(0, true, 1);
+    d.frame(99, true, 1);
+    let ewma = d.stats(w::RATE_11M) == (87, 125) && d.since == 1;
+    checks.push(("ratectl", cadence && climb && down && window && top && bottom && ewma));
+    let b12 = w::RateSet { listed: 0x000F, basic: 0x0003 };
+    let fb = |rs: Option<w::RateSet>, r: u8| super::assoc::fallback_rate(rs, r);
+    checks.push(("fallback", fb(Some(g), w::RATE_24M) == w::RATE_11M && fb(Some(g), w::RATE_11M) == 11 && fb(Some(g), 11) == 4
+        && fb(Some(g), 4) == w::RATE_1M && fb(Some(g), w::RATE_1M) == w::RATE_1M && fb(Some(b12), w::RATE_11M) == 4
+        && fb(None, w::RATE_24M) == w::RATE_1M && super::bringup::station_kat()[7]));
+}
+
+/// `kat`'s rows after B881's (STATIONERP rmbp-ledger B884). `erp`: a beacon (§9.3.3.2) naming UnaNet with capability 0x0021 (ESS +
+/// Short Preamble) and an ERP element (§9.4.2.12, element 42) of 0x06 (Use_Protection | Barker_Preamble_Mode) -> `Bss { short: true,
+/// erp: Some(6) }`, protection asked, Barker asked, `erp=prot,barker`, S9's capability 0x0021, and CCK 11 then leaves LONG
+/// (`station_short(cap, barker, rate)`); the same beacon with capability 0x0001 and ERP 0x00 -> short false, `open,short`, S9
+/// capability 0x0001; with no ERP element (or an empty one) -> `None`, `absent`, neither asked. `cts`: `tx::cts_kat`'s header words.
+fn erp_rows(checks: &mut Vec<(&'static str, bool)>) {
+    use super::assoc;
+    let beacon = |cap: u16, erp: &[u8]| {
+        let mut f = alloc::vec![0x80, 0x00, 0x00, 0x00];
+        f.extend_from_slice(&[0xFF; 6]);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&BSSID);
+        f.extend_from_slice(&[0x00, 0x00]);
+        f.extend_from_slice(&[0; 8]);
+        f.extend_from_slice(&[0x64, 0x00]);
+        f.extend_from_slice(&cap.to_le_bytes());
+        f.extend_from_slice(&[0x00, 0x06]);
+        f.extend_from_slice(b"UnaNet");
+        f.extend_from_slice(&[0x03, 0x01, 0x0b]);
+        f.extend_from_slice(erp);
+        f
+    };
+    let pb = assoc::bss_match(&beacon(0x0021, &[w::EID_ERP, 1, 0x06]), b"UnaNet");
+    let ob = assoc::bss_match(&beacon(0x0001, &[w::EID_ERP, 1, 0x00]), b"UnaNet");
+    let nb = assoc::bss_match(&beacon(0x0021, &[]), b"UnaNet");
+    let eb = assoc::bss_match(&beacon(0x0021, &[w::EID_ERP, 0]), b"UnaNet");
+    let prot = matches!(pb, Some(b) if b.short && b.erp == Some(0x06) && !b.protected && assoc::assoc_cap(&b) == 0x0021
+        && assoc::erp_protect(b.erp) && assoc::erp_barker(b.erp) && assoc::erp_text(b.erp) == "prot,barker"
+        && !assoc::station_short(b.short, assoc::erp_barker(b.erp), w::RATE_11M));
+    let open = matches!(ob, Some(b) if !b.short && b.erp == Some(0x00) && assoc::assoc_cap(&b) == 0x0001
+        && !assoc::erp_protect(b.erp) && !assoc::erp_barker(b.erp) && assoc::erp_text(b.erp) == "open,short");
+    let none = matches!(nb, Some(b) if b.erp.is_none() && assoc::erp_text(b.erp) == "absent" && !assoc::erp_protect(b.erp)
+        && assoc::station_short(b.short, assoc::erp_barker(b.erp), w::RATE_11M))
+        && matches!(eb, Some(b) if b.erp.is_none());
+    checks.push(("erp", prot && open && none));
+    checks.push(("cts", super::bringup::station_kat()[8]));
 }

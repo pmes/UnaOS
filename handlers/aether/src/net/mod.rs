@@ -1,3 +1,4 @@
+pub mod fetchseq; // AETHERLIB (LEDGER SR193): AETHER.ELF's navigation sequencer (std-free, #[path]-linked by unaos/crates/user-aether/src/net.rs)
 use anyhow::{Context, Result};
 use gneiss_pal::api::http::{self, CacheMode, Client, CookieJar, HttpCache};
 use html_core::url;

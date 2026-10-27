@@ -60,6 +60,7 @@ dependencies = [
  "gl_core",
  "gneiss_pal",
  "html_core",
+ "http_core",
  "image",
  "js_core",
  "kvstore_core",
@@ -1198,6 +1199,7 @@ version = "0.1.0"
 dependencies = [
  "audio_core",
  "av1_core",
+ "h264_core",
  "vp8_core",
 ]
 
@@ -2167,6 +2169,14 @@ name = "h264_core"
 version = "0.1.0"
 
 [[package]]
+name = "h264enc_core"
+version = "0.1.0"
+dependencies = [
+ "demux_core",
+ "h264_core",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2221,6 +2231,13 @@ name = "helm"
 version = "0.1.0"
 dependencies = [
  "ibus",
+]
+
+[[package]]
+name = "hevc_core"
+version = "0.1.0"
+dependencies = [
+ "h264_core",
 ]
 
 [[package]]
@@ -2993,6 +3010,14 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "nle"
+version = "0.1.0"
+dependencies = [
+ "stria",
+ "timeline_core",
+]
 
 [[package]]
 name = "no_std_io2"
@@ -4535,8 +4560,22 @@ dependencies = [
  "anyhow",
  "bandy",
  "gneiss_pal",
+ "h264enc_core",
  "log",
  "resonance",
+ "text_host",
+ "timeline_core",
+ "tokio",
+]
+
+[[package]]
+name = "stria-view"
+version = "0.1.0"
+dependencies = [
+ "bandy",
+ "quartzite",
+ "stria",
+ "timeline_core",
  "tokio",
 ]
 
@@ -4758,6 +4797,13 @@ dependencies = [
  "quick-error",
  "weezl",
  "zune-jpeg",
+]
+
+[[package]]
+name = "timeline_core"
+version = "0.1.0"
+dependencies = [
+ "demux_core",
 ]
 
 [[package]]

@@ -126,12 +126,12 @@ pub struct HeapCensus {
 pub fn heap_census(align: usize) -> HeapCensus {
     let mut c = HeapCensus { used: 0, free: 0, largest_run: 0 };
     arch::without_interrupts(|| {
-        let mut heap = ALLOCATOR.lock(); #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_CENSUS); // POISON2 (B846): the trial loop mutates the hole list
+        let mut heap = ALLOCATOR.inner.lock(); #[cfg(target_arch = "x86_64")] heappoison::census_check(&ALLOCATOR.inner, &mut heap); #[cfg(target_arch = "x86_64")] heappoison::op(heappoison::OP_CENSUS); // BINDLIVE (B873) HEAPCENSUSCHECK: the census take runs the SAME poison check as alloc and free. POISON2 (B846): the trial loop mutates the hole list
         c.used = heap.used();
         c.free = heap.free();
         let step = align.max(1);
         let mut lo = 0usize;
-        let mut hi = c.free / step * step;
+        let mut hi = if heap_dead() { 0 } else { c.free / step * step }; // BINDLIVE (B873): after a fatal verdict the trial loop walks nothing
         while lo < hi {
             // Round the midpoint UP to a step so the search always makes progress toward `hi`.
             let mid = (lo + (hi - lo + step) / 2 + step - 1) / step * step;
@@ -153,7 +153,7 @@ pub fn heap_census(align: usize) -> HeapCensus {
         }
         c.largest_run = lo; #[cfg(target_arch = "x86_64")] heappoison::op(0);
     });
-    c
+    #[cfg(target_arch = "x86_64")] heappoison::say(); c // BINDLIVE (B873): the census's check is said after the lock drops, as alloc's tail does
 }
 
 /// PANICSCREEN (B406): the heap lock is held right now (the panic log is written only when it is free — a
@@ -754,14 +754,14 @@ pub mod heappoison {
         p >= lo && p < hi
     }
 
-    /// The global re-init (caller holds the heap lock): the abandoned range recorded, `heap_bounds()` raised to the
-    /// reserve's end (the reserve is adjacent, so `[lo, hi)` still covers every live block), the free gate moved.
+    /// The global re-init (caller holds the heap lock): the abandoned range recorded, `heap_bounds()` widened to the
+    /// reserve's OWN bounds (BINDLIVE B873: adjacent or not, `[lo, hi)` still covers every live block), the free gate moved.
     fn regrow(heap: &mut Heap, lo: usize, len: usize) {
         let (olo, ohi) = regrow_onto(heap, lo, len);
         OLD_LO.store(olo, Relaxed);
         OLD_HI.store(ohi, Relaxed);
         REGREW_LEN.store(len, Relaxed);
-        super::HEAP_HI.fetch_max(lo + len, Relaxed);
+        super::HEAP_HI.fetch_max(lo + len, Relaxed); super::HEAP_LO.fetch_min(lo, Relaxed); // BINDLIVE (B873) HEAPRESERVE2: a reserve below the heap lowers LO
         REINITS.fetch_add(1, Relaxed);
         GATE.store(GATE_MOVED, Release);
     }
@@ -824,6 +824,42 @@ pub mod heappoison {
             Ok(p) if in_old(p.as_ptr() as usize, blo, blo + SPAN) => "ok",
             _ => "not-reserve",
         }
+    }
+
+    // ── BINDLIVE (rmbp-ledger B873) HEAPCENSUSCHECK: `heap_census`'s take runs [`check`] through [`census_check`], which
+    // also counts the checks made at a census take (the `census_check=` leg reads it rise). ──
+    static CENSUS_CHECKS: AtomicU64 = AtomicU64::new(0);
+
+    /// [`check`] at the census take (caller holds `lock`, whose guard is `heap`): one load while nothing is poisoned.
+    #[inline(always)]
+    pub(super) fn census_check(lock: &Mutex<Heap>, heap: &mut Heap) {
+        if lock.take_poison() {
+            CENSUS_CHECKS.fetch_add(1, AcqRel);
+            checked(heap);
+        }
+    }
+
+    /// `tests lockreg`'s `census_check=` leg: the heap lock marked as a dead holder's release marks it (under this task's
+    /// own hold, `fs::unafs::poison_leg`'s shape), then one `heap_census`. `ok` = the census take ran the check and read
+    /// the list whole; another core's allocation may take the mark first (its own check, also whole), so up to 8 tries.
+    pub fn census_leg() -> &'static str {
+        let c0 = CENSUS_CHECKS.load(Acquire);
+        for _ in 0..8 {
+            let marked = crate::arch::without_interrupts(|| {
+                let g = ALLOCATOR.inner.lock();
+                let m = ALLOCATOR.inner.mark_poison();
+                drop(g);
+                m
+            });
+            if !marked {
+                return "table-full";
+            }
+            let _ = super::heap_census(4096);
+            if CENSUS_CHECKS.load(Acquire) > c0 {
+                return if LAST_TORN.load(Acquire) { "torn" } else { "ok" };
+            }
+        }
+        "lost-race"
     }
 }
 

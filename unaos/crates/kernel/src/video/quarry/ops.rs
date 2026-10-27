@@ -518,7 +518,7 @@ pub fn right_press(x: i32, y: i32) -> bool {
     {
         let mut guard = MODEL.lock();
         let Some(m) = guard.as_mut() else { return true };
-        let cols_hit = super::toolbar::view() == super::toolbar::View::Columns && super::millercols::right_select(m, sx, sy); // SMALLFIX4 (COLUMNSVIEW owed): the Columns view's panes, not the list geometry, take the right press
+        let cols_hit = super::toolbar::view() == super::toolbar::View::Columns && super::millercols::right_select(m, sx, sy); if cols_hit && super::millercols::right_deferred() { drop(guard); repaint(); return true; } // RELISTREAD (B853): a row whose folder is still being read opens no menu (it arrives selected) · SMALLFIX4 (COLUMNSVIEW owed): the Columns view's panes, not the list geometry, take the right press
         let g = &m.geom;
         let li = g.list_pane().inner();
         let body_y = li.y + g.row_h();

@@ -41,19 +41,32 @@
 # (`via=sdhc`, `seat store=fat:/USERS.DAT`), the bench card's is SDHC/UnaFS `/system`; the builder re-stages the ESP directory each run, so boot-1 writes to the ESP (not to the
 # stick) do not reach boot 2; no LIB/TCC/rustc payload on the ESP (the selfbuild staging is not entered).
 #
-# usage: ./arroyo twoboot [--judge <boot1 log> [<boot2 log>]]      (= twoboot.sh <unaos dir> …)
+# usage: ./arroyo twoboot [--card] [--judge <boot1 log> [<boot2 log> [<boot3 log> <boot4 log>]]]      (= twoboot.sh <unaos dir> …)
 #        `--judge` reads captured logs only (no build, no QEMU).
-# env:   UNAOS_TWOBOOT_CAP1 / _CAP2 (s, default 60 each: a hang pays its spec's wall, bounded), UNAOS_TWOBOOT_GRACE (s,
+#   --card KEYBOOT4 (rmbp-ledger B864): after boot 2, BOOTS 3-4 on a NATIVE card — the one x86 card builder
+#          (`esp_x86_unafs_card`, re-entered as `./arroyo twoboot --build-card` over boot 1's ESP) lays
+#          target/unaos-x86-card.img (GPT p1 ESP + p2 UnaFS with /apps /lib /system); its sparse copy
+#          target/twoboot-card.img rides the second SATA disk (UNAOS_AHCI_DISK; the line's INSTALLDEMO owns the stick, and
+#          AHCI_WRITE makes the builder attach a fresh copy, target/ahcifixture.img, copied back after boot 3). Boot 3:
+#          the first-user form typed -> `[keyboot] root keyed` (x86-twoboot-3.spec). Boot 4: the keyed card -> the unlock
+#          form typed (`correct-horse` Enter), then the login screen (`una` Tab `correct-horse` Enter) -> the desktop
+#          (x86-twoboot-4.spec). The plain leg is exactly two boots and its wire line is unchanged (the seat's ruling).
+# env:   UNAOS_TWOBOOT_CAP1 / _CAP2 (s, default 60 each: a hang pays its spec's wall, bounded), _CAP3 / _CAP4 (s, default
+#        120 each, `--card` only: the native root's mounts and one Argon2id under TCG), UNAOS_TWOBOOT_GRACE (s,
 #        default 5: the FASTTEST grace after each COMPLETE), UNAOS_QEMU_MACHINE (auto: the newest pc-q35 this QEMU has
 #        when it lacks the builder's pinned pc-q35-10.0).
 # exit:  0 PASS · 1 FAIL · 2 NO VERDICT (the line or the list refused, SELFBUILD staging ran, no capture) · 127 no qemu/arroyo
 # wire:  TWOBOOT: boot1=<desktop-built|wedge@"<last line>"> boot2=<console|hang@<last step>|no-user@users-load|not-run(<why>)> wall_s=<n> -> PASS|FAIL
 #        (wall_s = the two QEMU walls, the leg's own cost; the one build is reported beside it as build_s.)
+#        --card: TWOBOOT: boot1= boot2= boot3=<keyed|not-keyed@<reason>|hang@"<last line>"|not-run(<why>)>
+#                boot4=<desktop-unlocked|unlock-refused@"<line>"|hang@"<last line>"|not-run(<why>)> wall_s=<n> -> PASS|FAIL
 set -u
 U="${1:?usage: twoboot.sh <unaos dir> [--judge <boot1 log> [<boot2 log>]]}"; shift
 U="$(cd "$U" && pwd)"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CAP1="${UNAOS_TWOBOOT_CAP1:-60}" CAP2="${UNAOS_TWOBOOT_CAP2:-60}" GRACE="${UNAOS_TWOBOOT_GRACE:-5}"
+CAP3="${UNAOS_TWOBOOT_CAP3:-120}" CAP4="${UNAOS_TWOBOOT_CAP4:-120}"
+CARD=0; if [ "${1:-}" = "--card" ]; then CARD=1; shift; fi   # KEYBOOT4 (B864): boots 3-4 on a native card
 
 # --- the judges (awk, never bare grep — LAWS) -------------------------------------------------------------------------
 # last_line <log>: the last line with printable text, control bytes stripped, cut to 160.
@@ -82,18 +95,53 @@ judge2() {
     if [ -n "$st" ]; then echo "hang@${st}"; else echo "hang@\"$(last_line "$log" | sed 's/"/'"'"'/g')\""; fi
     return 1
 }
-verdict() { # b1 b2 wall_s rc1 rc2
-    local res=FAIL; [ "$4" -eq 0 ] && [ "$5" -eq 0 ] && res=PASS
-    echo "TWOBOOT: boot1=$1 boot2=$2 wall_s=$3 -> ${res}"
+# KEYBOOT4 (B864) boot3 <log> -> keyed | not-keyed@<reason> | hang@"<last line>"  (the native card's first-user keying)
+judge3() {
+    local log="$1" why
+    [ -s "$log" ] || { echo 'hang@"<no serial bytes>"'; return 1; }
+    if awk 'index($0,"[keyboot] root keyed user=una ") { k = 1 } index($0,"[login] recovery words shown") { w = 1 } END { exit !(k && w) }' "$log"; then
+        echo "keyed"; return 0
+    fi
+    why="$(awk 'match($0, /\[keyboot\] root not keyed user=[^ ]+ reason=[^ ]+/) { s = substr($0, RSTART, RLENGTH); sub(/.*reason=/, "", s); r = s }
+                index($0,"[keyboot] first-user keying=deferred") { r = "deferred" } index($0,"[keyboot] root=none hold=none") { if (r == "") r = "no-native-root" }
+                END { print r }' "$log")"
+    if [ -n "$why" ]; then echo "not-keyed@${why}"; else echo "hang@\"$(last_line "$log" | sed 's/"/'"'"'/g')\""; fi
+    return 1
+}
+# KEYBOOT4 (B864) boot4 <log> -> desktop-unlocked | unlock-refused@"<line>" | hang@"<last line>"  (the keyed card's boot)
+judge4() {
+    local log="$1" bad
+    [ -s "$log" ] || { echo 'hang@"<no serial bytes>"'; return 1; }
+    if awk 'index($0,"[keyboot] root unlocked handle=") { u = 1 } index($0,"[desktop] built at=") { d = 1 } index($0,"[boot] services up first=") { s = 1 } END { exit !(u && d && s) }' "$log"; then
+        echo "desktop-unlocked"; return 0
+    fi
+    bad="$(awk '(index($0,"[keyboot] unlock kdf_ms=") && (index($0,"-> bad why=") || index($0,"-> refused why="))) || index($0,"NO OUTCOME after") { l = $0 } END { gsub(/[\r\001-\010\013-\037\177]/, "", l); print substr(l, 1, 120) }' "$log")"
+    if [ -n "$bad" ]; then echo "unlock-refused@\"$(printf '%s' "$bad" | sed 's/"/'"'"'/g')\""; else echo "hang@\"$(last_line "$log" | sed 's/"/'"'"'/g')\""; fi
+    return 1
+}
+verdict() { # b1 b2 wall_s rc1 rc2 [b3 b4 rc3 rc4] — the two-boot line is byte-identical to TWOBOOT's; --card adds boot3= boot4=
+    local res=FAIL extra=""
+    if [ $# -ge 9 ]; then
+        extra=" boot3=$6 boot4=$7"
+        [ "$4" -eq 0 ] && [ "$5" -eq 0 ] && [ "$8" -eq 0 ] && [ "$9" -eq 0 ] && res=PASS
+    else
+        [ "$4" -eq 0 ] && [ "$5" -eq 0 ] && res=PASS
+    fi
+    echo "TWOBOOT: boot1=$1 boot2=$2${extra} wall_s=$3 -> ${res}"
     [ "$res" = PASS ]
 }
 
 if [ "${1:-}" = "--judge" ]; then
-    l1="${2:?--judge needs the boot-1 log}" l2="${3:-}"
+    l1="${2:?--judge needs the boot-1 log}" l2="${3:-}" l3="${4:-}" l4="${5:-}"
     b1="$(judge1 "$l1")"; r1=$?
     if [ -n "$l2" ]; then b2="$(judge2 "$l2")"; r2=$?; else b2="not-run(no-log)"; r2=1; fi
     [ "$r1" -ne 0 ] && echo "TWOBOOT: boot-1 last line: $(last_line "$l1")"
     [ "$r2" -ne 0 ] && [ -n "$l2" ] && echo "TWOBOOT: boot-2 last line: $(last_line "$l2")"
+    if [ -n "$l3" ]; then   # KEYBOOT4 (B864): a --card capture set
+        b3="$(judge3 "$l3")"; r3=$?
+        if [ -n "$l4" ]; then b4="$(judge4 "$l4")"; r4=$?; else b4="not-run(no-log)"; r4=1; fi
+        verdict "$b1" "$b2" "-" "$r1" "$r2" "$b3" "$b4" "$r3" "$r4"; exit $?
+    fi
     verdict "$b1" "$b2" "-" "$r1" "$r2"; exit $?
 fi
 
@@ -156,38 +204,49 @@ export UNAOS_QEMU_EXTRA="-qmp tcp:127.0.0.1:${port},server,nowait"
 stamp="$(mktemp "$T/.twoboot.XXXXXX")"
 t0=$(date +%s)
 
-# --- boot 1: the fresh volume, the typist on the first-user form -------------------------------------------------------
-# The typist: qmp_type.py's Qmp/connect/wait_for_marker/qcode, imported by path (the module's main() is guarded), plus
-# the two keys its --text cannot spell (Tab, Enter). Its connect waits out the build; its marker wait is boot 1's cap.
-python3 - "$HERE" "$port" "$LOG" "$CAP1" > "$T/twoboot-typist.log" 2>&1 <<'PY' &
+# --- the typist (KEYBOOT4 B864: one function over PHASES; boot 1's phase is the TWOBOOT typist's keys, unchanged) ------
+# qmp_type.py's Qmp/connect/wait_for_marker/qcode, imported by path (the module's main() is guarded), plus the keys its
+# --text cannot spell (Tab, Enter). Its connect waits out the build; each phase's marker wait is the boot's cap. A phase is
+# `<marker>|<label>|<keys>`: keys are space-separated, `t:<text>` one key per character, anything else a QMP qcode.
+typist_start() { # <out log> <cap> <phase>...
+    local out="$1" cap="$2"; shift 2
+    python3 - "$HERE" "$port" "$LOG" "$cap" "$@" > "$out" 2>&1 <<'PY' &
 import sys, time
 sys.path.insert(0, sys.argv[1])
 import qmp_type as q
 port, log, cap = int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
+phases = [a.split("|", 2) for a in sys.argv[5:]]
 qmp = q.Qmp(q.connect("127.0.0.1", port, 7200))
 qmp._read_obj()
 r = qmp.execute("qmp_capabilities")
 if "error" in r:
     raise SystemExit(f"[typist] qmp_capabilities refused: {r['error']} — nothing typed")
 t0 = time.time()
-mark = "[login] installer: first-user form open"
-print(f"[typist] connected :{port}; waiting up to {cap:.0f}s for {mark!r}", flush=True)
-if not q.wait_for_marker(log, mark, cap):
-    raise SystemExit(f"[typist] {mark!r} not seen in {cap:.0f}s — nothing typed")
-print(f"[typist] form open at +{time.time() - t0:.1f}s; settling 4s", flush=True)
-time.sleep(4)
-keys = [q.qcode(c) for c in "una"] + ["tab"] + [q.qcode(c) for c in "correct-horse"] + ["tab"] \
-     + [q.qcode(c) for c in "correct-horse"] + ["ret"]
-for k in keys:
-    r = qmp.execute("send-key", {"keys": [{"type": "qcode", "data": k}]})
-    if "error" in r:
-        raise SystemExit(f"[typist] send-key {k!r} refused: {r['error']}")
-    time.sleep(0.12)
-print(f"[typist] typed name + Tab + password + Tab + retype + Enter ({len(keys)} keys) at +{time.time() - t0:.1f}s", flush=True)
-ok = q.wait_for_marker(log, "[login] key taken by the screen", 10)
-print(f"[typist] the screen {'took' if ok else 'did NOT report taking'} a key", flush=True)
+for n, (mark, label, spec) in enumerate(phases):
+    lead = f"connected :{port}; " if n == 0 else ""
+    print(f"[typist] {lead}waiting up to {cap:.0f}s for {mark!r}", flush=True)
+    if not q.wait_for_marker(log, mark, cap):
+        raise SystemExit(f"[typist] {mark!r} not seen in {cap:.0f}s — nothing typed")
+    print(f"[typist] form open at +{time.time() - t0:.1f}s; settling 4s", flush=True)
+    time.sleep(4)
+    keys = []
+    for tok in spec.split():
+        keys += [q.qcode(c) for c in tok[2:]] if tok.startswith("t:") else [tok]
+    for k in keys:
+        r = qmp.execute("send-key", {"keys": [{"type": "qcode", "data": k}]})
+        if "error" in r:
+            raise SystemExit(f"[typist] send-key {k!r} refused: {r['error']}")
+        time.sleep(0.12)
+    print(f"[typist] typed {label} ({len(keys)} keys) at +{time.time() - t0:.1f}s", flush=True)
+    ok = q.wait_for_marker(log, "[login] key taken by the screen", 10)
+    print(f"[typist] the screen {'took' if ok else 'did NOT report taking'} a key", flush=True)
 PY
-typist=$!
+    typist=$!
+}
+FIRSTUSER_PHASE="[login] installer: first-user form open|name + Tab + password + Tab + retype + Enter|t:una tab t:correct-horse tab t:correct-horse ret"
+
+# --- boot 1: the fresh volume, the typist on the first-user form -------------------------------------------------------
+typist_start "$T/twoboot-typist.log" "$CAP1" "$FIRSTUSER_PHASE"
 echo "TWOBOOT: boot 1 — build + boot on a fresh volume, cap ${CAP1}s (output: target/twoboot-1.out; typist: target/twoboot-typist.log, QMP :${port})"
 tb=$(date +%s)
 ( cd "$U" && ./arroyo twoboot --boot 1 "$CAP1" ) > "$T/twoboot-1.out" 2>&1
@@ -241,10 +300,64 @@ else
     fi
     if [ -s "$T/twoboot-2.log" ]; then b2="$(judge2 "$T/twoboot-2.log")"; r2=$?; else b2='hang@"<no serial bytes>"'; fi
 fi
+# --- KEYBOOT4 (B864) `--card`: boots 3-4 on a native card, keyed at boot 3's first-user form, unlocked at boot 4 --------
+b3="" r3=1 b4="" r4=1 qw3="" qw4=""
+if [ "$CARD" = 1 ]; then
+    CARDIMG="$T/twoboot-card.img"
+    rm -f "$CARDIMG" "$T"/twoboot-3.log "$T"/twoboot-4.log "$T"/twoboot-3.log.run "$T"/twoboot-4.log.run "$T"/twoboot-typist-3.log "$T"/twoboot-typist-4.log
+    echo "TWOBOOT: card — esp_x86_unafs_card over boot 1's ESP (output: target/twoboot-card.out)"
+    if ! ( cd "$U" && ./arroyo twoboot --build-card ) > "$T/twoboot-card.out" 2>&1; then
+        b3="not-run(card-build-failed)"; b4="not-run(no-card)"
+    elif ! cp --sparse=always "$T/unaos-x86-card.img" "$CARDIMG"; then
+        b3="not-run(card-copy-failed)"; b4="not-run(no-card)"
+    else
+        echo "TWOBOOT: boot 3 — a fresh native card on the second SATA disk (target/twoboot-card.img), cap ${CAP3}s (output: target/twoboot-3.out)"
+        typist_start "$T/twoboot-typist-3.log" "$CAP3" "$FIRSTUSER_PHASE"
+        ( cd "$U" && UNAOS_AHCI_DISK="$CARDIMG" ./arroyo twoboot --boot 3 "$CAP3" ) > "$T/twoboot-3.out" 2>&1
+        rc3run=$?
+        wait "$typist" 2>/dev/null
+        [ -f "$LOG" ] && cp "$LOG" "$T/twoboot-3.log"
+        [ -f "$LOG.run" ] && cp "$LOG.run" "$T/twoboot-3.log.run"
+        awk '/^\[typist\]/ { print "TWOBOOT:   boot 3 " $0 }' "$T/twoboot-typist-3.log"
+        qw3="$(awk -F= '$1 == "qemu_wall" { print $2 }' "$T/twoboot-3.log.run" 2>/dev/null)"
+        [ -n "$qw3" ] && [ "$qw3" != "-" ] || qw3="$CAP3"
+        sha3="$(sha256sum "$elf" 2>/dev/null | cut -c1-16)"
+        echo "TWOBOOT: boot 3 arroyo rc=${rc3run} qemu_wall=${qw3} kernel.elf=${sha3:-none} image_unchanged=$([ "$sha3" = "$sha1" ] && echo 1 || echo 0)"
+        if [ -z "$sha1" ] || [ "$sha3" != "$sha1" ]; then
+            echo "TWOBOOT: boot 3 booted a DIFFERENT kernel.elf than boot 1 (${sha1:-none} -> ${sha3:-none}) — not the same image -> NO VERDICT rc=2"; rm -f "$stamp"; exit 2
+        fi
+        b3="$(judge3 "$T/twoboot-3.log")"; r3=$?
+        if [ "$r3" -ne 0 ]; then
+            b4="not-run(boot3-not-keyed)"
+        elif ! cp --sparse=always "$T/ahcifixture.img" "$CARDIMG"; then
+            b4="not-run(card-copy-back-failed)"   # AHCI_WRITE: boot 3 wrote the builder's fresh copy, not the source
+        else
+            echo "TWOBOOT: boot 4 — the same card, keyed, cap ${CAP4}s (output: target/twoboot-4.out)"
+            typist_start "$T/twoboot-typist-4.log" "$CAP4" \
+                "[keyboot] unlock form up kdf_pending=1|the root's password + Enter|t:correct-horse ret" \
+                "modal=true power_row=1|name + Tab + password + Enter|t:una tab t:correct-horse ret"
+            ( cd "$U" && UNAOS_AHCI_DISK="$CARDIMG" ./arroyo twoboot --boot 4 "$CAP4" ) > "$T/twoboot-4.out" 2>&1
+            rc4run=$?
+            wait "$typist" 2>/dev/null
+            [ -f "$LOG" ] && cp "$LOG" "$T/twoboot-4.log"
+            [ -f "$LOG.run" ] && cp "$LOG.run" "$T/twoboot-4.log.run"
+            awk '/^\[typist\]/ { print "TWOBOOT:   boot 4 " $0 }' "$T/twoboot-typist-4.log"
+            qw4="$(awk -F= '$1 == "qemu_wall" { print $2 }' "$T/twoboot-4.log.run" 2>/dev/null)"
+            [ -n "$qw4" ] && [ "$qw4" != "-" ] || qw4="$CAP4"
+            echo "TWOBOOT: boot 4 arroyo rc=${rc4run} qemu_wall=${qw4}"
+            if [ -s "$T/twoboot-4.log" ]; then b4="$(judge4 "$T/twoboot-4.log")"; r4=$?; else b4='hang@"<no serial bytes>"'; fi
+        fi
+    fi
+fi
 rm -f "$stamp"
 t1=$(date +%s)
-wall="$(awk -v a="${qw1:-0}" -v b="${qw2:-0}" 'BEGIN { a += 0; b += 0; printf "%.0f", a + b }')"
+wall="$(awk -v a="${qw1:-0}" -v b="${qw2:-0}" -v c="${qw3:-0}" -v d="${qw4:-0}" 'BEGIN { a += 0; b += 0; c += 0; d += 0; printf "%.0f", a + b + c + d }')"
 echo "TWOBOOT: build_s=$(awk -v v="${vw1:-0}" -v q="${qw1:-0}" 'BEGIN { printf "%.0f", v - q }') total_s=$((t1 - t0)) logs=target/twoboot-1.log,target/twoboot-2.log volume=target/twoboot-vol.img"
 [ "$r1" -ne 0 ] && echo "TWOBOOT: boot-1 last line: $(last_line "$T/twoboot-1.log")"
 [ "$r2" -ne 0 ] && [ -s "$T/twoboot-2.log" ] && echo "TWOBOOT: boot-2 last line: $(last_line "$T/twoboot-2.log")"
+if [ "$CARD" = 1 ]; then   # KEYBOOT4 (B864)
+    [ "$r3" -ne 0 ] && [ -s "$T/twoboot-3.log" ] && echo "TWOBOOT: boot-3 last line: $(last_line "$T/twoboot-3.log")"
+    [ "$r4" -ne 0 ] && [ -s "$T/twoboot-4.log" ] && echo "TWOBOOT: boot-4 last line: $(last_line "$T/twoboot-4.log")"
+    verdict "$b1" "$b2" "$wall" "$r1" "$r2" "$b3" "$b4" "$r3" "$r4"; exit $?
+fi
 verdict "$b1" "$b2" "$wall" "$r1" "$r2"

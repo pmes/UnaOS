@@ -52,6 +52,8 @@ pub mod md5;
 pub mod mp3;
 pub mod ogg;
 pub mod opus;
+/// NLE4 (SR203): a LINEAR position-addressed resampler for Stria's editor render (NLE4b owes windowed sinc).
+pub mod resample;
 /// AETHERMEDIA2 (SR134): WSOLA time-stretch (playbackRate with the pitch kept).
 pub mod stretch;
 pub mod vorbis;

@@ -391,6 +391,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "timeline_core"
+version = "0.1.0"
+dependencies = [
+ "demux_core",
+]
+
+[[package]]
 name = "trash_core"
 version = "0.1.0"
 dependencies = [
@@ -532,6 +539,7 @@ dependencies = [
  "rast",
  "smoltcp",
  "spin 0.12.3",
+ "timeline_core",
  "trash_core",
  "type_core",
  "type_registry_core",

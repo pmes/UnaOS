@@ -8,6 +8,48 @@ QEMU behavior. Newest sitting first.
 > in [`SHUTOUT-REGISTER.md`](SHUTOUT-REGISTER.md) (R19; rmbp-ledger B10). This file stays the
 > per-sitting narrative; the register is the verdict table.**
 
+## PRE-REGISTERED — KEPLER3D (rmbp-ledger B877), cut 2026-10-27 at 3ead33dc7: the copy engine's two walls; `tests keplerce`
+
+The channel (chid 2, class 0xA0B5, LAUNCH_DMA, the host semaphore), the CPU fallback (`video/blitter.rs` `run_on`) and the
+compositor seam (`video/wm.rs:21226`, `blitter::present_band`) are GPUBLIT's (B371..B463). The boot self-test passes on every
+flight since 26 (f34..f37: `:: GPUBLIT: selftest=ok ce_us=20..23 cpu_us=197 -> blitter=gpu ::`). Two walls stand between it and
+the glass.
+
+- **WALL A — the selection latches before the copy engine arms (KEPLER3D2, owed, a two-line reorder).** `drivers/gpu/kepler.rs:1464`
+  `takeover_display` -> `kepler_display.rs:511` `desktop_uefi::activate` -> `video/desktop_uefi.rs:457` `blitter::ignite` ->
+  `GpuBlitter::probe` -> `kepler_gpublit::armed()` is still false (VERDICT 0, `no-takeover`) -> `IGNITED` latched, `SEL_GPU` never
+  set. `kepler_gpublit::arm` runs after `takeover_display` returns, at `kepler.rs:1474`. Wire: every `[wc-h] rollup` of f37 boots 1
+  and 3 reads `blitter=cpu … gpu_fallback=0` beside the `selftest=ok -> blitter=gpu` line (flights 34..36 the same). The fix:
+  re-probe the selection once after `arm` returns ok, or `ignite` declines to latch on `no-takeover` while the takeover runs.
+  Gated on WALL B: with A fixed alone, the first present times out and demotes.
+- **WALL B — the first job after the self-test times out.** f34-boot2, f36-boot2, f37-boot1, each at `tests gen7` (its candidate
+  race hands the CE heap buffers): `:: GPUBLIT: demoted reason=timeout job=1 budget_us=4000 gp_get=2 gp_put=2 sem=00000001
+  want=00000002 -> blitter=cpu ::`. The host fetched both entries; seq 2 never released.
+- **The fixture** (`UNAOS_KEPLERCE=1`, feature `nvidia-kepler-cecopy`; `tests keplerce`, run BEFORE `tests gen7`): three
+  256x256x4 copies under the `CHAN` mutex through `kepler_gpublit::run` (never `copy_wait`: it cannot demote or select), into a
+  knob-only tail of GPUBLIT's VRAM window, each read back through BAR1 word by word; stop at the first non-ok job.
+
+| job | kind | source | a failure here means (`wall=`) |
+| --- | --- | --- | --- |
+| J1 | `vram` | VRAM the CPU wrote through BAR1 (timed: `cpu_us`) | `later-job` — any pushbuffer after the first dies; read the second push with `[kfifo] decode` |
+| J2 | `sys` | a fresh heap buffer: new `map_sys` PTEs after the GMMU walked the table | `fresh-pte` — no TLB invalidate; invalidate after the PTE writes, or map a staging pool at `arm` |
+| J3 | `reuse` | the same buffer, pattern changed in place (cached mapping) | `reuse` — the map cache's pfn re-check |
+
+Wire: `[keplerce] job=<k> kind= us= verify=<ok|mismatch@n|timeout|unmappable> seq= gp_get= gp_put= sem=` per job, then
+`:: KEPLERCE: channel=ok copy=<ok|timeout|unmappable> verify=<ok|mismatch@n|-> us=<J2> jobs=<k>/3 wall=<…> cpu_us=<n> px=65536 -> PASS|FAIL ::`;
+a non-ok job adds the existing `[gpublit]`/`[kfifo] decode` dump. Refusals: `channel=<refused(why)|unwound|demoted|busy> … -> FAIL`;
+QEMU: `:: KEPLERCE: channel=absent copy=- verify=- us=0 jobs=0/3 wall=- sel=cpu -> SKIP reason=no-kepler ::`. `wall=none` opens KEPLER3D2.
+
+- **KEPLER3D2 (rmbp-ledger B883), cut 2026-10-27 at 5e65a8816: WALL A behind the same knob.** `kepler.rs:1474`'s arm line calls
+  `blitter::reprobe` (file tail of `video/blitter.rs`, `nvidia-kepler-cecopy` only): it releases `IGNITED` by compare-exchange and
+  re-runs `ignite` verbatim, so the selection is made once more, now that `arm` has run. Every `:: KEPLERCE:` line gains `sel=<cpu|gpu|bcs>`
+  (`blitter::selected`) after `wall=`. Expected on an `UNAOS_KEPLERCE=1` metal image:
+  self-test ok -> `[wc] blitter reprobe armed=1 was=cpu now=gpu why=selftest-ok`, then `[wc-h] rollup … blitter=gpu`; with WALL B
+  fixed, `:: KEPLERCE: channel=ok … wall=none sel=gpu … -> PASS ::`; with WALL B standing, the first present demotes
+  (`:: GPUBLIT: demoted reason=timeout job=1 …`) and `:: KEPLERCE: channel=demoted … wall=- sel=cpu -> FAIL ::`. Self-test not ok ->
+  `[wc] blitter reprobe armed=0 was=cpu now=cpu why=selftest-<mismatch|timeout|refused>`. A build without `wc` -> `why=not-ignited`.
+  QEMU: no reprobe line (`arm` never runs). Knob off: no line, no token; `./arroyo knoboff nvidia-kepler-cecopy` is the proof.
+
 ## PRE-REGISTERED — KEPLERGR4 (rmbp-ledger B627, R101), cut 2026-10-13: the GR class, SET_OBJECT, one readable method; UCODE-GATED
 
 Design, rung table and citations: [`docs/dev/evidence/keplergr4/keplergr4.md`](../../evidence/keplergr4/keplergr4.md). Code:

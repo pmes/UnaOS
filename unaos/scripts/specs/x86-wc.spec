@@ -1001,3 +1001,7 @@ REQUIRE :: PROBESLOW: -> SKIP\(budget 1s\) ::
 REQUIRE :: BOOTLIST: ran=3 pass=2 fail=0 skip=1 heavy=ran ms=[0-9]+ ::
 REQUIRE :: BOOTLIST: probe entries=3 heavy=1 budget_skips=1 summary=ok -> PASS ::
 FORBID :: BOOTLIST: .* -> FAIL ::
+# ── LEASERENEW (rmbp-ledger B888), TAIL-APPENDED — `tests dhcprenew`: the smoltcp lease capped at 8 s through the socket's public API and reset, re-acquired, then ONE renewal at T1 said (`[net] dhcp renewed lease= ip=same t1_at=`). OPTIONAL until flown. ASSUMPTION (code-only, unrun): slirp's bootp answers the renewal's UNICAST REQUEST to 10.0.2.2:67 (ciaddr set, no option 50) with an ACK found by MAC; if it does not, the line reads `-> FAIL reason=no-renewal`.
+OPTIONAL :: DHCPRENEW: first=[0-9]+ renewed=[1-9][0-9]* changed=0 -> PASS ::
+# NLE6 (LEDGER SR207): `tests nle` (typed, R80; needs UNAOS_VIDEO=1, which this leg does not set) — the Player's EDL mode over two synthetic utp1 reels.
+OPTIONAL :: NLE: frames=\d+ seeks=\d+ runup=\d+ agree=\d+/\d+ counter=frame-ord -> PASS ::

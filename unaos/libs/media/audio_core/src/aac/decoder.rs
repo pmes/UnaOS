@@ -289,8 +289,15 @@ pub struct AacDecoder {
     chans: [Chan; 2],
     /// per output channel decoded this frame
     pub out: Vec<Vec<f32>>,
-    /// Set when the stream carries an SBR extension (decoded here as the AAC-LC core only).
+    /// Set when the stream carries an SBR extension (decoded by [`AacDecoder::enable_sbr`]'s SBR, else the core only).
     pub sbr_seen: bool,
+    /// HEAACSBR (LEDGER SR198): the SBR tool, when on (`enable_sbr`): `out` is then 2048 samples per channel.
+    sbr: Option<alloc::boxed::Box<super::sbr::Sbr>>,
+    /// A parametric stereo extension was seen (`ps=seen`).
+    pub ps_seen: bool,
+    /// PS on a mono core: `out[1]` is the parametric stereo right channel (HEAACSBR-PS, LEDGER SR214; the mono core on
+    /// both channels until the first PS header).
+    ps_dup: bool,
     /// The PCE seen in-band (channelConfiguration 0).
     pub pce: Option<Pce>,
     scratch: Vec<f32>,
@@ -341,6 +348,9 @@ impl AacDecoder {
             chans: [Chan::new(), Chan::new()],
             out: vec![vec![0.0; 1024]; n],
             sbr_seen: false,
+            sbr: None,
+            ps_seen: false,
+            ps_dup: false,
             pce: None,
             scratch: vec![0.0; 2048],
         })
@@ -352,6 +362,12 @@ impl AacDecoder {
         for o in self.out.iter_mut() { o.iter_mut().for_each(|x| *x = 0.0); }
         let (mut nsce, mut ncpe, mut nlfe) = (0usize, 0usize, 0usize);
         let mut done = vec![false; self.layout.channels];
+        // HEAACSBR: the frame's SCE/CPEs as (element index, output channels, count); `last` is what a fill
+        // element's SBR data extends
+        let mut elems: Vec<(usize, [usize; 2], usize)> = Vec::new();
+        let mut last: Option<(usize, [usize; 2], usize)> = None;
+        let mut nel = 0usize;
+        if let Some(s) = self.sbr.as_mut() { s.begin_frame(); }
         loop {
             let id = r.read(3)?;
             match id {
@@ -362,6 +378,9 @@ impl AacDecoder {
                     let target = if id == ID_SCE { let t = self.layout.sce.get(nsce).copied(); nsce += 1; t } else { let t = self.layout.lfe.get(nlfe).copied(); nlfe += 1; t };
                     self.spectral_tools(0);
                     if let Some(ch) = target { self.synth(0, ch); done[ch] = true; }
+                    last = None;
+                    if let (Some(ch), true) = (target, id == ID_SCE) { let e = (nel, [ch, 0], 1); elems.push(e); last = Some(e); }
+                    nel += 1;
                 }
                 ID_CPE => {
                     let _tag = r.read(4)?;
@@ -371,6 +390,9 @@ impl AacDecoder {
                     self.spectral_tools(0);
                     self.spectral_tools(1);
                     if let Some((a, b)) = target { self.synth(0, a); self.synth(1, b); done[a] = true; done[b] = true; }
+                    last = target.map(|(a, b)| (nel, [a, b], 2));
+                    if let Some(e) = last { elems.push(e); }
+                    nel += 1;
                 }
                 ID_CCE => { self.skip_cce(r)?; }
                 ID_DSE => {
@@ -388,12 +410,23 @@ impl AacDecoder {
                 ID_FIL => {
                     let mut cnt = r.read(4)? as usize;
                     if cnt == 15 { cnt = cnt + r.read(8)? as usize - 1; } // MP3HANG: 15 + esc - 1 (ISO 14496-3 fill_element); `esc - 1` alone underflowed at esc=0 (aac_kat, debug)
+                    let end = r.bit_pos() + 8 * cnt;
                     if cnt > 0 {
                         // extension_type: EXT_SBR_DATA (13) / EXT_SBR_DATA_CRC (14) mark HE-AAC
                         let ty = r.peek(4) as u32;
-                        if ty == 13 || ty == 14 { self.sbr_seen = true; }
+                        if ty == 13 || ty == 14 {
+                            self.sbr_seen = true;
+                            // HEAACSBR: sbr_extension_data for the element just decoded (an error leaves it upsampling)
+                            if let (Some(s), Some((el, ochs, n))) = (self.sbr.as_mut(), last) {
+                                if r.skip(4).is_ok() { let _ = s.read(r, el, &ochs[..n], ty == 14); }
+                                self.ps_seen |= s.ps_seen;
+                            }
+                        }
                     }
-                    r.skip(8 * cnt)?;
+                    // land on the element's end whatever the payload's reader consumed
+                    let here = r.bit_pos();
+                    if here > end { r.seek_bits(end); }
+                    r.skip(end - here.min(end))?;
                 }
                 _ => return Err(Error::Invalid("aac: element id")),
             }
@@ -407,9 +440,35 @@ impl AacDecoder {
                 self.synth(0, ch);
             }
         }
+        if self.sbr.is_some() { self.sbr_apply(&elems); }
         let rel = r.bit_pos() - start;
         r.skip((8 - rel % 8) % 8).ok();
         Ok(())
+    }
+
+    /// HEAACSBR (LEDGER SR198): switch the SBR tool on — the output doubles to 2048 samples per channel at twice the
+    /// core rate; `ps` (a parametric stereo stream on a mono core) adds the second channel the PS stage synthesises.
+    pub fn enable_sbr(&mut self, ps: bool) {
+        let n = self.layout.channels;
+        self.sbr = Some(alloc::boxed::Box::new(super::sbr::Sbr::new(super::RATES[self.sf_index], n, ps && n == 1)));
+        self.ps_dup = ps && n == 1;
+        self.ps_seen |= ps;
+        self.out = vec![vec![0.0; 2048]; if self.ps_dup { 2 } else { n }];
+    }
+
+    /// Output samples per channel per raw_data_block: 1024, or 2048 with SBR on.
+    pub fn frame_len(&self) -> usize { if self.sbr.is_some() { 2048 } else { 1024 } }
+
+    /// The SBR pass over the frame's elements; channels no element carried (and LFE) are upsampled alone.
+    fn sbr_apply(&mut self, elems: &[(usize, [usize; 2], usize)]) {
+        let n = self.layout.channels;
+        let Some(s) = self.sbr.as_mut() else { return };
+        let mut covered = vec![false; n];
+        for &(el, ochs, k) in elems {
+            s.apply(Some(el), &ochs[..k], &mut self.out);
+            for &c in &ochs[..k] { if c < n { covered[c] = true; } }
+        }
+        for (c, cov) in covered.iter().enumerate() { if !cov { s.apply(None, &[c], &mut self.out); } }
     }
 
     fn ics_info(&self, r: &mut BitReader) -> Result<Ics> {

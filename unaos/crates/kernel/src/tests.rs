@@ -174,7 +174,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
 /// SHELLUX (R75): register the `shellux` line-editor fixture exactly once (x86 witness images).
 fn ensure_shellux() {
     ensure_bootverdicts(); crate::boot::ensure_tests(); crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } register("tzlocale", tzlocale_selftest); #[cfg(feature = "uvc")] register("uac1", uac1_fixture); register("mtpphone", mtpphone_selftest); #[cfg(feature = "uac")] register("uacmic", uacmic_fixture); register("clockpainters", clockpainters_selftest); register("hwreport", hwreport_selftest); register("audiomix", audiomix_selftest); register("micring3", micring3_selftest); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] register("a2dp", a2dp_selftest); register("sinkall", sinkall_selftest); } ensure_attr(); #[cfg(target_arch = "x86_64")] crate::arch::clockcore::ensure_tests(); #[cfg(all(feature = "midden", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::middenapp::ensure(); #[cfg(all(feature = "aether", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::aether::ensure(); #[cfg(all(feature = "una", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::unaapp::ensure(); #[cfg(feature = "sonde")] crate::sonde::ensure(); #[cfg(all(feature = "uvc", target_arch = "aarch64"))] crate::drivers::uvc::ensure_tests(); crate::pointerfeel::ensure(); #[cfg(feature = "installdemo")] crate::install::uninstall::ensure(); #[cfg(all(feature = "stria", any(target_arch = "x86_64", feature = "aarch64_el0")))] crate::striaapp::ensure(); #[cfg(feature = "uvc")] crate::drivers::xhci::uvc::ensure_tests(); #[cfg(all(target_arch = "aarch64", feature = "v3d"))] crate::arch::aarch64::v3d::ensure_tests(); #[cfg(target_arch = "aarch64")] crate::arch::aarch64::mmu_wxn::ensure(); #[cfg(all(target_arch = "aarch64", not(feature = "busreg")))] register("hwreport", hwreport_selftest); // PIEMPTYBIN (PI24): `tests v3d`, the [v3d105] emptybin rung (LINE-NEUTRAL append, before this comment). STRIAMETAL (SR139): `tests stria` (LINE-NEUTRAL append, before this comment). ARMSONDE (SR101): `tests sonde` arch-neutral, and `tests uvc` registered eagerly on aarch64 (LINE-NEUTRAL append, before this comment). CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). REALSENSE (SR92): `tests sonde` (LINE-NEUTRAL append, before this comment). // CLOCKCORE (B397): `tests clock`. HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`. MIDDENTWIN (SR75): `tests midden` (LINE-NEUTRAL append, before this comment). UNAMETAL (SR90): `tests una` (LINE-NEUTRAL append, before this comment). POINTERFEEL (B535): `tests pointerfeel` (LINE-NEUTRAL append, before this comment). HWCENSUSARM (SR165): `tests hwreport` on an aarch64 image with no busreg (the tegra line) (LINE-NEUTRAL append, before this comment).
-    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("pinchzoom", pinchzoom_selftest); } #[cfg(all(target_arch = "x86_64", feature = "wc"))] register("bootlist", bootlist::selftest); /* BOOTLIST (B817, R132): `tests bootlist`, the list runner's probe (file tail; LINE-NEUTRAL) */ /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
+    crate::help::ensure(); #[cfg(all(feature = "busreg", any(feature = "aarch64_el0", target_arch = "x86_64")))] { static B3: AtomicBool = AtomicBool::new(false); if !B3.swap(true, Ordering::AcqRel) { register("bandy3", crate::arch::syscall::bandy3_selftest); } } ensure_attr(); ensure_brightfloor(); ensure_gen7(); ensure_wifi(); #[cfg(target_arch = "x86_64")] register("kelfhash", kelfhash_selftest); #[cfg(all(target_arch = "x86_64", feature = "installdemo", feature = "wc"))] register("updateui", updateui_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] { static SK: AtomicBool = AtomicBool::new(false); if !SK.swap(true, Ordering::AcqRel) { register("sock", crate::drivers::e1000::sock_selftest); } #[cfg(all(target_arch = "x86_64", feature = "ahci"))] register("smartline", smartline_selftest); register("notelemetry", notelemetry_selftest); register("dhcprenew", dhcprenew_selftest); #[cfg(all(feature = "smolnet", target_arch = "x86_64"))] ensure_idlenet(); #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))] register("pinchzoom", pinchzoom_selftest); } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] register("bootlist", bootlist::selftest); #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-cecopy"))] register("keplerce", crate::drivers::gpu::kepler_gpublit::tests_keplerce); /* BOOTLIST (B817, R132): `tests bootlist`, the list runner's probe (file tail; LINE-NEUTRAL) */ /* INPUTSTALL2 M4 (B388, R80): `tests sock` arms the SOCK ladder; it never runs at boot */ // HELPVERB: `tests helpdoc` ATTRSURF: `tests attr`.
     #[cfg(all(feature = "linuxabi", target_arch = "x86_64"))]
     {
         static LDONE: AtomicBool = AtomicBool::new(false);
@@ -324,7 +324,7 @@ fn ensure_brightfloor() {
     #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
     {
         static DONE: AtomicBool = AtomicBool::new(false);
-        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", sleep_usb_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("usbsuspend", usbsuspend_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))] register("ehci", ehci_hub_selftest); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] register("trackpadmt", trackpadmt_selftest); } // TRACKPADMT (B818): `tests trackpadmt` (the file-tail fn; the Wellspring contacts KAT). EHCIHUBDISC (B801): `tests ehci` (the file-tail fn; the hub status-change leg). USBSUSPEND (B766): `tests usbsuspend` (the file-tail fn; same gate as `sleep`). AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
+        if !DONE.swap(true, Ordering::AcqRel) { register("brightfloor", crate::video::backlight::selftest); register("brightstep", crate::video::backlight::brightstep); register("lidsleep", crate::video::lidsleep::selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("sleep", sleep_usb_selftest); #[cfg(feature = "login")] register("autolock", autolock_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))] register("usbsuspend", usbsuspend_selftest); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc", feature = "ehcihid"))] register("ehci", ehci_hub_selftest); #[cfg(all(target_arch = "x86_64", feature = "ehcihid"))] register("trackpadmt", trackpadmt_selftest); #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] register("sleepkey", sleepkey_login_selftest); } // SLEEPRESUME2 (B887): `tests sleepkey` (aarch64 desktop_firmware; the file-tail fn: the login Sleep's waking key). TRACKPADMT (B818): `tests trackpadmt` (the file-tail fn; the Wellspring contacts KAT). EHCIHUBDISC (B801): `tests ehci` (the file-tail fn; the hub status-change leg). USBSUSPEND (B766): `tests usbsuspend` (the file-tail fn; same gate as `sleep`). AUTOLOCK (B712): `tests autolock` (the file-tail fn; same gate, `login`). SLEEP (B691): `tests sleep` enters and leaves the state (same-line fold, code before the comment)
     }
 }
 
@@ -1619,7 +1619,7 @@ pub fn focussteal_selftest() {
 ///    the worst whole call whose present was the DRAIN (SHIMMERPRESENT B840: tick + erase drain + cursor tail; bar: <= 200 us);
 ///    a run with no drain frame does not pass. A frame the whole pass carried (owed work, or the drain re-damaged a
 ///    window) is printed as `pass_us=` (ungated; flight 37's 6053 us was that pass), the drain frames as `drain_frames=`.
-/// `:: VEILCOST: detail veil_p50_us=<n> veil_p99_us=<n> fill_p99_us=<n> bar_us=<n> n=<n> shimmer_frames=<n> pass_us=<n> drain_frames=<n> ::`
+/// `:: VEILCOST: detail veil_p50_us=<n> veil_p99_us=<n> fill_p99_us=<n> bar_us=<n> n=<n> shimmer_frames=<n> pass_us=<n> drain_frames=<n> drain_p99_us=<n> ::` (DRAINVEIL B868)
 /// `:: VEILCOST: ratio_p99=<x.xx> shimmer_idle_us=<n> -> PASS|FAIL|SKIP ::`
 #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))]
 fn veilcost_selftest() {
@@ -1662,8 +1662,8 @@ fn veilcost_selftest() {
     }
     let shim_ok = rm || (frames > 0 && drain_frames > 0 && worst <= SHIM_BAR_US);
     serial_println!(
-        ":: VEILCOST: detail veil_p50_us={} veil_p99_us={} fill_p99_us={} bar_us={} n={} shimmer_frames={} pass_us={} drain_frames={}{} ::",
-        v50, v99, s99, bar_us, k, frames, pass_worst, drain_frames, if rm { " reduce_motion=1" } else { "" }
+        ":: VEILCOST: detail veil_p50_us={} veil_p99_us={} fill_p99_us={} bar_us={} n={} shimmer_frames={} pass_us={} drain_frames={} drain_p99_us={}{} ::",
+        v50, v99, s99, bar_us, k, frames, pass_worst, drain_frames, crate::video::veilcost::drain_p99_us(), if rm { " reduce_motion=1" } else { "" }
     );
     serial_println!(
         ":: VEILCOST: ratio_p99={}.{:02} shimmer_idle_us={} -> {} ::",
@@ -2023,8 +2023,8 @@ pub fn diskfull_selftest() {
 #[cfg(all(feature = "login", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 fn autolock_selftest() {
     use crate::video::{crystal::login, keymap, lock};
-    const NAME: &[u8] = b"una";
-    const PW: &[u8] = b"correct-horse";
+    #[cfg(not(feature = "autolock_fixture"))] const NAME: &[u8] = b"una"; #[cfg(feature = "autolock_fixture")] let Some(cred) = autolock_fixture_cred() else { return }; #[cfg(feature = "autolock_fixture")] #[allow(non_snake_case)] let NAME: &[u8] = &cred.name; // AUTOLOCK3 (B875): knob on, the pair is the card's staged fixture file, never a literal (file tail). LINE-NEUTRAL fold, code first.
+    #[cfg(not(feature = "autolock_fixture"))] const PW: &[u8] = b"correct-horse"; #[cfg(feature = "autolock_fixture")] #[allow(non_snake_case)] let PW: &[u8] = &cred.pw; // AUTOLOCK3 (B875): knob on, no password literal in this leg; `cred` zeroes it on drop.
     const WRONG: &[u8] = b"wrong-horse";
     let mut nb = [0u8; crate::fs::users::NAME_MAX];
     let is_una = |nb: &mut [u8; crate::fs::users::NAME_MAX]| matches!(crate::fs::users::whoami(nb), Some(k) if &nb[..k] == NAME);
@@ -2045,7 +2045,7 @@ fn autolock_selftest() {
             crate::arch::sched::yield_now();
         }
     };
-    let before = lock::fingerprint();
+    let before = lock::fingerprint(); #[cfg(feature = "autolock_fixture")] let root0 = autolock_root_state(); // AUTOLOCK3 (B875): the keyed root's state before the lock (file tail). LINE-NEUTRAL fold, code first.
     let role = keymap::start_role();
     let win = if role != 0 { role } else { crate::drivers::xhci::HID_MOD_GUI };
     let mut cur = [0u8; 6];
@@ -2070,7 +2070,7 @@ fn autolock_selftest() {
     let after = lock::fingerprint();
     let same = before == after;
     let ms = lock::last_open_ms(); let prefs = lockprefs_leg(); let gets = lockchanged_leg(); let deleted = lockdeleted_leg(); // PREFSDELETED (B755): the deleted-domain leg (file tail). // LOCKCHANGED (B758): the lock's GETs per lock-key and per other-key change (file tail). LOCKPREFS (B748): a bus write of the delay is the lock's within one service pass (file tail). LINE-NEUTRAL fold, code first.
-    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0 && gets.0 && deleted.0; // PREFSDELETED (B755): + deleted. // LOCKCHANGED (B758): + gets. LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
+    let pass = entered && leaked == 0 && refused && reopened && same && ms.is_some() && painted && resumed >= 1 && prefs.0 && gets.0 && deleted.0; #[cfg(feature = "autolock_fixture")] let pass = pass && autolock_root_kept(root0); // AUTOLOCK3 (B875): + the keyed root kept across the lock (file tail). // PREFSDELETED (B755): + deleted. // LOCKCHANGED (B758): + gets. LOCK2 (B728): + the resume pass and the one-frame paint; the words leg is owed (`words_path=owed`, see the file tail)
     serial_println!(
         ":: AUTOLOCK: entered={} leaked_keys={} reopened={} table_same={} ms={} resumed={} hole_ms={} words_path={} prefs={} -> {} :: chord={} wrong={} windows_hidden={} painted={} gets={} deleted={} verify={} kdf_ms={}",
         entered as u8, leaked, if reopened { "ok" } else { "FAIL" }, same as u8, ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), resumed, hole_ms.map_or(alloc::string::String::from("-"), |m| alloc::format!("{}", m)), "owed", prefs.1,
@@ -3029,15 +3029,15 @@ fn softydots_selftest() {
     #[cfg(feature = "login")]
     {
         use crate::video::{crystal::login, lock};
-        const NAME: &[u8] = b"una";
-        const PW: &[u8] = b"correct-horse";
+        #[cfg(not(feature = "autolock_fixture"))] const NAME: &[u8] = b"una"; #[cfg(feature = "autolock_fixture")] let cred = autolock_fixture_cred(); #[cfg(feature = "autolock_fixture")] #[allow(non_snake_case)] let NAME: &[u8] = cred.as_ref().map_or(&b""[..], |c| &c.name[..]); // AUTOLOCK4 (B885): knob on, the pair is the card's staged fixture file (AUTOLOCK3's one reader, file tail), never a literal. LINE-NEUTRAL fold, code first.
+        #[cfg(not(feature = "autolock_fixture"))] const PW: &[u8] = b"correct-horse"; #[cfg(feature = "autolock_fixture")] #[allow(non_snake_case)] let PW: &[u8] = cred.as_ref().map_or(&b""[..], |c| &c.pw[..]); // AUTOLOCK4 (B885): knob on, no password literal in this leg; `cred` zeroes it on drop.
         let mut nb = [0u8; crate::fs::users::NAME_MAX];
         let is_una = |nb: &mut [u8; crate::fs::users::NAME_MAX]| matches!(crate::fs::users::whoami(nb), Some(k) if &nb[..k] == NAME);
         if !is_una(&mut nb) {
-            lock_word = alloc::string::String::from("skip(session-not-fixture-user)");
+            lock_word = alloc::string::String::from("skip(session-not-fixture-user)"); #[cfg(feature = "autolock_fixture")] { if cred.is_none() { lock_word = alloc::string::String::from("skip(fixture-credential)"); } } // AUTOLOCK4 (B885): knob on, no staged pair (NAME empty, so this arm) names its own reason after AUTOLOCK3's SKIP line.
         } else if lock::active() || login::is_open() {
             lock_word = alloc::string::String::from("skip(screen-up)");
-        } else {
+        } else if autolock_credential(NAME, PW).is_none() { lock_word = alloc::string::String::from("skip(credential-not-fixture)"); } else { // AUTOLOCK4 (B885): AUTOLOCK2's guard (`users::verify`, the screen's one verdict) BEFORE the lock and any typing, both knob states; a human's `una` SKIPs, never locked (FLIGHT37 §7). LINE-NEUTRAL fold, code first.
             let entered = login::lock() && lock::active();
             wm::composite();
             let gone = entered && taskbar::painted_rect().is_none();
@@ -5313,14 +5313,14 @@ fn usbsuspend_selftest() {
     }
     #[cfg(feature = "ehcihid")] use crate::drivers::ehci::suspend as es; #[cfg(feature = "ehcihid")] let (e_down, e_up): (fn() -> bool, fn() -> bool) = (es::suspended, es::up);
     #[cfg(not(feature = "ehcihid"))] let (e_down, e_up): (fn() -> bool, fn() -> bool) = (|| true, || true);
-    let to0 = xs::ep0_timeouts(); let rw0 = xhci::ep0_rewinds(); xs::request(true); #[cfg(feature = "ehcihid")] es::request(true);
+    let to0 = xs::ep0_timeouts(); let rw0 = xhci::ep0_rewinds(); let h0 = xhci::hub_td_counts(); let td0 = xhci::td_counts(); xs::request(true); #[cfg(feature = "ehcihid")] es::request(true);
     let in_u3 = wait(2_000, &|| xs::suspended() && e_down());
     let c = xs::census();
-    let held = usbsuspend_held_queue(in_u3);
+    let held = usbsuspend_held_queue(in_u3); let io = usbsuspend_io_leg(in_u3); let rsp = usbsuspend_resuspend_leg(io, &wait);
     xs::request(false); #[cfg(feature = "ehcihid")] es::request(false);
     let up = wait(2_000, &|| xs::up() && e_up());
     let held_word = usbsuspend_held_collect(held);
-    let r = xs::census(); let (ep0_word, ep0_refused, ep0_replayed) = usbsuspend_held_ep0_leg(up && held_word != "none", &wait); let rs = usbsuspend_reset_leg(up && held_word != "none", &wait); // HELDSLOTEP0 (B804): the second, xHCI-only cycle (file-tail fn), after this cycle's census; LINE-NEUTRAL fold, code first
+    let r = xs::census(); let (ep0_word, ep0_refused, ep0_replayed) = usbsuspend_held_ep0_leg(up && held_word != "none", &wait); let rs = usbsuspend_reset_leg(up && held_word != "none", &wait); let hub = usbsuspend_hub_leg(h0, up); let ks = usbsuspend_key_leg(&wait, &|| xs::up() && e_up()); let tds = usbsuspend_tds(td0); // SLEEPRESUME2 (B887): every cycle's Stop TD checks (file-tail fn); SLEEPRESUME (B863): the hub TD after UP, then the login-entry key cycle LAST (it waits for all-up); HELDSLOTEP0 (B804): the second, xHCI-only cycle (file-tail fn), after this cycle's census; LINE-NEUTRAL fold, code first
     let mut probe = None;
     let t0 = crate::arch::ms();
     while probe.is_none() && crate::arch::ms().wrapping_sub(t0) < 1_000 {
@@ -5335,7 +5335,7 @@ fn usbsuspend_selftest() {
     let (e, e_kbd) = usbsuspend_ehci_leg(kbd == "none");
     let verdict = if xs::ep0_timeouts() != to0 { "FAIL reason=xhci-dead" } else if !in_u3 || !up {
         "FAIL reason=phase-timeout"
-    } else if c.pls3 != c.suspended || r.resumed < c.suspended || e.resumed < e.suspended || r.ep_running < r.ep_stopped { "FAIL"
+    } else if c.pls3 != c.suspended || r.resumed < c.suspended || e.resumed < e.suspended || r.ep_running < r.ep_stopped || !matches!(io, "ok" | "none") || ks != "ok" || hub == "lost" || rsp == "miss" || tds.2 != 0 { "FAIL"
     } else if kbd != "none" { if kbd != "ok" || c.suspended == 0 || held_word != "ok" || ep0_word != "ok" || rs.0 != "ok" || rs.1 != "ok" || rs.2 != "ok" { "FAIL" } else { "PASS" }
     } else if e_kbd == "none" {
         "SKIP reason=no-kbd"
@@ -5346,8 +5346,8 @@ fn usbsuspend_selftest() {
     };
     let (kbd_on, kbd_word) = if kbd != "none" { ("xhci", kbd) } else { ("ehci", e_kbd) };
     serial_println!(
-        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={} held_ep0_refused={} replayed={} ep0_after_wake={} ep0_timeouts={} stuck={} held_halt_replayed={} phy_skipped={} rewinds={} held_recovery={} port_reset={} reenum={} ep0_after_reset={} reset={}",
-        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings, ep0_refused, ep0_replayed, kbd, xs::ep0_timeouts().wrapping_sub(to0), r.stuck, xs::census().held_halt_replayed, xs::census().phy_skipped, xhci::ep0_rewinds().wrapping_sub(rw0), xs::census().held_recovery, rs.0, rs.1, rs.2, rs.3 // HELDMAP (B838): the second (held-EP0) cycle's census; rewinds= is 0 because the rewind is unreachable while the ring push is infallible, not because it never happened
+        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={} held_ep0_refused={} replayed={} ep0_after_wake={} ep0_timeouts={} stuck={} held_halt_replayed={} phy_skipped={} rewinds={} held_recovery={} port_reset={} reenum={} ep0_after_reset={} reset={} io_resume={} key_swallow={} hub_td={} resuspend={} tds=kept:{},requeued:{},lost:{}",
+        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings, ep0_refused, ep0_replayed, kbd, xs::ep0_timeouts().wrapping_sub(to0), r.stuck, xs::census().held_halt_replayed, xs::census().phy_skipped, xhci::ep0_rewinds().wrapping_sub(rw0), xs::census().held_recovery, rs.0, rs.1, rs.2, rs.3, io, ks, hub, rsp, tds.0, tds.1, tds.2 // HELDMAP (B838): the second (held-EP0) cycle's census; rewinds= is 0 because the rewind is unreachable while the ring push is infallible, not because it never happened
     );
 }
 
@@ -5424,10 +5424,10 @@ fn sinkall_selftest() {
         sources += sinkall_player("video", s, k) as u32; clock = sinkall_clock(s, k);
         overlap = if sinkall_overlap(s) { "ok" } else { "FAIL" }; pause_ms = sinkall_pause(s); start_gap = sinkall_start(s); // SINKALLDOCS (B781): the Player's pause lands within the sink's queue (file tail). PLAYSTARTGAP (B805): a file play's start gap on the HDA ring (file tail)
     }
-    let usb_volume = sinkall_usb_volume(usb); let slider_ms = sinkall_slider(hda, usb); let idle_level = sinkall_idle_level(usb); // MIXERPUMP (B787): a set through `status::set_volume` reaches its carrier within one period + 10 ms (file tail)
+    let usb_volume = sinkall_usb_volume(usb); let slider_ms = sinkall_slider(hda, usb); let idle_level = sinkall_idle_level(usb); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] let bt_clock = sinkall_bt_clock(bt_live); // MIXERPUMP (B787): a set through `status::set_volume` reaches its carrier within one period + 10 ms (file tail)
     let direct = play::epoch().wrapping_sub(e0) as i64 - mixer::hda_opens().wrapping_sub(o0) as i64;
     let _ = audio::sink(if was == Sink::Usb { "usb" } else if was == Sink::Hda { "hda" } else { "bt" });
-    let failed = [hda, usb, bt_live, bt, overlap, usb_volume, idle_level, clock].iter().any(|v| *v == "FAIL");
+    let failed = [hda, usb, bt_live, bt, overlap, usb_volume, idle_level, clock].iter().any(|v| *v == "FAIL"); #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] let failed = failed || bt_clock == "FAIL"; // A2DPKAT (rmbp-ledger B870): the player clock leg on BT (file tail). LINE-NEUTRAL append, before this comment.
     let verdict = if live.is_none() { "SKIP" } else if !failed && sources == 3 && direct == 0 && pause_ms <= SINKALL_PAUSE_MS && slider_ms <= SINKALL_SLIDER_MS && start_gap.map_or(true, |g| g <= play::REFILL_MS) { "PASS" } else { "FAIL" };
     serial_println!(
         ":: SINKALL: sources={} direct_writes={} usb_volume={} -> {} :: hda={} usb={} bt={} overlap={} pause_ms={} slider_ms={} start_gap_ms={} ::",
@@ -6530,15 +6530,15 @@ fn a11yshadow_leg() {
             (Some(ok), relaid, calls, extra)
         }
     };
-    change(m0, i0);
+    let (cpass, lpass, cwalks) = shadowcover_legs(); change(m0, i0); // SHADOWDAMAGE (rmbp-ledger B865): the CONTRAST and lens bumpers' re-lays, counted (fn at this file's tail). LINE-NEUTRAL fold, code first.
     wm::focus_changed(saved);
     wm::close(win);
     wm::composite();
     if let Some(ok) = verdict {
-        let pass = ok && calls == 1 && extra == 0;
+        let pass = ok && calls == 1 && extra == 0 && cpass == 1 && lpass != "0" && cwalks == 0;
         serial_println!(
-            ":: A11YSHADOW: shadow_follows={} relaid={} changed_calls={} extra_pass={} -> {} ::",
-            if ok { "ok" } else { "FAIL" }, relaid, calls, extra, if pass { "PASS" } else { "FAIL" }
+            ":: A11YSHADOW: shadow_follows={} relaid={} changed_calls={} extra_pass={} contrast_pass={} lens_pass={} relay_walks={} -> {} ::",
+            if ok { "ok" } else { "FAIL" }, relaid, calls, extra, cpass, lpass, extra + cwalks, if pass { "PASS" } else { "FAIL" }
         );
     }
 }
@@ -6554,7 +6554,7 @@ static RUN_GEN: AtomicU32 = AtomicU32::new(0);
 
 /// BOOTLIST (B817): the list fixture `name` overran its budget. Only when `run` is executing THAT fixture now (never the
 /// seat's own run, never an outer `tests bootlist`): retire the run — CUR and RUNNING free for the next fixture. `true` when retired.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 fn supersede(name: &str) -> bool {
     if !(RUNNING.load(Ordering::Acquire) && running_is(name)) {
         return false;
@@ -6565,7 +6565,7 @@ fn supersede(name: &str) -> bool {
     true
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
 pub mod bootlist {
     //! CHARTER: Kernel — kernel-by-ruling R132 (BOOTLIST: the kernel runs the flight's fixture list from the ESP at the first [desktop] built; seam: kernel-only)
     //!
@@ -6581,7 +6581,7 @@ pub mod bootlist {
     //! the seat typed (`[bootlist] paused why=<lock|login|tests-busy>`). The door is never taken.
     //!
     //! HONEST LIMITS: pass/fail/skip is the verdict tap's PASS/FAIL delta across the fixture, so an abandoned fixture's
-    //! late verdict lands in the delta of whichever fixture runs then; an abandoned fixture keeps running beside the next.
+    //! late verdict lands in the delta of whichever fixture runs then; an abandoned fixture keeps running beside the next. BOOTLISTARM (rmbp-ledger B874): the same module on the aarch64 desktop family (Pi, Orin), started by the same `boot::oldest_say` call (the crystal login's `desktopbuild::build` reaches it there too); the arch differences, the ONE overrun path (`abandon`: the child marked abandoned and named; its later return counted `late=`) and the `@<board>` identity live in `bootlist_arm` at the file's end (LINE-NEUTRAL: every line of this module changed in place). aarch64 limit: a fixture child that never yields holds its core, so the budget fires only when it yields.
     use alloc::string::String;
     use alloc::vec::Vec;
     use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
@@ -6597,7 +6597,7 @@ pub mod bootlist {
     /// The child's stack: the shell-job's (`shelltask.rs` STACK).
     const STACK: usize = 64 * 1024;
     const POLL_MS: u64 = 50;
-    const PROBE: &str = "# probe (BOOTLIST B817)\nprobefast\nprobeslow @1\nHEAVY:\nprobeheavy\n";
+    const PROBE: &str = "# probe (BOOTLIST B817)\nprobefast\nprobeslow @1\nprobeboard @elsewhere\nHEAVY:\nprobeheavy @probe\n";
 
     /// One list line.
     #[derive(Clone, PartialEq, Eq, Debug)]
@@ -6635,14 +6635,14 @@ pub mod bootlist {
         crate::arch::ms()
     }
 
-    fn place() -> usize {
-        crate::arch::smp::worker_cpu(0).unwrap_or(crate::arch::sched::CPU_AUTO)
+    #[allow(dead_code)] fn place() -> usize {
+        super::bootlist_arm::place()
     }
 
     /// The list's text -> its entries. PURE. One verb per line (a leading `tests` is allowed, one argument word kept),
-    /// `#` starts a comment, blank lines skipped, `HEAVY:` puts every later line in the heavy tier, `@<s>` is the budget.
-    pub fn parse(text: &str) -> Vec<Entry> {
-        let mut out = Vec::new();
+    /// `#` starts a comment, blank lines skipped, `HEAVY:` puts every later line in the heavy tier, `@<s>` is the budget, `@<board>` (a letter first) limits the line to the named boards and counts it `other` elsewhere (BOOTLISTARM B874; untagged = every board).
+    pub fn parse(text: &str, board: &str) -> (Vec<Entry>, u32) {
+        let mut out = Vec::new(); let mut other = 0u32;
         let mut heavy_tier = false;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
@@ -6654,9 +6654,9 @@ pub mod bootlist {
                 continue;
             }
             let mut words: Vec<String> = Vec::new();
-            let mut budget_s = BUDGET_DEFAULT_S;
+            let mut budget_s = BUDGET_DEFAULT_S; let (mut tagged, mut mine) = (false, false);
             for w in line.split_whitespace() {
-                if let Some(s) = w.strip_prefix('@') {
+                if let Some(s) = w.strip_prefix('@') { if s.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) { tagged = true; mine |= s.eq_ignore_ascii_case(board); continue; }
                     if let Ok(n) = s.trim_end_matches('s').parse::<u32>() {
                         budget_s = n.clamp(1, BUDGET_MAX_S);
                     }
@@ -6672,10 +6672,10 @@ pub mod bootlist {
             if words.is_empty() {
                 continue;
             }
-            let heavy = heavy_tier || HEAVY_ALWAYS.contains(&words[0].as_str());
+            if tagged && !mine { other += 1; continue; } let heavy = heavy_tier || HEAVY_ALWAYS.contains(&words[0].as_str());
             out.push(Entry { words, budget_s, heavy });
         }
-        out
+        (out, other)
     }
 
     /// Does the heavy tier run on THIS boot? PURE. `boot2` mode: only on a boot whose desktop came from the login
@@ -6689,12 +6689,12 @@ pub mod bootlist {
         if STARTED.swap(true, AcqRel) {
             return;
         }
-        crate::arch::sched::spawn("bootlist", worker, 0, place(), crate::arch::sched::PRIO_NORMAL);
+        super::bootlist_arm::go("bootlist", worker, 0, None);
     }
 
     fn worker(_arg: usize) {
         while !crate::boot::services_up() {
-            crate::arch::sched::sleep_ms(250);
+            super::bootlist_arm::sleep(250);
         }
         wait_clear();
         let mt = crate::shell::vfs_mount_table();
@@ -6708,12 +6708,12 @@ pub mod bootlist {
         let boot2 = matches!(mt.read(HEAVY_PATH, 0, 64), Ok(b) if String::from_utf8_lossy(&b).split_whitespace().next() == Some("boot2"));
         drop(mt);
         let text = String::from_utf8_lossy(&bytes);
-        let entries = parse(&text);
+        let (entries, other) = parse(&text, super::bootlist_arm::board());
         let from = crate::boot::ignite_from();
         let heavy = entries.iter().filter(|e| e.heavy).count();
         serial_println!(
-            "[bootlist] list src={} bytes={} light={} heavy={} heavy_mode={} boot={} cpu={}",
-            LIST_PATH, bytes.len(), entries.len() - heavy, heavy, if boot2 { "boot2" } else { "after" }, from, crate::arch::percpu::this_cpu().cpu_index
+            "[bootlist] list src={} bytes={} light={} heavy={} heavy_mode={} boot={} cpu={} board={} other={}",
+            LIST_PATH, bytes.len(), entries.len() - heavy, heavy, if boot2 { "boot2" } else { "after" }, from, crate::arch::percpu::this_cpu().cpu_index, super::bootlist_arm::board(), other
         );
         let _ = run_list(&entries, exec_tests, true, heavy_now(boot2, from));
     }
@@ -6729,7 +6729,7 @@ pub mod bootlist {
         }
         let n_heavy = entries.iter().filter(|e| e.heavy).count();
         let word = if n_heavy == 0 { "none" } else { "deferred" };
-        summary(&t, word, t0);
+        summary(&t, word, t0); super::bootlist_arm::tally_say();
         said.push((t, word));
         if n_heavy == 0 || !heavy_now {
             return (t, said);
@@ -6738,7 +6738,7 @@ pub mod bootlist {
         for e in entries.iter().filter(|e| e.heavy) {
             one(e, exec, gated, &mut t);
         }
-        summary(&t, "ran", t0);
+        summary(&t, "ran", t0); super::bootlist_arm::tally_say();
         said.push((t, "ran"));
         (t, said)
     }
@@ -6761,7 +6761,7 @@ pub mod bootlist {
         }
         let before = super::verdicts();
         t.ran += 1;
-        crate::arch::sched::spawn_stack("bootlist-fx", child, seq as usize, place(), crate::arch::sched::PRIO_NORMAL, STACK);
+        super::bootlist_arm::go("bootlist-fx", child, seq as usize, Some(STACK));
         let t0 = ms();
         let budget_ms = e.budget_s as u64 * 1000;
         loop {
@@ -6770,13 +6770,13 @@ pub mod bootlist {
             }
             let age = ms().saturating_sub(t0);
             if age >= budget_ms {
-                super::supersede(&e.words[0]);
-                serial_println!(":: {}: -> SKIP(budget {}s) ::", e.words[0].to_ascii_uppercase(), e.budget_s);
+                super::bootlist_arm::abandon(&e.words[0], e.budget_s, seq, LIVE.load(Acquire));
+                // BOOTLISTARM (B874): the run's retirement, the SKIP line and the abandon mark are `bootlist_arm::abandon`'s — ONE overrun path, both arches.
                 t.skip += 1;
                 t.budget_skips += 1;
                 return;
             }
-            crate::arch::sched::sleep_ms(if age < 200 { 5 } else { POLL_MS });
+            super::bootlist_arm::sleep(if age < 200 { 5 } else { POLL_MS });
         }
         let after = super::verdicts();
         if after.1 != before.1 {
@@ -6805,9 +6805,9 @@ pub mod bootlist {
             line.push_str(w);
         }
         LIVE.fetch_add(1, AcqRel);
-        crate::tests_watch::arm(&line);
+        super::bootlist_arm::watch_arm(&line);
         exec(&words);
-        crate::tests_watch::disarm();
+        super::bootlist_arm::watch_disarm(); super::bootlist_arm::late(seq);
         LIVE.fetch_sub(1, AcqRel);
         DONE.fetch_max(seq, AcqRel);
     }
@@ -6841,7 +6841,7 @@ pub mod bootlist {
         let t0 = ms();
         serial_println!("[bootlist] paused why={}", why);
         loop {
-            crate::arch::sched::sleep_ms(250);
+            super::bootlist_arm::sleep(250);
             match blocker() {
                 None => break,
                 Some(w) if w != why => {
@@ -6859,7 +6859,7 @@ pub mod bootlist {
         if super::RUNNING.load(Acquire) && super::running_is("bootlist") {
             probe();
         } else {
-            crate::arch::sched::spawn("bootlist-probe", probe_task, 0, place(), crate::arch::sched::PRIO_NORMAL);
+            super::bootlist_arm::go("bootlist-probe", probe_task, 0, None);
         }
     }
 
@@ -6869,9 +6869,9 @@ pub mod bootlist {
 
     /// The RAM list through the same [`parse`] and [`run_list`]: one budget SKIP and both summaries.
     fn probe() {
-        let entries = parse(PROBE);
+        let (entries, other) = parse(PROBE, "probe"); let (a0, l0) = super::bootlist_arm::counts();
         let heavy = entries.iter().filter(|e| e.heavy).count();
-        let parsed_ok = entries.len() == 3
+        let parsed_ok = other == 1 && entries.len() == 3
             && heavy == 1
             && entries.get(1).map(|e| e.words[0] == "probeslow" && e.budget_s == 1).unwrap_or(false)
             && entries.get(2).map(|e| e.heavy && e.budget_s == BUDGET_DEFAULT_S).unwrap_or(false);
@@ -6885,9 +6885,9 @@ pub mod bootlist {
             && said[1].1 == "ran";
         let w0 = ms();
         while LIVE.load(Acquire) > 0 && ms().saturating_sub(w0) < 4000 {
-            crate::arch::sched::sleep_ms(POLL_MS);
+            super::bootlist_arm::sleep(POLL_MS);
         }
-        let pass = parsed_ok && t.budget_skips == 1 && summary_ok;
+        let (da, dl) = super::bootlist_arm::since(a0, l0); serial_println!("[bootlist] probe abandoned={} late={} other={}", da, dl, other); let pass = parsed_ok && t.budget_skips == 1 && summary_ok && da == 1 && dl == 1;
         serial_println!(
             ":: BOOTLIST: probe entries={} heavy={} budget_skips={} summary={} -> {} ::",
             entries.len(), heavy, t.budget_skips, if summary_ok { "ok" } else { "bad" }, if pass { "PASS" } else { "FAIL" }
@@ -6898,7 +6898,7 @@ pub mod bootlist {
     fn probe_exec(words: &[String]) {
         match words.first().map(|s| s.as_str()) {
             Some("probeslow") => {
-                crate::arch::sched::sleep_ms(2500);
+                super::bootlist_arm::sleep(2500);
                 serial_println!("[bootlist] probe verb=probeslow woke after its budget (abandoned; no verdict)");
             }
             Some(v) => serial_println!("[bootlist] probe verb={} -> PASS", v),
@@ -7174,11 +7174,11 @@ fn textscale_selftest() {
             }
         }
     }
-    let restored = crate::video::text::textscale::step(0).is_some(); textscale_win_close(&mut tsw); // TEXTSCALE3 (B849): the windows this test opened close
+    let restored = crate::video::text::textscale::step(0).is_some(); let rs2 = textscale_reseat2_leg(); textscale_win_close(&mut tsw); // TEXTSCALE3 (B849): the windows this test opened close
     let bumps = crate::video::text::epoch().wrapping_sub(e0);
     let v = if done == 0 && why == "not-applied" {
         "SKIP"
-    } else if done == STEPS.len() && overlap == 0 && kit && fits && restored && tsw.ok() {
+    } else if done == STEPS.len() && overlap == 0 && kit && fits && restored && tsw.ok() && rs2.2 {
         "PASS"
     } else {
         "FAIL"
@@ -7187,8 +7187,8 @@ fn textscale_selftest() {
         why = "no-face";
     }
     serial_println!(
-        ":: TEXTSCALE: steps={} overlap={} cap={} -> {} :: bumps={} moved={} fits={} clipped={} kit={} restored={} why={} stacked={} windows={}/{} frames={}/{}",
-        done, overlap, cap_seen, v, bumps, moved, fits as u8, clipped, if kit { "ok" } else { "bad" }, restored as u8, why, tsw.stacked, tsw.bad, tsw.legs, tsw.frames, tsw.want
+        ":: TEXTSCALE: steps={} overlap={} cap={} -> {} :: bumps={} moved={} fits={} clipped={} kit={} restored={} why={} stacked={} windows={}/{} frames={}/{} reseat={} clipped_after={} seated={} instgui={} drag={}",
+        done, overlap, cap_seen, v, bumps, moved, fits as u8, clipped, if kit { "ok" } else { "bad" }, restored as u8, why, tsw.stacked, tsw.bad, tsw.legs, tsw.frames, tsw.want, tsw.reseat, tsw.clipped_after, tsw.seated, rs2.0, rs2.1
     );
 }
 
@@ -7482,13 +7482,23 @@ struct TsWin {
     frames: usize,
     want: usize,
     stacked: u32,
+    /// TEXTSCALERESEAT (B880): this test opened the login card / the dialog (closes it); the re-seats the two rows took
+    /// over the run (deltas from `r0`, their counters at open), the per-step rows whose height missed `h_at`, the rows
+    /// seated at the last step, and the steps that moved the text epoch.
+    login_own: bool,
+    dlg_own: bool,
+    reseat: u32,
+    clipped_after: u32,
+    seated: u32,
+    moved_steps: u32,
+    r0: (u32, u32),
 }
 
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
 impl TsWin {
     /// No window leg read rows_ok=0, and every moved step reached every opened window as a frame.
     fn ok(&self) -> bool {
-        self.bad == 0 && self.frames >= self.want
+        self.bad == 0 && self.frames >= self.want && self.clipped_after == 0 && (self.seated == 0 || self.reseat > 0 || self.moved_steps == 0)
     }
 }
 
@@ -7500,6 +7510,22 @@ fn textscale_win_open() -> TsWin {
         text.push_str(&alloc::format!("{:02} the quick brown fox jumps over the lazy dog, and the view re-wraps this line at every text size\n", i));
     }
     let fv_own = !crate::video::fileview::is_open() && crate::video::fileview::open_text("textscale", &text).is_ok();
+    // TEXTSCALERESEAT (B880): the login card (the bare shot's form, over the session) and a dialog, seated for the re-seat legs.
+    #[cfg(feature = "login")]
+    let login_own = !crate::video::crystal::login::is_open() && crate::video::crystal::login::shot_bare_open(false);
+    #[cfg(not(feature = "login"))]
+    let login_own = false;
+    let dlg_own = !crate::video::dialog::is_up()
+        && crate::video::dialog::post(crate::video::dialog::Dlg::new(crate::video::dialog::Icon::Caution, b"Text size", b"TEXTSCALERESEAT fixture", b"re-seats at every text step", &[b"OK"]))
+        && {
+            crate::video::dialog::open_now();
+            crate::video::dialog::is_up()
+        };
+    #[cfg(feature = "login")]
+    let r0l = crate::video::crystal::login::reseat_probe().map_or(0, |p| p.0);
+    #[cfg(not(feature = "login"))]
+    let r0l = 0u32;
+    let r0 = (r0l, crate::video::dialog::reseat_probe().map_or(0, |p| p.0));
     TsWin {
         act: crate::video::activity::is_open(),
         fv: crate::video::fileview::is_open(),
@@ -7511,6 +7537,13 @@ fn textscale_win_open() -> TsWin {
         frames: 0,
         want: 0,
         stacked: 0,
+        login_own,
+        dlg_own,
+        reseat: 0,
+        clipped_after: 0,
+        seated: 0,
+        moved_steps: 0,
+        r0,
     }
 }
 
@@ -7554,6 +7587,22 @@ fn textscale_win_leg(t: &mut TsWin, css: i64, e_before: u32) {
         t.frames += (t.act && got.0) as usize + (t.fv && got.1) as usize;
     }
     t.f = now();
+    // TEXTSCALERESEAT (B880): the restyle hooks re-seat the login card (`font_repaint`; the fan-out above is quarry-gated)
+    // and the dialog (`service` -> `font_follow`, idempotent per epoch); each seated row's height must be `h_at` now.
+    #[cfg(all(feature = "login", not(feature = "quarry")))]
+    crate::video::crystal::login::font_repaint();
+    crate::video::dialog::service();
+    #[cfg(feature = "login")]
+    let lp = crate::video::crystal::login::reseat_probe();
+    #[cfg(not(feature = "login"))]
+    let lp: Option<(u32, usize, usize)> = None;
+    let dp = crate::video::dialog::reseat_probe();
+    let show = |p: Option<(u32, usize, usize)>| p.map_or(alloc::string::String::from("skip"), |(_, h, w)| alloc::format!("{}/{}", h, w));
+    serial_println!("[textscale] reseat css={} login={} dialog={}", css, show(lp), show(dp));
+    t.moved_steps += moved as u32;
+    t.seated = lp.is_some() as u32 + dp.is_some() as u32;
+    t.clipped_after += lp.map_or(0, |p| (p.1 != p.2) as u32) + dp.map_or(0, |p| (p.1 != p.2) as u32);
+    t.reseat = lp.map_or(0, |p| p.0.wrapping_sub(t.r0.0)) + dp.map_or(0, |p| p.0.wrapping_sub(t.r0.1));
 }
 
 #[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
@@ -7565,6 +7614,17 @@ fn textscale_win_close(t: &mut TsWin) {
     if t.fv_own {
         crate::video::fileview::close();
         t.fv_own = false;
+    }
+    if t.dlg_own {
+        crate::video::dialog::answer(crate::video::dialog::Answer::Cancel);
+        t.dlg_own = false;
+    }
+    #[cfg(feature = "login")]
+    {
+        if t.login_own {
+            let _ = crate::video::crystal::login::shot_bare_close();
+            t.login_own = false;
+        }
     }
 }
 
@@ -7624,7 +7684,7 @@ fn sinkall_clock(sink: &str, k: usize) -> &'static str {
         let _ = play::pump_until(500, || mixer::sources() == 0);
     }
     let frames = mixer::delivered()[k].wrapping_sub(d0);
-    let ok = closed && backsteps == 0 && moves > 0 && last >= 800 && gap <= play::REFILL_MS;
+    let ok = closed && backsteps == 0 && moves > 0 && last >= 800 && gap <= play::REFILL_MS; #[cfg(all(target_arch = "x86_64", feature = "a2dp"))] let ok = ok || (k == 2 && closed && backsteps == 0 && moves > 0 && last + sinkall_bt_delay_ms() >= 800 && gap <= play::REFILL_MS); // A2DPKAT (rmbp-ledger B870): on BT the 800 ms are played audio before the headset's reported delay (file tail). LINE-NEUTRAL append, before this comment.
     serial_println!(
         "[sinkall] leg player src={} sink={} position_ms={} monotone={} backsteps={} gap_ms={} moves={} closed={} frames={} -> {}",
         src, sink, last, if backsteps == 0 { "ok" } else { "FAIL" }, backsteps, gap, moves, closed as u8, frames, if ok { "ok" } else { "FAIL" }
@@ -7779,4 +7839,542 @@ fn micring3_two(bytes: &[u8], key: &str, wait: &dyn Fn(u64, &dyn Fn() -> bool) -
         out.readers, out.a, out.b, produced, out.split, n_closed, idle4 as u8, ea as u8, eb as u8
     );
     out
+}
+
+// SHADOWDAMAGE (rmbp-ledger B865, BP-video-25) — TAIL-APPENDED: `a11yshadow_leg`'s two more bumpers, on its existing
+// `change(m0, i0)` line. Each bump is made through its own production door and the shadow pass's re-lay is counted: a
+// covered epoch re-lays STALE-only, so `desktop::relay_walks` does not move. CONTRAST: `theme::set_contrast` (the door
+// Settings' toggle and `contrast_follow` take), on and back. LENS (x86 `wc`): `zoom::set(2, ..)` + `zoom::service` (the
+// Settings pass's engage), then the asked factor restored; `-` when the lens was already on or refused to engage.
+// Returns `(contrast_pass, lens_pass, relay_walks)`; go-red: `theme.rs` `set_contrast`'s `contrast_bumped()` back to a
+// bare `EPOCH.fetch_add` -> contrast_pass=0 relay_walks>=1.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn shadowcover_legs() -> (u8, &'static str, u32) {
+    use crate::video::wm::{self, desktop};
+    let pause = || {
+        let t = crate::arch::ms() + 5;
+        while crate::arch::ms() < t {
+            crate::arch::sched::yield_now();
+        }
+    };
+    // The counters, taken BEFORE a bump, so a re-lay another pass takes in the gap is still seen.
+    let snap = || (wm::a11yshadow::relays(), desktop::relay_walks());
+    // Up to 8 composites until the shadow pass has re-laid since `s`: (re-laid, walks since `s`).
+    let settle = |s: (u32, u32)| -> (bool, u32) {
+        let mut relaid = wm::a11yshadow::relays() != s.0;
+        let mut k = 0;
+        while !relaid && k < 8 {
+            wm::composite();
+            relaid = wm::a11yshadow::relays() != s.0;
+            k += 1;
+            if !relaid {
+                pause();
+            }
+        }
+        (relaid, desktop::relay_walks().wrapping_sub(s.1))
+    };
+    let c0 = crate::video::theme::contrast();
+    let s0 = snap();
+    let _ = crate::video::theme::set_contrast(!c0);
+    let (on_relaid, on_walks) = settle(s0);
+    let s1 = snap();
+    let _ = crate::video::theme::set_contrast(c0);
+    let (off_relaid, off_walks) = settle(s1);
+    let cwalks = on_walks + off_walks;
+    let cpass = (on_relaid && off_relaid && cwalks == 0) as u8;
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    let (lpass, lwalks): (&'static str, u32) = {
+        use crate::video::zoom;
+        let (z0, f0) = zoom::want();
+        if z0 >= 2 {
+            ("-", 0)
+        } else {
+            let s = snap();
+            zoom::set(2, f0);
+            zoom::service();
+            if zoom::want().0 != 2 {
+                ("-", 0) // refused: engage named it on the wire and put the ask back to 0
+            } else {
+                let (relaid, w) = settle(s);
+                zoom::set(z0, f0);
+                zoom::service();
+                (if relaid && w == 0 { "1" } else { "0" }, w)
+            }
+        }
+    };
+    #[cfg(not(all(target_arch = "x86_64", feature = "wc")))]
+    let (lpass, lwalks): (&'static str, u32) = ("-", 0);
+    serial_println!(
+        "[a11y] shadowcover contrast_relaid={}/{} lens={} walks=contrast:{},lens:{}",
+        on_relaid as u8, off_relaid as u8, lpass, cwalks, lwalks
+    );
+    (cpass, lpass, cwalks + lwalks)
+}
+
+// A2DPKAT (rmbp-ledger B870; BP-audio-17) — TAIL-APPENDED: `tests sinkall`'s Player clock leg (AUDIOSINK B850's
+// `sinkall_clock`) on the BT output when an A2DP stream is kept (metal only: QEMU has no Bluetooth, the leg skips and
+// says why). On BT `mixer::played_now` subtracts the headset's AVDTP DelayReport (read at stream start), so the clock
+// ends near 1000 ms - delay: the leg's 800 ms bound is taken before the delay (`sinkall_clock`'s folded BT arm). A
+// FAIL fails SINKALL. Wire: `[sinkall] leg player sink=bt -> skip reason=<no-a2dp-stream|bt-alert-failed>` or
+// `[sinkall] leg player sink=bt delay_ms=<n> src=<sink|none> -> run`, then `sinkall_clock`'s `[sinkall] leg player`.
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone", feature = "a2dp"))]
+fn sinkall_bt_clock(bt_live: &str) -> &'static str {
+    if bt_live != "ok" {
+        serial_println!("[sinkall] leg player sink=bt -> skip reason={}", if bt_live == "absent" { "no-a2dp-stream" } else { "bt-alert-failed" });
+        return "skip";
+    }
+    if crate::audio::sink("bt").is_err() {
+        serial_println!("[sinkall] leg player sink=bt -> skip reason=no-a2dp-stream");
+        return "skip";
+    }
+    let d = crate::drivers::ehci::bthid::avdtp::delay_tenth_ms();
+    serial_println!("[sinkall] leg player sink=bt delay_ms={} src={} -> run", sinkall_bt_delay_ms(), if d.is_some() { "sink" } else { "none" });
+    sinkall_clock("bt", 2)
+}
+
+/// A2DPKAT: the streaming headset's reported delay in ms (0 when none).
+#[cfg(all(target_arch = "x86_64", feature = "hda-tone", feature = "a2dp"))]
+fn sinkall_bt_delay_ms() -> u64 {
+    crate::drivers::ehci::bthid::avdtp::delay_tenth_ms().map_or(0, |t| t as u64 / 10)
+}
+
+// ══════════════ SLEEPRESUME (rmbp-ledger B863, BP-power-7/13) — `tests usbsuspend`'s io, hub and key legs — TAIL-APPENDED ══════════════
+
+/// SLEEPRESUME (B863) M1: while SUSPENDED, a TEST UNIT READY to a held storage slot (`io_resume_probe`) must resume its port
+/// and complete. `ok` | `none` (no storage record) | `unheld` | `refused` | `fail` | `busy` (no claim in 1 s) | `phase`; an
+/// `unheld` slot whose port another storage caller already resumed by I/O (`io_resumes` grew) reads `ok`.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_io_leg(in_u3: bool) -> &'static str {
+    use crate::drivers::xhci;
+    if !in_u3 { return "phase"; }
+    let n0 = xhci::io_resumes();
+    let t0 = crate::arch::ms();
+    loop {
+        match xhci::claim() {
+            Ok(mut x) => {
+                let w = x.io_resume_probe();
+                return if w == "unheld" && xhci::io_resumes() != n0 { "ok" } else { w };
+            }
+            Err(_) if crate::arch::ms().wrapping_sub(t0) < 1_000 => crate::arch::sched::sleep_ms(5),
+            Err(_) => return "busy",
+        }
+    }
+}
+
+/// SLEEPRESUME (B863) M3: what the cycle's Stop found on a hub's status-change TD (`requeued` | `kept` | `none`: no hub was
+/// stopped), and after UP the hub's endpoint must still hold a TD for the controller (`lost` otherwise, a FAIL).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_hub_leg(h0: (u32, u32), up: bool) -> &'static str {
+    use crate::drivers::xhci;
+    let (kept, requeued) = xhci::hub_td_counts();
+    let word = if requeued != h0.1 { "requeued" } else if kept != h0.0 { "kept" } else { return "none" };
+    if !up { return word; }
+    let t0 = crate::arch::ms();
+    loop {
+        match xhci::claim() {
+            Ok(x) => return if x.hub_td_armed() == Some(false) { "lost" } else { word },
+            Err(_) if crate::arch::ms().wrapping_sub(t0) < 1_000 => crate::arch::sched::sleep_ms(5),
+            Err(_) => return word,
+        }
+    }
+}
+
+/// SLEEPRESUME (B863) M2: a real login-entry sleep (`lidsleep::key_cycle("loginwindow")`, the entry the login window's
+/// Sleep reaches through `power::sleep_request`) woken by a key: the key is swallowed and the entry is named `login`. Waits
+/// (bounded 2 s) for every driver back UP and restores the backlight level it found if the cycle left another. `ok` | `fail`
+/// | `busy` (already asleep).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_key_leg(wait: &dyn Fn(u64, &dyn Fn() -> bool) -> bool, all_up: &dyn Fn() -> bool) -> &'static str {
+    use crate::video::{backlight, lidsleep};
+    if lidsleep::asleep() { return "busy"; }
+    let found = backlight::readback_now();
+    let woke = lidsleep::key_cycle("loginwindow");
+    let swallowed = lidsleep::wake_key_swallowed();
+    let src = lidsleep::entry_src();
+    let _ = wait(2_000, all_up);
+    let restored = match found {
+        Some(p) if backlight::readback_now() != Some(p) => backlight::set_raw_via(p, "usbsuspend-key").readback == Some(p),
+        _ => true,
+    };
+    serial_println!("[usbsuspend] key leg woke={} swallowed={} src={} backlight_restored={}", woke as u8, swallowed as u8, src, restored as u8);
+    if woke && swallowed && src == "login" && restored { "ok" } else { "fail" }
+}
+
+// AUTOLOCK3 (rmbp-ledger B875, BP-security-18, BP-security-2) — TAIL-APPENDED, so no line above moves. CHARTER: on a
+// build that armed the fixture knob (`autolock_fixture`, UNAOS_AUTOLOCK_FIXTURE=1) `tests autolock` takes its credential
+// from the card's staged fixture file (the arroyo card builder's AUTOLOCK3 step, after CARDREGISTRY, ROOTACL owning it)
+// through the mount table's one read path (BOOTLIST's), never from a compiled literal; the pair still goes to AUTOLOCK2's
+// `users::verify` guard and the one typist (`users::screen_key`). The wire carries the user name and the password's
+// LENGTH only; the RAM copy is zeroed on drop. M2: the keyed root's state (the public `unafs::root_unlocked` /
+// `root_locked`) is read before the lock and after the reopen, and PASS needs it kept — a lock never re-asks the root's key.
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+struct FixtureCred {
+    name: alloc::vec::Vec<u8>,
+    pw: alloc::vec::Vec<u8>,
+}
+
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+impl Drop for FixtureCred {
+    fn drop(&mut self) {
+        for b in self.pw.iter_mut() {
+            unsafe { core::ptr::write_volatile(b as *mut u8, 0) };
+        }
+        core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    }
+}
+
+/// The staged fixture credential: line 1 the user name (1..=NAME_MAX bytes), line 2 the password (non-empty); `\r` trimmed.
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+const AUTOLOCK_CRED_PATH: &str = "/system/fixtures/autolock.cred";
+
+/// AUTOLOCK3: read [`AUTOLOCK_CRED_PATH`] (cap 256 B) through `shell::vfs_mount_table().read`. Absent or malformed ->
+/// the AUTOLOCK SKIP line and `None` (the screen is never raised); held -> one `[lock] fixture credential` line naming
+/// the user and the password's byte count only. The read buffer is zeroed before it is freed.
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn autolock_fixture_cred() -> Option<FixtureCred> {
+    let mut raw = match crate::shell::vfs_mount_table().read(AUTOLOCK_CRED_PATH, 0, 256) {
+        Ok(b) => b,
+        Err(_) => {
+            serial_println!(":: AUTOLOCK: entered=0 leaked_keys=0 reopened=- table_same=- ms=- -> SKIP reason=fixture-file-absent path={} ::", AUTOLOCK_CRED_PATH);
+            return None;
+        }
+    };
+    let n = raw.len();
+    let cred = {
+        let mut lines = raw.split(|&b| b == b'\n').map(|l| l.strip_suffix(&b"\r"[..]).unwrap_or(l));
+        let name: &[u8] = lines.next().unwrap_or_default();
+        let pw: &[u8] = lines.next().unwrap_or_default();
+        if !name.is_empty() && name.len() <= crate::fs::users::NAME_MAX && !pw.is_empty() {
+            Some(FixtureCred { name: name.to_vec(), pw: pw.to_vec() })
+        } else {
+            None
+        }
+    };
+    for b in raw.iter_mut() {
+        unsafe { core::ptr::write_volatile(b as *mut u8, 0) };
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    drop(raw);
+    match cred {
+        Some(c) => {
+            serial_println!(
+                "[lock] fixture credential src={} user={} pw_bytes={} (the password is never printed)",
+                AUTOLOCK_CRED_PATH, core::str::from_utf8(&c.name).unwrap_or("?"), c.pw.len()
+            );
+            Some(c)
+        }
+        None => {
+            serial_println!(":: AUTOLOCK: entered=0 leaked_keys=0 reopened=- table_same=- ms=- -> SKIP reason=fixture-file-malformed path={} bytes={} ::", AUTOLOCK_CRED_PATH, n);
+            None
+        }
+    }
+}
+
+/// AUTOLOCK3 M2: 0 = unkeyed (or no native root compiled), 1 = keyed and open this boot, 2 = keyed and not open.
+/// Read-only: the KB_* words are unafs.rs's.
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn autolock_root_state() -> u8 {
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
+    {
+        if crate::fs::unafs::root_locked() {
+            return 2;
+        }
+        if crate::fs::unafs::root_unlocked() {
+            return 1;
+        }
+    }
+    0
+}
+
+/// AUTOLOCK3 M2: after the reopen the root's state equals `root0` and is not keyed-and-closed.
+/// `[lock] fixture root=<keyed|unkeyed|none|locked> before=<…> kept=<1|0> (the lock never re-asks the root's key)`
+#[cfg(all(feature = "autolock_fixture", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn autolock_root_kept(root0: u8) -> bool {
+    fn label(s: u8) -> &'static str {
+        match s {
+            1 => "keyed",
+            2 => "locked",
+            _ if cfg!(any(target_arch = "aarch64", feature = "unafs")) => "unkeyed",
+            _ => "none",
+        }
+    }
+    let now = autolock_root_state();
+    let kept = now == root0 && now != 2;
+    serial_println!("[lock] fixture root={} before={} kept={} (the lock never re-asks the root's key)", label(now), label(root0), kept as u8);
+    kept
+}
+// ── BOOTLISTARM (rmbp-ledger B874, R132) — TAIL-APPENDED (nothing above moves; `bootlist`'s lines changed in place). The
+// Pi and the Orin run their TESTS.LIST too: `bootlist` widens to the desktop family and its arch differences live here —
+// the scheduler's sleep / spawn / placement and TESTWATCH (x86 only). The overrun is ONE path on both arches ([`abandon`]:
+// the run retired, the B817 SKIP line, the child marked abandoned and named); a marked child's return is counted by
+// [`late`] (`[bootlist] late … late=<n>`), and a tally line rides beside every summary (whose format the x86-wc spec pins).
+// A list line's `@<board>` tags are matched against `boot::OLDEST.0` (rmbp12, pi4, orin): no second board identity.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+mod bootlist_arm {
+    //! CHARTER: Kernel — kernel-by-ruling R132 (BOOTLISTARM: the list runner's arch shims and its one overrun path; seam: kernel-only)
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::sync::atomic::AtomicU32;
+    use core::sync::atomic::Ordering::{AcqRel, Acquire};
+
+    /// The abandoned children not yet returned — `(seq, verb, abandoned at ms)`. A leaf lock: pushed by [`abandon`] (the
+    /// worker), taken once by [`late`] (the child), never held across a print or a spawn.
+    static ABANDONED: crate::sync::Mutex<Vec<(u32, String, u64)>> = crate::sync::Mutex::new(Vec::new());
+    static ABANDON_N: AtomicU32 = AtomicU32::new(0);
+    static LATE_N: AtomicU32 = AtomicU32::new(0);
+
+    fn ms() -> u64 {
+        crate::arch::ms()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn place() -> usize {
+        crate::arch::smp::worker_cpu(0).unwrap_or(crate::arch::sched::CPU_AUTO)
+    }
+
+    /// aarch64 has no `worker_cpu`: the scheduler places the task (load-balanced).
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn place() -> usize {
+        crate::arch::sched::CPU_AUTO
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn sleep(n: u64) {
+        crate::arch::sched::sleep_ms(n);
+    }
+
+    /// aarch64 has no `sleep_ms`: the `arch::ms()` yield loop.
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn sleep(n: u64) {
+        let t0 = ms();
+        while ms().saturating_sub(t0) < n {
+            crate::arch::sched::yield_now();
+        }
+    }
+
+    /// Spawn `f(arg)` at the default priority, on `stack` bytes when given.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn go(name: &'static str, f: fn(usize), arg: usize, stack: Option<usize>) {
+        match stack {
+            Some(sz) => crate::arch::sched::spawn_stack(name, f, arg, place(), crate::arch::sched::PRIO_NORMAL, sz),
+            None => crate::arch::sched::spawn(name, f, arg, place(), crate::arch::sched::PRIO_NORMAL),
+        }
+    }
+
+    /// aarch64's spawns take no priority (the default level) and return the task id.
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn go(name: &'static str, f: fn(usize), arg: usize, stack: Option<usize>) {
+        let _ = match stack {
+            Some(sz) => crate::arch::sched::spawn_stack(name, f, arg, place(), sz),
+            None => crate::arch::sched::spawn(name, f, arg, place()),
+        };
+    }
+
+    /// TESTWATCH around the fixture (x86: the module's gate makes x86 imply `wc`, TESTWATCH's own gate).
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn watch_arm(line: &str) {
+        crate::tests_watch::arm(line);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn watch_disarm() {
+        crate::tests_watch::disarm();
+    }
+
+    /// No TESTWATCH on aarch64 (owed).
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn watch_arm(_line: &str) {}
+
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn watch_disarm() {}
+
+    /// This board's name for the list's `@<board>` tags: `boot::OLDEST.0` (one identity per image line).
+    #[cfg(feature = "login")]
+    pub(super) fn board() -> &'static str {
+        crate::boot::OLDEST.0
+    }
+
+    /// No `login`, no OLDEST: no board-tagged line runs.
+    #[cfg(not(feature = "login"))]
+    pub(super) fn board() -> &'static str {
+        ""
+    }
+
+    /// Beside every summary: the boot's abandoned and late counts.
+    pub(super) fn tally_say() {
+        serial_println!("[bootlist] tally abandoned={} late={}", ABANDON_N.load(Acquire), LATE_N.load(Acquire));
+    }
+
+    /// THE overrun path, both arches: retire the run ([`super::supersede`]), print the B817 SKIP line, and mark the child
+    /// — left running, never killed — abandoned and named, so its return is counted by [`late`]. The caller tallies the skip.
+    pub(super) fn abandon(verb: &str, budget_s: u32, seq: u32, live: u32) {
+        super::supersede(verb);
+        serial_println!(":: {}: -> SKIP(budget {}s) ::", verb.to_ascii_uppercase(), budget_s);
+        ABANDONED.lock().push((seq, String::from(verb), ms()));
+        let n = ABANDON_N.fetch_add(1, AcqRel).wrapping_add(1);
+        serial_println!("[bootlist] abandoned verb={} seq={} task=bootlist-fx live={} abandoned={}", verb, seq, live, n);
+    }
+
+    /// A `bootlist-fx` child returning: if [`abandon`] marked it, count it late and say so.
+    pub(super) fn late(seq: u32) {
+        let hit = {
+            let mut a = ABANDONED.lock();
+            match a.iter().position(|x| x.0 == seq) {
+                Some(i) => Some(a.swap_remove(i)),
+                None => None,
+            }
+        };
+        if let Some((_, verb, at)) = hit {
+            let n = LATE_N.fetch_add(1, AcqRel).wrapping_add(1);
+            serial_println!("[bootlist] late verb={} seq={} over_ms={} late={}", verb, seq, ms().saturating_sub(at), n);
+        }
+    }
+
+    /// `(abandoned, late)` so far (the probe's baseline).
+    pub(super) fn counts() -> (u32, u32) {
+        (ABANDON_N.load(Acquire), LATE_N.load(Acquire))
+    }
+
+    /// `(abandoned, late)` since the baseline [`counts`] returned.
+    pub(super) fn since(a0: u32, l0: u32) -> (u32, u32) {
+        let (a, l) = counts();
+        (a.wrapping_sub(a0), l.wrapping_sub(l0))
+    }
+}
+
+// LEASERENEW (rmbp-ledger B888, BP-net-16) — TAIL-APPENDED. `tests dhcprenew`: one DHCP renewal on the live smoltcp lease
+// (x86 smolnet, QEMU user-net). slirp leases 86400 s, so `smolnet::renew_probe` caps the lease at 8 s through smoltcp's
+// public `set_max_lease_duration` and `reset`s the socket: `[net] dhcp lease lost`, the SOCK-5 lease line, ~4 s later
+// `[net] dhcp renewed lease=<s> ip=same t1_at=<ms>`. Registered beside `tests notelemetry`.
+// Wire: `:: DHCPRENEW: first=<s> renewed=<n> changed=<n> -> PASS|FAIL reason=<no-reacquire|no-renewal|changed> ::`,
+// `-> SKIP reason=<no-stack|no-dhcp-socket|no-lease>`.
+#[cfg(all(feature = "smolnet", target_arch = "x86_64"))]
+fn dhcprenew_selftest() {
+    match crate::smolnet::renew_probe(8, 15_000) {
+        Err(why) => serial_println!(":: DHCPRENEW: first=0 renewed=0 changed=0 -> SKIP reason={} ::", why),
+        Ok((reacquired, first, renewed, changed)) => {
+            let fail = if !reacquired { Some("no-reacquire") } else if renewed == 0 { Some("no-renewal") } else if changed != 0 { Some("changed") } else { None };
+            match fail {
+                None => serial_println!(":: DHCPRENEW: first={} renewed={} changed={} -> PASS ::", first, renewed, changed),
+                Some(why) => serial_println!(":: DHCPRENEW: first={} renewed={} changed={} -> FAIL reason={} ::", first, renewed, changed, why),
+            }
+        }
+    }
+}
+// TEXTSCALERESEAT2 (rmbp-ledger B886; BP-video-40) — TAIL-APPENDED: `tests textscale`'s drag and installer legs, run after
+// the restore and before the fixture windows close. DRAG: a real bottom-edge resize gesture on the fixture dialog through
+// wm's own seam (`resize_begin`, `drag_motion`, `drag_end`), half-way to its capacity and then past it; after each,
+// `dialog::service` (`drag_follow`) must have laid the dialog out at the row's height, and the row never passes capacity.
+// INSTGUI (x86 `wc` + `instgui` only): the installer re-seats at the largest step (`instgui=<h>/<want>`, h == want).
+// Wire: `[textscale] reseat2 drag=<ok|bad|skip> grew=<h0>-><h1> cap=<c> instgui=<h>/<want>|skip`; the summary's tail
+// tokens `instgui=` and `drag=`; a `bad` or a mismatch fails TEXTSCALE.
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))]
+fn textscale_reseat2_leg() -> (alloc::string::String, &'static str, bool) {
+    use crate::video::dialog;
+    fn drag_leg() -> (&'static str, (usize, usize, usize)) {
+        use crate::video::{dialog, wm};
+        dialog::service(); // the restore's text step re-seats the dialog first (`font_follow`, once per epoch)
+        let Some((win, cap, _)) = dialog::drag_probe() else { return ("skip", (0, 0, 0)) };
+        let Some(i) = wm::info(win) else { return ("skip", (0, 0, 0)) };
+        if cap <= i.h {
+            return ("skip", (i.h, i.h, i.h));
+        }
+        let (gx, gy) = (i.x as i32 + 8, (i.y + i.h) as i32);
+        let gesture = |dy: usize| -> bool {
+            if !wm::resize_begin(win, wm::RS_B, gx, gy) {
+                return false;
+            }
+            let _ = wm::drag_motion(gx, gy + dy as i32);
+            let _ = wm::drag_end();
+            dialog::service();
+            true
+        };
+        if !gesture(((cap - i.h) / 2).max(1)) {
+            return ("bad", (i.h, 0, 0));
+        }
+        let (Some(a), Some((_, _, laid_a))) = (wm::info(win), dialog::drag_probe()) else { return ("bad", (i.h, 0, 0)) };
+        if !gesture(cap * 2) {
+            return ("bad", (i.h, a.h, 0));
+        }
+        let (Some(b), Some((_, _, laid_b))) = (wm::info(win), dialog::drag_probe()) else { return ("bad", (i.h, a.h, 0)) };
+        let ok = a.h > i.h && a.h == laid_a && b.h <= cap && b.h == laid_b;
+        (if ok { "ok" } else { "bad" }, (i.h, a.h, b.h))
+    }
+    let (drag, grew) = drag_leg();
+    let (ig, ig_ok) = textscale_instgui_leg();
+    let cap = dialog::drag_probe().map_or(0, |p| p.1);
+    serial_println!("[textscale] reseat2 drag={} grew={}->{} cap={} instgui={}", drag, grew.0, grew.1, cap, ig); let _ = grew.2;
+    (ig, drag, drag != "bad" && ig_ok)
+}
+
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc", feature = "instgui"))]
+fn textscale_instgui_leg() -> (alloc::string::String, bool) {
+    use crate::video::instgui;
+    let own = !instgui::is_open();
+    if own {
+        instgui::open();
+    }
+    if !instgui::is_open() {
+        return (alloc::string::String::from("skip"), true);
+    }
+    let r = crate::video::text::textscale::step(32).map(|_| {
+        instgui::font_repaint();
+        instgui::reseat_probe()
+    });
+    let _ = crate::video::text::textscale::step(0);
+    instgui::font_repaint();
+    if own {
+        instgui::close();
+    }
+    match r {
+        Some(Some((_, h, want))) => (alloc::format!("{}/{}", h, want), h == want),
+        _ => (alloc::string::String::from("skip"), true),
+    }
+}
+
+#[cfg(all(feature = "witness", any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")), not(all(target_arch = "x86_64", feature = "wc", feature = "instgui"))))]
+fn textscale_instgui_leg() -> (alloc::string::String, bool) {
+    (alloc::string::String::from("skip"), true)
+}
+
+// ══════════════ SLEEPRESUME2 (rmbp-ledger B887, BP-power-7/13) — `tests usbsuspend`'s resuspend and tds legs, `tests sleepkey` — TAIL-APPENDED ══════════════
+
+/// SLEEPRESUME2 (B887) M1: still SUSPENDED after the io leg, the port it resumed must be parked again by the suspend
+/// service once idle (`xhci::IO_IDLE_MS`): `ok` (`io_resuspends` grew within the window + 1.5 s) | `miss` (a FAIL) |
+/// `none` (the io leg resumed nothing).
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_resuspend_leg(io: &str, wait: &dyn Fn(u64, &dyn Fn() -> bool) -> bool) -> &'static str {
+    use crate::drivers::xhci;
+    if io != "ok" { return "none"; }
+    let n0 = xhci::io_resuspends();
+    if wait(xhci::IO_IDLE_MS + 1_500, &|| xhci::io_resuspends() != n0) { "ok" } else { "miss" }
+}
+
+/// SLEEPRESUME2 (B887) M3: the Stop's TD checks across every cycle of the test, every interrupt-IN endpoint (hub, keyboard,
+/// pointer): (kept, re-queued TDs, lost endpoints) since `td0`. `lost > 0` is a FAIL.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_tds(td0: (u32, u32, u32)) -> (u32, u32, u32) {
+    let (k, r, l) = crate::drivers::xhci::td_counts();
+    (k.wrapping_sub(td0.0), r.wrapping_sub(td0.1), l.wrapping_sub(td0.2))
+}
+
+/// SLEEPRESUME2 (B887) M2: `tests sleepkey` (aarch64 `desktop_firmware`; R80: registered, never at boot) — a login-entry
+/// sleep (`lidsleep::key_cycle("loginwindow")`, the entry the login window's Sleep reaches through `power::sleep_request`)
+/// woken by a key: the key is swallowed by the one claim and the entry is named `login`.
+/// `:: SLEEPKEY: src=<login|…> input_wake_key_swallowed=<0|1> woke=<0|1> -> PASS|FAIL ::` (` reason=no-drain` unwoken).
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+fn sleepkey_login_selftest() {
+    use crate::video::lidsleep;
+    if lidsleep::asleep() {
+        serial_println!(":: SLEEPKEY: src=- input_wake_key_swallowed=0 woke=0 -> SKIP :: reason=asleep");
+        return;
+    }
+    let woke = lidsleep::key_cycle("loginwindow");
+    let ks = lidsleep::wake_key_swallowed();
+    let src = lidsleep::entry_src();
+    let ok = woke && ks && src == "login";
+    serial_println!(
+        ":: SLEEPKEY: src={} input_wake_key_swallowed={} woke={} -> {} ::{}",
+        src, ks as u8, woke as u8, if ok { "PASS" } else { "FAIL" }, if woke { "" } else { " reason=no-drain" }
+    );
 }

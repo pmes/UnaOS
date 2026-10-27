@@ -1471,7 +1471,7 @@ pub fn init(gpu: &GpuInfo) {
         // GPUBLIT (B371): the takeover succeeded -> the copy engine arms itself (one `:: GPUBLIT:` line).
         #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-takeover"))]
         if let Some(fbo) = fb_offset {
-            crate::drivers::gpu::kepler_gpublit::arm(bar0, bar1_base, bar1_size, vram_size, fbo, &mut vram_allocator);
+            crate::drivers::gpu::kepler_gpublit::arm(bar0, bar1_base, bar1_size, vram_size, fbo, &mut vram_allocator); #[cfg(feature = "nvidia-kepler-cecopy")] { crate::video::blitter::reprobe(); } // KEPLER3D2 (B883): the blitter selection re-probed once after arm (WALL A; LINE-NEUTRAL fold, code first)
         }
         // KEPLERGR (B421): the GR channel's window + the one arming line; `tests kgr` runs it (R80: nothing tests at boot).
         #[cfg(all(target_arch = "x86_64", feature = "nvidia-kepler-takeover"))]

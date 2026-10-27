@@ -22,7 +22,7 @@ REQUIRE \[dpi\] panel=2880x1800@2\.0 src=knob ppi=221
 # ── 2. THE FIVE METAL-SHAPED FIXTURES, each at that panel ─────────────────────────────────────────────────────
 # ZOOM's line names the panel it presented on; PERFHUD's names the scale it laid out at.
 REQUIRE :: ZOOM: z=2 px_ok=3 present_us=\d+ -> PASS :: panel=2880x1800 smooth_us=
-REQUIRE :: PERFHUD: visible=1 paint_us=\d+ fields=9 -> PASS :: .* scale=2\.0 rect=
+REQUIRE :: PERFHUD: visible=1 paint_us=\d+ fields=10 -> PASS :: .* scale=2\.0 rect=
 REQUIRE :: TEXTSCALE: steps=5 overlap=0 cap=\d+ -> PASS ::
 REQUIRE :: SHIMMERIDLE: idle_ms=\d+ ticks=\d+ max_us=\d+ reduce_motion_ticks=\d+ gate_steals=\d+ -> PASS ::
 REQUIRE :: VEILCOST: ratio_p99=\d+\.\d+ shimmer_idle_us=\d+ -> PASS ::

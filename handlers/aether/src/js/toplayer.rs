@@ -483,6 +483,7 @@ const PRELUDE: &str = r#"
         remove(autoList, el);
         remove(hintList, el);
         s.vis = 'hidden';
+        track(); // AETHERFIT2 (SR191): the Rust mirror out of the top layer before the focus restore, as closeDialog
         if (fireEvents) { queueToggle(el, 'open', 'closed'); }
         var prev = s.prevFocus;
         s.prevFocus = null;
@@ -672,6 +673,9 @@ const PRELUDE: &str = r#"
         s.modal = false;
         remove(topLayer, d);
         remove(dialogs, d);
+        // AETHERFIT2 (SR191): HTML's close steps take the dialog out of the top layer BEFORE the focus restore —
+        // the Rust mirror (`is_inert`, which `focus()` refuses on) is synced here, or the restore is refused.
+        track();
         if (s.cw) { s.cw.destroy(); s.cw = null; }
         if (result !== null && result !== undefined) { s.returnValue = String(result); }
         s.closeSource = null;

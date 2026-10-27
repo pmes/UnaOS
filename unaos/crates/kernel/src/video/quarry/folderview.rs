@@ -347,9 +347,9 @@ pub(super) fn enter(cwd: &str) {
         }
         out.is_some()
     };
-    let mt = crate::shell::vfs_mount_table();
-    super::columns::io_note(); // QUARRYIO (B660): the resolve reads the folder's attributes
-    let (v, src, writable) = resolve(&mt, cwd);
+    let pre = super::livedir::pre_view(cwd); // RELISTREAD (B853): an install's resolve, read off every Quarry lock
+    if pre.is_none() { super::columns::io_note(); } // QUARRYIO (B660): the resolve reads the folder's attributes
+    let (v, src, writable) = pre.unwrap_or_else(|| resolve(&crate::shell::vfs_mount_table(), cwd));
     {
         let mut st = COLS.lock();
         st.widths = v.widths;

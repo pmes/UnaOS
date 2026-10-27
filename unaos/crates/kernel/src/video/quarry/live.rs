@@ -441,7 +441,7 @@ enum Pane {
 struct CacheEnt {
     path: String,
     is_dir: bool,
-    rows: Vec<DirEnt>,
+    rows: Vec<DirEnt>, err: Option<String>, // RELISTREAD (B853): a NEGATIVE entry — the off-lock read's failure (`livedir::read_paths` only), generation-stamped like every entry
 }
 
 /// What a press or an Enter decided, carried OUT of the model lock before it is acted on.
@@ -988,7 +988,7 @@ impl Model {
         }
         if let Some(e) = self.cache.iter().find(|e| e.path == path) {
             self.hits += 1;
-            return Ok((e.is_dir, e.rows.clone()));
+            return match &e.err { Some(x) => Err(x.clone()), None => Ok((e.is_dir, e.rows.clone())) }; // RELISTREAD (B853): a negative entry answers its error with no read
         }
         let t0 = crate::arch::now_cycles();
         let out = collect(path);
@@ -1002,7 +1002,7 @@ impl Model {
                 CacheEnt {
                     path: String::from(path),
                     is_dir: *is_dir,
-                    rows: rows.clone(),
+                    rows: rows.clone(), err: None, // RELISTREAD (B853): only the off-lock read caches an error
                 },
             );
         }
@@ -3420,7 +3420,7 @@ pub fn selftest_result() -> Result<(usize, usize), &'static str> {
         if m.cache.len() >= MAX_CACHE {
             m.cache.remove(0);
         }
-        m.cache.push(CacheEnt { path: alloc::format!("/p{}", k), is_dir: true, rows: Vec::new() });
+        m.cache.push(CacheEnt { path: alloc::format!("/p{}", k), is_dir: true, rows: Vec::new(), err: None });
     }
     if m.cache.len() != MAX_CACHE {
         return Err("the directory cache grew past its bound");

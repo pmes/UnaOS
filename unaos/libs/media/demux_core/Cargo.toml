@@ -17,3 +17,4 @@ description = "Stria's container core: ISOBMFF/MP4 (progressive and fragmented) 
 vp8_core = { path = "../vp8_core" }
 av1_core = { path = "../av1_core" }
 audio_core = { path = "../audio_core" }
+h264_core = { path = "../h264_core" }

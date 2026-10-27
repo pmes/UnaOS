@@ -85,7 +85,7 @@ pub struct Bound;
 impl Vol for Bound {
     type D = ::unafs::adapter::BlockAdapter<super::unafs::SdSectorDevice>;
     fn run<R>(&mut self, f: &mut dyn FnMut(&mut UnaFS<Self::D>) -> R) -> Result<R, Why> {
-        super::unafs::with_unafs(|fs| f(fs)).map_err(|_| "busy")
+        super::unafs::with_unafs_write(|fs| f(fs)).map_err(|_| "busy")
     }
     fn put(fs: &mut UnaFS<Self::D>, id: u64, off: u64, data: &[u8]) -> Result<(), Why> {
         super::unafs::diskfull::write_root(fs, "native", id, off, data).map_err(|_| "nospace")

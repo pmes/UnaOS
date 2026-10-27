@@ -2,7 +2,7 @@
 # ARROYO: The Stream that Feeds the River
 # "Ad Astra Per Aspera"
 #
-# Usage:   (BOOTLIST B817: `esp-x86` also stages unaos/fixtures/TESTS.LIST and TESTS.HEAVY onto the ESP when present — the list the kernel runs at [desktop] built)
+# Usage:   (BOOTLIST B817/B874: `esp-x86`, `esp-arm`, `esp-jetson[-img]` and `kernel8` stage unaos/fixtures/TESTS.LIST and TESTS.HEAVY onto the boot FAT when present — `bootlist_stage`, before each verb's card image; the list the kernel runs at [desktop] built)
 #   ./arroyo              Interactive menu
 #   ./arroyo x86           Build & boot x86_64 (GUI window + serial on stdio)
 #   ./arroyo arm           Build & boot aarch64
@@ -25,6 +25,9 @@
 #                          Knob-off byte-identity: build the knob-OFF loadable image at the baseline
 #                          and at this tree IN ONE DIRECTORY and compare them, with an armed control
 #                          probe. Exit 0 identical / 1 moved / 2 no verdict. EXECUTOR-BRIEF §5.
+#   ./arroyo knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]
+#                          The same check for an option_env! knob (UNAOS_PPI, UNAOS_FBW/FBH): both kernels
+#                          AND both UEFI loaders built with the knob UNSET, SET and EMPTY. See THE ENV FORM.
 #   ./arroyo clean         Purge all build artifacts
 
 set -e
@@ -686,6 +689,10 @@ _feats="${_feats}sdw,"
 # KEYBOOT3 (rmbp-ledger B856): UNAOS_KEYBOOT_DEFER=1 defers the first-user keying of the native root (`[keyboot]
 # first-user keying=deferred`); unset keys it. Implies `login` in Cargo.toml. Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_KEYBOOT_DEFER:-}" ] && _feats="${_feats}keyboot_defer,"
+# AUTOLOCK3 (rmbp-ledger B875): UNAOS_AUTOLOCK_FIXTURE=1 — `tests autolock` takes its credential from the card's staged
+# /system/fixtures/autolock.cred (`autolock_fixture_stage` puts it on the x86, Pi and Orin cards' p2 under the same knob, AUTOLOCK4 B885), never a literal. Implies `login` in
+# Cargo.toml. Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_AUTOLOCK_FIXTURE:-}" ] && _feats="${_feats}autolock_fixture,"
 # R77 M3: UNAOS_TESTS_AT_BOOT=1 runs the desktop fixture registry (`tests.rs`) at registration, in boot order, exactly as before the `tests` verb existed; unset, the desktop boots quiet and `tests` fires them. The test/test-arm lanes default it ON (top of this file). Kept in sync with builder/src/main.rs.
 [ -n "${UNAOS_TESTS_AT_BOOT:-}" ] && _feats="${_feats}tests-at-boot,"
 # QUIETBOOT (R80): UNAOS_CENSUS=1 boots with every periodic sampler (`census.rs`) on; unset, the boot prints the boot and `census start <name>` turns one on. The battery verbs export it (head `case`).
@@ -879,6 +886,9 @@ _feats="${_feats}sdw,"
 # KBLIT blit run from `tests ce` / `tests kblit`, never at boot. GPUTESTS (B334): x86_64-only module,
 # stripped by arm_features (k8-reach NA row).
 [ -n "${UNAOS_KEPLER_CE:-}" ] && _feats="${_feats}nvidia-kepler-ce,"
+# KEPLER3D (B877): UNAOS_KEPLERCE=1 arms `tests keplerce` (drivers/gpu/kepler_gpublit.rs tail) — the copy engine's
+# three-job wall fixture. x86_64-only (stripped by arm_features). Kept in sync with builder/src/main.rs.
+[ -n "${UNAOS_KEPLERCE:-}" ] && _feats="${_feats}nvidia-kepler-cecopy,"
 # SHUTRESTORE (rmbp, 2026-09-15) — the SEVEN refuted Kepler rungs whose CODE had been deleted, each
 # back behind a knob of its own. RULINGS R19 (Peter, 2026-09-05): "you take a path that does not work
 # out so you shut it out but after very many boots its discovered that path needs to be open for
@@ -3321,6 +3331,9 @@ arm_features() {
     # conjunction, so the feature emits not one byte of aarch64 CODE; stripping it keeps the aarch64
     # `-Cmetadata` fingerprint unchanged when an x86 knob line carries `UNAOS_KEPLER_CE=1`.
     f="${f//,nvidia-kepler-ce,/,}"
+    # KEPLER3D (B877): `nvidia-kepler-cecopy` is a cfg'd tail of `kepler_gpublit.rs` (x86_64-only module) and a
+    # `target_arch = "x86_64"` registration: not one byte of aarch64 CODE, same strip, same hash argument.
+    f="${f//,nvidia-kepler-cecopy,/,}"
     f="${f#,}"; f="${f%,}"
     if [ -n "$f" ]; then printf -- '--features %s' "$f"; fi
     return 0
@@ -9781,6 +9794,9 @@ esp_x86_unafs_card() {
     # builds nothing. Before ROOTACL: /system takes its owner row after. Witness: `[unafs-tool] filetypes staged n= created= stamp=`.
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- filetypes -i "$vol" || {
         echo -e "${COLOR_RED}❌ CARDREGISTRY: tools/unafs filetypes failed — no card image${COLOR_RESET}"; return 1; }
+    # AUTOLOCK3 (B875) / AUTOLOCK4 (B885): the autolock fixture's credential, ONLY under UNAOS_AUTOLOCK_FIXTURE=1 — the one
+    # staging fn (`autolock_fixture_stage`, beside `bootlist_stage`). Before ROOTACL: /system's owner row covers it.
+    autolock_fixture_stage "$vol" || return 1
     # ROOTACL (rmbp-ledger B456, SECREVIEW F2): every tree the loop put takes the `system` owner row, so the card is
     # system-owned from its first boot — the kernel's native ACL lets only `kernel` and the administrator write there
     # (children carry no row and inherit it; fs/rootacl.rs). The kernel stamps /system/types at the registry build.
@@ -10010,7 +10026,7 @@ esp_x86() {
     echo -e "               data tree -> the USB stick, or \`bg /apps/VUG.ELF\` reports -ENOENT."
     echo -e "   Probe after boot: \`cat hello.txt\` must say 'DATA volume' — if it says anything else,"
     echo -e "               the kernel is reading a stick you did not stage."
-    if [ -n "${UNAOS_UNAFS:-}" ]; then esp_x86_unafs_card || exit $?; fi   # UNAFSX86 M3
+    bootlist_stage "${WORKSPACE_DIR}/target/x86_64_esp"; if [ -n "${UNAOS_UNAFS:-}" ]; then esp_x86_unafs_card || exit $?; fi   # UNAFSX86 M3. BOOTLISTARM (B874): the list is staged BEFORE una-card lays p1 from this tree (B817's dispatch-arm copy ran after it)
 }
 
 # VMIMAGE-1: emit ONE self-contained, distributable bootable disk image — a GPT disk with a FAT32
@@ -10618,11 +10634,47 @@ banner_cert_arm() {   # banner_cert_arm <artifact>
     bash "${WORKSPACE_DIR}/scripts/banner-cert.sh" "$1" "$_bc_feats" || exit $?
 }
 
+# BOOTLISTARM (rmbp-ledger B874, R132): ONE staging fn for the list every media verb carries — `esp-x86`, `esp-arm`,
+# `esp-jetson[-img]`, `kernel8`. It copies unaos/fixtures/TESTS.LIST (and TESTS.HEAVY) VERBATIM into the boot FAT tree:
+# one list for every board; a line's `@<board>` tags (rmbp12 / pi4 / orin = the kernel's `boot::OLDEST`) are filtered by
+# the kernel's `bootlist::parse`, so a card copy edited by hand reads the same everywhere (grammar: PLAYBOOK §4 item 7).
+# Each verb calls it BEFORE its card image is built from the tree. It stages only when a MEDIA dispatch arm set
+# `_BOOTLIST_MEDIA=1` (a shell variable, not a UNAOS_ knob): the QEMU lanes that reuse these fns (test_fat, test_selfhost,
+# fat_img, run_kernel8, test_kernel8, install_pi) never carry a list.
+bootlist_stage() {
+    [ "${_BOOTLIST_MEDIA:-}" = "1" ] || return 0
+    local dir="$1" _bl
+    for _bl in TESTS.LIST TESTS.HEAVY; do
+        if [ -f "${WORKSPACE_DIR}/fixtures/${_bl}" ]; then
+            cp "${WORKSPACE_DIR}/fixtures/${_bl}" "${dir}/${_bl}" && echo "   BOOTLIST (B817/B874): staged ${_bl} onto ${dir#${WORKSPACE_DIR}/} (the kernel runs it at [desktop] built; @board lines filtered there)"
+        fi
+    done
+}
+
+# AUTOLOCK4 (rmbp-ledger B885; AUTOLOCK3 B875's step, MOVED here; BP-security-2, BP-security-18): ONE staging fn for the
+# autolock fixture's credential file /system/fixtures/autolock.cred (line 1 the user, line 2 the password: the pair
+# twoboot.sh types at the first-user form), put into the card's native UnaFS volume — the p2 image `/` is on both arches
+# (fs/bootdisk.rs `bind_root`), NOT the boot FAT `bootlist_stage` fills. $1 = that volume image. Called by the three card
+# builders that make a p2: `esp_x86_unafs_card` (x86), `kernel8` (the Pi's K3 volume) and `jetson_card_image` (the Orin's),
+# before each card image is assembled; `esp_arm` (the virt tree) carries no p2. ONLY under UNAOS_AUTOLOCK_FIXTURE=1 — a
+# fixture credential on the card is a fixture card's, by the loginst rule; unset, no step and every card is byte-identical.
+# A failed write or put returns 1 and the caller fails its card loudly.
+autolock_fixture_stage() {
+    [ -n "${UNAOS_AUTOLOCK_FIXTURE:-}" ] || return 0
+    local img="$1" alf="${WORKSPACE_DIR}/target/autolock-fixture"
+    local m="${WORKSPACE_DIR}/../tools/unafs/Cargo.toml"
+    mkdir -p "$alf" && printf 'una\ncorrect-horse\n' > "$alf/autolock.cred" || {
+        echo -e "${COLOR_RED}❌ AUTOLOCK3: could not write ${alf#${WORKSPACE_DIR}/}/autolock.cred — no card image${COLOR_RESET}"; return 1; }
+    cargo run -q --manifest-path "$m" -- put "$alf" /system/fixtures -i "$img" || {
+        echo -e "${COLOR_RED}❌ AUTOLOCK3: tools/unafs put autolock.cred -> /system/fixtures failed — no card image${COLOR_RESET}"; return 1; }
+    echo -e "${COLOR_YELLOW}⚡ AUTOLOCK3: /system/fixtures/autolock.cred staged user=una (fixture card only)${COLOR_RESET}"
+}
+
 esp_arm() {
     prepare_aarch64
     # BANNERCERT2: the ELF the aarch64 firmware loads, certified before the media is announced.
     banner_cert_arm "${ESP_DIR_ARM}/kernel.elf"
-    pack_source_along "$ESP_DIR_ARM"
+    bootlist_stage "$ESP_DIR_ARM"; pack_source_along "$ESP_DIR_ARM"   # BOOTLISTARM (B874): the list, before the tree is packed or carded
     echo -e "${COLOR_GREEN}✅ aarch64 ESP: ${ESP_DIR_ARM}${COLOR_RESET}"
     echo -e "   kernel.elf sha256: $(sha256_of "${ESP_DIR_ARM}/kernel.elf")"
     [ -f "${ESP_DIR_ARM}/SRC.TGZ" ] && echo -e "   SRC.TGZ    sha256: $(sha256_of "${ESP_DIR_ARM}/SRC.TGZ")"
@@ -10850,7 +10902,7 @@ esp_jetson() {
     # `jetson_card_image` below can only ever copy an ELF that has already answered for its banner.
     banner_cert_arm "${ESP_DIR_ARM}/kernel.elf"
     stage_jetson_el0_images
-    pack_source_along "$ESP_DIR_ARM"
+    bootlist_stage "$ESP_DIR_ARM"; pack_source_along "$ESP_DIR_ARM"   # BOOTLISTARM (B874): the list, before the tree is packed or carded
     echo -e "${COLOR_GREEN}✅ Jetson ESP (tegra): ${ESP_DIR_ARM}${COLOR_RESET}"
     [ -f "${ESP_DIR_ARM}/SRC.TGZ" ] && echo -e "   SRC.TGZ sha256: $(sha256_of "${ESP_DIR_ARM}/SRC.TGZ")"
     cat <<EOF
@@ -11022,6 +11074,7 @@ jetson_card_image() {
     printf 'UNAFSGROW %s MiB volume, %s blocks of 4096 B, staged by arroyo esp-jetson-img\n' \
         "$unafs_mb" "$(( unafs_mb * 256 ))" > "${WORKSPACE_DIR}/target/UNAFSVOL.TXT"
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/UNAFSVOL.TXT" / -i "$ORIN_UNAFS_IMG"
+    autolock_fixture_stage "$ORIN_UNAFS_IMG" || return 1   # AUTOLOCK4 (B885): the fixture credential on the Orin card's p2, knob only
 
     # 3. The card image. ONE partition writer for both platforms; the knobs carry the differences.
     echo -e "${COLOR_YELLOW}⚡ Building the Orin card image: ${img_mb} MiB (FAT ${fat_mb} + unafs ${unafs_mb})...${COLOR_RESET}"
@@ -12550,6 +12603,10 @@ kernel8() {
         K8_FEATS="${K8_FEATS},keyboot_defer"
         echo -e "${COLOR_YELLOW}  • UNAOS_KEYBOOT_DEFER: the first user's password does NOT key the native root (KEYBOOT3 B856; keying deferred)${COLOR_RESET}"
     fi
+    if [ -n "${UNAOS_AUTOLOCK_FIXTURE:-}" ]; then
+        K8_FEATS="${K8_FEATS},autolock_fixture"
+        echo -e "${COLOR_YELLOW}  • UNAOS_AUTOLOCK_FIXTURE: tests autolock reads its credential from the card's /system/fixtures/autolock.cred (AUTOLOCK3 B875; the card's p2 carries it: autolock_fixture_stage, AUTOLOCK4 B885)${COLOR_RESET}"
+    fi
     if [ -n "${UNAOS_BUSREG:-}" ]; then
         K8_FEATS="${K8_FEATS},busreg"
         echo -e "${COLOR_YELLOW}  • UNAOS_BUSREG: BANDY3 fulfiller registration on the bus wire (register verb 127, registrable tags 128..=255, kernel relay; tests bandy3)${COLOR_RESET}"
@@ -12824,8 +12881,9 @@ kernel8() {
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- init -p "$UNAFS_K3_IMG" -s 4
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/K3HELLO.TXT" / -i "$UNAFS_K3_IMG"
     cargo run -q --manifest-path "$UNAFS_CLI_MANIFEST" -- put "${WORKSPACE_DIR}/target/K3PAT.BIN" / -i "$UNAFS_K3_IMG"
+    autolock_fixture_stage "$UNAFS_K3_IMG" || exit 1   # AUTOLOCK4 (B885): the fixture credential on the Pi card's p2, knob only (the EXIT trap releases the K8 lock)
 
-    bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 128 "$UNAFS_K3_IMG"
+    bootlist_stage "$KERNEL8_DIR"; bash "${WORKSPACE_DIR}/scripts/make-pi-img.sh" "$KERNEL8_DIR" "${WORKSPACE_DIR}/target/UnaOS-pi4-baremetal.img" 128 "$UNAFS_K3_IMG"
     echo -e "${COLOR_GREEN}✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.${COLOR_RESET}"
     # BUILD-2: release the coarse build lock now that the image is complete — any QEMU phase that
     # follows (kernel8-test / -run / install) uses per-run ports/logs and may overlap other runs.
@@ -12853,6 +12911,57 @@ run_kernel8() {
         -serial mon:stdio -serial null \
         ${SD_DRIVE} \
         ${UNAOS_QEMU_EXTRA:-}
+}
+
+# PIDESK-SPEC (rmbp-ledger B878): THE ARMED PI DESKTOP'S SPEC, picked in `x86_pick_capture_spec`'s shape. The base
+# battery (pi4-regression.spec) is knob-off, so every `desktop_firmware`-gated line in it is OPTIONAL + FORBID (the
+# DRAG-PI rule) and nothing REQUIREd the Pi desktop's wire. With UNAOS_PIDESK armed (`kernel8-test --desk`), the capture
+# is replayed a SECOND time against pi4-desktop.spec, which carries the positive half (SUITETYPE's second-spec pattern,
+# as pi4-barename.spec). The base spec stays the completion source and owns TRUNCATED; the desktop spec has no COMPLETE.
+PI4_DESKTOP_SPEC="${WORKSPACE_DIR}/scripts/specs/pi4-desktop.spec"
+K8_DESK_SPEC=""   # path of the armed-desktop spec to replay, or "" when none describes this capture
+K8_DESK_WHY=""    # why there is none — printed verbatim in the skip line (empty on the knob-off battery: it stays quiet)
+k8_pick_capture_spec() {
+    K8_DESK_SPEC=""; K8_DESK_WHY=""
+    if [ -z "${UNAOS_PIDESK:-}" ]; then
+        return 0   # the knob-off battery: pi4-regression.spec alone, its output unchanged
+    fi
+    # SHARD-PRESS is `witness`-gated and the drag probes run at registration only under `tests-at-boot`; the lane's
+    # head `case` exports both, so this fires only when a caller cleared one by hand.
+    if [ -z "${UNAOS_WITNESS:-}" ] || [ -z "${UNAOS_TESTS_AT_BOOT:-}" ]; then
+        K8_DESK_WHY="UNAOS_PIDESK is armed but UNAOS_WITNESS='${UNAOS_WITNESS:-}' UNAOS_TESTS_AT_BOOT='${UNAOS_TESTS_AT_BOOT:-}' — pi4-desktop.spec's REQUIREs are the witness-gated SHARD-PRESS and the drag probes that run at registration only under tests-at-boot. Use './arroyo kernel8-test --desk 300' for the gated run."
+        return 0
+    fi
+    K8_DESK_SPEC="$PI4_DESKTOP_SPEC"
+}
+
+# Replay the capture against the armed-desktop spec. $1 = the capture, $2 = the base verdict; returns the COMBINED rc.
+# A base TRUNCATED (3), FLAKE (4) or anything else is returned unchanged and this spec is not asserted (BP-gates-3: a
+# truncated capture is never scored); on a base 0 or 1 the desktop verdict is printed either way and the rc is the base's
+# 1 if it was red, else this spec's.
+k8_desk_replay() {
+    local logf="$1" base="$2" drc=0
+    k8_pick_capture_spec
+    if [ -z "$K8_DESK_SPEC" ]; then
+        if [ -n "$K8_DESK_WHY" ]; then echo -e "${COLOR_YELLOW}⚠ armed-desktop spec replay SKIPPED — ${K8_DESK_WHY}${COLOR_RESET}"; fi
+        return "$base"
+    fi
+    if [ "$base" -ne 0 ] && [ "$base" -ne 1 ]; then
+        echo -e "${COLOR_YELLOW}⚠ armed-desktop spec NOT asserted — the base verdict is rc ${base}, not a complete capture; truncation and flakes are pi4-regression.spec's call.${COLOR_RESET}"
+        return "$base"
+    fi
+    if [ ! -f "$K8_DESK_SPEC" ]; then
+        echo -e "${COLOR_RED}✖ kernel8-test: UNAOS_PIDESK is armed but ${K8_DESK_SPEC} is MISSING — nothing gates the desktop. rc=1${COLOR_RESET}"
+        return 1
+    fi
+    echo -e "${COLOR_CYAN}⚡ mbench: asserting the armed desktop against ${K8_DESK_SPEC#${WORKSPACE_DIR}/}${COLOR_RESET}"
+    python3 "${WORKSPACE_DIR}/scripts/mbench.py" --replay "$logf" --spec "$K8_DESK_SPEC" --platform pi || drc=$?
+    if [ "$drc" -ne 0 ]; then
+        echo -e "${COLOR_RED}✖ kernel8-test: the armed desktop's spec did not pass (rc ${drc}) — a REQUIREd desktop_firmware line is"
+        echo -e "  missing or reads FAIL (its FAIL forbid in pi4-regression.spec says which). Spec: ${K8_DESK_SPEC#${WORKSPACE_DIR}/}${COLOR_RESET}"
+    fi
+    if [ "$base" -ne 0 ]; then return "$base"; fi
+    return "$drc"
 }
 
 # Headless raspi4b test: boot kernel8.img, capture PL011 -> target/serial-pi.log and a QMP
@@ -13099,6 +13208,7 @@ test_kernel8() {
                 echo -e "  in the path that word takes. Script: ${k8_script}${COLOR_RESET}"
             fi
         fi
+        k8_desk_replay "$logf" "$mrc" || mrc=$?   # PIDESK-SPEC (B878): the armed desktop's spec, after the base (and typed) verdicts; rc 3/4 pass through
         return $mrc
     fi
     echo -e "${COLOR_YELLOW}  • UNAOS_K8T_ASSERT=0 — spec assertion SKIPPED; this run carries no verdict${COLOR_RESET}"
@@ -13895,6 +14005,24 @@ battery() {
 #      named, build failure, a control that did not fire, a scored build that compiled something
 #      other than the kernel crate (or nothing), or a user_blob that moved between the two scored
 #      builds. A 2 is never a pass.
+#
+# THE ENV FORM (`./arroyo knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]`, PANELKNOB2 rmbp-ledger B867). A
+# cargo feature is not the only knob: `UNAOS_PPI` (video/dpi.rs `mod panelknob`) and `UNAOS_FBW`/`UNAOS_FBH`
+# (crates/bootloader `mod panelknob`, arch/aarch64/mailbox.rs) are `option_env!` reads, so no feature set names
+# them and the form above has nothing to remove. THE RULE for such a knob: the images built with it UNSET equal
+# the baseline's (the classic claim), an EMPTY value (`NAME=`) builds the same bytes as UNSET (every parser here
+# folds `Some("")` to off, and arroyo's own `[ -n "${UNAOS_X:-}" ]` reads empty as unset), and SET moves at least
+# one image (the control — a knob that moves nothing is misspelled or dead, and gets no verdict). Each NAME must
+# be read by an `option_env!("NAME")` under crates/kernel/src or crates/bootloader/src, the two crates this verb
+# builds (the env form's "declared" check), and is unset in this process before the first build. FOUR phases —
+# [1/4] baseline UNSET and [2/4] tree UNSET (scored, warm-first exactly as above), [3/4] tree SET (control),
+# [4/4] tree EMPTY — and each builds FOUR artifacts: the two kernel loadable images and the x86_64-unknown-uefi
+# and aarch64-unknown-uefi `bootloader.efi` (the loader reads the panel knobs; GATE-BOOTLOADER's command, with
+# $BOOTLOADER_FEATURES, in the same throwaway tree and target dir). A PE carries a link TimeDateStamp and a
+# CheckSum that say nothing about the code, so `_knoboff_pe_norm` zeroes those 8 bytes in the COMPARED COPY
+# (COFF header +4 = e_lfanew+8; optional header +64 = e_lfanew+88) — the PE analogue of objcopy-ing the ELF.
+# COST: 16 compiles a run (4 per phase; a cold key adds the warm-up pass), so every phase prints its wall time.
+# Exit status as above; an EMPTY that differs from UNSET is a 1 naming the artifact.
 _knoboff_arm_csv() {
     local _save="$KERNEL_FEATURES" _out
     KERNEL_FEATURES="${1:+--features $1}"
@@ -13915,26 +14043,48 @@ _knoboff_arm_csv() {
 # run log, which keeps the existing `tail -20 "$LOG"` diagnostics working unchanged.
 _knoboff_flat() {
     local _tree="$1" _tgt="$2" _arch="$3" _feats="$4" _out="$5" _log="$6" _census="${7:-}"
-    local _tspec _elf _TOOLBIN _rc=0
+    local _tspec _elf _TOOLBIN _rc=0 _crate=kernel _uefi=0
     _TOOLBIN="$(rustc +nightly --print sysroot)/lib/rustlib/$(rustc +nightly -vV | awk '/host/{print $2}')/bin"
     case "$_arch" in
         x86) _tspec="../../x86_64-unaos.json"; _elf="$_tgt/x86_64-unaos/release/unaos-kernel" ;;
         arm) _tspec="../../aarch64-unaos.json"; _elf="$_tgt/aarch64-unaos/release/unaos-kernel" ;;
+        # THE ENV FORM's loaders (B867): GATE-BOOTLOADER's / prepare_aarch64's command, in the same tree and target dir.
+        uefi-x86) _tspec="x86_64-unknown-uefi";  _elf="$_tgt/x86_64-unknown-uefi/release/bootloader.efi";  _crate=bootloader; _uefi=1 ;;
+        uefi-arm) _tspec="aarch64-unknown-uefi"; _elf="$_tgt/aarch64-unknown-uefi/release/bootloader.efi"; _crate=bootloader; _uefi=1 ;;
         *)   echo "knoboff: bad arch $_arch" >&2; return 2 ;;
     esac
     local _fargs=""; [ -n "$_feats" ] && _fargs="--features $_feats"
+    local _zflags="$NIGHTLY_FLAGS"
+    if [ "$_uefi" -eq 1 ]; then _zflags="-Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem"; fi
     local _step="${_log}.step"
     : > "$_step"
-    ( cd "$_tree/unaos/crates/kernel" \
+    ( cd "$_tree/unaos/crates/$_crate" \
       && CARGO_TARGET_DIR="$_tgt" cargo +nightly build --release \
-         --target "$_tspec" $NIGHTLY_FLAGS $_fargs ) >"$_step" 2>&1 || _rc=1
+         --target "$_tspec" $_zflags $_fargs ) >"$_step" 2>&1 || _rc=1
     if [ -n "$_census" ]; then
         awk '$1 == "Compiling" { print $2 }' "$_step" | sort -u | paste -sd, - > "$_census"
     fi
     cat "$_step" >> "$_log"; rm -f "$_step"
     [ $_rc -eq 0 ] || return 1
     [ -f "$_elf" ] || return 1
+    if [ "$_uefi" -eq 1 ]; then
+        cp -f "$_elf" "$_out" >>"$_log" 2>&1 || return 1
+        _knoboff_pe_norm "$_out" || { echo "knoboff: $_out is not a PE image" >>"$_log"; return 1; }
+        return 0
+    fi
     "$_TOOLBIN/llvm-objcopy" -O binary "$_elf" "$_out" >>"$_log" 2>&1 || return 1
+    return 0
+}
+
+# THE ENV FORM (B867): zero a PE image's COFF TimeDateStamp (e_lfanew+8) and optional-header CheckSum
+# (e_lfanew+88) in place — the copy knoboff compares, never the build's own .efi. 1 = not a PE.
+_knoboff_pe_norm() {
+    local _f="$1" _pe
+    _pe="$(od -An -tu4 -j60 -N4 "$_f" 2>/dev/null | tr -d ' \n')"
+    case "$_pe" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(dd if="$_f" bs=1 skip="$_pe" count=2 2>/dev/null)" = "PE" ] || return 1
+    printf '\0\0\0\0' | dd of="$_f" bs=1 seek=$((_pe + 8)) conv=notrunc 2>/dev/null || return 1
+    printf '\0\0\0\0' | dd of="$_f" bs=1 seek=$((_pe + 88)) conv=notrunc 2>/dev/null || return 1
     return 0
 }
 
@@ -13960,7 +14110,7 @@ _knoboff_census_empty() { [ -z "$(tr -d '[:space:]' < "$1" 2>/dev/null)" ]; }
 _knoboff_census_foreign() {
     local _f
     for _f in "$@"; do cat "$_f" 2>/dev/null || true; echo; done \
-        | tr ',' '\n' | sed '/^$/d' | { grep -vx 'unaos-kernel' || true; } | sort -u | paste -sd, -
+        | tr ',' '\n' | sed '/^$/d' | { grep -vxE 'unaos-kernel|bootloader' || true; } | sort -u | paste -sd, -
 }
 
 # FORCE THE SCORED KERNEL COMPILE, so that "this run measured it" is true.
@@ -13976,6 +14126,7 @@ _knoboff_census_foreign() {
 # than a claim about the cache.
 _knoboff_touch_kernel() {
     touch "$1/unaos/crates/kernel/src/main.rs" "$1/unaos/crates/kernel/src/lib.rs" 2>/dev/null || true
+    touch "$1/unaos/crates/bootloader/src/main.rs" 2>/dev/null || true   # THE ENV FORM's scored loader compile (B867)
 }
 
 # sha256 of the `include_bytes!`d EL0 payload, or "absent". See the USER_BLOB paragraph in the header.
@@ -14002,27 +14153,53 @@ _knoboff_blob_id() {
 # $9 census-arm.  Sets _kb_rc_x / _kb_rc_a (0 = built).
 _knoboff_scored_pair() {
     local _lbl="$1" _tree="$2" _tgt="$3" _fx="$4" _fa="$5" _ox="$6" _oa="$7" _cx="$8" _ca="$9"
+    # THE ENV FORM (B867): $10-$13 = loader out-x86, out-arm, census-x86, census-arm; built in the same pass, their
+    # censuses join the warm test. Absent (the feature form), nothing below differs from the two-arch path.
+    local _olx="${10:-}" _ola="${11:-}" _clx="${12:-}" _cla="${13:-}"
     _kb_rc_x=0; _knoboff_flat "$_tree" "$_tgt" x86 "$_fx" "$_ox" "$LOG" "$_cx" || _kb_rc_x=$?
     _kb_rc_a=0; _knoboff_flat "$_tree" "$_tgt" arm "$_fa" "$_oa" "$LOG" "$_ca" || _kb_rc_a=$?
-    [ $_kb_rc_x -eq 0 ] && [ $_kb_rc_a -eq 0 ] || return 0
-    if [ -z "$(_knoboff_census_foreign "$_cx" "$_ca")" ] \
+    _kb_rc_lx=0; _kb_rc_la=0
+    if [ -n "$_olx" ]; then
+        _knoboff_flat "$_tree" "$_tgt" uefi-x86 "${kb_lf:-}" "$_olx" "$LOG" "$_clx" || _kb_rc_lx=$?
+        _knoboff_flat "$_tree" "$_tgt" uefi-arm "${kb_lf:-}" "$_ola" "$LOG" "$_cla" || _kb_rc_la=$?
+    fi
+    [ $_kb_rc_x -eq 0 ] && [ $_kb_rc_a -eq 0 ] && [ $_kb_rc_lx -eq 0 ] && [ $_kb_rc_la -eq 0 ] || return 0
+    local _lwarm=1
+    if [ -n "$_olx" ]; then
+        if [ -n "$(_knoboff_census_foreign "$_clx" "$_cla")" ] || _knoboff_census_empty "$_clx" || _knoboff_census_empty "$_cla"; then _lwarm=0; fi
+    fi
+    if [ "$_lwarm" -eq 1 ] && [ -z "$(_knoboff_census_foreign "$_cx" "$_ca")" ] \
        && ! _knoboff_census_empty "$_cx" && ! _knoboff_census_empty "$_ca"; then
         return 0        # exactly one kernel compile per arch with the deps warm: this IS the scored build
     fi
+    if [ -n "$_olx" ]; then
+    echo -e "   ${COLOR_YELLOW}↻ $_lbl: first pass compiled [$(_knoboff_census_show "$_cx")|$(_knoboff_census_show "$_ca")|$(_knoboff_census_show "$_clx")|$(_knoboff_census_show "$_cla")] —${COLOR_RESET}"
+    else
     echo -e "   ${COLOR_YELLOW}↻ $_lbl: first pass compiled [$(_knoboff_census_show "$_cx")|$(_knoboff_census_show "$_ca")] —${COLOR_RESET}"
+    fi
     echo -e "   ${COLOR_YELLOW}  it paid for the deps, or it compiled nothing at all. Either way it is a WARM-UP and its${COLOR_RESET}"
     echo -e "   ${COLOR_YELLOW}  images are discarded: rebuilding the kernel alone against the now-warm cache and scoring${COLOR_RESET}"
     echo -e "   ${COLOR_YELLOW}  THAT — one extra kernel-only compile per arch, which is what the claim costs.${COLOR_RESET}"
     _knoboff_touch_kernel "$_tree"
     _kb_rc_x=0; _knoboff_flat "$_tree" "$_tgt" x86 "$_fx" "$_ox" "$LOG" "$_cx" || _kb_rc_x=$?
     _kb_rc_a=0; _knoboff_flat "$_tree" "$_tgt" arm "$_fa" "$_oa" "$LOG" "$_ca" || _kb_rc_a=$?
+    if [ -n "$_olx" ]; then
+        _kb_rc_lx=0; _knoboff_flat "$_tree" "$_tgt" uefi-x86 "${kb_lf:-}" "$_olx" "$LOG" "$_clx" || _kb_rc_lx=$?
+        _kb_rc_la=0; _knoboff_flat "$_tree" "$_tgt" uefi-arm "${kb_lf:-}" "$_ola" "$LOG" "$_cla" || _kb_rc_la=$?
+    fi
     return 0
 }
 
 knoboff() {
     local feat="${1:-}" baseline="${2:-}"
-    if [ -z "$feat" ]; then
+    # THE ENV FORM (B867): `knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]` — see its paragraph in the header.
+    local kb_env=0 envspec="" kb_lbl="${1:-}"
+    if [ "$feat" = env ]; then kb_env=1; envspec="${2:-}"; baseline="${3:-}"; kb_lbl="env ${envspec}"; fi
+    if [ -z "$feat" ] || { [ "$kb_env" -eq 1 ] && [ -z "$envspec" ]; }; then
         echo -e "${COLOR_RED}usage: ./arroyo knoboff <feature> [baseline-ref]${COLOR_RESET}"
+        echo -e "${COLOR_RED}       ./arroyo knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]${COLOR_RESET}"
+        echo "       env NAME=VAL   an option_env! knob (UNAOS_PPI, UNAOS_FBW/FBH): both kernels and both"
+        echo "                      UEFI loaders built UNSET, SET and EMPTY (THE ENV FORM)"
         echo "       <feature>      a cargo feature declared in crates/kernel/Cargo.toml [features]"
         echo "       [baseline-ref] default: HEAD when the tree is dirty, HEAD~1 when it is clean."
         echo "                      A MERGE HEAD has no default — HEAD~1 is the first parent, which is"
@@ -14039,12 +14216,37 @@ knoboff() {
     # byte-identity for a name cargo has never heard of is measuring nothing.
     local declared
     declared="$(awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[A-Za-z0-9_-]+[ \t]*=/{sub(/[ \t]*=.*/,"");print}' "$CARGO_TOML" | sort -u)"
-    if ! printf '%s\n' "$declared" | grep -qx -- "$feat"; then
+    if [ "$kb_env" -eq 0 ] && ! printf '%s\n' "$declared" | grep -qx -- "$feat"; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — '$feat' is not declared in crates/kernel/Cargo.toml [features].${COLOR_RESET}"
         echo -e "         A cfg on an undeclared feature is always false, so nothing here could be measured."
         echo -e "         Declared: $(printf '%s' "$declared" | tr '\n' ' ')"
         return 2
     fi
+    # (1, ENV FORM) READ. The env form's "declared": every NAME is a UNAOS_ knob with a non-empty value, read by an
+    # `option_env!("NAME")` in one of the two crates built here. A name nothing reads cannot move an image, and a
+    # misspelling would otherwise reach the control and read as "dead knob" instead of "no such knob".
+    local kb_pairs="" kb_names="" kb_pair kb_n kb_v
+    if [ "$kb_env" -eq 1 ]; then
+        for kb_pair in ${envspec//,/ }; do
+            kb_n="${kb_pair%%=*}"; kb_v="${kb_pair#*=}"
+            if [ "$kb_n" = "$kb_pair" ] || [ -z "$kb_v" ] || ! printf '%s' "$kb_n" | grep -qx 'UNAOS_[A-Z0-9_]\{1,\}'; then
+                echo -e "${COLOR_RED}knoboff: NO VERDICT — '$kb_pair' is not NAME=VAL with NAME a UNAOS_ knob and VAL non-empty.${COLOR_RESET}"
+                return 2
+            fi
+            if ! grep -rqF "option_env!(\"$kb_n\")" "$WORKSPACE_DIR/crates/kernel/src" "$WORKSPACE_DIR/crates/bootloader/src" 2>/dev/null; then
+                echo -e "${COLOR_RED}knoboff: NO VERDICT — no option_env!(\"$kb_n\") under crates/kernel/src or crates/bootloader/src.${COLOR_RESET}"
+                echo -e "         Nothing this verb builds reads '$kb_n', so no image could move; a feature knob takes the"
+                echo -e "         first form: ${COLOR_YELLOW}./arroyo knoboff <feature>${COLOR_RESET}"
+                return 2
+            fi
+            kb_pairs="$kb_pairs $kb_pair"; kb_names="$kb_names $kb_n"
+        done
+        if [ -z "$kb_names" ]; then
+            echo -e "${COLOR_RED}knoboff: NO VERDICT — the env spec '$envspec' names no knob.${COLOR_RESET}"; return 2
+        fi
+        for kb_n in $kb_names; do unset "$kb_n"; done   # UNSET is the scored state; the caller may have exported it
+    fi
+    local kb_lf="${BOOTLOADER_FEATURES#--features }"   # the loaders' feature csv (env form; GATE-BOOTLOADER's set)
 
     # (2) ENV — asked as a FEATURE-SET question, not as an env-var-name question. The first cut of this
     # check scanned for `UNAOS_*` in the environment and refused; it fired on every single run, because
@@ -14136,6 +14338,7 @@ knoboff() {
     for f in ${base_feats//,/ }; do [ "$f" = "$feat" ] && continue; acc="$acc$f,"; done
     local off_csv="${acc%,}"
     local on_csv="${off_csv:+$off_csv,}$feat"
+    if [ "$kb_env" -eq 1 ]; then off_csv="$base_feats"; on_csv="$base_feats"; fi   # ENV FORM: the knob is the env, not a feature
     local off_arm on_arm
     off_arm="$(_knoboff_arm_csv "$off_csv")"
     on_arm="$(_knoboff_arm_csv "$on_csv")"
@@ -14163,9 +14366,11 @@ knoboff() {
     # A feature that is ON by default inverts the question — knob-off then means REMOVING shipped code,
     # and the baseline it is compared against still contains it. Say so rather than printing a verdict
     # whose words ("knob-off byte-identical") mean something else here.
+    if [ "$kb_env" -eq 0 ]; then
     case ",${default_csv}," in
         *",${feat},"*) echo -e "${COLOR_YELLOW}⚠ '${feat}' is ON by default: this run measures REMOVING it, not adding it.${COLOR_RESET}" ;;
     esac
+    fi
 
     # (5b) SCRATCH — PER CALLER, never one directory per bench (SO34; see this verb's header). The
     # key is a digest of the CALLER'S worktree path, so two executors on one box are two keys and
@@ -14210,11 +14415,15 @@ knoboff() {
         return 0
     }
 
-    echo -e "${COLOR_PURPLE}══ knoboff: $feat ══${COLOR_RESET}"
+    echo -e "${COLOR_PURPLE}══ knoboff: $kb_lbl ══${COLOR_RESET}"
     echo -e "   baseline   ${base_sha}  $(cd "$REPO" && git log --format=%s -1 "$base_sha" | cut -c1-64)"
     echo -e "   current    ${head_sha}$([ "$dirty" -eq 1 ] && echo ' + uncommitted diff')"
     echo -e "   knob-off   x86: [${off_csv:-<none>}]   arm: [${off_arm:-<none>}]"
     echo -e "   knob-on    x86: [${on_csv}]   arm: [${on_arm:-<none>}]"
+    if [ "$kb_env" -eq 1 ]; then
+        echo -e "   env knob  ${kb_pairs}   phases: UNSET (baseline, tree) · SET (control) · EMPTY (tree)"
+        echo -e "   loaders    uefi-x86 + uefi-arm bootloader.efi, features [${kb_lf:-<none>}], PE stamp+checksum zeroed"
+    fi
     echo -e "   tree       $TREE   (all three builds of THIS run go HERE — one directory, no path delta)"
     echo -e "   caller     $REPO   (the key above: no other executor's run shares this directory)"
     echo -e "   run        $RUN"
@@ -14261,31 +14470,74 @@ knoboff() {
     # for identity — only for inequality).
     local C_BX="$RUN/census-base-x86.txt" C_BA="$RUN/census-base-arm.txt"
     local C_CX="$RUN/census-cur-x86.txt"  C_CA="$RUN/census-cur-arm.txt"
-    local _kb_rc_x=0 _kb_rc_a=0
+    local _kb_rc_x=0 _kb_rc_a=0 _kb_rc_lx=0 _kb_rc_la=0
+    # THE ENV FORM's artifacts (B867): the two loaders of each phase, the EMPTY phase's four, the loader censuses.
+    local F_BLX="$RUN/flat-base-uefi-x86.efi"  F_BLA="$RUN/flat-base-uefi-arm.efi"
+    local F_CLX="$RUN/flat-cur-uefi-x86.efi"   F_CLA="$RUN/flat-cur-uefi-arm.efi"
+    local F_OLX="$RUN/flat-armed-uefi-x86.efi" F_OLA="$RUN/flat-armed-uefi-arm.efi"
+    local F_EX="$RUN/flat-empty-x86.bin" F_EA="$RUN/flat-empty-arm.bin" F_ELX="$RUN/flat-empty-uefi-x86.efi" F_ELA="$RUN/flat-empty-uefi-arm.efi"
+    local C_BLX="$RUN/census-base-uefi-x86.txt" C_BLA="$RUN/census-base-uefi-arm.txt"
+    local C_CLX="$RUN/census-cur-uefi-x86.txt"  C_CLA="$RUN/census-cur-uefi-arm.txt"
+    local kb_lb=() kb_lc=() kb_np=3 kb_off="knob OFF" kb_t0=$SECONDS kb_t=$SECONDS
+    local rc_base_lx=0 rc_base_la=0 rc_cur_lx=0 rc_cur_la=0 rc_on_lx=0 rc_on_la=0
+    local rc_e_x=0 rc_e_a=0 rc_e_lx=0 rc_e_la=0
+    if [ "$kb_env" -eq 1 ]; then
+        kb_lb=( "$F_BLX" "$F_BLA" "$C_BLX" "$C_BLA" ); kb_lc=( "$F_CLX" "$F_CLA" "$C_CLX" "$C_CLA" )
+        kb_np=4; kb_off="knob UNSET (${kb_names# })"
+    fi
+    # The env form's per-phase wall time (16 compiles a run: the bench reads the cost before it pays it).
+    _knoboff_took() { if [ "$kb_env" -eq 1 ]; then echo -e "   ⏱ $1 took $((SECONDS - kb_t)) s (run so far $((SECONDS - kb_t0)) s)"; fi; kb_t=$SECONDS; return 0; }
 
     # [1/3] THE SCORED BASELINE. `_knoboff_scored_pair` warms first and scores second whenever the
     # first pass was not already a warm kernel-only compile; see its header for why the warm-up is
     # conditional rather than unconditional.
-    echo -e "${COLOR_YELLOW}⚡ [1/3] baseline ${base_sha:0:8}, knob OFF (scored)...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}⚡ [1/${kb_np}] baseline ${base_sha:0:8}, ${kb_off} (scored)...${COLOR_RESET}"
     if ! _knoboff_checkout "$base_sha" ""; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — could not check out $base_sha in $TREE; see $LOG${COLOR_RESET}"; _knoboff_bye 2; return 2; fi
     local BLOB_B; BLOB_B="$(_knoboff_blob_id "$TREE")"
-    _knoboff_scored_pair "baseline" "$TREE" "$TGT" "$off_csv" "$off_arm" "$F_BX" "$F_BA" "$C_BX" "$C_BA"
-    rc_base_x=$_kb_rc_x; rc_base_a=$_kb_rc_a
+    _knoboff_scored_pair "baseline" "$TREE" "$TGT" "$off_csv" "$off_arm" "$F_BX" "$F_BA" "$C_BX" "$C_BA" "${kb_lb[@]}"
+    rc_base_x=$_kb_rc_x; rc_base_a=$_kb_rc_a; rc_base_lx=$_kb_rc_lx; rc_base_la=$_kb_rc_la
+    _knoboff_took "[1/${kb_np}]"
 
-    echo -e "${COLOR_YELLOW}⚡ [2/3] current tree, knob OFF (scored)...${COLOR_RESET}"
+    echo -e "${COLOR_YELLOW}⚡ [2/${kb_np}] current tree, ${kb_off} (scored)...${COLOR_RESET}"
     if ! _knoboff_checkout "$head_sha" "$PATCHF"; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — the working diff did not apply onto $head_sha in $TREE; see $LOG${COLOR_RESET}"; _knoboff_bye 2; return 2; fi
     local BLOB_C; BLOB_C="$(_knoboff_blob_id "$TREE")"
-    _knoboff_scored_pair "tree" "$TREE" "$TGT" "$off_csv" "$off_arm" "$F_CX" "$F_CA" "$C_CX" "$C_CA"
-    rc_cur_x=$_kb_rc_x; rc_cur_a=$_kb_rc_a
+    _knoboff_scored_pair "tree" "$TREE" "$TGT" "$off_csv" "$off_arm" "$F_CX" "$F_CA" "$C_CX" "$C_CA" "${kb_lc[@]}"
+    rc_cur_x=$_kb_rc_x; rc_cur_a=$_kb_rc_a; rc_cur_lx=$_kb_rc_lx; rc_cur_la=$_kb_rc_la
+    _knoboff_took "[2/${kb_np}]"
 
+    if [ "$kb_env" -eq 1 ]; then
+        echo -e "${COLOR_YELLOW}⚡ [3/4] current tree, knob SET${kb_pairs} (control — the comparison must be able to come out unequal)...${COLOR_RESET}"
+        for kb_pair in $kb_pairs; do export "$kb_pair"; done
+    else
     echo -e "${COLOR_YELLOW}⚡ [3/3] current tree, knob ON (control — the comparison must be able to come out unequal)...${COLOR_RESET}"
+    fi
     rc_on_x=0; _knoboff_flat "$TREE" "$TGT" x86 "$on_csv" "$F_OX" "$LOG" || rc_on_x=$?
     rc_on_a=0; _knoboff_flat "$TREE" "$TGT" arm "$on_arm" "$F_OA" "$LOG" || rc_on_a=$?
+    if [ "$kb_env" -eq 1 ]; then
+        _knoboff_flat "$TREE" "$TGT" uefi-x86 "$kb_lf" "$F_OLX" "$LOG" || rc_on_lx=$?
+        _knoboff_flat "$TREE" "$TGT" uefi-arm "$kb_lf" "$F_OLA" "$LOG" || rc_on_la=$?
+        for kb_n in $kb_names; do unset "$kb_n"; done
+        _knoboff_took "[3/4]"
+        # [4/4] EMPTY: the knob present with no value must build the UNSET bytes (the parsers' `Some("")` = off).
+        echo -e "${COLOR_YELLOW}⚡ [4/4] current tree, knob EMPTY (${kb_names# } set to '') — must equal UNSET...${COLOR_RESET}"
+        for kb_n in $kb_names; do export "$kb_n="; done
+        _knoboff_flat "$TREE" "$TGT" x86 "$off_csv" "$F_EX" "$LOG" || rc_e_x=$?
+        _knoboff_flat "$TREE" "$TGT" arm "$off_arm" "$F_EA" "$LOG" || rc_e_a=$?
+        _knoboff_flat "$TREE" "$TGT" uefi-x86 "$kb_lf" "$F_ELX" "$LOG" || rc_e_lx=$?
+        _knoboff_flat "$TREE" "$TGT" uefi-arm "$kb_lf" "$F_ELA" "$LOG" || rc_e_la=$?
+        for kb_n in $kb_names; do unset "$kb_n"; done
+        _knoboff_took "[4/4]"
+    fi
 
-    if [ $rc_base_x -ne 0 ] || [ $rc_base_a -ne 0 ] || [ $rc_cur_x -ne 0 ] || [ $rc_cur_a -ne 0 ]; then
+    if [ $rc_base_x -ne 0 ] || [ $rc_base_a -ne 0 ] || [ $rc_cur_x -ne 0 ] || [ $rc_cur_a -ne 0 ] \
+       || [ $rc_base_lx -ne 0 ] || [ $rc_base_la -ne 0 ] || [ $rc_cur_lx -ne 0 ] || [ $rc_cur_la -ne 0 ] \
+       || [ $rc_e_x -ne 0 ] || [ $rc_e_a -ne 0 ] || [ $rc_e_lx -ne 0 ] || [ $rc_e_la -ne 0 ]; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — a knob-OFF build failed (x86 base:$rc_base_x arm base:$rc_base_a x86 cur:$rc_cur_x arm cur:$rc_cur_a).${COLOR_RESET}"
+        if [ "$kb_env" -eq 1 ]; then
+            echo -e "${COLOR_RED}         loaders base:$rc_base_lx|$rc_base_la cur:$rc_cur_lx|$rc_cur_la · EMPTY x86:$rc_e_x arm:$rc_e_a loaders:$rc_e_lx|$rc_e_la${COLOR_RESET}"
+        fi
         echo -e "         tail of $LOG:"; tail -20 "$LOG" | sed 's/^/         /'
         _knoboff_bye 2; return 2
     fi
@@ -14295,14 +14547,21 @@ knoboff() {
     # images came out of the same cache state, and the census is the only evidence of that. Printed
     # unconditionally, because a verdict quoted without it cannot be checked.
     local foreign warm=yes why=""
-    foreign="$(_knoboff_census_foreign "$C_BX" "$C_BA" "$C_CX" "$C_CA")"
+    local kb_cen=( "$C_BX" "$C_BA" "$C_CX" "$C_CA" )
+    if [ "$kb_env" -eq 1 ]; then kb_cen+=( "$C_BLX" "$C_BLA" "$C_CLX" "$C_CLA" ); fi
+    foreign="$(_knoboff_census_foreign "${kb_cen[@]}")"
+    local kb_c kb_cempty=0
+    for kb_c in "${kb_cen[@]}"; do if _knoboff_census_empty "$kb_c"; then kb_cempty=1; fi; done
     if [ -n "$foreign" ]; then
         warm=no; why="a scored build compiled a crate that is not the kernel (rebuilt: $foreign)"
-    elif _knoboff_census_empty "$C_BX" || _knoboff_census_empty "$C_BA" \
-      || _knoboff_census_empty "$C_CX" || _knoboff_census_empty "$C_CA"; then
+    elif [ "$kb_cempty" -eq 1 ]; then
         warm=no; why="a scored build compiled NOTHING, so its image is an artifact some earlier run left behind"
     fi
+    if [ "$kb_env" -eq 1 ]; then
+    echo -e "   knoboff: warm=${warm} compiled_baseline=[$(_knoboff_census_show "$C_BX")|$(_knoboff_census_show "$C_BA")|$(_knoboff_census_show "$C_BLX")|$(_knoboff_census_show "$C_BLA")] compiled_tree=[$(_knoboff_census_show "$C_CX")|$(_knoboff_census_show "$C_CA")|$(_knoboff_census_show "$C_CLX")|$(_knoboff_census_show "$C_CLA")]   (x86|arm|uefi-x86|uefi-arm)"
+    else
     echo -e "   knoboff: warm=${warm} compiled_baseline=[$(_knoboff_census_show "$C_BX")|$(_knoboff_census_show "$C_BA")] compiled_tree=[$(_knoboff_census_show "$C_CX")|$(_knoboff_census_show "$C_CA")]   (x86|arm)"
+    fi
     echo -e "   user_blob  baseline ${BLOB_B:0:16}   tree ${BLOB_C:0:16}   (include_bytes! payload, arch/aarch64/syscall.rs)"
     if [ "$warm" != yes ]; then
         echo -e "${COLOR_RED}knoboff: 2 — NO VERDICT: cache not warm (rebuilt: ${foreign:-<nothing — see below>})${COLOR_RESET}"
@@ -14343,8 +14602,22 @@ knoboff() {
     local ctl_x=0 ctl_a=0
     if [ $rc_on_x -eq 0 ] && ! cmp -s "$F_OX" "$F_CX"; then ctl_x=1; fi
     if [ $rc_on_a -eq 0 ] && ! cmp -s "$F_OA" "$F_CA"; then ctl_a=1; fi
+    local ctl_lx=0 ctl_la=0
+    if [ "$kb_env" -eq 1 ]; then
+        if [ $rc_on_lx -eq 0 ] && ! cmp -s "$F_OLX" "$F_CLX"; then ctl_lx=1; fi
+        if [ $rc_on_la -eq 0 ] && ! cmp -s "$F_OLA" "$F_CLA"; then ctl_la=1; fi
+        echo -e "   control    SET≠UNSET  x86: $([ $ctl_x -eq 1 ] && echo YES || echo no)   arm: $([ $ctl_a -eq 1 ] && echo YES || echo no)   uefi-x86: $([ $ctl_lx -eq 1 ] && echo YES || echo no)   uefi-arm: $([ $ctl_la -eq 1 ] && echo YES || echo no)"
+        if [ $ctl_x -eq 0 ] && [ $ctl_a -eq 0 ] && [ $ctl_lx -eq 0 ] && [ $ctl_la -eq 0 ]; then
+            echo -e "${COLOR_RED}knoboff: NO VERDICT — setting${kb_pairs} changed NONE of the four images.${COLOR_RESET}"
+            echo -e "         (SET builds: x86:$rc_on_x arm:$rc_on_a uefi-x86:$rc_on_lx uefi-arm:$rc_on_la.) A knob read only under a cfg"
+            echo -e "         nobody armed (re-run with its partner: ${COLOR_YELLOW}UNAOS_<PARTNER>=1 UNAOS_KNOBOFF_WITH_ENV=1 ./arroyo knoboff env …${COLOR_RESET}),"
+            echo -e "         a knob that needs a pair (UNAOS_FBW needs UNAOS_FBH: name both), or a dead read. Not a pass."
+            _knoboff_bye 2; return 2
+        fi
+    else
     echo -e "   control    x86 armed≠off: $([ $ctl_x -eq 1 ] && echo YES || echo no)   arm armed≠off: $([ $ctl_a -eq 1 ] && echo YES || echo no)"
-    if [ $ctl_x -eq 0 ] && [ $ctl_a -eq 0 ]; then
+    fi
+    if [ $ctl_x -eq 0 ] && [ $ctl_a -eq 0 ] && [ "$kb_env" -eq 0 ]; then
         echo -e "${COLOR_RED}knoboff: NO VERDICT — arming '$feat' changed NEITHER image.${COLOR_RESET}"
         if [ $rc_on_x -ne 0 ] || [ $rc_on_a -ne 0 ]; then
             echo -e "         (the armed build itself failed: x86:$rc_on_x arm:$rc_on_a.) TWO causes, and the"
@@ -14373,10 +14646,16 @@ knoboff() {
 
     # (8) VERDICT.
     local rc=0
-    local a
-    for a in x86 arm; do
+    local a kb_arts="x86 arm"
+    if [ "$kb_env" -eq 1 ]; then kb_arts="x86 arm uefi-x86 uefi-arm"; fi
+    for a in $kb_arts; do
         local base cur bfile cfile
-        if [ "$a" = x86 ]; then bfile="$F_BX"; cfile="$F_CX"; else bfile="$F_BA"; cfile="$F_CA"; fi
+        case "$a" in
+            x86) bfile="$F_BX"; cfile="$F_CX" ;;
+            arm) bfile="$F_BA"; cfile="$F_CA" ;;
+            uefi-x86) bfile="$F_BLX"; cfile="$F_CLX" ;;
+            uefi-arm) bfile="$F_BLA"; cfile="$F_CLA" ;;
+        esac
         base="$(_knoboff_id "$bfile")"; cur="$(_knoboff_id "$cfile")"
         if cmp -s "$bfile" "$cfile"; then
             echo -e "${COLOR_GREEN}   ✅ $a knob-off image BYTE-IDENTICAL to baseline — ${base}${COLOR_RESET}"
@@ -14389,8 +14668,31 @@ knoboff() {
             rc=1
         fi
     done
+    # THE ENV FORM's second claim: EMPTY builds the UNSET bytes, on every artifact.
+    if [ "$kb_env" -eq 1 ]; then
+        local efile kb_eok=1
+        for a in $kb_arts; do
+            case "$a" in
+                x86) efile="$F_EX"; cfile="$F_CX" ;;
+                arm) efile="$F_EA"; cfile="$F_CA" ;;
+                uefi-x86) efile="$F_ELX"; cfile="$F_CLX" ;;
+                uefi-arm) efile="$F_ELA"; cfile="$F_CLA" ;;
+            esac
+            if ! cmp -s "$efile" "$cfile"; then
+                echo -e "${COLOR_RED}   ❌ $a EMPTY ≠ UNSET — an empty value is not unset: the knob's parser reads Some(\"\") as set${COLOR_RESET}"
+                echo -e "${COLOR_RED}      unset $(_knoboff_id "$cfile")   empty $(_knoboff_id "$efile")${COLOR_RESET}"
+                kb_eok=0; rc=1
+            fi
+        done
+        if [ "$kb_eok" -eq 1 ]; then echo -e "${COLOR_GREEN}   ✅ EMPTY == UNSET on all four images${COLOR_RESET}"; fi
+        echo -e "   ⏱ knoboff env: whole run $((SECONDS - kb_t0)) s"
+    fi
 
-    if [ $rc -eq 0 ]; then
+    if [ $rc -eq 0 ] && [ "$kb_env" -eq 1 ]; then
+        echo -e "${COLOR_GREEN}knoboff: PASS — env${kb_pairs} UNSET is byte-identical to ${base_sha:0:8} on both kernels and both loaders; EMPTY == UNSET; control fired, cache warm.${COLOR_RESET}"
+        echo -e "   Scope of that PASS: the x86_64 and aarch64-virt KERNEL images and the two UEFI loaders. NOT kernel8.img"
+        echo -e "   and NOT any staged media. It GUARDS A BASELINE; it is not evidence the knob WORKS (score the armed run)."
+    elif [ $rc -eq 0 ]; then
         echo -e "${COLOR_GREEN}knoboff: PASS — '$feat' OFF is byte-identical to ${base_sha:0:8} on both arches; control fired, cache warm.${COLOR_RESET}"
         echo -e "   Scope of that PASS: the x86_64 and aarch64-virt KERNEL images. NOT kernel8.img (built"
         echo -e "   from K8_FEATS, a separate curated list) and NOT any staged media. A pi ack is still a pi ack."
@@ -14631,16 +14933,16 @@ case "${1:-}" in
         build_both
         ;;
     esp-x86|esp_x86)
-        esp_x86; for _bl in TESTS.LIST TESTS.HEAVY; do if [ -f "${WORKSPACE_DIR}/fixtures/${_bl}" ]; then cp "${WORKSPACE_DIR}/fixtures/${_bl}" "${WORKSPACE_DIR}/target/x86_64_esp/${_bl}" && echo "   BOOTLIST (B817): staged ${_bl} onto the ESP (the kernel runs it at [desktop] built)"; fi; done   # BOOTLIST (rmbp-ledger B817, R132): the media verb only — the QEMU lanes never stage a list (the builder wipes target/x86_64_esp each run)
+        _BOOTLIST_MEDIA=1 esp_x86   # BOOTLIST (B817, R132) / BOOTLISTARM (B874): the media verb only arms `bootlist_stage` (inside esp_x86, before the card) — the QEMU lanes never stage a list
         ;;
     esp-arm|esp_arm)
-        esp_arm
+        _BOOTLIST_MEDIA=1 esp_arm   # BOOTLISTARM (B874): the media verb arms the list
         ;;
     esp-jetson|esp_jetson|jetson)
-        esp_jetson
+        _BOOTLIST_MEDIA=1 esp_jetson   # BOOTLISTARM (B874)
         ;;
     esp-jetson-img|esp_jetson_img|jetson-img)
-        esp_jetson_img
+        _BOOTLIST_MEDIA=1 esp_jetson_img   # BOOTLISTARM (B874)
         ;;
     selfup-pak|selfup_pak)
         selfup_pak "${2:-}" "${3:-}"
@@ -14683,12 +14985,13 @@ case "${1:-}" in
         test_splash "${2:-120}"
         ;;
     kernel8|baremetal)
-        kernel8
+        _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do
         ;;
     kernel8-run|run-pi)
         run_kernel8
         ;;
     kernel8-test|test-pi)
+        if [ "${2:-}" = "--desk" ]; then export UNAOS_PIDESK=1; set -- "$1" "${@:3}"; fi   # PIDESK-SPEC (B878): `./arroyo kernel8-test --desk 300` = UNAOS_PIDESK=1, scored by pi4-regression.spec then pi4-desktop.spec
         test_kernel8 "${2:-60}"   # MBENCH-HONEST: 8 s never finished a pi4 boot — see test_kernel8
         ;;
     kernel8-install|install-pi)
@@ -14707,7 +15010,7 @@ case "${1:-}" in
     knoboff)
         # KNOBOFF: byte-identity of the knob-OFF image against a baseline, measured in ONE directory.
         # Exit status IS the result (0 identical / 1 moved / 2 no verdict) — see knoboff() above.
-        knoboff "${2:-}" "${3:-}" || exit $?
+        knoboff "${2:-}" "${3:-}" "${4:-}" || exit $?
         ;;
     jobs-image)
         jobs_image
@@ -14730,12 +15033,18 @@ case "${1:-}" in
             case "${3:-}" in
                 1) X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-twoboot-1.spec" ;;
                 2) X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-twoboot-2.spec" ;;
-                *) echo "twoboot: --boot wants 1 or 2"; exit 2 ;;
+                3) X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-twoboot-3.spec" ;;   # KEYBOOT4 (B864): `twoboot --card` only — a fresh native card, keyed at its first-user form
+                4) X86_TEST_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-twoboot-4.spec" ;;   # KEYBOOT4 (B864): `twoboot --card` only — the same card, keyed: the unlock form typed, to the desktop
+                *) echo "twoboot: --boot wants 1, 2, 3 or 4"; exit 2 ;;
             esac
             build_selfbuild_x86() { echo "   TWOBOOT: SELFBUILD staging not entered (build_selfbuild_x86 stubbed by the twoboot arm; no fetch, no LLD, no LIB)"; }
             test_x86_64 "${4:-60}"   # bare, as the `test)` arm calls it: under `||` bash would drop errexit inside the whole path
+        elif [ "${2:-}" = "--build-card" ]; then
+            # KEYBOOT4 (B864): twoboot.sh's re-entry for `twoboot --card` — the ONE x86 card builder, as-is, over the ESP the
+            # boot-1 build staged (target/x86_64_esp): target/unaos-x86-card.img, GPT p1 ESP + p2 UnaFS with /apps /lib /system.
+            esp_x86_unafs_card || exit $?
         else
-            bash "$WORKSPACE_DIR/scripts/twoboot.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # `--judge <log1> [<log2>]` reads captures only. NOT a host gate: a fold leg beside foldleg (PLAYBOOK §2)
+            bash "$WORKSPACE_DIR/scripts/twoboot.sh" "$WORKSPACE_DIR" "${@:2}" || exit $?   # `--judge <log1> [<log2>]` reads captures only; `--card` adds boots 3-4 on a native card (KEYBOOT4 B864). NOT a host gate: a fold leg beside foldleg (PLAYBOOK §2)
         fi
         ;;
     foldleg)
@@ -14751,7 +15060,7 @@ case "${1:-}" in
         ;;
     *)
         echo -e "${COLOR_RED}Unknown command: $1${COLOR_RESET}"
-        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [secs]|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|gates [--list|--selftest]|jobs-image|twoboot [--judge <log1> [<log2>]]|clean]"
+        echo "Usage: ./arroyo [state|x86|arm|test [secs]|test-arm [secs]|check|build|esp-x86|esp-arm|esp-jetson|esp-jetson-img|vm-image|fat-img|test-fat [part|gpt|p16|sf] [secs]|test-selfhost [part|gpt|p16|sf] [secs]|test-install [secs]|test-ptr [secs]|test-splash [secs]|kernel8|kernel8-run|kernel8-test [--desk] [secs] (the Pi desktop: ./arroyo kernel8-test --desk 300)|kernel8-install [secs]|battery|knoboff <feature> [baseline-ref]|gates [--list|--selftest]|jobs-image|twoboot [--card] [--judge <log1> [<log2> [<log3> <log4>]]]|clean]"
         exit 1
         ;;
 esac

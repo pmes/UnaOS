@@ -138,7 +138,7 @@ fn install(dark: bool, accent: usize, highlight: usize, via: &str) -> bool {
     if !theme::set(dark, accent, highlight) {
         return false;
     }
-    repaint();
+    wm::desktop::shadows_covered(theme::epoch()); repaint(); // SHADOWDAMAGE (rmbp-ledger B865): `theme::set` just bumped; the epoch is covered by the damage-all `repaint` makes, so the shadow re-lay only sets STALE (`desktop::shadows_relay`). A pass between the bump and this store walks (conservative). LINE-NEUTRAL fold, code first.
     let ms = crate::arch::ms().saturating_sub(t0) as u32;
     REPAINT_MS.store(ms, Ordering::Relaxed);
     SWITCHES.fetch_add(1, Ordering::Relaxed);

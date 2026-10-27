@@ -11,9 +11,15 @@
 //!   iTunSMPB gapless trimming.
 //!
 //! Output channel order is the WAVE order (FL FR FC LFE BL BR FLC FRC BC SL SR), mapped from the
-//! channelConfiguration or the program_config_element. HE-AAC (SBR, PS) streams decode as their AAC-LC
-//! core at the core sample rate; SBR/PS are owed.
+//! channelConfiguration or the program_config_element.
+//!
+//! HE-AAC (HEAACSBR, LEDGER SR198): [`sbr`] rebuilds the upper band and the output runs at twice the core rate,
+//! 2048 samples per access unit — switched on by the AudioSpecificConfig (explicit signalling) or by an SBR fill
+//! element in the first access unit (implicit signalling, [`sbr_probe`]). HE-AAC v2's parametric stereo
+//! (`AacDecoder::ps_seen`, `ps=seen`) is synthesised from the mono core into a stereo pair (HEAACSBR-PS, LEDGER
+//! SR214; a stream whose PS first appears after the probed first access unit stays mono).
 pub mod decoder;
+pub mod sbr;
 pub mod tables;
 
 use alloc::boxed::Box;
@@ -33,7 +39,7 @@ pub struct Asc {
     pub sf_index: usize,
     pub channel_config: u8,
     pub pce: Option<Pce>,
-    /// Explicitly signalled SBR (object type 5/29 or the sync extension): the output rate would double.
+    /// Explicitly signalled SBR (object type 5/29 or the sync extension): SBR on, the output rate doubles.
     pub sbr: bool,
 }
 
@@ -91,6 +97,33 @@ impl Asc {
     }
 }
 
+/// HEAACSBR: SBR on when the AudioSpecificConfig signals it (`explicit`) or the first access unit carries SBR data
+/// (implicit signalling: an HE-AAC stream is announced as plain AAC-LC at the core rate). The probe decodes that unit
+/// with SBR on (so a parametric stereo extension is seen too) and hands back a FRESH decoder in the found mode, so
+/// the unit decodes again from clean state. A plain LC stream comes back as plain LC.
+pub fn sbr_probe(mut dec: AacDecoder, first: Option<&[u8]>, explicit: bool) -> Result<AacDecoder> {
+    let (sf, layout) = (dec.sf_index, dec.layout.clone());
+    dec.enable_sbr(false);
+    if let Some(au) = first {
+        let mut r = BitReader::new(au);
+        let _ = dec.decode_block(&mut r, 0);
+    }
+    if !explicit && !dec.sbr_seen { return AacDecoder::new(sf, layout); }
+    let ps = dec.ps_seen;
+    let mut fresh = AacDecoder::new(sf, layout)?;
+    fresh.enable_sbr(ps);
+    Ok(fresh)
+}
+
+/// The decoder a seek restarts with: the same parameters and the same SBR mode (`Some(ps)` when on).
+fn restart(sf_index: usize, layout: &Layout, sbr: Option<bool>) -> Result<AacDecoder> {
+    let mut d = AacDecoder::new(sf_index, layout.clone())?;
+    if let Some(ps) = sbr { d.enable_sbr(ps); }
+    Ok(d)
+}
+
+fn sbr_mode(d: &AacDecoder) -> Option<bool> { (d.frame_len() == 2048).then_some(d.out.len() > d.layout.channels) }
+
 // ------------------------------------------------------------------ ADTS
 
 #[derive(Clone, Copy, Debug)]
@@ -131,6 +164,8 @@ pub struct AdtsStream {
     sf_index: usize,
     layout: Layout,
     index: Option<Vec<(u64, u64)>>,
+    /// HEAACSBR: the SBR mode a seek restarts with
+    sbr: Option<bool>,
 }
 
 /// SEEKTABLE2: one index point per this many ADTS frames (a seek walks at most twice this many headers).
@@ -152,11 +187,16 @@ impl AdtsStream {
                 Layout::from_pce(&Pce::parse(&mut r, 0)?)
             }
         };
-        let ch = layout.channels as u16;
-        let dec = AacDecoder::new(h.sf_index, layout.clone())?;
-        let info = Info { rate: RATES[h.sf_index], channels: ch, bits: 0, frames: None, format: Format::Adts, codec: Codec::Aac, float: true };
+        // HEAACSBR: the first frame's first raw block, peeked (not consumed), decides SBR (implicit signalling)
+        let off = 7 + if h.protection_absent { 0 } else if h.blocks > 1 { 2 * h.blocks } else { 2 };
+        let first = s.need(h.frame_length).ok().map(|d| d.to_vec());
+        let dec = sbr_probe(AacDecoder::new(h.sf_index, layout.clone())?, first.as_deref().and_then(|f| f.get(off..)), false)?;
+        let ch = dec.out.len() as u16;
+        let rate = RATES[h.sf_index] * (dec.frame_len() / 1024) as u32;
+        let info = Info { rate, channels: ch, bits: 0, frames: None, format: Format::Adts, codec: Codec::Aac, float: true };
         let start = s.offset();
-        Ok(AdtsStream { s, dec, info, in_sync: true, start, sf_index: h.sf_index, layout, index: None })
+        let sbr = sbr_mode(&dec);
+        Ok(AdtsStream { s, dec, info, in_sync: true, start, sf_index: h.sf_index, layout, index: None, sbr })
     }
 }
 
@@ -201,6 +241,7 @@ impl Source for AdtsStream {
             let body = &fr[off..];
             let mut r = BitReader::new(body);
             let ch = self.info.channels as usize;
+            let fl = self.dec.frame_len();
             pcm.set_float(ch, 0);
             let mut ok_blocks = 0;
             for b in 0..h.blocks {
@@ -209,15 +250,15 @@ impl Source for AdtsStream {
                 if !h.protection_absent && h.blocks > 1 { r.skip(16).ok(); }
                 let n = pcm.frames;
                 for c in 0..ch { pcm.flt[c].extend_from_slice(&self.dec.out[c]); }
-                pcm.frames = n + 1024;
+                pcm.frames = n + fl;
                 ok_blocks += 1;
                 let _ = b;
             }
             if ok_blocks == 0 {
                 // a damaged frame: hand out silence of its length so timing holds, and resync
                 self.in_sync = false;
-                for c in 0..ch { pcm.flt[c].resize(1024 * h.blocks, 0.0); }
-                pcm.frames = 1024 * h.blocks;
+                for c in 0..ch { pcm.flt[c].resize(fl * h.blocks, 0.0); }
+                pcm.frames = fl * h.blocks;
                 return Ok(true);
             }
             self.in_sync = true;
@@ -237,14 +278,14 @@ impl Source for AdtsStream {
         let (mut cur, mut prev) = ((b0, s0), None);
         while let Some(h) = self.header_here()? {
             cur.0 = self.s.offset();
-            let len = 1024 * h.blocks as u64;
+            let len = self.dec.frame_len() as u64 * h.blocks as u64;
             if cur.1 + len > t || !self.step(&h)? { break; }
             prev = Some(cur);
             cur.1 += len;
         }
         let (byte, sample) = prev.unwrap_or(cur);
         if !self.s.seek(byte)? { return Ok(None); }
-        self.dec = AacDecoder::new(self.sf_index, self.layout.clone())?;
+        self.dec = restart(self.sf_index, &self.layout, self.sbr)?;
         self.in_sync = true;
         Ok(Some(SeekPoint { byte, sample, exact: true, table: "adts", landed: sample }))
     }
@@ -271,12 +312,13 @@ impl AdtsStream {
     fn build_index(&mut self) -> Result<Vec<(u64, u64)>> {
         let mut idx = Vec::new();
         let (mut n, mut sample) = (0u64, 0u64);
+        let fl = self.dec.frame_len() as u64;
         if !self.s.seek(self.start)? { return Ok(idx); }
         while let Some(h) = self.header_here()? {
             let at = self.s.offset();
             if !self.step(&h)? { break; }
             if n % ADTS_STRIDE == 0 { idx.push((at, sample)); }
-            sample += 1024 * h.blocks as u64;
+            sample += fl * h.blocks as u64;
             n += 1;
         }
         self.info.frames = Some(sample);
@@ -300,6 +342,9 @@ pub struct AacSource {
     /// SEEKTABLE (rmbp B433): the gapless skip at the top, and the ASC (a seek restarts the decoder from it).
     skip0: u64,
     asc: Vec<u8>,
+    /// HEAACSBR: samples per access unit (1024, 2048 with SBR) and the SBR mode a seek restarts with
+    fl: usize,
+    sbr: Option<bool>,
 }
 
 impl AacSource {
@@ -307,11 +352,18 @@ impl AacSource {
         let data = data.into();
         let a = Asc::parse(asc)?;
         let layout = a.layout()?;
-        let ch = layout.channels as u16;
-        let dec = AacDecoder::new(a.sf_index, layout)?;
-        let frames = total.or(Some((units.len() as u64 * 1024).saturating_sub(skip)));
-        let info = Info { rate: RATES[a.sf_index], channels: ch, bits: 0, frames, format: Format::Mp4, codec: Codec::Aac, float: true };
-        Ok(AacSource { data, units, next: 0, dec, info, skip, total, emitted: 0, skip0: skip, asc: asc.to_vec() })
+        // HEAACSBR: explicit SBR from the ASC, implicit from the first access unit
+        let first = units.first().and_then(|&(o, l)| data.get(o..(o + l).min(data.len())));
+        let dec = sbr_probe(AacDecoder::new(a.sf_index, layout)?, first, a.sbr)?;
+        let ch = dec.out.len() as u16;
+        let fl = dec.frame_len();
+        // the container's trim is in core-rate samples; with SBR the output runs at twice that rate
+        let mult = (fl / 1024) as u64;
+        let (skip, total) = (skip * mult, total.map(|t| t * mult));
+        let frames = total.or(Some((units.len() as u64 * fl as u64).saturating_sub(skip)));
+        let info = Info { rate: RATES[a.sf_index] * mult as u32, channels: ch, bits: 0, frames, format: Format::Mp4, codec: Codec::Aac, float: true };
+        let sbr = sbr_mode(&dec);
+        Ok(AacSource { data, units, next: 0, dec, info, skip, total, emitted: 0, skip0: skip, asc: asc.to_vec(), fl, sbr })
     }
     pub fn boxed(self) -> Box<dyn Source> { Box::new(self) }
 }
@@ -332,8 +384,8 @@ impl Source for AacSource {
                 for o in self.dec.out.iter_mut() { o.iter_mut().for_each(|x| *x = 0.0); }
             }
             let mut start = 0usize;
-            if self.skip > 0 { let s = (self.skip as usize).min(1024); start = s; self.skip -= s as u64; }
-            let mut stop = 1024usize;
+            if self.skip > 0 { let s = (self.skip as usize).min(self.fl); start = s; self.skip -= s as u64; }
+            let mut stop = self.fl;
             if let Some(t) = self.total { stop = stop.min(start + (t - self.emitted) as usize); }
             if stop <= start { continue; }
             pcm.set_float(ch, stop - start);
@@ -347,13 +399,14 @@ impl Source for AacSource {
     /// gives; `demux_core::Demuxer::seek_track` over the same file lands on the same unit). One unit of pre-roll
     /// primes the MDCT overlap; its PCM is dropped. Exact.
     fn seek(&mut self, t: u64) -> Result<Option<SeekPoint>> {
-        let n = ((t + self.skip0) / 1024).min(self.units.len() as u64);
+        let fl = self.fl as u64;
+        let n = ((t + self.skip0) / fl).min(self.units.len() as u64);
         let l = n.saturating_sub(1);
         let a = Asc::parse(&self.asc)?;
-        self.dec = AacDecoder::new(a.sf_index, a.layout()?)?;
+        self.dec = restart(a.sf_index, &a.layout()?, self.sbr)?;
         self.next = l as usize;
-        let d0 = (n * 1024).max(self.skip0);
-        self.skip = d0 - l * 1024;
+        let d0 = (n * fl).max(self.skip0);
+        self.skip = d0 - l * fl;
         let sample = d0 - self.skip0;
         self.emitted = sample;
         let byte = self.units.get(l as usize).map(|u| u.0 as u64).unwrap_or(self.data.len() as u64);

@@ -3,7 +3,7 @@
 //! PERFHUD (rmbp-ledger B710, BP-bar-5 / BP-bar-24: "the numbers exist on the wire — the user, and Peter on the glass,
 //! should see them without a serial cable"). A small panel in the top-right of the desktop, painted by the compositor
 //! as its TOPMOST layer (after every window and furniture strip, before the cursor tail — `wm::composite_pass_half`),
-//! showing nine fields:
+//! showing ten fields:
 //!
 //! 1. frame time p50 / p99 over the last 120 passes (`ft`) — the pass from `wm::composite_once`'s start
 //!    ([`pass_begin`]) to the overlay layer ([`compose`]): every window and strip, NOT the HUD's own paint and not the
@@ -13,7 +13,7 @@
 //! 4. heap used / limit (MEMLINE's `allocator::heap_used`, the heap's span);
 //! 5. windows (live / limit, `wincap`); 6. processes (running / limit);
 //! 7. the render core's load and 8. the service core's (`sched::core_load` on the published split; `*` = inferred);
-//! 9. the boot's OVER steps and when the last one was seen (`fs::bootstep::tally`).
+//! 9. the boot's OVER steps and when the last one was seen (`fs::bootstep::tally`); 10. the drain presents (DRAINHUD B868: `drn <n> <us>us`, DRAINMETER's `drain_sample`).
 //!
 //! Toggle: Win+F12 (the fn-row router's one entry, [`chord`]; the Windows key is `keymap::start_role` under Softy and
 //! the GUI key — Command on a Mac — under Una) or Settings > Accessibility > Show performance (Principia key
@@ -30,16 +30,16 @@
 //!   [`strip_rect`] = the rect it last painted), so the window blits (`wm::occ_clip`), the erase drain and the shimmer
 //!   (`wm::erase_clip`) and the desktop present withhold its rect; the strip writers that do not consult the registry
 //!   latch a full repaint (`strip::overlay_take_hit`). So a pass repaints only what changed: the sampler diffs each new
-//!   image against the cached one into nine field bands, and the pass paints the dirty bands; it paints the WHOLE
+//!   image against the cached one into ten field bands, and the pass paints the dirty bands; it paints the WHOLE
 //!   image only on a first paint, a move, a latched hit or a colour-filter change, and nothing at all otherwise.
 //!   Measured: `paint_us` = the steady (band) paint, budget 300; the full paint is reported as `full_us=`/`full_px=`.
 //! * Hidden: the rect is VACATED once (`strip::vacate`: erased and handed back to the scene and the windows under it,
 //!   the furniture's own restore), then [`compose`] costs one relaxed load.
 //!
 //! Wire: `[hud] visible=<0|1> via=<chord|settings|login|test>` on a change; `[hud] shown rect=<w>x<h>+<x>+<y>
-//! paint_us=<n> budget_us=300 fields_dirty=9 px=<n> -> UNDER|OVER` (the full paint after a show); every 10 s while
+//! paint_us=<n> budget_us=300 fields_dirty=10 px=<n> -> UNDER|OVER` (the full paint after a show); every 10 s while
 //! visible `[hud] ft_p50=<us> ft_p99=<us> missed=<n> k2p_p99=<us> heap=<kb>/<kb> win=<n> proc=<n>`.
-//! `tests perfhud`: `:: PERFHUD: visible=1 paint_us=<steady> fields=9 -> PASS :: pixels=3/3 budget_us=300 under=1
+//! `tests perfhud`: `:: PERFHUD: visible=1 paint_us=<steady> fields=10 -> PASS :: pixels=3/3 budget_us=300 under=1
 //! fields_dirty=<n> px=<n> full_us=<n> full_px=<n> scale=<s> rect=… max_paint_us=<n>`.
 
 use core::sync::atomic::{AtomicBool, Ordering::{AcqRel, Acquire, Release}};
@@ -154,13 +154,15 @@ mod glass {
     const ECHO_MS: u64 = 10_000;
     /// The paint budget (BP-bar-5's HUD: <= 0.3 ms).
     pub const PAINT_BUDGET_US: u64 = 300;
-    /// The fields the panel shows, one per line.
-    pub const FIELDS: usize = 9;
+    /// The fields the panel shows, one per line (DRAINHUD B868: the tenth is the drain present).
+    pub const FIELDS: usize = 10;
     /// Characters per line (the longest field is 18).
     const COLS: usize = 18;
     /// Budgets a field is inked `ink.warning` past: a frame, and one vblank plus scanout for k2p.
     const FRAME_US: u32 = 16_667;
     const K2P_US: u32 = 33_334;
+    /// DRAINHUD (B868): the drain present's bar (BP-video-11: the shimmer's drain present, <= 200 us).
+    const DRAIN_US: u64 = 200;
 
     #[allow(clippy::declare_interior_mutable_const)]
     const Z: AtomicU32 = AtomicU32::new(0);
@@ -173,7 +175,7 @@ mod glass {
     static PAINTS: AtomicU64 = AtomicU64::new(0);
     static LAST_PAINT_US: AtomicU64 = AtomicU64::new(0);
     static MAX_PAINT_US: AtomicU64 = AtomicU64::new(0);
-    /// PERFHUD2: the last paint's pixels and field bands (9 = a full paint).
+    /// PERFHUD2: the last paint's pixels and field bands (FIELDS = a full paint).
     static LAST_PX: AtomicU64 = AtomicU64::new(0);
     static LAST_FIELDS: AtomicUsize = AtomicUsize::new(0);
     /// PERFHUD2: the last FULL paint — its cost, pixels and rect, stored at that paint (the shown line reads these, never
@@ -341,7 +343,7 @@ mod glass {
         true
     }
 
-    /// One reading of the nine fields.
+    /// One reading of the ten fields.
     #[derive(Clone, Copy, Default)]
     struct Snap {
         ft_p50: u32,
@@ -359,6 +361,9 @@ mod glass {
         scpu: Option<(usize, u32, bool, bool)>,
         over: u32,
         over_age_s: Option<u64>,
+        /// DRAINHUD (B868): drain presents since boot and the last one's us (`super::drain_sample`).
+        drain_n: u64,
+        drain_us: u64,
     }
 
     fn core(cpu: Option<usize>) -> Option<(usize, u32, bool, bool)> {
@@ -380,6 +385,7 @@ mod glass {
         let (lo, hi) = crate::allocator::heap_bounds();
         let (_, running, _, _) = crate::arch::x86_64::syscall::proc_table_headroom();
         let (over_n, over_age_s) = over();
+        let (drain_n, drain_us, _) = super::drain_sample();
         Snap {
             ft_p50,
             ft_p99,
@@ -396,6 +402,8 @@ mod glass {
             scpu: core(crate::arch::smp::service_cpu()),
             over: over_n,
             over_age_s,
+            drain_n,
+            drain_us,
         }
     }
 
@@ -426,7 +434,7 @@ mod glass {
         }
     }
 
-    /// The nine lines and whether each is past its budget (inked `ink.warning`).
+    /// The ten lines and whether each is past its budget (inked `ink.warning`).
     fn lines(s: &Snap) -> [(String, bool); FIELDS] {
         let (a, b) = ms1(s.ft_p50);
         let (c, d) = ms1(s.ft_p99);
@@ -448,6 +456,7 @@ mod glass {
                 },
                 s.over_age_s.is_some_and(|t| t < 60),
             ),
+            (if s.drain_n == 0 { String::from("drn --") } else { alloc::format!("drn {} {}us", s.drain_n, s.drain_us) }, s.drain_us > DRAIN_US),
         ]
     }
 
@@ -530,7 +539,7 @@ mod glass {
     }
 
     /// PERFHUD2: union the pixels `new` changes from `old` (both `w` x `h`) into the field bands of `dirty`: per changed
-    /// row the first..last differing column, in the band of field `(row - pad) / ch`. `false` = a change outside the nine
+    /// row the first..last differing column, in the band of field `(row - pad) / ch`. `false` = a change outside the ten
     /// field rows (the border or the padding: a theme change), so the whole image is owed.
     fn diff_bands(old: &[u32], new: &[u32], w: usize, h: usize, ch: usize, pad: usize, dirty: &mut [Option<strip::Rect>; FIELDS]) -> bool {
         let mut span: [Option<(usize, usize)>; FIELDS] = [None; FIELDS];

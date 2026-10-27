@@ -33,7 +33,7 @@
 //! rung's end line counts every write class that made it possible.
 
 use super::rx::{shm_r16, shm_w16, w16, Writes};
-use super::{r32, settle, w32, D11_SHM_CONTROL, D11_SHM_DATA};
+use super::{r32, settle, w32, D11_MACCTL, D11_SHM_CONTROL, D11_SHM_DATA, MACCTL_BE};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -97,6 +97,12 @@ pub(super) const MACFILTER_BSSID: u16 = 0x0003;
 /// `main.c:665` — the offset is OR'd with 0x0020 before the select.
 const MACFILTER_SELECT: u16 = 0x0020;
 
+// ── Template RAM (STATIONTEMPLATE, rmbp-ledger B862; b43.h:45-46; main.c:465-477, :679-703) ─────────────────────
+const RAM_CONTROL: u64 = 0x0130;
+const RAM_DATA: u64 = 0x0134;
+/// `main.c:701` — the station MAC then the BSSID, 12 octets as three words from template RAM offset 0x20.
+const TEMPLATE_MAC_BSSID: u32 = 0x0020;
+
 // ── SHM words the ucode's own TX reads (b43.h; main.c:3162-3216) ────────────────────────────────
 const SHM_SH_ACKCTSPHYCTL: u16 = 0x0022; // b43.h:306
 const SHM_SH_BEACPHYCTL: u16 = 0x0054; // b43.h:302
@@ -129,6 +135,14 @@ const TXH_PLCP_FB: usize = 54; // plcp_hdr6
 const TXH_DUR_FB: usize = 60; // __le16
 const TXH_COOKIE_598: usize = 76; // format_598.cookie
 const TXH_PLCP_598: usize = 112; // format_598.plcp
+/// STATIONERP (rmbp-ledger B884): the FW598 header's RTS/CTS slot (`xmit.h:35`, `:41-42`, `:61-62`) — the CTS-to-self rides it.
+const TXH_PHY_RATE_RTS: usize = 19; // u8 phy_rate_rts
+const TXH_RTS_PLCP_FB: usize = 46; // plcp_hdr6 rts_plcp_fb
+const TXH_RTS_DUR_FB: usize = 52; // __le16 rts_dur_fb
+const TXH_RTS_PLCP_598: usize = 88; // format_598.rts_plcp
+const TXH_RTS_FRAME_598: usize = 94; // format_598.rts_frame[16]
+/// A CTS frame (§9.3.1.3): FC, Duration, RA — 10 octets before the FCS.
+const CTS_LEN: usize = 10;
 /// `xmit.h:124-127` — MAC control: hardware sequence number, start of MSDU, long-frame retry limit.
 const TXH_MAC_HWSEQ: u32 = 0x0000_0010;
 const TXH_MAC_STMSDU: u32 = 0x0000_0008;
@@ -136,10 +150,15 @@ const TXH_MAC_LONGFRAME: u32 = 0x0000_0002;
 /// `xmit.h:128` — immediate ACK expected; b43 sets it on every frame mac80211 does not mark NO_ACK
 /// (`xmit.c:399-400`), i.e. every unicast frame (WIFIAUTH B788: the auth and association requests).
 const TXH_MAC_ACK: u32 = 0x0000_0001;
+/// `xmit.h:114` — send a CTS-to-self before the frame (b43 `xmit.c:458`; STATIONERP B884).
+const TXH_MAC_SENDCTS: u32 = 0x0000_0800;
 /// `xmit.h:149`, `:157`, `:160` — PHY control: CCK encoding, antenna 0/1 auto, the TX-power field.
 const TXH_PHY_ENC_CCK: u16 = 0x0000;
 /// `xmit.h:150` — OFDM encoding (STATIONRATE B855).
 const TXH_PHY_ENC_OFDM: u16 = 0x0001;
+/// `xmit.h:153` — short preamble for the primary rate (b43 `xmit.c:374-375`; STATIONSHORTPRE B862). The fallback's own bit
+/// (`B43_TXH_MAC_FB_SHORTPRMBL`, `xmit.h:103`) stays clear: the fallback is CCK 1, long preamble only.
+const TXH_PHY_SHORTPRMBL: u16 = 0x0010;
 const TXH_PHY_ANT01AUTO: u16 = 0x00C0;
 const TXH_PHY_TXPWR: u16 = 0xFC00;
 /// `xmit.h:167` + `xmit.c:167-181` — PHY control word 1 for a CCK rate on an HT-PHY is the 20 MHz bandwidth alone.
@@ -150,6 +169,8 @@ const TXH_EFT_FB_CCK: u8 = 0x00;
 pub(super) use wifi_core::ieee80211::RATE_1M;
 /// `xmit.c:688` — the FCS the hardware appends is in the PLCP length.
 const FCS_LEN: usize = 4;
+/// IEEE Std 802.11-2020 aSIFSTime for DSSS / HR-DSSS / ERP (2.4 GHz), microseconds (STATIONDURATION B862).
+const SIFS_US: u16 = 10;
 
 // ── The retry limits (WIFIAUTH B788; b43.h:229, :345-346, :608-609; main.c:3972-3985, called at core init :4909) ──
 /// `b43.h:229` — the SHM routing enum's third entry, SCRATCH. Scratch is WORD-addressed (`main.c:555-569`:
@@ -285,6 +306,28 @@ pub(super) fn macfilter(bar0: u64, entry: u16, mac: [u8; 6], w: &mut Writes) {
     w.macfilter += 4;
 }
 
+/// STATIONTEMPLATE (B862) — the template half of `main.c:679-703` (`b43_write_mac_bssid_templates`; its filter half is
+/// `macfilter`, the one filter writer, already run by `rx::station_filter`): the station MAC then the BSSID, 12 octets as
+/// three little-endian words, into template RAM at 0x20/0x24/0x28 through RAM_CONTROL / RAM_DATA (`main.c:465-477`), each
+/// word byte-swapped when MACCTL says big-endian. Written live, as b43 writes it from bss_info_changed (`main.c:4139-4140`,
+/// before its suspend). Not counted in `Writes`: `join::keep` runs after the pass's census line. Returns the words written.
+pub(super) fn templates(bar0: u64, mac: [u8; 6], bssid: [u8; 6]) -> u32 {
+    let mut b = [0u8; 12];
+    b[..6].copy_from_slice(&mac);
+    b[6..].copy_from_slice(&bssid);
+    let be = unsafe { r32(bar0, D11_MACCTL) } & MACCTL_BE != 0;
+    let mut n = 0u32;
+    for i in 0..3usize {
+        let v = u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
+        unsafe {
+            w32(bar0, RAM_CONTROL, TEMPLATE_MAC_BSSID + 4 * i as u32);
+            w32(bar0, RAM_DATA, if be { v.swap_bytes() } else { v });
+        }
+        n += 1;
+    }
+    n
+}
+
 /// `main.c:3162-3199` — the rate memory for a G/N/HT PHY: 8 OFDM + 4 CCK entries copied to +0x20.
 fn rate_memory_init(bar0: u64, w: &mut Writes) -> u32 {
     let mut n = 0u32;
@@ -403,12 +446,20 @@ fn plcp(out: &mut [u8], octets: usize, rate: u8) {
 }
 
 /// `xmit.c:235-567` for a frame at `rate` (STATIONRATE B855: the rungs pass `RATE_1M`; the kept station its chosen rate),
-/// no key, no RTS/CTS, no short preamble, the fallback ALWAYS CCK 1 (`plcp_fb`, `phy_ctl1_fb`, extra_ft FB_CCK: `:354-361`):
+/// no key, no RTS (a CTS-to-self when `r.prot` and the rate is OFDM: `cts_to_self`, STATIONERP B884), no short preamble, the fallback `TxRate::fb`, a CCK rate (CCK 1 for the rungs; STATIONRATECTL B881) (`plcp_fb`, `phy_ctl1_fb`, extra_ft FB_CCK: `:354-361`):
 /// phy_rate (`:271-274`), phy_ctl's encoding (`:370-371`), the FC copy, the receiver, dur_fb = the frame's own duration (0: `:279-286`), both PLCPs,
 /// extra_ft CCK fallback, chan_radio_code = the channel (`:360-364`), phy_ctl CCK + ANT01AUTO
 /// (`:367-392`), mac_ctl HWSEQ + STMSDU + LONGFRAME (`:396-421`) + ACK on a unicast addr1 (`:399-400`), phy_ctl1 and
 /// its fallback = BW_20 (`:554-558`, `:167-181`), the cookie (`:541-552`). Everything else stays 0 (`:263`).
-fn txhdr(frame: &[u8], ch: u16, cookie: u16, rate: u8) -> [u8; TXH_SIZE] {
+/// STATIONAIR (B862): the rate arrives as ONE `TxRate`; phy_ctl carries SHORTPRMBL (`xmit.c:374-375`) only for a short
+/// CCK 2/5.5/11 rate (`short_ok`); dur_fb = `duration`'s NAV re-taken at the CCK 1 long fallback (SIFS + ACK = 314 us) when
+/// a Duration was computed and the rate is not 1 Mbit/s, else the computed Duration, else the frame's own field (the rungs'
+/// management frames: byte-identical). THE ONE DURATION WRITER is `post`: it writes `duration(frame, r)` into the frame's
+/// DMA body copy at octets 2-3; the codec's output (`wifi_core::ieee80211`) is never re-encoded and no other site (no
+/// codec, no Link) writes a Duration. This divergence from b43 is deliberate: b43 `xmit.c:287` takes the fallback duration
+/// from `ieee80211_generic_frame_duration(fragment_len, fbrate)`, the whole fragment's airtime; we take the ACK's.
+fn txhdr(frame: &[u8], ch: u16, cookie: u16, r: TxRate) -> [u8; TXH_SIZE] {
+    let rate = r.rate;
     let mut h = [0u8; TXH_SIZE];
     let octets = frame.len() + FCS_LEN;
     let unicast = frame[4] & 0x01 == 0;
@@ -416,7 +467,7 @@ fn txhdr(frame: &[u8], ch: u16, cookie: u16, rate: u8) -> [u8; TXH_SIZE] {
     h[TXH_MAC_CTL..TXH_MAC_CTL + 4].copy_from_slice(&mac_ctl.to_le_bytes());
     h[TXH_MAC_FRAME_CTL..TXH_MAC_FRAME_CTL + 2].copy_from_slice(&frame[0..2]);
     let (rc, ofdm) = ratecode(rate).unwrap_or((CCK_RATECODES[0], false));
-    let phy_ctl = (if ofdm { TXH_PHY_ENC_OFDM } else { TXH_PHY_ENC_CCK }) | TXH_PHY_ANT01AUTO;
+    let phy_ctl = (if ofdm { TXH_PHY_ENC_OFDM } else { TXH_PHY_ENC_CCK }) | TXH_PHY_ANT01AUTO | if short_ok(r) { TXH_PHY_SHORTPRMBL } else { 0 };
     h[TXH_PHY_CTL..TXH_PHY_CTL + 2].copy_from_slice(&phy_ctl.to_le_bytes());
     h[TXH_PHY_CTL1..TXH_PHY_CTL1 + 2].copy_from_slice(&phy_ctl1(if ratecode(rate).is_some() { rate } else { RATE_1M }).to_le_bytes());
     h[TXH_PHY_CTL1_FB..TXH_PHY_CTL1_FB + 2].copy_from_slice(&phy_ctl1(RATE_1M).to_le_bytes());
@@ -424,10 +475,18 @@ fn txhdr(frame: &[u8], ch: u16, cookie: u16, rate: u8) -> [u8; TXH_SIZE] {
     h[TXH_EXTRA_FT] = TXH_EFT_FB_CCK;
     h[TXH_CHAN_RADIO_CODE] = ch as u8;
     h[TXH_TX_RECEIVER..TXH_TX_RECEIVER + 6].copy_from_slice(&frame[4..10]);
-    plcp(&mut h[TXH_PLCP_FB..TXH_PLCP_FB + 6], octets, RATE_1M);
-    h[TXH_DUR_FB..TXH_DUR_FB + 2].copy_from_slice(&frame[2..4]);
+    plcp(&mut h[TXH_PLCP_FB..TXH_PLCP_FB + 6], octets, fb_of(r));
+    let dur_fb = match duration(frame, r) {
+        Some(d) if d != 0 && rate != fb_of(r) => nav_us(TxRate::long(fb_of(r))).to_le_bytes(),
+        Some(d) => d.to_le_bytes(),
+        None => [frame[2], frame[3]],
+    };
+    h[TXH_DUR_FB..TXH_DUR_FB + 2].copy_from_slice(&dur_fb);
     h[TXH_COOKIE_598..TXH_COOKIE_598 + 2].copy_from_slice(&cookie.to_le_bytes());
     plcp(&mut h[TXH_PLCP_598..TXH_PLCP_598 + 6], octets, rate);
+    if r.prot && ofdm {
+        cts_to_self(&mut h, frame, r); // STATIONERP (B884): the BSS asked for protection and the frame is OFDM
+    }
     h
 }
 
@@ -491,7 +550,7 @@ pub(super) fn fire_frame(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, k
         serial_println!("[wifi10] tx-poke kind={} REFUSED reason=frame-slot(n={} len={}) — nothing written", kind, n, frame.len());
         return r;
     }
-    let (cookie, txindex, dptr, hdr) = post(bar0, p, frame, ch, n, rate, w);
+    let (cookie, txindex, dptr, hdr) = post(bar0, p, frame, ch, n, TxRate::long(rate), w);
     r.cookie = cookie;
     r.dptr_before = dptr;
     let mut hx = String::new();
@@ -567,7 +626,7 @@ pub(super) fn stop(bar0: u64, w: &mut Writes) -> bool {
 /// region, the frame into its body region, slot 2n (FRAMESTART) and 2n+1 (FRAMEEND | IRQ) filled, `TXINDEX` <- the slot
 /// after (`dma.c:1186-1286`, `:213-217`). Precondition (the callers' guards): `n < FRAMES`, 24 <= len <= `FRAME_MAX`.
 /// Returns (the cookie `(controller + 1) << 12 | 2n`, the TXINDEX written, the engine's pointer before the poke, the header).
-fn post(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, rate: u8, w: &mut Writes) -> (u16, usize, u32, [u8; TXH_SIZE]) {
+fn post(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, rate: TxRate, w: &mut Writes) -> (u16, usize, u32, [u8; TXH_SIZE]) {
     let slot = n * TX_SLOTS_PER_FRAME;
     let cookie = COOKIE_RING1 | slot as u16;
     let hdr = txhdr(frame, ch, cookie, rate);
@@ -579,6 +638,12 @@ fn post(bar0: u64, p: &Prep, frame: &[u8], ch: u16, n: usize, rate: u8, w: &mut 
     }
     for (i, b) in frame.iter().enumerate() {
         unsafe { core::ptr::write_volatile((fbuf + i as u64) as *mut u8, *b) };
+    }
+    // STATIONDURATION (B862): the ONE Duration writer — the NAV into the body copy's octets 2-3 (see `txhdr`).
+    if let Some(d) = duration(frame, rate) {
+        for (i, b) in d.to_le_bytes().iter().enumerate() {
+            unsafe { core::ptr::write_volatile((fbuf + 2 + i as u64) as *mut u8, *b) };
+        }
     }
     unsafe {
         fill(p.ring, slot, hbuf, TXH_SIZE, DCTL0_FRAMESTART, w);
@@ -627,7 +692,7 @@ pub(super) struct Queue {
     pub acked: u32,
     pub failed: u32,
     pub stuck: u32,
-    pub full: u32,
+    pub full: u32, rate: [u8; BUF_FRAMES], pub ctl: crate::wifi::data::RateCtl, // STATIONRATECTL (B881): the rate each buffer pair's frame was posted at (0 = group addr1, not counted) and the rate controller, both under STATION
 }
 
 impl Queue {
@@ -651,7 +716,7 @@ fn cookie_of(n: usize) -> u16 {
 
 /// Post frame `n` on the ring for the kept station and return — no wait (`post`). `false` = refused (no room, counted
 /// `full`; or outside the ring's frame / length bounds), nothing written.
-pub(super) fn queue(bar0: u64, p: &Prep, q: &mut Queue, frame: &[u8], ch: u16, n: usize, now_ms: u64, rate: u8, w: &mut Writes) -> bool {
+pub(super) fn queue(bar0: u64, p: &Prep, q: &mut Queue, frame: &[u8], ch: u16, n: usize, now_ms: u64, rate: TxRate, w: &mut Writes) -> bool {
     if !q.room() {
         q.full += 1;
         return false;
@@ -662,7 +727,7 @@ pub(super) fn queue(bar0: u64, p: &Prep, q: &mut Queue, frame: &[u8], ch: u16, n
     if q.n == 0 {
         q.first = n;
     }
-    q.t0_ms[n % BUF_FRAMES] = now_ms;
+    q.t0_ms[n % BUF_FRAMES] = now_ms; q.rate[n % BUF_FRAMES] = if frame[4] & 0x01 == 0 { rate.rate } else { 0 }; // STATIONRATECTL (B881)
     let (cookie, _, _, _) = post(bar0, p, frame, ch, n, rate, w);
     q.n += 1;
     q.posted += 1;
@@ -688,13 +753,13 @@ pub(super) fn reap(bar0: u64, q: &mut Queue, now_ms: u64) {
         if r.intermediate || q.n == 0 {
             continue;
         }
-        let Some(k) = (0..q.n).find(|&i| cookie_of(q.first + i) == ck) else { continue };
+        let Some(k) = (0..q.n).find(|&i| cookie_of(q.first + i) == ck) else { continue }; let at = q.rate[(q.first + k) % FRAMES % BUF_FRAMES]; // STATIONRATECTL (B881): the popped frame's posted rate
         for _ in 0..k {
             q.pop();
             q.failed += 1;
         }
         q.pop();
-        let ok = r.frame_count > 0 && r.supp == 0;
+        let ok = r.frame_count > 0 && r.supp == 0; q.ctl.frame(at, ok && r.acked && (r.frame_count as u16) <= RETRY_LONG, r.frame_count); // STATIONRATECTL (B881): `Report::acked_at_rate`'s rule, the one status reader counts
         if ok {
             q.sent += 1;
             if r.acked {
@@ -738,9 +803,9 @@ pub(super) fn rate_kat() -> [bool; 4] {
     f[0] = 0x08;
     f[1] = 0x01;
     f[4..10].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
-    let h = txhdr(&f, 11, COOKIE_RING1, wifi_core::ieee80211::RATE_24M);
-    let g = txhdr(&f, 11, COOKIE_RING1, wifi_core::ieee80211::RATE_11M);
-    let c = txhdr(&f, 11, COOKIE_RING1, RATE_1M);
+    let h = txhdr(&f, 11, COOKIE_RING1, TxRate::long(wifi_core::ieee80211::RATE_24M));
+    let g = txhdr(&f, 11, COOKIE_RING1, TxRate::long(wifi_core::ieee80211::RATE_11M));
+    let c = txhdr(&f, 11, COOKIE_RING1, TxRate::long(RATE_1M));
     let hdr = h[TXH_PHY_RATE] == 0x09 && h[TXH_PHY_CTL..TXH_PHY_CTL + 2] == [0xC1, 0x00]
         && h[TXH_PHY_CTL1..TXH_PHY_CTL1 + 2] == [0x02, 0x10] && h[TXH_PHY_CTL1_FB..TXH_PHY_CTL1_FB + 2] == [0x02, 0x00]
         && h[TXH_EXTRA_FT] == TXH_EFT_FB_CCK && h[TXH_PLCP_FB..TXH_PLCP_FB + 6] == [0x0A, 0x04, 0x00, 0x02, 0, 0]
@@ -748,4 +813,232 @@ pub(super) fn rate_kat() -> [bool; 4] {
         && g[TXH_PHY_RATE] == 0x6E && g[TXH_PHY_CTL..TXH_PHY_CTL + 2] == [0xC0, 0x00] && g[TXH_PHY_CTL1..TXH_PHY_CTL1 + 2] == [0x02, 0x00]
         && c[TXH_PHY_RATE] == 0x0A && c[TXH_PHY_CTL..TXH_PHY_CTL + 2] == [0xC0, 0x00] && c[TXH_PLCP_598..TXH_PLCP_598 + 6] == [0x0A, 0x04, 0x00, 0x02, 0, 0];
     [cck1, cck11, ofdm24, hdr]
+}
+
+// ── STATIONAIR (rmbp-ledger B862): the station's air — one TxRate, the NAV, the short preamble ────────────────────
+
+/// The rate a frame leaves at (500 kbit/s units), the rate the AP answers it with (`assoc::ack_rate`, the control response
+/// rate) and whether the primary rate uses the short preamble (`assoc::station_short`). The rungs pass `long(rate)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct TxRate {
+    pub rate: u8,
+    pub ack: u8,
+    pub short: bool, pub fb: u8, // STATIONRATECTL (B881): `fb` = the TX header's fallback rate, a CCK rate (`assoc::fallback_rate`; the rungs CCK 1)
+    /// STATIONERP (B884): the BSS's ERP Use_Protection (`assoc::erp_protect`) — an OFDM frame goes behind a CTS-to-self.
+    pub prot: bool,
+}
+
+impl TxRate {
+    /// `rate`, answered at `rate`, long preamble.
+    pub(super) const fn long(rate: u8) -> TxRate {
+        TxRate { rate, ack: rate, short: false, fb: RATE_1M, prot: false }
+    }
+}
+
+/// The short-preamble bit applies: asked for, and the rate is CCK 2/5.5/11 (never CCK 1, never OFDM, never an unknown rate).
+fn short_ok(r: TxRate) -> bool {
+    r.short && matches!(ratecode(r.rate), Some((_, false))) && r.rate != RATE_1M
+}
+
+/// The ACK's airtime (14 octets, 112 bits) at `ack` (500 kbit/s units): CCK = the PLCP preamble + header (192 us long, 96 us
+/// short; CCK 1 is always long) + ceil(112 / Mbit/s) = ceil(224 / ack); OFDM (ERP) = 16 us preamble + 4 us SIGNAL + 4 us per
+/// symbol over 16 + 112 + 6 bits at 2 * ack data bits per symbol + the 6 us signal extension. An unknown rate counts as CCK 1.
+/// STATIONERP (B884): the formula is `air_us`'s for 14 octets (the CTS-to-self's NAV times the protected frame with it).
+fn ack_us(ack: u8, short: bool) -> u16 {
+    air_us(14, ack, short)
+}
+
+/// The airtime of `octets` (FCS included) at `rate` (500 kbit/s units): CCK = the PLCP preamble + header (192 us long, 96 us
+/// short; CCK 1 always long) + ceil(octets * 16 / rate); OFDM (ERP) = 16 us preamble + 4 us SIGNAL + 4 us per symbol over
+/// 16 + 8 * octets + 6 bits at 2 * rate data bits per symbol + the 6 us signal extension. An unknown rate counts as CCK 1.
+fn air_us(octets: usize, rate: u8, short: bool) -> u16 {
+    let o = octets as u32;
+    let us = match ratecode(rate) {
+        Some((_, true)) => {
+            let ndbps = 2 * rate as u32;
+            16 + 4 + 4 * ((22 + 8 * o + ndbps - 1) / ndbps) + 6
+        }
+        Some((_, false)) => {
+            let pre = if short && rate != RATE_1M { 96 } else { 192 };
+            pre + (o * 16 + rate as u32 - 1) / rate as u32
+        }
+        None => 192 + o * 8,
+    };
+    us.min(u16::MAX as u32) as u16
+}
+
+/// The NAV an individually addressed frame carries: SIFS + the ACK at `r.ack` with `r`'s preamble.
+pub(super) fn nav_us(r: TxRate) -> u16 {
+    SIFS_US + ack_us(r.ack, r.short)
+}
+
+/// IEEE Std 802.11-2020 §9.2.5 (Duration/ID) for a non-fragmented frame: `None` unless a Data-type frame (FC type 2) or,
+/// since STATIONMGMTDUR (B884), a Management-type frame (FC type 0: the rungs' auth and association requests) of at least 24
+/// octets whose Duration is 0 (the field is then left as the codec built it); 0 for a group addr1; else `nav_us`.
+pub(super) fn duration(frame: &[u8], r: TxRate) -> Option<u16> {
+    if frame.len() < 24 || !matches!((frame[0] >> 2) & 0x3, 0x0 | 0x2) || frame[2] != 0 || frame[3] != 0 {
+        return None;
+    }
+    if frame[4] & 0x01 != 0 {
+        return Some(0);
+    }
+    Some(nav_us(r))
+}
+
+/// `tests wifi` (through `join::station_kat`): [duration, shortpre], hand-computed. A 60-octet unicast ToDS data frame:
+/// CCK 11 long 10+192+11 = 213, short 10+96+11 = 117, answered at CCK 2 10+192+56 = 258, CCK 5.5 10+192+21 = 223, CCK 1
+/// 10+192+112 = 314, OFDM 24 10+16+4+8+6 = 44, OFDM 6 10+16+4+24+6 = 60; a group addr1 0; a unicast management frame 213
+/// (STATIONMGMTDUR B884; `mgmt_dur_kat`), a frame already carrying a Duration untouched; dur_fb 314 (0x013A) at CCK 11 and at CCK 1. phy_ctl: CCK 11 short 0x00D0, CCK 1
+/// asked short 0x00C0, OFDM 24 asked short 0x00C1; mac_ctl's fallback-preamble bits (top three) stay clear.
+pub(super) fn air_kat() -> [bool; 2] {
+    use wifi_core::ieee80211::{RATE_11M, RATE_24M};
+    let mut f = alloc::vec![0u8; 60];
+    f[0] = 0x08;
+    f[1] = 0x01;
+    f[4..10].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    let t = |rate: u8, ack: u8, short: bool| TxRate { rate, ack, short, fb: RATE_1M, prot: false };
+    let mut grp = f.clone();
+    grp[4..10].copy_from_slice(&[0xFF; 6]);
+    let mut mgmt = f.clone();
+    mgmt[0] = 0x00;
+    let mut set = f.clone();
+    set[2] = 0x3A;
+    set[3] = 0x01;
+    let h11 = txhdr(&f, 11, COOKIE_RING1, TxRate::long(RATE_11M));
+    let h1 = txhdr(&f, 11, COOKIE_RING1, TxRate::long(RATE_1M));
+    let dur = duration(&f, TxRate::long(RATE_11M)) == Some(213)
+        && duration(&f, t(RATE_11M, RATE_11M, true)) == Some(117)
+        && duration(&f, t(RATE_11M, 4, false)) == Some(258)
+        && duration(&f, TxRate::long(11)) == Some(223)
+        && duration(&f, TxRate::long(RATE_1M)) == Some(314)
+        && duration(&f, TxRate::long(RATE_24M)) == Some(44)
+        && duration(&f, TxRate::long(12)) == Some(60)
+        && duration(&grp, TxRate::long(RATE_11M)) == Some(0)
+        && duration(&mgmt, TxRate::long(RATE_11M)) == Some(213)
+        && duration(&set, TxRate::long(RATE_11M)).is_none()
+        && h11[TXH_DUR_FB..TXH_DUR_FB + 2] == [0x3A, 0x01] && h1[TXH_DUR_FB..TXH_DUR_FB + 2] == [0x3A, 0x01]
+        && mgmt_dur_kat(&f);
+    let s11 = txhdr(&f, 11, COOKIE_RING1, t(RATE_11M, RATE_11M, true));
+    let s1 = txhdr(&f, 11, COOKIE_RING1, t(RATE_1M, RATE_1M, true));
+    let s24 = txhdr(&f, 11, COOKIE_RING1, t(RATE_24M, RATE_24M, true));
+    let short = s11[TXH_PHY_CTL..TXH_PHY_CTL + 2] == [0xD0, 0x00] && s11[TXH_MAC_CTL + 3] & 0xE0 == 0
+        && s11[TXH_PLCP_FB..TXH_PLCP_FB + 6] == h11[TXH_PLCP_FB..TXH_PLCP_FB + 6]
+        && s1[TXH_PHY_CTL..TXH_PHY_CTL + 2] == [0xC0, 0x00] && s24[TXH_PHY_CTL..TXH_PHY_CTL + 2] == [0xC1, 0x00];
+    [dur, short]
+}
+
+// ── STATIONRATECTL (rmbp-ledger B881): the TX header's fallback follows the rate ──────────────────────────────────
+
+/// The fallback rate `txhdr` writes: `r.fb` when it is a CCK rate (the header's fallback words stay in CCK form: extra_ft
+/// FB_CCK, phy_ctl1_fb BW_20), else CCK 1. `assoc::fallback_rate` picks the highest BASIC CCK rate below the primary, so the
+/// AP answers a fallback frame at the fallback rate and dur_fb = SIFS + the ACK at `fb` long is exact. Stated divergence from
+/// b43 `b43_calc_fallback_rate` (OFDM falls back to OFDM there).
+fn fb_of(r: TxRate) -> u8 {
+    if matches!(ratecode(r.fb), Some((_, false))) { r.fb } else { RATE_1M }
+}
+
+/// `tests wifi` (through `join::station_kat`, `data::kat`'s `fallback` row): a 60-octet unicast ToDS data frame (64 octets
+/// with FCS) at OFDM 24 with fallback CCK 11 -> plcp_fb 6E 04 2F 00 (64 * 16 / 22 = 46 r 12 -> 47; 512 % 11 = 6 -> 0x04),
+/// dur_fb 10 + 192 + 11 = 213 (D5 00), phy_ctl1_fb 0x0002, extra_ft 0; an OFDM `fb` is refused to CCK 1; `TxRate::long`
+/// keeps the CCK 1 fallback (0A 04 00 02, the rungs' bytes).
+pub(super) fn fb_kat() -> bool {
+    use wifi_core::ieee80211::{RATE_11M, RATE_24M};
+    let mut f = alloc::vec![0u8; 60];
+    f[0] = 0x08;
+    f[1] = 0x01;
+    f[4..10].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    let h = txhdr(&f, 11, COOKIE_RING1, TxRate { rate: RATE_24M, ack: RATE_24M, short: false, fb: RATE_11M, prot: false });
+    let o = txhdr(&f, 11, COOKIE_RING1, TxRate { rate: RATE_24M, ack: RATE_24M, short: false, fb: 12, prot: false });
+    let l = txhdr(&f, 11, COOKIE_RING1, TxRate::long(RATE_24M));
+    h[TXH_PLCP_FB..TXH_PLCP_FB + 6] == [0x6E, 0x04, 0x2F, 0x00, 0, 0] && h[TXH_DUR_FB..TXH_DUR_FB + 2] == [0xD5, 0x00]
+        && h[TXH_PHY_CTL1_FB..TXH_PHY_CTL1_FB + 2] == [0x02, 0x00] && h[TXH_EXTRA_FT] == TXH_EFT_FB_CCK
+        && o[TXH_PLCP_FB..TXH_PLCP_FB + 6] == [0x0A, 0x04, 0x00, 0x02, 0, 0] && o[TXH_DUR_FB..TXH_DUR_FB + 2] == [0x3A, 0x01]
+        && l[TXH_PLCP_FB..TXH_PLCP_FB + 6] == [0x0A, 0x04, 0x00, 0x02, 0, 0] && l[TXH_DUR_FB..TXH_DUR_FB + 2] == [0x3A, 0x01]
+}
+
+// ── STATIONERP / STATIONMGMTDUR (rmbp-ledger B884): the CTS-to-self in the FW598 header's RTS slot; the rungs' NAV ───────────
+
+/// b43 `xmit.c:421-539` for CTS protection (`IEEE80211_TX_RC_USE_CTS_PROTECT`), from `txhdr` when `r.prot` and the frame is OFDM:
+/// mac_ctl gains SENDCTS (`xmit.h:114`, `xmit.c:458`); `format_598.rts_frame` carries the CTS (§9.3.1.3: FC c4 00, Duration, RA =
+/// the frame's addr2 = our MAC, the transmitter's own address); `rts_plcp` codes CTS_LEN + FCS at the CTS rate = `fb_of(r)`, the
+/// highest basic CCK rate below the primary (`assoc::fallback_rate`; mac80211's rule for the protection rate), `rts_plcp_fb` at
+/// CCK 1 (a stated divergence from b43's `b43_calc_fallback_rate` table: nobody answers a CTS, CCK 1 is the most robust);
+/// `rts_dur_fb` = the CTS's own Duration (`xmit.c:517`); `phy_rate_rts` = the CTS rate code (`xmit.c:524-526`); extra_ft's RTS and
+/// RTSFB encodings are CCK = 0 (`xmit.h:137`, `:142`), so the byte is unchanged; `phy_ctl1_rts*` stay 0 as b43 leaves them for a CTS
+/// (`xmit.c:533-538` writes them for RTS only). The CTS Duration (802.11-2020 §10.3.2.9: the pending frame, its ACK, two SIFS) =
+/// SIFS + the frame's airtime at its own rate + the frame's NAV (`duration`, the ONE NAV fn: SIFS + the ACK, 0 for a group addr1;
+/// else the field the frame carries).
+fn cts_to_self(h: &mut [u8; TXH_SIZE], frame: &[u8], r: TxRate) {
+    let mac_ctl = u32::from_le_bytes([h[TXH_MAC_CTL], h[TXH_MAC_CTL + 1], h[TXH_MAC_CTL + 2], h[TXH_MAC_CTL + 3]]) | TXH_MAC_SENDCTS;
+    h[TXH_MAC_CTL..TXH_MAC_CTL + 4].copy_from_slice(&mac_ctl.to_le_bytes());
+    let nav = duration(frame, r).unwrap_or(u16::from_le_bytes([frame[2], frame[3]]));
+    let dur = SIFS_US.saturating_add(air_us(frame.len() + FCS_LEN, r.rate, short_ok(r))).saturating_add(nav);
+    let cts_rate = fb_of(r);
+    let f = &mut h[TXH_RTS_FRAME_598..TXH_RTS_FRAME_598 + 16];
+    f.fill(0);
+    f[0] = 0xC4; // (subtype 12 << 4) | (type 1 << 2): Control, CTS
+    f[2..4].copy_from_slice(&dur.to_le_bytes());
+    f[4..10].copy_from_slice(&frame[10..16]);
+    plcp(&mut h[TXH_RTS_PLCP_598..TXH_RTS_PLCP_598 + 6], CTS_LEN + FCS_LEN, cts_rate);
+    plcp(&mut h[TXH_RTS_PLCP_FB..TXH_RTS_PLCP_FB + 6], CTS_LEN + FCS_LEN, RATE_1M);
+    h[TXH_RTS_DUR_FB..TXH_RTS_DUR_FB + 2].copy_from_slice(&dur.to_le_bytes());
+    h[TXH_PHY_RATE_RTS] = ratecode(cts_rate).map_or(CCK_RATECODES[0], |(rc, _)| rc);
+}
+
+/// `air_kat`'s STATIONMGMTDUR half, hand-computed: the rungs' authentication request (FC b0 00, unicast) at `TxRate::long(CCK 1)`
+/// carries 10 + 192 + 112 = 314 us (3A 01) and its header's dur_fb 3A 01 (was 00 00); a probe request (FC 40 00, group addr1)
+/// stays 0 and its dur_fb 00 00; a control frame (FC c4 00) is not a Duration this fn writes.
+fn mgmt_dur_kat(f: &[u8]) -> bool {
+    let mut auth = f.to_vec();
+    auth[0] = 0xB0;
+    auth[1] = 0x00;
+    let mut probe = auth.clone();
+    probe[0] = 0x40;
+    probe[4..10].copy_from_slice(&[0xFF; 6]);
+    let mut ctl = auth.clone();
+    ctl[0] = 0xC4;
+    let ha = txhdr(&auth, 11, COOKIE_RING1, TxRate::long(RATE_1M));
+    let hp = txhdr(&probe, 11, COOKIE_RING1, TxRate::long(RATE_1M));
+    duration(&auth, TxRate::long(RATE_1M)) == Some(314) && ha[TXH_DUR_FB..TXH_DUR_FB + 2] == [0x3A, 0x01]
+        && duration(&probe, TxRate::long(RATE_1M)) == Some(0) && hp[TXH_DUR_FB..TXH_DUR_FB + 2] == [0x00, 0x00]
+        && duration(&ctl, TxRate::long(RATE_1M)).is_none()
+}
+
+/// `tests wifi` (through `join::station_kat`, `data::kat`'s `cts` row), hand-computed: a 60-octet unicast ToDS data frame (64
+/// octets with FCS; addr2 = STA 02:55:4e:41:4f:53) at OFDM 24, answered at OFDM 24, fallback CCK 11, protected: its airtime
+/// 16 + 4 + 4 * ceil(534 / 96) + 6 = 50, its NAV 44, the CTS Duration 10 + 50 + 44 = 104 (68 00); rts_frame c4 00 68 00 + STA + six
+/// zeros; rts_plcp CCK 11 of 14 octets 6E 84 0B 00 (224 / 22 -> 11, 112 % 11 = 2 < 4); rts_plcp_fb CCK 1 0A 04 70 00; rts_dur_fb
+/// 68 00; phy_rate_rts 0x6E; mac_ctl 0x0000081B; extra_ft 0; every other octet equal to the unprotected header. The same frame at
+/// CCK 11, protected: no CTS (mac_ctl 0x1B, the slot zero). A group addr1 at OFDM 24, protected: Duration 10 + 50 + 0 = 60 (3C 00),
+/// mac_ctl 0x0000081A.
+pub(super) fn cts_kat() -> bool {
+    use wifi_core::ieee80211::{RATE_11M, RATE_24M};
+    const STA: [u8; 6] = [0x02, 0x55, 0x4e, 0x41, 0x4f, 0x53];
+    let mut f = alloc::vec![0u8; 60];
+    f[0] = 0x08;
+    f[1] = 0x01;
+    f[4..10].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    f[10..16].copy_from_slice(&STA);
+    let pr = TxRate { rate: RATE_24M, ack: RATE_24M, short: false, fb: RATE_11M, prot: true };
+    let p = txhdr(&f, 11, COOKIE_RING1, pr);
+    let n = txhdr(&f, 11, COOKIE_RING1, TxRate { prot: false, ..pr });
+    let mut cts = [0u8; 16];
+    cts[..4].copy_from_slice(&[0xC4, 0x00, 0x68, 0x00]);
+    cts[4..10].copy_from_slice(&STA);
+    let slot = p[TXH_MAC_CTL..TXH_MAC_CTL + 4] == [0x1B, 0x08, 0x00, 0x00] && p[TXH_RTS_FRAME_598..TXH_RTS_FRAME_598 + 16] == cts
+        && p[TXH_RTS_PLCP_598..TXH_RTS_PLCP_598 + 6] == [0x6E, 0x84, 0x0B, 0x00, 0, 0]
+        && p[TXH_RTS_PLCP_FB..TXH_RTS_PLCP_FB + 6] == [0x0A, 0x04, 0x70, 0x00, 0, 0]
+        && p[TXH_RTS_DUR_FB..TXH_RTS_DUR_FB + 2] == [0x68, 0x00] && p[TXH_PHY_RATE_RTS] == 0x6E && p[TXH_EXTRA_FT] == 0;
+    let rest = n[TXH_MAC_CTL..TXH_MAC_CTL + 4] == [0x1B, 0x00, 0x00, 0x00] && p[4..TXH_PHY_RATE_RTS] == n[4..TXH_PHY_RATE_RTS]
+        && p[TXH_PHY_RATE_RTS + 1..TXH_RTS_PLCP_FB] == n[TXH_PHY_RATE_RTS + 1..TXH_RTS_PLCP_FB]
+        && p[TXH_RTS_DUR_FB + 2..TXH_RTS_PLCP_598] == n[TXH_RTS_DUR_FB + 2..TXH_RTS_PLCP_598]
+        && p[TXH_RTS_FRAME_598 + 16..] == n[TXH_RTS_FRAME_598 + 16..]
+        && n[TXH_RTS_PLCP_598..TXH_RTS_FRAME_598 + 16].iter().all(|b| *b == 0) && n[TXH_PHY_RATE_RTS] == 0;
+    let c = txhdr(&f, 11, COOKIE_RING1, TxRate { rate: RATE_11M, ack: RATE_11M, ..pr });
+    let cck = c[TXH_MAC_CTL..TXH_MAC_CTL + 4] == [0x1B, 0x00, 0x00, 0x00] && c[TXH_RTS_PLCP_598..TXH_RTS_FRAME_598 + 16].iter().all(|b| *b == 0);
+    let mut g = f.clone();
+    g[4..10].copy_from_slice(&[0xFF; 6]);
+    let gh = txhdr(&g, 11, COOKIE_RING1, pr);
+    let grp = gh[TXH_MAC_CTL..TXH_MAC_CTL + 4] == [0x1A, 0x08, 0x00, 0x00] && gh[TXH_RTS_FRAME_598 + 2..TXH_RTS_FRAME_598 + 4] == [0x3C, 0x00];
+    slot && rest && cck && grp
 }

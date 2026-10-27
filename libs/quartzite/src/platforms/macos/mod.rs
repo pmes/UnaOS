@@ -28,6 +28,10 @@ pub mod workspace;
 pub mod tetra_eval;
 pub mod button;
 pub mod text_field;
+pub mod tab_strip;
+pub mod find_bar;
+pub mod status_line;
+pub mod downloads;
 
 // The UI bootstrapping closure
 type BootstrapFn = Box<
@@ -414,5 +418,42 @@ impl Backend {
         unsafe {
             let _: () = msg_send![&app, run];
         }
+    }
+}
+
+/// AETHERMACCHROME (SR205): the Aether browser window on AppKit, the GTK face's `bootstrap_browser_chrome`
+/// counterpart over the same `Browser*` wire: the tetra `toolbar` (back, forward, reload, the address field) across
+/// the top; under it the side tab column ([`tab_strip`], carrying the find bar's Cmd+F button) beside the page column
+/// (the [`find_bar`] over the page surface, the [`downloads`] list under it); the [`status_line`] at the foot. The
+/// title bar follows the page (`window_title::bind_browser_title`). The page surface is the one `eval_tetra` builds
+/// (stretched), so it takes the window's slack; every other piece hugs.
+pub fn bootstrap_browser_chrome(window: &NSWindow, toolbar: crate::tetra::TetraNode, synapse: bandy::Synapse) -> Retained<NSView> {
+    window_title::bind_browser_title(window, synapse.clone());
+    let bar = tetra_eval::eval_tetra(toolbar, synapse.clone());
+    tab_strip::hug(&bar, 1);
+    let find = find_bar::bootstrap_find_bar(synapse.clone());
+    let side = tab_strip::bootstrap_side_tabs(synapse.clone(), find_bar::find_toggle(&find));
+    let page = tetra_eval::eval_tetra(crate::tetra::TetraNode::Surface { id: "viewport".into() }, synapse.clone());
+    let downloads = downloads::bootstrap_downloads(synapse.clone());
+    let status = status_line::bootstrap_status_line(synapse);
+
+    let page_col = tab_strip::stack(true);
+    let body = tab_strip::stack(false);
+    let root = tab_strip::stack(true);
+    unsafe {
+        // NSLayoutAttributeWidth = 7: the page column's and the root's children fill their width.
+        let _: () = msg_send![&page_col, setAlignment: 7isize];
+        let _: () = msg_send![&root, setAlignment: 7isize];
+        // NSLayoutAttributeHeight = 8: the side column and the page column take the body's full height.
+        let _: () = msg_send![&body, setAlignment: 8isize];
+        let _: () = msg_send![&page_col, addArrangedSubview: &*find.root];
+        let _: () = msg_send![&page_col, addArrangedSubview: &*page];
+        let _: () = msg_send![&page_col, addArrangedSubview: &*downloads];
+        let _: () = msg_send![&body, addArrangedSubview: &*side];
+        let _: () = msg_send![&body, addArrangedSubview: &*page_col];
+        let _: () = msg_send![&root, addArrangedSubview: &*bar];
+        let _: () = msg_send![&root, addArrangedSubview: &*body];
+        let _: () = msg_send![&root, addArrangedSubview: &*status];
+        Retained::cast_unchecked::<NSView>(root)
     }
 }

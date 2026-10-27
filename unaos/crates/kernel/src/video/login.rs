@@ -689,7 +689,7 @@ fn open_as(state: State) {
         crate::splash::hold_release("first-screen");
         return;
     }
-    CARD_H.store(h_at(theme::metrics()), Ordering::Relaxed); let Some((_s, ow, oh)) = wm::spawn_geometry_native(super::super::metrics::size(W), super::super::metrics::size(H())) else { // TEXTSCALE3 (B849): the height this card lays out at, latched before the row exists
+    CARD_H.store(h_at(theme::metrics()), Ordering::Relaxed); seat_open(); let Some((_s, ow, oh)) = wm::spawn_geometry_native(super::super::metrics::size(W), super::super::metrics::size(H())) else { // TEXTSCALE3 (B849): the height this card lays out at, latched before the row exists
         crate::bootlog_println!("[login] screen open window=no (no surface yet — headless form)");
         crate::splash::hold_release("first-screen");
         return;
@@ -712,8 +712,8 @@ fn open_as(state: State) {
     // argument gives the login screen a close box and gives a one-click route to a machine with no
     // screen, no console and a swallowed keyboard. The fixture's CLOSE leg measures it every witness
     // boot, against a control row that differs only here.
-    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::Unlock { b"Unlock" } else if state == State::CreateUser { b"Create account" } else { b"Log in" };
-    let id = wm::create_at_native(OWNER, surf, sw * sh * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
+    let title: &[u8] = if LOCKED.load(Ordering::Relaxed) { b"Locked" } else if state == State::SetPw { b"Set password" } else if state == State::Unlock { b"Unlock" } else if state == State::CreateUser { b"Create account" } else { b"Log in" }; *CARD_TITLE.lock() = title;
+    let id = wm::create_at_native(OWNER, surf, sw * super::super::metrics::size(CARD_CAP.load(Ordering::Relaxed)) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, ox + wm::BORDER(), oy + wm::TITLE_H() + wm::BORDER());
     if id == wm::WIN_NONE {
         FORM.lock().windowed = false;
         serial_println!("[login] screen open window=no (create refused — headless form)");
@@ -962,7 +962,7 @@ pub fn consume_key(c: u8) -> bool {
     // mutex take and one relaxed load, and it answers `false`.
     heal_if_row_gone();
     crate::boot::key_taken(); // INSTALLBARE M2 (R86): `[login] key latency ms=` — the EHCI decode's stamp to here
-    submit_drain(); // INPUTSTALL M5: an outcome that landed since the last pass applies before this key is read
+    kb_drain_key(); // INPUTSTALL M5: an outcome that landed since the last pass applies before this key is read. KEYBOOT4 (B864): `submit_drain` labelled `on=key` (tail)
     if submit_busy() {
         return true; // INPUTSTALL M5: a submit is on the worker — the form takes no keys until its outcome lands
     }
@@ -2065,7 +2065,7 @@ pub fn shot_release() -> bool {
 /// glass, painted before the volume was up) repaints once in DejaVu Sans.
 pub fn font_repaint() {
     if is_open() {
-        repaint();
+        if !reseat() { repaint(); }
     }
 }
 
@@ -2358,7 +2358,7 @@ fn dispatch_old(job: Job, n: &[u8], p: &[u8], o: &[u8]) {
     w.old[..w.olen].copy_from_slice(&o[..w.olen]);
     let windowed = FORM.lock().windowed || kb_off_render(job); // KEYBOOT2 (B810): the unlock's KDF takes the worker windowed or headless, never the render/input task (LINE-NEUTRAL fold, code first; body at the tail)
     if windowed && kb_worker(job).is_some() && !BUSY.swap(true, Ordering::AcqRel) { // KEYBOOT3 (B856): `kb_worker` — x86 `worker_core()` for every job (unchanged); the Pi's unlock on a worker core (tail). LINE-NEUTRAL
-        let _ = DONE.lock().take(); // a late outcome of a released submit is never applied to this one
+        let _ = DONE.lock().take(); kb_woke_clear(); // a late outcome of a released submit is never applied to this one. KEYBOOT4 (B864): nor labelled by its late wake (LINE-NEUTRAL, body at the tail)
         *WORK.lock() = Some(w);
         // SAFETY: a plain store into our own local; volatile so the scrub of the password copy is not elided.
         unsafe { core::ptr::write_volatile(&mut w.pw, [0; FIELD_MAX]); core::ptr::write_volatile(&mut w.old, [0; FIELD_MAX]) };
@@ -2401,7 +2401,7 @@ fn submit_worker(_: usize) {
     let (out, kdf_ms, adduser_ms) = compute(&w);
     w.pw = [0; FIELD_MAX];
     w.old = [0; FIELD_MAX];
-    *DONE.lock() = Some(Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: true, blocked_ms: 0 });
+    *DONE.lock() = Some(Done { out, name: w.name, nlen: w.nlen, kdf_ms, adduser_ms, on_worker: true, blocked_ms: 0 }); kb_wake(); // KEYBOOT4 (B864): posted, THEN the render task woken (the Pi's registered hook; none on x86). LINE-NEUTRAL, body at the tail
 }
 
 /// The render task's drain: apply a landed outcome (called from the render loop's pulse and ahead of every
@@ -2432,7 +2432,7 @@ pub fn submit_drain() { crate::video::lock::service(); civil_tick(); // CLOCKPAI
             f.message = "";
         }
     }
-    say(&d, outcome_word(&d.out));
+    say(&d, outcome_word(&d.out)); kb_drained(&d.out); // KEYBOOT4 (B864): `[login] unlock drained on=<wake|tick|key>` (LINE-NEUTRAL, body at the tail)
     apply(&d);
     BUSY.store(false, Ordering::Release);
     repaint();
@@ -3505,7 +3505,7 @@ pub fn consume_char(ch: char) -> bool {
     }
     heal_if_row_gone();
     crate::boot::key_taken();
-    submit_drain();
+    kb_drain_key(); // KEYBOOT4 (B864): `submit_drain` labelled `on=key` (tail)
     if submit_busy() || PFOCUS.load(Ordering::Relaxed) != 0 {
         return true;
     }
@@ -3682,10 +3682,11 @@ fn kb_wire(ok: bool, why: &'static str) {
 // The card draws the UI face (`FACE`) on bands that sat at constant logical tops on a 16 px rhythm, so the largest
 // text step overwrote its own rows. Every band top is now `gy(top)`: the top at the default size grown once for each
 // text band above it, the count read from ONE table (`BANDS`), and the boxes (`FIELD_H`, `BTN_H`, `PWR_H`) hold the
-// UI line (`theme::metrics().grow`, TEXTSCALE's one reader). The card's height (`h_at`) is latched at open (`CARD_H`):
-// no public wm door resizes a kernel row and the surface is a leaked buffer the row names, so a card open across a
-// step keeps its height (TEXTSCALE-RESEAT, owed). Labels clip at the field; captions stay inside their box. The
-// default size draws the constants.
+// UI line (`theme::metrics().grow`, TEXTSCALE's one reader). The card's height (`h_at`) is set at open (`CARD_H`) and
+// RE-SEATED live (TEXTSCALERESEAT B880): the open reserves the surface for the card's LARGEST height (`h_at` at the
+// cap, `CARD_CAP`) and names that capacity at create, and the restyle hook (`font_repaint` -> `reseat`) repaints at the
+// new `h_at` and asks `wm::resize_kernel_row` for it; past the capacity the door refuses and the card keeps its height.
+// Labels clip at the field; captions stay inside their box. The default size draws the constants.
 
 /// THE BAND TABLE — every literal band top the card's forms use, at the default size, and the number of text bands
 /// above it (each grows the top by what the UI line grew). A new band is added HERE, once; a top missing from the
@@ -3763,7 +3764,7 @@ pub fn textscale_rows() -> (usize, bool) {
 fn kb_worker(job: Job) -> Option<usize> {
     #[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
     {
-        if !kb_off_render(job) {
+        if !kb_arm_job(job) { // KEYBOOT4 (B864): the unlock AND the create/verify submits (ARMSUBMIT; the audit at `kb_arm_job`)
             return None;
         }
         let o = crate::arch::smp::online_secondaries();
@@ -3809,4 +3810,171 @@ pub fn kb_arm_drain() {
     if submit_busy() {
         submit_drain();
     }
+}
+
+// ── KEYBOOT4 (rmbp-ledger B864) — TAIL-APPENDED: the worker WAKES the render task; the Pi's create/verify on the worker ─
+// KEYBOOT3 put the Pi's unlock on a worker core, but its outcome waited for the render task's next wake: the 250 ms
+// status tick on metal, and on QEMU raspi4b (no live timer, so no `status-tick` task) the next KEY. Now the worker
+// posts DONE and calls ONE registered hook — the Pi binary registers `gui_send(Event::Timer)` under `status_tick`'s
+// own `SCREEN_APP_ACTIVE` gate at the render task's spawn (main.rs, the `register_fb_present_hook` shape) — so the
+// render pass's `kb_arm_drain` applies it at once. The hook is copied out of `KB_WAKE` and called with NO lock held;
+// it must be IRQ-safe and must never wait on the render task (`gui_send` is: one counter bump and a channel post the
+// render task drains). x86 registers none (its pulse drains, X86WAKE owed). The drain says how it ran: `[login] unlock
+// drained on=<wake|tick|key>`. ARMSUBMIT: on the Pi `kb_worker` admits the create/verify submits too (`kb_arm_job`).
+
+/// KEYBOOT4: the render-task wake the worker calls after posting its outcome (`None`: nothing registered — x86).
+static KB_WAKE: crate::sync::Mutex<Option<fn()>> = crate::sync::Mutex::new(None);
+/// KEYBOOT4: the worker's wake was posted for the outcome now in `DONE` (swapped false by the drain's label).
+static KB_WOKE: AtomicBool = AtomicBool::new(false);
+/// KEYBOOT4: a drain is running ahead of a key (`consume_key` / `consume_char`).
+static KB_VIA_KEY: AtomicBool = AtomicBool::new(false);
+
+/// KEYBOOT4: register the render task's wake (the Pi binary, once, at the render task's spawn). IRQ-safe, never
+/// waits on the render task.
+pub fn kb_wake_hook(f: fn()) {
+    *KB_WAKE.lock() = Some(f);
+}
+
+/// KEYBOOT4: the worker's half — the outcome is posted; wake the render task (copied out, called with no lock held).
+fn kb_wake() {
+    let f = *KB_WAKE.lock();
+    if let Some(f) = f {
+        KB_WOKE.store(true, Ordering::Release);
+        f();
+    }
+}
+
+/// KEYBOOT4: a new submit's dispatch — a released submit's late wake never labels the next drain.
+fn kb_woke_clear() {
+    KB_WOKE.store(false, Ordering::Release);
+}
+
+/// KEYBOOT4: the key paths' drain — `submit_drain`, labelled `on=key`.
+fn kb_drain_key() {
+    KB_VIA_KEY.store(true, Ordering::Relaxed);
+    submit_drain();
+    KB_VIA_KEY.store(false, Ordering::Relaxed);
+}
+
+/// KEYBOOT4: `[login] unlock drained on=<wake|tick|key>` — once per applied unlock outcome: `key` ahead of a key,
+/// `wake` on a pass after the worker's wake was posted, else `tick` (a pulse found it).
+fn kb_drained(o: &Outcome) {
+    let woke = KB_WOKE.swap(false, Ordering::AcqRel);
+    if !matches!(o, Outcome::VolUnlock { .. }) {
+        return;
+    }
+    let on = if KB_VIA_KEY.load(Ordering::Relaxed) { "key" } else if woke { "wake" } else { "tick" };
+    serial_println!("[login] unlock drained on={} (KEYBOOT4: the worker's outcome applied on the render task)", on);
+}
+
+/// KEYBOOT4 (ARMSUBMIT): the jobs the Pi gives a worker core — the unlock, and the create / verify submits (create-user,
+/// the login screen's user, the lock screen's unlock). THE AUDIT: they take `TABLE` and `SESSION_LOCAL` (`sync::Mutex`,
+/// BP-cores-20: no raw spin lock outside sync.rs, all in the death walk BP-cores-14), run PBKDF2 / Argon2id with no lock
+/// held, and reach the medium only through the masked `with_unafs` (MOUNT) / `card_lock` (CARD) accessors KEYBOOT3's
+/// unlock worker already takes on that core; the worker is never the input core (BP-cores-3: `online.last()`), and x86
+/// has run this same `compute` on `login-submit` since INPUTSTALL M5 (B375). SetPw and Root stay inline (PISETPW owed).
+#[cfg(all(target_arch = "aarch64", feature = "baremetal"))]
+fn kb_arm_job(job: Job) -> bool {
+    matches!(job, Job::VolUnlock { .. } | Job::Create | Job::User | Job::Unlock)
+}
+
+// ── TEXTSCALERESEAT (rmbp-ledger B880; BP-video-40) — TAIL-APPENDED: the open card re-seats at a text step ────────────
+// The open reserves the leaked surface ONCE for the card's LARGEST height (`cap_h`: `h_at` at the cap metrics, never
+// below the live one) and names that capacity as the row's `surf_len`; every later `surf()` is a no-alloc slice of it
+// (`leaked_surf` reuses a buffer whose cap holds `n`), so the surface is never re-allocated under the live row. The
+// restyle hook (`font_repaint`) re-seats within that capacity through wm's door; past it the card keeps its height.
+
+/// The height the open card's surface was reserved for (logical px; `cap_h` at open).
+static CARD_CAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(H0);
+/// Re-seats the door accepted (the `tests textscale` leg reads deltas).
+static RESEATS: AtomicU32 = AtomicU32::new(0);
+
+/// The card's largest height: `h_at` at the cap the restyle published (else the live panel's `cap_now`), never below
+/// the live `h_at`.
+fn cap_h() -> usize {
+    let m = theme::metrics();
+    let cap = if m.cap_css > 0 { m.cap_css } else { crate::video::text::textscale::cap_now().max(0) as u32 };
+    let top = theme::TextMetrics { line: crate::video::text::textscale::line_at(cap, crate::video::dpi::s2()), cap_css: cap };
+    h_at(m).max(h_at(top))
+}
+
+/// `open_as`, before the row exists: record the capacity and reserve the surface for it.
+fn seat_open() {
+    let cap = cap_h();
+    CARD_CAP.store(cap, Ordering::Relaxed); CARD_S2.store(crate::video::dpi::s2(), Ordering::Relaxed);
+    let _ = super::super::metrics::leaked_surf(&SURF_AT, super::super::metrics::size(W) * super::super::metrics::size(cap));
+}
+
+/// The restyle hook's re-seat: when a row is up and the card's `h_at` moved within its capacity, lay out and paint at
+/// the new height, then ask wm for it. `true` = re-seated (painted); `false` = nothing to do or refused (the caller
+/// repaints at the kept height).
+fn reseat() -> bool {
+    let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE && rescaled(id) { return true; }
+    let h = h_at(theme::metrics());
+    let old = CARD_H.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE || h == old || h > CARD_CAP.load(Ordering::Relaxed) {
+        return false;
+    }
+    CARD_H.store(h, Ordering::Relaxed);
+    repaint();
+    if wm::resize_kernel_row(id, super::super::metrics::size(W), super::super::metrics::size(h)) == Some(true) {
+        RESEATS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    CARD_H.store(old, Ordering::Relaxed);
+    false
+}
+
+/// `tests textscale`: (re-seats so far, the row's height, the height the live text size wants), source px; `None` when
+/// no card row is up.
+#[cfg(feature = "witness")]
+pub fn reseat_probe() -> Option<(u32, usize, usize)> {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE {
+        return None;
+    }
+    let i = wm::info(id)?;
+    Some((RESEATS.load(Ordering::Relaxed), i.h, super::super::metrics::size(h_at(theme::metrics()))))
+}
+
+// ── TEXTSCALERESEAT2 (rmbp-ledger B886; BP-video-40) — TAIL-APPENDED: the open card re-mints at a dpi step ────────────
+// A dpi-scale change since `seat_open` cannot re-seat in place (the row's stride is fixed at create), so `reseat` re-mints
+// the row while it is NOT live: close it (drained), re-reserve the capacity at the new scale, create it where it stood
+// under the title it opened with. The form (typed fields, LOCKED) is kept: this is not `take_down` + `open_as`. No code
+// path changes the scale under an open card today (Settings sits under the modal card; `mode_at_login` runs after it).
+
+/// The scale (`dpi::s2`) the open card's surface was reserved at (`seat_open`).
+static CARD_S2: AtomicU32 = AtomicU32::new(0);
+/// The title the open card's row was minted with (`open_as`).
+static CARD_TITLE: crate::sync::Mutex<&'static [u8]> = crate::sync::Mutex::new(b"Log in");
+/// Not-live re-mints a dpi step gave the open card.
+static RESCALES: AtomicU32 = AtomicU32::new(0);
+
+/// `reseat`'s first question: did the dpi scale move since `seat_open`? `false` = no (re-seat in place). `true` = the row
+/// was re-minted at the new scale.
+fn rescaled(id: wm::WinId) -> bool {
+    let (a, b) = (CARD_S2.load(Ordering::Relaxed), crate::video::dpi::s2());
+    if a == b {
+        return false;
+    }
+    let Some(i) = wm::info(id) else { return false };
+    wm::clear_modal_top(id);
+    wm::close(id); // the WINID teardown clears `WIN`
+    WIN.store(wm::WIN_NONE, Ordering::Relaxed);
+    CARD_H.store(h_at(theme::metrics()), Ordering::Relaxed);
+    seat_open();
+    repaint();
+    let (sw, sh, cap) = (super::super::metrics::size(W), super::super::metrics::size(H()), CARD_CAP.load(Ordering::Relaxed));
+    let title = *CARD_TITLE.lock();
+    let new = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * super::super::metrics::size(cap) * 4, sw as u32, sh as u32, (sw * 4) as u32, title, i.x, i.y);
+    if new != wm::WIN_NONE {
+        WIN.store(new, Ordering::Relaxed);
+        wm::set_modal_top(new);
+        let _ = wm::present(new);
+    } else {
+        FORM.lock().windowed = false;
+    }
+    RESCALES.fetch_add(1, Ordering::Relaxed);
+    serial_println!("[textscale] rescale win=login s2={}->{} old={} new={} cap={}", a, b, id, new, cap);
+    true
 }

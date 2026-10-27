@@ -608,3 +608,15 @@ pub fn decode_avif(file: &[u8]) -> Result<Image> {
     let p = decode_avif_planes(file, Filters::default())?;
     Ok(planes_to_rgba(&p, Upsampling::Bilinear))
 }
+
+/// DEMUXSEEK (LEDGER SR200): the reorder depth of an AV1 track from its AV1CodecConfigurationRecord (`av1C`, Matroska
+/// CodecPrivate) — the number `demux_core::Demuxer::derive_dts` takes. A container sample is one temporal unit, which holds
+/// exactly one shown frame (AV1 §7.5; AV1-ISOBMFF §2.4), so decode order is presentation order: `Some(0)` when the record's
+/// configOBUs carry a sequence header that parses, `None` otherwise.
+pub fn av1c_reorder_depth(av1c: &[u8]) -> Option<u32> {
+    let cfg = crate::avif::Av1Config::parse(av1c).ok()?;
+    let obus = split_obus(&cfg.config_obus).ok()?;
+    let o = obus.iter().find(|o| o.obu_type == OBU_SEQUENCE_HEADER_T)?;
+    SequenceHeader::parse(o.payload).ok()?;
+    Some(0)
+}

@@ -42,7 +42,7 @@
 //! pointer move (the cursor's `RepaintTail::finish`, [`on_pointer`]); a masked caller or a present already running
 //! only OWES one ([`OWED`]), cashed by the next unmasked caller or the service pass ([`service`]). ZOOMFURN (B848):
 //! there is no timer sweep; a writer outside the composite pass names its rows ([`note_drawn`]) or owes one whole
-//! present ([`note_unnoted`]).
+//! present (an unnoted dirty pass; `note_unnoted` is deleted by ZOOMFLUSH2 B868).
 //!
 //! # The cursor
 //!
@@ -80,15 +80,17 @@
 //! no noted write came since the last pass ([`DRAWN`]). The pointer path is KEYED ([`KEYED`]): `present_locked`'s own
 //! glass compare makes a moved origin whole, an unmoved pointer presents the sprite's noted rows. THE SWEEP RULE: a
 //! whole present is owed only by a moved glass key, an engage or factor change, or an UNNOTED write (a dirty pass with
-//! no note, or a writer outside the noted set calling [`note_unnoted`]: dimidle, lidsleep, lock, winsnap), each counted
+//! no note — `note_unnoted`, the door dimidle/lidsleep/lock/winsnap once called, is deleted by ZOOMFLUSH2 B868), each counted
 //! ([`SWEEP_WHOLE`], `sweep_whole=`) and paid ONCE by the next present. No timer: with every writer noted a boot never
 //! sweeps. ZOOMFLUSH (B859): the post-write clean IS the note — `FrameBuffer::flush_*` of the RAM frame names its rows ([`flushed`]).
+//! ZOOMFLUSH2 (B868): it is the ONLY note — strip.rs's and wm's own notes are retired (`double_notes` counts every non-flush
+//! source; `pass_notes` the callerless [`note_rows`] door, both gated 0 by `tests zoom`).
 //!
 //! WIRE: `[zoom] z=<n> follow=<p|f> origin=<x>,<y> present_us=<n> rows=<w>/<h> skipped=<0|1>` on each change
 //! (rate-limited to 1/s, from the service pass); `[zoom] engage refused z=<n> why=<why>` (printed by [`engage`]
 //! itself, ZOOM2 B829); `tests zoom`: `:: ZOOM: z=2 px_ok=3 present_us=<n> -> PASS ::` (+ `panel= smooth_us=
 //! engage_us= budget_us= under= lost= why= present_full_us= present_band_us= rows=<w>/<h> skipped= furn_rows=<ok|bad>
-//! furn=<flush rows>/<dest rows> sweep_whole=<fixture delta> sweep_boot=<n> flush_noted=<n> double_notes=0`); ZOOMFURN (B848): `[zoom] rows=<n>/<h>
+//! furn=<flush rows>/<dest rows> sweep_whole=<fixture delta> sweep_boot=<n> flush_noted=<n> double_notes=0 pass_notes=0`); ZOOMFURN (B848): `[zoom] rows=<n>/<h>
 //! src=<strip|hud|dropdown|cursor|screen|flush> noted=strip:<a>,hud:<b>,dropdown:<c>,cursor:<d>,screen:<e>,flush:<f> sweep_whole=<n>`
 //! (the service pass, at most every 5 s, only when a tally moved).
 
@@ -170,8 +172,10 @@ static NOTED: [AtomicU64; SRC_N] = [const { AtomicU64::new(0) }; SRC_N];
 static LAST_SRC: AtomicU8 = AtomicU8::new(0);
 /// A present is owed whose extent the glass key decides (a pointer move; `present_locked` goes whole on a moved key).
 static KEYED: AtomicBool = AtomicBool::new(false);
-/// UNNOTED writes paid whole since boot (`sweep_whole=`): a dirty pass with no note, or a [`note_unnoted`] caller.
+/// UNNOTED writes paid whole since boot (`sweep_whole=`): a dirty pass with no note.
 static SWEEP_WHOLE: AtomicU64 = AtomicU64::new(0);
+/// ZOOMFLUSH2 (B868): source rows named through [`note_rows`] since boot (`pass_notes=`, gated 0: the door has no caller).
+static PASS_NOTED: AtomicU64 = AtomicU64::new(0);
 /// The furniture line's rate limit and the tally sum it last printed.
 static FURN_AT: AtomicU64 = AtomicU64::new(0);
 static FURN_KEY: AtomicU64 = AtomicU64::new(0);
@@ -289,14 +293,17 @@ pub fn on_damage(dirty: bool) {
     kick(true);
 }
 
-/// ZOOMCOST (B835): a composite pass wrote source rows `y..y+h` of the RAM frame (wm's `zoom_note_pass` and
-/// `zoom_note_boxes`, at the pass's own snapshot points). One relaxed load when the lens is off.
+/// ZOOMCOST (B835): a composite pass wrote source rows `y..y+h` of the RAM frame. ZOOMFLUSH2 (B868): no caller — wm's
+/// `zoom_note_pass` / `zoom_note_boxes` are retired (the pass's own `flush_rect`s note through [`flushed_rows`]); a call
+/// is tallied ([`PASS_NOTED`], `pass_notes=`) so `tests zoom` sees a writer that names rows here instead of cleaning.
+/// One relaxed load when the lens is off.
 #[inline]
 pub fn note_rows(y: usize, h: usize) {
     if LIVE.load(Relaxed) == 0 {
         return;
     }
     set_rows(&PASS_ROWS, y, h);
+    PASS_NOTED.fetch_add(h as u64, Relaxed);
 }
 
 /// ZOOMFURN (B848): a writer outside wm's damage set ALREADY wrote source rows `y..y+h` of the RAM frame (`src` one of
@@ -312,17 +319,6 @@ pub fn note_drawn(y: usize, h: usize, src: u8) {
     let k = (src as usize).min(SRC_N - 1);
     NOTED[k].fetch_add(h as u64, Relaxed);
     LAST_SRC.store(k as u8, Relaxed);
-}
-
-/// ZOOMFURN (B848): a writer that cannot name its rows wrote the RAM frame (a whole-panel fill, the snap ring): one
-/// whole present owed and counted (`sweep_whole=`), paid once by the next present. One relaxed load when off.
-#[inline]
-pub fn note_unnoted() {
-    if LIVE.load(Relaxed) == 0 {
-        return;
-    }
-    SWEEP_WHOLE.fetch_add(1, Relaxed);
-    OWED.store(true, Release);
 }
 
 /// Set rows `y..y+h` (clipped to the bitset) in `set`.
@@ -572,7 +568,7 @@ fn engage_at(z: u8) -> Result<u64, &'static str> {
     }
     LIVE.store(z, Release);
     let us = super::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
-    drop(g); super::theme::bump_epoch(); // crawl A 7: every strip re-seals into the RAM frame
+    drop(g); super::wm::desktop::shadows_covered(super::theme::epoch().wrapping_add(1)); super::theme::bump_epoch(); // crawl A 7: every strip re-seals into the RAM frame. LENSCOVER (SHADOWDAMAGE rmbp-ledger B865): the epoch this bump makes is covered by the damage-all + full present below, so the shadow re-lay only sets STALE (`desktop::shadows_relay`); the one cover fold, ZOOMFLUSH2 (B868) holds the note path. LINE-NEUTRAL fold, code first.
     let _ = super::wm::damage_intersecting(0, 0, w, h);
     super::screen::request_full_present();
     ENGAGE_US.store(us, Relaxed);
@@ -738,18 +734,21 @@ pub fn selftest() {
     let sweep_boot = SWEEP_WHOLE.load(Relaxed);
     let sweep_whole = sweep_boot.saturating_sub(sweep0);
     let furn_ok = furn_why == "-";
+    let pass_notes = PASS_NOTED.load(Relaxed);
     if px_ok == 3 && band_ok && why == "-" {
         if !furn_ok {
             why = furn_why;
         } else if sweep_whole != 0 {
             why = "sweep";
+        } else if pass_notes != 0 {
+            why = "pass";
         }
     }
-    let pass = px_ok == 3 && band_ok && furn_ok && sweep_whole == 0;
+    let pass = px_ok == 3 && band_ok && furn_ok && sweep_whole == 0 && pass_notes == 0;
     serial_println!(
-        ":: ZOOM: z=2 px_ok={} present_us={} -> {} :: panel={}x{} smooth_us={} engage_us={} budget_us={} under={} lost={} why={} present_full_us={} present_band_us={} rows={}/{} skipped={} furn_rows={} furn={}/{} sweep_whole={} sweep_boot={} flush_noted={} double_notes={}",
+        ":: ZOOM: z=2 px_ok={} present_us={} -> {} :: panel={}x{} smooth_us={} engage_us={} budget_us={} under={} lost={} why={} present_full_us={} present_band_us={} rows={}/{} skipped={} furn_rows={} furn={}/{} sweep_whole={} sweep_boot={} flush_noted={} double_notes={} pass_notes={}",
         px_ok, worst, if pass { "PASS" } else { "FAIL" }, w, h, smooth_us, ENGAGE_US.load(Relaxed), BUDGET_US, (worst <= BUDGET_US) as u8, PANEL_LOST.load(Relaxed), why,
-        full_us, band_us, band_rows, h, skipped as u8, if furn_ok { "ok" } else { "bad" }, furn_cur, furn_rows, sweep_whole, sweep_boot, furn_cur, double_notes
+        full_us, band_us, band_rows, h, skipped as u8, if furn_ok { "ok" } else { "bad" }, furn_cur, furn_rows, sweep_whole, sweep_boot, furn_cur, double_notes, pass_notes
     );
 }
 
@@ -775,15 +774,15 @@ fn band_probe() -> (u64, u64, u64, bool) {
 /// owe), then a present that must write rows, not the panel: `0 < rows < h`. Returns `(cursor rows noted, destination
 /// rows written, why)`; why `-` = ok, `furn` = the cursor noted nothing, `furn-whole` = the noted dirty owed whole,
 /// `furn-rows` = the present wrote none or every row. ZOOMFLUSH (B859): the cursor's rows are its flush's (`SRC_FLUSH`), and
-/// a cursor/screen note during the write is a double (`double`, returned third).
+/// (ZOOMFLUSH2 B868) a note from any other source during the write is a double (`double`, returned third).
 fn furn_probe() -> (u64, u64, u64, &'static str) {
     let mut g = LENS.lock();
     let Some(l) = g.as_mut() else { return (0, 0, 0, "furn") };
     let _ = present_locked(l, false, true);
-    let c0 = NOTED[SRC_FLUSH as usize].load(Relaxed); let d0 = NOTED[SRC_CURSOR as usize].load(Relaxed) + NOTED[SRC_SCREEN as usize].load(Relaxed); // ZOOMFLUSH (B859): the cursor write is noted by its flush; a cursor/screen note is a double
+    let c0 = NOTED[SRC_FLUSH as usize].load(Relaxed); let d0 = noted_others(); // ZOOMFLUSH2 (B868): the cursor write is noted by its flush; a note from ANY other source is a double
     DRAWN.store(false, Release);
     super::cursor::repaint();
-    let cur = NOTED[SRC_FLUSH as usize].load(Relaxed).saturating_sub(c0); let double = (NOTED[SRC_CURSOR as usize].load(Relaxed) + NOTED[SRC_SCREEN as usize].load(Relaxed)).saturating_sub(d0);
+    let cur = NOTED[SRC_FLUSH as usize].load(Relaxed).saturating_sub(c0); let double = noted_others().saturating_sub(d0);
     let whole0 = OWED.swap(false, AcqRel);
     on_damage(true);
     let whole = OWED.load(Acquire);
@@ -806,6 +805,12 @@ fn furn_probe() -> (u64, u64, u64, &'static str) {
         "-"
     };
     (cur, rows, double, why)
+}
+
+/// ZOOMFLUSH2 (B868): source rows noted since boot by every source but `flush` — the one note door is the flush, so any
+/// of these moving is a double note (`double_notes=`, [`furn_probe`]).
+fn noted_others() -> u64 {
+    NOTED.iter().enumerate().filter(|&(k, _)| k != SRC_FLUSH as usize).map(|(_, n)| n.load(Relaxed)).sum()
 }
 
 /// ZOOM2 (B829): one fixture present + its read-back under ONE waiting `LENS` hold. The pointer is moved to the corner

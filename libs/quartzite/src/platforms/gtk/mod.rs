@@ -198,7 +198,9 @@ impl Backend {
     }
 
     pub fn run(&self) {
-        self.app.run();
+        // AETHERMACCHROME (SR205): argv is the vessel's (aether-shell's `start_url`), not GApplication's: with no
+        // HANDLES_OPEN a URL argument made GApplication refuse to start.
+        let _ = self.app.run_with_args::<&str>(&[]);
     }
 }
 

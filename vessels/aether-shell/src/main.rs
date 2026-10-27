@@ -1030,9 +1030,10 @@ fn main() {
     }
 
     // R104: the GTK face grows the browser chrome (quartzite's tab strip, url bar, find bar, status
-    // line, downloads); the other faces keep the tetra toolbar until their arms carry it.
+    // line, downloads); the macOS face grows its own below (SR205); the headless fallback keeps the tetra toolbar.
     #[cfg(all(target_os = "linux", feature = "gtk"))]
     {
+        start_url(&synapse); // AETHERMACCHROME (SR205): the GTK face opens the first argument too (run_with_args)
         let syn = synapse.clone();
         quartzite::Backend::new_vessel("org.unaos.aether", "Aether Browser", (800.0, 600.0), move |window| {
             quartzite::platforms::gtk::bootstrap_browser_chrome(window, syn.clone())
@@ -1042,8 +1043,7 @@ fn main() {
 
     #[cfg(not(all(target_os = "linux", feature = "gtk")))]
     {
-        let aether_ui = quartzite::tetra::TetraNode::VStack(vec![
-            quartzite::tetra::TetraNode::HStack(vec![
+        start_url(&synapse); let toolbar = quartzite::tetra::TetraNode::HStack(vec![
                 quartzite::tetra::TetraNode::Button {
                     id: "back".into(),
                     label: "<".into(),
@@ -1064,11 +1064,28 @@ fn main() {
                     placeholder: "Enter URL...".into(),
                     action: quartzite::tetra::TextAction::OpenDocument,
                 },
-            ]),
-            quartzite::tetra::TetraNode::Surface { id: "viewport".into() },
-        ]);
+            ]);
 
-        quartzite::Backend::new_tetra_vessel("org.unaos.aether", "Aether Browser", (800.0, 600.0), aether_ui, synapse.clone()).run();
+        // AETHERMACCHROME (SR205): the macOS face grows the browser chrome around the tetra toolbar (the side tab
+        // column, the find bar, the status line, the downloads; `platforms::macos::bootstrap_browser_chrome`).
+        #[cfg(target_os = "macos")]
+        {
+            let syn = synapse.clone();
+            quartzite::Backend::new_vessel("org.unaos.aether", "Aether Browser", (1000.0, 700.0), move |window| {
+                quartzite::platforms::macos::bootstrap_browser_chrome(window, toolbar, syn)
+            })
+            .run();
+        }
+
+        // The headless fallback keeps the tetra vessel (toolbar over the page).
+        #[cfg(not(target_os = "macos"))]
+        {
+            let aether_ui = quartzite::tetra::TetraNode::VStack(vec![
+                toolbar,
+                quartzite::tetra::TetraNode::Surface { id: "viewport".into() },
+            ]);
+            quartzite::Backend::new_tetra_vessel("org.unaos.aether", "Aether Browser", (800.0, 600.0), aether_ui, synapse.clone()).run();
+        }
     }
 
     // A11YFACE (SR124): the window closed — the socket goes with the process.
@@ -1129,5 +1146,106 @@ mod tests {
         assert!(c.on_key("I", true, true, false));
         assert_eq!(shape(&c), "BrowserDevtoolsLayout { bottom: true, page: (0, 0, 1000, 800), pane: None }");
         assert_eq!(format!("{:?}", devtools_layout(&c, None)), "BrowserDevtoolsLayout { bottom: true, page: (0, 0, 0, 0), pane: None }");
+    }
+
+    /// AETHERMACCHROME (SR205): the AppKit side column's rows are the model's rows. The face derives them from the
+    /// wire (`quartzite::widgets::chrome_rows::side_rows` over `chrome::tabs_message`), and they are
+    /// `TabStrip::rows` kind for kind and id for id — an open group, a collapsed group (its tabs hidden), ungrouped
+    /// tabs, `+` last — with the active tab marked; the face's mirrored widths are the model's.
+    #[test]
+    fn aethermacchrome_rows_follow_the_model_kat() {
+        use chrome::tabs::{GroupColor, Row, TabStrip};
+        use quartzite::widgets::chrome_rows::{self, SideRow};
+        let mut strip = TabStrip::new();
+        let ids: Vec<u64> = (0..5).map(|_| strip.open()).collect();
+        let work = strip.group_new("work", GroupColor::Blue, &ids[1..3]).expect("group");
+        let side = strip.group_new("", GroupColor::Red, &ids[3..4]).expect("group");
+        assert_eq!(strip.group_toggle(side), Some(true));
+        assert!(strip.select(ids[2]));
+        let SMessage::BrowserTabs { active, tabs, groups } = chrome::tabs_message(&strip) else { panic!("not BrowserTabs") };
+        let rows = chrome_rows::side_rows(active, &tabs, &groups);
+        let face: Vec<Row> = rows
+            .iter()
+            .map(|r| match r {
+                SideRow::Group { id, .. } => Row::Group(*id),
+                SideRow::Tab { id, .. } => Row::Tab(*id),
+                SideRow::New => Row::NewTab,
+            })
+            .collect();
+        assert_eq!(face, strip.rows());
+        assert!(rows.iter().any(|r| matches!(r, SideRow::Group { id, count: 2, collapsed: false, .. } if *id == work)));
+        assert!(rows.iter().any(|r| matches!(r, SideRow::Group { id, count: 1, collapsed: true, .. } if *id == side)));
+        let marked: Vec<u64> = rows.iter().filter_map(|r| match r { SideRow::Tab { id, active: true, .. } => Some(*id), _ => None }).collect();
+        assert_eq!(marked, vec![ids[2]]);
+        assert_eq!(
+            (chrome_rows::SIDE_W, chrome_rows::RAIL_W, chrome_rows::ROW_H),
+            (chrome::sidetabs::SIDE_W, chrome::sidetabs::RAIL_W, chrome::sidetabs::ROW_H)
+        );
+    }
+
+    /// AETHERMACCHROME (SR205): the verbs the AppKit column and find bar fire drive the model the way
+    /// `Coordinator::on_bus` applies them: a tab row selects (`TabStrip::select`), its close box closes
+    /// (`TabStrip::close`), `+` opens (`TabStrip::open`), a group header toggles (`chrome::apply_tab_verb`), and the
+    /// republished wire's rows follow; the find bar's verb is the one the shell routes to the active tab.
+    #[test]
+    fn aethermacchrome_verbs_drive_the_model_kat() {
+        use chrome::tabs::{GroupColor, TabStrip};
+        use quartzite::widgets::chrome_rows::{self, SideRow};
+        let rows_of = |strip: &TabStrip| {
+            let SMessage::BrowserTabs { active, tabs, groups } = chrome::tabs_message(strip) else { panic!("not BrowserTabs") };
+            chrome_rows::side_rows(active, &tabs, &groups)
+        };
+        // What `Coordinator::on_bus` does with each verb (without the engine threads).
+        let apply = |strip: &mut TabStrip, m: SMessage| match m {
+            SMessage::BrowserTabNew => {
+                strip.open();
+            }
+            SMessage::BrowserTabClose(id) => {
+                let id = id.unwrap_or(strip.active());
+                if strip.get(id).is_some() {
+                    strip.close(id);
+                }
+            }
+            SMessage::BrowserTabSelect(id) => {
+                strip.select(id);
+            }
+            other => {
+                assert!(chrome::apply_tab_verb(strip, &other).is_some(), "not a tab verb: {other:?}");
+            }
+        };
+        let mut strip = TabStrip::new();
+        let a = strip.open();
+        let b = strip.open();
+        let g = strip.group_new("g", GroupColor::Green, &[b]).expect("group");
+
+        let row_a = rows_of(&strip).into_iter().find(|r| matches!(r, SideRow::Tab { id, .. } if *id == a)).expect("row a");
+        apply(&mut strip, chrome_rows::row_verb(&row_a, false));
+        assert_eq!(strip.active(), a);
+        assert!(rows_of(&strip).contains(&SideRow::Tab { id: a, label: "New Tab".into(), active: true, grouped: false }));
+
+        let header = rows_of(&strip).into_iter().find(|r| matches!(r, SideRow::Group { .. })).expect("header");
+        apply(&mut strip, chrome_rows::row_verb(&header, false));
+        assert!(rows_of(&strip).contains(&SideRow::Group { id: g, name: "g".into(), count: 1, collapsed: true }));
+        assert!(!rows_of(&strip).iter().any(|r| matches!(r, SideRow::Tab { id, .. } if *id == b)));
+
+        apply(&mut strip, chrome_rows::row_verb(&SideRow::New, false));
+        assert_eq!(strip.len(), 3);
+
+        let row_a = rows_of(&strip).into_iter().find(|r| matches!(r, SideRow::Tab { id, .. } if *id == a)).expect("row a");
+        apply(&mut strip, chrome_rows::row_verb(&row_a, true));
+        assert!(strip.get(a).is_none());
+        assert_eq!(strip.len(), 2);
+
+        assert_eq!(format!("{:?}", chrome_rows::find_msg("needle", true)), r#"BrowserFind { query: "needle", forward: true }"#);
+    }
+}
+
+/// AETHERMAC (SR196): every face opens the first argument that is not a flag as the first page
+/// (`cargo run -p aether-shell --features macos -- https://example.com`), through the same `OpenDocument` the
+/// omnibox fires. The coordinator subscribed before this fires, so its first tab receives it. AETHERMACCHROME
+/// (SR205): the GTK face too, since its `Backend::run` hands GApplication no argv (`run_with_args`).
+fn start_url(bus: &Synapse) {
+    if let Some(url) = std::env::args().skip(1).find(|a| !a.starts_with('-')) {
+        bus.fire(SMessage::OpenDocument { url });
     }
 }

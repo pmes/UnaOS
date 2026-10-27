@@ -775,10 +775,10 @@ refs/heads/exec-rmbp-textscale3   ba46fc94e FOLDED-BY-HAND (this commit) 2026-10
 refs/heads/exec-rmbp-audiosink   660e532f1 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-audiocapture   55b818d92 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-netsplit   95cf9f058 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-relistread   2879aed46 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-relistread   f0a789c45 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-heapregion   9fcec8da7 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aetherscale   9fe4596db FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aetherfit2   2879aed46 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aetherfit2   1db3f282c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-stationrate   8ad458e8a FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-keyboot3   3e6d45b10 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-a11yfilter   e38b0b2cd FOLDED-BY-HAND (this commit) 2026-10-27
@@ -786,31 +786,65 @@ refs/heads/exec-rmbp-shellface   b52c38a47 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-zoomflush   a26685cb9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-scanoutwc   8f7963e9d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-unafswrite2   4dd10bb1c FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aetherbar   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-aetherlib   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-stationair   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-sleepresume   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-keyboot4   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-shadowdamage   baa7d1da6 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aetherbar   25952b571 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aetherlib   0213ffb62 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-stationair   01f916bb9 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-sleepresume   f5363b198 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-keyboot4   30fcc1192 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-shadowdamage   55270af51 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-overlayarm2   149ba4120 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-panelknob2   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-zoomflush2   baa7d1da6 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-panelknob2   a3cd0eb5a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-zoomflush2   9060133b8 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hdastart   190d2f9b0 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-a2dpkat   baa7d1da6 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-a2dpkat   df1470d0f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-miccursor   d2cb6dd2e FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-unafswrite3   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-bindlive   baa7d1da6 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-nle1   6bb942eef IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-unafswrite3   b93e5f46f FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-bindlive   6d79b79b8 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle1   24b620060 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nleprobe   2c8aa19b1 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-aethermac   7d735522c IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-h264enc   3ead33dc7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-heaacsbr   3ead33dc7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-hevcparse   3ead33dc7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-demuxseek   3ead33dc7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-bootlistarm   3ead33dc7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-autolock3   3ead33dc7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-templeperf   3ead33dc7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-kepler3d   3ead33dc7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-pideskspec   3ead33dc7 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aethermac   d08ed067e FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-h264enc   5f08b4680 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-heaacsbr   bbc4e7bae FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-hevcparse   a8ceb09f5 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-demuxseek   0f8b5a732 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-bootlistarm   e116e1449 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-autolock3   30cf7bdad FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-templeperf   18c4aa607 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kepler3d   318b4fbb6 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pideskspec   5960a44de FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-wpa2   3ead33dc7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-textscalereseat   3ead33dc7 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-textscalereseat   5e60ea4ff FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle2   806b5d03a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle3   05de8d24e FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle4   0ebe27382 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle5   75fc6b139 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-aethermacchrome   49af67fd8 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-stationratectl   2e09a4ed6 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-wpa2crypto   27569f892 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle5b   3688fb7ca FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-kepler3d2   f2f7b61b3 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-stationerp   cbd72f19e FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-autolock4   600ac953d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-textscalereseat2   694417d6a FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-sleepresume2   e37ca958d FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-leaserenew   7da6faa75 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pidesklist   7a96c024c FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle6   4af3f1dca FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle2b   9eb029ec7 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-nle3b   93b1f9431 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-onetext   056a7a524 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-h264enc2   9f778dc37 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-httpfail   d78ff23a7 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-wpa2join   1705724a4 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-demuxwire   03ecb5366 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-heaacps   bb1c77e81 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-hevcpal   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-hevcinter   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-hevcheic   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle2c   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-h264encrc   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-strip2   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-stationrejoin   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pideskqemulist   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle4b   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-editmap   1d99c4ae9 IN-FLIGHT cut 2026-10-27

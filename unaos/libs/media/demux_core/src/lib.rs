@@ -34,6 +34,12 @@
 //! tables; [`Demuxer::keyframe_before`] and [`Demuxer::samples_from`] are the editor's two seek reads, which
 //! never move the playback cursor.
 //!
+//! DEMUXSEEK (SR200): [`Demuxer::derive_dts`] gives a Matroska video track decode times from the codec core's reorder
+//! depth ([`DecodeTime`]); [`Demuxer::open_indexed`] opens a file by its own index (Matroska Cues, MP4 `sidx` / `mfra`)
+//! without walking its Clusters or fragments, and [`Demuxer::load_at`] reads the span that holds a time;
+//! [`Demuxer::edit_list`] keeps every `elst` entry; [`Sample::depends`] carries `sdtp` / the trun dependency bits, and
+//! [`SampleRead::skip`] marks the leading pictures an open-GOP start cannot decode (the LEADSKIP rule).
+//!
 //! [`build`] holds minimal *writers* for both containers — the test media the KATs and Stria's
 //! test-pattern pipeline are made from, and the remux path that lets Chromium act as an oracle for
 //! fragmented MP4 and WebM built around a real AV1 stream.
@@ -232,6 +238,11 @@ pub struct Sample {
     /// Matroska BlockGroup `DiscardPadding` (ns of decoded audio to drop at this frame's end;
     /// RFC 9559 §5.1.3.5.6); 0 elsewhere.
     pub discard_ns: u64,
+    /// DEMUXSEEK (SR200): the sample's dependency word in the ISO/IEC 14496-12 §8.6.4 `sdtp` byte layout —
+    /// `is_leading << 6 | sample_depends_on << 4 | sample_is_depended_on << 2 | sample_has_redundancy` — from `sdtp`
+    /// (progressive) or the `trun` / `tfhd` / `trex` sample_flags bits 27..20 (§8.8.3.1, the same four fields). 0 = unknown
+    /// (Matroska, and a file that states nothing).
+    pub depends: u8,
 }
 
 /// What a format parser hands back: tracks plus each track's samples in decode order.
@@ -241,6 +252,8 @@ pub(crate) struct Parsed {
     pub samples: Vec<Vec<Sample>>,
     /// The container's declared duration (mvhd/mehd, Info/Duration), if any.
     pub declared_duration_ns: Option<u64>,
+    /// DEMUXSEEK (SR200): every track's edit list (MP4 `elst`, every entry); empty for Matroska.
+    pub edits: Vec<Vec<EditSegment>>,
 }
 
 pub struct Demuxer {
@@ -253,6 +266,14 @@ pub struct Demuxer {
     order: Vec<Sample>,
     pos: usize,
     declared_duration_ns: Option<u64>,
+    /// DEMUXSEEK (SR200): where each track's decode times come from.
+    decode_time: Vec<DecodeTime>,
+    /// DEMUXSEEK (SR200): each track's edit list.
+    edits: Vec<Vec<EditSegment>>,
+    /// DEMUXSEEK (SR200): the file's seek index (Matroska Cues, MP4 `sidx` / `mfra`) when opened by it.
+    index: Vec<IndexPoint>,
+    /// DEMUXSEEK (SR200): the spans not yet read, on an [`Demuxer::open_indexed`] open; `None` on a full open.
+    lazy: Option<Lazy>,
 }
 
 /// Which container the bytes are, by signature: ISOBMFF puts a box type at offset 4, EBML starts
@@ -288,7 +309,7 @@ impl Demuxer {
             Some(_) => mkv::parse(&data)?,
             None => return Err(Error::UnknownFormat),
         };
-        let Parsed { format, mut tracks, mut samples, declared_duration_ns } = parsed;
+        let Parsed { format, mut tracks, mut samples, declared_duration_ns, edits } = parsed;
         if partial {
             let len = data.len() as u64;
             for s in samples.iter_mut() {
@@ -312,7 +333,8 @@ impl Demuxer {
                 return Err(Error::Truncated);
             }
         }
-        Ok(Demuxer { data: Arc::new(data), format, tracks, order, pos: 0, declared_duration_ns })
+        let decode_time = alloc::vec![if format == Format::Mp4 { DecodeTime::Stored } else { DecodeTime::Presentation }; tracks.len()];
+        Ok(Demuxer { data: Arc::new(data), format, tracks, order, pos: 0, declared_duration_ns, decode_time, edits, index: Vec::new(), lazy: None })
     }
 
     pub fn format(&self) -> Format {
@@ -331,7 +353,18 @@ impl Demuxer {
     /// VPLAYAUDIO (rmbp B475): a second cursor over the same bytes and tables (from the first packet). The picture
     /// job keeps the file; the sound job reads its own track through the share — one parse, no byte copy.
     pub fn share(&self) -> Demuxer {
-        Demuxer { data: self.data.clone(), format: self.format, tracks: self.tracks.clone(), order: self.order.clone(), pos: 0, declared_duration_ns: self.declared_duration_ns }
+        Demuxer {
+            data: self.data.clone(),
+            format: self.format,
+            tracks: self.tracks.clone(),
+            order: self.order.clone(),
+            pos: 0,
+            declared_duration_ns: self.declared_duration_ns,
+            decode_time: self.decode_time.clone(),
+            edits: self.edits.clone(),
+            index: self.index.clone(),
+            lazy: self.lazy.clone(),
+        }
     }
     /// VPLAYAUDIO (rmbp B475): a sample's payload as a slice of the file (no copy; no `frame_prefix`).
     pub fn sample_data(&self, s: &Sample) -> &[u8] {
@@ -378,6 +411,9 @@ impl Demuxer {
         Packet { track: t.id, pts: s.pts, dts: s.dts, duration: s.duration, keyframe: s.keyframe, data, discard_ns: s.discard_ns }
     }
     pub fn next_packet(&mut self) -> Option<Packet> {
+        if self.pos >= self.order.len() && self.lazy.is_some() {
+            self.load_next(); // DEMUXSEEK (SR200): an indexed open reads the next span at the window's end
+        }
         let s = *self.order.get(self.pos)?;
         self.pos += 1;
         Some(self.packet_at(&s))
@@ -423,6 +459,7 @@ impl Demuxer {
                 duration: f.duration_ns.max(0) as u64,
                 keyframe: f.keyframe,
                 discard_ns: f.discard_ns,
+                depends: 0,
             });
         }
         for (i, t) in tracks.iter_mut().enumerate() {
@@ -442,7 +479,9 @@ impl Demuxer {
             };
         }
         let order = merge(&tracks, per);
-        Demuxer { data: Arc::new(data), format, tracks, order, pos: 0, declared_duration_ns }
+        let decode_time = alloc::vec![if format == Format::Mp4 { DecodeTime::Stored } else { DecodeTime::Presentation }; tracks.len()];
+        let edits = alloc::vec![Vec::new(); tracks.len()];
+        Demuxer { data: Arc::new(data), format, tracks, order, pos: 0, declared_duration_ns, decode_time, edits, index: Vec::new(), lazy: None }
     }
     /// Seek to the last keyframe of the reference track (first video track, else track 0) whose
     /// presentation time is ≤ `target_ns` (the first keyframe if none is). Packets of every track
@@ -462,6 +501,9 @@ impl Demuxer {
     pub fn seek_track(&mut self, ref_idx: usize, target_ns: i64) -> Option<i64> {
         if ref_idx >= self.tracks.len() {
             return None;
+        }
+        if self.lazy.is_some() {
+            self.load_at(ref_idx, target_ns).ok()?; // DEMUXSEEK (SR200): the index jumps to the span
         }
         let tb = self.tracks[ref_idx].timebase;
         let (i, p) = self.key_at_or_before(ref_idx, target_ns)?;
@@ -517,10 +559,19 @@ impl Demuxer {
     pub fn samples_from(&self, track_index: usize, target_ns: i64) -> impl Iterator<Item = SampleRead> + '_ {
         let start = self.key_at_or_before(track_index, target_ns).map_or(self.order.len(), |(i, _)| i);
         let tb = self.tracks.get(track_index).map_or(Timebase::NANOS, |t| t.timebase);
-        self.order[start..]
-            .iter()
-            .filter(move |s| s.track_index == track_index)
-            .map(move |s| SampleRead { sample: *s, preroll: tb.to_ns(s.pts) < target_ns })
+        let key = self.order.get(start).copied();
+        let mut past_gop = false;
+        self.order[start..].iter().enumerate().filter(move |(_, s)| s.track_index == track_index).map(move |(k, s)| {
+            // DEMUXSEEK (SR200): LEADSKIP — leading pictures of the start key's GOP that cannot be decoded from it.
+            if k > 0 && s.keyframe {
+                past_gop = true;
+            }
+            let skip = match key {
+                Some(key) if k > 0 && !past_gop => self.leading_skip(&key, s),
+                _ => false,
+            };
+            SampleRead { sample: *s, preroll: tb.to_ns(s.pts) < target_ns, skip }
+        })
     }
 }
 
@@ -530,6 +581,9 @@ impl Demuxer {
 pub struct SampleRead {
     pub sample: Sample,
     pub preroll: bool,
+    /// DEMUXSEEK (SR200): a leading picture of an open-GOP start key that cannot be decoded from this start (the
+    /// LEADSKIP rule, [`Demuxer::samples_from`]): do not decode it.
+    pub skip: bool,
 }
 
 /// k-way merge of per-track decode-order tables by decode time in ns. Each track's own order is
@@ -553,4 +607,262 @@ fn merge(tracks: &[Track], per: Vec<Vec<Sample>>) -> Vec<Sample> {
         idx[t] += 1;
     }
     out
+}
+
+// ---------------------------------------------------------------------------------------------------
+// DEMUXSEEK (LEDGER SR200): decode times derived from the codec's reorder depth, the open by the file's own index,
+// the edit list, and the leading pictures an open-GOP start cannot decode.
+// ---------------------------------------------------------------------------------------------------
+
+/// DEMUXSEEK (SR200): where a track's decode times come from.
+///
+/// MP4 stores them (`stts` / `trun`): `Stored`. Matroska stores none — blocks are in decode order and carry their
+/// presentation time — so a Matroska track starts as `Presentation` (dts = pts, its composition offsets are 0 and carry no
+/// reorder fact) until the caller hands [`Demuxer::derive_dts`] the codec's reorder depth: `Derived(depth)`. The depth is the
+/// codec core's number, injected by the caller (this crate links no decoder): `h264_core::ps::avcc_reorder_depth` (the SPS
+/// VUI `max_num_reorder_frames`, else the H.264 E.2.1 inference) and `av1_core::image::av1c_reorder_depth` (0: one temporal
+/// unit is one shown frame). A VP9 track has no accessor and stays `Presentation` — exact for VP9, whose superframe packs a
+/// hidden frame with its shown one so every packet is presented in decode order — and an HEVC track stays `Presentation`
+/// until an HEVC core reads `sps_max_num_reorder_pics` (the gap DEMUXSEEK-WIRE / DEMUXSEEK-HEVCDTS name in handlers.md §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeTime {
+    Stored,
+    Derived(u32),
+    Presentation,
+}
+
+/// DEMUXSEEK (SR200): one entry of a file's seek index — a sync sample's presentation time and the file offset of the
+/// Matroska Cluster (a Cues CuePoint) or the MP4 `moof` (a `sidx` reference, a `tfra` entry) that holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexPoint {
+    pub track_index: usize,
+    pub pts_ns: i64,
+    pub pos: u64,
+}
+
+/// DEMUXSEEK (SR200): one entry of an MP4 edit list (ISO/IEC 14496-12 §8.6.6), every entry kept — the segment list an editor
+/// cuts by. Playback's pts still follow the first media edit alone ([`Track::edit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditSegment {
+    /// Where the segment starts on the movie timeline, ns (the sum of the segments before it).
+    pub start_ns: i64,
+    pub duration_ns: u64,
+    /// The first presented media time in the track's ticks on the same axis as [`Sample::pts`] (the file's `media_time` less
+    /// the shift the first media edit applied); `None` for an empty edit (`media_time == -1`).
+    pub media_pts: Option<i64>,
+    /// `media_rate` as 16.16: 0x10000 = normal speed, 0 = a dwell (the frame at `media_pts` held for the duration).
+    pub rate: i32,
+}
+
+/// What a format's index open hands back: the headers' tracks (no samples), the index and the spans to read.
+pub(crate) struct IndexedOpen {
+    pub parsed: Parsed,
+    pub index: Vec<IndexPoint>,
+    /// `[start, end)` file ranges in file order, each a run of Clusters / moofs beginning at an index position.
+    pub spans: Vec<(u64, u64)>,
+    pub reader: SpanReader,
+}
+
+#[derive(Clone)]
+pub(crate) enum SpanReader {
+    Mkv(mkv::Spans),
+    Mp4(mp4::Spans),
+}
+
+/// An [`Demuxer::open_indexed`] open's spans and which of them `order` holds.
+#[derive(Clone)]
+struct Lazy {
+    spans: Vec<(u64, u64)>,
+    loaded: core::ops::Range<usize>,
+    reader: SpanReader,
+}
+
+impl Demuxer {
+    /// DEMUXSEEK (SR200): derive each Matroska/WebM video track's decode times from the codec's reorder depth, which
+    /// `depth_of` returns (see [`DecodeTime`]). With depth d the presentation times sorted ascending give
+    /// `dts[i] = sorted[i - d]` (the first d extrapolated back by the smallest frame step): at least i-d+1 of the first i+1
+    /// decoded frames are presented no later than frame i, so dts <= pts and dts strictly increases. A depth the samples
+    /// contradict (some dts would pass its pts) is refused and the track stays `Presentation`. Call it right after open: the
+    /// table is re-merged and the cursor goes to the start. Returns how many tracks were derived. MP4 is left untouched.
+    pub fn derive_dts(&mut self, depth_of: impl Fn(&Track) -> Option<u32>) -> usize {
+        if self.format == Format::Mp4 {
+            return 0;
+        }
+        let mut per: Vec<Vec<Sample>> = (0..self.tracks.len()).map(|ti| self.track_samples(ti).copied().collect()).collect();
+        let mut n = 0;
+        for (ti, t) in self.tracks.iter().enumerate() {
+            if t.kind != TrackKind::Video || self.decode_time[ti] != DecodeTime::Presentation {
+                continue;
+            }
+            let Some(d) = depth_of(t) else { continue };
+            if mkv::derive_dts(&mut per[ti], d) {
+                self.decode_time[ti] = DecodeTime::Derived(d);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.order = merge(&self.tracks, per);
+            self.pos = 0;
+        }
+        n
+    }
+
+    /// DEMUXSEEK (SR200): open a file by its own seek index — Matroska Cues (found before the first Cluster or through the
+    /// SeekHead), MP4 `sidx` or `mfra` — reading the headers and the index only: no Cluster or fragment is walked, and the
+    /// sample table starts empty. [`Demuxer::load_at`] reads the span that holds a time ([`Demuxer::seek_track`] calls it),
+    /// and [`Demuxer::next_packet`] reads the next span at the end of the loaded window. Track `sample_count` is 0 (unknown)
+    /// and `duration_ns` the declared duration. [`Demuxer::samples`], the editor's reads and [`Demuxer::survey`] see the
+    /// loaded window; an editor holds its own [`Demuxer::share`]. A file with no usable index (none, a position that is not a
+    /// Cluster / moof, a hierarchical `sidx`, a progressive MP4) opens exactly as [`Demuxer::open`].
+    pub fn open_indexed(data: Vec<u8>) -> Result<Demuxer, Error> {
+        let io = match probe(&data) {
+            Some(Format::Mp4) => mp4::parse_index(&data).ok().flatten(),
+            Some(_) => mkv::parse_index(&data).ok().flatten(),
+            None => return Err(Error::UnknownFormat),
+        };
+        let Some(IndexedOpen { parsed, index, spans, reader }) = io else {
+            return Demuxer::open(data);
+        };
+        let Parsed { format, mut tracks, declared_duration_ns, edits, .. } = parsed;
+        for t in tracks.iter_mut() {
+            t.sample_count = 0;
+            t.duration_ns = declared_duration_ns.unwrap_or(0);
+        }
+        let decode_time = alloc::vec![if format == Format::Mp4 { DecodeTime::Stored } else { DecodeTime::Presentation }; tracks.len()];
+        Ok(Demuxer {
+            data: Arc::new(data),
+            format,
+            tracks,
+            order: Vec::new(),
+            pos: 0,
+            declared_duration_ns,
+            decode_time,
+            edits,
+            index,
+            lazy: Some(Lazy { spans, loaded: 0..0, reader }),
+        })
+    }
+
+    /// DEMUXSEEK (SR200): true when this Demuxer was opened by its index ([`Demuxer::open_indexed`] found one).
+    pub fn indexed(&self) -> bool {
+        self.lazy.is_some()
+    }
+
+    /// DEMUXSEEK (SR200): the seek index read at an [`Demuxer::open_indexed`] open (empty on a full open).
+    pub fn index(&self) -> &[IndexPoint] {
+        &self.index
+    }
+
+    /// DEMUXSEEK (SR200): each track's edit list ([`EditSegment`]); empty for Matroska and for a file without `elst`.
+    pub fn edit_list(&self, track_index: usize) -> &[EditSegment] {
+        self.edits.get(track_index).map_or(&[], |e| e.as_slice())
+    }
+
+    /// DEMUXSEEK (SR200): on an indexed open, read the span holding the reference track's last index point at or before
+    /// `target_ns` (any track's points when `track_index` has none; the first span when no point is that early) into the
+    /// sample table, replacing the loaded window, and put the cursor at its start. A full open is left as it is.
+    pub fn load_at(&mut self, track_index: usize, target_ns: i64) -> Result<(), Error> {
+        let Some(lz) = self.lazy.as_ref() else { return Ok(()) };
+        let own = self.index.iter().any(|x| x.track_index == track_index);
+        let best = self
+            .index
+            .iter()
+            .filter(|x| (!own || x.track_index == track_index) && x.pts_ns <= target_ns)
+            .max_by_key(|x| (x.pts_ns, core::cmp::Reverse(x.pos)));
+        let k = best.map_or(0, |x| lz.spans.partition_point(|s| s.0 <= x.pos).saturating_sub(1));
+        if k >= lz.spans.len() {
+            return Ok(());
+        }
+        let per = self.read_span(k)?;
+        self.order = merge(&self.tracks, per);
+        self.pos = 0;
+        if let Some(lz) = self.lazy.as_mut() {
+            lz.loaded = k..k + 1;
+        }
+        Ok(())
+    }
+
+    /// The next span after the loaded window, appended (an indexed open's `next_packet`).
+    fn load_next(&mut self) {
+        let Some(lz) = self.lazy.as_ref() else { return };
+        let k = lz.loaded.end;
+        if k >= lz.spans.len() {
+            return;
+        }
+        let Ok(per) = self.read_span(k) else {
+            if let Some(lz) = self.lazy.as_mut() {
+                lz.loaded.end = lz.spans.len(); // a span that will not read ends the stream
+            }
+            return;
+        };
+        let more = merge(&self.tracks, per);
+        self.order.extend(more);
+        if let Some(lz) = self.lazy.as_mut() {
+            if lz.loaded.is_empty() {
+                lz.loaded = k..k + 1;
+            } else {
+                lz.loaded.end = k + 1;
+            }
+        }
+    }
+
+    /// One span's samples per track, through the format's own Cluster / moof reader; a `Derived` track's dts derived over
+    /// the span (a span begins at an index position, a sync sample).
+    fn read_span(&self, k: usize) -> Result<Vec<Vec<Sample>>, Error> {
+        let lz = self.lazy.as_ref().ok_or(Error::Invalid("not an indexed open"))?;
+        let (from, to) = lz.spans[k];
+        let last = k + 1 == lz.spans.len();
+        let mut per = match &lz.reader {
+            SpanReader::Mkv(sp) => mkv::load_span(&self.data, sp, from as usize, to as usize, last)?,
+            SpanReader::Mp4(sp) => mp4::load_span(&self.data, sp, from as usize, to as usize)?,
+        };
+        for (ti, v) in per.iter_mut().enumerate() {
+            if let Some(DecodeTime::Derived(d)) = self.decode_time.get(ti) {
+                mkv::derive_dts(v, *d);
+            }
+            for s in v.iter() {
+                let end = s.offset.checked_add(s.size as u64).ok_or(Error::Invalid("sample offset overflow"))?;
+                if end > self.data.len() as u64 {
+                    return Err(Error::Truncated);
+                }
+            }
+        }
+        Ok(per)
+    }
+
+    /// DEMUXSEEK (SR200), the LEADSKIP rule for [`Demuxer::samples_from`]: `s` follows the start `key` in decode order inside
+    /// its GOP. It is a leading picture when presented before the key; a leading picture is skipped when
+    /// (1) its sample flags say `is_leading` 1 (a dependency before the key: undecodable from here; 3 = decodable, 2 = not
+    /// leading: kept), else (2) for HEVC its first NAL's `nal_unit_type` is RASL_N / RASL_R (8 / 9; RADL_N / RADL_R 6 / 7 are
+    /// kept), else (3) always — an IDR has no leading pictures (H.264 8.2.1, HEVC IDR_N_LP), so a picture decoded after the
+    /// key and presented before it follows an open-GOP I and references the GOP before it.
+    fn leading_skip(&self, key: &Sample, s: &Sample) -> bool {
+        if s.pts >= key.pts {
+            return false;
+        }
+        match s.depends >> 6 {
+            1 => return true,
+            2 | 3 => return false,
+            _ => {}
+        }
+        if let Some(t) = self.tracks.get(s.track_index) {
+            if t.codec == Codec::Hevc {
+                if let Some(ty) = self.hevc_nal_type(t, s) {
+                    match ty {
+                        8 | 9 => return true,
+                        6 | 7 => return false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// The first NAL's `nal_unit_type` of an HEVC sample (length size from `hvcC` byte 21, ISO/IEC 14496-15 §8.3.3.1).
+    fn hevc_nal_type(&self, t: &Track, s: &Sample) -> Option<u8> {
+        let len = (*t.config.get(21)? & 3) as usize + 1;
+        let b = *self.sample_data(s).get(len)?;
+        Some((b >> 1) & 0x3F)
+    }
 }

@@ -2633,7 +2633,7 @@ fn move_to_inner(id: WinId, expect_owner: Option<u64>, x: usize, y: usize) -> Mo
         // `drain_deferred` and FLICKER-3 removed from `Screen::flush`, and re-paying it on the drag
         // path would be the largest instance of it in the system. The sprite is handled where the
         // paint now happens: the drain's masked handback, and `composite`'s own tail. See [`erase`].
-        composite();
+        if !move_batched() { composite(); } // RESTACKPASS (SHADOWDAMAGE rmbp-ledger B865, seat-granted): a `move_set` batch withholds THIS task's per-move composite and runs one after its last move; every other mover composites as before (fns at this file's tail). LINE-NEUTRAL: edited in place, code first.
     }
     placed
 }
@@ -6164,7 +6164,7 @@ fn composite_inner() -> CursorTail {
     // FOCUS-VIS — one snapshot of the shell's z for the whole pass, so every window in it is judged
     // against the same shell position (a concurrent focus change either lands wholly before this pass
     // or is serviced by the composite that change performs itself).
-    let shell = shell_z(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] zoom_note_pass(&rows, &dirty, &bands);
+    let shell = shell_z(); // ZOOMFLUSH2 (B868): no pass note — each dirty row is noted by `draw_window`'s tail `flush_rect` (zoom src flush)
     // FOCUS-HL: one snapshot per pass, for the same reason `shell` is one snapshot per pass — every
     // window in this pass is judged against a single focus owner, so no pass can draw two highlights.
     let focus = focus_asid();
@@ -18900,7 +18900,7 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     // future reorder, on the arm that actually disturbs the sprite.
     #[cfg(feature = "witness")]
     F2W_DRAINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] zoom_note_boxes(&boxes[..n]); let sprite_hit = super::cursor::sprite_box()
+    let sprite_hit = super::cursor::sprite_box() // ZOOMFLUSH2 (B868): no box note — each drained box is noted by its own `flush_rect` below (zoom src flush)
         .map(|sb| boxes[..n].iter().any(|&b| b.2 != 0 && b.3 != 0 && boxes_overlap(sb, b)))
         .unwrap_or(false);
     if sprite_hit {
@@ -31922,30 +31922,30 @@ pub mod a11yshadow {
     }
 }
 
-// ZOOMCOST (rmbp-ledger B835; BP-video-26) — TAIL-APPENDED bodies of two LINE-NEUTRAL folds. The lens presents only the
-// source rows a composite pass wrote, and only this file can read the pass's damage set: `composite_inner` calls
-// `zoom_note_pass` once the occlusion closure has made its rows/dirty/bands final (each dirty row's `damaged_box`, the
-// rect the pass writes), and `drain_deferred` calls `zoom_note_boxes` with the erase boxes it drained. Both only name
-// rows to `zoom::note_rows` (one relaxed load with the lens off); `zoom::on_damage` commits them after the pixels.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
-fn zoom_note_pass(rows: &[Window], dirty: &[bool], bands: &[Option<(usize, usize)>]) {
-    for (i, r) in rows.iter().enumerate() {
-        if !r.used || !dirty.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        let (_, y, _, h) = damaged_box(r, bands.get(i).copied().flatten());
-        super::zoom::note_rows(y, h);
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
-fn zoom_note_boxes(boxes: &[(usize, usize, usize, usize)]) {
-    for &(_, y, w, h) in boxes {
-        if w != 0 {
-            super::zoom::note_rows(y, h);
-        }
-    }
-}
+// ZOOMCOST (rmbp-ledger B835; BP-video-26) — RETIRED by ZOOMFLUSH2 (rmbp-ledger B868). This tail held the bodies of two
+// LINE-NEUTRAL folds: `zoom_note_pass` (from `composite_inner`, each dirty row's `damaged_box` into `zoom::note_rows`) and
+// `zoom_note_boxes` (from `drain_deferred`, each drained erase box). Both named rows the pass's own cleans already name:
+//
+// * a dirty row's pixels are written only by `draw_window`, whose early returns all precede its first write and whose
+//   tail ALWAYS runs `fb.flush_rect(bx, y0, bw, y1 - y0)` over the staged band or the whole outer box — beam held or
+//   not. The in-bracket band clean under `beam::held` (`stage_window`) is the Orin's extra publish; the not-held
+//   branch was already published by that tail, so ZOOMPASSFLUSH needed no new flush, only this deletion;
+// * every drained box that `stage_fill` wrote is cleaned by `drain_deferred`'s own `flush_rect` at once.
+//
+// Since ZOOMFLUSH (B859) `FrameBuffer::flush_rect` IS the lens note (`zoom::flushed_rows`, src flush, attribution by
+// base only), so both folds noted every row twice. `zoom::note_rows` and its `PASS_ROWS` commit stay as a door with no
+// caller; its tally is `tests zoom`'s `pass_notes=` (gated 0; PASSROWSDOOR owed, video §5, deletes the door once a
+// flight reads it).
+//
+// Kept as a comment of the retired block's own length: wm.rs compiles on every build (knob-off included), so no line
+// below may move.
+//
+// (ZOOMPASSFLUSH, video §5 — closed by B868.)
+//
+//
+//
+//
+//
 
 // OVERLAYOCC (rmbp-ledger B827, BP-video-17) — TAIL-APPENDED so no line above moves: the one overlay predicate the three
 // occluder sets ask (through `overlay_occludes`), and `tests overlays`' fixture-only readers.
@@ -31994,7 +31994,7 @@ pub fn surface_pixel(id: WinId, sx: usize, sy: usize) -> Option<u32> {
 // SHIMMERPRESENT (rmbp-ledger B840; BP-video-11) — TAIL-APPENDED so no line above moves. The shimmer's idle seat
 // (`desktop::shimmer_idle`) presents its boxes, not the whole pass: under `COMP_GATE`, with nothing but its own boxes owed,
 // only the head of `composite_inner` runs — `shadow_track` (whose `desktop::track` makes the tick and queues its boxes),
-// the erase drain (`drain_deferred`: the filtered `stage_fill` + `flush_rect` of each box, ZOOMCOST's `zoom_note_boxes`
+// the erase drain (`drain_deferred`: the filtered `stage_fill` + `flush_rect` of each box, each clean the lens note since B868
 // inside it), then `cash_tail`'s cursor tail and `zoom::on_damage`. No window blit, no snapshot, no furniture compose
 // (`erase_clip` keeps every fill off the strips, so the drain owes them nothing). Anything else owed — before the drain or
 // left by it — runs the whole pass (`composite_once`) inside the same hold. The gate is taken and released with
@@ -32062,7 +32062,7 @@ fn drain_present_once() -> bool {
         c2_t1: crate::arch::now_cycles(),
     });
     super::zoom::on_damage(dirty);
-    pass_owed_redrive(); super::perfhud::drain_present(dm_t0); // DRAINMETER (B859): the drain present's sample beside the HUD's frame-time ring (perfhud.rs tail). LINE-NEUTRAL fold, code first.
+    pass_owed_redrive(); super::perfhud::drain_present(dm_t0); super::veilcost::drain(dm_t0); // DRAINVEIL (B868): the drain present's cost into veilcost's drain ring (`drain_p99_us=`, veilcost.rs tail). DRAINMETER (B859): the drain present's sample beside the HUD's frame-time ring (perfhud.rs tail). LINE-NEUTRAL fold, code first.
     true
 }
 
@@ -32235,4 +32235,101 @@ pub fn svc_redrive() {
     if COMP_PENDING.load(Acquire) && !COMP_GATE.load(Relaxed) {
         let _ = present_drain();
     }
+}
+
+// SHADOWDAMAGE (rmbp-ledger B865, BP-video-17; the seat granted wm.rs) — TAIL-APPENDED so no line above moves.
+// TOASTMETER: `overlay_boxes`, the desktop present's meter reading the ONE overlay predicate (`overlay_row`).
+// RESTACKPASS: `move_set`, notify's stack re-seat as ONE composite: each row goes through `move_to_inner` exactly as
+// `move_to` does (the clamp, the erase-minus-new, the re-damage, the present rects, the barrier), and only the tail
+// composite is withheld for the batching task (`move_batched`, the one fold at `move_to_inner`'s end).
+
+/// TOASTMETER (B865): the live overlay rows' boxes (`outer_box` of every row [`overlay_row`] admits) into `out`, by
+/// count, under one table hold (sequential with the present's `occluders`, never nested). Witness meter only.
+#[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
+pub fn overlay_boxes(out: &mut [(usize, usize, usize, usize)]) -> usize {
+    let t = table();
+    let mut n = 0usize;
+    for r in t.rows.iter() {
+        if n == out.len() {
+            break;
+        }
+        if r.used && overlay_row(r) {
+            out[n] = outer_box(r);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// RESTACKPASS (B865): the task running a [`move_set`] batch (`u64::MAX` = none).
+static BATCH_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Is the calling task inside a [`move_set`] batch? `move_to_inner` then leaves its composite to the batch's one.
+/// One relaxed-cost load when no batch runs.
+#[inline]
+fn move_batched() -> bool {
+    let b = BATCH_TID.load(core::sync::atomic::Ordering::Acquire);
+    b != u64::MAX && crate::arch::sched::current_id() == Some(b)
+}
+
+/// Clears [`BATCH_TID`] on EVERY exit of the batch (the seat's hold: a store at the end alone would, on an early exit,
+/// leave every later move on that task without its composite).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+struct MoveBatch;
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+impl Drop for MoveBatch {
+    fn drop(&mut self) {
+        BATCH_TID.store(u64::MAX, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// RESTACKPASS (B865): move every `(id, x, y)` through [`move_to_inner`] (any owner, as [`move_to`]) with no composite
+/// between them, then ONE composite when any row moved (a no-op move never composited): the rows move together. Outside a scheduled task (no task id to scope the batch)
+/// each move composites as `move_to` does. Not nested (an inner batch's guard would end the outer one early: the outer
+/// moves then composite each, never lose one).
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn move_set(moves: &[(WinId, usize, usize)]) {
+    if moves.is_empty() {
+        return;
+    }
+    let Some(me) = crate::arch::sched::current_id() else {
+        for &(id, x, y) in moves {
+            let _ = move_to_inner(id, None, x, y);
+        }
+        return;
+    };
+    let mut moved = false;
+    {
+        BATCH_TID.store(me, core::sync::atomic::Ordering::Release);
+        let _batch = MoveBatch;
+        for &(id, x, y) in moves {
+            moved |= matches!(move_to_inner(id, None, x, y), Moved::Placed { changed: true, .. });
+        }
+    }
+    if moved {
+        composite();
+    }
+}
+
+// TEXTSCALERESEAT (rmbp-ledger B880; BP-video-40) — TAIL-APPENDED so no line above moves. The kernel apps' re-seat door: a
+// kernel row (the kernel band, or owner 0 — the login card) asks wm to change its own height when its text size steps.
+// wm never learns text metrics; the window computes its height (`h_at`) and names it. THE RULE: a row that re-seats
+// allocated its surface ONCE, at open, for its LARGEST height (`h_at` at the cap) and named that capacity as `surf_len`
+// at create; it never re-allocates under a live row. The door re-seats within that capacity; past it `resize_to_inner`
+// answers `Some(false)` and the window keeps its height.
+
+/// The kernel apps' re-seat door (TEXTSCALERESEAT B880): `resize_to_inner` — the ONE resize body — with the row's own
+/// position and `Some(owner)`, so a recycled id is refused. `None` = no such row, a compat row, or not a kernel-owned row;
+/// `Some(false)` = unchanged or past the row's surface capacity (the window keeps its height); `Some(true)` = re-seated.
+#[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))]
+pub fn resize_kernel_row(id: WinId, w: usize, h: usize) -> Option<bool> {
+    let (owner, x, y) = {
+        let t = table();
+        let r = row(&t, id)?;
+        if r.compat || !(r.owner_asid == 0 || is_kernel_owner(r.owner_asid)) {
+            return None;
+        }
+        (r.owner_asid, r.x, r.y)
+    };
+    resize_to_inner(id, Some(owner), x, y, w, h)
 }

@@ -7,8 +7,9 @@
 //! mirrored). At the default face every height is the base (TAB 26, BAR 30, CTL 22, MENU_ROW 22, STATUS 14).
 //!
 //! THE BOUND is the surface: the header and the status line leave at least one page line on a [`SURFACE_H`] window
-//! across the whole font-size schema (9..=32); the menu's row is the one value the surface caps
-//! ([`Metrics::menu`]), and its face is held to that row's line.
+//! across the whole font-size schema (9..=32); the menu keeps its grown row and SCROLLS when the window holds fewer
+//! than its rows ([`Metrics::menu`], AETHERBAR SR192); the toolbar's optional controls leave for the menu when the
+//! omnibox would not keep its width ([`Metrics::bar`]).
 
 /// The chrome's body face at the default font size, px.
 pub const FACE_BASE: f32 = 11.0;
@@ -53,12 +54,14 @@ pub struct Metrics {
     pub status_h: i32,
 }
 
-/// The open menu's fit: its row height, its face, and its top edge (window px).
+/// The open menu's fit: its row height, its face, its top edge (window px), and how many of its rows are on view
+/// (AETHERBAR: fewer than its rows when the window is too short for all of them at the face; the menu then scrolls).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Menu {
     pub row: i32,
     pub face: f32,
     pub y: i32,
+    pub vis: i32,
 }
 
 impl Metrics {
@@ -85,15 +88,62 @@ impl Metrics {
         win_h - self.chrome_h() - self.status_h
     }
 
-    /// The menu of `rows` rows (inner padding `pad`) at face `face`, fitted inside a `win_h` window: the row is the
-    /// grown row, capped so every row fits (`(win_h - 4 - 2 pad) / rows`); the top sits under the page origin
+    /// The menu of `rows` rows (inner padding `pad`) at face `face`, fitted inside a `win_h` window (AETHERBAR,
+    /// SR192): the row is the grown row (capped only when not even one row fits), and as many rows as fit are on view
+    /// (`vis`, at least 1; the rest are reached by scrolling the menu); the top sits under the page origin
     /// (`page_y + 2`), lifted so the menu ends 2 px above the window's foot, never above 2; the face is held to the
-    /// row (`row / LINE_RATIO`) so a row never carries more than its line.
+    /// row (`row / LINE_RATIO`) only in that one-row case, so a row never carries more than its line.
     pub fn menu(&self, face: f32, rows: i32, pad: i32, page_y: i32, win_h: i32) -> Menu {
         let rows = rows.max(1);
-        let row = self.menu_row.min((win_h - 4 - 2 * pad) / rows).max(1);
-        let h = rows * row + 2 * pad;
+        let room = win_h - 4 - 2 * pad;
+        let row = self.menu_row.min(room).max(1);
+        let vis = (room / row).clamp(1, rows);
+        let h = vis * row + 2 * pad;
         let y = (page_y + 2).min(win_h - h - 2).max(2);
-        Menu { row, face: face.min(row as f32 / LINE_RATIO), y }
+        Menu { row, face: face.min(row as f32 / LINE_RATIO), y, vis }
     }
+
+    /// AETHERBAR (SR192): which of the toolbar's optional controls a bar `bw` px wide carries at this face — the zoom
+    /// pair, the star, Reload — each only when the omnibox keeps [`OMNI_MIN`] beside it ([`bar_need`] at this `ctl`),
+    /// never below SR143's thresholds (the floors, so the default face's bar is unchanged). A control the bar lacks
+    /// is in the menu.
+    pub fn bar(&self, bw: i32) -> Bar {
+        Bar {
+            reload: bw >= bar_need(self.ctl, 3, 1),
+            star: bw >= BAR_STAR_FLOOR.max(bar_need(self.ctl, 3, 2)),
+            zoom: bw >= BAR_ZOOM_FLOOR.max(bar_need(self.ctl, 3, 4)),
+        }
+    }
+}
+
+// ---- AETHERBAR (LEDGER SR192): the toolbar's horizontal fit and the menu's width ------------------------------------
+
+/// The toolbar's outer edge, the gap between two controls, and the omnibox's narrowest width, px.
+pub const BAR_EDGE: i32 = 8;
+pub const BAR_GAP: i32 = 4;
+pub const OMNI_MIN: i32 = 24;
+/// The narrowest bars that carried the star and the zoom pair at the default face (SR143): floors under the rule.
+pub const BAR_STAR_FLOOR: i32 = 220;
+pub const BAR_ZOOM_FLOOR: i32 = 360;
+/// The menu's narrowest width (SR143's fixed width).
+pub const MENU_W: i32 = 176;
+
+/// The toolbar's optional controls a bar carries ([`Metrics::bar`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bar {
+    pub reload: bool,
+    pub star: bool,
+    pub zoom: bool,
+}
+
+/// The narrowest bar holding `left` controls at its left edge, the omnibox at [`OMNI_MIN`], and `right` controls at
+/// its right edge, each `ctl` square: an edge at each end and on each side of the omnibox, a gap between neighbours.
+pub fn bar_need(ctl: i32, left: i32, right: i32) -> i32 {
+    4 * BAR_EDGE + OMNI_MIN + (left + right) * ctl + ((left - 1).max(0) + (right - 1).max(0)) * BAR_GAP
+}
+
+/// The open menu's width: its widest row `need` (measured at the face by the face), never under [`MENU_W`], never
+/// wider than a `win_w` window less its edges.
+pub fn menu_w(need: i32, win_w: i32) -> i32 {
+    need.max(MENU_W).min(win_w - 2 * BAR_EDGE).max(1)
 }

@@ -125,8 +125,9 @@ fn aac_fetched_streams() {
         ("chromium-sfx.m4a", Some((44100, 1, 12701))),
         ("chromium-bear-640x360-a_frag.mp4", Some((44100, 2, 123904))),
         ("chromium-bear-mpeg2-aac-only_frag.mp4", Some((44100, 2, 121856))),
-        ("chromium-bear-audio-implicit-he-aac-v1.aac", Some((24000, 2, 68608))),
-        ("chromium-bear-audio-implicit-he-aac-v2.aac", Some((24000, 1, 69632))),
+        // HEAACSBR (LEDGER SR198): implicit HE-AAC plays at twice the 24 kHz core rate; v2's PS core is duplicated
+        ("chromium-bear-audio-implicit-he-aac-v1.aac", Some((48000, 2, 137216))),
+        ("chromium-bear-audio-implicit-he-aac-v2.aac", Some((48000, 2, 139264))),
         ("chromium-bear-audio-main-aac.aac", None),
     ];
     let mut checked = 0;
@@ -146,4 +147,62 @@ fn aac_fetched_streams() {
         checked += 1;
     }
     eprintln!("fetched AAC streams: {} checked", checked);
+}
+
+/// HEAACSBR (LEDGER SR198): Chromium's implicit HE-AAC streams (fetched, sha256-pinned in vectors.txt) against
+/// FFmpeg 6.1.1's float decode (`he1.ref.flac` 24-bit, `he2.ref.flac` 16-bit; the commands are in expected.txt and
+/// oracle/gen-aac.sh). v1 (SBR): waveform SNR >= 50 dB. v2 (SBR + parametric stereo, HEAACSBR-PS LEDGER SR214):
+/// both channels through our PS stage, waveform SNR >= 55 dB per channel. Measured (SR214): this stream's PS headers
+/// switch IID and ICC off, so FFmpeg's L and R are equal (bit-equal on 133122 of 139264 float samples, the rest in
+/// blocks under -82 dBFS) and the 16-bit reference caps the SNR at ~59.8 dB; a left/right difference bound would
+/// compare against silence, so the stereo image itself is held by sbr.rs `ps_tests` (a real-stereo HE-AAC v2 vector
+/// is owed: handlers.md HEAACSBR-PSVEC).
+#[test]
+fn heaac_vs_ffmpeg() {
+    let mut checked = 0;
+    for v in common::vectors("aac") {
+        let name = v.path.file_name().unwrap().to_string_lossy().to_string();
+        let refname = match name.as_str() {
+            "chromium-bear-audio-implicit-he-aac-v1.aac" => "he1",
+            "chromium-bear-audio-implicit-he-aac-v2.aac" => "he2",
+            _ => continue,
+        };
+        let Some(bytes) = common::fetch(&v) else { continue };
+        // the first ADTS frame through the public probe: implicit SBR found, and PS seen or not
+        let (sfi, cc) = (((bytes[2] >> 2) & 15) as usize, ((bytes[2] & 1) << 2) | (bytes[3] >> 6));
+        let flen = (((bytes[3] & 3) as usize) << 11) | ((bytes[4] as usize) << 3) | (bytes[5] as usize >> 5);
+        let off = if bytes[1] & 1 != 0 { 7 } else { 9 };
+        let layout = audio_core::aac::Layout::from_config(cc).unwrap();
+        let dec = audio_core::aac::sbr_probe(audio_core::aac::AacDecoder::new(sfi, layout).unwrap(), Some(&bytes[off..flen]), false).unwrap();
+        assert_eq!(dec.frame_len(), 2048, "{}: SBR not found", name);
+        let ps = if dec.ps_seen { "ps=seen" } else { "ps=none" };
+        let (info, pcm) = decode_all(&bytes).unwrap_or_else(|e| panic!("{}: {:?}", name, e));
+        let (rinfo, rf) = decode_all(&std::fs::read(data().join(format!("{}.ref.flac", refname))).unwrap()).unwrap();
+        let ch = info.channels as usize;
+        assert_eq!((info.rate, ch), (rinfo.rate, rinfo.channels as usize), "{}: rate/channels", name);
+        assert_eq!(pcm.len(), rf.len(), "{}: length", name);
+        let frames = pcm.len() / ch;
+        if refname == "he1" {
+            assert_eq!(ps, "ps=none", "{}", name);
+            let (mut s, mut e) = (0f64, 0f64);
+            for i in 0..pcm.len() { let d = (pcm[i] - rf[i]) as f64; s += (rf[i] as f64).powi(2); e += d * d; }
+            let snr = 10.0 * (s / e).log10();
+            eprintln!("HE-AAC v1 {:<44} {}ch {}Hz frames={} {} SNR={:.1} dB -> {}", name, ch, info.rate, frames, ps, snr, if snr >= 50.0 { "OK" } else { "FAIL" });
+            assert!(snr >= 50.0, "{}: SNR {:.1} dB", name, snr);
+        } else {
+            assert_eq!(ps, "ps=seen", "{}", name);
+            assert_eq!(ch, 2, "{}: PS channels", name);
+            let snr: Vec<f64> = (0..ch).map(|c| {
+                let (mut s, mut e) = (0f64, 0f64);
+                for i in 0..frames { let (x, y) = (pcm[i * ch + c] as f64, rf[i * ch + c] as f64); s += y * y; e += (x - y) * (x - y); }
+                10.0 * (s / e).log10()
+            }).collect();
+            let good = snr.iter().all(|&v| v >= 55.0);
+            eprintln!("HE-AAC v2 {:<44} {}ch {}Hz frames={} {} (PS synthesised) SNR L={:.1} dB R={:.1} dB -> {}",
+                name, ch, info.rate, frames, ps, snr[0], snr[1], if good { "OK" } else { "FAIL" });
+            assert!(good, "{}: SNR L {:.1} dB R {:.1} dB", name, snr[0], snr[1]);
+        }
+        checked += 1;
+    }
+    eprintln!("HE-AAC streams: {} checked", checked);
 }

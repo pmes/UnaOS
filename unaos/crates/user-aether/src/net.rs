@@ -51,6 +51,11 @@
 //  hops=<n> conn=<new|reused> coding=<identity|gzip|deflate|br> [issuer=<CN>] -> PASS|FAIL [reason=<why> code=<n>] ::`
 // — PASS when a final answer arrived (any status: a 404 page is a page); FAIL names the stage (`dns`, `connect`,
 // `tls-<why>`, `h2-protocol`, `timeout`, ...).
+//
+// AETHERLIB (LEDGER SR193): steps 2, 3's retry, 4's refusals, 8 and 9's pool are SEQUENCED by one std-free model,
+// handlers/aether/src/net/fetchseq.rs, linked here by `#[path]` (R104, the AETHERSCALE shape) and driven on the host by a
+// stub: the answer cache, the keep-alive pool, the hop order, the redirect count and the `reason=` words live there; this
+// file implements its `Io` over vein_ring3 + http_core (the `Elf` below) and writes the wire line from its `Nav`.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -60,7 +65,7 @@ use http_core::cookie::{CookieContext, CookieJar};
 use http_core::encoding::{self, Coding};
 use http_core::h1::{self, BodyDecoder};
 use http_core::h2::H2Conn;
-use http_core::url::{Host, Url};
+use http_core::url::Url;
 use http_core::{redirect, Conn, Headers};
 use vein_core::client::Transport as VeinTransport;
 use vein_core::prefs::Verify;
@@ -69,17 +74,18 @@ use vein_ring3::net::{Tcp, ECANCELED};
 use crate::sys::now_ms;
 use crate::Line;
 
+// AETHERLIB (SR193): the sequencer's model — the bytes the host test drives (handlers/aether/src/net/fetchseq.rs).
+#[allow(dead_code)]
+#[path = "../../../../handlers/aether/src/net/fetchseq.rs"]
+mod fetchseq;
+use fetchseq::{fail, Fail, Gate, Session};
+pub use fetchseq::is_net_scheme;
+
 /// The per-origin HTTP/1.1 connection cap: http_core's shared `MAX_H1_PER_ORIGIN` (NETDEBT SR97), the SAME constant
 /// the host transport's pool reads (NETDEBT2 SR113) — never a copy.
 pub const MAX_PER_ORIGIN: usize = http_core::MAX_H1_PER_ORIGIN;
 /// Every navigation (all hops, DNS, connect, TLS, body) finishes inside this or ends `timeout`.
 pub const FETCH_MS: u64 = 30_000;
-/// A parked keep-alive socket older than this is closed rather than reused (servers time idle ones out).
-const IDLE_MS: u64 = 15_000;
-/// Parked sockets across every origin.
-const POOL_MAX: usize = 16;
-/// A resolver answer is reused this long.
-const DNS_TTL_MS: u64 = 60_000;
 /// The largest body read (still content-coded) and decoded; Aether's file pages stop at 1 MiB, the network at 4.
 const BODY_MAX: usize = 4 * 1024 * 1024;
 const UA: &str = "Mozilla/5.0 (UnaOS) Aether/1";
@@ -92,11 +98,6 @@ pub fn is_net(s: &str) -> bool {
     pre(b"http://") || pre(b"https://")
 }
 
-/// A scheme this module fetches.
-pub fn is_net_scheme(s: &str) -> bool {
-    s == "http" || s == "https"
-}
-
 /// `aether <url>`: argv[1] when it is an http(s) URL — the page to open after the first one is reported.
 pub fn arg_url() -> Option<String> {
     let a = una_abi::args()?;
@@ -106,19 +107,12 @@ pub fn arg_url() -> Option<String> {
 
 // ---- state (one thread: the program's) ----------------------------------------------------------------------
 
-struct Idle {
-    origin: String,
-    tcp: Tcp,
-    at: u64,
-}
-
 struct Net {
     tls: Option<vein_ring3::TlsSetup>,
     jar: CookieJar,
-    pool: Vec<Idle>,
-    dns: Vec<(String, [u8; 4], u64)>,
-    /// The registrable domain of the last page fetched (the site-for-cookies of the next navigation).
-    site: Option<String>,
+    /// AETHERLIB (SR193): the answer cache, the parked sockets and the last page's site (the site-for-cookies of the
+    /// next navigation) — the model's state.
+    seq: fetchseq::Seq<Tcp>,
 }
 
 static mut NET: Option<Net> = None;
@@ -126,7 +120,7 @@ static mut NET: Option<Net> = None;
 fn state() -> &'static mut Net {
     // SAFETY: AETHER.ELF is single-threaded and nothing here re-enters `state` while a borrow is live (the tick hook
     // reads only `DEADLINE`).
-    unsafe { (*core::ptr::addr_of_mut!(NET)).get_or_insert_with(|| Net { tls: None, jar: CookieJar::new(), pool: Vec::new(), dns: Vec::new(), site: None }) }
+    unsafe { (*core::ptr::addr_of_mut!(NET)).get_or_insert_with(|| Net { tls: None, jar: CookieJar::new(), seq: fetchseq::Seq::new() }) }
 }
 
 static DEADLINE: AtomicU64 = AtomicU64::new(0);
@@ -138,33 +132,9 @@ fn tick() -> bool {
 
 // ---- failure ----------------------------------------------------------------------------------------------
 
-/// Why a navigation did not produce a page: the wire's `reason=` and `code=`.
-#[derive(Clone, Copy)]
-struct Fail {
-    why: &'static str,
-    code: i64,
-}
-
-fn fail(why: &'static str, code: i64) -> Fail {
-    Fail { why, code }
-}
-
-/// http_core's error, named for the wire (a transport errno rides `Io` as text; ECANCELED is the deadline).
+/// http_core's error, named for the wire: the table is fetchseq's (HTTPFAIL SR212), the errnos the `Elf`'s.
 fn http_fail(e: &http_core::Error) -> Fail {
-    use http_core::encoding::DecodeError;
-    match e {
-        http_core::Error::Timeout => fail("timeout", ECANCELED),
-        http_core::Error::Io(_) => fail("io", una_abi::EIO),
-        http_core::Error::Tls(_) => fail("tls-stream", vein_ring3::tls::EPROTO),
-        http_core::Error::Http(h1::H1Error::Truncated) => fail("truncated", 0),
-        http_core::Error::Http(_) => fail("http-framing", 0),
-        http_core::Error::Decode(DecodeError::Unsupported(_)) => fail("coding-unsupported", 0),
-        http_core::Error::Decode(_) => fail("coding-corrupt", 0),
-        http_core::Error::Url(_) => fail("bad-url", 0),
-        http_core::Error::Redirect(_) => fail("redirect-refused", 0),
-        http_core::Error::TooManyRedirects => fail("too-many-redirects", 0),
-        http_core::Error::Proxy(_) => fail("proxy", 0),
-    }
+    fetchseq::http_fail::<Elf<'static>>(e)
 }
 
 // ---- the byte stream http_core reads: any vein Transport (a Tcp, a TLS session) ------------------------------
@@ -237,159 +207,126 @@ fn exchange_h2<T: VeinTransport + ?Sized>(t: &mut T, authority: &str, target: &s
     Ok(Resp { status, headers, body, keep: false })
 }
 
-// ---- name, socket ---------------------------------------------------------------------------------------------
+// ---- the sequencer's I/O over this program's syscalls (AETHERLIB SR193) ----------------------------------------
 
-/// The IPv4 address of `url`'s host: a literal as written, else the kernel resolver (cached).
-fn address(n: &mut Net, url: &Url) -> Result<[u8; 4], Fail> {
-    match url.host() {
-        Some(Host::Ipv4(v)) => Ok(v.to_be_bytes()),
-        Some(Host::Domain(d)) => {
-            let now = now_ms();
-            n.dns.retain(|(_, _, at)| now.saturating_sub(*at) < DNS_TTL_MS);
-            if let Some((_, ip, _)) = n.dns.iter().find(|(h, _, _)| h == d) {
-                return Ok(*ip);
-            }
-            let ip = vein_ring3::net::resolve(d).map_err(|e| fail("dns", e))?; // AETHERNET2 (SR187): the errno names why (-19 no link, -2 no answer)
-            if n.dns.len() >= 32 {
-                n.dns.remove(0);
-            }
-            n.dns.push((d.clone(), ip, now));
-            Ok(ip)
+/// One encoded GET: the HTTP/1.1 head, and the target and fields an h2 stream sends instead.
+struct Req {
+    head: Vec<u8>,
+    target: String,
+    h: Headers,
+}
+
+/// `fetchseq::Io` over vein_ring3 (sockets, SYS_RESOLVE, TLS) and http_core (framing, the jar, the redirect rule).
+struct Elf<'a> {
+    tls: &'a mut Option<vein_ring3::TlsSetup>,
+    jar: &'a mut CookieJar,
+}
+
+impl fetchseq::Io for Elf<'_> {
+    type Conn = Tcp;
+    type Req = Req;
+    type Resp = Resp;
+    type Ctx = CookieContext;
+    type Issuer = vein_ring3::Verified;
+    const CANCELED: i64 = ECANCELED;
+    const EIO: i64 = una_abi::EIO;
+    const EPROTO: i64 = vein_ring3::tls::EPROTO;
+    const MAX_REDIRECTS: usize = redirect::MAX_REDIRECTS;
+    const PER_ORIGIN: usize = MAX_PER_ORIGIN;
+
+    fn now(&mut self) -> u64 {
+        now_ms()
+    }
+
+    fn resolve(&mut self, host: &str) -> Result<[u8; 4], i64> {
+        vein_ring3::net::resolve(host)
+    }
+
+    fn connect(&mut self, ip: [u8; 4], port: u16) -> Result<Tcp, i64> {
+        Tcp::connect(ip, port)
+    }
+
+    fn context(&mut self, cross_site: bool, partition: Option<String>) -> CookieContext {
+        CookieContext { cross_site, top_level_navigation: true, safe_method: true, partition }
+    }
+
+    fn request(&mut self, url: &Url, tls: bool, ctx: &CookieContext) -> Option<Req> {
+        let mut target = url.pathname();
+        if target.is_empty() {
+            target.push('/');
         }
-        Some(Host::Ipv6(_)) => Err(fail("ipv6-unsupported", 0)),
-        _ => Err(fail("no-host", 0)),
+        target.push_str(&url.search());
+        let mut h = Headers::new();
+        let _ = h.set("User-Agent", UA);
+        let _ = h.set("Accept", ACCEPT);
+        let _ = h.set("Accept-Encoding", encoding::ACCEPT_ENCODING);
+        let _ = h.set("Connection", if tls { "close" } else { "keep-alive" });
+        let unix = vein_ring3::sys::unix_time().unwrap_or(0);
+        if let Some(c) = self.jar.cookie_header_in(url, unix, true, ctx) {
+            let _ = h.set("Cookie", &c);
+        }
+        let head = h1::encode_request_head("GET", &target, &url.host_str(), &h, None).ok()?;
+        Some(Req { head, target, h })
     }
-}
 
-/// `scheme://host:port` — the pool's key (an origin).
-fn origin_key(url: &Url, port: u16) -> String {
-    alloc::format!("{}://{}:{}", url.scheme(), url.hostname(), port)
-}
-
-/// A parked socket for `origin`, freshest first (stale ones closed on the way).
-fn take_idle(n: &mut Net, origin: &str) -> Option<Tcp> {
-    let now = now_ms();
-    n.pool.retain(|i| now.saturating_sub(i.at) < IDLE_MS); // dropping an Idle closes its socket
-    let k = n.pool.iter().rposition(|i| i.origin == origin)?;
-    Some(n.pool.remove(k).tcp)
-}
-
-/// Park `tcp` for `origin` — never past `MAX_PER_ORIGIN` for one origin (one is in flight while we fetch, so at
-/// most `MAX_PER_ORIGIN - 1` wait) nor `POOL_MAX` overall (the oldest goes).
-fn park(n: &mut Net, origin: String, tcp: Tcp) {
-    if n.pool.iter().filter(|i| i.origin == origin).count() + 1 >= MAX_PER_ORIGIN {
-        return;
+    fn exchange(&mut self, c: &mut Tcp, req: &Req) -> Result<(Resp, bool), Fail> {
+        exchange(c, &req.head, false).map(|r| {
+            let keep = r.keep;
+            (r, keep)
+        })
     }
-    if n.pool.len() >= POOL_MAX {
-        n.pool.remove(0);
+
+    fn tls_ready(&mut self) -> Result<(), Gate> {
+        if self.tls.is_none() {
+            *self.tls = Some(vein_ring3::TlsSetup::load()); // VEINTLS: provider, /system/trust/roots.pem, the CT list — once
+        }
+        let setup = self.tls.as_ref().ok_or(Gate::NoContext)?;
+        match setup.verify() {
+            Verify::Ready => {}
+            Verify::NoProvider => return Err(Gate::NoProvider),
+            Verify::NoTrustStore => return Err(Gate::NoTrustStore(setup.trust_fail.map_or(0, |f| f.errno()))),
+            Verify::NoClock => return Err(Gate::NoClock(una_abi::EAGAIN)),
+        }
+        setup.context().map(|_| ()).ok_or(Gate::NoContext)
     }
-    n.pool.push(Idle { origin, tcp, at: now_ms() });
-}
 
-// ---- one hop ----------------------------------------------------------------------------------------------
-
-/// What one hop learned beyond the response.
-struct Hop {
-    tls: u16,
-    /// AETHERNET2 (SR187): the negotiated cipher suite's wire name (`vein_ring3::tls::cipher_name`), "" without TLS.
-    cipher: &'static str,
-    /// The page came over HTTP/2 (ALPN `h2`); otherwise HTTP/1.1.
-    h2: bool,
-    reused: bool,
-    issuer: Option<vein_ring3::Verified>,
-}
-
-/// One request for `url` (GET, top-level navigation) and its whole answer.
-fn hop(n: &mut Net, url: &Url, ctx: &CookieContext) -> Result<(Resp, Hop), Fail> {
-    let tls = url.scheme() == "https";
-    let port = url.port_or_default().unwrap_or(if tls { 443 } else { 80 });
-    let mut target = url.pathname();
-    if target.is_empty() {
-        target.push('/');
-    }
-    target.push_str(&url.search());
-    let mut h = Headers::new();
-    let _ = h.set("User-Agent", UA);
-    let _ = h.set("Accept", ACCEPT);
-    let _ = h.set("Accept-Encoding", encoding::ACCEPT_ENCODING);
-    let _ = h.set("Connection", if tls { "close" } else { "keep-alive" });
-    let unix = vein_ring3::sys::unix_time().unwrap_or(0);
-    if let Some(c) = n.jar.cookie_header_in(url, unix, true, ctx) {
-        let _ = h.set("Cookie", &c);
-    }
-    let head = h1::encode_request_head("GET", &target, &url.host_str(), &h, None).map_err(|_| fail("bad-request", 0))?;
-    let ip = address(n, url)?;
-
-    if !tls {
-        let origin = origin_key(url, port);
-        // A parked socket first; a reused one the server already closed fails before any answer: retry once, fresh.
-        if let Some(mut t) = take_idle(n, &origin) {
-            if let Ok(r) = exchange(&mut t, &head, false) {
-                if r.keep {
-                    park(n, origin, t);
-                }
-                return Ok((r, Hop { tls: 0, cipher: "", h2: false, reused: true, issuer: None }));
+    fn tls_exchange(&mut self, c: &mut Tcp, url: &Url, req: &Req) -> Result<Session<Resp, vein_ring3::Verified>, (&'static str, i64)> {
+        let setup = self.tls.as_ref().ok_or(("tls-no-context", 0))?;
+        let ctx_tls = setup.context().ok_or(("tls-no-context", 0))?;
+        let host = url.hostname();
+        let authority = url.host_str();
+        // NETDEBT2 (SR113): offer h2 first; the server's choice picks the exchange.
+        let done = vein_ring3::tls::with_session_alpn(c, &host, &ctx_tls, vein_ring3::tls::ALPN_H2_HTTP1, |s, v| {
+            let h2 = s.is_h2();
+            let out = if h2 { exchange_h2(s, &authority, &req.target, &req.h) } else { exchange(s, &req.head, true) };
+            Session { out, ver: s.version(), cipher: s.cipher(), h2, issuer: v, late: None }
+        });
+        match done {
+            Err(f) => Err((f.why, f.errno)),
+            Ok((mut s, tf)) => {
+                s.late = tf.map(|f| (f.why, f.errno));
+                Ok(s)
             }
         }
-        let mut t = Tcp::connect(ip, port).map_err(|e| fail(if e == ECANCELED { "timeout" } else { "connect" }, e))?;
-        let r = exchange(&mut t, &head, false)?;
-        if r.keep {
-            park(n, origin, t);
+    }
+
+    fn store_cookies(&mut self, url: &Url, r: &Resp, ctx: &CookieContext) {
+        let unix = vein_ring3::sys::unix_time().unwrap_or(0);
+        for v in r.headers.get_all("set-cookie") {
+            self.jar.set_cookie_in(url, v, unix, true, ctx);
         }
-        return Ok((r, Hop { tls: 0, cipher: "", h2: false, reused: false, issuer: None }));
     }
 
-    if n.tls.is_none() {
-        n.tls = Some(vein_ring3::TlsSetup::load()); // VEINTLS: provider, /system/trust/roots.pem, the CT list — once
+    fn status(&self, r: &Resp) -> u16 {
+        r.status
     }
-    let setup = n.tls.as_ref().ok_or(fail("tls-no-context", 0))?;
-    match setup.verify() {
-        Verify::Ready => {}
-        Verify::NoProvider => return Err(fail("tls-no-provider", 0)),
-        Verify::NoTrustStore => return Err(fail("tls-no-trust-store", setup.trust_fail.map_or(0, |f| f.errno()))),
-        Verify::NoClock => return Err(fail("tls-clock-unset", una_abi::EAGAIN)),
-    }
-    let ctx_tls = setup.context().ok_or(fail("tls-no-context", 0))?;
-    let mut t = Tcp::connect(ip, port).map_err(|e| fail(if e == ECANCELED { "timeout" } else { "connect" }, e))?;
-    let host = url.hostname();
-    let authority = url.host_str();
-    // NETDEBT2 (SR113): offer h2 first; the server's choice picks the exchange.
-    let done = vein_ring3::tls::with_session_alpn(&mut t, &host, &ctx_tls, vein_ring3::tls::ALPN_H2_HTTP1, |s, v| {
-        let h2 = s.is_h2();
-        let r = if h2 { exchange_h2(s, &authority, &target, &h) } else { exchange(s, &head, true) };
-        (r, s.version(), v, h2, s.cipher())
-    });
-    match done {
-        Err(f) => Err(fail(tls_why(f.why), f.errno)),
-        Ok(((Ok(r), ver, v, h2, cipher), _)) => Ok((r, Hop { tls: ver, cipher, h2, reused: false, issuer: Some(v) })),
-        Ok(((Err(e), _, _, _, _), Some(tf))) if e.why != "timeout" => Err(fail(tls_why(tf.why), tf.errno)),
-        Ok(((Err(e), _, _, _, _), _)) => Err(e),
-    }
-}
 
-/// `tls-<reason>` for the wire (tls_core's names are static; the prefix is chosen from a fixed set).
-fn tls_why(w: &'static str) -> &'static str {
-    match w {
-        "clock-unset" => "tls-clock-unset",
-        "no-trust-anchors" => "tls-no-trust-anchors",
-        "cert-unknown-issuer" => "tls-cert-unknown-issuer",
-        "cert-expired" => "tls-cert-expired",
-        "cert-not-yet-valid" => "tls-cert-not-yet-valid",
-        "cert-name-mismatch" => "tls-cert-name-mismatch",
-        "transport" => "tls-transport",
-        _ => w,
+    fn next_hop(&mut self, r: &Resp, url: &Url) -> Option<Result<Url, ()>> {
+        redirect::next_hop(r.status, "GET", url, r.headers.get("location")).map(|h| h.map(|h| h.url).map_err(|_| ()))
     }
 }
 
 // ---- the navigation ---------------------------------------------------------------------------------------
-
-/// psl_core's site (registrable domain, or the host itself for an IP / a bare suffix) of `url`.
-fn site_of(url: &Url) -> Option<String> {
-    match url.host()? {
-        Host::Domain(d) => Some(String::from(psl_core::site_host(d))),
-        h => Some(alloc::format!("{}", h)),
-    }
-}
 
 /// Fetch `url` (an absolute http/https URL) as a top-level navigation: `(body, final URL)` — the final URL without
 /// its fragment is the page's path (its relative hrefs resolve against it) — or the failure's code. Writes the
@@ -399,51 +336,9 @@ pub fn fetch(url: &str) -> Result<(Vec<u8>, String), i64> {
     DEADLINE.store(t0 + FETCH_MS, Ordering::Relaxed);
     vein_ring3::net::set_tick(Some(tick));
     let n = state();
-    let mut cur = match Url::parse(url) {
-        Ok(u) if is_net_scheme(u.scheme()) => Ok(u),
-        Ok(_) => Err(fail("not-http", 0)),
-        Err(_) => Err(fail("bad-url", 0)),
-    };
-    let mut hops = 0usize;
-    let mut last: Option<Hop> = None;
-    let out: Result<Resp, Fail> = loop {
-        let u = match &cur {
-            Ok(u) => u.clone(),
-            Err(f) => break Err(*f),
-        };
-        let target_site = site_of(&u);
-        let ctx = CookieContext {
-            cross_site: matches!((&n.site, &target_site), (Some(a), Some(b)) if a != b),
-            top_level_navigation: true,
-            safe_method: true,
-            partition: target_site.clone(),
-        };
-        let (r, h) = match hop(n, &u, &ctx) {
-            Ok(x) => x,
-            Err(f) => break Err(f),
-        };
-        last = Some(h);
-        let unix = vein_ring3::sys::unix_time().unwrap_or(0);
-        for v in r.headers.get_all("set-cookie") {
-            n.jar.set_cookie_in(&u, v, unix, true, &ctx);
-        }
-        match redirect::next_hop(r.status, "GET", &u, r.headers.get("location")) {
-            None => {
-                n.site = target_site;
-                cur = Ok(u);
-                break Ok(r);
-            }
-            Some(Err(_)) => break Err(fail("redirect-refused", r.status as i64)),
-            Some(Ok(next)) => {
-                hops += 1;
-                if hops > redirect::MAX_REDIRECTS {
-                    break Err(fail("too-many-redirects", hops as i64));
-                }
-                n.site = target_site; // the redirecting response's site is the next hop's site-for-cookies
-                cur = Ok(next.url);
-            }
-        }
-    };
+    let mut io = Elf { tls: &mut n.tls, jar: &mut n.jar };
+    // AETHERLIB (SR193): the model sequences the hops; the values below are the ones this line always read.
+    let fetchseq::Nav { cur, out, hops, last } = fetchseq::navigate(&mut io, &mut n.seq, url);
     // Undo the content codings (gzip/deflate/br; any other is a named refusal).
     let mut coding: &[u8] = b"identity";
     let out = out.and_then(|r| {

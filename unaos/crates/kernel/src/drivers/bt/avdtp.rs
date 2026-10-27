@@ -10,11 +10,14 @@
 //! device (`a2dp_link`: `bt audio <addr>` named it, or its Class of Device is Audio/Video):
 //! * SDP: the AudioSink query instead of the HID one ([`super::sdp`]);
 //! * AVDTP signalling on PSM 0x0019 ([`Peer`], pure, driven by `tests a2dp` with no radio). As INITIATOR: DISCOVER
-//!   (first free audio SINK SEP), GET_CAPABILITIES (its SBC codec element), SET_CONFIGURATION (SBC, 44.1 kHz, joint
-//!   stereo, 16 blocks, 8 subbands, loudness — SNR when loudness is not offered — bitpool [`pick_bitpool`]), OPEN, the
-//!   media channel, START. As ACCEPTOR (a headset that reconnects and drives): our one SEP (SEID 1, audio, SOURCE)
+//!   (first free audio SINK SEP), GET_ALL_CAPABILITIES (its SBC codec element and Delay Reporting; GET_CAPABILITIES
+//!   when a pre-1.3 sink rejects it, A2DPKAT B870), SET_CONFIGURATION (SBC, 44.1 kHz, joint stereo, 16 blocks, 8
+//!   subbands, loudness — SNR when loudness is not offered — bitpool [`pick_bitpool`]; Delay Reporting when the sink
+//!   listed it), OPEN, the media channel, START. As ACCEPTOR (a headset that reconnects and drives): our one SEP (SEID 1, audio, SOURCE)
 //!   answers DISCOVER, GET_(ALL_)CAPABILITIES, SET_CONFIGURATION, OPEN, START, SUSPEND, CLOSE, ABORT and
-//!   DELAYREPORT; anything else gets a general reject. Fragmented signalling packets are not reassembled.
+//!   DELAYREPORT (A2DPKAT B870: the GET_ALL_CAPABILITIES answer lists Delay Reporting; a DELAYREPORT to our SEID is
+//!   kept in [`Peer`] and read ONCE at stream start into [`delay_tenth_ms`], which the mixer takes off the Player's
+//!   A/V clock on BT); anything else gets a general reject. Fragmented signalling packets are not reassembled.
 //! * THE MEDIA TRANSPORT: the second L2CAP channel on PSM 0x0019 carries RTP (version 2, payload type 96, sequence,
 //!   timestamp in samples, SSRC 1) + the one-byte SBC media payload header (frame count) + `fpp` SBC frames from
 //!   [`sbc::Encoder`] (the `sbc_core` source, included by path). One packet is at most two ACL packets
@@ -29,7 +32,7 @@
 //!
 //! Wire: `[a2dp] dev=<addr> link up -> sdp`, `[a2dp] sdp dev= sink=<yes|no> psm= avdtp= a2dp=`, `[a2dp] dev=
 //! signalling channel …`, `[a2dp] dev= media channel …`, `[a2dp] dev=<addr> codec=sbc 44100 js bitpool=<n> mtu=<n>
-//! -> streaming`, `[a2dp] dev= -> FAILED reason=`, `[a2dp] dev= gone`; `tests a2dp`: `:: A2DP: sbc_kat=ok avdtp=ok
+//! -> streaming`, `[a2dp] delay=<ms> src=<sink|none> cap=<0|1>` (A2DPKAT B870), `[a2dp] dev= -> FAILED reason=`, `[a2dp] dev= gone`; `tests a2dp`: `:: A2DP: sbc_kat=ok avdtp=ok
 //! frag=ok stream=<ok|no-device> sdp_server=<ok|FAIL> inbound=<ok|FAIL> avrcp=<ok|FAIL> avrcp_ct=<ok|FAIL> avrcp_mute=<ok|FAIL> -> PASS|SKIP|FAIL ::` (`sdp_server`, `inbound`: SDPSERVER
 //! B769; `avrcp=` AVRCP B774; `avrcp_ct=` AVRCPCT B780; `avrcp_mute=` AVRCPMUTE B790); `[a2dp] dev= the peer opened the link -> acceptor …` (a reconnecting headset drives AVDTP, [`acp_due`]). Compiled only under the `a2dp` knob (A2DPKNOB B750).
 
@@ -65,6 +68,10 @@ const SUSPEND: u8 = 0x09;
 const ABORT: u8 = 0x0A;
 const GET_ALL_CAPS: u8 = 0x0C;
 const DELAY_REPORT: u8 = 0x0D;
+
+/// A2DPKAT (rmbp-ledger B870): the Delay Reporting service category (AVDTP 1.3), LOSC 0; listed only in a
+/// GET_ALL_CAPABILITIES answer.
+const CAT_DELAY: u8 = 0x08;
 
 // Message types.
 const MT_CMD: u8 = 0;
@@ -140,6 +147,21 @@ fn sbc_caps(mut c: &[u8]) -> Option<[u8; 4]> {
         c = &c[2 + len..];
     }
     None
+}
+
+/// A2DPKAT: service category `cat` is in a capability / configuration list.
+fn has_cat(mut c: &[u8], cat: u8) -> bool {
+    while c.len() >= 2 {
+        if c[0] == cat {
+            return true;
+        }
+        let len = c[1] as usize;
+        if 2 + len > c.len() {
+            return false;
+        }
+        c = &c[2 + len..];
+    }
+    false
 }
 
 /// The RTP + SBC media payload header of one media packet.
@@ -225,11 +247,15 @@ pub struct Peer {
     fit: usize,
     media: bool,
     start_pending: bool,
+    /// A2DPKAT: the configuration carries Delay Reporting (the sink offered it / configured it).
+    pub delay_cap: bool,
+    /// A2DPKAT: the sink's last DelayReport, in 1/10 ms (AVDTP 1.3).
+    pub delay: Option<u16>,
 }
 
 impl Peer {
     pub fn new(fit: usize) -> Peer {
-        Peer { st: St::Idle, int: false, label: 0, pending: None, cands: [0; 8], ncand: 0, cand: 0, acp: 0, bitpool: 0, min_bp: 2, snr: false, fpp: 1, fit, media: false, start_pending: false }
+        Peer { st: St::Idle, int: false, label: 0, pending: None, cands: [0; 8], ncand: 0, cand: 0, acp: 0, bitpool: 0, min_bp: 2, snr: false, fpp: 1, fit, media: false, start_pending: false, delay_cap: false, delay: None }
     }
 
     fn cmd(&mut self, sig: u8, args: &[u8], out: &mut Vec<Out>) {
@@ -310,7 +336,7 @@ impl Peer {
         if self.cand < self.ncand {
             self.st = St::Caps;
             let s = self.cands[self.cand];
-            self.cmd(GET_CAPS, &[s << 2], out);
+            self.cmd(GET_ALL_CAPS, &[s << 2], out);
         } else {
             self.fail(why, out);
         }
@@ -333,9 +359,9 @@ impl Peer {
                 self.cand = 0;
                 self.st = St::Caps;
                 let s = self.cands[0];
-                self.cmd(GET_CAPS, &[s << 2], out);
+                self.cmd(GET_ALL_CAPS, &[s << 2], out);
             }
-            (GET_CAPS, St::Caps) => {
+            (GET_CAPS | GET_ALL_CAPS, St::Caps) => {
                 let Some(c) = sbc_caps(p) else { return self.next_cand("no-sbc-codec", out) };
                 let ok = c[0] & SBC_44100 != 0 && c[0] & SBC_JOINT != 0 && c[1] & SBC_BLOCKS16 != 0 && c[1] & SBC_SUBBANDS8 != 0 && c[1] & (SBC_LOUDNESS | SBC_SNR) != 0;
                 if !ok {
@@ -347,10 +373,12 @@ impl Peer {
                 self.min_bp = c[2].max(2);
                 self.bitpool = bp;
                 self.fpp = n;
+                self.delay_cap = has_cat(p, CAT_DELAY);
                 self.st = St::Config;
                 let alloc = if self.snr { SBC_SNR } else { SBC_LOUDNESS };
-                let args = [self.acp << 2, OUR_SEID << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, SBC_44100 | SBC_JOINT, SBC_BLOCKS16 | SBC_SUBBANDS8 | alloc, self.min_bp, bp];
-                self.cmd(SET_CONFIG, &args, out);
+                let args = [self.acp << 2, OUR_SEID << 2, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, SBC_44100 | SBC_JOINT, SBC_BLOCKS16 | SBC_SUBBANDS8 | alloc, self.min_bp, bp, CAT_DELAY, 0x00];
+                let n = if self.delay_cap { args.len() } else { args.len() - 2 };
+                self.cmd(SET_CONFIG, &args[..n], out);
             }
             (SET_CONFIG, St::Config) => {
                 self.st = St::Opening;
@@ -373,6 +401,11 @@ impl Peer {
         match sig {
             DISCOVER => self.fail("discover-rejected", out),
             GET_CAPS => self.next_cand("get-capabilities-rejected", out),
+            GET_ALL_CAPS => {
+                // A2DPKAT: a pre-1.3 sink rejects GET_ALL_CAPABILITIES: ask the same end-point GET_CAPABILITIES.
+                let s = self.cands[self.cand];
+                self.cmd(GET_CAPS, &[s << 2], out);
+            }
             SET_CONFIG => self.next_cand("set-configuration-rejected", out),
             OPEN => self.fail("open-rejected", out),
             START => self.fail("start-rejected", out),
@@ -385,8 +418,10 @@ impl Peer {
         match sig {
             DISCOVER => Self::reply(label, MT_ACC, sig, &[OUR_SEID << 2 | (self.busy() as u8) << 1, 0x00], out),
             GET_CAPS | GET_ALL_CAPS if ours => {
-                let caps = [0x01, 0x00, 0x07, 0x06, 0x00, 0x00, SBC_44100 | SBC_JOINT, SBC_BLOCKS16 | SBC_SUBBANDS8 | SBC_LOUDNESS | SBC_SNR, 2, MAX_BITPOOL];
-                Self::reply(label, MT_ACC, sig, &caps, out);
+                // A2DPKAT: Delay Reporting is listed in the GET_ALL_CAPABILITIES answer only (AVDTP 1.3).
+                let caps = [0x01, 0x00, 0x07, 0x06, 0x00, 0x00, SBC_44100 | SBC_JOINT, SBC_BLOCKS16 | SBC_SUBBANDS8 | SBC_LOUDNESS | SBC_SNR, 2, MAX_BITPOOL, CAT_DELAY, 0x00];
+                let n = if sig == GET_ALL_CAPS { caps.len() } else { caps.len() - 2 };
+                Self::reply(label, MT_ACC, sig, &caps[..n], out);
             }
             GET_CAPS | GET_ALL_CAPS => Self::reply(label, MT_REJ, sig, &[E_BAD_ACP_SEID], out),
             SET_CONFIG => {
@@ -408,6 +443,7 @@ impl Peer {
                 self.min_bp = c[2].max(2);
                 self.bitpool = bp;
                 self.fpp = n;
+                self.delay_cap = has_cat(&p[2..], CAT_DELAY);
                 self.st = St::Configured;
                 Self::reply(label, MT_ACC, sig, &[], out);
             }
@@ -450,7 +486,11 @@ impl Peer {
                     out.push(Out::Stopped);
                 }
             }
-            DELAY_REPORT => Self::reply(label, MT_ACC, sig, &[], out),
+            DELAY_REPORT if ours && p.len() >= 3 => {
+                self.delay = Some(u16::from_be_bytes([p[1], p[2]])); // A2DPKAT: kept; read at stream start
+                Self::reply(label, MT_ACC, sig, &[], out);
+            }
+            DELAY_REPORT => Self::reply(label, MT_REJ, sig, &[E_BAD_ACP_SEID], out),
             _ => Self::reply(label, MT_GREJ, sig, &[], out),
         }
     }
@@ -517,6 +557,10 @@ static WRITER: AtomicBool = AtomicBool::new(false);
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 static PACKETS: AtomicU64 = AtomicU64::new(0);
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+/// A2DPKAT (rmbp-ledger B870): the streaming sink's reported delay in 1/10 ms, read ONCE at stream start (the A/V clock
+/// never steps back mid-stream); [`NO_DELAY`] when none was reported or no stream runs. The mixer reads it lock-free.
+static DELAY: AtomicU32 = AtomicU32::new(NO_DELAY);
+const NO_DELAY: u32 = u32::MAX;
 /// SDPSERVER (B769): a link the PEER opened whose SDP is done (address, when): AVDTP signalling is the peer's to open
 /// for [`ACP_WAIT_MS`], then [`acp_due`] opens it. Lock order: BTHID's `BT`, then this alone (never held with `A2`).
 static ACP_DUE: crate::sync::Mutex<Option<([u8; 6], u64)>> = crate::sync::Mutex::new(None);
@@ -677,17 +721,22 @@ impl Bt {
                         s.sent = 0;
                         serial_println!("[a2dp] dev={} codec=sbc 44100 js bitpool={} mtu={} -> streaming", fmt_addr(&addr), cfg.bitpool, s.mtu);
                         serial_println!("[a2dp] dev={} frame_len={} frames_per_packet={} alloc={} role={}", fmt_addr(&addr), cfg.frame_len(), s.peer.fpp, if s.peer.snr { "snr" } else { "loudness" }, if s.peer.int { "initiator" } else { "acceptor" });
+                        let d = s.peer.delay;
+                        DELAY.store(d.map_or(NO_DELAY, |t| t as u32), Ordering::Release);
+                        serial_println!("[a2dp] delay={} src={} cap={}", d.map_or(0, |t| t / 10), if d.is_some() { "sink" } else { "none" }, s.peer.delay_cap as u8);
                     }
                     STREAMING.store(true, Ordering::Release);
                     super::avctp::ct_arm(addr, now); // AVRCPCT (B780): the AVRCP controller is bound to the streaming headset
                 }
                 Out::Stopped => {
                     STREAMING.store(false, Ordering::Release);
+                    DELAY.store(NO_DELAY, Ordering::Release);
                     let st = A2.lock().as_ref().map(|s| s.peer.st.name()).unwrap_or("gone");
                     serial_println!("[a2dp] dev={} stream stopped state={}", fmt_addr(&addr), st);
                 }
                 Out::Failed(why) => {
                     STREAMING.store(false, Ordering::Release);
+                    DELAY.store(NO_DELAY, Ordering::Release);
                     serial_println!("[a2dp] dev={} -> FAILED reason={}", fmt_addr(&addr), why);
                 }
             }
@@ -702,6 +751,7 @@ pub(super) fn link_gone(addr: &[u8; 6]) {
         let pk = PACKETS.load(Ordering::Relaxed);
         *g = None;
         STREAMING.store(false, Ordering::Release);
+        DELAY.store(NO_DELAY, Ordering::Release);
         *LABEL.lock() = None;
         serial_println!("[a2dp] dev={} gone packets={} underruns={}", fmt_addr(addr), pk, UNDERRUNS.load(Ordering::Relaxed));
     }
@@ -881,6 +931,15 @@ pub fn queued() -> usize {
     PCM.lock().len / 2
 }
 
+/// A2DPKAT (rmbp-ledger B870): the streaming sink's reported delay in 1/10 ms, as read at stream start; None when it
+/// reported none (the kernel-ms clock alone then) or no stream runs. An atomic load: any context.
+pub fn delay_tenth_ms() -> Option<u16> {
+    match DELAY.load(Ordering::Acquire) {
+        NO_DELAY => None,
+        d => Some(d as u16),
+    }
+}
+
 /// (frames sent, underruns) since boot.
 pub fn counters() -> (u64, u32) {
     (FRAMES.load(Ordering::Relaxed), UNDERRUNS.load(Ordering::Relaxed))
@@ -913,7 +972,8 @@ pub(super) fn verb_audio(bt: &mut Bt, a: [u8; 6], now: u64, out: &mut dyn FnMut(
 pub(super) fn list_line(out: &mut dyn FnMut(&str)) {
     if let Some(s) = A2.lock().as_ref() {
         let (f, u) = counters();
-        out(&format!("bt: a2dp {}  state={}  role={}  bitpool={}  frames_per_packet={}  payload_max={}  packets={}  frames={}  underruns={}", fmt_addr(&s.addr), s.peer.st.name(), if s.peer.int { "initiator" } else { "acceptor" }, s.peer.bitpool, s.peer.fpp, s.mtu, PACKETS.load(Ordering::Relaxed), f, u));
+        let delay = s.peer.delay.map_or(String::from("none"), |t| format!("{}ms", t / 10));
+        out(&format!("bt: a2dp {}  state={}  role={}  bitpool={}  frames_per_packet={}  payload_max={}  packets={}  frames={}  underruns={}  delay={}", fmt_addr(&s.addr), s.peer.st.name(), if s.peer.int { "initiator" } else { "acceptor" }, s.peer.bitpool, s.peer.fpp, s.mtu, PACKETS.load(Ordering::Relaxed), f, u, delay));
     }
 }
 
@@ -957,8 +1017,8 @@ fn avdtp_legs() -> Result<(), &'static str> {
         return Err("int-discover");
     }
     // SEID 2 a source, SEID 3 a sink in use, SEID 1 a free audio sink.
-    step_is(&mut p, &[0x12, 0x01, 0x08, 0x00, 0x0E, 0x08, 0x04, 0x08], &[0x20, 0x02, 0x04], "int-get-capabilities")?;
-    step_is(&mut p, &[0x22, 0x02, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0xFF, 0xFF, 0x02, 0x35], &[0x30, 0x03, 0x04, 0x04, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x34], "int-set-configuration")?;
+    step_is(&mut p, &[0x12, 0x01, 0x08, 0x00, 0x0E, 0x08, 0x04, 0x08], &[0x20, 0x0C, 0x04], "int-get-capabilities")?;
+    step_is(&mut p, &[0x22, 0x0C, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0xFF, 0xFF, 0x02, 0x35], &[0x30, 0x03, 0x04, 0x04, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x34], "int-set-configuration")?;
     step_is(&mut p, &[0x32, 0x03], &[0x40, 0x06, 0x04], "int-open")?;
     let mut o = Vec::new();
     p.on_sig(&[0x42, 0x06], &mut o);
@@ -973,8 +1033,28 @@ fn avdtp_legs() -> Result<(), &'static str> {
     let mut o = Vec::new();
     p.on_sig(&[0x92, 0x07], &mut o); // a stale label: ignored
     p.on_sig(&[0x52, 0x07], &mut o);
-    if o != [Out::Streaming] || p.st != St::Streaming || p.bitpool != 52 || p.fpp != 2 || p.snr || p.acp != 1 {
+    if o != [Out::Streaming] || p.st != St::Streaming || p.bitpool != 52 || p.fpp != 2 || p.snr || p.acp != 1 || p.delay_cap || p.delay.is_some() {
         return Err("int-streaming");
+    }
+    // A2DPKAT (B870): a 1.3 sink lists Delay Reporting -> it is configured, and the sink's DELAYREPORT (200.0 ms) is kept.
+    let mut p = Peer::new(248);
+    let mut o = Vec::new();
+    p.start(&mut o);
+    step_is(&mut p, &[0x12, 0x01, 0x04, 0x08], &[0x20, 0x0C, 0x04], "int-delay-all-capabilities")?;
+    step_is(&mut p, &[0x22, 0x0C, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0xFF, 0xFF, 0x02, 0x35, 0x08, 0x00], &[0x30, 0x03, 0x04, 0x04, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x34, 0x08, 0x00], "int-delay-set-configuration")?;
+    step_is(&mut p, &[0x40, 0x0D, 0x04, 0x07, 0xD0], &[0x42, 0x0D], "int-delay-report")?;
+    if !p.delay_cap || p.delay != Some(2000) {
+        return Err("int-delay-kept");
+    }
+    // A2DPKAT: a pre-1.3 sink general-rejects GET_ALL_CAPABILITIES -> GET_CAPABILITIES of the same SEP, no Delay Reporting.
+    let mut p = Peer::new(248);
+    let mut o = Vec::new();
+    p.start(&mut o);
+    step_is(&mut p, &[0x12, 0x01, 0x04, 0x08], &[0x20, 0x0C, 0x04], "int-fallback-all-capabilities")?;
+    step_is(&mut p, &[0x21, 0x0C], &[0x30, 0x02, 0x04], "int-fallback-get-capabilities")?;
+    step_is(&mut p, &[0x32, 0x02, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0xFF, 0xFF, 0x02, 0x35], &[0x40, 0x03, 0x04, 0x04, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x34], "int-fallback-set-configuration")?;
+    if p.delay_cap {
+        return Err("int-fallback-no-delay");
     }
     // Refusals: a rejected DISCOVER fails; a sink without 44.1 kHz fails after its only candidate.
     let mut p = Peer::new(248);
@@ -987,9 +1067,9 @@ fn avdtp_legs() -> Result<(), &'static str> {
     let mut p = Peer::new(248);
     let mut o = Vec::new();
     p.start(&mut o);
-    step_is(&mut p, &[0x12, 0x01, 0x04, 0x08], &[0x20, 0x02, 0x04], "int-one-sink")?;
+    step_is(&mut p, &[0x12, 0x01, 0x04, 0x08], &[0x20, 0x0C, 0x04], "int-one-sink")?;
     let mut o = Vec::new();
-    p.on_sig(&[0x22, 0x02, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x11, 0x15, 0x02, 0x35], &mut o);
+    p.on_sig(&[0x22, 0x0C, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x11, 0x15, 0x02, 0x35], &mut o);
     if o != [Out::Failed("sbc-44100-js-not-offered")] {
         return Err("int-48k-only");
     }
@@ -997,9 +1077,15 @@ fn avdtp_legs() -> Result<(), &'static str> {
     let mut q = Peer::new(248);
     step_is(&mut q, &[0x50, 0x01], &[0x52, 0x01, 0x04, 0x00], "acp-discover")?;
     step_is(&mut q, &[0x60, 0x02, 0x04], &[0x62, 0x02, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x17, 0x02, 0x35], "acp-capabilities")?;
-    step_is(&mut q, &[0x70, 0x03, 0x04, 0x08, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35], &[0x72, 0x03], "acp-set-configuration")?;
-    if q.st != St::Configured || q.acp != 2 || q.bitpool != 52 || q.int {
+    step_is(&mut q, &[0xE0, 0x0C, 0x04], &[0xE2, 0x0C, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x17, 0x02, 0x35, 0x08, 0x00], "acp-all-capabilities")?; // A2DPKAT (B870)
+    step_is(&mut q, &[0x70, 0x03, 0x04, 0x08, 0x01, 0x00, 0x07, 0x06, 0x00, 0x00, 0x21, 0x15, 0x02, 0x35, 0x08, 0x00], &[0x72, 0x03], "acp-set-configuration")?;
+    if q.st != St::Configured || q.acp != 2 || q.bitpool != 52 || q.int || !q.delay_cap {
         return Err("acp-configured");
+    }
+    step_is(&mut q, &[0xF0, 0x0D, 0x04, 0x05, 0xDC], &[0xF2, 0x0D], "acp-delay-report")?; // A2DPKAT: 150.0 ms kept
+    step_is(&mut q, &[0xF0, 0x0D, 0x08, 0x00, 0x10], &[0xF3, 0x0D, E_BAD_ACP_SEID], "acp-delay-report-other-seid")?;
+    if q.delay != Some(1500) {
+        return Err("acp-delay-kept");
     }
     step_is(&mut q, &[0x80, 0x01], &[0x82, 0x01, 0x06, 0x00], "acp-discover-in-use")?;
     step_is(&mut q, &[0x90, 0x06, 0x04], &[0x92, 0x06], "acp-open")?;

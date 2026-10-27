@@ -40,7 +40,7 @@ use super::wm;
 
 /// Content surface dimensions (pixels). The compositor's scale rule may magnify.
 const W: usize = 520;
-const H: usize = 396;
+const H: usize = 396; #[allow(non_snake_case)] fn IH() -> usize { INST_H.load(Ordering::Relaxed) } // TEXTSCALERESEAT2 (B886): the height the open installer laid out at (`h_at`, re-seated at a text step); `H` stays the default (install3.rs lays out at it)
 
 /// FONTSURF (SO48) — **the dialog's face, and the metric split that came with it.**
 ///
@@ -74,7 +74,7 @@ static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsiz
 /// a composite read only in the benign present-tear sense every app surface
 /// shares (`wm` copies rows; a mid-paint read shows a mixed frame, corrected by
 /// the follow-up present).
-fn surf() -> &'static mut [u32] { super::metrics::leaked_surf(&SURF_AT, super::metrics::size(W) * super::metrics::size(H)) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
+fn surf() -> &'static mut [u32] { super::metrics::leaked_surf(&SURF_AT, super::metrics::size(W) * super::metrics::size(IH())) } // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -381,7 +381,7 @@ fn step_part(cur: usize, dir: isize) -> usize {
 
 fn fill(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
     // UIMETRICS (B372): LOGICAL rect, clipped to the logical W x H, onto the physical surface.
-    let (w, h) = (w.min(W.saturating_sub(x)), h.min(H.saturating_sub(y)));
+    let (w, h) = (w.min(W.saturating_sub(x)), h.min(IH().saturating_sub(y)));
     super::metrics::fill(px, super::metrics::size(W), x, y, w, h, c);
 }
 
@@ -418,7 +418,7 @@ fn bevel(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, raised: bool) {
 /// surface and any other that adopts the seam truncate identically.
 fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], fg: u32) {
     let n = s.iter().position(|&c| c == b'\n').unwrap_or(s.len());
-    super::metrics::text(px, super::metrics::size(W), super::metrics::size(H), W, x, y, &s[..n], fg, false, FACE); // UIMETRICS: logical origin, the dpi-sized grid face
+    super::metrics::text(px, super::metrics::size(W), super::metrics::size(IH()), W, x, y, &s[..n], fg, false, FACE); // UIMETRICS: logical origin, the dpi-sized grid face
 }
 
 /// Format a byte count as whole gibibytes/mebibytes into `buf`, returning the slice.
@@ -466,15 +466,15 @@ fn repaint() {
     // — every other window's pixels belong to a ring-3 app. `super::paper` derives its base from
     // `theme::CONTENT_FILL`, so the flat fill this replaces is exactly the texture's mean; nothing
     // drawn on top (text, rows, buttons) moves by a pixel.
-    fill(px, 0, 0, W, H, theme::surface_window());
-    bevel(px, 4, 4, W - 8, H - 8, false);
+    fill(px, 0, 0, W, IH(), theme::surface_window());
+    bevel(px, 4, 4, W - 8, IH() - 8, false);
     super::paper::fill_rect(
         px,
         W,
         4 + crate::ui::base::BEVEL,
         4 + crate::ui::base::BEVEL,
         W - 8 - 2 * crate::ui::base::BEVEL,
-        H - 8 - 2 * crate::ui::base::BEVEL,
+        IH() - 8 - 2 * crate::ui::base::BEVEL,
     );
 
     let lx = 24; #[cfg(feature = "ahciroot")] if install3::paint(px) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } if st == State::Choose && plan_view_paint(px, lx) { let id = WIN.load(Ordering::Relaxed); if id != wm::WIN_NONE { wm::present(id); } return; } // SELFINSTALL2 M3: the SSD plan view (key `i`), see the file tail
@@ -546,11 +546,11 @@ fn repaint() {
                 text(px, lx, ry + CELL_H + 4, b"install onto.", theme::text_primary());
             }
             // Exits are ALWAYS on screen: an installer that can only go forward is a trap.
-            text(px, lx, H - 100, b"w/s select   Enter continue", theme::text_secondary());
-            text(px, lx, H - 100 + CELL_H + 4, b"Esc boot this live system", theme::text_secondary());
-            text(px, lx, H - 100 + 2 * (CELL_H + 4), b"q  halt the machine", theme::text_secondary()); text(px, lx, H - 100 + 3 * (CELL_H + 4), b"i  SSD install plan", theme::text_secondary()); // SELFINSTALL2 M3
+            text(px, lx, IH() - 100, b"w/s select   Enter continue", theme::text_secondary());
+            text(px, lx, IH() - 100 + CELL_H + 4, b"Esc boot this live system", theme::text_secondary());
+            text(px, lx, IH() - 100 + 2 * (CELL_H + 4), b"q  halt the machine", theme::text_secondary()); text(px, lx, IH() - 100 + 3 * (CELL_H + 4), b"i  SSD install plan", theme::text_secondary()); // SELFINSTALL2 M3
             if n > 0 && selectable {
-                button(px, W - 190, H - 52, 160, b"Continue", true);
+                button(px, W - 190, IH() - 52, 160, b"Continue", true);
             }
         }
         State::Census => {
@@ -571,7 +571,7 @@ fn repaint() {
             }
             for (i, pr) in parts.iter().enumerate() {
                 let ry = 62 + i * (CELL_H + 10);
-                if ry + CELL_H > H - 118 {
+                if ry + CELL_H > IH() - 118 {
                     break; // the fixture disk has five; a bigger table simply paints what fits
                 }
                 let sel = i == psel && pr.empty;
@@ -590,7 +590,7 @@ fn repaint() {
             // THE WHOLE-DISK AFFORDANCE, AND WHERE IT IS NOT. On a disk carrying anything that is
             // not ours the button is not disabled, not confirmed twice, not hidden behind a
             // modifier — it is ABSENT, and the reason is on the glass in place of it. R25.
-            let ry = H - 116;
+            let ry = IH() - 116;
             if whole_ok {
                 text(px, lx, ry, b"d  erase the WHOLE disk", theme::text_primary());
             } else {
@@ -598,13 +598,13 @@ fn repaint() {
                 text(px, lx, ry + CELL_H + 2, b"offered: this disk holds", theme::text_secondary());
                 text(px, lx, ry + 2 * (CELL_H + 2), b"volumes that are not ours.", theme::text_secondary());
             }
-            text(px, lx, H - 52 + 4, if selectable {
+            text(px, lx, IH() - 52 + 4, if selectable {
                 b"w/s pick  Enter install  Esc".as_slice()
             } else {
                 b"Esc back   q halt".as_slice()
             }, theme::text_secondary());
             if selectable {
-                button(px, W - 190, H - 52, 160, b"Install", true);
+                button(px, W - 190, IH() - 52, 160, b"Install", true);
             }
         }
         State::Warn => {
@@ -662,12 +662,12 @@ fn repaint() {
             text(px, lx, 200 + CELL_H + 4, b"The census found nothing here", theme::text_secondary());
             text(px, lx, 200 + 2 * (CELL_H + 4), b"that is not ours.", theme::text_secondary());
             if bound.is_some() {
-                text(px, lx, H - 92, b"Enter install    Esc back", theme::text_secondary());
-                button(px, W - 190, H - 52, 160, b"Install", true);
+                text(px, lx, IH() - 92, b"Enter install    Esc back", theme::text_secondary());
+                button(px, W - 190, IH() - 52, 160, b"Install", true);
             } else {
-                text(px, lx, H - 92, b"Esc back", theme::text_secondary());
+                text(px, lx, IH() - 92, b"Esc back", theme::text_secondary());
             }
-            button(px, W - 370, H - 52, 160, b"Back", false);
+            button(px, W - 370, IH() - 52, 160, b"Back", false);
         }
         State::Running => {
             text(px, lx, 20, b"Installing...", theme::text_primary());
@@ -694,8 +694,8 @@ fn repaint() {
                 text(px, lx, 84 + 2 * (CELL_H + 6), b"log names the exact reason", theme::text_primary());
                 text(px, lx, 84 + 3 * (CELL_H + 6), b"it gave.", theme::text_primary());
             }
-            text(px, lx, H - 92, b"Esc close", theme::text_secondary());
-            button(px, W - 190, H - 52, 160, b"Close", true);
+            text(px, lx, IH() - 92, b"Esc close", theme::text_secondary());
+            button(px, W - 190, IH() - 52, 160, b"Close", true);
         }
         State::Gone => {
             // INSTALL-SEL: the go-time refusal. Reached when the identity resolved on the warning
@@ -709,8 +709,8 @@ fn repaint() {
             text(px, lx, 84 + 2 * (CELL_H + 6), b"about to begin. NOTHING was", theme::text_primary());
             text(px, lx, 84 + 3 * (CELL_H + 6), b"written - not to it, and not", theme::text_primary());
             text(px, lx, 84 + 4 * (CELL_H + 6), b"to any other disk.", theme::text_primary());
-            text(px, lx, H - 92, b"Enter choose again   Esc close", theme::text_secondary());
-            button(px, W - 190, H - 52, 160, b"Choose", true);
+            text(px, lx, IH() - 92, b"Enter choose again   Esc close", theme::text_secondary());
+            button(px, W - 190, IH() - 52, 160, b"Choose", true);
         }
         State::Closed => {}
     }
@@ -744,8 +744,8 @@ pub fn open() {
         let n = devices(&mut devs);
         SEL.store(first_selectable(&devs, n).unwrap_or(0) as u8, Ordering::Relaxed);
     }
-    repaint(); // full first paint BEFORE the window names the surface
-    let (_s, ow, oh) = match wm::spawn_geometry_native(super::metrics::size(W), super::metrics::size(H)) {
+    seat_open(); repaint(); // full first paint BEFORE the window names the surface
+    let (_s, ow, oh) = match wm::spawn_geometry_native(super::metrics::size(W), super::metrics::size(IH())) {
         Some(g) => g,
         None => {
             crate::census_println!("[wc-x] instgui DECLINE reason=geometry-unavailable");
@@ -760,12 +760,12 @@ pub fn open() {
     };
     let ox = (pw.saturating_sub(ow)) / 2;
     let oy = (ph.saturating_sub(oh)) / 3; // upper-third center: reads as a dialog
-    let (sw, sh) = (super::metrics::size(W), super::metrics::size(H));
+    let (sw, sh) = (super::metrics::size(W), super::metrics::size(IH()));
     let surf = surf().as_mut_ptr() as usize;
     let id = wm::create_at_native(
         0,
         surf,
-        sw * sh * 4,
+        sw * super::metrics::size(INST_CAP.load(Ordering::Relaxed)) * 4,
         sw as u32,
         sh as u32,
         (sw * 4) as u32,
@@ -1208,15 +1208,15 @@ fn plan_view_paint(px: &mut [u32], lx: usize) -> bool {
         let b = l.as_bytes();
         let mut off = 0;
         // Wrap long lines at the column budget so nothing the verb prints is clipped off glass.
-        while off < b.len() && y + CELL_H < H - 60 {
+        while off < b.len() && y + CELL_H < IH() - 60 {
             let end = core::cmp::min(off + cols, b.len());
             text(px, lx, y, &b[off..end], theme::text_primary());
             off = end;
             y += CELL_H + 4;
         }
     }
-    text(px, lx, H - 52, b"Enter/Esc back - write it with", theme::text_secondary());
-    text(px, lx, H - 52 + CELL_H + 4, b"`install ssd --write` in the shell", theme::text_secondary());
+    text(px, lx, IH() - 52, b"Enter/Esc back - write it with", theme::text_secondary());
+    text(px, lx, IH() - 52 + CELL_H + 4, b"`install ssd --write` in the shell", theme::text_secondary());
     true
 }
 
@@ -1232,6 +1232,82 @@ pub mod install3;
 /// KERNELFONT2 (B363) M4: the faces loaded or were restyled — repaint the open installer window once.
 pub fn font_repaint() {
     if is_open() {
-        repaint();
+        if !reseat() { repaint(); }
     }
+}
+
+// ── TEXTSCALERESEAT2 (rmbp-ledger B886; BP-video-40) — TAIL-APPENDED: the installer re-seats at a text step ───────────
+// B880's shape (the login card's and the dialog's): the open reserves the leaked surface ONCE for the window's LARGEST
+// height (`cap_h`: `h_at` at the cap metrics, never below the live one) and names that capacity as the row's `surf_len`;
+// the restyle hook (`font_repaint` -> `reseat`) lays out at the new `h_at` and asks `wm::resize_kernel_row` for it; past
+// the capacity the door refuses and the window keeps its height. The height grows once per line of the bottom-anchored
+// footer (`IH() - 100`, four lines); the rows above keep their tops (TEXTSCALE-INSTGUI). install3's screens lay out at `H`.
+
+/// The height the open installer was laid out at (logical px; `seat_open`, `reseat`).
+static INST_H: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(H);
+/// The height the open installer's surface was reserved for (logical px; `cap_h` at open).
+static INST_CAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(H);
+/// Re-seats the door accepted (the `tests textscale` leg reads them).
+static RESEATS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The installer's height at text metrics `m`: `H` grown once per footer line.
+fn h_at(m: theme::TextMetrics) -> usize {
+    (0..4).fold(H, |a, _| m.grow(a))
+}
+
+/// The installer's largest height: `h_at` at the cap the restyle published (else the live panel's `cap_now`), never below
+/// the live `h_at`.
+fn cap_h() -> usize {
+    let m = theme::metrics();
+    let cap = if m.cap_css > 0 { m.cap_css } else { super::text::textscale::cap_now().max(0) as u32 };
+    let top = theme::TextMetrics { line: super::text::textscale::line_at(cap, super::dpi::s2()), cap_css: cap };
+    h_at(m).max(h_at(top))
+}
+
+/// `open`, before the first paint: the live height, the capacity, the surface reserved for it, the band filled.
+fn seat_open() {
+    INST_H.store(h_at(theme::metrics()), Ordering::Relaxed);
+    INST_CAP.store(cap_h(), Ordering::Relaxed);
+    band_clear(IH());
+}
+
+/// Fill the capacity surface from logical row `from` to `INST_CAP` with the window's surface colour.
+fn band_clear(from: usize) {
+    let cap = INST_CAP.load(Ordering::Relaxed);
+    let px = super::metrics::leaked_surf(&SURF_AT, super::metrics::size(W) * super::metrics::size(cap));
+    super::metrics::fill(px, super::metrics::size(W), 0, from, W, cap.saturating_sub(from), theme::surface_window());
+}
+
+/// The restyle hook's re-seat: when a row is up and `h_at` moved within the capacity, lay out and paint at the new height,
+/// then ask wm for it. `true` = re-seated (painted); `false` = nothing to do or refused (the caller repaints).
+fn reseat() -> bool {
+    let id = WIN.load(Ordering::Relaxed);
+    let h = h_at(theme::metrics());
+    let old = INST_H.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE || h == old || h > INST_CAP.load(Ordering::Relaxed) {
+        return false;
+    }
+    INST_H.store(h, Ordering::Relaxed);
+    repaint();
+    if wm::resize_kernel_row(id, super::metrics::size(W), super::metrics::size(h)) == Some(true) {
+        RESEATS.fetch_add(1, Ordering::Relaxed);
+        if h < old {
+            band_clear(h);
+        }
+        return true;
+    }
+    INST_H.store(old, Ordering::Relaxed);
+    false
+}
+
+/// `tests textscale`: (re-seats so far, the row's height, the height the live text size wants), source px; `None` when
+/// no installer row is up.
+#[cfg(feature = "witness")]
+pub fn reseat_probe() -> Option<(u32, usize, usize)> {
+    let id = WIN.load(Ordering::Relaxed);
+    if id == wm::WIN_NONE {
+        return None;
+    }
+    let i = wm::info(id)?;
+    Some((RESEATS.load(Ordering::Relaxed), i.h, super::metrics::size(h_at(theme::metrics()))))
 }

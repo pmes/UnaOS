@@ -1,0 +1,17 @@
+[package]
+name = "timeline_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Stria's timeline core: the non-linear editor's EDL model (tracks, clips, pure edit operations), the CMX 3600 text EDL and the keyframe-aware render schedule — shared by Ring 0 and Ring 3."
+
+# NLE1 (LEDGER SR194): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, the midden_core shape: a shared core under
+# `unaos/libs/`, a member of the ROOT host workspace (Stria's render links it), linkable by the kernel by path with
+# `default-features = false` (NLE6). Its one dependency is demux_core, for the ONE time-base type (`Timebase`).
+[dependencies]
+demux_core = { path = "../demux_core" }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).
+std = []
