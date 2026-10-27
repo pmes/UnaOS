@@ -179,25 +179,42 @@ pub(super) fn after_show(m: &mut Model) {
     }
 }
 
-fn travel(m: &mut Model, to: Option<String>) -> bool {
+/// NAVTRAVEL (B841): focus and status are set BEFORE the navigate (a deferred one leaves `opening <leaf>` showing),
+/// and a raised door is re-worded with the step (a door that is down stays down: q3_key's `<` / `>`).
+fn travel(m: &mut Model, to: Option<String>, t: super::livedir::Travel) -> bool {
     let Some(p) = to else { return false };
-    TRAVEL.store(true, Ordering::Relaxed);
-    m.navigate(&p);
-    TRAVEL.store(false, Ordering::Relaxed);
     m.focus = Pane::List;
     m.status = None;
+    {
+        let _door = super::livedir::Door::reword(t);
+        arrive(m, &p);
+    }
     serial_println!("[quarry3] travel -> {}", p);
     true
 }
 
-fn go_back(m: &mut Model) -> bool {
-    let to = TB.lock().hist.back();
-    travel(m, to)
+/// NAVTRAVEL (B841): a history step's arrival — the ONE place TRAVEL is raised for a navigate, by the synchronous step
+/// and by the deferred install (`livedir::nav_install`) alike, so it is never left set across a drop.
+pub(super) fn arrive(m: &mut Model, path: &str) {
+    TRAVEL.store(true, Ordering::Relaxed);
+    m.navigate(path);
+    TRAVEL.store(false, Ordering::Relaxed);
 }
 
-fn go_forward(m: &mut Model) -> bool {
+pub(super) fn go_back(m: &mut Model) -> bool {
+    let to = TB.lock().hist.back();
+    travel(m, to, super::livedir::Travel::Back)
+}
+
+pub(super) fn go_forward(m: &mut Model) -> bool {
     let to = TB.lock().hist.forward();
-    travel(m, to)
+    travel(m, to, super::livedir::Travel::Forward)
+}
+
+/// NAVTRAVEL (B841): the history's current place and its forward depth (`tests quarryio`'s travel leg).
+pub(super) fn history() -> (String, usize) {
+    let t = TB.lock();
+    (t.hist.cur.clone(), t.hist.fwd.len())
 }
 
 fn set_view(v: View) {

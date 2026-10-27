@@ -563,13 +563,16 @@ pub(super) fn relist_probe(bump: &dyn Fn()) -> RelistProbe {
     RelistProbe { paint_defer, stale_dropped, done }
 }
 
-// ── NAVREAD (rmbp-ledger B834): a navigation's read off MODEL ───────────────────────────────────────────────────
+// ── NAVREAD (rmbp-ledger B834) + NAVTRAVEL (B841): a navigation's and a tree expansion's read off MODEL ─────────────
 //
 // CHARTER: a navigation the router makes (content_press's tree press and list double-click, key_route's Enter and
-// Backspace) to a folder the model's cache does not hold is DEFERRED: recorded under the router's MODEL hold with the
-// path bar saying `opening <leaf>`, read on the service pass with no Quarry lock (QUARRYRELIST's `read_paths`), and
-// installed in one short take through the existing `Model::navigate` over the warm cache. The glass shows the press at
-// once instead of freezing on the old folder for the length of the read. Toolbar travel (q3_press) is owed NAVTRAVEL.
+// Backspace, and NAVTRAVEL: every q3_press door — toolbar back/forward, the path bar, sidebar rows, the icon grid,
+// millercols) to a folder the model's cache does not hold is DEFERRED: recorded under the router's MODEL hold with
+// the path bar saying `opening <leaf>`, read on the service pass with no Quarry lock (QUARRYRELIST's `read_paths`),
+// and installed in one short take through the existing `Model::navigate` over the warm cache — a history step
+// (Back / Forward) through `toolbar::arrive`, so it records a TRAVEL, not a visit. EXPANDREAD rides the SAME intent: a
+// cold `Model::expand` under the Door shows the row open onto an empty level (the state expand gives a row whose
+// read returned nothing) and the install splices it from the same read. One slot, one read, one install take.
 
 impl Model {
     /// The ONE cache insert (`collect_cached`'s miss and the NAVREAD install): an entry read at volume generation `gen`.
@@ -588,31 +591,127 @@ impl Model {
     }
 }
 
-/// One deferred navigation: its sequence number, the folder it goes to and the folder it left.
+/// NAVTRAVEL (B841): the q3_press door a navigation came through — the word its install honours.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Travel {
+    Back,
+    Forward,
+    PathBar,
+    Sidebar,
+    Icons,
+    Columns,
+}
+
+impl Travel {
+    const ALL: [Travel; 6] = [Travel::Back, Travel::Forward, Travel::PathBar, Travel::Sidebar, Travel::Icons, Travel::Columns];
+    pub(super) fn word(self) -> &'static str {
+        match self {
+            Travel::Back => "back",
+            Travel::Forward => "forward",
+            Travel::PathBar => "pathbar",
+            Travel::Sidebar => "sidebar",
+            Travel::Icons => "icons",
+            Travel::Columns => "columns",
+        }
+    }
+    /// A history step: its install records a TRAVEL (`toolbar::arrive`); every other word records a visit, exactly as
+    /// its synchronous path does.
+    pub(super) fn steps(self) -> bool {
+        matches!(self, Travel::Back | Travel::Forward)
+    }
+    fn code(self) -> u8 {
+        DOOR_TRAVEL + self as u8
+    }
+    fn of(code: u8) -> Option<Travel> {
+        code.checked_sub(DOOR_TRAVEL).and_then(|k| Travel::ALL.get(k as usize).copied())
+    }
+}
+
+/// One deferred navigation: the folder it goes to, the folder it left, the door's travel word (`None` = a router
+/// visit) and the row to select on arrival (millercols' press).
+#[derive(Clone)]
+struct Go {
+    path: String,
+    from: String,
+    travel: Option<Travel>,
+    select: Option<String>,
+}
+
+/// THE pending intent (NAVREAD's, given a kind by NAVTRAVEL / EXPANDREAD): at most one navigation (a newer one
+/// replaces it) and the tree rows (by path) shown open and waiting for their read. Every change takes a new `seq`, so
+/// a read planned from an older shape drops `superseded` and the next pass re-reads.
 #[derive(Clone)]
 struct NavIntent {
     seq: u64,
-    path: String,
-    from: String,
+    go: Option<Go>,
+    open: Vec<String>,
 }
 
-/// The pending navigation (a newer one replaces it). A LEAF: taken after MODEL, never holding another lock.
+impl NavIntent {
+    /// Every folder the intent reads, the navigation's first, each once.
+    fn paths(&self) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        if let Some(g) = &self.go {
+            v.push(g.path.clone());
+        }
+        for p in self.open.iter() {
+            if !v.iter().any(|q| q == p) {
+                v.push(p.clone());
+            }
+        }
+        v
+    }
+    /// The folder the wire names for a whole-intent drop or retry.
+    fn label(&self) -> String {
+        self.go.as_ref().map(|g| g.path.clone()).or_else(|| self.open.first().cloned()).unwrap_or_default()
+    }
+}
+
+/// EXPANDREAD: tree rows one intent holds open; past it `Model::expand` reads synchronously, as before (said once per
+/// fallback: `[quarry] expand sync dir=<p> why=open-full`). With the navigation, under `read_paths`' MAX_CACHE.
+const OPEN_MAX: usize = 8;
+
+/// The pending intent. A LEAF: taken after MODEL, never holding another lock.
 static NAV: crate::sync::Mutex<Option<NavIntent>> = crate::sync::Mutex::new(None);
 static NAV_SEQ: AtomicU64 = AtomicU64::new(0);
-/// Up only while a router gesture runs under MODEL ([`Door`]); read only inside `Model::navigate` (MODEL held).
-static DOOR: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The door's word: down, the router's (a visit), or a travel word (`DOOR_TRAVEL + Travel`). Set only while a router
+/// gesture runs under MODEL ([`Door`]); read only inside `nav_defer` / `expand_defer` (MODEL held).
+const DOOR_DOWN: u8 = 0;
+const DOOR_ROUTER: u8 = 1;
+const DOOR_TRAVEL: u8 = 2;
+static DOOR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(DOOR_DOWN);
 
-/// The router's door: while it lives (inside the router's MODEL hold) a cold navigation is deferred.
-pub(super) struct Door;
+fn next_seq() -> u64 {
+    NAV_SEQ.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// The router's door: while it lives (inside the router's MODEL hold) a cold navigation or expansion is deferred.
+/// Dropping it restores the word it found, so a re-worded inner door hands the outer one back unchanged.
+pub(super) struct Door {
+    prev: u8,
+}
 impl Door {
+    /// The router's own door (content_press, key_route): a deferred navigation records a visit.
     pub(super) fn raise() -> Door {
-        DOOR.store(true, Ordering::Release);
-        Door
+        Door { prev: DOOR.swap(DOOR_ROUTER, Ordering::AcqRel) }
+    }
+    /// NAVTRAVEL (B841): a q3_press branch's door, carrying its travel word.
+    pub(super) fn travel(t: Travel) -> Door {
+        Door { prev: DOOR.swap(t.code(), Ordering::AcqRel) }
+    }
+    /// NAVTRAVEL (B841): re-word a RAISED door for this scope (toolbar's Back / Forward). A door that is down stays
+    /// down, so a travel with no door around it (q3_key's `<` / `>`, owed KEYTRAVEL) stays synchronous.
+    pub(super) fn reword(t: Travel) -> Door {
+        let prev = DOOR.load(Ordering::Acquire);
+        if prev != DOOR_DOWN {
+            DOOR.store(t.code(), Ordering::Release);
+        }
+        Door { prev }
     }
 }
 impl Drop for Door {
     fn drop(&mut self) {
-        DOOR.store(false, Ordering::Release);
+        DOOR.store(self.prev, Ordering::Release);
     }
 }
 
@@ -621,30 +720,113 @@ fn opening(path: &str) -> String {
     alloc::format!("opening {}", leaf(path))
 }
 
+/// The model's cache holds `path` at the current generation.
+fn warm(m: &Model, path: &str) -> bool {
+    m.cache_gen == volume_gen() && m.cache.iter().any(|e| e.path == path)
+}
+
 /// `Model::navigate`'s first statement. `false` (navigate synchronously) unless the Door is up AND `path` is cold;
-/// a warm path also cancels any pending intent. A cold path is recorded, the status set, and `true` returned.
+/// a warm path also cancels any pending navigation (pending tree rows stay). A cold path is recorded with the door's
+/// travel word, the status set, and `true` returned.
 pub(super) fn nav_defer(m: &mut Model, path: &str) -> bool {
-    if !DOOR.load(Ordering::Acquire) {
+    let word = DOOR.load(Ordering::Acquire);
+    if word == DOOR_DOWN {
         return false;
     }
-    let warm = m.cache_gen == volume_gen() && m.cache.iter().any(|e| e.path == path);
-    if warm {
-        if let Some(old) = NAV.lock().take() {
-            if m.status.as_deref() == Some(opening(&old.path).as_str()) {
-                m.status = None;
+    if warm(m, path) {
+        let mut nav = NAV.lock();
+        if let Some(n) = nav.as_mut() {
+            if let Some(old) = n.go.take() {
+                if m.status.as_deref() == Some(opening(&old.path).as_str()) {
+                    m.status = None;
+                }
+                n.seq = next_seq();
+            }
+            if n.open.is_empty() {
+                *nav = None;
             }
         }
         return false;
     }
-    let seq = NAV_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let travel = Travel::of(word);
+    let seq = next_seq();
     let from = m.cwd.clone();
-    serial_println!("[quarry] navigate pending dir={} seq={} from={}", path, seq, from);
+    serial_println!(
+        "[quarry] navigate pending dir={} seq={} from={} travel={}",
+        path, seq, from, travel.map_or("-", |t| t.word())
+    );
     m.status = Some(opening(path));
-    *NAV.lock() = Some(NavIntent { seq, path: String::from(path), from });
+    let go = Go { path: String::from(path), from, travel, select: None };
+    let mut nav = NAV.lock();
+    match nav.as_mut() {
+        Some(n) => {
+            n.seq = seq;
+            n.go = Some(go);
+        }
+        None => *nav = Some(NavIntent { seq, go: Some(go), open: Vec::new() }),
+    }
     true
 }
 
-/// What one deferred navigation reads: the intent, and the generation it is read at.
+/// EXPANDREAD (B841): `Model::expand`'s defer, after the row is marked expanded. `false` (read synchronously) unless
+/// the Door is up AND the row's folder is cold AND the intent has room; `true` leaves the row open onto an empty level
+/// until the install splices it.
+pub(super) fn expand_defer(m: &mut Model, i: usize) -> bool {
+    if DOOR.load(Ordering::Acquire) == DOOR_DOWN {
+        return false;
+    }
+    let Some(path) = m.tree.get(i).map(|r| r.path.clone()) else { return false };
+    if warm(m, &path) {
+        return false;
+    }
+    let seq: Option<u64> = {
+        let mut nav = NAV.lock();
+        match nav.as_mut() {
+            Some(n) if n.open.iter().any(|p| *p == path) => return true,
+            Some(n) if n.open.len() >= OPEN_MAX => None,
+            Some(n) => {
+                let s = next_seq();
+                n.seq = s;
+                n.open.push(path.clone());
+                Some(s)
+            }
+            None => {
+                let s = next_seq();
+                *nav = Some(NavIntent { seq: s, go: None, open: alloc::vec![path.clone()] });
+                Some(s)
+            }
+        }
+    };
+    match seq {
+        Some(s) => {
+            serial_println!("[quarry] expand pending dir={} seq={}", path, s);
+            true
+        }
+        None => {
+            serial_println!("[quarry] expand sync dir={} why=open-full", path);
+            false
+        }
+    }
+}
+
+/// NAVTRAVEL (B841): millercols' press selects `name` in `path` on arrival when its navigation was deferred (a
+/// synchronous one already selected it; nothing pending for `path` is a no-op).
+pub(super) fn nav_select(path: &str, name: &str) {
+    let mut nav = NAV.lock();
+    let Some(n) = nav.as_mut() else { return };
+    let hit = match n.go.as_mut() {
+        Some(g) if g.path == path => {
+            g.select = Some(String::from(name));
+            true
+        }
+        _ => false,
+    };
+    if hit {
+        n.seq = next_seq();
+    }
+}
+
+/// What one deferred intent reads: the intent, and the generation it is read at.
 struct NavPlan {
     intent: NavIntent,
     at_gen: u64,
@@ -667,10 +849,33 @@ pub(super) struct Navigated {
     pub locked_reads: usize,
 }
 
+/// EXPANDREAD (B841): one tree row the install opened (the wire's and the fixture's).
+pub(super) struct Opened {
+    pub dir: String,
+    pub kids: usize,
+    pub held_us: u64,
+    pub locked_reads: usize,
+}
+
+/// The navigation's share of an install.
+enum NavPart {
+    None,
+    Done(Navigated),
+    /// The window left the folder the navigation started from (folder).
+    Moved(String),
+}
+
+/// One install take's account: the navigation, the rows opened, the rows no longer waiting (collapsed or gone).
+struct Installed {
+    nav: NavPart,
+    opened: Vec<Opened>,
+    gone: Vec<String>,
+}
+
 /// The install's outcome.
 enum NavInstall {
-    Done(Navigated),
-    /// (folder, why: superseded | moved | closed)
+    Done(Installed),
+    /// (folder, why: superseded | closed)
     Dropped(String, &'static str),
     /// (folder, planned generation, generation now): the intent stays, the next pass re-reads.
     Retry(String, u64, u64),
@@ -692,74 +897,127 @@ fn nav_plan() -> Option<NavPlan> {
     Some(NavPlan { intent, at_gen: volume_gen() })
 }
 
-/// The read — no Quarry lock is taken here.
+/// The read — every folder of the intent in ONE `read_paths` call; no Quarry lock is taken here.
 fn nav_read(plan: NavPlan) -> NavRead {
-    let (ents, read_ms, read_cycles) = read_paths(core::slice::from_ref(&plan.intent.path), None);
+    let paths = plan.intent.paths();
+    let (ents, read_ms, read_cycles) = read_paths(&paths, None);
     NavRead { plan, ents, read_ms, read_cycles }
 }
 
-/// ONE MODEL take, timed: the read installs only for the intent, generation and folder it was planned in.
+/// ONE MODEL take, timed: the read installs only for the intent and generation it was planned in; the tree rows
+/// still waiting are spliced through `Model::expand`, then the navigation (if its folder was not left) through
+/// `Model::navigate` — or `toolbar::arrive` for a history step — over the warm cache.
 fn nav_install(r: NavRead) -> NavInstall {
     let mut g = MODEL.lock();
     let c0 = crate::arch::now_cycles();
-    let path = r.plan.intent.path.clone();
+    let label = r.plan.intent.label();
     let Some(m) = g.as_mut() else {
         *NAV.lock() = None;
-        return NavInstall::Dropped(path, "closed");
+        return NavInstall::Dropped(label, "closed");
     };
     {
         let mut nav = NAV.lock();
         if nav.as_ref().map(|n| n.seq) != Some(r.plan.intent.seq) {
-            return NavInstall::Dropped(path, "superseded");
+            return NavInstall::Dropped(label, "superseded");
         }
         let now_gen = volume_gen();
         if now_gen != r.plan.at_gen {
-            return NavInstall::Retry(path, r.plan.at_gen, now_gen);
+            return NavInstall::Retry(label, r.plan.at_gen, now_gen);
         }
         *nav = None;
-    }
-    let status = opening(&path);
-    if m.cwd != r.plan.intent.from {
-        if m.status.as_deref() == Some(status.as_str()) {
-            m.status = None;
-        }
-        return NavInstall::Dropped(path, "moved");
     }
     m.reads += r.ents.len();
     m.read_cycles = m.read_cycles.saturating_add(r.read_cycles);
     for e in r.ents {
         m.cache_put(r.plan.at_gen, e);
     }
-    let reads0 = m.reads;
-    m.navigate(&path); // the Door is down here: a warm, synchronous show
-    if m.status.as_deref() == Some(status.as_str()) {
-        m.status = None;
+    let mut opened: Vec<Opened> = Vec::new();
+    let mut gone: Vec<String> = Vec::new();
+    for p in r.plan.intent.open.iter() {
+        match m.tree.iter().position(|row| row.path == *p) {
+            Some(i) if m.tree[i].expanded && m.subtree_len(i) == 0 => {
+                let r0 = m.reads;
+                m.tree[i].expanded = false;
+                m.expand(i); // the Door is down here: a warm, synchronous splice
+                let kids = m.subtree_len(i);
+                opened.push(Opened { dir: p.clone(), kids, held_us: 0, locked_reads: m.reads.saturating_sub(r0) });
+            }
+            _ => gone.push(p.clone()),
+        }
     }
+    let nav = match r.plan.intent.go {
+        None => NavPart::None,
+        Some(go) => {
+            let status = opening(&go.path);
+            if m.cwd != go.from {
+                if m.status.as_deref() == Some(status.as_str()) {
+                    m.status = None;
+                }
+                NavPart::Moved(go.path)
+            } else {
+                let reads0 = m.reads;
+                if go.travel.is_some_and(|t| t.steps()) {
+                    toolbar::arrive(m, &go.path); // a history step records a TRAVEL, as its synchronous path does
+                } else {
+                    m.navigate(&go.path); // the Door is down here: a warm, synchronous show
+                }
+                if let Some(s) = go.select.as_deref() {
+                    if let Some(k) = m.list.iter().position(|e| e.name == s) {
+                        m.list_sel = k;
+                    }
+                }
+                if m.status.as_deref() == Some(status.as_str()) {
+                    m.status = None;
+                }
+                let locked_reads = m.reads.saturating_sub(reads0);
+                NavPart::Done(Navigated { dir: m.cwd.clone(), rows: m.list.len(), read_ms: r.read_ms, held_us: 0, locked_reads })
+            }
+        }
+    };
     m.settle();
-    let locked_reads = m.reads.saturating_sub(reads0);
-    let (dir, rows) = (m.cwd.clone(), m.list.len());
     let held_us = crate::video::strip::cycles_to_us(crate::arch::now_cycles().saturating_sub(c0));
     drop(g);
-    NavInstall::Done(Navigated { dir, rows, read_ms: r.read_ms, held_us, locked_reads })
+    let nav = match nav {
+        NavPart::Done(mut d) => {
+            d.held_us = held_us;
+            NavPart::Done(d)
+        }
+        other => other,
+    };
+    for o in opened.iter_mut() {
+        o.held_us = held_us;
+    }
+    NavInstall::Done(Installed { nav, opened, gone })
 }
 
-/// The pass's tail, after the MODEL drop: the wire, the account, the repaint.
+/// The pass's tail, after the MODEL drop: the wire, the accounts, the repaint.
 fn nav_done(r: NavInstall) -> NavStep {
     match r {
         NavInstall::Done(d) => {
-            serial_println!(
-                "[quarry] navigate dir={} rows={} read_ms={} held_us={} on={} locked_reads={}",
-                d.dir, d.rows, d.read_ms, d.held_us, crate::arch::sched::current_name().unwrap_or("?"), d.locked_reads
-            );
-            *NAV_LAST.lock() = Some(d);
+            let on = crate::arch::sched::current_name().unwrap_or("?");
+            for o in d.opened {
+                serial_println!("[quarry] expand dir={} kids={} held_us={} locked_reads={}", o.dir, o.kids, o.held_us, o.locked_reads);
+                *OPEN_LAST.lock() = Some(o);
+            }
+            for p in d.gone.iter() {
+                serial_println!("[quarry] expand dropped dir={} why=gone", p);
+            }
+            match d.nav {
+                NavPart::Done(n) => {
+                    serial_println!(
+                        "[quarry] navigate dir={} rows={} read_ms={} held_us={} on={} locked_reads={}",
+                        n.dir, n.rows, n.read_ms, n.held_us, on, n.locked_reads
+                    );
+                    *NAV_LAST.lock() = Some(n);
+                }
+                NavPart::Moved(dir) => serial_println!("[quarry] navigate dropped dir={} why=moved", dir),
+                NavPart::None => {}
+            }
             repaint();
             NavStep::Done
         }
         NavInstall::Dropped(dir, why) => {
             serial_println!("[quarry] navigate dropped dir={} why={}", dir, why);
-            if why == "moved" {
-                repaint();
-            }
             NavStep::Dropped
         }
         NavInstall::Retry(dir, a, b) => {
@@ -780,6 +1038,8 @@ pub(super) fn nav_now() -> NavStep {
 
 /// The last installed navigation's account (the fixture reads it; a leaf lock).
 static NAV_LAST: crate::sync::Mutex<Option<Navigated>> = crate::sync::Mutex::new(None);
+/// EXPANDREAD (B841): the last tree row an install opened (the fixture reads it; a leaf lock).
+static OPEN_LAST: crate::sync::Mutex<Option<Opened>> = crate::sync::Mutex::new(None);
 
 /// `tests quarryio`'s navigation leg (columns.rs `nav_leg`).
 pub(super) struct NavProbe {
@@ -841,4 +1101,88 @@ pub(super) fn nav_probe(to: &str) -> NavProbe {
     let done = NAV_LAST.lock().take();
     let cwd_ok = MODEL.lock().as_ref().map_or(false, |m| m.cwd == to);
     NavProbe { deferred, paint_defer, stale_dropped, cwd_ok, done }
+}
+
+/// NAVTRAVEL (B841): `tests quarryio`'s travel leg (columns.rs `nav_leg`).
+pub(super) struct TravelProbe {
+    pub deferred: bool,
+    pub cwd_ok: bool,
+    /// The history's forward depth after the step (a TRAVEL keeps the place left on Forward: 1).
+    pub history: usize,
+    pub done: Option<Navigated>,
+}
+
+/// After `nav_probe` landed: under ONE MODEL take, the cache dropped and the router's Door up, the toolbar's Back
+/// (`toolbar::go_back`, which re-words the door `back`) defers (cwd unchanged, status `opening <leaf>`, the pending go
+/// worded back); the pass installs it through `toolbar::arrive`, and the window shows `back_to` with the history's
+/// current place `back_to` and the folder left on Forward.
+pub(super) fn travel_probe(back_to: &str) -> TravelProbe {
+    let deferred = {
+        let mut g = MODEL.lock();
+        match g.as_mut() {
+            Some(m) => {
+                m.invalidate();
+                let was = m.cwd.clone();
+                *NAV_LAST.lock() = None;
+                let _door = Door::raise();
+                let stepped = toolbar::go_back(m);
+                let pending = NAV
+                    .lock()
+                    .as_ref()
+                    .and_then(|n| n.go.as_ref().map(|gw| gw.path == back_to && gw.travel == Some(Travel::Back)))
+                    .unwrap_or(false);
+                stepped && pending && m.cwd == was && m.status.as_deref() == Some(opening(back_to).as_str())
+            }
+            None => false,
+        }
+    };
+    let t0 = crate::arch::ms();
+    while NAV_LAST.lock().is_none() && crate::arch::ms().saturating_sub(t0) < 2_000 {
+        if nav_now() == NavStep::Idle {
+            crate::arch::sched::yield_now();
+        }
+    }
+    let done = NAV_LAST.lock().take();
+    let (cur, history) = toolbar::history();
+    let cwd_ok = MODEL.lock().as_ref().map_or(false, |m| m.cwd == back_to) && cur == back_to;
+    TravelProbe { deferred, cwd_ok, history, done }
+}
+
+/// EXPANDREAD (B841): `tests quarryio`'s expand leg (columns.rs `nav_leg`).
+pub(super) struct ExpandProbe {
+    pub deferred: bool,
+    pub done: Option<Opened>,
+}
+
+/// Under ONE MODEL take, the cache dropped and the Door up, the last closed tree row's `expand` defers (the row open
+/// onto an empty level, its path pending); the pass splices it from the off-lock read (`locked_reads=0`).
+pub(super) fn expand_probe() -> ExpandProbe {
+    let deferred = {
+        let mut g = MODEL.lock();
+        match g.as_mut() {
+            Some(m) => match m.tree.iter().rposition(|r| !r.expanded && r.depth + 1 <= MAX_DEPTH) {
+                Some(i) => {
+                    m.invalidate();
+                    *OPEN_LAST.lock() = None;
+                    let path = m.tree[i].path.clone();
+                    {
+                        let _door = Door::raise();
+                        m.expand(i);
+                    }
+                    m.tree[i].expanded
+                        && m.subtree_len(i) == 0
+                        && NAV.lock().as_ref().map_or(false, |n| n.open.iter().any(|p| *p == path))
+                }
+                None => false,
+            },
+            None => false,
+        }
+    };
+    let t0 = crate::arch::ms();
+    while OPEN_LAST.lock().is_none() && crate::arch::ms().saturating_sub(t0) < 2_000 {
+        if nav_now() == NavStep::Idle {
+            crate::arch::sched::yield_now();
+        }
+    }
+    ExpandProbe { deferred, done: OPEN_LAST.lock().take() }
 }

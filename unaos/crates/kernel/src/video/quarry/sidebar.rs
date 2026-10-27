@@ -219,9 +219,9 @@ pub(super) fn press(m: &mut Model, sx: usize, sy: usize) -> Option<Act> {
         m.status = Some(alloc::format!("{} is not on this volume ({})", e.label, e.path));
         return Some(Act::None);
     }
+    m.status = None; // NAVTRAVEL (B841): cleared BEFORE the navigate, so a deferred one leaves `opening <leaf>` showing
     m.navigate(&e.path);
     m.focus = Pane::List;
-    m.status = None;
     serial_println!("[quarry3] sidebar press row={} -> {}", e.label, e.path);
     Some(Act::None)
 }
