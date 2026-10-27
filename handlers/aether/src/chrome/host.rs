@@ -384,9 +384,57 @@ fn page_archive_for(path: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
     Some(gneiss_pal::mhtml::write(&page.root_url, &page.html, &page.parts))
 }
 
+// ---- SAVERECENT (SR391): the last Save As folder and the recent paths, Principia's two `aether` keys ----------------
+
+/// SAVERECENT (SR391): Principia's key (namespace [`super::sidetabs::PREF_NS`], `aether`) for the folder the last Save As
+/// chose; the shell seeds the next save panel with it (`SavePanel.folder`).
+pub const SAVE_FOLDER_KEY: &str = "save.folder";
+/// SAVERECENT (SR391): Principia's key for the recent paths, newest first, one per line (a TOML multi-line string).
+pub const RECENT_KEY: &str = "recent";
+/// SAVERECENT (SR391): how many recent paths are kept.
+pub const RECENT_MAX: usize = 10;
+
+/// SAVERECENT (SR391): the stored recent paths, newest first (blank lines dropped; empty when unset).
+pub fn recent_paths(stored: Option<&str>) -> Vec<String> {
+    stored.map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect()).unwrap_or_default()
+}
+
+/// SAVERECENT (SR391): fold a saved `path` into the two rows: its folder (`None` when it has none) and the recent list
+/// with `path` first, an equal older entry dropped, at most [`RECENT_MAX`], one per line. Pure.
+pub fn remember_path(path: &Path, stored_recent: Option<&str>) -> (Option<String>, String) {
+    let p = path.to_string_lossy().into_owned();
+    let folder = path.parent().map(|d| d.to_string_lossy().into_owned()).filter(|d| !d.is_empty());
+    let mut recent = vec![p.clone()];
+    recent.extend(recent_paths(stored_recent).into_iter().filter(|r| *r != p));
+    recent.truncate(RECENT_MAX);
+    (folder, recent.join("\n"))
+}
+
+/// SAVERECENT (SR391): record a written Save As at `path` through the prefs fulfiller (`get` / `set` over namespace and
+/// key; the shell passes quartzite's `chrome_rows::stored_str` / `store_str`, Principia's store): the folder key, then
+/// the recent list. A path with a line break is not recorded (the list is one path per line).
+pub fn remember_saved(path: &Path, get: impl Fn(&str, &str) -> Option<String>, mut set: impl FnMut(&str, &str, String)) {
+    if path.to_string_lossy().contains('\n') {
+        return;
+    }
+    let ns = super::sidetabs::PREF_NS;
+    let (folder, recent) = remember_path(path, get(ns, RECENT_KEY).as_deref());
+    if let Some(f) = folder {
+        set(ns, SAVE_FOLDER_KEY, f);
+    }
+    set(ns, RECENT_KEY, recent);
+}
+
+/// SAVERECENT (SR391): the save panel's initial folder: Principia's `aether.save.folder` when it is still a directory,
+/// else `None` (the panel's own).
+pub fn save_folder(get: impl Fn(&str, &str) -> Option<String>) -> Option<String> {
+    get(super::sidetabs::PREF_NS, SAVE_FOLDER_KEY).filter(|f| !f.is_empty() && Path::new(f).is_dir())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{save_bytes_at, save_bytes_in};
+    use std::path::Path;
 
     /// PDF4FORMSAVE (SR354): the one writer: the path answered, the `(n)` suffix on a collision (a finished file or a
     /// landing `.part`), a hostile name kept inside the folder, no `.part` left behind.
@@ -425,6 +473,55 @@ mod tests {
         assert_eq!(std::fs::read(&to).unwrap(), b"new", "replaced at the chosen path");
         assert!(!dir.join("chosen (1).pdf").exists() && !dir.join("chosen.pdf.part").exists());
         assert!(save_bytes_at(&dir.join("gone").join("x.pdf"), b"x").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// SAVERECENT (SR391): a Save As writes the folder key and puts the path first in the recent list, through a fake
+    /// prefs fulfiller (the shell's is Principia's store).
+    #[test]
+    fn saverecent_writes_folder_and_recent() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        let store: RefCell<HashMap<(String, String), String>> = RefCell::new(HashMap::new());
+        let get = |ns: &str, k: &str| store.borrow().get(&(ns.to_string(), k.to_string())).cloned();
+        let set = |ns: &str, k: &str, v: String| {
+            store.borrow_mut().insert((ns.to_string(), k.to_string()), v);
+        };
+        super::remember_saved(Path::new("/home/p/Docs/a.pdf"), get, set);
+        assert_eq!(get("aether", super::SAVE_FOLDER_KEY).as_deref(), Some("/home/p/Docs"));
+        assert_eq!(get("aether", super::RECENT_KEY).as_deref(), Some("/home/p/Docs/a.pdf"));
+        super::remember_saved(Path::new("/tmp/b.pdf"), get, set);
+        assert_eq!(get("aether", super::SAVE_FOLDER_KEY).as_deref(), Some("/tmp"));
+        assert_eq!(get("aether", super::RECENT_KEY).as_deref(), Some("/tmp/b.pdf\n/home/p/Docs/a.pdf"), "newest first");
+        super::remember_saved(Path::new("/home/p/Docs/a.pdf"), get, set);
+        assert_eq!(super::recent_paths(get("aether", super::RECENT_KEY).as_deref()), ["/home/p/Docs/a.pdf", "/tmp/b.pdf"], "deduped, moved to the front");
+        super::remember_saved(Path::new("/tmp/bad\nname.pdf"), get, set);
+        assert_eq!(get("aether", super::SAVE_FOLDER_KEY).as_deref(), Some("/home/p/Docs"), "a path with a line break is not recorded");
+    }
+
+    /// SAVERECENT (SR391): the recent list keeps at most ten paths, newest first.
+    #[test]
+    fn saverecent_caps_at_ten() {
+        let mut stored: Option<String> = None;
+        for i in 0..12 {
+            let (_, r) = super::remember_path(&Path::new("/d").join(format!("{i}.pdf")), stored.as_deref());
+            stored = Some(r);
+        }
+        let r = super::recent_paths(stored.as_deref());
+        assert_eq!(r.len(), super::RECENT_MAX);
+        assert_eq!((r[0].as_str(), r[9].as_str()), ("/d/11.pdf", "/d/2.pdf"));
+        assert!(super::recent_paths(None).is_empty() && super::recent_paths(Some("")).is_empty());
+    }
+
+    /// SAVERECENT (SR391): the panel's initial folder is the stored folder only while it is a directory.
+    #[test]
+    fn saverecent_folder_only_if_directory() {
+        let dir = std::env::temp_dir().join(format!("aether-saverecent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        assert_eq!(super::save_folder(|_, k| (k == super::SAVE_FOLDER_KEY).then(|| d.clone())), Some(d.clone()));
+        assert_eq!(super::save_folder(|_, _| Some(dir.join("gone").to_string_lossy().into_owned())), None, "a stale folder is the panel's own");
+        assert_eq!(super::save_folder(|_, _| None), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

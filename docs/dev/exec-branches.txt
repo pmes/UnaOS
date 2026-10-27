@@ -1003,7 +1003,7 @@ refs/heads/exec-rmbp-mt7925s4   3465258aa FOLDED-BY-HAND (this commit) 2026-10-2
 refs/heads/exec-rmbp-zenbooktouchpadreports   6434f6cd4 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-dmaallocone   5dbd44257 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-hidbootleds   8ba82e813 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-saverecent   d7ad4440e cut 2026-10-27 (wave36 batch 9)
+refs/heads/exec-rmbp-saverecent   8e8712129 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pagesave   2234b50e6 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbooklanelist   232175f52 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbookecbattery   438be9774 FOLDED-BY-HAND (this commit) 2026-10-27

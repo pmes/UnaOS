@@ -1779,8 +1779,14 @@ kat!(
 );
 kat!(
     kat_save_panel,
-    SMessage::SavePanel { url: "viewport".to_string(), name: "form.pdf".to_string() },
+    SMessage::SavePanel { url: "viewport".to_string(), name: "form.pdf".to_string(), folder: None },
     r#"{"SavePanel":{"url":"viewport","name":"form.pdf"}}"#
+);
+// SAVERECENT (SR391): the panel opens in the folder the last Save As chose (Principia's `aether.save.folder`).
+kat!(
+    kat_save_panel_folder,
+    SMessage::SavePanel { url: "viewport".to_string(), name: "form.pdf".to_string(), folder: Some("/home/p/Documents".to_string()) },
+    r#"{"SavePanel":{"url":"viewport","name":"form.pdf","folder":"/home/p/Documents"}}"#
 );
 kat!(
     kat_save_panel_chose,

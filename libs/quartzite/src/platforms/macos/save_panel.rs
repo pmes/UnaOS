@@ -14,9 +14,10 @@ use objc2_foundation::NSString;
 /// `NSModalResponseOK`.
 const MODAL_OK: isize = 1;
 
-/// Show the save panel seeded with `name` (app-modal) and answer `SavePanelChose { url, path }`: the chosen file's
-/// path, or `None` when the person cancelled (or no panel could be made). Main thread only.
-pub fn run(url: String, name: &str, syn: &bandy::Synapse) {
+/// Show the save panel seeded with `name` (app-modal; opening in `folder` when given: SAVERECENT, SR391) and answer
+/// `SavePanelChose { url, path }`: the chosen file's path, or `None` when the person cancelled (or no panel could be
+/// made). Main thread only.
+pub fn run(url: String, name: &str, folder: Option<&str>, syn: &bandy::Synapse) {
     let path = unsafe {
         let panel: *mut AnyObject = msg_send![class!(NSSavePanel), savePanel];
         if panel.is_null() {
@@ -25,6 +26,14 @@ pub fn run(url: String, name: &str, syn: &bandy::Synapse) {
             let seed = NSString::from_str(name);
             let _: () = msg_send![panel, setNameFieldStringValue: &*seed];
             let _: () = msg_send![panel, setCanCreateDirectories: Bool::YES];
+            // SAVERECENT (SR391): the initial directory.
+            if let Some(f) = folder {
+                let dir = NSString::from_str(f);
+                let u: *mut AnyObject = msg_send![class!(NSURL), fileURLWithPath: &*dir, isDirectory: Bool::YES];
+                if !u.is_null() {
+                    let _: () = msg_send![panel, setDirectoryURL: u];
+                }
+            }
             let response: isize = msg_send![panel, runModal];
             if response != MODAL_OK {
                 None

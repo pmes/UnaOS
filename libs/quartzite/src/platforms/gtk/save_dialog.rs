@@ -9,11 +9,13 @@
 use bandy::{SMessage, Synapse};
 use gtk4::prelude::*;
 
-/// Show the save dialog over `widget`'s window, seeded with `name`, and answer `SavePanelChose { url, path }`: the
-/// chosen file's path, or `None` when the dialog was dismissed (or failed). Main context only.
-pub fn run(widget: &impl IsA<gtk4::Widget>, url: String, name: &str, syn: Synapse) {
+/// Show the save dialog over `widget`'s window, seeded with `name` (opening in `folder` when given: SAVERECENT, SR391),
+/// and answer `SavePanelChose { url, path }`: the chosen file's path, or `None` when the dialog was dismissed (or
+/// failed). Main context only.
+pub fn run(widget: &impl IsA<gtk4::Widget>, url: String, name: &str, folder: Option<&str>, syn: Synapse) {
     let dialog = gtk4::FileDialog::new();
     dialog.set_initial_name(Some(name));
+    if let Some(f) = folder { dialog.set_initial_folder(Some(&gtk4::gio::File::for_path(f))); } // SAVERECENT (SR391)
     let parent = widget.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
     gtk4::glib::spawn_future_local(async move {
         let path = dialog.save_future(parent.as_ref()).await.ok().and_then(|f| f.path()).map(|p| p.to_string_lossy().into_owned());
