@@ -70,6 +70,9 @@ pub struct Decoder {
     prev_tid0_poc: i32,
     /// (sps_max_num_reorder_pics, SpsMaxLatencyPictures or 0, sps_max_dec_pic_buffering) of the active SPS.
     bump: (u32, u32, u32),
+    /// HEVCREXT (SR334): the consumer shows 4:2:0 at one bit depth only, so 4:2:2 / 4:4:4 and unequal luma / chroma depths
+    /// are refused by name ([`Decoder::set_chroma_420_only`]).
+    chroma_420_only: bool,
 }
 
 impl Default for Decoder {
@@ -78,16 +81,38 @@ impl Default for Decoder {
     }
 }
 
-/// The refusals by name (the crate doc): what an activated SPS / PPS may not use.
+/// The refusals by name (the crate doc): what an activated SPS / PPS may not use. HEVCREXT (SR334): 4:2:2, 4:4:4, 12
+/// bits and unequal luma / chroma depths decode; monochrome, separate colour planes, depths above 12 and each range
+/// extension tool are refused by name.
 fn check_supported(sps: &Sps, pps: &Pps) -> Result<()> {
-    if sps.chroma_format_idc != 1 || sps.separate_colour_plane_flag {
-        return Err(Error::Unsupported("chroma other than 4:2:0"));
+    if sps.separate_colour_plane_flag {
+        return Err(Error::Unsupported("separate colour planes (HEVCREXT)"));
     }
-    if sps.bit_depth_luma > 10 || sps.bit_depth_chroma > 10 {
-        return Err(Error::Unsupported("bit depth above 10 (HEVCREXT)"));
+    if sps.chroma_format_idc == 0 {
+        return Err(Error::Unsupported("monochrome 4:0:0 (HEVCREXT-MONO)"));
     }
-    if sps.bit_depth_luma != sps.bit_depth_chroma {
-        return Err(Error::Unsupported("luma and chroma bit depths differ (HEVCREXT)"));
+    if sps.bit_depth_luma > 12 || sps.bit_depth_chroma > 12 {
+        return Err(Error::Unsupported("bit depth above 12 (HEVCREXT-TOOLS)"));
+    }
+    let (s, p) = (&sps.range_ext, &pps.range_ext);
+    let tools = [
+        (s.transform_skip_rotation_enabled_flag, "range extension tool transform_skip_rotation_enabled_flag (HEVCREXT-TOOLS)"),
+        (s.transform_skip_context_enabled_flag, "range extension tool transform_skip_context_enabled_flag (HEVCREXT-TOOLS)"),
+        (s.implicit_rdpcm_enabled_flag, "range extension tool implicit_rdpcm_enabled_flag (HEVCREXT-TOOLS)"),
+        (s.explicit_rdpcm_enabled_flag, "range extension tool explicit_rdpcm_enabled_flag (HEVCREXT-TOOLS)"),
+        (s.extended_precision_processing_flag, "range extension tool extended_precision_processing_flag (HEVCREXT-TOOLS)"),
+        (s.intra_smoothing_disabled_flag, "range extension tool intra_smoothing_disabled_flag (HEVCREXT-TOOLS)"),
+        (s.high_precision_offsets_enabled_flag, "range extension tool high_precision_offsets_enabled_flag (HEVCREXT-TOOLS)"),
+        (s.persistent_rice_adaptation_enabled_flag, "range extension tool persistent_rice_adaptation_enabled_flag (HEVCREXT-TOOLS)"),
+        (s.cabac_bypass_alignment_enabled_flag, "range extension tool cabac_bypass_alignment_enabled_flag (HEVCREXT-TOOLS)"),
+        (p.log2_max_transform_skip_block_size_minus2 != 0, "range extension tool log2_max_transform_skip_block_size_minus2 (HEVCREXT-TOOLS)"),
+        (p.cross_component_prediction_enabled_flag, "range extension tool cross_component_prediction_enabled_flag (HEVCREXT-TOOLS)"),
+        (p.chroma_qp_offset_list_enabled_flag, "range extension tool chroma_qp_offset_list_enabled_flag (HEVCREXT-TOOLS)"),
+        (p.log2_sao_offset_scale_luma != 0, "range extension tool log2_sao_offset_scale_luma (HEVCREXT-TOOLS)"),
+        (p.log2_sao_offset_scale_chroma != 0, "range extension tool log2_sao_offset_scale_chroma (HEVCREXT-TOOLS)"),
+    ];
+    if let Some(&(_, name)) = tools.iter().find(|t| t.0) {
+        return Err(Error::Unsupported(name));
     }
     if sps.range_ext.any() || pps.range_ext.any() {
         return Err(Error::Unsupported("range extension tools"));
@@ -116,7 +141,16 @@ impl Decoder {
             skip_rasl: false,
             prev_tid0_poc: 0,
             bump: (0, 0, 1),
+            chroma_420_only: false,
         }
+    }
+
+    /// HEVCREXT (SR334): a consumer that can only display 4:2:0 at one bit depth (gneiss_pal's `to_frame` / `Pixels::I420Hi`
+    /// carry one `bit_depth`, until COLOURONE-422) asks for 4:2:2 / 4:4:4 streams and unequal luma / chroma depths to be
+    /// refused by name at SPS activation, so its player keeps the labelled stand-in instead of showing wrong colours.
+    /// Kept across [`Decoder::reset`].
+    pub fn set_chroma_420_only(&mut self, on: bool) {
+        self.chroma_420_only = on;
     }
 
     /// Forget every picture (after a seek); parameter sets and the hvcC configuration stay.
@@ -303,6 +337,12 @@ impl Decoder {
                 return Err(Error::Unsupported("constrained intra prediction in inter slices (HEVCINTER-CIP)"));
             }
             check_supported(&sps, &pps)?;
+            if self.chroma_420_only && sps.chroma_format_idc != 1 {
+                return Err(Error::Unsupported("chroma 4:2:2 / 4:4:4 not displayable yet (COLOURONE-422)"));
+            }
+            if self.chroma_420_only && sps.bit_depth_luma != sps.bit_depth_chroma {
+                return Err(Error::Unsupported("luma and chroma bit depths differ (COLOURONE-422)"));
+            }
             self.start_picture(nal, &sh, sps, pps, poc)?;
             return self.decode_segment(sh, rbsp);
         }
@@ -367,16 +407,20 @@ impl Decoder {
 
     fn start_picture(&mut self, nal: &NalHeader, sh: &SliceHeader, sps: Sps, pps: Pps, poc: i32) -> Result<()> {
         let geo = Geometry::new(&sps, &pps)?;
-        let mut pic = Picture::new(sps.width as usize, sps.height as usize, &geo);
+        let chroma = sps.chroma_format().ok_or(Error::Unsupported("monochrome 4:0:0 (HEVCREXT-MONO)"))?;
+        let mut pic = Picture::with_chroma(sps.width as usize, sps.height as usize, &geo, chroma);
         pic.poc = poc;
         pic.tag = self.tag;
         pic.full_range = sps.vui.as_ref().is_some_and(|v| v.video_full_range_flag);
         pic.bit_depth = sps.bit_depth_luma;
+        pic.bit_depth_c = sps.bit_depth_chroma;
         pic.output = sh.pic_output_flag && !(nal.is_rasl() && self.skip_rasl);
+        // 7.4.3.2.1: the offsets are in chroma samples (SubWidthC, SubHeightC).
         let [l, r, t, b] = sps.conf_win;
-        let (x0, y0) = (2 * l as usize, 2 * t as usize);
-        let cw = 2 * (l as usize + r as usize);
-        let chh = 2 * (t as usize + b as usize);
+        let (sub_w, sub_h) = chroma.sub();
+        let (x0, y0) = (sub_w * l as usize, sub_h * t as usize);
+        let cw = sub_w * (l as usize + r as usize);
+        let chh = sub_h * (t as usize + b as usize);
         if cw >= pic.width || chh >= pic.height {
             return Err(Error::Invalid("conformance window empty"));
         }
@@ -450,7 +494,7 @@ impl Decoder {
         sao_picture(&mut cur.pic, &cur.geo, &cur.sps, &cur.pps);
         // HEVCCONF (SR321): D.3.19 over the filtered, uncropped sample arrays.
         if let Some(h) = &cur.hash {
-            self.hashes.push((cur.pic.poc, sei::check(&cur.pic.planes, cur.pic.bit_depth, h)));
+            self.hashes.push((cur.pic.poc, sei::check(&cur.pic.planes, cur.pic.bit_depth, cur.pic.bit_depth_c, h)));
         }
         // C.5.2.3: every picture is stored (a reference even when not output), then bumped as the DPB requires.
         let (reorder, latency, _) = self.bump;

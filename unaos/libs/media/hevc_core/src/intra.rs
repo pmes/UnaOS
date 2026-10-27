@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! Intra prediction: the luma mode (8.4.2: the three most probable modes), the chroma mode (8.4.3, Table 8-2), and the
+//! Intra prediction: the luma mode (8.4.2: the three most probable modes), the chroma mode (8.4.3, Tables 8-2 / 8-3), and the
 //! sample prediction of 8.4.4.2: reference sample availability and substitution (8.4.4.2.2), filtering with strong
 //! intra smoothing (8.4.4.2.3), INTRA_PLANAR (8.4.4.2.5), INTRA_DC (8.4.4.2.6 of the 2013 numbering: the DC with its
 //! luma edge filter) and INTRA_ANGULAR 2..34 (8.4.4.2.6) with the mode 10 / 26 boundary filters.
@@ -10,8 +10,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::picture::Picture;
+use h264_core::ChromaFormat;
 use crate::ps::Geometry;
-use crate::tables::{INTRA_HOR_VER_DIST_THRES, INTRA_PRED_ANGLE, INV_ANGLE};
+use crate::tables::{CHROMA_422_MODE, INTRA_HOR_VER_DIST_THRES, INTRA_PRED_ANGLE, INV_ANGLE};
 
 pub const PLANAR: u32 = 0;
 pub const DC: u32 = 1;
@@ -56,12 +57,18 @@ pub fn chroma_mode(intra_chroma_pred_mode: u32, luma: u32) -> u32 {
     if m == luma { 34 } else { m }
 }
 
+/// HEVCREXT (SR334) 8.4.3, Table 8-3 (ChromaArrayType 2): the 4:2:2 IntraPredModeC from the Table 8-2 mode X.
+pub fn chroma_mode_422(mode: u32) -> u32 {
+    CHROMA_422_MODE[mode as usize] as u32
+}
+
 /// Predict the nTbS x nTbS block (nTbS = 1 << log2) of component `c` whose top-left sample is (x0, y0) in that
 /// component's plane, writing the prediction into the plane (8.4.4.2).
 pub fn predict(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: usize, log2: u32, mode: u32, strong_smoothing: bool, bit_depth: u32) {
     let n = 1usize << log2;
-    let scale = if c == 0 { 1 } else { 2 };
-    let (xl, yl) = ((x0 * scale) as i32, (y0 * scale) as i32);
+    // HEVCREXT (SR334): the component's (SubWidthC, SubHeightC) maps its samples to luma locations (6.4.1).
+    let (sw, sh) = if c == 0 { (1, 1) } else { pic.chroma.sub() };
+    let (xl, yl) = ((x0 * sw) as i32, (y0 * sh) as i32);
     // refs[0..2n] = p[-1][2n-1 .. 0], refs[2n] = p[-1][-1], refs[2n+1 ..] = p[0 .. 2n-1][-1]: the order of 8.4.4.2.2.
     let total = 4 * n + 1;
     let mut refs = vec![0i32; total];
@@ -80,7 +87,7 @@ pub fn predict(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: usize
         let plane = &pic.planes[c];
         for i in 0..total {
             let (xs, ys) = pos(i);
-            if pic.available(geo, xl, yl, xs * scale as i32, ys * scale as i32) {
+            if pic.available(geo, xl, yl, xs * sw as i32, ys * sh as i32) {
                 avail[i] = true;
                 refs[i] = plane.at(xs as usize, ys as usize) as i32;
                 any = true;
@@ -103,8 +110,8 @@ pub fn predict(pic: &mut Picture, geo: &Geometry, c: usize, x0: usize, y0: usize
         }
     }
     let ni = n as i32;
-    // 8.4.4.2.3 filtering (cIdx 0 for 4:2:0).
-    if c == 0 && mode != DC && n != 4 {
+    // 8.4.4.2.3 filtering: cIdx 0, or every component at ChromaArrayType 3 (HEVCREXT SR334).
+    if (c == 0 || pic.chroma == ChromaFormat::Yuv444) && mode != DC && n != 4 {
         let min_dist = (mode as i32 - 26).abs().min((mode as i32 - 10).abs());
         if min_dist > INTRA_HOR_VER_DIST_THRES[(log2 - 3) as usize] {
             let left = |y: i32| refs[(2 * ni - 1 - y) as usize];

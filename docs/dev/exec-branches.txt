@@ -890,7 +890,7 @@ refs/heads/exec-rmbp-surfaceid   4a3691214 FOLDED-BY-HAND (this commit) 2026-10-
 refs/heads/exec-rmbp-roamxchan   67abf4a00 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264encbframes   89c453d1f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle6mix   d08a83b03 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-hevcrext   d08a83b03 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-hevcrext   eca4a26e1 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-phyoncefn   5a80ea12d FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pdfjpx   f3d5ae3c9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-jbig2huff   f3d5ae3c9 IN-FLIGHT cut 2026-10-27

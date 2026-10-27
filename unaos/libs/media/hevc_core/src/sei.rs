@@ -128,13 +128,15 @@ pub fn plane_checksum(p: &Plane, bit_depth: u32) -> u32 {
     sum
 }
 
-/// Check a picture's decoded sample arrays (after deblocking and SAO) against its decoded_picture_hash.
-pub fn check(planes: &[Plane; 3], bit_depth: u32, h: &PictureHash) -> HashCheck {
+/// Check a picture's decoded sample arrays (after deblocking and SAO) against its decoded_picture_hash. HEVCREXT
+/// (SR334): D.3.19's bitDepth is per component — BitDepthY for plane 0, BitDepthC (`bit_depth_c`) for planes 1 and 2.
+pub fn check(planes: &[Plane; 3], bit_depth: u32, bit_depth_c: u32, h: &PictureHash) -> HashCheck {
     for c in 0..3 {
+        let bd = if c == 0 { bit_depth } else { bit_depth_c };
         let ok = match h {
             Md5(_) => return HashCheck::Md5Unchecked,
-            Crc(want) => plane_crc(&planes[c], bit_depth) == want[c],
-            Checksum(want) => plane_checksum(&planes[c], bit_depth) == want[c],
+            Crc(want) => plane_crc(&planes[c], bd) == want[c],
+            Checksum(want) => plane_checksum(&planes[c], bd) == want[c],
         };
         if !ok {
             return HashCheck::Mismatch(c);

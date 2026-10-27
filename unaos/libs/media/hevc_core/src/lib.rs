@@ -64,7 +64,7 @@
 //! deblocking bS 0 / 1 from motion.
 //!
 //! Refused by name ([`Error::Unsupported`]): constrained_intra_pred_flag in P / B slices (HEVCINTER-CIP), bit depths
-//! above 10 or unequal luma / chroma bit depths (HEVCREXT), chroma other than 4:2:0, separate colour planes, every range-extension and screen-content
+//! above 12, monochrome and separate colour planes (HEVCREXT SR334 decodes 4:2:2 / 4:4:4, 12-bit, unequal depths), each range-extension and screen-content
 //! tool. Layers above the base (nuh_layer_id > 0) are ignored.
 
 #![no_std]

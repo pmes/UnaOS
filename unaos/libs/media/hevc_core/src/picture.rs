@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 //
-//! The picture under decoding: three 16-bit sample planes (4:2:0; HEVCMAIN10 SR311: 8- and 10-bit samples alike) and the facts the parser, intra prediction, the deblocking
+//! The picture under decoding: three 16-bit sample planes (4:2:0, and 4:2:2 / 4:4:4 since HEVCREXT SR334; HEVCMAIN10 SR311: every bit depth alike) and the facts the parser, intra prediction, the deblocking
 //! filter and SAO read back — per 4x4 luma block (coding quadtree depth, IntraPredModeY, QpY, pcm / transquant bypass,
 //! transform / coding block edges) and per CTB (its slice, its SAO parameters) — with the z-scan availability
 //! process of 6.4.1, and the conformance-window crop into h264_core's [`Frame`]. HEVCINTER (SR216): the per-4x4 motion
@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 
 use crate::ps::Geometry;
 use crate::Frame;
+use h264_core::ChromaFormat;
 
 /// One sample plane, row-major, no padding.
 #[derive(Clone, Debug, Default)]
@@ -122,18 +123,28 @@ pub struct Picture {
     /// The conformance window in luma samples: (x0, y0, w, h).
     pub crop: (usize, usize, usize, usize),
     pub output: bool,
-    /// BitDepthY (= BitDepthC; unequal depths are refused): to_frame narrows by it (HEVCMAIN10 SR311).
+    /// BitDepthY: to_frame narrows the luma plane by it (HEVCMAIN10 SR311).
     pub bit_depth: u32,
+    /// HEVCREXT (SR334): the chroma format (the Cb / Cr planes are width / SubWidthC x height / SubHeightC).
+    pub chroma: ChromaFormat,
+    /// HEVCREXT (SR334): BitDepthC (to_frame narrows the chroma planes by it; the hash SEI reads it).
+    pub bit_depth_c: u32,
 }
 
 impl Picture {
     pub fn new(width: usize, height: usize, geo: &Geometry) -> Picture {
+        Picture::with_chroma(width, height, geo, ChromaFormat::Yuv420)
+    }
+
+    /// HEVCREXT (SR334): a picture whose chroma planes follow `chroma` (Table 6-1).
+    pub fn with_chroma(width: usize, height: usize, geo: &Geometry, chroma: ChromaFormat) -> Picture {
+        let (sw, sh) = chroma.sub();
         let n4 = geo.w4 * geo.h4;
         let nctb = (geo.width_ctbs * geo.height_ctbs) as usize;
         Picture {
             width,
             height,
-            planes: [Plane::new(width, height, 0), Plane::new(width / 2, height / 2, 0), Plane::new(width / 2, height / 2, 0)],
+            planes: [Plane::new(width, height, 0), Plane::new(width / sw, height / sh, 0), Plane::new(width / sw, height / sh, 0)],
             w4: geo.w4,
             h4: geo.h4,
             ctdepth: vec![0; n4],
@@ -150,6 +161,8 @@ impl Picture {
             crop: (0, 0, width, height),
             output: true,
             bit_depth: 8,
+            chroma,
+            bit_depth_c: 8,
         }
     }
 
@@ -196,11 +209,14 @@ impl Picture {
         geo.tile_of_rs(cn) == geo.tile_of_rs(cc)
     }
 
-    /// The cropped picture as h264_core's frame type (7.4.3.2.1 conformance window, 4:2:0). HEVCMAIN10 (SR311): above
+    /// The cropped picture as h264_core's frame type (7.4.3.2.1 conformance window). HEVCMAIN10 (SR311): above
     /// 8 bits `planes16` carries the samples as decoded and `planes` holds them narrowed `>> (bit_depth - 8)`; at 8 bits
-    /// the narrow is a shift of 0 and `planes16` is None.
+    /// the narrow is a shift of 0 and `planes16` is None. HEVCREXT (SR334): the chroma planes are cropped by
+    /// (SubWidthC, SubHeightC) and narrowed by BitDepthC; `planes16` is Some when either depth is above 8 and holds each
+    /// plane at its own depth (`Frame.bit_depth` is BitDepthY); `Frame.chroma` names the format.
     pub fn to_frame(&self) -> Frame {
         let (x0, y0, w, h) = self.crop;
+        let (sw, sh) = self.chroma.sub();
         let crop = |pl: &Plane, x0: usize, y0: usize, w: usize, h: usize| {
             let mut v = Vec::with_capacity(w * h);
             for r in 0..h {
@@ -211,20 +227,21 @@ impl Picture {
         };
         let planes16 = [
             crop(&self.planes[0], x0, y0, w, h),
-            crop(&self.planes[1], x0 / 2, y0 / 2, w / 2, h / 2),
-            crop(&self.planes[2], x0 / 2, y0 / 2, w / 2, h / 2),
+            crop(&self.planes[1], x0 / sw, y0 / sh, w / sw, h / sh),
+            crop(&self.planes[2], x0 / sw, y0 / sh, w / sw, h / sh),
         ];
-        let shift = self.bit_depth - 8;
-        let narrow = |p: &Vec<u16>| p.iter().map(|&v| (v >> shift) as u8).collect::<Vec<u8>>();
+        let (shift, shift_c) = (self.bit_depth - 8, self.bit_depth_c - 8);
+        let narrow = |p: &Vec<u16>, shift: u32| p.iter().map(|&v| (v >> shift) as u8).collect::<Vec<u8>>();
         Frame {
             width: w as u32,
             height: h as u32,
-            planes: [narrow(&planes16[0]), narrow(&planes16[1]), narrow(&planes16[2])],
+            planes: [narrow(&planes16[0], shift), narrow(&planes16[1], shift_c), narrow(&planes16[2], shift_c)],
             poc: self.poc,
             tag: self.tag,
             full_range: self.full_range,
             bit_depth: self.bit_depth as u8,
-            planes16: if self.bit_depth > 8 { Some(planes16) } else { None },
+            planes16: if self.bit_depth > 8 || self.bit_depth_c > 8 { Some(planes16) } else { None },
+            chroma: self.chroma,
         }
     }
 }

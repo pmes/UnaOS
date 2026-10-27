@@ -171,12 +171,12 @@ fn heic_tile(
     item: &demux_core::heif::Item,
     fallback: Option<demux_core::heif::Nclx>,
 ) -> Result<(u32, u32, Vec<u8>), Error> {
+    let mut d = hevc_core::Decoder::new(); d.set_chroma_420_only(true); // HEVCREXT (SR334): to_frame is 4:2:0 at one depth until COLOURONE-422
     let rec = item.hvcc.as_deref().ok_or(Error::Malformed("heic: hvc1 item has no hvcC"))?;
     if let Some((w, ht)) = item.ispe {
         heic_dims(w, ht)?;
     }
     let nclx = item.nclx.or(fallback);
-    let mut d = hevc_core::Decoder::new();
     d.configure_hvcc(rec).map_err(heic_hevc_err)?;
     d.decode_sample(&h.data(bytes, item).map_err(heic_demux_err)?).map_err(heic_hevc_err)?;
     d.flush();

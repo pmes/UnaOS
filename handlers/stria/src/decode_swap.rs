@@ -5,7 +5,7 @@
 //! ([`crate::media::Player`]) and the editor render ([`crate::nle`]) share.
 //!
 //! SWAPBACK (LEDGER SR329; HEVCPAL-SWAP SR304 factored out of the Player): a decoder that refuses the stream MID-STREAM
-//! (`DecodeError::Unsupported`: an in-band SPS turning 12-bit HEVC (HEVCREXT), an H.264 stream switching to 4:2:2, ...)
+//! (`DecodeError::Unsupported`: an in-band SPS turning 13-bit HEVC (above 12: HEVCREXT-TOOLS), an H.264 stream switching to 4:2:2, ...)
 //! hands the picture to the labelled stand-in ([`TestPattern::stand_in`] at the track's size) ONCE: the frames it still
 //! holds are drained first, one `video decode: swapped to stand-in` line is logged, and the refused packet is drawn by the
 //! stand-in so its interval is not a gap. The refused decoder is PARKED, reset (every decoder's `reset` forgets its
