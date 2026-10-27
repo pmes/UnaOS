@@ -1619,7 +1619,7 @@ pub fn focussteal_selftest() {
 ///    the worst whole call whose present was the DRAIN (SHIMMERPRESENT B840: tick + erase drain + cursor tail; bar: <= 200 us);
 ///    a run with no drain frame does not pass. A frame the whole pass carried (owed work, or the drain re-damaged a
 ///    window) is printed as `pass_us=` (ungated; flight 37's 6053 us was that pass), the drain frames as `drain_frames=`.
-/// `:: VEILCOST: detail veil_p50_us=<n> veil_p99_us=<n> fill_p99_us=<n> bar_us=<n> n=<n> shimmer_frames=<n> pass_us=<n> drain_frames=<n> ::`
+/// `:: VEILCOST: detail veil_p50_us=<n> veil_p99_us=<n> fill_p99_us=<n> bar_us=<n> n=<n> shimmer_frames=<n> pass_us=<n> drain_frames=<n> drain_p99_us=<n> ::` (DRAINVEIL B868)
 /// `:: VEILCOST: ratio_p99=<x.xx> shimmer_idle_us=<n> -> PASS|FAIL|SKIP ::`
 #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))]
 fn veilcost_selftest() {
@@ -1662,8 +1662,8 @@ fn veilcost_selftest() {
     }
     let shim_ok = rm || (frames > 0 && drain_frames > 0 && worst <= SHIM_BAR_US);
     serial_println!(
-        ":: VEILCOST: detail veil_p50_us={} veil_p99_us={} fill_p99_us={} bar_us={} n={} shimmer_frames={} pass_us={} drain_frames={}{} ::",
-        v50, v99, s99, bar_us, k, frames, pass_worst, drain_frames, if rm { " reduce_motion=1" } else { "" }
+        ":: VEILCOST: detail veil_p50_us={} veil_p99_us={} fill_p99_us={} bar_us={} n={} shimmer_frames={} pass_us={} drain_frames={} drain_p99_us={}{} ::",
+        v50, v99, s99, bar_us, k, frames, pass_worst, drain_frames, crate::video::veilcost::drain_p99_us(), if rm { " reduce_motion=1" } else { "" }
     );
     serial_println!(
         ":: VEILCOST: ratio_p99={}.{:02} shimmer_idle_us={} -> {} ::",

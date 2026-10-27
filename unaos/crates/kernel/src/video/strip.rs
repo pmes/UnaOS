@@ -439,7 +439,7 @@ pub fn paint(name: &str, r: Rect, mut compose_row: impl FnMut(&mut [u32], usize)
     fb.flush_rect(x, y, w, h);
     let _ = super::beam::settle(hb);
     // TEARSCOPE — record what this present cost against what the beam spends on the same rows.
-    bar_painted(name, r, crate::arch::now_cycles().saturating_sub(tp0), info.height); overlay_note(name, r, info.width, info.height); #[cfg(all(target_arch = "x86_64", feature = "wc"))] zoom_note(name, r); // ZOOMFURN (B848): the painted rows named to the lens after the pixels (`zoom_note`, file tail). PERFHUD2 (B828): a strip painted over the HUD owes it a full repaint (`overlay_note`, file tail). ⚠ LINE-NEUTRAL fold, code first.
+    bar_painted(name, r, crate::arch::now_cycles().saturating_sub(tp0), info.height); overlay_note(name, r, info.width, info.height); // ZOOMFLUSH2 (B868): no note here — the `flush_rect` above IS the lens note (`zoom::flushed_rows`, src flush; ZOOMFURN's `zoom_note` retired, file tail). PERFHUD2 (B828): a strip painted over the HUD owes it a full repaint (`overlay_note`, file tail). ⚠ LINE-NEUTRAL fold, code first.
     true
 }
 
@@ -487,7 +487,7 @@ pub fn erase_rect(r: Rect) -> bool {
         let bytes = unsafe { core::slice::from_raw_parts(s.raw.as_ptr() as *const u8, w * 4) };
         fb.blit((y + j) * stride_b + x * 4, bytes);
     }
-    fb.flush_rect(x, y, w, h); #[cfg(all(target_arch = "x86_64", feature = "wc"))] zoom_note("", (x, y, w, h)); // ZOOMFURN (B848): the erased rows named to the lens after the pixels (`zoom_note`, file tail). ⚠ LINE-NEUTRAL fold, code first.
+    fb.flush_rect(x, y, w, h); // ZOOMFLUSH2 (B868): this clean IS the lens note (`zoom::flushed_rows`, src flush); ZOOMFURN's `zoom_note` retired (file tail). ⚠ LINE-NEUTRAL: 1 line out, 1 line in.
     let _ = super::beam::settle(hb);
     true
 }
@@ -2100,27 +2100,27 @@ pub fn overlay_pending() -> bool {
     OVERLAY_HIT.load(Ordering::Acquire)
 }
 
-// ZOOMFURN (rmbp-ledger B848; BP-video-26) — TAIL-APPENDED body of two LINE-NEUTRAL folds. Every strip, HUD and dropdown
-// pixel reaches the RAM frame through [`paint`] or [`erase_rect`]; each names the rows it just wrote to the lens
-// (`zoom::note_drawn`, straight into its owed rows), so a menu-bar clock tick presents its rows, not the panel. The
-// source is the tenant's name: the overlay tenant is the HUD, the two menus are dropdowns, every other paint and every
-// erase (`name` = `""`) is a strip.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
-fn zoom_note(name: &str, r: Rect) {
-    let (_, y, w, h) = r;
-    if w == 0 || h == 0 {
-        return;
-    }
-    let n = name.as_bytes();
-    let src = if n == TENANTS[OVERLAY_SLOT].name.as_bytes() {
-        super::zoom::SRC_HUD
-    } else if name == "crystal" || name == "winmenu" {
-        super::zoom::SRC_DROPDOWN
-    } else {
-        super::zoom::SRC_STRIP
-    };
-    super::zoom::note_drawn(y, h, src);
-}
+// ZOOMFURN (rmbp-ledger B848; BP-video-26) — RETIRED by ZOOMFLUSH2 (rmbp-ledger B868). This tail held `zoom_note`, the
+// body of two LINE-NEUTRAL folds in [`paint`] and [`erase_rect`] that named the rows each had just written to the lens
+// (`zoom::note_drawn`, src strip|hud|dropdown by the tenant's name). Both callers already end in `fb.flush_rect` over
+// the very same rect, and since ZOOMFLUSH (B859) that clean IS the note: `FrameBuffer::flush_rect` asks
+// `zoom::flushed_rows`, which notes the rows (src flush) when the base is the lens's RAM frame. So every strip, HUD and
+// dropdown row was noted twice; `zoom`'s `double_notes` (the `tests zoom` fixture) now counts EVERY non-flush source.
+//
+// One note door, attribution by base only: no source hint is threaded into the flush. The cost of that is the
+// furniture line's split — `[zoom] noted=strip:,hud:,dropdown:` read 0 and the strip rows tally under `flush:` — which
+// is the clause's choice (BP-video-26), not a loss: the tallies were attribution, never the owed set.
+//
+// Kept as a comment of the retired block's own length so no line below moves (strip.rs compiles on aarch64
+// `desktop_firmware` too, where the retired fn never existed; BEAMSPLIT's fns below keep their line numbers).
+//
+// What a future writer to the RAM frame must do instead of a note: clean what it wrote through
+// `FrameBuffer::flush_rect` / `flush_range` (the post-write clean every writer owes the non-coherent scan-out
+// anyway). A writer that cannot clean is the `sweep_whole` class `zoom::on_damage` counts — and `tests zoom`
+// gates `sweep_whole=0`, so it would be seen at the first boot that runs the fixture.
+//
+// (ZOOMFLUSHSTRIP, video §5 — closed by B868.)
+//
 
 // BEAMSPLIT (rmbp-ledger B860; BP-video-27) — ONE beam hold over a pass's dirty bands. TAIL-APPENDED body of one
 // LINE-NEUTRAL fold ([`paint`]'s hold line). A painter that repaints several bands of one tenant in one pass (the HUD's

@@ -15,7 +15,8 @@
 //!
 //! WIRE: `[veil] cost p50_us=<n> p99_us=<n> solid_us=<n> ratio=<x.xx>` on the first pass after `[desktop] built`
 //! and every 60 s while the desktop is up; printed only with IRQs on (the k2p `Flush` rule), else on a later pass.
-//! `p50_us`/`p99_us` are the VEIL rect's, `solid_us` the fill's p99, `ratio` = VEIL p99 / fill p99.
+//! `p50_us`/`p99_us` are the VEIL rect's, `solid_us` the fill's p99, `ratio` = VEIL p99 / fill p99. DRAINVEIL (B868): the
+//! line ends ` drain_p99_us=<n>` — the drain-only present's whole call (`wm::drain_present_once`, [`drain`], file tail).
 //! The fixture (`tests veilcost`, tests.rs tail) reads [`sample`] and [`stats`].
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::{AcqRel, Relaxed}};
@@ -106,7 +107,7 @@ pub fn stats() -> (u32, u32, u32, u32, usize) {
 /// Print the `[veil] cost` line from the rings.
 pub fn line() {
     let (p50, p99, solid, r, _) = stats();
-    serial_println!("[veil] cost p50_us={} p99_us={} solid_us={} ratio={}.{:02}", p50, p99, solid, r / 100, r % 100);
+    serial_println!("[veil] cost p50_us={} p99_us={} solid_us={} ratio={}.{:02} drain_p99_us={}", p50, p99, solid, r / 100, r % 100, drain_p99_us());
 }
 
 /// **The seam** — `wm::composite_once`, once per pass after the present. Samples at most every [`SAMPLE_MS`];
@@ -131,4 +132,30 @@ pub fn frame() {
         LINE_OWED.store(false, Relaxed);
         line();
     }
+}
+
+// DRAINVEIL (rmbp-ledger B868; BP-video-11) — TAIL-APPENDED. The drain-only present (`wm::drain_present_once`, the
+// shimmer's idle seat, SHIMMERPRESENT B840) is a frame the glass shows that never reaches [`frame`] (which runs once per
+// WHOLE pass). Its own cost is recorded here, tagged drain: one ring of the same shape as the VEIL's, timed from the
+// drain present's own open (`dm_t0`, DRAINMETER's clock) to its tail, under the caller's `COMP_GATE`. It records only
+// that cost — no VEIL paint sample runs inside the drain's hold, so the drain present stays the cost it measures.
+
+static DRAIN_NS: [AtomicU32; RING] = [Z; RING];
+/// Drain presents ever recorded (the ring index is `k % RING`).
+static DRAIN_K: AtomicUsize = AtomicUsize::new(0);
+
+/// `wm::drain_present_once`'s tail: one drain present ran, opened at cycle `t0`. Two relaxed stores and a clock read.
+pub fn drain(t0: u64) {
+    let i = DRAIN_K.fetch_add(1, Relaxed) % RING;
+    DRAIN_NS[i].store(ns(crate::arch::now_cycles().saturating_sub(t0)), Relaxed);
+}
+
+/// The drain ring's p99 in us (0 = no drain present yet).
+pub fn drain_p99_us() -> u32 {
+    let k = DRAIN_K.load(Relaxed).min(RING);
+    let mut d = [0u32; RING];
+    for (i, x) in d.iter_mut().take(k).enumerate() {
+        *x = DRAIN_NS[i].load(Relaxed);
+    }
+    crate::video::wm::k2p::p50_p99(&mut d[..k]).1 / 1000
 }

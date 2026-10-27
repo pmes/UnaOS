@@ -6164,7 +6164,7 @@ fn composite_inner() -> CursorTail {
     // FOCUS-VIS — one snapshot of the shell's z for the whole pass, so every window in it is judged
     // against the same shell position (a concurrent focus change either lands wholly before this pass
     // or is serviced by the composite that change performs itself).
-    let shell = shell_z(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] zoom_note_pass(&rows, &dirty, &bands);
+    let shell = shell_z(); // ZOOMFLUSH2 (B868): no pass note — each dirty row is noted by `draw_window`'s tail `flush_rect` (zoom src flush)
     // FOCUS-HL: one snapshot per pass, for the same reason `shell` is one snapshot per pass — every
     // window in this pass is judged against a single focus owner, so no pass can draw two highlights.
     let focus = focus_asid();
@@ -18900,7 +18900,7 @@ fn drain_deferred(fb: &super::FrameBuffer) -> bool {
     // future reorder, on the arm that actually disturbs the sprite.
     #[cfg(feature = "witness")]
     F2W_DRAINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    #[cfg(all(target_arch = "x86_64", feature = "wc"))] zoom_note_boxes(&boxes[..n]); let sprite_hit = super::cursor::sprite_box()
+    let sprite_hit = super::cursor::sprite_box() // ZOOMFLUSH2 (B868): no box note — each drained box is noted by its own `flush_rect` below (zoom src flush)
         .map(|sb| boxes[..n].iter().any(|&b| b.2 != 0 && b.3 != 0 && boxes_overlap(sb, b)))
         .unwrap_or(false);
     if sprite_hit {
@@ -31922,30 +31922,30 @@ pub mod a11yshadow {
     }
 }
 
-// ZOOMCOST (rmbp-ledger B835; BP-video-26) — TAIL-APPENDED bodies of two LINE-NEUTRAL folds. The lens presents only the
-// source rows a composite pass wrote, and only this file can read the pass's damage set: `composite_inner` calls
-// `zoom_note_pass` once the occlusion closure has made its rows/dirty/bands final (each dirty row's `damaged_box`, the
-// rect the pass writes), and `drain_deferred` calls `zoom_note_boxes` with the erase boxes it drained. Both only name
-// rows to `zoom::note_rows` (one relaxed load with the lens off); `zoom::on_damage` commits them after the pixels.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
-fn zoom_note_pass(rows: &[Window], dirty: &[bool], bands: &[Option<(usize, usize)>]) {
-    for (i, r) in rows.iter().enumerate() {
-        if !r.used || !dirty.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        let (_, y, _, h) = damaged_box(r, bands.get(i).copied().flatten());
-        super::zoom::note_rows(y, h);
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
-fn zoom_note_boxes(boxes: &[(usize, usize, usize, usize)]) {
-    for &(_, y, w, h) in boxes {
-        if w != 0 {
-            super::zoom::note_rows(y, h);
-        }
-    }
-}
+// ZOOMCOST (rmbp-ledger B835; BP-video-26) — RETIRED by ZOOMFLUSH2 (rmbp-ledger B868). This tail held the bodies of two
+// LINE-NEUTRAL folds: `zoom_note_pass` (from `composite_inner`, each dirty row's `damaged_box` into `zoom::note_rows`) and
+// `zoom_note_boxes` (from `drain_deferred`, each drained erase box). Both named rows the pass's own cleans already name:
+//
+// * a dirty row's pixels are written only by `draw_window`, whose early returns all precede its first write and whose
+//   tail ALWAYS runs `fb.flush_rect(bx, y0, bw, y1 - y0)` over the staged band or the whole outer box — beam held or
+//   not. The in-bracket band clean under `beam::held` (`stage_window`) is the Orin's extra publish; the not-held
+//   branch was already published by that tail, so ZOOMPASSFLUSH needed no new flush, only this deletion;
+// * every drained box that `stage_fill` wrote is cleaned by `drain_deferred`'s own `flush_rect` at once.
+//
+// Since ZOOMFLUSH (B859) `FrameBuffer::flush_rect` IS the lens note (`zoom::flushed_rows`, src flush, attribution by
+// base only), so both folds noted every row twice. `zoom::note_rows` and its `PASS_ROWS` commit stay as a door with no
+// caller; its tally is `tests zoom`'s `pass_notes=` (gated 0; PASSROWSDOOR owed, video §5, deletes the door once a
+// flight reads it).
+//
+// Kept as a comment of the retired block's own length: wm.rs compiles on every build (knob-off included), so no line
+// below may move.
+//
+// (ZOOMPASSFLUSH, video §5 — closed by B868.)
+//
+//
+//
+//
+//
 
 // OVERLAYOCC (rmbp-ledger B827, BP-video-17) — TAIL-APPENDED so no line above moves: the one overlay predicate the three
 // occluder sets ask (through `overlay_occludes`), and `tests overlays`' fixture-only readers.
@@ -31994,7 +31994,7 @@ pub fn surface_pixel(id: WinId, sx: usize, sy: usize) -> Option<u32> {
 // SHIMMERPRESENT (rmbp-ledger B840; BP-video-11) — TAIL-APPENDED so no line above moves. The shimmer's idle seat
 // (`desktop::shimmer_idle`) presents its boxes, not the whole pass: under `COMP_GATE`, with nothing but its own boxes owed,
 // only the head of `composite_inner` runs — `shadow_track` (whose `desktop::track` makes the tick and queues its boxes),
-// the erase drain (`drain_deferred`: the filtered `stage_fill` + `flush_rect` of each box, ZOOMCOST's `zoom_note_boxes`
+// the erase drain (`drain_deferred`: the filtered `stage_fill` + `flush_rect` of each box, each clean the lens note since B868
 // inside it), then `cash_tail`'s cursor tail and `zoom::on_damage`. No window blit, no snapshot, no furniture compose
 // (`erase_clip` keeps every fill off the strips, so the drain owes them nothing). Anything else owed — before the drain or
 // left by it — runs the whole pass (`composite_once`) inside the same hold. The gate is taken and released with
@@ -32062,7 +32062,7 @@ fn drain_present_once() -> bool {
         c2_t1: crate::arch::now_cycles(),
     });
     super::zoom::on_damage(dirty);
-    pass_owed_redrive(); super::perfhud::drain_present(dm_t0); // DRAINMETER (B859): the drain present's sample beside the HUD's frame-time ring (perfhud.rs tail). LINE-NEUTRAL fold, code first.
+    pass_owed_redrive(); super::perfhud::drain_present(dm_t0); super::veilcost::drain(dm_t0); // DRAINVEIL (B868): the drain present's cost into veilcost's drain ring (`drain_p99_us=`, veilcost.rs tail). DRAINMETER (B859): the drain present's sample beside the HUD's frame-time ring (perfhud.rs tail). LINE-NEUTRAL fold, code first.
     true
 }
 
