@@ -50,7 +50,7 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
    Owed: ZENBOOK-XHCIALL (every controller up; the ring/port/slot statics per instance, one MSI-X vector each), USB
    tunnelled behind the NHIs (ZENBOOK-USB4), the Fn-key keyboard (ZENBOOK-EC).
 8. **ZENBOOK-EC** — battery, lid and the Fn keys through the ACPI embedded controller (the SMC's job on the rMBP). In flight (ZENBOOKEC, Z8): rung 1 is the ECDT-located transport + a 256-byte RAM census at pci init; the battery decode is ZENBOOK-EC-BATTERY (needs the first boot's DSDT).
-9. **ZENBOOK-TOUCHPAD** — the touchpad over I2C-HID on the AMD DesignWare I2C controller.
+9. **ZENBOOK-TOUCHPAD** — the touchpad over I2C-HID on the AMD DesignWare I2C controller. In flight (ZENBOOKTOUCHPAD, Z14): rung 1 is `drivers/dwi2c.rs`, the FCH's fixed I2C pages identified read-only, a 1-byte-read bus census and the I2C-HID descriptor at a guess-table address, Zenbook only, each controller restored as found. Owed: ZENBOOK-TOUCHPAD-REPORTS (the reports into the pointer route), DWI2C-ACPI (the `_CRS` base and the touchpad's address and `_DSM` register: AML or the first boot's dump), DWI2C-FAST, DWI2C-AOAC, the Fn keys.
 10. **ZENBOOK-ACP** — audio: the ALC294 codec on the Ryzen HD Audio controller (1022:15e3; Linux quirk 1043:1df3
     `ALC294_FIXUP_BASS_SPEAKER_15`) with its CS35L41 amplifiers, and the ACP 7.x coprocessor (1022:15e2). Until this
     lands `hda::probe` answers `[hda] absent` on the Zenbook (Z1's gate).
