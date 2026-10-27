@@ -964,4 +964,4 @@ refs/heads/exec-rmbp-h264enccolourhost   6217b99d3 FOLDED-BY-HAND (this commit) 
 refs/heads/exec-rmbp-aacencgrouping   16cacfacd FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle6dragsnap   2e1698471 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-av1inbandsize   2e1698471 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-kernelscalecols   2e1698471 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-kernelscalecols   1e5dd1888 FOLDED-BY-HAND (this commit) 2026-10-27
