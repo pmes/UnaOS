@@ -4055,8 +4055,8 @@ pub fn write_block_nvme(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
 /// NVMEBOOT (NVMEWRITE): THE NVMe block-layer write. -EPERM unless the live root grant covers every block
 /// of the run; otherwise written through `drivers::nvme::write_at` and read back with ONE `read_at` over the
 /// run, compared block by block in memory (NVMEBATCH, zenbook-ledger Z22: `fs::unafs::handle_write_multi` hands a
-/// whole 4 KiB UnaFS block here as one run; the driver chunks by its own MDTS). A grant exists only over a
-/// 512-byte-LBA namespace (`fs::unafs::SdSectorDevice` is 512-only), so any other block size is refused.
+/// whole 4 KiB UnaFS block here as one run; the driver chunks by its own MDTS). NVME4KN (zenbook-ledger Z31): `lba` and
+/// the grant are the namespace's OWN LBAs on every LBA size; [`write_sectors_nvme`] maps the 512 B sector view onto them.
 #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
 pub fn write_blocks_nvme(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
     let dev = nvme_info().ok_or(BlockError::NotReady)?;
@@ -4076,9 +4076,6 @@ pub fn write_blocks_nvme(lba: u64, buf: &[u8]) -> Result<(), BlockError> {
         }
     }
     let bs = dev.block_size as usize;
-    if bs != SECTOR_BYTES {
-        return Err(BlockError::BadLba);
-    }
     crate::drivers::nvme::write_at(lba, buf).map_err(|_| BlockError::Io)?;
     let mut rb = alloc::vec![0u8; count * bs];
     crate::drivers::nvme::read_at(lba, &mut rb).map_err(|_| BlockError::Io)?;
@@ -4116,3 +4113,120 @@ pub fn flush_nvme() -> Result<(), BlockError> {
 #[cfg(all(feature = "sdwrite", target_arch = "x86_64", feature = "nvme"))]
 const NATIVE_NVME_VETO: &str = "the volume rides the NVMe namespace and the block layer refuses every \
                                 write outside the boot's NVMe root grant (one UnaFS extent, NVMEBOOT)";
+
+// ══════════ NVME4KN (zenbook-ledger Z31) — the NVMe namespace as a 512 B sector view, on any LBA size ══════════
+//
+// TAIL-APPENDED. `fs::unafs::SdSectorDevice` (the unafs crate's `SectorDevice`) addresses 512 B sectors on every handle;
+// on the NVMe that space is a VIEW over the namespace: sector `s` is byte `s * 512`, LBA `s >> k` with
+// k = log2(lba_bytes) - 9 (0 on a 512 B namespace, 3 on 4Kn). This section is the ONE place the mapping lives. Every
+// entry point issues only [`read_blocks_nvme`] / [`write_blocks_nvme`] (the grant check and the read-back stay theirs);
+// on k = 0 each one is exactly the call it replaced. A 512 B write on k > 0 (the unafs K8a root flip, the keyslot) is a
+// read-modify-write of its ONE LBA through the granted write: a one-LBA NVMe write is power-fail atomic (AWUPF is
+// 0's-based) and the sibling bytes are rewritten as just read, so the flip stays one device write. The pair runs under
+// the UnaFS MOUNT lock that holds every write of the bound mount (BP-storage-8); `CTRL` is held per command only.
+// Any other sub-LBA write is refused by name, nothing written.
+
+/// NVME4KN: sub-LBA writes served by read-modify-write this boot (`tests nvme`'s `rmw=`).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_RMW: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// NVME4KN: unaligned-write refusals so far (the first [`NVME_DENY_LINES`] print).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_UNALIGNED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// NVME4KN: `k` = log2(LBA size) - 9 of the published namespace (0 for 512 B .. 3 for 4 KiB); `None` with no namespace
+/// or a size that is not a power of two in 512..=4096.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_sector_shift() -> Option<u32> {
+    let bs = nvme_info()?.block_size;
+    if bs.is_power_of_two() && (512..=4096).contains(&bs) { Some(bs.trailing_zeros() - 9) } else { None }
+}
+
+/// NVME4KN: `(k, block size)` of the published namespace, or the refusal the block layer gives.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_view() -> Result<(u32, usize), BlockError> {
+    let dev = nvme_info().ok_or(BlockError::NotReady)?;
+    let k = nvme_sector_shift().ok_or(BlockError::Io)?;
+    Ok((k, dev.block_size as usize))
+}
+
+/// NVME4KN: read `buf.len() / 512` view sectors from `sector`. Whole LBAs go straight to [`read_blocks_nvme`]
+/// (chunked by `MAX_BLOCKS_PER_OP`, as `fs::unafs::nvme_read_multi` did); a span that is not whole LBAs is served LBA
+/// by LBA through a one-LBA bounce.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn read_sectors_nvme(sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+    if buf.is_empty() || buf.len() % SECTOR_BYTES != 0 {
+        return Err(BlockError::Io);
+    }
+    let (k, bs) = nvme_view()?;
+    let per = 1u64 << k;
+    if sector % per == 0 && buf.len() % bs == 0 {
+        for (i, c) in buf.chunks_mut(MAX_BLOCKS_PER_OP * bs).enumerate() {
+            read_blocks_nvme((sector >> k) + (i * MAX_BLOCKS_PER_OP) as u64, c)?;
+        }
+        return Ok(());
+    }
+    let mut b = alloc::vec![0u8; bs];
+    let mut done = 0usize;
+    while done < buf.len() {
+        let s = sector.checked_add((done / SECTOR_BYTES) as u64).ok_or(BlockError::BadLba)?;
+        read_blocks_nvme(s >> k, &mut b)?;
+        let off = ((s & (per - 1)) as usize) * SECTOR_BYTES;
+        let n = core::cmp::min(bs - off, buf.len() - done);
+        buf[done..done + n].copy_from_slice(&b[off..off + n]);
+        done += n;
+    }
+    Ok(())
+}
+
+/// NVME4KN: write `buf.len() / 512` view sectors at `sector`. Whole LBAs -> ONE [`write_blocks_nvme`] run (as
+/// `fs::unafs::handle_write_multi` did); exactly one 512 B sector inside a larger LBA -> read-modify-write of that LBA
+/// through the same granted write; anything else is refused by name and nothing is written.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn write_sectors_nvme(sector: u64, buf: &[u8]) -> Result<(), BlockError> {
+    if buf.is_empty() || buf.len() % SECTOR_BYTES != 0 {
+        return Err(BlockError::Io);
+    }
+    let (k, bs) = nvme_view()?;
+    let per = 1u64 << k;
+    if sector % per == 0 && buf.len() % bs == 0 {
+        return write_blocks_nvme(sector >> k, buf);
+    }
+    if buf.len() == SECTOR_BYTES {
+        let mut b = alloc::vec![0u8; bs];
+        read_blocks_nvme(sector >> k, &mut b)?;
+        let off = ((sector & (per - 1)) as usize) * SECTOR_BYTES;
+        b[off..off + SECTOR_BYTES].copy_from_slice(buf);
+        write_blocks_nvme(sector >> k, &b)?;
+        NVME_RMW.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return Ok(());
+    }
+    if NVME_UNALIGNED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < NVME_DENY_LINES {
+        serial_println!(":: [nvme] write refused sector={} len={} lba={} — not whole LBAs, nothing written ::", sector, buf.len(), bs);
+    }
+    Err(BlockError::Io)
+}
+
+/// NVME4KN: ONE 512 B view sector at `sector` into the front of `buf` (the `fs::unafs::handle_read` arm). Returns 512.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn read_sector_nvme(sector: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    if buf.len() < SECTOR_BYTES {
+        return Err(BlockError::Io);
+    }
+    read_sectors_nvme(sector, &mut buf[..SECTOR_BYTES])?;
+    Ok(SECTOR_BYTES)
+}
+
+/// NVME4KN: ONE 512 B view sector at `sector` from the front of `buf` (the `fs::unafs::handle_write` arm).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn write_sector_nvme(sector: u64, buf: &[u8]) -> Result<(), BlockError> {
+    if buf.len() < SECTOR_BYTES {
+        return Err(BlockError::Io);
+    }
+    write_sectors_nvme(sector, &buf[..SECTOR_BYTES])
+}
+
+/// NVME4KN: sub-LBA writes served by read-modify-write this boot.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_rmw_count() -> u32 {
+    NVME_RMW.load(core::sync::atomic::Ordering::Relaxed)
+}

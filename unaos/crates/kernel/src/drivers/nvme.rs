@@ -23,7 +23,8 @@
 //! admits writes through `block::write_blocks_nvme`; [`flush`] (NVM Flush) is the commit barrier.
 //!
 //! **Does NOT (owed rows, docs/dev/blueprint/storage.md §5):** MSI-X; namespaces other than 1; TRIM; the
-//! SMART/Health log page; a 4096-byte-LBA root (NVME4KN); an installer path onto the NVMe (NVMEINSTALL).
+//! SMART/Health log page; an installer path onto the NVMe (NVMEINSTALL). NVME4KN (zenbook-ledger Z31): a 4096-byte-LBA
+//! namespace is served through the block layer's 512 B sector view (`block::read_sectors_nvme`, block.rs tail).
 //!
 //! **The writes:** WRITE (0x01) is compiled, and [`write_at`] is `pub(crate)` with exactly TWO callers —
 //! `block::write_blocks_nvme` (-EPERM outside the live root grant, each run read back with ONE `read_at` —
@@ -45,7 +46,7 @@
 //! ```text
 //! [nvme] bdf <b>:<s>.<f> <vid>:<did> bar0=0x<..> cap=0x<..> ver=<x.y.z> mqes=<n> dstrd=<n> to_ms=<n>   (bootlog)
 //! [nvme] ctrl  (the ready line: mn="<model>" ns=1 lba=<bytes> blocks=<n> -> ready; spelled once, at `probe`)
-//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> rbatch=<n> runs=<n> run_blocks=<n> rblocks=<n> rcmds=<n>
+//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> rbatch=<n> runs=<n> run_blocks=<n> rblocks=<n> rcmds=<n> lba=<bytes> shift=<9..12> rmw=<n>
 //! :: NVME: ctrl=ok ns=1 rw=ok -> PASS ::
 //! ```
 //!
@@ -174,7 +175,8 @@ struct Ctrl {
     bounce: u64,
     /// Bytes one command may move: min(the bounce, MDTS).
     max_xfer: usize,
-    lba_bytes: u32,
+    /// log2 of the namespace's LBA size (9 = 512 B .. 12 = 4 KiB; NVME4KN, zenbook-ledger Z31).
+    lba_shift: u32,
     nsze: u64,
     mn: [u8; 40],
 }
@@ -287,7 +289,7 @@ fn io_cmd(c: &mut Ctrl, opc: u32, lba: u64, bytes: usize) -> Result<(), ()> {
         }
         c.prp_list
     };
-    let nlb = (bytes / c.lba_bytes as usize) as u32;
+    let nlb = (bytes >> c.lba_shift) as u32;
     if nlb == 0 {
         return Err(());
     }
@@ -310,7 +312,7 @@ fn io_cmd(c: &mut Ctrl, opc: u32, lba: u64, bytes: usize) -> Result<(), ()> {
 /// Move `len` bytes (whole blocks) at `lba`, chunked by `max_xfer`, through the bounce.
 fn transfer(lba: u64, ptr: *mut u8, len: usize, write: bool) -> Result<(), ()> {
     with_ctrl(lba, |c| {
-        let bs = c.lba_bytes as usize;
+        let bs = 1usize << c.lba_shift;
         if len == 0 || len % bs != 0 {
             return Err(());
         }
@@ -488,7 +490,7 @@ fn bring_up(bus: u8, slot: u8, func: u8, vend: u16, devid: u16, bar0: u64) -> Op
         prp_list,
         bounce,
         max_xfer: BOUNCE_BYTES,
-        lba_bytes: 512,
+        lba_shift: 9,
         nsze: 0,
         mn: [b' '; 40],
     };
@@ -529,7 +531,7 @@ fn bring_up(bus: u8, slot: u8, func: u8, vend: u16, devid: u16, bar0: u64) -> Op
         return None;
     }
     c.nsze = nsze;
-    c.lba_bytes = 1u32 << lbads;
+    c.lba_shift = lbads;
 
     // CREATE I/O CQ (qid 1, physically contiguous, interrupts off), then CREATE I/O SQ on it.
     let qsz = ((io_depth - 1) as u32) << 16;
@@ -570,7 +572,7 @@ pub fn probe() {
             return;
         }
     };
-    let (mn, lba, blocks) = (c.mn, c.lba_bytes, c.nsze); XFER_SECTORS.store(if c.lba_bytes == 512 { (c.max_xfer / 512) as u32 } else { 0 }, Ordering::Relaxed); // NVMEBATCHREAD (Z24): the read-ahead window `fs::unafs::ra_window` gives the NVMe, set before `c` moves
+    let (mn, lba, blocks) = (c.mn, 1u32 << c.lba_shift, c.nsze); XFER_SECTORS.store((c.max_xfer / 512) as u32, Ordering::Relaxed); // NVMEBATCHREAD (Z24): the read-ahead window `fs::unafs::ra_window` gives the NVMe, set before `c` moves; NVME4KN (Z31): in 512 B view sectors on EVERY namespace (the one unit)
     crate::arch::without_interrupts(|| *CTRL.lock() = Some(c));
     if crate::drivers::block::register_nvme(blocks, lba, &mn) {
         serial_println!("[nvme] ctrl mn=\"{}\" ns=1 lba={} blocks={} -> ready", trimmed(&mn), lba, blocks);
@@ -615,8 +617,8 @@ pub fn selftest() {
     };
     let (runs, run_blocks) = crate::drivers::block::nvme_run_census(); // NVMEBATCH (Z22)
     serial_println!(
-        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} rbatch={} runs={} run_blocks={} rblocks={} rcmds={}",
-        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), LAST_RBATCH.load(Ordering::Relaxed), runs, run_blocks, IO_READ_BLOCKS.load(Ordering::Relaxed), IO_READ_CMDS.load(Ordering::Relaxed)
+        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} rbatch={} runs={} run_blocks={} rblocks={} rcmds={} lba={} shift={} rmw={}",
+        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), LAST_RBATCH.load(Ordering::Relaxed), runs, run_blocks, IO_READ_BLOCKS.load(Ordering::Relaxed), IO_READ_CMDS.load(Ordering::Relaxed), dev.block_size, dev.block_size.trailing_zeros(), crate::drivers::block::nvme_rmw_count() // NVME4KN (Z31): the namespace's LBA size, its shift, and the sub-LBA writes served by read-modify-write this boot
     );
     let ctrl = if identify { "ok" } else { "bad" };
     let root = root_leg();
@@ -729,8 +731,8 @@ static IO_READ_BLOCKS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// NVMEBATCHREAD: the READ commands the scratch leg's 8-block `block::read_blocks_nvme` cost (0 = the leg did not
 /// run); it must equal the write leg's `expect` (`ceil(len / max_xfer)`, 1 for 8 x 512 B) or the leg answers `bad:rbatch`.
 static LAST_RBATCH: AtomicU32 = AtomicU32::new(0);
-/// NVMEBATCHREAD: sectors one command may move (`max_xfer / 512`), set once at [`probe`]; 0 = no window (not
-/// probed, or a non-512-byte namespace, which `fs::unafs::SdSectorDevice` cannot serve: NVME4KN).
+/// NVMEBATCHREAD: 512 B sectors one command may move (`max_xfer / 512`), set once at [`probe`]; 0 = not probed. NVME4KN
+/// (Z31): set on every namespace — the window is in the 512 B view sectors `fs::unafs::SdSectorDevice` addresses.
 static XFER_SECTORS: AtomicU32 = AtomicU32::new(0);
 
 /// NVMEBATCHREAD: the read-ahead window `fs::unafs::ra_window` gives the NVMe handle (it clamps to the block layer's

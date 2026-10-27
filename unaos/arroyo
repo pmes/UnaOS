@@ -2750,7 +2750,7 @@ fi
 # disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson), and for this driver
 # a silent no-op is indistinguishable on the wire from a machine with no SATA controller in it.
 [ -n "${UNAOS_AHCI:-}" ] && _feats="${_feats}ahci,"
-[ -n "${UNAOS_NVME:-}" ] && _feats="${_feats}nvme,"   # NVME (zenbook-ledger Z2): drivers/nvme.rs, the polled NVMe controller (probe, identify, `block::register_nvme`, `tests nvme`); the builder also attaches `-device nvme,drive=nvme0,serial=una` on a fresh target/nvmefixture.img (UNAOS_NVME_DISK=<img> to seed it). x86-only: stripped by `arm_features` below. Kept in sync with builder/src/main.rs, crates/kernel/Cargo.toml, banner-cert.sh, k8-reach.registry.
+[ -n "${UNAOS_NVME:-}" ] && _feats="${_feats}nvme,"   # NVME (zenbook-ledger Z2): drivers/nvme.rs, the polled NVMe controller (probe, identify, `block::register_nvme`, `tests nvme`); the builder also attaches `-device nvme,drive=nvme0,serial=una` on a fresh target/nvmefixture.img (UNAOS_NVME_DISK=<img> to seed it; NVME4KN Z31: UNAOS_NVME_4K=1 makes the namespace 4096-byte LBAs, kept through test-zenbook's scrub). x86-only: stripped by `arm_features` below. Kept in sync with builder/src/main.rs, crates/kernel/Cargo.toml, banner-cert.sh, k8-reach.registry.
 # AHCIWRITE (rmbp-ledger B89, SATA write half): UNAOS_AHCI_WRITE=1 arms the ATA `WRITE DMA EXT`
 # (0x35) path in drivers/ahci.rs. Implies `ahci` (Cargo.toml declares `ahci-write = ["ahci"]`), so
 # this knob alone is sufficient; pairing it with UNAOS_AHCI is harmless and is how the flight lines
@@ -10588,7 +10588,7 @@ test_zenbook() {
     local secs="${1:-180}"
     if [ -z "${UNAOS_ZENBOOKLANE:-}" ]; then
         local _zk="" _zv
-        for _zv in $(compgen -e); do case "$_zv" in UNAOS_QEMU_MACHINE|UNAOS_QMP_PORT) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
+        for _zv in $(compgen -e); do case "$_zv" in UNAOS_QEMU_MACHINE|UNAOS_QMP_PORT|UNAOS_NVME_4K) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
         echo -e "${COLOR_CYAN}⚡ test-zenbook: line=scripts/image-line-zenbook.env (minus [media]) scrubbed=[${_zk# }] platform=zenbook_um5606w${COLOR_RESET}"
         set -a; . <(awk '!index($0, "# [media]")' "$WORKSPACE_DIR/scripts/image-line-zenbook.env") || exit 1; set +a
         exec env UNAOS_ZENBOOKLANE=1 UNAOS_PLATFORM=zenbook_um5606w UNAOS_CENSUS=1 UNAOS_USBSERIAL=1 "$0" test-zenbook "$secs"

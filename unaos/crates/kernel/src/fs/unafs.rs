@@ -185,7 +185,7 @@ fn handle_read(
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::read_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::read_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::read_block_ahci_port(port, lba, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => block::read_block_nvme(lba, buf), // UNAFSX86
+        block::BlockHandle::SdMmc => block::read_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::read_block_ahci_port(port, lba, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => block::read_sector_nvme(lba, buf), // UNAFSX86
     }
 }
 
@@ -199,7 +199,7 @@ fn handle_write(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), 
         #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
         block::BlockHandle::Sdhc => block::write_block_sdhc(lba, buf),
         #[cfg(all(target_arch = "aarch64", feature = "tegra", feature = "sdmmc"))]
-        block::BlockHandle::SdMmc => block::write_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::write_block_ahci_port(port, lba, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => block::write_block_nvme(lba, buf), // UNAFSX86: refuses unless ahci-write's grant path — the twin of the read arm
+        block::BlockHandle::SdMmc => block::write_block_tegra_sd(lba, buf), #[cfg(all(target_arch = "x86_64", feature = "ahci"))] block::BlockHandle::Ahci { port } => block::write_block_ahci_port(port, lba, buf), #[cfg(all(target_arch = "x86_64", feature = "nvme"))] block::BlockHandle::Nvme => block::write_sector_nvme(lba, buf), // UNAFSX86: refuses unless ahci-write's grant path — the twin of the read arm
     }
 }
 
@@ -230,7 +230,7 @@ impl SdSectorDevice {
     /// clobbered by another device's enumeration, so its own row is already the right answer and it
     /// takes no override.
     pub fn open_on(handle: block::BlockHandle) -> Result<Self, MountError> {
-        let dev = handle_info(handle).ok_or(MountError::NoStorage)?;
+        let dev = handle_info(handle).ok_or(MountError::NoStorage)?; #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == block::BlockHandle::Nvme && dev.block_size != 512 { return nvme_lba_open(&dev); } // NVME4KN (zenbook-ledger Z31): a non-512 namespace as the 512 B sector view (body at the file tail; LINE-NEUTRAL fold)
         if dev.block_size != 512 {
             return Err(MountError::BadSectorSize(dev.block_size));
         }
@@ -423,7 +423,7 @@ pub fn locate() -> Result<PartitionSpan, MountError> {
 /// probe and the bound the span is checked against all come off the same disk. That is the property
 /// [`locate`] used to get only by luck of the ambient backend agreeing with the ambient registry.
 pub fn locate_on(handle: block::BlockHandle) -> Result<PartitionSpan, MountError> {
-    let mut dev = SdSectorDevice::open_on(handle)?;
+    let mut dev = SdSectorDevice::open_on(handle)?; #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == block::BlockHandle::Nvme && block::nvme_sector_shift().unwrap_or(0) > 0 { return nvme_lba_locate(&mut dev); } // NVME4KN (zenbook-ledger Z31): the 4Kn GPT through amber_core (body at the file tail; LINE-NEUTRAL fold)
     locate_unafs(&mut dev)
         .map_err(MountError::Part)?
         .ok_or(MountError::NoVolume)
@@ -2847,7 +2847,7 @@ fn handle_read_multi(handle: block::BlockHandle, lba: u64, buf: &mut [u8]) -> Re
 fn handle_write_multi(handle: block::BlockHandle, lba: u64, buf: &[u8]) -> Result<(), SectorError> {
     if buf.len() % 512 != 0 {
         return Err(SectorError::Io(format!("write span {} not whole sectors", buf.len())));
-    } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == block::BlockHandle::Nvme { return block::write_blocks_nvme(lba, buf).map_err(|e| map_block_err(lba, e)); } // NVMEBATCH (zenbook-ledger Z22): a 4 KiB block is ONE granted run on the NVMe (one WRITE, one read-back), never eight 512 B writes (LINE-NEUTRAL fold, before this comment)
+    } #[cfg(all(target_arch = "x86_64", feature = "nvme"))] if handle == block::BlockHandle::Nvme { return block::write_sectors_nvme(lba, buf).map_err(|e| map_block_err(lba, e)); } // NVMEBATCH (zenbook-ledger Z22): a 4 KiB block is ONE granted run on the NVMe (one WRITE, one read-back), never eight 512 B writes (LINE-NEUTRAL fold, before this comment)
     #[cfg(all(target_arch = "x86_64", feature = "sdhcblk"))]
     if let block::BlockHandle::Sdhc = handle {
         let per = block::MAX_BLOCKS_PER_OP * 512;
@@ -4976,7 +4976,7 @@ fn bind_dead_task(_: usize) {
 //   is this function for `Ahci { port }`).
 
 /// NVMEBOOT: the negative answer, cached (DONGLEBOOT B658's idea): the namespace was read and carries no UnaFS
-/// volume, or its LBA size is not 512. Never set on an I/O error, nor while no namespace is published.
+/// volume (NVME4KN Z31: any LBA size 512..4096 is served). Never set on an I/O error, nor while no namespace is published.
 #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
 static NVME_ROOT_NONE: AtomicBool = AtomicBool::new(false);
 
@@ -5002,11 +5002,11 @@ pub fn ensure_nvme_root_grant() -> bool {
         }
         Err(_) => return false,
     };
-    // A UnaFS block is 8 sectors (4 KiB over 512 B LBAs — `open_on` refused any other size above).
-    let Some(last) = span.block_count.checked_mul(8).and_then(|n| span.base_lba.checked_add(n)).and_then(|e| e.checked_sub(1)) else {
+    // A UnaFS block is 8 view sectors; the grant is in the namespace's OWN LBAs (NVME4KN Z31: `nvme_grant_lbas`, file tail).
+    let Some((first, last)) = nvme_grant_lbas(&span) else {
         return false;
     };
-    if !nvme_root_one(&span) { return false; } block::hold_nvme_root_grant(span.base_lba, last) // NVMEROOTONE (zenbook-ledger Z22): a namespace with a second UnaFS volume gets no grant (body at the file tail; LINE-NEUTRAL fold)
+    if !nvme_root_one(&span) { return false; } block::hold_nvme_root_grant(first, last) // NVMEROOTONE (zenbook-ledger Z22): a namespace with a second UnaFS volume gets no grant (body at the file tail; LINE-NEUTRAL fold)
 }
 
 /// NVMEBOOT: make the shared UnaFS mount ride `want` — drop a mount bound elsewhere (an earlier lazy bind),
@@ -5061,7 +5061,7 @@ impl SectorDevice for HideVolume<'_> {
 /// the wire and cached in `NVME_ROOT_NONE` (a content verdict, as NoVolume is); an I/O error is `false`, never cached.
 #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
 fn nvme_root_one(span: &PartitionSpan) -> bool {
-    let Ok(mut dev) = SdSectorDevice::open_on(block::BlockHandle::Nvme) else { return false };
+    let Ok(mut dev) = SdSectorDevice::open_on(block::BlockHandle::Nvme) else { return false }; if block::nvme_sector_shift().unwrap_or(0) > 0 { return nvme_lba_one(&mut dev, span); } // NVME4KN (zenbook-ledger Z31): the 4Kn namespace counts its volumes from the same list it located from (LINE-NEUTRAL fold)
     let mut view = HideVolume { dev: &mut dev, at: span.base_lba };
     match locate_unafs(&mut view) {
         Ok(None) => true,
@@ -5085,12 +5085,7 @@ fn nvme_root_one(span: &PartitionSpan) -> bool {
 /// NVMEBATCHREAD: `buf.len() / 512` consecutive sectors from `lba` on the NVMe — the Sdhc arm's shape.
 #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
 fn nvme_read_multi(lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
-    let per = block::MAX_BLOCKS_PER_OP * 512;
-    for (i, c) in buf.chunks_mut(per).enumerate() {
-        let at = lba + (i * block::MAX_BLOCKS_PER_OP) as u64;
-        block::read_blocks_nvme(at, c).map_err(|e| map_block_err(at, e))?;
-    }
-    Ok(())
+    block::read_sectors_nvme(lba, buf).map_err(|e| map_block_err(lba, e)) // NVME4KN (Z31): the block layer's sector view chunks by MAX_BLOCKS_PER_OP and maps to the namespace's LBAs
 }
 
 /// NVMEBATCHREAD: `tests nvme`'s `rpath` leg — read `out.len() / 512` sectors at `lba` through a FRESH mount-shaped
@@ -5099,7 +5094,89 @@ fn nvme_read_multi(lba: u64, buf: &mut [u8]) -> Result<(), SectorError> {
 #[cfg(all(target_arch = "x86_64", feature = "nvme"))]
 pub fn nvme_read_leg(lba: u64, out: &mut [u8]) -> bool {
     match SdSectorDevice::open_on(block::BlockHandle::Nvme) {
-        Ok(mut dev) => dev.ra.window_sectors() > 1 && dev.read_sectors(lba, out).is_ok(),
+        Ok(mut dev) => dev.ra.window_sectors() > 1 && dev.read_sectors(lba << block::nvme_sector_shift().unwrap_or(0), out).is_ok(), // NVME4KN (Z31): the caller passes a namespace LBA; the device addresses 512 B view sectors
         Err(_) => false,
     }
+}
+
+// =================================================================================================
+// NVME4KN (zenbook-ledger Z31) — a UnaFS volume on a namespace whose LBA is not 512 B (4Kn).
+// TAIL-APPENDED; the calls are LINE-NEUTRAL folds in `open_on`, `locate_on` and `nvme_root_one`, and in-place token
+// edits on the already-cfg'd Nvme arms. `SdSectorDevice` keeps its 512 B sector space on every handle (the crate's
+// unit: `PartitionSpan.base_lba`, the RaSet window, `drivers::nvme::xfer_sectors`); on the NVMe it is the block layer's
+// sector view (`block::read_sectors_nvme` / `write_sectors_nvme`, block.rs tail), LBA = sector >> k. The crate's
+// `parse_gpt` reads a 512 B GPT only, so a k > 0 namespace is located through THE GPT reader, amber_core's
+// `gpt::read_table_with`, over native LBAs, each entry magic-probed by the crate's own `BlockAdapter::read_block`
+// (NVME4KN-CRATE owed: the crate's parser taking the LBA size retires this loop).
+// =================================================================================================
+
+/// NVME4KN: the NVMe namespace as a 512 B sector view (`num_blocks << k` sectors).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_lba_open(dev: &block::BlockDeviceInfo) -> Result<SdSectorDevice, MountError> {
+    let k = block::nvme_sector_shift().ok_or(MountError::BadSectorSize(dev.block_size))?;
+    let sectors = dev.num_blocks.checked_shl(k).ok_or(MountError::BadSectorSize(dev.block_size))?;
+    Ok(SdSectorDevice { handle: block::BlockHandle::Nvme, sectors, ra: RaSet::new(ra_window(block::BlockHandle::Nvme)) })
+}
+
+/// NVME4KN: every UnaFS volume on a k > 0 namespace, in GPT entry order, as 512 B view spans.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_lba_spans(dev: &mut SdSectorDevice) -> Result<Vec<PartitionSpan>, MountError> {
+    let k = block::nvme_sector_shift().ok_or(MountError::NoStorage)?;
+    let total = dev.sectors >> k;
+    let table = amber_core::gpt::read_table_with(total, |lba, buf: &mut [u8]| block::read_sectors_nvme(lba << k, buf).is_ok())
+        .map_err(|e| match e {
+            amber_core::gpt::GptError::Io => MountError::Part(PartError::Device(SectorError::Io(String::from("NVME4KN: GPT read failed")))),
+            _ => MountError::Part(PartError::Malformed("NVME4KN: no valid GPT at LBA 1")),
+        })?;
+    let mut out = Vec::new();
+    for (_slot, e) in table.entries.iter() {
+        let Some(base) = e.first_lba.checked_shl(k) else { continue };
+        let Some(sectors) = e.last_lba.checked_sub(e.first_lba).and_then(|d| d.checked_add(1)).and_then(|n| n.checked_shl(k)) else { continue };
+        let block_count = sectors / ::unafs::adapter::SECTORS_PER_BLOCK;
+        if block_count == 0 {
+            continue;
+        }
+        let mut adapter = BlockAdapter::new(&mut *dev, base, block_count);
+        let mut b = alloc::vec![0u8; ::unafs::BLOCK_SIZE as usize];
+        if adapter.read_block(0, &mut b).is_ok() && b[..::unafs::superblock::MAGIC.len()] == ::unafs::superblock::MAGIC {
+            out.push(PartitionSpan { base_lba: base, block_count });
+        }
+    }
+    Ok(out)
+}
+
+/// NVME4KN: `locate_on(Nvme)` on a k > 0 namespace — the first UnaFS volume.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_lba_locate(dev: &mut SdSectorDevice) -> Result<PartitionSpan, MountError> {
+    nvme_lba_spans(dev)?.first().copied().ok_or(MountError::NoVolume)
+}
+
+/// NVME4KN: NVMEROOTONE on a k > 0 namespace — `true` when the list `nvme_lba_locate` took `span` from holds no other
+/// volume; a second one is refused on the same wire line and cached, an I/O error is `false`, never cached.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_lba_one(dev: &mut SdSectorDevice, span: &PartitionSpan) -> bool {
+    match nvme_lba_spans(dev) {
+        Ok(v) => match v.iter().find(|s| s.base_lba != span.base_lba) {
+            None => true,
+            Some(second) => {
+                serial_println!("[nvme] root grant refused why=two-volumes first={} second={}", span.base_lba, second.base_lba);
+                NVME_ROOT_NONE.store(true, Ordering::Release);
+                false
+            }
+        },
+        Err(_) => false,
+    }
+}
+
+/// NVME4KN: the NVMe root grant for `span` in the namespace's OWN LBAs, inclusive: `base >> k` ..
+/// `+ (block_count << (3 - k)) - 1`. On a 512 B namespace (k = 0) this is NVMEBOOT's `base .. base + blocks*8 - 1`.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+fn nvme_grant_lbas(span: &PartitionSpan) -> Option<(u64, u64)> {
+    let k = block::nvme_sector_shift()?;
+    if span.base_lba & ((1u64 << k) - 1) != 0 {
+        return None;
+    }
+    let first = span.base_lba >> k;
+    let last = span.block_count.checked_shl(3 - k).and_then(|n| first.checked_add(n)).and_then(|e| e.checked_sub(1))?;
+    Some((first, last))
 }
