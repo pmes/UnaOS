@@ -34,7 +34,7 @@ use std::time::Duration;
 use bandy::{SMessage, Synapse};
 pub use text_host::line::PixelOrder;
 use text_host::line::TextStyle;
-use timeline_core::{Clip, EditError, Kind, Timeline, edl};
+use timeline_core::{Clip, EditError, Kind, Timeline, Transition, TransitionKind, WipeDir, edl};
 
 use crate::nle::{RenderError, RenderSink, Sources, render, synth_source};
 
@@ -288,6 +288,7 @@ pub fn paint_in(st: &EditorState, l: Layout, order: PixelOrder, labels: Option<&
         c.rect(x0, y0 + 2, x0 + HANDLE_W, y1 - 2, HANDLE);
         c.rect(x1 - HANDLE_W, y0 + 2, x1, y1 - 2, HANDLE);
     }
+    paint_transitions(&mut c, l, st);
     // The playhead, through the ruler and the tracks.
     let px = l.x_of(st.playhead);
     c.rect(px, ry, px + 1, h as i64, PLAYHEAD);
@@ -373,13 +374,15 @@ pub struct Face {
     wheel: f64,
     /// A wheel zoom's anchored view: `(t0, the playhead it was anchored at)`.
     view: Option<(i64, i64)>,
+    /// NLE3d (SR302): the selected transition's thumbnail, keyed `(track, idx, dur, at)` (rendered once per change).
+    trans_still: Option<((usize, usize, i64, i64), Option<Still>)>,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None }
+        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -413,6 +416,7 @@ impl Face {
     }
     /// A transport verb ([`VERBS`]); false for any other word.
     pub fn verb(&mut self, v: &str) -> bool {
+        if let Some(r) = self.transition_verb(v) { return r; }
         let st = &mut self.state;
         let r = match v {
             "play" => {
@@ -461,6 +465,7 @@ impl Face {
     /// A click on the surface (buffer pixels): the ruler scrubs, a clip is selected and scrubbed to, an empty track
     /// spot scrubs and deselects.
     fn click(&mut self, x: f64, y: f64) -> bool {
+        if let Some(r) = self.pick_transition(x, y) { return r; }
         let l = self.layout();
         match l.hit(&self.state.timeline, x, y) {
             Hit::Ruler(t) => self.state.seek(t),
@@ -504,7 +509,7 @@ impl Face {
             }
         };
         let px = paint_in(st, l, self.order, self.labels.as_ref(), self.still.as_ref());
-        paint_drag(px, l, self.order, self.drag.as_ref())
+        paint_drag(self.paint_transition_still(px, l), l, self.order, self.drag.as_ref())
     }
     /// The canvas as the surface's blit.
     pub fn frame(&mut self) -> SMessage {
@@ -579,6 +584,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Right", "nudge+"),
     ("\u{f702}", "nudge-"),
     ("\u{f703}", "nudge+"),
+    ("[", "["),
+    ("]", "]"),
 ];
 /// The wheel delta one zoom step takes (the AppKit surface sends 3 per notch).
 pub const WHEEL_STEP: f64 = 3.0;
@@ -776,6 +783,7 @@ impl Face {
     fn press(&mut self, x: f64, y: f64, mods: u8) -> bool {
         self.buttons = true;
         self.pointer = Some((x, y));
+        if let Some(r) = self.pick_transition(x, y) { return r; }
         let l = self.layout();
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
@@ -1026,6 +1034,172 @@ fn paint_drag(px: Vec<u8>, l: Layout, order: PixelOrder, drag: Option<&Drag>) ->
         c.frame(x0, y0, x1, y1, MARQUEE);
     }
     c.px
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------
+// THE TRANSITION WIDGET (NLE3d, LEDGER SR302)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// The widget's height (px): a band at the foot of the track row.
+pub const TRANS_H: i64 = 10;
+/// The narrowest widget (px), so a short transition at a low zoom stays clickable.
+pub const TRANS_MIN_W: i64 = 8;
+/// The selected transition's thumbnail box (px), above its row.
+pub const THUMB_W: i64 = 48;
+pub const THUMB_H: i64 = 36;
+const TRANS: [u8; 4] = [0xe0, 0x90, 0xff, 255];
+const TRANS_FILL: [u8; 4] = [0x50, 0x30, 0x70, 255];
+/// The kind glyphs, 7x7 (bit 6 the leftmost column): D, W001, W002, W041, W101, W201.
+const GLYPHS: [[u8; 7]; 6] = [
+    [0x41, 0x22, 0x14, 0x08, 0x14, 0x22, 0x41],
+    [0x70, 0x70, 0x70, 0x70, 0x70, 0x70, 0x70],
+    [0x7f, 0x7f, 0x7f, 0x00, 0x00, 0x00, 0x00],
+    [0x7f, 0x7e, 0x7c, 0x78, 0x70, 0x60, 0x40],
+    [0x7f, 0x41, 0x5d, 0x55, 0x5d, 0x41, 0x7f],
+    [0x1c, 0x2a, 0x49, 0x4f, 0x41, 0x22, 0x1c],
+];
+
+fn glyph(kind: TransitionKind) -> &'static [u8; 7] {
+    &GLYPHS[match kind {
+        TransitionKind::Dissolve => 0,
+        TransitionKind::Wipe(WipeDir::LeftToRight) => 1,
+        TransitionKind::Wipe(WipeDir::TopToBottom) => 2,
+        TransitionKind::Wipe(WipeDir::Diagonal) => 3,
+        TransitionKind::Wipe(WipeDir::Box) => 4,
+        TransitionKind::Wipe(WipeDir::Clock) => 5,
+    }]
+}
+
+impl Layout {
+    /// THE widget geometry, read by [`paint`] and [`Layout::transition_at`]: a bracket spanning the transition's `dur`
+    /// ticks from its cut (`x_of(at)..x_of(at + dur)`, at least [`TRANS_MIN_W`] wide) in the foot band of row `row`.
+    pub fn transition_rect(&self, row: usize, x: &Transition) -> (i64, i64, i64, i64) {
+        let x0 = self.x_of(x.at);
+        let x1 = self.x_of(x.at + x.dur).max(x0 + TRANS_MIN_W);
+        let y1 = self.row_y(row) + ROW_H as i64 - 2;
+        (x0, y1 - TRANS_H, x1, y1)
+    }
+    /// The transition whose widget is under `(x, y)`: `(track, index)` (the last drawn wins).
+    pub fn transition_at(&self, tl: &Timeline, x: f64, y: f64) -> Option<(usize, usize)> {
+        let mut hit = None;
+        for (row, tr) in tl.tracks.iter().enumerate().take(self.rows) {
+            for (i, t) in tr.transitions.iter().enumerate() {
+                let (x0, y0, x1, y1) = self.transition_rect(row, t);
+                if x >= x0 as f64 && x < x1 as f64 && y >= y0 as f64 && y < y1 as f64 {
+                    hit = Some((row, i));
+                }
+            }
+        }
+        hit
+    }
+    /// The thumbnail box `(x0, y0)` ([`THUMB_W`] x [`THUMB_H`]): above row `row`, at the widget's left, kept on the canvas.
+    pub fn transition_thumb(&self, row: usize, x: &Transition) -> (i64, i64) {
+        let x0 = self.x_of(x.at).min((self.w as i64 - THUMB_W).max(0)).max(0);
+        (x0, (self.row_y(row) - THUMB_H).max(0))
+    }
+}
+
+/// The tick a transition's preview shows: its midpoint, `at + dur / 2`.
+pub fn transition_mid(x: &Transition) -> i64 {
+    x.at + x.dur / 2
+}
+
+/// Every transition's widget: the bracket (outlined white when selected), its kind glyph and, from black, a black
+/// marker on its outgoing (left) edge.
+fn paint_transitions(c: &mut Canvas, l: Layout, st: &EditorState) {
+    for (row, tr) in st.timeline.tracks.iter().enumerate().take(l.rows) {
+        for (i, x) in tr.transitions.iter().enumerate() {
+            let (x0, y0, x1, y1) = l.transition_rect(row, x);
+            if x1 <= 0 || x0 >= l.w as i64 {
+                continue;
+            }
+            c.rect(x0, y0, x1, y1, TRANS_FILL);
+            c.frame(x0, y0, x1, y1, if st.transition == Some((row, i)) { SELECT } else { TRANS });
+            let gx = if x.from_black {
+                c.rect(x0 + 1, y0 + 1, (x0 + 4).min(x1 - 1), y1 - 1, FIELD);
+                x0 + 5
+            } else {
+                x0 + 2
+            };
+            for (dy, bits) in glyph(x.kind).iter().enumerate() {
+                for dx in 0..7i64 {
+                    if bits & (0x40 >> dx) != 0 && gx + dx < x1 - 1 {
+                        let (px, py) = (gx + dx, y0 + 2 + dy as i64);
+                        c.rect(px, py, px + 1, py + 1, TRANS);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Face {
+    /// A press or click on a transition's widget selects it (any live drag dropped, none begun): `Some(true)`. Anywhere
+    /// else the transition selection goes and the press / click is the clip face's (`None`).
+    fn pick_transition(&mut self, x: f64, y: f64) -> Option<bool> {
+        let l = self.layout();
+        match l.transition_at(&self.state.timeline, x, y) {
+            Some((t, i)) => {
+                self.drag = None;
+                if let Err(e) = self.state.select_transition(t, i) {
+                    self.last_error = Some(format!("transition: {e}"));
+                }
+                Some(true)
+            }
+            None => {
+                self.state.transition = None;
+                None
+            }
+        }
+    }
+    /// With a transition selected: "delete" removes it, "[" / "]" shorten / lengthen it by one tick. `None` for any other
+    /// verb, or with no transition selected.
+    fn transition_verb(&mut self, v: &str) -> Option<bool> {
+        let x = self.state.selected_transition()?;
+        let r = match v {
+            "delete" => self.state.remove_selected_transition(),
+            "[" => self.state.set_transition_dur(x.dur - 1),
+            "]" => self.state.set_transition_dur(x.dur + 1),
+            _ => return None,
+        };
+        if let Err(e) = r {
+            self.last_error = Some(format!("{v}: {e}"));
+        }
+        Some(true)
+    }
+    /// The selected transition's thumbnail over the painted canvas: ONE tick at its midpoint through [`preview`],
+    /// rendered only when `(track, idx, dur, at)` changed, blitted framed into [`Layout::transition_thumb`].
+    fn paint_transition_still(&mut self, px: Vec<u8>, l: Layout) -> Vec<u8> {
+        let (Some(key), Some(x)) = (self.transition_key(), self.state.selected_transition()) else { return px };
+        if self.trans_still.as_ref().map(|c| c.0) != Some(key) {
+            let s = match preview(&self.state.timeline, &self.sources, transition_mid(&x)) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.last_error = Some(format!("transition preview: {e}"));
+                    None
+                }
+            };
+            self.trans_still = Some((key, s));
+        }
+        let Some(s) = self.trans_still.as_ref().and_then(|c| c.1.as_ref()) else { return px };
+        let (x0, y0) = l.transition_thumb(key.0, &x);
+        let mut c = Canvas { w: l.w, h: l.h, order: self.order, px };
+        c.rect(x0, y0, x0 + THUMB_W, y0 + THUMB_H, FIELD);
+        c.blit_fit(s, x0 as u32 + 1, y0 as u32 + 1, THUMB_W as u32 - 2, THUMB_H as u32 - 2);
+        c.frame(x0, y0, x0 + THUMB_W, y0 + THUMB_H, TRANS);
+        c.px
+    }
+    /// The selected transition's thumbnail (the last [`Face::frame`]'s).
+    pub fn transition_still(&self) -> Option<&Still> {
+        self.trans_still.as_ref().filter(|c| Some(c.0) == self.transition_key()).and_then(|c| c.1.as_ref())
+    }
+    /// The thumbnail's cache key: the selected transition's `(track, idx, dur, at)`.
+    pub fn transition_key(&self) -> Option<(usize, usize, i64, i64)> {
+        let (t, i) = self.state.transition?;
+        let x = self.state.selected_transition()?;
+        Some((t, i, x.dur, x.at))
+    }
 }
 
 #[cfg(test)]
@@ -1562,4 +1736,147 @@ mod tests {
 
     /// `nle2c_two_clip_selection_golden`'s hash, measured by the test's first run (FNV-1a 64 of the 320x160 RGBA paint).
     const GOLDEN_SET: &str = "b274098fed21524f";
+
+    /// NLE3d: the fixture with a dissolve on V1's cut at 10 (A[13,23)@0 -> B[0,10)@10), 4 ticks.
+    fn dissolve_face() -> Face {
+        let (mut st, src) = state();
+        st.timeline = st.timeline.add_transition(0, 10, TransitionKind::Dissolve, 4).unwrap();
+        Face::new(st, src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    /// NLE3d M1: the widget is hit exactly where `transition_rect` draws it (x 80..112, the foot band y 108..118 of
+    /// row 0 at zoom 8), widened to `TRANS_MIN_W` at zoom 1.
+    #[test]
+    fn nle3d_hit_reads_the_widget_geometry() {
+        let face = dissolve_face();
+        let (l, tl) = (face.layout(), &face.state.timeline);
+        assert_eq!(l.transition_rect(0, &tl.tracks[0].transitions[0]), (80, 108, 112, 118));
+        assert_eq!(l.transition_at(tl, 96.0, 113.0), Some((0, 0)));
+        assert_eq!(l.transition_at(tl, 80.0, 108.0), Some((0, 0)));
+        assert_eq!(l.transition_at(tl, 96.0, 100.0), None, "above the band is the clip");
+        assert_eq!(l.transition_at(tl, 79.0, 113.0), None);
+        assert_eq!(l.transition_at(tl, 112.0, 113.0), None);
+        assert_eq!(l.transition_at(tl, 96.0, 153.0), None, "no transition on A1");
+        let mut st = face.state.clone();
+        st.zoom = 1;
+        let l1 = Layout::of(320, 160, &st);
+        assert_eq!(l1.transition_rect(0, &tl.tracks[0].transitions[0]), (10, 108, 18, 118));
+        assert_eq!(l1.transition_at(tl, 16.0, 113.0), Some((0, 0)));
+    }
+
+    /// NLE3d M1: a press + release on the widget selects the transition (the clips deselected, no drag); a press
+    /// elsewhere drops it; Delete is `remove_transition` by hand, ONE undoable edit.
+    #[test]
+    fn nle3d_click_selects_and_delete_removes() {
+        let mut face = dissolve_face();
+        let tl0 = face.state.timeline.clone();
+        face.state.select(0, 2).unwrap();
+        assert!(face.on(&btn(true, 96.0, 113.0)));
+        assert!(face.dragging().is_none());
+        assert!(face.on(&btn(false, 96.0, 113.0)));
+        assert_eq!((face.state.transition, face.state.selection, face.state.set.len()), (Some((0, 0)), None, 0));
+        assert_eq!(face.state.playhead, 0, "a widget click does not scrub");
+        // A click on a clip drops the transition selection.
+        assert!(face.on(&btn(true, 228.0, 100.0)));
+        assert!(face.on(&btn(false, 228.0, 100.0)));
+        assert_eq!((face.state.transition, face.state.selection), (None, Some((0, 2))));
+        // Select it again, then Delete (GTK's named key): the transition goes, the clips stay.
+        face.on(&btn(true, 96.0, 113.0));
+        face.on(&btn(false, 96.0, 113.0));
+        assert!(face.on(&SMessage::BrowserKey("Delete".into())));
+        assert_eq!(face.state.timeline, tl0.remove_transition(0, 10).unwrap());
+        assert_eq!((face.state.transition, face.state.undo_depth()), (None, 1));
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+        assert!(face.state.undo());
+        assert_eq!(face.state.timeline, tl0);
+    }
+
+    /// NLE3d M1: `]` / `[` (typed, as `BrowserText`) lengthen / shorten the selected transition by one tick through the
+    /// add op at the same `at`; a refused length (dur 0, past the incoming clip) leaves the state.
+    #[test]
+    fn nle3d_brackets_set_the_dur() {
+        let mut face = dissolve_face();
+        let tl0 = face.state.timeline.clone();
+        face.state.select_transition(0, 0).unwrap();
+        assert!(face.on(&SMessage::BrowserText("]".into())));
+        assert_eq!(face.state.timeline, tl0.add_transition(0, 10, TransitionKind::Dissolve, 5).unwrap());
+        assert_eq!(face.state.transition, Some((0, 0)));
+        assert!(face.verb("["));
+        assert!(face.verb("["));
+        assert_eq!(face.state.selected_transition().map(|x| x.dur), Some(3));
+        assert!(!face.on(&SMessage::BrowserKey("[".into())), "a one-character key is read from BrowserText only");
+        face.state.set_transition_dur(1).unwrap();
+        let before = face.state.clone();
+        assert!(face.verb("["));
+        assert_eq!(face.state, before);
+        assert!(face.last_error.take().is_some_and(|e| e.starts_with("[:")));
+        face.state.set_transition_dur(10).unwrap();
+        let before = face.state.clone();
+        assert!(face.verb("]"));
+        assert_eq!(face.state, before, "11 ticks is longer than B[0,10)");
+        assert_eq!(face.last_error.take(), Some(format!("]: {}", EditError::Handle)));
+        // From black: the length change keeps `from_black`.
+        let (mut st, _) = state();
+        st.timeline = st.timeline.add_transition_from_black(0, 0, TransitionKind::Wipe(WipeDir::Box), 3).unwrap();
+        st.select_transition(0, 0).unwrap();
+        st.set_transition_dur(4).unwrap();
+        assert_eq!(st.selected_transition().map(|x| (x.dur, x.from_black)), Some((4, true)));
+        // No transition selected (the plain fixture): the bracket keys are the buttons' in-point trim.
+        let (st, src) = state();
+        let mut plain = Face::new(st, src, (320, 160), PixelOrder::Rgba, false);
+        plain.state.select(0, 1).unwrap();
+        plain.on(&SMessage::BrowserText("]".into()));
+        assert_eq!(plain.state.selected().map(|c| c.src_in), Some(1));
+    }
+
+    /// NLE3d M2: the thumbnail is `preview` of the transition's mid tick, rendered once per `(track, idx, dur, at)`: a
+    /// repaint with the key unchanged keeps the cache (a planted still survives it), a length change re-renders.
+    #[test]
+    fn nle3d_thumbnail_cache_key() {
+        let mut face = dissolve_face();
+        face.frame();
+        assert_eq!((face.transition_key(), face.transition_still()), (None, None));
+        face.state.select_transition(0, 0).unwrap();
+        let SMessage::SurfaceBlit { pixels, .. } = face.frame() else { panic!("not a blit") };
+        assert_eq!(face.transition_key(), Some((0, 0, 4, 10)));
+        let want = preview(&face.state.timeline, &face.sources, 12).unwrap().expect("a frame at 12");
+        assert_eq!(face.transition_still(), Some(&want));
+        // The thumb box sits above row 0 at the widget's x: (80, 44), framed.
+        let at = |x: usize, y: usize| pixels[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4].to_vec();
+        assert_eq!(at(80, 44), TRANS.to_vec());
+        assert_eq!(at(127, 79), TRANS.to_vec());
+        let planted = Still { width: 1, height: 1, rgba: vec![9, 9, 9, 255] };
+        face.trans_still = Some(((0, 0, 4, 10), Some(planted.clone())));
+        face.frame();
+        assert_eq!(face.transition_still(), Some(&planted), "same key: no second render");
+        face.verb("]");
+        face.frame();
+        assert_eq!(face.transition_key(), Some((0, 0, 5, 10)));
+        let want = preview(&face.state.timeline, &face.sources, transition_mid(&face.state.selected_transition().unwrap()));
+        assert_eq!(face.transition_still(), want.unwrap().as_ref());
+        assert!(face.last_error.is_none(), "{:?}", face.last_error);
+    }
+
+    /// NLE3d M3: the painted widgets (a selected dissolve on the cut at 10, a from-black box wipe on A at 0); golden.
+    #[test]
+    fn nle3d_widget_paint_golden() {
+        let (mut st, _) = state();
+        let tl = st.timeline.add_transition(0, 10, TransitionKind::Dissolve, 4).unwrap();
+        st.timeline = tl.add_transition_from_black(0, 0, TransitionKind::Wipe(WipeDir::Box), 3).unwrap();
+        st.select_transition(0, 1).unwrap();
+        st.seek(15);
+        let rgba = paint(&st, 320, 160, PixelOrder::Rgba, None, None);
+        let at = |x: usize, y: usize| &rgba[(y * 320 + x) * 4..(y * 320 + x) * 4 + 4];
+        assert_eq!(at(96, 108), SELECT, "the selected widget's outline");
+        assert_eq!(at(100, 112), TRANS_FILL);
+        assert_eq!(at(82, 110), TRANS, "the dissolve glyph's corner");
+        assert_eq!(at(0, 108), TRANS, "the unselected widget's outline");
+        assert_eq!(at(2, 112), FIELD, "the from-black marker");
+        assert_eq!(at(5, 110), TRANS, "the box glyph after the marker");
+        assert_eq!(at(96, 100), clip_colour(1, Kind::Video), "the clip above the band");
+        assert_eq!(format!("{:016x}", fnv1a(&rgba)), GOLDEN_TRANSITIONS);
+    }
+
+    /// `nle3d_widget_paint_golden`'s hash, measured by the test's first run (FNV-1a 64 of the 320x160 RGBA paint).
+    const GOLDEN_TRANSITIONS: &str = "9b5278f1281cd494";
 }

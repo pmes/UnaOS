@@ -23,6 +23,8 @@
 //! `MOD_SHIFT` / `MOD_ALT` in the `mods` of every press the token sends (NLE2-MODS SR306, as both faces send them: add to
 //! the set / no snapping), `marquee:<x0>:<y0>:<x1>:<y1>` is a press, a move and the release, `key:Ctrl+a` /
 //! `key:Meta+a` is the `BrowserSelectAll` both faces send for it, and the JSON line ends with the set's size `set`.
+//! NLE3d (SR302): `transition:<track>:<idx>` clicks that transition's widget (selecting it; `delete`, `[` / `]` then edit
+//! it), and the JSON line ends with `transition` (the selected one and its thumbnail's size, or `null`).
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::TetraNode;
@@ -41,7 +43,7 @@ struct Cli {
     labels: bool,
 }
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -159,6 +161,11 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
             let (x, y) = l.point(row.parse().ok()?, num(t)?);
             SMessage::BrowserClick(x, y)
         }
+        ["transition", t, i] => {
+            let (t, i) = (t.parse::<usize>().ok()?, i.parse::<usize>().ok()?);
+            let (x0, y0, x1, y1) = l.transition_rect(t, face.state.timeline.tracks.get(t)?.transitions.get(i)?);
+            SMessage::BrowserClick((x0 + x1) as f64 / 2.0, (y0 + y1) as f64 / 2.0)
+        }
         ["ruler", t] => SMessage::BrowserClick(l.x_of(num(t)?) as f64 + 0.5, l.ruler_y as f64 + 1.0),
         ["press", x, y] => SMessage::BrowserButton { down: true, x: px(x)?, y: px(y)?, mods: 0 },
         ["move", x, y] => SMessage::BrowserMouseMove(px(x)?, px(y)?),
@@ -217,7 +224,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let clip = st.selected().map(|c| format!("\"{}:{}:{}\"", c.at, c.src_in, c.src_out)).unwrap_or_else(|| "null".into());
     let err = errors.join("; ").replace('"', "'");
     println!(
-        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{}}}",
+        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{}}}",
         st.playhead,
         st.timeline.tracks.len(),
         clips,
@@ -226,7 +233,8 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
         st.undo_depth(),
         st.zoom,
         nle_face::fnv1a(&pixels),
-        st.set.len()
+        st.set.len(),
+        transition_json(&face)
     );
     0
 }
@@ -327,4 +335,37 @@ mod tests {
         assert_eq!(face.state.set.len(), 6);
         assert_eq!(drive(&mut face, "shift:nope"), vec!["bad token shift:nope".to_string()]);
     }
+
+    /// NLE3d M3: `transition:T:I` clicks the widget (the transition selected), `]` / `key:[` change its length and
+    /// `delete` removes it, each the timeline_core op by hand; the JSON value names it and its thumbnail.
+    #[test]
+    fn nle3d_witness_transition_token() {
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 4).unwrap();
+        let mut face = Face::new(EditorState::new(tl0.clone()), src, (320, 160), PixelOrder::Rgba, false);
+        assert_eq!(transition_json(&face), "null");
+        let errors = drive(&mut face, "transition:0:0,]");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.timeline, tl0.add_transition(0, 10, timeline_core::TransitionKind::Dissolve, 5).unwrap());
+        face.frame();
+        assert_eq!(transition_json(&face), r#"{"track":0,"idx":0,"at":10,"dur":5,"kind":"D","from_black":false,"still":"64x48"}"#);
+        assert!(drive(&mut face, "key:[,key:[,delete").is_empty());
+        assert_eq!(face.state.timeline, tl0.remove_transition(0, 10).unwrap());
+        assert_eq!((transition_json(&face), face.state.undo_depth()), ("null".to_string(), 4));
+        assert_eq!(drive(&mut face, "transition:0:0"), vec!["bad token transition:0:0".to_string()]);
+    }
+}
+
+/// NLE3d (SR302): the witness's `transition` value: the selected transition and its thumbnail's size, or `null`.
+fn transition_json(face: &Face) -> String {
+    let (Some((t, i)), Some(x)) = (face.state.transition, face.state.selected_transition()) else { return "null".into() };
+    let kind = match x.kind {
+        timeline_core::TransitionKind::Dissolve => "D".to_string(),
+        timeline_core::TransitionKind::Wipe(d) => format!("W{:03}", d.code()),
+    };
+    let still = face.transition_still().map(|s| format!("\"{}x{}\"", s.width, s.height)).unwrap_or_else(|| "null".into());
+    format!(
+        "{{\"track\":{t},\"idx\":{i},\"at\":{},\"dur\":{},\"kind\":\"{kind}\",\"from_black\":{},\"still\":{still}}}",
+        x.at, x.dur, x.from_black
+    )
 }
