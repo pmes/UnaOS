@@ -27,7 +27,7 @@
 //! * NLE3b/NLE3c (LEDGER SR209): a video transition implies the audio crossfade on every audio track whose clips butt
 //!   at the same cut with the same sources ([`Timeline::audio_crossfade`]; `validate` refuses [`EditError::Handle`]
 //!   when the audio clips' handle is short); wipes gain SMPTE W041 / W101 / W201; a transition may come FROM black
-//!   ([`Transition::from_black`], [`Timeline::add_transition_from_black`], CMX's `BL` outgoing line).
+//!   ([`Transition::from_black`], [`Timeline::add_transition_from_black`], CMX's `BL` outgoing line); NLE3cBLACK (LEDGER SR323): or go TO black ([`Transition::to_black`], [`Timeline::add_transition_to_black`], CMX's `BL` incoming line: the outgoing's handle over black in the gap `at..at + dur`), and wipes gain W003-W006 / W021 / W022 / W042 / W202-W204.
 //! * Audio (NLE4, LEDGER SR203): a clip carries a gain in centi-dB ([`Clip::gain_cdb`], 0 = unity) and linear fades in
 //!   ticks ([`Clip::fade_in`], [`Clip::fade_out`], 0 = none; `fade_in + fade_out <= len`); [`Timeline::set_gain`] and
 //!   [`Timeline::set_fades`] edit them; [`schedule::audio_runs`] mixes every audio track.
@@ -140,6 +140,26 @@ pub enum WipeDir {
     Box,
     /// NLE3c `W201` (SMPTE 258M clockWipe clockwiseTwelve): a hand sweeping clockwise from twelve o'clock.
     Clock,
+    /// NLE3cBLACK `W003` (SMPTE 258M boxWipe topLeft): a box growing from the top-left corner (the incoming inside).
+    CornerTopLeft,
+    /// NLE3cBLACK `W004` (boxWipe topRight): a box growing from the top-right corner.
+    CornerTopRight,
+    /// NLE3cBLACK `W005` (boxWipe bottomRight): a box growing from the bottom-right corner.
+    CornerBottomRight,
+    /// NLE3cBLACK `W006` (boxWipe bottomLeft): a box growing from the bottom-left corner.
+    CornerBottomLeft,
+    /// NLE3cBLACK `W021` (barnDoorWipe vertical): two vertical edges opening from the centre column (the incoming between).
+    BarnDoorVertical,
+    /// NLE3cBLACK `W022` (barnDoorWipe horizontal): two horizontal edges opening from the centre row.
+    BarnDoorHorizontal,
+    /// NLE3cBLACK `W042` (diagonalWipe topRight): a diagonal edge from the top-right corner.
+    DiagonalTopRight,
+    /// NLE3cBLACK `W202` (clockWipe clockwiseThree): a hand sweeping clockwise from three o'clock.
+    ClockThree,
+    /// NLE3cBLACK `W203` (clockWipe clockwiseSix): from six o'clock.
+    ClockSix,
+    /// NLE3cBLACK `W204` (clockWipe clockwiseNine): from nine o'clock.
+    ClockNine,
 }
 
 impl WipeDir {
@@ -151,6 +171,16 @@ impl WipeDir {
             WipeDir::Diagonal => 41,
             WipeDir::Box => 101,
             WipeDir::Clock => 201,
+            WipeDir::CornerTopLeft => 3,
+            WipeDir::CornerTopRight => 4,
+            WipeDir::CornerBottomRight => 5,
+            WipeDir::CornerBottomLeft => 6,
+            WipeDir::BarnDoorVertical => 21,
+            WipeDir::BarnDoorHorizontal => 22,
+            WipeDir::DiagonalTopRight => 42,
+            WipeDir::ClockThree => 202,
+            WipeDir::ClockSix => 203,
+            WipeDir::ClockNine => 204,
         }
     }
     pub fn from_code(code: u16) -> Option<WipeDir> {
@@ -160,6 +190,16 @@ impl WipeDir {
             41 => Some(WipeDir::Diagonal),
             101 => Some(WipeDir::Box),
             201 => Some(WipeDir::Clock),
+            3 => Some(WipeDir::CornerTopLeft),
+            4 => Some(WipeDir::CornerTopRight),
+            5 => Some(WipeDir::CornerBottomRight),
+            6 => Some(WipeDir::CornerBottomLeft),
+            21 => Some(WipeDir::BarnDoorVertical),
+            22 => Some(WipeDir::BarnDoorHorizontal),
+            42 => Some(WipeDir::DiagonalTopRight),
+            202 => Some(WipeDir::ClockThree),
+            203 => Some(WipeDir::ClockSix),
+            204 => Some(WipeDir::ClockNine),
             _ => None,
         }
     }
@@ -182,6 +222,9 @@ pub struct Transition {
     pub dur: i64,
     /// NLE3c: the outgoing is BLACK (CMX `BL`): no clip ends at `at`, and the incoming fades / wipes in from black.
     pub from_black: bool,
+    /// NLE3cBLACK (SR323): the incoming is BLACK (CMX `BL` incoming line): no clip starts at `at`; the outgoing's handle
+    /// fades / wipes out to black over `at..at + dur`, the black filling that gap of the track. Never with `from_black`.
+    pub to_black: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +400,15 @@ impl Timeline {
             last = Some(x.at);
             let out = t.clips.iter().find(|c| c.end() == x.at);
             let inc = t.clips.iter().find(|c| c.at == x.at);
+            if x.to_black {
+                // NLE3cBLACK: to black: an outgoing clip, NO incoming one, its handle, and nothing starting inside the black.
+                let (Some(o), None, false) = (out, inc, x.from_black) else { return Err(EditError::Transition) };
+                let handle = self.source(o.src).ok_or(EditError::NoSource)?.duration - o.src_out;
+                if x.dur > handle || t.clips.iter().any(|c| c.at > x.at && c.at < x.at + x.dur) {
+                    return Err(EditError::Handle);
+                }
+                continue;
+            }
             if x.from_black {
                 // NLE3c: from black: an incoming clip and NO outgoing one (a cut with an outgoing is a plain transition).
                 let (None, Some(i)) = (out, inc) else { return Err(EditError::Transition) };
@@ -376,12 +428,12 @@ impl Timeline {
 
     /// NLE3: put a transition on the cut at tick `at` of `track` (replacing one already there).
     pub fn add_transition(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
-        self.put_transition(track, Transition { at, kind, dur, from_black: false })
+        self.put_transition(track, Transition { at, kind, dur, from_black: false, to_black: false })
     }
 
     /// NLE3c: put a transition FROM BLACK on the clip starting at tick `at` of `track` (no clip may end there).
     pub fn add_transition_from_black(&self, track: usize, at: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
-        self.put_transition(track, Transition { at, kind, dur, from_black: true })
+        self.put_transition(track, Transition { at, kind, dur, from_black: true, to_black: false })
     }
 
     /// The one body of the two `add_transition` ops: replace whatever sits at `x.at`, keep `at` order, validate.
@@ -604,6 +656,7 @@ impl Timeline {
             let clips = &self.tracks.get(k).ok_or(EditError::NoTrack)?.clips;
             let mut moved = Vec::with_capacity(bt.transitions.len());
             for x in &bt.transitions {
+                if x.to_black { moved.push(Transition { at: black_cut(bt, clips, x)?, ..*x }); continue; } // NLE3cBLACK
                 let inc = bt.clips.iter().find(|c| c.at == x.at).ok_or(EditError::Transition)?;
                 let out = bt.clips.iter().find(|c| c.end() == x.at);
                 let at = clips
@@ -665,6 +718,12 @@ impl Timeline {
         tl.validate()?;
         Ok(tl)
     }
+
+    /// NLE3cBLACK (LEDGER SR323): put a transition TO BLACK on the clip ending at tick `at_end` of `track` (no clip may
+    /// start there): ticks `at_end..at_end + dur` show the outgoing's handle mixed with black, in the track's gap.
+    pub fn add_transition_to_black(&self, track: usize, at_end: i64, kind: TransitionKind, dur: i64) -> Result<Timeline, EditError> {
+        self.put_transition(track, Transition { at: at_end, kind, dur, from_black: false, to_black: true })
+    }
 }
 
 fn clip_mut(tl: &mut Timeline, track: usize, idx: usize) -> Result<&mut Clip, EditError> {
@@ -713,4 +772,18 @@ fn picks_desc(tl: &Timeline, picks: &[(usize, usize)]) -> Result<Vec<(usize, usi
     v.sort_unstable_by(|a, b| b.cmp(a));
     v.dedup();
     Ok(v)
+}
+
+/// NLE3cBLACK (LEDGER SR323): where a transition TO black on track `bt` (before an op) sits after it, among the op's
+/// `clips`: its cut is known by the outgoing's `(src, src_out)` and by nothing starting at that clip's end. The match
+/// nearest the old tick wins (ties: the earlier); none is the cut gone, refused by name like `retarget_transitions`.
+fn black_cut(bt: &Track, clips: &[Clip], x: &Transition) -> Result<i64, EditError> {
+    let out = bt.clips.iter().find(|c| c.end() == x.at).ok_or(EditError::Transition)?;
+    clips
+        .iter()
+        .filter(|o| o.src == out.src && o.src_out == out.src_out)
+        .map(|o| o.end())
+        .filter(|&at| !clips.iter().any(|c| c.at == at))
+        .min_by_key(|&at| ((at - x.at).abs(), at))
+        .ok_or(EditError::Transition)
 }

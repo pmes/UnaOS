@@ -445,7 +445,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     let mut r = RenderReport::default();
     let mut afmt: Option<(u32, u16)> = None;
     for s in &steps {
-        let Some(src) = s.src else { continue };
+        let Some(src) = s.src.or(s.vmix.and_then(|m| m.src)) else { continue }; // NLE3cBLACK: a to-black step sizes by its outgoing
         let m = sources.get(src)?;
         match s.kind {
             Kind::Video if r.width == 0 => {
@@ -483,8 +483,11 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
     for s in &steps {
         match (s.kind, s.src) {
             (Kind::Video, None) => {
-                vmix_run = None;
-                sink.frame(s.out_t, w, h, &black);
+                vmix_take(s, &mut vid, &mut vmix_run); // NLE3cBLACK: a to-black tick takes the live outgoing run; a gap drops it
+                match s.vmix {
+                    Some(_) => sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &black, w, h, tol, &mut r)?),
+                    None => sink.frame(s.out_t, w, h, &black),
+                }
                 r.frames += 1;
             }
             (Kind::Video, Some(src)) => {
@@ -493,7 +496,7 @@ pub fn render(tl: &Timeline, range: std::ops::Range<i64>, sources: &Sources, sin
                 if f.width != w || f.height != h {
                     return Err(RenderError::Size { src, width: f.width, height: f.height });
                 }
-                sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &f, tol, &mut r)?);
+                sink.frame(s.out_t, w, h, &vmix_frame(tl, sources, s, &mut vmix_run, &f.to_rgba(), f.width, f.height, tol, &mut r)?);
                 r.frames += 1;
             }
             (Kind::Audio, _) => {
@@ -678,31 +681,33 @@ fn vmix_take(s: &timeline_core::schedule::Step, vid: &mut Option<Vid>, vmix_run:
     }
 }
 
-/// NLE3: the RGBA a video step shows: its own frame `f`, or inside a transition `f` mixed with the outgoing source's
-/// frame from `vmix_run`.
+/// NLE3: the RGBA a video step shows: its own RGBA `b` (`w x h`), or inside a transition `b` mixed with the outgoing
+/// source's frame from `vmix_run` (NLE3cBLACK: `b` is the gap's black for a transition to black).
 #[allow(clippy::too_many_arguments)]
 fn vmix_frame(
     tl: &Timeline,
     sources: &Sources,
     s: &timeline_core::schedule::Step,
     vmix_run: &mut Option<Vid>,
-    f: &Frame,
+    b: &[u8],
+    w: u32,
+    h: u32,
     tol: i64,
     r: &mut RenderReport,
 ) -> Result<Vec<u8>, RenderError> {
-    let Some(m) = s.vmix else { return Ok(f.to_rgba()) };
+    let Some(m) = s.vmix else { return Ok(b.to_vec()) };
     let a = match m.src {
         Some(src) => {
             let a = vid_frame(tl, sources, vmix_run, src, m.src_t, m.seek, tol, r)?;
-            if a.width != f.width || a.height != f.height {
+            if a.width != w || a.height != h {
                 return Err(RenderError::Size { src, width: a.width, height: a.height });
             }
             a.to_rgba()
         }
         // NLE3c: from black: the outgoing is opaque black (the gap's black).
-        None => [0u8, 0, 0, 255].repeat(f.width as usize * f.height as usize),
+        None => [0u8, 0, 0, 255].repeat(w as usize * h as usize),
     };
-    Ok(vmix_rgba(m.kind, m.t, &a, &f.to_rgba(), f.width, f.height))
+    Ok(vmix_rgba(m.kind, m.t, &a, b, w, h))
 }
 
 /// NLE3: the outgoing frame `a` and the incoming frame `b` (RGBA, `w x h`) mixed at the incoming's weight `t`.
@@ -731,7 +736,17 @@ fn vmix_rgba(kind: timeline_core::TransitionKind, t: timeline_core::schedule::Fr
                         // NLE3c: exact fractions of t = num / den.
                         WipeDir::Diagonal => (xi + yi) * den < (wi + hi) * num,
                         WipeDir::Box => (2 * xi + 1 - wi).abs() * den < wi * num && (2 * yi + 1 - hi).abs() * den < hi * num,
-                        WipeDir::Clock => clock_angle(x, y, w, h) < std::f64::consts::TAU * num as f64 / den as f64,
+                        WipeDir::Clock | WipeDir::ClockThree | WipeDir::ClockSix | WipeDir::ClockNine => {
+                            clock_from(dir, x, y, w, h) < std::f64::consts::TAU * num as f64 / den as f64
+                        }
+                        // NLE3cBLACK: the corner boxes (mirrored coordinates), barn doors and the top-right diagonal.
+                        WipeDir::CornerTopLeft => xi * den < wi * num && yi * den < hi * num,
+                        WipeDir::CornerTopRight => (wi - 1 - xi) * den < wi * num && yi * den < hi * num,
+                        WipeDir::CornerBottomRight => (wi - 1 - xi) * den < wi * num && (hi - 1 - yi) * den < hi * num,
+                        WipeDir::CornerBottomLeft => xi * den < wi * num && (hi - 1 - yi) * den < hi * num,
+                        WipeDir::BarnDoorVertical => (2 * xi + 1 - wi).abs() * den < wi * num,
+                        WipeDir::BarnDoorHorizontal => (2 * yi + 1 - hi).abs() * den < hi * num,
+                        WipeDir::DiagonalTopRight => (wi - 1 - xi + yi) * den < (wi + hi) * num,
                     };
                     if incoming {
                         let i = (y * w + x) * 4;
@@ -748,6 +763,19 @@ fn vmix_rgba(kind: timeline_core::TransitionKind, t: timeline_core::schedule::Fr
 fn clock_angle(x: usize, y: usize, w: usize, h: usize) -> f64 {
     let (dx, dy) = (x as f64 + 0.5 - w as f64 / 2.0, y as f64 + 0.5 - h as f64 / 2.0);
     dx.atan2(-dy).rem_euclid(std::f64::consts::TAU)
+}
+
+/// NLE3cBLACK (LEDGER SR323): pixel `(x, y)`'s clock angle measured from where `dir`'s hand starts (W201 twelve, W202
+/// three, W203 six, W204 nine o'clock), clockwise, in `[0, 2 pi)`; W201's is [`clock_angle`] itself.
+fn clock_from(dir: timeline_core::WipeDir, x: usize, y: usize, w: usize, h: usize) -> f64 {
+    use timeline_core::WipeDir;
+    let q = match dir {
+        WipeDir::ClockThree => 1.0,
+        WipeDir::ClockSix => 2.0,
+        WipeDir::ClockNine => 3.0,
+        _ => return clock_angle(x, y, w, h),
+    };
+    (clock_angle(x, y, w, h) - q * std::f64::consts::TAU / 4.0).rem_euclid(std::f64::consts::TAU)
 }
 
 /// EDITMAP (LEDGER SR223): a media file as its own timeline.

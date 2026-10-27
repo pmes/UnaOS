@@ -23,7 +23,9 @@
 //! previous step's source position: the outgoing run decodes on past its out point), and the incoming's weight
 //! `t = (k + 1) / (dur + 1)` (never 0 or 1). The step's own `src` / `src_t` / `seek` stay the incoming clip's, which
 //! seeks at the cut as a plain cut does. NLE3c (SR209): a transition from black names no outgoing source
-//! (`VideoMix::src` `None`: opaque black, no seek).
+//! (`VideoMix::src` `None`: opaque black, no seek). NLE3cBLACK (SR323): a transition TO black owns its track's gap
+//! `at..at + dur` (that track wins those ticks): the step's own `src` is `None` (the incoming is black) and its
+//! `VideoMix` names the outgoing at its handle, continuing the outgoing's run (no seek at the cut).
 //!
 //! Audio crossfades (NLE3b, LEDGER SR209): on an audio cut paired with a video transition
 //! ([`crate::Timeline::audio_crossfade`]) a run breaks at `at` and `at + dur`, and inside that span the track gives TWO
@@ -121,8 +123,10 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
     let mut run = runs.iter().peekable();
     for t in range.clone() {
         if video {
-            let step = match top(tl, Kind::Video, t) {
-                Some((ti, ci)) => {
+            let win = top(tl, Kind::Video, t);
+            let step = match (black_over(tl, t, win.map(|w| w.0)), win) {
+                (Some((ti, x)), _) => black_step(tl, idx, ti, &x, t, &mut v_next, &mut m_next)?,
+                (None, Some((ti, ci))) => {
                     let c = tl.tracks[ti].clips[ci];
                     let src_t = c.src_in + (t - c.at);
                     let vmix = vmix_for(tl, idx, ti, ci, t, v_next, &mut m_next)?;
@@ -130,7 +134,7 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
                     v_next = Some((c.src, src_t + 1));
                     Step { kind: Kind::Video, track: Some(ti), src: Some(c.src), src_t, out_t: t, len: 1, seek, vmix }
                 }
-                None => {
+                (None, None) => {
                     (v_next, m_next) = (None, None);
                     Step { kind: Kind::Video, track: None, src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: None }
                 }
@@ -358,4 +362,37 @@ fn under_layer(
     let tail = env_q16(o, o.end()) as i64;
     let fall = |e: i64| ((ENV_ONE as i64 - ramp_q16(x, e) as i64) * tail / ENV_ONE as i64) as u32;
     Ok(Layer { track: ti, src: o.src, src_t, seek, gain_cdb: o.gain_cdb, env: [fall(t), fall(end)] })
+}
+
+/// NLE3cBLACK (LEDGER SR323): the highest video track above the clip winner's (`above`; any when `None`) whose
+/// transition TO black spans tick `t`, with that transition.
+fn black_over(tl: &Timeline, t: i64, above: Option<usize>) -> Option<(usize, crate::Transition)> {
+    tl.tracks
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(i, tr)| tr.kind == Kind::Video && above.is_none_or(|a| *i > a))
+        .find_map(|(i, tr)| tr.transitions.iter().find(|x| x.to_black && x.at <= t && t < x.at + x.dur).map(|x| (i, *x)))
+}
+
+/// NLE3cBLACK: the video step at tick `t` of the transition to black `x` on track `ti`: black as its own picture
+/// (`src` `None`) under a [`VideoMix`] of the outgoing at its handle `src_out + k`, the incoming (black) weighted
+/// `(k + 1) / (dur + 1)`. The outgoing's run continues the previous video step at the cut (`v_next`), then itself.
+fn black_step(
+    tl: &Timeline,
+    idx: &dyn SourceIndex,
+    ti: usize,
+    x: &crate::Transition,
+    t: i64,
+    v_next: &mut Option<(SourceId, i64)>,
+    m_next: &mut Option<(SourceId, i64)>,
+) -> Result<Step, ScheduleError> {
+    // validate: the outgoing clip ends at the cut.
+    let o = *tl.tracks[ti].clips.iter().find(|c| c.end() == x.at).ok_or(ScheduleError::Invalid(EditError::Transition))?;
+    let k = t - x.at;
+    let src_t = o.src_out + k;
+    let seek = seek_for(tl, idx, Kind::Video, o.src, src_t, if k == 0 { *v_next } else { *m_next })?;
+    (*v_next, *m_next) = (None, Some((o.src, src_t + 1)));
+    let vmix = VideoMix { kind: x.kind, src: Some(o.src), src_t, seek, t: Frac { num: k + 1, den: x.dur + 1 } };
+    Ok(Step { kind: Kind::Video, track: Some(ti), src: None, src_t: 0, out_t: t, len: 1, seek: None, vmix: Some(vmix) })
 }
