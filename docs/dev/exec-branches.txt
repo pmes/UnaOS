@@ -938,3 +938,12 @@ refs/heads/exec-rmbp-hevcscctail   07f7262c1 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-av1inbandcolour   95cdd4473 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-metaiccone   8d63439cb FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle6exportone   dbf86cea5 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-vfsputone   672c23c04 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-kernelscaleone   672c23c04 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-hevclevelline   672c23c04 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle6exportmkv   672c23c04 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-stationroampmu   672c23c04 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-yuvfancy   672c23c04 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-swapbackspancache   672c23c04 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-h264enccbrone   672c23c04 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-kerneldisplayicc   672c23c04 IN-FLIGHT cut 2026-10-27
