@@ -259,15 +259,45 @@ fn text_goes_to_the_sink() {
 }
 
 #[test]
-fn jpx_refused_grey_box() {
+fn jpx_draws() {
+    // PDFJPX (SR335): JPXDecode images drawn, no longer a refused grey box. Both are lossless OpenJPEG 2.5.0 output
+    // (ImageMagick 6.9.12-98, `-define jp2:number-resolutions=2`) of 4 x 4 formula images: Im1 a raw codestream (RCT)
+    // of rgb(x, y) = (60x + 20, 70y + 10, 30(x + y) + 5) under /DeviceRGB; Im2 a JP2 of grey(x, y) = 50x + 12y + 3 with
+    // colr greyscale and NO /ColorSpace (§8.9.5: the codestream's colour space rules), /BitsPerComponent 1 ignored.
+    let unhex = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect::<Vec<u8>>();
+    let im1 = unhex(concat!(
+        "ff4fff51002f000000000004000000040000000000000000000000040000000400000000000000000003070101070101",
+        "070101ff52000c00000001010104040001ff5c00074040484850ff640025000143726561746564206279204f70656e4a",
+        "5045472076657273696f6e20322e352e30ff90000a0000000000520001ff93cfb4140658c0d7d9cfb4140c1d7e66bfdf",
+        "80300baf5537d77fc1f38387d40900220d002d0b3c654f01cfc1f38387d4080cf78f0c17359fc3ea038fb4100cf78f0c",
+        "18035fffd9",
+    ));
+    let im2 = unhex(concat!(
+        "0000000c6a5020200d0a870a00000014667479706a703220000000006a7032200000002d6a7032680000001669686472",
+        "00000004000000040001070700000000000f636f6c7201000000000011000000976a703263ff4fff5100290000000000",
+        "04000000040000000000000000000000040000000400000000000000000001070101ff52000c00000001000104040001",
+        "ff5c00074040484850ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e30",
+        "ff90000a0000000000220001ff93cfb414091b4d147fc3ea0381f202000cfaed0b39ffd9",
+    ));
     let r = render(
-        "/XObject << /Im1 5 0 R >>",
-        "q 10 0 0 10 10 10 cm /Im1 Do Q",
-        &[(5, "/Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /JPXDecode", Some(vec![0, 0, 0, 12]))],
+        "/XObject << /Im1 5 0 R /Im2 6 0 R >>",
+        "q 10 0 0 10 10 10 cm /Im1 Do Q q 10 0 0 10 22 10 cm /Im2 Do Q",
+        &[
+            (5, "/Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /JPXDecode", Some(im1)),
+            (6, "/Type /XObject /Subtype /Image /Width 4 /Height 4 /BitsPerComponent 1 /Filter /JPXDecode", Some(im2)),
+        ],
     );
-    assert_eq!(px(&r, 15, 25), [128, 128, 128, 255]);
-    assert_eq!(px(&r, 25, 25), WHITE);
-    assert_eq!(r.refused, vec!["JPXDecode"]);
+    assert!(r.refused.is_empty(), "{:?}", r.refused);
+    // Image pixel (x, y) covers device [10 + 2.5x, +2.5) x [20 + 2.5y, +2.5) (row 0 at the top); sample its middle.
+    for (x, y) in [(0, 0), (3, 0), (1, 2), (3, 3)] {
+        let (dx, dy) = (10 + x * 5 / 2 + 1, 20 + y * 5 / 2 + 1);
+        assert_eq!(px(&r, dx, dy), [(60 * x + 20) as u8, (70 * y + 10) as u8, (30 * (x + y) + 5) as u8, 255], "Im1 ({x}, {y})");
+        let g = (50 * x + 12 * y + 3) as u8;
+        assert_eq!(px(&r, dx + 12, dy), [g, g, g, 255], "Im2 ({x}, {y})");
+    }
+    assert_eq!(px(&r, 5, 25), WHITE);
+    let got = fnv(&r.pixmap.data);
+    assert_eq!(got, 0xb14e_6429_8bc7_85fd, "fnv pin: got {got:#018x}");
 }
 
 #[test]
