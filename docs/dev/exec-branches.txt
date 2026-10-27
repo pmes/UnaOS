@@ -1050,6 +1050,6 @@ refs/heads/exec-rmbp-flightlistboardtags   3a52111bd FOLDED-BY-HAND (this commit
 refs/heads/exec-rmbp-kernelpresentpolicy   1e744ddc9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-mt7925s8   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
 refs/heads/exec-rmbp-zenbookledgerhead   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
-refs/heads/exec-rmbp-nvme4knfixture   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
+refs/heads/exec-rmbp-nvme4knfixture   b1f383796 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-exportsizepolicypixel   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
 refs/heads/exec-rmbp-pdf4kernel   4b87cfee0 cut 2026-10-27 (wave36 batch 17)

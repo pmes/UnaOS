@@ -28,6 +28,18 @@ pub const FIRST_USABLE: u64 = 2 + ARRAY_SECTORS; // 34
 pub const ALIGN: u64 = 2048;
 /// Name field capacity in UTF-16 code units (72 bytes at entry offset 56).
 pub const NAME_UNITS: usize = 36;
+/// NVME4KN-FIXTURE (zenbook-ledger Z40): bytes of the standard 128 × 128 entry array, at any LBA size.
+pub const ARRAY_BYTES: u64 = ENTRIES as u64 * ENTRY_SIZE as u64;
+
+/// NVME4KN-FIXTURE (zenbook-ledger Z40): 512-byte sectors per `lba`-byte LBA, for the LBA sizes this crate lays
+/// (512, 1024, 2048, 4096 -> 1, 2, 4, 8); any other size is `BadGeometry`.
+pub fn lba_ratio(lba: usize) -> Result<u64, GptError> {
+    if lba.is_power_of_two() && (SECTOR..=4096).contains(&lba) {
+        Ok((lba / SECTOR) as u64)
+    } else {
+        Err(GptError::BadGeometry)
+    }
+}
 
 /// EFI System Partition C12A7328-F81F-11D2-BA4B-00A0C93EC93B (on-disk mixed-endian bytes).
 pub const ESP_TYPE: [u8; 16] = [
@@ -402,9 +414,12 @@ pub fn retype(raw: &mut [u8], h: &Header, index: u32, type_guid: &[u8; 16]) -> R
     Ok(crc32(&raw[..h.array_bytes()]))
 }
 
-/// A whole table, ready to write: the five structures and where each goes.
+/// A whole table, ready to write: the five structures and where each goes. `total_sectors` and every LBA
+/// are in the table's own LBAs of `lba_bytes` bytes (512 for [`Image::build`]); the MBR and the headers are
+/// 512 bytes at the front of their LBA, the rest of that LBA zero (NVME4KN-FIXTURE, zenbook-ledger Z40).
 pub struct Image {
     pub total_sectors: u64,
+    pub lba_bytes: usize,
     pub mbr: [u8; SECTOR],
     pub primary: [u8; SECTOR],
     pub array: Vec<u8>,
@@ -415,12 +430,20 @@ impl Image {
     /// Build the table for `entries` on a `total`-sector disk. Every entry must lie inside the usable
     /// range and no two may overlap.
     pub fn build(total: u64, disk_guid: [u8; 16], entries: &[Entry]) -> Result<Self, GptError> {
-        let last = last_usable(total).ok_or(GptError::TooSmall)?;
-        if last <= FIRST_USABLE {
+        Self::build_lba(total, disk_guid, entries, SECTOR)
+    }
+    /// NVME4KN-FIXTURE (zenbook-ledger Z40): THE table builder at `lba`-byte LBAs ([`lba_ratio`]): `total` and
+    /// every entry extent in those LBAs; the array takes `ARRAY_BYTES / lba` LBAs (32 at 512, 4 at 4096), the
+    /// primary at LBA 2, the backup at `total - 1 - that`. At 512 this is the layout the golden KAT pins.
+    pub fn build_lba(total: u64, disk_guid: [u8; 16], entries: &[Entry], lba: usize) -> Result<Self, GptError> {
+        let arr = ARRAY_BYTES / (lba_ratio(lba)? * SECTOR as u64);
+        let first_usable = 2 + arr;
+        let last = total.checked_sub(arr + 2).ok_or(GptError::TooSmall)?;
+        if last <= first_usable {
             return Err(GptError::TooSmall);
         }
         for (i, e) in entries.iter().enumerate() {
-            if e.last_lba < e.first_lba || e.first_lba < FIRST_USABLE || e.last_lba > last {
+            if e.last_lba < e.first_lba || e.first_lba < first_usable || e.last_lba > last {
                 return Err(GptError::EntryOutOfBounds(i as u32));
             }
             for f in &entries[..i] {
@@ -432,23 +455,24 @@ impl Image {
         let array = encode_array(entries)?;
         let acrc = crc32(&array);
         let backup_lba = total - 1;
-        let backup_array = total - 1 - ARRAY_SECTORS;
+        let backup_array = total - 1 - arr;
         Ok(Self {
             total_sectors: total,
+            lba_bytes: lba,
             mbr: protective_mbr(total),
-            primary: Header::standard(1, backup_lba, FIRST_USABLE, last, disk_guid, 2, acrc).encode(),
+            primary: Header::standard(1, backup_lba, first_usable, last, disk_guid, 2, acrc).encode(),
             array,
-            backup: Header::standard(backup_lba, 1, FIRST_USABLE, last, disk_guid, backup_array, acrc).encode(),
+            backup: Header::standard(backup_lba, 1, first_usable, last, disk_guid, backup_array, acrc).encode(),
         })
     }
     pub fn backup_array_lba(&self) -> u64 {
-        self.total_sectors - 1 - ARRAY_SECTORS
+        self.total_sectors - 1 - ARRAY_BYTES / self.lba_bytes as u64
     }
     pub fn backup_header_lba(&self) -> u64 {
         self.total_sectors - 1
     }
     /// The writes in the order the kernel has always issued them: MBR, primary header, primary array,
-    /// backup array, backup header.
+    /// backup array, backup header. LBAs are in the table's own units (`lba_bytes`).
     pub fn writes(&self) -> [(u64, &[u8]); 5] {
         [
             (0, &self.mbr[..]),
