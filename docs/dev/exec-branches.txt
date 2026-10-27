@@ -762,7 +762,7 @@ refs/heads/exec-rmbp-truststage   df909c747 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-portreset   df909c747 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-heldmap   df909c747 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pumppark   df909c747 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-shimmerpresent   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-shimmerpresent   df909c747 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-navtravel   df909c747 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-zoompanel   df909c747 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-stationwatch   df909c747 IN-FLIGHT cut 2026-10-27

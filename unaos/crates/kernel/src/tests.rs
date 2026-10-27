@@ -1614,12 +1614,12 @@ pub fn focussteal_selftest() {
 /// 1. THE VEIL: 64 samples of `video::veilcost::sample` (the menu bar's rect through `wm::desktop::bar_row` over the
 ///    live VEIL, then a solid fill of the same rows) into the compositor's ring; the bar is the sheet's ±5 %:
 ///    veil p99 <= fill p99 x 1.05 + 50 us (the arc's 1.25 is withdrawn).
-/// 2. THE SHIMMER: for 1.5 s, the idle seat (`wm::desktop::shimmer_idle`, one ordinary composite when a tick is due
+/// 2. THE SHIMMER: for 1.5 s, the idle seat (`wm::desktop::shimmer_idle`, one drain present when a tick is due
 ///    and the glass is idle); a call across which `shimmer_ticks` advanced is a shimmer frame. `shimmer_idle_us` is
-///    the worst TICK (`wm::desktop::shimmer_tick_us`: re-tint + queue, the shimmer's own cost; bar: <= 200 us) —
-///    SHIMMERIDLE2 (B830): flight 37's 6053 us was the whole composite pass timed around the call, which is printed
-///    beside it as `pass_us=` (the compositor's present, ungated: owed SHIMMERPRESENT, blueprint video §5).
-/// `:: VEILCOST: detail veil_p50_us=<n> veil_p99_us=<n> fill_p99_us=<n> bar_us=<n> n=<n> shimmer_frames=<n> pass_us=<n> ::`
+///    the worst whole call whose present was the DRAIN (SHIMMERPRESENT B840: tick + erase drain + cursor tail; bar: <= 200 us);
+///    a run with no drain frame does not pass. A frame the whole pass carried (owed work, or the drain re-damaged a
+///    window) is printed as `pass_us=` (ungated; flight 37's 6053 us was that pass), the drain frames as `drain_frames=`.
+/// `:: VEILCOST: detail veil_p50_us=<n> veil_p99_us=<n> fill_p99_us=<n> bar_us=<n> n=<n> shimmer_frames=<n> pass_us=<n> drain_frames=<n> ::`
 /// `:: VEILCOST: ratio_p99=<x.xx> shimmer_idle_us=<n> -> PASS|FAIL|SKIP ::`
 #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "facet"))]
 fn veilcost_selftest() {
@@ -1644,7 +1644,7 @@ fn veilcost_selftest() {
     let bar_us = s99 as u64 * 105 / 100 + 50;
     let veil_ok = v99 as u64 <= bar_us;
     let rm = crate::video::settings::reduce_motion();
-    let (mut worst, mut frames, mut pass_worst) = (0u64, 0u32, 0u64);
+    let (mut worst, mut frames, mut pass_worst, mut drain_frames) = (0u64, 0u32, 0u64, 0u32);
     if !rm {
         let end = crate::arch::ms() + SHIM_WINDOW_MS;
         while crate::arch::ms() < end {
@@ -1654,16 +1654,16 @@ fn veilcost_selftest() {
             let us = crate::video::blitter::cycles_to_us(crate::arch::now_cycles().saturating_sub(t0));
             if crate::video::wm::desktop::shimmer_ticks() != n0 {
                 frames += 1;
-                worst = worst.max(crate::video::wm::desktop::shimmer_tick_us());
-                pass_worst = pass_worst.max(us);
+                if crate::video::wm::desktop::shimmer_present_drain() { drain_frames += 1; worst = worst.max(us); } // SHIMMERPRESENT (B840): `shimmer_idle_us` reads the drain present's whole call
+                else { pass_worst = pass_worst.max(us); }
             }
             crate::arch::sched::sleep_ms(5);
         }
     }
-    let shim_ok = rm || (frames > 0 && worst <= SHIM_BAR_US);
+    let shim_ok = rm || (frames > 0 && drain_frames > 0 && worst <= SHIM_BAR_US);
     serial_println!(
-        ":: VEILCOST: detail veil_p50_us={} veil_p99_us={} fill_p99_us={} bar_us={} n={} shimmer_frames={} pass_us={}{} ::",
-        v50, v99, s99, bar_us, k, frames, pass_worst, if rm { " reduce_motion=1" } else { "" }
+        ":: VEILCOST: detail veil_p50_us={} veil_p99_us={} fill_p99_us={} bar_us={} n={} shimmer_frames={} pass_us={} drain_frames={}{} ::",
+        v50, v99, s99, bar_us, k, frames, pass_worst, drain_frames, if rm { " reduce_motion=1" } else { "" }
     );
     serial_println!(
         ":: VEILCOST: ratio_p99={}.{:02} shimmer_idle_us={} -> {} ::",

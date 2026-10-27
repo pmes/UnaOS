@@ -2658,7 +2658,7 @@ pub fn shimmer_idle() {
     let carry = why != 0; // SHIMMERIDLE2 (B830): a carried pass services owed work; its tick-less outcome is no backoff
     let n0 = SHIM_TICKS.load(Ordering::Relaxed);
     let t0 = now_ns().0;
-    super::composite();
+    let drained = if carry { super::composite(); false } else { super::present_drain() == Some(true) }; // SHIMMERPRESENT (B840): the idle tick presents its boxes through the drain (`wm::present_drain`); a carried pass is the whole composite
     let pass_us = now_ns().0.saturating_sub(t0) / 1000;
     let ticked = SHIM_TICKS.load(Ordering::Relaxed) != n0;
     if !carry || ticked {
@@ -2667,7 +2667,7 @@ pub fn shimmer_idle() {
     if ticked {
         SHIM_IDLE_TICKS.fetch_add(1, Ordering::Relaxed);
         SHIM_IDLE_MAX_US.fetch_max(SHIM_TICK_US.load(Ordering::Relaxed), Ordering::Relaxed);
-        SHIM_IDLE_PASS_US.fetch_max(pass_us, Ordering::Relaxed);
+        SHIM_IDLE_PASS_US.fetch_max(pass_us, Ordering::Relaxed); shim_present_note(drained, pass_us);
         shim_wire_once();
     }
 }
@@ -2676,7 +2676,7 @@ pub fn shimmer_idle() {
 /// draws nothing), after a settle of at most 1 s for the first tick (SHIMMERIDLE2 B830): (1) the shimmer's ticks in the
 /// window (all seats) must be 3..=7 — the 33 ms floor caps it at 7, the idle seat must lift it to at least 3 — each idle tick under STARFIELD's bound (800 us), and no gate steal;
 /// (2) with reduce motion forced, the idle seat ticks zero times.
-/// `:: SHIMMERIDLE: detail idle_ticks=<n> pass_max_us=<n> skips=<n> backdrop=<0|1> why=<terms|none> carried=<n> settle_ms=<n> ::`
+/// `:: SHIMMERIDLE: detail idle_ticks=<n> pass_max_us=<n> skips=<n> backdrop=<0|1> why=<terms|none> carried=<n> settle_ms=<n> present=<drain|pass> pass_us=<n> ::`
 /// `:: SHIMMERIDLE: idle_ms=<n> ticks=<n> max_us=<n> reduce_motion_ticks=<n> gate_steals=<n> -> PASS|FAIL ::`
 #[cfg(all(target_arch = "x86_64", feature = "facet"))]
 pub fn shimmeridle_selftest() {
@@ -2712,9 +2712,9 @@ pub fn shimmeridle_selftest() {
     let ok = (3..=7).contains(&ticks) && idle_ticks > 0 && max_us <= 800 && rm_ticks == 0 && steals == 0;
     shim_wire();
     serial_println!(
-        ":: SHIMMERIDLE: detail idle_ticks={} pass_max_us={} skips={} backdrop={} why={} carried={} settle_ms={} ::",
+        ":: SHIMMERIDLE: detail idle_ticks={} pass_max_us={} skips={} backdrop={} why={} carried={} settle_ms={} present={} pass_us={} ::",
         idle_ticks, pass_us, SHIM_IDLE_SKIPS.load(Ordering::Relaxed).wrapping_sub(skip0), crate::video::wallpaper::owns_backdrop() as u8,
-        WhyLabel(SHIM_IDLE_WHY.load(Ordering::Relaxed)), SHIM_IDLE_CARRIED.load(Ordering::Relaxed).wrapping_sub(carried0), settle_ms
+        WhyLabel(SHIM_IDLE_WHY.load(Ordering::Relaxed)), SHIM_IDLE_CARRIED.load(Ordering::Relaxed).wrapping_sub(carried0), settle_ms, shim_present_label(), SHIM_PRESENT_US.load(Ordering::Relaxed)
     );
     serial_println!(
         ":: SHIMMERIDLE: idle_ms={} ticks={} max_us={} reduce_motion_ticks={} gate_steals={} -> {} ::",
@@ -3494,12 +3494,12 @@ static SHIM_IDLE_CARRIED: AtomicU32 = AtomicU32::new(0);
 #[cfg(all(target_arch = "x86_64", feature = "facet"))]
 static SHIM_WIRE_SAID: AtomicBool = AtomicBool::new(false);
 
-/// A refusal by `why`: note it, and answer whether the owed work is STRANDED — the gate free, no pass pending, and no
+/// A refusal by `why`: note it, and answer whether the owed work is STRANDED — the gate free (a standing PENDING included, B840), and no
 /// composite pass since the previous due attempt that also found work owed. Counts a carry when it is.
 #[cfg(all(target_arch = "x86_64", feature = "facet"))]
 fn shim_stranded(why: u8) -> bool {
     SHIM_IDLE_WHY.fetch_or(why, Ordering::Relaxed);
-    if why & (WHY_GATE | WHY_PENDING) != 0 {
+    if why & WHY_GATE != 0 { // SHIMMERPRESENT (B840, the seat's ruling): a PENDING with the gate free is strandable — a one-pass holder's COMP_PENDING has only `service_damage` as taker
         SHIM_OWED_AT.store(0, Ordering::Relaxed);
         return false;
     }
@@ -3559,5 +3559,41 @@ impl core::fmt::Display for WhyLabel {
             }
         }
         Ok(())
+    }
+}
+
+// ── SHIMMERPRESENT (rmbp-ledger B840): the idle tick's present, named ─────────────────────────────────────────────
+//
+// Handler: Kernel — wm. `shimmer_idle` presents an idle tick through `wm::present_drain` (the tick, the erase drain and the
+// cursor tail under COMP_GATE; the whole pass whenever anything else is owed). The fixture's detail line names the last
+// ticked idle present (`present=drain|pass`, `-` before any) and its whole-call cost (`pass_us=`); VEILCOST reads drain
+// frames through [`shimmer_present_drain`].
+
+/// The last ticked idle present (0 none, 1 drain, 2 pass) and its whole-call cost (us).
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_PRESENT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+static SHIM_PRESENT_US: AtomicU64 = AtomicU64::new(0);
+
+/// [`shimmer_idle`]'s ticked arm: record which present carried the tick and what the call cost.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn shim_present_note(drained: bool, us: u64) {
+    SHIM_PRESENT.store(if drained { 1 } else { 2 }, Ordering::Relaxed);
+    SHIM_PRESENT_US.store(us, Ordering::Relaxed);
+}
+
+/// Was the last ticked idle present the drain present (VEILCOST's `shimmer_idle_us` reads only those)?
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+pub fn shimmer_present_drain() -> bool {
+    SHIM_PRESENT.load(Ordering::Relaxed) == 1
+}
+
+/// `present=` — `drain`, `pass`, or `-` before any ticked idle present.
+#[cfg(all(target_arch = "x86_64", feature = "facet"))]
+fn shim_present_label() -> &'static str {
+    match SHIM_PRESENT.load(Ordering::Relaxed) {
+        1 => "drain",
+        2 => "pass",
+        _ => "-",
     }
 }
