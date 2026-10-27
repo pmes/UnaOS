@@ -7576,3 +7576,20 @@ fn hold_leg() {
         serial_println!(":: GEN7HOLD: runs=2 held_kb={} growth_kb={} -> {} ::", k1, growth, if growth == 0 { "PASS" } else { "FAIL" });
     }
 }
+
+// =================================================================================
+// GEN7HELDONE (rmbp-ledger B1031) — FILE-TAIL append beside GEN7HOLDONCE's block: nothing above it moves. The three
+// holds that kept their own "allocate once, cache the VA, never free" copy of the GEN7TLB rule now take through
+// `held_take` with a slot each (their per-site VA caches retired). Each site already re-seeds every page it reads and
+// re-derives its PTEs every run, so a reused block needs no new re-init. `held_kb()` now covers all six sites.
+// =================================================================================
+
+/// r9's slot: the ring page + the pinned page (2 pages, `r9::exec`).
+#[cfg(feature = "gen7r9")]
+static R9_HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0, 0));
+/// r10's slot: ring, state, kernel and render-target pages (R10_WIN = 4, `r9::draw::exec`).
+#[cfg(feature = "gen7r9")]
+static R10_HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0, 0));
+/// gen7blit's ring slot: the ring + sentinel pages (2 pages, `blit::bcs_job`; `blit::PAGES` stays the engine's lock).
+#[cfg(feature = "gen7blit")]
+static BLIT_RING_HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::new((0, 0));

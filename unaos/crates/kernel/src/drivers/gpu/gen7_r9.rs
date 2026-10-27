@@ -109,9 +109,7 @@ const RING_CMDS: [(usize, &str); 8] = [
 ];
 const RING_DW: usize = 52; // 208 bytes: QWord aligned (§1.1.11.1 p.75)
 
-/// The ring + pinned pages (8 KiB), allocated once and held for the boot (GEN7TLB, gen7.md §2.6: a page the GT may
-/// hold a translation to never goes back to the heap on an unpinned register's word).
-static PAGES_VA: crate::sync::Mutex<usize> = crate::sync::Mutex::new(0);
+// The ring + pinned pages (8 KiB) are held in gen7.rs's `R9_HELD` slot through `held_take` (GEN7HELDONE, B1031).
 
 /// R6's verdict this run (`rearm` notes it at its verdict line).
 static R6: crate::sync::Mutex<Option<&'static str>> = crate::sync::Mutex::new(None);
@@ -144,6 +142,7 @@ struct Out {
     fw_restored: bool,
     ptes_restored: bool,
     cyc: u64,
+    reused: bool, // GEN7HELDONE (B1031): `held_take` handed back R9_HELD's block from an earlier run
 }
 
 fn cycles_to_us(c: u64) -> u64 {
@@ -245,7 +244,7 @@ pub(super) fn run() {
     let select_retired = o.armed && head_dw >= RING_CMDS[1].0;
     let sba_retired = o.armed && head_dw >= RING_CMDS[4].0;
     serial_println!(
-        "[gen7] r9 ring=rcs r6={} cand={} pipeline={} sba={} pipe_control={} immediate=0x{:08X} read=0x{:08X} landed={} head={:#x} tail={:#x} passed={} idle={} restored=regs:{},fw:{},ptes:{} gpu_us={} us={} -> {}",
+        "[gen7] r9 ring=rcs r6={} cand={} pipeline={} sba={} pipe_control={} immediate=0x{:08X} read=0x{:08X} landed={} head={:#x} tail={:#x} passed={} idle={} restored=regs:{},fw:{},ptes:{} gpu_us={} us={} reuse={} held_kb={} -> {}",
         r6,
         o.cand,
         if select_retired { "3d" } else { "not-retired" },
@@ -263,6 +262,8 @@ pub(super) fn run() {
         o.ptes_restored as u32,
         cycles_to_us(o.cyc),
         us,
+        if o.reused { "y" } else { "n" },
+        crate::drivers::gpu::gen7::held_kb(),
         verdict
     );
     r10(word());
@@ -328,16 +329,18 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
     }
 
     // ---- the pages: ring + pinned, held for the boot ----------------------------------------------------------------
-    let ring_va = {
-        let mut pages = PAGES_VA.lock();
-        if *pages == 0 {
-            let p = alloc_zeroed(Layout::from_size_align(8192, 4096).unwrap());
-            if p.is_null() {
+    let (ring_va, reused) = {
+        let (p, reused) = crate::drivers::gpu::gen7::held_take(&crate::drivers::gpu::gen7::R9_HELD, 2); // GEN7HELDONE (B1031): B1025's one hold rule (gen7.rs tail)
+        if !reused {
+            if p == 0 {
                 return Err("alloc");
             }
-            *pages = p as usize;
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+            {
+                crate::allocator::census::retag(p, 2 * 4096, crate::allocator::census::GEN7_HELD); // FIXTURERETAIN (B1017): counted once, never fx:gen7
+            }
         }
-        *pages
+        (p, reused) // a reused block is not re-zeroed: the ring is NOOP-filled and the post dword seeded below, every run
     };
     let pin_va = ring_va + 4096;
     let mut ptes = [0u32; R9_WIN];
@@ -392,7 +395,7 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
     core::ptr::write_volatile(post, R9_SEED);
     clflush_range(ring_va, 8192);
 
-    let mut out = Out { cand, ..Out::default() };
+    let mut out = Out { cand, reused, ..Out::default() };
 
     // ---- claim: PTEs, landed check, the pinned GTT flush (Vol1 Pt3 §1.2.21 p.191) -----------------------------------
     for k in 0..R9_WIN {

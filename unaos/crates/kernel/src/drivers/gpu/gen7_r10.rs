@@ -269,8 +269,7 @@ const R10_FENCE_SEED: u32 = 0x5EED_3D10;
 /// The 32 centres ON the hypotenuse (x+y = 31) are reported as `edge=` and decide nothing.
 const INSIDE_EXPECT: u32 = 496;
 
-/// The four pages (16 KiB), allocated once and held for the boot (GEN7TLB, gen7.md §2.6).
-static PAGES_VA: crate::sync::Mutex<usize> = crate::sync::Mutex::new(0);
+// The four pages (16 KiB) are held in gen7.rs's `R10_HELD` slot through `held_take` (GEN7HELDONE, B1031).
 
 /// Command names by end dword, filled as the stream is built; the head offset maps onto the last command retired.
 const MARKS: usize = 48;
@@ -298,6 +297,7 @@ struct Out {
     other: u32,
     rt0: u32,
     passed: &'static str,
+    reused: bool, // GEN7HELDONE (B1031): `held_take` handed back R10_HELD's block from an earlier run
 }
 
 /// R10 under `tests gen7`, after R9, then R11 (GEN7R11, B654) on R10's word: `gen7_r11.rs`, gated on
@@ -368,7 +368,7 @@ fn run_inner(r9: &str) -> &'static str {
         "r10-head-stuck"
     };
     serial_println!(
-        "[gen7] r10 draw=3dprimitive r9={} rows_cited={}/{} ring=rcs cand={} prim=trilist verts=3 rt=32x32:b8g8r8a8 color=0x{:08X} fence=0x{:08X} read=0x{:08X} pixels={} inside={}/{} edge={} outside={} other={} rt0=0x{:08X} landed={} head={:#x} tail={:#x} passed={} idle={} restored=regs:{},fw:{},ptes:{} gpu_us={} us={} -> {}",
+        "[gen7] r10 draw=3dprimitive r9={} rows_cited={}/{} ring=rcs cand={} prim=trilist verts=3 rt=32x32:b8g8r8a8 color=0x{:08X} fence=0x{:08X} read=0x{:08X} pixels={} inside={}/{} edge={} outside={} other={} rt0=0x{:08X} landed={} head={:#x} tail={:#x} passed={} idle={} restored=regs:{},fw:{},ptes:{} gpu_us={} us={} reuse={} held_kb={} -> {}",
         r9,
         cited,
         rows,
@@ -393,6 +393,8 @@ fn run_inner(r9: &str) -> &'static str {
         o.ptes_restored as u32,
         cycles_to_us(o.cyc),
         us,
+        if o.reused { "y" } else { "n" },
+        crate::drivers::gpu::gen7::held_kb(),
         verdict
     );
     verdict
@@ -497,16 +499,18 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
     }
 
     // ---- the pages, held for the boot ---------------------------------------------------------------------------------
-    let base_va = {
-        let mut pages = PAGES_VA.lock();
-        if *pages == 0 {
-            let p = alloc_zeroed(Layout::from_size_align(R10_WIN * 4096, 4096).unwrap());
-            if p.is_null() {
+    let (base_va, reused) = {
+        let (p, reused) = crate::drivers::gpu::gen7::held_take(&crate::drivers::gpu::gen7::R10_HELD, R10_WIN); // GEN7HELDONE (B1031): B1025's one hold rule (gen7.rs tail)
+        if !reused {
+            if p == 0 {
                 return Err("alloc");
             }
-            *pages = p as usize;
+            #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+            {
+                crate::allocator::census::retag(p, R10_WIN * 4096, crate::allocator::census::GEN7_HELD); // FIXTURERETAIN (B1017): counted once, never fx:gen7
+            }
         }
-        *pages
+        (p, reused) // a reused block is not re-zeroed: every page is cleared or seeded below, every run
     };
     let va = |k: usize| base_va + k * 4096;
     let mut ptes = [0u32; R10_WIN];
@@ -610,7 +614,7 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
     clflush_range(base_va, R10_WIN * 4096);
     let fence = (va(PG_STATE) + OFF_FENCE as usize) as *mut u32;
 
-    let mut out = Out { cand, tail, ..Out::default() };
+    let mut out = Out { cand, tail, reused, ..Out::default() };
 
     // ---- claim: PTEs, landed check, the pinned GTT flush (Vol1 Pt3 §1.2.21 p.191) -----------------------------------
     for k in 0..R10_WIN {
