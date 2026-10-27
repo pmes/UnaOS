@@ -85,7 +85,7 @@ fn the_invariant_refuses_by_name() {
     let a1 = au.add_track(Kind::Audio);
     au.tracks[a1].clips = au.tracks[0].clips.clone();
     assert_eq!(au.add_transition(a1, 20, TransitionKind::Dissolve, 3), Err(EditError::Transition));
-    // a transition pins its cut: an edit that moves it is refused until the transition is removed
+    // NLE3E: a transition follows its cut; an edit that deletes the cut is refused until the transition is removed
     assert_eq!(three().ripple_delete(0, 0), Err(EditError::Transition));
     assert!(three().remove_transition(0, 20).unwrap().remove_transition(0, 40).unwrap().ripple_delete(0, 0).is_ok());
 }
@@ -253,4 +253,73 @@ fn nle3c_the_schedule_mixes_from_black() {
     assert_eq!((s[10].src, s[10].seek), (Some(SourceId(0)), Some(0)));
     assert!(s[10..15].iter().all(|x| x.vmix.is_some_and(|v| v.src.is_none())));
     assert_eq!(s[15].vmix, None);
+}
+
+// ---- NLE3E (SR225): a transition follows its cut through the ops; a cut that is gone is refused by name.
+
+fn ats(tl: &Timeline) -> Vec<(i64, i64, TransitionKind)> {
+    tl.tracks[0].transitions.iter().map(|x| (x.at, x.dur, x.kind)).collect()
+}
+
+#[test]
+fn nle3e_an_insert_before_a_cut_moves_its_transition() {
+    use timeline_core::Mode;
+    let ins = |at| Clip::new(SourceId(2), 0, 10, at);
+    let tl = three().place(0, ins(0), Mode::Insert).unwrap();
+    assert_eq!(ats(&tl), vec![(30, 9, TransitionKind::Dissolve), (50, 9, WIPE)]);
+    // at the cut: a clip now sits between the pair, the cut is gone
+    assert_eq!(three().place(0, ins(20), Mode::Insert), Err(EditError::Transition));
+    // inside the incoming's first 9 ticks: the cut stays at 20 but its incoming head is 5 ticks
+    assert_eq!(three().place(0, ins(25), Mode::Insert), Err(EditError::Handle));
+    // after every cut: nothing moves
+    assert_eq!(ats(&three().place(0, ins(60), Mode::Insert).unwrap()), ats(&three()));
+}
+
+#[test]
+fn nle3e_ripple_delete_and_move_clip() {
+    // an unrelated clip: the B -> C wipe moves 20 earlier with its pair
+    let bc = cuts().add_transition(0, 40, WIPE, 9).unwrap();
+    assert_eq!(ats(&bc.ripple_delete(0, 0).unwrap()), vec![(20, 9, WIPE)]);
+    // one of the pair: refused by name
+    assert_eq!(three().ripple_delete(0, 1), Err(EditError::Transition));
+    // move_clip moves one clip and never ripples: an unrelated clip keeps the transition, one of the pair is refused
+    let ab = cuts().add_transition(0, 20, TransitionKind::Dissolve, 9).unwrap();
+    let moved = ab.move_clip(0, 2, 0, 70).unwrap();
+    assert_eq!((ats(&moved), moved.tracks[0].clips[2].at), (vec![(20, 9, TransitionKind::Dissolve)], 70));
+    assert_eq!(ab.move_clip(0, 1, 0, 70), Err(EditError::Transition));
+}
+
+#[test]
+fn nle3e_trims_keep_or_refuse_by_name() {
+    // the outgoing's out edge (the cut's near edge) shorter: a gap opens at the cut
+    assert_eq!(three().trim_out(0, 0, 15), Err(EditError::Transition));
+    // the outgoing's in edge (far edge): the cut stays at 20
+    let tl = three().trim_in(0, 0, 5).unwrap();
+    assert_eq!((ats(&tl), tl.tracks[0].clips[0].at), (ats(&three()), 5));
+    // the incoming shorter than the dissolve
+    let ab = cuts().add_transition(0, 20, TransitionKind::Dissolve, 9).unwrap();
+    assert_eq!(ab.trim_out(0, 1, 5), Err(EditError::Handle));
+}
+
+#[test]
+fn nle3e_the_audio_crossfade_follows_the_same_op() {
+    use timeline_core::Mode;
+    // V1 and A1: A[10,30)@0, B[0,40)@20, a 9-tick dissolve on V1's cut at 20 (mix.rs's xfade)
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("A", 50);
+    let b = tl.add_source("B", 50);
+    tl.add_track(Kind::Video);
+    tl.add_track(Kind::Audio);
+    for t in 0..2 {
+        tl.tracks[t].clips = vec![Clip::new(a, 10, 30, 0), Clip::new(b, 0, 40, 20)];
+    }
+    let tl = tl.add_transition(0, 20, TransitionKind::Dissolve, 9).unwrap();
+    let ins = Clip::new(b, 40, 50, 0);
+    // the insert on V1 alone: the video transition moves, the audio cut at 20 is plain
+    let v = tl.place(0, ins, Mode::Insert).unwrap();
+    assert_eq!(ats(&v), vec![(30, 9, TransitionKind::Dissolve)]);
+    assert_eq!((v.audio_crossfade(1, 1), v.validate()), (None, Ok(())));
+    // the same insert on A1: the crossfade is derived at the new cut
+    let va = v.place(1, ins, Mode::Insert).unwrap();
+    assert_eq!(va.audio_crossfade(1, 2).map(|x| (x.at, x.dur)), Some((30, 9)));
 }

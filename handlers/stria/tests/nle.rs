@@ -483,3 +483,34 @@ fn demuxwire_player_plays_a_bframe_mkv_in_decode_order() {
     assert_eq!(v.composition_offsets, [80, 160, 40, 40, 160, 40, 40, 80, 160, 40, 40].map(|o| o * MS).to_vec());
     println!("demuxwire: player dts=derived:2");
 }
+
+// ----- NLE3E (LEDGER SR225): a transition follows its cut through an insert and renders at the new tick -----
+
+/// V1 A[0,20)@0, B[0,20)@20 with a 9-tick dissolve; a 10-tick C inserted at 0 moves the cut (and the dissolve) to
+/// 30, and tick 34 is transitions_blend's mid-dissolve frame (B at 4 at alpha 128 over A at 24) byte for byte.
+#[test]
+fn nle3e_a_transition_follows_an_insert_and_renders_there() {
+    use timeline_core::{Mode, TransitionKind};
+    let mut tl = Timeline::new(25);
+    let ids: Vec<SourceId> = ["A", "B", "C"].iter().map(|r| tl.add_source(r, 50)).collect();
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(ids[0], 0, 20, 0), Clip::new(ids[1], 0, 20, 20)];
+    let tl = tl.add_transition(0, 20, TransitionKind::Dissolve, 9).unwrap();
+    let tl = tl.place(0, Clip::new(ids[2], 5, 15, 0), Mode::Insert).unwrap();
+    assert_eq!(tl.tracks[0].transitions.iter().map(|x| x.at).collect::<Vec<_>>(), vec![30]);
+    let mut src = Sources::new(&tl);
+    for (i, id) in ids.iter().enumerate() {
+        src.add(*id, synth_source(i as u32 * 1000, 50, 25)).unwrap();
+    }
+    let mut sink = Collect::default();
+    render(&tl, 34..35, &src, &mut sink).unwrap();
+    let (a, b) = (TestPattern::render(64, 48, 24), TestPattern::render(64, 48, 1004));
+    let model: Vec<u8> = a
+        .chunks_exact(4)
+        .zip(b.chunks_exact(4))
+        .flat_map(|(o, p)| gneiss_pal::dsp::image::blend_nonpremult([p[0], p[1], p[2], 128], [o[0], o[1], o[2], o[3]]))
+        .collect();
+    assert_eq!((sink.frames.len(), sink.frames[0].0), (1, 34));
+    assert_eq!(sink.frames[0].1, model);
+    println!("nle3e: moved_at=30 frame34=blend");
+}
