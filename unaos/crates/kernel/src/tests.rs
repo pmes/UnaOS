@@ -4130,6 +4130,7 @@ fn micring3_selftest() {
         let o2 = d(OPENED);
         let mut revoked_ok = false;
         let mut rv_ms = u64::MAX;
+        let mut after_revoke = "-"; // AUDIOCAPTURE (B851): the word READ answered once revoked (`eperm` = -EPERM seen)
         match crate::arch::syscall::spawn_user_image_bg_argv(&bytes, &[APP, "hold"]) {
             Ok((pid, slot, _)) => {
                 if wait(3_000, &|| crate::audio::ring3_open(slot as usize) != 0) {
@@ -4141,6 +4142,9 @@ fn micring3_selftest() {
                     rv_ms = crate::arch::ms().wrapping_sub(t0);
                     let st = finish(pid, slot);
                     let saw = st.is_some_and(|s| s & (1 << 22) != 0);
+                    if saw {
+                        after_revoke = "eperm";
+                    }
                     revoked_ok = dropped && shut && idle2 && saw;
                     serial_println!("[micring3] run=hold status={:?} store_revoked={} source_closed={} idle={} program_saw_eperm={} ms={}", st, dropped as u8, shut as u8, idle2 as u8, saw as u8, rv_ms);
                 } else {
@@ -4168,9 +4172,9 @@ fn micring3_selftest() {
         dialog::headless(was);
         let pass = asked == 1 && opened == 1 && read_bytes > 0 && closed == 1 && idle1 && revoked_ok && term_ok && d(ASKED) == 1;
         serial_println!(
-            ":: MICRING3: asked={} opened={} read_bytes={} revoked={} terminate={} -> {} :: revoke_ms={} opens={} ::",
+            ":: MICRING3: asked={} opened={} read_bytes={} revoked={} terminate={} -> {} :: revoke_ms={} opens={} after_revoke={} ::",
             asked, opened, read_bytes, if revoked_ok { "closed" } else { "open" }, if term_ok { "closed" } else { "open" },
-            if pass { "PASS" } else { "FAIL" }, rv_ms, d(OPENED)
+            if pass { "PASS" } else { "FAIL" }, rv_ms, d(OPENED), after_revoke
         );
     }
     #[cfg(not(all(feature = "uac", target_arch = "x86_64", feature = "wc")))]
