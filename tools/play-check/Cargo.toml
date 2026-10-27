@@ -15,3 +15,11 @@ license = "LGPL-3.0-or-later"
 [dependencies]
 stria = { path = "../../handlers/stria" }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
+# PLAYCHECKHI (LEDGER SR352): the I420Hi oracle and `--md5` take HEVCCONF's ONE layout (`hevc_core::yuv_bytes` /
+# `le_bytes`) and crypto_core's MD5.
+hevc_core = { path = "../../unaos/libs/media/hevc_core" }
+crypto_core = { path = "../../unaos/libs/sys/crypto_core" }
+
+[dev-dependencies]
+# The hevc_core test kit (included by path in the unit tests) imports h264_core's CABAC tables.
+h264_core = { path = "../../unaos/libs/media/h264_core" }
