@@ -5309,7 +5309,7 @@ fn usbsuspend_selftest() {
     }
     #[cfg(feature = "ehcihid")] use crate::drivers::ehci::suspend as es; #[cfg(feature = "ehcihid")] let (e_down, e_up): (fn() -> bool, fn() -> bool) = (es::suspended, es::up);
     #[cfg(not(feature = "ehcihid"))] let (e_down, e_up): (fn() -> bool, fn() -> bool) = (|| true, || true);
-    let to0 = xs::ep0_timeouts(); xs::request(true); #[cfg(feature = "ehcihid")] es::request(true);
+    let to0 = xs::ep0_timeouts(); let rw0 = xhci::ep0_rewinds(); xs::request(true); #[cfg(feature = "ehcihid")] es::request(true);
     let in_u3 = wait(2_000, &|| xs::suspended() && e_down());
     let c = xs::census();
     let held = usbsuspend_held_queue(in_u3);
@@ -5342,8 +5342,8 @@ fn usbsuspend_selftest() {
     };
     let (kbd_on, kbd_word) = if kbd != "none" { ("xhci", kbd) } else { ("ehci", e_kbd) };
     serial_println!(
-        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={} held_ep0_refused={} replayed={} ep0_after_wake={} ep0_timeouts={} stuck={}",
-        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings, ep0_refused, ep0_replayed, kbd, xs::ep0_timeouts().wrapping_sub(to0), r.stuck
+        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={} held_ep0_refused={} replayed={} ep0_after_wake={} ep0_timeouts={} stuck={} held_halt_replayed={} phy_skipped={} rewinds={} held_recovery={}",
+        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings, ep0_refused, ep0_replayed, kbd, xs::ep0_timeouts().wrapping_sub(to0), r.stuck, xs::census().held_halt_replayed, xs::census().phy_skipped, xhci::ep0_rewinds().wrapping_sub(rw0), xs::census().held_recovery // HELDMAP (B838): the second (held-EP0) cycle's census; rewinds= is 0 because the rewind is unreachable while the ring push is infallible, not because it never happened
     );
 }
 
@@ -6142,13 +6142,13 @@ fn usbsuspend_held_ep0_leg(run: bool, wait: &dyn Fn(u64, &dyn Fn() -> bool) -> b
     let t0 = crate::arch::ms();
     let marked = loop {
         match xhci::claim() {
-            Ok(mut x) => break Some(x.held_leds_probe()),
+            Ok(mut x) => break Some(x.held_leds_probe() && x.held_halt_probe()), // HELDMAP (B838): the held keyboard's interrupt-IN put on the halt queue too, so `service_hid_halts` meets the held slot
             Err(_) if crate::arch::ms().wrapping_sub(t0) < 1_000 => crate::arch::sched::sleep_ms(5),
             Err(_) => break None,
         }
     };
     if marked == Some(true) {
-        let _ = wait(500, &|| xs::census().held_ep0_refused >= 1);
+        let _ = wait(500, &|| { let c = xs::census(); c.held_ep0_refused >= 1 && c.held_halt_owed >= 1 }); // HELDMAP (B838): the halt owed, nothing issued
     }
     xs::request(false);
     let up = wait(2_000, &|| xs::up());
@@ -6157,7 +6157,7 @@ fn usbsuspend_held_ep0_leg(run: bool, wait: &dyn Fn(u64, &dyn Fn() -> bool) -> b
         None => "busy",
         Some(false) => "none",
         Some(true) if !up => "phase",
-        Some(true) if c.held_ep0_refused >= 1 && c.replayed >= 1 => "ok",
+        Some(true) if c.held_ep0_refused >= 1 && c.replayed >= 1 && c.held_halt_replayed >= 1 && c.held_recovery == 0 => "ok", // HELDMAP (B838): the owed halt taken by the restart; no EP0 recovery on a held slot
         Some(true) => "fail",
     };
     (word, c.held_ep0_refused, c.replayed)

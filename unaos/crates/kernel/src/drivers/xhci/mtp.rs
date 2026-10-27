@@ -666,37 +666,37 @@ impl super::super::XhciController {
     /// The Microsoft OS descriptor probe (synchronous EP0 — the hub path and the service pass only):
     /// string 0xEE, then the Extended Compat ID (device recipient, then interface recipient). A STALL
     /// halts the xHCI control endpoint; it is un-halted before returning, so the next driver's EP0 lives.
-    pub(super) fn mtp_os_probe(&mut self, slot: u8, iface: u8) -> bool {
-        let buf = self.slots[slot as usize].descriptor_buffer as u64;
+    pub(super) fn mtp_os_probe(&mut self, slot: u8, iface: u8) -> Option<bool> { // HELDMAP (B838): `None` = refused on a held slot (deferred: the caller keeps the candidate), never read as "not MTP"
+        let buf = self.slots[slot as usize].descriptor_buffer as u64; let held = core::cell::Cell::new(false);
         if buf == 0 {
-            return false;
+            return Some(false);
         }
         let read = |c: &mut Self, bm: u8, req: u8, val: u16, idx: u16, len: u16| -> Option<Vec<u8>> {
             unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 256) };
-            let r = c.sync_control(slot, bm, req, val, idx, len, buf, true);
+            let r = c.ep0_control(slot, bm, req, val, idx, len, buf, true);
             if !matches!(r, Ok(1) | Ok(13)) {
-                c.mtp_ep0_unhalt(slot);
+                #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] if r == Err(super::super::Ep0Err::Held) { held.set(true); super::super::suspend::held_deferred(slot, super::super::suspend::DEFER_MTP); return None; } c.mtp_ep0_unhalt(slot); // HELDMAP (B838): a held refusal is not a STALL — no un-halt
                 return None;
             }
             let n = (c.last_control_len as usize).min(len as usize);
             Some(unsafe { core::slice::from_raw_parts(buf as *const u8, n) }.to_vec())
         };
         let Some(code) = read(self, 0x80, 0x06, 0x03EE, 0, 18).and_then(|d| os_string_vendor_code(&d)) else {
-            serial_println!("[mtp] slot={} iface={} os-descriptor=none -> not MTP (left to the stock path)", slot, iface);
-            return false;
+            if held.get() { return None; } serial_println!("[mtp] slot={} iface={} os-descriptor=none -> not MTP (left to the stock path)", slot, iface);
+            return Some(false);
         };
         let dev = read(self, 0xC0, code, 0, 4, 40).map(|d| compat_id_is_mtp(&d)).unwrap_or(false);
-        let yes = dev || read(self, 0xC1, code, iface as u16, 4, 40).map(|d| compat_id_is_mtp(&d)).unwrap_or(false);
+        let yes = dev || read(self, 0xC1, code, iface as u16, 4, 40).map(|d| compat_id_is_mtp(&d)).unwrap_or(false); if held.get() { return None; }
         serial_println!("[mtp] slot={} iface={} os-descriptor=MSFT100 vendor_code={:#04x} compat={}", slot, iface, code, if yes { "MTP" } else { "other" });
         if yes {
             OS_DESC_MTP.store(true, Ordering::Relaxed);
         }
-        yes
+        Some(yes)
     }
 
     /// Reset Endpoint (DCI 1) + Set TR Dequeue Pointer to the ep0 ring's enqueue (xHCI 1.2 §4.6.8,
     /// §4.6.10) — only when the control endpoint reads Halted/Error.
-    fn mtp_ep0_unhalt(&mut self, slot: u8) {
+    fn mtp_ep0_unhalt(&mut self, slot: u8) { #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] super::super::suspend::note_held_recovery(slot); // HELDMAP (B838): counted if the slot is held (`held_recovery=`, 0 for PASS)
         let st = self.ep_state_of(slot, 1);
         if st != 2 && st != 4 {
             return;

@@ -971,7 +971,7 @@ impl XhciController {
             HUBBED.store(false, Ordering::Relaxed);
             return false;
         };
-        if VENDOR.load(Ordering::Relaxed) && !self.mtp_os_probe(slot, IFACE.load(Ordering::Relaxed)) {
+        if VENDOR.load(Ordering::Relaxed) && self.mtp_os_probe(slot, IFACE.load(Ordering::Relaxed)) != Some(true) { // HELDMAP (B838): the hub walk reads a held refusal (`None`) as today — no downstream device enumerates behind a suspended hub
             // MTPPHONE: not MTP — release the walk so usbnet's downstream walk (next in mod.rs) sees the slot.
             STATE.store(ST_ABSENT, Ordering::Relaxed);
             HUBBED.store(false, Ordering::Relaxed);
@@ -1019,7 +1019,7 @@ impl XhciController {
         if super::usbnet::is_link_slot(slot) {
             return release(); // the link driver holds this slot (an AX88179 is 0xFF/0xFF/0x00 too)
         }
-        if !self.mtp_os_probe(slot, IFACE.load(Ordering::Relaxed)) {
+        let Some(mtp) = self.mtp_os_probe(slot, IFACE.load(Ordering::Relaxed)) else { return }; if !mtp { // HELDMAP (B838): `None` = refused on a held slot — the candidate stays ST_VENDOR and is asked again after the resume
             return release();
         }
         let (ia, im) = (IN_EP.load(Ordering::Relaxed), IN_MPS.load(Ordering::Relaxed));

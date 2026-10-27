@@ -2812,3 +2812,12 @@ pub fn dhcp_selftest() {
         if b2 { alloc::format!("{}", dora2) } else { alloc::string::String::from("none") }, UdIp(ip2), if ok { "PASS" } else { "FAIL" }
     );
 }
+
+// HELDMAP (rmbp-ledger B838, docs/dev/blueprint/power.md BP-power-7) — FILE-TAIL append under the `pub mod suspend` gate.
+/// `usbnet_ax_poll` on a held slot: the PHY read was REFUSED (`Ep0Err::Held`), not answered, so the link word is left as it
+/// was and only the next poll is scheduled, at the cadence that word implies (`link_seen`'s 2000 / 250 ms) — otherwise
+/// `poll_due` would stay true and the refusal would repeat on every pump pass.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+pub fn link_poll_held(now_ms: u64) {
+    POLL_NEXT.store(now_ms + if LINK.load(Ordering::Relaxed) { 2000 } else { 250 }, Ordering::Relaxed);
+}
