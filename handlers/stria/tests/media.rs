@@ -1085,3 +1085,88 @@ fn av1inband_720p_in_band_bt601_wins_over_the_size_default() {
     assert_ne!(by_track, f.to_rgba_colour(None, Chroma::Bilinear), "not the 720p size default, BT.709");
     println!("av1inband: 1280x720 in-band={} beats the size default", c);
 }
+
+// AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream changing color_config re-picks the colour. kids_720p's item
+// header (measured: a full sequence header, color_description_present_flag at bit 79 = 0, so 2/2/2; color_range at bit 80;
+// color_config ends at bit 85) is re-packed with 6/6/6 limited for the reel's last two samples: the same frame decodes, the
+// first two convert by the 720p size default (BT.709 limited), the last two by the new header's BT.601 limited, one log line.
+const AV1INBANDSWITCH_CDP_BIT: usize = 79;
+const AV1INBANDSWITCH_CC_END: usize = 85;
+
+/// kids_720p's sequence header payload (`seq`, the item's first OBU) with color_description 6/6/6 and the range bit `full`.
+fn av1inbandswitch_patch(seq: &[u8], full: bool) -> Vec<u8> {
+    let bit = |i: usize| (seq[i / 8] >> (7 - i % 8)) & 1 == 1;
+    let mut w = av1_vectors::BitWriter::default();
+    for i in 0..AV1INBANDSWITCH_CDP_BIT {
+        w.flag(bit(i));
+    }
+    w.flag(true); // color_description_present_flag
+    for _ in 0..3 {
+        w.put(8, 6);
+    }
+    w.flag(full); // color_range
+    for i in AV1INBANDSWITCH_CDP_BIT + 2..AV1INBANDSWITCH_CC_END {
+        w.flag(bit(i)); // chroma_sample_position, separate_uv_delta_q, film_grain_params_present
+    }
+    w.trailing();
+    w.bytes
+}
+
+/// kids_720p's item as 4 key samples of an `av01` track (av1C cut to its header); samples 2-3 carry the 6/6/6 header.
+fn av1inbandswitch_reel() -> Option<(Vec<u8>, Vec<u8>)> {
+    let item = av1_vectors::avif_item(&av1_vectors::fetch("kids_720p")?).unwrap();
+    let data = item.data.clone();
+    assert_eq!(&data[..2], &[0x0A, 0x0B], "the item opens with its 11-byte sequence header OBU");
+    let seq = av1inbandswitch_patch(&data[2..13], false);
+    let mut switched = vec![0x0A, seq.len() as u8];
+    switched.extend_from_slice(&seq);
+    switched.extend_from_slice(&data[13..]);
+    assert_eq!(av1_core::image::sequence_codes(&data), Some(((2, 2, 2, false), None, None)), "the vector's own header");
+    assert_eq!(av1_core::image::sequence_codes(&switched), Some(((6, 6, 6, false), None, None)), "the re-packed header");
+    let mut spec = build::TrackSpec::test_pattern(1, 1280, 720, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = item.av1c.unwrap()[..4].to_vec();
+    spec.timescale = 1000;
+    let samples = (0..4).map(|i| build::SampleSpec { data: if i < 2 { data.clone() } else { switched.clone() }, dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+    let file = build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &build::Mp4Extras::default());
+    Some((file, data))
+}
+
+/// The bus sink's conversion (`media_bus`'s `BusSink`): every presented frame by the open's colour, AV1's bilinear chroma.
+struct Av1InBandSwitchSink {
+    colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
+    shown: Vec<Vec<u8>>,
+}
+impl FrameSink for Av1InBandSwitchSink {
+    fn present(&mut self, f: &Frame, _ordinal: u64) {
+        self.shown.push(f.to_rgba_colour(self.colour.as_ref(), gneiss_pal::dsp::video::Chroma::Bilinear));
+    }
+}
+
+#[test]
+fn av1inbandswitch_player_repicks_bt601_after_the_header_switch() {
+    capture_logs();
+    let Some((file, _)) = av1inbandswitch_reel() else { return };
+    let (e709, e601) = (av1playercolour_expect(&file, &av1playercolour_c(1)), av1playercolour_expect(&file, &av1playercolour_c(6)));
+    assert_ne!(e709, e601, "the vector separates the two matrices");
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    assert_eq!(p.colour(), Some(&av1playercolour_c(2)), "the open's in-band header: 2/2/2 limited");
+    p.play();
+    let mut sink = Av1InBandSwitchSink { colour: p.colour().copied(), shown: Vec::new() };
+    for _ in 0..400 {
+        if sink.shown.len() >= 4 || p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    assert_eq!(sink.shown.len(), 4, "every sample presents");
+    assert!(sink.shown[0] == e709 && sink.shown[1] == e709, "before the switch: the 720p size default, BT.709 limited");
+    assert!(sink.shown[2] == e601 && sink.shown[3] == e601, "after the switch: the new header's BT.601 limited");
+    let lines = my_log_lines("video colour switch");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("matrix=2->6 range=limited"), "{}", lines[0]);
+    println!("av1inbandswitch: {} ; frames 0-1 bt709, 2-3 bt601", lines[0]);
+}

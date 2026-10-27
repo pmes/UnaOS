@@ -96,11 +96,12 @@ pub struct Decoder {
     pub seq: Option<SequenceHeader>,
     pub refs: RefStore,
     pub filters: Filters,
+    pub meta: (Option<(u16, u16)>, Option<([[u16; 2]; 3], [u16; 2], u32, u32)>), // AV1INBANDSWITCH (SR373): the last in-band HDR_CLL / HDR_MDCV
 }
 
 impl Decoder {
     pub fn new() -> Decoder {
-        Decoder { seq: None, refs: RefStore::default(), filters: Filters::default() }
+        Decoder { seq: None, refs: RefStore::default(), filters: Filters::default(), meta: (None, None) }
     }
 
     /// Decode every OBU in `data`; returns the shown frames in output order. With
@@ -161,7 +162,7 @@ impl Decoder {
                         }
                     }
                 }
-                _ => {}
+                _ => self.note(&o), // AV1INBANDSWITCH (SR373): METADATA OBUs recorded for `current_codes`
             }
         }
         Ok(out)
@@ -322,13 +323,14 @@ fn tile_group_ends_frame(g: &[u8], hdr: &FrameHeader) -> Result<bool> {
 pub struct StreamDecoder {
     pub dec: Decoder,
     pub filters: Filters,
+    pub inband: InBand, // AV1INBANDSWITCH (SR373): the in-band colour switch state
 }
 
 impl StreamDecoder {
     /// `av1c` is the container's AV1CodecConfigurationRecord body (MP4 `av1C`, Matroska
     /// CodecPrivate) or empty.
     pub fn new(av1c: &[u8]) -> Result<StreamDecoder> {
-        let mut d = StreamDecoder { dec: Decoder::new(), filters: Filters::default() };
+        let mut d = StreamDecoder { dec: Decoder::new(), filters: Filters::default(), inband: InBand::default() };
         if !av1c.is_empty() {
             let cfg = crate::avif::Av1Config::parse(av1c)?;
             for o in split_obus(&cfg.config_obus)? {
@@ -634,4 +636,64 @@ pub fn sequence_codes(tu: &[u8]) -> Option<Av1Codes> {
 /// the caller has none). `demux_core::colour::Colour::from_av1` maps it, for gneiss_pal and the kernel Player alike.
 pub fn stream_codes(av1c: &[u8], first_tu: &[u8]) -> Option<Av1Codes> {
     av1c_codes(av1c).or_else(|| sequence_codes(first_tu))
+}
+
+// ── AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream re-picks the colour ─────────────────────────────────────
+// The decoder already replaces its sequence header on every in-band OBU_SEQUENCE_HEADER and every `Planes` carries it; the
+// Players converted by the open's colour regardless. ONE rule, on plain values (demux_core's `Colour` maps them on each face): a
+// frame converts by the open's colour until the current header's code points differ from the first decoded one's (the open's
+// bitstream reading); then every field the open took FROM the bitstream (open == base) follows the current header and a field the
+// container stated differently keeps the container's. Back at the base codes = the open's colour again, byte-identical.
+
+/// AV1INBANDSWITCH (SR373): a [`StreamDecoder`]'s switch state — the first decoded header's code points (`base`) and the colour
+/// the last frame switched to (`last`, `None` = the open's).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct InBand {
+    pub base: Option<(u8, u8, u8, bool)>,
+    pub last: Option<(u8, u8, u8, Option<bool>)>,
+}
+
+impl Decoder {
+    /// AV1INBANDSWITCH (SR373): the codes of the sequence header in effect (its color_config) and the last HDR_CLL / HDR_MDCV
+    /// METADATA OBU the stream carried in-band (`None` before any sequence header).
+    pub fn current_codes(&self) -> Option<Av1Codes> {
+        let cc = &self.seq.as_ref()?.color_config;
+        Some(((cc.color_primaries, cc.transfer_characteristics, cc.matrix_coefficients, cc.color_range), self.meta.0, self.meta.1))
+    }
+
+    /// AV1INBANDSWITCH (SR373): a top-level OBU the decode loop does not decode: a METADATA OBU that parses updates `meta`.
+    fn note(&mut self, o: &Obu) {
+        if o.obu_type != OBU_METADATA_T {
+            return;
+        }
+        match parse_metadata(o.payload) {
+            Ok(Metadata::Cll { max_cll, max_fall }) => self.meta.0 = Some((max_cll, max_fall)),
+            Ok(Metadata::Mdcv { primaries, white, luminance_max, luminance_min }) => self.meta.1 = Some((primaries, white, luminance_max, luminance_min)),
+            _ => {}
+        }
+    }
+}
+
+impl StreamDecoder {
+    /// AV1INBANDSWITCH (SR373): after a decode — `open` the open's colour as `(primaries, transfer, matrix, full_range)`. `.0` is
+    /// `None` while the current header's code points equal the first decoded header's (the open's colour applies), else the
+    /// colour to convert by ([`switch_codes`]); `.1` is `Some((matrix before, matrix now))` once per change of `.0`.
+    pub fn switch(&mut self, open: Option<(u8, u8, u8, Option<bool>)>) -> (Option<(u8, u8, u8, Option<bool>)>, Option<(u8, u8)>) {
+        let Some((now, _, _)) = self.dec.current_codes() else { return (self.inband.last, None) };
+        let base = *self.inband.base.get_or_insert(now);
+        let next = if now == base { None } else { Some(switch_codes(open, base, now)) };
+        let open_m = open.map_or(base.2, |o| o.2);
+        let changed = (next != self.inband.last).then(|| (self.inband.last.map_or(open_m, |l| l.2), next.map_or(open_m, |n| n.2)));
+        self.inband.last = next;
+        (next, changed)
+    }
+}
+
+/// AV1INBANDSWITCH (SR373): the container-wins merge of a header switch — each field the open took from the bitstream (equal to
+/// `base`, the open's in-band reading) takes `now`'s value; a field the container stated differently keeps the open's. `open`
+/// `None` (no colour at open) reads as `base`.
+pub fn switch_codes(open: Option<(u8, u8, u8, Option<bool>)>, base: (u8, u8, u8, bool), now: (u8, u8, u8, bool)) -> (u8, u8, u8, Option<bool>) {
+    let o = open.unwrap_or((base.0, base.1, base.2, Some(base.3)));
+    let f = |o: u8, b: u8, n: u8| if o == b { n } else { o };
+    (f(o.0, base.0, now.0), f(o.1, base.1, now.1), f(o.2, base.2, now.2), if o.3 == Some(base.3) { Some(now.3) } else { o.3 })
 }

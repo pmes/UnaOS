@@ -537,3 +537,41 @@ fn av1inband_sequence_codes_equal_the_av1c_reading() {
     no_seq.extend(obu(15, &[0; 3], true));
     assert_eq!(sequence_codes(&no_seq), None, "a temporal unit with no sequence header");
 }
+
+// AV1INBANDSWITCH (LEDGER SR373): a new sequence header mid-stream — the decoder's current codes follow it (with the in-band
+// HDR metadata after the first temporal unit), and `StreamDecoder::switch` re-picks under the container-wins rule.
+
+/// A temporal unit: temporal delimiter, sequence header `seq`, then `extra` OBUs (no frame: the header and metadata path alone).
+fn inbandswitch_tu(seq: &[u8], extra: &[Vec<u8>]) -> Vec<u8> {
+    let mut tu = obu(2, &[], true);
+    tu.extend(obu(1, seq, true));
+    for e in extra {
+        tu.extend_from_slice(e);
+    }
+    tu
+}
+
+#[test]
+fn av1inbandswitch_current_codes_follow_the_in_band_header() {
+    use av1_core::image::{switch_codes, StreamDecoder};
+    let mut sd = StreamDecoder::new(&[]).unwrap();
+    assert_eq!(sd.dec.current_codes(), None, "no header yet");
+    let open = Some((1, 1, 1, Some(false)));
+    sd.decode_temporal_unit_all(&inbandswitch_tu(&inband_seq(1, 1, 1, false), &[])).unwrap();
+    assert_eq!(sd.dec.current_codes(), Some(((1, 1, 1, false), None, None)));
+    assert_eq!(sd.switch(open), (None, None), "the first header is the open's: no switch");
+    // the second temporal unit: a new header (BT.601) and HDR_CLL metadata after the first temporal unit
+    sd.decode_temporal_unit_all(&inbandswitch_tu(&inband_seq(6, 6, 6, false), &[obu(5, &inband_cll(), true)])).unwrap();
+    assert_eq!(sd.dec.current_codes(), Some(((6, 6, 6, false), Some((1000, 400)), None)), "current codes follow the new header and carry the CLL");
+    assert_eq!(sd.switch(open), (Some((6, 6, 6, Some(false))), Some((1, 6))), "the switch, reported once");
+    assert_eq!(sd.switch(open), (Some((6, 6, 6, Some(false))), None), "held, not reported again");
+    // a container-stated field (primaries 9, unlike the open's in-band 1) survives the switch
+    assert_eq!(switch_codes(Some((9, 1, 1, Some(false))), (1, 1, 1, false), (6, 6, 6, true)), (9, 6, 6, Some(true)));
+    assert_eq!(switch_codes(None, (1, 1, 1, false), (6, 6, 6, true)), (6, 6, 6, Some(true)), "no open colour: the new header whole");
+    // a seek drops the reference frames, not the switch state; back at the base header = the open's colour again
+    sd.reset();
+    sd.decode_temporal_unit_all(&inbandswitch_tu(&inband_seq(1, 1, 1, false), &[])).unwrap();
+    assert_eq!(sd.switch(open), (None, Some((6, 1))), "the switch back, reported once");
+    assert_eq!(sd.dec.current_codes(), Some(((1, 1, 1, false), Some((1000, 400)), None)), "the last CLL stays in effect");
+    println!("av1inbandswitch: current_codes 1/1/1 -> 6/6/6+cll -> 1/1/1; switch reported twice; container primaries kept");
+}
