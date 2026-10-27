@@ -500,7 +500,7 @@ pub fn disconnect(slot: u8) {
 //     flight-31 refusal was a timeout followed by a readback on a ring still holding the dead TD.
 //   * EP0 RESET. A retry after a try that timed out first takes EP0 out of its state (Stop Endpoint when
 //     Running, Reset Endpoint when Halted/Error) and moves its dequeue to our enqueue (Set TR Dequeue),
-//     abandoning the stranded TD — `usbnet_rx_reset`'s shape on DCI 1.
+//     abandoning the stranded TD — through the driver's ONE EP0 recovery, `ep0_recover` (mod.rs file tail, PORTRESET B837).
 // Wire: `[usbnet] bring-up try=<n> of 3 slot= after_ms= ep0_reset=..` at a retry's start, and one
 // `[usbnet] bring-up try=<n> of 3 kind= slot= ms= ep0_timeouts= at= -> armed | retry backoff_ms= | declined(final)`
 // per try.
@@ -606,7 +606,7 @@ impl super::XhciController {
         if n > 0 {
             let after = LAST_BACKOFF_MS.load(Ordering::Relaxed);
             if reset {
-                let (st, stop_cc, deq_cc) = self.usbnet_ep0_reset(slot);
+                let (st, stop_cc, deq_cc) = self.ep0_recover(slot);
                 serial_println!(
                     "[usbnet] bring-up try={} of {} slot={} after_ms={} ep0_reset=state:{} stop_cc={} deq_cc={} now={}",
                     n, BRINGUP_RETRIES, slot, after, st, stop_cc, deq_cc, self.ep_state_of(slot, 1)
@@ -616,32 +616,6 @@ impl super::XhciController {
             }
         }
         self.usbnet_bringup(slot);
-    }
-
-    /// EP0 (DCI 1) out of whatever a dead transfer left it in, its dequeue moved past the stranded TD:
-    /// Stop Endpoint (Running) or Reset Endpoint (Halted/Error), then Set TR Dequeue to our enqueue.
-    /// Returns (state before, stop/reset cc, set-dequeue cc); cc 0 = not issued or no completion.
-    fn usbnet_ep0_reset(&mut self, slot: u8) -> (u8, u8, u8) {
-        use super::Trb;
-        let ctx = (1u32 << 16) | ((slot as u32) << 24);
-        let st = self.ep_state_of(slot, 1);
-        let stop_cc = match st {
-            1 => self.recover_cmd(Trb { parameter: 0, status: 0, control: (15 << 10) | ctx }).1,
-            2 | 4 => self.recover_cmd(Trb { parameter: 0, status: 0, control: (14 << 10) | ctx }).1,
-            _ => 0,
-        };
-        if self.ep_state_of(slot, 1) != 3 {
-            return (st, stop_cc, 0);
-        }
-        let deq = match self.slots[slot as usize].ep0_ring.as_ref() {
-            Some(r) => {
-                let (phys, dcs) = r.dequeue_reset_target();
-                phys | (dcs as u64)
-            }
-            None => return (st, stop_cc, 0),
-        };
-        let deq_cc = self.recover_cmd(Trb { parameter: deq, status: 0, control: (16 << 10) | ctx }).1;
-        (st, stop_cc, deq_cc)
     }
 }
 

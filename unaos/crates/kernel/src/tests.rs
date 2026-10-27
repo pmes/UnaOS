@@ -5316,7 +5316,7 @@ fn usbsuspend_selftest() {
     xs::request(false); #[cfg(feature = "ehcihid")] es::request(false);
     let up = wait(2_000, &|| xs::up() && e_up());
     let held_word = usbsuspend_held_collect(held);
-    let r = xs::census(); let (ep0_word, ep0_refused, ep0_replayed) = usbsuspend_held_ep0_leg(up && held_word != "none", &wait); // HELDSLOTEP0 (B804): the second, xHCI-only cycle (file-tail fn), after this cycle's census; LINE-NEUTRAL fold, code first
+    let r = xs::census(); let (ep0_word, ep0_refused, ep0_replayed) = usbsuspend_held_ep0_leg(up && held_word != "none", &wait); let rs = usbsuspend_reset_leg(up && held_word != "none", &wait); // HELDSLOTEP0 (B804): the second, xHCI-only cycle (file-tail fn), after this cycle's census; LINE-NEUTRAL fold, code first
     let mut probe = None;
     let t0 = crate::arch::ms();
     while probe.is_none() && crate::arch::ms().wrapping_sub(t0) < 1_000 {
@@ -5332,7 +5332,7 @@ fn usbsuspend_selftest() {
     let verdict = if xs::ep0_timeouts() != to0 { "FAIL reason=xhci-dead" } else if !in_u3 || !up {
         "FAIL reason=phase-timeout"
     } else if c.pls3 != c.suspended || r.resumed < c.suspended || e.resumed < e.suspended || r.ep_running < r.ep_stopped { "FAIL"
-    } else if kbd != "none" { if kbd != "ok" || c.suspended == 0 || held_word != "ok" || ep0_word != "ok" { "FAIL" } else { "PASS" }
+    } else if kbd != "none" { if kbd != "ok" || c.suspended == 0 || held_word != "ok" || ep0_word != "ok" || rs.0 != "ok" || rs.1 != "ok" || rs.2 != "ok" { "FAIL" } else { "PASS" }
     } else if e_kbd == "none" {
         "SKIP reason=no-kbd"
     } else if e_kbd != "ok" || e.ports == 0 || e.suspended != e.ports {
@@ -5342,8 +5342,8 @@ fn usbsuspend_selftest() {
     };
     let (kbd_on, kbd_word) = if kbd != "none" { ("xhci", kbd) } else { ("ehci", e_kbd) };
     serial_println!(
-        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={} held_ep0_refused={} replayed={} ep0_after_wake={} ep0_timeouts={} stuck={}",
-        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings, ep0_refused, ep0_replayed, kbd, xs::ep0_timeouts().wrapping_sub(to0), r.stuck
+        ":: USBSUSPEND: ports={} suspended={} resumed={} kbd={} ep_stopped={} ep_running={} -> {} :: pls3={} kept={} kbd_ep={} remote_wakes={} ehci={}/{} ehci_kept={} ehci_resumed={} wake_armed={} kbd_on={} held_report={} held_rings={} held_ep0_refused={} replayed={} ep0_after_wake={} ep0_timeouts={} stuck={} port_reset={} reenum={} ep0_after_reset={} reset={}",
+        c.ports, c.suspended, r.resumed, kbd_word, r.ep_stopped, r.ep_running, verdict, c.pls3, c.kept, ep, r.remote_wakes, e.suspended, e.ports, e.kept, e.resumed, e.wake_armed, kbd_on, held_word, r.held_rings, ep0_refused, ep0_replayed, kbd, xs::ep0_timeouts().wrapping_sub(to0), r.stuck, rs.0, rs.1, rs.2, rs.3
     );
 }
 
@@ -6343,17 +6343,17 @@ fn textscale2_aether_spawn() -> Option<(u64, u64)> {
 /// `tests sleep` (registered on the SLEEP line): the sleep fixture, then (`wc`) the xHCI leg.
 #[cfg(all(target_arch = "x86_64", feature = "lidsleep"))]
 fn sleep_usb_selftest() {
-    #[cfg(feature = "wc")] let to0 = crate::drivers::xhci::suspend::ep0_timeouts();
+    #[cfg(feature = "wc")] let to0 = crate::drivers::xhci::suspend::ep0_timeouts(); #[cfg(feature = "wc")] let rs0 = crate::drivers::xhci::suspend::census().reset;
     crate::video::lidsleep::sleep_selftest();
-    #[cfg(feature = "wc")] sleep_xhci_leg(to0);
+    #[cfg(feature = "wc")] sleep_xhci_leg(to0, rs0);
 }
 
-/// `:: SLEEPUSB: suspended= resumed= stuck= ep0_timeouts= ep0_after_wake= -> PASS|FAIL reason=…|SKIP reason=no-xhci ::`.
+/// `:: SLEEPUSB: suspended= resumed= stuck= ep0_timeouts= ep0_after_wake= reset= -> PASS|FAIL reason=…|SKIP reason=no-xhci ::`.
 #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
-fn sleep_xhci_leg(to0: u32) {
+fn sleep_xhci_leg(to0: u32, rs0: u32) {
     use crate::drivers::xhci::{self, suspend as xs};
     if matches!(xhci::claim(), Err(xhci::XhciClaimError::NotReady)) {
-        serial_println!(":: SLEEPUSB: suspended=0 resumed=0 stuck=0 ep0_timeouts=0 ep0_after_wake=none -> SKIP reason=no-xhci ::");
+        serial_println!(":: SLEEPUSB: suspended=0 resumed=0 stuck=0 ep0_timeouts=0 ep0_after_wake=none reset=0 -> SKIP reason=no-xhci ::");
         return;
     }
     let t0 = crate::arch::ms();
@@ -6385,8 +6385,8 @@ fn sleep_xhci_leg(to0: u32) {
         "PASS"
     };
     serial_println!(
-        ":: SLEEPUSB: suspended={} resumed={} stuck={} ep0_timeouts={} ep0_after_wake={} -> {} ::",
-        c.suspended, c.resumed, c.stuck, timeouts, ep0, verdict
+        ":: SLEEPUSB: suspended={} resumed={} stuck={} ep0_timeouts={} ep0_after_wake={} reset={} -> {} ::",
+        c.suspended, c.resumed, c.stuck, timeouts, ep0, c.reset.wrapping_sub(rs0), verdict
     );
 }
 
@@ -7185,4 +7185,61 @@ fn textscale_selftest() {
         ":: TEXTSCALE: steps={} overlap={} cap={} -> {} :: bumps={} moved={} fits={} clipped={} kit={} restored={} why={}",
         done, overlap, cap_seen, v, bumps, moved, fits as u8, clipped, if kit { "ok" } else { "bad" }, restored as u8, why
     );
+}
+
+// ══════════════ PORTRESET (rmbp-ledger B837, BP-power-7) — `tests usbsuspend`'s reset leg — TAIL-APPENDED ══════════════
+
+/// PORTRESET (B837): a THIRD, xHCI-only cycle. The fixture hook (`reset_fixture_arm`) makes the resume judge the xHCI
+/// keyboard's port stuck; the pump's UP pass then resets that port and re-enumerates it through the attach path, and EP0
+/// answers again on the new slot (`kbd_report_probe`, GET_REPORT). `(port_reset, reenum, ep0_after_reset, resets)`:
+/// `port_reset` = `ok` | `stuck` (the reset was judged stuck) | `timeout` (not judged in 15 s) | `phase` | `none` (no xHCI
+/// keyboard, or not run) | `busy` (no claim); `reenum` / `ep0_after_reset` = `ok` | `fail` | `-`. The hook is disarmed on
+/// every exit.
+#[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))]
+fn usbsuspend_reset_leg(run: bool, wait: &dyn Fn(u64, &dyn Fn() -> bool) -> bool) -> (&'static str, &'static str, &'static str, u32) {
+    use crate::drivers::xhci::{self, suspend as xs};
+    if !run {
+        return ("none", "-", "-", 0);
+    }
+    let c0 = xs::census();
+    let claim = |f: &mut dyn FnMut(&mut xhci::XhciController)| -> bool {
+        let t0 = crate::arch::ms();
+        loop {
+            match xhci::claim() {
+                Ok(mut x) => { f(&mut *x); return true; }
+                Err(_) if crate::arch::ms().wrapping_sub(t0) < 1_000 => crate::arch::sched::sleep_ms(5),
+                Err(_) => return false,
+            }
+        }
+    };
+    let mut armed = None;
+    if !claim(&mut |x: &mut xhci::XhciController| armed = x.reset_fixture_arm()) {
+        return ("busy", "-", "-", 0);
+    }
+    let Some(port) = armed else { return ("none", "-", "-", 0) };
+    xs::request(true);
+    if !wait(2_000, &|| xs::suspended()) {
+        xs::request(false);
+        let _ = wait(2_000, &|| xs::up());
+        xs::reset_fixture_disarm();
+        return ("phase", "-", "-", 0);
+    }
+    xs::request(false);
+    let up = wait(2_000, &|| xs::up());
+    let judged = up && wait(15_000, &|| xs::census().reset > c0.reset && !xs::resetting());
+    xs::reset_fixture_disarm();
+    let c = xs::census();
+    let resets = c.reset.wrapping_sub(c0.reset);
+    let port_reset = if !up { "phase" } else if !judged { "timeout" } else if c.reset_ok > c0.reset_ok { "ok" } else { "stuck" };
+    let mut on_port = false;
+    let mut probe = None;
+    if !claim(&mut |x: &mut xhci::XhciController| { on_port = x.kbd_on_port(port); probe = x.kbd_report_probe(); }) {
+        return (port_reset, "-", "-", resets);
+    }
+    let reenum = if on_port { "ok" } else { "fail" };
+    let ep0 = match probe {
+        Some((cc, _, len)) if matches!(cc, 1 | 13) && len > 0 => "ok",
+        _ => "fail",
+    };
+    (port_reset, reenum, ep0, resets)
 }

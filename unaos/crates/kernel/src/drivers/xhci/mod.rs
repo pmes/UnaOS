@@ -6325,7 +6325,7 @@ impl XhciController {
     /// even a "ready" storage slot (recovery's paranoia guard protects a live device across a
     /// transient stall; a disconnect is not transient). Returns the number of slots torn down.
     fn dispose_disconnected_slots(&mut self, port: u8) -> usize {
-        let mut n = 0usize;
+        let mut n = 0usize; #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] self.port_forget(port);
         for i in 1..self.slots.len() {
             if !self.slots[i].active || self.slots[i].port_id != port {
                 continue;
@@ -13986,7 +13986,7 @@ impl XhciController {
             crate::hlt(); // yield to QEMU so it can DMA the completion into the event ring
             let elapsed = crate::arch::now_cycles().wrapping_sub(start);
             if elapsed >= budget {
-                serial_println!("xHCI: EP0 sync pump TIMEOUT after {} cycles (budget {})", elapsed, budget); #[cfg(feature = "usbnet")] usbnet::note_ep0_timeout(); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] suspend::note_ep0_timeout(); // PUMPRETRY (B537): counted into the bring-up try that saw it (`ep0_timeouts=`), which also arms the EP0 ring reset before the retry. LINE-NEUTRAL append
+                serial_println!("xHCI: EP0 sync pump TIMEOUT after {} cycles (budget {})", elapsed, budget); #[cfg(feature = "usbnet")] usbnet::note_ep0_timeout(); #[cfg(all(target_arch = "x86_64", feature = "lidsleep", feature = "wc"))] suspend::note_ep0_timeout(); self.ep0_recover(slot_id); // PUMPRETRY (B537): counted into the bring-up try that saw it (`ep0_timeouts=`), which also arms the EP0 ring reset before the retry. LINE-NEUTRAL append
                 return Err(());
             }
         }
@@ -18113,7 +18113,7 @@ pub mod suspend {
 
     /// One cycle's numbers, for `tests usbsuspend`.
     #[derive(Clone, Copy)]
-    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32, pub held_rings: u32, pub held_ep0_refused: u32, pub replayed: u32, pub stuck: u32 } // HELDSLOTEP0 (B804): held_ep0_refused, replayed; SLEEP2 (B812): stuck
+    pub struct Census { pub ports: u32, pub suspended: u32, pub pls3: u32, pub resumed: u32, pub kept: u32, pub remote_wakes: u32, pub ep_stopped: u32, pub ep_running: u32, pub held_rings: u32, pub held_ep0_refused: u32, pub replayed: u32, pub stuck: u32, pub reset: u32, pub reset_ok: u32, pub reset_fail: u32 } // HELDSLOTEP0 (B804): held_ep0_refused, replayed; SLEEP2 (B812): stuck; PORTRESET (B837): reset, reset_ok, reset_fail (this boot)
 
     /// `true` while the ports are in U3 (the last request has been applied); `false` once fully back in U0.
     pub fn suspended() -> bool { PHASE.load(Ordering::Acquire) == SUSPENDED }
@@ -18125,6 +18125,7 @@ pub mod suspend {
             resumed: RESUMED_N.load(Ordering::Relaxed), kept: KEPT_N.load(Ordering::Relaxed), remote_wakes: REMOTE_WAKES.load(Ordering::Relaxed),
             ep_stopped: EP_STOPPED_N.load(Ordering::Relaxed), ep_running: EP_RUNNING_N.load(Ordering::Relaxed),
             held_rings: HELD_RINGS.load(Ordering::Relaxed), held_ep0_refused: HELD_EP0_REFUSED_N.load(Ordering::Relaxed), replayed: HELD_EP0_REPLAYED_N.load(Ordering::Relaxed), stuck: STUCK.load(Ordering::Relaxed).count_ones(),
+            reset: RESET_N.load(Ordering::Relaxed), reset_ok: RESET_OK_N.load(Ordering::Relaxed), reset_fail: RESET_FAIL_N.load(Ordering::Relaxed),
         }
     }
 
@@ -18171,6 +18172,7 @@ pub mod suspend {
                     self.endpoints_restart();
                     PHASE.store(UP, Ordering::Release);
                 }
+                UP => self.ports_reset_service(now), // PORTRESET (B837): a stuck port is reset and re-enumerated through the attach path
                 _ => {}
             }
         }
@@ -18268,14 +18270,16 @@ pub mod suspend {
                     continue;
                 }
                 let pls = (self.read_portsc(port) & PLS_MASK) >> PLS_SHIFT;
-                let ok = pls == PLS_U0;
+                let forced = FORCE_STUCK.load(Ordering::Relaxed) & b != 0; // PORTRESET (B837): the fixture hook on the resume bound
+                let ok = pls == PLS_U0 && !forced;
                 let bound = if is2 { RESUME_MS + RESUME_BOUND_MS } else { RESUME_BOUND_MS };
                 if !ok && elapsed < bound { continue; }
                 pending &= !b;
                 if ok { RESUMED_N.fetch_add(1, Ordering::Relaxed); } else { STUCK.fetch_or(b, Ordering::Release); }
+                if forced { FORCE_STUCK.fetch_and(!b, Ordering::Relaxed); }
                 serial_println!(
-                    "[usb] port={} resume pls={}->{} ms={} -> {}{}",
-                    port, PLS_BEFORE[port as usize - 1].load(Ordering::Relaxed), pls, elapsed, if ok { "ok" } else { "stuck" }, self.kbd_ep_word(port)
+                    "[usb] port={} resume pls={}->{} ms={} -> {}{}{}",
+                    port, PLS_BEFORE[port as usize - 1].load(Ordering::Relaxed), pls, elapsed, if ok { "ok" } else { "stuck" }, self.kbd_ep_word(port), if forced { " why=fixture" } else { "" }
                 );
             }
             PENDING.store(pending, Ordering::Relaxed);
@@ -18500,6 +18504,112 @@ pub mod suspend {
             true
         }
     }
+
+    // ══════════════ PORTRESET (rmbp-ledger B837, BP-power-7) — a stuck port is reset and re-enumerated ══════════════
+    // SLEEP2 (B812) left a port whose resume missed its bound in `STUCK` for the rest of the boot, its slots `HELD`. The
+    // recovery is the ATTACH PATH, never a second one: `dispose_disconnected_slots` tears the port's slots down (its fold,
+    // [`XhciController::port_forget`], releases the hold and the port's `STUCK` bit), the port goes on `ports_to_enumerate`
+    // and `start_next_port` resets it (`issue_enum_reset`: PORTSC.PR, the PRC in `handle_port_status`, bounded by
+    // `service_enum`'s watchdog and its 3 resets) and re-enumerates it (Enable Slot, Address Device, the kind re-probed).
+    // The pump's UP pass judges the port once the attach path has left it. One try per stuck episode (`TRIED`): a port
+    // that fails the reset stays stuck and says so; its next disposal (a disconnect) clears `TRIED`. Loan holder only.
+
+    /// Ports whose reset this episode has been launched (bit `port - 1`); cleared by an `ok` and by the port's disposal.
+    static TRIED: AtomicU64 = AtomicU64::new(0);
+    /// Ports whose reset is launched and not yet judged (one at a time: the attach path is serial).
+    static RESETTING: AtomicU64 = AtomicU64::new(0);
+    /// The launch instant and the enumeration FSM's `stall_count` at the launch (a stall since then is this reset's).
+    static RESET_T0_MS: AtomicU64 = AtomicU64::new(0);
+    static RESET_STALL0: AtomicU32 = AtomicU32::new(0);
+    /// Resets launched / judged ok / judged stuck, this boot (`Census`; `tests usbsuspend`, `tests sleep`).
+    static RESET_N: AtomicU32 = AtomicU32::new(0);
+    static RESET_OK_N: AtomicU32 = AtomicU32::new(0);
+    static RESET_FAIL_N: AtomicU32 = AtomicU32::new(0);
+    /// `tests usbsuspend`'s fixture hook on the resume bound: the port(s) `ports_resume` judges stuck whatever PLS reads
+    /// (consumed when judged; disarmed by the fixture on every exit).
+    static FORCE_STUCK: AtomicU64 = AtomicU64::new(0);
+
+    /// `true` while a launched reset has not been judged.
+    pub fn resetting() -> bool { RESETTING.load(Ordering::Relaxed) != 0 }
+
+    /// The fixture's disarm (every exit of `tests usbsuspend`'s reset leg).
+    pub fn reset_fixture_disarm() { FORCE_STUCK.store(0, Ordering::Relaxed); }
+
+    impl XhciController {
+        /// `dispose_disconnected_slots`' fold (the ONE slot teardown: a disconnect CSC, the deferred re-plug, the reset):
+        /// every active slot on `port` leaves the hold (`HELD`, `RANG`, `OWED` := 0), and the port's `STUCK` and `TRIED`
+        /// bits are cleared, so a replugged or re-enumerated device can sleep again.
+        pub(super) fn port_forget(&mut self, port: u8) {
+            for slot in 1..self.slots.len().min(HELD.len()) {
+                if !self.slots[slot].active || self.slots[slot].port_id != port { continue; }
+                HELD[slot].store(0, Ordering::Relaxed);
+                RANG[slot].store(0, Ordering::Relaxed);
+                OWED[slot].store(0, Ordering::Relaxed);
+            }
+            let b = bit(port);
+            TRIED.fetch_and(!b, Ordering::Relaxed);
+            if STUCK.fetch_and(!b, Ordering::Release) & b != 0 {
+                serial_println!("[usb] port={} stuck cleared why=dispose", port);
+            }
+        }
+
+        /// The pump's UP pass (`port_suspend_service`): judge a launched reset once the attach path has left its port, else
+        /// launch the reset of the lowest stuck port not yet tried — only while no enumeration is in flight and the sleep
+        /// does not want the bus.
+        fn ports_reset_service(&mut self, now: u64) {
+            let resetting = RESETTING.load(Ordering::Relaxed);
+            if resetting != 0 {
+                let port = resetting.trailing_zeros() as u8 + 1;
+                if self.enumerating_port == port || self.ports_to_enumerate.contains(&port) { return; } // the attach path still owns it
+                let b = bit(port);
+                RESETTING.fetch_and(!b, Ordering::Relaxed);
+                let ms = now.saturating_sub(RESET_T0_MS.load(Ordering::Relaxed));
+                let slots = self.slots.iter().skip(1).filter(|s| s.active && s.port_id == port).count();
+                if slots > 0 {
+                    RESET_OK_N.fetch_add(1, Ordering::Relaxed);
+                    TRIED.fetch_and(!b, Ordering::Relaxed);
+                    serial_println!("[usb] port={} reset -> ok reenum=ok slots={} kbd={} ms={}", port, slots, self.kbd_slot_on(port).is_some() as u8, ms);
+                } else if self.read_portsc(port) & 1 == 0 {
+                    serial_println!("[usb] port={} reset -> clear why=no-device ms={}", port, ms);
+                } else {
+                    STUCK.fetch_or(b, Ordering::Release);
+                    RESET_FAIL_N.fetch_add(1, Ordering::Relaxed);
+                    let stalled = self.stall_count != RESET_STALL0.load(Ordering::Relaxed);
+                    let (why, stage) = match &self.last_stall {
+                        Some(s) if stalled && s.port == port => (s.why, s.stage),
+                        _ => ("reenum-none", "-"),
+                    };
+                    serial_println!("[usb] port={} reset -> stuck why={} stage={} ms={}", port, why, stage, ms);
+                }
+                return;
+            }
+            let pick = STUCK.load(Ordering::Acquire) & !TRIED.load(Ordering::Relaxed);
+            if pick == 0 || self.enum_active || WANT.load(Ordering::Acquire) { return; }
+            let port = pick.trailing_zeros() as u8 + 1;
+            let b = bit(port);
+            let disposed = self.dispose_disconnected_slots(port); // its fold (`port_forget`) releases the hold and clears `STUCK`
+            TRIED.fetch_or(b, Ordering::Relaxed);
+            RESETTING.fetch_or(b, Ordering::Relaxed);
+            RESET_N.fetch_add(1, Ordering::Relaxed);
+            RESET_T0_MS.store(now, Ordering::Relaxed);
+            RESET_STALL0.store(self.stall_count, Ordering::Relaxed);
+            serial_println!("[usb] port={} reset slots={} -> reenum", port, disposed);
+            if !self.ports_to_enumerate.contains(&port) { self.ports_to_enumerate.push(port); }
+            self.start_next_port();
+        }
+
+        /// `tests usbsuspend`'s reset leg: the next resume judges the xHCI keyboard's port stuck (`FORCE_STUCK`).
+        /// `Some(port)`; `None` = no xHCI keyboard.
+        pub fn reset_fixture_arm(&mut self) -> Option<u8> {
+            let (slot, _, _) = self.kbd_slot_on(0)?;
+            let port = self.slots[slot as usize].port_id;
+            FORCE_STUCK.store(bit(port), Ordering::Relaxed);
+            Some(port)
+        }
+
+        /// `tests usbsuspend`'s reset leg: an active keyboard slot is on `port` again (the kind re-probed).
+        pub fn kbd_on_port(&self, port: u8) -> bool { self.kbd_slot_on(port).is_some() }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -18525,5 +18635,46 @@ impl XhciController {
         }
         self.ep0_queue(slot_id, bm_req, b_req, w_value, w_index, w_length, data_phys, dir_in).map_err(|()| Ep0Err::NoCompletion)?;
         self.ep0_wait(slot_id, w_length, data_phys, dir_in).map_err(|()| Ep0Err::NoCompletion)
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
+// PORTRESET (rmbp-ledger B837, docs/dev/blueprint/power.md BP-power-7) — EP0's ONE recovery after a dead control transfer.
+// FILE-TAIL append (unconditional: the EP0 sync pump's TIMEOUT line calls it on every board), so no `panic::Location` above
+// moves. Generalised from usbnet's bring-up EP0 reset (USBNET PUMPRETRY B537, now a caller); SLEEP2 (B812) owed (4).
+
+impl XhciController {
+    /// EP0 (DCI 1) out of whatever a dead transfer left it in, its dequeue moved past the stranded TD: the slot's pending
+    /// control transfer is taken first (it fails to its caller, and the Stopped event the Stop posts is claimed by no
+    /// one), then Stop Endpoint (Running, xHCI 1.2 §4.6.9) or Reset Endpoint (Halted/Error, §4.6.8), then Set TR Dequeue
+    /// Pointer (§4.6.10, legal from Stopped) to the ring's enqueue. Returns (state before, stop/reset cc, set-dequeue cc);
+    /// cc 0 = not issued or no completion.
+    fn ep0_recover(&mut self, slot: u8) -> (u8, u8, u8) {
+        if slot == 0 || slot as usize >= self.slots.len() || self.slots[slot as usize].output_context.is_null() {
+            return (0, 0, 0);
+        }
+        let failed = self.slots[slot as usize].ep0_pending.take().is_some();
+        let ctx = (1u32 << 16) | ((slot as u32) << 24);
+        let st = self.ep_state_of(slot, 1);
+        let stop_cc = match st {
+            1 => self.recover_cmd(Trb { parameter: 0, status: 0, control: (15 << 10) | ctx }).1,
+            2 | 4 => self.recover_cmd(Trb { parameter: 0, status: 0, control: (14 << 10) | ctx }).1,
+            _ => 0,
+        };
+        let mut deq_cc = 0u8;
+        if self.ep_state_of(slot, 1) == 3 {
+            let deq = self.slots[slot as usize].ep0_ring.as_ref().map(|r| {
+                let (phys, dcs) = r.dequeue_reset_target();
+                phys | (dcs as u64)
+            });
+            if let Some(deq) = deq {
+                deq_cc = self.recover_cmd(Trb { parameter: deq, status: 0, control: (16 << 10) | ctx }).1;
+            }
+        }
+        serial_println!(
+            "[usb] slot={} ep0 recover state={}->{} stop_cc={} deq_cc={} failed={}",
+            slot, st, self.ep_state_of(slot, 1), stop_cc, deq_cc, failed as u8
+        );
+        (st, stop_cc, deq_cc)
     }
 }
