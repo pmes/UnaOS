@@ -5500,7 +5500,7 @@ pub fn timer_preempt() {
     if remaining <= 1 {
         SCHED[cpu].need_resched.store(true, Ordering::Relaxed);
     }
-    if !SCHED[cpu].need_resched.load(Ordering::Relaxed) {
+    if !SCHED[cpu].need_resched.load(Ordering::Relaxed) || preemptoff::defer(cpu) { // NVMEPREEMPTOFF (zenbook-ledger Z52): a preempt that is DUE while this CPU holds the preempt-off count is deferred (need_resched stays set; the first tick after enable switches). LINE-NEUTRAL fold, code first
         return;
     }
 
@@ -6334,7 +6334,7 @@ fn run() -> ! {
                 task.state.store(STATE_RUNNING, Ordering::Release);
                 // Fresh quantum + clear the reschedule signal, and publish the running priority so a
                 // remote waker/spawner can tell whether a newly-ready task should preempt us.
-                SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed); #[cfg(feature = "tickless")] tickless::on_dispatch(cpu); // TICKLESS (B765): a core leaving a tickless idle gets its 1 kHz tick back (the quantum counts ticks). LINE-NEUTRAL fold, code first
+                SCHED[cpu].quantum.store(QUANTUM_TICKS, Ordering::Relaxed); #[cfg(feature = "tickless")] tickless::on_dispatch(cpu); preemptoff::on_dispatch(cpu); // NVMEPREEMPTOFF (Z52): a count left by the task that left this CPU is reset and named once. TICKLESS (B765): a core leaving a tickless idle gets its 1 kHz tick back (the quantum counts ticks). LINE-NEUTRAL fold, code first
                 SCHED[cpu].need_resched.store(false, Ordering::Relaxed);
                 // R1 / rtpi: publish the EFFECTIVE priority so a remote waker cannot preempt a running
                 // boosted holder with a mid-priority task. Knob-off arm is the pre-arc verbatim.
@@ -8391,7 +8391,7 @@ pub fn singleton_restart(from: usize, live: usize) -> Option<(u64, u64)> {
     // SAFETY: `entry` was stored from a `fn(usize)` in `singleton_register`; fn pointers round-trip through usize.
     let f: fn(usize) = unsafe { core::mem::transmute::<usize, fn(usize)>(entry) };
     let name = sgl_name();
-    let new = spawn_inner(name, f, live, live, SGL_PRIO.load(Ordering::Relaxed), TASK_STACK_SIZE, None, None);
+    let new = spawn_inner(name, f, live, live, SGL_PRIO.load(Ordering::Relaxed), PUMP_PATH_STACK_SIZE, None, None); // PUMPSTACK (B1006): the one registered singleton is the usb-pump (main.rs `usb_pump` prologue), so its fresh instance takes the pump's MEASURED 32 KiB, never the blanket 16 KiB (flight 38: deaths=3; the RENDSTACK precedent sized `render-rehomed` too). LINE-NEUTRAL, in place
     SGL_TID.store(new, Ordering::Release);
     SGL_FRESH_MS.store(0, Ordering::Release);
     SGL_RESTART_OLD.store(old, Ordering::Relaxed);
@@ -9266,4 +9266,198 @@ pub fn spawn_joinable_stack(
     done.init(); // reserve the waiter list BEFORE the task can run + post (alloc-free park)
     let id = spawn_inner(name, entry, arg, target_cpu, PRIO_NORMAL, stack_bytes, Some(done.clone()), None);
     JoinHandle { done, id }
+}
+
+// ── PUMPSTACK (rmbp-ledger B1006) — THE x86 usb-pump ON A MEASURED STACK, and the per-fixture high-water reading. ──
+// Flight 38 boot 1 (narino, `docs/dev/evidence/rmbp-0915/flight38/FLIGHT38.md` on hw-rmbp, f38-boot1.log:3850-3856):
+// `[stack] guard hit task=usb-pump size=16384 high=17712 holding=2`, the pump in its prtscr step right after
+// `:: SHOTZIP: … -> PASS ::` (the PNG encode, then the shot's UnaFS write under the ticket: the two locks it held were
+// `unafs` and `unafs-ticket`). The 16 KiB was the SOURCE, not a lost request: main.rs spawned the x86 pump through
+// [`spawn`] (TASK_STACK_SIZE); the Pi's `PUMP_PATH_STACK_SIZE` (main.rs tail) is aarch64-only and never reached x86.
+// The cure is RENDSTACK's: [`spawn_stack`] with a measured size, at the primary spawn (main.rs, renamed in place) AND
+// at the singleton restart ([`singleton_restart`], in place), whose one registrant is the pump — sizing only the first
+// would put every re-homed pump (f38: `deaths=3`) back on 16 KiB. 32 KiB: `high=17712` is a FLOOR (the guard stopped
+// the descent), 32768 is 1.85x it, and RENDSTACK read 15536-15600 B on render's comparable pass at 32 KiB. A future
+// reading near the size is answered by a bigger number and the guard's verdict, never a raised TASK_STACK_SIZE.
+// Owed (B1006): PUMP-FIXTURE-AUDIT (every pump step's high-water on metal, prtscr's encode+save first), STACK-POOL-ONE
+// (one size table for both arches). At the tail: no line above moves.
+
+/// PUMPSTACK — the x86 usb-pump's USABLE stack span (the x86 twin of main.rs's aarch64 `PUMP_PATH_STACK_SIZE`).
+pub const PUMP_PATH_STACK_SIZE: usize = 32 * 1024;
+
+/// PUMPSTACK — `(name, lifetime high-water, usable size)` of the task CURRENT on this core: RENDSTACK's
+/// [`stack_high_water`] reading, one more caller (`tests::run`'s per-fixture `[tests] fixture=` line). Read with
+/// interrupts masked so the caller cannot migrate between the core lookup and the scan; `None` off a scheduled task.
+#[cfg(feature = "witness")]
+pub fn current_stack_high() -> Option<(&'static str, usize, usize)> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let cpu = percpu::this_cpu().cpu_index as usize;
+        if cpu >= MAX_CPUS {
+            return None;
+        }
+        let raw = SCHED[cpu].current.load(Ordering::Acquire) as *const Task;
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: the task running on THIS core with IF=0; nothing can free its Box underneath us.
+        let task = unsafe { &*raw };
+        Some((task.name, stack_high_water(task), task.stack.len() - STACK_GUARD))
+    })
+}
+
+// ══ NVMEPREEMPTOFF (zenbook-ledger Z52) — the per-CPU preempt-off count ══
+// A task that must not be switched out while it runs with interrupts ON (nvme's `cq_wait`: the `CTRL` holder asleep in
+// `sti; hlt`) brackets that span with `preemptoff::disable()` / `enable()`. Only `timer_preempt` (the one involuntary
+// switch site) reads the count: a preempt that falls DUE while it is held is deferred — the quantum runs out as usual,
+// `need_resched` stays set — and fires on the first tick after `enable` through the existing switch (no re-arm, no IPI).
+// The count is per CPU (an array beside `SCHED`, not a `SchedCpu` field: at the tail, no line above moves), written only
+// by its own CPU with IF=0. A count still held when the CPU dispatches is a leak (a voluntary switch or a death inside
+// the span): `on_dispatch` resets it and says so once. x86 only; owed: PREEMPTOFF-ARM (the aarch64 twin), PREEMPTOFF-AUDIT
+// (which `without_interrupts` spans become preempt-off), PREEMPTOFF-SLEEPCHECK (name a yield inside the span at its site).
+pub mod preemptoff {
+    use super::{percpu, ACCT, MAX_CPUS, QUANTUM_TICKS, SCHED};
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    /// The preempt-off count per CPU (0 = preemptible). Written only by its own CPU with interrupts masked.
+    static OFF: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+    /// A preempt fell due while the count was held and is waiting for the first tick after `enable`.
+    static PENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+    /// Spans that deferred a due preempt (`deferred=` on the nvme test line, summed), and deferred preempts that fired.
+    static DEFERRED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+    static FIRED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+    static ENABLE_ZERO_SAID: AtomicBool = AtomicBool::new(false);
+    static LEAK_SAID: AtomicBool = AtomicBool::new(false);
+
+    #[inline]
+    fn this_cpu() -> usize {
+        percpu::this_cpu().cpu_index as usize
+    }
+
+    /// Hold this CPU's preempt-off count (nests; saturates at `u32::MAX`). Masked around the read so the caller cannot
+    /// migrate between reading its CPU and writing that CPU's count.
+    pub fn disable() {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let cpu = this_cpu();
+            if cpu < MAX_CPUS {
+                let n = OFF[cpu].load(Ordering::Relaxed);
+                OFF[cpu].store(n.saturating_add(1), Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// Release one hold. An enable with the count already 0 is refused by name (once a boot) and changes nothing.
+    pub fn enable() {
+        let refused = x86_64::instructions::interrupts::without_interrupts(|| {
+            let cpu = this_cpu();
+            if cpu >= MAX_CPUS {
+                return None;
+            }
+            let n = OFF[cpu].load(Ordering::Relaxed);
+            if n == 0 {
+                return Some(cpu);
+            }
+            OFF[cpu].store(n - 1, Ordering::Relaxed);
+            None
+        });
+        if let Some(cpu) = refused {
+            if !ENABLE_ZERO_SAID.swap(true, Ordering::AcqRel) {
+                serial_println!("[sched] preempt_enable refused cpu={} — count already 0 (unpaired enable)", cpu);
+            }
+        }
+    }
+
+    /// `timer_preempt`'s fold (IF=0, reached only when a preempt is DUE): true = defer it (the count is held), false =
+    /// switch. The first due tick after `enable` finds `PENDING` and counts the deferred preempt as fired.
+    pub(super) fn defer(cpu: usize) -> bool {
+        if cpu >= MAX_CPUS {
+            return false;
+        }
+        if OFF[cpu].load(Ordering::Relaxed) > 0 {
+            if !PENDING[cpu].swap(true, Ordering::Relaxed) {
+                DEFERRED[cpu].fetch_add(1, Ordering::Relaxed);
+            }
+            return true;
+        }
+        if PENDING[cpu].swap(false, Ordering::Relaxed) {
+            FIRED[cpu].fetch_add(1, Ordering::Relaxed);
+        }
+        false
+    }
+
+    /// The dispatch fold (IF=0, `run()`): a count the departed task left behind is reset and named once.
+    pub(super) fn on_dispatch(cpu: usize) {
+        if cpu >= MAX_CPUS {
+            return;
+        }
+        let n = OFF[cpu].load(Ordering::Relaxed);
+        if n != 0 {
+            OFF[cpu].store(0, Ordering::Relaxed);
+            PENDING[cpu].store(false, Ordering::Relaxed);
+            if !LEAK_SAID.swap(true, Ordering::AcqRel) {
+                serial_println!("[sched] preempt-off leaked cpu={} count={} -> reset at dispatch (NVMEPREEMPTOFF Z52)", cpu, n);
+            }
+        }
+    }
+
+    /// Spans that deferred a due preempt this boot, over every CPU.
+    pub fn deferred_total() -> u32 {
+        DEFERRED.iter().fold(0u32, |a, d| a.wrapping_add(d.load(Ordering::Relaxed)))
+    }
+
+    /// `tests preemptoff`: hold the count over more than two quanta with interrupts ON, check nothing switched this
+    /// task out, then release it and check the deferred preempt fired on a following tick.
+    pub fn selftest() {
+        if crate::arch::irqs_masked() {
+            serial_println!(":: PREEMPTOFF: -> SKIP(masked) ::");
+            return;
+        }
+        const BOUND_MS: u64 = 200;
+        let want = 2 * QUANTUM_TICKS as u64 + 1;
+        disable();
+        let cpu = this_cpu();
+        if cpu >= MAX_CPUS {
+            enable();
+            serial_println!(":: PREEMPTOFF: -> SKIP(no-cpu) ::");
+            return;
+        }
+        let tid0 = SCHED[cpu].current_tid.load(Ordering::Relaxed);
+        let sw0 = ACCT[cpu].ctx_switches.load(Ordering::Relaxed);
+        let f0 = FIRED[cpu].load(Ordering::Relaxed);
+        let t0 = percpu::this_cpu().ticks.load(Ordering::Relaxed);
+        let m0 = crate::arch::ms();
+        while percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0) < want
+            && crate::arch::ms().wrapping_sub(m0) < BOUND_MS
+        {
+            core::hint::spin_loop();
+        }
+        let held_ticks = percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0);
+        let switched = (this_cpu() != cpu) as u64
+            + ACCT[cpu].ctx_switches.load(Ordering::Relaxed).wrapping_sub(sw0)
+            + (SCHED[cpu].current_tid.load(Ordering::Relaxed) != tid0) as u64;
+        let pending = PENDING[cpu].load(Ordering::Relaxed);
+        enable();
+        let m1 = crate::arch::ms();
+        while FIRED[cpu].load(Ordering::Relaxed) == f0 && crate::arch::ms().wrapping_sub(m1) < BOUND_MS {
+            core::hint::spin_loop();
+        }
+        let deferred = FIRED[cpu].load(Ordering::Relaxed).wrapping_sub(f0);
+        let reason = if held_ticks < 2 * QUANTUM_TICKS as u64 {
+            Some("few-ticks")
+        } else if switched != 0 {
+            Some("switched")
+        } else if !pending {
+            Some("not-held")
+        } else if deferred != 1 {
+            Some("not-fired")
+        } else {
+            None
+        };
+        match reason {
+            None => serial_println!(":: PREEMPTOFF: held_ticks={} switched=0 deferred=1 -> PASS ::", held_ticks),
+            Some(r) => serial_println!(
+                ":: PREEMPTOFF: held_ticks={} switched={} deferred={} -> FAIL reason={} ::",
+                held_ticks, switched, deferred, r
+            ),
+        }
+    }
 }

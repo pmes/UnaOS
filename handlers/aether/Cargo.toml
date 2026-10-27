@@ -37,6 +37,7 @@ taffy = { workspace = true }
 # HTTPCORE (SR51): HTTP(S) + cookies through gneiss_pal::api::http (UnaOS http_core + tls_core); reqwest is gone.
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 bandy = { path = "../../libs/bandy" }
+type_core = { path = "../../unaos/libs/sys/type_core" } # OPENANYTYPE (SR408): the open verb reads TYPECORE's one extension table
 gneiss_pal = { path = "../../libs/gneiss_pal", features = ["av1"] } # HEIFONE-RETIRE (SR318): `<img>` AVIF through `dsp::image::decode_heif`
 http_core = { path = "../../unaos/libs/net/http_core" } # HTTPFAIL (SR212): fetchseq names http_core's Error for the reason= table
 # AUDIOTRACK (SR45): SHA-256 names the http(s) media cache files — UnaOS's own primitive (SR27).

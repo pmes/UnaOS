@@ -1590,8 +1590,6 @@ const ACPI_TP_IDS: [&[u8]; 3] = [b"\x0dPNP0C50\x00", b"\x0dACPI0C50\x00", b"\x0c
 const HID_DSM_GUID: [u8; 16] = [0xf7, 0xf6, 0xdf, 0x3c, 0x67, 0x42, 0x55, 0x45, 0xad, 0x05, 0xb3, 0x0a, 0x3d, 0x89, 0x38, 0xde];
 /// AMDI0010 Devices kept.
 const ACPI_CTRL_MAX: usize = 8;
-/// How far back from a `_HID` the enclosing `Device` op is looked for.
-const DEV_BACK: usize = 512;
 
 /// What the scan found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1621,70 +1619,8 @@ struct AcpiNo {
 /// `probe` (pci init, BSP) on agree=yes only.
 static ACPI_PICK: spin::Once<(usize, u8, u16)> = spin::Once::new();
 
-/// The first `pat` at or after `lo` that ends at or before `hi`.
-pub(crate) fn find_from(a: &[u8], pat: &[u8], lo: usize, hi: usize) -> Option<usize> {
-    let hi = hi.min(a.len());
-    if pat.is_empty() || hi < pat.len() {
-        return None;
-    }
-    (lo..=hi - pat.len()).find(|&k| &a[k..k + pat.len()] == pat)
-}
-
-/// An AML PkgLength at `i`: (the length it encodes, counting itself; its own width).
-pub(crate) fn pkg_len(a: &[u8], i: usize) -> Option<(usize, usize)> {
-    let lead = *a.get(i)? as usize;
-    let n = lead >> 6;
-    if n == 0 {
-        return Some((lead & 0x3f, 1));
-    }
-    let mut v = lead & 0x0f;
-    for k in 0..n {
-        v |= (*a.get(i + 1 + k)? as usize) << (4 + 8 * k);
-    }
-    Some((v, 1 + n))
-}
-
-/// The last NameSeg of the NameString at `i` (root/parent prefixes, dual and multi names).
-pub(crate) fn last_seg(a: &[u8], mut i: usize) -> Option<[u8; 4]> {
-    while matches!(a.get(i), Some(0x5c) | Some(0x5e)) {
-        i += 1;
-    }
-    let at = match *a.get(i)? {
-        0x2e => i + 5,
-        0x2f => {
-            let n = *a.get(i + 1)? as usize;
-            if n == 0 {
-                return None;
-            }
-            i + 2 + 4 * (n - 1)
-        }
-        _ => i,
-    };
-    let s: [u8; 4] = a.get(at..at + 4)?.try_into().ok()?;
-    if s.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_') { Some(s) } else { None }
-}
-
-/// The nearest `Device` op before `hit` whose PkgLength covers it: (op offset, end, name).
-pub(crate) fn device_of(a: &[u8], hit: usize) -> Option<(usize, usize, [u8; 4])> {
-    let lo = hit.saturating_sub(DEV_BACK);
-    let mut j = hit.checked_sub(2)?;
-    loop {
-        if a[j] == 0x5b && a[j + 1] == 0x82 {
-            if let Some((len, w)) = pkg_len(a, j + 2) {
-                let end = j + 2 + len;
-                if end > hit && end <= a.len() {
-                    if let Some(nm) = last_seg(a, j + 2 + w) {
-                        return Some((j, end, nm));
-                    }
-                }
-            }
-        }
-        if j <= lo {
-            return None;
-        }
-        j -= 1;
-    }
-}
+// AML-HELPERS-ONE (zenbook-ledger Z53): `find_from`/`pkg_len`/`last_seg`/`device_of` (and `DEV_BACK`) MOVED to acpi_power.rs's tail, the ONE home of the AML byte-scan helpers; re-exported here so this file's scans call them by the same names.
+pub(crate) use crate::arch::acpi_power::{find_from, pkg_len, last_seg, device_of};
 
 /// The descriptor register from the touchpad Device's `_DSM`, only in the literal shape
 /// `If (Arg2 == One) Return (One | ByteConst | WordConst)` after the HID GUID; `None` otherwise.

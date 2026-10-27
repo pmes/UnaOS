@@ -113,7 +113,7 @@ esac
 _sha_base="$(git rev-parse --short=8 HEAD 2>/dev/null || echo unknown)"
 _sha_suffix=""
 if [ "$_sha_base" != "unknown" ]; then
-    git diff --quiet HEAD 2>/dev/null || _sha_suffix="-d$(git diff HEAD 2>/dev/null | sha256sum | cut -c1-6)"
+    git diff --quiet HEAD 2>/dev/null || _sha_suffix="-d$(git diff HEAD 2>/dev/null | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-6)"
 fi
 export UNAOS_GIT_SHA="${_sha_base}${_sha_suffix}"
 
@@ -2947,6 +2947,23 @@ if [ -n "${UNAOS_UAC:-}" ]; then
         *) export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -audiodev none,id=uac0 -device usb-audio,audiodev=uac0,bus=xhci.0" ;;
     esac
 fi
+# DONGLEBOOT2 (rmbp-ledger B1007): UNAOS_USB_EXTRA_INT=<n> attaches n extra interrupt-endpoint devices (QEMU usb-kbd) on
+# the harness EHCI bus (`usb-ehci,id=ehci`, builder/src/main.rs) at enumeration, through UNAOS_QEMU_EXTRA, so the EHCI
+# int-EP pool (`MAX_INT_EPS` = 6 per controller) carries load. QEMU's usb-ehci has six ports and the harness usb-kbd holds
+# one, so n is clamped to 5 (the pool fills 6/6 exactly; QEMU attaches no hub to EHCI and can never refuse a slot: the
+# refusal leg is `tests intpool`'s KAT). Non-numeric is ignored; skipped under UNAOS_NOEHCIHID (no ehci bus).
+# The leg: `UNAOS_USB_EXTRA_INT=4 ./arroyo test` + `tests intpool`:
+#   `:: INTPOOL: slots=6 taken=5 refused=0 hid_armed=5 reserve=owed who_lost=- kat=ok -> PASS ::`
+USB_EXTRA_INT_DEV="usb-kbd,bus=ehci.0"
+case "${UNAOS_USB_EXTRA_INT:-}" in
+    ''|*[!0-9]*) ;;
+    *) if [ -z "${UNAOS_NOEHCIHID:-}" ]; then
+           _xint=0; _xint_n=$(( UNAOS_USB_EXTRA_INT > 5 ? 5 : UNAOS_USB_EXTRA_INT ))
+           while [ "${_xint}" -lt "${_xint_n}" ]; do
+               export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -device ${USB_EXTRA_INT_DEV},id=xint${_xint}"; _xint=$((_xint + 1))
+           done
+       fi ;;
+esac
 # CONSOLEPICK (rmbp-ledger B1014): UNAOS_USB_EXTRA_XHCI=<n> attaches n `usb-net` devices on xhci.0 (enumeration only, no netdev) beside the FTDI (UNAOS_USBSERIAL=1); they take later ports than the builder's usb-serial, so this reproduces the slot count, not a before-the-FTDI order (CONSOLEPICK-ORDER owed). Leg: `tests consolepick`.
 if [ -n "${UNAOS_USB_EXTRA_XHCI:-}" ]; then case "${UNAOS_USB_EXTRA_XHCI}" in *[!0-9]*) echo "✖ UNAOS_USB_EXTRA_XHCI='${UNAOS_USB_EXTRA_XHCI}': a device count (digits)"; exit 1 ;; esac; _cpk=0; while [ "$_cpk" -lt "${UNAOS_USB_EXTRA_XHCI}" ]; do export UNAOS_QEMU_EXTRA="${UNAOS_QEMU_EXTRA:-} -device usb-net,bus=xhci.0"; _cpk=$((_cpk + 1)); done; fi
 # IOAPIC (rmbp-ledger B147): UNAOS_IOAPIC=1 arms arch/x86_64/ioapic.rs — the Intel 82093AA I/O APIC
@@ -3965,16 +3982,17 @@ _sb_fetch_why() { # dir url rev step tool… — why a fetch-then-build product 
     if [ -d "$d/.git" ] && [ "$(git -C "$d" rev-parse HEAD 2>/dev/null)" = "$r" ]; then echo "build failed $st"; else echo "fetch failed $u"; fi
 }
 _sb_kat_why() { # binary — a freestanding KAT: gcc absent, the gcc build, or the host-kernel run
-    _sb_missing gcc && return 0
-    if [ -x "$1" ]; then echo "host proof failed (the KAT's own fail line: run $1 on the host)"; else echo "build failed gcc -static -nostdlib"; fi
+    _lnx_why && return 0   # LNXCROSS (B1012): the host toolchain pick's refusal (on linux exactly `_sb_missing gcc`)
+    if [ -x "$1" ]; then echo "host proof failed (the KAT's own fail line: run $1 on the host)"; else echo "build failed $_LNX_CC -static -nostdlib"; fi
 }
 build_selfbuild_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c"
     mkdir -p "$sb"
+    _lnx_pick   # LNXCROSS (B1012): the Linux-target cc/ld/strip for this host, probed once, one [selfbuild] line
     cp "$c/hello.c" "${WORKSPACE_DIR}/target/HELLO.C"
     rm -f "$sb/SYSKAT.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -o "$sb/SYSKAT.LNX" "$c/syskat.c" \
-        && "$sb/SYSKAT.LNX" >/dev/null; then
+    if _lnx_kat "$sb/SYSKAT.LNX" "$c/syskat.c" \
+        && { _lnx_deferred 1 SYSKAT.LNX || "$sb/SYSKAT.LNX" >/dev/null; }; then
         cp "$sb/SYSKAT.LNX" "${WORKSPACE_DIR}/target/SYSKAT.LNX"
     else
         _sb_skip 1 SYSKAT.LNX "$(_sb_kat_why "$sb/SYSKAT.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT.LNX"
@@ -3983,8 +4001,8 @@ build_selfbuild_x86() {
     # fallocate/flock, socketpair, sendfile, one signal through rt_sigreturn. Proven on the host kernel (args: a file, its size,
     # a scratch path — UnaOS passes /apps/HELLO.C, the size its loader sees, <home>/kat2.tmp) before it is staged.
     rm -f "$sb/SYSKAT2.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT2.LNX" "$c/syskat2.c" \
-        && "$sb/SYSKAT2.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; then
+    if _lnx_kat "$sb/SYSKAT2.LNX" "$c/syskat2.c" -mno-red-zone \
+        && { _lnx_deferred 2 SYSKAT2.LNX || "$sb/SYSKAT2.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat2.tmp" | grep -q "^syskat2 ok threads=4 counter=400000 "; }; then
         cp "$sb/SYSKAT2.LNX" "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
     else
         _sb_skip 2 SYSKAT2.LNX "$(_sb_kat_why "$sb/SYSKAT2.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT2.LNX"
@@ -3994,7 +4012,7 @@ build_selfbuild_x86() {
     local lib="${WORKSPACE_DIR}/target/LIB"
     if [ ! -f "$lib/libc.a" ]; then
         if _selfbuild_fetch "$sb/musl" "$SELFBUILD_MUSL_URL" "$SELFBUILD_MUSL_REV" \
-            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC=gcc CFLAGS="-O2" >/dev/null && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
+            && ( cd "$sb/musl" && ./configure --prefix="$sb/musl-out" --disable-shared CC="$_LNX_CC" "${_LNX_TOOLS[@]}" CFLAGS="-O2" >/dev/null && make -s -j"$(nproc)" >/dev/null 2>&1 && make -s install >/dev/null 2>&1 ); then
             rm -rf "$lib" && mkdir -p "$lib/include" "$lib/tcc/include" \
                 && cp "$sb/musl-out/lib/crt1.o" "$sb/musl-out/lib/crti.o" "$sb/musl-out/lib/crtn.o" "$sb/musl-out/lib/libc.a" "$lib/" \
                 && cp -r "$sb/musl-out/include/." "$lib/include/" \
@@ -4006,12 +4024,13 @@ build_selfbuild_x86() {
     # SELFBUILD1 tcc; SELFBUILD3 configures its search paths onto the volume: tccdir /lib/tcc ({B}), crt + libs {B}/.. = /lib,
     # headers {B}/../include (musl) then {B}/include (tcc's own) — so on UnaOS a bare `TCC.LNX -static -o prog prog.c` links musl, and
     # on the host `-B target/LIB/tcc` points the SAME binary at the staged tree (the host proof below). Rebuilt when LIB lacks libtcc1.a.
-    if [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; } || LC_ALL=C grep -a -q -F /apps/LIB/tcc "${WORKSPACE_DIR}/target/TCC.LNX"; then  # ROOTDISK (B390, R94): a TCC.LNX configured for /apps/LIB is rebuilt for /lib
+    if ! _lnx_hostruns 1; then :   # LNXCROSS (B1012): a darwin host cannot run TCC.LNX (libtcc1.a, the LIB proof): TCC.LNX + LIB refused by name
+    elif [ ! -f "${WORKSPACE_DIR}/target/TCC.LNX" ] || { [ -f "$lib/libc.a" ] && [ ! -f "$lib/tcc/libtcc1.a" ]; } || LC_ALL=C grep -a -q -F /apps/LIB/tcc "${WORKSPACE_DIR}/target/TCC.LNX"; then  # ROOTDISK (B390, R94): a TCC.LNX configured for /apps/LIB is rebuilt for /lib
         if _selfbuild_fetch "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" \
-            && ( cd "$sb/tinycc" && ./configure --cc=gcc --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" \
+            && ( cd "$sb/tinycc" && ./configure --cc="$_LNX_CC" --extra-cflags="-O2 -fno-pie" --extra-ldflags="-static -no-pie" \
                    --tccdir=/lib/tcc --crtprefix='{B}/..' --libpaths='{B}:{B}/..' --sysincludepaths='{B}/../include:{B}/include' --config-musl >/dev/null \
                  && make -s tcc >/dev/null 2>&1 ); then
-            strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
+            _lnx_strip -o "${WORKSPACE_DIR}/target/TCC.LNX" "$sb/tinycc/tcc"
             if [ -f "$lib/libc.a" ]; then
                 cp "$sb/tinycc/include/"*.h "$lib/tcc/include/" \
                     && ( cd "$sb/tinycc" && rm -f libtcc1.a && make -s libtcc1.a XFLAGS="-B$lib/tcc" >/dev/null 2>&1; [ -f libtcc1.a ] ) \
@@ -4019,7 +4038,7 @@ build_selfbuild_x86() {
                     || { _sb_skip 3 LIB "build failed tinycc libtcc1.a against the staged musl"; rm -rf "$lib"; }
             fi
         else
-            _sb_skip 1 TCC.LNX "$(_sb_fetch_why "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" "tinycc configure/make" make gcc strip)"
+            _sb_skip 1 TCC.LNX "$(_sb_fetch_why "$sb/tinycc" "$SELFBUILD_TCC_URL" "$SELFBUILD_TCC_REV" "tinycc configure/make" make "${_LNX_CC%% *}" "$_LNX_STRIP")"
         fi
     fi
     # SELFBUILD3 host proof: the staged TCC.LNX compiles PRINTF.C against the staged musl and the output prints, or LIB is not staged.
@@ -4035,13 +4054,14 @@ build_selfbuild_x86() {
     # SELFBUILD3: the lazy-memory KAT (mmap of files private/shared, 256 MiB anon touched sparsely + mincore, PROT_NONE, brk 128 MiB,
     # madvise), proven on the host kernel before it is staged.
     rm -f "$sb/SYSKAT3.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT3.LNX" "$c/syskat3.c" \
-        && "$sb/SYSKAT3.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; then
+    if _lnx_kat "$sb/SYSKAT3.LNX" "$c/syskat3.c" -mno-red-zone \
+        && { _lnx_deferred 3 SYSKAT3.LNX || "$sb/SYSKAT3.LNX" "$c/hello.c" "$(stat -c %s "$c/hello.c")" "$sb/kat3.tmp" | grep -q "^syskat3 ok mmap=ok shared=ok anon_mib=256 resident_pages=256 "; }; then
         cp "$sb/SYSKAT3.LNX" "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     else
         _sb_skip 3 SYSKAT3.LNX "$(_sb_kat_why "$sb/SYSKAT3.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT3.LNX"
     fi
-    if [ ! -f "${WORKSPACE_DIR}/target/PROBE.LNX" ]; then
+    if ! _lnx_hostruns probe; then :   # LNXCROSS (B1012): busybox via the gcc driver (libc + libgcc): PROBE.LNX refused by name on darwin
+    elif [ ! -f "${WORKSPACE_DIR}/target/PROBE.LNX" ]; then
         if _selfbuild_fetch "$sb/busybox" "$SELFBUILD_BB_URL" "$SELFBUILD_BB_REV" \
             && ( cd "$sb/busybox" && make -s defconfig >/dev/null 2>&1 \
                  && sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/; s/^CONFIG_TC=y/# CONFIG_TC is not set/; s/^# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/; s/^# CONFIG_FEATURE_PREFER_APPLETS is not set/CONFIG_FEATURE_PREFER_APPLETS=y/' .config \
@@ -4072,8 +4092,8 @@ build_selfbuild4_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
     mkdir -p "$sb"
     rm -f "$sb/SYSKAT4.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT4.LNX" "$c/syskat4.c" \
-        && "$sb/SYSKAT4.LNX" "$sb/kat4.tmp" | grep -q "^syskat4 ok cow=ok cow_kernel=ok cow_prot=ok shared_fork=ok exec_lazy=ok sigbus=ok "; then
+    if _lnx_kat "$sb/SYSKAT4.LNX" "$c/syskat4.c" -mno-red-zone \
+        && { _lnx_deferred 4 SYSKAT4.LNX || "$sb/SYSKAT4.LNX" "$sb/kat4.tmp" | grep -q "^syskat4 ok cow=ok cow_kernel=ok cow_prot=ok shared_fork=ok exec_lazy=ok sigbus=ok "; }; then
         cp "$sb/SYSKAT4.LNX" "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
     else
         _sb_skip 4 SYSKAT4.LNX "$(_sb_kat_why "$sb/SYSKAT4.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT4.LNX"
@@ -4082,13 +4102,13 @@ build_selfbuild4_x86() {
         || rustup +nightly target add x86_64-unknown-linux-musl >/dev/null 2>&1 || true
     local bin="$sb/rust/x86_64-unknown-linux-musl/release/rust-probe"
     rm -f "$bin"
-    if ( cd "$rs" && CARGO_TARGET_DIR="$sb/rust" cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
+    if ( cd "$rs" && _lnx_cargoenv && CARGO_TARGET_DIR="$sb/rust" cargo +nightly build --release --quiet --target x86_64-unknown-linux-musl ) \
         && [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" = "2" ] \
-        && "$bin" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; then
-        strip -o "${WORKSPACE_DIR}/target/RUST.LNX" "$bin"
+        && { _lnx_deferred 4 RUST.LNX || "$bin" "$c/hello.c" 2>/dev/null | grep -q "^rust ok threads=4 counter=400000 hashmap=ok fs=ok panic_caught=1 "; }; then
+        _lnx_strip -o "${WORKSPACE_DIR}/target/RUST.LNX" "$bin"
     else
         local why4
-        if why4="$(_sb_missing strip)"; then :
+        if why4="$(_sb_missing "$_LNX_STRIP")"; then :
         elif [ ! -f "$(_sb_musl_selfc)/libc.a" ]; then why4="musl target missing (rustup +nightly target add x86_64-unknown-linux-musl refused)"
         elif [ ! -f "$bin" ]; then why4="build failed cargo crates/user-linux-rust --target x86_64-unknown-linux-musl"
         elif [ "$(od -An -t u2 -j 16 -N 2 "$bin" | tr -d ' ')" != "2" ]; then why4="build failed not ET_EXEC"
@@ -4118,8 +4138,8 @@ build_selfbuild5_x86() {
     local sb="${WORKSPACE_DIR}/target/selfbuild" c="$WORKSPACE_DIR/crates/user-linux-hello/c" rs="$WORKSPACE_DIR/crates/user-linux-rust"
     mkdir -p "$sb"
     rm -f "$sb/SYSKAT5.LNX"
-    if gcc -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin -mno-red-zone -o "$sb/SYSKAT5.LNX" "$c/syskat5.c" \
-        && "$sb/SYSKAT5.LNX" | grep -q "^syskat5 ok grow=ok move=ok fixed=ok dontunmap=ok errors=ok altstack=ok small=ok "; then
+    if _lnx_kat "$sb/SYSKAT5.LNX" "$c/syskat5.c" -mno-red-zone \
+        && { _lnx_deferred 5 SYSKAT5.LNX || "$sb/SYSKAT5.LNX" | grep -q "^syskat5 ok grow=ok move=ok fixed=ok dontunmap=ok errors=ok altstack=ok small=ok "; }; then
         cp "$sb/SYSKAT5.LNX" "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
     else
         _sb_skip 5 SYSKAT5.LNX "$(_sb_kat_why "$sb/SYSKAT5.LNX")"; rm -f "${WORKSPACE_DIR}/target/SYSKAT5.LNX"
@@ -9928,8 +9948,9 @@ KFONT_NOTO_SHA256=(
     "dfbd5ed0f1e68c3cbc51aa08f646d1ab0e68e7c4ceab70a69e465225ff701f93"
 )
 kfont_noto_missing() {
-    local f d n=0 dirs="${UNAOS_FONT_DIRS:-}:/usr/share/fonts/truetype/noto:/usr/share/fonts/opentype/noto:/usr/share/fonts/google-noto:/usr/share/fonts/TTF:/usr/share/fonts/noto"
-    for f in "${KFONT_NOTO_FACES[@]}"; do
+    local f d n=0 dirs="${UNAOS_FONT_DIRS:-}:/usr/share/fonts/truetype/noto:/usr/share/fonts/opentype/noto:/usr/share/fonts/google-noto:/usr/share/fonts/TTF:/usr/share/fonts/noto" faces=("$@")
+    [ "${#faces[@]}" -gt 0 ] || faces=("${KFONT_NOTO_FACES[@]}")   # GLYPHSCARD (B1010): the faces asked for (ensure_kfont_cjk: the CJK one), else the four
+    for f in "${faces[@]}"; do
         local hit=0 IFS=:
         for d in $dirs; do [ -n "$d" ] && [ -f "$d/$f" ] && { hit=1; break; }; done
         unset IFS
@@ -9947,14 +9968,14 @@ kfont_tree_pins() {
         case "$f" in ''|'#'*) continue ;; esac
         src="$(find "$root" -maxdepth 2 -name "$f" -print -quit 2>/dev/null)"
         if [ -z "$src" ]; then state="ABSENT ${f}"; continue; fi
-        have="$(sha256sum "$src" | cut -d' ' -f1)"
+        have="$(sha256_of "$src")"
         [ "$have" = "$want" ] || state="MISMATCH ${f}"
-        bytes=$((bytes + $(stat -c %s "$src")))
+        bytes=$((bytes + $(_fsize "$src")))
     done < "$pins"
     echo -e "${COLOR_YELLOW}⚡ FONTS: fonts/ vs firmware/fonts.pins -> ${state} (Inter + JetBrains Mono + Noto Sans, ${bytes} B per volume; FONTSCRAFT B640)${COLOR_RESET}"
 }
 ensure_kfont_noto() {
-    kfont_tree_pins   # FONTSCRAFT (B640): the vendored faces' pin verdict, before the Noto script faces
+    kfont_tree_pins; ensure_kfont_cjk   # FONTSCRAFT (B640): the vendored faces' pin verdict, before the Noto script faces. GLYPHSCARD (B1010): the CJK face's own leg first (it always returns 0; the early returns below would skip it)
     local miss; miss="$(kfont_noto_missing)"
     if [ "$miss" = 0 ]; then
         echo -e "${COLOR_GREEN}  • FONTS: the four Noto script faces are on this host (KERNELFONT2)${COLOR_RESET}"
@@ -9966,24 +9987,61 @@ ensure_kfont_noto() {
         echo -e "${COLOR_GREEN}  • FONTS: fonts-noto-core installed by apt${COLOR_RESET}"
         return 0
     fi
-    local dir="${WORKSPACE_DIR}/target/fonts-noto" deb tmp i ok=1
+    local dir="${WORKSPACE_DIR}/target/fonts-noto"
     echo -e "${COLOR_YELLOW}  • FONTS: apt refused or absent — fetching the pinned .deb into ${dir}${COLOR_RESET}"
-    mkdir -p "$dir"; deb="$dir/fonts-noto-core.deb"; tmp="$dir/x"
-    if ! { [ -f "$deb" ] && [ "$(sha512sum "$deb" | cut -d' ' -f1)" = "$KFONT_NOTO_DEB_SHA512" ]; }; then
-        curl -fsSL -m 300 -o "$deb" "$KFONT_NOTO_DEB_URL" || { echo -e "${COLOR_RED}  • FONTS: fetch failed — media builds without the Noto faces (scripts_missing on the wire)${COLOR_RESET}"; return 0; }
+    kfont_deb_stage "four Noto faces" "$KFONT_NOTO_DEB_URL" "$KFONT_NOTO_DEB_SHA512" "$dir" fonts-noto-core \
+        "${KFONT_NOTO_FACES[0]}=${KFONT_NOTO_SHA256[0]}" "${KFONT_NOTO_FACES[1]}=${KFONT_NOTO_SHA256[1]}" \
+        "${KFONT_NOTO_FACES[2]}=${KFONT_NOTO_SHA256[2]}" "${KFONT_NOTO_FACES[3]}=${KFONT_NOTO_SHA256[3]}"   # GLYPHSCARD (B1010): the ONE pinned-.deb leg
+    return 0
+}
+# GLYPHSCARD (rmbp-ledger B1010): the pinned-.deb leg KERNELFONT2 wrote inside ensure_kfont_noto, moved here VERBATIM and
+# parameterised so the Noto script faces and the CJK face share it: <label> <deb url> <deb sha512> <dir> <doc package>
+# <face>=<sha256>... . Fetch (cached in <dir>), SHA-512 the .deb, extract, copy each face only at its SHA-256, the package's
+# copyright as <dir>/LICENSE, append <dir> to UNAOS_FONT_DIRS. Always returns 0 (arroyo runs `set -e`; the media builds
+# without the face and the kernel names it); KFONT_DEB_OK=1 when every face landed.
+kfont_deb_stage() {
+    local label="$1" url="$2" sha512="$3" dir="$4" docpkg="$5" deb tmp pair ok=1
+    shift 5
+    KFONT_DEB_OK=0
+    mkdir -p "$dir"; deb="$dir/${docpkg}.deb"; tmp="$dir/x"
+    if ! { [ -f "$deb" ] && [ "$(sha512_of "$deb")" = "$sha512" ]; }; then
+        curl -fsSL -m 300 -o "$deb" "$url" || { echo -e "${COLOR_RED}  • FONTS: fetch failed — media builds without the ${label} (the kernel names them on the wire)${COLOR_RESET}"; return 0; }
     fi
-    [ "$(sha512sum "$deb" | cut -d' ' -f1)" = "$KFONT_NOTO_DEB_SHA512" ] || { echo -e "${COLOR_RED}  • FONTS: .deb SHA-512 mismatch — refused, not staged${COLOR_RESET}"; rm -f "$deb"; return 0; }
+    [ "$(sha512_of "$deb")" = "$sha512" ] || { echo -e "${COLOR_RED}  • FONTS: .deb SHA-512 mismatch — refused, not staged${COLOR_RESET}"; rm -f "$deb"; return 0; }
     rm -rf "$tmp"; mkdir -p "$tmp"
     # dpkg-deb reads every data.tar compression itself (the 2020 package is zstd); ar + tar where there is no dpkg.
     { if command -v dpkg-deb >/dev/null 2>&1; then dpkg-deb -x "$deb" "$tmp"; else ( cd "$tmp" && ar x "$deb" && tar -xf data.tar.* ); fi; } || { echo -e "${COLOR_RED}  • FONTS: .deb extract failed — not staged${COLOR_RESET}"; return 0; }
-    for i in 0 1 2 3; do
-        local f="${KFONT_NOTO_FACES[$i]}" src; src="$(find "$tmp" -name "${KFONT_NOTO_FACES[$i]}" -print -quit)"
-        if [ -n "$src" ] && [ "$(sha256sum "$src" | cut -d' ' -f1)" = "${KFONT_NOTO_SHA256[$i]}" ]; then cp -f "$src" "$dir/$f"; else ok=0; echo -e "${COLOR_RED}  • FONTS: ${f} absent or SHA-256 mismatch — not staged${COLOR_RESET}"; fi
+    for pair in "$@"; do
+        local f="${pair%%=*}" want="${pair#*=}" src; src="$(find "$tmp" -name "$f" -print -quit)"
+        if [ -n "$src" ] && [ "$(sha256_of "$src")" = "$want" ]; then cp -f "$src" "$dir/$f"; else ok=0; echo -e "${COLOR_RED}  • FONTS: ${f} absent or SHA-256 mismatch — not staged${COLOR_RESET}"; fi
     done
-    [ -f "$tmp/usr/share/doc/fonts-noto-core/copyright" ] && cp -f "$tmp/usr/share/doc/fonts-noto-core/copyright" "$dir/LICENSE"
+    [ -f "$tmp/usr/share/doc/${docpkg}/copyright" ] && cp -f "$tmp/usr/share/doc/${docpkg}/copyright" "$dir/LICENSE"
     rm -rf "$tmp"
     export UNAOS_FONT_DIRS="${UNAOS_FONT_DIRS:+${UNAOS_FONT_DIRS}:}${dir}"
-    [ "$ok" = 1 ] && echo -e "${COLOR_GREEN}  • FONTS: four Noto faces SHA-pinned into ${dir} (UNAOS_FONT_DIRS)${COLOR_RESET}"
+    [ "$ok" = 1 ] && { KFONT_DEB_OK=1; echo -e "${COLOR_GREEN}  • FONTS: ${label} SHA-pinned into ${dir} (UNAOS_FONT_DIRS)${COLOR_RESET}"; }
+    return 0
+}
+# GLYPHSCARD (rmbp-ledger B1010): the CJK face GLYPHS (B676) draws its Han + Hiragana line with — builder/src/main.rs
+# KFONT_FACES' NotoSansCJK-Regular.ttc, the kernel's `noto-cjk` FACES row (video/text.rs; read LATE, 64 KiB per desktop
+# service pass: 19484784 B is over FACE_MAX). Flight 38's Mac host had no package dir, so the card carried no CJK face.
+# (1) the face in UNAOS_FONT_DIRS or a package dir -> nothing to do; (2) else the Ubuntu pool fonts-noto-cjk .deb (jammy),
+# SHA-512 pinned, the face SHA-256 pinned, into the gitignored target/fonts-noto-cjk/ with the package's copyright as LICENSE
+# (the builder stages it as system/fonts/LICENSES/noto-cjk.txt). No apt: no ruling names fonts-noto-cjk on the host. Pins
+# measured 2026-10-27 by the GLYPHSCARD executor (curl of the pool .deb, 61220346 B; sha512sum / dpkg-deb -x / sha256sum).
+KFONT_CJK_FACE="NotoSansCJK-Regular.ttc"
+KFONT_CJK_BYTES=19484784
+KFONT_CJK_DEB_URL="http://archive.ubuntu.com/ubuntu/pool/main/f/fonts-noto-cjk/fonts-noto-cjk_20220127+repack1-1_all.deb"
+KFONT_CJK_DEB_SHA512="7f532d19dbba0cf4c00415c5d9cff90725b754339e89b29be543324f51bc391e21c9834c4cb15011f97684e4349c29629362a0cbbde5a517cec0e4105139b360"
+KFONT_CJK_SHA256="b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a"
+ensure_kfont_cjk() {
+    local state="host"
+    if [ "$(kfont_noto_missing "$KFONT_CJK_FACE")" != 0 ]; then
+        echo -e "${COLOR_YELLOW}  • FONTS: ${KFONT_CJK_FACE} not on this host — fetching the pinned fonts-noto-cjk .deb (GLYPHSCARD B1010)${COLOR_RESET}"
+        kfont_deb_stage "CJK face" "$KFONT_CJK_DEB_URL" "$KFONT_CJK_DEB_SHA512" "${WORKSPACE_DIR}/target/fonts-noto-cjk" fonts-noto-cjk \
+            "${KFONT_CJK_FACE}=${KFONT_CJK_SHA256}"
+        if [ "$KFONT_DEB_OK" = 1 ]; then state="MATCH"; else state="ABSENT ${KFONT_CJK_FACE}"; fi
+    fi
+    echo -e "${COLOR_YELLOW}⚡ FONTS: ${KFONT_CJK_FACE} -> ${state} (${KFONT_CJK_BYTES} B per volume that carries system/fonts; GLYPHSCARD B1010)${COLOR_RESET}"
     return 0
 }
 
@@ -10002,7 +10060,7 @@ esp_x86() {
     build_user_diag_x86    # SELFDIAG: target/DIAG-X86.ELF + target/witness-owners.txt — staged as APPS/DIAG.ELF + system/witness-owners.txt
     build_user_holocron_x86   # HOLOCRON2 (B355): target/HOLOCRON-X86.ELF — staged as APPS/HOLOCRON.ELF
     build_user_prefs_x86; build_user_big_x86; build_user_micring3_x86   # BANDY3: target/PREFS-X86.ELF — staged as APPS/PREFS.ELF. RING3WIN: target/BIG-X86.ELF — staged as APPS/BIG.ELF. MICSTAGE (B744): target/MICRING3-X86.ELF — staged as APPS/MICRING3.ELF (tests micring3)
-    ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363): the Noto script faces on the builder host first
+    _rustc_floor || exit 1; ensure_kfont_noto; cd "$WORKSPACE_DIR/builder"   # KERNELFONT2 (B363): the Noto script faces on the builder host first
     UNAOS_PACKAGE_ONLY=1 cargo +nightly run --release
     cd "$WORKSPACE_DIR"
     # The media path does NOT go through build_kernel_x86_64 (the builder compiles the kernel
@@ -10599,7 +10657,7 @@ test_splash() {
 # three), every line held on the previous line's verdict. The spec's COMPLETE is the last verdict. The typist connects to QMP before it reads a marker, and the QMP socket exists only after
 # test_x86_64 has removed the old capture, so it never reads a stale log. Transcript: target/zenbook-typist.log (beside it).
 test_zenbook() {
-    local secs="${1:-180}"
+    local secs="${1:-200}"   # ZENBOOKSPECPINS (Z54): 180 -> 200 s, the three typed verbs added below cost 18.15 s (3 x 4 s settle + 45 keys x 0.12 s + 3 x 0.25 s poll)
     if [ -z "${UNAOS_ZENBOOKLANE:-}" ]; then
         local _zk="" _zv
         for _zv in $(compgen -e); do case "$_zv" in UNAOS_QEMU_MACHINE|UNAOS_QMP_PORT|UNAOS_NVME_4K|UNAOS_NVME_DISK) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
@@ -10607,7 +10665,7 @@ test_zenbook() {
         set -a; . <(awk '!index($0, "# [media]")' "$WORKSPACE_DIR/scripts/image-line-zenbook.env") || exit 1; set +a
         exec env UNAOS_ZENBOOKLANE=1 UNAOS_PLATFORM=zenbook_um5606w UNAOS_CENSUS=1 UNAOS_USBSERIAL=1 "$0" test-zenbook "$secs"
     fi
-    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: the Zenbook line as zenbook_um5606w on a fresh card, the first-user form typed, then nine typed verbs (${secs}s wall, spec ${X86_ZENBOOK_SPEC#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: the Zenbook line as zenbook_um5606w on a fresh card, the first-user form typed, then twelve typed verbs (${secs}s wall, spec ${X86_ZENBOOK_SPEC#${WORKSPACE_DIR}/})${COLOR_RESET}"
     rm -f "${WORKSPACE_DIR}/target/sdcard.img"; zenbook_bootlist_carry   # ZENBOOKLANELIST (Z19): the lane's own list, staged by the ONE stager, carried onto the ESP by the builder
     X86_TEST_SPEC="$X86_ZENBOOK_SPEC"
     build_selfbuild_x86() { echo "   ZENBOOKLANE: SELFBUILD staging not entered (build_selfbuild_x86 stubbed, as the twoboot arm does)"; }
@@ -10624,14 +10682,14 @@ zenbook_lane_typed() { # $1 = the wall (s)
     TYPIST_PORT="$zport" TYPIST_LOG="$SERIAL_LOG"
     local -a zph=("$FIRSTUSER_PHASE")
     prev=":: BOOTLIST: ran="   # ZENBOOKLANELIST (Z19): held on the lane list's light summary (it runs at [desktop] built), so no typed `tests` meets a list fixture's RUNNING (`:: TESTS: already running — refused ::`)
-    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID bootlist:BOOTLIST; do   # ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged)
+    for v in platform:PLATFORM ec:EC nvme:NVME i8042:I8042 dwi2c:DWI2C hdacensus:HDACENSUS gopshot:GOPSHOT eclid:ECLID suspend:SUSPEND ecqnames:ECQNAMES dwi2cacpi:DWI2CFAST bootlist:BOOTLIST; do   # ZENBOOKFLIGHTLIST (Z33): hdacensus, gopshot, eclid typed before bootlist (COMPLETE unchanged). ZENBOOKSPECPINS (Z54): suspend, ecqnames, dwi2cacpi (held on DWI2CFAST, its last of three verdicts), each pinned by x86-zenbook.spec §9
         local done_mark=":: ${v#*:}: "; [ "${v%%:*}" = bootlist ] && done_mark=":: BOOTLIST: probe"
         zph+=("${prev}|tests ${v%%:*}|t:tests spc t:${v%%:*} ret|${done_mark}")
         prev="$done_mark"
     done
     mkdir -p "${WORKSPACE_DIR}/target"; rm -f "$tlog"
     typist_start "$tlog" "$secs" "${zph[@]}"
-    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: typist armed on QMP :${zport} — the first-user form, then tests platform/ec/nvme/i8042/dwi2c/hdacensus/gopshot/eclid/bootlist (transcript ${tlog#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: typist armed on QMP :${zport} — the first-user form, then tests platform/ec/nvme/i8042/dwi2c/hdacensus/gopshot/eclid/suspend/ecqnames/dwi2cacpi/bootlist (transcript ${tlog#${WORKSPACE_DIR}/})${COLOR_RESET}"
     test_x86_64 "$secs" || rc=$?
     wait "$typist" 2>/dev/null || true
     awk '/^\[typist\]/ { print "ZENBOOKLANE:   " $0 }' "$tlog" 2>/dev/null || true
@@ -14992,8 +15050,8 @@ fw_stage_pinned() {
     echo -e "${COLOR_YELLOW}⚡ ${tag}: $# files from ${src} onto the ESP at ${sub}/ (${envn}; bench-only, never in-tree)${COLOR_RESET}"
     for m in "$@"; do
         f="${m%%:*}"; role="${m##*:}"
-        sum=$(sha256sum "${src}/${f}" | cut -d' ' -f1)
-        bytes=$(stat -c %s "${src}/${f}")
+        sum=$(sha256_of "${src}/${f}")
+        bytes=$(_fsize "${src}/${f}")
         echo -e "${COLOR_YELLOW}⚡ ${tag}: ${f} sha256=${sum} bytes=${bytes} pin-row: ${role} ${sum}${COLOR_RESET}"
         pinned=$(awk -v r="$role" '$1==r && NF==2 {print tolower($2)}' "${WORKSPACE_DIR}/firmware/${pins}" 2>/dev/null | head -1)
         if [ -z "$pinned" ]; then [ "$state" = "MATCH" ] && state="UNPINNED"
@@ -15013,6 +15071,89 @@ fw_stage_unafs() {
     cargo run -q --manifest-path "${WORKSPACE_DIR}/../tools/unafs/Cargo.toml" -- put "${WORKSPACE_DIR}/target/${tag,,}" "$dir" -i "$img" >/dev/null || {
         echo -e "${COLOR_RED}❌ ${tag}: tools/unafs put target/${tag,,} -> ${dir} failed — no card image${COLOR_RESET}"; return 1; }
     echo -e "${COLOR_YELLOW}⚡ ${tag}: target/${tag,,} onto the UnaFS root at ${dir}/ (bench-only, never in-tree)${COLOR_RESET}"
+}
+
+# ARROYOMAC (rmbp-ledger B1011): the host-portable helpers, so a macOS bench builds the flight image (`esp-x86`) without
+# shims. GNU FIRST, BSD second: GNU `stat -f` is the FILESYSTEM mode, prints `?` for `%z` and exits 0, so the BSD form tried
+# first never falls through on Linux (media-writer.sh's order; make-pi-img.sh switches on `uname -s`). The sha256 mechanism is
+# `sha256_of` (above, Real-hardware boot media); `sha512_of` is its shape. `_ncpu` is for the self-host fixture builds (LNXCROSS).
+_fsize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
+_ncpu() { nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4; }
+sha512_of() {
+    if command -v shasum >/dev/null 2>&1; then shasum -a 512 "$1" | awk '{print $1}'
+    elif command -v sha512sum >/dev/null 2>&1; then sha512sum "$1" | awk '{print $1}'
+    else echo ""; fi
+}
+# The kernel and the builder are built with `cargo +nightly`, which overrides rust-toolchain.toml, so the floor is checked
+# on THAT toolchain: its commit date (YYYY-MM-DD, compared as a string — no `date -d`) must be >= the oldest nightly the
+# flights build on. A stale nightly (flight 38's Mac had a March one) is refused here, not as a compile error deep in a crate.
+_rustc_floor() {
+    local floor="2026-08-31" have
+    have="$(rustc +nightly -V 2>/dev/null | awk '{d=$NF; gsub(/[()]/, "", d); print d}')"
+    case "$have" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) echo -e "${COLOR_RED}❌ TOOLCHAIN: no dated \`rustc +nightly -V\` on this host — run: rustup toolchain install nightly (B1011)${COLOR_RESET}"; return 1 ;;
+    esac
+    if [[ "$have" < "$floor" ]]; then
+        echo -e "${COLOR_RED}❌ TOOLCHAIN: nightly ${have} is older than ${floor} — run: rustup update nightly (B1011)${COLOR_RESET}"; return 1
+    fi
+    return 0
+}
+
+
+# LNXCROSS (B1012, flight 38's medium gap): the Linux-target toolchain build_selfbuild_x86 and build_selfbuild4/5_x86 compile, link
+# and strip with. Linux host: gcc / strip — every argv byte-equal to the pre-LNXCROSS lines, so the staged .LNX files and the
+# `SELFBUILD1: sha256` lines are unchanged. Darwin host (a Mac bench): Apple clang cross-targets x86_64-unknown-linux-musl and links
+# through the Rust toolchain's own ld.lld wrapper (lib/rustlib/<host>/bin/gcc-ld/ld.lld; llvm-strip / llvm-ar from llvm-tools) — no
+# Homebrew. A Mac cannot RUN a Linux ELF, so each host proof is DEFERRED to the card's BOOTLIST row (said on its own line), and the
+# products whose build itself runs a Linux ELF on the host are refused by name: TCC.LNX + LIB (tinycc builds libtcc1.a with itself;
+# the LIB proof runs TCC.LNX: TCC-DARWIN-CROSS owed), PROBE.LNX (busybox links libc + libgcc through the gcc driver; no linux
+# builtins archive on a stock Mac: PROBE-DARWIN-CROSS owed). LLD.LNX, LIB/rust, LIB/dyn, LIB/rustc stay Linux-host products.
+_lnx_pick() {
+    [ -n "${_LNX_HOST:-}" ] && return 0
+    local tb why=""
+    if [ "$(uname -s)" = "Darwin" ]; then
+        _LNX_HOST=darwin
+        tb="$(rustc +nightly --print sysroot 2>/dev/null)/lib/rustlib/$(rustc +nightly -vV 2>/dev/null | awk '/host/{print $2}')/bin"
+        if [ -x "$tb/gcc-ld/ld.lld" ]; then _LNX_LD="$tb/gcc-ld/ld.lld"; else _LNX_LD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"; fi
+        if [ -x "$tb/llvm-strip" ]; then _LNX_STRIP="$tb/llvm-strip"; else _LNX_STRIP="$(command -v llvm-strip 2>/dev/null || echo llvm-strip)"; fi
+        _LNX_CC="clang --target=x86_64-unknown-linux-musl -fuse-ld=lld --ld-path=$_LNX_LD"
+        _LNX_TOOLS=("AR=$tb/llvm-ar" "RANLIB=$tb/llvm-ar s")
+        if ! command -v clang >/dev/null 2>&1; then why="missing tool: clang (xcode-select --install)"
+        elif ! command -v "$_LNX_LD" >/dev/null 2>&1; then why="missing tool: ld.lld (the Rust toolchain's gcc-ld/ld.lld)"
+        elif ! command -v "$_LNX_STRIP" >/dev/null 2>&1 || [ ! -x "$tb/llvm-ar" ]; then why="missing tool: llvm-strip/llvm-ar (rustup component add llvm-tools)"; fi
+    else
+        _LNX_HOST=linux _LNX_CC=gcc _LNX_LD=gcc _LNX_STRIP=strip
+        _LNX_TOOLS=()
+        why="$(_sb_missing gcc strip || true)"
+    fi
+    _LNX_WHY="$why"
+    echo "   [selfbuild] host=$_LNX_HOST cc=${_LNX_CC%% *} ld=$_LNX_LD strip=$_LNX_STRIP -> ${why:+REFUSED why=}${why:-ok}"
+}
+_lnx_why() { # prints why the Linux-target toolchain is absent and succeeds; fails silently when it is present (linux: `_sb_missing gcc`)
+    if [ "${_LNX_HOST:-linux}" = "linux" ]; then _sb_missing gcc; return; fi
+    [ -n "${_LNX_WHY:-}" ] && { echo "$_LNX_WHY"; return 0; }; return 1
+}
+_lnx_kat() { # out src [extra flag…] — a freestanding static KAT (no libc, no libgcc): the ONE copy of the flag string
+    $_LNX_CC -static -nostdlib -fno-pie -no-pie -O1 -ffreestanding -fno-stack-protector -fno-builtin "${@:3}" -o "$1" "$2"
+}
+_lnx_strip() { "$_LNX_STRIP" "$@"; }
+_lnx_deferred() { # n product — linux: fails silently (the host proof runs as before); darwin: says the proof is the card's and succeeds
+    [ "${_LNX_HOST:-linux}" = "darwin" ] || return 1
+    echo "   SELFBUILD$1: $2 host proof deferred (host=darwin: a Linux ELF does not run here; the card's BOOTLIST row runs it)"
+}
+_lnx_hostruns() { # 1|probe — linux: succeeds; darwin: refuses the products whose BUILD runs a Linux ELF on the host, by name, and fails
+    [ "${_LNX_HOST:-linux}" = "darwin" ] || return 0
+    case "$1" in
+        1) _sb_skip 1 TCC.LNX "host=darwin: tinycc builds libtcc1.a with the fresh TCC.LNX and the LIB proof runs it (TCC-DARWIN-CROSS owed)"
+           [ -d "${WORKSPACE_DIR}/target/LIB" ] && { _sb_skip 3 LIB "needs TCC.LNX (host=darwin, TCC-DARWIN-CROSS owed)"; rm -rf "${WORKSPACE_DIR}/target/LIB"; } ;;
+        probe) _sb_skip 1 PROBE.LNX "host=darwin: busybox links libc + libgcc through the gcc driver (PROBE-DARWIN-CROSS owed)" ;;
+    esac
+    return 1
+}
+_lnx_cargoenv() { # darwin: the musl target's linker is the Rust toolchain's ld.lld (rustc infers the ld.lld flavour from its name); linux: no-op
+    [ "${_LNX_HOST:-linux}" = "darwin" ] && export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$_LNX_LD"
+    return 0
 }
 
 # --- Entry Point ---
@@ -15136,7 +15277,7 @@ case "${1:-}" in
     test-zenbook|test_zenbook)
         # ZENBOOKLANE (zenbook-ledger Z13): the Zenbook line under QEMU as zenbook_um5606w. Re-execs itself (see
         # test_zenbook), so this arm is entered twice per invocation. Fold-gate command, not a leg of `check`.
-        test_zenbook "${2:-180}"   # ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
+        test_zenbook "${2:-200}"   # ZENBOOKSPECPINS (Z54): 200 s, twelve typed verbs (+18.15 s measured from typist.sh). ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
         ;;
     kernel8|baremetal)
         _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do

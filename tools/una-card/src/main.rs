@@ -83,7 +83,7 @@ fn trees_bytes(trees: &[PathBuf], skip: &[String]) -> u64 {
 fn build_fat(path: &Path, sectors: u64, trees: &[PathBuf], skip: &[String]) {
     for t in ["mkfs.vfat", "mcopy"] {
         if !which(t) {
-            die(&format!("'{t}' not found — install dosfstools + mtools"));
+            die(&format!("'{t}' not found — install dosfstools + mtools (macOS: brew install dosfstools mtools; Debian/Ubuntu: apt install dosfstools mtools)"));
         }
     }
     File::create(path).and_then(|f| f.set_len(sectors * SECTOR)).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));

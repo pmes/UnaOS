@@ -85,7 +85,7 @@ impl RawNic for E1000Nic {
         e1000::hw_addr().map(|(mac, _, _)| mac)
     }
     /// NETCLOCK M3: the USB dongle's TX ring is bounded and drained asynchronously; full = back-pressure.
-    fn tx_ready() -> bool { #[cfg(feature = "wifi10")] if crate::wifi::data::bound() { return crate::wifi::data::tx_ready(); } // STATIONTXGATE (B855): the kept station's asynchronous TX ring answers its own room in EVERY wifi10 image, usbnet or not (STATIONTX B843's fold, moved out of the usbnet cfg; LINE-NEUTRAL)
+    fn tx_ready() -> bool { #[cfg(feature = "wifi")] if crate::drivers::mt7925::bound() { return crate::drivers::mt7925::tx_room(); } #[cfg(feature = "wifi10")] if crate::wifi::data::bound() { return crate::wifi::data::tx_ready(); } // MT7925S9 (zenbook-ledger Z46): the MT7925 link answers its TX ring 0 room first (else usbnet's room, false with no dongle, would answer for it; LINE-NEUTRAL). STATIONTXGATE (B855): the kept station's asynchronous TX ring answers its own room in EVERY wifi10 image, usbnet or not (STATIONTX B843's fold, moved out of the usbnet cfg; LINE-NEUTRAL)
         #[cfg(feature = "usbnet")]
         if !e1000::nic_present() {
             return crate::drivers::xhci::usbnet::tx_room(); // NETCLOCK M3: the dongle's room (the Wi-Fi station's fold moved to this fn's first line, STATIONTXGATE B855; LINE-NEUTRAL)
@@ -654,7 +654,7 @@ fn rx_ready(drive: bool) -> bool {
     if crate::drivers::xhci::usbnet::rx_ready(drive) {
         return true;
     }
-    #[cfg(feature = "wifi10")] if crate::wifi::data::rx_ready() { return true; } let _ = drive; // WIFIDHCP (B831): a data frame kept by the Wi-Fi station (LINE-NEUTRAL)
+    #[cfg(feature = "wifi10")] if crate::wifi::data::rx_ready() { return true; } #[cfg(feature = "wifi")] if crate::drivers::mt7925::rx_pending() { return true; } let _ = drive; // MT7925S9 (zenbook-ledger Z46): a frame waiting on the MT7925 link's RX ring 2 (LINE-NEUTRAL). WIFIDHCP (B831): a data frame kept by the Wi-Fi station (LINE-NEUTRAL)
     false
 }
 

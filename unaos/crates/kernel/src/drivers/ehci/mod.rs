@@ -13407,13 +13407,13 @@ impl Controller {
         // just been skipped. A witness that fires when the thing it witnesses did not happen is
         // worse than no witness: it is what made "the trackpad is armed and silent" the working
         // theory for a whole sitting. The verdict now comes from the arming path itself.
-    ) -> bool { #[cfg(all(feature = "lidsleep", feature = "wc"))] { self.int_next = intpool::slot_take(self.int_used).unwrap_or(MAX_INT_EPS); } // EHCIPOOLRECYCLE (B807): under HUBREC `int_next` is the slot THIS arm takes — the lowest free one (`intpool::slot_take`), MAX_INT_EPS when all are held; the bound, the index, `+= 1` and the `isr_slot` derivation below read it unchanged. LINE-NEUTRAL fold, code first
+    ) -> bool { #[cfg(all(feature = "lidsleep", feature = "wc"))] { self.int_next = intpool::slot_take(self.int_used).unwrap_or(MAX_INT_EPS); } let ic = IntClass::of(is_kbd, is_rel, layout.is_some()); // EHCIPOOLRECYCLE (B807): under HUBREC `int_next` is the slot THIS arm takes — the lowest free one (`intpool::slot_take`), MAX_INT_EPS when all are held; the bound, the index, `+= 1` and the `isr_slot` derivation below read it unchanged. LINE-NEUTRAL fold, code first
         if self.int_next >= MAX_INT_EPS {
             serial_println!(
-                ":: EHCI-HID: [{}] STOP-NOTE static int-EP pool exhausted ({}) — addr {} intf {} ep=IN{} NOT armed ::",
-                self.idx, MAX_INT_EPS, t.addr, intf, ep
+                ":: EHCI-HID: [{}] STOP-NOTE static int-EP pool exhausted ({}) — addr {} intf {} ep=IN{} class={} NOT armed ::",
+                self.idx, MAX_INT_EPS, t.addr, intf, ep, ic.word()
             );
-            return false;
+            int_lost(ic, t.addr); return false;
         }
         let slot = &mut (*self.pool()).int_slots[self.int_next];
         let (qh, qtd, buf) = (
@@ -20604,4 +20604,153 @@ impl crate::drivers::hidboot::LedSlots for Controller {
     fn latch_off(&mut self, i: usize) {
         self.int_eps[i].kbd_led_ok = false; // the case fold is untouched
     }
+}
+
+// DONGLEBOOT2 (rmbp-ledger B1007, BP-input-21) — TAIL-APPENDED: who claims the fixed `MAX_INT_EPS` pool, by CLASS. The
+// three `arm_interrupt_ep` call sites ARE the claimants (boot HID, the report-protocol pointer, the hub status endpoint;
+// the BT event endpoint has its own `bt_slot`, USBNET-EHCI and UVC arm none), so the class is DERIVED from the arm's own
+// arguments, never passed: `is_kbd` -> kbd, `is_rel` or a report layout -> mouse, neither -> hub (the hub site is the
+// only all-false caller). The exhausted STOP-NOTE names `class=` and every refusal is counted (`int_lost`, under
+// `EHCI_HID`) for `tests intpool`. The take itself (`int_next`, `intpool::slot_take`) is untouched. A class reserve
+// for HID (INTPOOL-RESERVE) is owed: no claimant of another class reaches the pool today.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IntClass {
+    Kbd,
+    Mouse,
+    Hub,
+}
+
+impl IntClass {
+    /// The class of one `arm_interrupt_ep` claim, from its arguments (exact for the three call sites).
+    fn of(is_kbd: bool, is_rel: bool, has_layout: bool) -> IntClass {
+        if is_kbd {
+            IntClass::Kbd
+        } else if is_rel || has_layout {
+            IntClass::Mouse
+        } else {
+            IntClass::Hub
+        }
+    }
+    fn word(self) -> &'static str {
+        match self {
+            IntClass::Kbd => "kbd",
+            IntClass::Mouse => "mouse",
+            IntClass::Hub => "hub",
+        }
+    }
+    fn is_hid(self) -> bool {
+        matches!(self, IntClass::Kbd | IntClass::Mouse)
+    }
+    /// One loser packed for `INT_LOST`: `class << 8 | addr`, never 0 (the class codes start at 1).
+    fn pack(self, addr: u8) -> u32 {
+        let c = match self {
+            IntClass::Kbd => 1u32,
+            IntClass::Mouse => 2,
+            IntClass::Hub => 3,
+        };
+        (c << 8) | addr as u32
+    }
+    fn unpack(v: u32) -> (IntClass, u8) {
+        let c = match v >> 8 {
+            1 => IntClass::Kbd,
+            2 => IntClass::Mouse,
+            _ => IntClass::Hub,
+        };
+        (c, (v & 0xFF) as u8)
+    }
+}
+
+/// Every pool refusal this boot, the HID ones apart, and the first `INT_LOST.len()` losers (packed, 0 = none).
+static INT_REFUSED: AtomicU32 = AtomicU32::new(0);
+static INT_REFUSED_HID: AtomicU32 = AtomicU32::new(0);
+static INT_LOST: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+/// The counting rule, pure: refusal number `n` of `class` at `addr` lands in `lost[n]` while there is room; returns
+/// whether it was a HID loss. `int_lost` (live) and the KAT (synthetic) both go through it.
+fn lost_note(lost: &mut [u32; 4], n: usize, class: IntClass, addr: u8) -> bool {
+    if let Some(s) = lost.get_mut(n) {
+        *s = class.pack(addr);
+    }
+    class.is_hid()
+}
+
+/// Count one refused claim (the exhausted STOP-NOTE's site in `arm_interrupt_ep`, under `EHCI_HID`).
+fn int_lost(class: IntClass, addr: u8) {
+    let n = INT_REFUSED.fetch_add(1, Ordering::Relaxed) as usize;
+    let mut lost = [0u32; 4];
+    if lost_note(&mut lost, n, class, addr) {
+        INT_REFUSED_HID.fetch_add(1, Ordering::Relaxed);
+    }
+    if let (Some(s), Some(&v)) = (INT_LOST.get(n), lost.get(n)) {
+        s.store(v, Ordering::Relaxed);
+    }
+}
+
+impl Controller {
+    /// Slots of this controller's pool held now: the held-mask under HUBREC (slots come back), else the bump index.
+    fn int_held(&self) -> usize {
+        #[cfg(all(feature = "lidsleep", feature = "wc"))]
+        {
+            self.int_used.count_ones() as usize
+        }
+        #[cfg(not(all(feature = "lidsleep", feature = "wc")))]
+        {
+            self.int_next
+        }
+    }
+}
+
+/// `tests intpool` (R80: registered, never at boot): the class rule and the pool-full counting on synthetic claims,
+/// then the live census.
+/// `:: INTPOOL: slots=6 taken=<n> refused=<n> hid_armed=<n> reserve=owed who_lost=<class:addr,...|-> kat=ok|FAIL -> PASS|FAIL ::`
+/// PASS iff the KAT holds and no kbd/mouse claimant was refused. QEMU's EHCI has six ports (UNAOS_USB_EXTRA_INT fills
+/// at most five beside the harness keyboard) and takes no hub, so QEMU never refuses: the refusal leg is the KAT's.
+pub fn intpool_selftest() {
+    let shapes = IntClass::of(true, false, false) == IntClass::Kbd
+        && IntClass::of(false, true, false) == IntClass::Mouse
+        && IntClass::of(false, false, true) == IntClass::Mouse
+        && IntClass::of(false, false, false) == IntClass::Hub;
+    // Flight 38's controller 1 in arm order: four HID (kbd 6, boot-mouse 7, kbd 9, pointer 9), then hubs 5, 4, 1 —
+    // seven claims on six slots: the seventh (hub 1) is the one refusal, and it is not a HID loss.
+    let claims = [(IntClass::Kbd, 6u8), (IntClass::Mouse, 7), (IntClass::Kbd, 9), (IntClass::Mouse, 9), (IntClass::Hub, 5), (IntClass::Hub, 4), (IntClass::Hub, 1)];
+    let (mut held, mut refused, mut refused_hid, mut lost) = (0usize, 0usize, 0usize, [0u32; 4]);
+    for &(c, a) in claims.iter() {
+        if held < MAX_INT_EPS {
+            held += 1;
+        } else {
+            if lost_note(&mut lost, refused, c, a) {
+                refused_hid += 1;
+            }
+            refused += 1;
+        }
+    }
+    let counting = held == MAX_INT_EPS && refused == 1 && refused_hid == 0
+        && IntClass::unpack(lost[0]) == (IntClass::Hub, 1) && lost[1] == 0
+        && lost_note(&mut [0u32; 4], 4, IntClass::Kbd, 2); // past the record: still counted as a HID loss
+    let kat = shapes && counting;
+    let (mut taken, mut hid_armed) = (0usize, 0usize);
+    if let Some(ctrls) = EHCI_HID.lock().as_ref() {
+        for c in ctrls.iter() {
+            taken += c.int_held();
+            hid_armed += c.int_eps.iter().filter(|e| !e.dead && (e.is_kbd || e.is_rel_mouse || e.layout.is_some())).count();
+        }
+    }
+    let refused = INT_REFUSED.load(Ordering::Relaxed);
+    let refused_hid = INT_REFUSED_HID.load(Ordering::Relaxed);
+    let mut who = alloc::string::String::new();
+    for v in INT_LOST.iter().map(|s| s.load(Ordering::Relaxed)).filter(|&v| v != 0) {
+        let (c, a) = IntClass::unpack(v);
+        if !who.is_empty() {
+            who.push(',');
+        }
+        who.push_str(&alloc::format!("{}:{}", c.word(), a));
+    }
+    if who.is_empty() {
+        who.push('-');
+    }
+    let verdict = if kat && refused_hid == 0 { "PASS" } else { "FAIL" };
+    serial_println!(
+        ":: INTPOOL: slots={} taken={} refused={} hid_armed={} reserve=owed who_lost={} kat={} -> {} ::",
+        MAX_INT_EPS, taken, refused, hid_armed, who, if kat { "ok" } else { "FAIL" }, verdict
+    );
 }

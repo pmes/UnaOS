@@ -1519,16 +1519,16 @@ async fn open_verb_html_sandboxed_and_recorded() {
 #[tokio::test]
 async fn open_verb_refused_extension_prints_line() {
     let dir = pagesave_dir("openverbrefused");
-    let path = dir.join("notes.txt");
+    let path = dir.join("notes.xyz"); // OPENANYTYPE (SR408): a .txt is served now; a type TYPECORE does not name is not
     std::fs::write(&path, "plain").unwrap();
     let url = format!("file://{}", path.display());
     let mut e = AetherEngine::new();
     e.set_device_size(200, 100);
     e.load_html("https://openverb.example/", "<p>console</p>", true);
-    assert!(crate::chrome::host::open_local(&url).is_none(), "a .txt is not served");
+    assert!(crate::chrome::host::open_local(&url).is_none(), "a .xyz is not served");
     assert!(crate::chrome::host::open_local("file:///etc/hostname").is_none());
     let lines = crate::js::console_lines();
-    assert!(lines.iter().any(|(_, l)| l == "[pdf] open: txt not served"), "named on the console line: {lines:?}");
+    assert!(lines.iter().any(|(_, l)| l == "[pdf] open: xyz not served"), "named on the console line: {lines:?}");
     assert!(lines.iter().any(|(_, l)| l == "[pdf] open: none not served"), "no extension: {lines:?}");
     assert!(crate::net::fetch_document_any(&url).await.is_err(), "the loader refuses it");
     std::fs::remove_dir_all(&dir).unwrap();
@@ -1618,5 +1618,111 @@ fn pagesave_cssurls_mhtml_unchanged() {
         assert!(body(p).is_some(), "{p} discovered as a part");
     }
     assert!(body("gone.png").is_none(), "the uncached one left out");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---- OPENANYTYPE (SR408): a local .pdf / .txt / .svg / media file opens; a local page's own images, bounded to its folder
+
+/// OPENANYTYPE (SR408): `name` written into a fresh folder for KAT `tag`; answers (folder, the file's URL).
+fn open_any_file(tag: &str, name: &str, bytes: &[u8]) -> (std::path::PathBuf, String) {
+    let dir = pagesave_dir(tag);
+    let path = dir.join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&path, bytes).unwrap();
+    (dir, format!("file://{}", path.display()))
+}
+
+/// OPENANYTYPE (SR408): a local `.pdf` opens through the PDF arm (its `%PDF-` head): the engine's PDF document, both pages.
+#[tokio::test]
+async fn open_verb_any_pdf_pages() {
+    let (dir, url) = open_any_file("openanypdf", "two pages.pdf", &two_pages());
+    let url = url.replace(' ', "%20");
+    let page = crate::net::fetch_page(&url).await.expect("the local PDF opens");
+    assert_eq!(page.pdf.as_ref().map(|b| b.len()), Some(two_pages().len()), "the file's bytes, whole");
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_page(page, true);
+    assert_eq!(e.pdf.as_ref().expect("the PDF opened").page_count(), 2);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// OPENANYTYPE (SR408): a local `.txt` shows as its text in a `<pre>`: markup in it is text (no element made).
+#[tokio::test]
+async fn open_verb_any_txt_shows() {
+    let (dir, url) = open_any_file("openanytxt", "notes.txt", b"a <b>bold</b> & line");
+    let page = crate::net::fetch_page(&url).await.expect("the local text opens");
+    assert_eq!(page.base_url, url);
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_page(page, true);
+    let doc = e.document.as_ref().unwrap();
+    let pre = doc.select("pre").ok().and_then(|mut p| p.next()).expect("a <pre>").as_node().text_contents();
+    assert_eq!(pre, "a <b>bold</b> & line", "the text, escaped");
+    assert!(doc.select("b").ok().and_then(|mut b| b.next()).is_none(), "no element made from the text");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// OPENANYTYPE (SR408): a local `.svg` is an image document: its bytes are the page's own subresource, drawn by the image
+/// path's renderer (a red pixel at the top left), never parsed as markup.
+#[tokio::test]
+async fn open_verb_any_svg_pixel() {
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="20" fill="#ff0000"/></svg>"##;
+    let (dir, url) = open_any_file("openanysvg", "dot.svg", svg);
+    let page = crate::net::fetch_page(&url).await.expect("the local svg opens");
+    assert!(page.images.iter().any(|(u, _)| *u == url), "the svg decoded under its file URL: {:?}", page.images.iter().map(|(u, _)| u).collect::<Vec<_>>());
+    let mut e = AetherEngine::new();
+    e.set_device_size(200, 100);
+    e.load_page(page, true);
+    e.render_frame();
+    assert_eq!(px(&e.present_rgba(), 5, 5), [255, 0, 0], "the svg's red, drawn");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// OPENANYTYPE (SR408): a local `.mp4` is a media document: the media path is handed the file URL itself (Stria reads
+/// the file; Aether reads nothing).
+#[tokio::test]
+async fn open_verb_any_mp4_media() {
+    let (dir, url) = open_any_file("openanymp4", "clip.mp4", b"\x00\x00\x00\x18ftypmp42");
+    let page = crate::net::fetch_page(&url).await.expect("the local media opens");
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_page(page, true);
+    let reqs = e.take_media_requests();
+    let carries = |m: &bandy::SMessage| match m {
+        bandy::SMessage::MediaPoster { url: u } => *u == url,
+        bandy::SMessage::PlayMedia { url: u, mime, .. } => *u == url && mime == "video/mp4",
+        _ => false,
+    };
+    assert!(reqs.iter().any(carries), "the media request carries the file URL: {reqs:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// OPENANYTYPE (SR408): a local page's `<img src>` beside it is read from its folder and decoded.
+#[tokio::test]
+async fn open_verb_any_sibling_img() {
+    let (dir, url) = open_any_file("openanysibling", "page.html", b"<html><body><p>local</p><img src=\"pic.png\"></body></html>");
+    std::fs::write(dir.join("pic.png"), pagesave_png()).unwrap();
+    let page = crate::net::fetch_page(&url).await.expect("the local page opens");
+    let pic = format!("file://{}", dir.join("pic.png").display());
+    let img = page.images.iter().find(|(u, _)| *u == pic).map(|(_, i)| i.clone()).expect("the sibling image, decoded");
+    assert_eq!((img.width(), img.height(), img.get_pixel(0, 0).0), (1, 1, [255, 0, 0, 255]));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// OPENANYTYPE (SR408): a local page's `../` image (which exists) is outside its folder: refused by name, never read.
+#[tokio::test]
+async fn open_verb_any_dotdot_refused() {
+    let (dir, url) = open_any_file("openanydotdot", "sub/page.html", b"<html><body><img src=\"../out.png\"></body></html>");
+    std::fs::write(dir.join("out.png"), pagesave_png()).unwrap();
+    let mut e = AetherEngine::new();
+    e.set_device_size(200, 100);
+    e.load_html("https://openverb.example/", "<p>console</p>", true);
+    let page = crate::net::fetch_page(&url).await.expect("the local page opens");
+    assert!(!page.images.iter().any(|(u, _)| u.ends_with("/out.png")), "the escape is not read");
+    let want = format!("[pdf] open: {} outside the page's folder", dir.join("out.png").display());
+    let lines = crate::js::console_lines();
+    assert!(lines.iter().any(|(_, l)| *l == want), "named on the console line: {lines:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
