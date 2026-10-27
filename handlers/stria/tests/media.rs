@@ -612,3 +612,69 @@ fn hevcdepthcore_main10_mid_stream_swaps_to_the_stand_in_once() {
     assert_eq!(sink.shown.iter().map(|s| s.1).collect::<Vec<_>>(), [0, 40_000_000, 80_000_000, 120_000_000], "{:?}", sink.shown);
     println!("hevcpal-swap: {} | frames={}", lines[0], sink.shown.len());
 }
+
+// METERPLAYER (LEDGER SR319): the Player's RMS through `audio_core::meter`, one meter per channel, read at each 50 ms
+// pts window's close and handed to the sink by `FrameSink::levels_rms` beside the unchanged window-max `levels`.
+#[derive(Default)]
+struct RmsSink {
+    peaks: Vec<(i64, [f32; 2])>,
+    rms: Vec<(i64, [f64; 2])>,
+}
+impl FrameSink for RmsSink {
+    fn present(&mut self, _f: &Frame, _ordinal: u64) {}
+    fn levels(&mut self, pts_ns: i64, peaks: &[[f32; 2]]) {
+        for (i, p) in peaks.iter().enumerate() {
+            self.peaks.push((pts_ns + i as i64 * stria::media::LEVEL_WINDOW_NS, *p));
+        }
+    }
+    fn levels_rms(&mut self, pts_ns: i64, rms_db: &[[f64; 2]]) {
+        for (i, r) in rms_db.iter().enumerate() {
+            self.rms.push((pts_ns + i as i64 * stria::media::LEVEL_WINDOW_NS, *r));
+        }
+    }
+}
+
+/// 1 s of 48 kHz stereo PCM16, a 1 kHz sine at 0.5 full scale left and 0.25 right (2400 frames = one 50 ms window =
+/// fifty whole periods): twenty windows, each RMS 20 log10(A / sqrt 2) = -9.031 / -15.051 dBFS, at the peaks' pts.
+#[test]
+fn meterplayer_rms_of_a_stereo_sine_through_the_players_sink() {
+    let rate = 48_000usize;
+    let pcm: Vec<i16> = (0..rate)
+        .flat_map(|i| {
+            let x = (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / rate as f64).sin();
+            [(x * 16384.0).round() as i16, (x * 8192.0).round() as i16]
+        })
+        .collect();
+    let file = build::mkv(&[build::pcm16_track(1, rate as u32, 2, &pcm, 960)], &MkvOptions::default());
+    let time = ManualTime::new();
+    let (src, feed) = stream_pair_channels(rate as u32, 2, rate / 2);
+    let mut graph = AudioGraph::new(rate as f64);
+    graph.add_node(Box::new(src));
+    let mut p = Player::open(file, Arc::new(time.clone()), Some(Box::new(SharedFeed(Arc::new(Mutex::new(feed))))), 60).unwrap();
+    assert!(!p.info().has_video && p.info().audio_clock, "{:?}", p.info());
+    p.play();
+    let mut sink = RmsSink::default();
+    let (mut owed, mut ended) = (0usize, false);
+    for _ in 0..200 {
+        if p.tick(&mut sink) == Tick::Ended {
+            ended = true;
+            break;
+        }
+        time.advance(16_666_667);
+        owed += 800;
+        while owed >= BLOCK_SIZE {
+            graph.process_stereo();
+            owed -= BLOCK_SIZE;
+        }
+    }
+    assert!(ended);
+    assert_eq!(sink.rms.len(), 20, "one RMS per 50 ms window");
+    assert_eq!(sink.peaks.iter().map(|w| w.0).collect::<Vec<_>>(), sink.rms.iter().map(|w| w.0).collect::<Vec<_>>(), "the same windows");
+    let (want_l, want_r) = (20.0 * (0.5f64 / 2f64.sqrt()).log10(), 20.0 * (0.25f64 / 2f64.sqrt()).log10());
+    for (k, (t, r)) in sink.rms.iter().enumerate() {
+        assert_eq!(*t, k as i64 * stria::media::LEVEL_WINDOW_NS);
+        assert!((r[0] - want_l).abs() < 0.02 && (r[1] - want_r).abs() < 0.02, "window {k}: {r:?} want [{want_l}, {want_r}]");
+        let pk = sink.peaks[k].1;
+        assert!((pk[0] - 0.5).abs() < 0.001 && (pk[1] - 0.25).abs() < 0.001, "window {k}: peaks {pk:?}");
+    }
+}
