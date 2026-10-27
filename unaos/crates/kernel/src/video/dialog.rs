@@ -30,9 +30,9 @@ use super::{metrics, theme, wm};
 pub const OWNER: u64 = wm::KERNEL_OWNER_BASE + 0x70;
 /// Logical layout.
 const W: usize = 440;
-const H: usize = 168;
+const H0: usize = 168; #[allow(non_snake_case)] fn H() -> usize { DLG_H.load(Ordering::Relaxed) } // TEXTSCALE3 (B849): the height the open dialog was laid out at (`h_at`, latched at open: the surface, the row and every clip agree)
 const BW: usize = 104;
-const BH: usize = 26;
+const BH0: usize = 26; #[allow(non_snake_case)] fn BH() -> usize { theme::metrics().grow(BH0) } // TEXTSCALE3: the button holds the UI line
 const ML: usize = 64;
 const IL: usize = 3;
 /// The power confirm's countdown.
@@ -181,7 +181,7 @@ static PRIMARY: AtomicU32 = AtomicU32::new(0);
 
 static SURF_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 fn surf() -> &'static mut [u32] {
-    let n = metrics::size(W) * metrics::size(H);
+    let n = metrics::size(W) * metrics::size(H());
     metrics::leaked_surf(&SURF_AT, n) // SECREVIEW F1: grows with the live scale (was sized once, then sliced at the new scale)
 }
 
@@ -219,20 +219,20 @@ pub fn blocks_owner(owner: u64) -> bool {
 fn btn_rect(i: u8, nb: u8) -> (usize, usize, usize, usize) {
     let from_right = (nb - 1 - i) as usize;
     let x = W - 20 - BW - from_right * (BW + 12);
-    (x, H - 20 - BH, BW, BH)
+    (x, H() - 20 - BH(), BW, BH())
 }
 
 fn text(px: &mut [u32], x: usize, y: usize, s: &[u8], ink: u32, bold: bool) {
-    let _ = metrics::text(px, metrics::size(W), metrics::size(H), W, x, y, s, ink, bold, crate::video::text::Face::Ui);
+    let _ = metrics::text(px, metrics::size(W), metrics::size(H()), W, x, y, s, ink, bold, crate::video::text::Face::Ui);
 }
 fn fill(px: &mut [u32], x: usize, y: usize, w: usize, h: usize, c: u32) {
-    let (w, h) = (w.min(W.saturating_sub(x)), h.min(H.saturating_sub(y)));
+    let (w, h) = (w.min(W.saturating_sub(x)), h.min(H().saturating_sub(y)));
     metrics::fill(px, metrics::size(W), x, y, w, h, c);
 }
 
 fn paint(d: &Dlg, left_s: u32) {
     let px = surf();
-    fill(px, 0, 0, W, H, theme::surface_window());
+    fill(px, 0, 0, W, H(), theme::surface_window());
     // the icon: the app's mark (a rounded tile and its glyph)
     let (ic, glyph): (u32, &[u8]) = match d.icon { Icon::Stop => (theme::ctrl_close(), b"!"), Icon::Caution => (theme::ctrl_min(), b"!"), Icon::System => (theme::accent(), b"U") };
     fill(px, 22, 22, 48, 48, ic);
@@ -242,11 +242,11 @@ fn paint(d: &Dlg, left_s: u32) {
     text(px, 22 + 24usize.saturating_sub(gw / 2), 36, glyph, theme::surface_raised(), true);
     // the bold message, then the informative text
     text(px, 88, 22, d.message(), theme::text_primary(), true);
-    let mut y = 48;
+    let mut y = gy(48, 1); // TEXTSCALE3 (B849): under the grown message line
     for i in 0..IL {
         if d.il[i] != 0 {
             text(px, 88, y, &d.info[i][..d.il[i] as usize], theme::text_primary(), false);
-            y += 18;
+            y += theme::metrics().grow(18);
         }
     }
     if d.countdown_s != 0 {
@@ -268,7 +268,7 @@ fn paint(d: &Dlg, left_s: u32) {
         fill(px, x + w - 1, by, 1, h, theme::line_subtle());
         let l = d.btn(i);
         let tw = metrics::ladvance(l, false, crate::video::text::Face::Ui);
-        text(px, x + w.saturating_sub(tw) / 2, by + 5, l, if def { theme::surface_raised() } else { theme::text_primary() }, false);
+        text_to(px, x + w.saturating_sub(tw) / 2, by + h.saturating_sub(metrics::lcell_h(crate::video::text::Face::Ui)) / 2, l, if def { theme::surface_raised() } else { theme::text_primary() }, x + w); // TEXTSCALE3 (B849): centred on the UI line, clipped at the box
     }
     PRIMARY.store(primary, Ordering::Relaxed);
 }
@@ -298,7 +298,7 @@ fn open_pending() {
     let mut win = wm::WIN_NONE;
     let mut sheet = false;
     if !HEADLESS.load(Ordering::Relaxed) {
-        if let Some((_s, ow, oh)) = wm::spawn_geometry_native(metrics::size(W), metrics::size(H)) {
+        DLG_H.store(h_at(theme::metrics()), Ordering::Relaxed); DLG_SEEN.store(super::text::epoch(), Ordering::Relaxed); if let Some((_s, ow, oh)) = wm::spawn_geometry_native(metrics::size(W), metrics::size(H())) { // TEXTSCALE3 (B849): the height this dialog lays out at, latched before the row exists
             let (pw, ph) = { let i = super::WRITER.lock().info(); (i.width, i.height) };
             let (mut x, mut y) = (pw.saturating_sub(ow) / 2 + wm::BORDER(), ph.saturating_sub(oh) / 4 + wm::TITLE_H() + wm::BORDER());
             let mut slide = 0u8;
@@ -311,7 +311,7 @@ fn open_pending() {
                 }
             }
             paint(&d, d.countdown_s);
-            let (sw, sh) = (metrics::size(W), metrics::size(H));
+            let (sw, sh) = (metrics::size(W), metrics::size(H()));
             let start_y = y.saturating_sub(slide as usize * metrics::size(SLIDE_PX));
             win = wm::create_at_native(OWNER, surf().as_mut_ptr() as usize, sw * sh * 4, sw as u32, sh as u32, (sw * 4) as u32, d.title(), x, start_y);
             if win != wm::WIN_NONE {
@@ -407,7 +407,7 @@ pub fn service() {
         let Some(g) = ST.try_lock() else { return };
         (g.cur, g.win, g.deadline, g.shown_s, g.slide, g.at)
     };
-    let Some(d) = cur else { return };
+    let Some(d) = cur else { return }; font_follow(&d, win, shown); // TEXTSCALE3 (B849): a restyle repaints the open dialog once (its own pass; it is not in `font_repaint_pass`)
     if slide != 0 && win != wm::WIN_NONE {
         let s = slide - 1;
         let _ = wm::move_to(win, at.0, at.1.saturating_sub(s as usize * metrics::size(SLIDE_PX)));
@@ -469,7 +469,7 @@ pub fn press(x: i32, y: i32) -> bool {
                 return false; // the title bar: the WM's (a drag)
             }
             let (lx, ly) = (metrics::to_logical(x as usize - info.x), metrics::to_logical(y as usize - info.y));
-            if lx >= W || ly >= H {
+            if lx >= W || ly >= H() {
                 return false;
             }
             if wm::focus_asid() != OWNER {
@@ -1219,4 +1219,58 @@ pub fn toastcap_leg() -> (usize, u32, bool, bool) {
     HEADLESS.store(was, Ordering::Relaxed);
     serial_println!("[dialog] toastcap views={} primary_min={} primary_max={} return={} esc={}", n, if pmin == u32::MAX { 0 } else { pmin }, pmax, ret as u8, esc as u8);
     (n, if pmin == 1 { pmax } else { 0 }, ret && !acted, esc && !acted)
+}
+
+// ── TEXTSCALE3 (rmbp-ledger B849) — the dialog reflows with the text size ───────────────────────────────────────────
+// The message, the informative lines and the button labels draw the UI face; their bands sat on a constant 16 px
+// rhythm. Each band now grows by what the UI line grew (`theme::metrics().grow`, TEXTSCALE's one reader) and the
+// window's height follows (`h_at`), latched at open: no public wm door resizes a kernel row, so a dialog open across a
+// step keeps its height (TEXTSCALE-RESEAT, owed). The default size draws the constants.
+
+/// The height the open dialog was laid out at (`h_at`, stored at open).
+static DLG_H: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(H0);
+/// The text epoch the open dialog was painted at (`font_follow`).
+static DLG_SEEN: AtomicU32 = AtomicU32::new(0);
+/// Repaints a restyle gave the open dialog.
+static TS_FRAMES: AtomicU32 = AtomicU32::new(0);
+
+/// A band top `y` at the default size with `k` text bands above it, grown by what the UI line grew per band.
+fn gy(y: usize, k: usize) -> usize {
+    let m = theme::metrics();
+    (0..k).fold(y, |a, _| m.grow(a))
+}
+
+/// The dialog's height at text metrics `m`: the message, three informative lines, the countdown and the button row.
+fn h_at(m: theme::TextMetrics) -> usize {
+    (0..6).fold(H0, |a, _| m.grow(a))
+}
+
+/// Text clipped at the logical `clip` (a button's caption stays inside its box).
+fn text_to(px: &mut [u32], x: usize, y: usize, s: &[u8], ink: u32, clip: usize) {
+    let _ = metrics::text(px, metrics::size(W), metrics::size(H()), clip.min(W), x, y, s, ink, false, crate::video::text::Face::Ui);
+}
+
+/// The service pass: when the faces were restyled since the open dialog was painted, paint it once more.
+fn font_follow(d: &Dlg, win: wm::WinId, shown: u32) {
+    let e = super::text::epoch();
+    if win == wm::WIN_NONE || DLG_SEEN.swap(e, Ordering::Relaxed) == e {
+        return;
+    }
+    paint(d, shown);
+    let _ = wm::present(win);
+    TS_FRAMES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `tests textscale`: the dialog's height at the live metrics and whether its bands stack without overlap — the
+/// message over the first informative line, the third line and the countdown over the buttons, a button holding the
+/// line, an informative pitch holding the line.
+#[cfg(feature = "witness")]
+pub fn textscale_rows() -> (usize, bool) {
+    let m = theme::metrics();
+    let lh = metrics::lcell_h(crate::video::text::Face::Ui);
+    let h = h_at(m);
+    let info0 = gy(48, 1);
+    let last = info0 + 3 * m.grow(18) + lh;
+    let ok = 22 + lh <= info0 && m.grow(18) >= lh && BH() >= lh && last <= h.saturating_sub(20 + BH());
+    (h, ok)
 }
