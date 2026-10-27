@@ -338,3 +338,10 @@ mod tests {
         assert!(!matches(&post, &entry, QueryOptions { ignore_vary: true, ..o }));
     }
 }
+
+/// AETHER-TESTROOT (LEDGER SR355): drops every open Cache API store (each reopens under the current
+/// `storage::root_dir` on next use) — `storage::test_root::TestRoot` on acquire and drop.
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    stores().clear();
+}
