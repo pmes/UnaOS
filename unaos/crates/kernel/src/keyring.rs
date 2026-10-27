@@ -118,7 +118,7 @@ pub fn after_login(name: &[u8]) {
         }
     };
     match bytes {
-        Ok(b) => match crate::arch::syscall::spawn_user_image_bg_argv(&b, &["holocron"]) {
+        Ok(b) => match holocron_spawn(&b) {
             Ok((pid, slot, _)) => { crate::video::wm::app_name_arm_launch(crate::video::wm::owner_of_launch(slot as u64), APP); serial_println!("[holocron] login user={} ring=unafs -> started pid={} slot={}", user, pid, slot) } // SMALLFIX4 item 11: armed by APPRES
             Err(why) => serial_println!("[holocron] login user={} ring=unafs -> not started ({})", user, why),
         },
@@ -128,11 +128,11 @@ pub fn after_login(name: &[u8]) {
 
 /// Holocron verbs with a registered fulfiller right now.
 fn holocron_verbs_live() -> usize {
-    #[cfg(feature = "busreg")]
+    #[cfg(all(feature = "busreg", any(target_arch = "x86_64", feature = "aarch64_el0")))]
     {
         return (una_abi::BUS_VERB_HOLOCRON_FIRST..=una_abi::BUS_VERB_HOLOCRON_LAST).filter(|&v| crate::bus_route::registered(v)).count();
     }
-    #[cfg(not(feature = "busreg"))]
+    #[cfg(not(all(feature = "busreg", any(target_arch = "x86_64", feature = "aarch64_el0"))))] // KNOBOFF (seat, 2026-10-26): bus_route is x86 / EL0 only
     0
 }
 
@@ -927,3 +927,10 @@ pub fn keyboot_selftest() {
         if pass { "PASS" } else { "FAIL" }
     );
 }
+
+/// KNOBOFF (seat, 2026-10-26): the ring-3 spawn exists on x86 and the aarch64 EL0 image; the aarch64 leg without EL0
+/// has no program to start, so the login's Holocron spawn reads as not started through this one fn.
+#[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))]
+fn holocron_spawn(b: &[u8]) -> Result<(u64, u64, u64), &'static str> { crate::arch::syscall::spawn_user_image_bg_argv(b, &["holocron"]) }
+#[cfg(not(any(target_arch = "x86_64", feature = "aarch64_el0")))]
+fn holocron_spawn(_b: &[u8]) -> Result<(u64, u64, u64), &'static str> { Err("no-el0") }

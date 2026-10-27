@@ -1850,7 +1850,7 @@ impl VfsBackend for NativeBackend {
     }
 
     fn create(&self, rel: &str, kind: NodeKind, principal: &str) -> Result<Stat, VfsError> {
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_write(|fs| {
             // Create authorizes against the PARENT directory's write ACL (the
             // leaf does not exist yet), then plants the node under it.
             let (parent_id, leaf) = native_parent(fs, rel)?;
@@ -1942,7 +1942,7 @@ impl VfsBackend for NativeBackend {
 
     fn unlink(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_write(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, id, principal)?;
             let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
@@ -1966,7 +1966,7 @@ impl VfsBackend for NativeBackend {
     }
 
     fn rename(&self, from_rel: &str, to_rel: &str, principal: &str) -> Result<(), VfsError> {
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_write(|fs| {
             let from = native_abs(from_rel);
             let id = fs.resolve_path(&from).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, id, principal)?;
@@ -2013,7 +2013,7 @@ impl VfsBackend for NativeBackend {
     ///   check made out here would be a TOCTOU window between two mount calls.
     fn remove_dir(&self, rel: &str, principal: &str) -> Result<(), VfsError> {
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_write(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, id, principal)?;
             let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
@@ -2035,7 +2035,7 @@ impl VfsBackend for NativeBackend {
     fn remove_attr(&self, rel: &str, key: &str, principal: &str) -> Result<(), VfsError> {
         attr_key_guard(key, principal)?; // ATTRSURF: dropping `owner` would make the object public — ACL rows are not attributes to a non-kernel caller
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_write(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, id, principal)?;
             fs.remove_attribute(id, key)
@@ -2050,7 +2050,7 @@ impl VfsBackend for NativeBackend {
         attr_key_guard(key, principal)?;
         value.check()?;
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_write(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, id, principal)?;
             fs.set_attribute(id, key.to_string(), value.clone().into_native()) // `with_unafs` takes FnMut
@@ -2070,7 +2070,7 @@ impl VfsBackend for NativeBackend {
             }
         }
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_write(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, id, principal)?;
             fs.set_autocommit(false);
@@ -2085,7 +2085,7 @@ impl VfsBackend for NativeBackend {
                     break;
                 }
             }
-            let ok = staged && fs.commit().is_ok();
+            let ok = staged && { #[cfg(all(target_arch = "x86_64", feature = "wc"))] let c = true; #[cfg(not(all(target_arch = "x86_64", feature = "wc")))] let c = fs.commit().is_ok(); c }; // UNAFSWRITE (B825): under `wc` the commit is `with_unafs_write`'s, split around the card writes (LINE-NEUTRAL)
             if !ok {
                 crate::fs::unafs::request_mount_discard();
             }
@@ -2107,7 +2107,7 @@ impl VfsBackend for NativeBackend {
             }
         }
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_write(|fs| {
             let dir = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_write_authz(fs, dir, principal)?;
             let mut batch = Vec::with_capacity(files.len());
