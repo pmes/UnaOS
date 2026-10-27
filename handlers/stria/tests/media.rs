@@ -538,3 +538,77 @@ fn hevcpal_editor_derives_hevc_dts() {
     assert_eq!(r.to_string(), "open=full dts=derived:0 edits=0 applied=first-only", "{r:?}");
     println!("hevcpal: editor {r}");
 }
+
+// HEVCPAL-SWAP (LEDGER SR304): the Player's log lines, captured per thread (the tests of this binary run in parallel and
+// log through the one global logger; a test counts only the lines its own thread wrote).
+struct LogCapture;
+static CAPTURED: Mutex<Vec<(std::thread::ThreadId, String)>> = Mutex::new(Vec::new());
+impl log::Log for LogCapture {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, r: &log::Record) {
+        CAPTURED.lock().unwrap().push((std::thread::current().id(), r.args().to_string()));
+    }
+    fn flush(&self) {}
+}
+fn capture_logs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log::set_logger(&LogCapture).expect("no other logger in this test binary");
+        log::set_max_level(log::LevelFilter::Info);
+    });
+}
+fn my_log_lines(containing: &str) -> Vec<String> {
+    let me = std::thread::current().id();
+    CAPTURED.lock().unwrap().iter().filter(|(t, l)| *t == me && l.contains(containing)).map(|(_, l)| l.clone()).collect()
+}
+
+/// HEVC_SPS with bit_depth_luma_minus8 = bit_depth_chroma_minus8 = 2 (the two ue(v) after the conformance flag, 7.3.2.2:
+/// `1` -> `011` each), re-packed and re-escaped: a Main10 SPS hevc_core refuses by name at activation (HEVCMAIN10).
+const HEVC_SPS_MAIN10: [u8; 27] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x20, 0x83, 0x13, 0x65, 0xf9, 0x24, 0xc2, 0x08];
+
+#[derive(Default)]
+struct CountSink {
+    shown: Vec<(u64, i64)>,
+}
+impl FrameSink for CountSink {
+    fn present(&mut self, f: &Frame, ordinal: u64) {
+        self.shown.push((ordinal, f.pts_ns));
+    }
+}
+
+/// Rule: a decoder that refuses the stream mid-stream (the second sample carries an in-band Main10 SPS, so every later
+/// IDR activates an unsupported SPS) hands the picture to the labelled stand-in ONCE with one `swapped to stand-in`
+/// line; no per-packet warnings follow, and every sample still presents a frame (0 real, 1-3 the stand-in).
+#[test]
+fn hevcdepthcore_main10_mid_stream_swaps_to_the_stand_in_once() {
+    capture_logs();
+    let mut t = hevc_kat_track(4);
+    let mut s1 = Vec::new();
+    for unit in [&HEVC_SPS_MAIN10[..], &HEVC_PPS[..], &HEVC_IDR[..]] {
+        s1.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+        s1.extend_from_slice(unit);
+    }
+    t.samples[1].data = s1;
+    let file = build::mp4(&[t], &Mp4Options::default());
+    let time = ManualTime::new();
+    let mut p = Player::open(file, Arc::new(time.clone()), None, 60).unwrap();
+    assert!(p.info().real_video);
+    assert_eq!(p.info().video_decoder, "hevc (hevc_core)");
+    p.play();
+    let mut sink = CountSink::default();
+    for _ in 0..120 {
+        if p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    let lines = my_log_lines("[STRIA] :: video decode:");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0], "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (bit depth above 8 (HEVCMAIN10))");
+    assert!(!p.info().real_video);
+    assert_eq!(p.info().video_decoder, "test-pattern (stand-in)");
+    assert_eq!(sink.shown.iter().map(|s| s.1).collect::<Vec<_>>(), [0, 40_000_000, 80_000_000, 120_000_000], "{:?}", sink.shown);
+    println!("hevcpal-swap: {} | frames={}", lines[0], sink.shown.len());
+}

@@ -37,7 +37,7 @@ use gneiss_pal::dsp::audio::{self as ac, AudioDecoder};
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
 use gneiss_pal::dsp::avsync::{Decision, DriftMeter, DriftReport, MasterClock, SchedStats, Scheduler, TimeSource};
 use gneiss_pal::dsp::demux::{Demuxer, Packet, Track, TrackKind};
-use gneiss_pal::dsp::video::{Frame, TestPattern, VideoDecoder, decoder_for, reorder_depth};
+use gneiss_pal::dsp::video::{DecodeError, Frame, TestPattern, VideoDecoder, decoder_for, reorder_depth};
 
 /// Where presented frames (and the audio meters) go.
 pub trait FrameSink {
@@ -711,7 +711,7 @@ impl Player {
                 match v.decode(&p) {
                     Ok(Some(f)) => self.insert_frame(f),
                     Ok(None) => {}
-                    Err(e) => log::warn!("[STRIA] :: video decode: {e}"),
+                    Err(e) => self.video_decode_failed(e, &p),
                 }
             }
         } else if let Some(AudioSrc::Track { track, dec }) = self.audio.as_mut() {
@@ -1032,5 +1032,32 @@ fn edit_map_of(demux: Option<&Demuxer>, vtrack: Option<&Track>) -> Vec<timeline_
             log::info!("[STRIA] :: edit list not mapped: {e}");
             Vec::new()
         }
+    }
+}
+
+/// HEVCPAL-SWAP (LEDGER SR304): a decoder that refuses the stream MID-STREAM (`DecodeError::Unsupported`: an in-band SPS
+/// turning HEVC Main10, an H.264 stream switching to 4:2:2, ...) hands the picture to the labelled stand-in ONCE, as the
+/// open does when no decoder fits: the frames it still holds are drained first, `MediaInfo` says stand-in, one
+/// `video decode: swapped to stand-in` line is logged, and the refused packet is drawn by the stand-in so its interval
+/// is not a gap. Codec-blind (every decoder's refusal is this one error). A corrupt packet, or any error once the
+/// stand-in plays, keeps the per-packet warning. (Swapping back when the stream turns supported again is owed.)
+impl Player {
+    fn video_decode_failed(&mut self, e: DecodeError, p: &Packet) {
+        let (DecodeError::Unsupported(_), true, Some(vt)) = (&e, self.info.real_video, self.vtrack.as_ref()) else {
+            log::warn!("[STRIA] :: video decode: {e}");
+            return;
+        };
+        let mut stand_in: Box<dyn VideoDecoder> = Box::new(TestPattern::stand_in(vt));
+        let held = self.vdec.as_mut().map(|d| d.flush()).unwrap_or_default();
+        for f in held {
+            self.insert_frame(f);
+        }
+        log::warn!("[STRIA] :: video decode: swapped to stand-in: {e}");
+        self.info.real_video = stand_in.is_real();
+        self.info.video_decoder = stand_in.name().to_string();
+        if let Ok(Some(f)) = stand_in.decode(p) {
+            self.insert_frame(f);
+        }
+        self.vdec = Some(stand_in);
     }
 }

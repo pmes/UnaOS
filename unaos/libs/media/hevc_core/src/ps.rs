@@ -1078,3 +1078,16 @@ impl Geometry {
         (y >> self.log2_ctb) * self.width_ctbs + (x >> self.log2_ctb)
     }
 }
+
+/// HEVCDEPTH-CORE (LEDGER SR304; HEVCPAL SR215 wrote it in gneiss_pal): the reorder depth of an hvcC
+/// (HEVCDecoderConfigurationRecord, ISO/IEC 14496-15 8.3.3.1) — its first SPS's `sps_max_num_reorder_pics` at the highest
+/// sub-layer ([`Sps::highest_ordering`]), what a demuxer's derived decode times take (h264_core's twin is
+/// `h264_core::ps::avcc_reorder_depth`). `None` when the record or its SPS does not parse.
+pub fn hvcc_reorder_depth(hvcc: &[u8]) -> Option<u32> {
+    let cfg = crate::nal::parse_hvcc(hvcc).ok()?;
+    let nal = cfg.units().find(|u| u.first().is_some_and(|b| (b >> 1) & 0x3f == crate::nal::SPS_NUT))?;
+    let mut rbsp = Vec::new();
+    crate::nal::unescape(nal.get(2..)?, &mut rbsp);
+    let sps = parse_sps(&rbsp).ok()?;
+    Some(sps.highest_ordering().max_num_reorder_pics)
+}
