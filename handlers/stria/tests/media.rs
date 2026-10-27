@@ -826,3 +826,68 @@ fn colourone_player_main10_converts_from_ten_bits_and_by_its_colour() {
     assert!(tagged.chunks_exact(4).all(|p| p == [81, 142, 178, 255]), "{:?}", &tagged[..4]);
     println!("colourone: player main10 rgba=87,145,176 bt709=81,142,178");
 }
+
+// AV1PLAYERCOLOUR (LEDGER SR347): an AV1 reel's frames reach the bus sink as planes and convert by the reel's colour and the
+// size default with bilinear chroma (`chroma_of`), the kernel Player's `colour_rgba_av1`. The AV1 pictures are public AVIF
+// vectors' primary items (av1_core's ONE sha256-pinned fetcher, by path; SKIP offline), muxed as an `av01` MP4 track whose
+// av1C is cut to its 4-byte header, so the bitstream states no colour and only a `colr` can.
+#[path = "../../../unaos/libs/media/av1_core/tests/common/mod.rs"]
+mod av1_vectors;
+
+/// `name`'s primary AV1 item as 2 key samples of an `av01` track (`colr` from `colour` when given), and its size.
+fn av1playercolour_reel(name: &str, colour: Option<gneiss_pal::dsp::demux::colour::Colour>) -> Option<(Vec<u8>, u32, u32)> {
+    let item = av1_vectors::avif_item(&av1_vectors::fetch(name)?).unwrap();
+    let (w, h) = item.ispe.unwrap();
+    let mut spec = build::TrackSpec::test_pattern(1, w as u16, h as u16, 25);
+    spec.fourcc = *b"av01";
+    spec.config_box = Some(*b"av1C");
+    spec.codec_id = "V_AV1";
+    spec.config = item.av1c.unwrap()[..4].to_vec();
+    spec.timescale = 1000;
+    let samples = (0..2).map(|i| build::SampleSpec { data: item.data.clone(), dts: i * 40, pts: i * 40, duration: 40, keyframe: true }).collect();
+    let x = build::Mp4Extras { colour: colour.map(|c| vec![(1, c)]).unwrap_or_default(), ..Default::default() };
+    Some((build::mp4_with(&[build::MediaTrack { spec, samples }], &Mp4Options::default(), &x), w, h))
+}
+
+/// The reel's first frame through the registry, converted by an explicit colour with bilinear chroma.
+fn av1playercolour_expect(file: &[u8], c: &gneiss_pal::dsp::demux::colour::Colour) -> Vec<u8> {
+    use gneiss_pal::dsp::video::{Chroma, Pixels, decoder_for};
+    let mut d = gneiss_pal::dsp::demux::Demuxer::open(file.to_vec()).unwrap();
+    let mut dec = decoder_for(&d.tracks()[0].clone()).unwrap();
+    let f = dec.decode(&d.next_packet().unwrap()).unwrap().unwrap();
+    assert!(matches!(f.pixels, Pixels::I420 { .. }), "an 8-bit 4:2:0 AV1 frame leaves as planes");
+    f.to_rgba_colour(Some(c), Chroma::Bilinear)
+}
+
+fn av1playercolour_c(matrix: u8) -> gneiss_pal::dsp::demux::colour::Colour {
+    gneiss_pal::dsp::demux::colour::Colour { primaries: matrix, transfer: matrix, matrix, full_range: Some(false), mastering: None, light: None }
+}
+
+#[test]
+fn av1playercolour_untagged_720p_converts_bt709_by_the_size_default() {
+    let Some((file, w, h)) = av1playercolour_reel("kids_720p", None) else { return };
+    assert_eq!((w, h), (1280, 720));
+    let (e709, e601) = (av1playercolour_expect(&file, &av1playercolour_c(1)), av1playercolour_expect(&file, &av1playercolour_c(6)));
+    assert_ne!(e709, e601, "the vector separates the two matrices");
+    assert_eq!(Player::open(file.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), None);
+    let (pw, ph, posted) = posted_rgba(file, "av1-720p");
+    assert_eq!((pw, ph), (1280, 720));
+    assert!(posted == e709, "untagged 1280x720 AV1 is not BT.709 limited bilinear");
+    println!("av1playercolour: kids_720p untagged=bt709 (size default) bilinear");
+}
+
+#[test]
+fn av1playercolour_sd_reel_colr_709_wins_and_untagged_is_bt601() {
+    let Some((plain, w, h)) = av1playercolour_reel("kodim23_yuv420_8bpc", None) else { return };
+    assert_eq!((w, h), (768, 512));
+    let (e709, e601) = (av1playercolour_expect(&plain, &av1playercolour_c(1)), av1playercolour_expect(&plain, &av1playercolour_c(6)));
+    assert_ne!(e709, e601, "the vector separates the two matrices");
+    let (_, _, posted) = posted_rgba(plain, "av1-sd");
+    assert!(posted == e601, "untagged 768x512 AV1 is not BT.601 limited bilinear");
+    let c709 = av1playercolour_c(1);
+    let (tagged, _, _) = av1playercolour_reel("kodim23_yuv420_8bpc", Some(c709)).unwrap();
+    assert_eq!(Player::open(tagged.clone(), Arc::new(ManualTime::new()), None, 60).unwrap().colour(), Some(&c709));
+    let (_, _, posted) = posted_rgba(tagged, "av1-sd-709");
+    assert!(posted == e709, "a colr of BT.709 on an SD AV1 reel does not win over the size default");
+    println!("av1playercolour: kodim23 untagged=bt601 colr709=bt709 bilinear");
+}
