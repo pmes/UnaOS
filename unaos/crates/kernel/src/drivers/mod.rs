@@ -75,3 +75,4 @@ pub mod hda;
 // reason `ahci` and `hda` were: the knob-off line numbering of every module above is untouched.
 #[cfg(feature = "uvc")]
 pub mod uvc; #[cfg(feature = "sonde")] pub mod realsense_xu; #[cfg(feature = "uac")] pub mod usb { pub mod uac; } // UAC1 (rmbp-ledger B706): the USB Audio Class 1 driver at drivers/usb/uac.rs, declared under its own `uac` knob (UACMIC B723, word moved at the fold 2e8a3cd1; `uac` implies `uvc`), riding the `uvc` knob's isochronous engine (LINE-NEUTRAL append, before this comment; knob off => never lexed). REALSENSE (LEDGER SR92): the D400 vendor extension unit as data (librealsense facts, cited). LINE-NEUTRAL append, before this comment; knob off => never lexed.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))] pub mod nvme; // NVME (zenbook-ledger Z2, ZENBOOKNVME): the NVMe host controller, polled, rung 1 (probe, identify, the block registry `block::register_nvme`, `tests nvme`); x86_64 + `nvme` knob; knob off => never lexed.

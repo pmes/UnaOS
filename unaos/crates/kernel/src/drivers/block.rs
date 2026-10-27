@@ -3861,3 +3861,60 @@ pub fn boot_medium_not_sdhc() -> bool {
     #[cfg(not(all(target_arch = "x86_64", feature = "sdhcblk")))]
     false
 }
+
+// ══════════ NVME registry (zenbook-ledger Z2, ZENBOOKNVME) — the NVMe namespace as its own registry ══════════
+//
+// TAIL-APPENDED (no line above moves). The AHCI first rung's shape (`AHCI_DISKS` / `register_ahci` /
+// `read_blocks_ahci_ix` / the refusing `write_block_ahci`), for ONE namespace: `drivers/nvme.rs`
+// publishes namespace 1 here after IDENTIFY. Like AHCI's first rung this is NOT a `BlockHandle`, so
+// `fs/bootdisk.rs`'s walk does not see it yet — that is owed row NVMEBOOT (storage.md §5). The global
+// [`BLOCK_DEVICE`] is never touched.
+
+/// NVME: the published namespace's geometry. Never held across I/O.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub static NVME_DISK: Mutex<Option<BlockDeviceInfo>> = Mutex::new(None);
+
+/// NVME: publish namespace 1. Refuses a zero-block namespace or a block size outside 512..4096.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn register_nvme(num_blocks: u64, block_size: u32, model: &[u8; 40]) -> bool {
+    if num_blocks == 0 || !(512..=4096).contains(&block_size) {
+        serial_println!(":: [nvme] REFUSED to register ns=1 — blocks={} lba={} ::", num_blocks, block_size);
+        return false;
+    }
+    let mut product = [b' '; 16];
+    product.copy_from_slice(&model[..16]);
+    let dev = BlockDeviceInfo { slot_id: 0, block_size, num_blocks, vendor: *b"NVMe    ", product };
+    crate::arch::without_interrupts(|| *NVME_DISK.lock() = Some(dev));
+    true
+}
+
+/// NVME: geometry of the published namespace, if any.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn nvme_info() -> Option<BlockDeviceInfo> {
+    crate::arch::without_interrupts(|| *NVME_DISK.lock())
+}
+
+/// NVME: read `buf.len() / block_size` whole blocks at `lba`, DIRECTLY through the NVMe driver (it
+/// chunks by its own MDTS and re-guards the range against the namespace size one layer down).
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn read_blocks_nvme(lba: u64, buf: &mut [u8]) -> Result<usize, BlockError> {
+    let dev = nvme_info().ok_or(BlockError::NotReady)?;
+    let count = span_blocks(&dev, lba, buf.len())?;
+    let bs = dev.block_size as usize;
+    crate::drivers::nvme::read_at(lba, &mut buf[..count * bs]).map_err(|_| BlockError::Io)?;
+    Ok(buf.len())
+}
+
+/// NVME: one-shot latch for the refusal below.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+static NVME_WRITE_REFUSED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// NVME: every block-layer write is refused — there is no granted NVMe write path yet (owed NVMEWRITE,
+/// the AHCIWRITE/AHCIROOT grant shape). Nothing is written.
+#[cfg(all(target_arch = "x86_64", feature = "nvme"))]
+pub fn write_blocks_nvme(_lba: u64, _buf: &[u8]) -> Result<(), BlockError> {
+    if !NVME_WRITE_REFUSED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        serial_println!(":: [nvme] write refused — no block-layer NVMe write path (owed NVMEWRITE) ::");
+    }
+    Err(BlockError::Denied)
+}

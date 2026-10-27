@@ -2709,6 +2709,7 @@ fi
 # disabled while the banner claims it is on (the s42/INSTGUI and WXN-M3b lesson), and for this driver
 # a silent no-op is indistinguishable on the wire from a machine with no SATA controller in it.
 [ -n "${UNAOS_AHCI:-}" ] && _feats="${_feats}ahci,"
+[ -n "${UNAOS_NVME:-}" ] && _feats="${_feats}nvme,"   # NVME (zenbook-ledger Z2): drivers/nvme.rs, the polled NVMe controller (probe, identify, `block::register_nvme`, `tests nvme`); the builder also attaches `-device nvme,drive=nvme0,serial=una` on a fresh target/nvmefixture.img (UNAOS_NVME_DISK=<img> to seed it). x86-only: stripped by `arm_features` below. Kept in sync with builder/src/main.rs, crates/kernel/Cargo.toml, banner-cert.sh, k8-reach.registry.
 # AHCIWRITE (rmbp-ledger B89, SATA write half): UNAOS_AHCI_WRITE=1 arms the ATA `WRITE DMA EXT`
 # (0x35) path in drivers/ahci.rs. Implies `ahci` (Cargo.toml declares `ahci-write = ["ahci"]`), so
 # this knob alone is sufficient; pairing it with UNAOS_AHCI is harmless and is how the flight lines
@@ -3163,7 +3164,7 @@ arm_features() {
     # substring (the trailing comma is part of the pattern), so neither line can half-rewrite the
     # other — the same argument the `wifi2`/`wifi` pair above makes about itself.
     f="${f//,ahci-write,/,}"
-    f="${f//,ahciroot,/,}"   # AHCIROOT (B332): x86-only like its parents; stripped for the same -Cmetadata reason.
+    f="${f//,ahciroot,/,}"; f="${f//,nvme,/,}"   # NVME (Z2): x86-only, stripped like ahci.  AHCIROOT (B332): x86-only like its parents; stripped for the same -Cmetadata reason.
     # WIFI-1 (GR25) rides the same strip, for the same reason and by the same mechanism as
     # `bcmarecon` above: `src/wifi/` is declared `#[cfg(all(feature = "wifi", target_arch =
     # "x86_64"))]` and all three main-loop call sites carry the same pair, so `wifi` emits not one
@@ -6737,7 +6738,7 @@ KERNEL_CFG_MATRIX=(
   # SIDE EFFECT: the table gains one knob and the universe gains one (brand-new, so "unclaimed =>
   # assume x86" either way and naming it here removes nothing); read the live board/mix counts on
   # `./arroyo check`'s own summary line, never from this prose.
-  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,a2dp,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,wifi9,wifi10,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc,uac,tickless"
+  "x86-all     ../../x86_64-unaos.json  nvidia-kepler,nvidia-kepler-takeover,nvidia-kepler-fifo,wc,instgui,intel-ivb,unaos_ivb,gmux_igd,witness,wcg-paygo,skip_xhci,bootlog,logts,wedge2,sched_demo,usbdebug,mtraw,irqstorage,botfaultinject,botring64,botwedge,videobench,videocap,noportsw,ehciscout,ehciscout_run,ehciconfig,ehciconfig_run,ehcihid,kbdwit,smolnet,thermprobe,pcilink,vromprobe,smc,smcwalk,rast,rastmc,installdemo,pfwire_selftest,sdw,pcicensus,bcmarecon,bcmaS1,wxnro,sdhcblk,bt,btc,a2dp,wifi,nvidia-kepler-ce,gen7,wifi2,quarry,livecon,wifival,noaspm,wifi3,holocron,hcronst,deadman,wcdvalve,wedgeinj,btdir,prtscrst,bar1exp-uc,facet,login,loginst,beam,xhcikbd,nvidia-kepler-userdsnoop,nvidia-kepler-pfifoflush,nvidia-kepler-ctrladdr,nvidia-kepler-repoint,nvidia-kepler-latcharm,nvidia-kepler-pitchladder,nvidia-kepler-gopoverlap,ahci,nvme,bar1wedge,gen7r8,gen7r9,nvidia-kepler-kfbind,nvidia-kepler-kfctxbind,nvidia-kepler-kdhead,ahci-write,wifi4,wifi5,wifi9,wifi10,nvidia-kepler-ctrlbind,nvidia-kepler-kfunwedge,nvidia-kepler-vblank,uvc,uac,tickless"
   # (aarch64 + witness + baremetal), VUG-PAR, the SMP-7/8 + CORE3 probes, the whole V3D battery
   # including its deep/qpu/dispdone/firstkick sub-knobs, PI-USB, GENET + NET-13, NS-SPAN and the
   # three-rung INSTALL-PI ladder, and PI-RAST (`pirast` — the Pi-panel rasterizer call site; this is the
