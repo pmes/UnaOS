@@ -8397,12 +8397,12 @@ pub fn singleton_restart(from: usize, live: usize) -> Option<(u64, u64)> {
     SGL_RESTART_OLD.store(old, Ordering::Relaxed);
     SGL_RESTARTS.fetch_add(1, Ordering::AcqRel);
     serial_println!(
-        ":: [sched] RESTART: {} tid={} on c{} in no queue the re-home could drain -> tid={} on c{} at its loop head (GATESTEAL2 B667: a fresh start, never a frame move; the old instance exits at its next fence) ::",
+        ":: [sched] RESTART: {} tid={} on c{} in no queue the re-home could drain -> tid={} on c{} at its loop head holds={} (GATESTEAL2 B667: a fresh start, never a frame move; the old instance exits at its next fence) ::",
         name,
         old,
         from,
         new,
-        live
+        live, crate::sync::task_holds(old) // POISON2 (B846): the superseded instance's holds NAMED (never released: a restart is not a death)
     );
     Some((old, new))
 }

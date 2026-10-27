@@ -661,7 +661,7 @@ pub fn mount_bound_handle() -> Option<block::BlockHandle> { #[cfg(all(target_arc
 ///
 /// The successful bind prints the `[unafsbind]` witness: `mount=native` (the native volume's VFS
 /// name of record — vfs.rs mounts `NativeBackend::new("native")`), `handle=` the disk it rode.
-fn bind_mount() -> Result<BoundMount, MountError> {
+fn bind_mount() -> Result<BoundMount, MountError> { #[cfg(all(target_arch = "x86_64", feature = "wc"))] debug_assert!(crate::arch::sched::current_id().map_or(true, |t| !crate::lockowner::held_by(crate::lockowner::UNAFS, t)), "MOUNTSTACK (B846): bind_mount under the MOUNT hold"); // POISON2 (B846) MOUNTSTACK: with the ticket the bind runs BEFORE the masked hold (`prebind`, file tail); a bind under it is a bug. LINE-NEUTRAL append
     #[cfg(all(target_arch = "x86_64", feature = "ahciroot"))] if let Some(port) = crate::install::ahciroot::root_port() { if let Ok(fs) = mount_on(block::BlockHandle::Ahci { port }) { return Ok(BoundMount { handle: block::BlockHandle::Ahci { port }, fs }); } } // AHCIROOT (B332) M4: the root-granted SSD binds FIRST — SSD root over card root; silent (the UNAFSX86 line names it)
     let global_err = match mount_on(block::BlockHandle::Global) {
         Ok(fs) => {
@@ -791,7 +791,7 @@ enum Attempt<R> {
 /// `Busy` is RESTARTED — see [`with_unafs`]'s restart loop and [`TXN_BUSY_ATTEMPTS`].
 fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R> {
     crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return Attempt::Settled(Err(MountError::Busy)); } } // RENDERWEDGE (B520): the RENDER task's acquire of the mount is bounded (MOUNT_BOUND_MS) — f28's wedge was this masked spin with no bound; past it `[render] wait-timeout what=unafs-mount` and a clean Busy (nothing was touched). Every other caller is unchanged. ⚠ SAME-LINE fold: line :794's `MOUNT.lock()` keeps its line and column (its `#[track_caller]` site)
-        let mut guard = MOUNT.lock(); let _own = crate::lockowner::own(crate::lockowner::UNAFS); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if splitwrite::ticket_foreign() { return Attempt::Restart; } // UNAFSWRITE (B825): another task's commit is writing with MOUNT released — leave MOUNT untouched and restart (LINE-NEUTRAL, before this comment). STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
+        let mut guard = MOUNT.lock(); let _own = crate::lockowner::own(crate::lockowner::UNAFS); #[cfg(all(target_arch = "x86_64", feature = "wc"))] if splitwrite::ticket_foreign() { return Attempt::Restart; } #[cfg(target_arch = "x86_64")] mount_poison_check(&mut *guard); // POISON2 (B846) MOUNTPOISON: a dead holder's mark discards the in-RAM instance before anything reads it (file tail; LINE-NEUTRAL, before this comment). UNAFSWRITE (B825): another task's commit is writing with MOUNT released — leave MOUNT untouched and restart (LINE-NEUTRAL, before this comment). STACKGUARD2 (B403): the holder, released if it overflows mid-transaction
         // UNAFSTXN: open the attempt's contention window, INSIDE the hold. Clearing it before the
         // acquire would be an SMP bug: a core waiting on `MOUNT` would wipe the latch belonging to
         // the transaction currently running under it. Under the lock the flag is serialized with
@@ -803,7 +803,7 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R
         if guard.is_none() {
             // UNAFSBIND: the lazy bind DISCOVERS its handle (Global first and unchanged; probes only
             // on proven global absence) instead of assuming `Global` — see [`bind_mount`].
-            match bind_mount() {
+            match bind_in_hold() {
                 Ok(m) => { #[cfg(all(target_arch = "x86_64", feature = "wc"))] splitread::note_bound(m.handle); *guard = Some(m) } // HIDSTALL2 (B670): a new bound mount = a new epoch; a split read planned on the old one re-runs under the hold (LINE-NEUTRAL append, before this comment)
                 Err(e) => {
                     // UNAFSTXN: the MOUNT itself reads sectors (`locate`, the superblock, the
@@ -897,7 +897,7 @@ pub fn with_unafs<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, Moun
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;
     for _ in 0..TXN_BUSY_ATTEMPTS {
-        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } match { let t_mask = crate::hidstall::now_us(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked_since(t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
+        #[cfg(all(target_arch = "x86_64", feature = "wc"))] if !splitwrite::ticket_wait() { break; } #[cfg(all(target_arch = "x86_64", feature = "wc"))] if let Err(e) = prebind() { note_txn_restarts(restarts, true); return Err(e); } match { let t_mask = crate::hidstall::now_us(); let a = with_unafs_attempt(&mut f); crate::hidstall::note_masked_since(t_mask); a } { // HIDSTALL (B485): the attempt's IRQ-masked span, on the stall line as `masked_ms=`
             Attempt::Settled(out) => {
                 if restarts > 0 {
                     note_txn_restarts(restarts, true);
@@ -2875,14 +2875,14 @@ pub fn ra_window_bound() -> u64 {
 /// dead task its holder. Not dropped: `Drop` writes the in-RAM metadata back, and a transaction that died mid-way
 /// leaves that metadata half-done. Copy-on-write: the medium is consistent at the last root flip, so the next
 /// `with_unafs` re-binds from it.
-pub fn lockowner_release() {
+pub fn lockowner_release() -> bool { let poisoned = MOUNT.mark_poison(); // POISON2 (B846) MOUNTPOISON: MARKED before the force-unlock, so a taker that wins the window below sees it (`true` = marked)
     unsafe { MOUNT.force_unlock() };
     crate::arch::without_interrupts(|| { #[cfg(all(target_arch = "x86_64", feature = "wc"))] { if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) { return ; } } // TRASHLOCK (B523): RENDERWEDGE's bounded pre-wait (B520 :793's shape); past the bound the leak is left to the next `with_unafs` (the lock was force-released above). ⚠ SAME-LINE fold: :2881's `MOUNT.lock()` keeps its line and column
         if let Some(m) = MOUNT.lock().take() {
             core::mem::forget(m);
         }
     });
-    TXN_BUSY.store(false, Ordering::Relaxed);
+    TXN_BUSY.store(false, Ordering::Relaxed); poisoned
 }
 
 // =================================================================================================
@@ -3984,7 +3984,7 @@ pub mod splitwrite {
     use core::sync::atomic::AtomicU64;
 
     /// The commit ticket: the holder's task id, 0 = free.
-    static TICKET: AtomicU64 = AtomicU64::new(0);
+    pub(super) static TICKET: AtomicU64 = AtomicU64::new(0);
     /// Moves after every write phase; a `RaSet` filled under an older value drops its windows (`ra_sync`).
     static RA_GEN: AtomicU64 = AtomicU64::new(0);
 
@@ -4039,7 +4039,7 @@ pub mod splitwrite {
         true
     }
 
-    fn ticket_take(me: u64) -> bool {
+    pub(super) fn ticket_take(me: u64) -> bool {
         let t0 = now_us();
         loop {
             if TICKET.compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire).is_ok() {
@@ -4265,5 +4265,140 @@ pub mod splitwrite {
             lost,
             if ok { "ok" } else { "FAIL" }
         );
+    }
+}
+
+// ── POISON2 (rmbp-ledger B846, BP-storage-8) — the MOUNT's death mark CHECKED (MOUNTPOISON) and the lazy bind moved
+// BEFORE the masked hold (MOUNTSTACK). STACKGUARD3 (B832) left the mount's death recovery to lockowner's leak: its
+// `lockowner_release` force-unlocked MOUNT and only THEN took it to forget the instance, so a taker that won that window
+// ran its transaction on the dead holder's half-applied in-RAM state. Now the release MARKS the lock first (the POISON
+// table, `sync::Mutex::mark_poison`) and every `with_unafs` take checks it (`mount_poison_check`). And the lazy bind —
+// which mounts, reads the root and COMMITS the reclaim drain — ran inside the masked MOUNT hold on whatever stack the
+// caller had; with the commit ticket (x86 `wc`) it runs off the hold (`prebind`, `kb_bind_root`'s install shape), the
+// ticket making it the volume's only writer. At the tail: no line above moves. ──
+
+/// Poisoned MOUNT takes found (a dead holder's mark checked). Written under MOUNT.
+#[cfg(target_arch = "x86_64")]
+static MPOISON_CHECKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// MOUNTPOISON — run by every `with_unafs` take of MOUNT (the attempt's :794; the pre-bind's peek and install) with MOUNT
+/// held: a dead holder's mark DISCARDS the in-RAM instance by `mem::forget`, never `Drop` (its write-back would flush the
+/// half-applied transaction). The leak is deliberate (`dropped=1`; 0 = lockowner already leaked it): the medium is
+/// consistent at the last root flip and the bind that follows re-reads it.
+#[cfg(target_arch = "x86_64")]
+fn mount_poison_check(g: &mut Option<BoundMount>) {
+    if MOUNT.take_poison() {
+        let dropped = g.take().map(core::mem::forget).is_some();
+        MPOISON_CHECKS.fetch_add(1, Ordering::AcqRel);
+        serial_println!("[unafs] mount poisoned -> rebind dropped={} (POISON2 B846: the dead holder's in-RAM instance leaked, never written back)", dropped as u8);
+    }
+}
+
+/// MOUNTSTACK — the bind the attempt's hold would run (:806). x86 `wc` with a task identity: the bind belongs to
+/// [`prebind`] (off the hold, the ticket held), so a hold that finds no mount latches contention and the attempt RESTARTS
+/// (the next attempt pre-binds). Elsewhere (no task identity; no ticket: non-`wc` x86, aarch64) it binds here as before.
+fn bind_in_hold() -> Result<BoundMount, MountError> {
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))]
+    if crate::arch::sched::current_id().is_some() {
+        TXN_BUSY.store(true, Ordering::Relaxed);
+        return Err(MountError::Busy);
+    }
+    bind_mount()
+}
+
+/// MOUNTSTACK — the lazy bind BEFORE the masked hold (`with_unafs`, each attempt): MOUNT unbound -> take the commit ticket
+/// (or it is already this task's, inside `with_unafs_write`), look again, bind UNMASKED with no lock held, install under
+/// one short masked take, give the ticket back. `Err` = the bind's own verdict (not contention), returned as the hold's
+/// bind returned it; contention (Busy, the ticket's bound, a held MOUNT) answers `Ok` and the attempt restarts.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn prebind() -> Result<(), MountError> {
+    let Some(me) = crate::arch::sched::current_id() else { return Ok(()) };
+    if !mount_unbound() {
+        return Ok(());
+    }
+    let mine = splitwrite::TICKET.load(Ordering::Acquire) == me;
+    if !mine && !splitwrite::ticket_take(me) {
+        return Ok(());
+    }
+    let out = if mount_unbound() { prebind_now() } else { Ok(()) };
+    if !mine {
+        splitwrite::TICKET.store(0, Ordering::Release);
+    }
+    out
+}
+
+/// The pre-bind's peek: MOUNT free (`try_lock`, masked — it never spins) and empty after its poison check. A held MOUNT
+/// answers `false` (its holder may be binding or bound; the attempt waits on it).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn mount_unbound() -> bool {
+    crate::arch::without_interrupts(|| match MOUNT.try_lock() {
+        Some(mut g) => {
+            mount_poison_check(&mut *g);
+            g.is_none()
+        }
+        None => false,
+    })
+}
+
+/// The ticket held: bind, then install under one short masked take (RENDERWEDGE's bounded pre-wait first; a mount bound
+/// meanwhile wins and ours is dropped — `kb_bind_root`'s shape).
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+fn prebind_now() -> Result<(), MountError> {
+    match bind_mount() {
+        Ok(m) => {
+            if !crate::video::renderwedge::wait_unlocked(&MOUNT, crate::video::renderwedge::W_UNAFS) {
+                drop(m);
+                return Ok(());
+            }
+            let lost = crate::arch::without_interrupts(|| {
+                let mut g = MOUNT.lock();
+                mount_poison_check(&mut *g);
+                if g.is_none() {
+                    splitread::note_bound(m.handle);
+                    *g = Some(m);
+                    None
+                } else {
+                    Some(m)
+                }
+            });
+            drop(lost);
+            Ok(())
+        }
+        Err(e) => {
+            if TXN_BUSY.load(Ordering::Relaxed) || matches!(e, MountError::Busy) {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// `tests lockreg`'s mount leg (sync.rs `mount_leg`): the bound mount is marked as a dead holder's release marks it (under
+/// this task's own MOUNT hold, then a normal release), and one `with_unafs` must check it, discard the instance and re-bind.
+/// `ok` = the check ran, the call answered, a mount is bound again. Costs one leaked mount per run, by design.
+#[cfg(target_arch = "x86_64")]
+pub fn poison_leg() -> &'static str {
+    let bound = || crate::arch::without_interrupts(|| MOUNT.lock().is_some());
+    if !bound() {
+        return "skip(unbound)";
+    }
+    let c0 = MPOISON_CHECKS.load(Ordering::Acquire);
+    let marked = crate::arch::without_interrupts(|| {
+        let g = MOUNT.lock();
+        let m = MOUNT.mark_poison();
+        drop(g);
+        m
+    });
+    if !marked {
+        return "table-full";
+    }
+    let ok = with_unafs(|_| ()).is_ok();
+    if MPOISON_CHECKS.load(Ordering::Acquire) <= c0 {
+        "not-checked"
+    } else if !ok || !bound() {
+        "no-rebind"
+    } else {
+        "ok"
     }
 }

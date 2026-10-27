@@ -94,11 +94,11 @@ pub fn clear(lock: usize) {
 // ── STACKGUARD3 (rmbp-ledger B832) — the dead task's tracked locks, released FIRST by `sync::release_task` ──────────
 // `stackguard::release_held`'s body, MOVED here (it was called beside `release_task` at three death sites). Each of the
 // three is a `sync::Mutex` whose `force_unlock` forgets its registry entry, so `release_task`'s walk never sees it again:
-// these three are released UNPOISONED (their owners' releases are their recovery: the sink and the UART restart at a
-// line boundary, the mount is leaked and re-bound from the medium by the next `with_unafs`).
+// the sink and the UART are released UNPOISONED (their owners' releases are their recovery: they restart at a
+// line boundary); the mount is MARKED poisoned before its force-unlock, leaked, and re-bound from the medium by the next `with_unafs` (POISON2 B846).
 
 /// Force-release every tracked lock whose recorded holder is `tid` (a task that never runs again); the bit set of what
-/// was released (bit `i` = [`NAMES`]`[i]`). Off on aarch64 (no tracked holder is ever recorded there).
+/// was released (bit `i` = [`NAMES`]`[i]`; bit `8 + i` = released poisoned, POISON2 B846: the mount). Off on aarch64.
 pub fn release_dead(tid: u64) -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -116,8 +116,8 @@ pub fn release_dead(tid: u64) -> u32 {
         #[cfg(feature = "unafs")]
         if held_by(UNAFS, tid) {
             clear(UNAFS);
-            crate::fs::unafs::lockowner_release();
-            out |= 1 << UNAFS;
+            let poisoned = crate::fs::unafs::lockowner_release(); // POISON2 (B846): the mount is MARKED before its force-unlock
+            out |= (1 << UNAFS) | ((poisoned as u32) << (8 + UNAFS)); // POISON2 (B846): bit `8 + i` = lock `i` released POISONED
         }
         out
     }
