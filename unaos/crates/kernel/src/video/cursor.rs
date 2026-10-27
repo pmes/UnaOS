@@ -2016,7 +2016,7 @@ fn for_each_sprite_pixel(
 fn flush_box(fb: &FrameBuffer, y: usize, h: usize) {
     let info = fb.info();
     let row_bytes = info.stride * info.bytes_per_pixel;
-    let y0 = y.min(info.height);
+    let y0 = y.min(info.height); #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::note_drawn(y, h, super::zoom::SRC_CURSOR); // ZOOMFURN (B848): every cursor write ends in this clean or `flush_rect`'s — its rows named to the lens. ⚠ LINE-NEUTRAL fold, code first.
     let y1 = (y + h).min(info.height);
     if y1 > y0 {
         #[cfg(feature = "witness")]
@@ -2059,7 +2059,7 @@ fn flush_rect(fb: &FrameBuffer, x: usize, y: usize, w: usize, h: usize) {
         flush_box(fb, y0, y1 - y0);
         return;
     }
-    let span = (x1 - x0) * bpp;
+    let span = (x1 - x0) * bpp; #[cfg(all(target_arch = "x86_64", feature = "wc"))] super::zoom::note_drawn(y0, y1 - y0, super::zoom::SRC_CURSOR); // ZOOMFURN (B848): past the wide arm (it notes in `flush_box`), so no row is tallied twice. ⚠ LINE-NEUTRAL fold, code first.
     #[cfg(feature = "witness")]
     C10_FLUSH_BYTES.fetch_add(((y1 - y0) * span) as u64, Ordering::Relaxed);
     for row in y0..y1 {

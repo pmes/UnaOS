@@ -770,5 +770,5 @@ refs/heads/exec-rmbp-ticketowner   df909c747 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-memline3   079ff61d8 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-poison2   079ff61d8 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-overlayarm   de8dd3821 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-zoomfurn   079ff61d8 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-zoomfurn   56f9fa66f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-textscale3   079ff61d8 IN-FLIGHT cut 2026-10-27

@@ -1924,7 +1924,7 @@ fn unplug_selftest() {
 /// ZOOM (rmbp-ledger B713) — `tests zoom`: the lens engaged at z=2, the pointer moved to three corners, each present
 /// timed and one scan-out pixel read back against the RAM frame's source pixel, then everything restored. The body is
 /// `video::zoom::selftest` (it reads the lens's own frame and origin); registered beside `a11ytree`.
-/// `:: ZOOM: z=2 px_ok=3 present_us=<n> -> PASS ::`
+/// `:: ZOOM: z=2 px_ok=3 present_us=<n> -> PASS :: … furn_rows=ok furn=<c>/<r> sweep_whole=0 sweep_boot=<n>` (ZOOMFURN B848)
 #[cfg(all(feature = "witness", target_arch = "x86_64", feature = "wc"))]
 fn zoom_selftest() {
     crate::video::zoom::selftest();
