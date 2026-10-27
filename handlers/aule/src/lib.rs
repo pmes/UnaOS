@@ -99,15 +99,35 @@ impl Aule {
     /// trivial command (`cargo --version`-class) without kicking off a full
     /// `cargo build`. The public `forge`/`forge_streamed` API is unchanged.
     fn stream_command(program: &str, args: &[&str], tx: mpsc::Sender<String>) -> Result<()> {
+        Self::spawn_streamed(program, args, None, tx).map(drop)
+    }
+
+    /// INSTALLERVESSEL (LEDGER SR413): `cargo <args>` run IN `dir`, every stdout/stderr line streamed on `tx` (the
+    /// same banner and readers as [`Aule::forge_streamed`]), and the build's exit status returned once it ends. The
+    /// installer builds one vessel with it (`build -p <crate> [--features f] --release` in a source checkout) and
+    /// copies the binary only on success.
+    pub fn forge_in(dir: &std::path::Path, args: &[&str], tx: mpsc::Sender<String>) -> Result<std::process::ExitStatus> {
+        let mut child = Self::spawn_streamed("cargo", args, Some(dir), tx)?;
+        child.wait().context("Failed to wait for build process")
+    }
+
+    /// INSTALLERVESSEL (SR413): the one spawn-and-stream: send the forge banner, spawn `program args` (in `cwd` when
+    /// given), relay each stdout/stderr line on `tx` from two reader threads, and hand the child back to the caller.
+    fn spawn_streamed(
+        program: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<std::process::Child> {
         let _ = tx.send(format!("[AULE] Forging with: {} {:?}", program, args));
 
         // J15 SPECIALTY: Process Management
-        let mut child = Command::new(program)
-            .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to spawn build process")?;
+        let mut command = Command::new(program);
+        command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
+        let mut child = command.spawn().context("Failed to spawn build process")?;
 
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
@@ -129,7 +149,7 @@ impl Aule {
             }
         });
 
-        Ok(())
+        Ok(child)
     }
 }
 
@@ -189,6 +209,19 @@ mod tests {
         assert!(lines.is_empty(), "void forge should emit nothing, got: {:?}", lines);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// INSTALLERVESSEL (SR413): `forge_in` runs cargo in the named directory, streams its lines after the banner,
+    /// and returns the exit status (`cargo --version`: success).
+    #[test]
+    fn forge_in_reports_status() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let status = Aule::forge_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), &["--version"], tx)
+            .expect("spawn cargo --version");
+        assert!(status.success(), "cargo --version failed: {status:?}");
+        let lines: Vec<String> = rx.iter().collect();
+        assert!(lines[0].starts_with("[AULE] Forging with: cargo"), "unexpected banner: {:?}", lines[0]);
+        assert!(lines.iter().skip(1).any(|l| l.starts_with("cargo ")), "no cargo version line: {lines:?}");
     }
 
     /// A failed spawn (nonexistent program) surfaces as an `Err`, not a panic
