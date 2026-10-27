@@ -860,18 +860,7 @@ pub fn fixture() {
             let body = hw::fixture_wav();
             let mut got = None;
             for c in ["/home/PLAYERFX.WAV", "/PLAYERFX.WAV"] {
-                let _ = mt.unlink(c, p);
-                if mt.create(c, crate::fs::vfs::NodeKind::File, p).is_err() {
-                    continue;
-                }
-                let mut off = 0usize;
-                while off < body.len() {
-                    match mt.write(c, off as u64, &body[off..(off + 4096).min(body.len())], p) {
-                        Ok(n) if n > 0 => off += n,
-                        _ => break,
-                    }
-                }
-                if off == body.len() {
+                if mt.put_file(c, &body, p).is_ok() { // VFSPUTSWEEP (B983)
                     got = Some(String::from(c));
                     break;
                 }

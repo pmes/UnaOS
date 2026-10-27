@@ -4877,19 +4877,15 @@ fn hw_report_text(c: &crate::hw::Census) -> String {
     s
 }
 
-/// HWTAB2 (B759): write the report through the VFS (an old copy unlinked, then create + write, as `fs/trash.rs` writes
-/// the home). `Ok((path, bytes))`, or the refusal as `-E<errno>`.
+/// HWTAB2 (B759): write the report through the VFS (VFSPUTSWEEP B983: `MountTable::put_file_atomic`, `.new` written, read
+/// back and swapped). `Ok((path, bytes))`, or the refusal as `-E<errno>`.
 fn hw_report_write(c: &crate::hw::Census) -> Result<(String, usize), String> {
-    use crate::fs::vfs::{NodeKind, KERNEL_PRINCIPAL as P};
+    use crate::fs::vfs::KERNEL_PRINCIPAL as P;
     let path = hw_report_path();
     let body = hw_report_text(c);
     let why = |e: crate::fs::vfs::VfsError| alloc::format!("-E{}", crate::fs::attrsys::errno_of(&e).unsigned_abs());
     let mt = crate::shell::vfs_mount_table();
-    if mt.stat(&path).is_ok() {
-        mt.unlink(&path, P).map_err(why)?;
-    }
-    mt.create(&path, NodeKind::File, P).map_err(why)?;
-    mt.write(&path, 0, body.as_bytes(), P).map_err(why)?;
+    mt.put_file_atomic(&path, body.as_bytes(), P).map_err(why)?;
     Ok((path, body.len()))
 }
 

@@ -2483,8 +2483,7 @@ fn store_write(dir: &str, b: &Bond) {
     }
     let p = format!("{}/{}", dir, addr12(&b.addr));
     let line = format!("addr={} class={:#08x} kind={} name={} keytype={:#04x}\n", fmt_addr(&b.addr), b.cod, cod_kind(b.cod), b.name, b.ktype);
-    let _ = mt.unlink(&p, K);
-    let file = mt.create(&p, NodeKind::File, K).and_then(|_| mt.write(&p, 0, line.as_bytes(), K));
+    let file = mt.put_file(&p, line.as_bytes(), K); // VFSPUTSWEEP (B983)
     if let Err(e) = file {
         serial_println!(":: BTHID: store {} create/write REFUSED ({:?}) — the key is held in RAM for this session ::", p, e);
         return;

@@ -412,7 +412,6 @@ fn synth_wav() -> Vec<u8> {
 /// The PLAYWAV fixture (`synth_wav`) written to the first writable of the user's home, /home, / as `TEST.WAV` (an
 /// earlier one replaced); None when none takes it. `fixture_drop` unlinks it.
 pub fn fixture_file() -> Option<String> {
-    use crate::fs::vfs::NodeKind;
     let mut cands: Vec<String> = Vec::new();
     #[cfg(feature = "login")]
     {
@@ -428,14 +427,7 @@ pub fn fixture_file() -> Option<String> {
     let p = crate::fs::vfs::KERNEL_PRINCIPAL;
     let mut written: Option<&String> = None;
     for c in cands.iter() {
-        let _ = mt.unlink(c, p);
-        if mt.create(c, NodeKind::File, p).is_err() { continue; }
-        let (mut off, mut ok) = (0usize, true);
-        while off < wav.len() {
-            let n = (wav.len() - off).min(4096);
-            match mt.write(c, off as u64, &wav[off..off + n], p) { Ok(w) if w > 0 => off += w, _ => { ok = false; break; } }
-        }
-        if ok { written = Some(c); break; }
+        if mt.put_file(c, &wav, p).is_ok() { written = Some(c); break; } // VFSPUTSWEEP (B983)
         let _ = mt.unlink(c, p);
     }
     written.cloned()

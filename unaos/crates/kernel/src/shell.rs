@@ -565,19 +565,12 @@ fn fs_touch(console: &mut Console, arg: &str) {
 /// shrink-by-recreate would drop the per-object ACL), so unlink+create is the one shape that works
 /// on both volumes. Said here rather than discovered later.
 fn fs_write(console: &mut Console, arg: &str, data: &[u8]) {
-    use crate::fs::vfs::NodeKind;
     let Some((mt, path)) = vfs_write_open(console, "write", arg) else { return };
     if vfs_is_dir(&mt, &path) {
         return console.println(&alloc::format!("write: {}: is a directory (-EISDIR)", path));
     }
-    let _ = mt.unlink(&path, SHELL_PRINCIPAL); // drop the old contents if the name was taken
-    if let Err(e) = mt.create(&path, NodeKind::File, SHELL_PRINCIPAL) {
-        return vfs_fail(console, "write", &path, e);
-    }
-    if data.is_empty() {
-        return vfs_say(console, &alloc::format!("wrote 0 bytes to {}", path));
-    }
-    match mt.write(&path, 0, data, SHELL_PRINCIPAL) {
+    match mt.put_file(&path, data, SHELL_PRINCIPAL) { // VFSPUTSWEEP (B983): unlink + create + every byte
+        Ok(0) => vfs_say(console, &alloc::format!("wrote 0 bytes to {}", path)),
         Ok(n) => vfs_say(console, &alloc::format!("wrote {} bytes to {} ({} bytes)", n, path, n)),
         Err(e) => vfs_fail(console, "write", &path, e),
     }
