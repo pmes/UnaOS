@@ -1,0 +1,2104 @@
+⚡ Building EL0 user blob (crates/user-blob → target/user_blob.bin)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling user-blob v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-blob)
+    Finished `release` profile [optimized] target(s) in 9.66s
+✅ EL0 user blob: 51 bytes
+✅ K2 EL0 programs: owner_blob.bin (128 B) + imp_blob.bin (74 B)
+✅ midden EL0 program: midden_blob.bin (4084 B)
+⚡ Building EL0 static-ELF program (crates/user-elf → target/ELFHELLO.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling user-elf v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-elf)
+    Finished `release` profile [optimized] target(s) in 10.57s
+✅ static-ELF EL0 program: ELFHELLO.ELF (8560 B)
+⚡ Building EL0 mini-vug static-ELF program (crates/user-vug → target/VUG.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling user-vug v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-vug)
+    Finished `release` profile [optimized] target(s) in 10.04s
+✅ static-ELF EL0 mini-vug program: VUG.ELF (12648 B)
+⚡ Building EL0 mini-vug static-ELF program (crates/user-vug [pinlo] → target/VUGC.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling user-vug v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-vug)
+    Finished `release` profile [optimized] target(s) in 9.99s
+✅ static-ELF EL0 mini-vug program: VUGC.ELF (12648 B)
+⚡ Building EL0 mini-vug static-ELF program (crates/user-vug [pinhi] → target/VUGX.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling user-vug v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-vug)
+    Finished `release` profile [optimized] target(s) in 10.16s
+✅ static-ELF EL0 mini-vug program: VUGX.ELF (12648 B)
+⚡ Building EL0 KERNEL-VUG static-ELF program (crates/user-vug [kvug] → target/VUGK.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling user-vug v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-vug)
+    Finished `release` profile [optimized] target(s) in 10.72s
+✅ static-ELF EL0 kernel-vug program: VUGK.ELF (12648 B)
+⚡ Building EL0 persistence static-ELF program (crates/user-stat → target/STAT.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling user-stat v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-stat)
+    Finished `release` profile [optimized] target(s) in 8.76s
+✅ static-ELF EL0 persistence program: STAT.ELF (8552 B)
+⚡ Building EL0 cpu-pulse static-ELF program (crates/user-pulse → target/PULSE.ELF)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling user-pulse v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-pulse)
+    Finished `release` profile [optimized] target(s) in 10.35s
+✅ static-ELF EL0 cpu-pulse program: PULSE.ELF (12648 B)
+  • UNAOS_WITNESS: kernel8 carries the M6b..U7 fixture battery (CAPSTONE + PASS lines)
+  • UNAOS_TESTS_AT_BOOT: kernel8 runs the desktop fixture registry at boot (R77 M3)
+  • UNAOS_CENSUS: kernel8 boots with every periodic census sampler on (R80)
+  • UNAOS_USBNET: kernel8 carries the USB Ethernet link (CDC-ECM + AX88179 front-ends)
+  • UNAOS_SMP7: per-core secondary bring-up evidence + the [smp7] online/missed verdict
+  • UNAOS_V3D: V3D GPU foundation bring-up (probe/MMU/clear; attended-metal for positive verify)
+  • UNAOS_VUGPAR: band-parallel flush across free secondary cores (bands=N in [vugfps]; serial fallback)
+  • UNAOS_WEDGE2: <F1>..<F9> raw-UART breadcrumbs on the TAB->focus-raise chain (tokens may interleave with other serial lines — by design)
+  • UNAOS_PIUSB: BCM2711 PCIe RC + VL805 xHCI attach (attended-metal for positive verify)
+  • UNAOS_GENET: BCM2711 GENET v5 GbE + smoltcp bind (M1 probe classifies QEMU modelling; attended-metal for link/DHCP)
+  • UNAOS_NETTEST: QEMU TCP/HTTP/mDNS loopback gate (NET-GATE witness; hardware-free)
+  • UNAOS_PIRAST: software-rasterizer spinning cube on the BCM2711 panel (first 3D pixels on the Pi; 90 paced frames, then the shell repaints)
+  • UNAOS_PIDESK: desktop furniture on the BCM2711 panel (dock window-switcher strip + SHARD menu; menu bar default OFF), clicks routed through the Pi mouse
+  • UNAOS_QUARRY: the file manager on the BCM2711 panel (volume tree + detailed list + scrolling; arrows/Enter/Backspace/Esc, click, and the dock's pinned tile)
+  • UNAOS_LOGIN: human users — /USERS.DAT record store, login/logout session principal (user:<name>), /home/<user> at first login
+  • UNAOS_LUMEN: LUMENBIN — the lumen dock pin in the default set (the Pi image stages LUMEN.ELF since ARMAPPS SR100; tests lumen is x86) + HOLOCRONARM: APPS/HOLOCRON.ELF and the RINGLOGIN door
+  • UNAOS_SELFDIAG: SELFDIAG — the boot log on disk + tests selfdiag + SYS_PATH_READ/WRITE (HOLOCRONARM: Holocron's store; DIAG.ELF is x86's)
+  • UNAOS_HOLOCRON: the Holocron record store on the writable FAT volume (fs/holocron.rs; the framing fixture)
+  • UNAOS_MIDDEN: MIDDENTWIN — tests midden (APPS/MIDDEN.ELF spawned, help + ls typed, its exit read back)
+  • UNAOS_UNA: UNAMETAL — tests una (APPS/UNA.ELF spawned, Ctrl+3 + help typed, Ctrl+Q, its exit read back)
+  • UNAOS_SONDE: REALSENSE — tests sonde (the D435i census; SKIP(no-device) without the camera); implies uvc
+  • UNAOS_AETHER: AETHERMETAL — tests aether (APPS/AETHER.ELF spawned, its page report read); implies selfdiag
+  • UNAOS_STRIA: STRIAMETAL — tests stria (APPS/STRIA.ELF spawned on system/test-f/TEST.WEBM, its end line read; the Pi's sound is refused by name); implies selfdiag
+  • UNAOS_UVC: the USB Video Class driver (descriptor census, probe/commit, frames)
+⚡ kernel features: baremetal,skip_xhci,unafs,witness,tests-at-boot,census,usbnet,smp7,v3d,vugpar,wedge2,piusb,genet,nettest,genet,pirast,desktop_firmware,quarry,login,lumen,selfdiag,holocron,midden,una,sonde,aether,stria,uvc
+⚡ Building bare-metal kernel8.img (Pi 4, microSD-slot boot)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling libm v0.2.16
+   Compiling thiserror v2.0.21
+   Compiling heapless v0.9.3
+   Compiling smoltcp v0.14.0
+   Compiling syn v3.0.6
+   Compiling thiserror-impl v2.0.21
+   Compiling alloc v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling scopeguard v1.2.0
+   Compiling crypto_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/crypto_core)
+   Compiling byteorder v1.5.0
+   Compiling stable_deref_trait v1.2.1
+   Compiling elf_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/elf_core)
+   Compiling bitflags v1.3.2
+   Compiling vp8_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/vp8_core)
+   Compiling cfg-if v1.0.5
+   Compiling raw_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/raw_core)
+   Compiling managed v0.8.0
+   Compiling spin v0.9.9
+   Compiling demux_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/demux_core)
+   Compiling prefs_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/prefs_core)
+   Compiling palette_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/palette_core)
+   Compiling amber_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/amber_core)
+   Compiling volatile v0.6.1
+   Compiling exfat_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/fs/exfat_core)
+   Compiling unaos-boot-info v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/boot-info)
+   Compiling font_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/text/font_core)
+   Compiling lock_api v0.4.14
+   Compiling noto-sans-mono-bitmap v0.3.2
+   Compiling lazy_static v1.5.1
+   Compiling type_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/type_core)
+   Compiling vein_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_core)
+   Compiling font8x8 v0.3.1
+   Compiling hash32 v0.3.1
+   Compiling probe_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/probe_core)
+   Compiling diag_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/diag_core)
+   Compiling ldso_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/ldso_core)
+   Compiling spinning_top v0.2.5
+   Compiling midden_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/midden_core)
+   Compiling jobs_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/jobs_core)
+   Compiling trash_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/fs/trash_core)
+   Compiling linked_list_allocator v0.10.6
+   Compiling spin v0.12.3
+   Compiling net v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/net)
+   Compiling type_registry_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/type_registry_core)
+   Compiling usbnet_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/usbnet_core)
+   Compiling rast v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/rast)
+   Compiling fdt v0.1.5
+   Compiling pixel_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/pixel_core)
+   Compiling audio_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/audio_core)
+   Compiling unafs v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/fs/unafs)
+   Compiling holocron_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/holocron_core)
+   Compiling geode_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/fs/geode_core)
+   Compiling unaos-kernel v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/kernel)
+warning: unnecessary braces around block return value
+    --> crates/kernel/src/arch/aarch64/sched.rs:5622:5
+     |
+5622 |     { #[cfg(feature = "tegra")] { percpu::METER_CPU_COUNT } #[cfg(not(feature = "tegra"))] { NUM_CPUS } } // VUGFIX: tegra DISPLAY...
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                           ^^
+     |
+     = note: `#[warn(unused_braces)]` (part of `#[warn(unused)]`) on by default
+help: remove these braces
+     |
+5622 -     { #[cfg(feature = "tegra")] { percpu::METER_CPU_COUNT } #[cfg(not(feature = "tegra"))] { NUM_CPUS } } // VUGFIX: tegra DISPLAYS 6 (DTB /cpus), not the 8-slot array bound; one line => pi/virt byte-identical
+5622 +     #[cfg(not(feature = "tegra"))] { NUM_CPUS } // VUGFIX: tegra DISPLAYS 6 (DTB /cpus), not the 8-slot array bound; one line => pi/virt byte-identical
+     |
+
+warning: unnecessary braces around block return value
+     --> crates/kernel/src/arch/aarch64/syscall.rs:12726:5
+      |
+12726 |     { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_close(asid, win); 0 } // ORIN-TENANT: the owner-close...
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ^^
+      |
+help: remove these braces
+      |
+12726 -     { #[cfg(feature = "orintenant")] super::display_tegra::orin_tenant_note_close(asid, win); 0 } // ORIN-TENANT: the owner-close wire witness, after the WINDOWS release and the wm drain above. Line-NEUTRAL per this file's PANIC-Location rule.
+12726 +     0 // ORIN-TENANT: the owner-close wire witness, after the WINDOWS release and the wm drain above. Line-NEUTRAL per this file's PANIC-Location rule.
+      |
+
+warning: unused import: `super::*`
+   --> crates/kernel/src/net_phy.rs:467:9
+    |
+467 |     use super::*;
+    |         ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Release`
+    --> crates/kernel/src/tests.rs:6587:57
+     |
+6587 |     use core::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+     |                                                         ^^^^^^^
+
+warning: unnecessary braces around function argument
+    --> crates/kernel/src/video/cursor.rs:3813:94
+     |
+3813 | ...), { #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] { crate::ui::Metrics::panel().scale } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { block_scale(&fb) } }); ...
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                                                                                                                         ^^
+     |
+help: remove these braces
+     |
+3813 -     let (px, py) = shape_hot(crate::pal::cursor::pos(info.width as i32, info.height as i32), { #[cfg(not(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware"))))] { crate::ui::Metrics::panel().scale } #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { block_scale(&fb) } }); // A11YPANE (B655): the plan's origin at the scale `draw_locked` draws at (`block_scale`, the cursor size folded in); the knob-off arm is the expression as it was. CURSORSHAPE (B550): the LIVE glyph's hotspot sits on the pointer, exactly as `draw_locked` places it, so a plan is judged against the origin a draw would use. ⚠ LINE-NEUTRAL: edited in place.
+3813 +     let (px, py) = shape_hot(crate::pal::cursor::pos(info.width as i32, info.height as i32), #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] { block_scale(&fb) }); // A11YPANE (B655): the plan's origin at the scale `draw_locked` draws at (`block_scale`, the cursor size folded in); the knob-off arm is the expression as it was. CURSORSHAPE (B550): the LIVE glyph's hotspot sits on the pointer, exactly as `draw_locked` places it, so a plan is judged against the origin a draw would use. ⚠ LINE-NEUTRAL: edited in place.
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/kernel/src/arch/aarch64/sched.rs:1955:34
+     |
+1955 |     let _ = EL0_RESIDENTS[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |                                  ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1955 -     let _ = EL0_RESIDENTS[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+1955 +     let _ = EL0_RESIDENTS[cpu].0.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/kernel/src/arch/aarch64/sched.rs:2021:31
+     |
+2021 |     let _ = EL0_PARKED[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |                               ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+2021 -     let _ = EL0_PARKED[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+2021 +     let _ = EL0_PARKED[cpu].0.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/kernel/src/arch/aarch64/sched.rs:2187:32
+     |
+2187 |             let _ = row[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |                                ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+2187 -             let _ = row[cpu].0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+2187 +             let _ = row[cpu].0.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/kernel/src/arch/aarch64/sched.rs:5981:32
+     |
+5981 |     let _ = SPREAD15_RESID_MIN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+     |                                ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+5981 -     let _ = SPREAD15_RESID_MIN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+5981 +     let _ = SPREAD15_RESID_MIN.try_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+     --> crates/kernel/src/arch/aarch64/sched.rs:11166:38
+      |
+11166 |         let _ = NOPREEMPT[self.core].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+      |                                      ^^^^^^^^^^^^
+      |
+help: replace the use of the deprecated method
+      |
+11166 -         let _ = NOPREEMPT[self.core].fetch_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+11166 +         let _ = NOPREEMPT[self.core].try_update(Ordering::AcqRel, Ordering::Relaxed, |n| {
+      |
+
+warning: constant evaluation is taking a long time
+    --> crates/kernel/src/tests.rs:2861:31
+     |
+2861 |     while i + needle.len() <= hay.len() {
+     |                               ^^^^^^^^^ the const evaluator is currently interpreting this expression
+     |
+help: the constant being evaluated
+    --> crates/kernel/src/tests.rs:2880:1
+     |
+2880 | const CLOCK_UTC_SPLITS: usize = {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant evaluation is taking a long time
+    --> /home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/slice/mod.rs:119:9
+     |
+ 119 |         ptr::metadata(self)
+     |         ^^^^^^^^^^^^^^^^^^^ the const evaluator is currently interpreting this expression
+     |
+help: the constant being evaluated
+    --> crates/kernel/src/tests.rs:2880:1
+     |
+2880 | const CLOCK_UTC_SPLITS: usize = {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant evaluation is taking a long time
+    --> /home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/slice/mod.rs:119:9
+     |
+ 119 |         ptr::metadata(self)
+     |         ^^^^^^^^^^^^^^^^^^^ the const evaluator is currently interpreting this expression
+     |
+help: the constant being evaluated
+    --> crates/kernel/src/tests.rs:2899:1
+     |
+2899 | const CLOCK_KNOB_SITES: usize = {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/kernel/src/pal.rs:845:46
+    |
+845 |                 let _ = RELEASE_EDGE_IN_RING.fetch_update(
+    |                                              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+845 -                 let _ = RELEASE_EDGE_IN_RING.fetch_update(
+845 +                 let _ = RELEASE_EDGE_IN_RING.try_update(
+    |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+    --> crates/kernel/src/pal.rs:1176:35
+     |
+1176 |     let _ = RELEASE_EDGES_PENDING.fetch_update(
+     |                                   ^^^^^^^^^^^^
+     |
+help: replace the use of the deprecated method
+     |
+1176 -     let _ = RELEASE_EDGES_PENDING.fetch_update(
+1176 +     let _ = RELEASE_EDGES_PENDING.try_update(
+     |
+
+warning: constant evaluation is taking a long time
+   --> crates/kernel/src/prefs_client.rs:387:15
+    |
+387 |     while i + pat.len() <= hay.len() {
+    |               ^^^^^^^^^ the const evaluator is currently interpreting this expression
+    |
+help: the constant being evaluated
+   --> crates/kernel/src/prefs_client.rs:433:1
+    |
+433 | const ARCH_SYSCALL_WRITERS: usize = count(include_bytes!("arch/aarch64/syscall.rs"), WRITE_PAT);
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant evaluation is taking a long time
+   --> crates/kernel/src/prefs_client.rs:387:28
+    |
+387 |     while i + pat.len() <= hay.len() {
+    |                            ^^^^^^^^^ the const evaluator is currently interpreting this expression
+    |
+help: the constant being evaluated
+   --> crates/kernel/src/prefs_client.rs:414:1
+    |
+414 | pub const DIRECT_WRITERS: usize = count(include_bytes!("video/settings.rs"), WRITE_PAT)
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+   --> crates/kernel/src/loginfurn.rs:196:20
+    |
+196 |     if ITEM_CREDIT.fetch_update(Relaxed, Relaxed, |c| c.checked_sub(1)).is_ok() {
+    |                    ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+196 -     if ITEM_CREDIT.fetch_update(Relaxed, Relaxed, |c| c.checked_sub(1)).is_ok() {
+196 +     if ITEM_CREDIT.try_update(Relaxed, Relaxed, |c| c.checked_sub(1)).is_ok() {
+    |
+
+warning: unused variable: `reg`
+  --> crates/kernel/src/arch/aarch64/pci.rs:51:41
+   |
+51 | ...                   if let Some(reg) = node.property("reg") {
+   |                                   ^^^ help: if this is intentional, prefix it with an underscore: `_reg`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `daif` is assigned to, but never used
+   --> crates/kernel/src/arch/aarch64/boot.rs:396:28
+    |
+396 |         let (par_r, par_w, daif): (u64, u64, u64);
+    |                            ^^^^
+    |
+    = note: consider using `_daif` instead
+
+warning: value assigned to `daif` is never read
+   --> crates/kernel/src/arch/aarch64/boot.rs:397:9
+    |
+397 | /         core::arch::asm!(
+398 | |             "mrs {daif}, DAIF",
+399 | |             "msr DAIFSet, #2",
+400 | |             "at s1e0r, {va}",
+...   |
+411 | |             options(nostack, preserves_flags),
+412 | |         );
+    | |_________^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> crates/kernel/src/arch/aarch64/boot.rs:697:51
+    |
+697 |         sl2.add(l2_idx).write_volatile(table_desc(unsafe {
+    |                                                   ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> crates/kernel/src/arch/aarch64/boot.rs:700:46
+    |
+700 |         sl1.add(0).write_volatile(table_desc(unsafe {
+    |                                              ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> crates/kernel/src/arch/aarch64/smp.rs:531:5
+    |
+531 |     unsafe {
+    |     ^^^^^^ unnecessary `unsafe` block
+
+warning: variable `daif` is assigned to, but never used
+     --> crates/kernel/src/arch/aarch64/syscall.rs:11835:15
+      |
+11835 |     let (par, daif): (u64, u64);
+      |               ^^^^
+      |
+      = note: consider using `_daif` instead
+
+warning: value assigned to `daif` is never read
+     --> crates/kernel/src/arch/aarch64/syscall.rs:11837:9
+      |
+11837 | /         core::arch::asm!(
+11838 | |             "mrs {daif}, DAIF",
+11839 | |             "msr DAIFSet, #2",
+11840 | |             "at s1e0r, {va}",
+...     |
+11847 | |             options(nostack, preserves_flags),
+11848 | |         );
+      | |_________^
+      |
+      = help: maybe it is overwritten before being read?
+
+warning: value assigned to `i` is never read
+     --> crates/kernel/src/arch/aarch64/v3d.rs:13078:13
+      |
+13078 |             i += plen;
+      |             ^^^^^^^^^
+      |
+      = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+    --> crates/kernel/src/arch/aarch64/genet.rs:5544:17
+     |
+5544 |             let mut send_recv = |ks: &mut NetService<SmoltcpPhy<KernelLoopNic>>,
+     |                 ----^^^^^^^^^
+     |                 |
+     |                 help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/kernel/src/arch/aarch64/genet.rs:5741:17
+     |
+5741 |             let mut send_recv = |ks: &mut NetService<SmoltcpPhy<KernelLoopNic>>,
+     |                 ----^^^^^^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/kernel/src/drivers/xhci/uvc.rs:1065:9
+     |
+1065 |     let mut live_ok = true;
+     |         ----^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: unnecessary `unsafe` block
+   --> crates/kernel/src/drivers/xhci/mod.rs:467:24
+    |
+442 |     unsafe {
+    |     ------ because it's nested under this `unsafe` block
+...
+467 |                     || unsafe { core::ptr::read_volatile(usblegsup as *const u32) } & HC_BIOS_OWNED == 0,
+    |                        ^^^^^^ unnecessary `unsafe` block
+
+warning: value assigned to `current_intf_class` is never read
+    --> crates/kernel/src/drivers/xhci/mod.rs:4722:74
+     |
+4722 | ...                   let mut current_intf_class: u8 = 0;
+     |                                                        ^ this value is reassigned later and never used
+...
+4742 | ...                           current_intf_class = desc_data[offset + 5];
+     |                               ------------------------------------------ `current_intf_class` is overwritten here before the previous value is read
+
+warning: value assigned to `current_intf_protocol` is never read
+    --> crates/kernel/src/drivers/xhci/mod.rs:4723:77
+     |
+4723 | ...                         let mut current_intf_protocol: u8 = 0;
+     |                                                                 ^ this value is reassigned later and never used
+...
+4744 | ...                                 current_intf_protocol = desc_data[offset + 7]; #[cfg(feature = "usbnet")] { if usbnet::note_in...
+     |                                     --------------------------------------------- `current_intf_protocol` is overwritten here before the previous value is read
+
+warning: value assigned to `lba` is never read
+     --> crates/kernel/src/drivers/xhci/mod.rs:13447:23
+      |
+13447 |         let mut lba = (nb - 1) as u32;
+      |                       ^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+13466 |             lba = candidates[0];
+      |             ------------------- `lba` is overwritten here before the previous value is read
+
+warning: unnecessary `unsafe` block
+     --> crates/kernel/src/drivers/xhci/mod.rs:15520:9
+      |
+15520 |         unsafe {
+      |         ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+     --> crates/kernel/src/drivers/xhci/mod.rs:15912:9
+      |
+15912 |         unsafe {
+      |         ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+     --> crates/kernel/src/drivers/xhci/mod.rs:16066:9
+      |
+16066 |         unsafe {
+      |         ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+     --> crates/kernel/src/drivers/xhci/mod.rs:16106:9
+      |
+16106 |         unsafe {
+      |         ^^^^^^ unnecessary `unsafe` block
+
+warning: value assigned to `menu_ok` is never read
+    --> crates/kernel/src/tests.rs:1158:23
+     |
+1158 |     let mut menu_ok = true; // CLOCKPAINTERS (B719): the clock menu's zone-and-offset line (desktop builds draw it)
+     |                       ^^^^ this value is reassigned later and never used
+...
+1163 |         menu_ok = cl.len() > 2 && cl[2] == "14:34 Europe/Berlin +02:00 daylight";
+     |         ------------------------------------------------------------------------ `menu_ok` is overwritten here before the previous value is read
+
+warning: value assigned to `lock_word` is never read
+    --> crates/kernel/src/tests.rs:3026:48
+     |
+3026 |     let mut lock_word: alloc::string::String = alloc::string::String::from("skip(no-login)");
+     |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this value is reassigned later and never used
+...
+3037 |             lock_word = alloc::string::String::from("skip(session-not-fixture-user)"); #[cfg(feature = "autolock_fixture")] { if c...
+     |             --------- `lock_word` is overwritten here before the previous value is read
+
+warning: unused variable: `cleared_from`
+   --> crates/kernel/src/video/framebuffer.rs:565:13
+    |
+565 |         let cleared_from = self.info.height.saturating_sub(dy);
+    |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_cleared_from`
+
+warning: value assigned to `placed` is never read
+    --> crates/kernel/src/video/wm.rs:2386:22
+     |
+2386 |     let mut placed = Moved::NoRow;
+     |                      ^^^^^^^^^^^^ this value is reassigned later and never used
+...
+2432 |                 placed = Moved::Placed { x: r.x, y: r.y, changed };
+     |                 -------------------------------------------------- `placed` is overwritten here before the previous value is read
+
+warning: value assigned to `sprite_dock_tiles` is never read
+    --> crates/kernel/src/video/wm.rs:5576:37
+     |
+5576 |         let mut sprite_dock_tiles = 0usize;
+     |                                     ^^^^^^ this value is reassigned later and never used
+...
+5588 |                 sprite_dock_tiles = dock_tiles(&t.rows);
+     |                 --------------------------------------- `sprite_dock_tiles` is overwritten here before the previous value is read
+
+warning: variable does not need to be mutable
+    --> crates/kernel/src/video/wm.rs:6844:13
+     |
+6844 |         let mut rows_done = r1;
+     |             ----^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `a_col`
+     --> crates/kernel/src/video/wm.rs:23011:17
+      |
+23011 |     let (k_col, a_col, f_col) = (HT_SURF[0], FV_SURF_A[0], FV_SURF_B[0]);
+      |                 ^^^^^ help: if this is intentional, prefix it with an underscore: `_a_col`
+
+warning: unused variable: `ph`
+     --> crates/kernel/src/video/wm.rs:23759:19
+      |
+23759 | fn legibility_cap(ph: usize) -> usize {
+      |                   ^^ help: if this is intentional, prefix it with an underscore: `_ph`
+
+warning: unused variable: `fb`
+    --> crates/kernel/src/video/cursor.rs:1963:16
+     |
+1963 | fn block_scale(fb: &FrameBuffer) -> usize {
+     |                ^^ help: if this is intentional, prefix it with an underscore: `_fb`
+
+warning: value assigned to `ghost_box` is never read
+    --> crates/kernel/src/video/cursor.rs:3843:415
+     |
+3843 | ...re")))] let ghost = GHOST_COMPOSED.swap(0, Ordering::AcqRel); #[cfg(any(all(target_arch = "x86_64", feature = "wc"), all(target_arch = "aarch64", feature = "desktop_firmware")))] let mut ghost_box: Option<(usize, usize, usize, usize)> = None; /...
+     |                                                                                                                                                                                                                                                 ^^^^ this value is reassigned later and never used
+...
+3927 | ... { ghost_box = ghost_restore(&ov, c5_coherent); } // TWOCURSORS (B542) — an install about to be DECLINED for a session that no longer describes the live sprite: take back the arrow the layer delivered, colour-guarded, from the layer save, befor...
+     |       ------------------------------------------- `ghost_box` is overwritten here before the previous value is read
+
+warning: unused variable: `n`
+    --> crates/kernel/src/video/dock.rs:2564:23
+     |
+2564 | fn pin_console_wanted(n: usize, present: Present<'_>) -> bool {
+     |                       ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `n`
+    --> crates/kernel/src/video/dock.rs:2572:21
+     |
+2572 | fn pin_shell_wanted(n: usize, present: Present<'_>) -> bool {
+     |                     ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `n`
+    --> crates/kernel/src/video/dock.rs:2579:22
+     |
+2579 | fn pin_quarry_wanted(n: usize, present: Present<'_>) -> bool {
+     |                      ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `n`
+    --> crates/kernel/src/video/dock.rs:2593:21
+     |
+2593 | fn pin_pulse_wanted(n: usize) -> bool {
+     |                     ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: unused variable: `n`
+    --> crates/kernel/src/video/dock.rs:3311:30
+     |
+3311 | fn dp_extra_wanted(i: usize, n: usize, present: &dyn Fn(u64) -> bool) -> bool {
+     |                              ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: value assigned to `file_ok` is never read
+    --> crates/kernel/src/video/dock.rs:3520:10
+     |
+3520 |     let (mut file_ok, mut bytes, skip) = (true, 0i64, false);
+     |          ^^^^^^^^^^^ this value is reassigned later and never used
+...
+3528 |             file_ok = in_file && c == want.count_ones() && DP_MASK.load(Ordering::Relaxed) == want;
+     |             -------------------------------------------------------------------------------------- `file_ok` is overwritten here before the previous value is read
+
+warning: variable does not need to be mutable
+   --> crates/kernel/src/video/shortcuts.rs:317:9
+    |
+317 |     let mut ok = entries >= 12 && scopes >= 5 && shown_n == entries && chord_for("Keyboard Shortcuts") == Some(C_CMD_SLASH);
+    |         ----^^
+    |         |
+    |         help: remove this `mut`
+
+warning: type `video::wm::Window` is more private than the item `chrome_truth`
+   --> crates/kernel/src/video/wcf.rs:809:1
+    |
+809 | pub fn chrome_truth(fb: &FrameBuffer, rows: &[super::wm::Window], order: &[usize], focus: u64) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `chrome_truth` is reachable at visibility `pub`
+    |
+note: but type `video::wm::Window` is only usable at visibility `pub(in crate::video)`
+   --> crates/kernel/src/video/wm.rs:211:1
+    |
+211 | pub(super) struct Window {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `live::Geom` is more private than the item `hover_wash`
+    --> crates/kernel/src/video/quarry/live.rs:1634:1
+     |
+1634 | pub(super) fn hover_wash(px: &mut [u32], g: &Geom, x: usize, y: usize, w: usize, h: usize) {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `hover_wash` is reachable at visibility `pub(in crate::video::quarry)`
+     |
+note: but type `live::Geom` is only usable at visibility `pub(self)`
+    --> crates/kernel/src/video/quarry/live.rs:299:1
+     |
+ 299 | struct Geom {
+     | ^^^^^^^^^^^
+
+warning: type `live::Model` is more private than the item `paint_overlay`
+   --> crates/kernel/src/video/quarry/ops.rs:415:1
+    |
+415 | pub fn paint_overlay(m: &Model, px: &mut [u32]) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `paint_overlay` is reachable at visibility `pub`
+    |
+note: but type `live::Model` is only usable at visibility `pub(self)`
+   --> crates/kernel/src/video/quarry/live.rs:482:1
+    |
+482 | struct Model {
+    | ^^^^^^^^^^^^
+
+warning: type `video::wm::Window` is more private than the item `ctrl_at`
+   --> crates/kernel/src/video/softy/chrome.rs:63:1
+    |
+ 63 | pub fn ctrl_at(r: &Window, px: usize, py: usize) -> Option<Ctrl> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `ctrl_at` is reachable at visibility `pub`
+    |
+note: but type `video::wm::Window` is only usable at visibility `pub(in crate::video)`
+   --> crates/kernel/src/video/wm.rs:211:1
+    |
+211 | pub(super) struct Window {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `video::wm::Window` is more private than the item `chrome::paint`
+   --> crates/kernel/src/video/softy/chrome.rs:185:1
+    |
+185 | pub fn paint(dst: &crate::video::FrameBuffer, r: &Window, ox: usize, oy: usize, focused: bool, ctrls: bool, title: &[u8]) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `chrome::paint` is reachable at visibility `pub`
+    |
+note: but type `video::wm::Window` is only usable at visibility `pub(in crate::video)`
+   --> crates/kernel/src/video/wm.rs:211:1
+    |
+211 | pub(super) struct Window {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `STEAL_MIN_DEPTH` is never used
+    --> crates/kernel/src/arch/aarch64/sched.rs:5849:7
+     |
+5849 | const STEAL_MIN_DEPTH: usize = crate::sched_spread::STEAL_MIN_DEPTH;
+     |       ^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `U11DEFER_PATTERN` is never used
+   --> crates/kernel/src/arch/aarch64/syscall.rs:476:7
+    |
+476 | const U11DEFER_PATTERN: [u8; 16] = *b"U11-DEFER-OK-777";
+    |       ^^^^^^^^^^^^^^^^
+
+warning: constant `U11REAP_PATTERN` is never used
+   --> crates/kernel/src/arch/aarch64/syscall.rs:501:7
+    |
+501 | const U11REAP_PATTERN: [u8; 16] = *b"U11-REAP-OK-7777";
+    |       ^^^^^^^^^^^^^^^
+
+warning: constant `UOWNER_PATTERN` is never used
+    --> crates/kernel/src/arch/aarch64/syscall.rs:3768:7
+     |
+3768 | const UOWNER_PATTERN: [u8; 16] = *b"UOWNER-OK-1234!!";
+     |       ^^^^^^^^^^^^^^
+
+warning: constant `WCB_FILL_B` is never used
+     --> crates/kernel/src/arch/aarch64/syscall.rs:15153:7
+      |
+15153 | const WCB_FILL_B: u8 = 0x5A;
+      |       ^^^^^^^^^^
+
+warning: constant `WCB_W_B` is never used
+     --> crates/kernel/src/arch/aarch64/syscall.rs:15155:7
+      |
+15155 | const WCB_W_B: usize = 64;
+      |       ^^^^^^^
+
+warning: function `net6_el0_witness` is never used
+     --> crates/kernel/src/arch/aarch64/syscall.rs:24434:4
+      |
+24434 | fn net6_el0_witness() {}
+      |    ^^^^^^^^^^^^^^^^
+
+warning: function `fixture_abs` is never used
+     --> crates/kernel/src/arch/aarch64/syscall.rs:25638:4
+      |
+25638 | fn fixture_abs<'a>(path: &'a str, buf: &'a mut [u8; 48]) -> &'a str {
+      |    ^^^^^^^^^^^
+
+warning: field `0` is never read
+     --> crates/kernel/src/arch/aarch64/syscall.rs:27004:16
+      |
+27004 | struct ArzSurf([u32; ARZ_CW * ARZ_CH]);
+      |        ------- ^^^^^^^^^^^^^^^^^^^^^^
+      |        |
+      |        field in this struct
+      |
+      = help: consider removing this field
+
+warning: constant `V3D93_CLASS` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:10859:7
+      |
+10859 | const V3D93_CLASS: [&str; V3D93_N] = [
+      |       ^^^^^^^^^^^
+
+warning: constant `V3D93_FRAMECLOSE_COVERED` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:10867:7
+      |
+10867 | const V3D93_FRAMECLOSE_COVERED: [bool; V3D93_N] = [
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `t0` is never read
+     --> crates/kernel/src/arch/aarch64/v3d.rs:10878:5
+      |
+10875 | struct V3d93Sampler {
+      |        ------------ field in this struct
+...
+10878 |     t0: u64,
+      |     ^^
+
+warning: function `v3d93_sampler_arm` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:10905:4
+      |
+10905 | fn v3d93_sampler_arm() {
+      |    ^^^^^^^^^^^^^^^^^
+
+warning: function `v3d93_sampler_emit` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:10960:4
+      |
+10960 | fn v3d93_sampler_emit(what: &str, sync_pre: (u32, u32), sync_post: (u32, u32), retired: bool) {
+      |    ^^^^^^^^^^^^^^^^^^
+
+warning: constant `V3D94_HUB_N` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:11184:7
+      |
+11184 | const V3D94_HUB_N: usize = 6;
+      |       ^^^^^^^^^^^
+
+warning: constant `V3D94_HUB_COUNTERS` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:11190:7
+      |
+11190 | const V3D94_HUB_COUNTERS: [(&str, usize); V3D94_HUB_N] = [
+      |       ^^^^^^^^^^^^^^^^^^
+
+warning: constant `CM_BASE` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:11204:7
+      |
+11204 | const CM_BASE: usize = 0xFE10_1000;
+      |       ^^^^^^^
+
+warning: constant `CM_V3DCTL` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:11210:7
+      |
+11210 | const CM_V3DCTL: usize = 0x0038;
+      |       ^^^^^^^^^
+
+warning: constant `CM_V3DDIV` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:11211:7
+      |
+11211 | const CM_V3DDIV: usize = 0x003C;
+      |       ^^^^^^^^^
+
+warning: constant `CM_CTL_ENAB` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:11215:7
+      |
+11215 | const CM_CTL_ENAB: u32 = 1 << 4;
+      |       ^^^^^^^^^^^
+
+warning: constant `CM_CTL_KILL` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:11216:7
+      |
+11216 | const CM_CTL_KILL: u32 = 1 << 5;
+      |       ^^^^^^^^^^^
+
+warning: constant `CM_CTL_BUSY` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:11217:7
+      |
+11217 | const CM_CTL_BUSY: u32 = 1 << 7;
+      |       ^^^^^^^^^^^
+
+warning: constant `CM_CTL_FLIP` is never used
+     --> crates/kernel/src/arch/aarch64/v3d.rs:11218:7
+      |
+11218 | const CM_CTL_FLIP: u32 = 1 << 8;
+      |       ^^^^^^^^^^^
+
+warning: constant `RING_SIZE` is never used
+  --> crates/kernel/src/drivers/xhci/ring.rs:22:7
+   |
+22 | const RING_SIZE: usize = 16;
+   |       ^^^^^^^^^
+
+warning: static `CAM` is never used
+   --> crates/kernel/src/drivers/xhci/uvc.rs:163:8
+    |
+163 | static CAM: AtomicU64 = AtomicU64::new(0);
+    |        ^^^
+
+warning: static `SHOWN` is never used
+   --> crates/kernel/src/drivers/xhci/uvc.rs:164:8
+    |
+164 | static SHOWN: AtomicU64 = AtomicU64::new(0);
+    |        ^^^^^
+
+warning: static `DROPPED` is never used
+   --> crates/kernel/src/drivers/xhci/uvc.rs:165:8
+    |
+165 | static DROPPED: AtomicU64 = AtomicU64::new(0);
+    |        ^^^^^^^
+
+warning: static `BAD` is never used
+   --> crates/kernel/src/drivers/xhci/uvc.rs:166:8
+    |
+166 | static BAD: AtomicU64 = AtomicU64::new(0);
+    |        ^^^
+
+warning: constant `REVOKE_FRAME_MS` is never used
+   --> crates/kernel/src/drivers/xhci/uvc.rs:761:7
+    |
+761 | const REVOKE_FRAME_MS: u64 = 17;
+    |       ^^^^^^^^^^^^^^^
+
+warning: constant `MIX_ROW` is never used
+   --> crates/kernel/src/audio/mixer.rs:308:7
+    |
+308 | const MIX_ROW: usize = usize::MAX;
+    |       ^^^^^^^
+
+warning: constant `MIX_GEN` is never used
+   --> crates/kernel/src/audio/mixer.rs:309:7
+    |
+309 | const MIX_GEN: u64 = u64::MAX;
+    |       ^^^^^^^
+
+warning: function `principal_linked` is never used
+    --> crates/kernel/src/fs/users.rs:1069:10
+     |
+1069 | const fn principal_linked() -> bool {
+     |          ^^^^^^^^^^^^^^^^
+
+warning: static `WATCHING` is never used
+   --> crates/kernel/src/fs/bootstep.rs:462:8
+    |
+462 | static WATCHING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    |        ^^^^^^^^
+
+warning: static `COMPAT_HITS` is never used
+  --> crates/kernel/src/fs/rootdisk.rs:45:8
+   |
+45 | static COMPAT_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+   |        ^^^^^^^^^^^
+
+warning: static `COMPAT_SAID` is never used
+  --> crates/kernel/src/fs/rootdisk.rs:46:8
+   |
+46 | static COMPAT_SAID: crate::sync::Mutex<Vec<String>> = crate::sync::Mutex::new(Vec::new());
+   |        ^^^^^^^^^^^
+
+warning: function `bar_settled` is never used
+   --> crates/kernel/src/fs/jobs.rs:124:4
+    |
+124 | fn bar_settled() -> bool {
+    |    ^^^^^^^^^^^
+
+warning: function `adopt_bg_job` is never used
+    --> crates/kernel/src/shell.rs:7129:15
+     |
+7129 | pub(crate) fn adopt_bg_job(pid: u64, slot: u64, name: &str) -> bool {
+     |               ^^^^^^^^^^^^
+
+warning: function `font_aa_witness` is never used
+    --> crates/kernel/src/shell.rs:8457:4
+     |
+8457 | fn font_aa_witness() {
+     |    ^^^^^^^^^^^^^^^
+
+warning: function `cwd_now` is never used
+    --> crates/kernel/src/shell.rs:8806:15
+     |
+8806 | pub(crate) fn cwd_now() -> String { cwd_path() }
+     |               ^^^^^^^
+
+warning: function `test_font_aa` is never used
+    --> crates/kernel/src/selftest.rs:1034:15
+     |
+1034 | pub(crate) fn test_font_aa() -> Outcome {
+     |               ^^^^^^^^^^^^
+
+warning: function `uac1_fixture` is never used
+    --> crates/kernel/src/tests.rs:1438:4
+     |
+1438 | fn uac1_fixture() {
+     |    ^^^^^^^^^^^^
+
+warning: function `mtpphone_selftest` is never used
+    --> crates/kernel/src/tests.rs:2156:4
+     |
+2156 | fn mtpphone_selftest() {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: function `mtpwrite_vfs` is never used
+    --> crates/kernel/src/tests.rs:2706:4
+     |
+2706 | fn mtpwrite_vfs(miss: &mut impl FnMut(&'static str, bool) -> bool) -> (bool, bool, bool) {
+     |    ^^^^^^^^^^^^
+
+warning: function `audiomix_selftest` is never used
+    --> crates/kernel/src/tests.rs:3211:4
+     |
+3211 | fn audiomix_selftest() {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: function `micring3_selftest` is never used
+    --> crates/kernel/src/tests.rs:4044:4
+     |
+4044 | fn micring3_selftest() {
+     |    ^^^^^^^^^^^^^^^^^
+
+warning: function `shadows_stale` is never used
+     --> crates/kernel/src/video/wm.rs:30508:4
+      |
+30508 | fn shadows_stale() {
+      |    ^^^^^^^^^^^^^
+
+warning: static `SHIM_LAST` is never used
+    --> crates/kernel/src/video/desktop.rs:2516:8
+     |
+2516 | static SHIM_LAST: AtomicU64 = AtomicU64::new(0);
+     |        ^^^^^^^^^
+
+warning: static `SHIM_CURSOR` is never used
+    --> crates/kernel/src/video/desktop.rs:2517:8
+     |
+2517 | static SHIM_CURSOR: AtomicU32 = AtomicU32::new(0);
+     |        ^^^^^^^^^^^
+
+warning: static `SHIM_BUSY` is never used
+    --> crates/kernel/src/video/desktop.rs:2519:8
+     |
+2519 | static SHIM_BUSY: AtomicBool = AtomicBool::new(false);
+     |        ^^^^^^^^^
+
+warning: function `dnd_drop` is never used
+    --> crates/kernel/src/video/dock.rs:4585:15
+     |
+4585 | pub(crate) fn dnd_drop(path: &str) -> Result<alloc::string::String, alloc::string::String> {
+     |               ^^^^^^^^
+
+warning: static `DP_DIRECT_RUNNER` is never used
+    --> crates/kernel/src/video/dock.rs:4831:8
+     |
+4831 | static DP_DIRECT_RUNNER: AtomicBool = AtomicBool::new(false);
+     |        ^^^^^^^^^^^^^^^^
+
+warning: static `DP_DIRECT_PID` is never used
+    --> crates/kernel/src/video/dock.rs:4833:8
+     |
+4833 | static DP_DIRECT_PID: [AtomicU64; DP_PINS.len()] = [const { AtomicU64::new(0) }; DP_PINS.len()];
+     |        ^^^^^^^^^^^^^
+
+warning: static `DP_DIRECT_SLOT` is never used
+    --> crates/kernel/src/video/dock.rs:4834:8
+     |
+4834 | static DP_DIRECT_SLOT: [AtomicU64; DP_PINS.len()] = [const { AtomicU64::new(0) }; DP_PINS.len()];
+     |        ^^^^^^^^^^^^^^
+
+warning: function `worker_core` is never used
+    --> crates/kernel/src/video/login.rs:2383:4
+     |
+2383 | fn worker_core() -> Option<usize> {
+     |    ^^^^^^^^^^^
+
+warning: function `resolve_wall` is never used
+   --> crates/kernel/src/video/settings.rs:318:4
+    |
+318 | fn resolve_wall(p: &str) -> String {
+    |    ^^^^^^^^^^^^
+
+warning: function `home` is never used
+   --> crates/kernel/src/video/settings.rs:338:4
+    |
+338 | fn home() -> Option<String> {
+    |    ^^^^
+
+warning: function `row_of` is never used
+   --> crates/kernel/src/video/settings.rs:538:10
+    |
+538 | const fn row_of(i: usize) -> usize {
+    |          ^^^^^^
+
+warning: function `sel` is never used
+    --> crates/kernel/src/video/settings.rs:1585:4
+     |
+1585 | fn sel() -> usize {
+     |    ^^^
+
+warning: constant `FIX_LINE` is never used
+    --> crates/kernel/src/video/notify.rs:1505:7
+     |
+1505 | const FIX_LINE: &[u8] = b"toastflicker fixture";
+     |       ^^^^^^^^
+
+warning: static `WATCHING` is never used
+   --> crates/kernel/src/prefs.rs:440:8
+    |
+440 | static WATCHING: AtomicBool = AtomicBool::new(false);
+    |        ^^^^^^^^
+
+warning: function `take_reply` is never used
+   --> crates/kernel/src/prefs_client.rs:145:4
+    |
+145 | fn take_reply(corr: u32) -> Option<Box<[u8]>> {
+    |    ^^^^^^^^^^
+
+warning: constant `SETTLE_MS` is never used
+  --> crates/kernel/src/queuesleep.rs:45:7
+   |
+45 | const SETTLE_MS: u64 = 5_000;
+   |       ^^^^^^^^^
+
+warning: constant `DESK_WAIT_MS` is never used
+  --> crates/kernel/src/queuesleep.rs:47:7
+   |
+47 | const DESK_WAIT_MS: u64 = 180_000;
+   |       ^^^^^^^^^^^^
+
+warning: function `watch_arm` is never used
+   --> crates/kernel/src/queuesleep.rs:101:4
+    |
+101 | fn watch_arm() {
+    |    ^^^^^^^^^
+
+warning: function `watch_disarm` is never used
+   --> crates/kernel/src/queuesleep.rs:106:4
+    |
+106 | fn watch_disarm() {
+    |    ^^^^^^^^^^^^
+
+warning: constant `TOUCH_WAIT_MS` is never used
+  --> crates/kernel/src/pointerfeel.rs:40:7
+   |
+40 | const TOUCH_WAIT_MS: u64 = 20_000;
+   |       ^^^^^^^^^^^^^
+
+warning: struct `FineWord` is never constructed
+   --> crates/kernel/src/pointerfeel.rs:151:8
+    |
+151 | struct FineWord;
+    |        ^^^^^^^^
+
+warning: struct `WorstWord` is never constructed
+   --> crates/kernel/src/pointerfeel.rs:330:8
+    |
+330 | struct WorstWord(Option<Holder>);
+    |        ^^^^^^^^^
+
+warning: struct `FrWord` is never constructed
+   --> crates/kernel/src/pointerfeel.rs:343:8
+    |
+343 | struct FrWord(usize);
+    |        ^^^^^^
+
+warning: function `reset_class` is never used
+   --> crates/kernel/src/pointerfeel.rs:415:4
+    |
+415 | fn reset_class() {
+    |    ^^^^^^^^^^^
+
+warning: function `silent_worst` is never used
+   --> crates/kernel/src/pointerfeel.rs:427:4
+    |
+427 | fn silent_worst(gaps: u32) -> bool {
+    |    ^^^^^^^^^^^^
+
+warning: struct `Classed` is never constructed
+   --> crates/kernel/src/pointerfeel.rs:432:8
+    |
+432 | struct Classed<T: core::fmt::Display>(bool, T);
+    |        ^^^^^^^
+
+warning: struct `GapClass` is never constructed
+   --> crates/kernel/src/pointerfeel.rs:440:8
+    |
+440 | struct GapClass(usize);
+    |        ^^^^^^^^
+
+warning: struct `RateWord` is never constructed
+   --> crates/kernel/src/pointerfeel.rs:504:8
+    |
+504 | struct RateWord(u64);
+    |        ^^^^^^^^
+
+warning: function `reset_xfer` is never used
+   --> crates/kernel/src/pointerfeel.rs:551:4
+    |
+551 | fn reset_xfer() {
+    |    ^^^^^^^^^^
+
+warning: struct `XferWord` is never constructed
+   --> crates/kernel/src/pointerfeel.rs:558:8
+    |
+558 | struct XferWord;
+    |        ^^^^^^^^
+
+warning: direct cast of function item into an integer
+   --> crates/kernel/src/arch/aarch64/smp.rs:512:34
+    |
+512 |     let entry = _secondary_start as usize as u64;
+    |                                  ^^^^^^^^
+    |
+    = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+    |
+512 |     let entry = _secondary_start as *const () as usize as u64;
+    |                                  ++++++++++++
+
+warning: `unaos-kernel` (lib) generated 138 warnings (1 duplicate) (run `cargo fix --lib -p unaos-kernel` to apply 29 suggestions)
+warning: function `virt_el0_start_maybe` is never used
+    --> crates/kernel/src/main.rs:9804:4
+     |
+9804 | fn virt_el0_start_maybe() {}
+     |    ^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `unaos-kernel` (bin "unaos-kernel") generated 1 warning
+warning: unused dependency `ldso_core`
+    --> crates/kernel/Cargo.toml:3978:1
+     |
+3978 | ldso_core = { path = "../../libs/sys/ldso_core", default-features = false }
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `cargo::unused_dependencies` is set to `warn` by default
+help: consider removing the dependency on `ldso_core`
+warning: unused dependency `volatile`
+    --> crates/kernel/Cargo.toml:3907:1
+     |
+3907 | volatile = "0.6.1"
+     | ^^^^^^^^^^^^^^^^^^
+     |
+help: consider removing the dependency on `volatile`
+warning: `unaos-kernel` (manifest) generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 1m 28s
+⚡ banner-cert: artifact=/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/pi_baremetal/kernel8.img
+⚡ banner-cert: banner=baremetal,skip_xhci,unafs,witness,tests-at-boot,census,usbnet,smp7,v3d,vugpar,wedge2,piusb,genet,nettest,genet,pirast,desktop_firmware,quarry,login,lumen,selfdiag,holocron,midden,una,sonde,aether,stria,uvc
+⚡ banner-cert: arch=aarch64  (FLAT image (no ELF header); the caller named this arch in argument 3)
+feature=baremetal witness=:: UnaOS bare-metal — Pi 4 microSD-slot boot, serial console (no framebuffer) :: hits=1 -> OK
+feature=skip_xhci witness=:: xHCI bring-up SKIPPED (skip_xhci feature): video only, no USB :: hits=1 -> OK
+feature=unafs witness=:: UNAFSX86: root= hits=1 -> OK
+feature=witness witness=:: U1a: no application processors online — ring-3 demo SKIPPED :: hits=- -> UNVERIFIABLE (its literal needs 'NOT baremetal', and this build carries 'baremetal' — that configuration makes the code the literal lives in UNREACHABLE, so its absence proves nothing about the feature)
+feature=tests-at-boot witness=:: TESTS: deferred= hits=1 -> OK
+feature=census witness=:: CENSUS: armed=all hits=1 -> OK
+feature=usbnet witness=:: USBNET: bus=xhci slot= hits=1 -> OK
+feature=smp7 witness=[smp7] cores online= hits=1 -> OK
+feature=v3d witness=:: V3D: CT1 did not idle within budget hits=1 -> OK
+feature=vugpar witness=:: [spread2] window hits=1 -> OK
+feature=wedge2 witness=<none> hits=- -> NOWITNESS (no gated string literal anywhere under cfg(feature="wedge2") — the knob only re-times an existing path; certify it from its serial witness, not from the artifact)
+feature=piusb witness=early/bringup_inner (P38 context, right before the first RC read) hits=1 -> OK
+feature=genet witness=SKIP (no reply — pre-cable / no DHCP is the honest pre-metal state) hits=1 -> OK
+feature=nettest witness=:: NET20-GATE: mdns host-name publish battery hits=1 -> OK
+feature=genet witness=SKIP (no reply — pre-cable / no DHCP is the honest pre-metal state) hits=1 -> OK
+feature=pirast witness=:: RAST: no mailbox framebuffer (headless boot) — cube demo skipped :: hits=1 -> OK
+feature=desktop_firmware witness=[deskfw] activate DECLINE reason=no-panel hits=1 -> OK
+feature=quarry witness=[quarry] DECLINE reason=dock-cannot-host-full-strip panel= hits=1 -> OK
+feature=login witness=[login] screen open window= hits=4 -> OK
+feature=lumen witness=:: LUMENAPP: hits=3 -> OK
+feature=selfdiag witness=:: SELFDIAG: hits=3 -> OK
+feature=holocron witness=[hcron] /system/ hits=1 -> OK
+feature=midden witness=:: MIDDENAPP: image= hits=- -> UNVERIFIABLE (its literal exists only in a x86_64 artifact; this one is aarch64 — the module is compiled on that arch alone, so the row cannot fire here and says so)
+feature=una witness=:: UNAAPP: image= hits=- -> UNVERIFIABLE (its literal exists only in a x86_64 artifact; this one is aarch64 — the module is compiled on that arch alone, so the row cannot fire here and says so)
+feature=sonde witness=:: SONDE: hits=- -> UNVERIFIABLE (its literal exists only in a x86_64 artifact; this one is aarch64 — the module is compiled on that arch alone, so the row cannot fire here and says so)
+feature=aether witness=:: AETHERAPP: hits=4 -> OK
+feature=stria witness=:: STRIAAPP: image= hits=1 -> OK
+feature=uvc witness=[uvc] commit=withheld hits=2 -> OK
+control=instgui witness=[wc-x] instgui install-go with NO committed target hits=0 -> OK
+control=selfhost witness=:: SELFHOST: src payload holds no regular files -> FAIL :: hits=0 -> OK
+control=videobench witness=:: vperf: fbmem no framebuffer registered :: hits=0 -> OK
+control=irqstorage witness=irqstorage::submit called off a scheduled task hits=0 -> OK
+⚡ banner-cert: ok=23 missing/leak=0 registered-divergences=0 unverifiable=4 nowitness=1 noverdict=0  (table: 95 measured, 14 unmeasured-here)
+✅ banner-cert: every feature the banner named is in the artifact.
+✅ Boot files: /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/pi_baremetal (firmware raspberrypi/firmware 1.20260521)
+✅ vug images staged: VUG.ELF (12648 B, adaptive) + VUGC.ELF (12648 B, pinlo) + VUGX.ELF (12648 B, pinhi)
+⚡ Building aarch64 ring-3 secrets handler (crates/user-holocron → target/HOLOCRON.ELF, ELF window)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling alloc v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
+   Compiling crypto_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/crypto_core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling tls_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/tls_core)
+   Compiling vein_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_core)
+   Compiling holocron_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/holocron_core)
+   Compiling vein_ring3 v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_ring3)
+   Compiling user-holocron v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-holocron)
+    Finished `release` profile [optimized] target(s) in 15.96s
+   HOLOCRON.ELF: model=elf entry=0x7840200000 lo=0x7840200000 span=106753 stack=262144 need=372993 file=106928 file_cap=12582912
+✅ aarch64 ring-3 secrets handler: HOLOCRON.ELF
+⚡ Building aarch64 ring-3 Lumen app (crates/user-lumen → target/LUMEN.ELF, ELF window)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling alloc v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
+   Compiling crypto_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/crypto_core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling vein_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_core)
+   Compiling palette_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/palette_core)
+   Compiling syntax_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/text/syntax_core)
+   Compiling font8x8 v0.3.1
+   Compiling font_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/text/font_core)
+   Compiling holocron_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/holocron_core)
+   Compiling tls_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/tls_core)
+warning: unused import: `crypto_core::Digest`
+   --> /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling vein_ring3 v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_ring3)
+warning: `tls_core` (lib) generated 1 warning
+   Compiling user-lumen v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-lumen)
+    Finished `release` profile [optimized] target(s) in 19.13s
+  • symbols: target/APPS-ARM/LUMEN.syms (980 lines)
+   LUMEN.ELF: model=elf entry=0x7840200000 lo=0x7840200000 span=3931816 stack=262144 need=4198056 file=825904 file_cap=12582912
+una-res: stamped /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/LUMEN.ELF block=6949 bytes file=825904 -> 833456
+✅ aarch64 ring-3 Lumen app: LUMEN.ELF
+⚡ Building aarch64 ring-3 Midden app (crates/user-midden → target/MIDDEN.ELF, ELF window)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling alloc v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
+   Compiling crypto_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/crypto_core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling tls_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/tls_core)
+   Compiling vein_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_core)
+   Compiling palette_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/palette_core)
+   Compiling font8x8 v0.3.1
+   Compiling font_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/text/font_core)
+   Compiling edit_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/text/edit_core)
+   Compiling midden_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/midden_core)
+   Compiling holocron_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/holocron_core)
+   Compiling vein_ring3 v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_ring3)
+   Compiling user-midden v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-midden)
+    Finished `release` profile [optimized] target(s) in 20.06s
+  • symbols: target/APPS-ARM/MIDDEN.syms (603 lines)
+   MIDDEN.ELF: model=elf entry=0x7840200000 lo=0x7840200000 span=594992 stack=262144 need=861232 file=582184 file_cap=12582912
+una-res: stamped /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/MIDDEN.ELF block=4479 bytes file=582184 -> 587264
+✅ aarch64 ring-3 Midden app: MIDDEN.ELF
+⚡ Building aarch64 ring-3 Una IDE (crates/user-una → target/UNA.ELF, ELF window)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling alloc v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
+   Compiling crypto_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/crypto_core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling raw_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/raw_core)
+   Compiling vp8_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/vp8_core)
+   Compiling vein_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_core)
+   Compiling tls_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/tls_core)
+   Compiling syntax_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/text/syntax_core)
+   Compiling font8x8 v0.3.1
+   Compiling matrix_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/fs/matrix_core)
+   Compiling edit_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/text/edit_core)
+   Compiling font_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/text/font_core)
+   Compiling palette_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/palette_core)
+   Compiling midden_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/midden_core)
+   Compiling trash_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/fs/trash_core)
+   Compiling pixel_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/pixel_core)
+   Compiling holocron_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/holocron_core)
+   Compiling git_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/vcs/git_core)
+   Compiling vein_ring3 v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_ring3)
+   Compiling user-una v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-una)
+    Finished `release` profile [optimized] target(s) in 23.23s
+  • symbols: target/APPS-ARM/UNA.syms (756 lines)
+   UNA.ELF: model=elf entry=0x7840200000 lo=0x7840200000 span=709704 stack=262144 need=975944 file=696896 file_cap=12582912
+una-res: stamped /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/UNA.ELF block=5087 bytes file=696896 -> 702584
+✅ aarch64 ring-3 Una IDE: UNA.ELF
+⚡ Building aarch64 ring-3 Aether app (crates/user-aether → target/AETHER.ELF, ELF window)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling version_check v0.9.5
+   Compiling slotmap v1.1.1
+   Compiling alloc v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
+   Compiling crypto_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/crypto_core)
+   Compiling raw_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/raw_core)
+   Compiling vp8_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/vp8_core)
+   Compiling smallvec v1.16.3
+   Compiling font_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/text/font_core)
+   Compiling html_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/web/html_core)
+   Compiling css_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/web/css_core)
+   Compiling psl_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/net/psl_core)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling vein_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_core)
+   Compiling edit_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/text/edit_core)
+   Compiling palette_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/palette_core)
+   Compiling font8x8 v0.3.1
+   Compiling taffy v0.15.0
+   Compiling pixel_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/pixel_core)
+   Compiling holocron_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/holocron_core)
+   Compiling tls_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/tls_core)
+warning: unused import: `crypto_core::Digest`
+   --> /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling http_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/net/http_core)
+   Compiling vein_ring3 v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_ring3)
+   Compiling svg_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/svg_core)
+warning: `tls_core` (lib) generated 1 warning
+   Compiling layout_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/web/layout_core)
+warning: unreachable pattern
+    --> /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/web/layout_core/src/css.rs:1868:9
+     |
+1819 |         "border-style" => {
+     |         -------------- matches all the relevant values
+...
+1868 |         "border-style" => {} // stroke style is uniform; nothing to record
+     |         ^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: `layout_core` (lib) generated 1 warning
+   Compiling user-aether v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-aether)
+warning: fields `chrome_bg`, `tab_bg`, and `hot_bg` are never read
+  --> src/theme.rs:67:9
+   |
+48 | pub struct Theme {
+   |            ----- fields in this struct
+...
+67 |     pub chrome_bg: u32,
+   |         ^^^^^^^^^
+68 |     pub chrome_rule: u32,
+69 |     pub tab_bg: u32,
+   |         ^^^^^^
+...
+77 |     pub hot_bg: u32,
+   |         ^^^^^^
+   |
+   = note: `Theme` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `user-aether` (bin "user-aether") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 47.65s
+  • symbols: target/APPS-ARM/AETHER.syms (2499 lines)
+   AETHER.ELF: model=elf entry=0x7840200000 lo=0x7840200000 span=2972112 stack=262144 need=3238352 file=2958248 file_cap=12582912
+una-res: stamped /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/AETHER.ELF block=9224 bytes file=2958248 -> 2968072
+✅ aarch64 ring-3 Aether app: AETHER.ELF
+⚡ Building aarch64 ring-3 Stria app (crates/user-stria → target/STRIA.ELF, ELF window)...
+   Compiling compiler_builtins v0.1.160 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/compiler-builtins/compiler-builtins)
+   Compiling core v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+   Compiling alloc v0.0.0 (/home/pmes/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/alloc)
+   Compiling una-abi v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/una-abi)
+   Compiling demux_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/demux_core)
+   Compiling vp8_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/vp8_core)
+   Compiling h264_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/h264_core)
+   Compiling av1_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/av1_core)
+   Compiling font8x8 v0.3.1
+   Compiling vp9_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/vp9_core)
+   Compiling vein_ring3 v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/sys/vein_ring3)
+   Compiling audio_core v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/libs/media/audio_core)
+   Compiling user-stria v0.1.0 (/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/crates/user-stria)
+warning: method `usage` is never used
+   --> src/heap.rs:101:12
+    |
+ 85 | impl<G: Grow> SizeClassHeap<G> {
+    | ------------------------------ method in this implementation
+...
+101 |     pub fn usage(&self) -> (usize, usize) {
+    |            ^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `user-stria` (bin "user-stria") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 26.36s
+  • symbols: target/APPS-ARM/STRIA.syms (1254 lines)
+   STRIA.ELF: model=elf entry=0x7840200000 lo=0x7840200000 span=1028488 stack=262144 need=1294728 file=1020336 file_cap=12582912
+una-res: stamped /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/STRIA.ELF block=4729 bytes file=1020336 -> 1025600
+✅ aarch64 ring-3 Stria app: STRIA.ELF
+  ⚠ STRIAMETAL: target/testf-cache/TEST.WEBM absent (the builder fetches it) — tests stria SKIPs no-clip on this card
+⚡ Staging unafs K3 volume (host unafs CLI)...
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+⚡ [OPERATOR] Initializing Vault at '/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/unafs-k3.img' (4 MB)...
+   v7 · 1024 blocks · generation 1 · 945 free
+[UNAFS] Broadcasting event to 'system/fs/created': FileEvent { path: "/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/unafs-k3.img", event: "Created" }
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+✅ [OPERATOR] Wrote '/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/K3HELLO.TXT' to '//K3HELLO.TXT' (ID: 5)
+warning: unused import: `crypto_core::Digest`
+   --> unaos/libs/sys/tls_core/src/cryptocore_provider.rs:171:13
+    |
+171 |         use crypto_core::Digest as _;
+    |             ^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+✅ [OPERATOR] Wrote '/home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/K3PAT.BIN' to '//K3PAT.BIN' (ID: 6)
+Warning: block count mismatch: found 130048 but assuming 121856.
+mkfs.fat 4.2 (2021-01-31)
+make-pi-img: FATCLUST p1_start=2048 bps=512 spc=1 rsvd=32 nfats=2 tot=243712 fatsz=1875 data=239930 clusters=239930 kind=FAT32 bpb32=yes -> PASS
+unafs partition: LBA 245760, 16384 sectors (volume 112K)
+source-along: SRC.TGZ 48603 KiB in the FAT root, SRC.SHA bc3594ab97536a79... (tree /home/pmes/src/github.com/pmes/UnaOS-rmbp)
+built /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/UnaOS-pi4-baremetal.img  (128M, sha256 15831f8456fa6166...)
+✅ Flashable image: target/UnaOS-pi4-baremetal.img — Imager → Use custom → microSD → SD slot.
+⚡ Headless raspi4b test (300s). Serial -> /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/serial-pi.log, screen -> /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/pi-screen.png
+[qmp] connected; letting guest boot 0.0s ...
+[qmp] screendump written to /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/pi-screen.png
+qemu-system-aarch64: terminating on signal 15 from pid 75051 (/bin/bash)
+⚡ kernel8-test: no completion inside the 300s cap — full wall paid (300.2s), saved 0s.
+✅ Serial: /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/serial-pi.log    Screen: /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/pi-screen.png
+⚡ mbench: asserting the capture against scripts/specs/pi4-regression.spec
+  ❌ FORBID hit @ line 614: [wc-g] win=1 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x88c9ab06b55a5325 civac=0x88c9ab06b55a5325 after=0x88c9ab06b55a5325 fbbad=974/116480 occluded=0 occ=0/0 us=17136 rectscan_us=7222 slow=yes -> BLIT
+  ❌ FORBID hit @ line 645: [wc-d] verify win=1 surf=560x208 band=0..112 scale=1x at (40,38) panel=640x480 checked=62720 bad_cache=209 bad_ram=209 ram_indep=yes moved=15 sprite_px=0 nonzero=9415 occluded=0 occ=0/0 cksum=0x0611f64d63216b48 first=(40,38) got=0xbcbec2 want=0x000000 fills=1->1 fact=0/0 desk=0->0 dact=0/0 -> FAIL
+  ❌ FORBID hit @ line 645: [wc-d] verify win=1 surf=560x208 band=0..112 scale=1x at (40,38) panel=640x480 checked=62720 bad_cache=209 bad_ram=209 ram_indep=yes moved=15 sprite_px=0 nonzero=9415 occluded=0 occ=0/0 cksum=0x0611f64d63216b48 first=(40,38) got=0xbcbec2 want=0x000000 fills=1->1 fact=0/0 desk=0->0 dact=0/0 -> FAIL
+  ❌ FORBID hit @ line 680: :: SHARD-PRESS: menu=250x277+0+34 panel=640x480 routed=true(open) opened=true painted=false dismissed=true(dismiss) closed=true erased=true :: FAIL ::
+  ❌ FORBID hit @ line 680: :: SHARD-PRESS: menu=250x277+0+34 panel=640x480 routed=true(open) opened=true painted=false dismissed=true(dismiss) closed=true erased=true :: FAIL ::
+  ❌ FORBID hit @ line 1586: [wc-fv] focus-vis at (214,155) a=0xff2020 b=0x20ff20 stack=0x20ff20/true raise=0xff2020/true shell=0xf5f7fb/false reraise=0x20ff20/true -> FAIL
+════════════ MBENCH VERDICT — pi4-regression.spec vs /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/serial-pi.log ════════════
+  ✅ COMPLETE   :: SCHED: task 'el0-midden' -> core
+       end-of-run marker SEEN @ line 3652 — the run got past this point
+  ✅ COMPLETE   :: BANDY-RT:
+       end-of-run marker SEEN @ line 3755 — the run got past this point
+  ✅ REQUIRE    :: SERWIT-2: mirror taps .*-> PASS ::
+       1 hit(s), first @ line 782
+  ✅ REQUIRE    :: BOT-PARK: selftest .*-> PASS ::
+       1 hit(s), first @ line 467
+  ✅ REQUIRE    CAPSTONE COMPLETE
+       1 hit(s), first @ line 204
+  ✅ REQUIRE    M6b: EL0 fault isolation.*-> PASS
+       1 hit(s), first @ line 441
+  ✅ REQUIRE    M6g: disk-loaded EL0 program exited ok -> PASS
+       1 hit(s), first @ line 513
+  ✅ REQUIRE    :: ERET-SCRUB: first-entry GPR/FP/TPIDR residue = 0 .*-> PASS ::
+       1 hit(s), first @ line 488
+  ✅ REQUIRE    :: ERET-SCRUB: syscall-return preserved .*-> PASS ::
+       1 hit(s), first @ line 489
+  ✅ REQUIRE    U4: process model.*-> PASS
+       1 hit(s), first @ line 525
+  ✅ REQUIRE    U5: capabilities.*-> PASS
+       1 hit(s), first @ line 533
+  ✅ REQUIRE    U6: general object table.*-> PASS
+       1 hit(s), first @ line 545
+  ✅ REQUIRE    U6b: real File handles.*-> PASS
+       1 hit(s), first @ line 550
+  ✅ REQUIRE    U7: cross-process transfer.*-> PASS
+       1 hit(s), first @ line 560
+  ✅ REQUIRE    \[u7fix\] park margin — child parked [0-9]+ms before GO \(parked_out=0\), parent parked [0-9]+ms before GO \(parked_out=false\); park primitive=SYS_SLEEP_MS budget=0x8000
+       1 hit(s), first @ line 557
+  ✅ REQUIRE    U8: revocation trees.*-> PASS
+       1 hit(s), first @ line 567
+  ✅ REQUIRE    U9: real File writes.*-> PASS
+       1 hit(s), first @ line 572
+  ✅ REQUIRE    U10: file growth.*-> PASS
+       1 hit(s), first @ line 577
+  ✅ REQUIRE    U10-create: file create.*-> PASS
+       1 hit(s), first @ line 582
+  ✅ REQUIRE    U10-delete: file delete.*-> PASS
+       1 hit(s), first @ line 587
+  ✅ REQUIRE    U11: open-file lifecycle.*-> PASS
+       1 hit(s), first @ line 592
+  ✅ REQUIRE    U11-defer: cross-process unlink-defers-free.*-> PASS
+       1 hit(s), first @ line 650
+  ✅ REQUIRE    \[u11fix\] park margin — B parked [0-9]+ms before unlink-GO \(parked_out=0\), A parked [0-9]+ms before read-GO \(parked_out=false\) and [0-9]+ms before close-GO \(parked_out=false\); park primitive=SYS_SLEEP_MS budget=0x8000
+       1 hit(s), first @ line 643
+  ✅ REQUIRE    U11-reuse: sys_unlink slot-recycle.*-> PASS
+       1 hit(s), first @ line 655
+  ✅ REQUIRE    U11-reap: teardown-last-close reaper.*-> PASS
+       1 hit(s), first @ line 766
+  ✅ REQUIRE    U6-grants: owner/grants on open.*-> PASS
+       1 hit(s), first @ line 1013
+  ❌ REQUIRE    K1-persist:.*SURVIVE REBOOT.*PASS
+       0 hits — MISSING (pinned at pi4-regression.spec:364)
+  ✅ REQUIRE    K1-corrupt:.*fails closed to PUBLIC at boot PASS
+       1 hit(s), first @ line 1123
+  ✅ REQUIRE    F2-witness:.*locked 240000/240000 intact
+       1 hit(s), first @ line 1050
+  ✅ REQUIRE    F3-witness:.*locked 240000/240000 intact
+       1 hit(s), first @ line 1073
+  ✅ REQUIRE    K2-liveenf:.*rebuild\+enforce PASS
+       1 hit(s), first @ line 1159
+  ❌ REQUIRE    K3-revoke:.*durable-first PASS
+       0 hits — MISSING (pinned at pi4-regression.spec:385)
+  ✅ REQUIRE    K9-parity:.*discarded residue PASS
+       1 hit(s), first @ line 3259
+  ✅ REQUIRE    K3-mount:.*byte-verified PASS
+       1 hit(s), first @ line 3285
+  ✅ REQUIRE    K4-write:.*clean-tree PASS
+       1 hit(s), first @ line 3307
+  ✅ REQUIRE    K8a-cow:.*PASS
+       1 hit(s), first @ line 3351
+  ❌ REQUIRE    K8b-snap:.*PASS
+       0 hits — MISSING (pinned at pi4-regression.spec:424)
+  ✅ REQUIRE    K8c-snapread:.*PASS
+       1 hit(s), first @ line 3475
+  ✅ REQUIRE    K4-ready:.*prefix\) PASS
+       1 hit(s), first @ line 3274
+  ✅ REQUIRE    IMG-SIG:.*residual closed\) PASS
+       1 hit(s), first @ line 3263
+  ✅ REQUIRE    FATDIRS:.*delete_located\) PASS
+       1 hit(s), first @ line 3271
+  ✅ REQUIRE    FATMOVE:.*keep-chain\) PASS
+       1 hit(s), first @ line 3280
+  ✅ REQUIRE    K6-migrate:.*legacy PROGRAM_NAME stays\) PASS
+       1 hit(s), first @ line 3555
+  ✅ REQUIRE    BANDY-CODEC:.*decode fail-closed.*PASS
+       1 hit(s), first @ line 3612
+  ✅ REQUIRE    BANDY-CODEC2:.*decode fail-closed.*PASS
+       1 hit(s), first @ line 3615
+  ✅ REQUIRE    BANDY-STAMP:.*gen-fenced PASS
+       1 hit(s), first @ line 3622
+  ✅ REQUIRE    BANDY-RT:.*self-cleaned PASS
+       1 hit(s), first @ line 3755
+  ✅ REQUIRE    BANDY-EQ:.*both legs at EL0 through the production paths PASS
+       1 hit(s), first @ line 3757
+  ✅ REQUIRE    BANDY-WR:.*mv->cat\(new\) byte-exact.*PASS
+       1 hit(s), first @ line 3758
+  ✅ REQUIRE    BANDY-EQ2:.*byte-same -EACCES.*PASS
+       1 hit(s), first @ line 3760
+  ✅ REQUIRE    BANDY-ACL:.*foreign owner row intact.*PASS
+       1 hit(s), first @ line 3761
+  ✅ REQUIRE    BANDY-GRANT:.*grant re-persisted durable.*PASS
+       1 hit(s), first @ line 3647
+  ✅ REQUIRE    UVUG: frames=300 threads=2 checksum=0xf18f983557b87a55
+       1 hit(s), first @ line 1487
+  ✅ REQUIRE    USER: input router — routed=2 .*GUI_CHANNEL bypassed :: PASS
+       1 hit(s), first @ line 124
+  ✅ REQUIRE    \[inroute\] router window — routed=2 stale_dropped=1 revokes=0
+       1 hit(s), first @ line 123
+  ✅ REQUIRE    EL0: window verbs.*witness=0x3ffff.*PASS
+       1 hit(s), first @ line 1534
+  ✅ REQUIRE    \[wc-c\] side-by-side windows=2 drawn=2
+       1 hit(s), first @ line 1517
+  ✅ REQUIRE    \[wc-d\] verify win=.*bad_cache=0 bad_ram=0.*-> PASS
+       2 hit(s), first @ line 1568
+  ✅ REQUIRE    \[wc-b\] rollup presents=[0-9]+ banded=[0-9]+ maxbands=[0-9]+ chrome_rows=[0-9]+ chrome_rows_used=[0-9]+ amp=1\.00x
+       144 hit(s), first @ line 618
+  ❌ REQUIRE    \[wc-fv\] focus-vis .*-> PASS
+       0 hits — MISSING (pinned at pi4-regression.spec:675)
+  ✅ REQUIRE    \[wc-c\] focus tab-cycle [0-9]+ -> [0-9]+ \(ring of [0-9]+ \+ shell\)
+       3 hit(s), first @ line 2716
+  ✅ REQUIRE    :: TABRING: TAB rotation — witness=0xff .*noweld=true shellpass=true :: PASS ::
+       1 hit(s), first @ line 2756
+  ✅ REQUIRE    \[wedge1\] dwell drains=.*spin_max=.*mvbound=[0-9]+ mvgiveup=[0-9]+ mvskip=[0-9]+ ywait=[0-9]+ ydrain=[0-9]+ scskip=[0-9]+ rescued=[0-9]+ grace=[0-9]+ latched=.*->
+       4 hit(s), first @ line 1875
+  ✅ REQUIRE    \[storm\] boot-baseline \| busy
+       1 hit(s), first @ line 111
+  ✅ REQUIRE    BGRUN-ST: spawn->exit->reap PASS
+       1 hit(s), first @ line 2992
+  ✅ REQUIRE    BGRUN-ST: process table capacity = [1-9][0-9]* rows \(bg programs alive at once; EL0 slots=heap, R90\)
+       1 hit(s), first @ line 2995
+  ✅ REQUIRE    BGRUN-ST: slot reclaim PASS
+       1 hit(s), first @ line 3053
+  ✅ REQUIRE    BGRUN-ST: kill mid-run PASS \(pid=[0-9]+, killed — row reaped
+       1 hit(s), first @ line 3058
+  ✅ REQUIRE    BGRUN-ST: persist\+kill PASS \(pid=[0-9]+,
+       1 hit(s), first @ line 3121
+  ✅ REQUIRE    KILLBOUND: 5/5 rounds .*PASS
+       1 hit(s), first @ line 2804
+  ✅ REQUIRE    \[wc-e\] fb-geometry .*row_ok=true fit_ok=true
+       1 hit(s), first @ line 2
+  ✅ REQUIRE    \[wc-f\] scanout .*-> PASS
+       1 hit(s), first @ line 620
+  ✅ REQUIRE    \[wc-f\] twin .*-> PASS
+       1 hit(s), first @ line 621
+  ✅ REQUIRE    \[chrome-truth\] verdict wins=[0-9]+ hits=[0-9]+/[0-9]+ .*-> PASS
+       1 hit(s), first @ line 633
+  ✅ REQUIRE    \[chrome-truth\] defers=[0-9]+ budget=[0-9]+ exhausted=false
+       1 hit(s), first @ line 623
+  ✅ REQUIRE    \[wc-g\] win=.* fbbad=.* slow=.* ->
+       27 hit(s), first @ line 614
+  ✅ REQUIRE    \[wc-g\] rollup win=.* scope=window .*frame_us=.* ->
+       4 hit(s), first @ line 667
+  ✅ REQUIRE    \[wc-h\] win=.* compose_us=.* present_us=.* torn=.* -> BUFFERED
+       45 hit(s), first @ line 616
+  ✅ REQUIRE    \[wc-h\] win=.* staged=no reason=fixture -> DIRECT
+       1 hit(s), first @ line 644
+  ✅ REQUIRE    \[wc-h\] rollup win=.* scope=window .*declines=.* -> TEAR-FREE
+       51 hit(s), first @ line 661
+  ✅ REQUIRE    \[cursor3\] rollup scope=.* planned=.* offers=.* taken=.* adopt=.* repaint=.* ensure=.* stale=.* ->
+       1 hit(s), first @ line 1903
+  ✅ REQUIRE    \[cursor5\] rollup scope=.* stale_compose=.* adopt_incoh=.* selfsave=.* masked_nosession=.* drain_insession=.* ->
+       1 hit(s), first @ line 1904
+  ✅ REQUIRE    \[cursor6\] rollup scope=.* present_over=.* masked=.* desktop_over=.* mismatch=.* uncover_lost=.* ->
+       1 hit(s), first @ line 1905
+  ✅ REQUIRE    \[wc-j\] vacate close_painted=true close_desktop=true .* owner_painted=true owner_desktop=true .* -> PASS
+       1 hit(s), first @ line 1711
+  ✅ REQUIRE    \[wc-j\] retile survivor=.* moved=true painted=true live=true old_desktop=true .* -> PASS
+       1 hit(s), first @ line 1733
+  ✅ REQUIRE    \[wc-j\] move-once .* painted=true moved=true old_desktop=true .* new_window=true .* flash_px=0 exact=true -> PASS
+       1 hit(s), first @ line 1892
+  ✅ REQUIRE    \[wc-j\] vacate .*-> \w+ close_covered=[0-9]+ owner_covered=[0-9]+
+       1 hit(s), first @ line 1711
+  ✅ REQUIRE    \[wc-j\] retile .*-> \w+ covered=[0-9]+
+       1 hit(s), first @ line 1733
+  ✅ REQUIRE    \[wc-j\] move-once .*-> \w+ covered=[0-9]+
+       1 hit(s), first @ line 1892
+  ✅ REQUIRE    \[wc-k\] erase box=.* staged=yes .* contig=yes .* torn=.* -> BUFFERED
+       4 hit(s), first @ line 608
+  ✅ REQUIRE    \[wc-k\] rollup scope=fills samples=.* noncontig=.* declines=.* outside=0 .* -> TEAR-FREE
+       1 hit(s), first @ line 723
+  ✅ REQUIRE    \[wc-k\] erase box=.* staged=defer reason=route requeued=no -> DEFERRED
+       4 hit(s), first @ line 607
+  ✅ REQUIRE    \[pstrip\] armed cores=[0-9]+ panel=\([0-9]+,[0-9]+,[0-9]+x[0-9]+\) row_h=[0-9]+ bar=\(x=[0-9]+,w=[0-9]+\) leds=[0-9]+ led=[0-9]+x[0-9]+ gap=[0-9]+ bands=[0-9]+ full=[0-9]+ strip_h=[0-9]+ reserved=[0-9]+
+       1 hit(s), first @ line 1079
+  ✅ REQUIRE    \[pstrip\] armed .*full=1000
+       1 hit(s), first @ line 1079
+  ✅ REQUIRE    \[pstrip\] rollup samples=[0-9]+ redraws=[0-9]+ skipped=[1-9]
+       28 hit(s), first @ line 3983
+  ✅ REQUIRE    \[pstrip\] src live=[1-9][0-9]*/[0-9]+ quantum=[0-9]+ stepres=([0-9]+px|coarse) mono=(yes|no) (PASS|FAIL|SKIP-GEOM)
+       2 hit(s), first @ line 1081
+  ✅ REQUIRE    \[pstrip\] rollup .* srcdelta=[0-9]+ rate=
+       29 hit(s), first @ line 3091
+  ✅ REQUIRE    \[spinhunt\] SYS_EXIT asid=.* 2 sibling thread\(s\) left unjoined; orphan-reap armed
+       1 hit(s), first @ line 2809
+  ❌ REQUIRE    \[spinhunt\] load orphan-window\(leader gone\)
+       0 hits — MISSING (pinned at pi4-regression.spec:1665)
+  ✅ REQUIRE    \[spinhunt\] load settled
+       1 hit(s), first @ line 2970
+  ✅ REQUIRE    SPINHUNT: leader exited status=0 with 2 un-joined yield-polling workers .* drained to 0 live tasks PASS
+       1 hit(s), first @ line 2972
+  ✅ REQUIRE    BGSPREAD: 3 bg launches over [0-9]+ online cores -> cores [0-9]+,[0-9]+,[0-9]+ el0min [0-9]+/[0-9]+,[0-9]+/[0-9]+,[0-9]+/[0-9]+ inmin=3 \(want == 3\) PASS
+       1 hit(s), first @ line 2987
+  ✅ REQUIRE    VUGSPREAD: floor test — tasks=2 cores-used=[2-9] depth=1 tries=[1-9] :: PASS
+       1 hit(s), first @ line 212
+  ✅ REQUIRE    \[clickroute\] hit-test at .*corner=true close=true closereal=true -> PASS
+       1 hit(s), first @ line 2025
+  ✅ REQUIRE    \[clickroute\] hit-test at .*-> \w+ hidden_owner=0x[0-9a-f]+
+       1 hit(s), first @ line 2025
+  ✅ REQUIRE    \[clickroute\] close=win[0-9]+ asid=[0-9]+ at .* settle=noproc-selftest
+       2 hit(s), first @ line 2005
+  ✅ REQUIRE    :: MAILBOX: framebuffer [0-9]+x[0-9]+ pitch=[0-9]+B stride=[0-9]+px base=0x[0-9a-f]+ size=[0-9]+ ::
+       1 hit(s), first @ line 1
+  ✅ REQUIRE    :: TSTE: midden.dispatch -> PASS ::
+       1 hit(s), first @ line 255
+  ✅ REQUIRE    :: TSTE: midden.route -> PASS ::
+       1 hit(s), first @ line 256
+  ✅ REQUIRE    :: TSTE: midden.resolve -> PASS ::
+       1 hit(s), first @ line 257
+  ✅ REQUIRE    :: TSTE: midden.precedence -> PASS ::
+       1 hit(s), first @ line 259
+  ✅ REQUIRE    :: TSTE: shell\.relics\.mv -> PASS ::
+       1 hit(s), first @ line 308
+  ✅ REQUIRE    :: TSTE: layout\.mv -> PASS ::
+       1 hit(s), first @ line 364
+  ✅ REQUIRE    :: TSTE: vfsroute\.route -> PASS ::
+       1 hit(s), first @ line 327
+  ✅ REQUIRE    :: TSTE: shell\.relics\.mv\.xvol -> PASS ::
+       1 hit(s), first @ line 312
+  ✅ REQUIRE    :: TSTE: vfs.aclsym.dir -> PASS ::
+       1 hit(s), first @ line 298
+  ✅ REQUIRE    :: (?:TSTE: vfs.aclsym -> PASS|aclsym: .*vfs.aclsym skipped) ::
+       1 hit(s), first @ line 365
+  ✅ REQUIRE    \[paper\] kit=us-crispy-modern@0787ba9f algo=laid octaves=3 scale=4 amp_q16=1311 seed=0xfbb60e9f base=0xf5f2ea tile=352x64 hash=0x0df2b838251069dc
+       1 hit(s), first @ line 632
+  ✅ REQUIRE    :: PAPER: kit texture .* :: PASS ::
+       1 hit(s), first @ line 2664
+  ✅ REQUIRE    \[ceramic\] derived=peter-2026-08-09 algo=brushed-1d grain_oct=2 pitch=2 grain_amp_q16=786 curve_amp_q16=524 ctrl_gain_q16=32768 seed=0x75ae10b7 rows=128 hash=0x2c525bfdb49df67d
+       1 hit(s), first @ line 611
+  ✅ REQUIRE    :: CERAMIC: brushed material .* :: PASS ::
+       1 hit(s), first @ line 2666
+  ✅ REQUIRE    \[knurl\] derived=peter-2026-08-09 algo=crosshatch-2x45 pitch=4 amp_a_q16=656 amp_b_q16=655 budget_q16=1311 box=[1-9][0-9]* tile=4x4 hash=0x56957202a422b4b1
+       1 hit(s), first @ line 612
+  ✅ REQUIRE    :: KNURL: crosshatch material .* :: PASS ::
+       1 hit(s), first @ line 2669
+  ✅ REQUIRE    :: KNURL: .* paper=0x0df2b838251069dc ceramic=0x2c525bfdb49df67d unchanged
+       1 hit(s), first @ line 2669
+  ✅ REQUIRE    :: TERMRING: transport ring slots=64 len=240 .* :: PASS ::
+       1 hit(s), first @ line 3266
+  ❌ REQUIRE    :: WMCTRL: controls-declined — floor=[1-9][0-9]* .* furniture close=true minzoom=true packed=true/Some.* silent=true reaped=true :: PASS ::
+       0 hits — MISSING (pinned at pi4-regression.spec:2302)
+  ✅ REQUIRE    :: STOR2-MV: .* :: PASS \[w=0x3f/0x3f\] ::
+       1 hit(s), first @ line 3777
+  ✅ REQUIRE    :: LFNMV: sys_rename_long=-EINVAL shell_mv_long=ok alias_leak=false readback=ok \(aarch64: .* -> PASS ::
+       1 hit(s), first @ line 3785
+  ✅ COUNT>=26  :: (?:(?:[0-9A-DF-RT-Za-z_\-]|E[0-9A-KM-WYZa-z_\-]|EL[0-9A-EG-Za-z_\-]|ELF[02-9A-Za-z_\-]|ELF1[0-9A-Za-z_\-]|EX[0-9A-DF-Za-z_\-]|EXE[0-9ABD-Za-z_\-]|EXEC[02-9A-Za-z_]|EXEC\-[0-9A-TV-Za-z_\-]|EXEC\-U[0-9A-UW-Za-z_\-]|EXEC\-UV[0-9A-TV-Za-z_\-]|EXEC\-UVU[0-9A-FH-Za-z_\-]|EXEC\-UVUG[0-9A-Za-z_\-]|EXEC1[0-9A-Za-z_\-]|S[0-9A-DF-Za-z_\-]|SE[0-9A-QS-Za-z_\-]|SER[0-9A-VX-Za-z_\-]|SERW[0-9A-HJ-Za-z_\-]|SERWI[0-9A-SU-Za-z_\-]|SERWIT[0-9A-Za-z_]|SERWIT\-[013-9A-Za-z_\-]|SERWIT\-2[0-9A-Za-z_\-])[A-Za-z0-9_-]*|E|EL|ELF|EX|EXE|EXEC|EXEC\-|EXEC\-U|EXEC\-UV|EXEC\-UVU|S|SE|SER|SERW|SERWI|SERWIT|SERWIT\-): .*-> PASS ::
+       391 hit(s), first @ line 46
+  ✅ COUNT>=6   CAPSTONE \w+: PASS
+       6 hit(s), first @ line 184
+  ✅ PENDING    \[taskexit\] tid=\d+ name='[^']+' core=\d+ reason=(exit|killed)
+       59 hit(s), first @ line 81 — MATCHED: consider promoting to REQUIRE
+  ✅ OPTIONAL   K1-atr:.*codec PASS
+       1 hit(s), first @ line 1076
+  ◦ OPTIONAL   \[kfont\] repaint shell epoch=[1-9][0-9]* console_rows=[1-9]
+       0 hits (informational)
+  ◦ OPTIONAL   :: OVERLAYS: launcher=ok appswitch=skip\(x86\) .* -> PASS ::
+       0 hits (informational)
+  ◦ OPTIONAL   :: BOOTLIST: ran=[0-9]+ pass=[0-9]+ fail=[0-9]+ skip=[0-9]+ heavy=
+       0 hits (informational)
+  ❌ FORBID*    -> FAIL
+       25 hit(s), first @ line 645: [wc-d] verify win=1 surf=560x208 band=0..112 scale=1x at (40,38) panel=640x480 checked=62720 bad_cache=209 bad_ram=209 ram_indep=yes moved=15 sprite_px=0 nonzero=9415 occluded=0 occ=0/0 cksum=0x0611f64d63216b48 first=(40,38) got=0xbcbec2 want=0x000000 fills=1->1 fact=0/0 desk=0->0 dact=0/0 -> FAIL
+  ❌ FORBID*    FAIL ::
+       2 hit(s), first @ line 680: :: SHARD-PRESS: menu=250x277+0+34 panel=640x480 routed=true(open) opened=true painted=false dismissed=true(dismiss) closed=true erased=true :: FAIL ::
+  ✅ FORBID*    PANIC
+       0 hits
+  ✅ FORBID*    -> FLICKER
+       0 hits
+  ✅ FORBID     :: SERWIT-2: FAIL —
+       0 hits
+  ✅ FORBID     :: BOT-PARK: selftest .*-> FAIL ::
+       0 hits
+  ✅ FORBID     :: ERET-SCRUB: first-entry residue or=
+       0 hits
+  ✅ FORBID     :: ERET-SCRUB: syscall-return residue bitmap=
+       0 hits
+  ✅ FORBID     :: ERET-SCRUB: witness entries not latched
+       0 hits
+  ✅ FORBID     \[u7fix\] .*child parked [0-9]+ms before GO \(parked_out=[1-9]
+       0 hits
+  ✅ FORBID     \[u7fix\] .*parent parked [0-9]+ms before GO \(parked_out=true
+       0 hits
+  ✅ FORBID     \[u11fix\] .*B parked [0-9]+ms before unlink-GO \(parked_out=[1-9]
+       0 hits
+  ✅ FORBID     \[u11fix\] .*before read-GO \(parked_out=true
+       0 hits
+  ✅ FORBID     \[u11fix\] .*before close-GO \(parked_out=true
+       0 hits
+  ✅ FORBID     R1 error status
+       0 hits
+  ✅ FORBID     programming-busy timeout
+       0 hits
+  ✅ FORBID     AARCH64 EXCEPTION
+       0 hits
+  ◦ FORBID     K9-parity:.*discarded residue FAIL
+       0 hits — UNREACHABLE: its literal "discarded residue FAIL" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     K4-write:.*FAIL
+       0 hits
+  ✅ FORBID     K8a-cow:.*FAIL
+       0 hits
+  ✅ FORBID     K8b-snap:.*FAIL
+       0 hits
+  ✅ FORBID     K8c-snapread:.*FAIL
+       0 hits
+  ✅ FORBID     IMG-SIG:.*FAIL
+       0 hits
+  ✅ FORBID     FATDIRS:.*FAIL
+       0 hits
+  ✅ FORBID     FATMOVE:.*FAIL
+       0 hits
+  ✅ FORBID     K6-migrate:.*FAIL
+       0 hits
+  ✅ FORBID     BANDY-CODEC:.*FAIL
+       0 hits
+  ✅ FORBID     BANDY-CODEC2:.*FAIL
+       0 hits
+  ✅ FORBID     BANDY-STAMP:.*FAIL
+       0 hits
+  ✅ FORBID     BANDY-RT:.*FAIL
+       0 hits
+  ✅ FORBID     BANDY-EQ:.*FAIL
+       0 hits
+  ✅ FORBID     BANDY-WR:.*FAIL
+       0 hits
+  ✅ FORBID     BANDY-EQ2:.*FAIL
+       0 hits
+  ✅ FORBID     BANDY-ACL:.*FAIL
+       0 hits
+  ✅ FORBID     BANDY-GRANT:.*FAIL
+       0 hits
+  ✅ FORBID     USER: input router.*FAIL
+       0 hits
+  ❌ FORBID     \[wc-d\] verify .*-> FAIL
+       22 hit(s), first @ line 645: [wc-d] verify win=1 surf=560x208 band=0..112 scale=1x at (40,38) panel=640x480 checked=62720 bad_cache=209 bad_ram=209 ram_indep=yes moved=15 sprite_px=0 nonzero=9415 occluded=0 occ=0/0 cksum=0x0611f64d63216b48 first=(40,38) got=0xbcbec2 want=0x000000 fills=1->1 fact=0/0 desk=0->0 dact=0/0 -> FAIL
+  ✅ FORBID     \[wc-b\] rollup .* amp=(?:$|[^1]|1(?:$|[^.]|\.(?:$|[^0]|0(?:$|[^0]|0(?:$|[^x])))))
+       0 hits
+  ✅ FORBID     :: \[wedge1\] DRAIN ABANDONED
+       0 hits
+  ✅ FORBID     \[wedge1\] dwell .*-> ABANDONED
+       0 hits
+  ✅ FORBID     \[wedge1\] dwell .*abandoned=[1-9]
+       0 hits
+  ❌ FORBID     \[wc-fv\] focus-vis .*-> FAIL
+       1 hit(s), first @ line 1586: [wc-fv] focus-vis at (214,155) a=0xff2020 b=0x20ff20 stack=0x20ff20/true raise=0xff2020/true shell=0xf5f7fb/false reraise=0x20ff20/true -> FAIL
+  ✅ FORBID     BGRUN-ST: .*-> FAIL
+       0 hits
+  ✅ FORBID     KILLBOUND: .*-> FAIL
+       0 hits
+  ✅ FORBID     \[wc-e\] fb-geometry query FAILED
+       0 hits
+  ✅ FORBID     \[wc-f\] scanout .*-> FAIL
+       0 hits
+  ✅ FORBID     \[wc-f\] scanout -> SKIP
+       0 hits
+  ✅ FORBID     \[wc-f\] twin .*-> FAIL
+       0 hits
+  ✅ FORBID     \[wc-f\] twin -> SKIP
+       0 hits
+  ✅ FORBID     \[chrome-truth\] defers=.*exhausted=true
+       0 hits
+  ◦ FORBID     \[wc-g\] .*-> COHER
+       0 hits — UNREACHABLE: its literal "-> COHER" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     \[wc-g\] .*-> RACE
+       0 hits
+  ❌ FORBID     \[wc-g\] .*-> BLIT
+       31 hit(s), first @ line 614: [wc-g] win=1 seq=0 own=no scale=1x app=0xcbf29ce484222325 blit=0x88c9ab06b55a5325 civac=0x88c9ab06b55a5325 after=0x88c9ab06b55a5325 fbbad=974/116480 occluded=0 occ=0/0 us=17136 rectscan_us=7222 slow=yes -> BLIT
+  ✅ FORBID     \[wc-h\] .*presspread=[0-9] presspop=([2-9]|[0-9]{2,}) .*-> AT-RISK
+       0 hits
+  ◦ FORBID     \[wc-h\] .*-> UNSTAGED
+       0 hits — UNREACHABLE: its literal "-> UNSTAGED" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ◦ FORBID     \[cursor5\] .*-> REGRESSED
+       0 hits — UNREACHABLE: its literal "-> REGRESSED" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     \[cursor5\] .*drain_insession=[1-9]
+       0 hits
+  ✅ FORBID     \[wc-j\] .*-> FAIL
+       0 hits
+  ✅ FORBID     \[wc-k\] .*staged=no
+       0 hits
+  ✅ FORBID     \[wc-k\] .*-> DIRECT
+       0 hits
+  ✅ FORBID     \[wc-k\] .*contig=no
+       0 hits
+  ◦ FORBID     \[wc-k\] .*-> SPLIT
+       0 hits — UNREACHABLE: its literal "-> SPLIT" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     \[wc-k\] .*-> AT-RISK
+       0 hits
+  ◦ FORBID     \[wc-k\] .*-> UNSTAGED
+       0 hits — UNREACHABLE: its literal "-> UNSTAGED" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     \[wc-k\] .*-> LOST
+       0 hits
+  ✅ FORBID     \[wc-k\] .*-> STARVED
+       0 hits
+  ◦ FORBID     \[wc-k\] .*-> UNPUBLISHED
+       0 hits — UNREACHABLE: its literal "-> UNPUBLISHED" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     \[wc-k\] .*outside=[1-9]
+       0 hits
+  ✅ FORBID     \[pstrip\] armed .*panel=\([0-9]+,[0-9]+,0x[0-9]+\)
+       0 hits
+  ✅ FORBID     \[pstrip\] armed .*row_h=0
+       0 hits
+  ✅ FORBID     \[pstrip\] armed .*leds=[0-9] led=
+       0 hits
+  ✅ FORBID     \[pstrip\] rollup .*\bsamples=[1-9][0-9]*\b.*\bskipped=0\b.*\bsrcdelta=0\b
+       0 hits
+  ✅ FORBID     \[pstrip\] src live=0/
+       0 hits
+  ✅ FORBID     \[pstrip\] src .*stepres=0px
+       0 hits
+  ✅ FORBID     \[pstrip\] src .*mono=no
+       0 hits
+  ✅ FORBID     \[pstrip\] src .*FAIL
+       0 hits
+  ✅ FORBID     \[pstrip\] src .*SKIP-ARCH
+       0 hits
+  ✅ FORBID     \[pstrip\] rollup .*rate=([6-9]|[1-9][0-9]+)\.[0-9]/s
+       0 hits
+  ✅ FORBID     SPINHUNT: .*-> FAIL
+       0 hits
+  ✅ FORBID     REFUSING corrupt switch-in: task=
+       0 hits
+  ✅ FORBID     BGSPREAD: .*-> FAIL
+       0 hits
+  ✅ FORBID     VUGSPREAD: floor test .*:: FAIL
+       0 hits
+  ✅ FORBID     \[spread2\] .* ratio ([5-9][0-9]{2}|[0-9]{4,})
+       0 hits
+  ✅ FORBID     \[clickroute\] close=.* settle=noproc$
+       0 hits
+  ✅ FORBID     \[clickroute\] hit-test teardown LEAK
+       0 hits
+  ◦ FORBID     :: MAILBOX: timeout waiting for write FIFO
+       0 hits — UNREACHABLE: its literal ":: MAILBOX: timeout waiting for write FIFO" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ◦ FORBID     :: MAILBOX: timeout \(only other-channel replies\)
+       0 hits — UNREACHABLE: its literal ":: MAILBOX: timeout (only other-channel replies)" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     :: MAILBOX: timeout .* drained [1-9]
+       0 hits
+  ✅ FORBID     :: MAILBOX: BUSY
+       0 hits
+  ✅ FORBID     M6b: EL0 fault isolation FAIL
+       0 hits
+  ✅ FORBID     M6g: disk-loaded EL0 program FAIL
+       0 hits
+  ✅ FORBID     U4: process model FAIL
+       0 hits
+  ✅ FORBID     U5: capabilities FAIL
+       0 hits
+  ✅ FORBID     U6: general object table FAIL
+       0 hits
+  ✅ FORBID     U6b: real File handles FAIL
+       0 hits
+  ✅ FORBID     U7: cross-process transfer FAIL
+       0 hits
+  ✅ FORBID     U8: revocation trees FAIL
+       0 hits
+  ✅ FORBID     U9: real File writes FAIL
+       0 hits
+  ✅ FORBID     U10: file growth FAIL
+       0 hits
+  ✅ FORBID     U10-create: file create FAIL
+       0 hits
+  ✅ FORBID     U10-delete: file delete FAIL
+       0 hits
+  ✅ FORBID     U11: open-file lifecycle FAIL
+       0 hits
+  ✅ FORBID     U11-defer: cross-process unlink-defers-free FAIL
+       0 hits
+  ✅ FORBID     U11-reuse: .*orphan-head sweep FAIL
+       0 hits
+  ✅ FORBID     U11-reap: teardown-last-close reaper FAIL
+       0 hits
+  ✅ FORBID     U6-grants: owner/grants FAIL
+       0 hits
+  ✅ FORBID     K1-persist:.*rebuild\+enforce FAIL
+       0 hits
+  ◦ FORBID     K1-corrupt:.*at boot FAIL
+       0 hits — UNREACHABLE: its literal "at boot FAIL" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     F2-witness:.*-> SERIALIZATION REGRESSION
+       0 hits
+  ✅ FORBID     F3-witness:.*-> SERIALIZATION REGRESSION
+       0 hits
+  ✅ FORBID     K2-liveenf:.*rebuild\+enforce FAIL
+       0 hits
+  ◦ FORBID     K3-revoke:.*durable-first FAIL
+       0 hits — UNREACHABLE: its literal "durable-first FAIL" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ◦ FORBID     K3-mount:.*byte-verified FAIL
+       0 hits — UNREACHABLE: its literal "byte-verified FAIL" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     K3-mount: located but mount FAILED
+       0 hits
+  ◦ FORBID     K4-ready:.*prefix\) FAIL
+       0 hits — UNREACHABLE: its literal "prefix) FAIL" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     :: UVUG: frames=[0-9]+ threads=[0-9]+ checksum=(?:$|[^0]|0(?:$|[^x]|x(?:$|[^f]|f(?:$|[^1]|1(?:$|[^8]|8(?:$|[^f]|f(?:$|[^9]|9(?:$|[^8]|8(?:$|[^3]|3(?:$|[^5]|5(?:$|[^5]|5(?:$|[^7]|7(?:$|[^b]|b(?:$|[^8]|8(?:$|[^7]|7(?:$|[^a]|a(?:$|[^5]|5(?:$|[^5]))))))))))))))))))
+       0 hits
+  ✅ FORBID     \[inroute\] router window — (?:$|[^r]|r(?:$|[^o]|o(?:$|[^u]|u(?:$|[^t]|t(?:$|[^e]|e(?:$|[^d]|d(?:$|[^=]|=(?:$|[^2]|2(?:$|[^ ]| (?:$|[^s]|s(?:$|[^t]|t(?:$|[^a]|a(?:$|[^l]|l(?:$|[^e]|e(?:$|[^_]|_(?:$|[^d]|d(?:$|[^r]|r(?:$|[^o]|o(?:$|[^p]|p(?:$|[^p]|p(?:$|[^e]|e(?:$|[^d]|d(?:$|[^=]|=(?:$|[^1]|1(?:$|[^ ]| (?:$|[^r]|r(?:$|[^e]|e(?:$|[^v]|v(?:$|[^o]|o(?:$|[^k]|k(?:$|[^e]|e(?:$|[^s]|s(?:$|[^=]|=(?:$|[^0]))))))))))))))))))))))))))))))))))
+       0 hits
+  ✅ FORBID     \[wc-c\] side-by-side (?:$|[^w]|w(?:$|[^i]|i(?:$|[^n]|n(?:$|[^d]|d(?:$|[^o]|o(?:$|[^w]|w(?:$|[^s]|s(?:$|[^=]|=(?:$|[^2]|2(?:$|[^ ]| (?:$|[^d]|d(?:$|[^r]|r(?:$|[^a]|a(?:$|[^w]|w(?:$|[^n]|n(?:$|[^=]|=(?:$|[^2])))))))))))))))))
+       0 hits
+  ◦ FORBID     BGRUN-ST: process table capacity = (?:0 rows|[0-9]+ rows \(bg programs alive at once; EL0 slots [0-9])
+       0 hits — UNREACHABLE: its literal " rows (bg programs alive at once; EL0 slots " has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     \[wc-e\] fb-geometry .*row_ok=false
+       0 hits
+  ✅ FORBID     \[wc-e\] fb-geometry .*fit_ok=false
+       0 hits
+  ◦ FORBID     \[cursor3\] .*-> INCOHERENT
+       0 hits — UNREACHABLE: its literal "-> INCOHERENT" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ◦ FORBID     \[cursor6\] .*-> OVERWRITTEN
+       0 hits — UNREACHABLE: its literal "-> OVERWRITTEN" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     \[pstrip\] armed .*full=(?:[02-9]|1(?:$|[^0]|0(?:$|[^0]|0(?:$|[^0]|0(?:$|[^ ])))))
+       0 hits
+  ◦ FORBID     \[spinhunt\] SYS_EXIT .*orphan-reap NOT ARMED
+       0 hits — UNREACHABLE: its literal "orphan-reap NOT ARMED" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ◦ FORBID     :: TSTE: midden\.\w+ -> FAIL
+       0 hits — UNREACHABLE: its literal ":: TSTE: midden." has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ◦ FORBID     :: TSTE: vfs\.aclsym[\w.]* -> FAIL
+       0 hits — UNREACHABLE: its literal ":: TSTE: vfs.aclsym" has 0 hits in pi_baremetal/ (a check that cannot fire is an absent one, LAWS §5)
+  ✅ FORBID     aclsym: .*vfs\.aclsym skipped
+       0 hits
+  ✅ FORBID     :: PAPER: .* :: FAIL ::
+       0 hits
+  ✅ FORBID     :: CERAMIC: .* :: FAIL ::
+       0 hits
+  ✅ FORBID     :: KNURL: .* :: FAIL ::
+       0 hits
+  ✅ FORBID     :: WMCTRL: .* :: FAIL ::
+       0 hits
+  ✅ FORBID     \[dragperf\] .* -> FAIL
+       0 hits
+  ✅ FORBID     \[dragwedge\] .* -> FAIL
+       0 hits
+  ✅ FORBID     \[dragwedge\] .* arm_skip=false
+       0 hits
+  ✅ FORBID     \[dragwedge\] .* rescue=false
+       0 hits
+  ❌ FORBID     :: SHARD-PRESS: .* :: FAIL ::
+       1 hit(s), first @ line 680: :: SHARD-PRESS: menu=250x277+0+34 panel=640x480 routed=true(open) opened=true painted=false dismissed=true(dismiss) closed=true erased=true :: FAIL ::
+  ✅ FORBID     \[menubar\] .* press=inert
+       0 hits
+  ✅ FORBID     \[serfocus\] split .* :: FAIL ::
+       0 hits
+  ✅ FORBID     :: QUARRY: .* :: FAIL ::
+       0 hits
+  ✅ FORBID     :: STOR2-MV: aarch64 SYS_RENAME FAIL
+       0 hits
+  ✅ FORBID     :: LFNMV: SKIPPED
+       0 hits
+  ✅ FORBID     :: LFNMV: .* -> FAIL ::
+       0 hits
+  ✅ FORBID     \[textscale\] win=shell css=[0-9]+ grow=[0-9]+ rows_ok=0
+       0 hits
+  ✅ FORBID     :: OVERLAYS: .* -> FAIL ::
+       0 hits
+  ✅ FORBID     :: BOOTLIST: .* -> FAIL ::
+       0 hits
+  ─────
+  ❌ MBENCH FAIL — 122/128 required witnesses, 82 forbidden hit(s), 45703 lines scanned, pending 1/1 matched, 19 unreachable FORBID(s) [full wall 300.2s]
+       FIRST-SHORTFALL pi4-regression.spec:364 REQUIRE K1-persist:.*SURVIVE REBOOT.*PASS
+       (5 further pinned line(s) also short — full table above)
+       (the end-of-run marker was seen — the run completed, so a missing witness here is a GENUINE regression)
+  (* = default FORBID, always on)
+⚡ mbench: asserting the armed desktop against scripts/specs/pi4-desktop.spec
+  ❌ FORBID hit @ line 645: [wc-d] verify win=1 surf=560x208 band=0..112 scale=1x at (40,38) panel=640x480 checked=62720 bad_cache=209 bad_ram=209 ram_indep=yes moved=15 sprite_px=0 nonzero=9415 occluded=0 occ=0/0 cksum=0x0611f64d63216b48 first=(40,38) got=0xbcbec2 want=0x000000 fills=1->1 fact=0/0 desk=0->0 dact=0/0 -> FAIL
+  ❌ FORBID hit @ line 680: :: SHARD-PRESS: menu=250x277+0+34 panel=640x480 routed=true(open) opened=true painted=false dismissed=true(dismiss) closed=true erased=true :: FAIL ::
+════════════ MBENCH VERDICT — pi4-desktop.spec vs /home/pmes/src/github.com/pmes/UnaOS-rmbp/unaos/target/serial-pi.log ════════════
+  ✅ REQUIRE    \[deskfw\] activate panel=[0-9]+x[0-9]+ console_win=[0-9]+ routed=true
+       1 hit(s), first @ line 672
+  ❌ REQUIRE    :: SHARD-PRESS: .* :: PASS ::
+       0 hits — MISSING (pinned at pi4-desktop.spec:35)
+  ✅ REQUIRE    \[dragperf\] panel=[0-9]+x[0-9]+ .* -> PASS
+       1 hit(s), first @ line 2407
+  ✅ REQUIRE    \[dragwedge\] furniture aimed=.* -> PASS
+       1 hit(s), first @ line 2623
+  ◦ OPTIONAL   \[desktop\] built at=
+       0 hits (informational)
+  ◦ OPTIONAL   \[kfont\] repaint shell epoch=[1-9][0-9]* console_rows=[1-9]
+       0 hits (informational)
+  ◦ OPTIONAL   :: OVERLAYS: launcher=ok appswitch=skip\(x86\) .* -> PASS ::
+       0 hits (informational)
+  ◦ OPTIONAL   :: TEXTSCALE: steps=[0-9]+ .* -> PASS ::
+       0 hits (informational)
+  ◦ OPTIONAL   \[textscale\] win=shell css=[0-9]+ grow=[0-9]+ rows_ok=1
+       0 hits (informational)
+  ◦ OPTIONAL   :: BOOTLIST: ran=[0-9]+ pass=[0-9]+
+       0 hits (informational)
+  ◦ OPTIONAL   \[keyboot\] unlock form up kdf_pending=1
+       0 hits (informational)
+  ◦ OPTIONAL   \[keyboot\] unlock kdf_ms=[0-9]+ -> ok
+       0 hits (informational)
+  ❌ FORBID*    -> FAIL
+       25 hit(s), first @ line 645: [wc-d] verify win=1 surf=560x208 band=0..112 scale=1x at (40,38) panel=640x480 checked=62720 bad_cache=209 bad_ram=209 ram_indep=yes moved=15 sprite_px=0 nonzero=9415 occluded=0 occ=0/0 cksum=0x0611f64d63216b48 first=(40,38) got=0xbcbec2 want=0x000000 fills=1->1 fact=0/0 desk=0->0 dact=0/0 -> FAIL
+  ❌ FORBID*    FAIL ::
+       2 hit(s), first @ line 680: :: SHARD-PRESS: menu=250x277+0+34 panel=640x480 routed=true(open) opened=true painted=false dismissed=true(dismiss) closed=true erased=true :: FAIL ::
+  ✅ FORBID*    PANIC
+       0 hits
+  ✅ FORBID*    -> FLICKER
+       0 hits
+  ─────
+  ❌ MBENCH FAIL — 3/4 required witnesses, 27 forbidden hit(s), 45703 lines scanned [full wall 300.2s]
+       FIRST-SHORTFALL pi4-desktop.spec:35 REQUIRE :: SHARD-PRESS: .* :: PASS ::
+  (* = default FORBID, always on)
+✖ kernel8-test: the armed desktop's spec did not pass (rc 1) — a REQUIREd desktop_firmware line is
+  missing or reads FAIL (its FAIL forbid in pi4-regression.spec says which). Spec: scripts/specs/pi4-desktop.spec
