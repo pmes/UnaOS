@@ -757,3 +757,13 @@ refs/heads/exec-rmbp-stackguard3   6516102c8 FOLDED-BY-HAND (this commit) 2026-1
 refs/heads/exec-rmbp-cardregistry   c9d155994 FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-navread   ad3b4fe55 FOLDED-BY-HAND (this commit) 2026-10-26
 refs/heads/exec-rmbp-zoomcost   731d173b0 FOLDED-BY-HAND (this commit) 2026-10-26
+refs/heads/exec-rmbp-aetherfit   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-truststage   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-portreset   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-heldmap   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pumppark   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-shimmerpresent   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-navtravel   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-zoompanel   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-stationwatch   df909c747 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-ticketowner   df909c747 IN-FLIGHT cut 2026-10-27
