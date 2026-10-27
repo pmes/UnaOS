@@ -38,7 +38,7 @@ use gneiss_pal::dsp::audio::{self as ac, AudioDecoder};
 use gneiss_pal::dsp::audio_track::{AudioTrackDecoder, Timing, audio_decoder_for};
 use gneiss_pal::dsp::avsync::{Decision, DriftMeter, DriftReport, MasterClock, SchedStats, Scheduler, TimeSource};
 use gneiss_pal::dsp::demux::{Demuxer, Packet, Track, TrackKind};
-use gneiss_pal::dsp::video::{DecodeError, Frame, TestPattern, VideoDecoder, decoder_for, reorder_depth, colour_of};
+use gneiss_pal::dsp::video::{Frame, TestPattern, VideoDecoder, decoder_for, reorder_depth, colour_of};
 
 /// Where presented frames (and the audio meters) go.
 pub trait FrameSink {
@@ -256,6 +256,8 @@ pub struct Player {
     /// EDITMAP (SR223): the stream's whole edit list as clips at ns ticks ([`Player::edit_segments`]); playback still
     /// follows the first media edit.
     edit_map: Vec<timeline_core::Clip>,
+    /// SWAPBACK (SR329): the video stream's swap state (the parked real decoder while the stand-in plays); tick thread only.
+    vswap: crate::decode_swap::DecodeSwap,
 }
 
 /// AETHERMEDIA2 (SR134): a live session's resume state.
@@ -470,6 +472,7 @@ impl Player {
             start_ns,
             info,
             edit_map,
+            vswap: Default::default(),
         })
     }
 
@@ -723,11 +726,10 @@ impl Player {
             }
         }
         if Some(p.track) == self.vtrack.as_ref().map(|t| t.id) {
-            if let Some(v) = self.vdec.as_mut() {
-                match v.decode(&p) {
-                    Ok(Some(f)) => self.insert_frame(f),
-                    Ok(None) => {}
-                    Err(e) => self.video_decode_failed(e, &p),
+            if let (Some(v), Some(vt)) = (self.vdec.as_mut(), self.vtrack.as_ref()) {
+                match self.vswap.decode(v, vt, &p) {
+                    Ok(d) => self.video_decoded(d),
+                    Err(e) => log::warn!("[STRIA] :: video decode: {e}"),
                 }
             }
         } else if let Some(AudioSrc::Track { track, dec }) = self.audio.as_mut() {
@@ -1061,29 +1063,20 @@ fn edit_map_of(demux: Option<&Demuxer>, vtrack: Option<&Track>) -> Vec<timeline_
     }
 }
 
-/// HEVCPAL-SWAP (LEDGER SR304): a decoder that refuses the stream MID-STREAM (`DecodeError::Unsupported`: an in-band SPS
-/// turning 12-bit HEVC (HEVCREXT), an H.264 stream switching to 4:2:2, ...) hands the picture to the labelled stand-in ONCE, as the
-/// open does when no decoder fits: the frames it still holds are drained first, `MediaInfo` says stand-in, one
-/// `video decode: swapped to stand-in` line is logged, and the refused packet is drawn by the stand-in so its interval
-/// is not a gap. Codec-blind (every decoder's refusal is this one error). A corrupt packet, or any error once the
-/// stand-in plays, keeps the per-packet warning. (Swapping back when the stream turns supported again is owed.)
+/// HEVCPAL-SWAP (LEDGER SR304) / SWAPBACK (LEDGER SR329): a decoder that refuses the stream MID-STREAM hands the picture to
+/// the labelled stand-in ONCE and takes it back at a later keyframe it decodes — the swap is [`crate::decode_swap`]'s, shared
+/// with the editor; the Player presents the frames it gave in order and, on a swap, `MediaInfo` says which decoder plays
+/// (`real_video`, `video_decoder`). A corrupt packet, or any error once the stand-in plays, keeps the per-packet warning.
 impl Player {
-    fn video_decode_failed(&mut self, e: DecodeError, p: &Packet) {
-        let (DecodeError::Unsupported(_), true, Some(vt)) = (&e, self.info.real_video, self.vtrack.as_ref()) else {
-            log::warn!("[STRIA] :: video decode: {e}");
-            return;
-        };
-        let mut stand_in: Box<dyn VideoDecoder> = Box::new(TestPattern::stand_in(vt));
-        let held = self.vdec.as_mut().map(|d| d.flush()).unwrap_or_default();
-        for f in held {
+    fn video_decoded(&mut self, d: crate::decode_swap::Decoded) {
+        for f in d.frames {
             self.insert_frame(f);
         }
-        log::warn!("[STRIA] :: video decode: swapped to stand-in: {e}");
-        self.info.real_video = stand_in.is_real();
-        self.info.video_decoder = stand_in.name().to_string();
-        if let Ok(Some(f)) = stand_in.decode(p) {
-            self.insert_frame(f);
+        if d.swap.is_some() {
+            if let Some(v) = self.vdec.as_ref() {
+                self.info.real_video = v.is_real();
+                self.info.video_decoder = v.name().to_string();
+            }
         }
-        self.vdec = Some(stand_in);
     }
 }

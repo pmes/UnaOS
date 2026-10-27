@@ -678,3 +678,104 @@ fn meterplayer_rms_of_a_stereo_sine_through_the_players_sink() {
         assert!((pk[0] - 0.5).abs() < 0.001 && (pk[1] - 0.25).abs() < 0.001, "window {k}: peaks {pk:?}");
     }
 }
+
+// SWAPBACK (LEDGER SR329): an HEVC reel whose sample 1 turns 12-bit (an in-band HEVC_SPS_12BIT), sample 2 a bare IDR still
+// inside the 12-bit span, and sample 3 8-bit again (the in-band HEVC_SPS): the one `stria::decode_swap` takes the
+// Player and the editor to the stand-in at sample 1 and back at sample 3's keyframe.
+fn swapback_reel() -> Vec<u8> {
+    let mut t = hevc_kat_track(6);
+    for (i, sps) in [(1usize, &HEVC_SPS_12BIT[..]), (3, &HEVC_SPS[..])] {
+        let mut s = Vec::new();
+        for unit in [sps, &HEVC_PPS[..], &HEVC_IDR[..]] {
+            s.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+            s.extend_from_slice(unit);
+        }
+        t.samples[i].data = s;
+    }
+    build::mp4(&[t], &Mp4Options::default())
+}
+
+/// The flat-128 KAT picture (Y = U = V = 128) through `Frame::to_rgba`, pinned (BT.601 limited range: (128 - 16) * 255 / 219).
+const SWAPBACK_FLAT: [u8; 4] = [130, 130, 130, 255];
+
+/// Frame `i` of the swapback reel as the rule says it shows: the stand-in's counter for samples 1-2, flat for the rest.
+fn swapback_expected(i: usize, rgba: &[u8]) {
+    if i == 1 || i == 2 {
+        assert_eq!(rgba, &TestPattern::render(64, 48, i as u32)[..], "frame {i} is not the stand-in");
+    } else {
+        assert!(rgba.chunks(4).all(|p| p == SWAPBACK_FLAT), "frame {i} is not flat {:?}", &rgba[..4]);
+    }
+}
+
+#[derive(Default)]
+struct RgbaSink {
+    shown: Vec<(i64, Vec<u8>)>,
+}
+impl FrameSink for RgbaSink {
+    fn present(&mut self, f: &Frame, _ordinal: u64) {
+        self.shown.push((f.pts_ns, f.to_rgba()));
+    }
+}
+
+/// Rule: the Player swaps to the stand-in ONCE at the 12-bit sample and back ONCE at the later 8-bit keyframe (the bare
+/// IDR between is offered to the parked decoder and refused, since it keeps the in-band 12-bit SPS); two log lines, every
+/// sample presents a frame, real pixels after the swap back, and `MediaInfo` names the real decoder again.
+#[test]
+fn swapback_player_returns_to_the_real_decoder_at_the_8bit_keyframe() {
+    capture_logs();
+    let time = ManualTime::new();
+    let mut p = Player::open(swapback_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    assert_eq!(p.info().video_decoder, "hevc (hevc_core)");
+    p.play();
+    let mut sink = RgbaSink::default();
+    for _ in 0..200 {
+        if p.tick(&mut sink) == Tick::Ended {
+            break;
+        }
+        time.advance(16_666_667);
+    }
+    let lines = my_log_lines("[STRIA] :: video decode:");
+    assert_eq!(
+        lines,
+        [
+            "[STRIA] :: video decode: swapped to stand-in: no decoder: hevc: unsupported (bit depth above 10 (HEVCREXT))",
+            "[STRIA] :: video decode: swapped back at 120000000",
+        ],
+    );
+    assert!(p.info().real_video);
+    assert_eq!(p.info().video_decoder, "hevc (hevc_core)");
+    assert_eq!(sink.shown.iter().map(|s| s.0).collect::<Vec<_>>(), (0..6).map(|i| i * 40_000_000).collect::<Vec<i64>>());
+    for (i, (_, rgba)) in sink.shown.iter().enumerate() {
+        swapback_expected(i, rgba);
+    }
+    println!("swapback: {} | {} | frames={}", lines[0], lines[1], sink.shown.len());
+}
+
+/// Rule: the editor's render over the same reel draws the stand-in for the 12-bit span and real frames after it (today's
+/// render failed whole on the refusal), and the reel's open report says ` decode=stand-in` only once a render drew it.
+#[test]
+fn swapback_editor_renders_the_stand_in_span_and_reports_it() {
+    use stria::nle::{RenderSink, Sources, render};
+    use timeline_core::SourceId;
+    struct Frames(Vec<(i64, Vec<u8>)>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, out_t: i64, w: u32, h: u32, rgba: &[u8]) {
+            assert_eq!((w, h), (64, 48));
+            self.0.push((out_t, rgba.to_vec()));
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    let (tl, src) = Sources::from_media("A", &swapback_reel(), 25).unwrap().unwrap();
+    let before = src.open_report(SourceId(0)).unwrap().to_string();
+    assert!(!before.contains("decode="), "{before}");
+    let mut sink = Frames(Vec::new());
+    let r = render(&tl, 0..6, &src, &mut sink).unwrap();
+    assert_eq!(r.frames, 6);
+    assert_eq!(sink.0.iter().map(|f| f.0).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5]);
+    for (i, (_, rgba)) in sink.0.iter().enumerate() {
+        swapback_expected(i, rgba);
+    }
+    let after = src.open_report(SourceId(0)).unwrap().to_string();
+    assert_eq!(after, format!("{before} decode=stand-in"));
+    println!("swapback: editor {after}");
+}

@@ -883,7 +883,7 @@ refs/heads/exec-rmbp-pdfwrite   aec1d01c7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdfforms   aec1d01c7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdftransparency   aec1d01c7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-colourone   aec1d01c7 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-swapback   aec1d01c7 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-swapback   1fb7f6f07 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-cryptoone   aec1d01c7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-pdffax   aec1d01c7 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-surfaceid   aec1d01c7 IN-FLIGHT cut 2026-10-27

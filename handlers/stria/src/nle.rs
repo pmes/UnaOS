@@ -52,6 +52,8 @@ use gneiss_pal::dsp::demux::{DecodeTime, Demuxer, TrackKind, build};
 use gneiss_pal::dsp::video::{Frame, VideoDecoder, decoder_for, reorder_depth, colour_of};
 use timeline_core::schedule::{AudioRun, Layer, ScheduleError, audio_runs, schedule};
 use timeline_core::{Kind, SourceId, SourceIndex, Timebase, Timeline};
+use crate::decode_swap::{DecodeSwap, Swap};
+use gneiss_pal::dsp::demux::Track;
 
 /// Where rendered output goes, in output order.
 pub trait RenderSink {
@@ -176,11 +178,14 @@ pub struct Sources {
     audio_rate: u32,
     /// EDITMAP (SR223): the sources laid from their own edit list ([`Sources::from_media`]) and how many clips it gave.
     applied: Vec<(SourceId, usize)>,
+    /// SWAPBACK (SR329): the sources a render drew stand-in frames for (a mid-reel decoder refusal); locked only for one
+    /// push ([`Sources::note_stand_in`]) or one read ([`Sources::open_report`]), never across a decode.
+    stand_in: std::sync::Mutex<Vec<SourceId>>,
 }
 
 impl Sources {
     pub fn new(tl: &Timeline) -> Sources {
-        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new() }
+        Sources { tb: tl.tb, media: Vec::new(), audio_rate: 0, applied: Vec::new(), stand_in: Default::default() }
     }
     /// NLE4: render audio at `hz` (sources at other rates are resampled); 0 = the first scheduled audio source's rate.
     pub fn set_audio_rate(&mut self, hz: u32) {
@@ -202,7 +207,8 @@ impl Sources {
         let i = m.video.or(m.audio)?;
         let s = m.demux.survey().streams.into_iter().nth(i)?;
         let applied = self.applied.iter().find(|a| a.0 == id).map(|a| a.1);
-        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len(), applied, colour: s.colour })
+        let stand_in = self.stand_in.lock().map(|v| v.contains(&id)).unwrap_or(false);
+        Some(OpenReport { indexed: s.indexed, decode_time: s.decode_time, edits: s.edits.len(), applied, colour: s.colour, stand_in })
     }
 }
 
@@ -220,6 +226,8 @@ pub struct OpenReport {
     pub applied: Option<usize>,
     /// NLEPROBEHDRWIRE (SR305): the reel's colour (container, else the bitstream's through `fill_colour(colour_of)`).
     pub colour: Option<gneiss_pal::dsp::demux::colour::Colour>,
+    /// SWAPBACK (SR329): a render drew stand-in frames for this reel (its decoder refused a span mid-reel).
+    pub stand_in: bool,
 }
 
 impl std::fmt::Display for OpenReport {
@@ -238,6 +246,9 @@ impl std::fmt::Display for OpenReport {
         }
         if let Some(c) = self.colour {
             write!(f, " {c}")?;
+        }
+        if self.stand_in {
+            write!(f, " decode=stand-in")?;
         }
         Ok(())
     }
@@ -280,6 +291,10 @@ struct Vid {
     track_id: u32,
     cursor: Demuxer,
     dec: Box<dyn VideoDecoder>,
+    /// SWAPBACK (SR329): the track (the stand-in's size and clock), the run's swap state, and whether it drew the stand-in.
+    track: Track,
+    swap: DecodeSwap,
+    stood_in: bool,
     pending: VecDeque<Frame>,
     peeked: Option<Frame>,
     last: Option<Frame>,
@@ -293,7 +308,7 @@ impl Vid {
         let dec = decoder_for(track).map_err(|e| RenderError::Decode(e.to_string()))?;
         let mut cursor = m.demux.share();
         cursor.seek_track(i, origin + key_ns);
-        Ok(Vid { src, origin, track_id: track.id, cursor, dec, pending: VecDeque::new(), peeked: None, last: None, done: false })
+        Ok(Vid { src, origin, track_id: track.id, cursor, dec, track: track.clone(), swap: DecodeSwap::default(), stood_in: false, pending: VecDeque::new(), peeked: None, last: None, done: false })
     }
     fn pull(&mut self) -> Result<Option<Frame>, RenderError> {
         loop {
@@ -305,9 +320,9 @@ impl Vid {
             }
             match self.cursor.next_packet() {
                 Some(p) if p.track == self.track_id => {
-                    if let Some(f) = self.dec.decode(&p).map_err(|e| RenderError::Decode(e.to_string()))? {
-                        return Ok(Some(f));
-                    }
+                    let d = self.swap.decode(&mut self.dec, &self.track, &p).map_err(|e| RenderError::Decode(e.to_string()))?;
+                    self.stood_in |= d.swap == Some(Swap::ToStandIn);
+                    self.pending.extend(d.frames);
                 }
                 Some(_) => {}
                 None => {
@@ -664,7 +679,11 @@ fn vid_frame(
         *run = Some(Vid::open(sources.get(src)?, src, key)?);
         r.seeks += 1;
     }
-    run.as_mut().expect("opened above").show(target, tol, &mut r.runup_frames)
+    let f = run.as_mut().expect("opened above").show(target, tol, &mut r.runup_frames);
+    if run.as_ref().is_some_and(|v| v.stood_in) {
+        sources.note_stand_in(src);
+    }
+    f
 }
 
 /// NLE3: outside a transition the outgoing run is dropped; at a transition tick whose outgoing source continues the
@@ -898,5 +917,17 @@ impl RenderSink for MixMeters {
             *m = Meter::new(rate);
         }
         m.push(interleaved, channels as usize);
+    }
+}
+
+/// SWAPBACK (LEDGER SR329): the editor's half of [`crate::decode_swap`] — a reel a render drew stand-in frames for says
+/// so in its [`OpenReport`] (` decode=stand-in`).
+impl Sources {
+    fn note_stand_in(&self, id: SourceId) {
+        if let Ok(mut v) = self.stand_in.lock() {
+            if !v.contains(&id) {
+                v.push(id);
+            }
+        }
     }
 }
