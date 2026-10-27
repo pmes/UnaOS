@@ -413,7 +413,7 @@ pub fn leaked_surf_retire(at: &core::sync::atomic::AtomicUsize, who: &'static st
     // create that precedes this call, so no row names it and no composite reads it.
     let from = unsafe { *(q as *const u32) } as usize;
     let cur = at.load(Ordering::Acquire);
-    let to = if cur != 0 { unsafe { *(cur as *const u32) } as usize } else { 0 };
+    let to = if cur != 0 { (unsafe { *(cur as *const u32) }) as usize } else { 0 };
     drop(unsafe { alloc::boxed::Box::from_raw(core::ptr::slice_from_raw_parts_mut(q as *mut u32, from + 1)) });
     let ab = s.abandoned.swap(0, Ordering::Relaxed);
     serial_println!("[metrics] surf grow who={} from_kb={} to_kb={} retired=1 abandoned={}", who, from * 4 / 1024, to * 4 / 1024, ab);
