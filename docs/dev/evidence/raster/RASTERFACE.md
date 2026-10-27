@@ -236,3 +236,6 @@ Read whole before the first edit: `docs/dev/blueprint/handlers.md` (119 lines) a
   first GTK run, on a bench with the two libraries), RASTERFACE-MACRUN (the first AppKit build and run, Peter's
   Mac), RASTERFACE-SELCLIP (brush / adjust ignore the selection, RASTERCLI-SELCLIP's core gap), plus NLE2-GTKWHEEL
   (no wheel zoom on GTK) and NLE2-MACKEYS (Cmd+Z on AppKit: the Undo / Redo buttons and `Z` cover it).
+
+## MEASURED (the bench, 2026-10-27 06:1xZ) — RASTERFACE-GTKRUN, the GTK leg
+After `libgtksourceview-5-dev` + `libspelling-1-dev` (gtksourceview-5 5.18.0, libspelling-1 0.4.9) went onto the bench toolbox: `CARGO_TARGET_DIR=~/unaos-bench/scratch/rmbp-0915/rasterface/target-gtk cargo test -p facet-view --features gtk` → `Finished test profile in 1m 12s`, rc=0, `tests/editor.rs` 9 passed, `tests/viewer.rs` 3 passed, one warning (`unused variable: height`). The GTK leg LINKS and its headless tests pass; the first windowed run on a display is still owed (RASTERFACE-GTKWIN). The AppKit half stays read-checked only (no macOS on the bench; R135: the Mac builds are not the bench's).
