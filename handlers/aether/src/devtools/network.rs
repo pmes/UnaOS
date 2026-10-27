@@ -401,8 +401,6 @@ pub fn references(engine: &AetherEngine) -> Vec<(Initiator, String)> {
 /// then each refusal that names a URL no reference has.
 pub fn requests(engine: &AetherEngine) -> Vec<Request> {
     let top = engine.current_url();
-    let partition = gneiss_pal::api::http::site_of(&top);
-    let cache = crate::net::http_cache();
     let refusals = crate::security::refusals();
     // (rule, the URL it names) of each refusal whose detail is a URL.
     let refused: Vec<(String, String)> = refusals
@@ -431,20 +429,14 @@ pub fn requests(engine: &AetherEngine) -> Vec<Request> {
                 request_headers: Vec::new(),
                 preview: None,
             };
-            if let Ok(u) = html_core::url::Url::parse(&url) {
-                if matches!(u.scheme(), "http" | "https") {
-                    let part = partition.clone().or_else(|| gneiss_pal::api::http::site_of(&url)).unwrap_or_default();
-                    let key = format!("{part} {}", u.serialize(true));
-                    if let Some(e) = cache.get(&key) {
-                        r.status = Some(e.status);
-                        r.mime = e.headers.get("content-type").map(str::to_string);
-                        r.size = Some(e.body.len());
-                        r.time_ms = Some((e.response_time - e.request_time).max(0) * 1000);
-                        r.response_headers = e.headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-                        r.request_headers = e.vary.iter().map(|(k, v)| (k.clone(), v.clone().unwrap_or_else(|| "(absent)".to_string()))).collect();
-                        r.preview = Some(preview(r.mime.as_deref(), &e.body));
-                    }
-                }
+            if let Some(e) = cached(&top, &url) { // PAGESAVE (SR392): the one cache lookup, `cached`
+                r.status = Some(e.status);
+                r.mime = e.headers.get("content-type").map(str::to_string);
+                r.size = Some(e.body.len());
+                r.time_ms = Some((e.response_time - e.request_time).max(0) * 1000);
+                r.response_headers = e.headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                r.request_headers = e.vary.iter().map(|(k, v)| (k.clone(), v.clone().unwrap_or_else(|| "(absent)".to_string()))).collect();
+                r.preview = Some(preview(r.mime.as_deref(), &e.body));
             }
             r
         })
@@ -516,4 +508,19 @@ fn url_in(detail: &str) -> Option<&str> {
         .map(|(i, _)| i)?;
     let url = &detail[start..];
     (!url.is_empty()).then_some(url)
+}
+
+// ------------------------------------------------------------------------------------------------- PAGESAVE (SR392)
+
+/// What `net::http_cache()` holds for the GET of `url` made for the top-level page `top`: the key gneiss_pal stores
+/// under (`cache_key(partition, url)`, the partition `top`'s site, else `url`'s own: AETHERCACHE SR88); None for a
+/// non-http(s) URL or nothing stored. The ONE lookup: the panel's rows (`requests`) and the page save's MHTML parts
+/// (`chrome::host` PAGESAVE) read through it.
+pub fn cached(top: &str, url: &str) -> Option<http_core::cache::Entry> {
+    let u = html_core::url::Url::parse(url).ok()?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return None;
+    }
+    let part = gneiss_pal::api::http::site_of(top).or_else(|| gneiss_pal::api::http::site_of(url)).unwrap_or_default();
+    crate::net::http_cache().get(&format!("{part} {}", u.serialize(true)))
 }

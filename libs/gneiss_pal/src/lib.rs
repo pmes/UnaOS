@@ -27,6 +27,9 @@ pub mod dsp;
 pub mod forge;
 #[cfg(feature = "std")]
 pub mod io;
+// PAGESAVE (SR392): the ONE MHTML writer (RFC 2557); std-gated: it reuses `api::http::ws::base64`.
+#[cfg(feature = "std")]
+pub mod mhtml;
 #[cfg(feature = "std")]
 pub mod paths;
 #[cfg(feature = "std")]
