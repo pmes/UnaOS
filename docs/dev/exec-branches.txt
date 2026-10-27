@@ -991,7 +991,7 @@ refs/heads/exec-rmbp-aacenctnsnorm   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
 refs/heads/exec-rmbp-writeone   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
 refs/heads/exec-rmbp-pdf4outlineactions   bb5f279a7 cut 2026-10-27 (wave36 batch 7)
 refs/heads/exec-rmbp-zenbookoldest   5a348a6b8 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-zenbooklane   ae8272e02 cut 2026-10-27 (wave36 batch 8)
+refs/heads/exec-rmbp-zenbooklane   25ae0b177 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-zenbooktouchpad   56497bbe6 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-mt7925s3   e56878fb2 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-exportsizescale   2773a3aa8 FOLDED-BY-HAND (this commit) 2026-10-27
