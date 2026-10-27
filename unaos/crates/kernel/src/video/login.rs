@@ -777,7 +777,7 @@ pub fn reopen_after_logout() {
         refused_alert(reason);
         return;
     }
-    users::logout();
+    #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::desktopbuild::logout_census(); users::logout(); // MEMLINE-LOGOUT (B1032): the census's BEFORE at the Log Out's first line (the session as held). LINE-NEUTRAL append, code first
     take_down(); // LOGOUTUI: an alert left up by an earlier refusal goes with the session (no-op with no window)
     let (closed, kernel) = wm::close_all_furniture(); // LOGOUTDESK (R69): the desktop closes down COMPLETELY — every row, kernel furniture included
     crate::video::desktopbuild::teardown("logout"); // DESKTOPBUILT (R93): the desktop object goes with the session; the next login builds it fresh
