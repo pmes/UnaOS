@@ -1,6 +1,6 @@
 # x86-zenbook.spec — THE ZENBOOK IMAGE LINE, BOOTED UNDER QEMU AS THE ZENBOOK. ZENBOOKLANE (zenbook-ledger Z13), 2026-10-27.
 #
-#   QEMU gate:  ./arroyo test-zenbook 90 -> target/serial.log
+#   QEMU gate:  ./arroyo test-zenbook 180 -> target/serial.log   (ZENBOOKLANETYPED Z16: 180 s, the default)
 #               (= scripts/image-line-zenbook.env minus its [media] row, every inherited UNAOS_* unset first, plus
 #                UNAOS_PLATFORM=zenbook_um5606w UNAOS_CENSUS=1 UNAOS_USBSERIAL=1, on a fresh card; tests-at-boot OFF)
 #               ./arroyo mbench --replay target/serial.log --spec scripts/specs/x86-zenbook.spec --platform x86
@@ -8,6 +8,9 @@
 # RUN-BY: verb:test-zenbook — `arroyo` names this file in code as `X86_ZENBOOK_SPEC`; `test_zenbook` hands it to
 #          `test_x86_64` as X86_TEST_SPEC (its COMPLETE ends the wall, its REQUIREs are scored by `x86_test_completion`)
 #          and `x86_pick_capture_spec` replays it (the ZENBOOKLANE arm, asked before the SELFHOST skip).
+#          ZENBOOKLANETYPED (zenbook-ledger Z16): `zenbook_lane_typed` arms ONE typist (scripts/typist.sh, twoboot's) on the
+#          lane's QMP port: the first-user form, then `tests platform|ec|nvme|i8042|dwi2c|bootlist`, one line each (`tests`
+#          runs ONE fixture per line), each held on the verdict before it; transcript target/zenbook-typist.log (beside).
 #
 # WHY. The Zenbook-only kernel arms answer `hw::platform()`, and q35's SMBIOS resolves `qemu`, so no QEMU leg reached them
 # (GOPIGNITE-FIXTURE, Z10). `UNAOS_PLATFORM` (hw.rs `platform_knob`, witness builds only) writes the platform's one
@@ -17,8 +20,12 @@
 #   * `[hw] skip smc|gmux|hda` — ZERO lines: the SMC (feature smc), the gmux (gmux_igd + intel-ivb) and the HDA codec
 #     drive (hda) are not on the Zenbook line, so no gate call is linked. A future line that adds one prints its skip here.
 #   * `[mt7925] s2` — SILENT: with no 14c3 device on the bus `mt7925::s2` returns before its platform test.
-#   * the typed fixtures (`:: PLATFORM: … src=knob … -> PASS ::`, `:: EC:`, `:: NVME:`, `:: I8042:`) register only from the
-#     `tests` verb, which needs a session on this `login` line (the first-user form typed): ZENBOOK-LANETYPED, owed.
+#   * the typed fixtures register only from the `tests` verb, which needs a session on this `login` line: section 7 below
+#     (ZENBOOKLANETYPED, Z16, measured at d7ad4440e).
+#   * `[bootlist] list src=/boot/TESTS.LIST … board=zenbook` is UNREACHABLE here: `bootlist_stage` arms only on the media
+#     verbs and the builder re-creates target/x86_64_esp every run (builder/src/main.rs:1252), so the runner says
+#     `list=absent`; section 8 pins either arm and forbids a wrong board (ZENBOOK-LANELIST, owed).
+#   * no pixel witness: no spec scores pixels (the GOPIGNITE pixel witness is owed: no scorer exists).
 
 # ── 1. THE OVERRIDE: the platform's one resolution says the Zenbook, by the knob ──────────────────────────────────────
 REQUIRE \[hw\] platform=zenbook_um5606w dmi=".*" vendor=".*" src=knob
@@ -38,5 +45,24 @@ REQUIRE \[xhci\] controllers=\d+ picked=\d+ bdf=\d+:\d+\.\d+
 # ── 6. Z3: the 8042 keyboard controller (q35 has one; only the MacBookPro10,1 skips it) ───────────────────────────────
 REQUIRE \[i8042\] keyboard id=[0-9a-f]{4} set=1xlat irq=(routed|polled) -> ready
 
-# ── END OF RUN: a fresh card has no users, so the boot stops at the first-user form (BP-boot-7) ────────────────────────
-COMPLETE \[login\] installer: first-user form open
+# ── 7. ZENBOOKLANETYPED (Z16): the first-user form (BP-boot-7), typed; the session's desktop; the board by platform ─────
+REQUIRE \[login\] installer: first-user form open
+REQUIRE \[login\] installer: create-user user=una\b
+REQUIRE \[desktop\] built at=
+REQUIRE :: OLDEST: board=zenbook year=2024 image=\S+ net=(absent|present) -> BOOTS ::
+
+# ── 8. BOOTLIST's runner reached its list read: either arm (no list staged on this lane, or a staged list says zenbook) ─
+REQUIRE \[bootlist\] list(=absent path=/boot/TESTS\.LIST| src=/boot/TESTS\.LIST .* board=zenbook )
+FORBID \[bootlist\] list src=.* board=(rmbp12|pi4|orin)\b
+
+# ── 9. the six typed verdicts, one `tests <verb>` line each, in the typist's order ───────────────────────────────────
+REQUIRE :: PLATFORM: platform=zenbook_um5606w src=knob kat=\d+/\d+ gate=smc:skip,gmux:skip,hda:skip -> PASS ::
+REQUIRE :: EC: proto=ok cases=5/5 -> PASS ::
+REQUIRE :: NVME: ctrl=ok ns=1 rw=(ok|in-root) -> PASS :: root=(ok|skip) ::
+REQUIRE :: I8042: init=ready irq=(routed|polled) transport=ps2 table=ok .* -> PASS ::
+REQUIRE :: DWI2C: proto=ok cases=8/8 -> PASS ::
+REQUIRE :: BOOTLIST: probe entries=\d+ heavy=\d+ budget_skips=\d+ summary=ok -> PASS ::
+FORBID :: (PLATFORM|EC|NVME|I8042|DWI2C|BOOTLIST): .*-> FAIL
+
+# ── END OF RUN: the last typed verdict (mbench's completion also needs every REQUIRE above) ───────────────────────────
+COMPLETE :: BOOTLIST: probe .* -> PASS ::
