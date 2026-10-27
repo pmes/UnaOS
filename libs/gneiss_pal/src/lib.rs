@@ -17,10 +17,13 @@
 // libs/gneiss_pal/src/lib.rs (Logic Kernel)
 #![allow(deprecated)]
 
+// GNEISSPAL-NOSTD (SR308): the network face (`api`, `forge`: http_core + tokio) is std-only; `dsp` + `utils` build with --no-default-features.
+#[cfg(feature = "std")]
 pub mod api;
 // DSP (CODEX §2: Gneiss — "The Signal Processing Graph. Audio and Video codecs"): the host face of the
 // codecs UnaOS owns. `dsp::image` re-exports the no_std still-image core `pixel_core` (PIXELCORE, SR25).
 pub mod dsp;
+#[cfg(feature = "std")]
 pub mod forge;
 #[cfg(feature = "std")]
 pub mod io;
