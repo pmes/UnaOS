@@ -22,9 +22,10 @@
 #   * `[mt7925] s2` — SILENT: with no 14c3 device on the bus `mt7925::s2` returns before its platform test.
 #   * the typed fixtures register only from the `tests` verb, which needs a session on this `login` line: section 7 below
 #     (ZENBOOKLANETYPED, Z16, measured at d7ad4440e).
-#   * `[bootlist] list src=/boot/TESTS.LIST … board=zenbook` is UNREACHABLE here: `bootlist_stage` arms only on the media
-#     verbs and the builder re-creates target/x86_64_esp every run (builder/src/main.rs:1252), so the runner says
-#     `list=absent`; section 8 pins either arm and forbids a wrong board (ZENBOOK-LANELIST, owed).
+#   * ZENBOOKLANELIST (zenbook-ledger Z19): the builder re-creates target/x86_64_esp every run (builder/src/main.rs:1252),
+#     so `test_zenbook` stages the LANE list (unaos/fixtures/lanes/zenbook/TESTS.LIST: `platform @zenbook`, `gen7 @rmbp12`)
+#     through the ONE stager `bootlist_stage` and the builder carries it onto the ESP (UNAOS_BOOTLIST_STAGE,
+#     `stage_bootlist_carry`); the typist's first typed verb is held on the list's light summary. Section 8 pins the list.
 #   * no pixel witness: no spec scores pixels (the GOPIGNITE pixel witness is owed: no scorer exists).
 
 # ── 1. THE OVERRIDE: the platform's one resolution says the Zenbook, by the knob ──────────────────────────────────────
@@ -51,8 +52,10 @@ REQUIRE \[login\] installer: create-user user=una\b
 REQUIRE \[desktop\] built at=
 REQUIRE :: OLDEST: board=zenbook year=2024 image=\S+ net=(absent|present) -> BOOTS ::
 
-# ── 8. BOOTLIST's runner reached its list read: either arm (no list staged on this lane, or a staged list says zenbook) ─
-REQUIRE \[bootlist\] list(=absent path=/boot/TESTS\.LIST| src=/boot/TESTS\.LIST .* board=zenbook )
+# ── 8. ZENBOOKLANELIST (Z19): the lane list read as the Zenbook: the @zenbook line runs, the @rmbp12 line is counted ──
+REQUIRE \[bootlist\] list src=/boot/TESTS\.LIST bytes=\d+ light=1 heavy=0 heavy_mode=after boot=\S+ cpu=\d+ board=zenbook other=1\b
+REQUIRE :: BOOTLIST: ran=1 pass=1 fail=0 skip=0 heavy=none ms=\d+ ::
+FORBID \[bootlist\] list=absent
 FORBID \[bootlist\] list src=.* board=(rmbp12|pi4|orin)\b
 
 # ── 9. the six typed verdicts, one `tests <verb>` line each, in the typist's order ───────────────────────────────────
