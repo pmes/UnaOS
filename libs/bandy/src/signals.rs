@@ -481,8 +481,10 @@ pub enum SMessage {
     /// Chrome -> owner (NLE2B, LEDGER SR208): the primary button went down (`down: true`) or up on a surface, in
     /// surface pixels (top-left origin). Both ends of a press, so a drag has a start and an end on every face (GTK's
     /// click gesture sends no `BrowserClick` once the pointer passes its drag threshold). `BrowserClick` on release
-    /// and `BrowserMouseMove` are still sent as before. APPENDED so no earlier wire tag moves.
-    BrowserButton { down: bool, x: f64, y: f64 },
+    /// and `BrowserMouseMove` are still sent as before. APPENDED so no earlier wire tag moves. NLE2-MODS (LEDGER SR306):
+    /// `mods` is the modifier state at the press / release ([`MOD_SHIFT`] | [`MOD_CONTROL`] | [`MOD_ALT`] | [`MOD_SUPER`]),
+    /// omitted from the wire when 0 so a press with no modifier keeps its frozen shape (smessage_kats).
+    BrowserButton { down: bool, x: f64, y: f64, #[serde(default, skip_serializing_if = "no_mods")] mods: u8 },
 }
 
 /// A typed preference value — the whole value domain of the Principia
@@ -595,6 +597,20 @@ impl A11yVerb {
 fn is_false(b: &bool) -> bool {
     !*b
 }
+
+/// serde helper: omit an empty modifier set from the wire (`BrowserButton`'s `mods`).
+fn no_mods(m: &u8) -> bool {
+    *m == 0
+}
+
+/// `BrowserButton`'s `mods` bits (NLE2-MODS, LEDGER SR306), named once: Shift.
+pub const MOD_SHIFT: u8 = 1 << 0;
+/// Control.
+pub const MOD_CONTROL: u8 = 1 << 1;
+/// Alt / Option.
+pub const MOD_ALT: u8 = 1 << 2;
+/// Super / Command (GTK's Meta or Super).
+pub const MOD_SUPER: u8 = 1 << 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrincipiaCommand {

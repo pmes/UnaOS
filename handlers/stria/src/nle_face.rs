@@ -26,6 +26,8 @@
 //!   marquee from an empty track spot selects what it crosses ([`Layout::crossing`]), `BrowserSelectAll` takes all; delete
 //!   / lift / a drag / the arrows edit the set through ONE of timeline_core's set ops; a drag's moving edge snaps to clip
 //!   edges and the playhead within [`SNAP_PX`] (the guide line painted by `paint_drag`); a press on the ruler scrubs.
+//!   NLE2-MODS (LEDGER SR306): shift-add and the no-snap Alt / Option come on the press itself (`BrowserButton`'s
+//!   `mods`, bandy's `MOD_SHIFT` / `MOD_ALT`), so both faces have them and no keydown latch exists.
 
 use std::time::Duration;
 
@@ -371,15 +373,13 @@ pub struct Face {
     wheel: f64,
     /// A wheel zoom's anchored view: `(t0, the playhead it was anchored at)`.
     view: Option<(i64, i64)>,
-    /// NLE2c: the one-shot modifier latch `(shift, no-snap)` a modifier keydown arms and the next press consumes.
-    mods: (bool, bool),
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, mods: (false, false) }
+        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -394,8 +394,8 @@ impl Face {
                 self.canvas = (*w, *h);
                 true
             }
-            SMessage::BrowserButton { down: true, x, y } => self.press(*x, *y),
-            SMessage::BrowserButton { down: false, x, y } => self.release(*x, *y),
+            SMessage::BrowserButton { down: true, x, y, mods } => self.press(*x, *y, *mods),
+            SMessage::BrowserButton { down: false, x, y, .. } => self.release(*x, *y),
             SMessage::BrowserMouseMove(x, y) => self.hover(*x, *y),
             SMessage::BrowserScroll(_, dy) => self.scroll(*dy),
             SMessage::BrowserZoom(d) if *d != 0 => {
@@ -771,14 +771,15 @@ impl Face {
     pub fn dragging(&self) -> Option<&Drag> {
         self.drag.as_ref()
     }
-    /// The button went down: a drag may begin (a live one is dropped uncommitted).
-    fn press(&mut self, x: f64, y: f64) -> bool {
+    /// The button went down: a drag may begin (a live one is dropped uncommitted). `mods`: the press's modifier bits
+    /// (Shift adds to the set, Alt / Option turns snapping off).
+    fn press(&mut self, x: f64, y: f64, mods: u8) -> bool {
         self.buttons = true;
         self.pointer = Some((x, y));
         let l = self.layout();
         let dropped = self.drag.take().is_some();
         let (sel, set, ph) = (self.state.selection, self.state.set.clone(), self.state.playhead);
-        let (shift, nosnap) = std::mem::take(&mut self.mods);
+        let (shift, nosnap) = (mods & bandy::MOD_SHIFT != 0, mods & bandy::MOD_ALT != 0);
         self.drag = Drag::begin_with(&mut self.state, l, x, y, shift, nosnap);
         if let Some(d) = self.drag.filter(|d| d.kind == DragKind::Scrub) {
             self.state.seek(d.origin_tick);
@@ -843,9 +844,6 @@ impl Face {
     }
     /// A key ([`KEYS`]); `text` says it came as `BrowserText`. False for a key the face does not take.
     fn key(&mut self, k: &str, text: bool) -> bool {
-        if let Some(r) = self.latch(k, text) {
-            return r;
-        }
         if (k.chars().count() == 1) != text {
             return false;
         }
@@ -1028,27 +1026,6 @@ fn paint_drag(px: Vec<u8>, l: Layout, order: PixelOrder, drag: Option<&Drag>) ->
         c.frame(x0, y0, x1, y1, MARQUEE);
     }
     c.px
-}
-
-impl Face {
-    /// The modifier latch: GTK sends a bare modifier's keydown as `BrowserKey("Shift_L")` (autorepeat
-    /// `"Shift+Shift_L"`); Shift arms the add-to-set press, Alt the no-snap one, any other key disarms both. `Some`
-    /// when the key was a modifier (nothing to repaint). AppKit sends no bare modifier (NLE2-MODS owed).
-    fn latch(&mut self, k: &str, text: bool) -> Option<bool> {
-        let mut name = k;
-        while let Some(rest) = ["Ctrl+", "Alt+", "Shift+", "Meta+"].iter().find_map(|p| name.strip_prefix(p)) {
-            name = rest;
-        }
-        match (text, name) {
-            (false, "Shift_L" | "Shift_R") => self.mods.0 = true,
-            (false, "Alt_L" | "Alt_R") => self.mods.1 = true,
-            _ => {
-                self.mods = (false, false);
-                return None;
-            }
-        }
-        Some(false)
-    }
 }
 
 #[cfg(test)]
@@ -1250,7 +1227,12 @@ mod tests {
     const GOLDEN_TRACKS: &str = "99a12b088401a18f";
 
     fn btn(down: bool, x: f64, y: f64) -> SMessage {
-        SMessage::BrowserButton { down, x, y }
+        btn_mods(down, x, y, 0)
+    }
+
+    /// NLE2-MODS: a press / release carrying modifier bits (bandy's `MOD_*`).
+    fn btn_mods(down: bool, x: f64, y: f64, mods: u8) -> SMessage {
+        SMessage::BrowserButton { down, x, y, mods }
     }
 
     fn face() -> Face {
@@ -1425,9 +1407,13 @@ mod tests {
         face.on(&btn(false, x, y));
         assert!(!key(&mut face, "Shift_L"), "a modifier alone repaints nothing");
         let (x, y) = face.layout().point(0, 28);
-        assert!(face.on(&btn(true, x, y)));
-        assert!(face.on(&btn(false, x, y)));
-        assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 2)), vec![(0, 0), (0, 2)]));
+        face.on(&btn(true, x, y));
+        face.on(&btn(false, x, y));
+        assert_eq!(face.state.set, vec![(0, 2)], "NLE2-MODS: a bare Shift keydown arms nothing (no latch)");
+        let (x0, y0) = face.layout().point(0, 5);
+        assert!(face.on(&btn_mods(true, x0, y0, bandy::MOD_SHIFT)));
+        assert!(face.on(&btn_mods(false, x0, y0, bandy::MOD_SHIFT)));
+        assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 0)), vec![(0, 0), (0, 2)]));
         assert!(face.verb("delete"));
         let by_hand = tl0.ripple_delete(0, 2).unwrap().ripple_delete(0, 0).unwrap();
         assert_eq!(face.state.timeline, by_hand);
@@ -1452,16 +1438,14 @@ mod tests {
         face.state.select(0, 0).unwrap();
         face.state.select_add(0, 1).unwrap();
         let (x, y) = face.layout().point(0, 15); // B's body (B[0,10)@10 butts A@0 and ends 5 before A@25)
-        key(&mut face, "Alt_L");
-        face.on(&btn(true, x, y));
+        face.on(&btn_mods(true, x, y, bandy::MOD_ALT));
         face.on(&SMessage::BrowserMouseMove(x + 48.0, y));
         assert_eq!(face.dragging().map(|d| (d.kind, d.delta, d.snap)), Some((DragKind::Move, 6, false)));
         face.on(&btn(false, x + 48.0, y));
         assert_eq!(face.last_error.take().as_deref(), Some("drag: clips overlap"));
         assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl0, 0));
         assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 1)), vec![(0, 0), (0, 1)]));
-        key(&mut face, "Alt_L");
-        face.on(&btn(true, x, y));
+        face.on(&btn_mods(true, x, y, bandy::MOD_ALT));
         face.on(&SMessage::BrowserMouseMove(x + 40.0, y));
         face.on(&btn(false, x + 40.0, y));
         let want = tl0.move_many(&[(0, 0), (0, 1)], 5).unwrap();
@@ -1489,8 +1473,7 @@ mod tests {
         assert!(face.on(&SMessage::BrowserMouseMove(300.0, 130.0)));
         face.on(&btn(false, 300.0, 130.0));
         assert_eq!((face.state.selection, face.state.set.clone()), (Some((0, 2)), vec![(0, 2), (1, 2)]));
-        key(&mut face, "Shift_L");
-        face.on(&btn(true, 172.0, 125.0));
+        face.on(&btn_mods(true, 172.0, 125.0, bandy::MOD_SHIFT));
         face.on(&SMessage::BrowserMouseMove(40.0, 150.0));
         face.on(&btn(false, 40.0, 150.0));
         assert_eq!(face.state.set, vec![(0, 2), (1, 0), (1, 1), (1, 2)]);
@@ -1536,7 +1519,11 @@ mod tests {
         key(&mut face, "Alt_L");
         face.on(&btn(true, x, y));
         face.on(&SMessage::BrowserMouseMove(x - 35.0, y));
-        assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((-4, None)));
+        assert_eq!(face.dragging().map(|d| (d.delta, d.guide)), Some((-5, Some(20))), "NLE2-MODS: a bare Alt keydown arms nothing");
+        key(&mut face, "Escape");
+        face.on(&btn_mods(true, x, y, bandy::MOD_ALT | bandy::MOD_CONTROL | bandy::MOD_SUPER));
+        face.on(&SMessage::BrowserMouseMove(x - 35.0, y));
+        assert_eq!(face.dragging().map(|d| (d.delta, d.guide, d.additive)), Some((-4, None, false)));
     }
 
     /// NLE2c M2: a press on the ruler seeks there, a move scrubs the playhead (snapping to clip edges), the release keeps

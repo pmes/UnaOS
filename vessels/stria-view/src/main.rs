@@ -19,9 +19,9 @@
 //! `press:<x>:<y>` / `move:<x>:<y>` (surface pixels), `release` (at the last pointer: `BrowserButton` up + `BrowserClick`),
 //! `key:<name>` (as GTK sends it: `BrowserKey`, plus `BrowserText` for a one-character key; `key:space` types a space)
 //! and `wheel:<n>` (n notches at the last pointer, n > 0 up = zoom in). The JSON line also carries `playing`, `rate`
-//! and the selected clip as `clip: "<at>:<src_in>:<src_out>"`. NLE2c (SR217): `shift:<token>` / `alt:<token>` send GTK's
-//! bare modifier keydown (`BrowserKey("Shift_L")` / `"Alt_L"`, the latch the next press consumes: add to the set / no
-//! snapping) before the token, `marquee:<x0>:<y0>:<x1>:<y1>` is a press, a move and the release, `key:Ctrl+a` /
+//! and the selected clip as `clip: "<at>:<src_in>:<src_out>"`. NLE2c (SR217): `shift:<token>` / `alt:<token>` set
+//! `MOD_SHIFT` / `MOD_ALT` in the `mods` of every press the token sends (NLE2-MODS SR306, as both faces send them: add to
+//! the set / no snapping), `marquee:<x0>:<y0>:<x1>:<y1>` is a press, a move and the release, `key:Ctrl+a` /
 //! `key:Meta+a` is the `BrowserSelectAll` both faces send for it, and the JSON line ends with the set's size `set`.
 
 use bandy::{SMessage, Synapse};
@@ -131,10 +131,14 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
     let px = |s: &str| s.parse::<f64>().ok();
     let l: Layout = face.layout();
     let (lx, ly) = face.pointer().unwrap_or((0.0, 0.0));
-    for (prefix, key) in [("shift:", "Shift_L"), ("alt:", "Alt_L")] {
+    for (prefix, bit) in [("shift:", bandy::MOD_SHIFT), ("alt:", bandy::MOD_ALT)] {
         if let Some(rest) = tok.strip_prefix(prefix) {
-            let mut out = vec![SMessage::BrowserKey(key.to_string())];
-            out.extend(token(face, rest)?);
+            let mut out = token(face, rest)?;
+            for m in &mut out {
+                if let SMessage::BrowserButton { down: true, mods, .. } = m {
+                    *mods |= bit;
+                }
+            }
             return Some(out);
         }
     }
@@ -156,15 +160,15 @@ fn token(face: &Face, tok: &str) -> Option<Vec<SMessage>> {
             SMessage::BrowserClick(x, y)
         }
         ["ruler", t] => SMessage::BrowserClick(l.x_of(num(t)?) as f64 + 0.5, l.ruler_y as f64 + 1.0),
-        ["press", x, y] => SMessage::BrowserButton { down: true, x: px(x)?, y: px(y)? },
+        ["press", x, y] => SMessage::BrowserButton { down: true, x: px(x)?, y: px(y)?, mods: 0 },
         ["move", x, y] => SMessage::BrowserMouseMove(px(x)?, px(y)?),
-        ["release"] => return Some(vec![SMessage::BrowserButton { down: false, x: lx, y: ly }, SMessage::BrowserClick(lx, ly)]),
+        ["release"] => return Some(vec![SMessage::BrowserButton { down: false, x: lx, y: ly, mods: 0 }, SMessage::BrowserClick(lx, ly)]),
         ["marquee", x0, y0, x1, y1] => {
             let (x0, y0, x1, y1) = (px(x0)?, px(y0)?, px(x1)?, px(y1)?);
             return Some(vec![
-                SMessage::BrowserButton { down: true, x: x0, y: y0 },
+                SMessage::BrowserButton { down: true, x: x0, y: y0, mods: 0 },
                 SMessage::BrowserMouseMove(x1, y1),
-                SMessage::BrowserButton { down: false, x: x1, y: y1 },
+                SMessage::BrowserButton { down: false, x: x1, y: y1, mods: 0 },
                 SMessage::BrowserClick(x1, y1),
             ]);
         }
@@ -302,7 +306,7 @@ mod tests {
         assert_eq!(drive(&mut face, "press:x:1"), vec!["bad token press:x:1".to_string()]);
     }
 
-    /// NLE2c M3: `shift:` sends GTK's bare Shift keydown before its token (the press then adds to the set), `marquee:`
+    /// NLE2c M3: `shift:` sets MOD_SHIFT on its token's press (NLE2-MODS; the press then adds to the set), `marquee:`
     /// is a press, move and release from an empty spot, `key:Ctrl+a` is `BrowserSelectAll`; the results are the ops.
     #[test]
     fn nle2c_witness_set_tokens() {
