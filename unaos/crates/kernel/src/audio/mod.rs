@@ -245,14 +245,14 @@ pub const KERNEL_RECORDER: &str = "kernel";
 pub struct Source {
     app: String,
     ch: u8,
-    rate: u32,
+    rate: u32, cur: usize, // MICCURSOR (B871): this source's own cursor on the capture ring (`uac::read_capture`)
 }
 
 #[cfg(feature = "uac")]
 impl Source {
     /// Whole frames captured since the last read (0 = none yet: the pipe opens on the next service pass).
     pub fn read(&mut self, dst: &mut [u8]) -> usize {
-        crate::drivers::usb::uac::read_capture(dst)
+        mic_read(&mut self.cur, dst, PROG_SLOTS) // MICCURSOR (B871): this source's cursor; PROG_SLOTS names the kernel reader
     }
 
     /// `(channels, rate)`.
@@ -296,7 +296,7 @@ pub fn source(app: &str) -> Result<Source, &'static str> {
 pub(crate) fn open(app: &str, ask: bool) -> Result<Source, &'static str> {
     let (g, ch, rate) = grant_open(app, ask)?;
     serial_println!("[audio] source app={} grant={} fmt=pcm16/{}/{} opened", app, g, ch, rate);
-    ksrc_opened(app); Ok(Source { app: String::from(app), ch, rate }) // SOFTYMIC (B749): the kernel source's count and name for `mic_holder` (file tail). LINE-NEUTRAL fold, code first.
+    ksrc_opened(app); Ok(Source { app: String::from(app), ch, rate, cur: crate::drivers::usb::uac::capture_head() }) // MICCURSOR (B871): the cursor starts at the head. SOFTYMIC (B749): the kernel source's count and name for `mic_holder` (file tail). LINE-NEUTRAL fold, code first.
 }
 
 /// The grant, then the driver's open: `Ok((grant, channels, rate))` with the wanted count raised (the caller owes
@@ -527,7 +527,7 @@ pub fn bus_source(row: usize, verb: u8, body: &[u8], text: &mut alloc::vec::Vec<
                 t.push((row, app.clone()));
             }
             PROG_REVOKED[row].store(0, Ordering::Release);
-            PROG_SRC[row].store(h, Ordering::Release);
+            prog_cursor_open(row); PROG_SRC[row].store(h, Ordering::Release); // MICCURSOR (B871): the slot's cursor at the head, before the handle publishes
             r3_add(R3_OPENED, 1);
             serial_println!("[audio] source app={} grant={} fmt=pcm16/{}/{} opened slot={} handle={}", app, g, ch, rate, row, h);
             text.extend_from_slice(&una_abi::audio_source_open_reply(ch, rate, h));
@@ -539,7 +539,7 @@ pub fn bus_source(row: usize, verb: u8, body: &[u8], text: &mut alloc::vec::Vec<
                 return if PROG_REVOKED[row].load(Ordering::Acquire) == h { EPERM } else { EBADF };
             }
             text.resize(una_abi::AUDIO_SOURCE_READ_MAX, 0);
-            let n = crate::drivers::usb::uac::read_capture(&mut text[..]);
+            let n = prog_read(row, &mut text[..]); // MICCURSOR (B871): the slot's own cursor (file tail)
             text.truncate(n);
             r3_add(R3_READ, n as u64);
             0
@@ -780,4 +780,58 @@ pub fn mic_holder(out: &mut [u8]) -> (u32, usize) {
         None => 0,
     };
     (n, len)
+}
+
+// ── MICCURSOR (rmbp-ledger B871; BP-audio-12) — TAIL-APPENDED: a capture cursor per reader ───────────────────────────
+// Each open source reads the one capture ring from its OWN cursor (`uac::read_capture`, BP-audio-11), so two programs
+// (or a program and the kernel recorder) each read every frame; the device's open count stays `uac`'s CAP_WANT (first
+// open opens the pipe, last close closes it) and every close path above is unchanged. A ring-3 slot's cursor is set by
+// its OPEN (at the head, before the handle publishes) and stepped by its READ; nothing here runs on the terminate path.
+// Wire: `[mic] reader=<slot|kernel> dropped=<frames>` when a reader fell more than `uac::CAPTURE_KEEP` behind.
+
+/// Per slot: the open source's cursor on the capture ring (bytes since boot, wrapping).
+#[cfg(all(feature = "uac", target_arch = "x86_64"))]
+static PROG_CUR: [core::sync::atomic::AtomicUsize; PROG_SLOTS] = [const { core::sync::atomic::AtomicUsize::new(0) }; PROG_SLOTS];
+/// Per slot: frames READ answered since that slot's last OPEN (`tests micring3`'s two-reader leg).
+#[cfg(feature = "uac")]
+static PROG_RFRAMES: [core::sync::atomic::AtomicU64; PROG_SLOTS] = [const { core::sync::atomic::AtomicU64::new(0) }; PROG_SLOTS];
+
+/// MICCURSOR: one read from cursor `cur` for reader `who` (a slot, or `PROG_SLOTS` = the kernel recorder); a catch-up
+/// says its drop.
+#[cfg(feature = "uac")]
+fn mic_read(cur: &mut usize, dst: &mut [u8], who: usize) -> usize {
+    let (n, dropped) = crate::drivers::usb::uac::read_capture(cur, dst);
+    if dropped > 0 {
+        if who < PROG_SLOTS {
+            serial_println!("[mic] reader={} dropped={}", who, dropped);
+        } else {
+            serial_println!("[mic] reader=kernel dropped={}", dropped);
+        }
+    }
+    n
+}
+
+/// MICCURSOR: slot `row` opens — its cursor at the ring's head, its frame count from 0.
+#[cfg(all(feature = "uac", target_arch = "x86_64"))]
+fn prog_cursor_open(row: usize) {
+    PROG_CUR[row].store(crate::drivers::usb::uac::capture_head(), Ordering::Release);
+    PROG_RFRAMES[row].store(0, Ordering::Relaxed);
+}
+
+/// MICCURSOR: slot `row`'s READ from its own cursor (one reader per slot: two threads of one program racing READ can
+/// only re-read or skip within that slot).
+#[cfg(all(feature = "uac", target_arch = "x86_64"))]
+fn prog_read(row: usize, dst: &mut [u8]) -> usize {
+    let mut c = PROG_CUR[row].load(Ordering::Acquire);
+    let n = mic_read(&mut c, dst, row);
+    PROG_CUR[row].store(c, Ordering::Release);
+    let fb = crate::drivers::usb::uac::capture_frame_bytes();
+    PROG_RFRAMES[row].fetch_add((n / fb.max(1)) as u64, Ordering::Relaxed);
+    n
+}
+
+/// MICCURSOR: frames slot `s` has READ since its last OPEN.
+#[cfg(feature = "uac")]
+pub fn ring3_frames(s: usize) -> u64 {
+    if s < PROG_SLOTS { PROG_RFRAMES[s].load(Ordering::Relaxed) } else { 0 }
 }

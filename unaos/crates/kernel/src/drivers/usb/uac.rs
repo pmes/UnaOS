@@ -34,8 +34,9 @@
 //!   Endpoint (the audio IN pipe, `APIPE`), SET_INTERFACE(alt), the sampling-frequency SET_CUR when declared,
 //!   `iso_start`. The last source closing runs it the other way: SET_INTERFACE(0), drop the endpoint. [`capture_armed`]
 //!   — the IN pipe runs — is the ONE count the menu bar's mic dot paints from (`video::menubar::micdot`). Completed
-//!   TDs land in a 64 KiB single-producer single-consumer ring ([`push_capture`] from the claim path, lock-free;
-//!   [`read_capture`] from the one reader); a push that does not fit counts an overrun and drops the newest bytes.
+//!   TDs land in a 64 KiB single-producer ring ([`push_capture`] from the claim path, lock-free, never waiting) read
+//!   through a CURSOR per open source ([`read_capture`], MICCURSOR B871): a reader left more than [`CAPTURE_KEEP`]
+//!   behind is caught up and the drop counted as an overrun, so two readers each read every frame.
 //!
 //! * **Volume** (SINKALL, rmbp-ledger B767) — [`parse`] records the AC interface's first Feature Unit (its master and
 //!   channel 1-2 Mute / Volume controls); while the playback stream runs, the mixer hands the person's level to
@@ -393,8 +394,10 @@ pub fn out_td_len(interval_uf: u32) -> u32 {
 // ── The stream ──────────────────────────────────────────────────────────────────────────────────────────
 
 struct RingBuf(UnsafeCell<[u8; RING]>);
-// SAFETY: single producer (the `crate::audio` writer, under WRITER) and single consumer (the OUT pipe's fill, under
-// the pipe lock); each touches only the bytes its own index owns, published with Release / read with Acquire.
+// SAFETY: playback `BUF`: single producer (the `crate::audio` writer, under WRITER) and single consumer (the OUT pipe's
+// fill, under the pipe lock); each touches only the bytes its own index owns, published with Release / read with
+// Acquire. Capture `CBUF` (MICCURSOR B871): one producer, readers on their own cursors copying volatile and re-reading
+// the head, dropping whatever the producer could have overwritten during the copy (`cursor_torn`).
 unsafe impl Sync for RingBuf {}
 static BUF: RingBuf = RingBuf(UnsafeCell::new([0; RING]));
 static HEAD: AtomicUsize = AtomicUsize::new(0);
@@ -660,9 +663,10 @@ static CAP_WHY: crate::sync::Mutex<&'static str> = crate::sync::Mutex::new("none
 static CAP_OPENS: AtomicU32 = AtomicU32::new(0);
 /// `channels << 24 | rate` of the running stream.
 static CFMT: AtomicU32 = AtomicU32::new(0);
+/// MICCURSOR (B871): the capture ring has ONE producer (the claim path) and a CURSOR per reader (each open source):
+/// `CHEAD` — bytes pushed since boot, wrapping — is the clock every cursor runs against; there is no shared tail.
 static CBUF: RingBuf = RingBuf(UnsafeCell::new([0; RING]));
 static CHEAD: AtomicUsize = AtomicUsize::new(0);
-static CTAIL: AtomicUsize = AtomicUsize::new(0);
 static CFRAMES: AtomicU64 = AtomicU64::new(0);
 static COVERRUNS: AtomicU32 = AtomicU32::new(0);
 
@@ -670,22 +674,22 @@ fn cap_frame_bytes() -> usize {
     (((CFMT.load(Ordering::Relaxed) >> 24) as usize).clamp(1, 2)) * 2
 }
 
-/// THE CAPTURE PRODUCER — one completed IN TD's bytes (the claim path; lock-free). Whole frames only; what does not
-/// fit is dropped and counted as one overrun.
+/// THE CAPTURE PRODUCER — one completed IN TD's bytes (the claim path; lock-free). Whole frames only. It never waits
+/// on a reader (MICCURSOR B871): the oldest bytes are overwritten and a reader left more than [`CAPTURE_KEEP`] behind is
+/// caught up by [`read_capture`]. A TD over [`CAP_TD_MAX`] keeps its first `CAP_TD_MAX` bytes and counts one overrun.
 pub fn push_capture(src: &[u8]) {
     let fb = cap_frame_bytes();
     let want = src.len() - src.len() % fb;
     if want == 0 {
         return;
     }
-    let t = CTAIL.load(Ordering::Acquire);
+    let n = want.min(CAP_TD_MAX / fb * fb);
     let h = CHEAD.load(Ordering::Relaxed);
-    let free = RING - h.wrapping_sub(t);
-    let n = free.min(want) / fb * fb;
     let base = CBUF.0.get() as *mut u8;
     for (k, b) in src[..n].iter().enumerate() {
-        // SAFETY: index < RING; these bytes lie past the head, inside `free`: the reader has released them.
-        unsafe { *base.add((h + k) % RING) = *b };
+        // SAFETY: index < RING. These bytes may be the oldest a reader is copying: readers copy volatile and re-read
+        // the head afterwards, dropping whatever this push could have overtaken (`cursor_torn`, CAP_GUARD).
+        unsafe { core::ptr::write_volatile(base.add(h.wrapping_add(k) % RING), *b) };
     }
     CHEAD.store(h.wrapping_add(n), Ordering::Release);
     if n < want {
@@ -694,27 +698,47 @@ pub fn push_capture(src: &[u8]) {
     CFRAMES.fetch_add((n / fb) as u64, Ordering::Relaxed);
 }
 
-/// THE CAPTURE CONSUMER — whole frames into `dst`; returns the bytes read (0 = nothing captured yet).
-pub fn read_capture(dst: &mut [u8]) -> usize {
+/// THE CAPTURE CONSUMER — whole frames from the caller's cursor `cur` into `dst` (MICCURSOR B871: each reader owns its
+/// cursor, so two readers each read every frame). Returns `(bytes read, frames dropped)`: a cursor more than
+/// [`CAPTURE_KEEP`] behind the head is caught up first, and front bytes the producer overtook during the copy are
+/// dropped; either counts one overrun. `cur` advances past what was read and what was dropped.
+pub fn read_capture(cur: &mut usize, dst: &mut [u8]) -> (usize, u64) {
     let fb = cap_frame_bytes();
     let h = CHEAD.load(Ordering::Acquire);
-    let t = CTAIL.load(Ordering::Relaxed);
-    let n = h.wrapping_sub(t).min(dst.len()) / fb * fb;
+    let (start, n, mut dropped) = cursor_take(*cur, h, dst.len(), fb, CAPTURE_KEEP);
     let base = CBUF.0.get() as *const u8;
     for (k, b) in dst[..n].iter_mut().enumerate() {
-        // SAFETY: index < RING; published by the producer's Release store of CHEAD.
-        *b = unsafe { *base.add((t + k) % RING) };
+        // SAFETY: index < RING; published by the producer's Release store of CHEAD (validated below).
+        *b = unsafe { core::ptr::read_volatile(base.add(start.wrapping_add(k) % RING)) };
     }
-    CTAIL.store(t.wrapping_add(n), Ordering::Release);
-    n
+    core::sync::atomic::fence(Ordering::Acquire);
+    let torn = cursor_torn(start, n, CHEAD.load(Ordering::Acquire), fb, CAPTURE_KEEP);
+    if torn > 0 {
+        dst.copy_within(torn..n, 0);
+        dropped += torn;
+    }
+    *cur = start.wrapping_add(n);
+    if dropped > 0 {
+        COVERRUNS.fetch_add(1, Ordering::Relaxed);
+    }
+    (n - torn, (dropped / fb) as u64)
 }
 
-/// A source opens: Ok((channels, rate)). The first opener discards whatever an earlier session left in the ring (no
-/// reader holds it then), so one app never reads another's audio.
+/// MICCURSOR (B871): the ring's producer index — where a new reader's cursor starts (it never reads an earlier session).
+pub fn capture_head() -> usize {
+    CHEAD.load(Ordering::Acquire)
+}
+
+/// MICCURSOR (B871): the bytes of one capture frame (2 mono, 4 stereo) — the unit of [`capture_head`]'s deltas.
+pub fn capture_frame_bytes() -> usize {
+    cap_frame_bytes()
+}
+
+/// A source opens: Ok((channels, rate)). Every opener's cursor starts at [`capture_head`] (MICCURSOR B871), so no
+/// reader ever reads what was captured before it opened.
 pub fn capture_open() -> Result<(u8, u32), &'static str> {
     let Some(c) = *CAP.lock() else { return Err("no-capture-device") };
     if CAP_WANT.fetch_add(1, Ordering::AcqRel) == 0 {
-        CTAIL.store(CHEAD.load(Ordering::Acquire), Ordering::Release);
         CAP_FAIL.store(false, Ordering::Release);
     }
     Ok((c.alt.nch, c.rate))
@@ -1642,4 +1666,69 @@ fn fu_kats(sc: &mut Score) {
         "[uac] fu kat fixture={} size2={} nounit={} monotone={} clamp={} -> {}",
         w(fixture), w(size2_ok), w(nounit_ok), w(monotone), w(clamp), w(fixture && size2_ok && nounit_ok && monotone && clamp)
     );
+}
+
+// ── MICCURSOR (rmbp-ledger B871; BP-audio-11, BP-audio-12) — TAIL-APPENDED: the per-reader capture cursor ──────────────
+// Owner: the audio handler (CODEX §2, Stria A/V), the class driver's capture ring. The ring had one shared tail, so two
+// open sources split its frames (audio.md §5, AUDIOCAPTURE B851 owed). Now the producer index is the clock, each reader
+// holds a cursor (bytes, wrapping), and the copy is checked against the head re-read after it (a seqlock without the
+// sequence: the head IS the sequence). The arithmetic is pure and KAT-tested here; `tests micring3` runs the KAT first.
+// Wire: `[uac] cursor kat wrap=<ok|FAIL> catchup=<ok|FAIL> edge=<ok|FAIL> torn=<ok|FAIL> -> <ok|FAIL>`.
+
+/// The largest TD [`push_capture`] stores: one ESIT of a non-SuperSpeed isochronous IN endpoint (USB 2.0 §5.6.3:
+/// 1023 bytes per frame at full speed, 3 x 1024 per microframe at high-speed high-bandwidth) — at most
+/// `CAP_TD_MAX / cap_frame_bytes()` = 768 stereo or 1536 mono frames. A bigger TD is truncated and counted, never torn.
+pub const CAP_TD_MAX: usize = 3 * 1024;
+/// The bytes behind the head a reader may NOT trust: the producer may be writing up to one TD past the head it has
+/// published, over the ring's oldest bytes.
+const CAP_GUARD: usize = 8 * 1024;
+const _: () = assert!(CAP_TD_MAX < CAP_GUARD && CAP_GUARD < RING, "MICCURSOR: one TD in flight must fit the guard");
+/// How far a reader may lag the head and still read every byte (56 KiB = 298 ms of 48 kHz stereo).
+pub const CAPTURE_KEEP: usize = RING - CAP_GUARD;
+
+/// MICCURSOR: the read a cursor `cur` may take at head `head` into `room` bytes of `fb`-byte frames, keeping at most
+/// `keep` bytes behind the head: `(start, bytes, dropped bytes)` — `start` = `cur`, or caught up to within `keep`.
+pub fn cursor_take(cur: usize, head: usize, room: usize, fb: usize, keep: usize) -> (usize, usize, usize) {
+    let fb = fb.max(1);
+    let lag = head.wrapping_sub(cur);
+    let dropped = if lag > keep { (lag - keep).div_ceil(fb) * fb } else { 0 };
+    let start = cur.wrapping_add(dropped);
+    let n = head.wrapping_sub(start).min(room) / fb * fb;
+    (start, n, dropped)
+}
+
+/// MICCURSOR: of `n` bytes copied from `start`, the front bytes the producer may have overwritten by the time the head
+/// read `head2` (whole frames, at most `n`).
+pub fn cursor_torn(start: usize, n: usize, head2: usize, fb: usize, keep: usize) -> usize {
+    let fb = fb.max(1);
+    let lag = head2.wrapping_sub(start);
+    if lag > keep { ((lag - keep).div_ceil(fb) * fb).min(n) } else { 0 }
+}
+
+/// MICCURSOR: the cursor arithmetic's KAT (no device): the wrap of the index past `usize::MAX` and of the ring's edge,
+/// the catch-up of a reader more than a ring behind, the exact KEEP boundary, and a torn front (mono and stereo).
+pub fn cursor_kats() -> bool {
+    let k = CAPTURE_KEEP;
+    // wrap: a cursor just below usize::MAX, the head 1920 bytes on (past the index's wrap and the ring's edge).
+    let c = usize::MAX - 99;
+    let wrap = cursor_take(c, c.wrapping_add(1920), 4096, 4, k) == (c, 1920, 0)
+        && cursor_take(RING - 8, RING + 8, 4096, 4, k) == (RING - 8, 16, 0)
+        && cursor_take(5, 5, 4096, 2, k) == (5, 0, 0);
+    // catch-up: a reader 3 rings behind lands KEEP behind the head; the drop is the rest; the room still bounds the read.
+    let catchup = cursor_take(0, 3 * RING, 4096, 4, k) == (3 * RING - k, 4096, 3 * RING - k)
+        && cursor_take(1000, 1000 + RING + 6, 64, 2, k) == (1000 + RING + 6 - k, 64, RING + 6 - k);
+    // edge: exactly KEEP behind is readable whole; one frame more drops exactly one frame (stereo and mono).
+    let edge = cursor_take(0, k, usize::MAX, 4, k) == (0, k, 0)
+        && cursor_take(0, k + 4, usize::MAX, 4, k) == (4, k, 4)
+        && cursor_take(0, k + 2, 3, 2, k) == (2, 2, 2);
+    // torn: the head moved 100 frames past KEEP during a 4096-byte copy: those 400 bytes go; a copy that stayed inside
+    // KEEP loses nothing; a head that ran a ring on loses the whole copy.
+    let torn = cursor_torn(0, 4096, k + 400, 4, k) == 400
+        && cursor_torn(0, 4096, k, 4, k) == 0
+        && cursor_torn(0, 4096, k + RING, 4, k) == 4096
+        && cursor_torn(10, 64, 10 + k + 3, 2, k) == 4;
+    let w = |b: bool| if b { "ok" } else { "FAIL" };
+    let ok = wrap && catchup && edge && torn;
+    serial_println!("[uac] cursor kat wrap={} catchup={} edge={} torn={} -> {}", w(wrap), w(catchup), w(edge), w(torn), w(ok));
+    ok
 }
