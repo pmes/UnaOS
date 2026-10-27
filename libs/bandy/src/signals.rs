@@ -147,7 +147,12 @@ pub enum SMessage {
 
     // --- AETHER (The Browser) ---
     OpenDocument { url: String },
-    SurfaceBlit { url: String, width: u32, height: u32, pixels: Vec<u8> },
+    /// A surface's pixels (RGBA8, straight alpha; the contract on quartzite's `TetraNode::Surface`). AETHERMACGPU-DAMAGE
+    /// (LEDGER SR320): `damage = Some((x, y, w, h))` says `pixels` carries ONLY that rect's rows (`h * w * 4` bytes, stride
+    /// `w * 4`) of a `width x height` frame the receiver already holds; `None` (omitted from the wire, so a whole frame keeps
+    /// its frozen shape, smessage_kats) is the whole frame. A sender sends a whole frame at least every
+    /// [`SURFACE_FULL_EVERY`] blits so a receiver that lagged on the bus heals.
+    SurfaceBlit { url: String, width: u32, height: u32, pixels: Vec<u8>, #[serde(default, skip_serializing_if = "Option::is_none")] damage: Option<(u32, u32, u32, u32)> },
     PlayMedia { url: String, title: String, mime: String },
     BrowserNavBack,
     BrowserNavForward,
@@ -611,6 +616,10 @@ pub const MOD_CONTROL: u8 = 1 << 1;
 pub const MOD_ALT: u8 = 1 << 2;
 /// Super / Command (GTK's Meta or Super).
 pub const MOD_SUPER: u8 = 1 << 3;
+
+/// AETHERMACGPU-DAMAGE (LEDGER SR320): a sender of damage-only `SurfaceBlit`s sends a whole frame (`damage: None`) at
+/// least once every this many blits, so a receiver that missed one on the lossy bus is repaired within that many.
+pub const SURFACE_FULL_EVERY: u32 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PrincipiaCommand {

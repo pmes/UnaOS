@@ -226,6 +226,8 @@ struct Tab {
     devtools: chrome::devtools::DevTools,
     window: (u32, u32),
     last_lines: Option<Vec<String>>,
+    /// AETHERMACGPU-DAMAGE (SR320): the frame last blitted, so the next blit carries only its changed rows.
+    sent: quartzite::tetra::SurfaceDamage,
 }
 
 impl Tab {
@@ -254,6 +256,7 @@ impl Tab {
             devtools: chrome::devtools::DevTools::new(),
             window,
             last_lines: None,
+            sent: quartzite::tetra::SurfaceDamage::default(),
         }
     }
 
@@ -307,10 +310,13 @@ impl Tab {
         let _ = self.reports.send(r);
     }
 
-    fn blit(&self) {
+    fn blit(&mut self) {
         if self.is_active() {
             let (width, height, pixels) = self.engine.present_rgba();
-            self.bus.fire(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels });
+            // AETHERMACGPU-DAMAGE (SR320): only the rows that changed since the last blit (whole on the tetra rules).
+            if let Some(m) = self.sent.frame("viewport", width, height, pixels) {
+                self.bus.fire(m);
+            }
         }
     }
 
@@ -322,6 +328,7 @@ impl Tab {
         let (w, h) = (self.engine.width, self.engine.height);
         self.engine.damage_rects.push((0, 0, w, h));
         let _ = self.engine.render_frame();
+        self.sent.forget(); // AETHERMACGPU-DAMAGE (SR320): the face holds another tab's frame: this one goes whole
         self.blit();
         self.bus.fire(SMessage::BrowserUrlChanged(self.engine.current_url()));
         self.bus.fire(SMessage::BrowserTitleChanged(self.engine.title.clone()));
@@ -475,7 +482,8 @@ impl Tab {
                 }));
             }
             SMessage::Facet(FacetCommand::ImageRendered { receipt_id, width, height, rgba, .. }) if receipt_id >> 56 == FACET_RECEIPT_TAG >> 56 => {
-                self.show(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels: rgba });
+                self.sent.forget(); // AETHERMACGPU-DAMAGE (SR320): the image replaces the face's frame; the next page blit goes whole
+                self.show(SMessage::SurfaceBlit { url: "viewport".into(), width, height, pixels: rgba, damage: None });
                 if let Some(u) = self.facet_url.take() {
                     self.show(SMessage::BrowserUrlChanged(u.clone()));
                     self.report(TabReport::Url(self.id, u));
@@ -1364,6 +1372,32 @@ mod tests {
                 k.msg
             );
         }
+    }
+
+    /// AETHERMACGPU-DAMAGE (SR320): two frames of a real engine that differ in one row blit as that row alone (the
+    /// shell's `Tab::blit` path: `present_rgba` through `SurfaceDamage`), and the saving is the frame's height.
+    #[test]
+    fn aethermacgpudamage_one_row_kat() {
+        let mut engine = AetherEngine::new();
+        engine.load_html("about:blank", "<html><body><p>damage</p></body></html>", true);
+        let _ = engine.render_frame();
+        let mut sent = quartzite::tetra::SurfaceDamage::default();
+        let (w, h, first) = engine.present_rgba();
+        let Some(SMessage::SurfaceBlit { damage: None, pixels, .. }) = sent.frame("viewport", w, h, first) else { panic!("first blit is whole") };
+        let whole = pixels.len();
+        assert_eq!(whole, (w * h * 4) as usize);
+        let y = h / 2;
+        let at = ((y * w + 3) * 4) as usize;
+        engine.surface[at] ^= 0xFF; // one pixel of row y
+        let (w2, h2, second) = engine.present_rgba();
+        assert_eq!((w2, h2), (w, h));
+        let Some(SMessage::SurfaceBlit { damage, pixels, width, height, .. }) = sent.frame("viewport", w2, h2, second.clone()) else { panic!("a changed frame blits") };
+        assert_eq!((width, height), (w, h));
+        assert_eq!(damage, Some((0, y, w, 1)));
+        let stride = (w * 4) as usize;
+        assert_eq!(pixels, second[y as usize * stride..(y as usize + 1) * stride]);
+        assert_eq!(whole / pixels.len(), h as usize, "one row instead of {h}");
+        assert!(sent.frame("viewport", w2, h2, second).is_none(), "an identical frame sends nothing");
     }
 }
 

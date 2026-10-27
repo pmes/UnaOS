@@ -141,7 +141,7 @@ pub fn bootstrap_probe_view(id: &str, synapse: Synapse) -> NativeView {
         gtk4::glib::spawn_future_local(async move {
             loop {
                 match rx.recv().await {
-                    Ok(SMessage::SurfaceBlit { url, width, height, pixels }) if url == target => {
+                    Ok(SMessage::SurfaceBlit { url, width, height, pixels, damage: None }) if url == target => {
                         *surface.borrow_mut() = (crate::tetra::surface_argb32(&pixels), width, height);
                         da.queue_draw();
                     }

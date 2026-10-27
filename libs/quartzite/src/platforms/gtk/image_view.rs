@@ -123,10 +123,22 @@ pub fn bootstrap_image_surface(id: &str, synapse: Synapse) -> NativeView {
     gtk4::glib::spawn_future_local(async move {
         while let Ok(msg) = rx.recv().await {
             match msg {
-                SMessage::SurfaceBlit { url, width, height, pixels } if url == target_id => {
+                SMessage::SurfaceBlit { url, width, height, pixels, damage } if url == target_id => {
                     // NLE2ORDER (SR227): the Surface takes RGBA (tetra's contract); converted ONCE here to cairo's ARgb32.
-                    *buffer.borrow_mut() = crate::tetra::surface_argb32(&pixels);
-                    *dim.borrow_mut() = (width, height);
+                    match damage {
+                        None => {
+                            *buffer.borrow_mut() = crate::tetra::surface_argb32(&pixels);
+                            *dim.borrow_mut() = (width, height);
+                        }
+                        // AETHERMACGPU-DAMAGE (SR320): only the rect's rows are converted and spliced into the kept frame;
+                        // a frame of another size drops the blit (the sender's next whole frame repairs it).
+                        Some(rect) => {
+                            let same = *dim.borrow() == (width, height);
+                            if !same || !crate::tetra::surface_splice(&mut buffer.borrow_mut(), width, height, rect, &crate::tetra::surface_argb32(&pixels)) {
+                                continue;
+                            }
+                        }
+                    }
                     da_clone.queue_draw();
                 }
                 // SR67: the hovered element's css-ui-4 cursor keyword IS the GTK cursor name

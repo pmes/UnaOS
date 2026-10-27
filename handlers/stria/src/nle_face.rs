@@ -516,7 +516,7 @@ impl Face {
     /// The canvas as the surface's blit.
     pub fn frame(&mut self) -> SMessage {
         let (width, height) = self.canvas;
-        SMessage::SurfaceBlit { url: SURFACE.into(), width, height, pixels: self.paint() }
+        SMessage::SurfaceBlit { url: SURFACE.into(), width, height, pixels: self.paint(), damage: None }
     }
 }
 
@@ -1365,7 +1365,7 @@ mod tests {
 
         // The Face: preview band 48 px high (144 - 16 - 2 x 40), so the 64x48 frame lands 1:1 at x = (320 - 64) / 2.
         let mut face = Face::new(st, src, (320, 144), PixelOrder::Rgba, false);
-        let SMessage::SurfaceBlit { url, width, height, pixels } = face.frame() else { panic!("not a blit") };
+        let SMessage::SurfaceBlit { url, width, height, pixels, .. } = face.frame() else { panic!("not a blit") };
         assert_eq!((url.as_str(), width, height, pixels.len()), (SURFACE, 320, 144, 320 * 144 * 4));
         let still = face.still().expect("a still").clone();
         let mut crop = Vec::with_capacity(64 * 48 * 4);
