@@ -1016,7 +1016,7 @@ refs/heads/exec-rmbp-pdf4fitstatus   02a1235c8 FOLDED-BY-HAND (this commit) 2026
 refs/heads/exec-rmbp-mt7925s5   f359932bd FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-dmaallocehci   dbad75420 cut 2026-10-27 (wave36 batch 11)
 refs/heads/exec-rmbp-nvmebatchread   629f05525 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-zenbookacp   dbad75420 cut 2026-10-27 (wave36 batch 11)
+refs/heads/exec-rmbp-zenbookacp   e4733f77c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-exportsizefixture   43541b9e1 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-aacencpsypreddefault   dbad75420 cut 2026-10-27 (wave36 batch 11)
 refs/heads/exec-rmbp-swapbacksetidsavc   dbad75420 cut 2026-10-27 (wave36 batch 11)

@@ -1078,7 +1078,7 @@ fn reset(base: u64, a: &mut Audit) -> Option<u16> { #[cfg(feature = "hda-tone")]
 // ════════════════════════════════════════════════════════════════════════════════════════════════
 
 /// The whole driver, in one pass. Every exit path stops the CORB and RIRB DMA engines.
-pub fn probe() { if !crate::hw::gate(crate::hw::Probe::Hda) { serial_println!("[hda] absent"); return; } #[cfg(feature = "hda-tone")] if start_reattach() { return; } // ZENBOOKSURVEY (zenbook-ledger Z1): the codec drive (the CS4206-measured GPIO policy) stays off a positively identified non-Apple machine. NETSPLIT (B852) M3: a WARM stream open re-attaches (no reset, no walk); the rule is `start_reattach` at the file tail
+pub fn probe() { if !crate::hw::gate(crate::hw::Probe::Hda) { census(); return; } #[cfg(feature = "hda-tone")] if start_reattach() { return; } // ZENBOOKSURVEY (zenbook-ledger Z1): the codec drive (the CS4206-measured GPIO policy) stays off a positively identified non-Apple machine. ZENBOOKACP (zenbook-ledger Z25): there the read-only codec CENSUS runs instead (`census`, file tail; it prints `[hda] absent` when no controller is found). NETSPLIT (B852) M3: a WARM stream open re-attaches (no reset, no walk); the rule is `start_reattach` at the file tail
     let mut a = Audit::default();
     let found = crate::drivers::pci::PciScanner::audio_inventory();
     if found.is_empty() {
@@ -3034,7 +3034,7 @@ static START_CRST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 #[cfg(feature = "hda-tone")]
 static START_REPLAYED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// GET_SUBSYSTEM_ID (the implementation identification, on the audio function group). [HDA-SPEC §7.3.3.30]
-#[cfg(feature = "hda-tone")]
+#[cfg(feature = "hda")]
 const VERB_GET_SUBSYSTEM_ID: u32 = 0xF20;
 
 /// probe's end (the capture line): keep the walk that found an output path, with its witnesses — the codec's VENDOR_ID,
@@ -3155,8 +3155,8 @@ fn walk_check(g: &mut Rings, cad: u8, afg: u8, pin: u8, kept: (u32, u32, u32), a
 
 /// The codec's audio function group, from the wire: node 0's subordinate node count, then each function group's type
 /// (HDAAMP's lookup, moved out of `run_tone` by HDASTART B869 so `walk_keep` shares it). [HDA-SPEC §7.3.4.3, §7.3.4.4]
-#[cfg(feature = "hda-tone")]
-fn afg_find(rings: &mut Rings, cad: u8, a: &mut Audit) -> Option<u8> {
+#[cfg(feature = "hda")]
+fn afg_find<V: Verbs>(rings: &mut V, cad: u8, a: &mut Audit) -> Option<u8> {
     let sub = rings.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT, a)?;
     a.verbs_get += 1;
     let start = ((sub >> 16) & 0xFF) as u8;
@@ -3179,4 +3179,216 @@ fn afg_find(rings: &mut Rings, cad: u8, a: &mut Audit) -> Option<u8> {
 pub fn start_counts() -> (u32, u32, u32, u32) {
     use core::sync::atomic::Ordering::Relaxed;
     (START_REATTACH.load(Relaxed), START_WALK.load(Relaxed), START_CRST.load(Relaxed), START_REPLAYED.load(Relaxed))
+}
+
+// ── ZENBOOKACP (zenbook-ledger Z25, MEASURE: PASS) — the read-only codec CENSUS — TAIL-APPENDED ─────────────────────
+// `probe`'s gate arm: on a POSITIVELY identified non-Apple machine (`hw::gate(Probe::Hda)` false — the Zenbook UM5606W)
+// the drive path (walk_codec's D0, run_tone's pin / EAPD / the whole-set GPIO drive, all hda-tone) never runs; this
+// census runs instead. Per HDA function (`audio_inventory`, subclass 03: on the Zenbook 1002:1640 HDMI and 1022:15e3,
+// which hosts the ALC294; the ACP 1022:15e2 is class 0480 and only printed): `take` -> `ring::own` (the ONE pair,
+// BP-audio-19) -> `census_link` (the link out of reset: GCTL.CRST raised ONLY if found 0 — a raise, never a reset pulse —
+// then the 521 us discovery window; STATESTS read, never cleared) -> `ring::bring_up` -> per codec `census_codec`: GET
+// verbs only (VENDOR_ID, `afg_find`, GET_SUBSYSTEM_ID, the AFG's SUBNODE_COUNT) -> `Rings::stop` -> `census_unlink`
+// (CRST back to 0 iff this census raised it). `[hda] audit stage=census … verbs-set=0` is the live witness of zero codec
+// writes. Linux keys its UM5606WA quirk (1043:1df3, ALC294_FIXUP_BASS_SPEAKER_15: pin 0x15's connection list -> DACs
+// 0x02/0x03) on the CONTROLLER's PCI subsystem id, so the line carries `pcissid=` (config 0x2C) beside the codec's
+// `subsys=`. LOCKS: `ring::DEV` per controller, nothing taken under it; vol::BASE / WALKED / play::ST untouched.
+
+/// The codec verb door: `Rings` (the live CORB/RIRB) and the KAT's fake codec. `afg_find` is generic over it.
+trait Verbs {
+    fn cmd(&mut self, cad: u8, nid: u8, verb: u32, payload: u32, a: &mut Audit) -> Option<u32>;
+}
+
+impl Verbs for Rings {
+    fn cmd(&mut self, cad: u8, nid: u8, verb: u32, payload: u32, a: &mut Audit) -> Option<u32> {
+        Rings::cmd(self, cad, nid, verb, payload, a)
+    }
+}
+
+/// One codec's census answers.
+struct Census {
+    vid: u32,
+    ssid: u32,
+    afg: u8,
+    nodes: u32,
+}
+
+/// The census of every HDA function on the bus (`probe`'s gate-false arm). Prints `[hda] absent` with no controller.
+fn census() {
+    let mut a = Audit::default();
+    let found = crate::drivers::pci::PciScanner::audio_inventory();
+    if found.is_empty() {
+        serial_println!("[hda] absent");
+        return;
+    }
+    for (bus, slot, func, vend, devid) in found.iter().copied() {
+        let Some(base) = take(bus, slot, func, vend, devid, &mut a) else { continue };
+        let pss = unsafe { crate::arch::pci::read_config_32(bus, slot, func, 0x2C) };
+        let Some(mut rings) = ring::own(base) else {
+            serial_println!("[hda] census ctrl={:04x}:{:04x} rings busy bound_ms={} -> parked", vend, devid, VERB_BOUND_US / 1000);
+            continue;
+        };
+        let gctl = r32(base, REG_GCTL);
+        let (raised, statests) = match census_link(base, gctl, &mut a) {
+            Ok(x) => x,
+            Err(why) => {
+                serial_println!("[hda] census ctrl={:04x}:{:04x} why={} gctl={:#010x} -> parked", vend, devid, why, r32(base, REG_GCTL));
+                continue;
+            }
+        };
+        let (codecs, n) = codecs_of(statests);
+        serial_println!(
+            "[hda] census ctrl={:04x}:{:04x} bdf={}:{}.{} crst={} raised={} statests={:#06x} codecs={}",
+            vend, devid, bus, slot, func, gctl & GCTL_CRST, raised as u8, statests, n
+        );
+        if n == 0 {
+            serial_println!(
+                "[hda] census ctrl={:04x}:{:04x} codecs=0 why={} -> parked",
+                vend, devid, if raised { "no-codec" } else { "statests-clear" }
+            );
+        } else {
+            if ring::bring_up(&mut rings, &mut a) {
+                for &cad in &codecs[..n] {
+                    match census_codec(&mut *rings, cad, &mut a) {
+                        Ok(c) => serial_println!(
+                            "[hda] census codec={} vid={:04x}:{:04x} subsys={:04x}:{:04x} afg=0x{:02x} nodes={} ctrl={:04x}:{:04x} pcissid={:04x}:{:04x} -> parked",
+                            cad, c.vid >> 16, c.vid & 0xFFFF, c.ssid >> 16, c.ssid & 0xFFFF, c.afg, c.nodes,
+                            vend, devid, pss & 0xFFFF, pss >> 16
+                        ),
+                        Err("silent") => serial_println!("[hda] census codec={} -> silent", cad),
+                        Err(why) => serial_println!("[hda] census codec={} why={} -> parked", cad, why),
+                    }
+                }
+            }
+            rings.stop(&mut a);
+        }
+        census_unlink(base, raised, &mut a);
+    }
+    a.line("census");
+}
+
+/// Does the census have to raise the link? Only a link found IN reset (GCTL.CRST = 0) [HDA-SPEC §3.3.7].
+fn link_raises(gctl: u32) -> bool {
+    gctl & GCTL_CRST == 0
+}
+
+/// The link out of reset, the census's way: CRST raised only when found 0 (the controller's registers are held in
+/// reset until then), observed 1 within 1 ms, then the codec-discovery window (521 us, `reset`'s 600). A live link is
+/// not written. Returns `(raised, STATESTS)`; STATESTS is read, never cleared.
+fn census_link(base: u64, gctl: u32, a: &mut Audit) -> Result<(bool, u16), &'static str> {
+    let raised = link_raises(gctl);
+    if raised {
+        w32(base, REG_GCTL, gctl | GCTL_CRST);
+        a.ctrl += 1;
+        if !wait_us(1000, || r32(base, REG_GCTL) & GCTL_CRST != 0) {
+            census_unlink(base, true, a);
+            return Err("crst-would-not-deassert");
+        }
+        delay_us(600);
+    }
+    Ok((raised, r16(base, REG_STATESTS)))
+}
+
+/// The controller as found: CRST back to 0 iff the census raised it.
+fn census_unlink(base: u64, raised: bool, a: &mut Audit) {
+    if !raised {
+        return;
+    }
+    w32(base, REG_GCTL, r32(base, REG_GCTL) & !GCTL_CRST);
+    a.ctrl += 1;
+    let _ = wait_us(1000, || r32(base, REG_GCTL) & GCTL_CRST == 0);
+}
+
+/// The codec addresses a STATESTS word names.
+fn codecs_of(statests: u16) -> ([u8; MAX_CODECS], usize) {
+    let mut c = [0u8; MAX_CODECS];
+    let mut n = 0usize;
+    for i in 0..MAX_CODECS {
+        if statests & (1u16 << i) != 0 {
+            c[n] = i as u8;
+            n += 1;
+        }
+    }
+    (c, n)
+}
+
+/// One codec, GET verbs only: VENDOR_ID (node 0), the audio function group (`afg_find`), its SUBSYSTEM_ID and its
+/// SUBNODE_COUNT. `Err("silent")` = VENDOR_ID unanswered (no further verb).
+fn census_codec<V: Verbs>(v: &mut V, cad: u8, a: &mut Audit) -> Result<Census, &'static str> {
+    let Some(vid) = v.cmd(cad, 0, VERB_GET_PARAMETER, PARAM_VENDOR_ID, a) else { return Err("silent") };
+    a.verbs_get += 1;
+    let Some(afg) = afg_find(v, cad, a) else { return Err("no-afg") };
+    let Some(ssid) = v.cmd(cad, afg, VERB_GET_SUBSYSTEM_ID, 0, a) else { return Err("no-ssid") };
+    a.verbs_get += 1;
+    let Some(sub) = v.cmd(cad, afg, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT, a) else { return Err("no-nodes") };
+    a.verbs_get += 1;
+    Ok(Census { vid, ssid, afg, nodes: sub & 0xFF })
+}
+
+/// `tests hdacensus`'s codec: an ALC294 at address 0 behind the verb door (vid 10ec:0294, one function group at 0x01,
+/// type audio, ssid 1043:1df3; widgets 0x02.. — the count 0x23 is a FIXTURE value, not a measured ALC294 count).
+/// Every verb is logged; one whose id is not a GET (0xFxx) counts as a SET.
+struct FakeCodec {
+    silent: bool,
+    verbs: u32,
+    sets: u32,
+}
+
+impl Verbs for FakeCodec {
+    fn cmd(&mut self, cad: u8, nid: u8, verb: u32, payload: u32, _a: &mut Audit) -> Option<u32> {
+        self.verbs += 1;
+        if verb & 0xF00 != 0xF00 {
+            self.sets += 1;
+        }
+        if self.silent || cad != 0 {
+            return None;
+        }
+        match (nid, verb, payload) {
+            (0x00, VERB_GET_PARAMETER, PARAM_VENDOR_ID) => Some(0x10ec_0294),
+            (0x00, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT) => Some(0x0001_0001),
+            (0x01, VERB_GET_PARAMETER, PARAM_FUNCTION_TYPE) => Some(0x0000_0101),
+            (0x01, VERB_GET_SUBSYSTEM_ID, 0) => Some(0x1043_1df3),
+            (0x01, VERB_GET_PARAMETER, PARAM_SUBNODE_COUNT) => Some(0x0002_0023),
+            _ => None,
+        }
+    }
+}
+
+/// ZENBOOKACP (Z25): `tests hdacensus` — the census over a fake codec behind the verb door (a fake MMIO CORB/RIRB
+/// would test nothing: no RAM register file advances RIRBWP). Cases: alc294 (the answers, 5 verbs, 0 sets), silent
+/// (one verb, Err("silent")), statests (the codec list), plan (CRST raised only when found 0).
+pub fn census_selftest() {
+    let mut a = Audit::default();
+    let mut f = FakeCodec { silent: false, verbs: 0, sets: 0 };
+    let got = census_codec(&mut f, 0, &mut a);
+    let (vid, ssid, afg, nodes) = match &got {
+        Ok(c) => (c.vid, c.ssid, c.afg, c.nodes),
+        Err(_) => (0, 0, 0, 0),
+    };
+    let alc = got.is_ok() && vid == 0x10ec_0294 && ssid == 0x1043_1df3 && afg == 0x01 && nodes == 0x23 && f.verbs == 5 && f.sets == 0;
+    let mut s = FakeCodec { silent: true, verbs: 0, sets: 0 };
+    let silent = matches!(census_codec(&mut s, 0, &mut a), Err("silent")) && s.verbs == 1 && s.sets == 0;
+    let (_, n1) = codecs_of(0x0001);
+    let (c5, n5) = codecs_of(0x0005);
+    let (_, n0) = codecs_of(0x0000);
+    let statests = n1 == 1 && n5 == 2 && c5[0] == 0 && c5[1] == 2 && n0 == 0;
+    let plan = link_raises(0x0000_0100) && !link_raises(0x0000_0101);
+    let cases = [("alc294", alc), ("silent", silent), ("statests", statests), ("plan", plan)];
+    let mut ok = 0usize;
+    let mut first: Option<&str> = None;
+    for (name, r) in cases {
+        serial_println!("[hda] census kat case={} {}", name, if r { "ok" } else { "FAIL" });
+        if r {
+            ok += 1;
+        } else if first.is_none() {
+            first = Some(name);
+        }
+    }
+    match first {
+        None => serial_println!(
+            ":: HDACENSUS: codecs={} vid={:04x}:{:04x} subsys={:04x}:{:04x} afg=0x{:02x} nodes={} sets={} cases={}/{} -> PASS ::",
+            n1, vid >> 16, vid & 0xFFFF, ssid >> 16, ssid & 0xFFFF, afg, nodes, f.sets + s.sets, ok, cases.len()
+        ),
+        Some(name) => serial_println!(":: HDACENSUS: codecs={} cases={}/{} -> FAIL :: case={} ::", n1, ok, cases.len(), name),
+    }
 }
