@@ -33,7 +33,7 @@
 //!   (the section at the tail; NLE6MIX rmbp-ledger B899: a transition mixes a second run through timeline_core's one
 //!   `vmix::mix_step`; no sound yet).
 //!
-//! Wire: `[vplay] job spawn|run|exit …`, `[player] video codec=<vp8|av1> size=<w>x<h> fps=<n> …` (player.rs),
+//! Wire: `[vplay] job spawn|run|exit …`, `[vplay] colour matrix=<n> range=<limited|full> src=<container|bitstream|default>` (KERNELCOLOUR rmbp-ledger B952, the tail), `[player] video codec=<vp8|av1> size=<w>x<h> fps=<n> …` (player.rs),
 //! `:: VIDEOPLAYER: open=ok frames=<n> dropped=<n> fps=<n> av_sync_ms=<n> clock=<audio|wall> -> PASS ::`
 //! (`tests videoplayer`, R80: typed). Not here: video seek (SEEKTABLE B433), hardware decode.
 //! Design: docs/dev/evidence/rmbp-1005/videoplayer.md.
@@ -44,7 +44,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use demux_core::{Codec, Demuxer};
+use demux_core::{colour::Colour, Codec, Demuxer};
 
 /// `play-vdec`'s stack. The chains are heap-backed (vp8_core's `Decoder` is 1320 B, av1_core's `StreamDecoder`
 /// 280 B, host-measured); the decode frames are the cores' own. 256 KiB = AV1's tile/transform frames plus the
@@ -151,8 +151,8 @@ fn read_all(path: &str) -> Result<Vec<u8>, String> {
 // ── the picture decoders (the shared cores, behind one enum) ────────────────────────────────────────────────
 
 enum Pic {
-    Vp8(Box<vp8_core::Decoder>),
-    Av1(Box<av1_core::image::StreamDecoder>),
+    Vp8(Box<vp8_core::Decoder>, Option<Colour>), // KERNELCOLOUR (B952): the track's colour (`open_colour`), converted per picture
+    Av1(Box<av1_core::image::StreamDecoder>, Option<Colour>),
     /// NLE6 (SR207): demux_core's `utp1` test stream — its packet carries its ordinal (`build::TestPatternPacket`).
     Utp1,
 }
@@ -160,8 +160,8 @@ enum Pic {
 impl Pic {
     fn new(t: &demux_core::Track) -> Result<Pic, String> {
         match t.codec {
-            Codec::Vp8 => Ok(Pic::Vp8(Box::new(vp8_core::Decoder::new()))),
-            Codec::Av1 => av1_core::image::StreamDecoder::new(&t.config).map(|d| Pic::Av1(Box::new(d))).map_err(|e| alloc::format!("av1: {:?}", e)),
+            Codec::Vp8 => Ok(Pic::Vp8(Box::new(vp8_core::Decoder::new()), t.colour)),
+            Codec::Av1 => av1_core::image::StreamDecoder::new(&t.config).map(|d| Pic::Av1(Box::new(d), t.colour)).map_err(|e| alloc::format!("av1: {:?}", e)),
             Codec::TestPattern => Ok(Pic::Utp1),
             ref c => Err(alloc::format!("no decoder for {} in this tree (vp8, av1, utp1)", tok(c))),
         }
@@ -170,7 +170,7 @@ impl Pic {
     /// One packet → the picture it shows (`None`: an alt-ref / dropped frame that shows nothing).
     fn decode(&mut self, data: &[u8]) -> Result<Option<(usize, usize, Vec<u32>)>, String> {
         match self {
-            Pic::Vp8(d) => {
+            Pic::Vp8(d, c) => {
                 if data.is_empty() {
                     return Ok(None);
                 }
@@ -180,13 +180,13 @@ impl Pic {
                     Err(e) => return Err(alloc::format!("vp8: {:?}", e)),
                 };
                 let y = vp8_core::Yuv420::from_picture(&pic);
-                let rgba = vp8_core::yuv::to_rgba(&y);
+                let rgba = colour_rgba_vp8(&y, *c);
                 Ok(Some((y.width as usize, y.height as usize, pack(&rgba))))
             }
-            Pic::Av1(d) => {
+            Pic::Av1(d, c) => {
                 let planes = d.decode_temporal_unit(data).map_err(|e| alloc::format!("av1: {:?}", e))?;
-                let img = av1_core::image::planes_to_rgba(&planes, av1_core::image::Upsampling::Bilinear);
-                Ok(Some((img.w as usize, img.h as usize, pack(&img.rgba))))
+                let rgba = colour_rgba_av1(&planes, *c);
+                Ok(Some((planes.width as usize, planes.height as usize, pack(&rgba))))
             }
             Pic::Utp1 => {
                 // the stream's own decoder: the packet names its frame; the picture is a flat field whose level steps
@@ -488,7 +488,7 @@ fn job_task(arg: usize) {
             return job_exit(jid, paint, "demux-refused", 0, 0);
         }
     };
-    let Some(vt) = d.video_track().cloned() else {
+    open_colour(&mut d, true); let Some(vt) = d.video_track().cloned() else {
         fail(String::from("no video track"));
         return job_exit(jid, paint, "no-video", 0, 0);
     };
@@ -728,8 +728,8 @@ fn poster_task(arg: usize) {
     let Some(path) = POSTER.lock().as_ref().filter(|p| p.jid == jid).map(|p| p.path.clone()) else { return };
     let t0 = now();
     let r: Result<(Option<Facts>, Option<Frame>), String> = (|| {
-        let d = Demuxer::open(read_all(&path)?).map_err(|e| alloc::format!("{}", e))?;
-        let vt = d.video_track().cloned().ok_or_else(|| String::from("no video track"))?;
+        let mut d = Demuxer::open(read_all(&path)?).map_err(|e| alloc::format!("{}", e))?;
+        open_colour(&mut d, false); let vt = d.video_track().cloned().ok_or_else(|| String::from("no video track"))?;
         let f = facts_of(&d);
         let mut pic = Pic::new(&vt)?;
         for s in d.track_samples(d.track_index(vt.id).unwrap_or(0)).take(8) {
@@ -854,6 +854,8 @@ pub struct EdlReport {
     /// Pictures decoded unseen (the run-up from a keyframe).
     pub runup: u64,
     pub gaps: u64,
+    /// KERNELCOLOUR (B952): `(output tick, FNV-1a 64 of the RGBA)` of the first [`CODED_CAP`] coded pictures (no utp1 ordinal).
+    pub coded: Vec<(i64, u64)>,
     /// Per video step: `(output tick, (source, source tick), carries a seek)`; at most [`SHOWN_CAP`].
     pub plan: Vec<(i64, Option<(u32, i64)>, bool)>,
     /// NLE6MIX (B899): frames mixed inside a transition, outgoing runs opened at a keyframe, refused second slots, the
@@ -927,8 +929,8 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         let Some(rp) = [".MP4", ".WEBM", ".MKV"].iter().map(|x| alloc::format!("{}/{}{}", dir, s.reel, x)).find(|p| mt.stat(p).is_ok()) else {
             return Err(("reel-missing", Some(alloc::format!("no file for reel {} beside the EDL ({}/{}.MP4|.WEBM|.MKV)", s.reel, dir, s.reel))));
         };
-        let d = Demuxer::open(read_all(&rp).map_err(|e| ("read-refused", Some(e)))?).map_err(|e| ("demux-refused", Some(alloc::format!("{}: {}", rp, e))))?;
-        let v = d.video_track().and_then(|t| d.track_index(t.id).map(|i| (i, t.clone()))).map(|(i, t)| (i, t, origin(&d, i)));
+        let mut d = Demuxer::open(read_all(&rp).map_err(|e| ("read-refused", Some(e)))?).map_err(|e| ("demux-refused", Some(alloc::format!("{}: {}", rp, e))))?;
+        open_colour(&mut d, true); let v = d.video_track().and_then(|t| d.track_index(t.id).map(|i| (i, t.clone()))).map(|(i, t)| (i, t, origin(&d, i)));
         let a = d.audio_track().and_then(|t| d.track_index(t.id)).map(|i| (i, origin(&d, i)));
         serial_println!(
             "[nle] reel {} path={} codec={} frames={}",
@@ -974,7 +976,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
             }
             Some(id) => {
                 let (w, h, px, ord) = edl_frame(&reels, tl.tb, &mut run, id, s.src_t, s.seek.is_some(), rep, false)?;
-                Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) }
+                coded(rep, s.out_t, ord, &px); Frame { pts_ms, w, h, px, ord: ord.map(|n| (s.out_t, n)) }
             }
         };
         match (s.vmix, refused) {
@@ -1109,7 +1111,7 @@ fn edl_mix(
     };
     let b = unpack(&frame.px);
     timeline_core::vmix::mix_step(m.kind, m.t, &mut a, &b, w as u32, h as u32);
-    let sum = a.iter().fold(crate::video::strip::FNV_BASIS, |acc, x| crate::video::strip::fnv1a(acc, *x));
+    let sum = frame_fnv_rgba(&a);
     if rep.mixes.len() < SHOWN_CAP {
         rep.mixes.push((out_t, sum));
     }
@@ -1146,4 +1148,69 @@ fn unpack(px: &[u32]) -> Vec<u8> {
         v.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8, 255]);
     }
     v
+}
+
+// ── KERNELCOLOUR (rmbp-ledger B952): the open's colour and the picture -> RGBA conversion, Stria's own ────────────────────
+// handlers.md §5 NLEPROBE-HDR's KERNEL-COLOUR. An open (`job_task`, `poster_task`, each EDL reel) fills the video track's
+// `Track::colour` as Stria's opens do: the container's statement (MP4 `colr`, Matroska `Colour`, read by demux_core at open)
+// wins, and the bitstream's (AV1 `av1C`: `av1_core::image::av1c_codes` mapped by `demux_core::colour::Colour::from_av1`, the
+// one mapping gneiss_pal's `colour_of` calls too) fills its gaps through demux_core's one merge, `Demuxer::fill_colour`.
+// Each picture then converts through yuv_core's ONE `pick` (the H.273 matrix, else the size default: BT.601 below 1280x720,
+// BT.709 at it; full range only when stated) and ONE `to_rgba`: VP8 with nearest chroma (Stria's I420 path,
+// `Frame::to_rgba_colour`, so the two agree byte for byte), AV1 with bilinear chroma (Stria's `Av1Decoder` upsampling).
+// Wire: `[vplay] colour matrix=<n> range=<limited|full> src=<container|bitstream|default>`, once per vp8 / av1 open on the
+// job (the poster is silent); `<n>` is the track's stated code, 2 when none (then the size default converts).
+
+/// Coded pictures whose FNV the EDL report keeps (`tests nle` reads the colour witness from them).
+const CODED_CAP: usize = 16;
+
+/// An open's colour: the bitstream's fills what the container did not say ([`Demuxer::fill_colour`]); with `log`, the line.
+fn open_colour(d: &mut Demuxer, log: bool) {
+    let said = d.video_track().and_then(|t| t.colour).is_some_and(|c| c.matrix != 2);
+    d.fill_colour(bitstream_colour);
+    let Some(t) = d.video_track().filter(|t| log && matches!(t.codec, Codec::Vp8 | Codec::Av1)) else { return };
+    let stated = t.colour.map(|c| c.matrix).filter(|m| *m != 2);
+    let (_, full) = yuv_core::pick(stated, t.colour.and_then(|c| c.full_range), t.width, t.height);
+    let src = if said { "container" } else if stated.is_some() { "bitstream" } else { "default" };
+    serial_println!("[vplay] colour matrix={} range={} src={}", stated.unwrap_or(2), if full { "full" } else { "limited" }, src);
+}
+
+/// The bitstream's colour of a video track (what `fill_colour` takes): AV1's `av1C` through the one mapping; VP8 states none.
+fn bitstream_colour(t: &demux_core::Track) -> Option<Colour> {
+    match t.codec {
+        Codec::Av1 => av1_core::image::av1c_codes(&t.config).map(|(c, l, m)| Colour::from_av1(c, l, m)),
+        _ => None,
+    }
+}
+
+/// A VP8 picture -> RGBA by the track's colour: 8-bit 4:2:0, nearest chroma (Stria's `Pixels::I420` path).
+fn colour_rgba_vp8(y: &vp8_core::Yuv420, c: Option<Colour>) -> Vec<u8> {
+    let (w, h) = (y.width as usize, y.height as usize);
+    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), y.width, y.height);
+    let p = yuv_core::Picture { w, h, y: &y.y, u: &y.u, v: &y.v, y_stride: w, uv_stride: y.chroma_width() as usize, ss: (1, 1), mono: false, bit_depth: 8, full };
+    let mut out = alloc::vec![0u8; w * h * 4];
+    yuv_core::to_rgba(&p, m, yuv_core::Chroma::Nearest, false, &mut out);
+    out
+}
+
+/// An AV1 picture -> RGBA by the track's colour: av1_core's own `picture` (any depth, any subsampling) with the pick's
+/// range, bilinear chroma (Stria's `Av1Decoder`).
+fn colour_rgba_av1(planes: &av1_core::image::Planes, c: Option<Colour>) -> Vec<u8> {
+    let (m, full) = yuv_core::pick(c.map(|c| c.matrix), c.and_then(|c| c.full_range), planes.width, planes.height);
+    let p = yuv_core::Picture { full, ..av1_core::image::picture(planes) };
+    let mut out = alloc::vec![0u8; p.w * p.h * 4];
+    yuv_core::to_rgba(&p, m, yuv_core::Chroma::Bilinear, false, &mut out);
+    out
+}
+
+/// The EDL report's coded-picture witness: a picture with no utp1 ordinal, while fewer than [`CODED_CAP`] are kept.
+fn coded(rep: &mut EdlReport, out_t: i64, ord: Option<u32>, px: &[u32]) {
+    if ord.is_none() && rep.coded.len() < CODED_CAP {
+        rep.coded.push((out_t, frame_fnv_rgba(&unpack(px))));
+    }
+}
+
+/// FNV-1a 64 of straight RGBA (the mix witness and the coded witness hash the same bytes).
+fn frame_fnv_rgba(rgba: &[u8]) -> u64 {
+    rgba.iter().fold(crate::video::strip::FNV_BASIS, |acc, x| crate::video::strip::fnv1a(acc, *x))
 }

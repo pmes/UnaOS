@@ -1274,7 +1274,7 @@ pub fn open_flag_agrees() -> Option<bool> {
 // schedule's source tick at that output tick (the job's plan); `seeks` must equal the plan's seek steps and every queued
 // frame must be presented or dropped. NLE6MIX (rmbp-ledger B899): the cut list carries a dissolve A->B and a W001 wipe to
 // black; every transition tick is mixed (`mixed=8`, none refused) and the two mid-transition frames' FNV-1a 64 equal
-// `MIX_KAT`, pinned on the host by timeline_core's `vmix` test through the SAME `vmix::mix_step`.
+// `MIX_KAT`, pinned on the host by timeline_core's `vmix` test through the SAME `vmix::mix_step`. KERNELCOLOUR (rmbp-ledger B952): a third reel, NLEFXC (VP8 with a `colr` of BT.709 limited), at ticks 35..38 converts through yuv_core's `pick` + `to_rgba`; its middle frame's FNV equals `COLOUR_KAT` (`colour=1/1`).
 #[cfg(all(target_arch = "x86_64", feature = "videoplayer"))]
 mod nle_fx {
     use super::{hw, STATE};
@@ -1286,11 +1286,25 @@ mod nle_fx {
     const FPS: u32 = 25;
     /// The reels' frame ordinals start here (a frame names its reel and its index).
     const BASE: [u32; 2] = [1000, 2000];
-    const REELS: [&str; 2] = ["NLEFXA", "NLEFXB"];
+    const REELS: [&str; 3] = ["NLEFXA", "NLEFXB", "NLEFXC"];
     const FRAMES: u32 = 40;
     /// NLE6MIX (B899): `(output tick, FNV-1a 64 of the mixed 64x48 RGBA)` — tick 11 the dissolve at 2/5 (a flat 42), tick
     /// 22 the wipe to black at 3/5 (columns 0..37 black); timeline_core `vmix::tests::kernel_fixture_pins` re-derives both.
     const MIX_KAT: [(i64, u64); 2] = [(11, 0x565d_af03_7163_1325), (22, 0x575d_e51b_bec6_ed25)];
+    /// KERNELCOLOUR (B952): `(output tick, FNV-1a 64 of the 64x48 RGBA)` of NLEFXC's middle frame. Its `colr` says BT.709 limited,
+    /// so yuv_core's `pick` converts by BT.709 (the BT.601 size default would give 0xe0cb_8241_1331_0525). Derived on the host by
+    /// the arc's kat.py: ffmpeg's (normative) VP8 decode of `NLEFXC_KEY`, COLOURONE's integer kernel (shift 8, nearest chroma), FNV-1a 64.
+    const COLOUR_KAT: (i64, u64) = (37, 0x2948_5fdd_7b85_f725);
+    /// NLEFXC's one picture: a libvpx keyframe, 64x48, four flat quadrants (Cb 176 | 94 split at luma column 32, rows at 24).
+    const NLEFXC_KEY: [u8; 112] = [
+        0xf0, 0x05, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x00, 0x30, 0x00, 0x00, 0x07, 0x08, 0x85, 0x85, 0x88,
+        0x85, 0x84, 0x88, 0x00, 0x28, 0x10, 0x13, 0xae, 0xa8, 0x5f, 0xc0, 0x7f, 0x00, 0x79, 0x4a, 0x98,
+        0x8f, 0x01, 0xfc, 0x01, 0xfd, 0x15, 0xdc, 0x01, 0x05, 0x12, 0x35, 0xcb, 0xb6, 0x86, 0xd6, 0xb4,
+        0x40, 0x6d, 0x27, 0x31, 0x84, 0x56, 0x4b, 0x08, 0x00, 0xfe, 0xf1, 0x94, 0x53, 0xe8, 0x96, 0x9f,
+        0xf8, 0x6a, 0x0e, 0x47, 0x76, 0x17, 0xec, 0xc1, 0x54, 0x1e, 0x73, 0x9d, 0xd0, 0x5e, 0xd0, 0x0b,
+        0x7f, 0x16, 0x3d, 0x14, 0xa5, 0xfe, 0xea, 0xc0, 0x00, 0x76, 0x4e, 0x4e, 0x20, 0x03, 0x93, 0x2f,
+        0xa9, 0x38, 0xff, 0xfe, 0xe6, 0x70, 0x00, 0x0c, 0x1b, 0xb6, 0x58, 0x03, 0x5e, 0x76, 0x2a, 0x00,
+    ];
 
     /// A utp1 reel: `FRAMES` 64x48 test-pattern frames at `FPS`, a keyframe every 10, ordinals `base..`.
     fn reel(base: u32) -> Vec<u8> {
@@ -1302,14 +1316,31 @@ mod nle_fx {
         build::mp4(&[video], &build::Mp4Options::default())
     }
 
+    /// KERNELCOLOUR (B952): a VP8 reel of 4 keyframes (`NLEFXC_KEY` each) whose `vp08` sample entry carries a `colr` of BT.709 limited.
+    fn vp8_reel() -> Vec<u8> {
+        use demux_core::build;
+        let mut video = build::test_pattern_track(1, 64, 48, FPS, 4, 1);
+        video.spec.fourcc = *b"vp08";
+        video.spec.config_box = Some(*b"vpcC");
+        video.spec.codec_id = "V_VP8";
+        // vpcC v1: profile 0, level 1.0, 8-bit 4:2:0 limited, BT.709 primaries / transfer / matrix, no init data
+        video.spec.config = alloc::vec![1, 0, 0, 0, 0, 10, 0x82, 1, 1, 1, 0, 0];
+        for s in video.samples.iter_mut() {
+            s.data = NLEFXC_KEY.to_vec();
+        }
+        let bt709 = demux_core::colour::Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false), mastering: None, light: None };
+        build::mp4_with(&[video], &build::Mp4Options::default(), &build::Mp4Extras { colour: alloc::vec![(1, bt709)], ..Default::default() })
+    }
+
     /// The cut list: A 13..23 at 0, B 0..10 at 10, a gap 20..25, A 23..33 at 25; NLE6MIX: a 4-tick dissolve on the cut at
-    /// 10 and a 4-tick W001 wipe to black at 20 (tick 24 stays a gap).
+    /// 10 and a 4-tick W001 wipe to black at 20 (tick 24 stays a gap); KERNELCOLOUR (B952): C 0..4 at 35, after the last cut.
     fn timeline() -> Result<Timeline, EditError> {
         let mut tl = Timeline::new(FPS);
         let a = tl.add_source(REELS[0], FRAMES as i64);
         let b = tl.add_source(REELS[1], FRAMES as i64);
+        let c = tl.add_source(REELS[2], 4);
         tl.add_track(Kind::Video);
-        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25)];
+        tl.tracks[0].clips = alloc::vec![Clip::new(a, 13, 23, 0), Clip::new(b, 0, 10, 10), Clip::new(a, 23, 33, 25), Clip::new(c, 0, 4, 35)];
         tl.add_transition(0, 10, TransitionKind::Dissolve, 4)?.add_transition_to_black(0, 20, TransitionKind::Wipe(WipeDir::LeftToRight), 4)
     }
 
@@ -1330,9 +1361,10 @@ mod nle_fx {
                 return;
             }
         };
-        let files: [(String, Vec<u8>); 3] = [
+        let files: [(String, Vec<u8>); 4] = [
             (alloc::format!("{}.MP4", REELS[0]), reel(BASE[0])),
             (alloc::format!("{}.MP4", REELS[1]), reel(BASE[1])),
+            (alloc::format!("{}.MP4", REELS[2]), vp8_reel()),
             (String::from("NLEFX.EDL"), edl.into_bytes()),
         ];
         let put = |c: &str, body: &[u8]| -> bool {
@@ -1378,14 +1410,15 @@ mod nle_fx {
         let seek_steps = rep.plan.iter().filter(|s| s.2).count() as u64;
         let kat = MIX_KAT.iter().filter(|k| rep.mixes.contains(*k)).count();
         let mix_ok = rep.mixed == 8 && rep.mix_refused == 0 && kat == MIX_KAT.len();
-        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok;
+        let colour = rep.coded.iter().filter(|k| **k == COLOUR_KAT).count(); // KERNELCOLOUR (B952): NLEFXC's middle frame by BT.709
+        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1;
         serial_println!(
             "[nle] fixture edl={} presented={} dropped={} queued={} gaps={} seek_steps={} ms={}{}",
             path, pres, drop, rep.frames, rep.gaps, seek_steps, crate::arch::ms().saturating_sub(t0), err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default()
         );
         serial_println!(
-            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} -> {} ::",
-            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), if ok { "PASS" } else { "FAIL" }
+            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 -> {} ::",
+            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, if ok { "PASS" } else { "FAIL" }
         );
     }
 }

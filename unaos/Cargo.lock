@@ -560,6 +560,7 @@ dependencies = [
  "vp8_core",
  "wifi_core",
  "x86_64",
+ "yuv_core",
 ]
 
 [[package]]
