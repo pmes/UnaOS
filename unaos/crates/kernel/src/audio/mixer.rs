@@ -1198,3 +1198,8 @@ pub fn tap(on: bool) -> Vec<u64> {
     }
     was
 }
+
+/// NLE6EXPORT (rmbp-ledger B959): source `id`'s account in an OFFLINE [`Mix`] (the export's capture, `video::export::bus`): no sink,
+/// so every mixed frame counts as played (the sink position is the emitted-frame index).
+#[cfg(feature = "videoplayer")]
+impl Mix { pub fn account_of(&self, id: u32) -> Option<Played> { self.srcs.iter().find(|s| s.id == id).map(|s| s.account(self.emitted)) } }

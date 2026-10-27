@@ -1249,7 +1249,7 @@ pub mod lidsleep;
 pub mod dnd;
 // VIDEOPLAYER (B434, MACPARITY row 30): the Player's video job — Stria's fulfiller over demux_core + vp8_core + av1_core (UNAOS_VIDEO). x86 `wc` (the Player's window and the worker pool); at the tail so no line above moves.
 #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "videoplayer"))]
-pub mod vplay;
+pub mod vplay; #[cfg(all(target_arch = "x86_64", feature = "wc", feature = "videoplayer"))] pub mod export; // NLE6EXPORT (rmbp-ledger B959): the editor's export on UnaOS (`nle export`), vplay's EDL job in its Encode sink; same gate as vplay. LINE-NEUTRAL append, code before the comment.
 // SVCLATCH (B462, PERFREVIEW F8): the service passes' latches, a posted flag checked before the lock; `tests svclatch`. See video/svclatch.rs.
 pub mod svclatch;
 // GLASSKIT (B628): the glass's drawing kit — anti-aliased rounded rects, strokes, shadows, dithered gradients, circles, lines and the control set; `tests glasskit`. Same gate as dock; at the tail so no line above moves.

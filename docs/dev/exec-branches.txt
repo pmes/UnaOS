@@ -924,4 +924,4 @@ refs/heads/exec-rmbp-pdficc   ede9416e4 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-swapbackvplay   5b23271da FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle6mixface   721600d2c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-stationroamsweep   1703321fe FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-nle6export   781558de2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle6export   c29def3f8 FOLDED-BY-HAND (this commit) 2026-10-27

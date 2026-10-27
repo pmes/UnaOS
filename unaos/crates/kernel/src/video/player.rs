@@ -1412,14 +1412,14 @@ mod nle_fx {
         let kat = MIX_KAT.iter().filter(|k| rep.mixes.contains(*k)).count();
         let mix_ok = rep.mixed == 8 && rep.mix_refused == 0 && kat == MIX_KAT.len(); let mix_ok = mix_ok && face_verdict(&rep, face); // NLE6MIXFACE (rmbp-ledger B957): the fresh outgoing run and the seek preview (module tail)
         let colour = rep.coded.iter().filter(|k| **k == COLOUR_KAT).count(); // KERNELCOLOUR (B952): NLEFXC's middle frame by BT.709
-        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1 && standin_ok(&rep); let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; // NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
+        let ok = open_ok && err.is_none() && ended && pres > 0 && !shown.is_empty() && agree == shown.len() && pres + drop == rep.frames && rep.seeks == seek_steps && mix_ok && colour == 1 && standin_ok(&rep); let (env_ok, env_word) = env_verdict(&env, &rep); let ok = ok && env_ok; let (exp_ok, exp_word) = export_verdict(dir); let ok = ok && exp_ok; // NLE6MIXAUDIO (rmbp-ledger B953): the dissolve's sound (module tail)
         serial_println!(
             "[nle] fixture edl={} presented={} dropped={} queued={} gaps={} seek_steps={} ms={}{}",
             path, pres, drop, rep.frames, rep.gaps, seek_steps, crate::arch::ms().saturating_sub(t0), err.map(|e| alloc::format!(" err={}", e)).unwrap_or_default()
         );
         serial_println!(
-            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 env={} xfades={} swaps={} standin={} -> {} ::",
-            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, env_word, rep.xfades, rep.swaps, rep.stand_in_frames, if ok { "PASS" } else { "FAIL" }
+            ":: NLE: frames={} seeks={} runup={} agree={}/{} counter=frame-ord mix={} kat={}/{} colour={}/1 env={} xfades={} swaps={} standin={} export={} -> {} ::",
+            pres, rep.seeks, rep.runup, agree, shown.len(), rep.mixed, kat, MIX_KAT.len(), colour, env_word, rep.xfades, rep.swaps, rep.stand_in_frames, exp_word, if ok { "PASS" } else { "FAIL" }
         );
     }
 
@@ -1545,5 +1545,59 @@ mod nle_fx {
     /// The stand-in's verdict: one run went to it, its four pictures were shown, and tick 40 is the shared painter's frame.
     fn standin_ok(rep: &vplay::EdlReport) -> bool {
         rep.swaps == 1 && rep.stand_in_frames == 4 && rep.coded.contains(&STANDIN_KAT)
+    }
+
+    // ── NLE6EXPORT (rmbp-ledger B959): the fixture's EDL exported on UnaOS and re-demuxed ─────────────────────────────
+    // After the play-through (the Player closed), `nle export`'s door (`video::export::start`) exports NLEFX.EDL with two B
+    // pictures to `<dir>/NLEFX.MP4` through vplay's Encode sink, and the file is read back through demux_core: the avc1
+    // track's sample count must equal the timeline's ticks and the export's frames, a sample with pts != dts says `ctts` was
+    // written, and (with an audio module) a 48 kHz stereo track whose capture covers the ticks. The kernel has no H.264
+    // decoder: the container only (NLE6EXPORT-HOSTKAT owed: the host decodes the file through h264_core).
+    fn export_verdict(dir: &str) -> (bool, &'static str) {
+        use crate::video::export;
+        let ticks = timeline().map(with_audio).map(|t| t.end()).unwrap_or(0).max(0) as u64;
+        let t0 = crate::arch::ms();
+        let (edl, out) = (alloc::format!("{}/NLEFX.EDL", dir), alloc::format!("{}/NLEFX.MP4", dir));
+        let jid = match export::start(&edl, &out, export::Opts { bframes: 2, ..export::Opts::default() }) {
+            Ok(j) => j,
+            Err(e) => {
+                serial_println!("[nle] fixture export refused ({}) -> FAIL", e);
+                return (false, "FAIL");
+            }
+        };
+        let rep = loop {
+            if let Some(r) = export::report(jid) {
+                break Some(r);
+            }
+            if crate::arch::ms().saturating_sub(t0) > 30_000 {
+                break None;
+            }
+            crate::arch::sched::sleep_ms(4);
+        };
+        let rep = match rep {
+            Some(r) if r.err.is_none() => r,
+            r => {
+                serial_println!("[nle] fixture export out={} err={} -> FAIL", out, r.and_then(|r| r.err).unwrap_or_else(|| String::from("timeout")));
+                return (false, "FAIL");
+            }
+        };
+        let d = match vplay::read_all(&out).and_then(|b| demux_core::Demuxer::open(b).map_err(|e| alloc::format!("demux: {}", e))) {
+            Ok(d) => d,
+            Err(e) => {
+                serial_println!("[nle] fixture export out={} reread={} -> FAIL", out, e);
+                return (false, "FAIL");
+            }
+        };
+        let vi = d.video_track().and_then(|t| d.track_index(t.id));
+        let samples = vi.map(|i| d.track_samples(i).count() as u64).unwrap_or(0);
+        let ctts = vi.is_some_and(|i| d.track_samples(i).any(|s| s.pts != s.dts));
+        let audio_ok = d.audio_track().is_some_and(|t| t.sample_rate == 48_000 && t.channels == 2) && rep.audio_target > 0 && rep.audio_mixed >= rep.audio_target;
+        let need_audio = cfg!(any(feature = "uvc", feature = "hda-tone"));
+        let ok = samples == ticks && rep.frames == ticks && ctts && (audio_ok || !need_audio);
+        serial_println!(
+            "[nle] fixture export out={} samples={} ticks={} ctts={} audio={} mixed={}/{} bytes={} ms={} -> {}",
+            out, samples, ticks, ctts as u8, audio_ok as u8, rep.audio_mixed, rep.audio_target, rep.bytes, rep.ms, if ok { "ok" } else { "FAIL" }
+        );
+        (ok, if !ok { "FAIL" } else if need_audio { "ok" } else { "skip(no-audio)" })
     }
 }

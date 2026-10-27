@@ -81,7 +81,7 @@ pub mod nal;
 pub mod rc;
 pub mod sps;
 pub mod transform;
-pub mod yuv;
+pub mod yuv; pub mod rgba; // NLE6EXPORT (rmbp-ledger B959): the RGBA face both editor exports drive (rgba.rs)
 
 use alloc::boxed::Box;
 use alloc::vec;

@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 use gneiss_pal::dsp::demux::TrackKind;
 use gneiss_pal::dsp::demux::build;
 use gneiss_pal::dsp::image::{PngError, encode_rgba};
-use h264enc_core::yuv::I420;
-use h264enc_core::{Config, Encoder, RateControl, RcMode};
+use h264enc_core::rgba::{RgbaEncoder, Unit};
+use h264enc_core::{Config, RateControl, RcMode};
 use timeline_core::{Timebase, Timeline};
 
 use crate::nle::{RenderError, RenderSink, Sources, render};
@@ -120,57 +120,46 @@ impl VideoEncoder for RawSequence {
 /// SR218), an IDR every `gop` frames): each RGBA frame becomes I420
 /// by `h264enc_core::yuv::I420::from_rgba`, then one access unit, stored as its avcC sample. The encoder is built at
 /// the first frame (its size); a later frame of another size is refused (`h264enc_core::Error::FrameSize`).
+/// NLE6EXPORT (rmbp-ledger B959): the glue is h264enc_core's `rgba::RgbaEncoder` (the kernel's `nle export` drives the same).
 pub struct H264Encoder {
-    qp: u8,
-    gop: u32,
-    rate: Option<RateControl>,
-    bframes: u8,
-    enc: Option<Encoder>,
+    rgba: RgbaEncoder,
 }
 
 impl H264Encoder {
     /// `qp` 16..=40 and `gop` >= 1 (checked by `Encoder::new` at the first frame).
     pub fn new(qp: u8, gop: u32) -> H264Encoder {
-        H264Encoder { qp, gop, rate: None, bframes: 0, enc: None }
+        H264Encoder { rgba: RgbaEncoder::new(Config { qp, gop, ..Default::default() }) }
     }
 
     /// A constant bit rate of `kbps` kbit/s at `fps_num / fps_den` frames per second (`nle export --bitrate`): `qp`
     /// becomes the rate controller's starting QP.
     pub fn with_bitrate(mut self, kbps: u32, fps_num: u32, fps_den: u32) -> H264Encoder {
-        self.rate = Some(RateControl { bits_per_second: kbps.saturating_mul(1000), fps_num, fps_den, mode: RcMode::Cbr });
+        self.rgba.cfg.rate = Some(RateControl { bits_per_second: kbps.saturating_mul(1000), fps_num, fps_den, mode: RcMode::Cbr });
         self
     }
 
     /// `n` B pictures between anchors (H264ENCBFRAMES SR333, h264enc_core's `Config::bframes`): units come out in
     /// decoding order with their (dts, pts), the last ones from `flush`. 0 = the pinned stream.
     pub fn with_bframes(mut self, n: u8) -> H264Encoder {
-        self.bframes = n;
+        self.rgba.cfg.bframes = n;
         self
     }
 }
 
-/// h264enc_core's access units as MP4 samples with their (dts, pts).
-fn h264_units(aus: Vec<h264enc_core::Access>) -> Vec<Access> {
-    aus.into_iter().map(|au| Access { keyframe: au.keyframe, data: au.avcc_sample(), time: Some((au.dts as i64, au.pts as i64)) }).collect()
+/// h264enc_core's units (`rgba::Unit`: the avcC sample and its (dts, pts)) as the seam's [`Access`].
+fn h264_units(units: Vec<Unit>) -> Vec<Access> {
+    units.into_iter().map(|u| Access { keyframe: u.keyframe, data: u.sample, time: Some((u.dts, u.pts)) }).collect()
 }
 
 impl VideoEncoder for H264Encoder {
     fn encode(&mut self, width: u32, height: u32, rgba: &[u8]) -> Result<Vec<Access>, ExportError> {
-        if self.enc.is_none() {
-            self.enc = Some(Encoder::new(Config { width, height, qp: self.qp, gop: self.gop, rate: self.rate, bframes: self.bframes, ..Default::default() }).map_err(ExportError::H264)?);
-        }
-        let enc = self.enc.as_mut().expect("built above");
-        let yuv = I420::from_rgba(width, height, rgba).map_err(ExportError::H264)?;
-        Ok(h264_units(enc.push(&yuv.as_yuv420()).map_err(ExportError::H264)?))
+        Ok(h264_units(self.rgba.push_rgba(width, height, rgba).map_err(ExportError::H264)?))
     }
     fn flush(&mut self) -> Result<Vec<Access>, ExportError> {
-        match self.enc.as_mut() {
-            Some(enc) => Ok(h264_units(enc.flush().map_err(ExportError::H264)?)),
-            None => Ok(Vec::new()),
-        }
+        Ok(h264_units(self.rgba.flush().map_err(ExportError::H264)?))
     }
     fn config(&self) -> VideoConfig {
-        VideoConfig { fourcc: *b"avc1", config_box: Some(*b"avcC"), config: self.enc.as_ref().map(Encoder::avcc).unwrap_or_default() }
+        VideoConfig { fourcc: *b"avc1", config_box: Some(*b"avcC"), config: self.rgba.avcc() }
     }
     fn layout(&self) -> Layout {
         Layout::Mp4
