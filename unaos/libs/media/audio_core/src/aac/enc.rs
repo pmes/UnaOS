@@ -40,10 +40,16 @@
 //!   (AACENC-TNS-DOWN owed: the NMR trial picked downward filters that raised the short-block pre-echo).
 //! * THE PSY MODEL (AACENCTNS, LEDGER SR381; `allowed`): the band energies spread by a two-slope Bark function (3GPP TS
 //!   26.403: `SPREAD_LO_DB` 30 / `SPREAD_HI_DB` 15 dB per Bark, one `Spread` table per block type built in `new`), under a
-//!   spectral-flatness tonality offset (`TONAL_DB` 18 for a tonal band, `NOISE_DB` 6 for a flat one; AACENCTNSNORM SR385:
-//!   the opt-in `Psy::Pred` takes a long block's tonality from the unpredictability of its MDCT magnitudes over the two
-//!   previous long blocks instead, `chaos_tonality`; not the default: on the correlated CPE fixture it overran the
-//!   bitrate by 6 bytes, AACENC-PSY-PRED-DEFAULT owed; with AACENCTNSMULTI's PE lend it is inside the bitrate). A band under the
+//!   tonality offset (`TONAL_DB` 18 for a tonal band, `NOISE_DB` 6 for a flat one). THE TONALITY (AACENCPSYPREDDEFAULT,
+//!   LEDGER SR396; SR385's opt-in made the default): a long block's band tonality is the complex unpredictability of
+//!   3GPP TS 26.403 / ISO/IEC 13818-7 model 2 over the two previous long blocks (`chaos_tonality`): the spectrum is the
+//!   MDCT and its MDST (the sine counterpart, the complex spectrum's imaginary part, `Encoder::mdst`: the ONE transform
+//!   on the time-reversed windowed block, MDST_k(z) = -(-1)^k MDCT_k(z reversed), so no second window or transform),
+//!   and each line's (r, φ) is predicted as (2r1 - r2, 2φ1 - φ2). A magnitude-only predictor read the 1 kHz tone as noise
+//!   (its MDCT magnitudes cycle every 3 blocks: tonality 0.00 / 0.61 / 0.00; the complex one 1.00 on each); an MDST
+//!   estimated from the MDCT's neighbour bins was measured and rejected (residual -2.9 dB, the tone 0.21 / 0.09 / 0.00).
+//!   A short block, a block without two long predecessors and a band whose history is silent take the spectral
+//!   flatness instead (Johnston; the `Psy::Flatness` switch takes it everywhere). A band under the
 //!   floor below is not coded; a band the model masks keeps a base scalefactor (never coarser than the last that codes
 //!   anything) the inner loop's spare bits reach (the seat's ruling: with the masked bands dropped, the 1 kHz tone fell to
 //!   36.7 dB). THE BIT RESERVOIR: a frame borrows from the bits earlier frames left (capped at `AU_MAX_BITS` a channel) and
@@ -91,7 +97,7 @@ const TONAL_DB: f64 = 18.0;
 const NOISE_DB: f64 = 6.0;
 const SFM_TONAL_DB: f64 = -60.0;
 /// AACENCTNSNORM (LEDGER SR385): `Psy::Pred`'s chaos -> tonality map (ISO/IEC 13818-7 psychoacoustic model 2):
-/// tonality = clamp(PRED_A - PRED_B · ln c, 0, 1).
+/// tonality = clamp(PRED_A - PRED_B · ln c, 0, 1); AACENCPSYPREDDEFAULT (SR396): c the complex unpredictability, the default.
 const PRED_A: f64 = -0.299;
 const PRED_B: f64 = 0.43;
 const ATH: f64 = 1000.0;
@@ -210,13 +216,14 @@ impl Coded {
     }
 }
 
-/// The psy model's tonality source (AACENCTNSNORM, LEDGER SR385): the band's spectral flatness (the default), or the
-/// unpredictability of its MDCT magnitudes over the two previous long blocks (opt-in, AACENC-PSY-PRED).
+/// The psy model's tonality source (AACENCTNSNORM, LEDGER SR385): the complex unpredictability of the band's MDCT +
+/// MDST over the two previous long blocks (the default since AACENCPSYPREDDEFAULT, LEDGER SR396), or the band's
+/// spectral flatness everywhere (the switch).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Psy {
-    Flatness,
-    /// opt-in: only the KATs choose it today (no caller sets it)
+    /// the switch: only the KATs choose it today (no caller sets it)
     #[cfg_attr(not(test), allow(dead_code))]
+    Flatness,
     Pred,
 }
 
@@ -267,7 +274,8 @@ pub struct Encoder {
     reservoir: bool,
     tns_windows: u8,
     /// AACENCTNSNORM (LEDGER SR385): the band-normalised TNS detector on, SR381's attack gate off (KAT switches), the
-    /// tonality source, and per channel the two previous long spectra `Psy::Pred` reads (kept only under Pred)
+    /// tonality source, and per channel the two previous long spectra `Psy::Pred` reads (kept only under Pred; each the
+    /// complex spectrum, 1024 MDCT then 1024 MDST values, AACENCPSYPREDDEFAULT SR396)
     tns_norm: bool,
     tns_gate: bool,
     psy: Psy,
@@ -341,7 +349,7 @@ impl Encoder {
             tns_windows: 0,
             tns_norm: true,
             tns_gate: false,
-            psy: Psy::Flatness,
+            psy: Psy::Pred,
             pred: vec![(None, None); ch],
             tns_multi: true,
             res_pe: true,
@@ -480,9 +488,17 @@ impl Encoder {
         (0..n2).map(|j| -2.0 * y[3 * n4 - 1 - j]).collect()
     }
 
+    /// The MDST of a windowed N-sample block (AACENCPSYPREDDEFAULT, LEDGER SR396): the ONE transform on the block
+    /// reversed, MDST_k(z) = -(-1)^k · MDCT_k(z[N-1-n]) (checked against the direct sine sum by `aac_enc_psy_pred`).
+    fn mdst(&self, z: &[f32]) -> Vec<f32> {
+        let r: Vec<f32> = z.iter().rev().copied().collect();
+        self.mdct(&r).into_iter().enumerate().map(|(k, v)| if k % 2 == 0 { -v } else { v }).collect()
+    }
+
     /// The analysis window of `seq` over a raw 2048-sample block (the decoder's `synth` mirrored, sine shapes) and its
-    /// spectrum: 1024 long coefficients, or eight short windows of 128 (window-major).
-    fn analyse(&self, seq: u8, raw: &[f32]) -> Vec<f32> {
+    /// spectrum: 1024 long coefficients, or eight short windows of 128 (window-major). With `mdst` (AACENCPSYPREDDEFAULT
+    /// SR396) a long block's MDST of the same windowed block too (`Psy::Pred`); a short block has none.
+    fn analyse(&self, seq: u8, raw: &[f32], mdst: bool) -> (Vec<f32>, Option<Vec<f32>>) {
         let (wl, ws) = (&self.win, &self.win_s);
         if seq == EIGHT_SHORT {
             let mut x = vec![0f32; 1024];
@@ -495,7 +511,7 @@ impl Encoder {
                 }
                 x[w * 128..w * 128 + 128].copy_from_slice(&self.mdct(&z));
             }
-            return x;
+            return (x, None);
         }
         let mut z = vec![0f32; 2048];
         if seq == LONG_STOP {
@@ -510,7 +526,7 @@ impl Encoder {
         } else {
             for n in 0..1024 { z[1024 + n] = raw[1024 + n] * wl[1023 - n]; }
         }
-        self.mdct(&z)
+        (self.mdct(&z), if mdst { Some(self.mdst(&z)) } else { None })
     }
 
     fn frame(&mut self, cur: &[i16], next: &[i16]) -> AccessUnit {
@@ -553,15 +569,18 @@ impl Encoder {
                 raw[FRAME + i] = s;
                 self.hist[c][i] = s;
             }
-            let mut s = self.analyse(seq, &raw);
+            // AACENCPSYPREDDEFAULT (SR396): under `Psy::Pred` a long block's MDST too, from the same windowed block
+            let (mut s, sine) = self.analyse(seq, &raw, self.psy == Psy::Pred && !g.short);
             // AACENCTNS: the thresholds from the unfiltered spectrum, then TNS on the window-major spectrum, the thresholds
             // of the filtered bands lowered by the synthesis filter's noise gain (`candidate`)
             let o = if g.short { interleave(&s, &g) } else { s.clone() };
-            // AACENCTNSNORM: `Psy::Pred` reads the two previous long spectra (a short block clears them)
+            // AACENCTNSNORM: `Psy::Pred` reads the two previous long spectra (a short block clears them); AACENCPSYPREDDEFAULT
+            // (SR396): each the complex spectrum, the MDCT then its MDST
             let pred = if self.psy == Psy::Pred { core::mem::replace(&mut self.pred[c], (None, None)) } else { (None, None) };
-            let prev = match (&pred, g.short) { ((Some(p1), Some(p2)), false) => Some((&p1[..], &p2[..])), _ => None };
+            let cur: Option<Vec<f32>> = sine.map(|m| { let mut z = o.clone(); z.extend_from_slice(&m); z });
+            let prev = match (&cur, &pred) { (Some(z), (Some(p1), Some(p2))) => Some((&z[..], &p1[..], &p2[..])), _ => None };
             let (a, fl) = self.allowed(&o, &g, prev);
-            if self.psy == Psy::Pred { self.pred[c] = if g.short { (None, None) } else { (Some(o.clone()), pred.0) }; }
+            if self.psy == Psy::Pred { self.pred[c] = if g.short { (None, None) } else { (cur, pred.0) }; }
             // AACENCTNSNORM: every block whose band-normalised prediction gain passes; SR381's attack gate (LONG_START /
             // EIGHT_SHORT / LONG_STOP only) is the `tns_gate` KAT switch
             let gate = self.tns && (!self.tns_gate || seq != ONLY_LONG);
@@ -645,7 +664,10 @@ impl Encoder {
     /// loudest band per coefficient). Also returned: that floor alone per band (the outer loop's coded-or-not line, the
     /// seat's ruling (B): a band the model masks is still coded when spare bits reach it).
     /// AACENCTNSNORM (SR385): with `prev` (the two previous long spectra, `Psy::Pred`) the tonality is `chaos_tonality`'s.
-    fn allowed(&self, x: &[f32], g: &Grid, prev: Option<(&[f32], &[f32])>) -> (Vec<f64>, Vec<f64>) {
+    /// AACENCPSYPREDDEFAULT (SR396): `prev` = (this block's complex spectrum, the two previous), each 1024 MDCT then 1024
+    /// MDST values; a band whose range is all zero in either previous spectrum (silent history: nothing to predict
+    /// from) takes the flatness tonality.
+    fn allowed(&self, x: &[f32], g: &Grid, prev: Option<(&[f32], &[f32], &[f32])>) -> (Vec<f64>, Vec<f64>) {
         let nb = g.bands();
         let sp = if g.short { &self.spread_s } else { &self.spread_l };
         let energy: Vec<f64> = (0..nb).map(|i| { let (lo, hi) = g.rng(i); x[lo..hi].iter().map(|&v| v as f64 * v as f64).sum() }).collect();
@@ -664,8 +686,8 @@ impl Encoder {
             let geo = x[lo..hi].iter().map(|&v| math::ln(v as f64 * v as f64 + 1.0)).sum::<f64>() / n;
             let sfm = 10.0 * math::log10(math::exp(geo) / (energy[i] / n + 1.0));
             let alpha = match prev {
-                Some((p1, p2)) => chaos_tonality(x, p1, p2, lo, hi),
-                None => (sfm / SFM_TONAL_DB).clamp(0.0, 1.0),
+                Some((z, p1, p2)) if !silent(p1, lo, hi) && !silent(p2, lo, hi) => chaos_tonality(z, p1, p2, lo, hi),
+                _ => (sfm / SFM_TONAL_DB).clamp(0.0, 1.0),
             };
             let off = NOISE_DB + alpha * (TONAL_DB - NOISE_DB);
             (s[i] * db(-off)).max(fl[i])
@@ -1227,21 +1249,43 @@ fn tns_weights(x: &[f32], swb: &[u16], start: usize, end: usize) -> Vec<f64> {
     w
 }
 
-/// AACENCTNSNORM (LEDGER SR385), `Psy::Pred`: band `lo..hi`'s tonality from the unpredictability of its MDCT magnitudes —
-/// per line the prediction r̂ = 2|X(t-1)| - |X(t-2)| from the two previous long spectra `p1`, `p2`, the chaos
-/// c = | |X| - r̂ | / (|X| + |r̂|), the band's energy-weighted mean c mapped by PRED_A - PRED_B · ln c into 0..1.
-fn chaos_tonality(x: &[f32], p1: &[f32], p2: &[f32], lo: usize, hi: usize) -> f64 {
+/// AACENCTNSNORM (LEDGER SR385), `Psy::Pred`; AACENCPSYPREDDEFAULT (LEDGER SR396) the complex predictor of 3GPP TS 26.403
+/// / ISO/IEC 13818-7 model 2: band `lo..hi`'s tonality from the unpredictability of its COMPLEX spectrum. `z`, `p1`,
+/// `p2` (this block, the two previous long blocks) each hold 1024 MDCT then 1024 MDST values: per line z = X + jS,
+/// r = |z|, the prediction r̂ = 2·r1 - r2 at the phase 2·φ1 - φ2 (the unit phasor (z1/r1)²·conj(z2/r2): no trig; 1 where
+/// a previous line is zero), the chaos c = |z - r̂·e^{jφ̂}| / (r + |r̂|), the band's energy-weighted mean c mapped by
+/// PRED_A - PRED_B · ln c into 0..1. (SR385's magnitude-only r̂ = 2|X1| - |X2| read a tone whose MDCT magnitudes cycle
+/// as noise; deleted.)
+fn chaos_tonality(z: &[f32], p1: &[f32], p2: &[f32], lo: usize, hi: usize) -> f64 {
+    const H: usize = FRAME;
     let (mut cw, mut ew) = (0f64, 0f64);
     for i in lo..hi {
-        let r = (x[i] as f64).abs();
-        let rh = 2.0 * (p1[i] as f64).abs() - (p2[i] as f64).abs();
-        let c = (r - rh).abs() / (r + rh.abs() + 1e-9);
+        let (xr, xi) = (z[i] as f64, z[H + i] as f64);
+        let (ar, ai) = (p1[i] as f64, p1[H + i] as f64);
+        let (br, bi) = (p2[i] as f64, p2[H + i] as f64);
+        let r = math::sqrt(xr * xr + xi * xi);
+        let r1 = math::sqrt(ar * ar + ai * ai);
+        let r2 = math::sqrt(br * br + bi * bi);
+        let rh = 2.0 * r1 - r2;
+        let (ur, ui) = if r1 > 1e-9 && r2 > 1e-9 {
+            let (a, b) = (ar / r1, ai / r1);
+            let (sr, si) = (a * a - b * b, 2.0 * a * b);
+            let (c, d) = (br / r2, -bi / r2);
+            (sr * c - si * d, sr * d + si * c)
+        } else {
+            (1.0, 0.0)
+        };
+        let (pr, pi) = (rh * ur, rh * ui);
+        let c = math::sqrt((xr - pr) * (xr - pr) + (xi - pi) * (xi - pi)) / (r + rh.abs() + 1e-9);
         cw += c * r * r;
         ew += r * r;
     }
     let chaos = if ew > 0.0 { cw / ew } else { 1.0 };
     (PRED_A - PRED_B * math::ln(chaos.max(1e-9))).clamp(0.0, 1.0)
 }
+
+/// AACENCPSYPREDDEFAULT (SR396): band `lo..hi` of a stored complex spectrum is all zero (MDCT and MDST): silent history.
+fn silent(p: &[f32], lo: usize, hi: usize) -> bool { p[lo..hi].iter().chain(p[FRAME + lo..FRAME + hi].iter()).all(|&v| v == 0.0) }
 
 /// The two-slope Bark spreading of one block type's bands (3GPP TS 26.403's AAC psy model): `up[b]` the power factor
 /// from band b-1 into b (`SPREAD_HI_DB` per Bark), `down[b]` from band b+1 into b (`SPREAD_LO_DB` per Bark).
@@ -1716,7 +1760,8 @@ mod tests {
 
     /// L = a broadband noise, R = L + an independent ±8: (units, total bytes, per-channel SNR) with M/S on or off and the
     /// one CPE budget on or off.
-    fn correlated(ms: bool, cpe: bool) -> (Vec<AccessUnit>, usize, [f64; 2]) { correlated_psy(ms, cpe, Psy::Flatness) }
+    /// AACENCPSYPREDDEFAULT (SR396): the default's tonality source, `Psy::Pred`.
+    fn correlated(ms: bool, cpe: bool) -> (Vec<AccessUnit>, usize, [f64; 2]) { correlated_psy(ms, cpe, Psy::Pred) }
 
     /// `correlated` with the psy model's tonality source (AACENCTNSNORM, LEDGER SR385: `aac_enc_psy_pred`).
     fn correlated_psy(ms: bool, cpe: bool, psy: Psy) -> (Vec<AccessUnit>, usize, [f64; 2]) {
@@ -1811,7 +1856,9 @@ mod tests {
     /// SR381 (586, 160); AACENCTNSNORM (SR385): (566, 168), the burst's neighbours now filtered by the normalised gate.
     const RESERVOIR_BYTES: (usize, usize) = (566, 168);
     /// AACENCTNSMULTI (LEDGER SR390): the tone + noise-burst units whose long window carries two filters.
-    const TWO_FILTER_UNITS: [usize; 5] = [0, 9, 11, 19, 28];
+    /// AACENCPSYPREDDEFAULT (SR396; SR390's [0, 9, 11, 19, 28] under the flatness tonality): unit 9's NMR trial now keeps
+    /// the one-filter candidate.
+    const TWO_FILTER_UNITS: [usize; 4] = [0, 11, 19, 28];
 
     /// A tone (440 Hz + 2 harmonics) with 512-sample white-noise bursts (abrupt onset) at `BURSTS`, mono.
     fn tone_bursts(frames: usize) -> Vec<i16> {
@@ -1984,20 +2031,84 @@ mod tests {
         for c in 0..2 { assert!(sine[c] >= sine_381[c] - 0.3, "channel {c}: {:.1} dB, the SR381 arm {:.1} dB", sine[c], sine_381[c]); }
     }
 
-    /// `Psy::Pred` (opt-in, AACENC-PSY-PRED): the tonality from the unpredictability of the MDCT magnitudes over the two
-    /// previous long blocks holds the sine within 0.3 dB of SR381 and the correlated CPE at SR378's one-budget floor, and
-    /// both streams decode. Not the default: measured (SR385) the CPE stream at 8539 bytes, over the bitrate's 8533
-    /// (`aac_enc_cpe_budget`'s bound); the 1 kHz tone's MDCT magnitudes cycle every 3 blocks, which a magnitude-only
-    /// two-block prediction reads as partly chaotic (AACENC-PSY-PRED-DEFAULT owed). AACENCTNSMULTI (SR390): under the
-    /// PE lend the CPE stream is 8423 bytes, inside the bitrate (the overrun closed), at 4.9/4.9 dB (SR385 5.0/5.0).
+    /// AACENCPSYPREDDEFAULT (LEDGER SR396): `Psy::Pred`, THE DEFAULT — the complex unpredictability over the MDCT and its
+    /// MDST. (i) `mdst` (the ONE transform on the reversed block) against the direct sine sum; (ii) the phase claim: the
+    /// 1 kHz tone's band (its MDCT magnitudes cycle every 3 blocks) reads tonality >= 0.99 on three consecutive long
+    /// blocks, where SR385's magnitude-only rule (r̂ = 2|X1| - |X2|, here test-local) read < 0.7 on each (measured
+    /// 1.00 / 1.00 / 1.00 against 0.00 / 0.61 / 0.00); (iii) against the `Psy::Flatness` switch the sine is kept or
+    /// beaten, the correlated CPE within the bitrate at SR378's floor, the M/S pair no worse (measured: sine 56.95/57.54
+    /// against 56.88/57.50, CPE 4.96 at 8419 bytes of 8533 against 4.97, M/S 3.11 against 2.98 dB).
     #[test]
     fn aac_enc_psy_pred() {
+        let e = Encoder::new(48000, 1, 64000).unwrap();
+        // (i) the MDST
+        let z: Vec<f32> = (0..2048).map(|n| (math::sin(n as f64 * 0.37) * 1000.0 + math::cos(n as f64 * 0.011) * 300.0) as f32).collect();
+        let m = e.mdst(&z);
+        let (mut worst, mut peak) = (0f64, 0f64);
+        for k in (0..1024).step_by(37) {
+            let mut s = 0f64;
+            for n in 0..2048 {
+                s += z[n] as f64 * math::sin(2.0 * core::f64::consts::PI / 2048.0 * (n as f64 + 0.5 + 512.0) * (k as f64 + 0.5));
+            }
+            worst = worst.max((2.0 * s - m[k] as f64).abs());
+            peak = peak.max((2.0 * s).abs());
+        }
+        assert!(worst <= peak * 1e-4, "mdst worst {worst} peak {peak}");
+        // (ii) the 1 kHz tone's band over three consecutive long blocks
+        let pcm = sine_pcm(48000, 8192, 1000.0, 16000.0);
+        let mono: Vec<f32> = pcm.iter().step_by(2).map(|&v| v as f32).collect();
+        let cplx = |t: usize| -> Vec<f32> {
+            let (x, s) = e.analyse(ONLY_LONG, &mono[t * 1024..t * 1024 + 2048], true);
+            let mut v = x;
+            v.extend_from_slice(&s.unwrap());
+            v
+        };
+        let swb = t::SWB_1024[e.sf_index()];
+        let band = (0..t::NUM_SWB_1024[e.sf_index()] as usize).find(|&b| swb[b + 1] as usize > 43).unwrap(); // 1 kHz: bin 42.7
+        let (lo, hi) = (swb[band] as usize, swb[band + 1] as usize);
+        let magnitude = |x: &[f32], p1: &[f32], p2: &[f32]| -> f64 {
+            let (mut cw, mut ew) = (0f64, 0f64);
+            for i in lo..hi {
+                let r = (x[i] as f64).abs();
+                let rh = 2.0 * (p1[i] as f64).abs() - (p2[i] as f64).abs();
+                cw += (r - rh).abs() / (r + rh.abs() + 1e-9) * r * r;
+                ew += r * r;
+            }
+            (PRED_A - PRED_B * math::ln((cw / ew).max(1e-9))).clamp(0.0, 1.0)
+        };
+        let mut tone = [(0f64, 0f64); 3];
+        for (k, t0) in (0..3).enumerate() {
+            let (z0, z1, z2) = (cplx(t0 + 2), cplx(t0 + 1), cplx(t0));
+            tone[k] = (chaos_tonality(&z0, &z1, &z2, lo, hi), magnitude(&z0, &z1, &z2));
+        }
+        // (iii) the floors against the switch
         let (sine, sine_b) = sine_with(|e| e.psy = Psy::Pred);
+        let (flat, flat_b) = sine_with(|e| e.psy = Psy::Flatness);
         let (u, bytes, cpe) = correlated_psy(true, true, Psy::Pred);
+        let (_, _, ms) = correlated_psy(true, false, Psy::Pred);
+        let (_, _, ms_flat) = correlated_psy(true, false, Psy::Flatness);
         let cap = 128000 * u.len() * 1024 / 48000 / 8;
-        std::println!("aac_enc_psy_pred: sine {:.1}/{:.1} dB {sine_b} B; correlated one budget {:.1}/{:.1} dB {bytes} bytes, the bitrate's {cap}", sine[0], sine[1], cpe[0], cpe[1]);
-        for c in 0..2 { assert!(sine[c] >= SINE_SR381[c] - 0.3, "channel {c}: Pred {:.1} dB, SR381 {:.1}", sine[c], SINE_SR381[c]); }
-        for c in 0..2 { assert!(cpe[c] >= CPE_SR378, "channel {c}: Pred {:.1} dB, SR378 {CPE_SR378}", cpe[c]); }
+        std::println!("aac_enc_psy_pred: mdst worst {worst:.3e} peak {peak:.3e}; 1 kHz band {band} tonality complex {:.2}/{:.2}/{:.2} magnitude {:.2}/{:.2}/{:.2}; sine {:.2}/{:.2} dB {sine_b} B (flatness {:.2}/{:.2} dB {flat_b} B); correlated one budget {:.2}/{:.2} dB {bytes} bytes, the bitrate's {cap}; M/S {:.2}/{:.2} dB (flatness {:.2}/{:.2})",
+            tone[0].0, tone[1].0, tone[2].0, tone[0].1, tone[1].1, tone[2].1, sine[0], sine[1], flat[0], flat[1], cpe[0], cpe[1], ms[0], ms[1], ms_flat[0], ms_flat[1]);
+        for (c, m) in tone { assert!(c >= 0.99 && m < 0.7, "tone band: complex {c:.3}, magnitude {m:.3}"); }
+        for c in 0..2 { assert!(sine[c] >= flat[c], "channel {c}: Pred {:.2} dB, flatness {:.2}", sine[c], flat[c]); }
+        for c in 0..2 { assert!(cpe[c] >= CPE_SR378, "channel {c}: Pred {:.2} dB, SR378 {CPE_SR378}", cpe[c]); }
+        assert!(bytes <= cap, "Pred CPE {bytes} bytes, the bitrate's {cap}");
+        for c in 0..2 { assert!(ms[c] >= ms_flat[c], "channel {c}: M/S Pred {:.2} dB, flatness {:.2}", ms[c], ms_flat[c]); }
+    }
+
+    /// AACENCPSYPREDDEFAULT (LEDGER SR396): `Psy::Flatness`, the switch (SR381-SR390's default): the spectral-flatness
+    /// tonality everywhere still holds SR381's sine and SR378's one-budget CPE within the bitrate, and both decode
+    /// (measured: sine 56.88/57.50 dB 14270 B, CPE 4.97/4.97 dB 8458 bytes of 8533).
+    #[test]
+    fn aac_enc_psy_flat() {
+        let (sine, sine_b) = sine_with(|e| e.psy = Psy::Flatness);
+        let (u, bytes, cpe) = correlated_psy(true, true, Psy::Flatness);
+        let cap = 128000 * u.len() * 1024 / 48000 / 8;
+        std::println!("aac_enc_psy_flat: sine {:.2}/{:.2} dB {sine_b} B; correlated one budget {:.2}/{:.2} dB {bytes} bytes, the bitrate's {cap}", sine[0], sine[1], cpe[0], cpe[1]);
+        for c in 0..2 { assert!(sine[c] >= SINE_SR381[c], "channel {c}: flatness {:.2} dB, SR381 {:.1}", sine[c], SINE_SR381[c]); }
+        for c in 0..2 { assert!(cpe[c] >= CPE_SR378, "channel {c}: flatness {:.2} dB, SR378 {CPE_SR378}", cpe[c]); }
+        assert!(bytes <= cap, "flatness CPE {bytes} bytes, the bitrate's {cap}");
     }
 
     // ---- AACENCTNSMULTI (LEDGER SR390): two filters, coef_compress; the PE lend
