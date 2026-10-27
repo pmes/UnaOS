@@ -150,6 +150,7 @@ pub enum Doc {
 /// [`fetch_document_final`]'s fetch, with a PDF body kept as bytes instead of refused as non-UTF-8.
 pub async fn fetch_document_any(input: &str) -> Result<(Doc, String)> {
     if input.starts_with("file://") {
+        if let Some(opened) = crate::chrome::host::open_archive(input) { return opened.map(|(html, url)| (Doc::Text(html), url)); } // PAGESAVECOMPLETE (SR398): a .mhtml / .mht file URL opens as its archive (chrome::host); every other file stays refused
         anyhow::bail!("file:// fetches are disabled for security reasons.");
     }
     let urls = normalize_url(input);

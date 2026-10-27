@@ -851,12 +851,15 @@ fn pagesave_mhtml_save_as() {
     assert_eq!(String::from_utf8(parts[0].1.clone()).unwrap().replace("\r\n", "\n"), String::from_utf8(html.clone()).unwrap().replace("\r\n", "\n"), "the root is the staged markup");
     assert_eq!((field(&parts[1].0, "content-type"), field(&parts[1].0, "content-location")), ("image/png".to_string(), IMG.to_string()));
     assert_eq!(parts[1].1, png, "the image part is the cached bytes");
-    // The same Save As chosen as .html lands the markup itself; a PDF-like save named .mhtml lands its bytes unchanged.
+    // The same Save As chosen as .html lands Webpage, Complete (PAGESAVECOMPLETE SR398: the image in `Archive_files/`, its
+    // src rewritten); a PDF-like save named .mhtml lands its bytes unchanged.
     e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
     let html2 = staged_save_as(&mut e).2;
     let plain = dir.join("Archive.html");
     crate::chrome::host::save_bytes_at(&plain, &html2).unwrap();
-    assert_eq!(std::fs::read(&plain).unwrap(), html2, "a .html path: the HTML");
+    let complete = String::from_utf8(std::fs::read(&plain).unwrap()).unwrap();
+    assert!(complete.contains("src=\"Archive_files/a.png\""), "a .html path: Webpage, Complete: {complete}");
+    assert_eq!(std::fs::read(dir.join("Archive_files").join("a.png")).unwrap(), png, "the image beside it");
     let other = dir.join("x.mhtml");
     crate::chrome::host::save_bytes_at(&other, b"%PDF-1.7").unwrap();
     assert_eq!(std::fs::read(&other).unwrap(), b"%PDF-1.7", "bytes that are not the staged page land unchanged");
@@ -1169,4 +1172,127 @@ fn pdf4fitstatus_refit_scale2() {
     let f = e.present_rgba();
     assert_eq!(px(&f, 235, 290), [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2], "the strip is 240 device px at zoom 2");
     assert_ne!(px(&f, 245, 290), [STRIP_BG.0, STRIP_BG.1, STRIP_BG.2], "and stops there");
+}
+
+// =================================================================================================
+// PAGESAVECOMPLETE (LEDGER SR398): Webpage, Complete (a `_files` folder, the markup rewritten); the MHTML reader opening a
+// `.mhtml` file URL; the save-time fetch of a reference the cache did not hold.
+
+/// PAGESAVECOMPLETE (SR398): a fresh scratch folder of this process for KAT `tag`.
+fn pagesave_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("aether-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// PAGESAVECOMPLETE (SR398): a real 1x1 red PNG.
+fn pagesave_png() -> Vec<u8> {
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255])).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    png.into_inner()
+}
+
+/// PAGESAVECOMPLETE (SR398): `body` stored as `url`'s cached response for the page `top` (as SR392's KAT stores it).
+fn pagesave_cache(top: &str, url: &str, ty: &str, body: &[u8]) {
+    let u = gneiss_pal::api::http::Url::parse(url).unwrap();
+    let key = http_core::cache::cache_key(&gneiss_pal::api::http::site_of(top).unwrap(), &u);
+    let mut hdrs = gneiss_pal::api::http::Headers::new();
+    hdrs.append("content-type", ty).unwrap();
+    let mut entry = http_core::cache::Entry::new(key, &u, &gneiss_pal::api::http::Headers::new(), 200, "OK", &hdrs, 0, 0);
+    entry.body = body.to_vec();
+    crate::net::http_cache().put(entry);
+}
+
+/// PAGESAVECOMPLETE (SR398): a Save As to `.html` writes the cached image into `<name>_files/` and rewrites its `src` to
+/// the relative path (the space escaped); a relative link is made absolute, an in-page one kept; the live DOM is untouched.
+#[test]
+fn pagesave_complete_folder() {
+    let _g = pagesave_lock();
+    const TOP: &str = "https://pagesave.example/complete/doc";
+    const IMG: &str = "https://pagesave.example/complete/pic.png";
+    let png = pagesave_png();
+    pagesave_cache(TOP, IMG, "image/png", &png);
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_html(TOP, "<html><head><title>Complete Page</title></head><body><img src=\"pic.png\"><a href=\"next#top\">next</a> <a href=\"#here\">here</a></body></html>", true);
+    e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
+    let (name, _, html) = staged_save_as(&mut e);
+    assert_eq!(name, "Complete Page.html");
+    let dir = pagesave_dir("pagesavecomplete");
+    let to = dir.join("Complete Page.html");
+    assert_eq!(crate::chrome::host::save_bytes_at(&to, &html).unwrap(), to);
+    assert_eq!(std::fs::read(dir.join("Complete Page_files").join("pic.png")).unwrap(), png, "the cached image in the _files folder");
+    let saved = String::from_utf8(std::fs::read(&to).unwrap()).unwrap();
+    assert!(saved.contains("src=\"Complete%20Page_files/pic.png\""), "the img src rewritten: {saved}");
+    assert!(saved.contains("href=\"https://pagesave.example/complete/next#top\""), "a relative link made absolute: {saved}");
+    assert!(saved.contains("href=\"#here\""), "an in-page link kept: {saved}");
+    assert!(e.document.as_ref().unwrap().inner_html().contains("src=\"pic.png\""), "the live DOM is untouched");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// PAGESAVECOMPLETE (SR398): a `.mhtml` file URL opens through the loader: the root is the document at its
+/// Content-Location, the image is decoded from its part (served by the cache's memory tier, no network), the archive's
+/// script does not run (ARCHIVE_CSP), and every other file URL stays refused.
+#[tokio::test]
+async fn pagesave_mhtml_open() {
+    const TOP: &str = "https://pagesave.example/open/doc";
+    const IMG: &str = "https://pagesave.example/open/dot.png";
+    let png = pagesave_png();
+    let html = "<html><head><title>Opened</title></head><body><p>from the archive</p><img src=\"dot.png\"><script>document.title = 'scripted';</script></body></html>";
+    let part = gneiss_pal::mhtml::Part { location: IMG.to_string(), content_type: "image/png".to_string(), body: png };
+    let dir = pagesave_dir("pagesaveopen");
+    let path = dir.join("Opened page.mhtml");
+    std::fs::write(&path, gneiss_pal::mhtml::write(TOP, html, &[part])).unwrap();
+    let url = format!("file://{}", path.display()).replace(' ', "%20");
+    let page = crate::net::fetch_page(&url).await.expect("the archive opens");
+    assert_eq!(page.base_url, TOP, "the document's URL is the root's Content-Location");
+    let img = page.images.iter().find(|(u, _)| u == IMG).map(|(_, i)| i.clone()).expect("the image, decoded from its part");
+    assert_eq!((img.width(), img.height(), img.get_pixel(0, 0).0), (1, 1, [255, 0, 0, 255]));
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_page(page, true);
+    assert!(crate::images::get(IMG).is_some(), "the opened page shows the image");
+    let (title, body) = title_and_body(e.document.as_ref().unwrap());
+    assert_eq!(title, "Opened", "the archive's script did not run");
+    assert!(body.contains("from the archive"), "{body}");
+    assert!(crate::net::fetch_document_any("file:///etc/hostname").await.is_err(), "any other file URL stays refused");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// PAGESAVECOMPLETE (SR398): a reference the cache does not hold is fetched once at save time (here by a stub, in the
+/// page's partition, within the 5 s budget) and lands as its part; a fetch that answers nothing leaves it out.
+#[test]
+fn pagesave_fetch_stub() {
+    let _g = pagesave_lock();
+    const TOP: &str = "https://pagesave.example/fetch/doc";
+    const IMG: &str = "https://pagesave.example/fetch/uncached.png";
+    let png = pagesave_png();
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    let dir = pagesave_dir("pagesavefetch");
+    let to = dir.join("Fetch.mhtml");
+    let asked = std::cell::RefCell::new(Vec::new());
+    for serve in [true, false] {
+        e.load_html(TOP, "<html><head><title>Fetch</title></head><body><img src=\"uncached.png\"></body></html>", true);
+        e.handle_event(Event::KeyDown("Ctrl+Shift+S".to_string()));
+        let html = staged_save_as(&mut e).2;
+        let stub = |url: &str, site: &str, left: std::time::Duration| {
+            asked.borrow_mut().push((url.to_string(), site.to_string()));
+            assert!(left <= std::time::Duration::from_secs(5), "within the budget");
+            (serve && url == IMG).then(|| ("image/png".to_string(), png.clone()))
+        };
+        let archive = crate::chrome::host::page_output(&to, &html, &stub).expect("the staged page's archive");
+        let (root, parts) = gneiss_pal::mhtml::read(&archive).expect("an archive");
+        assert_eq!(root.location, TOP);
+        if serve {
+            assert_eq!(parts.len(), 1, "the fetched image is a part");
+            assert_eq!((parts[0].location.as_str(), parts[0].content_type.as_str(), &parts[0].body), (IMG, "image/png", &png));
+        } else {
+            assert!(parts.is_empty(), "an unfetched reference is left out");
+        }
+    }
+    let site = gneiss_pal::api::http::site_of(TOP).unwrap();
+    assert_eq!(*asked.borrow(), vec![(IMG.to_string(), site.clone()), (IMG.to_string(), site)], "once per save, in the partition");
+    std::fs::remove_dir_all(&dir).unwrap();
 }

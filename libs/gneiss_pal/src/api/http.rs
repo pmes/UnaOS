@@ -236,6 +236,14 @@ impl HttpCache {
         }
     }
 
+    /// PAGESAVECOMPLETE (SR398): store `e` in the memory tier ONLY (emptied by the next [`HttpCache::clear_memory`]),
+    /// never the disk tier: an opened archive's parts serve its own load and never outlive it.
+    pub fn put_memory(&self, e: Entry) {
+        if let Ok(mut m) = self.mem.lock() {
+            m.put(e);
+        }
+    }
+
     pub fn remove(&self, key: &str) {
         if let Ok(mut m) = self.mem.lock() {
             m.remove(key);
