@@ -2894,16 +2894,7 @@ pub fn watch() {
     let Some((what, code)) = lost else { return };
     let why = if what == "beacon-loss" { String::from(what) } else { alloc::format!("{}(reason={})", what, code) };
     let stack = if bound() { "reset" } else { "unbound" };
-    let mut hw = MCU_LINK.try_lock().and_then(|mut g| g.take()); // S9REJOIN (Z59, S9-UNLINK): the channel taken out (lock released) for link_down's commands, put back after; None while a scan/join holds it
-    let took = link_down(&why, hw.as_mut());
-    if let Some(hw) = hw {
-        *MCU_LINK.lock() = Some(hw);
-    }
-    let held = *PROBE.lock();
-    let rel = match held {
-        Some(p) => give_back(p.bar0 + CONN_HOST_CSR_TOP + LPCTL, took),
-        None => "found",
-    };
+    let rel = link_end(&why); // WIFILEAVE (zenbook-ledger Z68): the ONE link end (take the channel, `link_down`, put it back, hand driver-own back), hoisted verbatim to the file tail so `leave` runs the same path
     let rejoin = if rejoin_lose(what) { "armed" } else { "off" }; // S9REJOIN (Z59): the kept plan's backoff armed (REJOIN, a leaf lock); the attempts run on the mt7925-rejoin task
     serial_println!("[mt7925] s9 watch -> lost why={} code={} rel={} stack={} rejoin={}", what, code, rel, stack, rejoin);
 }
@@ -3531,4 +3522,99 @@ pub fn pmk_rows() -> Option<[u8; 32]> {
     let kept = got == P && p.rsn_len == 22 && p.rsn[..22] == [0x30u8; 22] && open.rsn_len == 0;
     pmk_forget(&mut k);
     if kept && k.plan.pmk == [0u8; 32] { Some(got) } else { None }
+}
+
+// ── WIFILEAVE (zenbook-ledger Z68) — the operator leaves the network: the plan dropped, the station's leaving notice, the ONE teardown ──
+// A leave is final: `rejoin_keep(None)`'s drop path (the kept plan's `Drop` zeroizes the PMK; the `mt7925-rejoin` task idles, nothing
+// respawns it until the next operator join), `rekey_clear`, the station's own deauthentication (reason 3, leaving) posted on the
+// link's TX ring BEFORE `link_down` (whose STA_REC remove frees the peer's WTBL entry), the ONE teardown `link_end`. The MCU has no
+// disconnect command of its own (S7/S8 built none; `unlink` only informs the firmware), so the notice is a raw management frame; a
+// silent station is aged out by the AP's inactivity timer. Radio keys: the PTK goes with the STA_REC remove; the GTK slot on wlan 19
+// stays until a rejoin overwrites it (`set_keys` only installs; S10-KEYZERO owed). Owed: S9-ROAM, S10-PMKSA, S10-KEYSTORE,
+// S10-KEYZERO, WIFILEAVE-BUILD, WIFILEAVE-DEAUTH-PMF. Hardware facts only; no code copied.
+
+/// The ONE link end, hoisted verbatim out of `watch` (and now also `leave`'s): the MCU channel taken out of `MCU_LINK` (None while a scan
+/// or join holds it), `link_down`, the channel put back, driver-own handed back when the link's run took it. The `rel=` word.
+fn link_end(why: &str) -> &'static str {
+    let mut hw = MCU_LINK.try_lock().and_then(|mut g| g.take()); // S9REJOIN (Z59, S9-UNLINK): the channel taken out (lock released) for link_down's commands, put back after; None while a scan/join holds it
+    let took = link_down(why, hw.as_mut());
+    if let Some(hw) = hw {
+        *MCU_LINK.lock() = Some(hw);
+    }
+    let held = *PROBE.lock();
+    match held {
+        Some(p) => give_back(p.bar0 + CONN_HOST_CSR_TOP + LPCTL, took),
+        None => "found",
+    }
+}
+
+/// The kept plan out of its slot: the PMK wiped in place (`pmk_forget`) and read back (all zero when it worked); None = no plan.
+#[cfg(feature = "wifi")]
+fn plan_drop_of(k: &mut Option<Kept>) -> Option<[u8; 32]> {
+    let mut old = k.take()?;
+    pmk_forget(&mut old);
+    Some(old.plan.pmk)
+}
+
+/// The operator's leave (`tests wifileave`, no lock held): the plan dropped and its PMK wiped, the group-rekey record cleared, the
+/// station's deauthentication (`deauth(me, bssid)`, the station's frame) posted on the link's ring and awaited, the ONE teardown, ONE line.
+#[cfg(feature = "wifi")]
+pub fn leave(deauth: &dyn Fn([u8; 6], [u8; 6]) -> Vec<u8>) {
+    let pmk = match plan_drop_of(&mut *REJOIN.lock()) {
+        Some(z) if z == [0u8; 32] => "zeroized",
+        Some(_) => "NOT-ZEROED",
+        None => "none",
+    };
+    let keys = rekey_clear();
+    let mut notice = "skip(no-link)";
+    let mut wait = None;
+    {
+        let mut g = S9_LINK.lock();
+        if let Some(l) = g.as_mut() {
+            let f = deauth(l.me, l.bssid);
+            if f.len() < 24 || f.len() > MGMT_MAX {
+                notice = "skip(frame-len)";
+            } else if !room(l) {
+                notice = "skip(no-room)";
+            } else {
+                let slot = l.txb + l.wi as u64 * DATA_SLOT;
+                let w = mgmt_txwi(&f, slot + TX_FRAME_OFF, LEAVE_TOK, l.five, l.band, WCID_PEER);
+                l.wi = tx_put(l.q0, l.wi, slot, &f, &w);
+                l.tx += 1;
+                notice = "sent";
+                wait = Some((l.q0, l.wi));
+            }
+        }
+    }
+    if let Some((q, wi)) = wait {
+        if !tx_done(q, wi) {
+            notice = "sent(unfetched)";
+        }
+    }
+    let rel = link_end("leave");
+    serial_println!(
+        "[mt7925] s9 left reason=operator keys=cleared pmk={} deauth={} rejoins=0 rekeys={} radiokeys=ptk-sta-remove,gtk-owed(S10-KEYZERO) rel={}",
+        pmk, notice, keys, rel
+    );
+}
+
+/// The management token of the leaving notice (the TXD's msdu id; a u8 here, below the data frames' 0x100 range).
+const LEAVE_TOK: u8 = 3;
+
+/// `tests wifileave`'s leg (no device): a local kept plan carrying a PMK, its backoff armed and one attempt due; the drop leaves no
+/// plan (nothing can come due), the PMK reads back all zero, a second drop and a drop with no plan are no-ops.
+#[cfg(feature = "wifi")]
+pub fn leave_kat() -> bool {
+    let plan = RejoinPlan {
+        ssid: [0; 32], ssid_len: 0, bssid: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55], channel: 6, cap: 0x0001,
+        watch: rejoin_kat_judge, again: rejoin_kat_again, dhcp: rejoin_kat_dhcp, pmk: [0x5a; 32], rsn: [0; 128], rsn_len: 0,
+    };
+    let mut k = Some(Kept { plan, r: crate::wifi::assoc::Rejoin::new() });
+    if let Some(x) = k.as_mut() {
+        x.r.lose(1000, "beacon-loss");
+    }
+    let due = k.as_mut().and_then(|x| rejoin_begin(x, 2000)).is_some();
+    let z = plan_drop_of(&mut k);
+    let gone = k.is_none() && k.as_mut().and_then(|x| rejoin_begin(x, 1_000_000)).is_none();
+    due && gone && z == Some([0u8; 32]) && plan_drop_of(&mut k).is_none()
 }
