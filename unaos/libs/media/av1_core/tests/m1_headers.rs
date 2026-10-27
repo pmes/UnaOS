@@ -482,3 +482,58 @@ fn avif_container_public_vectors() {
         assert_eq!((fh.tile_info.tile_cols, fh.tile_info.tile_rows), (1, 1));
     }
 }
+
+// AV1INBANDCOLOUR (LEDGER SR366): an av1C without configOBUs states no colour; the first temporal unit's in-band sequence
+// header does, read by the same walk (`obus_colour`) and fold as the configOBUs.
+
+/// A profile-0 8-bit 4:2:0 reduced sequence header stating `(primaries, transfer, matrix)` and `full`.
+fn inband_seq(cp: u8, tc: u8, mc: u8, full: bool) -> Vec<u8> {
+    reduced_seq(0, &|w| {
+        w.flag(false); // high_bitdepth
+        w.flag(false); // mono_chrome
+        w.flag(true); // color_description_present_flag
+        w.put(8, cp as u64);
+        w.put(8, tc as u64);
+        w.put(8, mc as u64);
+        w.flag(full); // color_range
+        w.put(2, 0); // chroma_sample_position
+        w.flag(false); // separate_uv_delta_q
+    })
+}
+
+/// HDR_CLL metadata (max_cll 1000, max_fall 400).
+fn inband_cll() -> Vec<u8> {
+    let mut p = vec![1u8];
+    p.extend_from_slice(&1000u16.to_be_bytes());
+    p.extend_from_slice(&400u16.to_be_bytes());
+    p
+}
+
+#[test]
+fn av1inband_sequence_codes_equal_the_av1c_reading() {
+    use av1_core::image::{av1c_codes, sequence_codes, stream_codes};
+    let seq = inband_seq(1, 1, 6, true);
+    // A temporal unit as MP4 / Matroska store it: temporal delimiter, sequence header, metadata, padding.
+    let mut tu = obu(2, &[], true);
+    tu.extend(obu(1, &seq, true));
+    tu.extend(obu(5, &inband_cll(), true));
+    tu.extend(obu(15, &[0xAA, 0x55], true));
+    // The same header and metadata as an av1C's configOBUs.
+    let mut full = vec![0x81, 0x00, 0x0C, 0x00];
+    full.extend(obu(1, &seq, true));
+    full.extend(obu(5, &inband_cll(), true));
+    let bare = vec![0x81, 0x00, 0x0C, 0x00];
+    let want = ((1, 1, 6, true), Some((1000, 400)), None);
+    assert_eq!(av1c_codes(&full), Some(want));
+    assert_eq!(sequence_codes(&tu), Some(want), "the in-band header reads as the configOBUs do");
+    assert_eq!(av1c_codes(&bare), None, "an av1C without configOBUs states no colour");
+    assert_eq!(stream_codes(&bare, &tu), Some(want), "the first temporal unit fills it");
+    assert_eq!(stream_codes(&bare, &[]), None);
+    let mut other = obu(2, &[], true);
+    other.extend(obu(1, &inband_seq(9, 16, 9, false), true));
+    assert_eq!(sequence_codes(&other), Some(((9, 16, 9, false), None, None)));
+    assert_eq!(stream_codes(&full, &other), Some(want), "the configOBUs win over the in-band header");
+    let mut no_seq = obu(2, &[], true);
+    no_seq.extend(obu(15, &[0; 3], true));
+    assert_eq!(sequence_codes(&no_seq), None, "a temporal unit with no sequence header");
+}
