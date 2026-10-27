@@ -1042,3 +1042,23 @@ pub(super) fn tx_pwr_ctl(h: &mut Ht, p: &[PwrIn; 3]) -> TxPctl {
     );
     TxPctl { on, idle, status, cmd, targ, idle_regs, tone_ok, samp_stat, c: h.c }
 }
+
+// ── STATIONROAM-XCHAN (rmbp-ledger B898): the kept station's channel switch ─────────────────────────────────────────────
+
+/// `phy_common.c:416-441` (`b43_switch_channel`) -> `phy_ht.c:807-835` (`b43_phy_ht_op_switch_channel`): the hardware half of a
+/// channel switch on the PHY `run` initialised this boot — ONLY `tune` (the 2059 PLL, the PHY channel setup, tx_power_fix, the
+/// 8 ms settle), the same fn `run` calls twice. No one-shot: b43's switch re-runs no init, no tx_prep, no power-control setup
+/// (2.4 GHz power control reads the band's SPROM block, `phy_ht.c` tx_power_ctl_setup) and touches no DMA. Channels 1..12 only:
+/// 13/14 take spuravoid=1 (`phy_ht.c:740-741`), whose PMU PLL step is outside the d11 window (STATIONROAM-SWEEP owed). Refused
+/// BEFORE any write. Preconditions (the caller, `join::retune`): the MAC suspended, the SHM cookie written, no spinlock held
+/// (`tune` sleeps), the d11 owned (the Station taken out of `STATION`).
+#[cfg(feature = "wifi10")]
+pub(super) fn switch_channel(bar0: u64, ch: u16) -> Result<Tune, &'static str> {
+    if !(1..=12).contains(&ch) {
+        return Err("spuravoid");
+    }
+    let Some(e) = chan_entry(2407 + 5 * ch) else { return Err("no-channel-row") };
+    let mut h = Ht::new(bar0);
+    Ok(tune(&mut h, ch, e))
+}
+
