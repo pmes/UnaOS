@@ -176,13 +176,13 @@ fn discover() -> Result<S5, &'static str> {
         // legal in any AML table, and vendors (Apple included) do split their namespace across
         // SSDTs, so the DSDT is searched first and every SSDT after it. First recognisable match
         // wins — duplicate `_S5_` definitions would be a firmware bug, not a case to arbitrate.
-        let mut dsdt: u64 = 0;
-        if fadt_len >= FADT_X_DSDT + 8 {
-            dsdt = ((fadt as usize + FADT_X_DSDT) as *const u64).read_unaligned();
-        }
-        if dsdt == 0 && fadt_len >= FADT_DSDT + 4 {
-            dsdt = ((fadt as usize + FADT_DSDT) as *const u32).read_unaligned() as u64;
-        }
+        let dsdt: u64 = dsdt().map_or(0, |t| t.as_ptr() as u64);
+        // DSDT-ONE (rmbp-ledger B996): the locator is `dsdt()`'s at the file tail, the ONE reader of the FADT's
+        // X_DSDT/DSDT pointer, so its signature check ("DSDT") and its length bound (header..=DSDT_MAX) apply here
+        // too; the open-coded copy that stood here took any non-zero pointer and any length. A DSDT `dsdt()` refuses
+        // reads as 0 — exactly the no-pointer case — so the SSDT scan below still runs and the refusal word is
+        // unchanged. LINE-NEUTRAL: these lines replace the seven of the old locator one for one, so no
+        // `panic::Location` below moves (LEDGER P7).
 
         let mut types = if dsdt != 0 { scan_s5(dsdt) } else { None };
         if types.is_none() {
@@ -773,9 +773,9 @@ pub fn s3_census() -> Option<S3Census> {
         } else {
             facs = 0;
         }
-        let mut dsdt: u64 = 0;
-        if fl >= FADT_X_DSDT + 8 { dsdt = ((fadt as usize + FADT_X_DSDT) as *const u64).read_unaligned(); }
-        if dsdt == 0 && fl >= FADT_DSDT + 4 { dsdt = ((fadt as usize + FADT_DSDT) as *const u32).read_unaligned() as u64; }
+        let dsdt: u64 = dsdt().map_or(0, |t| t.as_ptr() as u64);
+        // DSDT-ONE (B996): `dsdt()`'s locator, the stricter one (signature + DSDT_MAX); a refused DSDT reads as 0, so
+        // `_S3_` still comes from the SSDTs and `pts`/`wak` read 0. LINE-NEUTRAL: three lines for the old three.
         let mut s3 = if dsdt != 0 { scan_sx(dsdt, b"_S3_") } else { None };
         if s3.is_none() {
             acpi::each_table(sdt, es, |addr, sig| { if sig == b"SSDT" { s3 = scan_sx(addr, b"_S3_"); } s3.is_some() });
@@ -848,8 +848,8 @@ pub fn pwrbtn_take() -> Option<bool> {
 }
 
 // ── DWI2CACPI (zenbook-ledger Z32) — the DSDT's bytes for the byte scans that read it — FILE TAIL ────────────────────
-// The FADT names the DSDT (`X_DSDT` preferred, else the legacy `DSDT`), exactly as `discover` and `s3_census` resolve it
-// above (DSDT-ONE owed: those two still open-code the locator). One bounded slice of firmware memory, read-only: the
+// The FADT names the DSDT (`X_DSDT` preferred, else the legacy `DSDT`); this is the ONE locator: `discover` and `s3_census`
+// call it too (DSDT-ONE, rmbp-ledger B996). One bounded slice of firmware memory, read-only: the
 // signature must be "DSDT" and the header's length between the header and DSDT_MAX. First user: `drivers::dwi2c`'s
 // `aml_scan` (a byte scan, BP-power-4: no AML runs).
 
