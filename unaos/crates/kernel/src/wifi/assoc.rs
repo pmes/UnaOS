@@ -26,6 +26,10 @@ pub struct Bss {
     /// The capability Privacy bit or an RSN element (`Beacon::protected`): WPA is unbuilt, so S8 refuses.
     pub protected: bool,
     pub channel: Option<u8>,
+    /// STATIONSHORTCAP (B884): the beacon's capability Short Preamble bit (§9.4.1.4, `w::CAP_SHORT_PREAMBLE`).
+    pub short: bool,
+    /// STATIONERP (B884): the beacon's ERP element first octet (§9.4.2.12, `w::ERP_*`), `None` when absent.
+    pub erp: Option<u8>,
 }
 
 /// A beacon / probe response naming exactly `ssid` (§9.4.2.2), else `None`.
@@ -34,7 +38,7 @@ pub fn bss_match(frame: &[u8], ssid: &[u8]) -> Option<Bss> {
     if ssid.is_empty() || b.ssid != ssid {
         return None;
     }
-    Some(Bss { bssid: b.bssid, protected: b.protected(), channel: b.channel })
+    Some(Bss { bssid: b.bssid, protected: b.protected(), channel: b.channel, short: b.capabilities & w::CAP_SHORT_PREAMBLE != 0, erp: b.erp })
 }
 
 /// §9.2.4.3 for a frame from the AP to the station: addr1 = us, addr2 = addr3 = the BSSID.
@@ -72,10 +76,38 @@ pub fn assoc_reply_air(frame: &[u8], me: Mac, bssid: Mac) -> Option<(AssocResult
 }
 
 /// STATIONSHORTPRE (B862): the station's primary rate uses the short preamble — the AP's capability bit allows it (`cap`) and
-/// the rate is CCK 2/5.5/11 (CCK 1 is long only; OFDM has no such preamble). Until STATIONSHORTCAP (our association request
-/// advertises capability 0x0001 only, `wifi_core::ieee80211::build_assoc_req`) the AP's bit alone decides.
-pub fn station_short(cap: bool, rate: u8) -> bool {
-    cap && matches!(rate, 4 | 11 | 22)
+/// the rate is CCK 2/5.5/11 (CCK 1 is long only; OFDM has no such preamble). STATIONSHORTCAP (B884): our association request
+/// now advertises Short Preamble when the beacon's bit allows it (`assoc_cap`); STATIONERP (B884): the BSS's ERP
+/// Barker_Preamble_Mode (`barker`, `erp_barker`) forces the long preamble regardless of the capability bit.
+pub fn station_short(cap: bool, barker: bool, rate: u8) -> bool {
+    cap && !barker && matches!(rate, 4 | 11 | 22)
+}
+
+/// STATIONSHORTCAP (B884): S9's Capability Information word (§9.4.1.4) — ESS, with Short Preamble only when the BSS's beacon
+/// set its own Short Preamble bit.
+pub fn assoc_cap(b: &Bss) -> u16 {
+    w::CAP_ESS | if b.short { w::CAP_SHORT_PREAMBLE } else { 0 }
+}
+
+/// STATIONERP (B884): the BSS asks for protection (ERP Use_Protection, §9.4.2.12): OFDM frames go behind a CTS-to-self.
+pub fn erp_protect(erp: Option<u8>) -> bool {
+    erp.map_or(false, |e| e & w::ERP_USE_PROTECTION != 0)
+}
+
+/// STATIONERP (B884): the BSS asks for the long preamble (ERP Barker_Preamble_Mode, §9.4.2.12).
+pub fn erp_barker(erp: Option<u8>) -> bool {
+    erp.map_or(false, |e| e & w::ERP_BARKER_PREAMBLE != 0)
+}
+
+/// STATIONERP (B884): the wire's `erp=` value — `<prot|open>,<barker|short>`, or `absent` (no ERP element heard).
+pub fn erp_text(erp: Option<u8>) -> &'static str {
+    match (erp.is_some(), erp_protect(erp), erp_barker(erp)) {
+        (false, _, _) => "absent",
+        (true, true, true) => "prot,barker",
+        (true, true, false) => "prot,short",
+        (true, false, true) => "open,barker",
+        (true, false, false) => "open,short",
+    }
 }
 
 /// STATIONDURATION (B862): the rate the AP answers a frame at `rate` with — the control response rate (IEEE Std 802.11-2020
@@ -166,12 +198,16 @@ pub fn kat() -> (u32, u32, Option<&'static str>, [bool; 6]) {
     other[9] = 0x54;
     checks.push(("auth-resp", 1, auth_reply(&other, STA, BSSID).is_none()));
     checks.push(("auth-resp", 1, auth_reply(&ok[..29], STA, BSSID).is_none()));
-    // 3. assoc-req (§9.3.3.5): cap ESS, listen 3, SSID, Supported Rates 8, Extended Supported Rates 4 — 52 octets.
+    // 3. assoc-req (§9.3.3.5): cap ESS, listen 3, SSID, Supported Rates 8, Extended Supported Rates 4 — 52 octets; STATIONSHORTCAP
+    //    (B884): the same request with cap ESS | Short Preamble differs only in octet 24 (21 00), in the same check.
     let mut want = hdr(0x00, [0, 0], BSSID, STA, BSSID, [0, 0]);
     want.extend_from_slice(&[0x01, 0x00, 0x03, 0x00, 0x00, 0x06]);
     want.extend_from_slice(SSID);
     want.extend_from_slice(&[0x01, 0x08, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 0x32, 0x04, 0x30, 0x48, 0x60, 0x6c]);
-    checks.push(("assoc-req", 2, w::build_assoc_req(STA, BSSID, SSID, 0) == want && want.len() == 52));
+    let mut want_sp = want.clone();
+    want_sp[24] = 0x21;
+    checks.push(("assoc-req", 2, w::build_assoc_req(STA, BSSID, SSID, 0, w::CAP_ESS) == want && want.len() == 52
+        && w::build_assoc_req(STA, BSSID, SSID, 0, w::CAP_ESS | w::CAP_SHORT_PREAMBLE) == want_sp));
     // 4. assoc-resp (§9.3.3.6): cap, status 0, AID 1 with the two top bits set (§9.4.1.8); status 17.
     let mut ar = hdr(0x10, [0x3a, 0x01], STA, BSSID, BSSID, [0x20, 0x00]);
     ar.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x01, 0xc0, 0x01, 0x04, 0x82, 0x84, 0x8b, 0x96]);
@@ -189,7 +225,7 @@ pub fn kat() -> (u32, u32, Option<&'static str>, [bool; 6]) {
     b.extend_from_slice(&[0x64, 0x00, 0x01, 0x04, 0x00, 0x06]);
     b.extend_from_slice(SSID);
     b.extend_from_slice(&[0x03, 0x01, 0x0b]);
-    checks.push(("bss", 5, bss_match(&b, SSID) == Some(Bss { bssid: BSSID, protected: false, channel: Some(11) })));
+    checks.push(("bss", 5, bss_match(&b, SSID) == Some(Bss { bssid: BSSID, protected: false, channel: Some(11), short: false, erp: None })));
     let mut bp = b.clone();
     bp[34] = 0x11;
     checks.push(("bss", 5, bss_match(&bp, SSID).map(|x| x.protected) == Some(true)));

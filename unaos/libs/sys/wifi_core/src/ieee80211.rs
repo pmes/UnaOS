@@ -33,6 +33,15 @@ pub const EID_RSN: u8 = 48;
 /// Supported Rates (§9.4.2.3) and Extended Supported Rates (§9.4.2.13).
 pub const EID_SUPP_RATES: u8 = 1;
 pub const EID_EXT_RATES: u8 = 50;
+/// STATIONERP (rmbp-ledger B884): the ERP element (§9.4.2.12) and its first octet's bits — NonERP_Present, Use_Protection,
+/// Barker_Preamble_Mode.
+pub const EID_ERP: u8 = 42;
+pub const ERP_NON_ERP_PRESENT: u8 = 0x01;
+pub const ERP_USE_PROTECTION: u8 = 0x02;
+pub const ERP_BARKER_PREAMBLE: u8 = 0x04;
+/// STATIONSHORTCAP (B884): the Capability Information bits this station writes (§9.4.1.4) — ESS, Short Preamble.
+pub const CAP_ESS: u16 = 0x0001;
+pub const CAP_SHORT_PREAMBLE: u16 = 0x0020;
 
 /// A 48-bit MAC address.
 pub type Mac = [u8; 6];
@@ -48,6 +57,8 @@ pub struct Beacon {
     pub capabilities: u16,
     /// True when an RSN (WPA2) IE is present — the station must then refuse an OPEN join.
     pub rsn: bool,
+    /// STATIONERP (B884): the ERP element's first octet (`ERP_*` bits), when the element was present with at least one octet.
+    pub erp: Option<u8>,
 }
 
 impl Beacon {
@@ -78,6 +89,7 @@ pub fn parse_beacon(frame: &[u8]) -> Option<Beacon> {
     let mut ssid = Vec::new();
     let mut channel = None;
     let mut rsn = false;
+    let mut erp = None;
     let mut i = 24 + 12;
     while i + 2 <= frame.len() {
         let eid = frame[i];
@@ -90,11 +102,12 @@ pub fn parse_beacon(frame: &[u8]) -> Option<Beacon> {
             EID_SSID => ssid = body.to_vec(),
             EID_DS_PARAM if len >= 1 => channel = Some(body[0]),
             EID_RSN => rsn = true,
+            EID_ERP if len >= 1 => erp = Some(body[0]),
             _ => {}
         }
         i += 2 + len;
     }
-    Some(Beacon { bssid, ssid, channel, capabilities, rsn })
+    Some(Beacon { bssid, ssid, channel, capabilities, rsn, erp })
 }
 
 fn push_mgmt_header(out: &mut Vec<u8>, subtype: u8, da: Mac, sa: Mac, bssid: Mac, seq: u16) {
@@ -145,11 +158,12 @@ pub fn parse_auth(frame: &[u8]) -> Option<AuthResult> {
 
 /// Build an association request (§9.3.3.5) carrying the SSID, Supported Rates (eight: the four CCK
 /// rates as basic + 6/9/12/18) and Extended Supported Rates (24/36/48/54) — an AP whose basic set holds
-/// OFDM rates refuses an 11b-only request.
-pub fn build_assoc_req(sta: Mac, bssid: Mac, ssid: &[u8], seq: u16) -> Vec<u8> {
+/// OFDM rates refuses an 11b-only request. STATIONSHORTCAP (rmbp-ledger B884): `cap` is the Capability Information word
+/// (§9.4.1.4) — `CAP_ESS`, with `CAP_SHORT_PREAMBLE` when the caller's BSS allows it.
+pub fn build_assoc_req(sta: Mac, bssid: Mac, ssid: &[u8], seq: u16, cap: u16) -> Vec<u8> {
     let mut f = Vec::new();
     push_mgmt_header(&mut f, SUBTYPE_ASSOC_REQ, bssid, sta, bssid, seq);
-    f.extend_from_slice(&0x0001u16.to_le_bytes()); // Capability Info: ESS
+    f.extend_from_slice(&cap.to_le_bytes()); // Capability Info
     f.extend_from_slice(&3u16.to_le_bytes()); // Listen interval
     f.push(EID_SSID);
     f.push(ssid.len() as u8);
@@ -288,6 +302,14 @@ mod tests {
         assert_eq!(b.channel, Some(6));
         assert_eq!(b.bssid, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
         assert!(b.rsn && b.protected());
+        assert_eq!(b.erp, None);
+        // STATIONERP (B884): an ERP element (Use_Protection | Barker_Preamble_Mode) is kept; an empty one is not.
+        let mut e = beacon_frame(b"UnaNet", 6, false);
+        e.extend_from_slice(&[EID_ERP, 1, ERP_USE_PROTECTION | ERP_BARKER_PREAMBLE]);
+        assert_eq!(parse_beacon(&e).unwrap().erp, Some(0x06));
+        let mut z = beacon_frame(b"UnaNet", 6, false);
+        z.extend_from_slice(&[EID_ERP, 0]);
+        assert_eq!(parse_beacon(&z).unwrap().erp, None);
         assert!(parse_beacon(&f[..20]).is_none());
         // a malformed IE length is refused, not read past
         let mut bad = f.clone();
@@ -304,7 +326,11 @@ mod tests {
         let (ty, sub) = ((a[0] >> 2) & 3, (a[0] >> 4) & 0xf);
         assert_eq!((ty, sub), (FC_TYPE_MGMT, SUBTYPE_AUTH));
         assert_eq!(u16::from_le_bytes([a[24], a[25]]), 0); // Open System
-        let r = build_assoc_req(sta, bssid, b"UnaNet", 2);
+        let r = build_assoc_req(sta, bssid, b"UnaNet", 2, CAP_ESS);
+        assert_eq!(&r[24..26], &[0x01, 0x00]);
+        let rs = build_assoc_req(sta, bssid, b"UnaNet", 2, CAP_ESS | CAP_SHORT_PREAMBLE);
+        assert_eq!(&rs[24..26], &[0x21, 0x00]);
+        assert_eq!(&rs[26..], &r[26..]);
         // header 24 + capability 2 + listen 2 = 28; SSID eid+len = 2; body at 30.
         assert_eq!(r[28], EID_SSID);
         assert_eq!(&r[30..30 + 6], b"UnaNet");
