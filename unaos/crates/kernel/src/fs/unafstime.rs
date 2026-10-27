@@ -79,7 +79,7 @@ pub fn times_of(mt: &crate::fs::vfs::MountTable, path: &str) -> Option<(u64, u64
 pub fn times_of_id(id: u64) -> Option<(u64, u64)> {
     #[cfg(any(target_arch = "aarch64", feature = "unafs"))]
     {
-        let st = crate::fs::unafs::with_unafs(|fs| fs.stat(id).ok()).ok()??;
+        let st = crate::fs::unafs::with_unafs_read(|fs| fs.stat(id).ok()).ok()??;
         Some((st.ctime, st.mtime))
     }
     #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))]

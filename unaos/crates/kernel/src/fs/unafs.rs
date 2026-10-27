@@ -1230,7 +1230,7 @@ fn native_acl_stage_row(
 /// mount fails. The read is pure (no metadata write-back through the coherent mount). Used by the
 /// migration read-back verify and by a native single-row lookup.
 #[track_caller] pub fn native_acl_read(dir_lba: u64, dir_off: u32) -> Option<NativeAclRow> {
-    with_unafs(|fs| native_acl_read_on(fs, dir_lba, dir_off)).ok().flatten()
+    with_unafs_read(|fs| native_acl_read_on(fs, dir_lba, dir_off)).ok().flatten()
 }
 
 /// K5B: the body of [`native_acl_read`], against an ALREADY-HELD coherent mount — for callers already
@@ -1291,7 +1291,7 @@ fn native_acl_row_of(fs: &mut KernelUnaFS, id: u64) -> Option<NativeAclRow> {
 /// native successor reads this and re-resolves each `name` on the FAT volume). Skips non-`acl-` files
 /// and rows without an owner. On a mount error, an empty list (fail-closed: no owners installed).
 #[track_caller] pub fn native_acl_list() -> Vec<NativeAclRow> {
-    with_unafs(|fs| {
+    with_unafs_read(|fs| {
         let root = fs.superblock.root_inode;
         let mut out = Vec::new();
         let entries = match fs.ls(root) {
@@ -1458,7 +1458,7 @@ pub enum SnapReadResult {
     path: &str,
     principal: &str,
 ) -> Result<SnapReadResult, MountError> {
-    with_unafs(|fs| {
+    with_unafs_read(|fs| {
         // Phase 1: resolve the object's logical id in the snapshot (frozen view
         // borrows fs; scope it so the ACL check below can re-borrow fs).
         let sid = {
@@ -3894,12 +3894,12 @@ pub fn restore_version_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, path: &str
 
 /// FILEVERSIONS (B714): [`versions_on`] on THE mount (`None`: no volume, or no such file).
 #[track_caller] pub fn versions(path: &str) -> Option<Vec<VersionInfo>> {
-    with_unafs(|fs| versions_on(fs, path).ok()).ok().flatten()
+    with_unafs_read(|fs| versions_on(fs, path).ok()).ok().flatten()
 }
 
 /// FILEVERSIONS (B714): [`read_version_on`] on THE mount.
 #[track_caller] pub fn read_version(path: &str, n: usize) -> Option<Vec<u8>> {
-    with_unafs(|fs| read_version_on(fs, path, n).ok()).ok().flatten()
+    with_unafs_read(|fs| read_version_on(fs, path, n).ok()).ok().flatten()
 }
 
 /// FILEVERSIONS (B714): [`restore_version_on`] on THE mount (`Ok` once committed). RESTORERESULT (SR161): the ONE
@@ -5397,7 +5397,7 @@ fn note_attempt(arm: bool, t0_us: u64) {
 
 /// UNAFSREADUNMASKED: run a READ-ONLY `f` against the one coherent mount — [`with_unafs`]'s loop (restart, RENDERWEDGE bound,
 /// ticket, poison, lockowner unchanged) with the attempt preempt-off and interrupts ON when the bound medium takes the read arm.
-#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+/// PREEMPTAUDITUNAFSLEG (rmbp-ledger B1048): on EVERY build — off x86 `wc` `attempt_arm` is false, so this is `with_unafs` exactly.
 #[track_caller]
 pub fn with_unafs_read<R>(f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
     with_unafs_arm(f, true)
@@ -5449,6 +5449,70 @@ pub mod readarm {
             let site = core::panic::Location::caller();
             let file = site.file().rsplit('/').next().unwrap_or(site.file());
             serial_println!("[unafs] hold why=read masked=0 ms={} site={}:{} (UNAFSREADUNMASKED B1035)", ms, file, site.line());
+        }
+    }
+}
+
+// ── PREEMPTAUDITUNAFSLEG (rmbp-ledger B1048, BP-storage-8 / BP-cores-23) — `tests preemptaudit`'s UnaFS LEG. `converted_unafs=`
+// was a constant; this is its witness, Z61's sdhc leg's checks (sched.rs `sdhc_audit_leg`) inside THE read arm: a
+// `with_unafs_read` hold whose body is a stat of the root inode (harmless, read-only). Inside the hold, on a medium that takes the
+// read arm (`readarm::irq_on`), interrupts must be on, this CPU's preempt-off count held by this task (`preemptoff::witness`), a
+// tick must arrive on this CPU within 20 ms, and nothing may switch this task out (the CPU, the ACCT switch count through
+// `core_load`, the current tid). An xHCI-backed mount keeps the mask by design: `skip(medium)`; no UnaFS volume: `skip(no-volume)`.
+// Words: ok | skip(no-wc|medium|no-volume) | masked | not-held | stat | no-tick | switched | mount. At the tail: no line above moves.
+
+/// PREEMPTAUDITUNAFSLEG: the `unafs_leg=` word of `tests preemptaudit` (sched.rs `audit_selftest`, the leg line).
+#[cfg(all(target_arch = "x86_64", any(feature = "ahci", feature = "nvme"), not(feature = "wc")))]
+pub fn unafs_leg() -> &'static str {
+    "skip(no-wc)"
+}
+
+/// PREEMPTAUDITUNAFSLEG: on `wc`, the hold itself.
+#[cfg(all(target_arch = "x86_64", any(feature = "ahci", feature = "nvme"), feature = "wc"))]
+pub fn unafs_leg() -> &'static str {
+    {
+        let r = with_unafs_read(|fs| -> &'static str {
+            if !readarm::irq_on() {
+                return "skip(medium)";
+            }
+            if crate::arch::irqs_masked() {
+                return "masked";
+            }
+            let (held, tid) = crate::arch::sched::preemptoff::witness();
+            let cpu = crate::arch::percpu::this_cpu().cpu_index as usize;
+            let tid0 = crate::arch::sched::current_task_id(cpu);
+            let sw0 = crate::arch::sched::core_load(cpu).ctx_switches;
+            if !held || tid0 != Some(tid) {
+                return "not-held";
+            }
+            let root = fs.superblock.root_inode;
+            if fs.stat(root).is_err() {
+                return "stat";
+            }
+            let t0 = crate::arch::percpu::this_cpu().ticks.load(Ordering::Relaxed);
+            let m0 = crate::arch::ms();
+            while crate::arch::percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0) < 2
+                && crate::arch::ms().wrapping_sub(m0) < 20
+            {
+                core::hint::spin_loop();
+            }
+            let ticks = crate::arch::percpu::this_cpu().ticks.load(Ordering::Relaxed).wrapping_sub(t0);
+            let cpu1 = crate::arch::percpu::this_cpu().cpu_index as usize;
+            let switched = (cpu1 != cpu) as u64
+                + crate::arch::sched::core_load(cpu).ctx_switches.wrapping_sub(sw0)
+                + (crate::arch::sched::current_task_id(cpu) != tid0) as u64;
+            if ticks == 0 {
+                "no-tick"
+            } else if switched != 0 {
+                "switched"
+            } else {
+                "ok"
+            }
+        });
+        match r {
+            Ok(w) => w,
+            Err(MountError::NoVolume | MountError::NoStorage | MountError::BadSectorSize(_)) => "skip(no-volume)",
+            Err(_) => "mount",
         }
     }
 }

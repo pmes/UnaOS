@@ -135,7 +135,7 @@ pub fn query(prefix: &str, limit: usize) -> Option<Vec<Hit>> {
         if !mt.volume_name("/").map(|n| n == "native").unwrap_or(false) {
             return None;
         }
-        let f = crate::fs::unafs::with_unafs(|fs| fs.find_names(prefix, limit + 16)).ok()?.ok()?;
+        let f = crate::fs::unafs::with_unafs_read(|fs| fs.find_names(prefix, limit + 16)).ok()?.ok()?;
         if !f.indexed {
             return None;
         }

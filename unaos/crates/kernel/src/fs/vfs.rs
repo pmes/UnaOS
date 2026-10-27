@@ -1757,7 +1757,7 @@ impl VfsBackend for NativeBackend {
 
     fn read_dir(&self, rel: &str) -> Result<Vec<DirEnt>, VfsError> {
         let path = native_abs(rel); let mut tx = TxCost::default();
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_read(|fs| {
             tx.start(); let id = fs.resolve_path(&path); tx.resolved(fs.root_generation()); let id = id.map_err(|_| VfsError::NoSuchPath)?;
             let entries = fs.ls(id).map_err(|_| VfsError::NotADirectory)?;
             Ok(entries
@@ -1786,7 +1786,7 @@ impl VfsBackend for NativeBackend {
 
     fn read_dir_kinds(&self, rel: &str) -> Result<Vec<(String, NodeKind)>, VfsError> {
         let path = native_abs(rel); let mut tx = TxCost::default(); // JOBSCAN (B497): the directory blob alone — one bounded transaction, no inode read per row
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_read(|fs| {
             tx.start(); let id = fs.resolve_path(&path); tx.resolved(fs.root_generation()); let id = id.map_err(|_| VfsError::NoSuchPath)?;
             let entries = fs.ls(id).map_err(|_| VfsError::NotADirectory)?;
             Ok(entries.into_iter().filter(|e| e.name != "." && e.name != ".." && e.kind != ::unafs::FileKind::System).map(|e| (e.name, native_kind(e.kind))).collect())
@@ -1797,7 +1797,7 @@ impl VfsBackend for NativeBackend {
 
     fn stat(&self, rel: &str) -> Result<Stat, VfsError> {
         let path = native_abs(rel); let mut tx = TxCost::default();
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_read(|fs| {
             tx.start(); let id = fs.resolve_path(&path); tx.resolved(fs.root_generation()); let id = id.map_err(|_| VfsError::NoSuchPath)?;
             let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
             Ok(Stat {
@@ -1812,7 +1812,7 @@ impl VfsBackend for NativeBackend {
 
     fn read(&self, rel: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
         let path = native_abs(rel); let mut tx = TxCost::default(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { let _ = &mut tx; return crate::fs::unafs::splitread::read(&path, offset, len as u64).map_err(|m| match m { crate::fs::unafs::splitread::ReadMiss::NoSuchPath => VfsError::NoSuchPath, crate::fs::unafs::splitread::ReadMiss::IsADirectory => VfsError::IsADirectory, crate::fs::unafs::splitread::ReadMiss::Failed => VfsError::Backend("unafs-read"), crate::fs::unafs::splitread::ReadMiss::Mount(e) => unafs_err(e) }); } // HIDSTALL2 (B670): the data read leaves MOUNT (LINE-NEUTRAL append)
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_read(|fs| {
             tx.start(); let id = fs.resolve_path(&path); tx.resolved(fs.root_generation()); let id = id.map_err(|_| VfsError::NoSuchPath)?;
             let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
             if matches!(native_kind(ino.kind), NodeKind::Dir) {
@@ -1829,7 +1829,7 @@ impl VfsBackend for NativeBackend {
         // read_authz evaluator (owner/grant-with-CAP_READ/public, fail-closed on
         // a deleted object) — identical semantics to the live SYS_OPEN check.
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_read(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             match crate::fs::unafs::read_authz(fs, id, principal) {
                 crate::fs::unafs::ReadAuthz::Permit => Ok(()),
@@ -2132,7 +2132,7 @@ impl VfsBackend for NativeBackend {
 
     fn get_attr(&self, rel: &str, key: &str, principal: &str) -> Result<AttrValue, VfsError> {
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_read(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_read_gate(fs, id, principal)?;
             match fs.get_attribute(id, key) {
@@ -2146,7 +2146,7 @@ impl VfsBackend for NativeBackend {
 
     fn list_attrs(&self, rel: &str, principal: &str) -> Result<Vec<(String, AttrValue)>, VfsError> {
         let path = native_abs(rel);
-        crate::fs::unafs::with_unafs(|fs| {
+        crate::fs::unafs::with_unafs_read(|fs| {
             let id = fs.resolve_path(&path).map_err(|_| VfsError::NoSuchPath)?;
             native_read_gate(fs, id, principal)?;
             let ino = fs.read_inode(id).map_err(|_| VfsError::NoSuchPath)?;
