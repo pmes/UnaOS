@@ -203,7 +203,7 @@ pub fn probe() { crate::arch::acpi_power::gpe0_say(); // ZENBOOKECGPE (zenbook-l
     if !crate::hw::gate(crate::hw::Probe::Ec) {
         return;
     }
-    let Some((sdt, es)) = crate::arch::acpi::root_sdt(crate::arch::acpi::rsdp_addr()) else {
+    qnames_boot(); let Some((sdt, es)) = crate::arch::acpi::root_sdt(crate::arch::acpi::rsdp_addr()) else { // ZENBOOKECQNAMES (zenbook-ledger Z51): the DSDT's `_Qxx` method names and Notify targets, read once past the EC gate and before the ECDT lookup, so a no-ECDT machine still prints them and the drain below can name its bytes (`qnames_boot`, file tail). LINE-NEUTRAL fold, code before the comment.
         serial_println!("[ec] -> SKIP reason=no-rsdp");
         return;
     };
@@ -897,7 +897,7 @@ fn qsay(bytes: &[u8]) {
     for &q in bytes {
         let total = QEVENTS.fetch_add(1, Ordering::Relaxed) + 1;
         if note_seen(&SEEN, q) {
-            serial_println!("[ec] q={:#04x} total={}", q, total);
+            serial_println!("[ec] q={:#04x} total={}{}", q, total, QArrow(q));
         }
     }
 }
@@ -1527,4 +1527,463 @@ fn bkat_sci() -> bool {
 
     serial_println!("[ec] sci kat ec={} drained={} en={:#04x} storm_at={}", hit.ec as u8, n, en, storm_at);
     step && drained && rearm && idle && storm_at == SCI_STORM_N + 1 && reset && masked
+}
+
+// ── ZENBOOKECQNAMES (zenbook-ledger Z51) — the EC's `_Qxx` method NAMES and their Notify targets, read from the DSDT — FILE TAIL ──
+// Z30 drains the query BYTES; the `_Qxx` METHODS that give them meaning are AML, and this tree runs none (BP-power-4). But a
+// Method's NAME is its byte (`_Q0B` answers query 0x0B), and inside its body a `Notify` (opcode 0x86 + the target NameString +
+// the value) and the EC Field names it touches are plain bytes. So `qnames_scan` is a BYTE SCAN, not an interpreter: the ONE
+// PNP0C09 Device (EISAID or string `_HID`; none = `no-ec`, two = `ambiguous`), every `Scope` whose last NameSeg is that
+// Device's name (the `Scope (\_SB.PCI0.SBRG.EC0) { Method (_Qxx) }` blocks outside it), the EmbeddedControl OperationRegions
+// and their Field unit names, then every `_Q<hex><hex>` Method in those spans with its Notify targets and the fields its body
+// names. The honest claim is "byte xx's handler notifies <device> with <code> and names fields <...>"; what the handler
+// COMPUTES is not read. The AML helpers are DWI2CACPI's (`dwi2c::find_from`/`pkg_len`/`last_seg`/`device_of`, widened to
+// pub(crate) in place; AML-HELPERS-ONE owes their lift to one home). Once per boot from `probe`, past `hw::gate(Probe::Ec)`
+// (the rMBP and QEMU print nothing): `[ec] qnames n= dev= spans= fields=` + one `[ec] qname 0x<xx> notify= fields=` per
+// method, or `[ec] qnames -> REFUSED why=`; the table is kept write-once in `QNAMES` and the drain's `[ec] q=` line gains
+// ` -> notify=<TGT>:<v>` (or `-`) for a byte it holds. SSDT methods (ZENBOOK-EC-QSSDT) and the calls inside a body
+// (ZENBOOK-EC-QCALLS) are owed. `tests ecqnames`: the live line, then the scan over `QN_KAT` and three refusal mutants.
+
+use crate::drivers::dwi2c as aml;
+
+/// Methods kept (more are counted, ` more=` on the summary line).
+const QN_MAX: usize = 64;
+/// EC spans: the Device plus at most seven `Scope` blocks naming it.
+const QN_SPANS: usize = 8;
+/// EmbeddedControl OperationRegions kept.
+const QN_REGIONS: usize = 4;
+/// EC Field unit names kept for the body match (more are counted).
+const QN_FIELDS: usize = 192;
+
+/// One `_Qxx` method: its query byte, up to two Notify (target, value: `None` = not a constant), up to four EC fields its body
+/// names; `nn`/`nf` count all (saturating).
+#[derive(Clone, Copy)]
+struct QName {
+    byte: u8,
+    notify: [([u8; 4], Option<u8>); 2],
+    nn: u8,
+    fields: [[u8; 4]; 4],
+    nf: u8,
+}
+
+const QNAME_NONE: QName = QName { byte: 0, notify: [([0; 4], None); 2], nn: 0, fields: [[0; 4]; 4], nf: 0 };
+
+/// What the scan read: the EC Device's name, the spans scanned, the EC field units seen, the methods (`n` counts all).
+#[derive(Clone, Copy)]
+struct QNames {
+    dev: [u8; 4],
+    spans: usize,
+    nfields: usize,
+    n: usize,
+    q: [QName; QN_MAX],
+}
+
+/// A refusal, by name.
+#[derive(Clone, Copy)]
+enum QNo {
+    NoDsdt,
+    NoEc,
+    Ambiguous(usize),
+    NoMethods([u8; 4]),
+}
+
+/// The boot's table, written once by `qnames_boot` (pci init, BSP, before the drain); read by the drain's `QArrow`.
+static QNAMES: spin::Once<QNames> = spin::Once::new();
+
+/// The index just past the NameString at `i` (`\`/`^` prefixes, a dual or multi name, the null name, else one NameSeg).
+fn name_end(a: &[u8], mut i: usize) -> Option<usize> {
+    while matches!(a.get(i), Some(0x5c) | Some(0x5e)) {
+        i += 1;
+    }
+    let e = match *a.get(i)? {
+        0x00 => i + 1,
+        0x2e => i + 9,
+        0x2f => i + 2 + 4 * (*a.get(i + 1)? as usize),
+        _ => i + 4,
+    };
+    if e <= a.len() { Some(e) } else { None }
+}
+
+/// A NameSeg character.
+fn seg_char(c: u8) -> bool {
+    c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'
+}
+
+/// The ONE PNP0C09 Device and the `Scope` blocks naming it: (its name, the spans, how many).
+fn qn_spans(a: &[u8]) -> Result<([u8; 4], [(usize, usize); QN_SPANS], usize), QNo> {
+    let pats: [&[u8]; 2] = [b"\x08_HID\x0c\x41\xd0\x0c\x09", b"\x08_HID\x0dPNP0C09\x00"];
+    let mut dev: Option<(usize, usize, [u8; 4])> = None;
+    let mut seen = [0usize; 8];
+    let mut ndev = 0usize;
+    for p in pats {
+        let mut i = 0;
+        while let Some(h) = aml::find_from(a, p, i, a.len()) {
+            i = h + 1;
+            let Some(d) = aml::device_of(a, h) else { continue };
+            if seen[..ndev.min(8)].contains(&d.0) {
+                continue;
+            }
+            if ndev < 8 {
+                seen[ndev] = d.0;
+            }
+            if dev.is_none() {
+                dev = Some(d);
+            }
+            ndev += 1;
+        }
+    }
+    let Some((s, e, nm)) = dev else { return Err(QNo::NoEc) };
+    if ndev > 1 {
+        return Err(QNo::Ambiguous(ndev));
+    }
+    let mut spans = [(0usize, 0usize); QN_SPANS];
+    spans[0] = (s, e);
+    let mut ns = 1;
+    let mut k = 0;
+    while ns < QN_SPANS {
+        let Some(at) = aml::find_from(a, &[0x10], k, a.len()) else { break };
+        k = at + 1;
+        if (s..e).contains(&at) {
+            continue;
+        }
+        let Some((len, w)) = aml::pkg_len(a, at + 1) else { continue };
+        let end = at + 1 + len;
+        if end > a.len() || len <= w || aml::last_seg(a, at + 1 + w) != Some(nm) {
+            continue;
+        }
+        if name_end(a, at + 1 + w).is_none_or(|ne| ne > end) {
+            continue;
+        }
+        spans[ns] = (at, end);
+        ns += 1;
+    }
+    Ok((nm, spans, ns))
+}
+
+/// The EmbeddedControl (space 0x03) OperationRegions inside the spans.
+fn qn_regions(a: &[u8], spans: &[(usize, usize)]) -> ([[u8; 4]; QN_REGIONS], usize) {
+    let mut regs = [[0u8; 4]; QN_REGIONS];
+    let mut nr = 0;
+    for &(s, e) in spans {
+        let mut k = s;
+        while let Some(at) = aml::find_from(a, &[0x5b, 0x80], k, e) {
+            k = at + 1;
+            let Some(ne) = name_end(a, at + 2) else { continue };
+            if ne >= e || a[ne] != 0x03 {
+                continue;
+            }
+            let Some(r) = aml::last_seg(a, at + 2) else { continue };
+            if nr < QN_REGIONS && !regs[..nr].contains(&r) {
+                regs[nr] = r;
+                nr += 1;
+            }
+        }
+    }
+    (regs, nr)
+}
+
+/// The Field unit names of every Field on an EC region inside the spans, into `out`; returns how many were seen. The
+/// FieldList walk: 0x00 reserved (+PkgLength), 0x01 access (+2), 0x03 extended access (+3), a NameSeg + PkgLength; a
+/// ConnectField (0x02) or anything else ends that list.
+fn qn_fields(a: &[u8], spans: &[(usize, usize)], regs: &[[u8; 4]], out: &mut [[u8; 4]; QN_FIELDS]) -> usize {
+    let mut n = 0;
+    for &(s, e) in spans {
+        let mut k = s;
+        while let Some(at) = aml::find_from(a, &[0x5b, 0x81], k, e) {
+            k = at + 1;
+            let Some((len, w)) = aml::pkg_len(a, at + 2) else { continue };
+            let fe = at + 2 + len;
+            let rn = at + 2 + w;
+            if fe > e || aml::last_seg(a, rn).is_none_or(|r| !regs.contains(&r)) {
+                continue;
+            }
+            let Some(ne) = name_end(a, rn) else { continue };
+            let mut i = ne + 1;
+            while i < fe {
+                match a[i] {
+                    0x00 => {
+                        let Some((_, fw)) = aml::pkg_len(a, i + 1) else { break };
+                        i += 1 + fw;
+                    }
+                    0x01 => i += 3,
+                    0x03 => i += 4,
+                    c if c.is_ascii_uppercase() || c == b'_' => {
+                        let Some(sg) = a.get(i..i + 4) else { break };
+                        if !sg.iter().all(|&c| seg_char(c)) {
+                            break;
+                        }
+                        let Some((_, fw)) = aml::pkg_len(a, i + 4) else { break };
+                        if n < QN_FIELDS {
+                            out[n].copy_from_slice(sg);
+                        }
+                        n += 1;
+                        i += 4 + fw;
+                    }
+                    _ => break,
+                }
+            }
+            k = fe;
+        }
+    }
+    n
+}
+
+/// One hex digit of a `_Qxx` name (upper case, as the ASL compiler emits it).
+fn qn_hex(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// A `Method (_Qxx)` at `m` ending within `e`: (the query byte, its body's start after the flags byte, its end).
+fn qn_method(a: &[u8], m: usize, e: usize) -> Option<(u8, usize, usize)> {
+    if a.get(m) != Some(&0x14) {
+        return None;
+    }
+    let (len, w) = aml::pkg_len(a, m + 1)?;
+    let end = m + 1 + len;
+    let nm = m + 1 + w;
+    if end > e || nm + 5 > end || a[nm] != b'_' || a[nm + 1] != b'Q' {
+        return None;
+    }
+    Some(((qn_hex(a[nm + 2])? << 4) | qn_hex(a[nm + 3])?, nm + 5, end))
+}
+
+/// A method body's Notify targets (with the value when it is a constant) and the EC fields whose names it carries.
+fn qn_body(a: &[u8], s: usize, e: usize, fields: &[[u8; 4]], q: &mut QName) {
+    let mut i = s;
+    while let Some(at) = aml::find_from(a, &[0x86], i, e) {
+        i = at + 1;
+        let Some(t) = aml::last_seg(a, at + 1) else { continue };
+        let Some(ne) = name_end(a, at + 1) else { continue };
+        if ne >= e {
+            continue;
+        }
+        let v = match a[ne] {
+            0x00 => Some(0),
+            0x01 => Some(1),
+            0x0a if ne + 1 < e => Some(a[ne + 1]),
+            0x0b if ne + 2 < e && a[ne + 2] == 0 => Some(a[ne + 1]),
+            _ => None,
+        };
+        if (q.nn as usize) < q.notify.len() {
+            q.notify[q.nn as usize] = (t, v);
+        }
+        q.nn = q.nn.saturating_add(1);
+        i = ne;
+    }
+    for f in fields {
+        if aml::find_from(a, f, s, e).is_some() {
+            if (q.nf as usize) < q.fields.len() {
+                q.fields[q.nf as usize] = *f;
+            }
+            q.nf = q.nf.saturating_add(1);
+        }
+    }
+}
+
+/// The scan, bounded to `a` (the DSDT). Pure: the KAT runs it over `QN_KAT`.
+fn qnames_scan(a: &[u8]) -> Result<QNames, QNo> {
+    let (dev, sp, ns) = qn_spans(a)?;
+    let spans = &sp[..ns];
+    let (regs, nr) = qn_regions(a, spans);
+    let mut fl = [[0u8; 4]; QN_FIELDS];
+    let nfields = qn_fields(a, spans, &regs[..nr], &mut fl);
+    let mut out = QNames { dev, spans: ns, nfields, n: 0, q: [QNAME_NONE; QN_MAX] };
+    for &(s, e) in spans {
+        let mut k = s;
+        while let Some(m) = aml::find_from(a, &[0x14], k, e) {
+            let Some((b, bs, be)) = qn_method(a, m, e) else {
+                k = m + 1;
+                continue;
+            };
+            k = be;
+            let mut q = QName { byte: b, ..QNAME_NONE };
+            qn_body(a, bs, be, &fl[..nfields.min(QN_FIELDS)], &mut q);
+            if out.n < QN_MAX {
+                out.q[out.n] = q;
+            }
+            out.n += 1;
+        }
+    }
+    if out.n == 0 {
+        return Err(QNo::NoMethods(dev));
+    }
+    Ok(out)
+}
+
+/// The kept method for query byte `b`.
+fn qname_of(t: &QNames, b: u8) -> Option<&QName> {
+    t.q[..t.n.min(QN_MAX)].iter().find(|q| q.byte == b)
+}
+
+/// A NameSeg for the wire.
+struct Seg([u8; 4]);
+impl core::fmt::Display for Seg {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.write_str(core::str::from_utf8(&self.0).unwrap_or("????"))
+    }
+}
+
+/// `LID0:0x80`, or `LID0:?` when the value is not a constant.
+struct NotifyAt(([u8; 4], Option<u8>));
+impl core::fmt::Display for NotifyAt {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(f, "{}:", Seg(self.0.0))?;
+        match self.0.1 {
+            Some(v) => write!(f, "{:#04x}", v),
+            None => f.write_str("?"),
+        }
+    }
+}
+
+/// A method's Notify list: `LID0:0x80[,PWRB:0x80][+k]`, or `-`.
+struct QNotes<'a>(&'a QName);
+impl core::fmt::Display for QNotes<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let q = self.0;
+        if q.nn == 0 {
+            return f.write_str("-");
+        }
+        let kept = (q.nn as usize).min(q.notify.len());
+        for (k, n) in q.notify[..kept].iter().enumerate() {
+            if k > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{}", NotifyAt(*n))?;
+        }
+        if q.nn as usize > kept {
+            write!(f, "+{}", q.nn as usize - kept)?;
+        }
+        Ok(())
+    }
+}
+
+/// A method's EC fields: `LIDS,BATS[+k]`, or `-`.
+struct QFields<'a>(&'a QName);
+impl core::fmt::Display for QFields<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let q = self.0;
+        if q.nf == 0 {
+            return f.write_str("-");
+        }
+        let kept = (q.nf as usize).min(q.fields.len());
+        for (k, s) in q.fields[..kept].iter().enumerate() {
+            if k > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{}", Seg(*s))?;
+        }
+        if q.nf as usize > kept {
+            write!(f, "+{}", q.nf as usize - kept)?;
+        }
+        Ok(())
+    }
+}
+
+/// The drain's arrow (`qsay`): ` -> notify=<first target>:<v>` or ` -> notify=-` for a byte `QNAMES` holds; nothing else.
+struct QArrow(u8);
+impl core::fmt::Display for QArrow {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        let Some(q) = QNAMES.get().and_then(|t| qname_of(t, self.0)) else { return Ok(()) };
+        if q.nn == 0 {
+            return f.write_str(" -> notify=-");
+        }
+        write!(f, " -> notify={}", NotifyAt(q.notify[0]))
+    }
+}
+
+/// Print one scan: the summary and one line per kept method, or the refusal.
+fn qnames_say(r: &Result<QNames, QNo>) {
+    match r {
+        Err(QNo::NoDsdt) => serial_println!("[ec] qnames -> REFUSED why=no-dsdt"),
+        Err(QNo::NoEc) => serial_println!("[ec] qnames -> REFUSED why=no-ec"),
+        Err(QNo::Ambiguous(n)) => serial_println!("[ec] qnames -> REFUSED why=ambiguous n={}", n),
+        Err(QNo::NoMethods(d)) => serial_println!("[ec] qnames -> REFUSED why=no-methods dev={}", Seg(*d)),
+        Ok(t) => {
+            if t.n > QN_MAX {
+                serial_println!("[ec] qnames n={} dev={} spans={} fields={} more={}", t.n, Seg(t.dev), t.spans, t.nfields, t.n - QN_MAX);
+            } else {
+                serial_println!("[ec] qnames n={} dev={} spans={} fields={}", t.n, Seg(t.dev), t.spans, t.nfields);
+            }
+            for q in &t.q[..t.n.min(QN_MAX)] {
+                serial_println!("[ec] qname {:#04x} notify={} fields={}", q.byte, QNotes(q), QFields(q));
+            }
+        }
+    }
+}
+
+/// The live DSDT's scan (read-only), or `no-dsdt`.
+fn qnames_live() -> Result<QNames, QNo> {
+    match crate::arch::acpi_power::dsdt() {
+        Some(d) => qnames_scan(d),
+        None => Err(QNo::NoDsdt),
+    }
+}
+
+/// `probe`'s once-per-boot scan (past the EC gate, before the drain); keeps the table for the drain's arrow.
+fn qnames_boot() {
+    let r = qnames_live();
+    qnames_say(&r);
+    if let Ok(t) = r {
+        QNAMES.call_once(|| t);
+    }
+}
+
+const QN_KAT_LEN: usize = 110;
+/// The Device's bytes at the fragment's head (the `ambiguous` mutant is the Device twice).
+const QN_KAT_DEV: usize = 84;
+/// A hand-built DSDT body: `Device (EC0) { Name (_HID, EisaId ("PNP0C09")) OperationRegion (ECOR, EmbeddedControl, Zero,
+/// 0xFF) Field (ECOR, ByteAcc, NoLock, Preserve) { Offset (0x46), LIDS, 1, , 7, BATS, 8 } Method (_Q0B) { If (LIDS)
+/// { Notify (LID0, 0x80) } } Method (_Q52) { Store (BATS, Local0) } }` then `Scope (EC0) { Method (_QA0) { Notify
+/// (\_SB.PWRB, 0x80) } }`.
+const QN_KAT: [u8; QN_KAT_LEN] = [
+    0x5b, 0x82, 0x42, 0x05, 0x45, 0x43, 0x30, 0x5f, 0x08, 0x5f, 0x48, 0x49, 0x44, 0x0c, 0x41, 0xd0, 0x0c, 0x09,
+    0x5b, 0x80, 0x45, 0x43, 0x4f, 0x52, 0x03, 0x00, 0x0a, 0xff, 0x5b, 0x81, 0x15, 0x45, 0x43, 0x4f, 0x52, 0x01,
+    0x00, 0x40, 0x23, 0x4c, 0x49, 0x44, 0x53, 0x01, 0x00, 0x07, 0x42, 0x41, 0x54, 0x53, 0x08, 0x14, 0x13, 0x5f,
+    0x51, 0x30, 0x42, 0x00, 0xa0, 0x0c, 0x4c, 0x49, 0x44, 0x53, 0x86, 0x4c, 0x49, 0x44, 0x30, 0x0a, 0x80, 0x14,
+    0x0c, 0x5f, 0x51, 0x35, 0x32, 0x00, 0x70, 0x42, 0x41, 0x54, 0x53, 0x60, 0x10, 0x19, 0x45, 0x43, 0x30, 0x5f,
+    0x14, 0x13, 0x5f, 0x51, 0x41, 0x30, 0x00, 0x86, 0x5c, 0x2e, 0x5f, 0x53, 0x42, 0x5f, 0x50, 0x57, 0x52, 0x42,
+    0x0a, 0x80,
+];
+
+/// `tests ecqnames`: the live DSDT's line (read-only), then the scan over `QN_KAT` and three refusal mutants.
+pub fn qnames_selftest() {
+    qnames_say(&qnames_live());
+    let good = qnames_scan(&QN_KAT);
+    let g = good.as_ref().ok();
+    let q0b = g.and_then(|t| qname_of(t, 0x0b));
+    let q52 = g.and_then(|t| qname_of(t, 0x52));
+    let qa0 = g.and_then(|t| qname_of(t, 0xa0));
+    let lid = q0b.is_some_and(|q| q.nn == 1 && q.notify[0] == (*b"LID0", Some(0x80)) && q.nf == 1 && q.fields[0] == *b"LIDS");
+    let quiet = q52.is_some_and(|q| q.nn == 0 && q.nf == 1 && q.fields[0] == *b"BATS");
+    let scope = g.is_some_and(|t| t.spans == 2 && t.n == 3) && qa0.is_some_and(|q| q.nn == 1 && q.notify[0] == (*b"PWRB", Some(0x80)) && q.nf == 0);
+    let fields = g.is_some_and(|t| t.nfields == 2 && t.dev == *b"EC0_");
+    let arrow = g.is_some_and(|t| qname_of(t, 0x0c).is_none()) && q0b.is_some_and(|q| q.byte == 0x0b);
+    let mut m = QN_KAT;
+    m[17] = 0x0a; // EISAID ("PNP0C09") -> EISAID ("PNP0C0A")
+    let noec = QN_KAT[17] == 0x09 && matches!(qnames_scan(&m), Err(QNo::NoEc));
+    let mut m = QN_KAT;
+    for k in 0..QN_KAT_LEN - 1 {
+        if m[k] == b'_' && m[k + 1] == b'Q' {
+            m[k + 1] = b'R'; // `_Qxx` -> `_Rxx`
+        }
+    }
+    let nometh = matches!(qnames_scan(&m), Err(QNo::NoMethods(d)) if d == *b"EC0_");
+    let mut two = [0u8; 2 * QN_KAT_DEV];
+    two[..QN_KAT_DEV].copy_from_slice(&QN_KAT[..QN_KAT_DEV]);
+    two[QN_KAT_DEV..].copy_from_slice(&QN_KAT[..QN_KAT_DEV]);
+    let amb = matches!(qnames_scan(&two), Err(QNo::Ambiguous(2)));
+    match (g, q0b, qa0) {
+        (Some(t), Some(b), Some(c)) => serial_println!("[ec] qnames kat n={} q0b={} fields={} qa0={}", t.n, QNotes(b), QFields(b), QNotes(c)),
+        _ => serial_println!("[ec] qnames kat scan={}", if g.is_some() { "partial" } else { "refused" }),
+    }
+    let refuse = noec as u32 + nometh as u32 + amb as u32;
+    let cases = [("lid", lid), ("quiet", quiet), ("scope", scope), ("fields", fields), ("arrow", arrow), ("no-ec", noec), ("no-methods", nometh), ("ambiguous", amb)];
+    match cases.iter().find(|c| !c.1) {
+        None => serial_println!(":: ECQNAMES: n={} notify=LID0:0x80 fields=ok scope=ok refuse={}/3 -> PASS ::", g.map_or(0, |t| t.n), refuse),
+        Some(c) => serial_println!(":: ECQNAMES: case={} -> FAIL ::", c.0),
+    }
 }

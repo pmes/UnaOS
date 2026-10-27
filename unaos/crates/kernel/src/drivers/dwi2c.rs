@@ -1604,7 +1604,7 @@ struct AcpiNo {
 static ACPI_PICK: spin::Once<(usize, u8, u16)> = spin::Once::new();
 
 /// The first `pat` at or after `lo` that ends at or before `hi`.
-fn find_from(a: &[u8], pat: &[u8], lo: usize, hi: usize) -> Option<usize> {
+pub(crate) fn find_from(a: &[u8], pat: &[u8], lo: usize, hi: usize) -> Option<usize> {
     let hi = hi.min(a.len());
     if pat.is_empty() || hi < pat.len() {
         return None;
@@ -1613,7 +1613,7 @@ fn find_from(a: &[u8], pat: &[u8], lo: usize, hi: usize) -> Option<usize> {
 }
 
 /// An AML PkgLength at `i`: (the length it encodes, counting itself; its own width).
-fn pkg_len(a: &[u8], i: usize) -> Option<(usize, usize)> {
+pub(crate) fn pkg_len(a: &[u8], i: usize) -> Option<(usize, usize)> {
     let lead = *a.get(i)? as usize;
     let n = lead >> 6;
     if n == 0 {
@@ -1627,7 +1627,7 @@ fn pkg_len(a: &[u8], i: usize) -> Option<(usize, usize)> {
 }
 
 /// The last NameSeg of the NameString at `i` (root/parent prefixes, dual and multi names).
-fn last_seg(a: &[u8], mut i: usize) -> Option<[u8; 4]> {
+pub(crate) fn last_seg(a: &[u8], mut i: usize) -> Option<[u8; 4]> {
     while matches!(a.get(i), Some(0x5c) | Some(0x5e)) {
         i += 1;
     }
@@ -1647,7 +1647,7 @@ fn last_seg(a: &[u8], mut i: usize) -> Option<[u8; 4]> {
 }
 
 /// The nearest `Device` op before `hit` whose PkgLength covers it: (op offset, end, name).
-fn device_of(a: &[u8], hit: usize) -> Option<(usize, usize, [u8; 4])> {
+pub(crate) fn device_of(a: &[u8], hit: usize) -> Option<(usize, usize, [u8; 4])> {
     let lo = hit.saturating_sub(DEV_BACK);
     let mut j = hit.checked_sub(2)?;
     loop {
