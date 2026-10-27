@@ -1024,3 +1024,152 @@ fn av1playercolour_sd_reel_colr_709_wins_and_untagged_is_bt601() {
     assert!(posted == e709, "a colr of BT.709 on an SD AV1 reel does not win over the size default");
     println!("av1playercolour: kodim23 untagged=bt601 colr709=bt709 bilinear");
 }
+
+// SWAPBACKSPANCACHE (LEDGER SR370): a reseed (a Player seek, an editor run open) primes the decoder with EVERY in-band set
+// blob in effect at the target (`decode_swap::SetIndex`, an indexed reel's earlier Clusters read through a share), and keeps
+// two parked decoders keyed by their set state: a seek back into a span reuses its decoder (`video reseed: ... cache=hit`).
+
+/// Rule: after straight play, a seek into the refused span is a miss (the 8-bit decoder parked under its state), a seek out
+/// of it to s9 is a hit (that decoder again; the frames equal straight play), and a seek back to s4 is a hit (the parked
+/// refused decoder; the stand-in at the target).
+#[test]
+fn swapbackspancache_player_seek_back_into_a_parked_span_hits_the_cache() {
+    capture_logs();
+    let straight = swapbackseek_straight();
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseek_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, _| false);
+    p.seek(160_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| !s.shown.is_empty());
+    assert_eq!(sink.shown[0], (160_000_000, TestPattern::render(64, 48, 4)), "the first seek target is not the stand-in");
+    p.seek(360_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| s.shown.len() >= 2);
+    assert_eq!(sink.shown, straight[9..11].to_vec(), "s9/s10 after the seek are not the straight-play frames");
+    assert!(p.info().real_video);
+    p.seek(160_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| !s.shown.is_empty());
+    assert_eq!(sink.shown[0], (160_000_000, TestPattern::render(64, 48, 4)), "the seek back is not the stand-in");
+    let lines = my_log_lines("[STRIA] :: video reseed:");
+    assert_eq!(
+        lines,
+        [
+            "[STRIA] :: video reseed: at 160000000 sets=1 cache=miss",
+            "[STRIA] :: video reseed: at 360000000 sets=2 cache=hit",
+            "[STRIA] :: video reseed: at 160000000 sets=1 cache=hit",
+        ],
+    );
+    println!("swapbackspancache: miss hit hit");
+}
+
+/// Rule: `DecodeSwap` alone over the same reel constructs one decoder per set state: reseeds at s9 / s0 / s9 / s4 / s9
+/// build 1, 1, 1, 2, 2 decoders (the open's decoder serves s0, the first fresh one s9), and s9 then decodes flat.
+#[test]
+fn swapbackspancache_decode_swap_builds_one_decoder_per_span() {
+    use gneiss_pal::dsp::demux::Demuxer;
+    use stria::decode_swap::{DecodeSwap, open};
+    let d = Demuxer::open(swapbackseek_reel()).unwrap();
+    let t = d.tracks()[0].clone();
+    let mut dec = open(&t);
+    let mut swap = DecodeSwap::default();
+    let mut built = Vec::new();
+    for ns in [360_000_000i64, 0, 360_000_000, 160_000_000, 360_000_000] {
+        swap.reseed(&mut dec, &t, &d, ns);
+        built.push(swap.built());
+    }
+    assert_eq!(built, [1, 1, 1, 2, 2]);
+    let s9 = d.packet_at(&d.samples()[9]);
+    let out = swap.decode(&mut dec, &t, &s9).unwrap();
+    assert!(dec.is_real() && out.swap.is_none());
+    let mut frames = out.frames;
+    frames.extend(dec.flush());
+    assert!(frames[0].to_rgba().chunks(4).all(|p| p == SWAPBACK_FLAT), "s9 is not flat");
+    println!("swapbackspancache: built={}", swap.built());
+}
+
+/// HEVC_SPS with sps_seq_parameter_set_id 1 (its ue(v) `1` -> `010` at RBSP bit 104, after the PTL) and HEVC_PPS naming
+/// SPS 1 (its second ue(v) `1` -> `010`), re-packed bit-exact (stop bit and emulation prevention re-written).
+const HEVC_SPS_ID1: [u8; 27] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x48, 0x08, 0x20, 0xc5, 0x97, 0xe4, 0x93, 0x08, 0x20];
+const HEVC_PPS_TO1: [u8; 7] = [0x44, 0x01, 0xa0, 0x1c, 0x60, 0x44, 0x80];
+
+/// SWAPBACK-SEEK-IDS: s1 carries SPS id 1 and a PPS naming it, s4 re-sends only that PPS (the nearer carrier holds no SPS).
+fn swapbackseekids_reel() -> Vec<u8> {
+    let mut t = hevc_kat_track(8);
+    let carriers: [(usize, &[&[u8]]); 2] = [(1, &[&HEVC_SPS_ID1[..], &HEVC_PPS_TO1[..], &HEVC_IDR[..]]), (4, &[&HEVC_PPS_TO1[..], &HEVC_IDR[..]])];
+    for (i, units) in carriers {
+        let mut s = Vec::new();
+        for unit in units {
+            s.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+            s.extend_from_slice(unit);
+        }
+        t.samples[i].data = s;
+    }
+    build::mp4(&[t], &Mp4Options::default())
+}
+
+/// Rule: a fresh Player's seek to s6 replays BOTH carriers (SPS 1 from s1, the PPS from s4): s6 / s7 decode flat as in
+/// straight play, with no decode warning (today: s4's PPS alone, "PPS references a missing SPS", no picture).
+#[test]
+fn swapbackseekids_player_seek_replays_every_set_id_in_effect() {
+    capture_logs();
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseekids_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.play();
+    let mut straight = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut straight, |_, _| false);
+    assert_eq!(straight.shown.len(), 8);
+    assert!(straight.shown.iter().all(|(_, rgba)| rgba.chunks(4).all(|p| p == SWAPBACK_FLAT)), "straight play is not flat");
+    let time = ManualTime::new();
+    let mut p = Player::open(swapbackseekids_reel(), Arc::new(time.clone()), None, 60).unwrap();
+    p.seek(240_000_000);
+    p.play();
+    let mut sink = RgbaSink::default();
+    swapbackseek_run(&mut p, &time, &mut sink, |_, s| s.shown.len() >= 2);
+    assert_eq!(sink.shown, straight.shown[6..8].to_vec(), "s6/s7 after the seek are not the straight-play frames");
+    assert!(my_log_lines("[STRIA] :: video decode:").is_empty(), "{:?}", my_log_lines("[STRIA] :: video decode:"));
+    assert_eq!(my_log_lines("[STRIA] :: video reseed:"), ["[STRIA] :: video reseed: at 240000000 sets=2 cache=miss"]);
+    println!("swapbackseekids: s6 flat sets=2");
+}
+
+/// SWAPBACK-SEEK-INDEXED: the swapbackseek reel's samples as Matroska with Cues, four blocks a Cluster: the 13/12 carrier s1
+/// is in Cluster 0, s4-s7 in Cluster 1, the 8-bit carrier s8 in Cluster 2.
+fn swapbackseekindexed_reel() -> Vec<u8> {
+    let mp4 = gneiss_pal::dsp::demux::Demuxer::open(swapbackseek_reel()).unwrap();
+    let mut t = hevc_kat_track(12);
+    for (spec, s) in t.samples.iter_mut().zip(mp4.samples()) {
+        spec.data = mp4.packet_at(s).data;
+    }
+    build::mkv(&[t], &MkvOptions { webm: false, cues: true, cluster_blocks: 4, duration: true, ..Default::default() })
+}
+
+/// Rule: the editor opens the reel by its Cues (one Cluster loaded per run); a run opened at tick 5 primes from Cluster 0's
+/// carrier and draws the stand-in, the frame the whole render draws there (today: the container's sets, flat). The stand-in's
+/// counter on this Matroska reel reads one ahead from s3 on (its numbering, not the reseed's), so the oracle is the whole render.
+#[test]
+fn swapbackseekindexed_editor_run_primes_from_an_earlier_cluster() {
+    use stria::nle::{RenderSink, Sources, render};
+    struct Frames(Vec<Vec<u8>>);
+    impl RenderSink for Frames {
+        fn frame(&mut self, _out_t: i64, _w: u32, _h: u32, rgba: &[u8]) {
+            self.0.push(rgba.to_vec());
+        }
+        fn pcm(&mut self, _: i64, _: u32, _: u16, _: &[f32]) {}
+    }
+    let file = swapbackseekindexed_reel();
+    assert!(gneiss_pal::dsp::demux::Demuxer::open_indexed(file.clone()).unwrap().indexed(), "the reel did not open by its Cues");
+    let (tl, src) = Sources::from_media("A", &file, 25).unwrap().unwrap();
+    let mut whole = Frames(Vec::new());
+    render(&tl, 0..8, &src, &mut whole).unwrap();
+    let mut at5 = Frames(Vec::new());
+    render(&tl, 5..6, &src, &mut at5).unwrap();
+    assert!(TestPattern::read_counter(&at5.0[0], 64, 48).is_some(), "a run opened at tick 5 is not the stand-in (a flat decode reads no counter)");
+    assert_eq!(at5.0, whole.0[5..6].to_vec());
+    println!("swapbackseekindexed: tick5 stand-in");
+}
