@@ -95,21 +95,21 @@ const WALL_MAX: usize = 120;
 /// The tab column's width (logical px).
 pub const COL_W: usize = 220;
 /// One tab row's pitch in the column (the pill is [`PILL_H`] tall, centred in it).
-const COL_ROW: usize = 32;
+#[allow(non_snake_case)] fn COL_ROW() -> usize { theme::metrics().grow(32) } // TEXTSCALE (B813): every text-bearing pitch below grows with the UI line (`theme::metrics`); the default size draws the constants
 /// The user card at the column's top: the avatar disc, the name, the role (a press opens Users).
 const CARD_Y: usize = 12;
 const AVATAR: usize = 32;
-const CARD_H: usize = AVATAR + 8;
+#[allow(non_snake_case)] fn CARD_H() -> usize { let m = theme::metrics(); m.grow(m.grow(AVATAR + 8)) } // TEXTSCALE: two lines (the name, the role)
 /// The search field under the card: it filters the tab names.
 const SEARCH_X: usize = 8;
-const SEARCH_Y: usize = CARD_Y + CARD_H + 8;
+#[allow(non_snake_case)] fn SEARCH_Y() -> usize { CARD_Y + CARD_H() + 8 }
 const SEARCH_W: usize = COL_W - 2 * SEARCH_X;
-const SEARCH_H: usize = draw::DIMS.field_h;
+#[allow(non_snake_case)] fn SEARCH_H() -> usize { draw::field_h() }
 /// The first tab row's top.
-const COL_PAD: usize = SEARCH_Y + SEARCH_H + 12;
+#[allow(non_snake_case)] fn COL_PAD() -> usize { SEARCH_Y() + SEARCH_H() + 12 }
 /// The pill's inset and height, the icon tile and the label after it.
 const PILL_X: usize = 8;
-const PILL_H: usize = draw::DIMS.row_h;
+#[allow(non_snake_case)] fn PILL_H() -> usize { draw::row_h() }
 const ICON: usize = 16;
 const ICON_X: usize = PILL_X + 8;
 const COL_LABEL_X: usize = ICON_X + ICON + 8;
@@ -118,17 +118,23 @@ const PANE_X: usize = COL_W;
 const PANE_Y: usize = 60;
 /// The pane's own width (SETTINGSCRAFT: the window is 920 x 560, the proportion the language's Settings keeps).
 const PANE_W: usize = 700;
-const WIN_W: usize = PANE_X + PANE_W;
+pub(crate) const WIN_W: usize = PANE_X + PANE_W;
 /// The first control row's top: the pane origin (the title band is above it).
 const TOP: usize = PANE_Y;
-const ROW_H: usize = 48;
+const ROW_H0: usize = 48;
+#[allow(non_snake_case)] fn ROW_H() -> usize { theme::metrics().grow(ROW_H0) }
 const ROWS: usize = 10;
 /// The tabs, in the column's order.
 pub const TABS: usize = 16;
 pub(super) const TAB_NAMES: [&str; TABS] = ["General", "Users", "Display", "About", "Login Items", "Appearance", "Trackpad", "File Types", "Notifications", "Accessibility", "Privacy", "Date & Time", "Keyboard", "Storage", "Security", "Hardware"]; // PREFSUI (R91) · APPEARANCE (B408) 5 · TRACKPADPANE · TZLOCALE (B701) 11 · KEYMAPS (B704) 12 · SMARTLINE (B708) 13 · AUTOLOCK (B712) 14 · HWTAB (B737) 15
-const WIN_H: usize = TOP + ROWS * ROW_H + PAD;
+#[allow(non_snake_case)] fn WIN_H() -> usize { win_h_at(theme::metrics()) }
+/// TEXTSCALE (B813): the window's logical height at text metrics `m` — the one height formula (`video::text`'s cap asks
+/// it at each candidate size).
+pub(crate) fn win_h_at(m: theme::TextMetrics) -> usize {
+    TOP + ROWS * m.grow(ROW_H0) + PAD
+}
 /// Tab rows the column shows at once; more than this and it scrolls (the wheel, or the selection kept in view).
-const COL_VIS: usize = (WIN_H - COL_PAD - 8) / COL_ROW;
+#[allow(non_snake_case)] fn COL_VIS() -> usize { (WIN_H() - COL_PAD() - 8) / COL_ROW() }
 /// The pane's padding, a group box's inset from its band of rows, a row's inset inside its box.
 const PAD: usize = 20;
 const GAP: usize = 4;
@@ -142,8 +148,8 @@ const TRACK_X: usize = PANE_X + 300;
 const TRACK_W: usize = 240;
 const VAL_X: usize = TRACK_X + TRACK_W + 12;
 const BTN_W: usize = 70;
-const BTN_H: usize = draw::DIMS.button_h;
-const FIELD_H: usize = draw::DIMS.field_h;
+#[allow(non_snake_case)] fn BTN_H() -> usize { draw::button_h() }
+#[allow(non_snake_case)] fn FIELD_H() -> usize { draw::field_h() }
 /// A row's switch, right-aligned.
 const TOG_X: usize = CTRL_R - draw::DIMS.toggle_w;
 
@@ -217,6 +223,9 @@ struct State {
     kf: usize,
     pend: Option<usize>,
     cid: u16,
+    /// TEXTSCALE (rmbp-ledger B813): the paint's text runs, queued by [`text_at`] while armed and drawn by
+    /// [`textscale::flush`], each clipped at the next item on its line when it would collide (`None` = never armed).
+    runs: Option<textscale::Queue>,
 }
 
 impl State {
@@ -225,7 +234,7 @@ impl State {
             sel, strip, col_top, col_hover: None, u: UsersUi::new(), li_add: 0, modes_open: false, w, h, surf,
             query: String::new(), search: false, kbd: false, ptr: None, press: None, hits: Vec::new(), hot: None,
             glides: draw::motion::Glides::new(), frame: draw::motion::Frame::new(), now: 0, tab: 0, found: None,
-            meta: Vec::new(), pane0: usize::MAX, kf: 0, pend: None, cid: NO_ID,
+            meta: Vec::new(), pane0: usize::MAX, kf: 0, pend: None, cid: NO_ID, runs: None,
         }
     }
 }
@@ -557,13 +566,13 @@ fn dp(n: usize) -> i32 {
 }
 
 /// Row `r`'s logical top.
-const fn row_top(r: usize) -> usize {
-    TOP + r * ROW_H
+fn row_top(r: usize) -> usize {
+    TOP + r * ROW_H()
 }
 
 /// The top of an `h`-tall control centred in row `r`.
-const fn mid_y(r: usize, h: usize) -> usize {
-    row_top(r) + (ROW_H - h) / 2
+fn mid_y(r: usize, h: usize) -> usize {
+    row_top(r) + (ROW_H() - h) / 2
 }
 
 /// The kit's surface over the window's pixels.
@@ -658,7 +667,7 @@ fn stop_set(st: &mut State, tab: usize, k: usize) {
         if st.u.form {
             if k < 3 { st.u.focus = k as u8; }
         } else if let Some(h) = st.hits.get(st.pane0.saturating_add(k)) {
-            let r = (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H;
+            let r = (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H();
             if r >= 1 { st.u.sel = r - 1; }
         }
     }
@@ -674,7 +683,7 @@ fn stop_of_ctrl(st: &State, ctrl: usize) -> Option<usize> {
 /// else the first control painted in the row.
 fn stop_in_row(st: &State, r: usize, ctrl: usize) -> Option<usize> {
     let (p0, n) = stops(st);
-    let row_of_hit = |k: usize| { let h = st.hits[p0 + k]; (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H };
+    let row_of_hit = |k: usize| { let h = st.hits[p0 + k]; (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H() };
     stop_of_ctrl(st, ctrl).filter(|&k| row_of_hit(k) == r).or_else(|| (0..n).find(|&k| row_of_hit(k) == r))
 }
 
@@ -786,6 +795,7 @@ fn hit_at(hits: &[[u16; 4]], p: Option<(usize, usize)>) -> Option<usize> {
 /// Text with its line top at the logical `(x, y)`, clipped at the logical `clip`; returns the pen.
 #[allow(clippy::too_many_arguments)]
 fn text_at(st: &mut State, x: usize, y: usize, clip: usize, t: &str, ink: u32, bold: bool, face: super::text::Face) -> usize {
+    if let Some(q) = st.runs.as_mut().filter(|q| q.armed) { return textscale::queue(q, x, y, clip, t, ink, bold, face); } // TEXTSCALE (B813): a full paint draws its text at its end, clipped where it would collide
     let (w, h) = (st.w, st.h);
     super::metrics::text(&mut st.surf, super::metrics::size(w), super::metrics::size(h), clip, x, y, t.as_bytes(), ink, bold, face)
 }
@@ -794,7 +804,7 @@ fn text_at(st: &mut State, x: usize, y: usize, clip: usize, t: &str, ink: u32, b
 fn txt_ink(st: &mut State, x: usize, r: usize, t: &str, ink: u32) {
     let face = super::text::Face::Ui; // KERNELFONT: labels in the UI face
     let ch = super::metrics::lcell_h(face);
-    text_at(st, x, row_top(r) + (ROW_H - ch) / 2, CTRL_R.max(x + 1), t, ink, false, face);
+    text_at(st, x, row_top(r) + (ROW_H() - ch) / 2, CTRL_R.max(x + 1), t, ink, false, face);
 }
 
 /// A row's label (the primary ink).
@@ -810,24 +820,24 @@ fn txt2(st: &mut State, x: usize, r: usize, t: &str) {
 /// The kit's push button `w` wide at the logical `(x, y)`.
 #[allow(clippy::too_many_arguments)]
 fn btn_at(st: &mut State, x: usize, y: usize, w: usize, t: &str, default: bool, focus: bool) {
-    let c = cs(st, x, y, w, BTN_H, focus);
+    let c = cs(st, x, y, w, BTN_H(), focus);
     draw::push_button(&mut sf(st), e(x), e(y), ew(x, w), t.as_bytes(), default, c);
 }
 
 /// A [`BTN_W`] push button in row `r` at `x`.
 fn btn(st: &mut State, r: usize, x: usize, t: &str) {
-    btn_at(st, x, mid_y(r, BTN_H), BTN_W, t, false, false);
+    btn_at(st, x, mid_y(r, BTN_H()), BTN_W, t, false, false);
 }
 
 /// [`btn`] that may be the pane's default action and may hold the keyboard focus.
 fn btn_f(st: &mut State, r: usize, x: usize, t: &str, default: bool, focus: bool) {
-    btn_at(st, x, mid_y(r, BTN_H), BTN_W, t, default, focus);
+    btn_at(st, x, mid_y(r, BTN_H()), BTN_W, t, default, focus);
 }
 
 /// The kit's text field in row `r` from the track to the controls' edge; focused, it carries the caret and the ring.
 fn field(st: &mut State, r: usize, t: &str, focus: bool) {
-    let (y, w) = (mid_y(r, FIELD_H), CTRL_R - TRACK_X);
-    let c = cs(st, TRACK_X, y, w, FIELD_H, focus);
+    let (y, w) = (mid_y(r, FIELD_H()), CTRL_R - TRACK_X);
+    let c = cs(st, TRACK_X, y, w, FIELD_H(), focus);
     kmeta(st, K_FIELD, 0, 0); // PICKERKEYS (B768): typed into, never pressed by a key
     draw::text_field(&mut sf(st), e(TRACK_X), e(y), ew(TRACK_X, w), t.as_bytes(), c);
 }
@@ -881,7 +891,7 @@ fn check(st: &mut State, r: usize, x: usize, on: bool) {
 /// PICKERKEYS (B768): holding the keyboard, the thumb shows the PENDING segment (the arrows moved it; Space/Return
 /// chooses it); the committed one is what the press map and `meta` keep.
 fn seg(st: &mut State, r: usize, labels: &[&[u8]], sel: usize, focus: bool) {
-    let h = draw::DIMS.seg_h;
+    let h = draw::seg_h();
     let y = mid_y(r, h);
     let committed = sel;
     let sel = if keyed_at(st, st.hits.len()) { st.pend.unwrap_or(sel) } else { sel };
@@ -912,7 +922,7 @@ fn groups(st: &mut State, g: &[(usize, usize)]) {
 /// A wash over row `r` inside its box (a list's selected or hovered row).
 fn row_wash(st: &mut State, r: usize) {
     let (x, y) = (BOX_X + GAP, row_top(r) + GAP);
-    let rr = Rect::new(e(x), e(y), ew(x, BOX_W - 2 * GAP), ew(y, ROW_H - 2 * GAP));
+    let rr = Rect::new(e(x), e(y), ew(x, BOX_W - 2 * GAP), ew(y, ROW_H() - 2 * GAP));
     draw::fill_rrect(&mut sf(st), rr, dp(draw::DIMS.row_radius), Ink::argb(theme::hairline()));
 }
 
@@ -1059,8 +1069,8 @@ fn tab_icon(s: &mut draw::Surf, tab: usize, x: i32, y: i32, t: i32, tile: Option
 // ── The column ────────────────────────────────────────────────────────────────────────────────────────────────
 
 /// The column's pill top for list position `i` (with `top` the first visible).
-const fn pill_y(i: usize, top: usize) -> usize {
-    COL_PAD + (i - top) * COL_ROW + (COL_ROW - PILL_H) / 2
+fn pill_y(i: usize, top: usize) -> usize {
+    COL_PAD() + (i - top) * COL_ROW() + (COL_ROW() - PILL_H()) / 2
 }
 
 fn paint_column(st: &mut State, tab: usize) {
@@ -1077,25 +1087,25 @@ fn paint_column(st: &mut State, tab: usize) {
         None => (String::from("No session"), "Sign in to keep settings"),
     };
     let cw = COL_W - 2 * PILL_X;
-    let c = cs(st, PILL_X, CARD_Y, cw, CARD_H, false);
+    let c = cs(st, PILL_X, CARD_Y, cw, CARD_H(), false);
     if c.hover || c.pressed {
-        let r = Rect::new(e(PILL_X), e(CARD_Y), ew(PILL_X, cw), ew(CARD_Y, CARD_H));
+        let r = Rect::new(e(PILL_X), e(CARD_Y), ew(PILL_X, cw), ew(CARD_Y, CARD_H()));
         draw::fill_rrect(&mut sf(st), r, dp(draw::DIMS.row_radius), Ink::argb(theme::hairline()));
     }
-    let (ax, ay) = (PILL_X + 4, CARD_Y + (CARD_H - AVATAR) / 2);
+    let (ax, ay) = (PILL_X + 4, CARD_Y + (CARD_H() - AVATAR) / 2);
     avatar(st, ax, ay, AVATAR, &name);
     let face = super::text::Face::Ui;
     let ch = super::metrics::lcell_h(face);
     let tx = ax + AVATAR + 10;
-    text_at(st, tx, CARD_Y + CARD_H / 2 - ch, COL_W - PILL_X, &name, theme::text_primary(), true, face);
-    text_at(st, tx, CARD_Y + CARD_H / 2, COL_W - PILL_X, role, theme::ink_secondary(), false, face);
+    text_at(st, tx, CARD_Y + CARD_H() / 2 - ch, COL_W - PILL_X, &name, theme::text_primary(), true, face);
+    text_at(st, tx, CARD_Y + CARD_H() / 2, COL_W - PILL_X, role, theme::ink_secondary(), false, face);
     // The search field (a real filter over the tab names); its placeholder in the secondary ink.
     let foc = st.search;
-    let c = cs(st, SEARCH_X, SEARCH_Y, SEARCH_W, SEARCH_H, foc);
+    let c = cs(st, SEARCH_X, SEARCH_Y(), SEARCH_W, SEARCH_H(), foc);
     let q = st.query.clone();
-    draw::text_field(&mut sf(st), e(SEARCH_X), e(SEARCH_Y), ew(SEARCH_X, SEARCH_W), q.as_bytes(), c);
+    draw::text_field(&mut sf(st), e(SEARCH_X), e(SEARCH_Y()), ew(SEARCH_X, SEARCH_W), q.as_bytes(), c);
     if q.is_empty() && !foc {
-        text_at(st, SEARCH_X + draw::DIMS.field_pad_x, SEARCH_Y + (SEARCH_H - ch) / 2, SEARCH_X + SEARCH_W, "Search", theme::ink_secondary(), false, face);
+        text_at(st, SEARCH_X + draw::DIMS.field_pad_x, SEARCH_Y() + (SEARCH_H() - ch) / 2, SEARCH_X + SEARCH_W, "Search", theme::ink_secondary(), false, face);
     }
     // The tab rows: the selected one a full-width accent pill with the light ink, the hovered one washed.
     // MOTIONKIT (B648): the pill is ONE shape that glides between rows — the washes first, then the pill at its
@@ -1103,9 +1113,9 @@ fn paint_column(st: &mut State, tab: usize) {
     let (list, n) = col_list(&st.query);
     st.col_top = col_clamp(st.col_top, n);
     let top = st.col_top;
-    let vis = top..(top + COL_VIS).min(n);
+    let vis = top..(top + COL_VIS()).min(n);
     let pill = vis.clone().find(|&i| list[i] as usize == tab).map(|i| {
-        let (now, ph) = (st.now, dp(PILL_H));
+        let (now, ph) = (st.now, dp(PILL_H()));
         let py = st.glides.to(mkey(MK_PILL, 0, 0, 0), e(pill_y(i, top)), now, draw::motion::dur(draw::motion::BASE), draw::motion::Curve::Standard);
         Rect::new(e(PILL_X), py, ew(PILL_X, cw), ph)
     });
@@ -1121,17 +1131,17 @@ fn paint_column(st: &mut State, tab: usize) {
     for i in vis {
         let k = list[i] as usize;
         let y = pill_y(i, top);
-        let on = pill.is_some_and(|p| { let cy = e(y) + ew(y, PILL_H) / 2; cy >= p.y && cy < p.bottom() });
+        let on = pill.is_some_and(|p| { let cy = e(y) + ew(y, PILL_H()) / 2; cy >= p.y && cy < p.bottom() });
         {
             let mut s = sf(st);
-            let iy = y + (PILL_H - ICON) / 2;
+            let iy = y + (PILL_H() - ICON) / 2;
             tab_icon(&mut s, k, e(ICON_X), e(iy), ew(ICON_X, ICON), None);
         }
         let ink = if on { theme::ink_on_accent() } else { theme::text_primary() };
-        text_at(st, COL_LABEL_X, y + (PILL_H - ch) / 2, COL_W - PILL_X, TAB_NAMES[k], ink, k == tab, face);
+        text_at(st, COL_LABEL_X, y + (PILL_H() - ch) / 2, COL_W - PILL_X, TAB_NAMES[k], ink, k == tab, face);
     }
     if n == 0 {
-        text_at(st, ICON_X, pill_y(0, 0) + (PILL_H - ch) / 2, COL_W - PILL_X, "No results", theme::ink_secondary(), false, face);
+        text_at(st, ICON_X, pill_y(0, 0) + (PILL_H() - ch) / 2, COL_W - PILL_X, "No results", theme::ink_secondary(), false, face);
     }
     // SCROLLPANES (B777): the column's bar is wm's one widget (`col_scroll_sync`, from the full paint).
 }
@@ -1150,7 +1160,7 @@ fn paint(st: &mut State, v: &Values) {
 
 fn paint_once(st: &mut State, v: &Values) {
     let w = st.w;
-    st.hits.clear(); st.meta.clear(); st.pane0 = usize::MAX; st.cid = NO_ID; // PICKERKEYS (B768): the column's controls are not stops
+    st.hits.clear(); st.meta.clear(); st.pane0 = usize::MAX; st.cid = NO_ID; st.runs = Some(textscale::Queue::armed()); // PICKERKEYS (B768): the column's controls are not stops
     st.now = crate::arch::ms(); st.tab = (v.tab as usize).min(TABS - 1); // MOTIONKIT (B648): this frame's clock and tab, read once
     {
         let mut s = sf(st);
@@ -1186,8 +1196,9 @@ fn paint_once(st: &mut State, v: &Values) {
         txt_ink(st, x, r, &t, theme::accent());
         let lw = super::metrics::ladvance(t.as_bytes(), false, super::text::Face::Ui).clamp(1, CTRL_R.saturating_sub(x).max(1));
         let lh = super::metrics::lcell_h(super::text::Face::Ui);
-        hit_line(st, x, row_top(r) + (ROW_H - lh) / 2, lw, lh, K_PRESS); // PICKERKEYS (B768): the link is a stop
+        hit_line(st, x, row_top(r) + (ROW_H() - lh) / 2, lw, lh, K_PRESS); // PICKERKEYS (B768): the link is a stop
     }
+    textscale::flush(st, false); // TEXTSCALE (B813): the paint's text, each run clipped at the next item on its line
     st.hot = hit_at(&st.hits, st.ptr);
 }
 
@@ -1255,7 +1266,7 @@ fn paint_display(st: &mut State, v: &Values) {
     txt2(st, TRACK_X, 6, &alloc::format!("{} in {}x{} cells, {} ppi x{}", super::text::face_name(super::text::Face::Grid), cw, chh, super::dpi::ppi(), super::dpi::scale_str(s2)));
     txt(st, LABEL_X, 7, "Sample");
     txt(st, TRACK_X, 7, SAMPLE);
-    if st.modes_open { mode_list(st); } // PREFSUI: the open popup paints over the rows below it
+    if st.modes_open { textscale::flush(st, true); mode_list(st); } // PREFSUI: the open popup paints over the rows below it
 }
 
 /// KERNELFONT M3: the Display tab's sample line.
@@ -1443,8 +1454,8 @@ fn paint_users(st: &mut State) {
             let d = 24;
             avatar(st, LABEL_X, mid_y(r, d), d, nm);
             let ch = super::metrics::lcell_h(face);
-            let pen = text_at(st, LABEL_X + d + 10, row_top(r) + (ROW_H - ch) / 2, TRACK_X - 8, nm, theme::text_primary(), false, face);
-            if !tag.is_empty() { text_at(st, pen, row_top(r) + (ROW_H - ch) / 2, TRACK_X - 8, tag, theme::ink_secondary(), false, face); }
+            let pen = text_at(st, LABEL_X + d + 10, row_top(r) + (ROW_H() - ch) / 2, TRACK_X - 8, nm, theme::text_primary(), false, face);
+            if !tag.is_empty() { text_at(st, pen, row_top(r) + (ROW_H() - ch) / 2, TRACK_X - 8, tag, theme::ink_secondary(), false, face); }
             if st.u.confirm.as_deref() == Some(nm.as_str()) {
                 txt2(st, TRACK_X + 130, r, "Delete?");
                 btn_f(st, r, TRACK_X + 200, "Yes", true, false);
@@ -1522,7 +1533,7 @@ pub fn open() -> Result<(), String> {
     let (pw, ph) = (pi.width, pi.height);
     // UIMETRICS (B372): a NATIVE window — the layout stays WIN_W x WIN_H logical px, the surface is that at the
     // panel's dpi scale, drawn at scale 1 (never magnified by the compositor).
-    let (w, h) = (WIN_W, WIN_H);
+    let (w, h) = (WIN_W, WIN_H());
     let (sw, sh) = (super::metrics::size(w), super::metrics::size(h));
     if sw > pw.saturating_sub(2 * wm::BORDER()) || sh > ph.saturating_sub(wm::TITLE_H() + 2 * wm::BORDER()) { return Err(String::from("window below floor")); }
     let len = sw * sh;
@@ -1621,21 +1632,21 @@ fn col_list(q: &str) -> ([u8; TABS], usize) {
 
 /// The first visible row held to a list of `n`.
 fn col_clamp(top: usize, n: usize) -> usize {
-    top.min(n.saturating_sub(COL_VIS))
+    top.min(n.saturating_sub(COL_VIS()))
 }
 
 /// The column's first visible row so that list position `pos` is in view, starting from `top`.
 fn col_scrolled(top: usize, pos: usize, n: usize) -> usize {
-    let top = if pos < top { pos } else if pos >= top + COL_VIS { pos + 1 - COL_VIS } else { top };
+    let top = if pos < top { pos } else if pos >= top + COL_VIS() { pos + 1 - COL_VIS() } else { top };
     col_clamp(top, n)
 }
 
 /// The tab under logical `cy` in a column listing `list[..n]` from row `top` (`None` = the inset or past the last).
 fn col_tab_at(cy: usize, top: usize, list: &[u8; TABS], n: usize) -> Option<usize> {
-    if cy < COL_PAD { return None; }
-    let r = (cy - COL_PAD) / COL_ROW;
+    if cy < COL_PAD() { return None; }
+    let r = (cy - COL_PAD()) / COL_ROW();
     let i = top + r;
-    (r < COL_VIS && i < n).then(|| list[i] as usize)
+    (r < COL_VIS() && i < n).then(|| list[i] as usize)
 }
 
 /// The last pointer position the hover pass read (`x << 32 | y`; `u64::MAX` = read it afresh).
@@ -1910,21 +1921,21 @@ fn press_at(cx: usize, cy: usize, key: bool) -> bool {
 fn press_dispatch(cx: usize, cy: usize, key: bool) -> bool {
     // SETTINGSCRAFT: the press shows its control's pressed face for PRESS_MS (the action's own repaint draws it); a
     // press anywhere but the search field takes the keys back from it; the focus ring hides until the next key.
-    let in_search = cx >= SEARCH_X && cx < SEARCH_X + SEARCH_W && cy >= SEARCH_Y && cy < SEARCH_Y + SEARCH_H;
+    let in_search = cx >= SEARCH_X && cx < SEARCH_X + SEARCH_W && cy >= SEARCH_Y() && cy < SEARCH_Y() + SEARCH_H();
     let (top, query) = match STATE.lock().as_mut() {
         Some(s) => { s.press = Some((cx, cy, crate::arch::ms().max(1))); s.kbd = key; s.search = in_search; s.found = None; (s.col_top, s.query.clone()) }
         None => return true,
     };
     if cx < COL_W { // SETTINGSTABS (B623): a press in the column selects by row
         if in_search { repaint(); return true; }
-        if cy < CARD_Y + CARD_H { if cur_tab() != 1 { switch_tab(1); } else { repaint(); } return true; } // the user card opens Users
+        if cy < CARD_Y + CARD_H() { if cur_tab() != 1 { switch_tab(1); } else { repaint(); } return true; } // the user card opens Users
         let (list, n) = col_list(&query);
         let Some(t) = col_tab_at(cy, top, &list, n) else { repaint(); return true };
         if t != cur_tab() { switch_tab(t); } else { if let Some(st) = STATE.lock().as_mut() { st.strip = true; } repaint(); }
         return true;
     }
     if cy < TOP { repaint(); return true; }
-    let row = (cy - TOP) / ROW_H;
+    let row = (cy - TOP) / ROW_H();
     if row >= ROWS { repaint(); return true; }
     if !STATE.lock().as_ref().is_some_and(|s| s.modes_open) && super::settingsfiles::press(cur_tab(), row, cx, ROWS, CTRL_R, LABEL_X) { return true; } // SETTINGSFILES (B407): the pane's `Stored in settings/<domain>` link
     match cur_tab() {
@@ -2042,10 +2053,10 @@ pub fn selftest() {
     let (all, n_all) = col_list("");
     let (disp, n_disp) = col_list("DISP");
     let col_ok = PANE_X == COL_W && WIN_W == COL_W + PANE_W && n_all == TABS && n_disp == 1 && disp[0] == 2 && col_list("zzz").1 == 0
-        && (0..TABS).all(|k| { let t = col_scrolled(0, k, TABS); col_tab_at(COL_PAD + (k - t) * COL_ROW + COL_ROW / 2, t, &all, TABS) == Some(k) });
+        && (0..TABS).all(|k| { let t = col_scrolled(0, k, TABS); col_tab_at(COL_PAD() + (k - t) * COL_ROW() + COL_ROW() / 2, t, &all, TABS) == Some(k) });
     let craft = craft_check();
     let ok = saved && same && live && col_ok && craft.is_ok();
-    serial_println!("[settings] fixture opened={} saved={:?} reread_same={} live_idle={} store={} tabs=left col_w={} sel={} col_ok={} craft={} win={}x{}", opened as u8, saved, same as u8, live as u8, crate::prefs::path(), COL_W, TAB_NAMES[(CUR.lock().tab as usize).min(TABS - 1)], col_ok as u8, craft.err().unwrap_or("ok"), WIN_W, WIN_H);
+    serial_println!("[settings] fixture opened={} saved={:?} reread_same={} live_idle={} store={} tabs=left col_w={} sel={} col_ok={} craft={} win={}x{}", opened as u8, saved, same as u8, live as u8, crate::prefs::path(), COL_W, TAB_NAMES[(CUR.lock().tab as usize).min(TABS - 1)], col_ok as u8, craft.err().unwrap_or("ok"), WIN_W, WIN_H());
     witness(ok);
 }
 
@@ -2091,11 +2102,11 @@ fn craft_dark(e: &'static str) -> &'static str {
 /// One set's probe: the General pane painted into a fresh surface; returns the pane's face.
 #[cfg(feature = "witness")]
 fn craft_probe() -> Result<u32, &'static str> {
-    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
     let mut surf: Vec<u32> = Vec::new();
     if surf.try_reserve_exact(pw * ph).is_err() { return Err("oom"); }
     surf.resize(pw * ph, 0);
-    let mut st = State::new(WIN_W, WIN_H, surf, 1, true, 0);
+    let mut st = State::new(WIN_W, WIN_H(), surf, 1, true, 0);
     let mut v = CUR.lock().clone();
     v.tab = 0;
     paint(&mut st, &v);
@@ -2105,7 +2116,7 @@ fn craft_probe() -> Result<u32, &'static str> {
     if sb == face { return Err("sets"); }
     // icons
     for k in 0..TABS {
-        let iy = pill_y(k, 0) + (PILL_H - ICON) / 2;
+        let iy = pill_y(k, 0) + (PILL_H() - ICON) / 2;
         let (x0, y0, t) = (e(ICON_X), e(iy), ew(ICON_X, ICON));
         let tile = icon_tile(k);
         if px(x0, y0) == tile { return Err("icons"); }
@@ -2305,6 +2316,7 @@ pub fn set_tab_named(name: &str) -> bool {
 
 /// KERNELFONT2 (B363) M4: the faces loaded or were restyled — repaint the open window once (no window: nothing).
 pub fn font_repaint() {
+    if textscale::resized() && open().is_ok() { return; } // TEXTSCALE (B813): the text size moved the window's height — open re-lays it (a refusal keeps the old window)
     repaint();
 }
 
@@ -2626,13 +2638,13 @@ fn mode_caption(m: &prefs_core::modes::Mode) -> String {
 /// The closed popup: the kit's button across the row with the current entry and a chevron; the panel's own mode below.
 fn mode_field(st: &mut State) {
     let ms = display_modes();
-    let (y, w) = (mid_y(2, BTN_H), CTRL_R - TRACK_X);
-    let c = cs(st, TRACK_X, y, w, BTN_H, false);
+    let (y, w) = (mid_y(2, BTN_H()), CTRL_R - TRACK_X);
+    let c = cs(st, TRACK_X, y, w, BTN_H(), false);
     {
         let mut s = sf(st);
         draw::push_button(&mut s, e(TRACK_X), e(y), ew(TRACK_X, w), b"", false, c);
         // The chevron: two strokes, down.
-        let (cx, cy, a) = (e(CTRL_R - 14), e(y + BTN_H / 2), dp(4));
+        let (cx, cy, a) = (e(CTRL_R - 14), e(y + BTN_H() / 2), dp(4));
         let sw = dp(2).max(1) * draw::SUB * 3 / 4;
         let ink = theme::ink_secondary();
         draw::line_aa(&mut s, (cx - a) * draw::SUB, (cy - a / 2) * draw::SUB, cx * draw::SUB, (cy + a / 2) * draw::SUB, sw, ink);
@@ -2656,7 +2668,7 @@ fn mode_list(st: &mut State) {
     let (x, y, w) = (TRACK_X, row_top(3), CTRL_R - TRACK_X);
     {
         let mut s = sf(st);
-        let r = Rect::new(e(x), e(y), ew(x, w), ew(y, n * ROW_H));
+        let r = Rect::new(e(x), e(y), ew(x, w), ew(y, n * ROW_H()));
         let rad = dp(draw::DIMS.group_radius);
         draw::shadow_rrect(&mut s, r.offset(0, dp(2)), rad, dp(12), theme::shadow_window());
         draw::fill_rrect(&mut s, r, rad, theme::group_fill());
@@ -2664,13 +2676,13 @@ fn mode_list(st: &mut State) {
     }
     for (k, m) in ms.iter().enumerate().take(n) {
         let ry = row_top(3 + k);
-        let c = cs(st, x, ry, w, ROW_H, false);
+        let c = cs(st, x, ry, w, ROW_H(), false);
         kmeta(st, K_ENTRY, 0, 0);
-        if c.focused { ring_box(st, x + 6, ry + 6, w - 12, ROW_H - 12); } // PICKERKEYS (B768): the entry holding the keyboard
+        if c.focused { ring_box(st, x + 6, ry + 6, w - 12, ROW_H() - 12); } // PICKERKEYS (B768): the entry holding the keyboard
         let on = k == cur;
         if on || c.hover {
             let (px, py) = (x + 6, ry + 6);
-            let r = Rect::new(e(px), e(py), ew(px, w - 12), ew(py, ROW_H - 12));
+            let r = Rect::new(e(px), e(py), ew(px, w - 12), ew(py, ROW_H() - 12));
             let ink = if on { Ink::solid(theme::accent()) } else { Ink::argb(theme::hairline()) };
             draw::fill_rrect(&mut sf(st), r, dp(draw::DIMS.row_radius), ink);
         }
@@ -2838,7 +2850,7 @@ fn paint_appearance(st: &mut State) {
     txt(st, LABEL_X, 4, "Selection");
     {
         let y = row_top(4) + 10;
-        let r = Rect::new(e(TRACK_X), e(y), ew(TRACK_X, TRACK_W), ew(y, ROW_H - 20));
+        let r = Rect::new(e(TRACK_X), e(y), ew(TRACK_X, TRACK_W), ew(y, ROW_H() - 20));
         draw::fill_rrect(&mut sf(st), r, dp(draw::DIMS.row_radius), theme::selection());
     }
     txt(st, TRACK_X + 8, 4, "Selected text looks like this");
@@ -3154,7 +3166,7 @@ fn paint_notifypane(st: &mut State) {
     let sched = super::notifypane::in_window_now();
     txt2(st, TRACK_X, 0, if dnd { "On" } else if sched { "On (scheduled)" } else { "Off" });
     txt(st, LABEL_X, 1, "Scheduled");
-    let sy = mid_y(1, BTN_H);
+    let sy = mid_y(1, BTN_H());
     for (k, x) in NP_STEPS.iter().enumerate() { btn_at(st, *x, sy, NP_STEP_W, if k % 2 == 0 { "-" } else { "+" }, false, false); }
     txt(st, NP_STEPS[0] + NP_STEP_W + 8, 1, &alloc::format!("{:02}:00", np.0));
     txt(st, NP_STEPS[2] + NP_STEP_W + 8, 1, &alloc::format!("{:02}:00", np.1));
@@ -3234,14 +3246,14 @@ fn paint_filetypes(st: &mut State) {
     for (k, r) in v.iter().skip(first).take(FT_ROWS).enumerate() {
         let row = 1 + k;
         // A type's row is one press target (it hands the type to its next app): it lights under the pointer.
-        let c = cs(st, BOX_X, row_top(row), BOX_W, ROW_H, false);
+        let c = cs(st, BOX_X, row_top(row), BOX_W, ROW_H(), false);
         if c.hover || c.pressed || c.focused { row_wash(st, row); }
         if c.focused { row_ring(st, row); } // PICKERKEYS (B768): the type row holding the keyboard
         let t = 20;
         tab_icon(&mut sf(st), FT_TAB, e(LABEL_X), e(mid_y(row, t)), ew(LABEL_X, t), None);
         let app = if r.preferred.is_empty() { String::from("(no app)") } else { r.preferred_name.clone() };
         let ext = if r.extensions.is_empty() { String::new() } else { alloc::format!(" .{}", r.extensions.replace(", ", " .")) };
-        let ty = row_top(row) + (ROW_H - ch) / 2;
+        let ty = row_top(row) + (ROW_H() - ch) / 2;
         let pen = text_at(st, LABEL_X + t + 10, ty, app_x - 8, &r.description, theme::text_primary(), false, face);
         text_at(st, pen + 8, ty, app_x - 8, &alloc::format!("{}{}", r.mime, ext), theme::ink_secondary(), false, face);
         text_at(st, app_x, ty, FT_GX, &alloc::format!("{} ({})", app, r.registrants), theme::ink_secondary(), false, face); // SCROLLPANES (B777): clipped at the gutter
@@ -3562,11 +3574,11 @@ pub fn selftest_a11y() {
     let declared = keys.iter().filter(|k| prefs_core::schema::lookup(crate::prefs::NS, k).is_some()).count();
     // The pane, painted offscreen at the panel's scale: the card, the search field and the four controls record hits.
     let pane = {
-        let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+        let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
         let mut surf: Vec<u32> = Vec::new();
         if surf.try_reserve_exact(pw * ph).is_err() { false } else {
             surf.resize(pw * ph, 0);
-            let mut st = State::new(WIN_W, WIN_H, surf, 0, true, 0);
+            let mut st = State::new(WIN_W, WIN_H(), surf, 0, true, 0);
             let mut v = CUR.lock().clone();
             v.tab = A11Y_TAB as u8;
             paint(&mut st, &v);
@@ -3983,7 +3995,7 @@ fn open_hit(h: Hit, typed: usize) {
 /// The accent ring around row `r` (the row the search opened).
 fn found_ring(st: &mut State, r: usize) {
     let (x, y) = (BOX_X + GAP, row_top(r) + GAP);
-    let rr = Rect::new(e(x), e(y), ew(x, BOX_W - 2 * GAP), ew(y, ROW_H - 2 * GAP));
+    let rr = Rect::new(e(x), e(y), ew(x, BOX_W - 2 * GAP), ew(y, ROW_H() - 2 * GAP));
     draw::stroke_rrect(&mut sf(st), rr, dp(draw::DIMS.row_radius), dp(2).max(1), Ink::argb(theme::accent()));
 }
 
@@ -4113,14 +4125,14 @@ pub fn selftest_map() {
 /// a knob), pixels of the ring's colour (`theme::focus_ring`, +-3 a channel) changed from the rest. Equal = every
 /// control is reached by the keyboard and shows it. A fresh `State` per paint (no glide carries); one surface pair.
 pub fn keys_probe() -> (usize, usize) {
-    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
     let (mut a, mut b): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     if a.try_reserve_exact(pw * ph).is_err() || b.try_reserve_exact(pw * ph).is_err() { return (0, 0); }
     a.resize(pw * ph, 0);
     b.resize(pw * ph, 0);
     let v0 = CUR.lock().clone();
     let paint_one = |buf: Vec<u32>, tab: usize, kf: usize| -> (Vec<u32>, Vec<[u16; 4]>, usize) {
-        let mut st = State::new(WIN_W, WIN_H, buf, 1, false, 0);
+        let mut st = State::new(WIN_W, WIN_H(), buf, 1, false, 0);
         st.kbd = true;
         st.kf = kf;
         let mut v = v0.clone();
@@ -4175,7 +4187,7 @@ pub fn keys_probe() -> (usize, usize) {
 /// the wash's plus that width — what `draw::focus_ring` draws around a control.
 fn row_ring(st: &mut State, r: usize) {
     let (x, y) = (BOX_X + GAP, row_top(r) + GAP);
-    let rr = Rect::new(e(x), e(y), ew(x, BOX_W - 2 * GAP), ew(y, ROW_H - 2 * GAP));
+    let rr = Rect::new(e(x), e(y), ew(x, BOX_W - 2 * GAP), ew(y, ROW_H() - 2 * GAP));
     let w = dp(draw::DIMS.focus_ring);
     draw::stroke_rrect(&mut sf(st), rr.inset(-w), dp(draw::DIMS.row_radius) + w, w, Ink::argb(theme::focus_ring()));
 }
@@ -4190,7 +4202,7 @@ fn row_ring(st: &mut State, r: usize) {
 /// (`col_scrolled`, `open`'s rule), so a tab past [`COL_VIS`] shows its pill and its ring as on the glass.
 #[cfg(feature = "witness")]
 pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str)>) {
-    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
     let (mut a, mut b): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     if a.try_reserve_exact(pw * ph).is_err() || b.try_reserve_exact(pw * ph).is_err() {
         return (0, 0, 0, alloc::vec![(usize::MAX, 0, "-")]);
@@ -4200,7 +4212,7 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str)>) 
     let v0 = CUR.lock().clone();
     // PICKERKEYS (B768): each paint also returns the pane's stops (the rest paint's count is the tab's)
     let paint_one = |buf: Vec<u32>, tab: usize, stop: Option<usize>| -> (Vec<u32>, usize, Option<[u16; 4]>) {
-        let mut st = State::new(WIN_W, WIN_H, buf, 1, true, col_scrolled(0, tab, TABS)); // A11YTREE2 (B822): the live column
+        let mut st = State::new(WIN_W, WIN_H(), buf, 1, true, col_scrolled(0, tab, TABS)); // A11YTREE2 (B822): the live column
         if let Some(k) = stop {
             st.kbd = true;
             if k > 0 {
@@ -4252,7 +4264,7 @@ pub fn ring_probe() -> (usize, usize, usize, Vec<(usize, usize, &'static str)>) 
 fn ring_row_name(tab: usize, stop: usize, hit: Option<[u16; 4]>) -> &'static str {
     if stop == 0 { return "column"; }
     let Some(h) = hit else { return "-" };
-    let r = (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H;
+    let r = (h[1] as usize + h[3] as usize / 2).saturating_sub(TOP) / ROW_H();
     MAP.iter().find(|m| m.tab == tab && m.row == r).map_or("-", |m| m.label)
 }
 
@@ -4407,7 +4419,7 @@ fn paint_storage(st: &mut State) {
     let ch = super::metrics::lcell_h(face);
     for (i, c) in cards.iter().take(shown).enumerate() {
         let r = i * 3;
-        text_at(st, LABEL_X, row_top(r) + (ROW_H - ch) / 2, CTRL_R, &c.head, theme::text_primary(), true, face);
+        text_at(st, LABEL_X, row_top(r) + (ROW_H() - ch) / 2, CTRL_R, &c.head, theme::text_primary(), true, face);
         txt2(st, LABEL_X, r + 1, &c.facts);
         let ink = match c.level { 1 => theme::ink_positive(), 2 => theme::ink_warning(), _ => theme::ink_secondary() };
         txt_ink(st, LABEL_X, r + 2, &c.health, ink);
@@ -4598,7 +4610,7 @@ pub(crate) mod sysimg {
         txt(st, LABEL_X, R_STAGED, "Staged");
         txt2(st, VAL, R_STAGED, &lines[1]);
         if aside { txt_ink(st, LABEL_X, R_NOTE, &lines[2], theme::text_primary()); } else { txt2(st, LABEL_X, R_NOTE, &lines[2]); }
-        let y = mid_y(R_BTN, BTN_H);
+        let y = mid_y(R_BTN, BTN_H());
         if aside {
             btn_at(st, LABEL_X, y, SMALL_W, "Remove", false, false);
         } else if picking {
@@ -4963,7 +4975,7 @@ fn hw_service() {
 pub fn hwtab_probe() -> (usize, usize, usize, bool, String) {
     let Some(c) = crate::hw::last() else { return (HW_TAB, 0, 0, false, String::from("no-census")) };
     let n = c.rows.len();
-    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
     let mut buf: Vec<u32> = Vec::new();
     if buf.try_reserve_exact(pw * ph).is_err() {
         return (HW_TAB, n, 0, false, String::from("oom"));
@@ -4978,7 +4990,7 @@ pub fn hwtab_probe() -> (usize, usize, usize, bool, String) {
     let mut page = 0;
     loop {
         HW_TOP.store(page, Ordering::Relaxed);
-        let mut st = State::new(WIN_W, WIN_H, core::mem::take(&mut buf), 1, true, 0);
+        let mut st = State::new(WIN_W, WIN_H(), core::mem::take(&mut buf), 1, true, 0);
         paint(&mut st, &v);
         buf = core::mem::take(&mut st.surf);
         let first = hw_first(n);
@@ -5182,7 +5194,7 @@ pub(crate) mod backup {
         groups(st, &[(R_BACK, R_NOTE)]);
         let busy = phase != job::IDLE;
         let picker = |st: &mut State, r: usize, items: &[String], empty: &str| {
-            let y = mid_y(r, BTN_H);
+            let y = mid_y(r, BTN_H());
             if !surveyed {
                 txt2(st, LABEL_X, r, "Measuring…");
                 return;
@@ -5200,12 +5212,12 @@ pub(crate) mod backup {
             let empty = if need == 0 { String::from("Home could not be measured") } else { format!("No removable volume has room for Home ({} MB)", mb(need)) };
             picker(st, R_BACK, &vols, &empty);
         } else {
-            btn_at(st, LABEL_X, mid_y(R_BACK, BTN_H), OPEN_W, "Back up Home to…", false, false);
+            btn_at(st, LABEL_X, mid_y(R_BACK, BTN_H()), OPEN_W, "Back up Home to…", false, false);
         }
         if pick == 2 && !busy {
             picker(st, R_REST, &archives, "No removable volume carries a .geode archive");
         } else {
-            btn_at(st, LABEL_X, mid_y(R_REST, BTN_H), OPEN_W, "Restore from…", false, false);
+            btn_at(st, LABEL_X, mid_y(R_REST, BTN_H()), OPEN_W, "Restore from…", false, false);
         }
         let note = note_of(phase, done, total, &said);
         if busy { txt_ink(st, LABEL_X, R_NOTE, &note, theme::text_primary()); } else { txt2(st, LABEL_X, R_NOTE, &note); }
@@ -5418,7 +5430,7 @@ fn hw_scrolled(id: wm::WinId, s: &wm::ScrollStep) -> usize {
     HW_TOP.store(s.off / dlh.max(1), Ordering::Relaxed);
     let Some(c) = c.filter(|c| tab == HW_TAB && c.rows.len() == HW_N.load(Ordering::Relaxed)) else {
         repaint();
-        return super::metrics::size(WIN_W) * super::metrics::size(WIN_H);
+        return super::metrics::size(WIN_W) * super::metrics::size(WIN_H());
     };
     let mut g = STATE.lock();
     let Some(st) = g.as_mut() else { return 0 };
@@ -5440,12 +5452,12 @@ pub fn scrollview_probe() -> Result<usize, &'static str> {
         .map(|k| crate::hw::Row { bus: "pci", id: alloc::format!("8086:{:04x}", k), at: alloc::format!("00:{:02x}.0", k), name: alloc::format!("Device {}", k), driver: if k % 3 == 0 { "none" } else { "xhci" }, state: if k % 3 == 0 { "absent" } else { "up" } })
         .collect();
     let (top, _, lh, vis) = hw_geom();
-    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
     let full = |first: usize| -> Option<State> {
         let mut buf: Vec<u32> = Vec::new();
         buf.try_reserve_exact(pw * ph).ok()?;
         buf.resize(pw * ph, 0);
-        let mut st = State::new(WIN_W, WIN_H, buf, 1, true, 0);
+        let mut st = State::new(WIN_W, WIN_H(), buf, 1, true, 0);
         let (v, _) = hw_view(rows.len(), first);
         let (x0, y0, vw, vh) = v.viewport;
         draw::fill(&mut sf(&mut st), Rect::new(x0 as i32, y0 as i32, vw as i32, vh as i32), theme::group_fill());
@@ -5519,9 +5531,9 @@ fn bar_only(id: wm::WinId, pane: u8, s: &wm::ScrollStep) -> usize {
 
 /// The column's model for `n` listed tabs from row `top`, device px: `(view, gutter_w)`.
 fn col_view(n: usize, top: usize) -> (wm::ScrollView, usize) {
-    let y0 = e(COL_PAD).max(0) as usize;
-    let dl = ew(COL_PAD, COL_ROW).max(1) as usize;
-    let vp = (0, y0, e(COL_GX).max(0) as usize, COL_VIS * dl);
+    let y0 = e(COL_PAD()).max(0) as usize;
+    let dl = ew(COL_PAD(), COL_ROW()).max(1) as usize;
+    let vp = (0, y0, e(COL_GX).max(0) as usize, COL_VIS() * dl);
     (wm::ScrollView { offset: top * dl, extent: n * dl, viewport: vp, line: dl }, ew(COL_GX, COL_GW).max(1) as usize)
 }
 
@@ -5531,7 +5543,7 @@ fn col_scroll_sync(id: wm::WinId, st: &mut State) {
         return;
     }
     let n = col_list(&st.query).1;
-    if n <= COL_VIS {
+    if n <= COL_VIS() {
         wm::scroll_drop(id, PANE_COL);
         return;
     }
@@ -5557,7 +5569,7 @@ fn col_scrolled_fn(id: wm::WinId, s: &wm::ScrollStep) -> usize {
         st.col_top = col_step_top(s.off, n);
     }
     repaint();
-    super::metrics::size(WIN_W) * super::metrics::size(WIN_H)
+    super::metrics::size(WIN_W) * super::metrics::size(WIN_H())
 }
 
 // ── the File Types rows ──
@@ -5571,7 +5583,7 @@ fn ft_first(n: usize) -> usize {
 /// box (inset `GAP` top and bottom, so the gutter stays inside the box), line = the device row pitch; the extent is
 /// short by the same inset, so the last offset still shows the last [`FT_ROWS`] types.
 fn ft_view(n: usize, first: usize) -> (wm::ScrollView, usize) {
-    let dl = ew(row_top(1), ROW_H).max(1) as usize;
+    let dl = ew(row_top(1), ROW_H()).max(1) as usize;
     let y0 = e(row_top(1) + GAP).max(0) as usize;
     let y1 = e(row_top(1 + FT_ROWS) - GAP).max(0) as usize;
     let vh = y1.saturating_sub(y0);
@@ -5611,7 +5623,7 @@ fn ft_scrolled(id: wm::WinId, s: &wm::ScrollStep) -> usize {
     let n = crate::fs::assoc::view().len();
     FT_TOP.store(ft_step_first(s.off, n), Ordering::Relaxed);
     repaint();
-    super::metrics::size(WIN_W) * super::metrics::size(WIN_H)
+    super::metrics::size(WIN_W) * super::metrics::size(WIN_H())
 }
 
 /// Prev / Next: a viewport of rows through wm's model. `true` = the model took it (its step repainted).
@@ -5626,7 +5638,7 @@ fn ft_page(dir: isize) -> bool {
 /// the model's viewport sits inside the window and left of its gutter, the column's paint at that row puts the
 /// expected tab first (an offscreen `State`), and a Prev / Next page is exactly [`FT_ROWS`] rows.
 pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 2] {
-    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H));
+    let (pw, ph) = (super::metrics::size(WIN_W), super::metrics::size(WIN_H()));
     let walk: [isize; 7] = [3, 5, -2, 40, -1000, 1000, -1];
     let inside = |v: &wm::ScrollView, gw: usize| {
         let (x, y, w, h) = v.viewport;
@@ -5635,7 +5647,7 @@ pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 2] {
     // The column.
     let tabs = (|| -> Result<usize, &'static str> {
         let n = TABS;
-        if n <= COL_VIS {
+        if n <= COL_VIS() {
             return Err("the column fits: nothing to scroll");
         }
         let (mut v, gw) = col_view(n, 0);
@@ -5643,11 +5655,11 @@ pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 2] {
             return Err("the column's viewport leaves the window");
         }
         let mut want: isize = 0;
-        let max = (n - COL_VIS) as isize;
+        let max = (n - COL_VIS()) as isize;
         let mut buf: Vec<u32> = Vec::new();
         buf.try_reserve_exact(pw * ph).map_err(|_| "oom")?;
         buf.resize(pw * ph, 0);
-        let mut st = State::new(WIN_W, WIN_H, buf, 0, true, 0);
+        let mut st = State::new(WIN_W, WIN_H(), buf, 0, true, 0);
         for &d in walk.iter() {
             let s = v.step(d * v.line as isize);
             v.offset = s.off;
@@ -5658,7 +5670,7 @@ pub fn scrollpanes_probe() -> [Result<usize, &'static str>; 2] {
             }
             st.col_top = top;
             paint_column(&mut st, 0);
-            if st.col_top != top || col_tab_at(COL_PAD + COL_ROW / 2, st.col_top, &col_list("").0, n) != Some(top) {
+            if st.col_top != top || col_tab_at(COL_PAD() + COL_ROW() / 2, st.col_top, &col_list("").0, n) != Some(top) {
                 return Err("the column's paint does not start at the step's row");
             }
         }
@@ -5704,5 +5716,160 @@ fn bus_subscribe_once() {
     if !BUS_SUB.swap(true, Ordering::AcqRel) {
         crate::prefs_client::subscribe();
         serial_println!("[settings] prefchanged subscribe once (SETTINGSSUB B802)");
+    }
+}
+
+// ── TEXTSCALE (rmbp-ledger B813) — Settings reflows with the text size ─────────────────────────────────────────────
+// Flight 37: `font_size=26 … ui=inter-52.75` and every row, pill and control box kept its px, so glyphs overwrote
+// their neighbours. VERTICAL: every text-bearing pitch above is a same-line fn over `theme::metrics().grow` (rows, the
+// column's card/search/pills, the kit's boxes via `draw::*_h`), and the window's height follows (`win_h_at`, whose
+// largest size `video::text::textscale::cap_for` keeps on the panel); `font_repaint` re-opens a window whose height
+// moved. HORIZONTAL: a full paint queues its text runs ([`text_at`]) and draws them at its end ([`flush`]): a run whose
+// pen would pass the start of a control recorded since the last flush, or of another run, on its line to its right is
+// clipped `GAP` before it; a run that collides with nothing draws exactly as before. The overlay (the Resolution popup)
+// flushes first so it covers the rows' text as it always did.
+pub(crate) mod textscale {
+    use super::{State, GAP};
+    use crate::video::metrics;
+    use crate::video::text::Face;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// One queued text run (logical px; `pen` is where the unclipped text would end).
+    pub(super) struct Run {
+        x: usize,
+        y: usize,
+        clip: usize,
+        pen: usize,
+        t: String,
+        ink: u32,
+        bold: bool,
+        face: Face,
+    }
+
+    /// The paint's text queue: armed while a full paint lays its controls; the drawn runs' rects (logical
+    /// `x, y, w, h`, as clipped) for the fixture; how many runs a collision clipped.
+    pub(super) struct Queue {
+        pub(super) armed: bool,
+        runs: Vec<Run>,
+        from: usize,
+        pub(super) drawn: Vec<[u16; 4]>,
+        pub(super) clipped: u32,
+    }
+
+    impl Queue {
+        pub(super) fn armed() -> Queue {
+            Queue { armed: true, runs: Vec::new(), from: 0, drawn: Vec::new(), clipped: 0 }
+        }
+    }
+
+    /// Queue a run; returns the logical pen the drawn text would return (`metrics::text`'s).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn queue(q: &mut Queue, x: usize, y: usize, clip: usize, t: &str, ink: u32, bold: bool, face: Face) -> usize {
+        let pen = metrics::to_logical(metrics::edge(x) + crate::video::text::advance(t.as_bytes(), bold, metrics::native_face(face)));
+        q.runs.push(Run { x, y, clip, pen, t: String::from(t), ink, bold, face });
+        pen
+    }
+
+    /// Draw the queued runs, each clipped at the next item on its line when its pen would pass it; `keep` re-arms the
+    /// queue (an overlay paints next), else the paint's text is done and later text draws at once.
+    pub(super) fn flush(st: &mut State, keep: bool) {
+        let Some(mut q) = st.runs.take() else { return };
+        let runs = core::mem::take(&mut q.runs);
+        let from = q.from.min(st.hits.len());
+        let (pw, ph) = (metrics::size(st.w), metrics::size(st.h));
+        for (i, r) in runs.iter().enumerate() {
+            let lh = metrics::lcell_h(r.face);
+            let on_line = |y: usize, h: usize| y < r.y + lh && r.y < y + h;
+            let mut clip = r.clip;
+            for h in &st.hits[from..] {
+                let (hx, hy, hh) = (h[0] as usize, h[1] as usize, h[3] as usize);
+                if hx > r.x && r.pen > hx && on_line(hy, hh) {
+                    clip = clip.min(hx.saturating_sub(GAP).max(r.x + 1));
+                }
+            }
+            for (j, o) in runs.iter().enumerate() {
+                if j != i && o.x > r.x && r.pen > o.x && on_line(o.y, metrics::lcell_h(o.face)) {
+                    clip = clip.min(o.x.saturating_sub(GAP).max(r.x + 1));
+                }
+            }
+            if clip < r.clip {
+                q.clipped += 1;
+            }
+            metrics::text(&mut st.surf, pw, ph, clip, r.x, r.y, r.t.as_bytes(), r.ink, r.bold, r.face);
+            let right = r.pen.min(clip).max(r.x);
+            q.drawn.push([r.x.min(0xFFFF) as u16, r.y.min(0xFFFF) as u16, (right - r.x).min(0xFFFF) as u16, lh.min(0xFFFF) as u16]);
+        }
+        q.from = st.hits.len();
+        q.armed = keep;
+        st.runs = Some(q);
+    }
+
+    /// The open window was laid out for another text size (its surface is not [`super::WIN_H`] tall).
+    pub(super) fn resized() -> bool {
+        super::is_open() && super::STATE.lock().as_ref().is_some_and(|st| st.h != super::WIN_H())
+    }
+
+    /// `[kfont] restyle … metrics=row:<n> bar:<n>`: the row pitch and the control box at the live text size.
+    pub fn wire() -> (usize, usize) {
+        (super::ROW_H(), super::BTN_H())
+    }
+
+    /// `tests textscale`'s per-step reading: every tab painted offscreen at `WIN_W x WIN_H()` (the column scrolled by
+    /// the live rule, `col_scrolled`) — the text runs drawn, the controls recorded, text-over-text and text-over-control
+    /// collisions (a run crossing a control it is not inside), the runs a collision clipped, and the kit's relations
+    /// (the UI line fits every text-bearing box; the card holds two lines; a pill fits its column row).
+    #[cfg(feature = "witness")]
+    pub struct Probe {
+        pub runs: usize,
+        pub hits: usize,
+        pub tt: usize,
+        pub tc: usize,
+        pub clipped: u32,
+        pub kit: bool,
+        pub row: usize,
+        pub win_h: usize,
+        pub line: usize,
+    }
+
+    #[cfg(feature = "witness")]
+    pub fn probe() -> Option<Probe> {
+        use super::{col_scrolled, paint, CUR, TABS, WIN_H, WIN_W};
+        let (pw, ph) = (metrics::size(WIN_W), metrics::size(WIN_H()));
+        let mut buf: Vec<u32> = Vec::new();
+        if buf.try_reserve_exact(pw * ph).is_err() {
+            return None;
+        }
+        buf.resize(pw * ph, 0);
+        let v0 = CUR.lock().clone();
+        let lc = metrics::lcell_h(Face::Ui);
+        let kit = [crate::video::draw::button_h(), crate::video::draw::field_h(), crate::video::draw::seg_h(), crate::video::draw::row_h(), super::ROW_H()].iter().all(|&b| lc <= b)
+            && super::CARD_H() >= 2 * lc
+            && super::PILL_H() <= super::COL_ROW()
+            && super::BTN_H() <= super::ROW_H();
+        let inter = |a: &[u16; 4], b: &[u16; 4]| {
+            let (ax, ay, aw, ah) = (a[0] as usize, a[1] as usize, a[2] as usize, a[3] as usize);
+            let (bx, by, bw, bh) = (b[0] as usize, b[1] as usize, b[2] as usize, b[3] as usize);
+            aw > 0 && ah > 0 && bw > 0 && bh > 0 && ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+        };
+        let inside = |a: &[u16; 4], b: &[u16; 4]| a[0] >= b[0] && a[1] >= b[1] && a[0] as usize + a[2] as usize <= b[0] as usize + b[2] as usize && a[1] as usize + a[3] as usize <= b[1] as usize + b[3] as usize;
+        let mut p = Probe { runs: 0, hits: 0, tt: 0, tc: 0, clipped: 0, kit, row: super::ROW_H(), win_h: WIN_H(), line: crate::video::theme::metrics().line };
+        for tab in 0..TABS {
+            let mut st = State::new(WIN_W, WIN_H(), core::mem::take(&mut buf), 1, true, col_scrolled(0, tab, TABS));
+            let mut v = v0.clone();
+            v.tab = tab as u8;
+            paint(&mut st, &v);
+            if let Some(q) = st.runs.as_ref() {
+                p.runs += q.drawn.len();
+                p.clipped += q.clipped;
+                for (i, a) in q.drawn.iter().enumerate() {
+                    p.tt += q.drawn[i + 1..].iter().filter(|b| inter(a, *b)).count();
+                    p.tc += st.hits.iter().filter(|h| inter(a, *h) && !inside(a, *h)).count();
+                }
+            }
+            p.hits += st.hits.len();
+            buf = core::mem::take(&mut st.surf);
+        }
+        Some(p)
     }
 }

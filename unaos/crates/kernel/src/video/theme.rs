@@ -1086,3 +1086,43 @@ impl TypeStep {
 pub fn bump_epoch() {
     EPOCH.fetch_add(1, AOrd::AcqRel);
 }
+
+// ── TEXTSCALE (rmbp-ledger B813): the text size's line, published for the layouts that grow with it ───────────────
+// Flight 37: at the largest text step the UI face doubled while Settings' rows and the kit's boxes kept constant
+// logical px, so glyphs overwrote their neighbours. `video::text`'s restyle (the one face sizer, under its lock)
+// publishes the UI face's line here; a layout grows each text-bearing box by what the line grew. At the default size
+// (and anything smaller) `line` is TEXT_LINE_BASE and `grow(b)` is `b`: every layout draws its constants. Appended at
+// the file tail so no line above moves (this file is in every image).
+
+/// The UI face's line in logical px at the default text size — `font::CELL_H`, the cell the body atlas was cut for.
+pub const TEXT_LINE_BASE: usize = crate::video::font::CELL_H;
+static TEXT_LINE: AtomicU32 = AtomicU32::new(TEXT_LINE_BASE as u32);
+static TEXT_CAP: AtomicU32 = AtomicU32::new(0);
+
+/// The text size's metrics: the UI face's line (logical px) and the css size the panel holds (0 = not computed).
+#[derive(Clone, Copy)]
+pub struct TextMetrics {
+    pub line: usize,
+    pub cap_css: u32,
+}
+
+impl TextMetrics {
+    /// A text-bearing box `base` logical px tall at the default size, grown by what the line grew (never shrunk).
+    #[inline]
+    pub fn grow(self, base: usize) -> usize {
+        base + self.line.saturating_sub(TEXT_LINE_BASE)
+    }
+}
+
+/// The live text metrics (lock-free; written by `video::text`'s restyle before it bumps `text::epoch`).
+#[inline]
+pub fn metrics() -> TextMetrics {
+    TextMetrics { line: TEXT_LINE.load(AOrd::Relaxed) as usize, cap_css: TEXT_CAP.load(AOrd::Relaxed) }
+}
+
+/// The restyle's publish: the new line and cap. `true` when the line moved. Does NOT bump [`EPOCH`]: `text::epoch`
+/// is the one restyle signal (BP-video-39), and nothing keyed on the looks epoch depends on the line.
+pub fn text_restyled(line: usize, cap_css: u32) -> bool {
+    TEXT_CAP.store(cap_css, AOrd::Relaxed);
+    TEXT_LINE.swap(line as u32, AOrd::AcqRel) != line as u32
+}
