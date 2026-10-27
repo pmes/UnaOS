@@ -8,8 +8,8 @@
 //! a 20 x 2 KiB IOC ring and returns early. The stream is NOT run until `feed()` has primed the ring; the
 //! service tick (`service()`, folded at the top of `probe_after_root`) polls `LPIB` (INTCTL is never written, the
 //! BCIS latch reaches no CPU — HDASIE is a latch experiment) and refills each entry as it completes.
-//! Internally the stream is ALWAYS 16-bit stereo: `feed()` widens 8-bit and duplicates mono, and resamples by
-//! nearest-sample to 48 kHz when the codec's PCM-rates word (or the format readback) refuses the rate.
+//! Internally the stream is ALWAYS 16-bit stereo: `feed()` widens 8-bit and duplicates mono, one out frame per in frame;
+//! a rate the codec does not run (its PCM-rates word or the format readback) is refused by `start` (NLE4BKERNEL B896).
 //!
 //! SINKALL (rmbp-ledger B767): the stream above has ONE client — the mixer (`audio::mixer`'s HDA output, through the
 //! ring-3 door at the tail); `start` / `feed` / `finish` are private to this file and reached only from that door. The
@@ -155,7 +155,7 @@ pub(super) fn gate(base: u64, sd: u64, iss: u8, rings: &mut Rings, cad: u8, path
 }
 
 /// Begin a stream of `rate` Hz / `channels` / `bits` source samples. Returns the EFFECTIVE codec rate
-/// (equal to `rate` unless it is being resampled to 48 kHz). The stream starts once `feed()` primes the ring.
+/// (equal to `rate`: a rate the codec does not run is refused, NLE4BKERNEL B896). The stream starts once `feed()` primes the ring.
 /// SINKALL: called only by the ring-3 door's tick (`r3_tick`), i.e. for the mixer.
 fn start(rate: u32, channels: u8, bits: u8) -> Result<u32, &'static str> {
     if !(8_000..=48_000).contains(&rate) { return Err("rate outside 8000..48000"); }
@@ -172,12 +172,12 @@ fn start(rate: u32, channels: u8, bits: u8) -> Result<u32, &'static str> {
     if !s.armed {
         return Err("no speaker path / stream not armed");
     }
-    ACTIVE.store(true, Ordering::Release);
+    if s.eff_rate != s.src_rate { return rate_refused(s); } ACTIVE.store(true, Ordering::Release); // NLE4BKERNEL (rmbp-ledger B896): a codec rate that is not the source's is refused by name (file tail). LINE-NEUTRAL append, before this comment.
     Ok(s.eff_rate)
 }
 
 /// Queue source-format PCM bytes. Returns the bytes accepted: all of them, or 0 when the ring's FIFO has no
-/// room yet (retry on the next tick). Format conversion and nearest-sample resampling happen here.
+/// room yet (retry on the next tick). Format conversion happens here; no rate conversion (`start` refuses src != eff).
 fn feed(data: &[u8]) -> usize {
     let mut s = ST.lock();
     if !s.armed || s.ended || data.is_empty() { return 0; }
@@ -187,7 +187,7 @@ fn feed(data: &[u8]) -> usize {
     if s.fifo.len() + nframes * ratio * 4 > FIFO_CAP { return 0; }
     let mut buf = core::mem::take(&mut s.carry);
     buf.extend_from_slice(data);
-    let (src, eff) = (s.src_rate as u64, s.eff_rate as u64);
+    debug_assert_eq!(s.src_rate, s.eff_rate); // NLE4BKERNEL (B896): `start` refused a stream whose codec rate is not its source's
     let mut i = 0;
     while i + fin <= buf.len() {
         let f = &buf[i..i + fin];
@@ -197,13 +197,13 @@ fn feed(data: &[u8]) -> usize {
             (_, 1) => { let v = i16::from_le_bytes([f[0], f[1]]); (v, v) }
             _ => (i16::from_le_bytes([f[0], f[1]]), i16::from_le_bytes([f[2], f[3]])),
         };
-        let gi = s.in_frames; // global input frame index
-        s.in_frames += 1;
-        while s.out_n * src / eff <= gi {
-            let (lb, rb) = (l.to_le_bytes(), r.to_le_bytes());
-            s.fifo.extend([lb[0], lb[1], rb[0], rb[1]]);
-            s.out_n += 1;
-        }
+        s.in_frames += 1; // global input frame count; ONE out frame per in frame (NLE4BKERNEL B896: the nearest-sample loop
+        // here was dead — this stream's one client, the mixer, opens 48 kHz and `gate` falls back to 48 kHz, so src == eff on
+        // every live stream; it is deleted and `start` refuses a mismatch by name)
+        let (lb, rb) = (l.to_le_bytes(), r.to_le_bytes());
+        s.fifo.extend([lb[0], lb[1], rb[0], rb[1]]);
+        s.out_n += 1;
+        // (a rate converter for a native-rate master is MIXNATIVE's, owed: handlers.md §5 NLE4b)
         i += fin;
     }
     s.carry = buf[i..].to_vec();
@@ -1886,4 +1886,20 @@ pub fn fixture_end() {
 /// The alert's chime as the mixer source takes it (mono 16-bit, 48 kHz) — `tests sinkall`'s synthetic BT leg.
 pub fn alert_fixture_pcm() -> Vec<u8> {
     alert_pcm()
+}
+
+// ── NLE4BKERNEL (rmbp-ledger B896) — TAIL-APPENDED: `start` refuses a stream whose codec rate is not its source's ──────────
+// Owner: Stria (CODEX §2), the HDA driver's one stream. `feed`'s nearest-sample resampler (out k at source frame k * src /
+// eff) was dead: the stream's one client, the mixer's HDA output, opens 48 kHz (`r3_open(48000, 2, 16)`) and `gate` falls
+// back to 48 kHz when the codec refuses a rate, so src == eff on every live stream. The loop is deleted (the seat's MEASURE:
+// option B) and `start` is narrowed: a stream whose codec rate differs from its source's is refused here by name and
+// stopped. A converter for a native-rate master is MIXNATIVE's (owed, handlers.md §5 NLE4b).
+
+/// `start`'s refusal of a stream whose codec rate is not its source's: say so, stop the armed stream, Err.
+fn rate_refused(s: crate::sync::MutexGuard<'_, St>) -> Result<u32, &'static str> {
+    let (src, eff) = (s.src_rate, s.eff_rate);
+    drop(s);
+    serial_println!("[play] start: rate mismatch src={} eff={} refused (NLE4BKERNEL B896)", src, eff);
+    stream_stop();
+    Err("rate mismatch")
 }
