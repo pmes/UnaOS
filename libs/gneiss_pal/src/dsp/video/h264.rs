@@ -32,10 +32,19 @@ fn map_err(e: h264_core::Error) -> DecodeError {
     }
 }
 
-pub(super) fn to_frame(f: h264_core::Frame) -> Frame {
+/// The one h264_core / hevc_core `Frame` -> [`Frame`] bridge. COLOURONE (SR328): above 8 bits (HEVC Main10) the samples
+/// as decoded (`planes16`) become `Pixels::I420Hi`, so the conversion narrows after it converts; 8-bit is `I420` as before.
+pub(crate) fn to_frame(f: h264_core::Frame) -> Frame {
     let (w, h) = (f.width, f.height);
-    let [y, u, v] = f.planes;
-    Frame { width: w, height: h, pts_ns: f.tag, pixels: Pixels::I420 { y, u, v, y_stride: w as usize, uv_stride: w as usize / 2 } }
+    let (y_stride, uv_stride) = (w as usize, w as usize / 2);
+    let pixels = match f.planes16 {
+        Some([y, u, v]) => Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth: f.bit_depth },
+        None => {
+            let [y, u, v] = f.planes;
+            Pixels::I420 { y, u, v, y_stride, uv_stride }
+        }
+    };
+    Frame { width: w, height: h, pts_ns: f.tag, pixels }
 }
 
 impl H264Decoder {

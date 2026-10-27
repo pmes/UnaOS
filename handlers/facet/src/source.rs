@@ -22,7 +22,7 @@
 //!
 //! HEVCHEIC (SR220): an HEIC still ([`Format::Heic`]: `ftyp` heic / heix, or mif1 without AVIF) is the one container
 //! pixel_core does not own: it decodes through `gneiss_pal::dsp::image::decode_heif` (demux_core's HEIF reader +
-//! hevc_core, 8-bit intra; 10-bit refuses by name until HEVCMAIN10), and its refusals name `heic` the same way.
+//! hevc_core, 8- and 10-bit intra, COLOURONE SR328), and its refusals name `heic` the same way.
 //! HEIFONE (SR303): an AVIF still ([`Format::Avif`]: `ftyp` avif) decodes through the same `decode_heif` (demux_core's
 //! HEIF reader + av1_core), grids included; its refusals name `avif`.
 
@@ -337,17 +337,21 @@ mod tests {
         let e = PixelCoreSource.decode(&heic).unwrap_err();
         assert!(matches!(&e, SourceError::Decode { format: "heic", reason } if reason.contains("no meta")), "{e:?}");
         assert!(e.to_string().starts_with("heic: "), "{e}");
-        // 10-bit refuses by name until HEVCMAIN10.
-        use gneiss_pal::dsp::image::heic_kat;
-        let mut t = heic_kat::tile(false, vec![]);
-        let mut rec = heic_kat::flat_hvcc();
-        rec[17] = 0xFA;
-        t.props[0] = demux_core_build::hvcc(&rec);
-        let e = PixelCoreSource.decode(&demux_core_build::still(1, &[t])).unwrap_err();
-        assert_eq!(e.to_string(), "heic: unsupported: heic: 10-bit HEVC (HEVCMAIN10)");
     }
 
-    use gneiss_pal::dsp::demux::heif::build as demux_core_build;
+    /// COLOURONE (SR328): Facet opens a 10-bit (Main 10) HEIC, converted from its 16-bit samples (HEVCHEIC-MAIN10).
+    #[test]
+    fn colourone_facet_opens_a_ten_bit_heic() {
+        use gneiss_pal::dsp::image::{decode_heif, heic_kat};
+        let bytes = heic_kat::main10_heic();
+        assert_eq!(sniff(&bytes), Some(Format::Heic));
+        let d = PixelCoreSource.decode(&bytes).unwrap();
+        assert_eq!((d.width, d.height, d.frames.is_none()), (32, 32, true));
+        assert_eq!(d.rgba, decode_heif(&bytes).unwrap().rgba);
+        assert!(d.rgba.chunks_exact(4).all(|p| p == [87, 145, 176, 255]), "{:?}", &d.rgba[..4]);
+        let (_, info) = crate::Facet::new().open_bytes("main10.heic", &bytes).unwrap();
+        assert_eq!((info.width, info.height), (32, 32));
+    }
 
     #[test]
     fn heic_stills_decode_through_hevc_core() {

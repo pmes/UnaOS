@@ -21,11 +21,13 @@
 use super::demux::{Codec, Packet, Track};
 use super::demux::build::TestPatternPacket;
 
-/// Decoded pixels: packed 8-bit RGBA, or planar 8-bit 4:2:0 YCbCr (what an AV1 decoder emits).
+/// Decoded pixels: packed 8-bit RGBA, or planar 8-bit 4:2:0 YCbCr (what an AV1 decoder emits), or planar 4:2:0 YCbCr
+/// above 8 bits (COLOURONE SR328: `I420Hi`, a Main10 picture's samples as decoded, `bit_depth` 9..16).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pixels {
     Rgba(Vec<u8>),
     I420 { y: Vec<u8>, u: Vec<u8>, v: Vec<u8>, y_stride: usize, uv_stride: usize },
+    I420Hi { y: Vec<u16>, u: Vec<u16>, v: Vec<u16>, y_stride: usize, uv_stride: usize, bit_depth: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,34 +39,94 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// Packed RGBA, row-major, top row first. I420 converts with BT.601 limited-range
-    /// coefficients in fixed point (Y 16..235, CbCr 16..240; chroma sited at the 2×2 block).
+    /// Packed RGBA, row-major, top row first. YCbCr converts with BT.601 limited-range coefficients in fixed point
+    /// (Y 16..235, CbCr 16..240 scaled to the sample depth; chroma sited at the 2×2 block) through the ONE kernel
+    /// [`Frame::to_rgba_colour`] uses (COLOURONE SR328); at 8 bits its derived table is the historical 298 / 409 / 100 /
+    /// 208 / 516 at >> 8, so every caller is byte-identical.
     pub fn to_rgba(&self) -> Vec<u8> {
+        self.yuv_rgba(KR_KB_601, false)
+    }
+
+    /// COLOURONE (LEDGER SR328): packed RGBA converted by the source's colour (`Track::colour`, NLEPROBEHDR SR226) —
+    /// H.273 MatrixCoefficients 1 BT.709, 4 FCC, 5 / 6 BT.601, 7 SMPTE 240M, 9 BT.2020 non-constant-luminance; any other
+    /// matrix (2 unspecified, 0 identity, 8 YCgCo, 10 BT.2020 constant-luminance, reserved) and `None` take the size
+    /// default, BT.601 below HD and BT.709 when the frame is at least 1280 wide or 720 high (the industry default for
+    /// untagged video, as ffmpeg's swscale and the browsers do). `full_range == Some(true)` is full range, anything else
+    /// limited. Integer only: a sample above 8 bits (`Pixels::I420Hi`) is narrowed to 8 inside the one rounded multiply,
+    /// after the conversion (no dither). No tone mapping: a PQ / HLG picture keeps its transfer.
+    pub fn to_rgba_colour(&self, colour: Option<&super::demux::colour::Colour>) -> Vec<u8> {
+        let hd = self.width >= 1280 || self.height >= 720;
+        let kk = match colour.map(|c| c.matrix) {
+            Some(1) => KR_KB_709,
+            Some(4) => (3000, 1100),
+            Some(5 | 6) => KR_KB_601,
+            Some(7) => (2120, 870),
+            Some(9) => (2627, 593),
+            _ if hd => KR_KB_709,
+            _ => KR_KB_601,
+        };
+        self.yuv_rgba(kk, colour.is_some_and(|c| c.full_range == Some(true)))
+    }
+
+    fn yuv_rgba(&self, kk: (i64, i64), full: bool) -> Vec<u8> {
+        let (w, h) = (self.width as usize, self.height as usize);
         match &self.pixels {
             Pixels::Rgba(p) => p.clone(),
-            Pixels::I420 { y, u, v, y_stride, uv_stride } => {
-                let (w, h) = (self.width as usize, self.height as usize);
-                let mut out = vec![0u8; w * h * 4];
-                for row in 0..h {
-                    for col in 0..w {
-                        let yy = y[row * y_stride + col] as i32 - 16;
-                        let cb = u[(row / 2) * uv_stride + col / 2] as i32 - 128;
-                        let cr = v[(row / 2) * uv_stride + col / 2] as i32 - 128;
-                        let c = 298 * yy + 128;
-                        let r = (c + 409 * cr) >> 8;
-                        let g = (c - 100 * cb - 208 * cr) >> 8;
-                        let b = (c + 516 * cb) >> 8;
-                        let o = (row * w + col) * 4;
-                        out[o] = r.clamp(0, 255) as u8;
-                        out[o + 1] = g.clamp(0, 255) as u8;
-                        out[o + 2] = b.clamp(0, 255) as u8;
-                        out[o + 3] = 255;
-                    }
-                }
-                out
+            Pixels::I420 { y, u, v, y_stride, uv_stride } => yuv_to_rgba(w, h, [&y[..], &u[..], &v[..]], *y_stride, *uv_stride, yuv_coeffs(kk, full, 8)),
+            Pixels::I420Hi { y, u, v, y_stride, uv_stride, bit_depth } => {
+                yuv_to_rgba(w, h, [&y[..], &u[..], &v[..]], *y_stride, *uv_stride, yuv_coeffs(kk, full, *bit_depth as u32))
             }
         }
     }
+}
+
+/// COLOURONE (SR328): (Kr, Kb) x 10000 of BT.601 and BT.709 (H.273 Table 4).
+const KR_KB_601: (i64, i64) = (2990, 1140);
+const KR_KB_709: (i64, i64) = (2126, 722);
+
+/// COLOURONE (SR328): the integer YCbCr -> RGB coefficients of one matrix, range and sample depth `n`:
+/// `(shift, [yc, rv, gu, gv, bu], y_offset, c_offset)`. Shift 8 at 8 bits (the historical precision), 16 above; each
+/// coefficient rounded half up from the exact rational: yc = 255 / ys, rv = 2(1-Kr) / cs, bu = 2(1-Kb) / cs,
+/// gu = 2Kb(1-Kb) / (Kg cs), gv = 2Kr(1-Kr) / (Kg cs), with ys = 219 << (n-8), cs = 224 << (n-8) limited and
+/// ys = cs = 2^n - 1 full. The 255 maps every depth straight to 8-bit output.
+fn yuv_coeffs((kr, kb): (i64, i64), full: bool, n: u32) -> (u32, [i32; 5], i32, i32) {
+    let s = if n <= 8 { 8 } else { 16 };
+    let (ys, cs) = if full { (((1i64 << n) - 1), ((1i64 << n) - 1)) } else { (219i64 << (n - 8), 224i64 << (n - 8)) };
+    let rnd = |a: i64, b: i64| ((2 * a + b) / (2 * b)) as i32;
+    let kg = 10000 - kr - kb;
+    let c = [
+        rnd(255 << s, ys),
+        rnd(2 * (10000 - kr) * (255 << s), 10000 * cs),
+        rnd(2 * kb * (10000 - kb) * (255 << s), 10000 * kg * cs),
+        rnd(2 * kr * (10000 - kr) * (255 << s), 10000 * kg * cs),
+        rnd(2 * (10000 - kb) * (255 << s), 10000 * cs),
+    ];
+    let (yoff, coff) = if full { (0, 1i32 << (n - 1)) } else { (16i32 << (n - 8), 128i32 << (n - 8)) };
+    (s, c, yoff, coff)
+}
+
+/// COLOURONE (SR328): the ONE YCbCr 4:2:0 -> RGBA loop, 8-bit or deeper planes, coefficients from [`yuv_coeffs`].
+fn yuv_to_rgba<T: Copy + Into<i32>>(w: usize, h: usize, [y, u, v]: [&[T]; 3], y_stride: usize, uv_stride: usize, k: (u32, [i32; 5], i32, i32)) -> Vec<u8> {
+    let (s, [yc, rv, gu, gv, bu], yoff, coff) = k;
+    let half = 1i32 << (s - 1);
+    let mut out = vec![0u8; w * h * 4];
+    for row in 0..h {
+        for col in 0..w {
+            let yy = y[row * y_stride + col].into() - yoff;
+            let cb = u[(row / 2) * uv_stride + col / 2].into() - coff;
+            let cr = v[(row / 2) * uv_stride + col / 2].into() - coff;
+            let c = yc * yy + half;
+            let r = (c + rv * cr) >> s;
+            let g = (c - gu * cb - gv * cr) >> s;
+            let b = (c + bu * cb) >> s;
+            let o = (row * w + col) * 4;
+            out[o] = r.clamp(0, 255) as u8;
+            out[o + 1] = g.clamp(0, 255) as u8;
+            out[o + 2] = b.clamp(0, 255) as u8;
+            out[o + 3] = 255;
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -522,5 +584,73 @@ mod tests {
         assert_eq!(f(16, 128, 128), vec![0, 0, 0]);
         let red = f(81, 90, 240);
         assert!(red[0] >= 253 && red[1] <= 2 && red[2] <= 2, "{red:?}");
+    }
+
+    // COLOURONE (LEDGER SR328): the one parametrised conversion.
+    use crate::dsp::demux::colour::Colour;
+
+    fn colour(matrix: u8, full: Option<bool>) -> Colour {
+        Colour { primaries: 2, transfer: 2, matrix, full_range: full, mastering: None, light: None }
+    }
+    fn px8(w: u32, h: u32, y: u8, u: u8, v: u8, c: Option<&Colour>) -> Vec<u8> {
+        let (cw, ch) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+        let pixels = Pixels::I420 { y: vec![y; (w * h) as usize], u: vec![u; cw * ch], v: vec![v; cw * ch], y_stride: w as usize, uv_stride: cw };
+        Frame { width: w, height: h, pts_ns: 0, pixels }.to_rgba_colour(c)[..3].to_vec()
+    }
+
+    #[test]
+    fn colourone_the_601_limited_table_is_the_historical_one() {
+        assert_eq!(yuv_coeffs(KR_KB_601, false, 8), (8, [298, 409, 100, 208, 516], 16, 128));
+        // Every caller of to_rgba is byte-identical: None and an explicit BT.601 limited match it on an SD frame.
+        let bt601 = colour(6, Some(false));
+        for y in (0..=255u8).step_by(5) {
+            for u in (0..=255u8).step_by(17) {
+                for v in (0..=255u8).step_by(17) {
+                    let f = Frame { width: 4, height: 2, pts_ns: 0, pixels: Pixels::I420 { y: vec![y; 8], u: vec![u; 2], v: vec![v; 2], y_stride: 4, uv_stride: 2 } };
+                    let old = f.to_rgba();
+                    assert_eq!(f.to_rgba_colour(None), old);
+                    assert_eq!(f.to_rgba_colour(Some(&bt601)), old);
+                    assert_eq!(f.to_rgba_colour(Some(&colour(2, None))), old);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn colourone_hand_computed_samples() {
+        // BT.709 limited 8-bit, Y 120 Cb 140 Cr 100: table (298, 459, 55, 136, 541); yy 104, cb 12, cr -28,
+        // c = 298 * 104 + 128 = 31120: R (31120 - 12852) >> 8 = 71, G (31120 - 660 + 3808) >> 8 = 133, B (31120 + 6492) >> 8 = 146.
+        assert_eq!(yuv_coeffs(KR_KB_709, false, 8), (8, [298, 459, 55, 136, 541], 16, 128));
+        assert_eq!(px8(2, 2, 120, 140, 100, Some(&colour(1, Some(false)))), [71, 133, 146]);
+        assert_eq!(px8(2, 2, 120, 140, 100, None), [76, 139, 145], "BT.601 differs");
+        // BT.601 full range 8-bit, Y 100 Cb 150 Cr 60: table (256, 359, 88, 183, 454), offsets 0 / 128; c = 25600 + 128:
+        // R (25728 - 24412) >> 8 = 5, G (25728 - 1936 + 12444) >> 8 = 141, B (25728 + 9988) >> 8 = 139.
+        assert_eq!(yuv_coeffs(KR_KB_601, true, 8), (8, [256, 359, 88, 183, 454], 0, 128));
+        assert_eq!(px8(2, 2, 100, 150, 60, Some(&colour(5, Some(true)))), [5, 141, 139]);
+        // BT.2020 NCL limited 10-bit (I420Hi), Y 400 Cb 600 Cr 300: table (19077, 27503, 3069, 10657, 35091) at >> 16,
+        // offsets 64 / 512; yy 336, cb 88, cr -212, c = 19077 * 336 + 32768 = 6442640:
+        // R (6442640 - 5830636) >> 16 = 9, G (6442640 - 270072 + 2259284) >> 16 = 128, B (6442640 + 3088008) >> 16 = 145.
+        assert_eq!(yuv_coeffs((2627, 593), false, 10), (16, [19077, 27503, 3069, 10657, 35091], 64, 512));
+        let hi = Frame { width: 2, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![400; 4], u: vec![600], v: vec![300], y_stride: 2, uv_stride: 1, bit_depth: 10 } };
+        assert_eq!(hi.to_rgba_colour(Some(&colour(9, Some(false))))[..4], [9, 128, 145, 255]);
+        // A Main10 sample narrowed after the conversion, not before: 601 limited Y 515 Cb 600 Cr 400 is (87, 145, 176);
+        // the >> 2 planes (128, 150, 100) through the 8-bit table give (86, 145, 175).
+        let m10 = Frame { width: 2, height: 2, pts_ns: 0, pixels: Pixels::I420Hi { y: vec![515; 4], u: vec![600], v: vec![400], y_stride: 2, uv_stride: 1, bit_depth: 10 } };
+        assert_eq!(m10.to_rgba()[..3], [87, 145, 176]);
+        assert_eq!(px8(2, 2, 128, 150, 100, None), [86, 145, 175]);
+    }
+
+    #[test]
+    fn colourone_untagged_hd_is_bt709() {
+        // Matrix 2 (unspecified) and None: BT.601 below HD, BT.709 at 1280 wide or 720 high; to_rgba stays BT.601.
+        let (sd, hd) = (px8(2, 2, 120, 140, 100, Some(&colour(2, None))), px8(1280, 2, 120, 140, 100, Some(&colour(2, None))));
+        assert_eq!((sd, hd), (vec![76, 139, 145], vec![71, 133, 146]));
+        assert_eq!(px8(2, 720, 120, 140, 100, None), [71, 133, 146]);
+        assert_eq!(px8(1280, 2, 120, 140, 100, Some(&colour(6, Some(false)))), [76, 139, 145], "a stated matrix wins at HD");
+        let f = Frame { width: 1280, height: 2, pts_ns: 0, pixels: Pixels::I420 { y: vec![120; 2560], u: vec![140; 640], v: vec![100; 640], y_stride: 1280, uv_stride: 640 } };
+        assert_eq!(f.to_rgba()[..3], [76, 139, 145]);
+        // RGBA frames pass through untouched.
+        let rgba = Frame { width: 1, height: 1, pts_ns: 0, pixels: Pixels::Rgba(vec![1, 2, 3, 4]) };
+        assert_eq!(rgba.to_rgba_colour(Some(&colour(9, Some(true)))), [1, 2, 3, 4]);
     }
 }

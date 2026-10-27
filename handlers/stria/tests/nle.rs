@@ -758,3 +758,35 @@ fn nleprobehdrwire_a_no_colr_h264_reel_falls_back_to_the_vui() {
     assert_eq!(reorder_depth(&track), Some(2));
     println!("nleprobehdrwire: vui {r}");
 }
+
+// COLOURONE (LEDGER SR328): the editor's render converts a reel's frames by the reel's colour. NLEPROBEHDR's synth reel is
+// a test-pattern (RGBA) stream no matrix can show in, so the same BT.2020 PQ `colr` goes on an hvc1 reel of the HEIC
+// fixture's PCM picture (64x48, a non-neutral chroma gradient).
+
+fn colourone_render(file: Vec<u8>) -> Vec<u8> {
+    let mut tl = Timeline::new(25);
+    let a = tl.add_source("P", 2);
+    tl.add_track(Kind::Video);
+    tl.tracks[0].clips = vec![Clip::new(a, 0, 2, 0)];
+    let mut src = Sources::new(&tl);
+    src.add(SourceId(0), file).unwrap();
+    let mut sink = Collect::default();
+    render(&tl, 0..2, &src, &mut sink).unwrap();
+    assert_eq!(sink.frames.len(), 2);
+    sink.frames.swap_remove(0).1
+}
+
+#[test]
+fn colourone_editor_renders_a_bt2020_reel_with_the_2020_matrix() {
+    use gneiss_pal::dsp::image::heic_kat::{access_unit, hvc1_track, pcm_hvcc, pcm_slice};
+    let track = || hvc1_track(pcm_hvcc(), &access_unit(&pcm_slice()), 64, 48, 2);
+    let x = build::Mp4Extras { colour: vec![(1, bt2020_pq())], ..Default::default() };
+    let tagged = colourone_render(build::mp4_with(&[track()], &build::Mp4Options::default(), &x));
+    let plain = colourone_render(build::mp4(&[track()], &build::Mp4Options::default()));
+    let at = |rgba: &[u8], x: usize, y: usize| rgba[(y * 64 + x) * 4..][..4].to_vec();
+    // (10, 10): Y 100 Cb 60 Cr 185 — BT.2020 limited (298, 430, 48, 167, 548) at >> 8 gives (194, 73, 0); BT.601 (189, 78, 0).
+    // (20, 6): Y 158 Cb 73 Cr 184 — BT.2020 (255, 139, 48); BT.601 (255, 141, 54).
+    assert_eq!((at(&tagged, 10, 10), at(&plain, 10, 10)), (vec![194, 73, 0, 255], vec![189, 78, 0, 255]));
+    assert_eq!((at(&tagged, 20, 6), at(&plain, 20, 6)), (vec![255, 139, 48, 255], vec![255, 141, 54, 255]));
+    println!("colourone: editor bt2020 px=194,73,0 bt601=189,78,0");
+}

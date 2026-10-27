@@ -25,14 +25,13 @@ pub use demux_core::heif::is_avif;
 
 /// HEVCHEIC (SR220) / HEIFONE (SR303): decode an HEIF still — HEIC or AVIF. demux_core's HEIF reader finds the primary
 /// item; each coded image decodes through its codec's core: `hvc1` through hevc_core (one IDR access unit; 8-bit 4:2:0
-/// intra; the `hevc` feature) and the ONE YCbCr->RGB conversion of the HEVC face, [`super::video::Frame::to_rgba`]
-/// (BT.601 limited range; a full-range picture — `colr` nclx's flag, else the stream's VUI — is first mapped into
-/// limited range); `av01` through av1_core (`decode_item_planes`, the `av1` feature) and the AV1 face's conversion,
+/// intra, 8- and 10-bit; the `hevc` feature) and the ONE YCbCr->RGB conversion, [`super::video::Frame::to_rgba_colour`]
+/// (COLOURONE SR328: the `colr` nclx's matrix and range, else BT.601 with the stream's VUI range; an unspecified matrix
+/// is BT.601, the stills convention; a 10-bit picture converts from its 16-bit samples); `av01` through av1_core (`decode_item_planes`, the `av1` feature) and the AV1 face's conversion,
 /// `av1_core::image::planes_to_rgba` with bilinear chroma (the one `dsp::video::av1` uses: any matrix,
 /// range, depth and subsampling; so an AVIF still's pixels are av1_core's own). A `grid` item's tiles are composited
 /// row-major into its canvas and cut to the grid's output size, then the primary item's `clap` and `irot` apply in
-/// association order (`irot` through [`Image::apply_orientation`]). Refused by name: 10-bit HEVC (HEVCMAIN10 — most
-/// iPhone HEICs are 10-bit), an HEVC colour matrix other than BT.601 (HEVCHEIC-COLR), `imir`, a primary item that is not
+/// association order (`irot` through [`Image::apply_orientation`]). Refused by name: `imir`, a primary item that is not
 /// `hvc1` / `av01` / `grid`, a codec whose feature this build lacks, and whatever the codec core refuses. The returned
 /// image has `orientation` 1.
 #[cfg(any(feature = "hevc", feature = "av1"))]
@@ -163,8 +162,8 @@ fn avif_err(e: av1_core::Error) -> Error {
     }
 }
 
-/// One `hvc1` item to straight RGBA: the hvcC bit depth checked first, hevc_core decodes the one access unit, the range
-/// mapped, then the one `to_rgba`. `fallback` is the grid's `colr` for a tile that carries none.
+/// One `hvc1` item to straight RGBA: hevc_core decodes the one access unit (above 10 bits it refuses by name), then the
+/// one `to_rgba_colour` with the item's `colr` (COLOURONE SR328). `fallback` is the grid's `colr` for a tile that carries none.
 #[cfg(feature = "hevc")]
 fn heic_tile(
     h: &demux_core::heif::Heif,
@@ -172,19 +171,11 @@ fn heic_tile(
     item: &demux_core::heif::Item,
     fallback: Option<demux_core::heif::Nclx>,
 ) -> Result<(u32, u32, Vec<u8>), Error> {
-    use super::video::{Frame as VideoFrame, Pixels};
     let rec = item.hvcc.as_deref().ok_or(Error::Malformed("heic: hvc1 item has no hvcC"))?;
-    let cfg = hevc_core::nal::parse_hvcc(rec).map_err(heic_hevc_err)?;
-    if cfg.bit_depth_luma > 8 || cfg.bit_depth_chroma > 8 {
-        return Err(Error::Unsupported("heic: 10-bit HEVC (HEVCMAIN10)"));
-    }
     if let Some((w, ht)) = item.ispe {
         heic_dims(w, ht)?;
     }
     let nclx = item.nclx.or(fallback);
-    if nclx.is_some_and(|n| !matches!(n.matrix_coefficients, 2 | 5 | 6)) {
-        return Err(Error::Unsupported("heic: colr matrix is not BT.601 (to_rgba is BT.601 only; HEVCHEIC-COLR)"));
-    }
     let mut d = hevc_core::Decoder::new();
     d.configure_hvcc(rec).map_err(heic_hevc_err)?;
     d.decode_sample(&h.data(bytes, item).map_err(heic_demux_err)?).map_err(heic_hevc_err)?;
@@ -195,24 +186,22 @@ fn heic_tile(
     }
     let f = frames.remove(0);
     heic_dims(f.width, f.height)?;
-    let [mut y, mut u, mut v] = f.planes;
-    if nclx.map_or(f.full_range, |n| n.full_range) {
-        // Full range (Y and C 0..255) into limited (Y 16..235, C 16..240), rounded half away from zero.
-        let scale = |s: &mut u8, num: i32, zero: i32, base: i32| {
-            let p = (*s as i32 - zero) * num;
-            *s = (base + (p + if p >= 0 { 127 } else { -127 }) / 255) as u8;
-        };
-        y.iter_mut().for_each(|s| scale(s, 219, 0, 16));
-        u.iter_mut().chain(v.iter_mut()).for_each(|s| scale(s, 224, 128, 128));
-    }
-    let (w, ht) = (f.width, f.height);
-    let frame = VideoFrame {
-        width: w,
-        height: ht,
-        pts_ns: 0,
-        pixels: Pixels::I420 { y, u, v, y_stride: w as usize, uv_stride: w as usize / 2 },
+    // COLOURONE (SR328): the colr's code points (H.273 values fit a byte; anything else reads as unspecified), else the
+    // VUI range; an unspecified matrix is BT.601 for a still (the HEIF / JPEG convention, libheif's), not video's size default.
+    let code = |v: u16| u8::try_from(v).unwrap_or(2);
+    let colour = demux_core::colour::Colour {
+        primaries: nclx.map_or(2, |n| code(n.colour_primaries)),
+        transfer: nclx.map_or(2, |n| code(n.transfer_characteristics)),
+        matrix: match nclx.map_or(2, |n| code(n.matrix_coefficients)) {
+            2 => 6,
+            m => m,
+        },
+        full_range: Some(nclx.map_or(f.full_range, |n| n.full_range)),
+        mastering: None,
+        light: None,
     };
-    Ok((w, ht, frame.to_rgba()))
+    let frame = super::video::h264::to_frame(f);
+    Ok((frame.width, frame.height, frame.to_rgba_colour(Some(&colour))))
 }
 
 #[cfg(any(feature = "hevc", feature = "av1"))]
@@ -250,6 +239,11 @@ fn heic_hevc_err(e: hevc_core::Error) -> Error {
 /// KATs, embedded here) and HEIC files built around them with demux_core's HEIF writer. (a) FLAT: a 64x48 picture of
 /// INTRA_DC coding units with no residual, 128 in every plane. (b) PCM: the same size, a 32x32 I_PCM block at (0,0)
 /// holding Y = 7x + 3y, Cb = 40 + 3x + y, Cr = 200 - x - 2y (chroma 16x16), the rest predicted from it; deblocking off.
+/// (c) MAIN10 (COLOURONE SR328): a 32x32 Main 10 picture, one 32x32 I_PCM coding unit at PcmBitDepth 10 / 10 holding the
+/// flat 10-bit samples Y 515, Cb 600, Cr 400 (the bytes hevc_core's kit writes for `SpsCfg { width: 32, height: 32,
+/// log2_ctb: 5, bit_depth: 10, pcm: Some((10, 10, 3, 5, true)) }`, `PpsCfg { init_qp: 26, deblocking_disabled: true }` and
+/// `pcm_cu_bits(0, 5, 10, 10, ..)`; its VPS and PPS are [`VPS`] and [`PPS_PCM`] byte for byte). BT.601 limited at 10
+/// bits is (87, 145, 176); the old 8-bit path (planes >> 2) gave (86, 145, 175).
 #[cfg(feature = "hevc")]
 #[doc(hidden)]
 pub mod heic_kat {
@@ -281,6 +275,15 @@ pub mod heic_kat {
     pub const SLICE_PCM_TAIL: [u8; 6] = [
         0x29, 0x37, 0x0D, 0x3A, 0xE4, 0x98, 
     ];
+
+    pub const SPS_MAIN10: [u8; 28] = [
+        0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3C, 0xA0, 0x42,
+        0x08, 0x4D, 0x97, 0xEE, 0x4C, 0x66, 0x6F, 0x04,
+    ];
+    /// The MAIN10 slice: its head, the PCM samples packed 10 bits each (1024 Y, 256 Cb, 256 Cr), its tail.
+    pub const SLICE_MAIN10_HEAD: [u8; 5] = [0x26, 0x01, 0xAF, 0x86, 0x80];
+    pub const SLICE_MAIN10_TAIL: [u8; 2] = [0xFE, 0x80];
+    pub const MAIN10_YCC: [u16; 3] = [515, 600, 400];
 
     pub fn pcm_y(x: usize, y: usize) -> u8 {
         (x * 7 + y * 3) as u8
@@ -326,6 +329,48 @@ pub mod heic_kat {
     }
     pub fn pcm_heic() -> Vec<u8> {
         build::still(1, &[tile(true, vec![])])
+    }
+    /// The MAIN10 picture's hvcC, its depth bytes saying 10 bits (bitDepthLumaMinus8 = bitDepthChromaMinus8 = 2).
+    pub fn main10_hvcc() -> Vec<u8> {
+        let mut rec = build::hvcc_record(&[&VPS, &SPS_MAIN10, &PPS_PCM]);
+        rec[17] = 0xFA;
+        rec[18] = 0xFA;
+        rec
+    }
+    /// The MAIN10 slice NAL (no emulation prevention is needed: no two zero bytes meet in it).
+    pub fn main10_slice() -> Vec<u8> {
+        let mut v = SLICE_MAIN10_HEAD.to_vec();
+        let (mut acc, mut bits) = (0u32, 0u32);
+        for (n, s) in [(32 * 32, MAIN10_YCC[0]), (16 * 16, MAIN10_YCC[1]), (16 * 16, MAIN10_YCC[2])] {
+            for _ in 0..n {
+                acc = (acc << 10) | s as u32;
+                bits += 10;
+                while bits >= 8 {
+                    bits -= 8;
+                    v.push((acc >> bits) as u8);
+                }
+            }
+        }
+        v.extend_from_slice(&SLICE_MAIN10_TAIL);
+        v
+    }
+    pub fn main10_heic() -> Vec<u8> {
+        let props = vec![build::hvcc(&main10_hvcc()), build::ispe(32, 32)];
+        build::still(1, &[ItemSpec { kind: *b"hvc1", data: access_unit(&main10_slice()), props, ..Default::default() }])
+    }
+    /// COLOURONE (SR328): an `hvc1` video track of `n` IDR samples (each `au`, 40 ms apart) configured by `hvcc`, for the
+    /// Player's and the editor's KATs over these pictures (the shape of Stria's `hevc_kat_track`).
+    pub fn hvc1_track(hvcc: Vec<u8>, au: &[u8], w: u16, h: u16, n: usize) -> demux_core::build::MediaTrack {
+        let mut spec = demux_core::build::TrackSpec::test_pattern(1, w, h, 25);
+        spec.fourcc = *b"hvc1";
+        spec.config_box = Some(*b"hvcC");
+        spec.codec_id = "V_MPEGH/ISO/HEVC";
+        spec.config = hvcc;
+        spec.timescale = 1000;
+        let samples = (0..n)
+            .map(|i| demux_core::build::SampleSpec { data: au.to_vec(), dts: i as i64 * 40, pts: i as i64 * 40, duration: 40, keyframe: true })
+            .collect();
+        demux_core::build::MediaTrack { spec, samples }
     }
     /// A 2x2 grid (output 120x90 of the 128x96 canvas, ImageGrid in `idat`) of tiles flat, PCM / PCM, flat.
     pub fn grid_2x2_heic() -> Vec<u8> {
@@ -425,23 +470,47 @@ mod heic_tests {
 
     #[test]
     fn colr_range_and_matrix() {
-        // Full range: Y 128 -> 16 + round(219 * 128 / 255) = 126 -> (298 * 110 + 128) >> 8 = 128.
+        // Full range converts directly (COLOURONE SR328, no remap into limited): Y 128 -> (256 * 128 + 128) >> 8 = 128.
         let full = decode_heif(&build::still(1, &[tile(false, vec![build::nclx(1, 13, 6, true)])])).unwrap();
         assert!(full.rgba.chunks_exact(4).all(|p| p == [128, 128, 128, 255]));
         let limited = decode_heif(&build::still(1, &[tile(false, vec![build::nclx(1, 13, 5, false)])])).unwrap();
         assert!(limited.rgba.chunks_exact(4).all(|p| p == [130, 130, 130, 255]));
-        let e = decode_heif(&build::still(1, &[tile(false, vec![build::nclx(1, 1, 1, false)])])).unwrap_err();
-        assert!(matches!(e, Error::Unsupported(s) if s.contains("BT.601")), "{e:?}");
+        // BT.709 decodes now (HEVCHEIC-COLR): the PCM block's samples through to_rgba_colour's BT.709 limited table.
+        let c709 = demux_core::colour::Colour { primaries: 1, transfer: 1, matrix: 1, full_range: Some(false), mastering: None, light: None };
+        let pcm = decode_heif(&pcm_heic()).unwrap();
+        let bt709 = decode_heif(&build::still(1, &[tile(true, vec![build::nclx(1, 1, 1, false)])])).unwrap();
+        for (x, y) in [(0, 0), (10, 10), (20, 6), (31, 31)] {
+            assert_eq!(px(&bt709, x, y), rgb_colour(pcm_y(x, y), pcm_cb(x / 2, y / 2), pcm_cr(x / 2, y / 2), &c709), "({x},{y})");
+        }
+        // (10, 10): Y 100 Cb 60 Cr 185 is (200, 82, 0) in BT.709 and (189, 78, 0) in BT.601.
+        assert_eq!((px(&bt709, 10, 10), px(&pcm, 10, 10)), ([200, 82, 0, 255], [189, 78, 0, 255]));
+        // An unspecified matrix in a still is BT.601 (not video's size default).
+        let unspec = decode_heif(&build::still(1, &[tile(true, vec![build::nclx(2, 2, 2, false)])])).unwrap();
+        assert_eq!(unspec.rgba, pcm.rgba);
+    }
+
+    /// to_rgba_colour of one (Y, Cb, Cr) sample.
+    fn rgb_colour(y: u8, cb: u8, cr: u8, c: &demux_core::colour::Colour) -> [u8; 4] {
+        let f = super::super::video::Frame {
+            width: 2,
+            height: 2,
+            pts_ns: 0,
+            pixels: super::super::video::Pixels::I420 { y: vec![y; 4], u: vec![cb], v: vec![cr], y_stride: 2, uv_stride: 1 },
+        };
+        f.to_rgba_colour(Some(c))[..4].try_into().unwrap()
+    }
+
+    #[test]
+    fn colourone_main10_heic_converts_its_ten_bit_samples() {
+        // HEVCHEIC-MAIN10: no up-front refusal; BT.601 limited from Y 515 Cb 600 Cr 400 at 10 bits, not from the >> 2 planes.
+        let img = decode_heif(&main10_heic()).unwrap();
+        assert_eq!((img.width, img.height), (32, 32));
+        assert!(img.rgba.chunks_exact(4).all(|p| p == [87, 145, 176, 255]), "{:?}", &img.rgba[..4]);
+        assert_ne!(rgb(128, 150, 100), [87, 145, 176, 255]);
     }
 
     #[test]
     fn refusals_are_named() {
-        // 10-bit: the hvcC says bitDepthLumaMinus8 = 2.
-        let mut t = tile(false, vec![]);
-        let mut rec = flat_hvcc();
-        rec[17] = 0xFA;
-        t.props[0] = build::hvcc(&rec);
-        assert_eq!(decode_heif(&build::still(1, &[t])), Err(Error::Unsupported("heic: 10-bit HEVC (HEVCMAIN10)")));
         // A primary item no core decodes (HEIFONE SR303: av01 decodes now, through av1_core).
         let jpeg = ItemSpec { kind: *b"jpeg", data: vec![0], ..Default::default() };
         assert_eq!(decode_heif(&build::still(1, &[jpeg])), Err(Error::Unsupported("heif: the primary item is jpeg")));
