@@ -2,7 +2,7 @@
 // Copyright (C) 2026 The Architect & Una
 //
 //! Colour spaces (ISO 32000-1 §8.6) to sRGB: DeviceGray / DeviceRGB / DeviceCMYK, CalGray / CalRGB read as their device
-//! spaces, ICCBased by /N (1, 3, 4: no profile is applied — ICC profiles are owed), Lab drawn as its L* grey (owed),
+//! spaces, ICCBased through its profile (PDFICC SR358: icc_core, else by /N 1, 3, 4 when refused), Lab drawn as its L* grey (owed),
 //! Indexed, Separation and DeviceN through their tint transform ([`Function`]), and Pattern. CMYK is the naive
 //! conversion R = (1-C)(1-K), G = (1-M)(1-K), B = (1-Y)(1-K).
 
@@ -29,7 +29,7 @@ pub enum ColourSpace {
     /// Separation (n = 1) or DeviceN: n tints through `tint` into `alt`.
     Sep { n: usize, alt: Rc<ColourSpace>, tint: Option<Function> },
     /// Pattern, with the underlying space of an uncoloured pattern.
-    Pattern(Option<Rc<ColourSpace>>),
+    Pattern(Option<Rc<ColourSpace>>), Icc { n: usize, xf: Rc<icc_core::Transform> }, // PDFICC (SR358): ICCBased (or a JPX colr profile) through icc_core, n components
 }
 
 /// A colour: its space, its components, and the pattern resource name when the space is Pattern.
@@ -67,7 +67,7 @@ impl ColourSpace {
             ColourSpace::Gray | ColourSpace::Indexed { .. } => 1,
             ColourSpace::Rgb | ColourSpace::Lab => 3,
             ColourSpace::Cmyk => 4,
-            ColourSpace::Sep { n, .. } => *n,
+            ColourSpace::Sep { n, .. } | ColourSpace::Icc { n, .. } => *n,
             ColourSpace::Pattern(_) => 0,
         }
     }
@@ -77,8 +77,8 @@ impl ColourSpace {
         match self {
             ColourSpace::Gray | ColourSpace::Indexed { .. } => vec![0.0],
             ColourSpace::Rgb | ColourSpace::Lab => vec![0.0; 3],
-            ColourSpace::Cmyk => vec![0.0, 0.0, 0.0, 1.0],
-            ColourSpace::Sep { n, .. } => vec![1.0; *n],
+            ColourSpace::Cmyk | ColourSpace::Icc { n: 4, .. } => vec![0.0, 0.0, 0.0, 1.0],
+            ColourSpace::Sep { n, .. } => vec![1.0; *n], ColourSpace::Icc { n, .. } => vec![0.0; *n],
             ColourSpace::Pattern(_) => Vec::new(),
         }
     }
@@ -131,7 +131,7 @@ impl ColourSpace {
                     [v, v, v]
                 }
             },
-            ColourSpace::Pattern(_) => [0.0, 0.0, 0.0],
+            ColourSpace::Icc { n, xf } => icc_rgb(xf, c, *n), ColourSpace::Pattern(_) => [0.0, 0.0, 0.0],
         }
     }
 
@@ -168,7 +168,7 @@ fn parse_depth(o: &Object, res: &Dict, doc: &Document, depth: usize) -> Option<C
                 b"Lab" => Some(ColourSpace::Lab),
                 b"ICCBased" => {
                     let s = arg(1)?;
-                    let d = s.as_stream().map(|s| &s.dict).or(s.as_dict())?;
+                    let d = s.as_stream().map(|s| &s.dict).or(s.as_dict())?; if let Some(cs) = icc_of(&s, d, doc) { return Some(cs); }
                     match doc.get(d.get(b"N")?).as_int()? {
                         1 => Some(ColourSpace::Gray),
                         3 => Some(ColourSpace::Rgb),
@@ -201,4 +201,28 @@ fn parse_depth(o: &Object, res: &Dict, doc: &Document, depth: usize) -> Option<C
         }
         _ => None,
     }
+}
+
+/// PDFICC (SR358): the colour space of an ICC profile with `n` components (the profile's own count when `n` is None),
+/// or None when icc_core refuses the profile or the counts disagree (the caller keeps its fallback).
+pub(crate) fn icc_space(profile: &[u8], n: Option<usize>) -> Option<ColourSpace> {
+    let xf = icc_core::Transform::from_icc(profile).ok()?;
+    let k = xf.channels();
+    if n.is_some_and(|n| n != k) {
+        return None;
+    }
+    Some(ColourSpace::Icc { n: k, xf: Rc::new(xf) })
+}
+
+/// PDFICC (SR358): an `[/ICCBased stream]` through its profile (§8.6.5.5), when icc_core takes it with /N components.
+fn icc_of(s: &Object, d: &Dict, doc: &Document) -> Option<ColourSpace> {
+    let n = doc.get(d.get(b"N")?).as_int()?;
+    let data = doc.decode(s.as_stream()?).ok()?.data;
+    icc_space(&data, Some(usize::try_from(n).ok()?))
+}
+
+/// PDFICC (SR358): one ICCBased colour to sRGB through its transform.
+fn icc_rgb(xf: &icc_core::Transform, c: &[f64], n: usize) -> [f32; 3] {
+    let ins: Vec<f32> = (0..n).map(|i| unit(c.get(i).copied().unwrap_or(0.0)) as f32).collect();
+    xf.eval(&ins)
 }

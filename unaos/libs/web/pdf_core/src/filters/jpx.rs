@@ -7,7 +7,7 @@
 //! T.800 Annex C is the coder of T.88 Annex E), never a second copy; `render::image` maps the samples this module
 //! returns to colour through its one raw-sample path (§7.4.9: /ColorSpace wins, else the [`Space`] read here).
 //!
-//! Built: the JP2 boxes (signature, jp2h's colr: enumerated sRGB / greyscale / sYCC / CMYK; an ICC profile reads as
+//! Built: the JP2 boxes (signature, jp2h's colr: enumerated sRGB / greyscale / sYCC / CMYK; an ICC profile (METH 2 / 3) is [`Image::icc`] and else reads as
 //! [`Space::Unknown`], i.e. by channel count) and raw codestreams; SIZ, COD, COC, QCD, QCC in the main and the
 //! tile-part headers; tiles over any number of tile-parts; precincts; the LRCP, RLCP and RPCL progressions; packet
 //! headers (tag trees, inclusion, zero bit-planes, pass counts, Lblock, SOP / EPH); EBCOT (Annex D) with selective
@@ -41,7 +41,7 @@ pub struct Image {
     pub h: usize,
     pub comps: usize,
     pub space: Space,
-    pub data: Vec<u8>,
+    pub data: Vec<u8>, pub icc: Option<Vec<u8>>, // PDFICC (SR358): `icc` is the colr box's ICC profile (METH 2 / 3), which render::image converts through icc_core
 }
 
 /// Components per image.
@@ -85,9 +85,9 @@ fn pow2(e: i32) -> f32 {
 
 /// Decode a JPXDecode stream: a JP2 file (boxes) or a raw codestream.
 pub fn decode(data: &[u8]) -> Result<Image, Error> {
-    let (cs, space, ycc) = if data.starts_with(&JP2_SIGNATURE) { boxes(data)? } else { (data, Space::Unknown, false) };
+    let (cs, space, ycc, icc) = if data.starts_with(&JP2_SIGNATURE) { boxes(data)? } else { (data, Space::Unknown, false, None) };
     let mut img = codestream(cs)?;
-    img.space = space;
+    img.space = space; img.icc = icc.map(<[u8]>::to_vec);
     if ycc && img.comps >= 3 {
         sycc_to_rgb(&mut img);
     }
@@ -97,9 +97,9 @@ pub fn decode(data: &[u8]) -> Result<Image, Error> {
 // ---------------------------------------------------------------------------------------------------------------
 // The JP2 file format (Annex I)
 
-/// The top-level box walk: (the codestream, the colr space, whether it is sYCC).
-fn boxes(data: &[u8]) -> Result<(&[u8], Space, bool), Error> {
-    let (mut space, mut ycc) = (Space::Unknown, false);
+/// The top-level box walk: (the codestream, the colr space, whether it is sYCC, the colr ICC profile).
+fn boxes(data: &[u8]) -> Result<(&[u8], Space, bool, Option<&[u8]>), Error> {
+    let (mut space, mut ycc, mut icc) = (Space::Unknown, false, None);
     let mut at = 0;
     while at + 8 <= data.len() {
         let (body, next) = one_box(data, at)?;
@@ -109,7 +109,7 @@ fn boxes(data: &[u8]) -> Result<(&[u8], Space, bool), Error> {
                 while i + 8 <= body.len() {
                     let (b, n) = one_box(body, i)?;
                     match &body[i + 4..i + 8] {
-                        // METH 1: an enumerated colour space; 2 / 3 (ICC) stay Unknown (PDF-ICC owed).
+                        b"colr" if matches!(b.first(), Some(2 | 3)) => icc = b.get(3..), // METH 2 / 3: the ICC profile (PDFICC SR358); METH 1, an enumerated space, below
                         b"colr" if b.first() == Some(&1) => match be32(b, 3)? {
                             16 => space = Space::Rgb,
                             17 => space = Space::Gray,
@@ -123,7 +123,7 @@ fn boxes(data: &[u8]) -> Result<(&[u8], Space, bool), Error> {
                     i = n;
                 }
             }
-            b"jp2c" => return Ok((body, space, ycc)),
+            b"jp2c" => return Ok((body, space, ycc, icc)),
             _ => {}
         }
         at = next;
@@ -514,7 +514,7 @@ fn codestream(cs: &[u8]) -> Result<Image, Error> {
             }
         }
     }
-    Ok(Image { w, h, comps: nc, space: Space::Unknown, data })
+    Ok(Image { w, h, comps: nc, space: Space::Unknown, data, icc: None })
 }
 
 /// sYCC (colr enumeration 18) to sRGB on the 8-bit samples: the ICT equations about a 128 chroma midpoint.

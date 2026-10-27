@@ -21,6 +21,8 @@ svg_core = { path = "../../media/svg_core" }
 font_core = { path = "../../text/font_core" }
 # PDFSIG (LEDGER SR337): signature checks link tls_core's DER / X.509 / chain builder / verify_signed (product provider) — never a second X.509 reader.
 tls_core = { path = "../../sys/tls_core", features = ["cryptocore"] }
+# PDFICC (LEDGER SR358): /ICCBased colour spaces and JPX colr profiles convert through icc_core (Facet's ONE ICC engine) — never a second CMM.
+icc_core = { path = "../../media/icc_core" }
 
 [features]
 default = ["std"]

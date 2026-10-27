@@ -228,7 +228,7 @@ impl ImageSource for PixelCoreSource {
     fn decode(&self, bytes: &[u8]) -> Result<Decoded, SourceError> {
         let format = self.sniff(bytes).ok_or_else(|| unrecognised(bytes))?.name();
         let decoded = if format == "heic" || format == "avif" { gneiss_pal::dsp::image::decode_heif(bytes) } else { pixel_core::decode(bytes) };
-        decoded.map(Decoded::from).map_err(|e| match e {
+        decoded.map(icc_to_srgb).map(Decoded::from).map_err(|e| match e {
             pixel_core::Error::UnknownFormat => unrecognised(bytes),
             pixel_core::Error::TooLarge => SourceError::TooLarge { format },
             e => SourceError::Decode { format, reason: e.to_string() },
@@ -400,4 +400,68 @@ mod tests {
         assert!(matches!(&e, SourceError::Decode { format: "avif", reason } if reason.contains("no meta")), "{e:?}");
         assert!(e.to_string().starts_with("avif: "), "{e}");
     }
+
+    /// A JPEG of a flat (200, 100, 50) 16 x 16 picture (the `image` crate's encoder at quality 100), and the same file
+    /// with `profile` spliced in as one APP2 ICC_PROFILE segment right after SOI.
+    fn pdficc_jpegs(profile: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let img = image::RgbImage::from_pixel(16, 16, image::Rgb([200, 100, 50]));
+        let mut plain = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut plain, 100).encode_image(&img).unwrap();
+        let mut tagged = plain[..2].to_vec();
+        tagged.extend([0xFF, 0xE2]);
+        tagged.extend(((profile.len() + 16) as u16).to_be_bytes());
+        tagged.extend(b"ICC_PROFILE\0\x01\x01");
+        tagged.extend(profile);
+        tagged.extend(&plain[2..]);
+        (plain, tagged)
+    }
+
+    #[test]
+    fn pdficc_adobe_rgb_jpeg_opens_converted() {
+        // PDFICC (SR358): an Adobe RGB JPEG opens converted to sRGB — every pixel is icc_core's transform of the
+        // untagged decode, and the flat (200, 100, 50) lands on numpy's (227.065, 100.067, 42.350) within the JPEG's own
+        // rounding.
+        let profile = icc_core::kat::adobe_rgb_v2();
+        let (plain, tagged) = pdficc_jpegs(&profile);
+        let raw = PixelCoreSource.decode(&plain).unwrap();
+        let open = PixelCoreSource.decode(&tagged).unwrap();
+        let mut want = raw.rgba.clone();
+        icc_core::Transform::from_icc(&profile).unwrap().apply_rgba(&mut want);
+        assert_eq!(open.rgba, want);
+        assert_ne!(open.rgba, raw.rgba);
+        let c = &open.rgba[(8 * 16 + 8) * 4..][..4];
+        assert!(c[0].abs_diff(227) <= 2 && c[1].abs_diff(100) <= 2 && c[2].abs_diff(42) <= 2 && c[3] == 255, "{c:?}");
+        let (_, info) = crate::Facet::new().open_bytes("adobe.jpg", &tagged).unwrap();
+        assert_eq!((info.format.as_str(), info.width, info.height), ("jpeg", 16, 16));
+    }
+
+    #[test]
+    fn pdficc_untagged_open_is_byte_identical() {
+        // An untagged file and an sRGB-tagged one open exactly as pixel_core decodes them (the is_srgb short-circuit).
+        let (plain, srgb) = pdficc_jpegs(&icc_core::kat::srgb_v2());
+        let raw = pixel_core::decode(&plain).unwrap().rgba;
+        assert_eq!(PixelCoreSource.decode(&plain).unwrap().rgba, raw);
+        assert_eq!(PixelCoreSource.decode(&srgb).unwrap().rgba, raw);
+        // A profile icc_core refuses keeps the decoded pixels (sRGB assumed, as before PDFICC).
+        let (_, named) = pdficc_jpegs(&icc_core::kat::named_colour());
+        assert_eq!(PixelCoreSource.decode(&named).unwrap().rgba, raw);
+    }
+}
+
+/// PDFICC (SR358): convert a decoded image tagged with an embedded ICC profile to sRGB — the first frame and every
+/// animation frame, through ONE icc_core `Transform` (an sRGB profile is left untouched). A refused profile is logged and
+/// the pixels stay as decoded (sRGB assumed). Facet works in sRGB from here on (view, adjust, the `sRGB`-tagged export).
+fn icc_to_srgb(mut i: pixel_core::Image) -> pixel_core::Image {
+    let Some(icc) = i.icc.take() else { return i };
+    match icc_core::Transform::for_rgba(&icc) {
+        Ok(None) => {}
+        Ok(Some(xf)) => {
+            xf.apply_rgba(&mut i.rgba);
+            for f in i.frames.iter_mut().flatten() {
+                xf.apply_rgba(&mut f.rgba);
+            }
+        }
+        Err(e) => log::warn!("[FACET] :: icc refused: {e} (kept as sRGB)"),
+    }
+    i
 }

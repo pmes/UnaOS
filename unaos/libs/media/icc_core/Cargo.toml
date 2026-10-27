@@ -1,0 +1,13 @@
+[package]
+name = "icc_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "PDFICC (SR358): Facet's ONE ICC colour engine — ICC.1:2010 v2/v4 profiles (matrix/TRC, lut8/lut16/mAB) to sRGB; no_std + alloc, linked by Facet, Aether's <img> and pdf_core."
+
+# PDFICC (LEDGER SR358): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, CHARTER Facet shared-core. Its one dependency is
+# libm (the timeline_core line, already in both locks) for `powf` / `cbrtf` — never a sixth hand-written pow (MATH-ONE owed).
+# pixel_core does NOT link it: pixel_core only surfaces the profile bytes (`Image::icc`); the consumers call
+# `apply_icc_to_srgb` / `Transform` here.
+[dependencies]
+libm = { version = "0.2", default-features = false }

@@ -75,7 +75,7 @@ pub struct Image {
     /// EXIF orientation tag (1..=8) found in the file, 1 when absent. It is REPORTED, not applied:
     /// call [`Image::apply_orientation`] to rotate/flip the pixels (a browser applies it by default,
     /// CSS `image-orientation: from-image`).
-    pub orientation: u8,
+    pub orientation: u8, pub icc: Option<Vec<u8>>, // PDFICC (SR358): `icc` is the embedded ICC profile as stored (PNG iCCP inflated, JPEG APP2 chunks joined in order, WebP ICCP), else None; REPORTED, not applied — `icc_core::apply_icc_to_srgb` converts
 }
 
 /// Why a decode failed. Every variant names a distinct falsifiable claim about the input.
@@ -198,7 +198,7 @@ pub fn decode_webp(bytes: &[u8]) -> Result<Image, Error> {
 impl Image {
     /// A still image.
     pub(crate) fn still(width: u32, height: u32, rgba: Vec<u8>) -> Self {
-        Image { width, height, rgba, frames: None, loop_count: None, orientation: 1 }
+        Image { width, height, rgba, frames: None, loop_count: None, orientation: 1, icc: None }
     }
 
     /// Rotate/flip the pixels (and every frame) so the image displays upright per its EXIF
@@ -404,4 +404,15 @@ pub fn mime_of(bytes: &[u8]) -> Option<&'static str> {
         #[cfg(feature = "svg")]
         Format::Svg => "image/svg+xml",
     })
+}
+
+/// PDFICC (SR358): the largest embedded ICC profile kept (a 33^4 CMYK lut16 profile is about 1.4 MB).
+pub const ICC_MAX: usize = 8 << 20;
+
+impl Image {
+    /// PDFICC (SR358): the same image carrying the embedded profile `icc` (see [`Image::icc`]).
+    pub(crate) fn with_icc(mut self, icc: Option<Vec<u8>>) -> Self {
+        self.icc = icc;
+        self
+    }
 }
