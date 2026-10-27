@@ -506,10 +506,11 @@ fn s10_wpa2(me: [u8; 6], bssid: [u8; 6], ch: u8, ssid: &str, rsn: Option<alloc::
 pub fn wpa2() {
     let a = super::assoc::wpa2_kat();
     let keys = crate::drivers::mt7925::s10_kat();
+    let kz = crate::drivers::mt7925::keyzero_kat();
     let ok = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!(
-        ":: WPA2KAT: pbkdf2={} prf={} mic={} unwrap={} frame={} keys={} rekey={} -> {} ::",
-        ok(a[0]), ok(a[1]), ok(a[2]), ok(a[3]), ok(a[4]), ok(keys), ok(a[5]), if a.iter().all(|&b| b) && keys { "PASS" } else { "FAIL" }
+        ":: WPA2KAT: pbkdf2={} prf={} mic={} unwrap={} frame={} keys={} rekey={} keyzero={} -> {} ::",
+        ok(a[0]), ok(a[1]), ok(a[2]), ok(a[3]), ok(a[4]), ok(keys), ok(a[5]), kz, if a.iter().all(|&b| b) && keys && kz.starts_with("skip") { "PASS" } else { "FAIL" }
     );
 }
 
@@ -607,4 +608,38 @@ fn rejoin_again(p: &crate::drivers::mt7925::RejoinPlan) -> Result<(), &'static s
     let rsn = p.rsn[..(p.rsn_len as usize).min(128)].to_vec();
     let ssid = core::str::from_utf8(sb).unwrap_or("");
     if s10_wpa2(me, p.bssid, p.channel, ssid, Some(rsn), Some(crypto_core::ct::SecretBytes(p.pmk)), None) { Ok(()) } else { Err("wpa2") }
+}
+
+// ── WIFILEAVE (zenbook-ledger Z68): `tests wifileave` — the operator leaves the network ──────────────────────────────────────
+/// The station's own deauthentication (26 octets, IEEE 802.11 management frame, reason 3 = the station is leaving): frame control
+/// {deauthentication, version 0, no flags}, duration 0, addr1 = the BSSID, addr2 = the station, addr3 = the BSSID, sequence 0, the
+/// reason code little-endian. Unprotected (our RSN element advertises no MFP). WIFILEAVE-BUILD owed: the builder into wifi_core.
+fn deauth_frame(me: [u8; 6], bssid: [u8; 6]) -> alloc::vec::Vec<u8> {
+    use wifi_core::ieee80211 as w;
+    let mut f = alloc::vec::Vec::with_capacity(26);
+    f.extend_from_slice(&[(w::SUBTYPE_DEAUTH << 4) | (w::FC_TYPE_MGMT << 2), 0, 0, 0]);
+    f.extend_from_slice(&bssid);
+    f.extend_from_slice(&me);
+    f.extend_from_slice(&bssid);
+    f.extend_from_slice(&[0, 0, 3, 0]);
+    f
+}
+
+/// `tests wifileave`: the radio-less KAT leg (`mt7925::leave_kat`: the plan dropped, nothing due, the PMK zero; the deauth bytes),
+/// then, with the radio registered, the leave itself (`mt7925::leave`, which prints the `[mt7925] s9 left` line). Run after
+/// `tests wifijoin <ssid>` on the metal; with no link it still drops the plan and the keys (`deauth=skip(no-link)`).
+pub fn wifileave() {
+    use crate::drivers::mt7925 as mt;
+    let me = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let bssid = [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+    let want: [u8; 26] = [0xc0, 0, 0, 0, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0, 0, 3, 0];
+    let kat = mt::leave_kat() && deauth_frame(me, bssid) == want;
+    let k = if kat { "ok" } else { "FAIL" };
+    let v = if kat { "PASS" } else { "FAIL" };
+    if !mt::registered() {
+        serial_println!(":: WIFILEAVE: kat={} radio=absent -> {} ::", k, v);
+        return;
+    }
+    mt::leave(&deauth_frame);
+    serial_println!(":: WIFILEAVE: kat={} wifileave=ok radio=mt7925 -> {} ::", k, v);
 }

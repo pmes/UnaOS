@@ -772,7 +772,7 @@ pub fn open() {
         b"Install UnaOS",
         ox + wm::BORDER(),
         oy + wm::TITLE_H() + wm::BORDER(),
-    );
+    ); super::metrics::leaked_surf_retire(&SURF_AT, "instgui");
     if id == wm::WIN_NONE {
         serial_println!("[wc-x] instgui DECLINE reason=create-failed");
         *STATE.lock() = State::Closed;

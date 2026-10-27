@@ -9498,12 +9498,12 @@ pub mod preemptoff {
 
     /// PREEMPTOFFAUDIT M1: the census of the x86 kernel's `without_interrupts` call sites (cores.md §4, the Z57 row): 178
     /// sites at 611cf90b9, corrected by PREEMPTOFFFAT Z65: fat.rs:1027/:1133 are aarch64-only, so 176 — 13 I (ISR or CPU
-    /// state), 136 II (holder non-preemption only), 27 III (both); ONE converted to preempt-off (`block::hold::with`).
+    /// state), 136 II (holder non-preemption only), 27 III (both); ONE converted to preempt-off (`block::hold::with`); B1035: the MOUNT site READS only.
     pub const AUDIT_SITES: u32 = 176;
     pub const AUDIT_ISR: u32 = 13;
     pub const AUDIT_HOLDER: u32 = 136;
     pub const AUDIT_BOTH: u32 = 27;
-    pub const AUDIT_CONVERTED: u32 = 1;
+    pub const AUDIT_CONVERTED: u32 = 1; pub const AUDIT_CONVERTED_UNAFS: u32 = cfg!(feature = "wc") as u32; // UNAFSREADUNMASKED (rmbp-ledger B1035): the MOUNT hold (`fs/unafs.rs` `attempt_span`, was :793) runs preempt-off for READS on a card/AHCI/NVMe medium (`with_unafs_read`); it still masks writes, so the site stays in the census and in II (sites=/holder= unchanged, Z65's rule)
 
     /// `tests preemptaudit`: take the block hold from a task with interrupts ON; inside it interrupts must still be on,
     /// a timer tick must arrive on this CPU, and nothing may switch this task out (Z52's reading).
@@ -9548,7 +9548,7 @@ pub mod preemptoff {
         let (sdhc_word, sdhc_sw): (&'static str, u64) = ("skip(no-sdhcblk)", 0);
         let converted_sdhc = cfg!(feature = "sdhcblk") as u32;
         let switched = switched.saturating_add(sdhc_sw);
-        let (lw, lw_us) = crate::drivers::block::xhci_loan_wait_kat(); #[cfg(feature = "uvc")] let pp: &'static str = crate::drivers::xhci::ptp::loan_path_kat(); #[cfg(not(feature = "uvc"))] let pp: &'static str = "skip(no-uvc)"; let reason = if !on { // PREEMPTOFFXHCILOAN (Z62) leg: the masked claimant on a running block-loan holder (`loan_wait=`)
+        let (lw, lw_us) = crate::drivers::block::xhci_loan_wait_kat(); #[cfg(feature = "uvc")] let (pp, py): (&'static str, &'static str) = crate::drivers::xhci::ptp::loan_path_kat(); #[cfg(not(feature = "uvc"))] let (pp, py): (&'static str, &'static str) = ("skip(no-uvc)", "skip(no-uvc)"); let ls = crate::drivers::block::xhci_loan_shed_count(); let lk = crate::drivers::block::xhci_loan_shed_kat(); let reason = if !on { // PREEMPTOFFXHCILOAN (Z62) leg: the masked claimant on a running block-loan holder (`loan_wait=`)
             Some("masked")
         } else if ticks == 0 {
             Some("no-tick")
@@ -9560,18 +9560,18 @@ pub mod preemptoff {
             Some("sdhc-not-held")
         } else if sdhc_word == "err" {
             Some("sdhc-read")
-        } else if !(lw == "ok" || lw.starts_with("skip")) { Some("loan-wait") } else if !(pp == "ok" || pp.starts_with("skip")) { Some("ptp-path") } else {
+        } else if !(lw == "ok" || lw.starts_with("skip")) { Some("loan-wait") } else if !(pp == "ok" || pp.starts_with("skip")) { Some("ptp-path") } else if !(py == "ok" || py.starts_with("skip")) { Some("ptp-yield") } else if !(lk == "ok" || lk.starts_with("skip")) { Some("shed-kat") } else {
             None
         };
         match reason {
             None => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} -> PASS ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word, lw, lw_us, pp
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} sdhc_irq_on={} hold_irq_on=ok tick_in_hold=ok switched=0 loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} loan_shed={} loan_shed_kat={} -> PASS ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, sdhc_word, lw, lw_us, pp, py, ls, lk
             ),
             Some(r) => serial_println!(
-                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} -> FAIL reason={} ::",
-                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, sdhc_word,
-                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, r
+                ":: PREEMPTAUDIT: sites={} isr={} holder={} both={} converted={} converted_sdhc={} converted_unafs={} sdhc_irq_on={} hold_irq_on={} tick_in_hold={} switched={} loan_wait={} loan_wait_us={} ptp_path={} ptp_yield={} loan_shed={} loan_shed_kat={} -> FAIL reason={} ::",
+                AUDIT_SITES, AUDIT_ISR, AUDIT_HOLDER, AUDIT_BOTH, AUDIT_CONVERTED, converted_sdhc, AUDIT_CONVERTED_UNAFS, sdhc_word,
+                if on { "ok" } else { "masked" }, if ticks > 0 { "ok" } else { "none" }, switched, lw, lw_us, pp, py, ls, lk, r
             ),
         }
     }

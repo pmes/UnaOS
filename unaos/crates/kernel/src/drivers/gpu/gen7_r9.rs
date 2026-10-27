@@ -402,7 +402,7 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
         wr(bar0, slot(k), ptes[k]);
     }
     out.landed = (0..R9_WIN).all(|k| rd(bar0, slot(k)) == ptes[k]) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
-    wr(bar0, flsh, 1);
+    wr(bar0, flsh, 1); crate::drivers::gpu::gen7::assert_no_slot_held("r9-ptes"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
 
     out.disabled = true;
     if out.landed {
@@ -414,7 +414,7 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
         wr(bar0, g7regs::RCS_RING_CTL, RCS_RING_CTL_1PAGE_EN);
         out.armed = rd(bar0, g7regs::RCS_RING_CTL) & 1 == 1;
         if out.armed {
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst); crate::drivers::gpu::gen7::assert_no_slot_held("r9-kick"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
             let t0 = crate::arch::now_cycles();
             wr(bar0, g7regs::RCS_RING_TAIL, tail);
             let _ = poll_cycles(EXEC_BUDGET_CYC, || {
@@ -452,7 +452,7 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
             wr(bar0, slot(k), base_img);
         }
         out.ptes_restored = (0..R9_WIN).all(|k| rd(bar0, slot(k)) == base_img) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
-        wr(bar0, flsh, 1);
+        wr(bar0, flsh, 1); crate::drivers::gpu::gen7::assert_no_slot_held("r9-unmap"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
     }
     crate::drivers::gpu::gen7::held_release(&crate::drivers::gpu::gen7::R9_HELD, "r9", out.disabled, out.ptes_restored); Ok(out) // GEN7HELDRELEASE (B1039): the ONE release, behind the disabled confirm + the PTE read-back + R6c's witness (gen7.rs tail). LINE-NEUTRAL append
 }
@@ -463,7 +463,7 @@ unsafe fn exec(bar0: usize, bar0_size: usize) -> Result<Out, &'static str> {
 // =====================================================================================================================
 
 #[path = "gen7_r10.rs"]
-mod draw;
+pub(in crate::drivers::gpu::gen7) mod draw;
 
 /// R10 under `tests gen7`, after R9's witness line: gated on R9's word, one `[gen7] r10` line.
 fn r10(r9: &str) {

@@ -235,7 +235,8 @@ pub fn text(px: &mut [u32], pw: usize, ph: usize, clip_w: usize, x: usize, y: us
 /// the LIVE scale. Each module used to leak one buffer of `n` words at first use and then build a slice of the
 /// CURRENT `n` over it on every call; `dpi::set_live` (PREFSUI's Resolution dropdown) raises the scale at run time,
 /// so the slice ran past the allocation (a heap overwrite by the painter). Word 0 of each allocation holds its
-/// capacity; a larger `n` leaks a fresh buffer (an old one stays valid for a reader that still holds it).
+/// capacity; a larger `n` allocates a fresh buffer and QUEUES the old one (LEAKEDSURFGROW B1043): it stays valid until
+/// the owner re-points its wm row and calls [`leaked_surf_retire`], which frees it.
 pub fn leaked_surf(at: &core::sync::atomic::AtomicUsize, n: usize) -> &'static mut [u32] {
     use core::sync::atomic::Ordering;
     loop {
@@ -247,7 +248,7 @@ pub fn leaked_surf(at: &core::sync::atomic::AtomicUsize, n: usize) -> &'static m
         }
         let b: &'static mut [u32] = alloc::boxed::Box::leak(alloc::vec![0u32; n + 1].into_boxed_slice());
         b[0] = n as u32;
-        let _ = at.compare_exchange(p, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire);
+        if at.compare_exchange(p, b.as_mut_ptr() as usize, Ordering::AcqRel, Ordering::Acquire).is_ok() && p != 0 { surf_retiring_queue(at, p); }
     }
 }
 
@@ -327,11 +328,93 @@ pub fn sanity_fixture() {
 // `task:<n>`; on an auto-login boot the card's first allocation lands inside the Log Out round trip (BEFORE ->
 // AFTER) and was charged as `leaked_kb`. [`login_surf`] holds a `census::enter(LOGIN_SURFACE)` scope around the one
 // [`leaked_surf`] call (atomics only, no lock on the painter's path; inert while the census is unarmed), so the
-// buffer — and any grow (LEAKEDSURF-GROW, owed) — is the `login-surface` row, counted once by desktopbuild's memline.
+// buffer — and any grow (LEAKEDSURFGROW B1043: the replaced block is freed by `leaked_surf_retire`) — is the
+// `login-surface` row, counted once by desktopbuild's memline. notify's and bezel's buffers take this path too (B1043).
 
-/// [`leaked_surf`] for the login furniture (login card, dialog, instgui): the same buffer, census-tagged `login-surface`.
+/// [`leaked_surf`] for the furniture (login card, dialog, instgui, notify, bezel): the same buffer, census-tagged `login-surface`.
 pub fn login_surf(at: &core::sync::atomic::AtomicUsize, n: usize) -> &'static mut [u32] {
     #[cfg(all(target_arch = "x86_64", feature = "wc"))]
     let _tag = crate::allocator::census::enter(crate::allocator::census::LOGIN_SURFACE);
     leaked_surf(at, n)
+}
+
+// ── LEAKEDSURFGROW (rmbp-ledger B1043, BP-video-18 kept) — a grown furniture surface frees the block it replaced ──────
+// `leaked_surf` used to abandon the smaller block on every grow (SECREVIEW F1 left it valid for a reader still holding
+// it). The old block may still be the owner's LIVE wm row's surface (bezel paints the grown block under its live row),
+// so it cannot be freed at the grow, nor at the next grow (two grows under one live row). The ONE rule: the grow QUEUES
+// the old block in a retiring slot keyed by `at`; the owner calls [`leaked_surf_retire`] right after its wm create /
+// overlay_open returns. Every such site runs only after the owner's row on the old block was closed by `wm::close`
+// (TABLE clear, then the drain barrier), so at the retire no row names the old block and no composite is reading it
+// (video.md §3: free only after `wm::close` returns). A second grow before the re-point abandons the NEWER old block
+// as before (never in a row, but a slice of it may still be in the owner's hand) and counts it; the older stays queued.
+// No lock: atomics, as `leaked_surf`; the free takes only the allocator's own lock; no wm lock is held at any retire.
+// Wire, once per grow at its retire: `[metrics] surf grow who=<owner> from_kb=<a> to_kb=<b> retired=1 abandoned=<n>`.
+// Owed: SURFGROW-KAT (no `tests` door drives a dpi step), RETIRE-DRAIN (a close behind a WINID holder's back on another
+// core clears its cell before that close's drain; a racing grow + re-mint could free under that drain's blit).
+
+/// Retiring slots: one per `leaked_surf` `at` that has grown (the five owners hold 8 `at`s).
+const SURF_RETIRE_SLOTS: usize = 10;
+
+/// One `at`'s queued block (0 = none) and the grows abandoned since its last retire.
+struct SurfRetiring {
+    at: core::sync::atomic::AtomicUsize,
+    old: core::sync::atomic::AtomicUsize,
+    abandoned: core::sync::atomic::AtomicU32,
+}
+
+static SURF_RETIRING: [SurfRetiring; SURF_RETIRE_SLOTS] = [const {
+    SurfRetiring {
+        at: core::sync::atomic::AtomicUsize::new(0),
+        old: core::sync::atomic::AtomicUsize::new(0),
+        abandoned: core::sync::atomic::AtomicU32::new(0),
+    }
+}; SURF_RETIRE_SLOTS];
+
+/// The slot keyed by `at`; with `claim`, a free slot is taken when none is.
+fn surf_retiring_slot(at: usize, claim: bool) -> Option<&'static SurfRetiring> {
+    use core::sync::atomic::Ordering;
+    if let Some(s) = SURF_RETIRING.iter().find(|s| s.at.load(Ordering::Acquire) == at) {
+        return Some(s);
+    }
+    if !claim {
+        return None;
+    }
+    for s in SURF_RETIRING.iter() {
+        match s.at.compare_exchange(0, at, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(s),
+            Err(cur) if cur == at => return Some(s),
+            Err(_) => {}
+        }
+    }
+    None
+}
+
+/// `leaked_surf`'s grow: queue the replaced block `p` for `at`'s next retire. Already queued: `p` is abandoned (as
+/// before B1043) and counted. Table full: abandoned.
+fn surf_retiring_queue(at: &core::sync::atomic::AtomicUsize, p: usize) {
+    use core::sync::atomic::Ordering;
+    let Some(s) = surf_retiring_slot(at as *const core::sync::atomic::AtomicUsize as usize, true) else { return };
+    if s.old.compare_exchange(0, p, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        s.abandoned.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The owner re-pointed its wm row (its create / overlay_open returned, after its row on the old block was closed):
+/// free the block `at`'s last grow replaced. Nothing queued: a no-op, no line.
+pub fn leaked_surf_retire(at: &core::sync::atomic::AtomicUsize, who: &'static str) {
+    use core::sync::atomic::Ordering;
+    let Some(s) = surf_retiring_slot(at as *const core::sync::atomic::AtomicUsize as usize, false) else { return };
+    let q = s.old.swap(0, Ordering::AcqRel);
+    if q == 0 {
+        return;
+    }
+    // SAFETY: `q` is a block `leaked_surf` published (`vec![0u32; cap + 1].into_boxed_slice()`, word 0 = `cap`), queued
+    // once and swapped out once here, so it is freed once; the caller's row on it was closed (and drained) before the
+    // create that precedes this call, so no row names it and no composite reads it.
+    let from = unsafe { *(q as *const u32) } as usize;
+    let cur = at.load(Ordering::Acquire);
+    let to = if cur != 0 { (unsafe { *(cur as *const u32) }) as usize } else { 0 };
+    drop(unsafe { alloc::boxed::Box::from_raw(core::ptr::slice_from_raw_parts_mut(q as *mut u32, from + 1)) });
+    let ab = s.abandoned.swap(0, Ordering::Relaxed);
+    serial_println!("[metrics] surf grow who={} from_kb={} to_kb={} retired=1 abandoned={}", who, from * 4 / 1024, to * 4 / 1024, ab);
 }

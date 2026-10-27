@@ -4414,19 +4414,19 @@ pub unsafe fn rearm(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, 
     // middle arm is the honest one: a self-clearing flush register and a non-decoding offset
     // BOTH read back their entry value, and nothing readable on this part separates them. The
     // rung says so instead of scoring a silent write as a success.
-    let flsh_pre = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-    let flsh_post = witnessed_write(bar0, "r6", "GFX_FLSH_CNTL", g7regs::HYP_GFX_FLSH_CNTL, 1, "EXT-UNPINNED");
-    witnessed_write(bar0, "r6", "GFX_FLSH_RESTORE", g7regs::HYP_GFX_FLSH_CNTL, flsh_pre, "EXT-UNPINNED");
-    let flsh_rest = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-    let flsh_restored = flsh_rest == flsh_pre;
-    let tlb_verdict = if flsh_post != flsh_pre {
-        "tlb-flush-decodes"
-    } else if flsh_pre == 0xFFFF_FFFF {
-        "tlb-flush-allones"
-    } else {
-        "tlb-flush-write-silent"
-    };
-    let flush_positive = tlb_verdict == "tlb-flush-decodes"; #[cfg(any(feature = "gen7r9", feature = "gen7blit"))] { flush_bank(tlb_verdict); } // GEN7HELDRELEASE (B1039): R6c's read-back is the held pages' ONE witness (body at the file tail). LINE-NEUTRAL append, code first
+    // FLUSHVERDICTONE (rmbp-ledger B1045): the read-back and its three-way verdict are ONE fn, `flush_verdict` at the file
+    // tail, which R7 and R8 call too; it banks every reading for `held_release` (GEN7HELDRELEASE B1039).
+    let FlushVerdict {
+        pre: flsh_pre,
+        post: flsh_post,
+        rest: flsh_rest,
+        restored: flsh_restored,
+        verdict: tlb_verdict,
+        positive: flush_positive,
+    } = flush_verdict(
+        bar0,
+        "r6",
+    );
 
     // The independent structural leg. If no candidate's enable ever latched, the head never
     // moved and no sentinel ever landed, then no engine access was ever issued through either
@@ -5473,20 +5473,20 @@ pub unsafe fn blit(bar0: usize, bar0_size: usize, bus: u8, slot: u8, func: u8, w
     }
 
     // ---- The GGTT TLB-invalidation rung, and the reclaim it gates ---------------------
-    // Copied verbatim from rearm()'s R6c, over three pages instead of two.
-    let flsh_pre = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-    let flsh_post = witnessed_write(bar0, "r7", "GFX_FLSH_CNTL", g7regs::HYP_GFX_FLSH_CNTL, 1, "EXT-UNPINNED");
-    witnessed_write(bar0, "r7", "GFX_FLSH_RESTORE", g7regs::HYP_GFX_FLSH_CNTL, flsh_pre, "EXT-UNPINNED");
-    let flsh_rest = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-    let flsh_restored = flsh_rest == flsh_pre;
-    let tlb_verdict = if flsh_post != flsh_pre {
-        "tlb-flush-decodes"
-    } else if flsh_pre == 0xFFFF_FFFF {
-        "tlb-flush-allones"
-    } else {
-        "tlb-flush-write-silent"
-    };
-    let flush_positive = tlb_verdict == "tlb-flush-decodes";
+    // R6c's verdict through its one fn (no copy, FLUSHVERDICTONE B1045), over three pages instead of two.
+    // FLUSHVERDICTONE (rmbp-ledger B1045): R6c's one read-back and verdict (`flush_verdict`, file tail); this reading is
+    // banked for `held_release` too (GEN7HELDRELEASE B1039).
+    let FlushVerdict {
+        pre: flsh_pre,
+        post: flsh_post,
+        rest: flsh_rest,
+        restored: flsh_restored,
+        verdict: tlb_verdict,
+        positive: flush_positive,
+    } = flush_verdict(
+        bar0,
+        "r7",
+    );
 
     // The independent structural leg. If no candidate's enable ever latched, the head never
     // moved, no sentinel ever landed and no pixel was ever copied, then no engine access was ever
@@ -6705,19 +6705,19 @@ mod r8 {
         }
 
         // ---- The GGTT TLB-invalidation rung, and the reclaim it gates (GEN7TLB) -------------
-        let flsh_pre = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-        let flsh_post = witnessed_write(bar0, "r8", "GFX_FLSH_CNTL", g7regs::HYP_GFX_FLSH_CNTL, 1, "EXT-UNPINNED");
-        witnessed_write(bar0, "r8", "GFX_FLSH_RESTORE", g7regs::HYP_GFX_FLSH_CNTL, flsh_pre, "EXT-UNPINNED");
-        let flsh_rest = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
-        let flsh_restored = flsh_rest == flsh_pre;
-        let tlb_verdict = if flsh_post != flsh_pre {
-            "tlb-flush-decodes"
-        } else if flsh_pre == 0xFFFF_FFFF {
-            "tlb-flush-allones"
-        } else {
-            "tlb-flush-write-silent"
-        };
-        let flush_positive = tlb_verdict == "tlb-flush-decodes";
+        // FLUSHVERDICTONE (rmbp-ledger B1045): R6c's one read-back and verdict (`flush_verdict`, file tail); this
+        // reading is banked for `held_release` too (GEN7HELDRELEASE B1039).
+        let FlushVerdict {
+            pre: flsh_pre,
+            post: flsh_post,
+            rest: flsh_rest,
+            restored: flsh_restored,
+            verdict: tlb_verdict,
+            positive: flush_positive,
+        } = flush_verdict(
+            bar0,
+            "r8",
+        );
         let never_fetched = !any_ctl_enabled && !any_head_moved && !any_sentinel && !any_copy;
         let reversal_clean = r7_reversal_clean(engine_quiesced, ptes_restored, smear_post, all_regs_restored);
         let reclaim = r7_reclaim(reversal_clean, never_fetched, flush_positive);
@@ -7310,7 +7310,7 @@ pub fn ladder_test() {
     ladder::run();
     #[cfg(feature = "gen7blit")]
     blit::test(); // GEN7B (B422): the BCS job, the display capture, KCOMP's second-blitter decision
-    hold_leg(); } // GEN7HOLDONCE (B1025): the second run, asserting no new held page (`:: GEN7HOLD: ::`, body at the file tail). LINE-NEUTRAL append
+    hold_leg(); order_leg(); } // GEN7HOLDONCE (B1025): the second run, asserting no new held page (`:: GEN7HOLD: ::`, body at the file tail). LINE-NEUTRAL append
 
 mod ladder {
     use super::GtWake;
@@ -7601,10 +7601,10 @@ static BLIT_RING_HELD: crate::sync::Mutex<(usize, usize)> = crate::sync::Mutex::
 // rule is R7's `r7_reclaim` (never_fetched = false: a held block may carry an earlier run's fetch); the witness is R6c's
 // read-back of `0x101008` banked this boot (`flush_bank`), never "the engine is idle" (GEN7TLB, gen7.rs R6c). On a part
 // whose R6c reads `tlb-flush-write-silent` (the RMBP) every engine is refused by name once per boot and its slot stays
-// intact, so reuse is unchanged. GEN7-HELD-PARK / GEN7-TLB-WITNESS / FLUSH-VERDICT-ONE owed.
+// intact, so reuse is unchanged. GEN7-HELD-PARK / GEN7-TLB-WITNESS owed (FLUSH-VERDICT-ONE: built by B1045 below).
 // =================================================================================
 
-/// R6c's `0x101008` read-back this boot: 0 unmeasured, 1 decodes, 2 write-silent, 3 all-ones.
+/// The boot's `0x101008` read-backs (R6c, R7, R8 via `flush_verdict`): 0 unmeasured, 1 decodes, 2 write-silent, 3 all-ones.
 #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
 static FLUSH_SEEN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 /// Bytes `held_release` returned to the heap this boot.
@@ -7614,7 +7614,7 @@ static RELEASED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::Ato
 #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
 static KEPT_SAID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-/// R6c banks its three-way `tlb_verdict` (the only read-back of `0x101008` the driver makes).
+/// `flush_verdict` banks each three-way reading (R6c, R7, R8); 0 and 1 take the new reading, 2 and 3 stay for the boot (a contradiction never decodes).
 #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
 fn flush_bank(verdict: &str) {
     let v = match verdict {
@@ -7622,7 +7622,7 @@ fn flush_bank(verdict: &str) {
         "tlb-flush-allones" => 3,
         _ => 2,
     };
-    FLUSH_SEEN.store(v, core::sync::atomic::Ordering::Relaxed);
+    let _ = FLUSH_SEEN.fetch_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |cur| Some(if cur <= 1 { v } else { cur }));
 }
 
 /// Release `slot`'s held block after a WITNESSED GGTT TLB flush, else keep it (refused by name, once per engine per
@@ -7669,4 +7669,189 @@ pub(crate) fn held_release(slot: &crate::sync::Mutex<(usize, usize)>, engine: &'
 #[allow(dead_code)]
 pub(crate) fn held_released_kb() -> usize {
     RELEASED_BYTES.load(core::sync::atomic::Ordering::Relaxed) / 1024
+}
+
+// =================================================================================
+// FLUSHVERDICTONE (rmbp-ledger B1045) — FILE-TAIL append: nothing above it moves. The GGTT TLB-flush read-back of
+// `0x101008` and its three-way verdict lived three times (R6c, R7, R8; B1039 owed FLUSH-VERDICT-ONE); it is now ONE fn,
+// R6c's body verbatim, which R6c, R7 and R8 call with their rung tag (the only drift between the copies: the tag
+// `witnessed_write` prints). Every reading banks for `held_release` (`flush_bank`, sticky on write-silent / all-ones), so
+// the witness gets two more chances per boot and a contradiction never reads as decodes. Same reads in the same order
+// (pre, write 1, restore pre, re-read), same words; each rung keeps its own `tlb verdict=` line.
+// =================================================================================
+
+/// One reading of `0x101008`: captured, written 1, restored, re-read, and judged.
+struct FlushVerdict {
+    pre: u32,
+    post: u32,
+    rest: u32,
+    restored: bool,
+    verdict: &'static str,
+    positive: bool,
+}
+
+/// The ONE `0x101008` read-back and three-way verdict (decodes / allones / write-silent). `tag` is the rung ("r6", "r7",
+/// "r8") its `witnessed_write` step lines carry. Same contract as the rungs: `bar0` is a live MMIO mapping of the IGD's
+/// BAR0 covering `HYP_GFX_FLSH_CNTL`, on a `write_ok()` wake.
+unsafe fn flush_verdict(bar0: usize, tag: &str) -> FlushVerdict {
+    let pre = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
+    let post = witnessed_write(bar0, tag, "GFX_FLSH_CNTL", g7regs::HYP_GFX_FLSH_CNTL, 1, "EXT-UNPINNED");
+    witnessed_write(bar0, tag, "GFX_FLSH_RESTORE", g7regs::HYP_GFX_FLSH_CNTL, pre, "EXT-UNPINNED");
+    let rest = rd(bar0, g7regs::HYP_GFX_FLSH_CNTL);
+    let verdict = if post != pre {
+        "tlb-flush-decodes"
+    } else if pre == 0xFFFF_FFFF {
+        "tlb-flush-allones"
+    } else {
+        "tlb-flush-write-silent"
+    };
+    #[cfg(any(feature = "gen7r9", feature = "gen7blit"))]
+    {
+        flush_bank(verdict);
+    }
+    FlushVerdict { pre, post, rest, restored: rest == pre, verdict, positive: verdict == "tlb-flush-decodes" }
+}
+
+// =================================================================================
+// GEN7LOCKHELD (rmbp-ledger B1044) — FILE-TAIL append: nothing above it moves. BP-gpu-9's order (gen7blit's `PAGES`
+// before a slot, never the reverse) held by the lock registry's own walk: every lock here is a `crate::sync::Mutex`, a
+// blocking `lock()` records an order edge from each hold this task has on this core (a `try_lock` records none: it
+// cannot wait, B578), and an edge whose reverse is already recorded counts in LOCKREG's `inversions=` (which FAILs).
+// The only nested pair is `blit::bcs_job` (`PAGES.try_lock()` then `held_take(&BLIT_RING_HELD)`), and it never runs
+// without an IGD bank (QEMU), so this leg makes the production take itself and READS the registry's table: the
+// forward edge must be recorded, the reverse absent, and no inversion counted by the take. Nothing is taken inverted:
+// an inverted take would leave its edge for the boot and silence every later real inversion of the pair.
+// =================================================================================
+
+/// `tests gen7`'s order leg: `:: GEN7ORDER: pair=pages->blit-ring fwd= rev= inversions=<before>-><after> -> <v> gen7_order=<w> ::`.
+fn order_leg() {
+    #[cfg(feature = "gen7blit")]
+    {
+        let before = blit::PAGES.order_seen(&BLIT_RING_HELD);
+        // One core, one task for both takes: the walk reads only this core's partition. The slot guard drops first.
+        let taken = crate::arch::without_interrupts(|| {
+            let Some(_engine) = blit::PAGES.try_lock() else { return false }; // bcs_job's own take (a live job: busy)
+            let _slot = BLIT_RING_HELD.lock(); // held_take's take; nothing is done under it
+            true
+        });
+        let after = blit::PAGES.order_seen(&BLIT_RING_HELD);
+        let (fwd, rev, i1) = after.unwrap_or((false, false, 0));
+        let i0 = before.map(|b| b.2).unwrap_or(i1);
+        let w = if before.is_none() || after.is_none() {
+            "skip(unarmed)"
+        } else if !taken {
+            "skip(busy)"
+        } else if !fwd {
+            "no-edge"
+        } else if rev {
+            "inverted"
+        } else if i1 != i0 {
+            "rose"
+        } else {
+            "ok"
+        };
+        let v = if w == "ok" { "PASS" } else if w.starts_with("skip") { "SKIP" } else { "FAIL" };
+        let (v, n, kat) = nohold_leg(v); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} slot_nohold={} slot_kat={} ::", fwd as u8, rev as u8, i0, i1, v, w, n, kat);
+    }
+    #[cfg(not(feature = "gen7blit"))]
+    {
+        let (v, n, kat) = nohold_leg("SKIP"); serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> {} gen7_order=skip(no-gen7blit) slot_nohold={} slot_kat={} ::", v, n, kat);
+    }
+}
+
+// =================================================================================
+// GEN7SLOTNOHOLD (rmbp-ledger B1047) — FILE-TAIL append: nothing above it moves. BP-gpu-9's second half (a slot's Mutex
+// is never held across a GPU op) witnessed: the four engines (r9, r10, r11, gen7blit) call `assert_no_slot_held` on the
+// existing line of each GPU-op phase (the PTE install flush, the ring kick's fence line before t0, the PTE restore
+// flush: twelve same-line tokens). It READS the lock registry through its existing API (`Mutex::holder` + `sync::here`,
+// B1016; no new registry fn): a slot THIS task holds at the op counts in `SLOT_HELD_N` and says one `[gen7] slot held
+// across op=<what> slot=<name>` per boot; it never panics and takes no lock. The engine lock (gen7blit's `PAGES`) is
+// held across ops by design and is not a slot. `tests gen7`'s GEN7ORDER line carries `slot_nohold=<n>` (0 = pass) and
+// `slot_kat=` (one slot taken by `try_lock`, checked under SLOT_KAT, its own count given back: B1034's shape).
+// GEN7-SLOT-NOHOLD-RUNGS owed: R5-R8's `witnessed_write` sites in this file carry no token.
+// =================================================================================
+
+/// Slot holds seen live across a GPU op this boot (the KAT's own count given back).
+static SLOT_HELD_N: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// The boot's one `[gen7] slot held across` line was said.
+static SLOT_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// `nohold_leg`'s KAT is checking: count, never say.
+static SLOT_KAT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// BP-gpu-9's witness at a GPU-op site: how many gen7 slots THIS task holds now (each counted in `SLOT_HELD_N`, the
+/// boot's first said by name). 0 while the registry is unarmed or names no caller (nothing attributable). Reads only:
+/// one `is_locked` load per built slot, the registry walk (`holder`) only for a locked one.
+pub(crate) fn assert_no_slot_held(what: &'static str) -> usize {
+    let Some((me, _)) = crate::sync::here() else { return 0 };
+    let mut n = 0usize;
+    #[allow(unused_mut, unused_variables)]
+    let mut chk = |name: &'static str, s: &crate::sync::Mutex<(usize, usize)>| {
+        if s.is_locked() && s.holder().map(|h| h.0) == Some(me) {
+            n += 1;
+            SLOT_HELD_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if !SLOT_KAT.load(core::sync::atomic::Ordering::Relaxed) && !SLOT_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                serial_println!("[gen7] slot held across op={} slot={}", what, name);
+            }
+        }
+    };
+    #[cfg(feature = "gen7r8")]
+    {
+        chk("r8-ring", &R8_HELD[0]);
+        chk("r8-src", &R8_HELD[1]);
+        chk("r8-dst", &R8_HELD[2]);
+    }
+    #[cfg(feature = "gen7blit")]
+    {
+        chk("blit-sp", &BLIT_HELD[0]);
+        chk("blit-dp", &BLIT_HELD[1]);
+        chk("blit-ring", &BLIT_RING_HELD);
+    }
+    #[cfg(feature = "gen7r9")]
+    {
+        chk("r9", &R9_HELD);
+        chk("r10", &R10_HELD);
+        chk("r11", &r9::draw::quad::HELD);
+    }
+    n
+}
+
+/// The KAT's slot: the first one this build has.
+#[allow(unreachable_code)]
+fn kat_slot() -> Option<&'static crate::sync::Mutex<(usize, usize)>> {
+    #[cfg(feature = "gen7blit")]
+    {
+        return Some(&BLIT_RING_HELD);
+    }
+    #[cfg(feature = "gen7r9")]
+    {
+        return Some(&R9_HELD);
+    }
+    #[cfg(feature = "gen7r8")]
+    {
+        return Some(&R8_HELD[0]);
+    }
+    None
+}
+
+/// GEN7ORDER's nohold terms `(verdict, slot_nohold, slot_kat)`: the KAT holds one slot (`try_lock`: no order edge, it
+/// cannot wait) and asks the helper, which must count exactly it; the count is given back. `slot_nohold` is the boot's
+/// real count after both ladder runs; a non-zero count or a KAT miss FAILs, else `v` stands.
+fn nohold_leg(v: &'static str) -> (&'static str, usize, &'static str) {
+    let kat = crate::arch::without_interrupts(|| {
+        let Some(slot) = kat_slot() else { return "skip(no-slot)" };
+        if crate::sync::here().is_none() {
+            return "skip(unarmed)";
+        }
+        let Some(_g) = slot.try_lock() else { return "skip(busy)" };
+        if slot.holder().is_none() {
+            return "skip(untracked)";
+        }
+        SLOT_KAT.store(true, core::sync::atomic::Ordering::Relaxed);
+        let c = assert_no_slot_held("kat");
+        SLOT_KAT.store(false, core::sync::atomic::Ordering::Relaxed);
+        SLOT_HELD_N.fetch_sub(c, core::sync::atomic::Ordering::Relaxed);
+        if c == 1 { "ok" } else { "miss" }
+    });
+    let n = SLOT_HELD_N.load(core::sync::atomic::Ordering::Relaxed);
+    (if n != 0 || kat == "miss" { "FAIL" } else { v }, n, kat)
 }

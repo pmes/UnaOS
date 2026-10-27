@@ -1558,7 +1558,7 @@ pub fn open() -> Result<(), String> {
     if id == wm::WIN_NONE { return Err(String::from("window create failed")); }
     *STATE.lock() = Some(st);
     WIN.store(id, Ordering::Relaxed);
-    wm::winid_register_holder(&WIN, "settings");
+    wm::winid_register_close_hook(&WIN, "settings", close_hook); // WMCLOSEHOOK (rmbp-ledger B1038): a close behind our back frees STATE (file tail)
     wm::focus_changed(OWNER);
     if let Some(st) = STATE.lock().as_mut() { panes_sync(id, st, tab0); } let _ = wm::present(id); // SCROLLVIEW (B764) · SCROLLPANES (B777): a window opens with its panes' models before the first wheel
     serial_println!("[settings] open win={}", id);
@@ -5959,4 +5959,16 @@ pub fn tabs_probe(write_tab: &dyn Fn(usize)) -> (&'static str, &'static str, Str
     let ok = shown(a, last) && b.map_or(true, |t| shown(t, last));
     let detail = alloc::format!("tab={} switch={} prefchanged={}", TAB_NAMES[last], a, b.map_or(String::from("na"), |t| alloc::format!("{}", t)));
     (if ok { "ok" } else { "bad" }, rule, detail)
+}
+
+// ── WMCLOSEHOOK (rmbp-ledger B1038, BP-video-18 kept) — FILE-TAIL. A close behind this window's back (the furniture disc,
+// `wm::close_all_furniture` at a Log Out) cleared `WIN` through wm's WINID registry, so [`close`] returned at its
+// `WIN_NONE` guard and STATE (with its surface) stayed. `wm::close` now runs this hook after the drain, with no wm lock
+// held: STATE is taken iff its surface is the one the closed row seated (a reopen builds a fresh one), dropped outside the lock.
+fn close_hook(_id: wm::WinId, surf: usize) {
+    let st = {
+        let mut g = STATE.lock();
+        if g.as_ref().map(|s| s.surf.as_ptr() as usize) == Some(surf) { g.take() } else { None }
+    };
+    drop(st);
 }

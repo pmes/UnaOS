@@ -85,7 +85,7 @@ impl JobOut {
 /// The engine's lock: a second job while one runs is `busy`. The ring + sentinel pages (8 KiB, GGTT-reachable,
 /// gen7.md §2.6) are held in gen7.rs's `BLIT_RING_HELD` slot through `held_take` (GEN7HELDONE, B1031), taken under
 /// this lock (PAGES -> slot, never the reverse).
-static PAGES: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
+pub(super) static PAGES: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 fn span_pages(p: &Plane) -> (usize, usize) {
     let first = p.va & !0xFFF;
@@ -249,7 +249,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
         wr(bar0, slot(k), ptes[k]);
     }
     out.landed = (0..win).all(|k| rd(bar0, slot(k)) == ptes[k]) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
-    wr(bar0, GFX_FLSH, 1); // write-any-value: invalidate after a CPU-side GTT update (§1.2.21 p.191)
+    wr(bar0, GFX_FLSH, 1); crate::drivers::gpu::gen7::assert_no_slot_held("blit-ptes"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail), LINE-NEUTRAL append. write-any-value: invalidate after a CPU-side GTT update (§1.2.21 p.191)
 
     let mut all_disabled = true;
     let mut cyc = 0u64;
@@ -267,7 +267,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
                 if out.setup_us == 0 {
                     out.setup_us = kb::cycles_to_us(crate::arch::now_cycles().saturating_sub(t_setup));
                 }
-                core::sync::atomic::compiler_fence(AO::SeqCst);
+                core::sync::atomic::compiler_fence(AO::SeqCst); crate::drivers::gpu::gen7::assert_no_slot_held("blit-kick"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
                 let t0 = crate::arch::now_cycles();
                 wr(bar0, g7regs::BCS_RING_TAIL, tail);
                 let (_hit, _it, _cy) = poll_cycles(EXEC_BUDGET_CYC, || {
@@ -316,7 +316,7 @@ pub unsafe fn bcs_job(bar0: usize, bar0_size: usize, src: Plane, dst: Plane, rec
             wr(bar0, slot(k), base_img);
         }
         out.ptes_restored = (0..win).all(|k| rd(bar0, slot(k)) == base_img) && rd(bar0, prev_off) == prev && rd(bar0, next_off) == next;
-        wr(bar0, GFX_FLSH, 1);
+        wr(bar0, GFX_FLSH, 1); crate::drivers::gpu::gen7::assert_no_slot_held("blit-unmap"); // GEN7SLOTNOHOLD (B1047): no slot guard live across this GPU op (gen7.rs tail). LINE-NEUTRAL append
     }
     clflush_range(dst.va, dst.len); crate::drivers::gpu::gen7::held_release(&crate::drivers::gpu::gen7::BLIT_RING_HELD, "blit", all_disabled, out.ptes_restored); // the CPU reads what the engine wrote, not a stale line. GEN7HELDRELEASE (B1039): the ONE release, under PAGES, behind the disabled+idle confirm + the PTE read-back + R6c's witness (gen7.rs tail). LINE-NEUTRAL append, code first
     Ok(out)

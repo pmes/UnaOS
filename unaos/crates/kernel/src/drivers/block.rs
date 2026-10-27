@@ -4271,9 +4271,9 @@ impl Drop for BlockLoan {
     fn drop(&mut self) {
         // The put first (XhciLoan's masked O(1) put), while this CPU is still preempt-off; then the publication is
         // withdrawn (only if it is still ours) and the count released.
-        drop(self.loan.take());
+        #[cfg(target_arch = "x86_64")] let shed = loan_shed_take(); drop(self.loan.take()); // XHCILOANFAILHOLD (Z66): the shed mark is read BEFORE the put (still held: no other block loan can exist to clear it)
         #[cfg(target_arch = "x86_64")]
-        { if self.tag == 0 { return; } // XHCILOANPTPCOPY (Z69): a demoted (claim-only) loan holds no count and no publication
+        { if self.tag == 0 { return; } if shed { return; } // XHCILOANPTPCOPY (Z69): a demoted (claim-only) loan holds no count and no publication. XHCILOANFAILHOLD (Z66): a shed loan already withdrew its publication and released its count (`xhci_loan_shed`)
             let _ = BLOCK_LOAN_CPU.compare_exchange(
                 self.tag,
                 0,
@@ -4324,7 +4324,7 @@ fn take_block_loan() -> Result<BlockLoan, XhciClaimError> {
     crate::arch::sched::preemptoff::disable();
     match xhci::claim() {
         Ok(l) => {
-            let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+            let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); // XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared
             BLOCK_LOAN_CPU.store(tag, core::sync::atomic::Ordering::Release);
             Ok(BlockLoan { loan: Some(l), tag })
         }
@@ -4515,6 +4515,180 @@ impl BlockLoan {
     }
 }
 
+// ══════════ XHCILOANPTPYIELD (zenbook-ledger Z73) — a PTP/MTP data phase hands the loan back to a block claimant between TDs ══════════
+//
+// A claim-only PTP hold (Z69) keeps controller 0 for a whole data phase: a 64 MiB GetPartialObject (`mtp::READ_CHUNK`) is
+// 2048 TDs of 32 KiB (`STORAGE_DATA_BYTES`), seconds at USB2, and a masked block claimant (FAT RMW, `with_unafs`) is told
+// `Busy` at once (why=holder-preemptible) and gives up after its 64 / 8 tick-paced retries. `ptp::loan_yield` calls
+// `yield_now` from the ONE bulk-in loop (`ptp_txn_inner`'s Phase::In) between two TDs (nothing of PTP armed; a bulk
+// transfer has no inter-TD timing): the PUT (`XhciLoan`'s masked O(1) put), a bounded WINDOW in which a block claimant
+// takes it (its take publishes `BLOCK_LOAN_CPU`), the RE-TAKE through `claim_only` again (its bounded wait is the ONE
+// path's), pointer-checked to be the same heap controller. Only a demoted loan (tag 0) yields. Owed: XHCILOAN-PTPYIELD-ARM.
+
+/// XHCILOANPTPYIELD: a periodic yield every this many TDs (4 MiB of 32 KiB TDs) ...
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_TDS: u32 = 128;
+/// XHCILOANPTPYIELD: ... and no sooner than this many ms after the last (a no-claimant window then costs <= 3/50 of a pull).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_MIN_MS: u64 = 50;
+/// XHCILOANPTPYIELD: a masked claimant refused since the last yield makes one due after this many TDs (256 KiB).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_DEMAND_TDS: u32 = 8;
+/// XHCILOANPTPYIELD: the window on the ms clock (>= 2 real ms: two 1 kHz ticks on every CPU, so a hlt-waiter retries).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub const LOAN_YIELD_WINDOW_MS: u64 = 3;
+/// XHCILOANPTPYIELD: `claim_only` attempts for the re-take (~8 s at x86's 2 s budget: past a failing BOT ladder's 3x first attempt).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+const LOAN_YIELD_RETAKES: u32 = 4;
+
+/// XHCILOANPTPYIELD: TDs since the last yield, `arch::ms` at it, `LOAN_MASKED_BUSY` at it (one PTP hold at a time: written
+/// only by the holder).
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_TDS_SINCE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_LAST_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_SEEN_BUSY: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// XHCILOANPTPYIELD: yields this boot, and windows a block claimant took.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_TAKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+impl BlockLoan {
+    /// XHCILOANPTPYIELD: one TD of a PTP data phase passed; a yield is due at >= `LOAN_YIELD_TDS` TDs and
+    /// >= `LOAN_YIELD_MIN_MS` since the last, or at >= `LOAN_YIELD_DEMAND_TDS` when a masked claimant was refused since.
+    pub fn yield_due() -> bool {
+        use core::sync::atomic::Ordering;
+        let n = LOAN_YIELD_TDS_SINCE.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let periodic = n >= LOAN_YIELD_TDS
+            && crate::arch::ms().saturating_sub(LOAN_YIELD_LAST_MS.load(Ordering::Relaxed)) >= LOAN_YIELD_MIN_MS;
+        let demand = n >= LOAN_YIELD_DEMAND_TDS
+            && LOAN_MASKED_BUSY.load(Ordering::Relaxed) != LOAN_YIELD_SEEN_BUSY.load(Ordering::Relaxed);
+        periodic || demand
+    }
+
+    /// XHCILOANPTPYIELD: put the loan back, give a block claimant a bounded window, re-take it through `claim_only`.
+    /// `Ok((µs put -> re-take, a block claimant took the window))`; `Ok((0, false))` with nothing moved for a loan that must
+    /// not yield (masked, preempt-off held, published, absent). `Err` leaves the loan EMPTY: the caller must not touch the
+    /// controller again (the Drop of an empty demoted loan does nothing).
+    pub fn yield_now(&mut self) -> Result<(u64, bool), BlockError> {
+        use core::sync::atomic::Ordering;
+        if crate::arch::irqs_masked() || crate::arch::sched::preemptoff::witness().0 || self.tag != 0 || self.loan.is_none() {
+            return Ok((0, false));
+        }
+        let before: *const crate::drivers::xhci::XhciController = &***self;
+        let t0 = crate::arch::now_cycles();
+        drop(self.loan.take()); // the PUT: XhciLoan's masked O(1) put
+        let m0 = crate::arch::ms();
+        let mut taken = false;
+        loop {
+            if BLOCK_LOAN_CPU.load(Ordering::Acquire) != 0 {
+                taken = true; // a block take published: the re-take below waits out its transaction
+                break;
+            }
+            if crate::arch::ms().saturating_sub(m0) >= LOAN_YIELD_WINDOW_MS {
+                break;
+            }
+            crate::arch::sched::yield_now(); // a same-CPU claimant runs
+        }
+        let mut tries = 0u32;
+        let mut l = loop {
+            match BlockLoan::claim_only() {
+                Ok(l) => break l,
+                Err(BlockError::Busy) => {
+                    tries += 1;
+                    if tries >= LOAN_YIELD_RETAKES {
+                        return Err(BlockError::Busy);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let after: *const crate::drivers::xhci::XhciController = &**l;
+        if !core::ptr::eq(before, after) {
+            return Err(BlockError::Io); // `l` drops: the controller goes back
+        }
+        self.loan = l.loan.take(); // the demoted temporary drops empty (tag 0)
+        LOAN_YIELD_TDS_SINCE.store(0, Ordering::Relaxed);
+        LOAN_YIELD_LAST_MS.store(crate::arch::ms(), Ordering::Relaxed);
+        LOAN_YIELD_SEEN_BUSY.store(LOAN_MASKED_BUSY.load(Ordering::Relaxed), Ordering::Relaxed);
+        LOAN_YIELDS.fetch_add(1, Ordering::Relaxed);
+        if taken {
+            LOAN_YIELD_TAKEN.fetch_add(1, Ordering::Relaxed);
+        }
+        let us = crate::arch::now_cycles().wrapping_sub(t0).saturating_mul(1000) / wait::cycles_ms(1).max(1);
+        Ok((us, taken))
+    }
+}
+
+/// XHCILOANPTPYIELD: aarch64 never yields (no `BLOCK_LOAN_CPU` publication there: XHCILOAN-PTPYIELD-ARM owed).
+#[cfg(all(feature = "uvc", not(target_arch = "x86_64")))]
+impl BlockLoan {
+    pub fn yield_due() -> bool {
+        false
+    }
+    pub fn yield_now(&mut self) -> Result<(u64, bool), BlockError> {
+        Ok((0, false))
+    }
+}
+
+/// XHCILOANPTPYIELD: `(yields, windows a block claimant took)` this boot.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub fn xhci_loan_yields() -> (u32, u32) {
+    (
+        LOAN_YIELDS.load(core::sync::atomic::Ordering::Relaxed),
+        LOAN_YIELD_TAKEN.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// XHCILOANPTPYIELD KAT handshake: 0 idle, 1 the claimant is about to wait, 2 it holds the loan, 3 it put it back, 9 refused.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+static LOAN_YIELD_KAT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// XHCILOANPTPYIELD KAT claimant (a task on a sibling CPU, Z62's `loan_kat_holder` shape): an unmasked block claim that
+/// hlt-waits while the KAT's PTP claim holds the loan, takes it in the yield window, holds 1 ms, puts it back.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+fn loan_yield_kat_claimant(_: usize) {
+    use core::sync::atomic::Ordering;
+    LOAN_YIELD_KAT.store(1, Ordering::Release);
+    match claim_xhci_for_io() {
+        Ok(l) => {
+            LOAN_YIELD_KAT.store(2, Ordering::Release);
+            let _ = wait::bounded(1, || false);
+            drop(l);
+            LOAN_YIELD_KAT.store(3, Ordering::Release);
+        }
+        Err(_) => LOAN_YIELD_KAT.store(9, Ordering::Release),
+    }
+}
+
+/// XHCILOANPTPYIELD: arm the KAT claimant on a sibling CPU and wait until it is in its claim wait (called while the
+/// PTP claim holds the loan). `Err` = `skip(one-cpu)` / `skip(claimant-late)`.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub fn xhci_loan_yield_kat_arm() -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(me);
+    if cpu == me {
+        return Err("skip(one-cpu)");
+    }
+    LOAN_YIELD_KAT.store(0, Ordering::Release);
+    crate::arch::sched::spawn("ptpyield-kat", loan_yield_kat_claimant, 0, cpu, crate::arch::sched::PRIO_HIGH);
+    if !wait::bounded(1000, || LOAN_YIELD_KAT.load(Ordering::Acquire) == 1) {
+        return Err("skip(claimant-late)");
+    }
+    let _ = wait::bounded(2, || false); // it is in `claim_xhci_for_io`'s hlt wait now
+    Ok(())
+}
+
+/// XHCILOANPTPYIELD: after the KAT's PTP claim is put back, wait (<= 2500 ms) for the claimant to finish.
+#[cfg(all(feature = "uvc", target_arch = "x86_64"))]
+pub fn xhci_loan_yield_kat_settle() {
+    let _ = wait::bounded(2500, || LOAN_YIELD_KAT.load(core::sync::atomic::Ordering::Acquire) >= 3);
+}
+
 /// XHCILOANPTPCOPY: PTP/MTP claims through the one path this boot (read by `ptp::loan_path_kat`).
 pub fn xhci_loan_ptp_claims() -> u32 {
     LOAN_PTP_CLAIMS.load(core::sync::atomic::Ordering::Relaxed)
@@ -4557,4 +4731,237 @@ fn say_loan_refusal(who: &str, code: u8, t0: u64) {
             us
         );
     }
+}
+
+// ══════════ XHCILOANFAILHOLD (zenbook-ledger Z66) — a block loan in a BOT wait sheds its non-preemption ══════════
+//
+// TAIL-APPENDED after Z62's KAT (Z62's `Drop` and `take_block_loan` gain one same-line token each, line-neutral). Z62 held
+// the block loan preempt-off from take to put; a FAILING BOT transfer holds that loan through the whole ladder inside one
+// `storage_*10` call (`xhci/mod.rs` `bot_transfer_body`): a 3x `hw_wait_budget` first attempt (6 s on x86) plus a
+// recovery and its rungs, every other task on the holder's CPU stopped with it — on the service core, 3x the pump
+// watch's `WEDGE_MS`. The xHCI layer's hook (`XhciController::loan_shed_hook`, its file tail) calls `xhci_loan_shed` from
+// the holder's own call chain at each stage-wait wake (gate: loan age >= `LOAN_MASKED_WAIT_MS`) and at the ladder entry
+// (gate 0: the recovery's EP0/command waits are unhooked). The shed is Z69's demotion shape on the static path: the
+// publication withdrawn (CAS tag -> 0), the count released (`preemptoff::enable`), then the mark (`LOAN_SHED`) that tells
+// `Drop` not to do either again. The holder KEEPS the claim and is preemptible as before Z62; a masked claimant answers
+// `Busy` at once (unpublished holder), WEDGE-8 F3 restated. All state is lock-free and written only by the holder while
+// it holds the loan (controller 0's single loan: at most one block loan is live). aarch64: no count, nothing to shed.
+
+/// XHCILOANFAILHOLD: the live block loan was shed (set by `xhci_loan_shed`, cleared at the take, read-and-cleared by
+/// `Drop` before the put).
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// XHCILOANFAILHOLD: `now_cycles` at the live block loan's take (its age).
+#[cfg(target_arch = "x86_64")]
+static LOAN_TAKEN_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// XHCILOANFAILHOLD: block loans shed this boot.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHED_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// XHCILOANFAILHOLD: at the take (loan held, preempt-off): stamp the loan's age, clear its shed mark.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_shed_arm() {
+    LOAN_TAKEN_AT.store(crate::arch::now_cycles(), core::sync::atomic::Ordering::Relaxed);
+    LOAN_SHED.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// XHCILOANFAILHOLD: `Drop`'s read of the shed mark, taken (cleared) while the loan is still held.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_shed_take() -> bool {
+    LOAN_SHED.swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// XHCILOANFAILHOLD: shed THIS CPU's live block loan if it has been held at least `gate_ms` — the publication withdrawn,
+/// the preempt-off count released, the mark set (Z69's `demote` shape). A no-op unless the published block holder is
+/// this CPU (so a non-block xHCI holder, or a loan already shed, never matches). Called only from the holder's own call
+/// chain (`xhci::XhciController::loan_shed_hook`) while it is still preempt-off, so the check and the release cannot
+/// interleave with a switch. The first shed of the boot is said once.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed(rung: &'static str, gate_ms: u64) {
+    use core::sync::atomic::Ordering;
+    let me = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+    if BLOCK_LOAN_CPU.load(Ordering::Acquire) != me || LOAN_SHED.load(Ordering::Relaxed) {
+        return;
+    }
+    let waited_ms = crate::arch::now_cycles().wrapping_sub(LOAN_TAKEN_AT.load(Ordering::Relaxed)) / wait::cycles_ms(1).max(1);
+    if waited_ms < gate_ms {
+        return;
+    }
+    if BLOCK_LOAN_CPU.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    crate::arch::sched::preemptoff::enable();
+    LOAN_SHED.store(true, Ordering::Release);
+    if LOAN_SHED_N.fetch_add(1, Ordering::Relaxed) == 0 {
+        serial_println!(
+            "[xhci] loan shed cpu={} rung={} waited_ms={} (XHCILOANFAILHOLD Z66, first shed, once)",
+            me - 1,
+            rung,
+            waited_ms
+        );
+    }
+}
+
+/// XHCILOANFAILHOLD: block loans shed this boot (`loan_shed=` on the PREEMPTAUDIT line).
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed_count() -> u32 {
+    LOAN_SHED_N.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// ══════════ XHCILOANSHEDKAT (zenbook-ledger Z71) — `tests preemptaudit` drives the block loan's shed ══════════
+//
+// TAIL-APPENDED after Z66 (no line above moves). `loan_shed=` reads 0 on every healthy boot, so Z66's shed had never run
+// under a test. The honest unit: the KAT takes the block loan through the ONE claim path (`claim_xhci_for_io`) and calls
+// `xhci_loan_shed` on it directly (`XhciController::loan_shed_hook` is a private rung/gate picker over exactly this call
+// and needs a live mid-BOT controller: owed XHCILOAN-SHEDHOOK-KAT). Legs: the gate (a 60 s gate changes nothing), the
+// shed (count back to its pre-take value — 0, read by `preemptoff::witness` false -> true -> false — publication 0, the
+// claim kept, `LOAN_SHED_N` +1), a MASKED contender on a sibling CPU answered Busy why=holder-preemptible inside
+// `LOAN_MASKED_WAIT_MS` while the holder waits preemptible, and the shed-aware Drop under the KAT's own extra `disable`
+// (a double release would read the count free). The KAT gives back what it spent (B1034 `full_kat`'s shape): its
+// `LOAN_SHED_N`, the contender's `LOAN_MASKED_BUSY`, `LOAN_LAST_WHY`, and neither once-line (`[xhci] loan shed`,
+// `[xhci] loan masked claim`) is said by it. The shed statics are written only by the ONE block-loan holder — the KAT
+// for the whole window. A real masked refusal inside the contender's ~ms window is still counted, but its once-line is
+// silenced if it was the boot's first. Owed: XHCILOAN-SHEDKAT-CONTROL (a pre-shed contender go-red leg).
+
+/// XHCILOANSHEDKAT contender handshake: 0 waiting, then the masked claim's outcome — 1 Ok, 2 Busy, 3 NotReady, 4 error.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHEDKAT_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// XHCILOANSHEDKAT: the contender's `LOAN_LAST_WHY` read right after its claim.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHEDKAT_WHY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// XHCILOANSHEDKAT: µs the contender's masked claim took.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHEDKAT_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// XHCILOANSHEDKAT contender (a task on a sibling CPU): one MASKED `claim_xhci_for_io` against the KAT's shed loan,
+/// timed; the outcome, the refusal's why and the µs published for the KAT.
+#[cfg(target_arch = "x86_64")]
+fn loan_shed_contender(_: usize) {
+    use core::sync::atomic::Ordering;
+    let (code, why, cycles) = crate::arch::without_interrupts(|| {
+        let t0 = crate::arch::now_cycles();
+        let r = claim_xhci_for_io();
+        let c = crate::arch::now_cycles().wrapping_sub(t0);
+        let code = match &r {
+            Ok(_) => 1u8,
+            Err(BlockError::Busy) => 2,
+            Err(BlockError::NotReady) => 3,
+            Err(_) => 4,
+        };
+        let why = LOAN_LAST_WHY.load(Ordering::Relaxed);
+        drop(r);
+        (code, why, c)
+    });
+    LOAN_SHEDKAT_WHY.store(why, Ordering::Relaxed);
+    LOAN_SHEDKAT_US.store(cycles.saturating_mul(1000) / wait::cycles_ms(1).max(1), Ordering::Relaxed);
+    LOAN_SHEDKAT_STATE.store(code, Ordering::Release);
+}
+
+/// XHCILOANSHEDKAT: `tests preemptaudit`'s shed leg (`loan_shed_kat=`): `ok`, `skip(masked|no-xhci|one-cpu)`, or the
+/// first failed check — `claim-busy` / `claim-notready` / `held-before` / `not-held` / `gate-ignored` / `not-released` /
+/// `still-published` / `claim-lost` / `not-counted` / `contender-got` / `contender-waited` / `contender-late` /
+/// `double-release` / `mark-kept`.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed_kat() -> &'static str {
+    use core::sync::atomic::Ordering;
+    use crate::arch::sched::preemptoff;
+    if crate::arch::irqs_masked() {
+        return "skip(masked)";
+    }
+    if matches!(xhci::claim(), Err(XhciClaimError::NotReady)) {
+        return "skip(no-xhci)";
+    }
+    let me = crate::arch::percpu::this_cpu().cpu_index as usize;
+    let cpu = crate::arch::sched::sibling_online_cpu(me);
+    if cpu == me {
+        return "skip(one-cpu)";
+    }
+    if preemptoff::witness().0 {
+        return "held-before";
+    }
+    let loan = match claim_xhci_for_io() {
+        Ok(l) => l,
+        Err(BlockError::NotReady) => return "claim-notready",
+        Err(_) => return "claim-busy",
+    };
+    // The take holds the count (no switch, no migration until the shed); the mask keeps the shed and its reads on
+    // one CPU. The pre-bump keeps the boot's "first shed, once" line for a real shed; every count is given back.
+    let shed: Result<(), &'static str> = crate::arch::without_interrupts(|| {
+        let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+        if !preemptoff::witness().0 || BLOCK_LOAN_CPU.load(Ordering::Acquire) != tag {
+            return Err("not-held");
+        }
+        let n0 = LOAN_SHED_N.fetch_add(1, Ordering::Relaxed);
+        let legs = || -> Result<(), &'static str> {
+            xhci_loan_shed("kat", 60_000);
+            if !preemptoff::witness().0
+                || BLOCK_LOAN_CPU.load(Ordering::Acquire) != tag
+                || LOAN_SHED.load(Ordering::Acquire)
+                || LOAN_SHED_N.load(Ordering::Relaxed) != n0.wrapping_add(1)
+            {
+                return Err("gate-ignored");
+            }
+            xhci_loan_shed("kat", 0);
+            if preemptoff::witness().0 {
+                return Err("not-released");
+            }
+            if BLOCK_LOAN_CPU.load(Ordering::Acquire) != 0 {
+                return Err("still-published");
+            }
+            if !matches!(xhci::claim(), Err(XhciClaimError::Busy)) {
+                return Err("claim-lost");
+            }
+            if LOAN_SHED_N.load(Ordering::Relaxed) != n0.wrapping_add(2) || !LOAN_SHED.load(Ordering::Acquire) {
+                return Err("not-counted");
+            }
+            Ok(())
+        };
+        let r = legs();
+        let n1 = LOAN_SHED_N.load(Ordering::Relaxed);
+        LOAN_SHED_N.fetch_sub(n1.wrapping_sub(n0), Ordering::Relaxed);
+        r
+    });
+    if let Err(w) = shed {
+        return w;
+    }
+    // The masked contender on the sibling CPU; this holder waits PREEMPTIBLE (the shed's point).
+    let prior_said = LOAN_REFUSAL_SAID.swap(true, Ordering::AcqRel);
+    let prior_why = LOAN_LAST_WHY.load(Ordering::Relaxed);
+    LOAN_SHEDKAT_STATE.store(0, Ordering::Release);
+    crate::arch::sched::spawn("loanshed-kat", loan_shed_contender, 0, cpu, crate::arch::sched::PRIO_HIGH);
+    let came = wait::bounded(1000, || LOAN_SHEDKAT_STATE.load(Ordering::Acquire) != 0);
+    let code = LOAN_SHEDKAT_STATE.load(Ordering::Acquire);
+    if code == 2 {
+        LOAN_MASKED_BUSY.fetch_sub(1, Ordering::Relaxed);
+    }
+    LOAN_LAST_WHY.store(prior_why, Ordering::Relaxed);
+    if !prior_said {
+        LOAN_REFUSAL_SAID.store(false, Ordering::Release);
+    }
+    let why = LOAN_SHEDKAT_WHY.load(Ordering::Relaxed);
+    let us = LOAN_SHEDKAT_US.load(Ordering::Relaxed);
+    if !came {
+        return "contender-late";
+    }
+    if code == 1 {
+        return "contender-got";
+    }
+    if !(code == 2 && why == 1 && us < LOAN_MASKED_WAIT_MS.saturating_mul(1000)) {
+        return "contender-waited";
+    }
+    // The shed-aware Drop under this KAT's own hold: the put, and no second release (a double one reads the count free).
+    preemptoff::disable();
+    drop(loan);
+    let (held, _) = preemptoff::witness();
+    let mark = LOAN_SHED.load(Ordering::Acquire);
+    preemptoff::enable();
+    if !held {
+        return "double-release";
+    }
+    if mark {
+        return "mark-kept";
+    }
+    "ok"
 }

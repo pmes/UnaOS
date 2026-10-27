@@ -233,7 +233,7 @@ pub fn open(path: &str) -> Result<(usize, usize), String> {
     }
     *STATE.lock() = Some(st);
     WIN.store(id, Ordering::Relaxed);
-    wm::winid_register_holder(&WIN, "textedit");
+    wm::winid_register_close_hook(&WIN, "textedit", close_hook); // WMCLOSEHOOK (rmbp-ledger B1038): a close behind our back frees STATE (file tail)
     wm::focus_changed(OWNER);
     let _ = wm::present(id);
     serial_println!("[edit] open win={} path={} bytes={} lines={} cols={} vis={}", id, path, n_bytes, n_lines, cols, vis);
@@ -749,4 +749,19 @@ pub fn textscale_rows() -> (usize, bool) {
     let fits = cols >= 8 && vis >= 2 && 2 * PAD() + vis * ch <= WIN_H();
     let relaid = STATE.lock().as_ref().is_none_or(|st| (st.cols, st.vis) == super::fileview::grid_fit(st.w, st.h, cw, ch));
     (vis, fits && relaid)
+}
+
+// ── WMCLOSEHOOK (rmbp-ledger B1038, BP-video-18 kept) — FILE-TAIL. A close behind this window's back (the furniture disc,
+// `wm::close_all_furniture` at a Log Out) cleared `WIN` through wm's WINID registry, so [`close`] returned at its
+// `WIN_NONE` guard and STATE (with its surface) stayed. `wm::close` now runs this hook after the drain, with no wm lock
+// held: STATE is taken iff its surface is the one the closed row seated (a reopen builds a fresh one), dropped outside the lock.
+fn close_hook(_id: wm::WinId, surf: usize) {
+    let st = {
+        let mut g = STATE.lock();
+        if g.as_ref().map(|s| s.surf.as_ptr() as usize) == Some(surf) { g.take() } else { None }
+    };
+    if st.is_some() {
+        crate::video::dialog::unsaved_declare(OWNER, b"", false); // DIALOG2, as `close`: nothing of ours is unsaved any more
+    }
+    drop(st);
 }
