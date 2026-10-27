@@ -436,7 +436,7 @@ pub fn bootstrap_browser_chrome(window: &NSWindow, toolbar: crate::tetra::TetraN
     tab_strip::hug(&bar, 1);
     let find = find_bar::bootstrap_find_bar(synapse.clone());
     let strips = tab_strip::bootstrap_tab_strips(synapse.clone(), find_bar::find_toggle(&find));
-    let page = tetra_eval::eval_tetra(crate::tetra::TetraNode::Surface { id: "viewport".into() }, synapse.clone());
+    let page = tetra_eval::eval_tetra(crate::tetra::TetraNode::Surface { id: "viewport".into() }, synapse.clone()); gpu_view::attach_page(&page);
     let downloads = downloads::bootstrap_downloads(synapse.clone());
     install_tab_keys(&bar, &find, &synapse);
     let status = status_line::bootstrap_status_line(synapse);

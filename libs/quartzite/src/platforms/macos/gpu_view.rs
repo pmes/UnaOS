@@ -470,28 +470,7 @@ impl FacetGpuView {
         let Some(layer) = layer else {
             return (0, 0);
         };
-        let scale: f64 = match self.window() {
-            Some(w) => unsafe { msg_send![&w, backingScaleFactor] },
-            None => unsafe { msg_send![&*layer, contentsScale] },
-        };
-        let scale = if scale > 0.0 { scale } else { 1.0 };
-        let bounds = self.bounds();
-        let want = NSSize::new(
-            (bounds.size.width * scale).round().max(1.0),
-            (bounds.size.height * scale).round().max(1.0),
-        );
-        unsafe {
-            let cur_scale: f64 = msg_send![&*layer, contentsScale];
-            let cur: NSSize = msg_send![&*layer, drawableSize];
-            if cur_scale != scale || cur.width != want.width || cur.height != want.height {
-                let _: () = msg_send![class!(CATransaction), begin];
-                let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-                let _: () = msg_send![&*layer, setContentsScale: scale];
-                let _: () = msg_send![&*layer, setDrawableSize: want];
-                let _: () = msg_send![class!(CATransaction), commit];
-            }
-        }
-        (want.width as u32, want.height as u32)
+        sync_metal_layer(self, &layer)
     }
 
     /// The on-demand redraw: sync the layer metrics, hand the current dest
@@ -764,37 +743,18 @@ where
     let view = FacetGpuView::new(mtm, frame);
 
     // The CAMetalLayer, via class!/msg_send! — quartzite's Cargo.toml stays
-    // zero-diff (no objc2-quartz-core edge).
-    let layer: Retained<AnyObject> = unsafe {
-        let l: *mut AnyObject = msg_send![class!(CAMetalLayer), new];
-        match Retained::from_raw(l) {
-            Some(l) => l,
-            None => {
-                log::warn!("[FACET] bootstrap_gpu_view: CAMetalLayer alloc failed (no Metal?)");
-                return None;
-            }
-        }
-    };
-
+    // zero-diff (no objc2-quartz-core edge); contentsScale and the sRGB pin
+    // are `metal_layer`'s, shared with the Aether page (AETHERMACGPU SR309).
     let scale: f64 = unsafe { msg_send![window, backingScaleFactor] };
     let scale = if scale > 0.0 { scale } else { 1.0 };
+    let Some(layer) = metal_layer(scale) else {
+        log::warn!("[FACET] bootstrap_gpu_view: CAMetalLayer alloc failed (no Metal?)");
+        return None;
+    };
     let dw = (init_w * scale).round().max(1.0);
     let dh = (init_h * scale).round().max(1.0);
     unsafe {
-        let _: () = msg_send![&*layer, setContentsScale: scale];
         let _: () = msg_send![&*layer, setDrawableSize: NSSize::new(dw, dh)];
-
-        // Pin the layer to sRGB: euclase renders into an sRGB swapchain, and
-        // tagging the layer makes the window server present those bytes the
-        // same way AppKit presents the CPU path's sRGB-tagged bitmap on a P3
-        // display — the eye-witness color axis.
-        let srgb_ns: *mut AnyObject = msg_send![class!(NSColorSpace), sRGBColorSpace];
-        if !srgb_ns.is_null() {
-            let cg: *mut CGColorSpace = msg_send![srgb_ns, CGColorSpace];
-            if !cg.is_null() {
-                let _: () = msg_send![&*layer, setColorspace: cg];
-            }
-        }
 
         // Layer-HOSTING: setLayer: before setWantsLayer: (the AppKit contract
         // for supplying your own layer).
@@ -813,4 +773,481 @@ where
     view.request_render();
 
     Some(Retained::into_super(view))
+}
+
+// ---------------------------------------------------------------------------
+// THE SHARED LAYER MECHANISM (facet's view and the Aether page, AETHERMACGPU SR309)
+// ---------------------------------------------------------------------------
+
+/// A new `CAMetalLayer` at `scale` (contentsScale), pinned to sRGB: euclase
+/// renders into an sRGB swapchain and the page's bytes are sRGB, and tagging
+/// the layer makes the window server present those bytes the same way AppKit
+/// presents the CPU path's sRGB-tagged bitmap on a P3 display — the
+/// eye-witness color axis. `None` if the class will not allocate (no Metal).
+fn metal_layer(scale: f64) -> Option<Retained<AnyObject>> {
+    unsafe {
+        let l: *mut AnyObject = msg_send![class!(CAMetalLayer), new];
+        let layer = Retained::from_raw(l)?;
+        let _: () = msg_send![&*layer, setContentsScale: scale];
+        let srgb_ns: *mut AnyObject = msg_send![class!(NSColorSpace), sRGBColorSpace];
+        if !srgb_ns.is_null() {
+            let cg: *mut CGColorSpace = msg_send![srgb_ns, CGColorSpace];
+            if !cg.is_null() {
+                let _: () = msg_send![&*layer, setColorspace: cg];
+            }
+        }
+        Some(layer)
+    }
+}
+
+/// Keep a metal layer's `contentsScale` and `drawableSize` in lockstep with
+/// `view`'s live bounds and backing scale. Returns the drawable size in
+/// pixels.
+fn sync_metal_layer(view: &NSView, layer: &AnyObject) -> (u32, u32) {
+    let scale: f64 = match view.window() {
+        Some(w) => unsafe { msg_send![&w, backingScaleFactor] },
+        None => unsafe { msg_send![layer, contentsScale] },
+    };
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let bounds = view.bounds();
+    let want = NSSize::new(
+        (bounds.size.width * scale).round().max(1.0),
+        (bounds.size.height * scale).round().max(1.0),
+    );
+    unsafe {
+        let cur_scale: f64 = msg_send![layer, contentsScale];
+        let cur: NSSize = msg_send![layer, drawableSize];
+        if cur_scale != scale || cur.width != want.width || cur.height != want.height {
+            let _: () = msg_send![class!(CATransaction), begin];
+            let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+            let _: () = msg_send![layer, setContentsScale: scale];
+            let _: () = msg_send![layer, setDrawableSize: want];
+            let _: () = msg_send![class!(CATransaction), commit];
+        }
+    }
+    (want.width as u32, want.height as u32)
+}
+
+// ---------------------------------------------------------------------------
+// THE AETHER PAGE SURFACE (AETHERMACGPU, LEDGER SR309)
+// ---------------------------------------------------------------------------
+//
+// The browser chrome's page (`image_view::bootstrap_image_surface`, a
+// `FacetImageView` in browser mode) gets a non-hit-testing child view whose
+// hosted `CAMetalLayer` shows each `SurfaceBlit`: ONE `MTLTexture` in
+// `RGBA8Unorm` (the Surface contract's RGBA8 bytes as they are: no swizzle),
+// refreshed by `replaceRegion` (the whole frame: a blit carries no damage
+// rect), drawn as one quad by a shader compiled at runtime from `PAGE_MSL`
+// (no .metal build step), presented once per blit. The fragment premultiplies
+// the contract's straight alpha (NLE2-ORDER-MACALPHA) and the layer is not
+// opaque, so a translucent page pixel composites over what is under the
+// layer. Every event still lands on the parent: its browser input path is
+// untouched. Raw Metal over `msg_send!` keeps quartzite's Cargo.toml and the
+// lock unchanged; `MTLCreateSystemDefaultDevice` nil keeps the CPU blit.
+
+#[link(name = "Metal", kind = "framework")]
+unsafe extern "C" {
+    fn MTLCreateSystemDefaultDevice() -> *mut AnyObject;
+}
+
+/// `MTLPixelFormatRGBA8Unorm` (the page texture) and `MTLPixelFormatBGRA8Unorm` (the layer's drawables).
+const MTL_RGBA8_UNORM: usize = 70;
+const MTL_BGRA8_UNORM: usize = 80;
+/// `MTLLoadActionClear`, `MTLStoreActionStore`, `MTLPrimitiveTypeTriangleStrip`.
+const MTL_LOAD_CLEAR: usize = 2;
+const MTL_STORE_STORE: usize = 1;
+const MTL_TRIANGLE_STRIP: usize = 4;
+/// NSViewWidthSizable (2) | NSViewHeightSizable (16): the page view follows its parent's size.
+const AUTORESIZE_FILL: usize = 18;
+
+// The Metal value structs, encoded as objc2-metal 0.3.2 encodes them
+// (anonymous C structs: `{?=QQQ}`, `{?={?=QQQ}{?=QQQ}}`, `{?=dddd}`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MtlOrigin {
+    x: usize,
+    y: usize,
+    z: usize,
+}
+unsafe impl objc2::encode::Encode for MtlOrigin {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Struct(
+        "?",
+        &[
+            <usize as objc2::encode::Encode>::ENCODING,
+            <usize as objc2::encode::Encode>::ENCODING,
+            <usize as objc2::encode::Encode>::ENCODING,
+        ],
+    );
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MtlSize {
+    width: usize,
+    height: usize,
+    depth: usize,
+}
+unsafe impl objc2::encode::Encode for MtlSize {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Struct(
+        "?",
+        &[
+            <usize as objc2::encode::Encode>::ENCODING,
+            <usize as objc2::encode::Encode>::ENCODING,
+            <usize as objc2::encode::Encode>::ENCODING,
+        ],
+    );
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MtlRegion {
+    origin: MtlOrigin,
+    size: MtlSize,
+}
+unsafe impl objc2::encode::Encode for MtlRegion {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Struct(
+        "?",
+        &[
+            <MtlOrigin as objc2::encode::Encode>::ENCODING,
+            <MtlSize as objc2::encode::Encode>::ENCODING,
+        ],
+    );
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MtlClearColor {
+    red: f64,
+    green: f64,
+    blue: f64,
+    alpha: f64,
+}
+unsafe impl objc2::encode::Encode for MtlClearColor {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Struct(
+        "?",
+        &[
+            <f64 as objc2::encode::Encode>::ENCODING,
+            <f64 as objc2::encode::Encode>::ENCODING,
+            <f64 as objc2::encode::Encode>::ENCODING,
+            <f64 as objc2::encode::Encode>::ENCODING,
+        ],
+    );
+}
+
+/// The page's two shaders, compiled at `attach_page`. The vertex stage makes a
+/// 4-vertex triangle strip from `vertex_id` over the quad `[left, top, right,
+/// bottom]` (`tetra::surface_ndc`) at buffer 0; texture row 0 is the page's top
+/// row (uv y = 0). The fragment samples the RGBA8 texture and premultiplies.
+const PAGE_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+struct PageV {
+    float4 pos [[position]];
+    float2 uv;
+};
+
+vertex PageV page_vs(uint vid [[vertex_id]], constant float4 &q [[buffer(0)]]) {
+    PageV o;
+    float2 c = float2((vid & 1u) ? q.z : q.x, (vid & 2u) ? q.w : q.y);
+    o.pos = float4(c, 0.0, 1.0);
+    o.uv = float2((vid & 1u) ? 1.0 : 0.0, (vid & 2u) ? 1.0 : 0.0);
+    return o;
+}
+
+fragment float4 page_fs(PageV v [[stage_in]], texture2d<float> t [[texture(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float4 c = t.sample(s, v.uv);
+    return float4(c.rgb * c.a, c.a);
+}
+"#;
+
+/// The page's Metal objects, built once at `attach_page`.
+pub struct PageMetal {
+    layer: Retained<AnyObject>,
+    device: Retained<AnyObject>,
+    queue: Retained<AnyObject>,
+    pipeline: Retained<AnyObject>,
+}
+
+pub struct PageGpuIvars {
+    /// The device, queue, pipeline and hosted layer (`None` until attached).
+    metal: RefCell<Option<PageMetal>>,
+    /// The ONE page texture and its pixel size; rebuilt only when a blit's size changes.
+    texture: RefCell<Option<(Retained<AnyObject>, u32, u32)>>,
+}
+
+define_class!(
+    #[unsafe(super(NSView))]
+    #[name = "UnaPageGpuView"]
+    #[ivars = PageGpuIvars]
+    pub struct PageGpuView;
+
+    impl PageGpuView {
+        #[unsafe(method_id(initWithFrame:))]
+        fn init_with_frame(this: Allocated<Self>, frame: NSRect) -> Retained<Self> {
+            let this = this.set_ivars(PageGpuIvars {
+                metal: RefCell::new(None),
+                texture: RefCell::new(None),
+            });
+            unsafe { msg_send![super(this), initWithFrame: frame] }
+        }
+
+        // Never the hit view: clicks, wheel, keys and tracking stay the
+        // parent page view's (its browser input path).
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, _point: NSPoint) -> *mut NSView {
+            std::ptr::null_mut()
+        }
+
+        // A resize re-presents the held texture at the new bounds (top-left
+        // pinned); the engine's reflowed blit follows its BrowserResize.
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, new_size: NSSize) {
+            let _: () = unsafe { msg_send![super(self), setFrameSize: new_size] };
+            self.draw();
+        }
+
+        #[unsafe(method(viewDidChangeBackingProperties))]
+        fn view_did_change_backing_properties(&self) {
+            let _: () = unsafe { msg_send![super(self), viewDidChangeBackingProperties] };
+            self.draw();
+        }
+    }
+);
+
+impl PageGpuView {
+    fn new(frame: NSRect) -> Retained<Self> {
+        let this: Allocated<Self> = unsafe { msg_send![Self::class(), alloc] };
+        unsafe { msg_send![this, initWithFrame: frame] }
+    }
+
+    /// Present the held texture: clear to the CPU page's white field (the band
+    /// a reflow has not covered yet), draw the 1:1 top-left quad, present.
+    fn draw(&self) {
+        let metal = self.ivars().metal.borrow();
+        let Some(m) = metal.as_ref() else {
+            return;
+        };
+        let held = self.ivars().texture.borrow();
+        let Some((tex, tw, th)) = held.as_ref() else {
+            return;
+        };
+        let bounds = self.bounds();
+        let Some(quad) = crate::tetra::surface_ndc(bounds.size.width, bounds.size.height, *tw, *th) else {
+            return;
+        };
+        let (dw, dh) = sync_metal_layer(self, &m.layer);
+        if dw == 0 || dh == 0 {
+            return;
+        }
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let drawable: *mut AnyObject = msg_send![&*m.layer, nextDrawable];
+            let Some(drawable) = drawable.as_ref() else {
+                return;
+            };
+            let target: *mut AnyObject = msg_send![drawable, texture];
+            let cmd: *mut AnyObject = msg_send![&*m.queue, commandBuffer];
+            let Some(cmd) = cmd.as_ref() else {
+                return;
+            };
+            let pass: *mut AnyObject = msg_send![class!(MTLRenderPassDescriptor), renderPassDescriptor];
+            let Some(pass) = pass.as_ref() else {
+                return;
+            };
+            let atts: *mut AnyObject = msg_send![pass, colorAttachments];
+            let ca: *mut AnyObject = msg_send![atts, objectAtIndexedSubscript: 0usize];
+            let Some(ca) = ca.as_ref() else {
+                return;
+            };
+            let _: () = msg_send![ca, setTexture: target];
+            let _: () = msg_send![ca, setLoadAction: MTL_LOAD_CLEAR];
+            let white = MtlClearColor { red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0 };
+            let _: () = msg_send![ca, setClearColor: white];
+            let _: () = msg_send![ca, setStoreAction: MTL_STORE_STORE];
+            let enc: *mut AnyObject = msg_send![cmd, renderCommandEncoderWithDescriptor: pass];
+            let Some(enc) = enc.as_ref() else {
+                return;
+            };
+            let _: () = msg_send![enc, setRenderPipelineState: &*m.pipeline];
+            let _: () = msg_send![
+                enc,
+                setVertexBytes: quad.as_ptr() as *const c_void,
+                length: std::mem::size_of_val(&quad),
+                atIndex: 0usize,
+            ];
+            let _: () = msg_send![enc, setFragmentTexture: &**tex, atIndex: 0usize];
+            let _: () = msg_send![
+                enc,
+                drawPrimitives: MTL_TRIANGLE_STRIP,
+                vertexStart: 0usize,
+                vertexCount: 4usize,
+            ];
+            let _: () = msg_send![enc, endEncoding];
+            let _: () = msg_send![cmd, presentDrawable: drawable];
+            let _: () = msg_send![cmd, commit];
+        });
+    }
+}
+
+/// Build the page's Metal objects and its layer; `Err` names the step that failed.
+fn page_metal() -> Result<(PageMetal, String), &'static str> {
+    unsafe {
+        let device = Retained::from_raw(MTLCreateSystemDefaultDevice()).ok_or("no Metal device")?;
+        let queue: *mut AnyObject = msg_send![&*device, newCommandQueue];
+        let queue = Retained::from_raw(queue).ok_or("newCommandQueue nil")?;
+        let src = NSString::from_str(PAGE_MSL);
+        let lib: *mut AnyObject = msg_send![
+            &*device,
+            newLibraryWithSource: &*src,
+            options: None::<&AnyObject>,
+            error: std::ptr::null_mut::<*mut AnyObject>(),
+        ];
+        let lib = Retained::from_raw(lib).ok_or("page shader compile failed")?;
+        let vs: *mut AnyObject = msg_send![&*lib, newFunctionWithName: &*NSString::from_str("page_vs")];
+        let vs = Retained::from_raw(vs).ok_or("page_vs missing")?;
+        let fs: *mut AnyObject = msg_send![&*lib, newFunctionWithName: &*NSString::from_str("page_fs")];
+        let fs = Retained::from_raw(fs).ok_or("page_fs missing")?;
+        let desc: *mut AnyObject = msg_send![class!(MTLRenderPipelineDescriptor), new];
+        let desc = Retained::from_raw(desc).ok_or("pipeline descriptor nil")?;
+        let _: () = msg_send![&*desc, setVertexFunction: &*vs];
+        let _: () = msg_send![&*desc, setFragmentFunction: &*fs];
+        let atts: *mut AnyObject = msg_send![&*desc, colorAttachments];
+        let ca0: *mut AnyObject = msg_send![atts, objectAtIndexedSubscript: 0usize];
+        let ca0 = ca0.as_ref().ok_or("pipeline colour attachment nil")?;
+        // No blending: the quad writes premultiplied pixels over the clear.
+        let _: () = msg_send![ca0, setPixelFormat: MTL_BGRA8_UNORM];
+        let pipe: *mut AnyObject = msg_send![
+            &*device,
+            newRenderPipelineStateWithDescriptor: &*desc,
+            error: std::ptr::null_mut::<*mut AnyObject>(),
+        ];
+        let pipeline = Retained::from_raw(pipe).ok_or("page pipeline build failed")?;
+        // The scale is re-read from the window at every draw (`sync_metal_layer`).
+        let layer = metal_layer(1.0).ok_or("CAMetalLayer nil")?;
+        let _: () = msg_send![&*layer, setDevice: &*device];
+        let _: () = msg_send![&*layer, setPixelFormat: MTL_BGRA8_UNORM];
+        let _: () = msg_send![&*layer, setFramebufferOnly: true];
+        let _: () = msg_send![&*layer, setOpaque: false];
+        let name: Option<Retained<NSString>> = msg_send![&*device, name];
+        let name = name.map(|n| n.to_string()).unwrap_or_else(|| String::from("unnamed"));
+        Ok((PageMetal { layer, device, queue, pipeline }, name))
+    }
+}
+
+/// AETHERMACGPU (SR309): the choice at the chrome's bootstrap. With a Metal
+/// device, `page` (the browser page view) gets the GPU child view and every
+/// later blit goes to it ([`page_frame`]); without one, nothing changes and the
+/// CPU blit draws. ONE log line names the choice. Main thread only.
+pub fn attach_page(page: &NSView) {
+    let (m, name) = match page_metal() {
+        Ok(built) => built,
+        Err(why) => {
+            log::info!("[surface] page: cpu blit ({why})");
+            return;
+        }
+    };
+    let view = PageGpuView::new(page.bounds());
+    unsafe {
+        let _: () = msg_send![&view, setAutoresizingMask: AUTORESIZE_FILL];
+        // Layer-HOSTING: setLayer: before setWantsLayer:.
+        let _: () = msg_send![&view, setLayer: &*m.layer];
+        let _: () = msg_send![&view, setWantsLayer: true];
+    }
+    *view.ivars().metal.borrow_mut() = Some(m);
+    unsafe {
+        let _: () = msg_send![page, addSubview: &*view];
+    }
+    log::info!("[surface] page: metal ({name})");
+}
+
+/// The page's GPU child view, if [`attach_page`] gave it one.
+fn page_view(page: &NSView) -> Option<Retained<PageGpuView>> {
+    unsafe {
+        let subs: *mut AnyObject = msg_send![page, subviews];
+        let subs = subs.as_ref()?;
+        let n: usize = msg_send![subs, count];
+        for i in 0..n {
+            let v: *mut AnyObject = msg_send![subs, objectAtIndex: i];
+            if v.is_null() {
+                continue;
+            }
+            let is_page: bool = msg_send![v, isKindOfClass: PageGpuView::class()];
+            if is_page {
+                return Retained::retain(v as *mut PageGpuView);
+            }
+        }
+        None
+    }
+}
+
+/// AETHERMACGPU (SR309): one `SurfaceBlit` (RGBA8, straight alpha, stride
+/// `width * 4`) to the page's GPU view: the texture is rebuilt only when the
+/// size changes, filled whole by `replaceRegion`, and presented. `false` when
+/// the page has no GPU view (the CPU blit draws); a texture that will not
+/// allocate detaches the GPU view so the CPU blit takes over. Main thread only.
+pub fn page_frame(page: &NSView, rgba: &[u8], width: u32, height: u32) -> bool {
+    let Some(view) = page_view(page) else {
+        return false;
+    };
+    let expected = width as usize * height as usize * 4;
+    if width == 0 || height == 0 || rgba.len() < expected {
+        return false;
+    }
+    {
+        let metal = view.ivars().metal.borrow();
+        let Some(m) = metal.as_ref() else {
+            return false;
+        };
+        let mut slot = view.ivars().texture.borrow_mut();
+        let same = matches!(slot.as_ref(), Some((_, w, h)) if *w == width && *h == height);
+        if !same {
+            let tex = unsafe {
+                let desc: *mut AnyObject = msg_send![
+                    class!(MTLTextureDescriptor),
+                    texture2DDescriptorWithPixelFormat: MTL_RGBA8_UNORM,
+                    width: width as usize,
+                    height: height as usize,
+                    mipmapped: false,
+                ];
+                if desc.is_null() {
+                    None
+                } else {
+                    let t: *mut AnyObject = msg_send![&*m.device, newTextureWithDescriptor: desc];
+                    Retained::from_raw(t)
+                }
+            };
+            match tex {
+                Some(t) => *slot = Some((t, width, height)),
+                None => {
+                    log::warn!("[surface] page: {width}x{height} texture failed; cpu blit from here");
+                    *slot = None;
+                    drop(slot);
+                    drop(metal);
+                    unsafe {
+                        let _: () = msg_send![&view, removeFromSuperview];
+                    }
+                    return false;
+                }
+            }
+        }
+        let Some((tex, _, _)) = slot.as_ref() else {
+            return false;
+        };
+        let region = MtlRegion {
+            origin: MtlOrigin { x: 0, y: 0, z: 0 },
+            size: MtlSize { width: width as usize, height: height as usize, depth: 1 },
+        };
+        unsafe {
+            let _: () = msg_send![
+                &**tex,
+                replaceRegion: region,
+                mipmapLevel: 0usize,
+                withBytes: rgba.as_ptr() as *const c_void,
+                bytesPerRow: width as usize * 4,
+            ];
+        }
+    }
+    view.draw();
+    true
 }

@@ -414,6 +414,7 @@ impl FacetImageView {
             );
             return;
         }
+        if super::gpu_view::page_frame(self, rgba, width, height) { *self.ivars().size.borrow_mut() = (width, height); return; } // AETHERMACGPU (SR309): the Metal page takes the blit (size kept for the event mapping)
 
         let bytes_per_row = width as usize * 4;
         let rep: Retained<NSBitmapImageRep> = unsafe {

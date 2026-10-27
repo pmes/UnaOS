@@ -862,7 +862,7 @@ refs/heads/exec-rmbp-nle2mods   44d0e2b7a FOLDED-BY-HAND (this commit) 2026-10-2
 refs/heads/exec-rmbp-vorbistrim   ef3144396 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-gneisspalnostd   9bbbfa121 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle4bkernel   5da786379 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-aethermacgpu   5da786379 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aethermacgpu   667c333dd FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-h264enccabac   5da786379 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-hevcmain10   e8ed82064 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-aethermacdevtools   e8ed82064 IN-FLIGHT cut 2026-10-27
