@@ -193,6 +193,21 @@ if [ -n "${UNAOS_XHCI_PICK:-}" ]; then
     esac
     echo "⚡ xhci pick knob: ${UNAOS_XHCI_PICK} (x86 kernel only; the census line names the controller that ran)"
 fi
+# ZENBOOKLANE (zenbook-ledger Z13): UNAOS_PLATFORM=<token> is a TEST-ONLY platform override (hw.rs `platform_knob`,
+# option_env!, read only in a `witness` build; no plumbing: the builder's cargo inherits this environment). The token is
+# one `hw::Platform::token` prints; the kernel's `[hw] platform=<token> … src=knob` line says it ran. Never media: refused
+# on the card verbs (esp-zenbook unsets every inherited UNAOS_* before it re-enters esp-x86). `./arroyo test-zenbook` sets it.
+if [ -n "${UNAOS_PLATFORM:-}" ]; then
+    case "${UNAOS_PLATFORM}" in
+        macbookpro10_1|zenbook_um5606w|qemu) ;;
+        *) echo "✖ UNAOS_PLATFORM='${UNAOS_PLATFORM}': the platform knob is macbookpro10_1, zenbook_um5606w or qemu"; exit 1 ;;
+    esac
+    case "${1:-}" in
+        esp-*|esp_*|jetson*|kernel8|baremetal|selfup-pak|selfup_pak|vm-image|vm_image|vmimage|vm|fat-img|fat_img|fatimg)
+            echo "✖ UNAOS_PLATFORM is a QEMU-lane override and never rides media ('${1}'): unset it"; exit 1 ;;
+    esac
+    echo "⚡ platform knob: ${UNAOS_PLATFORM} (witness QEMU builds only; never media)"
+fi
 #
 # RTCCLOCK (R75) / CLOCKPAINTERS (B719): the display-offset build knob is RETIRED. The CMOS RTC is read and anchored
 # as UTC; the zone is Principia's `system.locale.tz` (Settings > Date & Time), applied when a second is printed
@@ -5572,10 +5587,17 @@ X86_SPLASH_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-splash.spec"
 X86_USBNET_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-usbnet.spec"
 X86_WC_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-wc.spec"         # WCLANE (B156): the compositor leg, UNAOS_WC=1 UNAOS_QUARRY=1 UNAOS_FTDIRX=1   # USBNET (SO56): the dongle-only leg, UNAOS_USBNET=1 UNAOS_NOE1000=1
 X86_PANEL_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-panel.spec"   # ZOOMPANEL (B842): the WC leg at the rMBP panel, UNAOS_FBW=2880 UNAOS_FBH=1800 UNAOS_PPI=221 + UNAOS_WC/FACET
+X86_ZENBOOK_SPEC="${WORKSPACE_DIR}/scripts/specs/x86-zenbook.spec"   # ZENBOOKLANE (zenbook-ledger Z13): `./arroyo test-zenbook`, the Zenbook line booted as zenbook_um5606w (UNAOS_PLATFORM)
 X86_REPLAY_SPEC=""   # path of the spec to replay, or "" when none describes this capture
 X86_REPLAY_WHY=""    # why there is none — printed verbatim in the skip line
 x86_pick_capture_spec() {
     X86_REPLAY_SPEC=""; X86_REPLAY_WHY=""
+    # ZENBOOKLANE (zenbook-ledger Z13): `UNAOS_ZENBOOKLANE` is set only by `test_zenbook`'s re-exec. Asked FIRST: the Zenbook
+    # line arms UNAOS_SELFHOST, whose arm below would skip the replay; this lane stubs the selfbuild staging and has its own spec.
+    if [ -n "${UNAOS_ZENBOOKLANE:-}" ]; then
+        X86_REPLAY_SPEC="$X86_ZENBOOK_SPEC"
+        return 0
+    fi
     if [ -n "${UNAOS_SELFHOST:-}" ]; then
         X86_REPLAY_WHY="UNAOS_SELFHOST is armed — test-selfhost packs SOURCE-ALONG onto the fixture, so this is not the capture x86-fat.spec was measured against. That lane's verdict is its own 'SELFHOST: src verified … -> PASS ::' witness."
         return 0
@@ -10542,6 +10564,36 @@ test_splash() {
     return $_rc
 }
 
+# ZENBOOKLANE (zenbook-ledger Z13): `./arroyo test-zenbook [secs]` — THE ZENBOOK LINE, BOOTED UNDER QEMU AS THE ZENBOOK.
+# The Zenbook-only kernel arms (Z8's EC census, Z10's gop_ignite, Z11's S2 gate) answer `hw::platform()`, which q35
+# resolves as `qemu`, so no QEMU leg reached them (GOPIGNITE-FIXTURE, Z10). This verb boots scripts/image-line-zenbook.env
+# with UNAOS_PLATFORM=zenbook_um5606w (hw.rs `platform_knob`, witness builds only — the line carries WITNESS).
+# FIRST PASS: esp-zenbook's scrub (every inherited UNAOS_* unset bar the QEMU machine / QMP port), the line sourced minus
+# its `# [media]` rows (the MT7925 firmware path: QEMU stages none), then the re-exec with the lane's four additions —
+# the marker, the platform, UNAOS_CENSUS (gop-ignite's line is census_println) and UNAOS_USBSERIAL (twoboot-knobs.env:
+# QEMU attaches the FTDI the metal wire is). `tests-at-boot` stays OFF (this verb is not in the head arming case): the
+# metal shape, as twoboot boots it.
+# SECOND PASS: twoboot's arm, three idioms: a fresh card (target/sdcard.img deleted, so the store is empty and the boot
+# reaches the first-user form), the lane's own spec as X86_TEST_SPEC (its COMPLETE ends FASTTEST's wall; its REQUIREs are
+# scored by `x86_test_completion` and replayed by `x86_spec_replay`), and SELFBUILD's toolchain staging stubbed (the line
+# arms SELFHOST). Then `test_x86_64`, whose verdict is this verb's. The typed `tests platform|ec|nvme|i8042` verdicts need
+# a session (the first-user form typed): ZENBOOK-LANETYPED, owed.
+test_zenbook() {
+    local secs="${1:-90}"
+    if [ -z "${UNAOS_ZENBOOKLANE:-}" ]; then
+        local _zk="" _zv
+        for _zv in $(compgen -e); do case "$_zv" in UNAOS_QEMU_MACHINE|UNAOS_QMP_PORT) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
+        echo -e "${COLOR_CYAN}⚡ test-zenbook: line=scripts/image-line-zenbook.env (minus [media]) scrubbed=[${_zk# }] platform=zenbook_um5606w${COLOR_RESET}"
+        set -a; . <(awk '!index($0, "# [media]")' "$WORKSPACE_DIR/scripts/image-line-zenbook.env") || exit 1; set +a
+        exec env UNAOS_ZENBOOKLANE=1 UNAOS_PLATFORM=zenbook_um5606w UNAOS_CENSUS=1 UNAOS_USBSERIAL=1 "$0" test-zenbook "$secs"
+    fi
+    echo -e "${COLOR_CYAN}⚡ ZENBOOKLANE: the Zenbook line as zenbook_um5606w on a fresh card, to the first-user form (${secs}s wall, spec ${X86_ZENBOOK_SPEC#${WORKSPACE_DIR}/})${COLOR_RESET}"
+    rm -f "${WORKSPACE_DIR}/target/sdcard.img"
+    X86_TEST_SPEC="$X86_ZENBOOK_SPEC"
+    build_selfbuild_x86() { echo "   ZENBOOKLANE: SELFBUILD staging not entered (build_selfbuild_x86 stubbed, as the twoboot arm does)"; }
+    test_x86_64 "$secs"
+}
+
 # SPLASHGATE — the two splash witnesses are IN THE BOOTED ELF, counted, with both controls.
 #
 # THE SHAPE IS `banner_artifact_check`'s and the controls are the same pair, for its reason: a `grep`
@@ -14729,7 +14781,7 @@ jobs_image() {
 # plants GATEREVIEW's table proved each gate catches) in a scratch copy of the tree, runs that gate through
 # `_gates_one` there, and needs a non-zero rc whose log names the plant. Witness (host):
 #   GATEPATH selftest: plants=<n> caught=<n> -> PASS
-GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py nonetreach:unaos/scripts/nonet-reach.py neutral:tools/neutral-check.py firmware:tools/firmware-census.py locktype:unaos/scripts/lock-type.py"
+GATES_SET="charter:unaos/scripts/charter-check.sh arch:unaos/scripts/arch-check.py attrkeys:unaos/scripts/attrkeys-check.py status:tools/status-check.py prefs:tools/prefs-schema-check.py appearance:unaos/scripts/appearance-check.py deps:tools/deps-audit/run.py knob:unaos/scripts/knob-hygiene.sh verbs:unaos/scripts/verb-roots.sh banner:unaos/scripts/banner-cert.sh k8reach:unaos/scripts/k8-reach.py sanity:unaos/scripts/sanity-legs.py image-line:unaos/scripts/knob-parity.sh knob-parity-orin:unaos/scripts/knob-parity.sh knob-parity-pi:unaos/scripts/knob-parity.sh mbench-selftest:unaos/scripts/mbench.py specscore:unaos/scripts/orin-specscore.py blueprint:unaos/scripts/blueprint-check.py nonet:unaos/scripts/nonet-check.py nonetreach:unaos/scripts/nonet-reach.py neutral:tools/neutral-check.py firmware:tools/firmware-census.py locktype:unaos/scripts/lock-type.py knob-parity-zenbook:unaos/scripts/knob-parity.sh"
 # NEUTRAL (SR166 GATENEUTRAL, BP-shape-4, R16): no board name (orin/rmbp/pi4/jetson/tegra word parts) in an identifier or a
 # string of a shared kernel file (crates/kernel/src minus arch/); comments, `feature = "…"` gates, arch board-module paths
 # and ledger/round citations excepted; the ruled exceptions are tools/neutral.allow, one row + reason each, shrink-only.
@@ -14761,6 +14813,7 @@ _gates_one() { # $1 = repo root, $2 = gate name, $3 = log; prints the summary li
         image-line) e=(--line "$R/unaos/scripts/image-line.env") ;;   # FOLDBUILD (B517): the image build line's file against arroyo's knob map and the builder's
         knob-parity-orin) e=(--line "$R/unaos/scripts/image-line-orin.env" --board orin) ;;   # ARMPARITY: the Orin line against esp_jetson's top-level map, Cargo, banner-cert; shared knobs also against the x86 maps
         knob-parity-pi)   e=(--line "$R/unaos/scripts/image-line-pi.env" --board pi) ;;       # ARMPARITY: the Pi line against kernel8()'s K8_FEATS arms, Cargo, banner-cert, k8-reach; shared knobs also against the x86 maps
+        knob-parity-zenbook) e=(--line "$R/unaos/scripts/image-line-zenbook.env") ;;   # ZENBOOKLANE (zenbook-ledger Z13): LINEGATE — the Zenbook line (every knob x86) against arroyo's knob map and the builder's, the x86 `--line` mode
         mbench-selftest|specscore) e=(--self-test) ;;   # TOOLING1: the scorers' own self-tests (see GATES_SET)
         blueprint) e=("$R") ;;   # BLUEPRINT: the repo root (the sheets are docs/dev/blueprint/, the anchors are tree paths)
         nonet) e=("$R/unaos") ;;   # NONET (B672): the unaos dir (the walk reads crates/kernel/src)
@@ -14795,6 +14848,7 @@ _gates_plant() { # $1 = scratch repo root, $2 = gate: plants the defect, prints 
         image-line) printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line.env"; echo ZZGATEPLANT ;; # FOLDBUILD (B517); no restore is owed: no later gate reads image-line.env
         knob-parity-orin) printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line-orin.env"; echo ZZGATEPLANT ;; # ARMPARITY; no later gate reads image-line-orin.env
         knob-parity-pi)   printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line-pi.env"; echo ZZGATEPLANT ;;   # ARMPARITY; no later gate reads image-line-pi.env
+        knob-parity-zenbook) printf 'export UNAOS_ZZGATEPLANT=1  # GATEPATH plant: a knob no map names\n' >> "$C/unaos/scripts/image-line-zenbook.env"; echo ZZGATEPLANT ;;   # ZENBOOKLANE (Z13); no later gate reads image-line-zenbook.env
         mbench-selftest) sed -i 's/, r"-> FLICKER"\]/]/' "$C/unaos/scripts/mbench.py"; echo "SELF-TEST FAIL" ;; # TOOLING1: a default FORBID dropped from DEFAULT_FORBIDS — every spec silently stops forbidding it (renaming RC_TRUNCATED was tried first and MISSED: the self-test compares against the constant, so it moves with it)
         specscore)  sed -i 's/^    return DEAD, (f"the only site/    return WIRE, (f"the only site/' "$C/unaos/scripts/orin-specscore.py"; echo "SPECSCORE SELF-TEST FAIL" ;; # TOOLING1: a compiled-out emitter read as reachable — the coverage lie the tool exists to catch
         blueprint)  mkdir -p "$C/docs/dev/blueprint" && printf '| BP-zzgateplant-1 | plant | `unaos/zz_gateplant_nowhere.rs` | - |\n' > "$C/docs/dev/blueprint/zzgateplant.md"; echo zz_gateplant_nowhere ;; # BLUEPRINT: a sheet citing a file that is not in the tree
@@ -15019,6 +15073,11 @@ case "${1:-}" in
         # UNAOS_SPLASHLANE / UNAOS_WC / UNAOS_QEMU_FULL armed (see test_splash), so this arm is
         # entered twice per invocation. Fold-gate command, not a leg of `check`.
         test_splash "${2:-120}"
+        ;;
+    test-zenbook|test_zenbook)
+        # ZENBOOKLANE (zenbook-ledger Z13): the Zenbook line under QEMU as zenbook_um5606w. Re-execs itself (see
+        # test_zenbook), so this arm is entered twice per invocation. Fold-gate command, not a leg of `check`.
+        test_zenbook "${2:-90}"
         ;;
     kernel8|baremetal)
         _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do

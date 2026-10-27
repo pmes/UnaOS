@@ -778,7 +778,7 @@ pub fn platform() -> Platform {
 
 /// Resolve (once) and print `[hw] platform=… dmi="…" vendor="…" src=…`. Called first thing in `pci.rs init` and by
 /// `tests platform`.
-pub fn platform_say() {
+pub fn platform_say() { #[cfg(feature = "witness")] { platform_knob(); } // ZENBOOKLANE (zenbook-ledger Z13): a witness build's `UNAOS_PLATFORM` resolves PLAT first (body `platform_knob` at the file tail). LINE-NEUTRAL fold, code before the comment.
     let d = PLAT.call_once(resolve);
     serial_println!("[hw] platform={} dmi=\"{}\" vendor=\"{}\" src={}", platform().token(), d.product_str(), d.vendor_str(), d.src);
 }
@@ -891,4 +891,47 @@ fn pci_id_name(vendor: u16, device: u16) -> Option<&'static str> {
 /// QEMU, any Apple machine and a boot with no readable SMBIOS answer `false`, silently.
 fn ec_runs() -> bool {
     PLAT.get().is_some_and(|d| !kind_runs(d.kind))
+}
+
+// ── ZENBOOKLANE (zenbook-ledger Z13) — the test-only platform override — TAIL-APPENDED, so no line above moves ──────────
+// `UNAOS_PLATFORM=<token>` (`option_env!`, read ONLY in a `witness` build — the QEMU lanes'; arroyo refuses it on a media
+// verb and `esp-zenbook` unsets every inherited UNAOS_*) makes [`platform_say`]'s ONE resolution answer that token's kind
+// with `src=knob`, so a QEMU boot (`./arroyo test-zenbook`) runs the Zenbook-only arms: Z8's EC census, Z10's
+// `gop_ignite`, Z11's S2 gate. The DMI strings stay the machine's own. Unset or empty: nothing is written here and the
+// Once resolves as before. An unknown token keeps the resolved kind and says `src=knob-refused`.
+
+/// The build's platform token, `Some("")` folded to `None` so an EMPTY knob builds the UNSET bytes.
+#[cfg(feature = "witness")]
+const PLATFORM_KNOB: Option<&str> = match option_env!("UNAOS_PLATFORM") {
+    Some(s) if !s.is_empty() => Some(s),
+    _ => None,
+};
+
+/// ZENBOOKLANE (Z13): resolve [`PLAT`] under the build's `UNAOS_PLATFORM` before [`platform_say`]'s own `call_once`
+/// (the first `call_once` wins); a no-op when the knob is unset.
+#[cfg(feature = "witness")]
+fn platform_knob() {
+    let Some(tok) = PLATFORM_KNOB else { return };
+    PLAT.call_once(|| {
+        let mut d = resolve();
+        match knob_kind(tok) {
+            Some(k) => {
+                d.kind = k;
+                d.src = "knob";
+            }
+            None => d.src = "knob-refused",
+        }
+        d
+    });
+}
+
+/// The kind for a wire token, as [`Platform::token`] prints it.
+#[cfg(feature = "witness")]
+fn knob_kind(tok: &str) -> Option<u8> {
+    match tok {
+        "macbookpro10_1" => Some(K_MAC),
+        "zenbook_um5606w" => Some(K_ZENBOOK),
+        "qemu" => Some(K_QEMU),
+        _ => None,
+    }
 }
