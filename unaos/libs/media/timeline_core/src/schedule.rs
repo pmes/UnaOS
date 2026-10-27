@@ -4,10 +4,13 @@
 //! The render schedule (NLE1 M2, LEDGER SR194): what each output tick shows, in output order, and where a decoder
 //! must seek.
 //!
-//! Cut-only: at tick `t` the HIGHEST-numbered track of a kind with a clip at `t` wins (V2 over V1, A2 over A1);
-//! dissolves are NLE3 and the audio mix NLE4. For each output tick the schedule holds one video [`Step`] (`len` 1),
-//! then the audio step whose run starts at that tick, if any (an audio step covers one contiguous clip run or one gap
-//! run). A kind with no track gets no steps. A step with `src: None` is a gap: black, or silence.
+//! Video is cut-only: at tick `t` the HIGHEST-numbered video track with a clip at `t` wins (V2 over V1); its transitions are
+//! below. Audio is a MIX (NLE4, LEDGER SR203): [`audio_runs`] lists, per run, EVERY audio track's clip with its gain and
+//! fade envelope; a run is the longest span over which every audio track shows the same clip in the same envelope
+//! segment (fade-in, body, fade-out) or nothing. For each output tick the schedule holds one video [`Step`] (`len` 1),
+//! then the audio step whose run starts at that tick, if any: one step per [`AudioRun`], in the same order, whose
+//! `track` / `src` / `src_t` / `seek` are its TOP layer's (with one audio track, exactly NLE1's cut-only runs). A kind
+//! with no track gets no steps. A step with `src: None` is a gap: black, or silence.
 //!
 //! Keyframe-aware: the first step of a run whose source position does not continue the previous step of its kind (a
 //! cut to another source, or a jump inside the same one) carries `seek`: the keyframe at or before its source time,
@@ -96,24 +99,17 @@ fn top(tl: &Timeline, kind: Kind, t: i64) -> Option<(usize, usize)> {
 
 /// The schedule for output ticks `range` (see the module docs).
 pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Result<Vec<Step>, ScheduleError> {
-    if range.start < 0 || range.end < range.start {
-        return Err(ScheduleError::Range);
-    }
-    tl.validate().map_err(ScheduleError::Invalid)?;
-    for c in tl.tracks.iter().flat_map(|t| t.clips.iter()) {
-        if idx.duration(c.src).is_some_and(|d| c.src_out > d) {
-            return Err(ScheduleError::OutOfSource(c.src));
-        }
-    }
+    check(tl, &range, idx)?;
     handles_fit(tl, idx)?;
     let has = |k: Kind| tl.tracks.iter().any(|t| t.kind == k);
     let (video, audio) = (has(Kind::Video), has(Kind::Audio));
     let mut out = Vec::new();
-    // The previous step of each kind's (source, the source tick it would continue at).
     let mut m_next: Option<(SourceId, i64)> = None; // NLE3: the transition's outgoing run
+    // The previous video step's (source, the source tick it would continue at).
     let mut v_next: Option<(SourceId, i64)> = None;
-    let mut a_next: Option<(SourceId, i64)> = None;
-    let mut a_run_end = range.start;
+    // NLE4: the audio steps are the mix runs' headers, one per run.
+    let runs = if audio { audio_runs(tl, range.clone(), idx)? } else { Vec::new() };
+    let mut run = runs.iter().peekable();
     for t in range.clone() {
         if video {
             let step = match top(tl, Kind::Video, t) {
@@ -132,29 +128,111 @@ pub fn schedule(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Resu
             };
             out.push(step);
         }
-        if audio && t >= a_run_end {
-            let here = top(tl, Kind::Audio, t);
-            // The run lasts while the same clip (or the gap) wins.
-            let mut end = t + 1;
-            while end < range.end && top(tl, Kind::Audio, end) == here {
-                end += 1;
-            }
-            a_run_end = end;
-            let step = match here {
-                Some((ti, ci)) => {
+        if let Some(r) = run.next_if(|r| r.out_t == t) {
+            out.push(r.header());
+        }
+    }
+    Ok(out)
+}
+
+/// The range, invariant and media-length checks [`schedule`] and [`audio_runs`] share.
+fn check(tl: &Timeline, range: &Range<i64>, idx: &dyn SourceIndex) -> Result<(), ScheduleError> {
+    if range.start < 0 || range.end < range.start {
+        return Err(ScheduleError::Range);
+    }
+    tl.validate().map_err(ScheduleError::Invalid)?;
+    for c in tl.tracks.iter().flat_map(|t| t.clips.iter()) {
+        if idx.duration(c.src).is_some_and(|d| c.src_out > d) {
+            return Err(ScheduleError::OutOfSource(c.src));
+        }
+    }
+    Ok(())
+}
+
+/// Full scale of a fade envelope (Q16).
+pub const ENV_ONE: u32 = 1 << 16;
+
+/// NLE4: one audio track's part of an [`AudioRun`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layer {
+    /// The track's index in [`Timeline::tracks`].
+    pub track: usize,
+    pub src: SourceId,
+    /// The first source tick heard.
+    pub src_t: i64,
+    /// Seek here (ns from the source's start, a sync point) before decoding this layer; `None` when it continues the
+    /// same track's previous layer.
+    pub seek: Option<i64>,
+    /// The clip's gain, centi-dB.
+    pub gain_cdb: i32,
+    /// The fade envelope (Q16, [`ENV_ONE`] = full) at the run's first tick and at its end edge; linear between.
+    pub env: [u32; 2],
+}
+
+/// NLE4: one mix run: output ticks `out_t..out_t + len`, every audio track's layer (track order; none = silence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioRun {
+    pub out_t: i64,
+    pub len: i64,
+    pub layers: Vec<Layer>,
+}
+
+impl AudioRun {
+    /// The run's [`Step`]: its top (highest-track) layer, or a gap.
+    pub fn header(&self) -> Step {
+        let (track, src, src_t, seek) = match self.layers.last() {
+            Some(l) => (Some(l.track), Some(l.src), l.src_t, l.seek),
+            None => (None, None, 0, None),
+        };
+        Step { kind: Kind::Audio, track, src, src_t, out_t: self.out_t, len: self.len, seek, vmix: None }
+    }
+}
+
+/// NLE4: the audio mix runs for output ticks `range` (see the module docs).
+pub fn audio_runs(tl: &Timeline, range: Range<i64>, idx: &dyn SourceIndex) -> Result<Vec<AudioRun>, ScheduleError> {
+    check(tl, &range, idx)?;
+    let tracks: Vec<usize> = (0..tl.tracks.len()).filter(|&i| tl.tracks[i].kind == Kind::Audio).collect();
+    if tracks.is_empty() {
+        return Ok(Vec::new());
+    }
+    // What each audio track shows at `t`: (clip index, envelope segment 0 fade-in / 1 body / 2 fade-out).
+    let key = |t: i64| -> Vec<Option<(usize, u8)>> {
+        tracks
+            .iter()
+            .map(|&ti| {
+                tl.clip_at(ti, t).map(|ci| {
+                    let c = &tl.tracks[ti].clips[ci];
+                    let seg = if t < c.at + c.fade_in { 0 } else if t >= c.end() - c.fade_out { 2 } else { 1 };
+                    (ci, seg)
+                })
+            })
+            .collect()
+    };
+    // Per track: (source, the source tick its previous layer would continue at).
+    let mut next: Vec<Option<(SourceId, i64)>> = alloc::vec![None; tl.tracks.len()];
+    let mut out = Vec::new();
+    let mut t = range.start;
+    while t < range.end {
+        let here = key(t);
+        let mut end = t + 1;
+        while end < range.end && key(end) == here {
+            end += 1;
+        }
+        let mut layers = Vec::new();
+        for (k, &ti) in tracks.iter().enumerate() {
+            match here[k] {
+                Some((ci, _)) => {
                     let c = tl.tracks[ti].clips[ci];
                     let src_t = c.src_in + (t - c.at);
-                    let seek = seek_for(tl, idx, Kind::Audio, c.src, src_t, a_next)?;
-                    a_next = Some((c.src, src_t + (end - t)));
-                    Step { kind: Kind::Audio, track: Some(ti), src: Some(c.src), src_t, out_t: t, len: end - t, seek, vmix: None }
+                    let seek = seek_for(tl, idx, Kind::Audio, c.src, src_t, next[ti])?;
+                    next[ti] = Some((c.src, src_t + (end - t)));
+                    layers.push(Layer { track: ti, src: c.src, src_t, seek, gain_cdb: c.gain_cdb, env: [env_q16(&c, t), env_q16(&c, end)] });
                 }
-                None => {
-                    a_next = None;
-                    Step { kind: Kind::Audio, track: None, src: None, src_t: 0, out_t: t, len: end - t, seek: None, vmix: None }
-                }
-            };
-            out.push(step);
+                None => next[ti] = None,
+            }
         }
+        out.push(AudioRun { out_t: t, len: end - t, layers });
+        t = end;
     }
     Ok(out)
 }
@@ -171,6 +249,19 @@ fn seek_for(
         return Ok(None);
     }
     idx.keyframe_ns(src, kind, tl.tb.to_ns(src_t)).map(Some).ok_or(ScheduleError::NoKeyframe(src))
+}
+
+/// NLE4: clip `c`'s fade envelope at timeline tick (edge) `t`, Q16: rising over `at..at + fade_in`, falling over
+/// `end - fade_out..end`, full between.
+fn env_q16(c: &crate::Clip, t: i64) -> u32 {
+    let mut e = ENV_ONE as i64;
+    if c.fade_in > 0 && t < c.at + c.fade_in {
+        e = e.min((t - c.at).max(0) * ENV_ONE as i64 / c.fade_in);
+    }
+    if c.fade_out > 0 && t > c.end() - c.fade_out {
+        e = e.min((c.end() - t).max(0) * ENV_ONE as i64 / c.fade_out);
+    }
+    e as u32
 }
 
 /// NLE3: the outgoing source under video tick `t` of clip `ci` on track `ti`, if `t` lies in the transition on that

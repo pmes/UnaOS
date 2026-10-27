@@ -21,6 +21,10 @@
 //! `* UNA FPS <n>` (the frame rate; else the caller's) and `* UNA SOURCE <reel> <duration>` (a reel's length; else the
 //! furthest source out point that cites it). Reel `BL` (black) is a gap and makes no clip.
 //!
+//! NLE4 (LEDGER SR203): two more belong to the event line just above them, written only when not the default:
+//! `* UNA GAIN <centi-dB>` (the clip's audio gain; absent = 0) and `* UNA FADE <in> <out>` (fade lengths as
+//! `HH:MM:SS:FF`; absent = none). One with no event above it (or under a `BL` event) is a syntax error.
+//!
 //! Refused, each by name: `FCM: DROP FRAME` or a `;` timecode (drop-frame), any other FCM, a transition other than
 //! `C`, `D` or `W001`/`W002` (or one not shaped as below), an unknown channel, a record span unequal to its source span,
 //! a malformed timecode, and any line that is none of the above. Tracks come back canonical: V1..Vn, then A1..An.
@@ -140,6 +144,8 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
     }
     let mut tl = Timeline::new(fps);
     let mut events: Vec<(&str, Kind, usize, Clip)> = Vec::new();
+    // NLE4: the event a `* UNA GAIN` / `* UNA FADE` line belongs to (the event line just above it).
+    let mut cur: Option<usize> = None;
     // NLE3: a zero-length `C` line waiting for its `D`/`W` line: (event number, kind, track number, reel, clip).
     let mut from: Option<(&str, Kind, usize, &str, Clip)> = None;
     // NLE3: each transition read: (kind, track number, transition, outgoing reel, outgoing out point, line).
@@ -168,6 +174,9 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
                     tl.add_source(w[0], d);
                 }
             }
+            if l.starts_with("* UNA GAIN ") || l.starts_with("* UNA FADE ") {
+                audio_comment(l, fps, line, cur.and_then(|i| events.get_mut(i)).map(|e| &mut e.3))?;
+            }
             continue;
         }
         let w: Vec<&str> = l.split_whitespace().collect();
@@ -184,7 +193,7 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
         if tc[3] - tc[2] != tc[1] - tc[0] {
             return Err(EdlError::Duration { line });
         }
-        let clip = Clip { src: crate::SourceId(0), src_in: tc[0], src_out: tc[1], at: tc[2] };
+        let clip = Clip::new(crate::SourceId(0), tc[0], tc[1], tc[2]);
         if let Some(tk) = tk {
             // The incoming line of a transition: it needs its outgoing line (same number, channel and record point).
             let dur = edl_frames(w[4]).ok_or(EdlError::Transition { line })?;
@@ -195,19 +204,23 @@ pub fn parse(text: &str, fps_if_absent: u32) -> Result<Timeline, EdlError> {
                 _ => return Err(EdlError::Transition { line }),
             }
             events.push((w[1], kind, num, clip));
+            cur = Some(events.len() - 1);
             continue;
         }
         if let Some((_, k, c, reel, o)) = from.take() {
             events.push((reel, k, c, o)); // not followed by its D/W line: an empty clip, refused by validate
         }
         if w[1] == "BL" {
+            cur = None;
             continue;
         }
         if clip.src_in == clip.src_out {
             from = Some((w[0], kind, num, w[1], clip));
+            cur = None;
             continue;
         }
         events.push((w[1], kind, num, clip));
+        cur = Some(events.len() - 1);
     }
     if let Some((_, k, c, reel, o)) = from.take() {
         events.push((reel, k, c, o));
@@ -334,6 +347,27 @@ pub fn write(tl: &Timeline, title: &str) -> Result<String, EdlError> {
             timecode(c.at, fps),
             timecode(c.end(), fps)
         ));
+        if c.gain_cdb != 0 {
+            s.push_str(&format!("* UNA GAIN {}\n", c.gain_cdb));
+        }
+        if c.fade_in != 0 || c.fade_out != 0 {
+            s.push_str(&format!("* UNA FADE {} {}\n", timecode(c.fade_in, fps), timecode(c.fade_out, fps)));
+        }
     }
     Ok(s)
+}
+
+/// NLE4: apply a `* UNA GAIN <cdb>` or `* UNA FADE <in> <out>` line to the event above it (`None`: no event).
+fn audio_comment(l: &str, fps: u32, line: usize, clip: Option<&mut Clip>) -> Result<(), EdlError> {
+    let c = clip.ok_or(EdlError::Syntax { line })?;
+    if let Some(r) = l.strip_prefix("* UNA GAIN ") {
+        c.gain_cdb = r.trim().parse().map_err(|_| EdlError::Syntax { line })?;
+    } else if let Some(r) = l.strip_prefix("* UNA FADE ") {
+        let w: Vec<&str> = r.split_whitespace().collect();
+        if w.len() != 2 {
+            return Err(EdlError::Syntax { line });
+        }
+        (c.fade_in, c.fade_out) = (parse_tc(w[0], fps, line)?, parse_tc(w[1], fps, line)?);
+    }
+    Ok(())
 }
