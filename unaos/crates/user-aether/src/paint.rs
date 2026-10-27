@@ -439,8 +439,8 @@ fn paint_box_plain(cv: &mut Canvas, cx: &Cx, id: NodeId, x: f32, y: f32) {
 
 // ---- AETHERMETAL M3 (SR96): over the page ---------------------------------------------------------------
 
-/// The status line's height (px) at the window's foot.
-pub const STATUS_H: i32 = 14;
+/// The status line's height (px) at the window's foot: AETHERSCALE (SR190) grows it with the chrome face's line.
+pub fn status_h() -> i32 { crate::chrome::metrics().status_h }
 
 /// A 1 px outline (the focused link's text boxes).
 pub fn outline(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, c: u32) {
@@ -454,12 +454,12 @@ pub fn outline(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, c: u32) {
 /// find bar, a flash); `accent` turns it to the alert band (the find bar with no match).
 pub fn status(cv: &mut Canvas, fonts: &Fonts, s: &str, accent: bool) {
     let th = crate::theme::cur();
-    let y = cv.h - STATUS_H;
-    cv.fill(0, y, cv.w, STATUS_H, if accent { th.status_alert } else { th.status_bg });
+    let (y, sh) = (cv.h - status_h(), status_h());
+    cv.fill(0, y, cv.w, sh, if accent { th.status_alert } else { th.status_bg });
     cv.fill(0, y, cv.w, 1, th.status_rule);
     let sel = FontSel::default();
     let ink = th.status_ink;
     let mut t = fonts.0.borrow_mut();
-    let (a, _, _) = t.line_metrics(sel, 11.0);
-    t.draw(4.0, (y + 2) as f32 + a, s, sel, 11.0, ink, &mut |gx, gy, cov| cv.blend(gx, gy, ink, cov));
+    let (a, _, _) = t.line_metrics(sel, crate::chrome::font());
+    t.draw(4.0, (y + 2) as f32 + a, s, sel, crate::chrome::font(), ink, &mut |gx, gy, cov| cv.blend(gx, gy, ink, cov));
 }

@@ -127,12 +127,12 @@ use sidetabs::{SideHit, SideStrip, TabLayout};
 // ---- THE HEADER'S METRICS (AETHERSIDETABS / header craft, SR140): every dimension the strip and the toolbar are
 // drawn with, named once here; the colours are `Skin` (below), derived once from the theme tokens. ----------------
 /// The tab strip's band, the toolbar's band, and the chrome's height (the page starts below it), window px.
-pub const TAB_H: i32 = 26;
-pub const BAR_H: i32 = 30;
-pub const CHROME_H: i32 = TAB_H + BAR_H;
+pub fn tab_h() -> i32 { metrics().tab_h }
+pub fn bar_h() -> i32 { metrics().bar_h }
+pub fn chrome_h() -> i32 { metrics().chrome_h() }
 /// The type: the BODY size (tab titles, the address field) and one step down (the zoom badge, the letter tile), at the
 /// default `system.display.font_size`; TEXTSCALE2 (B814): the live sizes are [`font`] / [`font_small`] (file tail).
-const FONT_BASE: f32 = 11.0;
+const FONT_BASE: f32 = scale::FACE_BASE;
 const FONT_SMALL_BASE: f32 = 9.5;
 /// The header's inset from the window's left and right edges, and the gap between neighbouring controls.
 const EDGE: i32 = 8;
@@ -153,24 +153,24 @@ const TILE_GAP: i32 = 6;
 const CLOSE: i32 = 16;
 const CLOSE_ARM: f32 = 3.0;
 /// A toolbar control's square (the field's height too), its hover / pressed wash radius.
-const CTL: i32 = 22;
+fn ctl() -> i32 { metrics().ctl }
 const CTL_R: i32 = 6;
 /// The address field: its radius (a full pill), its text inset, the focus ring's width.
-const FIELD_R: i32 = CTL / 2;
+fn field_r() -> i32 { ctl() / 2 }
 const FIELD_PAD: i32 = 10;
 const RING: i32 = 2;
 /// The drawn glyphs (chevrons, plus, minus, ×): half their extent and their stroke width.
 const GLYPH: f32 = 4.0;
 const STROKE: f32 = 1.5;
 /// Where the toolbar's controls stand in the bar (their top edge below the bar's top; `Chrome::bar_y`).
-const BAR_INSET: i32 = (BAR_H - CTL) / 2;
+fn bar_inset() -> i32 { (bar_h() - ctl()) / 2 }
 /// AETHERSIDETABS2 (SR143): the narrowest bar that still carries the zoom buttons, and the star (else they are only
 /// in the menu).
 const BAR_ZOOM_MIN: i32 = 360;
 const BAR_STAR_MIN: i32 = 220;
 /// The menu: its width, one row's height, its inner padding, its radius, and its rows.
 const MENU_W: i32 = 176;
-const MENU_ROW: i32 = 22;
+fn menu_row(ch: &Chrome) -> i32 { ch.menu_m().row }
 const MENU_PAD: i32 = 4;
 const MENU_R: i32 = 8;
 const MENU: [(&str, &str); 10] = [
@@ -312,19 +312,19 @@ impl Chrome {
 
     pub fn page_y(&self) -> i32 {
         if self.is_side() {
-            BAR_H
+            bar_h()
         } else {
-            CHROME_H
+            chrome_h()
         }
     }
 
     /// The toolbar's band top, and its controls' top edge.
     fn bar_top(&self) -> i32 {
-        self.page_y() - BAR_H
+        self.page_y() - bar_h()
     }
 
     fn bar_y(&self) -> i32 {
-        self.bar_top() + BAR_INSET
+        self.bar_top() + bar_inset()
     }
 
     /// The page's logical size at this window and zoom (CSS px).
@@ -337,9 +337,9 @@ impl Chrome {
 
     /// The open menu's rectangle (x, y, w, h), under the menu button's right edge.
     fn menu_rect(&self) -> (i32, i32, i32, i32) {
-        let w = MENU_W.min(self.pw - 2 * EDGE);
-        let h = MENU.len() as i32 * MENU_ROW + 2 * MENU_PAD;
-        (self.pw - EDGE - w, self.page_y() + 2, w, h)
+        let (w, m) = (MENU_W.min(self.pw - 2 * EDGE), self.menu_m());
+        let h = MENU.len() as i32 * m.row + 2 * MENU_PAD;
+        (self.pw - EDGE - w, m.y, w, h)
     }
 
     fn in_menu(&self, x: i32, y: i32) -> bool {
@@ -1012,50 +1012,50 @@ fn geo(ch: &Chrome) -> Geo {
     let (tabs, plus) = if ch.is_side() {
         (Vec::new(), (0, 0))
     } else {
-        let area = (w - 2 * EDGE - GAP - CTL).max(TAB_MIN_W);
+        let area = (w - 2 * EDGE - GAP - ctl()).max(TAB_MIN_W);
         let n = ch.strip.len().max(1) as i32;
         let tw = (area / n).clamp(TAB_MIN_W, TAB_MAX_W);
         // Tabs past the strip's room are not drawn (Ctrl+1..9 still reach them).
         let tabs: Vec<(u64, i32, i32)> =
             ch.strip.tabs().iter().enumerate().map(|(i, t)| (t.id, EDGE + i as i32 * tw, tw)).filter(|&(_, x, tw)| x + tw <= EDGE + area).collect();
-        let plus_x = (EDGE + tabs.len() as i32 * tw + GAP).min(w - EDGE - CTL);
-        (tabs, (plus_x, CTL))
+        let plus_x = (EDGE + tabs.len() as i32 * tw + GAP).min(w - EDGE - ctl());
+        (tabs, (plus_x, ctl()))
     };
     let x0 = ch.page_x();
     let bw = w - x0;
-    let menu = w - EDGE - CTL;
+    let menu = w - EDGE - ctl();
     let mut r = menu - GAP;
     let (zout, zin) = if bw >= BAR_ZOOM_MIN {
-        let zin = r - CTL;
-        let zout = zin - GAP - CTL;
+        let zin = r - ctl();
+        let zout = zin - GAP - ctl();
         r = zout - GAP;
-        (Some((zout, CTL)), Some((zin, CTL)))
+        (Some((zout, ctl())), Some((zin, ctl())))
     } else {
         (None, None)
     };
     let star = if bw >= BAR_STAR_MIN {
-        r -= CTL;
+        r -= ctl();
         let s = r;
         r -= GAP;
-        Some((s, CTL))
+        Some((s, ctl()))
     } else {
         None
     };
     let back = x0 + EDGE;
-    let fwd = back + CTL + GAP;
-    let reload = fwd + CTL + GAP;
-    let omni = reload + CTL + EDGE;
+    let fwd = back + ctl() + GAP;
+    let reload = fwd + ctl() + GAP;
+    let omni = reload + ctl() + EDGE;
     Geo {
         tabs,
         plus,
-        back: (back, CTL),
-        fwd: (fwd, CTL),
-        reload: (reload, CTL),
+        back: (back, ctl()),
+        fwd: (fwd, ctl()),
+        reload: (reload, ctl()),
         omni: (omni, (r + GAP - EDGE - omni).max(24)),
         star,
         zout,
         zin,
-        menu: (menu, CTL),
+        menu: (menu, ctl()),
     }
 }
 
@@ -1073,7 +1073,7 @@ fn hit(ch: &Chrome, x: i32, y: i32) -> Hot {
         // The open menu sits over the page: its rows are the chrome's.
         let (mx, my, mw, mh) = ch.menu_rect();
         if x >= mx && x < mx + mw && y >= my && y < my + mh {
-            let k = (y - my - MENU_PAD).div_euclid(MENU_ROW);
+            let k = (y - my - MENU_PAD).div_euclid(menu_row(ch));
             return if k >= 0 && (k as usize) < MENU.len() { Hot::MenuItem(k as usize) } else { Hot::None };
         }
     }
@@ -1088,7 +1088,7 @@ fn hit(ch: &Chrome, x: i32, y: i32) -> Hot {
         return Hot::None;
     }
     let g = geo(ch);
-    if !ch.is_side() && y < TAB_H {
+    if !ch.is_side() && y < tab_h() {
         if y < TAB_TOP {
             return Hot::None;
         }
@@ -1103,7 +1103,7 @@ fn hit(ch: &Chrome, x: i32, y: i32) -> Hot {
         return if within(x, g.plus) { Hot::NewTab } else { Hot::None };
     }
     let by = ch.bar_y();
-    if y < by || y >= by + CTL {
+    if y < by || y >= by + ctl() {
         return Hot::None;
     }
     let opt = [(g.star, Hot::Star), (g.zout, Hot::ZoomOut), (g.zin, Hot::ZoomIn)];
@@ -1218,7 +1218,7 @@ pub fn input(app: &mut App, page: &mut Page, fonts: &mut Fonts, ev: u64) -> Opti
         }
         INPUT_EV_WIN_RESIZE => {
             app.ch.pw = (((p >> 16) & 0xffff) as i32).clamp(64, MAX_W);
-            app.ch.ph = ((p & 0xffff) as i32).clamp(CHROME_H + 32, MAX_H);
+            app.ch.ph = ((p & 0xffff) as i32).clamp(chrome_h() + 32, MAX_H);
             app.ch.side.scroll = app.ch.side.scroll.clamp(0, SideStrip::max_scroll(&app.ch.strip, app.ch.ph as u32));
             refit(app);
             None
@@ -1575,10 +1575,10 @@ fn control(cv: &mut Canvas, ch: &Chrome, sk: &Skin, r: (i32, i32), h: Hot, enabl
     let by = ch.bar_y();
     if enabled {
         if let Some(c) = wash(ch, h, sk) {
-            rrect(cv, r.0, by, r.1, CTL, CTL_R, c, false);
+            rrect(cv, r.0, by, r.1, ctl(), CTL_R, c, false);
         }
     }
-    let (cx, cy) = (r.0 as f32 + r.1 as f32 / 2.0, by as f32 + CTL as f32 / 2.0);
+    let (cx, cy) = (r.0 as f32 + r.1 as f32 / 2.0, by as f32 + ctl() as f32 / 2.0);
     glyph(cv, g, cx, cy, if enabled { sk.ink } else { sk.dim });
 }
 
@@ -1680,10 +1680,10 @@ fn paint_side(ch: &Chrome, cv: &mut Canvas, fonts: &Fonts, sk: &Skin) {
                 }
                 let name = if g.name.trim().is_empty() { g.color.name() } else { g.name.as_str() };
                 let count = alloc::format!("{}", ch.strip.group_tabs(gid).len());
-                let cx = (cw - 8 - CTL / 2) as f32;
+                let cx = (cw - 8 - ctl() / 2) as f32;
                 glyph(cv, if g.collapsed { Glyph::Fwd } else { Glyph::Down }, cx, (y + rh / 2) as f32, sk.dim);
                 let nw = fonts.0.borrow_mut().measure(&count, FontSel::default(), font_small());
-                let nx = cx - CTL as f32 / 2.0 - nw;
+                let nx = cx - ctl() as f32 / 2.0 - nw;
                 label_at(cv, fonts, &count, nx, y, rh, sk.dim, 0, cw, font_small());
                 let t0 = bx + 10 + SIDE_TILE + TILE_GAP;
                 let t1 = nx as i32 - GAP;
@@ -1707,13 +1707,13 @@ fn paint_side(ch: &Chrome, cv: &mut Canvas, fonts: &Fonts, sk: &Skin) {
     }
     // The toggle row, over whatever scrolled under it: collapse (open) or expand (rail).
     cv.fill(0, 0, cw, rh, sk.strip);
-    let tw = CTL;
+    let tw = ctl().min(rh);
     let tx = if rail { (cw - tw) / 2 } else { cw - EDGE - tw };
-    let ty = (rh - CTL) / 2;
+    let ty = (rh - tw) / 2;
     if let Some(c) = wash(ch, Hot::Side(SideHit::Toggle), sk) {
-        rrect(cv, tx, ty, tw, CTL, CTL_R, c, false);
+        rrect(cv, tx, ty, tw, tw, CTL_R, c, false);
     }
-    glyph(cv, if rail { Glyph::Fwd } else { Glyph::Back }, tx as f32 + tw as f32 / 2.0, ty as f32 + CTL as f32 / 2.0, sk.dim);
+    glyph(cv, if rail { Glyph::Fwd } else { Glyph::Back }, tx as f32 + tw as f32 / 2.0, ty as f32 + tw as f32 / 2.0, sk.dim);
     cv.fill(cw - 1, 0, 1, h, sk.rule);
 }
 
@@ -1727,20 +1727,20 @@ fn paint_menu(ch: &Chrome, cv: &mut Canvas, fonts: &Fonts, sk: &Skin) {
     rrect(cv, mx - 1, my - 1, mw + 2, mh + 2, MENU_R + 1, sk.field_line, false);
     rrect(cv, mx, my, mw, mh, MENU_R, sk.bar, false);
     for (i, (name, key)) in MENU.iter().enumerate() {
-        let ry = my + MENU_PAD + i as i32 * MENU_ROW;
+        let ry = my + MENU_PAD + i as i32 * menu_row(ch);
         if ch.hot == Hot::MenuItem(i) {
-            rrect(cv, mx + MENU_PAD, ry, mw - 2 * MENU_PAD, MENU_ROW, CTL_R, sk.ctl_hover, false);
+            rrect(cv, mx + MENU_PAD, ry, mw - 2 * MENU_PAD, menu_row(ch), CTL_R, sk.ctl_hover, false);
         }
         let x1 = mx + mw - 2 * MENU_PAD;
         let mut t1 = x1;
         if !key.is_empty() {
-            let kw = fonts.0.borrow_mut().measure(key, FontSel::default(), font_small());
+            let kw = fonts.0.borrow_mut().measure(key, FontSel::default(), font_small().min(ch.menu_m().face));
             let kx = x1 as f32 - kw;
-            label_at(cv, fonts, key, kx, ry, MENU_ROW, sk.dim, mx, x1, font_small());
+            label_at(cv, fonts, key, kx, ry, menu_row(ch), sk.dim, mx, x1, font_small().min(ch.menu_m().face));
             t1 = kx as i32 - GAP;
         }
         let t0 = mx + 3 * MENU_PAD;
-        label(cv, fonts, name, t0 as f32, ry, MENU_ROW, sk.ink, t0, t1);
+        label_at(cv, fonts, name, t0 as f32, ry, menu_row(ch), sk.ink, t0, t1, ch.menu_m().face);
     }
 }
 
@@ -1754,14 +1754,14 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
     if ch.is_side() {
         paint_side(ch, cv, fonts, &sk);
     } else {
-        cv.fill(0, 0, cv.w, TAB_H, sk.strip);
+        cv.fill(0, 0, cv.w, tab_h(), sk.strip);
         // The hairline under the strip; the active tab is painted over it below, so it joins the toolbar seamlessly.
-        cv.fill(0, TAB_H - 1, cv.w, 1, sk.rule);
+        cv.fill(0, tab_h() - 1, cv.w, 1, sk.rule);
     }
-    cv.fill(x0, bt, cv.w - x0, BAR_H, sk.bar);
+    cv.fill(x0, bt, cv.w - x0, bar_h(), sk.bar);
     let active = ch.strip.active();
     let lit = |id: u64| id == active || ch.hot == Hot::Tab(id) || ch.hot == Hot::Close(id);
-    let body_h = TAB_H - TAB_TOP;
+    let body_h = tab_h() - TAB_TOP;
     for (i, &(id, tx, tw)) in g.tabs.iter().enumerate() {
         let on = id == active;
         if on {
@@ -1778,7 +1778,7 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
         let tab = &ch.strip.tabs()[i];
         // AETHERSIDETABS2: a grouped tab's run carries its group's colour along the strip's foot.
         if let Some(gr) = tab.group.and_then(|g| ch.strip.group(g)) {
-            cv.fill(tx + 2, TAB_H - 3, tw - 4, 2, gr.color.rgb());
+            cv.fill(tx + 2, tab_h() - 3, tw - 4, 2, gr.color.rgb());
         }
         // The favicon slot (the favicon, else the letter tile), vertically centred with the title.
         let ty = TAB_TOP + (body_h - TILE) / 2;
@@ -1821,7 +1821,7 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
     }
     // The menu button: washed while its menu is open.
     if ch.menu {
-        rrect(cv, g.menu.0, by, g.menu.1, CTL, CTL_R, sk.ctl_press, false);
+        rrect(cv, g.menu.0, by, g.menu.1, ctl(), CTL_R, sk.ctl_press, false);
     }
     control(cv, ch, &sk, g.menu, Hot::Menu, true, Glyph::Dots);
     // The bookmark star: the font's own star (a filled one in the accent when the page is bookmarked).
@@ -1830,24 +1830,24 @@ fn paint_chrome(app: &App, cv: &mut Canvas, fonts: &Fonts) {
         let enabled = !ch.url.is_empty();
         if enabled {
             if let Some(c) = wash(ch, Hot::Star, &sk) {
-                rrect(cv, star.0, by, star.1, CTL, CTL_R, c, false);
+                rrect(cv, star.0, by, star.1, ctl(), CTL_R, c, false);
             }
         }
         let s = if on { "\u{2605}" } else { "\u{2606}" };
         let gw = fonts.0.borrow_mut().measure(s, FontSel::default(), font());
         let ink = if on { sk.accent } else if enabled { sk.ink } else { sk.dim };
-        label(cv, fonts, s, star.0 as f32 + (star.1 as f32 - gw) / 2.0, by, CTL, ink, star.0, star.0 + star.1);
+        label(cv, fonts, s, star.0 as f32 + (star.1 as f32 - gw) / 2.0, by, ctl(), ink, star.0, star.0 + star.1);
     }
     // The address field: one rounded field with a quiet border; focused, the border turns the accent inside a soft
     // halo.
     let (fx, fw) = g.omni;
-    let (ft, fh) = (by, CTL);
+    let (ft, fh) = (by, ctl());
     let focused = ch.omni.is_some();
     if focused {
-        rrect(cv, fx - RING, ft - RING, fw + 2 * RING, fh + 2 * RING, FIELD_R + RING, sk.halo, false);
+        rrect(cv, fx - RING, ft - RING, fw + 2 * RING, fh + 2 * RING, field_r() + RING, sk.halo, false);
     }
-    rrect(cv, fx, ft, fw, fh, FIELD_R, if focused { sk.accent } else { sk.field_line }, false);
-    rrect(cv, fx + 1, ft + 1, fw - 2, fh - 2, FIELD_R - 1, sk.field_bg, false);
+    rrect(cv, fx, ft, fw, fh, field_r(), if focused { sk.accent } else { sk.field_line }, false);
+    rrect(cv, fx + 1, ft + 1, fw - 2, fh - 2, field_r() - 1, sk.field_bg, false);
     let mut x1 = fx + fw - FIELD_PAD;
     if ch.zoom != 100 {
         let z = alloc::format!("{}%", ch.zoom);
@@ -1973,18 +1973,23 @@ pub fn open_arg_tab(app: &mut App, page: &mut Page, fonts: &mut Fonts, arg: &str
 // Flight 37: "aether input font size did not increase" — the chrome drew a constant 11 px while the text step moved
 // `system.display.font_size` (Principia's; theme.rs subscribes `system.display.` / `system.accessibility.` on its ONE
 // subscribe and `prefs` above re-reads on its answer). The tab titles, the omnibox field (and its caret), the menu and
-// the badges draw [`font`] / [`font_small`]: the base size x font_size / DEFAULT_CSS_PX, capped at [`FONT_MAX`] — what
-// the 22 px control holds while the header geometry (TAB_H, BAR_H, CTL) stays (its reflow is owed, BP-handlers §5).
-// The page's own faces follow the page's CSS, unchanged.
+// the badges draw [`font`] / [`font_small`]: the base size x font_size / DEFAULT_CSS_PX (`scale::face_for`).
+// AETHERSCALE (LEDGER SR190): the header REFLOWS with the face — every band (TAB_H, BAR_H, CTL, the menu row, the status
+// line) grows by the face's line over the default's (`scale::grow`, the kernel's TextMetrics idiom), so the old
+// FONT_MAX cap is gone; the one cap left is the menu's row on a short window (`scale::Metrics::menu`). A moved face
+// relays the page (`refit`: the header's height moved the page's origin). The page's own faces follow the page's CSS.
 
-/// The largest chrome face the control box holds: the field's inner height over a 1.25 line.
-const FONT_MAX: f32 = (CTL - 2 * RING) as f32 / 1.25;
+// The header's metrics model (handlers/aether/src/chrome/scale.rs; std-free), the host test's bytes.
+#[allow(dead_code, unused_imports)]
+#[path = "../../../../handlers/aether/src/chrome/scale.rs"]
+pub mod scale;
+
 /// The live body face (f32 bits; 0 = not restyled yet: the base) and the font size it was derived from (0 = none yet).
 static FACE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static FACE_PX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// The chrome's body size now, px.
-fn font() -> f32 {
+pub(crate) fn font() -> f32 {
     match FACE.load(core::sync::atomic::Ordering::Relaxed) {
         0 => FONT_BASE,
         b => f32::from_bits(b),
@@ -1996,8 +2001,21 @@ fn font_small() -> f32 {
     font() * FONT_SMALL_BASE / FONT_BASE
 }
 
-/// Re-read the type preferences; a moved font size re-derives the face, repaints the chrome and says
-/// `[aether] restyle font_size=<px> text_size=<step> chrome_px=<n>` (the default size at start says nothing).
+/// AETHERSCALE: every header height at the live face (the status line's too: `paint::status_h`).
+pub fn metrics() -> scale::Metrics {
+    scale::Metrics::at(font())
+}
+
+impl Chrome {
+    /// AETHERSCALE: the open menu's fit inside the window (its row, its face, its top).
+    fn menu_m(&self) -> scale::Menu {
+        metrics().menu(font(), MENU.len() as i32, MENU_PAD, self.page_y(), self.ph)
+    }
+}
+
+/// Re-read the type preferences; a moved font size re-derives the face, re-lays the header and the page, and says
+/// `[aether] restyle font_size=<px> text_size=<step> chrome_px=<n> chrome_h=<n> status_h=<n> menu_row=<n>` (the
+/// default size at start says nothing).
 fn restyle(app: &mut App) {
     use core::sync::atomic::Ordering::Relaxed;
     let (px, step) = crate::theme::read_type();
@@ -2005,10 +2023,13 @@ fn restyle(app: &mut App) {
     if was == px as u32 || (was == 0 && px == font_core::ui::DEFAULT_CSS_PX) {
         return;
     }
-    let face = (FONT_BASE * px as f32 / font_core::ui::DEFAULT_CSS_PX as f32).min(FONT_MAX);
+    let face = scale::face_for(px as i32, font_core::ui::DEFAULT_CSS_PX as i32);
     FACE.store(face.to_bits(), Relaxed);
-    app.dirty = true;
+    refit(app);
+    let m = metrics();
     let mut l = Line::new(b"[aether] restyle font_size=");
     l.dec(px).put(b" text_size=").put(step.as_bytes()).put(b" chrome_px=").dec((face + 0.5) as i64);
+    l.put(b" chrome_h=").dec(m.chrome_h() as i64).put(b" status_h=").dec(m.status_h as i64);
+    l.put(b" menu_row=").dec(app.ch.menu_m().row as i64);
     l.wire();
 }

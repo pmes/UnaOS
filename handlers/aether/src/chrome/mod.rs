@@ -16,6 +16,7 @@ pub mod downloads;
 pub mod find;
 pub mod history;
 pub mod omnibox;
+pub mod scale;
 // AETHERSIDETABS (SR140, R118): the vertical side strip's layout pref, geometry and tab search (std-free).
 pub mod sidetabs;
 pub mod tabs;
