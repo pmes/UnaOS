@@ -72,6 +72,19 @@ pub fn is_pdf(ctype: &str, bytes: &[u8]) -> bool {
     t == "application/pdf" || t == "application/x-pdf" || (t != "text/html" && bytes.starts_with(b"%PDF-"))
 }
 
+/// PDF4-SIZE (SR404): the largest PDF a navigation reads (`net::fetch_document_any` chooses it by [`is_pdf`]; every other
+/// document keeps the 10 MiB cap). 64 MiB, SR398's `chrome::host` ARCHIVE_MAX precedent: PDFs are routinely 10-100 MB.
+pub const MAX_BYTES: usize = 64 << 20;
+
+/// PDF4-SIZE (SR404): the refusal of a PDF `n` bytes long (declared, or read so far) over [`MAX_BYTES`], named on the
+/// console (`[pdf] open: <n> MiB over the 64 MiB cap`, the strip's `[pdf]` console shape) and returned as the
+/// navigation's error, which the error page shows.
+pub fn over_cap(n: u64) -> String {
+    let msg = format!("[pdf] open: {} MiB over the {} MiB cap", n.div_ceil(1 << 20), MAX_BYTES >> 20);
+    crate::js::host::console_out(1, &msg);
+    msg
+}
+
 /// One installed face's file for a CSS generic family (a collection's first face only: Fallback takes bytes).
 fn face_file(generic: &str) -> Option<Vec<u8>> {
     let db = text_host::db::db();
@@ -130,7 +143,7 @@ pub struct PdfDocument {
     pub pressed: Option<forms::Target>,
     pub hover: Option<forms::Target>,
     pub focus: Option<forms::FieldFocus>,
-    /// The last fill pdf_core refused, by name (the page shows the file as it was).
+    /// The last fill's refusal by name (`pdf_core::Error`, Debug: set_value, save_update, or `reload`'s re-parse and page-count check); None after an accepted fill (the page shows the file as it was).
     pub form_refused: Option<String>,
     /// PDF4-THUMBS (SR360): the thumbnail strip is open, and its width in CSS px (0 when closed; `thumbs::STRIP_W`
     /// device px at the zoom), which the page lane starts after.
@@ -151,9 +164,10 @@ pub struct PdfDocument {
 }
 
 impl PdfDocument {
-    /// Parse `bytes` (the empty user password: `pdf_core::Error::Password` when the file needs another).
-    pub fn open(bytes: &[u8]) -> Result<PdfDocument, pdf_core::Error> {
-        let doc = Document::parse(bytes)?;
+    /// Parse `bytes` (the empty user password: `pdf_core::Error::Password` when the file needs another); the fetched
+    /// Vec is kept as [`PdfDocument::bytes`] itself, not copied (PDF4-SIZE SR404).
+    pub fn open(bytes: Vec<u8>) -> Result<PdfDocument, pdf_core::Error> {
+        let doc = Document::parse(&bytes)?;
         let pages = doc.pages()?;
         if pages.is_empty() {
             return Err(pdf_core::Error::Missing);
@@ -188,7 +202,7 @@ impl PdfDocument {
             sel: PdfSelection::default(),
             hits: Vec::new(),
             cur: None,
-            bytes: bytes.to_vec(),
+            bytes,
             page_refs,
             annots: RefCell::new(vec![None; n]),
             form,
@@ -478,7 +492,7 @@ impl crate::AetherEngine {
     /// then the PDF takes over painting, scrolling, selection and find. A file that needs a password, or that pdf_core
     /// refuses, is a visible HTML page saying so.
     pub fn load_pdf(&mut self, url: &str, bytes: Vec<u8>, add_history: bool) {
-        match PdfDocument::open(&bytes) {
+        match PdfDocument::open(bytes) {
             Ok(pdf) => {
                 let title = pdf.title.clone().unwrap_or_else(|| file_name(url));
                 let html = format!("<html><head><title>{}</title></head><body></body></html>", escape(&title));

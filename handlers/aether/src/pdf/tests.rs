@@ -1351,3 +1351,95 @@ fn pagesave_fetch_stub() {
     assert_eq!(*asked.borrow(), vec![(IMG.to_string(), site.clone()), (IMG.to_string(), site)], "once per save, in the partition");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ------------------------------------------------------------------------------------------ PDF4-SIZE (SR404)
+
+/// PDF4-SIZE (SR404): a loopback HTTP/1.1 server answering every request with `body`, its Content-Type `ctype` (none when
+/// empty) and, with `with_len`, its Content-Length (else the body runs to the close). media/tests.rs's `MiniHttp` always
+/// sends a length and never a type, so it cannot serve these answers unchanged.
+fn pdf4size_serve(ctype: &'static str, body: Vec<u8>, with_len: bool) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { break };
+            let mut rd = BufReader::new(c.try_clone().unwrap());
+            loop {
+                let mut h = String::new();
+                if rd.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                    break;
+                }
+            }
+            let mut head = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
+            if !ctype.is_empty() {
+                head.push_str(&format!("Content-Type: {ctype}\r\n"));
+            }
+            if with_len {
+                head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            }
+            head.push_str("\r\n");
+            let _ = c.write_all(head.as_bytes());
+            let _ = c.write_all(&body);
+            let _ = c.shutdown(std::net::Shutdown::Both);
+        }
+    });
+    format!("http://127.0.0.1:{port}/big.pdf")
+}
+
+/// PDF4-SIZE (SR404): a valid one-page PDF padded past `pad` bytes by an unreferenced stream object.
+fn pdf4size_padded(pad: usize) -> Vec<u8> {
+    let mut b = PdfBuilder::new(1);
+    b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+        .obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 100] >>")
+        .obj(3, "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>")
+        .stream(4, "", b"1 0 0 rg 0 0 200 100 re f")
+        .stream(5, "", &vec![b'x'; pad]);
+    b.classic()
+}
+
+/// PDF4-SIZE (SR404): an 11 MiB PDF (over the old shared 10 MiB document cap) is fetched whole and opens; the fetched
+/// bytes are the document's bytes.
+#[tokio::test]
+async fn pdf4size_11mib_opens() {
+    let body = pdf4size_padded(11 << 20);
+    assert!(body.len() > 11 << 20);
+    let url = pdf4size_serve("application/pdf", body.clone(), true);
+    let page = crate::net::fetch_page(&url).await.expect("an 11 MiB PDF is under its 64 MiB cap");
+    assert_eq!(page.pdf.as_ref().map(|b| b.len()), Some(body.len()), "the body is the PDF's, whole");
+    let mut e = AetherEngine::new();
+    e.set_device_size(400, 300);
+    e.load_page(page, true);
+    let pdf = e.pdf.as_ref().expect("the PDF opened");
+    assert_eq!(pdf.page_count(), 1);
+    assert_eq!(pdf.bytes.len(), body.len(), "the fetched Vec is the document's bytes");
+}
+
+/// PDF4-SIZE (SR404): a 65 MiB PDF is refused by name: by its Content-Length before the read, and (untyped, no length,
+/// known by the `%PDF-` sniff) the moment the read passes the cap.
+#[tokio::test]
+async fn pdf4size_65mib_refused_by_name() {
+    const NAMED: &str = "[pdf] open: 65 MiB over the 64 MiB cap";
+    let url = pdf4size_serve("application/pdf", pdf4size_padded(65 << 20)[..65 << 20].to_vec(), true);
+    let err = crate::net::fetch_page(&url).await.err().expect("refused by its Content-Length").to_string();
+    assert_eq!(err, NAMED);
+    let mut sniffed = b"%PDF-1.7\n".to_vec();
+    sniffed.resize(65 << 20, b'x');
+    let url = pdf4size_serve("", sniffed, false);
+    let err = crate::net::fetch_page(&url).await.err().expect("refused while read").to_string();
+    assert_eq!(err, NAMED);
+}
+
+/// PDF4-SIZE (SR404): HTML keeps the 10 MiB cap and its messages: an 11 MiB text/html page is refused by its
+/// Content-Length, an untyped non-PDF 11 MiB body with no length while read.
+#[tokio::test]
+async fn pdf4size_html_11mib_keeps_html_cap() {
+    let mut html = b"<html><body>".to_vec();
+    html.resize(11 << 20, b'a');
+    let url = pdf4size_serve("text/html", html.clone(), true);
+    let err = crate::net::fetch_page(&url).await.err().expect("the HTML cap").to_string();
+    assert_eq!(err, "Response exceeds size limit");
+    let url = pdf4size_serve("", html, false);
+    let err = crate::net::fetch_page(&url).await.err().expect("the HTML cap, while read").to_string();
+    assert_eq!(err, "Response body exceeds size limit");
+}
