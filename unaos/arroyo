@@ -9946,8 +9946,9 @@ KFONT_NOTO_SHA256=(
     "dfbd5ed0f1e68c3cbc51aa08f646d1ab0e68e7c4ceab70a69e465225ff701f93"
 )
 kfont_noto_missing() {
-    local f d n=0 dirs="${UNAOS_FONT_DIRS:-}:/usr/share/fonts/truetype/noto:/usr/share/fonts/opentype/noto:/usr/share/fonts/google-noto:/usr/share/fonts/TTF:/usr/share/fonts/noto"
-    for f in "${KFONT_NOTO_FACES[@]}"; do
+    local f d n=0 dirs="${UNAOS_FONT_DIRS:-}:/usr/share/fonts/truetype/noto:/usr/share/fonts/opentype/noto:/usr/share/fonts/google-noto:/usr/share/fonts/TTF:/usr/share/fonts/noto" faces=("$@")
+    [ "${#faces[@]}" -gt 0 ] || faces=("${KFONT_NOTO_FACES[@]}")   # GLYPHSCARD (B1010): the faces asked for (ensure_kfont_cjk: the CJK one), else the four
+    for f in "${faces[@]}"; do
         local hit=0 IFS=:
         for d in $dirs; do [ -n "$d" ] && [ -f "$d/$f" ] && { hit=1; break; }; done
         unset IFS
@@ -9972,7 +9973,7 @@ kfont_tree_pins() {
     echo -e "${COLOR_YELLOW}⚡ FONTS: fonts/ vs firmware/fonts.pins -> ${state} (Inter + JetBrains Mono + Noto Sans, ${bytes} B per volume; FONTSCRAFT B640)${COLOR_RESET}"
 }
 ensure_kfont_noto() {
-    kfont_tree_pins   # FONTSCRAFT (B640): the vendored faces' pin verdict, before the Noto script faces
+    kfont_tree_pins; ensure_kfont_cjk   # FONTSCRAFT (B640): the vendored faces' pin verdict, before the Noto script faces. GLYPHSCARD (B1010): the CJK face's own leg first (it always returns 0; the early returns below would skip it)
     local miss; miss="$(kfont_noto_missing)"
     if [ "$miss" = 0 ]; then
         echo -e "${COLOR_GREEN}  • FONTS: the four Noto script faces are on this host (KERNELFONT2)${COLOR_RESET}"
@@ -9984,24 +9985,61 @@ ensure_kfont_noto() {
         echo -e "${COLOR_GREEN}  • FONTS: fonts-noto-core installed by apt${COLOR_RESET}"
         return 0
     fi
-    local dir="${WORKSPACE_DIR}/target/fonts-noto" deb tmp i ok=1
+    local dir="${WORKSPACE_DIR}/target/fonts-noto"
     echo -e "${COLOR_YELLOW}  • FONTS: apt refused or absent — fetching the pinned .deb into ${dir}${COLOR_RESET}"
-    mkdir -p "$dir"; deb="$dir/fonts-noto-core.deb"; tmp="$dir/x"
-    if ! { [ -f "$deb" ] && [ "$(sha512_of "$deb")" = "$KFONT_NOTO_DEB_SHA512" ]; }; then
-        curl -fsSL -m 300 -o "$deb" "$KFONT_NOTO_DEB_URL" || { echo -e "${COLOR_RED}  • FONTS: fetch failed — media builds without the Noto faces (scripts_missing on the wire)${COLOR_RESET}"; return 0; }
+    kfont_deb_stage "four Noto faces" "$KFONT_NOTO_DEB_URL" "$KFONT_NOTO_DEB_SHA512" "$dir" fonts-noto-core \
+        "${KFONT_NOTO_FACES[0]}=${KFONT_NOTO_SHA256[0]}" "${KFONT_NOTO_FACES[1]}=${KFONT_NOTO_SHA256[1]}" \
+        "${KFONT_NOTO_FACES[2]}=${KFONT_NOTO_SHA256[2]}" "${KFONT_NOTO_FACES[3]}=${KFONT_NOTO_SHA256[3]}"   # GLYPHSCARD (B1010): the ONE pinned-.deb leg
+    return 0
+}
+# GLYPHSCARD (rmbp-ledger B1010): the pinned-.deb leg KERNELFONT2 wrote inside ensure_kfont_noto, moved here VERBATIM and
+# parameterised so the Noto script faces and the CJK face share it: <label> <deb url> <deb sha512> <dir> <doc package>
+# <face>=<sha256>... . Fetch (cached in <dir>), SHA-512 the .deb, extract, copy each face only at its SHA-256, the package's
+# copyright as <dir>/LICENSE, append <dir> to UNAOS_FONT_DIRS. Always returns 0 (arroyo runs `set -e`; the media builds
+# without the face and the kernel names it); KFONT_DEB_OK=1 when every face landed.
+kfont_deb_stage() {
+    local label="$1" url="$2" sha512="$3" dir="$4" docpkg="$5" deb tmp pair ok=1
+    shift 5
+    KFONT_DEB_OK=0
+    mkdir -p "$dir"; deb="$dir/${docpkg}.deb"; tmp="$dir/x"
+    if ! { [ -f "$deb" ] && [ "$(sha512_of "$deb")" = "$sha512" ]; }; then
+        curl -fsSL -m 300 -o "$deb" "$url" || { echo -e "${COLOR_RED}  • FONTS: fetch failed — media builds without the ${label} (the kernel names them on the wire)${COLOR_RESET}"; return 0; }
     fi
-    [ "$(sha512_of "$deb")" = "$KFONT_NOTO_DEB_SHA512" ] || { echo -e "${COLOR_RED}  • FONTS: .deb SHA-512 mismatch — refused, not staged${COLOR_RESET}"; rm -f "$deb"; return 0; }
+    [ "$(sha512_of "$deb")" = "$sha512" ] || { echo -e "${COLOR_RED}  • FONTS: .deb SHA-512 mismatch — refused, not staged${COLOR_RESET}"; rm -f "$deb"; return 0; }
     rm -rf "$tmp"; mkdir -p "$tmp"
     # dpkg-deb reads every data.tar compression itself (the 2020 package is zstd); ar + tar where there is no dpkg.
     { if command -v dpkg-deb >/dev/null 2>&1; then dpkg-deb -x "$deb" "$tmp"; else ( cd "$tmp" && ar x "$deb" && tar -xf data.tar.* ); fi; } || { echo -e "${COLOR_RED}  • FONTS: .deb extract failed — not staged${COLOR_RESET}"; return 0; }
-    for i in 0 1 2 3; do
-        local f="${KFONT_NOTO_FACES[$i]}" src; src="$(find "$tmp" -name "${KFONT_NOTO_FACES[$i]}" -print -quit)"
-        if [ -n "$src" ] && [ "$(sha256_of "$src")" = "${KFONT_NOTO_SHA256[$i]}" ]; then cp -f "$src" "$dir/$f"; else ok=0; echo -e "${COLOR_RED}  • FONTS: ${f} absent or SHA-256 mismatch — not staged${COLOR_RESET}"; fi
+    for pair in "$@"; do
+        local f="${pair%%=*}" want="${pair#*=}" src; src="$(find "$tmp" -name "$f" -print -quit)"
+        if [ -n "$src" ] && [ "$(sha256_of "$src")" = "$want" ]; then cp -f "$src" "$dir/$f"; else ok=0; echo -e "${COLOR_RED}  • FONTS: ${f} absent or SHA-256 mismatch — not staged${COLOR_RESET}"; fi
     done
-    [ -f "$tmp/usr/share/doc/fonts-noto-core/copyright" ] && cp -f "$tmp/usr/share/doc/fonts-noto-core/copyright" "$dir/LICENSE"
+    [ -f "$tmp/usr/share/doc/${docpkg}/copyright" ] && cp -f "$tmp/usr/share/doc/${docpkg}/copyright" "$dir/LICENSE"
     rm -rf "$tmp"
     export UNAOS_FONT_DIRS="${UNAOS_FONT_DIRS:+${UNAOS_FONT_DIRS}:}${dir}"
-    [ "$ok" = 1 ] && echo -e "${COLOR_GREEN}  • FONTS: four Noto faces SHA-pinned into ${dir} (UNAOS_FONT_DIRS)${COLOR_RESET}"
+    [ "$ok" = 1 ] && { KFONT_DEB_OK=1; echo -e "${COLOR_GREEN}  • FONTS: ${label} SHA-pinned into ${dir} (UNAOS_FONT_DIRS)${COLOR_RESET}"; }
+    return 0
+}
+# GLYPHSCARD (rmbp-ledger B1010): the CJK face GLYPHS (B676) draws its Han + Hiragana line with — builder/src/main.rs
+# KFONT_FACES' NotoSansCJK-Regular.ttc, the kernel's `noto-cjk` FACES row (video/text.rs; read LATE, 64 KiB per desktop
+# service pass: 19484784 B is over FACE_MAX). Flight 38's Mac host had no package dir, so the card carried no CJK face.
+# (1) the face in UNAOS_FONT_DIRS or a package dir -> nothing to do; (2) else the Ubuntu pool fonts-noto-cjk .deb (jammy),
+# SHA-512 pinned, the face SHA-256 pinned, into the gitignored target/fonts-noto-cjk/ with the package's copyright as LICENSE
+# (the builder stages it as system/fonts/LICENSES/noto-cjk.txt). No apt: no ruling names fonts-noto-cjk on the host. Pins
+# measured 2026-10-27 by the GLYPHSCARD executor (curl of the pool .deb, 61220346 B; sha512sum / dpkg-deb -x / sha256sum).
+KFONT_CJK_FACE="NotoSansCJK-Regular.ttc"
+KFONT_CJK_BYTES=19484784
+KFONT_CJK_DEB_URL="http://archive.ubuntu.com/ubuntu/pool/main/f/fonts-noto-cjk/fonts-noto-cjk_20220127+repack1-1_all.deb"
+KFONT_CJK_DEB_SHA512="7f532d19dbba0cf4c00415c5d9cff90725b754339e89b29be543324f51bc391e21c9834c4cb15011f97684e4349c29629362a0cbbde5a517cec0e4105139b360"
+KFONT_CJK_SHA256="b76b0433203017ca80401b2ee0dd69350349871c4b19d504c34dbdd80541690a"
+ensure_kfont_cjk() {
+    local state="host"
+    if [ "$(kfont_noto_missing "$KFONT_CJK_FACE")" != 0 ]; then
+        echo -e "${COLOR_YELLOW}  • FONTS: ${KFONT_CJK_FACE} not on this host — fetching the pinned fonts-noto-cjk .deb (GLYPHSCARD B1010)${COLOR_RESET}"
+        kfont_deb_stage "CJK face" "$KFONT_CJK_DEB_URL" "$KFONT_CJK_DEB_SHA512" "${WORKSPACE_DIR}/target/fonts-noto-cjk" fonts-noto-cjk \
+            "${KFONT_CJK_FACE}=${KFONT_CJK_SHA256}"
+        if [ "$KFONT_DEB_OK" = 1 ]; then state="MATCH"; else state="ABSENT ${KFONT_CJK_FACE}"; fi
+    fi
+    echo -e "${COLOR_YELLOW}⚡ FONTS: ${KFONT_CJK_FACE} -> ${state} (${KFONT_CJK_BYTES} B per volume that carries system/fonts; GLYPHSCARD B1010)${COLOR_RESET}"
     return 0
 }
 

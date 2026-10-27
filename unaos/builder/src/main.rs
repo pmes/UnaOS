@@ -116,7 +116,7 @@ const KFONT_FACES: &[(&str, &str)] = &[
     ("NotoSansHebrew-Regular.ttf", "noto"),
     ("NotoSansDevanagari-Regular.ttf", "noto"),
     ("NotoSansThai-Regular.ttf", "noto"),
-    ("NotoSansCJK-Regular.ttc", "noto"), // GLYPHS (B676): the CJK face; staged when the bench has fonts-noto-cjk (search dir below), else reported absent
+    ("NotoSansCJK-Regular.ttc", "noto-cjk"), // GLYPHS (B676): the CJK face; staged when the bench has fonts-noto-cjk (search dir below), else reported absent
 ];
 const KFONT_DIRS: &[&str] = &[
     "/usr/share/fonts/truetype/dejavu",
