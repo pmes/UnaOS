@@ -32,7 +32,7 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
 4. **ZENBOOK-I8042** — `drivers/i8042.rs`: the internal keyboard on the EC's 8042 into the input route. In flight
    (ZENBOOKI8042; it asks `hw::platform()`).
 5. **ZENBOOK-GOP** — the loader picks the CONNECTED output's native mode (the dead internal panel enumerated or not:
-   um5606w.md §4), `desktop_uefi` + dpi for an external monitor. In flight (ZENBOOKGOP).
+   um5606w.md §4), `desktop_uefi` + dpi for an external monitor. In flight (ZENBOOKGOP). The desktop's ignition without a Kepler takeover: in flight (GOPIGNITE, Z10: `desktop_uefi::gop_ignite`, Origin `gop`, the Zenbook only).
 6. **ZENBOOK-XHCIPICK** — the kernel brings up ONE xHCI, the first class 0C/03/30 in walk order (`PciScanner::scan`,
    `unaos/crates/kernel/src/arch/x86_64/pci.rs:895`); Strix Point has four (1022:151a/151b/151e/151f) plus two USB4
    NHIs (151c/151d). Measure which physical ports the first one serves; then bring up every xHCI or pick by port.
@@ -44,7 +44,12 @@ ZENBOOKGOP, ZENBOOKMT7925) are the next rows. No Zenbook image line exists yet (
     lands `hda::probe` answers `[hda] absent` on the Zenbook (Z1's gate).
 11. **ZENBOOK-USB4** — the USB4 host routers (NHI 151c/151d) and the tunnelled DP / PCIe / USB behind them.
 12. **ZENBOOK-RADEON** — display beyond GOP: the amdgpu DCN 3.5 scanout on the Radeon 890M (1002:150e, gfx1150) — the
-    Kepler-sized job.
+    Kepler-sized job. FBWCLEAF (measured by GOPIGNITE Z10, not built): `set_framebuffer_wc` (`unaos/crates/kernel/src/arch/x86_64/memory.rs:3735`)
+    retypes whole firmware identity-map leaves; the APU's GOP fb is the iGPU BAR aperture (MMIO, not RAM), so a 1 GiB leaf
+    WC-types the neighbouring MMIO it shares (ECAM, IOAPIC, HPET, LAPIC, the iGPU register BAR), `leaf_is_fb_wc` then keeps
+    `map_mmio_window` from re-typing it UC, and the WXN-M2 splitter's named assert fires if that leaf holds kernel text; the
+    first boot's `:: x86 fb-wc: retyped N leaf(s) … over lo..hi ::` names the level (a 1 GiB hull = live; the fix splits the
+    fb's leaf to 2 MiB / 4 KiB before the retype).
 13. **ZENBOOK-SUSPEND** — S0ix / modern standby (the rMBP's `idle` state has no meaning here until the EC row lands).
 14. **ZENBOOK-LOADERTRACE** — the loader's `unaos_ivb` entry traces (`read_igpu_trace`: config 0:2.0 BAR0 MMIO;
     `read_gmux_trace`: gmux ports 0x7D0/0x7D4; `unaos/crates/bootloader/src/main.rs:448`) run before `uefi::helpers::init`

@@ -155,6 +155,9 @@ pub enum Origin {
     /// `requested=` witness has both words from the first boot that can print them.
     #[allow(dead_code)] // constructed by the M-b caller (drivers/gpu/igpu.rs), not by M-a.
     IgpuScanout,
+    /// GOPIGNITE (zenbook-ledger Z10) — the post-PCI ignition on a GOP-only x86 machine (no takeover exists to call
+    /// [`activate`]): the surface is the one the firmware's GOP left and `WRITER` already holds. See [`gop_ignite`].
+    GopBoot,
 }
 
 /// [`ACTIVATED`]'s alphabet. Kept as plain `u32` constants rather than a `repr` on [`Origin`] so the
@@ -163,12 +166,14 @@ pub enum Origin {
 const ORIGIN_NONE: u32 = 0;
 const ORIGIN_KEPLER: u32 = 1;
 const ORIGIN_IGPU: u32 = 2;
+const ORIGIN_GOP: u32 = 3;
 
 impl Origin {
     const fn code(self) -> u32 {
         match self {
             Origin::KeplerTakeover => ORIGIN_KEPLER,
             Origin::IgpuScanout => ORIGIN_IGPU,
+            Origin::GopBoot => ORIGIN_GOP,
         }
     }
     const fn name(self) -> &'static str {
@@ -180,6 +185,7 @@ const fn origin_name(code: u32) -> &'static str {
     match code {
         ORIGIN_KEPLER => "kepler",
         ORIGIN_IGPU => "igpu",
+        ORIGIN_GOP => "gop",
         _ => "none",
     }
 }
@@ -1100,3 +1106,28 @@ fn move_vacate_test() {
     move_vacate_probe(pw, ph);
 }
 
+/// GOPIGNITE (zenbook-ledger Z10) — light the compositor on a GOP-only x86 machine, where no Kepler takeover exists to
+/// run [`activate`]. ONE call site: `main.rs`'s `arch::pci::init` line (a LINE-NEUTRAL fold, `wc` + x86 only), i.e.
+/// the same instant the Kepler seam runs at — inside the post-PCI window, before the `pci-usb` bootpace stamp.
+///
+/// SILENT unless `hw::platform()` (resolved in `pci.rs init`) is the Zenbook UM5606W: QEMU, the rMBP and unknown
+/// machines return before any line, so their wire is unchanged. On the Zenbook it repeats the Kepler seam's ORDER LAW
+/// with the existing verbs and nothing else: `fbcon::panel_console_resume` (re-home the glyph grid, splash or clear,
+/// `PANEL_CONSOLE`) and then [`activate_on`] on [`SurfaceDesc::from_writer`] — `WRITER` was seeded from the same
+/// BootInfo triple at `main.rs` WRITER-SEED, so the reconciliation takes its `adopt SKIP (already live)` arm, and the
+/// aperture is already write-combined by `main.rs`'s generic `set_framebuffer_wc`. A second origin is refused by the
+/// existing `ACTIVATED` latch (`requested=gop`).
+pub fn gop_ignite() {
+    let plat = crate::hw::platform();
+    if !matches!(plat, crate::hw::Platform::ZenbookUm5606w) {
+        return;
+    }
+    let (w, h) = {
+        let fb = *super::WRITER.lock();
+        let i = fb.info();
+        (i.width, i.height)
+    };
+    crate::census_println!("[wc-x] gop-ignite platform={} fb={}x{}", plat.token(), w, h);
+    super::fbcon::panel_console_resume();
+    activate_on(SurfaceDesc::from_writer(Origin::GopBoot));
+}

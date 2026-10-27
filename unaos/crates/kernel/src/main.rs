@@ -1031,7 +1031,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // kernel8 battery — the gate that has to hold this line — is a `skip_xhci` build.
     unaos_kernel::drivers::xhci::bot_park_selftest();
     #[cfg(not(feature = "skip_xhci"))]
-    unaos_kernel::arch::pci::init(dtb_addr, dtb_size);
+    unaos_kernel::arch::pci::init(dtb_addr, dtb_size); #[cfg(all(target_arch = "x86_64", feature = "wc", not(feature = "skip_xhci")))] unaos_kernel::video::desktop_uefi::gop_ignite(); // GOPIGNITE (zenbook-ledger Z10): the compositor's ignition on a GOP-only x86 machine (no Kepler takeover to call `desktop_uefi::activate`), at the Kepler seam's instant (inside the post-PCI window, before the `pci-usb` stamp). Silent unless `hw::platform()` (resolved in `pci.rs init`) is the Zenbook, so QEMU and the rMBP run byte-identical paths. ⚠ LINE-NEUTRAL fold, `#[cfg]`-erased on aarch64 and on every build without `wc`.
     // BPACE: PCI scan + xHCI controller bring-up returned. This is the SYNCHRONOUS half of USB; the
     // per-port enumeration that follows is asynchronous and stamps itself from the main loop. On a
     // `skip_xhci` build this tag is absent — the asymmetry the doc's "did not run (b)" reading uses.
