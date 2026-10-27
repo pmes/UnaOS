@@ -5592,9 +5592,9 @@ fn settingsmap_switch_leg() {
         let _ = crate::video::settings::bus_changes_idle(); // the write's own frame drained: only the switch's is counted
         let n = crate::prefs::reload_session(&old);
         let frames = consumers_pass();
-        let r0 = crate::fs::users::session_gen_reads();
+        let r0 = session_gen_reads_now();
         let _ = consumers_pass();
-        (n, frames, crate::fs::users::session_gen_reads().wrapping_sub(r0))
+        (n, frames, session_gen_reads_now().wrapping_sub(r0))
     } else {
         (0, 0, 0)
     };
@@ -7186,3 +7186,10 @@ fn textscale_selftest() {
         done, overlap, cap_seen, v, bumps, moved, fits as u8, clipped, if kit { "ok" } else { "bad" }, restored as u8, why
     );
 }
+
+/// PREFSRELOAD's session-gen read counter: fs::users is declared only under `login`
+/// (fs/mod.rs tail); the knob-off twin reads 0 so the tenant-input row is byte-identical.
+#[cfg(feature = "login")]
+fn session_gen_reads_now() -> u32 { crate::fs::users::session_gen_reads() }
+#[cfg(not(feature = "login"))]
+fn session_gen_reads_now() -> u32 { 0 }

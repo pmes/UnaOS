@@ -41,3 +41,10 @@ consumers = ["vug"]
 reason = "moves with gtk4 in Vug (outside every workspace; unbuildable as declared)"
 ledger = "SR31"
 until = "0.22.10"
+
+[[pin]]
+crate = "resvg"
+consumers = ["aether"]
+reason = "Aether's SVG rasteriser: 0.48 -> 0.49 is a major bump of resvg/usvg/tiny-skia whose render API moved; the bump is owed to its own host-proven arc (the WPT svg pages are the measure), not a fold slip"
+ledger = "SR146"
+until = "0.49.0"
