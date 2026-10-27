@@ -132,22 +132,9 @@ fn tick() -> bool {
 
 // ---- failure ----------------------------------------------------------------------------------------------
 
-/// http_core's error, named for the wire (a transport errno rides `Io` as text; ECANCELED is the deadline).
+/// http_core's error, named for the wire: the table is fetchseq's (HTTPFAIL SR212), the errnos the `Elf`'s.
 fn http_fail(e: &http_core::Error) -> Fail {
-    use http_core::encoding::DecodeError;
-    match e {
-        http_core::Error::Timeout => fail("timeout", ECANCELED),
-        http_core::Error::Io(_) => fail("io", una_abi::EIO),
-        http_core::Error::Tls(_) => fail("tls-stream", vein_ring3::tls::EPROTO),
-        http_core::Error::Http(h1::H1Error::Truncated) => fail("truncated", 0),
-        http_core::Error::Http(_) => fail("http-framing", 0),
-        http_core::Error::Decode(DecodeError::Unsupported(_)) => fail("coding-unsupported", 0),
-        http_core::Error::Decode(_) => fail("coding-corrupt", 0),
-        http_core::Error::Url(_) => fail("bad-url", 0),
-        http_core::Error::Redirect(_) => fail("redirect-refused", 0),
-        http_core::Error::TooManyRedirects => fail("too-many-redirects", 0),
-        http_core::Error::Proxy(_) => fail("proxy", 0),
-    }
+    fetchseq::http_fail::<Elf<'static>>(e)
 }
 
 // ---- the byte stream http_core reads: any vein Transport (a Tcp, a TLS session) ------------------------------
@@ -242,6 +229,8 @@ impl fetchseq::Io for Elf<'_> {
     type Ctx = CookieContext;
     type Issuer = vein_ring3::Verified;
     const CANCELED: i64 = ECANCELED;
+    const EIO: i64 = una_abi::EIO;
+    const EPROTO: i64 = vein_ring3::tls::EPROTO;
     const MAX_REDIRECTS: usize = redirect::MAX_REDIRECTS;
     const PER_ORIGIN: usize = MAX_PER_ORIGIN;
 

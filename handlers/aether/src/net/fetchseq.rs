@@ -7,7 +7,8 @@
 //!
 //! MOVED from user-aether/src/net.rs (AETHERNET SR110, AETHERNET2 SR187), not copied: `Fail`, `fail`, `is_net_scheme`, the
 //! answer cache (`address`), the pool (`take_idle` -> [`Seq::take`], `park` -> [`Seq::park`]), `Hop`, `hop`, `tls_why`,
-//! `site_of` and `fetch`'s redirect loop ([`navigate`]). The wire line stays in net.rs and reads [`Nav`].
+//! `site_of` and `fetch`'s redirect loop ([`navigate`]); HTTPFAIL (SR212): `http_fail`, http_core's error -> the `reason=`
+//! words, its errnos read from [`Io`]. The wire line stays in net.rs and reads [`Nav`].
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -72,6 +73,25 @@ pub fn tls_why(w: &'static str) -> &'static str {
     }
 }
 
+/// HTTPFAIL (SR212): http_core's error, named for the wire (a transport errno rides `Io` as text; `I::CANCELED` is the
+/// deadline). MOVED from user-aether/src/net.rs, every word and code unchanged.
+pub fn http_fail<I: Io>(e: &http_core::Error) -> Fail {
+    use http_core::encoding::DecodeError;
+    match e {
+        http_core::Error::Timeout => fail("timeout", I::CANCELED),
+        http_core::Error::Io(_) => fail("io", I::EIO),
+        http_core::Error::Tls(_) => fail("tls-stream", I::EPROTO),
+        http_core::Error::Http(http_core::h1::H1Error::Truncated) => fail("truncated", 0),
+        http_core::Error::Http(_) => fail("http-framing", 0),
+        http_core::Error::Decode(DecodeError::Unsupported(_)) => fail("coding-unsupported", 0),
+        http_core::Error::Decode(_) => fail("coding-corrupt", 0),
+        http_core::Error::Url(_) => fail("bad-url", 0),
+        http_core::Error::Redirect(_) => fail("redirect-refused", 0),
+        http_core::Error::TooManyRedirects => fail("too-many-redirects", 0),
+        http_core::Error::Proxy(_) => fail("proxy", 0),
+    }
+}
+
 /// What one TLS session gave: the exchange's result, the version, the cipher's wire name, ALPN `h2`, the verified issuer,
 /// and the session's own late failure (a transport error under the exchange).
 pub struct Session<R, V> {
@@ -108,6 +128,10 @@ pub trait Io {
     type Issuer;
     /// The errno a wait answers once the navigation's deadline passed (-> `timeout`).
     const CANCELED: i64;
+    /// The errno a transport failure reports (-> `io`).
+    const EIO: i64;
+    /// The errno a TLS record-layer failure reports (-> `tls-stream`).
+    const EPROTO: i64;
     /// Redirects followed before `too-many-redirects`.
     const MAX_REDIRECTS: usize;
     /// HTTP/1.1 connections to one origin.
@@ -351,6 +375,8 @@ mod tests {
         type Ctx = bool;
         type Issuer = &'static str;
         const CANCELED: i64 = CANCELED;
+        const EIO: i64 = -5;
+        const EPROTO: i64 = -71;
         const MAX_REDIRECTS: usize = 20;
         const PER_ORIGIN: usize = 6;
         fn now(&mut self) -> u64 {
@@ -463,11 +489,11 @@ mod tests {
             ("ipv6", "http://[::1]/", |_| {}, Some(("ipv6-unsupported", 0))),
             ("handshake", "https://a.test/", |s| s.handshake = Some(("cert-expired", -71)), Some(("tls-cert-expired", -71))),
             ("late overrides", "https://a.test/", |s| {
-                s.session_err = Some(fail("io", -5));
+                s.session_err = Some(http_fail::<Stub>(&http_core::Error::Io(String::from("errno -5"))));
                 s.late = Some(("transport", -104));
             }, Some(("tls-transport", -104))),
             ("late under timeout", "https://a.test/", |s| {
-                s.session_err = Some(fail("timeout", CANCELED));
+                s.session_err = Some(http_fail::<Stub>(&http_core::Error::Timeout));
                 s.late = Some(("transport", -104));
             }, Some(("timeout", CANCELED))),
         ];
@@ -492,6 +518,45 @@ mod tests {
         let n = go(&mut s, &mut Seq::new(), "http://[");
         assert_eq!(n.cur.err(), Some(fail("bad-url", 0)));
         assert!(n.last.is_none() && s.log.is_empty());
+    }
+
+    #[test]
+    fn aetherlib_httpfail_kat() {
+        use http_core::encoding::DecodeError;
+        use http_core::h1::H1Error;
+        use http_core::redirect::RedirectError;
+        use http_core::url::UrlError;
+        use http_core::Error;
+        // HTTPFAIL (SR212): one row per http_core error variant (and each split the table makes) -> the wire's word and code.
+        let rows: [(Error, (&str, i64)); 14] = [
+            (Error::Timeout, ("timeout", CANCELED)),
+            (Error::Io(String::from("errno -104")), ("io", -5)),
+            (Error::Tls(String::from("bad record mac")), ("tls-stream", -71)),
+            (Error::Http(H1Error::Truncated), ("truncated", 0)),
+            (Error::Http(H1Error::BadChunk), ("http-framing", 0)),
+            (Error::Http(H1Error::BadStatusLine), ("http-framing", 0)),
+            (Error::Decode(DecodeError::Unsupported(String::from("zstd"))), ("coding-unsupported", 0)),
+            (Error::Decode(DecodeError::Inflate("bad block")), ("coding-corrupt", 0)),
+            (Error::Decode(DecodeError::Brotli("bad window")), ("coding-corrupt", 0)),
+            (Error::Decode(DecodeError::Source), ("coding-corrupt", 0)),
+            (Error::Url(UrlError::InvalidHost), ("bad-url", 0)),
+            (Error::Redirect(RedirectError::UnsupportedScheme(String::from("ftp"))), ("redirect-refused", 0)),
+            (Error::TooManyRedirects, ("too-many-redirects", 0)),
+            (Error::Proxy(String::from("407")), ("proxy", 0)),
+        ];
+        for (e, (w, code)) in &rows {
+            assert_eq!(http_fail::<Stub>(e), fail(*w, *code), "{e:?}");
+        }
+        // The ordering: each as the TLS session's exchange error under a late transport failure — the late failure names
+        // the navigation, except under a timeout (the deadline is the cause).
+        for (e, _) in &rows {
+            let mut s = stub();
+            s.session_err = Some(http_fail::<Stub>(e));
+            s.late = Some(("transport", -104));
+            let n = go(&mut s, &mut Seq::new(), "https://a.test/");
+            let want = if *e == Error::Timeout { ("timeout", CANCELED) } else { ("tls-transport", -104) };
+            assert_eq!(why(&n), Some(want), "{e:?}");
+        }
     }
 
     #[test]

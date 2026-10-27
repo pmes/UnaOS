@@ -60,6 +60,7 @@ dependencies = [
  "gl_core",
  "gneiss_pal",
  "html_core",
+ "http_core",
  "image",
  "js_core",
  "kvstore_core",
