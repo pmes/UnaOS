@@ -407,3 +407,141 @@ mod tests {
         }
     }
 }
+
+// ── H264ENCPLANES (rmbp-ledger B973): the ONE R'G'B' -> Y'CbCr, beside `to_rgba` (handlers.md §5 NLEPROBE-HDR's H264ENC-PLANES) ──
+// h264enc_core's private BT.601 table (`yuv.rs` `I420::from_rgba`, the export's input side) moved here and became a function of
+// (Kr, Kb) and range, so both directions live in one crate and derive from the same `kr_kb` values: the BT.601-limited table is
+// the retired one bit for bit (measured, pinned below), so every RGBA export keeps its bytes. The kernel export converts a mixed
+// or non-matching frame at its FILE's matrix through it (`unaos/crates/kernel/src/video/export.rs`).
+
+/// `([y_r, y_g, y_b], [cb_r, cb_g, cb_b], [cr_r, cr_g, cr_b], y_offset)`, the coefficients x 65536 [`rgb_coeffs`] derives.
+pub type RgbCoeffs = ([i64; 3], [i64; 3], [i64; 3], i64);
+
+/// The integer R'G'B' -> Y'CbCr coefficients of one (Kr, Kb) and range at 8 bits, 16 fractional bits: each Y' coefficient
+/// rounded half up from Kx x ys / 255 (ys 219 limited, 255 full); Cb's B and Cr's R rounded from cs / 510 (cs 224 limited, 255
+/// full), Cb's R from Kr cs / (510 (1-Kb)) and Cr's B from Kb cs / (510 (1-Kr)), each chroma G = -(R + B) so the row sums to
+/// zero and any grey has Cb = Cr = 128 exactly. The Y' offset is 16 limited, 0 full.
+pub fn rgb_coeffs((kr, kb): (i64, i64), full: bool) -> RgbCoeffs {
+    let (ys, cs) = if full { (255i64, 255i64) } else { (219i64, 224i64) };
+    let rnd = |a: i64, b: i64| (2 * a + b) / (2 * b);
+    let kg = 10000 - kr - kb;
+    let ky = [rnd((kr * ys) << 16, 10000 * 255), rnd((kg * ys) << 16, 10000 * 255), rnd((kb * ys) << 16, 10000 * 255)];
+    let half = rnd(cs << 16, 2 * 255);
+    let cb_r = rnd((kr * cs) << 16, 2 * (10000 - kb) * 255);
+    let cr_b = rnd((kb * cs) << 16, 2 * (10000 - kr) * 255);
+    (ky, [-cb_r, cb_r - half, half], [half, cr_b - half, -cr_b], if full { 0 } else { 16 })
+}
+
+/// THE ONE straight-RGBA -> 8-bit 4:2:0 Y'CbCr: `w * h * 4` bytes, top row first, into `y` (`w x h`) and `u` / `v`
+/// (`ceil(w/2) x ceil(h/2)`), row-major, no padding, by [`rgb_coeffs`] of `kr_kb` and `full`. Y' per pixel; chroma sited at
+/// the 2x2 block and computed from the block's RGB sums (the block's average; an edge block of an odd size averages the pixels it
+/// has). Alpha is ignored. False (nothing written) when a buffer is short. No alloc: the caller owns the planes.
+#[allow(clippy::too_many_arguments)]
+pub fn from_rgba(rgba: &[u8], w: usize, h: usize, kr_kb: (i64, i64), full: bool, y: &mut [u8], u: &mut [u8], v: &mut [u8]) -> bool {
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    if rgba.len() < w * h * 4 || y.len() < w * h || u.len() < cw * ch || v.len() < cw * ch {
+        return false;
+    }
+    let (ky, ku, kv, yoff) = rgb_coeffs(kr_kb, full);
+    for row in 0..h {
+        for col in 0..w {
+            let p = &rgba[(row * w + col) * 4..];
+            let s = ky[0] * p[0] as i64 + ky[1] * p[1] as i64 + ky[2] * p[2] as i64;
+            y[row * w + col] = (yoff + ((s + 32768) >> 16)).clamp(0, 255) as u8;
+        }
+    }
+    for by in 0..ch {
+        for bx in 0..cw {
+            let (mut sum, mut n) = ([0i64; 3], 0i64);
+            for row in by * 2..(by * 2 + 2).min(h) {
+                for col in bx * 2..(bx * 2 + 2).min(w) {
+                    let p = &rgba[(row * w + col) * 4..];
+                    for c in 0..3 {
+                        sum[c] += p[c] as i64;
+                    }
+                    n += 1;
+                }
+            }
+            let chroma = |k: &[i64; 3]| (128 + (k[0] * sum[0] + k[1] * sum[1] + k[2] * sum[2] + n * 32768).div_euclid(n * 65536)).clamp(0, 255) as u8;
+            u[by * cw + bx] = chroma(&ku);
+            v[by * cw + bx] = chroma(&kv);
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod from_rgba_kats {
+    use super::*;
+
+    /// H264ENCPLANES (B973): the BT.601-limited table is h264enc_core's retired `KY` / `KU` / `KV`, bit for bit.
+    #[test]
+    fn h264encplanes_bt601_limited_is_the_retired_table() {
+        assert_eq!(rgb_coeffs(KR_KB_601, false), ([16829, 33039, 6416], [-9714, -19070, 28784], [28784, -24103, -4681], 16));
+        assert_eq!(rgb_coeffs(KR_KB_601, true).3, 0);
+        for (kk, full) in [(KR_KB_601, false), (KR_KB_709, false), (KR_KB_601, true), (KR_KB_709, true)] {
+            let (_, u, v, _) = rgb_coeffs(kk, full);
+            assert_eq!((u.iter().sum::<i64>(), v.iter().sum::<i64>()), (0, 0), "a grey is Cb = Cr = 128");
+        }
+    }
+
+    const ALL: [((i64, i64), bool); 4] = [(KR_KB_601, false), (KR_KB_709, false), (KR_KB_601, true), (KR_KB_709, true)];
+
+    /// Planes first: a flat in-gamut 2x2 picture -> `to_rgba` -> `from_rgba` is within 1 per sample (measured 0 / 1 / 1 / 1 for
+    /// 601 / 709 limited, 601 / 709 full over this grid); a triple whose RGB clamps (out of gamut) is skipped.
+    #[test]
+    fn h264encplanes_planes_round_trip_within_one() {
+        for (kk, full) in ALL {
+            let (lo, hi, clo, chi) = if full { (0u32, 255u32, 0u32, 255u32) } else { (16, 235, 16, 240) };
+            for yy in (lo..=hi).step_by(5) {
+                for uu in (clo..=chi).step_by(5) {
+                    for vv in (clo..=chi).step_by(5) {
+                        let (py, pu, pv) = ([yy as u8; 4], [uu as u8], [vv as u8]);
+                        let p = Picture { w: 2, h: 2, y: &py[..], u: &pu[..], v: &pv[..], y_stride: 2, uv_stride: 1, ss: (1, 1), mono: false, bit_depth: 8, full };
+                        let mut rgba = [0u8; 16];
+                        to_rgba(&p, Matrix::Kr(kk), Chroma::Nearest, false, &mut rgba);
+                        if rgba.chunks(4).any(|c| c[..3].iter().any(|&x| x == 0 || x == 255)) {
+                            continue;
+                        }
+                        let (mut y2, mut u2, mut v2) = ([0u8; 4], [0u8; 1], [0u8; 1]);
+                        assert!(from_rgba(&rgba, 2, 2, kk, full, &mut y2, &mut u2, &mut v2));
+                        let ok = y2.iter().all(|&s| s.abs_diff(yy as u8) <= 1) && u2[0].abs_diff(uu as u8) <= 1 && v2[0].abs_diff(vv as u8) <= 1;
+                        assert!(ok, "{:?} full={} ({}, {}, {}) -> {:?} {:?} {:?}", kk, full, yy, uu, vv, y2, u2, v2);
+                    }
+                }
+            }
+        }
+    }
+
+    /// RGB first: a flat 2x2 RGBA -> `from_rgba` -> `to_rgba` is within 2 per channel (measured 2: the 8-bit Y'CbCr grid is
+    /// coarser than R'G'B', so the arc's 1 holds only planes first).
+    #[test]
+    fn h264encplanes_rgba_round_trip_within_two() {
+        for (kk, full) in ALL {
+            for r in (0u32..=255).step_by(5) {
+                for g in (0u32..=255).step_by(5) {
+                    for b in (0u32..=255).step_by(5) {
+                        let rgba = [r as u8, g as u8, b as u8, 255].repeat(4);
+                        let (mut y, mut u, mut v) = ([0u8; 4], [0u8; 1], [0u8; 1]);
+                        assert!(from_rgba(&rgba, 2, 2, kk, full, &mut y, &mut u, &mut v));
+                        let p = Picture { w: 2, h: 2, y: &y[..], u: &u[..], v: &v[..], y_stride: 2, uv_stride: 1, ss: (1, 1), mono: false, bit_depth: 8, full };
+                        let mut back = [0u8; 16];
+                        to_rgba(&p, Matrix::Kr(kk), Chroma::Nearest, false, &mut back);
+                        for (a, z) in rgba.iter().zip(back.iter()) {
+                            assert!(a.abs_diff(*z) <= 2, "{:?} full={} ({}, {}, {}) -> {:?}", kk, full, r, g, b, &back[..4]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Short buffers write nothing.
+    #[test]
+    fn h264encplanes_short_buffers_refused() {
+        let (mut y, mut u, mut v) = ([7u8; 4], [7u8; 1], [7u8; 1]);
+        assert!(!from_rgba(&[0; 15], 2, 2, KR_KB_601, false, &mut y, &mut u, &mut v));
+        assert!(!from_rgba(&[0; 16], 2, 2, KR_KB_601, false, &mut y[..3], &mut u, &mut v));
+        assert_eq!((y, u, v), ([7; 4], [7], [7]));
+    }
+}
