@@ -3076,10 +3076,34 @@ pub mod splitread {
     /// Read `len` bytes at `offset` of the file at absolute unafs `path`: the plan and the check hold
     /// MOUNT, the data blocks are read without it. Same bytes and same refusals as the one-hold
     /// `resolve_path` + `read_inode` + `read_data` it replaces.
-    pub fn read(path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadMiss> {
+    pub fn read(path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadMiss> { read_with(path, offset, len).0 }
+    /// One split try's outcome (UNAFSLOCKHOLD, B1015): bytes or a refusal, the plan went stale, or no split at all.
+    enum Try { Done(Result<Vec<u8>, ReadMiss>), Stale, Whole }
+
+    /// UNAFSLOCKHOLD (B1015): the split read RETRIED with a fresh plan while the check finds the generation or the
+    /// epoch moved (at most `lockhold::TRIES`), then the fallback CHUNKED (`locked`): no hold reads more than one run.
+    pub(super) fn read_with(path: &str, offset: u64, len: u64) -> (Result<Vec<u8>, ReadMiss>, super::lockhold::Stats) {
         OPS.fetch_add(1, Ordering::Relaxed);
-        let t0 = crate::hidstall::now_us();
-        let (plan, held_plan) = with_unafs(|fs| {
+        let mut st = super::lockhold::Stats { how: "split", ..Default::default() };
+        let (t0, mut data_us, mut out) = (crate::hidstall::now_us(), 0u64, None);
+        while out.is_none() && st.tries < super::lockhold::TRIES {
+            st.tries += 1;
+            match try_split(path, offset, len, &mut st, &mut data_us) { Try::Done(r) => out = Some(r), Try::Stale => {} Try::Whole => break }
+        }
+        let out = match out { Some(r) => r, None => locked(path, offset, len, &mut st) };
+        let t3 = crate::hidstall::now_us();
+        if t3.saturating_sub(t0) >= LINE_MS * 1000 || st.tries > 1 || st.how != "split" {
+            serial_println!(
+                "[unafslock] read path={} bytes={} held_us={} data_ms={} total_ms={} tries={} how={} chunks={} restarts={} hold_max_us={} -> {}",
+                path, out.as_ref().map(|d| d.len()).unwrap_or(0), st.held_split_us, data_us / 1000, t3.saturating_sub(t0) / 1000,
+                st.tries, st.how, st.chunks, st.restarts, st.hold_max_us, if st.how == "split" { "split" } else { "fallback" });
+        }
+        (out, st)
+    }
+
+    /// One split try (the B670 body): plan under MOUNT, the data blocks off it, the check under MOUNT.
+    fn try_split(path: &str, offset: u64, len: u64, st: &mut super::lockhold::Stats, data_us: &mut u64) -> Try {
+        let planned = with_unafs(|fs| {
             let h0 = crate::hidstall::now_us();
             let r = (|| -> Result<Option<Plan>, ReadMiss> {
                 let id = fs.resolve_path(path).map_err(|_| ReadMiss::NoSuchPath)?;
@@ -3091,55 +3115,31 @@ pub mod splitread {
                 Ok(BOUND.lock().as_ref().copied().map(|bound| Plan { root_gen, bound, chunks: ino.chunks, size: ino.size }))
             })();
             (r, crate::hidstall::now_us().saturating_sub(h0))
-        })
-        .map_err(ReadMiss::Mount)?;
-        HELD_MAX_US.fetch_max(held_plan, Ordering::Relaxed);
-        let Some(plan) = plan? else {
-            return locked(path, offset, len); // no bound identity noted: the one-hold read
-        };
-        let t1 = crate::hidstall::now_us();
-        let data = read_extents(&plan, offset, len);
-        let t2 = crate::hidstall::now_us();
-        let (same, held_check) = with_unafs(|fs| {
+        });
+        let (plan, held_plan) = match planned { Ok(p) => p, Err(e) => return Try::Done(Err(ReadMiss::Mount(e))) };
+        st.split_hold(held_plan); HELD_MAX_US.fetch_max(held_plan, Ordering::Relaxed);
+        let plan = match plan { Ok(Some(p)) => p, Ok(None) => return Try::Whole, Err(e) => return Try::Done(Err(e)) }; // no bound identity noted, or a ciphered root: the fallback
+        let t1 = crate::hidstall::now_us(); let data = read_extents(&plan, offset, len);
+        *data_us += crate::hidstall::now_us().saturating_sub(t1); super::lockhold::kat_inject(); // `tests unafslock` KAT only: a commit between the data and the check
+        let checked = with_unafs(|fs| {
             let h0 = crate::hidstall::now_us();
             let same = fs.root_generation() == plan.root_gen && BOUND.lock().as_ref().map(|b| b.epoch) == Some(plan.bound.epoch);
             (same, crate::hidstall::now_us().saturating_sub(h0))
-        })
-        .map_err(ReadMiss::Mount)?;
-        HELD_MAX_US.fetch_max(held_check, Ordering::Relaxed);
-        let (out, how) = match data {
-            Some(d) if same => (Ok(d), "split"),
-            _ => (locked(path, offset, len), "fallback"),
-        };
-        let t3 = crate::hidstall::now_us();
-        if t3.saturating_sub(t0) >= LINE_MS * 1000 {
-            serial_println!(
-                "[unafslock] read path={} bytes={} held_us={} data_ms={} total_ms={} -> {}",
-                path,
-                out.as_ref().map(|d| d.len()).unwrap_or(0),
-                held_plan.max(held_check),
-                t2.saturating_sub(t1) / 1000,
-                t3.saturating_sub(t0) / 1000,
-                how
-            );
-        }
-        out
+        });
+        let (same, held_check) = match checked { Ok(c) => c, Err(e) => return Try::Done(Err(ReadMiss::Mount(e))) };
+        st.split_hold(held_check); HELD_MAX_US.fetch_max(held_check, Ordering::Relaxed);
+        match data { Some(d) if same => Try::Done(Ok(d)), Some(_) => Try::Stale, None => Try::Whole }
     }
 
-    /// The pre-split read: one `with_unafs` hold, data I/O under MOUNT. Counted.
-    fn locked(path: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadMiss> {
+    /// The fallback (UNAFSLOCKHOLD, B1015): the one-hold read CHUNKED — `lockhold::chunked` takes MOUNT once per run of
+    /// `RUN_BLOCKS` blocks, the root generation re-checked in each hold. Counted; its holds feed `HELD_MAX_US`.
+    fn locked(path: &str, offset: u64, len: u64, st: &mut super::lockhold::Stats) -> Result<Vec<u8>, ReadMiss> {
         FALLBACKS.fetch_add(1, Ordering::Relaxed);
         let (f0, _) = tx_io();
-        let r = with_unafs(|fs| -> Result<Vec<u8>, ReadMiss> {
-            let id = fs.resolve_path(path).map_err(|_| ReadMiss::NoSuchPath)?;
-            let ino = fs.read_inode(id).map_err(|_| ReadMiss::NoSuchPath)?;
-            if ino.kind == ::unafs::FileKind::Directory {
-                return Err(ReadMiss::IsADirectory);
-            }
-            fs.read_data(id, offset, len).map_err(|_| ReadMiss::Failed)
-        });
+        let r = super::lockhold::chunked(path, offset, len, RUN_BLOCKS * ::unafs::BLOCK_SIZE, st);
         IO_UNDER_LOCK.fetch_add(tx_io().0.wrapping_sub(f0), Ordering::Relaxed);
-        r.map_err(ReadMiss::Mount)?
+        HELD_MAX_US.fetch_max(st.hold_max_us, Ordering::Relaxed);
+        r
     }
 
     /// The crate's extent walk (`unafs::fs::read_from_extents_via`), step for step, with the block
@@ -3337,13 +3337,13 @@ pub mod splitread {
         let held_us = read_held.max(meta_held_max);
         let io_under = io1.wrapping_sub(io0);
         let fallbacks = fb1.wrapping_sub(fb0);
-        let same = T_OK.load(Ordering::Relaxed) && T_BYTES.load(Ordering::Relaxed) == len && T_HASH.load(Ordering::Relaxed) == want;
-        let pass = done && same && held_us <= 5000 && io_under == 0 && fallbacks == 0 && ops >= 1;
+        let same = T_OK.load(Ordering::Relaxed) && T_BYTES.load(Ordering::Relaxed) == len && T_HASH.load(Ordering::Relaxed) == want; let (retry, chunked, kat_hold) = super::lockhold::kat(&path, len, |d: &[u8]| fnv(FNV0, d) == want); // UNAFSLOCKHOLD (B1015): the retry + chunked-fallback KAT, after the census (file tail; LINE-NEUTRAL, before this comment)
+        let pass = done && same && held_us <= 5000 && io_under == 0 && fallbacks == 0 && ops >= 1 && retry && chunked;
         serial_println!(
-            ":: UNAFSLOCK: ops={} held_max_ms={} io_under_lock={} -> {} :: path={} bytes={} read_ms={} read_held_us={} meta_held_us={} meta_wait_max_ms={} fallbacks={} match={} done={}",
+            ":: UNAFSLOCK: ops={} held_max_ms={} io_under_lock={} retry={} chunked={} hold_max_us={} -> {} :: path={} bytes={} read_ms={} read_held_us={} meta_held_us={} meta_wait_max_ms={} fallbacks={} match={} done={}",
             ops,
             held_us.div_ceil(1000),
-            io_under,
+            io_under, if retry { "ok" } else { "FAIL" }, if chunked { "ok" } else { "FAIL" }, kat_hold,
             if pass { "PASS" } else { "FAIL" },
             path,
             len,
@@ -5179,4 +5179,162 @@ fn nvme_grant_lbas(span: &PartitionSpan) -> Option<(u64, u64)> {
     let first = span.base_lba >> k;
     let last = span.block_count.checked_shl(3 - k).and_then(|n| first.checked_add(n)).and_then(|e| e.checked_sub(1))?;
     Some((first, last))
+}
+
+// ── UNAFSLOCKHOLD (rmbp-ledger B1015, BP-storage-8) — the split read's fallback never reads more than ONE run under the
+// masked MOUNT hold. Flight 38: the write leg's 8 MiB read-back (`splitread::read`, `tests unafslock`) lost its generation
+// check to the desktop's commits during its 3.5 s data read, and the one-hold fallback (`splitread::locked`) read all of it
+// under MOUNT (`[lock] held-too-long name=unafs.rs:567 at=unafs.rs:794 … ms=2939`; render's `wait-timeout what=unafs-mount`).
+// Now `splitread::read_with` retries the split with a fresh plan (`TRIES`), and the fallback is `chunked`: one `with_unafs`
+// hold per `RUN_BLOCKS` run through the crate's `read_data`, the root generation noted in the first hold and re-checked in
+// every later one (a flip restarts from the first run, at most `RESTARTS` times, then `Busy`: never a short Ok). Same
+// generation across every hold = no commit flipped = the bytes the one hold returned (K8a). At the tail: no line above moves.
+#[cfg(all(target_arch = "x86_64", feature = "wc"))]
+pub mod lockhold {
+    use super::*;
+    use super::splitread::ReadMiss;
+    use core::sync::atomic::{AtomicU32, AtomicU64};
+
+    /// Split tries before the fallback (a try that meets a moved generation or epoch plans again).
+    pub const TRIES: u32 = 3;
+    /// Restarts of the chunked fallback on a generation that moved between its holds, then `Busy`.
+    pub const RESTARTS: u32 = 3;
+    /// The KAT's bound on any one hold of its chunked read (the write leg's bound, under lockreg's 50 ms line).
+    const KAT_HOLD_MAX_US: u64 = 20_000;
+
+    /// One read's witness (the `[unafslock] read` line's fields).
+    #[derive(Clone, Copy, Default)]
+    pub struct Stats {
+        pub tries: u32,
+        pub how: &'static str,
+        pub chunks: u32,
+        pub restarts: u32,
+        pub run: u64,
+        pub hold_max_us: u64,
+        pub held_split_us: u64,
+    }
+
+    impl Stats {
+        /// A split try's plan or check hold (`held_us=` on the line) — also a hold of this read.
+        pub fn split_hold(&mut self, us: u64) {
+            self.held_split_us = self.held_split_us.max(us);
+            self.hold_max_us = self.hold_max_us.max(us);
+        }
+    }
+
+    /// The fallback: `len` bytes at `offset` of `path`, `run` bytes per masked MOUNT hold.
+    pub fn chunked(path: &str, offset: u64, len: u64, run: u64, st: &mut Stats) -> Result<Vec<u8>, ReadMiss> {
+        st.how = "fallback-chunked";
+        st.run = run;
+        let run = run.max(::unafs::BLOCK_SIZE);
+        loop {
+            let mut out: Vec<u8> = Vec::new();
+            let (mut id, mut gen0, mut end, mut at) = (0u64, 0u64, 0u64, offset);
+            let mut first = true;
+            let restart = loop {
+                let held = with_unafs(|fs| {
+                    let h0 = crate::hidstall::now_us();
+                    let r = (|| -> Result<Option<Vec<u8>>, ReadMiss> {
+                        if first {
+                            id = fs.resolve_path(path).map_err(|_| ReadMiss::NoSuchPath)?;
+                            let ino = fs.read_inode(id).map_err(|_| ReadMiss::NoSuchPath)?;
+                            if ino.kind == ::unafs::FileKind::Directory {
+                                return Err(ReadMiss::IsADirectory);
+                            }
+                            gen0 = fs.root_generation();
+                            end = offset.saturating_add(len.min(ino.size.saturating_sub(offset)));
+                        } else if fs.root_generation() != gen0 {
+                            return Ok(None); // a commit flipped between two holds: restart from the first run
+                        }
+                        let n = run.min(end.saturating_sub(at));
+                        if n == 0 {
+                            return Ok(Some(Vec::new()));
+                        }
+                        fs.read_data(id, at, n).map(Some).map_err(|_| ReadMiss::Failed)
+                    })();
+                    (r, crate::hidstall::now_us().saturating_sub(h0))
+                });
+                let (r, us) = held.map_err(ReadMiss::Mount)?;
+                st.hold_max_us = st.hold_max_us.max(us);
+                match r? {
+                    None => break true,
+                    Some(d) => {
+                        st.chunks += 1;
+                        first = false;
+                        let got = d.len() as u64;
+                        out.extend_from_slice(&d);
+                        at = at.saturating_add(got);
+                        if got == 0 || at >= end {
+                            break false;
+                        }
+                        kat_inject(); // `tests unafslock` KAT only: a commit between two holds
+                    }
+                }
+            };
+            if !restart {
+                return Ok(out);
+            }
+            st.restarts += 1;
+            if st.restarts > RESTARTS {
+                st.how = "busy";
+                return Err(ReadMiss::Mount(MountError::Busy));
+            }
+        }
+    }
+
+    // ── `tests unafslock` KAT: commits injected between a read's phases, in the reader's own task ──
+    static INJECT: AtomicU32 = AtomicU32::new(0);
+    static INJECT_TID: AtomicU64 = AtomicU64::new(0);
+    const KAT_ATTR: &str = "unafslock.kat";
+
+    /// A KAT commit at an injection point: one attribute commit on `/var` through the split commit path (the root
+    /// generation moves). Only the KAT's own task, only while it armed `INJECT`; elsewhere one atomic load.
+    pub fn kat_inject() {
+        if INJECT.load(Ordering::Relaxed) == 0 || crate::arch::sched::current_id() != Some(INJECT_TID.load(Ordering::Relaxed)) {
+            return;
+        }
+        INJECT.fetch_sub(1, Ordering::Relaxed);
+        let v = crate::hidstall::now_us() as i64;
+        let _ = super::splitwrite::with_unafs_write(|fs| fs.resolve_path("/var").and_then(|var| fs.set_attribute(var, String::from(KAT_ATTR), AttributeValue::Int(v))));
+    }
+
+    /// `(retry_ok, chunked_ok, hold_max_us)`: leg 1 injects ONE commit (the split must retry once and land split); leg 2
+    /// injects one per split try plus one between the fallback's first two holds (the split must give up after `TRIES`,
+    /// the chunked fallback restart once when the file spans more than one run, every hold <= `KAT_HOLD_MAX_US`). Both
+    /// legs' bytes must equal the caller's reference (`same`).
+    pub fn kat(path: &str, len: u64, same: impl Fn(&[u8]) -> bool) -> (bool, bool, u64) {
+        let Some(me) = crate::arch::sched::current_id() else {
+            serial_println!("[unafslock] kat -> FAIL why=no-task");
+            return (false, false, 0);
+        };
+        INJECT_TID.store(me, Ordering::Relaxed);
+        INJECT.store(1, Ordering::Relaxed);
+        let (r, a) = super::splitread::read_with(path, 0, len);
+        let a_same = r.is_ok_and(|d| same(&d[..]));
+        let retry = a_same && a.tries == 2 && a.how == "split" && a.chunks == 0;
+        INJECT.store(TRIES + 1, Ordering::Relaxed);
+        let (r, b) = super::splitread::read_with(path, 0, len);
+        let b_same = r.is_ok_and(|d| same(&d[..]));
+        let want_restarts = (len > b.run) as u32;
+        let chunked = b_same && b.tries == TRIES && b.how == "fallback-chunked" && b.restarts == want_restarts && b.chunks >= 1 && b.hold_max_us <= KAT_HOLD_MAX_US;
+        let left = INJECT.swap(0, Ordering::Relaxed);
+        INJECT_TID.store(0, Ordering::Relaxed);
+        let _ = super::splitwrite::with_unafs_write(|fs| fs.resolve_path("/var").and_then(|var| fs.remove_attribute(var, KAT_ATTR)));
+        serial_println!(
+            "[unafslock] kat retry tries={} how={} match={} -> {} · chunked tries={} how={} chunks={} restarts={} hold_max_us={} match={} left={} -> {}",
+            a.tries,
+            a.how,
+            a_same,
+            if retry { "ok" } else { "FAIL" },
+            b.tries,
+            b.how,
+            b.chunks,
+            b.restarts,
+            b.hold_max_us,
+            b_same,
+            left,
+            if chunked { "ok" } else { "FAIL" }
+        );
+        (retry, chunked, b.hold_max_us)
+    }
 }
