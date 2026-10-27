@@ -146,7 +146,7 @@ pub fn shell_verb(args: &[&str], console: &mut Console) {
         console.println("tests: refused — finish first-boot setup (root password, then create a user) before the desktop suite runs");
         return;
     }
-    ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); crate::pwwire::ensure_tests(); // CONSOLEFIX (B365): `tests pwwire`, `tests notice`. LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
+    #[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))] { if typed_child::hand(args, console) { return; } } ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_lumen(); ensure_netring3(); ensure_netclock(); crate::pwwire::ensure_tests(); // CONSOLEFIX (B365): `tests pwwire`, `tests notice`. LUMENBIN: `tests lumen`. NETRING3: `tests net` (merge10 fold). NETCLOCK/ARMNET (merge12 fold)
     ensure_ring3win(); ensure_ring3abi(); ensure_elfbss(); crate::smallfix3::ensure(); crate::smallfix4::ensure(); crate::smallfix5::ensure(); crate::smallfix6::ensure(); crate::smallfix7::ensure(); crate::shelltask::ensure_tests(); crate::serialdoor::ensure_tests(); crate::hidstall::ensure(); ensure_fpu(); #[cfg(any(target_arch = "x86_64", feature = "aarch64_el0"))] { crate::video::cursor::cursorshape::ensure(); } /* CURSORSHAPE: the module is gated so (cursor.rs tail); ARMVIRT found the ungated call reds every aarch64 kernel without el0 */ // SHELLTASK (B458): `tests shelltask`. SMALLFIX3 (B416): `tests smallfix3`. RING3WIN, RING3ABI2 (merge12 fold)
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); crate::fs::filetype::ensure_tests(); #[cfg(target_arch = "x86_64")] crate::loaderstage::ensure_tests(); crate::soundopeners::ensure(); // LOADERSTALL (B490): `tests loader`. FILETYPE (B307): `tests filetype`.
     ensure_shellux(); ensure_selfinstall(); ensure_unafsx86(); ensure_usbnet(); ensure_kvblank8(); #[cfg(all(target_arch = "x86_64", feature = "wc"))] crate::video::wm::k2p::ensure_tests(); // K2P (B671): `tests k2p` — 200 synthetic reports through the input-to-photon carriers (`video/wm.rs` tail). LINE-NEUTRAL append, code before the comment. 
@@ -8377,4 +8377,52 @@ fn sleepkey_login_selftest() {
         ":: SLEEPKEY: src={} input_wake_key_swallowed={} woke={} -> {} ::{}",
         src, ks as u8, woke as u8, if ok { "PASS" } else { "FAIL" }, if woke { "" } else { " reason=no-drain" }
     );
+}
+
+// PIDESKQEMULIST (rmbp-ledger B894) — TAIL-APPENDED: a `tests` the operator types into the Pi's windowed shell runs on its
+// own `tests-fx` child, in `bootlist-fx`'s shape (`bootlist_arm::go`, a scratch console, `shell_verb`'s own path). On
+// aarch64 `desktop_firmware` the windowed shell IS the `render` task (main.rs `render_pass`), and a fixture that waits for
+// that pass — `textscale_shell_leg`'s 2 s wait for `font_follow` — could never see it run when the fixture ran on it
+// (`rows_ok=0`, a FORBID in pi4-regression.spec). Only the `render` task hands off (bootlist's children and `tests-fx` itself
+// run inline); `tests list` stays inline (its table is for the glass). One typed run at a time; the verdicts are on the wire.
+// The call is folded onto `shell_verb`'s first ensure line, code first (LINE-NEUTRAL).
+#[cfg(all(target_arch = "aarch64", feature = "desktop_firmware"))]
+mod typed_child {
+    //! CHARTER: Kernel — kernel-by-ruling R132 (PIDESKQEMULIST: a typed `tests` run leaves the Pi render task for its own child; seam: kernel-only)
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use core::sync::atomic::AtomicBool;
+    use core::sync::atomic::Ordering::{AcqRel, Release};
+
+    /// The child's stack, `bootlist-fx`'s size.
+    const STACK: usize = 64 * 1024;
+    /// The words the child runs; written by [`hand`] before the spawn, taken once by [`child`].
+    static WORDS: crate::sync::Mutex<Option<Vec<String>>> = crate::sync::Mutex::new(None);
+    /// A typed run is live on `tests-fx`.
+    static LIVE: AtomicBool = AtomicBool::new(false);
+
+    /// `true` = the run was handed to `tests-fx` (or refused while one is live); `false` = run inline.
+    pub(super) fn hand(args: &[&str], console: &mut crate::console::Console) -> bool {
+        if crate::arch::sched::current_name() != Some("render") || args.first().copied() == Some("list") {
+            return false;
+        }
+        if LIVE.swap(true, AcqRel) {
+            console.println("tests: a typed run is already on its own task (tests-fx)");
+            return true;
+        }
+        *WORDS.lock() = Some(args.iter().map(|a| String::from(*a)).collect());
+        serial_println!("[tests] typed run handed to task=tests-fx words={}", args.join(" "));
+        console.println("tests: running on its own task (tests-fx); the verdicts are on the wire");
+        super::bootlist_arm::go("tests-fx", child, 0, Some(STACK));
+        true
+    }
+
+    /// The `tests-fx` child: the typed words through `shell_verb` on a scratch console.
+    fn child(_arg: usize) {
+        let words = WORDS.lock().take().unwrap_or_default();
+        let args: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+        let mut con = crate::console::Console::new();
+        super::shell_verb(&args, &mut con);
+        LIVE.store(false, Release);
+    }
 }
