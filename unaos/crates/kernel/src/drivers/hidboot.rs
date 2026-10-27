@@ -20,14 +20,16 @@
 // apart from the transport label: `decode_boot_keyboard` now takes the `Transport` that carried the
 // report, and the decoder's own key lines name it — `EHCI-HID:` for EHCI (byte-identical to before),
 // `BT-HID:` for the Bluetooth keyboard (`ehci::bthid`), `PS2-HID:` for the i8042 (`drivers::i8042`).
-// The caller still owns the per-keyboard state (previous keys, modifiers, the lock-key LED byte) and
-// still lights the LED it is told to; every caller runs under `ehci::EHCI_HID`, which serialises the
+// The caller still owns the per-keyboard state (previous keys, modifiers, the lock-key LED byte); the
+// LED change is sent through `Transport::set_leds` (HIDBOOTLEDS B987; EHCI's SET_REPORT stays at its
+// caller, see that fn); every caller runs under `ehci::EHCI_HID`, which serialises the
 // decoder's globals (the DBLSTROKE atomics below) and the typematic feed. `ehci` re-exports
 // `decode_boot_keyboard`, so `ehci::decode_boot_keyboard` paths in prose still resolve.
 //
-// Owed (B982, input.md §5 Z3 row): the lock LEDs (0xED) sent through the transport; the typematic
-// rate (0xF3); the Fn keys; HIDBOOT-TAGS (`[keystat] ehci` / PRTSCR `on EHCI` name EHCI for every
-// transport); HIDBOOT-ARM; HIDBOOT-PUMP (the i8042 is pumped only from `ehci::service_ehci_hid`).
+// HIDBOOTLEDS (rmbp-ledger B987): the lock LEDs leave the decoder through ONE `Transport::set_leds`
+// call; `[keystat] <tag>` and the PRTSCR `on <transport>` word name the transport (EHCI byte-identical).
+// Owed (input.md §5 Z3 row): HIDBOOT-LEDS-EHCI; the Fn keys; HIDBOOT-ARM; HIDBOOT-PUMP (the i8042 is
+// pumped only from `ehci::service_ehci_hid`).
 
 /// The transport that carried a boot keyboard report. Labels the decoder's wire; changes no decode.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,6 +58,21 @@ impl Transport {
             Transport::Ehci => "ehci",
             Transport::Bluetooth => "bt",
             Transport::Ps2 => "ps2",
+        }
+    }
+
+    /// HIDBOOTLEDS (B987) — the ONE route for a lock-LED change, called once from
+    /// `decode_boot_keyboard`'s lock-key site. PS/2: the i8042's 0xED sequence (async, acked through
+    /// the scancode ring, bounded). Bluetooth: bthid's existing `PENDING_LED` slot, drained as the
+    /// DATA|Output report on the next pass. EHCI: nothing here — SET_REPORT is an EP0 control transfer
+    /// that needs `&mut Controller`, which the endpoint walk holds while it calls the decoder, so the
+    /// caller's `led_pushes` deferral (`set_hid_leds` after the walk) sends it, reading this decoder's
+    /// `bool` (owed: HIDBOOT-LEDS-EHCI).
+    pub fn set_leds(self, leds: u8) {
+        match self {
+            Transport::Ehci => {}
+            Transport::Bluetooth => bt_queue_led(leds),
+            Transport::Ps2 => crate::drivers::i8042::set_leds(leds),
         }
     }
 }
@@ -292,7 +309,7 @@ const DOUBLE_LOG_MAX: u32 = 8;
 /// Called ONLY from the `push_event(Event::Key(..))` site, so what it measures is what ring 3 actually
 /// received. If this ever fires after the edge gate, the edge gate is not the whole story and the next
 /// boot says so on its own line rather than leaving the bench to re-describe the symptom.
-fn note_press_edge(ascii: u8) {
+fn note_press_edge(t: Transport, ascii: u8) {
     use core::sync::atomic::Ordering;
     let now = crate::arch::ms();
     PRESS_EDGES.fetch_add(1, Ordering::Relaxed);
@@ -302,7 +319,8 @@ fn note_press_edge(ascii: u8) {
         let n = DOUBLE_PUSHES.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= DOUBLE_LOG_MAX {
             serial_println!(
-                "[keystat] ehci double-push — ascii={:#04x} pushed twice {}ms apart (<= {}ms); the PRODUCER is doubling, not the console (boot dbl={})",
+                "[keystat] {} double-push — ascii={:#04x} pushed twice {}ms apart (<= {}ms); the PRODUCER is doubling, not the console (boot dbl={})",
+                t.tag(),
                 ascii,
                 now.wrapping_sub(prev_ms),
                 DOUBLE_WINDOW_MS,
@@ -316,7 +334,7 @@ fn note_press_edge(ascii: u8) {
 ///
 /// `down` counts character keys down in the report (rollover measure); `restated` counts those the
 /// previous report already carried (suppressed doubles).
-fn note_press_report(down: u32, restated: u32) {
+fn note_press_report(t: Transport, down: u32, restated: u32) {
     use core::sync::atomic::Ordering;
     if down >= 2 {
         ROLLOVER_REPORTS.fetch_add(1, Ordering::Relaxed);
@@ -328,7 +346,8 @@ fn note_press_report(down: u32, restated: u32) {
     let first_few = total <= RESTATE_LOG_MAX;
     if first_few || total % RESTATE_ROLLUP_EVERY < restated {
         serial_println!(
-            "[keystat] ehci press — edges={} restated={} (+{} this report) rollover_reports={} dbl={} window={}ms",
+            "[keystat] {} press — edges={} restated={} (+{} this report) rollover_reports={} dbl={} window={}ms",
+            t.tag(),
             PRESS_EDGES.load(Ordering::Relaxed),
             total,
             restated,
@@ -398,7 +417,7 @@ pub unsafe fn decode_boot_keyboard(
     // keycode went down in THIS report". A keycode the previous report already carried is a RESTATED
     // level, not a new press, and pushing `Event::Key` for it is what doubled characters on metal.
     let mut restated_this_report = 0u32;
-    let mut down_this_report = 0u32; { let mut lev = [crate::pal::Event::None; 12]; let ln = crate::drivers::xhci::hid_layout_push(&cur_keys, prev_keys, modifiers, caps, t.label(), true, &mut lev); for ev in lev[..ln].iter() { if let crate::pal::Event::Key(b) = *ev { note_press_edge(b); } } } // KEYCHARS (B718): the report's ONE layout call (stamped for `[login] key latency`, DBLSTROKE-counted); its claimed usages are skipped below. LINE-NEUTRAL, code first.
+    let mut down_this_report = 0u32; { let mut lev = [crate::pal::Event::None; 12]; let ln = crate::drivers::xhci::hid_layout_push(&cur_keys, prev_keys, modifiers, caps, t.label(), true, &mut lev); for ev in lev[..ln].iter() { if let crate::pal::Event::Key(b) = *ev { note_press_edge(t, b); } } } // KEYCHARS (B718): the report's ONE layout call (stamped for `[login] key latency`, DBLSTROKE-counted); its claimed usages are skipped below. LINE-NEUTRAL, code first.
     for &keycode in cur_keys.iter() {
         if keycode <= 1 {
             continue; // no key / ErrorRollOver
@@ -418,9 +437,9 @@ pub unsafe fn decode_boot_keyboard(
         if !crate::pwwire::withhold() { serial_println!("{}: KEY: class={}", t.label(), crate::pwwire::key_class(ascii)); let _ = keycode; } else { serial_println!("{}: KEY withheld (a secret is being typed)", t.label()); } // CONSOLEFIX M3 (B365, R65): flight 22 printed the login password AND `holocron init`'s here, byte by byte
         crate::boot::key_stamp(); // INSTALLBARE M2: the decode's stamp, read back by `login::consume_key` as `[login] key latency ms=`
         crate::pal::push_event(crate::pal::Event::Key(ascii));
-        note_press_edge(ascii);
+        note_press_edge(t, ascii);
     }
-    note_press_report(down_this_report, restated_this_report);
+    note_press_report(t, down_this_report, restated_this_report);
 
     // KEYREPEAT-X86: feed the host-side typematic tracker at the REPORT LEVEL — BEFORE the release
     // edges below and before anything else this report will push, so a `KeyUp` the 64-slot ring may
@@ -484,6 +503,9 @@ pub unsafe fn decode_boot_keyboard(
             changed = true;
         }
     }
+    if changed {
+        t.set_leds(*leds); // HIDBOOTLEDS (B987): the ONE LED route; EHCI's arm is empty (its caller's SET_REPORT reads `changed`)
+    }
 
     // PRTSCR: the Print Screen press edge — the SAME shared predicate the xHCI decoder asks, for the
     // same reason the lock keys share a table: a key is a key whichever controller carried it. This
@@ -497,7 +519,7 @@ pub unsafe fn decode_boot_keyboard(
     if let Some(act) = crate::drivers::xhci::hid_print_screen_action_edge(&cur_keys, prev_keys, modifiers) {
         // KEYMAP (R60): the 0x46 EDGE is detected as it always was; what the usage MEANS comes from
         // the theme's binding table now, so a theme that drops the row disarms the key here too.
-        serial_println!(":: PRTSCR: PrintScreen (HID 0x46) down on EHCI -> capture armed action={} ::", act.name());
+        serial_println!(":: PRTSCR: PrintScreen (HID 0x46) down on {} -> capture armed action={} ::", t.label().trim_end_matches("-HID"), act.name()); // HIDBOOT-TAGS (B987): EHCI byte-identical
         if act.is_capture() { crate::video::prtscr::request(); }
     } else if let Some((act, chord)) =
         crate::drivers::xhci::hid_screenshot_chord_edge(&cur_keys, prev_keys, modifiers)
@@ -509,8 +531,8 @@ pub unsafe fn decode_boot_keyboard(
         // a chord arms exactly once. The chord types nothing: `ascii_of` above folds any GUI-held (and
         // any Alt-held) usage to 0, which covers a PC-shaped table with no new rule.
         if act.is_capture() { serial_println!(
-            ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on EHCI -> capture armed action={} ::",
-            chord, act.name()); crate::video::prtscr::request(); } else { serial_println!("[clip] chord={} action={} via={} -> delivered", chord, act.name(), t.tag()); crate::pal::push_event(crate::pal::Event::Action(act)); } } // APPCLIP (R61) — **THE NON-CAPTURE ARM, WHICH UNTIL NOW WENT NOWHERE.** KEYMAP resolved ⌘C/⌘V/⌘X/⌘A here and STOPPED (keymap.md §6: "no consumer and no delivery path"), so the chord was judged and then dropped on the floor. It is now pushed onto the SAME ring the keystrokes from this decoder travel, as `pal::Event::Action` — a third kind of event, neither key nor pointer — and the first thing that acts on it is `video::clipboard::terminal_action`. The capture arm above is byte-for-byte what it was: `is_capture()` still owns `prtscr::request()`, so the PRTSCR wire and flight 11’s two proven chords are untouched, and this `else` can only be reached by an action `is_capture()` refused. No modifier, focus or window test is added here and none may be: R61’s point is that the TABLE decides, which is also why `Ctrl-C` cannot reach this line — no shipped row claims it, so `resolve` returns `None` and `hid_key_ascii` still hands the shell 0x03. ⚠ FOLDED onto the existing statement and given no line of its own — this file is 17k/19k lines of `panic::Location` records that embed line numbers (B94, LEDGER P7); CODE FIRST, then the prose (A10FIX).
+            ":: PRTSCR: [prtscr] chord={} (GUI+Shift+digit) down on {} -> capture armed action={} ::",
+            chord, t.label().trim_end_matches("-HID"), act.name()); crate::video::prtscr::request(); } else { serial_println!("[clip] chord={} action={} via={} -> delivered", chord, act.name(), t.tag()); crate::pal::push_event(crate::pal::Event::Action(act)); } } // APPCLIP (R61) — **THE NON-CAPTURE ARM, WHICH UNTIL NOW WENT NOWHERE.** KEYMAP resolved ⌘C/⌘V/⌘X/⌘A here and STOPPED (keymap.md §6: "no consumer and no delivery path"), so the chord was judged and then dropped on the floor. It is now pushed onto the SAME ring the keystrokes from this decoder travel, as `pal::Event::Action` — a third kind of event, neither key nor pointer — and the first thing that acts on it is `video::clipboard::terminal_action`. The capture arm above is byte-for-byte what it was: `is_capture()` still owns `prtscr::request()`, so the PRTSCR wire and flight 11’s two proven chords are untouched, and this `else` can only be reached by an action `is_capture()` refused. No modifier, focus or window test is added here and none may be: R61’s point is that the TABLE decides, which is also why `Ctrl-C` cannot reach this line — no shipped row claims it, so `resolve` returns `None` and `hid_key_ascii` still hands the shell 0x03. ⚠ FOLDED onto the existing statement and given no line of its own — this file is 17k/19k lines of `panic::Location` records that embed line numbers (B94, LEDGER P7); CODE FIRST, then the prose (A10FIX).
 
     *prev_keys = cur_keys;
     // ALLKEYS: remember this accepted report's modifier byte, so a later endpoint-death flush can
@@ -519,3 +541,12 @@ pub unsafe fn decode_boot_keyboard(
     *prev_mods = modifiers;
     changed
 }
+
+// HIDBOOTLEDS (B987): `Transport::set_leds`'s Bluetooth arm — bthid's `PENDING_LED` slot where the
+// Bluetooth HID host is linked (`btc`), nothing where it is not.
+#[cfg(feature = "btc")]
+fn bt_queue_led(leds: u8) {
+    crate::drivers::ehci::bthid::queue_led(leds);
+}
+#[cfg(not(feature = "btc"))]
+fn bt_queue_led(_leds: u8) {}
