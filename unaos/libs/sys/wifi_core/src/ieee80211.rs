@@ -213,6 +213,19 @@ pub fn parse_reason(frame: &[u8]) -> Option<(u8, u16)> {
     Some((sub, u16::from_le_bytes([frame[24], frame[25]])))
 }
 
+/// WIFILEAVEBUILD (zenbook-ledger Z75): Reason Code 3 (§9.4.1.7) — deauthenticated because the sending station is leaving.
+pub const REASON_LEAVING: u16 = 3;
+
+/// WIFILEAVEBUILD (Z75): the station's own Deauthentication (§9.3.3.12) — the 24-octet management header from
+/// `push_mgmt_header` (DA = addr3 = the BSSID, SA = the station, sequence 0) and the Reason Code little-endian: 26 octets,
+/// unprotected. `parse_reason` is its reader; the MT7925 leave (`tests wifileave`) sends it.
+pub fn build_deauth(sta: Mac, bssid: Mac, reason: u16) -> Vec<u8> {
+    let mut f = Vec::with_capacity(26);
+    push_mgmt_header(&mut f, SUBTYPE_DEAUTH, bssid, sta, bssid, 0);
+    f.extend_from_slice(&reason.to_le_bytes()); // Reason Code
+    f
+}
+
 /// LLC/SNAP header for an Ethernet-typed payload (RFC 1042): AA-AA-03-00-00-00 then the EtherType.
 pub const SNAP_PREFIX: [u8; 6] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00];
 
@@ -340,6 +353,27 @@ mod tests {
         resp[26] = 2; // transaction 2
         resp[28] = 13; // status 13
         assert_eq!(parse_auth(&resp), Some(AuthResult { alg: 0, seq: 2, status: 13 }));
+    }
+
+    // WIFILEAVEBUILD (Z75): the deauthentication KAT — the expected octets assembled field by field from §9.3.3.12's layout.
+    #[test]
+    fn deauth_kat() {
+        let sta = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let bssid = [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        let mut want = vec![0xc0, 0x00]; // Frame Control: management (type 0), deauthentication (subtype 12), no flags
+        want.extend_from_slice(&[0x00, 0x00]); // Duration
+        want.extend_from_slice(&bssid); // addr1 = DA = the AP
+        want.extend_from_slice(&sta); // addr2 = SA = the station
+        want.extend_from_slice(&bssid); // addr3 = the BSSID
+        want.extend_from_slice(&[0x00, 0x00]); // Sequence Control: fragment 0, sequence 0
+        want.extend_from_slice(&[0x03, 0x00]); // Reason Code 3, little-endian
+        let f = build_deauth(sta, bssid, REASON_LEAVING);
+        assert_eq!(f.len(), 26);
+        assert_eq!(f, want);
+        assert_eq!(parse_reason(&f), Some((SUBTYPE_DEAUTH, REASON_LEAVING)));
+        let g = build_deauth(sta, bssid, 0x0102);
+        assert_eq!(&g[24..26], &[0x02, 0x01]);
+        assert_eq!(&g[..24], &want[..24]);
     }
 
     #[test]

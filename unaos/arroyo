@@ -10657,7 +10657,7 @@ test_splash() {
 # three), every line held on the previous line's verdict. The spec's COMPLETE is the last verdict. The typist connects to QMP before it reads a marker, and the QMP socket exists only after
 # test_x86_64 has removed the old capture, so it never reads a stale log. Transcript: target/zenbook-typist.log (beside it).
 test_zenbook() {
-    local secs="${1:-206}"   # MT7925S10 (Z55): 200 -> 206 s, the typed `tests wpa2` costs 5.6 s (4 s settle + 11 keys x 0.12 + 0.25 poll). ZENBOOKSPECPINS (Z54): 180 -> 200 s, the three typed verbs added below cost 18.15 s (3 x 4 s settle + 45 keys x 0.12 s + 3 x 0.25 s poll)
+    local secs="${1:-213}"   # WIFILEAVEBUILD (Z75): 206 -> 213 s, the typed `tests wifileave` (Z68) costs 6.17 s by the Z55 formula (4 s settle + 16 keys x 0.12 + 0.25 poll = 4 + 1.92 + 0.25). MT7925S10 (Z55): 200 -> 206 s, the typed `tests wpa2` costs 5.6 s (4 s settle + 11 keys x 0.12 + 0.25 poll). ZENBOOKSPECPINS (Z54): 180 -> 200 s, the three typed verbs added below cost 18.15 s (3 x 4 s settle + 45 keys x 0.12 s + 3 x 0.25 s poll)
     if [ -z "${UNAOS_ZENBOOKLANE:-}" ]; then
         local _zk="" _zv
         for _zv in $(compgen -e); do case "$_zv" in UNAOS_QEMU_MACHINE|UNAOS_QMP_PORT|UNAOS_NVME_4K|UNAOS_NVME_DISK) ;; UNAOS_*) _zk="${_zk} ${_zv#UNAOS_}"; unset "$_zv" ;; esac; done
@@ -15294,7 +15294,7 @@ case "${1:-}" in
     test-zenbook|test_zenbook)
         # ZENBOOKLANE (zenbook-ledger Z13): the Zenbook line under QEMU as zenbook_um5606w. Re-execs itself (see
         # test_zenbook), so this arm is entered twice per invocation. Fold-gate command, not a leg of `check`.
-        test_zenbook "${2:-206}"   # MT7925S10 (Z55): 206 s, the default beside test_zenbook's (a dispatcher default of 200 would override it). ZENBOOKSPECPINS (Z54): 200 s, twelve typed verbs (+18.15 s measured from typist.sh). ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
+        test_zenbook "${2:-213}"   # WIFILEAVEBUILD (Z75): 213 s, the default beside test_zenbook's (206 + 6.17 s for the typed `tests wifileave`: 4 s settle + 16 keys x 0.12 + 0.25 poll). MT7925S10 (Z55): 206 s, the default beside test_zenbook's (a dispatcher default of 200 would override it). ZENBOOKSPECPINS (Z54): 200 s, twelve typed verbs (+18.15 s measured from typist.sh). ZENBOOKLANETYPED (Z16): 180 s — the run now reaches the desktop and six typed verbs; FASTTEST ends it at COMPLETE
         ;;
     kernel8|baremetal)
         _BOOTLIST_MEDIA=1 kernel8   # BOOTLISTARM (B874): the Pi card verb arms the list; kernel8-run/-test/-install never do
