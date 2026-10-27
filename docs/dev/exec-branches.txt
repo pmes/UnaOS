@@ -843,7 +843,7 @@ refs/heads/exec-rmbp-hevcinter   1d99c4ae9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-hevcheic   1d99c4ae9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle2c   1d99c4ae9 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-h264encrc   c456a1b0d FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-strip2   1d99c4ae9 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-strip2   e24c32e9f FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-stationrejoin   fc3028c88 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-pideskqemulist   87a0a3af5 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle4b   4782a5a10 FOLDED-BY-HAND (this commit) 2026-10-27

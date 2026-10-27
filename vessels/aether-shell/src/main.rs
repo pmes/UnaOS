@@ -1238,6 +1238,133 @@ mod tests {
 
         assert_eq!(format!("{:?}", chrome_rows::find_msg("needle", true)), r#"BrowserFind { query: "needle", forward: true }"#);
     }
+
+    /// STRIP2 (SR219): what chrome_rows derives for both faces' strips is the model's. The tab search over the wire is
+    /// `TabStrip::search`; the top strip's walk is `TabStrip::rows` without `+` (open and collapsed); a drop's verb,
+    /// applied as `Coordinator::on_bus` applies it (`chrome::apply_tab_verb`), lands the tab where the model puts it;
+    /// the layout row and its parse and the favicon tile's side are the model's.
+    #[test]
+    fn aethermacstrip2_model_kat() {
+        use chrome::sidetabs::{self, TabLayout};
+        use chrome::tabs::{GroupColor, Row, TabStrip};
+        use quartzite::widgets::chrome_rows::{self, DropOn, SideRow, TabWire};
+        let mut strip = TabStrip::new();
+        let ids: Vec<u64> = (0..5).map(|_| strip.open()).collect();
+        let pages = [
+            ("Rust Docs", "https://doc.rust-lang.org/"),
+            ("News", "https://news.example/rust"),
+            ("Mail", "https://mail.example/"),
+            ("Maps", "https://maps.example/"),
+            ("Video", "https://video.example/"),
+        ];
+        for (k, (title, url)) in pages.iter().enumerate() {
+            assert!(strip.update(ids[k], Some(title), Some(url), Some(false)));
+        }
+        let g = strip.group_new("work", GroupColor::Blue, &ids[1..3]).expect("group");
+        let wire_of = |strip: &TabStrip| {
+            let mut w = TabWire::default();
+            assert!(w.take(&chrome::tabs_message(strip)));
+            w
+        };
+        let face_of = |w: &TabWire| -> Vec<Row> {
+            chrome_rows::top_rows(w.active, &w.tabs, &w.groups)
+                .iter()
+                .map(|r| match r {
+                    SideRow::Group { id, .. } => Row::Group(*id),
+                    SideRow::Tab { id, .. } => Row::Tab(*id),
+                    SideRow::New => Row::NewTab,
+                })
+                .collect()
+        };
+        let w = wire_of(&strip);
+        for q in ["rust", "  MA ", "", "example/", "nothing"] {
+            assert_eq!(w.search(q).iter().map(|t| t.id).collect::<Vec<_>>(), strip.search(q), "query {q:?}");
+        }
+        for collapse in [false, true] {
+            if collapse {
+                assert_eq!(strip.group_toggle(g), Some(true));
+            }
+            let mut rows = strip.rows();
+            assert_eq!(rows.pop(), Some(Row::NewTab));
+            assert_eq!(face_of(&wire_of(&strip)), rows, "collapsed {collapse}");
+        }
+        assert_eq!(strip.group_toggle(g), Some(false));
+
+        // The drops, applied the shell's way.
+        let drop = |strip: &mut TabStrip, id: u64, on: DropOn| {
+            let verb = wire_of(strip).drop_verb(id, on).expect("a drop verb");
+            assert_eq!(chrome::apply_tab_verb(strip, &verb), Some(true), "{verb:?}");
+        };
+        drop(&mut strip, ids[4], DropOn::Tab(ids[0]));
+        assert_eq!(strip.tabs().first().map(|t| t.id), Some(ids[4]));
+        drop(&mut strip, ids[0], DropOn::End);
+        assert_eq!(strip.tabs().last().map(|t| t.id), Some(ids[0]));
+        drop(&mut strip, ids[3], DropOn::Group(g));
+        assert_eq!(strip.get(ids[3]).and_then(|t| t.group), Some(g));
+        assert!(wire_of(&strip).drop_verb(ids[3], DropOn::Tab(ids[3])).is_none());
+
+        // The layout row, its parse, the favicon tile.
+        assert_eq!((chrome_rows::LAYOUT_NS, chrome_rows::LAYOUT_KEY), (sidetabs::PREF_NS, sidetabs::PREF_KEY));
+        for v in ["side", " SIDE ", "top", "", "left"] {
+            assert_eq!(chrome_rows::layout_is_side(v), TabLayout::parse(v) == TabLayout::Side, "{v:?}");
+        }
+        assert_eq!(chrome_rows::FAVICON_PX, sidetabs::FAVICON_PX);
+        let tile = sidetabs::favicon_tile(32, 32, &vec![200u8; 32 * 32 * 4]).expect("tile");
+        assert_eq!(chrome_rows::favicon_rgba(sidetabs::FAVICON_PX, &tile).map(|p| p.len()), Some(16 * 16 * 4));
+    }
+
+    /// STRIP2 (SR219): the chrome's keys (`chrome_rows::key_verbs`, both faces' table) drive the model the way
+    /// `Coordinator::on_bus` applies them: Ctrl+Tab / Ctrl+PgDn step right, Ctrl+Shift+Tab / Ctrl+PgUp step left
+    /// (`TabStrip::step`, wrapping), Cmd+W closes the active tab, Cmd+T opens one; zoom and the bookmark are the
+    /// shell's existing `BrowserZoom` / `BrowserBookmarkToggle` arms.
+    #[test]
+    fn aethermacstrip2_keys_drive_the_model_kat() {
+        use chrome::tabs::TabStrip;
+        use quartzite::widgets::chrome_rows::{key_verbs, KeyMods};
+        let verb = |key: &str, mods: KeyMods| key_verbs().into_iter().find(|k| k.key == key && k.mods == mods).map(|k| k.msg).expect("a key");
+        let apply = |strip: &mut TabStrip, m: SMessage| match m {
+            SMessage::BrowserTabNew => {
+                strip.open();
+            }
+            SMessage::BrowserTabClose(id) => {
+                let id = id.unwrap_or(strip.active());
+                if strip.get(id).is_some() {
+                    strip.close(id);
+                }
+            }
+            SMessage::BrowserTabStep(n) => {
+                strip.step(n);
+            }
+            other => panic!("not a strip key: {other:?}"),
+        };
+        let mut strip = TabStrip::new();
+        let a = strip.open();
+        let b = strip.open();
+        let c = strip.open();
+        assert!(strip.select(a));
+        apply(&mut strip, verb("Tab", KeyMods::Control));
+        assert_eq!(strip.active(), b);
+        apply(&mut strip, verb("Page_Down", KeyMods::Control));
+        assert_eq!(strip.active(), c);
+        apply(&mut strip, verb("Tab", KeyMods::Control));
+        assert_eq!(strip.active(), a, "wraps");
+        apply(&mut strip, verb("Tab", KeyMods::ControlShift));
+        assert_eq!(strip.active(), c);
+        apply(&mut strip, verb("Page_Up", KeyMods::Control));
+        assert_eq!(strip.active(), b);
+        apply(&mut strip, verb("w", KeyMods::Primary));
+        assert!(strip.get(b).is_none());
+        assert_eq!(strip.len(), 2);
+        apply(&mut strip, verb("t", KeyMods::Primary));
+        assert_eq!(strip.len(), 3);
+        for k in key_verbs() {
+            assert!(
+                matches!(k.msg, SMessage::BrowserTabNew | SMessage::BrowserTabClose(None) | SMessage::BrowserTabStep(_) | SMessage::BrowserZoom(_) | SMessage::BrowserBookmarkToggle),
+                "{:?}",
+                k.msg
+            );
+        }
+    }
 }
 
 /// AETHERMAC (SR196): every face opens the first argument that is not a flag as the first page
