@@ -584,6 +584,7 @@ pub fn source_revoked(key: &str) {
     if n == 0 {
         serial_println!("[mic] revoke key={} open=0 (no program source open; the next open asks)", key);
     }
+    serial_println!("[privacy] revoke mic key={} -> sources_closed={}", key, n); // AUDIOCAPTURE (B851): the Revoke's count
 }
 
 /// MICRING3 — slot `s` lost its last holder (`sched::term_release_edge`, IF=0): its source, if any, closes. Atomics and
