@@ -14,7 +14,9 @@
 //! MP4 `vp08`) is real: [`vp8::Vp8Decoder`] over `vp8_core` (VP8CORE, LEDGER SR40). VP9 (WebM
 //! `V_VP9`, MP4 `vp09`, profiles 0 and 2) is real: [`vp9::Vp9Decoder`] over `vp9_core` (VP9CORE,
 //! LEDGER SR116). H.264 / AVC (MP4 `avc1` / `avc3`, Matroska `V_MPEG4/ISO/AVC`; Baseline, Main and
-//! High at 8-bit 4:2:0) is real: [`h264::H264Decoder`] over `h264_core` (H264CORE, LEDGER SR133).
+//! High at 8-bit 4:2:0) is real: [`h264::H264Decoder`] over `h264_core` (H264CORE, LEDGER SR133). H.265 / HEVC (MP4
+//! `hvc1` / `hev1`, Matroska `V_MPEGH/ISO/HEVC`; 8-bit 4:2:0 intra pictures) is real behind the `hevc` feature:
+//! `hevc::HevcDecoder` over `hevc_core` (HEVCPAL, LEDGER SR215).
 
 use super::demux::{Codec, Packet, Track};
 use super::demux::build::TestPatternPacket;
@@ -106,7 +108,7 @@ pub trait VideoDecoder: Send {
 ///
 /// `utp1` → [`TestPattern`] (real: it is that stream's decoder). VP8 → [`vp8::Vp8Decoder`]. VP9 →
 /// [`vp9::Vp9Decoder`]. H.264 → [`h264::H264Decoder`]. AV1 →
-/// `av1::Av1Decoder` when the `av1` feature is on. Anything else → `Err(Unsupported)`; the caller may then ask for
+/// `av1::Av1Decoder` when the `av1` feature is on. HEVC → `hevc::HevcDecoder` when the `hevc` feature is on. Anything else → `Err(Unsupported)`; the caller may then ask for
 /// [`TestPattern::stand_in`] to keep the pipeline (clock, scheduling, sink) running, which marks
 /// itself `is_real() == false`.
 pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> {
@@ -117,6 +119,8 @@ pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> 
         Codec::Avc => Ok(Box::new(h264::H264Decoder::new(track)?)),
         #[cfg(feature = "av1")]
         Codec::Av1 => Ok(Box::new(av1::Av1Decoder::new(track)?)),
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => Ok(Box::new(hevc::HevcDecoder::new(track)?)),
         other => Err(DecodeError::Unsupported(format!("{other:?} ({})", track.codec_name))),
     }
 }
@@ -124,14 +128,17 @@ pub fn decoder_for(track: &Track) -> Result<Box<dyn VideoDecoder>, DecodeError> 
 /// DEMUXWIRE (LEDGER SR213): the reorder depth of a video track, read by its codec core from the track's decoder
 /// configuration — what `Demuxer::derive_dts` takes to give a Matroska track decode times (demux_core links no decoder).
 /// H.264 → `h264_core::ps::avcc_reorder_depth` (avcC); AV1 → `av1_core::image::av1c_reorder_depth` (av1C) when the `av1`
-/// feature is on. Anything else → `None`: VP9 (exact: a superframe is presented in decode order) and HEVC (no core reads
-/// hvcC yet, DEMUXSEEK-HEVCDTS) stay `DecodeTime::Presentation`. The one dispatch both of Stria's opens (the editor's and
+/// feature is on; HEVC → `hevc::hvcc_reorder_depth` (hvcC's sps_max_num_reorder_pics, HEVCPAL SR215) when the `hevc`
+/// feature is on. Anything else → `None`: VP9 (exact: a superframe is presented in decode order) stays
+/// `DecodeTime::Presentation`. The one dispatch both of Stria's opens (the editor's and
 /// the Player's) pass by name.
 pub fn reorder_depth(track: &Track) -> Option<u32> {
     match &track.codec {
         Codec::Avc => h264_core::ps::avcc_reorder_depth(&track.config),
         #[cfg(feature = "av1")]
         Codec::Av1 => av1_core::image::av1c_reorder_depth(&track.config),
+        #[cfg(feature = "hevc")]
+        Codec::Hevc => hevc::hvcc_reorder_depth(&track.config),
         _ => None,
     }
 }
@@ -140,6 +147,8 @@ pub fn reorder_depth(track: &Track) -> Option<u32> {
 pub mod av1;
 pub mod vp8;
 pub mod h264;
+#[cfg(feature = "hevc")]
+pub mod hevc;
 pub mod vp9;
 
 // ---------------------------------------------------------------------------------------------
@@ -348,10 +357,11 @@ mod tests {
 
     #[test]
     fn unsupported_codec_is_named_and_stand_in_is_labelled() {
-        // H.264 has a decoder since H264CORE (SR133); HEVC still has none.
+        // HEVC has a decoder since HEVCPAL (SR215); MPEG-4 Part 2 Visual (`mp4v`) is mapped by no demux_core arm
+        // (Codec::Other) and decoded by no core.
         let mut t = build::test_pattern_track(1, 320, 240, 10, 10, 10).spec;
-        t.fourcc = *b"hvc1";
-        t.config_box = Some(*b"hvcC");
+        t.fourcc = *b"mp4v";
+        t.config_box = None;
         let file = build::mp4(&[build::MediaTrack { spec: t, samples: vec![] }], &Mp4Options::default());
         let d = Demuxer::open(file).unwrap();
         assert!(matches!(decoder_for(&d.tracks()[0]), Err(DecodeError::Unsupported(_))));

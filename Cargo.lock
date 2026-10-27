@@ -2013,6 +2013,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "h264_core",
+ "hevc_core",
  "http_core",
  "infer_core",
  "log",
