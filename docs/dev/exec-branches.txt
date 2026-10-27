@@ -1046,7 +1046,7 @@ refs/heads/exec-rmbp-hidbootledstest   9a4ea2fd7 FOLDED-BY-HAND (this commit) 20
 refs/heads/exec-rmbp-aacenctnsdown   b3def5e82 cut 2026-10-27 (wave36 batch 16)
 refs/heads/exec-rmbp-zenbookecgpe   dc1814ec9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-dsdtone   353c891c8 FOLDED-BY-HAND (this commit) 2026-10-27
-refs/heads/exec-rmbp-flightlistboardtags   b3def5e82 cut 2026-10-27 (wave36 batch 16)
+refs/heads/exec-rmbp-flightlistboardtags   3a52111bd FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-kernelpresentpolicy   1e744ddc9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-mt7925s8   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
 refs/heads/exec-rmbp-zenbookledgerhead   4b87cfee0 cut 2026-10-27 (wave36 batch 17)
