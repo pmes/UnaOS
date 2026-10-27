@@ -3196,10 +3196,10 @@ pub fn start_counts() -> (u32, u32, u32, u32) {
 
 /// The codec verb door: `Rings` (the live CORB/RIRB) and the KAT's fake codec. `afg_find` is generic over it.
 trait Verbs {
-    fn cmd(&mut self, cad: u8, nid: u8, verb: u32, payload: u32, a: &mut Audit) -> Option<u32>;
+    fn cmd(&mut self, cad: u8, nid: u8, verb: u32, payload: u32, a: &mut Audit) -> Option<u32>; #[cfg(feature = "hda-tone")] fn live(&self) -> bool { false } // ZENBOOKACPDEPOP (Z60): true only on the live door (`Rings`), so a KAT fake never runs the depop
 }
 
-impl Verbs for Rings {
+impl Verbs for Rings { #[cfg(feature = "hda-tone")] fn live(&self) -> bool { true } // ZENBOOKACPDEPOP (Z60)
     fn cmd(&mut self, cad: u8, nid: u8, verb: u32, payload: u32, a: &mut Audit) -> Option<u32> {
         Rings::cmd(self, cad, nid, verb, payload, a)
     }
@@ -3531,7 +3531,7 @@ struct AlcArm {
 fn alc_arm<V: Verbs>(v: &mut V, cad: u8, afg: u8, ws: &mut [Widget; MAX_NODES], b: &mut Audit) -> Result<AlcArm, &'static str> {
     let walk = walk_codec(v, cad, ws, b).ok_or("walk")?;
     let hp = walk.hp_pin.ok_or("no-hp")?;
-    let path = find_path(ws, hp).ok_or("no-path")?;
+    let path = find_path(ws, hp).ok_or("no-path")?; alc_depop_due(v, cad, hp, b); // ZENBOOKACPDEPOP (Z60): Linux alc294_hp_init once per boot, before path_on drives the HP pin (file tail)
     let (d0, hp_on, eapd) = path_on(v, cad, afg, &path, ws, b);
     Ok(AlcArm { walk, path, d0, hp: hp_on, eapd })
 }
@@ -3707,7 +3707,7 @@ pub fn path_selftest() {
         None => serial_println!(":: HDAPATH: d0=ok path=ok sets={} cases={}/{} -> PASS ::", g.sets, ok, cases.len()),
         Some(name) => serial_println!(":: HDAPATH: cases={}/{} -> FAIL :: case={} ::", ok, cases.len(), name),
     }
-    alc_due_selftest(); // ZENBOOKACPPLAY (Z47): its own line, outside HDAPATH's count
+    alc_due_selftest(); alc_depop_selftest(); // ZENBOOKACPPLAY (Z47): its own line, outside HDAPATH's count; ZENBOOKACPDEPOP (Z60): the depop kat, its own line
 }
 
 // ── ZENBOOKACPPLAY (zenbook-ledger Z47, MEASURE: PASS) — the mixer's HDA stream on the ALC294 arm — TAIL ──
@@ -3774,5 +3774,208 @@ fn alc_due_selftest() {
     serial_println!(
         "[hda] alcplay kat keep={} arm={} tone={} play={} held={} -> {}",
         w(keep), w(arm), w(tone), w(play), w(held), w(keep && arm && tone && play && held)
+    );
+}
+
+// ── ZENBOOKACPDEPOP (zenbook-ledger Z60, MEASURE: PASS) — Linux alc294_hp_init before the first HP drive — TAIL ──
+// Owner: Stria (CODEX §2), the HDA driver's one codec door. Linux (sound/hda/codecs/realtek/alc269.c `alc294_hp_init`,
+// run once by `alc294_init` BEFORE `alc_default_init` re-drives the pins): HP pin AMP_OUT_MUTE, 100 ms, pin ctl 0, COEF
+// 0x6f &= ~0xf (depop manual), COEFEX 0x58/0x00 |= 0x8000 (depop start), poll COEFEX 0x58/0x01 bit 0x80 up to 20 x 50
+// ms, COEF 0x6f = (.. & ~0xf) | 0xb (depop auto), 50 ms. COEF and COEFEX are ONE verb pair (realtek.c
+// `__alc_read_coefex_idx` / `__alc_write_coefex_idx`: SET_COEF_INDEX then GET_PROC_COEF / SET_PROC_COEF on a NID);
+// plain COEF is NID 0x20, COEFEX 0x58 is the hidden vendor widget 0x58. The seat: `alc_arm`, between `find_path` (the
+// walk's HP pin; the walk set the AFG D0) and `path_on` (which re-drives pin ctl OUT|HP; `vol::apply` and run_tone's
+// amp loop unmute the pin, path node 0) — Linux's order. Once per boot (`DEPOP_DONE`), live door only (`Verbs::live`),
+// so the HDAPATH KAT's fake never sees it. Owed: ZENBOOK-ACP-RESUME (again after S3/S4), DEPOP-YIELD. LOCKS: the arm's
+// (census's `ring::own` hold, probe's task); the latch is an atomic.
+
+/// Set by the first live depop of the boot (Linux `spec->done_hp_init`), refused or not; never retried.
+#[cfg(feature = "hda-tone")]
+static DEPOP_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Realtek SET_COEF_INDEX / SET_PROC_COEF (4-bit verbs, 16-bit payload) and GET_PROC_COEF. [Linux hda_verbs.h]
+#[cfg(feature = "hda-tone")]
+const VERB_SET_COEF_INDEX: u32 = 0x500;
+#[cfg(feature = "hda-tone")]
+const VERB_SET_PROC_COEF: u32 = 0x400;
+#[cfg(feature = "hda-tone")]
+const VERB_GET_PROC_COEF: u32 = 0xC00;
+
+/// Read Realtek coefficient `idx` behind `nid` (0x20 = COEF, 0x58 = COEFEX): SET_COEF_INDEX then GET_PROC_COEF.
+#[cfg(feature = "hda-tone")]
+fn coef_read<V: Verbs>(v: &mut V, cad: u8, nid: u8, idx: u32, b: &mut Audit) -> Option<u32> {
+    v.cmd(cad, nid, VERB_SET_COEF_INDEX, idx & 0xFFFF, b)?;
+    b.verbs_set += 1;
+    let r = v.cmd(cad, nid, VERB_GET_PROC_COEF, 0, b)?;
+    b.verbs_get += 1;
+    Some(r & 0xFFFF)
+}
+
+/// Write Realtek coefficient `idx` behind `nid`: SET_COEF_INDEX then SET_PROC_COEF.
+#[cfg(feature = "hda-tone")]
+fn coef_write<V: Verbs>(v: &mut V, cad: u8, nid: u8, idx: u32, val: u32, b: &mut Audit) -> Option<()> {
+    v.cmd(cad, nid, VERB_SET_COEF_INDEX, idx & 0xFFFF, b)?;
+    b.verbs_set += 1;
+    v.cmd(cad, nid, VERB_SET_PROC_COEF, val & 0xFFFF, b)?;
+    b.verbs_set += 1;
+    Some(())
+}
+
+/// One depop's answers. `step` 0 = every step answered; else the step that refused and `why`.
+#[cfg(feature = "hda-tone")]
+struct Depop {
+    before: u32,
+    after: u32,
+    poll_ms: u32,
+    step: u8,
+    why: &'static str,
+}
+
+/// Linux `alc294_hp_init` over the verb door, steps 1..6 (see the block head). `sleep(v, ms)` is the wait: the live
+/// door's `delay_us`, the KAT's log. A door that does not answer stops the sequence at that step (`timeout`: `Rings`
+/// returns None only on its 100 ms verb bound); a poll still busy after 20 x 50 ms is step 5 `poll-timeout` and step 6
+/// still runs, as in Linux.
+#[cfg(feature = "hda-tone")]
+fn alc294_depop<V: Verbs, S: FnMut(&mut V, u32)>(v: &mut V, cad: u8, hp: u8, b: &mut Audit, mut sleep: S) -> Depop {
+    fn halt(mut d: Depop, n: u8) -> Depop {
+        d.step = n;
+        d.why = "timeout";
+        d
+    }
+    let mut d = Depop { before: 0, after: 0, poll_ms: 0, step: 0, why: "" };
+    let Some(_) = v.cmd(cad, hp, tone::VERB_SET_AMP_GAIN_MUTE, 0xb080, b) else { return halt(d, 1) }; // AMP_OUT_MUTE
+    b.verbs_set += 1;
+    sleep(&mut *v, 100);
+    let Some(_) = v.cmd(cad, hp, tone::VERB_SET_PIN_CONTROL, 0, b) else { return halt(d, 2) };
+    b.verbs_set += 1;
+    let Some(c) = coef_read(v, cad, 0x20, 0x6f, b) else { return halt(d, 3) };
+    d.before = c;
+    let Some(()) = coef_write(v, cad, 0x20, 0x6f, c & !0x000F, b) else { return halt(d, 3) };
+    let Some(x) = coef_read(v, cad, 0x58, 0x00, b) else { return halt(d, 4) };
+    let Some(()) = coef_write(v, cad, 0x58, 0x00, (x & !0x8000) | 0x8000, b) else { return halt(d, 4) };
+    let Some(mut p) = coef_read(v, cad, 0x58, 0x01, b) else { return halt(d, 5) };
+    let mut i = 0;
+    while i < 20 && p & 0x0080 != 0 {
+        sleep(&mut *v, 50);
+        d.poll_ms += 50;
+        let Some(q) = coef_read(v, cad, 0x58, 0x01, b) else { return halt(d, 5) };
+        p = q;
+        i += 1;
+    }
+    if p & 0x0080 != 0 {
+        d.step = 5;
+        d.why = "poll-timeout";
+    }
+    let Some(y) = coef_read(v, cad, 0x20, 0x6f, b) else { return halt(d, 6) };
+    d.after = (y & !0x000F) | 0x000B;
+    let Some(()) = coef_write(v, cad, 0x20, 0x6f, d.after, b) else { return halt(d, 6) };
+    sleep(&mut *v, 50);
+    d
+}
+
+/// `alc_arm`'s hook: the first live arm of the boot runs the depop before `path_on` drives the HP pin. One line.
+#[cfg(feature = "hda-tone")]
+fn alc_depop_due<V: Verbs>(v: &mut V, cad: u8, hp: u8, b: &mut Audit) {
+    if !v.live() || DEPOP_DONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let d = alc294_depop(v, cad, hp, b, |_: &mut V, ms: u32| delay_us(ms as u64 * 1000));
+    match d.step {
+        0 => serial_println!("[hda] depop alc294 coef6f=0x{:04x}->0x{:04x} poll_ms={} -> ok", d.before, d.after, d.poll_ms),
+        5 if d.why == "poll-timeout" => serial_println!("[hda] depop step=5 -> REFUSED why=poll-timeout({}ms)", d.poll_ms),
+        n => serial_println!("[hda] depop step={} -> REFUSED why={}", n, d.why),
+    }
+}
+
+/// The depop KAT's codec: logs every verb (nid, verb, payload) and every sleep (0xFF, 0, ms); keeps the coefficient
+/// index per NID; answers COEF 0x20/0x6f and COEFEX 0x58/0x00 from its store and 0x58/0x01 busy (0x80) for `busy` reads.
+#[cfg(feature = "hda-tone")]
+struct DepopFake {
+    silent: bool,
+    idx20: u32,
+    idx58: u32,
+    c6f: u32,
+    c58_0: u32,
+    busy: u32,
+    log: [(u8, u32, u32); 96],
+    n: usize,
+}
+
+#[cfg(feature = "hda-tone")]
+impl DepopFake {
+    fn new(silent: bool, busy: u32) -> DepopFake {
+        DepopFake { silent, idx20: 0, idx58: 0, c6f: 0x1234, c58_0: 0x0102, busy, log: [(0, 0, 0); 96], n: 0 }
+    }
+    fn push(&mut self, nid: u8, verb: u32, payload: u32) {
+        if self.n < self.log.len() {
+            self.log[self.n] = (nid, verb, payload);
+        }
+        self.n += 1;
+    }
+    fn verbs(&self) -> usize {
+        self.log[..self.n.min(self.log.len())].iter().filter(|e| e.0 != 0xFF).count()
+    }
+}
+
+#[cfg(feature = "hda-tone")]
+impl Verbs for DepopFake {
+    fn cmd(&mut self, cad: u8, nid: u8, verb: u32, payload: u32, _a: &mut Audit) -> Option<u32> {
+        self.push(nid, verb, payload);
+        if self.silent || cad != 0 {
+            return None;
+        }
+        match (nid, verb) {
+            (_, 0x300) | (_, 0x707) => Some(0),
+            (0x20, 0x500) => { self.idx20 = payload; Some(0) }
+            (0x58, 0x500) => { self.idx58 = payload; Some(0) }
+            (0x20, 0xC00) if self.idx20 == 0x6f => Some(self.c6f),
+            (0x20, 0x400) if self.idx20 == 0x6f => { self.c6f = payload; Some(0) }
+            (0x58, 0xC00) if self.idx58 == 0x00 => Some(self.c58_0),
+            (0x58, 0x400) if self.idx58 == 0x00 => { self.c58_0 = payload; Some(0) }
+            (0x58, 0xC00) if self.idx58 == 0x01 => {
+                if self.busy > 0 {
+                    self.busy -= 1;
+                    Some(0x0080)
+                } else {
+                    Some(0)
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// ZENBOOKACPDEPOP (Z60): the depop KAT (`tests hdacensus`, after the alcplay kat, its own line). order: the whole verb
+/// and sleep sequence; rmw: the masks on 0x6f and 0x58/0x00; poll: bounded at 20 x 50 ms and step 6 still runs; nack:
+/// a silent door stops at step 1.
+#[cfg(feature = "hda-tone")]
+fn alc_depop_selftest() {
+    const S: u8 = 0xFF;
+    const EXPECT: [(u8, u32, u32); 24] = [
+        (0x21, 0x300, 0xb080), (S, 0, 100), (0x21, 0x707, 0),
+        (0x20, 0x500, 0x6f), (0x20, 0xC00, 0), (0x20, 0x500, 0x6f), (0x20, 0x400, 0x1230),
+        (0x58, 0x500, 0x00), (0x58, 0xC00, 0), (0x58, 0x500, 0x00), (0x58, 0x400, 0x8102),
+        (0x58, 0x500, 0x01), (0x58, 0xC00, 0), (S, 0, 50),
+        (0x58, 0x500, 0x01), (0x58, 0xC00, 0), (S, 0, 50),
+        (0x58, 0x500, 0x01), (0x58, 0xC00, 0),
+        (0x20, 0x500, 0x6f), (0x20, 0xC00, 0), (0x20, 0x500, 0x6f), (0x20, 0x400, 0x123b), (S, 0, 50),
+    ];
+    let mut a = Audit::default();
+    let mut f = DepopFake::new(false, 2);
+    let d = alc294_depop(&mut f, 0, 0x21, &mut a, |f: &mut DepopFake, ms: u32| f.push(S, 0, ms));
+    let order = f.n == EXPECT.len() && f.log[..EXPECT.len()] == EXPECT;
+    let rmw = d.before == 0x1234 && d.after == 0x123b && f.c6f == 0x123b && f.c58_0 == 0x8102;
+    let mut t = DepopFake::new(false, 99);
+    let e = alc294_depop(&mut t, 0, 0x21, &mut a, |f: &mut DepopFake, ms: u32| f.push(S, 0, ms));
+    let reads = t.log[..t.n.min(t.log.len())].iter().filter(|x| x.0 == 0x58 && x.1 == 0xC00).count();
+    let poll = d.step == 0 && d.poll_ms == 100
+        && e.step == 5 && e.why == "poll-timeout" && e.poll_ms == 1000 && reads == 22 && t.verbs() == 56 && t.c6f == 0x123b;
+    let mut s = DepopFake::new(true, 0);
+    let g = alc294_depop(&mut s, 0, 0x21, &mut a, |f: &mut DepopFake, ms: u32| f.push(S, 0, ms));
+    let nack = g.step == 1 && g.why == "timeout" && s.n == 1;
+    let w = |b: bool| if b { "ok" } else { "FAIL" };
+    serial_println!(
+        "[hda] depop kat verbs={} order={} rmw={} poll={} nack={} -> {}",
+        f.verbs(), w(order), w(rmw), w(poll), w(nack), w(order && rmw && poll && nack)
     );
 }
