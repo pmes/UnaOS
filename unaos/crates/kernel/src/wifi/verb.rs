@@ -484,10 +484,18 @@ fn s10_wpa2(me: [u8; 6], bssid: [u8; 6], ch: u8, ssid: &str, rsn: Option<alloc::
         "[mt7925] s10 wpa2 m1={} m3={} replay={} eapol={} other={} -> keys",
         t1, t3, again, c1.0.wrapping_sub(c0.0), c1.1.wrapping_sub(c0.1)
     );
-    if let Err(e) = mt::set_keys(bssid, ch, &keys.tk, &keys.gtk, keys.gtk_id) {
+    if let Err(e) = mt::set_keys(bssid, ch, Some(&keys.tk), &keys.gtk, keys.gtk_id) {
         return refuse(&alloc::format!("set-key({})", e));
     }
     serial_println!(":: wifijoin: s10 wpa2 ssid={} -> SECURED ::", ssid_view(ssid.as_bytes()));
+    // S10REKEY (zenbook-ledger Z63): the KCK/KEK kept as `assoc::Rekey` inside the group judge handed to the driver (zeroized on link_down).
+    if let Some(mut rk) = hs.rekey() {
+        mt::rekey_arm(bssid, ch, alloc::boxed::Box::new(move |eth: &[u8]| -> Result<(alloc::vec::Vec<u8>, u8, [u8; 16], u64), &'static str> {
+            let p = eapol_payload(eth, &me, &bssid).ok_or("frame")?;
+            let (m2, gtk_id, gtk, replay) = rk.on_group_m1(p).map_err(|w| w.name())?;
+            Ok((eapol_eth(&me, &bssid, &m2), gtk_id, gtk, replay))
+        }));
+    }
     true
 }
 
@@ -499,8 +507,8 @@ pub fn wpa2() {
     let keys = crate::drivers::mt7925::s10_kat();
     let ok = |b: bool| if b { "ok" } else { "FAIL" };
     serial_println!(
-        ":: WPA2KAT: pbkdf2={} prf={} mic={} unwrap={} frame={} keys={} -> {} ::",
-        ok(a[0]), ok(a[1]), ok(a[2]), ok(a[3]), ok(a[4]), ok(keys), if a.iter().all(|&b| b) && keys { "PASS" } else { "FAIL" }
+        ":: WPA2KAT: pbkdf2={} prf={} mic={} unwrap={} frame={} keys={} rekey={} -> {} ::",
+        ok(a[0]), ok(a[1]), ok(a[2]), ok(a[3]), ok(a[4]), ok(keys), ok(a[5]), if a.iter().all(|&b| b) && keys { "PASS" } else { "FAIL" }
     );
 }
 

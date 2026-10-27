@@ -88,8 +88,8 @@ REQUIRE :: DWI2CGPIO: .* refuse=2/2 -> PASS ::
 REQUIRE :: DWI2CFAST: fmcn=120/256/30 sscn=650/669/30 .* refuse=3/3 -> PASS ::
 FORBID :: (SUSPEND|ECQNAMES|DWI2CACPI|DWI2CGPIO|DWI2CFAST): .*-> FAIL
 FORBID :: (PLATFORM|EC|NVME|I8042|DWI2C|HDACENSUS|GOPSHOT|ECLID|BOOTLIST): .*-> FAIL
-# MT7925S10 (zenbook-ledger Z55): `tests wpa2`, the WPA2-PSK known-answer legs (PBKDF2 Annex J.4, PRF Annex J.3 + a pinned PTK, the EAPOL-Key MIC, RFC 3394 unwrap, the M1->M2 / M3->M4 frames, the key-command bodies); pure, so QEMU runs it with no radio
-REQUIRE :: WPA2KAT: pbkdf2=ok prf=ok mic=ok unwrap=ok frame=ok keys=ok -> PASS ::
+# MT7925S10 (zenbook-ledger Z55): `tests wpa2`, the WPA2-PSK known-answer legs (PBKDF2 Annex J.4, PRF Annex J.3 + a pinned PTK, the EAPOL-Key MIC, RFC 3394 unwrap, the M1->M2 / M3->M4 frames, the key-command bodies; S10REKEY Z63: rekey=, the group-key handshake); pure, so QEMU runs it with no radio
+REQUIRE :: WPA2KAT: pbkdf2=ok prf=ok mic=ok unwrap=ok frame=ok keys=ok rekey=ok -> PASS ::
 FORBID :: WPA2KAT: .*-> FAIL
 
 # ── 10. ZENBOOKACP (Z25): the HDA census on q35's intel-hda + hda-duplex (UNAOS_HDA), the drive path skipped ───────────
