@@ -1895,3 +1895,13 @@ fn rate_refused(s: crate::sync::MutexGuard<'_, St>) -> Result<u32, &'static str>
     stream_stop();
     Err("rate mismatch")
 }
+
+// ── ZENBOOKACPPLAY (zenbook-ledger Z47) — TAIL-APPENDED: the armed stream's facts for the ALC294 arm's play line ──────────
+// `hda::alc_play` (hda.rs file tail) reads whether `gate` armed the stream it just handed over, under `ring::DEV` in the
+// census's own task — the DEV -> ST direction `probe` -> `run_tone` -> `gate` already takes (BP-audio §3, HDARING).
+
+/// `(effective rate, BDL entries)` while `gate` has armed the stream, else None.
+pub(super) fn armed_facts() -> Option<(u32, usize)> {
+    let s = ST.lock();
+    if s.armed { Some((s.eff_rate, ENTRIES)) } else { None }
+}
