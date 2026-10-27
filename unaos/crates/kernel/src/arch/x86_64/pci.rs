@@ -894,7 +894,7 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
     // hung". Config-space reads only, no waits: a single trailing stamp is sufficient here.
     crate::bootpace::record("pci-probes"); record_functions(); let xhci_found = crate::drivers::xhci::pick(crate::drivers::pci::PciScanner::scan(), &functions()); // ZENBOOKXHCIPICK (zenbook-ledger Z7): the registry walk runs once more HERE so `xhci::pick` can count every 0C/03/30 and honour `UNAOS_XHCI_PICK=<index|b:d.f>` (unset = the first, today's tuple unchanged); the :1173 call stays and refreshes the table. ⚠ LINE-NEUTRAL, statement before the first `//`. BOOTWAITS (rmbp-ledger B152): `pci-scan` is stamped AFTER the walk and BPACE's `d=` is always the delta from the PREVIOUS stamp — which was `ehci-hid-done`, four knob-gated passenger blocks upstream (SMC-SCOUT, PCI-CENSUS, BCMA-RECON, and until this arc the HDA hook inside the walk itself). So the tag reported whatever had been hooked in above it, under a name that promises a config-space walk. Flight 11: `pci-scan d=1315ms`, of which the walk is ~1 ms (it early-returns at 0:20.0) and a full census is 6 ms (bootpace.md §10o) — the other 1314 ms is 104 ms of SMC key sweep (`UNAOS_SMC=1`, 25626->25730 ms) and 1210 ms of HDA. This stamp closes the window: everything between `ehci-hid-done` and here is `pci-probes`, and `pci-scan d=` is the walk. UNCONDITIONAL on purpose — a knob-gated stamp would make the tag mean different things on different builds, which is the exact failure being fixed. Costs one ring slot (flight 11 ran `n=28` of `CAP=64`, drop-NEWEST). ⚠ LINE-NEUTRAL append, statement BEFORE the first `//`.
     crate::bootpace::record("pci-scan");
-    if let Some((xhci_phys_addr, bus, dev, func)) = xhci_found {
+    for (xi, (xhci_phys_addr, bus, dev, func)) in crate::drivers::xhci::bring_list(xhci_found, &functions()).into_iter().enumerate() { // ZENBOOKXHCIALL (zenbook-ledger Z21): EVERY 0C/03/30 up, in walk order after the pick (controller 0 = `xhci_found`, every unaddressed `claim()`); the block below runs once per controller, unchanged but for `xi`
         crate::bootlog_println!(":: x86_64 PCI Init: Found xHCI at {:#x} ::", xhci_phys_addr);
 
         // DIAGNOSTIC (read-only): dump interrupt line/pin + capability list to plan
@@ -925,14 +925,14 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
         crate::drivers::xhci::init(xhci_phys_addr); // Reset and command ring
 
         unsafe {
-            let mut xhci = crate::drivers::xhci::XhciController::new(xhci_phys_addr as usize);
+            let mut xhci = crate::drivers::xhci::XhciController::new(xhci_phys_addr as usize); xhci.xi = xi as u8;
 
             // Allocate the global command + event rings, capture their physical
             // addresses, then DROP the guards before start()/poll so nothing can
             // deadlock by re-locking them later.
             let (event_ring_phys, command_ring_phys) = {
-                let mut cmd_ring_guard = crate::drivers::xhci::COMMAND_RING.lock();
-                let mut evt_ring_guard = crate::drivers::xhci::EVENT_RING.lock();
+                let mut cmd_ring_guard = crate::drivers::xhci::command_ring(xi).lock();
+                let mut evt_ring_guard = crate::drivers::xhci::event_ring(xi).lock();
 
                 *cmd_ring_guard = Some(crate::drivers::xhci::ring::TransferRing::new(256));
                 *evt_ring_guard = Some(crate::drivers::xhci::event::EventRing::new());
@@ -953,15 +953,15 @@ pub fn init(_dtb_addr: u64, _dtb_size: usize) {
             // `None` cannot happen on a built kernel (the seed is unconditional); if it ever did,
             // the MSI-X table is left alone rather than pointed at a number with no handler.
             let msg_addr = 0xFEE0_0000u32 | ((crate::arch::apic::apic_id() as u32) << 12);
-            match crate::arch::interrupts::vectors::of("xhci") {
+            match crate::drivers::xhci::msix_vector(xi) {
                 Some(vector) => {
                     let _ = crate::drivers::pci::PciScanner::enable_msix(
                         bus, dev, func, xhci_phys_addr, msg_addr, vector as u32,
                     );
                 }
-                None => crate::bootlog_println!(
+                None => if xi == 0 { crate::bootlog_println!(
                     ":: x86_64 PCI: xHCI MSI-X NOT ARMED — this kernel allocated no `xhci` interrupt vector, so there is no number to program and no handler to deliver to. The event ring stays on the polled drain, unchanged == witness ::"
-                ),
+                ) },
             };
 
             xhci.init_pointers(command_ring_phys);

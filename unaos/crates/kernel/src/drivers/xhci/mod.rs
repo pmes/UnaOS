@@ -624,13 +624,13 @@ pub(crate) fn hub_port_change_feature_selector(bit: u16, is_ss: bool) -> Option<
 ///
 /// The invariant, checkable by grep (the F1 idiom): `XHCI_CONTROLLER.lock()` appears ONLY in
 /// `claim`/`Drop`/`install` in this file — the static is private, so the compiler enforces it.
-static XHCI_CONTROLLER: crate::sync::Mutex<Option<alloc::boxed::Box<XhciController>>> =
-    crate::sync::Mutex::new(None);
+static XHCI_CONTROLLER: [crate::sync::Mutex<Option<alloc::boxed::Box<XhciController>>>; XHCI_MAX] =
+    [const { crate::sync::Mutex::new(None) }; XHCI_MAX]; // ZENBOOKXHCIALL (zenbook-ledger Z21): ONE slot per controller, index = `XhciController::xi` (0 = the picked one, every unaddressed `claim()`)
 
 /// True while the controller is loaned out via [`claim`]. Written only inside the masked mutex
 /// hold, so a `None` in the mutex disambiguates cleanly: loaned (`Busy`) vs never installed
 /// (`NotReady`).
-static XHCI_LOANED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static XHCI_LOANED: [core::sync::atomic::AtomicBool; XHCI_MAX] = [const { core::sync::atomic::AtomicBool::new(false) }; XHCI_MAX];
 
 /// Why [`claim`] returned no controller.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -667,9 +667,9 @@ impl Drop for XhciLoan {
             // WEDGE-8: masked micro-hold; field order of the locals is the fix in miniature — the
             // guard (lock) drops before `_mask` restores, so we never run unmasked while holding.
             let _mask = crate::arch::IrqMask::new();
-            let mut guard = XHCI_CONTROLLER.lock();
+            let xi = (x.xi as usize).min(XHCI_MAX - 1); let mut guard = XHCI_CONTROLLER[xi].lock();
             *guard = Some(x);
-            XHCI_LOANED.store(false, Ordering::Release);
+            XHCI_LOANED[xi].store(false, Ordering::Release);
         }
     }
 }
@@ -678,15 +678,15 @@ impl Drop for XhciLoan {
 /// masked take (a preempted holder is impossible, so a spin on it is bounded by construction), and
 /// a controller already loaned out returns [`XhciClaimError::Busy`] instead of blocking. Callers
 /// that can afford to wait do so OUTSIDE this call, unmasked, with their own bounded policy.
-pub fn claim() -> Result<XhciLoan, XhciClaimError> {
+pub fn claim() -> Result<XhciLoan, XhciClaimError> { claim_at(0) } pub fn claim_at(i: usize) -> Result<XhciLoan, XhciClaimError> { let i = i.min(XHCI_MAX - 1);
     let _mask = crate::arch::IrqMask::new();
-    let mut guard = XHCI_CONTROLLER.lock();
+    let mut guard = XHCI_CONTROLLER[i].lock();
     match guard.take() {
         Some(x) => {
-            XHCI_LOANED.store(true, Ordering::Release);
+            XHCI_LOANED[i].store(true, Ordering::Release);
             Ok(XhciLoan(Some(x)))
         }
-        None => Err(if XHCI_LOANED.load(Ordering::Acquire) {
+        None => Err(if XHCI_LOANED[i].load(Ordering::Acquire) {
             XhciClaimError::Busy
         } else {
             XhciClaimError::NotReady
@@ -697,11 +697,11 @@ pub fn claim() -> Result<XhciLoan, XhciClaimError> {
 /// Install the freshly initialised controller into the shared slot (boot bring-up, both arches).
 /// Masked micro-hold, same discipline as [`claim`].
 pub fn install(x: XhciController) {
-    let boxed = alloc::boxed::Box::new(x);
+    let boxed = alloc::boxed::Box::new(x); let i = (boxed.xi as usize).min(XHCI_MAX - 1); xhciall_note_live(i);
     let _mask = crate::arch::IrqMask::new();
-    let mut guard = XHCI_CONTROLLER.lock();
+    let mut guard = XHCI_CONTROLLER[i].lock();
     *guard = Some(boxed);
-    XHCI_LOANED.store(false, Ordering::Release);
+    XHCI_LOANED[i].store(false, Ordering::Release);
 }
 
 /// Human-readable mass-storage enumeration/bring-up state, for the shell `fdisk -l` command when no
@@ -817,7 +817,7 @@ pub fn log_summary_once() {
 /// Read-only. Emphasises the port under `enumerating_port` (boots 13+14 both crashed with a port
 /// mid-enumeration; port 7 in the field capture). Called once from the boot witness under the knob.
 pub fn vugras_dump() {
-    let ctrl = XHCI_CONTROLLER.lock();
+    let ctrl = XHCI_CONTROLLER[0].lock();
     let Some(x) = ctrl.as_ref() else {
         serial_println!(":: VUGRAS: xHCI not initialised — no controller PAs ::");
         return;
@@ -934,7 +934,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 /// LOUD and honestly instead of silently dropping every CRCR/DCBAAP/ERST/RS write into a not-ready
 /// controller. Defaults true so a path that never runs the wait behaves exactly as before; on x86
 /// CNR clears near-instantly, so this is always true and the guards are behaviourally invisible.
-static XHCI_CNR_OK: AtomicBool = AtomicBool::new(true);
+static XHCI_CNR_OK: [AtomicBool; XHCI_MAX] = [const { AtomicBool::new(true) }; XHCI_MAX];
 
 /// xHCI 5.4.1 / 4.2: after a Chip Hardware Reset (HCRST) software MUST NOT write ANY Doorbell,
 /// Operational, or Runtime (interrupter) register until USBSTS.CNR (Controller Not Ready, bit 11)
@@ -1104,15 +1104,15 @@ static FTDI_PUMP_REPORTED: AtomicU64 = AtomicU64::new(0);
 // early empty pass cannot close the window before a slow port has had time to assert.
 //
 // Armed once, at the end of the settle. Not reset per boot because there is only one boot.
-static CCS_LATE_ARMED: AtomicBool = AtomicBool::new(false);
+static CCS_LATE_ARMED: [AtomicBool; XHCI_MAX] = [const { AtomicBool::new(false) }; XHCI_MAX];
 /// `now_cycles()` at the instant the settle began (i.e. immediately after the port-power loop).
-static CCS_SETTLE_START: AtomicU64 = AtomicU64::new(0);
+static CCS_SETTLE_START: [AtomicU64; XHCI_MAX] = [const { AtomicU64::new(0) }; XHCI_MAX];
 /// The settle value this boot actually ran (150 or 100 — see `start()`), so the late line can
 /// restate the budget it beat without the constant being in scope.
-static CCS_SETTLE_MS_LIVE: AtomicU64 = AtomicU64::new(0);
+static CCS_SETTLE_MS_LIVE: [AtomicU64; XHCI_MAX] = [const { AtomicU64::new(0) }; XHCI_MAX];
 /// Per root port: "the settle ended without ever seeing CCS=1 here". Cleared on the first connect
 /// edge, so each port reports at most once and a later re-plug of the same port stays quiet.
-static CCS_UNSEEN: [AtomicBool; 256] = [const { AtomicBool::new(false) }; 256];
+static CCS_UNSEEN: [[AtomicBool; 256]; XHCI_MAX] = [const { [const { AtomicBool::new(false) }; 256] }; XHCI_MAX];
 /// Earliest point, in ms after `settle_start`, at which a completed `poll_events()` pass may close
 /// the late window. Two seconds: the slowest bring-up either seat has observed for a device
 /// physically present at power-on is the Pi's VL805 presenting its root ports, in the high
@@ -2594,8 +2594,8 @@ pub static MOUSE_ERROR_REARM_COUNT: AtomicU64 = AtomicU64::new(0); pub static MO
 /// the event ring; the main loop / BOT pump owns that (and the controller lock). A spurious
 /// interrupt (IP not set) is harmless — clearing an already-clear RW1C bit is a no-op. The
 /// caller (the MSI-X handler) issues the local-APIC EOI; this function does not.
-pub fn interrupt_ack() {
-    let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
+pub fn interrupt_ack() { interrupt_ack_at(0) } pub fn interrupt_ack_at(i: usize) {
+    let ir0 = ir0_base(i).load(Ordering::Acquire);
     if ir0 != 0 {
         unsafe {
             let iman = core::ptr::read_volatile(ir0 as *const u32);
@@ -2604,7 +2604,7 @@ pub fn interrupt_ack() {
             core::ptr::write_volatile(ir0 as *mut u32, iman | 1);
         }
     }
-    let op = XHCI_OP_BASE.load(Ordering::Acquire);
+    let op = op_base_of(i).load(Ordering::Acquire);
     if op != 0 {
         unsafe {
             // USBSTS.EINT only. Bit 4 (PCD) is also RW1C and is deliberately NOT written here —
@@ -2612,7 +2612,7 @@ pub fn interrupt_ack() {
             core::ptr::write_volatile((op + 0x04) as *mut u32, USBSTS_EINT);
         }
     }
-    XHCI_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+    irq_count(i).fetch_add(1, Ordering::Relaxed);
 }
 
 /// THE GREAT UNIFICATION
@@ -3353,7 +3353,7 @@ pub struct XhciController {
     pub ports_to_enumerate: Vec<u8>,
 
     pub configuring_slot: u8,
-    pub event_ring_phys_base: u64,
+    pub event_ring_phys_base: u64, pub xi: u8,
     /// Heap PA of the Event Ring Segment Table (ERST) allocated in `init_interrupter`. Kept for the
     /// VUGRAS candidate-PA dump so both event-ring and ERST bases are witnessed as heap-resident.
     pub erst_table_phys: u64,
@@ -3634,7 +3634,7 @@ impl XhciController {
             pending_ports: Vec::new(),
             ports_to_enumerate: Vec::new(),
             configuring_slot: 0,
-            event_ring_phys_base: 0,
+            event_ring_phys_base: 0, xi: 0,
             erst_table_phys: 0,
             storage: [StorageRecord::EMPTY; STORAGE_SLOTS],
             storage_diag_pending: false,
@@ -3732,7 +3732,7 @@ impl XhciController {
 
 
     pub fn send_noop_command(&mut self) -> Result<usize, &'static str> {
-        COMMAND_RING.lock().as_mut().unwrap().push_noop()
+        command_ring(self.xi as usize).lock().as_mut().unwrap().push_noop()
     }
 
     /// Push a command TRB and ring the host-controller doorbell. Returns the PHYSICAL address of
@@ -3758,7 +3758,7 @@ impl XhciController {
         }
         Self::clean_cmd_input_ctx(&trb);
         let phys = {
-            let mut g = COMMAND_RING.lock();
+            let mut g = command_ring(self.xi as usize).lock();
             let ring = g.as_mut().ok_or("command ring not initialised")?;
             let base = ring.get_ptr();
             let idx = ring.push(trb)?;
@@ -3787,7 +3787,7 @@ impl XhciController {
                 usbsts, usbsts & 1, (usbsts >> 2) & 1, (usbsts >> 3) & 1, (usbsts >> 11) & 1, (usbsts >> 12) & 1,
                 (crcr >> 3) & 1, dboff
             );
-            let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
+            let ir0 = ir0_base(self.xi as usize).load(Ordering::Acquire);
             if ir0 != 0 {
                 let iman = core::ptr::read_volatile(ir0 as *const u32);
                 let erdp = core::ptr::read_volatile((ir0 + 0x18) as *const u32);
@@ -3938,12 +3938,12 @@ impl XhciController {
         // Status Change TRB the detector exists to report, and disarming on entry would swallow it.
         // Every connect edge latched during boot is in the ring by the time the first pass runs, so
         // one completed pass past the floor is sufficient — see CCS_LATE_ARMED.
-        if CCS_LATE_ARMED.load(Ordering::Acquire) {
+        if CCS_LATE_ARMED[self.xi as usize].load(Ordering::Acquire) {
             let since = crate::arch::now_cycles()
-                .wrapping_sub(CCS_SETTLE_START.load(Ordering::Relaxed))
+                .wrapping_sub(CCS_SETTLE_START[self.xi as usize].load(Ordering::Relaxed))
                 / Self::cycles_per_ms();
             if since >= CCS_LATE_FLOOR_MS {
-                CCS_LATE_ARMED.store(false, Ordering::Release);
+                CCS_LATE_ARMED[self.xi as usize].store(false, Ordering::Release);
             }
         }
         any
@@ -3955,7 +3955,7 @@ impl XhciController {
     /// ERDP owner and the EVENT_RING lock is never held across dispatch.
     fn drain_event_ring_once(&mut self) -> bool { if cfg!(feature = "witness") { let now = crate::arch::now_cycles(); let prev = KBD_DRAIN_LAST.swap(now, Ordering::Relaxed); if prev != 0 { let gap = now.wrapping_sub(prev); KBD_DRAIN_GAP.store(gap, Ordering::Relaxed); if gap > KBD_DRAIN_GAPMAX.load(Ordering::Relaxed) { KBD_DRAIN_GAPMAX.store(gap, Ordering::Relaxed); } } } // PRTSCLOST — THE SINGLE PLACE THAT KNOWS WHEN SOFTWARE LOOKED AT THE RING. This is the one entry point for consuming events (the doc block above), so the gap between two calls of it bounds how long a retired interrupt-IN TD went un-re-armed, and therefore how long the keyboard endpoint had no TD queued. Stamped BEFORE the empty-ring early return on purpose: a pass that found nothing still LOOKED, and counting only non-empty drains would report the device's idle time instead of the pump's cadence. The keyboard completion latches `KBD_DRAIN_GAP` into `KBD_ARMGAP_MAX` so the reported bound is the one that preceded a real report rather than an enumeration stall. Cost: one `now_cycles()` (rdtsc / one MRS of CNTVCT) and three relaxed accesses against the uncached MMIO this function already does. ⚠ FOLDED onto this line — see `KBD_REARM_COUNT`'s note.
         let (trb, dequeue_index) = {
-            let mut guard = EVENT_RING.lock();
+            let mut guard = event_ring(self.xi as usize).lock();
             let ring = guard.as_mut().unwrap();
             if !ring.has_event() {
                 return false;
@@ -3973,7 +3973,7 @@ impl XhciController {
     /// Update the Event Ring Dequeue Pointer to `dequeue_index`, clearing Event Handler Busy.
     fn advance_erdp(&self, dequeue_index: usize) {
         unsafe {
-            if EVENT_RING_PHYS_BASE == 0 {
+            if self.event_ring_phys_base == 0 {
                 crate::bootlog_println!("xHCI: WARNING - EVENT_RING_PHYS_BASE is 0, skipping ERDP update!");
                 return;
             }
@@ -3989,7 +3989,7 @@ impl XhciController {
             core::ptr::write_volatile(ir0_base as *mut u32, iman | 1);
             core::ptr::write_volatile((self.op_base + 0x04) as *mut u32, USBSTS_EINT);
 
-            let new_dequeue_ptr = EVENT_RING_PHYS_BASE + (dequeue_index as u64 * 16);
+            let new_dequeue_ptr = self.event_ring_phys_base + (dequeue_index as u64 * 16);
             // Bit 3 (EHB) is write-1-to-clear. High-dword-first (write_erdp) so the
             // controller never latches a torn pointer when PIUSB-21 forces a real 32-bit
             // split on the brcmstb RC — see write_erdp (XHCI-INT).
@@ -4683,14 +4683,14 @@ impl XhciController {
                                     // meaningless on a config event, guarded for the same reason.
                                     let class_code = desc_data[4];
                                     let subclass = desc_data[5];
-                                    let protocol = desc_data[6]; #[cfg(feature = "usbnet")] { if desc_data[1] == 0x01 { usbnet::note_device(slot_id as u8, class_code, desc_data[17], vid, pid); } } #[cfg(feature = "uvc")] { if desc_data[1] == 0x01 { ptp::note_device(slot_id as u8, vid, pid); } } // PTPCAM: the camera candidate's identity (a PTP body reports class 0x00 or 0x06 here; its interface says 0x06/0x01/0x01). // USBNET: bNumConfigurations (byte 17) — a walk of configuration 0 that finds no ECM asks for configuration 1 only if the device declares one
+                                    let protocol = desc_data[6]; let xa_refused = self.xhciall_refuse(desc_data[1], slot_id as u8); #[cfg(feature = "usbnet")] { if desc_data[1] == 0x01 && !xa_refused { usbnet::note_device(slot_id as u8, class_code, desc_data[17], vid, pid); } } #[cfg(feature = "uvc")] { if desc_data[1] == 0x01 && !xa_refused { ptp::note_device(slot_id as u8, vid, pid); } } // PTPCAM: the camera candidate's identity (a PTP body reports class 0x00 or 0x06 here; its interface says 0x06/0x01/0x01). // USBNET: bNumConfigurations (byte 17) — a walk of configuration 0 that finds no ECM asks for configuration 1 only if the device declares one
 
                                     if desc_data[1] == 0x01 {
                                         crate::bootlog_println!("xHCI: Device Found. Class={:#x} Sub={:#x} Proto={:#x}",
                                             class_code, subclass, protocol);
                                     }
 
-                                    if class_code == 0x08 { // 0x08 = Mass Storage (device-level)
+                                    if xa_refused {} else if class_code == 0x08 { // ZENBOOKXHCIALL (Z21): a device on controller 1..3 refused by `xhciall_refuse` takes no class arm (it printed its line and released the port). // 0x08 = Mass Storage (device-level)
                                         crate::bootlog_println!("xHCI: >>> CARGO DETECTED (MASS STORAGE) <<<");
                                         crate::bootlog_println!("xHCI: Requesting Configuration Descriptor for bulk endpoints...");
                                         // Route through the config-descriptor parser so the
@@ -4820,7 +4820,7 @@ impl XhciController {
                                             // these two arms are mutually exclusive.)
                                             match (bulk_in, bulk_out) {
                                                 (Some((ia, im)), Some((oa, om))) => {
-                                                    self.ftdi_configuring_slot = slot_id as u8;
+                                                    self.ftdi_configuring_slot = slot_id as u8; ftdi_take(self.xi); // ZENBOOKXHCIALL (Z21): the FTDI door belongs to the first controller it binds on
                                                     self.configure_endpoints(slot_id as u8, ia, im, oa, om);
                                                 }
                                                 _ => {
@@ -5387,7 +5387,7 @@ impl XhciController {
     pub unsafe fn init_pointers(&mut self, ring_phys_addr: u64) {
         // PIUSB-10: if CNR never cleared (init_interrupter aborted), do NOT program CRCR/DCBAAP —
         // the controller is not ready and would silently drop the writes. Fail loud, skip cleanly.
-        if !XHCI_CNR_OK.load(Ordering::Acquire) {
+        if !XHCI_CNR_OK[self.xi as usize].load(Ordering::Acquire) {
             crate::bootlog_println!("xHCI: init_pointers SKIPPED — controller never left Not-Ready (CNR=1)");
             return;
         }
@@ -5513,10 +5513,10 @@ impl XhciController {
         // not-ready controller (the Pi VL805 holds CNR during fw-load; Intel clears it instantly, so
         // this is a fast no-op on x86 and its register-write behaviour is byte-identical).
         if !wait_for_cnr_clear(self.op_base) {
-            XHCI_CNR_OK.store(false, Ordering::Release);
+            XHCI_CNR_OK[self.xi as usize].store(false, Ordering::Release);
             return;
         }
-        XHCI_CNR_OK.store(true, Ordering::Release);
+        XHCI_CNR_OK[self.xi as usize].store(true, Ordering::Release);
         unsafe {
             // SAVE THIS for later use in the interrupt/event loop (ERDP updates)
             EVENT_RING_PHYS_BASE = event_ring_phys;
@@ -5593,8 +5593,8 @@ impl XhciController {
             // handler can never load an un-initialized (0) base if an interrupt fires. (Both
             // IMAN.IE here and USBCMD.INTE in start() gate delivery, but publish-before-enable
             // is the correct-by-design ordering regardless of those gates.)
-            XHCI_IR0_BASE.store(ir0_base, Ordering::Release);
-            XHCI_OP_BASE.store(self.op_base, Ordering::Release);
+            ir0_base(self.xi as usize).store(ir0_base, Ordering::Release);
+            op_base_of(self.xi as usize).store(self.op_base, Ordering::Release);
 
             // 6. ENABLE the Interrupter (IMAN - Interrupter Management) - Offset 0x00.
             // Bit 0 = IP (Interrupt Pending, RW1C), Bit 1 = IE (Interrupt Enable).
@@ -5612,7 +5612,7 @@ impl XhciController {
     pub fn start(&mut self) {
         // PIUSB-10: if CNR never cleared, do NOT set CONFIG/RS=1 on a not-ready controller — fail
         // loud and skip so RS never latches into a controller that dropped its ring/interrupter setup.
-        if !XHCI_CNR_OK.load(Ordering::Acquire) {
+        if !XHCI_CNR_OK[self.xi as usize].load(Ordering::Acquire) {
             crate::bootlog_println!("xHCI: start SKIPPED — controller never left Not-Ready (CNR=1); RS=1 not issued");
             return;
         }
@@ -5682,7 +5682,7 @@ impl XhciController {
                     usbsts_rb, usbsts_rb & 1, (usbsts_rb >> 2) & 1, (usbsts_rb >> 11) & 1, (usbsts_rb >> 12) & 1,
                     crcr, (crcr >> 3) & 1, (crcr >> 1) & 1, (crcr >> 2) & 1, crcr & 1, dcbaap, dcbaap_raw
                 );
-                let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
+                let ir0 = ir0_base(self.xi as usize).load(Ordering::Acquire);
                 if ir0 != 0 {
                     let iman = core::ptr::read_volatile(ir0 as *const u32);
                     let erstsz = core::ptr::read_volatile((ir0 + 0x08) as *const u32);
@@ -5938,13 +5938,13 @@ impl XhciController {
             // Polling debounce is deliberately NOT reported: the scan still has it, it cost
             // nothing, and `CCSMARGIN-LATE` must mean "a port missed the scan", not "a timer was
             // tight". Only ports the scan also misses stay armed.
-            CCS_SETTLE_START.store(settle_start, Ordering::Relaxed);
-            CCS_SETTLE_MS_LIVE.store(settle_ms, Ordering::Relaxed);
+            CCS_SETTLE_START[self.xi as usize].store(settle_start, Ordering::Relaxed);
+            CCS_SETTLE_MS_LIVE[self.xi as usize].store(settle_ms, Ordering::Relaxed);
             for i in 1..=max_ports {
-                CCS_UNSEEN[i as usize]
+                CCS_UNSEEN[self.xi as usize][i as usize]
                     .store(ccs_first[i as usize] == CCS_NEVER, Ordering::Relaxed);
             }
-            CCS_LATE_ARMED.store(true, Ordering::Release);
+            CCS_LATE_ARMED[self.xi as usize].store(true, Ordering::Release);
             crate::bootlog_println!("xHCI: port settle complete before CCS scan (settle_ms={})", settle_ms);
             // BPACE: the fixed pre-enumeration settle (`hw_wait_budget()/4` — ~0.5 s of wall clock
             // and nothing else).
@@ -6135,7 +6135,7 @@ impl XhciController {
                     // it, but it cost nothing, and `CCSMARGIN-LATE` must mean "the scan missed a
                     // port", not "a timer was tight". Its own CSC arrives later and is swallowed
                     // by the active-device case in `handle_port_status`.)
-                    CCS_UNSEEN[i as usize].store(false, Ordering::Relaxed);
+                    CCS_UNSEEN[self.xi as usize][i as usize].store(false, Ordering::Relaxed);
                     self.ports_to_enumerate.push(i);
                     // BOOTPACE M4: mark this as an INITIAL-SCAN entry. Its connection has been
                     // electrically stable since before we powered the port — the boot device was
@@ -6243,13 +6243,13 @@ impl XhciController {
                 // to catch — which is exactly the failure a trim can cause and CCSMARGIN, stopping
                 // at the deadline, can never see. Reported once per port; the flag is cleared
                 // either way, so a re-plug of the same port stays quiet.
-                if CCS_LATE_ARMED.load(Ordering::Acquire)
-                    && CCS_UNSEEN[port_id as usize].swap(false, Ordering::Relaxed)
+                if CCS_LATE_ARMED[self.xi as usize].load(Ordering::Acquire)
+                    && CCS_UNSEEN[self.xi as usize][port_id as usize].swap(false, Ordering::Relaxed)
                 {
                     let t_seen_ms = crate::arch::now_cycles()
-                        .wrapping_sub(CCS_SETTLE_START.load(Ordering::Relaxed))
+                        .wrapping_sub(CCS_SETTLE_START[self.xi as usize].load(Ordering::Relaxed))
                         / Self::cycles_per_ms();
-                    let settle_ms = CCS_SETTLE_MS_LIVE.load(Ordering::Relaxed);
+                    let settle_ms = CCS_SETTLE_MS_LIVE[self.xi as usize].load(Ordering::Relaxed);
                     crate::bootlog_println!(
                         "xHCI: !! ccs-margin LATE port={} t_seen_ms={} settle_ms={} short_by_ms<={} \
                          (missed the initial CCS scan; recovered via CSC; t_seen is drain time, an \
@@ -6821,7 +6821,7 @@ impl XhciController {
                             else { "CRR=0 ring NEVER STARTED — doorbell not observed or dead fw (hyp d)" }
                         );
                         let landed = {
-                            EVENT_RING
+                            event_ring(self.xi as usize)
                                 .lock()
                                 .as_ref()
                                 .map(|r| r.has_event())
@@ -6902,7 +6902,7 @@ impl XhciController {
         let crr_set = unsafe { (read_reg64(crcr_ptr) >> 3) & 1 != 0 };
         if crr_set {
             self.cmd_ring_stopped = true;
-            let rcs = COMMAND_RING.lock().as_ref()
+            let rcs = command_ring(self.xi as usize).lock().as_ref()
                 .map(|r| r.trb_cycle(aborted))
                 .unwrap_or(1) as u64;
             unsafe {
@@ -6930,7 +6930,7 @@ impl XhciController {
         // Ring stopped. Drain whatever completions the stop produced (Command Aborted for our
         // TRB, Command Ring Stopped), then defuse the aborted TRB and restart.
         while self.drain_event_ring_once() {}
-        if let Some(ring) = COMMAND_RING.lock().as_mut() {
+        if let Some(ring) = command_ring(self.xi as usize).lock().as_mut() {
             if !ring.replace_with_noop(aborted) {
                 serial_println!("xHCI: WARNING: aborted TRB {:#x} not found in the command ring.", aborted);
             }
@@ -7078,7 +7078,7 @@ impl XhciController {
             let mut posted = false;
             let mut errored = false;
             loop {
-                let has = { EVENT_RING.lock().as_ref().map(|r| r.has_event()).unwrap_or(false) };
+                let has = { event_ring(self.xi as usize).lock().as_ref().map(|r| r.has_event()).unwrap_or(false) };
                 if has {
                     posted = true;
                     break;
@@ -10533,7 +10533,7 @@ impl XhciController {
         // (index, cycle, trb_type) for the 8-slot window around our dequeue position.
         let mut slots = [(0usize, 0u32, 0u32); 8];
         let (sw_deq, colour, popped) = {
-            let guard = EVENT_RING.lock();
+            let guard = event_ring(self.xi as usize).lock();
             let ring = match guard.as_ref() {
                 Some(r) => r,
                 None => {
@@ -10577,7 +10577,7 @@ impl XhciController {
         // still 0, so no derivation is possible and only the raw ERDP above carries information. An
         // out-of-range positive index is NOT an arithmetic bug — an ERDP pointing outside our own
         // ring is itself a finding, so it is printed exactly as computed.
-        let phys_base = unsafe { EVENT_RING_PHYS_BASE };
+        let phys_base = self.event_ring_phys_base;
         let hw_slot: i64 = if phys_base == 0 {
             -1
         } else {
@@ -11649,7 +11649,7 @@ impl XhciController {
                 // that did not exist when the pump last looked). Read-only: `has_event` invalidates
                 // and reads the dequeue TRB, consumes nothing, moves no pointer.
                 let bc_fresh_at_expiry = {
-                    let guard = EVENT_RING.lock();
+                    let guard = event_ring(self.xi as usize).lock();
                     guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
                 };
                 // BOTBOUND instrument 1 — the expiry RE-PEEK. Here, between the expiry-instant peek
@@ -11669,7 +11669,7 @@ impl XhciController {
                     loop {
                         let d = crate::arch::now_cycles().wrapping_sub(t0);
                         let fresh = {
-                            let guard = EVENT_RING.lock();
+                            let guard = event_ring(self.xi as usize).lock();
                             guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
                         };
                         if fresh {
@@ -11690,13 +11690,13 @@ impl XhciController {
                 };
                 BOT_PUMP_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 unsafe {
-                    let ir0 = XHCI_IR0_BASE.load(Ordering::Acquire);
-                    let op = XHCI_OP_BASE.load(Ordering::Acquire);
+                    let ir0 = ir0_base(self.xi as usize).load(Ordering::Acquire);
+                    let op = op_base_of(self.xi as usize).load(Ordering::Acquire);
                     let iman = if ir0 != 0 { core::ptr::read_volatile(ir0 as *const u32) } else { 0 };
                     let usbsts = if op != 0 { core::ptr::read_volatile((op + 0x04) as *const u32) } else { 0 };
                     serial_println!(
                         "xHCI: BOT pump TIMEOUT after {} cycles (IRQ_COUNT={} IMAN={:#x} USBSTS={:#x})",
-                        elapsed, XHCI_IRQ_COUNT.load(Ordering::Relaxed), iman, usbsts);
+                        elapsed, irq_count(self.xi as usize).load(Ordering::Relaxed), iman, usbsts);
                     // BOTBOUND instrument 2 — IMOD READBACK, on its own line so the line above stays
                     // byte-comparable with every capture taken before this arc.
                     //
@@ -11799,7 +11799,7 @@ impl XhciController {
                 //     late=no on the `[botbound]` line is the independent confirmation that the
                 //     ring stayed silent for a further 50 ms past a budget it had already blown.
                 let bc_fresh_now = {
-                    let guard = EVENT_RING.lock();
+                    let guard = event_ring(self.xi as usize).lock();
                     guard.as_ref().map(|r| r.has_event()).unwrap_or(false)
                 };
                 serial_println!(
@@ -13174,7 +13174,7 @@ impl XhciController {
                             crate::bootlog_println!("xHCI: >>> MISSION SUCCESS (BOT + CSW). TARGET ACQUIRED. <<<");
                         }
                         crate::bootlog_println!("xHCI: [IRQ] xHCI interrupts taken so far: {}",
-                            XHCI_IRQ_COUNT.load(Ordering::Relaxed));
+                            irq_count(self.xi as usize).load(Ordering::Relaxed));
                         // PIUSB-25: Pi mass-storage enumeration + LBA0 read-proof witness. aarch64-gated
                         // (byte-identical x86 codegen — nothing here changes the BOT/CSW core path; the
                         // `data` slice is the block just read by the READ(10) above, invalidated at the
@@ -13608,7 +13608,7 @@ impl XhciController {
             crate::bootpace::record("ftdi-up");
             ftdi::set_live(true);
         }
-        self.drain_ftdi(); #[cfg(feature = "ftdirx")] self.service_ftdi_rx(); #[cfg(feature = "usbnet")] self.service_usbnet(); #[cfg(feature = "uvc")] self.service_uvc(); #[cfg(feature = "uvc")] uvc::pump(); #[cfg(feature = "uvc")] self.service_ptp(); // XHCIISO: one camera candidate per pass (never mid-enumeration). // USBNET: the link's pass rides the same ladder slot — one call, all four x86 ladders. // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img.
+        self.drain_ftdi(); #[cfg(feature = "ftdirx")] self.service_ftdi_rx(); if self.xi != 0 { return; } #[cfg(feature = "usbnet")] self.service_usbnet(); #[cfg(feature = "uvc")] self.service_uvc(); #[cfg(feature = "uvc")] uvc::pump(); #[cfg(feature = "uvc")] self.service_ptp(); // XHCIISO: one camera candidate per pass (never mid-enumeration). // USBNET: the link's pass rides the same ladder slot — one call, all four x86 ladders. // FTDIRX (rmbp A9) — THE RX HALF OF THE CONSOLE, the one statement this path never had. TX-first on purpose: the drain above is the console's own output and stays ahead of the input that provokes it, so an echoed prompt reaches the wire before the next typed byte is taken off it. Arms one Normal TRB on bulk-IN once the sink is live (the `set_live(true)` directly above), consumes each completion, strips the FT232's TWO modem-status bytes and pushes the rest as `Event::Key` — the same queue the xHCI HID decoder feeds, so `input_service`'s `next_event` drain sees a cable byte exactly as it sees a keystroke. Same shape as `serialrx::drain` on the Orin (arch/aarch64/serial.rs), one pass per device-service pass. DEFAULT OFF. ⚠ LINE-NEUTRAL append: panic `Location` records embed line numbers and this file is compiled into the Pi kernel8.img.
     }
 
     /// PTBURST — bytes staged into ONE bulk-OUT transfer. **64, the FT232's full-speed bulk max packet
@@ -14003,7 +14003,7 @@ impl XhciController {
         }
         Self::clean_cmd_input_ctx(&trb);
         let cmd_phys = {
-            let mut g = COMMAND_RING.lock();
+            let mut g = command_ring(self.xi as usize).lock();
             let ring = g.as_mut().ok_or(())?;
             let base = ring.get_ptr();
             let idx = ring.push(trb).map_err(|_| ())?;
@@ -16205,7 +16205,7 @@ pub fn ftdi_flush_sync(budget_cycles: u64) -> (u64, u64, bool) {
     let t0 = crate::arch::now_cycles();
     let tx0 = FTDI_PUMP_COUNT.load(Ordering::Relaxed);
     let mut loan = loop {
-        match claim() {
+        match claim_at(ftdi_ctrl()) {
             Ok(l) => break l,
             // No controller was ever installed: there is no ring to drain and no tail to lose.
             Err(XhciClaimError::NotReady) => return (0, 0, false),
@@ -17823,7 +17823,7 @@ pub fn poll_task_start(cpu: usize) {
 fn poll_task(_: usize) {
     loop {
         crate::arch::sched::sleep_ticks(1);
-        if let Ok(mut x) = claim_noted() {
+        service_others(); if let Ok(mut x) = claim_noted() {
             x.poll_events();
             crate::video::lag::xhci_polled();
         }
@@ -19203,4 +19203,172 @@ pub fn pick(first: Option<(u64, u8, u8, u8)>, fns: &[crate::arch::pci::PciFn]) -
         None => serial_println!("[xhci] controllers={} picked=none{}{}", list.len(), rtag, rval),
     }
     chosen
+}
+
+// ── ZENBOOKXHCIALL (zenbook-ledger Z21) — EVERY xHCI up, in walk order — TAIL-APPENDED, so no line above moves ──────────
+// Controller 0 is Z7's pick and keeps every name it had (`COMMAND_RING`, `EVENT_RING`, `XHCI_IR0_BASE`, `XHCI_OP_BASE`,
+// `XHCI_IRQ_COUNT`: the aarch64 bring-ups and x86 `pci.rs` read them by name); controllers 1..3 live in the `_N`
+// tables below, reached through `command_ring(i)` / `event_ring(i)` / `ir0_base(i)` / `op_base_of(i)` / `irq_count(i)`
+// with `XhciController::xi`. The loan (`XHCI_CONTROLLER`, `XHCI_LOANED`), `XHCI_CNR_OK` and the `CCS_*` port statics
+// are `[_; XHCI_MAX]` in place; the ERDP base is the instance's own `event_ring_phys_base`. The CLASS drivers stay
+// single-instance: on controllers 1..3 only the FTDI door binds (on the first controller it binds on, `FTDI_CTRL`);
+// every other device is printed and refused by name (ZENBOOK-XHCIALL-CLASS owed). Controller 1 takes a RUNTIME MSI-X
+// vector `xhci1` (`vectors::alloc`; the IDT seed and its census untouched); 2..3 are polled every tick by `xhci-poll`
+// (`service_others`). One controller (QEMU): no line printed, no vector allocated, controller 0's bytes unchanged.
+
+/// The controller table's size: Strix Point carries four xHCI functions (1022:151a/151b/151e/151f).
+pub const XHCI_MAX: usize = 4;
+
+static COMMAND_RING_N: [Mutex<Option<TransferRing>>; XHCI_MAX - 1] = [const { Mutex::new(None) }; XHCI_MAX - 1];
+static EVENT_RING_N: [Mutex<Option<EventRing>>; XHCI_MAX - 1] = [const { Mutex::new(None) }; XHCI_MAX - 1];
+static IR0_BASE_N: [AtomicUsize; XHCI_MAX - 1] = [const { AtomicUsize::new(0) }; XHCI_MAX - 1];
+static OP_BASE_N: [AtomicUsize; XHCI_MAX - 1] = [const { AtomicUsize::new(0) }; XHCI_MAX - 1];
+static IRQ_COUNT_N: [AtomicU64; XHCI_MAX - 1] = [const { AtomicU64::new(0) }; XHCI_MAX - 1];
+
+/// Controller `i`'s command ring (0, or out of range, = `COMMAND_RING`).
+pub fn command_ring(i: usize) -> &'static Mutex<Option<TransferRing>> {
+    if i == 0 || i >= XHCI_MAX { &COMMAND_RING } else { &COMMAND_RING_N[i - 1] }
+}
+
+/// Controller `i`'s event ring (0, or out of range, = `EVENT_RING`).
+pub fn event_ring(i: usize) -> &'static Mutex<Option<EventRing>> {
+    if i == 0 || i >= XHCI_MAX { &EVENT_RING } else { &EVENT_RING_N[i - 1] }
+}
+
+/// Controller `i`'s Interrupter 0 MMIO base for the lock-free ack (0 = `XHCI_IR0_BASE`).
+pub fn ir0_base(i: usize) -> &'static AtomicUsize {
+    if i == 0 || i >= XHCI_MAX { &XHCI_IR0_BASE } else { &IR0_BASE_N[i - 1] }
+}
+
+/// Controller `i`'s operational-register base for the lock-free ack (0 = `XHCI_OP_BASE`).
+pub fn op_base_of(i: usize) -> &'static AtomicUsize {
+    if i == 0 || i >= XHCI_MAX { &XHCI_OP_BASE } else { &OP_BASE_N[i - 1] }
+}
+
+/// Controller `i`'s interrupt count (0 = `XHCI_IRQ_COUNT`).
+pub fn irq_count(i: usize) -> &'static AtomicU64 {
+    if i == 0 || i >= XHCI_MAX { &XHCI_IRQ_COUNT } else { &IRQ_COUNT_N[i - 1] }
+}
+
+/// Bit `i` set = controller `i` was installed. Lets a one-controller boot's `service_others` cost one relaxed load.
+static XHCI_LIVE: AtomicU32 = AtomicU32::new(0);
+
+fn xhciall_note_live(i: usize) {
+    XHCI_LIVE.fetch_or(1u32 << i, Ordering::Release);
+}
+
+/// The controller the FTDI console door bound on (0xFF = none yet). Taken by CAS: the first controller to bind wins.
+static FTDI_CTRL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
+
+/// Take the FTDI door for controller `xi`; `true` when it is (now or already) `xi`'s.
+fn ftdi_take(xi: u8) -> bool {
+    match FTDI_CTRL.compare_exchange(0xFF, xi, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(held) => held == xi,
+    }
+}
+
+/// The controller `ftdi_flush_sync` claims: the FTDI's own, or controller 0 before any bound.
+fn ftdi_ctrl() -> usize {
+    match FTDI_CTRL.load(Ordering::Acquire) {
+        0xFF => 0,
+        i => (i as usize).min(XHCI_MAX - 1),
+    }
+}
+
+/// ZENBOOKXHCIALL: the controllers the bring-up at `arch/x86_64/pci.rs:897` runs on, in order — Z7's pick FIRST
+/// (controller 0, every unaddressed `claim()`), then every other 0C/03/30 of the PCI registry in walk order, BAR from
+/// `PciScanner::get_bar_address`, at most `XHCI_MAX`. Prints only for a controller beyond the pick, so a one-controller
+/// machine's wire is unchanged.
+#[cfg(target_arch = "x86_64")]
+pub fn bring_list(first: Option<(u64, u8, u8, u8)>, fns: &[crate::arch::pci::PciFn]) -> Vec<(u64, u8, u8, u8)> {
+    let Some(picked) = first else {
+        return Vec::new();
+    };
+    let mut out: Vec<(u64, u8, u8, u8)> = alloc::vec![picked];
+    for p in fns.iter().filter(|p| (p.class, p.sub, p.progif) == (0x0C, 0x03, 0x30)) {
+        if (p.bus, p.dev, p.func) == (picked.1, picked.2, picked.3) {
+            continue;
+        }
+        if out.len() >= XHCI_MAX {
+            serial_println!("[xhci] bdf={}:{}.{} -> REFUSED reason=table-full max={}", p.bus, p.dev, p.func, XHCI_MAX);
+            continue;
+        }
+        serial_println!("[xhci] ctrl={} bdf={}:{}.{} bring-up", out.len(), p.bus, p.dev, p.func);
+        out.push((crate::drivers::pci::PciScanner::get_bar_address(p.bus, p.dev, p.func), p.bus, p.dev, p.func));
+    }
+    out
+}
+
+/// The MSI-X vector controller `xi` is programmed with: 0 = the IDT-seeded `xhci` (unchanged), 1 = a RUNTIME `xhci1`
+/// (`vectors::alloc` registers `xhci1_msi_handler` before it answers; a refusal prints its own witness), 2..3 = none
+/// (the event ring stays on the polled drain, `xhci-poll` every tick).
+#[cfg(target_arch = "x86_64")]
+pub fn msix_vector(xi: usize) -> Option<u8> {
+    match xi {
+        0 => crate::arch::interrupts::vectors::of("xhci"),
+        1 => crate::arch::interrupts::vectors::alloc("xhci1", xhci1_msi_handler),
+        _ => {
+            serial_println!("[xhci] ctrl={} msix=polled (one runtime vector, xhci1; ZENBOOK-XHCIALL-MSIX owed)", xi);
+            None
+        }
+    }
+}
+
+/// Controller 1's MSI-X handler: the same lock-free ack as `xhci_msi_handler` (interrupts.rs), on controller 1's bases.
+#[cfg(target_arch = "x86_64")]
+extern "x86-interrupt" fn xhci1_msi_handler(_f: x86_64::structures::idt::InterruptStackFrame) {
+    interrupt_ack_at(1);
+    crate::arch::apic::eoi();
+}
+
+/// The `xhci-poll` task's pass over controllers 1..3 (controller 0 keeps its own pumps): each live one is claimed in
+/// turn — never two loans at once — polled, and given the FTDI, disposal and enumeration services. Storage, hubs and
+/// HID set-protocol are not run there: those classes are refused on 1..3 (ZENBOOK-XHCIALL-CLASS).
+#[cfg(target_arch = "x86_64")]
+fn service_others() {
+    let live = XHCI_LIVE.load(Ordering::Relaxed);
+    if live & !1u32 == 0 {
+        return;
+    }
+    for i in 1..XHCI_MAX {
+        if live & (1u32 << i) == 0 {
+            continue;
+        }
+        if let Ok(mut x) = claim_at(i) {
+            x.poll_events();
+            x.service_ftdi();
+            x.service_slot_disposal();
+            x.service_enum();
+        }
+    }
+}
+
+impl XhciController {
+    /// ZENBOOKXHCIALL: the class gate for controllers 1..3, asked once per descriptor completion in `poll_events`.
+    /// Controller 0: `false`, no line, no state. Controller 1..3 + a DEVICE descriptor: one line
+    /// `[xhci] ctrl=<i> port=<p> device <vid>:<pid> -> …`; the FT232 binds when the FTDI door is free or already this
+    /// controller's (`-> bind ftdi`, `false`); anything else is refused by name, its root port released (the ORIN-P7
+    /// no-driver arm's shape) and `true` returned so no class arm and no class note sees it.
+    fn xhciall_refuse(&mut self, desc_type: u8, slot: u8) -> bool {
+        if self.xi == 0 || desc_type != 0x01 {
+            return false;
+        }
+        let (vid, pid, port, downstream) = {
+            let s = &self.slots[slot as usize];
+            (s.vid, s.pid, s.port_id, s.is_downstream)
+        };
+        if vid == ftdi::FTDI_VID && pid == ftdi::FTDI_PID && ftdi_take(self.xi) {
+            serial_println!("[xhci] ctrl={} port={} device {:04x}:{:04x} -> bind ftdi", self.xi, port, vid, pid);
+            return false;
+        }
+        serial_println!(
+            "[xhci] ctrl={} port={} device {:04x}:{:04x} -> class driver single-instance (ZENBOOK-XHCIALL-CLASS owed)",
+            self.xi, port, vid, pid
+        );
+        if !downstream {
+            self.start_next_port();
+        }
+        true
+    }
 }
