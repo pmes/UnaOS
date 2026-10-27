@@ -1045,7 +1045,7 @@ fn edl_run(jid: u32, path: &str, seek_ms: u64, rep: &mut EdlReport) -> Result<()
         reels.reels.push(Reel { id: s.id, d, v, a });
     }
     let steps = timeline_core::schedule::schedule(tl, 0..tl.end(), &reels).map_err(|e| ("schedule-refused", Some(alloc::format!("schedule: {}", e))))?;
-    rep.reels = reels.reels.len();
+    rep.reels = reels.reels.len(); super::export::set_reels(jid, tl.reels_colour(|id| reels.get(id).and_then(|r| r.v.as_ref()).and_then(|v| v.1.colour))); // EXPORTCOLOURPRIM (rmbp-ledger B979): the reels' one primaries / transfer pair, the export file's (video/export.rs)
     rep.clips = tl.tracks.iter().map(|t| t.clips.len()).sum();
     rep.steps = steps.len();
     serial_println!("[nle] open edl={} reels={} clips={} steps={}", path, rep.reels, rep.clips, rep.steps);

@@ -40,6 +40,7 @@
 //!   ([`vmix::take_outgoing`]) Stria's render and the kernel Player's EDL mode both call.
 //! * [`view`] (NLE6KEYS, rmbp-ledger B961): the editor's ONE track view — the geometry ([`view::Layout`]) and the painter
 //!   ([`view::paint_in`]) the host face (`stria::nle_face`) and the kernel Player's EDL view band both draw.
+//! * EXPORTCOLOURPRIM (rmbp-ledger B979): [`Timeline::reels_colour`] — the ONE file-colour rule both exports call (Stria's `nle_export::export`, the kernel's EDL export).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -792,4 +793,23 @@ fn black_cut(bt: &Track, clips: &[Clip], x: &Transition) -> Result<i64, EditErro
         .filter(|&at| !clips.iter().any(|c| c.at == at))
         .min_by_key(|&at| ((at - x.at).abs(), at))
         .ok_or(EditError::Transition)
+}
+
+// ── EXPORTCOLOURPRIM (rmbp-ledger B979): the export's file primaries / transfer (handlers.md §5 NLEPROBE-HDR's EXPORT-COLOUR-PRIM) ──
+// The mix converts each reel to R'G'B' by its own matrix and no primaries conversion exists (MIX-PRIMARIES owed), so an
+// export can state ONE primaries / transfer pair only when every reel it cuts states the same one.
+impl Timeline {
+    /// The H.273 (primaries, transfer) every source a video-track clip cuts states, when all of them state one and the same
+    /// pair; (2, 2) unspecified when one differs, one states no colour, or no video clip exists. `colour` is the face's reel
+    /// colour: Stria's `Sources::open_report(id).colour`, the kernel's EDL reel's opened `Track::colour`.
+    pub fn reels_colour(&self, colour: impl Fn(SourceId) -> Option<demux_core::colour::Colour>) -> (u8, u8) {
+        let mut pair = None;
+        for c in self.tracks.iter().filter(|t| t.kind == Kind::Video).flat_map(|t| t.clips.iter()) {
+            let Some(p) = colour(c.src).map(|k| (k.primaries, k.transfer)) else { return (2, 2) };
+            if *pair.get_or_insert(p) != p {
+                return (2, 2);
+            }
+        }
+        pair.unwrap_or((2, 2))
+    }
 }
