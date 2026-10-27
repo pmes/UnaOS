@@ -77,3 +77,6 @@ HEAVY:
 # The card-heavy fixtures (FLIGHT37 §4): NAMEINDEXTX held MOUNT+CARD 5 min, ABIMAGE copied 2 x 21.8 MB in 9 min.
 nameindextx @600
 abimage @900
+# PIDESK-LIST (rmbp-ledger B889): the aarch64 desktop's probes, Pi and Orin only (`@<board>` = boot::OLDEST.0; rmbp12 counts them other=); HEAVY: their run time is unmeasured (B817's budget rule).
+textscale @pi4 @orin
+overlays @pi4 @orin

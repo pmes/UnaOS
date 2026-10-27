@@ -828,7 +828,7 @@ refs/heads/exec-rmbp-autolock4   5e65a8816 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-textscalereseat2   5e65a8816 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-sleepresume2   5e65a8816 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-leaserenew   5e65a8816 IN-FLIGHT cut 2026-10-27
-refs/heads/exec-rmbp-pidesklist   5e65a8816 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pidesklist   7a96c024c FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-nle6   5e65a8816 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle2b   5e65a8816 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-nle3b   5e65a8816 IN-FLIGHT cut 2026-10-27

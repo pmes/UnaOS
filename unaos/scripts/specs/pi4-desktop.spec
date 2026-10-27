@@ -45,16 +45,16 @@ REQUIRE \[dragwedge\] furniture aimed=.* -> PASS
 # capture has no stage-resolve and no build line. Promote with PIDESK-BUILT (whether the Pi desktop takes the
 # DESKTOPBUILT object, R92/R93).
 OPTIONAL \[desktop\] built at=
-# SHELLFACE (B858), TEXTSCALE (BP-video-40), OVERLAYARM2 (B866): `tests textscale` and `tests overlays` are
-# registered only in `tests::ensure_shellux` (tests.rs:175), reached from `source_done` / `run` / `shell_verb`,
-# none of which an untyped aarch64 boot calls (no `:: TESTS:` line on the armed capture). The shell repaint
-# moves only on the textscale epoch. Promote all four with PIDESK-LIST (a Pi tier in TESTS.LIST naming
-# `textscale` and `overlays`, once BOOTLISTARM B874 runs the list at the aarch64 desktop's first word).
+# SHELLFACE (B858), TEXTSCALE (BP-video-40), OVERLAYARM2 (B866): `tests textscale` and `tests overlays` are registered
+# only in `tests::ensure_shellux` (tests.rs:175). PIDESK-LIST (B889) lists both `@pi4 @orin` in TESTS.LIST's HEAVY tier,
+# run by `bootlist` from `boot::oldest_say` (a `login` build's first `[desktop] built`) on a `kernel8` card that staged the
+# list. `kernel8-test --desk` has neither (no `login`, and `bootlist_stage` is media-only), so the four stay OPTIONAL here;
+# the shell repaint moves only on the textscale epoch. Promote all four with PIDESK-QEMULIST (the desk lane reaches the list).
 OPTIONAL \[kfont\] repaint shell epoch=[1-9][0-9]* console_rows=[1-9]
 OPTIONAL :: OVERLAYS: launcher=ok appswitch=skip\(x86\) .* -> PASS ::
 OPTIONAL :: TEXTSCALE: steps=[0-9]+ .* -> PASS ::
 OPTIONAL \[textscale\] win=shell css=[0-9]+ grow=[0-9]+ rows_ok=1
-# BOOTLIST (B817) is x86 `wc` only at the cut (tests.rs:6747); promote when BOOTLISTARM (B874) folds.
+# BOOTLIST: BOOTLISTARM (B874) runs the list on aarch64 too, but only from a `login` build's first build with a staged list (PIDESK-QEMULIST, B889).
 OPTIONAL :: BOOTLIST: ran=[0-9]+ pass=[0-9]+
 # KEYBOOT3 (B856) / KEYBOOT4's Pi worker: a keyed card only (fs/users.rs:4058, video/login.rs:3800).
 OPTIONAL \[keyboot\] unlock form up kdf_pending=1
