@@ -892,7 +892,7 @@ fn with_unafs_attempt<R>(f: &mut impl FnMut(&mut KernelUnaFS) -> R) -> Attempt<R
 /// the caller left us unmasked, and spin-hint otherwise. Either way the wait is OUTSIDE the
 /// attempt's own `without_interrupts` span: the F1–F4 rule that no masked span may wait on a driver
 /// lock is not weakened by this loop, it is what the loop is built out of.
-pub fn with_unafs<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
+#[track_caller] pub fn with_unafs<R>(mut f: impl FnMut(&mut KernelUnaFS) -> R) -> Result<R, MountError> {
     let start = crate::arch::now_cycles();
     let budget = crate::arch::hw_wait_budget();
     let mut restarts: u32 = 0;

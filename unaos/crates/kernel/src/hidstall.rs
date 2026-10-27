@@ -143,21 +143,21 @@ pub fn now_us() -> u64 {
     crate::arch::ms().saturating_mul(1000)
 }
 
-/// One UnaFS transaction attempt began at `t0_us` ([`now_us`]) and its IRQ-masked span just ended.
-pub fn note_masked_since(t0_us: u64) {
-    note_masked(now_us().saturating_sub(t0_us) / 1000);
+/// One UnaFS transaction attempt began at `t0_us` ([`now_us`]) and its IRQ-masked span just ended; the site is `with_unafs`'s caller (HIDSTALLMASKSCOPE B1019: both `#[track_caller]`).
+#[track_caller] pub fn note_masked_since(t0_us: u64) {
+    note_masked(now_us().saturating_sub(t0_us) / 1000, core::panic::Location::caller());
 }
 
-/// One UnaFS transaction attempt's IRQ-masked span (ms).
-pub fn note_masked(ms: u64) {
-    SEC_MASKED_MS.fetch_max(ms, Relaxed);
-    MASKED_MAX_MS.fetch_max(ms, Relaxed);
+/// One UnaFS transaction attempt's IRQ-masked span (ms), at `site`; a new max names its holder ([`masked_into`], tail).
+pub fn note_masked(ms: u64, site: &'static core::panic::Location<'static>) {
+    masked_into(&SEC_MASKED_MS, &SEC_MASKED_WHO, ms, site);
+    masked_into(&MASKED_MAX_MS, &MASKED_MAX_WHO, ms, site);
     SCOPE_MASKED_MS.fetch_max(ms, Relaxed); // REGISTRYCHUNK (B508): the scoped max ([`scope_masked_take`])
 }
 
-/// The second's longest masked UnaFS span, taken (reset) at `lag`'s roll.
-pub fn take_sec_masked() -> u64 {
-    SEC_MASKED_MS.swap(0, Relaxed)
+/// The second's longest masked UnaFS span and its holder, taken (reset) at `lag`'s roll (who first: a winner between the two is the next second's).
+pub fn take_sec_masked() -> (u64, MaskedBy) {
+    let by = SEC_MASKED_WHO.read(true); (SEC_MASKED_MS.swap(0, Relaxed), by)
 }
 
 /// A pin press timed out into its launch. SMALLFIX8 (B516): if the pump core was held for a frame or more inside the
@@ -195,12 +195,12 @@ fn selftest() {
     let s = HID_STALL_S.load(Relaxed);
     let k = KEYQ_MAX_MS.load(Relaxed);
     serial_println!(
-        ":: HIDSTALL: halted_at_login={} recovered={} proxy_retired={} hid_stall_s={} key_queue_max_ms={} dock_timeouts={} masked_max_ms={} -> {} :: hid_gap_bound_ms={} key_bound_ms={} release_timeout_ms={} holders={} hold_worst_ms={} hold_worst={} releases_waited={} lane_max_ms={} pump_cpu={} held_stall_s={} stall_gap_max_ms={} dock_held={} timeout_release_ms={} dock_undecoded={} fr={}",
-        h, RECOVERED.load(Relaxed), PROXY_RETIRED.load(Relaxed), s, k, DOCK_TIMEOUTS.load(Relaxed), MASKED_MAX_MS.load(Relaxed),
+        ":: HIDSTALL: halted_at_login={} recovered={} proxy_retired={} hid_stall_s={} key_queue_max_ms={} dock_timeouts={} masked_max_ms={} masked_by={} -> {} :: hid_gap_bound_ms={} key_bound_ms={} release_timeout_ms={} holders={} hold_worst_ms={} hold_worst={} releases_waited={} lane_max_ms={} pump_cpu={} held_stall_s={} stall_gap_max_ms={} dock_held={} timeout_release_ms={} dock_undecoded={} fr={}",
+        h, RECOVERED.load(Relaxed), PROXY_RETIRED.load(Relaxed), s, k, DOCK_TIMEOUTS.load(Relaxed), MASKED_MAX_MS.load(Relaxed), masked_by(),
         if verdict(h, s, k) { "PASS" } else { "FAIL" }, HID_GAP_STALL_MS, KEY_QUEUE_BOUND_MS, DOCK_RELEASE_TIMEOUT_MS,
         holders_seen(), session_worst().1, HolderName(session_worst().0), RELEASES_WAITED.load(Relaxed), LANE_MAX_MS.load(Relaxed), CpuWord(pump_cpu()),
         HID_STALL_HELD_S.load(Relaxed), STALL_GAP_MAX_MS.load(Relaxed), DOCK_HELD.load(Relaxed), TIMEOUT_RELEASE_MS.load(Relaxed), DOCK_UNDECODED.load(Relaxed), FrPlace
-    );
+    ); maskscope_kat(); // HIDSTALLMASKSCOPE (B1019): the masked-max holder KAT, `:: MASKSCOPE:` (LINE-NEUTRAL fold, code first; body at the tail)
 }
 
 /// REGISTRYCHUNK (rmbp-ledger B508): the longest masked UnaFS span on ANY core since the last take — a step reads
@@ -574,4 +574,151 @@ fn fr_step(step: u8) -> u8 {
         return P_FLIGHT_REST;
     }
     step
+}
+
+// ── HIDSTALLMASKSCOPE (rmbp-ledger B1019) — every masked maximum names its holder. FILE-TAIL append. ────────────────────
+// Flight 38: `:: HIDSTALL: … masked_max_ms=2940` and CLOCKCORE's 2939 were boot-long maxima with no holder; LOGINSTALL
+// (B1008) found task 67 by hand from the lock registry and the `[tests] watch` lines. The holder of a masked UnaFS span is
+// the CURRENT task by construction (MOUNT is already released at the note), so a max records what LOCKREG's
+// `pump_core_hold` records for a pump-core hold: `sched::current_name()` and a `&'static Location` — here `with_unafs`'s
+// caller (`with_unafs` and `note_masked_since` are `#[track_caller]`). The record is written ONLY on the winning branch of
+// the max's own `fetch_max`; two near-equal maxima racing may leave the earlier one's name (the try-lock below skips, it
+// never spins): benign, said. `MaskedBy` prints `HolderName`'s shape (`<task>@<file>:<line>`, `?` no task, `-` none);
+// it does not share `HolderName::fmt`'s body because that body is line-pinned above.
+
+/// One masked maximum's holder: the task name (`&'static str` as pointer + length, 0 = none) and the site (a
+/// `&'static Location`, 0 = none). `lock` is a TRY-lock over the three words: a writer or reader that finds it taken
+/// skips (safe in a masked span and in an ISR — clockcore's `isr_tick` writes one).
+pub struct MaskWho {
+    lock: AtomicBool,
+    name_p: AtomicUsize,
+    name_l: AtomicUsize,
+    site: AtomicUsize,
+}
+
+impl MaskWho {
+    pub const fn new() -> Self {
+        MaskWho { lock: AtomicBool::new(false), name_p: AtomicUsize::new(0), name_l: AtomicUsize::new(0), site: AtomicUsize::new(0) }
+    }
+
+    /// The max this record names was just won by `name` at `site` (call it only on the winning `fetch_max` branch).
+    pub fn note(&self, name: Option<&'static str>, site: &'static core::panic::Location<'static>) {
+        if self.lock.compare_exchange(false, true, Acquire, Relaxed).is_err() {
+            return; // a near-equal max is being named this instant: its name stands (benign)
+        }
+        let (np, nl) = name.map(|n| (n.as_ptr() as usize, n.len())).unwrap_or((0, 0));
+        self.name_p.store(np, Relaxed);
+        self.name_l.store(nl, Relaxed);
+        self.site.store(site as *const core::panic::Location<'static> as usize, Relaxed);
+        self.lock.store(false, Release);
+    }
+
+    /// A consistent snapshot (`clear` = reset it too, for a max that is taken); a busy record reads as none.
+    pub fn read(&self, clear: bool) -> MaskedBy {
+        if self.lock.compare_exchange(false, true, Acquire, Relaxed).is_err() {
+            return MaskedBy { name_p: 0, name_l: 0, site: 0 };
+        }
+        let by = MaskedBy { name_p: self.name_p.load(Relaxed), name_l: self.name_l.load(Relaxed), site: self.site.load(Relaxed) };
+        if clear {
+            self.name_p.store(0, Relaxed);
+            self.name_l.store(0, Relaxed);
+            self.site.store(0, Relaxed);
+        }
+        self.lock.store(false, Release);
+        by
+    }
+}
+
+/// A [`MaskWho`] snapshot: `masked_by=<task>@<file>:<line>` (`?` for no task, `-` for no record).
+pub struct MaskedBy {
+    name_p: usize,
+    name_l: usize,
+    site: usize,
+}
+
+impl MaskedBy {
+    /// The holder's task name, if one was recorded.
+    pub fn name(&self) -> Option<&'static str> {
+        if self.name_p == 0 {
+            return None;
+        }
+        // SAFETY: `name_p`/`name_l` are a task's `&'static str` name, stored whole under the record's lock.
+        Some(unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(self.name_p as *const u8, self.name_l)) })
+    }
+
+    /// The holder's site, if one was recorded.
+    pub fn site(&self) -> Option<&'static core::panic::Location<'static>> {
+        // SAFETY: `site` is a `&'static Location`, stored whole under the record's lock.
+        if self.site == 0 { None } else { Some(unsafe { &*(self.site as *const core::panic::Location<'static>) }) }
+    }
+}
+
+impl core::fmt::Display for MaskedBy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let Some(l) = self.site() else { return f.write_str("-") };
+        f.write_str(self.name().unwrap_or("?"))?;
+        let file = l.file();
+        write!(f, "@{}:{}", file.rsplit('/').next().unwrap_or(file), l.line())
+    }
+}
+
+/// The second's and the boot's masked-max holders ([`note_masked`]).
+static SEC_MASKED_WHO: MaskWho = MaskWho::new();
+static MASKED_MAX_WHO: MaskWho = MaskWho::new();
+
+/// Fold `ms` at `site` into `max`; when it is a new max, `who` names the current task and `site`. True on a new max.
+fn masked_into(max: &AtomicU64, who: &MaskWho, ms: u64, site: &'static core::panic::Location<'static>) -> bool {
+    let won = max.fetch_max(ms, Relaxed) < ms;
+    if won {
+        who.note(crate::arch::sched::current_name(), site);
+    }
+    won
+}
+
+/// The boot-long masked max's holder (the HIDSTALL verdict's `masked_by=`).
+pub fn masked_by() -> MaskedBy {
+    MASKED_MAX_WHO.read(false)
+}
+
+/// `tests hidstall`'s KAT: a 30 ms masked span held by the task running `tests`, recorded through the SAME
+/// [`masked_into`] / [`MaskWho`] path on the KAT's OWN pair (a fixture's hold never feeds the boot maxima, B1008), must
+/// name that task and the KAT's own call site through one `#[track_caller]` level (as `with_unafs` -> `note_masked_since`).
+/// `:: MASKSCOPE: who=<task>@hidstall.rs:<n> ms=<n> -> PASS|FAIL :: task= site_ok= boot_by=`.
+fn maskscope_kat() {
+    static KAT_MAX: AtomicU64 = AtomicU64::new(0);
+    static KAT_WHO: MaskWho = MaskWho::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::arch::x86_64::apic::tsc_hz() < 1_000_000 {
+            serial_println!(":: MASKSCOPE: who=- ms=0 -> SKIP reason=no-tsc-us ::"); // `now_us` would be the tick clock, frozen under the mask
+            return;
+        }
+    }
+    KAT_MAX.store(0, Relaxed);
+    let _ = KAT_WHO.read(true);
+    let me = crate::arch::sched::current_name();
+    let (line, ms) = (line!(), kat_hold(&KAT_MAX, &KAT_WHO, 30));
+    let by = KAT_WHO.read(false);
+    let site_ok = by.site().is_some_and(|l| l.file() == file!() && l.line() == line);
+    let pass = me.is_some() && by.name() == me && site_ok && ms >= 29 && KAT_MAX.load(Relaxed) == ms;
+    serial_println!(
+        ":: MASKSCOPE: who={} ms={} -> {} :: task={} site_ok={} boot_by={}",
+        by, ms, if pass { "PASS" } else { "FAIL" }, me.unwrap_or("?"), site_ok as u8, masked_by()
+    );
+    crate::tests::tally(pass);
+}
+
+/// Hold interrupts masked for `ms` on this task, then record the span at the CALLER's site into `max`/`who`.
+#[track_caller]
+fn kat_hold(max: &AtomicU64, who: &MaskWho, ms: u64) -> u64 {
+    let site = core::panic::Location::caller();
+    let t0 = now_us();
+    crate::arch::without_interrupts(|| {
+        while now_us().saturating_sub(t0) < ms * 1000 {
+            core::hint::spin_loop();
+        }
+    });
+    let span = now_us().saturating_sub(t0) / 1000;
+    masked_into(max, who, span, site);
+    span
 }
