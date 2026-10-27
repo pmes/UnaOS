@@ -25,8 +25,8 @@
 // controller's XLAT bit) are turned into HID usages through ONE table (`video::keymap::set1_usage`,
 // keymap's own vocabulary), folded into a synthetic 8-byte boot keyboard report (modifier byte +
 // six usage slots), and that report is handed to the ONE boot-report decoder the EHCI keyboard and
-// the Bluetooth keyboard already share (`drivers::ehci::decode_boot_keyboard`, passed in by the
-// pump as a fn pointer). Press edges, layouts, chords, the host typematic, KeyUp, the lock-key
+// the Bluetooth keyboard already share (`drivers::hidboot::decode_boot_keyboard`, HIDBOOTSHARED B982,
+// called with `Transport::Ps2` so its key lines read `PS2-HID:`). Press edges, layouts, chords, the host typematic, KeyUp, the lock-key
 // state, Print Screen and the K2P stamp are therefore the decoder's, never re-written here; the
 // PS/2 keyboard's own repeat makes leave the report unchanged and are not re-decoded.
 //
@@ -40,8 +40,9 @@
 // the init line says `irq=polled reason=no-ioapic-in-kernel`.
 //
 // Owed (Z3): Fn keys via asus-wmi; scancode set 2 raw; typematic rate (0xF3); lock LEDs (0xED);
-// Pause (E1, swallowed and counted); the aux port; HIDBOOT-SHARED (the decoder out of the EHCI
-// module); the FADT 8042 flag as a second witness; ZENBOOK-TOUCHPAD (I2C-HID, not this file).
+// Pause (E1, swallowed and counted); the aux port; the FADT 8042 flag as a second witness;
+// ZENBOOK-TOUCHPAD (I2C-HID, not this file). HIDBOOT-SHARED is built (B982): the decoder is
+// `drivers::hidboot`, so this module is gated on x86_64 alone, not on `ehcihid`.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use x86_64::instructions::port::Port;
@@ -123,8 +124,8 @@ struct Dec {
 static DEC: crate::sync::Mutex<Dec> =
     crate::sync::Mutex::new(Dec { e0: false, e1_skip: 0, report: [0; 8], kprev: [0; 6], kmods: 0, kleds: 0 });
 
-/// The one boot-keyboard decoder's shape (`drivers::ehci::decode_boot_keyboard`).
-pub type BootDecode = unsafe fn(&[u8], &mut [u8; 6], &mut u8, &mut u8) -> bool;
+// The one boot-keyboard decoder (HIDBOOTSHARED B982), called with this transport's label.
+use crate::drivers::hidboot::{decode_boot_keyboard, Transport};
 
 #[inline]
 fn status() -> u8 {
@@ -415,10 +416,10 @@ pub fn interrupt_ack() {
     harvest();
 }
 
-/// The pump half, called by `ehci::service_ehci_hid` under its `EHCI_HID` lock with the one
-/// boot-keyboard decoder. Polls when IRQ1 is not live, drains the ring through the set-1 machine,
-/// and hands each CHANGED report to `decode`.
-pub fn pump(decode: BootDecode) {
+/// The pump half, called by `ehci::service_ehci_hid` under its `EHCI_HID` lock. Polls when IRQ1
+/// is not live, drains the ring through the set-1 machine, and hands each CHANGED report to the
+/// one boot-keyboard decoder (`drivers::hidboot`, `Transport::Ps2`).
+pub fn pump() {
     if !READY.load(Ordering::Acquire) {
         return;
     }
@@ -427,12 +428,12 @@ pub fn pump(decode: BootDecode) {
     }
     let mut d = DEC.lock();
     while let Some(b) = ring_pop() {
-        step(&mut d, b, decode);
+        step(&mut d, b);
     }
 }
 
 /// One scancode byte through the set-1 machine.
-fn step(d: &mut Dec, b: u8, decode: BootDecode) {
+fn step(d: &mut Dec, b: u8) {
     if d.e1_skip > 0 {
         d.e1_skip -= 1;
         return;
@@ -484,7 +485,7 @@ fn step(d: &mut Dec, b: u8, decode: BootDecode) {
         return; // a typematic make or a release of a key not held: nothing new for the decoder
     }
     let r = d.report;
-    let led = unsafe { decode(&r, &mut d.kprev, &mut d.kmods, &mut d.kleds) };
+    let led = unsafe { decode_boot_keyboard(Transport::Ps2, &r, &mut d.kprev, &mut d.kmods, &mut d.kleds) };
     DECODED.fetch_add(1, Ordering::Relaxed);
     if led {
         LED_OWED.fetch_add(1, Ordering::Relaxed);
@@ -560,8 +561,8 @@ pub fn selftest() {
     let dropped = DROPPED.load(Ordering::Relaxed);
     let pass = table_ok && got_down && got_up && m_down == 0x10 && m_up == 0x00;
     serial_println!(
-        ":: I8042: init=ready irq={} table={} inject=e0,1d,e0,9d mods={:02x},{:02x} decoded={} dropped={} -> {} ::",
-        irq, tbl, m_down, m_up, n - base, dropped,
+        ":: I8042: init=ready irq={} transport={} table={} inject=e0,1d,e0,9d mods={:02x},{:02x} decoded={} dropped={} -> {} ::",
+        irq, Transport::Ps2.tag(), tbl, m_down, m_up, n - base, dropped,
         if pass { "PASS" } else if !(down && up) { "FAIL reason=inject" } else { "FAIL" }
     );
 }
