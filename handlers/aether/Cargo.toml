@@ -38,6 +38,7 @@ taffy = { workspace = true }
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
 bandy = { path = "../../libs/bandy" }
 gneiss_pal = { path = "../../libs/gneiss_pal" }
+http_core = { path = "../../unaos/libs/net/http_core" } # HTTPFAIL (SR212): fetchseq names http_core's Error for the reason= table
 # AUDIOTRACK (SR45): SHA-256 names the http(s) media cache files — UnaOS's own primitive (SR27).
 crypto_core = { path = "../../unaos/libs/sys/crypto_core" }
 # AETHERSTORAGE (SR94): IndexedDB, the Cache API index, the service-worker registry and the quota flags sit on
