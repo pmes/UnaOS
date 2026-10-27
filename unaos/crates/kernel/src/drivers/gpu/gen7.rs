@@ -7310,7 +7310,7 @@ pub fn ladder_test() {
     ladder::run();
     #[cfg(feature = "gen7blit")]
     blit::test(); // GEN7B (B422): the BCS job, the display capture, KCOMP's second-blitter decision
-    hold_leg(); } // GEN7HOLDONCE (B1025): the second run, asserting no new held page (`:: GEN7HOLD: ::`, body at the file tail). LINE-NEUTRAL append
+    hold_leg(); order_leg(); } // GEN7HOLDONCE (B1025): the second run, asserting no new held page (`:: GEN7HOLD: ::`, body at the file tail). LINE-NEUTRAL append
 
 mod ladder {
     use super::GtWake;
@@ -7710,4 +7710,51 @@ unsafe fn flush_verdict(bar0: usize, tag: &str) -> FlushVerdict {
         flush_bank(verdict);
     }
     FlushVerdict { pre, post, rest, restored: rest == pre, verdict, positive: verdict == "tlb-flush-decodes" }
+}
+
+// =================================================================================
+// GEN7LOCKHELD (rmbp-ledger B1044) — FILE-TAIL append: nothing above it moves. BP-gpu-9's order (gen7blit's `PAGES`
+// before a slot, never the reverse) held by the lock registry's own walk: every lock here is a `crate::sync::Mutex`, a
+// blocking `lock()` records an order edge from each hold this task has on this core (a `try_lock` records none: it
+// cannot wait, B578), and an edge whose reverse is already recorded counts in LOCKREG's `inversions=` (which FAILs).
+// The only nested pair is `blit::bcs_job` (`PAGES.try_lock()` then `held_take(&BLIT_RING_HELD)`), and it never runs
+// without an IGD bank (QEMU), so this leg makes the production take itself and READS the registry's table: the
+// forward edge must be recorded, the reverse absent, and no inversion counted by the take. Nothing is taken inverted:
+// an inverted take would leave its edge for the boot and silence every later real inversion of the pair.
+// =================================================================================
+
+/// `tests gen7`'s order leg: `:: GEN7ORDER: pair=pages->blit-ring fwd= rev= inversions=<before>-><after> -> <v> gen7_order=<w> ::`.
+fn order_leg() {
+    #[cfg(feature = "gen7blit")]
+    {
+        let before = blit::PAGES.order_seen(&BLIT_RING_HELD);
+        // One core, one task for both takes: the walk reads only this core's partition. The slot guard drops first.
+        let taken = crate::arch::without_interrupts(|| {
+            let Some(_engine) = blit::PAGES.try_lock() else { return false }; // bcs_job's own take (a live job: busy)
+            let _slot = BLIT_RING_HELD.lock(); // held_take's take; nothing is done under it
+            true
+        });
+        let after = blit::PAGES.order_seen(&BLIT_RING_HELD);
+        let (fwd, rev, i1) = after.unwrap_or((false, false, 0));
+        let i0 = before.map(|b| b.2).unwrap_or(i1);
+        let w = if before.is_none() || after.is_none() {
+            "skip(unarmed)"
+        } else if !taken {
+            "skip(busy)"
+        } else if !fwd {
+            "no-edge"
+        } else if rev {
+            "inverted"
+        } else if i1 != i0 {
+            "rose"
+        } else {
+            "ok"
+        };
+        let v = if w == "ok" { "PASS" } else if w.starts_with("skip") { "SKIP" } else { "FAIL" };
+        serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd={} rev={} inversions={}->{} -> {} gen7_order={} ::", fwd as u8, rev as u8, i0, i1, v, w);
+    }
+    #[cfg(not(feature = "gen7blit"))]
+    {
+        serial_println!(":: GEN7ORDER: pair=pages->blit-ring fwd=0 rev=0 inversions=0->0 -> SKIP gen7_order=skip(no-gen7blit) ::");
+    }
 }

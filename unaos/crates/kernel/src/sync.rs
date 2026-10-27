@@ -1722,6 +1722,40 @@ mod reg {
         }
         w
     }
+
+    // ── GEN7LOCKHELD (rmbp-ledger B1044, BP-gpu-9 / BP-cores-20): the order table READ, never written — a driver's
+    // order KAT asks whether the walk has recorded a->b and b->a, and the inversions so far. Nothing is planted: an
+    // inverted KAT take would leave b->a in `EDGE` for the boot (no removal path) and `edge()` would then return early on
+    // every later real inversion of the pair, uncounted. ──
+
+    /// `(a->b recorded, b->a recorded, inversions so far)` for order classes `a`, `b`; `None` while unarmed. A class 0
+    /// (never acquired, or the class table full) reads as not recorded. The probe is `edge()`'s reverse probe, read-only:
+    /// its hash, 64 slots, stop at an empty slot (a drift in the hash reads every edge absent: never a false "recorded").
+    #[inline]
+    #[allow(dead_code)]
+    pub fn order_seen(a: u16, b: u16) -> Option<(bool, bool, u32)> {
+        if !ON.load(Acquire) {
+            return None;
+        }
+        let has = |x: u16, y: u16| -> bool {
+            if x == 0 || y == 0 || x == y {
+                return false;
+            }
+            let key = (x as u32) << 16 | y as u32;
+            let h = ((key.wrapping_mul(0x9E37_79B1) >> 16) as usize) % EDGES;
+            for n in 0..64 {
+                let cur = EDGE[(h + n) % EDGES].load(Relaxed);
+                if cur == 0 {
+                    return false;
+                }
+                if cur == key {
+                    return true;
+                }
+            }
+            false
+        };
+        Some((has(a, b), has(b, a), INV_N.load(Acquire)))
+    }
 }
 
 // ── STACKGUARD3 (rmbp-ledger B832): the poison check, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
@@ -1815,5 +1849,23 @@ fn slot_era(slot: u16) -> u16 {
     {
         let _ = slot;
         0
+    }
+}
+
+// ── GEN7LOCKHELD (rmbp-ledger B1044): the registry's order knowledge of ONE pair, ADDITIVE (file tail: GATE-LOCKTYPE pins the lines above). ──
+impl<T: ?Sized> Mutex<T> {
+    /// `(self->then recorded, then->self recorded, inversions so far)` as the order walk has seen them (`reg::order_seen`):
+    /// read-only, plants nothing. `None` while the registry is unarmed, and on aarch64 (no registry).
+    #[inline]
+    pub fn order_seen<U: ?Sized>(&self, then: &Mutex<U>) -> Option<(bool, bool, u32)> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            reg::order_seen(self.class.load(core::sync::atomic::Ordering::Relaxed), then.class.load(core::sync::atomic::Ordering::Relaxed))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = then;
+            None
+        }
     }
 }
