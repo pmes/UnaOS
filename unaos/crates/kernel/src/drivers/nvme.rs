@@ -17,15 +17,17 @@
 //! phase bit against a TSC deadline ([`T_CMD_MS`]) — the phase bit is the ONLY authority. The I/O CQ is created with
 //! `IEN=1, IV=0` and [`arm_irq`] points MSI-X table entry 0 (else single-message MSI) at a `vectors::alloc`'d vector
 //! whose handler only sets a hint and counts (`irqs=` on the test line); the admin queue shares vector 0 and is idle
-//! after probe, so it stays polled with no INTMS/INTMC write. A miss prints `[nvme] cmd timeout opcode=0x<op> ...` and MARKS the controller
+//! after probe, so it stays polled with no INTMS/INTMC write. NVMEIRQWAIT (zenbook-ledger Z49): an I/O command whose
+//! caller came in UNMASKED, on the CPU the vector targets, sleeps between polls ([`cq_wait`]: `sti; hlt`, woken by the
+//! vector or the tick); every other wait is the spin. A miss prints `[nvme] cmd timeout opcode=0x<op> ...` and MARKS the controller
 //! (DONGLEBOOT's rule, rmbp-ledger B658): every later command is refused at once.
 //!
 //! **Rung 2 — NVMEBOOT (zenbook-ledger Z9):** the namespace is `BlockHandle::Nvme` / `fs::fat::BlockSource::Nvme`,
 //! so the root walk sees it; the boot's NVMe root grant (one UnaFS extent, `block::hold_nvme_root_grant`)
 //! admits writes through `block::write_blocks_nvme`; [`flush`] (NVM Flush) is the commit barrier.
 //!
-//! **Does NOT (owed rows, docs/dev/blueprint/storage.md §5):** a vector per queue (NVME-MSIX-PERQ) or a wait that sleeps
-//! on the vector (NVME-IRQWAIT); namespaces other than 1; TRIM; the
+//! **Does NOT (owed rows, docs/dev/blueprint/storage.md §5):** a vector per queue (NVME-MSIX-PERQ, which also lets the
+//! sleeping wait follow the caller's CPU); namespaces other than 1; TRIM; the
 //! SMART/Health log page; an installer path onto the NVMe (NVMEINSTALL). NVME4KN (zenbook-ledger Z31): a 4096-byte-LBA
 //! namespace is served through the block layer's 512 B sector view (`block::read_sectors_nvme`, block.rs tail).
 //!
@@ -42,14 +44,18 @@
 //! held ONLY through [`with_ctrl`]: interrupts masked (no preemption inside the hold) and acquired with a
 //! bounded `try_lock` — DONGLEBOOT's discipline, minimal half (no render path reaches this driver in
 //! rung 1; lifting `ahci::dongle::with_port` into one shared hold is owed row DISKHOLD). One command is
-//! outstanding at a time, so one lock is a correctness requirement.
+//! outstanding at a time, so one lock is a correctness requirement. The mask is the holder's NON-PREEMPTION (masked
+//! callers, e.g. the UnaFS MOUNT hold, spin on `CTRL`: WEDGE-8 F3, block.rs). NVMEIRQWAIT (Z49): a holder that sleeps in
+//! [`cq_wait`] is preemptible for that window, so a masked caller on the sleeper's CPU is refused at once and an
+//! unmasked one yields first ([`with_ctrl`]).
 //!
 //! # Wire
 //!
 //! ```text
 //! [nvme] bdf <b>:<s>.<f> <vid>:<did> bar0=0x<..> cap=0x<..> ver=<x.y.z> mqes=<n> dstrd=<n> to_ms=<n>   (bootlog)
 //! [nvme] ctrl  (the ready line: mn="<model>" ns=1 lba=<bytes> blocks=<n> -> ready irq=<msix|msi|none> vector=<0x<v>|->; spelled once, at `probe`)
-//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> rbatch=<n> runs=<n> run_blocks=<n> rblocks=<n> rcmds=<n> lba=<bytes> shift=<9..12> rmw=<n> irqs=<n>
+//! [nvme] test identify=ok sector0=<GPT|MBR|none> scratch_lba=<n> blocks=8 rw=<ok|skip|bad:<leg>> batch=<n> rbatch=<n> runs=<n> run_blocks=<n> rblocks=<n> rcmds=<n> lba=<bytes> shift=<9..12> rmw=<n> irqs=<n> waits=<n> wakes=<n> rw_us=<n>
+//! [nvme] irq wait off why=no-wakes waits=<n> — completions back on the spin   (once, NVMEIRQWAIT: a vector that never wakes)
 //! :: NVME: ctrl=ok ns=1 rw=ok -> PASS ::
 //! ```
 //!
@@ -182,6 +188,8 @@ struct Ctrl {
     lba_shift: u32,
     nsze: u64,
     mn: [u8; 40],
+    /// NVMEIRQWAIT (Z49): the current hold's caller came in UNMASKED (set by [`with_ctrl`]), so an I/O wait may sleep.
+    sleep_ok: bool,
 }
 
 /// THE controller. Held only through [`with_ctrl`].
@@ -206,6 +214,7 @@ fn submit(c: &mut Ctrl, admin: bool, cmd: &mut [u32; 16]) -> Result<u32, ()> {
     cmd[0] = (cmd[0] & 0xFF) | ((cid as u32) << 16);
     let bar0 = c.bar0;
     let dstrd = c.dstrd;
+    let may_sleep = !admin && c.sleep_ok; // NVMEIRQWAIT (Z49): the admin queue stays polled
     let q = if admin { &mut c.admin } else { &mut c.io };
 
     let slot = q.sq + (q.tail as u64) * SQE_BYTES;
@@ -236,7 +245,7 @@ fn submit(c: &mut Ctrl, admin: bool, cmd: &mut [u32; 16]) -> Result<u32, ()> {
             );
             return Err(());
         }
-        core::hint::spin_loop();
+        cq_wait(may_sleep); // NVMEIRQWAIT (Z49): sleep on the vector when the caller is unmasked on its CPU, else the spin
     }
     fence(Ordering::SeqCst);
     let dw0 = unsafe { core::ptr::read_volatile(ent as *const u32) };
@@ -262,9 +271,16 @@ fn submit(c: &mut Ctrl, admin: bool, cmd: &mut [u32; 16]) -> Result<u32, ()> {
 
 /// The ONE way [`CTRL`] is held: interrupts masked, a bounded try, never an unbounded spin.
 fn with_ctrl<R>(lba: u64, f: impl FnOnce(&mut Ctrl) -> Result<R, ()>) -> Result<R, ()> {
+    // NVMEIRQWAIT (Z49): the caller's own mask, read before the hold masks. WEDGE-8 F3 on `CTRL`: an unmasked caller
+    // yields while a sleeping holder sits on its CPU; a masked one there is refused at once (the holder cannot run).
+    let open = !crate::arch::irqs_masked();
+    if open {
+        irqwait_yield();
+    }
+    let at_once = !open && sleeper_here();
     crate::drivers::block::hold::with(
         T_HOLD_MS,
-        false,
+        at_once,
         || CTRL.try_lock(),
         |spun| {
             let n = BUSY_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -274,7 +290,10 @@ fn with_ctrl<R>(lba: u64, f: impl FnOnce(&mut Ctrl) -> Result<R, ()>) -> Result<
             Err(())
         },
         |mut guard| match &mut *guard {
-            Some(c) => f(c),
+            Some(c) => {
+                c.sleep_ok = open;
+                f(c)
+            }
             None => Err(()),
         },
     )
@@ -500,6 +519,7 @@ fn bring_up(bus: u8, slot: u8, func: u8, vend: u16, devid: u16, bar0: u64) -> Op
         lba_shift: 9,
         nsze: 0,
         mn: [b' '; 40],
+        sleep_ok: false,
     };
 
     // IDENTIFY controller (CNS 1).
@@ -581,6 +601,9 @@ pub fn probe() {
     };
     let (mn, lba, blocks) = (c.mn, 1u32 << c.lba_shift, c.nsze); XFER_SECTORS.store((c.max_xfer / 512) as u32, Ordering::Relaxed); // NVMEBATCHREAD (Z24): the read-ahead window `fs::unafs::ra_window` gives the NVMe, set before `c` moves; NVME4KN (Z31): in 512 B view sectors on EVERY namespace (the one unit)
     let (irq, vector) = arm_irq(bus, slot, func, bar0); // NVMEMSIX (Z45): one completion vector, after every admin command
+    if irq != "none" {
+        IRQ_APIC.store(crate::arch::apic::apic_id() as u32, Ordering::Release); // NVMEIRQWAIT (Z49): the CPU `arm_irq`'s message names
+    }
     crate::arch::without_interrupts(|| *CTRL.lock() = Some(c));
     if crate::drivers::block::register_nvme(blocks, lba, &mn) {
         if irq == "none" {
@@ -625,12 +648,15 @@ pub fn selftest() {
     } else if dev.num_blocks < SCRATCH_FROM_END * 2 {
         "bad:small"
     } else {
-        scratch_rw(scratch, bs)
+        let t0 = crate::arch::now_cycles();
+        let r = scratch_rw(scratch, bs);
+        RW_US.store(crate::arch::now_cycles().wrapping_sub(t0).saturating_mul(1000) / cycles_ms(1).max(1), Ordering::Relaxed); // NVMEIRQWAIT (Z49): the rw leg's wall time
+        r
     };
     let (runs, run_blocks) = crate::drivers::block::nvme_run_census(); // NVMEBATCH (Z22)
     serial_println!(
-        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} rbatch={} runs={} run_blocks={} rblocks={} rcmds={} lba={} shift={} rmw={} irqs={}",
-        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), LAST_RBATCH.load(Ordering::Relaxed), runs, run_blocks, IO_READ_BLOCKS.load(Ordering::Relaxed), IO_READ_CMDS.load(Ordering::Relaxed), dev.block_size, dev.block_size.trailing_zeros(), crate::drivers::block::nvme_rmw_count(), IRQS.load(Ordering::Relaxed) // NVMEMSIX (Z45): `irqs=` the completion interrupts fired this boot; NVME4KN (Z31): the namespace's LBA size, its shift, and the sub-LBA writes served by read-modify-write this boot
+        "[nvme] test identify={} sector0={} scratch_lba={} blocks={} rw={} batch={} rbatch={} runs={} run_blocks={} rblocks={} rcmds={} lba={} shift={} rmw={} irqs={} waits={} wakes={} rw_us={}",
+        if identify { "ok" } else { "bad" }, sector0, scratch, SCRATCH_BLOCKS, rw, LAST_BATCH.load(Ordering::Relaxed), LAST_RBATCH.load(Ordering::Relaxed), runs, run_blocks, IO_READ_BLOCKS.load(Ordering::Relaxed), IO_READ_CMDS.load(Ordering::Relaxed), dev.block_size, dev.block_size.trailing_zeros(), crate::drivers::block::nvme_rmw_count(), IRQS.load(Ordering::Relaxed), IRQ_WAITS.load(Ordering::Relaxed), IRQ_WAKES.load(Ordering::Relaxed), RW_US.load(Ordering::Relaxed) // NVMEIRQWAIT (Z49): sleeping waits, vector-woken sleeps, the rw leg's microseconds; NVMEMSIX (Z45): `irqs=` the completion interrupts fired this boot; NVME4KN (Z31): the namespace's LBA size, its shift, and the sub-LBA writes served by read-modify-write this boot
     );
     let ctrl = if identify { "ok" } else { "bad" };
     let root = root_leg();
@@ -832,4 +858,62 @@ fn arm_irq(bus: u8, slot: u8, func: u8, bar0: u64) -> (&'static str, u8) {
     }
     serial_println!("[nvme] irq polled why={},no-msi — completions stay on the phase-bit poll", msix_why);
     ("none", 0)
+}
+
+// ══════════ NVMEIRQWAIT (zenbook-ledger Z49) — the I/O wait sleeps on the vector ══════════
+
+/// NVMEIRQWAIT: the APIC id `arm_irq`'s message targets (set at [`probe`] for msix|msi); `u32::MAX` = no vector.
+static IRQ_APIC: AtomicU32 = AtomicU32::new(u32::MAX);
+/// NVMEIRQWAIT: the CPU index of a `CTRL` holder asleep in [`cq_wait`] (`u32::MAX` = none). One writer: the holder.
+static SLEEP_CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+/// NVMEIRQWAIT: sleeping waits this boot (`waits=`), and those the vector ended (`wakes=`; the rest the tick ended).
+static IRQ_WAITS: AtomicU32 = AtomicU32::new(0);
+static IRQ_WAKES: AtomicU32 = AtomicU32::new(0);
+/// NVMEIRQWAIT: the off-latch — [`WAIT_OFF_AFTER`] sleeps with no wake: the vector never wakes, back on the spin.
+static WAIT_OFF: AtomicBool = AtomicBool::new(false);
+const WAIT_OFF_AFTER: u32 = 16;
+/// NVMEIRQWAIT: the scratch leg's wall time in microseconds (`rw_us=`; 0 = the leg did not run).
+static RW_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn this_cpu() -> u32 {
+    crate::arch::percpu::this_cpu().cpu_index as u32
+}
+
+/// NVMEIRQWAIT: a `CTRL` holder is asleep (so preemptible) and was on THIS CPU — a masked caller here cannot let it run.
+#[inline]
+fn sleeper_here() -> bool {
+    SLEEP_CPU.load(Ordering::Acquire) == this_cpu()
+}
+
+/// NVMEIRQWAIT: an UNMASKED caller yields while a sleeping holder sits on its CPU (the holder, if preempted here, runs
+/// instead of this caller spinning masked against it), bounded by `T_HOLD_MS`.
+fn irqwait_yield() {
+    let start = crate::arch::now_cycles();
+    let bound = cycles_ms(T_HOLD_MS);
+    while sleeper_here() && crate::arch::now_cycles().wrapping_sub(start) < bound {
+        crate::arch::sched::yield_now();
+    }
+}
+
+/// NVMEIRQWAIT: THE wait between two polls of [`submit`]'s loop (the loop keeps the phase bit, the deadline and the
+/// timeout line). It sleeps only when `may_sleep` (an I/O command, an unmasked caller), the vector targets THIS CPU and
+/// the off-latch is clear: `sti; hlt` as one pair (a message latched in the IRR during the masked submit fires right
+/// after `sti` and ends the `hlt`), then masked again; a wake with `CQ_PENDING` set is the vector's. Every other wait is
+/// the old spin. Runs inside `with_ctrl`'s hold (IF=0 on entry and on return).
+fn cq_wait(may_sleep: bool) {
+    if !may_sleep || WAIT_OFF.load(Ordering::Relaxed) || IRQ_APIC.load(Ordering::Acquire) != crate::arch::apic::apic_id() as u32 {
+        core::hint::spin_loop();
+        return;
+    }
+    SLEEP_CPU.store(this_cpu(), Ordering::Release);
+    let waits = IRQ_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+    x86_64::instructions::interrupts::enable_and_hlt();
+    x86_64::instructions::interrupts::disable();
+    SLEEP_CPU.store(u32::MAX, Ordering::Release);
+    if CQ_PENDING.load(Ordering::Acquire) {
+        IRQ_WAKES.fetch_add(1, Ordering::Relaxed);
+    } else if waits >= WAIT_OFF_AFTER && IRQ_WAKES.load(Ordering::Relaxed) == 0 && !WAIT_OFF.swap(true, Ordering::AcqRel) {
+        serial_println!("[nvme] irq wait off why=no-wakes waits={} — completions back on the spin", waits);
+    }
 }
