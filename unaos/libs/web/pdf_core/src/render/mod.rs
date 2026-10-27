@@ -7,15 +7,18 @@
 //! A graphics-state machine over [`crate::content::ops`]: the CTM and the q/Q stack, line width / cap / join / miter /
 //! dash, fill and stroke colour ([`colour`], tints through [`function`]), clipping (W n / W* n intersect a device mask),
 //! paths (m l c v y h re) and the painting operators (f F f* B B* b b* S s n), constant alpha and the ExtGState
-//! ([`state`]), form XObjects (recursive to [`MAX_FORM_DEPTH`], their /Matrix and /BBox clip), image XObjects and
-//! inline images ([`image`]), shadings and shading patterns ([`shading`]). Every fill and stroke is svg_core's: its
-//! path filler (`raster::fill_polys`, nonzero / even-odd), its stroker (`stroke::stroke_polys`), its shaders
-//! (`paint::Shader`), its clip `Mask` and its one paint loop (`raster::paint_coverage`). This module draws NOTHING
-//! for text: each string goes to the [`TextSink`], which returns the advance, an outline to paint under the text
-//! rendering mode, and Type 3 glyph procedures to run; the recorder [`TextLog`] returns none.
+//! ([`state`]), transparency groups and soft masks ([`group`]) and blend modes ([`blend`], PDFTRANSPARENCY SR327), form
+//! XObjects (recursive to [`MAX_FORM_DEPTH`], their /Matrix and /BBox clip), image XObjects and inline images
+//! ([`image`]), shadings and shading patterns ([`shading`]). Every fill and stroke is svg_core's: its path filler
+//! (`raster::fill_polys`, nonzero / even-odd), its stroker (`stroke::stroke_polys`), its shaders (`paint::Shader`),
+//! its blend formula (`fe::blend`), its clip `Mask` and its one paint loop (`raster::paint_coverage`). This module
+//! draws NOTHING for text: each string goes to the [`TextSink`], which returns the advance, an outline to paint under
+//! the text rendering mode, and Type 3 glyph procedures to run; the recorder [`TextLog`] returns none.
 
+pub mod blend;
 pub mod colour;
 pub mod function;
+pub mod group;
 pub mod image;
 pub mod shading;
 pub mod state;
@@ -23,6 +26,7 @@ pub mod state;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
+use svg_core::fe::{BlendMode, IRect};
 use svg_core::geom::{Path, Transform};
 use svg_core::paint::{Shader, premul};
 use svg_core::raster::{Coverage, FLATTEN_TOL, FillRule, Mask, div255, fill_polys, paint_coverage};
@@ -250,7 +254,9 @@ impl Interp<'_, '_> {
             }
             b"gs" => {
                 if let Some(Object::Dict(d)) = name.and_then(|nm| self.resource(b"ExtGState", &nm)) {
-                    self.gs.apply_ext(&d, self.doc, &mut self.refused);
+                    if let Some(sm) = self.gs.apply_ext(&d, self.doc, &mut self.refused) {
+                        self.soft_mask(&sm);
+                    }
                 }
             }
             // --- path construction (§8.5.2)
@@ -443,9 +449,9 @@ impl Interp<'_, '_> {
         Some(Shader::Solid(premul([c[0], c[1], c[2], 1.0])))
     }
 
-    /// Composite a coverage region through the clip.
+    /// Composite a coverage region through the clip and the soft mask, under the blend mode (Normal: source-over).
     fn paint(&mut self, mut c: Coverage, sh: &Shader, opacity: f32) {
-        if let Some(m) = &self.gs.clip {
+        for m in [&self.gs.clip, &self.gs.soft_mask].into_iter().flatten() {
             for yy in 0..c.h {
                 for xx in 0..c.w {
                     let i = yy * c.w + xx;
@@ -453,6 +459,13 @@ impl Interp<'_, '_> {
                     c.data[i] = div255(c.data[i] as u32 * k) as u8;
                 }
             }
+        }
+        if self.gs.blend != BlendMode::Normal {
+            let mut layer = Pixmap::new(self.canvas.w, self.canvas.h);
+            paint_coverage(&mut layer, &c, sh, opacity);
+            let r = IRect { x0: c.x, y0: c.y, x1: c.x + c.w, y1: c.y + c.h };
+            blend::composite(&mut self.canvas, &layer, r, self.gs.blend);
+            return;
         }
         paint_coverage(&mut self.canvas, &c, sh, opacity);
     }
@@ -553,9 +566,21 @@ impl Interp<'_, '_> {
         }
     }
 
-    /// A form XObject (§8.10): its /Matrix, its /BBox clip, its own resources.
+    /// A form XObject (§8.10): its /Matrix, its /BBox clip, its own resources; a transparency group ([`group`]) draws
+    /// into its own canvas.
     fn form(&mut self, s: &Stream) {
-        let Ok(dec) = self.doc.decode(s) else { return };
+        if let Object::Dict(g) = self.doc.get(s.dict.get(b"Group").unwrap_or(&Object::Null)) {
+            if matches!(self.doc.get(g.get(b"S").unwrap_or(&Object::Null)).as_name(), Some(b"Transparency")) {
+                return self.group(s, &g);
+            }
+        }
+        let Some((m, bbox, data, res)) = self.form_parts(s) else { return };
+        self.nested(m, bbox, &data, res);
+    }
+
+    /// A form's /Matrix, /BBox, decoded content and resources (the caller's when it has none).
+    fn form_parts(&self, s: &Stream) -> Option<(Transform, Option<[f64; 4]>, Vec<u8>, Dict)> {
+        let dec = self.doc.decode(s).ok()?;
         let d = &s.dict;
         let m = matrix(self.doc, d.get(b"Matrix")).unwrap_or(Transform::IDENTITY);
         let bbox: Option<[f64; 4]> = self.doc.get(d.get(b"BBox").unwrap_or(&Object::Null)).as_array().and_then(|a| {
@@ -566,7 +591,7 @@ impl Interp<'_, '_> {
             Some(Object::Dict(r)) => r,
             _ => self.res.clone(),
         };
-        self.nested(m, bbox, &dec.data, res);
+        Some((m, bbox, dec.data, res))
     }
 
     /// Run a content stream (a form or a Type 3 glyph) under `m` x CTM, isolated: the graphics state, the path, the
