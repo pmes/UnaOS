@@ -3,20 +3,27 @@
 //
 //! PDF-WRITE (SR325): new PDF 1.4 files — [`PageBuilder`] (path operators, images), [`Builder::finish`], and
 //! [`from_rgba`], one image per page. Written through the one file writer (`serialize::write_file`); compressed through
-//! pixel_core's one compressor.
+//! pixel_core's one compressor. PDF-WRITE-FONTS (SR338): [`PageBuilder::text`] shows text in a face loaded by
+//! [`Builder::font`], embedded as a TrueType subset (`fonts.rs`).
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use core::cell::RefCell;
+
 use svg_core::geom::{Path, Seg};
+
+use super::fonts::{self, FontHandle};
 
 use super::serialize::{text_bytes, write_file, write_num};
 use crate::Error;
 use crate::object::{Dict, Object, Ref, Stream};
 
 /// FlateDecode bytes through pixel_core (`None`: the compressor declined; the stream is then written unfiltered).
-fn flate(data: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn flate(data: &[u8]) -> Option<Vec<u8>> {
     pixel_core::deflate::compress(data).ok()
 }
 
@@ -83,18 +90,20 @@ impl Image {
 }
 
 /// One page: its /MediaBox (points) and a content stream built from §8 operators. Text is drawn as paths (the caller's
-/// glyph outlines through [`PageBuilder::path`]); embedded fonts are owed (PDF-WRITE-FONTS).
+/// glyph outlines through [`PageBuilder::path`]) or shown in an embedded face ([`PageBuilder::text`], SR338).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PageBuilder {
     pub media_box: [f64; 4],
     content: Vec<u8>,
     images: Vec<Image>,
+    /// The ids of the [`FontHandle`]s this page shows text in (its /Font resources).
+    fonts: BTreeSet<u32>,
 }
 
 impl PageBuilder {
     /// A `width` x `height` point page (origin bottom left).
     pub fn new(width: f64, height: f64) -> Self {
-        PageBuilder { media_box: [0.0, 0.0, width, height], content: Vec::new(), images: Vec::new() }
+        PageBuilder { media_box: [0.0, 0.0, width, height], content: Vec::new(), images: Vec::new(), fonts: BTreeSet::new() }
     }
 
     /// The content stream so far.
@@ -217,6 +226,29 @@ impl PageBuilder {
         self.content.extend_from_slice(format!("/Im{k} Do\n").as_bytes());
         Ok(self.restore())
     }
+
+    /// PDF-WRITE-FONTS (SR338): `BT /F{id} size Tf x y Td <cids> Tj ET` — `s` in `font` at `size` points with its
+    /// baseline origin at (x, y), one glyph per character through font_core's cmap (2-byte CIDs, Identity-H), painted
+    /// with the current fill colour.
+    pub fn text(&mut self, font: &FontHandle, size: f64, x: f64, y: f64, s: &str) -> &mut Self {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let (id, cids) = {
+            let mut st = font.0.borrow_mut();
+            let cids = st.encode(s);
+            (st.id, cids)
+        };
+        self.fonts.insert(id);
+        self.content.extend_from_slice(format!("BT\n/F{id} ").as_bytes());
+        self.op(&[size], "Tf");
+        self.op(&[x, y], "Td");
+        self.content.push(b'<');
+        for b in cids {
+            self.content.push(HEX[(b >> 4) as usize]);
+            self.content.push(HEX[(b & 15) as usize]);
+        }
+        self.content.extend_from_slice(b"> Tj\nET\n");
+        self
+    }
 }
 
 /// A new document: pages in order and an optional title.
@@ -224,6 +256,8 @@ impl PageBuilder {
 pub struct Builder {
     pages: Vec<PageBuilder>,
     title: Option<String>,
+    /// PDF-WRITE-FONTS (SR338): the faces loaded by [`Builder::font`], `/F{index}`.
+    fonts: Vec<FontHandle>,
 }
 
 impl Builder {
@@ -242,12 +276,22 @@ impl Builder {
         self
     }
 
+    /// PDF-WRITE-FONTS (SR338): load a TrueType face for [`PageBuilder::text`]; embedded once per document, as the
+    /// subset of the glyphs the pages show, when `finish` runs. CFF / OpenType-CFF faces are refused by name.
+    pub fn font(&mut self, data: &[u8]) -> Result<FontHandle, Error> {
+        let st = fonts::load(self.fonts.len() as u32, data)?;
+        let h = FontHandle(Rc::new(RefCell::new(st)));
+        self.fonts.push(h.clone());
+        Ok(h)
+    }
+
     /// The PDF 1.4 file: 1 the catalog, 2 the page tree, then each page, its content stream (FlateDecode) and its
-    /// image XObjects; /Info last when titled.
+    /// image XObjects; then each used font's five objects (SR338); /Info last when titled.
     pub fn finish(self) -> Vec<u8> {
         let r = |num: u32| Ref { num, generation: 0 };
         let mut objs: Vec<(Ref, Object)> = Vec::new();
         let mut kids = Vec::new();
+        let font_refs = font_numbers(&self.pages, &self.fonts);
         let mut next = 3u32;
         for p in self.pages {
             let (page_num, content_num) = (next, next + 1);
@@ -261,6 +305,9 @@ impl Builder {
             let mut res = Dict::new();
             if !xobjects.is_empty() {
                 res.insert(b"XObject".to_vec(), Object::Dict(xobjects));
+            }
+            if !p.fonts.is_empty() {
+                res.insert(b"Font".to_vec(), Object::Dict(font_resources(&p.fonts, &font_refs)));
             }
             let mut page = Dict::new();
             page.insert(b"Type".to_vec(), name(b"Page"));
@@ -279,6 +326,11 @@ impl Builder {
             };
             objs.push((r(content_num), Object::Stream(Stream { dict: cd, data })));
             kids.push(Object::Ref(r(page_num)));
+        }
+        // SR338: `next` is now `font_numbers`' base; with no text nothing is added and the numbering is SR325's.
+        for (id, num) in &font_refs {
+            objs.extend(fonts::objects(&self.fonts[*id as usize].0.borrow(), *num));
+            next = next.max(num + 5);
         }
         let mut pages = Dict::new();
         pages.insert(b"Type".to_vec(), name(b"Pages"));
@@ -336,4 +388,23 @@ pub fn from_rgba(pages: &[RgbaPage<'_>], dpi: f64) -> Result<Vec<u8>, Error> {
         b.page(pb);
     }
     Ok(b.finish())
+}
+
+/// PDF-WRITE-FONTS (SR338): each font a page uses -> its Type0 object number, five numbers per font after every page's
+/// objects (`3 + sum(2 + images)`), so the page, content and image numbers stay those of a document without text.
+fn font_numbers(pages: &[PageBuilder], loaded: &[FontHandle]) -> BTreeMap<u32, u32> {
+    let base = 3 + pages.iter().map(|p| 2 + p.images.len() as u32).sum::<u32>();
+    let used: BTreeSet<u32> = pages.iter().flat_map(|p| p.fonts.iter().copied()).filter(|&id| (id as usize) < loaded.len()).collect();
+    used.into_iter().enumerate().map(|(j, id)| (id, base + 5 * j as u32)).collect()
+}
+
+/// A page's /Font dictionary: `/F{id}` -> its Type0 font.
+fn font_resources(ids: &BTreeSet<u32>, refs: &BTreeMap<u32, u32>) -> Dict {
+    let mut d = Dict::new();
+    for id in ids {
+        if let Some(&num) = refs.get(id) {
+            d.insert(format!("F{id}").into_bytes(), Object::Ref(Ref { num, generation: 0 }));
+        }
+    }
+    d
 }
