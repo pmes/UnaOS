@@ -916,3 +916,12 @@ refs/heads/exec-rmbp-aethermacgpupresentrects   e9df84207 IN-FLIGHT cut 2026-10-
 refs/heads/exec-rmbp-playcheckhi   a80198ec9 FOLDED-BY-HAND (this commit) 2026-10-27
 refs/heads/exec-rmbp-swapbackseek   e9df84207 IN-FLIGHT cut 2026-10-27
 refs/heads/exec-rmbp-stationroambgscan   7b77f79c3 FOLDED-BY-HAND (this commit) 2026-10-27
+refs/heads/exec-rmbp-pdf4formsave   781558de2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-aethertestroot   781558de2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-vp8colourone   781558de2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-hevcrextscc   781558de2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-pdficc   781558de2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-swapbackvplay   781558de2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle6mixface   781558de2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-stationroamsweep   781558de2 IN-FLIGHT cut 2026-10-27
+refs/heads/exec-rmbp-nle6export   781558de2 IN-FLIGHT cut 2026-10-27
