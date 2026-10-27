@@ -322,7 +322,7 @@ kat!(
 );
 kat!(
     kat_browser_resize,
-    SMessage::BrowserResize(800, 600),
+    SMessage::BrowserResize(800, 600, 0),
     r#"{"BrowserResize":[800,600]}"#
 );
 kat!(
@@ -565,7 +565,7 @@ fn surfaceid_old_forms_are_surface_zero() {
     let mut m = SMessage::BrowserMouseMove(1.0, 2.0, 0);
     *m.surface_mut().unwrap() = 7;
     assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"BrowserMouseMove":[1.0,2.0,7]}"#);
-    for other in [SMessage::BrowserResize(1, 1), SMessage::BrowserKey("a".into()), SMessage::BrowserText("a".into()), SMessage::Ping] {
+    for other in [SMessage::BrowserKey("a".into()), SMessage::BrowserText("a".into()), SMessage::Ping] {
         assert_eq!(other.surface(), None);
     }
     assert!(SMessage::Ping.surface_mut().is_none());
@@ -1451,7 +1451,7 @@ fn smessage_variant_name(m: &SMessage) -> &'static str {
         SMessage::BrowserNavReload => "BrowserNavReload",
         SMessage::BrowserScroll(..) => "BrowserScroll",
         SMessage::BrowserClick(..) => "BrowserClick",
-        SMessage::BrowserResize(_, _) => "BrowserResize",
+        SMessage::BrowserResize(..) => "BrowserResize",
         SMessage::BrowserKey(_) => "BrowserKey",
         SMessage::BrowserText(_) => "BrowserText",
         SMessage::BrowserPaste(_) => "BrowserPaste",
@@ -1691,4 +1691,24 @@ fn context_telemetry_ignores_injected_content_field() {
         skeletons[0].content.is_empty(),
         "injected content must NOT populate the in-process Arc"
     );
+}
+
+// NLE2-SURFACERESIZE (LEDGER SR339): `BrowserResize` carries the resized Surface's number, omitted when 0.
+kat!(
+    kat_browser_resize_surface,
+    SMessage::BrowserResize(800, 600, 1),
+    r#"{"BrowserResize":[800,600,1]}"#
+);
+
+/// NLE2-SURFACERESIZE (SR339): the pre-SR339 resize reads back as Surface 0, writes back byte-identical, and is stamped
+/// through the one `surface_mut`.
+#[test]
+fn surfaceresize_old_form_is_surface_zero() {
+    let old = r#"{"BrowserResize":[800,600]}"#;
+    let mut m: SMessage = serde_json::from_str(old).expect(old);
+    assert!(matches!(m, SMessage::BrowserResize(800, 600, 0)), "{m:?}");
+    assert_eq!(m.surface(), Some(0));
+    assert_eq!(serde_json::to_string(&m).unwrap(), old);
+    *m.surface_mut().unwrap() = 2;
+    assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"BrowserResize":[800,600,2]}"#);
 }

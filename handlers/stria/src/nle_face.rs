@@ -380,13 +380,15 @@ pub struct Face {
     meters: MixMeters,
     /// SURFACEID (SR332): the Surface number this face's pointer comes from (`None`: every surface, one-surface trees).
     surface: Option<u32>,
+    /// NLE2-SPLIT (SR339): the preview on its own Surface ([`Face::on_surfaces`]); `canvas` is then the tracks Surface's.
+    split: Option<Split>,
 }
 
 impl Face {
     /// `labels`: name the clips through the host font stack (off for a golden).
     pub fn new(state: EditorState, sources: Sources, canvas: (u32, u32), order: PixelOrder, labels: bool) -> Face {
         let labels = labels.then(|| TextStyle::new(&["sans"], 11.0));
-        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None }
+        Face { state, sources, canvas, order, playing: false, labels, still: None, last_error: None, rate: 1, drag: None, pointer: None, buttons: false, wheel: 0.0, view: None, trans_still: None, meters: MixMeters::default(), surface: None, split: None }
     }
     /// The preview frame of the last [`Face::frame`].
     pub fn still(&self) -> Option<&Still> {
@@ -394,11 +396,11 @@ impl Face {
     }
     /// One message from the surface or the buttons; true when the canvas must be repainted.
     pub fn on(&mut self, msg: &SMessage) -> bool {
-        if !self.takes(msg) { return false; } // SURFACEID (SR332): another Surface's pointer is not this face's
+        if !self.takes(msg) { return false; } if let Some(r) = self.on_preview_resize(msg) { return r; } // NLE2-SPLIT (SR339): the preview Surface's resize; SURFACEID (SR332): another Surface's pointer is not this face's
         match msg {
             SMessage::Input { target, text } if target == SURFACE => self.verb(text),
             SMessage::BrowserClick(x, y, _) if !self.buttons => self.click(*x, *y),
-            SMessage::BrowserResize(w, h) if *w > 0 && *h > 0 && (*w, *h) != self.canvas => {
+            SMessage::BrowserResize(w, h, _) if *w > 0 && *h > 0 && (*w, *h) != self.canvas => {
                 self.canvas = (*w, *h);
                 true
             }
@@ -503,18 +505,8 @@ impl Face {
     /// The canvas as painted now (the preview at the playhead rendered first). While a drag is live the drag's
     /// preview state ([`Drag::shown`]) is painted: the edit as it would commit, the timeline itself untouched.
     pub fn paint(&mut self) -> Vec<u8> {
-        let l = self.layout();
-        let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
-        let st = shown.as_ref().unwrap_or(&self.state);
-        self.still = match preview(&st.timeline, &self.sources, st.playhead) {
-            Ok(s) => s,
-            Err(e) => {
-                self.last_error = Some(format!("preview: {e}"));
-                None
-            }
-        };
-        let px = paint_in(st, l, self.order, self.labels.as_ref(), self.still.as_ref());
-        paint_meters(paint_drag(self.paint_transition_still(px, l), l, self.order, self.drag.as_ref()), l, self.order, &self.meter_levels())
+        let r = self.pointer_role();
+        self.paint_role(r)
     }
     /// The canvas as the surface's blit.
     pub fn frame(&mut self) -> SMessage {
@@ -527,7 +519,7 @@ impl Face {
 /// fresh blit after each change; while playing, a clock at the timeline's frame rate steps the playhead.
 pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessage>, mut face: Face) {
     use tokio::sync::broadcast::error::RecvError;
-    bus.fire(face.frame());
+    for m in face.frames() { bus.fire(m); }
     let fps = face.state.timeline.fps().unwrap_or(25).max(1);
     let mut clock = tokio::time::interval(Duration::from_nanos(1_000_000_000 / fps as u64));
     loop {
@@ -535,7 +527,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
             m = rx.recv() => match m {
                 Ok(m) => {
                     if face.on(&m) {
-                        bus.fire(face.frame());
+                        for m in face.frames() { bus.fire(m); }
                     }
                     if let Some(e) = face.last_error.take() {
                         log::warn!("[nle-face] {e}");
@@ -546,7 +538,7 @@ pub async fn serve(bus: Synapse, mut rx: tokio::sync::broadcast::Receiver<SMessa
             },
             _ = clock.tick(), if face.playing => {
                 if face.tick() {
-                    bus.fire(face.frame());
+                    for m in face.frames() { bus.fire(m); }
                 }
             }
         }
@@ -765,7 +757,7 @@ impl Face {
     /// was anchored or inside that view (else the page holding the playhead).
     pub fn layout(&self) -> Layout {
         let (w, h) = self.canvas;
-        let mut l = Layout::of(w, h, &self.state);
+        let mut l = Layout::of_role(self.pointer_role(), w, h, &self.state);
         if let Some((t0, at)) = self.view {
             let per = (w / l.zoom).max(1) as i64;
             let ph = self.state.playhead;
@@ -2061,7 +2053,7 @@ impl Face {
     /// and the pointer messages (bandy's `SMessage::surface`) of its own Surface.
     pub fn takes(&self, msg: &SMessage) -> bool {
         match (self.surface, msg.surface()) {
-            (Some(want), Some(got)) => want == got,
+            (Some(want), Some(got)) => want == got || self.split.is_some_and(|s| s.preview == got && matches!(msg, SMessage::BrowserResize(..))),
             _ => true,
         }
     }
@@ -2116,11 +2108,230 @@ mod surfaceid_tests {
         assert_eq!(routed.state.timeline, plain.state.timeline);
         assert_eq!((routed.state.zoom, routed.state.undo_depth()), (plain.state.zoom, 1));
         assert_eq!(routed.state.timeline, tl0.trim_in(0, 1, 3).unwrap());
-        // Not pointer messages: taken whatever the surface.
-        assert!(routed.takes(&SMessage::BrowserKey("Home".into())) && routed.takes(&SMessage::BrowserResize(320, 160)));
+        // Not pointer messages: taken whatever the surface; a resize (NLE2-SURFACERESIZE SR339) only from its own Surface.
+        assert!(routed.takes(&SMessage::BrowserKey("Home".into())) && routed.takes(&SMessage::BrowserResize(320, 160, 1)));
+        assert!(!routed.takes(&SMessage::BrowserResize(320, 160, 0)));
         assert!(routed.on(&SMessage::Input { target: SURFACE.into(), text: "undo".into() }));
         assert_eq!(routed.state.timeline, tl0);
         // An unrouted face takes every surface's pointer.
         assert!(face().takes(&on(7, SMessage::BrowserMouseMove(1.0, 1.0, 0))));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// NLE2-SPLIT (LEDGER SR339): the preview on its own Surface, the ruler and tracks on another, ONE geometry and ONE painter
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// The split editor's preview Surface (the preview frame and the master meter; the transport row sits under it).
+pub const PREVIEW_SURFACE: &str = "stria.nle.preview";
+/// The split editor's tracks Surface (the ruler, the tracks, the transition widgets and the track meters).
+pub const TRACKS_SURFACE: &str = "stria.nle.tracks";
+
+/// Which part of the editor a Surface shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// All three bands on one Surface (the one-Surface tree).
+    Whole,
+    /// The preview band only.
+    Preview,
+    /// The ruler and the tracks only.
+    Tracks,
+}
+
+impl Layout {
+    /// THE geometry for a Surface of `role`: [`Layout::of`] (zoom, page, rows: one computation), with only the band fields
+    /// set for the role. `Preview` puts the ruler a band below the canvas (`ruler_y = h + RULER_H`: no tick or label reaches
+    /// it, and [`Layout::hit`] finds nothing on it); `Tracks` has no preview band (the ruler at 0, the rows under it).
+    pub fn of_role(role: Role, w: u32, h: u32, st: &EditorState) -> Layout {
+        let mut l = Layout::of(w, h, st);
+        match role {
+            Role::Whole => {}
+            Role::Preview => {
+                l.preview_h = h;
+                l.ruler_y = h + RULER_H;
+                l.tracks_y = h + 2 * RULER_H;
+            }
+            Role::Tracks => {
+                l.preview_h = 0;
+                l.ruler_y = 0;
+                l.tracks_y = RULER_H;
+            }
+        }
+        l
+    }
+}
+
+/// A split face's Surfaces: the preview's number and canvas, the tracks' number (its canvas is [`Face::canvas`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Split {
+    pub preview: u32,
+    pub tracks: u32,
+    pub preview_canvas: (u32, u32),
+}
+
+impl Face {
+    /// Split this face over two Surfaces of its tetra tree: `preview` ([`PREVIEW_SURFACE`]) and `tracks`
+    /// ([`TRACKS_SURFACE`]). The canvas given at [`Face::new`] is cut where [`Layout::of`] puts the ruler: the preview
+    /// takes the band above it, the tracks the rest. The pointer is the tracks Surface's ([`Face::on_surface`]).
+    pub fn on_surfaces(mut self, preview: u32, tracks: u32) -> Face {
+        let (w, h) = self.canvas;
+        let ph = Layout::of(w, h, &self.state).preview_h;
+        self.split = Some(Split { preview, tracks, preview_canvas: (w, ph.max(1)) });
+        self.canvas = (w, h.saturating_sub(ph).max(1));
+        self.surface = Some(tracks);
+        self
+    }
+    /// The split, when the face has one.
+    pub fn split(&self) -> Option<Split> {
+        self.split
+    }
+    /// The role of the Surface the pointer (and [`Face::canvas`]) belongs to.
+    fn pointer_role(&self) -> Role {
+        if self.split.is_some() { Role::Tracks } else { Role::Whole }
+    }
+    /// The geometry of the Surface showing `role`: the preview's on its own canvas, anything else [`Face::layout`].
+    pub fn layout_for(&self, role: Role) -> Layout {
+        if role != Role::Preview {
+            return self.layout();
+        }
+        let (w, h) = self.split.map(|s| s.preview_canvas).unwrap_or(self.canvas);
+        Layout::of_role(Role::Preview, w, h, &self.state)
+    }
+    /// NLE2-SURFACERESIZE (SR339): a resize of the split preview Surface sizes the preview's canvas only (`Some(changed)`);
+    /// `None` for every other message (the tracks Surface's resize is [`Face::on`]'s, on [`Face::canvas`]).
+    fn on_preview_resize(&mut self, msg: &SMessage) -> Option<bool> {
+        let s = self.split?;
+        let SMessage::BrowserResize(w, h, n) = *msg else { return None };
+        if n != s.preview || n == s.tracks {
+            return None;
+        }
+        let changed = w > 0 && h > 0 && (w, h) != s.preview_canvas;
+        if changed {
+            self.split = Some(Split { preview_canvas: (w, h), ..s });
+        }
+        Some(changed)
+    }
+    /// The pixels of the Surface showing `role` (the preview at the playhead rendered first, except for the tracks
+    /// Surface, which shows none). While a drag is live the drag's preview state ([`Drag::shown`]) is painted. `Whole` is
+    /// the one-Surface paint; `Preview` carries no drag guide, marquee or transition thumbnail (their coordinates are the
+    /// tracks Surface's).
+    pub fn paint_role(&mut self, role: Role) -> Vec<u8> {
+        let l = self.layout_for(role);
+        let shown = self.drag.as_ref().and_then(|d| d.shown(&self.state));
+        let st = shown.as_ref().unwrap_or(&self.state);
+        if role != Role::Tracks {
+            self.still = match preview(&st.timeline, &self.sources, st.playhead) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.last_error = Some(format!("preview: {e}"));
+                    None
+                }
+            };
+        }
+        let still = if role == Role::Tracks { None } else { self.still.as_ref() };
+        let px = paint_in(st, l, self.order, self.labels.as_ref(), still);
+        if role == Role::Preview {
+            return paint_meters(px, l, self.order, &self.meter_levels());
+        }
+        paint_meters(paint_drag(self.paint_transition_still(px, l), l, self.order, self.drag.as_ref()), l, self.order, &self.meter_levels())
+    }
+    /// Every Surface's blit: [`Face::frame`] alone on one Surface; split, the preview's then the tracks'.
+    pub fn frames(&mut self) -> Vec<SMessage> {
+        let Some(s) = self.split else { return vec![self.frame()] };
+        let preview = self.paint_role(Role::Preview);
+        let tracks = self.paint_role(Role::Tracks);
+        let (pw, ph) = s.preview_canvas;
+        let (tw, th) = self.canvas;
+        vec![
+            SMessage::SurfaceBlit { url: PREVIEW_SURFACE.into(), width: pw, height: ph, pixels: preview, damage: None },
+            SMessage::SurfaceBlit { url: TRACKS_SURFACE.into(), width: tw, height: th, pixels: tracks, damage: None },
+        ]
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn face() -> Face {
+        let (tl, src) = synth_fixture();
+        Face::new(EditorState::new(tl), src, (320, 160), PixelOrder::Rgba, false)
+    }
+
+    fn blit(m: &SMessage) -> (&str, u32, u32, &[u8]) {
+        let SMessage::SurfaceBlit { url, width, height, pixels, .. } = m else { panic!("not a blit: {m:?}") };
+        (url.as_str(), *width, *height, pixels.as_slice())
+    }
+
+    /// NLE2-SPLIT M3: both Surfaces paint the one state: the preview's pixels are the one-Surface paint's rows above the
+    /// ruler, the tracks' its rows from the ruler down; an unsplit face's frames are its one frame.
+    #[test]
+    fn split_surfaces_paint_the_one_state() {
+        let mut whole = face();
+        whole.state.select(0, 1).unwrap();
+        let all = whole.paint();
+        let cut = whole.layout().ruler_y as usize * 320 * 4;
+        assert_eq!(cut, 64 * 320 * 4);
+        let frames = whole.frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(blit(&frames[0]), (SURFACE, 320, 160, all.as_slice()));
+        let mut split = face().on_surfaces(0, 1);
+        split.state.select(0, 1).unwrap();
+        assert_eq!((split.split().unwrap().preview_canvas, split.canvas), ((320, 64), (320, 96)));
+        let frames = split.frames();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(blit(&frames[0]), (PREVIEW_SURFACE, 320, 64, &all[..cut]));
+        assert_eq!(blit(&frames[1]), (TRACKS_SURFACE, 320, 96, &all[cut..]));
+        assert!(split.still().is_some(), "the preview Surface renders the playhead's frame");
+    }
+
+    /// NLE2-SPLIT M3: the NLE2B handle drag at the same coordinates: on the preview Surface it is not taken (nothing
+    /// changes), on the tracks Surface it is the one trim.
+    #[test]
+    fn split_press_in_tracks_trims_not_in_preview() {
+        let mut f = face().on_surfaces(0, 1);
+        f.state.select(0, 1).unwrap();
+        let tl0 = f.state.timeline.clone();
+        let gesture = |n: u32| {
+            vec![
+                SMessage::BrowserButton { down: true, x: 81.0, y: 36.0, mods: 0, surface: n },
+                SMessage::BrowserMouseMove(105.0, 36.0, n),
+                SMessage::BrowserButton { down: false, x: 105.0, y: 36.0, mods: 0, surface: n },
+                SMessage::BrowserClick(105.0, 36.0, n),
+            ]
+        };
+        for m in gesture(0) {
+            assert!(!f.takes(&m) && !f.on(&m), "{m:?}");
+        }
+        assert_eq!((&f.state.timeline, f.state.undo_depth()), (&tl0, 0));
+        assert!(f.dragging().is_none() && f.pointer().is_none());
+        for m in gesture(1) {
+            assert!(f.takes(&m), "{m:?}");
+            f.on(&m);
+        }
+        assert_eq!(f.state.timeline, tl0.trim_in(0, 1, 3).unwrap());
+        assert_eq!(f.state.undo_depth(), 1);
+    }
+
+    /// NLE2-SURFACERESIZE M3: a resize of one Surface changes only that Surface's canvas and rects; another Surface's
+    /// number is not taken.
+    #[test]
+    fn split_resize_changes_only_its_surface() {
+        let mut f = face().on_surfaces(0, 1);
+        let tracks = f.layout();
+        assert!(f.on(&SMessage::BrowserResize(400, 90, 0)));
+        assert_eq!((f.split().unwrap().preview_canvas, f.canvas, f.layout()), ((400, 90), (320, 96), tracks));
+        assert_eq!(f.layout_for(Role::Preview), Layout::of_role(Role::Preview, 400, 90, &f.state));
+        assert!(!f.on(&SMessage::BrowserResize(400, 90, 0)), "the same size: no repaint");
+        let preview = f.layout_for(Role::Preview);
+        assert!(f.on(&SMessage::BrowserResize(500, 120, 1)));
+        assert_eq!((f.split().unwrap().preview_canvas, f.canvas, f.layout_for(Role::Preview)), ((400, 90), (500, 120), preview));
+        assert_eq!(f.layout().tracks_y, RULER_H);
+        assert!(!f.takes(&SMessage::BrowserResize(1, 1, 7)) && !f.on(&SMessage::BrowserResize(1, 1, 7)));
+        let frames = f.frames();
+        assert_eq!((blit(&frames[0]).1, blit(&frames[0]).2, blit(&frames[1]).1, blit(&frames[1]).2), (400, 90, 500, 120));
+        // The preview's rect set holds no hit target.
+        let l = f.layout_for(Role::Preview);
+        assert_eq!(l.hit(&f.state.timeline, 81.0, 36.0), Hit::None);
     }
 }

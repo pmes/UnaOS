@@ -31,11 +31,15 @@
 //! editor's Surface is number 1 (quartzite's `tetra::SurfaceMap`) and the face is routed to it; every token's pointer
 //! messages carry the editor's number, `aux:<token>` the aux Surface's, and the JSON line ends
 //! `"presses":[[<surface>,<taken>],...]` (each press, the Surface it carried and whether the face took it).
+//! NLE2-SPLIT (SR339): `--split` builds the two-Surface tree ([`split_tree`]: the preview Surface over the transport row,
+//! the tracks Surface under it) and the face splits over them (`Face::on_surfaces`); the window runs it, and the witness
+//! stamps tokens with the tracks Surface's number (`aux:<token>`: the preview's), its line ending
+//! `"presses":[...],"surfaces":2,"fnvs":["<preview>","<tracks>"]` (`w` / `h` / `fnv` are the tracks blit's).
 
 use bandy::{SMessage, Synapse};
 use quartzite::tetra::{SurfaceMap, TetraNode};
 use stria::nle::Sources;
-use stria::nle_face::{self, EditorState, Face, Layout, PixelOrder, SURFACE};
+use stria::nle_face::{self, EditorState, Face, Layout, PixelOrder, PREVIEW_SURFACE, SURFACE, TRACKS_SURFACE};
 use timeline_core::{Timeline, edl};
 
 struct Cli {
@@ -48,12 +52,13 @@ struct Cli {
     out: Option<String>,
     labels: bool,
     two: bool,
+    split: bool,
 }
 
 /// SURFACEID (SR332): the second Surface of `--two-surfaces` (no painter: a press on it must not reach the editor).
 const AUX_SURFACE: &str = "stria.nle.aux";
 
-const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, aux:TOKEN)";
+const USAGE: &str = "usage: stria-view <edl> [--fps N] --src REEL=<media> ... | --synth  [--size WxH] [--do SCRIPT] [--out shot.rgba] [--labels] [--two-surfaces | --split]  (SCRIPT: verbs, at:T:ROW, ruler:T, press:X:Y, move:X:Y, release, key:NAME, wheel:N, marquee:X0:Y0:X1:Y1, shift:TOKEN, alt:TOKEN, transition:T:I, meters, aux:TOKEN)";
 
 fn die(msg: String) -> ! {
     eprintln!("stria-view: {msg}");
@@ -61,13 +66,14 @@ fn die(msg: String) -> ! {
 }
 
 fn cli() -> Cli {
-    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false };
+    let mut c = Cli { edl: None, synth: false, fps: 25, srcs: Vec::new(), size: (960, 540), script: None, out: None, labels: false, two: false, split: false };
     let mut a = std::env::args().skip(1);
     while let Some(arg) = a.next() {
         match arg.as_str() {
             "--synth" => c.synth = true,
             "--labels" => c.labels = true,
             "--two-surfaces" => c.two = true,
+            "--split" => c.split = true,
             "--fps" => c.fps = a.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| die(USAGE.into())),
             "--size" => {
                 let v = a.next().unwrap_or_default();
@@ -89,7 +95,7 @@ fn cli() -> Cli {
             _ => die(USAGE.into()),
         }
     }
-    if c.edl.is_none() && !c.synth {
+    if (c.edl.is_none() && !c.synth) || (c.two && c.split) {
         die(USAGE.into());
     }
     c
@@ -117,31 +123,8 @@ fn editor_tree() -> TetraNode {
 
 /// SURFACEID (SR332): the editor tree, with `two` a second Surface ([`AUX_SURFACE`]) first, above the editor's.
 fn editor_tree_for(two: bool) -> TetraNode {
-    let button = |verb: &str, label: &str| TetraNode::Button {
-        id: verb.into(),
-        label: label.into(),
-        action: SMessage::Input { target: SURFACE.into(), text: verb.into() },
-    };
     let aux = two.then(|| TetraNode::Surface { id: AUX_SURFACE.into() });
-    TetraNode::VStack(aux.into_iter().chain([
-        TetraNode::Surface { id: SURFACE.into() },
-        TetraNode::HStack(vec![
-            button("play", "Play"),
-            button("prev", "<"),
-            button("next", ">"),
-            button("split", "Split"),
-            button("delete", "Ripple Delete"),
-            button("undo", "Undo"),
-            button("redo", "Redo"),
-            button("zoom-", "-"),
-            button("zoom+", "+"),
-            button("[", "In -"),
-            button("]", "In +"),
-            button("{", "Out -"),
-            button("}", "Out +"),
-            button("lift", "Lift"),
-        ]),
-    ]).collect())
+    TetraNode::VStack(aux.into_iter().chain([TetraNode::Surface { id: SURFACE.into() }, transport()]).collect())
 }
 
 /// A `--do` token as the messages the window would send.
@@ -238,11 +221,17 @@ fn drive_on(face: &mut Face, script: &str, surfaces: Option<(u32, u32)>, presses
 
 /// The headless witness: the script through `Face::on`, then the last frame's facts as one JSON line.
 fn witness(c: &Cli, mut face: Face) -> i32 {
-    let map = SurfaceMap::of(&editor_tree_for(c.two));
-    let surfaces = c.two.then(|| (map.number(SURFACE).unwrap_or(0), map.number(AUX_SURFACE).unwrap_or(0)));
+    let map = SurfaceMap::of(&tree(c));
+    let surfaces = if c.split {
+        Some((map.number(TRACKS_SURFACE).unwrap_or(1), map.number(PREVIEW_SURFACE).unwrap_or(0)))
+    } else {
+        c.two.then(|| (map.number(SURFACE).unwrap_or(0), map.number(AUX_SURFACE).unwrap_or(0)))
+    };
     let mut presses = Vec::new();
     let mut errors = drive_on(&mut face, c.script.as_deref().unwrap_or(""), surfaces, &mut presses);
-    let SMessage::SurfaceBlit { width, height, pixels, .. } = face.frame() else { return 1 };
+    let blits = face.frames();
+    let fnvs = blits_json(c, &blits);
+    let Some(SMessage::SurfaceBlit { width, height, pixels, .. }) = blits.into_iter().last() else { return 1 };
     if let Some(e) = face.last_error.take() {
         errors.push(e);
     }
@@ -260,7 +249,7 @@ fn witness(c: &Cli, mut face: Face) -> i32 {
     let meters = meters_json(c, &face);
     let presses = presses_json(c, &presses);
     println!(
-        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{}{meters}{presses}}}",
+        "{{\"playhead\":{},\"tracks\":{},\"clips\":{},\"selection\":{sel},\"clip\":{clip},\"playing\":{},\"rate\":{},\"undo\":{},\"zoom\":{},\"w\":{width},\"h\":{height},\"fnv\":\"{:016x}\",\"errors\":\"{err}\",\"set\":{},\"transition\":{}{meters}{presses}{fnvs}}}",
         st.playhead,
         st.timeline.tracks.len(),
         clips,
@@ -292,9 +281,8 @@ fn main() {
     let c = cli();
     let (tl, sources) = load(&c);
     let windowed = cfg!(any(target_os = "macos", all(target_os = "linux", feature = "gtk")));
-    let editor = SurfaceMap::of(&editor_tree_for(c.two)).number(SURFACE).unwrap_or(0); // SURFACEID (SR332): the face's Surface
     if c.script.is_some() || c.out.is_some() || c.two || !windowed {
-        let face = Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels).on_surface(editor);
+        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, c.labels));
         std::process::exit(witness(&c, face));
     }
 
@@ -303,14 +291,14 @@ fn main() {
     let synapse = Synapse::new();
     {
         let rx = synapse.subscribe();
-        let face = Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true).on_surface(editor);
+        let face = route(&c, Face::new(EditorState::new(tl), sources, c.size, PixelOrder::Rgba, true));
         rt.spawn(nle_face::serve(synapse.clone(), rx, face));
     }
     quartzite::Backend::new_tetra_vessel(
         "org.unaos.stria",
         &format!("Stria — {title}"),
         (c.size.0 as f64, c.size.1 as f64 + 40.0),
-        editor_tree(),
+        tree(&c),
         synapse.clone(),
     )
     .run();
@@ -424,7 +412,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(face.state.timeline, tl0.trim_in(0, 1, 3).unwrap());
         assert_eq!(presses, vec![(0, false), (1, true)]);
-        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true };
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: true, split: false };
         assert_eq!(presses_json(&c, &presses), r#","presses":[[0,false],[1,true]]"#);
         assert_eq!(presses_json(&Cli { two: false, ..c }, &presses), "");
     }
@@ -457,9 +445,104 @@ fn transition_json(face: &Face) -> String {
 
 /// SURFACEID (SR332): the witness's `"presses"` field, with `--two-surfaces` only (the default line is unchanged).
 fn presses_json(c: &Cli, presses: &[(u32, bool)]) -> String {
-    if !c.two {
+    if !(c.two || c.split) {
         return String::new();
     }
     let all: Vec<String> = presses.iter().map(|(s, t)| format!("[{s},{t}]")).collect();
     format!(",\"presses\":[{}]", all.join(","))
+}
+
+// NLE2-SPLIT (LEDGER SR339): the two-Surface editor tree, the face routed over it, the witness's two fnvs.
+
+/// THE transport row (one button per verb, each firing `SMessage::Input { target: SURFACE, text: <verb> }`), shared by
+/// every editor tree.
+fn transport() -> TetraNode {
+    let button = |verb: &str, label: &str| TetraNode::Button {
+        id: verb.into(),
+        label: label.into(),
+        action: SMessage::Input { target: SURFACE.into(), text: verb.into() },
+    };
+    TetraNode::HStack(vec![
+        button("play", "Play"),
+        button("prev", "<"),
+        button("next", ">"),
+        button("split", "Split"),
+        button("delete", "Ripple Delete"),
+        button("undo", "Undo"),
+        button("redo", "Redo"),
+        button("zoom-", "-"),
+        button("zoom+", "+"),
+        button("[", "In -"),
+        button("]", "In +"),
+        button("{", "Out -"),
+        button("}", "Out +"),
+        button("lift", "Lift"),
+    ])
+}
+
+/// NLE2-SPLIT (SR339): the preview Surface (number 0) over the transport row, the tracks Surface (number 1) under it.
+fn split_tree() -> TetraNode {
+    TetraNode::VStack(vec![TetraNode::Surface { id: PREVIEW_SURFACE.into() }, transport(), TetraNode::Surface { id: TRACKS_SURFACE.into() }])
+}
+
+/// The tree this run declares: `--split`'s, else the editor tree (with `--two-surfaces` its aux Surface).
+fn tree(c: &Cli) -> TetraNode {
+    if c.split { split_tree() } else if c.two { editor_tree_for(true) } else { editor_tree() }
+}
+
+/// The face routed by the tree's `SurfaceMap`: split over the preview and tracks Surfaces, else on the editor's.
+fn route(c: &Cli, face: Face) -> Face {
+    let map = SurfaceMap::of(&tree(c));
+    if c.split {
+        face.on_surfaces(map.number(PREVIEW_SURFACE).unwrap_or(0), map.number(TRACKS_SURFACE).unwrap_or(1))
+    } else {
+        face.on_surface(map.number(SURFACE).unwrap_or(0))
+    }
+}
+
+/// The witness's `"surfaces"` / `"fnvs"` fields, with `--split` only (the default line is unchanged).
+fn blits_json(c: &Cli, blits: &[SMessage]) -> String {
+    if !c.split {
+        return String::new();
+    }
+    let fnvs: Vec<String> = blits
+        .iter()
+        .filter_map(|m| match m {
+            SMessage::SurfaceBlit { pixels, .. } => Some(format!("\"{:016x}\"", nle_face::fnv1a(pixels))),
+            _ => None,
+        })
+        .collect();
+    format!(",\"surfaces\":{},\"fnvs\":[{}]", fnvs.len(), fnvs.join(","))
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    /// NLE2-SPLIT M3: the split tree numbers the preview 0 and the tracks 1 and carries the one transport row; a gesture
+    /// on the preview Surface is not taken, the same on the tracks Surface is the NLE2B trim; the witness's fields.
+    #[test]
+    fn split_witness_two_surfaces() {
+        let m = SurfaceMap::of(&split_tree());
+        assert_eq!((m.number(PREVIEW_SURFACE), m.number(TRACKS_SURFACE), m.number(SURFACE)), (Some(0), Some(1), None));
+        let TetraNode::VStack(top) = split_tree() else { panic!("not a VStack") };
+        let TetraNode::VStack(one) = editor_tree() else { panic!("not a VStack") };
+        assert_eq!(format!("{:?}", top[1]), format!("{:?}", one[1]), "the one transport row");
+        let c = Cli { edl: None, synth: true, fps: 25, srcs: Vec::new(), size: (320, 160), script: None, out: None, labels: false, two: false, split: true };
+        let (tl, src) = nle_face::synth_fixture();
+        let tl0 = tl.clone();
+        let mut face = route(&c, Face::new(EditorState::new(tl), src, c.size, PixelOrder::Rgba, false));
+        assert_eq!(face.canvas, (320, 96));
+        let mut presses = Vec::new();
+        let errors = drive_on(&mut face, "at:12:0,aux:press:81:36,aux:move:105:36,aux:release", Some((1, 0)), &mut presses);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!((&face.state.timeline, face.state.undo_depth()), (&tl0, 0));
+        let errors = drive_on(&mut face, "press:81:36,move:105:36,release", Some((1, 0)), &mut presses);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(face.state.timeline, tl0.trim_in(0, 1, 3).unwrap());
+        assert_eq!(presses_json(&c, &presses), r#","presses":[[0,false],[1,true]]"#);
+        let j = blits_json(&c, &face.frames());
+        assert!(j.starts_with(r#","surfaces":2,"fnvs":[""#) && j.len() == r#","surfaces":2,"fnvs":["","#.len() + 2 * 16 + 3, "{j}");
+        assert_eq!(blits_json(&Cli { split: false, ..c }, &face.frames()), "");
+    }
 }

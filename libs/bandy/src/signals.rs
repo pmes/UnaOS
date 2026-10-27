@@ -162,7 +162,8 @@ pub enum SMessage {
     /// the first or only Surface is 0), omitted from the wire when 0 so a one-surface tree keeps its frozen shape.
     BrowserScroll(f64, f64, #[serde(default, skip_serializing_if = "no_surface")] u32),
     BrowserClick(f64, f64, #[serde(default, skip_serializing_if = "no_surface")] u32),
-    BrowserResize(u32, u32),
+    /// NLE2-SURFACERESIZE (LEDGER SR339): the third field is the resized Surface's number (as on the pointer messages), omitted when 0.
+    BrowserResize(u32, u32, #[serde(default, skip_serializing_if = "no_surface")] u32),
     BrowserKey(String),
     BrowserText(String),
     /// Chrome → engine: the platform clipboard's text, pasted at the focused field's caret (the shell
@@ -1072,16 +1073,18 @@ impl TabulaCommand {
     }
 }
 
-/// SURFACEID (LEDGER SR332): the ONE list of the pointer messages that carry a Surface number. Every receiver that routes
+/// SURFACEID (LEDGER SR332): the ONE list of the messages that carry a Surface number (the four pointer messages and, since
+/// NLE2-SURFACERESIZE SR339, `BrowserResize`). Every receiver that routes
 /// by surface (stria's `nle_face::Face::takes`) and every sender that stamps one (stria-view's witness) reads it here.
 impl SMessage {
-    /// The Surface number a pointer message carries; `None` for every other message.
+    /// The Surface number a pointer message (or `BrowserResize`) carries; `None` for every other message.
     pub fn surface(&self) -> Option<u32> {
         match self {
             SMessage::BrowserButton { surface, .. }
             | SMessage::BrowserMouseMove(_, _, surface)
             | SMessage::BrowserScroll(_, _, surface)
-            | SMessage::BrowserClick(_, _, surface) => Some(*surface),
+            | SMessage::BrowserClick(_, _, surface)
+            | SMessage::BrowserResize(_, _, surface) => Some(*surface),
             _ => None,
         }
     }
@@ -1091,7 +1094,8 @@ impl SMessage {
             SMessage::BrowserButton { surface, .. }
             | SMessage::BrowserMouseMove(_, _, surface)
             | SMessage::BrowserScroll(_, _, surface)
-            | SMessage::BrowserClick(_, _, surface) => Some(surface),
+            | SMessage::BrowserClick(_, _, surface)
+            | SMessage::BrowserResize(_, _, surface) => Some(surface),
             _ => None,
         }
     }

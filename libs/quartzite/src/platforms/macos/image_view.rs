@@ -518,7 +518,7 @@ impl FacetImageView {
         }
         self.ivars().last_resize_sent.set(Some((w, h)));
         self.ivars().last_resize_fire.set(Some(std::time::Instant::now()));
-        syn.fire(bandy::SMessage::BrowserResize(w, h));
+        syn.fire(bandy::SMessage::BrowserResize(w, h, self.ivars().surface.get()));
     }
 
     // -- interaction --------------------------------------------------------
