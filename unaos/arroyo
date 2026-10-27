@@ -26,7 +26,7 @@
 #                          and at this tree IN ONE DIRECTORY and compare them, with an armed control
 #                          probe. Exit 0 identical / 1 moved / 2 no verdict. EXECUTOR-BRIEF §5.
 #   ./arroyo knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]
-#                          The same check for an option_env! knob (UNAOS_PPI, UNAOS_FBW/FBH): both kernels
+#                          The same check for an option_env! knob (UNAOS_PPI, UNAOS_FBW/FBH, UNAOS_GOP): both kernels
 #                          AND both UEFI loaders built with the knob UNSET, SET and EMPTY. See THE ENV FORM.
 #   ./arroyo clean         Purge all build artifacts
 
@@ -166,6 +166,18 @@ if [ -n "${UNAOS_FBW:-}" ] && [ -n "${UNAOS_FBH:-}" ]; then
                    echo "⚡ panel knob: ${UNAOS_FBW}x${UNAOS_FBH} (VGA xres/yres/edid, vgamem ${_panel_mb} MB) ppi=${UNAOS_PPI:-edid}" ;;
             esac ;;
     esac
+fi
+# ZENBOOKGOP (zenbook-ledger Z4): UNAOS_GOP=<handle>:<mode> is the x86 UEFI loader's OUTPUT override (crates/bootloader
+# `mod gopsel`, option_env!, no plumbing: the builder's cargo inherits this environment). Unset, the loader picks the
+# only GOP handle, else the first whose EDID is usable and whose ACPI _ADR is not the internal panel, else handle 0;
+# the indices are the ones its `[boot] gop handle=<i> mode=<m>` lines print. A build made with it is NOT the flashable image.
+if [ -n "${UNAOS_GOP:-}" ]; then
+    case "${UNAOS_GOP}" in
+        *[!0-9:]*|:*|*:|*:*:*) echo "✖ UNAOS_GOP='${UNAOS_GOP}': the gop knob is <handle>:<mode>, decimal"; exit 1 ;;
+        *:*) ;;
+        *) echo "✖ UNAOS_GOP='${UNAOS_GOP}': the gop knob is <handle>:<mode>, decimal"; exit 1 ;;
+    esac
+    echo "⚡ gop knob: handle=${UNAOS_GOP%%:*} mode=${UNAOS_GOP#*:} (x86 loader only; not the flashable image)"
 fi
 #
 # RTCCLOCK (R75) / CLOCKPAINTERS (B719): the display-offset build knob is RETIRED. The CMOS RTC is read and anchored
@@ -14011,7 +14023,7 @@ battery() {
 #
 # THE ENV FORM (`./arroyo knoboff env NAME=VAL[,NAME=VAL...] [baseline-ref]`, PANELKNOB2 rmbp-ledger B867). A
 # cargo feature is not the only knob: `UNAOS_PPI` (video/dpi.rs `mod panelknob`) and `UNAOS_FBW`/`UNAOS_FBH`
-# (crates/bootloader `mod panelknob`, arch/aarch64/mailbox.rs) are `option_env!` reads, so no feature set names
+# (crates/bootloader `mod panelknob`, arch/aarch64/mailbox.rs) and `UNAOS_GOP` (crates/bootloader `mod gopsel`) are `option_env!` reads, so no feature set names
 # them and the form above has nothing to remove. THE RULE for such a knob: the images built with it UNSET equal
 # the baseline's (the classic claim), an EMPTY value (`NAME=`) builds the same bytes as UNSET (every parser here
 # folds `Some("")` to off, and arroyo's own `[ -n "${UNAOS_X:-}" ]` reads empty as unset), and SET moves at least
