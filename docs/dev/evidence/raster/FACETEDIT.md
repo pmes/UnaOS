@@ -295,3 +295,6 @@ on the `imgview` line (cfg `witness` + `facet` + the desktop family, + `facetedi
   FACETEDIT-EXPORT (PNG export as the host's Export), FACETEDIT-OWNER (files are written as the kernel principal, as
   Quarry's are), FACETEDIT-DOCK (the dock's Facet tile reads `facet::win()`, NONE while editing), plus RASTERCLI-SELCLIP
   (brush / adjust ignore the selection) inherited from the cores.
+
+## MEASURED (the bench, 2026-10-27 06:31Z) — the fold's compile with the knob ARMED
+The executor's fold leg never armed `facetedit` (foldleg clears caller knobs; the builder did not know the knob). The fold added the builder's line (`UNAOS_FACETEDIT` → `facetedit`, builder/src/main.rs beside UNAOS_FACET) and built the image: gate39s at 197971840, `tools/trust-bundle` rc=0, `UNAOS_FACETEDIT=1` on the image line + AETHER/MIDDEN/UNA/SONDE + the two bunker FW paths, `./arroyo esp-x86` rc=0 (06:28:03Z→06:31:34Z); the banner names `facetedit`; banner-cert ok=64 missing=0 noverdict=0 (`feature=facetedit witness=[facetedit] closed win= hits=1 -> OK`); in kernel.elf: `:: FACETEDIT:`×3, `:: FACET: gesture=`×1, `[facetedit] fixture`×1. Staged as rmbp12flight38 (image 32). The metal read is flight 38's `tests facetedit`.

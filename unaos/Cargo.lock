@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "adjust_core"
+version = "0.1.0"
+
+[[package]]
 name = "amber_core"
 version = "0.1.0"
 
@@ -45,6 +49,13 @@ dependencies = [
  "uefi",
  "unaos-boot-info",
  "xmas-elf",
+]
+
+[[package]]
+name = "brush_core"
+version = "0.1.0"
+dependencies = [
+ "raster_core",
 ]
 
 [[package]]
@@ -294,6 +305,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "raster_core"
+version = "0.1.0"
+dependencies = [
+ "pixel_core",
+]
+
+[[package]]
 name = "raw_core"
 version = "0.1.0"
 
@@ -511,9 +529,11 @@ dependencies = [
 name = "unaos-kernel"
 version = "0.1.0"
 dependencies = [
+ "adjust_core",
  "amber_core",
  "audio_core",
  "av1_core",
+ "brush_core",
  "cfg-if",
  "crypto_core",
  "demux_core",
@@ -537,6 +557,7 @@ dependencies = [
  "prefs_core",
  "probe_core",
  "rast",
+ "raster_core",
  "smoltcp",
  "spin 0.12.3",
  "timeline_core",
