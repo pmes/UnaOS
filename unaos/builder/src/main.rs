@@ -446,6 +446,9 @@ fn main() {
     // (the `rastmc` failure that check was written for). Cargo's `facet = ["quarry"]` pulls the file
     // manager in behind it, so this one line is the whole wiring. Default OFF => byte-identical.
     if std::env::var("UNAOS_FACET").is_ok() { feats.push("facet"); }
+    // FACETEDIT (rmbp-ledger B900): UNAOS_FACETEDIT=1 arms Facet's kernel face (video/facetedit*.rs over raster_core,
+    // brush_core, adjust_core; `tests facetedit`). Cargo's `facetedit` implies `facet`. Default OFF => byte-identical.
+    if std::env::var("UNAOS_FACETEDIT").is_ok() { feats.push("facetedit"); }
     // VPERF: x86 video-path bench instrumentation (scroll/VRAM-read counters, fbmem readout,
     // display-BAR probe, scripted scroll scenario). x86_64-only module; default OFF.
     if std::env::var("UNAOS_VIDEOBENCH").is_ok() { feats.push("videobench"); }
