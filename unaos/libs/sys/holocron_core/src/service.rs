@@ -19,7 +19,8 @@
 //! 5. every mutation (`SecretPut`, `SecretDelete`) and `Sign` needs the ring unlocked;
 //! 6. PDF-KEYSTORE (SR382): a secret in ns [`SIGN_NS`] is a key file of kind [`KIND_PKCS8`], parsed by tls_core's key
 //!    parser before it is sealed (feature `pkcs8`; without it such a put is `INVALID`: never stored unparsed), and
-//!    Sign's long form signs with it inside this service — only the signature leaves.
+//!    Sign's long form signs with it inside this service — only the signature leaves; a refused long form names its
+//!    reason (KEYSIGNONE SR393: `WRONG_KIND`, `BAD_DIGEST_LEN`, `UNSUPPORTED_SCHEME`; `INVALID` the catch-all).
 
 use crate::format::{self, Meta};
 use crate::name;
@@ -419,6 +420,8 @@ impl<S: Sealer, G: Signer, T: Store, E: Entropy> Holocron<S, G, T, E> {
                     self.sign(key, data).map(|s| wire::encode_sign(wire::key_kind::ED25519, &s))
                 } else if ns == SIGN_NS {
                     self.sign_key(key, *alg, data)
+                } else if ns == SSH_NS {
+                    Err(status::WRONG_KIND) // KEYSIGNONE (SR393): the ssh keys are Ed25519, pure over the message
                 } else {
                     Err(status::INVALID)
                 }

@@ -3,8 +3,16 @@
 //! prime256v1 / secp384r1, `openssl pkcs8 -topk8` and `-v2 aes256`, `openssl rsa -traditional [-aes128]`), the PEM text
 //! pinned below, the expected public halves pinned from `openssl rsa -modulus` / `openssl ec|pkey -pubout`, and the
 //! small keys' DER pinned from `-outform DER`.
+//!
+//! KEYSIGNONE (LEDGER SR393): `tls_core::key::sign`, the ONE signer, over the same fixture keys — every scheme checked
+//! by tls_core's own `verify_signed` and byte for byte against the crypto_core call sequence SR361's CMS writer and
+//! SR382's Holocron each ran; its refusals by name.
 
-use tls_core::key::{self, AlgParams, Key, KeyError, parse};
+use crypto_core::{Digest, Sha256, Sha384, Sha512};
+use tls_core::crypto::{EcCurve, HashAlg};
+use tls_core::cryptocore_provider::CryptoCoreProvider;
+use tls_core::key::{self, AlgParams, Key, KeyError, KeyRef, Salt, Scheme, parse, sign};
+use tls_core::x509::{PublicKey, SignatureAlgorithm, verify_signed};
 use tls_core::x509::build;
 use tls_core::x509::der::{Der, encode_tlv};
 use tls_core::x509::oid;
@@ -288,4 +296,126 @@ fn containers_round_trip_and_stay_strict() {
     let mut trailing = p8.clone();
     trailing.push(0);
     assert!(key::pkcs8(&trailing).is_err(), "trailing data");
+}
+
+// ---- KEYSIGNONE (SR393): the one signer ----
+
+const SIGN_MSG: &[u8] = b"KEYSIGNONE KAT: the CMS signed attributes stand-in";
+const HASHES: [HashAlg; 3] = [HashAlg::Sha256, HashAlg::Sha384, HashAlg::Sha512];
+
+fn d<D: Digest>(m: &[u8]) -> Vec<u8> {
+    let mut h = D::new();
+    h.update(m);
+    let mut out = vec![0u8; D::OUTPUT_LEN];
+    h.finalize_into(&mut out);
+    out
+}
+
+fn digest(h: HashAlg, m: &[u8]) -> Vec<u8> {
+    match h {
+        HashAlg::Sha256 => d::<Sha256>(m),
+        HashAlg::Sha384 => d::<Sha384>(m),
+        HashAlg::Sha512 => d::<Sha512>(m),
+    }
+}
+
+/// The three fixture keys: RSA-2048, P-256, Ed25519 (PKCS#8 PEM).
+fn sign_keys() -> (Key, Key, Key) {
+    (parse(RSA_PKCS8.as_bytes()).unwrap(), parse(EC_PKCS8.as_bytes()).unwrap(), parse(ED_PKCS8.as_bytes()).unwrap())
+}
+
+fn public(k: &Key) -> PublicKey {
+    match k {
+        Key::Rsa(k) => {
+            let p = k.public_key();
+            let (mut n, mut e) = (vec![0u8; p.size()], vec![0u8; p.size()]);
+            let nl = p.n_be(&mut n);
+            let el = p.e_be(&mut e);
+            n.truncate(nl);
+            e.truncate(el);
+            PublicKey::Rsa { n, e }
+        }
+        Key::P256(k) => PublicKey::Ec { curve: EcCurve::P256, point: k.public_key().to_sec1_uncompressed().to_vec() },
+        Key::Ed25519(k) => PublicKey::Ed25519(k.public_key()),
+    }
+}
+
+fn verifies(k: &Key, alg: SignatureAlgorithm, sig: &[u8]) -> bool {
+    verify_signed(&CryptoCoreProvider::new(), &public(k), alg, SIGN_MSG, sig).is_ok()
+}
+
+#[test]
+fn sign_every_scheme_verifies() {
+    let (rsa, ec, ed) = sign_keys();
+    for h in HASHES {
+        let dg = digest(h, SIGN_MSG);
+        let s = sign(&rsa, Scheme::Pkcs1(h), &dg, Salt::Given(&[])).unwrap();
+        assert_eq!(s.len(), 256);
+        assert!(verifies(&rsa, SignatureAlgorithm::RsaPkcs1(h), &s), "PKCS#1 {h:?}");
+        let pss = SignatureAlgorithm::RsaPss { hash: h, salt_len: h.output_len() as u32 };
+        let salt = vec![0x5a; h.output_len()];
+        let s = sign(&rsa, Scheme::Pss(h), &dg, Salt::Given(&salt)).unwrap();
+        assert!(verifies(&rsa, pss, &s), "PSS given {h:?}");
+        let mut fill = |b: &mut [u8]| -> Result<(), ()> {
+            b.fill(0xa5);
+            Ok(())
+        };
+        let r = sign(&rsa, Scheme::Pss(h), &dg, Salt::Random(&mut fill)).unwrap();
+        assert!(verifies(&rsa, pss, &r), "PSS random {h:?}");
+        let s = sign(&ec, Scheme::P256(h), &dg, Salt::Given(&[])).unwrap();
+        assert!(s.len() <= 72 && s[0] == 0x30);
+        assert!(verifies(&ec, SignatureAlgorithm::Ecdsa(h), &s), "ECDSA {h:?}");
+    }
+    let s = sign(&ed, Scheme::Ed25519, SIGN_MSG, Salt::Given(&[])).unwrap();
+    assert_eq!(s.len(), 64);
+    assert!(verifies(&ed, SignatureAlgorithm::Ed25519, &s));
+}
+
+#[test]
+fn sign_is_the_crypto_core_sequence() {
+    let (rsa, ec, ed) = sign_keys();
+    let (Key::Rsa(rk), Key::P256(ek), Key::Ed25519(dk)) = (&rsa, &ec, &ed) else { panic!("fixture kinds") };
+    for h in HASHES {
+        let dg = digest(h, SIGN_MSG);
+        let mut out = vec![0u8; 256];
+        let n = rk.sign_pkcs1v15(&dg, &mut out).unwrap();
+        assert_eq!(sign(&rsa, Scheme::Pkcs1(h), &dg, Salt::Given(&[])).unwrap(), out[..n], "PKCS#1 {h:?}");
+        let salt = digest(h, b"salt");
+        let n = match h {
+            HashAlg::Sha256 => rk.sign_pss::<Sha256>(&dg, &salt, &mut out),
+            HashAlg::Sha384 => rk.sign_pss::<Sha384>(&dg, &salt, &mut out),
+            HashAlg::Sha512 => rk.sign_pss::<Sha512>(&dg, &salt, &mut out),
+        }
+        .unwrap();
+        assert_eq!(sign(KeyRef::Rsa(rk), Scheme::Pss(h), &dg, Salt::Given(&salt)).unwrap(), out[..n], "PSS {h:?}");
+        let raw = ek.sign_prehashed(&dg);
+        let mut der = [0u8; 72];
+        let n = crypto_core::p256::signature_to_der(&raw, &mut der);
+        assert_eq!(sign(KeyRef::P256(ek), Scheme::P256(h), &dg, Salt::Given(&[])).unwrap(), der[..n], "P-256 {h:?}");
+        assert_eq!(sign(&ec, Scheme::P256(h), &dg, Salt::Given(&[])), sign(&ec, Scheme::P256(h), &dg, Salt::Given(&[])));
+    }
+    assert_eq!(sign(KeyRef::Ed25519(dk), Scheme::Ed25519, SIGN_MSG, Salt::Given(&[])).unwrap(), dk.sign(SIGN_MSG));
+}
+
+#[test]
+fn sign_refusals_by_name() {
+    let (rsa, ec, ed) = sign_keys();
+    let d256 = digest(HashAlg::Sha256, SIGN_MSG);
+    let refused = |w| Err(KeyError::Refused(w));
+    // The key that cannot make the scheme, whatever the bytes.
+    assert_eq!(sign(&ec, Scheme::Pkcs1(HashAlg::Sha256), &d256, Salt::Given(&[])), refused(key::WRONG_KIND));
+    assert_eq!(sign(&ec, Scheme::Pss(HashAlg::Sha256), &d256, Salt::Given(&[])), refused(key::WRONG_KIND));
+    assert_eq!(sign(&rsa, Scheme::Ed25519, SIGN_MSG, Salt::Given(&[])), refused(key::WRONG_KIND));
+    assert_eq!(sign(&ed, Scheme::P256(HashAlg::Sha256), &[0; 5], Salt::Given(&[])), refused(key::WRONG_KIND));
+    // A digest that is not the hash's length.
+    assert_eq!(sign(&ec, Scheme::P256(HashAlg::Sha384), &d256, Salt::Given(&[])), refused(key::DIGEST_LEN));
+    assert_eq!(sign(&rsa, Scheme::Pkcs1(HashAlg::Sha256), SIGN_MSG, Salt::Given(&[])), refused(key::DIGEST_LEN));
+    // The PSS salt: the hash's length, and the caller's source failing.
+    assert_eq!(sign(&rsa, Scheme::Pss(HashAlg::Sha256), &d256, Salt::Given(&[0; 20])), refused(key::SALT_LEN));
+    let mut broken = |_: &mut [u8]| -> Result<(), ()> { Err(()) };
+    assert_eq!(sign(&rsa, Scheme::Pss(HashAlg::Sha256), &d256, Salt::Random(&mut broken)), refused(key::SALT_SOURCE));
+    // The vocabulary: Ed25519 over the message, its CMS digest SHA-512.
+    assert!(!Scheme::Ed25519.tbs_is_digest() && Scheme::P256(HashAlg::Sha256).tbs_is_digest());
+    assert_eq!(Scheme::Ed25519.hash(), HashAlg::Sha512);
+    assert_eq!(Scheme::Pss(HashAlg::Sha384).hash(), HashAlg::Sha384);
 }

@@ -41,7 +41,6 @@ use alloc::vec::Vec;
 
 use crypto_core::{Sha256, Sha384, Sha512};
 use tls_core::CertError;
-use tls_core::crypto::HashAlg;
 use tls_core::cryptocore_provider::CryptoCoreProvider;
 use tls_core::x509::cert::parse_signature_algorithm;
 use tls_core::x509::der::{Der, parse_time, tag};
@@ -535,14 +534,19 @@ fn classify(o: &Object, n: u32, acroform: Option<u32>, root: Option<u32>) -> Kin
 }
 
 /// The digest algorithms read (SHA-1 is refused by name) and, PDFSIGNKEYPARSE (SR361), signed with ([`cms::SignerKey`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Hash {
-    Sha256,
-    Sha384,
-    Sha512,
+/// KEYSIGNONE (SR393): tls_core's one hash vocabulary (`tls_core::crypto::HashAlg`, the one `tls_core::key::Scheme`
+/// rides), the variant names unchanged.
+pub use tls_core::crypto::HashAlg as Hash;
+
+/// KEYSIGNONE (SR393): pdf_core's digest over the one hash vocabulary (the methods `Hash` carried as an enum here).
+pub(crate) trait HashDigest {
+    /// The digest of the concatenated `parts`.
+    fn digest(self, parts: &[&[u8]]) -> Vec<u8>;
+    /// The digest length in bytes.
+    fn len(self) -> usize;
 }
 
-impl Hash {
+impl HashDigest for Hash {
     fn digest(self, parts: &[&[u8]]) -> Vec<u8> {
         match self {
             Hash::Sha256 => {
@@ -563,17 +567,8 @@ impl Hash {
         }
     }
 
-    /// The digest length in bytes.
-    pub fn len(self) -> usize {
-        self.alg().output_len()
-    }
-
-    fn alg(self) -> HashAlg {
-        match self {
-            Hash::Sha256 => HashAlg::Sha256,
-            Hash::Sha384 => HashAlg::Sha384,
-            Hash::Sha512 => HashAlg::Sha512,
-        }
+    fn len(self) -> usize {
+        self.output_len()
     }
 }
 
@@ -698,7 +693,7 @@ fn parse_cms(der: &[u8]) -> Result<Cms<'_>, &'static str> {
 /// rsaEncryption names only the key: its hash is the digest algorithm's. Anything else is tls_core's mapping.
 fn signature_algorithm(sig_alg: &[u8], hash: Hash) -> SignatureAlgorithm {
     if Der::new(sig_alg).oid().is_ok_and(|id| id == oid::RSA_ENCRYPTION) {
-        return SignatureAlgorithm::RsaPkcs1(hash.alg());
+        return SignatureAlgorithm::RsaPkcs1(hash);
     }
     parse_signature_algorithm(sig_alg).unwrap_or(SignatureAlgorithm::Unsupported)
 }
