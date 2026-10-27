@@ -134,7 +134,7 @@ fn savedialog_viewer_save_as() {
     pump(&mut v, &mut f, s);
     assert!(v.input(&SMessage::BrowserKey("Meta+Shift+s".into())).is_empty(), "the key asks; it exports nothing yet");
     match v.take_panel() {
-        Some(SMessage::SavePanel { url, name }) => assert_eq!((url.as_str(), name.as_str()), (facet_view::SURFACE, "pic.facet.png")),
+        Some(SMessage::SavePanel { url, name, .. }) => assert_eq!((url.as_str(), name.as_str()), (facet_view::SURFACE, "pic.facet.png")),
         other => panic!("no SavePanel staged: {other:?}"),
     }
     assert!(v.take_panel().is_none(), "taken once");

@@ -216,7 +216,7 @@ impl Viewer {
             // SAVEDIALOG (SR364): Save As: the window's save panel asks the path (seeded with the `e` export's name).
             "Meta+Shift+s" | "Ctrl+Shift+S" | "Ctrl+Shift+s" => {
                 if self.handle.is_some() {
-                    self.panel = Some(SMessage::SavePanel { url: SURFACE.into(), name: self.export_name() });
+                    self.panel = Some(SMessage::SavePanel { url: SURFACE.into(), name: self.export_name(), folder: None });
                 }
                 return Vec::new();
             }

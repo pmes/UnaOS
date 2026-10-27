@@ -952,7 +952,9 @@ impl Coordinator {
     /// SAVEDIALOG (SR364): a `BrowserSaveAs`: the bytes wait here (a newer Save As replaces them: the panel is modal) and
     /// the page surface's face shows the platform save panel seeded with the name.
     fn on_save_as(&mut self, name: String, bytes: Vec<u8>) {
-        self.bus.fire(SMessage::SavePanel { url: "viewport".into(), name: name.clone() });
+        // SAVERECENT (SR391): the panel opens in the folder the last Save As chose (Principia's `aether.save.folder`).
+        let folder = chrome::host::save_folder(quartzite::widgets::chrome_rows::stored_str);
+        self.bus.fire(SMessage::SavePanel { url: "viewport".into(), name: name.clone(), folder });
         self.save_as = Some((name, bytes));
     }
 
@@ -962,7 +964,15 @@ impl Coordinator {
     fn on_save_chosen(&mut self, path: Option<String>) {
         let Some((name, bytes)) = self.save_as.take() else { return };
         match path {
-            Some(p) => self.answer_save(&name, bytes.len() as u64, chrome::host::save_bytes_at(std::path::Path::new(&p), &bytes)),
+            Some(p) => {
+                let written = chrome::host::save_bytes_at(std::path::Path::new(&p), &bytes);
+                // SAVERECENT (SR391): a written Save As becomes Principia's `aether.save.folder` and heads `aether.recent`.
+                if let Ok(at) = &written {
+                    use quartzite::widgets::chrome_rows::{store_str, stored_str};
+                    chrome::host::remember_saved(at, stored_str, store_str);
+                }
+                self.answer_save(&name, bytes.len() as u64, written)
+            }
             None => self.bus.fire(SMessage::BrowserSaveFailed { why: "cancelled".into() }),
         }
     }

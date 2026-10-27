@@ -513,8 +513,15 @@ pub enum SMessage {
     BrowserSaveAs { name: String, mime: String, bytes: Vec<u8> },
     /// Owner -> face (SAVEDIALOG, SR364): show the platform save panel (AppKit NSSavePanel / GTK FileDialog) over the
     /// surface `url` (the lane that draws that surface answers; every other surface ignores it), seeded with `name`.
-    /// The face writes nothing: it answers [`SMessage::SavePanelChose`].
-    SavePanel { url: String, name: String },
+    /// The face writes nothing: it answers [`SMessage::SavePanelChose`]. SAVERECENT (SR391): `folder` is the panel's
+    /// initial directory (Principia's `aether.save.folder`, the folder the last Save As chose); omitted from the wire
+    /// when `None`, so a folderless panel keeps its frozen shape (smessage_kats).
+    SavePanel {
+        url: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+    },
     /// Face -> owner (SAVEDIALOG, SR364): the path the person chose in the [`SMessage::SavePanel`] over `url`, or `None`
     /// when the panel was cancelled. A chosen path that exists was confirmed as a replace by the panel.
     SavePanelChose { url: String, path: Option<String> },

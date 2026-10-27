@@ -932,9 +932,9 @@ pub fn bootstrap_image_surface(id: &str, synapse: bandy::Synapse) -> Retained<NS
                     }
                 }
                 // SAVEDIALOG (SR364): the owner asks THIS surface's window for a path: the platform save panel, on the main thread.
-                Ok(bandy::SMessage::SavePanel { url, name }) if url == target_id => {
+                Ok(bandy::SMessage::SavePanel { url, name, folder }) if url == target_id => {
                     let syn = resend.clone();
-                    dispatch2::DispatchQueue::main().exec_async(move || super::save_panel::run(url, &name, &syn));
+                    dispatch2::DispatchQueue::main().exec_async(move || super::save_panel::run(url, &name, folder.as_deref(), &syn));
                 }
                 // AETHERSELECT (SR69): the engine's copy lands on the general pasteboard as plain text.
                 Ok(bandy::SMessage::BrowserClipboardSet(text)) => {

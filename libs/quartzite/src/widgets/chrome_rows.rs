@@ -326,6 +326,33 @@ pub fn is_layout_change(msg: &SMessage) -> bool {
     matches!(msg, SMessage::Principia(PrincipiaCommand::PrefChanged { ns, key, .. }) if ns == LAYOUT_NS && key == LAYOUT_KEY)
 }
 
+/// SAVERECENT (SR391): a string row of Principia's store, else its schema default ([`stored_layout`]'s read); `None`
+/// when unset with no default, not a string, or the store cannot be read. The shell's prefs `get` for
+/// `aether::chrome::host::save_folder` / `remember_saved`.
+pub fn stored_str(ns: &str, key: &str) -> Option<String> {
+    let store = principia::prefs::PrefStore::load(principia::default_prefs_path()).ok()?;
+    if let Some(PrefValue::Str(s)) = store.get(ns, key) {
+        return Some(s);
+    }
+    match store.effective(ns, key, |k| std::env::var(k).ok()) {
+        Some((PrefValue::Str(s), _)) => Some(s),
+        _ => None,
+    }
+}
+
+/// SAVERECENT (SR391): store a string row in Principia (`devtools_rows::store_dock`'s write: only into a store that
+/// loaded, so a failed load never writes over the person's other rows). The shell's prefs `set`.
+pub fn store_str(ns: &str, key: &str, value: String) {
+    match principia::prefs::PrefStore::load(principia::default_prefs_path()) {
+        Ok(mut store) => {
+            if let Err(e) = store.set(ns, key, PrefValue::Str(value)) {
+                log::warn!("[aether] {ns}.{key} not stored: {e}");
+            }
+        }
+        Err(e) => log::warn!("[aether] {ns}.{key} not stored (prefs did not load): {e}"),
+    }
+}
+
 /// A chrome key's modifiers: `Primary` is Ctrl on GTK and Cmd on AppKit; `Control` is Ctrl on both (the tab step).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyMods {
