@@ -370,6 +370,25 @@ pub struct UnaFS<D: BlockDevice> {
     instance: u64,
     /// UNAFSWRITE (B825): failed-transaction reloads so far — a staged commit whose RAM was reloaded is lost.
     unwinds: u64,
+    /// UNAFSWRITE2 (rmbp-ledger B844): [`hold_fresh`](Self::hold_fresh) is on — `write_fresh` keeps its blocks in RAM.
+    fresh_hold: bool,
+    /// UNAFSWRITE2 (B844): the held blocks (block, bytes), newest copy per block. Every read of a write_fresh-class block
+    /// looks here first ([`read_held`]); a commit writes them before its barrier, a [`stage`](Self::stage) copies them
+    /// into its capture; cleared where a commit LANDS (`commit_flip`) and by `txn_unwind`.
+    fresh_held: Vec<(u64, Vec<u8>)>,
+}
+
+/// UNAFSWRITE2 (rmbp-ledger B844): THE read of a write_fresh-class block (inode, extents, data) — the held copy
+/// ([`UnaFS::hold_fresh`]) first, else the device. A snapshot read passes `&[]`.
+fn read_held<D: BlockDevice>(device: &mut D, held: &[(u64, Vec<u8>)], b: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+    match held.iter().find(|(x, _)| *x == b) {
+        Some((_, bytes)) => {
+            let n = buf.len().min(bytes.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            Ok(())
+        }
+        None => device.read_block(b, buf),
+    }
 }
 
 /// UNAFSWRITE (B825): the next mount instance id (format and mount take one each).
@@ -399,12 +418,19 @@ pub struct StagedCommit {
     next_inode: u64,
     instance: u64,
     unwinds: u64,
+    /// UNAFSWRITE2 (B844): how many of `blocks` are the op's own held write_fresh blocks.
+    fresh: usize,
 }
 
 impl StagedCommit {
-    /// Blocks staged (map leaves and index nodes).
+    /// Blocks staged (map leaves and index nodes, and the op's held write_fresh blocks).
     pub fn blocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// UNAFSWRITE2 (B844): the op's own write_fresh blocks (inode, extents, data) among [`blocks`](Self::blocks).
+    pub fn fresh_blocks(&self) -> usize {
+        self.fresh
     }
 
     /// Write every staged block to `device`, then flush — the commit's pre-flip barrier. `device` must address
@@ -526,6 +552,8 @@ impl<D: BlockDevice> UnaFS<D> {
             in_flight: false,
             instance: next_instance(),
             unwinds: 0,
+            fresh_hold: false,
+            fresh_held: Vec::new(),
         };
 
         // The reserved system objects, in id order (1..=4).
@@ -651,6 +679,8 @@ impl<D: BlockDevice> UnaFS<D> {
             in_flight: false,
             instance: next_instance(),
             unwinds: 0,
+            fresh_hold: false,
+            fresh_held: Vec::new(),
         };
 
         // Persistent reclaim queue: v1 drains eagerly on mount (crash-safe —
@@ -1017,7 +1047,7 @@ impl<D: BlockDevice> UnaFS<D> {
         if self.refmap.shape() == Shape::Legacy {
             self.refmap.convert_to_paged(&mut self.device)?;
             for b in self.imap_tree.convert_to_paged()? {
-                self.refmap.decref(&mut self.device, b);
+                self.free_block(b);
             }
             self.refmap.take_fault()?;
         }
@@ -1156,6 +1186,23 @@ impl<D: BlockDevice> UnaFS<D> {
         //    are incomplete: refuse before writing anything.
         self.refmap.take_fault()?;
 
+        // 0b. UNAFSWRITE2 (B844): the op's held write_fresh blocks join the commit — written now (a whole commit,
+        //     before its barrier) or copied into the capture (a stage). Kept until the commit LANDS, so a stage whose
+        //     write phase failed, or a Restage, re-writes them through the whole commit.
+        for (b, bytes) in &self.fresh_held {
+            match capture.as_deref_mut() {
+                None => self.device.write_block(*b, bytes)?,
+                Some(v) => {
+                    let mut copy = Vec::new();
+                    copy.try_reserve_exact(bytes.len())
+                        .and_then(|_| v.try_reserve(1))
+                        .map_err(|_| StorageError::AllocRefused(bytes.len() as u64))?;
+                    copy.extend_from_slice(bytes);
+                    v.push((*b, copy));
+                }
+            }
+        }
+
         // 1. Inode map: size it, then relocate its dirty leaves (and the index
         //    paths above them) to fresh blocks, releasing the old ones. Its
         //    allocations dirty refmap leaves, so it goes first.
@@ -1189,7 +1236,7 @@ impl<D: BlockDevice> UnaFS<D> {
             };
             let old = self.imap_tree.relocate(level, idx, nb);
             if old != 0 {
-                self.refmap.decref(&mut self.device, old);
+                self.free_block(old);
             }
         }
 
@@ -1264,6 +1311,7 @@ impl<D: BlockDevice> UnaFS<D> {
         self.device.flush()?;
 
         // 6. The new tree is the committed tree.
+        self.fresh_held.clear(); // UNAFSWRITE2 (B844): the held blocks are on the medium and now reachable
         self.root = new_root;
         self.active_slot = slot;
         self.imap_tree.finish_commit();
@@ -1290,6 +1338,7 @@ impl<D: BlockDevice> UnaFS<D> {
             return Ok(None);
         }
         let mut blocks = Vec::new();
+        let fresh = self.fresh_held.len();
         let (root, slot) = match self.commit_stage(Some(&mut blocks)) {
             Ok(r) => r,
             Err(e) => {
@@ -1307,6 +1356,7 @@ impl<D: BlockDevice> UnaFS<D> {
             next_inode: self.imap.len() as u64,
             instance: self.instance,
             unwinds: self.unwinds,
+            fresh,
         }))
     }
 
@@ -1347,6 +1397,29 @@ impl<D: BlockDevice> UnaFS<D> {
         self.in_flight && s.instance == self.instance && s.unwinds == self.unwinds
     }
 
+    /// UNAFSWRITE2 (rmbp-ledger B844): while on, the op's write_fresh blocks (inode, extents, data) are HELD in RAM —
+    /// read back from there — and land with the commit: a whole [`commit`](Self::commit) writes them before its
+    /// barrier, a [`stage`](Self::stage) carries them in its [`StagedCommit`] (written by `write_staged`, with the
+    /// caller's lock released). Off on a fresh mount. Turning it off keeps what is held for the next commit.
+    pub fn hold_fresh(&mut self, on: bool) {
+        self.fresh_hold = on;
+    }
+
+    /// UNAFSWRITE2 (B844): blocks held by [`hold_fresh`](Self::hold_fresh) and not yet landed.
+    pub fn fresh_held(&self) -> usize {
+        self.fresh_held.len()
+    }
+
+    /// UNAFSWRITE2 (B844): `refmap.decref`, and a block whose count reaches 0 loses its held copy — it may be
+    /// re-allocated inside this transaction (to the btree store, written straight to the device), and a stale held
+    /// copy must never land over it.
+    fn free_block(&mut self, b: u64) {
+        self.refmap.decref(&mut self.device, b);
+        if !self.fresh_held.is_empty() && self.refmap.refcount(&mut self.device, b) == 0 {
+            self.fresh_held.retain(|(x, _)| *x != b);
+        }
+    }
+
     /// Historical name for "make everything durable" — under CoW that is a
     /// commit. Kept for API compatibility (host tools call it).
     pub fn sync_metadata(&mut self) -> Result<(), FileSystemError> {
@@ -1384,7 +1457,21 @@ impl<D: BlockDevice> UnaFS<D> {
 
     /// Write a freshly allocated block, counting it for the bench.
     fn write_fresh(&mut self, block: u64, buf: &[u8]) -> Result<(), FileSystemError> {
-        self.device.write_block(block, buf)?;
+        if self.fresh_hold {
+            // UNAFSWRITE2 (B844): held in RAM (newest copy per block) until the commit or the stage takes it.
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(buf.len()).map_err(|_| StorageError::AllocRefused(buf.len() as u64))?;
+            copy.extend_from_slice(buf);
+            match self.fresh_held.iter_mut().find(|(b, _)| *b == block) {
+                Some(slot) => slot.1 = copy,
+                None => {
+                    self.fresh_held.try_reserve(1).map_err(|_| StorageError::AllocRefused(buf.len() as u64))?;
+                    self.fresh_held.push((block, copy));
+                }
+            }
+        } else {
+            self.device.write_block(block, buf)?;
+        }
         self.txn_blocks += 1;
         self.stats.blocks_written += 1;
         Ok(())
@@ -1407,7 +1494,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// Read an Inode by LOGICAL id.
     pub fn read_inode(&mut self, id: u64) -> Result<Inode, FileSystemError> {
         let bc = self.superblock.block_count;
-        Self::read_inode_via(&mut self.device, bc, &self.imap, id)
+        Self::read_inode_via(&mut self.device, &self.fresh_held, bc, &self.imap, id)
     }
 
     /// Read an Inode by LOGICAL id, resolving the id through an EXPLICIT inode
@@ -1423,11 +1510,12 @@ impl<D: BlockDevice> UnaFS<D> {
     /// oblivious to the split.
     fn read_inode_via(
         device: &mut D,
+        held: &[(u64, Vec<u8>)],
         block_count: u64,
         imap: &[u64],
         id: u64,
     ) -> Result<Inode, FileSystemError> {
-        let (inode, _index) = Self::read_inode_full_via(device, block_count, imap, id)?;
+        let (inode, _index) = Self::read_inode_full_via(device, held, block_count, imap, id)?;
         Ok(inode)
     }
 
@@ -1437,6 +1525,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// in-use metadata a naive extent walk would miss and report as leaked.
     fn read_inode_full_via(
         device: &mut D,
+        held: &[(u64, Vec<u8>)],
         block_count: u64,
         imap: &[u64],
         id: u64,
@@ -1446,8 +1535,8 @@ impl<D: BlockDevice> UnaFS<D> {
             return Err(FileSystemError::NotFound);
         }
         let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
-        device.read_block(pb, &mut block)?;
-        let (inode, index) = Self::reconstruct_inode(device, block_count, &block)?;
+        read_held(device, held, pb, &mut block)?; // UNAFSWRITE2 (B844)
+        let (inode, index) = Self::reconstruct_inode(device, held, block_count, &block)?;
         if inode.id != id {
             return Err(FileSystemError::CorruptVolume("inode id mismatch"));
         }
@@ -1463,6 +1552,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// snapshot walk (which has no inode map, only a physical block) can call it.
     fn reconstruct_inode(
         device: &mut D,
+        held: &[(u64, Vec<u8>)],
         block_count: u64,
         block: &[u8],
     ) -> Result<(Inode, ExtentList), FileSystemError> {
@@ -1475,6 +1565,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 }
                 let overflow_bytes = Self::read_from_extents_via(
                     device,
+                    held,
                     block_count,
                     &t.index,
                     0,
@@ -1493,7 +1584,7 @@ impl<D: BlockDevice> UnaFS<D> {
         // spill overflow), and its storage joins the returned index — it is inode metadata a snapshot pins.
         if let Some(store) = &inode.versions_store {
             inode.versions =
-                Self::read_from_extents_via(device, block_count, &store.index, 0, store.len, store.len)?;
+                Self::read_from_extents_via(device, held, block_count, &store.index, 0, store.len, store.len)?;
             if inode.versions.len() as u64 != store.len {
                 return Err(FileSystemError::CorruptVolume("versions payload short"));
             }
@@ -1512,7 +1603,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// exactly where the spill index is.
     pub(crate) fn inode_index_extents_at(&mut self, pb: u64) -> Result<ExtentList, FileSystemError> {
         let mut block = alloc::vec![0u8; BLOCK_SIZE as usize];
-        self.device.read_block(pb, &mut block)?;
+        read_held(&mut self.device, &self.fresh_held, pb, &mut block)?; // UNAFSWRITE2 (B844)
         let (inode, trailer) = Inode::decode_block(&block)?;
         let mut out = trailer.map(|t| t.index).unwrap_or_default();
         if let Some(store) = inode.versions_store {
@@ -1546,7 +1637,7 @@ impl<D: BlockDevice> UnaFS<D> {
             // inode block itself — the standard CoW decref of the old record.
             let old_index = self.inode_index_extents_at(old)?;
             self.decref_extents(&old_index);
-            self.refmap.decref(&mut self.device, old);
+            self.free_block(old);
         }
         self.imap[idx] = nb;
         self.imap_touch(idx as u64);
@@ -1836,7 +1927,7 @@ impl<D: BlockDevice> UnaFS<D> {
         for idx in first_touched..=last_touched {
             let old = map[idx as usize];
             if old != 0 {
-                self.device.read_block(old, &mut buf)?;
+                read_held(&mut self.device, &self.fresh_held, old, &mut buf)?; // UNAFSWRITE2 (B844)
             } else {
                 buf.fill(0);
             }
@@ -1851,7 +1942,7 @@ impl<D: BlockDevice> UnaFS<D> {
             let nb = self.alloc_data_block()?;
             self.write_fresh(nb, &buf)?;
             if old != 0 {
-                self.refmap.decref(&mut self.device, old);
+                self.free_block(old);
                 released += 1;
             }
             map[idx as usize] = nb;
@@ -1964,7 +2055,7 @@ impl<D: BlockDevice> UnaFS<D> {
         for idx in keep..old_blocks {
             let pb = map[idx as usize];
             if pb != 0 {
-                self.refmap.decref(&mut self.device, pb);
+                self.free_block(pb);
                 released += 1;
             }
         }
@@ -1975,11 +2066,11 @@ impl<D: BlockDevice> UnaFS<D> {
             let old = map[last];
             if old != 0 {
                 let mut buf = alloc::vec![0u8; BLOCK_SIZE as usize];
-                self.device.read_block(old, &mut buf)?;
+                read_held(&mut self.device, &self.fresh_held, old, &mut buf)?; // UNAFSWRITE2 (B844)
                 buf[tail..].fill(0);
                 let nb = self.alloc_block()?; // NEVER overwrite in place
                 self.write_fresh(nb, &buf)?;
-                self.refmap.decref(&mut self.device, old);
+                self.free_block(old);
                 released += 1;
                 map[last] = nb;
             }
@@ -2006,6 +2097,7 @@ impl<D: BlockDevice> UnaFS<D> {
     ) -> Result<Vec<u8>, FileSystemError> {
         Self::read_data_via(
             &mut self.device,
+            &self.fresh_held,
             self.superblock.block_count,
             &self.imap,
             inode_id,
@@ -2020,14 +2112,15 @@ impl<D: BlockDevice> UnaFS<D> {
     /// object, a snapshot's frozen map gives the retained bytes.
     fn read_data_via(
         device: &mut D,
+        held: &[(u64, Vec<u8>)],
         block_count: u64,
         imap: &[u64],
         inode_id: u64,
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, FileSystemError> {
-        let inode = Self::read_inode_via(device, block_count, imap, inode_id)?;
-        Self::read_from_extents_via(device, block_count, &inode.chunks, offset, length, inode.size)
+        let inode = Self::read_inode_via(device, held, block_count, imap, inode_id)?;
+        Self::read_from_extents_via(device, held, block_count, &inode.chunks, offset, length, inode.size)
     }
 
     /// Internal helper to read data from a specific ExtentList.
@@ -2046,6 +2139,7 @@ impl<D: BlockDevice> UnaFS<D> {
     ) -> Result<Vec<u8>, FileSystemError> {
         Self::read_from_extents_via(
             &mut self.device,
+            &self.fresh_held,
             self.superblock.block_count,
             chunks,
             offset,
@@ -2059,6 +2153,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// bounded reader (BEFS-HARDEN bounds are on `block_count`, disk-derived).
     fn read_from_extents_via(
         device: &mut D,
+        held: &[(u64, Vec<u8>)],
         block_count: u64,
         chunks: &ExtentList,
         offset: u64,
@@ -2128,7 +2223,7 @@ impl<D: BlockDevice> UnaFS<D> {
             );
 
             let mut block_buf = alloc::vec![0u8; BLOCK_SIZE as usize];
-            device.read_block(physical_block, &mut block_buf)?;
+            read_held(device, held, physical_block, &mut block_buf)?; // UNAFSWRITE2 (B844)
 
             buffer.extend_from_slice(&block_buf[block_offset..block_offset + to_read]);
 
@@ -2146,6 +2241,7 @@ impl<D: BlockDevice> UnaFS<D> {
     pub fn ls(&mut self, inode_id: u64) -> Result<Vec<DirEntry>, FileSystemError> {
         Self::ls_via(
             &mut self.device,
+            &self.fresh_held,
             self.superblock.block_count,
             &self.imap,
             inode_id,
@@ -2156,18 +2252,19 @@ impl<D: BlockDevice> UnaFS<D> {
     /// body of live [`ls`](Self::ls) and a [`SnapshotView`] listing.
     fn ls_via(
         device: &mut D,
+        held: &[(u64, Vec<u8>)],
         block_count: u64,
         imap: &[u64],
         inode_id: u64,
     ) -> Result<Vec<DirEntry>, FileSystemError> {
-        let inode = Self::read_inode_via(device, block_count, imap, inode_id)?;
+        let inode = Self::read_inode_via(device, held, block_count, imap, inode_id)?;
         if inode.kind != FileKind::Directory {
             return Err(FileSystemError::NotADirectory);
         }
         if inode.size == 0 {
             return Ok(Vec::new());
         }
-        let data = Self::read_data_via(device, block_count, imap, inode_id, 0, inode.size)?;
+        let data = Self::read_data_via(device, held, block_count, imap, inode_id, 0, inode.size)?;
         let entries: Vec<DirEntry> = crate::codec::deserialize(&data)?;
         Ok(entries)
     }
@@ -2358,6 +2455,7 @@ impl<D: BlockDevice> UnaFS<D> {
     pub fn resolve_path(&mut self, path: &str) -> Result<u64, FileSystemError> {
         Self::resolve_path_via(
             &mut self.device,
+            &self.fresh_held,
             self.superblock.block_count,
             &self.imap,
             self.superblock.root_inode,
@@ -2369,6 +2467,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// [`resolve_path`](Self::resolve_path) and a [`SnapshotView`] lookup.
     fn resolve_path_via(
         device: &mut D,
+        held: &[(u64, Vec<u8>)],
         block_count: u64,
         imap: &[u64],
         root_inode: u64,
@@ -2387,7 +2486,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 continue;
             }
 
-            let entries = Self::ls_via(device, block_count, imap, current_id)?;
+            let entries = Self::ls_via(device, held, block_count, imap, current_id)?;
             let entry = entries
                 .into_iter()
                 .find(|e| e.name == part)
@@ -2509,6 +2608,7 @@ impl<D: BlockDevice> UnaFS<D> {
     ) -> Result<Option<AttributeValue>, FileSystemError> {
         Self::get_attribute_via(
             &mut self.device,
+            &self.fresh_held,
             self.superblock.block_count,
             &self.imap,
             inode_id,
@@ -2521,12 +2621,13 @@ impl<D: BlockDevice> UnaFS<D> {
     /// [`SnapshotView`] attribute read (attrs AS-OF the snapshot).
     fn get_attribute_via(
         device: &mut D,
+        held: &[(u64, Vec<u8>)],
         block_count: u64,
         imap: &[u64],
         inode_id: u64,
         key: &str,
     ) -> Result<Option<AttributeValue>, FileSystemError> {
-        let inode = Self::read_inode_via(device, block_count, imap, inode_id)?;
+        let inode = Self::read_inode_via(device, held, block_count, imap, inode_id)?;
 
         if let Some(val) = inode.attributes.get(key) {
             return Ok(Some(val.clone()));
@@ -2534,7 +2635,7 @@ impl<D: BlockDevice> UnaFS<D> {
 
         if let Some(extents) = inode.large_attributes.get(key) {
             let total_size = checked_extent_total(extents)?;
-            let data = Self::read_from_extents_via(device, block_count, extents, 0, total_size, total_size)?;
+            let data = Self::read_from_extents_via(device, held, block_count, extents, 0, total_size, total_size)?;
             let val: AttributeValue = crate::codec::deserialize(&data)
                 .map_err(|_| FileSystemError::InvalidAttributeData)?;
             return Ok(Some(val));
@@ -2606,7 +2707,7 @@ impl<D: BlockDevice> UnaFS<D> {
             // would leak on unlink.
             let index = self.inode_index_extents_at(pb)?;
             self.decref_extents(&index);
-            self.refmap.decref(&mut self.device, pb);
+            self.free_block(pb);
         }
         self.imap_clear(inode_id);
 
@@ -2716,7 +2817,7 @@ impl<D: BlockDevice> UnaFS<D> {
         if pb != 0 {
             let index = self.inode_index_extents_at(pb)?;
             self.decref_extents(&index);
-            self.refmap.decref(&mut self.device, pb);
+            self.free_block(pb);
         }
         self.imap_clear(inode_id);
 
@@ -2998,7 +3099,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 // blocks (in the completed `chunks`) and its INDIRECT index
                 // blocks — a snapshot references every block its root reaches,
                 // and missing either would let a later drop free live storage.
-                let (inode, index) = Self::reconstruct_inode(&mut self.device, block_count, &ib)?;
+                let (inode, index) = Self::reconstruct_inode(&mut self.device, &self.fresh_held, block_count, &ib)?;
                 Self::push_extent_blocks(&inode.chunks, block_count, &mut blocks)?;
                 Self::push_extent_blocks(&index, block_count, &mut blocks)?;
                 for extents in inode.large_attributes.values() {
@@ -3012,6 +3113,7 @@ impl<D: BlockDevice> UnaFS<D> {
                 if inode.id == CATALOG_INODE_ID && self.superblock.indexed() {
                     blocks.extend(Self::catalog_tree_blocks_via(
                         &mut self.device,
+                        &self.fresh_held,
                         block_count,
                         &inode,
                     )?);
@@ -3171,6 +3273,7 @@ impl<D: BlockDevice> UnaFS<D> {
         self.txn_blocks = 0;
         // UNAFSWRITE (B825): a staged commit's RAM is gone — its flip answers `Lost`.
         self.in_flight = false;
+        self.fresh_held.clear(); // UNAFSWRITE2 (B844): unreferenced by the reloaded tree — never written
         self.unwinds = self.unwinds.wrapping_add(1);
     }
 
@@ -3287,7 +3390,7 @@ impl<D: BlockDevice> UnaFS<D> {
         for entry in &queue {
             for &b in &entry.blocks {
                 if b > ROOT_BLOCK && b < self.superblock.block_count {
-                    self.refmap.decref(&mut self.device, b);
+                    self.free_block(b);
                 }
             }
         }
@@ -3350,7 +3453,7 @@ impl<D: BlockDevice> UnaFS<D> {
                     Some(b) if b < self.superblock.block_count => b,
                     _ => break,
                 };
-                self.refmap.decref(&mut self.device, block);
+                self.free_block(block);
             }
         }
     }
@@ -3472,6 +3575,7 @@ impl<'a, D: BlockDevice> SnapshotView<'a, D> {
     pub fn resolve_path(&mut self, path: &str) -> Result<u64, FileSystemError> {
         UnaFS::<D>::resolve_path_via(
             self.device,
+            &[],
             self.block_count,
             &self.imap,
             self.root_inode,
@@ -3481,12 +3585,12 @@ impl<'a, D: BlockDevice> SnapshotView<'a, D> {
 
     /// Read an inode AS OF the snapshot (size, kind, attributes at snapshot time).
     pub fn read_inode(&mut self, inode_id: u64) -> Result<Inode, FileSystemError> {
-        UnaFS::<D>::read_inode_via(self.device, self.block_count, &self.imap, inode_id)
+        UnaFS::<D>::read_inode_via(self.device, &[], self.block_count, &self.imap, inode_id)
     }
 
     /// List a directory AS OF the snapshot.
     pub fn ls(&mut self, inode_id: u64) -> Result<Vec<DirEntry>, FileSystemError> {
-        UnaFS::<D>::ls_via(self.device, self.block_count, &self.imap, inode_id)
+        UnaFS::<D>::ls_via(self.device, &[], self.block_count, &self.imap, inode_id)
     }
 
     /// Read file data AS OF the snapshot — the OLD bytes, even after the live
@@ -3499,6 +3603,7 @@ impl<'a, D: BlockDevice> SnapshotView<'a, D> {
     ) -> Result<Vec<u8>, FileSystemError> {
         UnaFS::<D>::read_data_via(
             self.device,
+            &[],
             self.block_count,
             &self.imap,
             inode_id,
@@ -3515,6 +3620,7 @@ impl<'a, D: BlockDevice> SnapshotView<'a, D> {
     ) -> Result<Option<AttributeValue>, FileSystemError> {
         UnaFS::<D>::get_attribute_via(
             self.device,
+            &[],
             self.block_count,
             &self.imap,
             inode_id,
@@ -3785,6 +3891,7 @@ impl<D: BlockDevice> UnaFS<D> {
     /// snapshot walk. Empty for a catalog without a record.
     fn catalog_tree_blocks_via(
         device: &mut D,
+        held: &[(u64, Vec<u8>)],
         block_count: u64,
         catalog: &Inode,
     ) -> Result<Vec<u64>, FileSystemError> {
@@ -3793,6 +3900,7 @@ impl<D: BlockDevice> UnaFS<D> {
         }
         let data = Self::read_from_extents_via(
             device,
+            held,
             block_count,
             &catalog.chunks,
             0,
@@ -3818,7 +3926,7 @@ impl<D: BlockDevice> UnaFS<D> {
             return Ok(Vec::new());
         }
         let catalog = self.read_inode(self.superblock.catalog_inode)?;
-        Self::catalog_tree_blocks_via(&mut self.device, self.superblock.block_count, &catalog)
+        Self::catalog_tree_blocks_via(&mut self.device, &self.fresh_held, self.superblock.block_count, &catalog)
     }
 
     /// Every `(inode id, eq-key, ord-key?)` the index holds — fsck's orphan
@@ -4356,7 +4464,7 @@ impl<D: BlockDevice> UnaFS<D> {
         if self.refmap.shape() == Shape::Legacy {
             self.refmap.convert_to_paged(&mut self.device)?;
             for b in self.imap_tree.convert_to_paged()? {
-                self.refmap.decref(&mut self.device, b);
+                self.free_block(b);
             }
         }
         self.migrate_pending = false;

@@ -21,9 +21,9 @@ pub const SINK: usize = 0;
 pub const UART: usize = 1;
 /// The UnaFS mount (`fs/unafs.rs` `MOUNT`).
 pub const UNAFS: usize = 2;
-const N: usize = 3;
+const N: usize = 3; #[cfg(all(feature = "unafs", feature = "wc"))] pub const UNAFS_TICKET: usize = 3; // TICKETOWNER (rmbp-ledger B844): the UnaFS commit ticket (`fs::unafs::splitwrite::TICKET`) — its own word records its holder, so it has a NAME but no OWNER slot (LINE-NEUTRAL)
 /// The names `[lock] released-on-death name=<sink|uart|unafs> …` prints (STACKGUARD3 B832; `sync::release_task`).
-pub const NAMES: [&str; N] = ["sink", "uart", "unafs"];
+#[cfg(not(all(feature = "unafs", feature = "wc")))] pub const NAMES: [&str; N] = ["sink", "uart", "unafs"]; #[cfg(all(feature = "unafs", feature = "wc"))] pub const NAMES: [&str; N + 1] = ["sink", "uart", "unafs", "unafs-ticket"]; // TICKETOWNER (B844): bit 3 = the ticket (LINE-NEUTRAL)
 
 static ON: AtomicBool = AtomicBool::new(false);
 static OWNER: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
@@ -118,7 +118,7 @@ pub fn release_dead(tid: u64) -> u32 {
             clear(UNAFS);
             crate::fs::unafs::lockowner_release();
             out |= 1 << UNAFS;
-        }
+        } #[cfg(all(feature = "unafs", feature = "wc"))] if crate::fs::unafs::splitwrite::release_dead(tid) { out |= 1 << UNAFS_TICKET; } // TICKETOWNER (B844): the commit ticket dies with its holder — AFTER the UNAFS case (a holder dead inside a MOUNT hold has had MOUNT force-released and leaked already). LINE-NEUTRAL fold
         out
     }
     #[cfg(not(target_arch = "x86_64"))]

@@ -3970,6 +3970,22 @@ pub fn record_attrs_on<D: ::unafs::BlockDevice>(fs: &mut UnaFS<D>, id: u64, ino:
 // THE TWO-WRITER RULE: from the ticket's take to its give the holder is the volume's only writer — every
 // `with_unafs` waits for the ticket before an attempt (:900), and one that took MOUNT after the ticket was taken
 // leaves it untouched and restarts (:794). The holder's own holds pass by task id. Lock order TICKET ⊃ MOUNT.
+//
+// TICKETOWNER (rmbp-ledger B844; cores.md BP-cores-14): the ticket dies with its holder. `sync::release_task` ->
+// `lockowner::release_dead` -> [`splitwrite::release_dead`] (after lockowner's UNAFS case): the bound mount is LEAKED
+// (lockowner_release's take + forget, without its force_unlock — in the write phase the dead holder does not hold MOUNT
+// and another core may), then the ticket is given back; `[lock] released-on-death name=unafs-ticket …`. The dead op's
+// staged RAM leaves with the mount — the next `with_unafs` re-binds a new instance, so a flip of the dead stage is
+// `Lost` — and its written blocks are free space in the committed tree (K8a). MOUNT still held by another core past the
+// 1500 ms bound: the ticket stays held and `[lock] kept-on-death name=unafs-ticket … why=mount-busy` says so.
+// TICKETPREEMPT (B844): a caller with IRQs MASKED that meets a foreign ticket answers Busy at once (`pause`): the holder
+// may be preempted on this very core and cannot run until it unmasks. Only an unmasked caller waits (bounded).
+// UNAFSWRITE2 first half (B844; storage.md BP-storage-8): HOLD 1 runs the op under `FreshHold` (autocommit off +
+// the crate's `hold_fresh`): the op's own write_fresh blocks (inode, extents, data) are held in RAM and travel in the
+// `StagedCommit` (`fresh_blocks`), written with MOUNT released like the map blocks. The btree store's node writes
+// (catalog, name index, attribute index) still run under MOUNT. `write`/`truncate` stay WHOLE (plain `with_unafs`):
+// `nospace_room`'s oldest-version drop runs only with autocommit ON, and a split op runs with it off — a full volume
+// would refuse the write instead of spending a version.
 // =================================================================================================
 #[cfg(all(target_arch = "x86_64", feature = "wc"))]
 pub use splitwrite::with_unafs_write;
@@ -3997,6 +4013,8 @@ pub mod splitwrite {
     static LOST: AtomicU64 = AtomicU64::new(0);
     static HELD_MAX_US: AtomicU64 = AtomicU64::new(0);
     static WRITE_MS_MAX: AtomicU64 = AtomicU64::new(0);
+    /// UNAFSWRITE2 (B844): the op's own write_fresh blocks carried by flipped split commits (`fresh_blocks`).
+    static DATA_STAGED: AtomicU64 = AtomicU64::new(0);
 
     /// The bound on any wait for the ticket: RENDERWEDGE's `MOUNT_BOUND_MS` (`video/renderwedge.rs`, 1500 ms — not
     /// re-exported by that module, so its value is restated here), past which the caller answers `Busy`.
@@ -4010,12 +4028,14 @@ pub mod splitwrite {
         crate::hidstall::now_us()
     }
 
-    fn pause() {
+    /// TICKETPREEMPT (B844): `false` = IRQs are masked — the holder may be preempted on THIS core and cannot run
+    /// until the caller unmasks, so the caller answers Busy at once instead of spinning its bound masked.
+    fn pause() -> bool {
         if crate::arch::irqs_masked() {
-            core::hint::spin_loop();
-        } else {
-            crate::hlt(); // unmasked: let the holder run
+            return false;
         }
+        crate::hlt(); // unmasked: let the holder run
+        true
     }
 
     /// :794 fold — the ticket is held by another task (read inside the MOUNT hold).
@@ -4034,7 +4054,9 @@ pub mod splitwrite {
             if now_us().saturating_sub(t0) >= TICKET_BOUND_MS * 1000 {
                 return false;
             }
-            pause();
+            if !pause() {
+                return false; // TICKETPREEMPT (B844): masked — Busy now
+            }
         }
         true
     }
@@ -4048,7 +4070,64 @@ pub mod splitwrite {
             if now_us().saturating_sub(t0) >= TICKET_BOUND_MS * 1000 {
                 return false;
             }
-            pause();
+            if !pause() {
+                return false; // TICKETPREEMPT (B844): masked — Busy now
+            }
+        }
+    }
+
+    /// TICKETOWNER (B844): `lockowner::release_dead`'s ticket case — `tid` will never run again. `true` = the ticket was
+    /// its and is free now (named by `sync::release_task` as `unafs-ticket`). First, while the ticket still keeps every
+    /// other writer out, the bound mount is LEAKED (taken and forgotten, never dropped: its drop frees heap memory and
+    /// the heap's lock may still be the dead task's until the registry walk) — the dead op's staged RAM goes with it.
+    /// MOUNT is taken by a masked `try_lock` spin bounded by `TICKET_BOUND_MS`; never force-unlocked (another core may
+    /// hold it legitimately: a `with_unafs` that met the ticket and is restarting). Past the bound the ticket STAYS
+    /// held — the dead op's RAM may not be handed to the next writer — and `why=mount-busy` is printed.
+    pub fn release_dead(tid: u64) -> bool {
+        if tid == 0 || TICKET.load(Ordering::Acquire) != tid {
+            return false;
+        }
+        let t0 = now_us();
+        let leaked = crate::arch::without_interrupts(|| loop {
+            if let Some(mut g) = MOUNT.try_lock() {
+                if let Some(m) = g.take() {
+                    core::mem::forget(m);
+                }
+                break true;
+            }
+            if now_us().saturating_sub(t0) >= TICKET_BOUND_MS * 1000 {
+                break false;
+            }
+            core::hint::spin_loop();
+        });
+        if !leaked {
+            serial_println!(
+                "[lock] kept-on-death name=unafs-ticket at=lockowner by={}@cpu? why=mount-busy ms={} (TICKETOWNER B844: MOUNT held past the bound — the ticket stays held, never a force_unlock)",
+                tid,
+                now_us().saturating_sub(t0) / 1000
+            );
+            return false;
+        }
+        TICKET.compare_exchange(tid, 0, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    /// UNAFSWRITE2 (B844): HOLD 1's op shape — autocommit off and the crate's `hold_fresh` on for exactly the op's
+    /// run; both turned back on/off by `Drop`, so no exit of the closure leaves the hold armed (an armed hold would make
+    /// the NEXT op's write_fresh blocks wait silently for a commit).
+    struct FreshHold<'a>(&'a mut KernelUnaFS);
+
+    impl<'a> FreshHold<'a> {
+        fn on(fs: &'a mut KernelUnaFS) -> Self {
+            fs.set_autocommit(false);
+            fs.hold_fresh(true);
+            FreshHold(fs)
+        }
+    }
+
+    impl Drop for FreshHold<'_> {
+        fn drop(&mut self) {
+            self.0.hold_fresh(false);
+            self.0.set_autocommit(true);
         }
     }
 
@@ -4097,9 +4176,10 @@ pub mod splitwrite {
             // HOLD 1: the op, then the stage.
             let (r, stage, held1) = with_unafs(|fs| {
                 let h0 = now_us();
-                fs.set_autocommit(false);
-                let r = f(fs);
-                fs.set_autocommit(true);
+                let r = {
+                    let mut hold = FreshHold::on(fs); // UNAFSWRITE2 (B844): autocommit off + hold_fresh on, both undone by Drop
+                    f(&mut *hold.0)
+                };
                 let stage = if MOUNT_DISCARD.load(Ordering::Relaxed) || !fs.has_staged() {
                     Stage::Done // a K9 discard drops the mount after this closure; or nothing to commit
                 } else if fs.key_slot().is_some_and(|k| k.cipher == ::unafs::keyslot::CIPHER_AES256_XTS) {
@@ -4159,6 +4239,7 @@ pub mod splitwrite {
             let (name, out) = match flip {
                 Flip::Ok => {
                     SPLIT.fetch_add(1, Ordering::Relaxed);
+                    DATA_STAGED.fetch_add(s.fresh_blocks() as u64, Ordering::Relaxed);
                     ("ok", Some(Ok(())))
                 }
                 Flip::Restaged(res) => {
@@ -4241,6 +4322,7 @@ pub mod splitwrite {
             }
         };
         let (s0, w0, r0, l0, _, _) = census();
+        let d0 = DATA_STAGED.load(Ordering::Relaxed);
         HELD_MAX_US.store(0, Ordering::Relaxed);
         WRITE_MS_MAX.store(0, Ordering::Relaxed);
         let mut commits = 0u64;
@@ -4251,11 +4333,12 @@ pub mod splitwrite {
             }
         }
         let (s1, w1, r1, l1, held, wms) = census();
+        let data = DATA_STAGED.load(Ordering::Relaxed).wrapping_sub(d0); // UNAFSWRITE2 (B844): each attribute commit's inode travels in its stage
         let _ = with_unafs_write(|fs| fs.resolve_path("/var").and_then(|var| fs.unlink(var, LEAF)));
         let (split, whole, restaged, lost) = (s1.wrapping_sub(s0), w1.wrapping_sub(w0), r1.wrapping_sub(r0), l1.wrapping_sub(l0));
-        let ok = commits == N && split >= N && whole == 0 && lost == 0 && held <= 20_000;
+        let ok = commits == N && split >= N && whole == 0 && lost == 0 && held <= 20_000 && data >= N;
         serial_println!(
-            "[unafslock] write commits={} split={} write_held_us={} write_ms_max={} io_under_lock={} restaged={} lost={} -> {}",
+            "[unafslock] write commits={} split={} write_held_us={} write_ms_max={} io_under_lock={} restaged={} lost={} data_blocks_staged={} -> {}",
             commits,
             split,
             held,
@@ -4263,6 +4346,7 @@ pub mod splitwrite {
             whole,
             restaged,
             lost,
+            data,
             if ok { "ok" } else { "FAIL" }
         );
     }
