@@ -1041,7 +1041,8 @@ fn masksites_kat() -> (u32, bool, bool, bool) {
 /// keyed here. `Some(true)` = the key at the call's line rose; `None` = no span was taken (an `Err`: no volume, a Busy
 /// ticket) or the table is full (`other` rose); `Some(false)` = a span ran and keyed elsewhere (e.g. `run`'s line).
 fn wrapsite_kat() -> Option<bool> {
-    let other0 = MASK_SITES.other_n.load(Relaxed);
+    #[cfg(not(any(target_arch = "aarch64", feature = "unafs")))] { return None; } // MASKWRITESITE (B1037) seat fix: no UnaFS in this image (fs/mod.rs:43 gate), no wrapper to walk — the KAT reads `-`
+    #[cfg(any(target_arch = "aarch64", feature = "unafs"))] let other0 = MASK_SITES.other_n.load(Relaxed);
     let n0 = site_n(line!() + 1); // the call's line: the NEXT line
     let (line, r) = (line!(), crate::fs::unafs::with_unafs_write(|_| ()));
     let rose = site_n(line) > n0;
