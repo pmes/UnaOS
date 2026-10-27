@@ -1,0 +1,18 @@
+[package]
+name = "brush_core"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+description = "Facet's brush engine: dab spacing along a stroke, hardness falloff, pressure curves, and painting through raster_core's one blend rule (the eraser is its Erase mode) — shared by Ring 0 and Ring 3."
+
+# BRUSHCORE (LEDGER SR231): `#![no_std]` + `alloc`, `#![forbid(unsafe_code)]`, raster_core's shape: a shared core
+# under `unaos/libs/`, a member of the ROOT host workspace, linkable by a later face by path with
+# `default-features = false`. Its one dependency is raster_core (`BlendMode` and `composite::blend_pixel`, the one
+# blend rule with its opaque / transparent short-cuts); no direct pixel_core line.
+[dependencies]
+raster_core = { path = "../raster_core", default-features = false }
+
+[features]
+default = ["std"]
+# The seam only: nothing in `src/` is std-gated (midden_core's spelling, so a kernel `default-features = false` is honest).
+std = []
