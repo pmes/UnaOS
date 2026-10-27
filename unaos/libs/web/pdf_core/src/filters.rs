@@ -10,7 +10,8 @@
 //! an unknown filter type reads as None, a short last row is kept — stay here); TIFF 2 lives here (pixel_core has none).
 //! The image codecs (DCT, JPX, CCITTFax, JBIG2) stop the chain: decoding stops at the first one and the result
 //! carries the raw bytes and the filter's name (PDF2 decodes DCT through pixel_core::jpeg); [`bilevel`] then decodes
-//! CCITTFax ([`ccitt`]) and JBIG2 ([`jbig2`], over the one MQ coder [`mq`]) to 1-bit rows (PDFFAX SR331). JPX stays raw.
+//! CCITTFax ([`ccitt`]) and JBIG2 ([`jbig2`], over the one MQ coder [`mq`]) to 1-bit rows (PDFFAX SR331). JPX decodes
+//! through [`jpx`] (PDFJPX SR335, over the same [`mq`]), called by `render::image`.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -22,6 +23,7 @@ use crate::{Error, MAX_DECODED};
 
 pub mod ccitt;
 pub mod jbig2;
+pub mod jpx;
 pub mod mq;
 
 /// A decoded stream.

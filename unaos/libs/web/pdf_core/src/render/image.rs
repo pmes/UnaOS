@@ -6,8 +6,9 @@
 //! `pixel_core::jpeg`; raw samples at 1/2/4/8/16 bits per component with /Decode through the colour space; /ImageMask
 //! stencils (painted later in the fill colour); /SMask as alpha. CCITTFax and JBIG2 decode to 1-bit rows through
 //! `filters::bilevel` and take the stencil or bpc-1 sample path (PDFFAX SR331; a feature their decoders refuse is
-//! refused by its name). JPX is refused by name (the caller draws a grey box; PDF-JPX owed). Explicit and colour-key
-//! /Mask and /Matte are owed (PDF-IMGMASK).
+//! refused by its name). JPXDecode goes through `filters::jpx` (PDFJPX SR335) to 8-bit samples mapped here by `raw`
+//! (§8.9.5: /ColorSpace wins, else the codestream's; /Decode ignored; /SMaskInData's channel as alpha). Explicit and
+//! colour-key /Mask and /Matte are owed (PDF-IMGMASK).
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -82,8 +83,12 @@ fn decode(s: &Stream, res: &Dict, doc: &Document, depth: usize) -> Option<Img> {
                 p.data.copy_from_slice(&img.rgba);
                 p
             }
-            // CCITTFax and JBIG2 became 1-bit rows above; JPX is owed (PDF-JPX: mq.rs is its first piece).
-            _ => return Some(Img::Refused("JPXDecode")),
+            // CCITTFax and JBIG2 became 1-bit rows above; JPX decodes through filters::jpx (PDFJPX SR335).
+            b"JPXDecode" => match jpx_pix(&dec.data, d, res, doc) {
+                Ok(p) => p,
+                Err(why) => return Some(Img::Refused(why)),
+            },
+            _ => return Some(Img::Refused("image codec")),
         }
     } else if stencil {
         let decode = nums(doc, get(b"Decode")).unwrap_or_else(|| vec![0.0, 1.0]);
@@ -198,4 +203,41 @@ fn bilevel_of(dec: Decoded, doc: &Document, w: usize, h: usize) -> Result<(Decod
         Err(crate::Error::Unsupported(why)) => Err(why),
         Err(_) => Err(name),
     }
+}
+
+/// JPXDecode (PDFJPX SR335): `filters::jpx` decodes the samples and `raw` maps them, so this file stays the one place
+/// samples become colour. §8.9.5: /ColorSpace wins when present, else the JP2 colr space, else the component count;
+/// /BitsPerComponent and /Decode are ignored; /SMaskInData 1 or 2 takes the channel after the colour channels as the
+/// alpha unless an /SMask is present. The codestream's own size wins over /Width /Height (the DCT rule). A refusal
+/// carries the decoder's feature name, else "JPXDecode".
+fn jpx_pix(data: &[u8], d: &Dict, res: &Dict, doc: &Document) -> Result<Pixmap, &'static str> {
+    use crate::filters::jpx::{self, Space};
+    let img = jpx::decode(data).map_err(|e| match e {
+        crate::Error::Unsupported(why) => why,
+        _ => "JPXDecode",
+    })?;
+    let get = |k: &[u8]| d.get(k).map(|o| doc.get(o));
+    let cs = match get(b"ColorSpace") {
+        Some(o) => ColourSpace::parse(&o, res, doc).ok_or("JPXDecode")?,
+        None => match (img.space, img.comps) {
+            (Space::Gray, _) | (Space::Unknown, 1 | 2) => ColourSpace::Gray,
+            (Space::Rgb, _) | (Space::Unknown, 3) => ColourSpace::Rgb,
+            _ => ColourSpace::Cmyk,
+        },
+    };
+    let n = cs.n();
+    if n == 0 || img.comps < n {
+        return Err("JPX component count");
+    }
+    let picked: Option<Vec<u8>> = (img.comps > n).then(|| img.data.chunks_exact(img.comps).flat_map(|px| px[..n].iter().copied()).collect());
+    let mut pix = raw(picked.as_deref().unwrap_or(&img.data), img.w, img.h, 8, &cs, None).ok_or("JPXDecode")?;
+    let smask_in_data = get(b"SMaskInData").and_then(|o| o.as_int()).unwrap_or(0);
+    if smask_in_data > 0 && get(b"SMask").is_none() && img.comps > n {
+        let mut m = Pixmap::new(img.w, img.h);
+        for (i, px) in img.data.chunks_exact(img.comps).enumerate() {
+            m.data[i * 4] = px[n];
+        }
+        apply_alpha(&mut pix, &m);
+    }
+    Ok(pix)
 }

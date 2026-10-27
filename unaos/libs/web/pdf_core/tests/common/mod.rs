@@ -5,6 +5,8 @@
 //! + object-stream file, or as a hybrid (/XRefStm); plus incremental updates. PDF2 / PDF3 reuse it.
 #![allow(dead_code)]
 
+pub mod mq;
+
 use std::collections::BTreeMap;
 
 /// One object's body.
