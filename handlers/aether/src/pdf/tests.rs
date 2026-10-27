@@ -175,7 +175,7 @@ fn pdf4_html_after_pdf() {
     assert_eq!(e.pdf_status(), None);
 }
 
-// ==========================================================================================
+// =================================================================================================
 // PDF4ANNOTS (SR343): links and form widgets on the page stack.
 // =================================================================================================
 
@@ -712,7 +712,6 @@ fn pdf4thumbs_labels() {
     assert!(ink, "page 1's number under its thumbnail");
 }
 
-=======
 /// SAVEDIALOG (SR364): the staged Save As's name, type and bytes.
 fn staged_save_as(e: &mut AetherEngine) -> (String, String, Vec<u8>) {
     match e.take_pending_save() {
