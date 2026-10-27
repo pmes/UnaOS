@@ -1774,7 +1774,7 @@ fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, font
         }
     }
     // AETHERFIT (SR189): the viewport is a fixed box's containing block (its insets rewritten for the run).
-    let mut fixed_saved: Vec<(taffy::NodeId, taffy::geometry::Rect<LengthPercentageAuto>)> = Vec::new();
+    let mut fixed_saved: Vec<FixedSaved> = Vec::new();
     if fixed_viewport(tree, &mut fixed_saved) {
         run_pass(tree);
     }
@@ -1909,6 +1909,18 @@ fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, font
         run_pass(tree);
     }
     record_fixed(tree, &fixed_saved);
+    // AETHERFIT2 (SR191): restored FIRST — a record taken after another pass rewrote a size gives that pass's
+    // own restore below the last word on its field.
+    for f in fixed_saved {
+        if let Ok(st) = tree.taffy.style(f.id) {
+            let mut st = st.clone();
+            st.inset = f.inset;
+            st.size = f.size;
+            st.min_size = f.min;
+            st.max_size = f.max;
+            let _ = tree.taffy.set_style(f.id, st);
+        }
+    }
     for (id, d) in mc_heights {
         if let Ok(st) = tree.taffy.style(id) {
             let mut st = st.clone();
@@ -1928,13 +1940,6 @@ fn passes<H: Host, F: Fonts + ?Sized>(tree: &mut LayoutTree<H>, prep: Prep, font
         if let Ok(st) = tree.taffy.style(id) {
             let mut st = st.clone();
             st.min_size.height = d;
-            let _ = tree.taffy.set_style(id, st);
-        }
-    }
-    for (id, inset) in fixed_saved {
-        if let Ok(st) = tree.taffy.style(id) {
-            let mut st = st.clone();
-            st.inset = inset;
             let _ = tree.taffy.set_style(id, st);
         }
     }
@@ -2486,8 +2491,10 @@ fn apply_inline_style<H: Host>(inline: &str, style: &mut Style, paint: &mut Pain
 
 /// css-sizing-3 §3.1: in the block axis `fit-content` behaves as the automatic size (the IFC pass writes the
 /// line boxes' height for it as for `auto`).
+/// AETHERFIT2 (SR191): so does every other sizing keyword but `stretch` (min-content, max-content, fit-content()).
 fn block_auto(d: Dimension) -> bool {
-    d == Dimension::auto() || d == Dimension::fit_content()
+    let raw = d.into_raw();
+    d == Dimension::auto() || (raw.is_sizing_keyword() && raw.tag() != taffy::style::CompactLength::STRETCH_TAG)
 }
 
 /// The document-space border-box origin of `id` as taffy placed it (the parent chain's `location` sum).
@@ -2514,9 +2521,40 @@ fn inset_px(v: LengthPercentageAuto, basis: f32) -> Option<f32> {
     }
 }
 
-/// The box's specified insets: the saved ones while this pass has them rewritten.
-fn specified_inset<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId, saved: &[(taffy::NodeId, taffy::geometry::Rect<LengthPercentageAuto>)]) -> Option<taffy::geometry::Rect<LengthPercentageAuto>> {
-    saved.iter().find(|(s, _)| *s == id).map(|(_, r)| *r).or_else(|| tree.taffy.style(id).ok().map(|st| st.inset))
+/// A fixed box's specified insets and sizes, kept while [`fixed_viewport`] has them rewritten for the run and
+/// restored by [`passes`] (AETHERFIT2 (SR191): the sizes joined the insets — one record per box).
+#[derive(Clone, Copy)]
+struct FixedSaved {
+    id: taffy::NodeId,
+    inset: taffy::geometry::Rect<LengthPercentageAuto>,
+    size: taffy::geometry::Size<Dimension>,
+    min: taffy::geometry::Size<LengthPercentageAuto>,
+    max: taffy::geometry::Size<LengthPercentageAuto>,
+}
+
+/// The box's specified insets and sizes: the saved ones while this pass has them rewritten.
+fn specified<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId, saved: &[FixedSaved]) -> Option<FixedSaved> {
+    saved.iter().find(|f| f.id == id).copied().or_else(|| {
+        tree.taffy.style(id).ok().map(|st| FixedSaved { id, inset: st.inset, size: st.size, min: st.min_size, max: st.max_size })
+    })
+}
+
+/// AETHERFIT2 (SR191): a fixed box's % size resolved against the VIEWPORT axis `basis` (a %, or a fit-content(%),
+/// becomes the same with a length); every other value is left as it is.
+fn dim_vp(d: Dimension, basis: f32) -> Dimension {
+    use taffy::style::CompactLength as C;
+    let raw = d.into_raw();
+    match raw.tag() {
+        C::PERCENT_TAG => Dimension::length(raw.value() * basis),
+        C::FIT_CONTENT_PERCENT_TAG => Dimension::fit_content_px(raw.value() * basis),
+        _ => d,
+    }
+}
+
+/// [`dim_vp`] for a min / max size.
+fn lpa_vp(v: LengthPercentageAuto, basis: f32) -> LengthPercentageAuto {
+    let raw = v.into_raw();
+    if raw.tag() == taffy::style::CompactLength::PERCENT_TAG { LengthPercentageAuto::length(raw.value() * basis) } else { v }
 }
 
 /// CSS 2.2 §10.1.3 / css-position-3 §2.1: the containing block of a `position: fixed` box is the viewport. taffy
@@ -2524,9 +2562,11 @@ fn specified_inset<H: Host>(tree: &LayoutTree<H>, id: taffy::NodeId, saved: &[(t
 /// each fixed box's definite insets (a length, or a % of the VIEWPORT axis) are rewritten as lengths from its
 /// parent's out-of-flow area (taffy's: the padding box, offset by the border, without the scrollbar gutter): taffy's
 /// own out-of-flow routine then stretches or fit-contents the box and resolves its auto margins (centring) against
-/// the viewport, and its `location` stays parent-relative for every parent-chain sum. The original insets are kept
-/// in `saved` and restored by [`passes`]. True when a style changed (the caller lays out again).
-fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<(taffy::NodeId, taffy::geometry::Rect<LengthPercentageAuto>)>) -> bool {
+/// the viewport, and its `location` stays parent-relative for every parent-chain sum. AETHERFIT2 (SR191): its %
+/// `width` / `height` / `min-*` / `max-*` (and `fit-content(%)`) resolve against the viewport too — rewritten as
+/// lengths of the viewport axis in the same step. The original values are kept in `saved` and restored by
+/// [`passes`]. True when a style changed (the caller lays out again).
+fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<FixedSaved>) -> bool {
     let (vw, vh) = tree.viewport;
     let mut ids: Vec<taffy::NodeId> = tree.paint_map.iter().filter(|(_, p)| p.position_kind == Some(3)).map(|(id, _)| *id).collect();
     ids.sort_by_key(|id| u64::from(*id));
@@ -2536,7 +2576,8 @@ fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<(taffy::Nod
         if st.position != taffy::style::Position::Absolute || st.display == taffy::style::Display::None {
             continue;
         }
-        let Some(orig) = specified_inset(tree, id, saved) else { continue };
+        let Some(spec) = specified(tree, id, saved) else { continue };
+        let orig = spec.inset;
         let Some(parent) = tree.taffy.parent(id) else { continue };
         let Ok(pl) = tree.taffy.layout(parent).cloned() else { continue };
         let (px, py) = chain_origin(tree, parent);
@@ -2553,14 +2594,20 @@ fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<(taffy::Nod
             top: side(orig.top, vh, ay),
             bottom: side(orig.bottom, vh, vh - (ay + ah)),
         };
-        if st.inset == want {
+        let size = taffy::geometry::Size { width: dim_vp(spec.size.width, vw), height: dim_vp(spec.size.height, vh) };
+        let min = taffy::geometry::Size { width: lpa_vp(spec.min.width, vw), height: lpa_vp(spec.min.height, vh) };
+        let max = taffy::geometry::Size { width: lpa_vp(spec.max.width, vw), height: lpa_vp(spec.max.height, vh) };
+        if st.inset == want && st.size == size && st.min_size == min && st.max_size == max {
             continue;
         }
-        if !saved.iter().any(|(s, _)| *s == id) {
-            saved.push((id, orig));
+        if !saved.iter().any(|f| f.id == id) {
+            saved.push(spec);
         }
         let mut st = st.clone();
         st.inset = want;
+        st.size = size;
+        st.min_size = min;
+        st.max_size = max;
         let _ = tree.taffy.set_style(id, st);
         changed = true;
     }
@@ -2569,7 +2616,7 @@ fn fixed_viewport<H: Host>(tree: &mut LayoutTree<H>, saved: &mut Vec<(taffy::Nod
 
 /// Records [`LayoutTree::fixed_at`] from the settled layout: per axis with a definite specified inset, the fixed
 /// box's border-box origin in the viewport (its parent-chain place, which [`fixed_viewport`] made viewport-relative).
-fn record_fixed<H: Host>(tree: &mut LayoutTree<H>, saved: &[(taffy::NodeId, taffy::geometry::Rect<LengthPercentageAuto>)]) {
+fn record_fixed<H: Host>(tree: &mut LayoutTree<H>, saved: &[FixedSaved]) {
     let (vw, vh) = tree.viewport;
     tree.fixed_at.clear();
     let ids: Vec<taffy::NodeId> = tree.paint_map.iter().filter(|(_, p)| p.position_kind == Some(3)).map(|(id, _)| *id).collect();
@@ -2578,7 +2625,7 @@ fn record_fixed<H: Host>(tree: &mut LayoutTree<H>, saved: &[(taffy::NodeId, taff
         if st.position != taffy::style::Position::Absolute || st.display == taffy::style::Display::None {
             continue;
         }
-        let Some(ins) = specified_inset(tree, id, saved) else { continue };
+        let Some(ins) = specified(tree, id, saved).map(|f| f.inset) else { continue };
         let (x, y) = chain_origin(tree, id);
         let fx = (inset_px(ins.left, vw).is_some() || inset_px(ins.right, vw).is_some()).then_some(x);
         let fy = (inset_px(ins.top, vh).is_some() || inset_px(ins.bottom, vh).is_some()).then_some(y);

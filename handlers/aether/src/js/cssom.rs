@@ -1072,6 +1072,10 @@ struct Flushed {
     tree: crate::layout::LayoutTree,
     report: HashMap<NodeId, [String; 20]>,
     boxes: HashMap<NodeId, Vec<(f32, f32, f32, f32)>>,
+    /// AETHERFIT2 (SR191): every element in a `position: fixed` box's subtree, with the axes `LayoutTree::fixed_at`
+    /// pins to the viewport — its rects do not move with the scroll on those axes (applied at read time,
+    /// [`client_rect`]: this cache is keyed by DOM version, not by scroll).
+    pinned: HashMap<NodeId, (bool, bool)>,
 }
 
 thread_local! {
@@ -1096,8 +1100,8 @@ fn with_layout<R>(f: impl FnOnce(&Flushed) -> R) -> R {
             let mut tree = crate::layout::build_tree(&doc, w, h);
             crate::css::apply_stylesheets(&mut tree, &sheets);
             let report = crate::css::computed_report(&tree);
-            let boxes = element_boxes(&tree);
-            Flushed { version, tree, report, boxes }
+            let (boxes, pinned) = element_boxes(&tree);
+            Flushed { version, tree, report, boxes, pinned }
         }
     };
     let r = f(&flushed);
@@ -1105,21 +1109,38 @@ fn with_layout<R>(f: impl FnOnce(&Flushed) -> R) -> R {
     r
 }
 
-/// Every element's border-box rects in document coordinates: one rect for a block-level or atomic box,
-/// one per line fragment for an inline box.
-fn element_boxes(tree: &crate::layout::LayoutTree) -> HashMap<NodeId, Vec<(f32, f32, f32, f32)>> {
+/// Every element's border-box rects in document coordinates (one rect for a block-level or atomic box, one per line
+/// fragment for an inline box), and AETHERFIT2 (SR191) the elements a fixed box pins to the viewport, per axis: a
+/// fixed box takes its origin from `LayoutTree::fixed_at` (the one viewport-origin map the painter reads) on each
+/// pinned axis, and its subtree inherits the pin.
+#[allow(clippy::type_complexity)]
+fn element_boxes(tree: &crate::layout::LayoutTree) -> (HashMap<NodeId, Vec<(f32, f32, f32, f32)>>, HashMap<NodeId, (bool, bool)>) {
     use crate::layout::inline::Frag;
     let mut out: HashMap<NodeId, Vec<(f32, f32, f32, f32)>> = HashMap::new();
-    let mut work: Vec<(taffy::NodeId, f32, f32)> = vec![(tree.root_node, 0.0, 0.0)];
+    let mut pinned: HashMap<NodeId, (bool, bool)> = HashMap::new();
+    let mut work: Vec<(taffy::NodeId, f32, f32, (bool, bool))> = vec![(tree.root_node, 0.0, 0.0, (false, false))];
     let elem_of = |t: taffy::NodeId| tree.node_map.get(&t).filter(|n| n.is_element()).map(|n| n.id());
     // The root's own location.
     if let Ok(l) = tree.taffy.layout(tree.root_node) {
-        work[0] = (tree.root_node, l.location.x, l.location.y);
+        work[0] = (tree.root_node, l.location.x, l.location.y, (false, false));
     }
-    while let Some((t, x, y)) = work.pop() {
+    while let Some((t, mut x, mut y, mut pin)) = work.pop() {
         let Ok(l) = tree.taffy.layout(t) else { continue };
+        if let Some(&(fx, fy)) = tree.fixed_at.get(&t) {
+            if let Some(fx) = fx {
+                x = fx;
+                pin.0 = true;
+            }
+            if let Some(fy) = fy {
+                y = fy;
+                pin.1 = true;
+            }
+        }
         if let Some(id) = elem_of(t) {
             out.entry(id).or_default().push((x, y, l.size.width, l.size.height));
+            if pin != (false, false) {
+                pinned.insert(id, pin);
+            }
         }
         if let Some(il) = tree.inline.get(&t) {
             let cx = x + l.border.left + l.padding.left;
@@ -1129,9 +1150,12 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> HashMap<NodeId, Vec<(f32, 
                     Frag::Box { node, x: fx, y: fy, w, h, .. } => {
                         if let Some(id) = elem_of(*node) {
                             out.entry(id).or_default().push((cx + fx, cy + fy, *w, *h));
+                            if pin != (false, false) {
+                                pinned.insert(id, pin);
+                            }
                         }
                     }
-                    Frag::Atomic { node, x: fx, y: fy } => work.push((*node, cx + fx, cy + fy)),
+                    Frag::Atomic { node, x: fx, y: fy } => work.push((*node, cx + fx, cy + fy, pin)),
                     Frag::Text { .. } => {}
                 }
             }
@@ -1139,28 +1163,37 @@ fn element_boxes(tree: &crate::layout::LayoutTree) -> HashMap<NodeId, Vec<(f32, 
             for c in tree.taffy.children(t).unwrap_or_default() {
                 if matches!(tree.paint_map.get(&c).and_then(|p| p.position_kind), Some(2 | 3)) {
                     if let Ok(cl) = tree.taffy.layout(c) {
-                        work.push((c, x + cl.location.x, y + cl.location.y));
+                        work.push((c, x + cl.location.x, y + cl.location.y, pin));
                     }
                 }
             }
         } else {
             for c in tree.taffy.children(t).unwrap_or_default() {
                 if let Ok(cl) = tree.taffy.layout(c) {
-                    work.push((c, x + cl.location.x, y + cl.location.y));
+                    work.push((c, x + cl.location.x, y + cl.location.y, pin));
                 }
             }
         }
     }
-    out
+    (out, pinned)
+}
+
+/// AETHERFIT2 (SR191): a document-space rect of element `id` in viewport coordinates — the scroll is subtracted
+/// only on the axes a fixed box does not pin (CSS 2.2 §9.6.1: a fixed box does not move when the document scrolls).
+/// The one conversion: [`client_rects`] and [`hit_test`] both read it.
+fn client_rect(f: &Flushed, id: NodeId, r: (f32, f32, f32, f32), scroll: (f64, f64)) -> (f64, f64, f64, f64) {
+    let (px, py) = f.pinned.get(&id).copied().unwrap_or((false, false));
+    let (x, y, w, h) = r;
+    (x as f64 - if px { 0.0 } else { scroll.0 }, y as f64 - if py { 0.0 } else { scroll.1 }, w as f64, h as f64)
 }
 
 /// The border-box rects of element `el` in viewport coordinates.
 pub fn client_rects(el: usize) -> Vec<(f64, f64, f64, f64)> {
-    let (sx, sy) = page(|p| p.scroll);
+    let scroll = page(|p| p.scroll);
     with_layout(|f| {
         f.boxes
             .get(&NodeId(el))
-            .map(|v| v.iter().map(|(x, y, w, h)| (*x as f64 - sx, *y as f64 - sy, *w as f64, *h as f64)).collect())
+            .map(|v| v.iter().map(|r| client_rect(f, NodeId(el), *r, scroll)).collect())
             .unwrap_or_default()
     })
 }
@@ -1422,6 +1455,21 @@ fn box_metric(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
         let t = f.tree.node_map.iter().find(|(_, n)| n.id() == NodeId(el)).map(|(t, _)| *t);
         t.and_then(|t| f.tree.taffy.layout(t).ok()).map(|l| (l.border.top, l.border.left, l.border.right, l.border.bottom)).unwrap_or((0.0, 0.0, 0.0, 0.0))
     });
+    // AETHERFIT2 (SR191): CSSOM View §7 — the root element's clientWidth / clientHeight are the viewport's (minus
+    // any scrollbar: Aether paints none), its scrollWidth / scrollHeight the viewport's scrolling area (the
+    // document's extent, never smaller than the viewport).
+    let is_root = with_doc(|d| d.element_children(NodeId(dom::main_doc())).next() == Some(NodeId(el)));
+    if is_root && matches!(which.as_str(), "clientWidth" | "clientHeight" | "scrollWidth" | "scrollHeight") {
+        let (vw, vh) = page(|p| p.viewport);
+        let (vw, vh) = (vw as f64, vh as f64);
+        let v = match which.as_str() {
+            "clientWidth" => vw,
+            "clientHeight" => vh,
+            "scrollWidth" => document_extent().0.max(vw),
+            _ => document_extent().1.max(vh),
+        };
+        return Ok(num(v.round()));
+    }
     let v = match which.as_str() {
         "offsetWidth" => w,
         "offsetHeight" => h,
@@ -1560,12 +1608,17 @@ fn scroll_to(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 // AETHERWPT4 (SR142): CSSOM View §6.1 hit testing and §7 scrollIntoView
 // =================================================================================================
 
-/// The document's extent (the union of every box) — the scrollable overflow of the viewport.
+/// The document's extent (the union of every box) — the scrollable overflow of the viewport. AETHERFIT2 (SR191): a
+/// box a fixed box pins is not in it (css-overflow-3 §2.2: a fixed box's containing block is the viewport, so it
+/// is not part of the document's scrollable overflow).
 fn document_extent() -> (f64, f64) {
     with_layout(|f| {
         let mut w = 0f32;
         let mut h = 0f32;
-        for rs in f.boxes.values() {
+        for (id, rs) in &f.boxes {
+            if f.pinned.contains_key(id) {
+                continue;
+            }
             for (x, y, bw, bh) in rs {
                 w = w.max(x + bw);
                 h = h.max(y + bh);
@@ -1577,7 +1630,16 @@ fn document_extent() -> (f64, f64) {
 
 /// The paint layer an element is hit in: positioned boxes (and their descendants) above in-flow ones, ordered by the
 /// nearest positioned ancestor-or-self's `z-index` (CSS 2 Appendix E's stacking order, without nested contexts).
-fn paint_layer(el: usize) -> (i32, i64) {
+/// AETHERFIT2 (SR191): an element in a top-layer element's subtree is above every document layer, a later top-layer
+/// entry above an earlier one (HTML "top layer" / CSS Position 4) — `top` is the rendered top layer in order.
+fn paint_layer(el: usize, top: &[usize]) -> (i32, i64) {
+    let mut cur = Some(el);
+    while let Some(c) = cur {
+        if let Some(i) = top.iter().position(|&t| t == c) {
+            return (2, i as i64);
+        }
+        cur = with_doc(|d| d.parent_element(NodeId(c)).map(|p| p.0));
+    }
     let mut cur = Some(el);
     while let Some(c) = cur {
         let pos = computed_value(c, "position");
@@ -1599,22 +1661,37 @@ fn hit_test(x: f64, y: f64) -> Vec<usize> {
     if x < 0.0 || y < 0.0 || x > vw as f64 || y > vh as f64 || !x.is_finite() || !y.is_finite() {
         return Vec::new();
     }
-    let (sx, sy) = page(|p| p.scroll);
-    let (dx, dy) = ((x + sx) as f32, (y + sy) as f32);
+    let scroll = page(|p| p.scroll);
     let doc = dom::main_doc();
     let order: Vec<usize> = with_doc(|d| d.descendants(NodeId(doc)).filter(|i| d.element(*i).is_some()).map(|i| i.0).collect());
-    let raw: Vec<(usize, usize)> = with_layout(|f| {
-        order
+    // AETHERFIT2 (SR191): compared in CLIENT space through the one conversion (a fixed box's rect does not move with
+    // the scroll), and the top layer as rendered — the same `top_layer()` list through the same `top_layer_box` path
+    // the painter and the shell's hit test use — computed once per call.
+    let (raw, top): (Vec<(usize, usize)>, Vec<usize>) = with_layout(|f| {
+        let raw = order
             .iter()
             .enumerate()
-            .filter(|(_, id)| f.boxes.get(&NodeId(**id)).is_some_and(|rs| rs.iter().any(|(bx, by, bw, bh)| dx >= *bx && dx < bx + bw && dy >= *by && dy < by + bh)))
+            .filter(|(_, id)| {
+                f.boxes.get(&NodeId(**id)).is_some_and(|rs| {
+                    rs.iter().any(|r| {
+                        let (bx, by, bw, bh) = client_rect(f, NodeId(**id), *r, scroll);
+                        x >= bx && x < bx + bw && y >= by && y < by + bh
+                    })
+                })
+            })
             .map(|(i, id)| (i, *id))
-            .collect()
+            .collect();
+        let top = super::toplayer::top_layer()
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|&n| crate::render::top_layer_box(&f.tree, NodeId(n)).is_some())
+            .collect();
+        (raw, top)
     });
     let mut hits: Vec<((i32, i64), usize, usize)> = raw
         .into_iter()
         .filter(|(_, id)| computed_value(*id, "pointer-events") != "none" && computed_value(*id, "visibility") != "hidden")
-        .map(|(i, id)| (paint_layer(id), i, id))
+        .map(|(i, id)| (paint_layer(id, &top), i, id))
         .collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
     let mut out: Vec<usize> = hits.into_iter().map(|h| h.2).collect();

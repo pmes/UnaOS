@@ -70,3 +70,75 @@ fn fixed_box_without_insets_keeps_its_place() {
     let id = id_of(&tree, &doc.by_id("box"));
     assert_eq!(tree.fixed_at.get(&id), None, "no definite inset: no viewport origin recorded");
 }
+
+/// AETHERFIT2 (SR191): CSS 2.2 §10.1.3 — a fixed box's % `width` / `height` / `max-*` resolve against the VIEWPORT
+/// (its containing block), not its narrow, short DOM parent; the rewrite rides the fixed pass's one
+/// rewrite-then-restore step, so a second layout leaves every style as the first did.
+#[test]
+fn fixed_percent_size_resolves_against_the_viewport() {
+    let fixed = "position: fixed; left: 0; top: 0; width: 50%; height: 2000px; max-height: 100%";
+    let doc = page(vec![el(
+        "div",
+        &[("id", "parent"), ("style", "margin: 30px 0 0 50px; width: 120px; height: 10px; padding: 5px; border: 2px solid")],
+        vec![el("div", &[("id", "box"), ("style", fixed)], vec![])],
+    )]);
+    let (vw, vh) = (400.0, 300.0);
+    let mut tree = lay(&doc, vw, vh);
+    let (x, y, w, h) = box_of(&tree, &doc.by_id("box"));
+    assert_eq!((x, y), (0.0, 0.0), "pinned to the viewport's origin");
+    assert_eq!(w, vw / 2.0, "width: 50% of the viewport, not of the 120px parent");
+    assert_eq!(h, vh, "max-height: 100% of the viewport clamps the 2000px height");
+    let id = id_of(&tree, &doc.by_id("box"));
+    let st = tree.taffy.style(id).unwrap();
+    assert_eq!(st.size.width, taffy::style::Dimension::percent(0.5), "the specified % is back after the run");
+    assert_eq!(st.max_size.height, taffy::style::LengthPercentageAuto::percent(1.0));
+    let mut ids: Vec<taffy::NodeId> = tree.node_map.iter().map(|(t, _)| *t).collect();
+    ids.sort_by_key(|t| u64::from(*t));
+    let before: Vec<taffy::Style> = ids.iter().map(|t| tree.taffy.style(*t).unwrap().clone()).collect();
+    layout_core::remeasure(&mut tree, &F);
+    let after: Vec<taffy::Style> = ids.iter().map(|t| tree.taffy.style(*t).unwrap().clone()).collect();
+    assert!(before == after, "a second layout leaves every style as the first left it");
+    assert_eq!(box_of(&tree, &doc.by_id("box")), (x, y, w, h));
+}
+
+/// AETHERFIT2 (SR191): css-sizing-3 §2.1 / §3.2 — `min-content`, `max-content` and `fit-content(<length-percentage>)`
+/// parse onto taffy's own keywords; in the block axis they behave as `auto` (§3.1).
+#[test]
+fn sizing_keywords_parse_onto_taffy() {
+    let doc = page(vec![
+        el("div", &[("id", "widest"), ("style", "width: fit-content")], vec![text("bbbbbbbb")]),
+        el("div", &[("id", "min"), ("style", "width: min-content")], vec![text("aa bbbbbbbb c")]),
+        el("div", &[("style", "width: 100px")], vec![el("div", &[("id", "max"), ("style", "width: max-content")], vec![text("word word word word word word")])]),
+        el("div", &[("id", "oneline"), ("style", "width: fit-content")], vec![text("word word word word word word")]),
+        el("div", &[("id", "fill")], vec![text("word word")]),
+        el("div", &[("id", "two"), ("style", "width: fit-content")], vec![text("word word")]),
+        el("div", &[("id", "fit200"), ("style", "width: fit-content(200px)")], vec![text("word word")]),
+        el("div", &[("id", "fit50"), ("style", "width: fit-content(50%)")], vec![text("word word")]),
+        el("div", &[("id", "bad"), ("style", "width: fit-content(red)")], vec![text("word word")]),
+        el("div", &[("id", "autoh"), ("style", "width: 100px")], vec![text("aa bb cc dd ee ff gg hh")]),
+        el("div", &[("id", "minh"), ("style", "width: 100px; height: min-content")], vec![text("aa bb cc dd ee ff gg hh")]),
+        el("div", &[("id", "fith"), ("style", "width: 100px; height: fit-content(5px)")], vec![text("aa bb cc dd ee ff gg hh")]),
+    ]);
+    let tree = lay(&doc, 400.0, 300.0);
+    let w = |id: &str| box_of(&tree, &doc.by_id(id)).2;
+    let h = |id: &str| box_of(&tree, &doc.by_id(id)).3;
+    assert!(w("widest") > 0.0);
+    assert_eq!(w("min"), w("widest"), "min-content: the widest word");
+    // max-content: one line, overflowing its 100px container (layout_core's text measure caps a max-content line
+    // at the viewport width — this text is shorter than the viewport, so the cap does not bite).
+    assert!(w("max") > 100.0, "max-content overflows its container: {}", w("max"));
+    assert_eq!(w("max"), w("oneline"), "max-content: the text's one-line width");
+    // fit-content(<length-percentage>) = min(max-content, max(min-content, the argument)): under a 200px / 50% limit
+    // a two-word text takes its max-content, where the line-filling auto width takes the container. (The clamp of
+    // a text WIDER than the argument is owed: layout_core's IFC-root measure lays a content-sized box at its
+    // max-content, capped at the viewport, whatever the definite available width — the bare `fit-content` keyword
+    // shares it.)
+    assert!(w("fill") > 300.0, "auto fills the line: {}", w("fill"));
+    assert!(w("two") < 100.0, "fit-content: max-content {}", w("two"));
+    assert_eq!(w("fit200"), w("two"), "fit-content(200px) parses onto taffy's keyword");
+    assert_eq!(w("fit50"), w("two"), "fit-content(50%) parses onto taffy's keyword");
+    assert_eq!(w("bad"), w("fill"), "an invalid fit-content() argument drops the declaration");
+    assert!(h("autoh") > 0.0);
+    assert_eq!(h("minh"), h("autoh"), "a block-axis min-content behaves as auto");
+    assert_eq!(h("fith"), h("autoh"), "a block-axis fit-content() behaves as auto");
+}

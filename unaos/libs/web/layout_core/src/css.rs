@@ -590,8 +590,10 @@ pub fn apply_declaration<H: Host>(prop: &str, value: &str, style: &mut Specified
                 style.paint.pct_math = Some(m);
             }
             if i == 0 {
-                // AETHERFIT (SR189): a `fit-content` width is content-sized, like `auto` (css-sizing-3 §5.2).
-                style.paint.has_width = Some(!matches!(value.trim(), "auto" | "fit-content"));
+                // AETHERFIT (SR189) / AETHERFIT2 (SR191): a sizing-keyword width (fit-content, min-content,
+                // max-content, fit-content()) is content-sized, like `auto` (css-sizing-3 §5.2).
+                style.paint.has_width =
+                    Some(!(value.trim() == "auto" || d.is_some_and(|d| d.into_raw().is_sizing_keyword())));
             }
             match i {
                 0 => style.width = d,
@@ -3338,6 +3340,22 @@ pub fn parse_dimension_str(value: &str, cx: &ParseCx) -> Option<Dimension> {
     // min(max-content, max(min-content, the stretch-fit size)), and abspos auto margins centre against it).
     if v == "fit-content" {
         return Some(Dimension::fit_content());
+    }
+    // AETHERFIT2 (SR191): css-sizing-3 §2.1 / §3.2 the other sizing keywords, onto taffy's own — `min-content`,
+    // `max-content` and `fit-content(<length-percentage>)` (min(max-content, max(min-content, the argument))).
+    // On `min-*` / `max-*` they fold to auto through `lpa` (taffy's min/max sizes cannot hold a keyword).
+    match v {
+        "min-content" => return Some(Dimension::min_content()),
+        "max-content" => return Some(Dimension::max_content()),
+        _ => {}
+    }
+    if let Some(arg) = v.strip_prefix("fit-content(").and_then(|r| r.strip_suffix(')')) {
+        let raw = parse_length_percentage_str(arg, cx)?.into_raw();
+        return match raw.tag() {
+            taffy::style::CompactLength::LENGTH_TAG => Some(Dimension::fit_content_px(raw.value())),
+            taffy::style::CompactLength::PERCENT_TAG => Some(Dimension::fit_content_percent(raw.value())),
+            _ => None,
+        };
     }
     if let Some(pct) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
         return Some(Dimension::percent(pct / 100.0));

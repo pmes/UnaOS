@@ -628,7 +628,9 @@ fn click_op(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
 
 fn focus_op(vm: &mut Vm, ctx: &CallCtx) -> JsResult<Value> {
     let el = this_html(vm, ctx)?;
-    if !dom::is_connected(el) {
+    // AETHERFIT2 (SR191): HTML §6.6.3 — an inert node is not a focusable area, so `focus()` on one (a modal
+    // dialog's blocked document, the dialog focusing steps included) REFUSES; it is never retargeted.
+    if !dom::is_connected(el) || super::toplayer::is_inert(el) {
         return Ok(Value::Undefined);
     }
     let old = page(|p| p.focused);

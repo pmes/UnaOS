@@ -738,10 +738,7 @@ impl AetherEngine {
         let hit = self.hit_test_at(x, y);
         // AETHERFIT (SR189): an inert hit is retargeted (HTML §6.3) BEFORE the hover path, so the boundary events
         // fire once at the modal dialog rather than once per inert element.
-        let target = hit.as_ref().map(|(n, _)| {
-            let r = js::toplayer::retarget(n.id().0);
-            if r == n.id().0 { n.clone() } else { n.node_at(html_core::NodeId(r)) }
-        });
+        let target = hit.as_ref().map(|(n, _)| retargeted(n));
         let new_path: Vec<crate::dom::NodeRef> = match &target {
             Some(t) => std::iter::once(t.clone()).chain(t.ancestors().filter(|a| a.is_element())).collect(),
             None => Vec::new(),
@@ -920,7 +917,12 @@ impl AetherEngine {
                     crate::dom::a11y::focus::set_starting_point(None);
                     return;
                 };
-                crate::dom::a11y::focus::set_starting_point(Some(node.clone())); // AETHERA11Y (SR119): HTML §6.6.3
+                // AETHERFIT2 (SR191): the defaults below (the focus starting point, media, the link / control / label
+                // walk) run on the RETARGETED hit — a click on a modal dialog's inert document lands on the dialog
+                // (HTML §6.3). The JS dispatch keeps the raw hit: `user_button` / `click_with_activation` retarget
+                // themselves, and light dismiss (`closedby=any`) needs to know the click fell outside the dialog.
+                let def = retargeted(&node);
+                crate::dom::a11y::focus::set_starting_point(Some(def.clone())); // AETHERA11Y (SR119): HTML §6.6.3
                 // Script click handlers run first (bubbling); a handled
                 // click still follows links, matching default behavior.
                 // The click's activation behavior runs here too: a checkbox
@@ -942,11 +944,11 @@ impl AetherEngine {
                 // A click on (or inside) a media element toggles it:
                 // play (PlayMedia toward Stria — the page's own stream,
                 // no site code) when not playing, MediaPause when it is.
-                media::toggle(&node);
+                media::toggle(&def);
                 // The hit is the DEEPEST box — usually the text run
                 // inside the link or the button — so walk ancestors for
                 // the element whose default action the click runs.
-                let mut cur = Some(node.clone());
+                let mut cur = Some(def);
                 while let Some(n) = cur {
                     if let Some(el) = n.as_element() {
                         match el.name.local.as_ref() {
@@ -2590,4 +2592,12 @@ impl AetherEngine {
             self.key_event("keyup", &shell);
         }
     }
+}
+
+/// AETHERFIT2 (SR191): the node an input event's DEFAULTS act on — `toplayer::retarget` (HTML §6.3: a hit on a
+/// modal dialog's inert document goes to the dialog) mapped back to a node of the same document. The one place the
+/// shell converts the retarget (`pointer_moved`'s hover path and MouseUp's defaults).
+fn retargeted(n: &crate::dom::NodeRef) -> crate::dom::NodeRef {
+    let r = js::toplayer::retarget(n.id().0);
+    if r == n.id().0 { n.clone() } else { n.node_at(html_core::NodeId(r)) }
 }
