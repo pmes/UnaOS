@@ -19,3 +19,5 @@ default = []
 gtk = ["quartzite/gtk"]
 gnome = ["quartzite/gnome"]
 qt = ["quartzite/qt"]
+# AETHERMAC (SR196): names the AppKit face for the run line; Quartzite selects AppKit by target_os.
+macos = ["quartzite/macos"]
