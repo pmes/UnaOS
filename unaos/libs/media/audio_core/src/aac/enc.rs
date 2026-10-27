@@ -22,8 +22,22 @@
 //!   `ATTACK_MIN`: `grouping`); the spectrum is interleaved into the decoder's group → band → window order (`interleave`),
 //!   so a group's band is one range sharing one scalefactor and codebook. M/S (AACENCSHORT): a stereo frame is always a
 //!   CPE with `common_window` 1; a band goes M/S when its perceptual-entropy estimate is lower that way (`ms_decide`),
-//!   ms_mask_present 0/1/2. Not built: TNS, PNS, intensity, SBR, a bit reservoir.
-//! * THE QUANTISER (the two loops): a per-band threshold from the band's energy at a fixed SNR offset (floored at an
+//!   ms_mask_present 0/1/2. Not built: PNS, intensity, SBR.
+//! * TNS (AACENCTNS, LEDGER SR381; §4.6.9): on the blocks around an attack (LONG_START / EIGHT_SHORT / LONG_STOP: the
+//!   attack gate; a stationary ONLY_LONG block carries none), per channel per window, the spectrum from `TNS_START_HZ` to
+//!   the decoder's `TNS_MAX_BANDS` limit is LPC-analysed (Levinson-Durbin, order <= 12 long / 7 short) and, where the
+//!   prediction gain exceeds `TNS_GAIN` 1.4, its parcor coefficients are quantised (4 / 3 bits), turned into the filter by
+//!   the decoder's own `tns_lpc` and the spectrum replaced by the residual before the two loops (`tns_window`); the
+//!   decoder's `spectral_tools` synthesis inverts it exactly. The thresholds are taken from the unfiltered spectrum and
+//!   divided by the synthesis filter's noise gain.
+//! * THE PSY MODEL (AACENCTNS, LEDGER SR381; `allowed`): the band energies spread by a two-slope Bark function (3GPP TS
+//!   26.403: `SPREAD_LO_DB` 30 / `SPREAD_HI_DB` 15 dB per Bark, one `Spread` table per block type built in `new`), under a
+//!   spectral-flatness tonality offset (`TONAL_DB` 18 for a tonal band, `NOISE_DB` 6 for a flat one). A band under the
+//!   floor below is not coded; a band the model masks keeps a base scalefactor (never coarser than the last that codes
+//!   anything) the inner loop's spare bits reach (the seat's ruling: with the masked bands dropped, the 1 kHz tone fell to
+//!   36.7 dB). THE BIT RESERVOIR: a frame borrows the bits earlier frames left (capped at `AU_MAX_BITS` a channel) and
+//!   banks the mean frame less its real bits, so a silent frame funds the next transient and the mean bitrate holds.
+//! * THE QUANTISER (the two loops): a per-band threshold from the psy model (floored at an
 //!   absolute level and at the frame's mask floor, `MASK_DB` under its loudest band per coefficient, so a tone's window
 //!   leakage is not coded at the tone's SNR; measured on `aac_enc_sine_snr`'s 1 kHz tone at 128 kb/s stereo, 1356 bits a
 //!   channel: MASK_DB 40 -> 40.2 dB at 75 B/frame, 50 -> 49.6 dB at 155 B, 60 (taken) -> 56.8 dB at 247 B; with no floor
@@ -56,12 +70,31 @@ pub struct AccessUnit {
     pub pts: u64,
 }
 
-/// Fixed signal-to-mask offset of the per-band threshold (dB) and its absolute floor (noise energy per coefficient,
-/// i16 units: well under one LSB of white noise, which is ~4096 in this spectrum's scale).
-const SNR_DB: f64 = 18.0;
+/// The psy model's signal-to-mask offsets (AACENCTNS, LEDGER SR381): a tonal band's (SR378's fixed SNR_DB 18) and a
+/// noise-like band's (dB), the spectral flatness that counts as fully tonal (Johnston, dB), and the absolute floor
+/// (noise energy per coefficient, i16 units: well under one LSB of white noise, which is ~4096 in this spectrum's scale).
+const TONAL_DB: f64 = 18.0;
+const NOISE_DB: f64 = 6.0;
+const SFM_TONAL_DB: f64 = -60.0;
 const ATH: f64 = 1000.0;
-/// The frame's mask floor: no band's noise need sit lower than this many dB under the loudest band (per coefficient).
+/// The two-slope Bark spreading (3GPP TS 26.403's AAC psy model): dB per Bark toward lower bands and toward higher.
+const SPREAD_LO_DB: f64 = 30.0;
+const SPREAD_HI_DB: f64 = 15.0;
+/// The frame's mask floor: no band's noise need sit lower than this many dB under the loudest band (per coefficient);
+/// AACENCTNS keeps it as the floor under the spread threshold.
 const MASK_DB: f64 = 60.0;
+/// TNS (§4.6.9, AACENCTNS): a filter where the spectrum's prediction gain exceeds TNS_GAIN, of order at most
+/// TNS_ORDER_LONG / TNS_ORDER_SHORT, over the bands from TNS_START_HZ to the TNS_MAX_BANDS table's limit.
+const TNS_GAIN: f64 = 1.4;
+const TNS_ORDER_LONG: usize = 12;
+const TNS_ORDER_SHORT: usize = 7;
+const TNS_START_HZ: f64 = 1500.0;
+/// The largest frame a channel may spend (bits, the decoder's input buffer, §4.5.3): the bit reservoir's bound.
+const AU_MAX_BITS: usize = 6144;
+/// The frame's bits outside the channels' budget: element id + tag (+ common_window), ID_END, the alignment; and room
+/// for the largest M/S mask.
+const FRAME_OVERHEAD: usize = 3 + 4 + 1 + 3 + 7;
+const MS_MASK_MAX: usize = 128;
 /// The largest quantised magnitude the escape codebook carries (§4.6.1: 8191).
 const MAX_Q: i32 = 8191;
 /// window_sequence values (§4.6.11, the decoder's).
@@ -191,10 +224,20 @@ pub struct Encoder {
     ms: bool,
     group: bool,
     cpe: bool,
+    /// AACENCTNS (LEDGER SR381): the spreading tables (long, short), the bit reservoir (bits banked, its bound, a frame's
+    /// largest set budget over all channels), TNS and the reservoir on (KAT switches), the windows the last unit filtered
+    spread_l: Spread,
+    spread_s: Spread,
+    res: usize,
+    res_max: usize,
+    au_max: usize,
+    tns: bool,
+    reservoir: bool,
+    tns_windows: u8,
 }
 
 impl Encoder {
-    /// `bitrate` in bits per second (the frame budget; there is no reservoir). Refused: a rate that is not an AAC
+    /// `bitrate` in bits per second (the mean frame budget; frames borrow from the bit reservoir, AACENCTNS). Refused: a rate that is not an AAC
     /// sampling rate, more than two channels, a zero bitrate.
     pub fn new(rate: u32, channels: u16, bitrate: u32) -> Result<Encoder> {
         let sf_index = super::RATES.iter().position(|&r| r == rate).ok_or(Error::Unsupported("aac-enc: sample rate (not an AAC rate)"))?;
@@ -203,7 +246,8 @@ impl Encoder {
         let ch = channels as usize;
         let total = (bitrate as u64 * FRAME as u64 / rate as u64) as usize;
         // frame overhead: element id + tag (+ common_window), ID_END, the alignment
-        let budget = (total.saturating_sub(3 + 4 + 1 + 3 + 7) / ch).clamp(64, 6144 - 16);
+        let budget = (total.saturating_sub(FRAME_OVERHEAD) / ch).clamp(64, 6144 - 16);
+        let au_max = (AU_MAX_BITS * ch).saturating_sub(FRAME_OVERHEAD + MS_MASK_MAX);
         let bpc = bitrate / channels as u32;
         let cutoff = match bpc { b if b >= 96_000 => 20_000, b if b >= 64_000 => 16_000, b if b >= 48_000 => 14_000, b if b >= 32_000 => 11_000, b if b >= 24_000 => 8_000, _ => 6_000 }.min(rate / 2);
         let bin = (cutoff as u64 * 2 * FRAME as u64 / rate as u64) as u16;
@@ -240,6 +284,14 @@ impl Encoder {
             ms: true,
             group: true,
             cpe: true,
+            spread_l: spread_table(swb, rate as f64 / 2048.0),
+            spread_s: spread_table(swb_s, rate as f64 / 256.0),
+            res: 0,
+            res_max: au_max.saturating_sub(budget * ch),
+            au_max,
+            tns: true,
+            reservoir: true,
+            tns_windows: 0,
         })
     }
 
@@ -429,6 +481,9 @@ impl Encoder {
         self.prev_seq = seq;
         let g = self.grid(seq, &env);
         let mut x: Vec<Vec<f32>> = Vec::with_capacity(ch);
+        let mut allowed: Vec<Vec<f64>> = Vec::with_capacity(ch);
+        let mut floors: Vec<Vec<f64>> = Vec::with_capacity(ch);
+        let mut tns: Vec<TnsSide> = Vec::with_capacity(ch);
         for c in 0..ch {
             let mut raw = vec![0f32; 2048];
             for i in 0..FRAME {
@@ -437,17 +492,30 @@ impl Encoder {
                 raw[FRAME + i] = s;
                 self.hist[c][i] = s;
             }
-            let s = self.analyse(seq, &raw);
-            x.push(if g.short { interleave(&s, &g) } else { s });
+            let mut s = self.analyse(seq, &raw);
+            // AACENCTNS: the thresholds from the unfiltered spectrum, then TNS on the window-major spectrum, the thresholds
+            // of the filtered bands lowered by the synthesis filter's noise gain
+            let orig = if g.short { interleave(&s, &g) } else { s.clone() };
+            let (mut a, mut fl) = self.allowed(&orig, &g);
+            // the attack gate (3GPP): TNS only on the blocks around an attack, never on a stationary ONLY_LONG block
+            let t = if self.tns && seq != ONLY_LONG { self.tns_block(&mut s, &g) } else { TnsSide::none(g.short) };
+            t.lift(&mut a, &g);
+            t.lift(&mut fl, &g);
+            x.push(if !t.any() { orig } else if g.short { interleave(&s, &g) } else { s });
+            allowed.push(a);
+            floors.push(fl);
+            tns.push(t);
         }
-        let mut allowed: Vec<Vec<f64>> = x.iter().map(|s| self.allowed(s, &g)).collect();
+        self.tns_windows = tns.iter().map(|t| t.order.iter().filter(|&&o| o > 0).count() as u8).sum();
         let ms = if ch == 2 && self.ms { ms_decide(&mut x, &mut allowed, &g) } else { vec![false; g.bands()] };
-        let mut coded: Vec<Coded> = self.code(&x, &g, &allowed);
+        let side: Vec<usize> = tns.iter().map(|t| t.bits()).collect();
+        let borrow = if self.reservoir { self.res } else { 0 };
+        let mut coded: Vec<Coded> = self.code(&x, &g, &allowed, &floors, &side, borrow);
         let mut w = Bits::new();
         if ch == 1 {
             w.put(3, super::decoder::ID_SCE);
             w.put(4, 0);
-            write_ics(&mut w, &coded[0], &g, Some(seq));
+            write_ics(&mut w, &coded[0], &g, Some(seq), &tns[0]);
         } else {
             let m = coded[0].max_sfb.max(coded[1].max_sfb);
             for c in coded.iter_mut() { c.pad(m, g.ng); }
@@ -460,43 +528,93 @@ impl Encoder {
             let present = if !used.iter().any(|&u| u) { 0 } else if used.iter().all(|&u| u) { 2 } else { 1 };
             w.put(2, present);
             if present == 1 { for &u in &used { w.put(1, u as u32); } }
-            write_ics(&mut w, &coded[0], &g, None);
-            write_ics(&mut w, &coded[1], &g, None);
+            write_ics(&mut w, &coded[0], &g, None, &tns[0]);
+            write_ics(&mut w, &coded[1], &g, None, &tns[1]);
         }
         w.put(3, super::decoder::ID_END);
         let au = AccessUnit { data: w.finish(), pts: self.units * FRAME as u64 };
+        // AACENCTNS: the reservoir banks the mean frame less the unit's REAL bits (the M/S mask and alignment included)
+        if self.reservoir { self.res = (self.res + self.budget * ch + FRAME_OVERHEAD).saturating_sub(au.data.len() * 8).min(self.res_max); }
         self.units += 1;
         au
     }
 
-    /// Per band of the grid, the noise energy it may carry: its energy at the fixed SNR offset, floored at the absolute
-    /// level and at the frame's mask floor (`MASK_DB` under its loudest band per coefficient).
-    fn allowed(&self, x: &[f32], g: &Grid) -> Vec<f64> {
+    /// The psy model (AACENCTNS, LEDGER SR381): per band of the grid, the noise energy it may carry — the band energies
+    /// spread across each group's bands by the block type's two-slope Bark table (`Spread`, the max of each band's own
+    /// and its neighbours' attenuated), under a tonality offset from the band's spectral flatness (`TONAL_DB` for a tonal
+    /// band, `NOISE_DB` for a flat one), floored at the absolute level and at the frame's mask floor (`MASK_DB` under its
+    /// loudest band per coefficient). Also returned: that floor alone per band (the outer loop's coded-or-not line, the
+    /// seat's ruling (B): a band the model masks is still coded when spare bits reach it).
+    fn allowed(&self, x: &[f32], g: &Grid) -> (Vec<f64>, Vec<f64>) {
         let nb = g.bands();
+        let sp = if g.short { &self.spread_s } else { &self.spread_l };
         let energy: Vec<f64> = (0..nb).map(|i| { let (lo, hi) = g.rng(i); x[lo..hi].iter().map(|&v| v as f64 * v as f64).sum() }).collect();
-        let floor = (0..nb).map(|i| { let (lo, hi) = g.rng(i); energy[i] / (hi - lo) as f64 }).fold(0f64, f64::max) * math::exp2(-MASK_DB / 10.0 * core::f64::consts::LOG2_10);
-        (0..nb).map(|i| {
+        let floor = (0..nb).map(|i| { let (lo, hi) = g.rng(i); energy[i] / (hi - lo) as f64 }).fold(0f64, f64::max) * db(-MASK_DB);
+        let mut s = energy.clone();
+        for gi in 0..g.ng {
+            let o = gi * g.nb;
+            for b in 1..g.nb { s[o + b] = s[o + b].max(s[o + b - 1] * sp.up[b]); }
+            for b in (0..g.nb.saturating_sub(1)).rev() { s[o + b] = s[o + b].max(s[o + b + 1] * sp.down[b]); }
+        }
+        let fl: Vec<f64> = (0..nb).map(|i| { let (lo, hi) = g.rng(i); ATH.max(floor) * (hi - lo) as f64 }).collect();
+        let a = (0..nb).map(|i| {
             let (lo, hi) = g.rng(i);
-            (energy[i] * math::exp2(-SNR_DB / 10.0 * core::f64::consts::LOG2_10)).max((ATH.max(floor)) * (hi - lo) as f64)
-        }).collect()
+            let n = (hi - lo) as f64;
+            // spectral flatness: geometric over arithmetic mean of the coefficients' energies (+1: no log of zero)
+            let geo = x[lo..hi].iter().map(|&v| math::ln(v as f64 * v as f64 + 1.0)).sum::<f64>() / n;
+            let sfm = 10.0 * math::log10(math::exp(geo) / (energy[i] / n + 1.0));
+            let alpha = (sfm / SFM_TONAL_DB).clamp(0.0, 1.0);
+            let off = NOISE_DB + alpha * (TONAL_DB - NOISE_DB);
+            (s[i] * db(-off)).max(fl[i])
+        }).collect();
+        (a, fl)
+    }
+
+    /// TNS (§4.6.9, AACENCTNS) over a block's window-major spectrum `s`, each window analysed and filtered in place.
+    fn tns_block(&self, s: &mut [f32], g: &Grid) -> TnsSide {
+        let mut side = TnsSide::none(g.short);
+        let (bins, num_swb, max_bands, order, res_bits) = if g.short {
+            (128usize, t::NUM_SWB_128[self.sf_index] as usize, t::TNS_MAX_BANDS_128[self.sf_index] as usize, TNS_ORDER_SHORT, 3u32)
+        } else {
+            (1024usize, t::NUM_SWB_1024[self.sf_index] as usize, t::TNS_MAX_BANDS_1024[self.sf_index] as usize, TNS_ORDER_LONG, 4u32)
+        };
+        let hz = self.rate as f64 / (2.0 * bins as f64);
+        let start = (0..num_swb).find(|&b| g.swb[b] as f64 * hz >= TNS_START_HZ).unwrap_or(num_swb);
+        let end = max_bands.min(g.nb);
+        if end <= start { return side; }
+        side.length = (num_swb - start) as u8;
+        side.bands = (start, end);
+        let (lo, hi) = (g.swb[start] as usize, g.swb[end] as usize);
+        for w in 0..if g.short { 8 } else { 1 } {
+            if let Some((p, idx, gain)) = tns_window(&mut s[w * bins..(w + 1) * bins], lo, hi, order, res_bits) {
+                side.order[w] = p as u8;
+                side.idx[w] = idx;
+                side.gain[w] = gain;
+            }
+        }
+        side
     }
 
     /// The two loops on the channels' spectra over the grid, each band held under its `allowed` noise: the OUTER loop per
     /// channel, the INNER loop per budget set — every channel in ONE set against `budget · channels` (AACENCGROUPING: a
     /// CPE's common global offset, so an M/S frame spends S's leftover on M), or with `cpe` off one set per channel.
-    fn code(&self, xs: &[Vec<f32>], g: &Grid, allowed: &[Vec<f64>]) -> Vec<Coded> {
+    /// AACENCTNS: a set's budget also borrows its share of the reservoir's `borrow` bits (capped at the AU max) and pays
+    /// its channels' TNS `side` bits.
+    fn code(&self, xs: &[Vec<f32>], g: &Grid, allowed: &[Vec<f64>], floors: &[Vec<f64>], side: &[usize], borrow: usize) -> Vec<Coded> {
         let nb = g.bands();
         let mut aa: Vec<Vec<f32>> = Vec::with_capacity(xs.len());
         let mut bases: Vec<Vec<Option<(i32, i32)>>> = Vec::with_capacity(xs.len());
-        for (x, allowed) in xs.iter().zip(allowed) {
+        for ((x, allowed), floor) in xs.iter().zip(allowed).zip(floors) {
             let a: Vec<f32> = x.iter().map(|&v| math::pow(v.abs() as f64, 0.75) as f32).collect();
-            // the OUTER loop: per band, the coarsest scalefactor within its threshold (None: the band is not coded)
+            // the OUTER loop: per band, the coarsest scalefactor within its threshold, never coarser than the last that codes
+            // anything (None: the band is under the floor, not coded — AACENCTNS ruling (B): a masked band over the floor
+            // keeps a base the inner loop's spare bits reach)
             let mut base: Vec<Option<(i32, i32)>> = Vec::with_capacity(nb); // (sf, the finest sf without overflow)
             for i in 0..nb {
                 let (lo, hi) = g.rng(i);
                 let e: f64 = x[lo..hi].iter().map(|&v| v as f64 * v as f64).sum();
                 let allowed = allowed[i];
-                if e <= allowed { base.push(None); continue; }
+                if e <= floor[i] { base.push(None); continue; }
                 // the finest legal sf: |q| <= MAX_Q (maxq falls as sf rises)
                 let (mut l, mut h) = (0i32, 255i32);
                 while l < h { let m = (l + h) / 2; if self.band(x, &a, lo, hi, m).1 <= MAX_Q { h = m; } else { l = m + 1; } }
@@ -504,7 +622,11 @@ impl Encoder {
                 // the coarsest sf whose noise stays under the threshold
                 let (mut l, mut h) = (fine, 255i32);
                 while l < h { let m = (l + h + 1) / 2; if self.band(x, &a, lo, hi, m).0 <= allowed { l = m; } else { h = m - 1; } }
-                base.push(Some((l, fine)));
+                let coarse = l;
+                // the coarsest sf that still codes a nonzero value (binds only on a band the model masks)
+                let (mut l, mut h) = (fine, 255i32);
+                while l < h { let m = (l + h + 1) / 2; if self.band(x, &a, lo, hi, m).1 >= 1 { l = m; } else { h = m - 1; } }
+                base.push(Some((coarse.min(l), fine)));
             }
             aa.push(a);
             bases.push(base);
@@ -512,7 +634,7 @@ impl Encoder {
         let sets: Vec<Vec<usize>> = if self.cpe { vec![(0..xs.len()).collect()] } else { (0..xs.len()).map(|c| vec![c]).collect() };
         let mut out: Vec<Coded> = Vec::with_capacity(xs.len());
         for set in &sets {
-            let budget = self.budget * set.len();
+            let budget = (self.budget * set.len() + borrow / sets.len()).min(self.au_max * set.len() / xs.len()).saturating_sub(set.iter().map(|&c| side[c]).sum::<usize>());
             let run = |gofs: i32, top: usize| -> Vec<Coded> { set.iter().map(|&c| self.plan(&xs[c], &aa[c], &bases[c], gofs, g, top)).collect() };
             let bits = |cs: &[Coded]| cs.iter().map(|c| c.bits).sum::<usize>();
             // the INNER loop: the smallest global offset whose frame fits the budget
@@ -709,9 +831,9 @@ fn write_info(w: &mut Bits, seq: u8, max_sfb: usize, grouping: u32) {
 }
 
 /// individual_channel_stream (§4.4.2.7): the ics_info when `info` (an SCE; a common_window CPE wrote it once), no pulse
-/// / TNS / gain control; section data and scalefactors per group, spectral data group → band → window (one range of
+/// or gain control, the channel's tns_data when it filtered (AACENCTNS); section data and scalefactors per group, spectral data group → band → window (one range of
 /// the interleaved block per group band: the decoder's per-window reads concatenated).
-fn write_ics(w: &mut Bits, c: &Coded, g: &Grid, info: Option<u8>) {
+fn write_ics(w: &mut Bits, c: &Coded, g: &Grid, info: Option<u8>, tns: &TnsSide) {
     w.put(8, c.global_gain as u32);
     if let Some(seq) = info { write_info(w, seq, c.max_sfb, g.bits); }
     let m = c.max_sfb;
@@ -738,7 +860,8 @@ fn write_ics(w: &mut Bits, c: &Coded, g: &Grid, info: Option<u8>) {
         }
     }
     w.put(1, 0); // pulse_data_present
-    w.put(1, 0); // tns_data_present
+    w.put(1, tns.any() as u32); // tns_data_present (AACENCTNS)
+    if tns.any() { tns.write(w); }
     w.put(1, 0); // gain_control_data_present
     for grp in 0..g.ng {
         for b in 0..m {
@@ -812,6 +935,137 @@ fn write_band(w: &mut Bits, cb: u8, q: &[i32]) {
         }
     }
 }
+
+// ── AACENCTNS (LEDGER SR381): TNS analysis, the spreading tables ──
+
+/// dB to a power ratio.
+fn db(x: f64) -> f64 { math::exp2(x / 10.0 * core::f64::consts::LOG2_10) }
+
+/// One channel's TNS side data for a block (§4.4.2.7 tns_data): one upward filter per window that has one (order 0:
+/// n_filt 0), over the bands `bands` (length = num_swb − start: the decoder's top is num_swb); the quantised parcor
+/// indices and the synthesis filter's noise gain per window.
+struct TnsSide {
+    short: bool,
+    length: u8,
+    bands: (usize, usize),
+    order: [u8; 8],
+    idx: [[i32; 12]; 8],
+    gain: [f64; 8],
+}
+
+impl TnsSide {
+    fn none(short: bool) -> TnsSide { TnsSide { short, length: 0, bands: (0, 0), order: [0; 8], idx: [[0; 12]; 8], gain: [1.0; 8] } }
+    fn any(&self) -> bool { self.order.iter().any(|&o| o > 0) }
+    fn windows(&self) -> usize { if self.short { 8 } else { 1 } }
+    /// Bits of tns_data (the present flag is `plan`'s): per window n_filt, then coef_res, length, order, direction,
+    /// coef_compress and the indices of its one filter.
+    fn bits(&self) -> usize {
+        if !self.any() { return 0; }
+        let (nf, len, ord, res) = if self.short { (1, 4, 3, 3) } else { (2, 6, 5, 4) };
+        (0..self.windows()).map(|w| { let o = self.order[w] as usize; nf + if o > 0 { 1 + len + ord + 2 + res * o } else { 0 } }).sum()
+    }
+    fn write(&self, w: &mut Bits) {
+        let (nf, len, ord, res) = if self.short { (1, 4, 3, 3u32) } else { (2, 6, 5, 4u32) };
+        for win in 0..self.windows() {
+            let o = self.order[win] as usize;
+            w.put(nf, (o > 0) as u32);
+            if o == 0 { continue; }
+            w.put(1, if self.short { 0 } else { 1 }); // coef_res: 3 bits short, 4 long
+            w.put(len, self.length as u32);
+            w.put(ord, o as u32);
+            w.put(1, 0); // direction: upward
+            w.put(1, 0); // coef_compress
+            for &v in &self.idx[win][..o] { w.put(res, (v as u32) & ((1 << res) - 1)); }
+        }
+    }
+    /// The thresholds of the grid's bands inside the filtered range divided by the synthesis filter's noise gain (a
+    /// short group: the largest of its filtered windows').
+    fn lift(&self, a: &mut [f64], g: &Grid) {
+        if !self.any() { return; }
+        let mut w0 = 0;
+        for gi in 0..g.ng {
+            let gl = g.glen[gi];
+            let gain = (w0..w0 + gl).filter(|&w| self.order[w] > 0).map(|w| self.gain[w]).fold(1f64, f64::max);
+            for b in self.bands.0..self.bands.1.min(g.nb) { a[gi * g.nb + b] /= gain; }
+            w0 += gl;
+        }
+    }
+}
+
+/// TNS on one window's spectrum `x` over `lo..hi`: the autocorrelation, Levinson-Durbin to `order` parcor coefficients,
+/// and where the prediction gain exceeds `TNS_GAIN`, the coefficients quantised to `res_bits` (trailing zeros trim the
+/// order), turned into the LPC by the decoder's own `tns_lpc`, and the spectrum replaced by the prediction residual
+/// (the FIR inverse of the decoder's all-pole synthesis, from the top down). Returns (order, indices, the synthesis
+/// filter's noise gain Σh²).
+fn tns_window(x: &mut [f32], lo: usize, hi: usize, order: usize, res_bits: u32) -> Option<(usize, [i32; 12], f64)> {
+    let n = hi.saturating_sub(lo);
+    if n <= 2 * order { return None; }
+    let mut r = [0f64; 13];
+    for (k, rk) in r.iter_mut().enumerate().take(order + 1) {
+        *rk = (lo..hi - k).map(|i| x[i] as f64 * x[i + k] as f64).sum();
+    }
+    if r[0] <= 0.0 { return None; }
+    let mut a = [0f64; 13];
+    a[0] = 1.0;
+    let mut k = [0f64; 12];
+    let mut err = r[0];
+    for m in 1..=order {
+        let acc = r[m] + (1..m).map(|i| a[i] * r[m - i]).sum::<f64>();
+        let km = (-acc / err).clamp(-0.9999, 0.9999);
+        let prev = a;
+        for i in 1..m { a[i] = prev[i] + km * prev[m - i]; }
+        a[m] = km;
+        k[m - 1] = km;
+        err *= 1.0 - km * km;
+        if err <= 0.0 { return None; }
+    }
+    if r[0] / err <= TNS_GAIN { return None; }
+    let half = (1i32 << (res_bits - 1)) as f64;
+    let (iqfac, iqfac_m) = ((half - 0.5) / (core::f64::consts::PI / 2.0), (half + 0.5) / (core::f64::consts::PI / 2.0));
+    let mut idx = [0i32; 12];
+    for m in 0..order {
+        let asin = math::atan(k[m] / math::sqrt(1.0 - k[m] * k[m]));
+        let q = math::round(asin * if k[m] >= 0.0 { iqfac } else { iqfac_m }) as i32;
+        idx[m] = q.clamp(-(half as i32), half as i32 - 1);
+    }
+    let p = (0..order).rev().find(|&m| idx[m] != 0).map(|m| m + 1)?;
+    let lpc = super::decoder::tns_lpc(&idx[..p], res_bits);
+    for i in (lo..hi).rev() {
+        let mut e = x[i];
+        for j in 1..=p.min(i - lo) { e += lpc[j - 1] * x[i - j]; }
+        x[i] = e;
+    }
+    let mut h = vec![0f64; n];
+    h[0] = 1.0;
+    let mut gain = 1.0;
+    for i in 1..n {
+        let mut y = 0f64;
+        for j in 1..=p.min(i) { y -= lpc[j - 1] as f64 * h[i - j]; }
+        h[i] = y;
+        gain += y * y;
+    }
+    Some((p, idx, gain))
+}
+
+/// The two-slope Bark spreading of one block type's bands (3GPP TS 26.403's AAC psy model): `up[b]` the power factor
+/// from band b-1 into b (`SPREAD_HI_DB` per Bark), `down[b]` from band b+1 into b (`SPREAD_LO_DB` per Bark).
+struct Spread {
+    up: Vec<f64>,
+    down: Vec<f64>,
+}
+
+/// The spreading table over `swb` (band edges in bins of `hz` each), the Bark distance between band centres.
+fn spread_table(swb: &[u16], hz: f64) -> Spread {
+    let n = swb.len() - 1;
+    let z: Vec<f64> = (0..n).map(|b| bark((swb[b] as f64 + swb[b + 1] as f64) * 0.5 * hz)).collect();
+    let up = (0..n).map(|b| if b == 0 { 0.0 } else { db(-SPREAD_HI_DB * (z[b] - z[b - 1])) }).collect();
+    let down = (0..n).map(|b| if b + 1 == n { 0.0 } else { db(-SPREAD_LO_DB * (z[b + 1] - z[b])) }).collect();
+    Spread { up, down }
+}
+
+/// Hz to Bark (Zwicker): 13·atan(0.00076 f) + 3.5·atan((f / 7500)²).
+fn bark(f: f64) -> f64 { 13.0 * math::atan(0.00076 * f) + 3.5 * math::atan((f / 7500.0) * (f / 7500.0)) }
+
 
 #[cfg(test)]
 mod tests {
@@ -900,6 +1154,8 @@ mod tests {
             let snr = 10.0 * math::log10(s / n.max(1e-9));
             std::println!("aac_enc_sine_snr: channel {c} SNR {snr:.1} dB");
             assert!(snr >= 30.0, "channel {c}: SNR {snr:.1} dB");
+            // AACENCTNS (LEDGER SR381): the psy model, TNS and the reservoir hold SR378's tone within 1 dB
+            assert!(snr >= SINE_SR378[c] - 1.0, "channel {c}: SNR {snr:.1} dB, SR378 {:.1}", SINE_SR378[c]);
         }
     }
 
@@ -1109,6 +1365,10 @@ mod tests {
         let db = 10.0 * math::log10(pl / ps.max(1e-9));
         std::println!("aac_enc_short_pre_echo: pre-echo long {pl:.3e} short {ps:.3e} ({db:.1} dB lower), SNR long {sl:.1} short {ss:.1} dB");
         assert!(db >= PRE_ECHO_DB, "pre-echo only {db:.1} dB lower");
+        // AACENCTNS (LEDGER SR381): TNS, the psy model and the reservoir together, against SR378's block switching alone
+        let vs = 10.0 * math::log10(PRE_ECHO_SR378 / ps.max(1e-9));
+        std::println!("aac_enc_short_pre_echo: short {ps:.3e} vs SR378's {PRE_ECHO_SR378:.3e} ({vs:.1} dB lower)");
+        assert!(vs >= PRE_ECHO_VS_SR378_DB, "only {vs:.1} dB under SR378");
     }
 
     /// L = a broadband noise, R = L + an independent ±8: (units, total bytes, per-channel SNR) with M/S on or off and the
@@ -1128,6 +1388,7 @@ mod tests {
         let mut e = Encoder::new(48000, 2, 128000).unwrap();
         e.ms = ms;
         e.cpe = cpe;
+        e.reservoir = cpe; // AACENCTNS: the per-channel arms measure the idle bits a reservoir would re-spend
         let mut units = e.encode(&pcm);
         units.extend(e.flush());
         let bytes = units.iter().map(|u| u.data.len()).sum();
@@ -1177,7 +1438,129 @@ mod tests {
         let (_, b_lr, _) = correlated(false, false);
         std::println!("aac_enc_cpe_budget: M/S one budget {b_one} bytes SNR {:.1}/{:.1} dB, per-channel {b_two} bytes SNR {:.1}/{:.1} dB, L/R {b_lr} bytes", s_one[0], s_one[1], s_two[0], s_two[1]);
         for c in 0..2 { assert!(s_one[c] > s_two[c], "channel {c}: one budget {:.1} dB, per-channel {:.1} dB", s_one[c], s_two[c]); }
+        // AACENCTNS (LEDGER SR381): no worse than SR378's one budget (4.9 dB)
+        for c in 0..2 { assert!(s_one[c] >= CPE_SR378, "channel {c}: one budget {:.1} dB, SR378 {CPE_SR378}", s_one[c]); }
         let cap = 128000 * u_one.len() * 1024 / 48000 / 8;
         assert!(b_one <= cap, "one budget {b_one} bytes, the bitrate's {cap}");
+    }
+
+    // ---- AACENCTNS (LEDGER SR381): TNS, the spread/tonality psy model, the bit reservoir
+
+    /// SR378's measured sine SNR (dB, per channel) and its one-budget correlated SNR: the floors this arc keeps.
+    const SINE_SR378: [f64; 2] = [56.5, 57.1];
+    const CPE_SR378: f64 = 4.9;
+    /// AACENCTNS: (unit, windows TNS filtered) on the tone + noise-burst stream — LONG_START / EIGHT_SHORT / LONG_STOP of
+    /// each burst (`aac_enc_short_click_sequence`'s units), the short units' filtered windows of eight.
+    const TNS_UNITS: [(usize, u8); 9] = [(9, 1), (10, 3), (11, 1), (19, 1), (20, 4), (21, 1), (28, 1), (29, 7), (30, 1)];
+    const TNS_PRE_ECHO_DB: f64 = 9.0;
+    /// SR378's short-block pre-echo (`aac_enc_short_pre_echo`, block switching alone) and the margin this arc keeps under it.
+    const PRE_ECHO_SR378: f64 = 4.257e7;
+    const PRE_ECHO_VS_SR378_DB: f64 = 20.0;
+    const RESERVOIR_BYTES: (usize, usize) = (586, 160);
+
+    /// A tone (440 Hz + 2 harmonics) with 512-sample white-noise bursts (abrupt onset) at `BURSTS`, mono.
+    fn tone_bursts(frames: usize) -> Vec<i16> {
+        let mut v = Vec::with_capacity(frames);
+        let mut a = 0x2468_ace1u32;
+        for n in 0..frames {
+            let p = 2.0 * core::f64::consts::PI * 440.0 * n as f64 / 48000.0;
+            let mut x = 3000.0 * math::sin(p) + 1500.0 * math::sin(2.0 * p) + 750.0 * math::sin(3.0 * p);
+            if BURSTS.iter().any(|&b| n >= b && n < b + 512) {
+                a = a.wrapping_mul(1664525).wrapping_add(1013904223);
+                x += ((a >> 8) % 24001) as f64 - 12000.0;
+            }
+            v.push(x as i16);
+        }
+        v
+    }
+
+    /// The tone + bursts at 64 kb/s mono, TNS on or off, fed a frame at a time: (units, the windows TNS filtered per
+    /// unit of the encode phase, the error energy in [p - 768, p - 64) summed over the bursts, the whole signal's SNR).
+    fn tns_run(tns: bool) -> (Vec<AccessUnit>, Vec<u8>, f64, f64) {
+        let frames = 40960;
+        let pcm = tone_bursts(frames);
+        let mut e = Encoder::new(48000, 1, 64000).unwrap();
+        e.tns = tns;
+        let mut units = Vec::new();
+        let mut filt = Vec::new();
+        for f in pcm.chunks(1024) {
+            for u in e.encode(f) { units.push(u); filt.push(e.tns_windows); }
+        }
+        units.extend(e.flush());
+        let d = decode(&e, &units);
+        let mut pre = 0f64;
+        for &p in &BURSTS { for i in p - 768..p - 64 { let r = pcm[i] as f64 - d[0][i + PRIMING as usize]; pre += r * r; } }
+        let (mut s, mut n) = (0f64, 0f64);
+        for i in 0..frames {
+            let x = pcm[i] as f64;
+            let r = x - d[0][i + PRIMING as usize];
+            s += x * x;
+            n += r * r;
+        }
+        (units, filt, pre, 10.0 * math::log10(s / n.max(1e-9)))
+    }
+
+    /// The silence clicks (`bursts`, mono 64 kb/s, block switching on) at the FIXED per-frame budget (reservoir off),
+    /// TNS on or off: the decoded energy in [p - 768, p - 64) summed over the bursts (the input is silence there).
+    fn tns_clicks(tns: bool) -> f64 {
+        let frames = 40960;
+        let pcm = bursts(frames, &BURSTS, 1);
+        let mut e = Encoder::new(48000, 1, 64000).unwrap();
+        e.tns = tns;
+        e.reservoir = false;
+        let mut units = e.encode(&pcm);
+        units.extend(e.flush());
+        let d = decode(&e, &units);
+        let mut pre = 0f64;
+        for &p in &BURSTS { for i in p - 768..p - 64 { pre += d[0][i + PRIMING as usize] * d[0][i + PRIMING as usize]; } }
+        pre
+    }
+
+    /// TNS on the bursts, the attack gate: on the tone + noise-burst stream only the blocks around the bursts filter
+    /// (the per-unit record PINNED, `TNS_UNITS`; stationary tonal blocks carry none) and the stream decodes through the
+    /// decoder's TNS synthesis; at the fixed budget TNS lowers the silence clicks' pre-echo by at least `TNS_PRE_ECHO_DB`.
+    #[test]
+    fn aac_enc_tns_burst() {
+        let (units, filt, pre_on, snr_on) = tns_run(true);
+        let (units_off, filt_off, pre_off, snr_off) = tns_run(false);
+        assert_eq!(units.len(), units_off.len());
+        assert!(filt_off.iter().all(|&f| f == 0));
+        let on: Vec<(usize, u8)> = filt.iter().copied().enumerate().filter(|&(_, f)| f > 0).collect();
+        let (c_on, c_off) = (tns_clicks(true), tns_clicks(false));
+        let db = 10.0 * math::log10(c_off / c_on.max(1e-9));
+        std::println!("aac_enc_tns_burst: tns units {on:?}; tone+bursts error before the bursts tns {pre_on:.3e} off {pre_off:.3e}, SNR tns {snr_on:.1} off {snr_off:.1} dB; clicks at the fixed budget tns {c_on:.3e} off {c_off:.3e} ({db:.1} dB lower)");
+        for u in [10usize, 20, 29] { assert_eq!(wire_seq(&units[u]), 2); assert!(filt[u] > 0, "unit {u}: no TNS"); }
+        for &(u, _) in &on { assert_ne!(wire_seq(&units[u]), 0, "unit {u}: TNS on an ONLY_LONG block"); }
+        assert_eq!(on, TNS_UNITS.to_vec());
+        assert!(db >= TNS_PRE_ECHO_DB, "pre-echo only {db:.1} dB lower");
+    }
+
+    /// The bit reservoir: silence, then one burst (mono 64 kb/s). The silent frames bank their budget, so the burst's
+    /// EIGHT_SHORT unit spends more than one frame's bits (within the AU max) — PINNED against the reservoir off — and
+    /// the stream stays within the bitrate.
+    #[test]
+    fn aac_enc_reservoir() {
+        let run = |res: bool| -> (Vec<AccessUnit>, usize) {
+            let frames = 16384;
+            let pcm = bursts(frames, &[10000], 1);
+            let mut e = Encoder::new(48000, 1, 64000).unwrap();
+            e.reservoir = res;
+            let mut units = e.encode(&pcm);
+            units.extend(e.flush());
+            (units, e.budget)
+        };
+        let (on, budget) = run(true);
+        let (off, _) = run(false);
+        let u = (10000 - 512) / 1024 + 1;
+        assert_eq!((wire_seq(&on[u]), wire_seq(&off[u])), (2, 2));
+        let (b_on, b_off) = (on[u].data.len(), off[u].data.len());
+        let total: usize = on.iter().map(|u| u.data.len()).sum();
+        let cap = 64000 * on.len() * 1024 / 48000 / 8;
+        std::println!("aac_enc_reservoir: burst unit {u} {b_on} bytes (reservoir off {b_off}), budget {} bytes a frame; stream {total} bytes, the bitrate's {cap}", budget / 8);
+        assert!(b_off * 8 <= budget + FRAME_OVERHEAD + MS_MASK_MAX, "off: {b_off} bytes");
+        assert!(b_on * 8 > budget + FRAME_OVERHEAD, "on: {b_on} bytes");
+        assert!(b_on * 8 <= AU_MAX_BITS, "on: {b_on} bytes over the AU max");
+        assert_eq!((b_on, b_off), RESERVOIR_BYTES);
+        assert!(total <= cap, "{total} bytes, the bitrate's {cap}");
     }
 }
