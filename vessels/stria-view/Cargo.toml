@@ -1,0 +1,26 @@
+# =====================================================================
+# CRATE: vessels/stria-view/Cargo.toml
+# DESCRIPTION: Stria's editor vessel (NLE2, LEDGER SR201). A window over
+#              stria::nle_face: one Quartzite tetra tree (the editor
+#              surface and the transport row) evaluated on AppKit and
+#              GTK, and the headless witness. It edits, paints and
+#              renders nothing itself.
+# =====================================================================
+
+[package]
+name = "stria-view"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-3.0-or-later"
+
+[dependencies]
+stria = { path = "../../handlers/stria" }
+timeline_core = { path = "../../unaos/libs/media/timeline_core" }
+bandy = { path = "../../libs/bandy" }
+quartzite = { path = "../../libs/quartzite", default-features = false }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+
+[features]
+default = []
+gtk = ["quartzite/gtk"]
+macos = ["quartzite/macos"]

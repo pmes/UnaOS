@@ -109,6 +109,7 @@ members = [
     "vessels/pulse",
     "vessels/phonolite",
     "vessels/facet-view",
+    "vessels/stria-view", # NLE2 (SR201): Stria's editor face — one tetra tree on AppKit / GTK, the headless witness
     "vessels/una",
     "libs/lux",
     "vessels/aether-shell"
