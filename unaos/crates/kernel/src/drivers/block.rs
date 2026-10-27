@@ -4271,9 +4271,9 @@ impl Drop for BlockLoan {
     fn drop(&mut self) {
         // The put first (XhciLoan's masked O(1) put), while this CPU is still preempt-off; then the publication is
         // withdrawn (only if it is still ours) and the count released.
-        drop(self.loan.take());
+        #[cfg(target_arch = "x86_64")] let shed = loan_shed_take(); drop(self.loan.take()); // XHCILOANFAILHOLD (Z66): the shed mark is read BEFORE the put (still held: no other block loan can exist to clear it)
         #[cfg(target_arch = "x86_64")]
-        {
+        { if shed { return; } // XHCILOANFAILHOLD (Z66): a shed loan already withdrew its publication and released its count (`xhci_loan_shed`)
             let _ = BLOCK_LOAN_CPU.compare_exchange(
                 self.tag,
                 0,
@@ -4323,7 +4323,7 @@ fn take_block_loan() -> Result<BlockLoan, XhciClaimError> {
     crate::arch::sched::preemptoff::disable();
     match xhci::claim() {
         Ok(l) => {
-            let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+            let tag = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1); loan_shed_arm(); // XHCILOANFAILHOLD (Z66): the loan's age starts here, its shed mark cleared
             BLOCK_LOAN_CPU.store(tag, core::sync::atomic::Ordering::Release);
             Ok(BlockLoan { loan: Some(l), tag })
         }
@@ -4472,4 +4472,81 @@ pub fn xhci_loan_wait_kat() -> (&'static str, u64) {
     });
     let _ = wait::bounded(200, || LOAN_KAT_STATE.load(Ordering::Acquire) >= 3);
     (word, cycles.saturating_mul(1000) / wait::cycles_ms(1).max(1))
+}
+
+// ══════════ XHCILOANFAILHOLD (zenbook-ledger Z66) — a block loan in a BOT wait sheds its non-preemption ══════════
+//
+// TAIL-APPENDED after Z62's KAT (Z62's `Drop` and `take_block_loan` gain one same-line token each, line-neutral). Z62 held
+// the block loan preempt-off from take to put; a FAILING BOT transfer holds that loan through the whole ladder inside one
+// `storage_*10` call (`xhci/mod.rs` `bot_transfer_body`): a 3x `hw_wait_budget` first attempt (6 s on x86) plus a
+// recovery and its rungs, every other task on the holder's CPU stopped with it — on the service core, 3x the pump
+// watch's `WEDGE_MS`. The xHCI layer's hook (`XhciController::loan_shed_hook`, its file tail) calls `xhci_loan_shed` from
+// the holder's own call chain at each stage-wait wake (gate: loan age >= `LOAN_MASKED_WAIT_MS`) and at the ladder entry
+// (gate 0: the recovery's EP0/command waits are unhooked). The shed is Z69's demotion shape on the static path: the
+// publication withdrawn (CAS tag -> 0), the count released (`preemptoff::enable`), then the mark (`LOAN_SHED`) that tells
+// `Drop` not to do either again. The holder KEEPS the claim and is preemptible as before Z62; a masked claimant answers
+// `Busy` at once (unpublished holder), WEDGE-8 F3 restated. All state is lock-free and written only by the holder while
+// it holds the loan (controller 0's single loan: at most one block loan is live). aarch64: no count, nothing to shed.
+
+/// XHCILOANFAILHOLD: the live block loan was shed (set by `xhci_loan_shed`, cleared at the take, read-and-cleared by
+/// `Drop` before the put).
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// XHCILOANFAILHOLD: `now_cycles` at the live block loan's take (its age).
+#[cfg(target_arch = "x86_64")]
+static LOAN_TAKEN_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// XHCILOANFAILHOLD: block loans shed this boot.
+#[cfg(target_arch = "x86_64")]
+static LOAN_SHED_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// XHCILOANFAILHOLD: at the take (loan held, preempt-off): stamp the loan's age, clear its shed mark.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_shed_arm() {
+    LOAN_TAKEN_AT.store(crate::arch::now_cycles(), core::sync::atomic::Ordering::Relaxed);
+    LOAN_SHED.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// XHCILOANFAILHOLD: `Drop`'s read of the shed mark, taken (cleared) while the loan is still held.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn loan_shed_take() -> bool {
+    LOAN_SHED.swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// XHCILOANFAILHOLD: shed THIS CPU's live block loan if it has been held at least `gate_ms` — the publication withdrawn,
+/// the preempt-off count released, the mark set (Z69's `demote` shape). A no-op unless the published block holder is
+/// this CPU (so a non-block xHCI holder, or a loan already shed, never matches). Called only from the holder's own call
+/// chain (`xhci::XhciController::loan_shed_hook`) while it is still preempt-off, so the check and the release cannot
+/// interleave with a switch. The first shed of the boot is said once.
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed(rung: &'static str, gate_ms: u64) {
+    use core::sync::atomic::Ordering;
+    let me = crate::arch::percpu::this_cpu().cpu_index.saturating_add(1);
+    if BLOCK_LOAN_CPU.load(Ordering::Acquire) != me || LOAN_SHED.load(Ordering::Relaxed) {
+        return;
+    }
+    let waited_ms = crate::arch::now_cycles().wrapping_sub(LOAN_TAKEN_AT.load(Ordering::Relaxed)) / wait::cycles_ms(1).max(1);
+    if waited_ms < gate_ms {
+        return;
+    }
+    if BLOCK_LOAN_CPU.compare_exchange(me, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return;
+    }
+    crate::arch::sched::preemptoff::enable();
+    LOAN_SHED.store(true, Ordering::Release);
+    if LOAN_SHED_N.fetch_add(1, Ordering::Relaxed) == 0 {
+        serial_println!(
+            "[xhci] loan shed cpu={} rung={} waited_ms={} (XHCILOANFAILHOLD Z66, first shed, once)",
+            me - 1,
+            rung,
+            waited_ms
+        );
+    }
+}
+
+/// XHCILOANFAILHOLD: block loans shed this boot (`loan_shed=` on the PREEMPTAUDIT line).
+#[cfg(target_arch = "x86_64")]
+pub fn xhci_loan_shed_count() -> u32 {
+    LOAN_SHED_N.load(core::sync::atomic::Ordering::Relaxed)
 }
