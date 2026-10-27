@@ -1,9 +1,9 @@
-//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23, and S6 the radio backend registered with the data rings armed, Z29; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
+//! CHARTER: Kernel — driver (the MediaTek MT7925 Wi-Fi 7 radio's S1 probe, zenbook-ledger Z5, S2 driver-own and the chip id, Z11, and S3 the WFSYS reset and the WFDMA rings, Z15, and S4 the firmware upload, Z17, and S5 the NIC capability and MAC, Z23, and S6 the radio backend registered with the data rings armed, Z29, and S7 the scan, Z34; no CODEX §2 handler owns a NIC driver, the BCM4331 `wifi/**` sits in the same seam)
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Architect & Una
 
 //! MT7925 — S1, the probe (ZENBOOKMT7925, zenbook-ledger Z5). The ladder is
-//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17), S5 (MT7925S5, Z23) and S6 (MT7925S6, Z29) are the five file-tail blocks; S7..S10 are owed there by name.
+//! `docs/dev/OS/06_NETWORK_STACK/mt7925.md`; S2 (MT7925S2, Z11), S3 (MT7925S3, Z15), S4 (MT7925S4, Z17), S5 (MT7925S5, Z23), S6 (MT7925S6, Z29) and S7 (MT7925S7, Z34) are the six file-tail blocks; S8..S10 are owed there by name.
 //!
 //! WHAT THIS RUNG DOES. Once per boot, from the three storage-ready passes in `main.rs` (beside `wifi::service()`,
 //! the same forward-only polled shape), and only after `boot::services_gate("wifi")` answers (R86, BP-net-4):
@@ -503,15 +503,13 @@ fn s3() {
         return;
     }
     let lp = b + CONN_HOST_CSR_TOP + LPCTL;
-    let took = r32(lp) & OWN_SYNC != 0;
-    if took {
-        let (ok, last, _) = own(lp, CLR_OWN, false);
-        if !ok {
-            let rel = if own(lp, SET_OWN, true).0 { "fw" } else { "timeout" };
+    let took = match take_own(lp) { // MT7925S7 (Z34): the ONE take beside `give_back`, the writes unchanged and in order
+        Ok(t) => t,
+        Err((last, rel)) => {
             serial_println!("[mt7925] s3 -> NOT ATTEMPTED why=own lpctl={:#010x} rel={}", last, rel);
             return;
         }
-    }
+    };
     let (emi, restored) = l1(b, HW_EMI_CTL, |win| {
         let a = win + (HW_EMI_CTL & 0xffff) as u64;
         w32(a, r32(a) | EMI_SLPPROT_EN); // linux's rmw_field(SLPPROT_EN, 1)
@@ -665,6 +663,21 @@ fn give_back(lp: u64, took: bool) -> &'static str {
     }
 }
 
+/// The ONE driver-own take (MT7925S7, Z34, hoisted out of s3..s6, whose four inline copies were byte-identical but for
+/// the print; the writes are unchanged and in order): when the firmware owns (OWN_SYNC set), CLR_OWN through `own`; on a
+/// failed take firmware-own is handed straight back. Ok(took); Err((the last LPCTL read, the `rel=` word)).
+fn take_own(lp: u64) -> Result<bool, (u32, &'static str)> {
+    let took = r32(lp) & OWN_SYNC != 0;
+    if took {
+        let (ok, last, _) = own(lp, CLR_OWN, false);
+        if !ok {
+            let rel = if own(lp, SET_OWN, true).0 { "fw" } else { "timeout" };
+            return Err((last, rel));
+        }
+    }
+    Ok(took)
+}
+
 // ── MT7925S4 (zenbook-ledger Z17) — S4: the patch and the RAM code uploaded over the MCU, the N9 started ──────────────
 // Once, on the storage-ready pass after a clean S3 line (`s3_done` hands to S_S4 only when S3's ring read-backs held, the
 // ownership went back and WFDMA0 read back enabled). Linux's `mt7925e_mcu_init` / `mt792x_load_firmware`: take driver-own
@@ -800,15 +813,13 @@ fn s4() {
         serial_println!("[mt7925] s4 -> NOT ATTEMPTED why=unmapped bm=off rel=found");
         return;
     }
-    let took = r32(lp) & OWN_SYNC != 0;
-    if took {
-        let (ok, last, _) = own(lp, CLR_OWN, false);
-        if !ok {
-            let rel = if own(lp, SET_OWN, true).0 { "fw" } else { "timeout" };
+    let took = match take_own(lp) { // MT7925S7 (Z34): the ONE take beside `give_back`, the writes unchanged and in order
+        Ok(t) => t,
+        Err((last, rel)) => {
             serial_println!("[mt7925] s4 -> NOT ATTEMPTED why=own lpctl={:#010x} bm=off rel={}", last, rel);
             return;
         }
-    }
+    };
     // The firmware bytes live in this frame: dropped only after every descriptor completed or bus master is back off.
     let mut hold: Vec<u8> = Vec::new();
     let mut rep = Rep { held: "lost", patch: String::from("-"), ram: 0, sent: false, fw_start: "-", n9: "-", saved: None };
@@ -969,33 +980,49 @@ fn event(h: &mut Hw, seq: u8) -> Result<u8, &'static str> {
         if !done {
             return Err("event");
         }
-        core::sync::atomic::fence(Ordering::SeqCst);
-        let buf = h.rxb + h.ri as u64 * RX_BUF_BYTES;
-        // SAFETY: descriptor ri's ctrl word and its 2048-byte buffer, which the device has finished writing (DMA_DONE).
-        let (ctrl, got, status) = unsafe {
-            (
-                core::ptr::read_volatile((d + 4) as *const u32),
-                core::ptr::read_volatile((buf + 37) as *const u8),
-                core::ptr::read_volatile((buf + 40) as *const u8),
-            )
-        };
-        if got == seq {
-            // The reply's bytes (SD_LEN0, capped at the buffer) leave the buffer before it is re-handed; a reply split over
-            // buffers (LAST_SEC0 clear) keeps nothing, so S5 reads it as `cap-parse`.
-            h.last.clear();
-            if ctrl & LAST_SEC0 != 0 {
-                let n = (((ctrl & SD_LEN0) >> 16) as u64).min(RX_BUF_BYTES);
-                for i in 0..n {
-                    // SAFETY: inside this descriptor's 2048-byte buffer (i < n <= RX_BUF_BYTES), written by the device.
-                    h.last.push(unsafe { core::ptr::read_volatile((buf + i) as *const u8) });
-                }
-            }
-        }
-        recycle(h);
-        if got == seq {
-            return Ok(status);
+        if let Some(Some(status)) = event_take(h, &|_: u8, got: u8, _: u8| got == seq) {
+            return Ok(status); // MT7925S7 (Z34): the consume step is `event_take`, the reads, h.last rule and recycle unchanged
         }
     }
+}
+
+/// The event ring's ONE consume step (hoisted out of `event` by MT7925S7, Z34, so S7 can poll for SCAN_DONE between RX ring
+/// 2 drains): descriptor `ri`'s DMA_DONE read; when set, its buffer's eid (@36), seq (@37), option (@38) and status (@40)
+/// read, the reply's bytes copied to `h.last` when `want(eid, seq, option)` matches, then one `recycle`. None = descriptor
+/// `ri` not done (nothing consumed); Some(Some(status)) = consumed and matched; Some(None) = consumed, another event.
+fn event_take(h: &mut Hw, want: &dyn Fn(u8, u8, u8) -> bool) -> Option<Option<u8>> {
+    let d = h.rx0 + h.ri as u64 * DESC_BYTES;
+    // SAFETY: descriptor ri (< RING_DEPTH) of ring 0's block; a status read.
+    if unsafe { core::ptr::read_volatile((d + 4) as *const u32) } & DMA_DONE == 0 {
+        return None;
+    }
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let buf = h.rxb + h.ri as u64 * RX_BUF_BYTES;
+    // SAFETY: descriptor ri's ctrl word and its 2048-byte buffer, which the device has finished writing (DMA_DONE).
+    let (ctrl, eid, got, opt, status) = unsafe {
+        (
+            core::ptr::read_volatile((d + 4) as *const u32),
+            core::ptr::read_volatile((buf + 36) as *const u8),
+            core::ptr::read_volatile((buf + 37) as *const u8),
+            core::ptr::read_volatile((buf + 38) as *const u8),
+            core::ptr::read_volatile((buf + 40) as *const u8),
+        )
+    };
+    let hit = want(eid, got, opt);
+    if hit {
+        // The reply's bytes (SD_LEN0, capped at the buffer) leave the buffer before it is re-handed; a reply split over
+        // buffers (LAST_SEC0 clear) keeps nothing, so S5 reads it as `cap-parse`.
+        h.last.clear();
+        if ctrl & LAST_SEC0 != 0 {
+            let n = (((ctrl & SD_LEN0) >> 16) as u64).min(RX_BUF_BYTES);
+            for i in 0..n {
+                // SAFETY: inside this descriptor's 2048-byte buffer (i < n <= RX_BUF_BYTES), written by the device.
+                h.last.push(unsafe { core::ptr::read_volatile((buf + i) as *const u8) });
+            }
+        }
+    }
+    recycle(h);
+    Some(if hit { Some(status) } else { None })
 }
 
 /// FW_SCATTER: `bytes` in chunks of at most CHUNK raw on ring 16, each chunk's TX completion awaited (linux gets no
@@ -1208,22 +1235,30 @@ fn uni_cmd(h: &mut Hw, cid: u16, payload: &[u8]) -> Result<u8, &'static str> {
     send(h, total, seq)
 }
 
-/// S4-RECYCLE: after descriptor `ri` is consumed, the slot one behind it (`ri + 31`, mod 32) gets its own fixed buffer back
-/// (buf1 and info 0, the length in ctrl, DMA_DONE clear), a fence, then ring 0's CPU index moves to `ri`, so 31 buffers stay
-/// handed and one descriptor unhanded; `ri` advances, wrapping at 32.
+/// S4-RECYCLE: ring 0's re-hand after each consumed event (MT7925S7, Z34: the body is the ONE ring-parameterised `rearm`,
+/// ring 0's writes unchanged and in order).
 fn recycle(h: &mut Hw) {
-    let slot = (h.ri + RX_BUFS) % RING_DEPTH;
-    let d = h.rx0 + slot as u64 * DESC_BYTES;
-    // SAFETY: descriptor `slot` (< 32) of ring 0's block; the buffer is slot `slot` of the 64 KiB event block (32 x 2 KiB).
+    h.ri = rearm(h.q0, h.rx0, h.rxb, h.ri);
+}
+
+/// The ONE RX re-hand for any ring (hoisted out of `recycle` by MT7925S7, Z34; ring 0's events and S7's RX ring 2 frames):
+/// after descriptor `ri` of the ring whose registers are at `q` (descriptors at `desc`, 32 x 2 KiB buffers at `bufs`) is
+/// consumed, the slot one behind it (`ri + 31`, mod 32) gets its own fixed buffer back (buf1 and info 0, the length in ctrl,
+/// DMA_DONE clear), a fence, then the ring's CPU index moves to `ri`, so 31 buffers stay handed and one descriptor unhanded.
+/// Returns the next `ri`, wrapping at 32.
+fn rearm(q: u64, desc: u64, bufs: u64, ri: u32) -> u32 {
+    let slot = (ri + RX_BUFS) % RING_DEPTH;
+    let d = desc + slot as u64 * DESC_BYTES;
+    // SAFETY: descriptor `slot` (< 32) of the ring's block; the buffer is slot `slot` of its 64 KiB block (32 x 2 KiB).
     unsafe {
-        core::ptr::write_volatile(d as *mut u32, (h.rxb + slot as u64 * RX_BUF_BYTES) as u32);
+        core::ptr::write_volatile(d as *mut u32, (bufs + slot as u64 * RX_BUF_BYTES) as u32);
         core::ptr::write_volatile((d + 8) as *mut u32, 0);
         core::ptr::write_volatile((d + 12) as *mut u32, 0);
         core::ptr::write_volatile((d + 4) as *mut u32, (RX_BUF_BYTES as u32) << 16); // DMA_DONE clear: handed to the device
     }
     core::sync::atomic::fence(Ordering::SeqCst);
-    w32(h.q0 + 8, (slot + 1) % RING_DEPTH);
-    h.ri = (h.ri + 1) % RING_DEPTH;
+    w32(q + 8, (slot + 1) % RING_DEPTH);
+    (ri + 1) % RING_DEPTH
 }
 
 /// S4 calls this at its end: the MCU channel parked for S5, and S5 on the next pass, only when FW_START was acked and N9 is
@@ -1261,15 +1296,13 @@ fn s5() {
         serial_println!("[mt7925] s5 -> NOT ATTEMPTED why=unmapped rel=found");
         return;
     }
-    let took = r32(lp) & OWN_SYNC != 0;
-    if took {
-        let (ok, last, _) = own(lp, CLR_OWN, false);
-        if !ok {
-            let rel = if own(lp, SET_OWN, true).0 { "fw" } else { "timeout" };
+    let took = match take_own(lp) { // MT7925S7 (Z34): the ONE take beside `give_back`, the writes unchanged and in order
+        Ok(t) => t,
+        Err((last, rel)) => {
             serial_println!("[mt7925] s5 -> NOT ATTEMPTED why=own lpctl={:#010x} rel={}", last, rel);
             return;
         }
-    }
+    };
     let mut kept = "lost";
     let res = s5_run(b, &mut h, &mut kept);
     let rel = give_back(lp, took);
@@ -1284,7 +1317,7 @@ fn s5() {
                 }
                 t
             });
-            *MAC.lock() = Some(m);
+            *MAC.lock() = Some(m); S7_PATH.store(c.phy.map_or(PATH_UNREAD, |v| v[10] as u16), Ordering::Relaxed); // MT7925S7 (Z34): the PHY TLV's hw_path byte (bit 0 = 2.4 GHz, bit 1 = 5 GHz) kept for S7's bands
             serial_println!(
                 "[mt7925] s5 mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} caps={} chip_cap={} phy={} held={} rel={} -> parked",
                 m[0], m[1], m[2], m[3], m[4], m[5], c.n, chip, phy, kept, rel
@@ -1434,15 +1467,13 @@ fn s6() {
         serial_println!("[mt7925] s6 -> NOT ATTEMPTED why=unmapped held=- rel=found");
         return;
     }
-    let took = r32(lp) & OWN_SYNC != 0;
-    if took {
-        let (ok, last, _) = own(lp, CLR_OWN, false);
-        if !ok {
-            let rel = if own(lp, SET_OWN, true).0 { "fw" } else { "timeout" };
+    let took = match take_own(lp) { // MT7925S7 (Z34): the ONE take beside `give_back`, the writes unchanged and in order
+        Ok(t) => t,
+        Err((last, rel)) => {
             serial_println!("[mt7925] s6 -> NOT ATTEMPTED why=own lpctl={:#010x} held=- rel={}", last, rel);
             return;
         }
-    }
+    };
     let kept = if r32(h.q15) as u64 == h.wm && r32(h.q0) as u64 == h.rx0 { "kept" } else { "lost" };
     let (tx0, rx2) = (ring(), ring());
     let res = if tx0 == 0 || rx2 == 0 {
@@ -1507,4 +1538,396 @@ impl crate::net_phy::RawNic for MtRadio {
     fn tx_ready() -> bool {
         false
     }
+}
+
+// ── MT7925S7 (zenbook-ledger Z34) — S7: the scan ────────────────────────────────────────────────────────────────────────
+// Only from the operator's `tests wifiscan` (wifi/verb.rs `wifiscan`), never at boot (BP-net-7), over the channel S6 parked
+// in `MCU_LINK` and the data rings in `RADIO`. Linux's `mt7925_mcu_hw_scan`: ONE unified SCAN_REQ (cid 0x16) per band, its
+// body a 4-byte header (scan seq, bss index) and six TLVs (request, SSID, BSSID, channel list, IEs, misc), acked; the end is
+// the UNSOLICITED SCAN_DONE event (eid 0x0e) on ring 0; the results are ordinary beacons and probe responses on the data RX
+// ring (ring 2) behind the connac3 RX descriptor. S7 re-takes own (`take_own`), runs S6's wake reset through the ONE `wake`
+// with S6's two data rings, hands RX ring 2 its 31 buffers (`hand_rx`), then per band sends the request (`uni_cmd`) and,
+// bounded 5 s, empties RX ring 2 (`drain`, one `rearm` per frame: the data-ring twin of the event recycle is the same fn)
+// while it polls ring 0 for SCAN_DONE (`event_take`). Each frame, its RX descriptor stripped (`rx_frame`), goes raw to the
+// station's closure; the driver links no wifi_core. 2.4 GHz channels 1-11 are scanned ACTIVE (the firmware sends the probe
+// requests, wildcard SSID); the nine non-DFS 5 GHz channels PASSIVE (listen only) and only when S5's hw_path says 5 GHz; no
+// DFS channel, no 12/13/14. bss index 0 with no DEV_INFO/BSS_INFO (the ladder's S8; S7-DEV owed should the firmware refuse:
+// the wire's `ack=` / `why=no-done` says so). No config write, no interrupt enable, no host-built frame. Hardware facts only;
+// no code copied.
+
+/// MCU_UNI_CMD_SCAN_REQ and its TLV tags (mt7925/mcu.h UNI_SCAN_*).
+const UNI_SCAN_REQ: u16 = 0x16;
+const SCAN_TAG_REQ: u16 = 1;
+const SCAN_TAG_SSID: u16 = 10;
+const SCAN_TAG_BSSID: u16 = 11;
+const SCAN_TAG_CHANNEL: u16 = 12;
+const SCAN_TAG_IE: u16 = 13;
+const SCAN_TAG_MISC: u16 = 14;
+/// The fixed header and each TLV's length (counting its own 4-byte tag/len header): 4 + 20 + 152 + 16 + 136 + 608 + 12 = 948.
+const SCAN_HDR: usize = 4;
+const SCAN_REQ_LEN: usize = 20;
+const SCAN_SSID_LEN: usize = 152;
+const SCAN_BSSID_LEN: usize = 16;
+const SCAN_CHAN_LEN: usize = 136;
+const SCAN_IE_LEN: usize = 608;
+const SCAN_MISC_LEN: usize = 12;
+const SCAN_BODY: usize = SCAN_HDR + SCAN_REQ_LEN + SCAN_SSID_LEN + SCAN_BSSID_LEN + SCAN_CHAN_LEN + SCAN_IE_LEN + SCAN_MISC_LEN;
+/// The channel TLV's capacity, the split-scan function bit, the wildcard SSID type, "listed channels", the band codes.
+const SCAN_CHAN_MAX: usize = 64;
+const SCAN_FUNC_SPLIT: u8 = 1 << 5;
+const SSID_WILDCARD: u8 = 1 << 0;
+const CHAN_LISTED: u8 = 4;
+const BAND_2G: u8 = 1;
+const BAND_5G: u8 = 2;
+/// Per-channel dwell (linux's MT76_CONNAC_SCAN_CHANNEL_TIME), doubled for a passive band.
+const DWELL_MS: u16 = 60;
+/// The unsolicited SCAN_DONE event: its uni event id and the event header's unsolicited option bit.
+const EVT_SCAN_DONE: u8 = 0x0e;
+const OPT_UNSOLICITED: u8 = 1 << 1;
+/// How long one band waits for SCAN_DONE after the ack, and the drain after it (frames still in flight).
+const SCAN_WAIT_MS: u64 = 5000;
+const TAIL_MS: u64 = 100;
+/// The channels: 2.4 GHz 1-11 (active); 5 GHz UNII-1 and UNII-3, the non-DFS nine (passive).
+const CH_2G: [u8; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const CH_5G: [u8; 9] = [36, 40, 44, 48, 149, 153, 157, 161, 165];
+/// The connac3 RX descriptor: 8 dwords; DW0 bits 31:27 the packet type (2 = a normal frame); DW1's group bits (G1 +4 dwords,
+/// G2 +2, G3 +4, G4 +4, G5 +24 only under G3); DW2 bit 7 header-translated, bit 24 max-length error, bits 15:13 the pad.
+const RXD_BASE: usize = 32;
+const PKT_NORMAL: u32 = 2;
+const RXD1_G1: u32 = 1 << 16;
+const RXD1_G2: u32 = 1 << 17;
+const RXD1_G3: u32 = 1 << 18;
+const RXD1_G4: u32 = 1 << 19;
+const RXD1_G5: u32 = 1 << 20;
+const RXD2_HDR_TRANS: u32 = 1 << 7;
+const RXD2_MAX_LEN_ERR: u32 = 1 << 24;
+/// S5's hw_path byte: bit 0 = 2.4 GHz, bit 1 = 5 GHz; PATH_UNREAD = no PHY TLV (2.4 GHz scanned, 5 GHz not).
+const PATH_UNREAD: u16 = 0x100;
+const PATH_2G: u16 = 1 << 0;
+const PATH_5G: u16 = 1 << 1;
+
+/// S5's hw_path byte: written by `s5`'s clean line, read by `scan`.
+static S7_PATH: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(PATH_UNREAD);
+/// RX ring 2's 64 KiB buffer block (32 x 2 KiB, below 4 GiB): allocated by the first scan, never freed (S3's rule).
+static S7_RXB: AtomicU64 = AtomicU64::new(0);
+/// The last scan sequence number (1..127).
+static S7_SEQ: AtomicU8 = AtomicU8::new(0);
+
+/// RX ring 2 as one scan drains it: registers, descriptors, buffer block, the next descriptor.
+struct Rx2 {
+    q: u64,
+    desc: u64,
+    bufs: u64,
+    ri: u32,
+}
+
+/// One band's counts: frames handed to the station, descriptors skipped (not a normal frame, translated, split, length
+/// error), and the BSSes the station listed new.
+#[derive(Clone, Copy, Default)]
+struct Counts {
+    frames: u32,
+    skip: u32,
+    bss: u32,
+}
+
+/// What one band's request did.
+struct BandRep {
+    name: &'static str,
+    kind: &'static str,
+    req: usize,
+    ack: Option<u8>,
+    done: Option<u64>,
+    n: Counts,
+    why: Option<&'static str>,
+}
+
+/// One TLV's tag and length at `o`; returns the offset of its data.
+fn put_tlv(v: &mut [u8], o: usize, tag: u16, len: usize) -> usize {
+    v[o..o + 2].copy_from_slice(&tag.to_le_bytes());
+    v[o + 2..o + 4].copy_from_slice(&(len as u16).to_le_bytes());
+    o + 4
+}
+
+/// The SCAN_REQ body (pure): header {seq, bss 0}; REQ {active 1 / passive 0, probes 2 / 0, split scan, min dwell, dwell,
+/// timeout = channels x dwell}; SSID {wildcard, none listed}; BSSID zero; CHANNEL {listed, n, (band, channel) each}; IE empty;
+/// MISC zero. 948 bytes.
+fn scan_req(seq: u8, band: u8, chans: &[u8], active: bool) -> Vec<u8> {
+    let n = chans.len().min(SCAN_CHAN_MAX);
+    let dwell = if active { DWELL_MS } else { DWELL_MS * 2 };
+    let mut v = alloc::vec![0u8; SCAN_BODY];
+    v[0] = seq & 0x7f; // band index 0 in bit 7
+    v[1] = 0; // bss index 0 (no DEV_INFO: S7-DEV owed)
+    let mut o = SCAN_HDR;
+    let d = put_tlv(&mut v, o, SCAN_TAG_REQ, SCAN_REQ_LEN);
+    v[d] = active as u8;
+    v[d + 1] = if active { 2 } else { 0 };
+    v[d + 2] = SCAN_FUNC_SPLIT;
+    v[d + 4..d + 6].copy_from_slice(&dwell.to_le_bytes());
+    v[d + 6..d + 8].copy_from_slice(&dwell.to_le_bytes());
+    v[d + 8..d + 10].copy_from_slice(&(n as u16 * dwell).to_le_bytes());
+    o += SCAN_REQ_LEN;
+    let d = put_tlv(&mut v, o, SCAN_TAG_SSID, SCAN_SSID_LEN);
+    v[d] = SSID_WILDCARD;
+    o += SCAN_SSID_LEN;
+    put_tlv(&mut v, o, SCAN_TAG_BSSID, SCAN_BSSID_LEN);
+    o += SCAN_BSSID_LEN;
+    let d = put_tlv(&mut v, o, SCAN_TAG_CHANNEL, SCAN_CHAN_LEN);
+    v[d] = CHAN_LISTED;
+    v[d + 1] = n as u8;
+    for (i, c) in chans.iter().take(n).enumerate() {
+        v[d + 4 + 2 * i] = band;
+        v[d + 5 + 2 * i] = *c;
+    }
+    o += SCAN_CHAN_LEN;
+    put_tlv(&mut v, o, SCAN_TAG_IE, SCAN_IE_LEN); // ies_len 0 (S7-IES owed)
+    o += SCAN_IE_LEN;
+    put_tlv(&mut v, o, SCAN_TAG_MISC, SCAN_MISC_LEN);
+    v
+}
+
+/// The 802.11 frame's byte range inside one RX ring 2 buffer (pure): past the 8-dword descriptor, its groups and twice the
+/// header pad. None = not a normal frame, header-translated, a length error, or too short for a MAC header.
+fn rx_frame(buf: &[u8]) -> Option<core::ops::Range<usize>> {
+    let (d0, d1, d2) = (le32(buf, 0)?, le32(buf, 4)?, le32(buf, 8)?);
+    if d0 >> 27 != PKT_NORMAL || d2 & (RXD2_HDR_TRANS | RXD2_MAX_LEN_ERR) != 0 {
+        return None;
+    }
+    let mut off = RXD_BASE;
+    if d1 & RXD1_G4 != 0 {
+        off += 16;
+    }
+    if d1 & RXD1_G1 != 0 {
+        off += 16;
+    }
+    if d1 & RXD1_G2 != 0 {
+        off += 8;
+    }
+    if d1 & RXD1_G3 != 0 {
+        off += 16;
+        if d1 & RXD1_G5 != 0 {
+            off += 96;
+        }
+    }
+    off += 2 * ((d2 >> 13) & 0x7) as usize;
+    if off + 24 > buf.len() {
+        return None;
+    }
+    Some(off..buf.len())
+}
+
+/// Every DMA_DONE descriptor of RX ring 2 in order, at most 32 per call: the bytes (SD_LEN0, capped at the buffer; a frame
+/// split over buffers keeps nothing) copied out, the buffer re-handed (`rearm`), then the frame to the station's closure
+/// (true = it listed a new BSS).
+fn drain(r: &mut Rx2, n: &mut Counts, on_frame: &mut dyn FnMut(&[u8]) -> bool) {
+    for _ in 0..RING_DEPTH {
+        let d = r.desc + r.ri as u64 * DESC_BYTES;
+        // SAFETY: descriptor ri (< RING_DEPTH) of RX ring 2's block (`ring()`, armed by `wake`); a status read.
+        let ctrl = unsafe { core::ptr::read_volatile((d + 4) as *const u32) };
+        if ctrl & DMA_DONE == 0 {
+            return;
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let buf = r.bufs + r.ri as u64 * RX_BUF_BYTES;
+        let mut v = Vec::new();
+        if ctrl & LAST_SEC0 != 0 {
+            let len = (((ctrl & SD_LEN0) >> 16) as u64).min(RX_BUF_BYTES);
+            v.reserve(len as usize);
+            for i in 0..len {
+                // SAFETY: inside descriptor ri's 2048-byte buffer (i < len <= RX_BUF_BYTES), written by the device (DMA_DONE).
+                v.push(unsafe { core::ptr::read_volatile((buf + i) as *const u8) });
+            }
+        }
+        r.ri = rearm(r.q, r.desc, r.bufs, r.ri);
+        match rx_frame(&v) {
+            Some(span) => {
+                n.frames += 1;
+                if on_frame(&v[span]) {
+                    n.bss += 1;
+                }
+            }
+            None => n.skip += 1,
+        }
+    }
+}
+
+/// One band: the SCAN_REQ (`uni_cmd`; its TX completion or ack missing = `scan-timeout`), then up to 5 s of RX ring 2 drains
+/// with ring 0 polled for SCAN_DONE between them (`no-done` without it), then a 100 ms tail drain; SCAN_DONE with no frame at
+/// all = `rx-stall`.
+fn band(h: &mut Hw, r: &mut Rx2, name: &'static str, code: u8, chans: &[u8], active: bool, on_frame: &mut dyn FnMut(&[u8]) -> bool) -> BandRep {
+    let seq = S7_SEQ.load(Ordering::Relaxed) % 127 + 1;
+    S7_SEQ.store(seq, Ordering::Relaxed);
+    let mut rep = BandRep {
+        name,
+        kind: if active { "active" } else { "passive" },
+        req: chans.len().min(SCAN_CHAN_MAX),
+        ack: None,
+        done: None,
+        n: Counts::default(),
+        why: None,
+    };
+    match uni_cmd(h, UNI_SCAN_REQ, &scan_req(seq, code, chans, active)) {
+        Ok(s) => rep.ack = Some(s),
+        Err(_) => {
+            rep.why = Some("scan-timeout");
+            return rep;
+        }
+    }
+    let done_want = |eid: u8, _seq: u8, opt: u8| eid == EVT_SCAN_DONE && opt & OPT_UNSOLICITED != 0;
+    let mut n = rep.n;
+    let (got, waited) = spin_long(SCAN_WAIT_MS, || {
+        drain(&mut *r, &mut n, &mut *on_frame);
+        matches!(event_take(&mut *h, &done_want), Some(Some(_)))
+    });
+    let _ = spin_long(TAIL_MS, || {
+        drain(&mut *r, &mut n, &mut *on_frame);
+        false
+    });
+    rep.n = n;
+    rep.done = if got { Some(waited) } else { None };
+    if rep.done.is_none() {
+        rep.why = Some("no-done");
+    } else if rep.n.frames == 0 {
+        rep.why = Some("rx-stall");
+    }
+    rep
+}
+
+/// `spin_until` in 1 ms slices for `ms`: S7's rounds read RAM descriptors only, so `spin_until`'s round cap alone could end a
+/// long wait early; each slice is bounded by the tick or the cap, and at most `ms` slices run should the tick stall.
+/// (done, ms waited).
+fn spin_long(ms: u64, mut done: impl FnMut() -> bool) -> (bool, u64) {
+    let t0 = crate::arch::ms();
+    let mut slices = 0u64;
+    while crate::arch::ms().saturating_sub(t0) < ms && slices < ms {
+        if spin_until(1, &mut done).0 {
+            return (true, crate::arch::ms().saturating_sub(t0));
+        }
+        slices += 1;
+    }
+    (false, crate::arch::ms().saturating_sub(t0))
+}
+
+/// S7: the scan, for the station's `tests wifiscan`. Each received beacon / probe response goes raw (RX descriptor stripped)
+/// to `on_frame`, which answers true when it listed a new BSS. Ok = frames handed over (a band may still have refused: its
+/// line says why); Err = the refusal word, said on the `[mt7925] s7` line. The channel goes back to `MCU_LINK` on every path.
+pub fn scan(on_frame: &mut dyn FnMut(&[u8]) -> bool) -> Result<u32, &'static str> {
+    let held = *PROBE.lock();
+    let (Some(p), Some((tx0, rx2)), true) = (held, data_rings(), registered()) else {
+        serial_println!("[mt7925] s7 -> NOT ATTEMPTED why=no-radio rel=found");
+        return Err("no-radio");
+    };
+    let link = MCU_LINK.lock().take();
+    let Some(mut h) = link else {
+        serial_println!("[mt7925] s7 -> NOT ATTEMPTED why=no-link rel=found");
+        return Err("no-link");
+    };
+    let res = scan_run(p.bar0, &mut h, tx0, rx2, on_frame);
+    *MCU_LINK.lock() = Some(h); // put back on every path: the next scan re-wakes it
+    res
+}
+
+/// Everything between the channel's take and its return: the pages, own, `held`, RX ring 2's buffer block, `wake` with the
+/// data rings, RX ring 2's 31 buffers handed, the bands, own given back, the lines.
+fn scan_run(b: u64, h: &mut Hw, tx0: u64, rx2: u64, on_frame: &mut dyn FnMut(&[u8]) -> bool) -> Result<u32, &'static str> {
+    let lp = b + CONN_HOST_CSR_TOP + LPCTL;
+    if !(map_page(b + WFDMA0) && map_page(b + (DMASHDL_SW_CONTROL & !0xfff))) {
+        serial_println!("[mt7925] s7 -> NOT ATTEMPTED why=unmapped rel=found");
+        return Err("unmapped");
+    }
+    let took = match take_own(lp) {
+        Ok(t) => t,
+        Err((last, rel)) => {
+            serial_println!("[mt7925] s7 -> NOT ATTEMPTED why=own lpctl={:#010x} rel={}", last, rel);
+            return Err("own");
+        }
+    };
+    let kept = if r32(h.q15) as u64 == h.wm && r32(h.q0) as u64 == h.rx0 { "kept" } else { "lost" };
+    let mut rxb2 = S7_RXB.load(Ordering::Relaxed);
+    if rxb2 == 0 {
+        let v = crate::arch::memory::dma::ident(RX_BLOCK, 4096);
+        if v != 0 && v + RX_BLOCK as u64 <= DMA_LIMIT {
+            rxb2 = v;
+            S7_RXB.store(v, Ordering::Relaxed);
+        }
+    }
+    let q2 = b + RX_EVENT_RING_BASE + RXQ_DATA * RING_REGS;
+    let pre = if rxb2 == 0 {
+        Err(String::from("no-memory")) // nothing written to a ring register
+    } else {
+        let data = [(b + TX_RING_BASE + TXQ_DATA * RING_REGS, tx0), (q2, rx2)];
+        wake(b, h, &data)
+    };
+    let path = S7_PATH.load(Ordering::Relaxed);
+    let mut reps: Vec<BandRep> = Vec::new();
+    if pre.is_ok() {
+        hand_rx(rx2, rxb2);
+        w32(q2 + 8, RX_BUFS); // RX ring 2's 31 buffers handed (ring 0's convention: descriptor 31 unhanded)
+        let mut r = Rx2 { q: q2, desc: rx2, bufs: rxb2, ri: 0 };
+        if path == PATH_UNREAD || path & PATH_2G != 0 {
+            reps.push(band(h, &mut r, "2g", BAND_2G, &CH_2G, true, &mut *on_frame));
+        }
+        if path != PATH_UNREAD && path & PATH_5G != 0 {
+            reps.push(band(h, &mut r, "5g", BAND_5G, &CH_5G, false, &mut *on_frame));
+        }
+    }
+    let rel = give_back(lp, took);
+    if let Err(w) = pre {
+        serial_println!("[mt7925] s7 -> NOT ATTEMPTED why={} rel={}", w, rel);
+        return Err("pre");
+    }
+    for r in &reps {
+        let ack = r.ack.map_or(String::from("-"), |a| alloc::format!("{:#04x}", a));
+        match r.why {
+            None => serial_println!(
+                "[mt7925] s7 scan band={} type={} req={} ack={} done={} frames={} skip={} bss={} -> parked",
+                r.name, r.kind, r.req, ack, r.done.unwrap_or(0), r.n.frames, r.n.skip, r.n.bss
+            ),
+            Some(w) => serial_println!(
+                "[mt7925] s7 scan band={} type={} req={} -> REFUSED why={} ack={} frames={} skip={} bss={}",
+                r.name, r.kind, r.req, w, ack, r.n.frames, r.n.skip, r.n.bss
+            ),
+        }
+    }
+    let ps = if path == PATH_UNREAD { String::from("-") } else { alloc::format!("{:#04x}", path) };
+    serial_println!("[mt7925] s7 path={} held={} rel={}", ps, kept, rel);
+    Ok(reps.iter().map(|r| r.n.frames).sum())
+}
+
+/// `tests wifiscan`'s known-answer rows (hand-assembled, no capture): the 2.4 GHz active request's length, TLV order and
+/// lengths at their offsets, scan type, probe count, split bit, dwell 60 / timeout 660, wildcard SSID, 11 listed channels;
+/// the 5 GHz passive request's dwell 120 / timeout 1080 and first channel 36; three RX descriptors: a normal frame with G4+G1
+/// and pad 1 starts at 66, a translated one and a packet type 7 are refused.
+pub fn scan_kat() -> bool {
+    let v = scan_req(5, BAND_2G, &CH_2G, true);
+    fn u(v: &[u8], o: usize) -> u16 {
+        u16::from_le_bytes([v[o], v[o + 1]])
+    }
+    let mut ok = v.len() == 948 && v[0] == 5 && v[1] == 0;
+    let tags = [
+        (4, SCAN_TAG_REQ, SCAN_REQ_LEN),
+        (24, SCAN_TAG_SSID, SCAN_SSID_LEN),
+        (176, SCAN_TAG_BSSID, SCAN_BSSID_LEN),
+        (192, SCAN_TAG_CHANNEL, SCAN_CHAN_LEN),
+        (328, SCAN_TAG_IE, SCAN_IE_LEN),
+        (936, SCAN_TAG_MISC, SCAN_MISC_LEN),
+    ];
+    for (o, t, l) in tags {
+        ok &= u(&v, o) == t && u(&v, o + 2) as usize == l;
+    }
+    ok &= v[8] == 1 && v[9] == 2 && v[10] == SCAN_FUNC_SPLIT && u(&v, 12) == 60 && u(&v, 14) == 60 && u(&v, 16) == 660;
+    ok &= v[28] == SSID_WILDCARD && v[29] == 0;
+    ok &= v[196] == CHAN_LISTED && v[197] == 11 && v[200] == BAND_2G && v[201] == 1 && v[220] == BAND_2G && v[221] == 11;
+    let p = scan_req(1, BAND_5G, &CH_5G, false);
+    ok &= p[8] == 0 && p[9] == 0 && u(&p, 14) == 120 && u(&p, 16) == 1080 && p[197] == 9 && p[200] == BAND_5G && p[201] == 36;
+    let mut f = alloc::vec![0u8; 90];
+    f[0..4].copy_from_slice(&((PKT_NORMAL << 27) | 90).to_le_bytes());
+    f[4..8].copy_from_slice(&(RXD1_G4 | RXD1_G1).to_le_bytes());
+    f[8..12].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    ok &= rx_frame(&f) == Some(66..90);
+    f[8..12].copy_from_slice(&((1u32 << 13) | RXD2_HDR_TRANS).to_le_bytes());
+    ok &= rx_frame(&f).is_none();
+    f[8..12].copy_from_slice(&(1u32 << 13).to_le_bytes());
+    f[0..4].copy_from_slice(&((7u32 << 27) | 90).to_le_bytes());
+    ok &= rx_frame(&f).is_none();
+    ok
 }
