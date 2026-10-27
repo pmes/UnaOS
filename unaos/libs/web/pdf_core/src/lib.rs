@@ -51,7 +51,7 @@ pub mod annots;
 pub mod write;
 pub mod sig;
 
-pub use doc::{Document, Info, Page, XrefKind};
+pub use doc::{Document, Info, OutlineItem, Page, XrefKind};
 pub use object::{Dict, Object, Ref, Stream};
 pub use annots::{Annot, Field, Form};
 

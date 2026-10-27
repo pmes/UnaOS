@@ -282,7 +282,7 @@ impl crate::AetherEngine {
     }
 
     /// Carry out a link: /URI navigates (the `<a>` path's `pending_nav`); /GoTo and /Named scroll.
-    fn pdf_follow(&mut self, link: LinkAction) {
+    pub(crate) fn pdf_follow(&mut self, link: LinkAction) {
         let vh = self.height as f64;
         let Some(pdf) = self.pdf.as_ref() else { return };
         let y = match link {

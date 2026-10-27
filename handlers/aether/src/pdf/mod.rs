@@ -23,8 +23,8 @@
 //!   `spans_to_string`;
 //! * find: `chrome::find::find_all` over each page's text joined by PDF3's `spans_to_string_mapped` (a match may cross
 //!   spans of one line), the engine's own `FindState`; hits painted as glyph-bounded span sub-boxes;
-//! * thumbnails: [`thumbs`] (PDF4-THUMBS SR360) — F4 toggles a left strip painted into the same frame, its pages
-//!   through the same (page, dpi) cache; a click scrolls to the page;
+//! * the left strip: [`thumbs`] (PDF4-THUMBS SR360, PDF4-OUTLINE / PDF4-THUMBSCROLL SR374) — F4 cycles thumbnails ->
+//!   outline -> off, painted into the same frame; a wheel over it scrolls it (`pdf_wheel`); a click goes to the page;
 //! * the status line: `AetherEngine::pdf_status` ("Page p / n");
 //! * links and form widgets: [`forms`] (PDF4ANNOTS SR343) — /URI, /GoTo and /Named links (hover: the pointer and the
 //!   status line), check boxes and text fields filled through pdf_core's `Form::set_value` + `Edit::save_update`.
@@ -38,7 +38,7 @@ pub mod thumbs;
 #[cfg(test)]
 mod tests;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -135,6 +135,14 @@ pub struct PdfDocument {
     /// device px at the zoom), which the page lane starts after.
     pub thumbs: bool,
     pub left: f64,
+    /// PDF4-OUTLINE (SR374): the open strip's mode, the outline (pdf_core's `outlines_with`, empty when the file has
+    /// none or it was refused), each item's toggle (open: its children shown), and PDF4-THUMBSCROLL's stored strip
+    /// scroll in device px with the page it last followed (`thumbs::sync`).
+    pub side: thumbs::Side,
+    pub outline: Vec<pdf_core::OutlineItem>,
+    pub outline_open: Vec<bool>,
+    pub strip_off: Cell<f64>,
+    pub strip_cur: Cell<Option<usize>>,
 }
 
 impl PdfDocument {
@@ -160,8 +168,10 @@ impl PdfDocument {
         }
         let title = doc.info().title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         let n = pages.len();
-        let page_refs = pages.iter().map(|p| p.obj).collect();
+        let page_refs: Vec<Option<Ref>> = pages.iter().map(|p| p.obj).collect();
         let form = doc.form();
+        let outline = doc.outlines_with(&page_refs).unwrap_or_default();
+        let outline_open = outline.iter().map(|i| i.open).collect();
         Ok(PdfDocument {
             doc,
             pages,
@@ -183,6 +193,11 @@ impl PdfDocument {
             form_refused: None,
             thumbs: false,
             left: 0.0,
+            side: thumbs::Side::Thumbs,
+            outline,
+            outline_open,
+            strip_off: Cell::new(0.0),
+            strip_cur: Cell::new(None),
         })
     }
 
@@ -495,7 +510,7 @@ impl crate::AetherEngine {
         if pdf.in_strip(x) {
             pdf.pressed = None;
             pdf.sel.drag = None;
-            return self.pdf_thumb_click(y);
+            return self.pdf_thumb_click(x, y);
         }
         // PDF4ANNOTS (SR343): a press on a link or form widget starts no selection (its release activates it); a press
         // anywhere else blurs the focused text field.
@@ -661,15 +676,15 @@ impl crate::AetherEngine {
         self.pdf_scroll_x(0.0);
     }
 
-    /// The PDF's view keys when no field takes them: unmodified Left / Right scroll a line sideways, F4 toggles the
-    /// thumbnail strip. False without a PDF and for any other key.
+    /// The PDF's view keys when no field takes them: unmodified Left / Right scroll a line sideways, F4 cycles the left
+    /// strip (thumbnails, outline, off: `pdf_strip_cycle`). False without a PDF and for any other key.
     pub(crate) fn pdf_view_key(&mut self, key: &str) -> bool {
         use crate::forms::edit::{parse_key, Key};
         if self.pdf.is_none() {
             return false;
         }
         if key == "F4" {
-            self.pdf_thumbs_toggle();
+            self.pdf_strip_cycle();
             return true;
         }
         let (m, k) = parse_key(key);
@@ -682,6 +697,27 @@ impl crate::AetherEngine {
             _ => return false,
         };
         self.handle_event(crate::api::events::Event::Scroll(dx, 0.0));
+        true
+    }
+}
+
+// =================================================================================================
+// PDF4-THUMBSCROLL (SR374): the wheel door. The face's wheel (aether-shell's `BrowserScroll` arm) asks here first: the
+// one `Event::Scroll` clamp cannot tell a wheel from a key, find or link scroll, several of which arrive with the pointer
+// resting on the strip.
+// =================================================================================================
+
+impl crate::AetherEngine {
+    /// A wheel of (`dx`, `dy`) CSS px: when a PDF's strip is open and the pointer is over it, the strip's stored
+    /// scroll moves by `dy` (device px at the zoom, clamped to its content) and the frame repaints; true (the pages do
+    /// not move, `dx` is dropped). False otherwise: the caller sends its `Event::Scroll` as before.
+    pub fn pdf_wheel(&mut self, _dx: f64, dy: f64) -> bool {
+        let (z, dh) = (self.zoom(), self.device.1 as f64);
+        let Some((px, _)) = self.pointer else { return false };
+        let Some(pdf) = self.pdf.as_ref().filter(|p| p.in_strip(px)) else { return false };
+        let max = (thumbs::extent(pdf) - dh).max(0.0);
+        pdf.strip_off.set((pdf.strip_off.get() + dy * z).clamp(0.0, max));
+        self.pdf_dirty();
         true
     }
 }

@@ -494,3 +494,84 @@ struct Inherit {
     crop: Option<[f64; 4]>,
     rotate: Option<i64>,
 }
+
+// =================================================================================================
+// PDF4-OUTLINE (LEDGER SR374): the document outline (ISO 32000-1 §12.3.3), the bookmarks panel's model.
+// =================================================================================================
+
+/// The most outline items one document may list.
+pub const MAX_OUTLINE: usize = 1 << 16;
+
+/// One outline item, in pre-order (a parent before its children, siblings in /Next order).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutlineItem {
+    /// /Title through the one text-string decoder (`text_string`); empty when absent.
+    pub title: String,
+    /// 0 for the outline's top items, one more per /First step.
+    pub level: usize,
+    /// /Dest through the one destination resolver, else /A through the one action reader (`annots::link`).
+    pub action: Option<crate::annots::LinkAction>,
+    /// /Count positive: the item is open (its children shown); negative or absent: closed.
+    pub open: bool,
+    /// The item's direct children.
+    pub kids: usize,
+}
+
+impl Document {
+    /// The outline (empty when the catalog names none), destinations resolved against this document's pages.
+    pub fn outlines(&self) -> Result<Vec<OutlineItem>, Error> {
+        let refs: Vec<Option<Ref>> = self.pages()?.iter().map(|p| p.obj).collect();
+        self.outlines_with(&refs)
+    }
+
+    /// The outline with destinations resolved against `page_refs` (each page's object reference, in page order).
+    /// A /First or /Next chain that reaches an item twice is refused as [`Error::Loop`], nesting past [`MAX_DEPTH`]
+    /// as [`Error::Depth`], more than [`MAX_OUTLINE`] items as [`Error::TooLarge`].
+    pub fn outlines_with(&self, page_refs: &[Option<Ref>]) -> Result<Vec<OutlineItem>, Error> {
+        let mut out = Vec::new();
+        let Some(cat) = self.catalog() else { return Ok(out) };
+        let Object::Dict(root) = self.get(cat.get(b"Outlines").unwrap_or(&Object::Null)) else { return Ok(out) };
+        let Some(first) = root.get(b"First") else { return Ok(out) };
+        let mut seen = BTreeSet::new();
+        outline_walk(self, first, 0, page_refs, &mut seen, &mut out)?;
+        Ok(out)
+    }
+}
+
+/// Append the sibling chain starting at `first` (and each one's children) at `level`; returns the chain's length.
+fn outline_walk(
+    doc: &Document,
+    first: &Object,
+    level: usize,
+    page_refs: &[Option<Ref>],
+    seen: &mut BTreeSet<Ref>,
+    out: &mut Vec<OutlineItem>,
+) -> Result<usize, Error> {
+    if level > MAX_DEPTH {
+        return Err(Error::Depth);
+    }
+    let mut cur = Some(first.clone());
+    let mut n = 0;
+    while let Some(o) = cur.take() {
+        if let Some(r) = o.as_ref() {
+            if !seen.insert(r) {
+                return Err(Error::Loop);
+            }
+        }
+        let Object::Dict(d) = doc.get(&o) else { break };
+        if out.len() >= MAX_OUTLINE {
+            return Err(Error::TooLarge);
+        }
+        let title = d.get(b"Title").map(|t| doc.get(t)).and_then(|t| t.as_str().map(text_string)).unwrap_or_default();
+        let open = d.get(b"Count").map(|c| doc.get(c)).and_then(|c| c.as_int()).is_some_and(|c| c > 0);
+        let action = crate::annots::link(doc, &d, page_refs);
+        let at = out.len();
+        out.push(OutlineItem { title, level, action, open, kids: 0 });
+        if let Some(kid) = d.get(b"First") {
+            out[at].kids = outline_walk(doc, kid, level + 1, page_refs, seen, out)?;
+        }
+        n += 1;
+        cur = d.get(b"Next").cloned();
+    }
+    Ok(n)
+}
