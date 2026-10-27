@@ -4196,3 +4196,157 @@ mod device_damage_tests {
         assert_eq!(present_damage(&e, &damages, &mut mark), vec![video], "the overlay rect alone");
     }
 }
+
+// =================================================================================================
+// AETHERMACGPU-SCROLL (LEDGER SR351): a viewport scroll presented as a copy of the kept frame plus the exposed band.
+// =================================================================================================
+
+/// [`present_damage`] with the viewport scroll as a copy-rect: `(rects, Some((0, dy)))` when the presented frame is the
+/// kept one moved `dy` device rows (pixel `(x, y)` to `(x, y + dy)`, quartzite `damage::scroll`) plus `rects` (the damaged
+/// CSS rects on the device, the exposed band among them): only the truncated `scroll_y` moved since `mark` (by `k`, less
+/// than the viewport), a layout and no PDF, a list that is neither empty nor covering, and a device height that is the CSS
+/// one times a power of two (zoom 100 / 200 / 400 when the sizes divide), where `present_rgba`'s bilinear is exact under
+/// the shift (`fy(d + k z) = fy(d) + k` in f64; the clamped edge rows that move inward lie inside the band's one-CSS-px
+/// growth). Every other case is `(present_damage(..), None)`. Updates `mark`.
+pub fn present_scroll(engine: &crate::AetherEngine, damages: &[DamageRect], mark: &mut PresentMark) -> (Vec<DamageRect>, Option<(i32, i32)>) {
+    let scroll = (engine.scroll_x as i32, engine.scroll_y as i32);
+    let k = scroll.1 - mark.scroll.1;
+    let css = (engine.width, engine.height);
+    let device = engine.device_size();
+    let covers = damages.iter().any(|&(x, y, w, h)| x == 0 && y == 0 && w >= css.0 && h >= css.1);
+    let z = (css.1 > 0 && device.1 % css.1 == 0).then(|| device.1 / css.1).filter(|z| z.is_power_of_two());
+    let pair = scroll.0 == mark.scroll.0 && k != 0 && k.unsigned_abs() < css.1;
+    match z {
+        Some(z) if pair && engine.layout_tree.is_some() && engine.pdf.is_none() && !damages.is_empty() && !covers => {
+            mark.scroll = scroll;
+            (device_rects(damages, css, device), Some((0, -k * z as i32)))
+        }
+        _ => (present_damage(engine, damages, mark), None),
+    }
+}
+
+/// PDF1's file builder, for the PDF case of `presentrects_style_rect_kat`.
+#[cfg(test)]
+#[path = "../../../../unaos/libs/web/pdf_core/tests/common/mod.rs"]
+#[allow(dead_code)]
+mod presentrects_builder;
+
+#[cfg(test)]
+mod presentrects_tests {
+    use super::presentrects_builder as builder;
+    use super::{PresentMark, device_rects, present_damage, present_scroll};
+    use crate::AetherEngine;
+
+    fn engine(html: &str, device: (u32, u32), zoom: u32) -> AetherEngine {
+        let mut e = AetherEngine::new();
+        e.set_device_size(device.0, device.1);
+        e.set_zoom_pct(zoom);
+        e.load_html_styled("file:///page/index.html", html, &[], true);
+        let _ = e.render_frame();
+        e
+    }
+
+    fn fnv(bytes: impl Iterator<Item = u8>) -> u64 {
+        bytes.fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+    }
+
+    fn inside(rects: &[super::DamageRect], x: u32, y: u32) -> bool {
+        rects.iter().any(|&(rx, ry, rw, rh)| x >= rx && x < rx + rw && y >= ry && y < ry + rh)
+    }
+
+    /// A one-element style change at zoom 100, 150 and 200 converts only its rect: written into a poisoned frame, every
+    /// pixel outside the rect keeps the poison (the fnv of the rest is unchanged) and every pixel inside equals the whole
+    /// `present_rgba`; written into the frame presented before, the result IS the whole new frame. A PDF refuses.
+    #[test]
+    fn presentrects_style_rect_kat() {
+        let html = r#"<html><body style="margin:0"><div id="a" style="margin:40px;width:60px;height:30px;background:#00f"></div>
+            <div style="height:2000px"></div></body></html>"#;
+        for (zoom, device) in [(100u32, (400u32, 300u32)), (150, (600, 450)), (200, (800, 600))] {
+            let mut e = engine(html, device, zoom);
+            let mut mark = PresentMark::default();
+            let _ = present_damage(&e, &[(0, 0, e.width, e.height)], &mut mark);
+            let (_, _, before) = e.present_rgba();
+            e.js_engine.as_mut().expect("js").eval_string("document.getElementById('a').style.background = '#f00'").expect("restyle");
+            e.tick();
+            let _ = e.render_frame();
+            // The element's box (what `damage_node` damages for a restyle of it), over the repainted surface.
+            let a = e.document.as_ref().and_then(|d| crate::dom::a11y::by_id(d, "a")).expect("#a");
+            let (x, y, w, h) = e.box_of(&a).expect("#a box");
+            let boxed = (x.floor() as u32, y.floor() as u32, w.ceil() as u32 + 1, h.ceil() as u32 + 1);
+            let rects = present_damage(&e, &[boxed], &mut mark);
+            let area: u64 = rects.iter().map(|r| r.2 as u64 * r.3 as u64).sum();
+            assert!(area * 4 < device.0 as u64 * device.1 as u64, "zoom {zoom}: small rects, got {rects:?}");
+            let (w, h, after) = e.present_rgba();
+            assert_eq!((w, h), device);
+            assert_ne!(before, after, "zoom {zoom}: the restyle changed the frame");
+            let mut poisoned = vec![0x5Au8; after.len()];
+            assert!(e.present_rects(&mut poisoned, &rects));
+            let outside = |f: &[u8]| {
+                fnv((0..h).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| !inside(&rects, x, y)).flat_map(|(x, y)| {
+                    let o = ((y * w + x) * 4) as usize;
+                    f[o..o + 4].to_vec()
+                }))
+            };
+            assert_eq!(outside(&poisoned), outside(&vec![0x5Au8; after.len()]), "zoom {zoom}: the rest untouched");
+            for y in 0..h {
+                for x in (0..w).filter(|&x| inside(&rects, x, y)) {
+                    let o = ((y * w + x) * 4) as usize;
+                    assert_eq!(poisoned[o..o + 4], after[o..o + 4], "zoom {zoom}: ({x},{y}) as the whole frame");
+                }
+            }
+            let mut kept = before.clone();
+            assert!(e.present_rects(&mut kept, &rects));
+            assert_eq!(kept, after, "zoom {zoom}: the kept frame plus the rects is the new frame");
+            assert!(!e.present_rects(&mut vec![0u8; 16], &rects), "a frame of another size refuses");
+        }
+        let mut b = builder::PdfBuilder::new(1);
+        b.obj(1, "<< /Type /Catalog /Pages 2 0 R >>")
+            .obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 100] >>")
+            .obj(3, "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>")
+            .stream(4, "", b"1 0 0 rg 0 0 200 100 re f");
+        let mut e = AetherEngine::new();
+        e.set_device_size(300, 200);
+        e.load_pdf("https://example.com/a.pdf", b.classic(), true);
+        assert!(e.pdf.is_some(), "the PDF opened");
+        let mut frame = vec![7u8; 300 * 200 * 4];
+        assert!(!e.present_rects(&mut frame, &[(0, 0, 10, 10)]), "a PDF refuses");
+        assert!(frame.iter().all(|&b| b == 7), "untouched");
+    }
+
+    /// A viewport scroll at zoom 100 and 200 presents as the copy pair `(0, -k z)` plus the exposed band on the device;
+    /// at zoom 150 (no exact shift) and after a zoom change it is the whole frame; an unscrolled frame after is rects.
+    #[test]
+    fn presentrects_scroll_pair_kat() {
+        let html = r#"<html><body style="margin:0"><div style="height:3000px;background:linear-gradient(red,blue)"></div></body></html>"#;
+        for (zoom, device, dy, band) in [(100u32, (300u32, 200u32), -40, (0, 160, 300, 40)), (200, (600, 400), -80, (0, 318, 600, 82))] {
+            let mut e = engine(html, device, zoom);
+            assert_eq!((e.width, e.height), (300, 200));
+            let mut mark = PresentMark::default();
+            assert_eq!(present_scroll(&e, &[(0, 0, 300, 200)], &mut mark), (vec![(0, 0, device.0, device.1)], None));
+            e.handle_event(crate::api::events::Event::Scroll(0.0, 40.0));
+            let damages = e.render_frame();
+            assert_eq!(damages, vec![(0, 160, 300, 40)], "zoom {zoom}: the engine damages the exposed band");
+            assert_eq!(device_rects(&damages, (300, 200), device), vec![band]);
+            assert_eq!(present_scroll(&e, &damages, &mut mark), (vec![band], Some((0, dy))), "zoom {zoom}: the pair");
+            e.damage_rects.push((5, 6, 7, 8));
+            let damages = e.render_frame();
+            let (rects, scroll) = present_scroll(&e, &damages, &mut mark);
+            assert_eq!((rects, scroll), (device_rects(&[(5, 6, 7, 8)], (300, 200), device), None), "zoom {zoom}: no scroll since");
+            e.handle_event(crate::api::events::Event::Scroll(0.0, -25.0));
+            let damages = e.render_frame();
+            assert_eq!(present_scroll(&e, &damages, &mut mark).1, Some((0, 25 * (zoom as i32 / 100))), "zoom {zoom}: up");
+        }
+        let mut e = engine(html, (450, 300), 150);
+        let mut mark = PresentMark::default();
+        let _ = present_scroll(&e, &[(0, 0, e.width, e.height)], &mut mark);
+        e.handle_event(crate::api::events::Event::Scroll(0.0, 40.0));
+        let damages = e.render_frame();
+        assert_eq!(present_scroll(&e, &damages, &mut mark), (vec![(0, 0, 450, 300)], None), "zoom 150: whole");
+        let mut e = engine(html, (600, 400), 100);
+        let mut mark = PresentMark::default();
+        let _ = present_scroll(&e, &[(0, 0, e.width, e.height)], &mut mark);
+        e.set_zoom_pct(200);
+        let damages = e.render_frame();
+        assert_eq!(present_scroll(&e, &damages, &mut mark), (vec![(0, 0, 600, 400)], None), "a zoom change: whole");
+    }
+}

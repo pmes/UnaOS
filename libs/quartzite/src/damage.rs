@@ -182,3 +182,69 @@ mod tests {
         assert_eq!(kept, new);
     }
 }
+
+// AETHERMACGPU-SCROLL (LEDGER SR351): the copy-rect op of a scroll blit (`SurfaceBlit { scroll: Some((dx, dy)) }`).
+
+/// Move the pixels of a `width x height` frame of 4-byte pixels (RGBA or cairo ARgb32 alike, stride `width * 4`) by
+/// `(dx, dy)`: pixel `(x, y)` lands at `(x + dx, y + dy)`; the pixels nothing lands on keep their old bytes (the blit's
+/// rects then overwrite the exposed band). Rows are copied in the order that never reads a row already written. `false`,
+/// and `frame` untouched, on a length mismatch or `|dx| >= width` or `|dy| >= height`. The ONE copy op: the sender's kept
+/// frame (`tetra::SurfaceDamage::present`) and every receiver's (`tetra::surface_apply`).
+pub fn scroll(frame: &mut [u8], width: u32, height: u32, (dx, dy): (i32, i32)) -> bool {
+    let (w, h) = (width as usize, height as usize);
+    let (ax, ay) = (dx.unsigned_abs() as usize, dy.unsigned_abs() as usize);
+    if frame.len() != w * h * 4 || ax >= w || ay >= h {
+        return false;
+    }
+    let stride = w * 4;
+    let run = (w - ax) * 4;
+    let (sx, tx) = if dx >= 0 { (0, ax * 4) } else { (ax * 4, 0) };
+    let copy = |f: &mut [u8], r: usize| {
+        let (sy, ty) = if dy >= 0 { (r, r + ay) } else { (r + ay, r) };
+        f.copy_within(sy * stride + sx..sy * stride + sx + run, ty * stride + tx);
+    };
+    if dy > 0 {
+        (0..h - ay).rev().for_each(|r| copy(frame, r));
+    } else {
+        (0..h - ay).for_each(|r| copy(frame, r));
+    }
+    true
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::scroll;
+
+    /// The copy equals a per-pixel reference (each moved pixel from its source, the rest unchanged) for every sign of dx
+    /// and dy; out-of-range shifts and a length mismatch refuse and leave the frame untouched.
+    #[test]
+    fn damage_scroll_kat() {
+        let (w, h) = (5u32, 4u32);
+        let frame: Vec<u8> = (0..(w * h * 4) as usize).map(|i| i as u8).collect();
+        for dx in -4i32..=4 {
+            for dy in -3i32..=3 {
+                let mut got = frame.clone();
+                assert!(scroll(&mut got, w, h, (dx, dy)), "({dx},{dy})");
+                let mut want = frame.clone();
+                for y in 0..h as i32 {
+                    for x in 0..w as i32 {
+                        let (sx, sy) = (x - dx, y - dy);
+                        if sx >= 0 && sy >= 0 && sx < w as i32 && sy < h as i32 {
+                            let (o, s) = (((y * w as i32 + x) * 4) as usize, ((sy * w as i32 + sx) * 4) as usize);
+                            want[o..o + 4].copy_from_slice(&frame[s..s + 4]);
+                        }
+                    }
+                }
+                assert_eq!(got, want, "({dx},{dy})");
+            }
+        }
+        for bad in [(5, 0), (-5, 0), (0, 4), (0, -4)] {
+            let mut f = frame.clone();
+            assert!(!scroll(&mut f, w, h, bad), "{bad:?}");
+            assert_eq!(f, frame);
+        }
+        let mut short = vec![1u8; 8];
+        assert!(!scroll(&mut short, w, h, (0, 1)));
+        assert_eq!(short, vec![1u8; 8]);
+    }
+}

@@ -511,7 +511,7 @@ impl Face {
     /// The canvas as the surface's blit.
     pub fn frame(&mut self) -> SMessage {
         let (width, height) = self.canvas;
-        SMessage::SurfaceBlit { url: SURFACE.into(), width, height, pixels: self.paint(), damage: None }
+        SMessage::SurfaceBlit { url: SURFACE.into(), width, height, pixels: self.paint(), damage: None, scroll: None }
     }
 }
 
@@ -2243,8 +2243,8 @@ impl Face {
         let (pw, ph) = s.preview_canvas;
         let (tw, th) = self.canvas;
         vec![
-            SMessage::SurfaceBlit { url: PREVIEW_SURFACE.into(), width: pw, height: ph, pixels: preview, damage: None },
-            SMessage::SurfaceBlit { url: TRACKS_SURFACE.into(), width: tw, height: th, pixels: tracks, damage: None },
+            SMessage::SurfaceBlit { url: PREVIEW_SURFACE.into(), width: pw, height: ph, pixels: preview, damage: None, scroll: None },
+            SMessage::SurfaceBlit { url: TRACKS_SURFACE.into(), width: tw, height: th, pixels: tracks, damage: None, scroll: None },
         ]
     }
 }
