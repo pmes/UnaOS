@@ -582,6 +582,6 @@ pub fn test() {
     for s in [&l1, &l2, &l3] {
         serial_println!("{}", s);
     }
-    *DONE.lock() = Some([l1, l2, l3]);
+    *DONE.lock() = Some([l1, l2, l3]); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { use crate::allocator::census::{retag, GEN7_HELD}; retag(sp as usize, lay_s.size(), GEN7_HELD); retag(dp as usize, lay_d.size(), GEN7_HELD); } // FIXTURERETAIN (B1017): sp/dp are `gen7-held`. LINE-NEUTRAL append, code first
     // sp/dp are deliberately not freed (reclaim=held); dcpu/dgpu were never GGTT-mapped and drop here.
 }

@@ -605,7 +605,7 @@ mod memcensus {
     const BEFORE: usize = 1;
     const AFTER: usize = 2;
     /// The count-once set (census tag names).
-    const ONCE: [&str; 4] = ["stage", "shadow", "wallpaper", "help"];
+    const ONCE: [&str; 5] = ["stage", "shadow", "wallpaper", "help", "gen7-held"];
     /// FIRST, BEFORE, AFTER. Each snapshot is taken (heap lock) before this lock: the two never nest.
     static SNAPS: crate::sync::Mutex<[Option<Snapshot>; 3]> = crate::sync::Mutex::new([None; 3]);
 
@@ -677,7 +677,7 @@ mod memcensus {
         if top.is_empty() {
             top.push('-');
         }
-        serial_println!("[memline] top {} once_kb={} once=stage,shadow,wallpaper,help raw_delta_pct={}", top, once / 1024, raw);
+        serial_println!("[memline] top {} once_kb={} once=stage,shadow,wallpaper,help,gen7-held raw_delta_pct={}", top, once / 1024, raw);
         let retained = b.used.saturating_sub(f.used); // MEMLINEREBUILD (B1009): the session's growth before the teardown
         let leaked = a.used as i64 - b.used as i64;
         let scored = if src == "rebuild" && snaps[BEFORE].is_some() {

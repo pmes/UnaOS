@@ -6773,7 +6773,7 @@ mod r8 {
                 pages, bytes, reclaim_reason
             );
         } else if reversal_clean {
-            let _ = (ring_page, src_page, dst_page);
+            let _ = (ring_page, src_page, dst_page); #[cfg(all(target_arch = "x86_64", feature = "wc"))] { use crate::allocator::census::{retag, GEN7_HELD}; retag(ring_page as usize, ring_layout.size(), GEN7_HELD); retag(src_page as usize, src_layout.size(), GEN7_HELD); retag(dst_page as usize, dst_layout.size(), GEN7_HELD); } // FIXTURERETAIN (B1017): R8's held surfaces are `gen7-held` (the leaked branch below stays fx:gen7). LINE-NEUTRAL append, code first
             serial_println!(
                 ":: gen7: r8 reclaim=held pages={} bytes={} reason={} note=GEN7TLB-DECIDED-RETENTION-engine-quiesced-every-write-restored-and-NO-GGTT-invalidation-witness-exists-on-this-part-bounded-and-documented-accepted-gen7.md-2.6 ::",
                 pages, bytes, reclaim_reason
