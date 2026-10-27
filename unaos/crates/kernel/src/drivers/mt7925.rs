@@ -91,7 +91,7 @@ pub fn service() {
         S_S4 => s4(), // MT7925S4 (zenbook-ledger Z17): the pass after a clean S3 line (`s3_done`)
         S_S5 => s5(), // MT7925S5 (zenbook-ledger Z23): the pass after a kept S4 line (`s4_done`)
         S_S6 => s6(), // MT7925S6 (zenbook-ledger Z29): the pass after a clean S5 line (`s5` hands to it with the channel parked)
-        _ => {}
+        _ => watch(), // S9WATCH (zenbook-ledger Z56): the parked arm watches the S9 link (one atomic load with no link)
     }
 }
 
@@ -1939,6 +1939,9 @@ pub struct JoinPlan<'a> {
     pub ssid: &'a str,
     pub bssid: [u8; 6],
     pub channel: u8,
+    /// S9WATCH (zenbook-ledger Z56): the station's deauth / disassoc judge (`wifi/assoc.rs::refusal`), handed in like S8's judges
+    /// and kept in the S9 link, so the driver links no wifi_core.
+    pub watch: Judge,
 }
 
 /// What `join` did.
@@ -1977,8 +1980,7 @@ struct Roc {
 /// S7's prologue, hoisted unchanged out of `scan_run` (MT7925S8, Z38; the writes and the s7 lines are the same, the tag is `who`):
 /// the pages, own (`take_own`), `kept`, RX ring 2's 64 KiB buffer block, `wake` with the data rings.
 fn rx_open(b: u64, h: &mut Hw, tx0: u64, rx2: u64, who: &'static str) -> Result<Run, &'static str> {
-    let dropped = S9_LINK.lock().take(); // MT7925S9 (Z46): a scan or join re-wakes the rings, so the S9 link ends first (its line)
-    let was = dropped.map_or(false, |l| link_down(l, who));
+    let was = link_down(who); // MT7925S9 (Z46): a scan or join re-wakes the rings, so the S9 link ends first (its line); S9WATCH (Z56): through the ONE link end
     let lp = b + CONN_HOST_CSR_TOP + LPCTL;
     if !(map_page(b + WFDMA0) && map_page(b + (DMASHDL_SW_CONTROL & !0xfff))) {
         serial_println!("[mt7925] {} -> NOT ATTEMPTED why=unmapped rel=found", who);
@@ -2283,7 +2285,7 @@ fn join_run(
         }
         posted = t.wi;
         if let Step::Ans(Answer::Ok(aid)) = rep.assoc {
-            linked = link_up(h, plan, aid, &t, r, took); // MT7925S9 (Z46): the connected BSS_INFO, STA_REC ASSOC, the S9 link
+            linked = link_up(h, plan, aid, &t, r, took); if linked { watch_arm(h); } // S9WATCH (zenbook-ledger Z56): the firmware's beacon monitor armed after the link (LINE-NEUTRAL). MT7925S9 (Z46): the connected BSS_INFO, STA_REC ASSOC, the S9 link
         }
     }
     let rel = if linked { "kept-s9" } else { give_back(lp, took) }; // MT7925S9: a linked run keeps driver-own for the data path
@@ -2425,6 +2427,12 @@ struct Link9 {
     rx_n: u32,
     skip: u32,
     full: u32,
+    /// S9WATCH (zenbook-ledger Z56): the station's MAC, the AP's BSSID, the station's judge, a refusal heard (noted by `link_rx`,
+    /// ended by `watch` on the main loop, never under smolnet's STACK).
+    me: [u8; 6],
+    bssid: [u8; 6],
+    judge: Judge,
+    lost: Option<(&'static str, u16)>,
 }
 
 /// The link, Some from `link_up` until `rx_open` ends it.
@@ -2616,7 +2624,7 @@ fn link_up(h: &mut Hw, plan: &JoinPlan, aid: u16, t: &Tx, r: Rx2, took: bool) ->
         );
         return false;
     }
-    *S9_LINK.lock() = Some(Link9 { took, aid, five: t.five, band: t.band, q0: t.q, wi: t.wi, txb, rx: r, tx: 0, rx_n: 0, skip: 0, full: 0 });
+    *S9_LINK.lock() = Some(Link9 { took, aid, five: t.five, band: t.band, q0: t.q, wi: t.wi, txb, rx: r, tx: 0, rx_n: 0, skip: 0, full: 0, me: mac().unwrap_or([0; 6]), bssid: plan.bssid, judge: plan.watch, lost: None }); // S9WATCH (Z56): the watch's four fields
     S9_RX_SAID.store(false, Ordering::Relaxed);
     S9_TX_SAID.store(false, Ordering::Relaxed);
     serial_println!(
@@ -2626,11 +2634,20 @@ fn link_up(h: &mut Hw, plan: &JoinPlan, aid: u16, t: &Tx, r: Rx2, took: bool) ->
     true
 }
 
-/// `rx_open` ended the link (a scan or join re-wakes the rings): one line; returns whether the link's run took own.
-fn link_down(l: Link9, who: &'static str) -> bool {
+/// S9WATCH (zenbook-ledger Z56): THE ONE link end (hoisted out of `rx_open`, which calls it when a scan or join re-wakes the
+/// rings; `watch` calls it on a deauth, a disassoc or the firmware's beacon loss): the link taken out of `S9_LINK`, one line, the
+/// watch disarmed, smolnet's flag raised when the stack was bound (`down_take`; the driver never calls the stack). Returns whether
+/// the link's run took own (the caller hands it back: `rx_open` with its run, `watch` at once). False with no link. Call it with
+/// no lock held (it takes `S9_LINK`). S10-KEYZERO (owed, MT7925S10's): the key teardown folds onto this body.
+pub fn link_down(why: &str) -> bool {
+    let Some(l) = S9_LINK.lock().take() else { return false };
+    S9_WATCH.store(false, Ordering::Relaxed);
+    if bound() {
+        S9_DOWN.store(true, Ordering::Relaxed);
+    }
     serial_println!(
         "[mt7925] s9 link down why={} aid={} tx={} rx={} skip={} full={}",
-        who, l.aid, l.tx, l.rx_n, l.skip, l.full
+        why, l.aid, l.tx, l.rx_n, l.skip, l.full
     );
     l.took
 }
@@ -2670,6 +2687,7 @@ pub fn link_rx(out: &mut [u8]) -> Option<usize> {
                 l.rx_n += 1;
                 return Some(n);
             }
+            Some((s, false)) => { l.skip += 1; if l.lost.is_none() { l.lost = (l.judge)(&v[s], l.me, l.bssid); } } // S9WATCH (zenbook-ledger Z56): an untranslated frame (management) judged by the station's refusal: noted, ended by `watch`
             _ => l.skip += 1,
         }
     }
@@ -2780,5 +2798,155 @@ fn link_kat() -> bool {
     ok &= rx_span(&x).is_none();
     x[8..12].copy_from_slice(&(1u32 << 13).to_le_bytes());
     ok &= rx_span(&x) == Some((66..90, false)) && rx_frame(&x) == Some(66..90);
+    ok && watch_rows() // S9WATCH (zenbook-ledger Z56): the BCNFT body and the beacon-loss event decode
+}
+
+// ── S9WATCH (zenbook-ledger Z56) — the S9 link's watch: deauth / disassoc from the AP, the firmware's beacon loss ──────────
+// The S9 link (`S9_LINK`) ended only by a later scan or join (`rx_open`); a deauthentication or disassociation from the AP, or
+// the AP gone silent, left it up while nothing flowed. Linux (mt7925, facts only): the station's beacon monitor is the
+// firmware's — at the association `mt7925_mcu_set_beacon_filter` sends ONE BSS_INFO_UPDATE with the BCNFT TLV (tag 22: the beacon
+// interval, the DTIM period) and the firmware reports the loss as the unsolicited uni event BSS_BEACON_LOSS (0x0c: hdr {bss
+// index, 3 pad}, TLV {tag, len, reason, nr_btolink, 2 pad}); a deauthentication / disassociation reaches the host as an ordinary
+// received management frame (RX ring 2, not header-translated). Here: `watch_arm` sends the BCNFT once after `link_up` (from
+// `join_run`, inside `tests wifijoin`: nothing at boot); `link_rx`'s untranslated arm hands each management frame to the
+// station's judge (`JoinPlan.watch` = `wifi/assoc.rs::refusal`, kept in the link: the driver links no wifi_core) and only NOTES a
+// refusal (under smolnet's STACK -> S9_LINK); `watch` (from `service()`'s parked arm, the main loop, no lock held) ends the link
+// on a noted refusal or on the beacon-loss event read through the ONE event consumer `event_take` (ring 0 under
+// `MCU_LINK.try_lock`, never nested with S9_LINK; other events consumed and dropped), through the ONE link end `link_down`, then
+// hands driver-own back (`give_back`). smolnet is told through its existing `dhcp_reset` on its own side (`down_take`, the one
+// line in `service_poll`). No beacon timer of our own. Owed: S9-REJOIN, S9-ROAM, S9-UNLINK (the firmware's records unwound on
+// link_down), S9-BCNDROP (linux's DROP_OTHER_BEACON rx filter), S9-BCNINT (the beacon's own interval / DTIM), S10-KEYZERO.
+// Hardware facts only; no code copied.
+
+/// The station's deauth / disassoc judge: (frame, the station's MAC, the BSSID) -> (`deauth` / `disassoc`, the reason code).
+pub type Judge = fn(&[u8], [u8; 6], [u8; 6]) -> Option<(&'static str, u16)>;
+/// MCU_UNI_EVENT_BSS_BEACON_LOSS (mt76_connac_mcu.h).
+const EVT_BCN_LOSS: u8 = 0x0c;
+/// The beacon-loss event's TLV: after the 44-byte rxd and the 4-byte header {bss index, 3 pad}; reason at +4.
+const BCN_LOSS_TLV: usize = RXD_BYTES + 4;
+/// UNI_BSS_INFO_BCNFT (mt76_connac_mcu.h); its TLV is 12 bytes {interval le16, dtim, bmc delivered ac, bmc triggered ac, 3 pad}.
+const BSS_TAG_BCNFT: u16 = 22;
+/// The beacon interval (TU) and DTIM period the BCNFT names: unread from the beacon (S9-BCNINT, with S8-BCNINT; `bss_req`'s 100).
+const BCN_TU: u16 = 100;
+const BCN_DTIM: u8 = 1;
+
+/// The watch is armed (`watch_arm`) until `link_down`: `watch` returns on this one load with no link.
+static S9_WATCH: AtomicBool = AtomicBool::new(false);
+/// `link_down` ended a link the stack was bound to; taken by smolnet's `service_poll` (`down_take`).
+static S9_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// BSS_INFO_UPDATE body with the BCNFT TLV (pure, 16 bytes): header {bss 0, 3 pad}, TLV {tag 22, len 12, `tu`, `dtim`, the two
+/// ac bytes 0, 3 pad}.
+fn bcnft_req(tu: u16, dtim: u8) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    let d = put_tlv(&mut v, 4, BSS_TAG_BCNFT, 12);
+    v[d..d + 2].copy_from_slice(&tu.to_le_bytes());
+    v[d + 2] = dtim;
+    v
+}
+
+/// The beacon-loss event's reason (pure; `ev` = the event's bytes, rxd included): None when shorter than the TLV or for
+/// another BSS index than the station's 0 (linux checks only the bss index).
+fn bcn_loss(ev: &[u8]) -> Option<u8> {
+    if ev.len() < BCN_LOSS_TLV + 8 || ev[RXD_BYTES] != 0 {
+        return None;
+    }
+    Some(ev[BCN_LOSS_TLV + 4])
+}
+
+/// After `link_up`, inside `tests wifijoin`: ONE BSS_INFO BCNFT (the firmware's beacon monitor), the watch armed either way (a
+/// refused BCNFT leaves the deauth / disassoc arm: `deauth-only`), one line.
+fn watch_arm(h: &mut Hw) {
+    let a = uni_cmd(h, UNI_BSS_INFO, &bcnft_req(BCN_TU, BCN_DTIM));
+    S9_WATCH.store(true, Ordering::Relaxed);
+    serial_println!(
+        "[mt7925] s9 watch armed bcnft={} tu={} dtim={} -> {}",
+        ack_text(&a), BCN_TU, BCN_DTIM, if a == Ok(0) { "armed" } else { "deauth-only" }
+    );
+}
+
+/// From `service()`'s parked arm (the main loop, no lock held): a refusal `link_rx` noted, else up to RING_DEPTH ring-0 events
+/// for the unsolicited beacon loss (`MCU_LINK.try_lock`: None while a scan or join holds the channel, whose `rx_open` ends the
+/// link itself); on a loss the ONE link end `link_down`, driver-own handed back, one line.
+pub fn watch() {
+    if !S9_WATCH.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(noted) = S9_LINK.lock().as_ref().map(|l| l.lost) else { return };
+    let lost = noted.or_else(|| {
+        let mut g = MCU_LINK.try_lock()?;
+        let h = g.as_mut()?;
+        let want = |eid: u8, _seq: u8, opt: u8| eid == EVT_BCN_LOSS && opt & OPT_UNSOLICITED != 0;
+        for _ in 0..RING_DEPTH {
+            if event_take(h, &want)?.is_some() {
+                if let Some(r) = bcn_loss(&h.last) {
+                    return Some(("beacon-loss", r as u16));
+                }
+            }
+        }
+        None
+    });
+    let Some((what, code)) = lost else { return };
+    let why = if what == "beacon-loss" { String::from(what) } else { alloc::format!("{}(reason={})", what, code) };
+    let stack = if bound() { "reset" } else { "unbound" };
+    let took = link_down(&why);
+    let held = *PROBE.lock();
+    let rel = match held {
+        Some(p) => give_back(p.bar0 + CONN_HOST_CSR_TOP + LPCTL, took),
+        None => "found",
+    };
+    serial_println!("[mt7925] s9 watch -> lost why={} code={} rel={} stack={}", what, code, rel, stack);
+}
+
+/// smolnet's `service_poll`: a link the stack was bound to ended since the last call (taken once).
+pub fn down_take() -> bool {
+    S9_DOWN.swap(false, Ordering::Relaxed)
+}
+
+/// `tests wifijoin`'s S9-WATCH rows (hand-assembled, no capture): canned RX ring 2 buffers (`link_kat`'s descriptor: groups 4 and
+/// 1, pad 1, frame at 66) through `rx_span` and `judge` as `link_rx`'s untranslated arm does — a deauthentication reason 3 and a
+/// disassociation reason 8 from the BSSID to the station, a deauthentication to another addr1 (not ours), the same frame marked
+/// translated (not judged) — then `watch_rows`.
+pub fn watch_kat(judge: Judge) -> bool {
+    let me = [0x02, 0x55, 0x4e, 0x41, 0x4f, 0x53];
+    let ap = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let buf = |fc0: u8, a1: [u8; 6], reason: u16, trans: bool| -> Vec<u8> {
+        let mut x = alloc::vec![0u8; 66];
+        x.extend_from_slice(&[fc0, 0, 0, 0]);
+        x.extend_from_slice(&a1);
+        x.extend_from_slice(&ap);
+        x.extend_from_slice(&ap);
+        x.extend_from_slice(&[0, 0]);
+        x.extend_from_slice(&reason.to_le_bytes());
+        let n = x.len() as u32;
+        x[0..4].copy_from_slice(&((PKT_NORMAL << 27) | n).to_le_bytes());
+        x[4..8].copy_from_slice(&(RXD1_G4 | RXD1_G1).to_le_bytes());
+        x[8..12].copy_from_slice(&((1u32 << 13) | if trans { RXD2_HDR_TRANS } else { 0 }).to_le_bytes());
+        x
+    };
+    let heard = |x: &[u8]| match rx_span(x) {
+        Some((s, false)) => judge(&x[s], me, ap),
+        _ => None,
+    };
+    let other = [0x02, 0, 0, 0, 0, 1];
+    heard(&buf(0xc0, me, 3, false)[..]) == Some(("deauth", 3))
+        && heard(&buf(0xa0, me, 8, false)[..]) == Some(("disassoc", 8))
+        && heard(&buf(0xc0, other, 3, false)[..]).is_none()
+        && heard(&buf(0xc0, me, 3, true)[..]).is_none()
+        && watch_rows()
+}
+
+/// The pure rows (no judge; also folded into `link_kat`): the BCNFT body, a canned beacon-loss event (reason 1 on bss 0), the
+/// same on bss 1, and one byte short.
+fn watch_rows() -> bool {
+    let mut ok = bcnft_req(BCN_TU, BCN_DTIM) == [0, 0, 0, 0, 22, 0, 12, 0, 100, 0, 1, 0, 0, 0, 0, 0];
+    let mut ev = alloc::vec![0u8; BCN_LOSS_TLV + 8];
+    ev[36] = EVT_BCN_LOSS;
+    ev[38] = 1 << 2;
+    ev[BCN_LOSS_TLV + 2] = 8;
+    ev[BCN_LOSS_TLV + 4] = 1;
+    ok &= bcn_loss(&ev) == Some(1) && bcn_loss(&ev[..BCN_LOSS_TLV + 7]).is_none();
+    ev[RXD_BYTES] = 1;
+    ok &= bcn_loss(&ev).is_none();
     ok
 }

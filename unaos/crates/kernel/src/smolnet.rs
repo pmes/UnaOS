@@ -714,7 +714,7 @@ fn pump_until<T>(budget_ms: i64, mut check: impl FnMut(&mut SmolStack) -> Option
 /// NETCLOCK M2: the idle service, once per main-loop pass (`e1000::service_net`). One poll when smoltcp
 /// asked for one or a frame is waiting — never per pass — and a DHCP lease that lands after `dhcp_acquire`
 /// gave up is applied here. Never spins on `STACK` (another core's syscall may hold it: next pass).
-pub fn service_poll() {
+pub fn service_poll() { #[cfg(feature = "wifi")] if crate::drivers::mt7925::down_take() { let _ = dhcp_reset(); } // S9WATCH (zenbook-ledger Z56): the MT7925 link the stack rode ended (deauth, disassoc, beacon loss, a later scan/join): the ONE DHCP socket reset through the existing hook (STATIONREJOIN's), so the held lease is dropped (`dhcp_lost`) — once per loss this waits for STACK (dhcp_reset's lock) (LINE-NEUTRAL)
     if !poll_due(false) {
         return;
     }
