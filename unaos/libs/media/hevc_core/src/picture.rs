@@ -117,6 +117,8 @@ pub struct Picture {
     pub slices: Vec<SliceInfo>,
     /// The motion of every 4x4 block (HEVCINTER).
     pub motion: Vec<PuMotion>,
+    /// HEVCREXTSCC (SR357): the block lies in a palette coding unit (8.7.2.5.7: not deblocked).
+    pub palette: Vec<bool>,
     pub poc: i32,
     pub tag: i64,
     pub full_range: bool,
@@ -157,6 +159,7 @@ impl Picture {
             sao: vec![SaoParams::default(); nctb],
             slices: Vec::new(),
             motion: vec![PuMotion::default(); n4],
+            palette: vec![false; n4],
             poc: 0,
             tag: 0,
             full_range: false,

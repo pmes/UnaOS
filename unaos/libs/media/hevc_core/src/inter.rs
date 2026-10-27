@@ -15,7 +15,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::dpb::{Dpb, RefList};
+use crate::dpb::{Dpb, RefList, CUR_PIC};
 use crate::picture::{Picture, Plane, PuMotion};
 use crate::ps::{Geometry, Pps};
 use crate::slice::{SliceHeader, SliceType};
@@ -100,6 +100,11 @@ impl<'a> InterCtx<'a> {
         self.dpb.pics.get(i).map(|d| &d.pic)
     }
 
+    /// HEVCREXTSCC (SR357): RefPicListX[refIdx] is the current picture (intra block copy).
+    pub fn is_cur(&self, x: usize, ref_idx: i8) -> bool {
+        usize::try_from(ref_idx).ok().and_then(|r| self.lists[x].dpb.get(r)).is_some_and(|&i| i == CUR_PIC)
+    }
+
     /// Normalise a motion (an unused list reset) and fill each used list's reference POC and long-term flag.
     pub fn complete(&self, m: &mut PuMotion) {
         for x in 0..2 {
@@ -177,6 +182,11 @@ fn col_mv(ctx: &InterCtx, col: &Picture, sh: &SliceHeader, xc: i32, yc: i32, x: 
     } else {
         sh.collocated_from_l0_flag as usize
     };
+    // HEVCREXTSCC (SR357, SPEC-CHECK): a collocated block that referenced its own picture (intra block copy) gives no
+    // temporal vector.
+    if m.ref_lt[lc] && m.ref_poc[lc] == col.poc {
+        return None;
+    }
     let cur_lt = *ctx.lists[x].long_term.get(ref_idx)?;
     if cur_lt != m.ref_lt[lc] {
         return None;
@@ -484,7 +494,9 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
             if !m.uses(l) {
                 continue;
             }
-            if let Some(r) = ctx.ref_pic(l, m.ref_idx[l]) {
+            // HEVCREXTSCC (SR357): the current picture's own (not yet loop-filtered) samples for intra block copy.
+            let r = if ctx.is_cur(l, m.ref_idx[l]) { Some(&*pic) } else { ctx.ref_pic(l, m.ref_idx[l]) };
+            if let Some(r) = r {
                 let mut v = vec![0i32; n];
                 if c == 0 {
                     luma_mc(&r.planes[0], cx, cy, m.mv[l], cw, ch, bd, &mut v);
@@ -532,4 +544,10 @@ pub fn predict_pu(pic: &mut Picture, ctx: &InterCtx, sh: &SliceHeader, pps: &Pps
             }
         }
     }
+}
+
+/// HEVCREXTSCC (SR357, SPEC-CHECK): a motion vector predictor in integer samples under use_integer_mv_flag (the
+/// quarter-sample vector floored to a multiple of 4).
+pub fn int_mv(v: [i32; 2]) -> [i32; 2] {
+    [(v[0] >> 2) << 2, (v[1] >> 2) << 2]
 }

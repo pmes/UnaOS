@@ -665,6 +665,10 @@ pub struct Sps {
     pub multilayer_extension_flag: bool,
     pub extension_3d_flag: bool,
     pub scc_extension_flag: bool,
+    /// HEVCREXTSCC (SR357): sps_scc_extension() (7.3.2.2.3); all off without it.
+    pub scc: SpsScc,
+    /// HEVCREXTSCC (SR357): the SCC body follows a 3D extension body this parser does not read (refused by name).
+    pub scc_unparsed: bool,
 }
 
 impl Sps {
@@ -803,8 +807,18 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
                 cabac_bypass_alignment_enabled_flag: f[8],
             };
         }
-        // The multilayer / 3D / SCC extension bodies and sps_extension_data_flag follow; the base layer needs none
-        // of them (SCC is refused at activation).
+        // HEVCREXTSCC (SR357): sps_multilayer_extension() is one flag (inter_view_mv_vert_constraint_flag); the SCC body
+        // follows it unless a 3D body (not read) comes first. sps_extension_data_flag is not read.
+        if s.multilayer_extension_flag {
+            r.skip(1);
+        }
+        if s.scc_extension_flag {
+            if s.extension_3d_flag {
+                s.scc_unparsed = true;
+            } else {
+                s.scc = parse_sps_scc(&mut r, &s)?;
+            }
+        }
         return done(&r, s);
     }
     done(&r, s)
@@ -876,6 +890,10 @@ pub struct Pps {
     pub multilayer_extension_flag: bool,
     pub extension_3d_flag: bool,
     pub scc_extension_flag: bool,
+    /// HEVCREXTSCC (SR357): pps_scc_extension() (7.3.2.3.3); all off without it.
+    pub scc: PpsScc,
+    /// HEVCREXTSCC (SR357): the SCC body follows multilayer / 3D bodies this parser does not read (refused by name).
+    pub scc_unparsed: bool,
 }
 
 pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
@@ -966,6 +984,14 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
             }
             e.log2_sao_offset_scale_luma = r.ue();
             e.log2_sao_offset_scale_chroma = r.ue();
+        }
+        // HEVCREXTSCC (SR357): the SCC body, unless multilayer / 3D bodies (not read) come first.
+        if p.scc_extension_flag {
+            if p.multilayer_extension_flag || p.extension_3d_flag {
+                p.scc_unparsed = true;
+            } else {
+                p.scc = parse_pps_scc(&mut r)?;
+            }
         }
     }
     done(&r, p)
@@ -1107,4 +1133,108 @@ pub fn hvcc_reorder_depth(hvcc: &[u8]) -> Option<u32> {
     crate::nal::unescape(nal.get(2..)?, &mut rbsp);
     let sps = parse_sps(&rbsp).ok()?;
     Some(sps.highest_ordering().max_num_reorder_pics)
+}
+
+// ---------------------------------------------------------------- screen content coding extension (HEVCREXTSCC)
+
+/// HEVCREXTSCC (LEDGER SR357): sps_scc_extension() (7.3.2.2.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpsScc {
+    pub curr_pic_ref_enabled_flag: bool,
+    pub palette_mode_enabled_flag: bool,
+    pub palette_max_size: u32,
+    pub delta_palette_max_predictor_size: u32,
+    /// sps_palette_predictor_initializer[comp][i] (None: sps_palette_predictor_initializers_present_flag 0).
+    pub palette_predictor_initializers: Option<[Vec<u16>; 3]>,
+    /// 0: quarter-sample vectors; 1: integer vectors; 2: use_integer_mv_flag per slice.
+    pub motion_vector_resolution_control_idc: u32,
+    pub intra_boundary_filtering_disabled_flag: bool,
+}
+
+impl SpsScc {
+    /// PaletteMaxPredictorSize (7-xx): palette_max_size + delta_palette_max_predictor_size.
+    pub fn palette_max_predictor_size(&self) -> u32 {
+        self.palette_max_size + self.delta_palette_max_predictor_size
+    }
+}
+
+fn parse_sps_scc(r: &mut BitReader, s: &Sps) -> Result<SpsScc> {
+    let mut e = SpsScc { curr_pic_ref_enabled_flag: r.flag(), palette_mode_enabled_flag: r.flag(), ..Default::default() };
+    if e.palette_mode_enabled_flag {
+        e.palette_max_size = ue_max(r, 64, "palette_max_size")?;
+        e.delta_palette_max_predictor_size = ue_max(r, 128, "delta_palette_max_predictor_size")?;
+        if e.palette_max_predictor_size() > 128 {
+            return Err(Error::Invalid("PaletteMaxPredictorSize above 128"));
+        }
+        if r.flag() {
+            let n = ue_max(r, 127, "sps_num_palette_predictor_initializers_minus1")? + 1;
+            if n > e.palette_max_predictor_size() {
+                return Err(Error::Invalid("sps_num_palette_predictor_initializers"));
+            }
+            let mut init: [Vec<u16>; 3] = Default::default();
+            let ncomp = if s.chroma_format_idc == 0 { 1 } else { 3 };
+            for (c, row) in init.iter_mut().enumerate().take(ncomp) {
+                let bd = if c == 0 { s.bit_depth_luma } else { s.bit_depth_chroma };
+                for _ in 0..n {
+                    row.push(r.u(bd) as u16);
+                }
+            }
+            e.palette_predictor_initializers = Some(init);
+        }
+    }
+    e.motion_vector_resolution_control_idc = r.u(2);
+    if e.motion_vector_resolution_control_idc == 3 {
+        return Err(Error::Invalid("motion_vector_resolution_control_idc"));
+    }
+    e.intra_boundary_filtering_disabled_flag = r.flag();
+    Ok(e)
+}
+
+/// HEVCREXTSCC (LEDGER SR357): pps_scc_extension() (7.3.2.3.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PpsScc {
+    pub curr_pic_ref_enabled_flag: bool,
+    pub residual_adaptive_colour_transform_enabled_flag: bool,
+    pub slice_act_qp_offsets_present_flag: bool,
+    /// PpsActQpOffsetY / Cb / Cr: pps_act_y_qp_offset_plus5 - 5, pps_act_cb_qp_offset_plus5 - 5,
+    /// pps_act_cr_qp_offset_plus3 - 3.
+    pub act_qp_offset: [i32; 3],
+    /// pps_palette_predictor_initializer[comp][i] (None: pps_palette_predictor_initializers_present_flag 0; Some with
+    /// empty rows: pps_num_palette_predictor_initializers 0, an empty predictor).
+    pub palette_predictor_initializers: Option<[Vec<u16>; 3]>,
+    pub monochrome_palette_flag: bool,
+    /// (luma_bit_depth_entry, chroma_bit_depth_entry) of the initializers; (0, 0) without them.
+    pub entry_bit_depth: (u32, u32),
+}
+
+fn parse_pps_scc(r: &mut BitReader) -> Result<PpsScc> {
+    let mut e = PpsScc { curr_pic_ref_enabled_flag: r.flag(), residual_adaptive_colour_transform_enabled_flag: r.flag(), ..Default::default() };
+    if e.residual_adaptive_colour_transform_enabled_flag {
+        e.slice_act_qp_offsets_present_flag = r.flag();
+        let y = r.se() - 5;
+        let cb = r.se() - 5;
+        let cr = r.se() - 3;
+        e.act_qp_offset = [y, cb, cr];
+        if e.act_qp_offset.iter().any(|v| !(-12..=12).contains(v)) {
+            return Err(Error::Invalid("PpsActQpOffset outside -12..12"));
+        }
+    }
+    if r.flag() {
+        let n = ue_max(r, 128, "pps_num_palette_predictor_initializers")?;
+        let mut init: [Vec<u16>; 3] = Default::default();
+        if n > 0 {
+            e.monochrome_palette_flag = r.flag();
+            let bdy = ue_max(r, 8, "luma_bit_depth_entry_minus8")? + 8;
+            let bdc = if e.monochrome_palette_flag { 0 } else { ue_max(r, 8, "chroma_bit_depth_entry_minus8")? + 8 };
+            e.entry_bit_depth = (bdy, bdc);
+            let ncomp = if e.monochrome_palette_flag { 1 } else { 3 };
+            for (c, row) in init.iter_mut().enumerate().take(ncomp) {
+                for _ in 0..n {
+                    row.push(r.u(if c == 0 { bdy } else { bdc }) as u16);
+                }
+            }
+        }
+        e.palette_predictor_initializers = Some(init);
+    }
+    Ok(e)
 }

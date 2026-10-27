@@ -11,18 +11,24 @@
 //! inter coding unit of P and B slices — cu_skip_flag, pred_mode_flag, the inter part_mode binarization (9.3.3.7 with
 //! the AMP context), prediction_unit (7.3.8.6: merge_flag, merge_idx, inter_pred_idc, ref_idx, mvd_coding 7.3.8.9,
 //! mvp flags) and rqt_root_cbf with the inter transform tree; the motion and the samples come from [`crate::inter`].
+//! HEVCREXTSCC (SR357): the screen content coding syntax of H.265 v4 — palette_mode_flag and palette_coding (7.3.8.13,
+//! the predictor synchronised with the contexts like StatCoeff; [`crate::palette`]), tu_residual_act_flag with the
+//! adaptive colour transform's residual and QP (8.6.8 / 8.6.1), intra block copy as inter prediction from the current
+//! picture (use_integer_mv_flag, the decoded-region check) and intra_boundary_filtering_disabled_flag; read without the
+//! reference software (self-consistent, unconformed until HEVCCONF-SCC).
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::cabac::{init_type, Contexts, Engine};
-use crate::inter::{amvp, merge_motion, predict_pu, wrap_mv, InterCtx, Part, Pb, PRED_BI, PRED_L0, PRED_L1};
+use crate::inter::{amvp, int_mv, merge_motion, predict_pu, wrap_mv, InterCtx, Part, Pb, PRED_BI, PRED_L0, PRED_L1};
 use crate::intra::{chroma_mode, chroma_mode_422, luma_mode, predict_rext, IntraRext, DC};
 use crate::picture::{Picture, PuMotion, SaoParams, F_BYPASS, F_CBF, F_EDGE_H, F_EDGE_V, F_PCM, F_PU_EDGE_H, F_PU_EDGE_V, F_SKIP};
+use crate::palette::{bypass_tb, escape_val, reconstruct, run_prefix, run_value, traverse, PalettePredictor};
 use crate::ps::{Geometry, Pps, ScalingList, Sps, SCAN_ORDER};
 use crate::slice::{SliceHeader, SliceType};
 use crate::tables::*;
-use crate::transform::{add_residual, inverse_transform_range, scale_range, transform_skip_range};
+use crate::transform::{add_residual, inverse_transform_range, inverse_ycgco_r, scale_range, transform_skip_range};
 use crate::{Error, Result};
 
 /// The CABAC and QP state that outlives one slice segment within a picture (9.3.2.4 TableStateIdxWpp /
@@ -35,6 +41,9 @@ pub struct Storage {
     /// HEVCREXTTOOLS (SR345): StatCoeff stored and synchronised with the contexts (9.3.2.4 TableStatCoeffWpp / Ds).
     pub wpp_stat: [u8; 4],
     pub ds_stat: [u8; 4],
+    /// HEVCREXTSCC (SR357): the palette predictor stored and synchronised with the contexts (9.3.2.4).
+    pub wpp_plt: PalettePredictor,
+    pub ds_plt: PalettePredictor,
 }
 
 pub struct SliceDecoder<'a> {
@@ -80,6 +89,12 @@ pub struct SliceDecoder<'a> {
     /// decoding (cross-component prediction, 7.3.8.12 / 8.6.6).
     luma_res: Vec<i32>,
     res_scale: i32,
+    /// HEVCREXTSCC (SR357): the palette predictor (PredictorPaletteSize / PredictorPaletteEntries).
+    plt_pred: PalettePredictor,
+    /// HEVCREXTSCC (SR357): tu_residual_act_flag of the transform unit under decoding and its three residuals, held
+    /// until the inverse colour transform.
+    act: bool,
+    act_res: [Vec<i32>; 3],
 }
 
 impl<'a> SliceDecoder<'a> {
@@ -129,6 +144,9 @@ impl<'a> SliceDecoder<'a> {
             chroma_qp_offset_coded: false,
             luma_res: Vec::new(),
             res_scale: 0,
+            plt_pred: PalettePredictor::default(),
+            act: false,
+            act_res: Default::default(),
         }
     }
 
@@ -150,6 +168,7 @@ impl<'a> SliceDecoder<'a> {
     fn init(&mut self) {
         self.eng.init_contexts(self.init_type, self.slice_qp);
         self.stat_coeff = [0; 4];
+        self.plt_pred = PalettePredictor::init(self.sps, self.pps);
     }
 
     /// 9.3.1: at the first CTB of a wavefront row, synchronise with the storage made after the second CTB of the
@@ -163,6 +182,7 @@ impl<'a> SliceDecoder<'a> {
             Some(s) if self.pic.available(g, x0, y0, x0 + c, y0 - c) => {
                 self.eng.load(&s);
                 self.stat_coeff = self.store.wpp_stat;
+                self.plt_pred = self.store.wpp_plt.clone();
             }
             _ => self.init(),
         }
@@ -186,6 +206,7 @@ impl<'a> SliceDecoder<'a> {
                 Some(s) => {
                     self.eng.load(&s);
                     self.stat_coeff = self.store.ds_stat;
+                    self.plt_pred = self.store.ds_plt.clone();
                 }
                 None => return Err(Error::Invalid("dependent slice segment without stored contexts")),
             }
@@ -200,10 +221,12 @@ impl<'a> SliceDecoder<'a> {
             if wpp && (rs % w == 1 || (w > 1 && rs > 1 && g.tile_id[ts as usize] != g.tile_id[g.rs_to_ts[rs as usize - 2] as usize])) {
                 self.store.wpp = Some(self.eng.save());
                 self.store.wpp_stat = self.stat_coeff;
+                self.store.wpp_plt = self.plt_pred.clone();
             }
             if end && self.pps.dependent_slice_segments_enabled_flag {
                 self.store.ds = Some(self.eng.save());
                 self.store.ds_stat = self.stat_coeff;
+                self.store.ds_plt = self.plt_pred.clone();
             }
             if self.eng.overran() {
                 return Err(Error::Truncated);
@@ -411,6 +434,10 @@ impl<'a> SliceDecoder<'a> {
         }
         self.cu_intra = true;
         self.inter_split = false;
+        // HEVCREXTSCC (SR357) 7.3.8.5: palette_mode_flag of an intra coding unit up to MaxTbLog2SizeY.
+        if self.sps.scc.palette_mode_enabled_flag && log2 <= self.sps.log2_max_tb && self.eng.decision(PALETTE_MODE) == 1 {
+            return self.palette_cu(x0, y0, log2, depth);
+        }
         let nxn = log2 == self.sps.log2_min_cb && self.eng.decision(PART_MODE) == 0;
         let pcm = !nxn && self.sps.pcm.is_some_and(|p| log2 >= p.log2_min_cb && log2 <= p.log2_max_cb) && self.eng.terminate() == 1;
         let bypass = self.cu_bypass;
@@ -598,27 +625,18 @@ impl<'a> SliceDecoder<'a> {
         let cat = self.sps.chroma_array_type();
         let chroma_here = cat != 0 && (log2 > 2 || cat == 3);
         let (ccb, ccr) = if chroma_here { (cb, cr) } else if cat != 0 { (parent_cb, parent_cr) } else { (0, 0) };
+        // HEVCREXTSCC (SR357) 7.3.8.10: tu_residual_act_flag in an inter coding unit or a 2Nx2N intra one with
+        // intra_chroma_pred_mode 4.
+        self.act = (cbf_luma || ccb != 0 || ccr != 0)
+            && self.pps.scc.residual_adaptive_colour_transform_enabled_flag
+            && (!self.cu_intra || (self.nxn_cmodes.is_none() && self.chroma_dm[0]))
+            && self.eng.decision(TU_ACT) == 1;
+        if self.act {
+            let n = 1usize << (2 * log2);
+            self.act_res = [vec![0; n], vec![0; n], vec![0; n]];
+        }
         if (cbf_luma || ccb != 0 || ccr != 0) && self.pps.cu_qp_delta_enabled_flag && !self.is_cu_qp_delta_coded {
-            let mut v: i32 = 0;
-            if self.eng.decision(CU_QP_DELTA_ABS) == 1 {
-                v = 1;
-                while v < 5 && self.eng.decision(CU_QP_DELTA_ABS + 1) == 1 {
-                    v += 1;
-                }
-                if v == 5 {
-                    v += self.eng.bypass_egk(0).min(1 << 16) as i32;
-                }
-            }
-            if v > 0 && self.eng.bypass() == 1 {
-                v = -v;
-            }
-            let off = 3 * (self.sps.bit_depth_luma as i32 - 8);
-            if v < -(26 + off) || v > 25 + off {
-                return Err(Error::Invalid("CuQpDeltaVal out of range"));
-            }
-            self.is_cu_qp_delta_coded = true;
-            self.cu_qp_delta_val = v;
-            self.update_qp();
+            self.delta_qp()?;
         }
         if self.sh.cu_chroma_qp_offset_enabled_flag && (ccb != 0 || ccr != 0) && !self.cu_bypass && !self.chroma_qp_offset_coded {
             self.cu_chroma_qp_offset();
@@ -654,6 +672,9 @@ impl<'a> SliceDecoder<'a> {
         } else if blk == 3 && cat != 0 {
             self.chroma_blocks(xb / sw, yb / sh, 2, parent_cb, parent_cr, cmode, false)?;
         }
+        if self.act {
+            self.act_finish(x0, y0, log2);
+        }
         Ok(())
     }
 
@@ -678,7 +699,7 @@ impl<'a> SliceDecoder<'a> {
                 } else if self.res_scale != 0 {
                     let mut res = vec![0i32; 1 << (2 * log2c)];
                     self.cross_comp(&mut res);
-                    add_residual(&mut self.pic.planes[c], xc, y, log2c, &res, bdc);
+                    self.put_residual(c, xc, y, log2c, res, bdc);
                 }
             }
         }
@@ -694,20 +715,7 @@ impl<'a> SliceDecoder<'a> {
         let mut res = if self.cu_bypass {
             coeff
         } else {
-            let qp = if c == 0 {
-                self.qp_y + 6 * (bd as i32 - 8)
-            } else {
-                let off = 6 * (bd as i32 - 8);
-                // HEVCREXTTOOLS (SR345) 8.6.1: + CuQpOffsetCb / CuQpOffsetCr.
-                let (po, so, co) = if c == 1 {
-                    (self.pps.cb_qp_offset, self.sh.cb_qp_offset, self.cu_qp_offset.0)
-                } else {
-                    (self.pps.cr_qp_offset, self.sh.cr_qp_offset, self.cu_qp_offset.1)
-                };
-                let qpi = (self.qp_y + po + so + co).clamp(-off, 57);
-                // 8.6.1: Table 8-10 at ChromaArrayType 1, else Min(qPi, 51) (HEVCREXT SR334).
-                (if self.sps.chroma_array_type() == 1 { qpc_420(qpi) } else { qpi.min(51) }) + off
-            };
+            let qp = self.qp_prime(c);
             let n = 1usize << log2;
             let factor = match self.scaling {
                 Some(sl) if !(ts && n > 4) => Some(sl.factor[(log2 - 2) as usize][c + if self.cu_intra { 0 } else { 3 }].as_slice()),
@@ -722,7 +730,7 @@ impl<'a> SliceDecoder<'a> {
         } else if c > 0 && self.res_scale != 0 {
             self.cross_comp(&mut res);
         }
-        add_residual(&mut self.pic.planes[c], x0, y0, log2, &res, bd);
+        self.put_residual(c, x0, y0, log2, res, bd);
         Ok(())
     }
 
@@ -1077,7 +1085,12 @@ impl<'a> SliceDecoder<'a> {
         let merge = skip || self.eng.decision(MERGE_FLAG) == 1;
         let motion = if merge {
             let idx = if max_merge > 1 { self.tr_ctx(MERGE_IDX, 1, max_merge - 1) } else { 0 };
-            merge_motion(self.pic, self.geo, &ctx, self.sh, self.pps, pb, idx as usize)
+            let mut mm = merge_motion(self.pic, self.geo, &ctx, self.sh, self.pps, pb, idx as usize);
+            // HEVCREXTSCC (SR357, SPEC-CHECK): integer vectors under use_integer_mv_flag.
+            if self.sh.use_integer_mv_flag {
+                mm.mv = mm.mv.map(int_mv);
+            }
+            mm
         } else {
             let idc = if self.sh.slice_type == SliceType::B { self.inter_pred_idc(pb.w + pb.h, depth) } else { PRED_L0 };
             let mut m = PuMotion::default();
@@ -1099,11 +1112,16 @@ impl<'a> SliceDecoder<'a> {
             for x in 0..2 {
                 if m.uses(x) {
                     let mvp = amvp(self.pic, self.geo, &ctx, self.sh, pb, x, m.ref_idx[x] as usize)[flag[x] as usize];
-                    m.mv[x] = [wrap_mv(mvp[0] + mvd[x][0]), wrap_mv(mvp[1] + mvd[x][1])];
+                    // HEVCREXTSCC (SR357): under use_integer_mv_flag MvdLX is in integer samples and the predictor floored.
+                    let (mvp, s) = if self.sh.use_integer_mv_flag { (int_mv(mvp), 2) } else { (mvp, 0) };
+                    m.mv[x] = [wrap_mv(mvp[0] + (mvd[x][0] << s)), wrap_mv(mvp[1] + (mvd[x][1] << s))];
                 }
             }
             m
         };
+        if !self.ibc_region_ok(&ctx, pb, &motion) {
+            return Err(Error::Unsupported("intra block copy outside the decoded region (HEVCREXT-SCC)"));
+        }
         self.pic.fill4(pb.x as usize, pb.y as usize, pb.w as usize, pb.h as usize, |p, i| p.motion[i] = motion);
         let (bdy, bdc) = (self.sps.bit_depth_luma, self.sps.bit_depth_chroma);
         predict_pu(self.pic, &ctx, self.sh, self.pps, bdy, bdc, self.sps.range_ext.high_precision_offsets_enabled_flag, pb.x, pb.y, pb.w, pb.h, &motion);
@@ -1114,7 +1132,9 @@ impl<'a> SliceDecoder<'a> {
     /// 8.4.4.2.6: disableIntraBoundaryFilter is implicit_rdpcm_enabled_flag with cu_transquant_bypass_flag).
     fn intra_rext(&self) -> IntraRext {
         let rx = self.sps.range_ext;
-        IntraRext { smoothing_disabled: rx.intra_smoothing_disabled_flag, boundary_filter_disabled: rx.implicit_rdpcm_enabled_flag && self.cu_bypass }
+        // HEVCREXTSCC (SR357): or intra_boundary_filtering_disabled_flag.
+        let off = (rx.implicit_rdpcm_enabled_flag && self.cu_bypass) || self.sps.scc.intra_boundary_filtering_disabled_flag;
+        IntraRext { smoothing_disabled: rx.intra_smoothing_disabled_flag, boundary_filter_disabled: off }
     }
 
     /// HEVCREXTTOOLS (SR345): the residual of a transform-skip or transquant-bypass block after its residual array is
@@ -1266,4 +1286,261 @@ pub fn sig_ctx(xc: usize, yc: usize, xs: usize, ys: usize, log2: u32, chroma: bo
         s
     };
     if chroma { 27 + s } else { s }
+}
+
+// ---------------------------------------------------------------- HEVCREXTSCC (LEDGER SR357)
+
+impl<'a> SliceDecoder<'a> {
+    /// delta_qp() (7.3.8.14): cu_qp_delta_abs / cu_qp_delta_sign_flag -> CuQpDeltaVal and QpY (8-283). Lifted from
+    /// transform_unit so the palette escape shares it (HEVCREXTSCC); the caller tests cu_qp_delta_enabled_flag and
+    /// IsCuQpDeltaCoded.
+    fn delta_qp(&mut self) -> Result<()> {
+        let mut v: i32 = 0;
+        if self.eng.decision(CU_QP_DELTA_ABS) == 1 {
+            v = 1;
+            while v < 5 && self.eng.decision(CU_QP_DELTA_ABS + 1) == 1 {
+                v += 1;
+            }
+            if v == 5 {
+                v += self.eng.bypass_egk(0).min(1 << 16) as i32;
+            }
+        }
+        if v > 0 && self.eng.bypass() == 1 {
+            v = -v;
+        }
+        let off = 3 * (self.sps.bit_depth_luma as i32 - 8);
+        if v < -(26 + off) || v > 25 + off {
+            return Err(Error::Invalid("CuQpDeltaVal out of range"));
+        }
+        self.is_cu_qp_delta_coded = true;
+        self.cu_qp_delta_val = v;
+        self.update_qp();
+        Ok(())
+    }
+
+    /// The scaling qP of component `c` (8.6.1 Qp'Y / Qp'Cb / Qp'Cr; HEVCREXTTOOLS SR345: + CuQpOffsetCb / Cr), lifted from
+    /// residual so the palette escape shares it. HEVCREXTSCC (SR357, SPEC-CHECK): in a transform unit with
+    /// tu_residual_act_flag, + PpsActQpOffset + SliceActQpOffset of the component, clamped at 0.
+    fn qp_prime(&self, c: usize) -> i32 {
+        let bd = if c == 0 { self.sps.bit_depth_luma } else { self.sps.bit_depth_chroma };
+        let off = 6 * (bd as i32 - 8);
+        let qp = if c == 0 {
+            self.qp_y + off
+        } else {
+            let (po, so, co) = if c == 1 {
+                (self.pps.cb_qp_offset, self.sh.cb_qp_offset, self.cu_qp_offset.0)
+            } else {
+                (self.pps.cr_qp_offset, self.sh.cr_qp_offset, self.cu_qp_offset.1)
+            };
+            let qpi = (self.qp_y + po + so + co).clamp(-off, 57);
+            // 8.6.1: Table 8-10 at ChromaArrayType 1, else Min(qPi, 51) (HEVCREXT SR334).
+            (if self.sps.chroma_array_type() == 1 { qpc_420(qpi) } else { qpi.min(51) }) + off
+        };
+        if self.act { (qp + self.pps.scc.act_qp_offset[c] + self.sh.slice_act_qp_offset[c]).max(0) } else { qp }
+    }
+
+    /// Add a block's residual to its prediction, or (HEVCREXTSCC) hold it for the transform unit's inverse colour
+    /// transform when tu_residual_act_flag is 1.
+    fn put_residual(&mut self, c: usize, x0: usize, y0: usize, log2: u32, res: Vec<i32>, bd: u32) {
+        if self.act {
+            self.act_res[c] = res;
+        } else {
+            add_residual(&mut self.pic.planes[c], x0, y0, log2, &res, bd);
+        }
+    }
+
+    /// HEVCREXTSCC 8.6.8: the transform unit's three residuals through the inverse YCgCo-R, then added (ChromaArrayType 3:
+    /// every component at (x0, y0), nTbS 1 << log2).
+    fn act_finish(&mut self, x0: usize, y0: usize, log2: u32) {
+        self.act = false;
+        let [mut ry, mut rcb, mut rcr] = core::mem::take(&mut self.act_res);
+        inverse_ycgco_r(&mut ry, &mut rcb, &mut rcr);
+        let (bdy, bdc) = (self.sps.bit_depth_luma, self.sps.bit_depth_chroma);
+        add_residual(&mut self.pic.planes[0], x0, y0, log2, &ry, bdy);
+        add_residual(&mut self.pic.planes[1], x0, y0, log2, &rcb, bdc);
+        add_residual(&mut self.pic.planes[2], x0, y0, log2, &rcr, bdc);
+    }
+
+    /// HEVCREXTSCC: the decoded-region constraint of a prediction block referring to the current picture (intra block
+    /// copy): the top-left and bottom-right reference samples, widened by 2 where ChromaArrayType 1 / 2 interpolates a
+    /// fractional chroma vector, are available (6.4.1) from (xPb, yPb), and the block's last CTB column is no further
+    /// right of the current CTB than its last CTB row is above it. False: the stream is refused by name.
+    fn ibc_region_ok(&self, ctx: &InterCtx, pb: &Pb, m: &PuMotion) -> bool {
+        let cat = self.sps.chroma_array_type();
+        let (sw, sh) = self.pic.chroma.sub();
+        for x in 0..2 {
+            if !m.uses(x) || !ctx.is_cur(x, m.ref_idx[x]) {
+                continue;
+            }
+            let mv = m.mv[x];
+            let frac = |v: i32, s: usize| (cat == 1 || cat == 2) && (v * 2 / s as i32) & 7 != 0;
+            let (ox, oy) = (if frac(mv[0], sw) { 2 } else { 0 }, if frac(mv[1], sh) { 2 } else { 0 });
+            let (xr, yr) = (pb.x + (mv[0] >> 2), pb.y + (mv[1] >> 2));
+            let (xe, ye) = (xr + pb.w - 1 + ox, yr + pb.h - 1 + oy);
+            if !self.avail(pb.x, pb.y, xr - ox, yr - oy) || !self.avail(pb.x, pb.y, xe, ye) {
+                return false;
+            }
+            let l = self.sps.log2_ctb;
+            if (xe >> l) - (pb.x >> l) > (pb.y >> l) - (ye >> l) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// HEVCREXTSCC: a coding unit with palette_mode_flag 1 — its facts (intra, DC for the MPM of its neighbours, the
+    /// palette mark for deblocking), palette_coding() (7.3.8.13), the samples (8.4.4.2.7) and the predictor update.
+    fn palette_cu(&mut self, x0: i32, y0: i32, log2: u32, depth: u32) -> Result<()> {
+        let size = 1usize << log2;
+        let (xu, yu) = (x0 as usize, y0 as usize);
+        let bypass = self.cu_bypass;
+        self.pic.fill4(xu, yu, size, size, |p, i| {
+            p.ctdepth[i] = depth as u8;
+            p.flags[i] = (p.flags[i] & !(F_PCM | F_BYPASS)) | if bypass { F_BYPASS } else { 0 };
+            p.intra_mode[i] = DC as u8;
+            p.palette[i] = true;
+        });
+        self.mark_edges(xu, yu, size);
+        let sps = self.sps;
+        let ncomp = if sps.chroma_array_type() == 0 { 1 } else { 3 };
+        let bd = [sps.bit_depth_luma, sps.bit_depth_chroma, sps.bit_depth_chroma];
+        let max_size = sps.scc.palette_max_size as usize;
+        // The predictor reuse (palette_predictor_run, EG0) and CurrentPaletteEntries.
+        let psize = self.plt_pred.size();
+        let mut reuse = vec![false; psize];
+        let mut cur: [Vec<u16>; 3] = Default::default();
+        let mut i = 0usize;
+        while i < psize && cur[0].len() < max_size {
+            let run = self.eng.bypass_egk(0).min(256) as usize;
+            if run == 1 {
+                break;
+            }
+            if run > 1 {
+                i += run - 1;
+            }
+            if i >= psize {
+                return Err(Error::Invalid("palette_predictor_run past the predictor"));
+            }
+            reuse[i] = true;
+            for (c, row) in cur.iter_mut().enumerate() {
+                row.push(self.plt_pred.entries[c][i]);
+            }
+            i += 1;
+        }
+        let npred = cur[0].len();
+        let nnew = if npred < max_size { self.eng.bypass_egk(0) as usize } else { 0 };
+        if npred + nnew > max_size {
+            return Err(Error::Invalid("num_signalled_palette_entries"));
+        }
+        for (c, row) in cur.iter_mut().enumerate() {
+            for _ in 0..nnew {
+                row.push(if c < ncomp { self.eng.bypass_bits(bd[c]) as u16 } else { 0 });
+            }
+        }
+        let size_cur = npred + nnew;
+        let escape = size_cur == 0 || self.eng.bypass() == 1;
+        // MaxPaletteIndex = CurrentPaletteSize - 1 + palette_escape_val_present_flag.
+        let max_idx = (size_cur + escape as usize).saturating_sub(1) as u32;
+        let total = size * size;
+        let mut idc: Vec<u32> = Vec::new();
+        let (mut final_copy, mut transpose) = (false, false);
+        let mut num_indices = 0usize;
+        if max_idx > 0 {
+            num_indices = self.eng.coeff_abs_level_remaining(3 + ((max_idx + 1) >> 3)) as usize + 1;
+            if num_indices > total {
+                return Err(Error::Invalid("num_palette_indices_minus1"));
+            }
+            let mut adjust = 0;
+            for _ in 0..num_indices {
+                idc.push(if max_idx - adjust > 0 { bypass_tb(&mut self.eng, max_idx - adjust) } else { 0 });
+                adjust = 1;
+            }
+            final_copy = self.eng.bypass() == 1;
+            transpose = self.eng.decision(PALETTE_TRANSPOSE) == 1;
+        }
+        if escape {
+            if self.pps.cu_qp_delta_enabled_flag && !self.is_cu_qp_delta_coded {
+                self.delta_qp()?;
+            }
+            if self.sh.cu_chroma_qp_offset_enabled_flag && !self.cu_bypass && !self.chroma_qp_offset_coded {
+                self.cu_chroma_qp_offset();
+            }
+        }
+        // The index map ([y * nCbS + x]) in traverse scan, runs of an index or of the row above.
+        let at = |p: usize| {
+            let (x, y) = traverse(log2, p, transpose);
+            y * size + x
+        };
+        let above_of = |i: usize| if transpose { i - 1 } else { i - size };
+        let mut map = vec![0u8; total];
+        let mut copied = vec![false; total];
+        let mut remaining = num_indices;
+        let mut pos = 0usize;
+        while pos < total {
+            let ic = at(pos);
+            let mut run = (total - pos - 1) as u32;
+            let mut copy = false;
+            if max_idx > 0 && pos >= size && !copied[at(pos - 1)] {
+                if remaining > 0 && pos < total - 1 {
+                    copy = self.eng.decision(PALETTE_COPY_ABOVE) == 1;
+                } else {
+                    copy = !(pos == total - 1 && remaining > 0);
+                }
+            }
+            if !copy {
+                // 7.4.9.13: palette_idx_idc skips adjustedRefPaletteIndex, the index on the left in scan order (or
+                // above the current sample after a copy run).
+                let raw = idc.get(num_indices - remaining).copied().unwrap_or(0);
+                let refi = if pos == 0 {
+                    max_idx + 1
+                } else {
+                    let p = at(pos - 1);
+                    if copied[p] { map[above_of(ic)] as u32 } else { map[p] as u32 }
+                };
+                map[ic] = (if raw >= refi { raw + 1 } else { raw }).min(max_idx) as u8;
+            }
+            if max_idx > 0 {
+                if !copy {
+                    remaining = remaining.checked_sub(1).ok_or(Error::Invalid("palette indices exhausted"))?;
+                }
+                if remaining > 0 || copy != final_copy {
+                    let max_run = (total - pos - 1) as i64 - remaining as i64 - final_copy as i64;
+                    if max_run < 0 {
+                        return Err(Error::Invalid("PaletteMaxRunMinus1"));
+                    }
+                    run = 0;
+                    if max_run > 0 {
+                        let pre = run_prefix(&mut self.eng, max_run as u32, copy, if copy { 0 } else { map[ic] as u32 });
+                        run = run_value(&mut self.eng, max_run as u32, pre);
+                    }
+                }
+            }
+            if run as usize > total - pos - 1 {
+                return Err(Error::Invalid("PaletteRunMinus1"));
+            }
+            for _ in 0..=run {
+                let ir = at(pos);
+                copied[ir] = copy;
+                map[ir] = if copy { map[above_of(ir)] } else { map[ic] };
+                pos += 1;
+            }
+        }
+        // palette_escape_val per component, at the chroma sample positions of the format.
+        let mut esc: [Vec<u32>; 3] = [vec![0; total], vec![0; total], vec![0; total]];
+        if escape {
+            let (sw, sh) = self.pic.chroma.sub();
+            for (c, row) in esc.iter_mut().enumerate().take(ncomp) {
+                for p in 0..total {
+                    let (x, y) = traverse(log2, p, transpose);
+                    if map[y * size + x] as u32 == max_idx && (c == 0 || (x % sw == 0 && y % sh == 0)) {
+                        row[y * size + x] = escape_val(&mut self.eng, self.cu_bypass, bd[c]);
+                    }
+                }
+            }
+        }
+        let qp = [self.qp_prime(0), self.qp_prime(1), self.qp_prime(2)];
+        reconstruct(self.pic, xu, yu, log2, &cur, &map, &esc, if escape { Some(max_idx) } else { None }, self.cu_bypass, qp, bd, ncomp);
+        self.plt_pred.update(&cur, &reuse, sps.scc.palette_max_predictor_size() as usize);
+        self.finish_cu(xu, yu, size)
+    }
 }

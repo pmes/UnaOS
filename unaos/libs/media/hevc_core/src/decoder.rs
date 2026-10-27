@@ -83,7 +83,9 @@ impl Default for Decoder {
 
 /// The refusals by name (the crate doc): what an activated SPS / PPS may not use. HEVCREXT (SR334): 4:2:2, 4:4:4, 12
 /// bits and unequal luma / chroma depths decode. HEVCREXTTOOLS (SR345): every range extension tool, monochrome and the
-/// 16-bit profiles decode; separate colour planes and the screen content coding extension are refused by name.
+/// 16-bit profiles decode; separate colour planes are refused by name. HEVCREXTSCC (SR357): the screen content coding
+/// tools decode (palette, intra block copy, the adaptive colour transform); refused by name: an SCC body behind the
+/// multilayer / 3D bodies, and the colour transform at unequal luma / chroma depths.
 fn check_supported(sps: &Sps, pps: &Pps) -> Result<()> {
     if sps.separate_colour_plane_flag {
         return Err(Error::Unsupported("separate colour planes (HEVCREXT)"));
@@ -91,8 +93,25 @@ fn check_supported(sps: &Sps, pps: &Pps) -> Result<()> {
     if sps.bit_depth_luma > 16 || sps.bit_depth_chroma > 16 {
         return Err(Error::Unsupported("bit depth above 16 (HEVCREXT-TOOLS)"));
     }
-    if sps.scc_extension_flag || pps.scc_extension_flag {
-        return Err(Error::Unsupported("screen content coding extension (HEVCREXT-SCC)"));
+    if sps.scc_unparsed || pps.scc_unparsed {
+        return Err(Error::Unsupported("screen content coding beside the multilayer / 3D extensions (HEVCREXT-SCC)"));
+    }
+    if pps.scc.curr_pic_ref_enabled_flag && !sps.scc.curr_pic_ref_enabled_flag {
+        return Err(Error::Invalid("pps_curr_pic_ref_enabled_flag without sps_curr_pic_ref_enabled_flag"));
+    }
+    if pps.scc.residual_adaptive_colour_transform_enabled_flag {
+        if sps.chroma_array_type() != 3 {
+            return Err(Error::Invalid("residual_adaptive_colour_transform_enabled_flag off 4:4:4"));
+        }
+        if sps.bit_depth_luma != sps.bit_depth_chroma {
+            return Err(Error::Unsupported("adaptive colour transform with unequal luma and chroma depths (HEVCREXT-SCC)"));
+        }
+    }
+    if pps.scc.palette_predictor_initializers.as_ref().is_some_and(|r| !r[0].is_empty()) {
+        let (y, c) = pps.scc.entry_bit_depth;
+        if y != sps.bit_depth_luma || (!pps.scc.monochrome_palette_flag && c != sps.bit_depth_chroma) {
+            return Err(Error::Invalid("palette predictor initializer bit depths differ from the SPS"));
+        }
     }
     Ok(())
 }
@@ -404,7 +423,7 @@ impl Decoder {
         let latency = if o.max_latency_increase_plus1 != 0 { o.max_num_reorder_pics + o.max_latency_increase_plus1 - 1 } else { 0 };
         self.bump = (o.max_num_reorder_pics, latency, o.max_dec_pic_buffering_minus1 + 1);
         // 8.3.2 (an IRAP with NoRaslOutputFlag 1 marks every picture unused), then C.5.2.2: make room in the DPB.
-        let rps = self.dpb.apply_rps(sh, &sps, poc, nal.is_irap() && self.skip_rasl)?;
+        let rps = self.dpb.apply_rps(sh, &sps, poc, nal.is_irap() && self.skip_rasl)?.with_curr(pps.scc.curr_pic_ref_enabled_flag, poc);
         let (reorder, latency, max_dec) = self.bump;
         self.dpb.make_room(reorder, latency, max_dec, &mut self.out);
         self.lists_log.clear();

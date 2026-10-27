@@ -16,7 +16,7 @@
 use h264_core::cabac::{Cabac, NUM_CTX};
 
 use crate::slice::SliceType;
-use crate::tables::{init_state, CNU, CTX_TABLES, REXT_CTX_TABLES};
+use crate::tables::{init_state, CNU, CTX_TABLES, REXT_CTX_TABLES, SCC_CTX_TABLES};
 
 /// A saved set of context states (9.3.2.4 TableStateIdxWpp / TableStateIdxDs).
 pub type Contexts = [u8; NUM_CTX];
@@ -45,7 +45,7 @@ pub fn init_type(slice_type: SliceType, cabac_init_flag: bool) -> usize {
 /// The initial context states of every slot for (initType, SliceQpY), 9.3.2.2.
 pub fn initial_contexts(init_type: usize, qp: i32) -> Contexts {
     let mut s = [0u8; NUM_CTX];
-    for t in CTX_TABLES.iter().chain(REXT_CTX_TABLES) {
+    for t in CTX_TABLES.iter().chain(REXT_CTX_TABLES).chain(SCC_CTX_TABLES) {
         let row = t.init[init_type];
         for i in 0..t.len() {
             s[t.slot + i] = init_state(row.get(i).copied().unwrap_or(CNU), qp);
